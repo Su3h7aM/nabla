@@ -1,0 +1,328 @@
+package ai
+
+import "core:mem"
+import "core:net"
+import "core:strings"
+
+Provider_Event_Callback :: #type proc(user_data: rawptr, event: Provider_Event)
+
+Provider_Operation_Error_Kind :: enum {
+	None,
+	Invalid_Request,
+	HTTP,
+	Stream,
+	Cancelled,
+	Timed_Out,
+	// TLS means the peer did not authenticate; the response was never usable.
+	TLS,
+}
+
+Provider_Operation_Error :: struct {
+	kind:   Provider_Operation_Error_Kind,
+	detail: string,
+}
+
+// Provider_Operation_Options is the caller's interruption and trust policy for
+// one request. A zero value performs the request without cancellation, which is
+// what the synchronous prototype path wants.
+Provider_Operation_Options :: struct {
+	interrupt:   ^Interrupt,
+	deadline:    Deadline,
+	// Empty uses the platform trust store. Credentialed HTTPS is never sent over
+	// an unverified connection, even when this is empty.
+	ca_file:     string,
+	// Empty uses the system resolver configuration. A value replaces it.
+	nameservers: []net.Endpoint,
+}
+
+// Provider_Request_Operation_Controlled performs one request with explicit
+// cancellation and deadline control. It delivers at most one terminal callback,
+// never exposes executable tool calls from an interrupted or truncated stream,
+// and destroys every payload it retains on failure.
+Provider_Request_Operation_Controlled :: proc(
+	connection: Provider_Connection,
+	request: Provider_Request,
+	user_data: rawptr,
+	callback: Provider_Event_Callback,
+	options: Provider_Operation_Options,
+	allocator := context.allocator,
+) -> Provider_Operation_Error {
+	if err := Provider_Validate_Request(request); err != .None {
+		return Provider_Operation_Error{kind = .Invalid_Request, detail = provider_request_error_text(err)}
+	}
+	if connection.API != request.API { return Provider_Operation_Error{kind = .Invalid_Request, detail = "connection/request API mismatch"} }
+	endpoint := strings.trim_right(connection.Endpoint, "/")
+	owned_endpoint := ""
+	want_suffix := "/responses" if request.API == .OpenAI_Responses else "/chat/completions"
+	if !strings.has_suffix(endpoint, want_suffix) {
+		owned_endpoint = strings.concatenate([]string{endpoint, want_suffix}, allocator = allocator)
+		endpoint = owned_endpoint
+	}
+	defer delete(owned_endpoint, allocator)
+	body, encode_err := Provider_Encode_Request(request, allocator)
+	if encode_err != .None {
+		return Provider_Operation_Error{kind = .Invalid_Request, detail = provider_request_error_text(encode_err)}
+	}
+	defer delete(body, allocator)
+
+	state := Provider_Request_Stream_State {
+		stream    = Provider_Stream_Start(connection.API, allocator),
+		api       = connection.API,
+		user_data = user_data,
+		callback  = callback,
+		allocator = allocator,
+		interrupt = options.interrupt,
+		deadline  = options.deadline,
+	}
+	sse_parser_init(&state.parser, provider_sse_event, &state, allocator = allocator)
+	defer sse_parser_destroy(&state.parser)
+	defer Provider_Event_Destroy(&state.completion, allocator)
+	defer Provider_Stream_Destroy(&state.stream)
+
+	failure := http_post_sse(
+		HTTP_Request {
+			url = endpoint,
+			body = transmute([]u8)body,
+			bearer_token = connection.Credential,
+			ca_file = options.ca_file,
+			nameservers = options.nameservers,
+			allocator = allocator,
+		},
+		HTTP_Control{interrupt = options.interrupt, deadline = options.deadline},
+		&state,
+		provider_http_chunk,
+	)
+	if failure.kind != .None {
+		if !state.failed { provider_emit_error(&state, provider_failure_kind(failure.kind), failure.detail) }
+		provider_drain_events(&state)
+		if failure.kind == .HTTP_Status && failure.detail != "" { delete(failure.detail, allocator) }
+		return provider_terminal_error(&state, provider_operation_error_kind(failure.kind))
+	}
+	if state.failed { return provider_terminal_error(&state, .Stream) }
+	if sse_parser_finish(&state.parser) != .None {
+		provider_emit_error(&state, .Invalid_Data, "malformed SSE stream")
+		provider_drain_events(&state)
+		return provider_terminal_error(&state, .Stream)
+	}
+	stream_err := Provider_Stream_Finish(&state.stream)
+	provider_drain_events(&state)
+	if stream_err != .None && !state.failed {
+		provider_emit_error(&state, .Stream_Truncated, provider_stream_error_text(stream_err))
+	}
+	if state.failed { return provider_terminal_error(&state, .Stream) }
+	// The transport finished cleanly and the terminal event is authoritative.
+	if state.stream.Phase == .Done && state.completion != nil {
+		provider_deliver(&state, state.completion)
+		state.completion = nil
+	}
+	return {}
+}
+
+Provider_Request_Stream_State :: struct {
+	stream:         Provider_Stream_State,
+	parser:         SSE_Parser,
+	api:            API_Kind,
+	user_data:      rawptr,
+	callback:       Provider_Event_Callback,
+	allocator:      mem.Allocator,
+	interrupt:      ^Interrupt,
+	deadline:       Deadline,
+	failed:         bool,
+	failure_detail: string,
+	completion:     Provider_Event,
+}
+
+// provider_operation_error_kind maps a transport failure onto the operation's
+// own outcome, so a caller that only inspects the returned error still learns
+// that the request was interrupted rather than malformed.
+provider_operation_error_kind :: proc(kind: HTTP_Failure_Kind) -> Provider_Operation_Error_Kind {
+	switch kind {
+	case .Cancelled:
+		return .Cancelled
+	case .Timed_Out:
+		return .Timed_Out
+	case .TLS:
+		return .TLS
+	case .None, .Transport, .Invalid_URL, .HTTPS_Required, .Redirect_Rejected, .HTTP_Status, .Content_Type:
+		return .Stream
+	}
+	return .Stream
+}
+
+// provider_terminal_error reports why an operation ended. An accepted
+// cancellation or an expired deadline always wins over whichever path happened
+// to notice first, so a late failure is never reported as an ordinary stream
+// defect and a late success can never be reported at all.
+provider_terminal_error :: proc(state: ^Provider_Request_Stream_State, kind: Provider_Operation_Error_Kind) -> Provider_Operation_Error {
+	resolved := kind
+	if interrupt_requested(state.interrupt) {
+		resolved = .Cancelled
+	} else if deadline_expired(state.deadline) {
+		resolved = .Timed_Out
+	}
+	return Provider_Operation_Error{kind = resolved, detail = provider_take_failure_detail(state)}
+}
+
+// provider_failure_kind maps a transport failure onto the event kind the caller
+// sees. Interruption is never reported as a stream defect, so a cancelled
+// operation can be distinguished from a broken one.
+provider_failure_kind :: proc(kind: HTTP_Failure_Kind) -> Provider_Error_Kind {
+	switch kind {
+	case .Cancelled:
+		return .Cancelled
+	case .Timed_Out:
+		return .Timed_Out
+	case .TLS:
+		return .TLS
+	case .None, .Transport, .Invalid_URL, .HTTPS_Required, .Redirect_Rejected, .HTTP_Status, .Content_Type:
+		return .Stream_Truncated
+	}
+	return .Stream_Truncated
+}
+
+provider_request_error_text :: proc(err: Provider_Request_Error) -> string {
+	switch err {
+	case .None:
+		return ""
+	case .Unsupported_API:
+		return "unsupported API family (only openai_chat_completions and openai_responses are implemented)"
+	case .Missing_Model:
+		return "model is required"
+	case .Missing_Messages:
+		return "at least one message is required"
+	case .Invalid_Message:
+		return "message role/content is invalid"
+	case .Invalid_Tools:
+		return "tool definitions are invalid"
+	case .Invalid_Tool_Call:
+		return "tool call id/name is invalid"
+	case .Invalid_Max_Output_Tokens:
+		return "max output tokens must be positive"
+	case .Invalid_Reasoning_Effort:
+		return "reasoning effort must be a non-empty level"
+	case .Invalid_Prompt_Cache_Key:
+		return "prompt cache key must be a non-empty string"
+	case .Invalid_Prompt_Cache_Options:
+		return "prompt cache options need implicit/explicit mode and 30m ttl"
+	case .Invalid_Prompt_Cache_Retention:
+		return "prompt cache retention must be in_memory or 24h (deprecated)"
+	}
+	return "invalid provider request"
+}
+
+provider_take_failure_detail :: proc(state: ^Provider_Request_Stream_State) -> string {
+	detail := state.failure_detail
+	state.failure_detail = ""
+	return detail
+}
+
+provider_stream_error_text :: proc(err: Provider_Stream_Error) -> string {
+	switch err {
+	case .None:
+		return ""
+	case .Invalid_State:
+		return "invalid stream state"
+	case .Unsupported_API:
+		return "unsupported API family"
+	case .Invalid_JSON:
+		return "malformed provider stream JSON"
+	case .Malformed_Event:
+		return "malformed provider stream event"
+	case .Stream_Truncated:
+		return "stream ended before completion"
+	case .Tool_Limit:
+		return "provider tool call limit exceeded"
+	case .Batch_Not_Drained:
+		return "provider event batch was not drained"
+	}
+	return "provider stream error"
+}
+
+provider_emit_error :: proc(state: ^Provider_Request_Stream_State, kind: Provider_Error_Kind, detail: string) {
+	if state.failed { return }
+	state.failed = true
+	state.failure_detail = strings.clone(detail, state.allocator)
+	event: Provider_Event = Provider_Error_Event {
+		Kind    = kind,
+		Message = strings.clone(detail, state.allocator),
+	}
+	provider_deliver(state, event)
+}
+
+provider_deliver :: proc(state: ^Provider_Request_Stream_State, event: Provider_Event) {
+	if event == nil { return }
+	// Once cancellation is accepted, provisional output must not be committed:
+	// only the terminal error is delivered, so the caller learns why.
+	if interrupt_requested(state.interrupt) {
+		#partial switch _ in event {
+		case Provider_Error_Event:
+		case:
+			owned := event
+			Provider_Event_Destroy(&owned, state.allocator)
+			return
+		}
+	}
+	if state.callback != nil { state.callback(state.user_data, event) }
+	owned_event := event
+	Provider_Event_Destroy(&owned_event, state.allocator)
+}
+
+// One terminal event per operation: the first error or completion wins, later
+// repeats are destroyed without another callback.
+provider_accept_event :: proc(state: ^Provider_Request_Stream_State, event: Provider_Event) {
+	if event == nil { return }
+	#partial switch value in event {
+	case Provider_Error_Event:
+		if state.failed {
+			owned := event
+			Provider_Event_Destroy(&owned, state.allocator)
+			return
+		}
+		state.failed = true
+		if state.failure_detail == "" { state.failure_detail = strings.clone(value.Message, state.allocator) }
+		provider_deliver(state, event)
+	case Provider_Completed_Event:
+		if state.failed {
+			owned := event
+			Provider_Event_Destroy(&owned, state.allocator)
+			return
+		}
+		// Retain until the transport finishes cleanly; calls must not become
+		// executable while a later failure could still arrive.
+		if state.completion != nil { Provider_Event_Destroy(&state.completion, state.allocator) }
+		state.completion = event
+	case:
+		if state.failed {
+			owned := event
+			Provider_Event_Destroy(&owned, state.allocator)
+			return
+		}
+		provider_deliver(state, event)
+	}
+}
+
+provider_drain_events :: proc(state: ^Provider_Request_Stream_State) {
+	for {
+		event, ok := Provider_Stream_Drain(&state.stream)
+		if !ok { break }
+		provider_accept_event(state, event)
+	}
+}
+
+provider_sse_event :: proc(user_data: rawptr, event: SSE_Event) {
+	state := cast(^Provider_Request_Stream_State)user_data
+	if state.failed { return }
+	stream_err := Provider_Consume_SSE_Data(event.data, &state.stream)
+	provider_drain_events(state)
+	if stream_err != .None && !state.failed {
+		provider_emit_error(state, .Invalid_Data, provider_stream_error_text(stream_err))
+	}
+}
+
+provider_http_chunk :: proc(user_data: rawptr, chunk: []u8) {
+	state := cast(^Provider_Request_Stream_State)user_data
+	if state.failed { return }
+	if sse_parser_feed(&state.parser, chunk) != .None {
+		provider_emit_error(state, .Invalid_Data, "malformed SSE stream")
+	}
+}

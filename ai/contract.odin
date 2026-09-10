@@ -1,0 +1,416 @@
+package ai
+
+import "core:mem"
+import "core:strings"
+
+API_Kind :: enum {
+	Invalid,
+	OpenAI_Chat_Completions,
+	OpenAI_Responses,
+	Anthropic_Messages,
+}
+
+Provider_Connection :: struct {
+	API:        API_Kind,
+	Endpoint:   string,
+	Credential: string, // borrowed until operation retirement; secret,
+}
+
+Provider_Role :: enum {
+	Invalid,
+	System,
+	User,
+	Assistant,
+	Tool,
+	// Reasoning carries an opaque Responses reasoning item for replay. The
+	// content stays encrypted and unread; only id and encrypted_content are
+	// kept, which is what the endpoint needs to continue reasoning.
+	Reasoning,
+}
+
+Provider_Tool_Call :: struct {
+	ID:        string, // borrowed until operation retirement; Chat id / Responses call_id,
+	Item_ID:   string, // borrowed; Responses output-item id, empty for Chat,
+	Name:      string, // borrowed until operation retirement,
+	Arguments: string, // borrowed until operation retirement; raw JSON object,
+}
+
+Provider_Tool_Def :: struct {
+	Name:            string, // borrowed until operation retirement,
+	Description:     string, // borrowed until operation retirement,
+	Parameters_JSON: string, // borrowed until operation retirement,
+}
+
+Provider_Message :: struct {
+	Role:                Provider_Role,
+	Content:             string, // borrowed until operation retirement,
+	Tool_Call_ID:        string, // borrowed; set on .Tool results, matches a call ID,
+	Tool_Calls:          []Provider_Tool_Call, // borrowed; set on assistant messages that request calls,
+	Reasoning_ID:        string, // borrowed; set on .Reasoning, the output-item id,
+	Reasoning_Encrypted: string, // borrowed; set on .Reasoning when the endpoint supplied it,
+	Cache_Breakpoint:    bool, // when true, emit prompt_cache_breakpoint explicit on this message,
+}
+
+Prompt_Cache_Mode :: enum {
+	Invalid,
+	Implicit,
+	Explicit,
+}
+
+Prompt_Cache_Options :: struct {
+	Mode_Present: bool,
+	Mode:         Prompt_Cache_Mode,
+	TTL_Present:  bool,
+	TTL:          string, // borrowed; only "30m" per spec,
+}
+
+Provider_Request :: struct {
+	API:                            API_Kind,
+	Model_Present:                  bool,
+	Model:                          string,
+	Messages_Present:               bool,
+	Messages:                       []Provider_Message,
+	Tools:                          []Provider_Tool_Def, // borrowed; frozen for the whole turn,
+	Max_Output_Tokens_Present:      bool,
+	Max_Output_Tokens:              int,
+	// Reasoning effort is a verbatim level validated against the model's
+	// configured levels, never translated. Absent means provider default.
+	Reasoning_Effort_Present:       bool,
+	Reasoning_Effort:               string, // borrowed; valid only when present,
+	Prompt_Cache_Key_Present:       bool,
+	Prompt_Cache_Key:               string, // borrowed; optional routing/accounting hint,
+	Prompt_Cache_Options_Present:   bool,
+	Prompt_Cache_Options:           Prompt_Cache_Options,
+	Prompt_Cache_Retention_Present: bool,
+	Prompt_Cache_Retention:         string, // borrowed; deprecated, use options TTL,
+}
+
+Provider_Request_Error :: enum {
+	None,
+	Unsupported_API,
+	Missing_Model,
+	Missing_Messages,
+	Invalid_Message,
+	Invalid_Tools,
+	Invalid_Tool_Call,
+	Invalid_Max_Output_Tokens,
+	Invalid_Reasoning_Effort,
+	Invalid_Prompt_Cache_Key,
+	Invalid_Prompt_Cache_Options,
+	Invalid_Prompt_Cache_Retention,
+}
+
+Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request_Error {
+	if request.API != .OpenAI_Chat_Completions && request.API != .OpenAI_Responses { return .Unsupported_API }
+	if !request.Model_Present || request.Model == "" { return .Missing_Model }
+	if !request.Messages_Present || len(request.Messages) == 0 { return .Missing_Messages }
+	if request.Max_Output_Tokens_Present && request.Max_Output_Tokens <= 0 { return .Invalid_Max_Output_Tokens }
+	if request.Reasoning_Effort_Present && request.Reasoning_Effort == "" { return .Invalid_Reasoning_Effort }
+	if request.Prompt_Cache_Key_Present && request.Prompt_Cache_Key == "" { return .Invalid_Prompt_Cache_Key }
+	if request.Prompt_Cache_Options_Present {
+		if !request.Prompt_Cache_Options.Mode_Present && !request.Prompt_Cache_Options.TTL_Present { return .Invalid_Prompt_Cache_Options }
+		if request.Prompt_Cache_Options.Mode_Present && request.Prompt_Cache_Options.Mode == .Invalid { return .Invalid_Prompt_Cache_Options }
+		if request.Prompt_Cache_Options.TTL_Present && request.Prompt_Cache_Options.TTL != "30m" { return .Invalid_Prompt_Cache_Options }
+	}
+	if request.Prompt_Cache_Retention_Present &&
+	   request.Prompt_Cache_Retention != "in_memory" &&
+	   request.Prompt_Cache_Retention != "24h" { return .Invalid_Prompt_Cache_Retention }
+	for message in request.Messages {
+		if message.Role == .Invalid { return .Invalid_Message }
+		#partial switch message.Role {
+		case .Assistant:
+			if message.Content == "" && len(message.Tool_Calls) == 0 { return .Invalid_Message }
+		case .Tool:
+			if message.Tool_Call_ID == "" { return .Invalid_Message }
+		case .Reasoning:
+			if message.Reasoning_ID == "" { return .Invalid_Message }
+		case:
+			if message.Content == "" { return .Invalid_Message }
+		}
+		for call in message.Tool_Calls {
+			if call.ID == "" || call.Name == "" { return .Invalid_Tool_Call }
+		}
+	}
+	for tool in request.Tools {
+		if tool.Name == "" || tool.Parameters_JSON == "" { return .Invalid_Tools }
+	}
+	return .None
+}
+
+Provider_Finish_Reason :: enum {
+	Unknown,
+	Stop,
+	Length,
+	Content_Filter,
+	Tool_Call,
+}
+Provider_Error_Kind :: enum {
+	Invalid_Data,
+	Stream_Truncated,
+	API_Error,
+	Unsupported_Tool_Output,
+	// Cancelled and Timed_Out are distinct from stream defects: the response was
+	// interrupted on purpose, and its partial output is not authoritative.
+	Cancelled,
+	Timed_Out,
+	// TLS means the peer did not authenticate; it is never a usable response.
+	TLS,
+}
+
+Provider_Text_Event :: struct {
+	Text: string,
+} // owned by receiver
+// Reasoning items arrive as their own event so the session stores them in
+// wire order, interleaved with text and tool calls exactly as the endpoint
+// produced them. Both strings are owned by the receiver.
+Provider_Reasoning_Event :: struct {
+	ID:        string,
+	Encrypted: string,
+}
+Provider_Usage_Event :: struct {
+	Cached_Input_Tokens:         i64,
+	Cached_Input_Tokens_Present: bool,
+	Cache_Write_Tokens:          i64,
+	Cache_Write_Tokens_Present:  bool,
+	Input_Tokens:                i64,
+	Output_Tokens:               i64,
+	Total_Tokens:                i64,
+	Input_Tokens_Present:        bool,
+	Output_Tokens_Present:       bool,
+	Total_Tokens_Present:        bool,
+}
+Provider_Completed_Event :: struct {
+	Reason:      Provider_Finish_Reason,
+	Reason_Text: string, // owned by receiver,
+	Tool_Calls:  []Provider_Tool_Call, // owned by receiver; present when Reason == .Tool_Call,
+} // Tool_Calls owned by receiver
+Provider_Error_Event :: struct {
+	Kind:          Provider_Error_Kind,
+	Message:       string,
+	Provider_Code: string,
+} // strings owned by receiver
+Provider_Event :: union {
+	Provider_Text_Event,
+	Provider_Reasoning_Event,
+	Provider_Usage_Event,
+	Provider_Completed_Event,
+	Provider_Error_Event,
+}
+
+Provider_Event_Destroy :: proc(event: ^Provider_Event, allocator := context.allocator) {
+	if event == nil { return }
+	#partial switch value in event^ {
+	case Provider_Text_Event:
+		if value.Text != "" { delete(value.Text, allocator) }
+	case Provider_Reasoning_Event:
+		if value.ID != "" { delete(value.ID, allocator) }
+		if value.Encrypted != "" { delete(value.Encrypted, allocator) }
+	case Provider_Completed_Event:
+		if value.Reason_Text != "" { delete(value.Reason_Text, allocator) }
+		for call in value.Tool_Calls {
+			if call.ID != "" { delete(call.ID, allocator) }
+			if call.Item_ID != "" { delete(call.Item_ID, allocator) }
+			if call.Name != "" { delete(call.Name, allocator) }
+			if call.Arguments != "" { delete(call.Arguments, allocator) }
+		}
+		if value.Tool_Calls != nil { delete(value.Tool_Calls, allocator) }
+	case Provider_Error_Event:
+		if value.Message != "" { delete(value.Message, allocator) }
+		if value.Provider_Code != "" { delete(value.Provider_Code, allocator) }
+	}
+	event^ = nil
+}
+
+Provider_Stream_Phase :: enum {
+	Open,
+	Completed,
+	Done,
+	Failed,
+}
+
+// One payload can carry text, usage, and completion together. Three slots are
+// enough for the current event set; tool calls stay inside completion.
+PROVIDER_STREAM_BATCH_SLOTS :: 3
+Provider_Stream_State :: struct {
+	API:            API_Kind,
+	Phase:          Provider_Stream_Phase,
+	Tool_Fragments: [dynamic]Provider_Tool_Fragment, // owned assembly slots,
+	Allocator:      mem.Allocator,
+	// Operation-owned staging for one decoded payload. Drained before the
+	// next payload is consumed; undrained events are destroyed with the
+	// stream.
+	Batch:          [PROVIDER_STREAM_BATCH_SLOTS]Provider_Event,
+	Batch_Count:    int,
+}
+
+Provider_Tool_Fragment :: struct {
+	Present:            bool,
+	Complete:           bool, // full arguments validated once (Responses done event),
+	Item_ID:            string, // owned,
+	ID:                 string, // owned; Chat id / Responses call_id,
+	Name:               string, // owned,
+	Arguments:          [dynamic]u8, // owned raw bytes,
+	Wire_Index:         i64,
+	Wire_Index_Present: bool,
+}
+
+PROVIDER_MAX_TOOL_CALLS :: 8
+PROVIDER_MAX_TOOL_ARGS_BYTES :: 64 * 1024
+
+Provider_Stream_Start :: proc(api: API_Kind, allocator := context.allocator) -> Provider_Stream_State {
+	return {API = api, Phase = .Open, Allocator = allocator}
+}
+
+provider_stream_batch_clear :: proc(state: ^Provider_Stream_State) {
+	for i in 0 ..< state.Batch_Count { Provider_Event_Destroy(&state.Batch[i], state.Allocator) }
+	state.Batch_Count = 0
+	for i in 0 ..< PROVIDER_STREAM_BATCH_SLOTS { state.Batch[i] = nil }
+}
+
+provider_stream_push :: proc(state: ^Provider_Stream_State, event: Provider_Event) {
+	assert(state.Batch_Count < PROVIDER_STREAM_BATCH_SLOTS, "provider event batch overflow")
+	if state.Batch_Count >= PROVIDER_STREAM_BATCH_SLOTS {
+		owned := event
+		Provider_Event_Destroy(&owned, state.Allocator)
+		return
+	}
+	state.Batch[state.Batch_Count] = event
+	state.Batch_Count += 1
+}
+
+// Discard staged success events and expose one error. A malformed payload
+// never leaves a partial batch behind.
+provider_stream_fail :: proc(
+	state: ^Provider_Stream_State,
+	kind: Provider_Error_Kind,
+	message: string,
+	stream_err := Provider_Stream_Error.Malformed_Event,
+	code := "",
+) -> Provider_Stream_Error {
+	provider_stream_batch_clear(state)
+	provider_stream_push(state, openai_error_event(kind, message, code, state.Allocator))
+	state.Phase = .Failed
+	return stream_err
+}
+
+// Transfers one owned event to the caller and clears its slot.
+Provider_Stream_Drain :: proc(state: ^Provider_Stream_State) -> (Provider_Event, bool) {
+	if state == nil || state.Batch_Count <= 0 { return nil, false }
+	event := state.Batch[0]
+	for i in 0 ..< state.Batch_Count - 1 { state.Batch[i] = state.Batch[i + 1] }
+	state.Batch_Count -= 1
+	state.Batch[state.Batch_Count] = nil
+	return event, true
+}
+
+Provider_Stream_Destroy :: proc(state: ^Provider_Stream_State) {
+	if state == nil { return }
+	provider_stream_batch_clear(state)
+	for &fragment in state.Tool_Fragments {
+		if fragment.Item_ID != "" { delete(fragment.Item_ID, state.Allocator) }
+		if fragment.ID != "" { delete(fragment.ID, state.Allocator) }
+		if fragment.Name != "" { delete(fragment.Name, state.Allocator) }
+		if fragment.Arguments != nil { delete(fragment.Arguments) }
+	}
+	delete(state.Tool_Fragments)
+	state.Tool_Fragments = nil
+}
+
+provider_tool_fragments_present :: proc(state: ^Provider_Stream_State) -> bool {
+	for &fragment in state.Tool_Fragments {
+		if fragment.Present { return true }
+	}
+	return false
+}
+
+provider_tool_fragment :: proc(state: ^Provider_Stream_State, index: int) -> (fragment: ^Provider_Tool_Fragment, ok: bool) {
+	if index < 0 || index >= PROVIDER_MAX_TOOL_CALLS { return nil, false }
+	for len(state.Tool_Fragments) <= index {
+		fragment := Provider_Tool_Fragment {
+			Arguments = make([dynamic]u8, 0, state.Allocator),
+		}
+		append(&state.Tool_Fragments, fragment)
+	}
+	return &state.Tool_Fragments[index], true
+}
+
+provider_tool_call_count :: proc(state: ^Provider_Stream_State) -> int {
+	count := 0
+	for &fragment in state.Tool_Fragments {
+		if fragment.Present { count += 1 }
+	}
+	return count
+}
+
+provider_tool_finalize :: proc(state: ^Provider_Stream_State, allocator := context.allocator) -> ([]Provider_Tool_Call, bool) {
+	count := 0
+	for &fragment in state.Tool_Fragments {
+		if !fragment.Present { continue }
+		count += 1
+		if fragment.ID == "" || fragment.Name == "" { return nil, false }
+		if len(fragment.Arguments) == 0 || len(fragment.Arguments) > PROVIDER_MAX_TOOL_ARGS_BYTES { return nil, false }
+		if !openai_tool_args_valid(fragment.Arguments[:]) { return nil, false }
+		for &other in state.Tool_Fragments {
+			if &other == &fragment || !other.Present { continue }
+			if other.ID != "" && other.ID == fragment.ID { return nil, false }
+		}
+	}
+	if count == 0 || count > PROVIDER_MAX_TOOL_CALLS { return nil, false }
+	calls := make([]Provider_Tool_Call, count, allocator)
+	i := 0
+	for &fragment in state.Tool_Fragments {
+		if !fragment.Present { continue }
+		calls[i] = Provider_Tool_Call {
+			ID        = strings.clone(fragment.ID, allocator),
+			Item_ID   = strings.clone(fragment.Item_ID, allocator),
+			Name      = strings.clone(fragment.Name, allocator),
+			Arguments = strings.clone(string(fragment.Arguments[:]), allocator),
+		}
+		i += 1
+	}
+	return calls, true
+}
+Provider_Stream_Error :: enum {
+	None,
+	Invalid_State,
+	Unsupported_API,
+	Invalid_JSON,
+	Malformed_Event,
+	Stream_Truncated,
+	Tool_Limit,
+	Batch_Not_Drained,
+}
+
+Provider_Encode_Request :: proc(request: Provider_Request, allocator := context.allocator) -> (string, Provider_Request_Error) {
+	if request.API == .OpenAI_Chat_Completions { return openai_chat_encode_request(request, allocator) }
+	if request.API == .OpenAI_Responses { return openai_responses_encode_request(request, allocator) }
+	return "", .Unsupported_API
+}
+
+Provider_Consume_SSE_Data :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
+	if state == nil { return .Invalid_State }
+	if state^.Batch_Count > 0 { return .Batch_Not_Drained }
+	if state^.API == .OpenAI_Chat_Completions { return openai_chat_consume_sse_data(payload, state) }
+	if state^.API == .OpenAI_Responses { return openai_responses_consume_sse_data(payload, state) }
+	state^.Phase = .Failed
+	return provider_stream_fail(state, .Invalid_Data, "unsupported API family", .Unsupported_API)
+}
+
+// EOF is authoritative when a terminal event was already decoded. Some proxies
+// close the stream without the `[DONE]` sentinel, and the Responses API never
+// sends one. A still-open stream is truncation, not success.
+Provider_Stream_Finish :: proc(state: ^Provider_Stream_State) -> Provider_Stream_Error {
+	if state == nil { return .Invalid_State }
+	switch state^.Phase {
+	case .Completed:
+		state^.Phase = .Done
+		return .None
+	case .Done:
+		return .None
+	case .Open:
+		return provider_stream_fail(state, .Stream_Truncated, "stream ended before completion", .Stream_Truncated)
+	case .Failed:
+		return .None
+	}
+	return .Invalid_State
+}
