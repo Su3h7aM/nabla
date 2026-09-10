@@ -23,7 +23,7 @@ import "core:fmt"
 import "core:os"
 import input "nabla:input"
 import "nabla:layout"
-import "nabla:tty"
+import "nabla:term"
 
 // State is the app state the input loop drives and panels.render reads.
 // main owns it (input updates it); panels.odin only reads it. selected is
@@ -53,14 +53,14 @@ Render_Error :: enum u8 {
 main :: proc() {
 	// The cursor stays visible so Cursor_Intent.Position is demonstrable:
 	// it follows the selected row (panels.render returns it each frame).
-	session, open_err := tty.open({alternate_screen = true, input_mode = .Raw})
+	session, open_err := term.open({alternate_screen = true, input_mode = .Raw})
 	if open_err != nil {
 		fmt.eprintln("dashboard: open:", open_err)
 		os.exit(1)
 	}
-	defer { _ = tty.close(session) }
+	defer { _ = term.close(session) }
 
-	tty_file, file_err := tty.session_file(session)
+	tty, file_err := term.session_file(session)
 	if file_err != nil {
 		fmt.eprintln("dashboard: session file:", file_err)
 		os.exit(1)
@@ -76,13 +76,13 @@ main :: proc() {
 	defer free(storage)
 
 	// The input read blocks up to RESIZE_POLL_MS, so a terminal resize is
-	// noticed without a keypress: the tty package's SIGWINCH handler
+	// noticed without a keypress: the term package's SIGWINCH handler
 	// flags it, and this loop re-reads the viewport on every wake. The frame
 	// re-renders only when something changed (input arrived or the size
 	// moved), so an idle terminal does not redraw.
 	last_columns, last_rows := -1, -1
 	for {
-		count, read_err := input.read_events(&parser, tty_file, &events, RESIZE_POLL_MS)
+		count, read_err := input.read_events(&parser, tty, &events, RESIZE_POLL_MS)
 		if read_err != nil {
 			fmt.eprintln("dashboard: input:", read_err)
 			break
@@ -114,7 +114,7 @@ main :: proc() {
 		}
 		clear(&events)
 
-		viewport, vp_err := tty.viewport(session)
+		viewport, vp_err := term.viewport(session)
 		if vp_err != nil {
 			fmt.eprintln("dashboard: viewport:", vp_err)
 			break
@@ -123,7 +123,7 @@ main :: proc() {
 			frame, cursor, render_err := render(&state, layout.Vec2{layout.Scalar(viewport.columns), layout.Scalar(viewport.rows)}, storage)
 			if render_err != .None {
 				fmt.eprintln("dashboard: render:", render_err)
-			} else if _, _, present_err := tty.present(session, frame, tty.profile_default(), cursor, storage.output[:]); present_err != nil {
+			} else if _, _, present_err := term.present(session, frame, term.profile_default(), cursor, storage.output[:]); present_err != nil {
 				fmt.eprintln("dashboard: present:", present_err)
 				break
 			}

@@ -17,8 +17,8 @@ package main
 
 import "core:fmt"
 import "nabla:layout"
+import "nabla:term"
 import "nabla:text"
-import "nabla:tty"
 import "nabla:tui"
 
 // The dashboard model: a sidebar of selectable files, a feature showcase,
@@ -103,7 +103,7 @@ Render_Storage :: struct {
 	measure_context: tui.ASCII_Measure_Context,
 	status_scratch:  [64]byte,
 	cells:           [16384]tui.Cell,
-	frame_cells:     [16384]tty.Cell,
+	frame_cells:     [16384]term.Cell,
 	buffer:          tui.Cell_Buffer,
 	// output is the reusable presentation scratch: 16384 logical cells at
 	// the worst-case ~66 serialized bytes per cell (reset + six modifier
@@ -123,7 +123,7 @@ Render_Storage :: struct {
 // cursor reports where the terminal cursor should sit after the frame: a
 // Position on the selected item's row (0-based; present emits it 1-based),
 // or unspecified (nil) when nothing is selected.
-render :: proc(state: ^State, viewport: layout.Vec2, storage: ^Render_Storage) -> (frame: tty.Frame_Buffer, cursor: tty.Cursor_Intent, err: Render_Error) {
+render :: proc(state: ^State, viewport: layout.Vec2, storage: ^Render_Storage) -> (frame: term.Frame_Buffer, cursor: term.Cursor_Intent, err: Render_Error) {
 	columns := int(viewport[0])
 	rows := int(viewport[1])
 	if viewport[0] < 0 || viewport[1] < 0 || layout.Scalar(columns) != viewport[0] || layout.Scalar(rows) != viewport[1] {
@@ -207,7 +207,7 @@ render :: proc(state: ^State, viewport: layout.Vec2, storage: ^Render_Storage) -
 		if item, found := layout.lookup(frame_result, layout.id_index("item", u64(idx))); found {
 			pos := item.outer.position
 			if layout.Scalar(int(pos.x)) == pos.x && layout.Scalar(int(pos.y)) == pos.y {
-				cursor = tty.Position {
+				cursor = term.Position {
 					x = int(pos.x),
 					y = int(pos.y),
 				}

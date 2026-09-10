@@ -4,7 +4,7 @@ package tui
 // Graphemes point into caller-owned text (draw_ascii stores slices of the
 // drawn string) and must stay valid until the frame is presented; an empty
 // grapheme means a blank cell, matching the terminal cell contract. The
-// logical buffer is the sole owner of this shape — tty.Cell is the
+// logical buffer is the sole owner of this shape — term.Cell is the
 // terminal-facing projection.
 Cell :: struct {
 	grapheme: string,

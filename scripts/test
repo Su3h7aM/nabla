@@ -81,7 +81,7 @@ for h in "${harnesses[@]}"; do
 	nabla_step "harness $h"
 	ran_harnesses=$((ran_harnesses + 1))
 	if ! timeout --foreground "$TEST_TIMEOUT_SECONDS" \
-		odin run "./$h" "${collections[@]}" -define:NABLA_TTY_TEST_HOOKS=true; then
+		odin run "./$h" "${collections[@]}" -define:NABLA_TERM_TEST_HOOKS=true; then
 		failed+=("$h")
 	fi
 done

@@ -2,8 +2,8 @@
 package main
 
 import "nabla:layout"
+import "nabla:term"
 import "nabla:text"
-import "nabla:tty"
 import "nabla:tui"
 
 test_init_fills_with_blanks :: proc(t: ^T) {
@@ -232,15 +232,15 @@ test_style_maps_to_the_terminal_vocabulary :: proc(t: ^T) {
 		modifiers  = {.Bold, .Underline},
 	}
 	mapped := tui.presentation_style(style)
-	expect_value(t, mapped.foreground, tty.Color(tty.RGB_Color{10, 20, 30}))
-	expect_value(t, mapped.background, tty.Color(tty.Indexed_Color(7)))
-	expect_value(t, mapped.modifiers, tty.Modifiers{.Bold, .Underline})
+	expect_value(t, mapped.foreground, term.Color(term.RGB_Color{10, 20, 30}))
+	expect_value(t, mapped.background, term.Color(term.Indexed_Color(7)))
+	expect_value(t, mapped.modifiers, term.Modifiers{.Bold, .Underline})
 }
 
 test_every_modifier_maps_to_a_distinct_counterpart :: proc(t: ^T) {
 	// A collision here would mean two tui modifiers collapse into one terminal
 	// modifier, which the total mapping exists to prevent.
-	seen: tty.Modifiers
+	seen: term.Modifiers
 	for modifier in tui.Modifier {
 		mapped := tui.presentation_modifier(modifier)
 		expect(t, mapped not_in seen, "modifiers must map one to one")
@@ -251,8 +251,8 @@ test_every_modifier_maps_to_a_distinct_counterpart :: proc(t: ^T) {
 test_unset_and_default_colors_are_distinguished :: proc(t: ^T) {
 	// nil means "inherit whatever is there"; tui.Default_Color means "reset to the
 	// terminal default". Collapsing them would lose an authored reset.
-	expect_value(t, tui.presentation_color(nil), tty.Color(nil))
-	expect_value(t, tui.presentation_color(tui.Default_Color{}), tty.Color(tty.Default_Color{}))
+	expect_value(t, tui.presentation_color(nil), term.Color(nil))
+	expect_value(t, tui.presentation_color(tui.Default_Color{}), term.Color(term.Default_Color{}))
 }
 
 test_build_frame_is_a_full_redraw :: proc(t: ^T) {
@@ -261,7 +261,7 @@ test_build_frame_is_a_full_redraw :: proc(t: ^T) {
 	_ = tui.init(&buffer, 3, 2, storage[:])
 	tui.put(&buffer, 1, 1, {grapheme = "x"})
 
-	cells: [8]tty.Cell
+	cells: [8]term.Cell
 	frame, ok := tui.build_frame(buffer, cells[:])
 	expect(t, ok, "build_frame must succeed with sufficient storage")
 	expect_value(t, frame.columns, 3)
@@ -276,7 +276,7 @@ test_build_frame_refuses_undersized_storage :: proc(t: ^T) {
 	buffer: tui.Cell_Buffer
 	_ = tui.init(&buffer, 3, 2, storage[:])
 
-	cells: [4]tty.Cell
+	cells: [4]term.Cell
 	_, ok := tui.build_frame(buffer, cells[:])
 	expect(t, !ok, "undersized storage must be refused")
 }
@@ -288,7 +288,7 @@ test_build_frame_rejects_malformed_buffers_without_writing :: proc(t: ^T) {
 		height = 2,
 		cells  = logical_cells[:],
 	}
-	terminal_cells := [?]tty.Cell{{grapheme = "kept", width = 1}, {}, {}, {}}
+	terminal_cells := [?]term.Cell{{grapheme = "kept", width = 1}, {}, {}, {}}
 	original := terminal_cells
 
 	_, ok := tui.build_frame(buffer, terminal_cells[:])

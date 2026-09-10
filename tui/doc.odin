@@ -18,5 +18,5 @@
 // Layout owns geometry and renderer-neutral commands. TUI owns projection,
 // clipping into terminal cells, command composition, and durable interaction
 // facts keyed by layout.Id. Terminal I/O occurs only when the caller passes a
-// completed frame to tty.present.
+// completed frame to term.present.
 package tui

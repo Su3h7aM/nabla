@@ -3,7 +3,7 @@ package main
 // Compile-only example of the core TUI storage and full-frame call shape.
 // The caller owns render cadence and all reusable storage.
 
-import "nabla:tty"
+import "nabla:term"
 import "nabla:tui"
 
 main :: proc() {
@@ -15,13 +15,13 @@ main :: proc() {
 
 	_ = tui.put(&buffer, 0, 0, tui.Cell{grapheme = "N"})
 
-	terminal_storage: [80 * 24]tty.Cell
+	terminal_storage: [80 * 24]term.Cell
 	frame, frame_ok := tui.build_frame(buffer, terminal_storage[:])
 	if !frame_ok {
 		return
 	}
 
-	// A real application passes frame to tty.present after opening a
+	// A real application passes frame to term.present after opening a
 	// session and providing reusable output scratch. No package retains it.
 	_ = frame
 

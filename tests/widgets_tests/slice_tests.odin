@@ -3,7 +3,7 @@ package main
 
 import input "nabla:input"
 import "nabla:layout"
-import "nabla:tty"
+import "nabla:term"
 import "nabla:tui"
 import "nabla:widgets"
 
@@ -92,7 +92,7 @@ Render_Storage :: struct {
 	layout_storage:  [SLICE_STORAGE_BYTES]byte,
 	measure_context: tui.ASCII_Measure_Context,
 	cells:           [512]tui.Cell,
-	frame_cells:     [400]tty.Cell,
+	frame_cells:     [400]term.Cell,
 	buffer:          tui.Cell_Buffer,
 }
 
@@ -114,7 +114,7 @@ Render_Error :: enum u8 {
 // The context is re-initialized on every call: `init_from_buffer` refuses a context
 // that is already initialized, and the fixed storage belongs to the caller, so
 // destroy is the no-op reset that makes reuse sound.
-render :: proc(app: App, storage: ^Render_Storage) -> (frame: tty.Frame_Buffer, err: Render_Error) {
+render :: proc(app: App, storage: ^Render_Storage) -> (frame: term.Frame_Buffer, err: Render_Error) {
 	config := layout.Options {
 		capacities = SLICE_CAPACITIES,
 	}
@@ -177,7 +177,7 @@ render :: proc(app: App, storage: ^Render_Storage) -> (frame: tty.Frame_Buffer, 
 }
 
 // expect_frames_equal compares two rendered frames field by field.
-expect_frames_equal :: proc(t: ^T, first, second: tty.Frame_Buffer) {
+expect_frames_equal :: proc(t: ^T, first, second: term.Frame_Buffer) {
 	expect_value(t, second.columns, first.columns)
 	expect_value(t, second.rows, first.rows)
 	expect_value(t, len(second.cells), len(first.cells))
@@ -191,13 +191,13 @@ expect_frames_equal :: proc(t: ^T, first, second: tty.Frame_Buffer) {
 // what keeps the boundary testable without a tty. The output scratch is a
 // fixed reusable buffer; the only test path that reaches present passes a
 // closed session, so the scratch never actually fills.
-present_frame :: proc(session: ^tty.Session, app: App, storage: ^Render_Storage) -> (Render_Error, tty.Error) {
+present_frame :: proc(session: ^term.Session, app: App, storage: ^Render_Storage) -> (Render_Error, term.Error) {
 	frame, render_error := render(app, storage)
 	if render_error != nil {
 		return render_error, nil
 	}
 	output: [4096]byte
-	_, _, present_error := tty.present(session, frame, tty.profile_default(), {}, output[:])
+	_, _, present_error := term.present(session, frame, term.profile_default(), {}, output[:])
 	return .None, present_error
 }
 
@@ -399,11 +399,11 @@ test_presenting_to_a_closed_session_reports_and_draws_nothing :: proc(t: ^T) {
 	// package's own serialization fixtures (present_test.odin) — the slice's
 	// render output is deterministic (test_two_identical_renders...), and
 	// render never sees a session.
-	session: tty.Session
+	session: term.Session
 
 	app := DEFAULT_APP
 	storage: Render_Storage
 	render_error, present_error := present_frame(&session, app, &storage)
 	expect_value(t, render_error, Render_Error.None)
-	expect(t, present_error == tty.General_Error.Not_Open, "expected not-open error")
+	expect(t, present_error == term.General_Error.Not_Open, "expected not-open error")
 }

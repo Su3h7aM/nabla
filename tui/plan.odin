@@ -1,10 +1,10 @@
 package tui
 
-import "nabla:tty"
+import "nabla:term"
 
 // Presentation planning (§3.5 of the frozen API target). plan_presentation
 // compares the current logical buffer with the previous one and produces a
-// borrowed []tty.Presentation_Op stream that terminal validates,
+// borrowed []term.Presentation_Op stream that terminal validates,
 // encodes, and transports. Changed-line spans with one buffered write are the
 // first optimization; scroll-region and cost-minimized cursor movement come
 // only after measurement (§6.8).
@@ -36,11 +36,11 @@ Presentation_Error :: enum u8 {
 plan_presentation :: proc(
 	current: Cell_Buffer,
 	previous: Maybe(Cell_Buffer),
-	profile: tty.Target_Profile,
-	capabilities: tty.Capabilities,
-	out: []tty.Presentation_Op,
+	profile: term.Target_Profile,
+	capabilities: term.Capabilities,
+	out: []term.Presentation_Op,
 ) -> (
-	ops: []tty.Presentation_Op,
+	ops: []term.Presentation_Op,
 	required: int,
 	full_redraw: bool,
 	err: Presentation_Error,
@@ -84,13 +84,13 @@ plan_presentation :: proc(
 // mode counts the exact operation count without touching out, so the
 // required-size contract and the emit pass share one walk.
 _Op_Plan :: struct {
-	out:        []tty.Presentation_Op,
+	out:        []term.Presentation_Op,
 	pos:        int,
 	count_only: bool,
 	overflowed: bool,
 }
 
-_plan_op :: proc(p: ^_Op_Plan, op: tty.Presentation_Op) {
+_plan_op :: proc(p: ^_Op_Plan, op: term.Presentation_Op) {
 	if p.count_only {
 		p.pos += 1
 		return
@@ -139,11 +139,11 @@ _plan_operations :: proc(p: ^_Op_Plan, current, prev: Cell_Buffer, full_redraw: 
 	if full_redraw {
 		// Establish the SGR baseline, mirroring the full-frame path's
 		// opening reset: an external write may have left attributes set.
-		_plan_op(p, tty.Set_Style_Op{})
+		_plan_op(p, term.Set_Style_Op{})
 	}
 
 	cursor_known := false
-	cursor: tty.Position
+	cursor: term.Position
 	style: Style
 
 	last_row := current.height - 1
@@ -187,25 +187,25 @@ _plan_operations :: proc(p: ^_Op_Plan, current, prev: Cell_Buffer, full_redraw: 
 				x += 1
 			}
 
-			position := tty.Position {
+			position := term.Position {
 				x = run_start,
 				y = y,
 			}
 			if !cursor_known || cursor != position {
-				_plan_op(p, tty.Move_Cursor_Op{position = position})
+				_plan_op(p, term.Move_Cursor_Op{position = position})
 				cursor = position
 				cursor_known = true
 			}
 			if style != run_style {
-				_plan_op(p, tty.Set_Style_Op{style = presentation_style(run_style)})
+				_plan_op(p, term.Set_Style_Op{style = presentation_style(run_style)})
 				style = run_style
 			}
 			if blank {
-				_plan_op(p, tty.Erase_Cells_Op{count = x - run_start})
+				_plan_op(p, term.Erase_Cells_Op{count = x - run_start})
 				// ECH leaves the cursor at the run start.
 			} else {
 				for i in run_start ..< x {
-					_plan_op(p, tty.Write_Grapheme_Op{grapheme = current.cells[y * current.width + i].grapheme, width = 1})
+					_plan_op(p, term.Write_Grapheme_Op{grapheme = current.cells[y * current.width + i].grapheme, width = 1})
 					cursor.x += 1
 				}
 			}

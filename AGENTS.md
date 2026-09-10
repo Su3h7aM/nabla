@@ -2,7 +2,7 @@
 
 A monorepo with two halves that share one philosophy:
 
-- **Foundation** — `text`, `input`, `tty`, `layout`, `tui`, `widgets`. Reusable by any Odin
+- **Foundation** — `text`, `input`, `term`, `layout`, `tui`, `widgets`. Reusable by any Odin
   program: the terminal, layout, and text stack knows nothing about models, agents, or HTTP.
 - **Harness** — `agent`, `ai`, `httpclient`, `acp`, and the `cmd/nabla` executable. A coding
   agent built on top of it.
@@ -33,12 +33,14 @@ Dependencies point inward, from the harness toward the foundation.
 - Only `cmd/nabla`, `examples/`, `tests/`, and `demo/` may import both the foundation and
   `agent`. A foundation package that needs something from the harness has the dependency
   backwards.
-- No package that uses `core:testing` may import `tty`: Odin requires package names to be
-  unique per compilation and `core:testing` transitively imports `core:terminal`. Test suites
-  that need `tty` run as external executables under `tests/`.
 
 Keep each package buildable, testable, and green on its own. That property is what makes the
 foundation reusable and the harness replaceable.
+
+Some suites are written against a package-local assertion harness rather than `core:testing`'s
+`@(test)` declarations, so `odin test` on those packages would compile them and report success
+while running nothing. They run as external executables under `tests/` instead, which is why
+`scripts/_lib.sh` names them in `NABLA_HARNESS_TEST_PACKAGES`.
 
 The harness stays presentation-free: `agent` produces data and writes to a caller-supplied
 `io.Writer`. The presentation stack stays agent-free. Long term the TUI should reach the

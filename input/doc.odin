@@ -1,5 +1,5 @@
 // A byte-to-event input package: acquisition and normalization of
-// terminal input, independent of the tty package (sibling core-style
+// terminal input, independent of the term package (sibling core-style
 // package).
 //
 // Three-layer seam (the acquisition and normalization split):

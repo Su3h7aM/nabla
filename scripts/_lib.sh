@@ -25,10 +25,10 @@ readonly NABLA_SERIAL_TEST_PACKAGES="agent ai"
 # `odin test`. Their test files are written against a bespoke assertion harness
 # (no `@(test)` declarations, a package-local `run_tests` entry), so `odin test`
 # would compile the package and report success while running nothing.
-readonly NABLA_HARNESS_TEST_PACKAGES="tty"
+readonly NABLA_HARNESS_TEST_PACKAGES="term"
 
 # Library packages, in dependency order, with sub-packages reported by their
-# relative path so `odin check ./tty/ansi` works unchanged.
+# relative path so `odin check ./term/ansi` works unchanged.
 nabla_packages() {
 	local d sub base
 	for d in "$NABLA_ROOT"/*/; do

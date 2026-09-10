@@ -3,7 +3,7 @@
 A terminal layout and presentation stack, and a coding agent harness built on it — one Odin
 monorepo.
 
-The foundation (`text`, `input`, `tty`, `layout`, `tui`, `widgets`) is reusable by any Odin
+The foundation (`text`, `input`, `term`, `layout`, `tui`, `widgets`) is reusable by any Odin
 program and knows nothing about models or agents. The harness (`agent`, `ai`, `httpclient`,
 `acp`) depends on it, never the reverse. See [AGENTS.md](AGENTS.md) for the philosophy and
 the package boundaries.

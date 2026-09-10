@@ -5,7 +5,7 @@ import "core:fmt"
 import "core:os"
 import input "nabla:input"
 import "nabla:layout"
-import "nabla:tty"
+import "nabla:term"
 import "nabla:tui"
 import widgets "nabla:widgets"
 
@@ -45,7 +45,7 @@ Render_Storage :: struct {
 	previous_cells:  [4096]tui.Cell,
 	buffer:          tui.Cell_Buffer,
 	previous:        tui.Cell_Buffer,
-	ops:             [MAX_PLAN_OPS]tty.Presentation_Op,
+	ops:             [MAX_PLAN_OPS]term.Presentation_Op,
 	output:          [270336]byte,
 	first_frame:     bool,
 	needs_redraw:    bool,
@@ -155,7 +155,7 @@ render :: proc(app: ^App, storage: ^Render_Storage) -> Render_Error {
 // leaves terminal state unspecified, and a later successful full frame is
 // the recovery contract. After a successful present, the current buffer
 // becomes the previous buffer for the next diff.
-present_frame :: proc(session: ^tty.Session, app: ^App, storage: ^Render_Storage) -> (render_err: Render_Error, present_err: tty.Error) {
+present_frame :: proc(session: ^term.Session, app: ^App, storage: ^Render_Storage) -> (render_err: Render_Error, present_err: term.Error) {
 	if err := render(app, storage); err != .None {
 		return err, nil
 	}
@@ -163,7 +163,7 @@ present_frame :: proc(session: ^tty.Session, app: ^App, storage: ^Render_Storage
 	if !storage.first_frame && !storage.needs_redraw {
 		previous = Maybe(tui.Cell_Buffer)(storage.previous)
 	}
-	ops, _, _, plan_err := tui.plan_presentation(storage.buffer, previous, tty.profile_default(), tty.Capabilities{}, storage.ops[:])
+	ops, _, _, plan_err := tui.plan_presentation(storage.buffer, previous, term.profile_default(), term.Capabilities{}, storage.ops[:])
 	switch plan_err {
 	case .None:
 	// The planner always fits: ops is sized for the worst-case per-cell
@@ -173,7 +173,7 @@ present_frame :: proc(session: ^tty.Session, app: ^App, storage: ^Render_Storage
 	case .Invalid_Buffer, .Unsupported:
 		return .Layout_Failed, nil
 	}
-	_, _, present_error := tty.present_operations(session, ops, tty.profile_default(), storage.output[:])
+	_, _, present_error := term.present_operations(session, ops, term.profile_default(), storage.output[:])
 	if present_error != nil {
 		// Terminal contents and cursor state are unspecified after a failed
 		// write; the next frame must be a complete redraw.
@@ -216,14 +216,14 @@ handle :: proc(app: ^App, event: input.Event) {
 }
 
 main :: proc() {
-	session, open_err := tty.open({alternate_screen = true, hide_cursor = true, input_mode = .Raw})
+	session, open_err := term.open({alternate_screen = true, hide_cursor = true, input_mode = .Raw})
 	if open_err != nil {
 		fmt.eprintln("demo: open failed:", open_err)
 		os.exit(1)
 	}
-	defer { _ = tty.close(session) }
+	defer { _ = term.close(session) }
 
-	tty_file, file_err := tty.session_file(session)
+	tty, file_err := term.session_file(session)
 	if file_err != nil {
 		fmt.eprintln("demo: session file:", file_err)
 		os.exit(1)
@@ -240,7 +240,7 @@ main :: proc() {
 	defer free(storage)
 
 	for !app.quit {
-		viewport, vp_err := tty.viewport(session)
+		viewport, vp_err := term.viewport(session)
 		if vp_err != nil {
 			fmt.eprintln("demo: viewport:", vp_err)
 			break
@@ -255,7 +255,7 @@ main :: proc() {
 			break
 		}
 
-		_, read_err := input.read_events(&parser, tty_file, &events, -1)
+		_, read_err := input.read_events(&parser, tty, &events, -1)
 		if read_err != nil {
 			fmt.eprintln("demo: read:", read_err)
 			break
