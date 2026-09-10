@@ -11,7 +11,7 @@ cd "$NABLA_ROOT"
 target="${usage_package:-${1:-}}"
 
 mapfile -t flags < <(nabla_vet_flags)
-mapfile -t packages < <(nabla_packages)
+mapfile -t packages < <(nabla_check_packages)
 [[ -n "$target" ]] && packages=("$target")
 
 failed=()

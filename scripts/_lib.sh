@@ -47,6 +47,7 @@ nabla_packages() {
 
 # Packages carrying in-package test files, and therefore `odin test` targets.
 # The glob covers both spellings in the tree (`*_test.odin`, `*_tests.odin`).
+# A package main can be tested too: the test runner does not call main.
 nabla_test_packages() {
 	local pkg
 	while IFS= read -r pkg; do
@@ -56,7 +57,15 @@ nabla_test_packages() {
 			*" $pkg "*) continue ;;
 		esac
 		printf '%s\n' "$pkg"
-	done < <(nabla_packages)
+	done < <(nabla_check_packages)
+}
+
+# Everything owned that has a package clause: the libraries plus every
+# executable. `odin check` covers all of them; only libraries build as shared
+# objects, and only some carry in-package suites.
+nabla_check_packages() {
+	nabla_packages
+	nabla_executables
 }
 
 # External test executables under tests/. These exist because a package name
