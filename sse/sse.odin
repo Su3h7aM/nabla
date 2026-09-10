@@ -21,6 +21,9 @@ MAX_RETRY_MS :: 24 * 60 * 60 * 1000
 // One worst-case line must always fit the event budget it accumulates into.
 #assert(MAX_LINE_BYTES < MAX_EVENT_BYTES)
 
+// DEFAULT_EVENT_TYPE is the type an event has when its block named none.
+DEFAULT_EVENT_TYPE :: "message"
+
 // Event is one dispatched event. The format's event type buffer defaults to
 // "message"; id is the stream's last event ID, which persists across events;
 // retry_ms is the reconnection time currently in force.
@@ -321,7 +324,7 @@ parser_dispatch :: proc(parser: ^Parser) -> Error {
 	// the event's data.
 	if len(data) > 0 && data[len(data) - 1] == '\n' { data = data[:len(data) - 1] }
 
-	event_type := "message"
+	event_type := DEFAULT_EVENT_TYPE
 	if len(parser.event_type) > 0 { event_type = string(parser.event_type[:]) }
 
 	// retry_ms is not reset here. The reconnection time is stream state, not
