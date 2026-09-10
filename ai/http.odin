@@ -6,7 +6,7 @@ import "core:strings"
 import linux "core:sys/linux"
 import "core:time"
 
-import "nabla:httpclient"
+import "nabla:http/client"
 
 HTTP_Request :: struct {
 	url:          string,
@@ -52,7 +52,7 @@ HTTP_Failure_Kind :: enum {
 // the transport's classification, so interruption is never reported as a broken
 // peer and a rejected certificate never yields a connection.
 http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: rawptr, callback: HTTP_Stream_Callback) -> HTTP_Failure {
-	headers: [3]httpclient.Header
+	headers: [3]client.Header
 	count := 0
 	headers[count] = {"content-type", "application/json"}; count += 1
 	headers[count] = {"accept", "text/event-stream"}; count += 1
@@ -66,7 +66,7 @@ http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: r
 	// The wait hook needs a pointer that outlives the request, so the control
 	// value lives in a local for the duration of this call.
 	local_control := control
-	options := httpclient.Options {
+	options := client.Options {
 		ca_file     = request.ca_file,
 		nameservers = request.nameservers,
 	}
@@ -77,7 +77,7 @@ http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: r
 		}
 	}
 
-	failure := httpclient.stream_request(
+	failure := client.stream_request(
 		{
 			url = request.url,
 			method = .Post,
@@ -97,7 +97,7 @@ http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: r
 // Cancellation is reported through the same path as a deadline, so both stop a
 // stalled phase instead of waiting for the next poll slice. A transport-supplied
 // timeout bounds only the wait that asked for it.
-http_wait :: proc(user_data: rawptr, fd: i64, kind: httpclient.Wait_Kind, timeout: time.Duration) -> httpclient.Wait_Status {
+http_wait :: proc(user_data: rawptr, fd: i64, kind: client.Wait_Kind, timeout: time.Duration) -> client.Wait_Status {
 	control := cast(^HTTP_Control)user_data
 	if control == nil { return .Ready }
 	if kind == .Probe {
@@ -120,7 +120,7 @@ http_wait :: proc(user_data: rawptr, fd: i64, kind: httpclient.Wait_Kind, timeou
 	return .Failed
 }
 
-http_failure_from :: proc(failure: httpclient.Failure) -> HTTP_Failure {
+http_failure_from :: proc(failure: client.Failure) -> HTTP_Failure {
 	kind: HTTP_Failure_Kind
 	switch failure.kind {
 	case .None:

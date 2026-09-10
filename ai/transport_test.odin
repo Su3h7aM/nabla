@@ -19,7 +19,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 
-import "nabla:httpclient"
+import "nabla:http/client"
 
 // Paths resolve against this file, not the working directory. The certificates are
 // test-only throwaways valid until 2126; their keys are intentionally committed.
@@ -129,37 +129,37 @@ transport_fixture_serve :: proc(thread: ^thread.Thread) {
 	}
 	defer net.close(socket)
 
-	ctx := httpclient.SSL_CTX_new(httpclient.TLS_server_method())
+	ctx := client.SSL_CTX_new(client.TLS_server_method())
 	if ctx == nil {
 		fixture.failed = true
 		sync.sema_post(&fixture.reached)
 		return
 	}
-	defer httpclient.SSL_CTX_free(ctx)
+	defer client.SSL_CTX_free(ctx)
 	cert := strings.clone_to_cstring(fixture.cert, context.temp_allocator)
 	key := strings.clone_to_cstring(fixture.key, context.temp_allocator)
-	if httpclient.SSL_CTX_use_certificate_file(ctx, cert, httpclient.FILETYPE_PEM) != 1 ||
-	   httpclient.SSL_CTX_use_PrivateKey_file(ctx, key, httpclient.FILETYPE_PEM) != 1 ||
-	   httpclient.SSL_CTX_check_private_key(ctx) != 1 {
+	if client.SSL_CTX_use_certificate_file(ctx, cert, client.FILETYPE_PEM) != 1 ||
+	   client.SSL_CTX_use_PrivateKey_file(ctx, key, client.FILETYPE_PEM) != 1 ||
+	   client.SSL_CTX_check_private_key(ctx) != 1 {
 		fixture.failed = true
 		sync.sema_post(&fixture.reached)
 		return
 	}
-	ssl := httpclient.SSL_new(ctx)
+	ssl := client.SSL_new(ctx)
 	if ssl == nil {
 		fixture.failed = true
 		sync.sema_post(&fixture.reached)
 		return
 	}
-	defer httpclient.SSL_free(ssl)
-	if httpclient.SSL_set_fd(ssl, c.int(i32(i64(socket)))) != 1 {
+	defer client.SSL_free(ssl)
+	if client.SSL_set_fd(ssl, c.int(i32(i64(socket)))) != 1 {
 		fixture.failed = true
 		sync.sema_post(&fixture.reached)
 		return
 	}
 	// A rejected certificate fails here, which is the expected outcome for the
 	// untrusted case.
-	if httpclient.SSL_accept(ssl) != 1 {
+	if client.SSL_accept(ssl) != 1 {
 		fixture.failed = true
 		sync.sema_post(&fixture.reached)
 		return
@@ -174,7 +174,7 @@ transport_fixture_serve :: proc(thread: ^thread.Thread) {
 	switch fixture.phase {
 	case .Complete:
 		transport_fixture_write(ssl, TRANSPORT_RESPONSE_COMPLETE)
-		_ = httpclient.SSL_shutdown(ssl)
+		_ = client.SSL_shutdown(ssl)
 	case .Truncate:
 		transport_fixture_write(ssl, TRANSPORT_RESPONSE_PARTIAL)
 	case .Stall:
@@ -183,21 +183,21 @@ transport_fixture_serve :: proc(thread: ^thread.Thread) {
 	}
 }
 
-transport_fixture_write :: proc(ssl: ^httpclient.SSL, text: string) -> bool {
+transport_fixture_write :: proc(ssl: ^client.SSL, text: string) -> bool {
 	pending := text
 	for len(pending) > 0 {
-		written := httpclient.SSL_write(ssl, raw_data(pending), c.int(len(pending)))
+		written := client.SSL_write(ssl, raw_data(pending), c.int(len(pending)))
 		if written <= 0 { return false }
 		pending = pending[written:]
 	}
 	return true
 }
 
-transport_fixture_read_request :: proc(ssl: ^httpclient.SSL) -> bool {
+transport_fixture_read_request :: proc(ssl: ^client.SSL) -> bool {
 	collected: [8192]u8
 	used := 0
 	for used < len(collected) {
-		count := httpclient.SSL_read(ssl, raw_data(collected[used:]), c.int(len(collected) - used))
+		count := client.SSL_read(ssl, raw_data(collected[used:]), c.int(len(collected) - used))
 		if count <= 0 { return false }
 		used += int(count)
 		if header_end := strings.index(string(collected[:used]), "\r\n\r\n"); header_end >= 0 {
@@ -435,12 +435,12 @@ test_transport_refused_connection_fails_to_connect :: proc(t: ^testing.T) {
 	// The hook makes the dial nonblocking, which is the path that has to learn why
 	// the connect failed from the socket error rather than from connect itself.
 	control: HTTP_Control
-	options := httpclient.Options {
+	options := client.Options {
 		wait = {hook = http_wait, data = &control},
 	}
-	connection, dial_err := httpclient.connection_dial(endpoint, options, context.temp_allocator)
+	connection, dial_err := client.connection_dial(endpoint, options, context.temp_allocator)
 	testing.expect(t, connection == nil)
-	testing.expect_value(t, dial_err, httpclient.Error.Connect)
+	testing.expect_value(t, dial_err, client.Error.Connect)
 }
 
 @(test)

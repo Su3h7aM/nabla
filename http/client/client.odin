@@ -1,4 +1,4 @@
-package httpclient
+package client
 
 import "core:bytes"
 import "core:fmt"
@@ -8,6 +8,7 @@ import "core:strconv"
 import "core:strings"
 
 import "nabla:http"
+
 
 HTTP_MAX_ERROR_BYTES :: 4096
 HTTP_MAX_HEADER_LINES :: 256
@@ -266,7 +267,7 @@ read_bounded_body :: proc(reader: ^Reader, limit: int, allocator: mem.Allocator)
 	return strings.to_string(builder)
 }
 
-// headers_destroy frees what header_parse allocated, which nabla:http does not
+// headers_destroy frees what http.header_parse allocated, which nabla:http does not
 // provide.
 @(private)
 headers_destroy :: proc(headers: ^http.Headers, allocator: mem.Allocator) {

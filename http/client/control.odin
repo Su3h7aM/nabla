@@ -1,13 +1,13 @@
-// Package httpclient is a minimal HTTP/1.1 client whose blocking phases are
+// Package client is a minimal HTTP/1.1 client whose blocking phases are
 // interruptible. The caller supplies a wait hook, so cancellation and deadlines
 // are the caller's policy and the transport never blocks unobservably.
 //
-// This package is a stopgap kept deliberately small: streaming bodies,
-// verified TLS, deadlines, and cancellation are the whole requirement set,
-// and nothing is added beyond them. Migrate to the official core HTTP package
-// once it exists; upstream laid its foundation with core:nbio (odin-lang/Odin
-// #6124, backbone of the coming HTTP package) but has not published it yet.
-package httpclient
+// It is a stopgap kept deliberately small: streaming bodies, verified TLS,
+// deadlines, and cancellation are the whole requirement set, and nothing is
+// added beyond them. Migrate to the official core HTTP package once it exists;
+// upstream laid its foundation with core:nbio (odin-lang/Odin #6124, backbone
+// of the coming HTTP package) but has not published it yet.
+package client
 
 import "core:net"
 import "core:time"

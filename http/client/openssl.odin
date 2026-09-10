@@ -1,6 +1,6 @@
 // Minimal OpenSSL 3 bindings. They cover the client transport and the local TLS
 // server used by the test fixture.
-package httpclient
+package client
 
 import "core:c"
 

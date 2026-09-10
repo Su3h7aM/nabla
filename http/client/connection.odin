@@ -1,4 +1,4 @@
-package httpclient
+package client
 
 import "core:c"
 import "core:mem"

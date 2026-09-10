@@ -4,8 +4,8 @@ A monorepo with two halves that share one philosophy:
 
 - **Foundation** — `text`, `input`, `term`, `layout`, `tui`, `widgets`. Reusable by any Odin
   program: the terminal, layout, and text stack knows nothing about models, agents, or HTTP.
-- **Harness** — `agent`, `ai`, `httpclient`, `acp`, and the `cmd/nabla` executable. A coding
-  agent built on top of it.
+- **Harness** — `http` (with its `client` subpackage), `ai`, `acp`, `agent`, and the
+  `cmd/nabla` executable. A coding agent built on top of it.
 
 The harness is one consumer of the foundation, not its owner.
 
@@ -27,7 +27,7 @@ than assuming; a quick experiment is cheaper than a wrong implementation.
 
 Dependencies point inward, from the harness toward the foundation.
 
-- Foundation packages never import `http`, `httpclient`, `ai`, `agent`, or `acp`.
+- Foundation packages never import `http`, `ai`, `agent`, or `acp`.
 - `layout` depends on nothing else in the repo. It is the renderer-neutral solver; every
   other package adapts to it.
 - Only `cmd/nabla`, `examples/`, `tests/`, and `demo/` may import both the foundation and
