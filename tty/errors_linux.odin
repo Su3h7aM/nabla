@@ -1,0 +1,6 @@
+#+build linux
+package tty
+
+import "core:sys/linux"
+
+_Platform_Error :: linux.Errno
