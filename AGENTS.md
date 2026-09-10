@@ -50,16 +50,43 @@ harness through ACP and nothing else, so it can be pointed at another ACP-compat
 
 ## Working in this repo
 
-Version control is **Jujutsu only**; the Git repository underneath is an implementation
-detail. One logical change per commit, described in the imperative mood.
-
 `mise run <task>` drives the work; `scripts/` holds the tasks and each one runs as plain Bash
-too. `./scripts/check` must pass, and `./scripts/test` is the gate: it runs every in-package
-suite in release and `-debug`, then the external harnesses. Read a script before changing
-what it does.
+too. Read a script before changing what it does.
+
+Verification is part of the work, not a step after it: run `./scripts/check` and whichever tests
+cover what you touched, and leave them green before committing. `./scripts/test` is the full
+gate — every in-package suite in release and `-debug`, then the external harnesses.
 
 Linux is the only target. Do not write Windows or macOS branches for platforms this project
 does not build.
+
+## Commits and history
+
+Version control is **Jujutsu only**; the Git repository underneath is an implementation detail.
+Work in one coherent change at a time and close it as a commit, rather than letting unrelated
+edits pile up in the working copy:
+
+```sh
+jj describe -m "<message>"   # name the change
+jj new                       # close it; the next edit starts a fresh change
+```
+
+Titles are Conventional Commits, concise, and about the diff rather than the session:
+
+```
+feat(sse): write events in the event-stream format
+fix(agent): keep the last event id when the id field is rejected
+refactor(http): move the client into an http/client subpackage
+```
+
+Use `chore`, `feat`, `fix`, `refactor`, `test`, `docs`, or `build`. A body is optional: one or two
+short paragraphs on intent and behaviour, or nothing when the title already carries it. Leave out
+the walkthrough — the files touched, the commands run, and how you got there are visible in the
+diff and belong in the pull request.
+
+Keep the diff scoped to its change. A bug you notice on the way is its own commit or its own
+later change rather than a passenger here, and code arrives when a need exists rather than in
+anticipation of one.
 
 ## Comments and naming
 
