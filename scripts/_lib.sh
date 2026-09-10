@@ -110,11 +110,6 @@ nabla_vet_flags() {
 
 nabla_collections() {
 	printf '%s\n' "-collection:nabla=$NABLA_ROOT"
-	# The vendored collection exists only once third_party/ is populated; Odin
-	# rejects a collection whose path is not a directory.
-	if [[ -d "$NABLA_ROOT/third_party" ]]; then
-		printf '%s\n' "-collection:tp=$NABLA_ROOT/third_party"
-	fi
 }
 
 nabla_have() { command -v "$1" >/dev/null 2>&1; }

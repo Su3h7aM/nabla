@@ -4,10 +4,6 @@
 		{
 			"name": "nabla",
 			"path": "."
-		},
-		{
-			"name": "tp",
-			"path": "./third_party/"
 		}
 	],
 	"enable_format": true,
