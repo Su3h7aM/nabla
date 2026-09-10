@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#MISE description="Type-check and vet every owned package (no binaries produced)"
+#MISE alias="c"
+#MISE sources=["*/*.odin", "*/*/*.odin"]
+#USAGE arg "[package]" help="Package to check; omit for all" default=""
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
+cd "$NABLA_ROOT"
+
+# usage_* only exists under mise; $1 covers direct execution.
+target="${usage_package:-${1:-}}"
+
+mapfile -t flags < <(nabla_vet_flags)
+mapfile -t packages < <(nabla_packages)
+[[ -n "$target" ]] && packages=("$target")
+
+failed=()
+for pkg in "${packages[@]}"; do
+	nabla_step "check $pkg"
+	if ! odin check "./$pkg" "${flags[@]}"; then
+		failed+=("$pkg")
+	fi
+done
+
+if ((${#failed[@]})); then
+	nabla_die "check failed: ${failed[*]}"
+fi
+printf '\nchecked %d package(s)\n' "${#packages[@]}"

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#MISE description="Build every library package as a shared object, and every cmd/ executable"
+#USAGE arg "[package]" help="Package to build; omit for all" default=""
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
+cd "$NABLA_ROOT"
+
+target="${usage_package:-${1:-}}"
+out="$NABLA_ROOT/.build"
+mkdir -p "$out"
+
+mapfile -t collections < <(nabla_collections)
+mapfile -t packages < <(nabla_packages)
+if [[ -n "$target" ]]; then packages=("$target"); fi
+
+failed=()
+
+# Nabla's library packages have no main, so `odin build` needs
+# -build-mode:shared. This proves the packages link, which `odin check` does
+# not do.
+for pkg in "${packages[@]}"; do
+	nabla_step "build $pkg"
+	out_name="$(printf '%s' "$pkg" | tr '/' '-')"
+	if ! odin build "./$pkg" \
+		-build-mode:shared \
+		"${collections[@]}" \
+		-out:"$out/lib${out_name}.so"; then
+		failed+=("$pkg")
+	fi
+done
+
+for d in "$NABLA_ROOT"/cmd/*/; do
+	[[ -f "${d%/}/main.odin" ]] || continue
+	name="$(basename "${d%/}")"
+	if [[ -n "$target" && "$target" != "cmd/$name" ]]; then continue; fi
+	nabla_step "build cmd/$name"
+	if ! odin build "./cmd/$name" "${collections[@]}" -out:"$out/$name"; then
+		failed+=("cmd/$name")
+	fi
+done
+
+((${#failed[@]})) && nabla_die "build failed: ${failed[*]}"
+printf '\nbuild green\n'

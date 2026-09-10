@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#MISE description="Run every test: in-package suites, then the external harnesses"
+#MISE alias="t"
+#MISE sources=["*/*.odin", "*/*/*.odin"]
+#USAGE arg "[target]" help="Package or harness to test; omit for all" default=""
+#USAGE flag "--debug-only" help="Only run the -debug configuration"
+#USAGE flag "--release-only" help="Only run the release configuration"
+#USAGE flag "--sanitize <kind>" help="Odin sanitizer for odin test (address, memory, thread)"
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
+cd "$NABLA_ROOT"
+
+target="${usage_package:-}"
+debug_only="${usage_debug_only:-false}"
+release_only="${usage_release_only:-false}"
+sanitize="${usage_sanitize:-}"
+
+# Standalone arg parsing — mise fills usage_* itself, but these must work when
+# the script is invoked directly.
+skip_next=false
+for arg in "$@"; do
+	if "$skip_next"; then
+		[[ -z "$sanitize" ]] && sanitize="$arg"
+		skip_next=false
+		continue
+	fi
+	case "$arg" in
+		--debug-only)   debug_only=true ;;
+		--release-only) release_only=true ;;
+		--sanitize)     skip_next=true ;;
+		--sanitize=*)   sanitize="${arg#--sanitize=}" ;;
+		-*)             nabla_die "unknown flag: $arg" ;;
+		*)              target="$arg" ;;
+	esac
+done
+
+# Every invocation is bounded so a broken interruption path fails the run
+# instead of hanging it. The retirement assertions in the transport and shell
+# tests are only meaningful if exceeding the bound is fatal.
+readonly TEST_TIMEOUT_SECONDS=300
+
+# The matrix is release + -debug. Both must be green: assertions used as test
+# oracles only fire in -debug, so a release-only run silently skips them.
+configs=()
+[[ "$debug_only" == "true" ]] || configs+=("release")
+[[ "$release_only" == "true" ]] || configs+=("debug")
+
+mapfile -t collections < <(nabla_collections)
+mapfile -t packages < <(nabla_test_packages)
+mapfile -t harnesses < <(nabla_harnesses)
+
+failed=()
+
+for config in "${configs[@]}"; do
+	for pkg in "${packages[@]}"; do
+		if [[ -n "$target" && "$target" != "$pkg" ]]; then continue; fi
+		extra=()
+		[[ "$config" == "debug" ]] && extra+=(-debug)
+		[[ -n "$sanitize" ]] && extra+=("-sanitize:$sanitize")
+		# Process-global assertions cannot survive concurrent test threads.
+		case " $NABLA_SERIAL_TEST_PACKAGES " in
+			*" $pkg "*) extra+=("-define:ODIN_TEST_THREADS=1") ;;
+		esac
+		nabla_step "test $pkg ($config)"
+		if ! timeout --foreground "$TEST_TIMEOUT_SECONDS" \
+			odin test "./$pkg" "${collections[@]}" "${extra[@]}"; then
+			failed+=("$pkg ($config)")
+		fi
+	done
+done
+
+# Suites that cannot live in-package run as external executables under tests/.
+# The hooks define exposes tty's fault injection so teardown-retry and
+# zero-progress write behavior can be driven deterministically against a real
+# PTY; it is inert for harnesses that do not compile it in.
+for h in "${harnesses[@]}"; do
+	if [[ -n "$target" && "$target" != "$(basename "$h")" ]]; then continue; fi
+	nabla_step "harness $h"
+	if ! timeout --foreground "$TEST_TIMEOUT_SECONDS" \
+		odin run "./$h" "${collections[@]}" -define:NABLA_TERMINAL_TEST_HOOKS=true; then
+		failed+=("$h")
+	fi
+done
+
+# End-to-end smoke: the demo and the dashboard are run under a real PTY to a
+# clean EOF exit. This is the only coverage of the full
+# session -> layout -> cells -> present path.
+if [[ -z "$target" ]]; then
+	smoke_dir="$NABLA_ROOT/.scratch/smoke"
+	mkdir -p "$smoke_dir"
+	for app in demo examples/dashboard; do
+		[[ -f "$NABLA_ROOT/$app/main.odin" ]] || continue
+		out_name="$(basename "$app")"
+		nabla_step "smoke $app"
+		if ! odin build "./$app" "${collections[@]}" -o:speed -out:"$smoke_dir/$out_name"; then
+			failed+=("$app build")
+			continue
+		fi
+		if ! script -qec "\"$smoke_dir/$out_name\"" /dev/null </dev/null >/dev/null 2>&1; then
+			failed+=("$app smoke")
+		fi
+	done
+	rm -rf "$smoke_dir"
+fi
+
+if ((${#failed[@]})); then
+	nabla_die "test failed: ${failed[*]}"
+fi
+printf '\n%d package(s) x %d config(s) + %d harness(es) green\n' \
+	"${#packages[@]}" "${#configs[@]}" "${#harnesses[@]}"

@@ -1,0 +1,18 @@
+# Build output
+.build/
+build/
+.scratch/
+
+# Odin artifacts
+*.bin
+*.exe
+*.o
+*.obj
+*.so
+
+# OS
+.DS_Store
+
+# mise local overrides (never committed)
+mise.local.toml
+mise.local.lock

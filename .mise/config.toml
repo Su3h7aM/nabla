@@ -1,0 +1,12 @@
+# Nabla toolchain and task configuration.
+#
+# Deliberately at .mise/config.toml rather than a root mise.toml: it keeps the
+# repository root clean and is higher precedence than .config/mise/config.toml.
+
+[tools]
+odin = "latest"
+
+[task_config]
+# Replaces mise's default task directories (mise-tasks/, .mise/tasks/, ...) so
+# tasks live in scripts/ and stay runnable as plain Bash without mise.
+includes = ["scripts"]
