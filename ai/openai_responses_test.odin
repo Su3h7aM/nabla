@@ -4,6 +4,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:strings"
 import "core:testing"
+import "nabla:sse"
 
 expect_event :: proc(t: ^testing.T, event: Provider_Event, $T: typeid) -> T {
 	testing.expect(t, event != nil)
@@ -666,14 +667,14 @@ run_request_chunks :: proc(api: API_Kind, chunks: []string) -> [dynamic]string {
 		callback  = test_record_callback,
 		allocator = context.temp_allocator,
 	}
-	sse_parser_init(&state.parser, provider_sse_event, &state, allocator = context.temp_allocator)
-	defer sse_parser_destroy(&state.parser)
+	sse.parser_init(&state.parser, provider_sse_event, &state, allocator = context.temp_allocator)
+	defer sse.parser_destroy(&state.parser)
 	defer Provider_Event_Destroy(&state.completion, context.temp_allocator)
 	defer Provider_Stream_Destroy(&state.stream)
 	for chunk in chunks {
-		if sse_parser_feed(&state.parser, transmute([]u8)chunk) != .None { break }
+		if sse.parser_feed(&state.parser, transmute([]u8)chunk) != .None { break }
 	}
-	if sse_parser_finish(&state.parser) != .None { return record.sequence }
+	if sse.parser_finish(&state.parser) != .None { return record.sequence }
 	stream_err := Provider_Stream_Finish(&state.stream)
 	provider_drain_events(&state)
 	if stream_err != .None && !state.failed {

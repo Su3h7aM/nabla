@@ -4,9 +4,10 @@ A terminal layout and presentation stack, and a coding agent harness built on it
 monorepo.
 
 The foundation (`text`, `input`, `term`, `layout`, `tui`, `widgets`) is reusable by any Odin
-program and knows nothing about models or agents. The harness (`http` with its `client`
-subpackage, `ai`, `acp`, `agent`) depends on it, never the reverse. See [AGENTS.md](AGENTS.md)
-for the philosophy and the package boundaries.
+program and knows nothing about models or agents. Above it sit the libraries (`http` with its
+`client` subpackage, `sse`, `ai`, `acp`) and then the harness (`agent`, `cmd/nabla`). Each layer
+depends only on the ones below it. See [AGENTS.md](AGENTS.md) for the philosophy and the package
+boundaries.
 
 ## Status
 

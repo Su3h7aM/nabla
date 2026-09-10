@@ -4,6 +4,8 @@ import "core:mem"
 import "core:net"
 import "core:strings"
 
+import "nabla:sse"
+
 Provider_Event_Callback :: #type proc(user_data: rawptr, event: Provider_Event)
 
 Provider_Operation_Error_Kind :: enum {
@@ -74,8 +76,8 @@ Provider_Request_Operation_Controlled :: proc(
 		interrupt = options.interrupt,
 		deadline  = options.deadline,
 	}
-	sse_parser_init(&state.parser, provider_sse_event, &state, allocator = allocator)
-	defer sse_parser_destroy(&state.parser)
+	sse.parser_init(&state.parser, provider_sse_event, &state, allocator = allocator)
+	defer sse.parser_destroy(&state.parser)
 	defer Provider_Event_Destroy(&state.completion, allocator)
 	defer Provider_Stream_Destroy(&state.stream)
 
@@ -99,7 +101,7 @@ Provider_Request_Operation_Controlled :: proc(
 		return provider_terminal_error(&state, provider_operation_error_kind(failure.kind))
 	}
 	if state.failed { return provider_terminal_error(&state, .Stream) }
-	if sse_parser_finish(&state.parser) != .None {
+	if sse.parser_finish(&state.parser) != .None {
 		provider_emit_error(&state, .Invalid_Data, "malformed SSE stream")
 		provider_drain_events(&state)
 		return provider_terminal_error(&state, .Stream)
@@ -120,7 +122,7 @@ Provider_Request_Operation_Controlled :: proc(
 
 Provider_Request_Stream_State :: struct {
 	stream:         Provider_Stream_State,
-	parser:         SSE_Parser,
+	parser:         sse.Parser,
 	api:            API_Kind,
 	user_data:      rawptr,
 	callback:       Provider_Event_Callback,
@@ -309,7 +311,7 @@ provider_drain_events :: proc(state: ^Provider_Request_Stream_State) {
 	}
 }
 
-provider_sse_event :: proc(user_data: rawptr, event: SSE_Event) {
+provider_sse_event :: proc(user_data: rawptr, event: sse.Event) {
 	state := cast(^Provider_Request_Stream_State)user_data
 	if state.failed { return }
 	stream_err := Provider_Consume_SSE_Data(event.data, &state.stream)
@@ -322,7 +324,7 @@ provider_sse_event :: proc(user_data: rawptr, event: SSE_Event) {
 provider_http_chunk :: proc(user_data: rawptr, chunk: []u8) {
 	state := cast(^Provider_Request_Stream_State)user_data
 	if state.failed { return }
-	if sse_parser_feed(&state.parser, chunk) != .None {
+	if sse.parser_feed(&state.parser, chunk) != .None {
 		provider_emit_error(state, .Invalid_Data, "malformed SSE stream")
 	}
 }

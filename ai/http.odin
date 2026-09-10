@@ -2,11 +2,11 @@ package ai
 
 import "core:mem"
 import "core:net"
-import "core:strings"
 import linux "core:sys/linux"
 import "core:time"
 
 import "nabla:http/client"
+import "nabla:sse"
 
 HTTP_Request :: struct {
 	url:          string,
@@ -27,8 +27,6 @@ HTTP_Control :: struct {
 	deadline:  Deadline,
 }
 
-HTTP_Stream_Callback :: #type proc(user_data: rawptr, data: []u8)
-
 HTTP_Failure :: struct {
 	kind:   HTTP_Failure_Kind,
 	status: int,
@@ -48,21 +46,12 @@ HTTP_Failure_Kind :: enum {
 	Content_Type,
 }
 
-// http_post_sse streams a Server-Sent Events response. Every failure maps onto
-// the transport's classification, so interruption is never reported as a broken
-// peer and a rejected certificate never yields a connection.
-http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: rawptr, callback: HTTP_Stream_Callback) -> HTTP_Failure {
-	headers: [3]client.Header
-	count := 0
-	headers[count] = {"content-type", "application/json"}; count += 1
-	headers[count] = {"accept", "text/event-stream"}; count += 1
-	token := ""
-	defer delete(token, request.allocator)
-	if request.bearer_token != "" {
-		token = strings.concatenate([]string{"Bearer ", request.bearer_token}, allocator = request.allocator)
-		headers[count] = {"authorization", token}; count += 1
-	}
-
+// http_post_sse streams a Server-Sent Events response under one operation's
+// interruption policy. The wire details -- SSE headers, the expected content
+// type -- live in nabla:sse. What stays here is what is provider-specific: the
+// interrupt/deadline policy handed to the transport as a wait hook, and the
+// mapping into this package's failure kinds.
+http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: rawptr, callback: client.Chunk_Callback) -> HTTP_Failure {
 	// The wait hook needs a pointer that outlives the request, so the control
 	// value lives in a local for the duration of this call.
 	local_control := control
@@ -77,15 +66,8 @@ http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: r
 		}
 	}
 
-	failure := client.stream_request(
-		{
-			url = request.url,
-			method = .Post,
-			headers = headers[:count],
-			body = request.body,
-			expected_content_type = "text/event-stream",
-			allocator = request.allocator,
-		},
+	failure := sse.post(
+		{url = request.url, body = request.body, bearer_token = request.bearer_token, allocator = request.allocator},
 		options,
 		user_data,
 		callback,
