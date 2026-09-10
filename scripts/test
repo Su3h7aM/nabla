@@ -50,6 +50,8 @@ mapfile -t packages < <(nabla_test_packages)
 mapfile -t harnesses < <(nabla_harnesses)
 
 failed=()
+ran=0
+ran_harnesses=0
 
 for config in "${configs[@]}"; do
 	for pkg in "${packages[@]}"; do
@@ -62,6 +64,7 @@ for config in "${configs[@]}"; do
 			*" $pkg "*) extra+=("-define:ODIN_TEST_THREADS=1") ;;
 		esac
 		nabla_step "test $pkg ($config)"
+		ran=$((ran + 1))
 		if ! timeout --foreground "$TEST_TIMEOUT_SECONDS" \
 			odin test "./$pkg" "${collections[@]}" "${extra[@]}"; then
 			failed+=("$pkg ($config)")
@@ -76,8 +79,9 @@ done
 for h in "${harnesses[@]}"; do
 	if [[ -n "$target" && "$target" != "$(basename "$h")" ]]; then continue; fi
 	nabla_step "harness $h"
+	ran_harnesses=$((ran_harnesses + 1))
 	if ! timeout --foreground "$TEST_TIMEOUT_SECONDS" \
-		odin run "./$h" "${collections[@]}" -define:NABLA_TERMINAL_TEST_HOOKS=true; then
+		odin run "./$h" "${collections[@]}" -define:NABLA_TTY_TEST_HOOKS=true; then
 		failed+=("$h")
 	fi
 done
@@ -106,5 +110,5 @@ fi
 if ((${#failed[@]})); then
 	nabla_die "test failed: ${failed[*]}"
 fi
-printf '\n%d package(s) x %d config(s) + %d harness(es) green\n' \
-	"${#packages[@]}" "${#configs[@]}" "${#harnesses[@]}"
+printf '\n%d package run(s) across %d config(s) + %d harness(es) green\n' \
+	"$ran" "${#configs[@]}" "$ran_harnesses"

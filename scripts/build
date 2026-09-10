@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#MISE description="Build every library package as a shared object, and every cmd/ executable"
+#MISE description="Build every library package as a shared object, and every executable"
 #USAGE arg "[package]" help="Package to build; omit for all" default=""
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
@@ -29,13 +29,15 @@ for pkg in "${packages[@]}"; do
 	fi
 done
 
-for d in "$NABLA_ROOT"/cmd/*/; do
-	[[ -f "${d%/}/main.odin" ]] || continue
-	name="$(basename "${d%/}")"
-	if [[ -n "$target" && "$target" != "cmd/$name" ]]; then continue; fi
-	nabla_step "build cmd/$name"
-	if ! odin build "./cmd/$name" "${collections[@]}" -out:"$out/$name"; then
-		failed+=("cmd/$name")
+# Executables: cmd/ ships to users, examples/ and demo/ are the contract
+# fixtures for the presentation stack. Nothing else compiles the latter, so a
+# broken example would otherwise go unnoticed.
+mapfile -t executables < <(nabla_executables)
+for exe in "${executables[@]}"; do
+	if [[ -n "$target" && "$target" != "$exe" ]]; then continue; fi
+	nabla_step "build $exe"
+	if ! odin build "./$exe" "${collections[@]}" -out:"$out/$(basename "$exe")"; then
+		failed+=("$exe")
 	fi
 done
 

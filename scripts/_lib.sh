@@ -21,6 +21,12 @@ readonly NABLA_NON_PACKAGE_DIRS="cmd demo examples tests third_party"
 # the same process. Pinned to one test thread.
 readonly NABLA_SERIAL_TEST_PACKAGES="agent ai"
 
+# Packages whose suites run through an external harness under tests/ instead of
+# `odin test`. Their test files are written against a bespoke assertion harness
+# (no `@(test)` declarations, a package-local `run_tests` entry), so `odin test`
+# would compile the package and report success while running nothing.
+readonly NABLA_HARNESS_TEST_PACKAGES="tty"
+
 # Library packages, in dependency order, with sub-packages reported by their
 # relative path so `odin check ./tty/ansi` works unchanged.
 nabla_packages() {
@@ -45,6 +51,10 @@ nabla_test_packages() {
 	local pkg
 	while IFS= read -r pkg; do
 		[[ -n "$(compgen -G "$NABLA_ROOT/$pkg/*_test*.odin")" ]] || continue
+		# A bespoke-harness suite is not an `odin test` target.
+		case " $NABLA_HARNESS_TEST_PACKAGES " in
+			*" $pkg "*) continue ;;
+		esac
 		printf '%s\n' "$pkg"
 	done < <(nabla_packages)
 }
@@ -58,6 +68,19 @@ nabla_harnesses() {
 		[[ -f "${d%/}/main.odin" ]] || continue
 		printf 'tests/%s\n' "$(basename "${d%/}")"
 	done
+}
+
+# Executable packages: cmd/* ships, examples/* and demo/ are contract fixtures
+# for the presentation stack. Every one of them has a main.
+nabla_executables() {
+	local d base
+	for base in cmd examples; do
+		for d in "$NABLA_ROOT/$base"/*/; do
+			[[ -f "${d%/}/main.odin" ]] || continue
+			printf '%s/%s\n' "$base" "$(basename "${d%/}")"
+		done
+	done
+	if [[ -f "$NABLA_ROOT/demo/main.odin" ]]; then printf 'demo\n'; fi
 }
 
 # Owned Odin sources, relative to the repo root. Formatting and listing
@@ -86,9 +109,12 @@ nabla_vet_flags() {
 }
 
 nabla_collections() {
-	printf '%s\n' \
-		"-collection:nabla=$NABLA_ROOT" \
-		"-collection:tp=$NABLA_ROOT/third_party"
+	printf '%s\n' "-collection:nabla=$NABLA_ROOT"
+	# The vendored collection exists only once third_party/ is populated; Odin
+	# rejects a collection whose path is not a directory.
+	if [[ -d "$NABLA_ROOT/third_party" ]]; then
+		printf '%s\n' "-collection:tp=$NABLA_ROOT/third_party"
+	fi
 }
 
 nabla_have() { command -v "$1" >/dev/null 2>&1; }
