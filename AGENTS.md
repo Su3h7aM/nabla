@@ -27,7 +27,7 @@ than assuming; a quick experiment is cheaper than a wrong implementation.
 
 Dependencies point inward, from the harness toward the foundation.
 
-- Foundation packages never import `ai`, `httpclient`, `agent`, or `acp`.
+- Foundation packages never import `http`, `httpclient`, `ai`, `agent`, or `acp`.
 - `layout` depends on nothing else in the repo. It is the renderer-neutral solver; every
   other package adapts to it.
 - Only `cmd/nabla`, `examples/`, `tests/`, and `demo/` may import both the foundation and
