@@ -541,3 +541,96 @@ test_a_nil_callback_still_parses :: proc(t: ^testing.T) {
 	testing.expect_value(t, parser_feed(&parser, transmute([]u8)string("data: a\n\n")), Error.None)
 	testing.expect_value(t, parser_finish(&parser), Error.None)
 }
+
+@(test)
+test_well_formed_utf8_is_preserved_byte_for_byte :: proc(t: ^testing.T) {
+	// The decode step must not re-encode: a valid multi-byte sequence is stored
+	// exactly as it arrived.
+	recorder: Recorder
+	recorder_init(&recorder)
+	defer recorder_destroy(&recorder)
+
+	err := parse(&recorder, "data: héllo → ✅\n\n")
+	testing.expect_value(t, err, Error.None)
+	expect_events(t, &recorder, {{type = "message", data = "héllo → ✅"}})
+}
+
+@(test)
+test_ill_formed_bytes_become_replacement_characters :: proc(t: ^testing.T) {
+	// "Streams must be decoded using the UTF-8 decode algorithm." A lone
+	// continuation byte, a byte that is never valid in UTF-8, and a truncated
+	// sequence are each ill-formed.
+	recorder: Recorder
+	recorder_init(&recorder)
+	defer recorder_destroy(&recorder)
+
+	err := parse(&recorder, "data: a\x80b\xFFc\xE2\x82d\n\n")
+	testing.expect_value(t, err, Error.None)
+	// \x80 -> one, \xFF -> one, \xE2\x82 -> two (one per ill-formed byte).
+	expect_events(t, &recorder, {{type = "message", data = "a\uFFFDb\uFFFDc\uFFFD\uFFFDd"}})
+}
+
+@(test)
+test_a_literal_replacement_character_is_not_replaced :: proc(t: ^testing.T) {
+	// U+FFFD is a valid character: an encoded one decodes to RUNE_ERROR with a
+	// length of three, which must be treated as well-formed and kept.
+	recorder: Recorder
+	recorder_init(&recorder)
+	defer recorder_destroy(&recorder)
+
+	err := parse(&recorder, "data: \xEF\xBF\xBD\n\ndata: \xFF\n\n")
+	testing.expect_value(t, err, Error.None)
+	expect_events(t, &recorder, {{type = "message", data = "\uFFFD"}, {type = "message", data = "\uFFFD"}})
+}
+
+@(test)
+test_ill_formed_bytes_in_event_type_and_id_are_replaced :: proc(t: ^testing.T) {
+	recorder: Recorder
+	recorder_init(&recorder)
+	defer recorder_destroy(&recorder)
+
+	err := parse(&recorder, "event: b\xFFd\nid: i\xFFd\ndata: a\n\n")
+	testing.expect_value(t, err, Error.None)
+	expect_events(t, &recorder, {{type = "b\uFFFDd", data = "a", id = "i\uFFFDd"}})
+}
+
+@(test)
+test_spanning_chunks_completes_a_multi_byte_sequence :: proc(t: ^testing.T) {
+	// A sequence split across two reads is still one character, because the line
+	// is only decoded once its terminator arrives.
+	recorder: Recorder
+	recorder_init(&recorder)
+	defer recorder_destroy(&recorder)
+
+	err := parse(&recorder, "data: \xE2\x9C", "\x85\n\n")
+	testing.expect_value(t, err, Error.None)
+	expect_events(t, &recorder, {{type = "message", data = "✅"}})
+}
+
+@(test)
+test_the_event_budget_counts_decoded_bytes :: proc(t: ^testing.T) {
+	// An ill-formed byte is stored as three bytes, so a stream of them reaches
+	// the budget sooner than its wire size suggests. Counting what is stored is
+	// what keeps the bound meaningful.
+	recorder: Recorder
+	recorder_init(&recorder)
+	defer recorder_destroy(&recorder)
+
+	parser: Parser
+	parser_init(&parser, record_event, &recorder, allocator = recorder.allocator)
+	defer parser_destroy(&parser)
+
+	filler := strings.repeat("\xFF", MAX_LINE_BYTES - 6, context.temp_allocator)
+	line := strings.concatenate({"data: ", filler, "\n"}, context.temp_allocator)
+	testing.expect(t, 3 * (MAX_LINE_BYTES - 6) < MAX_EVENT_BYTES, "one line must fit the budget")
+
+	err := Error.None
+	lines := 0
+	for err == .None {
+		err = parser_feed(&parser, transmute([]u8)line)
+		lines += 1
+		testing.expect(t, lines <= MAX_EVENT_BYTES / (3 * (MAX_LINE_BYTES - 6)) + 2, "budget was never exceeded")
+	}
+	testing.expect_value(t, err, Error.Event_Too_Large)
+	testing.expect_value(t, len(recorder.events), 0)
+}

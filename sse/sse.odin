@@ -12,6 +12,8 @@
 // retained stream. The caller owns the byte source and the event callbacks.
 package sse
 
+import "core:unicode/utf8"
+
 MAX_LINE_BYTES :: 64 * 1024
 MAX_EVENT_BYTES :: 1024 * 1024
 MAX_RETRY_MS :: 24 * 60 * 60 * 1000
@@ -197,17 +199,21 @@ parser_field :: proc(parser: ^Parser, line: []u8) {
 	// Exactly one leading space belongs to the syntax, not to the value.
 	if len(value) > 0 && value[0] == ' ' { value = value[1:] }
 
-	// Field names are compared literally, with no case folding.
+	// Field names are compared literally, with no case folding. Comparing the raw
+	// bytes is the same test as comparing decoded text here: no ill-formed or
+	// non-ASCII sequence can equal one of the four ASCII field names.
 	switch string(name) {
 	case "event":
 		clear(&parser.event_type)
-		append(&parser.event_type, ..value)
+		append_decoded_utf8(&parser.event_type, value)
 	case "data":
 		// Appending the value and one LF is what makes several data fields
-		// join with "\n" when the event is dispatched.
-		for byte in value { append(&parser.event_data, byte) }
+		// join with "\n" when the event is dispatched. The budget is charged
+		// after appending, because a decode can expand the value: the
+		// overshoot is bounded by one line's expansion, and the parser is dead
+		// once the error is raised.
+		parser.event_bytes += append_decoded_utf8(&parser.event_data, value) + 1
 		append(&parser.event_data, '\n')
-		parser.event_bytes += len(value) + 1
 		if parser.event_bytes > MAX_EVENT_BYTES {
 			parser.error = .Event_Too_Large
 			return
@@ -218,7 +224,7 @@ parser_field :: proc(parser: ^Parser, line: []u8) {
 		// old value must survive a rejected update.
 		if contains_null(value) { return }
 		clear(&parser.event_id)
-		append(&parser.event_id, ..value)
+		append_decoded_utf8(&parser.event_id, value)
 	case "retry":
 		// A malformed value is ignored, not an error: the reconnection time
 		// keeps whatever value it already had.
@@ -235,6 +241,50 @@ contains_null :: proc(value: []u8) -> bool {
 		if byte == 0 { return true }
 	}
 	return false
+}
+
+// append_decoded_utf8 appends value to dst as UTF-8 text and returns the number
+// of bytes appended.
+//
+// The standard decodes the stream with the UTF-8 decode algorithm, which
+// replaces ill-formed input with U+FFFD. This is that step, applied per field
+// value. A value is complete before it is stored -- line terminators cannot
+// appear inside a UTF-8 sequence, so splitting on them first is safe -- which
+// makes this equivalent to decoding the whole stream up front.
+//
+// One U+FFFD is emitted per ill-formed byte. The Encoding Standard's decoder
+// emits one per maximal subpart of an ill-formed sequence, so a truncated
+// sequence yields more replacement characters here than it would there. The
+// difference is confined to how many U+FFFD characters malformed input
+// produces: well-formed input is copied byte for byte either way.
+@(private)
+append_decoded_utf8 :: proc(dst: ^[dynamic]u8, value: []u8) -> int {
+	appended := 0
+	for i := 0; i < len(value); {
+		r, size := utf8.decode_rune_in_bytes(value[i:])
+		// A well-formed sequence decodes with its own length, including a
+		// literal U+FFFD. An ill-formed byte or a truncated sequence reports
+		// RUNE_ERROR with a length of one.
+		if r == utf8.RUNE_ERROR && size <= 1 {
+			appended += append_replacement_character(dst)
+			i += 1
+			continue
+		}
+		width := max(size, 1)
+		append(dst, ..value[i:i + width])
+		appended += width
+		i += width
+	}
+	return appended
+}
+
+@(private)
+append_replacement_character :: proc(dst: ^[dynamic]u8) -> int {
+	// U+FFFD REPLACEMENT CHARACTER. Encoded by the standard library rather than
+	// written out as bytes, which is how the wrong character gets in.
+	bytes, size := utf8.encode_rune(utf8.RUNE_ERROR)
+	append(dst, ..bytes[:size])
+	return size
 }
 
 // parse_retry reads a reconnection time. The specification accepts a field value
