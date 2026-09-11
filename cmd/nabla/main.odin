@@ -40,14 +40,14 @@ main :: proc() {
 	if !ok { fmt.println("usage: nabla --config PATH --provider ID --model ID"); return }
 	if options.help {
 		fmt.println("nabla [--config PATH] --provider ID --model ID")
-		fmt.println("default config: ~/.config/nabla/config.lua")
+		fmt.println("default config: $XDG_CONFIG_HOME/nabla/config.lua (~/.config/nabla/config.lua)")
 		fmt.println("without provider/model, prints configured catalog entries")
 		return
 	}
 	if options.config_path == "" {
-		home, home_err := os.user_home_dir(context.temp_allocator)
-		if home_err != nil { fmt.eprintln("cannot locate home directory"); os.exit(1) }
-		options.config_path = strings.concatenate([]string{home, "/.config/nabla/config.lua"}, allocator = context.temp_allocator)
+		directory, directory_err := agent.xdg_directory(.Config, context.temp_allocator)
+		if directory_err != .None { fmt.eprintln("cannot resolve the configuration directory"); return }
+		options.config_path = strings.concatenate([]string{directory, "/config.lua"}, allocator = context.temp_allocator)
 	}
 	sources, err := agent.load_lua_config(
 		options.config_path,
