@@ -341,36 +341,38 @@ dns_job_init :: proc(t: ^testing.T, job: ^Transport_Job, nameserver: net.Endpoin
 }
 
 @(test)
-test_transport_trusted_certificate_is_accepted :: proc(t: ^testing.T) {
-	fixture: Transport_Fixture
-	if !transport_fixture_start(t, &fixture, .Complete, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
-	defer transport_fixture_stop(&fixture)
+test_transport_certificate_trust :: proc(t: ^testing.T) {
+	// A certificate signed by the configured CA is accepted.
+	{
+		fixture: Transport_Fixture
+		if !transport_fixture_start(t, &fixture, .Complete, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
+		defer transport_fixture_stop(&fixture)
 
-	job: Transport_Job
-	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
-	defer transport_job_destroy(&job, job.allocator)
-	transport_job_start(&job)
-	transport_job_join(&job)
+		job: Transport_Job
+		if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+		defer transport_job_destroy(&job, job.allocator)
+		transport_job_start(&job)
+		transport_job_join(&job)
 
-	testing.expectf(t, job.error.kind == .None, "trusted request failed: %v %s", job.error.kind, job.error.detail)
-	testing.expect_value(t, job.texts, 1)
-	testing.expect_value(t, job.completions, 1)
-}
+		testing.expectf(t, job.error.kind == .None, "trusted request failed: %v %s", job.error.kind, job.error.detail)
+		testing.expect_value(t, job.texts, 1)
+		testing.expect_value(t, job.completions, 1)
+	}
+	// One that is not is rejected.
+	{
+		fixture: Transport_Fixture
+		if !transport_fixture_start(t, &fixture, .Complete, TRANSPORT_CERT_UNTRUSTED, TRANSPORT_KEY_UNTRUSTED) { return }
+		defer transport_fixture_stop(&fixture)
 
-@(test)
-test_transport_untrusted_certificate_is_rejected :: proc(t: ^testing.T) {
-	fixture: Transport_Fixture
-	if !transport_fixture_start(t, &fixture, .Complete, TRANSPORT_CERT_UNTRUSTED, TRANSPORT_KEY_UNTRUSTED) { return }
-	defer transport_fixture_stop(&fixture)
+		job: Transport_Job
+		if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+		defer transport_job_destroy(&job, job.allocator)
+		transport_job_start(&job)
+		transport_job_join(&job)
 
-	job: Transport_Job
-	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
-	defer transport_job_destroy(&job, job.allocator)
-	transport_job_start(&job)
-	transport_job_join(&job)
-
-	testing.expectf(t, job.error.kind == .TLS, "untrusted certificate was not rejected: %v", job.error.kind)
-	testing.expect_value(t, job.completions, 0)
+		testing.expectf(t, job.error.kind == .TLS, "untrusted certificate was not rejected: %v", job.error.kind)
+		testing.expect_value(t, job.completions, 0)
+	}
 }
 
 @(test)
@@ -450,62 +452,62 @@ test_transport_refused_connection_fails_to_connect :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_dns_cancel_retires_stalled_resolution :: proc(t: ^testing.T) {
-	server, nameserver, ok := dns_stalled_server_start(t)
-	if !ok { return }
-	defer net.close(server)
+test_dns_retires_stalled_resolution :: proc(t: ^testing.T) {
+	// Cancellation retires a resolution stalled at the nameserver.
+	{
+		server, nameserver, ok := dns_stalled_server_start(t)
+		if !ok { return }
+		defer net.close(server)
 
-	interrupt: Interrupt
+		interrupt: Interrupt
+		job: Transport_Job
+		if !dns_job_init(t, &job, nameserver) { return }
+		defer transport_job_destroy(&job, job.allocator)
+		job.options.interrupt = &interrupt
 
-	job: Transport_Job
-	if !dns_job_init(t, &job, nameserver) { return }
-	defer transport_job_destroy(&job, job.allocator)
-	job.options.interrupt = &interrupt
-
-	baseline := transport_open_fd_count()
-	transport_job_start(&job)
-	if !dns_stalled_server_await_query(server, TRANSPORT_FIXTURE_BOUND) {
-		testing.expectf(t, false, "resolution never reached the nameserver")
+		baseline := transport_open_fd_count()
+		transport_job_start(&job)
+		if !dns_stalled_server_await_query(server, TRANSPORT_FIXTURE_BOUND) {
+			testing.expectf(t, false, "resolution never reached the nameserver")
+			transport_job_join(&job)
+			return
+		}
+		started := time.tick_now()
+		interrupt_request(&interrupt)
 		transport_job_join(&job)
-		return
+		elapsed := time.tick_since(started)
+
+		testing.expectf(t, job.error.kind == .Cancelled, "expected cancellation, got %v (%s)", job.error.kind, job.error.detail)
+		testing.expect_value(t, job.completions, 0)
+		testing.expectf(t, elapsed < TRANSPORT_RETIRE_BOUND, "retirement took %v, above the %v bound", elapsed, TRANSPORT_RETIRE_BOUND)
+		testing.expect_value(t, transport_open_fd_count(), baseline)
 	}
-	started := time.tick_now()
-	interrupt_request(&interrupt)
-	transport_job_join(&job)
-	elapsed := time.tick_since(started)
+	// A deadline retires it too, well inside one resolution attempt so the
+	// operation bound expires rather than a nameserver attempt.
+	{
+		server, nameserver, ok := dns_stalled_server_start(t)
+		if !ok { return }
+		defer net.close(server)
 
-	testing.expectf(t, job.error.kind == .Cancelled, "expected cancellation, got %v (%s)", job.error.kind, job.error.detail)
-	testing.expect_value(t, job.completions, 0)
-	testing.expectf(t, elapsed < TRANSPORT_RETIRE_BOUND, "retirement took %v, above the %v bound", elapsed, TRANSPORT_RETIRE_BOUND)
-	testing.expect_value(t, transport_open_fd_count(), baseline)
-}
+		job: Transport_Job
+		if !dns_job_init(t, &job, nameserver) { return }
+		defer transport_job_destroy(&job, job.allocator)
+		job.options.deadline = deadline_in(300 * time.Millisecond)
 
-@(test)
-test_dns_deadline_retires_stalled_resolution :: proc(t: ^testing.T) {
-	server, nameserver, ok := dns_stalled_server_start(t)
-	if !ok { return }
-	defer net.close(server)
-
-	job: Transport_Job
-	if !dns_job_init(t, &job, nameserver) { return }
-	defer transport_job_destroy(&job, job.allocator)
-	// Well inside one resolution attempt, so the operation bound expires rather than
-	// a single nameserver attempt.
-	job.options.deadline = deadline_in(300 * time.Millisecond)
-
-	baseline := transport_open_fd_count()
-	transport_job_start(&job)
-	if !dns_stalled_server_await_query(server, TRANSPORT_FIXTURE_BOUND) {
-		testing.expectf(t, false, "resolution never reached the nameserver")
+		baseline := transport_open_fd_count()
+		transport_job_start(&job)
+		if !dns_stalled_server_await_query(server, TRANSPORT_FIXTURE_BOUND) {
+			testing.expectf(t, false, "resolution never reached the nameserver")
+			transport_job_join(&job)
+			return
+		}
+		started := time.tick_now()
 		transport_job_join(&job)
-		return
-	}
-	started := time.tick_now()
-	transport_job_join(&job)
-	elapsed := time.tick_since(started)
+		elapsed := time.tick_since(started)
 
-	testing.expectf(t, job.error.kind == .Timed_Out, "expected deadline expiry, got %v (%s)", job.error.kind, job.error.detail)
-	testing.expect_value(t, job.completions, 0)
-	testing.expectf(t, elapsed < TRANSPORT_RETIRE_BOUND, "retirement took %v, above the %v bound", elapsed, TRANSPORT_RETIRE_BOUND)
-	testing.expect_value(t, transport_open_fd_count(), baseline)
+		testing.expectf(t, job.error.kind == .Timed_Out, "expected deadline expiry, got %v (%s)", job.error.kind, job.error.detail)
+		testing.expect_value(t, job.completions, 0)
+		testing.expectf(t, elapsed < TRANSPORT_RETIRE_BOUND, "retirement took %v, above the %v bound", elapsed, TRANSPORT_RETIRE_BOUND)
+		testing.expect_value(t, transport_open_fd_count(), baseline)
+	}
 }
