@@ -77,21 +77,34 @@ Version :: struct {
 	minor: u8,
 }
 
-// Parses an HTTP version string according to RFC 7230, section 2.6.
+// version_parse reads the HTTP-version field of a start-line. It accepts the
+// eight-octet form and, for lenience, the six-octet "HTTP/1" whose minor version
+// is implicit. Every digit must actually be a digit: reading a non-digit as a
+// number would turn a malformed field into a plausible version.
+//
+// RFC 9112 2.3: HTTP-version = HTTP-name "/" DIGIT "." DIGIT, where HTTP-name is
+// the case-sensitive string "HTTP".
 version_parse :: proc(s: string) -> (version: Version, ok: bool) {
 	switch len(s) {
 	case 8:
 		(s[6] == '.') or_return
-		version.minor = u8(int(s[7]) - '0')
+		(is_digit(s[7])) or_return
+		version.minor = s[7] - '0'
 		fallthrough
 	case 6:
 		(s[:5] == "HTTP/") or_return
-		version.major = u8(int(s[5]) - '0')
+		(is_digit(s[5])) or_return
+		version.major = s[5] - '0'
 	case:
 		return
 	}
 	ok = true
 	return
+}
+
+@(private = "package")
+is_digit :: #force_inline proc(c: byte) -> bool {
+	return c >= '0' && c <= '9'
 }
 
 version_write :: proc(w: io.Writer, v: Version) -> io.Error {
@@ -432,6 +445,7 @@ import "core:testing"
 test_dynamic_unwritten :: proc(t: ^testing.T) {
 	{
 		d := make([dynamic]int, 4, 8)
+		defer delete(d)
 		du := _dynamic_unwritten(d)
 
 		testing.expect(t, len(du) == 4)
