@@ -59,7 +59,7 @@ for config in "${configs[@]}"; do
 done
 
 for h in "${harnesses[@]}"; do
-	[[ -n "$target" && "$target" != "$(basename "$h")" ]] && continue
+	[[ -n "$target" && "$target" != "$h" && "$target" != "$(basename "$h")" ]] && continue
 	nabla_step "harness $h"
 	timeout --foreground "$timeout_secs" odin run "./$h" "$collection" -define:NABLA_TERM_TEST_HOOKS=true || failed+=("$h")
 done
