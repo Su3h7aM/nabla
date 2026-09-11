@@ -45,14 +45,14 @@ Catalog_Model_Source :: struct {
 }
 
 Catalog_Provider_Source :: struct {
-	id:                  string,
-	base_url_present:    bool,
-	base_url:            string,
-	api_present:         bool,
-	api:                 string,
-	api_key_env_present: bool,
-	api_key_env:         string,
-	api_key_present:     bool,
-	api_key:             string,
-	models:              []Catalog_Model_Source,
+	id:               string,
+	base_url_present: bool,
+	base_url:         string,
+	api_present:      bool,
+	api:              string,
+	// A literal secret, or `${NAME}` naming an environment variable. Resolved
+	// only when a connection is built, so no secret is ever held here.
+	api_key_present:  bool,
+	api_key:          string,
+	models:           []Catalog_Model_Source,
 }

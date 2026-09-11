@@ -13,7 +13,7 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 		`return { providers = { acme = {
 			base_url = "https://api.acme.test",
 			api = "openai_responses",
-			api_key_env = "ACME_KEY",
+			api_key = "ACME_KEY",
 			models = {
 				chat = {
 					display_name = "Chat",
@@ -39,7 +39,7 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 	testing.expect_value(t, provider.id, "acme")
 	testing.expect_value(t, provider.base_url, "https://api.acme.test")
 	testing.expect_value(t, provider.api, "openai_responses")
-	testing.expect_value(t, provider.api_key_env, "ACME_KEY")
+	testing.expect_value(t, provider.api_key, "ACME_KEY")
 	testing.expect_value(t, len(provider.models), 3)
 
 	chat: ^Catalog_Model_Source
@@ -76,10 +76,53 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_config_env_reference_accepts_only_plain_names :: proc(t: ^testing.T) {
+	cases := []struct {
+		value: string,
+		name:  string,
+		ok:    bool,
+	} {
+		{"${OPENAI_API_KEY}", "OPENAI_API_KEY", true},
+		{"${_private}", "_private", true},
+		{"${A1}", "A1", true},
+		// A literal secret is never a reference, including one that happens to
+		// contain braces.
+		{"sk-abc123", "", false},
+		{"", "", false},
+		{"${}", "", false},
+		{"${1ABC}", "", false},
+		{"${A B}", "", false},
+		{"${A}", "A", true},
+		{"${A}}$", "", false},
+		{"$OPENAI_API_KEY", "", false},
+	}
+	for entry in cases {
+		name, ok := config_env_reference(entry.value)
+		testing.expectf(t, ok == entry.ok, "%q: ok=%v want %v", entry.value, ok, entry.ok)
+		if entry.ok { testing.expect_value(t, name, entry.name) }
+	}
+}
+
+@(test)
+test_config_resolve_credential_reads_a_reference_and_keeps_a_literal :: proc(t: ^testing.T) {
+	literal, literal_ok := config_resolve_credential("sk-literal", context.temp_allocator)
+	testing.expect(t, literal_ok)
+	testing.expect_value(t, literal, "sk-literal")
+
+	// An unset reference fails rather than resolving to an empty secret.
+	_, unset_ok := config_resolve_credential("${NABLA_TEST_UNSET_CREDENTIAL}", context.temp_allocator)
+	testing.expect(t, !unset_ok)
+
+	// An empty value is not a credential.
+	_, empty_ok := config_resolve_credential("", context.temp_allocator)
+	testing.expect(t, !empty_ok)
+}
+
+@(test)
 test_lua_config_failures_leave_no_partial_sources :: proc(t: ^testing.T) {
 	cases := []string {
 		`return { providers = { acme = { models = { chat = { display_name = 42 } } } } }`,
-		`return { providers = { acme = { api_key_env = "A", api_key = "B" } } }`,
+		`return { providers = { acme = { api_key = 42 } } }`,
 		`return { providers = { acme = { models = { chat = { tools = true }, bad = { context_window = -1 } } } } }`,
 		`return { providers = { acme = { models = { chat = { input_modalities = {"text"}, output_modalities = "text" } } } } }`,
 	}

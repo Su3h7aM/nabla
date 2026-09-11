@@ -43,17 +43,16 @@ cli_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id:
 	api, api_ok := agent.chat_api_kind(source.api)
 	if !api_ok { display_error(fmt.tprintf("unsupported api: %s", source.api)); return }
 
-	credential := ""
-	if source.api_key_present {
-		credential = source.api_key
-	} else if source.api_key_env_present {
-		found: bool
-		credential, found = os.lookup_env(source.api_key_env, context.temp_allocator)
-		if !found || credential == "" { display_error(fmt.tprintf("credential environment variable is missing: %s", source.api_key_env)); return }
-	} else {
-		display_error("selected provider requires api_key or api_key_env")
+	if !source.api_key_present {
+		display_error("selected provider requires api_key")
 		return
 	}
+	credential, credential_ok := agent.config_resolve_credential(source.api_key, context.allocator)
+	if !credential_ok {
+		display_error("selected provider requires api_key, or names an unset environment variable as ${NAME}")
+		return
+	}
+	defer delete(credential, context.allocator)
 
 	allocator := context.allocator
 	session := agent.chat_session_init(allocator)

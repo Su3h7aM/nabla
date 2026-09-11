@@ -248,22 +248,10 @@ load_provider :: proc(L: ^l.State, raw_idx: c.int, provider_id: string, allocato
 		out^.api_present = true
 	}
 	l.settop(L, base)
-	lua_field(L, idx, "api_key_env")
-	if l.type(L, -1) != .NIL {
-		value, ok := lua_string(L, -1, allocator)
-		if !ok { return .Invalid }
-		out^.api_key_env = value
-		out^.api_key_env_present = true
-	}
-	l.settop(L, base)
 	lua_field(L, idx, "api_key")
 	if l.type(L, -1) != .NIL {
 		value, ok := lua_string(L, -1, allocator)
 		if !ok { return .Invalid }
-		if out^.api_key_env_present {
-			delete(value, allocator)
-			return .Invalid
-		}
 		out^.api_key = value
 		out^.api_key_present = true
 	}
@@ -342,6 +330,39 @@ load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynam
 	return result, .None
 }
 
+// config_env_reference reports whether a configured value names an environment
+// variable. `${NAME}` is the reference syntax configuration values already use
+// for environment variables, and it is unambiguous: a literal secret never
+// matches it. The name must be a plain identifier.
+config_env_reference :: proc(value: string) -> (name: string, ok: bool) {
+	if len(value) < 4 || value[0] != '$' || value[1] != '{' || value[len(value) - 1] != '}' { return "", false }
+	name = value[2:len(value) - 1]
+	for character, index in name {
+		switch {
+		case character == '_', (character >= 'A' && character <= 'Z'), (character >= 'a' && character <= 'z'):
+		case (character >= '0' && character <= '9') && index > 0:
+		case:
+			return "", false
+		}
+	}
+	return name, true
+}
+
+// config_resolve_credential resolves a configured credential into a secret the
+// caller owns. A `${NAME}` value is read from the environment; anything else is
+// the secret itself. Resolution happens at use rather than at load, so the
+// catalog never holds a secret and no state file can.
+config_resolve_credential :: proc(value: string, allocator := context.allocator) -> (secret: string, ok: bool) {
+	if name, reference := config_env_reference(value); reference {
+		found: bool
+		secret, found = os.lookup_env(name, allocator)
+		if !found || secret == "" { return "", false }
+		return secret, true
+	}
+	if value == "" { return "", false }
+	return strings.clone(value, allocator), true
+}
+
 config_strings_destroy :: proc(values: ^[dynamic]string, allocator: mem.Allocator) {
 	if values == nil { return }
 	for value in values^ { delete(value, allocator) }
@@ -373,7 +394,6 @@ config_provider_source_destroy :: proc(provider: ^Catalog_Provider_Source, alloc
 	delete(provider.id, allocator)
 	if provider.base_url_present { delete(provider.base_url, allocator) }
 	if provider.api_present { delete(provider.api, allocator) }
-	if provider.api_key_env_present { delete(provider.api_key_env, allocator) }
 	if provider.api_key_present { delete(provider.api_key, allocator) }
 	for &model in provider.models { config_model_source_destroy(&model, allocator) }
 	delete(provider.models, allocator)
