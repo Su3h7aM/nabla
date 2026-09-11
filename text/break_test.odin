@@ -1,91 +1,41 @@
 #+test
+#+private file
 package text
 
 import "core:testing"
 
 @(test)
-test_break_ascii_reports_optional_whitespace_separator :: proc(t: ^testing.T) {
-	piece_end, next, kind := break_ascii("aaa bbb", 0)
-	testing.expect_value(t, piece_end, 3)
-	testing.expect_value(t, next, 4)
-	testing.expect_value(t, kind, Break_Kind.Optional)
-}
-
-@(test)
-test_break_ascii_reports_end_of_text :: proc(t: ^testing.T) {
-	piece_end, next, kind := break_ascii("aaa bbb", 4)
-	testing.expect_value(t, piece_end, 7)
-	testing.expect_value(t, next, 7)
-	testing.expect_value(t, kind, Break_Kind.None)
-}
-
-@(test)
-test_break_ascii_reports_hard_break_at_newline :: proc(t: ^testing.T) {
-	piece_end, next, kind := break_ascii("aaa\nbbb", 0)
-	testing.expect_value(t, piece_end, 3)
-	testing.expect_value(t, next, 4)
-	testing.expect_value(t, kind, Break_Kind.Mandatory)
-}
-
-@(test)
-test_break_ascii_collapses_crlf_into_one_separator :: proc(t: ^testing.T) {
-	// A CR immediately before an LF belongs to the terminator, not to the last
-	// word of the line.
-	piece_end, next, kind := break_ascii("aaa\r\nbbb", 0)
-	testing.expect_value(t, piece_end, 3)
-	testing.expect_value(t, next, 5)
-	testing.expect_value(t, kind, Break_Kind.Mandatory)
-}
-
-@(test)
-test_break_ascii_lone_carriage_return_is_whitespace :: proc(t: ^testing.T) {
-	piece_end, next, kind := break_ascii("a\rb", 0)
-	testing.expect_value(t, piece_end, 1)
-	testing.expect_value(t, next, 2)
-	testing.expect_value(t, kind, Break_Kind.Optional)
-}
-
-@(test)
-test_break_ascii_tab_is_whitespace :: proc(t: ^testing.T) {
-	piece_end, next, kind := break_ascii("aaa\tbbb", 0)
-	testing.expect_value(t, piece_end, 3)
-	testing.expect_value(t, next, 4)
-	testing.expect_value(t, kind, Break_Kind.Optional)
-}
-
-@(test)
-test_break_ascii_empty_input_ends_immediately :: proc(t: ^testing.T) {
-	piece_end, next, kind := break_ascii("", 0)
-	testing.expect_value(t, piece_end, 0)
-	testing.expect_value(t, next, 0)
-	testing.expect_value(t, kind, Break_Kind.None)
-}
-
-@(test)
-test_break_ascii_trailing_newline_yields_an_empty_break :: proc(t: ^testing.T) {
-	piece_end, next, kind := break_ascii("ab\n", 0)
-	testing.expect_value(t, piece_end, 2)
-	testing.expect_value(t, next, 3)
-	testing.expect_value(t, kind, Break_Kind.Mandatory)
-	// The remainder is the empty run that closes the final empty segment.
-	piece_end, next, kind = break_ascii("ab\n", 3)
-	testing.expect_value(t, piece_end, 3)
-	testing.expect_value(t, next, 3)
-	testing.expect_value(t, kind, Break_Kind.None)
-}
-
-@(test)
-test_break_ascii_skips_a_full_whitespace_run :: proc(t: ^testing.T) {
-	piece_end, next, kind := break_ascii("aaa  bbb", 0)
-	testing.expect_value(t, piece_end, 3)
-	testing.expect_value(t, next, 5)
-	testing.expect_value(t, kind, Break_Kind.Optional)
-}
-
-@(test)
-test_break_ascii_breaks_at_the_given_offset :: proc(t: ^testing.T) {
-	piece_end, next, kind := break_ascii("abc def", 4)
-	testing.expect_value(t, piece_end, 7)
-	testing.expect_value(t, next, 7)
-	testing.expect_value(t, kind, Break_Kind.None)
+test_break_ascii_reports_each_run_and_separator :: proc(t: ^testing.T) {
+	Case :: struct {
+		value:     string,
+		offset:    int,
+		piece_end: int,
+		next:      int,
+		kind:      Break_Kind,
+	}
+	cases := [?]Case {
+		// End of text: the run is empty and no break follows.
+		{"", 0, 0, 0, .None},
+		{"aaa bbb", 4, 7, 7, .None},
+		// Horizontal whitespace is an optional separator, and the whole run is
+		// skipped so the next call starts at the following word.
+		{"aaa bbb", 0, 3, 4, .Optional},
+		{"aaa\tbbb", 0, 3, 4, .Optional},
+		{"aaa  bbb", 0, 3, 5, .Optional},
+		{"a\rb", 0, 1, 2, .Optional},
+		// A line terminator is mandatory, with CRLF counted as one terminator.
+		{"aaa\nbbb", 0, 3, 4, .Mandatory},
+		{"aaa\r\nbb", 0, 3, 5, .Mandatory},
+		{"ab\n", 0, 2, 3, .Mandatory},
+		{"ab\n", 3, 3, 3, .None},
+	}
+	for c in cases {
+		piece_end, next, kind := break_ascii(c.value, c.offset)
+		testing.expect_value(t, piece_end, c.piece_end)
+		testing.expect_value(t, next, c.next)
+		testing.expect_value(t, kind, c.kind)
+		// Contract: the span is ordered and progresses unless it ends the text.
+		testing.expect(t, c.offset <= piece_end && piece_end <= next && next <= len(c.value))
+		testing.expect(t, next > c.offset || piece_end == len(c.value))
+	}
 }
