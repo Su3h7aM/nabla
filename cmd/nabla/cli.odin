@@ -67,7 +67,11 @@ cli_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id:
 	if session.workspace == "" { display_error("cannot determine working directory"); return }
 	session.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(api)
 	session.max_output_tokens = model.max_output_tokens
-	session.context_window = model.context_window
+	// User configuration, the provider's own model report, and models.dev have all
+	// been consulted by now. A window none of them stated is assumed rather than
+	// refused, so admission always has a bound to check a request against.
+	window, window_assumed := agent.chat_context_window(model^)
+	session.context_window = window
 	if model.thinking.levels_present {
 		for level in model.thinking.levels { append(&session.effort_levels, strings.clone(level, allocator)) }
 	}
@@ -83,6 +87,9 @@ cli_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id:
 		Credential = credential,
 	}
 	display_warning("shell execution is local and unsandboxed: valid model tool calls run directly")
+	if window_assumed {
+		display_notice(fmt.tprintf("no source describes %s's context window; assuming %dK", model_id, agent.CHAT_DEFAULT_CONTEXT_WINDOW / 1024))
+	}
 	display_notice(
 		fmt.tprintf("chat %s / %s (type /quit to exit, Ctrl-C cancels a request; input during a turn is queued, /compact summarizes)", provider_id, model_id),
 	)

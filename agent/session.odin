@@ -84,6 +84,21 @@ Chat_Session :: struct {
 	auto_compacted_turn:         u64,
 }
 
+// CHAT_DEFAULT_CONTEXT_WINDOW is the window a session assumes for a model that no
+// enrichment source described. It is a runtime default rather than a metadata
+// source: it applies only after user configuration, provider discovery, and
+// models.dev have all left the window unstated, and it never replaces a stated one.
+CHAT_DEFAULT_CONTEXT_WINDOW :: 128 * 1024
+
+// chat_context_window is the window a session runs with for a resolved model, and
+// whether that window is an assumption rather than a stated fact. Presence decides:
+// a window the catalog carries is used as stated, including an explicit zero, which
+// admission then refuses rather than quietly running with the default.
+chat_context_window :: proc(model: Catalog_Model) -> (window: int, assumed: bool) {
+	if model.context_window_present { return model.context_window, false }
+	return CHAT_DEFAULT_CONTEXT_WINDOW, true
+}
+
 chat_session_init :: proc(allocator := context.allocator) -> Chat_Session {
 	workspace, workspace_err := os.get_working_directory(allocator)
 	owned_workspace := ""
