@@ -107,6 +107,19 @@ is_digit :: #force_inline proc(c: byte) -> bool {
 	return c >= '0' && c <= '9'
 }
 
+// trim_ows strips optional whitespace, which is SP and HTAB only.
+//
+// RFC 9110 5.6.3: OWS = *( SP / HTAB ). It is narrower than
+// strings.trim_space, which also removes VT, FF, CR and LF -- bytes the field
+// value grammar does not admit in the first place.
+trim_ows :: proc(s: string) -> string {
+	start := 0
+	for start < len(s) && (s[start] == ' ' || s[start] == '\t') { start += 1 }
+	end := len(s)
+	for end > start && (s[end - 1] == ' ' || s[end - 1] == '\t') { end -= 1 }
+	return s[start:end]
+}
+
 version_write :: proc(w: io.Writer, v: Version) -> io.Error {
 	io.write_string(w, "HTTP/") or_return
 	io.write_rune(w, '0' + rune(v.major)) or_return

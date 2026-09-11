@@ -109,7 +109,9 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 		}
 	}
 
-	if body_err := stream_body(&reader, headers, user_data, callback); body_err != .None {
+	if framing, length, framing_err := response_framing(status, request.method, headers); framing_err != .None {
+		return failure_from_error(framing_err)
+	} else if body_err := stream_body(&reader, framing, length, user_data, callback); body_err != .None {
 		return failure_from_error(body_err)
 	}
 	return {}
@@ -200,16 +202,99 @@ content_type_matches :: proc(value, expected: string) -> bool {
 	return strings.equal_fold(media, expected)
 }
 
-stream_body :: proc(reader: ^Reader, headers: http.Headers, user_data: rawptr, callback: Chunk_Callback) -> Error {
-	encoding, has_encoding := http.headers_get_unsafe(headers, "transfer-encoding")
-	if has_encoding && strings.contains(encoding, "chunked") { return stream_chunked(reader, user_data, callback) }
-	length_text, has_length := http.headers_get_unsafe(headers, "content-length")
-	if has_length {
-		length, length_ok := strconv.parse_int(length_text)
-		if !length_ok || length < 0 { return .Bad_Response }
-		return stream_exact(reader, length, user_data, callback)
+// Body_Framing is how the end of a response body is found.
+Body_Framing :: enum {
+	// The response has no body at all.
+	None,
+	// The chunked transfer coding delimits the body.
+	Chunked,
+	// Exactly Length octets.
+	Exact,
+	// The body ends when the peer closes the connection.
+	Until_Close,
+}
+
+// response_framing decides how a response body is delimited.
+//
+// RFC 9112 6.3, in order of precedence: a response to HEAD and any 1xx, 204 or
+// 304 response is always terminated by the empty line that ends the field
+// section, whatever its fields claim; a Transfer-Encoding whose final coding is
+// chunked delimits the body, and one whose final coding is not chunked leaves a
+// response delimited by the connection closing; a Content-Length gives the
+// length in octets; and with neither, the body is delimited by the connection
+// closing.
+response_framing :: proc(status: int, method: http.Method, headers: http.Headers) -> (framing: Body_Framing, length: int, err: Error) {
+	// 1. Responses that never carry content, whatever their fields say.
+	if method == .Head || (status >= 100 && status < 200) || status == 204 || status == 304 {
+		return .None, 0, .None
 	}
-	return stream_until_closed(reader, user_data, callback)
+
+	// 3 and 4. A Transfer-Encoding overrides Content-Length, and it is the final
+	// coding that decides the framing.
+	if encoding, has_encoding := http.headers_get_unsafe(headers, "transfer-encoding"); has_encoding {
+		if final_transfer_coding_is_chunked(encoding) { return .Chunked, 0, .None }
+		return .Until_Close, 0, .None
+	}
+
+	// 5 and 6. Content-Length.
+	if length_text, has_length := http.headers_get_unsafe(headers, "content-length"); has_length {
+		value, value_ok := content_length_parse(length_text)
+		if !value_ok { return .None, 0, .Bad_Response }
+		return .Exact, value, .None
+	}
+
+	// 8. No framing field at all.
+	return .Until_Close, 0, .None
+}
+
+// final_transfer_coding_is_chunked reports whether the last coding of a
+// Transfer-Encoding field is chunked. The final coding decides the framing, not
+// the presence of the name anywhere in the list, and coding names are
+// case-insensitive (RFC 9112 6.1 and 7).
+final_transfer_coding_is_chunked :: proc(value: string) -> bool {
+	last := value
+	for {
+		comma := strings.index_byte(last, ',')
+		if comma < 0 { break }
+		last = last[comma + 1:]
+	}
+	return strings.equal_fold(http.trim_ows(last), "chunked")
+}
+
+// content_length_parse reads a Content-Length field value. RFC 9112 6.3 item 5
+// allows a comma-separated list only when every value is valid and identical, in
+// which case the message is framed by that single value.
+content_length_parse :: proc(value: string) -> (length: int, ok: bool) {
+	parsed := -1
+	remaining := value
+	for part in strings.split_iterator(&remaining, ",") {
+		text := http.trim_ows(part)
+		if text == "" { return 0, false }
+		number := 0
+		for c in text {
+			if c < '0' || c > '9' { return 0, false }
+			if number > (max(int) - int(c - '0')) / 10 { return 0, false }
+			number = number * 10 + int(c - '0')
+		}
+		if parsed >= 0 && parsed != number { return 0, false }
+		parsed = number
+	}
+	if parsed < 0 { return 0, false }
+	return parsed, true
+}
+
+stream_body :: proc(reader: ^Reader, framing: Body_Framing, length: int, user_data: rawptr, callback: Chunk_Callback) -> Error {
+	switch framing {
+	case .None:
+		return .None
+	case .Chunked:
+		return stream_chunked(reader, user_data, callback)
+	case .Exact:
+		return stream_exact(reader, length, user_data, callback)
+	case .Until_Close:
+		return stream_until_closed(reader, user_data, callback)
+	}
+	return .None
 }
 
 stream_exact :: proc(reader: ^Reader, length: int, user_data: rawptr, callback: Chunk_Callback) -> Error {
