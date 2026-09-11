@@ -1,9 +1,10 @@
 #+test
+#+private file
 package input
 
 import "core:testing"
 
-test_feed_events :: proc(t: ^testing.T, data: string, expected: []Event) {
+_feed_events :: proc(t: ^testing.T, data: string, expected: []Event) {
 	p: Parser
 	parser_init(&p)
 	events: [dynamic]Event
@@ -18,7 +19,7 @@ test_feed_events :: proc(t: ^testing.T, data: string, expected: []Event) {
 
 @(test)
 test_text_and_c0_keys :: proc(t: ^testing.T) {
-	test_feed_events(
+	_feed_events(
 		t,
 		"ab\t\r\x7f",
 		[]Event {
@@ -37,7 +38,7 @@ test_utf8_split_across_feeds :: proc(t: ^testing.T) {
 	parser_init(&p)
 	events: [dynamic]Event
 	defer delete(events)
-	// U+00E9 (e-acute) = 0xC3 0xA9, split across two feeds.
+	// U+00E9 (e-acute) is 0xC3 0xA9, split across two feeds.
 	testing.expect(t, feed(&p, []u8{0xc3}, &events) == nil, "first half must not error")
 	testing.expect_value(t, len(events), 0)
 	testing.expect(t, feed(&p, []u8{0xa9}, &events) == nil, "second half must not error")
@@ -46,13 +47,9 @@ test_utf8_split_across_feeds :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_csi_arrow_and_tilde_keys :: proc(t: ^testing.T) {
-	test_feed_events(t, "\e[A\e[3~\e[1;5D", []Event{Key_Event{code = .Up}, Key_Event{code = .Delete}, Key_Event{code = .Left}})
-}
-
-@(test)
-test_ss3_function_keys :: proc(t: ^testing.T) {
-	test_feed_events(t, "\eOP", []Event{Key_Event{code = .F1}})
+test_escape_sequences :: proc(t: ^testing.T) {
+	// CSI arrows and tilde keys, a CSI modifier, and the SS3 function-key form.
+	_feed_events(t, "\e[A\e[3~\e[1;5D\eOP", []Event{Key_Event{code = .Up}, Key_Event{code = .Delete}, Key_Event{code = .Left}, Key_Event{code = .F1}})
 }
 
 @(test)
@@ -72,12 +69,12 @@ test_lone_escape_resolves_on_deadline :: proc(t: ^testing.T) {
 @(test)
 test_escape_then_printable_emits_escape_then_key :: proc(t: ^testing.T) {
 	// Alt+x arrives as ESC x; the policy is an Escape event followed by the key.
-	test_feed_events(t, "\eX", []Event{Key_Event{code = .Escape}, Key_Event{code = .Character, character = 'X'}})
+	_feed_events(t, "\eX", []Event{Key_Event{code = .Escape}, Key_Event{code = .Character, character = 'X'}})
 }
 
 @(test)
 test_malformed_input_emits_unknown_and_resyncs :: proc(t: ^testing.T) {
 	// 0x80 is an invalid UTF-8 lead byte; report Unknown, then continue with
 	// the following byte.
-	test_feed_events(t, "\x80a", []Event{Unknown_Input{}, Key_Event{code = .Character, character = 'a'}})
+	_feed_events(t, "\x80a", []Event{Unknown_Input{}, Key_Event{code = .Character, character = 'a'}})
 }
