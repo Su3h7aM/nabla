@@ -76,6 +76,89 @@ exactly. A presentation string such as `"provider/model"` is never parsed, split
 key. Provider and model ids come from the source that introduced the entity and are not
 rewritten by a later stage.
 
+### 2.3 The provider-agnostic model fallback (design, not implemented)
+
+A user may configure a custom provider or proxy that models.dev does not list. No provider record
+exists for it, so its models stay unenriched. `models.json` — models.dev's third representation —
+carries model-only facts keyed by a model id alone, and is the candidate source for that case.
+
+**What identifies a model.** The key is the record's `id` and is always `vendor/model`: 382 of 382
+entries qualify, none is bare. The prefix is a model **vendor or lab**, not a serving provider —
+only 21 of the 36 prefixes are provider ids, and the rest (`amazon`, `microsoft`, `bytedance-seed`,
+…) are not. The prefix is a namespace, never a provider identity.
+
+**What it does not contain**, which is load-bearing:
+
+| absent | consequence |
+|---|---|
+| `reasoning_options` | no toggle, level list, or budget can be inherited — only that the model reasons |
+| `provider`, `npm`, `api` | the representation structurally cannot state a protocol, so importing it cannot route a request to the wrong wire format |
+
+**Coverage is narrow.** Of 2574 distinct model ids served by catalogue providers, 347 appear here
+(13%). Of its 382 entries, 266 also appear in a provider record and 116 appear nowhere else. This
+is a fallback for well-known models, not a general one, and it never substitutes for `/models`
+discovery.
+
+**Matching.** Exact key first, then a *unique* unqualified match, then vendor agreement:
+
+1. The configured `(provider_id, model_id)` resolves through the provider catalogue, as today.
+2. Otherwise the configured model id is looked up verbatim. Safest step, since it is exact and
+   case-sensitive; it only helps when the user spelled the id as models.dev does.
+3. Otherwise, if the id contains `/`, the part after the **first** `/` is looked up among the
+   unqualified ids. That is a name match, not an identity match, so it may only be used when it is
+   **unambiguous**: exactly one candidate.
+4. When several entries share the unqualified id, the configured prefix must equal the candidate's
+   vendor prefix. That is the only further evidence the data offers; if more than one candidate
+   remains, the lookup fails rather than guessing.
+5. Otherwise the model stays unenriched.
+
+Collisions are absent today — all 382 unqualified ids are distinct — so step 3 succeeds whenever
+the model is known at all. The uniqueness rule exists because that is a property of the current
+data and not a guarantee: a second `azure/gpt-5` beside `openai/gpt-5` would create one.
+
+**Fields to inherit**: model-intrinsic facts only, each independently, through the ordinary
+presence-aware merge — `limit.context`, `limit.output`, `tool_call`, `reasoning`, and the modality
+lists. Only three reach the runtime today: `limit.context` and `limit.output` through admission,
+and `tool_call` through tool advertisement. `reasoning` reaches no consumer without a level list,
+and modalities are not consumed yet.
+
+**A model-only value is a default, not a fact about the deployment.** Of the 266 entries that
+overlap a provider record, 91 disagree on `limit` and 68 on `modalities` (11 each on `reasoning`
+and `tool_call`); 59 disagree on the context window alone, where the model-only value is often
+*larger* than what a provider serves (`alibaba/qwen-plus`: 1,000,000 against 131,072). So this
+source must sit below every provider-specific source and only fill gaps, which first-defined-wins
+already guarantees.
+
+**Where it sits.** Last, and as a keyed lookup rather than a bulk source. Bulk-merging 382 entries
+into every provider would fabricate models for providers whose serving set is unknown. Instead the
+single model being resolved is synthesised into a provider entry carrying the **configured** model
+id — the id that goes on the wire — and appended after the models.dev provider records. Those are
+applied first, so they win where they exist, and the resolver keeps its three-source shape and its
+precedence.
+
+### 2.4 Unknown models: no invented metadata
+
+When neither a provider record nor a model-only entry resolves, the model has no metadata, and
+the runtime must not supply any of its own.
+
+**Reasoning is already silent, and that is the guarantee.** `chat_build_request` puts
+`reasoning_effort` on the wire only when an effort was chosen, and `chat_session_set_effort`
+accepts a level only if it appears in the model's level list. An unenriched model has an empty
+level list, so no effort can be set and nothing provider-specific is sent. A "conservative lowest
+level" default would be strictly worse: it would have to be inserted *into* the level list,
+asserting that an unknown model accepts a value it may not understand.
+
+**No context window constant is safe.** Admission refuses a request when no window is known and
+names the fix. The data says why a guess cannot replace that: served windows differ from
+model-level ones for 22% of overlapping models and are usually smaller, so any constant is too
+large for some models and needlessly small for others. Too large ships a request the provider
+rejects after it was paid for; too small compacts a context that would have fit.
+
+**Overrides belong in user configuration**, in the per-model fields that already exist
+(`context_window`, `max_output_tokens`, `tools`, `thinking.levels`). No new field, no provider-wide
+default, and nothing hardcoded in the runtime: an unconfigured model stays visibly unconfigured,
+and whatever makes it usable is a stated fact rather than a guess the harness made.
+
 ---
 
 ## 3. Explicit model disabling
