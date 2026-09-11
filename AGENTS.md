@@ -32,17 +32,18 @@ Dependencies point inward, from the harness toward the foundation.
 - Foundation packages never import `http`, `sse`, `ai`, `agent`, or `acp`.
 - `layout` depends on nothing else in the repo. It is the renderer-neutral solver; every
   other package adapts to it.
-- Only `cmd/nabla`, `examples/`, `tests/`, and `demo/` may import both the foundation and
+- Only `cmd/nabla`, `examples/`, and `demo/` may import both the foundation and
   `agent`. A foundation package that needs something from the harness has the dependency
   backwards.
 
 Keep each package buildable, testable, and green on its own. That property is what makes the
 foundation reusable and the harness replaceable.
 
-Some suites are written against a package-local assertion harness rather than `core:testing`'s
-`@(test)` declarations, so `odin test` on those packages would compile them and report success
-while running nothing. They run as external executables under `tests/` instead, which is why
-`scripts/_lib.sh` names them in `NABLA_HARNESS_TEST_PACKAGES`.
+Tests live inside the package whose behavior they validate: focused unit tests in colocated
+`<source>_test.odin` files, and broader package-level or end-to-end tests under `<package>/test/`.
+A suite that cannot run under `odin test` — `term/test/lifecycle` forks a child process, for
+example — ships as an in-package executable harness instead, which `scripts/_lib.sh` discovers
+through `nabla_harnesses`.
 
 The harness stays presentation-free: `agent` produces data and writes to a caller-supplied
 `io.Writer`. The presentation stack stays agent-free. Long term the TUI should reach the

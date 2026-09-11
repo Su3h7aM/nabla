@@ -7,7 +7,7 @@ created: 2026-08-12
 
 # Term full-frame encode benchmark — baseline
 
-Harness: `term/bench_tests.odin` (gated behind `-define:BENCH=true`).
+Harness: `term/bench_test.odin` (gated behind `-define:BENCH=true`).
 Measured at Talos workspace stack (terminal batch 1, package surface
 `encoded_size`/`encode`/`present` with caller-owned reusable output). This is
 the step D24 baseline: full-frame output with reusable storage, measured
@@ -20,7 +20,7 @@ before any diffing.
 | CPU | AMD Ryzen 7 5700X, 8 cores / 16 threads |
 | OS | Linux 7.1.8-1-cachyos-gcc |
 | Odin | `dev-2026-08-nightly:902106f` (mise-managed) |
-| Build | `odin run ./tests/term_tests -collection:nabla=$PWD -define:BENCH=true -o:speed -thread-count:1` |
+| Build | `odin test ./term -collection:nabla=$PWD -define:BENCH=true -o:speed -thread-count:1` |
 | Runs | 2026-08-12, one canonical run |
 
 ## Method
@@ -61,5 +61,5 @@ reusable 4 MiB scratch: 24 warmup frames, then `frames` timed frames with
 
 ```
 cd <nabla checkout>
-odin run ./tests/term_tests -collection:nabla=$PWD -define:BENCH=true -o:speed -thread-count:1
+odin test ./term -collection:nabla=$PWD -define:BENCH=true -o:speed -thread-count:1
 ```
