@@ -756,7 +756,8 @@ edit_backspace :: proc(app: ^App) {
 	for start > 0 && (app.line[start] & 0xC0) == 0x80 {
 		start -= 1
 	}
-	remove_range(&app.line, start, app.cursor - start)
+	// remove_range takes the half-open range [lo, hi), not index and count.
+	remove_range(&app.line, start, app.cursor)
 	app.cursor = start
 }
 
@@ -769,7 +770,8 @@ edit_delete :: proc(app: ^App) {
 		_, decoded := utf8.decode_rune(app.line[app.cursor:])
 		width = decoded
 	}
-	remove_range(&app.line, app.cursor, width)
+	// remove_range takes the half-open range [lo, hi), not index and count.
+	remove_range(&app.line, app.cursor, app.cursor + width)
 }
 
 edit_left :: proc(app: ^App) {
