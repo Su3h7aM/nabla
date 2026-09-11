@@ -106,8 +106,10 @@ chat_finalize_turn :: proc(session: ^Chat_Session, status: Chat_Terminal_Status,
 	turn_id := session.active_turn_id
 	// Only a completed response is a complete assistant message. A cancelled or
 	// failed turn may have produced partial text, and committing that would invent
-	// a response the model never finished.
-	if status == .Completed {
+	// a response the model never finished. A turn that completed without any text
+	// commits nothing either: an empty assistant message is invalid request
+	// history, not a response.
+	if status == .Completed && len(session.partial_assistant) > 0 {
 		append(&session.messages, Chat_Message{role = .Assistant, text = chat_clone_string(string(session.partial_assistant[:]), session.allocator)})
 	}
 	session.terminal_status = status

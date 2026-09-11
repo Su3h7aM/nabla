@@ -123,6 +123,7 @@ App :: struct {
 	scroll:          int, // lines scrolled back; 0 follows the bottom,
 	events:          [dynamic]input.Event,
 	generation_seen: u64,
+	cancel_seen:     bool, // the running cancel came from our own keys, not a signal,
 	columns:         int,
 	rows:            int,
 	quit:            bool,
@@ -304,15 +305,21 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id:
 		resized := viewport.columns != app.columns || viewport.rows != app.rows
 		app.columns, app.rows = viewport.columns, viewport.rows
 
-		// SIGINT/SIGTERM through the agent handler: cancel a running turn,
-		// or quit when idle (raw mode sends Ctrl-C as a byte, handled below).
-		if agent.chat_cancel_requested() && !runtime_busy(app) {
-			app.quit = true
-			break
-		}
-
 		if count > 0 || resized || generation_changed(app) {
 			present_frame(app, app.storage)
+		}
+
+		// SIGINT/SIGTERM through the agent handler: cancel a running turn, or
+		// quit when idle. A cancel this front-end requested through a key has
+		// already been seen and only ends the turn; an outside signal ends the
+		// session once the turn retired.
+		if agent.chat_cancel_requested() && !runtime_busy(app) {
+			if app.cancel_seen {
+				app.cancel_seen = false
+			} else {
+				app.quit = true
+				break
+			}
 		}
 	}
 
@@ -634,8 +641,13 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 	case .End:
 		app.cursor = len(app.line)
 	case .Escape:
-		clear(&app.line)
-		app.cursor = 0
+		if runtime_busy(app) {
+			app.cancel_seen = true
+			agent.chat_cancel_request()
+		} else {
+			clear(&app.line)
+			app.cursor = 0
+		}
 	case .Page_Up:
 		page := app.rows - 3
 		if page < 1 {
@@ -655,8 +667,9 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 	case .Up, .Down:
 	case .Character:
 		if .Control in key.modifiers {
-			if key.character == '\x03' {
+			if key.character == '\x03' || key.character == '\x04' {
 				if runtime_busy(app) {
+					app.cancel_seen = true
 					agent.chat_cancel_request()
 				} else {
 					app.quit = true
@@ -693,6 +706,7 @@ dispatch_command :: proc(app: ^App, text: string) {
 	switch {
 	case text == "/quit":
 		if runtime_busy(app) {
+			app.cancel_seen = true
 			agent.chat_cancel_request()
 		}
 		app.quit = true

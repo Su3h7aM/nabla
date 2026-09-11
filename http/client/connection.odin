@@ -202,6 +202,13 @@ connection_read_source :: proc(user_data: rawptr, buffer: []u8) -> (count: int, 
 // whether the message was complete.
 connection_read :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {
 	for {
+		// A body that keeps flowing never leaves a read blocked, so waiting
+		// alone would never ask the probe whether to stop. Asking here gives
+		// cancellation and deadlines a check on every read, flowing or stalled.
+		if probed := stop_from_wait(probe_now(connection.probe)); probed != .None {
+			if connection.stop == .None { connection.stop = probed }
+			return 0, error_from_stop(probed)
+		}
 		if connection.ssl != nil {
 			result := SSL_read(connection.ssl, raw_data(buffer), c.int(len(buffer)))
 			if result > 0 { return int(result), .None }

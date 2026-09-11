@@ -96,7 +96,7 @@ test_build_request_starts_at_active_window :: proc(t: ^testing.T) {
 	chat_effect_destroy(&finish)
 	testing.expect(t, chat_session_accept_user(&session, "second"))
 
-	session.active_start = 2
+	session.active_start = len(session.messages) - 1
 	effect = tool_loop_begin_request(&session)
 	request, wire, tools_owned, call_lists := chat_build_request(&session, effect.request, tool_loop_connection, "model")
 	testing.expect_value(t, len(request.Messages), 1)

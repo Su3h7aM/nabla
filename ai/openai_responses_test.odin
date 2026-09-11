@@ -349,10 +349,51 @@ test_responses_encode_replays_reasoning_in_order :: proc(t: ^testing.T) {
 	testing.expect_value(t, item_id, "rs_1")
 	encrypted, _, _ := openai_value_string(reasoning_item, "encrypted_content")
 	testing.expect_value(t, encrypted, "enc_1")
+	// The schema requires summary on a replayed reasoning item; it stays empty.
+	summaries, summaries_ok := reasoning_item["summary"]
+	testing.expect(t, summaries_ok)
+	summaries_array, is_array := summaries.(json.Array)
+	testing.expect(t, is_array && len(summaries_array) == 0)
 	call_item, call_ok := input[2].(json.Object)
 	testing.expect(t, call_ok)
 	call_type, _, _ := openai_value_string(call_item, "type")
 	testing.expect_value(t, call_type, "function_call")
+}
+
+@(test)
+test_responses_encode_skips_unreplayable_reasoning :: proc(t: ^testing.T) {
+	// A reasoning item the endpoint returned without encrypted content cannot
+	// satisfy the request schema (it wants encrypted_content or a summary), so
+	// it is skipped rather than sent.
+	messages := make([]Provider_Message, 2, context.temp_allocator)
+	messages[0] = Provider_Message {
+		Role         = .Reasoning,
+		Reasoning_ID = "rs_1",
+	}
+	messages[1] = Provider_Message {
+		Role    = .Assistant,
+		Content = "Done.",
+	}
+	request := Provider_Request {
+		API              = .OpenAI_Responses,
+		Model_Present    = true,
+		Model            = "gpt-5.6",
+		Messages_Present = true,
+		Messages         = messages,
+	}
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	testing.expect_value(t, err, Provider_Request_Error.None)
+	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
+	testing.expect_value(t, parse_err, nil)
+	defer json.destroy_value(value, context.temp_allocator)
+	object, ok := value.(json.Object)
+	testing.expect(t, ok)
+	input, input_ok := object["input"].(json.Array)
+	testing.expect(t, input_ok && len(input) == 1)
+	only, only_ok := input[0].(json.Object)
+	testing.expect(t, only_ok)
+	role, _, _ := openai_value_string(only, "role")
+	testing.expect_value(t, role, "assistant")
 }
 
 @(test)

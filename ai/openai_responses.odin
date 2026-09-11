@@ -14,9 +14,20 @@ openai_responses_encode_request :: proc(request: Provider_Request, allocator := 
 	input := make(json.Array, 0, len(request.Messages), allocator)
 	for message in request.Messages {
 		if message.Role == .Reasoning {
-			reasoning := make(json.Object, 3, allocator)
+			// A reasoning item is replayable only when the endpoint returned
+			// encrypted content: without it the item carries nothing the
+			// endpoint can continue from, and it is skipped rather than sent.
+			if message.Reasoning_Encrypted == "" {
+				continue
+			}
+			// The request schema requires a summary on every replayed reasoning
+			// item, empty or not; summaries are display-only and were never
+			// kept, so the replayed one is empty.
+			summaries := make(json.Array, 0, 0, allocator)
+			reasoning := make(json.Object, 4, allocator)
 			reasoning[strings.clone("type", allocator)] = json.String(strings.clone("reasoning", allocator))
 			reasoning[strings.clone("id", allocator)] = json.String(strings.clone(message.Reasoning_ID, allocator))
+			reasoning[strings.clone("summary", allocator)] = json.Value(summaries)
 			if message.Reasoning_Encrypted != "" {
 				reasoning[strings.clone("encrypted_content", allocator)] = json.String(strings.clone(message.Reasoning_Encrypted, allocator))
 			}
