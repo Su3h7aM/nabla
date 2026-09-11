@@ -21,6 +21,7 @@ import "core:strings"
 import "core:sync"
 import "core:sync/chan"
 import "core:thread"
+import "core:time"
 import "core:unicode/utf8"
 
 import "nabla:agent"
@@ -124,6 +125,8 @@ App :: struct {
 	events:          [dynamic]input.Event,
 	generation_seen: u64,
 	cancel_seen:     bool, // the running cancel came from our own keys, not a signal,
+	spin_lap:        time.Tick, // last working-frame advance,
+	spin_frame:      int,
 	columns:         int,
 	rows:            int,
 	quit:            bool,
@@ -305,17 +308,26 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id:
 		resized := viewport.columns != app.columns || viewport.rows != app.rows
 		app.columns, app.rows = viewport.columns, viewport.rows
 
-		if count > 0 || resized || generation_changed(app) {
+		// The working indicator animates only while a request is active, so a
+		// silent request (no stream events, tools running) still advances it.
+		now := time.tick_now()
+		advance_spinner := app.run.snap.status.running && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
+		if count > 0 || resized || generation_changed(app) || advance_spinner {
+			if advance_spinner {
+				app.spin_frame = (app.spin_frame + 1) % SPINNER_FRAMES
+				app.spin_lap = now
+			}
 			present_frame(app, app.storage)
 		}
 
 		// SIGINT/SIGTERM through the agent handler: cancel a running turn, or
-		// quit when idle. A cancel this front-end requested through a key has
-		// already been seen and only ends the turn; an outside signal ends the
-		// session once the turn retired.
+		// quit when idle. A cancel this front-end requested through a key is
+		// cleared once its turn retired, so it ends the turn only; an outside
+		// signal ends the session once the turn retired.
 		if agent.chat_cancel_requested() && !runtime_busy(app) {
 			if app.cancel_seen {
 				app.cancel_seen = false
+				agent.chat_cancel_reset()
 			} else {
 				app.quit = true
 				break

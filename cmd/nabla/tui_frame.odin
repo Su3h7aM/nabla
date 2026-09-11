@@ -22,6 +22,8 @@ import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
+import "core:time"
+import "core:unicode/utf8"
 
 import "nabla:layout"
 import "nabla:term"
@@ -39,6 +41,25 @@ TUI_FOOTER_ROWS :: 5
 // muted lavender rules, and grey body text.
 RULE_STYLE :: tui.Style {
 	foreground = tui.RGB_Color{150, 130, 165},
+}
+
+// The working indicator: the reference TUI's braille spinner on the rule row
+// above the input, shown only while a request is active.
+SPINNER_FRAMES :: 10
+WORKING_LABEL :: "Working"
+// SPINNER_INTERVAL is one spinner frame.
+SPINNER_INTERVAL :: 100 * time.Millisecond
+
+// spinner_glyph returns one braille spinner frame.
+spinner_glyph :: proc(index: int) -> string {
+	glyphs := [10]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	return glyphs[index % len(glyphs)]
+}
+WORKING_SPINNER :: tui.Style {
+	foreground = tui.RGB_Color{129, 162, 190},
+}
+WORKING_TEXT :: tui.Style {
+	foreground = tui.RGB_Color{205, 205, 212},
 }
 LABEL_STYLE :: tui.Style {
 	foreground = tui.RGB_Color{240, 198, 116},
@@ -251,7 +272,13 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (frame: term.Frame_B
 	}
 
 	draw_conversation(app, storage, conv_rect)
-	draw_rule(storage, rule_top_rect)
+	// The rule above the input doubles as the working indicator while a
+	// request is active.
+	if app.run.snap.status.running {
+		draw_working(storage, rule_top_rect, app.spin_frame)
+	} else {
+		draw_rule(storage, rule_top_rect)
+	}
 	caret := draw_input(app, storage, input_rect)
 	draw_rule(storage, rule_bottom_rect)
 	draw_footer(app, storage, cwd_rect, status_rect)
@@ -448,16 +475,65 @@ emit_paragraph :: proc(para: string, width: int, indent: int, style: tui.Style, 
 	append(out, Line{text = strings.clone(strings.to_string(line_buf), context.temp_allocator), style = style, indent = indent})
 }
 
+// frame_draw_at places text into one buffer row, one cell per rune, so
+// caller-controlled text may carry non-ASCII runes (the spinner, the rules).
+// Control code points are skipped, so no terminal control can reach the
+// frame; untrusted transcript text keeps its ASCII-only path. Cells past the
+// drawn text keep their blank from init.
+frame_draw_at :: proc(storage: ^Frame_Storage, x, y: int, value: string, style: tui.Style) {
+	if y < 0 || y >= storage.buffer.height {
+		return
+	}
+	column := x
+	offset := 0
+	for offset < len(value) {
+		if column >= storage.buffer.width {
+			return
+		}
+		r, width := utf8.decode_rune(value[offset:])
+		if r >= 0x20 && r != 0x7f {
+			storage.buffer.cells[y * storage.buffer.width + column] = tui.Cell {
+				grapheme = value[offset:offset + width],
+				style    = style,
+			}
+			column += 1
+		}
+		offset += width
+	}
+}
+
+// draw_working renders the rule row as the working indicator: dashes, a gap,
+// the braille frame, a gap, the label, then the rule continuing after it.
+draw_working :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect, frame_index: int) {
+	if rect.height <= 0 || rect.width <= 0 {
+		return
+	}
+	// "──" + gap + spinner + gap + label + gap.
+	prefix := 2 + 1 + 1 + 1 + len(WORKING_LABEL) + 1
+	if rect.width < prefix + 2 {
+		draw_rule(storage, rect)
+		return
+	}
+	frame_draw_at(storage, rect.x, rect.y, "──", RULE_STYLE)
+	frame_draw_at(storage, rect.x + 3, rect.y, spinner_glyph(frame_index), WORKING_SPINNER)
+	frame_draw_at(storage, rect.x + 5, rect.y, WORKING_LABEL, WORKING_TEXT)
+	rule, repeat_err := strings.repeat("─", rect.width - prefix, context.temp_allocator)
+	if repeat_err != nil {
+		return
+	}
+	frame_draw_at(storage, rect.x + prefix, rect.y, rule, RULE_STYLE)
+}
+
 // draw_rule paints one horizontal rule across the row.
 draw_rule :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	if rect.height <= 0 || rect.width <= 0 {
 		return
 	}
-	rule, repeat_err := strings.repeat("-", rect.width, context.temp_allocator)
+	rule, repeat_err := strings.repeat("─", rect.width, context.temp_allocator)
 	if repeat_err != nil {
 		return
 	}
-	_, _ = tui.draw_ascii(&storage.buffer, rect, rule, RULE_STYLE)
+	frame_draw_at(storage, rect.x, rect.y, rule, RULE_STYLE)
 }
 
 // draw_input draws the prompt and the visible part of the input line and
