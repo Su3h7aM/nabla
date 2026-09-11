@@ -1,3 +1,4 @@
+#+test
 package agent
 
 import "core:encoding/json"
