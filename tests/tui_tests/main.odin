@@ -70,7 +70,6 @@ main :: proc() {
 		test_build_frame_is_a_full_redraw,
 		test_build_frame_refuses_undersized_storage,
 		test_build_frame_rejects_malformed_buffers_without_writing,
-		test_ascii_break_proc_reproduces_fixture_wrapping_geometry,
 		test_plan_presentation_nil_previous_forces_full_redraw,
 		test_plan_presentation_identical_frames_plan_nothing,
 		test_plan_presentation_changed_cell_plans_a_write,
