@@ -55,6 +55,10 @@ Repository tasks go through **mise** — `mise tasks` lists them (`check`, `test
 contributor without mise can run `./scripts/check` and get identical behavior; mise discovers the
 task from the annotations at the top of the script. Read a script before changing it.
 
+Prefer native repository and search tools over shell equivalents (`grep`, `find`, `cat`, `ls`)
+for inspecting this repo; use the shell for what they cannot express — running builds, tests,
+and scripts, or a genuine pipeline.
+
 Verification is part of the work, not a step after it: run `mise run check` and whichever tests
 cover what you touched, and leave them green before committing. `mise run test` is the full
 gate — every in-package suite in release and `-debug`, then the external harnesses.
