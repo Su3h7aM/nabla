@@ -1,28 +1,24 @@
 #!/usr/bin/env bash
 #MISE description="Type-check and vet every owned package (no binaries produced)"
 #MISE alias="c"
-#MISE sources=["*/*.odin", "*/*/*.odin"]
-#USAGE arg "[package]" help="Package to check; omit for all" default=""
+#USAGE arg "[package]" help="Package to check; omit for all"
+#USAGE complete "package" run="bash -c 'source scripts/_lib.sh 2>/dev/null || source $(git rev-parse --show-toplevel 2>/dev/null)/scripts/_lib.sh 2>/dev/null && nabla_check_packages 2>/dev/null'"
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
 cd "$NABLA_ROOT"
 
-# usage_* only exists under mise; $1 covers direct execution.
-target="${usage_package:-${1:-}}"
+# Flags mirror checker_args in ols.json.
+flags=(-vet -strict-style -vet-tabs -disallow-do -warnings-as-errors -no-entry-point "-collection:nabla=$NABLA_ROOT")
 
-mapfile -t flags < <(nabla_vet_flags)
+target="${usage_package:-${1:-}}"
 mapfile -t packages < <(nabla_check_packages)
 [[ -n "$target" ]] && packages=("$target")
 
 failed=()
 for pkg in "${packages[@]}"; do
 	nabla_step "check $pkg"
-	if ! odin check "./$pkg" "${flags[@]}"; then
-		failed+=("$pkg")
-	fi
+	odin check "./$pkg" "${flags[@]}" || failed+=("$pkg")
 done
-
 if ((${#failed[@]})); then
 	nabla_die "check failed: ${failed[*]}"
 fi
-printf '\nchecked %d package(s)\n' "${#packages[@]}"

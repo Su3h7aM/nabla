@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #MISE description="Format owned Odin sources with odinfmt (odinfmt.json rules)"
 #MISE alias="f"
-#USAGE arg "[path]" help="File to format; omit for all owned sources" default=""
+#USAGE arg "[path]" help="File to format; omit for all owned sources"
 #USAGE flag "--check" help="Report unformatted files and exit non-zero; write nothing"
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
@@ -17,48 +17,24 @@ for arg in "$@"; do
 	esac
 done
 
-fmt="$(nabla_odinfmt)" || nabla_die \
-	"odinfmt not found. It ships inside the OLS release; install OLS and put it on PATH."
-
-# odinfmt recurses into the directories it is given, so this enumerates owned
-# files and never hands it a directory. Vendored code in third_party/ keeps its
-# upstream formatting.
-if [[ -n "$target" ]]; then
+if [[ -n $target ]]; then
 	sources=("$target")
 else
 	mapfile -t sources < <(nabla_owned_sources)
 fi
 
-if [[ "$check" != "true" ]]; then
+if "$check"; then
+	unformatted=()
 	for f in "${sources[@]}"; do
-		"$fmt" -w "$f" >/dev/null
+		odinfmt "$f" | cmp -s - "$f" || unformatted+=("$f")
 	done
-	printf 'formatted %d file(s)\n' "${#sources[@]}"
-	exit 0
+	if ((${#unformatted[@]})); then
+		printf 'unformatted:\n'
+		printf '  %s\n' "${unformatted[@]}"
+		nabla_die "${#unformatted[@]} file(s) need formatting"
+	fi
+else
+	for f in "${sources[@]}"; do
+		odinfmt -w "$f" >/dev/null
+	done
 fi
-
-# --check must not touch the tree, so format copies and diff them.
-#
-# Deliberately not using `odinfmt -stdin`: it appends a trailing newline the
-# file itself does not have, so a naive stdin diff reports every file as
-# unformatted.
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-cp odinfmt.json "$work/"
-for f in "${sources[@]}"; do
-	mkdir -p "$work/$(dirname "$f")"
-	cp "$f" "$work/$f"
-done
-(cd "$work" && for f in "${sources[@]}"; do "$fmt" -w "$f" >/dev/null; done)
-
-unformatted=()
-for f in "${sources[@]}"; do
-	cmp -s "$work/$f" "$f" || unformatted+=("$f")
-done
-
-if ((${#unformatted[@]})); then
-	printf 'unformatted:\n'
-	printf '  %s\n' "${unformatted[@]}"
-	nabla_die "${#unformatted[@]} file(s) need formatting — run ./scripts/fmt"
-fi
-printf 'all %d file(s) formatted\n' "${#sources[@]}"

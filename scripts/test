@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
 #MISE description="Run every test: in-package suites, then the external harnesses"
 #MISE alias="t"
-#MISE sources=["*/*.odin", "*/*/*.odin"]
-#USAGE arg "[target]" help="Package or harness to test; omit for all" default=""
+#USAGE arg "[target]" help="Package or harness to test; omit for all"
 #USAGE flag "--debug-only" help="Only run the -debug configuration"
 #USAGE flag "--release-only" help="Only run the release configuration"
-#USAGE flag "--sanitize <kind>" help="Odin sanitizer for odin test (address, memory, thread)"
+#USAGE flag "--sanitize <kind>" help="Odin sanitizer for odin test" {
+#USAGE   choices "address" "memory" "thread"
+#USAGE }
+#USAGE complete "target" run="bash -c 'source scripts/_lib.sh 2>/dev/null || source $(git rev-parse --show-toplevel 2>/dev/null)/scripts/_lib.sh 2>/dev/null && { nabla_test_packages; for h in $(nabla_harnesses); do echo ${h##*/}; done; } 2>/dev/null'"
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
 cd "$NABLA_ROOT"
 
-target="${usage_package:-}"
+target="${usage_target:-}"
 debug_only="${usage_debug_only:-false}"
 release_only="${usage_release_only:-false}"
 sanitize="${usage_sanitize:-}"
-
-# Standalone arg parsing — mise fills usage_* itself, but these must work when
-# the script is invoked directly.
 skip_next=false
 for arg in "$@"; do
 	if "$skip_next"; then
-		[[ -z "$sanitize" ]] && sanitize="$arg"
+		sanitize="$arg"
 		skip_next=false
 		continue
 	fi
@@ -34,76 +33,46 @@ for arg in "$@"; do
 	esac
 done
 
-# Every invocation is bounded so a broken interruption path fails the run
-# instead of hanging it. The retirement assertions in the transport and shell
-# tests are only meaningful if exceeding the bound is fatal.
-readonly TEST_TIMEOUT_SECONDS=300
+timeout_secs=300
+collection="-collection:nabla=$NABLA_ROOT"
 
-# The matrix is release + -debug. Both must be green: assertions used as test
-# oracles only fire in -debug, so a release-only run silently skips them.
 configs=()
-[[ "$debug_only" == "true" ]] || configs+=("release")
-[[ "$release_only" == "true" ]] || configs+=("debug")
+"$debug_only" || configs+=(release)
+"$release_only" || configs+=(debug)
 
-mapfile -t collections < <(nabla_collections)
 mapfile -t packages < <(nabla_test_packages)
 mapfile -t harnesses < <(nabla_harnesses)
 
 failed=()
-ran=0
-ran_harnesses=0
-
 for config in "${configs[@]}"; do
 	for pkg in "${packages[@]}"; do
-		if [[ -n "$target" && "$target" != "$pkg" ]]; then continue; fi
+		[[ -n "$target" && "$target" != "$pkg" ]] && continue
 		extra=()
-		[[ "$config" == "debug" ]] && extra+=(-debug)
-		[[ -n "$sanitize" ]] && extra+=("-sanitize:$sanitize")
-		# Some suites must not run their tests concurrently;
-		# NABLA_SERIAL_TEST_PACKAGES records which, and why.
+		[[ $config == debug ]] && extra+=(-debug)
+		[[ -n $sanitize ]] && extra+=("-sanitize:$sanitize")
 		case " $NABLA_SERIAL_TEST_PACKAGES " in
-			*" $pkg "*) extra+=("-define:ODIN_TEST_THREADS=1") ;;
+			*" $pkg "*) extra+=(-define:ODIN_TEST_THREADS=1) ;;
 		esac
 		nabla_step "test $pkg ($config)"
-		ran=$((ran + 1))
-		if ! timeout --foreground "$TEST_TIMEOUT_SECONDS" \
-			odin test "./$pkg" "${collections[@]}" "${extra[@]}"; then
-			failed+=("$pkg ($config)")
-		fi
+		timeout --foreground "$timeout_secs" odin test "./$pkg" "$collection" "${extra[@]}" || failed+=("$pkg ($config)")
 	done
 done
 
-# Suites that cannot live in-package run as external executables under tests/.
-# The hooks define exposes tty's fault injection so teardown-retry and
-# zero-progress write behavior can be driven deterministically against a real
-# PTY; it is inert for harnesses that do not compile it in.
 for h in "${harnesses[@]}"; do
-	if [[ -n "$target" && "$target" != "$(basename "$h")" ]]; then continue; fi
+	[[ -n "$target" && "$target" != "$(basename "$h")" ]] && continue
 	nabla_step "harness $h"
-	ran_harnesses=$((ran_harnesses + 1))
-	if ! timeout --foreground "$TEST_TIMEOUT_SECONDS" \
-		odin run "./$h" "${collections[@]}" -define:NABLA_TERM_TEST_HOOKS=true; then
-		failed+=("$h")
-	fi
+	timeout --foreground "$timeout_secs" odin run "./$h" "$collection" -define:NABLA_TERM_TEST_HOOKS=true || failed+=("$h")
 done
 
-# End-to-end smoke: the demo and the dashboard are run under a real PTY to a
-# clean EOF exit. This is the only coverage of the full
-# session -> layout -> cells -> present path.
-if [[ -z "$target" ]]; then
+if [[ -z $target ]]; then
 	smoke_dir="$NABLA_ROOT/.scratch/smoke"
 	mkdir -p "$smoke_dir"
 	for app in demo examples/dashboard; do
 		[[ -f "$NABLA_ROOT/$app/main.odin" ]] || continue
-		out_name="$(basename "$app")"
+		out="$smoke_dir/$(basename "$app")"
 		nabla_step "smoke $app"
-		if ! odin build "./$app" "${collections[@]}" -o:speed -out:"$smoke_dir/$out_name"; then
-			failed+=("$app build")
-			continue
-		fi
-		if ! script -qec "\"$smoke_dir/$out_name\"" /dev/null </dev/null >/dev/null 2>&1; then
-			failed+=("$app smoke")
-		fi
+		odin build "./$app" "$collection" -o:speed -out:"$out" || { failed+=("$app build"); continue; }
+		script -qec "\"$out\"" /dev/null </dev/null >/dev/null 2>&1 || failed+=("$app smoke")
 	done
 	rm -rf "$smoke_dir"
 fi
@@ -111,5 +80,3 @@ fi
 if ((${#failed[@]})); then
 	nabla_die "test failed: ${failed[*]}"
 fi
-printf '\n%d package run(s) across %d config(s) + %d harness(es) green\n' \
-	"$ran" "${#configs[@]}" "$ran_harnesses"

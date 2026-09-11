@@ -1,45 +1,32 @@
 #!/usr/bin/env bash
 #MISE description="Build every library package as a shared object, and every executable"
-#USAGE arg "[package]" help="Package to build; omit for all" default=""
+#USAGE arg "[package]" help="Package to build; omit for all"
+#USAGE complete "package" run="bash -c 'source scripts/_lib.sh 2>/dev/null || source $(git rev-parse --show-toplevel 2>/dev/null)/scripts/_lib.sh 2>/dev/null && nabla_check_packages 2>/dev/null'"
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
 cd "$NABLA_ROOT"
 
 target="${usage_package:-${1:-}}"
-out="$NABLA_ROOT/.build"
+out="$NABLA_ROOT/build"
 mkdir -p "$out"
+collection="-collection:nabla=$NABLA_ROOT"
 
-mapfile -t collections < <(nabla_collections)
 mapfile -t packages < <(nabla_packages)
-if [[ -n "$target" ]]; then packages=("$target"); fi
+[[ -n "$target" ]] && packages=("$target")
 
 failed=()
-
-# Nabla's library packages have no main, so `odin build` needs
-# -build-mode:shared. This proves the packages link, which `odin check` does
-# not do.
 for pkg in "${packages[@]}"; do
 	nabla_step "build $pkg"
-	out_name="$(printf '%s' "$pkg" | tr '/' '-')"
-	if ! odin build "./$pkg" \
-		-build-mode:shared \
-		"${collections[@]}" \
-		-out:"$out/lib${out_name}.so"; then
-		failed+=("$pkg")
-	fi
+	lib="${pkg//\//-}"
+	odin build "./$pkg" -build-mode:shared "$collection" -out:"$out/lib$lib.so" || failed+=("$pkg")
 done
 
-# Executables: cmd/ ships to users, examples/ and demo/ are the contract
-# fixtures for the presentation stack. Nothing else compiles the latter, so a
-# broken example would otherwise go unnoticed.
 mapfile -t executables < <(nabla_executables)
-for exe in "${executables[@]}"; do
-	if [[ -n "$target" && "$target" != "$exe" ]]; then continue; fi
-	nabla_step "build $exe"
-	if ! odin build "./$exe" "${collections[@]}" -out:"$out/$(basename "$exe")"; then
-		failed+=("$exe")
-	fi
+for bin in "${executables[@]}"; do
+	[[ -n "$target" && "$target" != "$bin" ]] && continue
+	nabla_step "build $bin"
+	odin build "./$bin" "$collection" -out:"$out/$(basename "$bin")" || failed+=("$bin")
 done
-
-((${#failed[@]})) && nabla_die "build failed: ${failed[*]}"
-printf '\nbuild green\n'
+if ((${#failed[@]})); then
+	nabla_die "build failed: ${failed[*]}"
+fi
