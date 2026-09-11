@@ -37,8 +37,6 @@ HTTP_Failure_Kind :: enum {
 	Timed_Out,
 	TLS,
 	Invalid_URL,
-	HTTPS_Required,
-	Redirect_Rejected,
 	HTTP_Status,
 	Content_Type,
 }

@@ -145,7 +145,7 @@ provider_operation_error_kind :: proc(kind: HTTP_Failure_Kind) -> Provider_Opera
 		return .Timed_Out
 	case .TLS:
 		return .TLS
-	case .None, .Transport, .Invalid_URL, .HTTPS_Required, .Redirect_Rejected, .HTTP_Status, .Content_Type:
+	case .None, .Transport, .Invalid_URL, .HTTP_Status, .Content_Type:
 		return .Stream
 	}
 	return .Stream
@@ -176,7 +176,7 @@ provider_failure_kind :: proc(kind: HTTP_Failure_Kind) -> Provider_Error_Kind {
 		return .Timed_Out
 	case .TLS:
 		return .TLS
-	case .None, .Transport, .Invalid_URL, .HTTPS_Required, .Redirect_Rejected, .HTTP_Status, .Content_Type:
+	case .None, .Transport, .Invalid_URL, .HTTP_Status, .Content_Type:
 		return .Stream_Truncated
 	}
 	return .Stream_Truncated

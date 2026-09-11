@@ -107,6 +107,10 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	defer headers_destroy(&headers, request.allocator)
 	if head_err != .None { return failure_from_error(head_err) }
 
+	// Anything outside 2xx ends the request and is reported by its status.
+	// Redirects are deliberately not followed: RFC 9110 15.4 makes automatic
+	// redirection optional for a user agent, and no API this client serves depends
+	// on it.
 	if status < 200 || status >= 300 {
 		return Failure{kind = .HTTP_Status, status = status, detail = error_detail(status, &reader, request.allocator)}
 	}
