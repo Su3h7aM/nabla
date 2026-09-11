@@ -50,11 +50,13 @@ harness through ACP and nothing else, so it can be pointed at another ACP-compat
 
 ## Working in this repo
 
-`mise run <task>` drives the work; `scripts/` holds the tasks and each one runs as plain Bash
-too. Read a script before changing what it does.
+Repository tasks go through **mise** — `mise tasks` lists them (`check`, `test`, `fmt`,
+`build`). Each is a plain Bash script under `scripts/` that stays directly executable, so a
+contributor without mise can run `./scripts/check` and get identical behavior; mise discovers the
+task from the annotations at the top of the script. Read a script before changing it.
 
-Verification is part of the work, not a step after it: run `./scripts/check` and whichever tests
-cover what you touched, and leave them green before committing. `./scripts/test` is the full
+Verification is part of the work, not a step after it: run `mise run check` and whichever tests
+cover what you touched, and leave them green before committing. `mise run test` is the full
 gate — every in-package suite in release and `-debug`, then the external harnesses.
 
 Linux is the only target. Do not write Windows or macOS branches for platforms this project
@@ -62,9 +64,9 @@ does not build.
 
 ## Commits and history
 
-Version control is **Jujutsu only**; the Git repository underneath is an implementation detail.
-Work in one coherent change at a time and close it as a commit, rather than letting unrelated
-edits pile up in the working copy:
+Version control is **Jujutsu (`jj`) only**; the Git repository underneath is an implementation
+detail. Work in one coherent change at a time and close it as a commit, rather than letting
+unrelated edits pile up in the working copy:
 
 ```sh
 jj describe -m "<message>"   # name the change
