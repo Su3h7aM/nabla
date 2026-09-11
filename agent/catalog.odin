@@ -20,6 +20,17 @@ import "core:strings"
 // Serving identity is the exact, case-sensitive pair of provider ID and model ID.
 // Neither part is ever parsed out of a combined string.
 
+// A token-budget control form: the range of reasoning budgets the model accepts.
+// Each bound has its own presence, because upstream states neither, either, or
+// both, and a stated bound is a fact rather than a default.
+Catalog_Thinking_Budget :: struct {
+	present:     bool,
+	min_present: bool,
+	min:         int,
+	max_present: bool,
+	max:         int,
+}
+
 Catalog_Thinking_Source :: struct {
 	present:           bool,
 	// A terminal negative. A blocked source prohibits all later thinking
@@ -31,6 +42,7 @@ Catalog_Thinking_Source :: struct {
 	toggle:            bool,
 	levels_present:    bool,
 	levels:            []string,
+	budget:            Catalog_Thinking_Budget,
 }
 
 Catalog_Model_Source :: struct {
@@ -206,6 +218,15 @@ catalog_apply_thinking :: proc(dst: ^Catalog_Thinking_Source, src: Catalog_Think
 	if !dst.levels_present && src.levels_present {
 		dst.levels_present = true
 		dst.levels = catalog_clone_strings(src.levels, allocator)
+	}
+	if src.budget.present && !dst.budget.present { dst.budget.present = true }
+	if !dst.budget.min_present && src.budget.min_present {
+		dst.budget.min_present = true
+		dst.budget.min = src.budget.min
+	}
+	if !dst.budget.max_present && src.budget.max_present {
+		dst.budget.max_present = true
+		dst.budget.max = src.budget.max
 	}
 }
 
