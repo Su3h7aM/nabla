@@ -116,14 +116,25 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 }
 
 format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer) {
-	path := url.path if url.path != "" else "/"
+	// The request target is the origin-form of the URL -- path and query both.
+	request_target := http.request_path(url, request.allocator)
+	defer delete(request_target, request.allocator)
+
 	bytes.buffer_init_allocator(&buffer, 0, len(request.body) + 512, request.allocator)
-	line: [1024]u8
-	bytes.buffer_write_string(&buffer, fmt.bprintf(line[:], "%s %s HTTP/1.1\r\n", http.method_string(request.method), path))
+
+	// The request line is appended rather than formatted through a fixed buffer.
+	// A URL has no length limit, and a line that outgrows such a buffer makes fmt
+	// allocate from the ambient context allocator, which this call does not own
+	// and never releases.
+	bytes.buffer_write_string(&buffer, http.method_string(request.method))
+	bytes.buffer_write_string(&buffer, " ")
+	bytes.buffer_write_string(&buffer, request_target)
+	bytes.buffer_write_string(&buffer, " HTTP/1.1\r\n")
 	bytes.buffer_write_string(&buffer, "host: ")
 	bytes.buffer_write_string(&buffer, url.host)
 	bytes.buffer_write_string(&buffer, "\r\nconnection: close\r\n")
-	bytes.buffer_write_string(&buffer, fmt.bprintf(line[:], "content-length: %d\r\n", len(request.body)))
+	length_line: [48]u8
+	bytes.buffer_write_string(&buffer, fmt.bprintf(length_line[:], "content-length: %d\r\n", len(request.body)))
 	for header in request.headers {
 		bytes.buffer_write_string(&buffer, header.name)
 		bytes.buffer_write_string(&buffer, ": ")
