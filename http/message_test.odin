@@ -31,6 +31,35 @@ test_method_round_trips :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_field_value_keeps_bytes_that_are_not_ows :: proc(t: ^testing.T) {
+	// RFC 9112 5.1 excludes optional whitespace -- SP and HTAB -- from the field
+	// line value. Anything else is not whitespace to discard, and a bare CR is
+	// not something a parser may quietly remove (RFC 9112 2.2).
+	headers: Headers
+	headers_init(&headers, context.temp_allocator)
+
+	_, ok := header_parse(&headers, "x:\ta\vb\t", context.temp_allocator)
+	testing.expect(t, ok)
+	value, found := headers_get_unsafe(headers, "x")
+	testing.expect(t, found)
+	testing.expect_value(t, value, "a\vb")
+}
+
+@(test)
+test_a_field_value_keeps_a_trailing_carriage_return :: proc(t: ^testing.T) {
+	// A trailing CR is not optional whitespace, so it is not trimmed away. RFC 9112
+	// 2.2 lets a recipient either treat a bare CR as invalid or replace it with SP;
+	// silently deleting it is neither.
+	headers: Headers
+	headers_init(&headers, context.temp_allocator)
+
+	_, ok := header_parse(&headers, "x: a\r", context.temp_allocator)
+	testing.expect(t, ok)
+	value, _ := headers_get_unsafe(headers, "x")
+	testing.expect_value(t, value, "a\r")
+}
+
+@(test)
 test_version_parse_reads_http_1_1 :: proc(t: ^testing.T) {
 	version, ok := version_parse("HTTP/1.1")
 	testing.expect(t, ok)

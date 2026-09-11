@@ -188,7 +188,9 @@ header_parse :: proc(headers: ^Headers, line: string, allocator := context.temp_
 	has_host := headers_has_unsafe(headers^, "host")
 	cl, has_cl := headers_get_unsafe(headers^, "content-length")
 
-	value := strings.trim_space(line[colon + 1:])
+	// RFC 9112 5.1: the field line value excludes the optional whitespace that
+	// may precede and follow it, and OWS is SP and HTAB only.
+	value := trim_ows(line[colon + 1:])
 	tmp_key := sanitize_key(headers^, line[:colon])
 	defer if !ok { delete(tmp_key, allocator) }
 
