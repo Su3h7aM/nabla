@@ -4,6 +4,25 @@ import "core:nbio"
 import "core:net"
 import "core:time"
 
+// This file waits for readiness rather than moving data.
+//
+// The event loop is used to wait for a socket to become ready, and the transfer
+// itself stays a direct call on the socket. core:nbio also offers send and recv
+// operations that carry the bytes, which suit most callers but not this one:
+//
+//   - TLS owns the socket's bytes. OpenSSL's BIO reads and writes the socket
+//     itself, so bytes taken out of it by nbio.recv would never reach the record
+//     layer, and bytes handed to nbio.send would bypass it. For a TLS
+//     connection only readiness can be expressed, and using the operations for
+//     plaintext and readiness for TLS would mean two partial-write loops, two
+//     cancellation paths and two error mappings where one of each does.
+//   - send's "all" option does carry the partial-write loop, but the case that
+//     cannot use the operation is the one that needs it.
+//
+// Neither choice is cheaper than the other: nbio.send and nbio.recv copy a
+// multi-buffer operation's slice into the loop's allocator, but a single buffer,
+// which is all this transport submits, is held inline and does not allocate.
+
 // WAIT_SLICE bounds one tick of the event loop, and so bounds how long a request
 // can go without the caller's probe being asked whether to stop.
 WAIT_SLICE :: 50 * time.Millisecond
