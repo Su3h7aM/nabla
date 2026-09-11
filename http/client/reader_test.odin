@@ -223,6 +223,66 @@ test_too_many_interim_responses_fail_the_request :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_folded_field_is_joined_with_sp :: proc(t: ^testing.T) {
+	// RFC 9112 5.2: a user agent that receives an obs-fold in a response replaces it
+	// with one or more SP octets before the field value is interpreted.
+	reader := _reader("HTTP/1.1 200 OK\r\nx-a: one\r\n  two\r\n\tthree\r\ncontent-length: 0\r\n\r\n")
+
+	status, headers, err := read_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, status, 200)
+
+	value, found := http.headers_get_unsafe(headers, "x-a")
+	testing.expect(t, found)
+	testing.expect_value(t, value, "one two three")
+
+	// The field after the fold was read normally, so the fold ended where it should.
+	_, length_found := http.headers_get_unsafe(headers, "content-length")
+	testing.expect(t, length_found)
+}
+
+@(test)
+test_a_folded_field_split_across_reads_is_joined :: proc(t: ^testing.T) {
+	// One octet per read, so the CRLF and the continuation always land in different
+	// reads.
+	reader := _reader("HTTP/1.1 200 OK\r\nx-a: one\r\n   two\r\n\r\n", 1)
+
+	_, headers, err := read_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+
+	value, found := http.headers_get_unsafe(headers, "x-a")
+	testing.expect(t, found)
+	testing.expect_value(t, value, "one two")
+}
+
+@(test)
+test_a_whitespace_only_continuation_adds_nothing :: proc(t: ^testing.T) {
+	// The fold becomes a SP, and trailing whitespace is excluded from a field value
+	// when it is extracted, so a continuation carrying nothing adds nothing.
+	reader := _reader("HTTP/1.1 200 OK\r\nx-a: one\r\n \t \r\n\r\n", 1)
+
+	_, headers, err := read_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+
+	value, _ := http.headers_get_unsafe(headers, "x-a")
+	testing.expect_value(t, value, "one")
+}
+
+@(test)
+test_a_fold_that_continues_nothing_is_rejected :: proc(t: ^testing.T) {
+	// RFC 9112 2.2: a line that begins with whitespace cannot be a field line, so
+	// one arriving before any field cannot begin a field section.
+	reader := _reader("HTTP/1.1 200 OK\r\n  stray\r\n\r\n", 1)
+
+	_, headers, err := read_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.Bad_Response)
+}
+
+@(test)
 test_a_truncated_body_is_reported :: proc(t: ^testing.T) {
 	// RFC 9112 8: a body shorter than its Content-Length is incomplete, and the
 	// peer closing is what ends it.

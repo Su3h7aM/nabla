@@ -177,6 +177,26 @@ resolve_endpoint :: proc(url: http.URL, options: Options, allocator: mem.Allocat
 	return net.Endpoint{address = address, port = port}, .None
 }
 
+// append_folded_value continues a field with the value of a folded line.
+//
+// RFC 9112 5.2 defines obs-fold as OWS CRLF RWS and requires a user agent that
+// receives one in a response to replace it with one or more SP octets before the
+// field value is interpreted. The continuation's leading whitespace is the RWS,
+// and a continuation carrying nothing adds nothing, because trailing whitespace is
+// excluded from the field value when it is extracted.
+append_folded_value :: proc(headers: ^http.Headers, key, line: string, allocator: mem.Allocator) -> bool {
+	value := http.trim_ows(line)
+	if value == "" { return true }
+
+	_, value_ptr, just_inserted := http.headers_entry_unsafe(headers, key)
+	if just_inserted { return false }
+
+	continued := strings.concatenate({value_ptr^, " ", value}, allocator)
+	delete(value_ptr^, allocator)
+	value_ptr^ = continued
+	return true
+}
+
 read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status_code: int, headers: http.Headers, err: Error) {
 	line, line_err := reader_line(reader)
 	if line_err != .None { return 0, headers, line_err }
@@ -184,14 +204,28 @@ read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status
 	if !parsed { return 0, headers, .Bad_Response }
 	status_code = code
 	http.headers_init(&headers, allocator)
+
+	// The field a folded line continues. A field line cannot begin with whitespace
+	// (RFC 9112 5 and 5.2), so whitespace here can only be an obs-fold, and one
+	// that continues nothing is a message that cannot be read as a field section.
+	last_key: string
 	for count := 0;; count += 1 {
 		if count > HTTP_MAX_HEADER_LINES { return 0, headers, .Bad_Response }
 		header_line, header_err := reader_line(reader)
 		if header_err != .None { return 0, headers, header_err }
 		if header_line == "" { break }
-		if _, ok := http.header_parse(&headers, header_line, allocator); !ok {
-			return 0, headers, .Bad_Response
+
+		if header_line[0] == ' ' || header_line[0] == '\t' {
+			if last_key == "" { return 0, headers, .Bad_Response }
+			if !append_folded_value(&headers, last_key, header_line, allocator) {
+				return 0, headers, .Bad_Response
+			}
+			continue
 		}
+
+		key, ok := http.header_parse(&headers, header_line, allocator)
+		if !ok { return 0, headers, .Bad_Response }
+		last_key = key
 	}
 	return status_code, headers, .None
 }
