@@ -7,15 +7,21 @@ import "nabla:http"
 // Slice_Source feeds a response from memory, so the parsing path can be tested
 // without a socket.
 Slice_Source :: struct {
-	bytes: []u8,
-	at:    int,
+	bytes:     []u8,
+	at:        int,
 	// chunk bounds one read, so a test can force a response to arrive in pieces.
-	chunk: int,
+	chunk:     int,
+	// truncated reports the end of the stream as an error rather than a clean
+	// close, which is what a lost connection or an incomplete TLS close looks like.
+	truncated: bool,
 }
 
 slice_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error) {
 	source := (^Slice_Source)(user_data)
-	if source.at >= len(source.bytes) { return 0, .Closed }
+	if source.at >= len(source.bytes) {
+		if source.truncated { return 0, .Truncated }
+		return 0, .Closed
+	}
 
 	count = min(len(buffer), len(source.bytes) - source.at)
 	if source.chunk > 0 { count = min(count, source.chunk) }
@@ -26,10 +32,11 @@ slice_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error) 
 
 // _reader builds a reader over a response, delivered no more than `chunk` octets
 // at a time so that a chunk boundary cannot hide a parsing bug.
-_reader :: proc(response: string, chunk := 0) -> Reader {
+_reader :: proc(response: string, chunk := 0, truncated := false) -> Reader {
 	source := new(Slice_Source, context.temp_allocator)
 	source.bytes = transmute([]u8)response
 	source.chunk = chunk
+	source.truncated = truncated
 
 	reader: Reader
 	reader_init(&reader, slice_read, source, context.temp_allocator)
@@ -280,6 +287,82 @@ test_a_fold_that_continues_nothing_is_rejected :: proc(t: ^testing.T) {
 	_, headers, err := read_response_head(&reader, context.temp_allocator)
 	defer headers_destroy(&headers, context.temp_allocator)
 	testing.expect_value(t, err, Error.Bad_Response)
+}
+
+@(test)
+test_a_chunked_body_without_its_last_chunk_is_incomplete :: proc(t: ^testing.T) {
+	// RFC 9112 8: a body using the chunked coding is incomplete if the zero-sized
+	// chunk that terminates the encoding has not been received.
+	reader := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n", 1)
+
+	status, headers, err := read_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+
+	framing, length, framing_err := response_framing(status, .Post, headers)
+	testing.expect_value(t, framing_err, Error.None)
+
+	collector: Collector
+	defer delete(collector.buffer)
+	testing.expect(t, stream_body(&reader, framing, length, &collector, collect) != Error.None)
+}
+
+@(test)
+test_a_chunked_body_without_its_trailer_terminator_is_incomplete :: proc(t: ^testing.T) {
+	// RFC 9112 7.1: chunked-body ends with the last-chunk, the trailer section and
+	// a CRLF, so a body that stops after the last-chunk is short.
+	reader := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n", 1)
+
+	status, headers, err := read_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+
+	framing, length, framing_err := response_framing(status, .Post, headers)
+	testing.expect_value(t, framing_err, Error.None)
+
+	collector: Collector
+	defer delete(collector.buffer)
+	testing.expect(t, stream_body(&reader, framing, length, &collector, collect) != Error.None)
+}
+
+@(test)
+test_a_close_delimited_body_ends_at_a_clean_close :: proc(t: ^testing.T) {
+	// RFC 9112 6.3 item 8 and 8: without a framing field the body ends when the
+	// connection closes, and a header section received intact makes that a
+	// complete response.
+	reader := _reader("HTTP/1.1 200 OK\r\n\r\nbody", 1)
+
+	status, headers, err := read_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+
+	framing, length, framing_err := response_framing(status, .Post, headers)
+	testing.expect_value(t, framing_err, Error.None)
+	testing.expect_value(t, framing, Body_Framing.Until_Close)
+
+	collector: Collector
+	defer delete(collector.buffer)
+	testing.expect_value(t, stream_body(&reader, framing, length, &collector, collect), Error.None)
+	testing.expect_value(t, string(collector.buffer[:]), "body")
+}
+
+@(test)
+test_a_close_delimited_body_cut_short_is_incomplete :: proc(t: ^testing.T) {
+	// RFC 9112 8 and 9.8: closure delimits the body, but a response closed without a
+	// clean signal is incomplete. This is the shape of an incomplete TLS close, and
+	// treating it as complete is the attack the section warns about.
+	reader := _reader("HTTP/1.1 200 OK\r\n\r\nbody", 1, truncated = true)
+
+	status, headers, err := read_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+
+	framing, length, framing_err := response_framing(status, .Post, headers)
+	testing.expect_value(t, framing_err, Error.None)
+
+	collector: Collector
+	defer delete(collector.buffer)
+	testing.expect_value(t, stream_body(&reader, framing, length, &collector, collect), Error.Truncated)
 }
 
 @(test)
