@@ -15,39 +15,35 @@ import "nabla:ai"
 // steering reader thread. The agent knows about none of them: it reports what
 // happened through a Chat_Observer and this decides how to show it.
 cli_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id: string) {
-	source: ^agent.Catalog_Provider_Source
-	for &candidate in sources { if candidate.id == provider_id { source = &candidate; break } }
-	if source == nil { display_error(fmt.tprintf("provider not found: %s", provider_id)); return }
-
-	model_tools := false
-	model_found := false
-	model_max_output := 0
-	model_context_window := 0
-	effort_levels: [dynamic]string
-	defer delete(effort_levels)
-	for &candidate in source.models {
-		if candidate.id == model_id && !(candidate.disabled_present && candidate.disabled) {
-			model_found = true
-			model_tools = candidate.tools_present && candidate.tools
-			if candidate.max_output_tokens_present && candidate.max_output_tokens > 0 { model_max_output = candidate.max_output_tokens }
-			if candidate.context_window_present && candidate.context_window > 0 { model_context_window = candidate.context_window }
-			if candidate.thinking.levels_present {
-				for level in candidate.thinking.levels { append(&effort_levels, level) }
-			}
-			break
-		}
+	// The resolver is the only place sources are combined, and the catalog it
+	// returns is the only thing this front-end reads metadata from.
+	catalog, resolve_err := agent.resolve_catalog(sources, {}, {})
+	defer agent.catalog_destroy(&catalog)
+	if resolve_err != .None {
+		display_error("invalid configuration: a model cannot be excluded and customized at the same time")
+		return
 	}
-	if !model_found { display_error(fmt.tprintf("model not found for provider: %s %s", provider_id, model_id)); return }
-	if !source.base_url_present || source.base_url == "" { display_error("selected provider requires explicit base_url endpoint"); return }
-	if !source.api_present || source.api == "" { display_error("selected provider requires explicit api"); return }
-	api, api_ok := agent.chat_api_kind(source.api)
-	if !api_ok { display_error(fmt.tprintf("unsupported api: %s", source.api)); return }
+	provider: ^agent.Catalog_Provider
+	for &candidate in catalog.providers {
+		if candidate.id == provider_id { provider = &candidate; break }
+	}
+	if provider == nil { display_error(fmt.tprintf("provider not found: %s", provider_id)); return }
+	model: ^agent.Catalog_Model
+	for &candidate in catalog.models {
+		if candidate.provider_id == provider_id && candidate.id == model_id { model = &candidate; break }
+	}
+	// An excluded model is absent from the catalog rather than flagged in it.
+	if model == nil { display_error(fmt.tprintf("model not found for provider: %s %s", provider_id, model_id)); return }
+	if !provider.base_url_present || provider.base_url == "" { display_error("selected provider requires explicit base_url endpoint"); return }
+	if !provider.api_present || provider.api == "" { display_error("selected provider requires explicit api"); return }
+	api, api_ok := agent.chat_api_kind(provider.api)
+	if !api_ok { display_error(fmt.tprintf("unsupported api: %s", provider.api)); return }
 
-	if !source.api_key_present {
+	if !provider.api_key_present {
 		display_error("selected provider requires api_key")
 		return
 	}
-	credential, credential_ok := agent.config_resolve_credential(source.api_key, context.allocator)
+	credential, credential_ok := agent.config_resolve_credential(provider.api_key, context.allocator)
 	if !credential_ok {
 		display_error("selected provider requires api_key, or names an unset environment variable as ${NAME}")
 		return
@@ -58,10 +54,12 @@ cli_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id:
 	session := agent.chat_session_init(allocator)
 	defer agent.chat_session_destroy(&session)
 	if session.workspace == "" { display_error("cannot determine working directory"); return }
-	session.tools_enabled = model_tools && agent.chat_supports_tools(api)
-	session.max_output_tokens = model_max_output
-	session.context_window = model_context_window
-	for level in effort_levels { append(&session.effort_levels, strings.clone(level, allocator)) }
+	session.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(api)
+	session.max_output_tokens = model.max_output_tokens
+	session.context_window = model.context_window
+	if model.thinking.levels_present {
+		for level in model.thinking.levels { append(&session.effort_levels, strings.clone(level, allocator)) }
+	}
 
 	sink := Display_Sink {
 		output = os.to_writer(os.stdout),
@@ -70,7 +68,7 @@ cli_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id:
 
 	connection := ai.Provider_Connection {
 		API        = api,
-		Endpoint   = source.base_url,
+		Endpoint   = provider.base_url,
 		Credential = credential,
 	}
 	display_warning("shell execution is local and unsandboxed: valid model tool calls run directly")

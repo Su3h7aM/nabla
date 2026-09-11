@@ -88,7 +88,7 @@ load_model :: proc(L: ^l.State, raw_idx: c.int, provider_id, model_id: string, a
 	thinking_levels: [dynamic]string
 	thinking_levels.allocator = allocator
 	failed := true
-	defer if failed { config_model_source_destroy(out, allocator); config_strings_destroy(&input_modalities, allocator); config_strings_destroy(&output_modalities, allocator); config_strings_destroy(&thinking_levels, allocator) }
+	defer if failed { catalog_model_source_destroy(out, allocator); config_strings_destroy(&input_modalities, allocator); config_strings_destroy(&output_modalities, allocator); config_strings_destroy(&thinking_levels, allocator) }
 	base := l.gettop(L)
 	defer l.settop(L, base)
 	lua_field(L, idx, "disabled")
@@ -225,10 +225,12 @@ load_provider :: proc(L: ^l.State, raw_idx: c.int, provider_id: string, allocato
 	models: [dynamic]Catalog_Model_Source
 	models.allocator = allocator
 	failed := true
+	// On failure the local list still owns every model, so it is released before
+	// the provider, whose model field is not assigned until the end.
 	defer if failed {
-		config_provider_source_destroy(out, allocator)
-		for &model in models { config_model_source_destroy(&model, allocator) }
+		for &model in models { catalog_model_source_destroy(&model, allocator) }
 		delete(models)
+		catalog_provider_source_destroy(out, allocator)
 	}
 	base := l.gettop(L)
 	defer l.settop(L, base)
@@ -272,7 +274,7 @@ load_provider :: proc(L: ^l.State, raw_idx: c.int, provider_id: string, allocato
 			err := load_model(L, -1, provider_id, model_id, allocator, &model)
 			delete(model_id, allocator)
 			if err != .None {
-				config_model_source_destroy(&model, allocator)
+				catalog_model_source_destroy(&model, allocator)
 				return err
 			}
 			append(&models, model)
@@ -307,20 +309,20 @@ load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynam
 		if l.next(L, providers_idx) == 0 { break }
 		count += 1
 		if count > CONFIG_MAX_ENTRIES || l.type(L, -2) != .STRING {
-			config_sources_destroy(&result, allocator)
+			catalog_sources_destroy(&result, allocator)
 			return {}, .Invalid
 		}
 		provider_id, ok := lua_string(L, -2, allocator)
 		if !ok {
-			config_sources_destroy(&result, allocator)
+			catalog_sources_destroy(&result, allocator)
 			return {}, .Invalid
 		}
 		provider: Catalog_Provider_Source
 		err := load_provider(L, -1, provider_id, allocator, &provider)
 		delete(provider_id, allocator)
 		if err != .None {
-			config_provider_source_destroy(&provider, allocator)
-			config_sources_destroy(&result, allocator)
+			catalog_provider_source_destroy(&provider, allocator)
+			catalog_sources_destroy(&result, allocator)
 			return {}, err
 		}
 		append(&result, provider)
@@ -363,45 +365,12 @@ config_resolve_credential :: proc(value: string, allocator := context.allocator)
 	return strings.clone(value, allocator), true
 }
 
+
+// config_strings_destroy frees a loader-local string accumulator. Catalog fields
+// are released by catalog_strings_destroy, which takes a slice.
 config_strings_destroy :: proc(values: ^[dynamic]string, allocator: mem.Allocator) {
 	if values == nil { return }
 	for value in values^ { delete(value, allocator) }
 	delete(values^)
 	values^ = nil
-}
-
-config_model_source_destroy :: proc(model: ^Catalog_Model_Source, allocator: mem.Allocator) {
-	if model == nil { return }
-	delete(model.id, allocator)
-	if model.display_name_present { delete(model.display_name, allocator) }
-	if model.input_modalities_present {
-		for value in model.input_modalities { delete(value, allocator) }
-		delete(model.input_modalities, allocator)
-	}
-	if model.output_modalities_present {
-		for value in model.output_modalities { delete(value, allocator) }
-		delete(model.output_modalities, allocator)
-	}
-	if model.thinking.levels_present {
-		for value in model.thinking.levels { delete(value, allocator) }
-		delete(model.thinking.levels, allocator)
-	}
-	model^ = {}
-}
-
-config_provider_source_destroy :: proc(provider: ^Catalog_Provider_Source, allocator: mem.Allocator) {
-	if provider == nil { return }
-	delete(provider.id, allocator)
-	if provider.base_url_present { delete(provider.base_url, allocator) }
-	if provider.api_present { delete(provider.api, allocator) }
-	if provider.api_key_present { delete(provider.api_key, allocator) }
-	for &model in provider.models { config_model_source_destroy(&model, allocator) }
-	delete(provider.models, allocator)
-	provider^ = {}
-}
-
-config_sources_destroy :: proc(sources: ^[dynamic]Catalog_Provider_Source, allocator := context.allocator) {
-	for &provider in sources^ { config_provider_source_destroy(&provider, allocator) }
-	delete(sources^)
-	sources^ = nil
 }

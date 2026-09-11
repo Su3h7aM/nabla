@@ -33,7 +33,7 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 
 	sources, err := load_lua_config(path)
 	testing.expect_value(t, err, Config_Error.None)
-	defer config_sources_destroy(&sources)
+	defer catalog_sources_destroy(&sources)
 	testing.expect_value(t, len(sources), 1)
 	provider := sources[0]
 	testing.expect_value(t, provider.id, "acme")
@@ -133,6 +133,6 @@ test_lua_config_failures_leave_no_partial_sources :: proc(t: ^testing.T) {
 		sources, err := load_lua_config(path)
 		testing.expectf(t, err != .None, "case %d loaded without error", i)
 		testing.expect_value(t, len(sources), 0)
-		config_sources_destroy(&sources)
+		catalog_sources_destroy(&sources)
 	}
 }

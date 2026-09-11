@@ -51,7 +51,7 @@ main :: proc() {
 	}
 	sources, err := agent.load_lua_config(
 		options.config_path,
-	); if err != .None { fmt.println(agent.config_error_text(err)); return }; defer agent.config_sources_destroy(&sources)
+	); if err != .None { fmt.println(agent.config_error_text(err)); return }; defer agent.catalog_sources_destroy(&sources)
 	if options.provider_id == "" || options.model_id == "" {
 		for provider in sources { for model in provider.models { if model.disabled_present && model.disabled { continue }; fmt.println(provider.id, "/", model.id) } }; return
 	}
