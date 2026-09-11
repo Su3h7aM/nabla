@@ -175,8 +175,11 @@ method_parse :: proc(m: string) -> (method: Method, ok: bool) #no_bounds_check {
 
 // Parses the header and adds it to the headers if valid. The given string is copied.
 header_parse :: proc(headers: ^Headers, line: string, allocator := context.temp_allocator) -> (key: string, ok: bool) {
-	// Preceding spaces should not be allowed.
-	(len(line) > 0 && line[0] != ' ') or_return
+	// RFC 9112 5: field-line = field-name ":" OWS field-value OWS, and a field name
+	// is a token, so a field line cannot begin with whitespace. RFC 9112 5.2 defines
+	// obs-fold as OWS CRLF RWS, and RWS is SP or HTAB, so a line beginning with
+	// either is a continuation rather than a field line.
+	(len(line) > 0 && line[0] != ' ' && line[0] != '\t') or_return
 
 	colon := strings.index_byte(line, ':')
 	(colon > 0) or_return

@@ -60,6 +60,21 @@ test_a_field_value_keeps_a_trailing_carriage_return :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_field_line_cannot_begin_with_whitespace :: proc(t: ^testing.T) {
+	// RFC 9112 5: field-line = field-name ":" OWS field-value OWS, and a field name
+	// is a token, so a field line cannot begin with whitespace. RFC 9112 5.2 defines
+	// obs-fold as OWS CRLF RWS, and RWS is SP or HTAB, so a line beginning with
+	// either is a continuation rather than a field line -- including a tab.
+	headers: Headers
+	headers_init(&headers, context.temp_allocator)
+
+	for line in ([]string{" x: 1", "\tx: 1", "\t: 1", " \t: 1"}) {
+		_, ok := header_parse(&headers, line, context.temp_allocator)
+		testing.expectf(t, !ok, "%q was accepted as a field line", line)
+	}
+}
+
+@(test)
 test_version_parse_reads_http_1_1 :: proc(t: ^testing.T) {
 	version, ok := version_parse("HTTP/1.1")
 	testing.expect(t, ok)
