@@ -11,6 +11,7 @@ package ai
 import "core:c"
 import "core:fmt"
 import "core:mem"
+import "core:nbio"
 import "core:net"
 import "core:os"
 import "core:strings"
@@ -432,12 +433,17 @@ test_transport_refused_connection_fails_to_connect :: proc(t: ^testing.T) {
 	endpoint, info_err := net.bound_endpoint(held)
 	testing.expect(t, info_err == nil)
 
-	// The hook makes the dial nonblocking, which is the path that has to learn why
+	// The probe makes the dial nonblocking, which is the path that has to learn why
 	// the connect failed from the socket error rather than from connect itself.
 	control: HTTP_Control
 	options := client.Options {
-		wait = {hook = http_wait, data = &control},
+		probe = {check = http_probe, user_data = &control},
 	}
+	// connection_dial waits on the calling thread's event loop, so a test that
+	// drives the transport directly owns one the way stream_request does.
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+
 	connection, dial_err := client.connection_dial(endpoint, options, context.temp_allocator)
 	testing.expect(t, connection == nil)
 	testing.expect_value(t, dial_err, client.Error.Connect)

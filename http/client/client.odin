@@ -3,6 +3,7 @@ package client
 import "core:bytes"
 import "core:fmt"
 import "core:mem"
+import "core:nbio"
 import "core:net"
 import "core:strconv"
 import "core:strings"
@@ -61,12 +62,19 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	if url.scheme != "http" && url.scheme != "https" { return failure_from_error(.None, .Invalid_URL, "URL scheme must be http or https") }
 	if url.host == "" { return failure_from_error(.None, .Invalid_URL, "URL host is empty") }
 
-	if stop := stop_from_wait(wait_probe(options.wait)); stop != .None {
+	// Every wait in this request runs on the calling thread's event loop, which
+	// owns readiness for the socket and for the resolver's.
+	if loop_err := nbio.acquire_thread_event_loop(); loop_err != nil {
+		return failure_from_error(.None, .Transport, "the event loop could not be started")
+	}
+	defer nbio.release_thread_event_loop()
+
+	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
 		return failure_from_error(error_from_stop(stop))
 	}
 	endpoint, resolve_err := resolve_endpoint(url, options, request.allocator)
 	if resolve_err != .None { return failure_from_error(resolve_err) }
-	if stop := stop_from_wait(wait_probe(options.wait)); stop != .None {
+	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
 		return failure_from_error(error_from_stop(stop))
 	}
 

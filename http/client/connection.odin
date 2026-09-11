@@ -12,7 +12,7 @@ Connection :: struct {
 	socket:      net.TCP_Socket,
 	ssl:         ^SSL,
 	ctx:         ^SSL_CTX,
-	wait:        Wait_Channel,
+	probe:       Probe,
 	ca_file:     string,
 	allocator:   mem.Allocator,
 	stop:        Transport_Stop,
@@ -20,14 +20,15 @@ Connection :: struct {
 }
 
 // connection_dial returns nil on failure, so a caller never owns a half-built
-// connection.
+// connection. It waits on the calling thread's core:nbio event loop, which the
+// caller must have acquired.
 connection_dial :: proc(endpoint: net.Endpoint, options: Options, allocator: mem.Allocator) -> (^Connection, Error) {
 	if endpoint.port == 0 { return nil, .Connect }
 	connection := new(Connection, allocator)
 	connection.allocator = allocator
-	connection.wait = options.wait
+	connection.probe = options.probe
 	connection.ca_file = options.ca_file
-	connection.nonblocking = options.wait.hook != nil
+	connection.nonblocking = options.probe.check != nil
 
 	// core:net owns socket creation, so CLOEXEC and the address family are handled
 	// there rather than restated as raw bits here.
@@ -245,11 +246,13 @@ connection_read :: proc(connection: ^Connection, buffer: []u8) -> (count: int, e
 	}
 }
 
-// connection_wait reports cancellation ahead of readiness, so an accepted
-// cancellation can never turn into a success.
-connection_wait :: proc(connection: ^Connection, kind: Wait_Kind) -> Transport_Stop {
-	stop := stop_from_wait(wait_for(connection.wait, i64(connection.socket), kind, 0))
-	if stop != .None && connection.stop == .None { connection.stop = stop }
+// connection_wait waits on the event loop until the socket is ready, or the
+// caller's probe ends the request. Cancellation is reported ahead of readiness,
+// so an accepted cancellation can never turn into a success.
+connection_wait :: proc(connection: ^Connection, kind: Ready_For) -> Transport_Stop {
+	result, stop := wait_ready(connection.socket, kind, connection.probe)
+	if result == .Ready { return .None }
+	if connection.stop == .None { connection.stop = stop }
 	return stop
 }
 

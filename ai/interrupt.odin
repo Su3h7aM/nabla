@@ -1,7 +1,6 @@
 package ai
 
 import "core:sync"
-import linux "core:sys/linux"
 import "core:time"
 
 // Interrupt is a one-way cancellation token owned by the turn and observed by
@@ -20,7 +19,7 @@ import "core:time"
 // self-pipe would wake a blocked poll sooner, but it is an OS resource that would
 // have to be freed while a handler that already observed the token may still be
 // running; sigaction does not wait for in-flight handlers. Cancellation latency is
-// bounded by WAIT_SLICE instead, which is cheaper than that race.
+// bounded by the transport's wait slice instead, which is cheaper than that race.
 Interrupt :: struct {
 	// [generation:63][requested:1]. Must stay naturally aligned: the compare-exchange
 	// has to remain lock-free to be usable from a signal handler.
@@ -85,50 +84,4 @@ deadline_remaining :: proc(deadline: Deadline) -> (time.Duration, bool) {
 	elapsed := time.tick_since(deadline.at)
 	if elapsed >= 0 { return 0, true }
 	return -elapsed, true
-}
-
-// Wait_Outcome names why waiting stopped. Callers must treat Cancelled and
-// Timed_Out as distinct outcomes, and Ready as "retry the operation".
-Wait_Outcome :: enum {
-	Ready,
-	Timed_Out,
-	Cancelled,
-	Failed,
-}
-
-// WAIT_SLICE is the longest a single wait may block, and therefore the upper bound
-// on cancellation acknowledgement latency.
-WAIT_SLICE :: 50 * time.Millisecond
-
-// wait_fd polls one descriptor until it is ready, the deadline expires, or
-// cancellation is requested. A positive timeout bounds this call only and is
-// combined with the deadline, never replacing it. Cancellation dominates: it is
-// checked before each wait, so an accepted cancellation can never become a
-// success.
-wait_fd :: proc(fd: linux.Fd, events: linux.Fd_Poll_Events, deadline: Deadline, interrupt: ^Interrupt, timeout: time.Duration = 0) -> Wait_Outcome {
-	effective := deadline
-	if timeout > 0 {
-		if remaining, active := deadline_remaining(effective); !active || timeout < remaining {
-			effective = deadline_in(timeout)
-		}
-	}
-	fds := [1]linux.Poll_Fd{{fd = fd, events = events}}
-	for {
-		if interrupt_requested(interrupt) { return .Cancelled }
-		if deadline_expired(effective) { return .Timed_Out }
-		slice := WAIT_SLICE
-		if remaining, active := deadline_remaining(effective); active && remaining < slice {
-			slice = remaining
-		}
-		millis := i64(slice / time.Millisecond)
-		if slice % time.Millisecond != 0 { millis += 1 }
-		if millis > i64(max(i32)) { millis = i64(max(i32)) }
-		if millis < 0 { millis = 0 }
-		ready, poll_errno := linux.poll(fds[:], i32(millis))
-		if poll_errno == .EINTR { continue }
-		if poll_errno != .NONE { return .Failed }
-		if ready == 0 { continue }
-		if fds[0].revents != {} { return .Ready }
-		fds[0].revents = {}
-	}
 }

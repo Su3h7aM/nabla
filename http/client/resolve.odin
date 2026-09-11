@@ -92,7 +92,7 @@ exchange_udp :: proc(server: net.Endpoint, packet: []u8, buffer: []u8, options: 
 	if create_err != .None { return 0, {}, .None }
 	socket := created.(net.UDP_Socket)
 	defer net.close(socket)
-	if options.wait.hook != nil {
+	if options.probe.check != nil {
 		if block_err := net.set_blocking(socket, false); block_err != .None { return 0, {}, .None }
 	} else {
 		// Without a hook there is nothing to interrupt, so the attempt is bounded by
@@ -115,7 +115,8 @@ send_query :: proc(socket: net.UDP_Socket, packet: []u8, server: net.Endpoint, o
 			// A datagram is all-or-nothing, so a short write is not retryable.
 			return written == len(packet), .None
 		case .Would_Block:
-			if err := attempt_wait(wait_for(options.wait, i64(socket), .Write, DNS_TIMEOUT), options); err != .None {
+			result, stop := wait_ready(socket, .Write, options.probe, DNS_TIMEOUT)
+			if err := attempt_end(result, stop, options); err != .None {
 				return false, err
 			}
 		case .Interrupted:
@@ -133,9 +134,9 @@ receive_reply :: proc(socket: net.UDP_Socket, buffer: []u8, options: Options) ->
 		case nil:
 			if received > 0 { return received, from, .None }
 		case .Would_Block:
-			status := wait_for(options.wait, i64(socket), .Read, DNS_TIMEOUT)
-			if status == .Ready { continue }
-			if wait_err := attempt_wait(status, options); wait_err != .None {
+			result, stop := wait_ready(socket, .Read, options.probe, DNS_TIMEOUT)
+			if result == .Ready { continue }
+			if wait_err := attempt_end(result, stop, options); wait_err != .None {
 				return 0, {}, wait_err
 			}
 			return 0, {}, .None
@@ -150,27 +151,26 @@ receive_reply :: proc(socket: net.UDP_Socket, buffer: []u8, options: Options) ->
 	}
 }
 
-// attempt_wait decides whether an exhausted wait ends the operation or only this
-// attempt. Only the caller's own policy can answer that.
-attempt_wait :: proc(status: Wait_Status, options: Options) -> Error {
-	switch status {
-	case .Ready:
+// attempt_end decides whether an exhausted attempt ends the request or only this
+// attempt. A wait that stopped because the caller's own policy said so ends the
+// request; one that merely ran out its own bound moves on to the next server,
+// which is why the policy is asked again rather than inferred from the stop.
+attempt_end :: proc(result: Wait_Result, stop: Transport_Stop, options: Options) -> Error {
+	if result == .Ready { return .None }
+	if result == .Failed { return .Recv }
+	switch stop_from_wait(probe_now(options.probe)) {
+	case .None:
 		return .None
 	case .Cancelled:
 		return .Cancelled
-	case .Closed:
+	case .Timed_Out:
+		return .Timed_Out
+	case .Peer_Closed:
 		return .Closed
+	case .Truncated:
+		return .Truncated
 	case .Failed:
 		return .Recv
-	case .Timed_Out:
-		switch wait_probe(options.wait) {
-		case .Cancelled:
-			return .Cancelled
-		case .Timed_Out:
-			return .Timed_Out
-		case .Ready, .Closed, .Failed:
-			return .None
-		}
 	}
 	return .None
 }

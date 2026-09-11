@@ -2,9 +2,6 @@ package ai
 
 import "core:mem"
 import "core:net"
-import linux "core:sys/linux"
-import "core:time"
-
 import "nabla:http/client"
 import "nabla:sse"
 
@@ -60,9 +57,9 @@ http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: r
 		nameservers = request.nameservers,
 	}
 	if control.interrupt != nil || control.deadline.active {
-		options.wait = {
-			hook = http_wait,
-			data = &local_control,
+		options.probe = {
+			check     = http_probe,
+			user_data = &local_control,
 		}
 	}
 
@@ -75,31 +72,16 @@ http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: r
 	return http_failure_from(failure)
 }
 
-// http_wait adapts Svan's interrupt/deadline policy to the transport's wait hook.
-// Cancellation is reported through the same path as a deadline, so both stop a
-// stalled phase instead of waiting for the next poll slice. A transport-supplied
-// timeout bounds only the wait that asked for it.
-http_wait :: proc(user_data: rawptr, fd: i64, kind: client.Wait_Kind, timeout: time.Duration) -> client.Wait_Status {
+// http_probe adapts this package's interrupt and deadline policy to the
+// transport's probe. Readiness belongs to the transport's event loop, so the
+// policy only answers whether the request should keep running; both cancellation
+// and a deadline stop a stalled phase rather than waiting for it to finish.
+http_probe :: proc(user_data: rawptr) -> client.Wait_Status {
 	control := cast(^HTTP_Control)user_data
 	if control == nil { return .Ready }
-	if kind == .Probe {
-		if interrupt_requested(control.interrupt) { return .Cancelled }
-		if deadline_expired(control.deadline) { return .Timed_Out }
-		return .Ready
-	}
-	events: linux.Fd_Poll_Events = {.IN}
-	if kind == .Write { events = {.OUT} }
-	switch wait_fd(linux.Fd(fd), events, control.deadline, control.interrupt, timeout) {
-	case .Ready:
-		return .Ready
-	case .Timed_Out:
-		return .Timed_Out
-	case .Cancelled:
-		return .Cancelled
-	case .Failed:
-		return .Failed
-	}
-	return .Failed
+	if interrupt_requested(control.interrupt) { return .Cancelled }
+	if deadline_expired(control.deadline) { return .Timed_Out }
+	return .Ready
 }
 
 http_failure_from :: proc(failure: client.Failure) -> HTTP_Failure {

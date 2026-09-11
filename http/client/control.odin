@@ -1,26 +1,18 @@
 // Package client is a minimal HTTP/1.1 client whose blocking phases are
-// interruptible. The caller supplies a wait hook, so cancellation and deadlines
-// are the caller's policy and the transport never blocks unobservably.
+// interruptible. Readiness and deadlines are the transport's business and are
+// answered by a core:nbio event loop; the caller supplies only an interruption
+// policy, so it never has to poll a descriptor itself.
 //
 // It is a stopgap kept deliberately small: streaming bodies, verified TLS,
 // deadlines, and cancellation are the whole requirement set, and nothing is
-// added beyond them. Migrate to the official core HTTP package once it exists;
-// upstream laid its foundation with core:nbio (odin-lang/Odin #6124, backbone
-// of the coming HTTP package) but has not published it yet.
+// added beyond them.
 package client
 
 import "core:net"
-import "core:time"
 
-// Wait_Kind is the readiness a caller is asked to wait for. Probe asks for
-// terminal state without waiting, so work the transport cannot interrupt can be
-// bracketed by it.
-Wait_Kind :: enum {
-	Read,
-	Write,
-	Probe,
-}
-
+// Wait_Status is why a probe ended. Ready means the request should continue; the
+// other values end it, and Cancelled and Timed_Out stay distinct so a caller
+// never reports one as the other.
 Wait_Status :: enum {
 	Ready,
 	Timed_Out,
@@ -29,35 +21,26 @@ Wait_Status :: enum {
 	Failed,
 }
 
-// Wait_Hook blocks until a descriptor is ready or reports why waiting stopped.
-// fd is -1 for a Probe. A timeout of zero means "until the caller's own deadline
-// or cancellation"; a positive timeout only bounds this one wait, which is how a
-// single DNS attempt can expire without ending the operation.
-// A nil hook means blocking I/O and no interruption.
-Wait_Hook :: #type proc(user_data: rawptr, fd: i64, kind: Wait_Kind, timeout: time.Duration) -> Wait_Status
+// Probe is the caller's interruption policy for one request. It is asked before
+// each wait slice and answers only whether the request should keep going; an
+// empty check waits indefinitely.
+Probe :: struct {
+	check:     proc(user_data: rawptr) -> Wait_Status,
+	user_data: rawptr,
+}
 
-Wait_Channel :: struct {
-	hook: Wait_Hook,
-	data: rawptr,
+probe_now :: proc(probe: Probe) -> Wait_Status {
+	if probe.check == nil { return .Ready }
+	return probe.check(probe.user_data)
 }
 
 // Options carries caller policy. An empty ca_file uses the platform trust store;
 // a value replaces it. TLS verification is always on. Empty nameservers use the
 // system resolver configuration.
 Options :: struct {
-	wait:        Wait_Channel,
+	probe:       Probe,
 	ca_file:     string,
 	nameservers: []net.Endpoint,
-}
-
-wait_for :: proc(channel: Wait_Channel, fd: i64, kind: Wait_Kind, timeout: time.Duration) -> Wait_Status {
-	if channel.hook == nil { return .Ready }
-	return channel.hook(channel.data, fd, kind, timeout)
-}
-
-wait_probe :: proc(channel: Wait_Channel) -> Wait_Status {
-	if channel.hook == nil { return .Ready }
-	return channel.hook(channel.data, -1, .Probe, 0)
 }
 
 // Error classifies transport outcomes. Cancellation and deadlines stay distinct
