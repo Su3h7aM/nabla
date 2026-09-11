@@ -69,9 +69,12 @@ Status :: struct {
 // Snapshot is everything the renderer reads. The worker bumps generation
 // after any change; the main thread redraws when it moves.
 Snapshot :: struct {
-	entries:    [dynamic]Entry, // owned,
-	status:     Status,
-	generation: u64,
+	entries:     [dynamic]Entry, // owned,
+	status:      Status,
+	// setup_error is why the last selection attempt failed; the picker shows
+	// it because it has no transcript.
+	setup_error: string, // owned,
+	generation:  u64,
 }
 
 Work_Kind :: enum u8 {
@@ -82,11 +85,18 @@ Work_Kind :: enum u8 {
 	Model,
 }
 Work :: struct {
-	kind: Work_Kind,
-	text: string, // owned,
+	kind:     Work_Kind,
+	provider: string, // owned; target provider for .Model, empty otherwise,
+	text:     string, // owned; model id for .Model, prompt or effort text otherwise,
 }
 
 Work_Chan :: chan.Chan(Work)
+
+// Picker_Entry is one selectable model in the picker: a serving identity.
+Picker_Entry :: struct {
+	provider_id: string,
+	model_id:    string,
+}
 
 Runtime :: struct {
 	mu:         sync.Mutex, // guards snapshot,
@@ -108,6 +118,10 @@ Run_Setup :: struct {
 	session:     agent.Chat_Session,
 	provider_id: string, // owned,
 	model_id:    string, // owned,
+	// configured holds the provider ids the user's own configuration declares;
+	// models.dev also contributes providers, and the picker offers only the
+	// configured ones, whose credentials the user actually set up.
+	configured:  [dynamic]string, // owned,
 	alloc:       mem.Allocator,
 }
 
@@ -127,14 +141,19 @@ App :: struct {
 	cancel_seen:     bool, // the running cancel came from our own keys, not a signal,
 	spin_lap:        time.Tick, // last working-frame advance,
 	spin_frame:      int,
+	picking:         bool, // the model picker owns the input until a model applies,
+	picker_cursor:   int,
+	picker_top:      int, // first picker line on screen, so the cursor stays visible,
 	columns:         int,
 	rows:            int,
 	quit:            bool,
 }
 
-// run_setup resolves the catalog, validates the selection, and builds the
-// session. Errors print to stderr; false means the caller should exit.
-run_setup :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id: string) -> (Run_Setup, bool) {
+// run_catalog resolves the configuration into the catalog and creates the
+// session. Which provider and model run is applied separately, so the
+// front-end can start without a selection and choose one in the TUI. Errors
+// print to stderr; false means the caller should exit.
+run_catalog :: proc(sources: []agent.Catalog_Provider_Source) -> (Run_Setup, bool) {
 	result := Run_Setup {
 		alloc = context.allocator,
 	}
@@ -154,47 +173,8 @@ run_setup :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_i
 		return result, false
 	}
 	result.catalog = catalog
-
-	provider_index, provider_found := agent.catalog_find_provider(&result.catalog, provider_id)
-	if !provider_found {
-		fmt.eprintln("nabla: provider not found:", provider_id)
-		return result, false
-	}
-	provider := &result.catalog.providers[provider_index]
-	model_index, model_found := agent.catalog_find_model(&result.catalog, provider_id, model_id)
-	if !model_found {
-		fmt.eprintln("nabla: model not found for provider:", provider_id, model_id)
-		return result, false
-	}
-	model := &result.catalog.models[model_index]
-	if !provider.base_url_present || provider.base_url == "" {
-		fmt.eprintln("nabla: selected provider requires explicit base_url endpoint")
-		return result, false
-	}
-	if !provider.api_present || provider.api == "" {
-		fmt.eprintln("nabla: selected provider requires explicit api")
-		return result, false
-	}
-	api, api_ok := agent.chat_api_kind(provider.api)
-	if !api_ok {
-		fmt.eprintln("nabla: unsupported api:", provider.api)
-		return result, false
-	}
-	if !provider.api_key_present {
-		fmt.eprintln("nabla: selected provider requires api_key")
-		return result, false
-	}
-	credential, credential_ok := agent.config_resolve_credential(provider.api_key, result.alloc)
-	if !credential_ok {
-		fmt.eprintln("nabla: selected provider requires api_key: name an environment variable that is set, or provide the key")
-		return result, false
-	}
-	result.credential = credential
-	result.api = api
-	result.connection = ai.Provider_Connection {
-		API        = api,
-		Endpoint   = provider.base_url,
-		Credential = credential,
+	for &source in sources {
+		append(&result.configured, strings.clone(source.id, result.alloc))
 	}
 
 	session := agent.chat_session_init(result.alloc)
@@ -203,36 +183,163 @@ run_setup :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_i
 		fmt.eprintln("nabla: cannot determine working directory")
 		return result, false
 	}
-	session.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(api)
-	session.max_output_tokens = model.max_output_tokens
-	window, _ := agent.chat_context_window(model^)
-	session.context_window = window
-	if model.thinking.levels_present {
-		for level in model.thinking.levels {
-			append(&session.effort_levels, strings.clone(level, result.alloc))
-		}
-	}
-	result.session = session
-	result.provider_id = strings.clone(provider_id, result.alloc)
-	result.model_id = strings.clone(model_id, result.alloc)
 
 	ok = true
 	return result, true
 }
 
+// provider_usable reports whether a provider can serve a request at all: an
+// endpoint, an api family, and a credential source. The picker offers only
+// usable providers' models.
+provider_usable :: proc(provider: ^agent.Catalog_Provider) -> bool {
+	return provider.base_url_present && provider.base_url != "" && provider.api_present && provider.api != "" && provider.api_key_present
+}
+
+// provider_configured reports whether the user's own configuration named the
+// provider; models.dev contributes providers the user never set up, and their
+// credentials are not the user's to resolve.
+provider_configured :: proc(app: ^App, provider_id: string) -> bool {
+	for id in app.setup.configured {
+		if id == provider_id {
+			return true
+		}
+	}
+	return false
+}
+
+// apply_selection switches the runtime to one provider's model and applies an
+// effort level. It resolves the credential and builds the connection, so it
+// must run where the runtime is owned: on the worker once it exists, or at
+// startup before it starts. The selection persists on success, so the next
+// launch restores it. A failure is reported through the snapshot; the
+// previously selected model, if any, stays in place.
+apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> bool {
+	provider_index, provider_found := agent.catalog_find_provider(&app.setup.catalog, provider_id)
+	if !provider_found {
+		selection_fail(app, fmt.tprintf("provider not found: %s", provider_id))
+		return false
+	}
+	provider := &app.setup.catalog.providers[provider_index]
+	if !provider_usable(provider) {
+		selection_fail(app, fmt.tprintf("provider %s needs base_url, api, and api_key", provider_id))
+		return false
+	}
+	api, api_ok := agent.chat_api_kind(provider.api)
+	if !api_ok {
+		selection_fail(app, fmt.tprintf("unsupported api: %s", provider.api))
+		return false
+	}
+	credential, credential_ok := agent.config_resolve_credential(provider.api_key, app.setup.alloc)
+	if !credential_ok {
+		selection_fail(app, fmt.tprintf("provider %s needs api_key: name an environment variable that is set, or provide the key", provider_id))
+		return false
+	}
+	model_index, model_found := agent.catalog_find_model(&app.setup.catalog, provider_id, model_id)
+	if !model_found {
+		delete(credential, app.setup.alloc)
+		selection_fail(app, fmt.tprintf("model not found for provider: %s %s", provider_id, model_id))
+		return false
+	}
+	model := &app.setup.catalog.models[model_index]
+
+	session := &app.setup.session
+	window, _ := agent.chat_context_window(model^)
+	session.context_window = window
+	session.max_output_tokens = model.max_output_tokens
+	session.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(api)
+	agent.chat_session_set_effort(session, "")
+	for level in session.effort_levels {
+		delete(level, session.allocator)
+	}
+	clear(&session.effort_levels)
+	if model.thinking.levels_present {
+		for level in model.thinking.levels {
+			append(&session.effort_levels, strings.clone(level, session.allocator))
+		}
+	}
+	// A persisted effort the restored model does not allow falls back to the
+	// provider default rather than failing the selection.
+	desired := effort
+	if desired != "" && !agent.chat_session_set_effort(session, desired) {
+		desired = ""
+	}
+
+	sync.mutex_lock(&app.run.mu)
+	defer sync.mutex_unlock(&app.run.mu)
+	delete(app.setup.credential, app.setup.alloc)
+	app.setup.credential = credential
+	app.setup.api = api
+	app.run.connection = ai.Provider_Connection {
+		API        = api,
+		Endpoint   = provider.base_url,
+		Credential = credential,
+	}
+	delete(app.setup.provider_id, app.setup.alloc)
+	app.setup.provider_id = strings.clone(provider_id, app.setup.alloc)
+	delete(app.setup.model_id, app.setup.alloc)
+	app.setup.model_id = strings.clone(model_id, app.setup.alloc)
+	status := &app.run.snap.status
+	if status.provider_id != provider_id {
+		delete(status.provider_id, app.run.alloc)
+		status.provider_id = strings.clone(provider_id, app.run.alloc)
+	}
+	if status.model_id != model_id {
+		delete(status.model_id, app.run.alloc)
+		status.model_id = strings.clone(model_id, app.run.alloc)
+	}
+	// The effort and the window apply here too, not only through
+	// refresh_status: a restored selection must show both before the first
+	// work item runs.
+	if status.effort != session.effort {
+		delete(status.effort, app.run.alloc)
+		status.effort = strings.clone(session.effort, app.run.alloc)
+	}
+	status.context_window = window
+	delete(app.run.snap.setup_error, app.run.alloc)
+	app.run.snap.setup_error = ""
+	snap_append_locked(app, .Notice, fmt.tprintf("model set to %s / %s", provider_id, model_id))
+	app.run.snap.generation += 1
+
+	saved := agent.Selection {
+		provider = provider_id,
+		model    = model_id,
+		effort   = session.effort,
+	}
+	sync.mutex_unlock(&app.run.mu)
+	agent.selection_save(saved)
+	sync.mutex_lock(&app.run.mu)
+	return true
+}
+
+// selection_fail records why a selection could not apply. The picker shows it
+// directly; chat mode sees it as a transcript warning.
+selection_fail :: proc(app: ^App, message: string) {
+	sync.mutex_lock(&app.run.mu)
+	defer sync.mutex_unlock(&app.run.mu)
+	delete(app.run.snap.setup_error, app.run.alloc)
+	app.run.snap.setup_error = strings.clone(message, app.run.alloc)
+	snap_append_locked(app, .Warning, message)
+	app.run.snap.generation += 1
+}
+
 run_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
 	agent.catalog_destroy(&setup.catalog)
+	for id in setup.configured {
+		delete(id, setup.alloc)
+	}
+	delete(setup.configured)
 	if setup.credential != "" { delete(setup.credential, setup.alloc) }
 	if setup.provider_id != "" { delete(setup.provider_id, setup.alloc) }
 	if setup.model_id != "" { delete(setup.model_id, setup.alloc) }
 	setup^ = {}
 }
 
-// tui_run is the interactive entry point: resolve, open the terminal, start
-// the worker, and drive the frame loop until quit.
-tui_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id: string) {
-	setup, setup_ok := run_setup(sources, provider_id, model_id)
+// tui_run is the interactive entry point: resolve the catalog, open the
+// terminal, apply the selection (explicit flags, then the persisted one, then
+// the in-TUI picker), start the worker, and drive the frame loop until quit.
+tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_model: string) {
+	setup, setup_ok := run_catalog(sources)
 	if !setup_ok {
 		return
 	}
@@ -259,15 +366,40 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id:
 	app.run.alloc = context.allocator
 	app.run.connection = setup.connection
 	app.run.snap.entries = make([dynamic]Entry, 0, 16, app.run.alloc)
-	app.run.snap.status.provider_id = setup.provider_id
+	app.run.snap.status.provider_id = strings.clone(setup.provider_id, app.run.alloc)
 	app.run.snap.status.model_id = strings.clone(setup.model_id, app.run.alloc)
 	app.run.snap.status.cwd = setup.session.workspace
 	app.run.snap.status.context_window = setup.session.context_window
+	// The picker owns the input until a selection applies: explicit flags, the
+	// persisted selection, or the user's choice.
+	app.picking = true
 	app.home = os.get_env("HOME", app.run.alloc)
 	app.line = make([dynamic]u8, 0, 128, app.run.alloc)
 	app.events = make([dynamic]input.Event, 0, 16, app.run.alloc)
 	app.storage = frame_storage_new(app.run.alloc)
 	app.run.work, _ = chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
+
+	if flag_provider != "" && flag_model != "" {
+		if !apply_selection(app, flag_provider, flag_model, "") {
+			fmt.eprintln("nabla:", app.run.snap.setup_error)
+			app_teardown(app)
+			return
+		}
+		app.picking = false
+	} else if flag_provider == "" && flag_model == "" {
+		if selection, selection_ok := agent.selection_load(app.run.alloc); selection_ok {
+			if apply_selection(app, selection.provider, selection.model, selection.effort) {
+				app.picking = false
+			}
+			delete(selection.provider, app.run.alloc)
+			delete(selection.model, app.run.alloc)
+			delete(selection.effort, app.run.alloc)
+		}
+	} else {
+		fmt.eprintln("nabla: --provider and --model must be given together")
+		app_teardown(app)
+		return
+	}
 
 	input.parser_init(&app.parser)
 	agent.chat_interactive_arm(&app.run.signals)
@@ -312,6 +444,12 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id:
 		// silent request (no stream events, tools running) still advances it.
 		now := time.tick_now()
 		advance_spinner := app.run.snap.status.running && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
+		// A picker selection applies on the worker; the first status that
+		// carries a model closes the picker.
+		if app.picking && app.run.snap.status.model_id != "" {
+			app.picking = false
+			app.cursor = 0
+		}
 		if count > 0 || resized || generation_changed(app) || advance_spinner {
 			if advance_spinner {
 				app.spin_frame = (app.spin_frame + 1) % SPINNER_FRAMES
@@ -362,8 +500,10 @@ app_teardown :: proc(app: ^App) {
 		}
 	}
 	delete(app.run.snap.entries)
+	delete(app.run.snap.status.provider_id, app.run.alloc)
 	delete(app.run.snap.status.model_id, app.run.alloc)
 	delete(app.run.snap.status.effort, app.run.alloc)
+	delete(app.run.snap.setup_error, app.run.alloc)
 	delete(app.home, app.run.alloc)
 	delete(app.line)
 	delete(app.events)
@@ -385,6 +525,9 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 		if work.text != "" {
 			delete(work.text, app.run.alloc)
 		}
+		if work.provider != "" {
+			delete(work.provider, app.run.alloc)
+		}
 	}
 }
 
@@ -404,55 +547,158 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	case .Context:
 		agent.chat_notice_context(&app.setup.session, observer)
 	case .Effort:
+		applied := true
 		if work.text == "" || work.text == "default" {
 			agent.chat_session_set_effort(&app.setup.session, "")
 			snap_append(app, .Notice, "effort cleared to provider default")
 		} else if agent.chat_session_set_effort(&app.setup.session, work.text) {
 			snap_append(app, .Notice, fmt.tprintf("effort set to %s for the next request", work.text))
 		} else {
+			applied = false
 			snap_append(app, .Notice, fmt.tprintf("effort %s is not allowed for this model", work.text))
 		}
+		// The effort is part of the persisted selection, so a change rewrites it.
+		if applied {
+			agent.selection_save(agent.Selection{provider = app.setup.provider_id, model = app.setup.model_id, effort = app.setup.session.effort})
+		}
 	case .Model:
-		run_model(app, work.text)
+		apply_selection(app, work.provider, work.text, "")
 	}
 	refresh_status(app)
 }
 
-// run_model switches the session to another model of the same provider.
-// Only the worker mutates the session; the footer picks the new id up from
-// the next refresh_status.
-run_model :: proc(app: ^App, model_id: string) {
-	if app.setup.session.state != .Idle {
-		snap_append(app, .Warning, "the model can change only when idle")
-		return
-	}
-	index, found := agent.catalog_find_model(&app.setup.catalog, app.setup.provider_id, model_id)
-	if !found {
-		snap_append(app, .Warning, fmt.tprintf("no model %s under provider %s", model_id, app.setup.provider_id))
-		return
-	}
-	model := &app.setup.catalog.models[index]
-	session := &app.setup.session
-	window, _ := agent.chat_context_window(model^)
-	session.context_window = window
-	session.max_output_tokens = model.max_output_tokens
-	session.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(app.setup.api)
-	agent.chat_session_set_effort(session, "")
-	for level in session.effort_levels {
-		delete(level, session.allocator)
-	}
-	clear(&session.effort_levels)
-	if model.thinking.levels_present {
-		for level in model.thinking.levels {
-			append(&session.effort_levels, strings.clone(level, session.allocator))
+// picker_entries lists every model the picker offers: one entry per usable
+// provider's model, ordered by provider id and then model id. The catalog's
+// own order follows the configuration loader's table iteration, which varies
+// between runs, so the picker sorts rather than trusting it.
+picker_entries :: proc(app: ^App, out: ^[dynamic]Picker_Entry) {
+	for &provider in app.setup.catalog.providers {
+		if !provider_usable(&provider) || !provider_configured(app, provider.id) {
+			continue
+		}
+		for &model in app.setup.catalog.models {
+			if model.provider_id != provider.id {
+				continue
+			}
+			picker_entry_insert(out, provider.id, model.id)
 		}
 	}
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
-	delete(app.setup.model_id, app.setup.alloc)
-	app.setup.model_id = strings.clone(model.id, app.setup.alloc)
-	app.run.snap.generation += 1
-	snap_append_locked(app, .Notice, fmt.tprintf("model set to %s", model.id))
+}
+
+// picker_entry_insert places an entry so the list stays ordered by provider id
+// and then model id.
+picker_entry_insert :: proc(out: ^[dynamic]Picker_Entry, provider_id, model_id: string) {
+	position := len(out^)
+	for index in 0 ..< len(out^) {
+		entry := &out^[index]
+		order := strings.compare(entry.provider_id, provider_id)
+		if order == 0 {
+			order = strings.compare(entry.model_id, model_id)
+		}
+		if order >= 0 {
+			position = index
+			break
+		}
+	}
+	append(out, Picker_Entry{})
+	for index := len(out^) - 1; index > position; index -= 1 {
+		out^[index] = out^[index - 1]
+	}
+	out^[position] = Picker_Entry {
+		provider_id = provider_id,
+		model_id    = model_id,
+	}
+}
+
+// picker_count reports how many models the picker offers.
+picker_count :: proc(app: ^App) -> int {
+	entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
+	picker_entries(app, &entries)
+	return len(entries)
+}
+
+// picker_page is how far one Page_Up/Page_Down moves in the picker.
+picker_page :: proc(app: ^App) -> int {
+	return max(app.rows - TUI_FOOTER_ROWS - 1, 1)
+}
+
+// picker_submit sends the entry under the cursor as the next selection.
+picker_submit :: proc(app: ^App) {
+	entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
+	picker_entries(app, &entries)
+	if len(entries) == 0 {
+		return
+	}
+	cursor := app.picker_cursor
+	if cursor >= len(entries) {
+		cursor = len(entries) - 1
+	}
+	enqueue(app, .Model, entries[cursor].provider_id, entries[cursor].model_id)
+}
+
+// handle_picker_key drives the model picker: arrows move, enter applies,
+// escape quits.
+handle_picker_key :: proc(app: ^App, key: input.Key_Event) {
+	#partial switch key.code {
+	case .Up:
+		if app.picker_cursor > 0 {
+			app.picker_cursor -= 1
+		}
+	case .Down:
+		entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
+		picker_entries(app, &entries)
+		if app.picker_cursor < len(entries) - 1 {
+			app.picker_cursor += 1
+		}
+	case .Enter:
+		picker_submit(app)
+	case .Escape:
+		app.quit = true
+	case .Home:
+		app.picker_cursor = 0
+	case .End:
+		entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
+		picker_entries(app, &entries)
+		app.picker_cursor = max(len(entries) - 1, 0)
+	case .Page_Up:
+		app.picker_cursor = max(app.picker_cursor - picker_page(app), 0)
+	case .Page_Down:
+		app.picker_cursor = min(app.picker_cursor + picker_page(app), picker_count(app) - 1)
+	case:
+	}
+}
+
+// resolve_model_reference maps a /model argument onto a serving identity. The
+// current provider is preferred, then any single provider serving that model
+// id, then an explicit "provider/model" pair.
+resolve_model_reference :: proc(app: ^App, text: string) -> (provider_id, model_id: string, ok: bool) {
+	if _, found := agent.catalog_find_model(&app.setup.catalog, app.setup.provider_id, text); found {
+		return app.setup.provider_id, text, true
+	}
+	matches := 0
+	found_provider := ""
+	for &provider in app.setup.catalog.providers {
+		if _, found := agent.catalog_find_model(&app.setup.catalog, provider.id, text); found {
+			matches += 1
+			found_provider = provider.id
+		}
+	}
+	if matches == 1 {
+		return found_provider, text, true
+	}
+	if slash := strings.index_byte(text, '/'); slash > 0 {
+		qualified_provider := text[:slash]
+		qualified_model := text[slash + 1:]
+		if _, found := agent.catalog_find_model(&app.setup.catalog, qualified_provider, qualified_model); found {
+			return qualified_provider, qualified_model, true
+		}
+	}
+	if matches > 1 {
+		snap_append(app, .Notice, fmt.tprintf("several providers serve %s; use provider/model", text))
+	} else {
+		snap_append(app, .Notice, fmt.tprintf("no model %s", text))
+	}
+	return "", "", false
 }
 
 // refresh_status recomputes the status block from the session after a work
@@ -475,6 +721,10 @@ refresh_status :: proc(app: ^App) {
 	status.context_window = session.context_window
 	status.cwd = session.workspace
 	status.running = session.state != .Idle
+	if status.provider_id != app.setup.provider_id {
+		delete(status.provider_id, app.run.alloc)
+		status.provider_id = strings.clone(app.setup.provider_id, app.run.alloc)
+	}
 	if status.model_id != app.setup.model_id {
 		delete(status.model_id, app.run.alloc)
 		status.model_id = strings.clone(app.setup.model_id, app.run.alloc)
@@ -628,7 +878,11 @@ obs_usage :: proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Ev
 handle_event :: proc(app: ^App, event: input.Event) {
 	#partial switch data in event {
 	case input.Key_Event:
-		handle_key(app, data)
+		if app.picking {
+			handle_picker_key(app, data)
+		} else {
+			handle_key(app, data)
+		}
 	case input.Resize_Event:
 	case input.End_Of_Input:
 		app.quit = true
@@ -705,7 +959,7 @@ submit :: proc(app: ^App) {
 	if strings.has_prefix(text, "/") {
 		dispatch_command(app, text)
 	} else {
-		enqueue(app, .Prompt, text)
+		enqueue(app, .Prompt, "", text)
 	}
 	clear(&app.line)
 	app.cursor = 0
@@ -723,26 +977,32 @@ dispatch_command :: proc(app: ^App, text: string) {
 		}
 		app.quit = true
 	case text == "/compact":
-		enqueue(app, .Compact, "")
+		enqueue(app, .Compact, "", "")
 	case text == "/context":
-		enqueue(app, .Context, "")
+		enqueue(app, .Context, "", "")
 	case text == "/effort" || strings.has_prefix(text, "/effort "):
-		enqueue(app, .Effort, strings.trim_space(text[len("/effort"):]))
+		enqueue(app, .Effort, "", strings.trim_space(text[len("/effort"):]))
 	case text == "/model" || strings.has_prefix(text, "/model "):
 		rest := strings.trim_space(text[len("/model"):])
 		if rest == "" {
 			snap_append(app, .Notice, "usage: /model <model-id>")
 			return
 		}
-		enqueue(app, .Model, rest)
+		provider_id, model_id, ok := resolve_model_reference(app, rest)
+		if ok {
+			enqueue(app, .Model, provider_id, model_id)
+		}
 	case:
 		snap_append(app, .Notice, fmt.tprintf("unknown command: %s", text))
 	}
 }
 
-enqueue :: proc(app: ^App, kind: Work_Kind, text: string) {
+enqueue :: proc(app: ^App, kind: Work_Kind, provider, text: string) {
 	item := Work {
 		kind = kind,
+	}
+	if provider != "" {
+		item.provider = strings.clone(provider, app.run.alloc)
 	}
 	if text != "" {
 		item.text = strings.clone(text, app.run.alloc)
@@ -752,6 +1012,9 @@ enqueue :: proc(app: ^App, kind: Work_Kind, text: string) {
 	}
 	if item.text != "" {
 		delete(item.text, app.run.alloc)
+	}
+	if item.provider != "" {
+		delete(item.provider, app.run.alloc)
 	}
 	snap_append(app, .Warning, "input queue full; line dropped")
 }

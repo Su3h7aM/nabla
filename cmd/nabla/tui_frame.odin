@@ -103,6 +103,10 @@ FOOTER_TEXT :: tui.Style {
 FOOTER_MUTED :: tui.Style {
 	foreground = tui.RGB_Color{110, 110, 118},
 }
+PICKED_STYLE :: tui.Style {
+	foreground = tui.RGB_Color{129, 162, 190},
+	modifiers  = {.Bold},
+}
 
 // BODY_INDENT is how far message bodies sit under their label, matching the
 // reference layout.
@@ -271,7 +275,14 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (frame: term.Frame_B
 		return {}, nil, .Layout_Failed
 	}
 
-	draw_conversation(app, storage, conv_rect)
+	caret: term.Cursor_Intent = nil
+	if app.picking {
+		draw_picker(app, storage, conv_rect)
+		draw_input_hint(storage, input_rect)
+	} else {
+		draw_conversation(app, storage, conv_rect)
+		caret = draw_input(app, storage, input_rect)
+	}
 	// The rule above the input doubles as the working indicator while a
 	// request is active.
 	if app.run.snap.status.running {
@@ -279,7 +290,6 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (frame: term.Frame_B
 	} else {
 		draw_rule(storage, rule_top_rect)
 	}
-	caret := draw_input(app, storage, input_rect)
 	draw_rule(storage, rule_bottom_rect)
 	draw_footer(app, storage, cwd_rect, status_rect)
 
@@ -355,6 +365,99 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 		}
 		_, _ = tui.draw_ascii(&storage.buffer, row, line.text, line.style)
 	}
+}
+
+// draw_picker renders the model picker: a title, the last selection error if
+// any, and one line per offered model grouped under its provider, with the
+// cursor kept visible in a scrolling window.
+draw_picker :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
+	if rect.height <= 0 || rect.width <= 0 {
+		return
+	}
+	lines := make([dynamic]Line, 0, 64, context.temp_allocator)
+	append(&lines, Line{text = "Select a model", style = TITLE_STYLE})
+	if app.run.snap.setup_error != "" {
+		append(&lines, Line{text = app.run.snap.setup_error, style = ERROR_TEXT})
+	}
+	entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
+	picker_entries(app, &entries)
+	cursor := app.picker_cursor
+	if cursor >= len(entries) {
+		cursor = max(len(entries) - 1, 0)
+	}
+	current_provider := ""
+	for entry, index in entries {
+		if entry.provider_id != current_provider {
+			current_provider = entry.provider_id
+			append(&lines, Line{text = fmt.tprintf("[%s]", current_provider), style = LABEL_STYLE})
+		}
+		if index == cursor {
+			append(&lines, Line{text = fmt.tprintf("> %s", entry.model_id), style = PICKED_STYLE})
+		} else {
+			append(&lines, Line{text = entry.model_id, style = HINT_STYLE, indent = 2})
+		}
+	}
+	total := len(lines)
+	if total == 0 {
+		return
+	}
+	// The cursor's line must stay inside the window.
+	cursor_line := picker_cursor_line(app, cursor, &lines)
+	visible := rect.height
+	if cursor_line < app.picker_top {
+		app.picker_top = cursor_line
+	}
+	if cursor_line >= app.picker_top + visible {
+		app.picker_top = cursor_line - visible + 1
+	}
+	start := app.picker_top
+	if start > max(total - visible, 0) {
+		start = max(total - visible, 0)
+	}
+	for i in 0 ..< visible {
+		idx := start + i
+		if idx >= total {
+			break
+		}
+		line := &lines[idx]
+		row := tui.Cell_Rect {
+			x      = rect.x + line.indent,
+			y      = rect.y + i,
+			width  = rect.width - line.indent,
+			height = 1,
+		}
+		if row.width <= 0 {
+			continue
+		}
+		_, _ = tui.draw_ascii(&storage.buffer, row, line.text, line.style)
+	}
+}
+
+// picker_cursor_line finds the rendered line of the cursor entry.
+picker_cursor_line :: proc(app: ^App, cursor: int, lines: ^[dynamic]Line) -> int {
+	entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
+	picker_entries(app, &entries)
+	line_index := 1
+	current_provider := ""
+	for entry, index in entries {
+		if entry.provider_id != current_provider {
+			current_provider = entry.provider_id
+			line_index += 1
+		}
+		if index == cursor {
+			return line_index
+		}
+		line_index += 1
+	}
+	return min(line_index, len(lines^) - 1)
+}
+
+// draw_input_hint replaces the prompt with the picker's keys while it is open.
+draw_input_hint :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect) {
+	if rect.height <= 0 || rect.width <= 0 {
+		return
+	}
+	_, _ = tui.draw_ascii(&storage.buffer, rect, "up/down move | enter select | esc quit", HINT_STYLE)
 }
 
 // emit_entry turns one conversation entry into a label plus wrapped body
@@ -580,14 +683,18 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 		return
 	}
 	status := &app.run.snap.status
-	cost := "-"
-	if status.cost_present {
-		cost = fmt.tprintf("$%.2f", status.cost)
-	}
-	left := fmt.tprintf("%dk/%dk | cost %s", (status.est_input + 512) / 1024, (status.context_window + 512) / 1024, cost)
-	right := fmt.tprintf("(%s) %s", status.provider_id, status.model_id)
-	if effort_text := strings.trim_space(status.effort); effort_text != "" {
-		right = fmt.tprintf("%s | %s", right, effort_text)
+	left := "no model selected"
+	right := ""
+	if status.model_id != "" {
+		cost := "-"
+		if status.cost_present {
+			cost = fmt.tprintf("$%.2f", status.cost)
+		}
+		left = fmt.tprintf("%dk/%dk | cost %s", (status.est_input + 512) / 1024, (status.context_window + 512) / 1024, cost)
+		right = fmt.tprintf("(%s) %s", status.provider_id, status.model_id)
+		if effort_text := strings.trim_space(status.effort); effort_text != "" {
+			right = fmt.tprintf("%s | %s", right, effort_text)
+		}
 	}
 	// The frame encoder reserves the terminal's bottom-right cell, and this
 	// is the last row, so the footer keeps one column clear.
