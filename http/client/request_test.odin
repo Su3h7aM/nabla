@@ -1,3 +1,5 @@
+#+test
+#+private file
 package client
 
 import "core:bytes"
@@ -44,37 +46,29 @@ _request_line_of :: proc(t: ^testing.T, request: Request) -> string {
 }
 
 @(test)
-test_request_target_keeps_the_query :: proc(t: ^testing.T) {
-	// RFC 9112 3.2.1: origin-form = absolute-path [ "?" query ]. A target that
-	// drops the query addresses a different resource.
-	request := Request {
+test_request_target :: proc(t: ^testing.T) {
+	// RFC 9112 3.2.1: origin-form = absolute-path [ "?" query ]; an empty path
+	// is sent as "/".
+	query_request := Request {
 		url    = "https://api.example.com/v1/responses?stream=true",
 		method = .Post,
 	}
-	testing.expect_value(t, _request_line_of(t, request), "POST /v1/responses?stream=true HTTP/1.1")
-}
+	testing.expect_value(t, _request_line_of(t, query_request), "POST /v1/responses?stream=true HTTP/1.1")
 
-@(test)
-test_request_target_of_an_empty_path_is_a_slash :: proc(t: ^testing.T) {
-	// RFC 9112 3.2.1: if the target URI's path component is empty, the client
-	// sends "/" as the path within the origin-form of request-target.
-	request := Request {
+	root_request := Request {
 		url    = "https://api.example.com",
 		method = .Get,
 	}
-	testing.expect_value(t, _request_line_of(t, request), "GET / HTTP/1.1")
-}
+	testing.expect_value(t, _request_line_of(t, root_request), "GET / HTTP/1.1")
 
-@(test)
-test_a_long_request_target_is_not_truncated :: proc(t: ^testing.T) {
-	// RFC 9112 3: it is RECOMMENDED that all HTTP senders and recipients support,
-	// at a minimum, request-line lengths of 8000 octets.
+	// RFC 9112 3: senders and recipients should support request lines of at least
+	// 8000 octets.
 	query := strings.repeat("a", 4096, context.temp_allocator)
-	request := Request {
+	long_request := Request {
 		url    = strings.concatenate({"https://api.example.com/v1/responses?q=", query}, context.temp_allocator),
 		method = .Post,
 	}
-	line := _request_line_of(t, request)
+	line := _request_line_of(t, long_request)
 	testing.expectf(t, strings.contains(line, query), "request line is %d octets and lost its query", len(line))
 	testing.expectf(t, len(line) > 4096, "request line is only %d octets", len(line))
 }
@@ -88,14 +82,13 @@ test_request_heading_headers :: proc(t: ^testing.T) {
 	}
 	text := _render(t, request)
 
-	// RFC 9112 3.2.1: a client MUST send a Host header field whose field value is
-	// identical to the target URI's authority component.
+	// RFC 9112 3.2.1: Host is identical to the target URI's authority component.
 	testing.expectf(t, strings.contains(text, "host: api.example.com:8443\r\n"), "missing host in:\n%s", text)
 
 	// RFC 9112 6.3: a request with content is framed by Content-Length.
 	testing.expectf(t, strings.contains(text, "content-length: 7\r\n"), "missing content-length in:\n%s", text)
 
-	// RFC 9112 9.3: a client that does not support persistent connections MUST
-	// send the "close" connection option in every request message.
+	// RFC 9112 9.3: a client that does not support persistent connections sends
+	// the "close" connection option in every request.
 	testing.expectf(t, strings.contains(text, "connection: close\r\n"), "missing close in:\n%s", text)
 }
