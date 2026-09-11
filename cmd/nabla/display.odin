@@ -1,112 +1,16 @@
 package main
 
 import "core:fmt"
-import "core:io"
 import "core:strings"
 import "core:unicode/utf8"
 
 import "nabla:agent"
-import "nabla:ai"
 
-// Display owns transcript rendering on the interactive path: role labels and
-// diagnostic lines go through here, so a later terminal owner takes over one
-// funnel instead of many print sites. Plain text only: no color, no cursor
-// movement. The labels carry the meaning with NO_COLOR set.
-//
-// Streams stay split: transcript and notices on stdout, warnings and errors
-// on stderr. Stored conversation content is never altered for display.
-//
-// Every text argument is sanitized before display: model output, tool
-// output, user text, and diagnostics may carry cursor movement, erase
-// commands, or OSC sequences, and only the renderer may emit controls.
-
-display_interactive: bool // set once from terminal detection; layout reads it later,
-
-display_set_interactive :: proc(interactive: bool) {
-	display_interactive = interactive
-}
-
-display_user :: proc(text: string) {
-	cleaned := display_clean(text)
-	defer delete(cleaned)
-	fmt.println("You")
-	fmt.println(cleaned)
-	fmt.println()
-}
-
-display_assistant_begin :: proc() {
-	fmt.println("Assistant")
-}
-
-display_assistant_end :: proc(output: io.Writer) {
-	io.write_string(output, "\n")
-}
-
-display_tool :: proc(name, detail: string) {
-	cleaned := display_clean(detail)
-	defer delete(cleaned)
-	fmt.println("Tool ·", name)
-	fmt.println(cleaned)
-	fmt.println()
-}
-
-display_notice :: proc(message: string) {
-	cleaned := display_clean(message)
-	defer delete(cleaned)
-	fmt.println(cleaned)
-}
-
-display_warning :: proc(message: string) {
-	cleaned := display_clean(message)
-	defer delete(cleaned)
-	fmt.eprintln("warning:", cleaned)
-}
-
-display_error :: proc(message: string) {
-	cleaned := display_clean(message)
-	defer delete(cleaned)
-	fmt.eprintln("error:", cleaned)
-}
-
-display_queue_ack :: proc(depth: int) {
-	fmt.eprintf("[queued %d]\n", depth)
-}
-
-display_queue_full :: proc() {
-	fmt.eprint("[steering queue full, input dropped]\n")
-}
-
-display_usage :: proc(operation: u64, usage: ai.Provider_Usage_Event) {
-	fmt.eprintf("tokens [request %d]:", operation)
-	if usage.Input_Tokens_Present { fmt.eprintf(" input %d", usage.Input_Tokens) } else { fmt.eprint(" input unknown") }
-	if usage.Cached_Input_Tokens_Present {
-		fmt.eprintf(", cached %d", usage.Cached_Input_Tokens)
-	} else {
-		fmt.eprint(", cached unknown")
-	}
-	if usage.Cache_Write_Tokens_Present { fmt.eprintf(", write %d", usage.Cache_Write_Tokens) }
-	if usage.Output_Tokens_Present { fmt.eprintf(", output %d", usage.Output_Tokens) } else { fmt.eprint(", output unknown") }
-	fmt.eprintln()
-}
-
-// tool_display_summary renders one result line for the transcript. The full
-// JSON goes to the model; a human gets the outcome.
-tool_display_summary :: proc(result: ^agent.Tool_Result) -> string {
-	#partial switch result.status {
-	case .Exited:
-		if result.stdout_trunc || result.stderr_trunc || result.output_trunc {
-			return fmt.tprintf("exited %d (output truncated)", result.exit_code)
-		}
-		return fmt.tprintf("exited %d", result.exit_code)
-	case .Timed_Out:
-		return "timed out"
-	case .Cancelled:
-		return "cancelled"
-	case:
-		if result.error_text != "" { return result.error_text }
-		return "not executed"
-	}
-}
+// Display owns the text sanitizer every transcript renderer needs. Model
+// output, tool output, user text, and diagnostics may carry cursor movement,
+// erase commands, or OSC sequences, and only the renderer may emit controls,
+// so untrusted text is cleaned before it is drawn. Stored conversation
+// content is never altered for display.
 
 Display_San_State :: enum {
 	Text,
@@ -275,17 +179,21 @@ display_clean :: proc(text: string, allocator := context.allocator) -> string {
 	return joined
 }
 
-// display_stream_text sanitizes one streamed fragment and writes it. The
-// sanitizer outlives the call so sequences split across fragments stay
-// dropped; flush it when the request ends.
-display_stream_text :: proc(output: io.Writer, san: ^Display_Sanitizer, chunk: string) {
-	cleaned := display_sanitize_chunk(san, chunk)
-	defer delete(cleaned)
-	io.write_string(output, cleaned)
-}
-
-display_stream_flush :: proc(output: io.Writer, san: ^Display_Sanitizer) {
-	tail := display_sanitize_flush(san)
-	defer delete(tail)
-	if tail != "" { io.write_string(output, tail) }
+// tool_display_summary renders one result line for the transcript. The full
+// JSON goes to the model; a human gets the outcome.
+tool_display_summary :: proc(result: ^agent.Tool_Result) -> string {
+	#partial switch result.status {
+	case .Exited:
+		if result.stdout_trunc || result.stderr_trunc || result.output_trunc {
+			return fmt.tprintf("exited %d (output truncated)", result.exit_code)
+		}
+		return fmt.tprintf("exited %d", result.exit_code)
+	case .Timed_Out:
+		return "timed out"
+	case .Cancelled:
+		return "cancelled"
+	case:
+		if result.error_text != "" { return result.error_text }
+		return "not executed"
+	}
 }

@@ -55,5 +55,5 @@ main :: proc() {
 	if options.provider_id == "" || options.model_id == "" {
 		for provider in sources { for model in provider.models { if model.disabled_present && model.disabled { continue }; fmt.println(provider.id, "/", model.id) } }; return
 	}
-	cli_run(sources[:], options.provider_id, options.model_id)
+	tui_run(sources[:], options.provider_id, options.model_id)
 }
