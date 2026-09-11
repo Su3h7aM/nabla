@@ -15,9 +15,20 @@ import "nabla:ai"
 // steering reader thread. The agent knows about none of them: it reports what
 // happened through a Chat_Observer and this decides how to show it.
 cli_run :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_id: string) {
+	// models.dev is the enrichment source between user configuration and the
+	// resolved catalog, so a provider only has to be named to become usable. It is
+	// optional: when the document cannot be acquired the configured provider and
+	// model are still resolved, just without whatever models.dev would have filled
+	// in, so a network problem degrades the catalog rather than refusing the run.
+	models_dev, models_dev_err := agent.models_dev_sources(allocator = context.allocator)
+	defer agent.catalog_sources_destroy(&models_dev)
+	if models_dev_err != .None {
+		display_warning("models.dev is unavailable; using configured values only")
+	}
+
 	// The resolver is the only place sources are combined, and the catalog it
 	// returns is the only thing this front-end reads metadata from.
-	catalog, resolve_err := agent.resolve_catalog(sources, {}, {})
+	catalog, resolve_err := agent.resolve_catalog(sources, {}, models_dev[:])
 	defer agent.catalog_destroy(&catalog)
 	if resolve_err != .None {
 		display_error("invalid configuration: a model cannot be excluded and customized at the same time")

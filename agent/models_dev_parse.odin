@@ -2,27 +2,29 @@ package agent
 
 import "core:encoding/json"
 import "core:mem"
+import "core:slice"
 import "core:strings"
 
 // models.dev catalog parsing: bytes in, provider source records out.
 //
-// The catalog is external input, so it is read defensively. A field of the wrong
-// type is treated as absent rather than as a failure -- upstream adding a string
-// where a number used to be must not take the harness down -- while identity that
-// is missing is a failure, because a source record that cannot be keyed would
-// corrupt the resolved catalog rather than merely be incomplete. Unknown fields
-// are ignored: models.dev carries far more than this harness reads.
+// The document is models.dev's API representation, a map of provider id to
+// provider record, each carrying the models that provider serves. It is external
+// input, so it is read defensively. A field of the wrong type is treated as
+// absent rather than as a failure -- upstream adding a string where a number used
+// to be must not take the harness down -- while identity that is missing is a
+// failure, because a source record that cannot be keyed would corrupt the
+// resolved catalog rather than merely be incomplete. Unknown fields are ignored:
+// models.dev carries far more than this harness reads.
 //
 // Nothing here decides precedence, exclusion, credentials, or endpoint defaults
 // for the user. It only transforms bytes, so it performs no I/O, and its input is
-// the raw catalog the cache layer acquired.
+// the raw document the cache layer acquired.
 
 Models_Dev_Parse_Error :: enum {
 	None,
 	// The bytes are not valid JSON.
 	Invalid_JSON,
-	// The document is not an object carrying a `providers` object of provider
-	// objects, or a provider has no `models` object.
+	// The document is not an object of provider records.
 	Invalid_Structure,
 	// A provider or model does not state the id its source record is keyed on.
 	// A record that cannot be keyed is refused rather than invented.
@@ -40,10 +42,6 @@ models_dev_parse :: proc(data: []u8, allocator := context.allocator) -> ([dynami
 
 	root_object, root_is_object := root.(json.Object)
 	if !root_is_object { return {}, .Invalid_Structure }
-	providers_value, has_providers := root_object["providers"]
-	if !has_providers { return {}, .Invalid_Structure }
-	providers, providers_is_object := providers_value.(json.Object)
-	if !providers_is_object { return {}, .Invalid_Structure }
 
 	result: [dynamic]Catalog_Provider_Source
 	result.allocator = allocator
@@ -53,7 +51,7 @@ models_dev_parse :: proc(data: []u8, allocator := context.allocator) -> ([dynami
 		delete(result)
 	}
 
-	for provider_id, provider_value in providers {
+	for provider_id, provider_value in root_object {
 		provider_object, provider_is_object := provider_value.(json.Object)
 		if !provider_is_object { return {}, .Invalid_Structure }
 
@@ -91,6 +89,7 @@ models_dev_parse :: proc(data: []u8, allocator := context.allocator) -> ([dynami
 			append(&models, model)
 		}
 		provider.models = models[:]
+		slice.sort_by(provider.models, models_dev_model_less)
 		models_owned = false
 
 		append(&result, provider)
@@ -98,8 +97,15 @@ models_dev_parse :: proc(data: []u8, allocator := context.allocator) -> ([dynami
 	}
 
 	failed = false
+	// The document is a JSON object, so its members arrive in hash order. Sorting
+	// by id keeps the result fully deterministic, so a catalog that changed order
+	// between runs cannot make diagnostics or first-match logic unstable.
+	slice.sort_by(result[:], models_dev_provider_less)
 	return result, .None
 }
+
+models_dev_provider_less :: proc(a, b: Catalog_Provider_Source) -> bool { return a.id < b.id }
+models_dev_model_less :: proc(a, b: Catalog_Model_Source) -> bool { return a.id < b.id }
 
 // models_dev_provider_source maps the provider fields that the source type can
 // represent. Everything else models.dev states about a provider -- its display

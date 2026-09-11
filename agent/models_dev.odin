@@ -15,8 +15,14 @@ import "nabla:http/client"
 // alongside user configuration and provider discovery. Nothing here interprets
 // the body.
 
-MODELS_DEV_URL :: "https://models.dev/catalog.json"
-MODELS_DEV_CACHE_FILE :: "models-dev-catalog.json"
+// The API representation is the models.dev endpoint for provider endpoints and
+// the models they serve, which is exactly what this harness consumes. The
+// catalog representation is the same provider records plus a provider-agnostic
+// model registry this harness never reads, and its two model-shaped maps share
+// ids -- so consuming it would mean fetching and discarding data, and risking a
+// record taken from the wrong map.
+MODELS_DEV_URL :: "https://models.dev/api.json"
+MODELS_DEV_CACHE_FILE :: "models-dev-api.json"
 
 // A cached catalog is used for a day before it is refreshed. A stale copy is a
 // normal input rather than an error, so a refresh that fails keeps serving it:
@@ -34,8 +40,15 @@ Models_Dev_Error :: enum {
 	// permits nowhere to cache. Reported rather than worked around with a
 	// home-relative path.
 	State_Directory,
-	// The catalog is neither cached nor reachable.
+	// The document is neither cached nor reachable.
 	Unavailable,
+	// The document was acquired but is not a usable provider document, and no
+	// cached copy could serve instead.
+	Invalid_Data,
+	// A document was acquired but cannot become provider source records.
+	Invalid_JSON,
+	Invalid_Structure,
+	Missing_Identity,
 }
 
 // Models_Dev_Fetch delivers a catalog body owned by the caller. Production uses
@@ -60,24 +73,72 @@ models_dev_catalog_at :: proc(now: time.Time, fetch: Models_Dev_Fetch, user_data
 	path, path_err := models_dev_cache_path(allocator)
 	if path_err != .None { return nil, path_err }
 	defer delete(path, allocator)
-
+	unusable := false
 	if models_dev_cache_fresh(path, now) {
 		if cached, cached_ok := models_dev_cache_read(path, allocator); cached_ok { return cached, .None }
 		// An unreadable cache counts as absent: the refresh below replaces it.
 	}
 	if body, fetched := fetch(user_data, allocator); fetched {
-		// Caching is best effort. A catalog already in hand is a usable source, so
-		// a write that fails is not a failed acquisition.
-		models_dev_cache_write(path, body)
-		return body, .None
+		if models_dev_validate(body) {
+			// Caching is best effort. A document already in hand is a usable source,
+			// so a write that fails is not a failed acquisition.
+			models_dev_cache_write(path, body)
+			return body, .None
+		}
+		// An acquired but unusable document never becomes the cache: replacing a
+		// usable one with it would deny enrichment for a whole refresh window. It is
+		// remembered only as the reason to report if the cache cannot serve either.
+		delete(body, allocator)
+		unusable = true
 	}
-	// The refresh failed, so the cached copy -- stale or not -- is the best
-	// source available, and it is still there because nothing removed it.
+	// The refresh failed or was unusable, so the cached copy -- stale or not -- is
+	// the best source available, and it is still there because nothing removed it.
 	if cached, cached_ok := models_dev_cache_read(path, allocator); cached_ok { return cached, .None }
+	if unusable { return nil, .Invalid_Data }
 	return nil, .Unavailable
 }
 
-// models_dev_cache_path resolves where the catalog is cached and creates the
+// models_dev_validate reports whether an acquired document is usable, which is
+// what decides whether it may replace the cache. It parses and discards, so the
+// check costs one parse per refresh and never keeps the result.
+models_dev_validate :: proc(data: []u8) -> bool {
+	sources, err := models_dev_parse(data, context.temp_allocator)
+	catalog_sources_destroy(&sources, context.temp_allocator)
+	return err == .None
+}
+
+// models_dev_sources produces the resolver input from models.dev: the document is
+// taken from the cache when it is fresh and acquired otherwise, then parsed into
+// provider source records. This is the whole ingestion path, so no caller handles
+// the raw document. The result is owned by the caller and released with
+// catalog_sources_destroy, exactly like the user configuration loader's result.
+models_dev_sources :: proc(
+	fetch: Models_Dev_Fetch = models_dev_fetch,
+	user_data: rawptr = nil,
+	allocator := context.allocator,
+) -> (
+	[dynamic]Catalog_Provider_Source,
+	Models_Dev_Error,
+) {
+	body, body_err := models_dev_catalog(fetch, user_data, allocator)
+	if body_err != .None { return {}, body_err }
+	defer delete(body, allocator)
+
+	sources, parse_err := models_dev_parse(body, allocator)
+	switch parse_err {
+	case .None:
+		return sources, .None
+	case .Invalid_JSON:
+		return {}, .Invalid_JSON
+	case .Invalid_Structure:
+		return {}, .Invalid_Structure
+	case .Missing_Identity:
+		return {}, .Missing_Identity
+	}
+	return {}, .Invalid_Data
+}
+
+// models_dev_cache_path resolves where the document is cached and creates the
 // directory, so a caller always has somewhere to read from and write to. The
 // state directory is the specification's place for regenerable state, and the
 // application directory beneath it is lowercased. The result is owned by the

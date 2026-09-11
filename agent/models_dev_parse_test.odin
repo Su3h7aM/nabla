@@ -4,68 +4,67 @@ import "core:os"
 import "core:path/filepath"
 import "core:testing"
 
-// A representative catalog in the shape models.dev publishes: providers keyed by
-// id, each carrying its own models keyed by model id. It is deliberately small
-// and exercises the fields this harness reads plus several it does not.
+// A representative document in the shape models.dev publishes at its API
+// endpoint: providers keyed by id, each carrying its own models keyed by model
+// id. It is deliberately small and exercises the fields this harness reads plus
+// several it does not.
 MODELS_DEV_FIXTURE :: `{
-  "providers": {
-    "acme": {
-      "id": "acme",
-      "name": "Acme",
-      "doc": "https://docs.acme.test",
-      "env": ["ACME_API_KEY"],
-      "npm": "@ai-sdk/openai-compatible",
-      "api": "https://api.acme.test/v1",
-      "models": {
-        "acme/thinker": {
-          "id": "acme/thinker",
-          "name": "Acme Thinker",
-          "description": "A reasoning model",
-          "reasoning": true,
-          "reasoning_options": [
-            {"type": "effort", "values": ["low", "high", "max"]},
-            {"type": "toggle"},
-            {"type": "budget_tokens", "min": 1024, "max": 81920}
-          ],
-          "tool_call": true,
-          "attachment": true,
-          "cost": {"input": 1.0, "output": 2.0},
-          "modalities": {"input": ["text", "image"], "output": ["text"]},
-          "limit": {"context": 200000, "output": 64000}
-        },
-        "acme/plain": {
-          "id": "acme/plain",
-          "name": "Acme Plain",
-          "reasoning": false,
-          "tool_call": false,
-          "modalities": {"input": ["text"], "output": ["text"]},
-          "limit": {"context": 8192, "output": 4096}
-        },
-        "acme/zeroed": {
-          "id": "acme/zeroed",
-          "name": "Acme Zeroed",
-          "reasoning": false,
-          "tool_call": false,
-          "modalities": {"input": [], "output": []},
-          "limit": {"context": 0, "output": 0}
-        }
+  "acme": {
+    "id": "acme",
+    "name": "Acme",
+    "doc": "https://docs.acme.test",
+    "env": ["ACME_API_KEY"],
+    "npm": "@ai-sdk/openai-compatible",
+    "api": "https://api.acme.test/v1",
+    "models": {
+      "acme/thinker": {
+        "id": "acme/thinker",
+        "name": "Acme Thinker",
+        "description": "A reasoning model",
+        "reasoning": true,
+        "reasoning_options": [
+          {"type": "effort", "values": ["low", "high", "max"]},
+          {"type": "toggle"},
+          {"type": "budget_tokens", "min": 1024, "max": 81920}
+        ],
+        "tool_call": true,
+        "attachment": true,
+        "cost": {"input": 1.0, "output": 2.0},
+        "modalities": {"input": ["text", "image"], "output": ["text"]},
+        "limit": {"context": 200000, "output": 64000}
+      },
+      "acme/plain": {
+        "id": "acme/plain",
+        "name": "Acme Plain",
+        "reasoning": false,
+        "tool_call": false,
+        "modalities": {"input": ["text"], "output": ["text"]},
+        "limit": {"context": 8192, "output": 4096}
+      },
+      "acme/zeroed": {
+        "id": "acme/zeroed",
+        "name": "Acme Zeroed",
+        "reasoning": false,
+        "tool_call": false,
+        "modalities": {"input": [], "output": []},
+        "limit": {"context": 0, "output": 0}
       }
-    },
-    "beta": {
-      "id": "beta",
-      "name": "Beta",
-      "env": ["BETA_KEY", "BETA_PROJECT"],
-      "npm": "@ai-sdk/anthropic",
-      "models": {
-        "beta/talker": {
-          "id": "beta/talker",
-          "name": "Beta Talker",
-          "reasoning": true,
-          "reasoning_options": [{"type": "budget_tokens"}],
-          "tool_call": true,
-          "modalities": {"input": ["text"], "output": ["text"]},
-          "limit": {"context": 100000, "output": 32000}
-        }
+    }
+  },
+  "beta": {
+    "id": "beta",
+    "name": "Beta",
+    "env": ["BETA_KEY", "BETA_PROJECT"],
+    "npm": "@ai-sdk/anthropic",
+    "models": {
+      "beta/talker": {
+        "id": "beta/talker",
+        "name": "Beta Talker",
+        "reasoning": true,
+        "reasoning_options": [{"type": "budget_tokens"}],
+        "tool_call": true,
+        "modalities": {"input": ["text"], "output": ["text"]},
+        "limit": {"context": 100000, "output": 32000}
       }
     }
   }
@@ -99,8 +98,11 @@ test_models_dev_parse_reads_providers_and_models :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Models_Dev_Parse_Error.None)
 	defer catalog_sources_destroy(&catalog)
 
-	// One source record per provider, each holding only its own models.
+	// One source record per provider, each holding only its own models, in id order
+	// so the document's hash order cannot leak into the result.
 	testing.expect_value(t, len(catalog), 2)
+	testing.expect_value(t, catalog[0].id, "acme")
+	testing.expect_value(t, catalog[1].id, "beta")
 	acme := models_dev_fixture_source(t, "acme", catalog[:])
 	beta := models_dev_fixture_source(t, "beta", catalog[:])
 	testing.expect_value(t, len(acme.models), 3)
@@ -185,25 +187,23 @@ test_models_dev_parse_ignores_unknown_and_mistyped_fields :: proc(t: ^testing.T)
 	// below is treated as absent rather than fatal; the record still parses and
 	// still states the identity it is keyed on.
 	fixture :: `{
-	  "providers": {
-	    "gamma": {
-	      "id": "gamma",
-	      "name": "Gamma",
-	      "future_field": {"nested": [1, 2, 3]},
-	      "env": "GAMMA_KEY",
-	      "npm": "@ai-sdk/some-future-sdk",
-	      "api": 42,
-	      "models": {
-	        "gamma/odd": {
-	          "id": "gamma/odd",
-	          "name": 7,
-	          "reasoning": "yes",
-	          "reasoning_options": [{"type": "effort", "values": "low"}, {"type": "budget_tokens", "min": "1024"}],
-	          "tool_call": 1,
-	          "modalities": {"input": "text"},
-	          "limit": {"context": "big", "output": 1.5},
-	          "unknown_model_field": true
-	        }
+	  "gamma": {
+	    "id": "gamma",
+	    "name": "Gamma",
+	    "future_field": {"nested": [1, 2, 3]},
+	    "env": "GAMMA_KEY",
+	    "npm": "@ai-sdk/some-future-sdk",
+	    "api": 42,
+	    "models": {
+	      "gamma/odd": {
+	        "id": "gamma/odd",
+	        "name": 7,
+	        "reasoning": "yes",
+	        "reasoning_options": [{"type": "effort", "values": "low"}, {"type": "budget_tokens", "min": "1024"}],
+	        "tool_call": 1,
+	        "modalities": {"input": "text"},
+	        "limit": {"context": "big", "output": 1.5},
+	        "unknown_model_field": true
 	      }
 	    }
 	  }
@@ -232,11 +232,11 @@ test_models_dev_parse_ignores_unknown_and_mistyped_fields :: proc(t: ^testing.T)
 test_models_dev_parse_drops_non_string_list_entries :: proc(t: ^testing.T) {
 	// An effort list is metadata a caller matches by exact value, so a null or a
 	// number can never be one of its members and is dropped rather than kept.
-	fixture :: `{"providers": {"delta": {"id": "delta", "npm": "@ai-sdk/openai", "models": {
+	fixture :: `{"delta": {"id": "delta", "npm": "@ai-sdk/openai", "models": {
 	  "delta/mixed": {"id": "delta/mixed", "reasoning": true,
 	    "reasoning_options": [{"type": "effort", "values": ["low", null, 3, "high"]}],
 	    "modalities": {"input": ["text", null], "output": []},
-	    "limit": {"context": 1, "output": 1}}}}}}`
+	    "limit": {"context": 1, "output": 1}}}}}`
 	catalog, err := models_dev_parse_text(fixture)
 	testing.expect_value(t, err, Models_Dev_Parse_Error.None)
 	defer catalog_sources_destroy(&catalog)
@@ -261,12 +261,12 @@ test_models_dev_parse_skips_a_model_with_its_own_foreign_routing :: proc(t: ^tes
 	// provider's protocol would send the wrong wire format, so it is left out. A
 	// model whose own route agrees, or names an SDK this harness does not
 	// implement, is kept.
-	fixture :: `{"providers": {"eps": {"id": "eps", "npm": "@ai-sdk/openai-compatible", "models": {
+	fixture :: `{"eps": {"id": "eps", "npm": "@ai-sdk/openai-compatible", "models": {
 	  "eps/foreign":   {"id": "eps/foreign",   "provider": {"npm": "@ai-sdk/anthropic"}},
 	  "eps/other-wire":{"id": "eps/other-wire","provider": {"npm": "@ai-sdk/openai"}},
 	  "eps/agreeing":  {"id": "eps/agreeing",  "provider": {"npm": "@ai-sdk/openai-compatible"}},
 	  "eps/unknown":   {"id": "eps/unknown",   "provider": {"npm": "@ai-sdk/some-future-sdk"}},
-	  "eps/plain":     {"id": "eps/plain"}}}}}}`
+	  "eps/plain":     {"id": "eps/plain"}}}}`
 	catalog, err := models_dev_parse_text(fixture)
 	testing.expect_value(t, err, Models_Dev_Parse_Error.None)
 	defer catalog_sources_destroy(&catalog)
@@ -290,19 +290,19 @@ test_models_dev_parse_rejects_unusable_input :: proc(t: ^testing.T) {
 
 
 		// Not JSON at all.
-		{`{"providers":`, .Invalid_JSON},
+		{`{"acme":`, .Invalid_JSON},
 		{`not json`, .Invalid_JSON},
-		// JSON, but not a catalog.
+		// JSON, but not a document of provider records.
 		{`[]`, .Invalid_Structure},
-		{`{"models": {}}`, .Invalid_Structure},
-		{`{"providers": []}`, .Invalid_Structure},
-		{`{"providers": {"p": 1}}`, .Invalid_Structure},
+		{`"acme"`, .Invalid_Structure},
+		{`{"acme": 1}`, .Invalid_Structure},
+		{`{"acme": []}`, .Invalid_Structure},
 		// A provider without the models object that associates its models.
-		{`{"providers": {"p": {"id": "p"}}}`, .Invalid_Structure},
+		{`{"acme": {"id": "acme"}}`, .Invalid_Structure},
 		// Identity that cannot be keyed is refused rather than invented.
-		{`{"providers": {"p": {"models": {}}}}`, .Missing_Identity},
-		{`{"providers": {"p": {"id": "other", "models": {}}}}`, .Missing_Identity},
-		{`{"providers": {"p": {"id": "p", "models": {"m": {"name": "no id"}}}}}`, .Missing_Identity},
+		{`{"acme": {"models": {}}}`, .Missing_Identity},
+		{`{"acme": {"id": "other", "models": {}}}`, .Missing_Identity},
+		{`{"acme": {"id": "acme", "models": {"m": {"name": "no id"}}}}`, .Missing_Identity},
 	}
 	for entry in cases {
 		catalog, err := models_dev_parse_text(entry.body)
@@ -313,8 +313,8 @@ test_models_dev_parse_rejects_unusable_input :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_models_dev_parse_accepts_a_catalog_with_no_providers :: proc(t: ^testing.T) {
-	catalog, err := models_dev_parse_text(`{"providers": {}}`)
+test_models_dev_parse_accepts_a_document_with_no_providers :: proc(t: ^testing.T) {
+	catalog, err := models_dev_parse_text(`{}`)
 	testing.expect_value(t, err, Models_Dev_Parse_Error.None)
 	testing.expect_value(t, len(catalog), 0)
 	catalog_sources_destroy(&catalog)
@@ -359,7 +359,7 @@ test_models_dev_parse_feeds_the_resolver_unchanged :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_models_dev_parse_survives_a_cached_catalog :: proc(t: ^testing.T) {
+test_models_dev_parse_survives_a_cached_document :: proc(t: ^testing.T) {
 	// The published catalog is the input this has to survive, so when one has been
 	// cached the real file is parsed. The path is resolved without creating it, and
 	// nothing here fetches: without a cache the check simply does not run, so no

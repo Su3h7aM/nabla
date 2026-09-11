@@ -441,29 +441,34 @@ Verified against the code at the time of writing.
 
 ### Needs work
 
-1. **No enrichment pipeline.** One source only. The first-present merge resolver was deleted for
-   lack of a second source (`agent/catalog.odin:11`); it must return, now driven by three.
-2. **`/models` discovery missing.** Nothing contacts a models endpoint.
-3. **models.dev missing.** No shared catalog is vendored or read.
-4. **Provider metadata is not discoverable.** `cli_run` *requires* user-supplied `base_url` and
-   `api` (`cmd/nabla/cli.odin:41-43`), contradicting "the user specifies only overrides".
-5. **No Resolved Catalog type.** Resolution is ad hoc inside `cli_run`, and its output is copied
-   field-by-field onto `Chat_Session`.
-6. **Catalog fields parsed but never consumed:** `input_modalities`, `output_modalities`,
+1. **`/models` discovery missing.** Nothing contacts a provider's models endpoint. It is the
+   middle enrichment stage, so a provider's own report cannot yet correct or extend what
+   models.dev states.
+2. **Provider metadata is only partly discoverable.** models.dev supplies the endpoint, the API
+   family, and the credential's environment variable for the providers it knows, but a provider
+   without an endpoint field — including `anthropic` and `openai`, which rely on their SDK's
+   built-in default — still needs `base_url` stated in configuration.
+3. **Catalog fields parsed but never consumed:** `input_modalities`, `output_modalities`,
    `display_name`.
-7. **Compaction drops the kept tail.** `chat_compact_active` protects the last
-   `CHAT_COMPACT_KEEP_MESSAGES` from summarisation, then appends the summary at the end and sets
-   `active_start` to it — so the active context becomes the summary alone and the kept tail is not
-   sent. Confirmed by `test_rebuild_after_compact_uses_committed_history`, which asserts a
-   one-message request. This contradicts "preserve the newest relevant exchange" and is the
-   highest-priority defect.
-8. **Subagents absent.** No spawn, no process isolation, no lifecycle.
-9. **No redact/cap/spill path for tool output.**
-10. **System prompt is a message, not a lane**, and is hardcoded (`AGENT_SYSTEM_PROMPT`,
-    `CHAT_COMPACT_INSTRUCTIONS`).
-11. **Anthropic unimplemented.** `API_Kind.Anthropic_Messages` exists; `Provider_Validate_Request`
-    rejects it and there is no encoder.
-12. **Prompt-cache fields unused** by the chat path.
+4. **Subagents absent.** No spawn, no process isolation, no lifecycle.
+5. **No redact/cap/spill path for tool output.**
+6. **System prompt is a message, not a lane**, and is hardcoded (`AGENT_SYSTEM_PROMPT`,
+   `CHAT_COMPACT_INSTRUCTIONS`).
+7. **Anthropic unimplemented.** `API_Kind.Anthropic_Messages` exists; `Provider_Validate_Request`
+   rejects it and there is no encoder.
+8. **Prompt-cache fields unused** by the chat path.
+
+### Settled since this document was written
+
+- **Compaction keeps the tail.** The active window is `[summary] + kept tail`, and the seam stays
+  out of a call/result run.
+- **One resolved catalog.** `resolve_catalog(user, provider, models_dev)` merges the sources,
+  first defined value wins, into the `Catalog` the runtime reads.
+- **models.dev ingestion.** The API representation is fetched and cached under the XDG state
+  directory, parsed into provider source records, and supplied to the resolver as its third
+  source. A document that cannot become source records never replaces a usable cache.
+- **One provider credential field.** `api_key` holds either a secret or `${NAME}`, resolved when a
+  connection is built.
 
 ### Must remain unchanged
 
@@ -480,27 +485,16 @@ Verified against the code at the time of writing.
 Only decisions that cannot be settled from the code, the provider specifications, or the
 requirements. Everything else is an implementation detail to resolve during the work.
 
-1. **Compaction tail semantics.** Should the active context after compaction be
-   `[summary] + kept tail`, or `[summary]` alone? The first matches "preserve the newest relevant
-   exchange" and the existence of `CHAT_COMPACT_KEEP_MESSAGES`; the second is what the code does
-   today and is lossy. Resolving this fixes gap 7 and determines whether compaction reorders the
-   record or gains a second window bound.
-
-2. **Which `models.dev` shape we consume, and how it is obtained.** Vendored snapshot versus
-   fetched-and-cached, and what happens when it is absent or stale. This decides whether the
-   harness needs a network fetch outside a provider request and whether it ships a data file.
-   Enrichment behaviour when the source is missing must be defined either way.
-
-3. **System prompt lane.** Keep the system prompt inside `messages` (today), or split
+1. **System prompt lane.** Keep the system prompt inside `messages` (today), or split
    `Provider_Request` into `instructions` + `messages` as FX and Goose both do. Splitting is
    cleaner and enforces the invariant that conversation never contains a system message, but it
    changes the provider contract and both encoders.
 
-4. **Anthropic reasoning replay representation.** The current replay slot is Responses-shaped
+2. **Anthropic reasoning replay representation.** The current replay slot is Responses-shaped
    (id + encrypted content). Anthropic needs signed thinking blocks, which are a different opaque
    payload, and the adjacency requirements around tool use differ. Decision: generalise the slot
    to a tagged opaque blob, or add a second provider-specific variant.
 
-5. **Subagent result shape.** Deliberately unresolved. Decide after the process lifecycle —
+3. **Subagent result shape.** Deliberately unresolved. Decide after the process lifecycle —
    exit status, timeout, kill, partial output — is implemented and its real distinctions are
    known. Do not design the public type first.
