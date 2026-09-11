@@ -105,7 +105,7 @@ test_config_env_reference_accepts_only_plain_names :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_config_resolve_credential_reads_a_reference_and_keeps_a_literal :: proc(t: ^testing.T) {
+test_config_resolve_credential_reads_env_and_keeps_a_literal :: proc(t: ^testing.T) {
 	literal, literal_ok := config_resolve_credential("sk-literal", context.temp_allocator)
 	testing.expect(t, literal_ok)
 	testing.expect_value(t, literal, "sk-literal")
@@ -117,6 +117,24 @@ test_config_resolve_credential_reads_a_reference_and_keeps_a_literal :: proc(t: 
 	// An empty value is not a credential.
 	_, empty_ok := config_resolve_credential("", context.temp_allocator)
 	testing.expect(t, !empty_ok)
+
+	// A value that names an existing environment variable is that variable's
+	// value, with or without the ${NAME} wrapper.
+	testing.expect(t, os.set_env("NABLA_TEST_CREDENTIAL", "resolved-secret") == nil)
+	defer os.unset_env("NABLA_TEST_CREDENTIAL")
+	named, named_ok := config_resolve_credential("NABLA_TEST_CREDENTIAL", context.temp_allocator)
+	testing.expect(t, named_ok)
+	testing.expect_value(t, named, "resolved-secret")
+	wrapped, wrapped_ok := config_resolve_credential("${NABLA_TEST_CREDENTIAL}", context.temp_allocator)
+	testing.expect(t, wrapped_ok)
+	testing.expect_value(t, wrapped, "resolved-secret")
+
+	// A name that exists but resolves to nothing fails, so a miswired
+	// reference never sends the variable's name as a key.
+	testing.expect(t, os.set_env("NABLA_TEST_EMPTY_CREDENTIAL", "") == nil)
+	defer os.unset_env("NABLA_TEST_EMPTY_CREDENTIAL")
+	_, empty_named_ok := config_resolve_credential("NABLA_TEST_EMPTY_CREDENTIAL", context.temp_allocator)
+	testing.expect(t, !empty_named_ok)
 }
 
 @(test)

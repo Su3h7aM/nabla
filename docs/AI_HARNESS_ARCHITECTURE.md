@@ -493,8 +493,10 @@ Verified against the code at the time of writing.
 - **models.dev ingestion.** The API representation is fetched and cached under the XDG state
   directory, parsed into provider source records, and supplied to the resolver as its third
   source. A document that cannot become source records never replaces a usable cache.
-- **One provider credential field.** `api_key` holds either a secret or `${NAME}`, resolved when a
-  connection is built.
+- **One provider credential field.** `api_key` is resolved when a connection is built: a value that
+  names an existing environment variable is that variable's value (the `${NAME}` reference form
+  included); anything else is the secret itself. A name that exists but is empty fails rather than
+  sending the name as a key.
 
 ### Must remain unchanged
 

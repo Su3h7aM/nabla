@@ -351,9 +351,12 @@ config_env_reference :: proc(value: string) -> (name: string, ok: bool) {
 }
 
 // config_resolve_credential resolves a configured credential into a secret the
-// caller owns. A `${NAME}` value is read from the environment; anything else is
-// the secret itself. Resolution happens at use rather than at load, so the
-// catalog never holds a secret and no state file can.
+// caller owns. A value that names an existing environment variable is that
+// variable's value, whether or not it is written as a `${NAME}` reference;
+// anything else is the secret itself. A name that exists but resolves to empty
+// fails, so a miswired reference can never send the variable's name as a key.
+// Resolution happens at use rather than at load, so the catalog never holds a
+// secret and no state file can.
 config_resolve_credential :: proc(value: string, allocator := context.allocator) -> (secret: string, ok: bool) {
 	if name, reference := config_env_reference(value); reference {
 		found: bool
@@ -362,6 +365,10 @@ config_resolve_credential :: proc(value: string, allocator := context.allocator)
 		return secret, true
 	}
 	if value == "" { return "", false }
+	if found_value, found := os.lookup_env(value, allocator); found {
+		if found_value == "" { return "", false }
+		return found_value, true
+	}
 	return strings.clone(value, allocator), true
 }
 

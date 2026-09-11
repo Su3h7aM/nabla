@@ -182,7 +182,7 @@ run_setup :: proc(sources: []agent.Catalog_Provider_Source, provider_id, model_i
 	}
 	credential, credential_ok := agent.config_resolve_credential(provider.api_key, result.alloc)
 	if !credential_ok {
-		fmt.eprintln("nabla: selected provider requires api_key, or names an unset environment variable as ${NAME}")
+		fmt.eprintln("nabla: selected provider requires api_key: name an environment variable that is set, or provide the key")
 		return result, false
 	}
 	result.credential = credential
