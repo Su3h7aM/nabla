@@ -2,19 +2,27 @@ package client
 
 import "core:mem"
 
-// Reader buffers a connection so response lines and bodies can be scanned without
-// a syscall per byte. reader_line returns a view that stays valid until the next
-// fill, which is enough because header parsing copies what it keeps.
+// Read_Proc fills buffer and reports .Closed once the stream has ended. It is the
+// signature of connection_read.
+Read_Proc :: #type proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error)
+
+// Reader buffers bytes so response lines and bodies can be scanned without a
+// syscall per byte. It reads through `read` rather than from a connection, so the
+// parsing path can be driven from a byte slice in tests. reader_line returns a
+// view that stays valid until the next fill, which is enough because header
+// parsing copies what it keeps.
 Reader :: struct {
-	connection: ^Connection,
-	allocator:  mem.Allocator,
-	buffer:     []u8,
-	head:       int,
-	tail:       int,
+	read:      Read_Proc,
+	user_data: rawptr,
+	allocator: mem.Allocator,
+	buffer:    []u8,
+	head:      int,
+	tail:      int,
 }
 
-reader_init :: proc(reader: ^Reader, connection: ^Connection, allocator: mem.Allocator) {
-	reader.connection = connection
+reader_init :: proc(reader: ^Reader, read: Read_Proc, user_data: rawptr, allocator: mem.Allocator) {
+	reader.read = read
+	reader.user_data = user_data
 	reader.allocator = allocator
 	reader.buffer = make([]u8, 8192, allocator)
 }
@@ -39,7 +47,7 @@ reader_fill :: proc(reader: ^Reader) -> Error {
 		delete(reader.buffer, reader.allocator)
 		reader.buffer = grown
 	}
-	count, err := connection_read(reader.connection, reader.buffer[reader.tail:])
+	count, err := reader.read(reader.user_data, reader.buffer[reader.tail:])
 	if err != .None { return err }
 	reader.tail += count
 	return .None

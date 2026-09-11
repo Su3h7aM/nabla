@@ -191,6 +191,13 @@ connection_write_all :: proc(connection: ^Connection, buffer: []u8) -> Error {
 	return .None
 }
 
+// connection_read_source adapts connection_read to the Reader's byte source. Odin
+// procedure types are nominal, so the typed connection pointer cannot stand in
+// for the rawptr the source takes.
+connection_read_source :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error) {
+	return connection_read(cast(^Connection)user_data, buffer)
+}
+
 // connection_read returns .Closed for an orderly end of stream. The caller decides
 // whether the message was complete.
 connection_read :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {

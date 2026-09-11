@@ -95,7 +95,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	}
 
 	reader: Reader
-	reader_init(&reader, connection, request.allocator)
+	reader_init(&reader, connection_read_source, connection, request.allocator)
 	defer reader_destroy(&reader)
 
 	status, headers, head_err := read_response_head(&reader, request.allocator)
