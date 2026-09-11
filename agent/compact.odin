@@ -16,15 +16,20 @@ CHAT_COMPACT_MAX_OUTPUT :: 2000
 CHAT_COMPACT_INSTRUCTIONS :: "Summarize the conversation so far in a few paragraphs for continued work. Preserve decisions, unresolved tasks, file paths, tool outcomes, and anything the next step depends on. Omit small talk. Plain text only."
 
 // chat_compact_seam finds where the kept tail starts so the last keep
-// messages stay verbatim. Coherence beats the count: backing over a tool
-// result or call keeps the whole call/result run together, because an
-// orphaned result is malformed history. A seam at or before active_start
-// means the whole active window is summarized.
+// messages stay verbatim. Coherence beats the count: the seam must not fall
+// inside a call/result run, because a result kept without its call is
+// malformed history and a call summarized without its result would be sent as
+// an unanswered tool call. A seam on a call is coherent -- its result follows
+// inside the tail -- so only a result, or a position whose predecessor is a
+// call, moves the seam left. A seam at active_start means nothing older than
+// the kept tail is left to summarize.
 chat_compact_seam :: proc(messages: []Chat_Message, active_start, keep: int) -> int {
 	seam := len(messages) - keep
 	if seam < active_start { seam = active_start }
-	for seam > active_start && messages[seam].role == .Tool { seam -= 1 }
-	for seam > active_start && messages[seam].is_tool_call { seam -= 1 }
+	for seam > active_start {
+		if messages[seam].role != .Tool && !messages[seam - 1].is_tool_call { break }
+		seam -= 1
+	}
 	return seam
 }
 
@@ -77,8 +82,11 @@ chat_compact_active :: proc(
 		_observer_message(observer, .Notice, "nothing to compact")
 		return false
 	}
-	// A seam at the window start means the whole active window is one call
-	// run or shorter than the kept tail: summarize all of it.
+	// The seam bounds the summary: everything before it is replaced by the
+	// summary, everything from it on stays in the active window verbatim. A seam
+	// at the window start means there is nothing older than the kept tail -- the
+	// whole active window is one call run or shorter than the tail -- so all of it
+	// is summarized and the summary then stands alone.
 	end := seam
 	if end <= session.active_start { end = len(session.messages) }
 	view := chat_request_view_clone(session.messages[:], 0, session.allocator)
@@ -131,10 +139,19 @@ chat_compact_active :: proc(
 		_observer_message(observer, .Error, "compaction produced no usable summary")
 		return false
 	}
-	summary := strings.concatenate([]string{"Summary of the conversation so far:\n", summary_text}, allocator = session.allocator)
-	append(&session.messages, Chat_Message{role = .Assistant, text = summary})
-	session.active_start = len(session.messages) - 1
+	chat_compact_commit(session, end, summary_text)
 	return true
+}
+
+// chat_compact_commit installs a summary ahead of the kept tail and moves the
+// active window onto it, so the active context becomes [summary] + [kept tail]
+// and the newest exchange still reaches the model. History is never deleted:
+// the summarized messages stay in the record behind the new window, which is
+// also what lets a later compaction fold the previous summary into the new one.
+chat_compact_commit :: proc(session: ^Chat_Session, end: int, summary_text: string) {
+	summary := strings.concatenate([]string{"Summary of the conversation so far:\n", summary_text}, allocator = session.allocator)
+	inject_at(&session.messages, end, Chat_Message{role = .Assistant, text = summary})
+	session.active_start = end
 }
 
 // chat_command_compact runs one manual compaction at a settled turn or a

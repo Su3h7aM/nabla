@@ -17,13 +17,68 @@ test_compact_seam_keeps_call_runs_together :: proc(t: ^testing.T) {
 		{role = .User, text = "b"},
 		{role = .Assistant, text = "done"},
 	}
-	// The tail would split the call from its result, so the seam backs up
-	// over both instead of honoring the keep count.
-	testing.expect_value(t, chat_compact_seam(messages, 0, 3), 0)
+	// The tail would split the call from its result, so the seam backs up over
+	// the result and stops on the call: the pair stays together in the tail
+	// instead of the whole window collapsing into the summary.
+	testing.expect_value(t, chat_compact_seam(messages, 0, 3), 1)
 	testing.expect_value(t, chat_compact_seam(messages, 0, 1), 4)
 	plain := []Chat_Message{{role = .User, text = "a"}, {role = .Assistant, text = "b"}, {role = .User, text = "c"}}
 	testing.expect_value(t, chat_compact_seam(plain, 0, 1), 2)
 	testing.expect_value(t, chat_compact_seam(plain, 1, 10), 1)
+}
+
+@(test)
+test_compact_seam_never_lands_inside_a_later_run :: proc(t: ^testing.T) {
+	// Two runs in one window: backing only over results stops on call_2, which
+	// keeps both runs whole. Backing over the call as well would strand result_1
+	// in the tail without call_1.
+	runs := []Chat_Message {
+		compact_call_message("call_1"),
+		{role = .Tool, text = `{"status":"exited"}`, tool_call_id = "call_1"},
+		compact_call_message("call_2"),
+		{role = .Tool, text = `{"status":"exited"}`, tool_call_id = "call_2"},
+	}
+	testing.expect_value(t, chat_compact_seam(runs, 0, 1), 2)
+	testing.expect_value(t, chat_compact_seam(runs, 0, 3), 0)
+
+	// A seam whose predecessor is a call backs up too, so a multi-call run is
+	// never cut between its calls.
+	grouped := []Chat_Message {
+		{role = .User, text = "ask"},
+		compact_call_message("call_1"),
+		compact_call_message("call_2"),
+		{role = .Tool, text = `{}`, tool_call_id = "call_1"},
+		{role = .Tool, text = `{}`, tool_call_id = "call_2"},
+	}
+	testing.expect_value(t, chat_compact_seam(grouped, 0, 3), 1)
+}
+
+// chat_compact_commit is the whole post-compaction window: the summary in front
+// of the kept tail. This is the behaviour the model sees, so it is pinned
+// directly rather than through a summarization request.
+@(test)
+test_compact_commit_keeps_the_tail_in_the_active_window :: proc(t: ^testing.T) {
+	session := chat_session_init(context.temp_allocator)
+	defer chat_session_destroy(&session)
+	session.workspace = tool_loop_workspace(t)
+	testing.expect(t, chat_session_accept_user(&session, "first"))
+	for text in ([]string{"early", "middle"}) {
+		append(&session.messages, Chat_Message{role = .Assistant, text = chat_clone_string(text, session.allocator)})
+	}
+
+	// Summarize everything before the last two messages, which is what
+	// compact_active computes when the seam lands ahead of the kept tail.
+	chat_compact_commit(&session, len(session.messages) - 2, "earlier work")
+	testing.expect_value(t, session.active_start, 1)
+	testing.expect_value(t, len(session.messages), 4)
+
+	fresh, request, wire, tools_owned, call_lists := chat_build_from_active(&session, tool_loop_connection, "model")
+	defer chat_request_view_destroy(&fresh)
+	defer tool_wire_cleanup(&wire, &tools_owned, &call_lists)
+	testing.expect_value(t, len(request.Messages), 3)
+	testing.expect(t, strings.has_prefix(request.Messages[0].Content, "Summary of the conversation so far:"))
+	testing.expect_value(t, request.Messages[1].Content, "early")
+	testing.expect_value(t, request.Messages[2].Content, "middle")
 }
 
 @(test)
@@ -79,9 +134,8 @@ test_rebuild_after_compact_uses_committed_history :: proc(t: ^testing.T) {
 	stale := chat_request_view_clone(session.messages[:], 0, context.temp_allocator)
 	defer chat_request_view_destroy(&stale)
 
-	// A committed compaction appends the summary past the snapshot's end.
-	append(&session.messages, Chat_Message{role = .Assistant, text = "Summary of the conversation so far:\nold stuff"})
-	session.active_start = len(session.messages) - 1
+	// A committed compaction installs the summary ahead of the kept tail.
+	chat_compact_commit(&session, len(session.messages), "old stuff")
 
 	stale_request, stale_wire, stale_tools, stale_calls := chat_build_request(&session, stale, tool_loop_connection, "model")
 	testing.expect_value(t, ai.Provider_Validate_Request(stale_request), ai.Provider_Request_Error.Missing_Messages)
