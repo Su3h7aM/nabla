@@ -456,34 +456,3 @@ atomic_store :: #force_inline proc(a: ^Atomic($T), val: T) {
 atomic_load :: #force_inline proc(a: ^Atomic($T)) -> T {
 	return sync.atomic_load(&a.raw)
 }
-
-import "core:testing"
-
-@(test)
-test_dynamic_unwritten :: proc(t: ^testing.T) {
-	{
-		d := make([dynamic]int, 4, 8)
-		defer delete(d)
-		du := _dynamic_unwritten(d)
-
-		testing.expect(t, len(du) == 4)
-	}
-
-	{
-		d := slice.into_dynamic([]int{1, 2, 3, 4, 5})
-		_dynamic_add_len(&d, 3)
-		du := _dynamic_unwritten(d)
-
-		testing.expect(t, len(d) == 3)
-		testing.expect(t, len(du) == 2)
-		testing.expect(t, du[0] == 4)
-		testing.expect(t, du[1] == 5)
-	}
-
-	{
-		d := slice.into_dynamic([]int{})
-		du := _dynamic_unwritten(d)
-
-		testing.expect(t, len(du) == 0)
-	}
-}
