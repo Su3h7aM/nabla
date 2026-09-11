@@ -164,6 +164,65 @@ test_a_bodyless_response_consumes_nothing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_interim_responses_precede_the_final_one :: proc(t: ^testing.T) {
+	// RFC 9112 9.2: the association between a request and a response is only
+	// complete on a final (non-1xx) response, so interim responses are read and
+	// discarded rather than answered.
+	wire := "HTTP/1.1 100 Continue\r\n\r\n" + "HTTP/1.1 103 Early Hints\r\nlink: </s.css>\r\n\r\n" + "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi"
+	reader := _reader(wire, 1)
+
+	status, headers, err := read_final_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, status, 200)
+
+	// The interim heads were consumed exactly, so the body begins where it should.
+	framing, length, framing_err := response_framing(status, .Post, headers)
+	testing.expect_value(t, framing_err, Error.None)
+	testing.expect_value(t, framing, Body_Framing.Exact)
+	testing.expect_value(t, length, 2)
+
+	collector: Collector
+	defer delete(collector.buffer)
+	testing.expect_value(t, stream_body(&reader, framing, length, &collector, collect), Error.None)
+	testing.expect_value(t, string(collector.buffer[:]), "hi")
+}
+
+@(test)
+test_an_unexpected_protocol_switch_is_returned_as_final :: proc(t: ^testing.T) {
+	// 101 ends the HTTP exchange instead of preceding a final response, and this
+	// client never asks to upgrade, so it must not wait for a response that will
+	// never come.
+	reader := _reader("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\r\n", 1)
+
+	status, headers, err := read_final_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, status, 101)
+}
+
+@(test)
+test_too_many_interim_responses_fail_the_request :: proc(t: ^testing.T) {
+	// A peer that only ever sends interim responses must not be able to keep the
+	// request running.
+	interim := "HTTP/1.1 100 Continue\r\n\r\n"
+	wire: [dynamic]u8
+	defer delete(wire)
+	for _ in 0 ..< HTTP_MAX_INTERIM_RESPONSES + 1 {
+		append(&wire, ..transmute([]u8)interim)
+	}
+
+	source := new(Slice_Source, context.temp_allocator)
+	source.bytes = wire[:]
+	reader: Reader
+	reader_init(&reader, slice_read, source, context.temp_allocator)
+
+	_, headers, err := read_final_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.Bad_Response)
+}
+
+@(test)
 test_a_truncated_body_is_reported :: proc(t: ^testing.T) {
 	// RFC 9112 8: a body shorter than its Content-Length is incomplete, and the
 	// peer closing is what ends it.

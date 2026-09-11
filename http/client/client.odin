@@ -15,6 +15,11 @@ HTTP_MAX_ERROR_BYTES :: 4096
 HTTP_MAX_HEADER_LINES :: 256
 HTTP_MAX_LINE_BYTES :: 32 * 1024
 
+// HTTP_MAX_INTERIM_RESPONSES bounds how many interim responses are discarded
+// before a final one, so a peer that only ever sends interim responses cannot
+// keep a request running indefinitely.
+HTTP_MAX_INTERIM_RESPONSES :: 16
+
 Failure_Kind :: enum {
 	None,
 	Cancelled,
@@ -98,7 +103,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	reader_init(&reader, connection_read_source, connection, request.allocator)
 	defer reader_destroy(&reader)
 
-	status, headers, head_err := read_response_head(&reader, request.allocator)
+	status, headers, head_err := read_final_response_head(&reader, request.allocator)
 	defer headers_destroy(&headers, request.allocator)
 	if head_err != .None { return failure_from_error(head_err) }
 
@@ -189,6 +194,28 @@ read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status
 		}
 	}
 	return status_code, headers, .None
+}
+
+// read_final_response_head reads response heads until a final one arrives.
+//
+// RFC 9112 9.2: responses are associated with requests in the order they arrive on
+// a connection, and that association is only complete on a final (non-1xx)
+// response. RFC 9112 6.3 item 1: an interim response cannot carry a body or a
+// trailer section, so each one is discarded in place and the next head is read.
+//
+// 101 is the exception. It ends the HTTP exchange rather than preceding a final
+// response, and this client never asks to upgrade, so an unexpected 101 is
+// returned as the final response for the caller to report as a failure rather
+// than being waited past.
+read_final_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status_code: int, headers: http.Headers, err: Error) {
+	for count := 0;; count += 1 {
+		code, head, head_err := read_response_head(reader, allocator)
+		if head_err != .None { return 0, head, head_err }
+		if code == 101 || code >= 200 { return code, head, .None }
+
+		headers_destroy(&head, allocator)
+		if count >= HTTP_MAX_INTERIM_RESPONSES { return 0, {}, .Bad_Response }
+	}
 }
 
 parse_status_line :: proc(line: string) -> (int, bool) {
