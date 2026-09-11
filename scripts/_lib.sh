@@ -16,10 +16,15 @@ readonly NABLA_ROOT
 # renamed, or deleted is picked up by every task without editing them.
 readonly NABLA_NON_PACKAGE_DIRS="cmd demo examples tests third_party"
 
-# Packages that assert on process-global state: the SIGINT disposition and
-# open descriptor counts are not meaningful if other tests run concurrently in
-# the same process. Pinned to one test thread.
-readonly NABLA_SERIAL_TEST_PACKAGES="agent ai"
+# Packages pinned to one test thread, for two different reasons. `agent` and
+# `ai` assert on process-global state: the SIGINT disposition and open
+# descriptor counts are not meaningful if other tests run concurrently in the
+# same process. `layout` is the only package that drives the test runner's
+# expected-assertion path, which recovers by trapping and unwinding through the
+# signal handler; with several tests free to trap at once the runner segfaults
+# at roughly one run in twelve, so its assertions need to be the only ones
+# in flight.
+readonly NABLA_SERIAL_TEST_PACKAGES="agent ai layout"
 
 # Packages whose suites run through an external harness under tests/ instead of
 # `odin test`. Their test files are written against a bespoke assertion harness

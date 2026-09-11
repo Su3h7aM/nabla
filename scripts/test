@@ -59,7 +59,8 @@ for config in "${configs[@]}"; do
 		extra=()
 		[[ "$config" == "debug" ]] && extra+=(-debug)
 		[[ -n "$sanitize" ]] && extra+=("-sanitize:$sanitize")
-		# Process-global assertions cannot survive concurrent test threads.
+		# Some suites must not run their tests concurrently;
+		# NABLA_SERIAL_TEST_PACKAGES records which, and why.
 		case " $NABLA_SERIAL_TEST_PACKAGES " in
 			*" $pkg "*) extra+=("-define:ODIN_TEST_THREADS=1") ;;
 		esac
