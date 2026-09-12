@@ -375,6 +375,45 @@ test_a_locked_database_reports_busy :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_busy_commit_leaves_the_transaction_open :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer delete(directory)
+	defer os.remove_all(directory)
+	path := _temp_database(directory)
+	defer delete(path)
+
+	reader: db.Conn
+	_expect_ok(t, open(&reader, {path = path}))
+	defer db.close(&reader)
+
+	writer: db.Conn
+	_expect_ok(t, open(&writer, {path = path}))
+	defer db.close(&writer)
+
+	_expect_ok(t, db.exec(&writer, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&writer, "INSERT INTO t VALUES (1)"))
+
+	// A result set that has stepped and is sitting on a row holds the shared
+	// lock, and the rolling-journal commit is the call that wants it gone. This
+	// is what makes the commit, rather than an earlier statement, the failure.
+	rows: db.Rows
+	_expect_ok(t, db.query(&reader, &rows, "SELECT * FROM t"))
+	_, _, _ = db.rows_next(&rows)
+
+	_expect_ok(t, db.begin(&writer))
+	_expect_ok(t, db.exec(&writer, "INSERT INTO t VALUES (2)"))
+	_expect_failure(t, db.commit(&writer), .Busy)
+
+	// A commit that lost the race leaves the transaction open, so the work is
+	// not lost and the lock is not left behind: the caller drops the reader and
+	// commits the same transaction again.
+	_expect_failure(t, db.begin(&writer), .Invalid_State)
+	_expect_ok(t, db.rows_close(&rows))
+	_expect_ok(t, db.commit(&writer))
+	testing.expect_value(t, _count(&writer), i64(2))
+}
+
+@(test)
 test_constraint_failures_are_classified :: proc(t: ^testing.T) {
 	conn := _open(t)
 	defer db.close(&conn)

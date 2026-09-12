@@ -22,7 +22,8 @@ Rows :: struct {
 // materialize decides whether the caller gets the row values; exec passes false
 // so a statement that returns rows nobody asked for costs no buffer.
 //
-// On failure rows is left closed.
+// A failure leaves no execution running, so a caller that gives up here has
+// nothing to finish.
 @(private)
 rows_execute :: proc(rows: ^Rows, args: []Value, materialize: bool) -> Error {
 	conn := rows.conn
