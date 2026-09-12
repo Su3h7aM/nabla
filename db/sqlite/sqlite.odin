@@ -17,11 +17,16 @@
 //
 // # Configuration
 //
-// Config covers what has to be set before the connection is used. Everything
-// else SQLite configures with a pragma is ordinary SQL, so it goes through
-// db.exec like anything else:
+// Config holds the two connection settings that have to be right before the
+// first statement and would otherwise have to be repeated on every open.
+// Everything else SQLite configures with a pragma is ordinary SQL, so it goes
+// through db.exec like anything else:
 //
 //	db.exec(&conn, "PRAGMA journal_mode = WAL") or_return
+//
+// WAL is persistent, so asking for it once is enough. The other journal modes
+// reset with the connection, and busy_timeout and foreign_keys are per
+// connection, which is why those two are fields and the journal mode is not.
 //
 // A pragma that reports a value is read with db.query. db.exec discards the
 // rows a statement produces rather than refusing them, so a pragma that returns
