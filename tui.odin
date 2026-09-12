@@ -222,7 +222,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 
 	if app.picking {
 		draw_picker(app, storage, conv_rect)
-		draw_input_hint(storage, input_rect)
+		draw_input_hint(app, storage, input_rect)
 	} else {
 		draw_conversation(app, storage, conv_rect)
 		cursor = draw_input(app, storage, input_rect)
@@ -377,11 +377,17 @@ picker_cursor_line :: proc(app: ^App, cursor: int, lines: ^[dynamic]Line) -> int
 }
 
 // draw_input_hint replaces the prompt with the picker's keys while it is open.
-draw_input_hint :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect) {
+// The startup chooser cannot be escaped, so the hint names quitting there and
+// cancelling elsewhere.
+draw_input_hint :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	if rect.height <= 0 || rect.width <= 0 {
 		return
 	}
-	_, _ = tui.draw_text(&storage.buffer, rect, "up/down move | enter select | esc quit", HINT_STYLE)
+	hint := "up/down move | enter select | esc cancel"
+	if app.picker_initial {
+		hint = "up/down move | enter select | esc quit"
+	}
+	_, _ = tui.draw_text(&storage.buffer, rect, hint, HINT_STYLE)
 }
 
 // emit_entry turns one conversation entry into a label plus wrapped body

@@ -135,11 +135,52 @@ App :: struct {
 	spin_lap:        time.Tick, // last working-frame advance,
 	spin_frame:      int,
 	picking:         bool, // the model picker owns the input until a model applies,
+	picker_initial:  bool, // the picker is the startup chooser: no model yet, so escape quits,
 	picker_cursor:   int,
 	picker_top:      int, // first picker line on screen, so the cursor stays visible,
 	columns:         int,
 	rows:            int,
 	quit:            bool,
+}
+
+// resolve_run_catalog builds the resolved catalog from the user's configuration:
+// the configuration's own statements, then each configured provider's listing,
+// then the models.dev catalog, merged first-value-wins. `configured` holds the
+// provider ids the user set up, which is the set the picker offers. Both results
+// are owned by the caller.
+resolve_run_catalog :: proc(
+	sources: []agent.Catalog_Provider_Source,
+	allocator: mem.Allocator,
+) -> (
+	catalog: agent.Catalog,
+	configured: [dynamic]string,
+	ok: bool,
+) {
+	// Only configured providers are selectable, so the raw catalog is filtered to
+	// them as it is read: enrichment for anything else has no consumer.
+	names := make([]string, len(sources), context.temp_allocator)
+	defer delete(names, context.temp_allocator)
+	for source, index in sources { names[index] = source.id }
+
+	// The provider's own listing comes before the shared catalog, so a model it
+	// introduces is enriched by models.dev in the same pass.
+	discovered := agent.discover_provider_models(sources, allocator = allocator)
+	defer agent.catalog_sources_destroy(&discovered, allocator)
+	models_dev, models_dev_err := agent.models_dev_sources(providers = names, allocator = allocator)
+	defer agent.catalog_sources_destroy(&models_dev, allocator)
+	if models_dev_err != .None {
+		fmt.eprintln("nabla: warning: models.dev is unavailable; using configured values only")
+	}
+	resolved, resolve_err := agent.resolve_catalog(sources, discovered[:], models_dev[:], allocator)
+	if resolve_err != .None {
+		fmt.eprintln("nabla: invalid configuration: a model cannot be excluded and customized at the same time")
+		return {}, {}, false
+	}
+	configured.allocator = allocator
+	for &source in sources {
+		append(&configured, strings.clone(source.id, allocator))
+	}
+	return resolved, configured, true
 }
 
 // run_catalog resolves the configuration into the catalog and creates the
@@ -155,25 +196,10 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source) -> (Run_Setup, boo
 		run_setup_destroy(&result)
 	}
 
-	// Only configured providers are selectable, so the raw catalog is filtered to
-	// them as it is read: enrichment for anything else has no consumer.
-	configured := make([]string, len(sources), context.temp_allocator)
-	defer delete(configured, context.temp_allocator)
-	for source, index in sources { configured[index] = source.id }
-	models_dev, models_dev_err := agent.models_dev_sources(providers = configured, allocator = result.alloc)
-	defer agent.catalog_sources_destroy(&models_dev, result.alloc)
-	if models_dev_err != .None {
-		fmt.eprintln("nabla: warning: models.dev is unavailable; using configured values only")
-	}
-	catalog, resolve_err := agent.resolve_catalog(sources, {}, models_dev[:], result.alloc)
-	if resolve_err != .None {
-		fmt.eprintln("nabla: invalid configuration: a model cannot be excluded and customized at the same time")
-		return {}, false
-	}
+	catalog, configured, resolved := resolve_run_catalog(sources, result.alloc)
+	if !resolved { return {}, false }
 	result.catalog = catalog
-	for &source in sources {
-		append(&result.configured, strings.clone(source.id, result.alloc))
-	}
+	result.configured = configured
 
 	session := agent.chat_session_init(result.alloc)
 	result.session = session
@@ -206,10 +232,14 @@ provider_configured :: proc(app: ^App, provider_id: string) -> bool {
 }
 
 // apply_selection switches the runtime to one provider's model and applies an
-// effort level. It resolves the credential and builds the connection, so it
-// must run where the runtime is owned: on the worker once it exists, or at
-// startup before it starts. The selection persists on success, so the next
-// launch restores it. A failure is reported through the snapshot; the
+// effort level. `effort` is an explicit level for the new model; empty means the
+// caller states none, and the level already in effect is then carried over
+// whenever the new model allows it, so switching models does not silently drop
+// the user's choice. A carried level the model does not allow falls back to the
+// lowest level it does state. It resolves the credential and builds the
+// connection, so it must run where the runtime is owned: on the worker once it
+// exists, or at startup before it starts. The selection persists on success, so
+// the next launch restores it. A failure is reported through the snapshot; the
 // previously selected model, if any, stays in place.
 apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> bool {
 	provider_index, provider_found := agent.catalog_find_provider(&app.setup.catalog, provider_id)
@@ -245,6 +275,14 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	session.context_window = window
 	session.max_output_tokens = model.max_output_tokens
 	session.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(api)
+	// The level to carry over: an explicit one, or the one already in effect, which
+	// a model switch keeps whenever the new model allows it. It may alias the
+	// session's stored effort, which rebuilding the level list replaces, so it is
+	// copied before the session is touched.
+	desired := effort
+	if desired == "" { desired = session.effort }
+	carried := strings.clone(desired, app.setup.alloc)
+	defer delete(carried, app.setup.alloc)
 	agent.chat_session_set_effort(session, "")
 	for level in session.effort_levels {
 		delete(level, session.allocator)
@@ -255,11 +293,11 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 			append(&session.effort_levels, strings.clone(level, session.allocator))
 		}
 	}
-	// A persisted effort the restored model does not allow falls back to the
-	// provider default rather than failing the selection.
-	desired := effort
-	if desired != "" && !agent.chat_session_set_effort(session, desired) {
-		desired = ""
+	// A carried level the new model does not allow falls back to the lowest level
+	// the model does state, so a switch never leaves an effort it cannot serve.
+	// With nothing to carry, the provider default stands.
+	if carried != "" && !agent.chat_session_set_effort(session, carried) && len(session.effort_levels) > 0 {
+		agent.chat_session_set_effort(session, session.effort_levels[0])
 	}
 
 	sync.mutex_lock(&app.run.mu)
@@ -353,8 +391,10 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	app.run.snap.status.cwd = setup.session.workspace
 	app.run.snap.status.context_window = setup.session.context_window
 	// The picker owns the input until a selection applies: explicit flags, the
-	// persisted selection, or the user's choice.
+	// persisted selection, or the user's choice. It is the startup chooser, so it
+	// cannot be dismissed until a model is in place.
 	app.picking = true
+	app.picker_initial = true
 	app.home = os.get_env("HOME", app.run.alloc)
 	app.input = widgets.Input{}
 	widgets.input_init(&app.input, app.run.alloc)
@@ -443,10 +483,12 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 		// silent request (no stream events, tools running) still advances it.
 		now := time.tick_now()
 		advance_spinner := app.run.snap.status.running && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
-		// A picker selection applies on the worker; the first status that
-		// carries a model closes the picker.
-		if app.picking && app.run.snap.status.model_id != "" {
+		// A startup picker closes once its selection applies on the worker. A picker
+		// opened from the prompt closes on submit instead, so browsing it does not
+		// dismiss it.
+		if app.picker_initial && app.run.snap.status.model_id != "" {
 			app.picking = false
+			app.picker_initial = false
 			widgets.input_clear(&app.input)
 		}
 		if count > 0 || resized || generation_changed(app) || advance_spinner {
@@ -634,6 +676,37 @@ picker_submit :: proc(app: ^App) {
 		cursor = len(entries) - 1
 	}
 	enqueue(app, .Model, entries[cursor].provider_id, entries[cursor].model_id)
+	// The startup chooser stays until the selection applies, because no model is
+	// selected yet; a picker opened over a running prompt closes at once, and a
+	// selection that fails is reported as a transcript warning.
+	if !app.picker_initial {
+		app.picking = false
+	}
+}
+
+// picker_open opens the model picker over the prompt, positioned on the model in
+// effect so the list starts where the user already is. The prompt is cleared: the
+// picker owns the keyboard until it closes. Only the startup chooser is
+// mandatory, so escaping this one returns to the prompt instead of quitting.
+picker_open :: proc(app: ^App) {
+	app.picking = true
+	app.picker_initial = false
+	app.picker_top = 0
+	app.picker_cursor = picker_current(app)
+	widgets.input_clear(&app.input)
+}
+
+// picker_current is the position of the selected model among the picker's
+// entries, or the first entry when the catalog cannot place it.
+picker_current :: proc(app: ^App) -> int {
+	entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
+	picker_entries(app, &entries)
+	for entry, index in entries {
+		if entry.provider_id == app.setup.provider_id && entry.model_id == app.setup.model_id {
+			return index
+		}
+	}
+	return 0
 }
 
 // handle_picker_key drives the model picker: arrows move, enter applies,
@@ -653,7 +726,11 @@ handle_picker_key :: proc(app: ^App, key: input.Key_Event) {
 	case .Enter:
 		picker_submit(app)
 	case .Escape:
-		app.quit = true
+		if app.picker_initial {
+			app.quit = true
+		} else {
+			app.picking = false
+		}
 	case .Home:
 		app.picker_cursor = 0
 	case .End:
@@ -875,6 +952,67 @@ obs_usage :: proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Ev
 
 // --- input handling -------------------------------------------------------
 
+// Command is one slash command the prompt recognizes. `menu` marks the command
+// whose argument is chosen from a list, so a completed name opens that list
+// instead of completing further. Every name is lowercase.
+Command :: struct {
+	name: string,
+	menu: bool,
+}
+
+COMMANDS :: []Command{{name = "/compact"}, {name = "/context"}, {name = "/effort"}, {name = "/model", menu = true}, {name = "/quit"}}
+
+// complete_command advances the slash command at the prompt. A unique prefix
+// completes to the whole name, several complete to what they share, and a name
+// that is already whole opens its list. Matching ignores case, but what is
+// written back is the command's own lowercase name. The command set is small and
+// closed, so there is no completion state to keep.
+complete_command :: proc(app: ^App) {
+	typed := strings.trim_space(widgets.input_text(&app.input))
+	if !strings.has_prefix(typed, "/") {
+		return
+	}
+	matches := 0
+	only := ""
+	only_menu := false
+	common := ""
+	for command in COMMANDS {
+		if !command_prefixed(command.name, typed) {
+			continue
+		}
+		matches += 1
+		only = command.name
+		only_menu = command.menu
+		if matches == 1 {
+			common = command.name
+		} else {
+			common = strings.common_prefix(common, command.name)
+		}
+	}
+	switch {
+	case matches == 0:
+	case matches == 1 && typed == only:
+		if only_menu {
+			picker_open(app)
+		}
+	case matches == 1:
+		widgets.input_clear(&app.input)
+		widgets.input_insert(&app.input, only)
+	case len(common) > len(typed):
+		widgets.input_clear(&app.input)
+		widgets.input_insert(&app.input, common)
+	}
+}
+
+// command_prefixed reports whether the typed text is a prefix of a command,
+// ignoring case so a capital is a typo rather than a miss.
+command_prefixed :: proc(command, typed: string) -> bool {
+	if len(typed) > len(command) {
+		return false
+	}
+	return strings.equal_fold(command[:len(typed)], typed)
+}
+
 handle_event :: proc(app: ^App, event: input.Event) {
 	#partial switch data in event {
 	case input.Key_Event:
@@ -931,6 +1069,7 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 			app.scroll = 0
 		}
 	case .Tab:
+		complete_command(app)
 	case .Up, .Down:
 	case .Character:
 		if .Control in key.modifiers {
@@ -982,9 +1121,11 @@ dispatch_command :: proc(app: ^App, text: string) {
 	case text == "/effort" || strings.has_prefix(text, "/effort "):
 		enqueue(app, .Effort, "", strings.trim_space(text[len("/effort"):]))
 	case text == "/model" || strings.has_prefix(text, "/model "):
+		// Naming no model lists them: the catalog is the authority on what is
+		// available, so choosing from it needs no typing.
 		rest := strings.trim_space(text[len("/model"):])
 		if rest == "" {
-			snap_append(app, .Notice, "usage: /model <model-id>")
+			picker_open(app)
 			return
 		}
 		provider_id, model_id, ok := resolve_model_reference(app, rest)

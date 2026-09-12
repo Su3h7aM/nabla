@@ -44,7 +44,7 @@ main :: proc() {
 		fmt.println("nabla [--config PATH] [--provider ID --model ID]")
 		fmt.println("default config: $XDG_CONFIG_HOME/nabla/config.lua (~/.config/nabla/config.lua)")
 		fmt.println("without provider/model, the last selection is restored, or the picker opens")
-		fmt.println("--list prints configured catalog entries")
+		fmt.println("--list prints the resolved catalog")
 		return
 	}
 	if options.config_path == "" {
@@ -56,7 +56,17 @@ main :: proc() {
 		options.config_path,
 	); if err != .None { fmt.println(agent.config_error_text(err)); return }; defer agent.catalog_sources_destroy(&sources)
 	if options.list {
-		for provider in sources { for model in provider.models { if model.disabled_present && model.disabled { continue }; fmt.println(provider.id, "/", model.id) } }; return
+		catalog, configured, catalog_ok := resolve_run_catalog(sources[:], context.allocator)
+		defer {
+			for id in configured { delete(id, context.allocator) }
+			delete(configured)
+			agent.catalog_destroy(&catalog)
+		}
+		if !catalog_ok { return }
+		for model in catalog.models {
+			fmt.println(model.provider_id, "/", model.id)
+		}
+		return
 	}
 	if (options.provider_id == "") != (options.model_id == "") {
 		fmt.eprintln("nabla: --provider and --model must be given together")
