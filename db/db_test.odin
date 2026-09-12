@@ -2,6 +2,7 @@
 #+private file
 package db
 
+import "core:math"
 import "core:mem"
 import "core:testing"
 
@@ -410,6 +411,15 @@ test_value_conversions_are_lossless_or_refused :: proc(t: ^testing.T) {
 	// A fraction does not become a truncated integer.
 	_, fraction_err := as_i64(Value(f64(1.5)))
 	testing.expect_value(t, error_kind(fraction_err), Error_Kind.Out_Of_Range)
+
+	// NaN orders false against both range bounds, so the guard has to refuse it
+	// rather than let it reach a conversion with no defined result.
+	_, nan_err := as_i64(Value(math.nan_f64()))
+	testing.expect_value(t, error_kind(nan_err), Error_Kind.Out_Of_Range)
+	_, infinity_err := as_i64(Value(math.inf_f64(1)))
+	testing.expect_value(t, error_kind(infinity_err), Error_Kind.Out_Of_Range)
+	_, neg_infinity_err := as_i64(Value(math.inf_f64(-1)))
+	testing.expect_value(t, error_kind(neg_infinity_err), Error_Kind.Out_Of_Range)
 
 	// An integer too large for a float is refused rather than rounded.
 	_, precision_err := as_f64(Value(i64(1) << 53 + 1))

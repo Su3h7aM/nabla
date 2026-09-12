@@ -1,5 +1,7 @@
 package db
 
+import "core:math"
+
 // Value is one SQL value. Its zero value, nil, is SQL NULL; an empty string and
 // a zero-length blob are values, not NULL.
 //
@@ -36,6 +38,10 @@ as_i64 :: proc(v: Value) -> (n: i64, err: Error) {
 	case i64:
 		return x, nil
 	case f64:
+		// NaN orders false against both bounds, so it needs its own refusal.
+		if math.is_nan(x) {
+			return 0, error_make(.Out_Of_Range, 0, "NaN has no integer value")
+		}
 		if x < I64_MIN_F64 || x >= I64_MAX_F64 {
 			return 0, error_make(.Out_Of_Range, 0, "float is outside the i64 range")
 		}
