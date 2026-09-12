@@ -47,17 +47,51 @@ Resize_Event :: struct {
 	rows:    int,
 }
 
+// Paste is one bracketed paste (DECSET 2004), emitted when the parser sees
+// CSI 200 ~ … CSI 201 ~. `text` owns its bytes: it is the only event payload
+// that allocates, and the caller releases the whole event list with
+// events_clear or events_destroy (or deletes the text individually). Every
+// other event is a plain value.
+//
+// A paste past PASTE_LIMIT is discarded and reported as Unknown_Input rather
+// than arriving truncated: the caller can tell an oversized paste from a
+// keypress, and no event ever carries a silently shortened body.
+Paste :: struct {
+	text: string,
+}
+
 // End_Of_Input marks the tty closing (read returning zero). It is a distinct
 // event, not an error.
 End_Of_Input :: struct {}
 
 // Unknown_Input is emitted for malformed or unsupported byte sequences; the
-// parser resynchronizes immediately after. Malformed input is never an error.
+// parser resynchronizes immediately after. An oversized paste (past
+// PASTE_LIMIT) is reported this way too, since its content is discarded rather
+// than delivered. Malformed input is never an error.
 Unknown_Input :: struct {}
 
 Event :: union #no_nil {
 	Key_Event,
 	Resize_Event,
+	Paste,
 	End_Of_Input,
 	Unknown_Input,
+}
+
+// events_clear releases every owned event payload and empties the list for
+// reuse. `allocator` must be the one the events were produced with. Only Paste
+// owns memory today.
+events_clear :: proc(events: ^[dynamic]Event, allocator := context.allocator) {
+	for event in events^ {
+		if paste, ok := event.(Paste); ok && paste.text != "" {
+			delete(paste.text, allocator)
+		}
+	}
+	clear(events)
+}
+
+// events_destroy releases every owned event payload and the list itself.
+events_destroy :: proc(events: ^[dynamic]Event, allocator := context.allocator) {
+	events_clear(events, allocator)
+	delete(events^)
 }

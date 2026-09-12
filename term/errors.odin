@@ -15,7 +15,7 @@ General_Error :: enum u32 {
 	Not_Open, // the operation requires an open session
 	Not_A_Tty, // the descriptor is not a terminal
 	No_Controlling_Tty, // open of /dev/tty found no controlling terminal
-	Unsupported, // the requested capability or frame width has no v1 implementation
+	Unsupported, // a cell width or shape the serializer cannot encode
 	Invalid_Frame_Data, // frame dimensions or logical cell count are malformed
 	Invalid_Cell, // a cell grapheme is malformed UTF-8 or carries terminal controls
 	Invalid_Cursor, // a cursor Position is out of the frame bounds

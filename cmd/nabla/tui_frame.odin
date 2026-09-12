@@ -11,24 +11,28 @@ package main
 //
 // The screen is a thin projection of runtime state: the conversation comes
 // from the runtime snapshot, the footer from the runtime status block.
-// Nothing here owns conversation state.
+// Nothing here owns conversation state. The region split is six integers
+// through tui.rows; there is no layout tree between the split and the
+// draw. The frame grid is term's; tui draws into it and term.present writes
+// it.
 //
-// Text policy stays conservative: every byte is drawn through the
-// sanitizer, and anything that is not printable ASCII becomes a
-// placeholder, so untrusted model or tool output can never emit a terminal
-// control sequence.
+// Text policy comes from nabla:text and tui: every byte is drawn through the
+// sanitizer, and draw_text runs the same policy that measurement and
+// truncation run, so untrusted model or tool output can never emit a terminal
+// control sequence and never measures differently from how it draws. The
+// glyphs the screen controls itself (the rule and spinner) go through tui.put,
+// which enforces the same policy.
 
 import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
 import "core:time"
-import "core:unicode/utf8"
 
-import "nabla:layout"
 import "nabla:term"
+import "nabla:text"
 import "nabla:tui"
-import widgets "nabla:widgets"
+import "nabla:tui/widgets"
 
 // TUI_MAX_CELLS bounds the frame budget. Larger terminals simply skip the
 // frame; the terminal keeps its previous contents.
@@ -39,8 +43,8 @@ TUI_FOOTER_ROWS :: 5
 
 // The palette follows the dark theme of the reference TUI: amber labels,
 // muted lavender rules, and grey body text.
-RULE_STYLE :: tui.Style {
-	foreground = tui.RGB_Color{150, 130, 165},
+RULE_STYLE :: term.Style {
+	foreground = term.RGB_Color{150, 130, 165},
 }
 
 // The working indicator: the reference TUI's braille spinner on the rule row
@@ -55,56 +59,56 @@ spinner_glyph :: proc(index: int) -> string {
 	glyphs := [10]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	return glyphs[index % len(glyphs)]
 }
-WORKING_SPINNER :: tui.Style {
-	foreground = tui.RGB_Color{129, 162, 190},
+WORKING_SPINNER :: term.Style {
+	foreground = term.RGB_Color{129, 162, 190},
 }
-WORKING_TEXT :: tui.Style {
-	foreground = tui.RGB_Color{205, 205, 212},
+WORKING_TEXT :: term.Style {
+	foreground = term.RGB_Color{205, 205, 212},
 }
-LABEL_STYLE :: tui.Style {
-	foreground = tui.RGB_Color{240, 198, 116},
+LABEL_STYLE :: term.Style {
+	foreground = term.RGB_Color{240, 198, 116},
 	modifiers  = {.Bold},
 }
-USER_TEXT :: tui.Style {
-	foreground = tui.RGB_Color{228, 228, 234},
+USER_TEXT :: term.Style {
+	foreground = term.RGB_Color{228, 228, 234},
 }
-AGENT_TEXT :: tui.Style {
-	foreground = tui.RGB_Color{205, 205, 212},
+AGENT_TEXT :: term.Style {
+	foreground = term.RGB_Color{205, 205, 212},
 }
-TOOL_TEXT :: tui.Style {
-	foreground = tui.RGB_Color{138, 138, 148},
+TOOL_TEXT :: term.Style {
+	foreground = term.RGB_Color{138, 138, 148},
 }
-NOTICE_TEXT :: tui.Style {
-	foreground = tui.RGB_Color{129, 162, 190},
+NOTICE_TEXT :: term.Style {
+	foreground = term.RGB_Color{129, 162, 190},
 }
-WARNING_TEXT :: tui.Style {
-	foreground = tui.RGB_Color{240, 198, 116},
+WARNING_TEXT :: term.Style {
+	foreground = term.RGB_Color{240, 198, 116},
 }
-ERROR_TEXT :: tui.Style {
-	foreground = tui.RGB_Color{204, 102, 102},
+ERROR_TEXT :: term.Style {
+	foreground = term.RGB_Color{204, 102, 102},
 }
-INPUT_TEXT :: tui.Style {
-	foreground = tui.RGB_Color{228, 228, 234},
+INPUT_TEXT :: term.Style {
+	foreground = term.RGB_Color{228, 228, 234},
 }
-INPUT_PROMPT :: tui.Style {
-	foreground = tui.RGB_Color{129, 162, 190},
+INPUT_PROMPT :: term.Style {
+	foreground = term.RGB_Color{129, 162, 190},
 	modifiers  = {.Bold},
 }
-TITLE_STYLE :: tui.Style {
-	foreground = tui.RGB_Color{228, 228, 234},
+TITLE_STYLE :: term.Style {
+	foreground = term.RGB_Color{228, 228, 234},
 	modifiers  = {.Bold},
 }
-HINT_STYLE :: tui.Style {
-	foreground = tui.RGB_Color{140, 140, 146},
+HINT_STYLE :: term.Style {
+	foreground = term.RGB_Color{140, 140, 146},
 }
-FOOTER_TEXT :: tui.Style {
-	foreground = tui.RGB_Color{205, 205, 212},
+FOOTER_TEXT :: term.Style {
+	foreground = term.RGB_Color{205, 205, 212},
 }
-FOOTER_MUTED :: tui.Style {
-	foreground = tui.RGB_Color{110, 110, 118},
+FOOTER_MUTED :: term.Style {
+	foreground = term.RGB_Color{110, 110, 118},
 }
-PICKED_STYLE :: tui.Style {
-	foreground = tui.RGB_Color{129, 162, 190},
+PICKED_STYLE :: term.Style {
+	foreground = term.RGB_Color{129, 162, 190},
 	modifiers  = {.Bold},
 }
 
@@ -116,23 +120,8 @@ BODY_INDENT :: 2
 // lives until the frame is presented.
 Line :: struct {
 	text:   string,
-	style:  tui.Style,
+	style:  term.Style,
 	indent: int,
-}
-
-TUI_CAPACITIES :: layout.Capacities {
-	nodes          = 16,
-	children       = 16,
-	clips          = 4,
-	commands       = 64,
-	text_lines     = 8,
-	measured_words = 16,
-	overlays       = 1,
-	measure_cache  = 8,
-	id_table       = 16,
-	depth          = 8,
-	diagnostics    = 8,
-	debug_labels   = 0,
 }
 
 Render_Status :: enum u8 {
@@ -142,18 +131,13 @@ Render_Status :: enum u8 {
 	Buffer_Too_Small,
 }
 
-// Frame_Storage is the caller-owned frame budget: layout storage plus the
-// logical and terminal cell grids and the presentation scratch, all sized to
-// the current viewport.
+// Frame_Storage is the caller-owned frame budget: the cell grid backing and
+// the presentation scratch, sized to the current viewport.
 Frame_Storage :: struct {
-	ctx:            layout.Context,
-	layout_storage: [262144]byte,
-	cells:          []tui.Cell,
-	frame_cells:    []term.Cell,
-	buffer:         tui.Cell_Buffer,
-	frame:          term.Frame_Buffer,
-	output:         []byte,
-	alloc:          mem.Allocator,
+	cells:  []term.Cell,
+	buffer: term.Frame_Buffer,
+	output: []byte,
+	alloc:  mem.Allocator,
 }
 
 frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
@@ -164,11 +148,14 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 
 frame_storage_destroy :: proc(storage: ^Frame_Storage) {
 	if storage.cells != nil { delete(storage.cells, storage.alloc) }
-	if storage.frame_cells != nil { delete(storage.frame_cells, storage.alloc) }
 	if storage.output != nil { delete(storage.output, storage.alloc) }
 	free(storage, storage.alloc)
 }
 
+// ensure_frame grows the cell grid to the viewport. The presentation scratch is
+// sized from term.present's required-size contract in present_frame, not
+// guessed here: a grapheme can carry arbitrarily many combining bytes, so no
+// bytes-per-cell bound is a valid upper bound.
 ensure_frame :: proc(storage: ^Frame_Storage, cols, rows: int) -> bool {
 	need := cols * rows
 	if need > TUI_MAX_CELLS {
@@ -176,16 +163,7 @@ ensure_frame :: proc(storage: ^Frame_Storage, cols, rows: int) -> bool {
 	}
 	if len(storage.cells) < need {
 		if storage.cells != nil { delete(storage.cells, storage.alloc) }
-		storage.cells = make([]tui.Cell, need, storage.alloc)
-	}
-	if len(storage.frame_cells) < need {
-		if storage.frame_cells != nil { delete(storage.frame_cells, storage.alloc) }
-		storage.frame_cells = make([]term.Cell, need, storage.alloc)
-	}
-	output_need := need * 80
-	if len(storage.output) < output_need {
-		if storage.output != nil { delete(storage.output, storage.alloc) }
-		storage.output = make([]byte, output_need, storage.alloc)
+		storage.cells = make([]term.Cell, need, storage.alloc)
 	}
 	return true
 }
@@ -200,11 +178,18 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	free_all(context.temp_allocator)
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
-	frame, cursor, err := render_frame(app, storage)
+	cursor, err := render_frame(app, storage)
 	if err != .None {
 		return
 	}
-	_, _, present_err := term.present(app.terminal, frame, term.profile_default(), cursor, storage.output)
+	_, required, present_err := term.present(app.terminal, storage.buffer, term.profile_default(), cursor, storage.output)
+	if present_err == term.General_Error.Presentation_Workspace_Too_Small {
+		// The encoder reports the exact required count before writing anything,
+		// so the scratch can be grown once and the frame retried.
+		delete(storage.output, storage.alloc)
+		storage.output = make([]byte, required, storage.alloc)
+		_, _, present_err = term.present(app.terminal, storage.buffer, term.profile_default(), cursor, storage.output)
+	}
 	if present_err != nil {
 		fmt.eprintln("nabla: present:", present_err)
 	}
@@ -212,76 +197,50 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 
 // render_frame composes one frame from the current snapshot. The caller
 // holds the runtime mutex.
-render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (frame: term.Frame_Buffer, cursor: term.Cursor_Intent, err: Render_Status) {
+render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor, err: Render_Status) {
 	cols, rows := app.columns, app.rows
 	if cols <= 0 || rows <= 0 {
-		return {}, nil, .None
+		return {}, .None
 	}
 	if rows < TUI_FOOTER_ROWS + 1 {
-		return {}, nil, .Too_Small
+		return {}, .Too_Small
 	}
 	if !ensure_frame(storage, cols, rows) {
-		return {}, nil, .Too_Small
-	}
-
-	config := layout.Options {
-		capacities = TUI_CAPACITIES,
-	}
-	if layout.storage_size(config.capacities) > len(storage.layout_storage) {
-		return {}, nil, .Too_Small
-	}
-	layout.destroy(&storage.ctx)
-	if layout.init_from_buffer(&storage.ctx, config, storage.layout_storage[:]) != nil {
-		return {}, nil, .Layout_Failed
-	}
-	viewport := layout.Vec2{layout.Scalar(cols), layout.Scalar(rows)}
-	if layout.frame(&storage.ctx, viewport) {
-		root := widgets.container_desc(widgets.Container{id = layout.id("root"), style = {flow = .Column, sizing = {layout.grow(), layout.grow()}}})
-		if layout.element(&storage.ctx, root) {
-			regions := [TUI_FOOTER_ROWS + 1]struct {
-				name: string,
-				size: layout.Axis_Size,
-			} {
-				{"conv", layout.grow()},
-				{"rule-top", layout.fixed(1)},
-				{"input", layout.fixed(1)},
-				{"rule-bottom", layout.fixed(1)},
-				{"cwd", layout.fixed(1)},
-				{"status", layout.fixed(1)},
-			}
-			for region in regions {
-				layout.content(
-					&storage.ctx,
-					widgets.container_desc(widgets.Container{id = layout.id(region.name), style = {sizing = {layout.grow(), region.size}}}),
-				)
-			}
-		}
-	}
-	frame_result, frame_err := layout.result(&storage.ctx)
-	if frame_err != .None {
-		return {}, nil, .Layout_Failed
+		return {}, .Too_Small
 	}
 	if !tui.init(&storage.buffer, cols, rows, storage.cells) {
-		return {}, nil, .Buffer_Too_Small
+		return {}, .Buffer_Too_Small
 	}
-	conv_rect := region_rect(frame_result, "conv")
-	rule_top_rect := region_rect(frame_result, "rule-top")
-	input_rect := region_rect(frame_result, "input")
-	rule_bottom_rect := region_rect(frame_result, "rule-bottom")
-	cwd_rect := region_rect(frame_result, "cwd")
-	status_rect := region_rect(frame_result, "status")
+
+	// One grow region for the conversation, then the fixed footer rows.
+	viewport := tui.Cell_Rect {
+		x      = 0,
+		y      = 0,
+		width  = cols,
+		height = rows,
+	}
+	heights := [TUI_FOOTER_ROWS + 1]int{-1, 1, 1, 1, 1, 1}
+	regions: [TUI_FOOTER_ROWS + 1]tui.Cell_Rect
+	if !tui.rows(viewport, heights[:], regions[:]) {
+		return {}, .Layout_Failed
+	}
+	conv_rect := regions[0]
+	rule_top_rect := regions[1]
+	input_rect := regions[2]
+	rule_bottom_rect := regions[3]
+	cwd_rect := regions[4]
+	status_rect := regions[5]
 
 	if conv_rect.width <= 0 && input_rect.width <= 0 {
-		return {}, nil, .Layout_Failed
+		return {}, .Layout_Failed
 	}
 
-	caret: term.Cursor_Intent = nil
 	if app.picking {
 		draw_picker(app, storage, conv_rect)
 		draw_input_hint(storage, input_rect)
 	} else {
 		draw_conversation(app, storage, conv_rect)
-		caret = draw_input(app, storage, input_rect)
+		cursor = draw_input(app, storage, input_rect)
 	}
 	// The rule above the input doubles as the working indicator while a
 	// request is active.
@@ -292,27 +251,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (frame: term.Frame_B
 	}
 	draw_rule(storage, rule_bottom_rect)
 	draw_footer(app, storage, cwd_rect, status_rect)
-
-	built, built_ok := tui.build_frame(storage.buffer, storage.frame_cells)
-	if !built_ok {
-		return {}, nil, .Buffer_Too_Small
-	}
-	storage.frame = built
-	return built, caret, .None
-}
-
-// region_rect projects a declared region to cells; a missing or
-// non-integral region yields the zero rect.
-region_rect :: proc(frame_result: layout.Frame_Result, name: string) -> tui.Cell_Rect {
-	node, found := layout.lookup(frame_result, layout.id(name))
-	if !found {
-		return {}
-	}
-	rect, projection_err := tui.project_rect_integral(node.outer)
-	if projection_err != .None {
-		return {}
-	}
-	return rect
+	return cursor, .None
 }
 
 // draw_conversation renders the transcript: an amber label per entry, its
@@ -363,7 +302,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 		if row.width <= 0 {
 			continue
 		}
-		_, _ = tui.draw_ascii(&storage.buffer, row, line.text, line.style)
+		_, _ = tui.draw_text(&storage.buffer, row, line.text, line.style)
 	}
 }
 
@@ -429,7 +368,7 @@ draw_picker :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 		if row.width <= 0 {
 			continue
 		}
-		_, _ = tui.draw_ascii(&storage.buffer, row, line.text, line.style)
+		_, _ = tui.draw_text(&storage.buffer, row, line.text, line.style)
 	}
 }
 
@@ -457,7 +396,7 @@ draw_input_hint :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	if rect.height <= 0 || rect.width <= 0 {
 		return
 	}
-	_, _ = tui.draw_ascii(&storage.buffer, rect, "up/down move | enter select | esc quit", HINT_STYLE)
+	_, _ = tui.draw_text(&storage.buffer, rect, "up/down move | enter select | esc quit", HINT_STYLE)
 }
 
 // emit_entry turns one conversation entry into a label plus wrapped body
@@ -477,7 +416,7 @@ emit_entry :: proc(entry: ^Entry, width: int, out: ^[dynamic]Line) {
 	append(out, Line{style = {}})
 }
 
-entry_label :: proc(kind: Entry_Kind) -> (string, tui.Style) {
+entry_label :: proc(kind: Entry_Kind) -> (string, term.Style) {
 	switch kind {
 	case .User:
 		return "[user]", LABEL_STYLE
@@ -490,7 +429,7 @@ entry_label :: proc(kind: Entry_Kind) -> (string, tui.Style) {
 	return "", {}
 }
 
-entry_style :: proc(kind: Entry_Kind) -> tui.Style {
+entry_style :: proc(kind: Entry_Kind) -> term.Style {
 	switch kind {
 	case .User:
 		return USER_TEXT
@@ -508,16 +447,16 @@ entry_style :: proc(kind: Entry_Kind) -> tui.Style {
 	return {}
 }
 
-// wrap_text splits sanitized text into wrapped lines. Tabs expand to four
-// spaces, line breaks split paragraphs, and anything that is not printable
-// ASCII becomes a placeholder. Paragraphs wrap on spaces.
-wrap_text :: proc(text: string, width: int, indent: int, style: tui.Style, out: ^[dynamic]Line) {
+// wrap_text splits sanitized text into wrapped lines. Paragraphs wrap on
+// spaces; the text policy (nabla:text) expands tabs at their line column and
+// drops undrawable clusters, so the measured line and the drawn line agree.
+wrap_text :: proc(value: string, width: int, indent: int, style: term.Style, out: ^[dynamic]Line) {
 	pos := 0
 	for {
-		nl := strings.index_byte(text[pos:], '\n')
-		para := text[pos:]
+		nl := strings.index_byte(value[pos:], '\n')
+		para := value[pos:]
 		if nl >= 0 {
-			para = text[pos:pos + nl]
+			para = value[pos:pos + nl]
 		}
 		if nl != 0 {
 			emit_paragraph(para, width, indent, style, out)
@@ -531,7 +470,7 @@ wrap_text :: proc(text: string, width: int, indent: int, style: tui.Style, out: 
 	}
 }
 
-emit_paragraph :: proc(para: string, width: int, indent: int, style: tui.Style, out: ^[dynamic]Line) {
+emit_paragraph :: proc(para: string, width: int, indent: int, style: term.Style, out: ^[dynamic]Line) {
 	if len(para) == 0 {
 		return
 	}
@@ -547,12 +486,13 @@ emit_paragraph :: proc(para: string, width: int, indent: int, style: tui.Style, 
 		switch {
 		case r == ' ':
 			flush_word(&word, &words)
-		case r == '\t':
-			strings.write_string(&word, "    ")
-		case r >= 0x20 && r <= 0x7e:
-			strings.write_byte(&word, u8(r))
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
+		// A control code point never reaches a cell; the sanitizer already
+		// dropped escape sequences, and the policy drops the rest at draw
+		// time, so it is not part of a word here either. A tab is kept: the
+		// policy expands it against its column.
 		case:
-			strings.write_byte(&word, '?')
+			strings.write_rune(&word, r)
 		}
 	}
 	flush_word(&word, &words)
@@ -563,7 +503,9 @@ emit_paragraph :: proc(para: string, width: int, indent: int, style: tui.Style, 
 	line_buf := strings.builder_make(0, 0, context.temp_allocator)
 	col := 0
 	for w in words {
-		if col > 0 && col + 1 + len(w) > width {
+		// Measure the word where it lands: a tab's width depends on the
+		// column, so the line is wrapped in the same columns it will draw in.
+		if col > 0 && col + 1 + text.text_columns_at(w, col + 1) > width {
 			append(out, Line{text = strings.clone(strings.to_string(line_buf), context.temp_allocator), style = style, indent = indent})
 			strings.builder_reset(&line_buf)
 			col = 0
@@ -573,36 +515,9 @@ emit_paragraph :: proc(para: string, width: int, indent: int, style: tui.Style, 
 			col += 1
 		}
 		strings.write_string(&line_buf, w)
-		col += len(w)
+		col += text.text_columns_at(w, col)
 	}
 	append(out, Line{text = strings.clone(strings.to_string(line_buf), context.temp_allocator), style = style, indent = indent})
-}
-
-// frame_draw_at places text into one buffer row, one cell per rune, so
-// caller-controlled text may carry non-ASCII runes (the spinner, the rules).
-// Control code points are skipped, so no terminal control can reach the
-// frame; untrusted transcript text keeps its ASCII-only path. Cells past the
-// drawn text keep their blank from init.
-frame_draw_at :: proc(storage: ^Frame_Storage, x, y: int, value: string, style: tui.Style) {
-	if y < 0 || y >= storage.buffer.height {
-		return
-	}
-	column := x
-	offset := 0
-	for offset < len(value) {
-		if column >= storage.buffer.width {
-			return
-		}
-		r, width := utf8.decode_rune(value[offset:])
-		if r >= 0x20 && r != 0x7f {
-			storage.buffer.cells[y * storage.buffer.width + column] = tui.Cell {
-				grapheme = value[offset:offset + width],
-				style    = style,
-			}
-			column += 1
-		}
-		offset += width
-	}
 }
 
 // draw_working renders the rule row as the working indicator: dashes, a gap,
@@ -617,14 +532,13 @@ draw_working :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect, frame_index: 
 		draw_rule(storage, rect)
 		return
 	}
-	frame_draw_at(storage, rect.x, rect.y, "──", RULE_STYLE)
-	frame_draw_at(storage, rect.x + 3, rect.y, spinner_glyph(frame_index), WORKING_SPINNER)
-	frame_draw_at(storage, rect.x + 5, rect.y, WORKING_LABEL, WORKING_TEXT)
-	rule, repeat_err := strings.repeat("─", rect.width - prefix, context.temp_allocator)
-	if repeat_err != nil {
-		return
+	tui.fill(&storage.buffer, tui.Cell_Rect{x = rect.x, y = rect.y, width = 2, height = 1}, "─", RULE_STYLE)
+	_ = tui.put(&storage.buffer, rect.x + 3, rect.y, spinner_glyph(frame_index), WORKING_SPINNER)
+	_, _ = tui.draw_text(&storage.buffer, tui.Cell_Rect{x = rect.x + 5, y = rect.y, width = len(WORKING_LABEL), height = 1}, WORKING_LABEL, WORKING_TEXT)
+	tail := rect.width - prefix
+	if tail > 0 {
+		tui.fill(&storage.buffer, tui.Cell_Rect{x = rect.x + prefix, y = rect.y, width = tail, height = 1}, "─", RULE_STYLE)
 	}
-	frame_draw_at(storage, rect.x + prefix, rect.y, rule, RULE_STYLE)
 }
 
 // draw_rule paints one horizontal rule across the row.
@@ -632,52 +546,30 @@ draw_rule :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	if rect.height <= 0 || rect.width <= 0 {
 		return
 	}
-	rule, repeat_err := strings.repeat("─", rect.width, context.temp_allocator)
-	if repeat_err != nil {
-		return
-	}
-	frame_draw_at(storage, rect.x, rect.y, rule, RULE_STYLE)
+	tui.fill(&storage.buffer, rect, "─", RULE_STYLE)
 }
 
-// draw_input draws the prompt and the visible part of the input line and
-// returns where the caret goes.
-draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> term.Cursor_Intent {
-	if rect.height <= 0 || rect.width <= 0 {
-		return nil
+// draw_input draws the prompt and the input line and returns the caret.
+draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> term.Cursor {
+	if rect.height <= 0 || rect.width <= 2 {
+		return {}
 	}
-	_, _ = tui.draw_ascii(&storage.buffer, {x = rect.x, y = rect.y, width = 2, height = 1}, "> ", INPUT_PROMPT)
-	avail := rect.width - 2
-	if avail < 0 {
-		avail = 0
+	_, _ = tui.draw_text(&storage.buffer, tui.Cell_Rect{x = rect.x, y = rect.y, width = 2, height = 1}, "> ", INPUT_PROMPT)
+	line := tui.Cell_Rect {
+		x      = rect.x + 2,
+		y      = rect.y,
+		width  = rect.width - 2,
+		height = 1,
 	}
-	text_x := rect.x + 2
-	content := string(app.line[:])
-	hstart := 0
-	if app.cursor > avail - 1 {
-		hstart = app.cursor - avail + 1
-	}
-	if hstart > len(content) {
-		hstart = len(content)
-	}
-	if avail > 0 {
-		_, _ = tui.draw_ascii(&storage.buffer, {x = text_x, y = rect.y, width = avail, height = 1}, content[hstart:], INPUT_TEXT)
-	}
-	caret_col := text_x + (app.cursor - hstart)
-	if caret_col > rect.x + rect.width - 1 {
-		caret_col = rect.x + rect.width - 1
-	}
-	return term.Position{x = caret_col, y = rect.y}
+	return widgets.draw_input(&storage.buffer, line, app.input, INPUT_TEXT)
 }
 
 // draw_footer paints the two footer rows: the working directory, then the
 // usage and cost on the left with provider, model, and effort on the right.
 draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: tui.Cell_Rect) {
 	if cwd_rect.height > 0 && cwd_rect.width > 0 {
-		directory := shorten_home(app, app.run.snap.status.cwd)
-		if len(directory) > cwd_rect.width {
-			directory = directory[:cwd_rect.width]
-		}
-		_, _ = tui.draw_ascii(&storage.buffer, cwd_rect, directory, FOOTER_TEXT)
+		directory := text.truncate_text(shorten_home(app, app.run.snap.status.cwd), cwd_rect.width)
+		_, _ = tui.draw_text(&storage.buffer, cwd_rect, directory, FOOTER_TEXT)
 	}
 	if status_rect.height <= 0 || status_rect.width <= 0 {
 		return
@@ -696,26 +588,26 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 			right = fmt.tprintf("%s | %s", right, effort_text)
 		}
 	}
-	// The frame encoder reserves the terminal's bottom-right cell, and this
-	// is the last row, so the footer keeps one column clear.
-	usable := status_rect.width - 1
+	// The session disables autowrap, so the whole width is usable: the
+	// bottom-right cell is written like any other, and a wide cluster may span
+	// the final two columns. Widths are cells, not bytes.
+	usable := status_rect.width
 	if usable <= 0 {
 		return
 	}
-	if len(left) > usable {
-		left = left[:usable]
-	}
-	_, _ = tui.draw_ascii(&storage.buffer, status_rect, left, FOOTER_MUTED)
-	if len(right) >= usable {
+	left = text.truncate_text(left, usable)
+	_, _ = tui.draw_text(&storage.buffer, status_rect, left, FOOTER_MUTED)
+	right_columns := text.text_columns(right)
+	if right_columns >= usable {
 		return
 	}
 	right_rect := tui.Cell_Rect {
-		x      = status_rect.x + usable - len(right),
+		x      = status_rect.x + usable - right_columns,
 		y      = status_rect.y,
-		width  = len(right),
+		width  = right_columns,
 		height = 1,
 	}
-	_, _ = tui.draw_ascii(&storage.buffer, right_rect, right, FOOTER_TEXT)
+	_, _ = tui.draw_text(&storage.buffer, right_rect, right, FOOTER_TEXT)
 }
 
 // shorten_home replaces a leading home directory with "~", the way the

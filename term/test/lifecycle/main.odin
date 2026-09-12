@@ -24,8 +24,6 @@ package main
 //   F descriptor-close failure: the one-shot close reports its cause, the
 //     session stays allocated, and the retry close settles and frees.
 //   G SIGWINCH disposition: close restores the caller's previous handler.
-//   H present_operations: the operation stream commits its exact size over
-//     the real controlling terminal.
 
 import "core:c"
 import "core:fmt"
@@ -302,38 +300,6 @@ run_child :: proc(slave_path: string, sync_out_w: posix.FD, sync_in_r: posix.FD)
 	retry_err = term.close(session)
 	check(retry_err == nil, "the retry close must settle and free")
 	check(len(tracking.allocation_map) == live, "the retry close must free the session")
-
-	// H: present_operations over the real terminal — the operation stream
-	// preflights, encodes into the caller-owned scratch, and commits its
-	// exact size through the same write loop as present.
-	session, open_err = term.open({})
-	check(open_err == nil, "open must succeed")
-	operations := []term.Presentation_Op {
-		term.Move_Cursor_Op{{x = 0, y = 0}},
-		term.Set_Style_Op{{foreground = term.Color(term.RGB_Color{0, 255, 0})}},
-		term.Write_Grapheme_Op{grapheme = "ok", width = 1},
-	}
-	op_scratch: [4096]byte
-	op_committed, op_required, op_err := term.present_operations(session, operations, term.profile_default(), op_scratch[:])
-	check(op_err == nil, "present_operations must succeed on a real session")
-	check(op_required > 0, "the op stream must report an exact required size")
-	check(op_committed == op_required, "present_operations must commit its exact size, committed %d required %d", op_committed, op_required)
-
-	// H2: max-boundary ops — a max(int) coordinate and erase count must
-	// encode and commit exactly over the real terminal, never overflow or
-	// panic (the CUP +1 runs in u64 and the digit buffer covers the whole
-	// nonnegative int domain).
-	max_ops := []term.Presentation_Op {
-		term.Move_Cursor_Op{{x = max(int), y = max(int)}},
-		term.Write_Grapheme_Op{grapheme = "x", width = 1},
-		term.Erase_Cells_Op{count = max(int)},
-	}
-	max_scratch: [4096]byte
-	max_committed, max_required, max_err := term.present_operations(session, max_ops, term.profile_default(), max_scratch[:])
-	check(max_err == nil, "max-boundary ops must present on a real session")
-	check(max_required > 0, "max-boundary ops must report an exact required size")
-	check(max_committed == max_required, "max-boundary ops must commit their exact size, committed %d required %d", max_committed, max_required)
-	check(term.close(session) == nil, "close must succeed")
 
 	// G: SIGWINCH disposition — close restores the caller's previous
 	// handler, so a closed session never leaves the package handler armed.

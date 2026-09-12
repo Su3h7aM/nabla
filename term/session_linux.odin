@@ -7,6 +7,7 @@ import "core:io"
 import "core:os"
 import "core:sys/linux"
 import "core:sys/posix"
+import "core:terminal/ansi"
 
 // Session_Impl is the Linux session state: the controlling-terminal
 // descriptor, the saved termios and file flags, and the entered terminal
@@ -20,24 +21,43 @@ Session_Impl :: struct {
 	file_flags_changed:  bool,
 	termios_saved:       bool,
 	mode_applied:        bool,
-	// alt_screen_entered and cursor_hidden mean "transition attempted": they
-	// are set before the write, so rollback and close always emit the
-	// compensating sequence even for a partially written one.
+	// The transition flags mean "transition attempted": they are set before the
+	// write, so rollback and close always emit the compensating sequence even
+	// for a partially written one. cursor_hidden tracks only the open option;
+	// close shows the cursor regardless, because a frame may have hidden it.
 	alt_screen_entered:  bool,
+	autowrap_disabled:   bool,
+	bracketed_paste:     bool,
 	cursor_hidden:       bool,
 	sigwinch_installed:  bool,
 	previous_sigaction:  posix.sigaction_t,
 }
 
-// Control-sequence literals. Every sequence starts with a real ESC (0x1B);
-// the byte-output test asserts this so a mangled literal cannot slip
-// through again. The ansi subpackage is not imported here: its package name
-// collides with core:terminal/ansi once core:testing is linked (see
-// doc.odin).
-ALT_SCREEN_ENTER :: "\e[?1049h\e[H"
-ALT_SCREEN_LEAVE :: "\e[?1049l"
-CURSOR_HIDE :: "\e[?25l"
-CURSOR_SHOW :: "\e[?25h"
+// Control sequences, composed from core:terminal/ansi constants rather than
+// hand-written literals, so a mistyped mode is a compile error and the whole
+// repository shares one definition. The byte-output test asserts they start
+// with a real ESC (0x1B).
+ALT_SCREEN_ENTER :: ansi.CSI + ansi.DECASB_ENTER + ansi.CSI + ansi.CUP
+ALT_SCREEN_LEAVE :: ansi.CSI + ansi.DECASB_EXIT
+CURSOR_HIDE :: ansi.CSI + ansi.DECTCEM_HIDE
+CURSOR_SHOW :: ansi.CSI + ansi.DECTCEM_SHOW
+// The session disables autowrap (DECAWM) for its lifetime: the frame path may
+// write the bottom-right cell, and with autowrap on that write can scroll the
+// viewport. Disabling it is what lets present write every cell, including a
+// wide character that spans the final two columns of the last row. The
+// session does not query the mode: it assumes autowrap is on at entry and
+// enables it on close (the documented baseline in doc.odin), so a terminal
+// that entered with autowrap off is left with it on.
+AUTOWRAP_OFF :: ansi.CSI + ansi.DECAWM_OFF
+AUTOWRAP_ON :: ansi.CSI + ansi.DECAWM_ON
+// Bracketed paste (DECSET 2004). core:terminal/ansi has no constant for it, so
+// the mode is composed here. Like autowrap, the mode is baseline-assumed
+// rather than queried: close sends the off sequence, so a terminal that
+// entered with bracketed paste on is left with it off. It is best-effort: a
+// crash that skips close leaves the mode on until the terminal resets, which
+// is the same hazard every full-screen program carries.
+BRACKETED_PASTE_ON :: ansi.CSI + "?2004h"
+BRACKETED_PASTE_OFF :: ansi.CSI + "?2004l"
 
 Linux_Window_Size :: struct {
 	rows, columns, x_pixels, y_pixels: u16,
@@ -57,14 +77,15 @@ _errno :: #force_inline proc "contextless" () -> Platform_Error {
 session_active: bool
 
 // sigwinch_pending is set by the SIGWINCH handler; the handler does no I/O.
-// The demo re-reads the viewport every frame, so nothing consumes the flag
+// Applications re-read the viewport every frame, so nothing consumes the flag
 // yet — it is the resize-notification seam.
 @(private = "file")
 sigwinch_pending: bool
 
 // atexit state: the exact saved termios plus the tty fd, restored on
-// abnormal exits as a best-effort safety net (raw_console pattern,
-// examples/console/raw_console/raw_posix.odin). POSIX atexit cannot
+// abnormal exits as a best-effort safety net (raw_console pattern, the Odin
+// distribution's examples/console/raw_console/raw_posix.odin). POSIX atexit
+// cannot
 // unregister, so the callback is registered once per process; atexit_active
 // is true only while the session still owns its descriptor — it is disarmed
 // the moment the one-shot descriptor close consumes the handle, success or
@@ -166,6 +187,18 @@ _session_open :: proc(s: ^Session, options: Options) -> (err: Error) {
 			return write_err
 		}
 	}
+	// Autowrap is always disabled: the session exists to present frames, and a
+	// frame writes the bottom-right cell. See AUTOWRAP_OFF.
+	impl.autowrap_disabled = true
+	if write_err := _session_write(file, AUTOWRAP_OFF); write_err != nil {
+		return write_err
+	}
+	if options.bracketed_paste {
+		impl.bracketed_paste = true
+		if write_err := _session_write(file, BRACKETED_PASTE_ON); write_err != nil {
+			return write_err
+		}
+	}
 	if options.hide_cursor {
 		impl.cursor_hidden = true
 		if write_err := _session_write(file, CURSOR_HIDE); write_err != nil {
@@ -231,6 +264,24 @@ _session_rollback :: proc(impl: ^Session_Impl) -> Error {
 			}
 		} else {
 			impl.cursor_hidden = false
+		}
+	}
+	if impl.bracketed_paste {
+		if err := _session_write(impl.file, BRACKETED_PASTE_OFF); err != nil {
+			if first_error == nil {
+				first_error = err
+			}
+		} else {
+			impl.bracketed_paste = false
+		}
+	}
+	if impl.autowrap_disabled {
+		if err := _session_write(impl.file, AUTOWRAP_ON); err != nil {
+			if first_error == nil {
+				first_error = err
+			}
+		} else {
+			impl.autowrap_disabled = false
 		}
 	}
 	if impl.alt_screen_entered {
@@ -300,13 +351,36 @@ _session_close :: proc(s: ^Session) -> Error {
 	impl := &s.impl
 	first_error: Error = nil
 	fd := posix.FD(os.fd(impl.file))
-	if impl.cursor_hidden {
+	// The cursor is part of the documented baseline: a presented frame may have
+	// hidden it and a partial write leaves that unspecified, so close shows it
+	// whenever the descriptor is still open, rather than tracking every frame's
+	// intent. The descriptor guard keeps a retry after the one-shot descriptor
+	// close from writing to a file the session no longer owns.
+	if impl.file != nil {
 		if err := _session_write(impl.file, CURSOR_SHOW); err != nil {
 			if first_error == nil {
 				first_error = err
 			}
 		} else {
 			impl.cursor_hidden = false
+		}
+	}
+	if impl.bracketed_paste {
+		if err := _session_write(impl.file, BRACKETED_PASTE_OFF); err != nil {
+			if first_error == nil {
+				first_error = err
+			}
+		} else {
+			impl.bracketed_paste = false
+		}
+	}
+	if impl.autowrap_disabled {
+		if err := _session_write(impl.file, AUTOWRAP_ON); err != nil {
+			if first_error == nil {
+				first_error = err
+			}
+		} else {
+			impl.autowrap_disabled = false
 		}
 	}
 	if impl.alt_screen_entered {

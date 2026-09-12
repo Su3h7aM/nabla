@@ -21,7 +21,7 @@ Modifier :: enum u8 {
 
 Modifiers :: distinct bit_set[Modifier;u8]
 
-Presentation_Style :: struct {
+Style :: struct {
 	foreground: Color,
 	background: Color,
 	modifiers:  Modifiers,

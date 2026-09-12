@@ -4,6 +4,7 @@
 package term
 
 import "core:strings"
+import "core:terminal"
 import "core:testing"
 
 // The frame-encoding suite. Expected bytes use \x1b hex escapes (not \e) so a
@@ -12,7 +13,7 @@ import "core:testing"
 // _encode_frame serializes through the public `encode` contract and checks
 // that the reported count agrees with `encoded_size`, so the fixtures pin the
 // real path rather than an internal helper.
-_encode_frame :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor_Intent, scratch: []byte) -> (out: string, ok: bool) {
+_encode_frame :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor, scratch: []byte) -> (out: string, ok: bool) {
 	written, required, err := encode(buffer, profile, cursor, scratch)
 	if err != nil {
 		return "", false
@@ -26,9 +27,9 @@ _encode_frame :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cur
 
 @(test)
 test_encode_reference_bytes_and_escape_correctness :: proc(t: ^testing.T) {
-	// 2x2: a and c are default cells; b is styled; d is the reserved
-	// bottom-right corner. Row 1 emits its own reset because row 0 ended
-	// styled (CUP does not reset SGR attributes).
+	// 2x2: a and c are default cells; b is styled; d closes the frame. Row 1
+	// emits its own style reset because row 0 ended styled (CUP does not reset
+	// SGR attributes). The whole frame is written, corner included.
 	buffer := Frame_Buffer {
 		columns = 2,
 		rows    = 2,
@@ -46,7 +47,7 @@ test_encode_reference_bytes_and_escape_correctness :: proc(t: ^testing.T) {
 	out, ok := _encode_frame(buffer, profile, {}, scratch[:])
 	testing.expect(t, ok, "a valid frame must encode")
 
-	expected := "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[2;1H\x1b[mc\x1b[m"
+	expected := "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[2;1H\x1b[mcd\x1b[?25l\x1b[m"
 	testing.expect_value(t, out, expected)
 
 	// The stream carries real ESC bytes and never a literal backslash-e.
@@ -81,12 +82,12 @@ test_encode_reference_bytes_and_escape_correctness :: proc(t: ^testing.T) {
 	padded_scratch: [4096]byte
 	padded_out, padded_ok := _encode_frame(padded, profile_default(), {}, padded_scratch[:])
 	testing.expect(t, padded_ok, "unused trailing cells must not veto the frame")
-	testing.expect_value(t, padded_out, "\x1b[H\x1b[m\x1b[1;1Hab\x1b[m")
+	testing.expect_value(t, padded_out, "\x1b[H\x1b[m\x1b[1;1Habc\x1b[?25l\x1b[m")
 }
 
 @(test)
 test_encode_emits_the_cursor_intent :: proc(t: ^testing.T) {
-	// 3x1: x and y write; z is the reserved bottom-right corner.
+	// 3x1: x, y, and z all write; the corner is part of the frame.
 	buffer := Frame_Buffer {
 		columns = 3,
 		rows    = 1,
@@ -97,22 +98,30 @@ test_encode_emits_the_cursor_intent :: proc(t: ^testing.T) {
 	}
 
 	scratch: [4096]byte
-	out, ok := _encode_frame(buffer, profile, Position{1, 0}, scratch[:])
+	placed := Cursor {
+		visible  = true,
+		position = {1, 0},
+		placed   = true,
+	}
+	out, ok := _encode_frame(buffer, profile, placed, scratch[:])
 	testing.expect(t, ok, "an in-bounds position must encode")
-	testing.expect_value(t, out, "\x1b[H\x1b[m\x1b[1;1Hxy\x1b[1;2H\x1b[m")
+	testing.expect_value(t, out, "\x1b[H\x1b[m\x1b[1;1Hxyz\x1b[1;2H\x1b[?25h\x1b[m")
 
-	// Hide and Show are the DECTCEM private sequences.
+	// Visibility and position are independent: a frame with no position still
+	// sets visibility, and an unplaced cursor keeps the frame's end position.
 	for hiding in ([?]bool{true, false}) {
-		intent := Cursor_Intent(Show{})
+		intent := Cursor {
+			visible = true,
+		}
 		sequence := "\x1b[?25h"
 		if hiding {
-			intent = Cursor_Intent(Hide{})
+			intent = Cursor{}
 			sequence = "\x1b[?25l"
 		}
 		hide_scratch: [4096]byte
 		hide_out, hide_ok := _encode_frame(buffer, profile, intent, hide_scratch[:])
 		testing.expect(t, hide_ok, "hide/show must encode")
-		expected := strings.concatenate({"\x1b[H\x1b[m\x1b[1;1Hxy", sequence, "\x1b[m"})
+		expected := strings.concatenate({"\x1b[H\x1b[m\x1b[1;1Hxyz", sequence, "\x1b[m"})
 		defer delete(expected)
 		testing.expect_value(t, hide_out, expected)
 	}
@@ -120,8 +129,8 @@ test_encode_emits_the_cursor_intent :: proc(t: ^testing.T) {
 
 @(test)
 test_encode_reduces_colors_by_depth :: proc(t: ^testing.T) {
-	// One styled cell after a default cell; the trailing cell is the reserved
-	// corner. Every depth's emission is byte-exact.
+	// One styled cell after a default cell; the frame is written whole. Every
+	// depth's emission is byte-exact.
 	buffer := Frame_Buffer {
 		columns = 3,
 		rows    = 1,
@@ -135,10 +144,10 @@ test_encode_reduces_colors_by_depth :: proc(t: ^testing.T) {
 		depth:    Color_Depth,
 		expected: string,
 	} {
-		{.True_Color, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[m"},
-		{.Eight_Bit, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;5;196mb\x1b[m"},
-		{.Four_Bit, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[m"},
-		{.None, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[mb\x1b[m"},
+		{.True_Color, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[mc\x1b[?25l\x1b[m"},
+		{.Eight_Bit, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;5;196mb\x1b[mc\x1b[?25l\x1b[m"},
+		{.Four_Bit, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[mc\x1b[?25l\x1b[m"},
+		{.None, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[mb\x1b[mc\x1b[?25l\x1b[m"},
 	}
 	for c in cases {
 		scratch: [4096]byte
@@ -169,7 +178,7 @@ test_encode_reduces_colors_by_depth :: proc(t: ^testing.T) {
 	indexed_scratch: [4096]byte
 	indexed_out, indexed_ok := _encode_frame(Frame_Buffer{columns = 3, rows = 1, cells = indexed}, {color_depth = .Four_Bit}, {}, indexed_scratch[:])
 	testing.expect(t, indexed_ok, "an indexed frame must encode")
-	testing.expect_value(t, indexed_out, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[m")
+	testing.expect_value(t, indexed_out, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[mc\x1b[?25l\x1b[m")
 }
 
 @(test)
@@ -189,27 +198,71 @@ test_encode_emits_style_once_per_run :: proc(t: ^testing.T) {
 	scratch: [4096]byte
 	out, ok := _encode_frame(buffer, {color_depth = .True_Color}, {}, scratch[:])
 	testing.expect(t, ok, "a valid frame must encode")
-	testing.expect_value(t, out, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mbc\x1b[m")
+	testing.expect_value(t, out, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mbcd\x1b[?25l\x1b[m")
 }
 
 @(test)
 test_encode_validates_frame_and_cells :: proc(t: ^testing.T) {
 	scratch: [4096]byte
 
-	// Wide rendering is not implemented: a non-width-1 cell is rejected before
-	// a byte is produced.
+	// Wide rendering uses the placeholder rule: a width-2 cell plus its
+	// zero-width placeholder encode as the wide grapheme followed by nothing.
+	// columns == 2 places the wide cell over the bottom-right corner, which is
+	// written because the session disables autowrap.
 	wide := Frame_Buffer {
 		columns = 2,
 		rows    = 1,
-		cells   = []Cell{{grapheme = "w", width = 2}, {grapheme = "", width = 0}},
+		cells   = []Cell{{grapheme = "界", width = 2}, {grapheme = "", width = 0}},
 	}
-	written, required, err := encode(wide, profile_default(), {}, scratch[:])
-	testing.expect_value(t, err, General_Error.Unsupported)
-	testing.expect_value(t, written, 0)
-	testing.expect_value(t, required, 0)
-	for i in 0 ..< len(scratch) {
-		testing.expect_value(t, scratch[i], byte(0))
+	wide_out, wide_ok := _encode_frame(wide, {color_depth = .True_Color}, {}, scratch[:])
+	testing.expect(t, wide_ok, "a well-formed wide frame must encode")
+	testing.expect_value(t, wide_out, "\x1b[H\x1b[m\x1b[1;1H界\x1b[?25l\x1b[m")
+
+	// Malformed wide grids are rejected before any byte is written.
+	width_three := Frame_Buffer {
+		columns = 3,
+		rows    = 1,
+		cells   = []Cell{{grapheme = "x", width = 3}, {grapheme = "", width = 0}, {grapheme = "", width = 0}},
 	}
+	_, _, width_three_err := encode(width_three, profile_default(), {}, scratch[:])
+	testing.expectf(t, width_three_err == General_Error.Unsupported, "width 3 must be unsupported")
+
+	// A wide cell with no room for its placeholder is rejected: the last
+	// column has no second physical cell.
+	no_room := Frame_Buffer {
+		columns = 3,
+		rows    = 1,
+		cells   = []Cell{{grapheme = "a", width = 1}, {grapheme = "b", width = 1}, {grapheme = "界", width = 2}},
+	}
+	_, _, no_room_err := encode(no_room, profile_default(), {}, scratch[:])
+	testing.expectf(t, no_room_err == General_Error.Unsupported, "a wide cell in the last column must be unsupported")
+
+	// A wide cell without its placeholder is rejected.
+	no_placeholder := Frame_Buffer {
+		columns = 3,
+		rows    = 1,
+		cells   = []Cell{{grapheme = "界", width = 2}, {grapheme = "a", width = 1}, {grapheme = "b", width = 1}},
+	}
+	_, _, no_placeholder_err := encode(no_placeholder, profile_default(), {}, scratch[:])
+	testing.expectf(t, no_placeholder_err == General_Error.Unsupported, "a wide cell needs a placeholder")
+
+	// A placeholder with no wide cell before it is rejected.
+	leading := Frame_Buffer {
+		columns = 1,
+		rows    = 1,
+		cells   = []Cell{{grapheme = "", width = 0}},
+	}
+	_, _, leading_err := encode(leading, profile_default(), {}, scratch[:])
+	testing.expectf(t, leading_err == General_Error.Unsupported, "a leading placeholder must be unsupported")
+
+	// A placeholder that carries text would advance the cursor.
+	filled := Frame_Buffer {
+		columns = 3,
+		rows    = 1,
+		cells   = []Cell{{grapheme = "界", width = 2}, {grapheme = "x", width = 0}, {grapheme = "a", width = 1}},
+	}
+	_, _, filled_err := encode(filled, profile_default(), {}, scratch[:])
+	testing.expectf(t, filled_err == General_Error.Invalid_Cell, "a placeholder must carry no text")
 
 	// A grapheme must be valid UTF-8 with no C0, C1, or DEL controls, so a
 	// frame can never inject terminal control into the stream.
@@ -258,10 +311,10 @@ test_encode_validates_frame_and_cells :: proc(t: ^testing.T) {
 		cells   = []Cell{{grapheme = "a", width = 1}, {grapheme = "b", width = 1}},
 	}
 	for position in ([?]Position{{-1, 0}, {0, -1}, {2, 0}, {0, 1}}) {
-		_, _, cursor_err := encode(two, profile_default(), position, scratch[:])
+		_, _, cursor_err := encode(two, profile_default(), Cursor{placed = true, position = position}, scratch[:])
 		testing.expectf(t, cursor_err == General_Error.Invalid_Cursor, "out-of-bounds cursor %v must be rejected", position)
 	}
-	_, _, corner_err := encode(two, profile_default(), Position{1, 0}, scratch[:])
+	_, _, corner_err := encode(two, profile_default(), Cursor{placed = true, position = {1, 0}}, scratch[:])
 	testing.expect_value(t, corner_err, nil)
 
 	// A zero-sized frame is a no-op, but its cursor intent is still validated.
@@ -273,7 +326,7 @@ test_encode_validates_frame_and_cells :: proc(t: ^testing.T) {
 	testing.expect_value(t, zero_err, nil)
 	testing.expect_value(t, zero_written, 0)
 	testing.expect_value(t, zero_required, 0)
-	_, _, zero_cursor_err := encode(zero, profile_default(), Position{0, 0}, scratch[:])
+	_, _, zero_cursor_err := encode(zero, profile_default(), Cursor{placed = true, position = {0, 0}}, scratch[:])
 	testing.expect_value(t, zero_cursor_err, General_Error.Invalid_Cursor)
 }
 
@@ -344,19 +397,19 @@ test_color_reduction_helpers_and_modifiers :: proc(t: ^testing.T) {
 
 @(test)
 test_profile_default_follows_the_color_state :: proc(t: ^testing.T) {
-	previous_depth := color_depth
-	previous_enabled := color_enabled
+	previous_depth := terminal.color_depth
+	previous_enabled := terminal.color_enabled
 	defer {
-		color_depth = previous_depth
-		color_enabled = previous_enabled
+		terminal.color_depth = previous_depth
+		terminal.color_enabled = previous_enabled
 	}
 
-	color_enabled = true
-	color_depth = .True_Color
+	terminal.color_enabled = true
+	terminal.color_depth = .True_Color
 	testing.expect_value(t, profile_default().color_depth, Color_Depth.True_Color)
 
 	// NO_COLOR collapses the depth to .None.
-	color_enabled = false
+	terminal.color_enabled = false
 	testing.expect_value(t, profile_default().color_depth, Color_Depth.None)
 }
 

@@ -1,10 +1,13 @@
 // Terminal session and presentation for interactive command-line programs.
 //
-// This package is the monorepo home of the enhanced core:terminal: a copy of
-// Odin's built-in terminal package (capability detection, color depth, ansi
-// constants) extended with terminal session and full-frame presentation
-// functionality. It is designed as if submitting a PR to the Odin repository
-// — API, naming, organization, and style follow the core conventions.
+// This package is the monorepo's terminal extension. It depends on
+// core:terminal for capability detection and the color-depth vocabulary
+// (Color_Depth and the color_depth/color_enabled startup globals) and on
+// core:terminal/ansi for the control sequences, and adds what core does not
+// have: a caller-owned Session, viewport polling, depth-aware color
+// reduction, and full-frame presentation. It is designed
+// as if submitting a PR to the Odin repository — API, naming, organization,
+// and style follow the core conventions.
 //
 // The package is named `term` rather than `terminal` so that it can be imported
 // by a package under `odin test`: Odin requires package names to be unique per
@@ -14,39 +17,26 @@
 // local: `tty` is the conventional name for a terminal file handle and this
 // package is called from code that holds one.
 //
-// The suites in this package are nevertheless written against a package-local
-// assertion harness (test_support.odin: a `T` context, `expect`, and a
-// `run_tests` entry) rather than core:testing's `@(test)` declarations, so they
-// run through the external harnesses in tests/tty_tests, tests/tui_tests, and
-// tests/widgets_tests, all invoked by scripts/test. `odin test ./term` would
-// compile the package and report success while executing nothing. The ansi
-// subpackage is not imported here and its package name collides with
-// core:terminal/ansi whenever core:testing is linked; the escape sequences are
-// written as literals instead.
-//
 // The package computes and serializes terminal output and nothing else. It
 // performs no layout, no text flow, no visual composition, and no input
-// decoding (input lives in the sibling core:input package). It imports only
-// core packages.
+// decoding (input lives in the sibling input package).
 //
 // Structure (core:os-shaped): session.odin holds the portable surface —
 // Session { allocator, impl: Session_Impl, opened }, mirroring core:os's
-// File/File_Impl split — and session_linux.odin is the platform file
-// (the session extension's equivalent of terminal_posix.odin for the copied
-// base), guarded by #+build linux + #+private, implementing the platform
-// operations as direct procs (_session_open, _session_close, ...). The
-// copied base keeps its own platform split (posix, windows, js, wasi stub)
-// so the package remains multi-platform in shape. Every other extension file
+// File/File_Impl split — and session_linux.odin is the platform file, guarded
+// by #+build linux + #+private, implementing the platform operations as
+// direct procs (_session_open, _session_close, ...). Every other file
 // (present, errors, profile, viewport, color, style, cell, frame_buffer) is
-// portable; targets without a backend compile the same public surface and
-// return a typed General_Error.Unsupported from session operations
+// portable; targets without a backend compile the same public
+// surface and return a typed General_Error.Unsupported from session operations
 // (session_unsupported.odin, errors_unsupported.odin).
 //
 // Ownership and lifetime:
 // - Session is a caller-owned handle. open allocates it with the caller's
 //   allocator, stores that allocator in the session, and takes ownership of
 //   the /dev/tty descriptor and terminal configuration (termios, file
-//   flags, SIGWINCH disposition, alternate screen, cursor visibility).
+//   flags, SIGWINCH disposition, alternate screen, autowrap disposition,
+//   bracketed paste, cursor visibility).
 //   close restores every entered transition and, on success, frees the
 //   Session with its stored allocator — the caller never calls free on the
 //   handle, and the pointer is dead after the one successful close.
@@ -65,7 +55,7 @@
 // - Frame_Buffer and Cell are pure data produced by the renderer and
 //   consumed by present/encode. Their cell slices are borrowed for the call
 //   duration only; the package never retains them.
-// - Cursor_Intent is per-Frame input and is never retained by the Session.
+// - Cursor is per-Frame input and is never retained by the Session.
 //
 // Viewport and resize:
 // - viewport(session) is the authoritative cell size and the only public
@@ -76,7 +66,18 @@
 //   remains an implementation optimization only.
 // - Viewport has no pixel field in the v1 surface.
 //
-// Restoration guarantees:
+// Terminal mode contract:
+// - The session assumes a documented entry baseline and restores it on close
+//   rather than querying and preserving whatever it found. Named state
+//   (termios, descriptor flags, the SIGWINCH disposition) is saved at open
+//   and restored exactly. Mode state that would need a terminal query is
+//   baseline-assumed instead: autowrap enabled, bracketed paste disabled, the
+//   cursor visible (close shows it unconditionally, since a presented frame may
+//   hide it), and no alternate screen. So a terminal that entered with
+//   autowrap off is left with autowrap on, and one that entered with
+//   bracketed paste on is left with it off. Querying a mode means reading a
+//   DECRQM reply, which would have to be routed back through the input
+//   parser; the narrow contract is worth more than that machinery.
 // - close always attempts every applicable teardown transition even after
 //   an earlier failure, and reports the first cause (the write path's own
 //   error or the Platform_Error from the failed syscall). A transition flag
@@ -100,15 +101,18 @@
 //
 // Frame validation and encoding:
 // - present/encode validate the whole frame before a single byte is written:
-//   dimensions and logical cell count (Invalid_Frame_Data), width (v1 is
-//   width-1 only; any other width is .Unsupported), grapheme safety
-//   (Invalid_Cell), and cursor bounds (Invalid_Cursor).
+//   dimensions and logical cell count (Invalid_Frame_Data), cell width
+//   (width 1 or 2; a width-2 cell needs its zero-width placeholder next, else
+//   .Unsupported), grapheme safety (Invalid_Cell), and cursor bounds
+//   (Invalid_Cursor).
 // - A non-empty Cell.grapheme must be valid UTF-8 and contain no C0
 //   controls, C1 controls, or DEL — ESC included — so a cell can never
 //   inject terminal control into the output stream.
-// - The bottom-right physical cell is always reserved: the serializer never
-//   writes it, because writing the corner can trigger autowrap scroll on
-//   some terminals. Placing the cursor there is allowed.
+// - The whole frame is written, bottom-right cell included. The session
+//   disables autowrap (DECAWM) for its lifetime, so writing the corner cannot
+//   scroll the viewport and a wide cell may span the final two columns.
+//   encode (the sessionless serializer) assumes the same no-autowrap context.
+//   Placing the cursor there is allowed.
 // - The output path is caller-owned and reusable: encoded_size reports the
 //   exact required byte count, encode serializes into the caller's scratch
 //   (returning .Presentation_Workspace_Too_Small without writing a usable
@@ -123,9 +127,9 @@
 //   to the profile's color depth — TrueColor as authored, 256-color via the
 //   xterm cube (6x6x6), 16/8-color via the nearest ANSI palette entry
 //   (ECMA-48 SGR 30-37/40-47, 90-97/100-107), and .None drops colors
-//   entirely (the SGR reset still runs). profile_default() derives the depth
-//   from the environment (NO_COLOR / COLORTERM / TERM); an explicit
-//   Target_Profile passed to present/encode wins.
+//   entirely (the SGR reset still runs). profile_default() reads
+//   core:terminal's startup detection (NO_COLOR / COLORTERM / TERM); an
+//   explicit Target_Profile passed to present/encode wins.
 //
 // Errors:
 // - Error is the union of General_Error, io.Error, runtime.Allocator_Error,
@@ -141,14 +145,12 @@
 //
 // Tests: the in-package suite exercises real, tty-free logic — encode bytes
 // (fixture-driven, like the layout package's fixtures), validation, the
-// env-based default profile, and the write loop (backpressure, EPIPE cause
+// default profile, and the write loop (backpressure, EPIPE cause
 // preservation). Session lifecycle against a real controlling terminal runs
-// in tests/tty_lifecycle (single-threaded executable: allocator
-// ownership, close-retry, resize, zero-progress Partial_Write, EINTR), and
-// scripts/test runs the demo and dashboard under a PTY to a clean EOF exit.
+// in term/test/lifecycle (single-threaded executable: allocator ownership,
+// close-retry, resize, zero-progress Partial_Write, EINTR).
 //
 // Scope: the public surface exists on every supported target; Linux is the
 // first real backend (session_linux.odin), and other targets return typed
-// .Unsupported from session operations. The copied core:terminal base keeps
-// its own platform split (posix, windows, js, wasi stub).
+// .Unsupported from session operations.
 package term

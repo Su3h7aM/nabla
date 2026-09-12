@@ -1,6 +1,7 @@
 package input
 
 import "base:runtime"
+import "core:strings"
 
 Parser_State :: enum u8 {
 	Ground,
@@ -9,7 +10,19 @@ Parser_State :: enum u8 {
 	Csi,
 	Ss3,
 	Osc,
+	Paste,
 }
+
+// The bracketed-paste end marker (DECSET 2004). The parser matches it on the
+// tail of the paste buffer so a partial marker stays content.
+PASTE_END :: "\e[201~"
+
+// PASTE_LIMIT bounds one retained paste. It exists so a missing or malformed
+// closing marker cannot grow the parser without bound: content that reaches the
+// limit is discarded as it arrives and the paste is reported as Unknown_Input.
+// Once discarded, the scratch keeps only the tail that can still begin the
+// closing marker, so the scan stays linear.
+PASTE_LIMIT :: 1 << 20
 
 // Parser is a caller-owned, pure byte-to-event state machine. It retains
 // state across feed calls (a key sequence may span reads) and performs no
@@ -17,15 +30,27 @@ Parser_State :: enum u8 {
 // input normalizes to Unknown_Input events and resynchronizes; only resource
 // failures are errors.
 Parser :: struct {
-	state:         Parser_State,
-	utf8_expected: int, // remaining UTF-8 continuation bytes
-	utf8_pending:  u32, // accumulated code point bits
-	params:        [8]u8,
-	param_count:   int,
-	intermediate:  u8,
+	state:            Parser_State,
+	utf8_expected:    int, // remaining UTF-8 continuation bytes
+	utf8_pending:     u32, // accumulated code point bits
+	params:           [8]u8,
+	param_count:      int,
+	intermediate:     u8,
+	// paste is the scratch for a bracketed paste's raw bytes, allocated with
+	// the feed allocator and owned by the parser until parser_destroy.
+	paste:            [dynamic]u8,
+	// paste_overflowed marks a paste past PASTE_LIMIT: its content is being
+	// discarded, and the closing marker yields Unknown_Input instead of Paste.
+	paste_overflowed: bool,
 }
 
 parser_init :: proc(p: ^Parser) {
+	p^ = {}
+}
+
+// parser_destroy releases the parser's paste scratch after the last feed.
+parser_destroy :: proc(p: ^Parser) {
+	delete(p.paste)
 	p^ = {}
 }
 
@@ -45,6 +70,8 @@ feed :: proc(p: ^Parser, data: []byte, events: ^[dynamic]Event, allocator := con
 			consumed, err = parser_escape(p, data[i], events, allocator)
 		case .Csi, .Ss3:
 			consumed, err = parser_sequence(p, data[i], events, allocator)
+		case .Paste:
+			consumed, err = parser_paste(p, data[i], events, allocator)
 		case .Osc:
 			consumed, err = parser_osc(p, data[i])
 		}
@@ -190,6 +217,19 @@ parser_sequence :: proc(p: ^Parser, b: u8, events: ^[dynamic]Event, allocator: r
 		return 1, nil
 	}
 	if b >= 0x40 && b <= 0x7e {
+		// Bracketed paste begins here (CSI 200 ~). The parser then collects the
+		// raw bytes in parser_paste until CSI 201 ~, so the content is emitted
+		// as one Paste event instead of being decoded into keys.
+		if p.state == .Csi && b == '~' && parser_first_param(p) == 200 {
+			if p.paste == nil {
+				p.paste = make([dynamic]u8, 0, 64, allocator)
+			} else {
+				clear(&p.paste)
+			}
+			p.paste_overflowed = false
+			p.state = .Paste
+			return 1, nil
+		}
 		state := p.state
 		final_err := parser_sequence_final(p, state, b, events, allocator)
 		parser_reset(p)
@@ -302,4 +342,64 @@ parser_osc :: proc(p: ^Parser, b: u8) -> (consumed: int, err: Error) {
 		parser_reset(p)
 	}
 	return 1, nil
+}
+
+// parser_paste collects the raw bytes of a bracketed paste after CSI 200 ~ and
+// emits one Paste event when the closing CSI 201 ~ arrives. The content is not
+// decoded: a paste may contain newlines and escape bytes that must not become
+// events. The end marker is matched on the tail of the buffer, so a partial
+// marker stays content.
+//
+// A paste past PASTE_LIMIT is discarded as it arrives and reported as
+// Unknown_Input. Once discarded, the scratch keeps only the tail that can still
+// start the marker, so a large paste costs linear time instead of shifting the
+// whole payload per byte. A paste whose marker never arrives is dropped with
+// the parser on parser_destroy.
+parser_paste :: proc(p: ^Parser, b: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> (consumed: int, err: Error) {
+	if p.paste_overflowed {
+		_paste_keep_tail(&p.paste)
+	}
+	if _, append_err := append(&p.paste, b); append_err != nil {
+		return 1, append_err
+	}
+	// Match the marker before discarding, so a paste that ends exactly at the
+	// limit still closes.
+	marker_at := len(p.paste) - len(PASTE_END)
+	if b == '~' && marker_at >= 0 && string(p.paste[marker_at:]) == PASTE_END {
+		if p.paste_overflowed {
+			clear(&p.paste)
+			p.paste_overflowed = false
+			p.state = .Ground
+			return 1, parser_emit(p, events, Unknown_Input{}, allocator)
+		}
+		text, clone_err := strings.clone(string(p.paste[:marker_at]), allocator)
+		if clone_err != nil {
+			return 1, clone_err
+		}
+		clear(&p.paste)
+		p.state = .Ground
+		emit_err := parser_emit(p, events, Paste{text = text}, allocator)
+		if emit_err != nil {
+			delete(text, allocator)
+		}
+		return 1, emit_err
+	}
+	if len(p.paste) > PASTE_LIMIT {
+		p.paste_overflowed = true
+	}
+	if p.paste_overflowed {
+		_paste_keep_tail(&p.paste)
+	}
+	return 1, nil
+}
+
+// _paste_keep_tail shrinks the paste scratch to the bytes that can still begin
+// the closing marker, so discarded content is neither carried nor shifted.
+_paste_keep_tail :: proc(paste: ^[dynamic]u8) {
+	keep := len(PASTE_END) - 1
+	if len(paste^) <= keep {
+		return
+	}
+	copy(paste[:], paste[len(paste^) - keep:])
+	resize(paste, keep)
 }

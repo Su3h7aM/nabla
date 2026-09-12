@@ -1,22 +1,15 @@
-// Package tui joins Nabla's pure layout results, normalized terminal events,
-// text policy, terminal-cell composition, and full-frame presentation.
+// Package tui is the drawing layer for full-screen terminal applications. It
+// consumes nabla:term (frame grid and presentation), nabla:text (width and
+// break rules), and nabla:layout (layout-to-cell projection), and adds:
 //
-// The package is a set of caller-driven data transformations. It owns no
-// application loop, clock, scheduler, retained widget tree, or render rate.
-// A caller may render from event handlers or at a fixed cadence. Every v1
-// render requested by the caller rebuilds layout and the complete cell frame;
-// cross-frame diff presentation is not part of the canonical path.
-// Terminal presentation reserves the bottom-right cell to avoid an autowrap
-// scroll. Composition may populate that logical cell, but the v1 full-frame
-// encoder intentionally does not emit it.
+//   - Drawing over term.Frame_Buffer: init, put, fill, draw_text
+//     (draw.odin), and rect geometry with rows/cols (geometry.odin,
+//     project.odin).
+//   - The layout.Services binding to text (measure.odin).
 //
-// Cell_Buffer borrows caller-owned Cell storage. Cell grapheme strings are
-// also borrowed and must remain valid until the corresponding terminal frame
-// has been presented. init performs no allocation, accepts zero-sized grids,
-// and leaves the destination and storage unchanged on failure.
+// The nabla:tui/widgets subpackage builds reusable components — Block,
+// Paragraph, List, Input — on top of those operations.
 //
-// Layout owns geometry and renderer-neutral commands. TUI owns projection,
-// clipping into terminal cells, command composition, and durable interaction
-// facts keyed by layout.Id. Terminal I/O occurs only when the caller passes a
-// completed frame to term.present.
+// Events, styles, colors, and the terminal session belong to nabla:input and
+// nabla:term; tui is not a facade over them.
 package tui

@@ -1,18 +1,18 @@
 #+build linux
 #+test
 #+private file
-// Package-level tests for the widgets package: a small list app composed from
-// `container_desc` and `label_desc` and rendered end to end through layout,
-// tui, and term. It lives under `test/` because it exercises the whole stack,
-// not one widget procedure.
-package widgets_test
+// Pipeline tests for the drawing stack: a small list app composed from layout
+// declarations and rendered end to end through layout, tui, and term. It lives
+// under `test/` because it exercises the whole stack, not one procedure, and
+// because the tuple of packages it needs (layout + tui + term) is exactly
+// tui's dependency direction.
+package tui_test
 
 import "core:testing"
 import input "nabla:input"
 import "nabla:layout"
 import "nabla:term"
 import "nabla:tui"
-import "nabla:widgets"
 
 // App is the whole slice state: a viewport and one selectable label. It is the
 // smallest model that exercises Key and Resize without inventing a framework.
@@ -43,30 +43,32 @@ update :: proc(app: ^App, event: input.Event) {
 	case input.Resize_Event:
 		app.columns = data.columns
 		app.rows = data.rows
+	case input.Paste:
+	// The slice test has no paste handling; the paste is ignored.
 	case input.End_Of_Input:
 	case input.Unknown_Input:
 	}
 }
 
-SELECTED_STYLE :: tui.Style {
-	foreground = tui.Indexed_Color(0),
-	background = tui.Indexed_Color(7),
+SELECTED_STYLE :: term.Style {
+	foreground = term.Indexed_Color(0),
+	background = term.Indexed_Color(7),
 	modifiers  = {.Bold},
 }
 
 // item_style exists because a *constant* struct holding a union miscompiles when
-// it reaches a conditional expression: `selected ? SELECTED_STYLE : tui.Style{}`
+// it reaches a conditional expression: `selected ? SELECTED_STYLE : term.Style{}`
 // makes LLVM reject the module with "PHI node operands are not the same type as
 // the result". Copying the constant to a local first is enough to avoid it,
 // which is why this reads `style := SELECTED_STYLE` rather than returning the
 // constant directly. Broken on every Odin release that has the feature
 // (dev-2025-11 through dev-2026-07a, verified).
-item_style :: proc(selected: bool) -> tui.Style {
+item_style :: proc(selected: bool) -> term.Style {
 	if selected {
 		selected_style := SELECTED_STYLE
 		return selected_style
 	}
-	return tui.Style{}
+	return term.Style{}
 }
 
 // SLICE_CAPACITIES is the layout budget for one frame of this app: a frame root,
@@ -97,10 +99,9 @@ SLICE_STORAGE_BYTES :: 16384
 Render_Storage :: struct {
 	ctx:             layout.Context,
 	layout_storage:  [SLICE_STORAGE_BYTES]byte,
-	measure_context: tui.ASCII_Measure_Context,
-	cells:           [512]tui.Cell,
-	frame_cells:     [400]term.Cell,
-	buffer:          tui.Cell_Buffer,
+	measure_context: tui.Measure_Context,
+	cells:           [512]term.Cell,
+	buffer:          term.Frame_Buffer,
 }
 
 Render_Error :: enum u8 {
@@ -109,11 +110,10 @@ Render_Error :: enum u8 {
 	Buffer_Too_Small,
 	Not_Integral,
 	Undrawable_Text,
-	Presentation_Too_Small,
 }
 
-// render runs the whole pipeline for one frame: compose, solve, project, draw,
-// plan. It touches no backend, which is what makes the boundary testable.
+// render runs the whole pipeline for one frame: compose, solve, project, draw.
+// It touches no backend, which is what makes the boundary testable.
 //
 // Partial progress: on any error nothing is presented, so a failed frame cannot
 // reach the terminal half-drawn.
@@ -134,22 +134,17 @@ render :: proc(app: App, storage: ^Render_Storage) -> (frame: term.Frame_Buffer,
 	}
 
 	viewport := layout.Vec2{layout.Scalar(app.columns), layout.Scalar(app.rows)}
-	layout.set_services(
-		&storage.ctx,
-		{measure_text = tui.ascii_measure_proc, measure_text_user_data = &storage.measure_context, break_text = tui.ascii_break_proc},
-	)
+	layout.set_services(&storage.ctx, {measure_text = tui.measure_proc, measure_text_user_data = &storage.measure_context, break_text = tui.break_proc})
 	if layout.frame(&storage.ctx, viewport) {
 		if layout.element(
 			&storage.ctx,
-			widgets.container_desc(
-				widgets.Container {
-					id = 1,
-					style = {flow = .Column, sizing = {layout.grow(), layout.grow()}, padding = {left = 2, top = 1, right = 2, bottom = 1}, gap = 1},
-				},
-			),
+			layout.Element_Desc {
+				id = 1,
+				layout = {flow = .Column, sizing = {layout.grow(), layout.grow()}, padding = {left = 2, top = 1, right = 2, bottom = 1}, gap = 1},
+			},
 		) {
 			for item, index in app.items {
-				layout.text(&storage.ctx, widgets.label_desc(widgets.Label{id = layout.Id(index + 2), text = item}, {layout.fit(), layout.fit()}))
+				layout.text(&storage.ctx, layout.Text_Desc{id = layout.Id(index + 2), text = item, sizing = {layout.fit(), layout.fit()}})
 			}
 		}
 	}
@@ -171,20 +166,16 @@ render :: proc(app: App, storage: ^Render_Storage) -> (frame: term.Frame_Buffer,
 		if projection_error != nil {
 			return {}, .Not_Integral
 		}
-		if _, ok := tui.draw_ascii(&storage.buffer, rect, item, item_style(index == app.selected)); !ok {
+		if _, ok := tui.draw_text(&storage.buffer, rect, item, item_style(index == app.selected)); !ok {
 			return {}, .Undrawable_Text
 		}
 	}
 
-	built, ok := tui.build_frame(storage.buffer, storage.frame_cells[:])
-	if !ok {
-		return {}, .Presentation_Too_Small
-	}
-	return built, .None
+	return storage.buffer, .None
 }
 
 // present_frame is the only procedure in the slice that talks to the terminal.
-// Everything else renders into the caller-owned buffer, which is what keeps the
+// Everything else renders into the caller-owned grid, which is what keeps the
 // boundary testable without a tty.
 present_frame :: proc(session: ^term.Session, app: App, storage: ^Render_Storage) -> (Render_Error, term.Error) {
 	frame, render_error := render(app, storage)
@@ -196,12 +187,12 @@ present_frame :: proc(session: ^term.Session, app: App, storage: ^Render_Storage
 	return .None, present_error
 }
 
-// glyph_row reads one row of the buffer as a string, so snapshots are legible in
+// glyph_row reads one row of the grid as a string, so snapshots are legible in
 // a failure message instead of being a wall of cell structs.
-glyph_row :: proc(buffer: tui.Cell_Buffer, row: int, storage: []byte) -> string {
+glyph_row :: proc(buffer: term.Frame_Buffer, row: int, storage: []byte) -> string {
 	count := 0
-	for column in 0 ..< buffer.width {
-		grapheme := buffer.cells[row * buffer.width + column].grapheme
+	for column in 0 ..< buffer.columns {
+		grapheme := buffer.cells[row * buffer.columns + column].grapheme
 		if len(grapheme) > 0 {
 			storage[count] = grapheme[0]
 		} else {
@@ -250,8 +241,8 @@ test_selection_is_the_only_styled_run :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Render_Error.None)
 
 	for cell, index in storage.buffer.cells {
-		row := index / storage.buffer.width
-		column := index % storage.buffer.width
+		row := index / storage.buffer.columns
+		column := index % storage.buffer.columns
 		selected_run := row == 1 && column >= 2 && column < 7
 		testing.expect_value(t, cell.style, item_style(selected_run))
 	}
@@ -278,8 +269,8 @@ test_key_events_move_and_clamp_the_selection :: proc(t: ^testing.T) {
 	_, err = render(app, &storage)
 	testing.expect_value(t, err, Render_Error.None)
 	for cell, index in storage.buffer.cells {
-		row := index / storage.buffer.width
-		column := index % storage.buffer.width
+		row := index / storage.buffer.columns
+		column := index % storage.buffer.columns
 		selected_run := row == 3 && column >= 2 && column < 6
 		testing.expect_value(t, cell.style, item_style(selected_run))
 	}
@@ -317,13 +308,13 @@ test_resize_recomputes_geometry :: proc(t: ^testing.T) {
 	storage: Render_Storage
 	_, err := render(app, &storage)
 	testing.expect_value(t, err, Render_Error.None)
-	testing.expect_value(t, storage.buffer.width, 24)
+	testing.expect_value(t, storage.buffer.columns, 24)
 
 	update(&app, input.Resize_Event{columns = 10, rows = 4})
 	_, resized_err := render(app, &storage)
 	testing.expect_value(t, resized_err, Render_Error.None)
-	testing.expect_value(t, storage.buffer.width, 10)
-	testing.expect_value(t, storage.buffer.height, 4)
+	testing.expect_value(t, storage.buffer.columns, 10)
+	testing.expect_value(t, storage.buffer.rows, 4)
 
 	// The old geometry must not survive: nothing may be drawn past the new width,
 	// and rows beyond the new viewport simply do not exist.
@@ -363,24 +354,6 @@ test_content_overflow_is_clipped :: proc(t: ^testing.T) {
 
 	row_storage: [64]byte
 	testing.expect_value(t, glyph_row(storage.buffer, 1, row_storage[:]), "  alph")
-}
-
-@(test)
-test_insufficient_presentation_capacity_fails_the_frame :: proc(t: ^testing.T) {
-	app := DEFAULT_APP
-	// The frame needs one cell entry per buffer cell; this viewport exceeds the
-	// frame_cells storage even though the cell storage fits. render fails before
-	// anything could reach present, so the terminal never sees a half-built frame.
-	app.columns = 20
-	app.rows = 21
-	storage: Render_Storage
-	_, render_error := render(app, &storage)
-	testing.expect_value(t, render_error, Render_Error.Presentation_Too_Small)
-
-	// The next valid frame still works: a rejected frame leaves no wedged state.
-	app = DEFAULT_APP
-	_, render_error = render(app, &storage)
-	testing.expect_value(t, render_error, Render_Error.None)
 }
 
 @(test)

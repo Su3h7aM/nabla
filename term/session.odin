@@ -15,10 +15,20 @@ Input_Mode :: enum u8 {
 }
 
 // Options selects the terminal modes applied by open. Only the requested
-// modes are applied; anything not listed is left untouched.
+// modes are applied; anything not listed is left untouched. Terminal autowrap
+// is the one mode the session always changes: it is disabled for the session's
+// lifetime and re-enabled by close, because the frame path writes the
+// bottom-right cell. Like the other mode changes, close restores the
+// documented baseline (autowrap on) rather than the state open found; see the
+// terminal mode contract in doc.odin.
 Options :: struct {
 	alternate_screen: bool,
 	hide_cursor:      bool,
+	// bracketed_paste enables DECSET 2004 so a paste arrives as one Paste event
+	// instead of keystrokes. close sends the off sequence, restoring the
+	// documented baseline, so an application that does not handle the event
+	// should leave it off.
+	bracketed_paste:  bool,
 	input_mode:       Input_Mode,
 }
 

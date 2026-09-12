@@ -11,7 +11,7 @@ Break_Kind :: enum u8 {
 	Mandatory,
 }
 
-// break_ascii reports the next unbreakable run in `value` and the separator
+// break_text reports the next unbreakable run in `value` and the separator
 // that follows it, starting at `offset`.
 //
 // `[offset, piece_end)` is the maximal run of bytes that are not a break
@@ -20,15 +20,17 @@ Break_Kind :: enum u8 {
 // terminator) for a Mandatory break. When the run ends the text,
 // `piece_end == next_offset == len(value)` and kind is .None.
 //
-// Scope: ASCII only, mirroring `measure_ascii`. Whitespace is space, tab and a
-// lone carriage return; a CR immediately followed by LF belongs to the
-// terminator, which is how CRLF stops glueing an invisible character onto the
-// last word of a line.
+// Scope: it scans bytes and breaks only on ASCII whitespace, so it is UTF-8
+// safe — a multi-byte character is part of the run and never split. Whitespace
+// is space, tab and a lone carriage return; a CR immediately followed by LF
+// belongs to the terminator, which is how CRLF stops gluing an invisible
+// character onto the last word of a line. Wider break opportunities (U+3000,
+// hyphenation) are not implemented.
 //
 // Contract: `offset <= piece_end <= next_offset <= len(value)`, and progress is
 // guaranteed — `next_offset > offset` unless `piece_end == len(value)`.
 // Allocation: none; `value` is borrowed and not retained.
-break_ascii :: proc "contextless" (value: string, offset: int) -> (piece_end: int, next_offset: int, kind: Break_Kind) {
+break_text :: proc "contextless" (value: string, offset: int) -> (piece_end: int, next_offset: int, kind: Break_Kind) {
 	index := offset
 	for index < len(value) {
 		switch value[index] {

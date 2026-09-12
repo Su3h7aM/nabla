@@ -14,12 +14,12 @@ import "nabla:tui"
 _wrapped_height :: proc(
 	t: ^testing.T,
 	ui: ^layout.Context,
-	measure_context: ^tui.ASCII_Measure_Context,
+	measure_context: ^tui.Measure_Context,
 	viewport: layout.Vec2,
 	body: string,
 	style: layout.Text_Style,
 ) -> layout.Scalar {
-	layout.set_services(ui, {measure_text = tui.ascii_measure_proc, measure_text_user_data = measure_context, break_text = tui.ascii_break_proc})
+	layout.set_services(ui, {measure_text = tui.measure_proc, measure_text_user_data = measure_context, break_text = tui.break_proc})
 	if layout.frame(ui, viewport) {
 		layout.text(ui, layout.Text_Desc{text = body, style = style, sizing = {layout.grow(), layout.fit()}})
 	}
@@ -31,8 +31,8 @@ _wrapped_height :: proc(
 }
 
 @(test)
-test_ascii_break_proc_reproduces_fixture_wrapping_geometry :: proc(t: ^testing.T) {
-	measure_context := tui.ASCII_Measure_Context {
+test_break_proc_reproduces_fixture_wrapping_geometry :: proc(t: ^testing.T) {
+	measure_context := tui.Measure_Context {
 		profile = text.DEFAULT_WIDTH_PROFILE,
 	}
 	config := layout.Options {

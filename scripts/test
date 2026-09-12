@@ -64,19 +64,6 @@ for h in "${harnesses[@]}"; do
 	timeout --foreground "$timeout_secs" odin run "./$h" "$collection" -define:NABLA_TERM_TEST_HOOKS=true || failed+=("$h")
 done
 
-if [[ -z $target ]]; then
-	smoke_dir="$NABLA_ROOT/.scratch/smoke"
-	mkdir -p "$smoke_dir"
-	for app in demo examples/dashboard; do
-		[[ -f "$NABLA_ROOT/$app/main.odin" ]] || continue
-		out="$smoke_dir/$(basename "$app")"
-		nabla_step "smoke $app"
-		odin build "./$app" "$collection" -o:speed -out:"$out" || { failed+=("$app build"); continue; }
-		script -qec "\"$out\"" /dev/null </dev/null >/dev/null 2>&1 || failed+=("$app smoke")
-	done
-	rm -rf "$smoke_dir"
-fi
-
 if ((${#failed[@]})); then
 	nabla_die "test failed: ${failed[*]}"
 fi

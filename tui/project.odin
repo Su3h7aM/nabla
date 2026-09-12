@@ -2,6 +2,7 @@ package tui
 
 import "nabla:layout"
 
+// Cell_Rect is a cell rectangle: origin plus extent, in cells.
 Cell_Rect :: struct {
 	x:      int,
 	y:      int,
@@ -15,6 +16,8 @@ Projection_Error :: enum u8 {
 	Negative_Size,
 }
 
+// project_rect_integral converts a layout.Rect to cells. It fails when a
+// coordinate is not integral or an extent is negative.
 project_rect_integral :: proc "contextless" (rect: layout.Rect) -> (result: Cell_Rect, err: Projection_Error) {
 	x := int(rect.position[0])
 	y := int(rect.position[1])

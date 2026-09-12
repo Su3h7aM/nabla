@@ -9,19 +9,25 @@ Frame_Buffer :: struct {
 	cells:   []Cell,
 }
 
-// Cursor_Intent specifies where the cursor should be placed after the frame.
-// An empty union member means unspecified (the frame does not change it).
-Cursor_Intent :: union {
-	Hide,
-	Show,
-	Position,
+// Cursor is the desired cursor state after a frame. Visibility and position
+// are independent pieces of state, so they are two fields rather than a union
+// of mutually exclusive commands: a frame can place the caret and show it,
+// place it while hidden, or change only visibility.
+//
+// The zero value hides the cursor where the frame writer left it (the
+// bottom-right cell). That is the safe default for a full-frame redraw: an
+// interactive application sets visible and placed when it wants an editing
+// caret.
+Cursor :: struct {
+	visible:  bool,
+	position: Position,
+	// placed moves the cursor to position; when false the cursor stays where
+	// the last written cell left it.
+	placed:   bool,
 }
 
-// Position puts the cursor at (x, y) after the frame, origin at the
-// top-left cell (1-based in the emitted CUP sequence).
+// Position is a zero-based cell coordinate, origin at the top-left. The
+// encoder emits it 1-based in a CUP sequence.
 Position :: struct {
 	x, y: int,
 }
-
-Hide :: struct {}
-Show :: struct {}

@@ -50,10 +50,10 @@ reusable 4 MiB scratch: 24 warmup frames, then `frames` timed frames with
 - **No per-frame allocation**: encode writes only into the caller's scratch
   (the benchmark reuses one buffer for all frames); the measured cost is
   pure serialization.
-- **Diffing headroom**: a full 400x100 truecolor frame costs ~5 ms here. The
-  complete-target `plan_presentation` changed-line path (step D25) will emit
-  only changed spans; this baseline is the cost of the full redraw that
-  remains the recovery path.
+- **Full-frame cost**: a full 400x100 truecolor frame costs ~5 ms here. The
+  package presents full frames only (the retained diff planner was removed);
+  this baseline is what a complete redraw costs, and it is the recovery path
+  if a partial write ever lands.
 - The 4 MiB scratch comfortably holds every measured frame (worst case
   1.58 MiB for fully-styled 400x100).
 

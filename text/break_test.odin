@@ -5,7 +5,7 @@ package text
 import "core:testing"
 
 @(test)
-test_break_ascii_reports_each_run_and_separator :: proc(t: ^testing.T) {
+test_break_text_reports_each_run_and_separator :: proc(t: ^testing.T) {
 	Case :: struct {
 		value:     string,
 		offset:    int,
@@ -30,7 +30,7 @@ test_break_ascii_reports_each_run_and_separator :: proc(t: ^testing.T) {
 		{"ab\n", 3, 3, 3, .None},
 	}
 	for c in cases {
-		piece_end, next, kind := break_ascii(c.value, c.offset)
+		piece_end, next, kind := break_text(c.value, c.offset)
 		testing.expect_value(t, piece_end, c.piece_end)
 		testing.expect_value(t, next, c.next)
 		testing.expect_value(t, kind, c.kind)

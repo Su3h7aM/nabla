@@ -22,12 +22,12 @@ import "core:sync"
 import "core:sync/chan"
 import "core:thread"
 import "core:time"
-import "core:unicode/utf8"
 
 import "nabla:agent"
 import "nabla:ai"
 import input "nabla:input"
 import "nabla:term"
+import "nabla:tui/widgets"
 
 TUI_POLL_MS :: 50
 WORK_CAPACITY :: 16
@@ -130,13 +130,12 @@ App :: struct {
 	terminal:        ^term.Session,
 	tty:             ^os.File,
 	parser:          input.Parser,
+	raw:             [dynamic]input.Event, // owned; the latest input batch,
 	run:             Runtime,
 	storage:         ^Frame_Storage,
 	home:            string, // owned; shortens the footer path,
-	line:            [dynamic]u8, // owned prompt line,
-	cursor:          int,
+	input:           widgets.Input,
 	scroll:          int, // lines scrolled back; 0 follows the bottom,
-	events:          [dynamic]input.Event,
 	generation_seen: u64,
 	cancel_seen:     bool, // the running cancel came from our own keys, not a signal,
 	spin_lap:        time.Tick, // last working-frame advance,
@@ -344,25 +343,9 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 		return
 	}
 
-	terminal, open_err := term.open({alternate_screen = true, input_mode = .Raw})
-	if open_err != nil {
-		fmt.eprintln("nabla: cannot open the terminal:", open_err)
-		run_setup_destroy(&setup)
-		return
-	}
-	defer { _ = term.close(terminal) }
-	tty, file_err := term.session_file(terminal)
-	if file_err != nil {
-		fmt.eprintln("nabla: cannot access the terminal input:", file_err)
-		run_setup_destroy(&setup)
-		return
-	}
-
 	app := new(App)
 	defer free(app)
 	app.setup = setup
-	app.terminal = terminal
-	app.tty = tty
 	app.run.alloc = context.allocator
 	app.run.connection = setup.connection
 	app.run.snap.entries = make([dynamic]Entry, 0, 16, app.run.alloc)
@@ -374,10 +357,29 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	// persisted selection, or the user's choice.
 	app.picking = true
 	app.home = os.get_env("HOME", app.run.alloc)
-	app.line = make([dynamic]u8, 0, 128, app.run.alloc)
-	app.events = make([dynamic]input.Event, 0, 16, app.run.alloc)
+	app.input = widgets.Input{}
+	widgets.input_init(&app.input, app.run.alloc)
 	app.storage = frame_storage_new(app.run.alloc)
 	app.run.work, _ = chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
+
+	terminal, open_err := term.open({alternate_screen = true, hide_cursor = true, bracketed_paste = true, input_mode = .Raw}, app.run.alloc)
+	if open_err != nil {
+		fmt.eprintln("nabla: cannot open the terminal:", open_err)
+		app_teardown(app)
+		return
+	}
+	defer { _ = term.close(terminal) }
+	app.terminal = terminal
+
+	tty, file_err := term.session_file(terminal)
+	if file_err != nil {
+		fmt.eprintln("nabla: cannot access the terminal input:", file_err)
+		app_teardown(app)
+		return
+	}
+	app.tty = tty
+	input.parser_init(&app.parser)
+	app.raw = make([dynamic]input.Event, 0, 16, app.run.alloc)
 
 	if flag_provider != "" && flag_model != "" {
 		if !apply_selection(app, flag_provider, flag_model, "") {
@@ -401,7 +403,6 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 		return
 	}
 
-	input.parser_init(&app.parser)
 	agent.chat_interactive_arm(&app.run.signals)
 	defer agent.chat_interactive_disarm(&app.run.signals)
 
@@ -415,25 +416,26 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	app.run.worker = worker
 	thread.start(worker)
 
-	if viewport, vp_err := term.viewport(terminal); vp_err == nil {
+	if viewport, vp_err := term.viewport(app.terminal); vp_err == nil {
 		app.columns, app.rows = viewport.columns, viewport.rows
 		present_frame(app, app.storage)
 	}
 
 	for !app.quit {
-		count, read_err := input.read_events(&app.parser, app.tty, &app.events, TUI_POLL_MS)
+		_, read_err := input.read_events(&app.parser, app.tty, &app.raw, TUI_POLL_MS)
 		if read_err != nil {
 			fmt.eprintln("nabla: input:", read_err)
 			break
 		}
-		for event in app.events {
+		for event in app.raw {
 			handle_event(app, event)
 		}
-		clear(&app.events)
+		count := len(app.raw)
+		input.events_clear(&app.raw, app.run.alloc)
 
 		// A terminal that has not reported a size yet (ENODATA) is treated
 		// as "keep waiting": nothing can be drawn until one exists.
-		viewport, vp_err := term.viewport(terminal)
+		viewport, vp_err := term.viewport(app.terminal)
 		if vp_err != nil {
 			continue
 		}
@@ -448,7 +450,7 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 		// carries a model closes the picker.
 		if app.picking && app.run.snap.status.model_id != "" {
 			app.picking = false
-			app.cursor = 0
+			widgets.input_clear(&app.input)
 		}
 		if count > 0 || resized || generation_changed(app) || advance_spinner {
 			if advance_spinner {
@@ -505,8 +507,9 @@ app_teardown :: proc(app: ^App) {
 	delete(app.run.snap.status.effort, app.run.alloc)
 	delete(app.run.snap.setup_error, app.run.alloc)
 	delete(app.home, app.run.alloc)
-	delete(app.line)
-	delete(app.events)
+	widgets.input_destroy(&app.input)
+	input.parser_destroy(&app.parser)
+	input.events_destroy(&app.raw, app.run.alloc)
 	frame_storage_destroy(app.storage)
 	run_setup_destroy(&app.setup)
 }
@@ -884,6 +887,8 @@ handle_event :: proc(app: ^App, event: input.Event) {
 			handle_key(app, data)
 		}
 	case input.Resize_Event:
+	case input.Paste:
+		paste_insert(app, data.text)
 	case input.End_Of_Input:
 		app.quit = true
 	case input.Unknown_Input:
@@ -895,24 +900,23 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 	case .Enter:
 		submit(app)
 	case .Backspace:
-		edit_backspace(app)
+		widgets.input_backspace(&app.input)
 	case .Delete:
-		edit_delete(app)
+		widgets.input_delete(&app.input)
 	case .Left:
-		edit_left(app)
+		widgets.input_move_left(&app.input)
 	case .Right:
-		edit_right(app)
+		widgets.input_move_right(&app.input)
 	case .Home:
-		app.cursor = 0
+		widgets.input_move_home(&app.input)
 	case .End:
-		app.cursor = len(app.line)
+		widgets.input_move_end(&app.input)
 	case .Escape:
 		if runtime_busy(app) {
 			app.cancel_seen = true
 			agent.chat_cancel_request()
 		} else {
-			clear(&app.line)
-			app.cursor = 0
+			widgets.input_clear(&app.input)
 		}
 	case .Page_Up:
 		page := app.rows - 3
@@ -942,7 +946,7 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 				}
 			}
 		} else if key.character >= 0x20 && key.character != 0x7f {
-			edit_insert(app, key.character)
+			widgets.input_insert_rune(&app.input, key.character)
 		}
 	case .Insert, .F1, .F2, .F3, .F4, .F5:
 	}
@@ -950,10 +954,9 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 
 // submit sends the prompt line as a turn prompt or a slash command.
 submit :: proc(app: ^App) {
-	text := strings.trim_space(string(app.line[:]))
+	text := strings.trim_space(widgets.input_text(&app.input))
 	if text == "" {
-		clear(&app.line)
-		app.cursor = 0
+		widgets.input_clear(&app.input)
 		return
 	}
 	if strings.has_prefix(text, "/") {
@@ -961,8 +964,7 @@ submit :: proc(app: ^App) {
 	} else {
 		enqueue(app, .Prompt, "", text)
 	}
-	clear(&app.line)
-	app.cursor = 0
+	widgets.input_clear(&app.input)
 }
 
 // dispatch_command picks only the known commands; everything else is
@@ -1021,63 +1023,23 @@ enqueue :: proc(app: ^App, kind: Work_Kind, provider, text: string) {
 
 // --- prompt line editing --------------------------------------------------
 
-edit_insert :: proc(app: ^App, r: rune) {
-	encoded, width := utf8.encode_rune(r)
-	old_len := len(app.line)
-	allowed := old_len + width
-	for len(app.line) < allowed {
-		append(&app.line, 0)
-	}
-	for i := old_len - 1; i >= app.cursor; i -= 1 {
-		app.line[i + width] = app.line[i]
-	}
-	for k in 0 ..< width {
-		app.line[app.cursor + k] = encoded[k]
-	}
-	app.cursor += width
-}
-
-edit_backspace :: proc(app: ^App) {
-	if app.cursor == 0 {
+// paste_insert inserts a bracketed paste at the cursor. A single-line prompt
+// has no place for a line break, so CR/LF become spaces and other controls are
+// dropped.
+paste_insert :: proc(app: ^App, text_value: string) {
+	if text_value == "" {
 		return
 	}
-	start := app.cursor - 1
-	for start > 0 && (app.line[start] & 0xC0) == 0x80 {
-		start -= 1
+	run := strings.builder_make(0, 0, context.temp_allocator)
+	for r in text_value {
+		switch {
+		case r == '\r' || r == '\n':
+			strings.write_byte(&run, ' ')
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
+		// A control code point has no place in the prompt line.
+		case:
+			strings.write_rune(&run, r)
+		}
 	}
-	// remove_range takes the half-open range [lo, hi), not index and count.
-	remove_range(&app.line, start, app.cursor)
-	app.cursor = start
-}
-
-edit_delete :: proc(app: ^App) {
-	if app.cursor >= len(app.line) {
-		return
-	}
-	width := 1
-	if app.line[app.cursor] >= 0x80 {
-		_, decoded := utf8.decode_rune(app.line[app.cursor:])
-		width = decoded
-	}
-	// remove_range takes the half-open range [lo, hi), not index and count.
-	remove_range(&app.line, app.cursor, app.cursor + width)
-}
-
-edit_left :: proc(app: ^App) {
-	if app.cursor == 0 {
-		return
-	}
-	start := app.cursor - 1
-	for start > 0 && (app.line[start] & 0xC0) == 0x80 {
-		start -= 1
-	}
-	app.cursor = start
-}
-
-edit_right :: proc(app: ^App) {
-	if app.cursor >= len(app.line) {
-		return
-	}
-	_, width := utf8.decode_rune(app.line[app.cursor:])
-	app.cursor += width
+	widgets.input_insert(&app.input, strings.to_string(run))
 }

@@ -9,14 +9,13 @@ package term
 // zero-width placeholder cell (width = 0); present emits its style but no
 // text, which keeps span style continuity.
 //
-// Wide rendering is not implemented: present rejects any frame containing a
-// cell with width != 1 (.Unsupported) before writing anything, which
-// keeps the corner reservation an exact physical-cell contract — a width-2
-// cell at columns - 2 would otherwise span the reserved bottom-right cell
-// and could trigger autowrap scroll. The placeholder rule lands with wide
-// rendering.
+// Wide rendering is supported through the placeholder rule. present validates
+// the grid before writing anything: a width-2 cell must not sit in the last
+// column and its placeholder must be the next cell and carry no text. Any
+// other width is .Unsupported. The whole frame is written, bottom-right cell
+// included, because the session disables autowrap.
 Cell :: struct {
 	grapheme: string,
-	style:    Presentation_Style,
+	style:    Style,
 	width:    u8,
 }

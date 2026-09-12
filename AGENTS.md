@@ -2,8 +2,9 @@
 
 A monorepo in three layers that share one philosophy:
 
-- **Foundation** — `text`, `input`, `term`, `layout`, `tui`, `widgets`. Reusable by any Odin
-  program: the terminal, layout, and text stack knows nothing about models, agents, or HTTP.
+- **Foundation** — `text`, `input`, `term`, `layout`, `tui` (with its `widgets`
+  subpackage). Reusable by any Odin program: the terminal, layout, and text stack knows
+  nothing about models, agents, or HTTP.
 - **Libraries** — `http` (with its `client` subpackage), `sse`, `ai`, `acp`. Each stands on its
   own: HTTP and SSE know nothing about agents, and the model client knows nothing about the
   turn loop that drives it.
@@ -32,9 +33,8 @@ Dependencies point inward, from the harness toward the foundation.
 - Foundation packages never import `http`, `sse`, `ai`, `agent`, or `acp`.
 - `layout` depends on nothing else in the repo. It is the renderer-neutral solver; every
   other package adapts to it.
-- Only `cmd/nabla`, `examples/`, and `demo/` may import both the foundation and
-  `agent`. A foundation package that needs something from the harness has the dependency
-  backwards.
+- Only `cmd/nabla` may import both the foundation and `agent`. A foundation package that
+  needs something from the harness has the dependency backwards.
 
 Keep each package buildable, testable, and green on its own. That property is what makes the
 foundation reusable and the harness replaceable.

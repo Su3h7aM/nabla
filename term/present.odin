@@ -1,5 +1,6 @@
 package term
 
+import "core:terminal/ansi"
 import "core:unicode/utf8"
 
 // Frame encoding and presentation.
@@ -16,8 +17,9 @@ import "core:unicode/utf8"
 // without a preliminary clear, reduces authored colors deterministically to
 // the profile's color depth (TrueColor as authored, 256 via the xterm cube,
 // 16/8 via the nearest ANSI entry, None drops colors), writes the full
-// logical frame except the reserved bottom-right cell, and restores the
-// base SGR state at the end.
+// logical frame including the bottom-right cell (the session disables
+// autowrap so the corner is safe), and restores the base SGR state at the
+// end.
 //
 // A hard write failure may occur after a prefix has reached the terminal;
 // terminal contents and cursor state are then unspecified. The caller
@@ -26,7 +28,7 @@ import "core:unicode/utf8"
 // terminal cannot be undone.
 
 @(require_results)
-encoded_size :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor_Intent) -> (required: int, err: Error) {
+encoded_size :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor) -> (required: int, err: Error) {
 	if v_err := _validate_frame(buffer, cursor); v_err != nil {
 		return 0, v_err
 	}
@@ -47,7 +49,7 @@ encoded_size :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Curs
 // written == 0 and nothing usable written; the caller resizes and retries,
 // never guessing.
 @(require_results)
-encode :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor_Intent, output: []byte) -> (written: int, required: int, err: Error) {
+encode :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor, output: []byte) -> (written: int, required: int, err: Error) {
 	if v_err := _validate_frame(buffer, cursor); v_err != nil {
 		return 0, 0, v_err
 	}
@@ -82,7 +84,7 @@ present :: proc(
 	session: ^Session,
 	buffer: Frame_Buffer,
 	profile: Target_Profile,
-	cursor: Cursor_Intent,
+	cursor: Cursor,
 	output: []byte,
 ) -> (
 	committed: int,
@@ -121,15 +123,12 @@ present :: proc(
 // serialized or written: dimensions, logical cell count, width, grapheme
 // safety, and cursor bounds. A zero-sized frame is a deterministic no-op
 // (nil error) unless the cursor intent is invalid.
-_validate_frame :: proc(buffer: Frame_Buffer, cursor: Cursor_Intent) -> Error {
+_validate_frame :: proc(buffer: Frame_Buffer, cursor: Cursor) -> Error {
 	if buffer.columns < 0 || buffer.rows < 0 {
 		return General_Error.Invalid_Frame_Data
 	}
-	switch c in cursor {
-	case Hide, Show:
-	// Explicit mode changes carry no position to validate.
-	case Position:
-		if c.x < 0 || c.y < 0 || c.x >= buffer.columns || c.y >= buffer.rows {
+	if cursor.placed {
+		if cursor.position.x < 0 || cursor.position.y < 0 || cursor.position.x >= buffer.columns || cursor.position.y >= buffer.rows {
 			return General_Error.Invalid_Cursor
 		}
 	}
@@ -143,12 +142,38 @@ _validate_frame :: proc(buffer: Frame_Buffer, cursor: Cursor_Intent) -> Error {
 	}
 	for i in 0 ..< buffer.columns * buffer.rows {
 		cell := buffer.cells[i]
-		if cell.width != 1 {
-			// v1 implements width-1 only; width-0/1/2 is the complete target.
+		column := i % buffer.columns
+		switch cell.width {
+		case 0:
+			// A zero-width cell is the placeholder a wide cell needs and must
+			// carry no text: emitting it would advance the cursor past the
+			// wide cluster's second column.
+			if i == 0 || buffer.cells[i - 1].width != 2 {
+				return General_Error.Unsupported
+			}
+			if len(cell.grapheme) != 0 {
+				return General_Error.Invalid_Cell
+			}
+		case 1:
+			if len(cell.grapheme) > 0 && !_grapheme_safe(cell.grapheme) {
+				return General_Error.Invalid_Cell
+			}
+		case 2:
+			// A wide cell spans two physical columns. It needs room for its
+			// placeholder (checked before indexing i + 1). There is no
+			// corner exception: the session disables autowrap, so the
+			// bottom-right cell is written and a wide cell may span it.
+			if column >= buffer.columns - 1 {
+				return General_Error.Unsupported
+			}
+			if buffer.cells[i + 1].width != 0 {
+				return General_Error.Unsupported
+			}
+			if len(cell.grapheme) == 0 || !_grapheme_safe(cell.grapheme) {
+				return General_Error.Invalid_Cell
+			}
+		case:
 			return General_Error.Unsupported
-		}
-		if len(cell.grapheme) > 0 && !_grapheme_safe(cell.grapheme) {
-			return General_Error.Invalid_Cell
 		}
 	}
 	return nil
@@ -233,72 +258,66 @@ _enc_uint :: proc(e: ^_Encoder, v: u64) {
 	}
 }
 
-// _serialize renders the (validated) frame to the ANSI byte stream. The
-// escape sequences are written literally because the ansi subpackage cannot
-// be imported here — its package name collides with core:terminal/ansi once
-// core:testing is linked (see doc.odin).
-_serialize :: proc(e: ^_Encoder, buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor_Intent) {
+// _serialize renders the (validated) frame to the ANSI byte stream. The fixed
+// sequences come from core:terminal/ansi; the numeric ones (SGR parameters,
+// CUP coordinates) are composed here because the encoder owns their exact
+// byte layout.
+_serialize :: proc(e: ^_Encoder, buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor) {
 	// Baseline: cursor origin + explicit base style. The frame overwrites the
 	// viewport without a preliminary clear (framework contract); the
 	// unconditional SGR reset prevents stale attributes from a previous frame.
-	_enc_str(e, "\e[H\e[m")
-	previous_style: Presentation_Style
+	_enc_str(e, ansi.CSI + ansi.CUP + ansi.CSI + ansi.SGR)
+	previous_style: Style
 
 	for y in 0 ..< buffer.rows {
 		// Per-row cursor positioning. CUP does not reset SGR attributes, so
 		// the diff carries the previous row's last style into the next row —
 		// a default cell after a styled row end emits its own reset.
-		_enc_str(e, "\e[")
+		_enc_str(e, ansi.CSI)
 		_enc_uint(e, u64(y) + 1)
-		_enc_str(e, ";1H")
+		_enc_str(e, ";1" + ansi.CUP)
 
 		for x in 0 ..< buffer.columns {
-			// Corner reserve: the bottom-right cell is never written —
-			// writing it can trigger autowrap scroll on some terminals.
-			if x == buffer.columns - 1 && y == buffer.rows - 1 {
-				break
-			}
 			idx := y * buffer.columns + x
 			_enc_cell(e, buffer.cells[idx], &previous_style, profile.color_depth)
 		}
 	}
 
-	switch c in cursor {
-	case Hide:
-		_enc_str(e, "\e[?25l")
-	case Show:
-		_enc_str(e, "\e[?25h")
-	case Position:
-		_enc_str(e, "\e[")
-		_enc_uint(e, u64(c.y) + 1)
+	// Position first, then visibility: showing after the move keeps a
+	// terminal from rendering a frame at the stale position.
+	if cursor.placed {
+		_enc_str(e, ansi.CSI)
+		_enc_uint(e, u64(cursor.position.y) + 1)
 		_enc_str(e, ";")
-		_enc_uint(e, u64(c.x) + 1)
-		_enc_str(e, "H")
+		_enc_uint(e, u64(cursor.position.x) + 1)
+		_enc_str(e, ansi.CUP)
+	}
+	if cursor.visible {
+		_enc_str(e, ansi.CSI + ansi.DECTCEM_SHOW)
+	} else {
+		_enc_str(e, ansi.CSI + ansi.DECTCEM_HIDE)
 	}
 
 	// Restore the base style at the end of the frame (baseline contract).
-	_enc_str(e, "\e[m")
+	_enc_str(e, ansi.CSI + ansi.SGR)
 }
 
-_enc_cell :: proc(e: ^_Encoder, cell: Cell, previous: ^Presentation_Style, depth: Color_Depth) {
+_enc_cell :: proc(e: ^_Encoder, cell: Cell, previous: ^Style, depth: Color_Depth) {
 	_enc_style_diff(e, previous^, cell.style, depth)
 	previous^ = cell.style
 	_enc_str(e, cell.grapheme)
 }
 
 // _enc_style_establish resets to the base rendition and applies `style` from
-// scratch. The frame path calls it on every style change; the operation path
-// calls it for the first Set_Style_Op, where the terminal's current rendition
-// is unknown and the reset is required even when the target is the base style
-// (an external write may have left attributes set).
-_enc_style_establish :: proc(e: ^_Encoder, style: Presentation_Style, depth: Color_Depth) {
-	_enc_str(e, "\e[m")
-	if style != (Presentation_Style{}) {
+// scratch. It is called on every style change.
+_enc_style_establish :: proc(e: ^_Encoder, style: Style, depth: Color_Depth) {
+	_enc_str(e, ansi.CSI + ansi.SGR)
+	if style != (Style{}) {
 		for mod in Modifier {
 			if mod in style.modifiers {
-				_enc_str(e, "\e[")
+				_enc_str(e, ansi.CSI)
 				_enc_uint(e, u64(_modifier_sgr(mod)))
-				_enc_str(e, "m")
+				_enc_str(e, ansi.SGR)
 			}
 		}
 		_enc_color(e, 38, style.foreground, depth)
@@ -306,7 +325,7 @@ _enc_style_establish :: proc(e: ^_Encoder, style: Presentation_Style, depth: Col
 	}
 }
 
-_enc_style_diff :: proc(e: ^_Encoder, prev, next: Presentation_Style, depth: Color_Depth) {
+_enc_style_diff :: proc(e: ^_Encoder, prev, next: Style, depth: Color_Depth) {
 	// SGR diff: the whole style is emitted only when it changes. The
 	// baseline \e[m already reset at frame start, so an unchanged style
 	// needs nothing — a style run is one SGR group, not one per cell.
@@ -346,29 +365,29 @@ _enc_color :: proc(e: ^_Encoder, prefix: u8, color: Color, depth: Color_Depth) {
 		index := u8(c)
 		switch depth {
 		case .True_Color, .Eight_Bit:
-			_enc_str(e, "\e[")
+			_enc_str(e, ansi.CSI)
 			_enc_uint(e, u64(prefix))
 			_enc_str(e, ";5;")
 			_enc_uint(e, u64(index))
-			_enc_str(e, "m")
+			_enc_str(e, ansi.SGR)
 		case .Four_Bit:
 			// Decode the xterm-256 index (ANSI/cube/grayscale) to RGB, then
 			// reduce to the nearest 16-color entry — never a modulo wrap
 			// (xterm 196 is red, not blue).
-			_enc_str(e, "\e[")
+			_enc_str(e, ansi.CSI)
 			_enc_uint(e, u64(_ansi_4bit(prefix, _nearest_ansi(_xterm_256_to_rgb(index), 16))))
-			_enc_str(e, "m")
+			_enc_str(e, ansi.SGR)
 		case .Three_Bit:
-			_enc_str(e, "\e[")
+			_enc_str(e, ansi.CSI)
 			_enc_uint(e, u64(_ansi_4bit(prefix, _nearest_ansi(_xterm_256_to_rgb(index), 8))))
-			_enc_str(e, "m")
+			_enc_str(e, ansi.SGR)
 		case .None:
 			unreachable()
 		}
 	case RGB_Color:
 		switch depth {
 		case .True_Color:
-			_enc_str(e, "\e[")
+			_enc_str(e, ansi.CSI)
 			_enc_uint(e, u64(prefix))
 			_enc_str(e, ";2;")
 			_enc_uint(e, u64(c[0]))
@@ -376,21 +395,21 @@ _enc_color :: proc(e: ^_Encoder, prefix: u8, color: Color, depth: Color_Depth) {
 			_enc_uint(e, u64(c[1]))
 			_enc_str(e, ";")
 			_enc_uint(e, u64(c[2]))
-			_enc_str(e, "m")
+			_enc_str(e, ansi.SGR)
 		case .Eight_Bit:
-			_enc_str(e, "\e[")
+			_enc_str(e, ansi.CSI)
 			_enc_uint(e, u64(prefix))
 			_enc_str(e, ";5;")
 			_enc_uint(e, u64(_rgb_to_256(c)))
-			_enc_str(e, "m")
+			_enc_str(e, ansi.SGR)
 		case .Four_Bit:
-			_enc_str(e, "\e[")
+			_enc_str(e, ansi.CSI)
 			_enc_uint(e, u64(_ansi_4bit(prefix, _nearest_ansi(c, 16))))
-			_enc_str(e, "m")
+			_enc_str(e, ansi.SGR)
 		case .Three_Bit:
-			_enc_str(e, "\e[")
+			_enc_str(e, ansi.CSI)
 			_enc_uint(e, u64(_ansi_4bit(prefix, _nearest_ansi(c, 8))))
-			_enc_str(e, "m")
+			_enc_str(e, ansi.SGR)
 		case .None:
 			unreachable()
 		}
