@@ -871,6 +871,30 @@ test_a_write_transaction_can_begin_immediately :: proc(t: ^testing.T) {
 	testing.expect_value(t, _scalar_i64(t, &writer, "SELECT changes()"), i64(1))
 }
 
+@(test)
+test_a_savepoint_is_ordinary_sql :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&conn, "SAVEPOINT outer"))
+
+	// A savepoint turns autocommit off, so db.begin sees a transaction open
+	// exactly as it does after a BEGIN.
+	_expect_failure(t, db.begin(&conn), .Invalid_State)
+
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (1)"))
+	_expect_ok(t, db.exec(&conn, "SAVEPOINT inner"))
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (2)"))
+	_expect_ok(t, db.exec(&conn, "ROLLBACK TO inner"))
+	_expect_ok(t, db.exec(&conn, "RELEASE inner"))
+
+	// The commit ends the outer savepoint transaction and keeps the row that
+	// was still inside it.
+	_expect_ok(t, db.commit(&conn))
+	testing.expect_value(t, _count(&conn), i64(1))
+}
+
 // _scalar_i64 runs a statement, reads its one column of one row, and closes the
 // set. It is a test-local stand-in for reading a single value.
 _scalar_i64 :: proc(t: ^testing.T, conn: ^db.Conn, sql: string) -> i64 {

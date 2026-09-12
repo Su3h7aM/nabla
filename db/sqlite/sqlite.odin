@@ -40,6 +40,11 @@
 // "BEGIN IMMEDIATE", which takes the write lock up front instead of failing
 // partway through. db.exec runs it and db.commit still ends it, but db.begin
 // will refuse, because the transaction is already open either way.
+//
+// A savepoint is ordinary SQL too, and it turns autocommit off the same way, so
+// db.begin refuses while one is open. db.commit and db.rollback end the whole
+// transaction, savepoints included; rolling back to a savepoint is a statement
+// like any other.
 package sqlite
 
 import "core:c"
