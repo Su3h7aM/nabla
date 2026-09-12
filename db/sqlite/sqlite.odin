@@ -62,6 +62,7 @@ Config :: struct {
 	// release a lock before a statement fails with `.Busy`. Zero fails at once.
 	// A single-process program that keeps one connection usually wants 0.
 	// Values above what SQLite accepts as an int are clamped, not truncated.
+	// Negative values are refused.
 	busy_timeout_ms: int,
 
 	// foreign_keys enforces REFERENCES clauses. SQLite's own default is off, so
@@ -110,6 +111,10 @@ DRIVER: db.Driver = {
 // hands back to this package.
 @(require_results)
 open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> db.Error {
+	if config.busy_timeout_ms < 0 {
+		return db.error_make(.Invalid_Argument, 0, "busy_timeout_ms cannot be negative")
+	}
+
 	if strings.contains_rune(config.path, 0) {
 		return db.error_make(.Invalid_Argument, 0, "database path contains a NUL byte")
 	}

@@ -867,6 +867,17 @@ failing_allocate :: proc(
 }
 
 @(test)
+test_a_negative_busy_timeout_is_refused :: proc(t: ^testing.T) {
+	// A negative wait is a caller bug, usually a computed timeout that went
+	// under zero. Failing the open names it; treating it as zero would hide it.
+	conn: db.Conn
+	_expect_failure(t, open(&conn, {path = ":memory:", busy_timeout_ms = -1}), .Invalid_Argument)
+
+	// Nothing was published, so the handle is still closed.
+	testing.expect_value(t, db.error_kind(db.exec(&conn, "SELECT 1")), db.Error_Kind.Invalid_State)
+}
+
+@(test)
 test_rejecting_trailing_sql_has_no_effect :: proc(t: ^testing.T) {
 	conn := _open(t)
 	defer db.close(&conn)
