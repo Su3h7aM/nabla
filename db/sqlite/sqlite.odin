@@ -239,14 +239,15 @@ stmt_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
 }
 
 // tail_holds_more_sql reports whether anything after the statement prepare_v3
-// compiled is another statement, or something SQLite would refuse.
+// compiled is another statement, or something SQLite would refuse. The
+// remainder is scanned rather than prepared, because preparing it would run
+// pragmas that take effect while a statement compiles. The first statement is
+// not covered by that: a pragma there has already run by the time a second
+// statement makes this refuse the call.
 //
-// The remainder is scanned rather than handed back to SQLite: preparing it
-// would execute pragmas that take effect during compilation, so validating
-// input must never have an effect on the connection. The scan accepts what
-// SQLite accepts after a complete statement, which is whitespace, statement
-// separators, and comments, and refuses everything else. A comment that never
-// ends is accepted, which matches how SQLite reads one.
+// The scan takes whitespace, statement separators, and comments as the only
+// things a complete statement may be followed by. It accepts a comment that
+// never ends, which is how SQLite reads one.
 @(private)
 tail_holds_more_sql :: proc(sql: string, tail: cstring) -> bool {
 	if tail == nil { return false }

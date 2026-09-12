@@ -970,6 +970,19 @@ test_rejecting_trailing_sql_has_no_effect :: proc(t: ^testing.T) {
 	_expect_failure(t, db.exec(&conn, "INSERT INTO sneaky VALUES (1)"), .Backend)
 }
 
+@(test)
+test_a_pragma_before_a_second_statement_has_already_run :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	// Refusing the call cannot undo the first statement, which prepare_v3 ran
+	// while it looked for the end of it. A caller splits the input instead, and
+	// this pins what happens when they do not.
+	testing.expect(t, _foreign_keys(&conn), "the test connection starts with foreign keys on")
+	_expect_failure(t, db.exec(&conn, "PRAGMA foreign_keys = OFF; SELECT 1"), .Invalid_Argument)
+	testing.expect(t, !_foreign_keys(&conn), "the first statement ran before the call was refused")
+}
+
 _foreign_keys :: proc(conn: ^db.Conn) -> bool {
 	rows: db.Rows
 	if db.query(conn, &rows, "PRAGMA foreign_keys") != nil { return false }
