@@ -721,3 +721,73 @@ test_a_pragma_that_reports_a_value_is_readable :: proc(t: ^testing.T) {
 	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
 	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (1)"))
 }
+
+@(test)
+test_changed_rows_are_readable_as_a_value :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (v INTEGER)"))
+
+	// changes() is SQLite's own count of the most recent INSERT, UPDATE, or
+	// DELETE, so a caller reads it as a value instead of through an API.
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (1), (2), (3)"))
+	testing.expect_value(t, _scalar_i64(t, &conn, "SELECT changes()"), i64(3))
+
+	_expect_ok(t, db.exec(&conn, "DELETE FROM t WHERE v > 1"))
+	testing.expect_value(t, _scalar_i64(t, &conn, "SELECT changes()"), i64(2))
+
+	// A statement that reads does not overwrite the count, so the delete is
+	// still the answer after a select or a schema change.
+	_expect_ok(t, db.exec(&conn, "SELECT count(*) FROM t"))
+	testing.expect_value(t, _scalar_i64(t, &conn, "SELECT changes()"), i64(2))
+}
+
+@(test)
+test_a_write_transaction_can_begin_immediately :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer delete(directory)
+	defer os.remove_all(directory)
+	path := _temp_database(directory)
+	defer delete(path)
+
+	writer: db.Conn
+	_expect_ok(t, open(&writer, {path = path}))
+	defer db.close(&writer)
+
+	other: db.Conn
+	_expect_ok(t, open(&other, {path = path}))
+	defer db.close(&other)
+
+	_expect_ok(t, db.exec(&writer, "CREATE TABLE t (v INTEGER)"))
+
+	// BEGIN IMMEDIATE takes the write lock at once, so the failure lands on the
+	// statement that asked for it rather than somewhere later in the work.
+	_expect_ok(t, db.exec(&writer, "BEGIN IMMEDIATE"))
+	_expect_failure(t, db.exec(&other, "INSERT INTO t VALUES (1)"), .Busy)
+
+	// db.begin refuses while one is open, because the connection is in a
+	// transaction either way that transaction was started.
+	_expect_failure(t, db.begin(&writer), .Invalid_State)
+
+	_expect_ok(t, db.exec(&writer, "INSERT INTO t VALUES (1)"))
+	_expect_ok(t, db.commit(&writer))
+
+	// And it is free again once the transaction is over.
+	testing.expect_value(t, _scalar_i64(t, &writer, "SELECT changes()"), i64(1))
+}
+
+// _scalar_i64 runs a statement, reads its one column of one row, and closes the
+// set. It is a test-local stand-in for reading a single value.
+_scalar_i64 :: proc(t: ^testing.T, conn: ^db.Conn, sql: string) -> i64 {
+	rows: db.Rows
+	_expect_ok(t, db.query(conn, &rows, sql))
+	defer db.rows_close(&rows)
+
+	values, has_row, err := db.rows_next(&rows)
+	_expect_ok(t, err)
+	if !testing.expect(t, has_row, "expected a row") { return 0 }
+	value, value_err := db.as_i64(values[0])
+	_expect_ok(t, value_err)
+	return value
+}

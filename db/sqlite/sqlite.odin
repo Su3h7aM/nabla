@@ -26,6 +26,20 @@
 // A pragma that reports a value is read with db.query. db.exec discards the
 // rows a statement produces rather than refusing them, so a pragma that returns
 // a row is readable either way.
+//
+// How many rows an INSERT, UPDATE, or DELETE changed is SQLite's own changes()
+// function, which is a value to select rather than a call to make. It reports
+// the most recent one of those on the connection, and a SELECT or a DDL
+// statement does not overwrite it:
+//
+//	db.exec(&conn, "DELETE FROM log WHERE at < ?", {db.Value(cutoff)}) or_return
+//	rows: db.Rows
+//	db.query(&conn, &rows, "SELECT changes()") or_return
+//
+// A transaction that reads before it writes is better started as
+// "BEGIN IMMEDIATE", which takes the write lock up front instead of failing
+// partway through. db.exec runs it and db.commit still ends it, but db.begin
+// will refuse, because the transaction is already open either way.
 package sqlite
 
 import "core:c"

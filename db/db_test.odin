@@ -660,3 +660,34 @@ test_the_lifecycle_frees_every_allocation_exactly_once :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "leaked %d bytes allocated at %v", entry.size, entry.location)
 	}
 }
+
+@(test)
+test_statements_release_in_any_order :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	conn: Conn
+	_fake_open(&conn, &calls)
+
+	first, second, third: Statement
+	_expect_ok(t, prepare(&conn, &first, "SELECT 1"))
+	_expect_ok(t, prepare(&conn, &second, "SELECT 2"))
+	_expect_ok(t, prepare(&conn, &third, "SELECT 3"))
+
+	// The connection tracks what it still owns in one list and refuses to close
+	// over it, so releasing out of order has to unlink the right entry each
+	// time rather than the head.
+	_expect_ok(t, statement_close(&second))
+	testing.expect_value(t, error_kind(close(&conn)), Error_Kind.Invalid_State)
+
+	_expect_ok(t, statement_close(&third))
+	testing.expect_value(t, error_kind(close(&conn)), Error_Kind.Invalid_State)
+
+	_expect_ok(t, statement_close(&first))
+	testing.expect_value(t, calls.finalize, 3)
+
+	_expect_ok(t, close(&conn))
+	testing.expect_value(t, calls.close, 1)
+
+	// Releasing one twice reaches nothing the second time.
+	_expect_ok(t, statement_close(&first))
+	testing.expect_value(t, calls.finalize, 3)
+}

@@ -44,6 +44,22 @@
 // how the layer knows which handle is open, so pass a pointer and keep it where
 // it is for as long as it is open.
 //
+// # Keeping a row
+//
+// A row's text and blobs point into the statement that produced them, so they
+// last until the next rows_next and no longer. Keeping them means copying them,
+// which is the whole price of a row that does not allocate:
+//
+//	for {
+//		values, has_row, err := db.rows_next(&rows)
+//		if err != nil { return err }
+//		if !has_row { break }
+//		id, _ := db.as_string(values[0])
+//		append(&sessions, Session{id = strings.clone(id, allocator)})
+//	}
+//
+// An integer or a float is already a copy, so only text and blobs need this.
+//
 // # Values
 //
 // Value is a closed union: integers, floats, booleans, text, and blobs, with
