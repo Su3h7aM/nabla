@@ -23,6 +23,7 @@ test_selection_roundtrip :: proc(t: ^testing.T) {
 
 	testing.expect(t, selection_save(Selection{provider = "proxy", model = "openai/gpt-5.6-luna", effort = "low"}))
 	saved, ok := selection_load(context.temp_allocator)
+	defer selection_destroy(&saved, context.temp_allocator)
 	testing.expect(t, ok)
 	testing.expect_value(t, saved.provider, "proxy")
 	testing.expect_value(t, saved.model, "openai/gpt-5.6-luna")
@@ -31,6 +32,7 @@ test_selection_roundtrip :: proc(t: ^testing.T) {
 	// An empty effort is the provider default and round-trips as well.
 	testing.expect(t, selection_save(Selection{provider = "proxy", model = "m"}))
 	cleared, cleared_ok := selection_load(context.temp_allocator)
+	defer selection_destroy(&cleared, context.temp_allocator)
 	testing.expect(t, cleared_ok)
 	testing.expect_value(t, cleared.effort, "")
 }

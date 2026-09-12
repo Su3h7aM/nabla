@@ -21,7 +21,7 @@ frame_decoder_init :: proc(max_frame_bytes := MAX_FRAME_BYTES, allocator := cont
 	return Frame_Decoder{buffer = make([dynamic]u8, 0, max_frame_bytes + 1, allocator), max_frame_bytes = max_frame_bytes, allocator = allocator}
 }
 frame_decoder_destroy :: proc(decoder: ^Frame_Decoder) { delete(decoder.buffer); decoder^ = {} }
-frame_strings_destroy :: proc(frames: ^[dynamic]string) { for frame in frames^ { delete(frame) }; delete(frames^) }
+frame_strings_destroy :: proc(frames: ^[dynamic]string, allocator := context.allocator) { for frame in frames^ { delete(frame, allocator) }; delete(frames^) }
 frame_decoder_feed :: proc(decoder: ^Frame_Decoder, chunk: []byte, frames: ^[dynamic]string) -> Frame_Error {
 	first_error := Frame_Error.None
 	for byte in chunk {

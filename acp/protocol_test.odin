@@ -31,6 +31,7 @@ test_envelope_kinds_and_validation :: proc(t: ^testing.T) {
 		{"not-json", .Invalid_JSON},
 		{"{\"jsonrpc\":\"1.0\",\"method\":\"x\"}", .Invalid_Version},
 		{"{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"x\"}", .Invalid_ID},
+		{"{\"jsonrpc\":\"2.0\",\"id\":\"abc\"}", .Invalid_Result},
 		{"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":1,\"error\":{}}", .Invalid_Result},
 	}
 	for c in invalid_cases {

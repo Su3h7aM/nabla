@@ -163,7 +163,7 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source) -> (Run_Setup, boo
 	catalog, resolve_err := agent.resolve_catalog(sources, {}, models_dev[:], result.alloc)
 	if resolve_err != .None {
 		fmt.eprintln("nabla: invalid configuration: a model cannot be excluded and customized at the same time")
-		return result, false
+		return {}, false
 	}
 	result.catalog = catalog
 	for &source in sources {
@@ -174,7 +174,7 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source) -> (Run_Setup, boo
 	result.session = session
 	if session.workspace == "" {
 		fmt.eprintln("nabla: cannot determine working directory")
-		return result, false
+		return {}, false
 	}
 
 	ok = true
@@ -387,9 +387,7 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 			if apply_selection(app, selection.provider, selection.model, selection.effort) {
 				app.picking = false
 			}
-			delete(selection.provider, app.run.alloc)
-			delete(selection.model, app.run.alloc)
-			delete(selection.effort, app.run.alloc)
+			agent.selection_destroy(&selection, app.run.alloc)
 		}
 	} else {
 		fmt.eprintln("nabla: --provider and --model must be given together")

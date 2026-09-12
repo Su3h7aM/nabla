@@ -35,8 +35,8 @@ test_shell_parameters_schema_matches_parser :: proc(t: ^testing.T) {
 @(test)
 test_shell_parse_args_accepts_full_shape :: proc(t: ^testing.T) {
 	raw := `{"command":"echo hi","working_directory":null,"timeout_ms":null}`
-	args, ok := tool_shell_parse_args(raw, context.temp_allocator)
-	defer tool_shell_args_destroy(&args, context.temp_allocator)
+	args, ok := tool_shell_parse_args(raw, context.allocator)
+	defer tool_shell_args_destroy(&args, context.allocator)
 	testing.expect(t, ok)
 	testing.expect_value(t, args.command, "echo hi")
 	testing.expect_value(t, args.working_directory, "")
@@ -57,8 +57,8 @@ test_shell_parse_args_rejects_shapes :: proc(t: ^testing.T) {
 		`[1,2]`,
 	}
 	for raw in cases {
-		args, ok := tool_shell_parse_args(raw, context.temp_allocator)
-		tool_shell_args_destroy(&args, context.temp_allocator)
+		args, ok := tool_shell_parse_args(raw, context.allocator)
+		tool_shell_args_destroy(&args, context.allocator)
 		testing.expect(t, !ok)
 	}
 }

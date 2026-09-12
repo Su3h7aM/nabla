@@ -68,13 +68,11 @@ tool_shell_raw_args_destroy :: proc(raw_args: ^Tool_Shell_Raw_Args, allocator: m
 	raw_args^ = {}
 }
 
+// tool_shell_raw_args_shape reports whether raw is an object whose top-level
+// keys are exactly command, working_directory, and timeout_ms, each once, with
+// values of the declared shape. It allocates nothing.
 @(private)
-tool_shell_unmarshal :: proc(raw: string, args: ^Tool_Shell_Raw_Args, allocator: mem.Allocator) -> bool {
-	err := json.unmarshal_string(raw, args, .JSON, allocator)
-	if err != nil { return false }
-	// Builtin unmarshal skips unknown fields, so reject them explicitly
-	// with the builtin tokenizer: top-level keys must be exactly the
-	// three schema fields, each appearing once.
+tool_shell_raw_args_shape :: proc(raw: string) -> bool {
 	tokenizer := json.make_tokenizer(raw, .JSON, true)
 	seen_command, seen_work, seen_timeout := false, false, false
 	token, token_err := json.get_token(&tokenizer)
@@ -84,17 +82,19 @@ tool_shell_unmarshal :: proc(raw: string, args: ^Tool_Shell_Raw_Args, allocator:
 		if token_err != nil && token_err != .EOF { return false }
 		if token.kind == .Close_Brace { break }
 		if token.kind != .String { return false }
-		key := token.text[1:len(token.text) - 1]
-		if key == "command" {
+		switch token.text[1:len(token.text) - 1] {
+		case "command":
 			if seen_command { return false }
 			seen_command = true
-		} else if key == "working_directory" {
+		case "working_directory":
 			if seen_work { return false }
 			seen_work = true
-		} else if key == "timeout_ms" {
+		case "timeout_ms":
 			if seen_timeout { return false }
 			seen_timeout = true
-		} else { return false }
+		case:
+			return false
+		}
 		token, token_err = json.get_token(&tokenizer)
 		if (token_err != nil && token_err != .EOF) || token.kind != .Colon { return false }
 		token, token_err = json.get_token(&tokenizer)
@@ -121,45 +121,51 @@ tool_shell_unmarshal :: proc(raw: string, args: ^Tool_Shell_Raw_Args, allocator:
 	}
 	if !seen_command || !seen_work || !seen_timeout { return false }
 	token, token_err = json.get_token(&tokenizer)
-	if token.kind != .EOF { return false }
-	return true
+	return token.kind == .EOF
+}
+
+@(private)
+tool_shell_unmarshal :: proc(raw: string, args: ^Tool_Shell_Raw_Args, allocator: mem.Allocator) -> bool {
+	// Shape first: the builtin unmarshal skips an unknown field and lets a
+	// repeated one overwrite its predecessor, and the replaced value would leak.
+	if !tool_shell_raw_args_shape(raw) { return false }
+	return json.unmarshal_string(raw, args, .JSON, allocator) == nil
 }
 
 tool_shell_parse_args :: proc(raw: string, allocator := context.allocator) -> (Tool_Shell_Args, bool) {
 	args := Tool_Shell_Args{}
 	ok := false
+	// A rejection frees what was built and returns the zero value, so the caller
+	// may destroy the result unconditionally.
 	defer if !ok { tool_shell_args_destroy(&args, allocator) }
-	if len(raw) == 0 || len(raw) > TOOL_MAX_ARGS_BYTES { return args, false }
+	if len(raw) == 0 || len(raw) > TOOL_MAX_ARGS_BYTES { return {}, false }
 	raw_args: Tool_Shell_Raw_Args
-	if !tool_shell_unmarshal(raw, &raw_args, allocator) { return args, false }
+	// The unmarshal transfers ownership of any field it set, and it can fail
+	// after doing so, so raw_args is released on every exit path.
 	defer tool_shell_raw_args_destroy(&raw_args, allocator)
+	if !tool_shell_unmarshal(raw, &raw_args, allocator) { return {}, false }
 	work_opt := raw_args.working_directory
 	timeout_opt := raw_args.timeout_ms
 	command_text := strings.trim_space(raw_args.command)
-	if command_text == "" { return args, false }
-	if strings.contains_rune(command_text, 0) { return args, false }
+	if command_text == "" || strings.contains_rune(command_text, 0) { return {}, false }
 	args.command = strings.clone(command_text, allocator)
-	work, work_present := work_opt.?
-	if !work_present {
-		args.working_directory = ""
-	} else {
+	if work, work_present := work_opt.?; work_present {
 		work_text := strings.trim_space(work)
-		if work_text == "" || strings.contains_rune(work_text, 0) { return args, false }
+		if work_text == "" || strings.contains_rune(work_text, 0) { return {}, false }
 		// Parse-time shape check mirrors the executor: absolute paths
 		// and parent escapes never reach a process, even before
 		// workspace resolution.
-		if work_text[0] == '/' { return args, false }
+		if work_text[0] == '/' { return {}, false }
 		for part in strings.split_iterator(&work_text, "/") {
-			if part == ".." { return args, false }
+			if part == ".." { return {}, false }
 		}
 		args.working_directory = strings.clone(work_text, allocator)
 	}
-	timeout, timeout_present := timeout_opt.?
-	if !timeout_present {
-		args.timeout_ms = TOOL_DEFAULT_TIMEOUT_MS
-	} else {
-		if timeout <= 0 || timeout > i64(TOOL_MAX_TIMEOUT_MS) { return args, false }
+	if timeout, timeout_present := timeout_opt.?; timeout_present {
+		if timeout <= 0 || timeout > i64(TOOL_MAX_TIMEOUT_MS) { return {}, false }
 		args.timeout_ms = int(timeout)
+	} else {
+		args.timeout_ms = TOOL_DEFAULT_TIMEOUT_MS
 	}
 	ok = true
 	return args, true

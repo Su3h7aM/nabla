@@ -53,20 +53,28 @@ parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Enve
 	if !version_ok || version != "2.0" { return {}, .Invalid_Version }
 	parsed_id, parsed_id_present, id_ok := object_id(obj, "id", allocator)
 	if !id_ok { return {}, .Invalid_ID }
-	parsed_method, method_present, method_ok := object_string_present(obj, "method")
-	if !method_ok || (method_present && parsed_method == "") { return {}, .Invalid_Method }
-	result_value, result_present := obj["result"]
-	error_value, error_present := obj["error"]
-	if method_present {
-		if result_present || error_present { return {}, .Invalid_Envelope }
-	} else if !parsed_id_present || (result_present == error_present) {
-		return {}, .Invalid_Result
-	}
+	// The id can own a cloned string, so every rejection below releases it.
 	result := Envelope {
-		kind       = .Notification,
 		id         = parsed_id,
 		id_present = parsed_id_present,
 	}
+	parsed_method, method_present, method_ok := object_string_present(obj, "method")
+	if !method_ok || (method_present && parsed_method == "") {
+		destroy_envelope(&result, allocator)
+		return {}, .Invalid_Method
+	}
+	result_value, result_present := obj["result"]
+	error_value, error_present := obj["error"]
+	if method_present {
+		if result_present || error_present {
+			destroy_envelope(&result, allocator)
+			return {}, .Invalid_Envelope
+		}
+	} else if !parsed_id_present || (result_present == error_present) {
+		destroy_envelope(&result, allocator)
+		return {}, .Invalid_Result
+	}
+	result.kind = .Notification
 	if method_present {
 		result.method = strings.clone(parsed_method, allocator)
 		if parsed_id_present { result.kind = .Request }
@@ -76,7 +84,10 @@ parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Enve
 	result.kind = .Response
 	if error_present {
 		parsed_error, error_ok := parse_rpc_error(error_value, allocator)
-		if !error_ok { return {}, .Invalid_Error }
+		if !error_ok {
+			destroy_envelope(&result, allocator)
+			return {}, .Invalid_Error
+		}
 		result.rpc_error = parsed_error
 		result.error_present = true
 	}
@@ -130,14 +141,14 @@ destroy_envelope :: proc(envelope: ^Envelope, allocator := context.allocator) {
 	if envelope.id_present {
 		#partial switch id in envelope.id {
 		case string:
-			delete(id)
+			delete(id, allocator)
 		}
 	}
-	if envelope.method != "" { delete(envelope.method) }
+	if envelope.method != "" { delete(envelope.method, allocator) }
 	if envelope.params_present { json.destroy_value(envelope.params, allocator) }
 	if envelope.result_present { json.destroy_value(envelope.result, allocator) }
 	if envelope.error_present {
-		delete(envelope.rpc_error.message)
+		delete(envelope.rpc_error.message, allocator)
 		if envelope.rpc_error.data_present { json.destroy_value(envelope.rpc_error.data, allocator) }
 	}
 	envelope^ = {}
