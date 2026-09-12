@@ -26,10 +26,6 @@ Error_Kind :: enum {
 	// Another connection holds a lock, or the database is being written by
 	// someone else. The same call may work after the other side finishes.
 	Busy,
-	// A lock inside this connection or its transaction is in the way, so
-	// running the same call again will fail the same way. Kept apart from
-	// Busy because the advice differs: Busy is worth waiting on, Locked is not.
-	Locked,
 	// The database or the file was opened read-only.
 	Read_Only,
 	Out_Of_Memory,

@@ -111,7 +111,6 @@ foreign lib {
 	column_blob :: proc(stmt: ^sqlite3_stmt, i: c.int) -> rawptr ---
 	column_bytes :: proc(stmt: ^sqlite3_stmt, i: c.int) -> c.int ---
 
-	errcode :: proc(db: ^sqlite3) -> Result_Code ---
 	extended_errcode :: proc(db: ^sqlite3) -> c.int ---
 	errmsg :: proc(db: ^sqlite3) -> cstring ---
 	get_autocommit :: proc(db: ^sqlite3) -> c.int ---

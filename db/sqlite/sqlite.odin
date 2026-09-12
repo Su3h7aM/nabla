@@ -461,10 +461,12 @@ classify :: proc(rc: Result_Code) -> db.Error_Kind {
 		return .None
 	case .Constraint:
 		return .Constraint
-	case .Busy:
+	case .Busy, .Locked:
+		// SQLite separates "someone else holds the database" from "a table is
+		// locked within this one", and the second needs shared cache, which
+		// this backend never turns on. Both are a lock in the way, and waiting
+		// is the only thing a caller can do about either.
 		return .Busy
-	case .Locked:
-		return .Locked
 	case .Read_Only:
 		return .Read_Only
 	case .No_Mem:
