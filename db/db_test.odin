@@ -744,6 +744,7 @@ test_the_row_buffer_is_sized_when_the_first_row_arrives :: proc(t: ^testing.T) {
 
 	stmt: Statement
 	_expect_ok(t, prepare(&conn, &stmt, "SELECT a, b"))
+	defer statement_close(&stmt)
 
 	rows: Rows
 	_expect_ok(t, statement_query(&stmt, &rows))
