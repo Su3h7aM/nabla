@@ -358,7 +358,7 @@ test_models_dev_sources_are_the_resolver_input :: proc(t: ^testing.T) {
 			stub := Models_Dev_Stub {
 				body = MODELS_DEV_FIXTURE,
 			}
-			sources, err := models_dev_sources(models_dev_stub_fetch, &stub, context.allocator)
+			sources, err := models_dev_sources(models_dev_stub_fetch, &stub, {}, context.allocator)
 			testing.expect_value(t, err, Models_Dev_Error.None)
 			defer catalog_sources_destroy(&sources)
 			testing.expect_value(t, stub.calls, 1)
@@ -393,7 +393,7 @@ test_models_dev_sources_reports_an_unusable_document :: proc(t: ^testing.T) {
 			broken := Models_Dev_Stub {
 				body = `{"stub": {"models": {}}}`,
 			}
-			sources, err := models_dev_sources(models_dev_stub_fetch, &broken, context.allocator)
+			sources, err := models_dev_sources(models_dev_stub_fetch, &broken, {}, context.allocator)
 			testing.expect_value(t, err, Models_Dev_Error.Invalid_Data)
 			testing.expect_value(t, len(sources), 0)
 			catalog_sources_destroy(&sources)
@@ -405,7 +405,7 @@ test_models_dev_sources_reports_an_unusable_document :: proc(t: ^testing.T) {
 			// A served cache that cannot be parsed is reported by kind, so a damaged
 			// document stays distinguishable from an unreachable service.
 			testing.expect(t, os.write_entire_file(path, transmute([]u8)string(`{"stub": {"models": {}}}`)) == nil)
-			cached, cached_err := models_dev_sources(models_dev_stub_fetch, &broken, context.allocator)
+			cached, cached_err := models_dev_sources(models_dev_stub_fetch, &broken, {}, context.allocator)
 			testing.expect_value(t, cached_err, Models_Dev_Error.Missing_Identity)
 			testing.expect_value(t, len(cached), 0)
 			catalog_sources_destroy(&cached)

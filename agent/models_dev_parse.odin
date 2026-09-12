@@ -2,6 +2,7 @@ package agent
 
 import "core:encoding/json"
 import "core:mem"
+import "core:mem/virtual"
 import "core:slice"
 import "core:strings"
 
@@ -35,10 +36,20 @@ Models_Dev_Parse_Error :: enum {
 // holding the models that provider serves. The result is owned by the caller and
 // released with catalog_sources_destroy, exactly like the result of the user
 // configuration loader, so both are the same kind of resolver input.
-models_dev_parse :: proc(data: []u8, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Models_Dev_Parse_Error) {
-	root, parse_err := json.parse_bytes(data, .JSON, true, context.temp_allocator)
+//
+// `providers` restricts the result to those provider ids; an empty list keeps
+// every provider. The resolved catalog only carries providers the user
+// configured, so the rest of the document is traversed but never materialized.
+models_dev_parse :: proc(data: []u8, providers: []string = {}, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Models_Dev_Parse_Error) {
+	// The document is megabyte-scale and its tree is several times that, so the
+	// tree lives in a dedicated arena that is unmapped when extraction finishes.
+	// The process-wide temp allocator would hold the pages until its next reset.
+	ast: virtual.Arena
+	if arena_err := virtual.arena_init_growing(&ast); arena_err != nil { return {}, .Invalid_JSON }
+	defer virtual.arena_destroy(&ast)
+
+	root, parse_err := json.parse_bytes(data, .JSON, true, virtual.arena_allocator(&ast))
 	if parse_err != .None { return {}, .Invalid_JSON }
-	defer json.destroy_value(root, context.temp_allocator)
 
 	root_object, root_is_object := root.(json.Object)
 	if !root_is_object { return {}, .Invalid_Structure }
@@ -52,6 +63,7 @@ models_dev_parse :: proc(data: []u8, allocator := context.allocator) -> ([dynami
 	}
 
 	for provider_id, provider_value in root_object {
+		if len(providers) > 0 && !_models_dev_wanted(providers, provider_id) { continue }
 		provider_object, provider_is_object := provider_value.(json.Object)
 		if !provider_is_object { return {}, .Invalid_Structure }
 
@@ -267,6 +279,14 @@ models_dev_api_family :: proc(npm: string) -> (api: string, known: bool) {
 		return "anthropic_messages", true
 	}
 	return "", false
+}
+
+// _models_dev_wanted reports whether a provider id is one of the ids the caller
+// asked for. The configured set is small, so a scan beats a lookup structure.
+@(private)
+_models_dev_wanted :: proc(providers: []string, id: string) -> bool {
+	for provider in providers { if provider == id { return true } }
+	return false
 }
 
 models_dev_member_string :: proc(object: json.Object, key: string) -> (value: string, present: bool) {

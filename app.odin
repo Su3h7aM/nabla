@@ -155,7 +155,12 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source) -> (Run_Setup, boo
 		run_setup_destroy(&result)
 	}
 
-	models_dev, models_dev_err := agent.models_dev_sources(allocator = result.alloc)
+	// Only configured providers are selectable, so the raw catalog is filtered to
+	// them as it is read: enrichment for anything else has no consumer.
+	configured := make([]string, len(sources), context.temp_allocator)
+	defer delete(configured, context.temp_allocator)
+	for source, index in sources { configured[index] = source.id }
+	models_dev, models_dev_err := agent.models_dev_sources(providers = configured, allocator = result.alloc)
 	defer agent.catalog_sources_destroy(&models_dev, result.alloc)
 	if models_dev_err != .None {
 		fmt.eprintln("nabla: warning: models.dev is unavailable; using configured values only")

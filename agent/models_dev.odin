@@ -2,6 +2,7 @@ package agent
 
 import "core:fmt"
 import "core:mem"
+import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
 import "core:time"
@@ -99,22 +100,28 @@ models_dev_catalog_at :: proc(now: time.Time, fetch: Models_Dev_Fetch, user_data
 }
 
 // models_dev_validate reports whether an acquired document is usable, which is
-// what decides whether it may replace the cache. It parses and discards, so the
-// check costs one parse per refresh and never keeps the result.
+// what decides whether it may replace the cache. The tree and the source records
+// it would produce both live in an arena released here, so the check costs one
+// parse per refresh and leaves nothing resident.
 models_dev_validate :: proc(data: []u8) -> bool {
-	sources, err := models_dev_parse(data, context.temp_allocator)
-	catalog_sources_destroy(&sources, context.temp_allocator)
+	arena: virtual.Arena
+	if arena_err := virtual.arena_init_growing(&arena); arena_err != nil { return false }
+	defer virtual.arena_destroy(&arena)
+	_, err := models_dev_parse(data, {}, virtual.arena_allocator(&arena))
 	return err == .None
 }
 
 // models_dev_sources produces the resolver input from models.dev: the document is
 // taken from the cache when it is fresh and acquired otherwise, then parsed into
 // provider source records. This is the whole ingestion path, so no caller handles
-// the raw document. The result is owned by the caller and released with
-// catalog_sources_destroy, exactly like the user configuration loader's result.
+// the raw document. `providers` restricts extraction to those provider ids, so a
+// provider the user cannot select is never materialized. The result is owned by
+// the caller and released with catalog_sources_destroy, exactly like the user
+// configuration loader's result.
 models_dev_sources :: proc(
 	fetch: Models_Dev_Fetch = models_dev_fetch,
 	user_data: rawptr = nil,
+	providers: []string = {},
 	allocator := context.allocator,
 ) -> (
 	[dynamic]Catalog_Provider_Source,
@@ -124,7 +131,7 @@ models_dev_sources :: proc(
 	if body_err != .None { return {}, body_err }
 	defer delete(body, allocator)
 
-	sources, parse_err := models_dev_parse(body, allocator)
+	sources, parse_err := models_dev_parse(body, providers, allocator)
 	switch parse_err {
 	case .None:
 		return sources, .None

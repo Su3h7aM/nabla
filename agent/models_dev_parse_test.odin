@@ -94,6 +94,17 @@ models_dev_fixture_model :: proc(t: ^testing.T, provider: ^Catalog_Provider_Sour
 }
 
 @(test)
+test_models_dev_parse_keeps_only_wanted_providers :: proc(t: ^testing.T) {
+	fixture := MODELS_DEV_FIXTURE
+	catalog, err := models_dev_parse(transmute([]u8)fixture, []string{"beta"}, context.allocator)
+	defer catalog_sources_destroy(&catalog, context.allocator)
+	testing.expect_value(t, err, Models_Dev_Parse_Error.None)
+	testing.expect_value(t, len(catalog), 1)
+	testing.expect_value(t, catalog[0].id, "beta")
+	testing.expect_value(t, len(catalog[0].models), 1)
+}
+
+@(test)
 test_models_dev_parse_reads_providers_and_models :: proc(t: ^testing.T) {
 	catalog, err := models_dev_parse_text(MODELS_DEV_FIXTURE)
 	testing.expect_value(t, err, Models_Dev_Parse_Error.None)
