@@ -1,27 +1,12 @@
 #+build linux
 package main
 
-// tui_frame.odin draws the three-region screen and presents it.
+// Draws the frame: the conversation, a rule, the input line, another rule, and
+// a two-line footer, into term's grid, then presents it.
 //
-// Shape of the frame, top to bottom: the conversation grows, then a rule,
-// the input line, another rule, and a two-line footer (working directory,
-// then usage on the left with provider/model/effort on the right). The
-// rules and the footer split follow the Pi TUI, which is the visual
-// reference for this screen.
-//
-// The screen is a thin projection of runtime state: the conversation comes
-// from the runtime snapshot, the footer from the runtime status block.
-// Nothing here owns conversation state. The region split is six integers
-// through tui.rows; there is no layout tree between the split and the
-// draw. The frame grid is term's; tui draws into it and term.present writes
-// it.
-//
-// Text policy comes from nabla:text and tui: every byte is drawn through the
-// sanitizer, and draw_text runs the same policy that measurement and
-// truncation run, so untrusted model or tool output can never emit a terminal
-// control sequence and never measures differently from how it draws. The
-// glyphs the screen controls itself (the rule and spinner) go through tui.put,
-// which enforces the same policy.
+// The screen is a projection of runtime state: the conversation comes from the
+// snapshot and the footer from the status block; nothing here owns conversation
+// state.
 
 import "core:fmt"
 import "core:mem"

@@ -4,7 +4,7 @@
 
 NABLA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-NABLA_NON_PACKAGE_DIRS="cmd third_party"
+NABLA_NON_PACKAGE_DIRS="third_party"
 NABLA_SERIAL_TEST_PACKAGES="agent ai layout"
 # Packages whose core:testing suites must not be discovered by `odin test`
 # because an external harness runs them instead. Empty once every suite is on
@@ -55,11 +55,10 @@ nabla_harnesses() {
 }
 
 nabla_executables() {
-	local d
-	for d in "$NABLA_ROOT/cmd"/*/; do
-		[[ -f "${d%/}/main.odin" ]] || continue
-		printf 'cmd/%s\n' "$(basename "${d%/}")"
-	done
+	# The harness is the repository root package.
+	if [[ -f "$NABLA_ROOT/main.odin" ]]; then
+		printf '.\n'
+	fi
 }
 
 nabla_owned_sources() {

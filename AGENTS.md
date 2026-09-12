@@ -8,7 +8,8 @@ A monorepo in three layers that share one philosophy:
 - **Libraries** — `http` (with its `client` subpackage), `sse`, `ai`, `acp`. Each stands on its
   own: HTTP and SSE know nothing about agents, and the model client knows nothing about the
   turn loop that drives it.
-- **Harness** — `agent` and the `cmd/nabla` executable. A coding agent built on top of both.
+- **Harness** — `agent` and the `nabla` executable at the repository root. A coding agent built on
+  top of both.
 
 The harness is one consumer of the layers beneath it, not their owner.
 
@@ -33,8 +34,8 @@ Dependencies point inward, from the harness toward the foundation.
 - Foundation packages never import `http`, `sse`, `ai`, `agent`, or `acp`.
 - `layout` depends on nothing else in the repo. It is the renderer-neutral solver; every
   other package adapts to it.
-- Only `cmd/nabla` may import both the foundation and `agent`. A foundation package that
-  needs something from the harness has the dependency backwards.
+- Only the root `nabla` package may import both the foundation and `agent`. A foundation package
+  that needs something from the harness has the dependency backwards.
 
 Keep each package buildable, testable, and green on its own. That property is what makes the
 foundation reusable and the harness replaceable.

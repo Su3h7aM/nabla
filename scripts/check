@@ -17,7 +17,7 @@ mapfile -t packages < <(nabla_check_packages)
 failed=()
 for pkg in "${packages[@]}"; do
 	nabla_step "check $pkg"
-	odin check "./$pkg" "${flags[@]}" || failed+=("$pkg")
+	odin check "$pkg" "${flags[@]}" || failed+=("$pkg")
 done
 if ((${#failed[@]})); then
 	nabla_die "check failed: ${failed[*]}"

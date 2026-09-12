@@ -1,6 +1,7 @@
 # Build output
 build/
 .scratch/
+/nabla
 
 # Odin artifacts
 *.bin

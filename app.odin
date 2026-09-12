@@ -1,18 +1,12 @@
 #+build linux
 package main
 
-// tui_app.odin is the harness's full-screen front-end.
-//
-// One worker thread owns the session: it runs turns, tool executions, and
-// compaction, and it is the only thread that mutates agent state. The main
-// thread owns the terminal: it reads input, edits the prompt line, and
-// renders. Communication is a single direction: the worker pushes work
-// results into the runtime snapshot (under a mutex) and the main thread
-// renders that snapshot. The session is never shared unlocked.
+// The front-end: a worker thread owns the agent session, the main thread owns
+// the terminal, and results cross through the runtime snapshot.
 //
 // The snapshot is a display projection only. The session keeps the real
-// history, request context, effort, and usage; the TUI renders the snapshot
-// and nothing else.
+// history, request context, effort, and usage; this package renders the
+// snapshot and nothing else.
 
 import "core:fmt"
 import "core:mem"
