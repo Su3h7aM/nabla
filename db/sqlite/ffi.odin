@@ -112,6 +112,13 @@ foreign lib {
 	column_bytes :: proc(stmt: ^sqlite3_stmt, i: c.int) -> c.int ---
 
 	extended_errcode :: proc(db: ^sqlite3) -> c.int ---
+	errcode :: proc(db: ^sqlite3) -> Result_Code ---
 	errmsg :: proc(db: ^sqlite3) -> cstring ---
 	get_autocommit :: proc(db: ^sqlite3) -> c.int ---
+
+	// These two are not called by the backend. They exist for the
+	// fault-injection test in sqlite_test.odin, which has to make a column read
+	// fail the way a real out-of-memory condition does.
+	memory_used :: proc() -> sqlite3_int64 ---
+	hard_heap_limit64 :: proc(limit: sqlite3_int64) -> sqlite3_int64 ---
 }

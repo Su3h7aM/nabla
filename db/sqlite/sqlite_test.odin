@@ -2,6 +2,8 @@
 #+private file
 package sqlite
 
+import "base:runtime"
+
 import "core:math"
 import "core:mem"
 import "core:os"
@@ -829,4 +831,169 @@ _scalar_i64 :: proc(t: ^testing.T, conn: ^db.Conn, sql: string) -> i64 {
 	value, value_err := db.as_i64(values[0])
 	_expect_ok(t, value_err)
 	return value
+}
+
+@(test)
+test_a_failed_path_allocation_does_not_open_a_database :: proc(t: ^testing.T) {
+	// The path is handed to SQLite as a C string, and making one allocates. If
+	// that allocation failed quietly, SQLite would be handed a null filename
+	// and open a private temporary database instead of the one asked for.
+	ambient := context.temp_allocator
+	defer context.temp_allocator = ambient
+	context.temp_allocator = mem.Allocator {
+		procedure = failing_allocate,
+	}
+
+	conn: db.Conn
+	_expect_failure(t, open(&conn, {path = "nabla-should-not-exist.db"}), .Out_Of_Memory)
+
+	// The refusal happened before anything was published, so the handle is
+	// still closed.
+	testing.expect_value(t, db.error_kind(db.exec(&conn, "SELECT 1")), db.Error_Kind.Invalid_State)
+}
+
+failing_allocate :: proc(
+	_: rawptr,
+	_: mem.Allocator_Mode,
+	_, _: int,
+	_: rawptr,
+	_: int,
+	_: runtime.Source_Code_Location = #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	return nil, .Out_Of_Memory
+}
+
+@(test)
+test_rejecting_trailing_sql_has_no_effect :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	testing.expect(t, _foreign_keys(&conn), "the test connection starts with foreign keys on")
+
+	// Some pragmas run while a statement is compiled, so the refused tail of a
+	// multi-statement string must never reach the compiler.
+	_expect_failure(t, db.exec(&conn, "SELECT 1; PRAGMA foreign_keys = OFF"), .Invalid_Argument)
+	testing.expect(t, _foreign_keys(&conn), "refused input must not change the connection")
+
+	_expect_failure(t, db.exec(&conn, "SELECT 1; CREATE TABLE sneaky (x)"), .Invalid_Argument)
+	_expect_failure(t, db.exec(&conn, "INSERT INTO sneaky VALUES (1)"), .Backend)
+}
+
+_foreign_keys :: proc(conn: ^db.Conn) -> bool {
+	rows: db.Rows
+	if db.query(conn, &rows, "PRAGMA foreign_keys") != nil { return false }
+	defer db.rows_close(&rows)
+
+	values, has_row, err := db.rows_next(&rows)
+	if err != nil || !has_row { return false }
+	on, _ := db.as_bool(values[0])
+	return on
+}
+
+@(test)
+test_prepared_columns_follow_the_schema_the_rows_come_from :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (a INTEGER)"))
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (1)"))
+
+	stmt: db.Statement
+	_expect_ok(t, db.prepare(&conn, &stmt, "SELECT * FROM t"))
+	defer db.statement_close(&stmt)
+
+	// SELECT * changes meaning with the table, and SQLite recompiles a
+	// statement against the new schema when it first steps. The columns a set
+	// reports have to be the ones its rows actually have.
+	_expect_ok(t, db.exec(&conn, "ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 2"))
+
+	rows: db.Rows
+	_expect_ok(t, db.statement_query(&stmt, &rows))
+	values, has_row, err := db.rows_next(&rows)
+	_expect_ok(t, err)
+	testing.expect(t, has_row, "expected a row")
+	testing.expect_value(t, len(values), 2)
+	b, b_err := db.as_i64(values[1])
+	_expect_ok(t, b_err)
+	testing.expect_value(t, b, i64(2))
+	_expect_ok(t, db.rows_close(&rows))
+
+	// The same in the other direction: the table has one column again, and a
+	// buffer sized for two would hand back a NULL that is not there.
+	_expect_ok(t, db.exec(&conn, "ALTER TABLE t DROP COLUMN b"))
+
+	shrunk: db.Rows
+	_expect_ok(t, db.statement_query(&stmt, &shrunk))
+	shrunk_values, shrunk_row, shrunk_err := db.rows_next(&shrunk)
+	_expect_ok(t, shrunk_err)
+	testing.expect(t, shrunk_row, "expected a row")
+	testing.expect_value(t, len(shrunk_values), 1)
+	a, a_err := db.as_i64(shrunk_values[0])
+	_expect_ok(t, a_err)
+	testing.expect_value(t, a, i64(1))
+	_expect_ok(t, db.rows_close(&shrunk))
+}
+
+@(test)
+test_a_column_that_cannot_be_read_reports_out_of_memory :: proc(t: ^testing.T) {
+	// The heap limit that forces a column read to fail belongs to the whole
+	// process, so the scenario runs in a child of this same test binary,
+	// filtered down to the child case, instead of racing every other test's
+	// allocations. In this process the test is a no-op.
+	if len(os.get_env("NABLA_DB_OOM_CHILD", context.temp_allocator)) > 0 {
+		_read_column_with_no_memory_left(t)
+		return
+	}
+
+	binary := os.args[0]
+	current_env, env_err := os.environ(context.temp_allocator)
+	if env_err != nil { testing.fail_now(t, "could not read the environment") }
+	child_env := make([dynamic]string, 0, len(current_env) + 1, context.temp_allocator)
+	append(&child_env, ..current_env)
+	append(&child_env, "NABLA_DB_OOM_CHILD=1")
+	defer delete(child_env)
+
+	state, _, stderr, process_err := os.process_exec(
+		{command = {binary, "-tests:sqlite.test_a_column_that_cannot_be_read_reports_out_of_memory"}, env = child_env[:]},
+		context.temp_allocator,
+	)
+	if process_err != nil { testing.fail_now(t, "could not run the child test binary") }
+	testing.expectf(t, state.exit_code == 0, "the child run failed:\n%s", string(stderr))
+}
+
+_read_column_with_no_memory_left :: proc(t: ^testing.T) {
+	conn: db.Conn
+	_expect_ok(t, open(&conn, {path = ":memory:"}))
+	defer db.close(&conn)
+
+	// The encoding has to be chosen before the schema exists. Every text value
+	// is then stored as UTF-16, and reading one has to convert, which is the
+	// one read in this backend that can fail.
+	_expect_ok(t, db.exec(&conn, "PRAGMA encoding = 'UTF-16le'"))
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (v TEXT)"))
+	text := strings.repeat("x", 1000)
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (?), (?)", {db.Value(text), db.Value(text)}))
+
+	rows: db.Rows
+	_expect_ok(t, db.query(&conn, &rows, "SELECT v FROM t"))
+
+	// The first row is stepped to and read with memory to spare, so that the
+	// only allocation between this point and the next read is its conversion.
+	_, has_row, first_err := db.rows_next(&rows)
+	_expect_ok(t, first_err)
+	testing.expect(t, has_row, "expected the first row")
+
+	// A heap limit at the memory in use leaves nothing for the next
+	// conversion, which SQLite reports as the same null pointer it uses for a
+	// value that is not there.
+	hard_heap_limit64(memory_used())
+	_, _, err := db.rows_next(&rows)
+	hard_heap_limit64(0)
+
+	testing.expect(t, err != nil, "the second row should not have been readable")
+	testing.expect_value(t, db.error_kind(err), db.Error_Kind.Out_Of_Memory)
+	_expect_ok(t, db.rows_close(&rows))
 }

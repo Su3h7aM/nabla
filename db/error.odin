@@ -23,9 +23,13 @@ Error_Kind :: enum {
 	Out_Of_Range,
 	// A UNIQUE, NOT NULL, CHECK, or FOREIGN KEY constraint rejected the row.
 	Constraint,
-	// Another connection holds a lock, or the database is being written by
-	// someone else. The same call may work after the other side finishes.
+	// Another connection holds the database file, so the same call may work
+	// once that connection finishes.
 	Busy,
+	// A table inside the database is locked rather than the file, which needs
+	// shared cache. The holder can be this connection, so retrying the same
+	// call is not the answer the way it can be for Busy.
+	Locked,
 	// The database or the file was opened read-only.
 	Read_Only,
 	Out_Of_Memory,

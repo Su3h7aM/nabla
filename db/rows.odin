@@ -11,35 +11,31 @@ package db
 // The zero value is a closed set. A live Rows must not be copied or moved: the
 // connection holds its address as the one execution currently running.
 Rows :: struct {
-	conn:       ^Conn,
-	stmt_state: rawptr,
-	owns_stmt:  bool,
-	state:      rawptr,
-	values:     []Value,
+	conn:        ^Conn,
+	stmt_state:  rawptr,
+	owns_stmt:   bool,
+
+	// materialize says whether the caller wants the row values. An execution
+	// whose rows are discarded allocates no buffer and reads no rows.
+	materialize: bool,
+	state:       rawptr,
+	values:      []Value,
 }
 
 // rows_execute starts one execution of the statement already prepared for rows.
 // materialize decides whether the caller gets the row values; exec passes false
-// so a statement that returns rows nobody asked for costs no buffer.
+// so a statement that returns rows nobody asked for allocates nothing.
 //
 // A failure leaves no execution running, so a caller that gives up here has
 // nothing to finish.
 @(private)
 rows_execute :: proc(rows: ^Rows, args: []Value, materialize: bool) -> Error {
 	conn := rows.conn
-	state, columns, err := conn.driver.execute(rows.stmt_state, args)
+	state, err := conn.driver.execute(rows.stmt_state, args)
 	if err != nil { return err }
 
 	rows.state = state
-	if materialize && columns > 0 {
-		values, alloc_err := make([]Value, columns, conn.allocator)
-		if alloc_err != nil {
-			conn.driver.execution_finish(state)
-			rows.state = nil
-			return error_make(.Out_Of_Memory, 0, "row buffer allocation failed")
-		}
-		rows.values = values
-	}
+	rows.materialize = materialize
 	conn.active = rows
 	return nil
 }
@@ -60,17 +56,45 @@ rows_next :: proc(rows: ^Rows) -> (values: []Value, has_row: bool, err: Error) {
 	if rows.state == nil {
 		return nil, false, error_make(.Invalid_State, 0, "no result set is open")
 	}
+	conn := rows.conn
 
-	row_err: Error
-	has_row, row_err = rows.conn.driver.next(rows.state, rows.values)
-	if has_row { return rows.values, true, nil }
+	stepped, next_err := conn.driver.next(rows.state)
+	if stepped {
+		if rows.materialize {
+			if rows.values == nil {
+				// The buffer is not sized until the first row has been stepped
+				// to: a backend can only settle on the result's shape while
+				// stepping, and a buffer sized before that can disagree with
+				// the rows it is about to hold.
+				buffer, alloc_err := make([]Value, conn.driver.columns(rows.state), conn.allocator)
+				if alloc_err != nil {
+					conn.driver.execution_finish(rows.state)
+					rows_release(rows)
+					return nil, false, error_make(.Out_Of_Memory, 0, "row buffer allocation failed")
+				}
+				rows.values = buffer
+			}
+			if row_err := conn.driver.row(rows.state, rows.values); row_err != nil {
+				// A row that cannot be read is an end: nothing behind it is
+				// trustworthy, and the execution is over either way.
+				finish_err := conn.driver.execution_finish(rows.state)
+				first := row_err
+				if first == nil { first = finish_err }
+				rows_release(rows)
+				return nil, false, first
+			}
+			return rows.values, true, nil
+		}
+		// The caller is draining, not reading, so there is nothing to hand over.
+		return nil, true, nil
+	}
 
 	// Out of rows, or a statement that failed. Both end the execution, and both
 	// can report one more failure on the way out: reset is where SQLite commits
 	// an implicit transaction, so a statement that stepped cleanly can still
 	// fail here. An error from the row itself is the one worth keeping.
-	finish_err := rows.conn.driver.execution_finish(rows.state)
-	first := row_err
+	finish_err := conn.driver.execution_finish(rows.state)
+	first := next_err
 	if first == nil { first = finish_err }
 	rows_release(rows)
 	return nil, false, first

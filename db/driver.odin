@@ -33,25 +33,37 @@ Driver :: struct {
 	// that promise by always resetting through execution_finish first.
 	finalize:         proc(stmt: rawptr),
 
-	// execute binds args and starts one execution of stmt. args are borrowed
-	// for the duration of the call; a backend must copy or consume them before
-	// returning. columns is how many columns the execution yields.
+	// execute binds args to stmt and starts one execution of it. args are
+	// borrowed for the duration of the call; a backend must copy or consume
+	// them before returning. The returned state is what columns, next, row,
+	// and execution_finish run on.
 	//
 	// A wrong argument count or a value the statement cannot take is reported
 	// here rather than left for the first call to next.
-	execute:          proc(stmt: rawptr, args: []Value) -> (rows: rawptr, columns: int, err: Error),
+	execute:          proc(stmt: rawptr, args: []Value) -> (rows: rawptr, err: Error),
 
-	// next advances the execution to its following row and fills values, which
-	// is exactly columns long. It reports false with a nil error at a clean
-	// end, and false with an error when the statement failed. An empty values
-	// slice means the caller does not want the row, which is how exec avoids
-	// materializing anything.
+	// columns reports how many columns the execution yields. It is read after
+	// the first next has stepped, because a backend may only settle on the
+	// result's shape while stepping: SQLite recompiles a statement against a
+	// changed schema on its first step, and a count taken before that is the
+	// shape of the schema the statement was prepared under.
+	columns:          proc(rows: rawptr) -> int,
+
+	// next steps the execution to its following row. It reports false with a
+	// nil error at a clean end, and false with an error when the statement
+	// failed. It fills nothing.
+	next:             proc(rows: rawptr) -> (has_row: bool, err: Error),
+
+	// row copies the row the execution is stopped on into values, which is as
+	// long as columns reported for this execution. It runs only for rows a
+	// caller asked for, so an execution whose rows are discarded never pays
+	// for reading them.
 	//
 	// Each value is written in the column's own storage class rather than
 	// converted, so a value's as_* conversions are the only place a type is
 	// decided. A string or blob written here stays borrowed until the next row
 	// or the end of the execution.
-	next:             proc(rows: rawptr, values: []Value) -> (has_row: bool, err: Error),
+	row:              proc(rows: rawptr, values: []Value) -> Error,
 
 	// execution_finish ends the execution and returns the statement to its
 	// prepared state, releasing any implicit transaction it left open. It is

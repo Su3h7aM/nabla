@@ -15,7 +15,9 @@ Fake_Calls :: struct {
 	prepare:  int,
 	finalize: int,
 	execute:  int,
+	columns:  int,
 	next:     int,
+	row:      int,
 	finish:   int,
 	begin:    int,
 	commit:   int,
@@ -31,10 +33,15 @@ Fake_Conn :: struct {
 	fail_prepare:  Error,
 	fail_execute:  Error,
 	fail_next:     Error,
+	fail_row:      Error,
 	fail_finish:   Error,
 	fail_begin:    Error,
 	fail_commit:   Error,
 	fail_rollback: Error,
+
+	// prepared is the statement the last prepare returned, so a test can change
+	// what a running execution reports about itself.
+	prepared:      ^Fake_Stmt,
 }
 
 Fake_Stmt :: struct {
@@ -42,7 +49,10 @@ Fake_Stmt :: struct {
 	conn:       ^Fake_Conn,
 	parameters: int,
 	columns:    int,
-	row:        int,
+
+	// stepped is how many rows this execution has stepped to so far, so it is
+	// also the index of the current row plus one.
+	stepped:    int,
 }
 
 fake_rows := [][]Value{{Value(i64(1)), Value("first")}, {Value(i64(2)), Value("second")}}
@@ -52,7 +62,9 @@ FAKE_DRIVER: Driver = {
 	prepare          = fake_prepare,
 	finalize         = fake_finalize,
 	execute          = fake_execute,
+	columns          = fake_columns,
 	next             = fake_next,
+	row              = fake_row,
 	execution_finish = fake_finish,
 	begin            = fake_begin,
 	commit           = fake_commit,
@@ -79,6 +91,7 @@ fake_prepare :: proc(state: rawptr, sql: string) -> (rawptr, Error) {
 		parameters = 0,
 		columns    = 2,
 	}
+	conn.prepared = stmt
 	return rawptr(stmt), nil
 }
 
@@ -88,33 +101,46 @@ fake_finalize :: proc(state: rawptr) {
 	free(stmt)
 }
 
-fake_execute :: proc(state: rawptr, args: []Value) -> (rawptr, int, Error) {
+fake_execute :: proc(state: rawptr, args: []Value) -> (rawptr, Error) {
 	stmt := cast(^Fake_Stmt)state
 	stmt.calls.execute += 1
-	if stmt.conn.fail_execute != nil { return nil, 0, stmt.conn.fail_execute }
+	if stmt.conn.fail_execute != nil { return nil, stmt.conn.fail_execute }
 	if len(args) != stmt.parameters {
-		return nil, 0, error_make(.Invalid_Argument, 0, "wrong number of parameters")
+		return nil, error_make(.Invalid_Argument, 0, "wrong number of parameters")
 	}
-	return rawptr(stmt), stmt.columns, nil
+	return rawptr(stmt), nil
 }
 
-fake_next :: proc(state: rawptr, values: []Value) -> (bool, Error) {
+fake_columns :: proc(state: rawptr) -> int {
+	stmt := cast(^Fake_Stmt)state
+	stmt.calls.columns += 1
+	return stmt.columns
+}
+
+fake_next :: proc(state: rawptr) -> (bool, Error) {
 	stmt := cast(^Fake_Stmt)state
 	stmt.calls.next += 1
 	if stmt.conn.fail_next != nil { return false, stmt.conn.fail_next }
-	if stmt.row >= len(fake_rows) { return false, nil }
-
-	for _, i in values {
-		values[i] = fake_rows[stmt.row][i]
-	}
-	stmt.row += 1
+	if stmt.stepped >= len(fake_rows) { return false, nil }
+	stmt.stepped += 1
 	return true, nil
+}
+
+fake_row :: proc(state: rawptr, values: []Value) -> Error {
+	stmt := cast(^Fake_Stmt)state
+	stmt.calls.row += 1
+	if stmt.conn.fail_row != nil { return stmt.conn.fail_row }
+	current := fake_rows[stmt.stepped - 1]
+	for value, i in current {
+		if i < len(values) { values[i] = value }
+	}
+	return nil
 }
 
 fake_finish :: proc(state: rawptr) -> Error {
 	stmt := cast(^Fake_Stmt)state
 	stmt.calls.finish += 1
-	stmt.row = 0
+	stmt.stepped = 0
 	return stmt.conn.fail_finish
 }
 
@@ -690,4 +716,81 @@ test_statements_release_in_any_order :: proc(t: ^testing.T) {
 	// Releasing one twice reaches nothing the second time.
 	_expect_ok(t, statement_close(&first))
 	testing.expect_value(t, calls.finalize, 3)
+}
+
+@(test)
+test_discarded_rows_are_never_read :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	conn: Conn
+	_fake_open(&conn, &calls)
+	defer close(&conn)
+
+	// exec runs a statement that yields rows nobody asked for. Reading them
+	// would be work with no buyer, so the backend is never asked for a row or
+	// its shape.
+	_expect_ok(t, exec(&conn, "SELECT a, b"))
+	testing.expect_value(t, calls.execute, 1)
+	testing.expect_value(t, calls.next, len(fake_rows) + 1)
+	testing.expect_value(t, calls.columns, 0)
+	testing.expect_value(t, calls.row, 0)
+}
+
+@(test)
+test_the_row_buffer_is_sized_when_the_first_row_arrives :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	conn: Conn
+	fake := _fake_open(&conn, &calls)
+	defer close(&conn)
+
+	stmt: Statement
+	_expect_ok(t, prepare(&conn, &stmt, "SELECT a, b"))
+
+	rows: Rows
+	_expect_ok(t, statement_query(&stmt, &rows))
+	testing.expect_value(t, calls.columns, 0)
+
+	// A backend can only settle on the result's shape while stepping, so the
+	// buffer is asked for at the first row rather than at execute. A count
+	// that changed in between is what the rows follow.
+	fake.prepared.columns = 3
+	values, has_row, err := rows_next(&rows)
+	_expect_ok(t, err)
+	testing.expect(t, has_row, "expected a row")
+	testing.expect_value(t, len(values), 3)
+	index, _ := as_i64(values[0])
+	testing.expect_value(t, index, i64(1))
+	testing.expect_value(t, calls.columns, 1)
+	testing.expect_value(t, calls.next, 1)
+
+	// The buffer is asked for once per execution, not once per row.
+	_, has_row, err = rows_next(&rows)
+	_expect_ok(t, err)
+	testing.expect(t, has_row, "expected the second row")
+	testing.expect_value(t, calls.columns, 1)
+
+	_expect_ok(t, rows_close(&rows))
+}
+
+@(test)
+test_a_row_that_cannot_be_read_ends_the_set :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	conn: Conn
+	fake := _fake_open(&conn, &calls)
+	defer close(&conn)
+
+	fake.fail_row = error_make(.Out_Of_Memory, 7, "the row could not be read")
+
+	rows: Rows
+	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+
+	_, has_row, err := rows_next(&rows)
+	testing.expect(t, !has_row, "a row that cannot be read is not a row")
+	testing.expect_value(t, error_kind(err), Error_Kind.Out_Of_Memory)
+
+	// The execution is over and the statement released, so the connection is
+	// free even though nothing was closed.
+	testing.expect_value(t, calls.finish, 1)
+	testing.expect_value(t, calls.finalize, 1)
+	_expect_ok(t, begin(&conn))
+	_expect_ok(t, rollback(&conn))
 }

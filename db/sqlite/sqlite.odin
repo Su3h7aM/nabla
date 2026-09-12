@@ -93,7 +93,9 @@ DRIVER: db.Driver = {
 	prepare          = stmt_prepare,
 	finalize         = stmt_finalize,
 	execute          = stmt_execute,
+	columns          = stmt_columns,
 	next             = execution_next,
+	row              = execution_row,
 	execution_finish = execution_finish,
 	begin            = conn_begin,
 	commit           = conn_commit,
@@ -118,7 +120,14 @@ open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> 
 	}
 	state.allocator = allocator
 
-	path := strings.clone_to_cstring(config.path, context.temp_allocator)
+	path, path_err := strings.clone_to_cstring(config.path, context.temp_allocator)
+	if path_err != nil {
+		// A nil filename is a database, not a failure: SQLite opens a private
+		// temporary one, so a dropped error here would quietly write somewhere
+		// the caller never asked for.
+		free(state, allocator)
+		return db.error_make(.Out_Of_Memory, 0, "database path allocation failed")
+	}
 	rc := open_v2(path, &state.handle, c.int(OPEN_READWRITE | OPEN_CREATE), nil)
 	if rc != .OK {
 		// open_v2 returns a handle even when it fails, and that handle still
@@ -197,7 +206,7 @@ stmt_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
 		// An empty string or a lone comment compiles to no statement at all.
 		return nil, db.error_make(.Invalid_Argument, 0, "SQL contains no statement")
 	}
-	if tail_holds_more_sql(conn, sql, tail) {
+	if tail_holds_more_sql(sql, tail) {
 		finalize(handle)
 		return nil, db.error_make(.Invalid_Argument, 0, "SQL contains more than one statement")
 	}
@@ -215,14 +224,16 @@ stmt_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
 }
 
 // tail_holds_more_sql reports whether anything after the statement prepare_v3
-// compiled is another statement, or something SQLite will not accept at all.
+// compiled is another statement, or something SQLite would refuse.
 //
-// The test is to compile the remainder. SQLite already knows that `; -- done`
-// ends the input while `; SELECT 2` does not, so asking it is exact where
-// looking for semicolons would only approximate. A remainder that is nothing
-// compiles to nothing.
+// The remainder is scanned rather than handed back to SQLite: preparing it
+// would execute pragmas that take effect during compilation, so validating
+// input must never have an effect on the connection. The scan accepts what
+// SQLite accepts after a complete statement, which is whitespace, statement
+// separators, and comments, and refuses everything else. A comment that never
+// ends is accepted, which matches how SQLite reads one.
 @(private)
-tail_holds_more_sql :: proc(conn: ^Conn, sql: string, tail: cstring) -> bool {
+tail_holds_more_sql :: proc(sql: string, tail: cstring) -> bool {
 	if tail == nil { return false }
 
 	// SAFETY: prepare_v3 documents tail as pointing into the SQL text it was
@@ -230,20 +241,36 @@ tail_holds_more_sql :: proc(conn: ^Conn, sql: string, tail: cstring) -> bool {
 	// the assumption does not hold, and the caller refuses rather than guesses.
 	offset := int(transmute(uintptr)tail - uintptr(raw_data(sql)))
 	if offset < 0 || offset > len(sql) { return true }
-	if offset == len(sql) { return false }
 
 	rest := sql[offset:]
-	extra: ^sqlite3_stmt
-	// SAFETY: rest is a non-empty suffix of sql's live buffer, so it is readable
-	// for its own length and needs no terminator of its own.
-	rc := prepare_v3(conn.handle, cstring(raw_data(rest)), c.int(len(rest)), 0, &extra, nil)
-	if extra != nil {
-		finalize(extra)
-		return true
+	i := 0
+	for i < len(rest) {
+		switch rest[i] {
+		case ' ', '\t', '\n', '\r', '\f', '\v', ';':
+			i += 1
+		case '-':
+			if i + 1 < len(rest) && rest[i + 1] == '-' {
+				// A line comment runs to the end of its line.
+				for i < len(rest) && rest[i] != '\n' { i += 1 }
+			} else {
+				return true
+			}
+		case '/':
+			if i + 1 < len(rest) && rest[i + 1] == '*' {
+				i += 2
+				for {
+					if i + 1 >= len(rest) { return false }
+					if rest[i] == '*' && rest[i + 1] == '/' { i += 2; break }
+					i += 1
+				}
+			} else {
+				return true
+			}
+		case:
+			return true
+		}
 	}
-	// A remainder that will not compile is still something the caller put after
-	// a complete statement, so refusing is safer than dropping it.
-	return rc != .OK
+	return false
 }
 
 @(private)
@@ -254,21 +281,31 @@ stmt_finalize :: proc(state: rawptr) {
 }
 
 @(private)
-stmt_execute :: proc(state: rawptr, args: []db.Value) -> (rawptr, int, db.Error) {
+stmt_execute :: proc(state: rawptr, args: []db.Value) -> (rawptr, db.Error) {
 	stmt := cast(^Stmt)state
 	if expected := int(bind_parameter_count(stmt.handle)); len(args) != expected {
 		scratch: [64]u8
 		message := fmt.bprintf(scratch[:], "statement argument count: expected %d, got %d", expected, len(args))
-		return nil, 0, db.error_make(.Invalid_Argument, 0, message)
+		return nil, db.error_make(.Invalid_Argument, 0, message)
 	}
 	for arg, i in args {
 		if bind_err := bind(stmt, c.int(i + 1), arg); bind_err != nil {
-			return nil, 0, bind_err
+			return nil, bind_err
 		}
 	}
 	// SQLite holds the cursor and the bindings inside the statement, so the
 	// statement is the whole execution state.
-	return rawptr(stmt), int(column_count(stmt.handle)), nil
+	return rawptr(stmt), nil
+}
+
+// stmt_columns reports how many columns the current execution yields. It is
+// read after the first row has been stepped to: SQLite can recompile a
+// statement against a changed schema on its first step, and only the count
+// from after that is the count the rows ahead actually have.
+@(private)
+stmt_columns :: proc(state: rawptr) -> int {
+	stmt := cast(^Stmt)state
+	return int(column_count(stmt.handle))
 }
 
 @(private)
@@ -309,20 +346,24 @@ bind :: proc(stmt: ^Stmt, index: c.int, value: db.Value) -> db.Error {
 }
 
 @(private)
-execution_next :: proc(state: rawptr, values: []db.Value) -> (has_row: bool, err: db.Error) {
+execution_next :: proc(state: rawptr) -> (has_row: bool, err: db.Error) {
 	stmt := cast(^Stmt)state
 	rc := step(stmt.handle)
 	#partial switch rc {
 	case .Row:
-		if fill_err := fill(stmt, values); fill_err != nil {
-			return false, fill_err
-		}
 		return true, nil
 	case .Done:
 		return false, nil
 	case:
 		return false, failure(stmt.conn.handle, rc)
 	}
+}
+
+// execution_row copies the row the execution is stopped on into values, which
+// is as long as stmt_columns reported for this execution.
+@(private)
+execution_row :: proc(state: rawptr, values: []db.Value) -> db.Error {
+	return fill(cast(^Stmt)state, values)
 }
 
 @(private)
@@ -338,12 +379,12 @@ execution_finish :: proc(state: rawptr) -> db.Error {
 }
 
 // fill copies one row out of the statement. The storage class chooses the
-// accessor, so no value is ever converted and no pointer read earlier in this
-// row is invalidated by a later one.
+// accessor, so nothing this side of the boundary ever converts a value.
 //
 // It can fail. The text and blob accessors allocate when the column is not
 // already stored in the encoding being asked for, and SQLite reports that by
-// handing back the same null pointer it uses for a value that is not there.
+// handing back the same null pointer it uses for a value that is not there;
+// errcode is the only thing that tells those two apart.
 @(private)
 fill :: proc(stmt: ^Stmt, values: []db.Value) -> db.Error {
 	for _, i in values {
@@ -354,34 +395,33 @@ fill :: proc(stmt: ^Stmt, values: []db.Value) -> db.Error {
 		case .Float:
 			values[i] = column_double(stmt.handle, column)
 		case .Text:
-			// Length before pointer, the order SQLite documents: asking for the
-			// pointer first can convert the value and leave the two disagreeing.
-			length := int(column_bytes(stmt.handle, column))
+			// The pointer is read before the length, the order SQLite documents
+			// as the safe one: asking for the pointer is what forces any
+			// conversion, so the length after it agrees with it. A null pointer
+			// from that call is a failed conversion until errcode says
+			// otherwise, and errcode has to be read at once, before anything
+			// else touches the connection.
 			text := column_text(stmt.handle, column)
 			if text == nil {
-				// column_type already ruled out NULL, so an empty value is the
-				// only other thing a null pointer can mean. Bytes behind it mean
-				// the conversion itself ran out of memory.
-				if length != 0 {
+				if errcode(stmt.conn.handle) == .No_Mem {
 					return db.error_make(.Out_Of_Memory, 0, "text column could not be read")
 				}
+				// The column cannot be NULL here, so nothing behind the pointer
+				// means an empty value; len is the truth.
 				values[i] = ""
 				continue
 			}
-			values[i] = string(text[:length])
+			values[i] = string(text[:int(column_bytes(stmt.handle, column))])
 		case .Blob:
-			// A zero-length blob is documented to come back as a null pointer,
-			// so bytes behind one mean the read ran out of memory.
-			length := int(column_bytes(stmt.handle, column))
 			blob := column_blob(stmt.handle, column)
 			if blob == nil {
-				if length != 0 {
+				if errcode(stmt.conn.handle) == .No_Mem {
 					return db.error_make(.Out_Of_Memory, 0, "blob column could not be read")
 				}
 				values[i] = []u8{}
 				continue
 			}
-			values[i] = ([^]u8)(blob)[:length]
+			values[i] = ([^]u8)(blob)[:int(column_bytes(stmt.handle, column))]
 		case .Null:
 			values[i] = nil
 		}
@@ -461,12 +501,15 @@ classify :: proc(rc: Result_Code) -> db.Error_Kind {
 		return .None
 	case .Constraint:
 		return .Constraint
-	case .Busy, .Locked:
-		// SQLite separates "someone else holds the database" from "a table is
-		// locked within this one", and the second needs shared cache, which
-		// this backend never turns on. Both are a lock in the way, and waiting
-		// is the only thing a caller can do about either.
+	case .Busy:
+		// Another connection holds the database file, so the same call can work
+		// once that connection finishes.
 		return .Busy
+	case .Locked:
+		// A table inside the database is locked, which needs shared cache. The
+		// holder can be this very connection, so unlike Busy, waiting is not
+		// guaranteed to help.
+		return .Locked
 	case .Read_Only:
 		return .Read_Only
 	case .No_Mem:
