@@ -30,6 +30,7 @@ package sqlite
 
 import "core:c"
 import "core:fmt"
+import "core:math"
 import "core:mem"
 import "core:strings"
 
@@ -182,7 +183,7 @@ stmt_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
 		// An empty string or a lone comment compiles to no statement at all.
 		return nil, db.error_make(.Invalid_Argument, 0, "SQL contains no statement")
 	}
-	if !tail_is_blank(sql, tail) {
+	if tail_holds_more_sql(conn, sql, tail) {
 		finalize(handle)
 		return nil, db.error_make(.Invalid_Argument, 0, "SQL contains more than one statement")
 	}
@@ -199,26 +200,36 @@ stmt_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
 	return rawptr(statement), nil
 }
 
-// tail_is_blank reports whether tail, which prepare_v3 sets to the first byte
-// past the statement it compiled, holds nothing but a terminator and
-// whitespace. Anything else is a second statement, which would otherwise be
-// dropped without a word.
+// tail_holds_more_sql reports whether anything after the statement prepare_v3
+// compiled is another statement, or something SQLite will not accept at all.
+//
+// The test is to compile the remainder. SQLite already knows that `; -- done`
+// ends the input while `; SELECT 2` does not, so asking it is exact where
+// looking for semicolons would only approximate. A remainder that is nothing
+// compiles to nothing.
 @(private)
-tail_is_blank :: proc(sql: string, tail: cstring) -> bool {
-	if tail == nil { return true }
+tail_holds_more_sql :: proc(conn: ^Conn, sql: string, tail: cstring) -> bool {
+	if tail == nil { return false }
+
 	// SAFETY: prepare_v3 documents tail as pointing into the SQL text it was
 	// given, so the difference is an offset into sql. A value outside it means
-	// the assumption does not hold, and the check refuses rather than guesses.
+	// the assumption does not hold, and the caller refuses rather than guesses.
 	offset := int(transmute(uintptr)tail - uintptr(raw_data(sql)))
-	if offset < 0 || offset > len(sql) { return false }
-	for i := offset; i < len(sql); i += 1 {
-		switch sql[i] {
-		case ' ', '\t', '\r', '\n', ';':
-		case:
-			return false
-		}
+	if offset < 0 || offset > len(sql) { return true }
+	if offset == len(sql) { return false }
+
+	rest := sql[offset:]
+	extra: ^sqlite3_stmt
+	// SAFETY: rest is a non-empty suffix of sql's live buffer, so it is readable
+	// for its own length and needs no terminator of its own.
+	rc := prepare_v3(conn.handle, cstring(raw_data(rest)), c.int(len(rest)), 0, &extra, nil)
+	if extra != nil {
+		finalize(extra)
+		return true
 	}
-	return true
+	// A remainder that will not compile is still something the caller put after
+	// a complete statement, so refusing is safer than dropping it.
+	return rc != .OK
 }
 
 @(private)
@@ -255,6 +266,12 @@ bind :: proc(stmt: ^Stmt, index: c.int, value: db.Value) -> db.Error {
 	case i64:
 		rc = bind_int64(stmt.handle, index, v)
 	case f64:
+		// SQLite has no NaN and stores one as NULL, which would lose the value
+		// without saying so. An infinity is a value it can hold, so only NaN is
+		// refused; a caller that wants NULL passes nil.
+		if math.is_nan(v) {
+			return db.error_make(.Invalid_Argument, 0, "NaN has no SQL value; bind nil for NULL")
+		}
 		rc = bind_double(stmt.handle, index, v)
 	case bool:
 		rc = bind_int64(stmt.handle, index, 1 if v else 0)

@@ -2,6 +2,7 @@
 #+private file
 package sqlite
 
+import "core:math"
 import "core:mem"
 import "core:os"
 import "core:slice"
@@ -206,6 +207,9 @@ test_one_statement_per_call :: proc(t: ^testing.T) {
 	// backend refuses rather than run half of what was written.
 	_expect_failure(t, db.exec(&conn, "SELECT 1; SELECT 2"), .Invalid_Argument)
 	_expect_failure(t, db.exec(&conn, "CREATE TABLE t (a INTEGER); DROP TABLE t"), .Invalid_Argument)
+	_expect_failure(t, db.exec(&conn, "SELECT 1; -- a note\nSELECT 2"), .Invalid_Argument)
+	// A remainder that will not compile is still a remainder.
+	_expect_failure(t, db.exec(&conn, "SELECT 1; SELCT 2"), .Invalid_Argument)
 	_expect_failure(t, db.exec(&conn, ""), .Invalid_Argument)
 	_expect_failure(t, db.exec(&conn, "-- nothing here"), .Invalid_Argument)
 
@@ -213,6 +217,31 @@ test_one_statement_per_call :: proc(t: ^testing.T) {
 	_expect_ok(t, db.exec(&conn, "SELECT 1;"))
 	_expect_ok(t, db.exec(&conn, "  SELECT 1 ; \n\t"))
 	_expect_ok(t, db.exec(&conn, "SELECT 1\n"))
+	_expect_ok(t, db.exec(&conn, "SELECT 1; ;"))
+}
+
+@(test)
+test_a_comment_after_the_terminator_is_not_a_second_statement :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	// The question the backend asks is whether anything after the statement
+	// compiles into another one. A comment does not, so this is one statement
+	// however it is punctuated.
+	_expect_ok(t, db.exec(&conn, "SELECT 1; -- done"))
+	_expect_ok(t, db.exec(&conn, "SELECT 1; /* done */"))
+	_expect_ok(t, db.exec(&conn, "SELECT 1; /* a */ ; /* b */"))
+	_expect_ok(t, db.exec(&conn, "SELECT 1 /* unterminated"))
+	_expect_ok(t, db.exec(&conn, "-- leading\nSELECT 1 -- trailing"))
+
+	rows: db.Rows
+	_expect_ok(t, db.query(&conn, &rows, "SELECT 2; -- and the row still comes back"))
+	defer db.rows_close(&rows)
+	values, has_row, err := db.rows_next(&rows)
+	_expect_ok(t, err)
+	if !testing.expect(t, has_row, "expected a row") { return }
+	two, _ := db.as_i64(values[0])
+	testing.expect_value(t, two, i64(2))
 }
 
 @(test)
@@ -591,4 +620,104 @@ _count :: proc(conn: ^db.Conn) -> i64 {
 	if err != nil || !has_row { return -1 }
 	count, _ := db.as_i64(values[0])
 	return count
+}
+
+@(test)
+test_numeric_extremes_round_trip :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (v)"))
+
+	integers := [?]i64{math.min(i64), math.max(i64), -1, 0}
+	floats := [?]f64{math.max(f64), math.min(f64), math.inf_f64(1), math.inf_f64(-1), 0.5}
+	for value in integers { _expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (?)", {db.Value(value)})) }
+	for value in floats { _expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (?)", {db.Value(value)})) }
+
+	rows: db.Rows
+	_expect_ok(t, db.query(&conn, &rows, "SELECT v FROM t ORDER BY rowid"))
+	defer db.rows_close(&rows)
+
+	for want in integers {
+		values, has_row, err := db.rows_next(&rows)
+		_expect_ok(t, err)
+		if !testing.expect(t, has_row, "expected an integer row") { return }
+		got, _ := db.as_i64(values[0])
+		testing.expect_value(t, got, want)
+	}
+	for want in floats {
+		values, has_row, err := db.rows_next(&rows)
+		_expect_ok(t, err)
+		if !testing.expect(t, has_row, "expected a float row") { return }
+		got, got_err := db.as_f64(values[0])
+		_expect_ok(t, got_err)
+		testing.expect_value(t, got, want)
+	}
+}
+
+@(test)
+test_a_not_a_number_is_refused_rather_than_stored_as_null :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (v)"))
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (?)", {db.Value(f64(1))}))
+
+	// SQLite stores a NaN as NULL, so accepting one would quietly turn a
+	// computed value into a missing one.
+	_expect_failure(t, db.exec(&conn, "INSERT INTO t VALUES (?)", {db.Value(math.nan_f64())}), .Invalid_Argument)
+
+	// Nil is how a caller says NULL.
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (?)", {db.Value(nil)}))
+
+	rows: db.Rows
+	_expect_ok(t, db.query(&conn, &rows, "SELECT v FROM t ORDER BY rowid"))
+	defer db.rows_close(&rows)
+
+	values, has_row, err := db.rows_next(&rows)
+	_expect_ok(t, err)
+	if !testing.expect(t, has_row, "expected the first row") { return }
+	first, _ := db.as_f64(values[0])
+	testing.expect_value(t, first, f64(1))
+
+	values, has_row, err = db.rows_next(&rows)
+	_expect_ok(t, err)
+	if !testing.expect(t, has_row, "expected the second row") { return }
+	testing.expect(t, values[0] == nil, "the bound NULL should read back as SQL NULL")
+}
+
+@(test)
+test_a_pragma_that_reports_a_value_is_readable :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer delete(directory)
+	defer os.remove_all(directory)
+	path := _temp_database(directory)
+	defer delete(path)
+
+	conn: db.Conn
+	_expect_ok(t, open(&conn, {path = path, busy_timeout_ms = 1000}))
+	defer db.close(&conn)
+
+	// The journal mode is not part of Config. It is a pragma, which is ordinary
+	// SQL, and exec runs one without minding that it answers with a row.
+	_expect_ok(t, db.exec(&conn, "PRAGMA journal_mode = WAL"))
+
+	rows: db.Rows
+	defer db.rows_close(&rows)
+	_expect_ok(t, db.query(&conn, &rows, "PRAGMA journal_mode"))
+
+	mode, has_row, err := db.rows_next(&rows)
+	_expect_ok(t, err)
+	if !testing.expect(t, has_row, "PRAGMA journal_mode should report its value") { return }
+	text, text_err := db.as_string(mode[0])
+	_expect_ok(t, text_err)
+	testing.expect_value(t, text, "wal")
+
+	// Reading one row leaves the set open, which is what holds the connection.
+	_expect_ok(t, db.rows_close(&rows))
+
+	// A journal mode outlives the connection that set it, so the setting is the
+	// file's from here on.
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (1)"))
 }
