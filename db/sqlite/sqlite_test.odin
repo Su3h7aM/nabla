@@ -620,6 +620,23 @@ test_a_connection_can_be_closed_and_opened_again :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_refused_open_leaves_no_database_behind :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer delete(directory)
+	defer os.remove_all(directory)
+	path := _temp_database(directory)
+	defer delete(path)
+
+	conn := _open(t)
+	defer db.close(&conn)
+
+	// The refusal happens before SQLite sees the path, so the file a refused
+	// open would have created is still not there.
+	_expect_failure(t, open(&conn, {path = path}), .Invalid_State)
+	testing.expect(t, !os.exists(path), "a refused open must not create the file")
+}
+
+@(test)
 test_another_connection_sees_only_committed_work :: proc(t: ^testing.T) {
 	directory := _temp_directory(t)
 	defer delete(directory)

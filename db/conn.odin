@@ -27,6 +27,13 @@ Conn :: struct {
 	statements: ^Statement,
 }
 
+// conn_is_open reports whether conn already holds a connection. A backend
+// checks it before it allocates state or touches a database, so a refused open
+// leaves nothing behind.
+conn_is_open :: proc(conn: ^Conn) -> bool {
+	return conn.state != nil
+}
+
 // conn_init publishes an open backend connection as a Conn. A backend calls it
 // from its own open procedure, once the connection is usable and configured.
 //
@@ -37,7 +44,7 @@ Conn :: struct {
 // free it. allocator is the one the backend used and the one this package uses
 // for row buffers, so the whole connection has a single owner for its memory.
 conn_init :: proc(conn: ^Conn, driver: ^Driver, state: rawptr, allocator: mem.Allocator) -> Error {
-	if conn.state != nil {
+	if conn_is_open(conn) {
 		return error_make(.Invalid_State, 0, "connection is already open")
 	}
 	conn.driver = driver

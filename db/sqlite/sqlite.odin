@@ -111,6 +111,11 @@ DRIVER: db.Driver = {
 // hands back to this package.
 @(require_results)
 open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> db.Error {
+	// Checked before the path reaches SQLite: open_v2 creates the file, so a
+	// refused open would otherwise leave a database behind.
+	if db.conn_is_open(conn) {
+		return db.error_make(.Invalid_State, 0, "connection is already open")
+	}
 	if config.busy_timeout_ms < 0 {
 		return db.error_make(.Invalid_Argument, 0, "busy_timeout_ms cannot be negative")
 	}
