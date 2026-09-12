@@ -1030,6 +1030,30 @@ handle_event :: proc(app: ^App, event: input.Event) {
 	}
 }
 
+// cancel_or_quit cancels the running request, or exits when nothing is running. A
+// cancel this front-end requested is remembered, so the retirement that follows
+// ends the turn rather than the session.
+cancel_or_quit :: proc(app: ^App) {
+	if runtime_busy(app) {
+		app.cancel_seen = true
+		agent.chat_cancel_request()
+		return
+	}
+	app.quit = true
+}
+
+// interrupt resolves one Ctrl+C press in the order the prompt's state demands:
+// text being composed is discarded first, then a running request is cancelled,
+// and only an empty, idle prompt exits. The first state that applies wins, so a
+// half-written prompt can neither cancel work nor end the session.
+interrupt :: proc(app: ^App) {
+	if len(widgets.input_text(&app.input)) > 0 {
+		widgets.input_clear(&app.input)
+		return
+	}
+	cancel_or_quit(app)
+}
+
 handle_key :: proc(app: ^App, key: input.Key_Event) {
 	switch key.code {
 	case .Enter:
@@ -1073,13 +1097,11 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 	case .Up, .Down:
 	case .Character:
 		if .Control in key.modifiers {
-			if key.character == '\x03' || key.character == '\x04' {
-				if runtime_busy(app) {
-					app.cancel_seen = true
-					agent.chat_cancel_request()
-				} else {
-					app.quit = true
-				}
+			switch key.character {
+			case '\x03':
+				interrupt(app)
+			case '\x04':
+				cancel_or_quit(app)
 			}
 		} else if key.character >= 0x20 && key.character != 0x7f {
 			widgets.input_insert_rune(&app.input, key.character)

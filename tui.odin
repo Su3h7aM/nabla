@@ -249,7 +249,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 	lines := make([dynamic]Line, 0, 64, context.temp_allocator)
 	if len(app.run.snap.entries) == 0 {
 		append(&lines, Line{text = "nabla", style = TITLE_STYLE})
-		append(&lines, Line{text = "escape interrupt | ctrl+c/ctrl+d quit | /model | /effort | /compact", style = HINT_STYLE})
+		append(&lines, Line{text = "escape interrupt | ctrl+c clear/cancel/quit | /model | /effort | /compact", style = HINT_STYLE})
 	} else {
 		for &entry in app.run.snap.entries {
 			emit_entry(&entry, rect.width, &lines)
