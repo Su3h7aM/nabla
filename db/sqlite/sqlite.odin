@@ -498,7 +498,13 @@ failure :: proc(handle: ^sqlite3, rc: Result_Code) -> db.Error {
 		message = string(errmsg(handle))
 		code = extended_errcode(handle)
 	}
-	return db.error_make(classify(rc), i32(code), message)
+	kind := classify(rc)
+	// A stale WAL snapshot is an extended Busy, so the primary code the call
+	// returned cannot tell it from a lock worth waiting out.
+	if kind == .Busy && code == BUSY_SNAPSHOT {
+		kind = .Busy_Snapshot
+	}
+	return db.error_make(kind, i32(code), message)
 }
 
 // classify maps a result code onto db.Error_Kind. Only the kinds a caller can
@@ -511,15 +517,11 @@ classify :: proc(rc: Result_Code) -> db.Error_Kind {
 		return .None
 	case .Constraint:
 		return .Constraint
-	case .Busy:
-		// Another connection holds the database file, so the same call can work
-		// once that connection finishes.
+	case .Busy, .Locked:
+		// Locked needs shared cache or a second live statement on this
+		// connection, neither of which this backend allows, so another
+		// connection holds the file in both cases.
 		return .Busy
-	case .Locked:
-		// A table inside the database is locked, which needs shared cache. The
-		// holder can be this very connection, so unlike Busy, waiting is not
-		// guaranteed to help.
-		return .Locked
 	case .Read_Only:
 		return .Read_Only
 	case .No_Mem:

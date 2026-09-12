@@ -24,13 +24,13 @@ Error_Kind :: enum {
 	Out_Of_Range,
 	// A UNIQUE, NOT NULL, CHECK, or FOREIGN KEY constraint rejected the row.
 	Constraint,
-	// Another connection holds the database file, so the same call may work
-	// once that connection finishes.
+	// Another connection holds the file or is writing to it, so the same call
+	// may work once that connection finishes.
 	Busy,
-	// A table inside the database is locked rather than the file, which needs
-	// shared cache. The holder can be this connection, so retrying the same
-	// call is not the answer the way it can be for Busy.
-	Locked,
+	// A WAL connection tried to write from a snapshot another connection has
+	// already moved past. Running the same call again cannot help: the caller
+	// rolls the transaction back and starts it over.
+	Busy_Snapshot,
 	// The database or the file was opened read-only.
 	Read_Only,
 	Out_Of_Memory,

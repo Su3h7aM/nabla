@@ -416,6 +416,42 @@ test_a_busy_commit_leaves_the_transaction_open :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_stale_wal_snapshot_is_not_a_busy_to_wait_out :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer delete(directory)
+	defer os.remove_all(directory)
+	path := _temp_database(directory)
+	defer delete(path)
+
+	writer: db.Conn
+	_expect_ok(t, open(&writer, {path = path}))
+	defer db.close(&writer)
+	_expect_ok(t, db.exec(&writer, "PRAGMA journal_mode = WAL"))
+	_expect_ok(t, db.exec(&writer, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&writer, "INSERT INTO t VALUES (1)"))
+
+	reader: db.Conn
+	_expect_ok(t, open(&reader, {path = path}))
+	defer db.close(&reader)
+
+	// Reading inside the transaction pins the reader's snapshot, and the writer
+	// then moves the database past it.
+	_expect_ok(t, db.begin(&reader))
+	testing.expect_value(t, _scalar_i64(t, &reader, "SELECT value FROM t"), i64(1))
+	_expect_ok(t, db.exec(&writer, "UPDATE t SET value = 2"))
+
+	// A write from that snapshot can never succeed, so the outcome is not the
+	// Busy a caller waits out.
+	_expect_failure(t, db.exec(&reader, "UPDATE t SET value = 3"), .Busy_Snapshot)
+	// Waiting and running the same statement again fails the same way.
+	_expect_failure(t, db.exec(&reader, "UPDATE t SET value = 3"), .Busy_Snapshot)
+
+	// Rolling the transaction back is what clears the snapshot.
+	_expect_ok(t, db.rollback(&reader))
+	_expect_ok(t, db.exec(&reader, "UPDATE t SET value = 4"))
+}
+
+@(test)
 test_constraint_failures_are_classified :: proc(t: ^testing.T) {
 	conn := _open(t)
 	defer db.close(&conn)

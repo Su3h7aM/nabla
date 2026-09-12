@@ -67,6 +67,10 @@ Result_Code :: enum (c.int) {
 	Done       = 101,
 }
 
+// BUSY_SNAPSHOT is the extended Busy a WAL connection reports when its read
+// snapshot is older than the last write to the database.
+BUSY_SNAPSHOT :: 517
+
 // Column_Type is a result column's storage class, as reported by column_type.
 // The numbering is SQLite's own datatype codes, not a result code.
 Column_Type :: enum (c.int) {
