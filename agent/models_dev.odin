@@ -194,54 +194,24 @@ models_dev_cache_write :: proc(path: string, body: []u8) -> bool {
 	return true
 }
 
-// Models_Dev_Body accumulates a response and remembers whether the size bound was
-// exceeded, which is what turns an oversized response into a failure rather than
-// a short body.
-Models_Dev_Body :: struct {
-	bytes:    [dynamic]u8,
-	overflow: bool,
-}
-
-models_dev_collect :: proc(user_data: rawptr, chunk: []u8) {
-	body := cast(^Models_Dev_Body)user_data
-	if len(body.bytes) + len(chunk) > MODELS_DEV_MAX_BYTES {
-		body.overflow = true
-		return
-	}
-	append(&body.bytes, ..chunk)
-}
-
-// models_dev_probe stops the request once its deadline passes, so a peer that
-// accepts the connection and then stalls cannot hold up the harness.
-models_dev_probe :: proc(user_data: rawptr) -> client.Wait_Status {
-	deadline := cast(^ai.Deadline)user_data
-	if deadline != nil && ai.deadline_expired(deadline^) { return .Timed_Out }
-	return .Ready
-}
-
 // models_dev_fetch performs the one request this source needs. It is deliberately
 // thin: freshness, caching, and persistence are the caller's decisions, so none
 // of them has to be exercised to test them.
 models_dev_fetch :: proc(_: rawptr, allocator: mem.Allocator) -> ([]u8, bool) {
-	body: Models_Dev_Body
+	body: Fetch_Body
 	body.bytes.allocator = allocator
+	body.limit = MODELS_DEV_MAX_BYTES
 
 	deadline := ai.deadline_in(MODELS_DEV_TIMEOUT)
 	failure := client.stream_request(
 		{url = MODELS_DEV_URL, method = .Get, expected_content_type = "application/json", allocator = allocator},
-		{probe = {check = models_dev_probe, user_data = &deadline}},
+		{probe = {check = fetch_probe, user_data = &deadline}},
 		&body,
-		models_dev_collect,
+		fetch_collect,
 	)
-	if failure.kind != .None || body.overflow || len(body.bytes) == 0 {
+	if failure.kind != .None {
 		delete(body.bytes)
 		return nil, false
 	}
-
-	// The caller frees the result the same way it frees the cached copy, so the
-	// slice is sized exactly rather than sharing the accumulator's capacity.
-	result := make([]u8, len(body.bytes), allocator)
-	copy(result, body.bytes[:])
-	delete(body.bytes)
-	return result, true
+	return fetch_body_finish(&body, allocator)
 }

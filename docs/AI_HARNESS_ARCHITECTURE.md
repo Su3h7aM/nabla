@@ -467,22 +467,19 @@ Verified against the code at the time of writing.
 
 ### Needs work
 
-1. **`/models` discovery missing.** Nothing contacts a provider's models endpoint. It is the
-   middle enrichment stage, so a provider's own report cannot yet correct or extend what
-   models.dev states.
-2. **Provider metadata is only partly discoverable.** models.dev supplies the endpoint, the API
+1. **Provider metadata is only partly discoverable.** models.dev supplies the endpoint, the API
    family, and the credential's environment variable for the providers it knows, but a provider
    without an endpoint field — including `anthropic` and `openai`, which rely on their SDK's
    built-in default — still needs `base_url` stated in configuration.
-3. **Catalog fields parsed but never consumed:** `input_modalities`, `output_modalities`,
+2. **Catalog fields parsed but never consumed:** `input_modalities`, `output_modalities`,
    `display_name`.
-4. **Subagents absent.** No spawn, no process isolation, no lifecycle.
-5. **No redact/cap/spill path for tool output.**
-6. **System prompt is a message, not a lane**, and is hardcoded (`AGENT_SYSTEM_PROMPT`,
+3. **Subagents absent.** No spawn, no process isolation, no lifecycle.
+4. **No redact/cap/spill path for tool output.**
+5. **System prompt is a message, not a lane**, and is hardcoded (`AGENT_SYSTEM_PROMPT`,
    `CHAT_COMPACT_INSTRUCTIONS`).
-7. **Anthropic unimplemented.** `API_Kind.Anthropic_Messages` exists; `Provider_Validate_Request`
+6. **Anthropic unimplemented.** `API_Kind.Anthropic_Messages` exists; `Provider_Validate_Request`
    rejects it and there is no encoder.
-8. **Prompt-cache fields unused** by the chat path.
+7. **Prompt-cache fields unused** by the chat path.
 
 ### Settled since this document was written
 
@@ -490,6 +487,9 @@ Verified against the code at the time of writing.
   out of a call/result run.
 - **One resolved catalog.** `resolve_catalog(user, provider, models_dev)` merges the sources,
   first defined value wins, into the `Catalog` the runtime reads.
+- **Provider `/models` discovery.** Each configured provider's own listing is read live at
+  startup (`agent/discovery.odin`) and merged as the middle source, so the catalog holds every
+  model the provider reports while the user's configuration keeps every field it states.
 - **models.dev ingestion.** The API representation is fetched and cached under the XDG state
   directory, parsed into provider source records, and supplied to the resolver as its third
   source. A document that cannot become source records never replaces a usable cache.
