@@ -65,10 +65,11 @@ conn_idle :: proc(conn: ^Conn) -> Error {
 	return nil
 }
 
-// close releases conn and its backend state. Every statement, result set, and
-// transaction derived from it has to be closed first: close refuses and leaves
-// conn usable otherwise, rather than freeing state a live handle still points
-// at. Closing a closed connection does nothing.
+// close releases conn and its backend state. A statement or result set derived
+// from it has to be closed first: close refuses and leaves conn usable rather
+// than free state a live handle still points at. An open transaction is
+// connection state, not a handle, so close rolls it back. Closing a closed
+// connection does nothing.
 close :: proc(conn: ^Conn) -> Error {
 	if conn.state == nil { return nil }
 	if conn.active != nil {

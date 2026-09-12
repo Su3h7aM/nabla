@@ -31,18 +31,19 @@
 // behind it before rows_next returns. rows_close is then only for stopping
 // early, and it is still safe to defer next to a loop that runs to the end.
 //
-// close, statement_close, and query refuse to run over something still open,
-// rather than freeing memory another handle still points at or stranding it.
-// Every release is safe to defer; releasing an already-released handle does
-// nothing.
+// close, statement_close, and query refuse to run over a live handle rather
+// than free memory another handle still points at. A transaction is connection
+// state rather than a handle, so closing the connection rolls it back. Every
+// release is safe to defer; releasing an already-released handle does nothing.
 //
 // One connection runs one thing at a time. While a result set is streaming, any
 // other use of that connection is refused, so the resource a caller holds stays
 // unambiguous. Reaching the end of the set is what gives it back.
 //
-// A live Conn, Statement, or Rows must not be copied or moved. Its address is
-// how the layer knows which handle is open, so pass a pointer and keep it where
-// it is for as long as it is open.
+// An open handle must not be copied: the copy would own the same backend state
+// and release it twice, and a live Statement or Rows is found through its
+// address. A freshly opened Conn may be returned by value, because nothing
+// points at it yet.
 //
 // # Keeping a row
 //
