@@ -4,8 +4,12 @@ package db
 // a zero-length blob are values, not NULL.
 //
 // A row's string and []u8 cases are views into backend storage, are read-only,
-// and are documented as borrowed by the procedure that produced them. A Value
-// given as an argument is borrowed only for the call that consumes it.
+// and are valid only until the result set moves on. A Value given as an argument
+// is borrowed only for the call that consumes it.
+//
+// A zero-length string or blob may come back with a nil data pointer, so len is
+// what says whether there is anything there. Both are empty values, and neither
+// is NULL.
 Value :: union {
 	i64,
 	f64,
@@ -26,6 +30,7 @@ I64_MAX_F64 :: 9223372036854775808.0
 // only when it is a whole number inside the i64 range, so reading a count that
 // arrived as a double works but rounding a measurement does not. Text, blobs,
 // and NULL do not convert.
+@(require_results)
 as_i64 :: proc(v: Value) -> (n: i64, err: Error) {
 	switch x in v {
 	case i64:
@@ -50,6 +55,7 @@ as_i64 :: proc(v: Value) -> (n: i64, err: Error) {
 
 // as_f64 returns v as a float. An integer converts only when the float can hold
 // it exactly, so a value above 2^53 is an error rather than a rounded number.
+@(require_results)
 as_f64 :: proc(v: Value) -> (x: f64, err: Error) {
 	switch y in v {
 	case f64:
@@ -73,6 +79,7 @@ as_f64 :: proc(v: Value) -> (x: f64, err: Error) {
 
 // as_bool returns v as a boolean. A bool converts directly; an integer
 // converts only when it is 0 or 1. Text and floats do not convert.
+@(require_results)
 as_bool :: proc(v: Value) -> (b: bool, err: Error) {
 	switch x in v {
 	case bool:
@@ -90,6 +97,7 @@ as_bool :: proc(v: Value) -> (b: bool, err: Error) {
 
 // as_string returns v as text. Only the text case converts; use as_bytes for a
 // blob. The result aliases the same storage as v.
+@(require_results)
 as_string :: proc(v: Value) -> (s: string, err: Error) {
 	switch x in v {
 	case string:
@@ -103,6 +111,7 @@ as_string :: proc(v: Value) -> (s: string, err: Error) {
 
 // as_bytes returns v as a blob. Only the blob case converts; use as_string for
 // text. The result aliases the same storage as v.
+@(require_results)
 as_bytes :: proc(v: Value) -> (b: []u8, err: Error) {
 	switch x in v {
 	case []u8:

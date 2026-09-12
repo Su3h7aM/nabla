@@ -82,6 +82,10 @@ close :: proc(conn: ^Conn) -> Error {
 //
 // sql holds exactly one statement and no NUL byte. A second statement is an
 // error rather than a silent no-op.
+//
+// exec compiles sql every call. A loop that runs the same statement repeatedly
+// wants prepare once and statement_exec, inside a transaction if it writes.
+@(require_results)
 exec :: proc(conn: ^Conn, sql: string, args: []Value = nil) -> Error {
 	state, err := statement_prepare(conn, sql)
 	if err != nil { return err }
@@ -95,11 +99,18 @@ exec :: proc(conn: ^Conn, sql: string, args: []Value = nil) -> Error {
 }
 
 // query prepares sql, runs it with args, and leaves the result set open in
-// rows. The statement query prepares is released by rows_close; the caller
-// never sees it.
+// rows. The statement query prepares is released when the set ends or is
+// closed; the caller never sees it.
 //
-// rows must stay where it is and must not be copied while the set is open.
+// rows must be a closed set: query refuses to overwrite one that is still open,
+// because nothing else would be left to close it. It must also stay where it is
+// and must not be copied while the set is open.
+@(require_results)
 query :: proc(conn: ^Conn, rows: ^Rows, sql: string, args: []Value = nil) -> Error {
+	if rows.conn != nil {
+		return error_make(.Invalid_State, 0, "the result set passed in is still open")
+	}
+
 	state, err := statement_prepare(conn, sql)
 	if err != nil { return err }
 
@@ -122,6 +133,7 @@ query :: proc(conn: ^Conn, rows: ^Rows, sql: string, args: []Value = nil) -> Err
 // A transaction is connection state, not a handle: statements prepared before
 // begin keep working inside it, and there is nothing extra to close. begin
 // fails when a transaction is already open.
+@(require_results)
 begin :: proc(conn: ^Conn) -> Error {
 	conn_idle(conn) or_return
 	return conn.driver.begin(conn.state)
@@ -130,13 +142,15 @@ begin :: proc(conn: ^Conn) -> Error {
 // commit ends the open transaction on conn and makes its work permanent.
 // Committing with no transaction open is an error, because it means the caller
 // has lost track of the connection's state.
+@(require_results)
 commit :: proc(conn: ^Conn) -> Error {
 	conn_idle(conn) or_return
 	return conn.driver.commit(conn.state)
 }
 
 // rollback discards the open transaction on conn. Rolling back with no
-// transaction open succeeds, so `defer rollback(&conn)` needs no bookkeeping.
+// transaction open succeeds, so `defer rollback(&conn)` needs no bookkeeping,
+// and rollback is not require_results for the same reason.
 rollback :: proc(conn: ^Conn) -> Error {
 	conn_idle(conn) or_return
 	return conn.driver.rollback(conn.state)

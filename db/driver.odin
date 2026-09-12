@@ -9,6 +9,10 @@ package db
 // rollback, so a backend never has to defend against reentrancy or a second
 // result set. Every state pointer is one the backend produced and still owns.
 //
+// finalize is the exception: the statement an execution was running on is
+// released while that execution is still the active one, because releasing it is
+// what ends the execution. It is the last call a backend sees for a statement.
+//
 // A backend reports failure with error_make. It may assume the caller checks
 // every error and closes what it opened.
 Driver :: struct {
@@ -22,13 +26,19 @@ Driver :: struct {
 	prepare:          proc(conn: rawptr, sql: string) -> (stmt: rawptr, err: Error),
 
 	// finalize releases a prepared statement, whether or not it was executed.
-	// It reports nothing: a final failure was already returned by execute,
-	// next, or execution_finish.
+	// It reports nothing, so a backend whose finalize can fail has to surface
+	// that through execute, next, or execution_finish instead: this package
+	// promises a caller that an error seen on one of those calls is the whole
+	// story, and it discards whatever finalize would have said. SQLite keeps
+	// that promise by always resetting through execution_finish first.
 	finalize:         proc(stmt: rawptr),
 
 	// execute binds args and starts one execution of stmt. args are borrowed
 	// for the duration of the call; a backend must copy or consume them before
 	// returning. columns is how many columns the execution yields.
+	//
+	// A wrong argument count or a value the statement cannot take is reported
+	// here rather than left for the first call to next.
 	execute:          proc(stmt: rawptr, args: []Value) -> (rows: rawptr, columns: int, err: Error),
 
 	// next advances the execution to its following row and fills values, which
@@ -36,10 +46,18 @@ Driver :: struct {
 	// end, and false with an error when the statement failed. An empty values
 	// slice means the caller does not want the row, which is how exec avoids
 	// materializing anything.
+	//
+	// Each value is written in the column's own storage class rather than
+	// converted, so a value's as_* conversions are the only place a type is
+	// decided. A string or blob written here stays borrowed until the next row
+	// or the end of the execution.
 	next:             proc(rows: rawptr, values: []Value) -> (has_row: bool, err: Error),
 
 	// execution_finish ends the execution and returns the statement to its
-	// prepared state, releasing any implicit transaction it left open.
+	// prepared state, releasing any implicit transaction it left open. It is
+	// called after the last row, after a failure, and when a caller stops
+	// early, so a backend must leave the statement reusable and report any
+	// failure it could not report earlier.
 	execution_finish: proc(rows: rawptr) -> Error,
 
 	// begin starts a transaction. It fails when one is already open, because

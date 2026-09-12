@@ -14,6 +14,18 @@
 // SQLite's prepare interface compiles only the first statement in a string and
 // silently ignores the rest. This backend rejects that rather than run half of
 // what you wrote, so a migration script is several calls, not one.
+//
+// # Configuration
+//
+// Config covers what has to be set before the connection is used. Everything
+// else SQLite configures with a pragma is ordinary SQL, so it goes through
+// db.exec like anything else:
+//
+//	db.exec(&conn, "PRAGMA journal_mode = WAL") or_return
+//
+// A pragma that reports a value is read with db.query. db.exec discards the
+// rows a statement produces rather than refusing them, so a pragma that returns
+// a row is readable either way.
 package sqlite
 
 import "core:c"
@@ -34,6 +46,7 @@ Config :: struct {
 	// busy_timeout_ms is how long SQLite waits for another connection to
 	// release a lock before a statement fails with `.Busy`. Zero fails at once.
 	// A single-process program that keeps one connection usually wants 0.
+	// Values above what SQLite accepts as an int are clamped, not truncated.
 	busy_timeout_ms: int,
 
 	// foreign_keys enforces REFERENCES clauses. SQLite's own default is off, so
@@ -78,6 +91,7 @@ DRIVER: db.Driver = {
 //
 // Every allocation the connection makes comes from allocator, which db.close
 // hands back to this package.
+@(require_results)
 open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> db.Error {
 	if strings.contains_rune(config.path, 0) {
 		return db.error_make(.Invalid_Argument, 0, "database path contains a NUL byte")
@@ -101,7 +115,11 @@ open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> 
 	}
 
 	if config.busy_timeout_ms > 0 {
-		if rc = busy_timeout(state.handle, c.int(config.busy_timeout_ms)); rc != .OK {
+		// SQLite takes an int here, so a caller asking for longer than one can
+		// express waits as long as it can rather than wrapping around to a
+		// short wait.
+		ms := min(config.busy_timeout_ms, int(max(c.int)))
+		if rc = busy_timeout(state.handle, c.int(ms)); rc != .OK {
 			err := failure(state.handle, rc)
 			close_v2(state.handle)
 			free(state, allocator)
@@ -145,6 +163,11 @@ stmt_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
 	}
 	if strings.contains_rune(sql, 0) {
 		return nil, db.error_make(.Invalid_Argument, 0, "SQL contains a NUL byte")
+	}
+	if len(sql) > int(max(c.int)) {
+		// prepare_v3 takes the length as an int, so anything longer would be
+		// truncated into a different statement.
+		return nil, db.error_make(.Invalid_Argument, 0, "SQL is longer than the backend can take")
 	}
 
 	handle: ^sqlite3_stmt
@@ -260,7 +283,9 @@ execution_next :: proc(state: rawptr, values: []db.Value) -> (has_row: bool, err
 	rc := step(stmt.handle)
 	#partial switch rc {
 	case .Row:
-		fill(stmt, values)
+		if fill_err := fill(stmt, values); fill_err != nil {
+			return false, fill_err
+		}
 		return true, nil
 	case .Done:
 		return false, nil
@@ -284,8 +309,12 @@ execution_finish :: proc(state: rawptr) -> db.Error {
 // fill copies one row out of the statement. The storage class chooses the
 // accessor, so no value is ever converted and no pointer read earlier in this
 // row is invalidated by a later one.
+//
+// It can fail. The text and blob accessors allocate when the column is not
+// already stored in the encoding being asked for, and SQLite reports that by
+// handing back the same null pointer it uses for a value that is not there.
 @(private)
-fill :: proc(stmt: ^Stmt, values: []db.Value) {
+fill :: proc(stmt: ^Stmt, values: []db.Value) -> db.Error {
 	for _, i in values {
 		column := c.int(i)
 		switch column_type(stmt.handle, column) {
@@ -294,17 +323,39 @@ fill :: proc(stmt: ^Stmt, values: []db.Value) {
 		case .Float:
 			values[i] = column_double(stmt.handle, column)
 		case .Text:
-			// text then bytes, with nothing in between: the order SQLite
-			// documents as the safe way to read a text column.
+			// Length before pointer, the order SQLite documents: asking for the
+			// pointer first can convert the value and leave the two disagreeing.
+			length := int(column_bytes(stmt.handle, column))
 			text := column_text(stmt.handle, column)
-			values[i] = string(text[:int(column_bytes(stmt.handle, column))])
+			if text == nil {
+				// column_type already ruled out NULL, so an empty value is the
+				// only other thing a null pointer can mean. Bytes behind it mean
+				// the conversion itself ran out of memory.
+				if length != 0 {
+					return db.error_make(.Out_Of_Memory, 0, "text column could not be read")
+				}
+				values[i] = ""
+				continue
+			}
+			values[i] = string(text[:length])
 		case .Blob:
-			blob := ([^]u8)(column_blob(stmt.handle, column))
-			values[i] = blob[:int(column_bytes(stmt.handle, column))]
+			// A zero-length blob is documented to come back as a null pointer,
+			// so bytes behind one mean the read ran out of memory.
+			length := int(column_bytes(stmt.handle, column))
+			blob := column_blob(stmt.handle, column)
+			if blob == nil {
+				if length != 0 {
+					return db.error_make(.Out_Of_Memory, 0, "blob column could not be read")
+				}
+				values[i] = []u8{}
+				continue
+			}
+			values[i] = ([^]u8)(blob)[:length]
 		case .Null:
 			values[i] = nil
 		}
 	}
+	return nil
 }
 
 @(private)
@@ -379,8 +430,10 @@ classify :: proc(rc: Result_Code) -> db.Error_Kind {
 		return .None
 	case .Constraint:
 		return .Constraint
-	case .Busy, .Locked:
+	case .Busy:
 		return .Busy
+	case .Locked:
+		return .Locked
 	case .Read_Only:
 		return .Read_Only
 	case .No_Mem:

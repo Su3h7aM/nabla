@@ -2,6 +2,7 @@
 #+private file
 package db
 
+import "core:mem"
 import "core:testing"
 
 // The lifecycle rules live in this package, not in a backend, so they are
@@ -423,4 +424,239 @@ test_a_long_message_is_cut_short_and_marked :: proc(t: ^testing.T) {
 	failure, _ := err.(Failure)
 	testing.expect(t, failure.truncated, "a message past the buffer must be marked")
 	testing.expect_value(t, len(error_message(&err)), MAX_ERROR_MESSAGE)
+}
+
+@(test)
+test_the_end_of_a_result_set_frees_the_connection :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	conn: Conn
+	_fake_open(&conn, &calls)
+	defer close(&conn)
+
+	rows: Rows
+	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+
+	seen := 0
+	for {
+		_, has_row, err := rows_next(&rows)
+		_expect_ok(t, err)
+		if !has_row { break }
+		seen += 1
+	}
+	testing.expect_value(t, seen, len(fake_rows))
+
+	// The set gave back everything it held on the way out: the execution and
+	// the statement it owns. Nothing is left for rows_close to do.
+	testing.expect_value(t, calls.finish, 1)
+	testing.expect_value(t, calls.finalize, 1)
+
+	finished := calls.finish
+	finalized := calls.finalize
+	_expect_ok(t, exec(&conn, "SELECT a, b"))
+	testing.expect_value(t, calls.finish, finished + 1)
+	testing.expect_value(t, calls.finalize, finalized + 1)
+
+	// rows_close on a set that already ended does nothing at all.
+	finished = calls.finish
+	finalized = calls.finalize
+	_expect_ok(t, rows_close(&rows))
+	testing.expect_value(t, calls.finish, finished)
+	testing.expect_value(t, calls.finalize, finalized)
+}
+
+@(test)
+test_a_finished_result_set_can_hold_the_next_one :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	conn: Conn
+	_fake_open(&conn, &calls)
+	defer close(&conn)
+
+	rows: Rows
+	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	for {
+		_, has_row, err := rows_next(&rows)
+		_expect_ok(t, err)
+		if !has_row { break }
+	}
+
+	// A set that reached its end holds nothing, so the same Rows is closed as
+	// far as query is concerned.
+	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	_, has_row, err := rows_next(&rows)
+	_expect_ok(t, err)
+	testing.expect(t, has_row, "expected the second query to produce a row")
+
+	_expect_ok(t, rows_close(&rows))
+	testing.expect_value(t, calls.finalize, 2)
+}
+
+@(test)
+test_a_row_failure_ends_the_set_and_frees_the_connection :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	conn: Conn
+	fake := _fake_open(&conn, &calls)
+	defer close(&conn)
+
+	fake.fail_next = error_make(.Busy, 5, "the row could not be read")
+
+	rows: Rows
+	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+
+	_, has_row, err := rows_next(&rows)
+	testing.expect(t, !has_row, "a failed row is not a row")
+	testing.expect_value(t, error_kind(err), Error_Kind.Busy)
+
+	// Failing is still an end: the execution and the owned statement are gone,
+	// so the connection is free even though nothing was closed.
+	testing.expect_value(t, calls.finish, 1)
+	testing.expect_value(t, calls.finalize, 1)
+	_expect_ok(t, begin(&conn))
+	_expect_ok(t, rollback(&conn))
+}
+
+@(test)
+test_a_borrowed_statement_survives_a_failed_set :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	conn: Conn
+	fake := _fake_open(&conn, &calls)
+	defer close(&conn)
+
+	stmt: Statement
+	_expect_ok(t, prepare(&conn, &stmt, "SELECT a, b"))
+	defer statement_close(&stmt)
+
+	fake.fail_next = error_make(.Busy, 5, "the row could not be read")
+
+	rows: Rows
+	_expect_ok(t, statement_query(&stmt, &rows))
+	_, _, err := rows_next(&rows)
+	testing.expect_value(t, error_kind(err), Error_Kind.Busy)
+	testing.expect_value(t, calls.finalize, 0)
+
+	// The statement belongs to the caller, so a set that failed leaves it
+	// prepared rather than releasing it.
+	fake.fail_next = nil
+	_expect_ok(t, statement_query(&stmt, &rows))
+	_, has_row, row_err := rows_next(&rows)
+	_expect_ok(t, row_err)
+	testing.expect(t, has_row, "the statement should run again")
+	_expect_ok(t, rows_close(&rows))
+	testing.expect_value(t, calls.finalize, 0)
+}
+
+@(test)
+test_preparing_over_a_live_statement_is_refused :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	conn: Conn
+	_fake_open(&conn, &calls)
+	defer close(&conn)
+
+	stmt: Statement
+	_expect_ok(t, prepare(&conn, &stmt, "SELECT 1"))
+	testing.expect_value(t, calls.prepare, 1)
+
+	// Preparing over a live statement would leak the state behind it and leave
+	// the connection's list pointing at the old one.
+	testing.expect_value(t, error_kind(prepare(&conn, &stmt, "SELECT 2")), Error_Kind.Invalid_State)
+	testing.expect_value(t, calls.prepare, 1)
+
+	_expect_ok(t, statement_close(&stmt))
+	_expect_ok(t, prepare(&conn, &stmt, "SELECT 2"))
+	testing.expect_value(t, calls.prepare, 2)
+	_expect_ok(t, statement_close(&stmt))
+}
+
+@(test)
+test_a_live_result_set_is_not_overwritten :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	conn: Conn
+	_fake_open(&conn, &calls)
+	defer close(&conn)
+
+	rows: Rows
+	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	testing.expect_value(t, calls.prepare, 1)
+
+	// Overwriting would strand the first set's statement and row buffer, so the
+	// second query never reaches the backend.
+	testing.expect_value(t, error_kind(query(&conn, &rows, "SELECT a, b")), Error_Kind.Invalid_State)
+	testing.expect_value(t, calls.prepare, 1)
+
+	_expect_ok(t, rows_close(&rows))
+	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	testing.expect_value(t, calls.prepare, 2)
+	_expect_ok(t, rows_close(&rows))
+}
+
+@(test)
+test_a_statement_is_not_queried_over_a_live_result_set :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	conn: Conn
+	_fake_open(&conn, &calls)
+	defer close(&conn)
+
+	stmt: Statement
+	_expect_ok(t, prepare(&conn, &stmt, "SELECT a, b"))
+	defer statement_close(&stmt)
+
+	rows: Rows
+	_expect_ok(t, statement_query(&stmt, &rows))
+
+	// The connection is busy, and the output object is taken. Either refusal
+	// leaves the set that is running untouched.
+	testing.expect_value(t, error_kind(statement_query(&stmt, &rows)), Error_Kind.Invalid_State)
+	testing.expect_value(t, calls.execute, 1)
+
+	other: Rows
+	testing.expect_value(t, error_kind(statement_query(&stmt, &other)), Error_Kind.Invalid_State)
+	testing.expect_value(t, calls.execute, 1)
+
+	_expect_ok(t, rows_close(&rows))
+	_expect_ok(t, statement_query(&stmt, &other))
+	_expect_ok(t, rows_close(&other))
+}
+
+@(test)
+test_the_lifecycle_frees_every_allocation_exactly_once :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+
+	ambient := context.allocator
+	defer context.allocator = ambient
+	context.allocator = mem.tracking_allocator(&track)
+
+	calls: Fake_Calls
+	conn: Conn
+	_fake_open(&conn, &calls)
+
+	stmt: Statement
+	_expect_ok(t, prepare(&conn, &stmt, "SELECT a, b"))
+
+	// A borrowed statement outlives the set that runs on it, so the set has to
+	// release the execution without releasing the statement.
+	rows: Rows
+	_expect_ok(t, statement_query(&stmt, &rows))
+	for {
+		_, has_row, err := rows_next(&rows)
+		_expect_ok(t, err)
+		if !has_row { break }
+	}
+	_expect_ok(t, statement_close(&stmt))
+
+	// A set that query compiled owns its statement, so stopping short has to
+	// release both.
+	owned: Rows
+	_expect_ok(t, query(&conn, &owned, "SELECT a, b"))
+	_, _, _ = rows_next(&owned)
+	_expect_ok(t, rows_close(&owned))
+
+	_expect_ok(t, close(&conn))
+
+	// Freeing backend state twice panics inside the tracking allocator, so
+	// reaching this point already means every release ran once. What is left to
+	// check is that none of them was skipped.
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "leaked %d bytes allocated at %v", entry.size, entry.location)
+	}
 }

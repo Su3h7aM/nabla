@@ -26,9 +26,19 @@
 //	query         -> rows_close
 //	begin         -> commit or rollback
 //
-// close and statement_close refuse to run while something derived from them is
-// still open, rather than freeing memory another handle still points at. Every
-// release is safe to defer; releasing an already-released handle does nothing.
+// A result set is the exception, because it releases itself. Walking a set to
+// its end, or hitting an error partway, frees the connection and the statement
+// behind it before rows_next returns. rows_close is then only for stopping
+// early, and it is still safe to defer next to a loop that runs to the end.
+//
+// close, statement_close, and query refuse to run over something still open,
+// rather than freeing memory another handle still points at or stranding it.
+// Every release is safe to defer; releasing an already-released handle does
+// nothing.
+//
+// One connection runs one thing at a time. While a result set is streaming, any
+// other use of that connection is refused, so the resource a caller holds stays
+// unambiguous. Reaching the end of the set is what gives it back.
 //
 // A live Conn, Statement, or Rows must not be copied or moved. Its address is
 // how the layer knows which handle is open, so pass a pointer and keep it where

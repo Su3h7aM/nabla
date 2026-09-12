@@ -4,6 +4,7 @@ package sqlite
 
 import "core:mem"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:testing"
 
@@ -413,4 +414,181 @@ test_every_allocation_is_returned :: proc(t: ^testing.T) {
 	for _, entry in track.allocation_map {
 		testing.expectf(t, false, "leaked %d bytes allocated at %v", entry.size, entry.location)
 	}
+}
+
+@(test)
+test_walking_a_result_set_frees_the_connection :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (1)"))
+
+	rows: db.Rows
+	_expect_ok(t, db.query(&conn, &rows, "SELECT value FROM t"))
+	for {
+		_, has_row, err := db.rows_next(&rows)
+		_expect_ok(t, err)
+		if !has_row { break }
+	}
+
+	// The end of the set returned the connection, so the next statement runs
+	// without anything being closed first.
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (2)"))
+
+	testing.expect_value(t, _count(&conn), i64(2))
+
+	// And a set that already ended closes without touching the statement again.
+	_expect_ok(t, db.rows_close(&rows))
+}
+
+@(test)
+test_stopping_short_of_the_end_frees_the_connection :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (1), (2), (3)"))
+
+	rows: db.Rows
+	_expect_ok(t, db.query(&conn, &rows, "SELECT value FROM t"))
+	_, has_row, err := db.rows_next(&rows)
+	_expect_ok(t, err)
+	testing.expect(t, has_row, "expected a row")
+
+	// One row out of three, then a close: the reset has to leave the statement
+	// and the connection usable.
+	_expect_ok(t, db.rows_close(&rows))
+	_expect_ok(t, db.exec(&conn, "SELECT 1"))
+
+	// The same for a borrowed statement, which has to stay prepared.
+	stmt: db.Statement
+	_expect_ok(t, db.prepare(&conn, &stmt, "SELECT value FROM t"))
+	defer db.statement_close(&stmt)
+
+	for _ in 0 ..< 2 {
+		_expect_ok(t, db.statement_query(&stmt, &rows))
+		_, _, row_err := db.rows_next(&rows)
+		_expect_ok(t, row_err)
+		_expect_ok(t, db.rows_close(&rows))
+	}
+}
+
+@(test)
+test_text_and_blobs_round_trip_byte_for_byte :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (a TEXT, b BLOB)"))
+
+	// Every binding carries a length, so an embedded NUL survives and a blob is
+	// never read as text.
+	text := "h\u00e9llo\x00world"
+	blob: [1024]u8
+	for i in 0 ..< len(blob) { blob[i] = u8(i % 256) }
+
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (?, ?)", {db.Value(text), db.Value(blob[:])}))
+
+	rows: db.Rows
+	_expect_ok(t, db.query(&conn, &rows, "SELECT a, b FROM t"))
+	defer db.rows_close(&rows)
+
+	values, has_row, err := db.rows_next(&rows)
+	_expect_ok(t, err)
+	if !testing.expect(t, has_row, "expected a row") { return }
+
+	got_text, text_err := db.as_string(values[0])
+	got_blob, blob_err := db.as_bytes(values[1])
+	_expect_ok(t, text_err)
+	_expect_ok(t, blob_err)
+	testing.expect_value(t, got_text, text)
+	testing.expect_value(t, len(got_blob), len(blob))
+	testing.expect(t, slice.equal(got_blob, blob[:]), "the blob should come back unchanged")
+}
+
+@(test)
+test_a_statement_survives_a_rejected_row :: proc(t: ^testing.T) {
+	conn := _open(t)
+	defer db.close(&conn)
+
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY)"))
+
+	stmt: db.Statement
+	_expect_ok(t, db.prepare(&conn, &stmt, "INSERT INTO t VALUES (?)"))
+	defer db.statement_close(&stmt)
+
+	_expect_ok(t, db.statement_exec(&stmt, {db.Value(i64(1))}))
+
+	// A failed step leaves the statement owing a reset, which the drain does
+	// before it reports. Reusing it afterwards is the whole point of preparing.
+	_expect_failure(t, db.statement_exec(&stmt, {db.Value(i64(1))}), .Constraint)
+	_expect_ok(t, db.statement_exec(&stmt, {db.Value(i64(2))}))
+
+	// One rejected row does not end the transaction it was written in.
+	_expect_ok(t, db.begin(&conn))
+	defer db.rollback(&conn)
+
+	_expect_failure(t, db.statement_exec(&stmt, {db.Value(i64(2))}), .Constraint)
+	_expect_ok(t, db.statement_exec(&stmt, {db.Value(i64(3))}))
+}
+
+@(test)
+test_a_connection_can_be_closed_and_opened_again :: proc(t: ^testing.T) {
+	conn: db.Conn
+	_expect_ok(t, open(&conn, CONFIG))
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.close(&conn))
+
+	// close cleared the handle, so the same Conn can hold a new connection.
+	// This one is a fresh in-memory database, which is why the table is gone.
+	_expect_ok(t, open(&conn, CONFIG))
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.close(&conn))
+
+	// Releasing a released connection is still nothing to do.
+	_expect_ok(t, db.close(&conn))
+}
+
+@(test)
+test_another_connection_sees_only_committed_work :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer delete(directory)
+	defer os.remove_all(directory)
+	path := _temp_database(directory)
+	defer delete(path)
+
+	writer: db.Conn
+	_expect_ok(t, open(&writer, {path = path}))
+	defer db.close(&writer)
+
+	reader: db.Conn
+	_expect_ok(t, open(&reader, {path = path}))
+	defer db.close(&reader)
+
+	_expect_ok(t, db.exec(&writer, "CREATE TABLE t (value INTEGER)"))
+
+	_expect_ok(t, db.begin(&writer))
+	_expect_ok(t, db.exec(&writer, "INSERT INTO t VALUES (1)"))
+
+	// The other connection reads the table it can see, which does not include
+	// a transaction that has not committed yet.
+	testing.expect_value(t, _count(&reader), i64(0))
+
+	_expect_ok(t, db.commit(&writer))
+	testing.expect_value(t, _count(&reader), i64(1))
+}
+
+// _count returns the one integer a count of the table produces, or -1 when the
+// query did not produce one. It is a test-local reading of one column, and it
+// closes its result set: leaving one open would hold a read transaction, which
+// stops another connection from committing.
+_count :: proc(conn: ^db.Conn) -> i64 {
+	rows: db.Rows
+	if db.query(conn, &rows, "SELECT count(*) FROM t") != nil { return -1 }
+	defer db.rows_close(&rows)
+
+	values, has_row, err := db.rows_next(&rows)
+	if err != nil || !has_row { return -1 }
+	count, _ := db.as_i64(values[0])
+	return count
 }

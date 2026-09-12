@@ -43,10 +43,15 @@ statement_unlink :: proc(stmt: ^Statement) {
 // prepare compiles sql into stmt for repeated execution. sql holds exactly one
 // statement and no NUL byte.
 //
-// Pair prepare with statement_close. A prepared statement belongs to one
-// connection and stops being usable when that connection closes, which close
-// enforces by refusing to run first.
+// stmt must be closed, so preparing over a live statement is refused rather than
+// silently leaking the state behind it. Pair prepare with statement_close. A
+// prepared statement belongs to one connection and stops being usable when that
+// connection closes, which close enforces by refusing to run first.
+@(require_results)
 prepare :: proc(conn: ^Conn, stmt: ^Statement, sql: string) -> Error {
+	if stmt.state != nil {
+		return error_make(.Invalid_State, 0, "the statement passed in is already prepared")
+	}
 	state, err := statement_prepare(conn, sql)
 	if err != nil { return err }
 	stmt^ = Statement {
@@ -62,7 +67,7 @@ prepare :: proc(conn: ^Conn, stmt: ^Statement, sql: string) -> Error {
 statement_close :: proc(stmt: ^Statement) -> Error {
 	if stmt.state == nil { return nil }
 	if stmt.conn.active != nil {
-		return error_make(.Invalid_State, 0, "a result set is still open")
+		return error_make(.Invalid_State, 0, "a result set is still open on the connection")
 	}
 	stmt.conn.driver.finalize(stmt.state)
 	statement_unlink(stmt)
@@ -72,6 +77,7 @@ statement_close :: proc(stmt: ^Statement) -> Error {
 
 // statement_exec runs stmt with args to completion, discarding any rows it
 // produces. The statement stays prepared and ready for the next call.
+@(require_results)
 statement_exec :: proc(stmt: ^Statement, args: []Value = nil) -> Error {
 	if stmt.state == nil {
 		return error_make(.Invalid_State, 0, "statement is closed")
@@ -89,11 +95,18 @@ statement_exec :: proc(stmt: ^Statement, args: []Value = nil) -> Error {
 }
 
 // statement_query runs stmt with args and leaves the result set open in rows.
-// The statement is borrowed, not owned: it stays prepared and rows_close leaves
-// it that way.
+// The statement is borrowed, not owned: it stays prepared and the end of the set
+// leaves it that way.
+//
+// rows must be a closed set: statement_query refuses to overwrite one that is
+// still open, because nothing else would be left to close it.
+@(require_results)
 statement_query :: proc(stmt: ^Statement, rows: ^Rows, args: []Value = nil) -> Error {
 	if stmt.state == nil {
 		return error_make(.Invalid_State, 0, "statement is closed")
+	}
+	if rows.conn != nil {
+		return error_make(.Invalid_State, 0, "the result set passed in is still open")
 	}
 	conn_idle(stmt.conn) or_return
 
