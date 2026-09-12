@@ -13,7 +13,8 @@ Error_Kind :: enum {
 	// operation while a result set is open, or a row read past the end.
 	Invalid_State,
 	// The arguments are unusable: empty SQL, more than one statement, a NUL
-	// byte inside SQL or text, or a wrong number of bind parameters.
+	// byte inside SQL or text, a wrong number of bind parameters, or a value
+	// too large for the backend to hold.
 	Invalid_Argument,
 	// A conversion was handed a value of a different type.
 	Type_Mismatch,
