@@ -167,7 +167,7 @@ test_tool_call_dispatch_and_result_are_linked :: proc(t: ^testing.T) {
 			request_no = request,
 			created_at_ms = 2_400,
 			related_seq = call_seq,
-			payload = Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = `{"status":"exited","exit_code":0}`, origin = .Executed},
+			payload = Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = `{"status":"exited","exit_code":0}`, origin = .Observed},
 		},
 	)
 	_expect_ok(t, result_err)
@@ -242,7 +242,7 @@ test_a_tool_link_must_name_an_existing_call :: proc(t: ^testing.T) {
 			request_no = request,
 			created_at_ms = 2_200,
 			related_seq = Seq(99),
-			payload = Tool_Result_Entry{outcome = .Exited, content = "x", origin = .Executed},
+			payload = Tool_Result_Entry{outcome = .Exited, content = "x", origin = .Observed},
 		},
 	)
 	_expect_error(t, no_such_err, .Invalid_Argument)
@@ -297,7 +297,7 @@ test_a_call_has_at_most_one_dispatch_and_one_result :: proc(t: ^testing.T) {
 		request_no = request,
 		created_at_ms = 2_400,
 		related_seq = call_seq,
-		payload = Tool_Result_Entry{outcome = .Exited, content = "{}", origin = .Executed},
+		payload = Tool_Result_Entry{outcome = .Exited, content = "{}", origin = .Observed},
 	}
 	_, first_result_err := entry_append(&store, session.id, result)
 	_expect_ok(t, first_result_err)
@@ -406,7 +406,7 @@ test_entry_payloads_round_trip :: proc(t: ^testing.T) {
 		Reasoning_Entry{id = "reason_1", encrypted = "opaque"},
 		Tool_Call_Entry{call_id = "call_1", item_id = "item_1", name = "shell", arguments = `{"command":"ls"}`},
 		Tool_Dispatch_Entry{tool = "shell", arguments = `{"command":"ls","timeout_ms":30000}`},
-		Tool_Result_Entry{outcome = .Exited, exit_code = 2, error = "", content = `{"status":"exited"}`, origin = .Executed},
+		Tool_Result_Entry{outcome = .Exited, exit_code = 2, error = "", content = `{"status":"exited"}`, origin = .Observed},
 		Tool_Result_Entry{outcome = .Unknown, content = `{"status":"unknown"}`, origin = .Recovered},
 		Checkpoint_Entry{summary = "so far", covered_seq = Seq(4), previous_seq = Seq(2)},
 	}

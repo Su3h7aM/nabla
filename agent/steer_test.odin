@@ -4,6 +4,8 @@ package agent
 import "core:strings"
 import "core:testing"
 
+import "nabla:agent/session"
+
 @(test)
 test_steer_queue_is_fifo_and_bounded :: proc(t: ^testing.T) {
 	queue := steer_queue_init(context.temp_allocator)
@@ -87,25 +89,34 @@ test_steer_queue_close_leaves_leftovers :: proc(t: ^testing.T) {
 
 @(test)
 test_session_steer_only_at_request_boundary :: proc(t: ^testing.T) {
-	session := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&session)
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
 
-	testing.expect(t, !chat_session_steer(&session, "idle"))
-	testing.expect(t, chat_session_accept_user(&session, "start"))
-	testing.expect(t, chat_session_steer(&session, "steered"))
-	testing.expect_value(t, len(session.messages), 2)
-	testing.expect_value(t, session.messages[1].role, Chat_Role.User)
-	testing.expect_value(t, session.messages[1].text, "steered")
-	// The turn keeps its id and budgets: steering starts nothing.
-	testing.expect_value(t, session.requests_made, 0)
+	testing.expect(t, !chat_session_steer(chat, "idle", session.now_ms()))
+	_test_accept(t, chat, "start")
+	testing.expect(t, chat_session_steer(chat, "steered", session.now_ms()))
+
+	ctx := _test_context(t, chat)
+	defer session.context_destroy(&ctx, context.allocator)
+	if !testing.expect_value(t, len(ctx.entries), 2) { return }
+	user, is_user := ctx.entries[1].payload.(session.User_Entry)
+	if !testing.expect(t, is_user, "the steering line should be user text") { return }
+	testing.expect_value(t, user.text, "steered")
+	testing.expect_value(t, user.origin, session.User_Origin.Steering)
+	// The turn keeps its budgets: steering starts nothing.
+	testing.expect_value(t, chat.requests_made, 0)
 }
 
 @(test)
 test_drain_injects_text_and_runs_commands :: proc(t: ^testing.T) {
-	session := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&session)
-	append(&session.effort_levels, strings.clone("high", context.temp_allocator))
-	testing.expect(t, chat_session_accept_user(&session, "start"))
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	append(&chat.effort_levels, strings.clone("high", chat.allocator))
+	_test_accept(t, chat, "start")
 
 	queue := steer_queue_init(context.temp_allocator)
 	defer steer_queue_destroy(&queue)
@@ -118,19 +129,25 @@ test_drain_injects_text_and_runs_commands :: proc(t: ^testing.T) {
 		provider_id = "p",
 		model_id    = "m",
 	}
-	chat_drain_steering(&session, {}, &steer)
+	chat_drain_steering(chat, {}, &steer)
 
 	testing.expect(t, !quit)
-	testing.expect_value(t, session.effort, "high")
-	testing.expect_value(t, len(session.messages), 2)
-	testing.expect_value(t, session.messages[1].text, "check the logs")
+	testing.expect_value(t, chat.effort, "high")
+	ctx := _test_context(t, chat)
+	defer session.context_destroy(&ctx, context.allocator)
+	if !testing.expect_value(t, len(ctx.entries), 2) { return }
+	user, is_user := ctx.entries[1].payload.(session.User_Entry)
+	if !testing.expect(t, is_user, "the queued line should be user text") { return }
+	testing.expect_value(t, user.text, "check the logs")
 }
 
 @(test)
 test_drain_quit_discards_what_was_never_sent :: proc(t: ^testing.T) {
-	session := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&session)
-	testing.expect(t, chat_session_accept_user(&session, "start"))
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	_test_accept(t, chat, "start")
 
 	queue := steer_queue_init(context.temp_allocator)
 	defer steer_queue_destroy(&queue)
@@ -143,8 +160,10 @@ test_drain_quit_discards_what_was_never_sent :: proc(t: ^testing.T) {
 		provider_id = "p",
 		model_id    = "m",
 	}
-	chat_drain_steering(&session, {}, &steer)
+	chat_drain_steering(chat, {}, &steer)
 
 	testing.expect(t, quit)
-	testing.expect_value(t, len(session.messages), 1)
+	entries := _test_entries(t, chat)
+	defer session.entries_destroy(entries, context.allocator)
+	testing.expect_value(t, len(entries), 1)
 }

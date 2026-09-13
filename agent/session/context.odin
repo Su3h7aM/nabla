@@ -209,7 +209,8 @@ entry_latest_checkpoint :: proc(store: ^Store, id: Session_Id, allocator := cont
 // ones a summary replaced and the bookkeeping a model is never shown.
 Context :: struct {
 	summary:     string, // owned; "" when the session has no checkpoint
-	summary_seq: Maybe(Seq),
+	summary_seq: Maybe(Seq), // the checkpoint entry itself
+	covered_seq: Maybe(Seq), // the last entry the checkpoint covers
 	entries:     []Entry, // owned
 }
 
@@ -238,6 +239,7 @@ context_load :: proc(store: ^Store, id: Session_Id, allocator := context.allocat
 		}
 		ctx.summary = payload.summary
 		ctx.summary_seq = checkpoint.seq
+		ctx.covered_seq = payload.covered_seq
 		boundary = payload.covered_seq
 		// The summary was moved out of the entry, so only the entry's other
 		// fields are released here.

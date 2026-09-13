@@ -18,6 +18,12 @@ TOOL_SHELL_PARAMETERS_JSON :: `{"type":"object","properties":{"command":{"type":
 
 AGENT_SYSTEM_PROMPT :: "You are svan, a coding agent. You have one tool named shell that runs /bin/sh commands in a fresh non-interactive process inside the session workspace. Use it to inspect files, run programs, and report what they print. Pass working_directory relative to the workspace, or null for the workspace root. Pass timeout_ms in milliseconds, or null for the default. Directory and environment changes do not persist between calls and standard input is closed. Results come back as JSON with stdout, stderr, exit code, and truncation flags. Never invent command output. Call the tool when the user asks you to do something on the machine, and keep chat replies short."
 
+// TOOL_RECOVERED_RESULT is the model-visible result written for a call whose
+// outcome the harness never observed, such as one a process died in the middle
+// of. It has the envelope a normal result has, with the status saying what the
+// harness knows rather than what it would have to guess.
+TOOL_RECOVERED_RESULT :: `{"status":"unknown","exit_code":null,"stdout":"","stderr":"","stdout_truncated":false,"stderr_truncated":false,"output_incomplete":false,"error":"the session was interrupted before this call finished"}`
+
 TOOL_MAX_ARGS_BYTES :: 64 * 1024
 TOOL_MAX_CALLS_PER_RESPONSE :: 8
 TOOL_MAX_CALLS_PER_TURN :: 32

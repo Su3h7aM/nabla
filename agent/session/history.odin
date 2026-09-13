@@ -38,6 +38,39 @@ Request_Finish :: struct {
 	at_ms:          i64,
 }
 
+// Request is one stored model request, exactly as it was recorded. Every string
+// is owned by the allocator it was read with and released by request_destroy.
+Request :: struct {
+	request_no:      Request_No,
+	turn_no:         Maybe(Turn_No),
+	purpose:         Request_Purpose,
+	started_at_ms:   i64,
+	finished_at_ms:  Maybe(i64),
+	outcome:         Outcome,
+	provider:        string, // owned
+	model_requested: string, // owned
+	model_resolved:  string, // owned
+	api:             string, // owned
+	config_json:     string, // owned
+	input_json:      string, // owned
+	response_json:   string, // owned
+	error_json:      string, // owned
+	usage:           Usage,
+}
+
+request_destroy :: proc(request: ^Request, allocator := context.allocator) {
+	if request == nil { return }
+	delete(request.provider, allocator)
+	delete(request.model_requested, allocator)
+	delete(request.model_resolved, allocator)
+	delete(request.api, allocator)
+	delete(request.config_json, allocator)
+	delete(request.input_json, allocator)
+	delete(request.response_json, allocator)
+	delete(request.error_json, allocator)
+	request^ = {}
+}
+
 // turn_begin admits user input: it opens a turn, records the prompt as the
 // turn's first entry, and marks the session active. All three land in one
 // transaction, so a turn never exists without the input that opened it.
@@ -200,6 +233,100 @@ request_finish :: proc(store: ^Store, id: Session_Id, request_no: Request_No, fi
 	return nil
 }
 
+// request_load reads one request. Reading does not need the writer claim.
+request_load :: proc(store: ^Store, id: Session_Id, request_no: Request_No, allocator := context.allocator) -> (Request, Error) {
+	if !store.open { return {}, error_make(.Invalid_State, "the store is closed") }
+
+	rows: db.Rows
+	args := [?]db.Value{db.Value(string(id)), db.Value(i64(request_no))}
+	if err := db.query(&store.conn, &rows, REQUEST_SELECT_ONE, args[:]); err != nil {
+		return {}, storage_error("load request", err)
+	}
+	defer db.rows_close(&rows)
+
+	values, has_row, next_err := db.rows_next(&rows)
+	if next_err != nil { return {}, storage_error("load request", next_err) }
+	if !has_row { return {}, error_make(.Not_Found, "no request has that number") }
+	return request_scan(values, allocator)
+}
+
+@(private)
+request_scan :: proc(values: []db.Value, allocator: mem.Allocator) -> (request: Request, err: Error) {
+	complete := false
+	defer if !complete { request_destroy(&request, allocator) }
+
+	request_no, number_err := db.as_i64(values[0])
+	if number_err != nil { return {}, corrupt_error("read request number", number_err) }
+	purpose_name, purpose_err := db.as_string(values[2])
+	if purpose_err != nil { return {}, corrupt_error("read request purpose", purpose_err) }
+	outcome_name, outcome_err := db.as_string(values[5])
+	if outcome_err != nil { return {}, corrupt_error("read request outcome", outcome_err) }
+	started_at_ms, started_err := db.as_i64(values[3])
+	if started_err != nil { return {}, corrupt_error("read request start", started_err) }
+	finished_at_ms, finished_err := read_optional_i64(values[4])
+	if finished_err != nil { return {}, corrupt_error("read request finish", finished_err) }
+	turn_no, turn_err := read_optional_i64(values[1])
+	if turn_err != nil { return {}, corrupt_error("read request turn", turn_err) }
+
+	purpose, known_purpose := request_purpose_from_name(purpose_name)
+	if !known_purpose {
+		return {}, error_make(.Corrupt, fmt.tprintf("a stored request has an unknown purpose: %s", purpose_name))
+	}
+	outcome, known_outcome := outcome_from_name(outcome_name)
+	if !known_outcome {
+		return {}, error_make(.Corrupt, fmt.tprintf("a stored request has an unknown outcome: %s", outcome_name))
+	}
+
+	request.request_no = Request_No(request_no)
+	request.purpose = purpose
+	request.outcome = outcome
+	request.started_at_ms = started_at_ms
+	if value, present := finished_at_ms.?; present { request.finished_at_ms = value }
+	if value, present := turn_no.?; present { request.turn_no = Turn_No(value) }
+
+	text_fields := [8]struct {
+		value:    db.Value,
+		optional: bool,
+	} {
+		{values[6], false}, // provider
+		{values[7], false}, // model_requested
+		{values[8], true}, // model_resolved
+		{values[9], false}, // api
+		{values[10], false}, // config_json
+		{values[11], false}, // input_json
+		{values[12], true}, // response_json
+		{values[13], true}, // error_json
+	}
+	targets := [8]^string {
+		&request.provider,
+		&request.model_requested,
+		&request.model_resolved,
+		&request.api,
+		&request.config_json,
+		&request.input_json,
+		&request.response_json,
+		&request.error_json,
+	}
+	for field, i in text_fields {
+		if field.value == nil {
+			if !field.optional { return {}, error_make(.Corrupt, "a stored request is missing its provider or settings") }
+			continue
+		}
+		text, text_err := db.as_string(field.value)
+		if text_err != nil { return {}, corrupt_error("read request text", text_err) }
+		targets[i]^ = strings.clone(text, allocator)
+	}
+
+	usage_targets := [4]^Maybe(i64){&request.usage.input, &request.usage.output, &request.usage.cache_read, &request.usage.cache_write}
+	for value, i in values[14:18] {
+		number, usage_err := read_optional_i64(value)
+		if usage_err != nil { return {}, corrupt_error("read request usage", usage_err) }
+		usage_targets[i]^ = number
+	}
+	complete = true
+	return request, nil
+}
+
 // entries_append stores a run of entries and returns the sequence numbers they
 // were given. The whole run is one transaction, so a request's output and the
 // calls it proposed are either all recorded or none of it is.
@@ -329,6 +456,12 @@ REQUEST_FINISH :: `UPDATE requests SET status = ?, finished_at_ms = ?, model_res
 
 @(private)
 REQUEST_NEXT_NO :: `SELECT COALESCE(MAX(request_no), 0) + 1 FROM requests WHERE session_id = ?`
+
+@(private)
+REQUEST_COLUMNS :: `request_no, turn_no, purpose, started_at_ms, finished_at_ms, status, provider, model_requested, model_resolved, api, config_json, input_json, response_json, error_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens`
+
+@(private)
+REQUEST_SELECT_ONE :: `SELECT ` + REQUEST_COLUMNS + ` FROM requests WHERE session_id = ? AND request_no = ?`
 
 @(private)
 ENTRY_INSERT :: `INSERT INTO entries (session_id, seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`

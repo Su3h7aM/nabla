@@ -101,7 +101,7 @@ test_recovery_leaves_resolved_calls_alone :: proc(t: ^testing.T) {
 			request_no = request,
 			created_at_ms = 2_350,
 			related_seq = call_seq,
-			payload = Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = "{}", origin = .Executed},
+			payload = Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = "{}", origin = .Observed},
 		},
 	)
 	_expect_ok(t, result_err)
@@ -164,7 +164,7 @@ test_checkpoints_chain_and_move_the_context :: proc(t: ^testing.T) {
 			request_no = request,
 			created_at_ms = 2_270,
 			related_seq = call_seq,
-			payload = Tool_Result_Entry{outcome = .Exited, content = `{"status":"exited"}`, origin = .Executed},
+			payload = Tool_Result_Entry{outcome = .Exited, content = `{"status":"exited"}`, origin = .Observed},
 		},
 	)
 	_expect_ok(t, result_err)

@@ -147,31 +147,30 @@ test_enrichment_unknown_model_assumes_the_default_window :: proc(t: ^testing.T) 
 
 @(test)
 test_enrichment_unknown_model_sends_no_reasoning :: proc(t: ^testing.T) {
-	session := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&session)
-	session.workspace = tool_loop_workspace(t)
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
 	window, assumed := chat_context_window(Catalog_Model{})
-	session.context_window = window
+	chat.context_window = window
 	testing.expect(t, assumed)
 
-	testing.expect(t, chat_session_accept_user(&session, "hello"))
-	effect := tool_loop_begin_request(&session)
-	defer chat_effect_destroy(&effect)
-	request, wire, tools_owned, call_lists := chat_build_request(&session, effect.request, tool_loop_connection, "unknown-model")
-	defer tool_wire_cleanup(&wire, &tools_owned, &call_lists)
+	_test_accept(t, chat, "hello")
+	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
 
 	// Nothing provider-specific is asserted about reasoning: the provider applies
 	// its own default.
-	testing.expect(t, !request.Reasoning_Effort_Present)
-	testing.expect_value(t, request.Reasoning_Effort, "")
+	testing.expect(t, !prep.request.Reasoning_Effort_Present)
+	testing.expect_value(t, prep.request.Reasoning_Effort, "")
 
 	// No level could be chosen either, because the model states none.
-	testing.expect(t, !chat_session_set_effort(&session, "high"))
-	testing.expect_value(t, session.effort, "")
+	testing.expect(t, !chat_session_set_effort(chat, "high"))
+	testing.expect_value(t, chat.effort, "")
 
 	// The assumed window is still enough to admit an ordinary request.
-	estimate := chat_estimate_input_tokens(wire[:], tools_owned[:])
-	_, admitted := chat_admission_check(&session, estimate)
+	_, admitted := chat_admission_check(chat, prep.estimate)
 	testing.expect(t, admitted)
 }
 
@@ -179,20 +178,19 @@ test_enrichment_unknown_model_sends_no_reasoning :: proc(t: ^testing.T) {
 test_enrichment_stated_levels_send_the_chosen_effort :: proc(t: ^testing.T) {
 	// The contrast that makes the silence above meaningful: when a source does state
 	// a level, the chosen one is sent.
-	session := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&session)
-	session.workspace = tool_loop_workspace(t)
-	session.context_window = CHAT_DEFAULT_CONTEXT_WINDOW
-	testing.expect(t, !chat_session_set_effort(&session, "high"))
-	append(&session.effort_levels, chat_clone_string("high", session.allocator))
-	testing.expect(t, chat_session_set_effort(&session, "high"))
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.context_window = CHAT_DEFAULT_CONTEXT_WINDOW
+	testing.expect(t, !chat_session_set_effort(chat, "high"))
+	append(&chat.effort_levels, chat_clone_string("high", chat.allocator))
+	testing.expect(t, chat_session_set_effort(chat, "high"))
 
-	testing.expect(t, chat_session_accept_user(&session, "hello"))
-	effect := tool_loop_begin_request(&session)
-	defer chat_effect_destroy(&effect)
-	request, wire, tools_owned, call_lists := chat_build_request(&session, effect.request, tool_loop_connection, "known-model")
-	defer tool_wire_cleanup(&wire, &tools_owned, &call_lists)
-
-	testing.expect(t, request.Reasoning_Effort_Present)
-	testing.expect_value(t, request.Reasoning_Effort, "high")
+	_test_accept(t, chat, "hello")
+	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+	testing.expect(t, prep.request.Reasoning_Effort_Present)
+	testing.expect_value(t, prep.request.Reasoning_Effort, "high")
 }

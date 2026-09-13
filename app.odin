@@ -18,6 +18,7 @@ import "core:thread"
 import "core:time"
 
 import "nabla:agent"
+import "nabla:agent/session"
 import "nabla:ai"
 import input "nabla:input"
 import "nabla:term"
@@ -103,12 +104,14 @@ Runtime :: struct {
 }
 
 // Run_Setup is the resolved runtime the app starts from: the catalog, the
-// selected provider/model, the connection, and the session.
+// selected provider/model, the connection, the session store, and the running
+// session the worker drives.
 Run_Setup :: struct {
 	catalog:     agent.Catalog,
 	api:         ai.API_Kind,
 	credential:  string, // owned,
 	connection:  ai.Provider_Connection,
+	store:       session.Store,
 	session:     agent.Chat_Session,
 	provider_id: string, // owned,
 	model_id:    string, // owned,
@@ -201,15 +204,85 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source) -> (Run_Setup, boo
 	result.catalog = catalog
 	result.configured = configured
 
-	session := agent.chat_session_init(result.alloc)
-	result.session = session
-	if session.workspace == "" {
+	workspace, workspace_err := os.get_working_directory(result.alloc)
+	if workspace_err != nil || workspace == "" {
 		fmt.eprintln("nabla: cannot determine working directory")
 		return {}, false
 	}
+	defer delete(workspace, result.alloc)
+
+	if !run_session_attach(&result, workspace) { return {}, false }
 
 	ok = true
 	return result, true
+}
+
+// run_session_attach opens the session store, resumes the newest session for
+// this workspace or starts one, claims it for writing, and settles anything an
+// earlier run left running. The running session is built on top of that claim.
+run_session_attach :: proc(setup: ^Run_Setup, workspace: string) -> bool {
+	directory, directory_err := agent.xdg_directory(.State, setup.alloc)
+	if directory_err != .None {
+		fmt.eprintln("nabla: cannot resolve the state directory for sessions")
+		return false
+	}
+	defer delete(directory, setup.alloc)
+
+	if store_err := session.store_open(&setup.store, directory); store_err != nil {
+		local := store_err
+		fmt.eprintln("nabla: cannot open the session database:", session.error_detail(&local))
+		return false
+	}
+
+	target, found := setup_resume_target(setup, workspace)
+	if !found {
+		created, create_err := session.session_create(&setup.store, {workspace = workspace}, session.now_ms())
+		if create_err != nil {
+			local := create_err
+			fmt.eprintln("nabla: cannot start a session:", session.error_detail(&local))
+			return false
+		}
+		target = session.Session_Id(strings.clone(string(created.id), setup.alloc))
+		session.session_destroy(&created)
+	}
+	defer delete(string(target), setup.alloc)
+
+	if claim_err := session.session_claim(&setup.store, target); claim_err != nil {
+		local := claim_err
+		fmt.eprintln("nabla: cannot take the session:", session.error_detail(&local))
+		return false
+	}
+
+	// Recovery settles what an earlier run left running before anything new is
+	// admitted, so a resumed session never continues from a half-written turn.
+	recovery, recover_err := session.session_recover(&setup.store, target, {at_ms = session.now_ms(), recovered_content = agent.TOOL_RECOVERED_RESULT})
+	if recover_err != nil {
+		local := recover_err
+		fmt.eprintln("nabla: cannot settle the session:", session.error_detail(&local))
+		return false
+	}
+	if recovery.interrupted_turns > 0 || recovery.recovered_calls > 0 {
+		fmt.eprintln("nabla: resumed after an interrupted turn; some tool outcomes are unknown")
+	}
+
+	claimed, held := session.session_claimed(&setup.store)
+	if !held {
+		fmt.eprintln("nabla: the session claim went missing")
+		return false
+	}
+	setup.session = agent.chat_session_init(&setup.store, claimed, workspace, setup.alloc)
+	return true
+}
+
+// setup_resume_target picks the newest unarchived session that ran in this
+// workspace, or nothing when the workspace has no session yet. The result is
+// owned by setup.alloc.
+setup_resume_target :: proc(setup: ^Run_Setup, workspace: string) -> (session.Session_Id, bool) {
+	sessions, list_err := session.session_list(&setup.store, {workspace = workspace, limit = 1}, setup.alloc)
+	if list_err != nil { return "", false }
+	defer session.sessions_destroy(sessions, setup.alloc)
+	if len(sessions) == 0 { return "", false }
+	return session.Session_Id(strings.clone(string(sessions[0].id), setup.alloc)), true
 }
 
 // provider_usable reports whether a provider can serve a request at all: an
@@ -270,34 +343,40 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	}
 	model := &app.setup.catalog.models[model_index]
 
-	session := &app.setup.session
+	running := &app.setup.session
 	window, _ := agent.chat_context_window(model^)
-	session.context_window = window
-	session.max_output_tokens = model.max_output_tokens
-	session.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(api)
+	running.context_window = window
+	running.max_output_tokens = model.max_output_tokens
+	running.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(api)
+	// The request record names the provider and model each request was sent to,
+	// so the running session carries them.
+	delete(running.provider_id, running.allocator)
+	running.provider_id = strings.clone(provider_id, running.allocator)
+	delete(running.model_id, running.allocator)
+	running.model_id = strings.clone(model_id, running.allocator)
 	// The level to carry over: an explicit one, or the one already in effect, which
 	// a model switch keeps whenever the new model allows it. It may alias the
 	// session's stored effort, which rebuilding the level list replaces, so it is
 	// copied before the session is touched.
 	desired := effort
-	if desired == "" { desired = session.effort }
+	if desired == "" { desired = running.effort }
 	carried := strings.clone(desired, app.setup.alloc)
 	defer delete(carried, app.setup.alloc)
-	agent.chat_session_set_effort(session, "")
-	for level in session.effort_levels {
-		delete(level, session.allocator)
+	agent.chat_session_set_effort(running, "")
+	for level in running.effort_levels {
+		delete(level, running.allocator)
 	}
-	clear(&session.effort_levels)
+	clear(&running.effort_levels)
 	if model.thinking.levels_present {
 		for level in model.thinking.levels {
-			append(&session.effort_levels, strings.clone(level, session.allocator))
+			append(&running.effort_levels, strings.clone(level, running.allocator))
 		}
 	}
 	// A carried level the new model does not allow falls back to the lowest level
 	// the model does state, so a switch never leaves an effort it cannot serve.
 	// With nothing to carry, the provider default stands.
-	if carried != "" && !agent.chat_session_set_effort(session, carried) && len(session.effort_levels) > 0 {
-		agent.chat_session_set_effort(session, session.effort_levels[0])
+	if carried != "" && !agent.chat_session_set_effort(running, carried) && len(running.effort_levels) > 0 {
+		agent.chat_session_set_effort(running, running.effort_levels[0])
 	}
 
 	sync.mutex_lock(&app.run.mu)
@@ -326,9 +405,9 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	// The effort and the window apply here too, not only through
 	// refresh_status: a restored selection must show both before the first
 	// work item runs.
-	if status.effort != session.effort {
+	if status.effort != running.effort {
 		delete(status.effort, app.run.alloc)
-		status.effort = strings.clone(session.effort, app.run.alloc)
+		status.effort = strings.clone(running.effort, app.run.alloc)
 	}
 	status.context_window = window
 	delete(app.run.snap.setup_error, app.run.alloc)
@@ -339,7 +418,7 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	saved := agent.Selection {
 		provider = provider_id,
 		model    = model_id,
-		effort   = session.effort,
+		effort   = running.effort,
 	}
 	sync.mutex_unlock(&app.run.mu)
 	agent.selection_save(saved)
@@ -360,6 +439,8 @@ selection_fail :: proc(app: ^App, message: string) {
 
 run_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
+	session.session_release(&setup.store)
+	session.store_close(&setup.store)
 	agent.catalog_destroy(&setup.catalog)
 	for id in setup.configured {
 		delete(id, setup.alloc)
@@ -576,16 +657,34 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	switch work.kind {
 	case .Prompt:
-		if !agent.chat_session_accept_user(&app.setup.session, work.text) {
-			snap_append(app, .Warning, "chat is busy; input dropped")
+		if work.text == "/new" {
+			provider := strings.clone(app.setup.provider_id, app.run.alloc)
+			model := strings.clone(app.setup.model_id, app.run.alloc)
+			defer delete(provider, app.run.alloc)
+			defer delete(model, app.run.alloc)
+			if session_start_new(app) {
+				snapshot_clear(app)
+				snap_append(app, .Notice, "started a new session")
+				// The new session runs the same selection; only the conversation is new.
+				if provider != "" && model != "" { apply_selection(app, provider, model, "") }
+			}
+			return
+		}
+		accepted := agent.chat_session_accept_user(&app.setup.session, work.text, session.now_ms())
+		if accepted != .Accepted {
+			if accepted == .Storage_Failed {
+				snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
+			} else {
+				snap_append(app, .Warning, "chat is busy; input dropped")
+			}
 			return
 		}
 		snap_append(app, .User, work.text)
 		set_running(app, true)
-		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, app.setup.model_id, observer, nil)
+		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, observer, nil)
 	case .Compact:
 		set_running(app, true)
-		agent.chat_command_compact(&app.setup.session, observer, app.run.connection, app.setup.model_id, nil)
+		agent.chat_command_compact(&app.setup.session, observer, app.run.connection, nil)
 	case .Context:
 		agent.chat_notice_context(&app.setup.session, observer)
 	case .Effort:
@@ -607,6 +706,52 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		apply_selection(app, work.provider, work.text, "")
 	}
 	refresh_status(app)
+}
+
+// session_start_new closes the running session and claims a fresh one, so the
+// next prompt opens a new conversation. The transcript is dropped with it; the
+// old session keeps its history in the store.
+session_start_new :: proc(app: ^App) -> bool {
+	setup := &app.setup
+	workspace := strings.clone(setup.session.workspace, setup.alloc)
+	defer delete(workspace, setup.alloc)
+
+	created, create_err := session.session_create(&setup.store, {workspace = workspace}, session.now_ms())
+	if create_err != nil {
+		local := create_err
+		snap_append(app, .Error, fmt.tprintf("cannot start a session: %s", session.error_detail(&local)))
+		return false
+	}
+	target := session.Session_Id(strings.clone(string(created.id), setup.alloc))
+	session.session_destroy(&created)
+	defer delete(string(target), setup.alloc)
+
+	agent.chat_session_destroy(&setup.session)
+	session.session_release(&setup.store)
+	if claim_err := session.session_claim(&setup.store, target); claim_err != nil {
+		local := claim_err
+		snap_append(app, .Error, fmt.tprintf("cannot take the session: %s", session.error_detail(&local)))
+		return false
+	}
+	claimed, held := session.session_claimed(&setup.store)
+	if !held {
+		snap_append(app, .Error, "the session claim went missing")
+		return false
+	}
+	setup.session = agent.chat_session_init(&setup.store, claimed, workspace, setup.alloc)
+	return true
+}
+
+// snapshot_clear drops the rendered transcript. The history lives in the store;
+// this is only what the screen shows.
+snapshot_clear :: proc(app: ^App) {
+	sync.mutex_lock(&app.run.mu)
+	defer sync.mutex_unlock(&app.run.mu)
+	for &entry in app.run.snap.entries {
+		if entry.text != nil { delete(entry.text) }
+	}
+	clear(&app.run.snap.entries)
+	app.run.snap.generation += 1
 }
 
 // picker_entries lists every model the picker offers: one entry per usable
@@ -782,22 +927,16 @@ resolve_model_reference :: proc(app: ^App, text: string) -> (provider_id, model_
 // item settles. Estimated input mirrors the agent's estimator over the
 // active request span.
 refresh_status :: proc(app: ^App) {
-	session := &app.setup.session
-	chars := 0
-	count := 0
-	for &message in session.messages[session.active_start:] {
-		count += 1
-		chars += len(message.text) + len(message.tool_call_id) + len(message.reasoning_id) + len(message.reasoning_encrypted)
-		chars += len(message.tool_call.id) + len(message.tool_call.item_id) + len(message.tool_call.name) + len(message.tool_call.arguments)
-	}
-	estimate := chars / agent.CHAT_CHARS_PER_TOKEN + count * agent.CHAT_MESSAGE_OVERHEAD_TOKENS
+	running := &app.setup.session
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
 	status := &app.run.snap.status
-	status.est_input = estimate
-	status.context_window = session.context_window
-	status.cwd = session.workspace
-	status.running = session.state != .Idle
+	// The estimate is the one the agent measured when it built the last request;
+	// the main thread never reads the store, so it cannot compute one itself.
+	status.est_input = running.last_estimate
+	status.context_window = running.context_window
+	status.cwd = running.workspace
+	status.running = running.state != .Idle
 	if status.provider_id != app.setup.provider_id {
 		delete(status.provider_id, app.run.alloc)
 		status.provider_id = strings.clone(app.setup.provider_id, app.run.alloc)
@@ -806,9 +945,9 @@ refresh_status :: proc(app: ^App) {
 		delete(status.model_id, app.run.alloc)
 		status.model_id = strings.clone(app.setup.model_id, app.run.alloc)
 	}
-	if status.effort != session.effort {
+	if status.effort != running.effort {
 		delete(status.effort, app.run.alloc)
-		status.effort = strings.clone(session.effort, app.run.alloc)
+		status.effort = strings.clone(running.effort, app.run.alloc)
 	}
 	app.run.snap.generation += 1
 }

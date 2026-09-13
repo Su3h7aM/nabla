@@ -13,6 +13,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 
+import "nabla:agent/session"
 import "nabla:ai"
 
 // Shell cancellation runs the real executor against real processes. The test
@@ -178,46 +179,49 @@ test_shell_cancel_escalates_when_sigterm_is_ignored :: proc(t: ^testing.T) {
 
 @(test)
 test_shell_cancel_reaps_child_and_allows_next_turn :: proc(t: ^testing.T) {
-	session := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&session)
-	session.workspace = shell_test_workspace(context.temp_allocator)
-	session.tools_enabled = true
-	testing.expect(t, chat_session_accept_user(&session, "run something long"))
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "run something long")
 
-	effect := tool_loop_begin_request(&session)
+	effect := _test_begin_request(t, chat)
 	first_turn := effect.turn_id
 	chat_effect_destroy(&effect)
-	calls := []ai.Provider_Tool_Call {
-		{ID = "call_long", Name = TOOL_SHELL_NAME, Arguments = `{"command":"sleep 30","working_directory":null,"timeout_ms":10000}`},
-	}
-	testing.expect(t, chat_session_feed_tool_calls(&session, chat_session_event_source(&session), calls))
-	effect = chat_session_advance(&session)
+
+	// The call is recorded first, exactly as a completed response would, and then
+	// the turn is cancelled before the tool would have finished.
+	_test_stage_call(t, chat, "call_long", `{"command":"sleep 30","working_directory":null,"timeout_ms":10000}`)
+	effect = chat_session_advance(chat)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Run_Tools)
 	chat_effect_destroy(&effect)
 
-	// Cancel and execute on separate threads so the request lands while the command
-	// is genuinely running.
-	chat_session_request_cancel(&session)
-	testing.expect_value(t, session.state, Chat_State.Cancelling)
-	count := chat_execute_pending(&session, {})
+	chat_session_request_cancel(chat)
+	testing.expect_value(t, chat.state, Chat_State.Cancelling)
+	count := chat_run_tools(chat, {})
 	testing.expect_value(t, count, 1)
-	testing.expect(t, chat_session_tools_done(&session, session.active_turn_id, count))
-	// The committed call is resolved rather than left dangling.
-	testing.expect_value(t, session.messages[2].role, Chat_Role.Tool)
-	testing.expect(t, strings.contains(session.messages[2].text, "cancelled") || strings.contains(session.messages[2].text, "not_executed"))
-	chat_session_retire_operation(&session)
+	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, count))
 
-	finish := chat_session_advance(&session)
+	// The committed call is resolved rather than left dangling.
+	entries := _test_entries(t, chat)
+	defer session.entries_destroy(entries, context.allocator)
+	result, is_result := entries[len(entries) - 1].payload.(session.Tool_Result_Entry)
+	if !testing.expect(t, is_result, "the last entry should be a result") { return }
+	testing.expect(t, result.outcome == .Cancelled || result.outcome == .Not_Executed, "a cancelled call is resolved, not left dangling")
+	chat_session_retire_operation(chat)
+
+	finish := _test_settle(t, chat)
 	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
 	chat_effect_destroy(&finish)
-	testing.expect_value(t, session.state, Chat_State.Idle)
+	testing.expect_value(t, chat.state, Chat_State.Idle)
 
 	// A fresh turn starts immediately, without waiting on anything from the last one.
-	testing.expect(t, chat_session_accept_user(&session, "next"))
-	testing.expect_value(t, session.active_turn_id, first_turn + 1)
-	testing.expect(t, !chat_session_cancelled(&session))
-	effect = tool_loop_begin_request(&session)
+	_test_accept(t, chat, "next")
+	testing.expect_value(t, chat.active_turn_id, first_turn + 1)
+	testing.expect(t, !chat_session_cancelled(chat))
+	effect = _test_begin_request(t, chat)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
 	chat_effect_destroy(&effect)
 }
@@ -316,14 +320,14 @@ shell_stall_stop :: proc(server: ^Shell_Stall_Server) {
 
 Shell_Turn_Run :: struct {
 	thread:     ^thread.Thread,
-	session:    ^Chat_Session,
+	chat:       ^Chat_Session,
 	connection: ai.Provider_Connection,
 	completed:  bool,
 }
 
 shell_turn_serve :: proc(thread: ^thread.Thread) {
 	run := cast(^Shell_Turn_Run)thread.data
-	run.completed = chat_run_turn(run.session, run.connection, "shell-test-model", {})
+	run.completed = chat_run_turn(run.chat, run.connection, {})
 }
 
 shell_turn_join :: proc(run: ^Shell_Turn_Run) {
@@ -339,15 +343,16 @@ test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
 	if !shell_stall_start(t, &server) { return }
 	defer shell_stall_stop(&server)
 
-	session := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&session)
-	session.workspace = shell_test_workspace(context.temp_allocator)
-	session.context_window = 500000
-	testing.expect(t, chat_session_accept_user(&session, "hello"))
-	first_turn := session.active_turn_id
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.context_window = 500000
+	_test_accept(t, chat, "hello")
+	first_turn := chat.active_turn_id
 
 	run := Shell_Turn_Run {
-		session = &session,
+		chat = chat,
 		connection = ai.Provider_Connection {
 			API = .OpenAI_Chat_Completions,
 			Endpoint = fmt.aprintf("http://127.0.0.1:%d", server.port, allocator = context.temp_allocator),
@@ -370,15 +375,15 @@ test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
 	shell_turn_join(&run)
 
 	testing.expectf(t, chat_cancel_requested(), "the SIGINT handler never requested cancellation")
-	testing.expect_value(t, session.terminal_status, Chat_Terminal_Status.Cancelled)
-	testing.expect_value(t, session.state, Chat_State.Idle)
+	testing.expect_value(t, chat.terminal_status, Chat_Terminal_Status.Cancelled)
+	testing.expect_value(t, chat.state, Chat_State.Idle)
 	testing.expect(t, !run.completed)
 
 	// The turn is over and the session is immediately reusable.
-	testing.expect(t, chat_session_accept_user(&session, "again"))
-	testing.expect_value(t, session.active_turn_id, first_turn + 1)
-	testing.expect(t, !chat_session_cancelled(&session))
-	effect := tool_loop_begin_request(&session)
+	_test_accept(t, chat, "again")
+	testing.expect_value(t, chat.active_turn_id, first_turn + 1)
+	testing.expect(t, !chat_session_cancelled(chat))
+	effect := _test_begin_request(t, chat)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
 	chat_effect_destroy(&effect)
 }

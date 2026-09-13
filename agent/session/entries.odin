@@ -125,13 +125,13 @@ tool_outcome_from_name :: proc(name: string) -> (Tool_Outcome, bool) {
 // observed, or the recovery that closed an interrupted session. A recovered
 // result describes what the harness knows, not what happened.
 Tool_Result_Origin :: enum {
-	Executed,
+	Observed,
 	Recovered,
 }
 
 @(private)
 tool_result_origin_names := [Tool_Result_Origin]string {
-	.Executed  = "executed",
+	.Observed  = "observed",
 	.Recovered = "recovered",
 }
 
@@ -143,7 +143,7 @@ tool_result_origin_from_name :: proc(name: string) -> (Tool_Result_Origin, bool)
 	for origin in Tool_Result_Origin {
 		if tool_result_origin_names[origin] == name { return origin, true }
 	}
-	return .Executed, false
+	return .Observed, false
 }
 
 // --- entries ----------------------------------------------------------------

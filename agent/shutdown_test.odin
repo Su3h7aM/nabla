@@ -11,6 +11,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 
+import "nabla:agent/session"
 import "nabla:ai"
 
 // Shutdown and race validation. These drive the production control path: the real
@@ -20,86 +21,95 @@ import "nabla:ai"
 
 @(test)
 test_repeated_cancellation_is_idempotent :: proc(t: ^testing.T) {
-	session := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&session)
-	session.workspace = shell_test_workspace(context.temp_allocator)
-	session.tools_enabled = true
-	testing.expect(t, chat_session_accept_user(&session, "repeat"))
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "repeat")
 
-	effect := tool_loop_begin_request(&session)
+	effect := _test_begin_request(t, chat)
 	chat_effect_destroy(&effect)
 
-	testing.expect(t, chat_session_request_cancel(&session))
+	testing.expect(t, chat_session_request_cancel(chat))
 	// The turn is already stopping, so a repeat is refused rather than accepted
 	// again, and it must not queue a cancellation for anything later.
-	testing.expect(t, !chat_session_request_cancel(&session))
-	testing.expect(t, !chat_session_request_cancel(&session))
-	testing.expect_value(t, session.state, Chat_State.Cancelling)
+	testing.expect(t, !chat_session_request_cancel(chat))
+	testing.expect(t, !chat_session_request_cancel(chat))
+	testing.expect_value(t, chat.state, Chat_State.Cancelling)
 
-	chat_session_retire_operation(&session)
-	finish := chat_session_advance(&session)
-	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
+	chat_session_retire_operation(chat)
+	finish := _test_settle(t, chat)
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
 	chat_effect_destroy(&finish)
 
 	// Exactly one terminal effect, and a repeat cannot resurrect the turn.
-	again := chat_session_advance(&session)
+	again := chat_session_advance(chat)
 	testing.expect_value(t, again.kind, Chat_Effect_Kind.None)
 	chat_effect_destroy(&again)
-	testing.expect_value(t, session.terminal_status, Chat_Terminal_Status.Cancelled)
-	testing.expect(t, !chat_session_request_cancel(&session))
+	testing.expect_value(t, chat.terminal_status, Chat_Terminal_Status.Cancelled)
+	testing.expect(t, !chat_session_request_cancel(chat))
 }
 
 @(test)
 test_cancel_racing_successful_completion_yields_one_status :: proc(t: ^testing.T) {
 	// Completion first: a cancellation arriving after the response completed must
 	// not relabel a successful turn.
-	completed := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&completed)
-	completed.workspace = shell_test_workspace(context.temp_allocator)
-	testing.expect(t, chat_session_accept_user(&completed, "win"))
-	effect := tool_loop_begin_request(&completed)
+	completed: Chat_Test
+	chat_test_begin(t, &completed, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(t, &completed)
+	completed_chat := &completed.chat
+	_test_accept(t, completed_chat, "win")
+	effect := _test_begin_request(t, completed_chat)
 	chat_effect_destroy(&effect)
-	testing.expect(t, chat_session_feed_completion(&completed, chat_session_event_source(&completed)))
-	testing.expect(t, !chat_session_request_cancel(&completed))
-	finish := chat_session_advance(&completed)
-	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
+	testing.expect(t, chat_session_feed_completion(completed_chat, chat_session_event_source(completed_chat)))
+	testing.expect(t, !chat_session_request_cancel(completed_chat))
+	finish := _test_settle(t, completed_chat)
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Completed)
 	chat_effect_destroy(&finish)
 
 	// Cancellation first: a completion arriving afterwards must not upgrade a
 	// cancelled turn, and partial text must not be committed as a response.
-	cancelled := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&cancelled)
-	cancelled.workspace = shell_test_workspace(context.temp_allocator)
-	testing.expect(t, chat_session_accept_user(&cancelled, "lose"))
-	effect = tool_loop_begin_request(&cancelled)
+	cancelled: Chat_Test
+	chat_test_begin(t, &cancelled, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(t, &cancelled)
+	cancelled_chat := &cancelled.chat
+	_test_accept(t, cancelled_chat, "lose")
+	effect = _test_begin_request(t, cancelled_chat)
 	chat_effect_destroy(&effect)
-	text := chat_session_feed_text(&cancelled, chat_session_event_source(&cancelled), "half")
-	chat_effect_destroy(&text)
-	testing.expect(t, chat_session_request_cancel(&cancelled))
-	testing.expect(t, !chat_session_feed_completion(&cancelled, chat_session_event_source(&cancelled)))
-	chat_session_retire_operation(&cancelled)
-	finish = chat_session_advance(&cancelled)
+	testing.expect(t, chat_session_feed_text(cancelled_chat, chat_session_event_source(cancelled_chat), "half"))
+	testing.expect(t, chat_session_request_cancel(cancelled_chat))
+	testing.expect(t, !chat_session_feed_completion(cancelled_chat, chat_session_event_source(cancelled_chat)))
+	chat_session_retire_operation(cancelled_chat)
+	finish = _test_settle(t, cancelled_chat)
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
 	chat_effect_destroy(&finish)
-	testing.expect_value(t, len(cancelled.messages), 1)
+
+	// The text the cancelled turn produced is kept as partial evidence.
+	entries := _test_entries(t, cancelled_chat)
+	defer session.entries_destroy(entries, context.allocator)
+	if !testing.expect_value(t, len(entries), 2) { return }
+	text, is_text := entries[1].payload.(session.Assistant_Entry)
+	if !testing.expect(t, is_text, "the second entry should be assistant text") { return }
+	testing.expect_value(t, text.text, "half")
+	testing.expect(t, text.partial, "text from a cancelled turn is partial")
 }
 
 @(test)
 test_cancellation_is_not_inherited_by_next_turn :: proc(t: ^testing.T) {
-	session := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&session)
-	session.workspace = shell_test_workspace(context.temp_allocator)
-	session.tools_enabled = true
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
 
 	for round in 0 ..< 3 {
-		testing.expect(t, chat_session_accept_user(&session, fmt.aprintf("round %d", round, allocator = context.temp_allocator)))
-		effect := tool_loop_begin_request(&session)
+		_test_accept(t, chat, fmt.aprintf("round %d", round, allocator = context.temp_allocator))
+		effect := _test_begin_request(t, chat)
 		if round == 0 {
-			testing.expect(t, chat_session_request_cancel(&session))
-			chat_session_retire_operation(&session)
-			finish := chat_session_advance(&session)
+			testing.expect(t, chat_session_request_cancel(chat))
+			chat_session_retire_operation(chat)
+			finish := _test_settle(t, chat)
 			testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
 			chat_effect_destroy(&finish)
 			chat_effect_destroy(&effect)
@@ -107,10 +117,10 @@ test_cancellation_is_not_inherited_by_next_turn :: proc(t: ^testing.T) {
 		}
 		// A stale cancellation would surface here: a later turn must reach a normal
 		// completion even though an earlier turn was cancelled.
-		testing.expect(t, !chat_session_cancelled(&session))
-		testing.expect_value(t, session.state, Chat_State.Requesting)
-		testing.expect(t, chat_session_feed_completion(&session, chat_session_event_source(&session)))
-		finish := chat_session_advance(&session)
+		testing.expect(t, !chat_session_cancelled(chat))
+		testing.expect_value(t, chat.state, Chat_State.Requesting)
+		testing.expect(t, chat_session_feed_completion(chat, chat_session_event_source(chat)))
+		finish := _test_settle(t, chat)
 		testing.expect_value(t, finish.status, Chat_Terminal_Status.Completed)
 		chat_effect_destroy(&finish)
 		chat_effect_destroy(&effect)
@@ -138,10 +148,11 @@ test_signal_handler_outlives_sessions :: proc(t: ^testing.T) {
 		previous: sigaction_storage
 		chat_signal_arm(&previous.saved)
 
-		session := chat_session_init(context.temp_allocator)
-		session.workspace = shell_test_workspace(context.temp_allocator)
-		testing.expect(t, chat_session_accept_user(&session, "signal"))
-		effect := tool_loop_begin_request(&session)
+		fixture: Chat_Test
+		chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
+		chat := &fixture.chat
+		_test_accept(t, chat, "signal")
+		effect := _test_begin_request(t, chat)
 		chat_effect_destroy(&effect)
 
 		testing.expect(t, linux.kill(linux.Pid(os.get_pid()), .SIGINT) == .NONE)
@@ -151,12 +162,12 @@ test_signal_handler_outlives_sessions :: proc(t: ^testing.T) {
 		for !chat_cancel_requested() && time.tick_since(deadline) < 0 { time.sleep(time.Millisecond) }
 		testing.expectf(t, chat_cancel_requested(), "round %d never observed the signal", round)
 
-		chat_session_note_cancel(&session)
-		chat_session_retire_operation(&session)
-		finish := chat_session_advance(&session)
+		chat_session_note_cancel(chat)
+		chat_session_retire_operation(chat)
+		finish := _test_settle(t, chat)
 		testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
 		chat_effect_destroy(&finish)
-		chat_session_destroy(&session)
+		chat_test_end(t, &fixture)
 
 		chat_signal_disarm(&previous.saved)
 	}
@@ -197,49 +208,50 @@ test_interrupt_generation_rejects_stale_request :: proc(t: ^testing.T) {
 // unconditional.
 @(test)
 test_stale_handler_cannot_cancel_next_turn :: proc(t: ^testing.T) {
-	session := chat_session_init(context.temp_allocator)
-	defer chat_session_destroy(&session)
-	session.workspace = shell_test_workspace(context.temp_allocator)
-	session.tools_enabled = true
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
 
-	testing.expect(t, chat_session_accept_user(&session, "first"))
-	effect := tool_loop_begin_request(&session)
+	_test_accept(t, chat, "first")
+	effect := _test_begin_request(t, chat)
 	first_turn := effect.turn_id
 	chat_effect_destroy(&effect)
 
 	// The handler runs only as far as observing the token, then stops.
 	captured := ai.interrupt_capture(&chat_cancel)
-	chat_session_request_cancel(&session)
-	chat_session_retire_operation(&session)
-	finish := chat_session_advance(&session)
+	chat_session_request_cancel(chat)
+	chat_session_retire_operation(chat)
+	finish := _test_settle(t, chat)
 	chat_effect_destroy(&finish)
 
-	testing.expect(t, chat_session_accept_user(&session, "second"))
-	testing.expect_value(t, session.active_turn_id, first_turn + 1)
-	effect = tool_loop_begin_request(&session)
+	_test_accept(t, chat, "second")
+	testing.expect_value(t, chat.active_turn_id, first_turn + 1)
+	effect = _test_begin_request(t, chat)
 	chat_effect_destroy(&effect)
 
 	// The stale handler resumes and completes its write against a reset token.
 	ai.interrupt_request_captured(&chat_cancel, captured)
 
 	testing.expectf(t, !chat_cancel_requested(), "a stale handler cancelled the current turn")
-	testing.expect_value(t, session.state, Chat_State.Requesting)
-	testing.expect(t, chat_session_feed_completion(&session, chat_session_event_source(&session)))
-	finish = chat_session_advance(&session)
+	testing.expect_value(t, chat.state, Chat_State.Requesting)
+	testing.expect(t, chat_session_feed_completion(chat, chat_session_event_source(chat)))
+	finish = _test_settle(t, chat)
 	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Completed)
 	chat_effect_destroy(&finish)
 
 	// A signal observed in the current generation still cancels.
-	testing.expect(t, chat_session_accept_user(&session, "third"))
-	effect = tool_loop_begin_request(&session)
+	_test_accept(t, chat, "third")
+	effect = _test_begin_request(t, chat)
 	chat_effect_destroy(&effect)
 	fresh := ai.interrupt_capture(&chat_cancel)
 	ai.interrupt_request_captured(&chat_cancel, fresh)
 	testing.expect(t, chat_cancel_requested())
-	chat_session_note_cancel(&session)
-	chat_session_retire_operation(&session)
-	finish = chat_session_advance(&session)
+	chat_session_note_cancel(chat)
+	chat_session_retire_operation(chat)
+	finish = _test_settle(t, chat)
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
 	chat_effect_destroy(&finish)
 }
@@ -318,16 +330,16 @@ test_shell_spawn_is_safe_with_running_threads :: proc(t: ^testing.T) {
 // --- production shutdown ordering ---------------------------------------------
 
 Shell_Tool_Run :: struct {
-	thread:  ^thread.Thread,
-	session: ^Chat_Session,
-	count:   int,
+	thread: ^thread.Thread,
+	chat:   ^Chat_Session,
+	count:  int,
 }
 
-// chat_execute_pending is the production tool path: the control loop calls exactly
-// this to run committed calls.
+// chat_run_tools is the production tool path: the control loop calls exactly this
+// to run committed calls.
 shell_tool_serve :: proc(thread: ^thread.Thread) {
 	run := cast(^Shell_Tool_Run)thread.data
-	run.count = chat_execute_pending(run.session, {})
+	run.count = chat_run_tools(run.chat, {})
 }
 
 @(test)
@@ -337,28 +349,31 @@ test_shutdown_during_tool_reaps_child_before_session_cleanup :: proc(t: ^testing
 	pid_file := fmt.aprintf("%s/shutdown.pid", workspace, allocator = allocator)
 	defer os.remove(pid_file)
 
-	session := chat_session_init(context.temp_allocator)
-	session.workspace = workspace
-	session.tools_enabled = true
-	testing.expect(t, chat_session_accept_user(&session, "run a child"))
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, workspace)
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "run a child")
 
-	effect := tool_loop_begin_request(&session)
+	effect := _test_begin_request(t, chat)
 	chat_effect_destroy(&effect)
+
+	// A call that starts a background child and then sleeps, so the descendant is
+	// observable and the turn is still running when the signal lands.
 	command := fmt.aprintf("sleep 30 & echo $! > %s; sleep 30", pid_file, allocator = allocator)
 	arguments := fmt.aprintf(`{{"command":%q,"working_directory":null,"timeout_ms":60000}}`, command, allocator = allocator)
-	calls := []ai.Provider_Tool_Call{{ID = "call_shutdown", Name = TOOL_SHELL_NAME, Arguments = arguments}}
-	testing.expect(t, chat_session_feed_tool_calls(&session, chat_session_event_source(&session), calls))
-	effect = chat_session_advance(&session)
+	_test_stage_call(t, chat, "call_shutdown", arguments)
+	effect = chat_session_advance(chat)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Run_Tools)
 	chat_effect_destroy(&effect)
 
 	run := Shell_Tool_Run {
-		session = &session,
+		chat = chat,
 	}
 	run.thread = test_thread_start(shell_tool_serve, &run, "svan-shutdown-tool")
 	if run.thread == nil {
 		testing.expectf(t, false, "shutdown thread could not start")
-		chat_session_destroy(&session)
 		return
 	}
 
@@ -367,26 +382,23 @@ test_shutdown_during_tool_reaps_child_before_session_cleanup :: proc(t: ^testing
 		testing.expectf(t, false, "tool child never started")
 		thread.join(run.thread)
 		thread.destroy(run.thread)
-		chat_session_destroy(&session)
 		return
 	}
-	testing.expect(t, chat_session_request_cancel(&session))
+	testing.expect(t, chat_session_request_cancel(chat))
 	thread.join(run.thread)
 	thread.destroy(run.thread)
 
-	testing.expect(t, chat_session_tools_done(&session, session.active_turn_id, run.count))
-	chat_session_retire_operation(&session)
-	finish := chat_session_advance(&session)
+	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, run.count))
+	chat_session_retire_operation(chat)
+	finish := _test_settle(t, chat)
 	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
 	chat_effect_destroy(&finish)
 
 	// Retirement and reaping must already have happened, so cleanup cannot race a
 	// live child.
-	testing.expect_value(t, session.operation.state, Chat_Operation_State.Retired)
+	testing.expect_value(t, chat.operation.state, Chat_Operation_State.Retired)
 	testing.expectf(t, shell_process_gone(descendant), "descendant %d outlived the turn, so reaping did not precede cleanup", descendant)
-
-	chat_session_destroy(&session)
 }
 
 // Shutdown while the model request is in flight, driven through the real turn
@@ -397,13 +409,15 @@ test_shutdown_during_request_retires_before_session_cleanup :: proc(t: ^testing.
 	if !shell_stall_start(t, &server) { return }
 	defer shell_stall_stop(&server)
 
-	session := chat_session_init(context.temp_allocator)
-	session.workspace = shell_test_workspace(context.temp_allocator)
-	session.context_window = 500000
-	testing.expect(t, chat_session_accept_user(&session, "block"))
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.context_window = 500000
+	_test_accept(t, chat, "block")
 
 	run := Shell_Turn_Run {
-		session = &session,
+		chat = chat,
 		connection = ai.Provider_Connection {
 			API = .OpenAI_Chat_Completions,
 			Endpoint = fmt.aprintf("http://127.0.0.1:%d", server.port, allocator = context.temp_allocator),
@@ -412,7 +426,6 @@ test_shutdown_during_request_retires_before_session_cleanup :: proc(t: ^testing.
 	run.thread = test_thread_start(shell_turn_serve, &run, "svan-shutdown-request")
 	if run.thread == nil {
 		testing.expectf(t, false, "shutdown thread could not start")
-		chat_session_destroy(&session)
 		return
 	}
 
@@ -420,7 +433,6 @@ test_shutdown_during_request_retires_before_session_cleanup :: proc(t: ^testing.
 		testing.expectf(t, false, "request never reached the stall server")
 		thread.join(run.thread)
 		thread.destroy(run.thread)
-		chat_session_destroy(&session)
 		return
 	}
 	testing.expect(t, linux.kill(linux.Pid(os.get_pid()), .SIGINT) == .NONE)
@@ -428,12 +440,11 @@ test_shutdown_during_request_retires_before_session_cleanup :: proc(t: ^testing.
 	thread.destroy(run.thread)
 
 	testing.expectf(t, chat_cancel_requested(), "the SIGINT handler never requested cancellation")
-	testing.expect_value(t, session.terminal_status, Chat_Terminal_Status.Cancelled)
-	testing.expect_value(t, session.state, Chat_State.Idle)
-	testing.expect_value(t, session.operation.state, Chat_Operation_State.Retired)
+	testing.expect_value(t, chat.terminal_status, Chat_Terminal_Status.Cancelled)
+	testing.expect_value(t, chat.state, Chat_State.Idle)
+	testing.expect_value(t, chat.operation.state, Chat_Operation_State.Retired)
 	testing.expect(t, !run.completed)
 
-	chat_session_destroy(&session)
 	// The token is static and outlives the session; clearing it here is what keeps a
 	// later turn from inheriting this cancellation.
 	chat_cancel_reset()
