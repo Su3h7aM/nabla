@@ -64,6 +64,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 	delete(app.run.snap.status.effort, app.run.alloc)
 	for level in app.run.snap.status.effort_levels { delete(level, app.run.alloc) }
 	delete(app.run.snap.status.effort_levels)
+	delete(app.run.snap.setup_error, app.run.alloc)
 	menu_destroy(&app.menu, app.run.alloc)
 	os.remove_all(app.setup.workspace)
 	delete(app.setup.workspace, app.setup.alloc)
@@ -142,6 +143,98 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	)
 	session.store_close(&missing_setup.store)
 	delete(missing_setup.workspace, missing_setup.alloc)
+}
+
+// The stored selection is the user's own last choice, so a launch restores it,
+// and a second launch that stores another replaces it rather than adding one.
+@(test)
+test_a_launch_restores_the_stored_selection :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	app.setup.catalog = app_test_catalog(app.setup.alloc)
+	defer agent.catalog_destroy(&app.setup.catalog)
+
+	if err := session.selection_save(&app.setup.store, {provider = "test-provider", model = "test-model", effort = ""}); err != nil {
+		testing.fail_now(t, "the selection could not be stored")
+	}
+
+	testing.expect(t, apply_startup_selection(&app, "", ""))
+	testing.expect_value(t, app.setup.session.provider_id, "test-provider")
+	testing.expect_value(t, app.setup.session.model_id, "test-model")
+}
+
+// A stored selection outranks the model a resumed session recorded, and the
+// session's model is the fallback for a launch that has no selection stored.
+@(test)
+test_the_stored_selection_outranks_the_session_model :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	app.setup.catalog = app_test_catalog(app.setup.alloc)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	app.setup.resumed_provider = strings.clone("test-provider", app.setup.alloc)
+	app.setup.resumed_model = strings.clone("test-model", app.setup.alloc)
+
+	testing.expect(t, apply_startup_selection(&app, "", ""))
+	testing.expect_value(t, app.setup.session.model_id, "test-model")
+
+	// Flags are the launch's own instruction and outrank both.
+	testing.expect(t, apply_startup_selection(&app, "test-provider", "test-model"))
+	testing.expect_value(t, app.setup.session.model_id, "test-model")
+}
+
+// A stale selection is not fatal: the session's model is tried, and a launch
+// that can resolve nothing continues to the model menu rather than failing.
+@(test)
+test_a_stale_selection_falls_back_rather_than_failing :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	app.setup.catalog = app_test_catalog(app.setup.alloc)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	if err := session.selection_save(&app.setup.store, {provider = "gone", model = "gone"}); err != nil {
+		testing.fail_now(t, "the selection could not be stored")
+	}
+	app.setup.resumed_provider = strings.clone("test-provider", app.setup.alloc)
+	app.setup.resumed_model = strings.clone("test-model", app.setup.alloc)
+
+	testing.expect(t, apply_startup_selection(&app, "", ""))
+	testing.expect_value(t, app.setup.session.model_id, "test-model")
+}
+
+// A launch that can resolve nothing is not a failure: no model is selected, so
+// the model menu is what opens.
+@(test)
+test_a_launch_with_nothing_to_resolve_continues_to_the_menu :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	app.setup.catalog = app_test_catalog(app.setup.alloc)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	if err := session.selection_save(&app.setup.store, {provider = "gone", model = "gone"}); err != nil {
+		testing.fail_now(t, "the selection could not be stored")
+	}
+
+	testing.expect(t, apply_startup_selection(&app, "", ""))
+	testing.expect_value(t, app.setup.model_id, "")
+	// Why the stored selection did not apply is recorded for the menu to show.
+	testing.expect(t, app.run.snap.setup_error != "")
+}
+
+// One flag without the other is a launch mistake, not something to guess at.
+@(test)
+test_a_half_given_model_flag_is_refused :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	testing.expect(t, !apply_startup_selection(&app, "test-provider", ""))
+	testing.expect(t, !apply_startup_selection(&app, "", "test-model"))
 }
 
 // app_session_add creates another session in the store and returns a copy of its
@@ -380,15 +473,13 @@ test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 }
 
 // Resuming has to leave the conversation able to send, so the model the session
-// recorded is applied to the running session.
+// recorded is applied to the running session. The selection lives in the store,
+// so the fixture's own store is all the test needs.
 @(test)
 test_a_switch_applies_the_model_the_session_recorded :: proc(t: ^testing.T) {
 	app: App
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
-
-	state, previous, had_previous := app_state_isolate(t)
-	defer app_state_restore(state, previous, had_previous)
 
 	app.setup.catalog = app_test_catalog(app.setup.alloc)
 	defer agent.catalog_destroy(&app.setup.catalog)

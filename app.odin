@@ -620,14 +620,50 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	snap_append_locked(app, .Notice, fmt.tprintf("model set to %s / %s", provider_id, model_id))
 	app.run.snap.generation += 1
 
-	saved := agent.Selection {
+	saved := session.Selection {
 		provider = provider_id,
 		model    = model_id,
 		effort   = running.effort,
 	}
 	sync.mutex_unlock(&app.run.mu)
-	agent.selection_save(saved)
+	if save_err := session.selection_save(&app.setup.store, saved); save_err != nil {
+		local := save_err
+		fmt.eprintln("nabla: the selection could not be recorded:", session.error_detail(&local))
+	}
 	sync.mutex_lock(&app.run.mu)
+	return true
+}
+
+// apply_startup_selection chooses the model a launch runs with. Two flags win,
+// because they are the launch's own instruction, and a pair that cannot be
+// resolved is a launch mistake rather than something to paper over. Otherwise
+// the stored selection is used, because it is the user's own last choice, and
+// the model a resumed session recorded is the fallback when there is no usable
+// selection. Neither is fatal: a stale selection leaves the launch to the model
+// menu, which is where a model would be chosen anyway.
+//
+// False means the launch cannot continue. The reason is in the snapshot.
+apply_startup_selection :: proc(app: ^App, flag_provider, flag_model: string) -> bool {
+	if flag_provider != "" || flag_model != "" {
+		if flag_provider == "" || flag_model == "" {
+			selection_fail(app, "--provider and --model must be given together")
+			return false
+		}
+		return apply_selection(app, flag_provider, flag_model, "")
+	}
+
+	selection, found, load_err := session.selection_load(&app.setup.store, app.run.alloc)
+	defer session.selection_destroy(&selection, app.run.alloc)
+	if load_err != nil {
+		// A database the store just opened failing to answer this is worth saying
+		// out loud, but the launch can still proceed to the model menu.
+		local := load_err
+		fmt.eprintln("nabla: the selection could not be read:", session.error_detail(&local))
+	}
+	applied := found && apply_selection(app, selection.provider, selection.model, selection.effort)
+	if !applied && app.setup.resumed_provider != "" && app.setup.resumed_model != "" {
+		apply_selection(app, app.setup.resumed_provider, app.setup.resumed_model, "")
+	}
 	return true
 }
 
@@ -707,26 +743,8 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	input.parser_init(&app.parser)
 	app.raw = make([dynamic]input.Event, 0, 16, app.run.alloc)
 
-	if flag_provider != "" && flag_model != "" {
-		if !apply_selection(app, flag_provider, flag_model, "") {
-			fmt.eprintln("nabla:", app.run.snap.setup_error)
-			app_teardown(app)
-			return
-		}
-	} else if flag_provider == "" && flag_model == "" {
-		// The persisted selection is the user's own choice, so it outranks the model
-		// a resumed session happens to have recorded. That model is used only when
-		// there is no selection at all, which beats opening the model menu.
-		if selection, selection_ok := agent.selection_load(app.run.alloc); selection_ok {
-			apply_selection(app, selection.provider, selection.model, selection.effort)
-			agent.selection_destroy(&selection, app.run.alloc)
-		} else if app.setup.resumed_provider != "" && app.setup.resumed_model != "" {
-			// The session's own model is a weaker hint than a selection, so it is
-			// used only when no selection exists, which beats opening the model menu.
-			apply_selection(app, app.setup.resumed_provider, app.setup.resumed_model, "")
-		}
-	} else {
-		fmt.eprintln("nabla: --provider and --model must be given together")
+	if !apply_startup_selection(app, flag_provider, flag_model) {
+		fmt.eprintln("nabla:", app.run.snap.setup_error)
 		app_teardown(app)
 		return
 	}
@@ -952,7 +970,15 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		}
 		// The effort is part of the persisted selection, so a change rewrites it.
 		if applied {
-			agent.selection_save(agent.Selection{provider = app.setup.provider_id, model = app.setup.model_id, effort = app.setup.session.effort})
+			selection := session.Selection {
+				provider = app.setup.provider_id,
+				model    = app.setup.model_id,
+				effort   = app.setup.session.effort,
+			}
+			if save_err := session.selection_save(&app.setup.store, selection); save_err != nil {
+				local := save_err
+				snap_append(app, .Error, fmt.tprintf("the selection could not be recorded: %s", session.error_detail(&local)))
+			}
 		}
 	case .Model:
 		apply_selection(app, work.provider, work.text, "")

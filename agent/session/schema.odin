@@ -7,9 +7,9 @@ import "nabla:db"
 // SCHEMA_VERSION is the version this package writes. A database at a higher
 // version was written by newer code, and this package refuses it rather than
 // risk losing columns it does not know about.
-SCHEMA_VERSION :: 1
+SCHEMA_VERSION :: 2
 
-// The schema is deliberately four tables. Identity, order, ownership, and
+// The schema is deliberately small. Identity, order, ownership, and
 // correlation are columns, because those are the relationships the database has
 // to enforce or query. Content is a typed JSON payload, because it changes shape
 // as the harness grows and has no relational structure worth enforcing.
@@ -17,8 +17,8 @@ SCHEMA_VERSION :: 1
 // STRICT tables are used so a column refuses a value of the wrong storage class
 // instead of quietly storing it.
 //
-// MIGRATION_1 is the initial schema. Each element is one statement: the backend
-// refuses a string holding more than one.
+// Each migration element is one statement: the backend refuses a string holding
+// more than one.
 @(private)
 MIGRATION_1 := [?]string {
 	`CREATE TABLE sessions (
@@ -96,6 +96,19 @@ MIGRATION_1 := [?]string {
 	`CREATE UNIQUE INDEX entries_result ON entries (session_id, related_seq) WHERE kind = 'tool_result'`,
 }
 
+// MIGRATION_2 adds the selection: the serving identity a launch restores. It is
+// not conversation history, so it belongs to no session and is not ordered; the
+// single-row constraint is what says there is exactly one of it.
+@(private)
+MIGRATION_2 := [?]string {
+	`CREATE TABLE selection (
+		id       INTEGER PRIMARY KEY CHECK (id = 1),
+		provider TEXT NOT NULL CHECK (length(provider) > 0),
+		model    TEXT NOT NULL CHECK (length(model) > 0),
+		effort   TEXT NOT NULL DEFAULT ''
+	) STRICT`,
+}
+
 // migration_statements returns the statements that bring version to
 // version + 1, or nil when there is no such migration.
 @(private)
@@ -103,6 +116,8 @@ migration_statements :: proc(version: int) -> []string {
 	switch version {
 	case 1:
 		return MIGRATION_1[:]
+	case 2:
+		return MIGRATION_2[:]
 	}
 	return nil
 }
