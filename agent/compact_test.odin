@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:fmt"
 import "core:strings"
 import "core:testing"
 
@@ -177,6 +178,11 @@ test_a_compaction_request_is_recorded_and_closed :: proc(t: ^testing.T) {
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat.context_window = 500000
+	// An effort and an output bound the session would normally send, so the record
+	// can be checked against the compaction request's own settings rather than
+	// against an empty session.
+	chat.max_output_tokens = 64_000
+	chat.effort = chat_clone_string("high", chat.allocator)
 	_test_accept(t, chat, "first")
 	// More entries than the kept tail, so compaction has a span to summarize.
 	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
@@ -199,4 +205,13 @@ test_a_compaction_request_is_recorded_and_closed :: proc(t: ^testing.T) {
 	testing.expect_value(t, request.outcome, session.Outcome.Failed)
 	_, still_running := request.finished_at_ms.?
 	testing.expect(t, still_running, "a finished request records when it finished")
+
+	// The settings describe the request that was sent: the summarization bound and
+	// no reasoning effort, not the settings the session would send ordinarily.
+	testing.expect(
+		t,
+		strings.contains(request.config_json, fmt.tprintf("\"max_output_tokens\":%d", CHAT_COMPACT_MAX_OUTPUT)),
+		"the record should carry the compaction output bound",
+	)
+	testing.expect(t, strings.contains(request.config_json, `"effort":""`), "a summarization request carries no effort")
 }

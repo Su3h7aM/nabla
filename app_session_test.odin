@@ -57,6 +57,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 		delete(row.title, app.run.alloc)
 	}
 	delete(app.run.snap.sessions)
+	delete(string(app.run.snap.active_session), app.run.alloc)
 	delete(app.run.snap.status.provider_id, app.run.alloc)
 	delete(app.run.snap.status.model_id, app.run.alloc)
 	delete(app.run.snap.status.effort, app.run.alloc)

@@ -33,6 +33,7 @@ command_app_end :: proc(app: ^App) {
 		delete(row.title, app.run.alloc)
 	}
 	delete(app.run.snap.sessions)
+	delete(string(app.run.snap.active_session), app.run.alloc)
 	delete(app.run.snap.status.effort, app.run.alloc)
 	for level in app.run.snap.status.effort_levels { delete(level, app.run.alloc) }
 	delete(app.run.snap.status.effort_levels)
@@ -152,6 +153,36 @@ test_effort_menu_offers_the_default_and_every_level :: proc(t: ^testing.T) {
 	defer delete(work.text, app.run.alloc)
 	testing.expect_value(t, work.kind, Work_Kind.Effort)
 	testing.expect_value(t, work.text, "")
+}
+
+@(test)
+test_the_session_menu_opens_where_the_worker_is :: proc(t: ^testing.T) {
+	app: App
+	command_app(t, &app)
+	defer command_app_end(&app)
+
+	append(
+		&app.run.snap.sessions,
+		Session_Row {
+			id = session.Session_Id(strings.clone("0123456789abcdef0123456789abcdef", app.run.alloc)),
+			title = strings.clone("first task", app.run.alloc),
+		},
+	)
+	append(
+		&app.run.snap.sessions,
+		Session_Row {
+			id = session.Session_Id(strings.clone("fedcba9876543210fedcba9876543210", app.run.alloc)),
+			title = strings.clone("second task", app.run.alloc),
+		},
+	)
+	// The worker publishes which session it is running, because the menu must not
+	// read the running session itself.
+	app.run.snap.active_session = session.Session_Id(strings.clone("fedcba9876543210fedcba9876543210", app.run.alloc))
+
+	menu_open_session(&app)
+	defer menu_close(&app)
+	if !testing.expect_value(t, len(app.menu.choices), 2) { return }
+	testing.expect_value(t, app.menu.cursor, 1)
 }
 
 @(test)

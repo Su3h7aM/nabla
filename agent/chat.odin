@@ -347,12 +347,19 @@ Chat_Request_Error :: struct {
 	message: string `json:"message"`,
 }
 
+// chat_request_config_json describes the settings a request is sent with. A
+// summarization request carries its own output bound and no reasoning effort, so
+// the record describes that request rather than the ordinary one the session
+// would run.
 @(private)
-chat_request_config_json :: proc(chat: ^Chat_Session) -> string {
-	config := Chat_Request_Config {
-		effort = chat.effort,
+chat_request_config_json :: proc(chat: ^Chat_Session, compact: bool) -> string {
+	config := Chat_Request_Config{}
+	if compact {
+		config.max_output_tokens = CHAT_COMPACT_MAX_OUTPUT
+	} else {
+		config.effort = chat.effort
+		if chat.max_output_tokens > 0 { config.max_output_tokens = i64(chat.max_output_tokens) }
 	}
-	if chat.max_output_tokens > 0 { config.max_output_tokens = i64(chat.max_output_tokens) }
 	data, marshal_err := json.marshal(config, allocator = context.temp_allocator)
 	if marshal_err != nil { return "{}" }
 	return string(data)
@@ -455,7 +462,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 			provider = chat.provider_id,
 			model_requested = chat.model_id,
 			api = chat_api_name(connection.API),
-			config_json = chat_request_config_json(chat),
+			config_json = chat_request_config_json(chat, false),
 			input_json = chat_request_input_json(chat, prep.history, len(prep.history.entries), false),
 		},
 		at_ms,

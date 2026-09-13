@@ -66,15 +66,19 @@ Status :: struct {
 // Snapshot is everything the renderer reads. The worker bumps generation
 // after any change; the main thread redraws when it moves.
 Snapshot :: struct {
-	entries:     [dynamic]Entry, // owned,
-	status:      Status,
+	entries:        [dynamic]Entry, // owned,
+	status:         Status,
 	// sessions is what the /resume menu offers. Only the worker reads the store,
 	// so only the worker rebuilds this.
-	sessions:    [dynamic]Session_Row, // owned,
+	sessions:       [dynamic]Session_Row, // owned,
+	// active_session is the session the worker is running. It travels with the row
+	// list so the menu can open on it without reading the running session, which
+	// the worker can replace at any moment.
+	active_session: session.Session_Id, // owned,
 	// setup_error is why the last selection attempt failed; the model menu shows
 	// it because it has no transcript.
-	setup_error: string, // owned,
-	generation:  u64,
+	setup_error:    string, // owned,
+	generation:     u64,
 }
 
 Work_Kind :: enum u8 {
@@ -839,6 +843,7 @@ app_teardown :: proc(app: ^App) {
 		delete(row.title, app.run.alloc)
 	}
 	delete(app.run.snap.sessions)
+	delete(string(app.run.snap.active_session), app.run.alloc)
 	delete(app.run.snap.status.provider_id, app.run.alloc)
 	delete(app.run.snap.status.model_id, app.run.alloc)
 	delete(app.run.snap.status.effort, app.run.alloc)
@@ -899,6 +904,10 @@ session_refresh_rows :: proc(app: ^App) {
 			Session_Row{id = session.Session_Id(strings.clone(string(entry.id), app.run.alloc)), title = strings.clone(entry.title, app.run.alloc)},
 		)
 	}
+	// The running session is published with the list, so the menu can open on it
+	// without reading the running session from another thread.
+	delete(string(app.run.snap.active_session), app.run.alloc)
+	app.run.snap.active_session = session.Session_Id(strings.clone(string(app.setup.session.id), app.run.alloc))
 	app.run.snap.generation += 1
 }
 
@@ -1233,14 +1242,15 @@ model_choice_less :: proc(a, b: Model_Choice) -> bool {
 }
 
 // menu_open_effort lists the levels the model allows, plus the provider default.
-// The levels are snapshot state, because only the worker owns the session, so
-// they are read under the lock the worker writes them with.
+// The levels are snapshot state, because only the worker owns the session, and
+// their strings belong to the worker, so they are copied while the lock that
+// protects them is held.
 menu_open_effort :: proc(app: ^App) {
 	sync.mutex_lock(&app.run.mu)
 	current := strings.clone(app.run.snap.status.effort, context.temp_allocator)
 	levels := make([dynamic]string, 0, len(app.run.snap.status.effort_levels) + 1, context.temp_allocator)
 	append(&levels, "provider default")
-	for level in app.run.snap.status.effort_levels { append(&levels, level) }
+	for level in app.run.snap.status.effort_levels { append(&levels, strings.clone(level, context.temp_allocator)) }
 	sync.mutex_unlock(&app.run.mu)
 	defer delete(levels)
 
@@ -1257,15 +1267,15 @@ menu_open_effort :: proc(app: ^App) {
 // a short id as the second column. Only the worker reads the store, so the list
 // it built is what the menu shows.
 menu_open_session :: proc(app: ^App) {
-	sync.mutex_lock(&app.run.mu)
-	rows := make([dynamic]Session_Row, 0, len(app.run.snap.sessions), context.temp_allocator)
-	for &row in app.run.snap.sessions { append(&rows, row) }
-	active := app.setup.session.id
-	sync.mutex_unlock(&app.run.mu)
-	defer delete(rows)
+	choices := make([dynamic]Choice, 0, 8, app.run.alloc)
+	active: session.Session_Id
 
-	choices := make([dynamic]Choice, 0, len(rows), app.run.alloc)
-	for &row in rows {
+	// The snapshot's rows and their strings belong to the worker, which can replace
+	// them the moment the lock is released, so the labels are copied while the lock
+	// that protects them is still held.
+	sync.mutex_lock(&app.run.mu)
+	active = session.Session_Id(strings.clone(string(app.run.snap.active_session), app.run.alloc))
+	for &row in app.run.snap.sessions {
 		label := row.title if row.title != "" else "(untitled)"
 		append(
 			&choices,
@@ -1276,12 +1286,23 @@ menu_open_session :: proc(app: ^App) {
 			},
 		)
 	}
+	sync.mutex_unlock(&app.run.mu)
+	defer delete(string(active), app.run.alloc)
+
 	menu_begin(app, "sessions in this workspace", choices, false)
+	menu_pick_session(app, active)
+}
+
+// menu_pick_session opens the list on the running session, so the menu shows
+// where the user already is.
+@(private)
+menu_pick_session :: proc(app: ^App, active: session.Session_Id) {
+	if active == "" { return }
 	for choice, index in app.menu.choices {
 		action := choice.action.(Session_Choice)
 		if action.id == active {
 			app.menu.cursor = index
-			break
+			return
 		}
 	}
 }
