@@ -214,7 +214,9 @@ Session_Start_Kind :: enum {
 	// New starts a session in the launch directory. It is the zero value, so a
 	// launch that asks for nothing starts fresh.
 	New,
-	// Resume_Latest opens the newest session that ran in the launch directory.
+	// Resume_Latest opens the newest session that ran and recorded work in the
+	// launch directory. A session that was created and then abandoned holds no
+	// work, so it is not a candidate.
 	Resume_Latest,
 	// Resume_Id opens one named session, wherever it ran.
 	Resume_Id,

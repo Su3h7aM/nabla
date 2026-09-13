@@ -217,7 +217,9 @@ session_open_target :: proc(setup: ^Run_Setup, start: Session_Start, launch_work
 		return target, true
 
 	case .Resume_Latest:
-		sessions, list_err := session.session_list(&setup.store, {workspace = launch_workspace, limit = 1}, setup.alloc)
+		// An empty session does not count. A launch opened and closed without a prompt
+		// must not become the session a later --resume picks up.
+		sessions, list_err := session.session_list(&setup.store, {workspace = launch_workspace, limit = 1, used_only = true}, setup.alloc)
 		if list_err != nil {
 			local := list_err
 			fmt.eprintln("nabla: cannot list sessions:", session.error_detail(&local))

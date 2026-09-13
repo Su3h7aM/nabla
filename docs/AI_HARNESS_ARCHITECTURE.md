@@ -250,8 +250,9 @@ run the same session. A claim is also what a mutation requires, which is why ope
 recording anything in it are separate steps.
 
 A launch opens exactly what it asks for: no flag starts a new session in the current directory,
-`--resume` opens the newest session that ran in that directory, and `--resume SESSION` opens that
-session by id wherever it ran. Resolving the target is separate from claiming it, so a refused
+`--resume` opens the newest session that recorded work in that directory, and `--resume SESSION`
+opens that session by id wherever it ran. A session that was created and then abandoned holds no
+work, so a resume passes over it. Resolving the target is separate from claiming it, so a refused
 resume costs nothing and never falls back to a different session. Opening an interrupted session
 settles it before anything new is admitted.
 

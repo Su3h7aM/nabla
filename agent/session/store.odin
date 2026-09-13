@@ -339,6 +339,9 @@ session_list :: proc(store: ^Store, options: List_Options, allocator := context.
 		strings.write_string(&builder, " AND workspace = ?")
 		append(&args, db.Value(options.workspace))
 	}
+	if options.used_only {
+		strings.write_string(&builder, SESSION_USED_ONLY)
+	}
 	if cursor, has_cursor := options.after.?; has_cursor {
 		strings.write_string(&builder, " AND (updated_at_ms < ? OR (updated_at_ms = ? AND id < ?))")
 		append(&args, db.Value(cursor.updated_at_ms))
@@ -530,6 +533,12 @@ SESSION_SELECT_ONE :: `SELECT ` + SESSION_COLUMNS + ` FROM sessions WHERE id = ?
 
 @(private)
 SESSION_SELECT_LIST :: `SELECT ` + SESSION_COLUMNS + ` FROM sessions WHERE 1 = 1`
+
+// SESSION_USED_ONLY keeps the sessions that hold work. The row is written when a
+// session is created, so the row alone says nothing about whether it was used;
+// only what hangs off it does. Each subquery is a primary-key lookup.
+@(private)
+SESSION_USED_ONLY :: ` AND (EXISTS (SELECT 1 FROM turns WHERE turns.session_id = sessions.id) OR EXISTS (SELECT 1 FROM requests WHERE requests.session_id = sessions.id) OR EXISTS (SELECT 1 FROM entries WHERE entries.session_id = sessions.id))`
 
 @(private)
 session_scan :: proc(values: []db.Value, allocator: mem.Allocator) -> (session: Session, err: Error) {

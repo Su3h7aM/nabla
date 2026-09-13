@@ -79,6 +79,11 @@ List_Options :: struct {
 	// include_archived lists archived sessions alongside the active ones.
 	include_archived: bool,
 
+	// used_only lists only sessions that hold work: one that has opened a turn,
+	// made a request, or recorded an entry. Creating a session writes its row and
+	// nothing else, so a session that was opened and then abandoned is left out.
+	used_only:        bool,
+
 	// limit bounds one page. Zero uses SESSION_LIST_DEFAULT_LIMIT; a value above
 	// SESSION_LIST_MAX_LIMIT is clamped.
 	limit:            int,

@@ -162,6 +162,42 @@ test_list_orders_by_activity_and_pages :: proc(t: ^testing.T) {
 	testing.expect_value(t, second_page[1].id, ids[0])
 }
 
+// Creating a session writes its row and nothing else, so a listing filtered to
+// used sessions has to read what the session recorded. The abandoned session
+// here is newer than the used one, which is the order a bare resume sees.
+@(test)
+test_list_can_skip_sessions_that_were_never_used :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	used, used_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, used_err)
+	defer session_destroy(&used)
+	_expect_ok(t, session_claim(&store, used.id))
+	_, turn_err := turn_begin(&store, used.id, "hello", .Prompt, 2_000)
+	_expect_ok(t, turn_err)
+	_expect_ok(t, session_release(&store))
+
+	abandoned, abandoned_err := session_create(&store, {workspace = "/tmp/project"}, 3_000)
+	_expect_ok(t, abandoned_err)
+	defer session_destroy(&abandoned)
+
+	every, every_err := session_list(&store, {workspace = "/tmp/project"})
+	_expect_ok(t, every_err)
+	defer sessions_destroy(every)
+	if !testing.expect_value(t, len(every), 2) { return }
+	testing.expect_value(t, every[0].id, abandoned.id)
+
+	// A limit of one is what the bare resume asks for, and the filter has to be
+	// applied before the limit for it to matter.
+	used_only, used_only_err := session_list(&store, {workspace = "/tmp/project", limit = 1, used_only = true})
+	_expect_ok(t, used_only_err)
+	defer sessions_destroy(used_only)
+	if !testing.expect_value(t, len(used_only), 1) { return }
+	testing.expect_value(t, used_only[0].id, used.id)
+}
+
 @(test)
 test_claim_is_exclusive :: proc(t: ^testing.T) {
 	store: Store

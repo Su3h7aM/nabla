@@ -114,6 +114,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	if !testing.expect(t, run_session_attach(&first_setup, workspace, {kind = .New})) { return }
 	first := session.Session_Id(strings.clone(string(first_setup.session.id), context.allocator))
 	defer delete(string(first), context.allocator)
+	app_session_turn(t, &first_setup)
 	attach_setup_destroy(&first_setup)
 
 	// Closing and reopening in one directory asks for a fresh conversation. A
@@ -125,6 +126,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	if !testing.expect(t, run_session_attach(&second_setup, workspace, {kind = .New})) { return }
 	second := session.Session_Id(strings.clone(string(second_setup.session.id), context.allocator))
 	defer delete(string(second), context.allocator)
+	app_session_turn(t, &second_setup)
 	attach_setup_destroy(&second_setup)
 	testing.expect(t, first != second, "a second launch must start a second session")
 
@@ -255,6 +257,34 @@ app_session_add :: proc(t: ^testing.T, setup: ^Run_Setup, options: session.Creat
 	return session.Session_Id(strings.clone(string(created.id), setup.alloc))
 }
 
+// app_session_use creates a session and records one turn in it, which is what
+// makes it a candidate for a bare resume. The turn needs the writer claim, and
+// the fixture's own session holds it, so the claim is swapped for the candidate
+// and swapped back, the way a running session switch does it.
+app_session_use :: proc(t: ^testing.T, setup: ^Run_Setup, options: session.Create_Options, at_ms: i64) -> session.Session_Id {
+	created, err := session.session_create(&setup.store, options, at_ms)
+	if err != nil { testing.fail_now(t, "session_create failed") }
+	defer session.session_destroy(&created)
+
+	displaced, claim_err := session.session_claim_candidate(&setup.store, created.id)
+	if claim_err != nil { testing.fail_now(t, "session_claim_candidate failed") }
+	if _, turn_err := session.turn_begin(&setup.store, created.id, "hello", .Prompt, at_ms); turn_err != nil {
+		testing.fail_now(t, "turn_begin failed")
+	}
+	if restore_err := session.session_claim_restore(&setup.store, displaced); restore_err != nil {
+		testing.fail_now(t, "session_claim_restore failed")
+	}
+	return session.Session_Id(strings.clone(string(created.id), setup.alloc))
+}
+
+// app_session_turn records one turn in the session a setup already holds and
+// claims, which is what makes it a candidate for a bare resume.
+app_session_turn :: proc(t: ^testing.T, setup: ^Run_Setup) {
+	if _, turn_err := session.turn_begin(&setup.store, setup.session.id, "hello", .Prompt, session.now_ms()); turn_err != nil {
+		testing.fail_now(t, "turn_begin failed")
+	}
+}
+
 // app_session_accept admits a prompt into the running session and checks that it
 // was recorded. A refusal that merely leaves the running session's id looking the
 // same is not enough: the session has to still be claimed and writable.
@@ -376,12 +406,13 @@ test_resume_latest_is_scoped_to_the_directory :: proc(t: ^testing.T) {
 	}
 
 	// The newest session in the store belongs to another directory, so picking it
-	// up here would be the wrong answer.
-	elder := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 2_000)
+	// up here would be the wrong answer. Every session here holds a turn, so none
+	// of them is passed over for being empty.
+	elder := app_session_use(t, &app.setup, {workspace = app.setup.workspace}, 2_000)
 	defer delete(string(elder), app.setup.alloc)
-	newest := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 3_000)
+	newest := app_session_use(t, &app.setup, {workspace = app.setup.workspace}, 3_000)
 	defer delete(string(newest), app.setup.alloc)
-	elsewhere := app_session_add(t, &app.setup, {workspace = other}, 9_000)
+	elsewhere := app_session_use(t, &app.setup, {workspace = other}, 9_000)
 	defer delete(string(elsewhere), app.setup.alloc)
 
 	target, ok := session_open_target(&app.setup, {kind = .Resume_Latest}, app.setup.workspace)
@@ -390,6 +421,27 @@ test_resume_latest_is_scoped_to_the_directory :: proc(t: ^testing.T) {
 	testing.expect_value(t, target.id, newest)
 	testing.expect(t, target.id != elsewhere, "a resume must not leave the directory")
 	testing.expect_value(t, target.workspace, app.setup.workspace)
+}
+
+// Opening the harness without --resume and closing it without typing creates a
+// session that was never used. It is newer than the conversation beside it, and
+// a later bare resume must still open the conversation.
+@(test)
+test_resume_latest_skips_a_session_that_was_never_used :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	conversation := app_session_use(t, &app.setup, {workspace = app.setup.workspace}, 2_000)
+	defer delete(string(conversation), app.setup.alloc)
+	abandoned := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 3_000)
+	defer delete(string(abandoned), app.setup.alloc)
+
+	target, ok := session_open_target(&app.setup, {kind = .Resume_Latest}, app.setup.workspace)
+	if !testing.expect(t, ok) { return }
+	defer session_target_destroy(&target, app.setup.alloc)
+	testing.expect_value(t, target.id, conversation)
+	testing.expect(t, target.id != abandoned, "a session that was never used must not be resumed")
 }
 
 // Nothing to resume is a refusal, not a fresh session in disguise.
@@ -404,6 +456,10 @@ test_resume_latest_refuses_an_empty_directory :: proc(t: ^testing.T) {
 		os.remove_all(empty)
 		delete(empty, context.allocator)
 	}
+
+	// A session in that directory that was never used leaves nothing to resume.
+	abandoned := app_session_add(t, &app.setup, {workspace = empty}, 4_000)
+	defer delete(string(abandoned), app.setup.alloc)
 
 	_, ok := session_open_target(&app.setup, {kind = .Resume_Latest}, empty)
 	testing.expect(t, !ok, "a resume with nothing to resume must fail")
