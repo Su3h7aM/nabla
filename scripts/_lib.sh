@@ -11,6 +11,10 @@ NABLA_SERIAL_TEST_PACKAGES="agent ai layout"
 # core:testing.
 NABLA_HARNESS_TEST_PACKAGES=""
 
+# The root package is in the list because its tests point the XDG state directory
+# at a temporary directory, which is process-wide.
+NABLA_SERIAL_TEST_PACKAGES="agent ai layout ."
+
 nabla_packages() {
 	local d sub base
 	for d in "$NABLA_ROOT"/*/; do

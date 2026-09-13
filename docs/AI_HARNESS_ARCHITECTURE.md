@@ -91,7 +91,7 @@ assumed is reported to the observer, so running on a default is visible rather t
 indistinguishable from a fact.
 
 **Reasoning: nothing is sent.** Reasoning stays unspecified and the provider applies its own
-default. `chat_build_request` puts `reasoning_effort` on the wire only when an effort was chosen,
+default. `chat_build_request_into` puts `reasoning_effort` on the wire only when an effort was chosen,
 and `chat_session_set_effort` accepts a level only if it appears in the model's level list. A model
 no source described has an empty level list, so no effort can be set and no effort, level, budget,
 or equivalent parameter reaches the provider. The defaults deliberately do not fabricate reasoning
@@ -221,14 +221,39 @@ resolved model, the catalog, the tool set, and runtime config. Never stored.
 Rules:
 
 - The projection is rebuilt for every request, including tool continuations
-  (today: `chat_build_request`, `agent/chat.odin`).
+  (`chat_build_request_into`, `agent/chat.odin`).
 - After compaction, rebuild from committed history, never from a pre-compaction view
-  (`chat_build_from_active`; the stale-view case is a tested failure mode).
+  (`chat_rebuild_prep`; the stale-view case is a tested failure mode).
 - The projection is *repairable*: it must not emit a tool call without its result, must not emit a
-  result without its call, and must keep call/result runs contiguous.
+  result without its call, and must keep call/result runs contiguous. Recovery enforces the first
+  two at open: a call that was dispatched and never came back is closed as an unknown outcome, and
+  a call that was never dispatched is closed as not executed.
 - **Tool results enter durable state before the next model request.** Never send a projection that
   contains a tool result the conversation does not have.
 - The durable model must not gain provider-shaped fields beyond an opaque replay slot (§8).
+
+### Where the durable conversation lives
+
+The store is a SQLite database in the XDG state directory, owned by `agent/session`. Four tables:
+a `sessions` header (identity, directory, title, provider, model), `turns`, `requests` (one row per
+model request, carrying the settings it was sent with and the usage it reported), and `entries` (an
+append-only transcript ordered by a per-session sequence). Content is typed JSON in one column;
+identity, order, ownership, and correlation are columns the database enforces.
+
+A `Store` owns one connection and one caller drives it from one thread: the worker. History is read
+back only through `context_load`, which is the newest checkpoint's summary followed by the entries
+the summary does not cover, minus bookkeeping a model is never shown. Memory holds the work in
+flight and nothing else.
+
+One session is claimed for writing at a time through an advisory file lock, so two processes cannot
+run the same session. A claim is also what a mutation requires, which is why opening a session and
+recording anything in it are separate steps.
+
+A launch opens exactly what it asks for: no flag starts a new session in the current directory,
+`--resume` opens the newest session that ran in that directory, and `--resume SESSION` opens that
+session by id wherever it ran. Resolving the target is separate from claiming it, so a refused
+resume costs nothing and never falls back to a different session. Opening an interrupted session
+settles it before anything new is admitted.
 
 ---
 
@@ -426,7 +451,7 @@ A subagent is a **tool** the orchestrating agent invokes. It is not a configured
 **Core (`agent`, `ai`) owns:** conversation, model interaction, tools, context/budget, streaming,
 cancellation, steering, compaction, subagents.
 
-**Edge owns:** ACP, CLI/TUI, presentation, rendering, command menus, session persistence policy,
+**Edge owns:** ACP, CLI/TUI, presentation, rendering, command menus, which session a launch opens,
 telemetry export.
 
 Rules:

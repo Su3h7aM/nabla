@@ -6,6 +6,7 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 import "nabla:agent"
 import "nabla:agent/session"
@@ -75,6 +76,74 @@ app_session_end :: proc(app: ^App, directory: string) {
 	delete(directory, context.allocator)
 }
 
+// attach_setup_destroy releases what run_session_attach built, without the
+// catalog teardown an empty setup does not need.
+attach_setup_destroy :: proc(setup: ^Run_Setup) {
+	agent.chat_session_destroy(&setup.session)
+	session.session_release(&setup.store)
+	session.store_close(&setup.store)
+	delete(setup.workspace, setup.alloc)
+	delete(setup.resumed_provider, setup.alloc)
+	delete(setup.resumed_model, setup.alloc)
+	setup^ = {}
+}
+
+// The whole open path, as a launch drives it: a new session each time, the
+// newest for this directory on a bare resume, and one named session by id.
+@(test)
+test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
+	state, previous, had_previous := app_state_isolate(t)
+	defer app_state_restore(state, previous, had_previous)
+
+	workspace, workspace_err := os.get_working_directory(context.allocator)
+	if workspace_err != nil { testing.fail_now(t, "could not read the working directory") }
+	defer delete(workspace, context.allocator)
+
+	first_setup: Run_Setup
+	first_setup.alloc = context.allocator
+	if !testing.expect(t, run_session_attach(&first_setup, workspace, {kind = .New})) { return }
+	first := session.Session_Id(strings.clone(string(first_setup.session.id), context.allocator))
+	defer delete(string(first), context.allocator)
+	attach_setup_destroy(&first_setup)
+
+	// Closing and reopening in one directory asks for a fresh conversation. A
+	// millisecond apart, because that is the clock the store orders sessions by,
+	// and two sessions created in the same one are ordered by id instead.
+	time.sleep(2 * time.Millisecond)
+	second_setup: Run_Setup
+	second_setup.alloc = context.allocator
+	if !testing.expect(t, run_session_attach(&second_setup, workspace, {kind = .New})) { return }
+	second := session.Session_Id(strings.clone(string(second_setup.session.id), context.allocator))
+	defer delete(string(second), context.allocator)
+	attach_setup_destroy(&second_setup)
+	testing.expect(t, first != second, "a second launch must start a second session")
+
+	latest_setup: Run_Setup
+	latest_setup.alloc = context.allocator
+	if !testing.expect(t, run_session_attach(&latest_setup, workspace, {kind = .Resume_Latest})) { return }
+	testing.expect_value(t, latest_setup.session.id, second)
+	testing.expect_value(t, latest_setup.workspace, workspace)
+	attach_setup_destroy(&latest_setup)
+
+	named_setup: Run_Setup
+	named_setup.alloc = context.allocator
+	if !testing.expect(t, run_session_attach(&named_setup, workspace, {kind = .Resume_Id, id = string(first)})) { return }
+	testing.expect_value(t, named_setup.session.id, first)
+	attach_setup_destroy(&named_setup)
+
+	// The running session is the one the launch named, and the store is free
+	// again after each teardown.
+	missing_setup: Run_Setup
+	missing_setup.alloc = context.allocator
+	testing.expect(
+		t,
+		!run_session_attach(&missing_setup, workspace, {kind = .Resume_Id, id = "00000000000000000000000000000000"}),
+		"an unknown id must not silently become a new session",
+	)
+	session.store_close(&missing_setup.store)
+	delete(missing_setup.workspace, missing_setup.alloc)
+}
+
 // app_session_add creates another session in the store and returns a copy of its
 // id, owned by setup.alloc.
 app_session_add :: proc(t: ^testing.T, setup: ^Run_Setup, options: session.Create_Options, at_ms: i64) -> session.Session_Id {
@@ -127,16 +196,25 @@ app_test_catalog :: proc(allocator: mem.Allocator) -> agent.Catalog {
 }
 
 // app_state_isolate points the state directory at a temporary directory, so a
-// test that persists a selection cannot touch the user's own state.
-app_state_isolate :: proc(t: ^testing.T) -> string {
-	state, state_err := os.make_directory_temp("", "nabla-app-state-*", context.allocator)
-	if state_err != nil { testing.fail_now(t, "could not create a temporary state directory") }
-	os.set_env("XDG_STATE_HOME", state)
-	return state
+// test that persists a selection or opens the session database cannot touch the
+// user's own state. It returns the previous value, which app_state_restore puts
+// back. The variable is process-wide, which is why the root package's tests run
+// on one thread.
+app_state_isolate :: proc(t: ^testing.T) -> (state: string, previous: string, had_previous: bool) {
+	directory, directory_err := os.make_directory_temp("", "nabla-app-state-*", context.allocator)
+	if directory_err != nil { testing.fail_now(t, "could not create a temporary state directory") }
+	previous, had_previous = os.lookup_env("XDG_STATE_HOME", context.allocator)
+	os.set_env("XDG_STATE_HOME", directory)
+	return directory, previous, had_previous
 }
 
-app_state_restore :: proc(state: string) {
-	os.unset_env("XDG_STATE_HOME")
+app_state_restore :: proc(state, previous: string, had_previous: bool) {
+	if had_previous {
+		os.set_env("XDG_STATE_HOME", previous)
+	} else {
+		os.unset_env("XDG_STATE_HOME")
+	}
+	delete(previous, context.allocator)
 	os.remove_all(state)
 	delete(state, context.allocator)
 }
@@ -309,8 +387,8 @@ test_a_switch_applies_the_model_the_session_recorded :: proc(t: ^testing.T) {
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
 
-	state := app_state_isolate(t)
-	defer app_state_restore(state)
+	state, previous, had_previous := app_state_isolate(t)
+	defer app_state_restore(state, previous, had_previous)
 
 	app.setup.catalog = app_test_catalog(app.setup.alloc)
 	defer agent.catalog_destroy(&app.setup.catalog)
