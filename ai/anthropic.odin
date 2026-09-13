@@ -72,7 +72,10 @@ anthropic_encode_request :: proc(request: Provider_Request, allocator := context
 	}
 
 	value := json.Value(object)
-	result, err := json.unparse(value, allocator = allocator)
+	// Keys are sorted so the same conversation encodes to the same bytes every
+	// time, including in a later process. Map iteration order is otherwise
+	// allocation-dependent, which would move bytes inside the cached prefix.
+	result, err := json.unparse(value, {sort_maps_by_key = true}, allocator)
 	json.destroy_value(value, allocator)
 	if err != nil { return "", .Invalid_Message }
 	return result, .None

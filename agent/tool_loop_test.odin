@@ -931,3 +931,112 @@ bound_of :: proc(object: json.Object, key: string) -> (value: i64, present: bool
 	return i64(integer), true, true
 }
 
+// Everything a provider cache can do rests on one property of the harness: a
+// request built from the same conversation is identical every time, and appending
+// a turn leaves every earlier item exactly where it was. Breakpoint placement and
+// cache keys cannot compensate for a rebuild that moves a byte, so this pins the
+// property for all three APIs at once.
+@(test)
+test_a_request_rebuilds_identically_and_only_appends :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	chat.max_output_tokens = 1024
+	_test_accept(t, chat, "run printf ok")
+	call_seq := _test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			created_at_ms = 2_000,
+			payload = session.Tool_Call_Entry{call_id = "call_1", name = TOOL_SHELL_NAME, arguments = `{"command":"ls"}`},
+		},
+	)
+	_test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			created_at_ms = 2_001,
+			related_seq = call_seq,
+			payload = session.Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = `{"status":"exited"}`, origin = .Observed},
+		},
+	)
+	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_002, payload = session.Assistant_Entry{text = "done"}})
+	// A native Responses output replays verbatim, so it is the path most able to
+	// move bytes if the encoder is not stable.
+	_test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			created_at_ms = 2_003,
+			payload = session.Response_Entry {
+				output = `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Working.","annotations":[]}]},{"type":"function_call","id":"fc_1","call_id":"call_2","name":"shell","arguments":"{}"}]`,
+			},
+		},
+	)
+
+	for connection in ([?]ai.Provider_Connection {
+		{API = .OpenAI_Chat_Completions},
+		{API = .OpenAI_Responses},
+		{API = .Anthropic_Messages},
+	}) {
+		first := encode_request_body(t, chat, connection)
+		defer delete(first)
+		second := encode_request_body(t, chat, connection)
+		defer delete(second)
+		testing.expectf(t, second == first, "an unchanged conversation must encode to the same bytes for %v", connection.API)
+
+		// A later turn grows the conversation. Everything already sent has to come
+		// back byte for byte, or the provider sees a different prefix and re-reads
+		// it whether or not it is cached.
+		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_003, payload = session.User_Entry{text = "and again", origin = .Prompt}})
+		grown := encode_request_body(t, chat, connection)
+		defer delete(grown)
+		before := encoded_items(t, first)
+		after := encoded_items(t, grown)
+		if !testing.expectf(t, len(after) > len(before), "the grown request should carry more items for %v", connection.API) { continue }
+		for item, i in before {
+			if !testing.expectf(t, after[i] == item, "item %d changed for %v", i, connection.API) { break }
+		}
+	}
+}
+
+@(private)
+encode_request_body :: proc(t: ^testing.T, chat: ^Chat_Session, connection: ai.Provider_Connection) -> string {
+	prep, prep_err := chat_prepare(chat, connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+	body, encode_err := ai.Provider_Encode_Request(prep.request)
+	if !testing.expect_value(t, encode_err, ai.Provider_Request_Error.None) { return "" }
+	return body
+}
+
+// encoded_items returns the conversation array of an encoded request as text, one
+// entry per item, so a prefix can be compared without depending on object key
+// order.
+@(private)
+encoded_items :: proc(t: ^testing.T, body: string) -> []string {
+	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
+	if !testing.expect_value(t, parse_err, nil) { return nil }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, object_ok := value.(json.Object)
+	if !testing.expect(t, object_ok) { return nil }
+	array, array_ok := object["input"].(json.Array)
+	if !array_ok {
+		array, array_ok = object["messages"].(json.Array)
+	}
+	if !testing.expect(t, array_ok) { return nil }
+	items := make([]string, len(array), context.temp_allocator)
+	for item, i in array {
+		// The same key order the encoder used, so equality here is equality of the
+		// bytes the provider would receive.
+		text, unparse_err := json.unparse(item, {sort_maps_by_key = true}, context.temp_allocator)
+		if !testing.expect_value(t, unparse_err, nil) { return nil }
+		items[i] = text
+	}
+	return items
+}
