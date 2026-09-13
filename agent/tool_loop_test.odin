@@ -398,6 +398,43 @@ test_the_first_prompt_names_the_session :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_status_reports_what_the_session_already_knows :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.context_window = 200_000
+	chat.max_output_tokens = 4_096
+	chat.tools_enabled = true
+	_test_accept(t, chat, "explain the parser")
+
+	log := Status_Log {
+		buffer = strings.builder_make(context.temp_allocator),
+	}
+	defer strings.builder_destroy(&log.buffer)
+	observer := Chat_Observer {
+		user_data = &log,
+		message   = status_log_message,
+	}
+	chat_notice_status(chat, observer, session.now_ms())
+
+	report := strings.to_string(log.buffer)
+	testing.expect(t, strings.contains(report, "explain the parser"), "the session's own title should be reported")
+	testing.expect(t, strings.contains(report, chat.workspace), "the working directory should be reported")
+	testing.expect(t, strings.contains(report, "test-provider / test-model"), "the model should be reported")
+	testing.expect(t, strings.contains(report, "200000 window"), "the context budget should be reported")
+	testing.expect(t, strings.contains(report, "shell"), "the tool set should be reported")
+}
+
+@(test)
+test_age_text_reads_in_two_units :: proc(t: ^testing.T) {
+	testing.expect_value(t, chat_age_text(5_000), "5s")
+	testing.expect_value(t, chat_age_text(90_000), "1m 30s")
+	testing.expect_value(t, chat_age_text(3 * 3_600_000 + 5 * 60_000), "3h 5m")
+	testing.expect_value(t, chat_age_text(2 * 86_400_000 + 3 * 3_600_000), "2d 3h")
+}
+
+@(test)
 test_usage_is_collected_per_request :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))

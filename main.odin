@@ -43,7 +43,7 @@ main :: proc() {
 	if options.help {
 		fmt.println("nabla [--config PATH] [--provider ID --model ID]")
 		fmt.println("default config: $XDG_CONFIG_HOME/nabla/config.lua (~/.config/nabla/config.lua)")
-		fmt.println("without provider/model, the last selection is restored, or the picker opens")
+		fmt.println("without provider/model, the last selection is restored, or the model menu opens")
 		fmt.println("--list prints the resolved catalog")
 		return
 	}

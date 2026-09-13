@@ -11,6 +11,7 @@ package main
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:sync/chan"
@@ -45,12 +46,13 @@ Entry :: struct {
 
 // Status carries the runtime facts the footer shows. provider_id and cwd
 // are borrowed from the runtime (the provider id and the session workspace,
-// both stable for the app's lifetime); model_id and effort are owned display
-// copies, replaced under the runtime mutex when they change.
+// both stable for the app's lifetime); model_id, effort, and effort_levels are
+// owned display copies, replaced under the runtime mutex when they change.
 Status :: struct {
 	provider_id:        string,
 	model_id:           string, // owned,
 	effort:             string, // owned,
+	effort_levels:      [dynamic]string, // owned; the levels the model allows,
 	cwd:                string,
 	context_window:     int,
 	est_input:          int,
@@ -66,7 +68,10 @@ Status :: struct {
 Snapshot :: struct {
 	entries:     [dynamic]Entry, // owned,
 	status:      Status,
-	// setup_error is why the last selection attempt failed; the picker shows
+	// sessions is what the /resume menu offers. Only the worker reads the store,
+	// so only the worker rebuilds this.
+	sessions:    [dynamic]Session_Row, // owned,
+	// setup_error is why the last selection attempt failed; the model menu shows
 	// it because it has no transcript.
 	setup_error: string, // owned,
 	generation:  u64,
@@ -75,11 +80,10 @@ Snapshot :: struct {
 Work_Kind :: enum u8 {
 	Prompt,
 	Compact,
-	Context,
+	Status,
 	Effort,
 	Model,
 	New_Session,
-	List_Sessions,
 	Resume_Session,
 }
 Work :: struct {
@@ -90,10 +94,73 @@ Work :: struct {
 
 Work_Chan :: chan.Chan(Work)
 
-// Picker_Entry is one selectable model in the picker: a serving identity.
-Picker_Entry :: struct {
-	provider_id: string,
-	model_id:    string,
+// Choice is one line a menu offers and what choosing it means. Every string is
+// owned by the menu's allocator and released by menu_destroy.
+Choice :: struct {
+	label:  string, // owned; the line itself
+	detail: string, // owned; a second column, "" when the choice needs none
+	action: Choice_Action,
+}
+
+Choice_Action :: union {
+	Model_Choice,
+	Effort_Choice,
+	Session_Choice,
+}
+
+Model_Choice :: struct {
+	provider_id: string, // owned
+	model_id:    string, // owned
+}
+
+// Effort_Choice carries a level name, or "" for the provider default.
+Effort_Choice :: struct {
+	level: string, // owned
+}
+
+Session_Choice :: struct {
+	id: session.Session_Id, // owned
+}
+
+choice_destroy :: proc(choice: ^Choice, allocator: mem.Allocator) {
+	delete(choice.label, allocator)
+	delete(choice.detail, allocator)
+	switch &action in choice.action {
+	case Model_Choice:
+		delete(action.provider_id, allocator)
+		delete(action.model_id, allocator)
+	case Effort_Choice:
+		delete(action.level, allocator)
+	case Session_Choice:
+		delete(string(action.id), allocator)
+	}
+	choice^ = {}
+}
+
+// Menu is an open choice list. The prompt is cleared while one is open: the menu
+// owns the keyboard until a choice is made or it is cancelled.
+Menu :: struct {
+	title:    string, // owned
+	choices:  [dynamic]Choice, // owned
+	cursor:   int,
+	top:      int, // first choice line on screen, so the cursor stays visible
+	// required marks the startup chooser: no model is selected yet, so escape
+	// quits rather than returning to the prompt.
+	required: bool,
+}
+
+menu_destroy :: proc(menu: ^Menu, allocator: mem.Allocator) {
+	delete(menu.title, allocator)
+	for &choice in menu.choices { choice_destroy(&choice, allocator) }
+	delete(menu.choices)
+	menu^ = {}
+}
+
+// Session_Row is one session the /resume menu can offer. The worker owns the
+// list; the front-end only renders it.
+Session_Row :: struct {
+	id:    session.Session_Id, // owned
+	title: string, // owned
 }
 
 Runtime :: struct {
@@ -120,40 +187,45 @@ Run_Setup :: struct {
 	provider_id: string, // owned,
 	model_id:    string, // owned,
 	// configured holds the provider ids the user's own configuration declares;
-	// models.dev also contributes providers, and the picker offers only the
+	// models.dev also contributes providers, and the model menu offers only the
 	// configured ones, whose credentials the user actually set up.
 	configured:  [dynamic]string, // owned,
 	alloc:       mem.Allocator,
 }
 
 App :: struct {
-	setup:           Run_Setup,
-	terminal:        ^term.Session,
-	tty:             ^os.File,
-	parser:          input.Parser,
-	raw:             [dynamic]input.Event, // owned; the latest input batch,
-	run:             Runtime,
-	storage:         ^Frame_Storage,
-	home:            string, // owned; shortens the footer path,
-	input:           widgets.Input,
-	scroll:          int, // lines scrolled back; 0 follows the bottom,
-	generation_seen: u64,
-	cancel_seen:     bool, // the running cancel came from our own keys, not a signal,
-	spin_lap:        time.Tick, // last working-frame advance,
-	spin_frame:      int,
-	picking:         bool, // the model picker owns the input until a model applies,
-	picker_initial:  bool, // the picker is the startup chooser: no model yet, so escape quits,
-	picker_cursor:   int,
-	picker_top:      int, // first picker line on screen, so the cursor stays visible,
-	columns:         int,
-	rows:            int,
-	quit:            bool,
+	setup:             Run_Setup,
+	terminal:          ^term.Session,
+	tty:               ^os.File,
+	parser:            input.Parser,
+	raw:               [dynamic]input.Event, // owned; the latest input batch,
+	run:               Runtime,
+	storage:           ^Frame_Storage,
+	home:              string, // owned; shortens the footer path,
+	input:             widgets.Input,
+	scroll:            int, // lines scrolled back; 0 follows the bottom,
+	generation_seen:   u64,
+	cancel_seen:       bool, // the running cancel came from our own keys, not a signal,
+	spin_lap:          time.Tick, // last working-frame advance,
+	spin_frame:        int,
+	// menu is the open choice list, when menu_open. One component serves every
+	// command whose argument is picked from a list.
+	menu:              Menu,
+	menu_open:         bool,
+	// completion_query and completion_index carry a Tab cycle: the prefix the
+	// cycle began with and where it has reached. Any other key ends the cycle.
+	completion_query:  string, // owned,
+	completion_index:  int,
+	completion_active: bool,
+	columns:           int,
+	rows:              int,
+	quit:              bool,
 }
 
 // resolve_run_catalog builds the resolved catalog from the user's configuration:
 // the configuration's own statements, then each configured provider's listing,
 // then the models.dev catalog, merged first-value-wins. `configured` holds the
-// provider ids the user set up, which is the set the picker offers. Both results
+// provider ids the user set up, which is the set the model menu offers. Both results
 // are owned by the caller.
 resolve_run_catalog :: proc(
 	sources: []agent.Catalog_Provider_Source,
@@ -287,7 +359,7 @@ setup_resume_target :: proc(setup: ^Run_Setup, workspace: string) -> (session.Se
 }
 
 // provider_usable reports whether a provider can serve a request at all: an
-// endpoint, an api family, and a credential source. The picker offers only
+// endpoint, an api family, and a credential source. The model menu offers only
 // usable providers' models.
 provider_usable :: proc(provider: ^agent.Catalog_Provider) -> bool {
 	return provider.base_url_present && provider.base_url != "" && provider.api_present && provider.api != "" && provider.api_key_present
@@ -410,6 +482,13 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 		delete(status.effort, app.run.alloc)
 		status.effort = strings.clone(running.effort, app.run.alloc)
 	}
+	// The levels travel with the model, because only the worker owns the session
+	// and the /effort menu is built on the front-end.
+	for level in status.effort_levels { delete(level, app.run.alloc) }
+	clear(&status.effort_levels)
+	for level in running.effort_levels {
+		append(&status.effort_levels, strings.clone(level, app.run.alloc))
+	}
 	status.context_window = window
 	delete(app.run.snap.setup_error, app.run.alloc)
 	app.run.snap.setup_error = ""
@@ -427,7 +506,7 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	return true
 }
 
-// selection_fail records why a selection could not apply. The picker shows it
+// selection_fail records why a selection could not apply. The model menu shows it
 // directly; chat mode sees it as a transcript warning.
 selection_fail :: proc(app: ^App, message: string) {
 	sync.mutex_lock(&app.run.mu)
@@ -456,7 +535,7 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 
 // tui_run is the interactive entry point: resolve the catalog, open the
 // terminal, apply the selection (explicit flags, then the persisted one, then
-// the in-TUI picker), start the worker, and drive the frame loop until quit.
+// the in-TUI model menu), start the worker, and drive the frame loop until quit.
 tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_model: string) {
 	app := new(App)
 	defer free(app)
@@ -475,11 +554,6 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	// The resumed conversation is shown before the first prompt, so the screen
 	// matches the history the next request will be built from.
 	session_replay(app, &app.setup.session)
-	// The picker owns the input until a selection applies: explicit flags, the
-	// persisted selection, or the user's choice. It is the startup chooser, so it
-	// cannot be dismissed until a model is in place.
-	app.picking = true
-	app.picker_initial = true
 	app.home = os.get_env("HOME", app.run.alloc)
 	app.input = widgets.Input{}
 	widgets.input_init(&app.input, app.run.alloc)
@@ -511,18 +585,22 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 			app_teardown(app)
 			return
 		}
-		app.picking = false
 	} else if flag_provider == "" && flag_model == "" {
 		if selection, selection_ok := agent.selection_load(app.run.alloc); selection_ok {
-			if apply_selection(app, selection.provider, selection.model, selection.effort) {
-				app.picking = false
-			}
+			apply_selection(app, selection.provider, selection.model, selection.effort)
 			agent.selection_destroy(&selection, app.run.alloc)
 		}
 	} else {
 		fmt.eprintln("nabla: --provider and --model must be given together")
 		app_teardown(app)
 		return
+	}
+
+	// With no model selected, the chooser is the only input: escape quits rather
+	// than returning to a prompt that cannot send anything.
+	if app.setup.model_id == "" {
+		menu_open_model(app)
+		app.menu.required = true
 	}
 
 	agent.chat_interactive_arm(&app.run.signals)
@@ -568,12 +646,11 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 		// silent request (no stream events, tools running) still advances it.
 		now := time.tick_now()
 		advance_spinner := app.run.snap.status.running && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
-		// A startup picker closes once its selection applies on the worker. A picker
+		// A startup chooser closes once its selection applies on the worker; a menu
 		// opened from the prompt closes on submit instead, so browsing it does not
 		// dismiss it.
-		if app.picker_initial && app.run.snap.status.model_id != "" {
-			app.picking = false
-			app.picker_initial = false
+		if app.menu.required && app.run.snap.status.model_id != "" {
+			menu_close(app)
 			widgets.input_clear(&app.input)
 		}
 		if count > 0 || resized || generation_changed(app) || advance_spinner {
@@ -626,10 +703,19 @@ app_teardown :: proc(app: ^App) {
 		}
 	}
 	delete(app.run.snap.entries)
+	for &row in app.run.snap.sessions {
+		delete(string(row.id), app.run.alloc)
+		delete(row.title, app.run.alloc)
+	}
+	delete(app.run.snap.sessions)
 	delete(app.run.snap.status.provider_id, app.run.alloc)
 	delete(app.run.snap.status.model_id, app.run.alloc)
 	delete(app.run.snap.status.effort, app.run.alloc)
+	for level in app.run.snap.status.effort_levels { delete(level, app.run.alloc) }
+	delete(app.run.snap.status.effort_levels)
 	delete(app.run.snap.setup_error, app.run.alloc)
+	menu_destroy(&app.menu, app.run.alloc)
+	delete(app.completion_query, app.run.alloc)
 	delete(app.home, app.run.alloc)
 	widgets.input_destroy(&app.input)
 	input.parser_destroy(&app.parser)
@@ -643,6 +729,9 @@ app_teardown :: proc(app: ^App) {
 run_worker :: proc(thread_handle: ^thread.Thread) {
 	app := cast(^App)thread_handle.data
 	observer := run_observer(app)
+	// The session list the /resume menu offers is built here, because only the
+	// worker touches the store.
+	session_refresh_rows(app)
 	for {
 		work, ok := chan.recv(app.run.work)
 		if !ok {
@@ -658,9 +747,37 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 	}
 }
 
+// session_refresh_rows rebuilds the list the /resume menu shows. Only the worker
+// calls it, so the store is never read from two threads.
+session_refresh_rows :: proc(app: ^App) {
+	if app.setup.session.store == nil { return }
+	sessions, list_err := session.session_list(&app.setup.store, {workspace = app.setup.workspace, limit = 20}, app.run.alloc)
+	if list_err != nil { return }
+	defer session.sessions_destroy(sessions, app.run.alloc)
+
+	sync.mutex_lock(&app.run.mu)
+	defer sync.mutex_unlock(&app.run.mu)
+	for &row in app.run.snap.sessions {
+		delete(string(row.id), app.run.alloc)
+		delete(row.title, app.run.alloc)
+	}
+	clear(&app.run.snap.sessions)
+	for &entry in sessions {
+		append(
+			&app.run.snap.sessions,
+			Session_Row{id = session.Session_Id(strings.clone(string(entry.id), app.run.alloc)), title = strings.clone(entry.title, app.run.alloc)},
+		)
+	}
+	app.run.snap.generation += 1
+}
+
 run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
+	// Work that can change which sessions exist, or what they are called, marks the
+	// list the /resume menu reads as needing a rebuild.
+	rows_dirty := false
 	switch work.kind {
 	case .Prompt:
+		rows_dirty = true
 		if app.setup.session.store == nil {
 			snap_append(app, .Error, "no session is open; use /new or /resume")
 			return
@@ -680,8 +797,8 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	case .Compact:
 		set_running(app, true)
 		agent.chat_command_compact(&app.setup.session, observer, app.run.connection, nil)
-	case .Context:
-		agent.chat_notice_context(&app.setup.session, observer)
+	case .Status:
+		agent.chat_notice_status(&app.setup.session, observer, session.now_ms())
 	case .Effort:
 		applied := true
 		if work.text == "" || work.text == "default" {
@@ -700,6 +817,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	case .Model:
 		apply_selection(app, work.provider, work.text, "")
 	case .New_Session:
+		rows_dirty = true
 		// The new session runs the same selection; only the conversation is new.
 		provider := strings.clone(app.setup.provider_id, app.run.alloc)
 		model := strings.clone(app.setup.model_id, app.run.alloc)
@@ -710,39 +828,18 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			snap_append(app, .Notice, "started a new session")
 			if provider != "" && model != "" { apply_selection(app, provider, model, "") }
 		}
-	case .List_Sessions:
-		session_list_sessions(app)
 	case .Resume_Session:
+		rows_dirty = true
 		session_resume(app, work.text)
 	}
+	if rows_dirty { session_refresh_rows(app) }
 	refresh_status(app)
 }
 
-// session_list_sessions reports the recent sessions that ran in this workspace,
-// so the user can name one with /resume. The current session is marked.
-session_list_sessions :: proc(app: ^App) {
-	sessions, list_err := session.session_list(&app.setup.store, {workspace = app.setup.workspace, limit = 20}, app.run.alloc)
-	if list_err != nil {
-		local := list_err
-		snap_append(app, .Error, fmt.tprintf("cannot list sessions: %s", session.error_detail(&local)))
-		return
-	}
-	defer session.sessions_destroy(sessions, app.run.alloc)
-	if len(sessions) == 0 {
-		snap_append(app, .Notice, "no sessions for this workspace")
-		return
-	}
-	current := app.setup.session.id
-	for &entry in sessions {
-		marker := "*" if entry.id == current else " "
-		title := entry.title if entry.title != "" else "(untitled)"
-		snap_append(app, .Notice, fmt.tprintf("%s %s  %s", marker, string(entry.id), title))
-	}
-}
-
 // session_resume switches to the session a full id or an unambiguous prefix
-// names, then shows the tail of its conversation. An ambiguous prefix is
-// refused rather than guessed.
+// names, then shows the tail of its conversation. The menu always names a whole
+// id; the prefix form exists for typing, and an ambiguous one is refused rather
+// than guessed.
 session_resume :: proc(app: ^App, reference: string) {
 	if reference == "" {
 		snap_append(app, .Notice, "usage: /resume <session id or prefix>")
@@ -888,138 +985,190 @@ snapshot_clear :: proc(app: ^App) {
 	app.run.snap.generation += 1
 }
 
-// picker_entries lists every model the picker offers: one entry per usable
-// provider's model, ordered by provider id and then model id. The catalog's
-// own order follows the configuration loader's table iteration, which varies
-// between runs, so the picker sorts rather than trusting it.
-picker_entries :: proc(app: ^App, out: ^[dynamic]Picker_Entry) {
-	for &provider in app.setup.catalog.providers {
-		if !provider_usable(&provider) || !provider_configured(app, provider.id) {
-			continue
-		}
-		for &model in app.setup.catalog.models {
-			if model.provider_id != provider.id {
-				continue
-			}
-			picker_entry_insert(out, provider.id, model.id)
-		}
+// menu_begin publishes a freshly built list. Every open procedure builds its
+// choices completely and then hands them over, so a half-built menu is never
+// visible.
+menu_begin :: proc(app: ^App, title: string, choices: [dynamic]Choice, required: bool) {
+	menu_destroy(&app.menu, app.run.alloc)
+	app.menu = Menu {
+		title    = strings.clone(title, app.run.alloc),
+		choices  = choices,
+		required = required,
 	}
-}
-
-// picker_entry_insert places an entry so the list stays ordered by provider id
-// and then model id.
-picker_entry_insert :: proc(out: ^[dynamic]Picker_Entry, provider_id, model_id: string) {
-	position := len(out^)
-	for index in 0 ..< len(out^) {
-		entry := &out^[index]
-		order := strings.compare(entry.provider_id, provider_id)
-		if order == 0 {
-			order = strings.compare(entry.model_id, model_id)
-		}
-		if order >= 0 {
-			position = index
-			break
-		}
-	}
-	append(out, Picker_Entry{})
-	for index := len(out^) - 1; index > position; index -= 1 {
-		out^[index] = out^[index - 1]
-	}
-	out^[position] = Picker_Entry {
-		provider_id = provider_id,
-		model_id    = model_id,
-	}
-}
-
-// picker_count reports how many models the picker offers.
-picker_count :: proc(app: ^App) -> int {
-	entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
-	picker_entries(app, &entries)
-	return len(entries)
-}
-
-// picker_page is how far one Page_Up/Page_Down moves in the picker.
-picker_page :: proc(app: ^App) -> int {
-	return max(app.rows - TUI_FOOTER_ROWS - 1, 1)
-}
-
-// picker_submit sends the entry under the cursor as the next selection.
-picker_submit :: proc(app: ^App) {
-	entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
-	picker_entries(app, &entries)
-	if len(entries) == 0 {
-		return
-	}
-	cursor := app.picker_cursor
-	if cursor >= len(entries) {
-		cursor = len(entries) - 1
-	}
-	enqueue(app, .Model, entries[cursor].provider_id, entries[cursor].model_id)
-	// The startup chooser stays until the selection applies, because no model is
-	// selected yet; a picker opened over a running prompt closes at once, and a
-	// selection that fails is reported as a transcript warning.
-	if !app.picker_initial {
-		app.picking = false
-	}
-}
-
-// picker_open opens the model picker over the prompt, positioned on the model in
-// effect so the list starts where the user already is. The prompt is cleared: the
-// picker owns the keyboard until it closes. Only the startup chooser is
-// mandatory, so escaping this one returns to the prompt instead of quitting.
-picker_open :: proc(app: ^App) {
-	app.picking = true
-	app.picker_initial = false
-	app.picker_top = 0
-	app.picker_cursor = picker_current(app)
+	app.menu_open = true
+	app.completion_active = false
 	widgets.input_clear(&app.input)
 }
 
-// picker_current is the position of the selected model among the picker's
-// entries, or the first entry when the catalog cannot place it.
-picker_current :: proc(app: ^App) -> int {
-	entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
-	picker_entries(app, &entries)
-	for entry, index in entries {
-		if entry.provider_id == app.setup.provider_id && entry.model_id == app.setup.model_id {
-			return index
-		}
-	}
-	return 0
+// menu_close drops the open menu and returns the prompt.
+menu_close :: proc(app: ^App) {
+	app.menu_open = false
+	menu_destroy(&app.menu, app.run.alloc)
 }
 
-// handle_picker_key drives the model picker: arrows move, enter applies,
-// escape quits.
-handle_picker_key :: proc(app: ^App, key: input.Key_Event) {
+// menu_pick places the cursor on the first choice whose label names the current
+// value, so a menu opens where the user already is.
+menu_pick :: proc(app: ^App, label: string) {
+	for choice, index in app.menu.choices {
+		if choice.label == label { app.menu.cursor = index; return }
+	}
+}
+
+// menu_open_model lists every usable configured model, with the provider as the
+// second column. The catalog's own order follows the loader's table iteration,
+// which varies between runs, so the list is sorted.
+menu_open_model :: proc(app: ^App) {
+	// The catalog is read-only after startup. The current selection is snapshot
+	// state, so it is read under the lock the worker writes it with.
+	sync.mutex_lock(&app.run.mu)
+	current_provider := strings.clone(app.run.snap.status.provider_id, context.temp_allocator)
+	current_model := strings.clone(app.run.snap.status.model_id, context.temp_allocator)
+	sync.mutex_unlock(&app.run.mu)
+
+	models := make([dynamic]Model_Choice, 0, 16, context.temp_allocator)
+	defer delete(models)
+	for &provider in app.setup.catalog.providers {
+		if !provider_usable(&provider) || !provider_configured(app, provider.id) { continue }
+		for &model in app.setup.catalog.models {
+			if model.provider_id != provider.id { continue }
+			append(&models, Model_Choice{provider_id = provider.id, model_id = model.id})
+		}
+	}
+	slice.sort_by(models[:], model_choice_less)
+
+	choices := make([dynamic]Choice, 0, len(models), app.run.alloc)
+	for model in models {
+		append(
+			&choices,
+			Choice {
+				label = strings.clone(model.model_id, app.run.alloc),
+				detail = strings.clone(model.provider_id, app.run.alloc),
+				action = Model_Choice{provider_id = strings.clone(model.provider_id, app.run.alloc), model_id = strings.clone(model.model_id, app.run.alloc)},
+			},
+		)
+	}
+	menu_title := "select a model"
+	if current_model != "" {
+		menu_title = fmt.tprintf("models (current: %s / %s)", current_provider, current_model)
+	}
+	menu_begin(app, menu_title, choices, false)
+	for choice, index in app.menu.choices {
+		action := choice.action.(Model_Choice)
+		if action.provider_id == current_provider && action.model_id == current_model {
+			app.menu.cursor = index
+			break
+		}
+	}
+}
+
+model_choice_less :: proc(a, b: Model_Choice) -> bool {
+	order := strings.compare(a.provider_id, b.provider_id)
+	if order == 0 { order = strings.compare(a.model_id, b.model_id) }
+	return order < 0
+}
+
+// menu_open_effort lists the levels the model allows, plus the provider default.
+// The levels are snapshot state, because only the worker owns the session, so
+// they are read under the lock the worker writes them with.
+menu_open_effort :: proc(app: ^App) {
+	sync.mutex_lock(&app.run.mu)
+	current := strings.clone(app.run.snap.status.effort, context.temp_allocator)
+	levels := make([dynamic]string, 0, len(app.run.snap.status.effort_levels) + 1, context.temp_allocator)
+	append(&levels, "provider default")
+	for level in app.run.snap.status.effort_levels { append(&levels, level) }
+	sync.mutex_unlock(&app.run.mu)
+	defer delete(levels)
+
+	choices := make([dynamic]Choice, 0, len(levels), app.run.alloc)
+	for level in levels {
+		value := "" if level == "provider default" else level
+		append(&choices, Choice{label = strings.clone(level, app.run.alloc), action = Effort_Choice{level = strings.clone(value, app.run.alloc)}})
+	}
+	menu_begin(app, "reasoning effort", choices, false)
+	menu_pick(app, "provider default" if current == "" else current)
+}
+
+// menu_open_session lists the workspace's recent sessions from the snapshot, with
+// a short id as the second column. Only the worker reads the store, so the list
+// it built is what the menu shows.
+menu_open_session :: proc(app: ^App) {
+	sync.mutex_lock(&app.run.mu)
+	rows := make([dynamic]Session_Row, 0, len(app.run.snap.sessions), context.temp_allocator)
+	for &row in app.run.snap.sessions { append(&rows, row) }
+	active := app.setup.session.id
+	sync.mutex_unlock(&app.run.mu)
+	defer delete(rows)
+
+	choices := make([dynamic]Choice, 0, len(rows), app.run.alloc)
+	for &row in rows {
+		label := row.title if row.title != "" else "(untitled)"
+		append(
+			&choices,
+			Choice {
+				label = strings.clone(label, app.run.alloc),
+				detail = strings.clone(string(row.id)[:8], app.run.alloc),
+				action = Session_Choice{id = session.Session_Id(strings.clone(string(row.id), app.run.alloc))},
+			},
+		)
+	}
+	menu_begin(app, "sessions in this workspace", choices, false)
+	for choice, index in app.menu.choices {
+		action := choice.action.(Session_Choice)
+		if action.id == active {
+			app.menu.cursor = index
+			break
+		}
+	}
+}
+
+// menu_page is how far one Page_Up/Page_Down moves in a menu.
+menu_page :: proc(app: ^App) -> int {
+	return max(app.rows - TUI_FOOTER_ROWS - 1, 1)
+}
+
+// menu_submit sends the choice under the cursor as work. The startup chooser
+// stays open until its selection applies, because no model is selected yet; a
+// menu opened from the prompt closes at once, and a selection that fails is
+// reported as a transcript warning.
+menu_submit :: proc(app: ^App) {
+	if len(app.menu.choices) == 0 { return }
+	cursor := min(app.menu.cursor, len(app.menu.choices) - 1)
+	switch action in app.menu.choices[cursor].action {
+	case Model_Choice:
+		enqueue(app, .Model, action.provider_id, action.model_id)
+	case Effort_Choice:
+		enqueue(app, .Effort, "", action.level)
+	case Session_Choice:
+		enqueue(app, .Resume_Session, "", string(action.id))
+	}
+	if !app.menu.required { menu_close(app) }
+}
+
+// handle_menu_key drives every menu: arrows move, enter chooses, escape cancels,
+// and the startup chooser quits instead because it cannot be dismissed.
+handle_menu_key :: proc(app: ^App, key: input.Key_Event) {
+	last := len(app.menu.choices) - 1
 	#partial switch key.code {
 	case .Up:
-		if app.picker_cursor > 0 {
-			app.picker_cursor -= 1
-		}
+		app.menu.cursor = max(app.menu.cursor - 1, 0)
 	case .Down:
-		entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
-		picker_entries(app, &entries)
-		if app.picker_cursor < len(entries) - 1 {
-			app.picker_cursor += 1
-		}
+		app.menu.cursor = min(app.menu.cursor + 1, max(last, 0))
+	case .Home:
+		app.menu.cursor = 0
+	case .End:
+		app.menu.cursor = max(last, 0)
+	case .Page_Up:
+		app.menu.cursor = max(app.menu.cursor - menu_page(app), 0)
+	case .Page_Down:
+		app.menu.cursor = min(app.menu.cursor + menu_page(app), max(last, 0))
 	case .Enter:
-		picker_submit(app)
+		menu_submit(app)
 	case .Escape:
-		if app.picker_initial {
+		if app.menu.required {
 			app.quit = true
 		} else {
-			app.picking = false
+			menu_close(app)
 		}
-	case .Home:
-		app.picker_cursor = 0
-	case .End:
-		entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
-		picker_entries(app, &entries)
-		app.picker_cursor = max(len(entries) - 1, 0)
-	case .Page_Up:
-		app.picker_cursor = max(app.picker_cursor - picker_page(app), 0)
-	case .Page_Down:
-		app.picker_cursor = min(app.picker_cursor + picker_page(app), picker_count(app) - 1)
 	case:
 	}
 }
@@ -1225,72 +1374,151 @@ obs_usage :: proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Ev
 
 // --- input handling -------------------------------------------------------
 
-// Command is one slash command the prompt recognizes. `menu` marks the command
-// whose argument is chosen from a list, so a completed name opens that list
-// instead of completing further. Every name is lowercase.
-Command :: struct {
-	name: string,
-	menu: bool,
+// Command_Id names what a slash command does. The id is what dispatch switches
+// on; everything else about a command lives in its table row.
+Command_Id :: enum {
+	Quit,
+	Help,
+	New_Session,
+	Resume,
+	Compact,
+	Status,
+	Effort,
+	Model,
 }
 
-COMMANDS :: []Command{{name = "/compact"}, {name = "/context"}, {name = "/effort"}, {name = "/model", menu = true}, {name = "/quit"}}
+// Command is one slash command. name is what the user types, summary is what
+// /help says about it, and open_menu shows the list its argument is chosen from
+// (nil when it takes no argument). The table is the only place a command is
+// declared, so completion, help, and dispatch cannot disagree about what exists
+// or about which commands offer a list.
+Command :: struct {
+	id:        Command_Id,
+	name:      string,
+	summary:   string,
+	open_menu: proc(app: ^App),
+}
 
-// complete_command advances the slash command at the prompt. A unique prefix
-// completes to the whole name, several complete to what they share, and a name
-// that is already whole opens its list. Matching ignores case, but what is
-// written back is the command's own lowercase name. The command set is small and
-// closed, so there is no completion state to keep.
-complete_command :: proc(app: ^App) {
-	typed := strings.trim_space(widgets.input_text(&app.input))
-	if !strings.has_prefix(typed, "/") {
-		return
-	}
-	matches := 0
-	only := ""
-	only_menu := false
-	common := ""
+@(rodata)
+COMMANDS := [?]Command {
+	Command{id = .Quit, name = "/quit", summary = "exit; during a turn, cancel it first"},
+	Command{id = .Help, name = "/help", summary = "list the commands"},
+	Command{id = .New_Session, name = "/new", summary = "start a new session"},
+	Command{id = .Resume, name = "/resume", summary = "choose a session to resume", open_menu = menu_open_session},
+	Command{id = .Compact, name = "/compact", summary = "summarize the active context now"},
+	Command{id = .Status, name = "/status", summary = "show the session, model, and context"},
+	Command{id = .Effort, name = "/effort", summary = "choose a reasoning effort level", open_menu = menu_open_effort},
+	Command{id = .Model, name = "/model", summary = "choose a provider and model", open_menu = menu_open_model},
+}
+
+// command_find looks a command up by its exact name, ignoring case.
+command_find :: proc(name: string) -> (Command, bool) {
 	for command in COMMANDS {
-		if !command_prefixed(command.name, typed) {
-			continue
-		}
-		matches += 1
-		only = command.name
-		only_menu = command.menu
-		if matches == 1 {
-			common = command.name
-		} else {
-			common = strings.common_prefix(common, command.name)
-		}
+		if strings.equal_fold(command.name, name) { return command, true }
 	}
-	switch {
-	case matches == 0:
-	case matches == 1 && typed == only:
-		if only_menu {
-			picker_open(app)
-		}
-	case matches == 1:
-		widgets.input_clear(&app.input)
-		widgets.input_insert(&app.input, only)
-	case len(common) > len(typed):
-		widgets.input_clear(&app.input)
-		widgets.input_insert(&app.input, common)
-	}
+	return {}, false
+}
+
+// command_split separates a command's name from its argument.
+command_split :: proc(text: string) -> (name, argument: string) {
+	trimmed := strings.trim_space(text)
+	space := strings.index_byte(trimmed, ' ')
+	if space < 0 { return trimmed, "" }
+	return trimmed[:space], strings.trim_space(trimmed[space + 1:])
 }
 
 // command_prefixed reports whether the typed text is a prefix of a command,
 // ignoring case so a capital is a typo rather than a miss.
 command_prefixed :: proc(command, typed: string) -> bool {
-	if len(typed) > len(command) {
-		return false
-	}
+	if len(typed) > len(command) { return false }
 	return strings.equal_fold(command[:len(typed)], typed)
+}
+
+// complete_command advances the slash command at the prompt. Tab cycles: the
+// first press reaches the first match of what is typed, and the next press moves
+// to the one after it, wrapping around, so pressing Tab on "/" walks the whole
+// set. A completed name whose command takes a list opens that list. Matching
+// ignores case; what is written back is the command's own lowercase name.
+complete_command :: proc(app: ^App) {
+	typed := widgets.input_text(&app.input)
+	if !strings.has_prefix(typed, "/") || strings.contains_rune(typed, ' ') {
+		completion_reset(app)
+		return
+	}
+
+	// A second Tab still refers to the prefix the cycle began with, because the
+	// input now holds the name the previous press wrote.
+	query := typed
+	after := -1
+	if app.completion_active {
+		query = app.completion_query
+		after = app.completion_index
+	}
+
+	index, found := command_next_match(query, after)
+	if !found {
+		completion_reset(app)
+		return
+	}
+	command := COMMANDS[index]
+	if !app.completion_active && query == command.name {
+		completion_reset(app)
+		if command.open_menu != nil { command.open_menu(app) }
+		return
+	}
+
+	// The query is stored only when a cycle begins, because the stored copy is
+	// what a later press reads and the input buffer is what it was taken from.
+	if !app.completion_active { completion_query_set(app, typed) }
+	app.completion_index = index
+	app.completion_active = true
+	widgets.input_clear(&app.input)
+	widgets.input_insert(&app.input, command.name)
+}
+
+// command_next_match finds the next command after `after` whose name starts with
+// query, wrapping around. -1 starts at the beginning.
+command_next_match :: proc(query: string, after: int) -> (int, bool) {
+	for offset in 1 ..= len(COMMANDS) {
+		index := (after + offset) % len(COMMANDS)
+		if command_prefixed(COMMANDS[index].name, query) { return index, true }
+	}
+	return 0, false
+}
+
+// completion_reset ends a Tab cycle. Any key other than Tab calls it, so an edit
+// starts the next cycle from what is on screen.
+completion_reset :: proc(app: ^App) {
+	app.completion_active = false
+	app.completion_index = 0
+	delete(app.completion_query, app.run.alloc)
+	app.completion_query = ""
+}
+
+@(private)
+completion_query_set :: proc(app: ^App, query: string) {
+	delete(app.completion_query, app.run.alloc)
+	app.completion_query = strings.clone(query, app.run.alloc)
+}
+
+// command_help prints the command table and the keys the prompt answers to. It is
+// generated from the same table completion and dispatch read, so it cannot go
+// stale.
+command_help :: proc(app: ^App) {
+	snap_append(app, .Notice, "commands")
+	for command in COMMANDS {
+		snap_append(app, .Notice, fmt.tprintf("  %-11s %s", command.name, command.summary))
+	}
+	snap_append(app, .Notice, "  tab completes a command and cycles through the matches")
+	snap_append(app, .Notice, "  a command that names a list opens it when given no argument")
+	snap_append(app, .Notice, "keys: escape interrupt | ctrl+c clear, cancel, then quit")
 }
 
 handle_event :: proc(app: ^App, event: input.Event) {
 	#partial switch data in event {
 	case input.Key_Event:
-		if app.picking {
-			handle_picker_key(app, data)
+		if app.menu_open {
+			handle_menu_key(app, data)
 		} else {
 			handle_key(app, data)
 		}
@@ -1332,8 +1560,10 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 	case .Enter:
 		submit(app)
 	case .Backspace:
+		completion_reset(app)
 		widgets.input_backspace(&app.input)
 	case .Delete:
+		completion_reset(app)
 		widgets.input_delete(&app.input)
 	case .Left:
 		widgets.input_move_left(&app.input)
@@ -1377,6 +1607,7 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 				cancel_or_quit(app)
 			}
 		} else if key.character >= 0x20 && key.character != 0x7f {
+			completion_reset(app)
 			widgets.input_insert_rune(&app.input, key.character)
 		}
 	case .Insert, .F1, .F2, .F3, .F4, .F5:
@@ -1388,6 +1619,7 @@ submit :: proc(app: ^App) {
 	text := strings.trim_space(widgets.input_text(&app.input))
 	if text == "" {
 		widgets.input_clear(&app.input)
+		completion_reset(app)
 		return
 	}
 	if strings.has_prefix(text, "/") {
@@ -1396,45 +1628,51 @@ submit :: proc(app: ^App) {
 		enqueue(app, .Prompt, "", text)
 	}
 	widgets.input_clear(&app.input)
+	completion_reset(app)
 }
 
-// dispatch_command picks only the known commands; everything else is
-// reported as unknown rather than sent to the model. Command semantics live
-// in the agent; this only routes the input.
+// dispatch_command routes one slash command. The name comes from the command
+// table, so a command that completion and help know about is always one dispatch
+// can run; the switch decides what that command does. Everything else is reported
+// as unknown rather than sent to the model.
 dispatch_command :: proc(app: ^App, text: string) {
-	switch {
-	case text == "/quit":
+	name, argument := command_split(text)
+	command, found := command_find(name)
+	if !found {
+		snap_append(app, .Notice, fmt.tprintf("unknown command: %s (try /help)", name))
+		return
+	}
+	// A command whose argument is chosen from a list opens that list when given no
+	// argument. One rule covers every such command, and it is the same rule
+	// completion applies to a completed name.
+	if argument == "" && command.open_menu != nil {
+		command.open_menu(app)
+		return
+	}
+	switch command.id {
+	case .Quit:
 		if runtime_busy(app) {
 			app.cancel_seen = true
 			agent.chat_cancel_request()
 		}
 		app.quit = true
-	case text == "/new":
+	case .Help:
+		command_help(app)
+	case .New_Session:
 		enqueue(app, .New_Session, "", "")
-	case text == "/sessions":
-		enqueue(app, .List_Sessions, "", "")
-	case text == "/resume" || strings.has_prefix(text, "/resume "):
-		enqueue(app, .Resume_Session, "", strings.trim_space(text[len("/resume"):]))
-	case text == "/compact":
+	case .Resume:
+		enqueue(app, .Resume_Session, "", argument)
+	case .Compact:
 		enqueue(app, .Compact, "", "")
-	case text == "/context":
-		enqueue(app, .Context, "", "")
-	case text == "/effort" || strings.has_prefix(text, "/effort "):
-		enqueue(app, .Effort, "", strings.trim_space(text[len("/effort"):]))
-	case text == "/model" || strings.has_prefix(text, "/model "):
-		// Naming no model lists them: the catalog is the authority on what is
-		// available, so choosing from it needs no typing.
-		rest := strings.trim_space(text[len("/model"):])
-		if rest == "" {
-			picker_open(app)
-			return
-		}
-		provider_id, model_id, ok := resolve_model_reference(app, rest)
+	case .Status:
+		enqueue(app, .Status, "", "")
+	case .Effort:
+		enqueue(app, .Effort, "", argument)
+	case .Model:
+		provider_id, model_id, ok := resolve_model_reference(app, argument)
 		if ok {
 			enqueue(app, .Model, provider_id, model_id)
 		}
-	case:
-		snap_append(app, .Notice, fmt.tprintf("unknown command: %s", text))
 	}
 }
 

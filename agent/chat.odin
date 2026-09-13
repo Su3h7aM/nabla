@@ -826,25 +826,66 @@ chat_notice_effort :: proc(chat: ^Chat_Session, observer: Chat_Observer, provide
 	}
 }
 
-chat_notice_context :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
+// chat_notice_status reports what the session is and what it is doing: who it is,
+// where it runs, how long it has run, which model and effort it uses, and the
+// context and usage numbers the harness already measured. Nothing here is
+// collected for the report; every value is one the session already holds.
+chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms: i64) {
+	header, header_err := session.session_load(chat.store, chat.id, context.temp_allocator)
+	have_header := header_err == nil
+	defer session.session_destroy(&header, context.temp_allocator)
+
+	chat_status_line(observer, "session", string(chat.id))
+	if have_header {
+		title := header.title if header.title != "" else "(untitled)"
+		chat_status_line(observer, "title", title)
+	}
+	chat_status_line(observer, "cwd", chat.workspace)
+	if have_header {
+		age := chat_age_text(now_ms - header.created_at_ms)
+		chat_status_line(observer, "running", fmt.tprintf("%s%s", age, " (turn active)" if chat.state != .Idle else ""))
+	}
+	chat_status_line(observer, "model", fmt.tprintf("%s / %s", chat.provider_id, chat.model_id))
+	chat_status_line(observer, "effort", chat.effort if chat.effort != "" else "provider default")
+	chat_status_line(observer, "tools", "shell" if chat.tools_enabled else "none")
+
 	if chat.context_window > 0 {
 		reserved := chat.max_output_tokens
 		if reserved <= 0 { reserved = CHAT_DEFAULT_OUTPUT_RESERVE_TOKENS }
-		_observer_message(observer, .Notice, fmt.tprintf("context window: %d", chat.context_window))
-		_observer_message(observer, .Notice, fmt.tprintf("reserved output: %d", reserved))
-		_observer_message(observer, .Notice, fmt.tprintf("safety margin: %d", CHAT_ADMISSION_MARGIN_TOKENS))
-		_observer_message(observer, .Notice, fmt.tprintf("max estimated input: %d", chat.context_window - reserved - CHAT_ADMISSION_MARGIN_TOKENS))
+		usable := chat.context_window - reserved - CHAT_ADMISSION_MARGIN_TOKENS
+		chat_status_line(
+			observer,
+			"context",
+			fmt.tprintf("%d window, %d reserved, %d margin (%d usable)", chat.context_window, reserved, CHAT_ADMISSION_MARGIN_TOKENS, usable),
+		)
 	} else {
-		_observer_message(observer, .Notice, "no context_window configured for this model")
+		chat_status_line(observer, "context", "not configured for this model")
 	}
-	if chat.last_estimate > 0 {
-		_observer_message(observer, .Notice, fmt.tprintf("last estimated input: %d", chat.last_estimate))
-	}
-	if chat.last_input_measured_present {
-		_observer_message(observer, .Notice, fmt.tprintf("last measured input tokens: %d", chat.last_input_measured))
-	} else {
-		_observer_message(observer, .Notice, "no measured usage yet")
-	}
+
+	estimate := "none"
+	if chat.last_estimate > 0 { estimate = fmt.tprintf("%d", chat.last_estimate) }
+	measured := "none"
+	if chat.last_input_measured_present { measured = fmt.tprintf("%d", chat.last_input_measured) }
+	chat_status_line(observer, "usage", fmt.tprintf("estimate %s, measured %s", estimate, measured))
+}
+
+@(private)
+chat_status_line :: proc(observer: Chat_Observer, label, value: string) {
+	_observer_message(observer, .Notice, fmt.tprintf("%-10s %s", label, value))
+}
+
+// chat_age_text says how long ago something happened, in the largest two units
+// that keep it readable.
+@(private)
+chat_age_text :: proc(elapsed_ms: i64) -> string {
+	seconds := elapsed_ms / 1_000
+	if seconds < 0 { return "unknown" }
+	if seconds < 60 { return fmt.tprintf("%ds", seconds) }
+	minutes := seconds / 60
+	if minutes < 60 { return fmt.tprintf("%dm %ds", minutes, seconds % 60) }
+	hours := minutes / 60
+	if hours < 24 { return fmt.tprintf("%dh %dm", hours, minutes % 60) }
+	return fmt.tprintf("%dd %dh", hours / 24, hours % 24)
 }
 
 // chat_handle_command runs one input line as a command. True means handled;
@@ -861,8 +902,8 @@ chat_handle_command :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue:
 		chat_notice_effort(chat, observer, provider_id, model_id)
 		return true
 	}
-	if text == "/context" {
-		chat_notice_context(chat, observer)
+	if text == "/status" {
+		chat_notice_status(chat, observer, session.now_ms())
 		return true
 	}
 	if text == "/drop" {
@@ -912,6 +953,10 @@ chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer:
 		if !chat_handle_command(chat, observer, steer.queue, line, steer.provider_id, steer.model_id, steer.quit) {
 			if line == "/compact" {
 				chat_command_compact(chat, observer, steer.connection, steer.usages)
+			} else if strings.has_prefix(line, "/") {
+				// A slash is a command, never a message. A command this path does not
+				// answer to is refused rather than sent to the model as steering text.
+				_observer_message(observer, .Notice, fmt.tprintf("%s is not available while a turn is running", line))
 			} else if !chat_session_steer(chat, line, session.now_ms()) {
 				if chat.last_error != "" {
 					_observer_message(observer, .Error, chat.last_error)

@@ -48,6 +48,12 @@ app_session_end :: proc(app: ^App, directory: string) {
 		if entry.text != nil { delete(entry.text) }
 	}
 	delete(app.run.snap.entries)
+	for &row in app.run.snap.sessions {
+		delete(string(row.id), app.run.alloc)
+		delete(row.title, app.run.alloc)
+	}
+	delete(app.run.snap.sessions)
+	menu_destroy(&app.menu, app.run.alloc)
 	delete(app.setup.workspace, app.setup.alloc)
 	os.remove_all(directory)
 	delete(directory, context.allocator)
@@ -72,8 +78,10 @@ test_new_and_resume_switch_and_replay :: proc(t: ^testing.T) {
 	testing.expect(t, first != second, "a new session must be a different session")
 
 	snapshot_clear(&app)
-	session_list_sessions(&app)
-	testing.expect(t, len(app.run.snap.entries) >= 2, "both sessions should be listed")
+	session_refresh_rows(&app)
+	menu_open_session(&app)
+	if !testing.expect_value(t, len(app.menu.choices), 2) { return }
+	menu_close(&app)
 
 	snapshot_clear(&app)
 	session_resume(&app, string(first)[:8])

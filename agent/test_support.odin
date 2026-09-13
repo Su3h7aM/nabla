@@ -74,6 +74,17 @@ _test_append :: proc(t: ^testing.T, chat: ^Chat_Session, entry: session.New_Entr
 	return seq
 }
 
+// Status_Log collects the lines a notice-only command reports.
+Status_Log :: struct {
+	buffer: strings.Builder,
+}
+
+status_log_message :: proc(user_data: rawptr, kind: Chat_Message_Kind, text: string) {
+	log := cast(^Status_Log)user_data
+	strings.write_string(&log.buffer, text)
+	strings.write_byte(&log.buffer, '\n')
+}
+
 _test_entries :: proc(t: ^testing.T, chat: ^Chat_Session, allocator := context.allocator) -> []session.Entry {
 	entries, err := session.entries_load(chat.store, chat.id, {}, allocator)
 	if err != nil { testing.fail_now(t, "entries_load failed") }

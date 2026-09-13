@@ -220,8 +220,8 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 		return {}, .Layout_Failed
 	}
 
-	if app.picking {
-		draw_picker(app, storage, conv_rect)
+	if app.menu_open {
+		draw_menu(app, storage, conv_rect)
 		draw_input_hint(app, storage, input_rect)
 	} else {
 		draw_conversation(app, storage, conv_rect)
@@ -249,7 +249,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 	lines := make([dynamic]Line, 0, 64, context.temp_allocator)
 	if len(app.run.snap.entries) == 0 {
 		append(&lines, Line{text = "nabla", style = TITLE_STYLE})
-		append(&lines, Line{text = "escape interrupt | ctrl+c clear/cancel/quit | /model | /effort | /compact", style = HINT_STYLE})
+		append(&lines, Line{text = "escape interrupt | ctrl+c clear/cancel/quit | /help for commands", style = HINT_STYLE})
 	} else {
 		for &entry in app.run.snap.entries {
 			emit_entry(&entry, rect.width, &lines)
@@ -291,34 +291,29 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 	}
 }
 
-// draw_picker renders the model picker: a title, the last selection error if
-// any, and one line per offered model grouped under its provider, with the
-// cursor kept visible in a scrolling window.
-draw_picker :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
+// draw_menu renders the open choice list: the title, the last selection error
+// when there is one, and one line per choice with its detail column. The cursor
+// stays visible in a scrolling window.
+draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	if rect.height <= 0 || rect.width <= 0 {
 		return
 	}
 	lines := make([dynamic]Line, 0, 64, context.temp_allocator)
-	append(&lines, Line{text = "Select a model", style = TITLE_STYLE})
+	append(&lines, Line{text = app.menu.title, style = TITLE_STYLE})
 	if app.run.snap.setup_error != "" {
 		append(&lines, Line{text = app.run.snap.setup_error, style = ERROR_TEXT})
 	}
-	entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
-	picker_entries(app, &entries)
-	cursor := app.picker_cursor
-	if cursor >= len(entries) {
-		cursor = max(len(entries) - 1, 0)
+	cursor := app.menu.cursor
+	if cursor >= len(app.menu.choices) {
+		cursor = max(len(app.menu.choices) - 1, 0)
 	}
-	current_provider := ""
-	for entry, index in entries {
-		if entry.provider_id != current_provider {
-			current_provider = entry.provider_id
-			append(&lines, Line{text = fmt.tprintf("[%s]", current_provider), style = LABEL_STYLE})
-		}
-		if index == cursor {
-			append(&lines, Line{text = fmt.tprintf("> %s", entry.model_id), style = PICKED_STYLE})
+	for choice, index in app.menu.choices {
+		marker := "> " if index == cursor else "  "
+		style := PICKED_STYLE if index == cursor else HINT_STYLE
+		if choice.detail != "" {
+			append(&lines, Line{text = fmt.tprintf("%s%-24s %s", marker, choice.label, choice.detail), style = style})
 		} else {
-			append(&lines, Line{text = entry.model_id, style = HINT_STYLE, indent = 2})
+			append(&lines, Line{text = fmt.tprintf("%s%s", marker, choice.label), style = style})
 		}
 	}
 	total := len(lines)
@@ -326,15 +321,15 @@ draw_picker :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 		return
 	}
 	// The cursor's line must stay inside the window.
-	cursor_line := picker_cursor_line(app, cursor, &lines)
+	cursor_line := min(cursor + 1, total - 1)
 	visible := rect.height
-	if cursor_line < app.picker_top {
-		app.picker_top = cursor_line
+	if cursor_line < app.menu.top {
+		app.menu.top = cursor_line
 	}
-	if cursor_line >= app.picker_top + visible {
-		app.picker_top = cursor_line - visible + 1
+	if cursor_line >= app.menu.top + visible {
+		app.menu.top = cursor_line - visible + 1
 	}
-	start := app.picker_top
+	start := app.menu.top
 	if start > max(total - visible, 0) {
 		start = max(total - visible, 0)
 	}
@@ -357,26 +352,7 @@ draw_picker :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	}
 }
 
-// picker_cursor_line finds the rendered line of the cursor entry.
-picker_cursor_line :: proc(app: ^App, cursor: int, lines: ^[dynamic]Line) -> int {
-	entries := make([dynamic]Picker_Entry, 0, 16, context.temp_allocator)
-	picker_entries(app, &entries)
-	line_index := 1
-	current_provider := ""
-	for entry, index in entries {
-		if entry.provider_id != current_provider {
-			current_provider = entry.provider_id
-			line_index += 1
-		}
-		if index == cursor {
-			return line_index
-		}
-		line_index += 1
-	}
-	return min(line_index, len(lines^) - 1)
-}
-
-// draw_input_hint replaces the prompt with the picker's keys while it is open.
+// draw_input_hint replaces the prompt with the menu's keys while one is open.
 // The startup chooser cannot be escaped, so the hint names quitting there and
 // cancelling elsewhere.
 draw_input_hint :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
@@ -384,7 +360,7 @@ draw_input_hint :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect)
 		return
 	}
 	hint := "up/down move | enter select | esc cancel"
-	if app.picker_initial {
+	if app.menu.required {
 		hint = "up/down move | enter select | esc quit"
 	}
 	_, _ = tui.draw_text(&storage.buffer, rect, hint, HINT_STYLE)
