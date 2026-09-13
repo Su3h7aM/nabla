@@ -78,6 +78,9 @@ Work_Kind :: enum u8 {
 	Context,
 	Effort,
 	Model,
+	New_Session,
+	List_Sessions,
+	Resume_Session,
 }
 Work :: struct {
 	kind:     Work_Kind,
@@ -113,6 +116,7 @@ Run_Setup :: struct {
 	connection:  ai.Provider_Connection,
 	store:       session.Store,
 	session:     agent.Chat_Session,
+	workspace:   string, // owned; the directory sessions here run in
 	provider_id: string, // owned,
 	model_id:    string, // owned,
 	// configured holds the provider ids the user's own configuration declares;
@@ -190,31 +194,27 @@ resolve_run_catalog :: proc(
 // session. Which provider and model run is applied separately, so the
 // front-end can start without a selection and choose one in the TUI. Errors
 // print to stderr; false means the caller should exit.
-run_catalog :: proc(sources: []agent.Catalog_Provider_Source) -> (Run_Setup, bool) {
-	result := Run_Setup {
-		alloc = context.allocator,
-	}
+run_catalog :: proc(sources: []agent.Catalog_Provider_Source, setup: ^Run_Setup) -> bool {
+	setup.alloc = context.allocator
 	ok := false
-	defer if !ok {
-		run_setup_destroy(&result)
-	}
+	defer if !ok { run_setup_destroy(setup) }
 
-	catalog, configured, resolved := resolve_run_catalog(sources, result.alloc)
-	if !resolved { return {}, false }
-	result.catalog = catalog
-	result.configured = configured
+	catalog, configured, resolved := resolve_run_catalog(sources, setup.alloc)
+	if !resolved { return false }
+	setup.catalog = catalog
+	setup.configured = configured
 
-	workspace, workspace_err := os.get_working_directory(result.alloc)
+	workspace, workspace_err := os.get_working_directory(setup.alloc)
 	if workspace_err != nil || workspace == "" {
 		fmt.eprintln("nabla: cannot determine working directory")
-		return {}, false
+		return false
 	}
-	defer delete(workspace, result.alloc)
+	defer delete(workspace, setup.alloc)
 
-	if !run_session_attach(&result, workspace) { return {}, false }
+	if !run_session_attach(setup, workspace) { return false }
 
 	ok = true
-	return result, true
+	return true
 }
 
 // run_session_attach opens the session store, resumes the newest session for
@@ -270,6 +270,7 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string) -> bool {
 		fmt.eprintln("nabla: the session claim went missing")
 		return false
 	}
+	setup.workspace = strings.clone(workspace, setup.alloc)
 	setup.session = agent.chat_session_init(&setup.store, claimed, workspace, setup.alloc)
 	return true
 }
@@ -446,6 +447,7 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 		delete(id, setup.alloc)
 	}
 	delete(setup.configured)
+	delete(setup.workspace, setup.alloc)
 	if setup.credential != "" { delete(setup.credential, setup.alloc) }
 	if setup.provider_id != "" { delete(setup.provider_id, setup.alloc) }
 	if setup.model_id != "" { delete(setup.model_id, setup.alloc) }
@@ -456,21 +458,23 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 // terminal, apply the selection (explicit flags, then the persisted one, then
 // the in-TUI picker), start the worker, and drive the frame loop until quit.
 tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_model: string) {
-	setup, setup_ok := run_catalog(sources)
-	if !setup_ok {
-		return
-	}
-
 	app := new(App)
 	defer free(app)
-	app.setup = setup
 	app.run.alloc = context.allocator
-	app.run.connection = setup.connection
+	// The setup is filled in place: a store owns a live connection, and copying
+	// one would leave two owners of it.
+	if !run_catalog(sources, &app.setup) {
+		return
+	}
+	app.run.connection = app.setup.connection
 	app.run.snap.entries = make([dynamic]Entry, 0, 16, app.run.alloc)
-	app.run.snap.status.provider_id = strings.clone(setup.provider_id, app.run.alloc)
-	app.run.snap.status.model_id = strings.clone(setup.model_id, app.run.alloc)
-	app.run.snap.status.cwd = setup.session.workspace
-	app.run.snap.status.context_window = setup.session.context_window
+	app.run.snap.status.provider_id = strings.clone(app.setup.provider_id, app.run.alloc)
+	app.run.snap.status.model_id = strings.clone(app.setup.model_id, app.run.alloc)
+	app.run.snap.status.cwd = app.setup.workspace
+	app.run.snap.status.context_window = app.setup.session.context_window
+	// The resumed conversation is shown before the first prompt, so the screen
+	// matches the history the next request will be built from.
+	session_replay(app, &app.setup.session)
 	// The picker owns the input until a selection applies: explicit flags, the
 	// persisted selection, or the user's choice. It is the startup chooser, so it
 	// cannot be dismissed until a model is in place.
@@ -657,17 +661,8 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	switch work.kind {
 	case .Prompt:
-		if work.text == "/new" {
-			provider := strings.clone(app.setup.provider_id, app.run.alloc)
-			model := strings.clone(app.setup.model_id, app.run.alloc)
-			defer delete(provider, app.run.alloc)
-			defer delete(model, app.run.alloc)
-			if session_start_new(app) {
-				snapshot_clear(app)
-				snap_append(app, .Notice, "started a new session")
-				// The new session runs the same selection; only the conversation is new.
-				if provider != "" && model != "" { apply_selection(app, provider, model, "") }
-			}
+		if app.setup.session.store == nil {
+			snap_append(app, .Error, "no session is open; use /new or /resume")
 			return
 		}
 		accepted := agent.chat_session_accept_user(&app.setup.session, work.text, session.now_ms())
@@ -704,8 +699,86 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		}
 	case .Model:
 		apply_selection(app, work.provider, work.text, "")
+	case .New_Session:
+		// The new session runs the same selection; only the conversation is new.
+		provider := strings.clone(app.setup.provider_id, app.run.alloc)
+		model := strings.clone(app.setup.model_id, app.run.alloc)
+		defer delete(provider, app.run.alloc)
+		defer delete(model, app.run.alloc)
+		if session_start_new(app) {
+			snapshot_clear(app)
+			snap_append(app, .Notice, "started a new session")
+			if provider != "" && model != "" { apply_selection(app, provider, model, "") }
+		}
+	case .List_Sessions:
+		session_list_sessions(app)
+	case .Resume_Session:
+		session_resume(app, work.text)
 	}
 	refresh_status(app)
+}
+
+// session_list_sessions reports the recent sessions that ran in this workspace,
+// so the user can name one with /resume. The current session is marked.
+session_list_sessions :: proc(app: ^App) {
+	sessions, list_err := session.session_list(&app.setup.store, {workspace = app.setup.workspace, limit = 20}, app.run.alloc)
+	if list_err != nil {
+		local := list_err
+		snap_append(app, .Error, fmt.tprintf("cannot list sessions: %s", session.error_detail(&local)))
+		return
+	}
+	defer session.sessions_destroy(sessions, app.run.alloc)
+	if len(sessions) == 0 {
+		snap_append(app, .Notice, "no sessions for this workspace")
+		return
+	}
+	current := app.setup.session.id
+	for &entry in sessions {
+		marker := "*" if entry.id == current else " "
+		title := entry.title if entry.title != "" else "(untitled)"
+		snap_append(app, .Notice, fmt.tprintf("%s %s  %s", marker, string(entry.id), title))
+	}
+}
+
+// session_resume switches to the session a full id or an unambiguous prefix
+// names, then shows the tail of its conversation. An ambiguous prefix is
+// refused rather than guessed.
+session_resume :: proc(app: ^App, reference: string) {
+	if reference == "" {
+		snap_append(app, .Notice, "usage: /resume <session id or prefix>")
+		return
+	}
+	sessions, list_err := session.session_list(&app.setup.store, {workspace = app.setup.workspace, limit = session.SESSION_LIST_MAX_LIMIT}, app.run.alloc)
+	if list_err != nil {
+		local := list_err
+		snap_append(app, .Error, fmt.tprintf("cannot list sessions: %s", session.error_detail(&local)))
+		return
+	}
+	defer session.sessions_destroy(sessions, app.run.alloc)
+
+	matched: session.Session_Id
+	matches := 0
+	defer if matched != "" { delete(string(matched), app.setup.alloc) }
+	for &entry in sessions {
+		if !strings.has_prefix(string(entry.id), reference) { continue }
+		if matches > 0 { delete(string(matched), app.setup.alloc) }
+		matched = session.Session_Id(strings.clone(string(entry.id), app.setup.alloc))
+		matches += 1
+	}
+	if matches == 0 {
+		snap_append(app, .Notice, fmt.tprintf("no session matches %s", reference))
+		return
+	}
+	if matches > 1 {
+		delete(string(matched), app.setup.alloc)
+		matched = ""
+		snap_append(app, .Notice, fmt.tprintf("%s matches more than one session", reference))
+		return
+	}
+	if !session_switch(app, matched) { return }
+	snapshot_clear(app)
+	snap_append(app, .Notice, fmt.tprintf("resumed session %s", string(matched)))
+	session_replay(app, &app.setup.session)
 }
 
 // session_start_new closes the running session and claims a fresh one, so the
@@ -713,8 +786,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 // old session keeps its history in the store.
 session_start_new :: proc(app: ^App) -> bool {
 	setup := &app.setup
-	workspace := strings.clone(setup.session.workspace, setup.alloc)
-	defer delete(workspace, setup.alloc)
+	workspace := setup.workspace
 
 	created, create_err := session.session_create(&setup.store, {workspace = workspace}, session.now_ms())
 	if create_err != nil {
@@ -740,6 +812,68 @@ session_start_new :: proc(app: ^App) -> bool {
 	}
 	setup.session = agent.chat_session_init(&setup.store, claimed, workspace, setup.alloc)
 	return true
+}
+
+// session_switch closes the running session and claims the named one, settling
+// anything an earlier run left running. The workspace recorded in the session
+// becomes the running session's workspace.
+session_switch :: proc(app: ^App, target: session.Session_Id) -> bool {
+	setup := &app.setup
+
+	header, load_err := session.session_load(&setup.store, target, setup.alloc)
+	if load_err != nil {
+		local := load_err
+		snap_append(app, .Error, fmt.tprintf("cannot read the session: %s", session.error_detail(&local)))
+		return false
+	}
+	defer session.session_destroy(&header)
+
+	agent.chat_session_destroy(&setup.session)
+	session.session_release(&setup.store)
+
+	if claim_err := session.session_claim(&setup.store, target); claim_err != nil {
+		local := claim_err
+		snap_append(app, .Error, fmt.tprintf("cannot take the session: %s", session.error_detail(&local)))
+		return false
+	}
+	_, recover_err := session.session_recover(&setup.store, target, {at_ms = session.now_ms(), recovered_content = agent.TOOL_RECOVERED_RESULT})
+	if recover_err != nil {
+		local := recover_err
+		snap_append(app, .Error, fmt.tprintf("cannot settle the session: %s", session.error_detail(&local)))
+		return false
+	}
+	claimed, held := session.session_claimed(&setup.store)
+	if !held {
+		snap_append(app, .Error, "the session claim went missing")
+		return false
+	}
+	// The other session's workspace is where its next request runs.
+	delete(setup.workspace, setup.alloc)
+	setup.workspace = strings.clone(header.workspace, setup.alloc)
+	setup.session = agent.chat_session_init(&setup.store, claimed, header.workspace, setup.alloc)
+	return true
+}
+
+// session_replay shows the tail of a resumed conversation. The store keeps every
+// entry; this is the part a person needs to recognise where they left off.
+session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
+	replayed, replay_err := session.context_load(chat.store, chat.id, app.run.alloc)
+	if replay_err != nil { return }
+	defer session.context_destroy(&replayed, app.run.alloc)
+
+	if replayed.summary != "" {
+		snap_append(app, .Notice, "(earlier turns are summarized)")
+	}
+	for &entry in replayed.entries {
+		#partial switch payload in entry.payload {
+		case session.User_Entry:
+			snap_append(app, .User, payload.text)
+		case session.Assistant_Entry:
+			snap_append(app, .Assistant, payload.text)
+		case session.Tool_Result_Entry:
+			snap_append(app, .Tool, payload.content)
+		}
+	}
 }
 
 // snapshot_clear drops the rendered transcript. The history lives in the store;
@@ -1275,6 +1409,12 @@ dispatch_command :: proc(app: ^App, text: string) {
 			agent.chat_cancel_request()
 		}
 		app.quit = true
+	case text == "/new":
+		enqueue(app, .New_Session, "", "")
+	case text == "/sessions":
+		enqueue(app, .List_Sessions, "", "")
+	case text == "/resume" || strings.has_prefix(text, "/resume "):
+		enqueue(app, .Resume_Session, "", strings.trim_space(text[len("/resume"):]))
 	case text == "/compact":
 		enqueue(app, .Compact, "", "")
 	case text == "/context":
