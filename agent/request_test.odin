@@ -432,11 +432,10 @@ bound_of :: proc(object: json.Object, key: string) -> (value: i64, present: bool
 	return i64(integer), true, true
 }
 
-// Everything a provider cache can do rests on one property of the harness: a
-// request built from the same conversation is identical every time, and appending
-// a turn leaves every earlier item exactly where it was. Breakpoint placement and
-// cache keys cannot compensate for a rebuild that moves a byte, so this pins the
-// property for all three APIs at once.
+// A cached prefix only helps if the bytes the provider renders do not change
+// between requests. This rebuilds a request from an unchanged conversation and
+// requires the same bytes, then appends a turn and requires every earlier item to
+// be unchanged, for all three APIs.
 @(test)
 test_a_request_rebuilds_identically_and_only_appends :: proc(t: ^testing.T) {
 	fixture: Chat_Test

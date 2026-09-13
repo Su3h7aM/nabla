@@ -10,7 +10,7 @@ import "core:sync"
 // only session writer. There are no parallel model requests and no scheduler.
 //
 // The queue is written by the front-end's thread and read by the execution
-// thread, which is the only reason it is guarded.
+// thread, so it is guarded.
 STEER_MAX_ITEMS :: 8
 STEER_MAX_BYTES :: 32 * 1024
 
