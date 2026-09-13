@@ -926,3 +926,36 @@ test_tool_args_reject_duplicates :: proc(t: ^testing.T) {
 	testing.expect(t, openai_tool_schema_valid(`{"type":"object","properties":{},"required":[],"additionalProperties":false}`))
 	testing.expect(t, !openai_tool_schema_valid(`[1]`))
 }
+
+// The output bound goes out in the field every current model accepts. The older
+// max_tokens spelling is deprecated and the reasoning models reject it, so a
+// request that used it would fail on exactly the models that need a bound most.
+@(test)
+test_chat_encode_output_bound_uses_the_current_field :: proc(t: ^testing.T) {
+	messages := make([]Provider_Message, 1, context.temp_allocator)
+	messages[0] = Provider_Message {
+		Role    = .User,
+		Content = "Hi.",
+	}
+	request := Provider_Request {
+		API                      = .OpenAI_Chat_Completions,
+		Model_Present            = true,
+		Model                    = "gpt-5.6",
+		Messages_Present         = true,
+		Messages                 = messages,
+		Max_Output_Tokens_Present = true,
+		Max_Output_Tokens        = 64,
+	}
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	testing.expect_value(t, err, Provider_Request_Error.None)
+	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
+	testing.expect_value(t, parse_err, nil)
+	defer json.destroy_value(value, context.temp_allocator)
+	object, object_ok := value.(json.Object)
+	if !testing.expect(t, object_ok) { return }
+	bound, present, bound_ok := openai_value_integer(object, "max_completion_tokens")
+	testing.expect(t, bound_ok && present)
+	testing.expect_value(t, bound, i64(64))
+	_, deprecated := object["max_tokens"]
+	testing.expect(t, !deprecated, "the deprecated field must not be sent")
+}

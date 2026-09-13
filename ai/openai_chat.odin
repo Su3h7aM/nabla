@@ -81,7 +81,10 @@ openai_chat_encode_request :: proc(request: Provider_Request, allocator := conte
 		}
 		object[strings.clone("tools", allocator)] = json.Value(tools)
 	}
-	if request.Max_Output_Tokens_Present { object[strings.clone("max_tokens", allocator)] = json.Integer(request.Max_Output_Tokens) }
+	// The output bound is sent in the field every current model accepts. The older
+	// `max_tokens` spelling is deprecated and is rejected outright by the reasoning
+	// models, so there is no model for which it is the right choice.
+	if request.Max_Output_Tokens_Present { object[strings.clone("max_completion_tokens", allocator)] = json.Integer(request.Max_Output_Tokens) }
 	if request.Reasoning_Effort_Present {
 		object[strings.clone("reasoning_effort", allocator)] = json.String(strings.clone(request.Reasoning_Effort, allocator))
 	}
