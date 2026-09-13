@@ -250,8 +250,6 @@ session_claim :: proc(store: ^Store, id: Session_Id) -> Error {
 	if load_err != nil { return load_err }
 	session_destroy(&session, context.temp_allocator)
 
-	if store.lock_open { return error_make(.Invalid_State, "another session is already claimed for writing") }
-
 	lock_directory, join_err := filepath.join({store.directory, LOCK_DIRECTORY}, context.temp_allocator)
 	if join_err != nil { return error_make(.Storage, "the lock directory path could not be built") }
 	ensure_private_directory(lock_directory) or_return
