@@ -554,6 +554,24 @@ test_chat_usage_only_after_completion :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_chat_cache_write_without_cached_tokens :: proc(t: ^testing.T) {
+	state := Provider_Stream_Start(.OpenAI_Chat_Completions, context.temp_allocator)
+	defer Provider_Stream_Destroy(&state)
+	events := consume(
+		t,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":1,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":9}}}`,
+		&state,
+		2,
+	)
+	usage := expect_event(t, events[0], Provider_Usage_Event)
+	testing.expect_value(t, usage.Input_Tokens, 9)
+	testing.expect(t, !usage.Cached_Input_Tokens_Present)
+	testing.expect(t, usage.Cache_Write_Tokens_Present)
+	testing.expect_value(t, usage.Cache_Write_Tokens, 9)
+	destroy_events(events)
+}
+
+@(test)
 test_chat_malformed_trailing_field_discards_text :: proc(t: ^testing.T) {
 	state := Provider_Stream_Start(.OpenAI_Chat_Completions, context.temp_allocator)
 	defer Provider_Stream_Destroy(&state)
