@@ -63,18 +63,22 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 			_observer_assistant_text(runtime.observer, value.Text)
 		}
 	case ai.Provider_Reasoning_Event:
-		// Reasoning never displays; it is staged so the next request can
-		// replay it. A rejected feed is a stale event, not a turn failure.
-		chat_session_feed_reasoning(runtime.chat, runtime.source, value.ID, value.Encrypted)
+		// Reasoning never displays and needs no staging: the verbatim output
+		// array staged below is the replay record. A rejected feed is a stale
+		// event, not a turn failure.
+		chat_session_accepts_event(runtime.chat, runtime.source)
 	case ai.Provider_Completed_Event:
 		// One response feeds one path: tool handoff when the provider
 		// assembled calls, plain completion on stop, failure otherwise.
 		// A length limit or content filter is not a usable answer, so it
 		// must not finalize as success. Partial argument fragments never
 		// reach the executor; only this validated event carries
-		// executable calls.
+		// executable calls. The verbatim output array is staged for the
+		// commit below, which stores it as the replay record.
 		runtime.finish_reason = value.Reason
-		if value.Reason == .Tool_Call && len(value.Tool_Calls) > 0 {
+		if !chat_session_feed_response_output(runtime.chat, runtime.source, value.Raw_Output) {
+			chat_session_feed_error(runtime.chat, runtime.source, "tool response was rejected")
+		} else if value.Reason == .Tool_Call && len(value.Tool_Calls) > 0 {
 			if !chat_session_feed_tool_calls(runtime.chat, runtime.source, value.Tool_Calls) {
 				chat_session_feed_error(runtime.chat, runtime.source, "tool response was rejected")
 			}
@@ -111,13 +115,17 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 
 // Chat_Request_Prep is one request built from committed history, together with
 // the storage the request borrows. It owns the context it was built from.
+// raw_responses holds the verbatim Responses output arrays committed alongside
+// the active context, oldest first. The encoder replays them in order, so a
+// later request carries exactly what the endpoint sent.
 Chat_Request_Prep :: struct {
-	history:  session.Context,
-	request:  ai.Provider_Request,
-	wire:     [dynamic]ai.Provider_Message,
-	tools:    [dynamic]ai.Provider_Tool_Def,
-	calls:    [dynamic][dynamic]ai.Provider_Tool_Call,
-	estimate: int,
+	history:       session.Context,
+	request:        ai.Provider_Request,
+	wire:          [dynamic]ai.Provider_Message,
+	tools:         [dynamic]ai.Provider_Tool_Def,
+	calls:         [dynamic][dynamic]ai.Provider_Tool_Call,
+	raw_responses: [dynamic]string,
+	estimate:       int,
 }
 
 chat_request_prep_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Allocator) {
@@ -126,6 +134,7 @@ chat_request_prep_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Alloc
 	delete(prep.calls)
 	delete(prep.tools)
 	delete(prep.wire)
+	delete(prep.raw_responses)
 	prep^ = {}
 }
 
@@ -157,6 +166,7 @@ chat_build_request_into :: proc(
 	prep.wire = make([dynamic]ai.Provider_Message, 0, len(entries) + 2, chat.allocator)
 	prep.tools = make([dynamic]ai.Provider_Tool_Def, 0, chat.allocator)
 	prep.calls = make([dynamic][dynamic]ai.Provider_Tool_Call, 0, chat.allocator)
+	prep.raw_responses = make([dynamic]string, 0, chat.allocator)
 
 	if compact {
 		append(&prep.wire, ai.Provider_Message{Role = .System, Content = CHAT_COMPACT_INSTRUCTIONS})
@@ -169,7 +179,7 @@ chat_build_request_into :: proc(
 		summary_text := strings.concatenate({"Summary of the conversation so far:\n", summary}, context.temp_allocator)
 		append(&prep.wire, ai.Provider_Message{Role = .Assistant, Content = summary_text})
 	}
-	chat_append_entries(&prep.wire, &prep.calls, entries)
+	chat_append_entries(&prep.wire, &prep.calls, &prep.raw_responses, entries)
 
 	prep.request = ai.Provider_Request {
 		API              = connection.API,
@@ -177,6 +187,7 @@ chat_build_request_into :: proc(
 		Model            = chat.model_id,
 		Messages_Present = true,
 		Messages         = prep.wire[:],
+		Raw_Responses    = prep.raw_responses[:],
 	}
 	if compact {
 		prep.request.Max_Output_Tokens_Present = true
@@ -198,15 +209,17 @@ chat_build_request_into :: proc(
 			prep.request.Tools = prep.tools[:]
 		}
 	}
-	prep.estimate = chat_estimate_input_tokens(prep.wire[:], prep.tools[:])
+	prep.estimate = chat_estimate_input_tokens(prep.wire[:], prep.raw_responses[:], prep.tools[:])
 }
 
 // chat_append_entries turns stored entries into provider messages. Consecutive
 // tool calls become one assistant message, which is how a provider sees a
 // multi-call response, and a result names the call it answers through the
-// sequence the two entries share.
+// sequence the two entries share. A Response_Entry contributes its verbatim
+// output array to raw_responses in entry order; Reasoning_Entry payloads
+// recorded before that change replay through the legacy path alongside it.
 @(private)
-chat_append_entries :: proc(messages: ^[dynamic]ai.Provider_Message, call_lists: ^[dynamic][dynamic]ai.Provider_Tool_Call, entries: []session.Entry) {
+chat_append_entries :: proc(messages: ^[dynamic]ai.Provider_Message, call_lists: ^[dynamic][dynamic]ai.Provider_Tool_Call, raw_responses: ^[dynamic]string, entries: []session.Entry) {
 	group: [dynamic]ai.Provider_Tool_Call
 	group_open := false
 	call_ids := make(map[i64]string, allocator = context.temp_allocator)
@@ -225,6 +238,9 @@ chat_append_entries :: proc(messages: ^[dynamic]ai.Provider_Message, call_lists:
 		case session.Reasoning_Entry:
 			chat_flush_calls(messages, call_lists, &group, &group_open)
 			append(messages, ai.Provider_Message{Role = .Reasoning, Reasoning_ID = payload.id, Reasoning_Encrypted = payload.encrypted})
+		case session.Response_Entry:
+			chat_flush_calls(messages, call_lists, &group, &group_open)
+			append(raw_responses, payload.output)
 		case session.Tool_Call_Entry:
 			call_ids[i64(entry.seq)] = payload.call_id
 			append(&group, ai.Provider_Tool_Call{ID = payload.call_id, Item_ID = payload.item_id, Name = payload.name, Arguments = payload.arguments})
@@ -257,8 +273,9 @@ chat_flush_calls :: proc(
 }
 
 @(private)
-chat_estimate_input_tokens :: proc(messages: []ai.Provider_Message, tools: []ai.Provider_Tool_Def) -> int {
+chat_estimate_input_tokens :: proc(messages: []ai.Provider_Message, raw_responses: []string, tools: []ai.Provider_Tool_Def) -> int {
 	chars := 0
+	for raw in raw_responses { chars += len(raw) }
 	for message in messages {
 		chars += len(message.Content) + len(message.Tool_Call_ID) + len(message.Reasoning_ID) + len(message.Reasoning_Encrypted)
 		for call in message.Tool_Calls {
@@ -503,10 +520,11 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 }
 
 // chat_commit_response records what the response produced and how the request
-// ended. A completed response becomes entries: its reasoning, then any text,
-// then the calls it proposed. A failed or cancelled one records only its
-// outcome here; the text it produced becomes a partial entry when the turn
-// settles, because an unfinished answer must never be replayed as a finished one.
+// ended. A completed response becomes entries: the verbatim Responses output
+// when the API produced one, then any text, then the calls it proposed. A
+// failed or cancelled one records only its outcome here; the text it produced
+// becomes a partial entry when the turn settles, because an unfinished answer
+// must never be replayed as a finished one.
 @(private)
 chat_commit_response :: proc(
 	chat: ^Chat_Session,
@@ -524,16 +542,17 @@ chat_commit_response :: proc(
 
 	if outcome == .Completed {
 		text := string(chat.partial_assistant[:])
-		entries := make([dynamic]session.New_Entry, 0, len(chat.pending_reasoning) + len(chat.pending_calls) + 1, chat.allocator)
+		response_count := 1 if chat.pending_response_present else 0
+		entries: [dynamic]session.New_Entry = make([dynamic]session.New_Entry, 0, response_count + len(chat.pending_calls) + 1, chat.allocator)
 		defer delete(entries)
-		for reasoning in chat.pending_reasoning {
+		if chat.pending_response_present {
 			append(
 				&entries,
 				session.New_Entry {
 					turn_no = chat.turn_no,
 					request_no = request_no,
 					created_at_ms = at_ms,
-					payload = session.Reasoning_Entry{id = reasoning.id, encrypted = reasoning.encrypted},
+					payload = session.Response_Entry{output = chat.pending_response.output},
 				},
 			)
 		}
@@ -563,11 +582,12 @@ chat_commit_response :: proc(
 		}
 		// Each staged call now knows the entry it was stored as, which is what a
 		// later dispatch and result name.
-		offset := len(chat.pending_reasoning) + (1 if text != "" else 0)
+		offset := response_count + (1 if text != "" else 0)
 		for i in 0 ..< len(chat.pending_calls) { chat.pending_calls[i].seq = seqs[offset + i] }
 		delete(seqs, chat.allocator)
 
-		chat_pending_reasoning_clear(chat)
+		chat_response_output_destroy(&chat.pending_response, chat.allocator)
+		chat.pending_response_present = false
 		delete(chat.partial_assistant)
 		chat.partial_assistant = make([dynamic]u8, 0, 0, chat.allocator)
 	}
@@ -748,14 +768,9 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	// A turn that ended without running its staged calls, such as one a durable
 	// write stopped, releases them here.
 	chat_pending_calls_clear(chat)
-	chat_pending_reasoning_clear(chat)
+	chat_response_output_destroy(&chat.pending_response, chat.allocator)
+	chat.pending_response_present = false
 	return recorded
-}
-
-@(private)
-chat_pending_reasoning_clear :: proc(chat: ^Chat_Session) {
-	for &reasoning in chat.pending_reasoning { chat_reasoning_destroy(&reasoning, chat.allocator) }
-	clear(&chat.pending_reasoning)
 }
 
 // --- the turn loop -----------------------------------------------------------

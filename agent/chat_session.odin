@@ -17,11 +17,21 @@ Chat_Tool_Call :: struct {
 	seq:       session.Seq,
 }
 
-// Chat_Reasoning is one provider replay item the current response produced. It
-// is committed with that response; nothing here survives the request otherwise.
-Chat_Reasoning :: struct {
-	id:        string, // owned
-	encrypted: string, // owned
+// Chat_Response_Output stages one completed Responses output for commit: the
+// terminal output array verbatim, exactly as the endpoint sent it. Display
+// text and executable calls are derived from the completion event alongside
+// this; the output itself is the replay record, owned here until the response
+// commits. Only the Responses API sets it; Chat Completions has no
+// replayable output items to preserve. A Reasoning_Entry payload recorded
+// before this change still decodes, so old sessions replay through the
+// legacy path in the request builder.
+Chat_Response_Output :: struct {
+	output: string, // owned; verbatim output array,
+}
+
+chat_response_output_destroy :: proc(output: ^Chat_Response_Output, allocator: mem.Allocator) {
+	delete(output.output, allocator)
+	output^ = {}
 }
 
 // Chat_State is the control state of the session. Durable state lives in the
@@ -89,9 +99,11 @@ Chat_Session :: struct {
 	// provisional until the turn settles.
 	partial_assistant:           [dynamic]u8,
 
-	// pending_reasoning and pending_calls are what the current response produced
-	// and has not committed yet.
-	pending_reasoning:           [dynamic]Chat_Reasoning,
+	// pending_response and pending_calls are what the current response produced
+	// and has not committed yet. pending_response holds the verbatim Responses
+	// output array; pending_calls holds the validated calls awaiting execution.
+	pending_response:            Chat_Response_Output,
+	pending_response_present:    bool,
 	pending_calls:               [dynamic]Chat_Tool_Call,
 	requests_made:               int, // model requests this turn; bounds the tool loop
 	calls_made:                  int, // tool executions this turn
@@ -146,7 +158,6 @@ chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspa
 		next_turn_id = 1,
 		next_operation_id = 1,
 		partial_assistant = make([dynamic]u8, 0, allocator),
-		pending_reasoning = make([dynamic]Chat_Reasoning, 0, allocator),
 		pending_calls = make([dynamic]Chat_Tool_Call, 0, allocator),
 		effort_levels = make([dynamic]string, 0, allocator),
 		workspace = strings.clone(workspace, allocator),
@@ -161,17 +172,10 @@ chat_tool_call_destroy :: proc(call: ^Chat_Tool_Call, allocator: mem.Allocator) 
 	call^ = {}
 }
 
-chat_reasoning_destroy :: proc(reasoning: ^Chat_Reasoning, allocator: mem.Allocator) {
-	delete(reasoning.id, allocator)
-	delete(reasoning.encrypted, allocator)
-	reasoning^ = {}
-}
-
 chat_session_destroy :: proc(chat: ^Chat_Session) {
 	delete(string(chat.id), chat.allocator)
 	delete(chat.partial_assistant)
-	for &reasoning in chat.pending_reasoning { chat_reasoning_destroy(&reasoning, chat.allocator) }
-	delete(chat.pending_reasoning)
+	if chat.pending_response_present { chat_response_output_destroy(&chat.pending_response, chat.allocator) }
 	for &call in chat.pending_calls { chat_tool_call_destroy(&call, chat.allocator) }
 	delete(chat.pending_calls)
 	delete(chat.last_error, chat.allocator)
@@ -284,7 +288,10 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat_cancel_reset()
 	chat_operation_retire(&chat.operation)
 	chat_pending_calls_clear(chat)
-	chat_pending_reasoning_clear(chat)
+	if chat.pending_response_present {
+		chat_response_output_destroy(&chat.pending_response, chat.allocator)
+		chat.pending_response_present = false
+	}
 	delete(chat.last_error, chat.allocator)
 	chat.last_error = ""
 	delete(chat.partial_assistant)

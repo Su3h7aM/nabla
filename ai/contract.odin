@@ -83,6 +83,11 @@ Provider_Request :: struct {
 	Prompt_Cache_Options:           Prompt_Cache_Options,
 	Prompt_Cache_Retention_Present: bool,
 	Prompt_Cache_Retention:         string, // borrowed; deprecated, use options TTL,
+	// Raw_Responses holds verbatim Responses output arrays, oldest first,
+	// borrowed until operation retirement. The Responses encoder replays them
+	// in order before the projected messages, so a request carries exactly
+	// what the endpoint sent.
+	Raw_Responses:                  []string,
 }
 
 Provider_Request_Error :: enum {

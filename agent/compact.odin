@@ -222,9 +222,11 @@ chat_request_storage_destroy :: proc(prep: ^Chat_Request_Prep) {
 	delete(prep.calls)
 	delete(prep.tools)
 	delete(prep.wire)
+	delete(prep.raw_responses)
 	prep.calls = nil
 	prep.tools = nil
 	prep.wire = nil
+	prep.raw_responses = nil
 }
 
 // chat_command_compact runs one manual compaction at a settled turn or a

@@ -128,16 +128,17 @@ chat_session_feed_completion :: proc(chat: ^Chat_Session, source: Chat_Event_Sou
 	return true
 }
 
-// chat_session_feed_reasoning stages one opaque reasoning item for the response
-// being assembled. The id is the replay key; a repeated id is the same item seen
-// twice, not a second item.
-chat_session_feed_reasoning :: proc(chat: ^Chat_Session, source: Chat_Event_Source, id, encrypted: string) -> bool {
+// chat_session_feed_response_output stages the verbatim Responses output array
+// for the response being assembled. The output is the replay record; display
+// text and executable calls travel through their own feeds alongside it.
+// Only the Responses API calls this; Chat Completions has no replayable
+// output items to preserve.
+chat_session_feed_response_output :: proc(chat: ^Chat_Session, source: Chat_Event_Source, output: string) -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
-	if id == "" { return false }
-	for reasoning in chat.pending_reasoning {
-		if reasoning.id == id { return true }
-	}
-	append(&chat.pending_reasoning, Chat_Reasoning{id = chat_clone_string(id, chat.allocator), encrypted = chat_clone_string(encrypted, chat.allocator)})
+	if output == "" { return true }
+	if chat.pending_response_present { return false }
+	chat.pending_response.output = chat_clone_string(output, chat.allocator)
+	chat.pending_response_present = true
 	return true
 }
 

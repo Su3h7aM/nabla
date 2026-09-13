@@ -12,6 +12,17 @@ openai_responses_encode_request :: proc(request: Provider_Request, allocator := 
 	object := make(json.Object, 8, allocator)
 	object[strings.clone("model", allocator)] = json.String(strings.clone(request.Model, allocator))
 	input := make(json.Array, 0, len(request.Messages), allocator)
+	// Verbatim outputs replay first, in commit order: each output array holds
+	// the endpoint's own items -- phase, status, summaries, unknown types --
+	// so the request carries exactly what earlier responses sent.
+	for raw in request.Raw_Responses {
+		items, parse_err := json.parse_string(raw, .JSON, true, allocator)
+		if parse_err != nil { return "", .Invalid_Message }
+		defer json.destroy_value(items, allocator)
+		array, is_array := items.(json.Array)
+		if !is_array { return "", .Invalid_Message }
+		for item in array { append(&input, json.Value(json.clone_value(item, allocator))) }
+	}
 	for message in request.Messages {
 		if message.Role == .Reasoning {
 			// A reasoning item is replayable only when the endpoint returned

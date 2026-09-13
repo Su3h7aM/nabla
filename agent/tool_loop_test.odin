@@ -72,6 +72,30 @@ test_build_request_keeps_reasoning_before_calls :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_build_request_replays_verbatim_response_output :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "run printf ok")
+
+	// A committed Responses output replays verbatim, ahead of the projected
+	// messages, so phase and unknown item fields survive the round trip.
+	output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Working.","annotations":[]}]}]`
+	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.Response_Entry{output = output}})
+
+	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+
+	testing.expect_value(t, len(prep.raw_responses), 1)
+	testing.expect_value(t, prep.raw_responses[0], output)
+	testing.expect_value(t, len(prep.request.Raw_Responses), 1)
+	testing.expect_value(t, prep.request.Raw_Responses[0], output)
+}
+
+@(test)
 test_a_stored_result_names_its_call :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))

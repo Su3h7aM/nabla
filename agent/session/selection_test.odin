@@ -81,6 +81,15 @@ test_a_selection_needs_an_open_store :: proc(t: ^testing.T) {
 // version migrates in place and keeps the history it holds.
 @(test)
 test_a_version_one_database_gains_a_selection_and_keeps_its_history :: proc(t: ^testing.T) {
+	test_version_one_migrates_to_current(t)
+
+// A version-two database -- one that predates the response entry -- migrates
+// in place too: the old rows stay readable and a response entry writes.
+	test_version_two_migrates_to_current(t)
+}
+
+@(private)
+test_version_one_migrates_to_current :: proc(t: ^testing.T) {
 	directory := _temp_directory(t)
 	defer {
 		os.remove_all(directory)
@@ -140,4 +149,73 @@ test_a_version_one_database_gains_a_selection_and_keeps_its_history :: proc(t: ^
 	_expect_ok(t, load_err)
 	testing.expect(t, !found)
 	_expect_ok(t, selection_save(&store, {provider = "p", model = "m"}))
+}
+
+// test_version_two_migrates_to_current builds a version-two database by hand --
+// the shape before the response entry existed -- and checks the migration
+// keeps its rows while admitting the new kind.
+@(private)
+test_version_two_migrates_to_current :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer {
+		os.remove_all(directory)
+		delete(directory, context.allocator)
+	}
+	{
+		conn: db.Conn
+		database_path, join_err := filepath.join({directory, DATABASE_NAME}, context.temp_allocator)
+		testing.expect(t, join_err == nil)
+		if open_err := sqlite.open(&conn, {path = database_path, foreign_keys = true}); open_err != nil {
+			local := open_err
+			testing.fail_now(t, strings.concatenate({"could not open a version-two database: ", db.error_message(&local)}, context.temp_allocator))
+		}
+		for statement in MIGRATION_1 {
+			_expect_db_ok(t, db.exec(&conn, statement))
+		}
+		for statement in MIGRATION_2 {
+			_expect_db_ok(t, db.exec(&conn, statement))
+		}
+		_expect_db_ok(t, db.exec(&conn, "PRAGMA user_version = 2"))
+		_expect_db_ok(
+			t,
+			db.exec(
+				&conn,
+				"INSERT INTO sessions (id, created_at_ms, updated_at_ms, workspace, title, provider, model, archived_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+				{
+					db.Value("0123456789abcdef0123456789abcdef"),
+					db.Value(i64(1_000)),
+					db.Value(i64(1_000)),
+					db.Value("/tmp/project"),
+					db.Value("older"),
+					db.Value(""),
+					db.Value(""),
+					db.Value(nil),
+				},
+			),
+		)
+		db.close(&conn)
+	}
+
+	store: Store
+	_expect_ok(t, store_open(&store, directory))
+	defer store_close(&store)
+
+	version, version_err := schema_read_version(&store)
+	_expect_ok(t, version_err)
+	testing.expect_value(t, version, SCHEMA_VERSION)
+
+	sessions, list_err := session_list(&store, {}, context.allocator)
+	_expect_ok(t, list_err)
+	defer sessions_destroy(sessions, context.allocator)
+	if !testing.expect_value(t, len(sessions), 1) { return }
+	testing.expect_value(t, sessions[0].title, "older")
+
+	// The migrated database admits the new kind.
+	_expect_ok(t, session_claim(&store, sessions[0].id))
+	_, append_err := entry_append(
+		&store,
+		sessions[0].id,
+		{created_at_ms = 2_000, payload = Response_Entry{output = `[{"type":"message"}]`}},
+	)
+	_expect_ok(t, append_err)
 }

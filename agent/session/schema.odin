@@ -7,7 +7,7 @@ import "nabla:db"
 // SCHEMA_VERSION is the version this package writes. A database at a higher
 // version was written by newer code, and this package refuses it rather than
 // risk losing columns it does not know about.
-SCHEMA_VERSION :: 2
+SCHEMA_VERSION :: 3
 
 // The schema is deliberately small. Identity, order, ownership, and
 // correlation are columns, because those are the relationships the database has
@@ -78,7 +78,7 @@ MIGRATION_1 := [?]string {
 		turn_no       INTEGER,
 		request_no    INTEGER,
 		created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
-		kind          TEXT NOT NULL CHECK (kind IN ('user', 'assistant', 'reasoning', 'tool_call', 'tool_dispatch', 'tool_result', 'checkpoint')),
+		kind          TEXT NOT NULL CHECK (kind IN ('user', 'assistant', 'reasoning', 'response', 'tool_call', 'tool_dispatch', 'tool_result', 'checkpoint')),
 		related_seq   INTEGER,
 		payload_json  TEXT NOT NULL,
 		PRIMARY KEY (session_id, seq),
@@ -109,8 +109,44 @@ MIGRATION_2 := [?]string {
 	) STRICT`,
 }
 
+// MIGRATION_3 admits the response entry: the verbatim Responses output array
+// stored alongside the projected text and calls. Existing rows are untouched;
+// the kind list is the only change, so old sessions read exactly as before.
+// SQLite has no ALTER for a CHECK list, so the table is rebuilt: new table,
+// copied rows, dropped old, renamed new. The indexes travel with the rebuild
+// because they name the table they index.
+@(private)
+MIGRATION_3 := [?]string {
+	`CREATE TABLE entries_new (
+		session_id    TEXT NOT NULL,
+		seq           INTEGER NOT NULL CHECK (seq > 0),
+		turn_no       INTEGER,
+		request_no    INTEGER,
+		created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+		kind          TEXT NOT NULL CHECK (kind IN ('user', 'assistant', 'reasoning', 'response', 'tool_call', 'tool_dispatch', 'tool_result', 'checkpoint')),
+		related_seq   INTEGER,
+		payload_json  TEXT NOT NULL,
+		PRIMARY KEY (session_id, seq),
+		FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE,
+		FOREIGN KEY (session_id, turn_no) REFERENCES turns (session_id, turn_no),
+		FOREIGN KEY (session_id, request_no) REFERENCES requests (session_id, request_no),
+		FOREIGN KEY (session_id, related_seq) REFERENCES entries_new (session_id, seq),
+		CHECK ((kind IN ('tool_dispatch', 'tool_result') AND related_seq IS NOT NULL) OR (kind NOT IN ('tool_dispatch', 'tool_result') AND related_seq IS NULL)),
+		CHECK (related_seq IS NULL OR related_seq < seq)
+	) STRICT`,
+	`INSERT INTO entries_new (session_id, seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json) SELECT session_id, seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries`,
+	`DROP TABLE entries`,
+	`ALTER TABLE entries_new RENAME TO entries`,
+	`CREATE INDEX entries_turn ON entries (session_id, turn_no, seq)`,
+	`CREATE INDEX entries_request ON entries (session_id, request_no, seq)`,
+	`CREATE INDEX entries_kind ON entries (session_id, kind, seq)`,
+	`CREATE UNIQUE INDEX entries_dispatch ON entries (session_id, related_seq) WHERE kind = 'tool_dispatch'`,
+	`CREATE UNIQUE INDEX entries_result ON entries (session_id, related_seq) WHERE kind = 'tool_result'`,
+}
+
 // migration_statements returns the statements that bring version to
-// version + 1, or nil when there is no such migration.
+// version + 1, or nil when there is no such migration. MIGRATION_1 carries
+// the older kind list without 'response'; version 3 admits it.
 @(private)
 migration_statements :: proc(version: int) -> []string {
 	switch version {
@@ -118,6 +154,8 @@ migration_statements :: proc(version: int) -> []string {
 		return MIGRATION_1[:]
 	case 2:
 		return MIGRATION_2[:]
+	case 3:
+		return MIGRATION_3[:]
 	}
 	return nil
 }
