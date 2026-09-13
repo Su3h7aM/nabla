@@ -374,8 +374,10 @@ Rules:
 - **Compaction commits only when the summary request succeeds.** A failed summary leaves history
   and the active window untouched.
 - **Never delete history.** Compaction advances a window over an append-only record.
-- **Bounded:** at most one automatic compaction per turn; a turn that still cannot fit fails
-  explicitly rather than looping.
+- **Compact only when a request would not be admitted.** Compaction is not eager: it rewrites
+  the active context, which discards the provider's cached prefix and pays for a summarization
+  request. A request that still does not fit after one compaction fails explicitly rather than
+  looping, and a seam that covers nothing cannot make progress, so repeated attempts terminate.
 - Provider-specific compaction belongs behind a **provider/decorator boundary** if it is needed at
   all. The core loop must not accumulate per-provider compaction rules.
 

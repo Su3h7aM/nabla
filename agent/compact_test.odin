@@ -216,3 +216,43 @@ test_a_compaction_request_is_recorded_and_closed :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, strings.contains(request.config_json, `"effort":""`), "a summarization request carries no effort")
 }
+
+// A request that fits is sent as it stands. Compaction rewrites the active
+// context, which discards the prefix the provider has cached, and it pays for a
+// summarization request, so it is reserved for a request that would otherwise be
+// refused rather than run early to keep the window small.
+@(test)
+test_a_request_that_fits_is_not_compacted :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.context_window = 70_000
+
+	// About 57k estimated tokens: inside the window, and near enough the top of
+	// it that an eager threshold would have compacted before sending.
+	prompt := strings.repeat("work ", 45_600) or_else ""
+	if !testing.expect(t, len(prompt) > 200_000, "the fixture prompt should be large") { return }
+	_test_accept(t, chat, prompt)
+	delete(prompt)
+	// Enough entries that a summarization would have a span to cover, so an eager
+	// trigger would really have run one instead of finding nothing to compact.
+	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
+		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.Assistant_Entry{text = text}})
+	}
+
+	// An unusable endpoint: the request is attempted and fails, which is what
+	// makes the recorded request observable without a server.
+	dead := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = "http://127.0.0.1:9/",
+	}
+	testing.expect(t, !chat_run_turn(chat, dead, {}))
+
+	// The only request recorded is the one that was attempted: no summarization
+	// ran ahead of it.
+	request, request_err := session.request_load(chat.store, chat.id, 1)
+	if request_err != nil { testing.fail_now(t, "the attempted request should be recorded") }
+	defer session.request_destroy(&request)
+	testing.expect_value(t, request.purpose, session.Request_Purpose.Response)
+}

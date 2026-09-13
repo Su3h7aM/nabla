@@ -498,13 +498,15 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	}
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
-	// Admission runs on every request, including tool continuations. An
-	// over-budget turn compacts once and recounts; a turn that still cannot
-	// fit fails here, before any byte is sent. A fitting but hot window
-	// compacts once so the next continuation starts small.
+	// A request that does not fit compacts once and recounts; one that still does
+	// not fit fails here, before any byte is sent. Compaction is deliberately not
+	// eager: it rewrites the active context, which discards the prefix the
+	// provider has cached and pays for a summarization request, so it happens
+	// when a request would otherwise be refused and not before. A turn that
+	// keeps growing can therefore compact more than once, and each time it does
+	// the alternative was failing.
 	message, admitted := chat_admission_check(chat, prep.estimate)
-	hot := chat.context_window > 0 && prep.estimate * 5 >= chat.context_window * 4
-	if !admitted || hot {
+	if !admitted {
 		if chat_compact(chat, observer, connection, &prep, usages) && !chat_session_cancelled(chat) {
 			message, admitted = chat_admission_check(chat, prep.estimate)
 		}

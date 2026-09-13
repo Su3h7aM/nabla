@@ -125,10 +125,6 @@ Chat_Session :: struct {
 	last_input_measured:         i64,
 	last_input_measured_present: bool,
 	last_estimate:               int,
-
-	// auto_compacted_turn records the turn automatic compaction already ran in,
-	// so a turn that still cannot fit fails instead of compacting forever.
-	auto_compacted_turn:         u64,
 }
 
 // CHAT_DEFAULT_CONTEXT_WINDOW is the window a session assumes for a model that no
