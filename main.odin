@@ -10,17 +10,35 @@ chat_cli_options :: struct {
 	config_path: string,
 	provider_id: string,
 	model_id:    string,
+	// resume opens an existing session instead of starting one, and resume_id
+	// names which. An empty resume_id means the newest session for the directory.
+	resume:      bool,
+	resume_id:   string,
 	help:        bool,
 	list:        bool,
 }
 
-chat_cli_parse :: proc() -> (chat_cli_options, bool) {
+chat_cli_parse :: proc(args: []string) -> (chat_cli_options, bool) {
 	result: chat_cli_options
-	args := os.args[1:]
 	for i := 0; i < len(args); i += 1 {
 		arg := args[i]
 		if arg == "--help" || arg == "-h" { result.help = true; continue }
 		if arg == "--list" { result.list = true; continue }
+		if arg == "--resume" {
+			result.resume = true
+			// A following argument that is not another flag names the session.
+			// Without one, the newest session for this directory is resumed.
+			if i + 1 < len(args) && !strings.has_prefix(args[i + 1], "-") {
+				i += 1
+				result.resume_id = args[i]
+			}
+			continue
+		}
+		if strings.has_prefix(arg, "--resume=") {
+			result.resume = true
+			result.resume_id = arg[len("--resume="):]
+			continue
+		}
 		if strings.has_prefix(arg, "--config=") { result.config_path = arg[len("--config="):]; continue }
 		if strings.has_prefix(arg, "--provider=") { result.provider_id = arg[len("--provider="):]; continue }
 		if strings.has_prefix(arg, "--model=") { result.model_id = arg[len("--model="):]; continue }
@@ -38,11 +56,13 @@ chat_cli_parse :: proc() -> (chat_cli_options, bool) {
 }
 
 main :: proc() {
-	options, ok := chat_cli_parse()
-	if !ok { fmt.println("usage: nabla [--config PATH] [--provider ID --model ID]"); return }
+	options, ok := chat_cli_parse(os.args[1:])
+	if !ok { fmt.println("usage: nabla [--config PATH] [--resume [SESSION]] [--provider ID --model ID]"); return }
 	if options.help {
-		fmt.println("nabla [--config PATH] [--provider ID --model ID]")
+		fmt.println("nabla [--config PATH] [--resume [SESSION]] [--provider ID --model ID]")
 		fmt.println("default config: $XDG_CONFIG_HOME/nabla/config.lua (~/.config/nabla/config.lua)")
+		fmt.println("without --resume, a new session starts in the current directory")
+		fmt.println("--resume opens the newest session for the current directory; --resume SESSION opens that one")
 		fmt.println("without provider/model, the last selection is restored, or the model menu opens")
 		fmt.println("--list prints the resolved catalog")
 		return
@@ -72,5 +92,12 @@ main :: proc() {
 		fmt.eprintln("nabla: --provider and --model must be given together")
 		return
 	}
-	tui_run(sources[:], options.provider_id, options.model_id)
+	start := Session_Start {
+		kind = .New,
+	}
+	if options.resume {
+		start.kind = .Resume_Id if options.resume_id != "" else .Resume_Latest
+		start.id = options.resume_id
+	}
+	tui_run(sources[:], options.provider_id, options.model_id, start)
 }
