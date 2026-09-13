@@ -1129,7 +1129,13 @@ session_restore_claim :: proc(app: ^App, previous: session.Session_Id) {
 // entry; this is the part a person needs to recognise where they left off.
 session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 	replayed, replay_err := session.context_load(chat.store, chat.id, app.run.alloc)
-	if replay_err != nil { return }
+	if replay_err != nil {
+		// Resuming a session and showing nothing would look like an empty
+		// conversation rather than a failure to read one.
+		local := replay_err
+		snap_append(app, .Error, fmt.tprintf("cannot read the session history: %s", session.error_detail(&local)))
+		return
+	}
 	defer session.context_destroy(&replayed, app.run.alloc)
 
 	if replayed.summary != "" {
