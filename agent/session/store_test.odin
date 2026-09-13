@@ -1,0 +1,412 @@
+#+test
+#+private file
+package session
+
+import "core:os"
+import "core:strings"
+import "core:testing"
+
+import "nabla:db"
+import "nabla:db/sqlite"
+
+_expect_ok :: proc(t: ^testing.T, err: Error) {
+	if err == nil { return }
+	local := err
+	testing.fail_now(t, strings.concatenate({"unexpected error: ", error_detail(&local)}, context.temp_allocator))
+}
+
+_expect_error :: proc(t: ^testing.T, err: Error, kind: Error_Kind) {
+	if err == nil {
+		testing.expectf(t, false, "expected a %v failure, got none", kind)
+		return
+	}
+	if actual := error_kind(err); actual != kind {
+		local := err
+		testing.expectf(t, false, "expected %v, got %v: %s", kind, actual, error_detail(&local))
+	}
+}
+
+_expect_db_ok :: proc(t: ^testing.T, err: db.Error) {
+	if err != nil {
+		local := err
+		testing.fail_now(t, strings.concatenate({"unexpected database error: ", db.error_message(&local)}, context.temp_allocator))
+	}
+}
+
+_temp_directory :: proc(t: ^testing.T) -> string {
+	directory, err := os.make_directory_temp("", "nabla-session-test-*", context.allocator)
+	if err != nil { testing.fail_now(t, "could not create a temporary directory") }
+	return directory
+}
+
+_open_store :: proc(t: ^testing.T, store: ^Store) -> string {
+	directory := _temp_directory(t)
+	_expect_ok(t, store_open(store, directory))
+	return directory
+}
+
+_close_store :: proc(store: ^Store, directory: string) {
+	store_close(store)
+	os.remove_all(directory)
+	delete(directory, context.allocator)
+}
+
+@(test)
+test_open_creates_a_private_store :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	directory_info, directory_err := os.stat(directory, context.temp_allocator)
+	if directory_err != nil { testing.fail_now(t, "the session directory was not created") }
+	testing.expect(t, permissions_are_private(directory_info.mode), "the session directory should be owner-only")
+
+	database := strings.concatenate({directory, "/", DATABASE_NAME}, context.temp_allocator)
+	database_info, database_err := os.stat(database, context.temp_allocator)
+	if database_err != nil { testing.fail_now(t, "the database was not created") }
+	testing.expect(t, permissions_are_private(database_info.mode), "the database should be owner-only")
+}
+
+@(test)
+test_open_is_idempotent_across_stores :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	store_close(&store)
+	defer {
+		os.remove_all(directory)
+		delete(directory, context.allocator)
+	}
+
+	reopened: Store
+	_expect_ok(t, store_open(&reopened, directory))
+	store_close(&reopened)
+}
+
+@(test)
+test_create_and_load_round_trip :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	created, create_err := session_create(&store, {workspace = "/tmp/project", title = "first", provider = "openai", model = "gpt-4"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&created)
+
+	testing.expect_value(t, len(created.id), SESSION_ID_LENGTH)
+	testing.expect(t, session_id_valid(created.id), "a created id should validate")
+	testing.expect_value(t, created.workspace, "/tmp/project")
+	testing.expect_value(t, created.title, "first")
+	testing.expect_value(t, created.provider, "openai")
+	testing.expect_value(t, created.model, "gpt-4")
+	testing.expect_value(t, created.created_at_ms, i64(1_000))
+	testing.expect_value(t, created.updated_at_ms, i64(1_000))
+	if _, archived := created.archived_at_ms.?; archived { testing.fail_now(t, "a new session is not archived") }
+
+	loaded, load_err := session_load(&store, created.id)
+	_expect_ok(t, load_err)
+	defer session_destroy(&loaded)
+	testing.expect_value(t, loaded.id, created.id)
+	testing.expect_value(t, loaded.workspace, "/tmp/project")
+	testing.expect_value(t, loaded.title, "first")
+	testing.expect_value(t, loaded.provider, "openai")
+	testing.expect_value(t, loaded.model, "gpt-4")
+	testing.expect_value(t, loaded.created_at_ms, i64(1_000))
+}
+
+@(test)
+test_two_sessions_get_different_ids :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	first, first_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, first_err)
+	defer session_destroy(&first)
+	second, second_err := session_create(&store, {workspace = "/tmp/project"}, 1_001)
+	_expect_ok(t, second_err)
+	defer session_destroy(&second)
+
+	testing.expect(t, first.id != second.id, "two sessions should not share an id")
+}
+
+@(test)
+test_create_rejects_an_empty_workspace :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session, err := session_create(&store, {}, 1_000)
+	_expect_error(t, err, .Invalid_Argument)
+	session_destroy(&session)
+}
+
+@(test)
+test_load_reports_a_missing_session :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	_, err := session_load(&store, Session_Id("0123456789abcdef0123456789abcdef"))
+	_expect_error(t, err, .Not_Found)
+}
+
+@(test)
+test_list_orders_by_activity_and_pages :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	ids: [4]Session_Id
+	for &id, i in ids {
+		session, err := session_create(&store, {workspace = "/tmp/project"}, i64(1_000 + i * 1_000))
+		_expect_ok(t, err)
+		// The array owns its own copy, because the session it came from is about
+		// to be destroyed.
+		id = Session_Id(strings.clone(string(session.id), context.allocator))
+		session_destroy(&session)
+	}
+	defer for id in ids { delete(string(id), context.allocator) }
+
+	// One session elsewhere must not appear in a workspace listing.
+	other, other_err := session_create(&store, {workspace = "/tmp/other"}, 10_000)
+	_expect_ok(t, other_err)
+	defer session_destroy(&other)
+
+	all, all_err := session_list(&store, {})
+	_expect_ok(t, all_err)
+	defer sessions_destroy(all)
+	if !testing.expect_value(t, len(all), 5) { return }
+	testing.expect_value(t, all[0].id, other.id)
+	testing.expect_value(t, all[1].id, ids[3])
+	testing.expect_value(t, all[4].id, ids[0])
+
+	project, project_err := session_list(&store, {workspace = "/tmp/project"})
+	_expect_ok(t, project_err)
+	defer sessions_destroy(project)
+	testing.expect_value(t, len(project), 4)
+
+	first_page, first_err := session_list(&store, {workspace = "/tmp/project", limit = 2})
+	_expect_ok(t, first_err)
+	defer sessions_destroy(first_page)
+	if !testing.expect_value(t, len(first_page), 2) { return }
+	testing.expect_value(t, first_page[0].id, ids[3])
+	testing.expect_value(t, first_page[1].id, ids[2])
+
+	cursor := Session_Cursor {
+		updated_at_ms = first_page[len(first_page) - 1].updated_at_ms,
+		id            = first_page[len(first_page) - 1].id,
+	}
+	second_page, second_err := session_list(&store, {workspace = "/tmp/project", limit = 2, after = cursor})
+	_expect_ok(t, second_err)
+	defer sessions_destroy(second_page)
+	if !testing.expect_value(t, len(second_page), 2) { return }
+	testing.expect_value(t, second_page[0].id, ids[1])
+	testing.expect_value(t, second_page[1].id, ids[0])
+}
+
+@(test)
+test_claim_is_exclusive :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session, create_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&session)
+
+	_expect_ok(t, session_claim(&store, session.id))
+	// A second claim from the same store is refused before it reaches the file.
+	_expect_error(t, session_claim(&store, session.id), .Invalid_State)
+	claimed, held := session_claimed(&store)
+	testing.expect(t, held, "the session should be reported as claimed")
+	testing.expect_value(t, claimed, session.id)
+
+	_expect_ok(t, session_release(&store))
+	_, still_held := session_claimed(&store)
+	testing.expect(t, !still_held, "the claim should be gone after release")
+	_expect_ok(t, session_claim(&store, session.id))
+	_expect_ok(t, session_release(&store))
+}
+
+@(test)
+test_claim_refuses_a_missing_session :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	_expect_error(t, session_claim(&store, Session_Id("0123456789abcdef0123456789abcdef")), .Not_Found)
+}
+
+@(test)
+test_a_second_store_cannot_claim_the_same_session :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session, create_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&session)
+
+	_expect_ok(t, session_claim(&store, session.id))
+	defer session_release(&store)
+
+	second: Store
+	_expect_ok(t, store_open(&second, directory))
+	defer store_close(&second)
+
+	_expect_error(t, session_claim(&second, session.id), .Busy)
+
+	// Releasing the first claim lets the second store take it.
+	_expect_ok(t, session_release(&store))
+	second_claim_err := session_claim(&second, session.id)
+	_expect_ok(t, second_claim_err)
+	session_release(&second)
+}
+
+@(test)
+test_archive_hides_and_unarchive_restores :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session, create_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&session)
+	_expect_ok(t, session_claim(&store, session.id))
+	defer session_release(&store)
+
+	_expect_ok(t, session_archive(&store, session.id, 2_000))
+
+	visible, visible_err := session_list(&store, {})
+	_expect_ok(t, visible_err)
+	testing.expect_value(t, len(visible), 0)
+	sessions_destroy(visible)
+
+	everything, everything_err := session_list(&store, {include_archived = true})
+	_expect_ok(t, everything_err)
+	if !testing.expect_value(t, len(everything), 1) { return }
+	if archived_at, archived := everything[0].archived_at_ms.?; archived {
+		testing.expect_value(t, archived_at, i64(2_000))
+	} else {
+		testing.fail_now(t, "the archived session should carry its archive time")
+	}
+	sessions_destroy(everything)
+
+	_expect_ok(t, session_unarchive(&store, session.id))
+	restored, restored_err := session_list(&store, {})
+	_expect_ok(t, restored_err)
+	testing.expect_value(t, len(restored), 1)
+	sessions_destroy(restored)
+}
+
+@(test)
+test_mutations_require_the_claim :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session, create_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&session)
+
+	_expect_error(t, session_set_title(&store, session.id, "named"), .Invalid_State)
+	_expect_error(t, session_archive(&store, session.id, 2_000), .Invalid_State)
+	_expect_error(t, session_delete(&store, session.id), .Invalid_State)
+
+	_expect_ok(t, session_claim(&store, session.id))
+	// A different session cannot be mutated through this claim.
+	other, other_err := session_create(&store, {workspace = "/tmp/project"}, 1_500)
+	_expect_ok(t, other_err)
+	defer session_destroy(&other)
+	_expect_error(t, session_set_title(&store, other.id, "named"), .Invalid_State)
+	_expect_ok(t, session_release(&store))
+}
+
+@(test)
+test_set_title_and_model_then_touch :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session, create_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&session)
+	_expect_ok(t, session_claim(&store, session.id))
+	defer session_release(&store)
+
+	_expect_ok(t, session_set_title(&store, session.id, "explain the parser"))
+	_expect_ok(t, session_set_model(&store, session.id, "anthropic", "claude"))
+	_expect_ok(t, session_touch(&store, session.id, 5_000))
+
+	loaded, load_err := session_load(&store, session.id)
+	_expect_ok(t, load_err)
+	defer session_destroy(&loaded)
+	testing.expect_value(t, loaded.title, "explain the parser")
+	testing.expect_value(t, loaded.provider, "anthropic")
+	testing.expect_value(t, loaded.model, "claude")
+	testing.expect_value(t, loaded.updated_at_ms, i64(5_000))
+}
+
+@(test)
+test_delete_removes_the_session_and_releases_the_claim :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session, create_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&session)
+	_expect_ok(t, session_claim(&store, session.id))
+
+	_expect_ok(t, session_delete(&store, session.id))
+	_, held := session_claimed(&store)
+	testing.expect(t, !held, "deleting the claimed session should release the claim")
+
+	_, load_err := session_load(&store, session.id)
+	_expect_error(t, load_err, .Not_Found)
+
+	remaining, list_err := session_list(&store, {})
+	_expect_ok(t, list_err)
+	testing.expect_value(t, len(remaining), 0)
+	sessions_destroy(remaining)
+}
+
+@(test)
+test_refuses_a_foreign_database :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer {
+		os.remove_all(directory)
+		delete(directory, context.allocator)
+	}
+
+	database := strings.concatenate({directory, "/", DATABASE_NAME}, context.temp_allocator)
+	conn: db.Conn
+	_expect_db_ok(t, sqlite.open(&conn, {path = database}))
+	_expect_db_ok(t, db.exec(&conn, "CREATE TABLE someone_elses (a TEXT)"))
+	_expect_db_ok(t, db.close(&conn))
+
+	store: Store
+	err := store_open(&store, directory)
+	_expect_error(t, err, .Schema_Unknown)
+	store_close(&store)
+}
+
+@(test)
+test_refuses_a_newer_schema :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer {
+		os.remove_all(directory)
+		delete(directory, context.allocator)
+	}
+
+	database := strings.concatenate({directory, "/", DATABASE_NAME}, context.temp_allocator)
+	conn: db.Conn
+	_expect_db_ok(t, sqlite.open(&conn, {path = database}))
+	_expect_db_ok(t, db.exec(&conn, "PRAGMA user_version = 99"))
+	_expect_db_ok(t, db.close(&conn))
+
+	store: Store
+	err := store_open(&store, directory)
+	_expect_error(t, err, .Schema_Too_New)
+	store_close(&store)
+}
