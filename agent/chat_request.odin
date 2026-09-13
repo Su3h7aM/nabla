@@ -195,7 +195,15 @@ chat_append_entries :: proc(
 			chat_flush_calls(messages, call_lists, &group, &group_open)
 			call_id := ""
 			if related, present := entry.related_seq.?; present { call_id = call_ids[i64(related)] }
-			append(messages, ai.Provider_Message{Role = .Tool, Content = payload.content, Tool_Call_ID = call_id})
+			append(
+				messages,
+				ai.Provider_Message {
+					Role = .Tool,
+					Content = payload.content,
+					Tool_Call_ID = call_id,
+					Tool_Is_Error = payload.outcome != .Exited,
+				},
+			)
 		case session.Tool_Dispatch_Entry, session.Checkpoint_Entry:
 		// Bookkeeping a model is never shown.
 		}

@@ -240,6 +240,50 @@ test_invalid_arguments_get_a_result_without_a_dispatch :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_malformed_arguments_are_rejected_and_replayed :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	chat.max_output_tokens = 4096
+	_test_accept(t, chat, "malformed call")
+
+	// The provider delivered a call whose argument document never parses. Nothing
+	// runs, the model is told what is wrong, and the turn keeps going.
+	_test_stage_call(t, chat, "call_bad", `{"command":`)
+	count := chat_run_tools(chat, {})
+	testing.expect_value(t, count, 1)
+	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, count))
+	testing.expect_value(t, chat.state, Chat_State.Preparing)
+
+	entries := _test_entries(t, chat)
+	defer session.entries_destroy(entries, context.allocator)
+	if !testing.expect_value(t, len(entries), 3) { return }
+	result, is_result := entries[2].payload.(session.Tool_Result_Entry)
+	if !testing.expect(t, is_result, "a rejected call still gets a result") { return }
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
+	testing.expect(t, strings.contains(result.content, `"code":"syntax"`), "the result names the defect")
+
+	// A rejected call stays in history, so every API family has to be able to
+	// encode the request that follows it.
+	apis := []ai.API_Kind{.OpenAI_Chat_Completions, .OpenAI_Responses, .Anthropic_Messages}
+	for api in apis {
+		prep, prep_err := chat_prepare(chat, {API = api})
+		if !testing.expectf(t, prep_err == nil, "%v must build a request", api) { continue }
+		body, encode_err := ai.Provider_Encode_Request(prep.request)
+		testing.expectf(t, encode_err == ai.Provider_Request_Error.None, "%v must encode a rejected call", api)
+		if api == .Anthropic_Messages {
+			// The rejection has to be readable as a failure on the wire; the original
+			// arguments cannot be represented as an object, so the call is replayed
+			// with its identity intact and the reason in the paired result.
+			testing.expect(t, strings.contains(body, `"is_error":true`), "the result is marked as an error")
+		}
+		delete(body)
+		chat_request_prep_destroy(&prep, chat.allocator)
+	}
+}
+@(test)
 test_unknown_tool_is_reported_not_run :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))

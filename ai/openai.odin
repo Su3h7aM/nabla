@@ -83,16 +83,6 @@ openai_finish_reason :: proc(reason: string) -> Provider_Finish_Reason {
 	return .Unknown
 }
 
-// Validate tool arguments without core's lossy parser: reject oversized or
-// empty input, scan for duplicate keys, then confirm the payload parses to a
-// single JSON object with nothing trailing.
-openai_tool_args_valid :: proc(raw: []u8, max_bytes := OPENAI_TOOL_ARGS_BYTES) -> bool {
-	if len(raw) == 0 || len(raw) > max_bytes { return false }
-	end := openai_json_object_check(raw, 0, OPENAI_TOOL_SCHEMA_DEPTH)
-	if end < 0 { return false }
-	return openai_json_skip(raw, end) == len(raw)
-}
-
 // Validate a tool parameter schema: bounded JSON object with nothing
 // trailing. Depth-bounded; the worker enforces the same shape on arguments.
 openai_tool_schema_valid :: proc(raw: string) -> bool {

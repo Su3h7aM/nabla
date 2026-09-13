@@ -32,7 +32,11 @@ Provider_Tool_Call :: struct {
 	ID:        string, // borrowed until operation retirement; Chat id / Responses call_id,
 	Item_ID:   string, // borrowed; Responses output-item id, empty for Chat,
 	Name:      string, // borrowed until operation retirement,
-	Arguments: string, // borrowed until operation retirement; raw JSON object,
+	// Arguments is the raw argument text the endpoint produced, exactly as it
+	// assembled it. It may be empty or malformed JSON: the provider boundary
+	// decides that a call is trustworthy, not that its arguments are usable, and
+	// the agent validates the document before anything runs.
+	Arguments: string, // borrowed until operation retirement,
 }
 
 Provider_Tool_Def :: struct {
@@ -45,6 +49,10 @@ Provider_Message :: struct {
 	Role:                Provider_Role,
 	Content:             string, // borrowed until operation retirement,
 	Tool_Call_ID:        string, // borrowed; set on .Tool results, matches a call ID,
+	// Tool_Is_Error marks a tool result the model should read as a failure. A
+	// nonzero exit is not one: it is an observation. It exists because some
+	// providers carry the distinction on the wire.
+	Tool_Is_Error:       bool,
 	Tool_Calls:          []Provider_Tool_Call, // borrowed; set on assistant messages that request calls,
 	Reasoning_ID:        string, // borrowed; set on .Reasoning, the output-item id,
 	Reasoning_Encrypted: string, // borrowed; set on .Reasoning when the endpoint supplied it,
@@ -401,8 +409,7 @@ provider_tool_finalize :: proc(state: ^Provider_Stream_State, allocator := conte
 		if !fragment.Present { continue }
 		count += 1
 		if fragment.ID == "" || fragment.Name == "" { return nil, false }
-		if len(fragment.Arguments) == 0 || len(fragment.Arguments) > PROVIDER_MAX_TOOL_ARGS_BYTES { return nil, false }
-		if !openai_tool_args_valid(fragment.Arguments[:]) { return nil, false }
+		if len(fragment.Arguments) > PROVIDER_MAX_TOOL_ARGS_BYTES { return nil, false }
 		for &other in state.Tool_Fragments {
 			if &other == &fragment || !other.Present { continue }
 			if other.ID != "" && other.ID == fragment.ID { return nil, false }

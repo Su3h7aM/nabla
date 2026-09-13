@@ -917,12 +917,9 @@ test_request_failure_suppresses_retained_completion :: proc(t: ^testing.T) {
 }
 
 test_tool_args_reject_duplicates :: proc(t: ^testing.T) {
-	good := `{"command":"a"}`
-	dup := `{"command":"a","command":"b"}`
-	list := `[1,2]`
-	testing.expect(t, openai_tool_args_valid(transmute([]u8)good))
-	testing.expect(t, !openai_tool_args_valid(transmute([]u8)dup))
-	testing.expect(t, !openai_tool_args_valid(transmute([]u8)list))
+	// The provider boundary no longer judges the argument document; the agent does,
+	// and it compares decoded keys. The schema check stays here because the
+	// request encoder still requires an object-shaped schema.
 	testing.expect(t, openai_tool_schema_valid(`{"type":"object","properties":{},"required":[],"additionalProperties":false}`))
 	testing.expect(t, !openai_tool_schema_valid(`[1]`))
 }

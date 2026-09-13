@@ -179,29 +179,35 @@ anthropic_text_block :: proc(text: string, allocator := context.allocator) -> js
 }
 
 // anthropic_tool_use_block turns a call into its content block. The arguments are
-// a JSON object on the wire, so a call whose arguments are not one cannot be
-// represented and is refused rather than sent as an empty object.
+// a JSON object on the wire, so a call whose arguments are not one is replayed
+// with an empty object: the id and name are preserved so the paired result still
+// answers this call, and the rejection travels in that result rather than in
+// invented arguments.
 @(private)
 anthropic_tool_use_block :: proc(call: Provider_Tool_Call, allocator := context.allocator) -> (json.Value, bool) {
-	input, parse_err := json.parse_string(call.Arguments, .JSON, true, allocator)
-	if parse_err != nil { return nil, false }
-	defer json.destroy_value(input, allocator)
-	if _, is_object := input.(json.Object); !is_object { return nil, false }
+	if call.ID == "" || call.Name == "" { return nil, false }
+	input: json.Value
+	if parsed, parse_err := json.parse_string(call.Arguments, .JSON, true, allocator); parse_err == nil {
+		if _, is_object := parsed.(json.Object); is_object { input = json.clone_value(parsed, allocator) }
+		json.destroy_value(parsed, allocator)
+	}
+	if input == nil { input = json.Value(make(json.Object, 0, allocator)) }
 	block := make(json.Object, 4, allocator)
 	anthropic_object_set(&block, "type", json.String(strings.clone(ANTHROPIC_BLOCK_TOOL_USE, allocator)), allocator)
 	anthropic_object_set(&block, "id", json.String(strings.clone(call.ID, allocator)), allocator)
 	anthropic_object_set(&block, "name", json.String(strings.clone(call.Name, allocator)), allocator)
-	anthropic_object_set(&block, "input", json.Value(json.clone_value(input, allocator)), allocator)
+	anthropic_object_set(&block, "input", input, allocator)
 	return json.Value(block), true
 }
 
 @(private)
 anthropic_tool_result_block :: proc(message: Provider_Message, allocator := context.allocator) -> (json.Value, bool) {
 	if message.Tool_Call_ID == "" { return nil, false }
-	block := make(json.Object, 3, allocator)
+	block := make(json.Object, 4, allocator)
 	anthropic_object_set(&block, "type", json.String(strings.clone(ANTHROPIC_BLOCK_TOOL_RESULT, allocator)), allocator)
 	anthropic_object_set(&block, "tool_use_id", json.String(strings.clone(message.Tool_Call_ID, allocator)), allocator)
 	anthropic_object_set(&block, "content", json.String(strings.clone(message.Content, allocator)), allocator)
+	if message.Tool_Is_Error { anthropic_object_set(&block, "is_error", json.Boolean(true), allocator) }
 	return json.Value(block), true
 }
 

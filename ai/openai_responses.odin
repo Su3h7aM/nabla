@@ -284,10 +284,7 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 			append(&fragment.Arguments, args)
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call arguments are invalid") }
 		fragment.Present = true
-		if done {
-			if !openai_tool_args_valid(fragment.Arguments[:]) { return provider_stream_fail(state, .Invalid_Data, "call arguments are invalid") }
-			fragment.Complete = true
-		}
+		if done { fragment.Complete = true }
 	}
 	return .None
 }
@@ -481,7 +478,6 @@ openai_responses_consume_sse_data :: proc(payload: string, state: ^Provider_Stre
 			clear(&fragment.Arguments)
 			append(&fragment.Arguments, args)
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call arguments are invalid") }
-		if !openai_tool_args_valid(fragment.Arguments[:]) { return provider_stream_fail(state, .Invalid_Data, "call arguments are invalid") }
 		fragment.Present = true
 		fragment.Complete = true
 		return .None
