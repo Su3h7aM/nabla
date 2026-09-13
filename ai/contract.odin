@@ -104,6 +104,12 @@ Provider_Request :: struct {
 	// APIs accept the field.
 	Store_Response_Present:         bool,
 	Store_Response:                 bool,
+	// Cache_Request asks the provider to keep this request's prefix for reuse by
+	// later ones. It is false for content that recurs only when the turn does,
+	// such as a summarization, so paying a cache-write premium for it cannot
+	// displace the conversation's own entries. Absent means the provider decides.
+	Cache_Request_Present:          bool,
+	Cache_Request:                  bool,
 }
 
 Provider_Request_Error :: enum {
@@ -116,6 +122,7 @@ Provider_Request_Error :: enum {
 	Invalid_Tools,
 	Invalid_Tool_Call,
 	Invalid_Max_Output_Tokens,
+	Missing_Max_Output_Tokens,
 	Invalid_Reasoning_Effort,
 	Invalid_Prompt_Cache_Key,
 	Invalid_Prompt_Cache_Options,
@@ -123,7 +130,11 @@ Provider_Request_Error :: enum {
 }
 
 Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request_Error {
-	if request.API != .OpenAI_Chat_Completions && request.API != .OpenAI_Responses { return .Unsupported_API }
+	switch request.API {
+	case .OpenAI_Chat_Completions, .OpenAI_Responses, .Anthropic_Messages:
+	case .Invalid:
+		return .Unsupported_API
+	}
 	if !request.Model_Present || request.Model == "" { return .Missing_Model }
 	if request.Instructions_Present && request.Instructions == "" { return .Invalid_Instructions }
 	if !request.Messages_Present || len(request.Messages) == 0 { return .Missing_Messages }
@@ -146,8 +157,7 @@ Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request
 		if message.Verbatim_Items != "" {
 			if request.API != .OpenAI_Responses { return .Invalid_Message }
 			continue
-		}
-		if message.Role == .Invalid { return .Invalid_Message }
+		}		if message.Role == .Invalid { return .Invalid_Message }
 		#partial switch message.Role {
 		case .Assistant:
 			if message.Content == "" && len(message.Tool_Calls) == 0 { return .Invalid_Message }
@@ -291,6 +301,10 @@ Provider_Tool_Fragment :: struct {
 	Arguments:          [dynamic]u8, // owned raw bytes,
 	Wire_Index:         i64,
 	Wire_Index_Present: bool,
+	// Arguments_Started marks that streamed argument fragments have begun, so a
+	// value stated by the opening event is replaced rather than appended to.
+	// Anthropic states the input object on the block and streams its JSON after.
+	Arguments_Started:  bool,
 }
 
 PROVIDER_MAX_TOOL_CALLS :: 8
@@ -421,16 +435,30 @@ Provider_Stream_Error :: enum {
 }
 
 Provider_Encode_Request :: proc(request: Provider_Request, allocator := context.allocator) -> (string, Provider_Request_Error) {
-	if request.API == .OpenAI_Chat_Completions { return openai_chat_encode_request(request, allocator) }
-	if request.API == .OpenAI_Responses { return openai_responses_encode_request(request, allocator) }
+	switch request.API {
+	case .OpenAI_Chat_Completions:
+		return openai_chat_encode_request(request, allocator)
+	case .OpenAI_Responses:
+		return openai_responses_encode_request(request, allocator)
+	case .Anthropic_Messages:
+		return anthropic_encode_request(request, allocator)
+	case .Invalid:
+	}
 	return "", .Unsupported_API
 }
 
 Provider_Consume_SSE_Data :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil { return .Invalid_State }
 	if state^.Batch_Count > 0 { return .Batch_Not_Drained }
-	if state^.API == .OpenAI_Chat_Completions { return openai_chat_consume_sse_data(payload, state) }
-	if state^.API == .OpenAI_Responses { return openai_responses_consume_sse_data(payload, state) }
+	switch state^.API {
+	case .OpenAI_Chat_Completions:
+		return openai_chat_consume_sse_data(payload, state)
+	case .OpenAI_Responses:
+		return openai_responses_consume_sse_data(payload, state)
+	case .Anthropic_Messages:
+		return anthropic_consume_sse_data(payload, state)
+	case .Invalid:
+	}
 	state^.Phase = .Failed
 	return provider_stream_fail(state, .Invalid_Data, "unsupported API family", .Unsupported_API)
 }

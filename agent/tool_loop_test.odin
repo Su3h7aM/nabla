@@ -835,3 +835,98 @@ test_usage_is_collected_per_request :: proc(t: ^testing.T) {
 		testing.fail_now(t, "an unreported measurement must stay unknown")
 	}
 }
+
+// The Messages API needs an output bound, its system prompt in its own field, and
+// tool calls and results as typed content blocks. The harness projection is
+// provider-neutral, so the adapter is what has to shape it, and this checks the
+// two fit together.
+@(test)
+test_anthropic_request_is_shaped_by_its_adapter :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	chat.max_output_tokens = 1024
+	_test_accept(t, chat, "run printf ok")
+
+	call_seq := _test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			created_at_ms = 2_000,
+			payload = session.Tool_Call_Entry {
+				call_id = "toolu_1",
+				item_id = "tu_1",
+				name = TOOL_SHELL_NAME,
+				arguments = `{"command":"ls","working_directory":null,"timeout_ms":null}`,
+			},
+		},
+	)
+	_test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			created_at_ms = 2_001,
+			related_seq = call_seq,
+			payload = session.Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = `{"status":"exited"}`, origin = .Observed},
+		},
+	)
+
+	anthropic := ai.Provider_Connection {
+		API      = .Anthropic_Messages,
+		Endpoint = "https://api.anthropic.com",
+	}
+	prep, prep_err := chat_prepare(chat, anthropic)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+
+	body, encode_err := ai.Provider_Encode_Request(prep.request)
+	if !testing.expect_value(t, encode_err, ai.Provider_Request_Error.None) { return }
+	defer delete(body)
+	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
+	if !testing.expect_value(t, parse_err, nil) { return }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, object_ok := value.(json.Object)
+	if !testing.expect(t, object_ok) { return }
+
+	system := item_string(object, "system")
+	testing.expect_value(t, system, AGENT_SYSTEM_PROMPT)
+	if bound, present, ok := bound_of(object, "max_tokens"); testing.expect(t, ok && present) {
+		testing.expect_value(t, bound, i64(1024))
+	}
+	_, cached := object["cache_control"]
+	testing.expect(t, cached, "a conversation request asks the provider to cache its prefix")
+
+	messages, messages_ok := object["messages"].(json.Array)
+	if !testing.expect(t, messages_ok) { return }
+	// user, assistant tool call, user tool result.
+	if !testing.expect_value(t, len(messages), 3) { return }
+	call_turn := item_object(t, messages, 1)
+	testing.expect_value(t, item_string(call_turn, "role"), "assistant")
+	call_blocks, call_blocks_ok := call_turn["content"].(json.Array)
+	if !testing.expect(t, call_blocks_ok && len(call_blocks) == 1) { return }
+	call_block := item_object(t, call_blocks, 0)
+	testing.expect_value(t, item_string(call_block, "type"), "tool_use")
+	testing.expect_value(t, item_string(call_block, "name"), TOOL_SHELL_NAME)
+
+	result_turn := item_object(t, messages, 2)
+	testing.expect_value(t, item_string(result_turn, "role"), "user")
+	result_blocks, result_blocks_ok := result_turn["content"].(json.Array)
+	if !testing.expect(t, result_blocks_ok && len(result_blocks) == 1) { return }
+	result_block := item_object(t, result_blocks, 0)
+	testing.expect_value(t, item_string(result_block, "type"), "tool_result")
+	testing.expect_value(t, item_string(result_block, "tool_use_id"), "toolu_1")
+}
+
+@(private)
+bound_of :: proc(object: json.Object, key: string) -> (value: i64, present: bool, ok: bool) {
+	raw, exists := object[key]
+	if !exists { return 0, false, true }
+	if _, is_null := raw.(json.Null); is_null { return 0, false, true }
+	integer, is_integer := raw.(json.Integer)
+	if !is_integer { return 0, true, false }
+	return i64(integer), true, true
+}

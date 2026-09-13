@@ -550,4 +550,18 @@ test_provider_auth_headers_are_optional :: proc(t: ^testing.T) {
 	none := provider_auth_headers(anonymous, context.allocator)
 	defer provider_headers_destroy(none, context.allocator)
 	testing.expect_value(t, len(none), 0)
+
+	// Anthropic authenticates with its own header and requires the API version.
+	messages := Provider_Connection {
+		API        = .Anthropic_Messages,
+		Credential = "secret",
+	}
+	versioned := provider_auth_headers(messages, context.allocator)
+	defer provider_headers_destroy(versioned, context.allocator)
+	if testing.expect_value(t, len(versioned), 2) {
+		testing.expect_value(t, versioned[0].name, "x-api-key")
+		testing.expect_value(t, versioned[0].value, "secret")
+		testing.expect_value(t, versioned[1].name, "anthropic-version")
+		testing.expect_value(t, versioned[1].value, ANTHROPIC_VERSION)
+	}
 }

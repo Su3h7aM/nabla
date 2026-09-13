@@ -41,8 +41,8 @@ Provider_Operation_Options :: struct {
 }
 
 // provider_auth_headers builds the request fields one API family authenticates
-// with. Authentication is provider policy, so the transport never learns it:
-// sse.post carries whatever headers it is handed.
+// with, and the version header it requires. Authentication is provider policy, so
+// the transport never learns it: sse.post carries whatever headers it is handed.
 //
 // An empty credential yields no auth header rather than a refused request, which
 // is what an endpoint that needs no credential expects. Every value in the
@@ -56,9 +56,19 @@ provider_auth_headers :: proc(connection: Provider_Connection, allocator := cont
 		result := make([]client.Header, 1, allocator)
 		result[0] = {"authorization", strings.concatenate({"Bearer ", connection.Credential}, allocator)}
 		return result
-	case .Anthropic_Messages, .Invalid:
-		// The Messages adapter is not implemented, and validation refuses the
-		// family before a request is built, so only the OpenAI scheme exists.
+	case .Anthropic_Messages:
+		// Anthropic authenticates with a key header rather than a bearer token,
+		// and requires the API version on every request.
+		if connection.Credential == "" {
+			result := make([]client.Header, 1, allocator)
+			result[0] = {"anthropic-version", strings.clone(ANTHROPIC_VERSION, allocator)}
+			return result
+		}
+		result := make([]client.Header, 2, allocator)
+		result[0] = {"x-api-key", strings.clone(connection.Credential, allocator)}
+		result[1] = {"anthropic-version", strings.clone(ANTHROPIC_VERSION, allocator)}
+		return result
+	case .Invalid:
 	}
 	return nil
 }
@@ -89,8 +99,21 @@ Provider_Request_Operation_Controlled :: proc(
 	}
 	endpoint := strings.trim_right(connection.Endpoint, "/")
 	owned_endpoint := ""
-	want_suffix := "/responses" if request.API == .OpenAI_Responses else "/chat/completions"
-	if !strings.has_suffix(endpoint, want_suffix) {
+	// Each API family names its own resource path. A configured endpoint may
+	// already include it, so the suffix is added only when it is missing.
+	want_suffix: string
+	switch request.API {
+	case .OpenAI_Chat_Completions:
+		want_suffix = "/chat/completions"
+	case .OpenAI_Responses:
+		want_suffix = "/responses"
+	case .Anthropic_Messages:
+		// The configured endpoint is the API root, version segment included, so the
+		// resource path is relative to it exactly as the OpenAI paths are.
+		want_suffix = "/messages"
+	case .Invalid:
+	}
+	if want_suffix != "" && !strings.has_suffix(endpoint, want_suffix) {
 		owned_endpoint = strings.concatenate([]string{endpoint, want_suffix}, allocator = allocator)
 		endpoint = owned_endpoint
 	}
@@ -239,6 +262,8 @@ provider_request_error_text :: proc(err: Provider_Request_Error) -> string {
 		return "tool call id/name is invalid"
 	case .Invalid_Max_Output_Tokens:
 		return "max output tokens must be positive"
+	case .Missing_Max_Output_Tokens:
+		return "this API requires an output bound; set max_output_tokens for the model"
 	case .Invalid_Reasoning_Effort:
 		return "reasoning effort must be a non-empty level"
 	case .Invalid_Prompt_Cache_Key:

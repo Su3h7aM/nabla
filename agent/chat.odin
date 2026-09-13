@@ -198,6 +198,11 @@ chat_build_request_into :: proc(
 	// self-contained rather than dependent on server-side state.
 	prep.request.Store_Response_Present = true
 	prep.request.Store_Response = false
+	// The conversation is worth caching because later requests reuse its prefix.
+	// A summarization is not: its content is one-off, so a cache write would pay a
+	// premium for something nothing reads back.
+	prep.request.Cache_Request_Present = true
+	prep.request.Cache_Request = !compact
 	// The session id is the cache identity: stable for the session's life, so
 	// related requests route together and account together. On Responses the
 	// implicit breakpoint advances through the newest eligible boundary on its
@@ -899,7 +904,12 @@ chat_report_usage :: proc(observer: Chat_Observer, entries: [dynamic]Chat_Reques
 }
 
 chat_supports_tools :: proc(api: ai.API_Kind) -> bool {
-	return api == .OpenAI_Chat_Completions || api == .OpenAI_Responses
+	switch api {
+	case .OpenAI_Chat_Completions, .OpenAI_Responses, .Anthropic_Messages:
+		return true
+	case .Invalid:
+	}
+	return false
 }
 
 chat_notice_effort :: proc(chat: ^Chat_Session, observer: Chat_Observer, provider_id, model_id: string) {
