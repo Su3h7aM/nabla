@@ -21,6 +21,8 @@ Provider_Operation_Error_Kind :: enum {
 
 Provider_Operation_Error :: struct {
 	kind:   Provider_Operation_Error_Kind,
+	// detail is owned by the caller and released with the operation's allocator,
+	// so a constant message is cloned into it like any other.
 	detail: string,
 }
 
@@ -50,9 +52,11 @@ Provider_Request_Operation_Controlled :: proc(
 	allocator := context.allocator,
 ) -> Provider_Operation_Error {
 	if err := Provider_Validate_Request(request); err != .None {
-		return Provider_Operation_Error{kind = .Invalid_Request, detail = provider_request_error_text(err)}
+		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(err), allocator)}
 	}
-	if connection.API != request.API { return Provider_Operation_Error{kind = .Invalid_Request, detail = "connection/request API mismatch"} }
+	if connection.API != request.API {
+		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("connection/request API mismatch", allocator)}
+	}
 	endpoint := strings.trim_right(connection.Endpoint, "/")
 	owned_endpoint := ""
 	want_suffix := "/responses" if request.API == .OpenAI_Responses else "/chat/completions"
@@ -63,7 +67,7 @@ Provider_Request_Operation_Controlled :: proc(
 	defer delete(owned_endpoint, allocator)
 	body, encode_err := Provider_Encode_Request(request, allocator)
 	if encode_err != .None {
-		return Provider_Operation_Error{kind = .Invalid_Request, detail = provider_request_error_text(encode_err)}
+		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(encode_err), allocator)}
 	}
 	defer delete(body, allocator)
 
