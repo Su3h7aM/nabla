@@ -241,6 +241,32 @@ test_an_open_store_runs_in_write_ahead_logging :: proc(t: ^testing.T) {
 	testing.expect(t, strings.equal_fold(mode, "wal"), "the store must run in write-ahead logging mode")
 }
 
+// The kind a caller sees is what tells it whether to retry, to fix its
+// arguments, or to report a database that could not work. That mapping is a
+// contract, so it is pinned rather than left to the call sites.
+@(test)
+test_storage_failures_keep_the_kind_a_caller_can_act_on :: proc(t: ^testing.T) {
+	cases := []struct {
+		backend: db.Error_Kind,
+		kind:    Error_Kind,
+	} {
+		{.Constraint, .Constraint},
+		{.Busy, .Contended},
+		{.Busy_Snapshot, .Stale_Snapshot},
+		{.Backend, .Storage},
+		{.Read_Only, .Storage},
+		{.Out_Of_Memory, .Storage},
+		{.Interrupted, .Storage},
+	}
+	for c in cases {
+		err := storage_error("write", db.error_make(c.backend, 7, "backend detail"))
+		if !testing.expectf(t, error_kind(err) == c.kind, "%v should map to %v, got %v", c.backend, c.kind, error_kind(err)) { continue }
+		// The backend's own words travel with the classification.
+		local := err
+		testing.expect(t, strings.contains(error_detail(&local), "backend detail"), "the backend detail must survive the mapping")
+	}
+}
+
 // A store whose failed write could not be rolled back must refuse later writes
 // rather than writing into a transaction nothing will commit. The trigger is a
 // rare I/O path, so the policy is what is exercised by setting the state the
