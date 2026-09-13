@@ -132,7 +132,7 @@ schema_migrate :: proc(store: ^Store) -> Error {
 		return storage_error("begin migration", err)
 	}
 	committed := false
-	defer if !committed { db.rollback(&store.conn) }
+	defer if !committed { abandon_transaction(store) }
 
 	version, version_err := schema_read_version(store)
 	if version_err != nil { return version_err }

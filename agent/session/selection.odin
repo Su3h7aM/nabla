@@ -64,7 +64,7 @@ selection_load :: proc(store: ^Store, allocator := context.allocator) -> (select
 
 // selection_save records the selection, replacing whatever was stored.
 selection_save :: proc(store: ^Store, selection: Selection) -> Error {
-	if !store.open { return error_make(.Invalid_State, "the store is closed") }
+	require_writable(store) or_return
 	if selection.provider == "" || selection.model == "" {
 		return error_make(.Invalid_Argument, "a selection needs a provider and a model")
 	}

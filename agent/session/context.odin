@@ -49,7 +49,7 @@ session_recover :: proc(store: ^Store, id: Session_Id, options: Recover_Options,
 		return {}, storage_error("begin recovery", err)
 	}
 	committed := false
-	defer if !committed { db.rollback(&store.conn) }
+	defer if !committed { abandon_transaction(store) }
 
 	unsettled, unsettled_err := unsettled_calls(store, id, allocator)
 	if unsettled_err != nil { return {}, unsettled_err }

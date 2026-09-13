@@ -212,13 +212,63 @@ test_a_second_store_cannot_claim_the_same_session :: proc(t: ^testing.T) {
 	_expect_ok(t, store_open(&second, directory))
 	defer store_close(&second)
 
-	_expect_error(t, session_claim(&second, session.id), .Busy)
+	_expect_error(t, session_claim(&second, session.id), .Claimed)
 
 	// Releasing the first claim lets the second store take it.
 	_expect_ok(t, session_release(&store))
 	second_claim_err := session_claim(&second, session.id)
 	_expect_ok(t, second_claim_err)
 	session_release(&second)
+}
+
+// The store assumes write-ahead logging: readers do not block the writer, and a
+// checkpoint does not block readers. An open store is checked against the mode
+// SQLite actually reported, so this pins the invariant the open path enforces.
+@(test)
+test_an_open_store_runs_in_write_ahead_logging :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	rows: db.Rows
+	_expect_db_ok(t, db.query(&store.conn, &rows, "PRAGMA journal_mode"))
+	defer db.rows_close(&rows)
+	values, has_row, next_err := db.rows_next(&rows)
+	_expect_db_ok(t, next_err)
+	if !testing.expect(t, has_row, "the journal mode should be reported") { return }
+	mode, convert_err := db.as_string(values[0])
+	_expect_db_ok(t, convert_err)
+	testing.expect(t, strings.equal_fold(mode, "wal"), "the store must run in write-ahead logging mode")
+}
+
+// A store whose failed write could not be rolled back must refuse later writes
+// rather than writing into a transaction nothing will commit. The trigger is a
+// rare I/O path, so the policy is what is exercised by setting the state the
+// failed rollback would have set.
+@(test)
+test_a_broken_transaction_state_refuses_writes_but_not_reads :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session, create_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&session)
+	_expect_ok(t, session_claim(&store, session.id))
+
+	store.broken = true
+
+	// A claiming mutation and a claim-free write are both refused, because both
+	// depend on the connection's transaction state.
+	_expect_error(t, session_set_title(&store, session.id, "named"), .Invalid_State)
+	_expect_error(t, selection_save(&store, {provider = "p", model = "m"}), .Invalid_State)
+
+	// Reads do not depend on transaction state, so they keep working: the session
+	// is still inspectable after a failed write.
+	loaded, load_err := session_load(&store, session.id)
+	_expect_ok(t, load_err)
+	defer session_destroy(&loaded)
+	testing.expect_value(t, loaded.id, session.id)
 }
 
 // A switch claims the candidate while the running session is still held, so both
@@ -250,14 +300,14 @@ test_a_switch_holds_both_sessions_until_it_commits :: proc(t: ^testing.T) {
 	claimed, held := session_claimed(&store)
 	testing.expect(t, held, "the candidate should be the store's claim")
 	testing.expect_value(t, claimed, target.id)
-	_expect_error(t, session_claim(&second, running.id), .Busy)
-	_expect_error(t, session_claim(&second, target.id), .Busy)
+	_expect_error(t, session_claim(&second, running.id), .Claimed)
+	_expect_error(t, session_claim(&second, target.id), .Claimed)
 
 	// Committing releases the running session and keeps the candidate.
 	_expect_ok(t, claim_release(&displaced))
 	_expect_ok(t, session_claim(&second, running.id))
 	_expect_ok(t, session_release(&second))
-	_expect_error(t, session_claim(&second, target.id), .Busy)
+	_expect_error(t, session_claim(&second, target.id), .Claimed)
 }
 
 // A candidate another process holds is refused without disturbing the running
@@ -285,7 +335,7 @@ test_a_refused_or_restored_switch_keeps_the_running_claim :: proc(t: ^testing.T)
 	// The refusal leaves the store claiming exactly what it claimed before, and the
 	// running session is still writable.
 	_, candidate_err := session_claim_candidate(&store, target.id)
-	_expect_error(t, candidate_err, .Busy)
+	_expect_error(t, candidate_err, .Claimed)
 	claimed, held := session_claimed(&store)
 	testing.expect(t, held, "the running session must still be claimed")
 	testing.expect_value(t, claimed, running.id)

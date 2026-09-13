@@ -83,7 +83,7 @@ turn_begin :: proc(store: ^Store, id: Session_Id, user_text: string, origin: Use
 		return 0, storage_error("begin turn", err)
 	}
 	committed := false
-	defer if !committed { db.rollback(&store.conn) }
+	defer if !committed { abandon_transaction(store) }
 
 	turn, turn_err := scalar_i64(store, TURN_NEXT_NO, {db.Value(string(id))})
 	if turn_err != nil { return 0, turn_err }
@@ -123,7 +123,7 @@ turn_finish :: proc(store: ^Store, id: Session_Id, turn_no: Turn_No, outcome: Ou
 		return storage_error("begin turn finish", err)
 	}
 	committed := false
-	defer if !committed { db.rollback(&store.conn) }
+	defer if !committed { abandon_transaction(store) }
 
 	args := [?]db.Value{db.Value(outcome_name(outcome)), db.Value(at_ms), optional_text_value(error_json), db.Value(string(id)), db.Value(i64(turn_no))}
 	affected, affected_err := exec_affected(store, TURN_FINISH, args[:])
@@ -158,7 +158,7 @@ request_begin :: proc(store: ^Store, id: Session_Id, request: New_Request, at_ms
 		return 0, storage_error("begin request", err)
 	}
 	committed := false
-	defer if !committed { db.rollback(&store.conn) }
+	defer if !committed { abandon_transaction(store) }
 
 	number, number_err := scalar_i64(store, REQUEST_NEXT_NO, {db.Value(string(id))})
 	if number_err != nil { return 0, number_err }
@@ -207,7 +207,7 @@ request_finish :: proc(store: ^Store, id: Session_Id, request_no: Request_No, fi
 		return storage_error("begin request finish", err)
 	}
 	committed := false
-	defer if !committed { db.rollback(&store.conn) }
+	defer if !committed { abandon_transaction(store) }
 
 	args := [?]db.Value {
 		db.Value(outcome_name(finish.outcome)),
@@ -340,7 +340,7 @@ entries_append :: proc(store: ^Store, id: Session_Id, entries: []New_Entry, allo
 		return nil, storage_error("begin entry write", err)
 	}
 	committed := false
-	defer if !committed { db.rollback(&store.conn) }
+	defer if !committed { abandon_transaction(store) }
 
 	base, base_err := scalar_i64(store, ENTRY_NEXT_SEQ, {db.Value(string(id))})
 	if base_err != nil { return nil, base_err }

@@ -6,7 +6,10 @@ package session
 MAX_ERROR_DETAIL :: 160
 
 // Error_Kind classifies a failure. The zero value is success, so Error composes
-// with or_return, or_else, and or_break.
+// with or_return, or_else, and or_break. The kinds tell a caller what it can do:
+// .Claimed and .Contended are contention, .Stale_Snapshot is a transaction that
+// must be restarted, .Constraint is a rejected row, and .Storage is a database
+// that could not work.
 Error_Kind :: enum {
 	None,
 	// The arguments do not describe a valid operation, or the store is in the
@@ -15,7 +18,14 @@ Error_Kind :: enum {
 	// No session with that id exists.
 	Not_Found,
 	// Another process holds the session's writer claim.
-	Busy,
+	Claimed,
+	// Another connection held the database's write lock for longer than the busy
+	// timeout allowed. The same call can succeed once that writer finishes.
+	Contended,
+	// A write was attempted from a WAL snapshot another connection had already
+	// moved past. Running the same call again cannot help: the caller rolls the
+	// transaction back and reads the current state before retrying.
+	Stale_Snapshot,
 	// A UNIQUE, NOT NULL, CHECK, or FOREIGN KEY constraint rejected the row.
 	Constraint,
 	// The database could not be opened, configured, read, or written.
@@ -29,7 +39,8 @@ Error_Kind :: enum {
 	Corrupt,
 	// A payload could not be encoded for storage.
 	Encode,
-	// The store is closed, or a writer claim is held that the call does not own.
+	// The store is closed, a writer claim is held that the call does not own, or
+	// a failed transaction could not be discarded.
 	Invalid_State,
 }
 

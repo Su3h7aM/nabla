@@ -44,6 +44,12 @@ Store :: struct {
 	directory: string, // owned
 	open:      bool,
 	claim:     Claim, // the session claimed for writing, if any
+	// broken records a transaction that could not be discarded. SQLite does not
+	// promise that a failed ROLLBACK has ended the transaction, so the
+	// connection's transaction state is unknown from then on: every mutation
+	// refuses rather than reporting a confusing "a transaction is already open"
+	// from the next statement. Reads are unaffected.
+	broken:    bool,
 }
 
 // Claim is one held writer claim: the advisory lock and the session it names.
@@ -63,7 +69,7 @@ Claim :: struct {
 // claim_acquire takes the writer claim for id. It consults no store and does not
 // disturb a claim the caller already holds, which is what lets a switch take the
 // candidate while the running session is still claimed. A second process holding
-// the same session is refused with .Busy.
+// the same session is refused with .Claimed.
 //
 // The claim is returned held and owns its session id under allocator; release it
 // with claim_release.
@@ -86,7 +92,7 @@ claim_acquire :: proc(directory: string, id: Session_Id, allocator: mem.Allocato
 	if lock_errno := linux.flock(fd, {.EX, .NB}); lock_errno != .NONE {
 		linux.close(fd)
 		if lock_errno == .EAGAIN || lock_errno == .EACCES {
-			return {}, error_make(.Busy, "another process is running that session")
+			return {}, error_make(.Claimed, "another process is running that session")
 		}
 		return {}, error_make(.Storage, fmt.tprintf("the session lock could not be taken: %v", lock_errno))
 	}
@@ -122,6 +128,31 @@ claim_release :: proc(claim: ^Claim) -> Error {
 	return nil
 }
 
+// set_journal_mode turns on write-ahead logging and checks that the database
+// accepted it. SQLite answers a journal-mode pragma with the mode it ended up in
+// and quietly keeps another mode on a filesystem that cannot support WAL, so the
+// answer is the only evidence for what this store assumes: readers do not block
+// the writer, and a checkpoint does not block readers. Running in `delete` mode
+// instead would silently turn every read into a writer-blocking one.
+@(private)
+set_journal_mode :: proc(store: ^Store) -> Error {
+	rows: db.Rows
+	if err := db.query(&store.conn, &rows, "PRAGMA journal_mode = WAL"); err != nil {
+		return storage_error("set the journal mode", err)
+	}
+	defer db.rows_close(&rows)
+
+	values, has_row, next_err := db.rows_next(&rows)
+	if next_err != nil { return storage_error("set the journal mode", next_err) }
+	if !has_row { return error_make(.Storage, "the journal mode was not reported") }
+	mode, convert_err := db.as_string(values[0])
+	if convert_err != nil { return corrupt_error("read the journal mode", convert_err) }
+	if !strings.equal_fold(mode, "wal") {
+		return error_make(.Storage, fmt.tprintf("the database is in %s journal mode, not wal", mode))
+	}
+	return nil
+}
+
 // store_open opens the session database in directory, creating the directory
 // and the database when they are missing, and brings the schema up to date.
 //
@@ -133,6 +164,7 @@ store_open :: proc(store: ^Store, directory: string, allocator := context.alloca
 
 	store.allocator = allocator
 	store.directory = strings.clone(directory, allocator)
+	store.broken = false
 	if store.directory == "" { return error_make(.Storage, "the session directory could not be recorded") }
 
 	succeeded := false
@@ -159,9 +191,7 @@ store_open :: proc(store: ^Store, directory: string, allocator := context.alloca
 		return storage_error("open the session database", open_err)
 	}
 
-	if err := db.exec(&store.conn, "PRAGMA journal_mode = WAL"); err != nil {
-		return storage_error("set the journal mode", err)
-	}
+	set_journal_mode(store) or_return
 	// FULL is deliberate: a record of intent is what lets an interrupted
 	// session be read honestly, and a write volume of a few rows per turn does
 	// not make the extra flush matter.
@@ -217,7 +247,7 @@ session_create :: proc(store: ^Store, options: Create_Options, at_ms: i64, alloc
 		return {}, storage_error("begin session creation", err)
 	}
 	committed := false
-	defer if !committed { db.rollback(&store.conn) }
+	defer if !committed { abandon_transaction(store) }
 
 	insert_args := [?]db.Value {
 		db.Value(string(session.id)),
@@ -312,7 +342,7 @@ session_list :: proc(store: ^Store, options: List_Options, allocator := context.
 
 // session_claim takes the writer claim for a session so the harness can run it.
 // Only one session may be claimed at a time, and a second process claiming the
-// same session is refused with .Busy.
+// same session is refused with .Claimed.
 session_claim :: proc(store: ^Store, id: Session_Id) -> Error {
 	if !store.open { return error_make(.Invalid_State, "the store is closed") }
 	if store.claim.held { return error_make(.Invalid_State, "another session is already claimed for writing") }
@@ -444,7 +474,7 @@ session_delete :: proc(store: ^Store, id: Session_Id) -> Error {
 		return storage_error("begin session deletion", err)
 	}
 	committed := false
-	defer if !committed { db.rollback(&store.conn) }
+	defer if !committed { abandon_transaction(store) }
 	if err := db.exec(&store.conn, "DELETE FROM sessions WHERE id = ?", {db.Value(string(id))}); err != nil {
 		return storage_error("delete session", err)
 	}
@@ -509,12 +539,34 @@ session_scan :: proc(values: []db.Value, allocator: mem.Allocator) -> (session: 
 
 // --- supporting -------------------------------------------------------------
 
+// require_writable reports whether the store can run a statement whose outcome
+// depends on its transaction state: it must be open, and no failed transaction
+// may have been left undiscarded.
+@(private)
+require_writable :: proc(store: ^Store) -> Error {
+	if !store.open { return error_make(.Invalid_State, "the store is closed") }
+	if store.broken { return error_make(.Invalid_State, "a failed write could not be rolled back, so this store cannot be written to again") }
+	return nil
+}
+
 @(private)
 require_claim :: proc(store: ^Store, id: Session_Id) -> Error {
-	if !store.open { return error_make(.Invalid_State, "the store is closed") }
+	require_writable(store) or_return
 	if !store.claim.held { return error_make(.Invalid_State, "no session is claimed for writing") }
 	if store.claim.session != id { return error_make(.Invalid_State, "a different session is claimed for writing") }
 	return nil
+}
+
+// abandon_transaction discards the transaction a failed operation left open. A
+// rollback that itself fails leaves SQLite's transaction state unknown: the
+// documentation points at get_autocommit to tell which course it took. The store
+// is marked broken and refuses later mutations rather than writing into a
+// transaction nothing will commit.
+@(private)
+abandon_transaction :: proc(store: ^Store) {
+	if err := db.rollback(&store.conn); err != nil {
+		store.broken = true
+	}
 }
 
 @(private)
@@ -536,8 +588,18 @@ db_failure :: proc(kind: Error_Kind, what: string, err: db.Error) -> Error {
 @(private)
 storage_error :: proc(what: string, err: db.Error) -> Error {
 	// A rejected row is the database telling the caller the write was not
-	// allowed, which is a different fact from a database that could not work.
-	if db.error_kind(err) == .Constraint { return db_failure(.Constraint, what, err) }
+	// allowed, and contention is another process telling the caller to try again.
+	// Neither is a database that could not work, so all three keep their own kind
+	// rather than being folded into .Storage.
+	#partial switch db.error_kind(err) {
+	case .Constraint:
+		return db_failure(.Constraint, what, err)
+	case .Busy:
+		return db_failure(.Contended, what, err)
+	case .Busy_Snapshot:
+		return db_failure(.Stale_Snapshot, what, err)
+	case:
+	}
 	return db_failure(.Storage, what, err)
 }
 

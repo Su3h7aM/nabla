@@ -528,11 +528,17 @@ classify :: proc(rc: Result_Code) -> db.Error_Kind {
 		return .None
 	case .Constraint:
 		return .Constraint
-	case .Busy, .Locked:
-		// Locked needs shared cache or a second live statement on this
-		// connection, neither of which this backend allows, so another
-		// connection holds the file in both cases.
+	case .Busy:
+		// Another connection holds the file, or is inside WAL recovery. Waiting
+		// and trying the same call again is what the caller should do.
 		return .Busy
+	case .Locked:
+		// LOCKED is a table lock inside one connection (shared cache), or a
+		// conflict with another live statement on this connection. It is not
+		// cross-process contention, and retrying it cannot help: this backend
+		// neither enables shared cache nor allows two live statements, so
+		// reaching it means the connection's own lifecycle was violated.
+		return .Invalid_State
 	case .Read_Only:
 		return .Read_Only
 	case .No_Mem:

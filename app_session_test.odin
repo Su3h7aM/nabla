@@ -503,7 +503,7 @@ test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 	if err := session.store_open(&prober, directory); err != nil { testing.fail_now(t, "third store_open failed") }
 	defer session.store_close(&prober)
 	running_claim_err := session.session_claim(&prober, running)
-	testing.expect(t, session.error_kind(running_claim_err) == session.Error_Kind.Busy, "a refused switch must not have released the running session")
+	testing.expect(t, session.error_kind(running_claim_err) == session.Error_Kind.Claimed, "a refused switch must not have released the running session")
 }
 
 // Resuming has to leave the conversation able to send, so the model the session
