@@ -58,3 +58,13 @@ _close_store :: proc(store: ^Store, directory: string) {
 	os.remove_all(directory)
 	delete(directory, context.allocator)
 }
+
+// _open_claimed_session creates a session and takes its writer claim, which is
+// the state every history suite starts from.
+@(private)
+_open_claimed_session :: proc(t: ^testing.T, store: ^Store) -> Session {
+	session, create_err := session_create(store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	_expect_ok(t, session_claim(store, session.id))
+	return session
+}

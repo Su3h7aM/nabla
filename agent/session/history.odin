@@ -52,7 +52,7 @@ turn_begin :: proc(store: ^Store, id: Session_Id, user_text: string, origin: Use
 	committed := false
 	defer if !committed { db.rollback(&store.conn) }
 
-	turn, turn_err := scalar_i64(store, TURN_NEXT_NO, string(id))
+	turn, turn_err := scalar_i64(store, TURN_NEXT_NO, {db.Value(string(id))})
 	if turn_err != nil { return 0, turn_err }
 	turn_no = Turn_No(turn)
 
@@ -61,7 +61,7 @@ turn_begin :: proc(store: ^Store, id: Session_Id, user_text: string, origin: Use
 		return 0, storage_error("begin turn", err)
 	}
 
-	seq, seq_err := scalar_i64(store, ENTRY_NEXT_SEQ, string(id))
+	seq, seq_err := scalar_i64(store, ENTRY_NEXT_SEQ, {db.Value(string(id))})
 	if seq_err != nil { return 0, seq_err }
 	entry := New_Entry {
 		turn_no = turn_no,
@@ -127,7 +127,7 @@ request_begin :: proc(store: ^Store, id: Session_Id, request: New_Request, at_ms
 	committed := false
 	defer if !committed { db.rollback(&store.conn) }
 
-	number, number_err := scalar_i64(store, REQUEST_NEXT_NO, string(id))
+	number, number_err := scalar_i64(store, REQUEST_NEXT_NO, {db.Value(string(id))})
 	if number_err != nil { return 0, number_err }
 	request_no = Request_No(number)
 
@@ -215,7 +215,7 @@ entries_append :: proc(store: ^Store, id: Session_Id, entries: []New_Entry, allo
 	committed := false
 	defer if !committed { db.rollback(&store.conn) }
 
-	base, base_err := scalar_i64(store, ENTRY_NEXT_SEQ, string(id))
+	base, base_err := scalar_i64(store, ENTRY_NEXT_SEQ, {db.Value(string(id))})
 	if base_err != nil { return nil, base_err }
 
 	seqs = make([]Seq, len(entries), allocator)
@@ -272,16 +272,38 @@ entries_load :: proc(store: ^Store, id: Session_Id, options: Entry_Load_Options,
 	}
 	defer db.rows_close(&rows)
 
-	entries := make([dynamic]Entry, 0, 16, allocator)
+	return entries_scan(store, &rows, false, allocator)
+}
+
+// entries_read runs one history query and decodes every row it returns.
+@(private)
+entries_read :: proc(store: ^Store, sql: string, args: []db.Value, skip_partial_assistant: bool, allocator: mem.Allocator) -> ([]Entry, Error) {
+	rows: db.Rows
+	if err := db.query(&store.conn, &rows, sql, args); err != nil {
+		return nil, storage_error("load history", err)
+	}
+	defer db.rows_close(&rows)
+	return entries_scan(store, &rows, skip_partial_assistant, allocator)
+}
+
+@(private)
+entries_scan :: proc(store: ^Store, rows: ^db.Rows, skip_partial_assistant: bool, allocator: mem.Allocator) -> ([]Entry, Error) {
+	entries := make([dynamic]Entry, 0, allocator)
 	complete := false
 	defer if !complete { entries_destroy(entries[:], allocator) }
 
 	for {
-		values, has_row, next_err := db.rows_next(&rows)
+		values, has_row, next_err := db.rows_next(rows)
 		if next_err != nil { return nil, storage_error("load history", next_err) }
 		if !has_row { break }
 		entry, scan_err := entry_scan(values, allocator)
 		if scan_err != nil { return nil, scan_err }
+		if skip_partial_assistant {
+			if assistant, is_assistant := entry.payload.(Assistant_Entry); is_assistant && assistant.partial {
+				entry_destroy(&entry, allocator)
+				continue
+			}
+		}
 		append(&entries, entry)
 	}
 	complete = true
@@ -442,21 +464,19 @@ touch_session :: proc(store: ^Store, id: Session_Id, at_ms: i64) -> Error {
 	return nil
 }
 
-// scalar_i64 runs a query whose single parameter is a session id and returns
-// its single integer result. It is used for the per-session counters, which are
-// read inside the transaction that appends the row they number.
+// scalar_i64 runs a query and returns its single integer result.
 @(private)
-scalar_i64 :: proc(store: ^Store, sql: string, argument: string) -> (i64, Error) {
+scalar_i64 :: proc(store: ^Store, sql: string, args: []db.Value) -> (i64, Error) {
 	rows: db.Rows
-	if err := db.query(&store.conn, &rows, sql, {db.Value(argument)}); err != nil {
-		return 0, storage_error("read counter", err)
+	if err := db.query(&store.conn, &rows, sql, args); err != nil {
+		return 0, storage_error("read a value", err)
 	}
 	defer db.rows_close(&rows)
 	values, has_row, next_err := db.rows_next(&rows)
-	if next_err != nil { return 0, storage_error("read counter", next_err) }
+	if next_err != nil { return 0, storage_error("read a value", next_err) }
 	if !has_row { return 0, error_make(.Corrupt, "a counter query returned no row") }
 	number, convert_err := db.as_i64(values[0])
-	if convert_err != nil { return 0, corrupt_error("read counter", convert_err) }
+	if convert_err != nil { return 0, corrupt_error("read a value", convert_err) }
 	return number, nil
 }
 

@@ -8,13 +8,6 @@ import "core:testing"
 
 import "nabla:db"
 
-_open_claimed_session :: proc(t: ^testing.T, store: ^Store) -> Session {
-	session, create_err := session_create(store, {workspace = "/tmp/project"}, 1_000)
-	_expect_ok(t, create_err)
-	_expect_ok(t, session_claim(store, session.id))
-	return session
-}
-
 _scalar_or_nil :: proc(t: ^testing.T, store: ^Store, column: string, id: Session_Id) -> Maybe(i64) {
 	sql := fmt.tprintf("SELECT %s FROM requests WHERE session_id = '%s'", column, string(id))
 	rows: db.Rows
