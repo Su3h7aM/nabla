@@ -5,7 +5,9 @@ package main
 import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:sync/chan"
 import "core:testing"
+import "core:thread"
 import "core:time"
 
 import "nabla:agent"
@@ -577,4 +579,40 @@ test_resume_refuses_an_unknown_reference :: proc(t: ^testing.T) {
 	session_resume(&app, "zzzzzzzz")
 	testing.expect_value(t, app.setup.session.id, before)
 	testing.expect(t, len(app.run.snap.entries) > 0, "the refusal should be reported")
+}
+
+// A stopped runtime abandons what is queued rather than running it: the worker
+// observes the stop before the command is started, so a shutdown never begins a
+// turn nobody will see through. The command is queued and the stop is set before
+// the worker exists, which is what makes the abandonment deterministic.
+@(test)
+test_a_stopped_worker_abandons_queued_work :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	channel, channel_err := chan.create_buffered(Work_Chan, 4, app.run.alloc)
+	if channel_err != nil { testing.fail_now(t, "the work channel could not be created") }
+	app.run.work = channel
+
+	worker := thread.create(run_worker, name = "nabla-test-worker")
+	if worker == nil { testing.fail_now(t, "the worker could not be created") }
+	worker.data = &app
+
+	enqueue(&app, .Prompt, "", "must not run")
+	stop_runtime(&app)
+	thread.start(worker)
+	// Closing the queue is what lets the worker finish draining it and return.
+	chan.close(&app.run.work)
+	thread.join(worker)
+	thread.destroy(worker)
+	app.run.worker = nil
+	chan.destroy(&app.run.work)
+
+	// Nothing ran: the session is idle and its history is empty.
+	testing.expect_value(t, agent.chat_session_state(&app.setup.session), agent.Chat_State.Idle)
+	entries, load_err := session.entries_load(&app.setup.store, app.setup.session.id, {}, context.allocator)
+	if !testing.expect(t, load_err == nil, "the session's history must be readable") { return }
+	defer session.entries_destroy(entries, context.allocator)
+	testing.expect_value(t, len(entries), 0)
 }
