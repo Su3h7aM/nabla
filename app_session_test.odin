@@ -802,3 +802,76 @@ test_input_during_a_turn_is_steered_not_dropped :: proc(t: ^testing.T) {
 	testing.expect_value(t, work.text, "hello")
 	work_destroy(&app, work)
 }
+
+// The Messages API answers with a different event stream, so a turn has to reach
+// the same place through the adapter: encode, stream, decode, record, and report
+// the answer. The stub ignores the path, so this also exercises the endpoint
+// suffix and the key header the provider layer adds.
+@(test)
+test_a_headless_turn_answers_against_an_anthropic_endpoint :: proc(t: ^testing.T) {
+	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
+	if !testing.expectf(t, listen_err == nil, "the stub endpoint could not listen: %v", listen_err) { return }
+	defer net.close(listener)
+	if block_err := net.set_blocking(listener, false); block_err != nil {
+		testing.fail_now(t, "the stub endpoint could not be made non-blocking")
+	}
+	endpoint, endpoint_err := net.bound_endpoint(listener)
+	if !testing.expectf(t, endpoint_err == nil, "the stub endpoint could not be read: %v", endpoint_err) { return }
+
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.session.provider_id = strings.clone("anthropic", app.setup.session.allocator)
+	app.setup.session.model_id = strings.clone("claude-sonnet-5", app.setup.session.allocator)
+	app.setup.session.context_window = 200_000
+	// The Messages API has no default output bound, so the session states one.
+	app.setup.session.max_output_tokens = 1024
+	app.run.connection = ai.Provider_Connection {
+		API        = .Anthropic_Messages,
+		Endpoint   = fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.temp_allocator),
+		Credential = "test-key",
+	}
+
+	answer: strings.Builder
+	out := Headless_Output {
+		answer = strings.to_writer(&answer),
+	}
+	run := Turn_Run {
+		app    = &app,
+		prompt = "hello",
+		out    = &out,
+	}
+	worker := thread.create(headless_turn_run, name = "nabla-anthropic-turn")
+	if worker == nil { testing.fail_now(t, "the turn thread could not be created") }
+	worker.data = &run
+	thread.start(worker)
+
+	served := stub_serve(listener, ANTHROPIC_COMPLETION_RESPONSE)
+	thread.join(worker)
+	thread.destroy(worker)
+
+	if !testing.expect(t, served, "the turn never made its request") { return }
+	if !testing.expect(t, run.completed, "the turn should complete") { return }
+	testing.expect_value(t, strings.to_string(answer), "hello\n")
+
+	// The turn recorded the usage the adapter normalized, so the cache accounting
+	// sees a total rather than only the uncached part.
+	request, request_err := session.request_load(&app.setup.store, app.setup.session.id, 1)
+	if !testing.expect_value(t, request_err, nil) { return }
+	defer session.request_destroy(&request)
+	if input, present := request.usage.input.?; testing.expect(t, present) {
+		testing.expect_value(t, input, i64(1050))
+	}
+	if read, present := request.usage.cache_read.?; testing.expect(t, present) {
+		testing.expect_value(t, read, i64(900))
+	}
+}
+
+ANTHROPIC_COMPLETION_RESPONSE ::
+	"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" +
+	"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":900,\"cache_creation_input_tokens\":50,\"output_tokens\":1}}}\n\n" +
+	"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+	"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n" +
+	"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+	"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" +
+	"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
