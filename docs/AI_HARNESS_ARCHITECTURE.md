@@ -334,16 +334,17 @@ model request → streaming → request completes
 Rules:
 
 - Steering arrives at any time; it is appended to a bounded FIFO
-  (`STEER_MAX_ITEMS`, `STEER_MAX_BYTES`) and read by the loop.
+  (`STEER_MAX_ITEMS`, `STEER_MAX_BYTES`) and read by the loop. The front-end owns reading input and
+  pushes lines into the queue; the agent does not read stdin, and there is no second input path.
 - **Injection happens only at a request boundary** — after tool calls settle, before the request
   view is frozen. Never mutates an in-flight request or an in-flight projection.
-- A steering line that arrives outside a boundary is either held until the next one or dropped
-  with a notice. It is never applied late into a request that already started.
+- A steering line that arrives after the turn's last boundary is reported and dropped when the turn
+  settles; it is never applied to a later turn, where it would no longer mean what the user typed.
 - Commands that must take effect before the next request (`/effort`, `/compact`) run at the
-  boundary, ahead of the request build.
-- Steering is bounded and observable: queue depth is reported to the observer.
-- **No arbitrary mid-request mutation. No scheduler.** One execution thread is the only session
-  writer.
+  boundary, ahead of the request build. The interactive front-end sends only text through the
+  queue and keeps commands on its own path, which decides what may happen mid-turn.
+- Steering is bounded. **No arbitrary mid-request mutation. No scheduler.** One execution thread is
+  the only session writer.
 
 ---
 

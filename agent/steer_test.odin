@@ -45,49 +45,6 @@ test_steer_queue_bounds_total_bytes :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_steer_feed_splits_lines_across_chunks :: proc(t: ^testing.T) {
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-	pending := make([dynamic]u8, 0, context.temp_allocator)
-	defer delete(pending)
-
-	steer_feed_bytes(&queue, {}, &pending, transmute([]u8)string("hello\nwor"))
-	steer_feed_bytes(&queue, {}, &pending, transmute([]u8)string("ld\n\n  \n"))
-	line, ok := steer_pop(&queue)
-	testing.expect(t, ok)
-	testing.expect_value(t, line, "hello")
-	steer_line_free(&queue, line)
-	line, ok = steer_pop(&queue)
-	testing.expect(t, ok)
-	testing.expect_value(t, line, "world")
-	steer_line_free(&queue, line)
-	_, ok = steer_pop(&queue)
-	testing.expect(t, !ok)
-
-	steer_feed_bytes(&queue, {}, &pending, transmute([]u8)string("partial"))
-	steer_flush_pending(&queue, {}, &pending)
-	line, ok = steer_pop(&queue)
-	testing.expect(t, ok)
-	testing.expect_value(t, line, "partial")
-	steer_line_free(&queue, line)
-}
-
-@(test)
-test_steer_queue_close_leaves_leftovers :: proc(t: ^testing.T) {
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-
-	testing.expect(t, !steer_drained(&queue))
-	testing.expect(t, steer_push(&queue, "late"))
-	steer_close(&queue)
-	testing.expect(t, !steer_drained(&queue))
-	line, ok := steer_pop(&queue)
-	testing.expect(t, ok)
-	delete(line, context.temp_allocator)
-	testing.expect(t, steer_drained(&queue))
-}
-
-@(test)
 test_session_steer_only_at_request_boundary :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))

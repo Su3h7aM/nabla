@@ -930,3 +930,4 @@ bound_of :: proc(object: json.Object, key: string) -> (value: i64, present: bool
 	if !is_integer { return 0, true, false }
 	return i64(integer), true, true
 }
+

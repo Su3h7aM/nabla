@@ -182,6 +182,10 @@ Runtime :: struct {
 	work:       Work_Chan,
 	worker:     ^thread.Thread,
 	connection: ai.Provider_Connection,
+	// steer carries lines typed while a turn is running. The front-end pushes
+	// them as they arrive and the worker drains them at request boundaries, which
+	// is why it is written from one thread and read from another.
+	steer:      agent.Steer_Queue,
 	alloc:      mem.Allocator,
 	signals:    agent.Chat_Interactive_Signals,
 	// stopping is set once by the front-end before the worker is stopped. It is
@@ -829,6 +833,7 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	widgets.input_init(&app.input, app.run.alloc)
 	app.storage = frame_storage_new(app.run.alloc)
 	app.run.work, _ = chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
+	app.run.steer = agent.steer_queue_init(app.run.alloc)
 
 	terminal, open_err := term.open({alternate_screen = true, hide_cursor = true, bracketed_paste = true, input_mode = .Raw}, app.run.alloc)
 	if open_err != nil {
@@ -967,6 +972,7 @@ app_teardown :: proc(app: ^App) {
 		work_destroy(app, queued)
 	}
 	chan.destroy(&app.run.work)
+	agent.steer_queue_destroy(&app.run.steer)
 	snapshot_destroy(app)
 	menu_destroy(&app.menu, app.run.alloc)
 	delete(app.completion_query, app.run.alloc)
@@ -1104,7 +1110,20 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		// stop that arrived while the prompt was being recorded has to be re-issued
 		// here: otherwise shutdown would wait out a whole model request.
 		if runtime_stopping(app) { agent.chat_cancel_request() }
-		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, observer, nil)
+		steer := agent.Steer_Context {
+			queue       = &app.run.steer,
+			provider_id = app.setup.provider_id,
+			model_id    = app.setup.model_id,
+			connection  = app.run.connection,
+		}
+		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, observer, &steer)
+		// A steering line applies only at a request boundary inside the turn it was
+		// typed during. One the turn ended before reaching would otherwise be
+		// applied to whatever turn comes next, where it no longer means what the
+		// user intended, so it is reported and dropped.
+		if dropped := agent.steer_clear(&app.run.steer); dropped > 0 {
+			snap_append(app, .Warning, fmt.tprintf("%d steering line(s) arrived too late to apply; dropped", dropped))
+		}
 	case .Compact:
 		set_running(app, true)
 		if runtime_stopping(app) { agent.chat_cancel_request() }
@@ -2009,7 +2028,10 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 	}
 }
 
-// submit sends the prompt line as a turn prompt or a slash command.
+// submit sends the prompt line as a turn prompt, a steering line, or a slash
+// command. A line typed while a turn runs is queued for the next request boundary
+// instead of being dropped, which is the only point at which it can safely change
+// what the model is asked next.
 submit :: proc(app: ^App) {
 	text := strings.trim_space(widgets.input_text(&app.input))
 	if text == "" {
@@ -2019,6 +2041,14 @@ submit :: proc(app: ^App) {
 	}
 	if strings.has_prefix(text, "/") {
 		dispatch_command(app, text)
+	} else if runtime_busy(app) {
+		// A steering line is not a command: commands keep their own path, which
+		// decides what can happen while a turn is running.
+		if agent.steer_push(&app.run.steer, text) {
+			snap_append(app, .Notice, "queued; the model sees this at its next request boundary")
+		} else {
+			snap_append(app, .Warning, "steering queue full; line dropped")
+		}
 	} else {
 		enqueue(app, .Prompt, "", text)
 	}

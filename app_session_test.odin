@@ -17,6 +17,7 @@ import "core:time"
 import "nabla:agent"
 import "nabla:agent/session"
 import "nabla:ai"
+import "nabla:tui/widgets"
 
 // The session commands are the only part of the front-end that owns a store, so
 // they are driven here without a terminal: a store, a running session, and the
@@ -762,4 +763,42 @@ test_a_headless_turn_answers_against_an_endpoint :: proc(t: ^testing.T) {
 	if !testing.expect(t, run.completed, "the turn should complete") { return }
 	// The answer is the model's text and one trailing newline, and nothing else.
 	testing.expect_value(t, strings.to_string(answer), "hello\n")
+}
+
+// Input typed while a turn is running is queued for the next request boundary
+// instead of being dropped or starting a second turn. The front-end's own input
+// path puts it in the queue; the agent drains it where it is safe.
+@(test)
+test_input_during_a_turn_is_steered_not_dropped :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.run.steer = agent.steer_queue_init(app.run.alloc)
+	defer agent.steer_queue_destroy(&app.run.steer)
+	app.run.work, _ = chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
+	defer chan.destroy(&app.run.work)
+	app.input = widgets.Input{}
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+
+	// A running turn takes the line as steering.
+	set_running(&app, true)
+	testing.expect(t, widgets.input_insert(&app.input, "use the other file"))
+	submit(&app)
+	line, queued := agent.steer_pop(&app.run.steer)
+	if !testing.expect(t, queued, "a line typed during a turn should be queued") { return }
+	testing.expect_value(t, line, "use the other file")
+	agent.steer_line_free(&app.run.steer, line)
+
+	// The same text on an idle session is a new turn, so it goes to the worker.
+	set_running(&app, false)
+	testing.expect(t, widgets.input_insert(&app.input, "hello"))
+	submit(&app)
+	_, still_queued := agent.steer_pop(&app.run.steer)
+	testing.expect(t, !still_queued, "an idle prompt is not steering")
+	work, has_work := chan.recv(app.run.work)
+	if !testing.expect(t, has_work, "an idle prompt should reach the worker") { return }
+	testing.expect_value(t, work.kind, Work_Kind.Prompt)
+	testing.expect_value(t, work.text, "hello")
+	work_destroy(&app, work)
 }

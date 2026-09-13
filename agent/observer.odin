@@ -23,7 +23,6 @@ Chat_Observer :: struct {
 	user_text:       proc(user_data: rawptr, text: string),
 	tool_result:     proc(user_data: rawptr, name: string, result: ^Tool_Result),
 	message:         proc(user_data: rawptr, kind: Chat_Message_Kind, text: string),
-	queue:           proc(user_data: rawptr, event: Chat_Queue_Event, depth: int),
 	usage:           proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event),
 }
 
@@ -33,13 +32,6 @@ Chat_Message_Kind :: enum {
 	Notice,
 	Warning,
 	Error,
-}
-
-// Chat_Queue_Event reports steering-queue activity. The front-end owns the
-// input affordance the depth describes.
-Chat_Queue_Event :: enum {
-	Queued,
-	Full,
 }
 
 @(private)
@@ -75,11 +67,6 @@ _observer_tool_result :: proc(observer: Chat_Observer, name: string, result: ^To
 @(private)
 _observer_message :: proc(observer: Chat_Observer, kind: Chat_Message_Kind, text: string) {
 	if observer.message != nil { observer.message(observer.user_data, kind, text) }
-}
-
-@(private)
-_observer_queue :: proc(observer: Chat_Observer, event: Chat_Queue_Event, depth: int) {
-	if observer.queue != nil { observer.queue(observer.user_data, event, depth) }
 }
 
 @(private)

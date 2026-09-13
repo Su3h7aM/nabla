@@ -845,6 +845,9 @@ chat_run_turn :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, o
 // after tool calls settled and before the request is read from the store.
 Steer_Context :: struct {
 	queue:       ^Steer_Queue,
+	// quit, when not nil, is set by a queued line that asks the session to end.
+	// A caller with no such flag leaves it nil; the line is then reported and
+	// ignored rather than dereferenced.
 	quit:        ^bool,
 	provider_id: string,
 	model_id:    string,
@@ -1021,14 +1024,13 @@ chat_age_text :: proc(elapsed_ms: i64) -> string {
 	return fmt.tprintf("%dd %dh", hours / 24, hours % 24)
 }
 
-// chat_handle_command runs one input line as a command. True means handled;
-// the caller sends anything else as a turn or a steering line. /quit during
-// a turn quits after it: no turn is running at shutdown, so the reader join
-// cannot strand tool children.
+// chat_handle_command runs one input line as a command. True means handled; the
+// caller sends anything else as a turn or a steering line. /quit during a turn
+// quits after it settles, so shutdown never strands tool children.
 chat_handle_command :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue: ^Steer_Queue, text, provider_id, model_id: string, quit: ^bool) -> bool {
 	if text == "/quit" {
 		if chat.state != .Idle { _observer_message(observer, .Notice, "quitting after this turn finishes") }
-		quit^ = true
+		if quit != nil { quit^ = true }
 		return true
 	}
 	if text == "/effort" {
@@ -1074,7 +1076,7 @@ chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer:
 		if !ok { break }
 		if line == "/quit" {
 			steer_line_free(steer.queue, line)
-			steer.quit^ = true
+			if steer.quit != nil { steer.quit^ = true }
 			dropped := steer_clear(steer.queue)
 			if dropped > 0 {
 				_observer_message(observer, .Notice, fmt.tprintf("quitting after this turn finishes; dropped %d queued line(s)", dropped))
@@ -1101,6 +1103,6 @@ chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer:
 			}
 		}
 		steer_line_free(steer.queue, line)
-		if steer.quit^ { return }
+		if steer.quit != nil && steer.quit^ { return }
 	}
 }
