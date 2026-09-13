@@ -61,6 +61,11 @@ Transport_Fixture :: struct {
 	key:      string,
 	listener: net.TCP_Socket,
 	port:     int,
+	// request holds what the client sent, so a test can assert on the fields the
+	// provider layer is responsible for. request_length is set once the read is
+	// complete, before any response byte leaves.
+	request:        [8192]u8,
+	request_length: int,
 	// reached is posted once the server has entered the stall point.
 	reached:  sync.Sema,
 	// release lets the server leave the stall point and clean up.
@@ -167,7 +172,7 @@ transport_fixture_serve :: proc(thread: ^thread.Thread) {
 	}
 	// Drain the request first: closing a socket that still holds unread data sends
 	// RST, which would turn an orderly close into a truncation.
-	if !transport_fixture_read_request(ssl) {
+	if !transport_fixture_read_request(fixture, ssl) {
 		fixture.failed = true
 		sync.sema_post(&fixture.reached)
 		return
@@ -194,14 +199,16 @@ transport_fixture_write :: proc(ssl: ^client.SSL, text: string) -> bool {
 	return true
 }
 
-transport_fixture_read_request :: proc(ssl: ^client.SSL) -> bool {
-	collected: [8192]u8
-	used := 0
-	for used < len(collected) {
-		count := client.SSL_read(ssl, raw_data(collected[used:]), c.int(len(collected) - used))
+// transport_fixture_read_request drains the request and keeps it, so a test can
+// check the fields the client sent. It waits for the whole payload so the server
+// is responding to a complete request.
+transport_fixture_read_request :: proc(fixture: ^Transport_Fixture, ssl: ^client.SSL) -> bool {
+	for used := 0; used < len(fixture.request); {
+		count := client.SSL_read(ssl, raw_data(fixture.request[used:]), c.int(len(fixture.request) - used))
 		if count <= 0 { return false }
 		used += int(count)
-		if header_end := strings.index(string(collected[:used]), "\r\n\r\n"); header_end >= 0 {
+		fixture.request_length = used
+		if header_end := strings.index(string(fixture.request[:used]), "\r\n\r\n"); header_end >= 0 {
 			if used - header_end >= len(TRANSPORT_PAYLOAD) { return true }
 		}
 	}
@@ -357,6 +364,14 @@ test_transport_certificate_trust :: proc(t: ^testing.T) {
 		testing.expectf(t, job.error.kind == .None, "trusted request failed: %v %s", job.error.kind, job.error.detail)
 		testing.expect_value(t, job.texts, 1)
 		testing.expect_value(t, job.completions, 1)
+		// Authentication is built by the provider layer, not the transport, so
+		// this is where the header it chose is observable.
+		sent := string(fixture.request[:fixture.request_length])
+		testing.expect(
+			t,
+			strings.contains(sent, "authorization: Bearer transport-test-credential"),
+			"the provider's authorization header should reach the wire",
+		)
 	}
 	// One that is not is rejected.
 	{
@@ -510,4 +525,29 @@ test_dns_retires_stalled_resolution :: proc(t: ^testing.T) {
 		testing.expectf(t, elapsed < TRANSPORT_RETIRE_BOUND, "retirement took %v, above the %v bound", elapsed, TRANSPORT_RETIRE_BOUND)
 		testing.expect_value(t, transport_open_fd_count(), baseline)
 	}
+}
+
+// Authentication is provider policy built from the connection. A credential
+// produces the header the family uses; no credential produces no header at all
+// rather than a refused request, because an unauthenticated endpoint is a valid
+// deployment and not a malformed request.
+@(test)
+test_provider_auth_headers_are_optional :: proc(t: ^testing.T) {
+	authenticated := Provider_Connection {
+		API        = .OpenAI_Chat_Completions,
+		Credential = "secret",
+	}
+	headers := provider_auth_headers(authenticated, context.allocator)
+	defer provider_headers_destroy(headers, context.allocator)
+	if testing.expect_value(t, len(headers), 1) {
+		testing.expect_value(t, headers[0].name, "authorization")
+		testing.expect_value(t, headers[0].value, "Bearer secret")
+	}
+
+	anonymous := Provider_Connection {
+		API = .OpenAI_Responses,
+	}
+	none := provider_auth_headers(anonymous, context.allocator)
+	defer provider_headers_destroy(none, context.allocator)
+	testing.expect_value(t, len(none), 0)
 }

@@ -1,17 +1,21 @@
 package sse
 
 import "core:mem"
-import "core:strings"
 
 import "nabla:http/client"
 
-// Post_Request is one request for an event stream. allocator owns the derived
-// header values for the duration of the call.
+// Post_Request is one request for an event stream. allocator owns the assembled
+// header list for the duration of the call; the header values belong to the
+// caller.
 Post_Request :: struct {
-	url:          string,
-	body:         []u8,
-	bearer_token: string,
-	allocator:    mem.Allocator,
+	url:       string,
+	body:      []u8,
+	// headers are the request's own fields, authentication included. This call
+	// adds only what every event-stream request has: the content type and the
+	// accept type it is asking for. How an API authenticates is its provider's
+	// business, not the transport's.
+	headers:   []client.Header,
+	allocator: mem.Allocator,
 }
 
 // post performs one POST that expects a text/event-stream response and delivers
@@ -23,22 +27,17 @@ Post_Request :: struct {
 // classification, not a caller-specific taxonomy -- mapping it into provider
 // error kinds is the caller's job.
 post :: proc(request: Post_Request, options: client.Options, user_data: rawptr, callback: client.Chunk_Callback) -> client.Failure {
-	headers: [3]client.Header
-	count := 0
-	headers[count] = {"content-type", "application/json"}; count += 1
-	headers[count] = {"accept", "text/event-stream"}; count += 1
-	token := ""
-	defer delete(token, request.allocator)
-	if request.bearer_token != "" {
-		token = strings.concatenate([]string{"Bearer ", request.bearer_token}, allocator = request.allocator)
-		headers[count] = {"authorization", token}; count += 1
-	}
+	headers := make([dynamic]client.Header, 0, len(request.headers) + 2, request.allocator)
+	defer delete(headers)
+	append(&headers, client.Header{"content-type", "application/json"})
+	append(&headers, client.Header{"accept", "text/event-stream"})
+	append(&headers, ..request.headers)
 
 	return client.stream_request(
 		{
 			url = request.url,
 			method = .Post,
-			headers = headers[:count],
+			headers = headers[:],
 			body = request.body,
 			expected_content_type = "text/event-stream",
 			allocator = request.allocator,

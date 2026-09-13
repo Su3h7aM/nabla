@@ -6,9 +6,11 @@ import "nabla:http/client"
 import "nabla:sse"
 
 HTTP_Request :: struct {
-	url:          string,
-	body:         []u8,
-	bearer_token: string,
+	url:   string,
+	body:  []u8,
+	// headers are the provider's own request fields, authentication included.
+	// The transport adds only what every event-stream request shares.
+	headers: []client.Header,
 	// Empty uses the platform trust store. A value replaces it, which tests and
 	// private deployments need. Credentialed HTTPS never runs unverified.
 	ca_file:      string,
@@ -44,8 +46,8 @@ HTTP_Failure_Kind :: enum {
 // http_post_sse streams a Server-Sent Events response under one operation's
 // interruption policy. The wire details -- SSE headers, the expected content
 // type -- live in nabla:sse. What stays here is what is provider-specific: the
-// interrupt/deadline policy handed to the transport as a wait hook, and the
-// mapping into this package's failure kinds.
+// headers the request carries, the interrupt/deadline policy handed to the
+// transport as a wait hook, and the mapping into this package's failure kinds.
 http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: rawptr, callback: client.Chunk_Callback) -> HTTP_Failure {
 	// The wait hook needs a pointer that outlives the request, so the control
 	// value lives in a local for the duration of this call.
@@ -62,7 +64,7 @@ http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: r
 	}
 
 	failure := sse.post(
-		{url = request.url, body = request.body, bearer_token = request.bearer_token, allocator = request.allocator},
+		{url = request.url, body = request.body, headers = request.headers, allocator = request.allocator},
 		options,
 		user_data,
 		callback,

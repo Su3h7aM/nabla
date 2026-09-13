@@ -4,6 +4,7 @@ import "core:mem"
 import "core:net"
 import "core:strings"
 
+import "nabla:http/client"
 import "nabla:sse"
 
 Provider_Event_Callback :: #type proc(user_data: rawptr, event: Provider_Event)
@@ -39,6 +40,35 @@ Provider_Operation_Options :: struct {
 	nameservers: []net.Endpoint,
 }
 
+// provider_auth_headers builds the request fields one API family authenticates
+// with. Authentication is provider policy, so the transport never learns it:
+// sse.post carries whatever headers it is handed.
+//
+// An empty credential yields no auth header rather than a refused request, which
+// is what an endpoint that needs no credential expects. Every value in the
+// result is owned by allocator; the names are literals. provider_headers_destroy
+// releases the whole result.
+@(private)
+provider_auth_headers :: proc(connection: Provider_Connection, allocator := context.allocator) -> []client.Header {
+	switch connection.API {
+	case .OpenAI_Chat_Completions, .OpenAI_Responses:
+		if connection.Credential == "" { return nil }
+		result := make([]client.Header, 1, allocator)
+		result[0] = {"authorization", strings.concatenate({"Bearer ", connection.Credential}, allocator)}
+		return result
+	case .Anthropic_Messages, .Invalid:
+		// The Messages adapter is not implemented, and validation refuses the
+		// family before a request is built, so only the OpenAI scheme exists.
+	}
+	return nil
+}
+
+@(private)
+provider_headers_destroy :: proc(headers: []client.Header, allocator := context.allocator) {
+	for header in headers { delete(header.value, allocator) }
+	delete(headers, allocator)
+}
+
 // Provider_Request_Operation_Controlled performs one request with explicit
 // cancellation and deadline control. It delivers at most one terminal callback,
 // never exposes executable tool calls from an interrupted or truncated stream,
@@ -71,6 +101,9 @@ Provider_Request_Operation_Controlled :: proc(
 	}
 	defer delete(body, allocator)
 
+	headers := provider_auth_headers(connection, allocator)
+	defer provider_headers_destroy(headers, allocator)
+
 	state := Provider_Request_Stream_State {
 		stream    = Provider_Stream_Start(connection.API, allocator),
 		api       = connection.API,
@@ -89,7 +122,7 @@ Provider_Request_Operation_Controlled :: proc(
 		HTTP_Request {
 			url = endpoint,
 			body = transmute([]u8)body,
-			bearer_token = connection.Credential,
+			headers = headers,
 			ca_file = options.ca_file,
 			nameservers = options.nameservers,
 			allocator = allocator,
