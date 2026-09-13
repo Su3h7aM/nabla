@@ -277,11 +277,22 @@ app_session_use :: proc(t: ^testing.T, setup: ^Run_Setup, options: session.Creat
 	return session.Session_Id(strings.clone(string(created.id), setup.alloc))
 }
 
-// app_session_turn records one turn in the session a setup already holds and
-// claims, which is what makes it a candidate for a bare resume.
+// app_session_count is how many sessions the store holds for a directory, which
+// is what says whether a launch left anything behind.
+app_session_count :: proc(t: ^testing.T, setup: ^Run_Setup, workspace: string) -> int {
+	sessions, list_err := session.session_list(&setup.store, {workspace = workspace})
+	if !testing.expect(t, list_err == nil) { return -1 }
+	defer session.sessions_destroy(sessions)
+	return len(sessions)
+}
+
+// app_session_turn admits a prompt into the session a setup already holds and
+// claims, which is what records the session and makes it a candidate for a bare
+// resume. It goes through the same path the front-end uses, because that path is
+// what writes the row.
 app_session_turn :: proc(t: ^testing.T, setup: ^Run_Setup) {
-	if _, turn_err := session.turn_begin(&setup.store, setup.session.id, "hello", .Prompt, session.now_ms()); turn_err != nil {
-		testing.fail_now(t, "turn_begin failed")
+	if accepted := agent.chat_session_accept_user(&setup.session, "hello", session.now_ms()); accepted != .Accepted {
+		testing.fail_now(t, "the prompt was not accepted")
 	}
 }
 
@@ -389,6 +400,32 @@ test_a_launch_without_resume_starts_a_new_session :: proc(t: ^testing.T) {
 	// Nothing was resumed, so there is no model to fall back to.
 	testing.expect_value(t, first.provider, "")
 	testing.expect_value(t, first.model, "")
+}
+
+// A session is recorded by its first prompt, not by the launch. Opening the
+// harness in a directory and closing it without typing leaves nothing behind: no
+// row, nothing to list, and nothing for a later resume to find.
+@(test)
+test_a_launch_that_is_never_prompted_leaves_no_session :: proc(t: ^testing.T) {
+	state, previous, had_previous := app_state_isolate(t)
+	defer app_state_restore(state, previous, had_previous)
+
+	workspace, workspace_err := os.get_working_directory(context.allocator)
+	if workspace_err != nil { testing.fail_now(t, "could not read the working directory") }
+	defer delete(workspace, context.allocator)
+
+	setup: Run_Setup
+	setup.alloc = context.allocator
+	if !testing.expect(t, run_session_attach(&setup, workspace, {kind = .New})) { return }
+	defer attach_setup_destroy(&setup)
+
+	// Choosing a model or an effort is not interaction, and neither is stored with
+	// the session, so a launch that only did that has nothing in the store.
+	testing.expect_value(t, app_session_count(t, &setup, workspace), 0)
+
+	// The first prompt is what records it, whether or not a request follows.
+	app_session_turn(t, &setup)
+	testing.expect_value(t, app_session_count(t, &setup, workspace), 1)
 }
 
 // A bare --resume is scoped to the directory it is run from, and the newest
@@ -613,10 +650,12 @@ test_new_and_resume_switch_and_replay :: proc(t: ^testing.T) {
 	defer delete(string(second), context.allocator)
 	testing.expect(t, first != second, "a new session must be a different session")
 
+	// The new session has no prompt, so it has no row: the list still names only
+	// the conversation that was used.
 	snapshot_clear(&app)
 	session_refresh_rows(&app)
 	menu_open_session(&app)
-	if !testing.expect_value(t, len(app.menu.choices), 2) { return }
+	if !testing.expect_value(t, len(app.menu.choices), 1) { return }
 	menu_close(&app)
 
 	snapshot_clear(&app)

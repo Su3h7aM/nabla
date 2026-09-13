@@ -247,14 +247,17 @@ flight and nothing else.
 
 One session is claimed for writing at a time through an advisory file lock, so two processes cannot
 run the same session. A claim is also what a mutation requires, which is why opening a session and
-recording anything in it are separate steps.
+recording anything in it are separate steps. The separation goes one step further for a new
+session: the launch holds an id and a directory in memory, and the `sessions` row is written by the
+first prompt. Nothing a session does can be recorded without that row, so a launch that is opened
+and closed without typing leaves no trace.
 
 A launch opens exactly what it asks for: no flag starts a new session in the current directory,
 `--resume` opens the newest session that recorded work in that directory, and `--resume SESSION`
-opens that session by id wherever it ran. A session that was created and then abandoned holds no
-work, so a resume passes over it. Resolving the target is separate from claiming it, so a refused
-resume costs nothing and never falls back to a different session. Opening an interrupted session
-settles it before anything new is admitted.
+opens that session by id wherever it ran. The first prompt is the only interaction that makes a
+session exist, whether or not the request behind it succeeds. Resolving the target is separate from
+claiming it, so a refused resume costs nothing and never falls back to a different session. Opening
+an interrupted session settles it before anything new is admitted.
 
 ---
 

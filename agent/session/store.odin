@@ -250,12 +250,12 @@ store_close :: proc(store: ^Store) -> Error {
 	return nil
 }
 
-// session_create inserts a new session and returns its header. The session is
+// session_create records a new session and returns its header. The session is
 // not claimed for writing; call session_claim before recording anything in it.
 //
 // The returned Session owns its strings under allocator.
 session_create :: proc(store: ^Store, options: Create_Options, at_ms: i64, allocator := context.allocator) -> (session: Session, err: Error) {
-	if !store.open { return {}, error_make(.Invalid_State, "the store is closed") }
+	require_writable(store) or_return
 	if options.workspace == "" { return {}, error_make(.Invalid_Argument, "the workspace is empty") }
 	if at_ms <= 0 { return {}, error_make(.Invalid_Argument, "the creation time is not a timestamp") }
 
@@ -269,17 +269,31 @@ session_create :: proc(store: ^Store, options: Create_Options, at_ms: i64, alloc
 		model         = strings.clone(options.model, allocator),
 	}
 	if session.id == "" { return {}, error_make(.Storage, "a session id could not be created") }
-
-	created := false
-	defer if !created { session_destroy(&session, allocator) }
-
-	if err := db.exec(&store.conn, "BEGIN IMMEDIATE"); err != nil {
-		return {}, storage_error("begin session creation", err)
+	if record_err := session_record(store, session); record_err != nil {
+		session_destroy(&session, allocator)
+		return {}, record_err
 	}
-	committed := false
-	defer if !committed { abandon_transaction(store) }
+	return session, nil
+}
 
-	insert_args := [?]db.Value {
+// session_record writes a session header that has no row yet, and leaves a
+// session that already has one exactly as it is.
+//
+// A launch holds a new session in memory and records nothing, so the first
+// prompt is what gives the session a row: a launch opened and closed without one
+// leaves nothing behind, and there is nothing for a later resume to find. Every
+// turn, request, and entry is a foreign key into that row, so recording it is
+// also what makes the session a candidate for a resume.
+session_record :: proc(store: ^Store, session: Session) -> Error {
+	require_writable(store) or_return
+	if !session_id_valid(session.id) { return error_make(.Invalid_Argument, "the session id is not a valid id") }
+	if session.workspace == "" { return error_make(.Invalid_Argument, "a session needs a workspace") }
+	if session.created_at_ms <= 0 { return error_make(.Invalid_Argument, "a session needs a creation time") }
+	if session.updated_at_ms < session.created_at_ms {
+		return error_make(.Invalid_Argument, "a session cannot record activity before it was created")
+	}
+
+	args := [?]db.Value {
 		db.Value(string(session.id)),
 		db.Value(session.created_at_ms),
 		db.Value(session.updated_at_ms),
@@ -289,15 +303,10 @@ session_create :: proc(store: ^Store, options: Create_Options, at_ms: i64, alloc
 		db.Value(session.model),
 		db.Value(nil),
 	}
-	if err := db.exec(&store.conn, SESSION_INSERT, insert_args[:]); err != nil {
-		return {}, storage_error("create session", err)
+	if err := db.exec(&store.conn, SESSION_INSERT_IF_ABSENT, args[:]); err != nil {
+		return storage_error("record the session", err)
 	}
-	if err := db.commit(&store.conn); err != nil {
-		return {}, storage_error("commit session creation", err)
-	}
-	committed = true
-	created = true
-	return session, nil
+	return nil
 }
 
 // session_load reads one session header. The result owns its strings under
@@ -525,6 +534,11 @@ session_delete :: proc(store: ^Store, id: Session_Id) -> Error {
 @(private)
 SESSION_INSERT :: `INSERT INTO sessions (id, created_at_ms, updated_at_ms, workspace, title, provider, model, archived_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 
+// A session that already has a row keeps it: the header a later write brings
+// describes the same session rather than a new one.
+@(private)
+SESSION_INSERT_IF_ABSENT :: SESSION_INSERT + ` ON CONFLICT (id) DO NOTHING`
+
 @(private)
 SESSION_COLUMNS :: `id, created_at_ms, updated_at_ms, workspace, title, provider, model, archived_at_ms`
 
@@ -534,9 +548,10 @@ SESSION_SELECT_ONE :: `SELECT ` + SESSION_COLUMNS + ` FROM sessions WHERE id = ?
 @(private)
 SESSION_SELECT_LIST :: `SELECT ` + SESSION_COLUMNS + ` FROM sessions WHERE 1 = 1`
 
-// SESSION_USED_ONLY keeps the sessions that hold work. The row is written when a
-// session is created, so the row alone says nothing about whether it was used;
-// only what hangs off it does. Each subquery is a primary-key lookup.
+// SESSION_USED_ONLY keeps the sessions that hold work. A session's row is written
+// by its first prompt, so a row with nothing under it is a prompt whose turn did
+// not land; only what hangs off the row tells the two apart. Each subquery is a
+// primary-key lookup.
 @(private)
 SESSION_USED_ONLY :: ` AND (EXISTS (SELECT 1 FROM turns WHERE turns.session_id = sessions.id) OR EXISTS (SELECT 1 FROM requests WHERE requests.session_id = sessions.id) OR EXISTS (SELECT 1 FROM entries WHERE entries.session_id = sessions.id))`
 

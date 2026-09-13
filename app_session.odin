@@ -175,7 +175,7 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 		return false
 	}
 
-	adoption, message, adopted := session_adopt(setup, target.id)
+	adoption, message, adopted := session_adopt_target(setup, start.kind, target)
 	if !adopted {
 		defer delete(message, setup.alloc)
 		fmt.eprintln("nabla:", message)
@@ -196,29 +196,29 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 	return true
 }
 
-// session_open_target resolves which session the launch opens. It reads the
-// store and, for .New, creates the session, but it never claims anything, so a
-// refusal costs nothing. Everything it returns is owned by setup.alloc.
+// session_open_target resolves which session the launch opens. It resolves the
+// id without claiming anything, so a refusal costs nothing, and a new session is
+// only an id and a directory: nothing is recorded until the first prompt.
+// Everything it returns is owned by setup.alloc.
 //
 // Every failure here is the launch's own: the caller reports it and exits rather
 // than falling back to a different session.
 session_open_target :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: string) -> (target: Session_Target, ok: bool) {
 	switch start.kind {
 	case .New:
-		created, create_err := session.session_create(&setup.store, {workspace = launch_workspace}, session.now_ms())
-		if create_err != nil {
-			local := create_err
-			fmt.eprintln("nabla: cannot start a session:", session.error_detail(&local))
+		id := session.session_id_create(setup.alloc)
+		if id == "" {
+			fmt.eprintln("nabla: cannot start a session: a session id could not be created")
 			return {}, false
 		}
-		defer session.session_destroy(&created)
-		target.id = session.Session_Id(strings.clone(string(created.id), setup.alloc))
+		target.id = id
 		target.workspace = strings.clone(launch_workspace, setup.alloc)
 		return target, true
 
 	case .Resume_Latest:
-		// An empty session does not count. A launch opened and closed without a prompt
-		// must not become the session a later --resume picks up.
+		// A bare resume opens the newest session that holds work. A launch that was
+		// never prompted has no row at all, and a row whose first turn did not land
+		// holds nothing, so neither can be what a resume opens.
 		sessions, list_err := session.session_list(&setup.store, {workspace = launch_workspace, limit = 1, used_only = true}, setup.alloc)
 		if list_err != nil {
 			local := list_err
@@ -271,6 +271,38 @@ Adoption :: struct {
 adoption_destroy :: proc(adoption: ^Adoption, allocator: mem.Allocator) {
 	session.session_destroy(&adoption.header, allocator)
 	adoption^ = {}
+}
+
+// session_adopt_target brings the session a launch resolved under this store's
+// claim. A new session has no row to read, so it is claimed from the target the
+// launch holds in memory; every other target is adopted from the store.
+session_adopt_target :: proc(setup: ^Run_Setup, kind: Session_Start_Kind, target: Session_Target) -> (adopted: Adoption, message: string, ok: bool) {
+	if kind == .New { return session_adopt_new(setup, target) }
+	return session_adopt(setup, target.id)
+}
+
+// session_adopt_new makes a fresh session the claimed one. A new session has no
+// row yet: there is no header to read and nothing an earlier run left to settle,
+// so the claim is taken directly and the header is the id and the directory the
+// launch already holds. The first prompt is what records the session, so a
+// launch that never gets one leaves no row behind.
+//
+// The header is owned by setup.alloc.
+session_adopt_new :: proc(setup: ^Run_Setup, target: Session_Target) -> (adopted: Adoption, message: string, ok: bool) {
+	displaced, claim_err := session.session_claim_candidate(&setup.store, target.id)
+	if claim_err != nil {
+		local := claim_err
+		return {}, strings.concatenate({"cannot start a session: ", session.error_detail(&local)}, setup.alloc), false
+	}
+	// The session that was running is given up only now, with the new claim settled.
+	// A release that reports an error has still closed the descriptor, which is what
+	// actually frees the lock.
+	_ = session.claim_release(&displaced)
+	adopted.header = session.Session {
+		id        = session.Session_Id(strings.clone(string(target.id), setup.alloc)),
+		workspace = strings.clone(target.workspace, setup.alloc),
+	}
+	return adopted, "", true
 }
 
 // session_adopt makes id the claimed session on this store: it takes the candidate

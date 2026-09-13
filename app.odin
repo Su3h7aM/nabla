@@ -212,7 +212,8 @@ runtime_stopping :: proc(app: ^App) -> bool {
 // Session_Start_Kind is which session a launch opens.
 Session_Start_Kind :: enum {
 	// New starts a session in the launch directory. It is the zero value, so a
-	// launch that asks for nothing starts fresh.
+	// launch that asks for nothing starts fresh. The session is recorded by its
+	// first prompt, so a launch that never gets one leaves no session behind.
 	New,
 	// Resume_Latest opens the newest session that ran and recorded work in the
 	// launch directory. A session that was created and then abandoned holds no

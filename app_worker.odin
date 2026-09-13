@@ -223,16 +223,18 @@ session_resume :: proc(app: ^App, reference: string) {
 }
 
 // session_start_new closes the running session and opens a fresh one, so the
-// next prompt starts a new conversation. The candidate is claimed while the
-// running session stays claimed, so a failure leaves the running session usable
-// rather than dropping the front-end's only session.
+// next prompt starts a new conversation. Nothing is recorded for the new session
+// until that prompt, so starting one and never prompting leaves the store as it
+// was. The candidate is claimed while the running session stays claimed, so a
+// failure leaves the running session usable rather than dropping the front-end's
+// only session.
 session_start_new :: proc(app: ^App) -> bool {
 	setup := &app.setup
 	target, opened := session_open_target(setup, {kind = .New}, setup.workspace)
 	if !opened { return false }
 	defer session_target_destroy(&target, setup.alloc)
 
-	adoption, message, adopted := session_adopt(setup, target.id)
+	adoption, message, adopted := session_adopt_new(setup, target)
 	if !adopted {
 		defer delete(message, setup.alloc)
 		snap_append(app, .Error, message)

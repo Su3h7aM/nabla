@@ -245,6 +245,22 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	if chat.storage_failed { return .Storage_Failed }
 	if chat.state != .Idle { return .Busy }
 
+	// The first prompt is what records the session. Everything below needs the row
+	// to exist, and the write leaves a session that already has one alone, so a
+	// resumed session keeps the time and title it was created with.
+	header := session.Session {
+		id            = chat.id,
+		created_at_ms = at_ms,
+		updated_at_ms = at_ms,
+		workspace     = chat.workspace,
+		provider      = chat.provider_id,
+		model         = chat.model_id,
+	}
+	if record_err := session.session_record(chat.store, header); record_err != nil {
+		chat_session_record_failure(chat, "the session could not be recorded", record_err)
+		return .Storage_Failed
+	}
+
 	// The header records which model the session last ran with, so a later
 	// continuation starts from it rather than from nothing.
 	if chat.provider_id != "" && chat.model_id != "" {

@@ -198,6 +198,56 @@ test_list_can_skip_sessions_that_were_never_used :: proc(t: ^testing.T) {
 	testing.expect_value(t, used_only[0].id, used.id)
 }
 
+// A header is not a session until it is recorded. The harness holds a new session
+// in memory and records it from the first prompt, so this is the step that decides
+// whether a launch leaves anything behind.
+@(test)
+test_record_is_what_puts_a_session_in_the_store :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	pending := Session {
+		id            = session_id_create(context.allocator),
+		created_at_ms = 1_000,
+		updated_at_ms = 1_000,
+		workspace     = strings.clone("/tmp/project", context.allocator),
+	}
+	defer session_destroy(&pending)
+
+	// A header that was never recorded has no row to load.
+	_, missing_err := session_load(&store, pending.id)
+	_expect_error(t, missing_err, .Not_Found)
+
+	_expect_ok(t, session_record(&store, pending))
+	recorded, recorded_err := session_load(&store, pending.id)
+	_expect_ok(t, recorded_err)
+	defer session_destroy(&recorded)
+	testing.expect_value(t, recorded.created_at_ms, i64(1_000))
+	testing.expect_value(t, recorded.workspace, "/tmp/project")
+
+	// Recording again describes the same session, so the row that exists wins and
+	// the later header changes nothing.
+	later := pending
+	later.created_at_ms = 5_000
+	later.updated_at_ms = 5_000
+	later.workspace = "/tmp/elsewhere"
+	later.title = "later"
+	_expect_ok(t, session_record(&store, later))
+
+	again, again_err := session_load(&store, pending.id)
+	_expect_ok(t, again_err)
+	defer session_destroy(&again)
+	testing.expect_value(t, again.created_at_ms, i64(1_000))
+	testing.expect_value(t, again.workspace, "/tmp/project")
+	testing.expect_value(t, again.title, "")
+
+	all, all_err := session_list(&store, {workspace = "/tmp/project"})
+	_expect_ok(t, all_err)
+	defer sessions_destroy(all)
+	testing.expect_value(t, len(all), 1)
+}
+
 @(test)
 test_claim_is_exclusive :: proc(t: ^testing.T) {
 	store: Store
