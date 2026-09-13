@@ -424,6 +424,10 @@ test_status_reports_what_the_session_already_knows :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(report, "test-provider / test-model"), "the model should be reported")
 	testing.expect(t, strings.contains(report, "200000 window"), "the context budget should be reported")
 	testing.expect(t, strings.contains(report, "shell"), "the tool set should be reported")
+	// The age counts from creation and includes the time the harness was closed,
+	// so it is labelled as age rather than as time spent working.
+	testing.expect(t, strings.contains(report, "age"), "the age should be labelled")
+	testing.expect(t, !strings.contains(report, "running"), "the age is not time spent working")
 }
 
 @(test)

@@ -849,8 +849,10 @@ chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms:
 	}
 	chat_status_line(observer, "cwd", chat.workspace)
 	if have_header {
+		// The age counts from creation, which includes the time the harness was not
+		// running, so it is called age rather than time spent working.
 		age := chat_age_text(now_ms - header.created_at_ms)
-		chat_status_line(observer, "running", fmt.tprintf("%s%s", age, " (turn active)" if chat.state != .Idle else ""))
+		chat_status_line(observer, "age", fmt.tprintf("%s%s", age, " (turn active)" if chat.state != .Idle else ""))
 	}
 	chat_status_line(observer, "model", fmt.tprintf("%s / %s", chat.provider_id, chat.model_id))
 	chat_status_line(observer, "effort", chat.effort if chat.effort != "" else "provider default")
