@@ -16,6 +16,8 @@ Error_Kind :: enum {
 	Not_Found,
 	// Another process holds the session's writer claim.
 	Busy,
+	// A UNIQUE, NOT NULL, CHECK, or FOREIGN KEY constraint rejected the row.
+	Constraint,
 	// The database could not be opened, configured, read, or written.
 	Storage,
 	// The database was written by a newer version of this schema. Running the

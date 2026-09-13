@@ -9,48 +9,6 @@ import "core:testing"
 import "nabla:db"
 import "nabla:db/sqlite"
 
-_expect_ok :: proc(t: ^testing.T, err: Error) {
-	if err == nil { return }
-	local := err
-	testing.fail_now(t, strings.concatenate({"unexpected error: ", error_detail(&local)}, context.temp_allocator))
-}
-
-_expect_error :: proc(t: ^testing.T, err: Error, kind: Error_Kind) {
-	if err == nil {
-		testing.expectf(t, false, "expected a %v failure, got none", kind)
-		return
-	}
-	if actual := error_kind(err); actual != kind {
-		local := err
-		testing.expectf(t, false, "expected %v, got %v: %s", kind, actual, error_detail(&local))
-	}
-}
-
-_expect_db_ok :: proc(t: ^testing.T, err: db.Error) {
-	if err != nil {
-		local := err
-		testing.fail_now(t, strings.concatenate({"unexpected database error: ", db.error_message(&local)}, context.temp_allocator))
-	}
-}
-
-_temp_directory :: proc(t: ^testing.T) -> string {
-	directory, err := os.make_directory_temp("", "nabla-session-test-*", context.allocator)
-	if err != nil { testing.fail_now(t, "could not create a temporary directory") }
-	return directory
-}
-
-_open_store :: proc(t: ^testing.T, store: ^Store) -> string {
-	directory := _temp_directory(t)
-	_expect_ok(t, store_open(store, directory))
-	return directory
-}
-
-_close_store :: proc(store: ^Store, directory: string) {
-	store_close(store)
-	os.remove_all(directory)
-	delete(directory, context.allocator)
-}
-
 @(test)
 test_open_creates_a_private_store :: proc(t: ^testing.T) {
 	store: Store

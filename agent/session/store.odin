@@ -335,11 +335,7 @@ session_set_model :: proc(store: ^Store, id: Session_Id, provider, model: string
 // Archiving does not touch a session: hiding it is not conversation activity.
 session_touch :: proc(store: ^Store, id: Session_Id, at_ms: i64) -> Error {
 	require_claim(store, id) or_return
-	args := [?]db.Value{db.Value(at_ms), db.Value(string(id))}
-	if err := db.exec(&store.conn, "UPDATE sessions SET updated_at_ms = ? WHERE id = ?", args[:]); err != nil {
-		return storage_error("record session activity", err)
-	}
-	return nil
+	return touch_session(store, id, at_ms)
 }
 
 // session_archive hides a claimed session from ordinary listings while keeping
@@ -463,6 +459,9 @@ db_failure :: proc(kind: Error_Kind, what: string, err: db.Error) -> Error {
 
 @(private)
 storage_error :: proc(what: string, err: db.Error) -> Error {
+	// A rejected row is the database telling the caller the write was not
+	// allowed, which is a different fact from a database that could not work.
+	if db.error_kind(err) == .Constraint { return db_failure(.Constraint, what, err) }
 	return db_failure(.Storage, what, err)
 }
 
