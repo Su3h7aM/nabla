@@ -154,6 +154,7 @@ Entry_Kind :: enum {
 	User,
 	Assistant,
 	Reasoning,
+	Response,
 	Tool_Call,
 	Tool_Dispatch,
 	Tool_Result,
@@ -168,6 +169,8 @@ entry_kind_name :: proc(kind: Entry_Kind) -> string {
 		return "assistant"
 	case .Reasoning:
 		return "reasoning"
+	case .Response:
+		return "response"
 	case .Tool_Call:
 		return "tool_call"
 	case .Tool_Dispatch:
@@ -204,9 +207,22 @@ Assistant_Entry :: struct {
 
 // Reasoning_Entry is one opaque provider replay item. It has no meaning to this
 // package; it is stored so the adapter that produced it can see it again.
+// New Responses sessions record the whole output as a Response_Entry instead;
+// this variant stays so sessions written before that change still decode.
 Reasoning_Entry :: struct {
 	id:        string,
 	encrypted: string,
+}
+
+// Response_Entry is one completed Responses output, stored verbatim: the
+// terminal output array exactly as the endpoint sent it. Display text and
+// executable calls are projections recorded as their own entries; this entry
+// is the replay record, so assistant phase, message status, reasoning
+// summaries, annotations, and unknown item types survive without the stream
+// decoder modeling them. Only the Responses API writes this entry; Chat
+// Completions has no replayable output items to preserve.
+Response_Entry :: struct {
+	output: string,
 }
 
 // Tool_Call_Entry is a call the model proposed. arguments holds the raw JSON
@@ -253,6 +269,7 @@ Entry_Payload :: union {
 	User_Entry,
 	Assistant_Entry,
 	Reasoning_Entry,
+	Response_Entry,
 	Tool_Call_Entry,
 	Tool_Dispatch_Entry,
 	Tool_Result_Entry,
@@ -301,6 +318,8 @@ entry_kind_of :: proc(payload: Entry_Payload) -> Entry_Kind {
 		return .Assistant
 	case Reasoning_Entry:
 		return .Reasoning
+	case Response_Entry:
+		return .Response
 	case Tool_Call_Entry:
 		return .Tool_Call
 	case Tool_Dispatch_Entry:
@@ -334,6 +353,8 @@ entry_payload_destroy :: proc(payload: ^Entry_Payload, allocator: mem.Allocator)
 	case Reasoning_Entry:
 		delete(value.id, allocator)
 		delete(value.encrypted, allocator)
+	case Response_Entry:
+		delete(value.output, allocator)
 	case Tool_Call_Entry:
 		delete(value.call_id, allocator)
 		delete(value.item_id, allocator)

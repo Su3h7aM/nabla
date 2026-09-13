@@ -30,6 +30,11 @@ Reasoning_Wire :: struct {
 }
 
 @(private)
+Response_Wire :: struct {
+	output: string `json:"output"`,
+}
+
+@(private)
 Tool_Call_Wire :: struct {
 	call_id:   string `json:"call_id"`,
 	item_id:   string `json:"item_id"`,
@@ -69,6 +74,8 @@ entry_payload_encode :: proc(payload: Entry_Payload, allocator := context.alloca
 		return json_encode(Assistant_Wire{text = value.text, partial = value.partial}, allocator)
 	case Reasoning_Entry:
 		return json_encode(Reasoning_Wire{id = value.id, encrypted = value.encrypted}, allocator)
+	case Response_Entry:
+		return json_encode(Response_Wire{output = value.output}, allocator)
 	case Tool_Call_Entry:
 		wire := Tool_Call_Wire {
 			call_id   = value.call_id,
@@ -130,6 +137,12 @@ entry_payload_decode :: proc(kind: Entry_Kind, data: string, allocator: mem.Allo
 		payload = Reasoning_Entry {
 			id        = wire.id,
 			encrypted = wire.encrypted,
+		}
+	case .Response:
+		wire: Response_Wire
+		if decode_err := json_decode(data, &wire, allocator); decode_err != nil { return nil, decode_err }
+		payload = Response_Entry {
+			output = wire.output,
 		}
 	case .Tool_Call:
 		wire: Tool_Call_Wire
@@ -206,6 +219,8 @@ entry_payload_complete :: proc(kind: Entry_Kind, payload: Entry_Payload) -> bool
 		return kind == .Assistant
 	case Reasoning_Entry:
 		return kind == .Reasoning && value.id != ""
+	case Response_Entry:
+		return kind == .Response && value.output != ""
 	case Tool_Call_Entry:
 		return kind == .Tool_Call && value.call_id != "" && value.name != ""
 	case Tool_Dispatch_Entry:
