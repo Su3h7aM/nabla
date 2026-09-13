@@ -139,6 +139,19 @@ openai_responses_incomplete_reason :: proc(reason: string) -> Provider_Finish_Re
 	return .Unknown
 }
 
+// openai_responses_clone_output clones the terminal response's output array
+// verbatim for the replay record. A missing output key replays as empty; ok
+// is false only when a present value cannot be stringified. The caller owns
+// the result on success.
+openai_responses_clone_output :: proc(response: json.Object, allocator := context.allocator) -> (cloned: string, ok: bool) {
+	raw_output_value, output_present := response["output"]
+	if !output_present { return "", true }
+	if _, is_null := raw_output_value.(json.Null); is_null { return "", true }
+	text, clone_err := json.unparse(raw_output_value, allocator = allocator)
+	if clone_err != nil { return "", false }
+	return text, true
+}
+
 provider_tool_fragment_by_item :: proc(object: json.Object, state: ^Provider_Stream_State, allocator := context.allocator) -> (^Provider_Tool_Fragment, bool) {
 	id, present, ok := openai_value_string(object, "item_id")
 	if !ok || !present || id == "" { state^.Phase = .Failed; return nil, false }
@@ -272,12 +285,22 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 	switch event_type {
 	case "response.completed":
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "duplicate response completion") }
+		// The terminal output array is the replay record. Clone it before
+		// finalizing calls: finalize can fail, and the failure path must not
+		// leak the clone. When there is no output key the replay is empty,
+		// not an error -- a completed response may carry usage alone.
+		raw_output, output_ok := openai_responses_clone_output(response, state.Allocator)
+		if !output_ok { return provider_stream_fail(state, .Invalid_Data, "response output is invalid") }
+		defer if !output_ok { delete(raw_output, state.Allocator) }
 		calls: []Provider_Tool_Call
 		if provider_tool_fragments_present(state) {
 			finalized: []Provider_Tool_Call
 			finalized_ok: bool
 			finalized, finalized_ok = provider_tool_finalize(state, state.Allocator)
-			if !finalized_ok { return provider_stream_fail(state, .Invalid_Data, "tool calls are invalid") }
+			if !finalized_ok {
+				output_ok = false
+				return provider_stream_fail(state, .Invalid_Data, "tool calls are invalid")
+			}
 			calls = finalized
 		}
 		if usage_present { provider_stream_push(state, Provider_Usage_Event(usage)) }
@@ -285,10 +308,24 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 		if calls != nil {
 			provider_stream_push(
 				state,
-				Provider_Completed_Event{Reason = .Tool_Call, Reason_Text = strings.clone("tool_calls", state.Allocator), Tool_Calls = calls},
+				Provider_Completed_Event {
+					Reason = .Tool_Call,
+					Reason_Text = strings.clone("tool_calls", state.Allocator),
+					Tool_Calls = calls,
+					Raw_Output = raw_output,
+				},
 			)
+			output_ok = true
 		} else {
-			provider_stream_push(state, Provider_Completed_Event{Reason = .Stop, Reason_Text = strings.clone("completed", state.Allocator)})
+			provider_stream_push(
+				state,
+				Provider_Completed_Event {
+					Reason = .Stop,
+					Reason_Text = strings.clone("completed", state.Allocator),
+					Raw_Output = raw_output,
+				},
+			)
+			output_ok = true
 		}
 		return .None
 	case "response.incomplete":

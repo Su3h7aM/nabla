@@ -226,6 +226,7 @@ test_responses_stream_text_usage_completed :: proc(t: ^testing.T) {
 	testing.expect_value(t, usage.Cache_Write_Tokens, 3000)
 	completed := expect_event(t, events[1], Provider_Completed_Event)
 	testing.expect_value(t, completed.Reason, Provider_Finish_Reason.Stop)
+	testing.expect_value(t, completed.Raw_Output, "")
 	destroy_events(events)
 
 	err := Provider_Consume_SSE_Data("[DONE]", &state)
@@ -299,6 +300,46 @@ test_responses_stream_reasoning_replays_with_tools :: proc(t: ^testing.T) {
 	testing.expect_value(t, completed.Reason, Provider_Finish_Reason.Tool_Call)
 	testing.expect_value(t, len(completed.Tool_Calls), 1)
 	testing.expect_value(t, completed.Tool_Calls[0].ID, "call_1")
+	testing.expect_value(t, completed.Raw_Output, "[]")
+	destroy_events(events)
+}
+
+@(test)
+test_responses_completion_carries_phase_and_raw_output :: proc(t: ^testing.T) {
+	state := Provider_Stream_Start(.OpenAI_Responses, context.temp_allocator)
+	defer Provider_Stream_Destroy(&state)
+	_ = consume(
+		t,
+		`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","status":"completed","content":[{"type":"output_text","text":"Working.","annotations":[]}],"role":"assistant"}}`,
+		&state,
+		0,
+	)
+	events := consume(
+		t,
+		strings.concatenate(
+			[]string {
+				`{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","id":"msg_1","status":"completed",`,
+				`"content":[{"type":"output_text","text":"Working.","annotations":[]}],"role":"assistant"}],"usage":{"input_tokens":10,`,
+				`"output_tokens":5,"total_tokens":15}}}`,
+			},
+			context.temp_allocator,
+		),
+		&state,
+		2,
+	)
+	completed := expect_event(t, events[1], Provider_Completed_Event)
+	testing.expect_value(t, completed.Reason, Provider_Finish_Reason.Stop)
+	// The done item is display-only bookkeeping for the stream; the terminal
+	// output array is the replay record, verbatim.
+	value, parse_err := json.parse_string(completed.Raw_Output, .JSON, true, context.temp_allocator)
+	testing.expect_value(t, parse_err, nil)
+	defer json.destroy_value(value, context.temp_allocator)
+	output, output_ok := value.(json.Array)
+	testing.expect(t, output_ok && len(output) == 1)
+	item, item_ok := output[0].(json.Object)
+	testing.expect(t, item_ok)
+	item_type, _, _ := openai_value_string(item, "type")
+	testing.expect_value(t, item_type, "message")
 	destroy_events(events)
 }
 

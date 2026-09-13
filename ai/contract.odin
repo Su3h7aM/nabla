@@ -183,7 +183,14 @@ Provider_Completed_Event :: struct {
 	Reason:      Provider_Finish_Reason,
 	Reason_Text: string, // owned by receiver,
 	Tool_Calls:  []Provider_Tool_Call, // owned by receiver; present when Reason == .Tool_Call,
-} // Tool_Calls owned by receiver
+	// Raw_Output holds the terminal response's output array verbatim, exactly
+	// as the endpoint sent it. Empty when the terminal event carried no
+	// output array. The agent replays this verbatim for its next request, so
+	// fields the stream decoder does not model -- assistant phase, message
+	// status, reasoning summaries, annotations -- still round-trip. This is
+	// the lossless-replay record; Tool_Calls stays the execution view.
+	Raw_Output:  string, // owned by receiver,
+} // Tool_Calls and Raw_Output owned by receiver
 Provider_Error_Event :: struct {
 	Kind:          Provider_Error_Kind,
 	Message:       string,
@@ -207,6 +214,7 @@ Provider_Event_Destroy :: proc(event: ^Provider_Event, allocator := context.allo
 		if value.Encrypted != "" { delete(value.Encrypted, allocator) }
 	case Provider_Completed_Event:
 		if value.Reason_Text != "" { delete(value.Reason_Text, allocator) }
+		if value.Raw_Output != "" { delete(value.Raw_Output, allocator) }
 		for call in value.Tool_Calls {
 			if call.ID != "" { delete(call.ID, allocator) }
 			if call.Item_ID != "" { delete(call.Item_ID, allocator) }
