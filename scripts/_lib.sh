@@ -4,7 +4,6 @@
 
 NABLA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-NABLA_NON_PACKAGE_DIRS="third_party"
 NABLA_SERIAL_TEST_PACKAGES="agent ai layout"
 # Packages whose core:testing suites must not be discovered by `odin test`
 # because an external harness runs them instead. Empty once every suite is on
@@ -20,7 +19,6 @@ nabla_packages() {
 	for d in "$NABLA_ROOT"/*/; do
 		d="${d%/}"
 		base="$(basename "$d")"
-		[[ " $NABLA_NON_PACKAGE_DIRS " == *" $base "* ]] && continue
 		[[ -n "$(compgen -G "$d/*.odin")" ]] || continue
 		printf '%s\n' "$base"
 		for sub in "$d"/*/; do
@@ -69,7 +67,7 @@ nabla_owned_sources() {
 	(
 		cd "$NABLA_ROOT" || exit 1
 		find . \
-			\( -name .jj -o -name .git -o -name third_party -o -name build -o -name .scratch \) -prune -o \
+			\( -name .jj -o -name .git -o -name build \) -prune -o \
 			-name '*.odin' -print | sed 's|^\./||' | sort
 	)
 }
