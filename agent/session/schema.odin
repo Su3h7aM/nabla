@@ -108,10 +108,17 @@ migration_statements :: proc(version: int) -> []string {
 }
 
 // schema_migrate brings the database up to SCHEMA_VERSION, creating the schema
-// when the database is empty. Every migration commits as one transaction, so a
-// failure leaves the database at the version it started from.
-@(private)
+// when the database is empty. The version it read and every statement it runs
+// are in one immediate transaction, so two processes opening the same database
+// cannot both migrate it: the second waits for the write lock and then sees the
+// work already done.
 schema_migrate :: proc(store: ^Store) -> Error {
+	if err := db.exec(&store.conn, "BEGIN IMMEDIATE"); err != nil {
+		return storage_error("begin migration", err)
+	}
+	committed := false
+	defer if !committed { db.rollback(&store.conn) }
+
 	version, version_err := schema_read_version(store)
 	if version_err != nil { return version_err }
 	if version > SCHEMA_VERSION {
@@ -124,34 +131,25 @@ schema_migrate :: proc(store: ^Store) -> Error {
 			return error_make(.Schema_Unknown, "the database holds tables this package did not create")
 		}
 	}
+
 	for from := version; from < SCHEMA_VERSION; from += 1 {
-		if err := schema_apply(store, from + 1); err != nil { return err }
-	}
-	return nil
-}
-
-@(private)
-schema_apply :: proc(store: ^Store, version: int) -> Error {
-	statements := migration_statements(version)
-	if statements == nil {
-		return error_make(.Storage, fmt.tprintf("no migration writes schema %d", version))
-	}
-	if err := db.exec(&store.conn, "BEGIN IMMEDIATE"); err != nil {
-		return storage_error("begin migration", err)
-	}
-	committed := false
-	defer if !committed { db.rollback(&store.conn) }
-
-	for statement in statements {
-		if err := db.exec(&store.conn, statement); err != nil {
-			return storage_error(fmt.tprintf("apply schema %d", version), err)
+		statements := migration_statements(from + 1)
+		if statements == nil {
+			return error_make(.Storage, fmt.tprintf("no migration writes schema %d", from + 1))
+		}
+		for statement in statements {
+			if err := db.exec(&store.conn, statement); err != nil {
+				return storage_error(fmt.tprintf("apply schema %d", from + 1), err)
+			}
+		}
+		// The version is stamped in the same transaction as the statements it
+		// describes, so a failure leaves the database at the version it started
+		// from rather than at one whose statements did not all land.
+		if err := db.exec(&store.conn, fmt.tprintf("PRAGMA user_version = %d", from + 1)); err != nil {
+			return storage_error("stamp schema version", err)
 		}
 	}
-	// user_version is written inside the same transaction, so a database is
-	// never stamped with a version whose statements did not all land.
-	if err := db.exec(&store.conn, fmt.tprintf("PRAGMA user_version = %d", version)); err != nil {
-		return storage_error("stamp schema version", err)
-	}
+
 	if err := db.commit(&store.conn); err != nil {
 		return storage_error("commit migration", err)
 	}

@@ -731,6 +731,9 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) {
 	}
 	chat.turn_no = nil
 	chat.active_request = nil
+	// A turn that ended without running its staged calls, such as one a durable
+	// write stopped, releases them here.
+	chat_pending_calls_clear(chat)
 	chat_pending_reasoning_clear(chat)
 }
 

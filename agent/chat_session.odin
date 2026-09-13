@@ -184,6 +184,13 @@ chat_clone_string :: proc(value: string, allocator: mem.Allocator) -> string {
 // chat_session_record_failure stops the turn because a durable write failed.
 // The turn is not allowed to continue from memory: the record did not land, and
 // carrying on would let the conversation diverge from what was stored.
+// chat_pending_calls_clear releases calls a turn staged but never ran, such as
+// when a durable write failed before they could be committed.
+chat_pending_calls_clear :: proc(chat: ^Chat_Session) {
+	for &call in chat.pending_calls { chat_tool_call_destroy(&call, chat.allocator) }
+	clear(&chat.pending_calls)
+}
+
 // CHAT_TITLE_MAX_BYTES bounds the derived title. It is a listing line, not a
 // summary: enough to recognise a session and no more.
 CHAT_TITLE_MAX_BYTES :: 80
@@ -264,8 +271,8 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	// finished can never be inherited by this one.
 	chat_cancel_reset()
 	chat_operation_retire(&chat.operation)
-	clear(&chat.pending_calls)
-	clear(&chat.pending_reasoning)
+	chat_pending_calls_clear(chat)
+	chat_pending_reasoning_clear(chat)
 	delete(chat.last_error, chat.allocator)
 	chat.last_error = ""
 	delete(chat.partial_assistant)

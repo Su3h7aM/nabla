@@ -399,7 +399,7 @@ entries_load :: proc(store: ^Store, id: Session_Id, options: Entry_Load_Options,
 	}
 	defer db.rows_close(&rows)
 
-	return entries_scan(store, &rows, false, allocator)
+	return entries_scan(&rows, false, allocator)
 }
 
 // entries_read runs one history query and decodes every row it returns.
@@ -410,11 +410,11 @@ entries_read :: proc(store: ^Store, sql: string, args: []db.Value, skip_partial_
 		return nil, storage_error("load history", err)
 	}
 	defer db.rows_close(&rows)
-	return entries_scan(store, &rows, skip_partial_assistant, allocator)
+	return entries_scan(&rows, skip_partial_assistant, allocator)
 }
 
 @(private)
-entries_scan :: proc(store: ^Store, rows: ^db.Rows, skip_partial_assistant: bool, allocator: mem.Allocator) -> ([]Entry, Error) {
+entries_scan :: proc(rows: ^db.Rows, skip_partial_assistant: bool, allocator: mem.Allocator) -> ([]Entry, Error) {
 	entries := make([dynamic]Entry, 0, allocator)
 	complete := false
 	defer if !complete { entries_destroy(entries[:], allocator) }
