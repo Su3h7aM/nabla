@@ -556,7 +556,19 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 		if status.cost_present {
 			cost = fmt.tprintf("$%.2f", status.cost)
 		}
-		left = fmt.tprintf("%dk/%dk | cost %s", (status.est_input + 512) / 1024, (status.context_window + 512) / 1024, cost)
+		cache := "cache n/a"
+		if status.session_hit_measured {
+			cache = fmt.tprintf("cache %.0f%%", status.session_hit_rate * 100)
+		} else if status.session_cache_present {
+			cache = fmt.tprintf("cache %dk", (status.session_cache_read + 512) / 1024)
+		}
+		left = fmt.tprintf(
+			"%dk/%dk | cost %s | %s",
+			(status.est_input + 512) / 1024,
+			(status.context_window + 512) / 1024,
+			cost,
+			cache,
+		)
 		right = fmt.tprintf("(%s) %s", status.provider_id, status.model_id)
 		if effort_text := strings.trim_space(status.effort); effort_text != "" {
 			right = fmt.tprintf("%s | %s", right, effort_text)

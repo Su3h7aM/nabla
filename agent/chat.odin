@@ -849,8 +849,7 @@ chat_notice_effort :: proc(chat: ^Chat_Session, observer: Chat_Observer, provide
 
 // chat_notice_status reports what the session is and what it is doing: who it is,
 // where it runs, how long it has run, which model and effort it uses, and the
-// context and usage numbers the harness already measured. Nothing here is
-// collected for the report; every value is one the session already holds.
+// context and usage numbers the harness already measured.
 chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms: i64) {
 	header, header_err := session.session_load(chat.store, chat.id, context.temp_allocator)
 	have_header := header_err == nil
@@ -890,6 +889,36 @@ chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms:
 	measured := "none"
 	if chat.last_input_measured_present { measured = fmt.tprintf("%d", chat.last_input_measured) }
 	chat_status_line(observer, "usage", fmt.tprintf("estimate %s, measured %s", estimate, measured))
+
+	// Session usage is a query over finished requests, so this line also fails
+	// when the store does: a status that hid a storage failure would be lying
+	// about the rest of the session too.
+	totals, totals_err := session.cache_totals(chat.store, chat.id)
+	if totals_err != nil {
+		local := totals_err
+		chat_status_line(observer, "cache", fmt.tprintf("unavailable: %s", session.error_detail(&local)))
+		return
+	}
+	rate_text := ""
+	if rate, measured := session.cache_hit_rate(totals); measured {
+		rate_text = fmt.tprintf(" (%.1f%% hit)", rate * 100)
+	}
+	chat_status_line(
+		observer,
+		"cache",
+		fmt.tprintf(
+			"input %d in %d, read %d in %d, write %d in %d, output %d in %d%s",
+			totals.input,
+			totals.input_requests,
+			totals.cache_read,
+			totals.cache_read_requests,
+			totals.cache_write,
+			totals.cache_write_requests,
+			totals.output,
+			totals.output_requests,
+			rate_text,
+		),
+	)
 }
 
 @(private)

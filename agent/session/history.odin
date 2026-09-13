@@ -15,6 +15,55 @@ Usage :: struct {
 	cache_write: Maybe(i64),
 }
 
+// Cache_Totals is one session's reported token accounting across finished
+// requests. A request contributes only when it reported that bucket; an
+// unmeasured bucket is smaller than the row count suggests, so the counts say
+// how many finished requests each sum rests on. Compaction and failed work are
+// included by default: hiding them would flatter the hit rate rather than
+// measure the session. A caller that wants the warm-period numbers filters by
+// purpose or outcome in the same query and says so.
+Cache_Totals :: struct {
+	input:              i64,
+	cache_read:         i64,
+	cache_write:        i64,
+	output:             i64,
+	// Requests each summed bucket rests on. A bucket the provider never
+	// reported has no denominator of its own; its count stays zero.
+	input_requests:      int,
+	cache_read_requests: int,
+	cache_write_requests: int,
+	output_requests:     int,
+}
+
+cache_totals_add :: proc(totals: ^Cache_Totals, usage: Usage) {
+	if value, present := usage.input.?; present {
+		totals.input += value
+		totals.input_requests += 1
+	}
+	if value, present := usage.cache_read.?; present {
+		totals.cache_read += value
+		totals.cache_read_requests += 1
+	}
+	if value, present := usage.cache_write.?; present {
+		totals.cache_write += value
+		totals.cache_write_requests += 1
+	}
+	if value, present := usage.output.?; present {
+		totals.output += value
+		totals.output_requests += 1
+	}
+}
+
+// cache_hit_rate is the token-weighted share of reported input read from the
+// provider's cache: cache-read tokens over all reported input tokens. A
+// workload whose turns are mostly new input cannot reach a high rate no
+// matter how stable its prefixes are, so callers pair this with the suffix
+// size before treating it as a regression signal.
+cache_hit_rate :: proc(totals: Cache_Totals) -> (rate: f64, measured: bool) {
+	if totals.input_requests == 0 || totals.cache_read_requests == 0 || totals.input <= 0 { return 0, false }
+	return f64(totals.cache_read) / f64(totals.input), true
+}
+
 // New_Request is a model request about to begin. The input description is
 // written before the request is sent, so a request that never finishes still
 // says what context it was given.
@@ -198,6 +247,11 @@ request_begin :: proc(store: ^Store, id: Session_Id, request: New_Request, at_ms
 // request_finish records how a request ended together with what it cost. The
 // request's own record is the only place usage lives, so a total is a query
 // over requests rather than a second counter that can drift.
+//
+// A finished request must either keep all four usage numbers unknown or keep
+// every number the provider reported. Cumulative stream measurements reach
+// here through one normalized `ai` value, so repeated reports of one request
+// are an update of that request, not another request's worth of tokens to add.
 request_finish :: proc(store: ^Store, id: Session_Id, request_no: Request_No, finish: Request_Finish) -> Error {
 	require_claim(store, id) or_return
 	if finish.outcome == .Running { return error_make(.Invalid_Argument, "a finished request cannot still be running") }
@@ -231,6 +285,31 @@ request_finish :: proc(store: ^Store, id: Session_Id, request_no: Request_No, fi
 	}
 	committed = true
 	return nil
+}
+
+// cache_totals sums the usage of every finished request in the session.
+// Rows still running and rows that never reported a bucket contribute
+// nothing to that bucket; returning their counts alongside the sums is what
+// keeps an unmeasured bucket from reading as zero use.
+cache_totals :: proc(store: ^Store, id: Session_Id) -> (Cache_Totals, Error) {
+	if !store.open { return {}, error_make(.Invalid_State, "the store is closed") }
+
+	rows: db.Rows
+	if err := db.query(&store.conn, &rows, REQUEST_SELECT_FINISHED_USAGE, {db.Value(string(id))}); err != nil {
+		return {}, storage_error("sum request usage", err)
+	}
+	defer db.rows_close(&rows)
+
+	totals: Cache_Totals
+	for {
+		values, has_row, next_err := db.rows_next(&rows)
+		if next_err != nil { return {}, storage_error("sum request usage", next_err) }
+		if !has_row { break }
+		usage, usage_err := request_usage_scan(values)
+		if usage_err != nil { return {}, usage_err }
+		cache_totals_add(&totals, usage)
+	}
+	return totals, nil
 }
 
 // request_load reads one request. Reading does not need the writer claim.
@@ -319,12 +398,38 @@ request_scan :: proc(values: []db.Value, allocator: mem.Allocator) -> (request: 
 
 	usage_targets := [4]^Maybe(i64){&request.usage.input, &request.usage.output, &request.usage.cache_read, &request.usage.cache_write}
 	for value, i in values[14:18] {
-		number, usage_err := read_optional_i64(value)
-		if usage_err != nil { return {}, corrupt_error("read request usage", usage_err) }
+		number, usage_err := request_usage_value(value)
+		if usage_err != nil { return {}, usage_err }
 		usage_targets[i]^ = number
 	}
 	complete = true
 	return request, nil
+}
+
+// request_usage_value reads one nullable usage column. A NULL column is a
+// measurement the provider never sent; it stays unknown rather than zero.
+@(private)
+request_usage_value :: proc(value: db.Value) -> (Maybe(i64), Error) {
+	number, usage_err := read_optional_i64(value)
+	if usage_err != nil { return nil, corrupt_error("read request usage", usage_err) }
+	return number, nil
+}
+
+// request_usage_scan reads the four usage columns `cache_totals` selects.
+// The order is fixed by REQUEST_FINISHED_USAGE_COLUMNS, not by the caller.
+@(private)
+request_usage_scan :: proc(values: []db.Value) -> (Usage, Error) {
+	if len(values) < len(REQUEST_FINISHED_USAGE_COLUMNS) {
+		return {}, error_make(.Corrupt, "a stored request is missing its usage")
+	}
+	usage: Usage
+	targets := [4]^Maybe(i64){&usage.input, &usage.output, &usage.cache_read, &usage.cache_write}
+	for value, i in values[:len(REQUEST_FINISHED_USAGE_COLUMNS)] {
+		number, usage_err := request_usage_value(value)
+		if usage_err != nil { return {}, usage_err }
+		targets[i]^ = number
+	}
+	return usage, nil
 }
 
 // entries_append stores a run of entries and returns the sequence numbers they
@@ -462,6 +567,15 @@ REQUEST_COLUMNS :: `request_no, turn_no, purpose, started_at_ms, finished_at_ms,
 
 @(private)
 REQUEST_SELECT_ONE :: `SELECT ` + REQUEST_COLUMNS + ` FROM requests WHERE session_id = ? AND request_no = ?`
+
+@(private)
+REQUEST_FINISHED_USAGE_COLUMNS :: [?]string{"input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"}
+
+// REQUEST_SELECT_FINISHED_USAGE is the only usage total. It reads finished
+// rows, never running ones, so an in-flight request cannot move a reported
+// total; finished usage is immutable by construction.
+@(private)
+REQUEST_SELECT_FINISHED_USAGE :: `SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens FROM requests WHERE session_id = ? AND status <> 'running' ORDER BY request_no`
 
 @(private)
 ENTRY_INSERT :: `INSERT INTO entries (session_id, seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`

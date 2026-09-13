@@ -424,10 +424,57 @@ test_status_reports_what_the_session_already_knows :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(report, "test-provider / test-model"), "the model should be reported")
 	testing.expect(t, strings.contains(report, "200000 window"), "the context budget should be reported")
 	testing.expect(t, strings.contains(report, "shell"), "the tool set should be reported")
+	// No request finished, so there is no token accounting yet. The status must
+	// say what it knows -- nothing -- instead of a confident zero.
+	testing.expect(t, strings.contains(report, "cache"), "the cache line should be reported")
+	testing.expect(t, strings.contains(report, "input 0 in 0"), "no finished request means no measured input")
 	// The age counts from creation and includes the time the harness was closed,
 	// so it is labelled as age rather than as time spent working.
 	testing.expect(t, strings.contains(report, "age"), "the age should be labelled")
 	testing.expect(t, !strings.contains(report, "running"), "the age is not time spent working")
+}
+
+@(test)
+test_status_reports_finished_request_usage :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	_test_accept(t, chat, "report the usage")
+	turn, present := chat.turn_no.?
+	if !present { testing.fail_now(t, "accepting the prompt should open a turn") }
+
+	request, request_err := session.request_begin(
+		chat.store,
+		chat.id,
+		{turn_no = turn, purpose = .Response, provider = "p", model_requested = "m", api = "a", config_json = "{}", input_json = "{}"},
+		session.now_ms(),
+	)
+	if request_err != nil { testing.fail_now(t, "the usage request should begin") }
+	finish := session.Request_Finish {
+		outcome = .Completed,
+		usage   = session.Usage{input = 100, output = 10, cache_read = 90, cache_write = 10},
+		at_ms   = session.now_ms(),
+	}
+	if finish_err := session.request_finish(chat.store, chat.id, request, finish); finish_err != nil {
+		testing.fail_now(t, "the usage request should finish")
+	}
+
+	log := Status_Log {
+		buffer = strings.builder_make(context.temp_allocator),
+	}
+	defer strings.builder_destroy(&log.buffer)
+	observer := Chat_Observer {
+		user_data = &log,
+		message   = status_log_message,
+	}
+	chat_notice_status(chat, observer, session.now_ms())
+
+	report := strings.to_string(log.buffer)
+	testing.expect(t, strings.contains(report, "input 100 in 1"), "finished requests are the usage totals")
+	testing.expect(t, strings.contains(report, "read 90 in 1"), "reported cache reads are summed")
+	testing.expect(t, strings.contains(report, "write 10 in 1"), "reported cache writes are summed")
+	testing.expect(t, strings.contains(report, "90.0% hit"), "90 of 100 input tokens is a 90% hit rate")
 }
 
 @(test)

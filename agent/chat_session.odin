@@ -107,7 +107,9 @@ Chat_Session :: struct {
 
 	// last_input_measured is the last endpoint-reported input size, and
 	// last_estimate is the harness's own count of the active context, kept for
-	// the status line without touching the store from another thread.
+	// the status line without touching the store from another thread. Usage
+	// accumulation lives in the store: a refresh sums finished requests, so the
+	// session totals never depend on which stream events already arrived.
 	last_input_measured:         i64,
 	last_input_measured_present: bool,
 	last_estimate:               int,

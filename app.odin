@@ -48,19 +48,28 @@ Entry :: struct {
 // are borrowed from the runtime (the provider id and the session workspace,
 // both stable for the app's lifetime); model_id, effort, and effort_levels are
 // owned display copies, replaced under the runtime mutex when they change.
+// Cache numbers are the token-weighted totals over finished requests: input
+// and cache reads plus the request counts each rests on, so a bucket the
+// provider never reported reads as unknown rather than zero.
 Status :: struct {
-	provider_id:        string,
-	model_id:           string, // owned,
-	effort:             string, // owned,
-	effort_levels:      [dynamic]string, // owned; the levels the model allows,
-	cwd:                string,
-	context_window:     int,
-	est_input:          int,
-	last_input:         i64,
-	last_input_present: bool,
-	cost:               f64,
-	cost_present:       bool,
-	running:            bool,
+	provider_id:          string,
+	model_id:             string, // owned,
+	effort:               string, // owned,
+	effort_levels:        [dynamic]string, // owned; the levels the model allows,
+	cwd:                  string,
+	context_window:       int,
+	est_input:            int,
+	last_input:           i64,
+	last_input_present:   bool,
+	cost:                 f64,
+	cost_present:         bool,
+	session_input:          i64,
+	session_input_present:  bool,
+	session_cache_read:     i64,
+	session_cache_present:  bool,
+	session_hit_rate:       f64,
+	session_hit_measured:   bool,
+	running:                bool,
 }
 
 // Snapshot is everything the renderer reads. The worker bumps generation
@@ -1556,6 +1565,32 @@ refresh_status :: proc(app: ^App) {
 	// the main thread never reads the store, so it cannot compute one itself.
 	status.est_input = running.last_estimate
 	status.context_window = running.context_window
+	// The footer shows the session's token-weighted hit rate beside the
+	// estimate: the estimate bounds the request being built, the hit rate says
+	// how much of the finished session the provider read from its cache. Both
+	// come from the worker's own records, never from a second thread's query.
+	totals, totals_err := session.cache_totals(running.store, running.id)
+	if totals_err != nil {
+		status.session_input_present = false
+		status.session_cache_present = false
+		status.session_hit_measured = false
+	} else {
+		if totals.input_requests > 0 {
+			status.session_input = totals.input
+			status.session_input_present = true
+		} else {
+			status.session_input_present = false
+		}
+		if totals.cache_read_requests > 0 {
+			status.session_cache_read = totals.cache_read
+			status.session_cache_present = true
+		} else {
+			status.session_cache_present = false
+		}
+		rate, measured := session.cache_hit_rate(totals)
+		status.session_hit_rate = rate
+		status.session_hit_measured = measured
+	}
 	if status.cwd != running.workspace {
 		delete(status.cwd, app.run.alloc)
 		status.cwd = strings.clone(running.workspace, app.run.alloc)
@@ -1725,7 +1760,9 @@ obs_usage :: proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Ev
 		status.last_input = usage.Input_Tokens
 		status.last_input_present = true
 	}
-	// Cost accumulation lands here once the catalog carries pricing.
+	// Cost accumulation lands here once the catalog carries pricing. Session
+	// totals are recomputed at work boundaries, not per stream event, so this
+	// only records the latest request's size for the footer beside them.
 	_ = operation
 	app.run.snap.generation += 1
 }

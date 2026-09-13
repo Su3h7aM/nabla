@@ -363,6 +363,71 @@ test_request_records_usage_and_finishes_once :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_cache_totals_sum_finished_requests_and_skip_running :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session := _open_claimed_session(t, &store)
+	defer session_destroy(&session)
+	turn, turn_err := turn_begin(&store, session.id, "go", .Prompt, 2_000)
+	_expect_ok(t, turn_err)
+
+	first, first_err := request_begin(
+		&store,
+		session.id,
+		{turn_no = turn, purpose = .Response, provider = "p", model_requested = "m", api = "a", config_json = "{}", input_json = "{}"},
+		2_100,
+	)
+	_expect_ok(t, first_err)
+	_expect_ok(
+		t,
+		request_finish(&store, session.id, first, {outcome = .Completed, usage = Usage{input = 100, output = 10, cache_read = 90}, at_ms = 2_200}),
+	)
+
+	second, second_err := request_begin(
+		&store,
+		session.id,
+		{turn_no = turn, purpose = .Compaction, provider = "p", model_requested = "m", api = "a", config_json = "{}", input_json = "{}"},
+		2_300,
+	)
+	_expect_ok(t, second_err)
+	_expect_ok(
+		t,
+		request_finish(&store, session.id, second, {outcome = .Failed, usage = Usage{input = 50, output = 5, cache_write = 50}, at_ms = 2_400}),
+	)
+
+	// A running request must not move a reported total.
+	_, running_err := request_begin(
+		&store,
+		session.id,
+		{turn_no = turn, purpose = .Response, provider = "p", model_requested = "m", api = "a", config_json = "{}", input_json = "{}"},
+		2_500,
+	)
+	_expect_ok(t, running_err)
+
+	totals, totals_err := cache_totals(&store, session.id)
+	_expect_ok(t, totals_err)
+	testing.expect_value(t, totals.input, i64(150))
+	testing.expect_value(t, totals.cache_read, i64(90))
+	testing.expect_value(t, totals.cache_write, i64(50))
+	testing.expect_value(t, totals.output, i64(15))
+	testing.expect_value(t, totals.input_requests, 2)
+	testing.expect_value(t, totals.cache_read_requests, 1)
+	testing.expect_value(t, totals.cache_write_requests, 1)
+	testing.expect_value(t, totals.output_requests, 2)
+
+	rate, measured := cache_hit_rate(totals)
+	testing.expect(t, measured, "two finished requests with input and one cache read are measurable")
+	testing.expect(t, rate > 0.59 && rate < 0.61, "90 of 150 input tokens is a 60% hit rate")
+
+	// Nothing reported: no input denominator, no hit rate to show.
+	empty := Cache_Totals{}
+	_, empty_measured := cache_hit_rate(empty)
+	testing.expect(t, !empty_measured, "unknown usage must stay unknown, not zero")
+}
+
+@(test)
 test_history_survives_a_reopen :: proc(t: ^testing.T) {
 	store: Store
 	directory := _open_store(t, &store)
