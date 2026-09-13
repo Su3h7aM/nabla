@@ -6,6 +6,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:sys/linux"
+import "core:time"
 
 import "nabla:db"
 import "nabla:db/sqlite"
@@ -21,6 +22,15 @@ LOCK_DIRECTORY :: "locks"
 // BUSY_TIMEOUT_MS is how long a write waits for another process to release the
 // database lock before it fails. Writes are short, so a short wait is enough.
 BUSY_TIMEOUT_MS :: 5_000
+
+// JOURNAL_MODE_ATTEMPTS and JOURNAL_MODE_RETRY bound the retry of the one-time
+// switch to write-ahead logging. The switch takes exclusive access to the file,
+// and SQLite refuses it outright rather than waiting on the connection's busy
+// handler, so a second harness opening the same empty directory at the same
+// moment is a refusal rather than a wait. The switch is idempotent, so retrying
+// it is safe, and the bound matches how long a busy write would have waited.
+JOURNAL_MODE_ATTEMPTS :: 50
+JOURNAL_MODE_RETRY :: 100 * time.Millisecond
 
 // PRIVATE_DIRECTORY_PERMISSIONS and PRIVATE_FILE_PERMISSIONS admit the owner
 // alone. Session history holds prompts, tool output, and file contents, so
@@ -136,21 +146,41 @@ claim_release :: proc(claim: ^Claim) -> Error {
 // instead would silently turn every read into a writer-blocking one.
 @(private)
 set_journal_mode :: proc(store: ^Store) -> Error {
+	last: Error
+	for attempt in 0 ..< JOURNAL_MODE_ATTEMPTS {
+		ready, err := journal_mode_attempt(store)
+		if err != nil {
+			// Only contention is worth retrying; a refused or damaged database is
+			// the callers' to hear about now.
+			if error_kind(err) != .Contended { return err }
+			last = err
+		} else if ready {
+			return nil
+		}
+		if attempt + 1 < JOURNAL_MODE_ATTEMPTS { time.sleep(JOURNAL_MODE_RETRY) }
+	}
+	if last != nil { return last }
+	return error_make(.Storage, "the database did not accept write-ahead logging")
+}
+
+// journal_mode_attempt asks for write-ahead logging once and reports whether the
+// database is now in it. A pragma that answered with another mode is not an
+// error: it is a switch that has not happened yet, because another connection
+// held the file.
+@(private)
+journal_mode_attempt :: proc(store: ^Store) -> (ready: bool, err: Error) {
 	rows: db.Rows
-	if err := db.query(&store.conn, &rows, "PRAGMA journal_mode = WAL"); err != nil {
-		return storage_error("set the journal mode", err)
+	if query_err := db.query(&store.conn, &rows, "PRAGMA journal_mode = WAL"); query_err != nil {
+		return false, storage_error("set the journal mode", query_err)
 	}
 	defer db.rows_close(&rows)
 
 	values, has_row, next_err := db.rows_next(&rows)
-	if next_err != nil { return storage_error("set the journal mode", next_err) }
-	if !has_row { return error_make(.Storage, "the journal mode was not reported") }
+	if next_err != nil { return false, storage_error("set the journal mode", next_err) }
+	if !has_row { return false, error_make(.Storage, "the journal mode was not reported") }
 	mode, convert_err := db.as_string(values[0])
-	if convert_err != nil { return corrupt_error("read the journal mode", convert_err) }
-	if !strings.equal_fold(mode, "wal") {
-		return error_make(.Storage, fmt.tprintf("the database is in %s journal mode, not wal", mode))
-	}
-	return nil
+	if convert_err != nil { return false, corrupt_error("read the journal mode", convert_err) }
+	return strings.equal_fold(mode, "wal"), nil
 }
 
 // store_open opens the session database in directory, creating the directory
