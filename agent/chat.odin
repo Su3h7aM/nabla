@@ -189,6 +189,15 @@ chat_build_request_into :: proc(
 		Messages         = prep.wire[:],
 		Raw_Responses    = prep.raw_responses[:],
 	}
+	if !compact && connection.API == .OpenAI_Responses {
+		// The session id is the cache identity: stable for the session's
+		// life, so related requests route together and account together.
+		// The implicit breakpoint advances through the newest eligible
+		// boundary on its own; the key is what keeps related requests on
+		// the same accounting and routing.
+		prep.request.Prompt_Cache_Key_Present = true
+		prep.request.Prompt_Cache_Key = string(chat.id)
+	}
 	if compact {
 		prep.request.Max_Output_Tokens_Present = true
 		prep.request.Max_Output_Tokens = CHAT_COMPACT_MAX_OUTPUT

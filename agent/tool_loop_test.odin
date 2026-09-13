@@ -72,6 +72,32 @@ test_build_request_keeps_reasoning_before_calls :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_build_request_sets_stable_response_cache_key :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "run printf ok")
+
+	responses := ai.Provider_Connection{API = .OpenAI_Responses}
+	prep, prep_err := chat_prepare(chat, responses)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+
+	// The cache key is the session id, stable across requests, so related
+	// requests route and account together.
+	testing.expect(t, prep.request.Prompt_Cache_Key_Present)
+	testing.expect_value(t, prep.request.Prompt_Cache_Key, string(chat.id))
+
+	// Chat Completions sends no key: implicit caching there needs none.
+	chat_prep, chat_err := chat_prepare(chat, tool_loop_connection)
+	if chat_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&chat_prep, chat.allocator)
+	testing.expect(t, !chat_prep.request.Prompt_Cache_Key_Present)
+}
+
+@(test)
 test_build_request_replays_verbatim_response_output :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
