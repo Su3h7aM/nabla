@@ -114,3 +114,60 @@ test_shell_result_json_shape :: proc(t: ^testing.T) {
 	result.call_id, result.stdout, result.stderr = "", "", ""
 	tool_result_destroy(&result)
 }
+
+@(test)
+test_shell_prepare_repairs_control_bytes_only :: proc(t: ^testing.T) {
+	// A raw newline inside the command string is the one defect a repair is
+	// forced to resolve, and the decoded command keeps the exact byte.
+	repaired, repaired_ok := tool_shell_parse_args(
+		"{\"command\":\"printf a\nb\",\"working_directory\":null,\"timeout_ms\":null}",
+		context.allocator,
+	)
+	defer tool_shell_args_destroy(&repaired, context.allocator)
+	if !testing.expect(t, repaired_ok, "a control byte in a string is a forced repair") { return }
+	testing.expect_value(t, repaired.command, "printf a\nb")
+
+	// Everything else is reported, never guessed at.
+	rejects := []string {
+		`{"command":"a\qb","working_directory":null,"timeout_ms":null}`,
+		`{"command":."working_directory":null,"timeout_ms":null}`,
+		`{"command":"a","working_directory":null,"timeout_ms":null`,
+		`{"command":"a","command":"b","working_directory":null,"timeout_ms":null}`,
+	}
+	for raw in rejects {
+		args, ok := tool_shell_parse_args(raw, context.allocator)
+		tool_shell_args_destroy(&args, context.allocator)
+		testing.expectf(t, !ok, "%s must not be repaired", raw)
+	}
+}
+
+@(test)
+test_shell_prepare_reports_the_defect :: proc(t: ^testing.T) {
+	cases := []struct {
+		raw:   string,
+		kind:  Tool_Argument_Error_Kind,
+		field: string,
+	} {
+		{`[1,2]`, .Not_Object, ""},
+		{`{}`, .Missing_Field, "command"},
+		{`{"command":"a","working_directory":null,"timeout_ms":null,"x":1}`, .Unknown_Field, ""},
+		{`{"command":"a","command":"b","working_directory":null,"timeout_ms":null}`, .Duplicate_Field, "command"},
+		{`{"command":7,"working_directory":null,"timeout_ms":null}`, .Wrong_Type, "command"},
+		{`{"command":"a","working_directory":null,"timeout_ms":0}`, .Invalid_Value, "timeout_ms"},
+	}
+	for c in cases {
+		prep := tool_shell_prepare(c.raw, context.allocator)
+		ok := testing.expectf(t, prep.status == .Rejected, "%s must be rejected", c.raw)
+		if ok {
+			testing.expect_value(t, prep.error.kind, c.kind)
+			// A defect about a value has to name the constraint, or the model is told
+			// only that something is wrong.
+			if c.kind == .Wrong_Type || c.kind == .Invalid_Value {
+				testing.expectf(t, prep.error.expected != "", "%s must say what was expected", c.raw)
+			}
+			testing.expect(t, tool_argument_error_text(prep.error, context.temp_allocator) != "")
+		}
+		if ok && c.field != "" { testing.expect_value(t, prep.error.field, c.field) }
+		tool_preparation_destroy(&prep, context.allocator)
+	}
+}

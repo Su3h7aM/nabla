@@ -236,10 +236,12 @@ Tool_Call_Entry :: struct {
 
 // Tool_Dispatch_Entry is the harness committing to run a call. It is written
 // before the external work begins, so a dispatch with no result means the
-// outcome is unknown rather than "did not run".
+// outcome is unknown rather than "did not run". arguments is the argument JSON
+// the call actually ran with: the proposal unchanged, or the repaired bytes when
+// a deterministic repair was applied.
 Tool_Dispatch_Entry :: struct {
 	tool:      string,
-	arguments: string, // effective arguments, after defaults were resolved
+	arguments: string,
 }
 
 // Tool_Result_Entry is what the harness observed, together with the exact text

@@ -16,31 +16,30 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 	count := 0
 	for &staged in chat.pending_calls {
 		result: Tool_Result
-		args: Tool_Shell_Args
-		args_valid := false
+		prep: Tool_Preparation
 
 		if chat_session_cancelled(chat) {
 			result = tool_error_result(staged.id, .Not_Executed, "turn cancelled before this call ran", chat.allocator)
 		} else if staged.name != TOOL_SHELL_NAME {
 			result = tool_error_result(staged.id, .Invalid_Arguments, "unknown tool", chat.allocator)
 		} else {
-			args, args_valid = tool_shell_parse_args(staged.arguments, chat.allocator)
-			if !args_valid {
-				result = tool_error_result(staged.id, .Invalid_Arguments, "invalid shell arguments", chat.allocator)
+			prep = tool_shell_prepare(staged.arguments, chat.allocator)
+			if prep.status == .Rejected {
+				result = tool_argument_result(staged.id, &prep.error, chat.allocator)
 			} else {
 				dispatch := session.New_Entry {
 					turn_no = chat.turn_no,
 					request_no = chat.active_request,
 					created_at_ms = session.now_ms(),
 					related_seq = staged.seq,
-					payload = session.Tool_Dispatch_Entry{tool = staged.name, arguments = staged.arguments},
+					payload = session.Tool_Dispatch_Entry{tool = staged.name, arguments = prep.effective},
 				}
 				if _, dispatch_err := session.entry_append(chat.store, chat.id, dispatch); dispatch_err != nil {
 					chat_session_record_failure(chat, "the tool dispatch could not be recorded", dispatch_err)
-					tool_shell_args_destroy(&args, chat.allocator)
+					tool_preparation_destroy(&prep, chat.allocator)
 					return count
 				}
-				result = tool_shell_execute(staged.id, args, chat.workspace, control, chat.allocator)
+				result = tool_shell_execute(staged.id, prep.args, chat.workspace, control, chat.allocator)
 			}
 		}
 
@@ -63,7 +62,7 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		_, result_err := session.entry_append(chat.store, chat.id, entry)
 		delete(text, chat.allocator)
 		tool_result_destroy(&result)
-		if args_valid { tool_shell_args_destroy(&args, chat.allocator) }
+		tool_preparation_destroy(&prep, chat.allocator)
 		if result_err != nil {
 			chat_session_record_failure(chat, "the tool result could not be recorded", result_err)
 			return count
