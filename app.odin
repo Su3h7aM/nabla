@@ -252,6 +252,11 @@ Run_Setup :: struct {
 	// models.dev also contributes providers, and the model menu offers only the
 	// configured ones, whose credentials the user actually set up.
 	configured:       [dynamic]string, // owned,
+	// owns_selection says whether this run's model choice is the user's. The
+	// interactive harness owns it: its choice is published to the front-end and
+	// remembered for the next launch. A headless or child run does not, because it
+	// selects a model for one job and must not change what the user starts with.
+	owns_selection:   bool,
 	alloc:            mem.Allocator,
 }
 
@@ -654,7 +659,6 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	setup_model := strings.clone(model_id, app.setup.alloc)
 
 	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
 	delete(app.setup.credential, app.setup.alloc)
 	app.setup.credential = credential
 	app.setup.api = api
@@ -667,6 +671,31 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	app.setup.provider_id = setup_provider
 	delete(app.setup.model_id, app.setup.alloc)
 	app.setup.model_id = setup_model
+	if app.setup.owns_selection { selection_publish_locked(app, provider_id, model_id) }
+	sync.mutex_unlock(&app.run.mu)
+
+	// A run that owns the selection remembers it, so the next launch restores the
+	// user's own last choice. A headless or child run leaves it alone.
+	if app.setup.owns_selection {
+		saved := session.Selection {
+			provider = provider_id,
+			model    = model_id,
+			effort   = running.effort,
+		}
+		if save_err := session.selection_save(&app.setup.store, saved); save_err != nil {
+			local := save_err
+			fmt.eprintln("nabla: the selection could not be recorded:", session.error_detail(&local))
+		}
+	}
+	return true
+}
+
+// selection_publish_locked shows an applied selection to the front-end. The
+// caller holds the runtime mutex, because the status block is what the frame
+// reads; a headless run has no frame and never calls this.
+@(private)
+selection_publish_locked :: proc(app: ^App, provider_id, model_id: string) {
+	running := &app.setup.session
 	status := &app.run.snap.status
 	if status.provider_id != provider_id {
 		delete(status.provider_id, app.run.alloc)
@@ -676,9 +705,8 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 		delete(status.model_id, app.run.alloc)
 		status.model_id = strings.clone(model_id, app.run.alloc)
 	}
-	// The effort and the window apply here too, not only through
-	// refresh_status: a restored selection must show both before the first
-	// work item runs.
+	// The effort and the window apply here too, not only through refresh_status: a
+	// restored selection must show both before the first work item runs.
 	if status.effort != running.effort {
 		delete(status.effort, app.run.alloc)
 		status.effort = strings.clone(running.effort, app.run.alloc)
@@ -690,24 +718,11 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	for level in running.effort_levels {
 		append(&status.effort_levels, strings.clone(level, app.run.alloc))
 	}
-	status.context_window = window
+	status.context_window = running.context_window
 	delete(app.run.snap.setup_error, app.run.alloc)
 	app.run.snap.setup_error = ""
 	snap_append_locked(app, .Notice, fmt.tprintf("model set to %s / %s", provider_id, model_id))
 	app.run.snap.generation += 1
-
-	saved := session.Selection {
-		provider = provider_id,
-		model    = model_id,
-		effort   = running.effort,
-	}
-	sync.mutex_unlock(&app.run.mu)
-	if save_err := session.selection_save(&app.setup.store, saved); save_err != nil {
-		local := save_err
-		fmt.eprintln("nabla: the selection could not be recorded:", session.error_detail(&local))
-	}
-	sync.mutex_lock(&app.run.mu)
-	return true
 }
 
 // apply_startup_selection chooses the model a launch runs with. Two flags win,
@@ -776,14 +791,17 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 // the launch asked for, open the terminal, apply the selection (explicit flags,
 // then the persisted one, then the in-TUI model menu), start the worker, and
 // drive the frame loop until quit.
-tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_model: string, start: Session_Start) {
+tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_model: string, start: Session_Start) -> (ok: bool) {
 	app := new(App)
 	defer free(app)
 	app.run.alloc = context.allocator
+	// This run is the user's own, so its model choice is published to the frame and
+	// remembered for the next launch.
+	app.setup.owns_selection = true
 	// The setup is filled in place: a store owns a live connection, and copying
 	// one would leave two owners of it.
 	if !run_catalog(sources, &app.setup, start) {
-		return
+		return false
 	}
 	app.run.connection = app.setup.connection
 	app.run.snap.entries = make([dynamic]Entry, 0, 16, app.run.alloc)
@@ -807,7 +825,7 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	if open_err != nil {
 		fmt.eprintln("nabla: cannot open the terminal:", open_err)
 		app_teardown(app)
-		return
+		return false
 	}
 	defer { _ = term.close(terminal) }
 	app.terminal = terminal
@@ -816,7 +834,7 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	if file_err != nil {
 		fmt.eprintln("nabla: cannot access the terminal input:", file_err)
 		app_teardown(app)
-		return
+		return false
 	}
 	app.tty = tty
 	input.parser_init(&app.parser)
@@ -825,7 +843,7 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	if !apply_startup_selection(app, flag_provider, flag_model) {
 		fmt.eprintln("nabla:", app.run.snap.setup_error)
 		app_teardown(app)
-		return
+		return false
 	}
 
 	// With no model selected, the chooser is the only input: escape quits rather
@@ -842,7 +860,7 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	if worker == nil {
 		fmt.eprintln("nabla: cannot start the worker thread")
 		app_teardown(app)
-		return
+		return false
 	}
 	worker.data = app
 	app.run.worker = worker
@@ -853,10 +871,12 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 		present_frame(app, app.storage)
 	}
 
+	read_failed := false
 	for !app.quit {
 		_, read_err := input.read_events(&app.parser, app.tty, &app.raw, TUI_POLL_MS)
 		if read_err != nil {
 			fmt.eprintln("nabla: input:", read_err)
+			read_failed = true
 			break
 		}
 		for event in app.raw {
@@ -916,6 +936,7 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 		agent.chat_cancel_request()
 	}
 	app_teardown(app)
+	return !read_failed
 }
 
 // app_teardown releases everything after the worker stopped. It must be
@@ -937,6 +958,22 @@ app_teardown :: proc(app: ^App) {
 		work_destroy(app, queued)
 	}
 	chan.destroy(&app.run.work)
+	snapshot_destroy(app)
+	menu_destroy(&app.menu, app.run.alloc)
+	delete(app.completion_query, app.run.alloc)
+	delete(app.home, app.run.alloc)
+	widgets.input_destroy(&app.input)
+	input.parser_destroy(&app.parser)
+	input.events_destroy(&app.raw, app.run.alloc)
+	frame_storage_destroy(app.storage)
+	run_setup_destroy(&app.setup)
+}
+
+// snapshot_destroy releases everything the front-end snapshot owns and zeroes it,
+// so it is safe to call on a partially filled snapshot and more than once. A
+// headless run has no front-end, but the launch path publishes into the snapshot
+// anyway, so both callers release it the same way.
+snapshot_destroy :: proc(app: ^App) {
 	for &entry in app.run.snap.entries {
 		if entry.text != nil {
 			delete(entry.text)
@@ -956,14 +993,7 @@ app_teardown :: proc(app: ^App) {
 	for level in app.run.snap.status.effort_levels { delete(level, app.run.alloc) }
 	delete(app.run.snap.status.effort_levels)
 	delete(app.run.snap.setup_error, app.run.alloc)
-	menu_destroy(&app.menu, app.run.alloc)
-	delete(app.completion_query, app.run.alloc)
-	delete(app.home, app.run.alloc)
-	widgets.input_destroy(&app.input)
-	input.parser_destroy(&app.parser)
-	input.events_destroy(&app.raw, app.run.alloc)
-	frame_storage_destroy(app.storage)
-	run_setup_destroy(&app.setup)
+	app.run.snap = {}
 }
 
 // --- worker ---------------------------------------------------------------

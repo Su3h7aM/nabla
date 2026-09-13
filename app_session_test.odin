@@ -2,8 +2,12 @@
 #+private file
 package main
 
+import "core:fmt"
+import "core:io"
 import "core:mem"
+import "core:net"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 import "core:sync/chan"
 import "core:testing"
@@ -12,6 +16,7 @@ import "core:time"
 
 import "nabla:agent"
 import "nabla:agent/session"
+import "nabla:ai"
 
 // The session commands are the only part of the front-end that owns a store, so
 // they are driven here without a terminal: a store, a running session, and the
@@ -615,4 +620,146 @@ test_a_stopped_worker_abandons_queued_work :: proc(t: ^testing.T) {
 	if !testing.expect(t, load_err == nil, "the session's history must be readable") { return }
 	defer session.entries_destroy(entries, context.allocator)
 	testing.expect_value(t, len(entries), 0)
+}
+
+// --- a headless turn, end to end ---------------------------------------------
+
+// COMPLETION_RESPONSE is one complete OpenAI chat-completions stream: a text
+// delta and a stop.
+COMPLETION_RESPONSE ::
+	"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" +
+	"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n" +
+	"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+	"data: [DONE]\n\n"
+
+// STUB_BOUND bounds the wait for a turn's request, so a turn that never connects
+// fails the test rather than hanging it.
+STUB_BOUND :: 10 * time.Second
+
+// stub_serve answers the one request a turn makes. The listener is non-blocking,
+// so the wait for that request is bounded rather than an accept this test could
+// never interrupt.
+stub_serve :: proc(listener: net.TCP_Socket, response: string) -> bool {
+	deadline := time.tick_add(time.tick_now(), STUB_BOUND)
+	for {
+		socket, _, accept_err := net.accept_tcp(listener)
+		if accept_err == nil {
+			defer net.close(socket)
+			if !stub_read_request(socket) { return false }
+			if _, send_err := net.send_tcp(socket, transmute([]byte)response); send_err != nil { return false }
+			return true
+		}
+		if accept_err != .Would_Block { return false }
+		if time.tick_since(deadline) >= 0 { return false }
+		time.sleep(2 * time.Millisecond)
+	}
+}
+
+// stub_read_request reads a whole request, headers and body. Closing a socket
+// that still holds unread data sends RST, which would turn the response into a
+// truncation the transport reports as a stream failure.
+stub_read_request :: proc(socket: net.TCP_Socket) -> bool {
+	request: [dynamic]u8
+	defer delete(request)
+	scratch: [4096]u8
+	header_end := -1
+	body_length := 0
+	for {
+		if header_end < 0 {
+			if index := strings.index(string(request[:]), "\r\n\r\n"); index >= 0 {
+				header_end = index + 4
+				body_length = stub_content_length(string(request[:index]))
+			}
+		}
+		if header_end >= 0 && len(request) >= header_end + body_length { return true }
+		read, read_err := net.recv_tcp(socket, scratch[:])
+		if read_err != nil || read <= 0 { return false }
+		append(&request, ..scratch[:read])
+	}
+}
+
+// stub_content_length finds the request body's size. A request without a
+// Content-Length has no body.
+stub_content_length :: proc(headers: string) -> int {
+	rest := headers
+	for {
+		line_end := strings.index(rest, "\r\n")
+		line := rest if line_end < 0 else rest[:line_end]
+		if colon := strings.index_byte(line, ':'); colon > 0 {
+			if strings.equal_fold(strings.trim_space(line[:colon]), "content-length") {
+				length, _ := strconv.parse_int(strings.trim_space(line[colon + 1:]), 10)
+				return length
+			}
+		}
+		if line_end < 0 { return 0 }
+		rest = rest[line_end + 2:]
+	}
+	return 0
+}
+
+// Turn_Run is one headless turn on its own thread, so the test thread is free to
+// answer the request the turn makes.
+Turn_Run :: struct {
+	app:       ^App,
+	prompt:    string,
+	out:       ^Headless_Output,
+	completed: bool,
+}
+
+headless_turn_run :: proc(thread_handle: ^thread.Thread) {
+	run := cast(^Turn_Run)thread_handle.data
+	run.completed = run_prompt_turn(run.app, run.prompt, run.out)
+}
+
+// A headless run is the interactive one without a terminal, so a turn driven
+// through it has to reach a provider, decode the stream, record the turn, and
+// report the answer. A stub endpoint on loopback is what lets that run end to
+// end: the same code path, without a paid model.
+@(test)
+test_a_headless_turn_answers_against_an_endpoint :: proc(t: ^testing.T) {
+	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
+	if !testing.expectf(t, listen_err == nil, "the stub endpoint could not listen: %v", listen_err) { return }
+	defer net.close(listener)
+	if block_err := net.set_blocking(listener, false); block_err != nil {
+		testing.fail_now(t, "the stub endpoint could not be made non-blocking")
+	}
+	endpoint, endpoint_err := net.bound_endpoint(listener)
+	if !testing.expectf(t, endpoint_err == nil, "the stub endpoint could not be read: %v", endpoint_err) { return }
+
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	// The chat is configured the way apply_selection would leave it, because this
+	// test is about the turn rather than about choosing a model.
+	app.setup.session.provider_id = strings.clone("test-provider", app.setup.session.allocator)
+	app.setup.session.model_id = strings.clone("test-model", app.setup.session.allocator)
+	app.setup.session.context_window = 128_000
+	app.run.connection = ai.Provider_Connection {
+		API        = .OpenAI_Chat_Completions,
+		Endpoint   = fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.temp_allocator),
+		Credential = "test-key",
+	}
+
+	answer: strings.Builder
+	out := Headless_Output {
+		answer = strings.to_writer(&answer),
+	}
+	run := Turn_Run {
+		app    = &app,
+		prompt = "hello",
+		out    = &out,
+	}
+	worker := thread.create(headless_turn_run, name = "nabla-headless-turn")
+	if worker == nil { testing.fail_now(t, "the turn thread could not be created") }
+	worker.data = &run
+	thread.start(worker)
+
+	served := stub_serve(listener, COMPLETION_RESPONSE)
+	thread.join(worker)
+	thread.destroy(worker)
+
+	if !testing.expect(t, served, "the turn never made its request") { return }
+	if !testing.expect(t, run.completed, "the turn should complete") { return }
+	// The answer is the model's text and one trailing newline, and nothing else.
+	testing.expect_value(t, strings.to_string(answer), "hello\n")
 }

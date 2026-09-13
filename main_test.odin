@@ -63,3 +63,36 @@ test_an_unknown_argument_is_refused :: proc(t: ^testing.T) {
 	_, value_missing_ok := chat_cli_parse({"--config"})
 	testing.expect(t, !value_missing_ok, "a flag without its value must stop the launch")
 }
+
+// A prompt is the whole instruction for a headless run, so both ways of giving a
+// flag its value work, and a missing one is a launch mistake rather than a
+// request for the interactive harness.
+@(test)
+test_prompt_is_taken_apart_or_joined :: proc(t: ^testing.T) {
+	apart, apart_ok := chat_cli_parse({"--prompt", "hello"})
+	if !testing.expect(t, apart_ok) { return }
+	testing.expect_value(t, apart.prompt, "hello")
+
+	joined, joined_ok := chat_cli_parse({"--prompt=hello"})
+	if !testing.expect(t, joined_ok) { return }
+	testing.expect_value(t, joined.prompt, "hello")
+
+	// Everything a launch can say at once, in one parse.
+	together, together_ok := chat_cli_parse({"--config=/tmp/c.lua", "--resume", "abc", "--provider", "p", "--model", "m", "--prompt=go"})
+	if !testing.expect(t, together_ok) { return }
+	testing.expect_value(t, together.config_path, "/tmp/c.lua")
+	testing.expect(t, together.resume)
+	testing.expect_value(t, together.resume_id, "abc")
+	testing.expect_value(t, together.provider_id, "p")
+	testing.expect_value(t, together.model_id, "m")
+	testing.expect_value(t, together.prompt, "go")
+}
+
+@(test)
+test_a_prompt_without_a_value_is_refused :: proc(t: ^testing.T) {
+	_, missing_ok := chat_cli_parse({"--prompt"})
+	testing.expect(t, !missing_ok, "a prompt flag without a value must stop the launch")
+
+	_, empty_ok := chat_cli_parse({"--prompt="})
+	testing.expect(t, !empty_ok, "an empty prompt is a mistake, not a headless run")
+}

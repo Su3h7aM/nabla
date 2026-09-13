@@ -1,10 +1,12 @@
 package main
 
 import "core:fmt"
+import "core:io"
 import "core:os"
 import "core:strings"
 
 import "nabla:agent"
+import "nabla:agent/session"
 
 chat_cli_options :: struct {
 	config_path: string,
@@ -14,6 +16,10 @@ chat_cli_options :: struct {
 	// names which. An empty resume_id means the newest session for the directory.
 	resume:      bool,
 	resume_id:   string,
+	// prompt runs one turn without a terminal: the answer goes to stdout and the
+	// process exits with the turn's outcome. An empty prompt means the interactive
+	// harness is what the launch asked for.
+	prompt:      string,
 	help:        bool,
 	list:        bool,
 }
@@ -39,6 +45,19 @@ chat_cli_parse :: proc(args: []string) -> (chat_cli_options, bool) {
 			result.resume_id = arg[len("--resume="):]
 			continue
 		}
+		if arg == "--prompt" {
+			// A prompt is the whole instruction, so an empty one is a launch
+			// mistake rather than a request for the interactive harness.
+			if i + 1 >= len(args) || args[i + 1] == "" { return result, false }
+			i += 1
+			result.prompt = args[i]
+			continue
+		}
+		if strings.has_prefix(arg, "--prompt=") {
+			result.prompt = arg[len("--prompt="):]
+			if result.prompt == "" { return result, false }
+			continue
+		}
 		if strings.has_prefix(arg, "--config=") { result.config_path = arg[len("--config="):]; continue }
 		if strings.has_prefix(arg, "--provider=") { result.provider_id = arg[len("--provider="):]; continue }
 		if strings.has_prefix(arg, "--model=") { result.model_id = arg[len("--model="):]; continue }
@@ -55,43 +74,100 @@ chat_cli_parse :: proc(args: []string) -> (chat_cli_options, bool) {
 	return result, true
 }
 
-main :: proc() {
-	options, ok := chat_cli_parse(os.args[1:])
-	if !ok { fmt.println("usage: nabla [--config PATH] [--resume [SESSION]] [--provider ID --model ID]"); return }
-	if options.help {
-		fmt.println("nabla [--config PATH] [--resume [SESSION]] [--provider ID --model ID]")
-		fmt.println("default config: $XDG_CONFIG_HOME/nabla/config.lua (~/.config/nabla/config.lua)")
-		fmt.println("without --resume, a new session starts in the current directory")
-		fmt.println("--resume opens the newest session for the current directory; --resume SESSION opens that one")
-		fmt.println("without provider/model, the last selection is restored, or the model menu opens")
-		fmt.println("--list prints the resolved catalog")
-		return
+chat_cli_usage :: proc() {
+	fmt.println("nabla [--config PATH] [--resume [SESSION]] [--provider ID --model ID] [--prompt TEXT]")
+	fmt.println("default config: $XDG_CONFIG_HOME/nabla/config.lua (~/.config/nabla/config.lua)")
+	fmt.println("without --resume, a new session starts in the current directory")
+	fmt.println("--resume opens the newest session for the current directory; --resume SESSION opens that one")
+	fmt.println("without provider/model, the last selection is restored, or the model menu opens")
+	fmt.println("--prompt runs one turn without a terminal, prints the answer to stdout, and exits")
+	fmt.println("--list prints the resolved catalog")
+}
+
+// --- headless ---------------------------------------------------------------
+
+// Headless_Output is the headless front-end's only state: where the answer goes,
+// and whether the turn has produced any of it, so a turn that produced none does
+// not print a blank line.
+Headless_Output :: struct {
+	answer:   io.Writer,
+	answered: bool,
+}
+
+headless_observer :: proc(out: ^Headless_Output) -> agent.Chat_Observer {
+	return {
+		user_data = out,
+		assistant_begin = headless_assistant_begin,
+		assistant_text = headless_assistant_text,
+		assistant_end = headless_assistant_end,
+		tool_result = headless_tool_result,
+		message = headless_message,
 	}
-	if options.config_path == "" {
-		directory, directory_err := agent.xdg_directory(.Config, context.temp_allocator)
-		if directory_err != .None { fmt.eprintln("cannot resolve the configuration directory"); return }
-		options.config_path = strings.concatenate([]string{directory, "/config.lua"}, allocator = context.temp_allocator)
+}
+
+// The answer goes to stdout as it arrives, and everything else goes to stderr, so
+// a caller can capture the answer alone.
+headless_assistant_begin :: proc(user_data: rawptr) {
+	out := cast(^Headless_Output)user_data
+	out.answered = false
+}
+
+headless_assistant_text :: proc(user_data: rawptr, text: string) {
+	out := cast(^Headless_Output)user_data
+	out.answered = true
+	_, _ = io.write_string(out.answer, text)
+}
+
+headless_assistant_end :: proc(user_data: rawptr) {
+	out := cast(^Headless_Output)user_data
+	if out.answered { _, _ = io.write_string(out.answer, "\n") }
+}
+
+headless_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Result) {
+	fmt.eprintf("nabla: tool %s: %s\n", name, tool_display_summary(result))
+}
+
+headless_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text: string) {
+	switch kind {
+	case .Notice:
+		fmt.eprintln("nabla:", text)
+	case .Warning:
+		fmt.eprintln("nabla: warning:", text)
+	case .Error:
+		fmt.eprintln("nabla: error:", text)
 	}
-	sources, err := agent.load_lua_config(
-		options.config_path,
-	); if err != .None { fmt.println(agent.config_error_text(err)); return }; defer agent.catalog_sources_destroy(&sources)
-	if options.list {
-		catalog, configured, catalog_ok := resolve_run_catalog(sources[:], context.allocator)
-		defer {
-			for id in configured { delete(id, context.allocator) }
-			delete(configured)
-			agent.catalog_destroy(&catalog)
-		}
-		if !catalog_ok { return }
-		for model in catalog.models {
-			fmt.println(model.provider_id, "/", model.id)
-		}
-		return
+}
+
+// run_prompt_turn accepts one prompt on an opened session and runs it to
+// completion, reporting through out. False means the turn did not complete; the
+// observer has already said why, so the caller only needs the exit code.
+//
+// This is the whole of what a headless run does with a prompt, which is what
+// makes it testable without a terminal: the launch around it is shared with the
+// interactive harness.
+run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> bool {
+	switch agent.chat_session_accept_user(&app.setup.session, prompt, session.now_ms()) {
+	case .Accepted:
+	case .Storage_Failed:
+		fmt.eprintln("nabla:", agent.chat_session_last_error(&app.setup.session))
+		return false
+	case .Busy:
+		fmt.eprintln("nabla: the session is already running")
+		return false
 	}
-	if (options.provider_id == "") != (options.model_id == "") {
-		fmt.eprintln("nabla: --provider and --model must be given together")
-		return
-	}
+	return agent.chat_run_turn_steered(&app.setup.session, app.run.connection, headless_observer(out), nil)
+}
+
+// run_prompt executes one prompt without a terminal and returns the process exit
+// code. It shares the launch path with the interactive harness: the same
+// configuration, the same catalog, the same session. Only the front-end differs,
+// so a headless run is the same conversation rather than a second implementation
+// of one.
+run_prompt :: proc(sources: []agent.Catalog_Provider_Source, options: chat_cli_options, answer: io.Writer) -> int {
+	app := new(App)
+	defer free(app)
+	app.run.alloc = context.allocator
+
 	start := Session_Start {
 		kind = .New,
 	}
@@ -99,5 +175,93 @@ main :: proc() {
 		start.kind = .Resume_Id if options.resume_id != "" else .Resume_Latest
 		start.id = options.resume_id
 	}
-	tui_run(sources[:], options.provider_id, options.model_id, start)
+	if !run_catalog(sources, &app.setup, start) { return 1 }
+	// The model this run picks belongs to the job, not to the user: a headless run
+	// must not change what the interactive harness starts with.
+	app.setup.owns_selection = false
+	defer {
+		snapshot_destroy(app)
+		run_setup_destroy(&app.setup)
+	}
+
+	if !apply_startup_selection(app, options.provider_id, options.model_id) {
+		fmt.eprintln("nabla:", app.run.snap.setup_error)
+		return 1
+	}
+	if app.setup.model_id == "" {
+		fmt.eprintln("nabla: no model is selected; give --provider and --model, or run the interactive harness once")
+		return 1
+	}
+
+	out := Headless_Output {
+		answer = answer,
+	}
+	return run_prompt_turn(app, options.prompt, &out) ? 0 : 1
+}
+
+// --- entry point ------------------------------------------------------------
+
+// chat_main runs one invocation and returns its exit code, so main has a single
+// exit and the deferred cleanup still runs.
+chat_main :: proc() -> int {
+	options, parsed := chat_cli_parse(os.args[1:])
+	if !parsed {
+		chat_cli_usage()
+		return 2
+	}
+	if options.help {
+		chat_cli_usage()
+		return 0
+	}
+	if options.config_path == "" {
+		directory, directory_err := agent.xdg_directory(.Config, context.temp_allocator)
+		if directory_err != .None {
+			fmt.eprintln("nabla: cannot resolve the configuration directory")
+			return 1
+		}
+		options.config_path = strings.concatenate([]string{directory, "/config.lua"}, allocator = context.temp_allocator)
+	}
+	sources, config_err := agent.load_lua_config(options.config_path)
+	if config_err != .None {
+		fmt.eprintln("nabla:", agent.config_error_text(config_err))
+		return 1
+	}
+	defer agent.catalog_sources_destroy(&sources)
+
+	if options.list {
+		catalog, configured, catalog_ok := resolve_run_catalog(sources[:], context.allocator)
+		defer {
+			for id in configured { delete(id, context.allocator) }
+			delete(configured)
+			agent.catalog_destroy(&catalog)
+		}
+		if !catalog_ok { return 1 }
+		for model in catalog.models {
+			fmt.println(model.provider_id, "/", model.id)
+		}
+		return 0
+	}
+	if (options.provider_id == "") != (options.model_id == "") {
+		fmt.eprintln("nabla: --provider and --model must be given together")
+		return 2
+	}
+	if options.prompt != "" { return run_prompt(sources[:], options, stdout_writer()) }
+
+	start := Session_Start {
+		kind = .New,
+	}
+	if options.resume {
+		start.kind = .Resume_Id if options.resume_id != "" else .Resume_Latest
+		start.id = options.resume_id
+	}
+	return tui_run(sources[:], options.provider_id, options.model_id, start) ? 0 : 1
+}
+
+main :: proc() {
+	os.exit(chat_main())
+}
+
+// stdout_writer is where a real headless run's answer goes.
+stdout_writer :: proc() -> io.Writer {
+	return io.to_writer(os.to_stream(os.stdout))
 }
