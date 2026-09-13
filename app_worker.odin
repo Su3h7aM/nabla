@@ -318,7 +318,11 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 	for &entry in replayed.entries {
 		#partial switch payload in entry.payload {
 		case session.User_Entry:
-			snap_append(app, .User, payload.text)
+			if payload.origin == .Harness {
+				snap_append(app, .Notice, payload.text)
+			} else {
+				snap_append(app, .User, payload.text)
+			}
 		case session.Assistant_Entry:
 			snap_append(app, .Assistant, payload.text)
 		case session.Tool_Result_Entry:

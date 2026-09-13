@@ -192,13 +192,62 @@ chat_tool_call_clone :: proc(call: ai.Provider_Tool_Call, allocator: mem.Allocat
 		true
 }
 
-// chat_session_feed_tool_calls validates the calls a response assembled and
-// stages them for execution. Nothing is stored yet: the driver commits the
-// calls, and then their dispatch, before any of them runs.
-chat_session_feed_tool_calls :: proc(chat: ^Chat_Session, source: Chat_Event_Source, calls: []ai.Provider_Tool_Call) -> bool {
+// Chat_Notice is why a completed response could not be used as it stood. None
+// means it was usable, and Ignored means the event did not belong to the running
+// operation and nothing should happen at all. Every other member is a defect the
+// model is told about: the response executes nothing, and the turn goes on to
+// another request so the model can correct itself.
+Chat_Notice :: enum {
+	None,
+	Ignored,
+	Truncated,
+	Too_Many_Calls,
+	Budget_Exhausted,
+	Missing_Call_Identity,
+	Duplicate_Call_ID,
+}
+
+// chat_notice_text is the harness's own explanation of an unusable response. The
+// text is a literal: the same notice always puts the same bytes into the
+// conversation, so a recovery turn adds no avoidable churn to the cacheable
+// prefix.
+chat_notice_text :: proc(notice: Chat_Notice) -> string {
+	switch notice {
+	case .Truncated:
+		return "the previous response was cut off by the output limit before it finished, so none of it was executed; reissue the work in smaller steps"
+	case .Too_Many_Calls:
+		return "the previous response proposed more tool calls than this harness accepts at once, so none of them ran; propose fewer calls"
+	case .Budget_Exhausted:
+		return "this turn has reached its tool-call budget, so none of the calls ran; answer with what you have, or say what still needs doing"
+	case .Missing_Call_Identity:
+		return "a proposed tool call carried no id or no tool name, so none of the calls ran; every call needs the provider's id and the tool's name"
+	case .Duplicate_Call_ID:
+		return "two proposed tool calls shared one id, so none of them ran; every call needs its own id"
+	case .None, .Ignored:
+		return ""
+	}
+	return ""
+}
+
+// chat_session_note_notice records that the running response was unusable and
+// moves the turn on to another request. The notice itself is committed with the
+// response that caused it, so the explanation follows the text it explains.
+chat_session_note_notice :: proc(chat: ^Chat_Session, source: Chat_Event_Source, notice: Chat_Notice) -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
-	if len(calls) == 0 || len(calls) > TOOL_MAX_CALLS_PER_RESPONSE { return false }
-	if chat.calls_made + len(calls) > TOOL_MAX_CALLS_PER_TURN { return false }
+	chat.pending_notice = notice
+	chat.state = .Preparing
+	return true
+}
+
+// chat_session_feed_tool_calls validates the calls a response assembled and
+// stages them for execution. It reports None when they were staged, Ignored when
+// the event did not belong to the running operation, and otherwise why the whole
+// response was refused: calls are staged all at once or not at all, so a
+// response is never half executed.
+chat_session_feed_tool_calls :: proc(chat: ^Chat_Session, source: Chat_Event_Source, calls: []ai.Provider_Tool_Call) -> Chat_Notice {
+	if !chat_session_accepts_event(chat, source) { return .Ignored }
+	if len(calls) == 0 || len(calls) > TOOL_MAX_CALLS_PER_RESPONSE { return .Too_Many_Calls }
+	if chat.calls_made + len(calls) > TOOL_MAX_CALLS_PER_TURN { return .Budget_Exhausted }
 
 	staged := make([dynamic]Chat_Tool_Call, 0, len(calls), chat.allocator)
 	defer delete(staged)
@@ -206,23 +255,21 @@ chat_session_feed_tool_calls :: proc(chat: ^Chat_Session, source: Chat_Event_Sou
 		cloned, valid := chat_tool_call_clone(call, chat.allocator)
 		if !valid {
 			for &leftover in staged { chat_tool_call_destroy(&leftover, chat.allocator) }
-			return false
+			return .Missing_Call_Identity
 		}
-		duplicate := false
 		for prior in staged {
-			if prior.id == cloned.id { duplicate = true }
-		}
-		if duplicate {
-			chat_tool_call_destroy(&cloned, chat.allocator)
-			for &leftover in staged { chat_tool_call_destroy(&leftover, chat.allocator) }
-			return false
+			if prior.id == cloned.id {
+				chat_tool_call_destroy(&cloned, chat.allocator)
+				for &leftover in staged { chat_tool_call_destroy(&leftover, chat.allocator) }
+				return .Duplicate_Call_ID
+			}
 		}
 		append(&staged, cloned)
 	}
 	for staged_call in staged { append(&chat.pending_calls, staged_call) }
 	clear(&staged)
 	chat.state = .Executing_Tools
-	return true
+	return .None
 }
 
 chat_session_tools_done :: proc(chat: ^Chat_Session, turn_id: u64, results: int) -> bool {

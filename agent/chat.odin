@@ -76,11 +76,16 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 		if !chat_session_feed_response_output(runtime.chat, runtime.source, value.Raw_Output) {
 			chat_session_feed_error(runtime.chat, runtime.source, "tool response was rejected")
 		} else if value.Reason == .Tool_Call && len(value.Tool_Calls) > 0 {
-			if !chat_session_feed_tool_calls(runtime.chat, runtime.source, value.Tool_Calls) {
-				chat_session_feed_error(runtime.chat, runtime.source, "tool response was rejected")
+			notice := chat_session_feed_tool_calls(runtime.chat, runtime.source, value.Tool_Calls)
+			if notice != .None && notice != .Ignored {
+				// The response proposed calls the harness cannot use. Executing
+				// nothing and telling the model why keeps the turn alive.
+				chat_session_note_notice(runtime.chat, runtime.source, notice)
 			}
 		} else if value.Reason == .Stop {
 			chat_session_feed_completion(runtime.chat, runtime.source)
+		} else if value.Reason == .Length {
+			chat_session_note_notice(runtime.chat, runtime.source, .Truncated)
 		} else {
 			if value.Reason_Text != "" {
 				chat_session_feed_error(runtime.chat, runtime.source, fmt.tprintf("response incomplete: %s", value.Reason_Text))
@@ -223,7 +228,8 @@ chat_commit_response :: proc(
 	if outcome == .Completed {
 		text := string(chat.partial_assistant[:])
 		response_count := 1 if chat.pending_response_present else 0
-		entries: [dynamic]session.New_Entry = make([dynamic]session.New_Entry, 0, response_count + len(chat.pending_calls) + 1, chat.allocator)
+		notice_text := chat_notice_text(chat.pending_notice)
+		entries: [dynamic]session.New_Entry = make([dynamic]session.New_Entry, 0, response_count + len(chat.pending_calls) + 2, chat.allocator)
 		defer delete(entries)
 		if chat.pending_response_present {
 			append(
@@ -253,6 +259,19 @@ chat_commit_response :: proc(
 				},
 			)
 		}
+		// The harness's explanation of an unusable response is committed with the
+		// response itself, after whatever text it produced.
+		if notice_text != "" {
+			append(
+				&entries,
+				session.New_Entry {
+					turn_no = chat.turn_no,
+					request_no = request_no,
+					created_at_ms = at_ms,
+					payload = session.User_Entry{text = notice_text, origin = .Harness},
+				},
+			)
+		}
 
 		seqs, append_err := session.entries_append(chat.store, chat.id, entries[:], chat.allocator)
 		if append_err != nil {
@@ -271,6 +290,9 @@ chat_commit_response :: proc(
 		delete(chat.partial_assistant)
 		chat.partial_assistant = make([dynamic]u8, 0, 0, chat.allocator)
 	}
+	// A notice is only ever committed with the response that raised it. One that
+	// did not commit, because the turn failed or was cancelled, is dropped.
+	chat.pending_notice = .None
 
 	response_json := ""
 	if finish_reason != .Unknown {

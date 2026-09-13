@@ -62,16 +62,21 @@ request_purpose_from_name :: proc(name: string) -> (Request_Purpose, bool) {
 	return .Response, false
 }
 
-// User_Origin says whether user text opened a turn or arrived while one ran.
+// User_Origin says where user-role conversation text came from: the prompt that
+// opened a turn, a line that arrived while one ran, or the harness explaining a
+// response it could not use. Harness text is conversation the model reads next,
+// never input the user wrote.
 User_Origin :: enum {
 	Prompt,
 	Steering,
+	Harness,
 }
 
 @(private)
 user_origin_names := [User_Origin]string {
 	.Prompt   = "prompt",
 	.Steering = "steering",
+	.Harness  = "harness",
 }
 
 user_origin_name :: proc(origin: User_Origin) -> string {

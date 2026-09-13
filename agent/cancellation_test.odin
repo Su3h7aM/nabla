@@ -109,7 +109,7 @@ test_stale_operation_events_are_rejected :: proc(t: ^testing.T) {
 	testing.expect(t, !chat_session_feed_error(chat, stale, "stale error"))
 	testing.expect_value(t, chat.last_error, "")
 	calls := []ai.Provider_Tool_Call{{ID = "stale_call", Name = TOOL_SHELL_NAME, Arguments = `{}`}}
-	testing.expect(t, !chat_session_feed_tool_calls(chat, stale, calls))
+	testing.expect_value(t, chat_session_feed_tool_calls(chat, stale, calls), Chat_Notice.Ignored)
 	// An operation id from another turn, and a turn id with the current operation,
 	// are both rejected.
 	testing.expect(t, !chat_session_feed_completion(chat, Chat_Event_Source{turn_id = current.turn_id, operation_id = stale.operation_id}))

@@ -89,17 +89,19 @@ anthropic_object_set :: proc(object: ^json.Object, key: string, value: json.Valu
 }
 
 // anthropic_encode_messages projects the conversation onto the Messages API. The
-// projection is not mechanical: tool results belong to a user turn and every
-// turn must be coherent, so consecutive results are collected into one user
-// message rather than sent as one message each.
+// projection is not mechanical: this API requires roles to alternate, so
+// consecutive user content is one user turn. Text and tool results accumulate
+// into the open user turn until something that is not user content ends it. A
+// turn that ends up holding exactly one text block is emitted in the plain
+// string form, so an ordinary conversation encodes to the bytes it always has.
 @(private)
 anthropic_encode_messages :: proc(messages: []Provider_Message, allocator := context.allocator) -> (json.Array, Provider_Request_Error) {
 	result := make(json.Array, 0, len(messages), allocator)
-	// Results are collected before they become a turn. A dynamic array owns its
-	// buffer, so the one buffer is released once and each flushed turn gets its
-	// own copy that the message then owns.
-	pending_results := make([dynamic]json.Value, 0, 4, allocator)
-	defer delete(pending_results)
+	// The open user turn. A dynamic array owns its buffer, so the one buffer is
+	// released once and each flushed turn gets its own copy that the message then
+	// owns.
+	pending_user := make([dynamic]json.Value, 0, 4, allocator)
+	defer delete(pending_user)
 
 	for message in messages {
 		switch message.Role {
@@ -108,10 +110,9 @@ anthropic_encode_messages :: proc(messages: []Provider_Message, allocator := con
 			// item has no representation here. Neither may be sent as a turn.
 			continue
 		case .User:
-			anthropic_flush_results(&result, &pending_results, allocator)
-			append(&result, json.Value(anthropic_text_message("user", message.Content, allocator)))
+			anthropic_user_add_text(&pending_user, message.Content, allocator)
 		case .Assistant:
-			anthropic_flush_results(&result, &pending_results, allocator)
+			anthropic_flush_user(&result, &pending_user, allocator)
 			// This API opens a conversation with a user turn. The only assistant
 			// turn that can come first is the checkpoint summary the harness
 			// carries, which is harness-authored context rather than something the
@@ -139,20 +140,40 @@ anthropic_encode_messages :: proc(messages: []Provider_Message, allocator := con
 		case .Tool:
 			block, ok := anthropic_tool_result_block(message, allocator)
 			if !ok { return nil, .Invalid_Message }
-			append(&pending_results, block)
+			append(&pending_user, block)
 		case .Invalid:
 			return nil, .Invalid_Message
 		}
 	}
-	anthropic_flush_results(&result, &pending_results, allocator)
+	anthropic_flush_user(&result, &pending_user, allocator)
 	return result, .None
 }
 
-// anthropic_flush_results closes the user turn that carries tool results. The
-// blocks are copied into the message, which owns them, and the buffer is reused.
 @(private)
-anthropic_flush_results :: proc(result: ^json.Array, pending: ^[dynamic]json.Value, allocator := context.allocator) {
+anthropic_user_add_text :: proc(pending: ^[dynamic]json.Value, text: string, allocator := context.allocator) {
+	if text == "" { return }
+	append(pending, json.Value(anthropic_text_block(text, allocator)))
+}
+
+// anthropic_flush_user closes the open user turn. The blocks are moved into the
+// message, which owns them, and the buffer is reused. One text block is emitted
+// as the plain string content this API has always accepted for a text turn.
+@(private)
+anthropic_flush_user :: proc(result: ^json.Array, pending: ^[dynamic]json.Value, allocator := context.allocator) {
 	if len(pending^) == 0 { return }
+	if len(pending^) == 1 {
+		if object, is_object := pending^[0].(json.Object); is_object {
+			block_type, is_text := object["type"].(json.String)
+			text, has_text := object["text"].(json.String)
+			if is_text && has_text && block_type == ANTHROPIC_BLOCK_TEXT {
+				message := anthropic_text_message("user", string(text), allocator)
+				json.destroy_value(pending^[0], allocator)
+				clear(pending)
+				append(result, message)
+				return
+			}
+		}
+	}
 	blocks := make(json.Array, len(pending^), allocator)
 	for value, i in pending^ { blocks[i] = value }
 	turn := make(json.Object, 2, allocator)

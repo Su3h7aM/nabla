@@ -133,7 +133,7 @@ test_build_request_replays_verbatim_response_output_in_order :: proc(t: ^testing
 		Name      = TOOL_SHELL_NAME,
 		Arguments = `{"command":"printf tool-ok","working_directory":null,"timeout_ms":null}`,
 	}
-	testing.expect(t, chat_session_feed_tool_calls(chat, source, calls))
+	testing.expect_value(t, chat_session_feed_tool_calls(chat, source, calls), Chat_Notice.None)
 
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
@@ -435,73 +435,78 @@ bound_of :: proc(object: json.Object, key: string) -> (value: i64, present: bool
 // A cached prefix only helps if the bytes the provider renders do not change
 // between requests. This rebuilds a request from an unchanged conversation and
 // requires the same bytes, then appends a turn and requires every earlier item to
-// be unchanged, for all three APIs.
+// be unchanged, for all three APIs. Each API gets its own conversation, because
+// appending a second user turn in a row is itself a normalization the encoders
+// are allowed to collapse.
 @(test)
 test_a_request_rebuilds_identically_and_only_appends :: proc(t: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
-	chat := &fixture.chat
-	chat.tools_enabled = true
-	chat.max_output_tokens = 1024
-	_test_accept(t, chat, "run printf ok")
-	call_seq := _test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			created_at_ms = 2_000,
-			payload = session.Tool_Call_Entry{call_id = "call_1", name = TOOL_SHELL_NAME, arguments = `{"command":"ls"}`},
-		},
-	)
-	_test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			created_at_ms = 2_001,
-			related_seq = call_seq,
-			payload = session.Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = `{"status":"exited"}`, origin = .Observed},
-		},
-	)
-	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_002, payload = session.Assistant_Entry{text = "done"}})
-	// A native Responses output replays verbatim, so it is the path most able to
-	// move bytes if the encoder is not stable.
-	_test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			created_at_ms = 2_003,
-			payload = session.Response_Entry {
-				output = `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Working.","annotations":[]}]},{"type":"function_call","id":"fc_1","call_id":"call_2","name":"shell","arguments":"{}"}]`,
-			},
-		},
-	)
-
-	for connection in ([?]ai.Provider_Connection {
+	connections := [?]ai.Provider_Connection {
 		{API = .OpenAI_Chat_Completions},
 		{API = .OpenAI_Responses},
 		{API = .Anthropic_Messages},
-	}) {
+	}
+	for connection in connections {
+		fixture: Chat_Test
+		chat_test_begin(t, &fixture, tool_loop_workspace(t))
+		chat := &fixture.chat
+		chat.tools_enabled = true
+		chat.max_output_tokens = 1024
+		_test_accept(t, chat, "run printf ok")
+		call_seq := _test_append(
+			t,
+			chat,
+			{
+				turn_no = chat.turn_no,
+				created_at_ms = 2_000,
+				payload = session.Tool_Call_Entry{call_id = "call_1", name = TOOL_SHELL_NAME, arguments = `{"command":"ls"}`},
+			},
+		)
+		_test_append(
+			t,
+			chat,
+			{
+				turn_no = chat.turn_no,
+				created_at_ms = 2_001,
+				related_seq = call_seq,
+				payload = session.Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = `{"status":"exited"}`, origin = .Observed},
+			},
+		)
+		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_002, payload = session.Assistant_Entry{text = "done"}})
+		// A native Responses output replays verbatim, so it is the path most able
+		// to move bytes if the encoder is not stable.
+		_test_append(
+			t,
+			chat,
+			{
+				turn_no = chat.turn_no,
+				created_at_ms = 2_003,
+				payload = session.Response_Entry {
+					output = `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Working.","annotations":[]}]},{"type":"function_call","id":"fc_1","call_id":"call_2","name":"shell","arguments":"{}"}]`,
+				},
+			},
+		)
+
 		first := encode_request_body(t, chat, connection)
-		defer delete(first)
 		second := encode_request_body(t, chat, connection)
-		defer delete(second)
 		testing.expectf(t, second == first, "an unchanged conversation must encode to the same bytes for %v", connection.API)
 
 		// A later turn grows the conversation. Everything already sent has to come
 		// back byte for byte, or the provider sees a different prefix and re-reads
 		// it whether or not it is cached.
-		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_003, payload = session.User_Entry{text = "and again", origin = .Prompt}})
+		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_004, payload = session.User_Entry{text = "and again", origin = .Prompt}})
 		grown := encode_request_body(t, chat, connection)
-		defer delete(grown)
 		before := encoded_items(t, first)
 		after := encoded_items(t, grown)
-		if !testing.expectf(t, len(after) > len(before), "the grown request should carry more items for %v", connection.API) { continue }
-		for item, i in before {
-			if !testing.expectf(t, after[i] == item, "item %d changed for %v", i, connection.API) { break }
+		if testing.expectf(t, len(after) > len(before), "the grown request should carry more items for %v", connection.API) {
+			for item, i in before {
+				if !testing.expectf(t, after[i] == item, "item %d changed for %v", i, connection.API) { break }
+			}
 		}
+
+		delete(first)
+		delete(second)
+		delete(grown)
+		chat_test_end(t, &fixture)
 	}
 }
 

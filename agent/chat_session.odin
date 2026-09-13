@@ -105,6 +105,10 @@ Chat_Session :: struct {
 	pending_response:            Chat_Response_Output,
 	pending_response_present:    bool,
 	pending_calls:               [dynamic]Chat_Tool_Call,
+	// pending_notice is why the running response could not be used. It is set
+	// while the response is still streaming and committed with it, so the
+	// explanation lands after the text it explains.
+	pending_notice:              Chat_Notice,
 	requests_made:               int, // model requests this turn; bounds the tool loop
 	calls_made:                  int, // tool executions this turn
 	active_failed:               bool,
@@ -300,6 +304,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat_cancel_reset()
 	chat_operation_retire(&chat.operation)
 	chat_pending_calls_clear(chat)
+	chat.pending_notice = .None
 	if chat.pending_response_present {
 		chat_response_output_destroy(&chat.pending_response, chat.allocator)
 		chat.pending_response_present = false

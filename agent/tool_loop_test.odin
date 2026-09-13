@@ -284,8 +284,7 @@ test_malformed_arguments_are_rejected_and_replayed :: proc(t: ^testing.T) {
 	}
 }
 @(test)
-test_unknown_tool_is_reported_not_run :: proc(t: ^testing.T) {
-	fixture: Chat_Test
+test_unknown_tool_is_reported_not_run :: proc(t: ^testing.T) {	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
@@ -550,3 +549,57 @@ test_usage_is_collected_per_request :: proc(t: ^testing.T) {
 // tool calls and results as typed content blocks. The harness projection is
 // provider-neutral, so the adapter is what has to shape it, and this checks the
 // two fit together.
+
+// A response the harness cannot use does not end the turn. Nothing runs, the
+// harness records why, and the state machine goes back to preparing a request so
+// the model can correct itself.
+@(test)
+test_unusable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "duplicate calls")
+
+	effect := _test_begin_request(t, chat)
+	chat_effect_destroy(&effect)
+	request_no, begin_err := session.request_begin(
+		chat.store,
+		chat.id,
+		{turn_no = chat.turn_no, purpose = .Response, provider = "p", model_requested = "m", api = "openai_chat_completions", config_json = "{}", input_json = "{}"},
+		session.now_ms(),
+	)
+	if !testing.expect_value(t, begin_err, nil) { return }
+
+	// Two calls under one id: the harness will not pick a winner, so it runs
+	// neither and says so.
+	source := chat_session_event_source(chat)
+	calls := []ai.Provider_Tool_Call {
+		{ID = "call_1", Name = TOOL_SHELL_NAME, Arguments = `{"command":"a","working_directory":null,"timeout_ms":null}`},
+		{ID = "call_1", Name = TOOL_SHELL_NAME, Arguments = `{"command":"b","working_directory":null,"timeout_ms":null}`},
+	}
+	testing.expect_value(t, chat_session_feed_tool_calls(chat, source, calls), Chat_Notice.Duplicate_Call_ID)
+	testing.expect(t, chat_session_note_notice(chat, source, .Duplicate_Call_ID))
+	testing.expect_value(t, chat.state, Chat_State.Preparing)
+
+	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
+	defer delete(usages)
+	chat_commit_response(chat, request_no, .Tool_Call, &usages)
+	chat_session_retire_operation(chat)
+
+	entries := _test_entries(t, chat)
+	defer session.entries_destroy(entries, context.allocator)
+	// The prompt and the harness explanation; no call and no result were recorded.
+	if !testing.expect_value(t, len(entries), 2) { return }
+	notice, is_notice := entries[1].payload.(session.User_Entry)
+	if !testing.expect(t, is_notice, "the harness explanation is conversation") { return }
+	testing.expect_value(t, notice.origin, session.User_Origin.Harness)
+	testing.expect(t, strings.contains(notice.text, "own id"), "the explanation names the defect")
+	testing.expect_value(t, chat.state, Chat_State.Preparing)
+
+	// The next step is another request, not a stop.
+	next := chat_session_advance(chat)
+	defer chat_effect_destroy(&next)
+	testing.expect_value(t, next.kind, Chat_Effect_Kind.Start_Request)
+}
