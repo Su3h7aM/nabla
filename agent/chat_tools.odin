@@ -27,12 +27,15 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 			if prep.status == .Rejected {
 				result = tool_argument_result(staged.id, &prep.error, chat.allocator)
 			} else {
+				if prep.status == .Repaired {
+					_observer_message(observer, .Notice, "a shell call was repaired before it ran: a raw control character was escaped")
+				}
 				dispatch := session.New_Entry {
 					turn_no = chat.turn_no,
 					request_no = chat.active_request,
 					created_at_ms = session.now_ms(),
 					related_seq = staged.seq,
-					payload = session.Tool_Dispatch_Entry{tool = staged.name, arguments = prep.effective},
+					payload = session.Tool_Dispatch_Entry{tool = staged.name, arguments = prep.effective, repair = prep.repair},
 				}
 				if _, dispatch_err := session.entry_append(chat.store, chat.id, dispatch); dispatch_err != nil {
 					chat_session_record_failure(chat, "the tool dispatch could not be recorded", dispatch_err)

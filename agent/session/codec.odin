@@ -46,6 +46,7 @@ Tool_Call_Wire :: struct {
 Tool_Dispatch_Wire :: struct {
 	tool:      string `json:"tool"`,
 	arguments: string `json:"arguments"`,
+	repair:    string `json:"repair"`,
 }
 
 @(private)
@@ -85,7 +86,8 @@ entry_payload_encode :: proc(payload: Entry_Payload, allocator := context.alloca
 		}
 		return json_encode(wire, allocator)
 	case Tool_Dispatch_Entry:
-		return json_encode(Tool_Dispatch_Wire{tool = value.tool, arguments = value.arguments}, allocator)
+		wire := Tool_Dispatch_Wire{tool = value.tool, arguments = value.arguments, repair = tool_repair_name(value.repair)}
+		return json_encode(wire, allocator)
 	case Tool_Result_Entry:
 		wire := Tool_Result_Wire {
 			outcome   = tool_outcome_name(value.outcome),
@@ -156,9 +158,16 @@ entry_payload_decode :: proc(kind: Entry_Kind, data: string, allocator: mem.Allo
 	case .Tool_Dispatch:
 		wire: Tool_Dispatch_Wire
 		if decode_err := json_decode(data, &wire, allocator); decode_err != nil { return nil, decode_err }
+		repair, repair_known := tool_repair_from_name(wire.repair)
+		// A dispatch written before repairs were recorded has no name at all, which
+		// means the same thing as the explicit "none".
+		if wire.repair == "" { repair, repair_known = .None, true }
+		delete(wire.repair, allocator)
+		vocabulary_ok = repair_known
 		payload = Tool_Dispatch_Entry {
 			tool      = wire.tool,
 			arguments = wire.arguments,
+			repair    = repair,
 		}
 	case .Tool_Result:
 		wire: Tool_Result_Wire

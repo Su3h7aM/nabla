@@ -4,6 +4,8 @@ package agent
 import "core:encoding/json"
 import "core:testing"
 
+import "nabla:agent/session"
+
 @(test)
 test_shell_parameters_schema_matches_parser :: proc(t: ^testing.T) {
 	value, parse_err := json.parse_string(TOOL_SHELL_PARAMETERS_JSON, .JSON, true, context.temp_allocator)
@@ -119,13 +121,13 @@ test_shell_result_json_shape :: proc(t: ^testing.T) {
 test_shell_prepare_repairs_control_bytes_only :: proc(t: ^testing.T) {
 	// A raw newline inside the command string is the one defect a repair is
 	// forced to resolve, and the decoded command keeps the exact byte.
-	repaired, repaired_ok := tool_shell_parse_args(
-		"{\"command\":\"printf a\nb\",\"working_directory\":null,\"timeout_ms\":null}",
-		context.allocator,
-	)
-	defer tool_shell_args_destroy(&repaired, context.allocator)
-	if !testing.expect(t, repaired_ok, "a control byte in a string is a forced repair") { return }
-	testing.expect_value(t, repaired.command, "printf a\nb")
+	raw := "{\"command\":\"printf a\nb\",\"working_directory\":null,\"timeout_ms\":null}"
+	prep := tool_shell_prepare(raw, context.allocator)
+	defer tool_preparation_destroy(&prep, context.allocator)
+	if !testing.expect_value(t, prep.status, Tool_Preparation_Status.Repaired) { return }
+	testing.expect_value(t, prep.repair, session.Tool_Repair.Escaped_Control_Characters)
+	testing.expect_value(t, prep.args.command, "printf a\nb")
+	testing.expect(t, prep.effective != raw, "the recorded arguments are the repaired bytes")
 
 	// Everything else is reported, never guessed at.
 	rejects := []string {
@@ -134,10 +136,10 @@ test_shell_prepare_repairs_control_bytes_only :: proc(t: ^testing.T) {
 		`{"command":"a","working_directory":null,"timeout_ms":null`,
 		`{"command":"a","command":"b","working_directory":null,"timeout_ms":null}`,
 	}
-	for raw in rejects {
-		args, ok := tool_shell_parse_args(raw, context.allocator)
+	for reject in rejects {
+		args, ok := tool_shell_parse_args(reject, context.allocator)
 		tool_shell_args_destroy(&args, context.allocator)
-		testing.expectf(t, !ok, "%s must not be repaired", raw)
+		testing.expectf(t, !ok, "%s must not be repaired", reject)
 	}
 }
 

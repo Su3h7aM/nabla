@@ -90,6 +90,32 @@ user_origin_from_name :: proc(name: string) -> (User_Origin, bool) {
 	return .Prompt, false
 }
 
+// Tool_Repair is what the harness had to change to make a proposed call usable.
+// It is recorded beside the arguments the call actually ran with, so a reader can
+// tell a repaired call from an untouched one without diffing the proposal. None
+// means nothing was changed.
+Tool_Repair :: enum {
+	None,
+	Escaped_Control_Characters,
+}
+
+@(private)
+tool_repair_names := [Tool_Repair]string {
+	.None                       = "none",
+	.Escaped_Control_Characters = "escaped_control_characters",
+}
+
+tool_repair_name :: proc(repair: Tool_Repair) -> string {
+	return tool_repair_names[repair]
+}
+
+tool_repair_from_name :: proc(name: string) -> (Tool_Repair, bool) {
+	for repair in Tool_Repair {
+		if tool_repair_names[repair] == name { return repair, true }
+	}
+	return .None, false
+}
+
 // Tool_Outcome is what the harness observed when it handled a tool call. It is
 // not a judgement about the model: a nonzero exit is a result, not a mistake.
 Tool_Outcome :: enum {
@@ -242,11 +268,12 @@ Tool_Call_Entry :: struct {
 // Tool_Dispatch_Entry is the harness committing to run a call. It is written
 // before the external work begins, so a dispatch with no result means the
 // outcome is unknown rather than "did not run". arguments is the argument JSON
-// the call actually ran with: the proposal unchanged, or the repaired bytes when
-// a deterministic repair was applied.
+// the call actually ran with, and repair names what had to change for it to be
+// usable, if anything.
 Tool_Dispatch_Entry :: struct {
 	tool:      string,
 	arguments: string,
+	repair:    Tool_Repair,
 }
 
 // Tool_Result_Entry is what the harness observed, together with the exact text

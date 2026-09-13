@@ -9,6 +9,7 @@ import linux "core:sys/linux"
 import "core:time"
 import "core:unicode/utf8"
 
+import "nabla:agent/session"
 import "nabla:ai"
 
 TOOL_SHELL_NAME :: "shell"
@@ -217,6 +218,9 @@ Tool_Preparation_Status :: enum {
 
 Tool_Preparation :: struct {
 	status:    Tool_Preparation_Status,
+	// repair names what had to change for the call to be usable. It is set in
+	// exactly the case where status is .Repaired.
+	repair:    session.Tool_Repair,
 	args:      Tool_Shell_Args,
 	effective: string, // owned; the argument JSON the call runs with
 	error:     Tool_Argument_Error,
@@ -238,6 +242,7 @@ tool_shell_prepare :: proc(raw: string, allocator := context.allocator) -> (prep
 	prep.status = .Rejected
 	prep.error = tool_shell_validate(raw, allocator)
 	effective := ""
+	repair: session.Tool_Repair
 	if prep.error.kind == .None {
 		prep.status = .Valid
 		effective = strings.clone(raw, allocator)
@@ -252,6 +257,7 @@ tool_shell_prepare :: proc(raw: string, allocator := context.allocator) -> (prep
 		tool_argument_error_destroy(&prep.error, allocator)
 		prep.error = {}
 		prep.status = .Repaired
+		repair = .Escaped_Control_Characters
 		effective = repaired
 	}
 	prep.effective = effective
@@ -276,6 +282,7 @@ tool_shell_prepare :: proc(raw: string, allocator := context.allocator) -> (prep
 		return prep
 	}
 	prep.args = args
+	prep.repair = repair
 	return prep
 }
 

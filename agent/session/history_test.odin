@@ -478,7 +478,7 @@ test_entry_payloads_round_trip :: proc(t: ^testing.T) {
 		Reasoning_Entry{id = "reason_1", encrypted = "opaque"},
 		Response_Entry{output = `[{"type":"message","id":"msg_1"}]`},
 		Tool_Call_Entry{call_id = "call_1", item_id = "item_1", name = "shell", arguments = `{"command":"ls"}`},
-		Tool_Dispatch_Entry{tool = "shell", arguments = `{"command":"ls","timeout_ms":30000}`},
+		Tool_Dispatch_Entry{tool = "shell", arguments = `{"command":"ls","timeout_ms":30000}`, repair = .Escaped_Control_Characters},
 		Tool_Result_Entry{outcome = .Exited, exit_code = 2, error = "", content = `{"status":"exited"}`, origin = .Observed},
 		Tool_Result_Entry{outcome = .Unknown, content = `{"status":"unknown"}`, origin = .Recovered},
 		Checkpoint_Entry{summary = "so far", covered_seq = Seq(4), previous_seq = Seq(2)},
@@ -496,6 +496,18 @@ test_entry_payloads_round_trip :: proc(t: ^testing.T) {
 		testing.expect_value(t, string(again), string(encoded))
 		entry_payload_destroy(&decoded, context.allocator)
 	}
+}
+
+// A dispatch recorded before repairs were named has no repair field, which means
+// the same thing as the explicit "none". Reading one cannot be a corruption.
+@(test)
+test_a_dispatch_without_a_repair_still_decodes :: proc(t: ^testing.T) {
+	decoded, err := entry_payload_decode(.Tool_Dispatch, `{"tool":"shell","arguments":"{}"}`, context.allocator)
+	_expect_ok(t, err)
+	defer entry_payload_destroy(&decoded, context.allocator)
+	dispatch, is_dispatch := decoded.(Tool_Dispatch_Entry)
+	if !testing.expect(t, is_dispatch, "the payload is a dispatch") { return }
+	testing.expect_value(t, dispatch.repair, Tool_Repair.None)
 }
 
 @(test)
