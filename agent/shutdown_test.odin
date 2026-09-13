@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -290,7 +291,10 @@ test_shell_spawn_is_safe_with_running_threads :: proc(t: ^testing.T) {
 	for i in 0 ..< len(spinners) {
 		spinners[i] = Shell_Spin {
 			stop      = &stop,
-			allocator = context.allocator,
+			// The spinner threads run beside the test thread, so they cannot use the
+			// allocator the test runner installs: it is per-task and not safe to share.
+			// The heap allocator is the one they would contend on in a real program.
+			allocator = runtime.heap_allocator(),
 		}
 		threads[i] = test_thread_start(shell_spin_serve, &spinners[i], "svan-spin")
 		if threads[i] == nil {
