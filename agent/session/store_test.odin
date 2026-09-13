@@ -281,8 +281,25 @@ test_mutations_require_the_claim :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_set_title_and_model_then_touch :: proc(t: ^testing.T) {
+test_a_title_is_derived_once :: proc(t: ^testing.T) {
 	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session := _open_claimed_session(t, &store)
+	defer session_destroy(&session)
+
+	_expect_ok(t, session_set_title_if_untitled(&store, session.id, "first prompt"))
+	_expect_ok(t, session_set_title_if_untitled(&store, session.id, "second prompt"))
+
+	loaded, load_err := session_load(&store, session.id)
+	_expect_ok(t, load_err)
+	defer session_destroy(&loaded)
+	testing.expect_value(t, loaded.title, "first prompt")
+}
+
+@(test)
+test_set_title_and_model_then_touch :: proc(t: ^testing.T) {store: Store
 	directory := _open_store(t, &store)
 	defer _close_store(&store, directory)
 

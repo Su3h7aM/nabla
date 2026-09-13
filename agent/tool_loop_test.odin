@@ -370,6 +370,34 @@ test_tool_loop_budget_exhausts :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_the_first_prompt_names_the_session :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+
+	// The title is the first line of the prompt that opened the session.
+	_test_accept(t, chat, "explain the parser\nand then stop")
+	header, header_err := session.session_load(chat.store, chat.id, context.allocator)
+	if header_err != nil { testing.fail_now(t, "session_load failed") }
+	testing.expect_value(t, header.title, "explain the parser")
+	session.session_destroy(&header)
+
+	effect := _test_begin_request(t, chat)
+	chat_effect_destroy(&effect)
+	testing.expect(t, chat_session_feed_completion(chat, chat_session_event_source(chat)))
+	finish := _test_settle(t, chat)
+	chat_effect_destroy(&finish)
+
+	// A later turn leaves the name alone.
+	_test_accept(t, chat, "something else")
+	reloaded, reload_err := session.session_load(chat.store, chat.id, context.allocator)
+	if reload_err != nil { testing.fail_now(t, "session_load failed") }
+	defer session.session_destroy(&reloaded)
+	testing.expect_value(t, reloaded.title, "explain the parser")
+}
+
+@(test)
 test_usage_is_collected_per_request :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))

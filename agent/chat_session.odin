@@ -2,6 +2,7 @@ package agent
 
 import "core:mem"
 import "core:strings"
+import "core:unicode/utf8"
 
 import "nabla:agent/session"
 import "nabla:ai"
@@ -183,6 +184,28 @@ chat_clone_string :: proc(value: string, allocator: mem.Allocator) -> string {
 // chat_session_record_failure stops the turn because a durable write failed.
 // The turn is not allowed to continue from memory: the record did not land, and
 // carrying on would let the conversation diverge from what was stored.
+// CHAT_TITLE_MAX_BYTES bounds the derived title. It is a listing line, not a
+// summary: enough to recognise a session and no more.
+CHAT_TITLE_MAX_BYTES :: 80
+
+// chat_title_from_prompt derives a session title from the prompt that opened it:
+// the first line, trimmed and cut to a whole rune. The result is owned by
+// allocator.
+chat_title_from_prompt :: proc(prompt: string, allocator := context.allocator) -> string {
+	line := prompt
+	if newline := strings.index_byte(line, '\n'); newline >= 0 { line = line[:newline] }
+	line = strings.trim_space(line)
+	if len(line) > CHAT_TITLE_MAX_BYTES {
+		line = line[:CHAT_TITLE_MAX_BYTES]
+		for len(line) > 0 {
+			_, width := utf8.decode_last_rune_in_string(line)
+			if width > 0 { break }
+			line = line[:len(line) - 1]
+		}
+	}
+	return strings.clone(line, allocator)
+}
+
 chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: session.Error) {
 	local := err
 	detail := session.error_detail(&local)
@@ -200,13 +223,24 @@ chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: sess
 // chat_session_accept_user admits a prompt: it opens a turn and records the
 // prompt as that turn's first entry before any request is made.
 chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> Chat_Accept {
-	if chat.state != .Idle || chat.storage_failed { return .Busy }
+	if chat.storage_failed { return .Storage_Failed }
+	if chat.state != .Idle { return .Busy }
 
 	// The header records which model the session last ran with, so a later
 	// continuation starts from it rather than from nothing.
 	if chat.provider_id != "" && chat.model_id != "" {
 		if model_err := session.session_set_model(chat.store, chat.id, chat.provider_id, chat.model_id); model_err != nil {
 			chat_session_record_failure(chat, "the session model could not be recorded", model_err)
+			return .Storage_Failed
+		}
+	}
+	// The first prompt names the session, so a listing says what each session was
+	// about without asking the user to name it.
+	if chat.next_turn_id == 1 {
+		title := chat_title_from_prompt(text, chat.allocator)
+		defer delete(title, chat.allocator)
+		if title_err := session.session_set_title_if_untitled(chat.store, chat.id, title); title_err != nil {
+			chat_session_record_failure(chat, "the session title could not be recorded", title_err)
 			return .Storage_Failed
 		}
 	}

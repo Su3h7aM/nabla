@@ -319,6 +319,19 @@ session_set_title :: proc(store: ^Store, id: Session_Id, title: string) -> Error
 	return nil
 }
 
+// session_set_title_if_untitled names a claimed session when it has no title
+// yet. It never overwrites a title, so the first prompt names a session and a
+// later one leaves it alone.
+session_set_title_if_untitled :: proc(store: ^Store, id: Session_Id, title: string) -> Error {
+	require_claim(store, id) or_return
+	if title == "" { return nil }
+	args := [?]db.Value{db.Value(title), db.Value(string(id))}
+	if err := db.exec(&store.conn, "UPDATE sessions SET title = ? WHERE id = ? AND title = ''", args[:]); err != nil {
+		return storage_error("name session", err)
+	}
+	return nil
+}
+
 // session_set_model records the provider and model a later turn should start
 // from. It is the session's default, not evidence about any earlier request:
 // each request keeps its own record of what it actually used.
