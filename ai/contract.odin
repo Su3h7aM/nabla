@@ -49,6 +49,14 @@ Provider_Message :: struct {
 	Reasoning_ID:        string, // borrowed; set on .Reasoning, the output-item id,
 	Reasoning_Encrypted: string, // borrowed; set on .Reasoning when the endpoint supplied it,
 	Cache_Breakpoint:    bool, // when true, emit prompt_cache_breakpoint explicit on this message,
+	// Verbatim_Items is a JSON array of Responses input items reproduced exactly
+	// as the endpoint produced them, emitted at this message's position. It is
+	// the replay slot: fields the harness does not model, such as assistant
+	// phase, message status, reasoning summaries, and annotations, survive
+	// because nothing here is re-derived. When set, the other fields are ignored
+	// and the Responses encoder splices the array in place. Only the Responses
+	// API accepts it; the harness sets it only for that API.
+	Verbatim_Items:      string, // borrowed until operation retirement,
 }
 
 Prompt_Cache_Mode :: enum {
@@ -68,6 +76,13 @@ Provider_Request :: struct {
 	API:                            API_Kind,
 	Model_Present:                  bool,
 	Model:                          string,
+	// Instructions is the instruction content that precedes the conversation.
+	// It is not a message: a conversation never contains an instruction turn,
+	// and the prefix a later request reuses begins with it. Responses takes it
+	// as the top-level `instructions` field; Chat Completions has no such field
+	// and takes it as a leading system message.
+	Instructions_Present:           bool,
+	Instructions:                   string, // borrowed until operation retirement,
 	Messages_Present:               bool,
 	Messages:                       []Provider_Message,
 	Tools:                          []Provider_Tool_Def, // borrowed; frozen for the whole turn,
@@ -83,11 +98,12 @@ Provider_Request :: struct {
 	Prompt_Cache_Options:           Prompt_Cache_Options,
 	Prompt_Cache_Retention_Present: bool,
 	Prompt_Cache_Retention:         string, // borrowed; deprecated, use options TTL,
-	// Raw_Responses holds verbatim Responses output arrays, oldest first,
-	// borrowed until operation retirement. The Responses encoder replays them
-	// in order before the projected messages, so a request carries exactly
-	// what the endpoint sent.
-	Raw_Responses:                  []string,
+	// Store_Response asks the endpoint to keep or discard its own copy of the
+	// response. The harness replays history itself, so it asks the endpoint not
+	// to keep a second copy; absent leaves the endpoint default. Both OpenAI
+	// APIs accept the field.
+	Store_Response_Present:         bool,
+	Store_Response:                 bool,
 }
 
 Provider_Request_Error :: enum {
@@ -95,6 +111,7 @@ Provider_Request_Error :: enum {
 	Unsupported_API,
 	Missing_Model,
 	Missing_Messages,
+	Invalid_Instructions,
 	Invalid_Message,
 	Invalid_Tools,
 	Invalid_Tool_Call,
@@ -108,6 +125,7 @@ Provider_Request_Error :: enum {
 Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request_Error {
 	if request.API != .OpenAI_Chat_Completions && request.API != .OpenAI_Responses { return .Unsupported_API }
 	if !request.Model_Present || request.Model == "" { return .Missing_Model }
+	if request.Instructions_Present && request.Instructions == "" { return .Invalid_Instructions }
 	if !request.Messages_Present || len(request.Messages) == 0 { return .Missing_Messages }
 	if request.Max_Output_Tokens_Present && request.Max_Output_Tokens <= 0 { return .Invalid_Max_Output_Tokens }
 	if request.Reasoning_Effort_Present && request.Reasoning_Effort == "" { return .Invalid_Reasoning_Effort }
@@ -121,6 +139,14 @@ Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request
 	   request.Prompt_Cache_Retention != "in_memory" &&
 	   request.Prompt_Cache_Retention != "24h" { return .Invalid_Prompt_Cache_Retention }
 	for message in request.Messages {
+		// A verbatim message is one opaque replay array, not a role plus content,
+		// so the role checks below do not apply to it. Only the Responses API
+		// has native items to replay; asking another API to emit them would send
+		// a message with no role and no content.
+		if message.Verbatim_Items != "" {
+			if request.API != .OpenAI_Responses { return .Invalid_Message }
+			continue
+		}
 		if message.Role == .Invalid { return .Invalid_Message }
 		#partial switch message.Role {
 		case .Assistant:

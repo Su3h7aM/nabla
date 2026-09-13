@@ -130,12 +130,13 @@ test_build_compact_request_has_no_tools :: proc(t: ^testing.T) {
 	testing.expect(t, prep.request.Max_Output_Tokens_Present)
 	testing.expect_value(t, prep.request.Max_Output_Tokens, CHAT_COMPACT_MAX_OUTPUT)
 	testing.expect(t, !prep.request.Reasoning_Effort_Present)
-	// Instructions and the span being summarized: a compaction request carries no
+	// The summary instructions travel in the instruction lane, and the span
+	// being summarized is the whole conversation: a compaction request carries no
 	// agent prompt and no tools, because a summary must be text.
-	if !testing.expect_value(t, len(prep.request.Messages), 2) { return }
-	testing.expect_value(t, prep.request.Messages[0].Role, ai.Provider_Role.System)
-	testing.expect_value(t, prep.request.Messages[0].Content, CHAT_COMPACT_INSTRUCTIONS)
-	testing.expect_value(t, prep.request.Messages[1].Content, "first")
+	testing.expect(t, prep.request.Instructions_Present)
+	testing.expect_value(t, prep.request.Instructions, CHAT_COMPACT_INSTRUCTIONS)
+	if !testing.expect_value(t, len(prep.request.Messages), 1) { return }
+	testing.expect_value(t, prep.request.Messages[0].Content, "first")
 }
 
 @(test)

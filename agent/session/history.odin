@@ -8,6 +8,13 @@ import "nabla:db"
 
 // Usage is what a provider reported for one request. A nil field means the
 // provider did not report that number; it does not mean zero.
+//
+// input is total input tokens, the number a cache-read share is measured
+// against, so it includes every token that was read from or written to the
+// cache. OpenAI reports it that way already. A provider that reports uncached
+// input on its own, as Anthropic does, must add its read and write counts before
+// the value is stored, or the hit rate would be measured against too small a
+// denominator.
 Usage :: struct {
 	input:       Maybe(i64),
 	output:      Maybe(i64),
@@ -55,12 +62,19 @@ cache_totals_add :: proc(totals: ^Cache_Totals, usage: Usage) {
 }
 
 // cache_hit_rate is the token-weighted share of reported input read from the
-// provider's cache: cache-read tokens over all reported input tokens. A
-// workload whose turns are mostly new input cannot reach a high rate no
-// matter how stable its prefixes are, so callers pair this with the suffix
-// size before treating it as a regression signal.
+// provider's cache: cache-read tokens over all reported input tokens. It counts
+// a session, not a request, because one request's ratio says more about where it
+// sits in the conversation than about how much the prefix was reused. A
+// workload whose turns are mostly new input cannot reach a high rate no matter
+// how stable its prefixes are, so callers pair this with the suffix size before
+// treating it as a regression signal.
+//
+// A read count larger than the total is not a rate, so it is reported as
+// unmeasured rather than as a number over 100%: that shape means an adapter
+// recorded uncached input without normalizing it.
 cache_hit_rate :: proc(totals: Cache_Totals) -> (rate: f64, measured: bool) {
 	if totals.input_requests == 0 || totals.cache_read_requests == 0 || totals.input <= 0 { return 0, false }
+	if totals.cache_read > totals.input { return 0, false }
 	return f64(totals.cache_read) / f64(totals.input), true
 }
 

@@ -204,7 +204,7 @@ chat_finish_compaction :: proc(chat: ^Chat_Session, request_no: session.Request_
 chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, prep: ^Chat_Request_Prep) -> bool {
 	session.context_destroy(&prep.history, chat.allocator)
 	prep.history = {}
-	chat_request_storage_destroy(prep)
+	chat_request_storage_destroy(prep, chat.allocator)
 
 	ctx, context_err := session.context_load(chat.store, chat.id, chat.allocator)
 	if context_err != nil {
@@ -217,16 +217,16 @@ chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connectio
 }
 
 @(private)
-chat_request_storage_destroy :: proc(prep: ^Chat_Request_Prep) {
+chat_request_storage_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Allocator) {
 	for &slot in prep.calls { delete(slot) }
 	delete(prep.calls)
 	delete(prep.tools)
 	delete(prep.wire)
-	delete(prep.raw_responses)
+	delete(prep.cache_key, allocator)
 	prep.calls = nil
 	prep.tools = nil
 	prep.wire = nil
-	prep.raw_responses = nil
+	prep.cache_key = ""
 }
 
 // chat_command_compact runs one manual compaction at a settled turn or a

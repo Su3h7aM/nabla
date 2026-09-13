@@ -425,6 +425,13 @@ test_cache_totals_sum_finished_requests_and_skip_running :: proc(t: ^testing.T) 
 	empty := Cache_Totals{}
 	_, empty_measured := cache_hit_rate(empty)
 	testing.expect(t, !empty_measured, "unknown usage must stay unknown, not zero")
+
+	// A read count larger than the total is not a rate: it means an adapter
+	// recorded uncached input without normalizing it, so the number is refused
+	// rather than shown above 100%.
+	inconsistent := Cache_Totals{input = 10, cache_read = 20, input_requests = 1, cache_read_requests = 1}
+	_, inconsistent_measured := cache_hit_rate(inconsistent)
+	testing.expect(t, !inconsistent_measured)
 }
 
 @(test)

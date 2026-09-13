@@ -11,19 +11,28 @@ openai_responses_encode_request :: proc(request: Provider_Request, allocator := 
 	}
 	object := make(json.Object, 8, allocator)
 	object[strings.clone("model", allocator)] = json.String(strings.clone(request.Model, allocator))
-	input := make(json.Array, 0, len(request.Messages), allocator)
-	// Verbatim outputs replay first, in commit order: each output array holds
-	// the endpoint's own items -- phase, status, summaries, unknown types --
-	// so the request carries exactly what earlier responses sent.
-	for raw in request.Raw_Responses {
-		items, parse_err := json.parse_string(raw, .JSON, true, allocator)
-		if parse_err != nil { return "", .Invalid_Message }
-		defer json.destroy_value(items, allocator)
-		array, is_array := items.(json.Array)
-		if !is_array { return "", .Invalid_Message }
-		for item in array { append(&input, json.Value(json.clone_value(item, allocator))) }
+	if request.Instructions_Present {
+		object[strings.clone("instructions", allocator)] = json.String(strings.clone(request.Instructions, allocator))
 	}
+	input := make(json.Array, 0, len(request.Messages), allocator)
 	for message in request.Messages {
+		// A verbatim message carries the endpoint's own items. They are emitted
+		// here, where they sit among the projected messages, so the request keeps
+		// the conversation's real order. Re-deriving them would lose phase,
+		// status, annotations, and summaries, and would send assistant content
+		// twice.
+		if message.Verbatim_Items != "" {
+			items, parse_err := json.parse_string(message.Verbatim_Items, .JSON, true, allocator)
+			if parse_err != nil { return "", .Invalid_Message }
+			array, is_array := items.(json.Array)
+			if !is_array {
+				json.destroy_value(items, allocator)
+				return "", .Invalid_Message
+			}
+			for item in array { append(&input, json.Value(json.clone_value(item, allocator))) }
+			json.destroy_value(items, allocator)
+			continue
+		}
 		if message.Role == .Reasoning {
 			// A reasoning item is replayable only when the endpoint returned
 			// encrypted content: without it the item carries nothing the
@@ -114,6 +123,7 @@ openai_responses_encode_request :: proc(request: Provider_Request, allocator := 
 		object[strings.clone("prompt_cache_options", allocator)] = json.Value(options)
 	}
 	if request.Prompt_Cache_Retention_Present { object[strings.clone("prompt_cache_retention", allocator)] = json.String(strings.clone(request.Prompt_Cache_Retention, allocator)) }
+	if request.Store_Response_Present { object[strings.clone("store", allocator)] = json.Boolean(request.Store_Response) }
 	object[strings.clone("stream", allocator)] = json.Boolean(true)
 	value := json.Value(object)
 	result, err := json.unparse(value, allocator = allocator)
@@ -151,13 +161,16 @@ openai_responses_incomplete_reason :: proc(reason: string) -> Provider_Finish_Re
 }
 
 // openai_responses_clone_output clones the terminal response's output array
-// verbatim for the replay record. A missing output key replays as empty; ok
-// is false only when a present value cannot be stringified. The caller owns
-// the result on success.
+// verbatim for the replay record. A missing, null, or empty array replays as
+// empty: there are no items to replay, and the harness falls back to its own
+// projection for that response rather than sending an empty native record. ok
+// is false only when a present value cannot be stringified. The caller owns the
+// result on success.
 openai_responses_clone_output :: proc(response: json.Object, allocator := context.allocator) -> (cloned: string, ok: bool) {
 	raw_output_value, output_present := response["output"]
 	if !output_present { return "", true }
 	if _, is_null := raw_output_value.(json.Null); is_null { return "", true }
+	if array, is_array := raw_output_value.(json.Array); is_array && len(array) == 0 { return "", true }
 	text, clone_err := json.unparse(raw_output_value, allocator = allocator)
 	if clone_err != nil { return "", false }
 	return text, true
@@ -296,26 +309,24 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 	switch event_type {
 	case "response.completed":
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "duplicate response completion") }
-		// The terminal output array is the replay record. Clone it before
-		// finalizing calls: finalize can fail, and the failure path must not
-		// leak the clone. When there is no output key the replay is empty,
-		// not an error -- a completed response may carry usage alone.
+		// The terminal output array is the replay record, so clone it before
+		// finalizing calls: a finalize failure returns here and must release it.
+		// An absent or empty array is not an error; a completed response may
+		// carry usage alone.
 		raw_output, output_ok := openai_responses_clone_output(response, state.Allocator)
 		if !output_ok { return provider_stream_fail(state, .Invalid_Data, "response output is invalid") }
-		defer if !output_ok { delete(raw_output, state.Allocator) }
 		calls: []Provider_Tool_Call
 		if provider_tool_fragments_present(state) {
-			finalized: []Provider_Tool_Call
-			finalized_ok: bool
-			finalized, finalized_ok = provider_tool_finalize(state, state.Allocator)
+			finalized, finalized_ok := provider_tool_finalize(state, state.Allocator)
 			if !finalized_ok {
-				output_ok = false
+				delete(raw_output, state.Allocator)
 				return provider_stream_fail(state, .Invalid_Data, "tool calls are invalid")
 			}
 			calls = finalized
 		}
 		if usage_present { provider_stream_push(state, Provider_Usage_Event(usage)) }
 		state^.Phase = .Completed
+		// The push takes ownership of raw_output on every path.
 		if calls != nil {
 			provider_stream_push(
 				state,
@@ -326,7 +337,6 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 					Raw_Output = raw_output,
 				},
 			)
-			output_ok = true
 		} else {
 			provider_stream_push(
 				state,
@@ -336,7 +346,6 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 					Raw_Output = raw_output,
 				},
 			)
-			output_ok = true
 		}
 		return .None
 	case "response.incomplete":

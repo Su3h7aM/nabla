@@ -196,6 +196,8 @@ provider_request_error_text :: proc(err: Provider_Request_Error) -> string {
 		return "model is required"
 	case .Missing_Messages:
 		return "at least one message is required"
+	case .Invalid_Instructions:
+		return "instructions must be a non-empty string when present"
 	case .Invalid_Message:
 		return "message role/content is invalid"
 	case .Invalid_Tools:

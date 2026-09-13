@@ -165,9 +165,63 @@ test_responses_encode_effort_and_omission :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Provider_Request_Error.Invalid_Reasoning_Effort)
 }
 
+// The instruction lane is one concept with two encodings: Responses has a
+// top-level field for it, Chat Completions has to make it the leading message.
+// A conversation never carries it as a turn, so the harness can stop pretending
+// a system message is part of the history.
 @(test)
-test_chat_encode_effort :: proc(t: ^testing.T) {
+test_instructions_encode_per_api :: proc(t: ^testing.T) {
 	messages := make([]Provider_Message, 1, context.temp_allocator)
+	messages[0] = Provider_Message {
+		Role    = .User,
+		Content = "Hi.",
+	}
+	request := Provider_Request {
+		API                  = .OpenAI_Responses,
+		Model_Present        = true,
+		Model                = "gpt-5.6",
+		Instructions_Present = true,
+		Instructions         = "Be brief.",
+		Messages_Present     = true,
+		Messages             = messages,
+	}
+
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	testing.expect_value(t, err, Provider_Request_Error.None)
+	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
+	testing.expect_value(t, parse_err, nil)
+	object, object_ok := value.(json.Object)
+	if testing.expect(t, object_ok) {
+		instructions, _, _ := openai_value_string(object, "instructions")
+		testing.expect_value(t, instructions, "Be brief.")
+		input, input_ok := object["input"].(json.Array)
+		// The lane is not repeated inside the input array.
+		testing.expect(t, input_ok && len(input) == 1)
+	}
+	json.destroy_value(value, context.temp_allocator)
+
+	request.API = .OpenAI_Chat_Completions
+	body, err = Provider_Encode_Request(request, context.temp_allocator)
+	testing.expect_value(t, err, Provider_Request_Error.None)
+	value, parse_err = json.parse_string(body, .JSON, true, context.temp_allocator)
+	testing.expect_value(t, parse_err, nil)
+	defer json.destroy_value(value, context.temp_allocator)
+	object, object_ok = value.(json.Object)
+	if !testing.expect(t, object_ok) { return }
+	_, inline_instructions := object["instructions"]
+	testing.expect(t, !inline_instructions)
+	messages_array, messages_ok := object["messages"].(json.Array)
+	if !testing.expect(t, messages_ok && len(messages_array) == 2) { return }
+	first, first_ok := messages_array[0].(json.Object)
+	if !testing.expect(t, first_ok) { return }
+	role, _, _ := openai_value_string(first, "role")
+	testing.expect_value(t, role, "system")
+	content, _, _ := openai_value_string(first, "content")
+	testing.expect_value(t, content, "Be brief.")
+}
+
+@(test)
+test_chat_encode_effort :: proc(t: ^testing.T) {	messages := make([]Provider_Message, 1, context.temp_allocator)
 	messages[0] = Provider_Message {
 		Role    = .User,
 		Content = "Hi.",
@@ -300,7 +354,9 @@ test_responses_stream_reasoning_replays_with_tools :: proc(t: ^testing.T) {
 	testing.expect_value(t, completed.Reason, Provider_Finish_Reason.Tool_Call)
 	testing.expect_value(t, len(completed.Tool_Calls), 1)
 	testing.expect_value(t, completed.Tool_Calls[0].ID, "call_1")
-	testing.expect_value(t, completed.Raw_Output, "[]")
+	// An empty output array has nothing to replay, so it is reported as no
+	// record at all and the harness falls back to its own projection.
+	testing.expect_value(t, completed.Raw_Output, "")
 	destroy_events(events)
 }
 

@@ -63,10 +63,9 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 			_observer_assistant_text(runtime.observer, value.Text)
 		}
 	case ai.Provider_Reasoning_Event:
-		// Reasoning never displays and needs no staging: the verbatim output
-		// array staged below is the replay record. A rejected feed is a stale
-		// event, not a turn failure.
-		chat_session_accepts_event(runtime.chat, runtime.source)
+		// Reasoning never displays, and it needs no staging: on the Responses
+		// API the verbatim output array is the replay record, and Chat
+		// Completions has no representation for it at all.
 	case ai.Provider_Completed_Event:
 		// One response feeds one path: tool handoff when the provider
 		// assembled calls, plain completion on stop, failure otherwise.
@@ -114,18 +113,18 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 // --- request assembly --------------------------------------------------------
 
 // Chat_Request_Prep is one request built from committed history, together with
-// the storage the request borrows. It owns the context it was built from.
-// raw_responses holds the verbatim Responses output arrays committed alongside
-// the active context, oldest first. The encoder replays them in order, so a
-// later request carries exactly what the endpoint sent.
+// the storage the request borrows. It owns the context it was built from. The
+// wire is one ordered list: a verbatim Responses output is a message in it, at
+// the position the response occupies in the conversation, so replay order and
+// projection order are the same order.
 Chat_Request_Prep :: struct {
-	history:       session.Context,
-	request:        ai.Provider_Request,
-	wire:          [dynamic]ai.Provider_Message,
-	tools:         [dynamic]ai.Provider_Tool_Def,
-	calls:         [dynamic][dynamic]ai.Provider_Tool_Call,
-	raw_responses: [dynamic]string,
-	estimate:       int,
+	history:   session.Context,
+	request:   ai.Provider_Request,
+	wire:      [dynamic]ai.Provider_Message,
+	tools:     [dynamic]ai.Provider_Tool_Def,
+	calls:     [dynamic][dynamic]ai.Provider_Tool_Call,
+	cache_key: string, // owned; request.Prompt_Cache_Key borrows it when present,
+	estimate:  int,
 }
 
 chat_request_prep_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Allocator) {
@@ -134,7 +133,7 @@ chat_request_prep_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Alloc
 	delete(prep.calls)
 	delete(prep.tools)
 	delete(prep.wire)
-	delete(prep.raw_responses)
+	delete(prep.cache_key, allocator)
 	prep^ = {}
 }
 
@@ -166,12 +165,15 @@ chat_build_request_into :: proc(
 	prep.wire = make([dynamic]ai.Provider_Message, 0, len(entries) + 2, chat.allocator)
 	prep.tools = make([dynamic]ai.Provider_Tool_Def, 0, chat.allocator)
 	prep.calls = make([dynamic][dynamic]ai.Provider_Tool_Call, 0, chat.allocator)
-	prep.raw_responses = make([dynamic]string, 0, chat.allocator)
 
+	// The instruction lane is the most stable content a request carries, so it
+	// travels beside the conversation rather than as a turn inside it. A
+	// summarization request states what a summary is, not what the agent is.
+	instructions := ""
 	if compact {
-		append(&prep.wire, ai.Provider_Message{Role = .System, Content = CHAT_COMPACT_INSTRUCTIONS})
+		instructions = CHAT_COMPACT_INSTRUCTIONS
 	} else if chat.tools_enabled {
-		append(&prep.wire, ai.Provider_Message{Role = .System, Content = AGENT_SYSTEM_PROMPT})
+		instructions = AGENT_SYSTEM_PROMPT
 	}
 	// A checkpoint stands in for the history it covers, so the request opens
 	// with the summary and continues with the entries after it.
@@ -179,23 +181,34 @@ chat_build_request_into :: proc(
 		summary_text := strings.concatenate({"Summary of the conversation so far:\n", summary}, context.temp_allocator)
 		append(&prep.wire, ai.Provider_Message{Role = .Assistant, Content = summary_text})
 	}
-	chat_append_entries(&prep.wire, &prep.calls, &prep.raw_responses, entries)
+	chat_append_entries(&prep.wire, &prep.calls, connection.API, entries)
 
 	prep.request = ai.Provider_Request {
-		API              = connection.API,
-		Model_Present    = true,
-		Model            = chat.model_id,
-		Messages_Present = true,
-		Messages         = prep.wire[:],
-		Raw_Responses    = prep.raw_responses[:],
+		API                  = connection.API,
+		Model_Present        = true,
+		Model                = chat.model_id,
+		Instructions_Present = instructions != "",
+		Instructions         = instructions,
+		Messages_Present     = true,
+		Messages             = prep.wire[:],
 	}
-	if !compact && connection.API == .OpenAI_Responses {
-		// The session id is the cache identity: stable for the session's
-		// life, so related requests route together and account together.
-		// The implicit breakpoint advances through the newest eligible
-		// boundary on its own; the key is what keeps related requests on
-		// the same accounting and routing.
-		prep.request.Prompt_Cache_Key_Present = true
+	// The harness replays history itself, so the endpoint is asked not to keep a
+	// second copy. On Responses this also makes reasoning items carry their
+	// encrypted content, which is what the verbatim record needs to be
+	// self-contained rather than dependent on server-side state.
+	prep.request.Store_Response_Present = true
+	prep.request.Store_Response = false
+	// The session id is the cache identity: stable for the session's life, so
+	// related requests route together and account together. On Responses the
+	// implicit breakpoint advances through the newest eligible boundary on its
+	// own; on both APIs the key is the routing hint for models that need one. A
+	// summarization request carries a different identity, so it neither reuses
+	// nor displaces the conversation's cache accounting.
+	prep.request.Prompt_Cache_Key_Present = true
+	if compact {
+		prep.cache_key = strings.concatenate({string(chat.id), ":summary"}, chat.allocator)
+		prep.request.Prompt_Cache_Key = prep.cache_key
+	} else {
 		prep.request.Prompt_Cache_Key = string(chat.id)
 	}
 	if compact {
@@ -218,21 +231,36 @@ chat_build_request_into :: proc(
 			prep.request.Tools = prep.tools[:]
 		}
 	}
-	prep.estimate = chat_estimate_input_tokens(prep.wire[:], prep.raw_responses[:], prep.tools[:])
+	prep.estimate = chat_estimate_input_tokens(instructions, prep.wire[:], prep.tools[:])
 }
 
 // chat_append_entries turns stored entries into provider messages. Consecutive
 // tool calls become one assistant message, which is how a provider sees a
 // multi-call response, and a result names the call it answers through the
-// sequence the two entries share. A Response_Entry contributes its verbatim
-// output array to raw_responses in entry order; Reasoning_Entry payloads
-// recorded before that change replay through the legacy path alongside it.
+// sequence the two entries share.
+//
+// On the Responses API a Response_Entry carries the endpoint's own items, so it
+// becomes one verbatim message at that point in the conversation and the plain
+// text and calls it already contains are not projected a second time. The calls
+// are still indexed either way, because a result names its call through the
+// sequence the two entries share. Chat Completions has no native items to
+// replay, so it keeps the portable projection; entries written before the
+// Response_Entry existed replay through that same path.
 @(private)
-chat_append_entries :: proc(messages: ^[dynamic]ai.Provider_Message, call_lists: ^[dynamic][dynamic]ai.Provider_Tool_Call, raw_responses: ^[dynamic]string, entries: []session.Entry) {
+chat_append_entries :: proc(
+	messages: ^[dynamic]ai.Provider_Message,
+	call_lists: ^[dynamic][dynamic]ai.Provider_Tool_Call,
+	api: ai.API_Kind,
+	entries: []session.Entry,
+) {
 	group: [dynamic]ai.Provider_Tool_Call
 	group_open := false
 	call_ids := make(map[i64]string, allocator = context.temp_allocator)
 	defer delete(call_ids)
+
+	// covered is the request whose assistant side a verbatim output already
+	// carries. Its projected text and calls would be the same content twice.
+	covered: Maybe(session.Request_No)
 
 	for entry in entries {
 		#partial switch payload in entry.payload {
@@ -240,7 +268,7 @@ chat_append_entries :: proc(messages: ^[dynamic]ai.Provider_Message, call_lists:
 			chat_flush_calls(messages, call_lists, &group, &group_open)
 			append(messages, ai.Provider_Message{Role = .User, Content = payload.text})
 		case session.Assistant_Entry:
-			if !payload.partial {
+			if !payload.partial && !chat_verbatim_covers(api, covered, entry.request_no) {
 				chat_flush_calls(messages, call_lists, &group, &group_open)
 				append(messages, ai.Provider_Message{Role = .Assistant, Content = payload.text})
 			}
@@ -249,11 +277,18 @@ chat_append_entries :: proc(messages: ^[dynamic]ai.Provider_Message, call_lists:
 			append(messages, ai.Provider_Message{Role = .Reasoning, Reasoning_ID = payload.id, Reasoning_Encrypted = payload.encrypted})
 		case session.Response_Entry:
 			chat_flush_calls(messages, call_lists, &group, &group_open)
-			append(raw_responses, payload.output)
+			if api == .OpenAI_Responses {
+				append(messages, ai.Provider_Message{Verbatim_Items = payload.output})
+				covered = entry.request_no
+			}
 		case session.Tool_Call_Entry:
+			// The index is built before the coverage check: a result names its
+			// call through the sequence whether or not the call is projected.
 			call_ids[i64(entry.seq)] = payload.call_id
-			append(&group, ai.Provider_Tool_Call{ID = payload.call_id, Item_ID = payload.item_id, Name = payload.name, Arguments = payload.arguments})
-			group_open = true
+			if !chat_verbatim_covers(api, covered, entry.request_no) {
+				append(&group, ai.Provider_Tool_Call{ID = payload.call_id, Item_ID = payload.item_id, Name = payload.name, Arguments = payload.arguments})
+				group_open = true
+			}
 		case session.Tool_Result_Entry:
 			chat_flush_calls(messages, call_lists, &group, &group_open)
 			call_id := ""
@@ -265,6 +300,17 @@ chat_append_entries :: proc(messages: ^[dynamic]ai.Provider_Message, call_lists:
 	}
 	chat_flush_calls(messages, call_lists, &group, &group_open)
 	delete(group)
+}
+
+// chat_verbatim_covers reports whether a verbatim output already carries the
+// assistant side of this entry's request. Both values must name the same
+// request: an entry with no request, such as a steering line, is never covered.
+@(private)
+chat_verbatim_covers :: proc(api: ai.API_Kind, covered, request_no: Maybe(session.Request_No)) -> bool {
+	if api != .OpenAI_Responses { return false }
+	covered_value, covered_ok := covered.?
+	request_value, request_ok := request_no.?
+	return covered_ok && request_ok && covered_value == request_value
 }
 
 @(private)
@@ -282,11 +328,10 @@ chat_flush_calls :: proc(
 }
 
 @(private)
-chat_estimate_input_tokens :: proc(messages: []ai.Provider_Message, raw_responses: []string, tools: []ai.Provider_Tool_Def) -> int {
-	chars := 0
-	for raw in raw_responses { chars += len(raw) }
+chat_estimate_input_tokens :: proc(instructions: string, messages: []ai.Provider_Message, tools: []ai.Provider_Tool_Def) -> int {
+	chars := len(instructions)
 	for message in messages {
-		chars += len(message.Content) + len(message.Tool_Call_ID) + len(message.Reasoning_ID) + len(message.Reasoning_Encrypted)
+		chars += len(message.Content) + len(message.Tool_Call_ID) + len(message.Reasoning_ID) + len(message.Reasoning_Encrypted) + len(message.Verbatim_Items)
 		for call in message.Tool_Calls {
 			chars += len(call.ID) + len(call.Item_ID) + len(call.Name) + len(call.Arguments)
 		}

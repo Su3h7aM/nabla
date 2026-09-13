@@ -22,7 +22,17 @@ openai_chat_encode_request :: proc(request: Provider_Request, allocator := conte
 	if err := Provider_Validate_Request(request); err != .None { return "", err }
 	object := make(json.Object, 8, allocator)
 	object[strings.clone("model", allocator)] = json.String(strings.clone(request.Model, allocator))
-	messages := make(json.Array, 0, len(request.Messages), allocator)
+	// Chat Completions has no instruction field, so the lane becomes the leading
+	// message it does understand. It is emitted here rather than carried in
+	// request.Messages, because an instruction is not a conversation turn.
+	capacity := len(request.Messages) + (1 if request.Instructions_Present else 0)
+	messages := make(json.Array, 0, capacity, allocator)
+	if request.Instructions_Present {
+		instructions := make(json.Object, 2, allocator)
+		instructions[strings.clone("role", allocator)] = json.String(strings.clone("system", allocator))
+		instructions[strings.clone("content", allocator)] = json.String(strings.clone(request.Instructions, allocator))
+		append(&messages, json.Value(instructions))
+	}
 	for message in request.Messages {
 		// Chat Completions has no reasoning input; reasoning continuity is
 		// a Responses replay contract, so these items are dropped here.
@@ -87,6 +97,7 @@ openai_chat_encode_request :: proc(request: Provider_Request, allocator := conte
 		object[strings.clone("prompt_cache_options", allocator)] = json.Value(opts)
 	}
 	if request.Prompt_Cache_Retention_Present { object[strings.clone("prompt_cache_retention", allocator)] = json.String(strings.clone(request.Prompt_Cache_Retention, allocator)) }
+	if request.Store_Response_Present { object[strings.clone("store", allocator)] = json.Boolean(request.Store_Response) }
 	object[strings.clone("stream", allocator)] = json.Boolean(true)
 	options := make(json.Object, 1, allocator)
 	options[strings.clone("include_usage", allocator)] = json.Boolean(true)
