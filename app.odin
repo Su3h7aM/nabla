@@ -175,6 +175,23 @@ Runtime :: struct {
 	connection: ai.Provider_Connection,
 	alloc:      mem.Allocator,
 	signals:    agent.Chat_Interactive_Signals,
+	// stopping is set once by the front-end before the worker is stopped. It is
+	// separate from a turn cancellation: a cancel ends the running turn and the
+	// session keeps going, while stopping ends the process. The worker checks it
+	// at its own boundaries, so shutdown does not have to reach the worker
+	// through the command queue.
+	stopping:   bool,
+}
+
+// stop_runtime refuses further work. The front-end is the only enqueuer, so once
+// this returns no command can enter the queue, and the worker abandons what is
+// already in it.
+stop_runtime :: proc(app: ^App) {
+	sync.atomic_store(&app.run.stopping, true)
+}
+
+runtime_stopping :: proc(app: ^App) -> bool {
+	return sync.atomic_load(&app.run.stopping)
 }
 
 // Run_Setup is the resolved runtime the app starts from: the catalog, the
@@ -363,22 +380,23 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 		return false
 	}
 
-	recovery, message, attached := session_attach(setup, target.id)
-	if !attached {
+	adoption, message, adopted := session_adopt(setup, target.id)
+	if !adopted {
 		defer delete(message, setup.alloc)
 		fmt.eprintln("nabla:", message)
 		return false
 	}
-	report_recovery(recovery)
+	defer adoption_destroy(&adoption, setup.alloc)
+	report_recovery(adoption.recovery)
 
 	claimed, held := session.session_claimed(&setup.store)
 	if !held {
 		fmt.eprintln("nabla: the session claim went missing")
 		return false
 	}
-	setup.workspace = strings.clone(target.workspace, setup.alloc)
-	setup.resumed_provider = strings.clone(target.provider, setup.alloc)
-	setup.resumed_model = strings.clone(target.model, setup.alloc)
+	setup.workspace = strings.clone(adoption.header.workspace, setup.alloc)
+	setup.resumed_provider = strings.clone(adoption.header.provider, setup.alloc)
+	setup.resumed_model = strings.clone(adoption.header.model, setup.alloc)
 	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
 	return true
 }
@@ -445,25 +463,83 @@ session_target_from :: proc(header: ^session.Session, allocator: mem.Allocator) 
 	}
 }
 
-// session_attach takes the writer claim for target and settles whatever an
-// earlier run left running in it. On failure the store holds no claim and the
-// message says why; the message is owned by setup.alloc.
-session_attach :: proc(setup: ^Run_Setup, target: session.Session_Id) -> (recovery: session.Recovery, message: string, ok: bool) {
-	if claim_err := session.session_claim(&setup.store, target); claim_err != nil {
+// Adoption is a session this process has taken over: the header as read under the
+// claim, and what an interrupted run left to settle. header is owned by the
+// allocator session_adopt was given.
+Adoption :: struct {
+	header:   session.Session,
+	recovery: session.Recovery,
+}
+
+adoption_destroy :: proc(adoption: ^Adoption, allocator: mem.Allocator) {
+	session.session_destroy(&adoption.header, allocator)
+	adoption^ = {}
+}
+
+// session_adopt makes id the claimed session on this store: it takes the candidate
+// claim while the claim the store already holds stays held, reads the header under
+// the new claim, and settles whatever an interrupted run left running. The
+// displaced claim is released only after all of that has succeeded.
+//
+// A refusal leaves the store holding exactly the claim it held before, so a switch
+// that fails leaves the running session claimed and usable. The message is owned by
+// setup.alloc.
+//
+// It runs on whichever thread owns the store: the startup thread before the worker
+// exists, and the worker afterwards.
+session_adopt :: proc(setup: ^Run_Setup, id: session.Session_Id) -> (adopted: Adoption, message: string, ok: bool) {
+	displaced, claim_err := session.session_claim_candidate(&setup.store, id)
+	if claim_err != nil {
 		local := claim_err
 		return {}, strings.concatenate({"cannot take the session: ", session.error_detail(&local)}, setup.alloc), false
 	}
-	settled, recover_err := session.session_recover(
+
+	// The claim is what makes the row safe to read: another process may have deleted
+	// the session between the caller's own read and this claim.
+	header, load_err := session.session_load(&setup.store, id, setup.alloc)
+	if load_err != nil {
+		// Abandoning the candidate cannot fail in a way the caller could act on: the
+		// descriptor is closed either way, so the lock is gone.
+		_ = session.session_claim_restore(&setup.store, displaced)
+		local := load_err
+		return {}, strings.concatenate({"cannot open the session: ", session.error_detail(&local)}, setup.alloc), false
+	}
+	recovery, recover_err := session.session_recover(
 		&setup.store,
-		target,
+		id,
 		{at_ms = session.now_ms(), recovered_content = agent.TOOL_RECOVERED_RESULT, unexecuted_content = agent.TOOL_UNEXECUTED_RESULT},
 	)
 	if recover_err != nil {
-		session.session_release(&setup.store)
+		session.session_destroy(&header)
+		_ = session.session_claim_restore(&setup.store, displaced)
 		local := recover_err
 		return {}, strings.concatenate({"cannot settle the session: ", session.error_detail(&local)}, setup.alloc), false
 	}
-	return settled, "", true
+
+	// The candidate is settled, so the session that was running can be given up. A
+	// release that reports an error has still closed the descriptor, which is what
+	// actually frees the lock, so there is nothing left for the caller to do.
+	_ = session.claim_release(&displaced)
+	return Adoption{header = header, recovery = recovery}, "", true
+}
+
+// session_activate makes an adopted session the running one. Its claim is already
+// the store's, so the previous chat is destroyed here and the workspace and chat
+// both become the adopted session's.
+@(private)
+session_activate :: proc(app: ^App, adoption: ^Adoption) {
+	setup := &app.setup
+	claimed, held := session.session_claimed(&setup.store)
+	if !held {
+		// session_adopt commits the candidate claim, so this cannot happen; a missing
+		// claim would mean the store lost it underneath us.
+		snap_append(app, .Error, "the session claim went missing")
+		return
+	}
+	agent.chat_session_destroy(&setup.session)
+	delete(setup.workspace, setup.alloc)
+	setup.workspace = strings.clone(adoption.header.workspace, setup.alloc)
+	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
 }
 
 // report_recovery says what an earlier run left behind, so a resumed session
@@ -713,7 +789,10 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	app.run.snap.entries = make([dynamic]Entry, 0, 16, app.run.alloc)
 	app.run.snap.status.provider_id = strings.clone(app.setup.provider_id, app.run.alloc)
 	app.run.snap.status.model_id = strings.clone(app.setup.model_id, app.run.alloc)
-	app.run.snap.status.cwd = app.setup.workspace
+	// cwd is owned by the snapshot: a session switch replaces the workspace, and
+	// the footer reads the status under the lock, so a borrowed workspace would
+	// dangle as soon as the running session changed.
+	app.run.snap.status.cwd = strings.clone(app.setup.workspace, app.run.alloc)
 	app.run.snap.status.context_window = app.setup.session.context_window
 	// The resumed conversation is shown before the first prompt, so the screen
 	// matches the history the next request will be built from.
@@ -798,11 +877,11 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 		// The working indicator animates only while a request is active, so a
 		// silent request (no stream events, tools running) still advances it.
 		now := time.tick_now()
-		advance_spinner := app.run.snap.status.running && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
+		advance_spinner := runtime_busy(app) && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
 		// A startup chooser closes once its selection applies on the worker; a menu
 		// opened from the prompt closes on submit instead, so browsing it does not
 		// dismiss it.
-		if app.menu.required && app.run.snap.status.model_id != "" {
+		if app.menu.required && runtime_model_selected(app) {
 			menu_close(app)
 			widgets.input_clear(&app.input)
 		}
@@ -829,9 +908,10 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 		}
 	}
 
-	// Teardown: cancel a running turn so the worker settles, then stop it
-	// and join. Join is safe only after the turn retired; cancellation
-	// guarantees that.
+	// Teardown: refuse further work, cancel a running turn so the worker settles,
+	// then stop it and join. Join is safe only after the turn retired;
+	// cancellation guarantees that.
+	stop_runtime(app)
 	if runtime_busy(app) {
 		agent.chat_cancel_request()
 	}
@@ -849,6 +929,13 @@ app_teardown :: proc(app: ^App) {
 		thread.destroy(app.run.worker)
 		app.run.worker = nil
 	}
+	// The worker frees what it had buffered on the way out; this covers commands
+	// that were queued after it stopped receiving, and a worker that never started.
+	for {
+		queued, ok := chan.recv(app.run.work)
+		if !ok { break }
+		work_destroy(app, queued)
+	}
 	chan.destroy(&app.run.work)
 	for &entry in app.run.snap.entries {
 		if entry.text != nil {
@@ -865,6 +952,7 @@ app_teardown :: proc(app: ^App) {
 	delete(app.run.snap.status.provider_id, app.run.alloc)
 	delete(app.run.snap.status.model_id, app.run.alloc)
 	delete(app.run.snap.status.effort, app.run.alloc)
+	delete(app.run.snap.status.cwd, app.run.alloc)
 	for level in app.run.snap.status.effort_levels { delete(level, app.run.alloc) }
 	delete(app.run.snap.status.effort_levels)
 	delete(app.run.snap.setup_error, app.run.alloc)
@@ -891,13 +979,32 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 		if !ok {
 			return
 		}
+		if runtime_stopping(app) {
+			work_destroy(app, work)
+			break
+		}
 		run_work(app, work, observer)
-		if work.text != "" {
-			delete(work.text, app.run.alloc)
-		}
-		if work.provider != "" {
-			delete(work.provider, app.run.alloc)
-		}
+		work_destroy(app, work)
+		// Temp scratch belongs to one work item. The worker is long-lived, so the
+		// pool is recycled here rather than left to grow with the process.
+		free_all(context.temp_allocator)
+	}
+	// The front-end stopped the runtime, so anything still queued is abandoned
+	// rather than run. Closing the channel ends the loop once the buffer drains.
+	for {
+		queued, more := chan.recv(app.run.work)
+		if !more { break }
+		work_destroy(app, queued)
+	}
+}
+
+// work_destroy releases the strings a queued command owns.
+work_destroy :: proc(app: ^App, work: Work) {
+	if work.text != "" {
+		delete(work.text, app.run.alloc)
+	}
+	if work.provider != "" {
+		delete(work.provider, app.run.alloc)
 	}
 }
 
@@ -930,6 +1037,9 @@ session_refresh_rows :: proc(app: ^App) {
 }
 
 run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
+	// A stop that arrived while this item was queued abandons it: shutdown does
+	// not start new work.
+	if runtime_stopping(app) { return }
 	// Work that can change which sessions exist, or what they are called, marks the
 	// list the /resume menu reads as needing a rebuild.
 	rows_dirty := false
@@ -951,9 +1061,14 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		}
 		snap_append(app, .User, work.text)
 		set_running(app, true)
+		// Accepting the prompt reset the cancellation token for the new turn, so a
+		// stop that arrived while the prompt was being recorded has to be re-issued
+		// here: otherwise shutdown would wait out a whole model request.
+		if runtime_stopping(app) { agent.chat_cancel_request() }
 		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, observer, nil)
 	case .Compact:
 		set_running(app, true)
+		if runtime_stopping(app) { agent.chat_cancel_request() }
 		agent.chat_command_compact(&app.setup.session, observer, app.run.connection, nil)
 	case .Status:
 		agent.chat_notice_status(&app.setup.session, observer, session.now_ms())
@@ -1045,33 +1160,23 @@ session_resume :: proc(app: ^App, reference: string) {
 }
 
 // session_start_new closes the running session and opens a fresh one, so the
-// next prompt starts a new conversation. The claim is released for the attempt
-// and taken again, because a store holds one claim; a failure puts the running
-// session back rather than leaving the front-end with no session at all.
+// next prompt starts a new conversation. The candidate is claimed while the
+// running session stays claimed, so a failure leaves the running session usable
+// rather than dropping the front-end's only session.
 session_start_new :: proc(app: ^App) -> bool {
 	setup := &app.setup
 	target, opened := session_open_target(setup, {kind = .New}, setup.workspace)
 	if !opened { return false }
 	defer session_target_destroy(&target, setup.alloc)
 
-	previous := session.Session_Id(strings.clone(string(setup.session.id), setup.alloc))
-	defer delete(string(previous), setup.alloc)
-	session.session_release(&setup.store)
-
-	_, message, attached := session_attach(setup, target.id)
-	if !attached {
+	adoption, message, adopted := session_adopt(setup, target.id)
+	if !adopted {
 		defer delete(message, setup.alloc)
 		snap_append(app, .Error, message)
-		session_restore_claim(app, previous)
 		return false
 	}
-	claimed, held := session.session_claimed(&setup.store)
-	if !held {
-		snap_append(app, .Error, "the session claim went missing")
-		return false
-	}
-	agent.chat_session_destroy(&setup.session)
-	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
+	defer adoption_destroy(&adoption, setup.alloc)
+	session_activate(app, &adoption)
 	return true
 }
 
@@ -1079,9 +1184,11 @@ session_start_new :: proc(app: ^App) -> bool {
 // running. The workspace recorded in the session becomes the running session's
 // workspace.
 //
-// The target is read and checked before anything is given up, and the running
-// session's claim is taken back when the switch fails, so a refusal leaves the
-// front-end working in the session it already had.
+// The target is read and checked before anything is given up, and session_adopt
+// holds the running session's claim until the candidate is settled, so a refusal
+// leaves the front-end working in the session it already had. Nothing is released
+// in between, so another process cannot take the running session during the
+// attempt.
 session_switch :: proc(app: ^App, target: session.Session_Id) -> bool {
 	setup := &app.setup
 
@@ -1097,58 +1204,34 @@ session_switch :: proc(app: ^App, target: session.Session_Id) -> bool {
 		return false
 	}
 
-	previous := session.Session_Id(strings.clone(string(setup.session.id), setup.alloc))
-	defer delete(string(previous), setup.alloc)
-	session.session_release(&setup.store)
-
-	recovery, message, attached := session_attach(setup, target)
-	if !attached {
+	adoption, message, adopted := session_adopt(setup, target)
+	if !adopted {
 		defer delete(message, setup.alloc)
 		snap_append(app, .Error, message)
-		session_restore_claim(app, previous)
 		return false
 	}
-	if recovery.recovered_calls > 0 {
-		snap_append(app, .Notice, fmt.tprintf("%d tool result(s) in this session record an outcome the harness never saw", recovery.recovered_calls))
+	defer adoption_destroy(&adoption, setup.alloc)
+
+	session_activate(app, &adoption)
+	if adoption.recovery.recovered_calls > 0 {
+		snap_append(app, .Notice, fmt.tprintf("%d tool result(s) in this session record an outcome the harness never saw", adoption.recovery.recovered_calls))
 	}
-	if recovery.unexecuted_calls > 0 {
-		snap_append(app, .Notice, fmt.tprintf("%d tool call(s) in this session never ran", recovery.unexecuted_calls))
+	if adoption.recovery.unexecuted_calls > 0 {
+		snap_append(app, .Notice, fmt.tprintf("%d tool call(s) in this session never ran", adoption.recovery.unexecuted_calls))
 	}
-	claimed, held := session.session_claimed(&setup.store)
-	if !held {
-		snap_append(app, .Error, "the session claim went missing")
-		return false
-	}
-	// The other session's workspace is where its next request runs.
-	agent.chat_session_destroy(&setup.session)
-	delete(setup.workspace, setup.alloc)
-	setup.workspace = strings.clone(header.workspace, setup.alloc)
-	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
 
 	// A conversation has to be configured before it can run: the new chat starts
 	// with no model, so the session's recorded one is applied, with the selection
 	// already in effect as the fallback. A session whose model is gone from the
 	// catalog stays open on the current selection, and can still be changed from
 	// the model menu.
-	if header.provider != "" && header.model != "" && apply_selection(app, header.provider, header.model, "") {
+	if adoption.header.provider != "" && adoption.header.model != "" && apply_selection(app, adoption.header.provider, adoption.header.model, "") {
 		return true
 	}
 	if setup.provider_id != "" && setup.model_id != "" {
 		apply_selection(app, setup.provider_id, setup.model_id, "")
 	}
 	return true
-}
-
-// session_restore_claim takes the claim the switch gave up, so a failed switch
-// leaves the front-end where it started. A failure here is reported because the
-// running session can no longer write.
-@(private)
-session_restore_claim :: proc(app: ^App, previous: session.Session_Id) {
-	setup := &app.setup
-	if claim_err := session.session_claim(&setup.store, previous); claim_err != nil {
-		local := claim_err
-		snap_append(app, .Error, fmt.tprintf("the running session could not be reclaimed: %s", session.error_detail(&local)))
-	}
 }
 
 // session_replay shows the tail of a resumed conversation. The store keeps every
@@ -1395,8 +1478,11 @@ handle_menu_key :: proc(app: ^App, key: input.Key_Event) {
 // current provider is preferred, then any single provider serving that model
 // id, then an explicit "provider/model" pair.
 resolve_model_reference :: proc(app: ^App, text: string) -> (provider_id, model_id: string, ok: bool) {
-	if _, found := agent.catalog_find_model(&app.setup.catalog, app.setup.provider_id, text); found {
-		return app.setup.provider_id, text, true
+	// The selection is worker state, so it is read through the lock that publishes
+	// it rather than from the live session.
+	current_provider := runtime_selection_provider(app)
+	if _, found := agent.catalog_find_model(&app.setup.catalog, current_provider, text); found {
+		return current_provider, text, true
 	}
 	matches := 0
 	found_provider := ""
@@ -1436,7 +1522,10 @@ refresh_status :: proc(app: ^App) {
 	// the main thread never reads the store, so it cannot compute one itself.
 	status.est_input = running.last_estimate
 	status.context_window = running.context_window
-	status.cwd = running.workspace
+	if status.cwd != running.workspace {
+		delete(status.cwd, app.run.alloc)
+		status.cwd = strings.clone(running.workspace, app.run.alloc)
+	}
 	status.running = running.state != .Idle
 	if status.provider_id != app.setup.provider_id {
 		delete(status.provider_id, app.run.alloc)
@@ -1466,6 +1555,23 @@ runtime_busy :: proc(app: ^App) -> bool {
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
 	return app.run.snap.status.running
+}
+
+// runtime_model_selected reports whether a model is in effect, under the lock the
+// worker publishes the status with.
+runtime_model_selected :: proc(app: ^App) -> bool {
+	sync.mutex_lock(&app.run.mu)
+	defer sync.mutex_unlock(&app.run.mu)
+	return app.run.snap.status.model_id != ""
+}
+
+// runtime_selection_provider copies the provider the runtime currently runs,
+// under the lock the worker publishes it with. The copy is temp-allocated, which
+// is the lifetime of one keypress on the front-end.
+runtime_selection_provider :: proc(app: ^App) -> string {
+	sync.mutex_lock(&app.run.mu)
+	defer sync.mutex_unlock(&app.run.mu)
+	return strings.clone(app.run.snap.status.provider_id, context.temp_allocator)
 }
 
 generation_changed :: proc(app: ^App) -> bool {
@@ -1895,6 +2001,10 @@ dispatch_command :: proc(app: ^App, text: string) {
 }
 
 enqueue :: proc(app: ^App, kind: Work_Kind, provider, text: string) {
+	// The worker abandons the queue on the way out, so a command that entered now
+	// would never run. Dropping it here is what makes shutdown's "no new work"
+	// promise hold without reaching through the queue.
+	if runtime_stopping(app) { return }
 	item := Work {
 		kind = kind,
 	}

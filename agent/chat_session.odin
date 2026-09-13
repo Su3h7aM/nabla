@@ -56,11 +56,14 @@ Chat_Accept :: enum {
 // Chat_Session is the running half of a session. Committed history lives in the
 // store; this holds only what the turn in flight needs.
 //
-// store and id are borrowed. The caller owns the store, holds the writer claim
-// for id, and keeps both alive for the session's lifetime.
+// store is borrowed and must outlive the chat; id is owned by the chat, because
+// the claim that produced it can be released while the chat is still alive
+// (a refused switch puts the running claim back, and the chat must not depend on
+// that claim's storage). The caller owns the store, holds the writer claim for
+// id, and keeps both alive for the session's lifetime.
 Chat_Session :: struct {
 	store:                       ^session.Store,
-	id:                          session.Session_Id,
+	id:                          session.Session_Id, // owned
 	allocator:                   mem.Allocator,
 	state:                       Chat_State,
 	terminal_status:             Chat_Terminal_Status,
@@ -131,11 +134,12 @@ chat_context_window :: proc(model: Catalog_Model) -> (window: int, assumed: bool
 
 // chat_session_init builds the running state for a claimed session. workspace is
 // the validated process directory; it is copied, because the caller's copy may
-// be temporary.
+// be temporary. The session id is copied too: the chat owns its identity rather
+// than borrowing it from whichever claim happens to be in the store.
 chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspace: string, allocator := context.allocator) -> Chat_Session {
 	return Chat_Session {
 		store = store,
-		id = id,
+		id = session.Session_Id(strings.clone(string(id), allocator)),
 		allocator = allocator,
 		next_turn_id = 1,
 		next_operation_id = 1,
@@ -162,6 +166,7 @@ chat_reasoning_destroy :: proc(reasoning: ^Chat_Reasoning, allocator: mem.Alloca
 }
 
 chat_session_destroy :: proc(chat: ^Chat_Session) {
+	delete(string(chat.id), chat.allocator)
 	delete(chat.partial_assistant)
 	for &reasoning in chat.pending_reasoning { chat_reasoning_destroy(&reasoning, chat.allocator) }
 	delete(chat.pending_reasoning)

@@ -221,6 +221,89 @@ test_a_second_store_cannot_claim_the_same_session :: proc(t: ^testing.T) {
 	session_release(&second)
 }
 
+// A switch claims the candidate while the running session is still held, so both
+// are locked until the switch commits or is restored. That is what keeps a refused
+// switch from handing the running session to another process.
+@(test)
+test_a_switch_holds_both_sessions_until_it_commits :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	running, running_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, running_err)
+	defer session_destroy(&running)
+	target, target_err := session_create(&store, {workspace = "/tmp/project"}, 2_000)
+	_expect_ok(t, target_err)
+	defer session_destroy(&target)
+
+	_expect_ok(t, session_claim(&store, running.id))
+
+	second: Store
+	_expect_ok(t, store_open(&second, directory))
+	defer store_close(&second)
+
+	displaced, candidate_err := session_claim_candidate(&store, target.id)
+	_expect_ok(t, candidate_err)
+
+	// Both are locked, and the store now names the candidate.
+	claimed, held := session_claimed(&store)
+	testing.expect(t, held, "the candidate should be the store's claim")
+	testing.expect_value(t, claimed, target.id)
+	_expect_error(t, session_claim(&second, running.id), .Busy)
+	_expect_error(t, session_claim(&second, target.id), .Busy)
+
+	// Committing releases the running session and keeps the candidate.
+	_expect_ok(t, claim_release(&displaced))
+	_expect_ok(t, session_claim(&second, running.id))
+	_expect_ok(t, session_release(&second))
+	_expect_error(t, session_claim(&second, target.id), .Busy)
+}
+
+// A candidate another process holds is refused without disturbing the running
+// session, and a switch that is abandoned puts the running claim back.
+@(test)
+test_a_refused_or_restored_switch_keeps_the_running_claim :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	running, running_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, running_err)
+	defer session_destroy(&running)
+	target, target_err := session_create(&store, {workspace = "/tmp/project"}, 2_000)
+	_expect_ok(t, target_err)
+	defer session_destroy(&target)
+
+	_expect_ok(t, session_claim(&store, running.id))
+
+	second: Store
+	_expect_ok(t, store_open(&second, directory))
+	defer store_close(&second)
+	_expect_ok(t, session_claim(&second, target.id))
+
+	// The refusal leaves the store claiming exactly what it claimed before, and the
+	// running session is still writable.
+	_, candidate_err := session_claim_candidate(&store, target.id)
+	_expect_error(t, candidate_err, .Busy)
+	claimed, held := session_claimed(&store)
+	testing.expect(t, held, "the running session must still be claimed")
+	testing.expect_value(t, claimed, running.id)
+	_expect_ok(t, session_set_title(&store, running.id, "still mine"))
+
+	// A candidate that was claimed and then abandoned is released, and the running
+	// claim is back in the store.
+	_expect_ok(t, session_release(&second))
+	displaced, claim_err := session_claim_candidate(&store, target.id)
+	_expect_ok(t, claim_err)
+	_expect_ok(t, session_claim_restore(&store, displaced))
+	claimed, held = session_claimed(&store)
+	testing.expect(t, held, "restoring must put the running claim back")
+	testing.expect_value(t, claimed, running.id)
+	_expect_ok(t, session_set_title(&store, running.id, "still mine"))
+	_expect_error(t, session_set_title(&store, target.id, "not mine"), .Invalid_State)
+}
+
 @(test)
 test_archive_hides_and_unarchive_restores :: proc(t: ^testing.T) {
 	store: Store

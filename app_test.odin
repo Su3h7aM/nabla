@@ -2,6 +2,7 @@
 #+private file
 package main
 
+import "core:sync/chan"
 import "core:testing"
 
 import "nabla:agent"
@@ -67,4 +68,30 @@ test_ctrl_c_resolves_by_prompt_state :: proc(t: ^testing.T) {
 	interrupt(&idle)
 	testing.expect(t, idle.quit)
 	testing.expect(t, !idle.cancel_seen)
+}
+
+// A stopped runtime refuses new work at the front-end, so a command typed while
+// the harness is shutting down is dropped rather than queued for a worker that
+// will abandon it.
+@(test)
+test_stopping_refuses_queued_work :: proc(t: ^testing.T) {
+	app: App
+	app.run.alloc = context.allocator
+	channel, channel_err := chan.create_buffered(Work_Chan, 4, app.run.alloc)
+	if channel_err != nil { testing.fail_now(t, "the work channel could not be created") }
+	app.run.work = channel
+	defer chan.destroy(&app.run.work)
+
+	enqueue(&app, .Prompt, "", "queued before the stop")
+	stop_runtime(&app)
+	enqueue(&app, .Prompt, "", "refused after the stop")
+	testing.expect(t, runtime_stopping(&app))
+
+	queued, ok := chan.recv(app.run.work)
+	if !testing.expect(t, ok) { return }
+	testing.expect_value(t, queued.text, "queued before the stop")
+	work_destroy(&app, queued)
+
+	_, more := chan.try_recv(app.run.work)
+	testing.expect(t, !more, "nothing may be accepted after the runtime stops")
 }

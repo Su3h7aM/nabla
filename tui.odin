@@ -154,16 +154,18 @@ ensure_frame :: proc(storage: ^Frame_Storage, cols, rows: int) -> bool {
 }
 
 // present_frame renders the runtime snapshot and writes the frame to the
-// terminal. It takes the runtime mutex and releases it only after the
-// terminal write, because the frame borrows grapheme strings from the
-// snapshot.
+// terminal.
+//
+// The runtime mutex is held only for the render. Everything the grid holds is
+// either this thread's state or a copy taken out of the snapshot under that
+// lock, so the terminal write does not hold up the worker.
 present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	// Frame scratch is temp-allocated; the previous frame was already
 	// presented, so its borrows are dead and the pool can be recycled.
 	free_all(context.temp_allocator)
 	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
 	cursor, err := render_frame(app, storage)
+	sync.mutex_unlock(&app.run.mu)
 	if err != .None {
 		return
 	}
@@ -182,6 +184,11 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 
 // render_frame composes one frame from the current snapshot. The caller
 // holds the runtime mutex.
+//
+// Every string it puts in the grid must outlive the lock: the snapshot's mutable
+// strings are copied into frame scratch, and everything else belongs to this
+// thread. A borrow straight from the snapshot would dangle once the worker
+// replaces it.
 render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor, err: Render_Status) {
 	cols, rows := app.columns, app.rows
 	if cols <= 0 || rows <= 0 {
@@ -301,7 +308,7 @@ draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	lines := make([dynamic]Line, 0, 64, context.temp_allocator)
 	append(&lines, Line{text = app.menu.title, style = TITLE_STYLE})
 	if app.run.snap.setup_error != "" {
-		append(&lines, Line{text = app.run.snap.setup_error, style = ERROR_TEXT})
+		append(&lines, Line{text = strings.clone(app.run.snap.setup_error, context.temp_allocator), style = ERROR_TEXT})
 	}
 	cursor := app.menu.cursor
 	if cursor >= len(app.menu.choices) {
@@ -536,7 +543,7 @@ draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> t
 draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: tui.Cell_Rect) {
 	if cwd_rect.height > 0 && cwd_rect.width > 0 {
 		directory := text.truncate_text(shorten_home(app, app.run.snap.status.cwd), cwd_rect.width)
-		_, _ = tui.draw_text(&storage.buffer, cwd_rect, directory, FOOTER_TEXT)
+		_, _ = tui.draw_text(&storage.buffer, cwd_rect, strings.clone(directory, context.temp_allocator), FOOTER_TEXT)
 	}
 	if status_rect.height <= 0 || status_rect.width <= 0 {
 		return

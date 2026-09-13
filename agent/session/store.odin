@@ -43,9 +43,83 @@ Store :: struct {
 	allocator: mem.Allocator,
 	directory: string, // owned
 	open:      bool,
-	lock_fd:   linux.Fd,
-	lock_open: bool,
-	session:   Session_Id, // owned; the session claimed for writing
+	claim:     Claim, // the session claimed for writing, if any
+}
+
+// Claim is one held writer claim: the advisory lock and the session it names.
+// The claim owns its session id.
+//
+// A claim is a value rather than something the store hides, because a session
+// switch briefly needs two of them: the running session stays locked while the
+// candidate is taken, so a refused switch cannot leave the running session
+// unclaimed. Nothing else holds one, and nothing but a switch holds two.
+Claim :: struct {
+	allocator: mem.Allocator,
+	fd:        linux.Fd,
+	held:      bool,
+	session:   Session_Id, // owned
+}
+
+// claim_acquire takes the writer claim for id. It consults no store and does not
+// disturb a claim the caller already holds, which is what lets a switch take the
+// candidate while the running session is still claimed. A second process holding
+// the same session is refused with .Busy.
+//
+// The claim is returned held and owns its session id under allocator; release it
+// with claim_release.
+claim_acquire :: proc(directory: string, id: Session_Id, allocator: mem.Allocator) -> (claim: Claim, err: Error) {
+	if !session_id_valid(id) { return {}, error_make(.Invalid_Argument, "the session id is not a valid id") }
+
+	lock_directory, join_err := filepath.join({directory, LOCK_DIRECTORY}, context.temp_allocator)
+	if join_err != nil { return {}, error_make(.Storage, "the lock directory path could not be built") }
+	ensure_private_directory(lock_directory) or_return
+
+	lock_path, path_err := filepath.join({lock_directory, fmt.tprintf("%s.lock", string(id))}, context.temp_allocator)
+	if path_err != nil { return {}, error_make(.Storage, "the lock path could not be built") }
+	lock_cstring, convert_err := strings.clone_to_cstring(lock_path, context.temp_allocator)
+	if convert_err != nil { return {}, error_make(.Storage, "the lock path could not be converted") }
+
+	fd, open_errno := linux.open(lock_cstring, {.RDWR, .CREAT, .CLOEXEC}, LOCK_FILE_MODE)
+	if open_errno != .NONE {
+		return {}, error_make(.Storage, fmt.tprintf("the session lock could not be opened: %v", open_errno))
+	}
+	if lock_errno := linux.flock(fd, {.EX, .NB}); lock_errno != .NONE {
+		linux.close(fd)
+		if lock_errno == .EAGAIN || lock_errno == .EACCES {
+			return {}, error_make(.Busy, "another process is running that session")
+		}
+		return {}, error_make(.Storage, fmt.tprintf("the session lock could not be taken: %v", lock_errno))
+	}
+
+	claim = Claim {
+		allocator = allocator,
+		fd        = fd,
+		held      = true,
+	}
+	claim.session = Session_Id(strings.clone(string(id), allocator))
+	if claim.session == "" {
+		_ = claim_release(&claim)
+		return {}, error_make(.Storage, "the claimed session id could not be recorded")
+	}
+	return claim, nil
+}
+
+// claim_release drops the writer claim and frees the id it owned. Releasing a
+// claim that is not held does nothing, so a zero Claim is safe to release.
+claim_release :: proc(claim: ^Claim) -> Error {
+	if !claim.held { return nil }
+	allocator := claim.allocator
+	unlock_errno := linux.flock(claim.fd, {.UN})
+	close_errno := linux.close(claim.fd)
+	delete(string(claim.session), allocator)
+	claim^ = {}
+	if unlock_errno != .NONE && unlock_errno != .EINVAL {
+		return error_make(.Storage, fmt.tprintf("the session lock could not be released: %v", unlock_errno))
+	}
+	if close_errno != .NONE {
+		return error_make(.Storage, fmt.tprintf("the session lock could not be closed: %v", close_errno))
+	}
+	return nil
 }
 
 // store_open opens the session database in directory, creating the directory
@@ -241,7 +315,7 @@ session_list :: proc(store: ^Store, options: List_Options, allocator := context.
 // same session is refused with .Busy.
 session_claim :: proc(store: ^Store, id: Session_Id) -> Error {
 	if !store.open { return error_make(.Invalid_State, "the store is closed") }
-	if store.lock_open { return error_make(.Invalid_State, "another session is already claimed for writing") }
+	if store.claim.held { return error_make(.Invalid_State, "another session is already claimed for writing") }
 	if !session_id_valid(id) { return error_make(.Invalid_Argument, "the session id is not a valid id") }
 
 	// Verify the session exists before taking the claim, so a stale id does not
@@ -250,61 +324,52 @@ session_claim :: proc(store: ^Store, id: Session_Id) -> Error {
 	if load_err != nil { return load_err }
 	session_destroy(&session, context.temp_allocator)
 
-	lock_directory, join_err := filepath.join({store.directory, LOCK_DIRECTORY}, context.temp_allocator)
-	if join_err != nil { return error_make(.Storage, "the lock directory path could not be built") }
-	ensure_private_directory(lock_directory) or_return
-
-	lock_path, path_err := filepath.join({lock_directory, fmt.tprintf("%s.lock", string(id))}, context.temp_allocator)
-	if path_err != nil { return error_make(.Storage, "the lock path could not be built") }
-	lock_cstring, convert_err := strings.clone_to_cstring(lock_path, context.temp_allocator)
-	if convert_err != nil { return error_make(.Storage, "the lock path could not be converted") }
-
-	fd, open_errno := linux.open(lock_cstring, {.RDWR, .CREAT, .CLOEXEC}, LOCK_FILE_MODE)
-	if open_errno != .NONE {
-		return error_make(.Storage, fmt.tprintf("the session lock could not be opened: %v", open_errno))
-	}
-	if lock_errno := linux.flock(fd, {.EX, .NB}); lock_errno != .NONE {
-		linux.close(fd)
-		if lock_errno == .EAGAIN || lock_errno == .EACCES {
-			return error_make(.Busy, "another process is running that session")
-		}
-		return error_make(.Storage, fmt.tprintf("the session lock could not be taken: %v", lock_errno))
-	}
-
-	store.session = Session_Id(strings.clone(string(id), store.allocator))
-	if store.session == "" {
-		linux.flock(fd, {.UN})
-		linux.close(fd)
-		return error_make(.Storage, "the claimed session id could not be recorded")
-	}
-	store.lock_fd = fd
-	store.lock_open = true
+	claim, claim_err := claim_acquire(store.directory, id, store.allocator)
+	if claim_err != nil { return claim_err }
+	store.claim = claim
 	return nil
+}
+
+// session_claim_candidate takes the claim for id in place of the one the store
+// holds, returning the claim it displaced. The displaced claim stays held, so
+// the running session remains locked while the candidate is settled.
+//
+// A switch is finished by releasing the displaced claim, or abandoned with
+// session_claim_restore, which releases the candidate and puts the displaced
+// claim back. A refusal leaves the store holding exactly the claim it held
+// before.
+session_claim_candidate :: proc(store: ^Store, id: Session_Id) -> (displaced: Claim, err: Error) {
+	if !store.open { return {}, error_make(.Invalid_State, "the store is closed") }
+	displaced = store.claim
+	store.claim = {}
+	candidate, claim_err := claim_acquire(store.directory, id, store.allocator)
+	if claim_err != nil {
+		store.claim = displaced
+		return {}, claim_err
+	}
+	store.claim = candidate
+	return displaced, nil
+}
+
+// session_claim_restore abandons a switch: the candidate is released and the
+// displaced claim becomes the store's again. The store is left holding the claim
+// it held before the switch started, even when releasing the candidate fails.
+session_claim_restore :: proc(store: ^Store, displaced: Claim) -> Error {
+	err := claim_release(&store.claim)
+	store.claim = displaced
+	return err
 }
 
 // session_release drops the writer claim. Releasing when nothing is claimed
 // does nothing.
 session_release :: proc(store: ^Store) -> Error {
-	if !store.lock_open { return nil }
-	unlock_errno := linux.flock(store.lock_fd, {.UN})
-	close_errno := linux.close(store.lock_fd)
-	store.lock_fd = 0
-	store.lock_open = false
-	delete(string(store.session), store.allocator)
-	store.session = ""
-	if unlock_errno != .NONE && unlock_errno != .EINVAL {
-		return error_make(.Storage, fmt.tprintf("the session lock could not be released: %v", unlock_errno))
-	}
-	if close_errno != .NONE {
-		return error_make(.Storage, fmt.tprintf("the session lock could not be closed: %v", close_errno))
-	}
-	return nil
+	return claim_release(&store.claim)
 }
 
 // session_claimed reports which session the store holds for writing.
 session_claimed :: proc(store: ^Store) -> (Session_Id, bool) {
-	if !store.lock_open { return "", false }
-	return store.session, true
+	if !store.claim.held { return "", false }
+	return store.claim.session, true
 }
 
 // session_set_title names a claimed session.
@@ -447,8 +512,8 @@ session_scan :: proc(values: []db.Value, allocator: mem.Allocator) -> (session: 
 @(private)
 require_claim :: proc(store: ^Store, id: Session_Id) -> Error {
 	if !store.open { return error_make(.Invalid_State, "the store is closed") }
-	if !store.lock_open { return error_make(.Invalid_State, "no session is claimed for writing") }
-	if store.session != id { return error_make(.Invalid_State, "a different session is claimed for writing") }
+	if !store.claim.held { return error_make(.Invalid_State, "no session is claimed for writing") }
+	if store.claim.session != id { return error_make(.Invalid_State, "a different session is claimed for writing") }
 	return nil
 }
 

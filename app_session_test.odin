@@ -62,6 +62,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 	delete(app.run.snap.status.provider_id, app.run.alloc)
 	delete(app.run.snap.status.model_id, app.run.alloc)
 	delete(app.run.snap.status.effort, app.run.alloc)
+	delete(app.run.snap.status.cwd, app.run.alloc)
 	for level in app.run.snap.status.effort_levels { delete(level, app.run.alloc) }
 	delete(app.run.snap.status.effort_levels)
 	delete(app.run.snap.setup_error, app.run.alloc)
@@ -244,6 +245,23 @@ app_session_add :: proc(t: ^testing.T, setup: ^Run_Setup, options: session.Creat
 	if err != nil { testing.fail_now(t, "session_create failed") }
 	defer session.session_destroy(&created)
 	return session.Session_Id(strings.clone(string(created.id), setup.alloc))
+}
+
+// app_session_accept admits a prompt into the running session and checks that it
+// was recorded. A refusal that merely leaves the running session's id looking the
+// same is not enough: the session has to still be claimed and writable.
+app_session_accept :: proc(t: ^testing.T, app: ^App, text: string) {
+	accepted := agent.chat_session_accept_user(&app.setup.session, text, session.now_ms())
+	if !testing.expect_value(t, accepted, agent.Chat_Accept.Accepted) { return }
+
+	entries, load_err := session.entries_load(&app.setup.store, app.setup.session.id, {}, context.allocator)
+	if !testing.expect(t, load_err == nil, "the running session's history must still be readable") { return }
+	defer session.entries_destroy(entries, context.allocator)
+	found := false
+	for &entry in entries {
+		if user, is_user := entry.payload.(session.User_Entry); is_user && user.text == text { found = true }
+	}
+	testing.expect(t, found, "the running session must still record history")
 }
 
 // app_workspace_make creates a directory a session can claim to have run in.
@@ -443,6 +461,9 @@ test_a_switch_to_a_missing_directory_keeps_the_running_session :: proc(t: ^testi
 	claimed, held := session.session_claimed(&app.setup.store)
 	if !testing.expect(t, held, "the running session must stay claimed") { return }
 	testing.expect_value(t, claimed, running)
+
+	// A refusal costs the running session nothing, so it can still take a prompt.
+	app_session_accept(t, &app, "after the refusal")
 }
 
 // A target another process is running is refused, and the session that was on
@@ -468,8 +489,21 @@ test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 	testing.expect(t, !session_switch(&app, id))
 	testing.expect_value(t, app.setup.session.id, running)
 	claimed, held := session.session_claimed(&app.setup.store)
-	if !testing.expect(t, held, "the running session must be reclaimed") { return }
+	if !testing.expect(t, held, "the running session must stay claimed") { return }
 	testing.expect_value(t, claimed, running)
+
+	// The refusal must not have disturbed the running session: it is still claimed
+	// and still writable, not merely named the same.
+	app_session_accept(t, &app, "after the refusal")
+
+	// The running session was never released during the attempt, so another
+	// process still cannot take it. A third store holds no claim of its own, so
+	// its refusal can only come from the running session being locked.
+	prober: session.Store
+	if err := session.store_open(&prober, directory); err != nil { testing.fail_now(t, "third store_open failed") }
+	defer session.store_close(&prober)
+	running_claim_err := session.session_claim(&prober, running)
+	testing.expect(t, session.error_kind(running_claim_err) == session.Error_Kind.Busy, "a refused switch must not have released the running session")
 }
 
 // Resuming has to leave the conversation able to send, so the model the session
