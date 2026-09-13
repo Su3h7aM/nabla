@@ -1069,7 +1069,11 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	case .Compact:
 		set_running(app, true)
 		if runtime_stopping(app) { agent.chat_cancel_request() }
-		agent.chat_command_compact(&app.setup.session, observer, app.run.connection, nil)
+		// Compaction reports why the model side stopped, but a durable write that
+		// failed only latches the session: the reason the user needs is there.
+		if !agent.chat_command_compact(&app.setup.session, observer, app.run.connection, nil) && agent.chat_session_storage_failed(&app.setup.session) {
+			snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
+		}
 	case .Status:
 		agent.chat_notice_status(&app.setup.session, observer, session.now_ms())
 	case .Effort:

@@ -700,11 +700,16 @@ chat_tool_outcome :: proc(status: Tool_Result_Status) -> session.Tool_Outcome {
 // chat_persist_turn_end records the turn's outcome and keeps whatever text the
 // turn produced but never committed. That text is marked partial, so it is
 // evidence in the record and never a finished answer in a later request.
+//
+// It reports whether every write landed. A turn whose outcome did not reach the
+// store must not be reported as the status the model reached, because that would
+// claim a record the database does not have.
 @(private)
-chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) {
+chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (recorded: bool) {
 	turn_no, has_turn := chat.turn_no.?
-	if !has_turn { return }
+	if !has_turn { return true }
 	at_ms := session.now_ms()
+	recorded = true
 
 	if text := string(chat.partial_assistant[:]); text != "" {
 		entry := session.New_Entry {
@@ -714,6 +719,7 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) {
 		}
 		if _, append_err := session.entry_append(chat.store, chat.id, entry); append_err != nil {
 			chat_session_record_failure(chat, "the partial answer could not be recorded", append_err)
+			recorded = false
 		}
 		delete(chat.partial_assistant)
 		chat.partial_assistant = make([dynamic]u8, 0, 0, chat.allocator)
@@ -735,6 +741,7 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) {
 
 	if turn_err := session.turn_finish(chat.store, chat.id, turn_no, outcome, error_json, at_ms); turn_err != nil {
 		chat_session_record_failure(chat, "the turn outcome could not be recorded", turn_err)
+		recorded = false
 	}
 	chat.turn_no = nil
 	chat.active_request = nil
@@ -742,6 +749,7 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) {
 	// write stopped, releases them here.
 	chat_pending_calls_clear(chat)
 	chat_pending_reasoning_clear(chat)
+	return recorded
 }
 
 @(private)
@@ -793,7 +801,13 @@ chat_run_turn_steered :: proc(chat: ^Chat_Session, connection: ai.Provider_Conne
 			chat_session_tools_done(chat, chat.active_turn_id, count)
 			if chat_session_cancelled(chat) { chat_session_note_cancel(chat) }
 		case .Turn_Finished:
-			chat_persist_turn_end(chat, effect)
+			// A turn whose outcome did not reach the store reports the storage failure,
+			// not the status the model reached: the session has no record of it.
+			if !chat_persist_turn_end(chat, effect) {
+				delete(effect.error, effect.allocator)
+				effect.error = chat_clone_string(chat.last_error, effect.allocator)
+				effect.status = .Failed
+			}
 			chat_report_terminal(observer, effect)
 			status := effect.status
 			chat_effect_destroy(&effect)

@@ -186,9 +186,6 @@ chat_clone_string :: proc(value: string, allocator: mem.Allocator) -> string {
 	return strings.clone(value, allocator)
 }
 
-// chat_session_record_failure stops the turn because a durable write failed.
-// The turn is not allowed to continue from memory: the record did not land, and
-// carrying on would let the conversation diverge from what was stored.
 // chat_pending_calls_clear releases calls a turn staged but never ran, such as
 // when a durable write failed before they could be committed.
 chat_pending_calls_clear :: proc(chat: ^Chat_Session) {
@@ -218,6 +215,14 @@ chat_title_from_prompt :: proc(prompt: string, allocator := context.allocator) -
 	return strings.clone(line, allocator)
 }
 
+// chat_session_record_failure stops the turn because a durable write failed. The
+// turn is not allowed to continue from memory: the record did not land, and
+// carrying on would let the conversation diverge from what was stored.
+//
+// The latch is deliberately not conditioned on the error kind. A write that
+// failed for any reason leaves the record's state in question, and separating
+// the kinds here would buy a more permissive policy at the cost of having to
+// reason about which failures are safe to continue past.
 chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: session.Error) {
 	local := err
 	detail := session.error_detail(&local)
@@ -288,6 +293,11 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 chat_session_state :: proc(chat: ^Chat_Session) -> Chat_State { return chat.state }
 chat_session_turn_id :: proc(chat: ^Chat_Session) -> u64 { return chat.active_turn_id }
 chat_session_last_error :: proc(chat: ^Chat_Session) -> string { return chat.last_error }
+
+// chat_session_storage_failed reports whether a durable write failed and latched
+// the session. The front-end reads this to report a command that failed only
+// because the store did.
+chat_session_storage_failed :: proc(chat: ^Chat_Session) -> bool { return chat.storage_failed }
 
 // --- operation ownership -----------------------------------------------------
 
