@@ -434,6 +434,60 @@ test_age_text_reads_in_two_units :: proc(t: ^testing.T) {
 	testing.expect_value(t, chat_age_text(2 * 86_400_000 + 3 * 3_600_000), "2d 3h")
 }
 
+// A response commits its tool calls and then the harness dispatches them. A
+// process that dies between those two writes leaves a call with neither a
+// dispatch nor a result, and recovery has to close it, because the provider is
+// sent the call and its result together.
+@(test)
+test_a_recovered_call_reaches_the_model_answered :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	chat.context_window = 200_000
+	_test_accept(t, chat, "run it")
+	_test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			created_at_ms = 2_000,
+			payload = session.Tool_Call_Entry{call_id = "call_1", name = TOOL_SHELL_NAME, arguments = `{"command":"echo hi"}`},
+		},
+	)
+
+	recovery, recover_err := session.session_recover(
+		chat.store,
+		chat.id,
+		{at_ms = session.now_ms(), recovered_content = TOOL_RECOVERED_RESULT, unexecuted_content = TOOL_UNEXECUTED_RESULT},
+	)
+	if recover_err != nil { testing.fail_now(t, "recovery failed") }
+	testing.expect_value(t, recovery.unexecuted_calls, 1)
+
+	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+
+	// The call and its recovered result are adjacent, and the result names the
+	// call it answers.
+	calls_opened := 0
+	answered := false
+	call_id := ""
+	for message in prep.wire {
+		if len(message.Tool_Calls) > 0 {
+			calls_opened += 1
+			call_id = message.Tool_Calls[0].ID
+		}
+		if message.Role == .Tool && strings.contains(message.Content, `"status":"not_executed"`) {
+			answered = true
+			testing.expect_value(t, message.Tool_Call_ID, call_id)
+		}
+	}
+	testing.expect_value(t, calls_opened, 1)
+	testing.expect(t, answered, "the recovered call must reach the model with a result")
+}
+
 @(test)
 test_usage_is_collected_per_request :: proc(t: ^testing.T) {
 	fixture: Chat_Test

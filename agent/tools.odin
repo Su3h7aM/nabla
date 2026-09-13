@@ -24,6 +24,12 @@ AGENT_SYSTEM_PROMPT :: "You are svan, a coding agent. You have one tool named sh
 // harness knows rather than what it would have to guess.
 TOOL_RECOVERED_RESULT :: `{"status":"unknown","exit_code":null,"stdout":"","stderr":"","stdout_truncated":false,"stderr_truncated":false,"output_incomplete":false,"error":"the session was interrupted before this call finished"}`
 
+// TOOL_UNEXECUTED_RESULT is the model-visible result written for a call that was
+// recorded but never dispatched, because the process died before the harness
+// began it. Unlike TOOL_RECOVERED_RESULT the outcome is not in doubt: the call
+// did not run.
+TOOL_UNEXECUTED_RESULT :: `{"status":"not_executed","exit_code":null,"stdout":"","stderr":"","stdout_truncated":false,"stderr_truncated":false,"output_incomplete":false,"error":"the session was interrupted before this call started"}`
+
 TOOL_MAX_ARGS_BYTES :: 64 * 1024
 TOOL_MAX_CALLS_PER_RESPONSE :: 8
 TOOL_MAX_CALLS_PER_TURN :: 32

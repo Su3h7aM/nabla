@@ -327,15 +327,17 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string) -> bool {
 
 	// Recovery settles what an earlier run left running before anything new is
 	// admitted, so a resumed session never continues from a half-written turn.
-	recovery, recover_err := session.session_recover(&setup.store, target, {at_ms = session.now_ms(), recovered_content = agent.TOOL_RECOVERED_RESULT})
+	recovery, recover_err := session.session_recover(
+		&setup.store,
+		target,
+		{at_ms = session.now_ms(), recovered_content = agent.TOOL_RECOVERED_RESULT, unexecuted_content = agent.TOOL_UNEXECUTED_RESULT},
+	)
 	if recover_err != nil {
 		local := recover_err
 		fmt.eprintln("nabla: cannot settle the session:", session.error_detail(&local))
 		return false
 	}
-	if recovery.interrupted_turns > 0 || recovery.recovered_calls > 0 {
-		fmt.eprintln("nabla: resumed after an interrupted turn; some tool outcomes are unknown")
-	}
+	report_recovery(recovery)
 
 	claimed, held := session.session_claimed(&setup.store)
 	if !held {
@@ -345,6 +347,18 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string) -> bool {
 	setup.workspace = strings.clone(workspace, setup.alloc)
 	setup.session = agent.chat_session_init(&setup.store, claimed, workspace, setup.alloc)
 	return true
+}
+
+// report_recovery says what an earlier run left behind, so a resumed session
+// starts with the two cases told apart: an outcome the harness never saw, and a
+// call it never began.
+report_recovery :: proc(recovery: session.Recovery) {
+	if recovery.recovered_calls > 0 {
+		fmt.eprintf("nabla: %d tool call(s) were dispatched and never came back; their results say the outcome is unknown\n", recovery.recovered_calls)
+	}
+	if recovery.unexecuted_calls > 0 {
+		fmt.eprintf("nabla: %d tool call(s) were recorded and never ran; their results say so\n", recovery.unexecuted_calls)
+	}
 }
 
 // setup_resume_target picks the newest unarchived session that ran in this
@@ -933,7 +947,11 @@ session_switch :: proc(app: ^App, target: session.Session_Id) -> bool {
 		snap_append(app, .Error, fmt.tprintf("cannot take the session: %s", session.error_detail(&local)))
 		return false
 	}
-	_, recover_err := session.session_recover(&setup.store, target, {at_ms = session.now_ms(), recovered_content = agent.TOOL_RECOVERED_RESULT})
+	_, recover_err := session.session_recover(
+		&setup.store,
+		target,
+		{at_ms = session.now_ms(), recovered_content = agent.TOOL_RECOVERED_RESULT, unexecuted_content = agent.TOOL_UNEXECUTED_RESULT},
+	)
 	if recover_err != nil {
 		local := recover_err
 		snap_append(app, .Error, fmt.tprintf("cannot settle the session: %s", session.error_detail(&local)))

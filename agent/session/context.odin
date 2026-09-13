@@ -6,25 +6,35 @@ import "nabla:db"
 
 // --- recovery ---------------------------------------------------------------
 
-// Recovery reports what an interrupted session had to settle.
+// Recovery reports what an interrupted session had to settle. The two call
+// counts are separate because they say different things: a dispatched call may
+// have taken effect, while a call that was never dispatched cannot have.
 Recovery :: struct {
 	interrupted_turns:    int,
 	interrupted_requests: int,
-	recovered_calls:      int,
+	recovered_calls:      int, // dispatched with no result; the outcome is unknown
+	unexecuted_calls:     int, // never dispatched; the call did not run
 }
 
-// Recover_Options carries what recovery needs besides the session itself.
-// recovered_content is the model-visible result written for a call whose
-// outcome the harness never observed; the harness supplies it because it owns
-// the shape of a tool result.
+// Recover_Options carries what recovery needs besides the session itself. Both
+// results are model-visible text the harness supplies, because it owns the shape
+// of a tool result: recovered_content answers a call that was dispatched and
+// never came back, and unexecuted_content answers a call that was never
+// dispatched.
 Recover_Options :: struct {
-	at_ms:             i64,
-	recovered_content: string,
+	at_ms:              i64,
+	recovered_content:  string,
+	unexecuted_content: string,
 }
 
-// session_recover settles a session that was interrupted. A dispatch with no
-// result gets an honest result saying the outcome is unknown, then any request
-// and turn still marked running is closed as interrupted.
+// session_recover settles a session that was interrupted. Every tool call with
+// no result is closed: one that was dispatched may have run, so its result says
+// the outcome is unknown, and one that was never dispatched cannot have run, so
+// its result says it did not execute. Then any request and turn still marked
+// running is closed as interrupted.
+//
+// A result is what makes the record coherent again: a call left without one is
+// a call a later request would send to the model unanswered.
 //
 // Recovery records what the harness knows. It never reruns a tool and never
 // resumes a request, because a dispatch may have taken effect before the
@@ -33,6 +43,7 @@ session_recover :: proc(store: ^Store, id: Session_Id, options: Recover_Options,
 	require_claim(store, id) or_return
 	if options.at_ms <= 0 { return {}, error_make(.Invalid_Argument, "recovery needs a timestamp") }
 	if options.recovered_content == "" { return {}, error_make(.Invalid_Argument, "recovery needs the result text to record") }
+	if options.unexecuted_content == "" { return {}, error_make(.Invalid_Argument, "recovery needs the unexecuted result text to record") }
 
 	if err := db.exec(&store.conn, "BEGIN IMMEDIATE"); err != nil {
 		return {}, storage_error("begin recovery", err)
@@ -40,19 +51,19 @@ session_recover :: proc(store: ^Store, id: Session_Id, options: Recover_Options,
 	committed := false
 	defer if !committed { db.rollback(&store.conn) }
 
-	unresolved, unresolved_err := unresolved_calls(store, id, allocator)
-	if unresolved_err != nil { return {}, unresolved_err }
-	defer delete(unresolved)
+	unsettled, unsettled_err := unsettled_calls(store, id, allocator)
+	if unsettled_err != nil { return {}, unsettled_err }
+	defer delete(unsettled)
 
-	if len(unresolved) > 0 {
+	if len(unsettled) > 0 {
 		base, base_err := scalar_i64(store, ENTRY_NEXT_SEQ, {db.Value(string(id))})
 		if base_err != nil { return {}, base_err }
-		for call, i in unresolved {
+		for call, i in unsettled {
+			// A recovered result is the harness saying what it knows, so there is
+			// no error text: an error would claim a cause it does not have.
 			payload := Tool_Result_Entry {
-				outcome = .Unknown,
-				// A recovered result is the harness admitting it does not know,
-				// so there is no error text: an error would claim a cause.
-				content = options.recovered_content,
+				outcome = .Unknown if call.dispatched else .Not_Executed,
+				content = options.recovered_content if call.dispatched else options.unexecuted_content,
 				origin  = .Recovered,
 			}
 			entry := New_Entry {
@@ -65,7 +76,7 @@ session_recover :: proc(store: ^Store, id: Session_Id, options: Recover_Options,
 			seq := Seq(base + i64(i))
 			if validate_err := validate_new_entry(store, id, seq, entry); validate_err != nil { return {}, validate_err }
 			if insert_err := insert_entry(store, id, seq, entry); insert_err != nil { return {}, insert_err }
-			recovery.recovered_calls += 1
+			if call.dispatched { recovery.recovered_calls += 1 } else { recovery.unexecuted_calls += 1 }
 		}
 	}
 
@@ -86,39 +97,44 @@ session_recover :: proc(store: ^Store, id: Session_Id, options: Recover_Options,
 }
 
 @(private)
-Unresolved_Call :: struct {
+Unsettled_Call :: struct {
 	call_seq:   Seq,
 	turn_no:    Maybe(Turn_No),
 	request_no: Maybe(Request_No),
+	dispatched: bool,
 }
 
-// unresolved_calls finds every dispatch that never produced a result. It runs
-// inside the recovery transaction, so the set cannot change under it.
+// unsettled_calls finds every tool call that never produced a result, whether or
+// not the harness got as far as committing a dispatch for it. It runs inside the
+// recovery transaction, so the set cannot change under it.
 @(private)
-unresolved_calls :: proc(store: ^Store, id: Session_Id, allocator: mem.Allocator) -> ([]Unresolved_Call, Error) {
+unsettled_calls :: proc(store: ^Store, id: Session_Id, allocator: mem.Allocator) -> ([]Unsettled_Call, Error) {
 	rows: db.Rows
-	if err := db.query(&store.conn, &rows, UNRESOLVED_CALLS, {db.Value(string(id))}); err != nil {
-		return nil, storage_error("find unresolved tool calls", err)
+	if err := db.query(&store.conn, &rows, UNSETTLED_CALLS, {db.Value(string(id))}); err != nil {
+		return nil, storage_error("find unsettled tool calls", err)
 	}
 	defer db.rows_close(&rows)
 
-	calls := make([dynamic]Unresolved_Call, 0, 4, allocator)
+	calls := make([dynamic]Unsettled_Call, 0, 4, allocator)
 	complete := false
 	defer if !complete { delete(calls) }
 
 	for {
 		values, has_row, next_err := db.rows_next(&rows)
-		if next_err != nil { return nil, storage_error("find unresolved tool calls", next_err) }
+		if next_err != nil { return nil, storage_error("find unsettled tool calls", next_err) }
 		if !has_row { break }
 		call_seq, seq_err := db.as_i64(values[0])
-		if seq_err != nil { return nil, corrupt_error("read an unresolved call", seq_err) }
+		if seq_err != nil { return nil, corrupt_error("read an unsettled call", seq_err) }
 		turn_no, turn_err := read_optional_i64(values[1])
-		if turn_err != nil { return nil, corrupt_error("read an unresolved call", turn_err) }
+		if turn_err != nil { return nil, corrupt_error("read an unsettled call", turn_err) }
 		request_no, request_err := read_optional_i64(values[2])
-		if request_err != nil { return nil, corrupt_error("read an unresolved call", request_err) }
+		if request_err != nil { return nil, corrupt_error("read an unsettled call", request_err) }
+		dispatched, dispatched_err := db.as_i64(values[3])
+		if dispatched_err != nil { return nil, corrupt_error("read an unsettled call", dispatched_err) }
 
-		call := Unresolved_Call {
-			call_seq = Seq(call_seq),
+		call := Unsettled_Call {
+			call_seq   = Seq(call_seq),
+			dispatched = dispatched != 0,
 		}
 		if value, present := turn_no.?; present { call.turn_no = Turn_No(value) }
 		if value, present := request_no.?; present { call.request_no = Request_No(value) }
@@ -268,7 +284,7 @@ context_load :: proc(store: ^Store, id: Session_Id, allocator := context.allocat
 // --- statements -------------------------------------------------------------
 
 @(private)
-UNRESOLVED_CALLS :: `SELECT d.related_seq, d.turn_no, d.request_no FROM entries AS d WHERE d.session_id = ? AND d.kind = 'tool_dispatch' AND NOT EXISTS (SELECT 1 FROM entries AS r WHERE r.session_id = d.session_id AND r.kind = 'tool_result' AND r.related_seq = d.related_seq) ORDER BY d.seq`
+UNSETTLED_CALLS :: `SELECT c.seq, c.turn_no, c.request_no, EXISTS (SELECT 1 FROM entries AS d WHERE d.session_id = c.session_id AND d.kind = 'tool_dispatch' AND d.related_seq = c.seq) FROM entries AS c WHERE c.session_id = ? AND c.kind = 'tool_call' AND NOT EXISTS (SELECT 1 FROM entries AS r WHERE r.session_id = c.session_id AND r.kind = 'tool_result' AND r.related_seq = c.seq) ORDER BY c.seq`
 
 @(private)
 REQUESTS_INTERRUPT :: `UPDATE requests SET status = 'interrupted', finished_at_ms = ? WHERE session_id = ? AND status = 'running'`
