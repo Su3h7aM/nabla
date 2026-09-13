@@ -139,9 +139,9 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		applied := true
 		if work.text == "" || work.text == "default" {
 			agent.chat_session_set_effort(&app.setup.session, "")
-			snap_append(app, .Notice, "effort cleared to provider default")
+			snap_append(app, .Notice, agent.chat_effort_change_note(""))
 		} else if agent.chat_session_set_effort(&app.setup.session, work.text) {
-			snap_append(app, .Notice, fmt.tprintf("effort set to %s for the next request", work.text))
+			snap_append(app, .Notice, agent.chat_effort_change_note(work.text))
 		} else {
 			applied = false
 			snap_append(app, .Notice, fmt.tprintf("effort %s is not allowed for this model", work.text))

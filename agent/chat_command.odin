@@ -5,6 +5,15 @@ import "core:strings"
 
 import "nabla:agent/session"
 
+// chat_effort_change_note is what a caller reports after changing the effort.
+// The change reaches the provider: reasoning effort is rendered into the prompt
+// prefix, so the prefix the provider has cached no longer matches and the next
+// request reads it again from the start. An empty level means the default.
+chat_effort_change_note :: proc(level: string) -> string {
+	if level == "" { return "effort cleared to provider default; the prompt prefix is read again from the start" }
+	return fmt.tprintf("effort set to %s for the next request; the prompt prefix is read again from the start", level)
+}
+
 chat_notice_effort :: proc(chat: ^Chat_Session, observer: Chat_Observer, provider_id, model_id: string) {
 	if chat.effort != "" {
 		_observer_message(observer, .Notice, fmt.tprintf("effort for %s / %s is %s", provider_id, model_id, chat.effort))
@@ -144,9 +153,9 @@ chat_handle_command :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue:
 		level := strings.trim_space(text[len("/effort "):])
 		if level == "default" {
 			chat_session_set_effort(chat, "")
-			_observer_message(observer, .Notice, "effort cleared to provider default")
+			_observer_message(observer, .Notice, chat_effort_change_note(""))
 		} else if chat_session_set_effort(chat, level) {
-			_observer_message(observer, .Notice, fmt.tprintf("effort set to %s for the next request", level))
+			_observer_message(observer, .Notice, chat_effort_change_note(level))
 		} else {
 			_observer_message(observer, .Notice, fmt.tprintf("effort %s is not allowed for this model", level))
 			chat_notice_effort(chat, observer, provider_id, model_id)
