@@ -24,7 +24,8 @@ Chat_Request_Input :: struct {
 
 @(private)
 Chat_Request_Response :: struct {
-	reason: string `json:"reason"`,
+	reason:   string `json:"reason"`,
+	attempts: int    `json:"attempts"`,
 }
 
 // chat_finish_reason_text is the stable name a request record keeps for why the

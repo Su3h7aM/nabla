@@ -12,7 +12,11 @@ Provider_Event_Callback :: #type proc(user_data: rawptr, event: Provider_Event)
 Provider_Operation_Error_Kind :: enum {
 	None,
 	Invalid_Request,
+	// HTTP means the endpoint answered with a status that is not a usable stream.
 	HTTP,
+	// Transport means the connection failed or ended before the endpoint said
+	// anything usable; Stream means it answered but the stream itself was broken.
+	Transport,
 	Stream,
 	Cancelled,
 	Timed_Out,
@@ -25,6 +29,10 @@ Provider_Operation_Error :: struct {
 	// detail is owned by the caller and released with the operation's allocator,
 	// so a constant message is cloned into it like any other.
 	detail: string,
+	// status is the HTTP response status when the endpoint gave one, and zero when
+	// no response arrived. Retry policy needs the status, and it is a fact about
+	// the request, not about the turn.
+	status: int,
 }
 
 // Provider_Operation_Options is the caller's interruption and trust policy for
@@ -158,6 +166,7 @@ Provider_Request_Operation_Controlled :: proc(
 		if !state.failed { provider_emit_error(&state, provider_failure_kind(failure.kind), failure.detail) }
 		provider_drain_events(&state)
 		if failure.kind == .HTTP_Status && failure.detail != "" { delete(failure.detail, allocator) }
+		state.failure_status = failure.status
 		return provider_terminal_error(&state, provider_operation_error_kind(failure.kind))
 	}
 	if state.failed { return provider_terminal_error(&state, .Stream) }
@@ -191,6 +200,7 @@ Provider_Request_Stream_State :: struct {
 	deadline:       Deadline,
 	failed:         bool,
 	failure_detail: string,
+	failure_status: int,
 	completion:     Provider_Event,
 }
 
@@ -205,8 +215,13 @@ provider_operation_error_kind :: proc(kind: HTTP_Failure_Kind) -> Provider_Opera
 		return .Timed_Out
 	case .TLS:
 		return .TLS
-	case .None, .Transport, .Invalid_URL, .HTTP_Status, .Content_Type:
-		return .Stream
+	case .HTTP_Status:
+		return .HTTP
+	case .Content_Type, .Invalid_URL:
+		return .Invalid_Request
+	case .Transport:
+		return .Transport
+	case .None:
 	}
 	return .Stream
 }
@@ -222,7 +237,7 @@ provider_terminal_error :: proc(state: ^Provider_Request_Stream_State, kind: Pro
 	} else if deadline_expired(state.deadline) {
 		resolved = .Timed_Out
 	}
-	return Provider_Operation_Error{kind = resolved, detail = provider_take_failure_detail(state)}
+	return Provider_Operation_Error{kind = resolved, detail = provider_take_failure_detail(state), status = state.failure_status}
 }
 
 // provider_failure_kind maps a transport failure onto the event kind the caller

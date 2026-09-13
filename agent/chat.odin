@@ -3,6 +3,7 @@ package agent
 import "core:encoding/json"
 import "core:fmt"
 import "core:sys/posix"
+import "core:time"
 
 import "nabla:agent/session"
 import "nabla:ai"
@@ -187,7 +188,24 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		interrupt = &chat_cancel,
 		deadline  = operation.deadline,
 	}
-	operation_error := ai.Provider_Request_Operation_Controlled(connection, prep.request, &runtime, chat_provider_event, options, chat.allocator)
+	// One request may be attempted more than once. A retry happens only while
+	// nothing has been exposed to the model, so the conversation the next request
+	// is built from is the same one, and the model never learns that an attempt
+	// failed. The operation and its deadline span every attempt, so the turn bound
+	// caps the total.
+	attempts := 0
+	operation_error: ai.Provider_Operation_Error
+	for {
+		attempts += 1
+		operation_error = ai.Provider_Request_Operation_Controlled(connection, prep.request, &runtime, chat_provider_event, options, chat.allocator)
+		if !chat_request_may_retry(chat, operation_error, attempts) { break }
+		_observer_message(observer, .Notice, chat_retry_notice(attempts, operation_error))
+		if !chat_retry_wait(chat, chat_retry_delay(attempts)) { break }
+		chat_session_clear_attempt(chat)
+		delete(operation_error.detail, chat.allocator)
+		operation_error = {}
+	}
+	chat.request_attempts = attempts
 	// The error owns its detail, and every path out of the request releases it.
 	defer delete(operation_error.detail, chat.allocator)
 	_observer_assistant_flush(observer)
@@ -297,7 +315,10 @@ chat_commit_response :: proc(
 	response_json := ""
 	if finish_reason != .Unknown {
 		response_json = string(
-			json.marshal(Chat_Request_Response{reason = chat_finish_reason_text(finish_reason)}, allocator = context.temp_allocator) or_else nil,
+			json.marshal(
+				Chat_Request_Response{reason = chat_finish_reason_text(finish_reason), attempts = chat.request_attempts},
+				allocator = context.temp_allocator,
+			) or_else nil,
 		)
 	}
 	error_json := ""
@@ -380,6 +401,99 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	chat_response_output_destroy(&chat.pending_response, chat.allocator)
 	chat.pending_response_present = false
 	return recorded
+}
+
+// CHAT_REQUEST_MAX_ATTEMPTS bounds how many times one request is sent. A retried
+// request reuses the same prepared bytes and the same operation, so the turn
+// bound and the record both span every attempt.
+CHAT_REQUEST_MAX_ATTEMPTS :: 3
+CHAT_RETRY_BASE_DELAY :: 500 * time.Millisecond
+CHAT_RETRY_MAX_DELAY :: 8 * time.Second
+CHAT_RETRY_SLICE :: 50 * time.Millisecond
+
+// chat_request_may_retry decides whether a failed attempt is followed by
+// another. Every reason is explicit: the failure has to be one that could
+// succeed on identical bytes, nothing may have been exposed, the turn must not be
+// stopping, and there has to be an attempt left.
+@(private)
+chat_request_may_retry :: proc(chat: ^Chat_Session, err: ai.Provider_Operation_Error, attempts: int) -> bool {
+	if err.kind == .None { return false }
+	if chat_session_cancelled(chat) { return false }
+	if attempts >= CHAT_REQUEST_MAX_ATTEMPTS { return false }
+	if !chat_request_retryable(err) { return false }
+	return !chat_request_output_exposed(chat)
+}
+
+// chat_request_retryable says whether sending the same bytes again could
+// succeed. Only a transport that never reached a usable response, or a status
+// that providers use for overload and throttling, qualifies. A refusal, a bad
+// request, an unauthenticated peer, and an expired deadline are deterministic:
+// the same bytes would fail the same way.
+@(private)
+chat_request_retryable :: proc(err: ai.Provider_Operation_Error) -> bool {
+	switch err.kind {
+	case .None, .Invalid_Request, .Cancelled, .Timed_Out, .TLS:
+		return false
+	case .Transport, .Stream:
+		return true
+	case .HTTP:
+		return err.status == 408 || err.status == 409 || err.status == 429 || err.status >= 500
+	}
+	return false
+}
+
+// chat_request_output_exposed reports whether the failed attempt produced
+// anything the model or the user could have seen. Once it has, a retry would
+// duplicate output, so the failure is reported instead.
+@(private)
+chat_request_output_exposed :: proc(chat: ^Chat_Session) -> bool {
+	return len(chat.partial_assistant) > 0 || len(chat.pending_calls) > 0 || chat.pending_response_present
+}
+
+// chat_retry_notice is the line a retry reports to the front-end. It is a
+// diagnostic for whoever is watching the turn, never conversation: the model is
+// told nothing about an attempt it never saw.
+@(private)
+chat_retry_notice :: proc(attempt: int, err: ai.Provider_Operation_Error) -> string {
+	if err.status != 0 { return fmt.tprintf("attempt %d did not complete (status %d); retrying", attempt, err.status) }
+	return fmt.tprintf("attempt %d did not complete; retrying", attempt)
+}
+
+@(private)
+chat_retry_delay :: proc(attempt: int) -> time.Duration {	delay := CHAT_RETRY_BASE_DELAY
+	for _ in 1 ..< attempt {
+		delay *= 2
+		if delay >= CHAT_RETRY_MAX_DELAY { return CHAT_RETRY_MAX_DELAY }
+	}
+	return delay
+}
+
+// chat_retry_wait sleeps out one backoff delay. It waits in slices and checks
+// cancellation and the operation deadline between them, so a retry never delays
+// a turn that is being stopped.
+@(private)
+chat_retry_wait :: proc(chat: ^Chat_Session, delay: time.Duration) -> bool {
+	remaining := delay
+	for remaining > 0 {
+		if chat_session_cancelled(chat) { return false }
+		if ai.deadline_expired(chat.operation.deadline) { return false }
+		slice := CHAT_RETRY_SLICE
+		if remaining < slice { slice = remaining }
+		time.sleep(slice)
+		remaining -= slice
+	}
+	return true
+}
+
+// chat_session_clear_attempt forgets the failure of an attempt that exposed
+// nothing, so the next attempt starts as if it were the first. Only a retry that
+// is about to happen calls it, and only while the operation is still running.
+chat_session_clear_attempt :: proc(chat: ^Chat_Session) {
+	if chat.operation.state != .Running { return }
+	delete(chat.last_error, chat.allocator)
+	chat.last_error = ""
+	chat.active_failed = false
+	chat.state = .Requesting
 }
 
 // --- the turn loop -----------------------------------------------------------

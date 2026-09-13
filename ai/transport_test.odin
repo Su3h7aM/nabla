@@ -402,7 +402,7 @@ test_transport_truncated_response_is_not_success :: proc(t: ^testing.T) {
 	transport_job_start(&job)
 	transport_job_join(&job)
 
-	testing.expectf(t, job.error.kind == .Stream, "truncated response was not a stream failure: %v", job.error.kind)
+	testing.expectf(t, job.error.kind == .Transport, "a truncated response is a transport failure: %v", job.error.kind)
 	testing.expect_value(t, job.completions, 0)
 }
 

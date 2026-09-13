@@ -110,6 +110,10 @@ Chat_Session :: struct {
 	// explanation lands after the text it explains.
 	pending_notice:              Chat_Notice,
 	requests_made:               int, // model requests this turn; bounds the tool loop
+	// request_attempts counts how many times the current request was sent. A retry
+	// is one request, so the record keeps one row and this is what says whether the
+	// provider was asked more than once.
+	request_attempts:            int,
 	calls_made:                  int, // tool executions this turn
 	active_failed:               bool,
 	workspace:                   string, // owned; validated process directory
@@ -298,6 +302,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat.active_failed = false
 	chat.requests_made = 0
 	chat.calls_made = 0
+	chat.request_attempts = 0
 	chat.turn_deadline = ai.deadline_in(CHAT_TURN_DEADLINE)
 	// A turn begins uncancelled, so a signal that arrived after the previous turn
 	// finished can never be inherited by this one.
