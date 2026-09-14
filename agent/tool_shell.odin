@@ -14,7 +14,7 @@ TOOL_SHELL_NAME :: "shell"
 
 TOOL_SHELL_DESCRIPTION :: "Execute a command with /bin/sh in a fresh non-interactive process. Standard input is closed. Commands may use shell syntax. Directory and environment changes do not persist between calls. Returns bounded stdout and stderr, exit information, and truncation status. This is not a terminal or background-job service."
 
-TOOL_SHELL_SCHEMA :: `{"type":"object","properties":{"command":{"type":"string","description":"Shell source to execute."},"working_directory":{"type":["string","null"],"description":"Directory relative to the session workspace. Leave out or pass null for the workspace root."},"timeout_ms":{"type":["integer","null"],"description":"Positive timeout in milliseconds. Leave out or pass null for the harness default."}},"required":["command"],"additionalProperties":false}`
+TOOL_SHELL_SCHEMA :: `{"type":"object","properties":{"command":{"type":"string","description":"Shell source to execute."},"working_directory":{"type":["string","null"],"description":"Directory in which to run the command. Relative paths start at the session workspace. Leave out or pass null for the workspace itself."},"timeout_ms":{"type":["integer","null"],"description":"Positive timeout in milliseconds. Leave out or pass null for the harness default."}},"required":["command"],"additionalProperties":false}`
 
 TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms"}
 
@@ -74,8 +74,8 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_She
 	}
 	working_directory, directory_error := tool_field_optional_string(arguments, "working_directory", allocator = ctx.allocator)
 	if directory_error.kind != .None { return {}, directory_error }
-	if !tool_relative_path_ok(working_directory) {
-		return {}, tool_argument_error(.Invalid_Value, "working_directory", "a path inside the workspace", ctx.allocator)
+	if strings.contains_rune(working_directory, 0) {
+		return {}, tool_argument_error(.Invalid_Value, "working_directory", "a path without a NUL byte", ctx.allocator)
 	}
 	timeout_ms, timeout_error := tool_field_optional_int(
 		arguments,
@@ -94,7 +94,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 	defer if args_error.kind != .None { tool_argument_error_destroy(&args_error, ctx.allocator) }
 	if args_error.kind != .None { return tool_result_refused(ctx, &args_error) }
 
-	directory, resolve_error := tool_workspace_path(ctx.workspace, args.working_directory, "working_directory", ctx.allocator)
+	directory, resolve_error := tool_resolve_path(ctx.workspace, args.working_directory, "working_directory", ctx.allocator)
 	if resolve_error.kind != .None { return tool_result_refused(ctx, &resolve_error) }
 	defer delete(directory, ctx.allocator)
 	info, info_error := os.stat(directory, ctx.allocator)
@@ -230,31 +230,14 @@ tool_sanitize_stream :: proc(raw: string, limit: int, allocator := context.alloc
 	return strings.to_string(builder), truncated
 }
 
-// tool_workspace_path resolves a path argument against the session workspace. It
-// refuses a path that walks out with "..", which keeps a call addressing the
-// workspace by policy. This is not containment: a shell command reaches any path
-// the user can, so the restriction is an interface choice rather than a security
-// boundary.
-tool_workspace_path :: proc(workspace, path: string, field := "path", allocator := context.allocator) -> (string, Tool_Argument_Error) {
-	if !tool_relative_path_ok(path) {
-		return "", tool_argument_error(.Invalid_Value, field, "a path inside the workspace", allocator)
+tool_resolve_path :: proc(workspace, path: string, field := "path", allocator := context.allocator) -> (string, Tool_Argument_Error) {
+	if strings.contains_rune(path, 0) {
+		return "", tool_argument_error(.Invalid_Value, field, "a path without a NUL byte", allocator)
 	}
+	if path != "" && path[0] == '/' { return strings.clone(path, allocator), {} }
 	joined, join_error := os.join_path([]string{workspace, path}, allocator)
 	if join_error != nil {
-		return "", tool_argument_error(.Invalid_Value, field, "a path inside the workspace", allocator)
+		return "", tool_argument_error(.Invalid_Value, field, "a valid path", allocator)
 	}
 	return joined, {}
-}
-
-// tool_relative_path_ok reports whether a path stays inside the workspace by
-// shape: relative, free of NUL, and never walking out with "..".
-@(private)
-tool_relative_path_ok :: proc(path: string) -> bool {
-	if path == "" { return true }
-	if path[0] == '/' || strings.contains_rune(path, 0) { return false }
-	remaining := path
-	for part in strings.split_iterator(&remaining, "/") {
-		if part == ".." { return false }
-	}
-	return true
 }

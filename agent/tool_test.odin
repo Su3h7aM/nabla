@@ -186,6 +186,10 @@ test_shell_runs_a_command_and_reports_what_it_did :: proc(t: ^testing.T) {
 	failed := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"exit 3"}`)
 	testing.expect_value(t, failed.outcome, session.Tool_Outcome.Tool_Failed)
 	testing.expect(t, strings.contains(failed.content, `"exit_code":3`), "a nonzero exit is still reported")
+
+	outside := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"pwd","working_directory":"/tmp"}`)
+	testing.expect_value(t, outside.outcome, session.Tool_Outcome.Success)
+	testing.expect(t, strings.contains(outside.content, `"stdout":"/tmp\n"`), "an absolute working directory is used as given")
 }
 
 @(test)
@@ -218,7 +222,8 @@ test_read_reports_the_lines_it_returned :: proc(t: ^testing.T) {
 	defer delete(path, context.temp_allocator)
 	if !tool_write_file(t, path, "one\ntwo\nthree\nfour\n") { return }
 
-	result := tool_run(t, &test, TOOL_READ_NAME, `{"path":"notes.txt","offset":2,"limit":2}`)
+	arguments := strings.concatenate({`{"path":"`, path, `","offset":2,"limit":2}`}, context.temp_allocator)
+	result := tool_run(t, &test, TOOL_READ_NAME, arguments)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
 	testing.expect(t, strings.contains(result.content, `"content":"two\nthree\n"`), "the requested lines are returned")
 	testing.expect(t, strings.contains(result.content, `"total_lines":4`), "the file's line count is reported")
@@ -228,7 +233,7 @@ test_read_reports_the_lines_it_returned :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_write_replaces_a_file_and_keeps_a_refusal_from_touching_it :: proc(t: ^testing.T) {
+test_write_replaces_a_file_by_absolute_or_relative_path :: proc(t: ^testing.T) {
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
@@ -236,16 +241,14 @@ test_write_replaces_a_file_and_keeps_a_refusal_from_touching_it :: proc(t: ^test
 	out := strings.concatenate({tool_test_workspace(&test), "/out.txt"}, context.temp_allocator)
 	defer delete(out, context.temp_allocator)
 
-	result := tool_run(t, &test, TOOL_WRITE_NAME, `{"path":"out.txt","content":"first\n"}`)
+	arguments := strings.concatenate({`{"path":"`, out, `","content":"first\n"}`}, context.temp_allocator)
+	result := tool_run(t, &test, TOOL_WRITE_NAME, arguments)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
 	if !tool_file_is(t, out, "first\n") { return }
 
 	again := tool_run(t, &test, TOOL_WRITE_NAME, `{"path":"out.txt","content":"second"}`)
 	testing.expect_value(t, again.outcome, session.Tool_Outcome.Success)
 	if !tool_file_is(t, out, "second") { return }
-
-	tool_run(t, &test, TOOL_WRITE_NAME, `{"path":"../out.txt","content":"nope"}`)
-	tool_file_is(t, out, "second")
 }
 
 @(test)
@@ -258,7 +261,8 @@ test_edit_applies_every_replacement_or_none :: proc(t: ^testing.T) {
 	defer delete(path, context.temp_allocator)
 	if !tool_write_file(t, path, "alpha beta gamma\n") { return }
 
-	result := tool_run(t, &test, TOOL_EDIT_NAME, `{"path":"code.txt","edits":[{"old":"alpha","new":"ALPHA"},{"old":"gamma","new":"GAMMA"}]}`)
+	arguments := strings.concatenate({`{"path":"`, path, `","edits":[{"old":"alpha","new":"ALPHA"},{"old":"gamma","new":"GAMMA"}]}`}, context.temp_allocator)
+	result := tool_run(t, &test, TOOL_EDIT_NAME, arguments)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
 	if !tool_file_is(t, path, "ALPHA beta GAMMA\n") { return }
 

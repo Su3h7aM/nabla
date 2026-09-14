@@ -168,9 +168,9 @@ blocks on a full pipe.
 - Group termination escalates from `SIGTERM` to `SIGKILL`.
 - Descendants holding output pipes get a bounded drain before cleanup.
 
-Working directory restrictions are invocation policy, not containment: shell
-commands reach absolute paths and symlinks escape any lexical check. A real
-sandbox is a separate project.
+Relative paths start at the session workspace. Absolute paths are used as given,
+and relative paths may walk outside the workspace. The tool system is not a
+sandbox. A permission system is a separate project.
 
 ## MCP
 

@@ -13,9 +13,9 @@ import "core:time"
 
 TOOL_READ_NAME :: "read"
 
-TOOL_READ_DESCRIPTION :: "Read a text file from the session workspace. Returns the requested lines together with the line range they came from and the file's total line count, so a long file can be read in parts."
+TOOL_READ_DESCRIPTION :: "Read a text file. Relative paths start at the session workspace, and absolute paths are used as given. Returns the requested lines together with the line range they came from and the file's total line count, so a long file can be read in parts."
 
-TOOL_READ_SCHEMA :: `{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the session workspace."},"offset":{"type":["integer","null"],"description":"First line to read, counting from 1. Leave out to start at the beginning."},"limit":{"type":["integer","null"],"description":"Maximum number of lines to read. Leave out for the harness default."}},"required":["path"],"additionalProperties":false}`
+TOOL_READ_SCHEMA :: `{"type":"object","properties":{"path":{"type":"string","description":"File path. Relative paths start at the session workspace; absolute paths are used as given."},"offset":{"type":["integer","null"],"description":"First line to read, counting from 1. Leave out to start at the beginning."},"limit":{"type":["integer","null"],"description":"Maximum number of lines to read. Leave out for the harness default."}},"required":["path"],"additionalProperties":false}`
 
 TOOL_READ_FIELDS :: []string{"path", "offset", "limit"}
 
@@ -65,7 +65,7 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Re
 	defer if args_error.kind != .None { tool_argument_error_destroy(&args_error, ctx.allocator) }
 	if args_error.kind != .None { return tool_result_refused(ctx, &args_error) }
 
-	path, resolve_error := tool_workspace_path(ctx.workspace, args.path, allocator = ctx.allocator)
+	path, resolve_error := tool_resolve_path(ctx.workspace, args.path, allocator = ctx.allocator)
 	if resolve_error.kind != .None { return tool_result_refused(ctx, &resolve_error) }
 	defer delete(path, ctx.allocator)
 
@@ -160,9 +160,9 @@ tool_line_span :: proc(text: string, start, limit: int) -> (end: int, lines: int
 
 TOOL_WRITE_NAME :: "write"
 
-TOOL_WRITE_DESCRIPTION :: "Write a text file in the session workspace, replacing whatever it held. The write is atomic: a reader sees either the old file or the whole new one. The parent directory must already exist."
+TOOL_WRITE_DESCRIPTION :: "Write a text file, replacing whatever it held. Relative paths start at the session workspace, and absolute paths are used as given. The write is atomic: a reader sees either the old file or the whole new one. The parent directory must already exist."
 
-TOOL_WRITE_SCHEMA :: `{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the session workspace."},"content":{"type":"string","description":"The complete new contents of the file."}},"required":["path","content"],"additionalProperties":false}`
+TOOL_WRITE_SCHEMA :: `{"type":"object","properties":{"path":{"type":"string","description":"File path. Relative paths start at the session workspace; absolute paths are used as given."},"content":{"type":"string","description":"The complete new contents of the file."}},"required":["path","content"],"additionalProperties":false}`
 
 TOOL_WRITE_FIELDS :: []string{"path", "content"}
 
@@ -197,7 +197,7 @@ tool_write_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 	defer if args_error.kind != .None { tool_argument_error_destroy(&args_error, ctx.allocator) }
 	if args_error.kind != .None { return tool_result_refused(ctx, &args_error) }
 
-	path, resolve_error := tool_workspace_path(ctx.workspace, args.path, allocator = ctx.allocator)
+	path, resolve_error := tool_resolve_path(ctx.workspace, args.path, allocator = ctx.allocator)
 	if resolve_error.kind != .None { return tool_result_refused(ctx, &resolve_error) }
 	defer delete(path, ctx.allocator)
 
@@ -296,9 +296,9 @@ tool_write_atomic :: proc(path: string, content: []u8, mode: os.Permissions, all
 
 TOOL_EDIT_NAME :: "edit"
 
-TOOL_EDIT_DESCRIPTION :: "Replace exact text in a file in the session workspace. Each replacement's old text must appear in the file exactly once, and no two replacements may overlap. All of them are applied in one write or none is."
+TOOL_EDIT_DESCRIPTION :: "Replace exact text in a file. Relative paths start at the session workspace, and absolute paths are used as given. Each replacement's old text must appear in the file exactly once, and no two replacements may overlap. All of them are applied in one write or none is."
 
-TOOL_EDIT_SCHEMA :: `{"type":"object","properties":{"path":{"type":"string","description":"File path relative to the session workspace."},"edits":{"type":"array","minItems":1,"description":"Replacements to apply, each matching exactly once.","items":{"type":"object","properties":{"old":{"type":"string","description":"Text to find, matched byte for byte."},"new":{"type":"string","description":"Text to put in its place."}},"required":["old","new"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}`
+TOOL_EDIT_SCHEMA :: `{"type":"object","properties":{"path":{"type":"string","description":"File path. Relative paths start at the session workspace; absolute paths are used as given."},"edits":{"type":"array","minItems":1,"description":"Replacements to apply, each matching exactly once.","items":{"type":"object","properties":{"old":{"type":"string","description":"Text to find, matched byte for byte."},"new":{"type":"string","description":"Text to put in its place."}},"required":["old","new"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}`
 
 TOOL_EDIT_FIELDS :: []string{"path", "edits"}
 TOOL_EDIT_ITEM_FIELDS :: []string{"old", "new"}
@@ -361,7 +361,7 @@ tool_edit_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Re
 		}
 	}
 
-	path, resolve_error := tool_workspace_path(ctx.workspace, path_argument, allocator = ctx.allocator)
+	path, resolve_error := tool_resolve_path(ctx.workspace, path_argument, allocator = ctx.allocator)
 	if resolve_error.kind != .None { return tool_result_refused(ctx, &resolve_error) }
 	defer delete(path, ctx.allocator)
 

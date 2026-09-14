@@ -183,7 +183,7 @@ tool_content_json :: proc(outcome: session.Tool_Outcome, message: string, data: 
 // AGENT_SYSTEM_PROMPT states what the agent is for. What each tool does, and
 // what arguments it takes, travels with the tool definitions, so this does not
 // repeat them.
-AGENT_SYSTEM_PROMPT :: "You are svan, a coding agent working in a session workspace. The tools available to you are listed with their arguments. Each call returns a JSON object with a status and, on success, a data object. Use the tools to inspect the workspace, change files, and run programs. Never invent tool output. Keep chat replies short."
+AGENT_SYSTEM_PROMPT :: "You are svan, a coding agent working from a session workspace. The tools available to you are listed with their arguments. Each call returns a JSON object with a status and, on success, a data object. Relative paths start at the workspace, while absolute paths may address the wider system. Use the tools to inspect files, make changes, and run programs. Never invent tool output. Keep chat replies short."
 
 // TOOL_MAX_CALLS_PER_RESPONSE and TOOL_MAX_CALLS_PER_TURN bound how much work one
 // response can commit to, so a model cannot turn a single answer into an
