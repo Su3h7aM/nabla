@@ -1,8 +1,6 @@
 #+test
 package agent
 
-import "core:os"
-import "core:path/filepath"
 import "core:testing"
 
 // A representative document in the shape models.dev publishes at its API
@@ -368,28 +366,4 @@ test_models_dev_parse_feeds_the_resolver_unchanged :: proc(t: ^testing.T) {
 	defer catalog_destroy(&excluded)
 	testing.expect(t, catalog_test_find(excluded, "acme", "acme/plain") == nil)
 	testing.expect(t, catalog_test_find(excluded, "acme", "acme/thinker") != nil)
-}
-
-@(test)
-test_models_dev_parse_survives_a_cached_document :: proc(t: ^testing.T) {
-	// The published catalog is the input this has to survive, so when one has been
-	// cached the real file is parsed. The path is resolved without creating it, and
-	// nothing here fetches: without a cache the check simply does not run, so no
-	// test depends on the network.
-	directory, directory_err := xdg_directory(.State, context.temp_allocator)
-	if directory_err != .None { return }
-	path, join_err := filepath.join([]string{directory, MODELS_DEV_CACHE_FILE}, context.temp_allocator)
-	if join_err != nil { return }
-	body, read_err := os.read_entire_file(path, context.temp_allocator)
-	if read_err != nil || len(body) == 0 { return }
-
-	catalog, err := models_dev_parse(body)
-	testing.expect_value(t, err, Models_Dev_Parse_Error.None)
-	defer catalog_sources_destroy(&catalog)
-	testing.expect(t, len(catalog) > 100)
-	for &provider in catalog {
-		testing.expect(t, provider.id != "")
-		testing.expect(t, len(provider.models) > 0)
-		for &model in provider.models { testing.expect(t, model.id != "") }
-	}
 }

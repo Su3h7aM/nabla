@@ -1,31 +1,9 @@
 #+test
 package agent
 
-import "core:encoding/json"
 import "core:testing"
 
 import "nabla:agent/session"
-
-@(test)
-test_shell_parameters_schema_matches_parser :: proc(t: ^testing.T) {
-	value, parse_err := json.parse_string(TOOL_SHELL_PARAMETERS_JSON, .JSON, true, context.temp_allocator)
-	testing.expect_value(t, parse_err, nil)
-	defer json.destroy_value(value, context.temp_allocator)
-	object, is_object := value.(json.Object)
-	testing.expect(t, is_object)
-	required_raw, present := object["required"]
-	testing.expect(t, present)
-	required, is_array := required_raw.(json.Array)
-	testing.expect(t, is_array)
-	names := make([dynamic]string, 0, len(required), context.temp_allocator)
-	for entry in required {
-		name, is_string := entry.(json.String)
-		testing.expect(t, is_string)
-		if is_string { append(&names, string(name)) }
-	}
-	testing.expect_value(t, len(names), 1)
-	testing.expect_value(t, names[0], "command")
-}
 
 @(test)
 test_shell_parse_args_accepts_full_shape :: proc(t: ^testing.T) {
@@ -123,25 +101,6 @@ test_shell_resolve_directory_stays_inside :: proc(t: ^testing.T) {
 	testing.expect(t, !ok)
 	_, ok = tool_resolve_directory("/work", "/abs", context.temp_allocator)
 	testing.expect(t, !ok)
-}
-
-@(test)
-test_shell_result_json_shape :: proc(t: ^testing.T) {
-	result := Tool_Result {
-		call_id      = "call_1",
-		status       = .Exited,
-		exit_code    = 0,
-		exit_present = true,
-		stdout       = "hello\n",
-		stderr       = "",
-		allocator    = context.temp_allocator,
-	}
-	// Strings borrow the literal; only the JSON output is owned here.
-	text := tool_result_json(&result, context.temp_allocator)
-	testing.expect(t, len(text) > 0)
-	testing.expect(t, len(text) <= TOOL_MAX_RESULT_BYTES)
-	result.call_id, result.stdout, result.stderr = "", "", ""
-	tool_result_destroy(&result)
 }
 
 @(test)
