@@ -149,6 +149,30 @@ command_help :: proc(app: ^App) {
 	snap_append(app, .Notice, "  tab completes a command and cycles through the matches")
 	snap_append(app, .Notice, "  a command that names a list opens it when given no argument")
 	snap_append(app, .Notice, "keys: escape interrupt | ctrl+c clear, cancel, then quit")
+	snap_append(app, .Notice, "  the wheel and page up/page down scroll the transcript")
+}
+
+// MOUSE_WHEEL_LINES is how many rows one wheel tick scrolls the transcript.
+MOUSE_WHEEL_LINES :: 3
+
+// wheel_scroll turns a mouse wheel report over the messages area into a scroll
+// delta with the same units Page Up/Down use. Reports below the conversation
+// (the rules, the input line, the footer) are ignored: they are not the
+// messages area, and the wheel has nothing to say about them.
+wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
+	if mouse.y > app.rows - TUI_FOOTER_ROWS {
+		return
+	}
+	#partial switch mouse.button {
+	case .Wheel_Up:
+		app.scroll += MOUSE_WHEEL_LINES
+	case .Wheel_Down:
+		app.scroll -= MOUSE_WHEEL_LINES
+		if app.scroll < 0 {
+			app.scroll = 0
+		}
+	case:
+	}
 }
 
 handle_event :: proc(app: ^App, event: input.Event) {
@@ -158,6 +182,10 @@ handle_event :: proc(app: ^App, event: input.Event) {
 			handle_menu_key(app, data)
 		} else {
 			handle_key(app, data)
+		}
+	case input.Mouse_Event:
+		if !app.menu_open {
+			wheel_scroll(app, data)
 		}
 	case input.Resize_Event:
 	case input.Paste:

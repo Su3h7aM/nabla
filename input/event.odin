@@ -47,6 +47,29 @@ Resize_Event :: struct {
 	rows:    int,
 }
 
+// Mouse_Button names which control produced a mouse report: the three
+// physical buttons button-event tracking reports, plus the four wheel
+// directions of the SGR protocol's 64..67 block.
+Mouse_Button :: enum u8 {
+	Left,
+	Middle,
+	Right,
+	Wheel_Up,
+	Wheel_Down,
+	Wheel_Left,
+	Wheel_Right,
+}
+
+// Mouse_Event is one SGR mouse report (DECSET 1002 + 1006). x and y are the
+// cell coordinates as the protocol sends them, 1-based. release marks a
+// button release and motion a drag report; wheel reports carry neither.
+Mouse_Event :: struct {
+	button:  Mouse_Button,
+	x, y:    int,
+	release: bool,
+	motion:  bool,
+}
+
 // Paste is one bracketed paste (DECSET 2004), emitted when the parser sees
 // CSI 200 ~ … CSI 201 ~. `text` owns its bytes: it is the only event payload
 // that allocates, and the caller releases the whole event list with
@@ -73,6 +96,7 @@ Unknown_Input :: struct {}
 Event :: union #no_nil {
 	Key_Event,
 	Resize_Event,
+	Mouse_Event,
 	Paste,
 	End_Of_Input,
 	Unknown_Input,

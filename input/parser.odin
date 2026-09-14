@@ -33,7 +33,10 @@ Parser :: struct {
 	state:            Parser_State,
 	utf8_expected:    int, // remaining UTF-8 continuation bytes
 	utf8_pending:     u32, // accumulated code point bits
-	params:           [8]u8,
+	// params holds the raw parameter bytes of one CSI/SS3 sequence. An SGR
+	// mouse report needs up to 14 bytes ('<' plus three decimal fields with
+	// separators), so the buffer is sized for that, not for key sequences.
+	params:           [16]u8,
 	param_count:      int,
 	intermediate:     u8,
 	// paste is the scratch for a bracketed paste's raw bytes, allocated with
@@ -246,6 +249,11 @@ parser_sequence :: proc(p: ^Parser, b: u8, events: ^[dynamic]Event, allocator: r
 }
 
 parser_sequence_final :: proc(p: ^Parser, state: Parser_State, final: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> Error {
+	// An SGR mouse report is CSI < Cb ; Cx ; Cy M/m: the leading '<' rides in
+	// the parameter bytes and 'M' (press/motion) and 'm' (release) finalize it.
+	if state == .Csi && p.param_count > 0 && p.params[0] == '<' && (final == 'M' || final == 'm') {
+		return parser_mouse_event(p, final, events, allocator)
+	}
 	code: Key_Code
 	found := false
 	if state == .Ss3 {
@@ -333,6 +341,74 @@ parser_first_param :: proc(p: ^Parser) -> int {
 		return 1
 	}
 	return value
+}
+
+// parser_mouse_fields splits the parameter bytes of an SGR mouse report (after
+// the leading '<') into the protocol's three decimal fields. A field that is
+// empty, non-numeric, or beyond three reports failure.
+parser_mouse_fields :: proc(p: ^Parser) -> (cb, x, y: int, ok: bool) {
+	field := 0
+	value := 0
+	digits := false
+	for i := 1; i < p.param_count; i += 1 {
+		c := p.params[i]
+		switch {
+		case c >= '0' && c <= '9':
+			value = value * 10 + int(c - '0')
+			digits = true
+		case c == ';':
+			if !digits {
+				return 0, 0, 0, false
+			}
+			switch field {
+			case 0:
+				cb = value
+			case 1:
+				x = value
+			case:
+				return 0, 0, 0, false
+			}
+			field += 1
+			value = 0
+			digits = false
+		case:
+			return 0, 0, 0, false
+		}
+	}
+	if field != 2 || !digits {
+		return 0, 0, 0, false
+	}
+	y = value
+	return cb, x, y, true
+}
+
+// parser_mouse_event decodes an SGR mouse report into a Mouse_Event. The
+// protocol packs the control into Cb: the low two bits name the button, bit 32
+// marks motion with a button held, bit 64 marks the wheel, and bits 4/8/16
+// carry shift/alt/ctrl, which pass through the button and wheel masks. A
+// report outside the 1002 vocabulary (button 3, hover reports from tracking
+// modes this parser never enables) is malformed here and becomes
+// Unknown_Input; wheel reports never release.
+parser_mouse_event :: proc(p: ^Parser, final: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> Error {
+	cb, x, y, ok := parser_mouse_fields(p)
+	if !ok || x <= 0 || y <= 0 {
+		return parser_emit(p, events, Unknown_Input{}, allocator)
+	}
+	switch {
+	case cb & 64 != 0:
+		// The wheel block starts at Mouse_Button.Wheel_Up: 64..67 map to 3..6.
+		return parser_emit(p, events, Mouse_Event{button = Mouse_Button((cb & 3) + 3), x = x, y = y}, allocator)
+	case cb & 32 != 0:
+		if cb & 3 == 3 {
+			return parser_emit(p, events, Unknown_Input{}, allocator)
+		}
+		return parser_emit(p, events, Mouse_Event{button = Mouse_Button(cb & 3), x = x, y = y, motion = true}, allocator)
+	case:
+		if cb & 3 == 3 {
+			return parser_emit(p, events, Unknown_Input{}, allocator)
+		}
+		return parser_emit(p, events, Mouse_Event{button = Mouse_Button(cb & 3), x = x, y = y, release = final == 'm'}, allocator)
+	}
 }
 
 // parser_osc discards string content (OSC/DCS/APC/PM/SOS) until BEL or an

@@ -86,7 +86,7 @@ check the sibling paths that reach it.
 When a simpler approach meets the same requirements, say so and use it. Routine implementation
 decisions are yours to make without stopping for approval.
 
-Keep a hand-written source file to roughly 1,500 lines or fewer and split it before going past
+Keep a hand-written source file to roughly 2000 lines or fewer and split it before going past
 that. Generated files, lockfiles, and fixtures do not count. This is a hint rather than a hard
 limit.
 

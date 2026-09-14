@@ -36,7 +36,7 @@
 //   allocator, stores that allocator in the session, and takes ownership of
 //   the /dev/tty descriptor and terminal configuration (termios, file
 //   flags, SIGWINCH disposition, alternate screen, autowrap disposition,
-//   bracketed paste, cursor visibility).
+//   bracketed paste, cursor visibility, mouse reporting).
 //   close restores every entered transition and, on success, frees the
 //   Session with its stored allocator — the caller never calls free on the
 //   handle, and the pointer is dead after the one successful close.
@@ -73,11 +73,11 @@
 //   and restored exactly. Mode state that would need a terminal query is
 //   baseline-assumed instead: autowrap enabled, bracketed paste disabled, the
 //   cursor visible (close shows it unconditionally, since a presented frame may
-//   hide it), and no alternate screen. So a terminal that entered with
-//   autowrap off is left with autowrap on, and one that entered with
-//   bracketed paste on is left with it off. Querying a mode means reading a
-//   DECRQM reply, which would have to be routed back through the input
-//   parser; the narrow contract is worth more than that machinery.
+//   hide it), mouse reporting disabled, and no alternate screen. So a terminal
+//   that entered with autowrap off is left with autowrap on, and one that
+//   entered with bracketed paste on is left with it off. Querying a mode means
+//   reading a DECRQM reply, which would have to be routed back through the
+//   input parser; the narrow contract is worth more than that machinery.
 // - close always attempts every applicable teardown transition even after
 //   an earlier failure, and reports the first cause (the write path's own
 //   error or the Platform_Error from the failed syscall). A transition flag

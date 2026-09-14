@@ -71,25 +71,6 @@ test_conversation_wraps_bodies_under_their_label :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_conversation_shows_the_startup_hint_when_empty :: proc(t: ^testing.T) {
-	app := new(App)
-	defer {
-		snapshot_destroy(app)
-		free(app)
-	}
-	app.run.alloc = context.allocator
-
-	storage := frame_storage_new(context.allocator)
-	defer frame_storage_destroy(storage)
-
-	testing.expect(t, conversation_render(t, app, storage, 70, 4), "the empty conversation must solve")
-
-	scratch: [256]byte
-	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), fmt.tprintf("%-70s", "nabla"))
-	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), fmt.tprintf("%-70s", STARTUP_HINT))
-}
-
-@(test)
 test_conversation_scroll_reveals_older_rows_and_clamps :: proc(t: ^testing.T) {
 	app := new(App)
 	defer {

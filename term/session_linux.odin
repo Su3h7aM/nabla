@@ -28,6 +28,7 @@ Session_Impl :: struct {
 	alt_screen_entered:  bool,
 	autowrap_disabled:   bool,
 	bracketed_paste:     bool,
+	mouse:               bool,
 	cursor_hidden:       bool,
 	sigwinch_installed:  bool,
 	previous_sigaction:  posix.sigaction_t,
@@ -58,6 +59,13 @@ AUTOWRAP_ON :: ansi.CSI + ansi.DECAWM_ON
 // is the same hazard every full-screen program carries.
 BRACKETED_PASTE_ON :: ansi.CSI + "?2004h"
 BRACKETED_PASTE_OFF :: ansi.CSI + "?2004l"
+// Mouse reporting (DECSET 1002 button-event tracking with 1006 SGR extended
+// coordinates). core:terminal/ansi has no constants for these either, so the
+// modes are composed here like bracketed paste. Like the other modes the pair
+// is baseline-assumed rather than queried: close sends the off sequences,
+// leaving mouse reporting off even if the terminal had it on at entry.
+MOUSE_ON :: ansi.CSI + "?1002h" + ansi.CSI + "?1006h"
+MOUSE_OFF :: ansi.CSI + "?1006l" + ansi.CSI + "?1002l"
 
 Linux_Window_Size :: struct {
 	rows, columns, x_pixels, y_pixels: u16,
@@ -199,6 +207,12 @@ _session_open :: proc(s: ^Session, options: Options) -> (err: Error) {
 			return write_err
 		}
 	}
+	if options.mouse {
+		impl.mouse = true
+		if write_err := _session_write(file, MOUSE_ON); write_err != nil {
+			return write_err
+		}
+	}
 	if options.hide_cursor {
 		impl.cursor_hidden = true
 		if write_err := _session_write(file, CURSOR_HIDE); write_err != nil {
@@ -273,6 +287,15 @@ _session_rollback :: proc(impl: ^Session_Impl) -> Error {
 			}
 		} else {
 			impl.bracketed_paste = false
+		}
+	}
+	if impl.mouse {
+		if err := _session_write(impl.file, MOUSE_OFF); err != nil {
+			if first_error == nil {
+				first_error = err
+			}
+		} else {
+			impl.mouse = false
 		}
 	}
 	if impl.autowrap_disabled {
@@ -372,6 +395,15 @@ _session_close :: proc(s: ^Session) -> Error {
 			}
 		} else {
 			impl.bracketed_paste = false
+		}
+	}
+	if impl.mouse {
+		if err := _session_write(impl.file, MOUSE_OFF); err != nil {
+			if first_error == nil {
+				first_error = err
+			}
+		} else {
+			impl.mouse = false
 		}
 	}
 	if impl.autowrap_disabled {

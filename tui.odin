@@ -103,7 +103,7 @@ PICKED_STYLE :: term.Style {
 BODY_INDENT :: 2
 
 // STARTUP_HINT is what an empty transcript shows under the title.
-STARTUP_HINT :: "escape interrupt | ctrl+c clear/cancel/quit | /help for commands"
+STARTUP_HINT :: "pgup/wheel scroll | escape interrupt | ctrl+c clear/cancel/quit | /help for commands"
 
 // CONVERSATION_ID names the transcript's scroll-container root inside the
 // frame, so the solved scroll range can be looked up after the solve.

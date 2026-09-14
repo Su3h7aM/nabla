@@ -93,6 +93,46 @@ test_bracketed_paste :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_sgr_mouse_reports_decode :: proc(t: ^testing.T) {
+	// Wheel up/down with extended coordinates, a button press, its release,
+	// and a drag (motion with the button held).
+	_feed_events(t, "\e[<64;10;5M", []Event{Mouse_Event{button = .Wheel_Up, x = 10, y = 5}})
+	_feed_events(t, "\e[<65;10;5M", []Event{Mouse_Event{button = .Wheel_Down, x = 10, y = 5}})
+	_feed_events(t, "\e[<0;12;9M", []Event{Mouse_Event{button = .Left, x = 12, y = 9}})
+	_feed_events(t, "\e[<0;12;9m", []Event{Mouse_Event{button = .Left, x = 12, y = 9, release = true}})
+	_feed_events(t, "\e[<32;7;7M", []Event{Mouse_Event{button = .Left, x = 7, y = 7, motion = true}})
+
+	// Coordinates the size of a wide terminal still fit the parameter buffer,
+	// a report split across feeds waits for its final byte, and a malformed
+	// report (an empty field, a hover report from a mode this parser never
+	// enables) becomes Unknown_Input and resynchronizes.
+	p: Parser
+	parser_init(&p)
+	defer parser_destroy(&p)
+	events: [dynamic]Event
+	defer events_destroy(&events)
+	partial := "\e[<0;1000;900"
+	testing.expect(t, feed(&p, transmute([]byte)partial, &events) == nil, "partial report must not error")
+	testing.expect_value(t, len(events), 0)
+	final := "M"
+	testing.expect(t, feed(&p, transmute([]byte)final, &events) == nil, "final must not error")
+	testing.expect_value(t, len(events), 1)
+	testing.expect_value(t, events[0], Event(Mouse_Event{button = .Left, x = 1000, y = 900}))
+	events_clear(&events)
+	malformed := []string{"\e[<0;;1M", "\e[<35;1;1M"}
+	for data in malformed {
+		testing.expect(t, feed(&p, transmute([]byte)data, &events) == nil, "malformed report must not error")
+		testing.expect_value(t, len(events), 1)
+		testing.expect_value(t, events[0], Event(Unknown_Input{}))
+		events_clear(&events)
+	}
+	resync := "q"
+	testing.expect(t, feed(&p, transmute([]byte)resync, &events) == nil, "resync must not error")
+	testing.expect_value(t, len(events), 1)
+	testing.expect_value(t, events[0], Event(Key_Event{code = .Character, character = 'q'}))
+}
+
+@(test)
 test_oversized_paste_is_discarded_and_reported :: proc(t: ^testing.T) {
 	p: Parser
 	parser_init(&p)

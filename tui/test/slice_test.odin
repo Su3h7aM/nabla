@@ -32,7 +32,7 @@ DEFAULT_APP :: App {
 // update is pure with respect to the terminal: it takes normalized event data
 // and performs no I/O.
 update :: proc(app: ^App, event: input.Event) {
-	switch data in event {
+	#partial switch data in event {
 	case input.Key_Event:
 		#partial switch data.code {
 		case .Down:

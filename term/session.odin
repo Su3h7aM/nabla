@@ -29,6 +29,12 @@ Options :: struct {
 	// documented baseline, so an application that does not handle the event
 	// should leave it off.
 	bracketed_paste:  bool,
+	// mouse enables SGR mouse reporting (DECSET 1002 button-event tracking and
+	// 1006 extended coordinates) so wheel and button reports arrive as
+	// Mouse_Events instead of undecoded byte soup. close sends the off
+	// sequences, restoring the documented baseline, so an application that
+	// does not handle the events should leave it off.
+	mouse:            bool,
 	input_mode:       Input_Mode,
 }
 

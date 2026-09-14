@@ -298,7 +298,7 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	app.run.work, _ = chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
 	app.run.steer = agent.steer_queue_init(app.run.alloc)
 
-	terminal, open_err := term.open({alternate_screen = true, hide_cursor = true, bracketed_paste = true, input_mode = .Raw}, app.run.alloc)
+	terminal, open_err := term.open({alternate_screen = true, hide_cursor = true, bracketed_paste = true, mouse = true, input_mode = .Raw}, app.run.alloc)
 	if open_err != nil {
 		fmt.eprintln("nabla: cannot open the terminal:", open_err)
 		app_teardown(app)
