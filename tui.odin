@@ -166,7 +166,7 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	storage := new(Frame_Storage, alloc)
 	storage.alloc = alloc
 	storage.layout_storage = make([]byte, layout.storage_size(CONVERSATION_CAPACITIES), alloc)
-	config := layout.Options{
+	config := layout.Options {
 		capacities = CONVERSATION_CAPACITIES,
 		cull       = .Visible,
 	}
@@ -318,21 +318,19 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 
 	for pass in 0 ..< 2 {
 		// Services bind for one frame only, so both passes re-bind.
-		layout.set_services(&storage.layout_ctx, layout.Services{
-			measure_text           = tui.measure_proc,
-			measure_text_user_data = &storage.measure,
-			break_text             = tui.break_proc,
-		})
+		layout.set_services(
+			&storage.layout_ctx,
+			layout.Services{measure_text = tui.measure_proc, measure_text_user_data = &storage.measure, break_text = tui.break_proc},
+		)
 		if layout.frame(&storage.layout_ctx, viewport) {
-			if layout.element(&storage.layout_ctx, layout.Element_Desc{
-				id     = CONVERSATION_ID,
-				layout = layout.Layout_Style{
-					flow   = .Column,
-					sizing = layout.Sizing{width = layout.grow(), height = layout.grow()},
-					align  = .Stretch,
+			if layout.element(
+				&storage.layout_ctx,
+				layout.Element_Desc {
+					id = CONVERSATION_ID,
+					layout = layout.Layout_Style{flow = .Column, sizing = layout.Sizing{width = layout.grow(), height = layout.grow()}, align = .Stretch},
+					clip = layout.Clip_Style{axes = {.Y}, offset = {0, layout.Scalar(offset)}},
 				},
-				clip = layout.Clip_Style{axes = {.Y}, offset = {0, layout.Scalar(offset)}},
-			}) {
+			) {
 				if len(app.run.snap.entries) == 0 {
 					if layout.element(&storage.layout_ctx, layout.Element_Desc{layout = {flow = .Column}}) {
 						layout.text(&storage.layout_ctx, layout.Text_Desc{text = "nabla", style = layout_text_style(TITLE_STYLE)})
@@ -397,13 +395,16 @@ declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry) {
 	if label != "" {
 		indent = BODY_INDENT
 	}
-	if layout.element(ctx, layout.Element_Desc{
-		layout = layout.Layout_Style{
-			sizing  = layout.Sizing{width = layout.fit(), height = layout.fit()},
-			align   = .Stretch,
-			padding = layout.Edges{left = indent, bottom = 1},
+	if layout.element(
+		ctx,
+		layout.Element_Desc {
+			layout = layout.Layout_Style {
+				sizing = layout.Sizing{width = layout.fit(), height = layout.fit()},
+				align = .Stretch,
+				padding = layout.Edges{left = indent, bottom = 1},
+			},
 		},
-	}) {
+	) {
 		if len(cleaned) > 0 {
 			body_style := layout_text_style(entry_style(entry.kind))
 			body_style.wrap = .Words
@@ -415,7 +416,11 @@ declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry) {
 // layout_text_style converts a palette style into layout's text style: the RGB
 // foreground and the bold distinction. Wrap is the declaration's choice.
 layout_text_style :: proc(style: term.Style) -> layout.Text_Style {
-	result := layout.Text_Style{size = 1, font = FONT_NORMAL, wrap = .None}
+	result := layout.Text_Style {
+		size = 1,
+		font = FONT_NORMAL,
+		wrap = .None,
+	}
 	if rgb, ok := style.foreground.(term.RGB_Color); ok {
 		result.color = layout.Color{rgb[0], rgb[1], rgb[2], 255}
 	}
@@ -428,7 +433,7 @@ layout_text_style :: proc(style: term.Style) -> layout.Text_Style {
 // term_text_style maps a solved text command back onto the palette: the
 // inverse of layout_text_style, so the transcript's styles have one origin.
 term_text_style :: proc(style: layout.Text_Style) -> term.Style {
-	result := term.Style{
+	result := term.Style {
 		foreground = term.RGB_Color{style.color[0], style.color[1], style.color[2]},
 	}
 	if style.font == FONT_BOLD {
@@ -613,13 +618,7 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 		} else if status.session_cache_present {
 			cache = fmt.tprintf("cache %dk", (status.session_cache_read + 512) / 1024)
 		}
-		left = fmt.tprintf(
-			"%dk/%dk | cost %s | %s",
-			(status.est_input + 512) / 1024,
-			(status.context_window + 512) / 1024,
-			cost,
-			cache,
-		)
+		left = fmt.tprintf("%dk/%dk | cost %s | %s", (status.est_input + 512) / 1024, (status.context_window + 512) / 1024, cost, cache)
 		right = fmt.tprintf("(%s) %s", status.provider_id, status.model_id)
 		if effort_text := strings.trim_space(status.effort); effort_text != "" {
 			right = fmt.tprintf("%s | %s", right, effort_text)

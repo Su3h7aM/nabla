@@ -221,7 +221,7 @@ test_instructions_encode_per_api :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_chat_encode_effort :: proc(t: ^testing.T) {	messages := make([]Provider_Message, 1, context.temp_allocator)
+test_chat_encode_effort :: proc(t: ^testing.T) {messages := make([]Provider_Message, 1, context.temp_allocator)
 	messages[0] = Provider_Message {
 		Role    = .User,
 		Content = "Hi.",
@@ -936,13 +936,13 @@ test_chat_encode_output_bound_uses_the_current_field :: proc(t: ^testing.T) {
 		Content = "Hi.",
 	}
 	request := Provider_Request {
-		API                      = .OpenAI_Chat_Completions,
-		Model_Present            = true,
-		Model                    = "gpt-5.6",
-		Messages_Present         = true,
-		Messages                 = messages,
+		API                       = .OpenAI_Chat_Completions,
+		Model_Present             = true,
+		Model                     = "gpt-5.6",
+		Messages_Present          = true,
+		Messages                  = messages,
 		Max_Output_Tokens_Present = true,
-		Max_Output_Tokens        = 64,
+		Max_Output_Tokens         = 64,
 	}
 	body, err := Provider_Encode_Request(request, context.temp_allocator)
 	testing.expect_value(t, err, Provider_Request_Error.None)

@@ -62,9 +62,9 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 			_observer_assistant_text(runtime.observer, value.Text)
 		}
 	case ai.Provider_Reasoning_Event:
-		// Reasoning never displays, and it needs no staging: on the Responses
-		// API the verbatim output array is the replay record, and Chat
-		// Completions has no representation for it at all.
+	// Reasoning never displays, and it needs no staging: on the Responses
+	// API the verbatim output array is the replay record, and Chat
+	// Completions has no representation for it at all.
 	case ai.Provider_Completed_Event:
 		// One response feeds one path: tool handoff when the provider
 		// assembled calls, plain completion on stop, failure otherwise.
@@ -460,7 +460,7 @@ chat_retry_notice :: proc(attempt: int, err: ai.Provider_Operation_Error) -> str
 }
 
 @(private)
-chat_retry_delay :: proc(attempt: int) -> time.Duration {	delay := CHAT_RETRY_BASE_DELAY
+chat_retry_delay :: proc(attempt: int) -> time.Duration {delay := CHAT_RETRY_BASE_DELAY
 	for _ in 1 ..< attempt {
 		delay *= 2
 		if delay >= CHAT_RETRY_MAX_DELAY { return CHAT_RETRY_MAX_DELAY }

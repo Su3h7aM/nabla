@@ -11,31 +11,48 @@ import "core:testing"
 
 anthropic_test_request :: proc(allocator := context.temp_allocator) -> Provider_Request {
 	calls := make([]Provider_Tool_Call, 1, allocator)
-	calls[0] = Provider_Tool_Call{ID = "toolu_1", Name = "shell", Arguments = `{"command":"ls"}`}
+	calls[0] = Provider_Tool_Call {
+		ID        = "toolu_1",
+		Name      = "shell",
+		Arguments = `{"command":"ls"}`,
+	}
 	messages := make([]Provider_Message, 4, allocator)
-	messages[0] = Provider_Message{Role = .User, Content = "run it"}
-	messages[1] = Provider_Message{Role = .Assistant, Content = "Working."}
-	messages[2] = Provider_Message{Role = .Assistant, Tool_Calls = calls}
-	messages[3] = Provider_Message{Role = .Tool, Content = `{"status":"exited"}`, Tool_Call_ID = "toolu_1"}
+	messages[0] = Provider_Message {
+		Role    = .User,
+		Content = "run it",
+	}
+	messages[1] = Provider_Message {
+		Role    = .Assistant,
+		Content = "Working.",
+	}
+	messages[2] = Provider_Message {
+		Role       = .Assistant,
+		Tool_Calls = calls,
+	}
+	messages[3] = Provider_Message {
+		Role         = .Tool,
+		Content      = `{"status":"exited"}`,
+		Tool_Call_ID = "toolu_1",
+	}
 	tools := make([]Provider_Tool_Def, 1, allocator)
-	tools[0] = Provider_Tool_Def{
+	tools[0] = Provider_Tool_Def {
 		Name            = "shell",
 		Description     = "Run a command.",
 		Parameters_JSON = `{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}`,
 	}
 	return Provider_Request {
-		API                      = .Anthropic_Messages,
-		Model_Present            = true,
-		Model                    = "claude-sonnet-5",
-		Instructions_Present     = true,
-		Instructions             = "Be brief.",
-		Messages_Present         = true,
-		Messages                 = messages,
-		Tools                    = tools,
+		API = .Anthropic_Messages,
+		Model_Present = true,
+		Model = "claude-sonnet-5",
+		Instructions_Present = true,
+		Instructions = "Be brief.",
+		Messages_Present = true,
+		Messages = messages,
+		Tools = tools,
 		Max_Output_Tokens_Present = true,
-		Max_Output_Tokens        = 1024,
-		Cache_Request_Present    = true,
-		Cache_Request            = true,
+		Max_Output_Tokens = 1024,
+		Cache_Request_Present = true,
+		Cache_Request = true,
 	}
 }
 
@@ -182,23 +199,13 @@ test_anthropic_stream_tool_use_arguments :: proc(t: ^testing.T) {
 	state := Provider_Stream_Start(.Anthropic_Messages, context.temp_allocator)
 	defer Provider_Stream_Destroy(&state)
 
-	events := consume(
-		t,
-		`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"shell","input":{}}}`,
-		&state,
-		0,
-	)
+	events := consume(t, `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"shell","input":{}}}`, &state, 0)
 	// The block index counts every block, so a call after a text block still maps
 	// to the first call slot.
 	events = consume(t, `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}`, &state, 0)
 	events = consume(t, `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}`, &state, 0)
 	events = consume(t, `{"type":"content_block_stop","index":0}`, &state, 0)
-	events = consume(
-		t,
-		`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}`,
-		&state,
-		2,
-	)
+	events = consume(t, `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}`, &state, 2)
 	completed := expect_event(t, events[1], Provider_Completed_Event)
 	testing.expect_value(t, completed.Reason, Provider_Finish_Reason.Tool_Call)
 	if !testing.expect_value(t, len(completed.Tool_Calls), 1) { return }
@@ -246,18 +253,24 @@ test_anthropic_stream_error_event :: proc(t: ^testing.T) {
 @(test)
 test_anthropic_opens_with_a_user_turn_for_a_summary :: proc(t: ^testing.T) {
 	request := Provider_Request {
-		API                      = .Anthropic_Messages,
-		Model_Present            = true,
-		Model                    = "claude-sonnet-5",
-		Instructions_Present     = true,
-		Instructions             = "Be brief.",
-		Messages_Present         = true,
+		API                       = .Anthropic_Messages,
+		Model_Present             = true,
+		Model                     = "claude-sonnet-5",
+		Instructions_Present      = true,
+		Instructions              = "Be brief.",
+		Messages_Present          = true,
 		Max_Output_Tokens_Present = true,
-		Max_Output_Tokens        = 256,
+		Max_Output_Tokens         = 256,
 	}
 	messages := make([]Provider_Message, 2, context.temp_allocator)
-	messages[0] = Provider_Message{Role = .Assistant, Content = "Summary of the conversation so far:\nworked on it"}
-	messages[1] = Provider_Message{Role = .User, Content = "continue"}
+	messages[0] = Provider_Message {
+		Role    = .Assistant,
+		Content = "Summary of the conversation so far:\nworked on it",
+	}
+	messages[1] = Provider_Message {
+		Role    = .User,
+		Content = "continue",
+	}
 	request.Messages = messages
 
 	body, err := Provider_Encode_Request(request, context.temp_allocator)

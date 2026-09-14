@@ -30,16 +30,16 @@ Usage :: struct {
 // measure the session. A caller that wants the warm-period numbers filters by
 // purpose or outcome in the same query and says so.
 Cache_Totals :: struct {
-	input:              i64,
-	cache_read:         i64,
-	cache_write:        i64,
-	output:             i64,
+	input:                i64,
+	cache_read:           i64,
+	cache_write:          i64,
+	output:               i64,
 	// Requests each summed bucket rests on. A bucket the provider never
 	// reported has no denominator of its own; its count stays zero.
-	input_requests:      int,
-	cache_read_requests: int,
+	input_requests:       int,
+	cache_read_requests:  int,
 	cache_write_requests: int,
-	output_requests:     int,
+	output_requests:      int,
 }
 
 cache_totals_add :: proc(totals: ^Cache_Totals, usage: Usage) {

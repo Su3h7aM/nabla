@@ -165,7 +165,7 @@ Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request
 		if message.Verbatim_Items != "" {
 			if request.API != .OpenAI_Responses { return .Invalid_Message }
 			continue
-		}		if message.Role == .Invalid { return .Invalid_Message }
+		}; if message.Role == .Invalid { return .Invalid_Message }
 		#partial switch message.Role {
 		case .Assistant:
 			if message.Content == "" && len(message.Tool_Calls) == 0 { return .Invalid_Message }

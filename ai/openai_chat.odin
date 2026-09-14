@@ -179,8 +179,7 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 				if raw_write, write_present := details["cache_write_tokens"]; write_present {
 					if _, write_is_null := raw_write.(json.Null); !write_is_null {
 						usage.Cache_Write_Tokens, usage.Cache_Write_Tokens_Present, details_ok = openai_value_integer(details, "cache_write_tokens")
-						if !details_ok ||
-						   usage.Cache_Write_Tokens < 0 { return provider_stream_fail(state, .Invalid_Data, "invalid cache_write_tokens") }
+						if !details_ok || usage.Cache_Write_Tokens < 0 { return provider_stream_fail(state, .Invalid_Data, "invalid cache_write_tokens") }
 					}
 				}
 			}

@@ -55,22 +55,22 @@ Fixture_Phase :: enum {
 }
 
 Transport_Fixture :: struct {
-	phase:    Fixture_Phase,
-	cert:     string,
-	key:      string,
-	listener: net.TCP_Socket,
-	port:     int,
+	phase:          Fixture_Phase,
+	cert:           string,
+	key:            string,
+	listener:       net.TCP_Socket,
+	port:           int,
 	// request holds what the client sent, so a test can assert on the fields the
 	// provider layer is responsible for. request_length is set once the read is
 	// complete, before any response byte leaves.
 	request:        [8192]u8,
 	request_length: int,
 	// reached is posted once the server has entered the stall point.
-	reached:  sync.Sema,
+	reached:        sync.Sema,
 	// release lets the server leave the stall point and clean up.
-	release:  sync.Sema,
-	thread:   ^thread.Thread,
-	failed:   bool,
+	release:        sync.Sema,
+	thread:         ^thread.Thread,
+	failed:         bool,
 }
 
 transport_fixture_start :: proc(t: ^testing.T, fixture: ^Transport_Fixture, phase: Fixture_Phase, cert, key: string) -> bool {

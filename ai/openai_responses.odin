@@ -343,11 +343,7 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 		} else {
 			provider_stream_push(
 				state,
-				Provider_Completed_Event {
-					Reason = .Stop,
-					Reason_Text = strings.clone("completed", state.Allocator),
-					Raw_Output = raw_output,
-				},
+				Provider_Completed_Event{Reason = .Stop, Reason_Text = strings.clone("completed", state.Allocator), Raw_Output = raw_output},
 			)
 		}
 		return .None

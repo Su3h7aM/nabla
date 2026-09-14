@@ -345,10 +345,7 @@ anthropic_complete :: proc(state: ^Provider_Stream_State, reason_text: string) -
 		return provider_stream_fail(state, .Invalid_Data, "response ended with unfinished tool calls")
 	}
 	state^.Phase = .Completed
-	provider_stream_push(
-		state,
-		Provider_Completed_Event{Reason = reason, Reason_Text = strings.clone(reason_text, state.Allocator), Tool_Calls = calls},
-	)
+	provider_stream_push(state, Provider_Completed_Event{Reason = reason, Reason_Text = strings.clone(reason_text, state.Allocator), Tool_Calls = calls})
 	return .None
 }
 
@@ -467,8 +464,8 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 			}
 			fragment.Present = true
 		case "thinking", "redacted_thinking":
-			// Not requested by this adapter; ignoring the block keeps an answer the
-			// model already produced from being discarded.
+		// Not requested by this adapter; ignoring the block keeps an answer the
+		// model already produced from being discarded.
 		case:
 			return provider_stream_fail(state, .Unsupported_Tool_Output, "unsupported content block", .None)
 		}
@@ -509,10 +506,10 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 				append(&fragment.Arguments, partial)
 			}
 		case "thinking_delta", "signature_delta", "citations_delta":
-			// Not modelled: this adapter requests no thinking and sends no
-			// documents, so these updates carry nothing the harness can use.
+		// Not modelled: this adapter requests no thinking and sends no
+		// documents, so these updates carry nothing the harness can use.
 		case:
-			// An unknown delta type is a protocol addition, not a defect.
+		// An unknown delta type is a protocol addition, not a defect.
 		}
 		return .None
 	case "content_block_stop":

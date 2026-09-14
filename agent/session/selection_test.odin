@@ -83,8 +83,8 @@ test_a_selection_needs_an_open_store :: proc(t: ^testing.T) {
 test_a_version_one_database_gains_a_selection_and_keeps_its_history :: proc(t: ^testing.T) {
 	test_version_one_migrates_to_current(t)
 
-// A version-two database -- one that predates the response entry -- migrates
-// in place too: the old rows stay readable and a response entry writes.
+	// A version-two database -- one that predates the response entry -- migrates
+	// in place too: the old rows stay readable and a response entry writes.
 	test_version_two_migrates_to_current(t)
 }
 
@@ -212,10 +212,6 @@ test_version_two_migrates_to_current :: proc(t: ^testing.T) {
 
 	// The migrated database admits the new kind.
 	_expect_ok(t, session_claim(&store, sessions[0].id))
-	_, append_err := entry_append(
-		&store,
-		sessions[0].id,
-		{created_at_ms = 2_000, payload = Response_Entry{output = `[{"type":"message"}]`}},
-	)
+	_, append_err := entry_append(&store, sessions[0].id, {created_at_ms = 2_000, payload = Response_Entry{output = `[{"type":"message"}]`}})
 	_expect_ok(t, append_err)
 }

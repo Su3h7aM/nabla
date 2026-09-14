@@ -6,17 +6,17 @@ import "nabla:http/client"
 import "nabla:sse"
 
 HTTP_Request :: struct {
-	url:   string,
-	body:  []u8,
+	url:         string,
+	body:        []u8,
 	// headers are the provider's own request fields, authentication included.
 	// The transport adds only what every event-stream request shares.
-	headers: []client.Header,
+	headers:     []client.Header,
 	// Empty uses the platform trust store. A value replaces it, which tests and
 	// private deployments need. Credentialed HTTPS never runs unverified.
-	ca_file:      string,
+	ca_file:     string,
 	// Empty uses the system resolver configuration. A value replaces it.
-	nameservers:  []net.Endpoint,
-	allocator:    mem.Allocator,
+	nameservers: []net.Endpoint,
+	allocator:   mem.Allocator,
 }
 
 // HTTP_Control is the caller's interruption policy for one request. Both are
@@ -63,12 +63,7 @@ http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: r
 		}
 	}
 
-	failure := sse.post(
-		{url = request.url, body = request.body, headers = request.headers, allocator = request.allocator},
-		options,
-		user_data,
-		callback,
-	)
+	failure := sse.post({url = request.url, body = request.body, headers = request.headers, allocator = request.allocator}, options, user_data, callback)
 	return http_failure_from(failure)
 }
 
