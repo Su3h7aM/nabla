@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+#MISE description="Download and build static third-party libs (sqlite3, OpenSSL) for static linking"
+#USAGE flag "--force" help="Re-download and rebuild even when the .a files already exist"
+#USAGE flag "--clean" help="Remove third_party/src and third_party/lib and exit"
+#USAGE flag "--jobs <n>" help="Build parallelism; defaults to half the cores"
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
+cd "$NABLA_ROOT"
+
+# Pinned versions. Bump the version, the URL, and the checksum together.
+SQLITE_VERSION="3.53.4"
+SQLITE_TARBALL="sqlite-autoconf-3530400.tar.gz"
+SQLITE_URL="https://sqlite.org/2026/$SQLITE_TARBALL"
+# SHA3-256 published on https://sqlite.org/download.html.
+SQLITE_SHA3="454e45f61c6bd75b7420e7190732dea03ce6639c63ada47bbc592f67fc340338"
+
+# OpenSSL 3.5 is the LTS line, supported until April 2030.
+OPENSSL_VERSION="3.5.8"
+OPENSSL_TARBALL="openssl-$OPENSSL_VERSION.tar.gz"
+OPENSSL_URL="https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/$OPENSSL_TARBALL"
+
+force="${usage_force:-false}"
+clean="${usage_clean:-false}"
+jobs="${usage_jobs:-}"
+skip_next=false
+for arg in "$@"; do
+	if "$skip_next"; then
+		jobs="$arg"
+		skip_next=false
+		continue
+	fi
+	case "$arg" in
+		--force) force=true ;;
+		--clean) clean=true ;;
+		--jobs) skip_next=true ;;
+		--jobs=*) jobs="${arg#--jobs=}" ;;
+		-*) nabla_die "unknown flag: $arg" ;;
+		*) nabla_die "unexpected argument: $arg" ;;
+	esac
+done
+if "$skip_next"; then
+	nabla_die "--jobs needs a value"
+fi
+if [[ -z "$jobs" ]]; then
+	# Half the cores: full parallelism starves interactive use, and the
+	# OpenSSL build already dominates the runtime.
+	jobs=$(( $(nproc) / 2 ))
+	if (( jobs < 1 )); then
+		jobs=1
+	fi
+fi
+
+third="$NABLA_ROOT/third_party"
+src="$third/src"
+lib="$third/lib"
+
+if "$clean"; then
+	rm -rf "$src" "$lib"
+	echo "removed $src and $lib"
+	exit 0
+fi
+
+for tool in cc ar make perl curl; do
+	command -v "$tool" >/dev/null || nabla_die "missing required tool: $tool"
+done
+
+mkdir -p "$src" "$lib"
+
+fetch() {
+	local url="$1" dest="$2"
+	if [[ -f "$dest" ]]; then
+		echo "cached $(basename "$dest")"
+		return 0
+	fi
+	echo "download $url"
+	curl -fsSL --retry 3 -o "$dest" "$url"
+}
+
+verify_sha3() {
+	local file="$1" expected="$2"
+	if ! command -v python3 >/dev/null; then
+		echo "warning: python3 not found, skipping checksum check for $(basename "$file")" >&2
+		return 0
+	fi
+	actual="$(python3 -c 'import hashlib,sys; print(hashlib.sha3_256(open(sys.argv[1],"rb").read()).hexdigest())' "$file")"
+	[[ "$actual" == "$expected" ]] || nabla_die "checksum mismatch for $(basename "$file")"
+	echo "checksum ok $(basename "$file")"
+}
+
+build_sqlite() {
+	local out="$lib/libsqlite3.a"
+	if [[ -f "$out" ]] && ! "$force"; then
+		echo "cached libsqlite3.a (use --force to rebuild)"
+		return 0
+	fi
+	nabla_step "sqlite $SQLITE_VERSION"
+	fetch "$SQLITE_URL" "$src/$SQLITE_TARBALL"
+	verify_sha3 "$src/$SQLITE_TARBALL" "$SQLITE_SHA3"
+	rm -rf "$src"/sqlite-autoconf-*/
+	tar -xzf "$src/$SQLITE_TARBALL" -C "$src"
+	(
+		cd "$src/$(tar -tzf "$src/$SQLITE_TARBALL" | head -1 | cut -d/ -f1)"
+		cc -O2 -fPIC -DSQLITE_THREADSAFE=1 -c sqlite3.c -o sqlite3.o
+		ar rcs "$out" sqlite3.o
+	)
+	echo "wrote $out"
+}
+
+build_openssl() {
+	local ssl="$lib/libssl.a" crypto="$lib/libcrypto.a"
+	if [[ -f "$ssl" && -f "$crypto" ]] && ! "$force"; then
+		echo "cached libssl.a libcrypto.a (use --force to rebuild)"
+		return 0
+	fi
+	nabla_step "openssl $OPENSSL_VERSION"
+	fetch "$OPENSSL_URL" "$src/$OPENSSL_TARBALL"
+	fetch "$OPENSSL_URL.sha256" "$src/$OPENSSL_TARBALL.sha256"
+	(cd "$src" && sha256sum -c "$OPENSSL_TARBALL.sha256" --status) \
+		|| nabla_die "checksum mismatch for $OPENSSL_TARBALL"
+	rm -rf "$src/openssl-$OPENSSL_VERSION"
+	tar -xzf "$src/$OPENSSL_TARBALL" -C "$src"
+	(
+		cd "$src/openssl-$OPENSSL_VERSION"
+		perl Configure no-shared no-tests "--prefix=$src/openssl-install" --openssldir=/etc/ssl
+		make "-j$jobs" build_libs
+		cp libssl.a libcrypto.a "$lib/"
+	)
+	echo "wrote $ssl $crypto"
+}
+
+build_sqlite
+build_openssl
+
+nabla_step "done"
+ls -la "$lib"
+cat <<EOF
+
+Link nabla fully static against these with:
+
+  LIBRARY_PATH="\$PWD/third_party/lib" odin build . -collection:nabla="\$PWD" \\
+      -out:build/nabla-static "-extra-linker-flags:-static"
+
+Lua needs nothing: vendor:lua/5.4 already links its bundled liblua54.a.
+Confirm with: ldd build/nabla-static
+(which should report "not a dynamic executable").
+
+Note: this toolchain's clang ignores LIBRARY_PATH for shared lookup, so the
+dynamic-mode variant still binds the system .so files; -static is required.
+Expect ld warnings about dlopen/getaddrinfo: the standard glibc caveat that
+NSS modules load from the host at runtime.
+EOF

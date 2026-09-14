@@ -15,3 +15,7 @@ build/
 # mise local overrides (never committed)
 mise.local.toml
 mise.local.lock
+
+# Static third-party build output (built by scripts/build-static-libs)
+third_party/src/
+third_party/lib/
