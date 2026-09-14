@@ -25,7 +25,7 @@ Chat_Request_Input :: struct {
 @(private)
 Chat_Request_Response :: struct {
 	reason:   string `json:"reason"`,
-	attempts: int    `json:"attempts"`,
+	attempts: int `json:"attempts"`,
 }
 
 // chat_finish_reason_text is the stable name a request record keeps for why the
@@ -75,9 +75,11 @@ chat_request_config_json :: proc(chat: ^Chat_Session, compact: bool) -> string {
 // place, so the record points at them rather than copying them.
 @(private)
 chat_request_input_json :: proc(chat: ^Chat_Session, ctx: session.Context, entry_count: int, compact: bool) -> string {
-	tools := make([dynamic]string, 0, 1, context.temp_allocator)
+	tools := make([dynamic]string, 0, len(chat.tools.definitions), context.temp_allocator)
 	defer delete(tools)
-	if chat.tools_enabled && !compact { append(&tools, TOOL_SHELL_NAME) }
+	if chat.tools_enabled && !compact {
+		for &definition in chat.tools.definitions { append(&tools, definition.name) }
+	}
 
 	input := Chat_Request_Input {
 		instructions = AGENT_SYSTEM_PROMPT if !compact else CHAT_COMPACT_INSTRUCTIONS,

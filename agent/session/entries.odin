@@ -117,37 +117,66 @@ tool_repair_from_name :: proc(name: string) -> (Tool_Repair, bool) {
 }
 
 // Tool_Outcome is what the harness observed when it handled a tool call. It is
-// not a judgement about the model: a nonzero exit is a result, not a mistake.
+// not a judgement about the model: a nonzero exit is an observation about the
+// command, and a refusal before anything ran is one about the arguments.
+//
+// Unknown is the zero value, so a call whose outcome was never recorded reads as
+// unobserved rather than as a success. Invalid_Arguments, Unavailable,
+// Not_Executed, and Transport_Failed all mean nothing ran; Unknown means the
+// harness cannot say.
 Tool_Outcome :: enum {
-	Exited,
+	Unknown,
+	Success,
+	Tool_Failed,
 	Invalid_Arguments,
-	Spawn_Failed,
+	Unavailable,
 	Timed_Out,
 	Cancelled,
 	Not_Executed,
-	IO_Failed,
-	Unknown,
+	Transport_Failed,
 }
 
 @(private)
 tool_outcome_names := [Tool_Outcome]string {
-	.Exited            = "exited",
+	.Unknown           = "unknown",
+	.Success           = "success",
+	.Tool_Failed       = "tool_failed",
 	.Invalid_Arguments = "invalid_arguments",
-	.Spawn_Failed      = "spawn_failed",
+	.Unavailable       = "unavailable",
 	.Timed_Out         = "timed_out",
 	.Cancelled         = "cancelled",
 	.Not_Executed      = "not_executed",
-	.IO_Failed         = "io_failed",
-	.Unknown           = "unknown",
+	.Transport_Failed  = "transport_failed",
 }
 
 tool_outcome_name :: proc(outcome: Tool_Outcome) -> string {
 	return tool_outcome_names[outcome]
 }
 
+// tool_outcome_from_name reads the outcome vocabulary, including the names
+// earlier versions wrote. A stored row keeps its own meaning: a command that
+// exited is a success here whatever its exit code was, because the exit code is
+// not in this field.
 tool_outcome_from_name :: proc(name: string) -> (Tool_Outcome, bool) {
-	for outcome in Tool_Outcome {
-		if tool_outcome_names[outcome] == name { return outcome, true }
+	switch name {
+	case "unknown":
+		return .Unknown, true
+	case "success", "exited":
+		return .Success, true
+	case "tool_failed", "spawn_failed", "io_failed":
+		return .Tool_Failed, true
+	case "invalid_arguments":
+		return .Invalid_Arguments, true
+	case "unavailable":
+		return .Unavailable, true
+	case "timed_out":
+		return .Timed_Out, true
+	case "cancelled":
+		return .Cancelled, true
+	case "not_executed":
+		return .Not_Executed, true
+	case "transport_failed":
+		return .Transport_Failed, true
 	}
 	return .Unknown, false
 }
@@ -278,13 +307,13 @@ Tool_Dispatch_Entry :: struct {
 
 // Tool_Result_Entry is what the harness observed, together with the exact text
 // the model was given. outcome and error are the analysis-facing summary;
-// content is what goes back into the conversation.
+// content is what goes back into the conversation, and it is the only place
+// tool-specific output lives.
 Tool_Result_Entry :: struct {
-	outcome:   Tool_Outcome,
-	exit_code: Maybe(i32),
-	error:     string,
-	content:   string,
-	origin:    Tool_Result_Origin,
+	outcome: Tool_Outcome,
+	error:   string,
+	content: string,
+	origin:  Tool_Result_Origin,
 }
 
 // Checkpoint_Entry is a summary that stands in for the history up to

@@ -132,10 +132,12 @@ chat_build_request_into :: proc(
 			prep.request.Reasoning_Effort = chat.effort
 		}
 		if chat.tools_enabled {
-			append(
-				&prep.tools,
-				ai.Provider_Tool_Def{Name = TOOL_SHELL_NAME, Description = TOOL_SHELL_DESCRIPTION, Parameters_JSON = TOOL_SHELL_PARAMETERS_JSON},
-			)
+			for &definition in chat.tools.definitions {
+				append(
+					&prep.tools,
+					ai.Provider_Tool_Def{Name = definition.name, Description = definition.description, Parameters_JSON = definition.input_schema},
+				)
+			}
 			prep.request.Tools = prep.tools[:]
 		}
 	}
@@ -260,7 +262,7 @@ chat_append_entries :: proc(
 						Role = .Tool,
 						Content = payload.content,
 						Tool_Call_ID = call_ids[call_seq],
-						Tool_Is_Error = payload.outcome != .Exited,
+						Tool_Is_Error = payload.outcome != .Success,
 					},
 				)
 			}

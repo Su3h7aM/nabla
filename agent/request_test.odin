@@ -59,7 +59,9 @@ test_request_retry_needs_an_unexposed_attempt :: proc(t: ^testing.T) {
 	// have left set.
 	_test_accept(t, chat, "go")
 
-	transient := ai.Provider_Operation_Error{kind = .Transport}
+	transient := ai.Provider_Operation_Error {
+		kind = .Transport,
+	}
 	testing.expect(t, chat_request_may_retry(chat, transient, 1))
 	// The last allowed attempt is not followed by another.
 	testing.expect(t, !chat_request_may_retry(chat, transient, CHAT_REQUEST_MAX_ATTEMPTS))
@@ -143,7 +145,9 @@ test_build_request_sets_stable_response_cache_key :: proc(t: ^testing.T) {
 	chat.tools_enabled = true
 	_test_accept(t, chat, "run printf ok")
 
-	responses := ai.Provider_Connection{API = .OpenAI_Responses}
+	responses := ai.Provider_Connection {
+		API = .OpenAI_Responses,
+	}
 	prep, prep_err := chat_prepare(chat, responses)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
@@ -174,21 +178,15 @@ test_build_request_replays_verbatim_response_output_in_order :: proc(t: ^testing
 	chat.tools_enabled = true
 	_test_accept(t, chat, "run printf ok")
 
-	responses := ai.Provider_Connection{API = .OpenAI_Responses}
+	responses := ai.Provider_Connection {
+		API = .OpenAI_Responses,
+	}
 	effect := _test_begin_request(t, chat)
 	chat_effect_destroy(&effect)
 	request_no, begin_err := session.request_begin(
 		chat.store,
 		chat.id,
-		{
-			turn_no = chat.turn_no,
-			purpose = .Response,
-			provider = "p",
-			model_requested = "m",
-			api = "openai_responses",
-			config_json = "{}",
-			input_json = "{}",
-		},
+		{turn_no = chat.turn_no, purpose = .Response, provider = "p", model_requested = "m", api = "openai_responses", config_json = "{}", input_json = "{}"},
 		session.now_ms(),
 	)
 	if !testing.expect_value(t, begin_err, nil) { return }
@@ -313,26 +311,8 @@ test_chat_completions_projects_entries_a_response_entry_covers :: proc(t: ^testi
 	if !testing.expect_value(t, begin_err, nil) { return }
 
 	output := `[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Working."}]},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}]`
-	_test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			request_no = request_no,
-			created_at_ms = 2_000,
-			payload = session.Response_Entry{output = output},
-		},
-	)
-	_test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			request_no = request_no,
-			created_at_ms = 2_001,
-			payload = session.Assistant_Entry{text = "Working."},
-		},
-	)
+	_test_append(t, chat, {turn_no = chat.turn_no, request_no = request_no, created_at_ms = 2_000, payload = session.Response_Entry{output = output}})
+	_test_append(t, chat, {turn_no = chat.turn_no, request_no = request_no, created_at_ms = 2_001, payload = session.Assistant_Entry{text = "Working."}})
 	call_seq := _test_append(
 		t,
 		chat,
@@ -351,7 +331,7 @@ test_chat_completions_projects_entries_a_response_entry_covers :: proc(t: ^testi
 			request_no = request_no,
 			created_at_ms = 2_003,
 			related_seq = call_seq,
-			payload = session.Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = `{"status":"exited"}`, origin = .Observed},
+			payload = session.Tool_Result_Entry{outcome = .Success, content = `{"status":"exited"}`, origin = .Observed},
 		},
 	)
 
@@ -395,7 +375,7 @@ test_a_stored_result_names_its_call :: proc(t: ^testing.T) {
 			turn_no = chat.turn_no,
 			created_at_ms = 2_001,
 			related_seq = call_seq,
-			payload = session.Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = `{"status":"exited"}`, origin = .Observed},
+			payload = session.Tool_Result_Entry{outcome = .Success, content = `{"status":"exited"}`, origin = .Observed},
 		},
 	)
 
@@ -444,7 +424,7 @@ test_anthropic_request_is_shaped_by_its_adapter :: proc(t: ^testing.T) {
 			turn_no = chat.turn_no,
 			created_at_ms = 2_001,
 			related_seq = call_seq,
-			payload = session.Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = `{"status":"exited"}`, origin = .Observed},
+			payload = session.Tool_Result_Entry{outcome = .Success, content = `{"status":"exited"}`, origin = .Observed},
 		},
 	)
 
@@ -512,11 +492,7 @@ bound_of :: proc(object: json.Object, key: string) -> (value: i64, present: bool
 // are allowed to collapse.
 @(test)
 test_a_request_rebuilds_identically_and_only_appends :: proc(t: ^testing.T) {
-	connections := [?]ai.Provider_Connection {
-		{API = .OpenAI_Chat_Completions},
-		{API = .OpenAI_Responses},
-		{API = .Anthropic_Messages},
-	}
+	connections := [?]ai.Provider_Connection{{API = .OpenAI_Chat_Completions}, {API = .OpenAI_Responses}, {API = .Anthropic_Messages}}
 	for connection in connections {
 		fixture: Chat_Test
 		chat_test_begin(t, &fixture, tool_loop_workspace(t))
@@ -540,7 +516,7 @@ test_a_request_rebuilds_identically_and_only_appends :: proc(t: ^testing.T) {
 				turn_no = chat.turn_no,
 				created_at_ms = 2_001,
 				related_seq = call_seq,
-				payload = session.Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = `{"status":"exited"}`, origin = .Observed},
+				payload = session.Tool_Result_Entry{outcome = .Success, content = `{"status":"exited"}`, origin = .Observed},
 			},
 		)
 		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_002, payload = session.Assistant_Entry{text = "done"}})

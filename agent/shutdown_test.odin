@@ -2,9 +2,11 @@
 package agent
 
 import "base:runtime"
+import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import linux "core:sys/linux"
 import "core:sys/posix"
@@ -310,17 +312,25 @@ test_shell_spawn_is_safe_with_running_threads :: proc(t: ^testing.T) {
 
 	workspace := shell_test_workspace(context.temp_allocator)
 	for iteration in 0 ..< 16 {
-		args, parsed := tool_shell_parse_args(`{"command":"printf child-ok","working_directory":null,"timeout_ms":5000}`, context.temp_allocator)
-		if !parsed {
-			testing.expectf(t, false, "iteration %d could not parse arguments", iteration)
+		arguments := tool_arguments_prepare(`{"command":"printf child-ok","working_directory":null,"timeout_ms":5000}`)
+		object, is_object := arguments.value.(json.Object)
+		if !is_object {
+			tool_arguments_destroy(&arguments)
+			testing.expectf(t, false, "iteration %d could not read arguments", iteration)
 			break
 		}
-		result := tool_shell_execute("call_spin", args, workspace, {}, context.temp_allocator)
-		ok_iteration := result.status == .Exited && result.stdout == "child-ok"
+		ctx := Tool_Context {
+			call_id   = "call_spin",
+			workspace = workspace,
+			allocator = context.temp_allocator,
+		}
+		result := tool_shell_execute(&ctx, object)
+		ok_iteration := result.outcome == .Success && strings.contains(result.content, "child-ok")
 		if !ok_iteration {
-			testing.expectf(t, false, "iteration %d produced %v %q", iteration, result.status, result.stdout)
+			testing.expectf(t, false, "iteration %d produced %v %q", iteration, result.outcome, result.content)
 		}
 		tool_result_destroy(&result)
+		tool_arguments_destroy(&arguments)
 		if !ok_iteration { break }
 	}
 

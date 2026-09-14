@@ -1,5 +1,8 @@
 package agent
 
+import "core:encoding/json"
+import "core:fmt"
+
 import "nabla:agent/session"
 
 // --- running tools -----------------------------------------------------------
@@ -7,6 +10,9 @@ import "nabla:agent/session"
 // chat_run_tools executes the calls the current response committed. Each call's
 // intent is recorded before it runs, and its result after, so an interruption
 // between the two is legible as an unknown outcome rather than a guess.
+//
+// It returns how many calls it recorded, which is what the caller compares
+// against the number of committed calls before the turn moves on.
 @(private)
 chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 	control := Tool_Control {
@@ -15,84 +21,98 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 	}
 	count := 0
 	for &staged in chat.pending_calls {
+		ctx := Tool_Context {
+			call_id   = staged.id,
+			workspace = chat.workspace,
+			control   = control,
+			allocator = chat.allocator,
+		}
 		result: Tool_Result
-		prep: Tool_Preparation
 
 		if chat_session_cancelled(chat) {
-			result = tool_error_result(staged.id, .Not_Executed, "turn cancelled before this call ran", chat.allocator)
-		} else if staged.name != TOOL_SHELL_NAME {
-			result = tool_error_result(staged.id, .Invalid_Arguments, "unknown tool", chat.allocator)
+			result = tool_result_failure(&ctx, .Not_Executed, "the turn was cancelled before this call ran", "not executed")
+		} else if definition, present := tool_registry_find(&chat.tools, staged.name); !present {
+			result = tool_result_failure(&ctx, .Unavailable, fmt.tprintf("no tool named %q is available", staged.name), "unavailable")
 		} else {
-			prep = tool_shell_prepare(staged.arguments, chat.allocator)
-			if prep.status == .Rejected {
-				result = tool_argument_result(staged.id, &prep.error, chat.allocator)
-			} else {
-				if prep.status == .Repaired {
-					_observer_message(observer, .Notice, "a shell call was repaired before it ran: a raw control character was escaped")
-				}
-				dispatch := session.New_Entry {
-					turn_no = chat.turn_no,
-					request_no = chat.active_request,
-					created_at_ms = session.now_ms(),
-					related_seq = staged.seq,
-					payload = session.Tool_Dispatch_Entry{tool = staged.name, arguments = prep.effective, repair = prep.repair},
-				}
-				if _, dispatch_err := session.entry_append(chat.store, chat.id, dispatch); dispatch_err != nil {
-					chat_session_record_failure(chat, "the tool dispatch could not be recorded", dispatch_err)
-					tool_preparation_destroy(&prep, chat.allocator)
-					return count
-				}
-				result = tool_shell_execute(staged.id, prep.args, chat.workspace, control, chat.allocator)
-			}
+			prepared, prepared_ok := chat_prepare_call(chat, observer, &staged, definition)
+			if !prepared_ok { return count }
+			result = prepared
 		}
 
-		text := tool_result_json(&result, chat.allocator)
-		_observer_tool_result(observer, staged.name, &result)
-
-		entry := session.New_Entry {
-			turn_no = chat.turn_no,
-			request_no = chat.active_request,
-			created_at_ms = session.now_ms(),
-			related_seq = staged.seq,
-			payload = session.Tool_Result_Entry {
-				outcome = chat_tool_outcome(result.status),
-				exit_code = i32(result.exit_code) if result.exit_present else nil,
-				error = result.error_text,
-				content = text,
-				origin = .Observed,
-			},
-		}
-		_, result_err := session.entry_append(chat.store, chat.id, entry)
-		delete(text, chat.allocator)
-		tool_result_destroy(&result)
-		tool_preparation_destroy(&prep, chat.allocator)
-		if result_err != nil {
-			chat_session_record_failure(chat, "the tool result could not be recorded", result_err)
+		if !chat_record_tool_result(chat, &staged, &result) {
+			tool_result_destroy(&result)
 			return count
 		}
+		_observer_tool_result(observer, staged.name, &result)
+		tool_result_destroy(&result)
 		count += 1
 	}
 	return count
 }
 
-chat_tool_outcome :: proc(status: Tool_Result_Status) -> session.Tool_Outcome {
-	switch status {
-	case .Exited:
-		return .Exited
-	case .Invalid_Arguments:
-		return .Invalid_Arguments
-	case .Spawn_Failed:
-		return .Spawn_Failed
-	case .Timed_Out:
-		return .Timed_Out
-	case .Cancelled:
-		return .Cancelled
-	case .Not_Executed:
-		return .Not_Executed
-	case .IO_Failed:
-		return .IO_Failed
-	case .None:
-		return .Unknown
+// chat_prepare_call admits one call's arguments, records the dispatch, and runs
+// the tool. It reports false when a durable write failed, which leaves the
+// result empty and the turn stopping.
+@(private)
+chat_prepare_call :: proc(
+	chat: ^Chat_Session,
+	observer: Chat_Observer,
+	staged: ^Chat_Tool_Call,
+	definition: ^Tool_Definition,
+) -> (
+	result: Tool_Result,
+	ok: bool,
+) {
+	ctx := Tool_Context {
+		call_id = staged.id,
+		workspace = chat.workspace,
+		control = {interrupt = &chat_cancel, deadline = chat.turn_deadline},
+		allocator = chat.allocator,
 	}
-	return .Unknown
+	arguments := tool_arguments_prepare(staged.arguments, chat.allocator)
+	defer tool_arguments_destroy(&arguments, chat.allocator)
+	if arguments.status == .Rejected {
+		return tool_result_refused(&ctx, &arguments.error), true
+	}
+	if arguments.repair != .None {
+		_observer_message(observer, .Notice, "a tool call was repaired before it ran: a raw control character was escaped")
+	}
+
+	object, is_object := arguments.value.(json.Object)
+	if !is_object {
+		return tool_result_failure(&ctx, .Invalid_Arguments, "the arguments are not a JSON object", "invalid arguments"), true
+	}
+	dispatch := session.New_Entry {
+		turn_no = chat.turn_no,
+		request_no = chat.active_request,
+		created_at_ms = session.now_ms(),
+		related_seq = staged.seq,
+		payload = session.Tool_Dispatch_Entry{tool = staged.name, arguments = arguments.effective, repair = arguments.repair},
+	}
+	if _, dispatch_error := session.entry_append(chat.store, chat.id, dispatch); dispatch_error != nil {
+		chat_session_record_failure(chat, "the tool dispatch could not be recorded", dispatch_error)
+		return {}, false
+	}
+	return definition.execute(&ctx, object), true
+}
+
+// chat_record_tool_result appends the result entry a model later reads. It
+// reports false when the write failed, which stops the turn: a call that ran and
+// left no result is exactly the unanswered call the record must never have.
+@(private)
+chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, result: ^Tool_Result) -> bool {
+	error_text := ""
+	if result.error.kind != .None { error_text = tool_argument_error_text(result.error, context.temp_allocator) }
+	entry := session.New_Entry {
+		turn_no = chat.turn_no,
+		request_no = chat.active_request,
+		created_at_ms = session.now_ms(),
+		related_seq = staged.seq,
+		payload = session.Tool_Result_Entry{outcome = result.outcome, error = error_text, content = result.content, origin = .Observed},
+	}
+	if _, append_error := session.entry_append(chat.store, chat.id, entry); append_error != nil {
+		chat_session_record_failure(chat, "the tool result could not be recorded", append_error)
+		return false
+	}
+	return true
 }

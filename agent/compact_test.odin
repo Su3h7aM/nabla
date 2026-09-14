@@ -13,7 +13,7 @@ compact_call_entry :: proc(seq: session.Seq, id: string) -> session.Entry {
 }
 
 compact_result_entry :: proc(seq: session.Seq) -> session.Entry {
-	return session.Entry{seq = seq, kind = .Tool_Result, payload = session.Tool_Result_Entry{outcome = .Exited, content = "{}", origin = .Observed}}
+	return session.Entry{seq = seq, kind = .Tool_Result, payload = session.Tool_Result_Entry{outcome = .Success, content = "{}", origin = .Observed}}
 }
 
 compact_user_entry :: proc(seq: session.Seq, text: string) -> session.Entry {

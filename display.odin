@@ -1,10 +1,10 @@
 package main
 
-import "core:fmt"
 import "core:strings"
 import "core:unicode/utf8"
 
 import "nabla:agent"
+import "nabla:agent/session"
 
 // Display owns the text sanitizer every transcript renderer needs. Model
 // output, tool output, user text, and diagnostics may carry cursor movement,
@@ -180,20 +180,9 @@ display_clean :: proc(text: string, allocator := context.allocator) -> string {
 }
 
 // tool_display_summary renders one result line for the transcript. The full
-// JSON goes to the model; a human gets the outcome.
+// JSON envelope goes to the model; a human gets the tool's own short line and
+// the outcome name when it has none.
 tool_display_summary :: proc(result: ^agent.Tool_Result) -> string {
-	#partial switch result.status {
-	case .Exited:
-		if result.stdout_trunc || result.stderr_trunc || result.output_trunc {
-			return fmt.tprintf("exited %d (output truncated)", result.exit_code)
-		}
-		return fmt.tprintf("exited %d", result.exit_code)
-	case .Timed_Out:
-		return "timed out"
-	case .Cancelled:
-		return "cancelled"
-	case:
-		if result.error_text != "" { return result.error_text }
-		return "not executed"
-	}
+	if result.reason != "" { return result.reason }
+	return session.tool_outcome_name(result.outcome)
 }

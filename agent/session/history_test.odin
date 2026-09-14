@@ -167,7 +167,7 @@ test_tool_call_dispatch_and_result_are_linked :: proc(t: ^testing.T) {
 			request_no = request,
 			created_at_ms = 2_400,
 			related_seq = call_seq,
-			payload = Tool_Result_Entry{outcome = .Exited, exit_code = 0, content = `{"status":"exited","exit_code":0}`, origin = .Observed},
+			payload = Tool_Result_Entry{outcome = .Success, content = `{"status":"exited","exit_code":0}`, origin = .Observed},
 		},
 	)
 	_expect_ok(t, result_err)
@@ -191,12 +191,8 @@ test_tool_call_dispatch_and_result_are_linked :: proc(t: ^testing.T) {
 	}
 	result, is_result := entries[2].payload.(Tool_Result_Entry)
 	if !testing.expect(t, is_result, "the last entry should be a result") { return }
-	testing.expect_value(t, result.outcome, Tool_Outcome.Exited)
-	if code, present := result.exit_code.?; present {
-		testing.expect_value(t, code, i32(0))
-	} else {
-		testing.fail_now(t, "an exit code of zero is still a reported code")
-	}
+	testing.expect_value(t, result.outcome, Tool_Outcome.Success)
+	testing.expect(t, result.content != "", "the envelope the model reads is stored on the result")
 }
 
 @(test)
@@ -242,7 +238,7 @@ test_a_tool_link_must_name_an_existing_call :: proc(t: ^testing.T) {
 			request_no = request,
 			created_at_ms = 2_200,
 			related_seq = Seq(99),
-			payload = Tool_Result_Entry{outcome = .Exited, content = "x", origin = .Observed},
+			payload = Tool_Result_Entry{outcome = .Success, content = "x", origin = .Observed},
 		},
 	)
 	_expect_error(t, no_such_err, .Invalid_Argument)
@@ -297,7 +293,7 @@ test_a_call_has_at_most_one_dispatch_and_one_result :: proc(t: ^testing.T) {
 		request_no = request,
 		created_at_ms = 2_400,
 		related_seq = call_seq,
-		payload = Tool_Result_Entry{outcome = .Exited, content = "{}", origin = .Observed},
+		payload = Tool_Result_Entry{outcome = .Success, content = "{}", origin = .Observed},
 	}
 	_, first_result_err := entry_append(&store, session.id, result)
 	_expect_ok(t, first_result_err)
@@ -380,10 +376,7 @@ test_cache_totals_sum_finished_requests_and_skip_running :: proc(t: ^testing.T) 
 		2_100,
 	)
 	_expect_ok(t, first_err)
-	_expect_ok(
-		t,
-		request_finish(&store, session.id, first, {outcome = .Completed, usage = Usage{input = 100, output = 10, cache_read = 90}, at_ms = 2_200}),
-	)
+	_expect_ok(t, request_finish(&store, session.id, first, {outcome = .Completed, usage = Usage{input = 100, output = 10, cache_read = 90}, at_ms = 2_200}))
 
 	second, second_err := request_begin(
 		&store,
@@ -392,10 +385,7 @@ test_cache_totals_sum_finished_requests_and_skip_running :: proc(t: ^testing.T) 
 		2_300,
 	)
 	_expect_ok(t, second_err)
-	_expect_ok(
-		t,
-		request_finish(&store, session.id, second, {outcome = .Failed, usage = Usage{input = 50, output = 5, cache_write = 50}, at_ms = 2_400}),
-	)
+	_expect_ok(t, request_finish(&store, session.id, second, {outcome = .Failed, usage = Usage{input = 50, output = 5, cache_write = 50}, at_ms = 2_400}))
 
 	// A running request must not move a reported total.
 	_, running_err := request_begin(
@@ -429,7 +419,12 @@ test_cache_totals_sum_finished_requests_and_skip_running :: proc(t: ^testing.T) 
 	// A read count larger than the total is not a rate: it means an adapter
 	// recorded uncached input without normalizing it, so the number is refused
 	// rather than shown above 100%.
-	inconsistent := Cache_Totals{input = 10, cache_read = 20, input_requests = 1, cache_read_requests = 1}
+	inconsistent := Cache_Totals {
+		input               = 10,
+		cache_read          = 20,
+		input_requests      = 1,
+		cache_read_requests = 1,
+	}
 	_, inconsistent_measured := cache_hit_rate(inconsistent)
 	testing.expect(t, !inconsistent_measured)
 }
@@ -479,7 +474,7 @@ test_entry_payloads_round_trip :: proc(t: ^testing.T) {
 		Response_Entry{output = `[{"type":"message","id":"msg_1"}]`},
 		Tool_Call_Entry{call_id = "call_1", item_id = "item_1", name = "shell", arguments = `{"command":"ls"}`},
 		Tool_Dispatch_Entry{tool = "shell", arguments = `{"command":"ls","timeout_ms":30000}`, repair = .Escaped_Control_Characters},
-		Tool_Result_Entry{outcome = .Exited, exit_code = 2, error = "", content = `{"status":"exited"}`, origin = .Observed},
+		Tool_Result_Entry{outcome = .Success, error = "", content = `{"status":"exited"}`, origin = .Observed},
 		Tool_Result_Entry{outcome = .Unknown, content = `{"status":"unknown"}`, origin = .Recovered},
 		Checkpoint_Entry{summary = "so far", covered_seq = Seq(4), previous_seq = Seq(2)},
 	}

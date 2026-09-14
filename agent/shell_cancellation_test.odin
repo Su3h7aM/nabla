@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:net"
@@ -52,28 +53,39 @@ shell_test_workspace :: proc(allocator: mem.Allocator) -> string {
 Shell_Run :: struct {
 	thread:    ^thread.Thread,
 	control:   Tool_Control,
-	args:      Tool_Shell_Args,
+	command:   string,
 	workspace: string,
 	result:    Tool_Result,
 	started:   sync.Sema,
 }
 
 shell_run_start :: proc(run: ^Shell_Run, workspace: string, command: string, control: Tool_Control) -> bool {
-	args, ok := tool_shell_parse_args(
-		fmt.aprintf(`{{"command":%q,"working_directory":null,"timeout_ms":10000}}`, command, allocator = context.temp_allocator),
-		context.temp_allocator,
-	)
-	if !ok { return false }
 	run.workspace = workspace
 	run.control = control
-	run.args = args
+	run.command = command
 	run.thread = test_thread_start(shell_run_serve, run, "svan-shell-run")
 	return run.thread != nil
 }
 
 shell_run_serve :: proc(thread: ^thread.Thread) {
 	run := cast(^Shell_Run)thread.data
-	run.result = tool_shell_execute("call_shell", run.args, run.workspace, run.control, context.allocator)
+	raw := fmt.aprintf(`{{"command":%q,"working_directory":null,"timeout_ms":10000}}`, run.command)
+	defer delete(raw)
+	arguments := tool_arguments_prepare(raw)
+	defer tool_arguments_destroy(&arguments)
+
+	ctx := Tool_Context {
+		call_id   = "call_shell",
+		workspace = run.workspace,
+		control   = run.control,
+		allocator = context.allocator,
+	}
+	object, is_object := arguments.value.(json.Object)
+	if !is_object {
+		run.result = tool_result_failure(&ctx, .Invalid_Arguments, "the test arguments did not parse")
+		return
+	}
+	run.result = tool_shell_execute(&ctx, object)
 }
 
 shell_run_join :: proc(run: ^Shell_Run) {
@@ -108,14 +120,20 @@ shell_await_pid_file :: proc(path: string) -> (int, bool) {
 test_shell_timeout_applies_after_pipes_close :: proc(t: ^testing.T) {
 	allocator := context.temp_allocator
 	workspace := shell_test_workspace(allocator)
-	args, ok := tool_shell_parse_args(`{"command":"exec 1>&- 2>&-; sleep 5","working_directory":null,"timeout_ms":100}`, allocator)
-	testing.expect(t, ok)
-	defer tool_shell_args_destroy(&args, allocator)
+	arguments := tool_arguments_prepare(`{"command":"exec 1>&- 2>&-; sleep 5","working_directory":null,"timeout_ms":100}`)
+	defer tool_arguments_destroy(&arguments)
+	object, is_object := arguments.value.(json.Object)
+	if !testing.expect(t, is_object, "the arguments should parse") { return }
+	ctx := Tool_Context {
+		call_id   = "call_timeout",
+		workspace = workspace,
+		allocator = allocator,
+	}
 	started := time.tick_now()
-	result := tool_shell_execute("call_timeout", args, workspace, {}, context.temp_allocator)
+	result := tool_shell_execute(&ctx, object)
 	defer tool_result_destroy(&result)
 	elapsed := time.tick_since(started)
-	testing.expect_value(t, result.status, Tool_Result_Status.Timed_Out)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Timed_Out)
 	testing.expectf(t, elapsed < 2 * time.Second, "100ms budget took %v; retirement ignored the deadline", elapsed)
 }
 
@@ -147,7 +165,7 @@ test_shell_cancel_terminates_descendants :: proc(t: ^testing.T) {
 	shell_run_join(&run)
 	defer tool_result_destroy(&run.result)
 
-	testing.expect_value(t, run.result.status, Tool_Result_Status.Cancelled)
+	testing.expect_value(t, run.result.outcome, session.Tool_Outcome.Cancelled)
 	testing.expectf(t, shell_await_process_gone(descendant), "descendant %d survived cancellation", descendant)
 }
 
@@ -173,7 +191,7 @@ test_shell_cancel_escalates_when_sigterm_is_ignored :: proc(t: ^testing.T) {
 	elapsed := time.tick_since(started)
 	defer tool_result_destroy(&run.result)
 
-	testing.expect_value(t, run.result.status, Tool_Result_Status.Cancelled)
+	testing.expect_value(t, run.result.outcome, session.Tool_Outcome.Cancelled)
 	testing.expectf(t, elapsed >= TOOL_KILL_GRACE, "returned in %v without waiting out the SIGTERM grace, so SIGKILL was not the escalation path", elapsed)
 }
 

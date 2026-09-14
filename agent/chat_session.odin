@@ -95,6 +95,11 @@ Chat_Session :: struct {
 	// let the conversation diverge from what was stored.
 	storage_failed:              bool,
 
+	// tools is the set of tools a turn may dispatch, owned by the chat. It is
+	// fixed for the session's life, so a response always runs against the
+	// definitions it was advertised with.
+	tools:                       Tool_Registry,
+
 	// partial_assistant is streamed text that has not been committed. It stays
 	// provisional until the turn settles.
 	partial_assistant:           [dynamic]u8,
@@ -165,6 +170,7 @@ chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspa
 		pending_calls = make([dynamic]Chat_Tool_Call, 0, allocator),
 		effort_levels = make([dynamic]string, 0, allocator),
 		workspace = strings.clone(workspace, allocator),
+		tools = tool_registry_make(allocator),
 	}
 }
 
@@ -189,6 +195,7 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	delete(chat.workspace, chat.allocator)
 	delete(chat.provider_id, chat.allocator)
 	delete(chat.model_id, chat.allocator)
+	tool_registry_destroy(&chat.tools)
 	chat^ = {}
 }
 

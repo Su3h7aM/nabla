@@ -183,7 +183,7 @@ test_tool_calls_are_recorded_then_run :: proc(t: ^testing.T) {
 
 	result, is_result := entries[3].payload.(session.Tool_Result_Entry)
 	if !testing.expect(t, is_result, "the fourth entry should be a result") { return }
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Exited)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
 	testing.expect_value(t, result.origin, session.Tool_Result_Origin.Observed)
 	testing.expect(t, strings.contains(result.content, "tool-ok"), "the model-visible result should carry the output")
 
@@ -195,7 +195,7 @@ test_tool_calls_are_recorded_then_run :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_invalid_arguments_get_a_result_without_a_dispatch :: proc(t: ^testing.T) {
+test_invalid_arguments_get_a_dispatch_and_result :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
@@ -229,13 +229,14 @@ test_invalid_arguments_get_a_result_without_a_dispatch :: proc(t: ^testing.T) {
 
 	entries := _test_entries(t, chat)
 	defer session.entries_destroy(entries, context.allocator)
-	// A rejected call never ran, so there is no dispatch: the prompt, the call, and
-	// the result that explains why nothing happened.
-	if !testing.expect_value(t, len(entries), 3) { return }
+	// Dispatch records the effective arguments before execution. The result then
+	// records that validation refused the call before any effect.
+	if !testing.expect_value(t, len(entries), 4) { return }
 	testing.expect_value(t, entries[1].kind, session.Entry_Kind.Tool_Call)
-	testing.expect_value(t, entries[2].kind, session.Entry_Kind.Tool_Result)
-	result, is_result := entries[2].payload.(session.Tool_Result_Entry)
-	if !testing.expect(t, is_result, "the second entry should be a result") { return }
+	testing.expect_value(t, entries[2].kind, session.Entry_Kind.Tool_Dispatch)
+	testing.expect_value(t, entries[3].kind, session.Entry_Kind.Tool_Result)
+	result, is_result := entries[3].payload.(session.Tool_Result_Entry)
+	if !testing.expect(t, is_result, "the last entry should be a result") { return }
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
 }
 
@@ -263,7 +264,7 @@ test_malformed_arguments_are_rejected_and_replayed :: proc(t: ^testing.T) {
 	result, is_result := entries[2].payload.(session.Tool_Result_Entry)
 	if !testing.expect(t, is_result, "a rejected call still gets a result") { return }
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
-	testing.expect(t, strings.contains(result.content, `"code":"syntax"`), "the result names the defect")
+	testing.expect(t, strings.contains(result.content, `"kind":"syntax"`), "the result names the defect")
 
 	// The proposal must never reach the wire: an endpoint refuses tool arguments it
 	// cannot parse, and one unsendable request would poison every request after it.
@@ -355,7 +356,12 @@ test_a_response_with_an_unparseable_call_is_not_replayed_verbatim :: proc(t: ^te
 			request_no = request_no,
 			created_at_ms = 2_003,
 			related_seq = call_seq,
-			payload = session.Tool_Result_Entry{outcome = .Invalid_Arguments, error = "the arguments are not valid JSON", content = `{\"status\":\"invalid_arguments\"}`, origin = .Observed},
+			payload = session.Tool_Result_Entry {
+				outcome = .Invalid_Arguments,
+				error = "the arguments are not valid JSON",
+				content = `{\"status\":\"invalid_arguments\"}`,
+				origin = .Observed,
+			},
 		},
 	)
 
@@ -403,7 +409,8 @@ test_unknown_tool_is_reported_not_run :: proc(t: ^testing.T) {
 	defer session.entries_destroy(entries, context.allocator)
 	result, is_result := entries[len(entries) - 1].payload.(session.Tool_Result_Entry)
 	if !testing.expect(t, is_result, "the last entry should be a result") { return }
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Unavailable)
+	testing.expect(t, strings.contains(result.content, "nope"), "the result names the tool the model asked for")
 }
 
 @(test)
@@ -567,7 +574,15 @@ test_unusable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T) {
 	request_no, begin_err := session.request_begin(
 		chat.store,
 		chat.id,
-		{turn_no = chat.turn_no, purpose = .Response, provider = "p", model_requested = "m", api = "openai_chat_completions", config_json = "{}", input_json = "{}"},
+		{
+			turn_no = chat.turn_no,
+			purpose = .Response,
+			provider = "p",
+			model_requested = "m",
+			api = "openai_chat_completions",
+			config_json = "{}",
+			input_json = "{}",
+		},
 		session.now_ms(),
 	)
 	if !testing.expect_value(t, begin_err, nil) { return }

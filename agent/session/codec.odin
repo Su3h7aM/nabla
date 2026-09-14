@@ -51,11 +51,10 @@ Tool_Dispatch_Wire :: struct {
 
 @(private)
 Tool_Result_Wire :: struct {
-	outcome:   string `json:"outcome"`,
-	exit_code: Maybe(i32) `json:"exit_code"`,
-	error:     string `json:"error"`,
-	content:   string `json:"content"`,
-	origin:    string `json:"origin"`,
+	outcome: string `json:"outcome"`,
+	error:   string `json:"error"`,
+	content: string `json:"content"`,
+	origin:  string `json:"origin"`,
 }
 
 @(private)
@@ -86,15 +85,18 @@ entry_payload_encode :: proc(payload: Entry_Payload, allocator := context.alloca
 		}
 		return json_encode(wire, allocator)
 	case Tool_Dispatch_Entry:
-		wire := Tool_Dispatch_Wire{tool = value.tool, arguments = value.arguments, repair = tool_repair_name(value.repair)}
+		wire := Tool_Dispatch_Wire {
+			tool      = value.tool,
+			arguments = value.arguments,
+			repair    = tool_repair_name(value.repair),
+		}
 		return json_encode(wire, allocator)
 	case Tool_Result_Entry:
 		wire := Tool_Result_Wire {
-			outcome   = tool_outcome_name(value.outcome),
-			exit_code = value.exit_code,
-			error     = value.error,
-			content   = value.content,
-			origin    = tool_result_origin_name(value.origin),
+			outcome = tool_outcome_name(value.outcome),
+			error   = value.error,
+			content = value.content,
+			origin  = tool_result_origin_name(value.origin),
 		}
 		return json_encode(wire, allocator)
 	case Checkpoint_Entry:
@@ -178,11 +180,10 @@ entry_payload_decode :: proc(kind: Entry_Kind, data: string, allocator: mem.Allo
 		delete(wire.origin, allocator)
 		vocabulary_ok = outcome_known && origin_known
 		payload = Tool_Result_Entry {
-			outcome   = outcome,
-			exit_code = wire.exit_code,
-			error     = wire.error,
-			content   = wire.content,
-			origin    = origin,
+			outcome = outcome,
+			error   = wire.error,
+			content = wire.content,
+			origin  = origin,
 		}
 	case .Checkpoint:
 		wire: Checkpoint_Wire
