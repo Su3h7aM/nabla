@@ -60,7 +60,12 @@ App :: struct {
 	storage:           ^Frame_Storage,
 	home:              string, // owned; shortens the footer path,
 	input:             widgets.Input,
-	scroll:            int, // lines scrolled back; 0 follows the bottom,
+	scroll:            int, // rows scrolled back; 0 follows the bottom,
+	// conv_scroll_range is the conversation's scrollable height in rows, as
+	// the last completed layout frame reported it. The offset handed to layout
+	// is range - scroll, so a scroll of 0 pins the newest content to the
+	// bottom and the range shrinks and grows with the transcript.
+	conv_scroll_range: int,
 	generation_seen:   u64,
 	cancel_seen:       bool, // the running cancel came from our own keys, not a signal,
 	spin_lap:          time.Tick, // last working-frame advance,

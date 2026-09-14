@@ -290,6 +290,11 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	app.input = widgets.Input{}
 	widgets.input_init(&app.input, app.run.alloc)
 	app.storage = frame_storage_new(app.run.alloc)
+	if app.storage == nil {
+		fmt.eprintln("nabla: cannot allocate the frame budget")
+		app_teardown(app)
+		return false
+	}
 	app.run.work, _ = chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
 	app.run.steer = agent.steer_queue_init(app.run.alloc)
 

@@ -14,6 +14,7 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 
+import "nabla:layout"
 import "nabla:term"
 import "nabla:text"
 import "nabla:tui"
@@ -101,6 +102,38 @@ PICKED_STYLE :: term.Style {
 // reference layout.
 BODY_INDENT :: 2
 
+// STARTUP_HINT is what an empty transcript shows under the title.
+STARTUP_HINT :: "escape interrupt | ctrl+c clear/cancel/quit | /help for commands"
+
+// CONVERSATION_ID names the transcript's scroll-container root inside the
+// frame, so the solved scroll range can be looked up after the solve.
+CONVERSATION_ID :: layout.Id(1)
+
+// FONT_NORMAL and FONT_BOLD travel in layout.Text_Style.font, which layout
+// never interprets: the transcript's one styling distinction beyond color.
+FONT_NORMAL :: layout.Font(0)
+FONT_BOLD :: layout.Font(1)
+
+// CONVERSATION_CAPACITIES budgets one transcript frame: three nodes per
+// labeled entry (label, body element, body text) and two per unlabeled one,
+// plus the root. Commands stay bounded by the viewport because culling drops
+// every line outside the conversation's clip. A frame whose transcript
+// outgrows a pool fails and leaves the previous screen up.
+// ponytail: layout storage is fixed at init, so measured_words bounds a frame
+// at ~131k transcript words; the upgrade path is a reserve API in layout.
+CONVERSATION_CAPACITIES :: layout.Capacities {
+	nodes          = 16384,
+	children       = 32768,
+	clips          = 8,
+	commands       = 4096,
+	text_lines     = 32768,
+	measured_words = 131072,
+	measure_cache  = 8192,
+	id_table       = 8,
+	depth          = 8,
+	diagnostics    = 64,
+}
+
 // Line is one wrapped display line: text is borrowed from frame scratch and
 // lives until the frame is presented.
 Line :: struct {
@@ -116,24 +149,40 @@ Render_Status :: enum u8 {
 	Buffer_Too_Small,
 }
 
-// Frame_Storage is the caller-owned frame budget: the cell grid backing and
-// the presentation scratch, sized to the current viewport.
+// Frame_Storage is the caller-owned frame budget: the cell grid backing, the
+// presentation scratch, and the layout context with its fixed storage, sized
+// to the current viewport.
 Frame_Storage :: struct {
-	cells:  []term.Cell,
-	buffer: term.Frame_Buffer,
-	output: []byte,
-	alloc:  mem.Allocator,
+	cells:          []term.Cell,
+	buffer:         term.Frame_Buffer,
+	output:         []byte,
+	alloc:          mem.Allocator,
+	layout_ctx:     layout.Context,
+	layout_storage: []byte, // owned,
+	measure:        tui.Measure_Context,
 }
 
 frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	storage := new(Frame_Storage, alloc)
 	storage.alloc = alloc
+	storage.layout_storage = make([]byte, layout.storage_size(CONVERSATION_CAPACITIES), alloc)
+	config := layout.Options{
+		capacities = CONVERSATION_CAPACITIES,
+		cull       = .Visible,
+	}
+	if layout.init_from_buffer(&storage.layout_ctx, config, storage.layout_storage) != nil {
+		delete(storage.layout_storage, alloc)
+		free(storage, alloc)
+		return nil
+	}
 	return storage
 }
 
 frame_storage_destroy :: proc(storage: ^Frame_Storage) {
 	if storage.cells != nil { delete(storage.cells, storage.alloc) }
 	if storage.output != nil { delete(storage.output, storage.alloc) }
+	layout.destroy(&storage.layout_ctx)
+	if storage.layout_storage != nil { delete(storage.layout_storage, storage.alloc) }
 	free(storage, storage.alloc)
 }
 
@@ -231,7 +280,9 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 		draw_menu(app, storage, conv_rect)
 		draw_input_hint(app, storage, input_rect)
 	} else {
-		draw_conversation(app, storage, conv_rect)
+		if !draw_conversation(app, storage, conv_rect) {
+			return {}, .Layout_Failed
+		}
 		cursor = draw_input(app, storage, input_rect)
 	}
 	// The rule above the input doubles as the working indicator while a
@@ -246,56 +297,144 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 	return cursor, .None
 }
 
-// draw_conversation renders the transcript: an amber label per entry, its
-// body indented under it, and a blank line between entries. An empty
-// transcript shows the startup hint instead.
-draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
+// draw_conversation solves the transcript as a layout column and draws the
+// visible text lines into rect. The conversation root is a scroll container:
+// app.scroll counts rows back from the bottom (0 follows it), and the clip
+// offset is range - scroll.
+//
+// The offset needs the solved range, which the same frame produces. The first
+// pass uses the previous frame's range; when that moved (new rows, a resize,
+// a cleared transcript), the frame re-solves once with the corrected offset,
+// so following the bottom never trails the newest row.
+draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> bool {
 	if rect.height <= 0 || rect.width <= 0 {
-		return
+		return true
 	}
-	lines := make([dynamic]Line, 0, 64, context.temp_allocator)
-	if len(app.run.snap.entries) == 0 {
-		append(&lines, Line{text = "nabla", style = TITLE_STYLE})
-		append(&lines, Line{text = "escape interrupt | ctrl+c clear/cancel/quit | /help for commands", style = HINT_STYLE})
-	} else {
-		for &entry in app.run.snap.entries {
-			emit_entry(&entry, rect.width, &lines)
+	if app.scroll > app.conv_scroll_range {
+		app.scroll = app.conv_scroll_range
+	}
+	offset := app.conv_scroll_range - app.scroll
+	viewport := layout.Vec2{layout.Scalar(rect.width), layout.Scalar(rect.height)}
+
+	for pass in 0 ..< 2 {
+		// Services bind for one frame only, so both passes re-bind.
+		layout.set_services(&storage.layout_ctx, layout.Services{
+			measure_text           = tui.measure_proc,
+			measure_text_user_data = &storage.measure,
+			break_text             = tui.break_proc,
+		})
+		if layout.frame(&storage.layout_ctx, viewport) {
+			if layout.element(&storage.layout_ctx, layout.Element_Desc{
+				id     = CONVERSATION_ID,
+				layout = layout.Layout_Style{
+					flow   = .Column,
+					sizing = layout.Sizing{width = layout.grow(), height = layout.grow()},
+					align  = .Stretch,
+				},
+				clip = layout.Clip_Style{axes = {.Y}, offset = {0, layout.Scalar(offset)}},
+			}) {
+				if len(app.run.snap.entries) == 0 {
+					if layout.element(&storage.layout_ctx, layout.Element_Desc{layout = {flow = .Column}}) {
+						layout.text(&storage.layout_ctx, layout.Text_Desc{text = "nabla", style = layout_text_style(TITLE_STYLE)})
+						layout.text(&storage.layout_ctx, layout.Text_Desc{text = STARTUP_HINT, style = layout_text_style(HINT_STYLE)})
+					}
+				} else {
+					for &entry in app.run.snap.entries {
+						declare_entry(&storage.layout_ctx, &entry)
+					}
+				}
+			}
 		}
-	}
-	total := len(lines)
-	if total == 0 {
-		return
-	}
-	visible := rect.height
-	scroll_max := total - visible
-	if scroll_max < 0 {
-		scroll_max = 0
-	}
-	scroll := app.scroll
-	if scroll > scroll_max {
-		scroll = scroll_max
-	}
-	start := total - visible - scroll
-	if start < 0 {
-		start = 0
-	}
-	for i in 0 ..< visible {
-		idx := start + i
-		if idx >= total {
-			break
+		frame_result, frame_error := layout.result(&storage.layout_ctx)
+		if frame_error != .None {
+			return false
 		}
-		line := &lines[idx]
-		row := tui.Cell_Rect {
-			x      = rect.x + line.indent,
-			y      = rect.y + i,
-			width  = rect.width - line.indent,
-			height = 1,
+		node, found := layout.lookup(frame_result, CONVERSATION_ID)
+		if !found {
+			return false
 		}
-		if row.width <= 0 {
+		app.conv_scroll_range = int(node.scroll_range.y)
+		if app.scroll > app.conv_scroll_range {
+			app.scroll = app.conv_scroll_range
+		}
+		corrected := app.conv_scroll_range - app.scroll
+		if corrected == offset || pass == 1 {
+			return draw_conversation_commands(storage, frame_result)
+		}
+		offset = corrected
+	}
+	return false
+}
+
+// draw_conversation_commands projects the solved frame's text commands into
+// the cell grid. Culling already dropped every line outside the clip.
+draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result) -> bool {
+	for command in frame_result.commands {
+		text_data, is_text := command.data.(layout.Text_Cmd)
+		if !is_text {
 			continue
 		}
-		_, _ = tui.draw_text(&storage.buffer, row, line.text, line.style)
+		line, project_err := tui.project_rect_integral(command.bounds)
+		if project_err != nil {
+			return false
+		}
+		_, _ = tui.draw_text(&storage.buffer, line, text_data.text, term_text_style(text_data.style))
 	}
+	return true
+}
+
+// declare_entry adds one transcript entry to the open conversation frame: the
+// label when the kind has one, then the cleaned body in a padded element. The
+// element's bottom padding is the blank row that separates entries, so the
+// spacing scrolls with the content instead of being pasted in at draw time.
+declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry) {
+	label, label_style := entry_label(entry.kind)
+	if label != "" {
+		layout.text(ctx, layout.Text_Desc{text = label, style = layout_text_style(label_style)})
+	}
+	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
+	indent := layout.Scalar(0)
+	if label != "" {
+		indent = BODY_INDENT
+	}
+	if layout.element(ctx, layout.Element_Desc{
+		layout = layout.Layout_Style{
+			sizing  = layout.Sizing{width = layout.fit(), height = layout.fit()},
+			align   = .Stretch,
+			padding = layout.Edges{left = indent, bottom = 1},
+		},
+	}) {
+		if len(cleaned) > 0 {
+			body_style := layout_text_style(entry_style(entry.kind))
+			body_style.wrap = .Words
+			layout.text(ctx, layout.Text_Desc{text = cleaned, style = body_style})
+		}
+	}
+}
+
+// layout_text_style converts a palette style into layout's text style: the RGB
+// foreground and the bold distinction. Wrap is the declaration's choice.
+layout_text_style :: proc(style: term.Style) -> layout.Text_Style {
+	result := layout.Text_Style{size = 1, font = FONT_NORMAL, wrap = .None}
+	if rgb, ok := style.foreground.(term.RGB_Color); ok {
+		result.color = layout.Color{rgb[0], rgb[1], rgb[2], 255}
+	}
+	if .Bold in style.modifiers {
+		result.font = FONT_BOLD
+	}
+	return result
+}
+
+// term_text_style maps a solved text command back onto the palette: the
+// inverse of layout_text_style, so the transcript's styles have one origin.
+term_text_style :: proc(style: layout.Text_Style) -> term.Style {
+	result := term.Style{
+		foreground = term.RGB_Color{style.color[0], style.color[1], style.color[2]},
+	}
+	if style.font == FONT_BOLD {
+		result.modifiers = {.Bold}
+	}
+	return result
 }
 
 // draw_menu renders the open choice list: the title, the last selection error
@@ -373,23 +512,8 @@ draw_input_hint :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect)
 	_, _ = tui.draw_text(&storage.buffer, rect, hint, HINT_STYLE)
 }
 
-// emit_entry turns one conversation entry into a label plus wrapped body
-// lines, followed by a blank line for the spacing between blocks.
-emit_entry :: proc(entry: ^Entry, width: int, out: ^[dynamic]Line) {
-	if width <= 0 {
-		return
-	}
-	label, label_style := entry_label(entry.kind)
-	indent := 0
-	if label != "" {
-		append(out, Line{text = label, style = label_style})
-		indent = BODY_INDENT
-	}
-	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
-	wrap_text(cleaned, max(width - indent, 1), indent, entry_style(entry.kind), out)
-	append(out, Line{style = {}})
-}
-
+// entry_label returns the label a transcript entry shows and its style. An
+// empty label means the entry has no label row.
 entry_label :: proc(kind: Entry_Kind) -> (string, term.Style) {
 	switch kind {
 	case .User:
@@ -419,79 +543,6 @@ entry_style :: proc(kind: Entry_Kind) -> term.Style {
 		return ERROR_TEXT
 	}
 	return {}
-}
-
-// wrap_text splits sanitized text into wrapped lines. Paragraphs wrap on
-// spaces; the text policy (nabla:text) expands tabs at their line column and
-// drops undrawable clusters, so the measured line and the drawn line agree.
-wrap_text :: proc(value: string, width: int, indent: int, style: term.Style, out: ^[dynamic]Line) {
-	pos := 0
-	for {
-		nl := strings.index_byte(value[pos:], '\n')
-		para := value[pos:]
-		if nl >= 0 {
-			para = value[pos:pos + nl]
-		}
-		if nl != 0 {
-			emit_paragraph(para, width, indent, style, out)
-		} else {
-			append(out, Line{style = style, indent = indent})
-		}
-		if nl < 0 {
-			break
-		}
-		pos += nl + 1
-	}
-}
-
-emit_paragraph :: proc(para: string, width: int, indent: int, style: term.Style, out: ^[dynamic]Line) {
-	if len(para) == 0 {
-		return
-	}
-	word := strings.builder_make(0, 0, context.temp_allocator)
-	words := make([dynamic]string, 0, 8, context.temp_allocator)
-	flush_word :: proc(word: ^strings.Builder, words: ^[dynamic]string) {
-		if strings.builder_len(word^) > 0 {
-			append(words, strings.clone(strings.to_string(word^), context.temp_allocator))
-			strings.builder_reset(word)
-		}
-	}
-	for r in para {
-		switch {
-		case r == ' ':
-			flush_word(&word, &words)
-		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
-		// A control code point never reaches a cell; the sanitizer already
-		// dropped escape sequences, and the policy drops the rest at draw
-		// time, so it is not part of a word here either. A tab is kept: the
-		// policy expands it against its column.
-		case:
-			strings.write_rune(&word, r)
-		}
-	}
-	flush_word(&word, &words)
-	if len(words) == 0 {
-		append(out, Line{style = style, indent = indent})
-		return
-	}
-	line_buf := strings.builder_make(0, 0, context.temp_allocator)
-	col := 0
-	for w in words {
-		// Measure the word where it lands: a tab's width depends on the
-		// column, so the line is wrapped in the same columns it will draw in.
-		if col > 0 && col + 1 + text.text_columns_at(w, col + 1) > width {
-			append(out, Line{text = strings.clone(strings.to_string(line_buf), context.temp_allocator), style = style, indent = indent})
-			strings.builder_reset(&line_buf)
-			col = 0
-		}
-		if col > 0 {
-			strings.write_byte(&line_buf, ' ')
-			col += 1
-		}
-		strings.write_string(&line_buf, w)
-		col += text.text_columns_at(w, col)
-	}
-	append(out, Line{text = strings.clone(strings.to_string(line_buf), context.temp_allocator), style = style, indent = indent})
 }
 
 // draw_working renders the rule row as the working indicator: dashes, a gap,
