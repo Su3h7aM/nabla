@@ -241,8 +241,9 @@ anthropic_tool_def :: proc(tool: Provider_Tool_Def, allocator := context.allocat
 	definition := make(json.Object, 4, allocator)
 	anthropic_object_set(&definition, "name", json.String(strings.clone(tool.Name, allocator)), allocator)
 	anthropic_object_set(&definition, "description", json.String(strings.clone(tool.Description, allocator)), allocator)
+	// Strict schema enforcement is not set: an optional argument has to stay
+	// optional, and the harness reads and validates the arguments itself.
 	anthropic_object_set(&definition, "input_schema", json.Value(json.clone_value(schema, allocator)), allocator)
-	anthropic_object_set(&definition, "strict", json.Boolean(true), allocator)
 	return json.Value(definition), true
 }
 

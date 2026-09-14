@@ -23,15 +23,8 @@ test_shell_parameters_schema_matches_parser :: proc(t: ^testing.T) {
 		testing.expect(t, is_string)
 		if is_string { append(&names, string(name)) }
 	}
-	testing.expect_value(t, len(names), 3)
-	expected_names := []string{"command", "working_directory", "timeout_ms"}
-	for expected in expected_names {
-		found := false
-		for name in names {
-			if name == expected { found = true }
-		}
-		testing.expectf(t, found, "schema required lacks %q", expected)
-	}
+	testing.expect_value(t, len(names), 1)
+	testing.expect_value(t, names[0], "command")
 }
 
 @(test)
@@ -49,20 +42,54 @@ test_shell_parse_args_accepts_full_shape :: proc(t: ^testing.T) {
 test_shell_parse_args_rejects_shapes :: proc(t: ^testing.T) {
 	cases := []string {
 		`{}`,
+		`{"working_directory":null,"timeout_ms":null}`,
 		`{"command":"","working_directory":null,"timeout_ms":null}`,
-		`{"command":"echo","working_directory":null}`,
+		`{"command":"   "}`,
 		`{"command":"echo","working_directory":null,"timeout_ms":null,"extra":1}`,
 		`{"command":"echo","command":"ls","working_directory":null,"timeout_ms":null}`,
 		`{"command":"echo","working_directory":"/abs","timeout_ms":null}`,
+		`{"command":"echo","working_directory":"../out"}`,
 		`{"command":"echo","working_directory":null,"timeout_ms":0}`,
 		`{"command":"echo","working_directory":null,"timeout_ms":999999999}`,
+		`{"command":"echo","working_directory":null,"timeout_ms":"soon"}`,
+		`{"command":"echo","working_directory":7}`,
+		`{"command":"echo","timeout_ms":true}`,
 		`[1,2]`,
 	}
 	for raw in cases {
 		args, ok := tool_shell_parse_args(raw, context.allocator)
 		tool_shell_args_destroy(&args, context.allocator)
-		testing.expect(t, !ok)
+		testing.expectf(t, !ok, "%s must be rejected", raw)
 	}
+}
+
+// command is the only argument a caller has to give. An optional field is not
+// given when it is absent, null, or empty, and an empty string is what a model
+// writes when it has nothing to say about a field it was told about.
+@(test)
+test_shell_optional_fields_may_be_left_out_or_empty :: proc(t: ^testing.T) {
+	absent := []string {
+		`{"command":"echo hi"}`,
+		`{"command":"echo hi","working_directory":null}`,
+		`{"command":"echo hi","timeout_ms":null}`,
+		`{"command":"echo hi","working_directory":null,"timeout_ms":null}`,
+		`{"command":"echo hi","working_directory":"","timeout_ms":""}`,
+		`{"command":"echo hi","working_directory":"  ","timeout_ms":"  "}`,
+	}
+	for raw in absent {
+		args, ok := tool_shell_parse_args(raw, context.allocator)
+		if !testing.expectf(t, ok, "%s must be accepted", raw) { continue }
+		testing.expect_value(t, args.command, "echo hi")
+		testing.expect_value(t, args.working_directory, "")
+		testing.expect_value(t, args.timeout_ms, TOOL_DEFAULT_TIMEOUT_MS)
+		tool_shell_args_destroy(&args, context.allocator)
+	}
+
+	given, ok := tool_shell_parse_args(`{"command":"echo hi","working_directory":"sub","timeout_ms":5000}`, context.allocator)
+	defer tool_shell_args_destroy(&given, context.allocator)
+	if !testing.expect(t, ok, "a given optional field is used") { return }
+	testing.expect_value(t, given.working_directory, "sub")
+	testing.expect_value(t, given.timeout_ms, 5000)
 }
 
 @(test)

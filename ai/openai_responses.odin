@@ -222,7 +222,10 @@ openai_responses_tool_def :: proc(tool: Provider_Tool_Def, allocator := context.
 		defer json.destroy_value(schema, allocator)
 		definition[strings.clone("parameters", allocator)] = json.Value(json.clone_value(schema, allocator))
 	}
-	definition[strings.clone("strict", allocator)] = json.Boolean(true)
+	// Strict schema enforcement is not set: it requires every property to be
+	// required, which would make an optional argument mandatory and push the model
+	// into filling it with an empty value. The tool's own schema and the harness's
+	// reading of it are the contract.
 	return json.Value(definition)
 }
 

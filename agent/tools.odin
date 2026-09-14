@@ -4,6 +4,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 import linux "core:sys/linux"
 import "core:time"
@@ -16,9 +17,9 @@ TOOL_SHELL_NAME :: "shell"
 
 TOOL_SHELL_DESCRIPTION :: "Execute a command with /bin/sh in a fresh non-interactive process. Standard input is closed. Commands may use shell syntax. Directory and environment changes do not persist between calls. Returns bounded stdout and stderr, exit information, and truncation status. This is not a terminal or background-job service."
 
-TOOL_SHELL_PARAMETERS_JSON :: `{"type":"object","properties":{"command":{"type":"string","description":"Shell source to execute."},"working_directory":{"type":["string","null"],"description":"Directory relative to the session workspace; null uses the workspace root."},"timeout_ms":{"type":["integer","null"],"description":"Positive timeout in milliseconds; null uses the harness default."}},"required":["command","working_directory","timeout_ms"],"additionalProperties":false}`
+TOOL_SHELL_PARAMETERS_JSON :: `{"type":"object","properties":{"command":{"type":"string","description":"Shell source to execute."},"working_directory":{"type":["string","null"],"description":"Directory relative to the session workspace. Leave out or pass null for the workspace root."},"timeout_ms":{"type":["integer","null"],"description":"Positive timeout in milliseconds. Leave out or pass null for the harness default."}},"required":["command"],"additionalProperties":false}`
 
-AGENT_SYSTEM_PROMPT :: "You are svan, a coding agent. You have one tool named shell that runs /bin/sh commands in a fresh non-interactive process inside the session workspace. Use it to inspect files, run programs, and report what they print. Pass working_directory relative to the workspace, or null for the workspace root. Pass timeout_ms in milliseconds, or null for the default. Directory and environment changes do not persist between calls and standard input is closed. Results come back as JSON with stdout, stderr, exit code, and truncation flags. Never invent command output. Call the tool when the user asks you to do something on the machine, and keep chat replies short."
+AGENT_SYSTEM_PROMPT :: "You are svan, a coding agent. You have one tool named shell that runs /bin/sh commands in a fresh non-interactive process inside the session workspace. Use it to inspect files, run programs, and report what they print. The command is the only argument you have to give. working_directory and timeout_ms are optional: leave them out, or pass null, and the harness runs in the session workspace with its own default timeout. Directory and environment changes do not persist between calls and standard input is closed. Results come back as JSON with stdout, stderr, exit code, and truncation flags. Never invent command output. Call the tool when the user asks you to do something on the machine, and keep chat replies short."
 
 // TOOL_RECOVERED_RESULT is the model-visible result written for a call whose
 // outcome the harness never observed, such as one a process died in the middle
@@ -69,19 +70,6 @@ tool_shell_args_destroy :: proc(args: ^Tool_Shell_Args, allocator := context.all
 	args^ = {}
 }
 
-Tool_Shell_Raw_Args :: struct {
-	command:           string,
-	working_directory: Maybe(string),
-	timeout_ms:        Maybe(i64),
-}
-
-tool_shell_raw_args_destroy :: proc(raw_args: ^Tool_Shell_Raw_Args, allocator: mem.Allocator) {
-	if raw_args == nil { return }
-	if raw_args.command != "" { delete(raw_args.command, allocator) }
-	if work, has_work := raw_args.working_directory.?; has_work { delete(work, allocator) }
-	raw_args^ = {}
-}
-
 // tool_timeout_expected is the constraint the timeout field has to satisfy, said
 // once so a type defect and a range defect give the model the same answer. The
 // text is temporary: the error that carries it copies it.
@@ -90,77 +78,76 @@ tool_timeout_expected :: proc() -> string {
 	return fmt.aprintf("a positive integer of milliseconds no greater than %d, or null", TOOL_MAX_TIMEOUT_MS, allocator = context.temp_allocator)
 }
 
-// tool_shell_validate checks the argument document structurally and reports the
-// first defect it can describe. Key comparison is on decoded bytes, so an
-// escaped spelling of a field is the same field, and the builtin unmarshal then
-// has nothing left to silently overwrite or skip.
+// tool_shell_read checks the argument document and reads it in one pass, and
+// reports the first defect it can describe. Reading and checking together is what
+// lets an optional field be absent, null, or empty and mean the same thing: the
+// token is right there to be interpreted, where the builtin unmarshal would
+// refuse an empty string in a field whose type is a number. Key comparison is on
+// decoded bytes, so an escaped spelling of a field is the same field.
 @(private)
-tool_shell_validate :: proc(raw: string, allocator: mem.Allocator) -> Tool_Argument_Error {
-	if len(raw) == 0 { return tool_argument_error(.Syntax, allocator = allocator) }
-	if len(raw) > TOOL_MAX_ARGS_BYTES { return tool_argument_error(.Too_Large, allocator = allocator) }
+tool_shell_read :: proc(raw: string, allocator: mem.Allocator) -> (Tool_Shell_Args, Tool_Argument_Error) {
+	if len(raw) == 0 { return {}, tool_argument_error(.Syntax, allocator = allocator) }
+	if len(raw) > TOOL_MAX_ARGS_BYTES { return {}, tool_argument_error(.Too_Large, allocator = allocator) }
+	result := Tool_Shell_Args{timeout_ms = TOOL_DEFAULT_TIMEOUT_MS}
+	complete := false
+	defer if !complete { tool_shell_args_destroy(&result, allocator) }
+
 	tokenizer := json.make_tokenizer(raw, .JSON, true)
 	token, token_err := json.get_token(&tokenizer)
-	if tool_token_bad(token, token_err) { return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
-	if token.kind != .Open_Brace { return tool_argument_error(.Not_Object, offset = token.offset, allocator = allocator) }
+	if tool_token_bad(token, token_err) { return {}, tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
+	if token.kind != .Open_Brace { return {}, tool_argument_error(.Not_Object, offset = token.offset, allocator = allocator) }
 
 	seen_command, seen_work, seen_timeout := false, false, false
 	for {
 		token, token_err = json.get_token(&tokenizer)
-		if tool_token_bad(token, token_err) { return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
+		if tool_token_bad(token, token_err) { return {}, tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
 		if token.kind == .Close_Brace { break }
-		if token.kind != .String { return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
+		if token.kind != .String { return {}, tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
 
 		key, key_err := json.unquote_string(token, .JSON, context.temp_allocator)
-		if key_err != nil { return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
+		if key_err != nil { return {}, tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
 
-		field, expected := "", ""
+		field := ""
 		switch key {
 		case "command":
-			if seen_command { return tool_argument_error(.Duplicate_Field, "command", allocator = allocator) }
+			if seen_command { return {}, tool_argument_error(.Duplicate_Field, "command", allocator = allocator) }
 			seen_command = true
-			field, expected = "command", "a non-empty shell command"
+			field = "command"
 		case "working_directory":
-			if seen_work { return tool_argument_error(.Duplicate_Field, "working_directory", allocator = allocator) }
+			if seen_work { return {}, tool_argument_error(.Duplicate_Field, "working_directory", allocator = allocator) }
 			seen_work = true
-			field, expected = "working_directory", "a relative path inside the workspace, or null"
+			field = "working_directory"
 		case "timeout_ms":
-			if seen_timeout { return tool_argument_error(.Duplicate_Field, "timeout_ms", allocator = allocator) }
+			if seen_timeout { return {}, tool_argument_error(.Duplicate_Field, "timeout_ms", allocator = allocator) }
 			seen_timeout = true
 			field = "timeout_ms"
 		case:
-			return tool_argument_error(.Unknown_Field, key, allocator = allocator)
+			return {}, tool_argument_error(.Unknown_Field, key, allocator = allocator)
 		}
 
 		token, token_err = json.get_token(&tokenizer)
-		if tool_token_bad(token, token_err) { return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
-		if token.kind != .Colon { return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
+		if tool_token_bad(token, token_err) { return {}, tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
+		if token.kind != .Colon { return {}, tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
 
 		token, token_err = json.get_token(&tokenizer)
-		if tool_token_bad(token, token_err) { return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
-		switch field {
-		case "command":
-			if token.kind != .String { return tool_argument_error(.Wrong_Type, field, expected, token.offset, allocator) }
-		case "working_directory":
-			if token.kind != .String && token.kind != .Null { return tool_argument_error(.Wrong_Type, field, expected, token.offset, allocator) }
-		case "timeout_ms":
-			if token.kind != .Integer && token.kind != .Null { return tool_argument_error(.Wrong_Type, field, tool_timeout_expected(), token.offset, allocator) }
-		}
+		if tool_token_bad(token, token_err) { return {}, tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
+		field_err := tool_shell_read_field(&result, field, token, allocator)
+		if field_err.kind != .None { return {}, field_err }
 
 		token, token_err = json.get_token(&tokenizer)
-		if tool_token_bad(token, token_err) { return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
+		if tool_token_bad(token, token_err) { return {}, tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
 		if token.kind == .Comma { continue }
 		if token.kind == .Close_Brace { break }
-		return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator)
+		return {}, tool_argument_error(.Syntax, offset = token.offset, allocator = allocator)
 	}
-	if !seen_command { return tool_argument_error(.Missing_Field, "command", allocator = allocator) }
-	if !seen_work { return tool_argument_error(.Missing_Field, "working_directory", allocator = allocator) }
-	if !seen_timeout { return tool_argument_error(.Missing_Field, "timeout_ms", allocator = allocator) }
+	if !seen_command { return {}, tool_argument_error(.Missing_Field, "command", allocator = allocator) }
 
 	token, token_err = json.get_token(&tokenizer)
 	if (token_err != nil && token_err != .EOF) || token.kind != .EOF {
-		return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator)
+		return {}, tool_argument_error(.Syntax, offset = token.offset, allocator = allocator)
 	}
-	return {}
+	complete = true
+	return result, {}
 }
 
 // tool_token_bad reports a token that cannot be used: a tokenizer failure or an
@@ -170,41 +157,67 @@ tool_token_bad :: proc(token: json.Token, err: json.Error) -> bool {
 	return (err != nil && err != .EOF) || token.kind == .EOF
 }
 
-// tool_shell_from_raw turns a decoded document into effective arguments. Every
-// rejection names the field and the constraint it failed, because that is what
-// the model needs to repair its own call.
+// tool_shell_read_field reads one field's value. command is the only field that
+// has to be there. An optional field is not given when it is absent, null, or an
+// empty string, because an empty string is what a model writes when it has
+// nothing to say about a field it was told about. Anything else has to be a value
+// of the declared type: inventing one would change what the model asked for.
 @(private)
-tool_shell_from_raw :: proc(raw: ^Tool_Shell_Raw_Args, allocator: mem.Allocator) -> (Tool_Shell_Args, Tool_Argument_Error) {
-	args := Tool_Shell_Args{}
-	ok := false
-	defer if !ok { tool_shell_args_destroy(&args, allocator) }
-	command_text := strings.trim_space(raw.command)
-	if command_text == "" || strings.contains_rune(command_text, 0) {
-		return {}, tool_argument_error(.Invalid_Value, "command", "a non-empty shell command", allocator = allocator)
-	}
-	args.command = strings.clone(command_text, allocator)
-	if work, work_present := raw.working_directory.?; work_present {
-		work_text := strings.trim_space(work)
-		if work_text == "" || strings.contains_rune(work_text, 0) || work_text[0] == '/' {
-			return {}, tool_argument_error(.Invalid_Value, "working_directory", "a relative path inside the workspace, or null", allocator = allocator)
+tool_shell_read_field :: proc(args: ^Tool_Shell_Args, field: string, token: json.Token, allocator: mem.Allocator) -> Tool_Argument_Error {
+	switch field {
+	case "command":
+		if token.kind != .String { return tool_argument_error(.Wrong_Type, field, "a non-empty shell command", token.offset, allocator) }
+		text, text_err := json.unquote_string(token, .JSON, allocator)
+		if text_err != nil { return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
+		defer delete(text, allocator)
+		command := strings.trim_space(text)
+		if command == "" || strings.contains_rune(command, 0) {
+			return tool_argument_error(.Invalid_Value, field, "a non-empty shell command", token.offset, allocator)
 		}
-		for part in strings.split_iterator(&work_text, "/") {
+		args.command = strings.clone(command, allocator)
+	case "working_directory":
+		if token.kind == .Null { return {} }
+		if token.kind != .String { return tool_argument_error(.Wrong_Type, field, "a relative path inside the workspace, or null", token.offset, allocator) }
+		text, text_err := json.unquote_string(token, .JSON, allocator)
+		if text_err != nil { return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
+		defer delete(text, allocator)
+		directory := strings.trim_space(text)
+		if directory == "" { return {} }
+		if strings.contains_rune(directory, 0) || directory[0] == '/' {
+			return tool_argument_error(.Invalid_Value, field, "a relative path inside the workspace, or null", token.offset, allocator)
+		}
+		// The iterator consumes the string it walks, so the check walks a copy and
+		// the clone below still sees the whole path.
+		parts := directory
+		for part in strings.split_iterator(&parts, "/") {
 			if part == ".." {
-				return {}, tool_argument_error(.Invalid_Value, "working_directory", "a relative path inside the workspace, or null", allocator = allocator)
+				return tool_argument_error(.Invalid_Value, field, "a relative path inside the workspace, or null", token.offset, allocator)
 			}
 		}
-		args.working_directory = strings.clone(work_text, allocator)
-	}
-	if timeout, timeout_present := raw.timeout_ms.?; timeout_present {
-		if timeout <= 0 || timeout > i64(TOOL_MAX_TIMEOUT_MS) {
-			return {}, tool_argument_error(.Invalid_Value, "timeout_ms", tool_timeout_expected(), allocator = allocator)
+		args.working_directory = strings.clone(directory, allocator)
+	case "timeout_ms":
+		if token.kind == .Null {
+			args.timeout_ms = TOOL_DEFAULT_TIMEOUT_MS
+			return {}
 		}
-		args.timeout_ms = int(timeout)
-	} else {
-		args.timeout_ms = TOOL_DEFAULT_TIMEOUT_MS
+		if token.kind == .String {
+			text, text_err := json.unquote_string(token, .JSON, allocator)
+			if text_err != nil { return tool_argument_error(.Syntax, offset = token.offset, allocator = allocator) }
+			defer delete(text, allocator)
+			if strings.trim_space(text) == "" {
+				args.timeout_ms = TOOL_DEFAULT_TIMEOUT_MS
+				return {}
+			}
+			return tool_argument_error(.Wrong_Type, field, tool_timeout_expected(), token.offset, allocator)
+		}
+		if token.kind != .Integer { return tool_argument_error(.Wrong_Type, field, tool_timeout_expected(), token.offset, allocator) }
+		milliseconds, parsed := strconv.parse_i64(token.text, 10)
+		if !parsed || milliseconds <= 0 || milliseconds > i64(TOOL_MAX_TIMEOUT_MS) {
+			return tool_argument_error(.Invalid_Value, field, tool_timeout_expected(), token.offset, allocator)
+		}
+		args.timeout_ms = int(milliseconds)
 	}
-	ok = true
-	return args, {}
+	return {}
 }
 
 // Tool_Preparation is the outcome of preparing one proposed call. A rejected
@@ -233,56 +246,35 @@ tool_preparation_destroy :: proc(prep: ^Tool_Preparation, allocator := context.a
 	prep^ = {}
 }
 
-// tool_shell_prepare validates a proposed call, repairs it only when the repair
-// is forced, and decodes it. Validation runs once on the bytes the model sent;
+// tool_shell_prepare reads a proposed call, repairs it only when the repair
+// is forced, and reads it again. Reading runs once on the bytes the model sent;
 // only a control-character defect that escaping resolves is accepted as a
-// repair, and the repaired bytes are revalidated in full before anything runs.
+// repair, and the repaired bytes are read in full before anything runs.
 // Nothing else is rewritten, and no value is ever invented.
 tool_shell_prepare :: proc(raw: string, allocator := context.allocator) -> (prep: Tool_Preparation) {
 	prep.status = .Rejected
-	prep.error = tool_shell_validate(raw, allocator)
-	effective := ""
-	repair: session.Tool_Repair
-	if prep.error.kind == .None {
+	args, read_err := tool_shell_read(raw, allocator)
+	if read_err.kind == .None {
 		prep.status = .Valid
-		effective = strings.clone(raw, allocator)
-	} else {
-		repaired, changed := tool_arguments_escape_control_chars(raw, allocator)
-		if !changed { return prep }
-		retry_err := tool_shell_validate(repaired, allocator)
-		if retry_err.kind != .None {
-			delete(repaired, allocator)
-			return prep
-		}
-		tool_argument_error_destroy(&prep.error, allocator)
-		prep.error = {}
-		prep.status = .Repaired
-		repair = .Escaped_Control_Characters
-		effective = repaired
-	}
-	prep.effective = effective
-
-	raw_args: Tool_Shell_Raw_Args
-	// The unmarshal transfers ownership of any field it set, and it can fail
-	// after doing so, so raw_args is released on every exit path.
-	defer tool_shell_raw_args_destroy(&raw_args, allocator)
-	if json.unmarshal_string(effective, &raw_args, .JSON, allocator) != nil {
-		delete(prep.effective, allocator)
-		prep.effective = ""
-		prep.status = .Rejected
-		prep.error = tool_argument_error(.Syntax, allocator = allocator)
+		prep.args = args
+		prep.effective = strings.clone(raw, allocator)
 		return prep
 	}
-	args, args_err := tool_shell_from_raw(&raw_args, allocator)
-	if args_err.kind != .None {
-		delete(prep.effective, allocator)
-		prep.effective = ""
-		prep.status = .Rejected
-		prep.error = args_err
+	repaired, changed := tool_arguments_escape_control_chars(raw, allocator)
+	if !changed {
+		prep.error = read_err
 		return prep
 	}
-	prep.args = args
-	prep.repair = repair
+	repaired_args, repaired_err := tool_shell_read(repaired, allocator)
+	if repaired_err.kind != .None {
+		delete(repaired, allocator)
+		prep.error = read_err
+		return prep
+	}
+	prep.status = .Repaired
+	prep.repair = .Escaped_Control_Characters
+	prep.args = repaired_args
+	prep.effective = repaired
 	return prep
 }
 
