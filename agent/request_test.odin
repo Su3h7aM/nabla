@@ -68,7 +68,9 @@ test_request_retry_needs_an_unexposed_attempt :: proc(t: ^testing.T) {
 	testing.expect(t, !chat_request_may_retry(chat, transient, 1))
 	clear(&chat.partial_assistant)
 
-	append(&chat.pending_calls, Chat_Tool_Call{id = "call_1"})
+	// The staged call's strings are owned by the session, so the id is cloned
+	// the way a response commit clones: chat_pending_calls_clear frees it.
+	append(&chat.pending_calls, Chat_Tool_Call{id = chat_clone_string("call_1", chat.allocator)})
 	testing.expect(t, !chat_request_may_retry(chat, transient, 1))
 	chat_pending_calls_clear(chat)
 
