@@ -121,6 +121,7 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 // asked anything, so a request that never finishes still says what it carried.
 @(private)
 chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, observer: Chat_Observer, usages: ^[dynamic]Chat_Request_Usage) {
+	if chat.skill_instructions == "" && !chat_ensure_instructions(chat) { return }
 	prep, prep_err := chat_prepare(chat, connection)
 	if prep_err != nil {
 		chat_session_record_failure(chat, "the request context could not be read", prep_err)

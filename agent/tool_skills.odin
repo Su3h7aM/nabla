@@ -259,12 +259,21 @@ tool_skill_outcome :: proc(kind: skills.Error_Kind) -> session.Tool_Outcome {
 
 skill_digest_text :: proc(digest: [32]u8, allocator := context.allocator) -> string {
 	out := make([]u8, 64, allocator)
-	hex := "0123456789abcdef"
 	for value, index in digest {
-		out[index * 2] = hex[value >> 4]
-		out[index * 2 + 1] = hex[value & 0x0f]
+		high, low := skill_hex_nibbles(value)
+		out[index * 2] = high
+		out[index * 2 + 1] = low
 	}
 	return string(out)
+}
+
+skill_hex_nibbles :: proc(value: u8) -> (u8, u8) {
+	return skill_hex_digit(value >> 4), skill_hex_digit(value & 0x0f)
+}
+
+skill_hex_digit :: proc(nibble: u8) -> u8 {
+	if nibble < 10 { return '0' + nibble }
+	return 'a' + (nibble - 10)
 }
 
 skill_primary_path :: proc(skill: skills.Skill, allocator := context.allocator) -> string {

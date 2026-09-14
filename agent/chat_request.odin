@@ -76,7 +76,9 @@ chat_build_request_into :: proc(
 	if compact {
 		instructions = CHAT_COMPACT_INSTRUCTIONS
 	} else if chat.tools_enabled {
-		instructions = AGENT_SYSTEM_PROMPT
+		instructions = chat.skill_instructions if chat.skill_instructions != "" else AGENT_SYSTEM_PROMPT
+	} else if chat.skill_instructions != "" {
+		instructions = chat.skill_instructions
 	}
 	// A checkpoint stands in for the history it covers, so the request opens
 	// with the summary and continues with the entries after it.

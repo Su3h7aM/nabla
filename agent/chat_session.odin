@@ -73,76 +73,79 @@ Chat_Accept :: enum {
 // that claim's storage). The caller owns the store, holds the writer claim for
 // id, and keeps both alive for the session's lifetime.
 Chat_Session :: struct {
-	store:                       ^session.Store,
-	id:                          session.Session_Id, // owned
-	allocator:                   mem.Allocator,
-	state:                       Chat_State,
-	terminal_status:             Chat_Terminal_Status,
-	last_error:                  string, // owned
+	store:                        ^session.Store,
+	id:                           session.Session_Id, // owned
+	allocator:                    mem.Allocator,
+	state:                        Chat_State,
+	terminal_status:              Chat_Terminal_Status,
+	last_error:                   string, // owned
 
 	// active_turn_id and the operation ids are process-local identities. They
 	// name an execution, not a durable turn; turn_no is the durable one.
-	active_turn_id:              u64,
-	next_turn_id:                u64,
-	turn_no:                     Maybe(session.Turn_No),
-	active_request:              Maybe(session.Request_No),
-	active_operation_id:         u64,
-	next_operation_id:           u64,
-	operation:                   Chat_Operation,
-	turn_deadline:               ai.Deadline,
+	active_turn_id:               u64,
+	next_turn_id:                 u64,
+	turn_no:                      Maybe(session.Turn_No),
+	active_request:               Maybe(session.Request_No),
+	active_operation_id:          u64,
+	next_operation_id:            u64,
+	operation:                    Chat_Operation,
+	turn_deadline:                ai.Deadline,
 
 	// storage_failed latches a durable write that did not land. A session that
 	// could not record its own history accepts no further work: continuing would
 	// let the conversation diverge from what was stored.
-	storage_failed:              bool,
+	storage_failed:               bool,
 
 	// tools is the set of tools a turn may dispatch, owned by the chat. It is
 	// fixed for the session's life, so a response always runs against the
 	// definitions it was advertised with.
-	tools:                       Tool_Registry,
+	tools:                        Tool_Registry,
 
 	// partial_assistant is streamed text that has not been committed. It stays
 	// provisional until the turn settles.
-	partial_assistant:           [dynamic]u8,
+	partial_assistant:            [dynamic]u8,
 
 	// pending_response and pending_calls are what the current response produced
 	// and has not committed yet. pending_response holds the verbatim Responses
 	// output array; pending_calls holds the validated calls awaiting execution.
-	pending_response:            Chat_Response_Output,
-	pending_response_present:    bool,
-	pending_calls:               [dynamic]Chat_Tool_Call,
+	pending_response:             Chat_Response_Output,
+	pending_response_present:     bool,
+	pending_calls:                [dynamic]Chat_Tool_Call,
 	// pending_notice is why the running response could not be used. It is set
 	// while the response is still streaming and committed with it, so the
 	// explanation lands after the text it explains.
-	pending_notice:              Chat_Notice,
-	requests_made:               int, // model requests this turn; bounds the tool loop
+	pending_notice:               Chat_Notice,
+	requests_made:                int, // model requests this turn; bounds the tool loop
 	// request_attempts counts how many times the current request was sent. A retry
 	// is one request, so the record keeps one row and this is what says whether the
 	// provider was asked more than once.
-	request_attempts:            int,
-	calls_made:                  int, // tool executions this turn
-	active_failed:               bool,
-	workspace:                   string, // owned; validated process directory
-	provider_id:                 string, // owned; the provider requests are addressed to
-	model_id:                    string, // owned; the model requests ask for
-	tools_enabled:               bool, // frozen for the session's life
-	max_output_tokens:           int, // 0 means unset
-	context_window:              int, // 0 means unconfigured
-	effort_levels:               [dynamic]string, // owned; allowed levels, verbatim
-	effort:                      string, // owned; "" means provider default
+	request_attempts:             int,
+	calls_made:                   int, // tool executions this turn
+	active_failed:                bool,
+	workspace:                    string, // owned; validated process directory
+	provider_id:                  string, // owned; the provider requests are addressed to
+	model_id:                     string, // owned; the model requests ask for
+	tools_enabled:                bool, // frozen for the session's life
+	max_output_tokens:            int, // 0 means unset
+	context_window:               int, // 0 means unconfigured
+	effort_levels:                [dynamic]string, // owned; allowed levels, verbatim
+	effort:                       string, // owned; "" means provider default
 
 	// last_input_measured is the last endpoint-reported input size, and
 	// last_estimate is the harness's own count of the active context, kept for
 	// the status line without touching the store from another thread. Usage
 	// accumulation lives in the store: a refresh sums finished requests, so the
 	// session totals never depend on which stream events already arrived.
-	last_input_measured:         i64,
-	last_input_measured_present: bool,
-	last_estimate:               int,
+	last_input_measured:          i64,
+	last_input_measured_present:  bool,
+	last_estimate:                int,
 
 	// skill_catalog is the frozen catalog from the instruction snapshot. Nil
 	// means unavailable, never an instruction to rescan.
-	skill_catalog:               Maybe(skills.Catalog),
+	skill_catalog:                Maybe(skills.Catalog),
+	skill_instructions:           string, // owned; exact normal-request prefix
+	skill_snapshot_seq:           Maybe(session.Seq),
+	disable_project_instructions: bool,
 }
 
 // CHAT_DEFAULT_CONTEXT_WINDOW is the window a session assumes for a model that no
@@ -195,6 +198,8 @@ chat_skill_catalog :: proc(chat: ^Chat_Session) -> ^skills.Catalog {
 chat_session_destroy :: proc(chat: ^Chat_Session) {
 	if catalog, present := &chat.skill_catalog.?; present { skills.catalog_destroy(catalog, chat.allocator) }
 	chat.skill_catalog = nil
+	delete(chat.skill_instructions, chat.allocator)
+	chat.skill_instructions = ""
 	delete(string(chat.id), chat.allocator)
 	delete(chat.partial_assistant)
 	if chat.pending_response_present { chat_response_output_destroy(&chat.pending_response, chat.allocator) }

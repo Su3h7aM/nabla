@@ -21,6 +21,10 @@ Config_Error :: enum {
 	Invalid,
 }
 
+Harness_Options :: struct {
+	disable_project_instructions: bool,
+}
+
 config_error_text :: proc(e: Config_Error) -> string {
 	switch e {
 	case .None:
@@ -284,6 +288,71 @@ load_provider :: proc(L: ^l.State, raw_idx: c.int, provider_id: string, allocato
 	}
 	failed = false
 	return .None
+}
+
+load_harness_options :: proc(L: ^l.State, idx: c.int) -> (Harness_Options, Config_Error) {
+	options: Harness_Options
+	if l.type(L, idx) == .NIL { return options, .None }
+	if !lua_plain_table(L, idx) { return {}, .Invalid }
+	base := l.gettop(L)
+	defer l.settop(L, base)
+	lua_field(L, idx, "project")
+	if l.type(L, -1) != .NIL {
+		project, ok := lua_bool(L, -1)
+		if !ok { return {}, .Invalid }
+		options.disable_project_instructions = !project
+	}
+	return options, .None
+}
+
+load_lua_config_full :: proc(path: string, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Harness_Options, Config_Error) {
+	if path == "" { return {}, {}, .None }
+	data, read_err := os.read_entire_file(path, context.temp_allocator)
+	if read_err != nil { return {}, {}, .Read }
+	if len(data) > CONFIG_MAX_BYTES { return {}, {}, .Invalid }
+	L := l.L_newstate(); if L == nil { return {}, {}, .Lua }; defer l.close(L)
+	l.sethook(L, lua_limit_hook, l.MASKCOUNT, CONFIG_INSTRUCTIONS)
+	if l.L_loadbuffer(L, raw_data(data), c.size_t(len(data)), "@svan-config", "t") != .OK { return {}, {}, .Lua }
+	if l.pcall(L, 0, 1, 0) != 0 { return {}, {}, .Lua }
+	if !lua_plain_table(L, -1) { return {}, {}, .Root }
+	base := l.gettop(L)
+	lua_field(L, -1, "instructions")
+	options, options_err := load_harness_options(L, -1)
+	if options_err != .None { return {}, {}, options_err }
+	l.settop(L, base)
+	lua_field(L, -1, "providers")
+	if l.type(L, -1) == .NIL { return {}, options, .None }
+	if !lua_plain_table(L, -1) { return {}, {}, .Invalid }
+	result: [dynamic]Catalog_Provider_Source
+	result.allocator = allocator
+	count := 0
+	providers_idx := l.absindex(L, -1)
+	l.pushnil(L)
+	for {
+		if l.next(L, providers_idx) == 0 { break }
+		count += 1
+		if count > CONFIG_MAX_ENTRIES || l.type(L, -2) != .STRING {
+			catalog_sources_destroy(&result, allocator)
+			return {}, {}, .Invalid
+		}
+		provider_id, ok := lua_string(L, -2, allocator)
+		if !ok {
+			catalog_sources_destroy(&result, allocator)
+			return {}, {}, .Invalid
+		}
+		provider: Catalog_Provider_Source
+		err := load_provider(L, -1, provider_id, allocator, &provider)
+		delete(provider_id, allocator)
+		if err != .None {
+			catalog_provider_source_destroy(&provider, allocator)
+			catalog_sources_destroy(&result, allocator)
+			return {}, {}, err
+		}
+		append(&result, provider)
+		l.settop(L, providers_idx + 1)
+	}
+	l.settop(L, base)
+	return result, options, .None
 }
 
 load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Config_Error) {

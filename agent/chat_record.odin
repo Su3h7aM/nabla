@@ -15,11 +15,12 @@ Chat_Request_Config :: struct {
 
 @(private)
 Chat_Request_Input :: struct {
-	instructions:    string `json:"instructions"`,
-	tools:           []string `json:"tools"`,
-	summary_seq:     Maybe(session.Seq) `json:"summary_seq"`,
-	covered_seq:     Maybe(session.Seq) `json:"covered_seq"`,
-	context_through: Maybe(session.Seq) `json:"context_through"`,
+	instructions:             string `json:"instructions"`,
+	tools:                    []string `json:"tools"`,
+	summary_seq:              Maybe(session.Seq) `json:"summary_seq"`,
+	covered_seq:              Maybe(session.Seq) `json:"covered_seq"`,
+	context_through:          Maybe(session.Seq) `json:"context_through"`,
+	instruction_snapshot_seq: Maybe(session.Seq) `json:"instruction_snapshot_seq"`,
 }
 
 @(private)
@@ -82,10 +83,17 @@ chat_request_input_json :: proc(chat: ^Chat_Session, ctx: session.Context, entry
 	}
 
 	input := Chat_Request_Input {
-		instructions = AGENT_SYSTEM_PROMPT if !compact else CHAT_COMPACT_INSTRUCTIONS,
-		tools        = tools[:],
-		summary_seq  = ctx.summary_seq,
-		covered_seq  = ctx.covered_seq,
+		tools       = tools[:],
+		summary_seq = ctx.summary_seq,
+		covered_seq = ctx.covered_seq,
+	}
+	if compact {
+		input.instructions = CHAT_COMPACT_INSTRUCTIONS
+	} else if chat.skill_instructions != "" {
+		input.instructions = chat.skill_instructions
+		input.instruction_snapshot_seq = chat.skill_snapshot_seq
+	} else {
+		input.instructions = AGENT_SYSTEM_PROMPT
 	}
 	count := entry_count
 	if count > len(ctx.entries) { count = len(ctx.entries) }
