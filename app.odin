@@ -262,7 +262,14 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 // the launch asked for, open the terminal, apply the selection (explicit flags,
 // then the persisted one, then the in-TUI model menu), start the worker, and
 // drive the frame loop until quit.
-tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_model: string, start: Session_Start) -> (ok: bool) {
+tui_run :: proc(
+	sources: []agent.Catalog_Provider_Source,
+	harness_options: agent.Harness_Options,
+	flag_provider, flag_model: string,
+	start: Session_Start,
+) -> (
+	ok: bool,
+) {
 	app := new(App)
 	defer free(app)
 	app.run.alloc = context.allocator
@@ -271,6 +278,7 @@ tui_run :: proc(sources: []agent.Catalog_Provider_Source, flag_provider, flag_mo
 	app.setup.owns_selection = true
 	// The setup is filled in place: a store owns a live connection, and copying
 	// one would leave two owners of it.
+	app.setup.harness_options = harness_options
 	if !run_catalog(sources, &app.setup, start) {
 		return false
 	}

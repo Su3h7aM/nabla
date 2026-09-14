@@ -163,7 +163,7 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 // configuration, the same catalog, the same session. Only the front-end differs,
 // so a headless run is the same conversation rather than a second implementation
 // of one.
-run_prompt :: proc(sources: []agent.Catalog_Provider_Source, options: chat_cli_options, answer: io.Writer) -> int {
+run_prompt :: proc(sources: []agent.Catalog_Provider_Source, harness_options: agent.Harness_Options, options: chat_cli_options, answer: io.Writer) -> int {
 	app := new(App)
 	defer free(app)
 	app.run.alloc = context.allocator
@@ -175,6 +175,7 @@ run_prompt :: proc(sources: []agent.Catalog_Provider_Source, options: chat_cli_o
 		start.kind = .Resume_Id if options.resume_id != "" else .Resume_Latest
 		start.id = options.resume_id
 	}
+	app.setup.harness_options = harness_options
 	if !run_catalog(sources, &app.setup, start) { return 1 }
 	// The model this run picks belongs to the job, not to the user: a headless run
 	// must not change what the interactive harness starts with.
@@ -221,7 +222,7 @@ chat_main :: proc() -> int {
 		}
 		options.config_path = strings.concatenate([]string{directory, "/config.lua"}, allocator = context.temp_allocator)
 	}
-	sources, config_err := agent.load_lua_config(options.config_path)
+	sources, harness_options, config_err := agent.load_lua_config_full(options.config_path)
 	if config_err != .None {
 		fmt.eprintln("nabla:", agent.config_error_text(config_err))
 		return 1
@@ -245,7 +246,7 @@ chat_main :: proc() -> int {
 		fmt.eprintln("nabla: --provider and --model must be given together")
 		return 2
 	}
-	if options.prompt != "" { return run_prompt(sources[:], options, stdout_writer()) }
+	if options.prompt != "" { return run_prompt(sources[:], harness_options, options, stdout_writer()) }
 
 	start := Session_Start {
 		kind = .New,
@@ -254,7 +255,7 @@ chat_main :: proc() -> int {
 		start.kind = .Resume_Id if options.resume_id != "" else .Resume_Latest
 		start.id = options.resume_id
 	}
-	return tui_run(sources[:], options.provider_id, options.model_id, start) ? 0 : 1
+	return tui_run(sources[:], harness_options, options.provider_id, options.model_id, start) ? 0 : 1
 }
 
 main :: proc() {

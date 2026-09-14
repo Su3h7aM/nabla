@@ -24,6 +24,7 @@ session_target_destroy :: proc(target: ^Session_Target, allocator: mem.Allocator
 }
 
 Run_Setup :: struct {
+	harness_options:  agent.Harness_Options,
 	catalog:          agent.Catalog,
 	api:              ai.API_Kind,
 	credential:       string, // owned,
@@ -198,6 +199,7 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 	setup.resumed_provider = strings.clone(adoption.header.provider, setup.alloc)
 	setup.resumed_model = strings.clone(adoption.header.model, setup.alloc)
 	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
+	setup.session.disable_project_instructions = setup.harness_options.disable_project_instructions
 	return true
 }
 
@@ -374,6 +376,7 @@ session_activate :: proc(app: ^App, adoption: ^Adoption) {
 	delete(setup.workspace, setup.alloc)
 	setup.workspace = strings.clone(adoption.header.workspace, setup.alloc)
 	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
+	setup.session.disable_project_instructions = setup.harness_options.disable_project_instructions
 }
 
 // report_recovery says what an earlier run left behind, so a resumed session
