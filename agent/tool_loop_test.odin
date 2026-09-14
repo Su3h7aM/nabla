@@ -265,26 +265,114 @@ test_malformed_arguments_are_rejected_and_replayed :: proc(t: ^testing.T) {
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
 	testing.expect(t, strings.contains(result.content, `"code":"syntax"`), "the result names the defect")
 
-	// A rejected call stays in history, so every API family has to be able to
-	// encode the request that follows it.
+	// The proposal must never reach the wire: an endpoint refuses tool arguments it
+	// cannot parse, and one unsendable request would poison every request after it.
+	// The refusal is spoken in the call's place, for every API family.
 	apis := []ai.API_Kind{.OpenAI_Chat_Completions, .OpenAI_Responses, .Anthropic_Messages}
 	for api in apis {
 		prep, prep_err := chat_prepare(chat, {API = api})
 		if !testing.expectf(t, prep_err == nil, "%v must build a request", api) { continue }
 		body, encode_err := ai.Provider_Encode_Request(prep.request)
-		testing.expectf(t, encode_err == ai.Provider_Request_Error.None, "%v must encode a rejected call", api)
-		if api == .Anthropic_Messages {
-			// The rejection has to be readable as a failure on the wire; the original
-			// arguments cannot be represented as an object, so the call is replayed
-			// with its identity intact and the reason in the paired result.
-			testing.expect(t, strings.contains(body, `"is_error":true`), "the result is marked as an error")
-		}
+		testing.expectf(t, encode_err == ai.Provider_Request_Error.None, "%v must encode a refused call", api)
+		testing.expectf(t, !strings.contains(body, `{\"command\":`), "%v must not carry the malformed proposal", api)
+		testing.expectf(t, strings.contains(body, "was refused before it ran"), "%v must say the call did not run", api)
 		delete(body)
 		chat_request_prep_destroy(&prep, chat.allocator)
 	}
 }
+
 @(test)
-test_unknown_tool_is_reported_not_run :: proc(t: ^testing.T) {	fixture: Chat_Test
+test_a_repaired_call_is_replayed_as_what_ran :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "repaired call")
+
+	// A raw newline inside the command string: the repair escapes it, so the
+	// proposal and what ran are different bytes.
+	_test_stage_call(t, chat, "call_fix", "{\"command\":\"echo hello\n\",\"working_directory\":null,\"timeout_ms\":null}")
+	count := chat_run_tools(chat, {})
+	testing.expect_value(t, count, 1)
+	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, count))
+
+	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Chat_Completions})
+	if !testing.expect_value(t, prep_err, nil) { return }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+
+	seen := false
+	for message in prep.wire {
+		for call in message.Tool_Calls {
+			seen = true
+			testing.expect(t, !strings.contains(call.Arguments, "\n"), "the repair is what the provider is told")
+			testing.expect(t, strings.contains(call.Arguments, "echo hello"), "the command survives the repair")
+		}
+	}
+	testing.expect(t, seen, "a repaired call is still replayed as a call")
+}
+
+@(test)
+test_a_response_with_an_unparseable_call_is_not_replayed_verbatim :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	chat.max_output_tokens = 4096
+	_test_accept(t, chat, "native malformed call")
+	effect := _test_begin_request(t, chat)
+	chat_effect_destroy(&effect)
+	request_no, begin_err := session.request_begin(
+		chat.store,
+		chat.id,
+		{turn_no = chat.turn_no, purpose = .Response, provider = "p", model_requested = "m", api = "openai_responses", config_json = "{}", input_json = "{}"},
+		session.now_ms(),
+	)
+	if !testing.expect_value(t, begin_err, nil) { return }
+
+	// A native Responses output whose function_call carries arguments that do not
+	// parse. Replaying it verbatim is exactly what the endpoint refuses, so the
+	// response has to fall back to the projection, which can say it correctly.
+	output := `[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"trying\"}]},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_v\",\"name\":\"shell\",\"arguments\":\"{\\\"command\\\": not_a_number}\"}]`
+	_test_append(t, chat, {turn_no = chat.turn_no, request_no = request_no, created_at_ms = 2_000, payload = session.Response_Entry{output = output}})
+	_test_append(t, chat, {turn_no = chat.turn_no, request_no = request_no, created_at_ms = 2_001, payload = session.Assistant_Entry{text = "trying"}})
+	call_seq := _test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			request_no = request_no,
+			created_at_ms = 2_002,
+			payload = session.Tool_Call_Entry{call_id = "call_v", item_id = "fc_1", name = TOOL_SHELL_NAME, arguments = `{\"command\": not_a_number}`},
+		},
+	)
+	_test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			request_no = request_no,
+			created_at_ms = 2_003,
+			related_seq = call_seq,
+			payload = session.Tool_Result_Entry{outcome = .Invalid_Arguments, error = "the arguments are not valid JSON", content = `{\"status\":\"invalid_arguments\"}`, origin = .Observed},
+		},
+	)
+
+	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Responses})
+	if !testing.expect_value(t, prep_err, nil) { return }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+	body, encode_err := ai.Provider_Encode_Request(prep.request)
+	if !testing.expect_value(t, encode_err, ai.Provider_Request_Error.None) { return }
+	defer delete(body)
+
+	testing.expect(t, !strings.contains(body, `{\"command\":`), "the native record must not be replayed as it stands")
+	testing.expect(t, strings.contains(body, "was refused before it ran"), "the refusal is spoken instead")
+}
+
+@(test)
+test_unknown_tool_is_reported_not_run :: proc(t: ^testing.T) {
+	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat

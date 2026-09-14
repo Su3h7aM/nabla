@@ -1,5 +1,6 @@
 package agent
 
+import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
@@ -20,6 +21,7 @@ Chat_Request_Prep :: struct {
 	wire:      [dynamic]ai.Provider_Message,
 	tools:     [dynamic]ai.Provider_Tool_Def,
 	calls:     [dynamic][dynamic]ai.Provider_Tool_Call,
+	feedback:  [dynamic]string, // owned; what a refused call is said to be,
 	cache_key: string, // owned; request.Prompt_Cache_Key borrows it when present,
 	estimate:  int,
 }
@@ -30,6 +32,8 @@ chat_request_prep_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Alloc
 	delete(prep.calls)
 	delete(prep.tools)
 	delete(prep.wire)
+	for text in prep.feedback { delete(text, allocator) }
+	delete(prep.feedback)
 	delete(prep.cache_key, allocator)
 	prep^ = {}
 }
@@ -42,7 +46,7 @@ chat_prepare :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection) ->
 	ctx, context_err := session.context_load(chat.store, chat.id, chat.allocator)
 	if context_err != nil { return {}, context_err }
 	prep.history = ctx
-	chat_build_request_into(chat, &prep, ctx.entries, ctx.summary, connection, false)
+	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, connection, false)
 	return prep, nil
 }
 
@@ -55,6 +59,7 @@ chat_build_request_into :: proc(
 	chat: ^Chat_Session,
 	prep: ^Chat_Request_Prep,
 	entries: []session.Entry,
+	dispatches: []session.Entry,
 	summary: string,
 	connection: ai.Provider_Connection,
 	compact: bool,
@@ -62,6 +67,7 @@ chat_build_request_into :: proc(
 	prep.wire = make([dynamic]ai.Provider_Message, 0, len(entries) + 2, chat.allocator)
 	prep.tools = make([dynamic]ai.Provider_Tool_Def, 0, chat.allocator)
 	prep.calls = make([dynamic][dynamic]ai.Provider_Tool_Call, 0, chat.allocator)
+	prep.feedback = make([dynamic]string, 0, chat.allocator)
 
 	// The instruction lane is the most stable content a request carries, so it
 	// travels beside the conversation rather than as a turn inside it. A
@@ -78,7 +84,7 @@ chat_build_request_into :: proc(
 		summary_text := strings.concatenate({"Summary of the conversation so far:\n", summary}, context.temp_allocator)
 		append(&prep.wire, ai.Provider_Message{Role = .Assistant, Content = summary_text})
 	}
-	chat_append_entries(&prep.wire, &prep.calls, connection.API, entries)
+	chat_append_entries(&prep.wire, &prep.calls, &prep.feedback, connection.API, entries, dispatches, chat.allocator)
 
 	prep.request = ai.Provider_Request {
 		API                  = connection.API,
@@ -141,30 +147,73 @@ chat_build_request_into :: proc(
 // multi-call response, and a result names the call it answers through the
 // sequence the two entries share.
 //
+// A call is replayed as what the harness ran, not always as what was proposed: a
+// repaired call is replayed with its repair, and a call that never ran and whose
+// arguments are not an object is not replayed as a call at all. An endpoint
+// refuses a request carrying tool arguments it cannot parse, so replaying the
+// model's own malformed bytes would make the request unsendable and poison every
+// request that follows. What the model is owed instead is the harness's account
+// of the refusal, spoken once, after the results of the calls that did run.
+//
 // On the Responses API a Response_Entry carries the endpoint's own items, so it
 // becomes one verbatim message at that point in the conversation and the plain
-// text and calls it already contains are not projected a second time. The calls
-// are still indexed either way, because a result names its call through the
-// sequence the two entries share. Chat Completions has no native items to
-// replay, so it keeps the portable projection; entries written before the
-// Response_Entry existed replay through that same path.
+// text and calls it already contains are not projected a second time. Native
+// items are replayed only when they say exactly what this projection would say,
+// because a response whose calls were repaired or refused carries bytes the
+// endpoint will not take back. The calls are indexed either way, because a
+// result names its call through the sequence the two entries share.
 @(private)
 chat_append_entries :: proc(
 	messages: ^[dynamic]ai.Provider_Message,
 	call_lists: ^[dynamic][dynamic]ai.Provider_Tool_Call,
+	feedback: ^[dynamic]string,
 	api: ai.API_Kind,
 	entries: []session.Entry,
+	dispatches: []session.Entry,
+	allocator: mem.Allocator,
 ) {
 	group: [dynamic]ai.Provider_Tool_Call
 	group_open := false
 	call_ids := make(map[i64]string, allocator = context.temp_allocator)
 	defer delete(call_ids)
 
+	// What each call actually ran with, keyed by the call it answers.
+	effective := make(map[i64]string, allocator = context.temp_allocator)
+	defer delete(effective)
+	for dispatch in dispatches {
+		payload, is_dispatch := dispatch.payload.(session.Tool_Dispatch_Entry)
+		if !is_dispatch { continue }
+		if related, present := dispatch.related_seq.?; present { effective[i64(related)] = payload.arguments }
+	}
+
+	// A call that is not replayed as a call still owes the model an answer, so its
+	// result becomes harness feedback. The name is kept so the account says which
+	// call it is about.
+	refused := make(map[i64]string, allocator = context.temp_allocator)
+	defer delete(refused)
+	pending: [dynamic]string
+	defer delete(pending)
+
+	// A request whose calls this projection cannot replay from the proposal alone
+	// cannot use its native items either, because those items carry the proposal.
+	unfaithful := make(map[i64]bool, allocator = context.temp_allocator)
+	defer delete(unfaithful)
+	for entry in entries {
+		call, is_call := entry.payload.(session.Tool_Call_Entry)
+		if !is_call { continue }
+		_, project, faithful := chat_replay_call(call, effective[i64(entry.seq)])
+		if project && faithful { continue }
+		if request, present := entry.request_no.?; present { unfaithful[i64(request)] = true }
+	}
+
 	// covered is the request whose assistant side a verbatim output already
 	// carries. Its projected text and calls would be the same content twice.
 	covered: Maybe(session.Request_No)
 
 	for entry in entries {
+		// Feedback waits for the last result of the response it belongs to, so the
+		// results stay adjacent to the assistant message that asked for them.
+		if entry.kind != .Tool_Result { chat_flush_feedback(messages, &pending) }
 		#partial switch payload in entry.payload {
 		case session.User_Entry:
 			chat_flush_calls(messages, call_lists, &group, &group_open)
@@ -179,7 +228,7 @@ chat_append_entries :: proc(
 			append(messages, ai.Provider_Message{Role = .Reasoning, Reasoning_ID = payload.id, Reasoning_Encrypted = payload.encrypted})
 		case session.Response_Entry:
 			chat_flush_calls(messages, call_lists, &group, &group_open)
-			if api == .OpenAI_Responses {
+			if api == .OpenAI_Responses && !chat_response_unfaithful(unfaithful, entry.request_no) {
 				append(messages, ai.Provider_Message{Verbatim_Items = payload.output})
 				covered = entry.request_no
 			}
@@ -188,28 +237,86 @@ chat_append_entries :: proc(
 			// call through the sequence whether or not the call is projected.
 			call_ids[i64(entry.seq)] = payload.call_id
 			if !chat_verbatim_covers(api, covered, entry.request_no) {
-				append(&group, ai.Provider_Tool_Call{ID = payload.call_id, Item_ID = payload.item_id, Name = payload.name, Arguments = payload.arguments})
-				group_open = true
+				arguments, project, _ := chat_replay_call(payload, effective[i64(entry.seq)])
+				if project {
+					append(&group, ai.Provider_Tool_Call{ID = payload.call_id, Item_ID = payload.item_id, Name = payload.name, Arguments = arguments})
+					group_open = true
+				} else {
+					refused[i64(entry.seq)] = payload.name
+				}
 			}
 		case session.Tool_Result_Entry:
 			chat_flush_calls(messages, call_lists, &group, &group_open)
-			call_id := ""
-			if related, present := entry.related_seq.?; present { call_id = call_ids[i64(related)] }
-			append(
-				messages,
-				ai.Provider_Message {
-					Role = .Tool,
-					Content = payload.content,
-					Tool_Call_ID = call_id,
-					Tool_Is_Error = payload.outcome != .Exited,
-				},
-			)
+			call_seq: i64 = -1
+			if related, present := entry.related_seq.?; present { call_seq = i64(related) }
+			if name, is_refused := refused[call_seq]; is_refused {
+				text := strings.concatenate({name, CHAT_REFUSED_CALL_SUFFIX, payload.content}, allocator)
+				append(feedback, text)
+				append(&pending, text)
+			} else {
+				append(
+					messages,
+					ai.Provider_Message {
+						Role = .Tool,
+						Content = payload.content,
+						Tool_Call_ID = call_ids[call_seq],
+						Tool_Is_Error = payload.outcome != .Exited,
+					},
+				)
+			}
 		case session.Tool_Dispatch_Entry, session.Checkpoint_Entry:
 		// Bookkeeping a model is never shown.
 		}
 	}
 	chat_flush_calls(messages, call_lists, &group, &group_open)
+	chat_flush_feedback(messages, &pending)
 	delete(group)
+}
+
+// CHAT_REFUSED_CALL_SUFFIX joins a call's name to the harness's account of why it
+// was not run. It is a literal, so the same refusal always says the same bytes.
+CHAT_REFUSED_CALL_SUFFIX :: " call was refused before it ran: "
+
+// chat_replay_call decides what a request says a call was. A call that ran is
+// replayed with the arguments it ran with, because a repair preserves the model's
+// intent and the proposal is then not what ran. A call that never ran is replayed
+// as proposed when the proposal is an object, and is not replayed as a call at
+// all when it is not: an endpoint refuses arguments it cannot parse, and
+// inventing arguments would put words in the model's mouth. faithful says the
+// proposal is already exactly what the provider will be told, which is what lets
+// a native response be replayed as it stands.
+@(private)
+chat_replay_call :: proc(call: session.Tool_Call_Entry, effective: string) -> (arguments: string, project: bool, faithful: bool) {
+	if effective != "" { return effective, true, effective == call.arguments }
+	if chat_arguments_object(call.arguments) { return call.arguments, true, true }
+	return "", false, false
+}
+
+// chat_arguments_object reports whether a call's arguments are an object an
+// endpoint can carry. It is a check on the bytes as sent, not a validation of the
+// tool's own fields, which happens where the call is prepared.
+@(private)
+chat_arguments_object :: proc(raw: string) -> bool {
+	if raw == "" { return false }
+	value, parse_err := json.parse_string(raw, .JSON, true, context.temp_allocator)
+	if parse_err != nil { return false }
+	defer json.destroy_value(value, context.temp_allocator)
+	_, is_object := value.(json.Object)
+	return is_object
+}
+
+@(private)
+chat_response_unfaithful :: proc(unfaithful: map[i64]bool, request_no: Maybe(session.Request_No)) -> bool {
+	request, present := request_no.?
+	return present && unfaithful[i64(request)]
+}
+
+@(private)
+chat_flush_feedback :: proc(messages: ^[dynamic]ai.Provider_Message, pending: ^[dynamic]string) {
+	for text in pending^ {
+		append(messages, ai.Provider_Message{Role = .User, Content = text})
+	}
+	clear(pending)
 }
 
 // chat_verbatim_covers reports whether a verbatim output already carries the

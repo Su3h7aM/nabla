@@ -227,13 +227,19 @@ Context :: struct {
 	summary:     string, // owned; "" when the session has no checkpoint
 	summary_seq: Maybe(Seq), // the checkpoint entry itself
 	covered_seq: Maybe(Seq), // the last entry the checkpoint covers
-	entries:     []Entry, // owned
+	entries:     []Entry, // owned; what a model is shown
+	// dispatches is what the harness committed to run, one per call it answered.
+	// It is not conversation, but a request needs it: a proposal is not always
+	// what ran, and the projection has to say what ran rather than replay
+	// arguments an endpoint would refuse.
+	dispatches:  []Entry, // owned
 }
 
 context_destroy :: proc(ctx: ^Context, allocator := context.allocator) {
 	if ctx == nil { return }
 	delete(ctx.summary, allocator)
 	entries_destroy(ctx.entries, allocator)
+	entries_destroy(ctx.dispatches, allocator)
 	ctx^ = {}
 }
 
@@ -278,6 +284,13 @@ context_load :: proc(store: ^Store, id: Session_Id, allocator := context.allocat
 		return {}, read_err
 	}
 	ctx.entries = entries
+
+	dispatches, dispatch_err := entries_read(store, ENTRY_SELECT_DISPATCHES, args[:], true, allocator)
+	if dispatch_err != nil {
+		context_destroy(&ctx, allocator)
+		return {}, dispatch_err
+	}
+	ctx.dispatches = dispatches
 	return ctx, nil
 }
 
@@ -300,6 +313,9 @@ ENTRY_SELECT_LATEST_CHECKPOINT :: `SELECT seq, turn_no, request_no, created_at_m
 
 @(private)
 ENTRY_SELECT_CONTEXT :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ? AND seq > COALESCE(?, 0) AND kind NOT IN ('tool_dispatch', 'checkpoint') ORDER BY seq`
+
+@(private)
+ENTRY_SELECT_DISPATCHES :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ? AND seq > COALESCE(?, 0) AND kind = 'tool_dispatch' ORDER BY seq`
 
 @(private)
 entry_exists :: proc(store: ^Store, id: Session_Id, seq: Seq) -> (bool, Error) {

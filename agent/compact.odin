@@ -93,7 +93,7 @@ chat_compact :: proc(
 	covered := entries[seam - 1].seq
 
 	compact_prep: Chat_Request_Prep
-	chat_build_request_into(chat, &compact_prep, entries[:seam], prep.history.summary, connection, true)
+	chat_build_request_into(chat, &compact_prep, entries[:seam], prep.history.dispatches, prep.history.summary, connection, true)
 	defer chat_request_prep_destroy(&compact_prep, chat.allocator)
 	if compact_prep.estimate + CHAT_COMPACT_MAX_OUTPUT + CHAT_ADMISSION_MARGIN_TOKENS > chat.context_window {
 		_observer_message(observer, .Error, "active context is too large to compact in one request; start a fresh session for a new topic")
@@ -212,7 +212,7 @@ chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connectio
 		return false
 	}
 	prep.history = ctx
-	chat_build_request_into(chat, prep, prep.history.entries, prep.history.summary, connection, false)
+	chat_build_request_into(chat, prep, prep.history.entries, prep.history.dispatches, prep.history.summary, connection, false)
 	return true
 }
 
@@ -222,10 +222,13 @@ chat_request_storage_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Al
 	delete(prep.calls)
 	delete(prep.tools)
 	delete(prep.wire)
+	for text in prep.feedback { delete(text, allocator) }
+	delete(prep.feedback)
 	delete(prep.cache_key, allocator)
 	prep.calls = nil
 	prep.tools = nil
 	prep.wire = nil
+	prep.feedback = nil
 	prep.cache_key = ""
 }
 
