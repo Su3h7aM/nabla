@@ -5,6 +5,7 @@ import "core:strings"
 import "core:unicode/utf8"
 
 import "nabla:agent/session"
+import "nabla:agent/skills"
 import "nabla:ai"
 
 // Chat_Tool_Call is a validated tool call awaiting execution. seq is the stored
@@ -138,6 +139,10 @@ Chat_Session :: struct {
 	last_input_measured:         i64,
 	last_input_measured_present: bool,
 	last_estimate:               int,
+
+	// skill_catalog is the frozen catalog from the instruction snapshot. Nil
+	// means unavailable, never an instruction to rescan.
+	skill_catalog:               Maybe(skills.Catalog),
 }
 
 // CHAT_DEFAULT_CONTEXT_WINDOW is the window a session assumes for a model that no
@@ -182,7 +187,14 @@ chat_tool_call_destroy :: proc(call: ^Chat_Tool_Call, allocator: mem.Allocator) 
 	call^ = {}
 }
 
+chat_skill_catalog :: proc(chat: ^Chat_Session) -> ^skills.Catalog {
+	if catalog, present := &chat.skill_catalog.?; present { return catalog }
+	return nil
+}
+
 chat_session_destroy :: proc(chat: ^Chat_Session) {
+	if catalog, present := &chat.skill_catalog.?; present { skills.catalog_destroy(catalog, chat.allocator) }
+	chat.skill_catalog = nil
 	delete(string(chat.id), chat.allocator)
 	delete(chat.partial_assistant)
 	if chat.pending_response_present { chat_response_output_destroy(&chat.pending_response, chat.allocator) }

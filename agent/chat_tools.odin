@@ -26,6 +26,7 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 			workspace = chat.workspace,
 			control   = control,
 			allocator = chat.allocator,
+			skills    = chat_skill_catalog(chat),
 		}
 		result: Tool_Result
 
@@ -68,6 +69,7 @@ chat_prepare_call :: proc(
 		workspace = chat.workspace,
 		control = {interrupt = &chat_cancel, deadline = chat.turn_deadline},
 		allocator = chat.allocator,
+		skills = chat_skill_catalog(chat),
 	}
 	arguments := tool_arguments_prepare(staged.arguments, chat.allocator)
 	defer tool_arguments_destroy(&arguments, chat.allocator)

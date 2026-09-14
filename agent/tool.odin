@@ -6,6 +6,7 @@ import "core:slice"
 import "core:strings"
 
 import "nabla:agent/session"
+import "nabla:agent/skills"
 import "nabla:ai"
 
 // Tool_Control is the caller's interruption policy for one execution. A zero
@@ -22,6 +23,7 @@ Tool_Context :: struct {
 	workspace: string,
 	control:   Tool_Control,
 	allocator: mem.Allocator,
+	skills:    ^skills.Catalog,
 }
 
 // Tool_Execute runs one admitted call. Returning .Invalid_Arguments promises the
@@ -195,7 +197,14 @@ TOOL_MAX_REQUESTS_PER_TURN :: 16
 // The native tools, in the order they are registered. tool_registry_sort fixes
 // the advertised order after this list is read.
 @(private)
-TOOL_NATIVE := [?]Tool_Definition{TOOL_EDIT_DEFINITION, TOOL_READ_DEFINITION, TOOL_SHELL_DEFINITION, TOOL_WRITE_DEFINITION}
+TOOL_NATIVE := [?]Tool_Definition {
+	TOOL_EDIT_DEFINITION,
+	TOOL_READ_DEFINITION,
+	TOOL_SHELL_DEFINITION,
+	TOOL_WRITE_DEFINITION,
+	TOOL_LIST_SKILLS_DEFINITION,
+	TOOL_LOAD_SKILL_DEFINITION,
+}
 
 // TOOL_RECOVERED_RESULT and TOOL_UNEXECUTED_RESULT are what recovery writes for a
 // call the harness never observed. They are constants so recovery allocates
