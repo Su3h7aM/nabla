@@ -55,7 +55,11 @@ load :: proc(skill: Skill, root: Root, control: Read_Control, allocator := conte
 		return {}, error_make(.Changed_During_Read, detail = "SKILL.md changed while it was read", allocator = allocator)
 	}
 
-	directory_name := filepath.base(skill.logical_path[:len(skill.logical_path) - len("/SKILL.md")])
+	suffix := "/SKILL.md"
+	if !strings.has_suffix(skill.logical_path, suffix) {
+		return {}, error_make(.Invalid_Metadata, detail = "skill provenance is invalid", allocator = allocator)
+	}
+	directory_name := filepath.base(skill.logical_path[:len(skill.logical_path) - len(suffix)])
 	metadata, metadata_error := parse_metadata(data, directory_name, allocator)
 	if metadata_error.kind != .None { return {}, metadata_error }
 	defer metadata_destroy(&metadata, allocator)

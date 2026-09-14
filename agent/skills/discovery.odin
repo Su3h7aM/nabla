@@ -156,14 +156,20 @@ discover_root :: proc(
 		name := strings.clone(entry.name, scratch)
 		append(&stack, Walk_Frame{path = path, logical = name})
 	}
-	visited := 0
+	visited := make(map[string]bool, context.temp_allocator)
+	count := 0
 	for len(stack) > 0 {
 		frame := stack[len(stack) - 1]
 		ordered_remove(&stack, len(stack) - 1)
 		defer delete(frame.path, scratch)
 		defer delete(frame.logical, scratch)
-		visited += 1
-		if visited > SKILL_MAX_DIRECTORIES {
+		count += 1
+		if frame.path in visited {
+			record_diagnostic(catalog, Diagnostic{.Traversal_Limit, root_pos, frame.logical, 0, "", "directory cycle detected", "", ""}, scratch, allocator)
+			return false
+		}
+		visited[frame.path] = true
+		if count > SKILL_MAX_DIRECTORIES {
 			record_diagnostic(
 				catalog,
 				Diagnostic{.Traversal_Limit, root_pos, root.path, 0, "", "visited directory budget exhausted", "", ""},
