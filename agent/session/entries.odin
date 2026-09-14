@@ -219,6 +219,7 @@ Entry_Kind :: enum {
 	Tool_Dispatch,
 	Tool_Result,
 	Checkpoint,
+	Instruction_Snapshot,
 }
 
 entry_kind_name :: proc(kind: Entry_Kind) -> string {
@@ -239,6 +240,8 @@ entry_kind_name :: proc(kind: Entry_Kind) -> string {
 		return "tool_result"
 	case .Checkpoint:
 		return "checkpoint"
+	case .Instruction_Snapshot:
+		return "instruction_snapshot"
 	}
 	return ""
 }
@@ -325,6 +328,15 @@ Checkpoint_Entry :: struct {
 	previous_seq: Maybe(Seq), // the checkpoint it summarized, when it summarized one
 }
 
+// Instruction_Snapshot_Entry is the frozen initial instructions and skill
+// catalog a session started with. It is bookkeeping, never conversation: no
+// turn or request names it, and context queries leave it out.
+Instruction_Snapshot_Entry :: struct {
+	format_version: u32,
+	instructions:   string,
+	manifest_json:  string,
+}
+
 // Entry_Payload is the decoded content of one entry. The active variant fixes
 // what the entry means; Entry.kind and the payload are always in agreement
 // because the codec derives one from the other.
@@ -337,6 +349,7 @@ Entry_Payload :: union {
 	Tool_Dispatch_Entry,
 	Tool_Result_Entry,
 	Checkpoint_Entry,
+	Instruction_Snapshot_Entry,
 }
 
 // Entry is one stored history record. Every string it holds is owned by the
@@ -391,6 +404,8 @@ entry_kind_of :: proc(payload: Entry_Payload) -> Entry_Kind {
 		return .Tool_Result
 	case Checkpoint_Entry:
 		return .Checkpoint
+	case Instruction_Snapshot_Entry:
+		return .Instruction_Snapshot
 	}
 	return .User
 }
@@ -431,6 +446,9 @@ entry_payload_destroy :: proc(payload: ^Entry_Payload, allocator: mem.Allocator)
 		delete(value.content, allocator)
 	case Checkpoint_Entry:
 		delete(value.summary, allocator)
+	case Instruction_Snapshot_Entry:
+		delete(value.instructions, allocator)
+		delete(value.manifest_json, allocator)
 	}
 	payload^ = nil
 }

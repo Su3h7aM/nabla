@@ -312,7 +312,7 @@ CHECKPOINT_LATEST_SEQ :: `SELECT seq FROM entries WHERE session_id = ? AND kind 
 ENTRY_SELECT_LATEST_CHECKPOINT :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ? AND kind = 'checkpoint' ORDER BY seq DESC LIMIT 1`
 
 @(private)
-ENTRY_SELECT_CONTEXT :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ? AND seq > COALESCE(?, 0) AND kind NOT IN ('tool_dispatch', 'checkpoint') ORDER BY seq`
+ENTRY_SELECT_CONTEXT :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ? AND seq > COALESCE(?, 0) AND kind NOT IN ('tool_dispatch', 'checkpoint', 'instruction_snapshot') ORDER BY seq`
 
 @(private)
 ENTRY_SELECT_DISPATCHES :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ? AND seq > COALESCE(?, 0) AND kind = 'tool_dispatch' ORDER BY seq`

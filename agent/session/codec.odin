@@ -64,6 +64,13 @@ Checkpoint_Wire :: struct {
 	previous_seq: Maybe(Seq) `json:"previous_seq"`,
 }
 
+@(private)
+Instruction_Snapshot_Wire :: struct {
+	format_version: u32 `json:"format_version"`,
+	instructions:   string `json:"instructions"`,
+	manifest_json:  string `json:"manifest_json"`,
+}
+
 // entry_payload_encode returns the stored JSON for one payload. The result is
 // allocated with allocator.
 entry_payload_encode :: proc(payload: Entry_Payload, allocator := context.allocator) -> ([]byte, Error) {
@@ -104,6 +111,13 @@ entry_payload_encode :: proc(payload: Entry_Payload, allocator := context.alloca
 			summary      = value.summary,
 			covered_seq  = value.covered_seq,
 			previous_seq = value.previous_seq,
+		}
+		return json_encode(wire, allocator)
+	case Instruction_Snapshot_Entry:
+		wire := Instruction_Snapshot_Wire {
+			format_version = value.format_version,
+			instructions   = value.instructions,
+			manifest_json  = value.manifest_json,
 		}
 		return json_encode(wire, allocator)
 	}
@@ -193,6 +207,14 @@ entry_payload_decode :: proc(kind: Entry_Kind, data: string, allocator: mem.Allo
 			covered_seq  = wire.covered_seq,
 			previous_seq = wire.previous_seq,
 		}
+	case .Instruction_Snapshot:
+		wire: Instruction_Snapshot_Wire
+		if decode_err := json_decode(data, &wire, allocator); decode_err != nil { return nil, decode_err }
+		payload = Instruction_Snapshot_Entry {
+			format_version = wire.format_version,
+			instructions   = wire.instructions,
+			manifest_json  = wire.manifest_json,
+		}
 	}
 	if !vocabulary_ok || !entry_payload_complete(kind, payload) {
 		entry_payload_destroy(&payload, allocator)
@@ -239,6 +261,8 @@ entry_payload_complete :: proc(kind: Entry_Kind, payload: Entry_Payload) -> bool
 		return kind == .Tool_Result
 	case Checkpoint_Entry:
 		return kind == .Checkpoint && value.summary != ""
+	case Instruction_Snapshot_Entry:
+		return kind == .Instruction_Snapshot && value.format_version == 1 && value.instructions != "" && value.manifest_json != ""
 	}
 	return false
 }
