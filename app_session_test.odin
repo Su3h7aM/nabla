@@ -50,6 +50,7 @@ app_session_begin :: proc(t: ^testing.T, app: ^App) -> string {
 	app.setup.workspace = workspace
 	claimed, _ := session.session_claimed(&app.setup.store)
 	app.setup.session = agent.chat_session_init(&app.setup.store, claimed, workspace, context.allocator)
+	app.setup.session.skill_instructions = agent.test_skill_instructions(&app.setup.session)
 	return directory
 }
 

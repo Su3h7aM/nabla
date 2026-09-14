@@ -44,7 +44,11 @@ chat_test_begin :: proc(t: ^testing.T, fixture: ^Chat_Test, workspace: string) {
 	fixture.chat = chat_session_init(&fixture.store, claimed, workspace, context.allocator)
 	fixture.chat.provider_id = chat_clone_string("test-provider", context.allocator)
 	fixture.chat.model_id = chat_clone_string("test-model", context.allocator)
-	fixture.chat.skill_instructions = strings.clone(AGENT_SYSTEM_PROMPT, fixture.chat.allocator)
+	fixture.chat.skill_instructions = test_skill_instructions(&fixture.chat)
+}
+
+test_skill_instructions :: proc(chat: ^Chat_Session) -> string {
+	return strings.clone(AGENT_SYSTEM_PROMPT, chat.allocator)
 }
 
 chat_test_end :: proc(t: ^testing.T, fixture: ^Chat_Test) {
