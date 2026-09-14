@@ -3,6 +3,7 @@ package agent
 
 import "core:os"
 import "core:path/filepath"
+import "core:strings"
 import "core:testing"
 
 import "nabla:agent/skills"
@@ -24,6 +25,10 @@ test_instruction_roots_order_and_rendering :: proc(t: ^testing.T) {
 	testing.expect(t, len(roots) >= 2)
 	testing.expect_value(t, roots[0].kind, Instruction_Source_Kind.Nabla_User)
 
+	disabled := instruction_roots(workspace, boundary, true)
+	defer instruction_roots_destroy(disabled)
+	for root in disabled { testing.expect(t, root.kind != .Project) }
+
 	files := make([dynamic]Agents_File, 0, context.allocator)
 	defer delete(files)
 	append(&files, Agents_File{path = "/home/user/.agents/AGENTS.md", scope = "personal", body = "Be brief."})
@@ -31,4 +36,6 @@ test_instruction_roots_order_and_rendering :: proc(t: ^testing.T) {
 	rendered := render_instructions(files[:], catalog, true)
 	defer delete(rendered, context.allocator)
 	testing.expect(t, len(rendered) > len(AGENT_SYSTEM_PROMPT))
+	testing.expect(t, strings.contains(rendered, "Be brief."))
+	testing.expect(t, strings.contains(rendered, "No skills are available."))
 }

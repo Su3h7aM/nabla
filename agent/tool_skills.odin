@@ -75,12 +75,18 @@ tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> 
 		oversized := tool_argument_error(.Too_Large, "query", "at most 4096 bytes", ctx.allocator)
 		return tool_result_refused(ctx, &oversized)
 	}
-	matches := list_skills_match(ctx.skills.skills, query, ctx.allocator)
+	matches, matched := list_skills_match(ctx.skills.skills, query, ctx.allocator)
+	if !matched {
+		return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be built", "too large")
+	}
 	defer delete(matches, ctx.allocator)
 	page_end := offset
 	if offset <= len(matches) && limit <= len(matches) - offset { page_end = offset + limit } else { page_end = len(matches) }
 	page := matches[offset:page_end] if offset <= len(matches) else matches[len(matches):]
 	records := make([]List_Skills_Record, len(page), ctx.allocator)
+	if len(page) > 0 && records == nil {
+		return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be built", "too large")
+	}
 	defer delete(records, ctx.allocator)
 	for match, index in page {
 		records[index] = List_Skills_Record {
@@ -161,8 +167,9 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> T
 	return result
 }
 
-list_skills_match :: proc(catalog: []skills.Skill, query: string, allocator := context.allocator) -> []^skills.Skill {
-	terms := list_skills_terms(query, allocator)
+list_skills_match :: proc(catalog: []skills.Skill, query: string, allocator := context.allocator) -> ([]^skills.Skill, bool) {
+	terms, terms_ok := list_skills_terms(query, allocator)
+	if !terms_ok { return nil, false }
 	defer {
 		for term in terms { delete(term, allocator) }
 		delete(terms, allocator)
@@ -181,15 +188,15 @@ list_skills_match :: proc(catalog: []skills.Skill, query: string, allocator := c
 	if exact != nil { append(&ordered, exact) }
 	for match in rest { append(&ordered, match) }
 	delete(matches)
-	return ordered[:]
+	return ordered[:], true
 }
 
-list_skills_terms :: proc(query: string, allocator := context.allocator) -> []string {
+list_skills_terms :: proc(query: string, allocator := context.allocator) -> ([]string, bool) {
 	fields := strings.fields(query, allocator)
 	defer delete(fields, allocator)
 	terms := make([dynamic]string, 0, len(fields), allocator)
 	for field in fields { append(&terms, strings.to_lower(field, allocator)) }
-	return terms[:]
+	return terms[:], true
 }
 
 tool_skill_cancelled :: proc(interrupt: ^ai.Interrupt) -> skills.Cancel_Check {

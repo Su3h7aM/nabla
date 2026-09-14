@@ -5,6 +5,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:strings"
 import "core:testing"
 
 import "nabla:agent/session"
@@ -58,12 +59,41 @@ test_list_and_load_skills_round_trip :: proc(t: ^testing.T) {
 		allocator = context.allocator,
 		skills    = chat_skill_catalog(chat),
 	}
-	list_arguments := tool_skills_arguments(t, `{"query":"pdf","limit":10}`)
+	list_arguments := tool_skills_arguments(t, `{}`)
 	defer json.destroy_value(list_arguments, context.allocator)
 	list_result := tool_list_skills_execute(&list_ctx, list_arguments)
 	defer tool_result_destroy(&list_result)
 	testing.expect_value(t, list_result.outcome, session.Tool_Outcome.Success)
 	testing.expect(t, len(list_result.content) > 0)
+	testing.expect(t, strings.contains(list_result.content, `"total_matches":2`))
+	testing.expect(t, strings.contains(list_result.content, `"name":"git"`))
+	testing.expect(t, strings.contains(list_result.content, `Work with pdf`))
+
+	page_ctx := Tool_Context {
+		call_id   = "call_1-page",
+		workspace = test.workspace,
+		allocator = context.allocator,
+		skills    = chat_skill_catalog(chat),
+	}
+	page_arguments := tool_skills_arguments(t, `{"offset":5}`)
+	defer json.destroy_value(page_arguments, context.allocator)
+	page_result := tool_list_skills_execute(&page_ctx, page_arguments)
+	defer tool_result_destroy(&page_result)
+	testing.expect_value(t, page_result.outcome, session.Tool_Outcome.Success)
+	testing.expect(t, strings.contains(page_result.content, `"total_matches":2`))
+	testing.expect(t, strings.contains(page_result.content, `"skills":[]`))
+
+	unknown_ctx := Tool_Context {
+		call_id   = "call_1-unknown",
+		workspace = test.workspace,
+		allocator = context.allocator,
+		skills    = chat_skill_catalog(chat),
+	}
+	unknown_arguments := tool_skills_arguments(t, `{"name":"missing"}`)
+	defer json.destroy_value(unknown_arguments, context.allocator)
+	unknown_result := tool_load_skill_execute(&unknown_ctx, unknown_arguments)
+	defer tool_result_destroy(&unknown_result)
+	testing.expect_value(t, unknown_result.outcome, session.Tool_Outcome.Tool_Failed)
 
 	load_ctx := Tool_Context {
 		call_id   = "call_2",
@@ -76,4 +106,6 @@ test_list_and_load_skills_round_trip :: proc(t: ^testing.T) {
 	load_result := tool_load_skill_execute(&load_ctx, load_arguments)
 	defer tool_result_destroy(&load_result)
 	testing.expect_value(t, load_result.outcome, session.Tool_Outcome.Success)
+	testing.expect(t, strings.contains(load_result.content, `"complete":true`))
+	testing.expect(t, strings.contains(load_result.content, `# pdf`))
 }

@@ -14,7 +14,7 @@ import "nabla:ai"
 // rewritten, so an evaluation of an old turn still sees exactly what happened.
 CHAT_COMPACT_KEEP_MESSAGES :: 10
 CHAT_COMPACT_MAX_OUTPUT :: 2000
-CHAT_COMPACT_INSTRUCTIONS :: "Summarize the conversation so far in a few paragraphs for continued work. Preserve decisions, unresolved tasks, file paths, tool outcomes, and anything the next step depends on. Omit small talk. Plain text only."
+CHAT_COMPACT_INSTRUCTIONS :: "Summarize the conversation so far in a few paragraphs for continued work. Preserve decisions, unresolved tasks, file paths, tool outcomes, and anything the next step depends on. Omit small talk. Plain text only. Name every loaded skill, the decisions made with it, and the paths it used. A summary never retains a complete skill verbatim: reload a skill before relying on its details."
 
 // chat_compact_seam finds where the kept tail starts so the last keep entries
 // stay verbatim. Coherence beats the count: the seam must not fall inside a
