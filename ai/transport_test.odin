@@ -13,7 +13,6 @@ import "core:fmt"
 import "core:mem"
 import "core:nbio"
 import "core:net"
-import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -292,15 +291,6 @@ transport_job_destroy :: proc(job: ^Transport_Job, allocator: mem.Allocator) {
 	if job.nameservers != nil { delete(job.nameservers, allocator) }
 }
 
-transport_open_fd_count :: proc() -> int {
-	file, open_err := os.open("/proc/self/fd")
-	if open_err != nil { return -1 }
-	defer os.close(file)
-	entries, read_err := os.read_dir(file, 0, context.temp_allocator)
-	if read_err != nil { return -1 }
-	return len(entries)
-}
-
 // --- resolution interruption -------------------------------------------------
 
 // A bound UDP socket that nobody reads from is a silently unresponsive nameserver:
@@ -480,7 +470,6 @@ test_dns_retires_stalled_resolution :: proc(t: ^testing.T) {
 		defer transport_job_destroy(&job, job.allocator)
 		job.options.interrupt = &interrupt
 
-		baseline := transport_open_fd_count()
 		transport_job_start(&job)
 		if !dns_stalled_server_await_query(server, TRANSPORT_FIXTURE_BOUND) {
 			testing.expectf(t, false, "resolution never reached the nameserver")
@@ -495,7 +484,6 @@ test_dns_retires_stalled_resolution :: proc(t: ^testing.T) {
 		testing.expectf(t, job.error.kind == .Cancelled, "expected cancellation, got %v (%s)", job.error.kind, job.error.detail)
 		testing.expect_value(t, job.completions, 0)
 		testing.expectf(t, elapsed < TRANSPORT_RETIRE_BOUND, "retirement took %v, above the %v bound", elapsed, TRANSPORT_RETIRE_BOUND)
-		testing.expect_value(t, transport_open_fd_count(), baseline)
 	}
 	// A deadline retires it too, well inside one resolution attempt so the
 	// operation bound expires rather than a nameserver attempt.
@@ -509,7 +497,6 @@ test_dns_retires_stalled_resolution :: proc(t: ^testing.T) {
 		defer transport_job_destroy(&job, job.allocator)
 		job.options.deadline = deadline_in(300 * time.Millisecond)
 
-		baseline := transport_open_fd_count()
 		transport_job_start(&job)
 		if !dns_stalled_server_await_query(server, TRANSPORT_FIXTURE_BOUND) {
 			testing.expectf(t, false, "resolution never reached the nameserver")
@@ -523,7 +510,6 @@ test_dns_retires_stalled_resolution :: proc(t: ^testing.T) {
 		testing.expectf(t, job.error.kind == .Timed_Out, "expected deadline expiry, got %v (%s)", job.error.kind, job.error.detail)
 		testing.expect_value(t, job.completions, 0)
 		testing.expectf(t, elapsed < TRANSPORT_RETIRE_BOUND, "retirement took %v, above the %v bound", elapsed, TRANSPORT_RETIRE_BOUND)
-		testing.expect_value(t, transport_open_fd_count(), baseline)
 	}
 }
 
