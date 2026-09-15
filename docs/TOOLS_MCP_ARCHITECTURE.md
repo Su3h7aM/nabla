@@ -12,9 +12,10 @@ system prompt all named shell fields directly. Adding a second tool meant
 editing dispatch, the request builder, result rendering, and the storage
 vocabulary.
 
-The goal is one tool system with four exposed tools (`shell`, `read`, `write`,
-`edit`) and MCP servers as a second source of the same kind of tool. Adding a
-tool should mean writing one declaration and one procedure.
+The goal is one tool system with a fixed set of native tools (`shell`,
+`read`, `write`, `edit`, plus the skill tools) and MCP servers as a second
+source of the same kind of tool. Adding a tool should mean writing one
+declaration and one procedure.
 
 ## What we keep
 
@@ -46,8 +47,33 @@ case attached.
 A tool is data plus one procedure.
 
 `Tool_Definition` carries the provider-visible name, description, and input
-schema bytes; behavior hints; a default and maximum timeout; the execute
+schema bytes; static behavior hints; a timeout policy; the execute
 procedure; and a borrowed backend binding.
+
+`Tool_Behavior_Hints` states read-only, destructive, idempotent, and
+open-world as tri-state values. Unknown is the zero value, so absence of
+knowledge reads as unknown rather than as a claim. The hints are for the
+harness, policy code, and diagnostics, not for the model: provider
+function-tool formats have no portable hint fields, so descriptions stay
+responsible for model-facing guidance and no generated prose is appended to
+them.
+
+`Tool_Timeout_Policy` states a default and a maximum as durations. Zero means
+no tool-specific deadline, not a forgotten configuration; the turn deadline
+still applies. Milliseconds live only at the JSON argument boundary.
+
+The backend binding is a borrowed pointer, nil for native tools. The registry
+copies it but never frees it: the adapter that registered the definition owns
+the state and keeps it alive until no registry and no in-flight turn can use
+it. Dispatch copies it into `Tool_Context`, and only the execute procedure
+paired with the definition may interpret it.
+
+Registration validates every definition and refuses malformed ones with a
+concrete error: names fit the provider-compatible subset, descriptions are
+non-empty and bounded, schemas are bounded JSON with an object root, timeouts
+are consistent, an executor is present, and collisions are refused rather than
+resolved last-wins. A bad definition never reaches request encoding, where it
+would fail after the request was already recorded.
 
 `Tool_Execute` has one signature for every tool:
 
@@ -66,13 +92,17 @@ the reference harnesses carry. Four tools do not need a plugin boundary.
 
 ## Registry and lifetime
 
-`Tool_Registry` owns a flat array of definitions, built before the first turn.
-It is not mutated while a turn runs, so a turn borrows it. A collision between
-two definitions is a configuration error, never a last-wins resolution.
+`Tool_Registry` owns a flat array of definitions. It is built separately,
+validated, and sorted before it is installed, so a failed build never leaves
+half of the new inventory behind. It is replaceable while the chat is idle
+and frozen for the entire user turn: all model requests and tool executions
+in a turn borrow the same definitions, and replacement is refused while a
+turn is in flight. The registry is never mutated in place, because
+dynamic-array growth could invalidate borrowed definition pointers.
 
-MCP tools enter the same registry through an adapter. A refresh happens between
-turns, so a running response always dispatches against the definitions it was
-advertised with.
+MCP tools will enter the same registry through an adapter. A refresh happens
+between turns, so a running response always dispatches against the definitions
+it was advertised with.
 
 ## Dispatch
 
@@ -84,10 +114,14 @@ The pipeline is fixed and lives in `chat_run_tools`:
 4. Prepare the argument bytes: size, syntax, object root, duplicate keys, then
    one deterministic repair for raw control bytes inside string literals.
 5. Write the dispatch entry with the effective arguments.
-6. Execute once, unless cancellation already landed.
-7. Normalize and bound the result.
-8. Write the result entry.
-9. Report to the observer and continue in assistant source order.
+6. Check cancellation again: a turn that ended after the dispatch was recorded
+   reports Not_Executed, because the call never started.
+7. Execute once through the definition's procedure.
+8. Finalize the result against the result contract: verify the envelope
+   shape, the status match, and the global budget, replacing a violation
+   with bounded feedback that preserves the observed outcome.
+9. Write the result entry.
+10. Report to the observer and continue in assistant source order.
 
 A durable write failure stops the turn. Nothing runs after a dispatch record
 failed to land, and no result is continued from memory.
@@ -149,15 +183,24 @@ unchecked.
 
 ## Output
 
-Model-visible content is bounded to 64 KiB of valid JSON. Shell output is
-previewed from the tail, spilled to a private file under the session directory,
-and reports when even the spill was incomplete, so a long build is recoverable
-instead of lost. Draining continues after the preview limit so the child never
-blocks on a full pipe.
+Model-visible content is bounded to 64 KiB of valid JSON for every tool alike.
+`TOOL_MAX_RESULT_BYTES` lives in `agent/tool.odin` and finalization enforces
+it, so no single call can consume a large part of the model context. Shell
+output is previewed from the tail, spilled to a private file under the session
+directory, and reports when even the spill was incomplete, so a long build is
+recoverable instead of lost. Draining continues after the preview limit so the
+child never blocks on a full pipe. A skill listing that does not fit returns
+fewer records with the usual paging cursor; an oversized single skill body is
+an explicit bounded failure until pagination or another deliberate design
+exists.
 
 ## Shell
 
-`shell` is not a terminal, a background-job service, or a sandbox.
+`shell` is not a terminal, a background-job service, or a sandbox. Its
+timeout policy lives in its definition: 30 seconds by default, 120 seconds
+maximum. A model-requested timeout above the maximum is refused, never
+silently clamped, and the turn deadline wins over a longer tool budget.
+Cancellation wins over the timeout when both are observed.
 
 - `/bin/sh -c` in a fresh process group, stdin closed.
 - The launch environment is captured once, with configured secrets removed, and
@@ -201,14 +244,27 @@ endpoint-bound credentials. No OAuth flow, no legacy transport, no fallback
 handshake. A `2026-07-28` server that is not understood gets an actionable
 diagnostic.
 
+A call can carry several bounds: the remaining turn deadline, the definition
+maximum, the definition default, and a model-requested timeout where the tool
+exposes one. The effective bound is the earliest applicable deadline. The
+file and skill tools state no tool-specific deadline and check the turn
+control cooperatively instead: before expensive reads, before the temporary
+write, while it grows, and before the atomic rename. A cancellation before
+the rename deletes the temporary file and reports Cancelled; once the rename
+succeeds the observed result stands. A hard deadline for synchronous
+filesystem calls would need process isolation or nonblocking I/O, which is
+outside this design.
+
 ## Prompt stability
 
 Tool definitions are sorted and serialized deterministically so the cacheable
 prefix does not churn. Descriptions and schemas are frozen within a response.
 Connection state, request ids, timestamps, and credentials never enter a
-description. Request records store the actual prepared inventory rather than
-reconstructing it. Session tips are not taken from a server: MCP instructions
-are untrusted external text.
+description. Request records store the actual prepared inventory, name,
+description, and exact schema bytes taken from the prepared request rather
+than reconstructed from the session, so the record stays true even if the
+registry changes before the write lands. Session tips are not taken from a
+server: MCP instructions are untrusted external text.
 
 ## Packages
 
