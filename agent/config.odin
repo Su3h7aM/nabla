@@ -307,6 +307,14 @@ load_harness_options :: proc(L: ^l.State, idx: c.int) -> (Harness_Options, Confi
 
 load_lua_config_full :: proc(path: string, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Harness_Options, Config_Error) {
 	if path == "" { return {}, {}, .None }
+	// A missing file is a valid setup: no providers, default options. Only a
+	// file that exists but cannot be read is an error.
+	if info, stat_err := os.stat(path, context.temp_allocator); stat_err != nil {
+		if stat_err == os.General_Error.Not_Exist { return {}, {}, .Missing }
+		return {}, {}, .Read
+	} else if info.type != .Regular {
+		return {}, {}, .Read
+	}
 	data, read_err := os.read_entire_file(path, context.temp_allocator)
 	if read_err != nil { return {}, {}, .Read }
 	if len(data) > CONFIG_MAX_BYTES { return {}, {}, .Invalid }
@@ -357,6 +365,12 @@ load_lua_config_full :: proc(path: string, allocator := context.allocator) -> ([
 
 load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Config_Error) {
 	if path == "" { return {}, .None }
+	if info, stat_err := os.stat(path, context.temp_allocator); stat_err != nil {
+		if stat_err == os.General_Error.Not_Exist { return {}, .Missing }
+		return {}, .Read
+	} else if info.type != .Regular {
+		return {}, .Read
+	}
 	data, read_err := os.read_entire_file(path, context.temp_allocator)
 	if read_err != nil { return {}, .Read }
 	if len(data) > CONFIG_MAX_BYTES { return {}, .Invalid }

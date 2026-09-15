@@ -72,8 +72,12 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 	testing.expect(t, mini^.thinking.present && mini^.thinking.blocked)
 	testing.expect(t, old^.disabled_present && old^.disabled)
 
+	// A missing config is a valid empty setup, not an error; a path that exists
+	// but cannot be read as a file still is.
 	_, missing_err := load_lua_config("/tmp/svan-config-test-missing.lua")
-	testing.expect_value(t, missing_err, Config_Error.Read)
+	testing.expect_value(t, missing_err, Config_Error.Missing)
+	_, unreadable_err := load_lua_config("/tmp")
+	testing.expect_value(t, unreadable_err, Config_Error.Read)
 }
 
 @(test)

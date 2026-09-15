@@ -222,8 +222,11 @@ chat_main :: proc() -> int {
 		}
 		options.config_path = strings.concatenate([]string{directory, "/config.lua"}, allocator = context.temp_allocator)
 	}
+	// A missing config file is a valid setup, not an error: the run proceeds
+	// with no providers and default options. Only a config that exists but
+	// cannot be used stops the launch.
 	sources, harness_options, config_err := agent.load_lua_config_full(options.config_path)
-	if config_err != .None {
+	if config_err != .None && config_err != .Missing {
 		fmt.eprintln("nabla:", agent.config_error_text(config_err))
 		return 1
 	}
