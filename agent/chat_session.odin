@@ -97,8 +97,12 @@ Chat_Session :: struct {
 	storage_failed:               bool,
 
 	// tools is the set of tools a turn may dispatch, owned by the chat. It is
-	// fixed for the session's life, so a response always runs against the
-	// definitions it was advertised with.
+	// replaceable while the chat is idle and frozen for the entire user turn,
+	// so a response always runs against the definitions it was advertised
+	// with. Replacement swaps whole registries; the registry is never mutated
+	// in place, because dynamic-array growth could invalidate borrowed
+	// definition pointers and a failed build could leave half of the new
+	// inventory installed.
 	tools:                        Tool_Registry,
 
 	// partial_assistant is streamed text that has not been committed. It stays
@@ -197,6 +201,37 @@ chat_tool_call_destroy :: proc(call: ^Chat_Tool_Call, allocator: mem.Allocator) 
 chat_skill_catalog :: proc(chat: ^Chat_Session) -> ^skills.Catalog {
 	if catalog, present := &chat.skill_catalog.?; present { return catalog }
 	return nil
+}
+
+// Tool_Registry_Replace_Error names why a registry replacement was refused.
+// None is the zero value, so a fresh error reads as no error.
+Tool_Registry_Replace_Error :: enum {
+	None,
+	// A turn is in flight, and it borrows the current registry. Replacing
+	// now would pull the definitions out from under running requests.
+	Busy,
+}
+
+// chat_session_replace_tools swaps the session's tool registry for a
+// replacement the caller built. The swap is atomic: on success the old
+// registry is destroyed and the session owns the replacement, whose struct the
+// caller must no longer use; on Busy nothing changes and the caller keeps
+// owning the replacement.
+//
+// Replacement is refused unless the chat is idle. Idle implies no turn is in
+// flight, so no request preparation or tool execution can still borrow the
+// old registry when it is destroyed. Each registry frees with its own
+// allocator, so the replacement may come from any allocator.
+//
+// Whether a failed external refresh keeps the previous registry, removes
+// unavailable tools, or blocks the next turn is the root package's policy
+// once discovery exists; it does not belong here.
+chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Registry) -> Tool_Registry_Replace_Error {
+	if chat.state != .Idle { return .Busy }
+	tool_registry_destroy(&chat.tools)
+	chat.tools = replacement^
+	replacement^ = {}
+	return .None
 }
 
 chat_session_destroy :: proc(chat: ^Chat_Session) {

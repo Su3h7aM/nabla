@@ -685,6 +685,54 @@ test_edit_cancelled_before_rename_keeps_destination :: proc(t: ^testing.T) {
 	tool_file_is(t, path, "alpha\n")
 }
 
+// A replacement is an atomic swap: on success the session owns the new
+// registry and the old one is gone, while a busy session keeps its registry
+// and the caller keeps owning the replacement.
+@(test)
+test_replace_tools_swaps_only_while_idle :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	testing.expect_value(t, chat.state, Chat_State.Idle)
+
+	replacement, make_error := tool_registry_make(chat.allocator)
+	if !testing.expect_value(t, make_error.kind, Tool_Registry_Error_Kind.None) {
+		tool_registry_destroy(&replacement)
+		return
+	}
+	extra := Tool_Definition {
+		name         = strings.clone("extra_tool", context.allocator),
+		description  = strings.clone("An extra tool.", context.allocator),
+		input_schema = strings.clone(`{"type":"object"}`, context.allocator),
+		execute      = tool_test_dummy_execute,
+	}
+	defer tool_test_definition_destroy(&extra, context.allocator)
+	if !testing.expect_value(t, tool_registry_add(&replacement, extra).kind, Tool_Registry_Error_Kind.None) {
+		tool_registry_destroy(&replacement)
+		return
+	}
+	tool_registry_sort(&replacement)
+
+	testing.expect_value(t, chat_session_replace_tools(chat, &replacement), Tool_Registry_Replace_Error.None)
+	testing.expect_value(t, len(chat.tools.definitions), len(TOOL_NATIVE) + 1)
+	_, found := tool_registry_find(&chat.tools, "extra_tool")
+	testing.expect(t, found, "the replacement registry is installed")
+
+	// A turn is in flight, so the registry is frozen: the swap is refused and
+	// the session keeps what it has.
+	_test_accept(t, chat, "hi")
+	second, second_error := tool_registry_make(chat.allocator)
+	if !testing.expect_value(t, second_error.kind, Tool_Registry_Error_Kind.None) {
+		tool_registry_destroy(&second)
+		return
+	}
+	defer tool_registry_destroy(&second)
+	testing.expect_value(t, chat_session_replace_tools(chat, &second), Tool_Registry_Replace_Error.Busy)
+	_, still_there := tool_registry_find(&chat.tools, "extra_tool")
+	testing.expect(t, still_there, "a busy session keeps its registry")
+}
+
 // --- recovery ----------------------------------------------------------------
 
 // The recovery results are constants so recovery allocates nothing. A drift
