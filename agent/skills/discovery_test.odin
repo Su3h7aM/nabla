@@ -48,6 +48,34 @@ test_discover_selects_highest_priority_winner :: proc(t: ^testing.T) {
 
 }
 
+// A root whose scan fails is discarded whole: its candidates never select, and
+// a valid candidate in another root keeps its win. Here the failed root is a
+// regular file, which a directory read refuses.
+@(test)
+test_discover_discards_a_failed_root_without_losing_the_others :: proc(t: ^testing.T) {
+	base := fmt.aprintf("/tmp/nabla-skills-failed-%d", os.get_pid(), allocator = context.temp_allocator)
+	defer os.remove_all(base)
+	good := filepath.join({base, "good"}, context.temp_allocator) or_else ""
+	testing.expect(t, os.make_directory_all(good) == nil)
+	write_skill(t, good, "pdf", "good pdf", "good")
+	blocked := filepath.join({base, "blocked"}, context.temp_allocator) or_else ""
+	testing.expect(t, os.write_entire_file(blocked, "not a directory") == nil)
+
+	catalog, load_error := discover([]Root{{source = .Generic_User, logical_path = blocked}, {source = .Nabla_User, logical_path = good}})
+	defer catalog_destroy(&catalog)
+	defer load_error_destroy(&load_error)
+	testing.expect_value(t, load_error.kind, Error_Kind.None)
+	testing.expect_value(t, len(catalog.skills), 1)
+	if len(catalog.skills) == 1 {
+		testing.expect_value(t, catalog.skills[0].name, "pdf")
+	}
+	unreadable := false
+	for diagnostic in catalog.diagnostics {
+		if diagnostic.kind == .Unreadable_Root { unreadable = true }
+	}
+	testing.expect(t, unreadable, "the failed root must carry its diagnostic")
+}
+
 @(test)
 test_discover_rejects_same_root_duplicates :: proc(t: ^testing.T) {
 	base := fmt.aprintf("/tmp/nabla-skills-duplicate-%d", os.get_pid(), allocator = context.temp_allocator)

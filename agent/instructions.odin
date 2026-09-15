@@ -44,7 +44,9 @@ instruction_roots :: proc(workspace: string, project_boundary: string, disable_p
 		)
 	}
 	if !disable_project {
-		append(&roots, Instruction_Root{kind = .Project, path = strings.clone(workspace, allocator), authority = strings.clone(project_boundary, allocator)})
+		authority := project_boundary
+		if authority == "" { authority = workspace }
+		append(&roots, Instruction_Root{kind = .Project, path = strings.clone(workspace, allocator), authority = strings.clone(authority, allocator)})
 	}
 	if home, home_err := os.user_home_dir(allocator); home_err == nil && home != "" {
 		defer delete(home, allocator)
@@ -215,6 +217,10 @@ write_json_string :: proc(builder: ^strings.Builder, value: string) {
 	strings.write_byte(builder, '"')
 }
 
+// project_boundary finds the nearest ancestor of the workspace that carries a
+// repository marker, checking .git before .jj at each level. An empty result
+// means no marker exists up to the filesystem root: the workspace is then its
+// own project scope, and no ancestor is scanned.
 project_boundary :: proc(workspace: string, allocator := context.allocator) -> string {
 	current := strings.clone(workspace, allocator)
 	for {
@@ -232,7 +238,10 @@ project_boundary :: proc(workspace: string, allocator := context.allocator) -> s
 			}
 		}
 		parent := filepath.dir(current)
-		if parent == current { return current }
+		if parent == current {
+			delete(current, allocator)
+			return ""
+		}
 		next := strings.clone(parent, allocator)
 		delete(current, allocator)
 		current = next

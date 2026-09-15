@@ -90,16 +90,17 @@ discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Cat
 		append(&resolved, Root{source = root.source, logical_path = root.logical_path, path = canonical, authority = root.authority})
 	}
 
-	failed_root := false
+	// A root whose scan fails is discarded whole, per the discovery contract:
+	// its candidates never reach selection, and a valid candidate in another
+	// root keeps its win. The diagnostic the scan recorded says why.
 	for root, resolved_index in resolved {
-		ok := discover_root(roots, resolved_index, root, &catalog, &candidates, scratch, allocator)
-		if !ok { failed_root = true }
-	}
-	if failed_root {
-		release_candidates(candidates[:], scratch)
-		catalog_destroy(&catalog, allocator)
-		load_error = error_make(.Unreadable, detail = "incomplete root scan produced no catalog", allocator = allocator)
-		return
+		before := len(candidates)
+		if !discover_root(roots, resolved_index, root, &catalog, &candidates, scratch, allocator) {
+			for index := len(candidates) - 1; index >= before; index -= 1 {
+				release_candidate(&candidates[index], scratch)
+				ordered_remove(&candidates, index)
+			}
+		}
 	}
 	if !select_candidates(candidates[:], &catalog, scratch, allocator) {
 		release_candidates(candidates[:], scratch)
@@ -381,12 +382,17 @@ clone_roots :: proc(roots: []Root, allocator: mem.Allocator) -> []Root {
 	return owned
 }
 
+release_candidate :: proc(candidate: ^Candidate, allocator: mem.Allocator) {
+	delete(candidate.name, allocator)
+	delete(candidate.description, allocator)
+	delete(candidate.logical, allocator)
+	delete(candidate.canonical, allocator)
+	candidate^ = {}
+}
+
 release_candidates :: proc(candidates: []Candidate, allocator: mem.Allocator) {
-	for candidate in candidates {
-		delete(candidate.name, allocator)
-		delete(candidate.description, allocator)
-		delete(candidate.logical, allocator)
-		delete(candidate.canonical, allocator)
+	for &candidate in candidates {
+		release_candidate(&candidate, allocator)
 	}
 }
 
