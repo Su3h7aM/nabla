@@ -309,7 +309,7 @@ test_content_type_detail_excerpts_the_body :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(detail, "(HTTP 200)"), detail)
 	testing.expect(t, strings.contains(detail, `{"error":"gateway down"}`), detail)
 
-	long := strings.repeat("x", HTTP_MAX_ERROR_EXCERPT + 100)
+	long := strings.repeat("x", HTTP_MAX_ERROR_EXCERPT + 100, context.temp_allocator)
 	padded := _reader(strings.concatenate({"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n", long}, context.temp_allocator))
 	padded_detail := content_type_detail(200, "text/event-stream", &padded, context.temp_allocator)
 	defer delete(padded_detail, context.temp_allocator)
