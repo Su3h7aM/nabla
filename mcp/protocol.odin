@@ -72,11 +72,9 @@ MAX_STDERR_TAIL_BYTES :: 32 * 1024
 // text the harness repeats, so it is cut to size rather than trusted.
 MAX_IDENTITY_BYTES :: 256
 
-// request_params_make starts a params object with the per-request protocol
-// metadata already in place. Every request in this revision must carry the
-// version and the client's capabilities in `params._meta`, so the metadata is
-// built in one place: a method encoder then adds its own fields and cannot
-// forget the envelope. The result is passed to request_encode, which consumes it.
+// request_params_make starts a params object with the per-request protocol metadata
+// already in place, so a method encoder adds its own fields and cannot forget the
+// envelope. The result is passed to request_encode, which consumes it.
 request_params_make :: proc(capacity := 0, allocator := context.allocator) -> json.Object {
 	params := make(json.Object, capacity + 1, allocator)
 	params[strings.clone("_meta", allocator)] = json.Value(protocol_meta_make(allocator))
@@ -101,11 +99,8 @@ protocol_meta_make :: proc(allocator: mem.Allocator) -> json.Object {
 	return meta
 }
 
-// request_encode frames one JSON-RPC request. It takes ownership of params,
-// including on failure, so a caller cannot leak a partially built envelope by
-// forgetting to release it. The encoded line never contains a newline, because
-// the stdio framing depends on that, and it is never longer than the message
-// bound.
+// request_encode frames one JSON-RPC request. It takes ownership of params, including
+// on failure, so a caller cannot leak a partially built envelope.
 request_encode :: proc(method: string, params: json.Object, id: i64, allocator := context.allocator) -> (string, Error) {
 	envelope := make(json.Object, 4, allocator)
 	envelope[strings.clone("jsonrpc", allocator)] = json.String(strings.clone("2.0", allocator))
@@ -200,14 +195,12 @@ message_destroy :: proc(message: ^Message, allocator := context.allocator) {
 	message^ = {}
 }
 
-// message_decode reads one JSON-RPC message from a line the server sent. Anything
-// that is not a well-formed message of a known shape is refused with the reason,
-// so a protocol violation is reported as one instead of being interpreted.
+// message_decode reads one JSON-RPC message from a line the server sent.
 //
-// A response must carry an integer id, because that is the only id this client
-// ever sends and an unmatchable reply cannot be acted on. A JSON-RPC error whose
-// id is null is accepted: the specification allows it when the server could not
-// read the request's id at all.
+// A response must carry an integer id, because that is the only id this client ever
+// sends and an unmatchable reply cannot be acted on. An error whose id is null is
+// accepted, because the specification allows it when the server could not read the
+// request's id at all.
 message_decode :: proc(line: string, allocator := context.allocator) -> (message: Message, err: Error) {
 	switch problem := document_admit(line, MAX_MESSAGE_BYTES, MAX_MESSAGE_DEPTH, true, allocator); problem {
 	case .None:
