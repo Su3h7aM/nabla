@@ -168,6 +168,10 @@ chat_context_window :: proc(model: Catalog_Model) -> (window: int, assumed: bool
 // be temporary. The session id is copied too: the chat owns its identity rather
 // than borrowing it from whichever claim happens to be in the store.
 chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspace: string, allocator := context.allocator) -> Chat_Session {
+	// The native definitions are compile-time constants, so a build failure
+	// here is a programming error; the registry tests hold them to validity.
+	// A partial registry is never installed: make destroys it before returning.
+	tools, _ := tool_registry_make(allocator)
 	return Chat_Session {
 		store = store,
 		id = session.Session_Id(strings.clone(string(id), allocator)),
@@ -178,7 +182,7 @@ chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspa
 		pending_calls = make([dynamic]Chat_Tool_Call, 0, allocator),
 		effort_levels = make([dynamic]string, 0, allocator),
 		workspace = strings.clone(workspace, allocator),
-		tools = tool_registry_make(allocator),
+		tools = tools,
 	}
 }
 

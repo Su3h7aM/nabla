@@ -4,6 +4,7 @@ import "core:encoding/json"
 import "core:mem"
 import "core:slice"
 import "core:strings"
+import "core:time"
 
 import "nabla:agent/session"
 import "nabla:agent/skills"
@@ -24,6 +25,12 @@ Tool_Context :: struct {
 	control:   Tool_Control,
 	allocator: mem.Allocator,
 	skills:    ^skills.Catalog,
+	// backend is the borrowed binding the definition was registered with, copied
+	// here by dispatch. It is nil for native tools. Only the execute procedure
+	// paired with the definition may interpret it; it must never be freed
+	// through this struct. The registry owner keeps it alive until no registry
+	// or in-flight turn can use it.
+	backend:   rawptr,
 }
 
 // Tool_Execute runs one admitted call. Returning .Invalid_Arguments promises the
@@ -31,13 +38,54 @@ Tool_Context :: struct {
 // call that did not run.
 Tool_Execute :: #type proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result
 
+// Tool_Hint_Value is one static behavior statement about a tool. Unknown is
+// the zero value, so absence of knowledge reads as unknown rather than as a
+// claim. Unknown is the only honest answer when the behavior depends on
+// run-time input, such as the command a shell call executes.
+Tool_Hint_Value :: enum {
+	Unknown,
+	No,
+	Yes,
+}
+
+// Tool_Behavior_Hints describes a tool before it runs. These are static facts
+// for the harness, policy code, and diagnostics, not model-facing guidance:
+// the description carries what the model needs, and provider tool formats have
+// no portable hint fields. No vague members live here: every hint names one
+// concrete property the future MCP adapter can map to the same-named protocol
+// annotation.
+Tool_Behavior_Hints :: struct {
+	read_only:   Tool_Hint_Value,
+	destructive: Tool_Hint_Value,
+	idempotent:  Tool_Hint_Value,
+	open_world:  Tool_Hint_Value,
+}
+
+// Tool_Timeout_Policy bounds how long one execution of a tool may run. A zero
+// duration means no tool-specific deadline, not a forgotten configuration: the
+// turn deadline still applies. Durations are time.Duration internally;
+// milliseconds live only at the JSON argument boundary.
+Tool_Timeout_Policy :: struct {
+	default: time.Duration,
+	maximum: time.Duration,
+}
+
 // Tool_Definition is one tool the harness can run. The strings are owned by the
 // registry that holds the definition.
 Tool_Definition :: struct {
 	name:         string,
 	description:  string,
 	input_schema: string,
+	hints:        Tool_Behavior_Hints,
+	timeouts:     Tool_Timeout_Policy,
 	execute:      Tool_Execute,
+	// backend is borrowed adapter state, nil for native tools. The registry
+	// copies the pointer but never frees what it points to: the adapter that
+	// registered the definition owns the state and must keep it alive until no
+	// registry holding the definition and no in-flight turn borrowing it
+	// remains. Dispatch copies it into Tool_Context, and only the execute
+	// procedure paired with this definition may cast it back.
+	backend:      rawptr,
 }
 
 // Tool_Registry owns the tools available to a session. It is built before the
@@ -47,14 +95,19 @@ Tool_Registry :: struct {
 	allocator:   mem.Allocator,
 }
 
-tool_registry_make :: proc(allocator := context.allocator) -> Tool_Registry {
-	registry := Tool_Registry {
+tool_registry_make :: proc(allocator := context.allocator) -> (registry: Tool_Registry, err: Tool_Registry_Error) {
+	registry = Tool_Registry {
 		allocator = allocator,
 	}
 	registry.definitions = make([dynamic]Tool_Definition, 0, len(TOOL_NATIVE), allocator)
-	for definition in TOOL_NATIVE { tool_registry_add(&registry, definition) }
+	for definition in TOOL_NATIVE {
+		if add_error := tool_registry_add(&registry, definition); add_error.kind != .None {
+			tool_registry_destroy(&registry)
+			return {}, add_error
+		}
+	}
 	tool_registry_sort(&registry)
-	return registry
+	return registry, {}
 }
 
 tool_registry_destroy :: proc(registry: ^Tool_Registry) {
@@ -63,22 +116,131 @@ tool_registry_destroy :: proc(registry: ^Tool_Registry) {
 	registry^ = {}
 }
 
-// tool_registry_add copies a definition into the registry. A name already in use
-// is refused rather than replaced: two tools sharing a name would make dispatch
-// a coin toss.
-tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition) -> bool {
-	if definition.name == "" || definition.execute == nil { return false }
-	if _, present := tool_registry_find(registry, definition.name); present { return false }
+// Tool_Registry_Error_Kind names why a definition was refused. None is the zero
+// value, so a fresh error reads as no error.
+Tool_Registry_Error_Kind :: enum {
+	None,
+	Invalid_Name,
+	Missing_Description,
+	Invalid_Schema,
+	Invalid_Timeout,
+	Missing_Execute,
+	Name_Collision,
+}
+
+// Tool_Registry_Error is why a definition was not registered. tool borrows the
+// rejected definition's name and detail borrows static text, so both live only
+// as long as the definition passed to the registering call.
+Tool_Registry_Error :: struct {
+	kind:   Tool_Registry_Error_Kind,
+	tool:   string,
+	detail: string,
+}
+
+// TOOL_MAX_NAME_BYTES bounds a tool name. Names travel to providers, so the
+// bound keeps them short enough for every provider tool-name field.
+TOOL_MAX_NAME_BYTES :: 64
+
+// TOOL_MAX_DESCRIPTION_BYTES bounds a tool description. Descriptions travel
+// with every request, so an unbounded one would tax the cacheable prefix.
+TOOL_MAX_DESCRIPTION_BYTES :: 4096
+
+// TOOL_MAX_SCHEMA_BYTES bounds an input schema document. It matches the
+// argument budget so a schema can never admit what arguments cannot carry.
+TOOL_MAX_SCHEMA_BYTES :: 64 * 1024
+
+// tool_name_valid reports whether a name fits the provider-compatible subset:
+// ASCII letters, digits, underscore, and hyphen. An empty name or anything
+// outside that set would fail when the request is encoded, so it is refused
+// here instead.
+tool_name_valid :: proc(name: string) -> bool {
+	if name == "" || len(name) > TOOL_MAX_NAME_BYTES { return false }
+	for i in 0 ..< len(name) {
+		c := name[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' { continue }
+		return false
+	}
+	return true
+}
+
+// tool_definition_validate checks a definition before it is copied into a
+// registry. The schema is admitted as bounded JSON with an object root, using
+// the same tokenizer admission as argument documents; general JSON Schema
+// semantics stay the definition source's responsibility.
+tool_definition_validate :: proc(definition: Tool_Definition) -> Tool_Registry_Error {
+	if !tool_name_valid(definition.name) {
+		return {kind = .Invalid_Name, tool = definition.name, detail = "a name uses letters, digits, underscore, or hyphen, at most 64 bytes"}
+	}
+	if definition.description == "" {
+		return {kind = .Missing_Description, tool = definition.name, detail = "a tool needs a description"}
+	}
+	if len(definition.description) > TOOL_MAX_DESCRIPTION_BYTES {
+		return {kind = .Missing_Description, tool = definition.name, detail = "the description exceeds 4096 bytes"}
+	}
+	if schema_error := tool_schema_valid(definition.input_schema); schema_error != "" {
+		return {kind = .Invalid_Schema, tool = definition.name, detail = schema_error}
+	}
+	if definition.timeouts.default < 0 || definition.timeouts.maximum < 0 {
+		return {kind = .Invalid_Timeout, tool = definition.name, detail = "a timeout cannot be negative"}
+	}
+	if definition.timeouts.default > 0 && definition.timeouts.maximum > 0 && definition.timeouts.default > definition.timeouts.maximum {
+		return {kind = .Invalid_Timeout, tool = definition.name, detail = "the default timeout exceeds the maximum"}
+	}
+	if definition.execute == nil {
+		return {kind = .Missing_Execute, tool = definition.name, detail = "a tool needs an execute procedure"}
+	}
+	return {}
+}
+
+// tool_schema_valid reports why a schema document is unusable, or "" when it is
+// one bounded JSON object. The returned string is static text.
+@(private)
+tool_schema_valid :: proc(schema: string) -> string {
+	if schema == "" { return "a tool needs an input schema" }
+	if len(schema) > TOOL_MAX_SCHEMA_BYTES { return "the schema exceeds 64 KiB" }
+	admit_error := tool_arguments_admit(schema, context.temp_allocator)
+	defer tool_argument_error_destroy(&admit_error, context.temp_allocator)
+	switch admit_error.kind {
+	case .None:
+		return ""
+	case .Not_Object:
+		return "the schema root must be a JSON object"
+	case .Too_Large:
+		return "the schema exceeds 64 KiB"
+	case .Too_Deep:
+		return "the schema nests too deeply"
+	case .Duplicate_Field:
+		return "the schema repeats a field name"
+	case .Syntax:
+		return "the schema is not valid JSON"
+	case .Unknown_Field, .Missing_Field, .Wrong_Type, .Invalid_Value:
+		return "the schema is not valid JSON"
+	}
+	return "the schema is not valid JSON"
+}
+
+// tool_registry_add validates a definition and copies it into the registry. A
+// name already in use is refused rather than replaced: two tools sharing a name
+// would make dispatch a coin toss. The backend pointer is copied, never
+// retained: the adapter keeps owning it.
+tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition) -> Tool_Registry_Error {
+	if invalid := tool_definition_validate(definition); invalid.kind != .None { return invalid }
+	if _, present := tool_registry_find(registry, definition.name); present {
+		return {kind = .Name_Collision, tool = definition.name, detail = "a tool with this name is already registered"}
+	}
 	append(
 		&registry.definitions,
 		Tool_Definition {
 			name = strings.clone(definition.name, registry.allocator),
 			description = strings.clone(definition.description, registry.allocator),
 			input_schema = strings.clone(definition.input_schema, registry.allocator),
+			hints = definition.hints,
+			timeouts = definition.timeouts,
 			execute = definition.execute,
+			backend = definition.backend,
 		},
 	)
-	return true
+	return {}
 }
 
 tool_registry_find :: proc(registry: ^Tool_Registry, name: string) -> (^Tool_Definition, bool) {

@@ -35,6 +35,7 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		} else if definition, present := tool_registry_find(&chat.tools, staged.name); !present {
 			result = tool_result_failure(&ctx, .Unavailable, fmt.tprintf("no tool named %q is available", staged.name), "unavailable")
 		} else {
+			ctx.backend = definition.backend
 			prepared, prepared_ok := chat_prepare_call(chat, observer, &staged, definition)
 			if !prepared_ok { return count }
 			result = prepared
@@ -70,6 +71,7 @@ chat_prepare_call :: proc(
 		control = {interrupt = &chat_cancel, deadline = chat.turn_deadline},
 		allocator = chat.allocator,
 		skills = chat_skill_catalog(chat),
+		backend = definition.backend,
 	}
 	arguments := tool_arguments_prepare(staged.arguments, chat.allocator)
 	defer tool_arguments_destroy(&arguments, chat.allocator)

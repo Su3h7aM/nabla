@@ -5,6 +5,7 @@ import "core:encoding/json"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 import "nabla:agent/session"
 
@@ -295,6 +296,170 @@ test_every_native_tool_is_registered_complete :: proc(t: ^testing.T) {
 		testing.expect(t, definition.input_schema != "", "a tool advertises its arguments")
 		testing.expect(t, definition.execute != nil, "a tool has an executor")
 	}
+}
+
+// The native definitions are compile-time constants, so building the registry
+// from them must never fail. A failure here is a programming error, not a
+// configuration the harness could recover from.
+@(test)
+test_native_registry_builds_without_error :: proc(t: ^testing.T) {
+	registry, registry_error := tool_registry_make(context.allocator)
+	defer tool_registry_destroy(&registry)
+	testing.expect_value(t, registry_error.kind, Tool_Registry_Error_Kind.None)
+	if registry_error.kind != .None { return }
+	testing.expect_value(t, len(registry.definitions), len(TOOL_NATIVE))
+}
+
+// tool_test_dummy_execute stands in for an executor where only registration
+// matters. Nothing runs through it.
+tool_test_dummy_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+	return tool_result_failure(ctx, .Tool_Failed, "dummy", "dummy")
+}
+
+tool_test_valid_definition :: proc(allocator := context.allocator) -> Tool_Definition {
+	return Tool_Definition {
+		name = strings.clone("test_tool", allocator),
+		description = strings.clone("A test tool.", allocator),
+		input_schema = strings.clone(`{"type":"object"}`, allocator),
+		execute = tool_test_dummy_execute,
+	}
+}
+
+tool_test_definition_destroy :: proc(definition: ^Tool_Definition, allocator := context.allocator) {
+	delete(definition.name, allocator)
+	delete(definition.description, allocator)
+	delete(definition.input_schema, allocator)
+	definition^ = {}
+}
+
+// Registration is where malformed definitions are refused. A bad definition
+// must never reach request encoding, where it would fail after the request was
+// already recorded.
+@(test)
+test_registry_rejects_invalid_definitions :: proc(t: ^testing.T) {
+	// Each case names the one defect it carries; every other field is valid.
+	// Replacements delete the original clone first and stay allocator-owned
+	// (or empty), so the definition can still be destroyed unconditionally.
+	cases := []struct {
+		mutate: proc(definition: ^Tool_Definition),
+		kind:   Tool_Registry_Error_Kind,
+	} {
+		{proc(definition: ^Tool_Definition) { delete(definition.name, context.allocator); definition.name = "" }, .Invalid_Name},
+		{proc(definition: ^Tool_Definition) {
+				delete(definition.name, context.allocator)
+				definition.name = strings.clone("bad name", context.allocator)
+			}, .Invalid_Name},
+		{proc(definition: ^Tool_Definition) {
+				delete(definition.name, context.allocator)
+				definition.name = strings.clone("bad.name", context.allocator)
+			}, .Invalid_Name},
+		{proc(definition: ^Tool_Definition) { delete(definition.description, context.allocator); definition.description = "" }, .Missing_Description},
+		{proc(definition: ^Tool_Definition) { delete(definition.input_schema, context.allocator); definition.input_schema = "" }, .Invalid_Schema},
+		{proc(definition: ^Tool_Definition) {
+				delete(definition.input_schema, context.allocator)
+				definition.input_schema = strings.clone(`[]`, context.allocator)
+			}, .Invalid_Schema},
+		{proc(definition: ^Tool_Definition) {
+				delete(definition.input_schema, context.allocator)
+				definition.input_schema = strings.clone(`{"type":}`, context.allocator)
+			}, .Invalid_Schema},
+		{proc(definition: ^Tool_Definition) {
+				delete(definition.input_schema, context.allocator)
+				definition.input_schema = strings.clone(`{"a":1} trailing`, context.allocator)
+			}, .Invalid_Schema},
+		{proc(definition: ^Tool_Definition) { definition.timeouts.default = -time.Second }, .Invalid_Timeout},
+		{proc(definition: ^Tool_Definition) {
+				definition.timeouts.default = 2 * time.Second
+				definition.timeouts.maximum = time.Second
+			}, .Invalid_Timeout},
+		{proc(definition: ^Tool_Definition) { definition.execute = nil }, .Missing_Execute},
+	}
+	for c in cases {
+		definition := tool_test_valid_definition(context.allocator)
+		c.mutate(&definition)
+		registry := Tool_Registry {
+			allocator = context.allocator,
+		}
+		registry.definitions = make([dynamic]Tool_Definition, 0, 1, context.allocator)
+		add_error := tool_registry_add(&registry, definition)
+		testing.expect_value(t, add_error.kind, c.kind)
+		testing.expect_value(t, len(registry.definitions), 0)
+		tool_registry_destroy(&registry)
+		tool_test_definition_destroy(&definition, context.allocator)
+	}
+
+	// An overlong name, description, and schema are refused at their bounds.
+	definition := tool_test_valid_definition(context.allocator)
+	defer tool_test_definition_destroy(&definition, context.allocator)
+	registry := Tool_Registry {
+		allocator = context.allocator,
+	}
+	registry.definitions = make([dynamic]Tool_Definition, 0, 1, context.allocator)
+	defer tool_registry_destroy(&registry)
+
+	delete(definition.name, context.allocator)
+	definition.name = strings.repeat("n", TOOL_MAX_NAME_BYTES + 1, context.allocator)
+	testing.expect_value(t, tool_registry_add(&registry, definition).kind, Tool_Registry_Error_Kind.Invalid_Name)
+
+	delete(definition.name, context.allocator)
+	definition.name = strings.clone("test_tool", context.allocator)
+	delete(definition.description, context.allocator)
+	definition.description = strings.repeat("d", TOOL_MAX_DESCRIPTION_BYTES + 1, context.allocator)
+	testing.expect_value(t, tool_registry_add(&registry, definition).kind, Tool_Registry_Error_Kind.Missing_Description)
+
+	delete(definition.description, context.allocator)
+	definition.description = strings.clone("A test tool.", context.allocator)
+	delete(definition.input_schema, context.allocator)
+	definition.input_schema = strings.concatenate(
+		{`{"type":"object","x":"`, strings.repeat("x", TOOL_MAX_SCHEMA_BYTES, context.temp_allocator), `"}`},
+		context.allocator,
+	)
+	testing.expect_value(t, tool_registry_add(&registry, definition).kind, Tool_Registry_Error_Kind.Invalid_Schema)
+	testing.expect_value(t, len(registry.definitions), 0)
+}
+
+// A collision is a configuration error, never a silent replacement. The first
+// definition keeps its place and its backend binding.
+@(test)
+test_registry_refuses_name_collisions :: proc(t: ^testing.T) {
+	registry, make_error := tool_registry_make(context.allocator)
+	defer tool_registry_destroy(&registry)
+	if !testing.expect_value(t, make_error.kind, Tool_Registry_Error_Kind.None) { return }
+	before := len(registry.definitions)
+
+	sentinel: u8 = 7
+	duplicate := TOOL_SHELL_DEFINITION
+	duplicate.backend = &sentinel
+	add_error := tool_registry_add(&registry, duplicate)
+	testing.expect_value(t, add_error.kind, Tool_Registry_Error_Kind.Name_Collision)
+	testing.expect_value(t, add_error.tool, TOOL_SHELL_NAME)
+	testing.expect_value(t, len(registry.definitions), before)
+
+	// The registry owns its strings: the definition passed in is borrowed, and
+	// freeing the caller's copy must not disturb what was stored.
+	definition := tool_test_valid_definition(context.allocator)
+	if !testing.expect_value(t, tool_registry_add(&registry, definition).kind, Tool_Registry_Error_Kind.None) {
+		tool_test_definition_destroy(&definition, context.allocator)
+		return
+	}
+	tool_test_definition_destroy(&definition, context.allocator)
+	stored, found := tool_registry_find(&registry, "test_tool")
+	if !testing.expect(t, found, "the stored definition survives its source") { return }
+	testing.expect_value(t, stored.name, "test_tool")
+	testing.expect_value(t, stored.description, "A test tool.")
+	testing.expect_value(t, stored.input_schema, `{"type":"object"}`)
+
+	// A borrowed backend binding is preserved through registration.
+	marker: u8 = 13
+	bound := tool_test_valid_definition(context.allocator)
+	delete(bound.name, context.allocator)
+	bound.name = strings.clone("bound_tool", context.allocator)
+	bound.backend = &marker
+	defer tool_test_definition_destroy(&bound, context.allocator)
+	if !testing.expect_value(t, tool_registry_add(&registry, bound).kind, Tool_Registry_Error_Kind.None) { return }
+	found_definition, bound_found := tool_registry_find(&registry, "bound_tool")
+	if !testing.expect(t, bound_found, "the bound definition is registered") { return }
+	testing.expect(t, found_definition.backend == &marker, "the backend binding is preserved")
 }
 
 // --- recovery ----------------------------------------------------------------
