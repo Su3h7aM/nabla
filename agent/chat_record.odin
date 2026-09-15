@@ -13,10 +13,25 @@ Chat_Request_Config :: struct {
 	effort:            string `json:"effort"`,
 }
 
+// Chat_Request_Tool is one advertised tool as the model saw it: the exact
+// name, description, and schema bytes the request carried.
+@(private)
+Chat_Request_Tool :: struct {
+	name:         string `json:"name"`,
+	description:  string `json:"description"`,
+	input_schema: string `json:"input_schema"`,
+}
+
+// CHAT_REQUEST_INPUT_VERSION versions the request input record. input_json is
+// opaque text, so old rows stay valid; the version tells a future reader which
+// shape a row was written in.
+CHAT_REQUEST_INPUT_VERSION :: 1
+
 @(private)
 Chat_Request_Input :: struct {
+	format_version:           u32 `json:"format_version"`,
 	instructions:             string `json:"instructions"`,
-	tools:                    []string `json:"tools"`,
+	tools:                    []Chat_Request_Tool `json:"tools"`,
 	summary_seq:              Maybe(session.Seq) `json:"summary_seq"`,
 	covered_seq:              Maybe(session.Seq) `json:"covered_seq"`,
 	context_through:          Maybe(session.Seq) `json:"context_through"`,
@@ -70,34 +85,40 @@ chat_request_config_json :: proc(chat: ^Chat_Session, compact: bool) -> string {
 	return string(data)
 }
 
-// chat_request_input_json describes what a request carried: the instructions and
-// tool names that are not in the entries, the boundary its context started
-// after, and the last entry it included. The entries themselves stay in one
-// place, so the record points at them rather than copying them.
+// chat_request_input_json describes what a request carried, serialized from
+// the prepared request rather than reconstructed from the session. The
+// inventory in prep.request is the snapshot the request was built with, so the
+// record stays true even if the registry changes before the write lands. The
+// entries themselves stay in one place, so the record points at them through
+// the history boundaries rather than copying them.
+//
+// Schema bytes are stored as written: the schema travels as a JSON string
+// value, so no canonical re-encoding touches the definition the model saw.
 @(private)
-chat_request_input_json :: proc(chat: ^Chat_Session, ctx: session.Context, entry_count: int, compact: bool) -> string {
-	tools := make([dynamic]string, 0, len(chat.tools.definitions), context.temp_allocator)
+chat_request_input_json :: proc(
+	prep: ^Chat_Request_Prep,
+	history: ^session.Context,
+	snapshot_seq: Maybe(session.Seq),
+	entry_count: int,
+	compact: bool,
+) -> string {
+	tools := make([dynamic]Chat_Request_Tool, 0, len(prep.request.Tools), context.temp_allocator)
 	defer delete(tools)
-	if chat.tools_enabled && !compact {
-		for &definition in chat.tools.definitions { append(&tools, definition.name) }
+	for &definition in prep.request.Tools {
+		append(&tools, Chat_Request_Tool{name = definition.Name, description = definition.Description, input_schema = definition.Parameters_JSON})
 	}
 
 	input := Chat_Request_Input {
-		tools       = tools[:],
-		summary_seq = ctx.summary_seq,
-		covered_seq = ctx.covered_seq,
+		format_version = CHAT_REQUEST_INPUT_VERSION,
+		tools          = tools[:],
+		summary_seq    = history.summary_seq,
+		covered_seq    = history.covered_seq,
 	}
-	if compact {
-		input.instructions = CHAT_COMPACT_INSTRUCTIONS
-	} else if chat.skill_instructions != "" {
-		input.instructions = chat.skill_instructions
-		input.instruction_snapshot_seq = chat.skill_snapshot_seq
-	} else {
-		input.instructions = AGENT_SYSTEM_PROMPT
-	}
+	if prep.request.Instructions_Present { input.instructions = prep.request.Instructions }
+	if !compact { input.instruction_snapshot_seq = snapshot_seq }
 	count := entry_count
-	if count > len(ctx.entries) { count = len(ctx.entries) }
-	if count > 0 { input.context_through = ctx.entries[count - 1].seq }
+	if count > len(history.entries) { count = len(history.entries) }
+	if count > 0 { input.context_through = history.entries[count - 1].seq }
 
 	data, marshal_err := json.marshal(input, allocator = context.temp_allocator)
 	if marshal_err != nil { return "{}" }

@@ -111,7 +111,7 @@ chat_compact :: proc(
 			model_requested = chat.model_id,
 			api = chat_api_name(connection.API),
 			config_json = chat_request_config_json(chat, true),
-			input_json = chat_request_input_json(chat, prep.history, seam, true),
+			input_json = chat_request_input_json(&compact_prep, &prep.history, nil, seam, true),
 		},
 		at_ms,
 	)

@@ -593,3 +593,110 @@ encoded_items :: proc(t: ^testing.T, body: string) -> []string {
 	}
 	return items
 }
+
+// --- request inventory records --------------------------------------------------
+
+// request_record_tools parses the tools array of a request input record.
+@(private)
+request_record_tools :: proc(t: ^testing.T, recorded: string) -> json.Array {
+	value, parse_err := json.parse_string(recorded, .JSON, true, context.temp_allocator)
+	if parse_err != nil { testing.fail_now(t, "the input record is not valid JSON") }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, object_ok := value.(json.Object)
+	if !object_ok { testing.fail_now(t, "the input record root is not an object") }
+	version, version_ok := object["format_version"].(json.Integer)
+	if !testing.expect(t, version_ok, "the input record carries a format version") { return nil }
+	testing.expect_value(t, int(version), CHAT_REQUEST_INPUT_VERSION)
+	tools, tools_ok := object["tools"].(json.Array)
+	if !testing.expect(t, tools_ok, "the input record carries tools") { return nil }
+	return tools
+}
+
+// The record describes the inventory the request was prepared with: full name,
+// description, and exact schema bytes, in advertised order. A registry change
+// after preparation must not leak into the record.
+@(test)
+test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "hi")
+
+	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+
+	// The registry changes after preparation, the way a between-turn refresh
+	// could. The record must still describe what was sent.
+	rogue := Tool_Definition {
+		name         = "rogue_tool",
+		description  = "A tool added after preparation.",
+		input_schema = `{"type":"object"}`,
+		execute      = tool_test_dummy_execute,
+	}
+	if !testing.expect_value(t, tool_registry_add(&chat.tools, rogue).kind, Tool_Registry_Error_Kind.None) { return }
+
+	recorded := chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries), false)
+	tools := request_record_tools(t, recorded)
+	if !testing.expect_value(t, len(tools), len(TOOL_NATIVE)) { return }
+	previous := ""
+	for item in tools {
+		entry, entry_ok := item.(json.Object)
+		if !testing.expect(t, entry_ok, "every recorded tool is an object") { return }
+		name, name_ok := entry["name"].(json.String)
+		if !testing.expect(t, name_ok, "every recorded tool is named") { return }
+		testing.expect(t, string(name) > previous, "the recorded inventory is in advertised order")
+		previous = string(name)
+		testing.expect(t, string(name) != "rogue_tool", "a later registry change is not recorded")
+		if string(name) == TOOL_SHELL_NAME {
+			description, _ := entry["description"].(json.String)
+			testing.expect_value(t, string(description), TOOL_SHELL_DESCRIPTION)
+			schema, _ := entry["input_schema"].(json.String)
+			testing.expect_value(t, string(schema), TOOL_SHELL_SCHEMA)
+		}
+	}
+
+	instructions := ""
+	{
+		value, parse_err := json.parse_string(recorded, .JSON, true, context.temp_allocator)
+		if parse_err != nil { testing.fail_now(t, "the input record is not valid JSON") }
+		defer json.destroy_value(value, context.temp_allocator)
+		record, _ := value.(json.Object)
+		text, _ := record["instructions"].(json.String)
+		instructions = string(text)
+	}
+	testing.expect_value(t, instructions, prep.request.Instructions)
+}
+
+// A summarization request carries instructions instead of the agent prompt and
+// no tools, because a summary must be text.
+@(test)
+test_compaction_record_carries_no_tools :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "hi")
+
+	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+
+	compact_prep: Chat_Request_Prep
+	chat_build_request_into(chat, &compact_prep, prep.history.entries, prep.history.dispatches, prep.history.summary, tool_loop_connection, true)
+	defer chat_request_prep_destroy(&compact_prep, chat.allocator)
+
+	recorded := chat_request_input_json(&compact_prep, &prep.history, nil, len(prep.history.entries), true)
+	tools := request_record_tools(t, recorded)
+	testing.expect_value(t, len(tools), 0)
+
+	value, parse_err := json.parse_string(recorded, .JSON, true, context.temp_allocator)
+	if parse_err != nil { testing.fail_now(t, "the input record is not valid JSON") }
+	defer json.destroy_value(value, context.temp_allocator)
+	record, _ := value.(json.Object)
+	instructions, _ := record["instructions"].(json.String)
+	testing.expect_value(t, string(instructions), CHAT_COMPACT_INSTRUCTIONS)
+}
