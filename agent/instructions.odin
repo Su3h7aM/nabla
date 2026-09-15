@@ -17,7 +17,7 @@ SKILL_MAX_MANIFEST_BYTES :: 32 * 1024 * 1024
 
 Instruction_Source_Kind :: enum {
 	Nabla_User,
-	Project,
+	Local,
 	Generic_User,
 }
 
@@ -27,26 +27,22 @@ Instruction_Root :: struct {
 	authority: string,
 }
 
-instruction_roots :: proc(workspace: string, project_boundary: string, disable_project: bool, allocator := context.allocator) -> []Instruction_Root {
-	roots := make([dynamic]Instruction_Root, 0, 4, allocator)
+// instruction_roots lists the skill sources in priority order, highest first.
+// The launch directory's own `.agents/skills` wins, then Nabla's configuration
+// directory, then the generic user directory. The workspace is the only scope
+// a local root may read from; nothing here depends on any repository state.
+instruction_roots :: proc(workspace: string, disable_project: bool, allocator := context.allocator) -> []Instruction_Root {
+	roots := make([dynamic]Instruction_Root, 0, 3, allocator)
+	if !disable_project {
+		if path, join_err := filepath.join({workspace, INSTRUCTIONS_AGENTS_DIR, INSTRUCTIONS_NABLA_SKILLS_DIR}, allocator); join_err == nil {
+			append(&roots, Instruction_Root{kind = .Local, path = path, authority = strings.clone(workspace, allocator)})
+		}
+	}
 	if config_dir, config_err := xdg_directory(.Config, allocator); config_err == .None {
 		defer delete(config_dir, allocator)
 		if path, join_err := filepath.join({config_dir, INSTRUCTIONS_NABLA_SKILLS_DIR}, allocator); join_err == nil {
 			append(&roots, Instruction_Root{kind = .Nabla_User, path = path})
-		} else {
-			delete(config_dir, allocator)
 		}
-	}
-	if !disable_project && project_boundary != "" && project_boundary != workspace {
-		append(
-			&roots,
-			Instruction_Root{kind = .Project, path = strings.clone(project_boundary, allocator), authority = strings.clone(project_boundary, allocator)},
-		)
-	}
-	if !disable_project {
-		authority := project_boundary
-		if authority == "" { authority = workspace }
-		append(&roots, Instruction_Root{kind = .Project, path = strings.clone(workspace, allocator), authority = strings.clone(authority, allocator)})
 	}
 	if home, home_err := os.user_home_dir(allocator); home_err == nil && home != "" {
 		defer delete(home, allocator)
@@ -72,8 +68,27 @@ agents_files_destroy :: proc(files: []Agents_File, allocator := context.allocato
 	delete(files, allocator)
 }
 
-collect_agents_files :: proc(workspace: string, boundary: string, disable_project: bool, allocator := context.allocator) -> ([]Agents_File, string) {
-	files := make([dynamic]Agents_File, 0, 4, allocator)
+// collect_agents_files reads the automatic instruction files: the launch
+// directory's AGENTS.md first, then the personal one in the home `.agents`
+// directory. Missing files are normal; an existing file that cannot be read
+// completely is an error, never a silent skip.
+collect_agents_files :: proc(workspace: string, disable_project: bool, allocator := context.allocator) -> ([]Agents_File, string) {
+	files := make([dynamic]Agents_File, 0, 2, allocator)
+	if !disable_project {
+		if path, join_err := filepath.join({workspace, INSTRUCTIONS_AGENTS_FILE}, context.temp_allocator); join_err == nil {
+			defer delete(path, context.temp_allocator)
+			if body, read_err := read_agents_file(path, context.temp_allocator); read_err == "" {
+				defer delete(body, context.temp_allocator)
+				append(
+					&files,
+					Agents_File{path = strings.clone(path, allocator), scope = strings.clone("local", allocator), body = strings.clone(body, allocator)},
+				)
+			} else if read_err != "missing" {
+				delete(files)
+				return nil, read_err
+			}
+		}
+	}
 	if home, home_err := os.user_home_dir(context.temp_allocator); home_err == nil && home != "" {
 		defer delete(home, context.temp_allocator)
 		if path, join_err := filepath.join({home, INSTRUCTIONS_AGENTS_DIR, INSTRUCTIONS_AGENTS_FILE}, context.temp_allocator); join_err == nil {
@@ -85,50 +100,12 @@ collect_agents_files :: proc(workspace: string, boundary: string, disable_projec
 					Agents_File{path = strings.clone(path, allocator), scope = strings.clone("personal", allocator), body = strings.clone(body, allocator)},
 				)
 			} else if read_err != "missing" {
+				delete(files)
 				return nil, read_err
 			}
 		}
 	}
-	if !disable_project {
-		chain := agents_chain(workspace, boundary, context.temp_allocator)
-		defer {
-			for path in chain { delete(path, context.temp_allocator) }
-			delete(chain, context.temp_allocator)
-		}
-		for directory in chain {
-			if path, join_err := filepath.join({directory, INSTRUCTIONS_AGENTS_FILE}, context.temp_allocator); join_err == nil {
-				defer delete(path, context.temp_allocator)
-				if body, read_err := read_agents_file(path, context.temp_allocator); read_err == "" {
-					defer delete(body, context.temp_allocator)
-					append(
-						&files,
-						Agents_File{path = strings.clone(path, allocator), scope = strings.clone(directory, allocator), body = strings.clone(body, allocator)},
-					)
-				} else if read_err != "missing" {
-					return nil, read_err
-				}
-			}
-		}
-	}
 	return files[:], ""
-}
-
-agents_chain :: proc(workspace: string, boundary: string, allocator := context.allocator) -> []string {
-	chain := make([dynamic]string, 0, 8, allocator)
-	current := strings.clone(boundary != "" ? boundary : workspace, allocator)
-	for {
-		append(&chain, strings.clone(current, allocator))
-		if current == workspace { break }
-		if !strings.has_prefix(workspace, current) || (len(workspace) > len(current) && workspace[len(current)] != '/') { break }
-		relative := workspace[len(current):]
-		if strings.has_prefix(relative, "/") { relative = relative[1:] }
-		separator := strings.index_byte(relative, '/')
-		next := workspace
-		if separator >= 0 { next = strings.concatenate({current, "/", relative[:separator]}, allocator) } else { next = strings.clone(workspace, allocator) }
-		delete(current, allocator)
-		current = next
-	}
-	return chain[:]
 }
 
 read_agents_file :: proc(path: string, allocator := context.allocator) -> (string, string) {
@@ -217,37 +194,6 @@ write_json_string :: proc(builder: ^strings.Builder, value: string) {
 	strings.write_byte(builder, '"')
 }
 
-// project_boundary finds the nearest ancestor of the workspace that carries a
-// repository marker, checking .git before .jj at each level. An empty result
-// means no marker exists up to the filesystem root: the workspace is then its
-// own project scope, and no ancestor is scanned.
-project_boundary :: proc(workspace: string, allocator := context.allocator) -> string {
-	current := strings.clone(workspace, allocator)
-	for {
-		git, git_error := filepath.join({current, ".git"}, context.temp_allocator)
-		if git_error == nil {
-			defer delete(git, context.temp_allocator)
-			if os.exists(git) { return current }
-		}
-		jj, jj_error := filepath.join({current, ".jj"}, context.temp_allocator)
-		if jj_error == nil {
-			defer delete(jj, context.temp_allocator)
-			if os.is_dir(jj) {
-				delete(current, allocator)
-				return strings.clone(jj[:len(jj) - len("/.jj")], allocator)
-			}
-		}
-		parent := filepath.dir(current)
-		if parent == current {
-			delete(current, allocator)
-			return ""
-		}
-		next := strings.clone(parent, allocator)
-		delete(current, allocator)
-		current = next
-	}
-}
-
 instruction_skill_roots :: proc(roots: []Instruction_Root, allocator := context.allocator) -> []skills.Root {
 	converted := make([]skills.Root, len(roots), allocator)
 	for root, index in roots {
@@ -264,8 +210,8 @@ instruction_source_kind :: proc(kind: Instruction_Source_Kind) -> skills.Source_
 	switch kind {
 	case .Nabla_User:
 		return .Nabla_User
-	case .Project:
-		return .Project
+	case .Local:
+		return .Local
 	case .Generic_User:
 		return .Generic_User
 	}

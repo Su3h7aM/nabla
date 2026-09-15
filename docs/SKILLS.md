@@ -5,23 +5,27 @@ conventions. Skills are directories containing a `SKILL.md` file with `name`
 and `description` frontmatter. Discovery records metadata and selected paths;
 `load_skill` returns one complete body as an ordinary tool result.
 
+The skills system has no relationship with source repositories. Nothing in
+discovery, loading, `AGENTS.md`, or the system prompt looks at Git, Jujutsu, or
+any other version-control state. The only inputs are the directory Nabla was
+launched from, the user's home, and Nabla's configuration directory.
+
 ## Sources
 
 Highest priority first:
 
-1. `$XDG_CONFIG_HOME/nabla/skills`, normally `~/.config/nabla/skills`.
-2. Project `.agents/skills`, nearest workspace directory first, up to the
-   repository boundary marked by `.git` or `.jj`.
+1. `<launch-directory>/.agents/skills`, the skills of the directory Nabla was
+   launched from.
+2. `$XDG_CONFIG_HOME/nabla/skills`, normally `~/.config/nabla/skills`.
 3. `~/.agents/skills`.
 
-Nabla configuration wins over all generic roots, including project roots.
-Missing directories are empty sources. The validated, case-sensitive `name`
-is the identity: one valid definition wins per name with no merging. A valid
-definition in a lower root can still win when a higher root is invalid or
-ambiguous. After selection, load errors never fall back to a shadowed
-definition.
+Local skills win over all other sources. Missing directories are empty
+sources. The validated, case-sensitive `name` is the identity: one valid
+definition wins per name with no merging. A valid definition in a lower
+source can still win when a higher source is invalid or ambiguous. After
+selection, load errors never fall back to a shadowed definition.
 
-Configure project instruction sources in `config.lua`:
+Configure local instruction sources in `config.lua`:
 
 ```lua
 return {
@@ -32,24 +36,23 @@ return {
 }
 ```
 
-Absent `instructions.project` means true. False disables project skills and
-automatic project `AGENTS.md` loading. Personal instructions and user skill
-roots remain available.
+Absent `instructions.project` means true. False disables the launch
+directory's skills and its `AGENTS.md`. Personal instructions and the Nabla
+configuration root remain available.
 
 ## AGENTS.md
 
 Scoped, always-applicable instructions accumulate separately from skills:
 
 ```text
+<launch-directory>/AGENTS.md
 ~/.agents/AGENTS.md
-<project-boundary>/AGENTS.md
-...
-<workspace>/AGENTS.md
 ```
 
-Personal guidance renders first, then project guidance from outermost to
-innermost. Missing files are normal. An existing applicable file that cannot
-be read completely blocks session start rather than being silently ignored.
+Local guidance renders first, then personal guidance. Missing files are
+normal. An existing applicable file that cannot be read completely blocks
+session start rather than being silently ignored. Nothing walks ancestor
+directories: only the launch directory and the home directory contribute.
 
 ## Tools
 

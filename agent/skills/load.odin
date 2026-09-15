@@ -20,8 +20,8 @@ load :: proc(skill: Skill, root: Root, control: Read_Control, allocator := conte
 	if read_control_cancelled(control) { return {}, error_make(.Cancelled, allocator = allocator) }
 	if read_control_timed_out(control) { return {}, error_make(.Timed_Out, allocator = allocator) }
 	if skill.root_index < 0 { return {}, error_make(.Outside_Authority, detail = "skill has no source root", allocator = allocator) }
-	if root.source == .Project && !path_within(skill.directory, root.authority) {
-		return {}, error_make(.Outside_Authority, detail = "skill directory is outside the project boundary", allocator = allocator)
+	if root.source == .Local && !path_within(skill.directory, root.authority) {
+		return {}, error_make(.Outside_Authority, detail = "skill directory is outside the workspace scope", allocator = allocator)
 	}
 
 	path, path_error := filepath.join({skill.directory, "SKILL.md"}, allocator)

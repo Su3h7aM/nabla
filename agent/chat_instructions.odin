@@ -7,7 +7,7 @@ import "core:strings"
 import "nabla:agent/session"
 import "nabla:agent/skills"
 
-INSTRUCTION_MANIFEST_VERSION :: 1
+INSTRUCTION_MANIFEST_VERSION :: 2
 SKILL_METADATA_FORMAT_VERSION :: 1
 
 chat_ensure_instructions :: proc(chat: ^Chat_Session) -> bool {
@@ -54,14 +54,12 @@ chat_ensure_instructions :: proc(chat: ^Chat_Session) -> bool {
 }
 
 chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: string, catalog: skills.Catalog, error_text: string) {
-	boundary := project_boundary(chat.workspace, chat.allocator)
-	defer delete(boundary, chat.allocator)
-	files, files_error := collect_agents_files(chat.workspace, boundary, chat.disable_project_instructions, chat.allocator)
+	files, files_error := collect_agents_files(chat.workspace, chat.disable_project_instructions, chat.allocator)
 	if files_error != "" {
-		return "", "", {}, fmt.tprintf("project instructions could not be read: %s", files_error)
+		return "", "", {}, fmt.tprintf("local instructions could not be read: %s", files_error)
 	}
 	defer agents_files_destroy(files, chat.allocator)
-	roots := instruction_roots(chat.workspace, boundary, chat.disable_project_instructions, chat.allocator)
+	roots := instruction_roots(chat.workspace, chat.disable_project_instructions, chat.allocator)
 	defer instruction_roots_destroy(roots, chat.allocator)
 	skill_roots := instruction_skill_roots(roots, chat.allocator)
 	defer {
@@ -82,7 +80,7 @@ chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: str
 		skills.catalog_destroy(&discovered, chat.allocator)
 		return "", "", {}, "initial instructions exceed the byte limit"
 	}
-	encoded := chat_encode_manifest(chat, boundary, roots, files, discovered, rendered, chat.allocator)
+	encoded := chat_encode_manifest(chat, roots, files, discovered, rendered, chat.allocator)
 	if len(encoded) > SKILL_MAX_MANIFEST_BYTES {
 		delete(rendered, chat.allocator)
 		delete(encoded, chat.allocator)
@@ -94,7 +92,6 @@ chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: str
 
 chat_encode_manifest :: proc(
 	chat: ^Chat_Session,
-	boundary: string,
 	roots: []Instruction_Root,
 	files: []Agents_File,
 	catalog: skills.Catalog,
@@ -106,7 +103,6 @@ chat_encode_manifest :: proc(
 	manifest := Instruction_Manifest {
 		version                  = INSTRUCTION_MANIFEST_VERSION,
 		workspace                = chat.workspace,
-		boundary                 = boundary,
 		disable_project          = chat.disable_project_instructions,
 		tools_enabled            = chat.tools_enabled,
 		metadata_format          = SKILL_METADATA_FORMAT_VERSION,
@@ -160,7 +156,6 @@ chat_encode_manifest :: proc(
 Instruction_Manifest :: struct {
 	version:                  int `json:"version"`,
 	workspace:                string `json:"workspace"`,
-	boundary:                 string `json:"boundary"`,
 	disable_project:          bool `json:"disable_project"`,
 	tools_enabled:            bool `json:"tools_enabled"`,
 	metadata_format:          int `json:"metadata_format"`,
@@ -207,8 +202,8 @@ instruction_manifest_kind :: proc(kind: Instruction_Source_Kind) -> string {
 	switch kind {
 	case .Nabla_User:
 		return "nabla_user"
-	case .Project:
-		return "project"
+	case .Local:
+		return "local"
 	case .Generic_User:
 		return "generic_user"
 	}
@@ -218,7 +213,10 @@ instruction_manifest_kind :: proc(kind: Instruction_Source_Kind) -> string {
 chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: string) -> bool {
 	manifest: Instruction_Manifest
 	if json.unmarshal_string(manifest_json, &manifest, allocator = context.temp_allocator) != nil { return false }
-	if manifest.version != INSTRUCTION_MANIFEST_VERSION { return false }
+	// Version 1 differed from the current manifest only by a removed repository
+	// boundary field and the source-kind name "project"; both are inert, so old
+	// snapshots keep applying instead of stranding their sessions.
+	if manifest.version > INSTRUCTION_MANIFEST_VERSION { return false }
 	if manifest.workspace != chat.workspace { return false }
 	if manifest.instruction_bytes != len(instructions) { return false }
 	catalog: skills.Catalog
@@ -265,8 +263,8 @@ instruction_manifest_source :: proc(kind: string) -> skills.Source_Kind {
 	switch kind {
 	case "nabla_user":
 		return .Nabla_User
-	case "project":
-		return .Project
+	case "local", "project":
+		return .Local
 	case "generic_user":
 		return .Generic_User
 	}

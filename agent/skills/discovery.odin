@@ -115,9 +115,9 @@ discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Cat
 canonical_root :: proc(root: Root, allocator: mem.Allocator) -> (string, Load_Error) {
 	canonical, canonical_error := os.get_absolute_path(root.logical_path, allocator)
 	if canonical_error != nil { return "", error_make(.Unreadable, detail = string(os.error_string(canonical_error)), allocator = allocator) }
-	if root.source == .Project && !path_within(canonical, root.authority) {
+	if root.source == .Local && !path_within(canonical, root.authority) {
 		delete(canonical, allocator)
-		return "", error_make(.Outside_Authority, detail = "outside the project boundary", allocator = allocator)
+		return "", error_make(.Outside_Authority, detail = "outside the workspace scope", allocator = allocator)
 	}
 	return canonical, {}
 }

@@ -15,26 +15,28 @@ write_skill :: proc(t: ^testing.T, root, name, description, body: string) {
 	testing.expect(t, os.write_entire_file(primary, text) == nil)
 }
 
+// Priority follows the product order: the launch directory's own skills win,
+// then Nabla's configuration, then the generic user directory.
 @(test)
 test_discover_selects_highest_priority_winner :: proc(t: ^testing.T) {
 	base := fmt.aprintf("/tmp/nabla-skills-%d", os.get_pid(), allocator = context.temp_allocator)
 	defer os.remove_all(base)
 	generic_root := filepath.join({base, "generic"}, context.temp_allocator) or_else ""
-	project_root := filepath.join({base, "project"}, context.temp_allocator) or_else ""
+	local_root := filepath.join({base, "local"}, context.temp_allocator) or_else ""
 	nabla_root := filepath.join({base, "nabla"}, context.temp_allocator) or_else ""
 	testing.expect(t, os.make_directory_all(generic_root) == nil)
-	testing.expect(t, os.make_directory_all(project_root) == nil)
+	testing.expect(t, os.make_directory_all(local_root) == nil)
 	testing.expect(t, os.make_directory_all(nabla_root) == nil)
 	write_skill(t, generic_root, "pdf", "generic pdf", "generic")
 	write_skill(t, generic_root, "git", "git work", "git")
-	write_skill(t, project_root, "pdf", "project pdf", "project")
-	write_skill(t, project_root, "review", "review work", "review")
+	write_skill(t, local_root, "pdf", "local pdf", "local")
+	write_skill(t, local_root, "review", "review work", "review")
 	write_skill(t, nabla_root, "pdf", "nabla pdf", "nabla")
 	write_skill(t, nabla_root, "database", "database work", "database")
 
 	roots := []Root {
+		{source = .Local, logical_path = local_root, authority = base},
 		{source = .Nabla_User, logical_path = nabla_root},
-		{source = .Project, logical_path = project_root, authority = base},
 		{source = .Generic_User, logical_path = generic_root},
 	}
 	catalog, load_error := discover(roots)
@@ -44,7 +46,7 @@ test_discover_selects_highest_priority_winner :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(catalog.skills), 4)
 	pdf, found := find(catalog.skills, "pdf")
 	testing.expect(t, found)
-	testing.expect_value(t, catalog.skills[pdf].description, "nabla pdf")
+	testing.expect_value(t, catalog.skills[pdf].description, "local pdf")
 
 }
 

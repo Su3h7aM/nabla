@@ -218,8 +218,8 @@ skill_source_label :: proc(catalog: ^skills.Catalog, skill: skills.Skill) -> str
 	switch catalog.roots[skill.root_index].source {
 	case .Nabla_User:
 		return "nabla user"
-	case .Project:
-		return "project"
+	case .Local:
+		return "local"
 	case .Generic_User:
 		return "generic user"
 	case .Unknown:

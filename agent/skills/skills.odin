@@ -7,10 +7,13 @@ SKILL_MAX_NAME_BYTES :: 64
 SKILL_MAX_DESCRIPTION_RUNES :: 1024
 SKILL_MAX_FILE_BYTES :: 256 * 1024
 
+// Source_Kind names where a skill root comes from. The session orders roots by
+// priority; discovery itself only needs to know which roots are scope-bound
+// (Local) and which are user-owned.
 Source_Kind :: enum {
 	Unknown,
 	Nabla_User,
-	Project,
+	Local,
 	Generic_User,
 }
 

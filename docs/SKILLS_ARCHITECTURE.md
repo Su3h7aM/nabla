@@ -98,7 +98,7 @@ There are three independent lifetimes:
 The snapshot freezes metadata, selected locations, and initial instructions. It
 does not claim to snapshot the contents of every unread skill or supporting file.
 
-## 4. Default paths and project scope
+## 4. Default paths and scope
 
 ### User roots
 
@@ -130,39 +130,40 @@ path. A valid XDG configuration root can still be used without home.
 Discovery does not create missing roots. Installing and managing skills is out
 of scope.
 
-### Project boundary
+### Local scope
 
-Use the canonical session workspace, not process-global cwd changes or the cwd
-of a shell command.
+The session workspace is the directory Nabla was launched from, resolved
+canonical: never process-global cwd changes or the cwd of a shell command.
 
-1. Walk upward from the workspace to find the nearest directory containing a
-   `.git` or `.jj` marker.
-2. A `.git` marker may be a file or directory; a `.jj` marker is a directory.
-3. Use that directory as the project boundary.
-4. If neither marker exists, the workspace itself is the boundary.
-5. Enumerate each directory between workspace and boundary, inclusive.
-6. Each contributes `<directory>/.agents/skills`.
+The only local source is:
 
-No VCS subprocess is needed. An inaccessible ancestor boundary check is a
-visible diagnostic; stop the boundary walk and use the workspace-only scope
-rather than assume an unreadable ancestor contains no boundary.
+```text
+<workspace>/.agents/skills
+```
 
-This deliberately avoids scanning arbitrary ancestors outside a repository. A
-session started in a repository subdirectory sees ancestor skills up to that
-repository boundary. Descendant work does not change the catalog. Start a new
-session in a different workspace when different project discovery is needed.
+Nothing walks ancestor directories, and nothing consults version-control
+state. Whether the workspace is a Git worktree, a Jujutsu workspace, or a
+plain directory has no effect on discovery. A session that needs different
+local skills starts in a different directory. The skills system and
+`AGENTS.md` carry no repository concept at all; only programming-specific
+skill content may refer to version control, as ordinary text.
 
-Never treat the canonical `~/.agents/skills` root as a project root even if the
-workspace walk reaches home. It retains generic-user provenance and priority.
+If the workspace is the home directory itself, the local root and the generic
+user root are the same directory. The canonical-root deduplication keeps the
+higher-priority provenance and diagnoses the alias.
+
+Discovery does not create missing roots. Installing and managing skills is out
+of scope.
 
 ### Priority, highest first
 
-1. Nabla user configuration skills.
-2. Project `.agents/skills`, nearest workspace directory first.
+1. Local `<workspace>/.agents/skills`.
+2. Nabla user configuration skills.
 3. Generic user `~/.agents/skills`.
 
-Nabla configuration wins over **all** generic roots, including project roots.
-This is deliberate and differs from the common project-first rule.
+The launch directory wins over everything else. This is deliberate: the
+closest instruction source to the work at hand is the one the user can see
+and edit.
 
 There are no default `.nabla/skills`, `.claude`, `.opencode`, `.pi`, singular
 `skill/`, URL, package, or builtin sources. Explicit arbitrary roots can be
@@ -181,12 +182,13 @@ Example:
 | Root | Contents |
 | --- | --- |
 | `~/.agents/skills` | `pdf`, `git` |
-| `<project>/.agents/skills` | `pdf`, `review` |
+| `<workspace>/.agents/skills` | `pdf`, `review` |
 | `~/.config/nabla/skills` | `pdf`, `database` |
 
-The final names are `database`, `git`, `pdf`, and `review`. `pdf` comes from Nabla
-configuration, `git` from generic user configuration, and `review` from the
-project. With just generic `pdf` and `git` plus Nabla `database`, all three remain.
+The final names are `database`, `git`, `pdf`, and `review`. `pdf` comes from
+the workspace, `git` from generic user configuration, `database` from Nabla
+configuration, and `review` from the workspace. With just generic `pdf` and
+`git` plus Nabla `database`, all three remain.
 
 Resolve candidates within each root before cross-root selection:
 
@@ -242,8 +244,10 @@ skill boundary. Stop recursion there, even when the primary file is malformed,
 unreadable, or not regular. Its children are resources, not additional skills.
 Loose Markdown files are ignored.
 
-Skip `.git`, `.jj`, `.hg`, `.svn`, and `node_modules` during grouping traversal.
-Other dot directories are allowed. No ignore-file parser is needed for this
+Skip `.git`, `.jj`, `.hg`, `.svn`, and `node_modules` during grouping traversal:
+these are noise filters that keep the walk out of tool internals that happen to
+sit inside a skills root, and discovery reads no version-control state. Other
+dot directories are allowed. No ignore-file parser is needed for this
 explicit skills tree. Bound depth and visited directories, detect canonical
 cycles, and report exclusions caused by limits or link policy.
 
@@ -357,7 +361,7 @@ Root :: struct {
     source:       Source_Kind,
     logical_path: string,
     path:         string, // canonical absolute path when present
-    authority:    string, // canonical project boundary; empty for user roots
+    authority:    string, // canonical workspace scope for local roots; empty for user roots
 }
 
 Skill :: struct {
@@ -444,7 +448,7 @@ The agent constructs source policy; `agent/skills` processes the ordered roots.
 
 ```text
 canonical workspace and XDG/home resolution
-  -> project boundary and ordered roots
+  -> ordered roots
   -> root deduplication and bounded traversal
   -> metadata parsing and candidate diagnostics
   -> per-root duplicate resolution
@@ -479,25 +483,21 @@ roots and invalid skill candidates do not prevent an otherwise usable catalog.
 Read these complete files when building the snapshot:
 
 ```text
-~/.agents/AGENTS.md
-<project-boundary>/AGENTS.md
-...
 <workspace>/AGENTS.md
+~/.agents/AGENTS.md
 ```
 
-Use the same boundary as skill discovery. Deduplicate identical canonical-path
-and scope pairs. A file reached at two different scopes remains two scoped
+Nothing above the workspace is read. Deduplicate identical canonical-path and
+scope pairs. A file reached at two different scopes remains two scoped
 instruction records; deduplicating by path alone would lose its broader scope.
-The personal file is session-wide guidance; ancestor project files govern their
-directory subtrees. Render personal guidance first, then project guidance from
-outermost to innermost, with explicit source paths and scopes. Apply the same
-UTF-8 and control-character validation as primary skill bodies.
+Render local guidance first, then personal guidance, with explicit source paths
+and scopes. Apply the same UTF-8 and control-character validation as primary
+skill bodies.
 
-Project instruction files accumulate; they are not same-name skill overrides.
-Deeper project instructions take precedence over broader project instructions
-for their subtree. Project-specific guidance refines personal defaults. None
-can grant tools or override harness restrictions, and explicit user task
-instructions take precedence over conflicting file guidance.
+Instruction files accumulate; they are not same-name skill overrides. Local
+guidance refines personal defaults. None can grant tools or override harness
+restrictions, and explicit user task instructions take precedence over
+conflicting file guidance.
 
 Do not read `Nabla.md`, `CLAUDE.md`, `SYSTEM.md`, or
 `~/.config/nabla/AGENTS.md`. The Nabla-specific path in this design overrides
@@ -513,10 +513,10 @@ the model to check for and read applicable nested files before working in a
 descendant directory. Those reads use ordinary tools and append ordinary results.
 An instruction found in one subtree does not govern unrelated subtrees.
 
-The first implementation automatically handles the startup ancestor chain.
-Nested discovery is model-directed, not a claimed security guarantee. Checking
-file-tool paths alone could not enforce arbitrary shell behavior, so do not
-build a misleading instruction-enforcement layer around `write` and `edit`.
+The first implementation reads the two fixed startup files. Nested discovery is
+model-directed, not a claimed security guarantee. Checking file-tool paths alone
+could not enforce arbitrary shell behavior, so do not build a misleading
+instruction-enforcement layer around `write` and `edit`.
 
 ### Configuration
 
@@ -535,14 +535,14 @@ return {
 
 Absent `instructions.project` means true. It must be a boolean when present.
 Internally prefer `disable_project_instructions: bool`, so a zero-initialized
-options value preserves default project discovery.
+options value preserves default local discovery.
 
-False disables both project skills and automatic project `AGENTS.md` loading,
-and removes guidance to automatically discover descendant project instructions.
-Personal instruction and user skill roots remain available. This is instruction
-source selection, not a filesystem sandbox; user-requested ordinary reads still
-work. Snapshot the effective value so configuration edits do not silently change
-an existing session. To apply a different value, create a new session.
+False disables both local skills and the local `AGENTS.md` from the launch
+directory. Personal instruction and user skill roots remain available. This is
+instruction source selection, not a filesystem sandbox; user-requested ordinary
+reads still work. Snapshot the effective value so configuration edits do not
+silently change an existing session. To apply a different value, create a new
+session.
 
 Extend the shared Lua decoding path to read harness options and provider sources
 from one evaluation. Do not execute the config twice or make model catalog code
@@ -565,7 +565,7 @@ The `instructions` field holds the exact normal-request prefix. `manifest_json`
 is a versioned, typed agent-owned document, not an arbitrary plugin dictionary.
 It records:
 
-- Workspace and project boundary.
+- Workspace and effective local-source option.
 - Effective project-instruction option and initial tool-enabled mode.
 - Renderer and metadata-parser format versions. Version 1 describes this
   document's contracts; future semantic changes need an explicit compatibility
@@ -931,10 +931,9 @@ location. A retargeted logical symlink does not redirect an existing session.
 The canonical selected location is pinned, not its inode forever; ordinary
 atomic file replacement is allowed subject to read-time validation.
 
-Project roots and grouping/candidate symlinks must resolve inside the canonical
-project boundary. A project symlink to a user dotfiles directory outside that
-boundary is rejected. The same skill can instead be discovered through the user
-root. Apply project authority checks to automatic AGENTS.md reads too.
+workspace. A local symlink pointing outside the workspace is rejected. The same
+skill can instead be discovered through a user root. Apply the workspace-scope
+check to automatic AGENTS.md reads too.
 
 After canonical selection, use directory-descriptor-relative opens. Reject new
 symlinks along the selected canonical directory chain. A primary `SKILL.md`
@@ -1100,25 +1099,28 @@ real model is needed to prove the loader and state-machine contracts.
   loading then fails rather than claiming discovery validated it.
 - Grouping recursion, boundary short-circuit even for invalid skills, loose-file
   exclusion, traversal limits, cycles, canonical aliases, and incomplete scans.
-- XDG absolute override and fallback, unresolved home, `.git` file and `.jj`
-  boundary detection, workspace-only fallback, and user-root classification.
+- XDG absolute override and fallback, unresolved home, and user-root
+  classification.
 
 ### Priority and identity
 
 - Generic `pdf`/`git` plus Nabla `database` yields all three.
-- Nabla `pdf` replaces generic and project `pdf`, with resources from Nabla only.
-- Nearest project wins below Nabla; same-root distinct duplicates are excluded.
+- Local `pdf` replaces generic and Nabla `pdf`, with resources from the local
+  directory only.
+- Nabla configuration wins below local; same-root distinct duplicates are
+  excluded.
 - Invalid higher-priority candidates permit a diagnosed fallback.
 - Deletion, metadata changes, retargeted aliases, and read failure never select
   a shadowed candidate after initialization.
 - Body-only replacement returns a new digest without modifying prior history.
 - Project escapes, allowed user aliases, primary-link policy, and concurrent
-  replacement checks exercise real filesystem behavior.
+  replacement checks exercise real filesystem behavior. Here "escapes" means a
+  local root resolving outside the workspace, not anything about repositories.
 
 ### Instructions, storage, and context
 
 - Applicable AGENTS.md order and scope, complete-read failures, aggregate limits,
-  project-disable mode, and no proprietary instruction-file discovery.
+  local-source-disable mode, and no proprietary instruction-file discovery.
 - Empty catalog still persists a snapshot. Second snapshot is rejected.
 - Legacy migration preserves old rows; snapshot decoding rejects corruption.
 - Resume and checkpoint context restore identical instruction bytes after disk
