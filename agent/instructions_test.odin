@@ -48,3 +48,35 @@ test_instruction_roots_order_and_rendering :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(rendered, "Be brief."))
 	testing.expect(t, strings.contains(rendered, "No skills are available."))
 }
+
+// An absent, empty, or whitespace-only AGENTS.md carries no instructions and is
+// equivalent to a missing file; every real failure names the file.
+@(test)
+test_read_agents_file_treats_empty_as_missing :: proc(t: ^testing.T) {
+	base, base_error := os.make_directory_temp("", "nabla-agents-read-*", context.allocator)
+	if base_error != nil { testing.fail_now(t, "could not create a temporary directory") }
+	defer os.remove_all(base)
+	defer delete(base, context.allocator)
+
+	body, err := read_agents_file(filepath.join({base, "AGENTS.md"}, context.allocator) or_else "")
+	testing.expect_value(t, err, "missing")
+	testing.expect_value(t, body, "")
+
+	empty := filepath.join({base, "AGENTS.md"}, context.allocator) or_else ""
+	testing.expect(t, os.write_entire_file(empty, "") == nil)
+	body, err = read_agents_file(empty)
+	testing.expect_value(t, err, "missing")
+
+	testing.expect(t, os.write_entire_file(empty, "\n\n   \n") == nil)
+	body, err = read_agents_file(empty)
+	testing.expect_value(t, err, "missing")
+
+	testing.expect(t, os.write_entire_file(empty, "Be concise.\n") == nil)
+	body, err = read_agents_file(empty)
+	testing.expect_value(t, err, "")
+	testing.expect_value(t, body, "Be concise.\n")
+
+	testing.expect(t, os.write_entire_file(empty, "broken\x00text") == nil)
+	_, err = read_agents_file(empty)
+	testing.expect(t, strings.contains(err, empty), err)
+}

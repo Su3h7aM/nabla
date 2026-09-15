@@ -17,7 +17,7 @@ chat_ensure_instructions :: proc(chat: ^Chat_Session) -> bool {
 	if read_error == nil && present {
 		defer session.instruction_snapshot_destroy(&snapshot, chat.allocator)
 		if !chat_apply_snapshot(chat, snapshot.instructions, snapshot.manifest_json) {
-			chat_session_record_failure(chat, "the instruction snapshot is invalid", session.error_make(.Corrupt, "the instruction snapshot is invalid"))
+			chat_session_record_failure(chat, "the instruction snapshot is invalid", session.error_make(.Corrupt, ""))
 			return false
 		}
 		chat.skill_snapshot_seq = snapshot.seq
@@ -28,7 +28,7 @@ chat_ensure_instructions :: proc(chat: ^Chat_Session) -> bool {
 	}
 	instructions, manifest, catalog, manifest_error := chat_build_snapshot(chat)
 	if manifest_error != "" {
-		chat_session_record_failure(chat, manifest_error, session.error_make(.Storage, manifest_error))
+		chat_session_record_failure(chat, manifest_error, session.error_make(.Storage, ""))
 		return false
 	}
 	seq, append_error := session.instruction_snapshot_append(

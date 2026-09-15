@@ -1,5 +1,6 @@
 package agent
 
+import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -108,19 +109,25 @@ collect_agents_files :: proc(workspace: string, disable_project: bool, allocator
 	return files[:], ""
 }
 
+// read_agents_file reads one automatic instruction file completely. An absent
+// file, including an empty or whitespace-only placeholder, reports "missing":
+// it carries no instructions, so it must not block the session. Every other
+// failure names the file, so the session error says which source is wrong. The
+// returned error text is borrowed and lives only for the call.
 read_agents_file :: proc(path: string, allocator := context.allocator) -> (string, string) {
 	info, stat_error := os.stat(path, context.temp_allocator)
 	defer os.file_info_delete(info, context.temp_allocator)
 	if stat_error != nil {
 		if stat_error == os.General_Error.Not_Exist { return "", "missing" }
-		return "", "unreadable"
+		return "", fmt.aprintf("%s could not be inspected", path, allocator = context.temp_allocator)
 	}
-	if info.type != .Regular { return "", "not a file" }
-	if info.size > INSTRUCTIONS_MAX_FILE_BYTES { return "", "too large" }
+	if info.type != .Regular { return "", fmt.aprintf("%s is not a regular file", path, allocator = context.temp_allocator) }
+	if info.size > INSTRUCTIONS_MAX_FILE_BYTES { return "", fmt.aprintf("%s exceeds the byte limit", path, allocator = context.temp_allocator) }
 	data, read_error := os.read_entire_file(path, allocator)
-	if read_error != nil { return "", "unreadable" }
+	if read_error != nil { return "", fmt.aprintf("%s could not be read", path, allocator = context.temp_allocator) }
 	defer delete(data, allocator)
-	if !skills.skill_body_valid(string(data)) { return "", "invalid text" }
+	if strings.trim_space(string(data)) == "" { return "", "missing" }
+	if !skills.skill_body_valid(string(data)) { return "", fmt.aprintf("%s contains invalid text", path, allocator = context.temp_allocator) }
 	return strings.clone(string(data), allocator), ""
 }
 
