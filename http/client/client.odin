@@ -12,6 +12,7 @@ import "nabla:http"
 
 
 HTTP_MAX_ERROR_BYTES :: 4096
+HTTP_MAX_ERROR_EXCERPT :: 2000
 HTTP_MAX_HEADER_LINES :: 256
 HTTP_MAX_LINE_BYTES :: 32 * 1024
 
@@ -121,7 +122,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 			return Failure {
 				kind = .Content_Type,
 				status = status,
-				detail = fmt.aprintf("response content-type is not %s", request.expected_content_type, allocator = request.allocator),
+				detail = content_type_detail(status, request.expected_content_type, &reader, request.allocator),
 			}
 		}
 	}
@@ -420,8 +421,21 @@ error_detail :: proc(status: int, reader: ^Reader, allocator: mem.Allocator) -> 
 	text := strings.trim_space(body)
 	if text == "" { return fmt.aprintf("HTTP %d: HTTP response was not successful", status, allocator = allocator) }
 	limit := len(text)
-	if limit > 2000 { limit = 2000 }
+	if limit > HTTP_MAX_ERROR_EXCERPT { limit = HTTP_MAX_ERROR_EXCERPT }
 	return fmt.aprintf("HTTP %d: %s", status, text[:limit], allocator = allocator)
+}
+
+// content_type_detail reports a rejected response content type together with a
+// bounded excerpt of whatever the peer actually sent, so the caller can see
+// whether a 2xx response carried an error document instead of the stream.
+content_type_detail :: proc(status: int, expected: string, reader: ^Reader, allocator: mem.Allocator) -> string {
+	body := read_bounded_body(reader, HTTP_MAX_ERROR_BYTES, allocator)
+	defer delete(body, allocator)
+	text := strings.trim_space(body)
+	if text == "" { return fmt.aprintf("response content-type is not %s (HTTP %d)", expected, status, allocator = allocator) }
+	limit := len(text)
+	if limit > HTTP_MAX_ERROR_EXCERPT { limit = HTTP_MAX_ERROR_EXCERPT }
+	return fmt.aprintf("response content-type is not %s (HTTP %d): %s", expected, status, text[:limit], allocator = allocator)
 }
 
 read_bounded_body :: proc(reader: ^Reader, limit: int, allocator: mem.Allocator) -> string {

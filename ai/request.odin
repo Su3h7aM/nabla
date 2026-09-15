@@ -206,7 +206,10 @@ Provider_Request_Stream_State :: struct {
 
 // provider_operation_error_kind maps a transport failure onto the operation's
 // own outcome, so a caller that only inspects the returned error still learns
-// that the request was interrupted rather than malformed.
+// that the request was interrupted rather than malformed. A content-type
+// rejection is a stream failure: the peer answered 2xx with something other
+// than the expected media type, which an unstable peer can produce on one
+// attempt and not the next, so it retries like any other broken stream.
 provider_operation_error_kind :: proc(kind: HTTP_Failure_Kind) -> Provider_Operation_Error_Kind {
 	switch kind {
 	case .Cancelled:
@@ -217,8 +220,10 @@ provider_operation_error_kind :: proc(kind: HTTP_Failure_Kind) -> Provider_Opera
 		return .TLS
 	case .HTTP_Status:
 		return .HTTP
-	case .Content_Type, .Invalid_URL:
+	case .Invalid_URL:
 		return .Invalid_Request
+	case .Content_Type:
+		return .Stream
 	case .Transport:
 		return .Transport
 	case .None:

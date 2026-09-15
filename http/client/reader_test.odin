@@ -2,6 +2,7 @@
 #+private file
 package client
 
+import "core:strings"
 import "core:testing"
 
 import "nabla:http"
@@ -296,4 +297,21 @@ test_close_delimited_bodies :: proc(t: ^testing.T) {
 	truncated_collector: Collector
 	defer delete(truncated_collector.buffer)
 	testing.expect_value(t, stream_body(&truncated, truncated_framing, truncated_length, &truncated_collector, collect), Error.Truncated)
+}
+
+// A rejected content type carries a bounded excerpt of the body, so the caller
+// can see whether a 2xx response was an error document instead of a stream.
+@(test)
+test_content_type_detail_excerpts_the_body :: proc(t: ^testing.T) {
+	reader := _reader("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 26\r\n\r\n{\"error\":\"gateway down\"}")
+	detail := content_type_detail(200, "text/event-stream", &reader, context.temp_allocator)
+	defer delete(detail, context.temp_allocator)
+	testing.expect(t, strings.contains(detail, "(HTTP 200)"), detail)
+	testing.expect(t, strings.contains(detail, `{"error":"gateway down"}`), detail)
+
+	long := strings.repeat("x", HTTP_MAX_ERROR_EXCERPT + 100)
+	padded := _reader(strings.concatenate({"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n", long}, context.temp_allocator))
+	padded_detail := content_type_detail(200, "text/event-stream", &padded, context.temp_allocator)
+	defer delete(padded_detail, context.temp_allocator)
+	testing.expect_value(t, len(padded_detail), len("response content-type is not text/event-stream (HTTP 200): ") + HTTP_MAX_ERROR_EXCERPT)
 }
