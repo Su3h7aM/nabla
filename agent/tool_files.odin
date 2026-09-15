@@ -82,11 +82,20 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Re
 			"too large",
 		)
 	}
+	// The read below can block on the filesystem, so cancellation is checked
+	// before the expensive call and again before the output is built. There is
+	// no tool-specific timeout for reads: only the turn ending stops one.
+	if tool_control_cancelled(ctx.control) {
+		return tool_result_failure(ctx, .Cancelled, "the read was cancelled", "cancelled")
+	}
 	data, read_error := os.read_entire_file(path, ctx.allocator)
 	if read_error != nil {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("could not read %s: %s", args.path, os.error_string(read_error)), "unreadable")
 	}
 	defer delete(data, ctx.allocator)
+	if tool_control_cancelled(ctx.control) {
+		return tool_result_failure(ctx, .Cancelled, "the read was cancelled", "cancelled")
+	}
 
 	text := string(data)
 	if strings.index_byte(text, 0) >= 0 {
@@ -209,7 +218,12 @@ tool_write_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 	if mode_error != .None {
 		return tool_result_failure(ctx, .Tool_Failed, tool_write_mode_text(args.path, mode_error), "not writable")
 	}
-	if write_error := tool_write_atomic(path, transmute([]u8)args.content, mode, ctx.allocator); write_error != nil {
+	if tool_control_cancelled(ctx.control) {
+		return tool_result_failure(ctx, .Cancelled, "the write was cancelled before it began", "cancelled")
+	}
+	if write_error, write_cancelled := tool_write_atomic(path, transmute([]u8)args.content, mode, ctx.allocator, ctx.control); write_cancelled {
+		return tool_result_failure(ctx, .Cancelled, "the write was cancelled", "cancelled")
+	} else if write_error != nil {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("could not write %s: %s", args.path, os.error_string(write_error)), "write failed")
 	}
 	return tool_result_success(ctx, Write_Data{path = args.path, bytes = len(args.content)}, fmt.tprintf("wrote %d bytes", len(args.content)))
@@ -259,41 +273,66 @@ TOOL_WRITE_TEMP_ATTEMPTS :: 64
 
 // tool_write_atomic writes content to a temporary file beside path and renames it
 // into place, so a reader never sees a half-written file and a failed write
-// leaves the original untouched.
-tool_write_atomic :: proc(path: string, content: []u8, mode: os.Permissions, allocator: mem.Allocator) -> os.Error {
+// leaves the original untouched. Cancellation is cooperative: it is checked
+// before the temporary write begins, while the temporary file grows, and
+// before the rename commits. A cancellation before the rename deletes the
+// temporary file and reports cancelled; once the rename succeeds the observed
+// result stands, because the effect already committed.
+tool_write_atomic :: proc(
+	path: string,
+	content: []u8,
+	mode: os.Permissions,
+	allocator: mem.Allocator,
+	control: Tool_Control,
+) -> (
+	write_error: os.Error,
+	cancelled: bool,
+) {
+	if tool_control_cancelled(control) { return nil, true }
 	for attempt in 0 ..< TOOL_WRITE_TEMP_ATTEMPTS {
+		if tool_control_cancelled(control) { return nil, true }
 		temp_path := fmt.aprintf("%s.nabla-%d-%d", path, time.tick_now(), attempt, allocator = allocator)
 		defer delete(temp_path, allocator)
 		file, open_error := os.open(temp_path, {.Write, .Create, .Excl}, mode)
 		if open_error == os.General_Error.Exist { continue }
-		if open_error != nil { return open_error }
+		if open_error != nil { return open_error, false }
 
+		cancelled_write := false
 		written := 0
 		for written < len(content) {
-			count, write_error := os.write(file, content[written:])
-			if write_error != nil {
+			if tool_control_cancelled(control) {
+				cancelled_write = true
+				break
+			}
+			count, chunk_error := os.write(file, content[written:])
+			if chunk_error != nil {
 				os.close(file)
 				os.remove(temp_path)
-				return write_error
+				return chunk_error, false
 			}
 			if count <= 0 {
 				os.close(file)
 				os.remove(temp_path)
-				return os.General_Error.Invalid_File
+				return os.General_Error.Invalid_File, false
 			}
 			written += count
 		}
 		if close_error := os.close(file); close_error != nil {
 			os.remove(temp_path)
-			return close_error
+			if cancelled_write { return nil, true }
+			return close_error, false
+		}
+		if cancelled_write || tool_control_cancelled(control) {
+			os.remove(temp_path)
+			return nil, true
 		}
 		if rename_error := os.rename(temp_path, path); rename_error != nil {
 			os.remove(temp_path)
-			return rename_error
+			return rename_error, false
 		}
-		return nil
+		return nil, false
 	}
-	return os.General_Error.Exist
+	return os.General_Error.Exist, false
 }
 
 // --- edit --------------------------------------------------------------------
@@ -442,7 +481,9 @@ tool_edit_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Re
 	}
 	copy(updated[at:], transmute([]u8)text[cursor:])
 
-	if write_error := tool_write_atomic(path, updated, mode, ctx.allocator); write_error != nil {
+	if write_error, write_cancelled := tool_write_atomic(path, updated, mode, ctx.allocator, ctx.control); write_cancelled {
+		return tool_result_failure(ctx, .Cancelled, "the edit was cancelled", "cancelled")
+	} else if write_error != nil {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("could not write %s: %s", path_argument, os.error_string(write_error)), "write failed")
 	}
 	return tool_result_success(ctx, Edit_Data{path = path_argument, replacements = len(matches)}, fmt.tprintf("%d replacements", len(matches)))

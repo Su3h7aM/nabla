@@ -97,6 +97,11 @@ chat_prepare_call :: proc(
 		chat_session_record_failure(chat, "the tool dispatch could not be recorded", dispatch_error)
 		return {}, false
 	}
+	// Cancellation can land after the intent was recorded but before execution
+	// begins. The intent is durable, but the call never started.
+	if tool_control_cancelled(ctx.control) {
+		return tool_result_failure(&ctx, .Not_Executed, "the turn was cancelled before this call ran", "not executed"), true
+	}
 	// Finalization is the dispatch boundary between execution and storage: the
 	// store only ever receives a valid bounded envelope.
 	return tool_result_finalize(&ctx, definition.execute(&ctx, object)), true

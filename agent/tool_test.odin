@@ -8,6 +8,7 @@ import "core:testing"
 import "core:time"
 
 import "nabla:agent/session"
+import "nabla:ai"
 
 // Tool_Test drives one tool call through the real dispatch path against a real
 // store, the way a completed response would.
@@ -561,6 +562,127 @@ test_read_reports_single_line_byte_truncation :: proc(t: ^testing.T) {
 	truncated, truncated_ok := data["truncated"].(json.Boolean)
 	if !testing.expect(t, truncated_ok, "the result reports truncation") { return }
 	testing.expect(t, bool(truncated), "a byte-truncated line must report truncation")
+}
+
+// --- timeout policy ------------------------------------------------------------
+
+// The timeout layers compose with the earliest deadline winning: a requested
+// bound is clamped to the definition maximum, and a tool timeout never revives
+// an expired turn.
+@(test)
+test_timeout_helpers_compose_deadlines :: proc(t: ^testing.T) {
+	testing.expect_value(t, tool_timeout_clamp(5 * time.Second, 120 * time.Second), 5 * time.Second)
+	testing.expect_value(t, tool_timeout_clamp(time.Hour, 120 * time.Second), 120 * time.Second)
+	testing.expect_value(t, tool_timeout_clamp(time.Hour, 0), time.Hour)
+
+	parent := Tool_Control {
+		deadline = ai.deadline_in(time.Hour),
+	}
+	shorter := tool_control_with_timeout(parent, time.Second)
+	remaining, remaining_ok := ai.deadline_remaining(shorter.deadline)
+	testing.expect(t, remaining_ok)
+	testing.expect(t, remaining > 0 && remaining <= time.Second, "the shorter timeout applies")
+
+	longer := tool_control_with_timeout(parent, 2 * time.Hour)
+	parent_remaining, _ := ai.deadline_remaining(longer.deadline)
+	testing.expect(t, parent_remaining > 59 * time.Minute, "the longer timeout keeps the parent deadline")
+
+	unchanged := tool_control_with_timeout(parent, 0)
+	testing.expect(t, unchanged.deadline == parent.deadline, "no timeout keeps the parent control")
+
+	expired := Tool_Control {
+		deadline = ai.deadline_in(-time.Second),
+	}
+	revived := tool_control_with_maximum(expired, time.Hour)
+	testing.expect(t, ai.deadline_expired(revived.deadline), "a longer bound never revives an expired turn")
+}
+
+// Cancellation wins over the tool timeout when both are observed, and the two
+// stops are distinguishable: only the budget expiring reports Timed_Out.
+@(test)
+test_control_stop_names_the_stop :: proc(t: ^testing.T) {
+	start := time.tick_now()
+	testing.expect_value(t, tool_control_stop({}, start, time.Hour), Tool_Stop.None)
+
+	interrupt: ai.Interrupt
+	ai.interrupt_request(&interrupt)
+	cancelled := Tool_Control {
+		interrupt = &interrupt,
+	}
+	past := time.tick_add(time.tick_now(), -2 * time.Second)
+	testing.expect_value(t, tool_control_stop(cancelled, past, time.Second), Tool_Stop.Cancelled)
+
+	expired := Tool_Control {
+		deadline = ai.deadline_in(-time.Second),
+	}
+	testing.expect_value(t, tool_control_stop(expired, start, time.Hour), Tool_Stop.Cancelled)
+	testing.expect_value(t, tool_control_stop({}, past, time.Second), Tool_Stop.Timed_Out)
+}
+
+// A model-requested timeout above the definition maximum is refused, never
+// silently clamped: the model is told the constraint it must change.
+@(test)
+test_shell_refuses_timeout_above_maximum :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+
+	result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"echo hi","timeout_ms":999999999}`)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
+}
+
+// tool_test_cancelled_moment runs one file-tool execution with cancellation
+// already requested, which is how the cooperative checks are reached without a
+// second thread.
+tool_test_cancelled_moment :: proc(workspace: string) -> Tool_Context {
+	interrupt := new(ai.Interrupt, context.temp_allocator)
+	ai.interrupt_request(interrupt)
+	return Tool_Context{call_id = "call_cancelled", workspace = workspace, control = {interrupt = interrupt}, allocator = context.allocator}
+}
+
+// A write cancelled before it begins leaves no file behind.
+@(test)
+test_write_cancelled_before_begin_leaves_no_file :: proc(t: ^testing.T) {
+	workspace, workspace_error := os.make_directory_temp("", "nabla-tool-cancel-*", context.allocator)
+	if workspace_error != nil { testing.fail_now(t, "could not create a workspace") }
+	defer {
+		os.remove_all(workspace)
+		delete(workspace, context.allocator)
+	}
+
+	ctx := tool_test_cancelled_moment(workspace)
+	arguments := tool_arguments_prepare(`{"path":"cancelled.txt","content":"hello"}`, context.allocator)
+	defer tool_arguments_destroy(&arguments, context.allocator)
+	object, is_object := arguments.value.(json.Object)
+	if !testing.expect(t, is_object, "the arguments should parse") { return }
+	result := tool_write_execute(&ctx, object)
+	defer tool_result_destroy(&result)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Cancelled)
+	full := strings.concatenate({workspace, "/cancelled.txt"}, context.temp_allocator)
+	testing.expect(t, !os.exists(full), "a cancelled write leaves no file")
+}
+
+// An edit cancelled before the rename keeps the destination unchanged.
+@(test)
+test_edit_cancelled_before_rename_keeps_destination :: proc(t: ^testing.T) {
+	workspace, workspace_error := os.make_directory_temp("", "nabla-tool-cancel-*", context.allocator)
+	if workspace_error != nil { testing.fail_now(t, "could not create a workspace") }
+	defer {
+		os.remove_all(workspace)
+		delete(workspace, context.allocator)
+	}
+	path := strings.concatenate({workspace, "/code.txt"}, context.temp_allocator)
+	if !tool_write_file(t, path, "alpha\n") { return }
+
+	ctx := tool_test_cancelled_moment(workspace)
+	arguments := tool_arguments_prepare(`{"path":"code.txt","edits":[{"old":"alpha","new":"beta"}]}`, context.allocator)
+	defer tool_arguments_destroy(&arguments, context.allocator)
+	object, is_object := arguments.value.(json.Object)
+	if !testing.expect(t, is_object, "the arguments should parse") { return }
+	result := tool_edit_execute(&ctx, object)
+	defer tool_result_destroy(&result)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Cancelled)
+	tool_file_is(t, path, "alpha\n")
 }
 
 // --- recovery ----------------------------------------------------------------

@@ -5,8 +5,6 @@ import "core:strings"
 import linux "core:sys/linux"
 import "core:time"
 
-import "nabla:ai"
-
 TOOL_SHELL_PATH :: "/bin/sh"
 
 // TOOL_KILL_GRACE bounds how long a terminated process group may take to exit on
@@ -121,13 +119,9 @@ tool_child_status :: proc(status: u32) -> (exited: bool, exit_code: int, waited:
 // pipes on return.
 tool_retire_child :: proc(child: ^Tool_Child, start: time.Tick, budget: time.Duration, control: Tool_Control) -> Tool_Stop {
 	for !tool_child_poll(child) {
-		if ai.interrupt_requested(control.interrupt) || ai.deadline_expired(control.deadline) {
+		if stop := tool_control_stop(control, start, budget); stop != .None {
 			tool_terminate_group(child)
-			return .Cancelled
-		}
-		if time.tick_since(start) > budget {
-			tool_terminate_group(child)
-			return .Timed_Out
+			return stop
 		}
 		time.sleep(5 * time.Millisecond)
 	}
@@ -151,16 +145,12 @@ tool_drain_pipes :: proc(
 	stderr_buf: [4096]u8
 	stdout_done, stderr_done := false, false
 	for !stdout_done || !stderr_done {
-		// Cancellation is checked before the timeout so a cancelled turn is never
-		// reported as a timeout. The deadline is checked because the turn bound
-		// cannot preempt a running tool any other way.
-		if ai.interrupt_requested(control.interrupt) || ai.deadline_expired(control.deadline) {
+		// One check covers both stops, and cancellation wins: a cancelled turn
+		// is never reported as a timeout. The turn deadline cannot preempt a
+		// running tool any other way.
+		if stop := tool_control_stop(control, start, budget); stop != .None {
 			tool_terminate_group(child)
-			return .Cancelled
-		}
-		if time.tick_since(start) > budget {
-			tool_terminate_group(child)
-			return .Timed_Out
+			return stop
 		}
 		progress := false
 		if !stdout_done &&

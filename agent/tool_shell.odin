@@ -18,8 +18,12 @@ TOOL_SHELL_SCHEMA :: `{"type":"object","properties":{"command":{"type":"string",
 
 TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms"}
 
-TOOL_SHELL_DEFAULT_TIMEOUT_MS :: 30_000
-TOOL_SHELL_MAX_TIMEOUT_MS :: 120_000
+// TOOL_SHELL_DEFAULT_TIMEOUT and TOOL_SHELL_MAX_TIMEOUT are the tool's own
+// policy, stated as durations. The definition below is the source of truth:
+// argument parsing derives its millisecond bounds from it, so the JSON
+// boundary is the only place milliseconds appear.
+TOOL_SHELL_DEFAULT_TIMEOUT :: 30 * time.Second
+TOOL_SHELL_MAX_TIMEOUT :: 120 * time.Second
 
 // TOOL_SHELL_NOT_STARTED is the one thing a failed spawn can say. A pipe that
 // could not be created, a fork that failed, and an exec that never reached the
@@ -44,10 +48,11 @@ Shell_Data :: struct {
 }
 
 TOOL_SHELL_DEFINITION :: Tool_Definition {
-	name         = TOOL_SHELL_NAME,
-	description  = TOOL_SHELL_DESCRIPTION,
+	name = TOOL_SHELL_NAME,
+	description = TOOL_SHELL_DESCRIPTION,
 	input_schema = TOOL_SHELL_SCHEMA,
-	execute      = tool_shell_execute,
+	timeouts = {default = TOOL_SHELL_DEFAULT_TIMEOUT, maximum = TOOL_SHELL_MAX_TIMEOUT},
+	execute = tool_shell_execute,
 }
 
 // Tool_Shell_Args is the shell's own view of a call. Its strings borrow the
@@ -59,7 +64,9 @@ Tool_Shell_Args :: struct {
 }
 
 // tool_shell_args reads the shell's arguments and reports the first defect
-// instead of a value, so a refused call is described exactly.
+// instead of a value, so a refused call is described exactly. The timeout
+// bounds come from the tool definition: a model-requested timeout above the
+// maximum is refused, never silently clamped.
 tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_Shell_Args, Tool_Argument_Error) {
 	if known_error := tool_fields_known(arguments, TOOL_SHELL_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
 	command, command_error := tool_field_string(arguments, "command", allocator = ctx.allocator)
@@ -75,9 +82,9 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_She
 	timeout_ms, timeout_error := tool_field_optional_int(
 		arguments,
 		"timeout_ms",
-		TOOL_SHELL_DEFAULT_TIMEOUT_MS,
+		int(TOOL_SHELL_DEFINITION.timeouts.default / time.Millisecond),
 		1,
-		TOOL_SHELL_MAX_TIMEOUT_MS,
+		int(TOOL_SHELL_DEFINITION.timeouts.maximum / time.Millisecond),
 		allocator = ctx.allocator,
 	)
 	if timeout_error.kind != .None { return {}, timeout_error }
@@ -126,8 +133,12 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 	child := Tool_Child {
 		pid = pid,
 	}
+	// The requested timeout is clamped to the definition maximum, so no call
+	// outlives the tool's own policy. The turn control stays separate from the
+	// tool budget: cancellation and the turn deadline report Cancelled, while
+	// only the budget expiring reports Timed_Out.
 	start := time.tick_now()
-	budget := time.Duration(args.timeout_ms) * time.Millisecond
+	budget := tool_timeout_clamp(time.Duration(args.timeout_ms) * time.Millisecond, TOOL_SHELL_DEFINITION.timeouts.maximum)
 	stop := tool_drain_pipes(&child, stdout_pipe[0], stderr_pipe[0], start, budget, ctx.control, &data, ctx.allocator)
 	_ = linux.close(stdout_pipe[0])
 	_ = linux.close(stderr_pipe[0])

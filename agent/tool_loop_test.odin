@@ -5,6 +5,7 @@ import "core:encoding/json"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 import "nabla:agent/session"
 import "nabla:ai"
@@ -666,4 +667,19 @@ test_result_contract_violation_is_replaced_in_dispatch :: proc(t: ^testing.T) {
 	result := tool_run(t, &test, "rogue_tool", `{}`)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
 	tool_test_envelope_matches(t, result.content, .Success, TOOL_RESULT_REPLACED_MALFORMED)
+}
+
+// Cancellation that lands after the dispatch was recorded but before execution
+// begins means the call never started: the intent is durable, the effect is
+// Not_Executed. An expired turn deadline reaches this window even though the
+// pre-dispatch check only observes interruption.
+@(test)
+test_cancel_after_dispatch_is_not_executed :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+
+	test.fixture.chat.turn_deadline = ai.deadline_in(-time.Second)
+	result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"echo hi"}`)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Not_Executed)
 }

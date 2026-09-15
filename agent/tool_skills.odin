@@ -144,7 +144,10 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> T
 	control := skills.Read_Control {
 		deadline     = ctx.control.deadline.at,
 		has_deadline = ctx.control.deadline.active,
-		cancelled    = tool_skill_cancelled(ctx.control.interrupt),
+		// Cancel_Check carries no context, so the check reads the process-wide
+		// turn token directly: one turn runs at a time, and the token is reset
+		// when a turn starts.
+		cancelled    = tool_skill_cancel_check,
 	}
 	loaded, load_error := skills.load(skill, root, control, ctx.allocator)
 	defer skills.loaded_destroy(&loaded, ctx.allocator)
@@ -211,8 +214,8 @@ list_skills_terms :: proc(query: string, allocator := context.allocator) -> ([]s
 	return terms[:], true
 }
 
-tool_skill_cancelled :: proc(interrupt: ^ai.Interrupt) -> skills.Cancel_Check {
-	return nil
+tool_skill_cancel_check :: proc() -> bool {
+	return ai.interrupt_requested(&chat_cancel)
 }
 
 list_skills_matches :: proc(skill: ^skills.Skill, terms: []string) -> bool {

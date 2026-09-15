@@ -393,6 +393,65 @@ tool_result_valid :: proc(outcome: session.Tool_Outcome, content: string) -> boo
 	return data_present
 }
 
+// --- timeout policy ------------------------------------------------------------
+
+// tool_control_with_timeout derives the control for one execution bounded by
+// timeout from now: the parent control with its deadline replaced by the
+// earlier of the parent deadline and now plus the timeout. A non-positive
+// timeout leaves the parent control unchanged. An expired parent deadline is
+// never revived by a longer timeout: the turn is over.
+tool_control_with_timeout :: proc(parent: Tool_Control, timeout: time.Duration) -> Tool_Control {
+	if timeout <= 0 { return parent }
+	return tool_control_earlier(parent, ai.deadline_in(timeout))
+}
+
+// tool_control_with_maximum clamps a requested bound the same way: the parent
+// control with its deadline replaced by the earlier of the parent deadline and
+// now plus the maximum. A non-positive maximum leaves the parent unchanged.
+tool_control_with_maximum :: proc(parent: Tool_Control, maximum: time.Duration) -> Tool_Control {
+	if maximum <= 0 { return parent }
+	return tool_control_earlier(parent, ai.deadline_in(maximum))
+}
+
+@(private)
+tool_control_earlier :: proc(parent: Tool_Control, candidate: ai.Deadline) -> Tool_Control {
+	control := parent
+	if !candidate.active { return control }
+	if !control.deadline.active {
+		control.deadline = candidate
+		return control
+	}
+	parent_remaining, parent_ok := ai.deadline_remaining(control.deadline)
+	candidate_remaining, candidate_ok := ai.deadline_remaining(candidate)
+	if candidate_ok && (!parent_ok || candidate_remaining < parent_remaining) { control.deadline = candidate }
+	return control
+}
+
+// tool_timeout_clamp bounds a requested timeout by the definition maximum. A
+// non-positive maximum means no bound: the request stands as asked. Durations
+// stay in time.Duration here; milliseconds live only at the JSON boundary.
+tool_timeout_clamp :: proc(requested, maximum: time.Duration) -> time.Duration {
+	if maximum > 0 && requested > maximum { return maximum }
+	return requested
+}
+
+// tool_control_cancelled reports whether the turn owning this control ended:
+// interruption was requested or the turn deadline passed. A tool's own timeout
+// is not cancellation; it has its own outcome and its own check.
+tool_control_cancelled :: proc(control: Tool_Control) -> bool {
+	return ai.interrupt_requested(control.interrupt) || ai.deadline_expired(control.deadline)
+}
+
+// tool_control_stop reports why an execution loop must stop. Cancellation wins
+// over the tool timeout when both are observed: a cancelled turn is never
+// reported as a timeout. control is the turn control and budget is the tool's
+// own bound; the two stay separate so the outcome can name which one fired.
+tool_control_stop :: proc(control: Tool_Control, start: time.Tick, budget: time.Duration) -> Tool_Stop {
+	if tool_control_cancelled(control) { return .Cancelled }
+	if budget > 0 && time.tick_since(start) > budget { return .Timed_Out }
+	return .None
+}
+
 // --- advertisement -----------------------------------------------------------
 
 // AGENT_SYSTEM_PROMPT states what the agent is for. What each tool does, and
