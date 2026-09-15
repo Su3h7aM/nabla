@@ -36,17 +36,22 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 			result = tool_result_failure(&ctx, .Unavailable, fmt.tprintf("no tool named %q is available", staged.name), "unavailable")
 		} else {
 			ctx.backend = definition.backend
+			ctx.timeouts = definition.timeouts
 			prepared, prepared_ok := chat_prepare_call(chat, observer, &staged, definition)
 			if !prepared_ok { return count }
 			result = prepared
 		}
+		// Finalization is the one boundary between execution and storage:
+		// every observed result crosses it here, regardless of its source,
+		// so the store only ever receives a valid bounded envelope.
+		finalized := tool_result_finalize(&ctx, result)
 
-		if !chat_record_tool_result(chat, &staged, &result) {
-			tool_result_destroy(&result)
+		if !chat_record_tool_result(chat, &staged, &finalized) {
+			tool_result_destroy(&finalized)
 			return count
 		}
-		_observer_tool_result(observer, staged.name, &result)
-		tool_result_destroy(&result)
+		_observer_tool_result(observer, staged.name, &finalized)
+		tool_result_destroy(&finalized)
 		count += 1
 	}
 	return count
@@ -69,6 +74,7 @@ chat_prepare_call :: proc(
 		call_id = staged.id,
 		workspace = chat.workspace,
 		control = {interrupt = &chat_cancel, deadline = chat.turn_deadline},
+		timeouts = definition.timeouts,
 		allocator = chat.allocator,
 		skills = chat_skill_catalog(chat),
 		backend = definition.backend,
@@ -102,9 +108,7 @@ chat_prepare_call :: proc(
 	if tool_control_cancelled(ctx.control) {
 		return tool_result_failure(&ctx, .Not_Executed, "the turn was cancelled before this call ran", "not executed"), true
 	}
-	// Finalization is the dispatch boundary between execution and storage: the
-	// store only ever receives a valid bounded envelope.
-	return tool_result_finalize(&ctx, definition.execute(&ctx, object)), true
+	return definition.execute(&ctx, object), true
 }
 
 // chat_record_tool_result appends the result entry a model later reads. It

@@ -23,6 +23,11 @@ Tool_Context :: struct {
 	call_id:   string,
 	workspace: string,
 	control:   Tool_Control,
+	// timeouts is the calling definition's own policy, copied here by
+	// dispatch. A shared executor, one procedure serving many definitions
+	// with different bindings, reads its bounds here instead of duplicating
+	// them into adapter state. The definition stays the source of truth.
+	timeouts:  Tool_Timeout_Policy,
 	allocator: mem.Allocator,
 	skills:    ^skills.Catalog,
 	// backend is the borrowed binding the definition was registered with, copied
@@ -353,8 +358,9 @@ tool_content_json :: proc(outcome: session.Tool_Outcome, message: string, data: 
 	return string(encoded)
 }
 
-// tool_result_finalize is the dispatch boundary between execution and storage.
-// It verifies a tool's result against the result contract and returns it
+// tool_result_finalize is the boundary between execution and storage, applied
+// once in chat_run_tools immediately before the result is recorded. It
+// verifies a tool's result against the result contract and returns it
 // unchanged when it complies. A violation never reaches the store: the content
 // is replaced with a minimal envelope that preserves the observed outcome, so
 // a tool bug is reported instead of stored as malformed JSON. The outcome is

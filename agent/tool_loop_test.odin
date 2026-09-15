@@ -683,3 +683,113 @@ test_cancel_after_dispatch_is_not_executed :: proc(t: ^testing.T) {
 	result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"echo hi"}`)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Not_Executed)
 }
+
+// --- execution context policy -------------------------------------------------
+
+// The probe records the policy and binding dispatch handed to one execution.
+// Package-level storage is how a shared executor reports back through a
+// signature that returns only a result; tests run serially, and every case
+// overwrites the previous observation before asserting on it.
+tool_policy_seen_default: time.Duration
+tool_policy_seen_maximum: time.Duration
+tool_policy_seen_backend: rawptr
+
+// tool_policy_probe_execute is an adapter-style shared executor: one procedure
+// serving many definitions, reading its bounds and binding from the context
+// rather than from a definition it cannot name.
+tool_policy_probe_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+	tool_policy_seen_default = ctx.timeouts.default
+	tool_policy_seen_maximum = ctx.timeouts.maximum
+	tool_policy_seen_backend = ctx.backend
+	return tool_result_success(ctx, Tool_Empty{}, "probed")
+}
+
+// One executor serves two definitions with different policies and bindings.
+// Dispatch must hand each call the policy of the definition that was resolved
+// for it, so no policy needs duplicating into adapter state.
+@(test)
+test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+
+	marker_one: u8 = 1
+	marker_two: u8 = 2
+	first := Tool_Definition {
+		name = "probe_first",
+		description = "First probe tool.",
+		input_schema = `{"type":"object"}`,
+		timeouts = {default = 5 * time.Second, maximum = 10 * time.Second},
+		execute = tool_policy_probe_execute,
+		backend = &marker_one,
+	}
+	second := Tool_Definition {
+		name = "probe_second",
+		description = "Second probe tool.",
+		input_schema = `{"type":"object"}`,
+		timeouts = {default = 30 * time.Second, maximum = 60 * time.Second},
+		execute = tool_policy_probe_execute,
+		backend = &marker_two,
+	}
+	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, first).kind, Tool_Registry_Error_Kind.None) { return }
+	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, second).kind, Tool_Registry_Error_Kind.None) { return }
+
+	first_result := tool_run(t, &test, "probe_first", `{}`)
+	testing.expect_value(t, first_result.outcome, session.Tool_Outcome.Success)
+	testing.expect_value(t, tool_policy_seen_default, 5 * time.Second)
+	testing.expect_value(t, tool_policy_seen_maximum, 10 * time.Second)
+	testing.expect(t, tool_policy_seen_backend == &marker_one, "the first call carries the first binding")
+
+	second_result := tool_run(t, &test, "probe_second", `{}`)
+	testing.expect_value(t, second_result.outcome, session.Tool_Outcome.Success)
+	testing.expect_value(t, tool_policy_seen_default, 30 * time.Second)
+	testing.expect_value(t, tool_policy_seen_maximum, 60 * time.Second)
+	testing.expect(t, tool_policy_seen_backend == &marker_two, "the second call carries the second binding")
+}
+
+// Every dispatch path stores a valid envelope: the unknown tool, the refused
+// arguments, the cancellation before dispatch, and the cancellation after the
+// dispatch was recorded. Finalization sits once before storage rather than in
+// the execute path, so results that never reach a definition cross it too.
+@(test)
+test_every_dispatch_path_stores_a_valid_envelope :: proc(t: ^testing.T) {
+	{
+		test: Tool_Test
+		tool_test_begin(t, &test)
+		defer tool_test_end(t, &test)
+
+		result := tool_run(t, &test, "no_such_tool", `{}`)
+		testing.expect_value(t, result.outcome, session.Tool_Outcome.Unavailable)
+		testing.expect(t, tool_result_valid(result.outcome, result.content), "an unknown tool stores a valid envelope")
+	}
+	{
+		test: Tool_Test
+		tool_test_begin(t, &test)
+		defer tool_test_end(t, &test)
+
+		result := tool_run(t, &test, TOOL_SHELL_NAME, `{"a":1} trailing`)
+		testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
+		testing.expect(t, tool_result_valid(result.outcome, result.content), "refused arguments store a valid envelope")
+	}
+	{
+		test: Tool_Test
+		tool_test_begin(t, &test)
+		defer tool_test_end(t, &test)
+
+		chat_cancel_request()
+		defer chat_cancel_reset()
+		result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"echo hi"}`)
+		testing.expect_value(t, result.outcome, session.Tool_Outcome.Not_Executed)
+		testing.expect(t, tool_result_valid(result.outcome, result.content), "a cancellation before dispatch stores a valid envelope")
+	}
+	{
+		test: Tool_Test
+		tool_test_begin(t, &test)
+		defer tool_test_end(t, &test)
+
+		test.fixture.chat.turn_deadline = ai.deadline_in(-time.Second)
+		result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"echo hi"}`)
+		testing.expect_value(t, result.outcome, session.Tool_Outcome.Not_Executed)
+		testing.expect(t, tool_result_valid(result.outcome, result.content), "a cancellation after dispatch stores a valid envelope")
+	}
+}
