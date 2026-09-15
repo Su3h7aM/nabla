@@ -85,7 +85,7 @@ collect_agents_files :: proc(workspace: string, disable_project: bool, allocator
 					Agents_File{path = strings.clone(path, allocator), scope = strings.clone("local", allocator), body = strings.clone(body, allocator)},
 				)
 			} else if read_err != "missing" {
-				delete(files)
+				agents_files_destroy(files[:], allocator)
 				return nil, read_err
 			}
 		}
@@ -101,7 +101,7 @@ collect_agents_files :: proc(workspace: string, disable_project: bool, allocator
 					Agents_File{path = strings.clone(path, allocator), scope = strings.clone("personal", allocator), body = strings.clone(body, allocator)},
 				)
 			} else if read_err != "missing" {
-				delete(files)
+				agents_files_destroy(files[:], allocator)
 				return nil, read_err
 			}
 		}

@@ -29,6 +29,7 @@ test_instruction_roots_order_and_rendering :: proc(t: ^testing.T) {
 		testing.expect_value(t, roots[0].kind, Instruction_Source_Kind.Local)
 		testing.expect_value(t, roots[0].authority, workspace)
 		expected_local := filepath.join({workspace, ".agents", "skills"}, context.allocator) or_else ""
+		defer delete(expected_local, context.allocator)
 		testing.expect_value(t, roots[0].path, expected_local)
 		testing.expect_value(t, roots[1].kind, Instruction_Source_Kind.Nabla_User)
 		testing.expect_value(t, roots[2].kind, Instruction_Source_Kind.Generic_User)
@@ -58,25 +59,34 @@ test_read_agents_file_treats_empty_as_missing :: proc(t: ^testing.T) {
 	defer os.remove_all(base)
 	defer delete(base, context.allocator)
 
-	body, err := read_agents_file(filepath.join({base, "AGENTS.md"}, context.allocator) or_else "")
+	// The joined path is owned by the test, and every successful read is
+	// owned too: each is deleted before the next read reuses the variable.
+	path := filepath.join({base, "AGENTS.md"}, context.allocator) or_else ""
+	defer delete(path, context.allocator)
+
+	body, err := read_agents_file(path)
 	testing.expect_value(t, err, "missing")
 	testing.expect_value(t, body, "")
+	delete(body, context.allocator)
 
-	empty := filepath.join({base, "AGENTS.md"}, context.allocator) or_else ""
-	testing.expect(t, os.write_entire_file(empty, "") == nil)
-	body, err = read_agents_file(empty)
+	testing.expect(t, os.write_entire_file(path, "") == nil)
+	body, err = read_agents_file(path)
 	testing.expect_value(t, err, "missing")
+	delete(body, context.allocator)
 
-	testing.expect(t, os.write_entire_file(empty, "\n\n   \n") == nil)
-	body, err = read_agents_file(empty)
+	testing.expect(t, os.write_entire_file(path, "\n\n   \n") == nil)
+	body, err = read_agents_file(path)
 	testing.expect_value(t, err, "missing")
+	delete(body, context.allocator)
 
-	testing.expect(t, os.write_entire_file(empty, "Be concise.\n") == nil)
-	body, err = read_agents_file(empty)
+	testing.expect(t, os.write_entire_file(path, "Be concise.\n") == nil)
+	body, err = read_agents_file(path)
 	testing.expect_value(t, err, "")
 	testing.expect_value(t, body, "Be concise.\n")
+	delete(body, context.allocator)
 
-	testing.expect(t, os.write_entire_file(empty, "broken\x00text") == nil)
-	_, err = read_agents_file(empty)
-	testing.expect(t, strings.contains(err, empty), err)
+	testing.expect(t, os.write_entire_file(path, "broken\x00text") == nil)
+	body, err = read_agents_file(path)
+	defer delete(body, context.allocator)
+	testing.expect(t, strings.contains(err, path), err)
 }

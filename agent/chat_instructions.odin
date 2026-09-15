@@ -211,6 +211,9 @@ instruction_manifest_kind :: proc(kind: Instruction_Source_Kind) -> string {
 }
 
 chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: string) -> bool {
+	// A second catalog never replaces the first: the check comes before any
+	// allocation, so refusing costs nothing and leaks nothing.
+	if chat.skill_catalog != nil { return false }
 	manifest: Instruction_Manifest
 	if json.unmarshal_string(manifest_json, &manifest, allocator = context.temp_allocator) != nil { return false }
 	// Version 1 differed from the current manifest only by a removed repository
@@ -223,6 +226,9 @@ chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: st
 	catalog.skills = make([]skills.Skill, len(manifest.skills), chat.allocator)
 	catalog.roots = make([]skills.Root, len(manifest.roots), chat.allocator)
 	catalog.diagnostics = make([]skills.Diagnostic, len(manifest.diagnostics), chat.allocator)
+	// A corrupt entry below must not strand what the earlier entries cloned.
+	applied := false
+	defer if !applied { skills.catalog_destroy(&catalog, chat.allocator) }
 	for entry, index in manifest.skills {
 		if !skills.skill_name_valid(entry.name) { return false }
 		catalog.skills[index] = skills.Skill {
@@ -252,10 +258,10 @@ chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: st
 		}
 	}
 	catalog.omitted = manifest.omitted_diagnostics
-	if chat.skill_catalog != nil { return false }
 	chat.skill_catalog = catalog
 	delete(chat.skill_instructions, chat.allocator)
 	chat.skill_instructions = strings.clone(instructions, chat.allocator)
+	applied = true
 	return true
 }
 
