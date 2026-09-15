@@ -462,6 +462,107 @@ test_registry_refuses_name_collisions :: proc(t: ^testing.T) {
 	testing.expect(t, found_definition.backend == &marker, "the backend binding is preserved")
 }
 
+// --- result finalization -------------------------------------------------------
+
+// tool_test_envelope_matches parses a stored result and checks the contract
+// finalization guarantees: a bounded object with a matching status, a message,
+// and a data value.
+tool_test_envelope_matches :: proc(t: ^testing.T, content: string, outcome: session.Tool_Outcome, message: string) -> bool {
+	if len(content) > TOOL_MAX_RESULT_BYTES { return testing.expect(t, false, "the envelope exceeds the result budget") }
+	value, parse_error := json.parse_string(content, .JSON, true, context.temp_allocator)
+	if parse_error != nil { return testing.expect(t, false, "the envelope is not valid JSON") }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, is_object := value.(json.Object)
+	if !is_object { return testing.expect(t, false, "the envelope root is not an object") }
+	status, status_ok := object["status"].(json.String)
+	if !status_ok || string(status) != session.tool_outcome_name(outcome) {
+		return testing.expect(t, false, "the envelope status does not match the outcome")
+	}
+	text, message_ok := object["message"].(json.String)
+	if !message_ok || string(text) != message {
+		return testing.expect(t, false, "the envelope message is not what was expected")
+	}
+	if "data" not_in object { return testing.expect(t, false, "the envelope carries no data") }
+	return true
+}
+
+tool_test_finalize_case :: proc(t: ^testing.T, outcome: session.Tool_Outcome, content: string, message: string) {
+	ctx := Tool_Context {
+		call_id   = "call_1",
+		allocator = context.allocator,
+	}
+	result := Tool_Result {
+		call_id   = strings.clone("call_1", context.allocator),
+		outcome   = outcome,
+		reason    = strings.clone("test", context.allocator),
+		content   = strings.clone(content, context.allocator),
+		allocator = context.allocator,
+	}
+	finalized := tool_result_finalize(&ctx, result)
+	defer tool_result_destroy(&finalized)
+	testing.expect_value(t, finalized.outcome, outcome)
+	tool_test_envelope_matches(t, finalized.content, outcome, message)
+}
+
+// A valid result passes finalization untouched.
+@(test)
+test_result_finalize_keeps_valid_results :: proc(t: ^testing.T) {
+	ctx := Tool_Context {
+		call_id   = "call_1",
+		allocator = context.allocator,
+	}
+	valid := tool_result_success(&ctx, Tool_Empty{}, "done")
+	original := strings.clone(valid.content, context.allocator)
+	defer delete(original, context.allocator)
+	finalized := tool_result_finalize(&ctx, valid)
+	defer tool_result_destroy(&finalized)
+	testing.expect_value(t, finalized.outcome, session.Tool_Outcome.Success)
+	testing.expect_value(t, finalized.content, original)
+}
+
+// A contract violation is replaced with a valid envelope that preserves the
+// observed outcome.
+@(test)
+test_result_finalize_replaces_contract_violations :: proc(t: ^testing.T) {
+	tool_test_finalize_case(t, .Success, "", TOOL_RESULT_REPLACED_MALFORMED)
+	tool_test_finalize_case(t, .Success, "[1,2]", TOOL_RESULT_REPLACED_MALFORMED)
+	tool_test_finalize_case(t, .Success, "not json", TOOL_RESULT_REPLACED_MALFORMED)
+	tool_test_finalize_case(t, .Success, `{"status":"tool_failed","message":"x","data":{}}`, TOOL_RESULT_REPLACED_MALFORMED)
+	tool_test_finalize_case(t, .Success, `{"status":"success","message":"x"}`, TOOL_RESULT_REPLACED_MALFORMED)
+	tool_test_finalize_case(t, .Tool_Failed, strings.repeat("a", TOOL_MAX_RESULT_BYTES + 1, context.temp_allocator), TOOL_RESULT_REPLACED_OVERSIZED)
+	// A well-formed refusal envelope is valid and passes through.
+	tool_test_finalize_case(
+		t,
+		.Invalid_Arguments,
+		`{"status":"invalid_arguments","message":"missing required field \"path\"","data":{"kind":"missing_field","field":"path","expected":""}}`,
+		`missing required field "path"`,
+	)
+}
+
+@(test)
+test_read_reports_single_line_byte_truncation :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+
+	// One line longer than the byte budget: the line span takes it whole, so
+	// only the byte truncation marks the result incomplete.
+	line := strings.concatenate({strings.repeat("a", TOOL_READ_MAX_BYTES + 100, context.temp_allocator), "\n"}, context.temp_allocator)
+	path := strings.concatenate({tool_test_workspace(&test), "/long.txt"}, context.temp_allocator)
+	if !tool_write_file(t, path, line) { return }
+
+	result := tool_run(t, &test, TOOL_READ_NAME, `{"path":"long.txt"}`)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
+	value, parse_error := json.parse_string(result.content, .JSON, true, context.temp_allocator)
+	if parse_error != nil { testing.fail_now(t, "the result is not valid JSON") }
+	defer json.destroy_value(value, context.temp_allocator)
+	data, data_ok := value.(json.Object)["data"].(json.Object)
+	if !testing.expect(t, data_ok, "the result carries data") { return }
+	truncated, truncated_ok := data["truncated"].(json.Boolean)
+	if !testing.expect(t, truncated_ok, "the result reports truncation") { return }
+	testing.expect(t, bool(truncated), "a byte-truncated line must report truncation")
+}
+
 // --- recovery ----------------------------------------------------------------
 
 // The recovery results are constants so recovery allocates nothing. A drift

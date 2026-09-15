@@ -15,13 +15,11 @@ TOOL_LIST_SKILLS_FIELDS :: []string{"query", "offset", "limit"}
 TOOL_LIST_SKILLS_DEFAULT_LIMIT :: 20
 TOOL_LIST_SKILLS_MAX_LIMIT :: 100
 TOOL_LIST_SKILLS_MAX_QUERY_BYTES :: 4096
-TOOL_LIST_SKILLS_MAX_RESULT_BYTES :: 2 * 1024 * 1024
 
 TOOL_LOAD_SKILL_NAME :: "load_skill"
 TOOL_LOAD_SKILL_DESCRIPTION :: "Load one skill's complete instructions by name. Returns the full body in a single tool result."
 TOOL_LOAD_SKILL_SCHEMA :: `{"type":"object","properties":{"name":{"type":"string","description":"The skill name from the catalog."}},"required":["name"],"additionalProperties":false}`
 TOOL_LOAD_SKILL_FIELDS :: []string{"name"}
-TOOL_LOAD_SKILL_MAX_RESULT_BYTES :: 2 * 1024 * 1024
 
 List_Skills_Record :: struct {
 	name:        string `json:"name"`,
@@ -80,34 +78,45 @@ tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> 
 		return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be built", "too large")
 	}
 	defer delete(matches, ctx.allocator)
-	page_end := offset
-	if offset <= len(matches) && limit <= len(matches) - offset { page_end = offset + limit } else { page_end = len(matches) }
-	page := matches[offset:page_end] if offset <= len(matches) else matches[len(matches):]
-	records := make([]List_Skills_Record, len(page), ctx.allocator)
-	if len(page) > 0 && records == nil {
-		return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be built", "too large")
-	}
-	defer delete(records, ctx.allocator)
-	for match, index in page {
-		records[index] = List_Skills_Record {
-			name        = match.name,
-			description = match.description,
-			source      = skill_source_label(ctx.skills, match^),
+	// The listing shares the global result budget with every other tool. When
+	// the requested page does not fit, the page shrinks instead of bypassing
+	// the bound: the caller pages forward with next_offset as usual.
+	page_limit := limit
+	for {
+		page_end := len(matches)
+		if offset <= len(matches) && page_limit <= len(matches) - offset { page_end = offset + page_limit }
+		page := matches[offset:page_end] if offset <= len(matches) else matches[len(matches):]
+		records := make([]List_Skills_Record, len(page), ctx.allocator)
+		if len(page) > 0 && records == nil {
+			return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be built", "too large")
 		}
-	}
-	next_offset: Maybe(int)
-	if page_end < len(matches) { next_offset = page_end }
-	data := List_Skills_Data {
-		skills        = records,
-		total_matches = len(matches),
-		next_offset   = next_offset,
-	}
-	result := tool_result_success(ctx, data, fmt.tprintf("%d of %d skills", len(records), len(matches)))
-	if len(result.content) > TOOL_LIST_SKILLS_MAX_RESULT_BYTES {
+		for match, index in page {
+			records[index] = List_Skills_Record {
+				name        = match.name,
+				description = match.description,
+				source      = skill_source_label(ctx.skills, match^),
+			}
+		}
+		next_offset: Maybe(int)
+		if page_end < len(matches) { next_offset = page_end }
+		data := List_Skills_Data {
+			skills        = records,
+			total_matches = len(matches),
+			next_offset   = next_offset,
+		}
+		result := tool_result_success(ctx, data, fmt.tprintf("%d of %d skills", len(records), len(matches)))
+		delete(records, ctx.allocator)
+		if result.content == "" {
+			tool_result_destroy(&result)
+			return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be encoded", "encoding failed")
+		}
+		if len(result.content) <= TOOL_MAX_RESULT_BYTES { return result }
 		tool_result_destroy(&result)
-		return tool_result_failure(ctx, .Tool_Failed, "the skill listing exceeds the result limit", "too large")
+		if page_limit <= 1 {
+			return tool_result_failure(ctx, .Tool_Failed, "the skill listing exceeds the result limit; narrow the query or use a smaller limit", "too large")
+		}
+		page_limit /= 2
 	}
-	return result
 }
 
 tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
@@ -160,7 +169,10 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> T
 		tool_result_destroy(&result)
 		return tool_result_failure(ctx, .Tool_Failed, "the skill result could not be encoded", "encoding failed")
 	}
-	if len(result.content) > TOOL_LOAD_SKILL_MAX_RESULT_BYTES {
+	// A single body has no smaller page to shrink to, so an oversized skill is
+	// an explicit bounded failure until pagination or another deliberate design
+	// exists. It must not bypass the global result budget.
+	if len(result.content) > TOOL_MAX_RESULT_BYTES {
 		tool_result_destroy(&result)
 		return tool_result_failure(ctx, .Tool_Failed, "the skill exceeds the result limit", "too large")
 	}

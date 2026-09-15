@@ -29,11 +29,6 @@ TOOL_SHELL_NOT_STARTED :: "the command did not start or its output was lost"
 TOOL_MAX_STDOUT_BYTES :: 24 * 1024
 TOOL_MAX_STDERR_BYTES :: 24 * 1024
 
-// TOOL_MAX_RESULT_BYTES bounds the model-visible result. The capture caps leave
-// room for the envelope and its escaping; a stream that still does not fit is
-// shortened before it is sent.
-TOOL_MAX_RESULT_BYTES :: 64 * 1024
-
 // Both excerpts plus the JSON envelope must fit the result budget together.
 #assert(TOOL_MAX_STDOUT_BYTES + TOOL_MAX_STDERR_BYTES < TOOL_MAX_RESULT_BYTES)
 

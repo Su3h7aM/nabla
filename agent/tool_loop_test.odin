@@ -618,3 +618,52 @@ test_unusable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T) {
 	defer chat_effect_destroy(&next)
 	testing.expect_value(t, next.kind, Chat_Effect_Kind.Start_Request)
 }
+
+// --- result envelope guarantees -------------------------------------------------
+
+// tool_loop_rogue_execute violates the result contract: it reports success with
+// content that is not a result envelope. Dispatch must replace it rather than
+// store it.
+tool_loop_rogue_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+	return Tool_Result {
+		call_id = strings.clone(ctx.call_id, ctx.allocator),
+		outcome = .Success,
+		reason = strings.clone("rogue", ctx.allocator),
+		content = strings.clone("not json", ctx.allocator),
+		allocator = ctx.allocator,
+	}
+}
+
+// An unavailable tool never executes, and what is stored for it is still a
+// valid envelope whose status names the outcome.
+@(test)
+test_unavailable_tool_records_a_valid_envelope :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+
+	result := tool_run(t, &test, "no_such_tool", `{}`)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Unavailable)
+	tool_test_envelope_matches(t, result.content, .Unavailable, `no tool named "no_such_tool" is available`)
+}
+
+// A result that violates the contract is replaced with valid bounded feedback,
+// and the observed outcome is preserved.
+@(test)
+test_result_contract_violation_is_replaced_in_dispatch :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+
+	rogue := Tool_Definition {
+		name         = "rogue_tool",
+		description  = "A tool that returns content outside the result contract.",
+		input_schema = `{"type":"object"}`,
+		execute      = tool_loop_rogue_execute,
+	}
+	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, rogue).kind, Tool_Registry_Error_Kind.None) { return }
+
+	result := tool_run(t, &test, "rogue_tool", `{}`)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
+	tool_test_envelope_matches(t, result.content, .Success, TOOL_RESULT_REPLACED_MALFORMED)
+}

@@ -97,7 +97,11 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Re
 	start := tool_line_start(text, args.offset)
 	end, lines := tool_line_span(text, start, args.limit)
 	content := text[start:end]
-	if len(content) > TOOL_READ_MAX_BYTES { content = tool_truncate_runes(content, TOOL_READ_MAX_BYTES) }
+	// A single very long line is taken whole by the line span and truncated
+	// here, which is a different fact from the line range ending early. Both
+	// set truncated, so the model knows when it did not receive everything.
+	byte_truncated := len(content) > TOOL_READ_MAX_BYTES
+	if byte_truncated { content = tool_truncate_runes(content, TOOL_READ_MAX_BYTES) }
 
 	result := Read_Data {
 		path        = args.path,
@@ -105,7 +109,7 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Re
 		first_line  = args.offset,
 		line_count  = lines,
 		total_lines = total_lines,
-		truncated   = end < len(text),
+		truncated   = end < len(text) || byte_truncated,
 	}
 	reason := fmt.tprintf("lines %d-%d of %d", args.offset, args.offset + lines - 1, total_lines) if lines > 0 else "no lines"
 	return tool_result_success(ctx, result, reason)

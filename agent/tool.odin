@@ -265,6 +265,17 @@ tool_definition_destroy :: proc(definition: ^Tool_Definition, allocator: mem.All
 
 // --- results -----------------------------------------------------------------
 
+// TOOL_MAX_RESULT_BYTES bounds the model-visible content of every tool result.
+// A result that does not fit is shortened or replaced before it is stored, so
+// no single call can consume a large part of the model context.
+TOOL_MAX_RESULT_BYTES :: 64 * 1024
+
+// TOOL_RESULT_REPLACED_OVERSIZED and TOOL_RESULT_REPLACED_MALFORMED are the
+// messages of a replacement envelope. They are constants so a tool bug is
+// always reported in the same bytes.
+TOOL_RESULT_REPLACED_OVERSIZED :: "the tool result exceeded the harness output limit and was replaced"
+TOOL_RESULT_REPLACED_MALFORMED :: "the tool returned a result the harness could not use"
+
 // Tool_Empty is the data of a result that carries none of its own.
 Tool_Empty :: struct {}
 
@@ -340,6 +351,46 @@ tool_content_json :: proc(outcome: session.Tool_Outcome, message: string, data: 
 	encoded, marshal_err := json.marshal(content, allocator = allocator)
 	if marshal_err != nil { return "" }
 	return string(encoded)
+}
+
+// tool_result_finalize is the dispatch boundary between execution and storage.
+// It verifies a tool's result against the result contract and returns it
+// unchanged when it complies. A violation never reaches the store: the content
+// is replaced with a minimal envelope that preserves the observed outcome, so
+// a tool bug is reported instead of stored as malformed JSON. The outcome is
+// always preserved, because the harness did observe the end: replacing it with
+// Unknown would claim ignorance it does not have, and replacing success with
+// failure (or the reverse) would rewrite what happened.
+tool_result_finalize :: proc(ctx: ^Tool_Context, result: Tool_Result) -> Tool_Result {
+	finalized := result
+	if tool_result_valid(finalized.outcome, finalized.content) { return finalized }
+	message := TOOL_RESULT_REPLACED_MALFORMED
+	if len(finalized.content) > TOOL_MAX_RESULT_BYTES { message = TOOL_RESULT_REPLACED_OVERSIZED }
+	delete(finalized.content, ctx.allocator)
+	finalized.content = tool_content_json(finalized.outcome, message, Tool_Empty{}, ctx.allocator)
+	return finalized
+}
+
+// tool_result_valid reports whether content is a usable result envelope for the
+// outcome: one bounded JSON object carrying a matching status, a message
+// string, and a data value.
+@(private)
+tool_result_valid :: proc(outcome: session.Tool_Outcome, content: string) -> bool {
+	if content == "" || len(content) > TOOL_MAX_RESULT_BYTES { return false }
+	value, parse_error := json.parse_string(content, .JSON, true, context.temp_allocator)
+	if parse_error != nil { return false }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, is_object := value.(json.Object)
+	if !is_object { return false }
+	status_value, status_present := object["status"]
+	if !status_present { return false }
+	status, status_is_string := status_value.(json.String)
+	if !status_is_string || string(status) != session.tool_outcome_name(outcome) { return false }
+	message_value, message_present := object["message"]
+	if !message_present { return false }
+	if _, message_is_string := message_value.(json.String); !message_is_string { return false }
+	_, data_present := object["data"]
+	return data_present
 }
 
 // --- advertisement -----------------------------------------------------------
