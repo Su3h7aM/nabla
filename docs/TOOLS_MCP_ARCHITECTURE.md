@@ -235,14 +235,134 @@ Stateless describes request routing, not effects. A `tools/call` is never
 automatically retried, including after a lost connection, because the server may
 have performed the action before the reply was lost. That case is `Unknown`.
 
-Server configuration is explicit user configuration in `config.lua`: a stable
-server id, a trust decision, a transport, credentials, a tool allowlist, and
-timeouts. Nothing auto-executes repository-provided MCP configuration.
-
 Supported at first: stdio, and Streamable HTTP with explicitly supplied
 endpoint-bound credentials. No OAuth flow, no legacy transport, no fallback
 handshake. A `2026-07-28` server that is not understood gets an actionable
 diagnostic.
+
+The transport states whether a complete request was written, not whether the
+server ran it. That one fact is what the adapter needs to choose between
+`Transport_Failed` and `Unknown`, so the MCP package reports delivery rather than
+collapsing it into a single failure.
+
+### Tool names
+
+A remote tool name cannot always become a Nabla tool name. MCP permits dots and
+recommends up to 128 characters; Nabla advertises letters, digits, underscore,
+and hyphen in at most 64 bytes. Two servers may also use the same remote name,
+and a remote name may collide with a native tool.
+
+The harness does not sanitize or truncate a remote name, because both are lossy
+and can manufacture a collision. The allowlist is a mapping instead:
+
+```lua
+tools = {
+  github_create_issue = "issues.create",
+  github_list_issues  = "issues.list",
+}
+```
+
+The key is the advertised name, the value is the exact case-sensitive remote
+name. The key must pass the same validation a native definition does, the value
+must match one tool the server listed, and the pair must not collide with any
+other tool. An empty allowlist advertises nothing. There is no wildcard: every
+exposed remote tool is named by the user.
+
+### Retry policy
+
+Retry is a property of the method, not of the transport failure.
+
+| Method | Policy |
+| --- | --- |
+| `server/discover` | Restart the server and retry once. |
+| `tools/list` | Restart the server and retry once. |
+| `tools/call` | Never automatically retry. |
+| `notifications/cancelled` | Best effort, never retried. |
+
+A `tools/call` that fails before its request was written reports
+`Transport_Failed`. One that fails after the request was written reports
+`Unknown`, because the harness cannot tell whether the effect happened. A remote
+JSON-RPC error response is an observation and is reported as `Tool_Failed`.
+Restarting a stdio server after it exits is fine; reissuing an ambiguous call is
+not.
+
+### Input required
+
+Nabla declares no sampling, elicitation, roots, or subscription capability, so it
+cannot answer a server-initiated input request. A `tools/call` answered with
+`resultType: "input_required"` is parsed, never retried, and reported as
+`Tool_Failed` with the requested interaction described for diagnostics. The
+protocol shape is understood; the interaction is not implemented.
+
+### Tool mapping
+
+Every MCP tool enters the registry through one executor, so a definition carries
+a backend binding instead of a procedure of its own. The binding names the
+server and the remote tool; the definition carries the remote description, the
+remote input schema bytes, the annotations as behavior hints, and the configured
+timeout policy.
+
+Annotated behavior maps one to one, and absence stays unknown rather than
+becoming a claim:
+
+| Remote annotation | Hint |
+| --- | --- |
+| absent | Unknown |
+| `readOnlyHint` | read-only |
+| `destructiveHint` | destructive |
+| `idempotentHint` | idempotent |
+| `openWorldHint` | open-world |
+
+Observations map onto the outcome vocabulary the session already persists:
+
+| Observation | Outcome |
+| --- | --- |
+| completed, `isError` false | `Success` |
+| completed, `isError` true | `Tool_Failed` |
+| input required | `Tool_Failed` |
+| cancelled with the turn | `Cancelled` |
+| the call's own deadline passed | `Timed_Out` |
+| the server is not running | `Unavailable` |
+| the request was never written | `Transport_Failed` |
+| written, reply lost or unreadable | `Unknown` |
+| remote JSON-RPC error | `Tool_Failed` |
+
+A remote error is never `Invalid_Arguments`. That outcome promises the call was
+refused before any effect, and a remote peer is not in a position to establish
+that promise. `Invalid_Arguments` stays what the harness itself decided before
+the call ran.
+
+Only text and structured content reach the model. An image, audio, or embedded
+resource is reported by type and omitted, because a base64 payload would consume
+the result budget to no purpose. The adapter bounds the result below the 64 KiB
+budget rather than relying on finalization to replace it.
+
+### Server configuration
+
+Server configuration is explicit user configuration in `config.lua`: a stable
+server id, a trust decision, a transport, credentials, a tool allowlist, and
+timeouts. Nothing auto-executes repository-provided MCP configuration, and a
+server that is not trusted is never started.
+
+A stdio server is launched by executable and argv, never through a shell, in its
+own process group, with an explicit frozen environment and an absolute
+executable path. Its stderr is drained by a thread that keeps a bounded tail, so
+a chatty server cannot block on a full pipe; stderr text is diagnostic only and
+never determines a request outcome. One request is in flight at a time, because
+the harness runs tools serially and nothing in a turn benefits from
+multiplexing.
+
+### Refresh
+
+Tools are refreshed between turns, while the session is idle. A server that
+cannot be discovered or listed contributes no tools for that turn and is
+reported once; its stale definitions are not kept, because a definition whose
+schema or backend no longer matches is worse than absent. Other servers still
+contribute. A registry that cannot be built at all leaves the installed registry
+untouched.
+
+Configuration problems fail startup. Runtime connectivity problems degrade one
+server for one turn.
 
 A call can carry several bounds: the remaining turn deadline, the definition
 maximum, the definition default, and a model-requested timeout where the tool
