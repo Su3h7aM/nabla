@@ -467,7 +467,10 @@ TOOL_MAX_CALLS_PER_TURN :: 32
 TOOL_MAX_REQUESTS_PER_TURN :: 16
 
 // The native tools, in the order they are registered. tool_registry_sort fixes
-// the advertised order after this list is read.
+// the advertised order after this list is read. Only shell states a timeout
+// policy; the file and skill tools carry a zero policy, which means no
+// tool-specific deadline rather than a forgotten configuration. The turn
+// deadline still governs them through the cooperative checks in each tool.
 @(private)
 TOOL_NATIVE := [?]Tool_Definition {
 	TOOL_EDIT_DEFINITION,

@@ -43,17 +43,19 @@ Load_Skill_Data :: struct {
 }
 
 TOOL_LIST_SKILLS_DEFINITION :: Tool_Definition {
-	name         = TOOL_LIST_SKILLS_NAME,
-	description  = TOOL_LIST_SKILLS_DESCRIPTION,
+	name = TOOL_LIST_SKILLS_NAME,
+	description = TOOL_LIST_SKILLS_DESCRIPTION,
 	input_schema = TOOL_LIST_SKILLS_SCHEMA,
-	execute      = tool_list_skills_execute,
+	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
+	execute = tool_list_skills_execute,
 }
 
 TOOL_LOAD_SKILL_DEFINITION :: Tool_Definition {
-	name         = TOOL_LOAD_SKILL_NAME,
-	description  = TOOL_LOAD_SKILL_DESCRIPTION,
+	name = TOOL_LOAD_SKILL_NAME,
+	description = TOOL_LOAD_SKILL_DESCRIPTION,
 	input_schema = TOOL_LOAD_SKILL_SCHEMA,
-	execute      = tool_load_skill_execute,
+	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
+	execute = tool_load_skill_execute,
 }
 
 tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {

@@ -474,6 +474,94 @@ test_anthropic_request_is_shaped_by_its_adapter :: proc(t: ^testing.T) {
 	testing.expect_value(t, item_string(result_block, "tool_use_id"), "toolu_1")
 }
 
+// The persisted outcome decides the provider's error marker: a nonzero exit is
+// .Tool_Failed and arrives as an error, while .Success does not.
+@(test)
+test_tool_failed_sets_the_provider_error_marker :: proc(t: ^testing.T) {
+	outcomes := [?]session.Tool_Outcome{.Success, .Tool_Failed}
+	for outcome in outcomes {
+		test_error_marker_case(t, outcome)
+	}
+}
+
+// test_error_marker_case encodes one call and its result for Anthropic and
+// checks the error marker. Cleanup is explicit because the caller runs cases
+// in a loop.
+test_error_marker_case :: proc(t: ^testing.T, outcome: session.Tool_Outcome) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	chat.max_output_tokens = 1024
+	_test_accept(t, chat, "run it")
+
+	call_seq := _test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			created_at_ms = 2_000,
+			payload = session.Tool_Call_Entry {
+				call_id = "toolu_1",
+				item_id = "tu_1",
+				name = TOOL_SHELL_NAME,
+				arguments = `{"command":"exit 3","working_directory":null,"timeout_ms":null}`,
+			},
+		},
+	)
+	_test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			created_at_ms = 2_001,
+			related_seq = call_seq,
+			payload = session.Tool_Result_Entry {
+				outcome = outcome,
+				content = `{"status":"success","message":"","data":{}}` if outcome == .Success else `{"status":"tool_failed","message":"the command exited with status 3","data":{}}`,
+				origin = .Observed,
+			},
+		},
+	)
+
+	anthropic := ai.Provider_Connection {
+		API      = .Anthropic_Messages,
+		Endpoint = "https://api.anthropic.com",
+	}
+	prep, prep_err := chat_prepare(chat, anthropic)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	body, encode_err := ai.Provider_Encode_Request(prep.request)
+	failed := !testing.expect_value(t, encode_err, ai.Provider_Request_Error.None)
+	chat_request_prep_destroy(&prep, chat.allocator)
+	if failed {
+		chat_test_end(t, &fixture)
+		return
+	}
+	defer delete(body)
+	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
+	defer json.destroy_value(value, context.temp_allocator)
+	if !testing.expect_value(t, parse_err, nil) {
+		chat_test_end(t, &fixture)
+		return
+	}
+	object, object_ok := value.(json.Object)
+	messages, messages_ok := object["messages"].(json.Array)
+	if !testing.expect(t, object_ok) || !testing.expect(t, messages_ok) || !testing.expect_value(t, len(messages), 3) {
+		chat_test_end(t, &fixture)
+		return
+	}
+	result_turn := item_object(t, messages, 2)
+	result_blocks, result_blocks_ok := result_turn["content"].(json.Array)
+	if !testing.expect(t, result_blocks_ok && len(result_blocks) == 1) {
+		chat_test_end(t, &fixture)
+		return
+	}
+	result_block := item_object(t, result_blocks, 0)
+	_, has_marker := result_block["is_error"]
+	testing.expect(t, has_marker == (outcome == .Tool_Failed), "only a failed tool carries the error marker")
+	chat_test_end(t, &fixture)
+}
+
 @(private)
 bound_of :: proc(object: json.Object, key: string) -> (value: i64, present: bool, ok: bool) {
 	raw, exists := object[key]

@@ -34,10 +34,11 @@ Read_Data :: struct {
 }
 
 TOOL_READ_DEFINITION :: Tool_Definition {
-	name         = TOOL_READ_NAME,
-	description  = TOOL_READ_DESCRIPTION,
+	name = TOOL_READ_NAME,
+	description = TOOL_READ_DESCRIPTION,
 	input_schema = TOOL_READ_SCHEMA,
-	execute      = tool_read_execute,
+	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
+	execute = tool_read_execute,
 }
 
 // Tool_Read_Args is the read tool's own view of a call. path borrows the
@@ -185,10 +186,13 @@ Write_Data :: struct {
 }
 
 TOOL_WRITE_DEFINITION :: Tool_Definition {
-	name         = TOOL_WRITE_NAME,
-	description  = TOOL_WRITE_DESCRIPTION,
+	name = TOOL_WRITE_NAME,
+	description = TOOL_WRITE_DESCRIPTION,
 	input_schema = TOOL_WRITE_SCHEMA,
-	execute      = tool_write_execute,
+	// Rewriting identical content reaches the same file, so a repeated call
+	// with identical arguments is idempotent.
+	hints = {read_only = .No, destructive = .Yes, idempotent = .Yes, open_world = .No},
+	execute = tool_write_execute,
 }
 
 Tool_Write_Args :: struct {
@@ -366,10 +370,13 @@ Tool_Match :: struct {
 }
 
 TOOL_EDIT_DEFINITION :: Tool_Definition {
-	name         = TOOL_EDIT_NAME,
-	description  = TOOL_EDIT_DESCRIPTION,
+	name = TOOL_EDIT_NAME,
+	description = TOOL_EDIT_DESCRIPTION,
 	input_schema = TOOL_EDIT_SCHEMA,
-	execute      = tool_edit_execute,
+	// A repeated edit finds different text: the first call consumed the match
+	// the second one looks for, so identical arguments do not repeat the effect.
+	hints = {read_only = .No, destructive = .Yes, idempotent = .No, open_world = .No},
+	execute = tool_edit_execute,
 }
 
 tool_edit_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {

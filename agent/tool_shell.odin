@@ -51,6 +51,9 @@ TOOL_SHELL_DEFINITION :: Tool_Definition {
 	name = TOOL_SHELL_NAME,
 	description = TOOL_SHELL_DESCRIPTION,
 	input_schema = TOOL_SHELL_SCHEMA,
+	// The command determines the behavior, so unknown is the only honest
+	// static answer for everything but the open world it can reach.
+	hints = {read_only = .Unknown, destructive = .Unknown, idempotent = .Unknown, open_world = .Yes},
 	timeouts = {default = TOOL_SHELL_DEFAULT_TIMEOUT, maximum = TOOL_SHELL_MAX_TIMEOUT},
 	execute = tool_shell_execute,
 }

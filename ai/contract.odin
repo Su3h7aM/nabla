@@ -49,8 +49,9 @@ Provider_Message :: struct {
 	Role:                Provider_Role,
 	Content:             string, // borrowed until operation retirement,
 	Tool_Call_ID:        string, // borrowed; set on .Tool results, matches a call ID,
-	// Tool_Is_Error marks a tool result the model should read as a failure. A
-	// nonzero exit is not one: it is an observation. It exists because some
+	// Tool_Is_Error marks a tool result the model should read as a failure. The
+	// harness sets it for every outcome other than .Success: a nonzero exit is
+	// .Tool_Failed, so it arrives as an error. It exists because some
 	// providers carry the distinction on the wire.
 	Tool_Is_Error:       bool,
 	Tool_Calls:          []Provider_Tool_Call, // borrowed; set on assistant messages that request calls,
