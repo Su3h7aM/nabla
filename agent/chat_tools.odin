@@ -84,6 +84,9 @@ chat_prepare_call :: proc(
 	if arguments.status == .Rejected {
 		return tool_result_refused(&ctx, &arguments.error), true
 	}
+	// What the call runs with is the text the dispatch record holds, so an executor
+	// that forwards the call cannot send something other than what was recorded.
+	ctx.arguments_json = arguments.effective
 	if arguments.repair != .None {
 		_observer_message(observer, .Notice, "a tool call was repaired before it ran: a raw control character was escaped")
 	}

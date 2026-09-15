@@ -20,22 +20,27 @@ Tool_Control :: struct {
 // Tool_Context is what one execution is given besides its arguments. Every
 // string is borrowed and lives for the call.
 Tool_Context :: struct {
-	call_id:   string,
-	workspace: string,
-	control:   Tool_Control,
+	call_id:        string,
+	workspace:      string,
+	control:        Tool_Control,
+	// arguments_json is the admitted argument text this call runs with, exactly as
+	// the dispatch record holds it. A tool that reads fields uses arguments; an
+	// executor that forwards the call elsewhere sends this, so the record and the
+	// remote peer see the same bytes rather than two encodings of one value.
+	arguments_json: string,
 	// timeouts is the calling definition's own policy, copied here by
 	// dispatch. A shared executor, one procedure serving many definitions
 	// with different bindings, reads its bounds here instead of duplicating
 	// them into adapter state. The definition stays the source of truth.
-	timeouts:  Tool_Timeout_Policy,
-	allocator: mem.Allocator,
-	skills:    ^skills.Catalog,
+	timeouts:       Tool_Timeout_Policy,
+	allocator:      mem.Allocator,
+	skills:         ^skills.Catalog,
 	// backend is the borrowed binding the definition was registered with, copied
 	// here by dispatch. It is nil for native tools. Only the execute procedure
 	// paired with the definition may interpret it; it must never be freed
 	// through this struct. The registry owner keeps it alive until no registry
 	// or in-flight turn can use it.
-	backend:   rawptr,
+	backend:        rawptr,
 }
 
 // Tool_Execute runs one admitted call. Returning .Invalid_Arguments promises the
