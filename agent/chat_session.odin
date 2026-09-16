@@ -75,10 +75,6 @@ Chat_Accept :: enum {
 Chat_Session :: struct {
 	store:                        ^session.Store,
 	id:                           session.Session_Id, // owned
-	// log is the process's diagnostic stream, borrowed and never owned here. Nil
-	// means diagnostics are off, which every emit point treats as a no-op rather
-	// than a reason to branch.
-	log:                          ^Log,
 	allocator:                    mem.Allocator,
 	state:                        Chat_State,
 	terminal_status:              Chat_Terminal_Status,
@@ -174,9 +170,11 @@ chat_context_window :: proc(model: Catalog_Model) -> (window: int, assumed: bool
 // chat_session_init builds the running state for a claimed session. workspace is
 // the validated process directory; it is copied, because the caller's copy may
 // be temporary. The session id is copied too: the chat owns its identity rather
-// than borrowing it from whichever claim happens to be in the store. log is
-// borrowed and must outlive the chat; nil records nothing.
-chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspace: string, log: ^Log, allocator := context.allocator) -> Chat_Session {
+// than borrowing it from whichever claim happens to be in the store.
+//
+// Diagnostics are not a field here. The session's work inherits the writer from
+// context.logger, which is what lets a call site emit without threading one.
+chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspace: string, allocator := context.allocator) -> Chat_Session {
 	// The native definitions are compile-time constants, so a build failure
 	// here is a programming error; the registry tests hold them to validity.
 	// A partial registry is never installed: make destroys it before returning.
@@ -184,7 +182,6 @@ chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspa
 	return Chat_Session {
 		store = store,
 		id = session.Session_Id(strings.clone(string(id), allocator)),
-		log = log,
 		allocator = allocator,
 		next_turn_id = 1,
 		next_operation_id = 1,
@@ -313,12 +310,16 @@ chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: sess
 	}
 	// The record names the local step that failed, the store's classification, and
 	// the store's own message, which is local text rather than anything a peer sent.
+	// The failure can be reached from any depth, so the binding is narrowed here to
+	// the session the failure belongs to.
+	binding: Log_Binding
+	context.logger = log_rebind(&binding, log_correlation(chat))
 	fields := [3]Log_Field {
 		{key = "operation", value = what},
 		{key = "error_kind", value = log_error_kind_name(session.error_kind(local))},
 		{key = "detail", value = detail},
 	}
-	log_emit(log_scope(chat), Log_Record{level = .Error, category = .Storage, event = "storage.failed", fields = fields[:]})
+	log_emit({level = .Error, category = .Storage, event = "storage.failed", fields = fields[:]})
 	chat.active_failed = true
 	chat.storage_failed = true
 	chat.state = .Finalizing
@@ -329,6 +330,11 @@ chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: sess
 chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> Chat_Accept {
 	if chat.storage_failed { return .Storage_Failed }
 	if chat.state != .Idle { return .Busy }
+
+	// The turn does not exist yet, so the binding is installed with what is known
+	// and its correlation is refreshed once the durable turn number is.
+	binding: Log_Binding
+	context.logger = log_rebind(&binding, log_correlation(chat))
 
 	// The first prompt is what records the session. Everything below needs the row
 	// to exist, and the write leaves a session that already has one alone, so a
@@ -397,7 +403,8 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat.partial_assistant = make([dynamic]u8, 0, 0, chat.allocator)
 
 	fields := [1]Log_Field{{key = "prompt_bytes", value = i64(len(text))}}
-	log_emit(log_scope(chat), Log_Record{level = .Info, category = .Agent, event = "turn.started", fields = fields[:]})
+	binding.correlation = log_correlation(chat)
+	log_emit({level = .Info, category = .Agent, event = "turn.started", fields = fields[:]})
 	return .Accepted
 }
 
@@ -439,13 +446,17 @@ chat_session_accepts_event :: proc(chat: ^Chat_Session, source: Chat_Event_Sourc
 	}
 	if reason == "" { return true }
 
+	// The refused event is recorded against the session and the operation the
+	// harness is actually running, not the one the event claimed.
+	binding: Log_Binding
+	context.logger = log_rebind(&binding, log_correlation(chat))
 	fields := [4]Log_Field {
 		{key = "reason", value = reason},
 		{key = "supplied_turn", value = i64(source.turn_id)},
 		{key = "supplied_operation", value = source.operation_id},
 		{key = "current_operation", value = chat.operation.id},
 	}
-	log_emit(log_scope(chat), Log_Record{level = .Debug, category = .Agent, event = "agent.event_ignored", fields = fields[:]})
+	log_emit({level = .Debug, category = .Agent, event = "agent.event_ignored", fields = fields[:]})
 	return false
 }
 

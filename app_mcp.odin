@@ -155,13 +155,16 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	if agent.chat_session_state(&setup.session) != .Idle { return "" }
 
 	setup.mcp.refresh_generation += 1
-	scope := agent.log_scope(&setup.session)
+	// The refresh is recorded against the session it changes, so the caller's
+	// run-level logger is narrowed to this session for the whole refresh.
+	binding: agent.Log_Binding
+	context.logger = agent.log_rebind(&binding, agent.log_correlation(&setup.session))
 	generation := setup.mcp.refresh_generation
 	discovered, accepted, disabled, rejected, unavailable := 0, 0, 0, 0, 0
 	installed := false
 	started := time.tick_now()
 	start_fields := [1]agent.Log_Field{{key = "generation", value = generation}}
-	agent.log_emit(scope, {level = .Info, category = .Tool, event = "tools.refresh_started", fields = start_fields[:]})
+	agent.log_emit({level = .Info, category = .Tool, event = "tools.refresh_started", fields = start_fields[:]})
 	defer {
 		fields := [8]agent.Log_Field {
 			{key = "generation", value = generation},
@@ -173,7 +176,7 @@ app_tools_refresh :: proc(app: ^App) -> string {
 			{key = "installed", value = installed},
 			{key = "elapsed_ms", value = agent.log_duration_ms(time.tick_since(started))},
 		}
-		agent.log_emit(scope, {level = .Info, category = .Tool, event = "tools.refresh_finished", fields = fields[:]})
+		agent.log_emit({level = .Info, category = .Tool, event = "tools.refresh_finished", fields = fields[:]})
 	}
 	registry, registry_err := agent.tool_registry_make(setup.alloc)
 	if registry_err.kind != .None {
@@ -218,7 +221,7 @@ app_tools_refresh :: proc(app: ^App) -> string {
 				{key = "remote_name", value = tool.name},
 				{key = "tool", value = name},
 			}
-			agent.log_emit(scope, {level = .Debug, category = .Tool, event = "tool.binding", fields = fields[:]})
+			agent.log_emit({level = .Debug, category = .Tool, event = "tool.binding", fields = fields[:]})
 			append(&bindings, binding)
 		}
 		for config in server.tools {

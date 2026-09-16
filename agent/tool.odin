@@ -21,7 +21,6 @@ Tool_Control :: struct {
 // string is borrowed and lives for the call.
 Tool_Context :: struct {
 	call_id:        string,
-	log:            Log_Context, // borrowed for this execution
 	workspace:      string,
 	control:        Tool_Control,
 	// arguments_json is the admitted argument text this call runs with, exactly as

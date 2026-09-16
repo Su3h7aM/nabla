@@ -176,23 +176,26 @@ Session_Row :: struct {
 }
 
 Runtime :: struct {
-	mu:         sync.Mutex, // guards snapshot,
-	snap:       Snapshot,
-	work:       Work_Chan,
-	worker:     ^thread.Thread,
-	connection: ai.Provider_Connection,
+	mu:                   sync.Mutex, // guards snapshot,
+	snap:                 Snapshot,
+	work:                 Work_Chan,
+	worker:               ^thread.Thread,
+	connection:           ai.Provider_Connection,
 	// steer carries lines typed while a turn is running. The front-end pushes
 	// them as they arrive and the worker drains them at request boundaries, which
 	// is why it is written from one thread and read from another.
-	steer:      agent.Steer_Queue,
-	alloc:      mem.Allocator,
-	signals:    agent.Chat_Interactive_Signals,
+	steer:                agent.Steer_Queue,
+	alloc:                mem.Allocator,
+	signals:              agent.Chat_Interactive_Signals,
 	// stopping is set once by the front-end before the worker is stopped. It is
 	// separate from a turn cancellation: a cancel ends the running turn and the
 	// session keeps going, while stopping ends the process. The worker checks it
 	// at its own boundaries, so shutdown does not have to reach the worker
 	// through the command queue.
-	stopping:   bool,
+	stopping:             bool,
+	// log_failure_reported latches the one warning that diagnostics stopped. Only
+	// the worker reads and writes it, so it needs no lock of its own.
+	log_failure_reported: bool,
 }
 
 // stop_runtime refuses further work. The front-end is the only enqueuer, so once
@@ -245,8 +248,12 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 	session.session_release(&setup.store)
 	session.store_close(&setup.store)
 	// The log outlives the session and the store deliberately: the record of the
-	// launch ending is the last thing it can write.
-	run_log_close(setup)
+	// launch ending is the last thing it can write. A close failure is reported
+	// outside the log, because that log is what failed.
+	if close_err := run_log_close(setup); close_err != nil {
+		local := close_err
+		fmt.eprintln("nabla: the diagnostic log could not be closed cleanly:", agent.log_error_detail(&local))
+	}
 	agent.catalog_destroy(&setup.catalog)
 	for id in setup.configured {
 		delete(id, setup.alloc)
@@ -283,6 +290,12 @@ tui_run :: proc(
 	// The setup is filled in place: a store owns a live connection, and copying
 	// one would leave two owners of it.
 	app.setup.harness_options = harness_options
+	// The writer is opened and the logger installed here, in the scope that owns the
+	// run, so adoption, the store, and every turn below are recorded. A helper
+	// cannot install it: assigning context.logger only configures the calling scope.
+	app.setup.alloc = context.allocator
+	context.logger = run_log_open(&app.setup)
+	run_log_header(&app.setup)
 	if !run_catalog(sources, mcp_servers, &app.setup, start) {
 		return false
 	}

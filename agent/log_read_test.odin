@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:log"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -37,16 +38,25 @@ log_read_collect_destroy :: proc(fixture: ^Log_Read_Test) {
 // of two runs is older. The returned run id is owned by the caller.
 log_read_test_run :: proc(t: ^testing.T, logs_root: string, session_id: session.Session_Id, age: time.Duration) -> string {
 	log: Log
-	if open_err := log_open(&log, {directory = logs_root, level = .Info}); open_err != nil {
+	if _, open_err := log_open(&log, {directory = logs_root, enabled = true, lowest = .Info}); open_err != nil {
 		testing.fail_now(t, "a run could not be opened")
 	}
 	run_id := strings.clone(log.run_id, context.allocator)
 	directory := strings.clone(log.directory, context.allocator)
 	defer delete(directory, context.allocator)
 
-	log_emit(Log_Context{log = &log}, Log_Record{level = .Info, category = .Runtime, event = "run.started"})
-	log_emit(Log_Context{log = &log, session_id = session_id, turn_no = 1}, Log_Record{level = .Info, category = .Agent, event = "turn.started"})
-	log_close(&log)
+	// The writer is its own scope here, so the binding lives for the whole run.
+	binding := Log_Binding {
+		sink = &log,
+	}
+	context.logger = log_logger(&binding)
+	log_emit({level = .Info, category = .Runtime, event = "run.started"})
+	binding.correlation = Log_Correlation {
+		session_id = session_id,
+		turn_no    = 1,
+	}
+	log_emit({level = .Info, category = .Agent, event = "turn.started"})
+	_ = log_close(&log)
 	log_test_age_run(t, directory, age)
 	return run_id
 }
@@ -59,11 +69,22 @@ log_read_run_directory :: proc(logs_root, run_id: string) -> string {
 
 @(test)
 test_log_segment_names_are_recognized :: proc(t: ^testing.T) {
-	testing.expect(t, log_segment_name_valid("events-000001.jsonl"), "a written segment is recognized")
-	testing.expect(t, !log_segment_name_valid("lease"), "the lease is not a segment")
-	testing.expect(t, !log_segment_name_valid("events-1.jsonl"), "an unpadded number is not a segment")
-	testing.expect(t, !log_segment_name_valid("events-000001.jsonl.tmp"), "a temporary file is not a segment")
-	testing.expect(t, !log_segment_name_valid("events-00000a.jsonl"), "a non-digit is not a segment")
+	number, written := log_segment_name_number("events-000001.jsonl")
+	testing.expect(t, written && number == 1, "a written segment is recognized")
+
+	_, lease := log_segment_name_number("lease")
+	testing.expect(t, !lease, "the lease is not a segment")
+	_, unpadded := log_segment_name_number("events-1.jsonl")
+	testing.expect(t, !unpadded, "an unpadded number is not a segment")
+	_, temporary := log_segment_name_number("events-000001.jsonl.tmp")
+	testing.expect(t, !temporary, "a temporary file is not a segment")
+	_, nondigit := log_segment_name_number("events-00000a.jsonl")
+	testing.expect(t, !nondigit, "a non-digit is not a segment")
+
+	// A run that rotated past six digits keeps its numbers, which is what the
+	// reader sorts by.
+	wide, wide_ok := log_segment_name_number("events-1234567.jsonl")
+	testing.expect(t, wide_ok && wide == 1_234_567, "a long segment number is read")
 }
 
 @(test)

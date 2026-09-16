@@ -1,13 +1,14 @@
 package agent
 
+import "core:log"
 import "core:time"
 
 import "nabla:agent/session"
 import "nabla:ai"
 
-// The bridge is where harness state becomes diagnostics: the scope a record is
-// emitted against, and the names the log's own fields use for enums that other
-// packages define.
+// The bridge is where Odin's logger meets the harness: the adapter that installs
+// this writer into context.logger, the correlation a record is emitted against,
+// and the names the log's own fields use for enums other packages define.
 //
 // Everything here is derived from state the harness already keeps, so a record
 // carries no identity the session database does not also have, and no procedure
@@ -17,18 +18,113 @@ import "nabla:ai"
 // changes the day a member is inserted and a record is read long after the code
 // that wrote it.
 
-// log_scope is the scope for work on chat. Whatever correlation the session has
-// reached is carried; a field the session has not set is left absent.
-log_scope :: proc(chat: ^Chat_Session) -> Log_Context {
+// log_logger is the standard logger for one binding. The returned value borrows
+// binding, so the binding must outlive every use of the logger. A nil or unopened
+// sink yields Odin's no-op logger, which is exactly what a run with diagnostics
+// off keeps.
+log_logger :: proc(binding: ^Log_Binding) -> log.Logger {
+	if binding == nil || binding.sink == nil || !binding.sink.open {
+		return log.nil_logger()
+	}
+	return log.Logger{procedure = log_procedure, data = rawptr(binding), lowest_level = binding.sink.lowest, options = nil}
+}
+
+// log_rebind fills binding from the logger already installed and returns a logger
+// pointed at it. It is how a scope narrows correlation: the caller declares the
+// binding, which is what gives it a lifetime, and this call returns the logger
+// that borrows it.
+//
+// When no Nabla logger is installed, the active logger is returned unchanged and
+// binding is left empty, so a host's own logger is never clobbered and a run with
+// diagnostics off stays off.
+log_rebind :: proc(binding: ^Log_Binding, correlation: Log_Correlation) -> log.Logger {
+	active := context.logger
+	if active.procedure != log_procedure { return active }
+	source := cast(^Log_Binding)active.data
+	if source == nil || source.sink == nil { return active }
+	binding^ = Log_Binding {
+		sink        = source.sink,
+		correlation = correlation,
+	}
+	return log_bound_logger(binding, active)
+}
+
+// log_rebound returns a logger for a binding this scope already filled, or the
+// active logger when the binding holds no sink. It is for a scope that updates its
+// own correlation in place as identities become known, rather than rebinding.
+log_rebound :: proc(binding: ^Log_Binding) -> log.Logger {
+	if binding.sink == nil { return context.logger }
+	return log_bound_logger(binding, context.logger)
+}
+
+@(private)
+log_bound_logger :: proc(binding: ^Log_Binding, template: log.Logger) -> log.Logger {
+	return log.Logger{procedure = log_procedure, data = rawptr(binding), lowest_level = template.lowest_level, options = template.options}
+}
+
+// log_procedure is the adapter Odin's logging calls arrive at: an ordinary
+// log.info, log.warnf, or log.error anywhere below the harness. The text is stored
+// once as text, never parsed back into fields, and the caller's location is kept as
+// scalar fields rather than as a formatted header.
+@(private)
+log_procedure :: proc(data: rawptr, level: log.Level, text: string, options: log.Options, location := #caller_location) {
+	binding := cast(^Log_Binding)data
+	if binding == nil || binding.sink == nil { return }
+	fields := [4]Log_Field {
+		{key = "message", value = log_bounded_text(text)},
+		{key = "file", value = log_bounded_text(location.file_path)},
+		{key = "line", value = i64(location.line)},
+		{key = "procedure", value = log_bounded_text(location.procedure)},
+	}
+	record := Log_Record {
+		level    = level,
+		category = .Runtime,
+		event    = "runtime.message",
+		fields   = fields[:],
+	}
+	log_write(binding.sink, binding.correlation, record)
+}
+
+// log_enabled reports whether a record at level would be written by the active
+// logger. It is for a producer that would have to do measurable work, such as
+// hashing a request body, before it could emit a record the threshold discards
+// anyway. It is a question about the sink, not a second filtering rule: the sink
+// still decides.
+log_enabled :: proc(level: log.Level) -> bool {
+	logger := context.logger
+	return logger.procedure == log_procedure && level >= logger.lowest_level
+}
+
+// log_correlation is the correlation work on chat currently carries. Whatever the
+// session has reached is carried; a field the session has not set is left absent
+// rather than guessed, and a retired operation contributes no identity because no
+// operation is running.
+log_correlation :: proc(chat: ^Chat_Session) -> Log_Correlation {
 	if chat == nil { return {} }
-	scope := Log_Context {
-		log        = chat.log,
+	correlation := Log_Correlation {
 		session_id = chat.id,
 	}
-	if turn_no, has_turn := chat.turn_no.?; has_turn { scope.turn_no = turn_no }
-	if request_no, has_request := chat.active_request.?; has_request { scope.request_no = request_no }
-	scope.operation_id = chat.active_operation_id
-	return scope
+	if turn_no, has_turn := chat.turn_no.?; has_turn { correlation.turn_no = turn_no }
+	if request_no, has_request := chat.active_request.?; has_request { correlation.request_no = request_no }
+	if chat.operation.state == .Running { correlation.operation_id = chat.operation.id }
+	return correlation
+}
+
+// log_correlation_for is log_correlation for one request attempt: the same
+// identities with the attempt the caller keeps.
+log_correlation_for :: proc(chat: ^Chat_Session, attempt: int) -> Log_Correlation {
+	correlation := log_correlation(chat)
+	correlation.attempt = attempt
+	return correlation
+}
+
+// log_correlation_for_call is log_correlation for one tool call. The call id is
+// scoped to one session and request, which is what the ambient binding already
+// carries.
+log_correlation_for_call :: proc(chat: ^Chat_Session, call_id: string) -> Log_Correlation {
+	correlation := log_correlation(chat)
+	correlation.call_id = call_id
+	return correlation
 }
 
 // log_duration_ms is a duration in whole milliseconds, which is the unit every

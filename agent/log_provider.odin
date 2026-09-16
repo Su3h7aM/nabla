@@ -7,13 +7,16 @@ import "nabla:ai"
 // Provider observations are the one piece of evidence the harness cannot see for
 // itself: the exact bytes an operation encoded are freed when it returns, and the
 // response bytes pass through the operation's own chunk callback. The observer
-// borrows state that lives in the caller's frame for the whole operation, so
-// nothing here is retained past the call it describes.
+// borrows state that lives in the caller's frame for one attempt, so nothing here
+// is retained past the call it describes.
+//
+// Records are emitted against the binding the caller installed, so an observation
+// needs no copy of the writer or of the correlation.
 
-// Provider_Log is what one provider operation reports into: the scope its records
-// carry and the running count of what came back.
+// Provider_Log is what one provider attempt reports into: the running count of
+// what came back. It is created fresh for each attempt, because a retry is a new
+// attempt with its own bytes rather than a continuation of the previous one.
 Provider_Log :: struct {
-	scope:          Log_Context,
 	response_bytes: u64,
 }
 
@@ -26,6 +29,9 @@ log_provider_report :: proc(user_data: rawptr, report: ai.Provider_Operation_Rep
 	observation := cast(^Provider_Log)user_data
 	#partial switch report.stage {
 	case .Encoded:
+		// The digest is only worth computing when the record would be written:
+		// a filtered record must not pay for hashing bytes nobody will read.
+		if !log_enabled(.Info) { return }
 		// The digest is taken over the exact buffer the operation is about to
 		// send, so the record can be compared against a later capture without the
 		// capture having to exist yet.
@@ -47,7 +53,7 @@ log_provider_report :: proc(user_data: rawptr, report: ai.Provider_Operation_Rep
 			{key = "body_bytes", value = i64(len(report.body))},
 			{key = "body_sha256", value = string(digest_text[:])},
 		}
-		log_emit(observation.scope, Log_Record{level = .Info, category = .Provider, event = "provider.encoded", fields = fields[:]})
+		log_emit({level = .Info, category = .Provider, event = "provider.encoded", fields = fields[:]})
 	case .Response_Body:
 		// The count is what an attempt reports when it ends; the bytes themselves
 		// are only kept when capture is on.

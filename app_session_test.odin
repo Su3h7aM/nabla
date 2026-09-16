@@ -49,7 +49,7 @@ app_session_begin :: proc(t: ^testing.T, app: ^App) -> string {
 
 	app.setup.workspace = workspace
 	claimed, _ := session.session_claimed(&app.setup.store)
-	app.setup.session = agent.chat_session_init(&app.setup.store, claimed, workspace, nil, context.allocator)
+	app.setup.session = agent.chat_session_init(&app.setup.store, claimed, workspace, context.allocator)
 	app.setup.session.skill_instructions = agent.test_skill_instructions(&app.setup.session)
 	return directory
 }
@@ -93,7 +93,7 @@ attach_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
 	session.session_release(&setup.store)
 	session.store_close(&setup.store)
-	run_log_close(setup)
+	_ = run_log_close(setup)
 	delete(setup.workspace, setup.alloc)
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
@@ -1015,11 +1015,17 @@ test_refresh_degrades_to_native_tools_when_a_server_is_unusable :: proc(t: ^test
 	}
 	app.setup.mcp_servers = servers
 	app.setup.mcp = mcp_runtime_make(servers, context.allocator)
-	if log_error := agent.log_open(&app.setup.log, {directory = directory, level = .Debug}); log_error != nil {
+	_, log_error := agent.log_open(&app.setup.log, {directory = directory, enabled = true, lowest = .Debug})
+	if log_error != nil {
 		testing.fail_now(t, "could not open diagnostics")
 	}
-	defer agent.log_close(&app.setup.log)
-	app.setup.session.log = &app.setup.log
+	defer _ = agent.log_close(&app.setup.log)
+	// The refresh records against whatever logger is installed, so the test installs
+	// the one the run would have installed in its own scope.
+	app.setup.log_binding = agent.Log_Binding {
+		sink = &app.setup.log,
+	}
+	context.logger = agent.log_logger(&app.setup.log_binding)
 	// The registry borrows the runtime's bindings, so the session goes first and the
 	// clients second. The directory belongs to app_session_end.
 	defer {

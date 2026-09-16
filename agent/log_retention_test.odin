@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:log"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -37,13 +38,17 @@ log_test_create_closed_runs :: proc(t: ^testing.T, logs_root: string, count: int
 	directories := make([]string, count, context.allocator)
 	for index in 0 ..< count {
 		log: Log
-		if open_err := log_open(&log, {directory = logs_root, level = .Info}); open_err != nil {
+		if _, open_err := log_open(&log, {directory = logs_root, enabled = true, lowest = .Info}); open_err != nil {
 			testing.fail_now(t, "a run could not be opened")
 		}
 		directories[index] = strings.clone(log.directory, context.allocator)
 		// A record makes the run occupy bytes, which is what the byte bound measures.
-		log_emit(Log_Context{log = &log}, Log_Record{level = .Info, category = .Agent, event = "agent.transition"})
-		log_close(&log)
+		binding := Log_Binding {
+			sink = &log,
+		}
+		context.logger = log_logger(&binding)
+		log_emit({level = .Info, category = .Agent, event = "agent.transition"})
+		_ = log_close(&log)
 		log_test_age_run(t, directories[index], time.Duration(count - index) * time.Minute)
 	}
 	return directories
@@ -78,18 +83,6 @@ log_test_run_count :: proc(t: ^testing.T, logs_root: string) -> int {
 }
 
 @(test)
-test_log_level_names_round_trip :: proc(t: ^testing.T) {
-	levels := [6]Log_Level{.Disabled, .Error, .Warn, .Info, .Debug, .Trace}
-	for level in levels {
-		parsed, known := log_level_parse(log_level_name(level))
-		testing.expect(t, known, "every level name should parse")
-		testing.expect_value(t, parsed, level)
-	}
-	_, known := log_level_parse("verbose")
-	testing.expect(t, !known, "an unknown level name should not parse")
-}
-
-@(test)
 test_log_cleanup_keeps_a_leased_run :: proc(t: ^testing.T) {
 	fixture: Log_Test
 	log_test_begin(t, &fixture)
@@ -101,10 +94,10 @@ test_log_cleanup_keeps_a_leased_run :: proc(t: ^testing.T) {
 	log_test_age_run(t, live_directory, LOG_RETENTION_AGE * 2)
 
 	second: Log
-	if open_err := log_open(&second, {directory = fixture.directory, level = .Info}); open_err != nil {
+	if _, open_err := log_open(&second, {directory = fixture.directory, enabled = true, lowest = .Info}); open_err != nil {
 		testing.fail_now(t, "the second log could not be opened")
 	}
-	defer log_close(&second)
+	defer _ = log_close(&second)
 
 	testing.expect(t, os.exists(live_directory), "a leased run is never removed")
 	testing.expect(t, os.exists(second.directory), "the run that just opened exists")
@@ -118,23 +111,30 @@ test_log_cleanup_removes_an_expired_closed_run :: proc(t: ^testing.T) {
 
 	closed_directory := strings.clone(fixture.log.directory, context.allocator)
 	defer delete(closed_directory, context.allocator)
-	log_close(&fixture.log)
+	// A record gives the run bytes to free, which is what the summary reports.
+	{
+		binding := log_test_install(&fixture)
+		context.logger = log_logger(&binding)
+		log_emit({level = .Info, category = .Agent, event = "agent.transition"})
+	}
+	_ = log_close(&fixture.log)
 	log_test_age_run(t, closed_directory, LOG_RETENTION_AGE * 2)
 
 	reopened: Log
-	if open_err := log_open(&reopened, {directory = fixture.directory, level = .Info}); open_err != nil {
+	cleanup, open_err := log_open(&reopened, {directory = fixture.directory, enabled = true, lowest = .Info})
+	if open_err != nil {
 		testing.fail_now(t, "the log could not be reopened")
 	}
-	defer log_close(&reopened)
+	defer _ = log_close(&reopened)
+	testing.expect_value(t, cleanup.deleted, 1)
 
 	testing.expect(t, !os.exists(closed_directory), "an expired closed run is removed")
 	testing.expect(t, os.exists(reopened.directory), "the live run stays")
 
-	// The pass reports itself in the stream of the run that performed it.
-	text := log_test_text(t, log_test_directory_segment(reopened.directory, 1))
-	defer delete(text, context.allocator)
-	testing.expect(t, strings.contains(text, `"event":"retention.finished"`), "the pass is recorded")
-	testing.expect(t, strings.contains(text, `"dropped_runs":1`), "the pass counts what it removed")
+	// The pass is returned to the caller rather than written by log_open, so it can
+	// be reported after run.started. The summary is what the caller records.
+	testing.expect_value(t, cleanup.failed, 0)
+	testing.expect(t, cleanup.freed_bytes > 0, "the pass counts the bytes it freed")
 
 	log_test_end(t, &fixture)
 }
@@ -159,10 +159,10 @@ test_log_cleanup_removes_an_unleased_orphan :: proc(t: ^testing.T) {
 	log_test_age_run(t, orphan, LOG_RETENTION_AGE * 2)
 
 	launch: Log
-	if open_err := log_open(&launch, {directory = logs_root, level = .Info}); open_err != nil {
+	if _, open_err := log_open(&launch, {directory = logs_root, enabled = true, lowest = .Info}); open_err != nil {
 		testing.fail_now(t, "the log could not be opened")
 	}
-	defer log_close(&launch)
+	defer _ = log_close(&launch)
 
 	testing.expect(t, !os.exists(orphan), "an unleased run is removed")
 	testing.expect_value(t, log_test_run_count(t, logs_root), 1)
@@ -180,15 +180,16 @@ test_log_cleanup_bounds_what_closed_runs_hold :: proc(t: ^testing.T) {
 	defer log_lock_release(&lock)
 
 	// Room for one run, with nothing expired and no byte pressure: the newest stays.
-	deleted, _ := log_cleanup_within(logs_root, time.Hour, 1, LOG_CLOSED_RUN_BYTES, context.allocator)
-	testing.expect_value(t, deleted, 2)
+	first_pass := log_cleanup_within(logs_root, time.Hour, 1, LOG_CLOSED_RUN_BYTES, context.allocator)
+	testing.expect_value(t, first_pass.deleted, 2)
+	testing.expect_value(t, first_pass.failed, 0)
 	testing.expect(t, os.exists(directories[2]), "the newest run is kept")
 	testing.expect(t, !os.exists(directories[1]), "an older run is removed")
 	testing.expect(t, !os.exists(directories[0]), "the oldest run is removed")
 
 	// Room for one byte: even the last run cannot fit.
-	deleted_bytes, freed_bytes := log_cleanup_within(logs_root, time.Hour, LOG_CLOSED_RUN_COUNT, 1, context.allocator)
-	testing.expect_value(t, deleted_bytes, 1)
-	testing.expect(t, freed_bytes > 0, "the freed byte count should be positive")
+	second_pass := log_cleanup_within(logs_root, time.Hour, LOG_CLOSED_RUN_COUNT, 1, context.allocator)
+	testing.expect_value(t, second_pass.deleted, 1)
+	testing.expect(t, second_pass.freed_bytes > 0, "the freed byte count should be positive")
 	testing.expect_value(t, log_test_run_count(t, logs_root), 0)
 }

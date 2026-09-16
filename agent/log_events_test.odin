@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:log"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -15,25 +16,31 @@ import "nabla:ai"
 Log_Chat_Test :: struct {
 	chat:      Chat_Test,
 	log:       Log,
+	binding:   Log_Binding,
 	logs_root: string,
 }
 
 // log_chat_begin is chat_test_begin with a writer attached, so the turn the test
-// drives has somewhere to record itself.
-log_chat_begin :: proc(t: ^testing.T, fixture: ^Log_Chat_Test, workspace: string, level := Log_Level.Info) {
+// drives has somewhere to record itself. It returns the logger for the test to
+// install: a helper cannot configure its caller's context, so the binding lives in
+// the fixture and the caller assigns it in its own scope.
+log_chat_begin :: proc(t: ^testing.T, fixture: ^Log_Chat_Test, workspace: string, lowest := log.Level.Info) -> log.Logger {
 	logs_root, root_err := os.make_directory_temp("", "nabla-log-events-*", context.allocator)
 	if root_err != nil { testing.fail_now(t, "could not create a temporary logs root") }
 	fixture.logs_root = logs_root
-	if open_err := log_open(&fixture.log, {directory = logs_root, level = level}); open_err != nil {
+	if _, open_err := log_open(&fixture.log, {directory = logs_root, enabled = true, lowest = lowest}); open_err != nil {
 		testing.fail_now(t, "the log could not be opened")
 	}
 	chat_test_begin(t, &fixture.chat, workspace)
-	fixture.chat.chat.log = &fixture.log
+	fixture.binding = Log_Binding {
+		sink = &fixture.log,
+	}
+	return log_logger(&fixture.binding)
 }
 
 log_chat_end :: proc(t: ^testing.T, fixture: ^Log_Chat_Test) {
 	chat_test_end(t, &fixture.chat)
-	log_close(&fixture.log)
+	_ = log_close(&fixture.log)
 	os.remove_all(fixture.logs_root)
 	delete(fixture.logs_root, context.allocator)
 	fixture^ = {}
@@ -64,7 +71,7 @@ log_chat_cancel_turn :: proc(t: ^testing.T, chat: ^Chat_Session) -> (entries: in
 @(test)
 test_a_turn_records_its_start_and_end :: proc(t: ^testing.T) {
 	fixture: Log_Chat_Test
-	log_chat_begin(t, &fixture, tool_loop_workspace(t))
+	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
 	defer log_chat_end(t, &fixture)
 	chat := &fixture.chat.chat
 
@@ -87,7 +94,7 @@ test_a_turn_records_its_start_and_end :: proc(t: ^testing.T) {
 @(test)
 test_a_superseded_operation_is_recorded :: proc(t: ^testing.T) {
 	fixture: Log_Chat_Test
-	log_chat_begin(t, &fixture, tool_loop_workspace(t), .Debug)
+	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t), .Debug)
 	defer log_chat_end(t, &fixture)
 	chat := &fixture.chat.chat
 
@@ -118,7 +125,7 @@ test_a_superseded_operation_is_recorded :: proc(t: ^testing.T) {
 @(test)
 test_a_tool_call_is_recorded_from_call_to_result :: proc(t: ^testing.T) {
 	fixture: Log_Chat_Test
-	log_chat_begin(t, &fixture, tool_loop_workspace(t), .Debug)
+	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t), .Debug)
 	defer log_chat_end(t, &fixture)
 	chat := &fixture.chat.chat
 	chat.tools_enabled = true
@@ -163,7 +170,7 @@ test_a_tool_call_is_recorded_from_call_to_result :: proc(t: ^testing.T) {
 @(test)
 test_the_provider_record_names_the_encoded_body :: proc(t: ^testing.T) {
 	fixture: Log_Chat_Test
-	log_chat_begin(t, &fixture, tool_loop_workspace(t))
+	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
 	defer log_chat_end(t, &fixture)
 
 	// The digest is computed here rather than by the code under test, so a record
@@ -177,9 +184,6 @@ test_the_provider_record_names_the_encoded_body :: proc(t: ^testing.T) {
 		body  = transmute([]u8)body,
 	}
 	observation: Provider_Log
-	observation.scope = Log_Context {
-		log = &fixture.log,
-	}
 	log_provider_report(&observation, report)
 
 	text := log_chat_text(t, &fixture)

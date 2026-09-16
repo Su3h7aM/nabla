@@ -2,6 +2,7 @@
 package agent
 
 import "core:encoding/json"
+import "core:log"
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -25,10 +26,13 @@ test_mcp_exchange_records_delivery_without_payloads :: proc(t: ^testing.T) {
 	}
 	ctx := mcp_test_context()
 	ctx.backend = &backend
-	ctx.log = {
-		log     = &fixture.log,
-		call_id = ctx.call_id,
+	// The executor is given its call's binding by its caller, so the test installs
+	// one here and the exchange below records against it.
+	binding := Log_Binding {
+		sink = &fixture.log,
+		correlation = Log_Correlation{call_id = ctx.call_id},
 	}
+	context.logger = log_logger(&binding)
 	result := tool_mcp_execute(&ctx, json.Object{})
 	defer tool_result_destroy(&result)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Unavailable)
@@ -38,7 +42,7 @@ test_mcp_exchange_records_delivery_without_payloads :: proc(t: ^testing.T) {
 		delivery    = .Delivered,
 		stderr_tail = "secret-token\nprivate output",
 	}
-	log_mcp_exchange_finished(ctx.log, &backend, failure.delivery, failure, .Timed_Out, time.Second)
+	log_mcp_exchange_finished(&backend, failure.delivery, failure, .Timed_Out, time.Second)
 	text := log_test_segment_text(t, &fixture, 1)
 	defer delete(text, context.allocator)
 	testing.expect(t, strings.contains(text, `"event":"mcp.exchange_started"`))

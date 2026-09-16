@@ -186,6 +186,11 @@ run_prompt :: proc(
 		start.id = options.resume_id
 	}
 	app.setup.harness_options = harness_options
+	// The writer is opened and the logger installed in the scope that owns the run,
+	// so the headless path records the same launch the interactive one does.
+	app.setup.alloc = context.allocator
+	context.logger = run_log_open(&app.setup)
+	run_log_header(&app.setup)
 	if !run_catalog(sources, mcp_servers, &app.setup, start) { return 1 }
 	// The model this run picks belongs to the job, not to the user: a headless run
 	// must not change what the interactive harness starts with.

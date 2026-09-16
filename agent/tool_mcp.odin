@@ -81,8 +81,8 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (result:
 	exchange_error: mcp.Error
 	delivery := mcp.Delivery_State.Not_Delivered
 	defer mcp.error_destroy(&exchange_error, ctx.allocator)
-	defer log_mcp_exchange_finished(ctx.log, backend, delivery, exchange_error, result.outcome, time.tick_since(started))
-	log_mcp_exchange_started(ctx.log, backend)
+	defer log_mcp_exchange_finished(backend, delivery, exchange_error, result.outcome, time.tick_since(started))
+	log_mcp_exchange_started(backend)
 	if backend == nil || backend.client == nil {
 		return tool_result_failure(ctx, .Unavailable, "the server for this tool is not configured", "unavailable")
 	}

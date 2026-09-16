@@ -16,6 +16,11 @@ import "nabla:ai"
 
 run_worker :: proc(thread_handle: ^thread.Thread) {
 	app := cast(^App)thread_handle.data
+	// A thread started without init_context gets the default context, not the one
+	// the creating scope modified, so the run's logger is installed here. Only the
+	// logger is taken: leaving init_context unset is what keeps the thread library
+	// managing this thread's temporary allocator.
+	context.logger = agent.log_logger(&app.setup.log_binding)
 	observer := run_observer(app)
 	// The session list the /resume menu offers is built here, because only the
 	// worker touches the store.
@@ -86,6 +91,9 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	// A stop that arrived while this item was queued abandons it: shutdown does
 	// not start new work.
 	if runtime_stopping(app) { return }
+	// A sink that failed during the previous item is reported once, here, where
+	// the snapshot can carry it.
+	run_log_failure(&app.setup, &app.run.log_failure_reported)
 	// Work that can change which sessions exist, or what they are called, marks the
 	// list the /resume menu reads as needing a rebuild.
 	rows_dirty := false

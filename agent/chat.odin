@@ -2,6 +2,7 @@ package agent
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:log"
 import "core:sys/posix"
 import "core:time"
 
@@ -85,10 +86,10 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 				// The name the model sent and the name the harness resolved it to are
 				// two different facts, and a mismatch is what a rejected tool name
 				// looks like from here.
-				resolved := log_scope(runtime.chat)
-				resolved.call_id = call.ID
+				resolved: Log_Binding
+				context.logger = log_rebind(&resolved, log_correlation_for_call(runtime.chat, call.ID))
 				fields := [2]Log_Field{{key = "wire_name", value = call.Name}, {key = "tool", value = wire_call.Name}}
-				log_emit(resolved, Log_Record{level = .Info, category = .Tool, event = "tool.name_resolved", fields = fields[:]})
+				log_emit({level = .Info, category = .Tool, event = "tool.name_resolved", fields = fields[:]})
 				append(&calls, wire_call)
 			}
 			notice := chat_session_feed_tool_calls(runtime.chat, runtime.source, calls[:])
@@ -136,6 +137,12 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 @(private)
 chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, observer: Chat_Observer, usages: ^[dynamic]Chat_Request_Usage) {
 	if chat.skill_instructions == "" && !chat_ensure_instructions(chat) { return }
+	// This request's correlation is narrowed once and refreshed as each identity
+	// becomes durable: the request number after request_begin, the attempt inside
+	// the retry loop. Nothing here invents an identity before it exists.
+	binding: Log_Binding
+	context.logger = log_rebind(&binding, log_correlation(chat))
+
 	prep, prep_err := chat_prepare(chat, connection)
 	if prep_err != nil {
 		chat_session_record_failure(chat, "the request context could not be read", prep_err)
@@ -183,7 +190,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		{key = "messages", value = i64(len(prep.history.entries))},
 		{key = "tools", value = i64(len(prep.tools))},
 	}
-	log_emit(log_scope(chat), Log_Record{level = .Info, category = .Provider, event = "request.prepared", fields = prepared[:]})
+	log_emit({level = .Info, category = .Provider, event = "request.prepared", fields = prepared[:]})
 
 	at_ms := session.now_ms()
 	request_no, begin_err := session.request_begin(
@@ -205,11 +212,13 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		return
 	}
 	chat.active_request = request_no
+	binding.correlation = log_correlation(chat)
 
 	recorded := [1]Log_Field{{key = "purpose", value = session.request_purpose_name(.Response)}}
-	log_emit(log_scope(chat), Log_Record{level = .Info, category = .Storage, event = "request.recorded", fields = recorded[:]})
+	log_emit({level = .Info, category = .Storage, event = "request.recorded", fields = recorded[:]})
 
 	chat_session_begin_operation(chat)
+	binding.correlation = log_correlation(chat)
 	operation := chat_session_operation(chat)
 	runtime := Chat_Runtime_Context {
 		chat      = chat,
@@ -223,9 +232,6 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	}
 	// The observation lives in this frame for every attempt, because the operation
 	// borrows it until it returns.
-	provider_log: Provider_Log
-	provider_log.scope = log_scope(chat)
-	options.observer = provider_log_observer(&provider_log)
 	// One request may be attempted more than once. A retry happens only while
 	// nothing has been exposed to the model, so the conversation the next request
 	// is built from is the same one, and the model never learns that an attempt
@@ -235,12 +241,18 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	operation_error: ai.Provider_Operation_Error
 	for {
 		attempts += 1
-		attempt := log_scope(chat)
-		attempt.attempt = attempts
+		binding.correlation = log_correlation_for(chat, attempts)
 		remaining_ms := i64(0)
 		if remaining, active := ai.deadline_remaining(operation.deadline); active { remaining_ms = log_duration_ms(remaining) }
 		deadline := [1]Log_Field{{key = "deadline_ms", value = remaining_ms}}
-		log_emit(attempt, Log_Record{level = .Info, category = .Provider, event = "attempt.started", fields = deadline[:]})
+		log_emit({level = .Info, category = .Provider, event = "attempt.started", fields = deadline[:]})
+
+		// The observation belongs to this attempt: a retry that receives no chunk
+		// must not inherit the previous attempt's byte count. It is only attached
+		// when a record could be written from it, so a run with diagnostics off
+		// pays nothing per chunk.
+		provider_log: Provider_Log
+		if log_enabled(.Info) { options.observer = provider_log_observer(&provider_log) } else { options.observer = {} }
 
 		at := time.tick_now()
 		operation_error = ai.Provider_Request_Operation_Controlled(connection, prep.request, &runtime, chat_provider_event, options, chat.allocator)
@@ -255,7 +267,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 			{key = "response_bytes", value = i64(provider_log.response_bytes)},
 			{key = "elapsed_ms", value = log_duration_ms(time.tick_since(at))},
 		}
-		log_emit(attempt, Log_Record{level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})
+		log_emit({level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})
 		if !chat_request_may_retry(chat, operation_error, attempts) { break }
 		_observer_message(observer, .Notice, chat_retry_notice(attempts, operation_error))
 		delay := chat_retry_delay(attempts)
@@ -264,7 +276,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 			{key = "next_attempt", value = i64(attempts + 1)},
 			{key = "delay_ms", value = log_duration_ms(delay)},
 		}
-		log_emit(attempt, Log_Record{level = .Warn, category = .Provider, event = "request.retry", fields = retry[:]})
+		log_emit({level = .Warning, category = .Provider, event = "request.retry", fields = retry[:]})
 		if !chat_retry_wait(chat, delay) { break }
 		chat_session_clear_attempt(chat)
 		delete(operation_error.detail, chat.allocator)
@@ -414,7 +426,14 @@ chat_commit_response :: proc(
 		{key = "attempts", value = i64(chat.request_attempts)},
 		{key = "finish_reason", value = chat_finish_reason_text(finish_reason)},
 	}
-	log_emit(log_scope(chat), Log_Record{level = .Info, category = .Provider, event = "request.finished", fields = finished[:]})
+	// A cancelled request is an ordinary end of the turn; one that failed is an
+	// error. The record keeps the completed request number, and the correlation is
+	// taken before the operation is retired.
+	finished_binding: Log_Binding
+	context.logger = log_rebind(&finished_binding, log_correlation(chat))
+	level := log.Level.Info
+	if outcome == .Failed { level = .Error }
+	log_emit({level = level, category = .Provider, event = "request.finished", fields = finished[:]})
 }
 
 // --- settling a turn ---------------------------------------------------------
@@ -432,6 +451,9 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	if !has_turn { return true }
 	at_ms := session.now_ms()
 	recorded = true
+	// The turn is still identifiable here, which is what the end record carries.
+	binding: Log_Binding
+	context.logger = log_rebind(&binding, log_correlation(chat))
 
 	if text := string(chat.partial_assistant[:]); text != "" {
 		entry := session.New_Entry {
@@ -472,7 +494,7 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 		{key = "calls", value = i64(chat.calls_made)},
 		{key = "status", value = chat_terminal_text(chat.terminal_status)},
 	}
-	log_emit(log_scope(chat), Log_Record{level = .Info, category = .Agent, event = "turn.finished", fields = finished[:]})
+	log_emit({level = .Info, category = .Agent, event = "turn.finished", fields = finished[:]})
 	chat.turn_no = nil
 	chat.active_request = nil
 	// A turn that ended without running its staged calls, such as one a durable

@@ -22,14 +22,16 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 	count := 0
 	for &staged in chat.pending_calls {
 		// Every record for this call carries its own id, so a call can be followed
-		// from what the model proposed to what was committed for it.
-		call := log_scope(chat)
-		call.call_id = staged.id
+		// from what the model proposed to what was committed for it. The binding is
+		// this iteration's: the executor and its callees inherit it through
+		// context.logger, and it is gone before the next call starts.
+		binding: Log_Binding
+		context.logger = log_rebind(&binding, log_correlation_for_call(chat, staged.id))
+
 		received := [2]Log_Field{{key = "tool", value = staged.name}, {key = "arguments_bytes", value = i64(len(staged.arguments))}}
-		log_emit(call, Log_Record{level = .Info, category = .Tool, event = "tool.call_received", fields = received[:]})
+		log_emit({level = .Info, category = .Tool, event = "tool.call_received", fields = received[:]})
 
 		ctx := Tool_Context {
-			log       = call,
 			call_id   = staged.id,
 			workspace = chat.workspace,
 			control   = control,
@@ -64,7 +66,7 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 			{key = "outcome", value = session.tool_outcome_name(finalized.outcome)},
 			{key = "result_seq", value = i64(result_seq)},
 		}
-		log_emit(call, Log_Record{level = .Info, category = .Tool, event = "tool.result_committed", fields = committed[:]})
+		log_emit({level = .Info, category = .Tool, event = "tool.result_committed", fields = committed[:]})
 		_observer_tool_result(observer, staged.name, &finalized)
 		tool_result_destroy(&finalized)
 		count += 1
@@ -75,6 +77,9 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 // chat_prepare_call admits one call's arguments, records the dispatch, and runs
 // the tool. It reports false when a durable write failed, which leaves the
 // result empty and the turn stopping.
+//
+// The caller installs the call's logging binding before this runs, so every record
+// this makes carries the call id and the tool executor inherits it.
 @(private)
 chat_prepare_call :: proc(
 	chat: ^Chat_Session,
@@ -85,10 +90,7 @@ chat_prepare_call :: proc(
 	result: Tool_Result,
 	ok: bool,
 ) {
-	call := log_scope(chat)
-	call.call_id = staged.id
 	ctx := Tool_Context {
-		log = call,
 		call_id = staged.id,
 		workspace = chat.workspace,
 		control = {interrupt = &chat_cancel, deadline = chat.turn_deadline},
@@ -105,7 +107,7 @@ chat_prepare_call :: proc(
 		{key = "repair", value = session.tool_repair_name(arguments.repair)},
 		{key = "effective_bytes", value = i64(len(arguments.effective))},
 	}
-	log_emit(call, Log_Record{level = .Debug, category = .Tool, event = "tool.arguments_prepared", fields = prepared[:]})
+	log_emit({level = .Debug, category = .Tool, event = "tool.arguments_prepared", fields = prepared[:]})
 	if arguments.status == .Rejected {
 		return tool_result_refused(&ctx, &arguments.error), true
 	}
@@ -132,7 +134,7 @@ chat_prepare_call :: proc(
 		return {}, false
 	} else {
 		dispatched := [2]Log_Field{{key = "tool", value = staged.name}, {key = "dispatch_seq", value = i64(dispatch_seq)}}
-		log_emit(call, Log_Record{level = .Info, category = .Tool, event = "tool.dispatch_committed", fields = dispatched[:]})
+		log_emit({level = .Info, category = .Tool, event = "tool.dispatch_committed", fields = dispatched[:]})
 	}
 	// Cancellation can land after the intent was recorded but before execution
 	// begins. The intent is durable, but the call never started.
@@ -140,10 +142,10 @@ chat_prepare_call :: proc(
 		return tool_result_failure(&ctx, .Not_Executed, "the turn was cancelled before this call ran", "not executed"), true
 	}
 	started := [1]Log_Field{{key = "tool", value = staged.name}}
-	log_emit(call, Log_Record{level = .Info, category = .Tool, event = "tool.execution_started", fields = started[:]})
+	log_emit({level = .Info, category = .Tool, event = "tool.execution_started", fields = started[:]})
 	result = definition.execute(&ctx, object)
 	finished := [2]Log_Field{{key = "tool", value = staged.name}, {key = "outcome", value = session.tool_outcome_name(result.outcome)}}
-	log_emit(call, Log_Record{level = .Info, category = .Tool, event = "tool.execution_finished", fields = finished[:]})
+	log_emit({level = .Info, category = .Tool, event = "tool.execution_finished", fields = finished[:]})
 	return result, true
 }
 

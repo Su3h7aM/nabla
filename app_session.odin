@@ -33,6 +33,13 @@ Run_Setup :: struct {
 	// log is this launch's diagnostic stream. It is opened before the store and
 	// closed after it, so a launch that cannot reach the store still says so.
 	log:              agent.Log,
+	// log_binding is what context.logger points at while the run is logging. It
+	// lives here, next to the writer, so it outlives every logger value that
+	// borrows it.
+	log_binding:      agent.Log_Binding,
+	// log_cleanup is what the retention pass did, held until the run's logger is
+	// installed so the pass is reported after run.started rather than before it.
+	log_cleanup:      agent.Log_Cleanup_Summary,
 	session:          agent.Chat_Session,
 	workspace:        string, // owned; the directory sessions here run in
 	provider_id:      string, // owned,
@@ -168,9 +175,10 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []age
 // for, claims it for writing, and settles anything an earlier run left running.
 // The running session is built on top of that claim. A launch that cannot open
 // the session it asked for fails rather than quietly starting a different one.
+//
+// The caller installs the launch's logger before this runs, so the store and the
+// adoption below are recorded.
 run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_Start) -> bool {
-	run_log_open(setup)
-
 	directory, directory_err := agent.xdg_directory(.State, setup.alloc)
 	if directory_err != .None {
 		fmt.eprintln("nabla: cannot resolve the state directory for sessions")
@@ -211,13 +219,12 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 	}
 
 	// The session and what an earlier run left unfinished are one record each, so a
-	// launch that found work to settle says which work it found.
-	claimed_scope := agent.Log_Context {
-		log        = &setup.log,
-		session_id = claimed,
-	}
+	// launch that found work to settle says which work it found. The binding is
+	// narrowed to the claimed session here rather than carried from the run scope.
+	claimed_binding: agent.Log_Binding
+	context.logger = agent.log_rebind(&claimed_binding, agent.Log_Correlation{session_id = claimed})
 	claimed_fields := [1]agent.Log_Field{{key = "resumed", value = start.kind != .New}}
-	agent.log_emit(claimed_scope, agent.Log_Record{level = .Info, category = .Session, event = "session.claimed", fields = claimed_fields[:]})
+	agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.claimed", fields = claimed_fields[:]})
 	recovery := adoption.recovery
 	if recovery.interrupted_turns > 0 || recovery.interrupted_requests > 0 || recovery.recovered_calls > 0 || recovery.unexecuted_calls > 0 {
 		recovery_fields := [4]agent.Log_Field {
@@ -226,13 +233,13 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 			{key = "recovered_calls", value = i64(recovery.recovered_calls)},
 			{key = "unexecuted_calls", value = i64(recovery.unexecuted_calls)},
 		}
-		agent.log_emit(claimed_scope, agent.Log_Record{level = .Info, category = .Session, event = "session.recovered", fields = recovery_fields[:]})
+		agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.recovered", fields = recovery_fields[:]})
 	}
 
 	setup.workspace = strings.clone(adoption.header.workspace, setup.alloc)
 	setup.resumed_provider = strings.clone(adoption.header.provider, setup.alloc)
 	setup.resumed_model = strings.clone(adoption.header.model, setup.alloc)
-	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, &setup.log, setup.alloc)
+	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
 	setup.session.disable_project_instructions = setup.harness_options.disable_project_instructions
 	return true
 }
@@ -409,7 +416,7 @@ session_activate :: proc(app: ^App, adoption: ^Adoption) {
 	agent.chat_session_destroy(&setup.session)
 	delete(setup.workspace, setup.alloc)
 	setup.workspace = strings.clone(adoption.header.workspace, setup.alloc)
-	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, &setup.log, setup.alloc)
+	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
 	setup.session.disable_project_instructions = setup.harness_options.disable_project_instructions
 }
 
