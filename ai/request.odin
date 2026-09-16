@@ -9,6 +9,38 @@ import "nabla:sse"
 
 Provider_Event_Callback :: #type proc(user_data: rawptr, event: Provider_Event)
 
+// Provider_Operation_Stage names what one provider operation has produced.
+//
+// Encoded carries the exact request body the operation is about to send, which is
+// the only moment it exists: the operation frees it when it returns. Response_Body
+// carries a plaintext response chunk as it arrives, before it is parsed, which is
+// what a capture needs and what a byte count is counted from.
+Provider_Operation_Stage :: enum {
+	Encoded,
+	Response_Body,
+}
+
+// Provider_Operation_Report is one observation of a provider operation. body and
+// chunk are borrowed for the duration of the call and never retained; an observer
+// that wants them beyond that must copy them itself.
+Provider_Operation_Report :: struct {
+	stage: Provider_Operation_Stage,
+	api:   API_Kind,
+	// model and tools describe the request the body was built from, and are zero
+	// for a response chunk.
+	model: string,
+	tools: int,
+	body:  []u8,
+	chunk: []u8,
+	// bytes is the running plaintext response byte count for the operation.
+	bytes: u64,
+}
+
+Provider_Operation_Observer :: struct {
+	user_data: rawptr,
+	report:    proc(user_data: rawptr, report: Provider_Operation_Report),
+}
+
 Provider_Operation_Error_Kind :: enum {
 	None,
 	Invalid_Request,
@@ -46,6 +78,9 @@ Provider_Operation_Options :: struct {
 	ca_file:     string,
 	// Empty uses the system resolver configuration. A value replaces it.
 	nameservers: []net.Endpoint,
+	// observer, when set, is told what this operation encoded and what came back.
+	// A zero observer observes nothing.
+	observer:    Provider_Operation_Observer,
 }
 
 // provider_auth_headers builds the request fields one API family authenticates
@@ -131,6 +166,12 @@ Provider_Request_Operation_Controlled :: proc(
 		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(encode_err), allocator)}
 	}
 	defer delete(body, allocator)
+	if options.observer.report != nil {
+		options.observer.report(
+			options.observer.user_data,
+			Provider_Operation_Report{stage = .Encoded, api = request.API, model = request.Model, tools = len(request.Tools), body = transmute([]u8)body},
+		)
+	}
 
 	headers := provider_auth_headers(connection, allocator)
 	defer provider_headers_destroy(headers, allocator)
@@ -143,6 +184,7 @@ Provider_Request_Operation_Controlled :: proc(
 		allocator = allocator,
 		interrupt = options.interrupt,
 		deadline  = options.deadline,
+		observer  = options.observer,
 	}
 	sse.parser_init(&state.parser, provider_sse_event, &state, allocator = allocator)
 	defer sse.parser_destroy(&state.parser)
@@ -198,6 +240,8 @@ Provider_Request_Stream_State :: struct {
 	allocator:      mem.Allocator,
 	interrupt:      ^Interrupt,
 	deadline:       Deadline,
+	observer:       Provider_Operation_Observer,
+	response_bytes: u64,
 	failed:         bool,
 	failure_detail: string,
 	failure_status: int,
@@ -408,6 +452,10 @@ provider_sse_event :: proc(user_data: rawptr, event: sse.Event) {
 provider_http_chunk :: proc(user_data: rawptr, chunk: []u8) {
 	state := cast(^Provider_Request_Stream_State)user_data
 	if state.failed { return }
+	state.response_bytes += u64(len(chunk))
+	if state.observer.report != nil {
+		state.observer.report(state.observer.user_data, Provider_Operation_Report{stage = .Response_Body, chunk = chunk, bytes = state.response_bytes})
+	}
 	if sse.parser_feed(&state.parser, chunk) != .None {
 		provider_emit_error(state, .Invalid_Data, "malformed SSE stream")
 	}

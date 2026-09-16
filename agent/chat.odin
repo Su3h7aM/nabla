@@ -221,6 +221,11 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		interrupt = &chat_cancel,
 		deadline  = operation.deadline,
 	}
+	// The observation lives in this frame for every attempt, because the operation
+	// borrows it until it returns.
+	provider_log: Provider_Log
+	provider_log.scope = log_scope(chat)
+	options.observer = provider_log_observer(&provider_log)
 	// One request may be attempted more than once. A retry happens only while
 	// nothing has been exposed to the model, so the conversation the next request
 	// is built from is the same one, and the model never learns that an attempt
@@ -239,11 +244,12 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 
 		at := time.tick_now()
 		operation_error = ai.Provider_Request_Operation_Controlled(connection, prep.request, &runtime, chat_provider_event, options, chat.allocator)
-		finished := [5]Log_Field {
+		finished := [6]Log_Field {
 			{key = "error_kind", value = log_operation_error_name(operation_error.kind)},
 			{key = "finish_reason", value = chat_finish_reason_text(runtime.finish_reason)},
 			{key = "status", value = i64(operation_error.status)},
 			{key = "detail_bytes", value = i64(len(operation_error.detail))},
+			{key = "response_bytes", value = i64(provider_log.response_bytes)},
 			{key = "elapsed_ms", value = log_duration_ms(time.tick_since(at))},
 		}
 		log_emit(attempt, Log_Record{level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})

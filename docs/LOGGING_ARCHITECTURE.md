@@ -1,7 +1,8 @@
 # Harness logging and diagnostics architecture
 
 Status: phases 1 and 2 are implemented, together with phase 3 apart from compaction
-requests and the session release record; the rest is planned.
+requests and the session release record, and the provider observation of phase 4; the rest
+is planned.
 
 This plan is based on the complete *Nabla Logging Reference Study: goose + opencode*,
 including its appendices, at
@@ -125,7 +126,8 @@ Inside `agent`, beside the state machine:
 | `agent/log_retention.odin` | run directories, leases, bounded cleanup |
 | `agent/log_capture.odin` | opt-in payload capture: admission, chunk append, digests, sidecar metadata, abort |
 | `agent/log_read.odin` | parsing and scanning a run directory for diagnosis and export |
-| `agent/log_bridge.odin` | adapters from `ai` observations and harness state into records |
+| `agent/log_bridge.odin` | the scope a record is emitted against, and the log's names for enums other packages define |
+| `agent/log_provider.odin` | the provider observation: what one operation encoded and what came back |
 | `agent/chat.odin`, `agent/chat_session.odin`, `agent/compact.odin`, `agent/tool*.odin` | emit calls at the boundaries they already own |
 | `agent/log_test.odin`, `agent/log_events_test.odin`, `agent/log_retention_test.odin`, `agent/log_read_test.odin` | unit tests |
 
@@ -413,13 +415,13 @@ Minimum event contracts:
 | `agent.event_ignored` | Debug | reason, supplied turn and operation, current operation |
 | `request.prepared`, `request.recorded` | Info | purpose, model, provider, API, token estimate, context window, message and tool counts; the record marks the durable row separately from the prepare |
 | `request.admission`, `compaction.started`, `compaction.finished` | Info | estimate, budget, decision, covered sequence, checkpoint commit result |
-| `attempt.started`, `attempt.finished` | Info | attempt, remaining deadline; error kind, finish reason, status, error detail length, duration |
+| `attempt.started`, `attempt.finished` | Info | attempt, remaining deadline; error kind, finish reason, status, error detail length, response byte count, duration |
 | `request.retry` | Warn | error kind, next attempt, delay |
 | `provider.encoded` | Info | body length and digest, api, model, tool count |
-| `provider.response_head` | Debug | status, declared content length if present |
-| `transport.phase`, `transport.bytes` | Debug | phase, plaintext byte count so far, transport error kind |
-| `provider.decode_failed` | Warn | stage, cumulative plaintext response bytes, error kind; no raw frame |
-| `provider.completion_received`, `provider.completion_delivered` | Debug | finish reason, call count, whether the terminal event was delivered |
+| `provider.response_head` | Debug | deferred with the transport observer |
+| `transport.phase`, `transport.bytes` | Debug | deferred with the transport observer |
+| `provider.decode_failed` | Warn | deferred; the stream failure already reaches the caller as an error kind |
+| `provider.completion_received`, `provider.completion_delivered` | Debug | deferred; the completion event already reaches the caller |
 | `request.finished`, `request.commit_failed` | Info, Error | outcome, attempts, finish reason; the storage failure is `storage.failed` |
 | `tools.refresh_started`, `tools.refresh_finished` | Info | generation, discovered, accepted, disabled and rejected counts |
 | `tool.name_resolved` | Info | the name the model sent and the name the harness resolved it to |
@@ -529,26 +531,29 @@ than the count being guessed.
 
 ```odin
 // Provider_Operation_Stage names what one provider operation has produced.
+//
+// Encoded carries the exact request body the operation is about to send, which is
+// the only moment it exists: the operation frees it when it returns. Response_Body
+// carries a plaintext response chunk as it arrives, before it is parsed.
 Provider_Operation_Stage :: enum {
 	Encoded,
-	Request_Bytes,
-	Response_Head,
 	Response_Body,
-	Failed,
-	Completed,
 }
 
 // Provider_Operation_Report is one observation of a provider operation. body and
-// chunk are borrowed for the duration of the call and never retained.
+// chunk are borrowed for the duration of the call and never retained; an observer
+// that wants them beyond that must copy them itself.
 Provider_Operation_Report :: struct {
-	stage:  Provider_Operation_Stage,
-	api:    API_Kind,
-	model:  string,                 // decoded from body when stage is Encoded
-	body:   []u8,
-	chunk:  []u8,
-	bytes:  u64,
-	status: int,
-	error:  Provider_Operation_Error,
+	stage: Provider_Operation_Stage,
+	api:   API_Kind,
+	// model and tools describe the request the body was built from, and are zero
+	// for a response chunk.
+	model: string,
+	tools: int,
+	body:  []u8,
+	chunk: []u8,
+	// bytes is the running plaintext response byte count for the operation.
+	bytes: u64,
 }
 
 Provider_Operation_Observer :: struct {
@@ -561,15 +566,26 @@ Provider_Operation_Observer :: struct {
 
 `Provider_Request_Operation_Controlled` reports `Encoded` immediately after
 `Provider_Encode_Request` succeeds and before `http_post_sse`, over the exact owned buffer
-that is about to be sent. `model` is decoded from that buffer, so a record states what was
-encoded rather than what was intended. `Failed` and `Completed` correspond to the returns
-the procedure already produces.
+that is about to be sent. `Response_Body` is reported from the chunk callback the
+operation already passes to `http_post_sse`, which is the one place the plaintext response
+bytes pass through. The operation's failure and completion are not reported: the caller
+already receives them as the return value and as the completion event, and a second
+channel for one fact is one too many. The hook is generic over APIs; `ai` gains no
+per-provider branch.
+
+The report carries the model and the tool count the body was built from rather than a value
+decoded back out of it. `Provider_Validate_Request` has already refused a request whose
+model is missing or empty, and `Provider_Encode_Request` validates again, so a body without
+a model cannot be produced here; the body digest covers the bytes themselves.
 
 This is provider protocol work, which is what `ai` is: the encoded body of a provider
-request is an `ai` fact, and no other layer can observe it before it is deleted. The hook
-is generic over APIs; `ai` gains no per-provider logging branch. Because
-`Provider_Validate_Request` already rejects a missing or empty model, the encoded report is
-evidence, not a second validation.
+request is an `ai` fact, and no other layer can observe it before it is freed.
+
+The transport-level facts that `ai` does not own, the plaintext bytes actually handed to
+the socket and the declared response length, need an observer inside `http/client`. They
+are deliberately deferred: the encoded digest, the response byte count, and the
+transport failure kind already answer whether a request was sent and whether anything came
+back, and an observer in the HTTP library is only worth adding when a question needs it.
 
 ### 8.3 What deliberately does not change
 
@@ -584,34 +600,31 @@ evidence, not a second validation.
 
 ### 8.4 Bridging
 
-`ai/http.odin` maps `Transfer_Report` into the provider operation report: `Write_Body`
-becomes `Request_Bytes` with the write count, and `Read_Head` becomes `Response_Head` with
-the status and declared length. `Read_Body` transport reports are not forwarded, because the
-same bytes already arrive through `provider_http_chunk`; the `Response_Body` stage is
-reported from there instead, so response bytes are observed exactly once. The transport
-observer is installed in the `client.Options` that `http_post_sse` builds.
+`agent/log_provider.odin` holds the state one provider operation reports into
+(`Provider_Log`: the scope its records carry and the running response byte count) and the
+observer that turns each report into a record. The state lives in the frame of
+`chat_perform_request`, so it outlives the operation and never outlives the turn.
 
-`agent/log_bridge.odin` holds the `ai.Provider_Operation_Observer` whose `user_data` is a
-small adapter carrying the borrowed `Log` and the borrowed `Log_Context`. It translates
-stages into records and feeds captures. It copies anything it needs before returning; no
-callback payload outlives its call.
+Rules for the bridge, which are the reason it is its own file:
 
-Rules for the bridge, which are the reason it is a separate file:
-
-- Callback payloads are borrowed for the call and never retained.
-- Capture writes happen synchronously inside the callback. Nothing is queued.
+- A report is borrowed for the call and never retained: the bridge hashes the body and
+  writes values, so nothing points into memory the operation frees. A test that copied the
+  body into a thread's temporary allocator was caught by the address sanitizer, which is
+  the rule enforced rather than stated.
 - The bridge holds no policy that belongs to a lower layer and no transport type.
-- The callback never mutates provider or transport state. Odin slices are mutable; the
-  contract is read-only, and the buffer owner stays alive until the operation retires.
+- The callback does not mutate what it observes. Odin slices are mutable; the contract is
+  read-only, and the buffer owner stays alive until the operation retires.
 
 ### 8.5 Byte accounting
 
-The log distinguishes four quantities and never presents one as another:
+The log distinguishes these quantities and never presents one as another:
 
 1. encoded request body bytes, hashed over the exact buffer handed to transport;
-2. request body bytes the transport reports as written;
-3. response body bytes received and passed to framing and parsing;
-4. bytes stored in a capture, which may be a bounded prefix of (1) or (3).
+2. request body bytes the transport reports as written, deferred with the transport
+   observer;
+3. response body bytes received and passed to framing and parsing, counted per attempt;
+4. bytes stored in a capture, which may be a bounded prefix of (1) or (3), and arrives with
+   capture support.
 
 `Content-Length` is reported as the declared value and separately from the body bytes
 actually observed. Response capture is the de-framed body byte stream before SSE parsing,
@@ -881,14 +894,14 @@ SQLite and JSONL.
 ## 14. Walkthroughs
 
 **A remote error about an unknown or blank model.** Find the logical request in the
-database, then its `provider.encoded` record: api, model, body length, digest, tool count.
-`ai` rejects a missing or empty model before encoding, so a record cannot show an empty
-model unless the harness itself is broken, and the digest makes the encoded bytes checkable
-rather than inferred. Compare the request body bytes the transport reports writing, then the
-`provider.response_head` status, then the bounded excerpt that already reaches the caller
-through `Failure.detail`. With capture enabled, the exact captured body removes the last
-guess. What the log cannot establish is how a gateway routed a model it received; it records
-which model it sent and when.
+database, then its `provider.encoded` record: api, model, tool count, body length, digest,
+and the response byte count on the `attempt.finished` that followed it. `ai` rejects a
+missing or empty model before encoding, so a record cannot show an empty model unless the
+harness itself is broken, and the digest makes the encoded bytes checkable rather than
+inferred. A response byte count of zero with a transport failure says nothing was received,
+while a count with a status says the peer answered. The bounded excerpt already reaches the
+caller through `Failure.detail`. What the log cannot establish is how a gateway routed a
+model it received; it records which model it sent and when.
 
 **A rejected tool name.** Compare the canonical name, the advertised wire name, the encoded
 inventory recorded at `provider.encoded`, the name in `tool.call_received`, and the resolved
@@ -970,17 +983,22 @@ that root performs at teardown.
 
 ### Phase 4: provider observation, transport accounting, and capture
 
-`Provider_Operation_Observer` in `ai/request.odin`, the bridge in `ai/http.odin`, the
-`Transfer_Observer` in `http/client`, and `agent/log_capture.odin` with quotas and sidecar
-metadata.
+The provider observation is implemented: `Provider_Operation_Observer` in
+`ai/request.odin`, reported at encode time and from the response chunk callback, and the
+bridge in `agent/log_provider.odin` that turns it into `provider.encoded` and a response
+byte count on the attempt that ends. The report borrows its bytes for the call only, so the
+bridge hashes the body and records values rather than keeping a pointer, and a test that
+kept one was caught by the address sanitizer.
 
-Tests: all three API families; a body larger than 1 MiB; NUL and control bytes; the encoded
-digest matching the exact buffer handed to transport; two attempts in one request; a model
-change between attempts; HTTP 400; a malformed SSE stream; a missing terminal event; a
-partial write; cancellation; a TLS failure; a fragmented capture; quota exhaustion and a
-crash residue. Assert that no `authorization` header, query string, or environment value
-reaches a default record or a capture, and that no callback retains its source buffer after
-returning. Run `mise run test ai`, `mise run test http/client`, and `mise run test agent`.
+Tests: the transport fixture reports what one operation encoded and received, and the bridge
+records the digest of those exact bytes, checked against a digest computed outside the code
+under test. Run `mise run test ai`, `mise run test agent`, and `mise run test .`.
+
+Still to build in this phase, when a question needs it: the `Transfer_Observer` in
+`http/client` for the bytes actually handed to the socket and the declared response length,
+and `agent/log_capture.odin` with its quotas, sidecar metadata, and the
+`NABLA_LOG_CAPTURE` switch. A capture would store the same borrowed body the bridge hashes,
+so the pieces that exist are the ones it needs.
 
 ### Phase 5: MCP and tool evidence
 

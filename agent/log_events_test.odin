@@ -6,6 +6,7 @@ import "core:strings"
 import "core:testing"
 
 import "nabla:agent/session"
+import "nabla:ai"
 
 // The state machine is driven here through the same helpers the rest of the suite
 // uses, so a test reads back what the harness actually recorded for a real turn
@@ -157,6 +158,43 @@ test_a_tool_call_is_recorded_from_call_to_result :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(text, `"repair":"none"`), "the admission says nothing was repaired")
 	testing.expect(t, strings.contains(text, `"outcome":"success"`), "the execution outcome is named")
 	testing.expect(t, strings.contains(text, `"result_seq":`), "the result names the entry it was stored as")
+}
+
+@(test)
+test_the_provider_record_names_the_encoded_body :: proc(t: ^testing.T) {
+	fixture: Log_Chat_Test
+	log_chat_begin(t, &fixture, tool_loop_workspace(t))
+	defer log_chat_end(t, &fixture)
+
+	// The digest is computed here rather than by the code under test, so a record
+	// that named a different body would not match it.
+	body := `{"model":"test-model","input":"hello"}`
+	report := ai.Provider_Operation_Report {
+		stage = .Encoded,
+		api   = .OpenAI_Responses,
+		model = "test-model",
+		tools = 3,
+		body  = transmute([]u8)body,
+	}
+	observation: Provider_Log
+	observation.scope = Log_Context {
+		log = &fixture.log,
+	}
+	log_provider_report(&observation, report)
+
+	text := log_chat_text(t, &fixture)
+	defer delete(text, context.allocator)
+	testing.expect(t, strings.contains(text, `"event":"provider.encoded"`), "the encoded body is recorded")
+	testing.expect(t, strings.contains(text, `"api":"openai_responses"`), "the record names the API family")
+	testing.expect(t, strings.contains(text, `"model":"test-model"`), "the record names the model")
+	testing.expect(t, strings.contains(text, `"tools":3`), "the record counts the encoded tools")
+	testing.expect_value(t, len(body), 38)
+	testing.expect(t, strings.contains(text, `"body_bytes":38`), "the record counts the encoded bytes")
+	testing.expect(
+		t,
+		strings.contains(text, "9a097790cd5c0aeb05c59c221f90963b0abbba75d5044c094beef975c536f26d"),
+		"the record carries the digest of those exact bytes",
+	)
 }
 
 @(test)

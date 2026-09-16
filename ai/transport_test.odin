@@ -381,6 +381,63 @@ test_transport_certificate_trust :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_transport_reports_what_it_encoded_and_received :: proc(t: ^testing.T) {
+	fixture: Transport_Fixture
+	if !transport_fixture_start(t, &fixture, .Complete, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
+	defer transport_fixture_stop(&fixture)
+
+	job: Transport_Job
+	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+	defer transport_job_destroy(&job, job.allocator)
+
+	observed: Transport_Observation
+	job.options.observer = {
+		user_data = &observed,
+		report    = transport_observation_report,
+	}
+	transport_job_start(&job)
+	transport_job_join(&job)
+
+	testing.expectf(t, job.error.kind == .None, "request failed: %v %s", job.error.kind, job.error.detail)
+	// The body is reported once, and it is the body the provider encoded. Nothing is
+	// kept from the report: its bytes are borrowed for the call only, and the call
+	// runs on another thread.
+	testing.expect_value(t, observed.encoded_reports, 1)
+	testing.expect(t, observed.body_has_model, "the encoded report should carry the model the request named")
+	testing.expect(t, observed.body_bytes > 0, "the encoded report should carry the body itself")
+	// The response arrives as chunks before the operation returns, and the count
+	// is the plaintext byte count.
+	testing.expect(t, observed.chunks > 0, "the response should be reported as it arrives")
+	testing.expect_value(t, observed.bytes, u64(observed.chunk_bytes))
+}
+
+// Transport_Observation is what the observer records about one operation. It holds
+// values rather than borrowed bytes, because a report is only valid for the call it
+// arrives in.
+Transport_Observation :: struct {
+	encoded_reports: int,
+	body_bytes:      int,
+	body_has_model:  bool,
+	chunks:          int,
+	chunk_bytes:     int,
+	bytes:           u64,
+}
+
+transport_observation_report :: proc(user_data: rawptr, report: Provider_Operation_Report) {
+	observed := cast(^Transport_Observation)user_data
+	switch report.stage {
+	case .Encoded:
+		observed.encoded_reports += 1
+		observed.body_bytes = len(report.body)
+		observed.body_has_model = strings.contains(string(report.body), `"model":"transport-test-model"`)
+	case .Response_Body:
+		observed.chunks += 1
+		observed.chunk_bytes += len(report.chunk)
+		observed.bytes = report.bytes
+	}
+}
+
+@(test)
 test_transport_truncated_response_is_not_success :: proc(t: ^testing.T) {
 	fixture: Transport_Fixture
 	if !transport_fixture_start(t, &fixture, .Truncate, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
