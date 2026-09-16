@@ -339,10 +339,16 @@ budget rather than relying on finalization to replace it.
 
 ### Server configuration
 
-Server configuration is explicit user configuration in `config.lua`: a stable
-server id, a trust decision, a transport, credentials, a tool allowlist, and
-timeouts. Nothing auto-executes repository-provided MCP configuration, and a
-server that is not trusted is never started.
+Server configuration is explicit user configuration in `config.lua` under
+`mcp.servers`: a stable server id, a trust decision, an endpoint, an allowlist of
+tool aliases, and timeouts. Nothing auto-executes repository-provided MCP
+configuration, and a server that is not trusted is never started. An absent or
+false trust flag is a configuration error rather than a disabled server: a
+process either runs or does not, and the user should not have to guess which.
+
+The transport is chosen by which endpoint field is present rather than by a
+`transport` field. Only stdio exists, so an `executable` is what selects it; a
+later transport brings its own field, and setting two is the error.
 
 A stdio server is launched by executable and argv, never through a shell, in its
 own process group, with an explicit frozen environment and an absolute
@@ -351,6 +357,12 @@ a chatty server cannot block on a full pipe; stderr text is diagnostic only and
 never determines a request outcome. One request is in flight at a time, because
 the harness runs tools serially and nothing in a turn benefits from
 multiplexing.
+
+The runtime is one client slot and one binding slot per configured server and
+alias, sized once and never grown. A definition borrows the address of a binding,
+so growing that array later would leave every registry entry pointing at freed
+memory. That is also the order teardown follows: the session and its registry go
+first, the clients second.
 
 ### Refresh
 
