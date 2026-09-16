@@ -17,6 +17,7 @@ import "nabla:agent/session"
 // every core:log call and structured record below that scope reaches this sink.
 
 LOG_LEVEL_VARIABLE :: "NABLA_LOG_LEVEL"
+LOG_CAPTURE_VARIABLE :: "NABLA_LOG_CAPTURE"
 
 // run_log_open resolves the launch's diagnostic policy, opens the writer, and
 // returns the logger the caller installs. It deliberately does not install it: a
@@ -28,6 +29,11 @@ LOG_LEVEL_VARIABLE :: "NABLA_LOG_LEVEL"
 run_log_open :: proc(setup: ^Run_Setup) -> log.Logger {
 	options := run_log_options()
 	if !options.enabled { return context.logger }
+	if options.capture == .Payloads {
+		// Capture is consent to store bytes that can contain secrets. It is stated
+		// once, locally, rather than described as safe.
+		fmt.eprintln("nabla: warning: payload capture is on; stored request and response bodies can contain secrets")
+	}
 
 	directory, directory_err := agent.log_default_directory(setup.alloc)
 	if directory_err != nil {
@@ -136,6 +142,7 @@ run_log_options :: proc() -> agent.Log_Options {
 	options := agent.Log_Options {
 		enabled = true,
 		lowest  = .Info,
+		capture = run_log_capture_mode(),
 	}
 	text, found := os.lookup_env(LOG_LEVEL_VARIABLE, context.temp_allocator)
 	if !found { return options }
@@ -148,4 +155,19 @@ run_log_options :: proc() -> agent.Log_Options {
 	options.enabled = enabled
 	options.lowest = level
 	return options
+}
+
+// run_log_capture_mode reads the payload permission. An unusable value is
+// reported once and falls back to off, so a typo can never enable capture.
+run_log_capture_mode :: proc() -> agent.Capture_Mode {
+	text, found := os.lookup_env(LOG_CAPTURE_VARIABLE, context.temp_allocator)
+	if !found { return .Off }
+	switch text {
+	case "off":
+		return .Off
+	case "payloads":
+		return .Payloads
+	}
+	fmt.eprintf("nabla: %s is not a capture mode, using off: %s\n", LOG_CAPTURE_VARIABLE, text)
+	return .Off
 }

@@ -95,6 +95,37 @@ log_enabled :: proc(level: log.Level) -> bool {
 	return logger.procedure == log_procedure && level >= logger.lowest_level
 }
 
+// log_active_sink returns the sink the installed logger writes to, or nil when no
+// Nabla logger is installed. It is for a producer that needs the writer itself,
+// such as payload capture, which holds quota and file state rather than emitting a
+// record.
+log_active_sink :: proc() -> ^Log {
+	logger := context.logger
+	if logger.procedure != log_procedure { return nil }
+	binding := cast(^Log_Binding)logger.data
+	if binding == nil { return nil }
+	return binding.sink
+}
+
+// log_active_correlation returns the correlation the installed logger carries, or
+// a zero value when there is none.
+log_active_correlation :: proc() -> Log_Correlation {
+	logger := context.logger
+	if logger.procedure != log_procedure { return {} }
+	binding := cast(^Log_Binding)logger.data
+	if binding == nil { return {} }
+	return binding.correlation
+}
+
+// log_observation_wanted reports whether a provider observation is worth
+// attaching: either a record could be written from it, or payload capture is on
+// and would store the bytes. A run with neither pays nothing per chunk.
+log_observation_wanted :: proc() -> bool {
+	if log_enabled(.Info) { return true }
+	sink := log_active_sink()
+	return sink != nil && sink.capture_mode == .Payloads
+}
+
 // log_correlation is the correlation work on chat currently carries. Whatever the
 // session has reached is carried; a field the session has not set is left absent
 // rather than guessed, and a retired operation contributes no identity because no

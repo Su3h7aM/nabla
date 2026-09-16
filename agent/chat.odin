@@ -249,13 +249,18 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 
 		// The observation belongs to this attempt: a retry that receives no chunk
 		// must not inherit the previous attempt's byte count. It is only attached
-		// when a record could be written from it, so a run with diagnostics off
-		// pays nothing per chunk.
+		// when something will come of it, so a run with diagnostics off and capture
+		// off pays nothing per chunk.
 		provider_log: Provider_Log
-		if log_enabled(.Info) { options.observer = provider_log_observer(&provider_log) } else { options.observer = {} }
+		if log_observation_wanted() { options.observer = provider_log_observer(&provider_log) } else { options.observer = {} }
 
 		at := time.tick_now()
 		operation_error = ai.Provider_Request_Operation_Controlled(connection, prep.request, &runtime, chat_provider_event, options, chat.allocator)
+		// The response artifact covers the whole attempt, so it is settled as soon as
+		// the bytes stop arriving. A cut-short stream is kept and marked incomplete.
+		if provider_log.response_capture.kind != .Invalid {
+			log_capture_finish(&provider_log.response_capture, operation_error.kind == .None)
+		}
 		finished := [6]Log_Field {
 			{key = "error_kind", value = log_operation_error_name(operation_error.kind)},
 			{key = "finish_reason", value = chat_finish_reason_text(runtime.finish_reason)},

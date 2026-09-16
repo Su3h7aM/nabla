@@ -95,10 +95,15 @@ Log_Category :: enum {
 // Log_Options is one run's diagnostic policy. A zero value opens nothing, which
 // is what a disabled run keeps. Severity is Odin's own logger level, and
 // enablement is a separate fact so "off" is not one of the severities.
+//
+// capture is a permission of its own rather than a consequence of the threshold:
+// storing payload bytes is a different decision from recording metadata, and it
+// never overrides a disabled log.
 Log_Options :: struct {
 	directory: string,
 	enabled:   bool,
 	lowest:    log.Level,
+	capture:   Capture_Mode,
 }
 
 // Log_Value is the closed set of scalar types a field may carry. It grows when a
@@ -223,6 +228,9 @@ Log_Health :: struct {
 	// means the global targets were not evaluated over every run.
 	retention_failed:     u64,
 	retention_limited:    bool,
+	// capture_denied counts artifacts declined because the run's capture quota was
+	// already spent.
+	capture_denied:       u64,
 }
 
 // Log_Cleanup_Summary is what one retention pass did. It is returned from
@@ -258,6 +266,14 @@ Log :: struct {
 	run_id:                string,
 	open:                  bool,
 	lowest:                log.Level,
+	// capture_mode is the run's payload permission; the counters below are the
+	// quota it admits against, reserved under mutex and released as artifacts
+	// settle, so a capture can never exceed what it reserved.
+	capture_mode:          Capture_Mode,
+	capture_sequence:      u64,
+	capture_count:         int,
+	capture_bytes:         i64,
+	capture_denied:        u64,
 	file:                  ^os.File,
 	// lease is held for the writer's whole life; it is what tells a later cleanup
 	// that this run is not its to remove.
@@ -332,6 +348,7 @@ log_open :: proc(log: ^Log, options: Log_Options, allocator := context.allocator
 
 	log.allocator = allocator
 	log.lowest = options.lowest
+	log.capture_mode = options.capture
 	log.segment_bytes = LOG_SEGMENT_BYTES
 	if claim_err := log_run_directory_claim(log, runs_directory); claim_err != nil { return {}, claim_err }
 
@@ -433,7 +450,9 @@ log_health :: proc(log: ^Log) -> Log_Health {
 	if log == nil { return {} }
 	sync.mutex_lock(&log.mutex)
 	defer sync.mutex_unlock(&log.mutex)
-	return log.health
+	health := log.health
+	health.capture_denied = log.capture_denied
+	return health
 }
 
 // log_emit writes one typed record against the correlation of the active Nabla
