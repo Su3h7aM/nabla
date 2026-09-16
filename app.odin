@@ -245,7 +245,7 @@ Session_Target :: struct {
 
 run_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
-	session.session_release(&setup.store)
+	_ = run_session_release(setup)
 	session.store_close(&setup.store)
 	// The log outlives the session and the store deliberately: the record of the
 	// launch ending is the last thing it can write. A close failure is reported

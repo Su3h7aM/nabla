@@ -99,6 +99,36 @@ run_log_failure :: proc(setup: ^Run_Setup, reported: ^bool) {
 	fmt.eprintln("nabla: warning: diagnostic logging stopped; the log file is incomplete")
 }
 
+// log_session_claimed records that this process took a session for writing. Every
+// adoption path calls it, so a launch and an in-session switch report the same
+// fact rather than only the launch path doing so. The recovery summary is recorded
+// only when an earlier run actually left work to settle.
+log_session_claimed :: proc(id: session.Session_Id, resumed: bool, recovery: session.Recovery) {
+	if id == "" { return }
+	binding: agent.Log_Binding
+	context.logger = agent.log_rebind(&binding, agent.Log_Correlation{session_id = id})
+	claimed := [1]agent.Log_Field{{key = "resumed", value = resumed}}
+	agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.claimed", fields = claimed[:]})
+	if recovery.interrupted_turns > 0 || recovery.interrupted_requests > 0 || recovery.recovered_calls > 0 || recovery.unexecuted_calls > 0 {
+		fields := [4]agent.Log_Field {
+			{key = "interrupted_turns", value = i64(recovery.interrupted_turns)},
+			{key = "interrupted_requests", value = i64(recovery.interrupted_requests)},
+			{key = "recovered_calls", value = i64(recovery.recovered_calls)},
+			{key = "unexecuted_calls", value = i64(recovery.unexecuted_calls)},
+		}
+		agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.recovered", fields = fields[:]})
+	}
+}
+
+// log_session_released records that this process gave a session up. It runs only
+// after the claim is gone, so the record never claims more than happened.
+log_session_released :: proc(id: session.Session_Id) {
+	if id == "" { return }
+	binding: agent.Log_Binding
+	context.logger = agent.log_rebind(&binding, agent.Log_Correlation{session_id = id})
+	agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.released"})
+}
+
 // run_log_options reads the launch's diagnostic policy. An unusable value is
 // reported once and the default is used, so a typo cannot silently choose a level
 // the user did not ask for.

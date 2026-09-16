@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sys/posix"
+import "core:time"
 
 import "nabla:agent/session"
 import "nabla:ai"
@@ -79,23 +80,43 @@ chat_compact :: proc(
 	usages: ^[dynamic]Chat_Request_Usage,
 ) -> bool {
 	_ = usages
+	// Compaction is its own logical request: it runs inside a turn when admission
+	// demands it and outside one when the user asks for it, and the correlation says
+	// which by carrying or omitting the turn.
+	binding: Log_Binding
+	context.logger = log_rebind(&binding, log_correlation(chat))
+	started := time.tick_now()
+	covered := session.Seq(0)
+	result := "failed"
+	defer {
+		finished := [4]Log_Field {
+			{key = "outcome", value = result},
+			{key = "covered_seq", value = i64(covered)},
+			{key = "context_window", value = i64(chat.context_window)},
+			{key = "elapsed_ms", value = log_duration_ms(time.tick_since(started))},
+		}
+		log_emit({level = .Info, category = .Provider, event = "compaction.finished", fields = finished[:]})
+	}
 	if chat.context_window <= 0 {
+		result = "unconfigured"
 		_observer_message(observer, .Error, "compaction needs context_window: add context_window to the model in config.lua")
 		return false
 	}
 	entries := prep.history.entries
 	seam := chat_compact_seam(entries, CHAT_COMPACT_KEEP_MESSAGES)
 	if seam <= 0 {
+		result = "nothing_to_compact"
 		_observer_message(observer, .Notice, "nothing to compact")
 		return false
 	}
 	// The summary covers everything before the seam and the tail stays verbatim.
-	covered := entries[seam - 1].seq
+	covered = entries[seam - 1].seq
 
 	compact_prep: Chat_Request_Prep
 	chat_build_request_into(chat, &compact_prep, entries[:seam], prep.history.dispatches, prep.history.summary, connection, true)
 	defer chat_request_prep_destroy(&compact_prep, chat.allocator)
 	if compact_prep.estimate + CHAT_COMPACT_MAX_OUTPUT + CHAT_ADMISSION_MARGIN_TOKENS > chat.context_window {
+		result = "too_large"
 		_observer_message(observer, .Error, "active context is too large to compact in one request; start a fresh session for a new topic")
 		return false
 	}
@@ -119,6 +140,13 @@ chat_compact :: proc(
 		chat_session_record_failure(chat, "the compaction request could not be recorded", begin_err)
 		return false
 	}
+	binding.correlation = log_correlation(chat)
+	start_fields := [3]Log_Field {
+		{key = "estimate", value = i64(compact_prep.estimate)},
+		{key = "context_window", value = i64(chat.context_window)},
+		{key = "covered_seq", value = i64(covered)},
+	}
+	log_emit({level = .Info, category = .Provider, event = "compaction.started", fields = start_fields[:]})
 
 	_observer_message(observer, .Notice, fmt.tprintf("compacting %d entries, keeping %d", seam, len(entries) - seam))
 	outcome := Compact_Outcome {
@@ -140,26 +168,31 @@ chat_compact :: proc(
 	defer delete(operation_error.detail, chat.allocator)
 
 	if chat_session_cancelled(chat) {
+		result = "cancelled"
 		chat_finish_compaction(chat, request_no, .Cancelled, outcome.usage, "cancelled")
 		return false
 	}
 	if operation_error.kind != .None {
+		result = "transport_failed"
 		_observer_message(observer, .Error, fmt.tprintf("compaction failed: %s", operation_error.detail))
 		chat_finish_compaction(chat, request_no, .Failed, outcome.usage, operation_error.detail)
 		return false
 	}
 	if outcome.failed {
+		result = "failed"
 		_observer_message(observer, .Error, fmt.tprintf("compaction failed: %s", outcome.error_text))
 		chat_finish_compaction(chat, request_no, .Failed, outcome.usage, outcome.error_text)
 		return false
 	}
 	if outcome.reason != .Stop || outcome.calls > 0 {
+		result = "no_summary"
 		_observer_message(observer, .Error, "compaction produced no usable summary")
 		chat_finish_compaction(chat, request_no, .Failed, outcome.usage, "no usable summary")
 		return false
 	}
 	summary_text := strings.trim_space(string(outcome.text[:]))
 	if summary_text == "" {
+		result = "no_summary"
 		_observer_message(observer, .Error, "compaction produced no usable summary")
 		chat_finish_compaction(chat, request_no, .Failed, outcome.usage, "no usable summary")
 		return false
@@ -182,6 +215,7 @@ chat_compact :: proc(
 		chat_session_record_failure(chat, "the compaction outcome could not be recorded", finish_err)
 		return false
 	}
+	result = "committed"
 
 	// Rebuild from the new checkpoint so the caller re-admits against it.
 	return chat_rebuild_prep(chat, connection, prep)

@@ -219,23 +219,8 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 	}
 
 	// The session and what an earlier run left unfinished are one record each, so a
-	// launch that found work to settle says which work it found. The binding is
-	// narrowed to the claimed session here rather than carried from the run scope.
-	claimed_binding: agent.Log_Binding
-	context.logger = agent.log_rebind(&claimed_binding, agent.Log_Correlation{session_id = claimed})
-	claimed_fields := [1]agent.Log_Field{{key = "resumed", value = start.kind != .New}}
-	agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.claimed", fields = claimed_fields[:]})
-	recovery := adoption.recovery
-	if recovery.interrupted_turns > 0 || recovery.interrupted_requests > 0 || recovery.recovered_calls > 0 || recovery.unexecuted_calls > 0 {
-		recovery_fields := [4]agent.Log_Field {
-			{key = "interrupted_turns", value = i64(recovery.interrupted_turns)},
-			{key = "interrupted_requests", value = i64(recovery.interrupted_requests)},
-			{key = "recovered_calls", value = i64(recovery.recovered_calls)},
-			{key = "unexecuted_calls", value = i64(recovery.unexecuted_calls)},
-		}
-		agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.recovered", fields = recovery_fields[:]})
-	}
-
+	// launch that found work to settle says which work it found. Both are emitted by
+	// the adoption path this launch shares with an in-session switch.
 	setup.workspace = strings.clone(adoption.header.workspace, setup.alloc)
 	setup.resumed_provider = strings.clone(adoption.header.provider, setup.alloc)
 	setup.resumed_model = strings.clone(adoption.header.model, setup.alloc)
@@ -329,6 +314,31 @@ session_adopt_target :: proc(setup: ^Run_Setup, kind: Session_Start_Kind, target
 	return session_adopt(setup, target.id)
 }
 
+// release_displaced gives up the session a switch replaced and records it. The id
+// is copied before the release frees the claim's own copy, so the record still
+// names the session that was given up.
+release_displaced :: proc(displaced: ^session.Claim, allocator: mem.Allocator) {
+	if !displaced.held { return }
+	id := session.Session_Id("")
+	if displaced.session != "" { id = session.Session_Id(strings.clone(string(displaced.session), allocator)) }
+	defer delete(string(id), allocator)
+	_ = session.claim_release(displaced)
+	log_session_released(id)
+}
+
+// run_session_release records the running session and gives it up. It is the
+// teardown counterpart of session_adopt, which records a switch's release.
+run_session_release :: proc(setup: ^Run_Setup) -> session.Error {
+	claimed, held := session.session_claimed(&setup.store)
+	if !held { return nil }
+	id := session.Session_Id("")
+	if claimed != "" { id = session.Session_Id(strings.clone(string(claimed), setup.alloc)) }
+	defer delete(string(id), setup.alloc)
+	release_err := session.session_release(&setup.store)
+	log_session_released(id)
+	return release_err
+}
+
 // session_adopt_new makes a fresh session the claimed one. A new session has no
 // row yet: there is no header to read and nothing an earlier run left to settle,
 // so the claim is taken directly and the header is the id and the directory the
@@ -345,11 +355,12 @@ session_adopt_new :: proc(setup: ^Run_Setup, target: Session_Target) -> (adopted
 	// The session that was running is given up only now, with the new claim settled.
 	// A release that reports an error has still closed the descriptor, which is what
 	// actually frees the lock.
-	_ = session.claim_release(&displaced)
+	release_displaced(&displaced, setup.alloc)
 	adopted.header = session.Session {
 		id        = session.Session_Id(strings.clone(string(target.id), setup.alloc)),
 		workspace = strings.clone(target.workspace, setup.alloc),
 	}
+	log_session_claimed(target.id, false, {})
 	return adopted, "", true
 }
 
@@ -396,7 +407,8 @@ session_adopt :: proc(setup: ^Run_Setup, id: session.Session_Id) -> (adopted: Ad
 	// The candidate is settled, so the session that was running can be given up. A
 	// release that reports an error has still closed the descriptor, which is what
 	// actually frees the lock, so there is nothing left for the caller to do.
-	_ = session.claim_release(&displaced)
+	release_displaced(&displaced, setup.alloc)
+	log_session_claimed(id, true, recovery)
 	return Adoption{header = header, recovery = recovery}, "", true
 }
 

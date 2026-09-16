@@ -1070,3 +1070,69 @@ test_refresh_without_servers_is_silent :: proc(t: ^testing.T) {
 	_, present := agent.tool_registry_find(&app.setup.session.tools, agent.TOOL_READ_NAME)
 	testing.expect(t, present, "the session keeps the native tools it started with")
 }
+
+// Session_Log_Text collects the records one session left, read back through the
+// public reader, so the lifecycle assertions below hold the reader to what the
+// writer produced rather than to a file layout the test also chose.
+Session_Log_Text :: struct {
+	builder: strings.Builder,
+}
+
+session_log_visit :: proc(user_data: rawptr, _: string, line: string) -> bool {
+	text := cast(^Session_Log_Text)user_data
+	strings.write_string(&text.builder, line)
+	strings.write_byte(&text.builder, '\n')
+	return true
+}
+
+app_session_log_text :: proc(t: ^testing.T, logs_root: string, id: session.Session_Id) -> strings.Builder {
+	collector := Session_Log_Text {
+		builder = strings.builder_make(context.allocator),
+	}
+	summary := agent.log_read_session(logs_root, id, &collector, session_log_visit)
+	testing.expectf(t, summary.cannot_read == 0, "the log should be readable")
+	testing.expectf(t, summary.records_skipped == 0, "every line the reader saw should parse")
+	return collector.builder
+}
+
+@(test)
+test_a_switch_records_the_claim_and_the_release :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	// The launch's logger is installed in the test's own scope, which is what the
+	// adoption path records against.
+	logs_root, root_err := os.make_directory_temp("", "nabla-app-log-*", context.allocator)
+	defer {
+		os.remove_all(logs_root)
+		delete(logs_root, context.allocator)
+	}
+	_, open_err := agent.log_open(&app.setup.log, {directory = logs_root, enabled = true, lowest = .Info}, app.setup.alloc)
+	if open_err != nil { testing.fail_now(t, "the log could not be opened") }
+	defer _ = agent.log_close(&app.setup.log)
+	app.setup.log_binding = agent.Log_Binding {
+		sink = &app.setup.log,
+	}
+	context.logger = agent.log_logger(&app.setup.log_binding)
+
+	first := session.Session_Id(strings.clone(string(app.setup.session.id), context.allocator))
+	defer delete(string(first), context.allocator)
+
+	// A new session displaces the running one, so both facts belong in the record.
+	testing.expect(t, session_start_new(&app))
+	second := session.Session_Id(strings.clone(string(app.setup.session.id), context.allocator))
+	defer delete(string(second), context.allocator)
+	testing.expect(t, first != second, "a new session must be a different session")
+
+	second_builder := app_session_log_text(t, logs_root, second)
+	defer strings.builder_destroy(&second_builder)
+	second_text := strings.to_string(second_builder)
+	testing.expect(t, strings.contains(second_text, `"event":"session.claimed"`), "the new claim is recorded")
+	testing.expect(t, strings.contains(second_text, `"resumed":false`), "a fresh session is not a resume")
+
+	first_builder := app_session_log_text(t, logs_root, first)
+	defer strings.builder_destroy(&first_builder)
+	first_text := strings.to_string(first_builder)
+	testing.expect(t, strings.contains(first_text, `"event":"session.released"`), "the replaced session's release is recorded")
+}

@@ -222,3 +222,66 @@ test_a_writer_does_not_change_a_turn :: proc(t: ^testing.T) {
 	testing.expect_value(t, logged_entries, plain_entries)
 	testing.expect_value(t, logged_calls, plain_calls)
 }
+
+@(test)
+test_an_admission_decision_is_recorded :: proc(t: ^testing.T) {
+	fixture: Log_Chat_Test
+	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
+	defer log_chat_end(t, &fixture)
+	chat := &fixture.chat.chat
+
+	chat.context_window = 1_000
+	chat.max_output_tokens = 0
+	message, admitted := chat_admission_check(chat, 10)
+	testing.expect(t, admitted, "a small request fits")
+	testing.expect_value(t, message, "")
+
+	_, refused := chat_admission_check(chat, 100_000)
+	testing.expect(t, !refused, "an oversized request is refused")
+
+	text := log_chat_text(t, &fixture)
+	defer delete(text, context.allocator)
+	testing.expect(t, strings.contains(text, `"event":"request.admission"`), "the decision is recorded")
+	testing.expect(t, strings.contains(text, `"decision":"admitted"`), "the admission is named")
+	testing.expect(t, strings.contains(text, `"decision":"refused"`), "the refusal is named")
+	testing.expect(t, strings.contains(text, `"estimate":100000`), "the refusal carries what was estimated")
+}
+
+@(test)
+test_compaction_outside_a_turn_records_its_own_scope :: proc(t: ^testing.T) {
+	fixture: Log_Chat_Test
+	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
+	defer log_chat_end(t, &fixture)
+	chat := &fixture.chat.chat
+
+	// A session with no context window refuses compaction before it can build a
+	// request, which is the shortest path that still records the attempt.
+	chat.context_window = 0
+	prep: Chat_Request_Prep
+	testing.expect(t, !chat_compact(chat, {}, {}, &prep, nil))
+
+	text := log_chat_text(t, &fixture)
+	defer delete(text, context.allocator)
+	testing.expect(t, strings.contains(text, `"event":"compaction.finished"`), "the attempt is recorded")
+	testing.expect(t, strings.contains(text, `"outcome":"unconfigured"`), "the record says why it stopped")
+	// Compaction outside a turn has no durable turn to name, so the scope must not
+	// invent one.
+	testing.expect(t, !strings.contains(text, `"turn_no"`), "compaction outside a turn carries no turn")
+}
+
+@(test)
+test_a_compaction_inside_a_turn_carries_the_turn :: proc(t: ^testing.T) {
+	fixture: Log_Chat_Test
+	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
+	defer log_chat_end(t, &fixture)
+	chat := &fixture.chat.chat
+	_test_accept(t, chat, "compact me")
+	chat.context_window = 0
+	prep: Chat_Request_Prep
+	testing.expect(t, !chat_compact(chat, {}, {}, &prep, nil))
+
+	text := log_chat_text(t, &fixture)
+	defer delete(text, context.allocator)
+	testing.expect(t, strings.contains(text, `"event":"compaction.finished"`), "the attempt is recorded")
+	testing.expect(t, strings.contains(text, `"turn_no":1`), "a compaction inside a turn names the turn")
+}

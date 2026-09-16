@@ -407,12 +407,32 @@ CHAT_DEFAULT_OUTPUT_RESERVE_TOKENS :: 4096
 // margin against the configured window. The message is temp-allocated; the
 // caller clones it when the turn must record the failure.
 chat_admission_check :: proc(chat: ^Chat_Session, estimate: int) -> (message: string, admitted: bool) {
+	// The decision is recorded even when it admits the request: what the harness
+	// estimated and what it compared that against is the whole reason a request was
+	// refused later.
+	binding: Log_Binding
+	context.logger = log_rebind(&binding, log_correlation(chat))
 	if chat.context_window <= 0 {
+		fields := [3]Log_Field {
+			{key = "decision", value = "unconfigured"},
+			{key = "estimate", value = i64(estimate)},
+			{key = "context_window", value = i64(chat.context_window)},
+		}
+		log_emit({level = .Warning, category = .Provider, event = "request.admission", fields = fields[:]})
 		return "context admission needs context_window: add context_window to the model in config.lua", false
 	}
 	reserved := chat.max_output_tokens
 	if reserved <= 0 { reserved = CHAT_DEFAULT_OUTPUT_RESERVE_TOKENS }
-	if estimate + reserved + CHAT_ADMISSION_MARGIN_TOKENS <= chat.context_window {
+	fits := estimate + reserved + CHAT_ADMISSION_MARGIN_TOKENS <= chat.context_window
+	admission := [5]Log_Field {
+		{key = "decision", value = fits ? "admitted" : "refused"},
+		{key = "estimate", value = i64(estimate)},
+		{key = "context_window", value = i64(chat.context_window)},
+		{key = "reserved", value = i64(reserved)},
+		{key = "margin", value = i64(CHAT_ADMISSION_MARGIN_TOKENS)},
+	}
+	log_emit({level = .Info, category = .Provider, event = "request.admission", fields = admission[:]})
+	if fits {
 		return "", true
 	}
 	return fmt.tprintf(
