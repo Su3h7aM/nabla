@@ -1,6 +1,6 @@
 # Harness logging and diagnostics architecture
 
-Status: implementation plan, not implemented.
+Status: phase 1 (the writer in `agent`) implemented; phases 2 to 6 are planned.
 
 This plan is based on the complete *Nabla Logging Reference Study: goose + opencode*,
 including its appendices, at
@@ -236,28 +236,27 @@ Category :: enum {
 
 // Value is the closed set of types a field may carry. A nested object, a raw JSON
 // fragment, or a blob is not a field: it belongs in a capture or nowhere.
-Value :: union {
+Log_Value :: union {
 	bool,
 	i64,
 	u64,
-	f64,
 	string,
-	Level,
-	Category,
 }
 
-Field :: struct {
+// Log_Field is one named scalar. The key is a producer-owned literal, and the
+// value is borrowed for the duration of the emit call.
+Log_Field :: struct {
 	key:   string,
-	value: Value,
+	value: Log_Value,
 }
 
-// Record is one event. event is a producer-owned literal. Fields are borrowed for
-// the duration of the emit call and never retained.
-Record :: struct {
-	level:    Level,
-	category: Category,
+// Log_Record is one event. Fields are borrowed for the duration of the emit call
+// and never retained.
+Log_Record :: struct {
+	level:    Log_Level,
+	category: Log_Category,
 	event:    string,
-	fields:   []Field,
+	fields:   []Log_Field,
 }
 
 // Log_Context is the correlation a record is emitted against. Every identity in
@@ -272,30 +271,33 @@ Log_Context :: struct {
 	operation_id: u64,
 }
 
-Emit_Result :: enum {
+// Log_Emit_Result says what became of one record. Disabled is the zero value:
+// a zero scope writes nothing.
+Log_Emit_Result :: enum {
 	Disabled,
 	Filtered,
-	Written,
 	Oversized,
+	Rejected,
+	Written,
 	Failed,
 }
 
-log_emit :: proc(context: Log_Context, record: Record) -> Emit_Result
+log_emit :: proc(scope: Log_Context, record: Log_Record) -> Log_Emit_Result
 ```
 
-`Emit_Result` exists so a call site that needs to know can check, while the common case
-ignores it. `log_emit` never panics and never emits a record about its own failure; it
-updates `Health` instead. A `Log_Context` whose `log` is nil, or whose `Log` was never
+`Log_Emit_Result` exists so a call site that needs to know can check, while the common
+case ignores it. `log_emit` never panics and never emits a record about its own failure; it
+updates `Log_Health` instead. A `Log_Context` whose `log` is nil, or whose `Log` was never
 opened, emits nothing and returns `.Disabled`, so a call site needs no enabled check and
 the harness behaves identically with diagnostics off.
 
-`log_emit` consumes every borrowed value synchronously. It never stores a `Record`, a
+`log_emit` consumes every borrowed value synchronously. It never stores a `Log_Record`, a
 `Log_Context`, a field slice, or a field string. Field names and event names are literals
 owned by the producing module. Strings are length plus bytes, not C strings. JSON escaping
 handles NUL, quotes, backslashes, control characters, and invalid UTF-8 through one
 explicit replacement policy. Binary data goes to a capture, never into a string field.
-Duplicate keys are rejected, including keys that collide with the reserved envelope.
-Non-finite floats are rejected rather than encoded as invalid JSON.
+A field key that repeats another key, or that collides with a reserved envelope name, is
+rejected. `Log_Value` grows when a producer needs a type it does not have.
 
 Domain values keep their types until the last conversion: the writer never reinterprets an
 integer as a session sequence, and a helper that builds fields takes
@@ -304,11 +306,14 @@ format string derived from remote content.
 
 ### 5.2 Owned state
 
+Phase 1 implements `Log_Options`, `Log`, and `Log_Health`. The capture types below arrive
+with phase 4, and the run lease fields with phase 2.
+
 | Type | Stored data | Owner and release |
 |---|---|---|
-| `Log_Options` | level, capture mode, named limits | copied into `Log` at open; immutable afterwards |
-| `Log` | allocator, owned run directory, run ID, `open` flag, run lease fd, current segment fd, segment number and byte count, sequence, capture counters, `sync.Mutex`, fixed record scratch, `Health`, monotonic start tick, last cleanup time | declared by root, opened once, lives at one stable address, released by `log_close` after all borrowers retire |
-| `Health` | failed flag, first error, written/filtered/omitted counts, write, capture-denied, and capture failures | inside `Log`; read through `log_health` under the mutex |
+| `Log_Options` | directory, level | copied into `Log` at open; immutable afterwards |
+| `Log` | allocator, owned run directory, run ID, `open` flag, current segment file, segment number and byte count, rollover bound, sequence, `sync.Mutex`, fixed record scratch, `Log_Health`, monotonic start tick and start time | declared by root, opened once, lives at one stable address, released by `log_close` after all borrowers retire |
+| `Log_Health` | failed flag, first error kind and platform error, written and omitted counts | inside `Log`; read through `log_health` under the mutex |
 | `Capture` | borrowed `Log`, kind, open fd, storage allowance, observed and stored byte counts, observed and stored SHA-256 contexts, truncated and failed flags, generated basename, owned correlation copy | owned by one operation; `log_capture_finish` or `log_capture_abort` closes it exactly once |
 | `Capture_Summary` | identity, counts, digests, completeness and truncation facts | value result with fixed-size ids and digests, no borrowed capture state |
 
@@ -892,17 +897,19 @@ Each phase is one scoped change. Unrelated tool or request-shape fixes do not ri
 
 ### Phase 1: the writer in `agent`
 
-`agent/log.odin` with `Log`, `Log_Options`, `Level`, `Category`, `Record`, `Log_Context`,
-zero-safe open and close, run identity, synchronous escaped JSONL, sequence, health, and
-size rollover. Use `core:crypto/sha2` for digests. Check whether `core:encoding/json` can
-meet the bounded scratch contract; if it cannot, write the flat scalar encoder directly, but
-never build a general JSON object tree for one record.
+`agent/log.odin` with `Log`, `Log_Options`, `Log_Level`, `Log_Category`, `Log_Value`,
+`Log_Field`, `Log_Record`, `Log_Context`, `Log_Health`, `Log_Error`, zero-safe open and
+close, run identity, synchronous escaped JSONL, sequence, health, and size rollover. The
+flat scalar encoder is written directly rather than through `core:encoding/json`, which
+allocates an object tree for a record that must be encoded into a fixed buffer with no
+allocation at all.
 
-Tests: NUL, quote, backslash, control, and invalid UTF-8 escaping; duplicate keys rejected;
-maximum escaping expansion still bounded; a zero `Log_Context` emits nothing; sequence is
-monotonic under concurrent producers; a short write and an injected write failure disable
-the sink exactly once; an oversized record produces the omission record; rollover; reading
-back a truncated final line. Run `mise run test agent` and `mise run check`.
+Tests: quote, backslash, control byte, and invalid UTF-8 escaping; a record that repeats a
+key or shadows an envelope key is rejected; a zero `Log_Context` emits nothing; the
+sequence increases with every record; an injected write failure disables the sink exactly
+once; an oversized record becomes the omission record; rollover keeps the configured
+window; the run directory and its segments are owner-only. Run `mise run test agent` and
+`mise run check`.
 
 ### Phase 2: root lifecycle and retention in `agent`
 
