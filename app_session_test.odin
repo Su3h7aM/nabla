@@ -971,3 +971,59 @@ ANTHROPIC_COMPLETION_RESPONSE ::
 	"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
 	"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" +
 	"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
+// --- tool refresh -------------------------------------------------------------
+
+// A server that cannot be started contributes no tools and is reported once, and the
+// native tools are still installed. That is what keeps a broken server from costing
+// the user the tools that have nothing to do with it.
+@(test)
+test_refresh_degrades_to_native_tools_when_a_server_is_unusable :: proc(t: ^testing.T) {
+	app := new(App)
+	defer free(app)
+	directory := app_session_begin(t, app)
+
+	servers := make([]agent.MCP_Server_Config, 1, context.allocator)
+	servers[0] = agent.MCP_Server_Config {
+		id = strings.clone("broken", context.allocator),
+		stdio = {executable = strings.clone("/nonexistent/nabla-no-such-server", context.allocator)},
+		tools = make([]agent.MCP_Tool_Alias, 1, context.allocator),
+		discovery_timeout = time.Second,
+		call_timeout = time.Second,
+	}
+	servers[0].tools[0] = {strings.clone("broken_read", context.allocator), strings.clone("read.file", context.allocator)}
+	app.setup.mcp_servers = servers
+	app.setup.mcp = mcp_runtime_make(servers, context.allocator)
+	// The registry borrows the runtime's bindings, so the session goes first and the
+	// clients second. The directory belongs to app_session_end.
+	defer {
+		app_session_end(app, directory)
+		mcp_runtime_destroy(&app.setup.mcp)
+		agent.mcp_server_config_destroy(&servers[0], context.allocator)
+		delete(servers, context.allocator)
+	}
+
+	warning := app_tools_refresh(app)
+	testing.expect(t, strings.contains(warning, "broken"), "the unusable server is named")
+	testing.expect(t, strings.contains(warning, "could not be started"), "the reason is given")
+
+	// The registry was replaced anyway, with the native tools and nothing from the
+	// server that failed.
+	_, native_present := agent.tool_registry_find(&app.setup.session.tools, agent.TOOL_SHELL_NAME)
+	testing.expect(t, native_present, "the native tools survive a broken server")
+	_, remote_present := agent.tool_registry_find(&app.setup.session.tools, "broken_read")
+	testing.expect(t, !remote_present, "an unreachable server contributes no tools")
+}
+
+// With nothing configured, refresh has nothing to do and says nothing.
+@(test)
+test_refresh_without_servers_is_silent :: proc(t: ^testing.T) {
+	app := new(App)
+	defer free(app)
+	directory := app_session_begin(t, app)
+	defer app_session_end(app, directory)
+
+	testing.expect_value(t, app_tools_refresh(app), "")
+	_, present := agent.tool_registry_find(&app.setup.session.tools, agent.TOOL_READ_NAME)
+	testing.expect(t, present, "the session keeps the native tools it started with")
+}

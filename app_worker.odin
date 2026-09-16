@@ -96,6 +96,9 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			snap_append(app, .Error, "no session is open; use /new or /resume")
 			return
 		}
+		// Tools are refreshed between turns, while the session is idle. Both prompt
+		// paths refresh, so an interactive turn and a headless one see the same tools.
+		if warning := app_tools_refresh(app); warning != "" { snap_append(app, .Warning, warning) }
 		accepted := agent.chat_session_accept_user(&app.setup.session, work.text, session.now_ms())
 		if accepted != .Accepted {
 			if accepted == .Storage_Failed {

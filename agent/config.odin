@@ -69,9 +69,19 @@ lua_int :: proc(L: ^l.State, idx: c.int) -> (int, bool) {
 	return int(n), true
 }
 
+// lua_field pushes the named field, or nil when the value at idx is not a table.
+// Indexing a non-table would raise a Lua error, which longjmps out of the Odin frame
+// that called it; reading a missing field is the same condition without the hazard.
 lua_field :: proc(L: ^l.State, idx: c.int, name: string) -> c.int {
+	if l.type(L, idx) != .TABLE {
+		l.pushnil(L)
+		return 0
+	}
 	name_c, name_err := strings.clone_to_cstring(name, context.temp_allocator)
-	if name_err != nil { return 0 }
+	if name_err != nil {
+		l.pushnil(L)
+		return 0
+	}
 	defer delete(name_c, context.temp_allocator)
 	return l.getfield(L, idx, name_c)
 }
@@ -305,32 +315,43 @@ load_harness_options :: proc(L: ^l.State, idx: c.int) -> (Harness_Options, Confi
 	return options, .None
 }
 
-load_lua_config_full :: proc(path: string, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Harness_Options, Config_Error) {
-	if path == "" { return {}, {}, .None }
+load_lua_config_full :: proc(
+	path: string,
+	allocator := context.allocator,
+) -> (
+	[dynamic]Catalog_Provider_Source,
+	Harness_Options,
+	[dynamic]MCP_Server_Config,
+	Config_Error,
+) {
+	if path == "" { return {}, {}, {}, .None }
 	// A missing file is a valid setup: no providers, default options. Only a
 	// file that exists but cannot be read is an error.
 	if info, stat_err := os.stat(path, context.temp_allocator); stat_err != nil {
-		if stat_err == os.General_Error.Not_Exist { return {}, {}, .Missing }
-		return {}, {}, .Read
+		if stat_err == os.General_Error.Not_Exist { return {}, {}, {}, .Missing }
+		return {}, {}, {}, .Read
 	} else if info.type != .Regular {
-		return {}, {}, .Read
+		return {}, {}, {}, .Read
 	}
 	data, read_err := os.read_entire_file(path, context.temp_allocator)
-	if read_err != nil { return {}, {}, .Read }
-	if len(data) > CONFIG_MAX_BYTES { return {}, {}, .Invalid }
-	L := l.L_newstate(); if L == nil { return {}, {}, .Lua }; defer l.close(L)
+	if read_err != nil { return {}, {}, {}, .Read }
+	if len(data) > CONFIG_MAX_BYTES { return {}, {}, {}, .Invalid }
+	L := l.L_newstate(); if L == nil { return {}, {}, {}, .Lua }; defer l.close(L)
 	l.sethook(L, lua_limit_hook, l.MASKCOUNT, CONFIG_INSTRUCTIONS)
-	if l.L_loadbuffer(L, raw_data(data), c.size_t(len(data)), "@svan-config", "t") != .OK { return {}, {}, .Lua }
-	if l.pcall(L, 0, 1, 0) != 0 { return {}, {}, .Lua }
-	if !lua_plain_table(L, -1) { return {}, {}, .Root }
+	if l.L_loadbuffer(L, raw_data(data), c.size_t(len(data)), "@svan-config", "t") != .OK { return {}, {}, {}, .Lua }
+	if l.pcall(L, 0, 1, 0) != 0 { return {}, {}, {}, .Lua }
+	if !lua_plain_table(L, -1) { return {}, {}, {}, .Root }
 	base := l.gettop(L)
 	lua_field(L, -1, "instructions")
 	options, options_err := load_harness_options(L, -1)
-	if options_err != .None { return {}, {}, options_err }
+	if options_err != .None { return {}, {}, {}, options_err }
 	l.settop(L, base)
 	lua_field(L, -1, "providers")
-	if l.type(L, -1) == .NIL { return {}, options, .None }
-	if !lua_plain_table(L, -1) { return {}, {}, .Invalid }
+	if l.type(L, -1) == .NIL {
+		l.settop(L, base)
+		return {}, options, load_mcp_servers_from(L, -1, allocator)
+	}
+	if !lua_plain_table(L, -1) { return {}, {}, {}, .Invalid }
 	result: [dynamic]Catalog_Provider_Source
 	result.allocator = allocator
 	count := 0
@@ -341,12 +362,12 @@ load_lua_config_full :: proc(path: string, allocator := context.allocator) -> ([
 		count += 1
 		if count > CONFIG_MAX_ENTRIES || l.type(L, -2) != .STRING {
 			catalog_sources_destroy(&result, allocator)
-			return {}, {}, .Invalid
+			return {}, {}, {}, .Invalid
 		}
 		provider_id, ok := lua_string(L, -2, allocator)
 		if !ok {
 			catalog_sources_destroy(&result, allocator)
-			return {}, {}, .Invalid
+			return {}, {}, {}, .Invalid
 		}
 		provider: Catalog_Provider_Source
 		err := load_provider(L, -1, provider_id, allocator, &provider)
@@ -354,13 +375,34 @@ load_lua_config_full :: proc(path: string, allocator := context.allocator) -> ([
 		if err != .None {
 			catalog_provider_source_destroy(&provider, allocator)
 			catalog_sources_destroy(&result, allocator)
-			return {}, {}, err
+			return {}, {}, {}, err
 		}
 		append(&result, provider)
 		l.settop(L, providers_idx + 1)
 	}
 	l.settop(L, base)
-	return result, options, .None
+	servers, servers_err := load_mcp_servers_from(L, -1, allocator)
+	if servers_err != .None {
+		catalog_sources_destroy(&result, allocator)
+		return {}, {}, {}, servers_err
+	}
+	l.settop(L, base)
+	return result, options, servers, .None
+}
+
+// load_mcp_servers_from reads the `mcp` table, which holds the `servers` table. The
+// state is reset by the caller.
+@(private)
+load_mcp_servers_from :: proc(L: ^l.State, root_idx: c.int, allocator: mem.Allocator) -> ([dynamic]MCP_Server_Config, Config_Error) {
+	base := l.gettop(L)
+	defer l.settop(L, base)
+	lua_field(L, root_idx, "mcp")
+	if l.type(L, -1) == .NIL { return {}, .None }
+	if !lua_plain_table(L, -1) { return {}, .Invalid }
+	mcp_idx := l.absindex(L, -1)
+	lua_field(L, mcp_idx, "servers")
+	if l.type(L, -1) == .NIL { return {}, .None }
+	return mcp_servers_load(L, -1, allocator)
 }
 
 load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Config_Error) {

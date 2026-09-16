@@ -104,9 +104,13 @@ tool_mcp_control :: proc(ctx: ^Tool_Context) -> mcp.Control {
 		user_data   = ctx.control.interrupt,
 		interrupted = tool_mcp_interrupted,
 	}
+	// An adapted tool exposes no timeout argument, so there is nothing for the model
+	// to request and nothing to clamp: the default is the bound, with the maximum as
+	// a ceiling in case the configuration states them the wrong way round.
+	timeout := ctx.timeouts.default
+	if ctx.timeouts.maximum > 0 && (timeout <= 0 || ctx.timeouts.maximum < timeout) { timeout = ctx.timeouts.maximum }
 	deadline := ctx.control.deadline
-	if ctx.timeouts.default > 0 { deadline = tool_mcp_deadline_earlier(deadline, ai.deadline_in(ctx.timeouts.default)) }
-	if ctx.timeouts.maximum > 0 { deadline = tool_mcp_deadline_earlier(deadline, ai.deadline_in(ctx.timeouts.maximum)) }
+	if timeout > 0 { deadline = tool_mcp_deadline_earlier(deadline, ai.deadline_in(timeout)) }
 	if deadline.active {
 		control.deadline_at = deadline.at
 		control.has_deadline = true

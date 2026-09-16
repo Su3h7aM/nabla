@@ -146,6 +146,9 @@ headless_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text:
 // makes it testable without a terminal: the launch around it is shared with the
 // interactive harness.
 run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> bool {
+	// Tools are refreshed between turns, while the session is idle, so the registry a
+	// turn dispatches against is the one it was advertised with.
+	if warning := app_tools_refresh(app); warning != "" { fmt.eprintln("nabla:", warning) }
 	switch agent.chat_session_accept_user(&app.setup.session, prompt, session.now_ms()) {
 	case .Accepted:
 	case .Storage_Failed:
@@ -163,7 +166,13 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 // configuration, the same catalog, the same session. Only the front-end differs,
 // so a headless run is the same conversation rather than a second implementation
 // of one.
-run_prompt :: proc(sources: []agent.Catalog_Provider_Source, harness_options: agent.Harness_Options, options: chat_cli_options, answer: io.Writer) -> int {
+run_prompt :: proc(
+	sources: []agent.Catalog_Provider_Source,
+	mcp_servers: []agent.MCP_Server_Config,
+	harness_options: agent.Harness_Options,
+	options: chat_cli_options,
+	answer: io.Writer,
+) -> int {
 	app := new(App)
 	defer free(app)
 	app.run.alloc = context.allocator
@@ -176,7 +185,7 @@ run_prompt :: proc(sources: []agent.Catalog_Provider_Source, harness_options: ag
 		start.id = options.resume_id
 	}
 	app.setup.harness_options = harness_options
-	if !run_catalog(sources, &app.setup, start) { return 1 }
+	if !run_catalog(sources, mcp_servers, &app.setup, start) { return 1 }
 	// The model this run picks belongs to the job, not to the user: a headless run
 	// must not change what the interactive harness starts with.
 	app.setup.owns_selection = false
@@ -225,12 +234,13 @@ chat_main :: proc() -> int {
 	// A missing config file is a valid setup, not an error: the run proceeds
 	// with no providers and default options. Only a config that exists but
 	// cannot be used stops the launch.
-	sources, harness_options, config_err := agent.load_lua_config_full(options.config_path)
+	sources, harness_options, mcp_servers, config_err := agent.load_lua_config_full(options.config_path)
 	if config_err != .None && config_err != .Missing {
 		fmt.eprintln("nabla:", agent.config_error_text(config_err))
 		return 1
 	}
 	defer agent.catalog_sources_destroy(&sources)
+	defer agent.mcp_servers_destroy(&mcp_servers)
 
 	if options.list {
 		catalog, configured, catalog_ok := resolve_run_catalog(sources[:], context.allocator)
@@ -249,7 +259,7 @@ chat_main :: proc() -> int {
 		fmt.eprintln("nabla: --provider and --model must be given together")
 		return 2
 	}
-	if options.prompt != "" { return run_prompt(sources[:], harness_options, options, stdout_writer()) }
+	if options.prompt != "" { return run_prompt(sources[:], mcp_servers[:], harness_options, options, stdout_writer()) }
 
 	start := Session_Start {
 		kind = .New,
@@ -258,7 +268,7 @@ chat_main :: proc() -> int {
 		start.kind = .Resume_Id if options.resume_id != "" else .Resume_Latest
 		start.id = options.resume_id
 	}
-	return tui_run(sources[:], harness_options, options.provider_id, options.model_id, start) ? 0 : 1
+	return tui_run(sources[:], mcp_servers[:], harness_options, options.provider_id, options.model_id, start) ? 0 : 1
 }
 
 main :: proc() {

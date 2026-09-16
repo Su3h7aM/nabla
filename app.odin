@@ -264,6 +264,7 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 // drive the frame loop until quit.
 tui_run :: proc(
 	sources: []agent.Catalog_Provider_Source,
+	mcp_servers: []agent.MCP_Server_Config,
 	harness_options: agent.Harness_Options,
 	flag_provider, flag_model: string,
 	start: Session_Start,
@@ -279,7 +280,7 @@ tui_run :: proc(
 	// The setup is filled in place: a store owns a live connection, and copying
 	// one would leave two owners of it.
 	app.setup.harness_options = harness_options
-	if !run_catalog(sources, &app.setup, start) {
+	if !run_catalog(sources, mcp_servers, &app.setup, start) {
 		return false
 	}
 	app.run.connection = app.setup.connection

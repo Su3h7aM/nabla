@@ -48,6 +48,11 @@ Run_Setup :: struct {
 	// remembered for the next launch. A headless or child run does not, because it
 	// selects a model for one job and must not change what the user starts with.
 	owns_selection:   bool,
+	// mcp_servers is borrowed from the launch's configuration, which outlives the
+	// setup. mcp owns the running MCP clients and the bindings a tool definition may
+	// borrow, so it is released after the session that holds the registry.
+	mcp_servers:      []agent.MCP_Server_Config,
+	mcp:              MCP_Runtime,
 	alloc:            mem.Allocator,
 }
 
@@ -129,10 +134,14 @@ resolve_run_catalog :: proc(
 // Which provider and model run is applied separately, so the front-end can start
 // without a selection and choose one in the TUI. Errors print to stderr; false
 // means the caller should exit.
-run_catalog :: proc(sources: []agent.Catalog_Provider_Source, setup: ^Run_Setup, start: Session_Start) -> bool {
+run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []agent.MCP_Server_Config, setup: ^Run_Setup, start: Session_Start) -> bool {
 	setup.alloc = context.allocator
 	ok := false
 	defer if !ok { run_setup_destroy(setup) }
+
+	setup.mcp_servers = mcp_servers
+	// The runtime's slots are fixed before any definition can borrow a binding.
+	setup.mcp = mcp_runtime_make(mcp_servers, setup.alloc)
 
 	catalog, configured, resolved := resolve_run_catalog(sources, setup.alloc)
 	if !resolved { return false }
