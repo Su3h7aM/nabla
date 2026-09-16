@@ -37,6 +37,32 @@ Dependencies point inward, from the harness toward the foundation.
 - Only the root `nabla` package may import both the foundation and `agent`. A foundation package
   that needs something from the harness has the dependency backwards.
 
+### When a package exists
+
+A package here is a standalone library, and it must be describable without naming this
+harness: `http` is the HTTP protocol, `term` is terminal control, `layout` solves layout,
+`tui` is a terminal UI toolkit, `ai` is a model-provider client, `mcp` is the MCP protocol.
+Another Odin project can take any of them and use it, so none of them carries Nabla's
+business rules. No turn, session, request, tool-policy, model-catalog, or presentation
+concept belongs in `http`, `sse`, `layout`, `term`, or `tui`, and no provider-specific
+behaviour belongs in `http`. Code that only this harness uses, and that cannot be described
+in a lower package's own vocabulary, belongs in `agent` or the root package.
+
+Create a package when the subject is separable and reusable on its own, which is why the
+foundation and library layers exist: Odin has no suitable library for layout, a terminal UI,
+or HTTP, so each was written once and kept standalone. Adding a package or subpackage is a
+decision, not the default move; prefer extending the package that already owns the subject.
+A subpackage is justified when it has its own boundaries and consumers (`http/client`,
+`agent/session`), never as a folder for code that fits badly. A name that sounds like a
+library does not make a harness component reusable, and a package usable only by this
+harness is worse than code placed in `agent` where its callers already live.
+
+Facts belong to the layer that observes them; decisions belong to the layer that owns them.
+A lower layer exposes its own protocol facts in its own vocabulary, and the harness decides
+what is recorded, where, at which level, and for how long. Concretely: the transport reports
+bytes, phases, and status; `ai` reports provider request and response facts; `agent` holds
+the policy and the sink; the root package owns the process lifetime that frames them.
+
 Keep each package buildable, testable, and green on its own. That property is what makes the
 foundation reusable and the harness replaceable.
 
