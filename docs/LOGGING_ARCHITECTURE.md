@@ -725,9 +725,12 @@ credentials. Response headers are not recorded wholesale; a status, a declared l
 a provider request id when it is specifically needed are allowlisted and capped. The
 `authorization` header and every other credential never enter a record or a capture.
 
-Free-form provider error text may echo a request body. Default records carry the status and
-the stable local reason; the raw text continues to reach the UI through the existing error
-path, which this plan does not claim is redacted.
+Provider error text is recorded. A refused request is diagnosed by the peer's own message,
+and the transport already bounds what it reads (`HTTP_MAX_ERROR_BYTES`, and
+`HTTP_MAX_ERROR_EXCERPT` for the text it keeps), so a record carries bounded text rather
+than a body. That text can echo part of the request, so a record is not safe to publish
+unreviewed: the file is owner-only, credentials are never part of a response body, and the
+capture policy below still governs the full bytes.
 
 Capture policy, first version, read only by root:
 

@@ -248,7 +248,10 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 			{key = "error_kind", value = log_operation_error_name(operation_error.kind)},
 			{key = "finish_reason", value = chat_finish_reason_text(runtime.finish_reason)},
 			{key = "status", value = i64(operation_error.status)},
-			{key = "detail_bytes", value = i64(len(operation_error.detail))},
+			// The provider's own message, which for a refused request is the only
+			// thing that says why. The transport bounds what it reads, so this is
+			// bounded text, not an unbounded body.
+			{key = "detail", value = operation_error.detail},
 			{key = "response_bytes", value = i64(provider_log.response_bytes)},
 			{key = "elapsed_ms", value = log_duration_ms(time.tick_since(at))},
 		}

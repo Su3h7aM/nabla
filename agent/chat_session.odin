@@ -311,12 +311,12 @@ chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: sess
 	} else {
 		chat.last_error = strings.concatenate({what, ": ", detail}, chat.allocator)
 	}
-	// The record names the local step that failed and the store's classification,
-	// not the detail text, which the front-end already shows the user.
+	// The record names the local step that failed, the store's classification, and
+	// the store's own message, which is local text rather than anything a peer sent.
 	fields := [3]Log_Field {
 		{key = "operation", value = what},
 		{key = "error_kind", value = log_error_kind_name(session.error_kind(local))},
-		{key = "detail_bytes", value = i64(len(detail))},
+		{key = "detail", value = detail},
 	}
 	log_emit(log_scope(chat), Log_Record{level = .Error, category = .Storage, event = "storage.failed", fields = fields[:]})
 	chat.active_failed = true
