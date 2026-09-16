@@ -93,6 +93,7 @@ attach_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
 	session.session_release(&setup.store)
 	session.store_close(&setup.store)
+	run_log_close(setup)
 	delete(setup.workspace, setup.alloc)
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)

@@ -244,6 +244,9 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
 	session.session_release(&setup.store)
 	session.store_close(&setup.store)
+	// The log outlives the session and the store deliberately: the record of the
+	// launch ending is the last thing it can write.
+	run_log_close(setup)
 	agent.catalog_destroy(&setup.catalog)
 	for id in setup.configured {
 		delete(id, setup.alloc)

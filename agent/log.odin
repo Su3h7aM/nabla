@@ -48,7 +48,10 @@ LOG_RUN_ID_ATTEMPTS :: 8
 
 LOG_MAX_DETAIL :: 160
 
+// LOG_RUNS_DIRECTORY is the directory inside the log root that holds one
+// directory per run. LOG_DIRECTORY_NAME is the log root's own name.
 LOG_RUNS_DIRECTORY :: "runs"
+LOG_DIRECTORY_NAME :: "logs"
 LOG_SEGMENT_PREFIX :: "events-"
 LOG_SEGMENT_SUFFIX :: ".jsonl"
 
@@ -226,6 +229,9 @@ Log :: struct {
 	open:                  bool,
 	level:                 Log_Level,
 	file:                  ^os.File,
+	// lease is held for the writer's whole life; it is what tells a later cleanup
+	// that this run is not its to remove.
+	lease:                 Log_Lock,
 	segment:               u32,
 	// segment_bytes is the rollover bound; a test may lower it, and nothing else
 	// changes it, so the default is the only bound a run sees.
@@ -249,18 +255,28 @@ log_open :: proc(log: ^Log, options: Log_Options, allocator := context.allocator
 	if log.open { return log_error(.Invalid_State, "the log is already open") }
 	if options.directory == "" || options.level == .Disabled { return nil }
 
-	runs_directory, okay := log_path_join(options.directory, LOG_RUNS_DIRECTORY, allocator)
-	if !okay { return log_error(.Allocation, "the runs directory path could not be built") }
+	runs_directory, runs_okay := log_path_join(options.directory, LOG_RUNS_DIRECTORY, allocator)
+	if !runs_okay { return log_error(.Allocation, "the runs directory path could not be built") }
 	defer delete(runs_directory, allocator)
-
 	// The runs directory is shared by every launch, so it is created as a parent
 	// rather than claimed. An existing one is expected.
 	if make_err := os.make_directory_all(runs_directory, LOG_DIRECTORY_PERMISSIONS); make_err != nil && make_err != .Exist {
 		return log_error(.Create, "the logs directory could not be created")
 	}
 
+	cleanup_path, cleanup_okay := log_path_join(options.directory, LOG_CLEANUP_LOCK_NAME, allocator)
+	if !cleanup_okay { return log_error(.Allocation, "the cleanup lock path could not be built") }
+	defer delete(cleanup_path, allocator)
+	// The cleanup lock is held while this run is created and while closed runs are
+	// removed, so a cleaner can never meet a run directory that has no lease yet.
+	// It is taken blocking because it is only ever held for one bounded pass.
+	cleanup_lock, cleanup_err := log_lock_acquire(cleanup_path, true)
+	if cleanup_err != nil { return cleanup_err }
+	defer log_lock_release(&cleanup_lock)
+
 	succeeded := false
 	defer if !succeeded {
+		log_lock_release(&log.lease)
 		if log.file != nil {
 			os.close(log.file)
 			log.file = nil
@@ -277,33 +293,78 @@ log_open :: proc(log: ^Log, options: Log_Options, allocator := context.allocator
 	log.allocator = allocator
 	log.level = options.level
 	log.segment_bytes = LOG_SEGMENT_BYTES
-
-	// The run directory is claimed exclusively, so two runs cannot write into one
-	// another's directory. A collision draws a fresh id rather than adopting what
-	// is already there.
-	for _ in 0 ..< LOG_RUN_ID_ATTEMPTS {
-		delete(log.run_id, allocator)
-		log.run_id = log_run_id_create(allocator)
-		if log.run_id == "" { break }
-		candidate, candidate_okay := log_path_join(runs_directory, log.run_id, allocator)
-		if !candidate_okay { break }
-		make_err := os.make_directory(candidate, LOG_DIRECTORY_PERMISSIONS)
-		if make_err == nil {
-			log.directory = candidate
-			break
-		}
-		delete(candidate, allocator)
-		if make_err != .Exist { break }
-	}
-	if log.directory == "" { return log_error(.Create, "the run directory could not be created") }
+	if claim_err := log_run_directory_claim(log, runs_directory); claim_err != nil { return claim_err }
 
 	log.start_tick = time.tick_now()
 	log.start_time_ns = time.time_to_unix_nano(time.now())
-	if err := log_segment_create(log, 1); err != nil { return err }
+	if segment_err := log_segment_create(log, 1); segment_err != nil { return segment_err }
 
 	log.open = true
 	succeeded = true
+
+	// Closed runs are removed now, under the cleanup lock. The pass is recorded only
+	// when it removed something: the absence of the record means nothing was dropped,
+	// so a launch that collected nothing keeps its first record for its own work.
+	dropped, freed_bytes := log_cleanup(options.directory, allocator)
+	if dropped > 0 {
+		fields := [2]Log_Field{{key = "dropped_runs", value = i64(dropped)}, {key = "freed_bytes", value = freed_bytes}}
+		log_emit(Log_Context{log = log}, Log_Record{level = .Info, category = .Diagnostics, event = "retention.finished", fields = fields[:]})
+	}
 	return nil
+}
+
+// log_default_directory is where this application keeps its logs: the logs
+// directory inside the state directory the XDG specification resolves. The result
+// is owned by allocator.
+log_default_directory :: proc(allocator := context.allocator) -> (string, Log_Error) {
+	state_directory, state_err := xdg_directory(.State, allocator)
+	if state_err != .None { return "", log_error(.Invalid_Argument, "the state directory could not be resolved") }
+	defer delete(state_directory, allocator)
+	directory, okay := log_path_join(state_directory, LOG_DIRECTORY_NAME, allocator)
+	if !okay { return "", log_error(.Allocation, "the log directory path could not be built") }
+	return directory, nil
+}
+
+// log_run_directory_claim creates a fresh run directory under runs_directory and
+// takes its lease. The lease is what keeps a later cleanup from removing a run
+// that is still alive, so a directory that cannot be leased is removed rather than
+// left behind unleased.
+@(private)
+log_run_directory_claim :: proc(log: ^Log, runs_directory: string) -> Log_Error {
+	allocator := log.allocator
+	for _ in 0 ..< LOG_RUN_ID_ATTEMPTS {
+		delete(log.run_id, allocator)
+		log.run_id = log_run_id_create(allocator)
+		if log.run_id == "" { return log_error(.Allocation, "a run id could not be created") }
+
+		directory, directory_okay := log_path_join(runs_directory, log.run_id, allocator)
+		if !directory_okay { return log_error(.Allocation, "the run directory path could not be built") }
+		if make_err := os.make_directory(directory, LOG_DIRECTORY_PERMISSIONS); make_err != nil {
+			delete(directory, allocator)
+			// A collision means the id is taken, which is what the loop is for.
+			if make_err != .Exist { return log_error(.Create, "the run directory could not be created") }
+			continue
+		}
+
+		lease, lease_err := log_run_directory_lease(log, directory)
+		if lease_err != nil {
+			os.remove_all(directory)
+			delete(directory, allocator)
+			return lease_err
+		}
+		log.lease = lease
+		log.directory = directory
+		return nil
+	}
+	return log_error(.Create, "the run directory could not be created")
+}
+
+@(private)
+log_run_directory_lease :: proc(log: ^Log, directory: string) -> (Log_Lock, Log_Error) {
+	lease_path, lease_okay := log_path_join(directory, LOG_LEASE_NAME, log.allocator)
+	if !lease_okay { return {}, log_error(.Allocation, "the lease path could not be built") }
+	defer delete(lease_path, log.allocator)
+	return log_lock_acquire(lease_path, false)
 }
 
 // log_close closes the current segment and releases the run directory and run
@@ -318,6 +379,9 @@ log_close :: proc(log: ^Log) -> Log_Error {
 			result = log_error(.Write, "the log segment could not be closed")
 		}
 	}
+	// The lease goes last: until it is dropped, a cleanup cannot remove what this
+	// writer still owns.
+	log_lock_release(&log.lease)
 	allocator := log.allocator
 	delete(log.directory, allocator)
 	delete(log.run_id, allocator)
@@ -528,11 +592,12 @@ log_line_value :: proc(line: ^Log_Line, value: Log_Value) {
 	}
 }
 
-@(private)
+// log_level_name is the name a level is written and configured by. Disabled is
+// "off", which is the value that turns logging off.
 log_level_name :: proc(level: Log_Level) -> string {
 	switch level {
 	case .Disabled:
-		return "disabled"
+		return "off"
 	case .Error:
 		return "error"
 	case .Warn:
@@ -544,7 +609,27 @@ log_level_name :: proc(level: Log_Level) -> string {
 	case .Trace:
 		return "trace"
 	}
-	return "disabled"
+	return "off"
+}
+
+// log_level_parse reads a level name. It accepts exactly what log_level_name
+// writes, so a configured value round trips.
+log_level_parse :: proc(name: string) -> (Log_Level, bool) {
+	switch name {
+	case "off":
+		return .Disabled, true
+	case "error":
+		return .Error, true
+	case "warn":
+		return .Warn, true
+	case "info":
+		return .Info, true
+	case "debug":
+		return .Debug, true
+	case "trace":
+		return .Trace, true
+	}
+	return .Disabled, false
 }
 
 @(private)

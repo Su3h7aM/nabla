@@ -1,6 +1,7 @@
 # Harness logging and diagnostics architecture
 
-Status: phase 1 (the writer in `agent`) implemented; phases 2 to 6 are planned.
+Status: phases 1 and 2 (the writer, run lifecycle, and retention) implemented; phases 3
+to 6 are planned.
 
 This plan is based on the complete *Nabla Logging Reference Study: goose + opencode*,
 including its appendices, at
@@ -120,8 +121,9 @@ Inside `agent`, beside the state machine:
 | File | Contents |
 |---|---|
 | `agent/log.odin` | record model, levels, categories, `Log`, `log_open`, `log_close`, JSONL encoding, sequence, rollover, health |
+| `agent/log_lock.odin`, `agent/log_lock_linux.odin` | the exclusive file lock a lease and the cleanup lock are built on; the platform file holds the one call no core package abstracts |
+| `agent/log_retention.odin` | run directories, leases, bounded cleanup |
 | `agent/log_capture.odin` | opt-in payload capture: admission, chunk append, digests, sidecar metadata, abort |
-| `agent/log_retention.odin` | run directories, `flock` leases, bounded cleanup |
 | `agent/log_read.odin` | parsing and scanning a run directory for diagnosis and export |
 | `agent/log_bridge.odin` | adapters from `ai` observations and harness state into records |
 | `agent/chat.odin`, `agent/chat_session.odin`, `agent/compact.odin`, `agent/tool*.odin` | emit calls at the boundaries they already own |
@@ -131,7 +133,7 @@ Inside the root package:
 
 | File | Contents |
 |---|---|
-| `app_log.odin` | options from argv and environment, `log_open`/`log_close` around the run, health notice through the existing observer |
+| `app_log.odin` | the level from the environment, `log_open`/`log_close` around the run, `run.started` and `run.finished` |
 | `main.odin` | `diagnostics` subcommand parsing, alongside the existing `chat_cli_parse` |
 | `app_command_test.odin` | CLI parsing tests |
 
@@ -306,13 +308,13 @@ format string derived from remote content.
 
 ### 5.2 Owned state
 
-Phase 1 implements `Log_Options`, `Log`, and `Log_Health`. The capture types below arrive
-with phase 4, and the run lease fields with phase 2.
+Phase 1 implements `Log_Options`, `Log`, `Log_Health`, and the plain-field additions
+below. The capture types arrive with phase 4.
 
 | Type | Stored data | Owner and release |
 |---|---|---|
 | `Log_Options` | directory, level | copied into `Log` at open; immutable afterwards |
-| `Log` | allocator, owned run directory, run ID, `open` flag, current segment file, segment number and byte count, rollover bound, sequence, `sync.Mutex`, fixed record scratch, `Log_Health`, monotonic start tick and start time | declared by root, opened once, lives at one stable address, released by `log_close` after all borrowers retire |
+| `Log` | allocator, owned run directory, run ID, `open` flag, current segment file, run lease, segment number and byte count, rollover bound, sequence, `sync.Mutex`, fixed record scratch, `Log_Health`, monotonic start tick and start time | declared by root, opened once, lives at one stable address, released by `log_close` after all borrowers retire |
 | `Log_Health` | failed flag, first error kind and platform error, written and omitted counts | inside `Log`; read through `log_health` under the mutex |
 | `Capture` | borrowed `Log`, kind, open fd, storage allowance, observed and stored byte counts, observed and stored SHA-256 contexts, truncated and failed flags, generated basename, owned correlation copy | owned by one operation; `log_capture_finish` or `log_capture_abort` closes it exactly once |
 | `Capture_Summary` | identity, counts, digests, completeness and truncation facts | value result with fixed-size ids and digests, no borrowed capture state |
@@ -329,8 +331,9 @@ A `Capture` copies its correlation at `begin`, because its metadata may be writt
 the state it describes has moved on. That copy is freed at finish or abort. No other
 diagnostic path retains caller memory.
 
-Root holds `Log` by value in its `App` state and passes `^Log` inward, matching the
-existing `Store` pattern in `agent/session/store.odin`.
+Root holds `Log` by value in its run setup, the `Run_Setup` the launch builds, and
+releases it through the same teardown path as the store, matching the existing `Store`
+pattern in `agent/session/store.odin`.
 
 ### 5.3 Envelope and sequence
 
@@ -647,11 +650,17 @@ Startup order:
 
 ```text
 resolve state directory and diagnostic options
-  -> make the private run directory, take the lease, open the first segment
-  -> run.started, then bounded retention cleanup
+  -> take the cleanup lock
+  -> make the private run directory, take its lease, open the first segment
+  -> remove closed runs until the retention bounds hold
+  -> release the cleanup lock
+  -> run.started
   -> open store, configuration, and MCP clients
   -> start the worker with a borrowed Log
 ```
+
+A pass that removed anything records `retention.finished` before `run.started`, so the
+first record of a run that collected nothing is still the run's own header.
 
 Shutdown order:
 
@@ -765,31 +774,33 @@ the quota is exhausted, later captures are declined and one warning plus counter
 emitted; a live capture is never evicted and nothing grows without bound. Metadata summaries
 remain available after payload admission is exhausted.
 
-Cleanup runs at startup and at worker work boundaries, at most once per hour, on the worker
-thread. There is no background thread. Run-local rollover and quotas hold bounds even during
-a very long turn; global retention is eventual and skips live runs, so total usage can
-exceed `CLOSED_RUN_BYTES` while many processes are active. That is stated rather than
-promised away.
+Cleanup runs once per launch, while the run directory is being created and the cleanup
+lock is held. There is no background thread and no periodic pass: a run bounds its own
+segments as it writes them, and what other launches left behind is collected by the next
+launch. Run-local rollover holds its bounds even during a very long turn; global retention
+is eventual and skips live runs, so total usage can exceed `CLOSED_RUN_BYTES` while many
+processes are active. That is stated rather than promised away.
 
-Leases use Linux `flock`, not a stale-mtime directory lock:
+Liveness is an exclusive lock, not a timestamp and not a process id:
 
-1. Every cleaner takes an exclusive non-blocking lock on the stable `cleanup.lock` and
-   skips if it loses. The lock file is never unlinked.
-2. Each writer holds an exclusive lock on its own `lease` for its whole lifetime. Cleanup
-   skips a run directory whose lease cannot be locked, and the kernel releases the lock when
-   the process dies.
-3. Under the cleanup lock, candidate lease locks are taken non-blocking, links and
-   unexpected entries are rejected, and only inactive run directories are deleted. An
-   existing run directory is never adopted by a new writer.
-4. Expired runs are deleted first, then the oldest inactive runs until the count and byte
-   targets are met. File modification time is used for retention, not for liveness, and a
-   future timestamp does not block size-based eviction forever.
+1. A run holds an exclusive lock on its own `lease` for its whole life. The kernel releases
+   it when the process dies, so a crashed run is collectable without any cleanup step.
+2. A cleanup pass holds the exclusive `cleanup.lock` for the whole pass. Creating a run
+   takes the same lock, blocking, so a cleaner can never meet a run directory that has no
+   lease yet. The lock file is never unlinked: replacing a locked inode would let two
+   processes hold what each believes is the same lock.
+3. Under that lock, each candidate's lease is probed with a non-blocking lock. A lease that
+   cannot be taken means the run is alive and is kept; a run whose lease is missing or free
+   is closed or orphaned and is collectable. Symlinks and names that are not run ids are
+   left alone rather than followed.
+4. Expired runs are removed first, then the oldest until the count and byte targets hold. A
+   future timestamp does not block size-based eviction, because the count and byte bounds
+   are evaluated independently of age.
 5. Failures are counted and reported, not fatal. Directory iteration is bounded to 4096 runs
-   per pass so a huge or hostile directory cannot stall startup.
+   per pass, so a huge or hostile directory cannot stall a launch.
 
-Creating a run and taking its lease is serialized against cleanup by the cleanup lock, so a
-cleaner cannot delete a just-created unleased directory. PID existence is never used as
-proof that a run is alive.
+An existing run directory is never adopted by a new writer, and PID existence is never used
+as proof that a run is alive.
 
 ## 12. Failure and durability contracts
 
@@ -911,17 +922,18 @@ once; an oversized record becomes the omission record; rollover keeps the config
 window; the run directory and its segments are owner-only. Run `mise run test agent` and
 `mise run check`.
 
-### Phase 2: root lifecycle and retention in `agent`
+### Phase 2: run lifecycle and retention
 
-`app_log.odin` for options from argv and environment plus open and close around the run.
-`agent/log_retention.odin` for run directories, `flock` leases, and bounded cleanup.
-No normal record reaches stdout or terminal stderr during interactive use.
+`agent/log_lock.odin` with `agent/log_lock_linux.odin` behind it holds the one operation
+no core package abstracts, and `agent/log_retention.odin` holds the policy: a lease per
+run and one bounded cleanup pass per launch. `app_log.odin` reads the level from the
+environment, opens and closes the writer around the run, and records `run.started` and
+`run.finished`. A launch whose log cannot be opened reports it once on stderr and carries
+on without one; no record is ever written to stdout or the terminal.
 
-Tests: two live runs; an abandoned run; a cleanup that races run creation; a disk and
-permission failure; clock skew; symlink rejection; byte, count, and age cleanup; partial
-initialization. If subprocess lock testing cannot run under `odin test`, ship it as a
-harness under `agent/test/`, which `scripts/_lib.sh` already discovers. Run
-`mise run test agent` and `mise run test .`.
+Tests: a leased run is kept even when it is past every bound; an expired closed run is
+removed; an unleased orphan is removed; the count and byte bounds keep the newest runs; the
+level names round trip. Run `mise run test agent` and `mise run test .`.
 
 ### Phase 3: harness correlation and events
 

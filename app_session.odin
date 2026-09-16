@@ -30,6 +30,9 @@ Run_Setup :: struct {
 	credential:       string, // owned,
 	connection:       ai.Provider_Connection,
 	store:            session.Store,
+	// log is this launch's diagnostic stream. It is opened before the store and
+	// closed after it, so a launch that cannot reach the store still says so.
+	log:              agent.Log,
 	session:          agent.Chat_Session,
 	workspace:        string, // owned; the directory sessions here run in
 	provider_id:      string, // owned,
@@ -166,6 +169,8 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []age
 // The running session is built on top of that claim. A launch that cannot open
 // the session it asked for fails rather than quietly starting a different one.
 run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_Start) -> bool {
+	run_log_open(setup)
+
 	directory, directory_err := agent.xdg_directory(.State, setup.alloc)
 	if directory_err != .None {
 		fmt.eprintln("nabla: cannot resolve the state directory for sessions")

@@ -35,18 +35,29 @@ log_test_end :: proc(t: ^testing.T, fixture: ^Log_Test) {
 }
 
 log_test_path :: proc(fixture: ^Log_Test, segment: u32) -> string {
+	return log_test_directory_segment(fixture.log.directory, segment)
+}
+
+// log_test_directory_segment is the path of one segment in a run directory, which
+// is what a test needs when it works with a run that is not the fixture's own.
+log_test_directory_segment :: proc(directory: string, segment: u32) -> string {
 	name_buffer: [32]u8
 	name := log_segment_name(segment, name_buffer[:])
-	path, _ := log_path_join(fixture.log.directory, name, context.temp_allocator)
+	path, _ := log_path_join(directory, name, context.temp_allocator)
 	return path
 }
 
-// log_test_segment_text reads one segment into caller-owned memory, released
-// with delete(text, context.allocator).
-log_test_segment_text :: proc(t: ^testing.T, fixture: ^Log_Test, segment: u32) -> string {
-	content, read_err := os.read_entire_file(log_test_path(fixture, segment), context.allocator)
+// log_test_text reads one file into caller-owned memory, released with
+// delete(text, context.allocator).
+log_test_text :: proc(t: ^testing.T, path: string) -> string {
+	content, read_err := os.read_entire_file(path, context.allocator)
 	if read_err != nil { testing.fail_now(t, "the log segment could not be read") }
 	return string(content)
+}
+
+// log_test_segment_text reads one segment of the fixture's run.
+log_test_segment_text :: proc(t: ^testing.T, fixture: ^Log_Test, segment: u32) -> string {
+	return log_test_text(t, log_test_path(fixture, segment))
 }
 
 @(test)
