@@ -136,7 +136,10 @@ error_text :: proc(err: Error, allocator := context.allocator) -> string {
 		if err.message != "" { return fmt.aprintf("the server sent an unexpected message: %s", err.message, allocator = allocator) }
 		return strings.clone("the server sent an unexpected message", allocator)
 	case .Version_Unsupported:
-		return fmt.aprintf("the server does not support protocol version %s", PROTOCOL_VERSION, allocator = allocator)
+		// The reader needs to know which revision the server chose, so the message
+		// built where the version was read wins over a generic one.
+		if err.message != "" { return strings.clone(err.message, allocator) }
+		return strings.clone("the server does not speak any protocol revision this client implements", allocator)
 	case .Capability_Missing:
 		return strings.clone("the server does not support tools", allocator)
 	case .Protocol_Violation:

@@ -221,24 +221,29 @@ MCP is an independent client library. It imports nothing from `agent`, `ai`, or
 the presentation stack, and the adapter in `agent` maps its definitions and
 results into the same tool contract.
 
-Only protocol version `2026-07-28` is implemented. It has no handshake and no
-protocol session:
+The client supports two protocol eras. It first probes with the stateless
+`2026-07-28` request shape. A discovery result selects that revision. If the
+server does not return a discovery result, the client restarts it when needed
+and performs the handshake used by `2025-11-25` and `2025-06-18`.
+
+Under `2026-07-28`:
 
 - Every request declares its version and client capabilities in `params._meta`.
 - `server/discover` reports supported versions, capabilities, and identity.
-- Streamable HTTP is one POST per request, answered with JSON or a
-  request-scoped SSE stream. `MCP-Protocol-Version`, `Mcp-Method`, and
-  `Mcp-Name` headers are required, and `x-mcp-header` parameters are mirrored.
 - `resultType: "input_required"` carries server-to-client input requests.
+
+Under the handshake revisions, `initialize` negotiates the version and is
+followed by `notifications/initialized`. Requests omit the stateless `_meta`
+envelope and results do not require `resultType`. Server requests are answered
+with method-not-found because Nabla advertises no client-side MCP capabilities.
 
 Stateless describes request routing, not effects. A `tools/call` is never
 automatically retried, including after a lost connection, because the server may
 have performed the action before the reply was lost. That case is `Unknown`.
 
-Supported at first: stdio, and Streamable HTTP with explicitly supplied
-endpoint-bound credentials. No OAuth flow, no legacy transport, no fallback
-handshake. A `2026-07-28` server that is not understood gets an actionable
-diagnostic.
+Only stdio transport is implemented. There is no Streamable HTTP or OAuth flow.
+A server that selects or advertises an unsupported revision gets an actionable
+diagnostic naming the revisions involved.
 
 The transport states whether a complete request was written, not whether the
 server ran it. That one fact is what the adapter needs to choose between

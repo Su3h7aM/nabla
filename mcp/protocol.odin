@@ -5,10 +5,92 @@ import "core:mem"
 import "core:strings"
 import "core:unicode/utf8"
 
-// PROTOCOL_VERSION is the only protocol revision this client implements. It has
-// no handshake and no protocol session: every request states the version and the
-// client's capabilities, and the server states what it supports.
-PROTOCOL_VERSION :: "2026-07-28"
+// The protocol revisions this client implements, and how it prefers them.
+//
+// 2026-07-28 is stateless: there is no handshake, so every request declares its
+// version and the client's capabilities, and every result carries a resultType.
+// The 2025 revisions negotiate once with an initialize handshake and carry
+// neither. Those two shapes are the only thing the rest of this package has to
+// branch on, so the branch is named once, by era.
+VERSION_2026_07_28 :: "2026-07-28"
+VERSION_2025_11_25 :: "2025-11-25"
+VERSION_2025_06_18 :: "2025-06-18"
+
+// Protocol_Version is the revision a server and this client agreed to speak.
+// Unknown is the zero value: nothing has been agreed, so nothing may be sent.
+Protocol_Version :: enum {
+	Unknown,
+	V2026_07_28,
+	V2025_11_25,
+	V2025_06_18,
+}
+
+// Protocol_Era is how a revision is spoken, which is what the request and result
+// shapes depend on. It is the one branch point between revisions.
+Protocol_Era :: enum {
+	// Stateless declares the version and capabilities on every request, and
+	// distinguishes results with a resultType.
+	Stateless,
+	// Handshake negotiates once at connect, and results carry no resultType.
+	Handshake,
+}
+
+protocol_version_name :: proc(version: Protocol_Version) -> string {
+	switch version {
+	case .V2026_07_28:
+		return VERSION_2026_07_28
+	case .V2025_11_25:
+		return VERSION_2025_11_25
+	case .V2025_06_18:
+		return VERSION_2025_06_18
+	case .Unknown:
+		return ""
+	}
+	return ""
+}
+
+// protocol_version_from_name reads a revision the server chose. A revision this
+// client does not implement is reported as unread rather than as Unknown, so the
+// caller can tell "the server chose something I cannot speak" from "nothing was
+// agreed".
+protocol_version_from_name :: proc(name: string) -> (Protocol_Version, bool) {
+	switch name {
+	case VERSION_2026_07_28:
+		return .V2026_07_28, true
+	case VERSION_2025_11_25:
+		return .V2025_11_25, true
+	case VERSION_2025_06_18:
+		return .V2025_06_18, true
+	}
+	return .Unknown, false
+}
+
+// protocol_version_era reports how a revision is spoken. Unknown has no era: a
+// request may not be sent before one is agreed.
+protocol_version_era :: proc(version: Protocol_Version) -> Protocol_Era {
+	switch version {
+	case .V2026_07_28:
+		return .Stateless
+	case .V2025_11_25, .V2025_06_18:
+		return .Handshake
+	case .Unknown:
+		return .Stateless
+	}
+	return .Stateless
+}
+
+// protocol_version_inlines_server_requests reports whether a revision carries
+// server-to-client interaction inside results rather than as requests on the
+// stream. Only the stateless revision does; a handshake-era server may ask for
+// sampling or elicitation at any time, and the specification requires a reply.
+protocol_version_inlines_server_requests :: proc(version: Protocol_Version) -> bool {
+	return version == .V2026_07_28
+}
+
+// PROTOCOL_VERSION_PREFERRED is the revision the handshake offers. A server that
+// supports it answers with it, and one that does not answers with what it does
+// support, which is the negotiation the specification defines.
+PROTOCOL_VERSION_PREFERRED :: VERSION_2025_11_25
 
 // CLIENT_NAME and CLIENT_VERSION identify this client in `_meta.clientInfo`. The
 // protocol treats identity as self-reported and unverified, so it is advisory:
@@ -20,8 +102,10 @@ CLIENT_VERSION :: "0.1.0"
 // named; anything else the client receives is reported as unexpected rather than
 // guessed at.
 METHOD_DISCOVER :: "server/discover"
+METHOD_INITIALIZE :: "initialize"
 METHOD_TOOLS_LIST :: "tools/list"
 METHOD_TOOLS_CALL :: "tools/call"
+NOTIFICATION_INITIALIZED :: "notifications/initialized"
 NOTIFICATION_CANCELLED :: "notifications/cancelled"
 NOTIFICATION_PROGRESS :: "notifications/progress"
 NOTIFICATION_MESSAGE :: "notifications/message"
@@ -72,31 +156,49 @@ MAX_STDERR_TAIL_BYTES :: 32 * 1024
 // text the harness repeats, so it is cut to size rather than trusted.
 MAX_IDENTITY_BYTES :: 256
 
-// request_params_make starts a params object with the per-request protocol metadata
-// already in place, so a method encoder adds its own fields and cannot forget the
-// envelope. The result is passed to request_encode, which consumes it.
-request_params_make :: proc(capacity := 0, allocator := context.allocator) -> json.Object {
-	params := make(json.Object, capacity + 1, allocator)
-	params[strings.clone("_meta", allocator)] = json.Value(protocol_meta_make(allocator))
-	return params
+// client_capabilities_make declares what this client can do, which is nothing
+// beyond the operations it initiates. Sampling, elicitation, roots, and
+// subscriptions are all unimplemented, and declaring one would invite a server to
+// require it: a server must not rely on a capability the client did not state.
+client_capabilities_make :: proc(allocator: mem.Allocator) -> json.Object {
+	return make(json.Object, 0, allocator)
 }
 
-// protocol_meta_make builds the `_meta` object every request carries. The client
-// declares no capabilities, because it implements no sampling, elicitation,
-// roots, or subscription support: declaring one would invite a server to require
-// it, and a server must not rely on a capability the client did not declare.
-@(private)
-protocol_meta_make :: proc(allocator: mem.Allocator) -> json.Object {
-	capabilities := make(json.Object, 0, allocator)
+// client_info_make names this client. The protocol treats identity as self
+// reported and unverified, so it is advisory: nothing may depend on it.
+client_info_make :: proc(allocator: mem.Allocator) -> json.Object {
 	info := make(json.Object, 2, allocator)
 	info[strings.clone("name", allocator)] = json.String(strings.clone(CLIENT_NAME, allocator))
 	info[strings.clone("version", allocator)] = json.String(strings.clone(CLIENT_VERSION, allocator))
+	return info
+}
 
+// request_params_make starts a params object for one request under version. A
+// stateless revision declares its protocol metadata on every request, and it is
+// built here so a method encoder adds its own fields and cannot forget the
+// envelope. A handshake revision negotiated the version once and carries none of
+// it. The result is passed to request_encode, which consumes it.
+request_params_make :: proc(version: Protocol_Version, capacity := 0, allocator := context.allocator) -> json.Object {
+	params := make(json.Object, capacity + 1, allocator)
+	if protocol_version_era(version) != .Stateless { return params }
 	meta := make(json.Object, 3, allocator)
-	meta[strings.clone(META_PROTOCOL_VERSION, allocator)] = json.String(strings.clone(PROTOCOL_VERSION, allocator))
-	meta[strings.clone(META_CLIENT_CAPABILITIES, allocator)] = json.Value(capabilities)
-	meta[strings.clone(META_CLIENT_INFO, allocator)] = json.Value(info)
-	return meta
+	meta[strings.clone(META_PROTOCOL_VERSION, allocator)] = json.String(strings.clone(protocol_version_name(version), allocator))
+	meta[strings.clone(META_CLIENT_CAPABILITIES, allocator)] = json.Value(client_capabilities_make(allocator))
+	meta[strings.clone(META_CLIENT_INFO, allocator)] = json.Value(client_info_make(allocator))
+	params[strings.clone("_meta", allocator)] = json.Value(meta)
+	return params
+}
+
+// initialize_params_make builds the handshake a 2025 revision expects. It offers
+// this client's preferred revision and carries no `_meta`: the version lives in
+// the request body, and which revision is in force is not known until the server
+// answers.
+initialize_params_make :: proc(allocator := context.allocator) -> json.Object {
+	params := make(json.Object, 3, allocator)
+	params[strings.clone("protocolVersion", allocator)] = json.String(strings.clone(PROTOCOL_VERSION_PREFERRED, allocator))
+	params[strings.clone("capabilities", allocator)] = json.Value(client_capabilities_make(allocator))
+	params[strings.clone("clientInfo", allocator)] = json.Value(client_info_make(allocator))
+	return params
 }
 
 // request_encode frames one JSON-RPC request. It takes ownership of params, including
@@ -114,13 +216,32 @@ request_encode :: proc(method: string, params: json.Object, id: i64, allocator :
 }
 
 // notification_encode frames one JSON-RPC notification. It takes ownership of
-// params and has no id, which is what makes it a notification rather than a
-// request.
+// params, which may be nil for a notification that carries none, and has no id,
+// which is what makes it a notification rather than a request.
 notification_encode :: proc(method: string, params: json.Object, allocator := context.allocator) -> (string, Error) {
 	envelope := make(json.Object, 3, allocator)
 	envelope[strings.clone("jsonrpc", allocator)] = json.String(strings.clone("2.0", allocator))
 	envelope[strings.clone("method", allocator)] = json.String(strings.clone(method, allocator))
-	envelope[strings.clone("params", allocator)] = json.Value(params)
+	if params != nil { envelope[strings.clone("params", allocator)] = json.Value(params) }
+
+	value := json.Value(envelope)
+	defer json.destroy_value(value, allocator)
+	return mcp_frame(value, allocator)
+}
+
+// response_error_encode frames one JSON-RPC error response. A client sends one
+// only when a handshake-era server asks for an interaction this client has no
+// capability for: the specification requires a reply to every request, and there
+// is nothing else honest to say.
+response_error_encode :: proc(id: i64, code: i64, message: string, allocator := context.allocator) -> (string, Error) {
+	remote := make(json.Object, 2, allocator)
+	remote[strings.clone("code", allocator)] = json.Integer(code)
+	remote[strings.clone("message", allocator)] = json.String(strings.clone(message, allocator))
+
+	envelope := make(json.Object, 3, allocator)
+	envelope[strings.clone("jsonrpc", allocator)] = json.String(strings.clone("2.0", allocator))
+	envelope[strings.clone("id", allocator)] = json.Integer(id)
+	envelope[strings.clone("error", allocator)] = json.Value(remote)
 
 	value := json.Value(envelope)
 	defer json.destroy_value(value, allocator)

@@ -100,8 +100,8 @@ MAX_CURSOR_BYTES :: 4096
 
 // tools_list_params_make builds the params for one tools/list page. An empty
 // cursor asks for the first page.
-tools_list_params_make :: proc(cursor: string, allocator := context.allocator) -> json.Object {
-	params := request_params_make(1 if cursor != "" else 0, allocator)
+tools_list_params_make :: proc(cursor: string, version: Protocol_Version, allocator := context.allocator) -> json.Object {
+	params := request_params_make(version, 1 if cursor != "" else 0, allocator)
 	if cursor != "" {
 		params[strings.clone("cursor", allocator)] = json.String(mcp_clone_bounded(cursor, MAX_CURSOR_BYTES, allocator))
 	}
@@ -111,7 +111,7 @@ tools_list_params_make :: proc(cursor: string, allocator := context.allocator) -
 // tools_list_decode reads one tools/list page. A tool that cannot be used is
 // reported as rejected rather than failing the page, so one malformed definition
 // does not cost the user the tools that were well formed.
-tools_list_decode :: proc(result: json.Object, allocator := context.allocator) -> (Tool_Page, Error) {
+tools_list_decode :: proc(result: json.Object, version: Protocol_Version, allocator := context.allocator) -> (Tool_Page, Error) {
 	// The accumulator is a local rather than the named return value: a deferred
 	// cleanup runs after the return value is assigned, so a named one would be
 	// freed after it had already been overwritten with the zero value.
@@ -120,12 +120,16 @@ tools_list_decode :: proc(result: json.Object, allocator := context.allocator) -
 	failed := true
 	defer if failed { tool_page_destroy(&page, allocator) }
 
-	kind, has_kind := result_type(result)
-	if !has_kind {
-		return {}, error_make(.Malformed_Message, "the tool listing carries no resultType", allocator = allocator)
-	}
-	if kind != RESULT_TYPE_COMPLETE {
-		return {}, error_make(.Unexpected_Message, fmt.tprintf("the tool listing answered with result type %q", kind), allocator = allocator)
+	// Only the stateless revision discriminates its results. A handshake-era listing
+	// has no resultType at all.
+	if protocol_version_era(version) == .Stateless {
+		kind, has_kind := result_type(result)
+		if !has_kind {
+			return {}, error_make(.Malformed_Message, "the tool listing carries no resultType", allocator = allocator)
+		}
+		if kind != RESULT_TYPE_COMPLETE {
+			return {}, error_make(.Unexpected_Message, fmt.tprintf("the tool listing answered with result type %q", kind), allocator = allocator)
+		}
 	}
 
 	tools_value, has_tools := result["tools"]
@@ -429,7 +433,7 @@ call_result_destroy :: proc(result: ^Call_Result, allocator := context.allocator
 // the wire are the bytes the session recorded as what the call ran with. Text
 // that does not parse is refused rather than sent, because an endpoint cannot
 // read it and the caller would have no record of what it said.
-tools_call_params_make :: proc(name, arguments_json: string, allocator := context.allocator) -> (params: json.Object, err: Error) {
+tools_call_params_make :: proc(name, arguments_json: string, version: Protocol_Version, allocator := context.allocator) -> (params: json.Object, err: Error) {
 	arguments, parse_err := json.parse_string(arguments_json, .JSON, true, allocator)
 	if parse_err != nil {
 		return {}, error_make(.Malformed_Message, "the call arguments are not valid JSON", allocator = allocator)
@@ -440,7 +444,7 @@ tools_call_params_make :: proc(name, arguments_json: string, allocator := contex
 		return {}, error_make(.Malformed_Message, "the call arguments are not a JSON object", allocator = allocator)
 	}
 
-	params = request_params_make(2, allocator)
+	params = request_params_make(version, 2, allocator)
 	params[strings.clone("name", allocator)] = json.String(mcp_clone_bounded(name, MAX_TOOL_NAME_BYTES, allocator))
 	params[strings.clone("arguments", allocator)] = json.Value(object)
 	return params, {}
@@ -449,15 +453,21 @@ tools_call_params_make :: proc(name, arguments_json: string, allocator := contex
 // call_result_decode reads one tools/call result, of either shape the revision
 // defines. A result type this revision does not define is refused rather than
 // guessed at, because the fields it carries would be unknown.
-call_result_decode :: proc(result: json.Object, allocator := context.allocator) -> (Call_Result, Error) {
+call_result_decode :: proc(result: json.Object, version: Protocol_Version, allocator := context.allocator) -> (Call_Result, Error) {
 	decoded: Call_Result
 	decoded.allocator = allocator
 	failed := true
 	defer if failed { call_result_destroy(&decoded, allocator) }
 
-	kind, has_kind := result_type(result)
-	if !has_kind {
-		return {}, error_make(.Malformed_Message, "the tool result carries no resultType", allocator = allocator)
+	// A handshake-era result is a completion: that era has no input-required reply,
+	// because server-to-client interaction travels as a request on the stream.
+	kind := RESULT_TYPE_COMPLETE
+	if protocol_version_era(version) == .Stateless {
+		read_kind, has_kind := result_type(result)
+		if !has_kind {
+			return {}, error_make(.Malformed_Message, "the tool result carries no resultType", allocator = allocator)
+		}
+		kind = read_kind
 	}
 	switch kind {
 	case RESULT_TYPE_INPUT_REQUIRED:

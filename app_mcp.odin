@@ -78,25 +78,24 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 	}
 
 	if !runtime.server_discovered[index] {
-		discover, discover_err := mcp.client_discover(client, mcp_deadline(server.discovery_timeout))
-		if discover_err.kind != .None {
-			fmt.sbprintf(warnings, "\n%s: %s", server.id, mcp.error_text(discover_err, context.temp_allocator))
-			mcp.error_destroy(&discover_err, runtime.alloc)
+		// Connecting negotiates a revision, so a server this client cannot speak to is
+		// refused here with the revision it offered rather than failing later under
+		// semantics neither side agreed to.
+		connection, connect_err := mcp.client_connect(client, mcp_deadline(server.discovery_timeout), runtime.alloc)
+		if connect_err.kind != .None {
+			fmt.sbprintf(warnings, "\n%s: %s", server.id, mcp.error_text(connect_err, context.temp_allocator))
+			if connect_err.stderr_tail != "" {
+				fmt.sbprintf(warnings, "\n%s: its last output was: %s", server.id, tail_excerpt(connect_err.stderr_tail))
+			}
+			mcp.error_destroy(&connect_err, runtime.alloc)
 			return nil, false
 		}
-		// The version is a precondition for interpreting anything else, and a server
-		// that exposes no tools has nothing to contribute.
-		if !mcp.discover_supports_version(discover) {
-			fmt.sbprintf(warnings, "\n%s: it does not support protocol version %s", server.id, mcp.PROTOCOL_VERSION)
-			mcp.discover_result_destroy(&discover, runtime.alloc)
-			return nil, false
-		}
-		if !discover.tools_supported {
+		if !connection.tools_supported {
 			fmt.sbprintf(warnings, "\n%s: it exposes no tools", server.id)
-			mcp.discover_result_destroy(&discover, runtime.alloc)
+			mcp.connection_destroy(&connection, runtime.alloc)
 			return nil, false
 		}
-		mcp.discover_result_destroy(&discover, runtime.alloc)
+		mcp.connection_destroy(&connection, runtime.alloc)
 		runtime.server_discovered[index] = true
 	}
 
@@ -189,3 +188,14 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	installed = true
 	return strings.to_string(warnings)
 }
+
+// tail_excerpt is the end of what a server wrote to standard error, bounded, which
+// is the part that says why it gave up.
+@(private)
+tail_excerpt :: proc(text: string) -> string {
+	if len(text) <= MCP_STDERR_EXCERPT { return text }
+	return text[len(text) - MCP_STDERR_EXCERPT:]
+}
+
+// MCP_STDERR_EXCERPT bounds how much of a server's own output a warning repeats.
+MCP_STDERR_EXCERPT :: 1024

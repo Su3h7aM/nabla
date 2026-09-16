@@ -17,7 +17,7 @@ test_tools_list_reads_a_page :: proc(t: ^testing.T) {
 	if owner == nil { return }
 	defer json.destroy_value(owner, context.allocator)
 
-	page, err := tools_list_decode(object, context.allocator)
+	page, err := tools_list_decode(object, .V2026_07_28, context.allocator)
 	defer tool_page_destroy(&page, context.allocator)
 	defer error_destroy(&err, context.allocator)
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
@@ -46,7 +46,7 @@ test_tools_list_rejects_a_bad_tool_and_keeps_the_good_one :: proc(t: ^testing.T)
 	if owner == nil { return }
 	defer json.destroy_value(owner, context.allocator)
 
-	page, err := tools_list_decode(object, context.allocator)
+	page, err := tools_list_decode(object, .V2026_07_28, context.allocator)
 	defer tool_page_destroy(&page, context.allocator)
 	defer error_destroy(&err, context.allocator)
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
@@ -72,7 +72,7 @@ test_tool_annotations_map_absence_to_unknown :: proc(t: ^testing.T) {
 	if owner == nil { return }
 	defer json.destroy_value(owner, context.allocator)
 
-	page, err := tools_list_decode(object, context.allocator)
+	page, err := tools_list_decode(object, .V2026_07_28, context.allocator)
 	defer tool_page_destroy(&page, context.allocator)
 	defer error_destroy(&err, context.allocator)
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
@@ -100,7 +100,7 @@ test_tools_list_refuses_malformed_results :: proc(t: ^testing.T) {
 	for text in cases {
 		owner, object := result_fixture(t, text)
 		if owner == nil { continue }
-		page, err := tools_list_decode(object, context.allocator)
+		page, err := tools_list_decode(object, .V2026_07_28, context.allocator)
 		testing.expectf(t, err.kind != .None, "%s should be refused", text)
 		tool_page_destroy(&page, context.allocator)
 		error_destroy(&err, context.allocator)
@@ -124,7 +124,7 @@ test_tool_schema_depth_is_bounded_like_the_definition_admission :: proc(t: ^test
 	if owner == nil { return }
 	defer json.destroy_value(owner, context.allocator)
 
-	page, err := tools_list_decode(object, context.allocator)
+	page, err := tools_list_decode(object, .V2026_07_28, context.allocator)
 	defer tool_page_destroy(&page, context.allocator)
 	defer error_destroy(&err, context.allocator)
 	testing.expect_value(t, err.kind, Error_Kind.None)
@@ -136,7 +136,7 @@ test_tool_schema_depth_is_bounded_like_the_definition_admission :: proc(t: ^test
 
 @(test)
 test_tools_call_params_carry_the_admitted_arguments :: proc(t: ^testing.T) {
-	params, err := tools_call_params_make("issues.create", `{"title":"a bug"}`, context.allocator)
+	params, err := tools_call_params_make("issues.create", `{"title":"a bug"}`, .V2026_07_28, context.allocator)
 	defer error_destroy(&err, context.allocator)
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
 
@@ -155,7 +155,7 @@ test_tools_call_params_carry_the_admitted_arguments :: proc(t: ^testing.T) {
 
 	// Arguments that do not parse are refused rather than sent: an endpoint cannot
 	// read them, and a caller would have no record of what it said.
-	_, bad_err := tools_call_params_make("t", `{`, context.allocator)
+	_, bad_err := tools_call_params_make("t", `{`, .V2026_07_28, context.allocator)
 	defer error_destroy(&bad_err, context.allocator)
 	testing.expect_value(t, bad_err.kind, Error_Kind.Malformed_Message)
 }
@@ -166,7 +166,7 @@ test_tools_call_params_carry_the_admitted_arguments :: proc(t: ^testing.T) {
 test_call_result_reads_completion_and_failure :: proc(t: ^testing.T) {
 	owner, object := result_fixture(t, `{"resultType":"complete","content":[{"type":"text","text":"created issue 12"}],"structuredContent":{"number":12}}`)
 	if owner == nil { return }
-	result, err := call_result_decode(object, context.allocator)
+	result, err := call_result_decode(object, .V2026_07_28, context.allocator)
 	if testing.expect_value(t, err.kind, Error_Kind.None) {
 		testing.expect(t, !result.is_error && !result.input_required)
 		if testing.expect_value(t, len(result.content), 1) {
@@ -181,7 +181,7 @@ test_call_result_reads_completion_and_failure :: proc(t: ^testing.T) {
 
 	owner, object = result_fixture(t, `{"resultType":"complete","isError":true,"content":[{"type":"text","text":"no such repo"}]}`)
 	if owner == nil { return }
-	result, err = call_result_decode(object, context.allocator)
+	result, err = call_result_decode(object, .V2026_07_28, context.allocator)
 	if testing.expect_value(t, err.kind, Error_Kind.None) {
 		testing.expect(t, result.is_error, "the failure flag is read")
 	}
@@ -198,7 +198,7 @@ test_call_result_reads_an_input_required_reply :: proc(t: ^testing.T) {
 	if owner == nil { return }
 	defer json.destroy_value(owner, context.allocator)
 
-	result, err := call_result_decode(object, context.allocator)
+	result, err := call_result_decode(object, .V2026_07_28, context.allocator)
 	defer call_result_destroy(&result, context.allocator)
 	defer error_destroy(&err, context.allocator)
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
@@ -224,7 +224,7 @@ test_call_result_reports_content_it_does_not_show :: proc(t: ^testing.T) {
 	if owner == nil { return }
 	defer json.destroy_value(owner, context.allocator)
 
-	result, err := call_result_decode(object, context.allocator)
+	result, err := call_result_decode(object, .V2026_07_28, context.allocator)
 	defer call_result_destroy(&result, context.allocator)
 	defer error_destroy(&err, context.allocator)
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
@@ -262,7 +262,7 @@ test_call_result_marks_and_bounds_the_text_it_keeps :: proc(t: ^testing.T) {
 	if owner == nil { return }
 	defer json.destroy_value(owner, context.allocator)
 
-	result, err := call_result_decode(object, context.allocator)
+	result, err := call_result_decode(object, .V2026_07_28, context.allocator)
 	defer call_result_destroy(&result, context.allocator)
 	defer error_destroy(&err, context.allocator)
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
@@ -285,10 +285,69 @@ test_call_result_refuses_malformed_results :: proc(t: ^testing.T) {
 	for text in cases {
 		owner, object := result_fixture(t, text)
 		if owner == nil { continue }
-		result, err := call_result_decode(object, context.allocator)
+		result, err := call_result_decode(object, .V2026_07_28, context.allocator)
 		testing.expectf(t, err.kind != .None, "%s should be refused", text)
 		call_result_destroy(&result, context.allocator)
 		error_destroy(&err, context.allocator)
 		json.destroy_value(owner, context.allocator)
 	}
+}
+
+// --- the handshake era --------------------------------------------------------
+
+// A handshake-era listing and call carry no resultType, because that discriminator
+// belongs to the stateless revision. Reading them with the stateless rule would
+// refuse every reply a 2025 server sends.
+@(test)
+test_handshake_era_results_carry_no_result_type :: proc(t: ^testing.T) {
+	owner, object := result_fixture(t, `{"tools":[{"name":"find_files","description":"Find a file.","inputSchema":{"type":"object"}}]}`)
+	if owner == nil { return }
+	page, page_err := tools_list_decode(object, .V2025_11_25, context.allocator)
+	if testing.expect_value(t, page_err.kind, Error_Kind.None) {
+		testing.expect_value(t, len(page.tools), 1)
+		testing.expect_value(t, page.tools[0].name, "find_files")
+	}
+	tool_page_destroy(&page, context.allocator)
+	error_destroy(&page_err, context.allocator)
+	json.destroy_value(owner, context.allocator)
+
+	owner, object = result_fixture(t, `{"content":[{"type":"text","text":"legacy ok"}],"structuredContent":{"n":1}}`)
+	if owner == nil { return }
+	result, call_err := call_result_decode(object, .V2025_11_25, context.allocator)
+	if testing.expect_value(t, call_err.kind, Error_Kind.None) {
+		// That era has no input-required reply: a result is always a completion.
+		testing.expect(t, !result.input_required, "a handshake-era result is a completion")
+		if testing.expect_value(t, len(result.content), 1) {
+			testing.expect_value(t, result.content[0].text, "legacy ok")
+		}
+		testing.expect_value(t, result.structured_json, `{"n":1}`)
+	}
+	call_result_destroy(&result, context.allocator)
+	error_destroy(&call_err, context.allocator)
+	json.destroy_value(owner, context.allocator)
+}
+
+// The stateless envelope belongs to one revision. Sending it under a handshake
+// revision would be a field the server has no reason to expect, and the negotiated
+// version is what decides.
+@(test)
+test_request_envelope_follows_the_revision :: proc(t: ^testing.T) {
+	stateless := tools_list_params_make("", .V2026_07_28, context.allocator)
+	defer json.destroy_value(json.Value(stateless), context.allocator)
+	_, stateless_has_meta := stateless["_meta"]
+	testing.expect(t, stateless_has_meta, "a stateless revision declares its version on every request")
+
+	handshake := tools_list_params_make("", .V2025_11_25, context.allocator)
+	defer json.destroy_value(json.Value(handshake), context.allocator)
+	_, handshake_has_meta := handshake["_meta"]
+	testing.expect(t, !handshake_has_meta, "a handshake revision negotiated once and carries nothing per request")
+	testing.expect_value(t, len(handshake), 0)
+
+	// The handshake itself is where the version is offered, and it carries no `_meta`
+	// either: the revision is not known until the server answers.
+	initialize := initialize_params_make(context.allocator)
+	defer json.destroy_value(json.Value(initialize), context.allocator)
+	testing.expect_value(t, wire_string(t, initialize, "protocolVersion"), PROTOCOL_VERSION_PREFERRED)
+	_, initialize_has_meta := initialize["_meta"]
+	testing.expect(t, !initialize_has_meta)
 }

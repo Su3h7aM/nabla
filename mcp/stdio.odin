@@ -96,6 +96,8 @@ stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.al
 		directory = cloned
 	}
 
+	// A dead peer must be an error, not a signal that kills the harness.
+	stdio_ignore_sigpipe()
 	pipes, child, spawned := stdio_spawn(name, raw_data(argv), raw_data(envp), directory)
 	if !spawned { return error_make(.Spawn_Failed, allocator = allocator) }
 

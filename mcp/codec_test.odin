@@ -41,7 +41,7 @@ wire_object_field :: proc(t: ^testing.T, object: json.Object, key: string) -> js
 
 @(test)
 test_request_carries_the_per_request_metadata :: proc(t: ^testing.T) {
-	params := request_params_make(1, context.allocator)
+	params := request_params_make(.V2026_07_28, 1, context.allocator)
 	params[strings.clone("cursor", context.allocator)] = json.String(strings.clone("page-2", context.allocator))
 	line, err := request_encode(METHOD_TOOLS_LIST, params, 7, context.allocator)
 	defer error_destroy(&err, context.allocator)
@@ -59,7 +59,7 @@ test_request_carries_the_per_request_metadata :: proc(t: ^testing.T) {
 	testing.expect_value(t, wire_string(t, params_object, "cursor"), "page-2")
 	meta := wire_object_field(t, params_object, "_meta")
 	if meta == nil { return }
-	testing.expect_value(t, wire_string(t, meta, META_PROTOCOL_VERSION), PROTOCOL_VERSION)
+	testing.expect_value(t, wire_string(t, meta, META_PROTOCOL_VERSION), VERSION_2026_07_28)
 	// An empty capabilities object is the declaration: the client implements no
 	// sampling, elicitation, roots, or subscriptions.
 	capabilities := wire_object_field(t, meta, META_CLIENT_CAPABILITIES)
@@ -74,7 +74,7 @@ test_request_carries_the_per_request_metadata :: proc(t: ^testing.T) {
 @(test)
 test_encoding_is_deterministic_and_a_notification_has_no_id :: proc(t: ^testing.T) {
 	encode := proc() -> string {
-		params := request_params_make(1, context.allocator)
+		params := request_params_make(.V2026_07_28, 1, context.allocator)
 		params[strings.clone("name", context.allocator)] = json.String(strings.clone("do_thing", context.allocator))
 		line, _ := request_encode(METHOD_TOOLS_CALL, params, 11, context.allocator)
 		return line

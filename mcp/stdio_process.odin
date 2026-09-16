@@ -113,6 +113,23 @@ stdio_close_pair :: proc(pair: [2]linux.Fd) {
 	_ = linux.close(pair[1])
 }
 
+// stdio_ignore_sigpipe makes a write to a pipe whose reader is gone fail with EPIPE
+// instead of terminating the writer. The default disposition of SIGPIPE kills the
+// process, which would make a server that dies mid-request fatal to the harness
+// rather than an error it reports. The disposition is process-wide and installing it
+// is idempotent, and the transport installs it because writing to a subprocess's
+// pipes is what creates the hazard.
+//
+// Every other write in the process then reports EPIPE too, which is the behaviour a
+// program with error handling wants: a closed output is a failure to handle, not a
+// reason to die without unwinding.
+stdio_ignore_sigpipe :: proc() {
+	action := linux.Sig_Action {
+		special = .SIG_IGN,
+	}
+	_ = linux.rt_sigaction(.SIGPIPE, &action, nil)
+}
+
 // stdio_set_nonblocking makes a pipe end usable from a poll loop, so reading and
 // writing can observe cancellation instead of blocking through it.
 stdio_set_nonblocking :: proc(fd: linux.Fd) -> bool {

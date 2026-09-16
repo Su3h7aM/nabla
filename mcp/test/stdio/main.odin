@@ -3,7 +3,9 @@
 // runner can deadlock on an allocator lock another thread holds.
 //
 // It runs itself in a fake-server mode: the child speaks the protocol on standard
-// input and output, and the parent drives the real client against it.
+// input and output, and the parent drives the real client against it. A scenario
+// whose name starts with "legacy" speaks the handshake era instead of the stateless
+// one, which is what makes the negotiation and both result shapes covered.
 package main
 
 import "core:encoding/json"
@@ -32,13 +34,16 @@ main :: proc() {
 		return
 	}
 	scenario_happy_path()
-	scenario_unsupported_version()
 	scenario_unusable_tool()
 	scenario_tool_failure()
 	scenario_input_required()
 	scenario_lost_reply()
 	scenario_stderr_flood()
 	scenario_oversized_message()
+	scenario_version_refused()
+	scenario_handshake()
+	scenario_handshake_server_request()
+	scenario_handshake_unsupported()
 	if failures > 0 {
 		fmt.eprintf("%d checks failed\n", failures)
 		os.exit(1)
@@ -79,6 +84,16 @@ start :: proc(client: ^mcp.Client, config: mcp.Stdio_Config) -> bool {
 }
 
 @(private)
+negotiate :: proc(client: ^mcp.Client) -> bool {
+	connection, err := mcp.client_connect(client, mcp.Control{})
+	ok := err.kind == .None
+	mcp.connection_destroy(&connection)
+	mcp.error_destroy(&err)
+	if !ok { check(false, "the server negotiates") }
+	return ok
+}
+
+@(private)
 scenario_happy_path :: proc() {
 	client: mcp.Client
 	defer mcp.client_destroy(&client)
@@ -88,16 +103,16 @@ scenario_happy_path :: proc() {
 	control := mcp.Control{}
 	// The fake server refuses to answer a request without the per-request protocol
 	// metadata, so every check below also asserts the envelope.
-	discover, discover_err := mcp.client_discover(&client, control)
-	if discover_err.kind == .None {
-		check(mcp.discover_supports_version(discover), "discovery reports this client's version")
-		check(discover.tools_supported, "discovery reports the tools capability")
-		check(discover.server_name == "fake", "discovery reports the server identity")
+	connection, connect_err := mcp.client_connect(&client, control)
+	if connect_err.kind == .None {
+		check(connection.version == .V2026_07_28, "the probe negotiates the stateless revision")
+		check(connection.tools_supported, "discovery reports the tools capability")
+		check(connection.server_name == "fake", "discovery reports the server identity")
 	} else {
 		check(false, "discovery succeeds")
 	}
-	mcp.discover_result_destroy(&discover)
-	mcp.error_destroy(&discover_err)
+	mcp.connection_destroy(&connection)
+	mcp.error_destroy(&connect_err)
 
 	page, page_err := mcp.client_tools_list(&client, control)
 	if page_err.kind == .None {
@@ -127,20 +142,19 @@ scenario_happy_path :: proc() {
 	mcp.error_destroy(&call_err)
 }
 
+// A stateless server that answers the probe but does not list this client's
+// revision is refused, and the handshake is not attempted: an answer to the probe
+// settles which era the server belongs to.
 @(private)
-scenario_unsupported_version :: proc() {
+scenario_version_refused :: proc() {
 	client: mcp.Client
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("unsupported")) { return }
 
-	discover, err := mcp.client_discover(&client, mcp.Control{})
-	if err.kind == .None {
-		check(!mcp.discover_supports_version(discover), "another version is reported as unsupported")
-		check(len(discover.supported_versions) > 0, "the versions it does support are kept")
-	} else {
-		check(false, "discovery succeeds even when the version does not match")
-	}
-	mcp.discover_result_destroy(&discover)
+	connection, err := mcp.client_connect(&client, mcp.Control{})
+	check(err.kind == .Version_Unsupported, "a stateless server without our revision is refused")
+	check(strings.contains(err.message, "2025-06-18"), "the refusal names the revisions it does support")
+	mcp.connection_destroy(&connection)
 	mcp.error_destroy(&err)
 }
 
@@ -149,7 +163,7 @@ scenario_unusable_tool :: proc() {
 	client: mcp.Client
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("bad_tool")) { return }
-
+	if !negotiate(&client) { return }
 	page, err := mcp.client_tools_list(&client, mcp.Control{})
 	if err.kind == .None {
 		check(len(page.tools) == 1, "a usable tool survives a malformed sibling")
@@ -167,6 +181,7 @@ scenario_tool_failure :: proc() {
 	client: mcp.Client
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("is_error")) { return }
+	if !negotiate(&client) { return }
 
 	result, err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Control{})
 	if err.kind == .None {
@@ -183,6 +198,7 @@ scenario_input_required :: proc() {
 	client: mcp.Client
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("input_required")) { return }
+	if !negotiate(&client) { return }
 
 	result, err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Control{})
 	if err.kind == .None {
@@ -210,6 +226,7 @@ scenario_lost_reply :: proc() {
 	client: mcp.Client
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("lost_reply", []string{marker})) { return }
+	if !negotiate(&client) { return }
 
 	result, err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Control{})
 	check(err.kind != .None, "a lost reply is a failure")
@@ -229,7 +246,7 @@ scenario_stderr_flood :: proc() {
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("stderr_flood")) { return }
 
-	_, err := mcp.client_tools_list(&client, mcp.Control{})
+	_, err := mcp.client_connect(&client, mcp.Control{})
 	check(err.kind != .None, "a server that exits without replying fails the request")
 	check(len(err.stderr_tail) > 0, "the server's own last output is attached")
 	// The flood is larger than the bound, so a bounded tail is exactly full.
@@ -243,8 +260,83 @@ scenario_oversized_message :: proc() {
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("oversized")) { return }
 
-	_, err := mcp.client_tools_list(&client, mcp.Control{})
+	_, err := mcp.client_connect(&client, mcp.Control{})
 	check(err.kind == .Message_Too_Large, "a message past the bound is refused")
+	mcp.error_destroy(&err)
+}
+
+// A handshake-era server knows nothing of the stateless probe, so the client must
+// read the refusal as "the other era" and negotiate. Both result shapes then arrive
+// without a resultType, and the requests must not carry the stateless envelope.
+@(private)
+scenario_handshake :: proc() {
+	client: mcp.Client
+	defer mcp.client_destroy(&client)
+	if !start(&client, scenario_config("legacy")) { return }
+
+	connection, connect_err := mcp.client_connect(&client, mcp.Control{})
+	if connect_err.kind == .None {
+		check(connection.version == .V2025_11_25, "the handshake takes the revision the server chose")
+		check(connection.tools_supported, "the handshake reports the tools capability")
+		check(connection.server_name == "fake", "the handshake reports the server identity, which is not under _meta")
+		check(connection.instructions != "", "the handshake keeps the server's guidance")
+	} else {
+		check(false, "a handshake-era server is negotiated with")
+	}
+	mcp.connection_destroy(&connection)
+	mcp.error_destroy(&connect_err)
+
+	page, page_err := mcp.client_tools_list(&client, mcp.Control{})
+	if page_err.kind == .None {
+		check(len(page.tools) == 1, "a listing with no resultType is read")
+	} else {
+		check(false, "a handshake-era listing is read")
+	}
+	mcp.tool_page_destroy(&page)
+	mcp.error_destroy(&page_err)
+
+	result, call_err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Control{})
+	if call_err.kind == .None {
+		check(!result.input_required, "a handshake-era result is always a completion")
+		check(len(result.content) == 1 && result.content[0].text == "legacy ok", "the text is read")
+		check(result.structured_json == `{"legacy":true}`, "structured content is read without a resultType")
+	} else {
+		check(false, "a handshake-era call is read")
+	}
+	mcp.call_result_destroy(&result)
+	mcp.error_destroy(&call_err)
+}
+
+// A handshake-era server may ask the client for something at any point, and the
+// specification requires a reply. The fake server refuses to answer the call until
+// it has seen one, so this fails loudly if the client stays silent.
+@(private)
+scenario_handshake_server_request :: proc() {
+	client: mcp.Client
+	defer mcp.client_destroy(&client)
+	if !start(&client, scenario_config("legacy_server_request")) { return }
+	if !negotiate(&client) { return }
+
+	result, call_err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Control{})
+	if call_err.kind == .None {
+		check(len(result.content) == 1 && result.content[0].text == "legacy ok", "the call completes while the server's own request is answered")
+	} else {
+		check(false, "a call completes while the server's own request is answered")
+	}
+	mcp.call_result_destroy(&result)
+	mcp.error_destroy(&call_err)
+}
+
+@(private)
+scenario_handshake_unsupported :: proc() {
+	client: mcp.Client
+	defer mcp.client_destroy(&client)
+	if !start(&client, scenario_config("legacy_unsupported")) { return }
+
+	connection, err := mcp.client_connect(&client, mcp.Control{})
+	check(err.kind == .Version_Unsupported, "a revision this client does not implement is refused")
+	check(strings.contains(err.message, "2024-11-05"), "the refusal names the revision the server chose")
+	mcp.connection_destroy(&connection)
 	mcp.error_destroy(&err)
 }
 
@@ -267,54 +359,95 @@ send_raw :: proc(text: string) {
 // string a brace opens a verb, so every literal brace in a JSON document would
 // have to be doubled.
 @(private)
-send :: proc(id, result: string) {
-	send_raw(strings.concatenate({`{"jsonrpc":"2.0","id":`, id, `,"result":`, result, `}`}, context.temp_allocator))
+send :: proc(id: i64, result: string) {
+	send_raw(
+		strings.concatenate(
+			{`{"jsonrpc":"2.0","id":`, fmt.aprintf("%d", id, allocator = context.temp_allocator), `,"result":`, result, `}`},
+			context.temp_allocator,
+		),
+	)
 }
 
 @(private)
-send_method_not_found :: proc(id: string) {
-	send_raw(strings.concatenate({`{"jsonrpc":"2.0","id":`, id, `,"error":{"code":-32601,"message":"method not found"}}`}, context.temp_allocator))
+send_method_not_found :: proc(id: i64) {
+	send_raw(
+		strings.concatenate(
+			{`{"jsonrpc":"2.0","id":`, fmt.aprintf("%d", id, allocator = context.temp_allocator), `,"error":{"code":-32601,"message":"method not found"}}`},
+			context.temp_allocator,
+		),
+	)
 }
 
-// read_request reads one newline-terminated message. The client waits for each
-// reply, so a read never carries two messages and the fake server does not need the
-// client's buffered framing.
+// Message_Reader is the fake server's line framing.
+//
+// It keeps whatever followed a message for the next read, because a client may write
+// two messages without waiting between them: `notifications/initialized` and the
+// first request after it are exactly that pair, and a reader that dropped the second
+// would leave both ends waiting forever.
 @(private)
-read_request :: proc(line: ^[dynamic]u8) -> bool {
-	clear(line)
-	buffer: [4096]u8
+Message_Reader :: struct {
+	buffer: [dynamic]u8,
+	offset: int,
+}
+
+// reader_next returns a view of the next message, or false at end of input. The view
+// is valid until the next call.
+@(private)
+reader_next :: proc(reader: ^Message_Reader) -> ([]u8, bool) {
 	for {
-		for byte, index in line^ {
-			if byte == '\n' {
-				// The message is one line; the newline is dropped.
-				resize(line, index)
-				return true
+		for index in reader.offset ..< len(reader.buffer) {
+			if reader.buffer[index] == '\n' {
+				start := reader.offset
+				reader.offset = index + 1
+				return reader.buffer[start:index], true
 			}
 		}
+		// Drop what was already returned before reading more, so the buffer holds only
+		// the unconsumed tail.
+		if reader.offset > 0 {
+			remaining := len(reader.buffer) - reader.offset
+			copy(reader.buffer[:remaining], reader.buffer[reader.offset:])
+			resize(&reader.buffer, remaining)
+			reader.offset = 0
+		}
+		buffer: [4096]u8
 		count, read_errno := linux.read(0, buffer[:])
-		if read_errno != .NONE || count <= 0 { return false }
-		append(line, ..buffer[:count])
+		if read_errno != .NONE || count <= 0 { return nil, false }
+		append(&reader.buffer, ..buffer[:count])
 	}
 }
 
-// parse_request reads the id and method, and refuses anything that does not carry
-// the per-request metadata this revision requires. That is what makes every parent
-// check above also assert the envelope.
 @(private)
-parse_request :: proc(line: string) -> (id: string, method: string, ok: bool) {
+parse :: proc(line: string) -> (json.Object, bool) {
 	value, parse_err := json.parse_string(line, .JSON, true, context.temp_allocator)
-	if parse_err != nil { return "", "", false }
+	if parse_err != nil { return nil, false }
 	object, is_object := value.(json.Object)
-	if !is_object { return "", "", false }
-	method_value, has_method := object["method"].(json.String)
-	id_value, has_id := object["id"].(json.Integer)
-	if !has_method || !has_id { return "", "", false }
-	if !request_has_metadata(object) { linux.exit_group(3) }
-	return fmt.aprintf("%d", i64(id_value), allocator = context.temp_allocator), string(method_value), true
+	if !is_object { return nil, false }
+	return object, true
 }
 
 @(private)
-request_has_metadata :: proc(object: json.Object) -> bool {
+message_id :: proc(object: json.Object) -> (i64, bool) {
+	value, present := object["id"]
+	if !present { return 0, false }
+	number, is_integer := value.(json.Integer)
+	if !is_integer { return 0, false }
+	return i64(number), true
+}
+
+@(private)
+message_method :: proc(object: json.Object) -> (string, bool) {
+	value, present := object["method"]
+	if !present { return "", false }
+	text, is_string := value.(json.String)
+	if !is_string { return "", false }
+	return string(text), true
+}
+
+// request_has_stateless_meta reports whether a request carries the per-request
+// protocol metadata the stateless revision requires.
+@(private)
+request_has_stateless_meta :: proc(object: json.Object) -> bool {
 	params_value, has_params := object["params"]
 	if !has_params { return false }
 	params, params_is_object := params_value.(json.Object)
@@ -324,7 +457,7 @@ request_has_metadata :: proc(object: json.Object) -> bool {
 	meta, meta_is_object := meta_value.(json.Object)
 	if !meta_is_object { return false }
 	version, _ := meta["io.modelcontextprotocol/protocolVersion"].(json.String)
-	if string(version) != mcp.PROTOCOL_VERSION { return false }
+	if string(version) != mcp.VERSION_2026_07_28 { return false }
 	capabilities_value, has_capabilities := meta["io.modelcontextprotocol/clientCapabilities"]
 	if !has_capabilities { return false }
 	_, capabilities_is_object := capabilities_value.(json.Object)
@@ -332,12 +465,7 @@ request_has_metadata :: proc(object: json.Object) -> bool {
 }
 
 @(private)
-request_cursor :: proc(line: string) -> string {
-	value, parse_err := json.parse_string(line, .JSON, true, context.temp_allocator)
-	if parse_err != nil { return "" }
-	defer json.destroy_value(value, context.temp_allocator)
-	object, is_object := value.(json.Object)
-	if !is_object { return "" }
+request_cursor :: proc(object: json.Object) -> string {
 	params_value, has_params := object["params"]
 	if !has_params { return "" }
 	params, params_is_object := params_value.(json.Object)
@@ -360,57 +488,134 @@ Fake_No_Description :: `{"name":"no_description","inputSchema":{"type":"object"}
 
 @(private)
 serve :: proc(scenario: string, extra: []string) {
-	line: [dynamic]u8
-	for read_request(&line) {
-		id, method, ok := parse_request(string(line[:]))
-		if !ok { continue }
-		switch method {
-		case "server/discover":
-			send(id, discover_result(scenario))
-
-		case "tools/list":
-			if scenario == "stderr_flood" {
-				flood_stderr()
-				// Exiting without a reply is the failure the parent reads, and by now
-				// the harness has had to drain the flood to let the writes complete.
-				linux.exit_group(0)
-			}
-			if scenario == "oversized" {
-				huge := strings.repeat("x", mcp.MAX_MESSAGE_BYTES + 4096, context.temp_allocator)
-				send(
-					id,
-					strings.concatenate(
-						{`{"resultType":"complete","tools":[{"name":"a","description":"`, huge, `","inputSchema":{"type":"object"}}]}`},
-						context.temp_allocator,
-					),
-				)
-				continue
-			}
-			send(id, list_result(scenario, request_cursor(string(line[:]))))
-
-		case "tools/call":
-			if scenario == "lost_reply" {
-				if len(extra) > 0 {
-					// One byte per call the server saw, so the parent can prove a lost
-					// reply was not reissued.
-					mark := [1]u8{'c'}
-					file, open_err := os.open(extra[0], {.Write, .Create, .Append})
-					if open_err == nil {
-						_, _ = os.write(file, mark[:])
-						os.close(file)
-					}
-				}
-				linux.exit_group(0)
-			}
-			send(id, call_result(scenario))
-
-		case "notifications/cancelled":
-		// Nothing to do: the fake server never has work to cancel.
-
-		case:
-			send_method_not_found(id)
+	// A scenario whose name starts with "legacy" speaks the handshake era: it knows
+	// nothing of the stateless probe, negotiates once, and carries no resultType.
+	legacy := strings.has_prefix(scenario, "legacy")
+	reader: Message_Reader
+	for {
+		message, read := reader_next(&reader)
+		if !read { break }
+		if scenario == "stderr_flood" {
+			flood_stderr()
+			// Exiting without a reply is the failure the parent reads, and by now the
+			// harness has had to drain the flood to let the writes complete.
+			linux.exit_group(0)
+		}
+		object, parsed := parse(string(message))
+		if !parsed { continue }
+		method, has_method := message_method(object)
+		if !has_method { continue }
+		id, has_id := message_id(object)
+		if !has_id {
+			// A notification. Only the handshake has one the server cares about.
+			continue
+		}
+		if legacy {
+			// Every request but the probe must not carry the stateless envelope: the
+			// handshake revisions do not define it, and the negotiated version lives in
+			// the handshake result instead. The probe is exempt because it is
+			// deliberately shaped like a stateless request, which is what makes the era
+			// unambiguous.
+			if method != "server/discover" && request_has_stateless_meta(object) { linux.exit_group(6) }
+			handle_legacy(&reader, scenario, id, method, extra)
+		} else {
+			// A stateless request without its protocol metadata is not one this server
+			// can act on, so the client is wrong rather than the request unlucky.
+			if !request_has_stateless_meta(object) { linux.exit_group(3) }
+			handle_stateless(scenario, id, method, object, message, extra)
 		}
 	}
+}
+
+@(private)
+handle_stateless :: proc(scenario: string, id: i64, method: string, object: json.Object, raw: []u8, extra: []string) {
+	switch method {
+	case "server/discover":
+		if scenario == "oversized" {
+			huge := strings.repeat("x", mcp.MAX_MESSAGE_BYTES + 4096, context.temp_allocator)
+			send(
+				id,
+				strings.concatenate(
+					{`{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"instructions":"`, huge, `"}`},
+					context.temp_allocator,
+				),
+			)
+			return
+		}
+		send(id, discover_result(scenario))
+
+	case "tools/list":
+		send(id, list_result(scenario, request_cursor(object)))
+
+	case "tools/call":
+		if scenario == "lost_reply" {
+			if len(extra) > 0 {
+				// One byte per call the server saw, so the parent can prove a lost reply
+				// was not reissued.
+				mark := [1]u8{'c'}
+				file, open_err := os.open(extra[0], {.Write, .Create, .Append})
+				if open_err == nil {
+					_, _ = os.write(file, mark[:])
+					os.close(file)
+				}
+			}
+			linux.exit_group(0)
+		}
+		send(id, call_result(scenario))
+
+	case:
+		send_method_not_found(id)
+	}
+	_ = raw
+}
+
+@(private)
+handle_legacy :: proc(reader: ^Message_Reader, scenario: string, id: i64, method: string, extra: []string) {
+	switch method {
+	case "server/discover":
+		// The stateless revision's probe is unknown here, which is exactly how the
+		// client learns which era it is talking to.
+		send_method_not_found(id)
+
+	case "initialize":
+		send(id, handshake_result(scenario))
+
+	case "tools/list":
+		send(id, strings.concatenate({`{"tools":[`, Fake_Good_A, `]}`}, context.temp_allocator))
+
+	case "tools/call":
+		if scenario == "legacy_server_request" {
+			// Ask for something this client has no capability for, then wait for its
+			// refusal. A client that stayed silent would leave this blocked, so the call
+			// it is waiting on would never be answered and the parent would see the
+			// server exit.
+			send_raw(`{"jsonrpc":"2.0","id":999,"method":"sampling/createMessage","params":{"messages":[]}}`)
+			if !await_refusal(reader, 999) { linux.exit_group(4) }
+		}
+		send(id, `{"content":[{"type":"text","text":"legacy ok"}],"structuredContent":{"legacy":true}}`)
+
+	case:
+		send_method_not_found(id)
+	}
+	_ = extra
+}
+
+// await_refusal reads until the client answers the server's own request, and reports
+// whether that answer was an error.
+@(private)
+await_refusal :: proc(reader: ^Message_Reader, id: i64) -> bool {
+	for {
+		message, read := reader_next(reader)
+		if !read { return false }
+		object, parsed := parse(string(message))
+		if !parsed { continue }
+		response_id, has_id := message_id(object)
+		if !has_id || response_id != id { continue }
+		_, has_error := object["error"]
+		_, has_result := object["result"]
+		return has_error && !has_result
+	}
+	return false
 }
 
 @(private)
@@ -422,6 +627,22 @@ discover_result :: proc(scenario: string) -> string {
 			`{"resultType":"complete","supportedVersions":`,
 			versions,
 			`,"capabilities":{"tools":{"listChanged":false}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"fake","version":"1"}}}`,
+		},
+		context.temp_allocator,
+	)
+}
+
+// handshake_result has no resultType and reports identity at its top level, which is
+// the shape the handshake revisions define.
+@(private)
+handshake_result :: proc(scenario: string) -> string {
+	version := `"2025-11-25"`
+	if scenario == "legacy_unsupported" { version = `"2024-11-05"` }
+	return strings.concatenate(
+		{
+			`{"protocolVersion":`,
+			version,
+			`,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"fake","version":"1"},"instructions":"a handshake-era test server"}`,
 		},
 		context.temp_allocator,
 	)
