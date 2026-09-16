@@ -245,6 +245,9 @@ Session_Target :: struct {
 
 run_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
+	// The tool registry borrowed the runtime's bindings, so the session goes first
+	// and the MCP clients second. A runtime that was never built owns nothing.
+	mcp_runtime_destroy(&setup.mcp)
 	_ = run_session_release(setup)
 	session.store_close(&setup.store)
 	// The log outlives the session and the store deliberately: the record of the

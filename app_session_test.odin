@@ -1136,3 +1136,43 @@ test_a_switch_records_the_claim_and_the_release :: proc(t: ^testing.T) {
 	first_text := strings.to_string(first_builder)
 	testing.expect(t, strings.contains(first_text, `"event":"session.released"`), "the replaced session's release is recorded")
 }
+
+@(test)
+test_the_mcp_lifecycle_records_name_the_server_instance :: proc(t: ^testing.T) {
+	// The process boundary is covered by the mcp stdio harness, which forks a real
+	// server. What this holds is the record contract: the fields a reader depends on
+	// and the names they are written by.
+	logs_root, root_err := os.make_directory_temp("", "nabla-app-mcp-log-*", context.allocator)
+	defer {
+		os.remove_all(logs_root)
+		delete(logs_root, context.allocator)
+	}
+	log_record: agent.Log
+	_, open_err := agent.log_open(&log_record, {directory = logs_root, enabled = true, lowest = .Info}, context.allocator)
+	if open_err != nil { testing.fail_now(t, "the log could not be opened") }
+	defer _ = agent.log_close(&log_record)
+
+	// The refresh records against the session it changes, so the binding carries one
+	// and the reader can find the records again.
+	session_id := session.Session_Id("00112233445566778899aabbccddeeff")
+	binding := agent.Log_Binding {
+		sink = &log_record,
+		correlation = agent.Log_Correlation{session_id = session_id},
+	}
+	context.logger = agent.log_logger(&binding)
+
+	log_mcp_started("files", 2)
+	log_mcp_negotiated("files", 2, {version = .V2026_07_28, server_name = "stub", server_version = "1", tools_supported = true})
+	log_mcp_stopped("files", 2, "restart")
+
+	builder := app_session_log_text(t, logs_root, session_id)
+	defer strings.builder_destroy(&builder)
+	text := strings.to_string(builder)
+	testing.expect(t, strings.contains(text, `"event":"mcp.started"`), "the launch is recorded")
+	testing.expect(t, strings.contains(text, `"event":"mcp.negotiated"`), "the negotiation is recorded")
+	testing.expect(t, strings.contains(text, `"event":"mcp.stopped"`), "the stop is recorded")
+	testing.expect(t, strings.contains(text, `"server_instance":2`), "the launch counter identifies the instance")
+	testing.expect(t, strings.contains(text, `"revision":"`), "the negotiated revision is recorded")
+	testing.expect(t, strings.contains(text, `"tools_supported":true`), "the capability answer is recorded")
+	testing.expect(t, strings.contains(text, `"reason":"restart"`), "the stop names why it stopped")
+}

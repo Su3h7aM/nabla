@@ -22,6 +22,11 @@ MCP_Runtime :: struct {
 	// which have answered discovery since they were launched.
 	server_started:     []bool,
 	server_discovered:  []bool,
+	// server_ids and server_launch name each slot for the lifecycle records, and
+	// server_launch counts launches within this run so a restart is distinguishable
+	// from a first launch without pretending to be a global identity.
+	server_ids:         []string,
+	server_launch:      []u64,
 	alloc:              mem.Allocator,
 	refresh_generation: u64,
 }
@@ -35,19 +40,32 @@ mcp_runtime_make :: proc(servers: []agent.MCP_Server_Config, alloc := context.al
 	resize(&runtime.clients, len(servers))
 	runtime.server_started = make([]bool, len(servers), alloc)
 	runtime.server_discovered = make([]bool, len(servers), alloc)
+	runtime.server_launch = make([]u64, len(servers), alloc)
+	runtime.server_ids = make([]string, len(servers), alloc)
+	for server, index in servers { runtime.server_ids[index] = strings.clone(server.id, alloc) }
 	return runtime
 }
 
 // mcp_runtime_destroy stops every server and releases the runtime. It must run only
 // once the registry that borrows the bindings is gone, which is why it is called
-// after the chat session is destroyed.
+// after the chat session is destroyed. A runtime that was never built, or was
+// already released, owns nothing.
 mcp_runtime_destroy :: proc(runtime: ^MCP_Runtime) {
+	if runtime == nil || runtime.alloc.procedure == nil { return }
 	allocator := runtime.alloc
-	for &client in runtime.clients { mcp.client_destroy(&client) }
+	for &client, index in runtime.clients {
+		if runtime.server_started[index] && mcp.client_running(&client) {
+			log_mcp_stopped(runtime.server_ids[index], runtime.server_launch[index], "released")
+		}
+		mcp.client_destroy(&client)
+	}
 	delete(runtime.clients)
 	mcp_bindings_destroy(&runtime.bindings, allocator)
 	delete(runtime.server_started, allocator)
 	delete(runtime.server_discovered, allocator)
+	delete(runtime.server_launch, allocator)
+	for id in runtime.server_ids { delete(id, allocator) }
+	delete(runtime.server_ids, allocator)
 	runtime^ = {}
 }
 
@@ -60,7 +78,10 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 	client := &runtime.clients[index]
 
 	if !mcp.client_running(client) {
-		if runtime.server_started[index] { mcp.client_destroy(client) }
+		if runtime.server_started[index] {
+			log_mcp_stopped(server.id, runtime.server_launch[index], "restart")
+			mcp.client_destroy(client)
+		}
 		config_err := mcp.client_start(client, agent.mcp_stdio_config(server), runtime.alloc)
 		if config_err.kind != .None {
 			fmt.sbprintf(warnings, "\n%s: %s", server.id, mcp.error_text(config_err, context.temp_allocator))
@@ -70,6 +91,8 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 			return nil, false
 		}
 		runtime.server_started[index] = true
+		runtime.server_launch[index] += 1
+		log_mcp_started(server.id, runtime.server_launch[index])
 		// A restarted server is a fresh one: it must be asked what it supports again.
 		runtime.server_discovered[index] = false
 	}
@@ -87,6 +110,7 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 			mcp.error_destroy(&connect_err, runtime.alloc)
 			return nil, false
 		}
+		log_mcp_negotiated(server.id, runtime.server_launch[index], connection)
 		if !connection.tools_supported {
 			fmt.sbprintf(warnings, "\n%s: it exposes no tools", server.id)
 			mcp.connection_destroy(&connection, runtime.alloc)
@@ -97,6 +121,32 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 	}
 
 	return client, true
+}
+
+// The MCP lifecycle is recorded from here because this is what launches and stops
+// the processes. The server instance is a run-local launch counter, which is what
+// tells a restart apart from the first launch. An exit status is not recorded
+// because mcp does not expose one; the record names the stop instead of inventing
+// a status.
+log_mcp_started :: proc(server_id: string, instance: u64) {
+	fields := [2]agent.Log_Field{{key = "server_id", value = server_id}, {key = "server_instance", value = instance}}
+	agent.log_emit(agent.Log_Record{level = .Info, category = .MCP, event = "mcp.started", fields = fields[:]})
+}
+
+log_mcp_negotiated :: proc(server_id: string, instance: u64, connection: mcp.Connection) {
+	fields := [5]agent.Log_Field {
+		{key = "server_id", value = server_id},
+		{key = "server_instance", value = instance},
+		{key = "revision", value = mcp.protocol_version_name(connection.version)},
+		{key = "server_name", value = connection.server_name},
+		{key = "tools_supported", value = connection.tools_supported},
+	}
+	agent.log_emit(agent.Log_Record{level = .Info, category = .MCP, event = "mcp.negotiated", fields = fields[:]})
+}
+
+log_mcp_stopped :: proc(server_id: string, instance: u64, reason: string) {
+	fields := [3]agent.Log_Field{{key = "server_id", value = server_id}, {key = "server_instance", value = instance}, {key = "reason", value = reason}}
+	agent.log_emit(agent.Log_Record{level = .Info, category = .MCP, event = "mcp.stopped", fields = fields[:]})
 }
 
 @(private)
