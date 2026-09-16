@@ -10,11 +10,13 @@ import "nabla:agent/session"
 
 // stdout contains JSONL only; diagnostics go to stderr.
 
-DIAGNOSTICS_USAGE :: "nabla diagnostics <session-id> [--request N] [--level NAME]"
+DIAGNOSTICS_USAGE :: "nabla diagnostics <session-id> [--request N] [--level NAME] [--export DIR [--include-payloads]]"
 
 diagnostics_main :: proc(args: []string) -> int {
 	session_id := session.Session_Id("")
 	selector: agent.Log_Read_Selector
+	export_directory := ""
+	include_payloads := false
 	for index := 0; index < len(args); index += 1 {
 		arg := args[index]
 		switch {
@@ -43,6 +45,19 @@ diagnostics_main :: proc(args: []string) -> int {
 			if !known { return diagnostics_bad_usage("--level takes debug, info, warn, error, or fatal") }
 			if !enabled { return diagnostics_bad_usage("--level off would visit nothing; omit it instead") }
 			selector.level = level
+		case arg == "--include-payloads":
+			include_payloads = true
+		case arg == "--export" || strings.has_prefix(arg, "--export="):
+			text := arg[len("--export"):]
+			if text == "" {
+				index += 1
+				if index >= len(args) { return diagnostics_bad_usage("--export needs a directory") }
+				text = args[index]
+			} else if text[0] == '=' {
+				text = text[1:]
+			}
+			if text == "" { return diagnostics_bad_usage("--export needs a directory") }
+			export_directory = text
 		case strings.has_prefix(arg, "-"):
 			return diagnostics_bad_usage(fmt.tprintf("unknown option %s", arg))
 		case session_id == "":
@@ -54,10 +69,17 @@ diagnostics_main :: proc(args: []string) -> int {
 	if session_id == "" { return diagnostics_bad_usage("a session id is required") }
 	if !session.session_id_valid(session_id) { return diagnostics_bad_usage("that is not a session id") }
 
+	if include_payloads && export_directory == "" {
+		return diagnostics_bad_usage("--include-payloads only applies to --export")
+	}
+
 	logs_root, directory_err := agent.log_default_directory(context.temp_allocator)
 	if directory_err != nil {
 		fmt.eprintln("nabla: the log directory could not be resolved")
 		return 1
+	}
+	if export_directory != "" {
+		return diagnostics_export(logs_root, session_id, export_directory, selector, include_payloads)
 	}
 
 	output: Diagnostics_Output
@@ -85,13 +107,15 @@ diagnostics_bad_usage :: proc(problem: string) -> int {
 // diagnostics_incomplete reports whether the read could not be trusted to be
 // complete: unreadable evidence, uninterpretable records, or a stopped visitor.
 diagnostics_incomplete :: proc(summary: agent.Log_Read_Summary) -> bool {
-	return summary.cannot_read > 0 ||
-	       summary.records_skipped > 0 ||
-	       summary.records_unsupported > 0 ||
-	       summary.records_foreign > 0 ||
-	       summary.partial_tails > 0 ||
-	       summary.runs_truncated ||
-	       summary.stopped
+	return(
+		summary.cannot_read > 0 ||
+		summary.records_skipped > 0 ||
+		summary.records_unsupported > 0 ||
+		summary.records_foreign > 0 ||
+		summary.partial_tails > 0 ||
+		summary.runs_truncated ||
+		summary.stopped \
+	)
 }
 
 Diagnostics_Output :: struct {
@@ -114,12 +138,7 @@ diagnostics_visit :: proc(user_data: rawptr, run_id: string, line: string) -> bo
 }
 
 diagnostics_report :: proc(summary: agent.Log_Read_Summary) {
-	fmt.eprintf(
-		"nabla: %d record(s), %d run(s) scanned, %d file(s) read",
-		summary.records,
-		summary.runs_scanned,
-		summary.files_read,
-	)
+	fmt.eprintf("nabla: %d record(s), %d run(s) scanned, %d file(s) read", summary.records, summary.runs_scanned, summary.files_read)
 	if summary.cannot_read > 0 { fmt.eprintf(", %d unreadable", summary.cannot_read) }
 	if summary.records_skipped > 0 { fmt.eprintf(", %d line(s) not records", summary.records_skipped) }
 	if summary.records_unsupported > 0 { fmt.eprintf(", %d unsupported version(s)", summary.records_unsupported) }

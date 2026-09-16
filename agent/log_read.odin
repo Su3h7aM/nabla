@@ -54,12 +54,71 @@ Log_Read_Summary :: struct {
 // borrowed until it returns. Returning false stops the read.
 Log_Read_Visit :: #type proc(user_data: rawptr, run_id: string, line: string) -> bool
 
-// Log_Read_Segment is one segment file of a run, with the number its name carries
-// so the read order is the write order rather than the name order.
-@(private)
-Log_Read_Segment :: struct {
+// Log_Run_Segment is one segment file of a run, with the number its name carries so
+// a caller reads the segments in the order they were written rather than in the
+// order their names happen to sort. name is owned by the caller's allocator.
+Log_Run_Segment :: struct {
 	name:   string,
 	number: u64,
+}
+
+// log_run_segments lists one run's segment files in write order. unreadable counts
+// entries that name a segment but are not a regular file, so a caller can report
+// what it did not read instead of passing it over. okay is false only when the run
+// directory itself could not be listed.
+log_run_segments :: proc(run_directory: string, allocator := context.allocator) -> (segments: [dynamic]Log_Run_Segment, unreadable: int, okay: bool) {
+	entries, list_err := os.read_all_directory_by_path(run_directory, allocator)
+	if list_err != nil { return {}, 0, false }
+	defer os.file_info_slice_delete(entries, allocator)
+
+	list, make_err := make([dynamic]Log_Run_Segment, 0, len(entries), allocator)
+	if make_err != nil { return {}, 0, false }
+	for file in entries {
+		number, is_segment := log_segment_name_number(file.name)
+		if !is_segment { continue }
+		if file.type != .Regular {
+			unreadable += 1
+			continue
+		}
+		append(&list, Log_Run_Segment{name = strings.clone(file.name, allocator) or_else "", number = number})
+	}
+	slice.sort_by(list[:], proc(a, b: Log_Run_Segment) -> bool { return a.number < b.number })
+	return list, unreadable, true
+}
+
+// log_run_segments_destroy releases what log_run_segments returned.
+log_run_segments_destroy :: proc(segments: ^[dynamic]Log_Run_Segment, allocator := context.allocator) {
+	for segment in segments^ { delete(segment.name, allocator) }
+	delete(segments^)
+}
+
+// log_read_segment_bytes reads at most limit bytes of one segment, and no more than
+// the file held when the read started, so an active writer's new tail is ignored
+// rather than copied half-written. It never follows a symlink: a link where a
+// segment should be is not a segment.
+log_read_segment_bytes :: proc(path: string, limit: int, allocator := context.allocator) -> ([]u8, bool) {
+	if limit <= 0 { return nil, false }
+	info, stat_err := os.lstat(path, allocator)
+	if stat_err != nil { return nil, false }
+	defer os.file_info_delete(info, allocator)
+	if info.type != .Regular { return nil, false }
+	if info.size <= 0 { return nil, true }
+
+	size := int(info.size)
+	if size > limit { size = limit }
+	file, open_err := os.open(path, {.Read})
+	if open_err != nil { return nil, false }
+	defer os.close(file)
+
+	buffer, alloc_err := make([]u8, size, allocator)
+	if alloc_err != nil { return nil, false }
+	read := 0
+	for read < size {
+		count, read_err := os.read(file, buffer[read:])
+		if read_err != nil || count <= 0 { break }
+		read += count
+	}
+	return buffer[:read], true
 }
 
 log_read_session :: proc(
@@ -133,31 +192,13 @@ log_read_run :: proc(
 	visit: Log_Read_Visit,
 	allocator: mem.Allocator,
 ) -> bool {
-	files, list_err := os.read_all_directory_by_path(run.path, allocator)
-	if list_err != nil {
+	segments, unreadable, listed := log_run_segments(run.path, allocator)
+	if !listed {
 		summary.cannot_read += 1
 		return true
 	}
-	defer os.file_info_slice_delete(files, allocator)
-
-	segments, segments_err := make([dynamic]Log_Read_Segment, 0, len(files), allocator)
-	if segments_err != nil {
-		summary.cannot_read += 1
-		return true
-	}
-	defer {
-		for segment in segments { delete(segment.name, allocator) }
-		delete(segments)
-	}
-	for file in files {
-		// Only a regular file whose name is one the writer produces is read: a
-		// symlink, a lease, or anything else a peer left there is not a segment.
-		if file.type != .Regular { continue }
-		number, is_segment := log_segment_name_number(file.name)
-		if !is_segment { continue }
-		append(&segments, Log_Read_Segment{name = strings.clone(file.name, allocator) or_else "", number = number})
-	}
-	slice.sort_by(segments[:], proc(a, b: Log_Read_Segment) -> bool { return a.number < b.number })
+	defer log_run_segments_destroy(&segments, allocator)
+	summary.cannot_read += unreadable
 
 	for segment in segments {
 		path, joined := log_path_join(run.path, segment.name, allocator)
@@ -165,7 +206,7 @@ log_read_run :: proc(
 			summary.cannot_read += 1
 			continue
 		}
-		content, read_okay := log_read_segment(path, allocator)
+		content, read_okay := log_read_segment_bytes(path, LOG_SEGMENT_BYTES + LOG_MAX_RECORD_BYTES, allocator)
 		delete(path, allocator)
 		if !read_okay {
 			summary.cannot_read += 1
@@ -179,26 +220,6 @@ log_read_run :: proc(
 		delete(content, allocator)
 	}
 	return true
-}
-
-// log_read_segment reads one segment, bounded by what the writer may legally
-// produce, and returns the bytes that existed when the read started. An active
-// writer appends, so anything past that point is a tail this read must not treat as
-// a record: it is ignored rather than reported as malformed.
-@(private)
-log_read_segment :: proc(path: string, allocator: mem.Allocator) -> (content: []u8, okay: bool) {
-	// lstat, not stat: a symlink where a segment should be is not a segment, and this
-	// reader never follows one out of the run directory. The File_Info owns its path,
-	// so it is released here rather than left to the allocator's bookkeeping.
-	info, stat_err := os.lstat(path, allocator)
-	if stat_err != nil { return nil, false }
-	defer os.file_info_delete(info, allocator)
-	if info.type != .Regular { return nil, false }
-	if info.size < 0 || info.size > i64(LOG_SEGMENT_BYTES + LOG_MAX_RECORD_BYTES) { return nil, false }
-	bytes, read_err := os.read_entire_file(path, allocator)
-	if read_err != nil { return nil, false }
-	if len(bytes) > int(info.size) { bytes = bytes[:int(info.size)] }
-	return bytes, true
 }
 
 // log_read_segment_lines splits one segment into lines and visits those the session

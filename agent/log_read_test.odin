@@ -242,14 +242,7 @@ log_read_test_raw_run :: proc(t: ^testing.T, logs_root, run_id, text: string) {
 
 // log_read_test_record builds one complete record line, so a test can vary the
 // fields that matter to the reader and nothing else.
-log_read_test_record :: proc(
-	run_id: string,
-	seq: int,
-	level: string,
-	event: string,
-	session_id := "",
-	request_no := 0,
-) -> string {
+log_read_test_record :: proc(run_id: string, seq: int, level: string, event: string, session_id := "", request_no := 0) -> string {
 	parts := make([dynamic]string, 0, 12, context.temp_allocator)
 	append(&parts, `{"version":1,"run_id":"`)
 	append(&parts, run_id)
