@@ -12,15 +12,16 @@ import "nabla:agent/session"
 // and the reader cannot drift from it quietly.
 
 Log_Read_Test :: struct {
-	lines: [dynamic]string, // owned copies of what the visitor saw
-	runs:  [dynamic]string, // owned copies of the run each line came from
+	lines:   [dynamic]string, // owned copies of what the visitor saw
+	runs:    [dynamic]string, // owned copies of the run each line came from
+	stopped: bool,
 }
 
 log_read_visit :: proc(user_data: rawptr, run_id: string, line: string) -> bool {
 	fixture := cast(^Log_Read_Test)user_data
 	append(&fixture.lines, strings.clone(line, context.allocator))
 	append(&fixture.runs, strings.clone(run_id, context.allocator))
-	return true
+	return !fixture.stopped
 }
 
 log_read_collect_destroy :: proc(fixture: ^Log_Read_Test) {
@@ -87,7 +88,7 @@ test_log_read_visits_only_the_session :: proc(t: ^testing.T) {
 	testing.expect(t, !strings.contains(fixture.lines[0], `"event":"run.started"`), "a run-level record is not")
 	testing.expect_value(t, fixture.runs[0], run_id)
 	testing.expect_value(t, summary.records_skipped, 0)
-	testing.expect_value(t, summary.files_skipped, 0)
+	testing.expect_value(t, summary.cannot_read, 0)
 
 	// Another session is not the one whose records these are.
 	other: Log_Read_Test
@@ -122,6 +123,29 @@ test_log_read_orders_runs_oldest_first :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_log_read_stops_when_the_visitor_stops :: proc(t: ^testing.T) {
+	logs_root := log_test_root(t)
+	defer log_test_root_remove(logs_root)
+	session_id := session.Session_Id("00112233445566778899aabbccddeeff")
+
+	older := log_read_test_run(t, logs_root, session_id, 2 * time.Hour)
+	defer delete(older, context.allocator)
+	newer := log_read_test_run(t, logs_root, session_id, time.Hour)
+	defer delete(newer, context.allocator)
+
+	fixture: Log_Read_Test
+	fixture.stopped = true
+	summary := log_read_session(logs_root, session_id, &fixture, log_read_visit)
+	defer log_read_collect_destroy(&fixture)
+
+	// One record was enough for the visitor; the newer run is left unread.
+	testing.expect_value(t, summary.records, 1)
+	testing.expect_value(t, len(fixture.lines), 1)
+	testing.expect_value(t, summary.runs_scanned, 1)
+	testing.expect(t, summary.stopped)
+}
+
+@(test)
 test_log_read_reports_a_line_it_cannot_parse :: proc(t: ^testing.T) {
 	logs_root := log_test_root(t)
 	defer log_test_root_remove(logs_root)
@@ -145,4 +169,29 @@ test_log_read_reports_a_line_it_cannot_parse :: proc(t: ^testing.T) {
 	testing.expect_value(t, summary.records, 1)
 	testing.expect_value(t, summary.records_skipped, 1)
 	testing.expect_value(t, len(fixture.lines), 1)
+}
+
+@(test)
+test_log_read_reports_missing_directories :: proc(t: ^testing.T) {
+	logs_root := log_test_root(t)
+	defer log_test_root_remove(logs_root)
+	session_id := session.Session_Id("00112233445566778899aabbccddeeff")
+	fixture: Log_Read_Test
+	defer log_read_collect_destroy(&fixture)
+
+	// No writer has created runs/ yet.
+	summary := log_read_session(logs_root, session_id, &fixture, log_read_visit)
+	testing.expect_value(t, summary.cannot_read, 1)
+	testing.expect_value(t, summary.records, 0)
+
+	// Retention can remove a run between listing runs/ and opening the run.
+	run := Log_Read_Run {
+		path   = logs_root,
+		run_id = "00112233445566778899aabbccddeeff",
+	}
+	testing.expect(t, os.remove_all(logs_root) == nil)
+	summary = {}
+	testing.expect(t, log_read_run(&summary, run, session_id, &fixture, log_read_visit, context.allocator))
+	testing.expect_value(t, summary.cannot_read, 1)
+	testing.expect_value(t, summary.files_read, 0)
 }

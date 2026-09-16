@@ -9,33 +9,24 @@ import "core:time"
 
 import "nabla:agent/session"
 
-// Reading a run is the other half of writing one. A session is selected by a field
-// rather than by a file name, because one run may hold records for several sessions
-// and one session may span many runs. What the reader could not read is counted and
-// reported rather than passed over: a diagnostic view that silently omits evidence
-// is worse than one that says it is incomplete.
-
-// Log_Read_Visit is called once per record, in the order the records were written
-// across runs. Returning false stops the read, which is what a caller that can no
-// longer write its output does.
+// The callback borrows run_id and line until it returns. Returning false stops
+// the read. Runs are grouped by directory modification time, not globally merged.
 Log_Read_Visit :: #type proc(user_data: rawptr, run_id: string, line: string) -> bool
 
-// Log_Read_Summary is what one read did, including the parts it could not do.
 Log_Read_Summary :: struct {
 	runs_scanned:    int,
 	files_read:      int,
-	files_skipped:   int,
+	// Counts directory, path allocation, and segment read failures.
+	cannot_read:     int,
 	records:         int,
 	records_skipped: int,
-	// runs_truncated says the logs held more runs than one pass inspects, so older
-	// records may exist beyond what was read.
+	// A full directory page may omit runs in any order.
 	runs_truncated:  bool,
+	stopped:         bool,
 }
 
-// log_read_session visits every record written for session_id under logs_root,
-// oldest run first. Only records that carry the session are visited: a run-level
-// record such as run.started belongs to the run rather than to the session, and its
-// run directory is named on every record that does belong to the session.
+// Only records carrying session_id are visited. Run-level framing is excluded.
+// visit must be non-nil.
 log_read_session :: proc(
 	logs_root: string,
 	session_id: session.Session_Id,
@@ -45,16 +36,22 @@ log_read_session :: proc(
 ) -> Log_Read_Summary {
 	summary: Log_Read_Summary
 	runs_directory, joined := log_path_join(logs_root, LOG_RUNS_DIRECTORY, allocator)
-	if !joined { return summary }
+	if !joined {
+		summary.cannot_read += 1
+		return summary
+	}
 	defer delete(runs_directory, allocator)
 
 	entries, read_err := os.read_directory_by_path(runs_directory, LOG_RUNS_SCAN_LIMIT, allocator)
-	if read_err != nil { return summary }
+	if read_err != nil {
+		summary.cannot_read += 1
+		return summary
+	}
 	defer os.file_info_slice_delete(entries, allocator)
 	if len(entries) == LOG_RUNS_SCAN_LIMIT { summary.runs_truncated = true }
 
-	// Oldest first. A run directory is created when its process starts, so its
-	// modification time orders the runs without reading a record.
+	// Directory modification time is only an approximate run ordering: rotation
+	// updates it too.
 	runs := make([dynamic]Log_Read_Run, 0, len(entries), allocator)
 	defer {
 		for run in runs { delete(run.path, allocator) }
@@ -63,7 +60,10 @@ log_read_session :: proc(
 	for entry in entries {
 		if entry.type != .Directory || !log_run_id_valid(entry.name) { continue }
 		path, path_joined := log_path_join(runs_directory, entry.name, allocator)
-		if !path_joined { continue }
+		if !path_joined {
+			summary.cannot_read += 1
+			continue
+		}
 		append(&runs, Log_Read_Run{path = path, run_id = entry.name, age = time.since(entry.modification_time)})
 	}
 	slice.sort_by(runs[:], proc(a, b: Log_Read_Run) -> bool { return a.age > b.age })
@@ -75,8 +75,7 @@ log_read_session :: proc(
 	return summary
 }
 
-// Log_Read_Run is one run directory a read may descend into. path is owned by the
-// read; run_id borrows the directory entry it came from.
+// path is owned; run_id borrows the directory entry.
 @(private)
 Log_Read_Run :: struct {
 	path:   string,
@@ -84,9 +83,6 @@ Log_Read_Run :: struct {
 	age:    time.Duration,
 }
 
-// log_read_run visits the records of one run and reports whether the read should
-// continue. A run whose directory cannot be listed is counted and skipped: one
-// unreadable run is not a reason to give up on the others.
 @(private)
 log_read_run :: proc(
 	summary: ^Log_Read_Summary,
@@ -98,7 +94,7 @@ log_read_run :: proc(
 ) -> bool {
 	files, list_err := os.read_all_directory_by_path(run.path, allocator)
 	if list_err != nil {
-		summary.files_skipped += 1
+		summary.cannot_read += 1
 		return true
 	}
 	defer os.file_info_slice_delete(files, allocator)
@@ -118,13 +114,13 @@ log_read_run :: proc(
 	for name in segments {
 		path, joined := log_path_join(run.path, name, allocator)
 		if !joined {
-			summary.files_skipped += 1
+			summary.cannot_read += 1
 			continue
 		}
 		content, read_err := os.read_entire_file(path, allocator)
 		delete(path, allocator)
 		if read_err != nil {
-			summary.files_skipped += 1
+			summary.cannot_read += 1
 			continue
 		}
 		summary.files_read += 1
@@ -151,9 +147,7 @@ log_read_run :: proc(
 	return true
 }
 
-// log_read_line parses one record far enough to know whether it belongs to the
-// session. The whole line is parsed rather than searched: a record may carry text a
-// peer sent, and that text must not be able to name another session.
+// Parse rather than search: peer text can contain another session's id.
 @(private)
 log_read_line :: proc(
 	summary: ^Log_Read_Summary,
@@ -182,11 +176,13 @@ log_read_line :: proc(
 	if !is_text || string(owner) != string(session_id) { return true }
 
 	summary.records += 1
-	return visit(user_data, run_id, line)
+	if !visit(user_data, run_id, line) {
+		summary.stopped = true
+		return false
+	}
+	return true
 }
 
-// log_segment_name_valid reports whether a file name is one the writer produces, so
-// nothing else in a run directory is read as a record.
 @(private)
 log_segment_name_valid :: proc(name: string) -> bool {
 	if !strings.has_prefix(name, LOG_SEGMENT_PREFIX) || !strings.has_suffix(name, LOG_SEGMENT_SUFFIX) { return false }

@@ -1,14 +1,12 @@
 package main
 
 import "core:fmt"
+import "core:io"
 
 import "nabla:agent"
 import "nabla:agent/session"
 
-// `nabla diagnostics <session-id>` prints the diagnostic records one session left,
-// oldest run first, exactly as they were written. The records go to stdout as JSON
-// Lines so a caller can pipe them into jq, and everything the command has to say
-// about what it read goes to stderr, so stdout stays a clean stream.
+// stdout contains JSONL only; diagnostics go to stderr.
 
 DIAGNOSTICS_USAGE :: "nabla diagnostics <session-id>"
 
@@ -31,8 +29,17 @@ diagnostics_main :: proc(args: []string) -> int {
 		return 1
 	}
 
-	summary := agent.log_read_session(logs_root, session_id, nil, diagnostics_visit)
+	output: Diagnostics_Output
+	output.writer = stdout_writer()
+	summary := agent.log_read_session(logs_root, session_id, &output, diagnostics_visit)
 	diagnostics_report(summary)
+	if output.broken {
+		fmt.eprintln("nabla: the output stream failed before the read was done")
+		return 1
+	}
+	if summary.cannot_read > 0 || summary.records_skipped > 0 || summary.runs_truncated || summary.stopped {
+		return 1
+	}
 	if summary.records == 0 {
 		fmt.eprintln("nabla: no diagnostic records for that session")
 		return 1
@@ -40,19 +47,30 @@ diagnostics_main :: proc(args: []string) -> int {
 	return 0
 }
 
-// diagnostics_visit prints one record as it was written. The run a record came from
-// is a field of the record, so the visitor needs nothing else.
+Diagnostics_Output :: struct {
+	writer: io.Writer,
+	broken: bool,
+}
+
+// user_data points to the Diagnostics_Output borrowed by log_read_session.
 diagnostics_visit :: proc(user_data: rawptr, run_id: string, line: string) -> bool {
-	fmt.println(line)
+	output := cast(^Diagnostics_Output)user_data
+	parts := [2]string{line, "\n"}
+	for part in parts {
+		written, write_error := io.write_string(output.writer, part)
+		if write_error != nil || written != len(part) {
+			output.broken = true
+			return false
+		}
+	}
 	return true
 }
 
-// diagnostics_report says what the read could and could not see. It describes the
-// output rather than being part of it, so it goes to stderr.
 diagnostics_report :: proc(summary: agent.Log_Read_Summary) {
-	fmt.eprintf("nabla: %d record(s) from %d run(s), %d file(s)", summary.records, summary.runs_scanned, summary.files_read)
-	if summary.files_skipped > 0 { fmt.eprintf(", %d file(s) unreadable", summary.files_skipped) }
+	fmt.eprintf("nabla: %d record(s), %d run(s) scanned, %d file(s) read", summary.records, summary.runs_scanned, summary.files_read)
+	if summary.cannot_read > 0 { fmt.eprintf(", %d unreadable", summary.cannot_read) }
 	if summary.records_skipped > 0 { fmt.eprintf(", %d line(s) unreadable", summary.records_skipped) }
-	if summary.runs_truncated { fmt.eprint(", older runs were not scanned") }
+	if summary.runs_truncated { fmt.eprint(", run scan limit reached") }
+	if summary.stopped { fmt.eprint(", read stopped by visitor") }
 	fmt.eprintln()
 }

@@ -857,9 +857,10 @@ One command reads the logs, parsed beside the existing `chat_cli_options`:
 nabla diagnostics <session-id>
 ```
 
-`agent/log_read.odin` holds the reader: it walks the run directories oldest first, reads
-whole segments, parses each line far enough to know which session it belongs to, and calls
-a visitor with the record as it was written. It parses the line rather than searching it,
+`agent/log_read.odin` holds the reader: it groups runs by directory modification time,
+reads whole segments, parses each line to select a session, and calls a visitor with the
+record as written. This is approximate run ordering, not a global timeline: rotation also
+updates directory modification time. It parses the line rather than searching it,
 because a record may carry text a peer sent and that text must not be able to name another
 session. Records are selected by the session field rather than by a file name, so a session
 that spans runs is read across all of them, and a run that holds several sessions
@@ -869,9 +870,10 @@ The command lives in root, which already resolves the logs directory and imports
 reader. Records go to stdout exactly as written, so a caller can pipe them into `jq`, and
 the count of what was read goes to stderr together with everything the reader could not
 read: an unlistable run directory, an unreadable segment, or a line that does not parse.
-That distinction is the point. A diagnostic view that silently omits evidence is worse than
-one that names it. The command exits 1 when the session left nothing, and 2 for a bad
-argument.
+A missing or unlistable logs directory is reported as unreadable, not as an empty result.
+The command exits 1 for no matching records, unreadable evidence, malformed lines, a run
+scan limit, or failed output. Bad arguments exit 2. The visitor stops scanning on a failed
+write, including a short write or a failure to write the record's newline.
 
 Run framing (`run.started`, `retention.finished`, `run.finished`) carries no session and is
 not part of a session's stream; the run a record came from is a field of the record, and
