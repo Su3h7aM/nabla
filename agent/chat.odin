@@ -77,7 +77,14 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 		if !chat_session_feed_response_output(runtime.chat, runtime.source, value.Raw_Output) {
 			chat_session_feed_error(runtime.chat, runtime.source, "tool response was rejected")
 		} else if value.Reason == .Tool_Call && len(value.Tool_Calls) > 0 {
-			notice := chat_session_feed_tool_calls(runtime.chat, runtime.source, value.Tool_Calls)
+			calls := make([dynamic]ai.Provider_Tool_Call, 0, len(value.Tool_Calls), context.temp_allocator)
+			defer delete(calls)
+			for call in value.Tool_Calls {
+				wire_call := call
+				wire_call.Name = chat_tool_canonical_name(&runtime.chat.tools, wire_call.Name)
+				append(&calls, wire_call)
+			}
+			notice := chat_session_feed_tool_calls(runtime.chat, runtime.source, calls[:])
 			if notice != .None && notice != .Ignored {
 				// The response proposed calls the harness cannot use. Executing
 				// nothing and telling the model why keeps the turn alive.

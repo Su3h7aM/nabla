@@ -2,6 +2,7 @@
 package agent
 
 import "core:encoding/json"
+import "core:strings"
 import "core:testing"
 import "core:time"
 
@@ -79,6 +80,46 @@ test_request_retry_needs_an_unexposed_attempt :: proc(t: ^testing.T) {
 	chat.pending_response_present = true
 	testing.expect(t, !chat_request_may_retry(chat, transient, 1))
 	chat.pending_response_present = false
+}
+
+// Provider function names allow underscores but not dots. The registry keeps
+// qualified names, while each request carries the provider-safe spelling and
+// the frozen registry restores returned calls before dispatch.
+@(test)
+test_build_request_normalizes_tool_names :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	definition := Tool_Definition {
+		name         = "FFF.find_files",
+		description  = "Find files.",
+		input_schema = `{"type":"object"}`,
+		execute      = tool_test_dummy_execute,
+	}
+	if !testing.expect_value(t, tool_registry_add(&chat.tools, definition).kind, Tool_Registry_Error_Kind.None) { return }
+	_test_accept(t, chat, "hi")
+
+	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+
+	found_builtin := false
+	found_mcp := false
+	for tool in prep.request.Tools {
+		testing.expect(t, !strings.contains(tool.Name, "."), "provider tool names must not contain dots")
+		if tool.Name == "builtin_edit" {
+			found_builtin = true
+			testing.expect_value(t, chat_tool_canonical_name(&chat.tools, tool.Name), "builtin.edit")
+		}
+		if tool.Name == "FFF_find_files" {
+			found_mcp = true
+			testing.expect_value(t, chat_tool_canonical_name(&chat.tools, tool.Name), "FFF.find_files")
+		}
+	}
+	testing.expect(t, found_builtin, "built-in tools are advertised")
+	testing.expect(t, found_mcp, "MCP tools are advertised")
 }
 
 @(test)
@@ -463,7 +504,7 @@ test_anthropic_request_is_shaped_by_its_adapter :: proc(t: ^testing.T) {
 	if !testing.expect(t, call_blocks_ok && len(call_blocks) == 1) { return }
 	call_block := item_object(t, call_blocks, 0)
 	testing.expect_value(t, item_string(call_block, "type"), "tool_use")
-	testing.expect_value(t, item_string(call_block, "name"), TOOL_SHELL_NAME)
+	testing.expect_value(t, item_string(call_block, "name"), "builtin_shell")
 
 	result_turn := item_object(t, messages, 2)
 	testing.expect_value(t, item_string(result_turn, "role"), "user")

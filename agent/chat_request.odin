@@ -16,20 +16,23 @@ import "nabla:ai"
 // the position the response occupies in the conversation, so replay order and
 // projection order are the same order.
 Chat_Request_Prep :: struct {
-	history:   session.Context,
-	request:   ai.Provider_Request,
-	wire:      [dynamic]ai.Provider_Message,
-	tools:     [dynamic]ai.Provider_Tool_Def,
-	calls:     [dynamic][dynamic]ai.Provider_Tool_Call,
-	feedback:  [dynamic]string, // owned; what a refused call is said to be,
-	cache_key: string, // owned; request.Prompt_Cache_Key borrows it when present,
-	estimate:  int,
+	history:    session.Context,
+	request:    ai.Provider_Request,
+	wire:       [dynamic]ai.Provider_Message,
+	tools:      [dynamic]ai.Provider_Tool_Def,
+	tool_names: [dynamic]string, // owned wire names referenced by tools and calls,
+	calls:      [dynamic][dynamic]ai.Provider_Tool_Call,
+	feedback:   [dynamic]string, // owned; what a refused call is said to be,
+	cache_key:  string, // owned; request.Prompt_Cache_Key borrows it when present,
+	estimate:   int,
 }
 
 chat_request_prep_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Allocator) {
 	session.context_destroy(&prep.history, allocator)
 	for &slot in prep.calls { delete(slot) }
 	delete(prep.calls)
+	for name in prep.tool_names { delete(name, allocator) }
+	delete(prep.tool_names)
 	delete(prep.tools)
 	delete(prep.wire)
 	for text in prep.feedback { delete(text, allocator) }
@@ -66,6 +69,7 @@ chat_build_request_into :: proc(
 ) {
 	prep.wire = make([dynamic]ai.Provider_Message, 0, len(entries) + 2, chat.allocator)
 	prep.tools = make([dynamic]ai.Provider_Tool_Def, 0, chat.allocator)
+	prep.tool_names = make([dynamic]string, 0, chat.allocator)
 	prep.calls = make([dynamic][dynamic]ai.Provider_Tool_Call, 0, chat.allocator)
 	prep.feedback = make([dynamic]string, 0, chat.allocator)
 
@@ -86,7 +90,7 @@ chat_build_request_into :: proc(
 		summary_text := strings.concatenate({"Summary of the conversation so far:\n", summary}, context.temp_allocator)
 		append(&prep.wire, ai.Provider_Message{Role = .Assistant, Content = summary_text})
 	}
-	chat_append_entries(&prep.wire, &prep.calls, &prep.feedback, connection.API, entries, dispatches, chat.allocator)
+	chat_append_entries(&prep.wire, &prep.calls, &prep.tool_names, &prep.feedback, connection.API, entries, dispatches, chat.allocator)
 
 	prep.request = ai.Provider_Request {
 		API                  = connection.API,
@@ -135,10 +139,8 @@ chat_build_request_into :: proc(
 		}
 		if chat.tools_enabled {
 			for &definition in chat.tools.definitions {
-				append(
-					&prep.tools,
-					ai.Provider_Tool_Def{Name = definition.name, Description = definition.description, Parameters_JSON = definition.input_schema},
-				)
+				wire_name := chat_tool_wire_name(&prep.tool_names, definition.name, chat.allocator)
+				append(&prep.tools, ai.Provider_Tool_Def{Name = wire_name, Description = definition.description, Parameters_JSON = definition.input_schema})
 			}
 			prep.request.Tools = prep.tools[:]
 		}
@@ -170,6 +172,7 @@ chat_build_request_into :: proc(
 chat_append_entries :: proc(
 	messages: ^[dynamic]ai.Provider_Message,
 	call_lists: ^[dynamic][dynamic]ai.Provider_Tool_Call,
+	tool_names: ^[dynamic]string,
 	feedback: ^[dynamic]string,
 	api: ai.API_Kind,
 	entries: []session.Entry,
@@ -243,7 +246,8 @@ chat_append_entries :: proc(
 			if !chat_verbatim_covers(api, covered, entry.request_no) {
 				arguments, project, _ := chat_replay_call(payload, effective[i64(entry.seq)])
 				if project {
-					append(&group, ai.Provider_Tool_Call{ID = payload.call_id, Item_ID = payload.item_id, Name = payload.name, Arguments = arguments})
+					wire_name := chat_tool_wire_name(tool_names, payload.name, allocator)
+					append(&group, ai.Provider_Tool_Call{ID = payload.call_id, Item_ID = payload.item_id, Name = wire_name, Arguments = arguments})
 					group_open = true
 				} else {
 					refused[i64(entry.seq)] = payload.name
@@ -280,6 +284,33 @@ chat_append_entries :: proc(
 // CHAT_REFUSED_CALL_SUFFIX joins a call's name to the harness's account of why it
 // was not run. It is a literal, so the same refusal always says the same bytes.
 CHAT_REFUSED_CALL_SUFFIX :: " call was refused before it ran: "
+
+// chat_tool_wire_name makes canonical dotted tool names acceptable to providers
+// that accept only letters, digits, underscores, and hyphens. The caller owns
+// the result for as long as its provider request borrows it.
+@(private)
+chat_tool_wire_name :: proc(names: ^[dynamic]string, name: string, allocator: mem.Allocator) -> string {
+	wire_name, allocated := strings.replace_all(name, ".", "_", allocator)
+	if allocated { append(names, wire_name) }
+	return wire_name
+}
+
+// chat_tool_canonical_name restores the registry name for a function call. The
+// registry is frozen while a request runs, so it is the request's tool inventory.
+// An unknown name stays unchanged so normal unavailable-tool handling can explain
+// it to the model.
+@(private)
+chat_tool_canonical_name :: proc(registry: ^Tool_Registry, wire_name: string) -> string {
+	for definition in registry.definitions {
+		candidate, allocated := strings.replace_all(definition.name, ".", "_", context.temp_allocator)
+		if candidate == wire_name {
+			if allocated { delete(candidate, context.temp_allocator) }
+			return definition.name
+		}
+		if allocated { delete(candidate, context.temp_allocator) }
+	}
+	return wire_name
+}
 
 // chat_replay_call decides what a request says a call was. A call that ran is
 // replayed with the arguments it ran with, because a repair preserves the model's
