@@ -113,6 +113,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 
 	first_setup: Run_Setup
 	first_setup.alloc = context.allocator
+	defer attach_setup_destroy(&first_setup)
 	if !testing.expect(t, run_session_attach(&first_setup, workspace, {kind = .New})) { return }
 	first := session.Session_Id(strings.clone(string(first_setup.session.id), context.allocator))
 	defer delete(string(first), context.allocator)
@@ -125,6 +126,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	time.sleep(2 * time.Millisecond)
 	second_setup: Run_Setup
 	second_setup.alloc = context.allocator
+	defer attach_setup_destroy(&second_setup)
 	if !testing.expect(t, run_session_attach(&second_setup, workspace, {kind = .New})) { return }
 	second := session.Session_Id(strings.clone(string(second_setup.session.id), context.allocator))
 	defer delete(string(second), context.allocator)
@@ -134,6 +136,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 
 	latest_setup: Run_Setup
 	latest_setup.alloc = context.allocator
+	defer attach_setup_destroy(&latest_setup)
 	if !testing.expect(t, run_session_attach(&latest_setup, workspace, {kind = .Resume_Latest})) { return }
 	testing.expect_value(t, latest_setup.session.id, second)
 	testing.expect_value(t, latest_setup.workspace, workspace)
@@ -141,6 +144,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 
 	named_setup: Run_Setup
 	named_setup.alloc = context.allocator
+	defer attach_setup_destroy(&named_setup)
 	if !testing.expect(t, run_session_attach(&named_setup, workspace, {kind = .Resume_Id, id = string(first)})) { return }
 	testing.expect_value(t, named_setup.session.id, first)
 	attach_setup_destroy(&named_setup)
@@ -154,8 +158,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 		!run_session_attach(&missing_setup, workspace, {kind = .Resume_Id, id = "00000000000000000000000000000000"}),
 		"an unknown id must not silently become a new session",
 	)
-	session.store_close(&missing_setup.store)
-	delete(missing_setup.workspace, missing_setup.alloc)
+	attach_setup_destroy(&missing_setup)
 }
 
 // The stored selection is the user's own last choice, so a launch restores it,
@@ -418,8 +421,8 @@ test_a_launch_that_is_never_prompted_leaves_no_session :: proc(t: ^testing.T) {
 
 	setup: Run_Setup
 	setup.alloc = context.allocator
-	if !testing.expect(t, run_session_attach(&setup, workspace, {kind = .New})) { return }
 	defer attach_setup_destroy(&setup)
+	if !testing.expect(t, run_session_attach(&setup, workspace, {kind = .New})) { return }
 
 	// Choosing a model or an effort is not interaction, and neither is stored with
 	// the session, so a launch that only did that has nothing in the store.
