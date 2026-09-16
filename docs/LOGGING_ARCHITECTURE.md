@@ -1,10 +1,11 @@
 # Harness logging and diagnostics architecture
 
-Status: authoritative target architecture, revised after checking Odin's logging and
-context APIs. Phases 0 through 5 are implemented, and phase 6 is implemented apart
-from the join with the session database. Section 4.1 records what the migration
-closed and what remains open; section 15 is the record of what each phase now
-contains.
+Status: authoritative architecture and close-out plan. The writer, context migration,
+correlation, lifecycle records, provider capture, MCP lifecycle evidence, reader, and
+export are implemented. Four bounded changes remain: the read-only request join, the final
+HTTP transfer summary, MCP wire capture, and the ordinary-log privacy audit. Follow mode
+is not part of the logging system. Section 15 gives the implementation order and the gate
+that closes this work.
 
 This plan is based on the complete *Nabla Logging Reference Study: goose + opencode*,
 including its appendices, at
@@ -68,11 +69,13 @@ Recheck these APIs against the installed compiler before implementing the migrat
 Given a session and a failed request, identify:
 
 - Which process, turn, logical request, retry attempt, and operation performed it.
-- What model and tool inventory were prepared, encoded, and handed to transport.
+- What model and tool inventory were prepared and encoded, and how many plaintext request
+  bytes the HTTP transport or TLS layer accepted.
 - Whether failure occurred during preparation, DNS, connect, TLS, write, response headers,
   body framing, SSE parsing, provider decoding, dispatch, or persistence.
 - Which tool identity the model returned, which canonical identity Nabla selected, and
-  which remote MCP name and JSON-RPC request were actually sent.
+  which remote MCP name and JSON-RPC line were encoded, with `Delivery_State` kept
+  separately.
 - Whether execution started, whether a result was observed, and whether that result
   committed to SQLite. These are three different facts.
 - What evidence is absent because capture was disabled, bounded, expired, or failed.
@@ -127,7 +130,7 @@ Checked source anchors:
 | `http`, `http/client` | the HTTP protocol | transfer phases, plaintext byte counts, status, declared length, failure kinds | sessions, turns, harness requests, providers, models, Nabla logging policy, log destinations, retention, a hook named after the harness |
 | `sse` | text/event-stream framing | unchanged in this plan | harness policy |
 | `ai` | provider wire protocols and one provider operation | the encoded request body it just built, the response body stream it already receives, provider operation outcomes | Nabla thresholds, log files, session correlation, retention, `agent` types, per-provider logging rules |
-| `mcp` | the MCP protocol | unchanged in this plan | harness policy |
+| `mcp` | the MCP protocol | exact framed messages borrowed by an optional operation observer | harness policy, log files, session correlation, capture quotas |
 | `agent` | the harness: turns, requests, retries, admission, compaction, tool dispatch, durability | everything that decides what is recorded: the record model, categories, levels, correlation, capture, rotation, retention, and the readers | anything from the root package, the terminal, or the TUI |
 | root `nabla` | the process: launch, config, terminal, CLI | writer lifetime, options from argv and environment, health presentation, the `diagnostics` command | the log format itself, which belongs to `agent` |
 
@@ -166,7 +169,8 @@ Inside `agent`, beside the state machine:
 | `agent/log_capture.odin` | opt-in payload capture: admission, chunk append, digests, sidecar metadata, abort |
 | `agent/log_read.odin` | parsing and scanning a run directory for diagnosis and export |
 | `agent/log_bridge.odin` | `core:log` adapter, scoped correlation bindings, structured emission entry point, stable names for domain enums |
-| `agent/log_provider.odin` | the provider observation: what one operation encoded and what came back |
+| `agent/log_provider.odin` | provider and transport observations for one attempt: what was encoded, what the HTTP client accepted, where it stopped, and what came back |
+| `agent/log_mcp.odin` | MCP exchange records and the bridge from borrowed wire messages to opt-in captures |
 | `agent/chat.odin`, `agent/chat_session.odin`, `agent/compact.odin`, `agent/tool*.odin` | emit calls at the boundaries they already own |
 | `agent/log_test.odin`, `agent/log_events_test.odin`, `agent/log_retention_test.odin`, `agent/log_read_test.odin` | unit tests |
 
@@ -184,20 +188,28 @@ Inside the libraries, only where a fact currently cannot leave the layer:
 
 | File | Change |
 |---|---|
-| `http/client/control.odin` | optional `Transfer_Observer` in `Options` |
-| `http/client/client.odin` | call the observer at phase boundaries |
-| `ai/request.odin` | optional `Provider_Operation_Observer` in `Provider_Operation_Options` |
-| `ai/http.odin` | bridge the transport observer into provider operation reports |
+| `http/client/control.odin` | optional final `Transfer_Observer` in `Options` |
+| `http/client/client.odin`, `http/client/connection.odin` | collect one transfer summary and report accepted plaintext request bytes without exposing headers or bodies |
+| `ai/request.odin` | carry the provider-owned form of the transfer summary through the existing operation observer |
+| `ai/http.odin` | map the HTTP summary into provider vocabulary |
+| `mcp/control.odin` | operation-scoped `Operation_Options` carrying the existing control and an optional `Wire_Observer` |
+| `mcp/client.odin` | report complete outgoing and incoming JSON-RPC lines while they are borrowed |
+| `db/sqlite/sqlite.odin` | explicit read-only open mode using `SQLITE_OPEN_READONLY` |
+| `agent/session/store.odin` | non-creating, non-migrating `store_open_read_only` |
 
 ### 3.4 Observation chain
 
 ```text
-http/client.Transfer_Observer            HTTP protocol facts
-        -> ai/http.odin                  provider operation facts
-ai.Provider_Operation_Observer           encoded request body, response chunks
-        -> agent/log_provider.odin       typed records and captures
-        -> context.logger binding       scoped correlation and sink selection
-agent.Log                               format, sequence, rotation, retention
+http/client.Transfer_Observer            one final HTTP transfer summary
+        -> ai/http.odin                  provider-owned transfer facts
+ai.Provider_Operation_Observer           transfer summary, encoded body, response chunks
+        -> agent/log_provider.odin       attempt records and provider captures
+
+mcp.Wire_Observer                        borrowed complete JSON-RPC lines
+        -> agent/log_mcp.odin            MCP metadata and opt-in captures
+
+context.logger binding                   scoped correlation and sink selection
+        -> agent.Log                     format, sequence, rotation, retention
 
 core:log calls in any package
         -> context.logger.procedure     ordinary messages with caller location
@@ -224,13 +236,14 @@ adds only what does not.
 | provider response bytes | `client.Chunk_Callback`, already forwarded by `ai/http.odin:http_post_sse` into `provider_http_chunk` | a capture sink |
 | provider usage, finish reason, tool calls | `ai.Provider_Event` callbacks | none |
 | the exact encoded request body | implemented borrowed report from `Provider_Request_Operation_Controlled` before deletion | preserve the report; migrate the bridge |
-| bytes handed to the transport, declared length | not exposed | `http/client` phase observation |
+| HTTP stop phase, accepted plaintext request bytes, declared response length | not exposed | one final `http/client` transfer summary, mapped through `ai` |
 | MCP delivery state | `mcp.Error.delivery` (`Delivery_State`) | none |
-| MCP server stderr excerpt | `TOOL_MCP_STDERR_EXCERPT` in `agent/tool_mcp.odin` | none |
+| exact MCP JSON-RPC messages | encoded and framed inside `mcp/client.odin`, then released or decoded | operation-scoped borrowed wire observation and opt-in capture |
+| MCP server stderr excerpt | `TOOL_MCP_STDERR_EXCERPT` in `agent/tool_mcp.odin` | metadata only; raw stderr capture is rejected |
 | process start and end | implemented `run.started` and `run.finished` | correct lifetime coverage and report sink/close failures |
 | storage commit results | `agent/session` returns | emit calls only |
 
-### 4.1 What the migration closed, and what is still open
+### 4.1 What the migration closed, and the final close-out decisions
 
 Closed by the migration and the phases that followed:
 
@@ -249,22 +262,22 @@ Closed by the migration and the phases that followed:
 | Reader accepted any matching object and only six-digit segment names | The envelope's version and run id are checked before its contents are believed; segment order comes from the parsed number; a symlink is never followed; a segment is read only up to the size it had when the read began |
 | Existing open paths did not enforce the full no-symlink contract | Segment reads use `lstat` and never follow a link |
 
-Still open, and deliberately so:
+The remaining decisions are final:
 
-| Open item | Why it is not done |
+| Item | Decision |
 |---|---|
-| The `Transfer_Observer` in `http/client` | The encoded digest and the observed response bytes already answer whether anything was sent or received. The observer is added when a phase or write count is needed, not before |
-| MCP payload capture | `mcp` exposes no observation point, and the plan keeps the protocol package free of harness policy. The `Capture_Kind` values exist so a later observation point has names to write |
-| The join with the session database | It needs a read-only connection in `agent/session`, which currently opens only a writable one. The reader and the export do not depend on it, so it is a later, separate change |
-| Follow mode and live replay | The reader is batch-only. A follow mode would use the `(run_id, seq)` cursor and would still not promise atomic replay across SQLite and JSONL |
+| HTTP transfer observation | Implement one completion callback per request. It reports the stopping phase, accepted plaintext request bytes, response status, and declared length. It never reports payload or headers and never claims peer receipt |
+| MCP payload capture | Implement an operation-scoped observer in `mcp.Operation_Options`. It borrows complete outgoing and incoming JSON-RPC lines. `agent` captures each line as one bounded artifact and links it through capture metadata |
+| MCP stderr capture | Do not implement it. Stderr belongs to the server process, not one JSON-RPC operation, and the drainer runs on another thread without request correlation. Keep the bounded excerpt and byte metadata on failures |
+| Session database join | Implement a true read-only SQLite and store open path. With `--request`, stderr shows the authoritative outcome and usage; export adds a separate `request.json`. Original log lines on stdout remain untouched |
+| Follow mode and live replay | Do not implement it as part of logging. Batch read and bounded export answer the current debugging need. A live tail would be a separate diagnostics feature with its own rotation and retention contract |
 
-Existing `core:log` calls, including HTTP server messages containing request targets or
-header text, still need a privacy review before a process that runs that server also
-installs this sink. The harness never starts one, so nothing in the current process
-reaches those calls; the note stays because the library is reusable and the sink is not
-installed by it. Fix producers rather than trying to redact arbitrary formatted text at
-the sink. Do not mechanically replace every `fmt` call with `core:log` either: a UI
-notice, a command's stdout, and a diagnostic record are three different destinations.
+The privacy review is also close-out work. Existing `core:log` producers in `http` that
+print raw request targets, request lines, header lines, or local paths must be removed or
+changed to structural facts before a future process combines the HTTP server with this
+persistent sink. Redaction does not belong in the sink because formatted text has already
+lost field boundaries. A UI notice, command stdout, and a diagnostic record remain three
+different destinations.
 
 ### 4.2 Constraints
 
@@ -459,12 +472,13 @@ an enabled open requires a valid directory and returns a concrete error otherwis
 | `Log` | allocator, owned run directory, run ID, `open` flag, policy, segment file, run lease, segment number and byte count, bounded segment sequence ranges, rollover bound, sequence, `sync.Mutex`, fixed record scratch, `Log_Health`, monotonic start tick | declared by root, opened once, lives at one stable address, released by `log_close` after all borrowers retire |
 | `Log_Health` | failed flag, first typed sink error, written/omitted counts, cleanup failures and scan-limit status | inside `Log`; read through `log_health` under the mutex |
 | `Log_Binding` | borrowed sink and correlation | root or synchronous caller stack; outlives all calls using its `log.Logger`; no allocation or destruction |
-| `Capture` | borrowed `Log`, kind, open fd, storage allowance, observed and stored byte counts, observed and stored SHA-256 contexts, truncated and failed flags, generated basename, owned correlation copy | owned by one operation; `log_capture_finish` or `log_capture_abort` closes it exactly once |
+| `Capture_Descriptor` | optional bounded server id, operation name, and external numeric id for a protocol artifact | borrowed by `log_capture_open`, copied only when present, released with the capture |
+| `Capture` | borrowed `Log`, kind, open fd, storage allowance, observed and stored byte counts, observed and stored SHA-256 contexts, truncated and failed flags, generated basename, owned correlation and descriptor copies | owned by one operation; `log_capture_finish` or `log_capture_abort` closes it exactly once |
 | `Capture_Summary` | identity, counts, digests, completeness and truncation facts | value result with fixed-size ids and digests, no borrowed capture state |
 
-`Capture_Mode :: enum { Off, Payloads }` has `Off` as zero. `Capture_Kind :: enum {
-Invalid, Provider_Request, Provider_Response, MCP_Request, MCP_Response, MCP_Stderr }`.
-`Run_Seq :: distinct u64` inside the package.
+`Capture_Mode :: enum { Off, Payloads }` has `Off` as zero. The final
+`Capture_Kind` is `{ Invalid, Provider_Request, Provider_Response, MCP_Outgoing,
+MCP_Incoming }`. `Run_Seq :: distinct u64` inside the package.
 
 Digests use `core:crypto/sha2`: `Context_256`, `init_256`, `update`, `final(ctx,
 hash[:])`, with `DIGEST_SIZE_256` of 32 bytes. Digests are stored as `[32]u8` and rendered
@@ -570,13 +584,9 @@ Minimum event contracts:
 | `agent.event_ignored` | Debug | reason, supplied turn and operation, current operation |
 | `request.prepared`, `request.recorded` | Info | purpose, model, provider, API, token estimate, context window, message and tool counts; the record marks the durable row separately from the prepare |
 | `request.admission`, `compaction.started`, `compaction.finished` | Info | estimate, budget, decision, covered sequence, checkpoint commit result |
-| `attempt.started`, `attempt.finished` | Info | attempt, remaining deadline; error kind, finish reason, status, bounded error detail, observed response byte count and coverage, duration |
+| `attempt.started`, `attempt.finished` | Info | attempt, remaining deadline; error kind, finish reason, status, bounded error detail, HTTP stop phase, accepted request-body bytes, request completeness, response-head and declared-length presence, observed streaming response bytes, duration |
 | `request.retry` | Warn | error kind, next attempt, delay |
 | `provider.encoded` | Info | body length and digest, api, model, tool count |
-| `provider.response_head` | Debug | deferred with the transport observer |
-| `transport.phase`, `transport.bytes` | Debug | deferred with the transport observer |
-| `provider.decode_failed` | Warn | deferred; the stream failure already reaches the caller as an error kind |
-| `provider.completion_received`, `provider.completion_delivered` | Debug | deferred; the completion event already reaches the caller |
 | `request.finished` | Info or Error | committed outcome, attempts, finish reason; failed requests use Error; failed persistence is recorded once as `storage.failed` |
 | `tools.refresh_started`, `tools.refresh_finished` | Info | generation, discovery/admission counts, unavailable servers, installed flag, duration |
 | `tool.binding` | Debug | candidate generation, remote and canonical names; refresh result establishes installation |
@@ -585,12 +595,11 @@ Minimum event contracts:
 | `tool.arguments_prepared` | Debug | admission status, repair classification, effective byte count |
 | `tool.dispatch_committed`, `tool.result_committed` | Info | the entry sequence the dispatch and the result were stored as, and the outcome |
 | `tool.execution_started`, `tool.execution_finished` | Info | the tool and the outcome it produced |
-| `mcp.started`, `mcp.negotiated`, `mcp.stopped` | Info | server instance, protocol revision, capability summary, exit status when observed |
+| `mcp.started`, `mcp.negotiated`, `mcp.stopped` | Info | server instance, protocol revision, capability summary, stop reason |
 | `mcp.exchange_started`, `mcp.exchange_finished` | Info | method, remote name for a call, delivery state from `mcp.Error.delivery`, duration |
-| `mcp.stderr` | Warn | tail length, exit status, error kind; the tail itself only under capture |
-| `capture.finished`, `capture.failed` | Info, Warning | artifact id and kind, observed and stored bytes, completeness, truncation, failure |
+| `mcp.stderr` | Warn | bounded tail length and error kind; raw stderr is never captured |
+| `capture.finished`, `capture.failed` | Info, Warning | artifact id and kind, observed and stored bytes, completeness, truncation, failure; optional server, operation, and external id descriptor |
 | `retention.finished` | Info | deletion counts, freed bytes, failures, unmeasured runs, incomplete scan |
-| `session.released` | Info | released session identity, emitted after the claim is gone |
 | `log.segment_removed` | Info, internal | segment number and removed first/last sequence; the private writer bypasses filtering for this metadata so rollover evidence is retained |
 
 Required fields are documented beside the procedure that emits the event and tested at the
@@ -631,60 +640,143 @@ outcome while recovery correctly reports the durable outcome as unknown. If a co
 succeeded just before a crash, the row is right and the missing record is not evidence
 against it. There is no atomicity across SQLite and a log file, and none is promised.
 
-## 8. Observation APIs, layer by layer
+### 7.1 Read-only join path
 
-### 8.1 `http/client`: transport facts
+The join uses a second SQLite connection opened for reading. It never borrows the running
+harness's `Store`, takes a session claim, starts a transaction, changes a pragma that writes,
+or runs schema migration.
+
+`sqlite.Config` gains a zero-safe mode:
 
 ```odin
-// Transfer_Phase names a stage of one HTTP transfer, in protocol terms.
+Open_Mode :: enum {
+	Read_Write_Create,
+	Read_Only,
+}
+
+Config :: struct {
+	path:            string,
+	busy_timeout_ms: int,
+	foreign_keys:    bool,
+	mode:            Open_Mode,
+}
+```
+
+The zero mode preserves today's behavior. `Read_Only` uses `SQLITE_OPEN_READONLY`; it does
+not emulate read-only operation with `PRAGMA query_only`, because that pragma does not make
+the connection itself read-only. The mode refuses a missing database and never creates
+one. Do not use SQLite's `immutable=1`: the harness may be writing the WAL at the same time,
+and immutable mode disables the change and locking checks needed to see that safely.
+SQLite 3.22 and later support read-only WAL access when the WAL and shared-memory files are
+readable or their directory is writable, as documented in SQLite's
+[`sqlite3_open_v2`](https://sqlite.org/c3ref/open.html) and
+[WAL](https://sqlite.org/wal.html) references. This project links the system SQLite; the
+checked development system reports SQLite 3.53.4. The implementation is still tested
+against a concurrent writer rather than relying on the version claim alone.
+
+`session.store_open_read_only` validates with `lstat` that the directory and database are
+the expected types and owner-private. It does not create them or repair permissions. It
+opens the connection, checks `PRAGMA user_version`, and requires exactly
+`SCHEMA_VERSION`. An older database needs one normal harness open to migrate; a newer one
+is refused. Exact version matching keeps every public read procedure safe when future
+schemas change a column shape. `Store` records that it is read-only, and
+`require_writable` refuses before SQLite does, so a caller gets the package's normal
+`.Invalid_State` contract rather than a backend-dependent error.
+
+The diagnostics command opens this store only when `--request` is present. It calls the
+existing `request_load`, closes the store before scanning files, and treats the row as the
+authoritative request result. stdout remains original JSONL records only. stderr prints a
+bounded summary containing request number, purpose, outcome, provider, requested and
+resolved model, API, timestamps, and each reported usage bucket. Missing usage is printed
+as unreported, never zero.
+
+Export adds `request.json` beside `session.jsonl` when `--request` is present. It contains
+the same metadata with explicit presence booleans for optional timestamps and usage. It
+does not contain `config_json`, `input_json`, `response_json`, or `error_json`, even with
+`--include-payloads`; that flag controls diagnostic wire artifacts, not a second export of
+the durable conversation. The file counts against the 32 MiB export bound and appears in
+the manifest with its length and digest. Its schema is fixed and flat:
+
+```text
+version, session_id, request_no
+turn_no_present, turn_no, purpose
+started_at_ms, finished_at_ms_present, finished_at_ms, outcome
+provider, model_requested, model_resolved, api
+input_tokens_present, input_tokens
+output_tokens_present, output_tokens
+cache_read_tokens_present, cache_read_tokens
+cache_write_tokens_present, cache_write_tokens
+```
+
+If the join fails, normal diagnostics still prints the log records but exits 1, while
+export records the omission and exits 1 after writing a manifest that says the bundle is
+incomplete.
+
+Tests cover a missing database without creation, symlink refusal, broad permissions,
+read-only write refusal, exact schema checks, a reader open beside a WAL writer, a request
+committed after the reader opens, absent usage, a missing request, stdout purity, and the
+manifest entry and digest for `request.json`.
+
+## 8. Observation APIs, layer by layer
+
+### 8.1 `http/client`: one final transfer summary
+
+```odin
+// Transfer_Phase is where a request stopped. Complete means the response body
+// framing finished without a transport error.
 Transfer_Phase :: enum {
+	Validate,
 	Resolve,
 	Connect,
-	Handshake,
-	Write_Head,
-	Write_Body,
-	Read_Head,
-	Read_Body,
+	TLS,
+	Request_Write,
+	Response_Head,
+	Response_Body,
 	Complete,
 }
 
-// Transfer_Report is one observation of a transfer's own progress. It reports
-// accounting, never payload: body bytes for a capture come from the buffer the
-// provider encoded and from the response chunks it already receives, so the
-// transport does not hand the same bytes out a second time.
-//
-// bytes counts plaintext payload for the whole transfer: request body bytes for
-// the write phases, response body bytes for the read phases. It excludes the
-// request line, the status line, and the header block, and it excludes TLS
-// ciphertext. declared_length is what the response head stated, kept separate
-// from what was actually read.
-Transfer_Report :: struct {
-	phase:                   Transfer_Phase,
-	bytes:                   u64,
-	status:                  u16,
-	declared_length:         u64,
-	declared_length_present: bool,
-	error:                   Error,
+// Transfer_Summary contains protocol facts only. Accepted means the plaintext
+// bytes were accepted by the socket or TLS layer. It does not mean the peer
+// received, parsed, or acted on them.
+Transfer_Summary :: struct {
+	stopped_at:                    Transfer_Phase,
+	error:                         Error,
+	request_bytes_accepted:        u64,
+	request_body_bytes_accepted:   u64,
+	request_complete:              bool,
+	response_head_received:        bool,
+	status:                        int,
+	declared_body_bytes:           u64,
+	declared_body_bytes_present:   bool,
 }
 
 Transfer_Observer :: struct {
 	user_data: rawptr,
-	report:    proc(user_data: rawptr, report: Transfer_Report),
+	complete:  proc(user_data: rawptr, summary: Transfer_Summary),
 }
 ```
 
-`Options` gains `observer: Transfer_Observer`, alongside `probe`, `ca_file`, and
-`nameservers`. A zero observer observes nothing.
+`Options` gains `observer: Transfer_Observer`. A zero observer does nothing. The client
+calls it exactly once after validation has begun, on success and on every error path. A
+single completion report is enough because the caller needs the last boundary reached and
+the accumulated counts, not a second event stream.
 
-This stays inside HTTP's subject: phases, byte counts, status, and declared length are
-facts about an HTTP transfer that any HTTP consumer could want. The hook contains no log
-level, no path, no filename, no session, no provider name, and no model. It never receives
-header text, so the `authorization` header cannot be captured here.
+`stream_request` keeps the summary on its stack and uses its named failure result when the
+deferred callback runs. `connection_write_all` returns both accepted bytes and `Error`.
+`format_request` returns the body offset, so a partial write can distinguish bytes from the
+request line and headers from body bytes. For TLS, accepted bytes are plaintext accepted by
+`SSL_write`; this still does not prove a kernel send or peer receipt. Names and comments
+must use `accepted`, never `sent` or `delivered`.
 
-`bytes` is reported for what the transport actually handled. When a write reports
-completion without a count, the report carries the previous count and no invented number;
-if partial-write evidence is needed, `connection_write_all` is extended to return it rather
-than the count being guessed.
+The response head sets status and the declared body length when a valid `Content-Length`
+exists. Chunked and close-delimited responses leave `declared_body_bytes_present=false`.
+The observer receives no URL, request target, header, body, endpoint, provider, model, or
+session. It cannot expose credentials by construction.
+
+Tests cover invalid URL, resolution failure, connect failure, TLS failure, a partial plain
+write, TLS acceptance accounting, a received non-2xx head, a declared length, chunked
+framing, a truncated body, cancellation in each blocking phase, and success. The observer is called
+once in every case and changing it from zero to non-zero does not change the transfer.
 
 ### 8.2 `ai`: provider operation facts
 
@@ -697,6 +789,29 @@ than the count being guessed.
 Provider_Operation_Stage :: enum {
 	Encoded,
 	Response_Body,
+	Transfer,
+}
+
+Provider_Transfer_Phase :: enum {
+	Validate,
+	Resolve,
+	Connect,
+	TLS,
+	Request_Write,
+	Response_Head,
+	Response_Body,
+	Complete,
+}
+
+Provider_Transfer_Summary :: struct {
+	stopped_at:                  Provider_Transfer_Phase,
+	request_bytes_accepted:      u64,
+	request_body_bytes_accepted: u64,
+	request_complete:            bool,
+	response_head_received:      bool,
+	status:                      int,
+	declared_body_bytes:         u64,
+	declared_body_bytes_present: bool,
 }
 
 // Provider_Operation_Report is one observation of a provider operation. body and
@@ -713,6 +828,10 @@ Provider_Operation_Report :: struct {
 	chunk: []u8,
 	// bytes is the running plaintext response byte count for the operation.
 	bytes: u64,
+
+	// transfer is set only for the final Transfer report. It uses ai's own
+	// vocabulary, not an http/client type, so agent never imports transport.
+	transfer: Provider_Transfer_Summary,
 }
 
 Provider_Operation_Observer :: struct {
@@ -727,10 +846,10 @@ Provider_Operation_Observer :: struct {
 `Provider_Encode_Request` succeeds and before `http_post_sse`, over the exact owned buffer
 that is about to be sent. `Response_Body` is reported from the chunk callback the
 operation already passes to `http_post_sse`, which is the one place the plaintext response
-bytes pass through. The operation's failure and completion are not reported: the caller
-already receives them as the return value and as the completion event, and a second
-channel for one fact is one too many. The hook is generic over APIs; `ai` gains no
-per-provider branch.
+bytes pass through. `Transfer` is reported once by `ai/http.odin` after mapping the HTTP
+summary into `Provider_Transfer_Summary`. The operation's error still returns through the
+normal result; the transfer report adds the boundary and accounting that result does not
+carry. The hook stays generic over APIs; `ai` gains no per-provider branch.
 
 The report carries the model and the tool count the body was built from rather than a value
 decoded back out of it. `Provider_Validate_Request` has already refused a request whose
@@ -740,33 +859,96 @@ a model cannot be produced here; the body digest covers the bytes themselves.
 This is provider protocol work, which is what `ai` is: the encoded body of a provider
 request is an `ai` fact, and no other layer can observe it before it is freed.
 
-The transport-level facts that `ai` does not own, the plaintext bytes actually handed to
-the socket and the declared response length, need an observer inside `http/client`. They
-are deliberately deferred: the encoded digest, the response byte count, and the
-transport failure kind already describe encoding and the response chunks observed. They do
-not prove that any request byte was written. Add the transport observer only when the
-missing write/phase accounting is needed; do not infer transmission from `provider.encoded`.
+`Provider_Transfer_Summary` mirrors only the fields `agent` needs: stopping phase, accepted
+request and body bytes, request completeness, response-head presence, status, and declared
+length. `ai/http.odin` owns the exhaustive mapping from `client.Transfer_Phase`; a new HTTP
+phase therefore produces a compile error until `ai` decides what it means. Do not infer
+transport acceptance from `provider.encoded`, and do not rename acceptance to delivery.
 
-### 8.3 What deliberately does not change
+### 8.3 MCP wire observation
 
-- `sse` gains nothing. An SSE parse failure already reaches `ai` as an error and leaves as
-  `Provider_Operation_Error` with kind `.Stream`. `provider_http_chunk` sees the chunks
-  forwarded on the accepted stream path, so their offset can be counted there. This does
-  not establish coverage of error responses or bytes discarded after a parse failure.
-- `mcp` gains nothing in this version. `mcp.Error.delivery` already distinguishes delivered
-  from not delivered, `agent/tool_mcp.odin` already receives a bounded stderr excerpt, and
-  the remote tool name at dispatch is chosen by `agent`, so it knows it by construction. If
-  correlation with a server's own logs later requires the JSON-RPC id, that is added inside
-  `client_exchange`, where the id is assigned, in MCP vocabulary, and not before.
+`sse` gains nothing. An SSE parse failure already reaches `ai` as an error and leaves as
+`Provider_Operation_Error` with kind `.Stream`. The provider chunk callback remains the
+owner of response-body capture.
+
+MCP gains one operation-scoped observer because the exact JSON-RPC line otherwise exists
+only between encoding and the stdio call, or between a framed read and decoding:
+
+```odin
+Wire_Direction :: enum {
+	Outgoing,
+	Incoming,
+}
+
+// message excludes the framing newline and is borrowed until report returns.
+// operation and request_id name the client exchange the line belongs to. An
+// operation-scoped notification has request_id zero.
+Wire_Report :: struct {
+	direction:  Wire_Direction,
+	operation:  string,
+	request_id: i64,
+	message:    []u8,
+}
+
+Wire_Observer :: struct {
+	user_data: rawptr,
+	report:    proc(user_data: rawptr, report: Wire_Report),
+}
+
+Operation_Options :: struct {
+	control:  Control,
+	observer: Wire_Observer,
+}
+```
+
+Do not put observation inside `mcp.Control`; that type owns cancellation and deadline
+policy. Add `Operation_Options {control: Control, observer: Wire_Observer}` and pass it to
+discovery, initialization, listing, and tool calls. Internal stdio waits receive only its
+`control` field. Both fields are borrowed for one synchronous operation, and a zero options
+value preserves today's unbounded, unobserved behavior.
+
+`client_exchange` reports the encoded request before `stdio_write_line`, every complete
+incoming line before decoding, and client-generated replies to server requests. The
+initialized notification is reported from `client_notify`. The observer sees a complete
+JSON-RPC line or nothing; it never sees a partial pipe write or the mutable decoder tree.
+`mcp.Error.delivery` remains authoritative for whether a complete operation request was
+written. Observation does not replace it.
+
+`agent/log_mcp.odin` provides `MCP_Log` and an observer constructor. Root creates a local
+`MCP_Log` with the server id for discovery and listing; the tool executor creates one under
+the call correlation. When capture is off, no observer is attached. When it is on, each
+line becomes one bounded artifact containing the exact framed bytes, including the newline.
+The capture kinds are `MCP_Outgoing` and `MCP_Incoming`. The bridge passes a bounded
+`Capture_Descriptor` with server id, operation, and request id to `log_capture_open`.
+`capture.finished` and the sidecar include those fields when present, so the link survives
+an Error logging threshold and does not depend on a second event. The generic metadata
+still carries correlation, counts, digests, truncation, and completeness.
+
+Raw MCP stderr is not captured. It is a process stream drained on another thread, may be
+written between operations, and cannot honestly inherit the current request or call. The
+bounded tail remains attached to failures, and `mcp.stderr` continues to record its size
+and error kind. Remove `MCP_Stderr` from `Capture_Kind` rather than leaving a mode that can
+never produce an artifact.
+
+Tests use the stdio harness to prove exact outgoing and incoming bytes, notification and
+server-request coverage, zero-observer behavior, quota refusal, truncation, correlation,
+and no change to retries or `Delivery_State`. A malicious line containing a secret appears
+only in the opted-in artifact, never in the metadata record.
 
 ### 8.4 Bridging
 
-`agent/log_provider.odin` holds the state one attempt reports into: response byte count
-and, once implemented, capture handles. Create it afresh inside each retry iteration.
+`agent/log_provider.odin` holds the state one attempt reports into: response byte count,
+transfer summary, and capture handles. Create it afresh inside each retry iteration.
 Install the attempt's logger binding before calling the provider operation. The observer
 is synchronous and uses that context for records, so `Provider_Log` needs no copy of the
-writer or correlation. A retry that fails before its first chunk reports zero bytes,
-never the previous attempt's count.
+writer or correlation. A retry that fails before its first chunk reports zero bytes and
+its own transfer phase, never values from the previous attempt.
+
+`attempt.finished` gains the transport stopping phase, accepted request-body bytes,
+request completeness, response-head presence, and declared length presence/value. Keep
+the existing provider error, status, observed streaming bytes, and elapsed time. Presence
+booleans stay separate from zero because an absent length and a declared empty body are
+different facts.
 
 Only attach the observer when metadata or capture policy needs it. Check whether
 `provider.encoded` is enabled before computing its digest; disabled or filtered logging
@@ -779,7 +961,7 @@ Rules for the bridge, which are the reason it is its own file:
   writes values, so nothing points into memory the operation frees. A test that copied the
   body into a thread's temporary allocator was caught by the address sanitizer, which is
   the rule enforced rather than stated.
-- The bridge holds no policy that belongs to a lower layer and no transport type.
+- The bridge holds no policy that belongs to a lower layer and no `http/client` type.
 - The callback does not mutate what it observes. Odin slices are mutable; the contract is
   read-only, and the buffer owner stays alive until the operation retires.
 
@@ -788,30 +970,26 @@ Rules for the bridge, which are the reason it is its own file:
 The log distinguishes these quantities and never presents one as another:
 
 1. encoded request body bytes, hashed over the exact buffer handed to transport;
-2. request body bytes the transport reports as written, deferred with the transport
-   observer;
-3. response body bytes received and passed to framing and parsing, counted per attempt;
-4. bytes stored in a capture, which may be a bounded prefix of (1) or (3), and arrives with
-   capture support.
+2. plaintext request and request-body bytes accepted by the socket or TLS layer;
+3. response body bytes received on the successful streaming path and passed to parsing;
+4. declared response body bytes, when a valid `Content-Length` exists;
+5. bytes stored in a capture, which may be a bounded prefix of an observed payload.
 
 `Content-Length` is reported as the declared value and separately from the body bytes
 actually observed. Response capture is the de-framed body byte stream before SSE parsing,
 not TCP packets, and it does not assume one event per chunk.
 
-A successful local write does not mean the remote received anything. The transport cannot
-prove remote receipt, and no record claims it.
+A successful local write or TLS acceptance does not mean the remote received anything.
+The transport cannot prove remote receipt, and no record uses `sent` or `delivered` for
+these HTTP counts.
 
-The current provider chunk callback observes the streaming success path. Non-2xx error
-bodies follow the transport's bounded error reader and must not be counted as zero bytes
-received merely because this observer saw no chunks. Until that path exposes its facts,
-label the count as observed streaming-body bytes and document its coverage in the record.
-
-For capture of a non-2xx response, reuse the existing error reader's bytes through a
-protocol-level report. It reads at most `HTTP_MAX_ERROR_BYTES`; reaching a proven end and
-stopping at the limit are different facts. Set `observed_complete=false` with
-`stop_reason=error_reader_limit` only when that is why observation stopped. The bounded
-excerpt still reaches the caller through `Failure.detail`. Never drain extra remote bytes
-just to complete a capture or claim bytes a callback did not observe.
+The provider chunk callback observes only a successful streaming body. A non-2xx response
+has `response_head_received=true`, its status, and the bounded `Failure.detail`; its
+`response_bytes` remains the explicitly named observed streaming-body count. Do not read or
+retain additional error-body bytes for capture. The existing 4096-byte error reader and
+2000-byte detail already answer why a provider refused the request, and draining more would
+change transport work for diagnostics. The capture contract names this omission instead of
+calling zero streaming bytes an empty response.
 
 ## 9. Lifetime, threading, startup and shutdown
 
@@ -949,10 +1127,10 @@ remains disabled. Fatal is supported as a record level, not a separate CLI mode.
 Capture does not override `off` logging. There is no provider-specific setting, and a later
 Lua setting reuses the same `Log_Options` rather than adding a second parser.
 
-`payloads` is explicit consent to sensitive local content. Today the producers are the
-provider request body and the de-framed provider response stream; MCP payloads and MCP
-stderr have `Capture_Kind` names but no producer yet, because that would need an
-observation point inside `mcp`. It does not capture authentication headers or the process
+`payloads` is explicit consent to sensitive local content. Producers are the provider
+request body, the de-framed successful provider response stream, and complete MCP outgoing
+and incoming JSON-RPC lines. It does not capture HTTP headers, authentication fields,
+non-2xx response bodies beyond the bounded logged detail, MCP stderr, or the process
 environment. Captured bodies can themselves contain secrets. Raw bytes and guaranteed
 redaction are incompatible, so the mode is not described as safe, and enabling it prints
 one local warning through the normal notice path.
@@ -968,10 +1146,13 @@ storing them. A digest therefore describes what was
 observed, never bytes that were never delivered to the hook.
 
 `log_capture_finish` closes the payload, then writes a bounded metadata sidecar through a
-temporary file and a rename. The sidecar, capped at `MAX_RECORD_BYTES`, carries the format
-version, full correlation, kind, observed and stored counts, observed and stored digests,
-and the completeness, truncation, and error facts. A stored artifact can be a complete
-observation and a truncated copy at the same time; the two flags are separate.
+temporary file and a rename. The sidecar, capped at `LOG_CAPTURE_SIDECAR_BYTES`, carries
+the format version, full correlation, kind, observed and stored counts, observed and stored
+digests, the completeness, truncation, and error facts, and the optional bounded capture
+descriptor. Provider kinds keep their existing wire names. MCP uses `mcp-outgoing` and
+`mcp-incoming`; remove the unused `mcp-stderr` kind. A
+stored artifact can be a complete observation and a truncated copy at the same time; the
+two flags are separate.
 
 A crash between payload and sidecar leaves a `.part` file or a final file with no sidecar.
 Readers never infer completion from a filename, and an orphan is never promoted to a
@@ -1146,44 +1327,48 @@ reads and line parsing are bounded by the writer's limits, each segment is read 
 it had at the start, and the version, run id, and sequence are validated. Directory and
 allocation failures stay visible in the summary.
 
-Still to build in this phase:
+The remaining reader work is the request join in section 7.1. It runs only for
+`--request`, reports the durable row to stderr, and keeps stdout as original JSONL.
 
-- the join with the session database, so a request's stored outcome and usage appear
-  beside its records, through a read-only connection rather than the store's writable one
-- a follow mode, which would use the `(run_id, seq)` cursor and rescan new segments
-
-The reader is batch-only. Follow mode, if it is ever needed, uses that cursor and rescans
-new segments, and it never claims atomic live replay across SQLite and JSONL.
+The reader stays batch-only. Follow mode is not deferred logging work; it is a separate
+feature if a user later needs to watch a live run. Nothing in the format prevents such a
+command from using `(run_id, seq)`, but the logging completion gate does not include one.
 
 The export bundle is laid out as:
 
 ```text
 manifest.json
 session.jsonl
+request.json                         # only with --request
 runs/<run-id>/events.jsonl
 runs/<run-id>/captures/<artifacts, only with explicit inclusion>
 ```
 
 The manifest records the format version, the selection, the snapshot time, per-file length
-and digest, and every missing, truncated, or disabled piece of evidence. Destination
-creation is exclusive with 0700 and 0600 permissions, and every file in the bundle is new,
-so an export never mixes with what a previous one left behind. The default export contains
-correlated metadata only. Payload artifacts and session content are omitted unless
-`--include-payloads` is given, which is the same flag that includes the artifacts, and an
-omitted artifact is recorded as an omission rather than passed over.
+and digest, the request join when selected, and every missing, truncated, or disabled
+piece of evidence. Destination creation is exclusive with 0700 and 0600 permissions, and
+every file in the bundle is new, so an export never mixes with what a previous one left
+behind. The default export contains correlated metadata only. `request.json` contains
+durable outcome and usage metadata, never the request's stored semantic input, response,
+error, or
+configuration JSON. `--include-payloads` adds diagnostic provider and MCP wire artifacts;
+it does not turn the export into a conversation dump. An omitted artifact is recorded as
+an omission rather than passed over.
 
-The default total export cap is 32 MiB across every file. The session stream is written
-first, then each contributing run's own stream, then opted-in artifacts within the
-remaining budget. Every omission is recorded with its reason, and unrelated recent requests
+The default total export cap is 32 MiB across every file. `request.json` is written first
+when selected, then the session stream, each contributing run's own stream, and opted-in
+artifacts within the remaining budget. Every omission is recorded with its reason, and unrelated recent requests
 are never added to fill a quota. A segment is read only up to the size it had when the read
 began, so an active writer's incomplete tail is ignored rather than copied half-written.
 A rotation race produces an explicit missing-file notice.
 
 ## 14. Walkthroughs
 
-**A remote error about an unknown or blank model.** Find the logical request in the
-database, then its `provider.encoded` record: api, model, tool count, body length, digest,
-and the response byte count on the `attempt.finished` that followed it. `ai` rejects a
+**A remote error about an unknown or blank model.** Run diagnostics with `--request` so the
+durable outcome and usage appear first, then inspect `provider.encoded`: api, model, tool
+count, body length, and digest. `attempt.finished` says whether the HTTP layer accepted the
+whole request body, whether a response head arrived, its status and declared length, and
+the observed streaming response bytes. `ai` rejects a
 missing or empty model before encoding, so a record cannot show an empty model unless the
 harness itself is broken, and the digest makes the encoded bytes checkable rather than
 inferred. Zero observed streaming-body bytes does not prove that no response arrived:
@@ -1201,8 +1386,10 @@ names were sent.
 
 **An MCP server reporting an unknown tool.** Follow `call_seq` to the server id and instance,
 then compare the discovery remote name, the binding name, and the name sent in `tools/call`.
-Record generation changes and restarts. Delivery state comes from `mcp.Error.delivery`, and a
-missing result is reported as unknown rather than as failure.
+With payload capture on, the outgoing artifact contains the exact framed JSON-RPC request
+and the incoming artifact contains the peer's exact line; their sidecars name the server,
+operation, request id, and call correlation. Delivery state still comes from
+`mcp.Error.delivery`, and a missing result is reported as unknown rather than as failure.
 
 **A crash during a tool.** A committed dispatch with no committed result stays unknown even
 if the log holds an observed result. The report shows both the observed diagnostic outcome
@@ -1211,10 +1398,10 @@ records.
 
 ## 15. Implementation sequence
 
-The original phase numbers remain to locate existing work. They are not completion
-certificates. First perform phase 0, then close the correctness gaps in phases 1 through
-3 before adding capture or export. Split each phase into coherent commits where needed;
-unrelated execution-policy changes do not ride along.
+The original phase numbers remain to locate existing work. Phases 0 through 3 are closed;
+phases 4 through 6 name the three remaining implementation changes. The close-out order at
+the end of this section is normative. Keep each package-boundary change in its own commit;
+unrelated execution policy does not ride along.
 
 ### Phase 0: migrate to Odin's logger and context
 
@@ -1323,7 +1510,7 @@ that logging observes a turn rather than taking part in it. Root records
 `session.claimed` and `session.recovered` where it claims the session and settles what an
 earlier run left. Run `mise run test agent`, `mise run test .`, and `mise run check`.
 
-Still to record: none. Admission, compaction, claim, release, and recovery are all
+This phase is complete. Admission, compaction, claim, release, and recovery are all
 recorded at the boundaries that own them.
 
 ### Phase 4: provider observation, transport accounting, and capture
@@ -1331,19 +1518,20 @@ recorded at the boundaries that own them.
 The provider observation is implemented: `Provider_Operation_Observer` in
 `ai/request.odin`, reported at encode time and from the response chunk callback, and the
 bridge in `agent/log_provider.odin` that turns it into `provider.encoded` and an observed
-streaming-body byte count on the attempt that ends. Phase 0 repairs attempt state and
-binding; section 8.5 specifies the missing non-2xx observation coverage. The report borrows
-bytes for the call only, so the bridge hashes the body and records values rather than
-keeping a pointer. Lifetime tests must consume or own their bytes before callback return.
+streaming-body byte count on the attempt that ends. Section 8.5 states the deliberate
+non-2xx coverage limit. The report borrows bytes for the call only, so the bridge hashes
+the body and records values rather than keeping a pointer. Lifetime tests must consume or
+own their bytes before callback return.
 
 Tests: the transport fixture reports what one operation encoded and received, and the bridge
 records the digest of those exact bytes, checked against a digest computed outside the code
 under test. Run `mise run test ai`, `mise run test agent`, and `mise run test .`.
 
-Still to build in this phase, when a question needs it: the `Transfer_Observer` in
-`http/client` for the bytes actually handed to the socket and the declared response length.
-It is the one deferred observer, because the encoded digest and the observed response
-bytes already answer whether anything was sent or received.
+Remaining in this phase: implement the one-shot transfer summary in section 8.1, map it
+through `ai`, and add its facts to `attempt.finished`. This is now required close-out work:
+without it a connect failure, partial write, and failure after a response head can collapse
+to the same high-level transport error. The report uses accepted-byte language and never
+claims transmission or receipt.
 
 Done: `agent/log_capture.odin` with its per-artifact and per-run quotas, sidecar metadata,
 digests, and the `NABLA_LOG_CAPTURE` switch, driven from the provider observation. A
@@ -1364,11 +1552,11 @@ generation; and `app_mcp.odin` records `mcp.started`, `mcp.negotiated`, and `mcp
 with a run-local launch counter, so a restart is distinguishable from a first launch. The
 MCP clients are released at teardown, which they previously were not.
 
-`mcp` itself is unchanged: delivery comes from `mcp.Error.delivery` rather than being
-inferred, the remote name being sent is the one `agent` chose, and `tools/call` is never
-automatically retried. MCP payload capture remains open because it would need an
-observation point inside `mcp`; the `Capture_Kind` values exist so a later one has names
-to write.
+Remaining in this phase: add the operation-scoped MCP wire observer from section 8.3 and
+bridge it to `MCP_Outgoing` and `MCP_Incoming` captures. Delivery still comes from
+`mcp.Error.delivery`, the remote name remains the one `agent` chose, and `tools/call` is
+never automatically retried. Raw stderr capture is rejected and its unused capture kind is
+removed.
 
 Tests: a remote name containing underscores and dots; a renamed local alias; a disabled
 discovery entry; a server restart; a malformed reply; a timeout after send; stderr
@@ -1385,10 +1573,48 @@ as they were written while reporting what could not be read, and takes `--reques
 the bundle section 13 lays out, with its manifest and its omissions. Tests hold the reader
 to records the writer produced, and the export to a bundle read back off disk.
 
-Still to build: the read-only database join, and the follow mode. Both are listed in
-section 4.1 with the reason they are not here yet.
+Remaining in this phase: the read-only database join in section 7.1. Follow mode is not
+part of this phase or the logging completion gate.
 
 Run `mise run test agent`, `mise run test .`, and `mise run check`.
+
+### Close-out order
+
+Finish the system in four reviewable changes. Do not combine them: each one crosses a
+different package boundary and has a different failure contract.
+
+1. **Read-only store and request join.** Add `sqlite.Open_Mode`, backend tests,
+   `session.store_open_read_only`, diagnostics stderr reporting, `request.json`, and export
+   tests. This change proves the authoritative row can be read without a writer claim,
+   migration, or database creation.
+2. **HTTP transfer summary.** Add accepted-byte accounting to the connection, one final
+   transfer callback, the exhaustive `ai` mapping, and attempt fields. Test partial plain
+   writes, TLS acceptance accounting, and every stop phase before changing the event
+   contract.
+3. **MCP wire capture.** Add `mcp.Operation_Options`, instrument all client
+   message paths, bridge capture in `agent` and root, rename the capture kinds, and remove
+   `MCP_Stderr`. The stdio harness proves exact bytes and unchanged delivery semantics.
+4. **Persistent-log privacy audit.** Remove raw request targets, request/header lines, and
+   local paths from ordinary `core:log` calls in `http`. Keep structural error and phase
+   facts. Add focused tests where formatting policy is testable; otherwise review every
+   remaining producer manually and record the list in the change description.
+
+The logging system is complete when all four changes are merged and these statements are
+true:
+
+- a failed provider attempt names the last HTTP phase and accepted request bytes without
+  claiming peer receipt;
+- payload capture includes provider bodies and exact MCP JSON-RPC lines, but not headers,
+  credentials, process environment, non-2xx bodies beyond bounded detail, or MCP stderr;
+- `diagnostics --request` reports the durable outcome and usage without changing stdout,
+  and export includes a hashed `request.json`;
+- no known ordinary `core:log` producer persists a raw HTTP request target,
+  request/header line, credential, environment value, peer payload, or local file path;
+  the structured provider error field remains the documented bounded exception;
+- logging and observers remain optional and do not change retries, delivery state, durable
+  rows, tool execution count, or process exit status;
+- the architecture document has no pending logging item. Follow mode remains an explicit
+  non-goal, not unfinished work.
 
 `mise run check` accompanies code changes, and `mise run fmt` formats Odin. Run affected
 package tests in release and debug during each change. Before declaring the migration
@@ -1398,18 +1624,19 @@ borrowed lifetime, privacy, or diagnostic completeness; the boundary tests above
 
 ## 16. Deliberate limits
 
-The metadata baseline is implemented: a failed request can be reconstructed from its
-attempts, correlation, encoded body evidence, tool resolution, and observed versus durable
-outcomes, and with capture on the log states exactly which observed bytes were kept and
-which were not. The command line reads and exports it. What the log still cannot establish
-is stated in section 4.1 rather than inferred: transmission, an untransmitted phase, MCP
-payloads, and anything the session database alone knows without the join.
+After the close-out changes, a failed request can be reconstructed from its attempts,
+correlation, encoded body evidence, HTTP stop phase, tool resolution, MCP wire evidence,
+and observed versus durable outcomes. The command line reads and exports it. The system
+still cannot prove that an HTTP peer received or acted on accepted bytes, and it never
+claims that it can.
 
-Not included: OTLP, remote upload, metrics backends, a live event bus, a trace-tree UI,
-per-token Info records, a package-global logger, a logging thread, a second SQLite event
-store, and a diagnostics package. Not promised: power-loss durability, a hard quota across unlimited
-concurrent processes, and safety to publish metadata or captures without review.
+Not included: OTLP, remote upload, metrics backends, follow mode, a live event bus, a
+trace-tree UI, per-token Info records, raw MCP stderr capture, non-2xx body capture beyond
+the bounded error detail, a package-global logger, a logging thread, a second SQLite event
+store, and a diagnostics package. Not promised: power-loss durability, a hard quota across
+unlimited concurrent processes, and safety to publish metadata or captures without review.
 
-Extend only when a debugging need is observed. The structure above follows one request from
-preparation through transport, tool execution, and committed recovery state without making
-diagnostics a second execution system.
+Further work needs a new debugging requirement. It is not part of finishing this logging
+system. The architecture follows one request from preparation through transport, tool
+execution, and committed recovery state without making diagnostics a second execution
+system.
