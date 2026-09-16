@@ -60,12 +60,26 @@ import "core:strings"
 
 import "nabla:db"
 
+// Open_Mode says whether a connection may write. Zero is `Read_Write_Create`,
+// so an existing Config that never mentions this field keeps the behavior it
+// had.
+//
+// Read_Only refuses a database that does not exist and never creates one. It is
+// the open flag itself, not `PRAGMA query_only`: that pragma leaves a
+// connection writable for checkpoints and commits, so it does not make a
+// connection read-only.
+Open_Mode :: enum {
+	Read_Write_Create,
+	Read_Only,
+}
+
 // Config describes one SQLite database to open. Its zero value opens a private
 // temporary database and enforces nothing, which is rarely what a caller wants:
 // set path and foreign_keys.
 Config :: struct {
 	// path is the database file. ":memory:" opens a private in-memory database
-	// and "" a private temporary one on disk.
+	// and "" a private temporary one on disk. A read-only connection refuses an
+	// empty or in-memory path, which has nothing on disk to read.
 	path:            string,
 
 	// busy_timeout_ms is how long SQLite waits for another connection to
@@ -79,6 +93,10 @@ Config :: struct {
 	// a schema that relies on foreign keys is silently unenforced unless this
 	// is set.
 	foreign_keys:    bool,
+
+	// mode is whether the connection may write. The zero value creates the
+	// database when it is missing, which is what every writer wants.
+	mode:            Open_Mode,
 }
 
 // Conn is the backend state behind a db.Conn this package opened. It is private
@@ -117,8 +135,9 @@ DRIVER: db.Driver = {
 // connection is fully configured before it is returned, so a caller that gets
 // no error has a database it can use.
 //
-// Every allocation the connection makes comes from allocator, which db.close
-// hands back to this package.
+// A read-only open refuses a database that does not exist; it never creates one
+// and never modifies the schema. Every allocation the connection makes comes
+// from allocator, which db.close hands back to this package.
 @(require_results)
 open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> db.Error {
 	// Checked before the path reaches SQLite: open_v2 creates the file, so a
@@ -132,6 +151,13 @@ open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> 
 
 	if strings.contains_rune(config.path, 0) {
 		return db.error_make(.Invalid_Argument, 0, "database path contains a NUL byte")
+	}
+
+	// A read-only connection has no file to fall back on, so SQLite's own
+	// private temporary database would be an empty database this call invented
+	// rather than the one the caller named.
+	if config.mode == .Read_Only && (config.path == "" || config.path == ":memory:") {
+		return db.error_make(.Invalid_Argument, 0, "a read-only connection needs a database file")
 	}
 
 	state, alloc_err := new(Conn, allocator)
@@ -148,7 +174,9 @@ open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> 
 		free(state, allocator)
 		return db.error_make(.Out_Of_Memory, 0, "database path allocation failed")
 	}
-	rc := open_v2(path, &state.handle, c.int(OPEN_READWRITE | OPEN_CREATE), nil)
+	flags := OPEN_READWRITE | OPEN_CREATE
+	if config.mode == .Read_Only { flags = OPEN_READONLY }
+	rc := open_v2(path, &state.handle, c.int(flags), nil)
 	if rc != .OK {
 		// open_v2 returns a handle even when it fails, and that handle still
 		// has to be closed. errmsg is read before that happens.

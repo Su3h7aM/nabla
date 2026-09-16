@@ -23,6 +23,7 @@ import "nabla:agent/session"
 
 EXPORT_MANIFEST_NAME :: "manifest.json"
 EXPORT_SESSION_NAME :: "session.jsonl"
+EXPORT_REQUEST_NAME :: "request.json"
 EXPORT_RUN_EVENTS_NAME :: "events.jsonl"
 EXPORT_RUNS_DIRECTORY :: "runs"
 EXPORT_CAPTURES_DIRECTORY :: "captures"
@@ -41,9 +42,43 @@ Export_Manifest :: struct {
 	created_unix_ns:  i64 `json:"created_unix_ns"`,
 	level_floor:      string `json:"level_floor"`,
 	request_no:       int `json:"request_no"`,
+	request_joined:   bool `json:"request_joined"`,
 	include_payloads: bool `json:"include_payloads"`,
 	files:            []Export_File `json:"files"`,
 	omissions:        []string `json:"omissions"`,
+}
+
+// Export_Request is the durable half of one --request export: what the session
+// database, not the log, is authoritative for. Every optional fact carries its
+// own presence flag, because JSON cannot tell a reader that did not write the
+// file whether an absent number was unreported or zero.
+//
+// The stored input, response, error, and configuration are deliberately absent,
+// `--include-payloads` included: that flag adds diagnostic wire artifacts, and a
+// conversation dump is a different request than a diagnostics bundle.
+Export_Request :: struct {
+	version:                    int `json:"version"`,
+	session_id:                 string `json:"session_id"`,
+	request_no:                 int `json:"request_no"`,
+	turn_no_present:            bool `json:"turn_no_present"`,
+	turn_no:                    int `json:"turn_no"`,
+	purpose:                    string `json:"purpose"`,
+	started_at_ms:              i64 `json:"started_at_ms"`,
+	finished_at_ms_present:     bool `json:"finished_at_ms_present"`,
+	finished_at_ms:             i64 `json:"finished_at_ms"`,
+	outcome:                    string `json:"outcome"`,
+	provider:                   string `json:"provider"`,
+	model_requested:            string `json:"model_requested"`,
+	model_resolved:             string `json:"model_resolved"`,
+	api:                        string `json:"api"`,
+	input_tokens_present:       bool `json:"input_tokens_present"`,
+	input_tokens:               i64 `json:"input_tokens"`,
+	output_tokens_present:      bool `json:"output_tokens_present"`,
+	output_tokens:              i64 `json:"output_tokens"`,
+	cache_read_tokens_present:  bool `json:"cache_read_tokens_present"`,
+	cache_read_tokens:          i64 `json:"cache_read_tokens"`,
+	cache_write_tokens_present: bool `json:"cache_write_tokens_present"`,
+	cache_write_tokens:         i64 `json:"cache_write_tokens"`,
 }
 
 Export_File :: struct {
@@ -71,6 +106,7 @@ diagnostics_export :: proc(
 	destination: string,
 	selector: agent.Log_Read_Selector,
 	include_payloads: bool,
+	join_okay: bool,
 ) -> int {
 	if destination == "" {
 		fmt.eprintln("nabla: --export needs a directory")
@@ -94,6 +130,14 @@ diagnostics_export :: proc(
 	state := Export_State {
 		written_okay = true,
 	}
+	// The durable row is written first, because it is the file that says what the
+	// session decided rather than what one process observed.
+	if request_no, selected := selector.request_no.?; selected {
+		if !diagnostics_export_request(&files, &omissions, destination, session_id, request_no, join_okay) {
+			state.written_okay = false
+		}
+	}
+
 	summary := diagnostics_export_session(&files, &state, logs_root, destination, session_id, selector)
 	if !state.written_okay { return 1 }
 	defer {
@@ -119,11 +163,16 @@ diagnostics_export :: proc(
 		created_unix_ns  = time.time_to_unix_nano(time.now()),
 		level_floor      = agent.log_level_name(selector.level),
 		request_no       = export_request_number(selector),
+		request_joined   = export_request_joined(selector, join_okay),
 		include_payloads = include_payloads,
 		files            = files[:],
 		omissions        = omissions[:],
 	}
-	if !diagnostics_export_manifest(destination, &manifest, &files) { return 1 }
+	joined_okay := diagnostics_export_manifest(destination, &manifest, &files)
+	if !joined_okay { return 1 }
+	// A --request whose durable half is missing is an incomplete answer, so the
+	// bundle is written, says so, and the command fails.
+	if !export_request_joined(selector, join_okay) { return 1 }
 
 	fmt.eprintf("nabla: exported %d record(s) from %d run(s) into %s\n", summary.records, len(state.runs), destination)
 	if len(omissions) > 0 { fmt.eprintf("nabla: %d omission(s) recorded in the manifest\n", len(omissions)) }
@@ -530,4 +579,92 @@ export_request_number :: proc(selector: agent.Log_Read_Selector) -> int {
 	request_no, present := selector.request_no.?
 	if !present { return 0 }
 	return int(request_no)
+}
+
+// export_request_joined reports whether the --request bundle holds the durable
+// half it was asked for. A selector that named no request has nothing to join,
+// so the flag is only meaningful when one was selected.
+@(private)
+export_request_joined :: proc(selector: agent.Log_Read_Selector, join_okay: bool) -> bool {
+	_, selected := selector.request_no.?
+	return !selected || join_okay
+}
+
+// diagnostics_export_request writes the durable row for a --request export. It is
+// the same read the record stream's stderr summary uses, so the two cannot
+// disagree about what the database says.
+diagnostics_export_request :: proc(
+	files: ^[dynamic]Export_File,
+	omissions: ^[dynamic]string,
+	destination: string,
+	session_id: session.Session_Id,
+	request_no: session.Request_No,
+	join_okay: bool,
+) -> bool {
+	if !join_okay {
+		export_note(omissions, "the session database did not report this request, so request.json is absent")
+		return true
+	}
+
+	row, load_err := diagnostics_request_open(session_id, request_no, context.temp_allocator)
+	if load_err != nil {
+		local := load_err
+		export_note(omissions, fmt.tprintf("the stored request could not be read: %s", session.error_detail(&local)))
+		return true
+	}
+	defer session.request_destroy(&row, context.temp_allocator)
+
+	payload := export_request_from(&row, session_id)
+	data, marshal_err := json.marshal(payload, {pretty = true, sort_maps_by_key = true}, context.allocator)
+	if marshal_err != nil {
+		export_note(omissions, "request.json could not be encoded")
+		return true
+	}
+	defer delete(data, context.allocator)
+
+	path, joined := export_join(destination, EXPORT_REQUEST_NAME, context.allocator)
+	if !joined { return false }
+	defer delete(path, context.allocator)
+	file, hash, open_okay := export_open(path, context.allocator)
+	if !open_okay {
+		export_note(omissions, "request.json could not be created")
+		return true
+	}
+	if !export_write(file, data, hash) { return false }
+	return export_close(files, EXPORT_REQUEST_NAME, file, hash, len(data), false, context.allocator)
+}
+
+@(private)
+export_request_from :: proc(row: ^session.Request, session_id: session.Session_Id) -> Export_Request {
+	payload := Export_Request {
+		version         = 1,
+		session_id      = string(session_id),
+		request_no      = int(row.request_no),
+		purpose         = session.request_purpose_name(row.purpose),
+		started_at_ms   = row.started_at_ms,
+		outcome         = session.outcome_name(row.outcome),
+		provider        = row.provider,
+		model_requested = row.model_requested,
+		model_resolved  = row.model_resolved,
+		api             = row.api,
+	}
+	if turn_no, present := row.turn_no.?; present {
+		payload.turn_no_present = true
+		payload.turn_no = int(turn_no)
+	}
+	if finished_at_ms, present := row.finished_at_ms.?; present {
+		payload.finished_at_ms_present = true
+		payload.finished_at_ms = finished_at_ms
+	}
+	payload.input_tokens_present, payload.input_tokens = export_usage_bucket(row.usage.input)
+	payload.output_tokens_present, payload.output_tokens = export_usage_bucket(row.usage.output)
+	payload.cache_read_tokens_present, payload.cache_read_tokens = export_usage_bucket(row.usage.cache_read)
+	payload.cache_write_tokens_present, payload.cache_write_tokens = export_usage_bucket(row.usage.cache_write)
+	return payload
+}
+
+@(private)
+export_usage_bucket :: proc(value: Maybe(i64)) -> (bool, i64) {
+	count, present := value.?
+	return present, count
 }

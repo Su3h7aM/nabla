@@ -630,3 +630,271 @@ test_refuses_a_newer_schema :: proc(t: ^testing.T) {
 	_expect_error(t, err, .Schema_Too_New)
 	store_close(&store)
 }
+
+// --- reading a store ---------------------------------------------------------
+
+// _write_finished_request records one complete request so a reader has a row to
+// find. It takes the claim, opens a turn, and finishes both.
+@(private)
+_write_finished_request :: proc(t: ^testing.T, store: ^Store, id: Session_Id) -> Request_No {
+	_expect_ok(t, session_claim(store, id))
+	turn, turn_err := turn_begin(store, id, "explain the parser", .Prompt, 2_000)
+	_expect_ok(t, turn_err)
+	request, request_err := request_begin(
+		store,
+		id,
+		{
+			turn_no = turn,
+			purpose = .Response,
+			provider = "openai",
+			model_requested = "gpt-4",
+			api = "openai_chat_completions",
+			config_json = "{}",
+			input_json = `{"messages":1}`,
+		},
+		2_100,
+	)
+	_expect_ok(t, request_err)
+	_expect_ok(t, request_finish(store, id, request, {outcome = .Completed, model_resolved = "gpt-4-0613", usage = {input = 10, output = 4}, at_ms = 2_200}))
+	_expect_ok(t, turn_finish(store, id, turn, .Completed, "", 2_300))
+	_expect_ok(t, session_release(store))
+	return request
+}
+
+@(test)
+test_read_only_reads_what_a_writer_left :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+
+	session: Session
+	{
+		created, create_err := session_create(&store, {workspace = "/tmp/project", title = "first"}, 1_000)
+		_expect_ok(t, create_err)
+		session = created
+	}
+	request := _write_finished_request(t, &store, session.id)
+	_expect_ok(t, store_close(&store))
+	defer {
+		session_destroy(&session)
+		os.remove_all(directory)
+		delete(directory, context.allocator)
+	}
+
+	reader: Store
+	_expect_ok(t, store_open_read_only(&reader, directory))
+	defer store_close(&reader)
+
+	loaded, load_err := session_load(&reader, session.id)
+	_expect_ok(t, load_err)
+	defer session_destroy(&loaded)
+	testing.expect_value(t, loaded.title, "first")
+
+	// The durable row is the whole point of the join, so the reader returns it
+	// exactly as the answer the log can only observe.
+	row, row_err := request_load(&reader, session.id, request)
+	_expect_ok(t, row_err)
+	defer request_destroy(&row)
+	testing.expect_value(t, row.outcome, Outcome.Completed)
+	testing.expect_value(t, row.model_resolved, "gpt-4-0613")
+	testing.expect_value(t, row.usage.input, Maybe(i64)(10))
+	testing.expect_value(t, row.usage.output, Maybe(i64)(4))
+	if _, present := row.usage.cache_read.?; present { testing.fail_now(t, "a bucket the provider never reported must stay unreported") }
+}
+
+@(test)
+test_read_only_refuses_every_mutation :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	session, create_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&session)
+	_expect_ok(t, store_close(&store))
+	defer {
+		os.remove_all(directory)
+		delete(directory, context.allocator)
+	}
+
+	reader: Store
+	_expect_ok(t, store_open_read_only(&reader, directory))
+	defer store_close(&reader)
+
+	// Taking a claim writes a lock file, so it is refused before the disk is
+	// touched rather than after SQLite refuses a statement.
+	_expect_error(t, session_claim(&reader, session.id), .Invalid_State)
+
+	created, created_err := session_create(&reader, {workspace = "/tmp/project"}, 2_000)
+	_expect_error(t, created_err, .Invalid_State)
+	session_destroy(&created)
+	_expect_error(t, session_record(&reader, session), .Invalid_State)
+	_expect_error(t, session_set_title(&reader, session.id, "new"), .Invalid_State)
+	_expect_error(t, session_touch(&reader, session.id, 2_000), .Invalid_State)
+	_expect_error(t, selection_save(&reader, {provider = "p", model = "m"}), .Invalid_State)
+
+	// Reads still work, which is what makes the refusal a policy rather than a
+	// broken connection.
+	loaded, load_err := session_load(&reader, session.id)
+	_expect_ok(t, load_err)
+	defer session_destroy(&loaded)
+	testing.expect_value(t, loaded.id, session.id)
+}
+
+@(test)
+test_read_only_refuses_a_store_that_is_not_there :: proc(t: ^testing.T) {
+	base := _temp_directory(t)
+	defer {
+		os.remove_all(base)
+		delete(base, context.allocator)
+	}
+	// The directory has to be private before the reader will look inside it, so
+	// the two missing cases are reached rather than the permissions check.
+	_expect_os_ok(t, os.chmod(base, PRIVATE_DIRECTORY_PERMISSIONS))
+
+	// A directory a writer never made.
+	missing_directory := strings.concatenate({base, "/sessions"}, context.temp_allocator)
+	store: Store
+	_expect_error(t, store_open_read_only(&store, missing_directory), .Not_Found)
+	testing.expect(t, !os.exists(missing_directory), "a read-only open must not create the directory")
+	testing.expect(t, !store.open, "a refused read-only open must not publish a store")
+
+	// A directory with no database in it. A reader that created the file would
+	// answer an empty database where the user's session store was missing.
+	directory := strings.concatenate({base, "/empty"}, context.temp_allocator)
+	_expect_os_ok(t, os.make_directory(directory, PRIVATE_DIRECTORY_PERMISSIONS))
+	database := strings.concatenate({directory, "/", DATABASE_NAME}, context.temp_allocator)
+	_expect_error(t, store_open_read_only(&store, directory), .Not_Found)
+	testing.expect(t, !os.exists(database), "a read-only open must not create the database")
+	testing.expect(t, !store.open, "a refused read-only open must not publish a store")
+}
+
+@(test)
+test_read_only_refuses_loose_permissions :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	session, create_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&session)
+	_expect_ok(t, store_close(&store))
+	defer {
+		os.remove_all(directory)
+		delete(directory, context.allocator)
+	}
+
+	// Session history holds prompts and file contents, so a reader refuses a
+	// database anyone else can read instead of quietly reading it anyway.
+	database := strings.concatenate({directory, "/", DATABASE_NAME}, context.temp_allocator)
+	_expect_os_ok(t, os.chmod(database, {.Read_User, .Write_User, .Read_Group, .Read_Other}))
+
+	reader: Store
+	_expect_error(t, store_open_read_only(&reader, directory), .Invalid_Argument)
+	testing.expect(t, !os.exists(strings.concatenate({database, "-journal"}, context.temp_allocator)), "a refused open must not touch the database")
+}
+
+@(test)
+test_read_only_refuses_a_symlinked_database :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	session, create_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&session)
+	_expect_ok(t, store_close(&store))
+	defer {
+		os.remove_all(directory)
+		delete(directory, context.allocator)
+	}
+
+	// A link where the database should be is not the database, and following it
+	// would read a file the session directory does not own.
+	database := strings.concatenate({directory, "/", DATABASE_NAME}, context.temp_allocator)
+	elsewhere := strings.concatenate({directory, "/", DATABASE_NAME, ".elsewhere"}, context.temp_allocator)
+	_expect_os_ok(t, os.rename(database, elsewhere))
+	_expect_os_ok(t, os.symlink(elsewhere, database))
+
+	reader: Store
+	_expect_error(t, store_open_read_only(&reader, directory), .Invalid_Argument)
+}
+
+@(test)
+test_read_only_requires_the_current_schema :: proc(t: ^testing.T) {
+	// A real store is created first, so the directory and the database have the
+	// permissions and the schema a writer leaves behind; only the version is
+	// then moved, which is the one thing the reader is checking.
+	directory := _temp_directory(t)
+	defer {
+		os.remove_all(directory)
+		delete(directory, context.allocator)
+	}
+	writer: Store
+	_expect_ok(t, store_open(&writer, directory))
+	_expect_ok(t, store_close(&writer))
+
+	database := strings.concatenate({directory, "/", DATABASE_NAME}, context.temp_allocator)
+	stamp: db.Conn
+	_expect_db_ok(t, sqlite.open(&stamp, {path = database}))
+
+	// A database one version behind is refused with the remedy in the message:
+	// the reader names columns, and only a writer can add them.
+	_expect_db_ok(t, db.exec(&stamp, "PRAGMA user_version = 1"))
+	older: Store
+	err := store_open_read_only(&older, directory)
+	_expect_error(t, err, .Schema_Unknown)
+	local := err
+	testing.expect(t, strings.contains(error_detail(&local), "run the harness once"), "an unreadable version should say how to fix it")
+
+	// A newer one is not readable at all: its columns may differ.
+	_expect_db_ok(t, db.exec(&stamp, "PRAGMA user_version = 99"))
+	newer: Store
+	_expect_error(t, store_open_read_only(&newer, directory), .Schema_Too_New)
+	_expect_db_ok(t, db.close(&stamp))
+}
+
+@(test)
+test_read_only_sees_a_row_committed_after_it_opened :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	session, create_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
+	_expect_ok(t, create_err)
+	defer session_destroy(&session)
+	defer {
+		store_close(&store)
+		os.remove_all(directory)
+		delete(directory, context.allocator)
+	}
+	_expect_ok(t, session_claim(&store, session.id))
+	defer session_release(&store)
+
+	// The reader attaches while the writer is live and holding the claim, which
+	// is the shape a diagnostics run against a running harness has.
+	reader: Store
+	_expect_ok(t, store_open_read_only(&reader, directory))
+	defer store_close(&reader)
+
+	_, missing_err := request_load(&reader, session.id, 1)
+	_expect_error(t, missing_err, .Not_Found)
+
+	turn, turn_err := turn_begin(&store, session.id, "explain the parser", .Prompt, 2_000)
+	_expect_ok(t, turn_err)
+	request, request_err := request_begin(
+		&store,
+		session.id,
+		{
+			turn_no = turn,
+			purpose = .Response,
+			provider = "openai",
+			model_requested = "gpt-4",
+			api = "openai_chat_completions",
+			config_json = "{}",
+			input_json = `{"messages":1}`,
+		},
+		2_100,
+	)
+	_expect_ok(t, request_err)
+	_expect_ok(t, request_finish(&store, session.id, request, {outcome = .Completed, usage = {input = 7}, at_ms = 2_200}))
+
+	// Nothing pins a read transaction between calls, so the reader sees the row
+	// the writer just committed rather than the snapshot it opened with.
+	row, row_err := request_load(&reader, session.id, request)
+	_expect_ok(t, row_err)
+	defer request_destroy(&row)
+	testing.expect_value(t, row.outcome, Outcome.Completed)
+	testing.expect_value(t, row.usage.input, Maybe(i64)(7))
+}

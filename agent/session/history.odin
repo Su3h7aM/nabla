@@ -339,7 +339,7 @@ request_load :: proc(store: ^Store, id: Session_Id, request_no: Request_No, allo
 
 	values, has_row, next_err := db.rows_next(&rows)
 	if next_err != nil { return {}, storage_error("load request", next_err) }
-	if !has_row { return {}, error_make(.Not_Found, "no request has that number") }
+	if !has_row { return {}, error_make(.Not_Found, fmt.tprintf("no request %d exists for that session", i64(request_no))) }
 	return request_scan(values, allocator)
 }
 

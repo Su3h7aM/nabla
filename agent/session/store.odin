@@ -53,6 +53,10 @@ Store :: struct {
 	allocator: mem.Allocator,
 	directory: string, // owned
 	open:      bool,
+	// read_only records how the connection was opened. A reader takes no
+	// claim and refuses every mutation, so store_open_read_only cannot be
+	// used to change a database by accident.
+	read_only: bool,
 	claim:     Claim, // the session claimed for writing, if any
 	// broken records a transaction that could not be discarded. SQLite does not
 	// promise that a failed ROLLBACK has ended the transaction, so the
@@ -245,8 +249,78 @@ store_close :: proc(store: ^Store) -> Error {
 	delete(store.directory, store.allocator)
 	store.directory = ""
 	store.open = false
+	store.read_only = false
 	if release_err != nil { return release_err }
 	if close_err != nil { return storage_error("close the session database", close_err) }
+	return nil
+}
+
+// store_open_read_only opens the session database in directory for reading.
+//
+// It creates nothing and migrates nothing. The directory, the database file,
+// and their permissions have to be exactly what a writer left behind, and the
+// schema has to be the version this build reads. A reader takes no writer claim
+// and refuses every mutation, so a diagnostics command can read a session whose
+// harness is running, and can never change the database it was pointed at.
+//
+// store_close releases it, exactly as it releases a writable store.
+store_open_read_only :: proc(store: ^Store, directory: string, allocator := context.allocator) -> (err: Error) {
+	if store.open { return error_make(.Invalid_State, "the store is already open") }
+	if directory == "" { return error_make(.Invalid_Argument, "the session directory is empty") }
+
+	store.allocator = allocator
+	store.directory = strings.clone(directory, allocator)
+	store.broken = false
+	store.read_only = true
+	if store.directory == "" {
+		store.read_only = false
+		return error_make(.Storage, "the session directory could not be recorded")
+	}
+
+	succeeded := false
+	defer if !succeeded {
+		db.close(&store.conn)
+		delete(store.directory, allocator)
+		store.directory = ""
+		store.open = false
+		store.read_only = false
+	}
+
+	ensure_readable_directory(store.directory) or_return
+
+	database_path, join_err := filepath.join({store.directory, DATABASE_NAME}, context.temp_allocator)
+	if join_err != nil { return error_make(.Storage, "the database path could not be built") }
+	ensure_readable_file(database_path) or_return
+
+	// No journal-mode pragma and no migration: both write, and neither is a
+	// reader's to decide. A database in another journal mode is still readable.
+	config := sqlite.Config {
+		path            = database_path,
+		busy_timeout_ms = BUSY_TIMEOUT_MS,
+		foreign_keys    = true,
+		mode            = .Read_Only,
+	}
+	if open_err := sqlite.open(&store.conn, config, allocator); open_err != nil {
+		return storage_error("open the session database for reading", open_err)
+	}
+
+	// The exact version is required rather than merely tolerated: every read
+	// procedure names columns, so an older database does not have them and a
+	// newer one may have changed them. A writer migrates; a reader only reads.
+	version, version_err := schema_read_version(store)
+	if version_err != nil { return version_err }
+	if version != SCHEMA_VERSION {
+		if version > SCHEMA_VERSION {
+			return error_make(.Schema_Too_New, fmt.tprintf("the database is at schema %d; this build reads %d", version, SCHEMA_VERSION))
+		}
+		return error_make(
+			.Schema_Unknown,
+			fmt.tprintf("the database is at schema %d; reading requires %d, so run the harness once to migrate it", version, SCHEMA_VERSION),
+		)
+	}
+
+	store.open = true
+	succeeded = true
 	return nil
 }
 
@@ -385,8 +459,11 @@ session_list :: proc(store: ^Store, options: List_Options, allocator := context.
 // session_claim takes the writer claim for a session so the harness can run it.
 // Only one session may be claimed at a time, and a second process claiming the
 // same session is refused with .Claimed.
+//
+// Taking a claim creates a lock file, so a read-only store is refused before
+// anything on disk is touched.
 session_claim :: proc(store: ^Store, id: Session_Id) -> Error {
-	if !store.open { return error_make(.Invalid_State, "the store is closed") }
+	require_writable(store) or_return
 	if store.claim.held { return error_make(.Invalid_State, "another session is already claimed for writing") }
 	if !session_id_valid(id) { return error_make(.Invalid_Argument, "the session id is not a valid id") }
 
@@ -411,7 +488,7 @@ session_claim :: proc(store: ^Store, id: Session_Id) -> Error {
 // claim back. A refusal leaves the store holding exactly the claim it held
 // before.
 session_claim_candidate :: proc(store: ^Store, id: Session_Id) -> (displaced: Claim, err: Error) {
-	if !store.open { return {}, error_make(.Invalid_State, "the store is closed") }
+	require_writable(store) or_return
 	displaced = store.claim
 	store.claim = {}
 	candidate, claim_err := claim_acquire(store.directory, id, store.allocator)
@@ -594,11 +671,12 @@ session_scan :: proc(values: []db.Value, allocator: mem.Allocator) -> (session: 
 // --- supporting -------------------------------------------------------------
 
 // require_writable reports whether the store can run a statement whose outcome
-// depends on its transaction state: it must be open, and no failed transaction
-// may have been left undiscarded.
+// depends on its transaction state: it must be open, writable, and free of a
+// failed transaction that was left undiscarded.
 @(private)
 require_writable :: proc(store: ^Store) -> Error {
 	if !store.open { return error_make(.Invalid_State, "the store is closed") }
+	if store.read_only { return error_make(.Invalid_State, "the store is open for reading only") }
 	if store.broken { return error_make(.Invalid_State, "a failed write could not be rolled back, so this store cannot be written to again") }
 	return nil
 }
@@ -720,6 +798,43 @@ restrict_private_file :: proc(path: string, info: os.File_Info) -> Error {
 	if permissions_are_private(info.mode) { return nil }
 	if chmod_err := os.chmod(path, PRIVATE_FILE_PERMISSIONS); chmod_err != nil {
 		return error_make(.Storage, fmt.tprintf("%s could not be restricted to its owner: %v", path, chmod_err))
+	}
+	return nil
+}
+
+// ensure_readable_directory verifies that path is the directory a writer left
+// behind. Unlike the writer's own check it repairs nothing: a reader has no
+// business creating a store or loosening what it found, so a missing
+// directory, a symlink, or a directory other users can read is refused rather
+// than fixed.
+@(private)
+ensure_readable_directory :: proc(path: string) -> Error {
+	info, stat_err := os.lstat(path, context.temp_allocator)
+	if stat_err != nil {
+		return error_make(.Not_Found, fmt.tprintf("%s could not be examined: %v", path, stat_err))
+	}
+	if info.type != .Directory {
+		return error_make(.Invalid_Argument, fmt.tprintf("%s is not a directory", path))
+	}
+	if !permissions_are_private(info.mode) {
+		return error_make(.Invalid_Argument, fmt.tprintf("%s is readable by other users", path))
+	}
+	return nil
+}
+
+// ensure_readable_file verifies that path is the database a writer left behind.
+// A missing file is .Not_Found rather than a file this call would create.
+@(private)
+ensure_readable_file :: proc(path: string) -> Error {
+	info, stat_err := os.lstat(path, context.temp_allocator)
+	if stat_err != nil {
+		return error_make(.Not_Found, fmt.tprintf("%s could not be examined: %v", path, stat_err))
+	}
+	if info.type != .Regular {
+		return error_make(.Invalid_Argument, fmt.tprintf("%s is not a regular file", path))
+	}
+	if !permissions_are_private(info.mode) {
+		return error_make(.Invalid_Argument, fmt.tprintf("%s is readable by other users", path))
 	}
 	return nil
 }

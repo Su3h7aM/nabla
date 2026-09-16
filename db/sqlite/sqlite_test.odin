@@ -451,3 +451,88 @@ test_a_stale_wal_snapshot_is_not_a_busy_to_wait_out :: proc(t: ^testing.T) {
 	_expect_ok(t, db.rollback(&reader))
 	_expect_ok(t, db.exec(&reader, "UPDATE t SET value = 4"))
 }
+
+@(test)
+test_read_only_needs_a_database_file :: proc(t: ^testing.T) {
+	conn: db.Conn
+	// SQLite's own private temporary database is empty by definition, so a
+	// read-only connection to one would read a database this call invented
+	// rather than the one the caller named.
+	_expect_failure(t, open(&conn, {path = ":memory:", mode = .Read_Only}), .Invalid_Argument)
+	_expect_failure(t, open(&conn, {path = "", mode = .Read_Only}), .Invalid_Argument)
+	testing.expect(t, !db.conn_is_open(&conn), "a refused open must not publish a connection")
+}
+
+@(test)
+test_read_only_never_creates_the_database :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer delete(directory)
+	defer os.remove_all(directory)
+	path := _temp_database(directory)
+	defer delete(path)
+
+	conn: db.Conn
+	_expect_failure(t, open(&conn, {path = path, mode = .Read_Only}), .Backend)
+
+	// The point of the flag: a refused open leaves no file behind, so a
+	// diagnostics command cannot conjure an empty database where the user's
+	// session store was missing.
+	testing.expect(t, !os.exists(path), "a read-only open must not create the database")
+}
+
+@(test)
+test_read_only_reads_and_refuses_writes :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer delete(directory)
+	defer os.remove_all(directory)
+	path := _temp_database(directory)
+	defer delete(path)
+
+	writer: db.Conn
+	_expect_ok(t, open(&writer, {path = path}))
+	defer db.close(&writer)
+	_expect_ok(t, db.exec(&writer, "PRAGMA journal_mode = WAL"))
+	_expect_ok(t, db.exec(&writer, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&writer, "INSERT INTO t VALUES (1)"))
+
+	// The writer stays open, so the write-ahead log and its shared-memory file
+	// are live while the reader attaches to the same database.
+	reader: db.Conn
+	_expect_ok(t, open(&reader, {path = path, mode = .Read_Only}))
+	defer db.close(&reader)
+
+	testing.expect_value(t, _scalar_i64(t, &reader, "SELECT value FROM t"), i64(1))
+
+	// A read-only connection is a property of the connection, not of a
+	// statement, so every writing statement is refused by the backend itself.
+	_expect_failure(t, db.exec(&reader, "INSERT INTO t VALUES (2)"), .Read_Only)
+	_expect_failure(t, db.exec(&reader, "UPDATE t SET value = 3"), .Read_Only)
+	_expect_failure(t, db.exec(&reader, "DELETE FROM t"), .Read_Only)
+	_expect_failure(t, db.exec(&reader, "CREATE TABLE u (value INTEGER)"), .Read_Only)
+	_expect_failure(t, db.exec(&reader, "DROP TABLE t"), .Read_Only)
+
+	// A write the reader never saw is still visible to its next read: nothing
+	// pins a read transaction between calls, which is what makes a reader
+	// opened beside a running harness useful.
+	_expect_ok(t, db.exec(&writer, "INSERT INTO t VALUES (4)"))
+	testing.expect_value(t, _scalar_i64(t, &reader, "SELECT count(*) FROM t"), i64(2))
+	testing.expect_value(t, _scalar_i64(t, &reader, "SELECT value FROM t WHERE value = 4"), i64(4))
+}
+
+@(test)
+test_read_write_create_stays_the_default :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer delete(directory)
+	defer os.remove_all(directory)
+	path := _temp_database(directory)
+	defer delete(path)
+
+	// The zero mode is what every existing caller relies on, so it still
+	// creates the database and still writes to it.
+	conn: db.Conn
+	_expect_ok(t, open(&conn, {path = path}))
+	defer db.close(&conn)
+	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (1)"))
+	testing.expect_value(t, _scalar_i64(t, &conn, "SELECT value FROM t"), i64(1))
+}

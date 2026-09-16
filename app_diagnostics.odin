@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:io"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 
 import "nabla:agent"
 import "nabla:agent/session"
@@ -78,14 +79,24 @@ diagnostics_main :: proc(args: []string) -> int {
 		fmt.eprintln("nabla: the log directory could not be resolved")
 		return 1
 	}
+
+	// The records are what the writer observed; the row is what the session
+	// database decided. A --request selector asks for both, so the join is
+	// attempted first and its absence is reported rather than hidden.
+	durable_ok := true
+	if request_no, selected := selector.request_no.?; selected {
+		durable_ok = diagnostics_report_request(session_id, request_no)
+	}
+
 	if export_directory != "" {
-		return diagnostics_export(logs_root, session_id, export_directory, selector, include_payloads)
+		return diagnostics_export(logs_root, session_id, export_directory, selector, include_payloads, durable_ok)
 	}
 
 	output: Diagnostics_Output
 	output.writer = stdout_writer()
 	summary := agent.log_read_session(logs_root, session_id, &output, diagnostics_visit, selector)
 	diagnostics_report(summary)
+	if !durable_ok { return 1 }
 	if output.broken {
 		fmt.eprintln("nabla: the output stream failed before the read was done")
 		return 1
@@ -135,6 +146,109 @@ diagnostics_visit :: proc(user_data: rawptr, run_id: string, line: string) -> bo
 		}
 	}
 	return true
+}
+
+// --- the durable half of --request ------------------------------------------
+
+DIAGNOSTICS_TIMESTAMP_BYTES :: 32
+
+// diagnostics_request_open reads one request through a connection that cannot
+// write. The session database is authoritative for the row, so this is the
+// answer the record stream is read beside rather than instead of. The store is
+// closed before it returns, so a reader never holds a connection open while the
+// record files are scanned.
+diagnostics_request_open :: proc(
+	session_id: session.Session_Id,
+	request_no: session.Request_No,
+	allocator := context.allocator,
+) -> (
+	row: session.Request,
+	err: session.Error,
+) {
+	directory, directory_err := agent.xdg_directory(.State, context.temp_allocator)
+	if directory_err != .None {
+		return {}, session.error_make(.Storage, "the session store directory could not be resolved")
+	}
+
+	store: session.Store
+	if open_err := session.store_open_read_only(&store, directory); open_err != nil {
+		return {}, open_err
+	}
+	defer session.store_close(&store)
+
+	return session.request_load(&store, session_id, request_no, allocator)
+}
+
+// diagnostics_report_request prints the durable row for a --request selection on
+// stderr, beside the records that go to stdout. False means the row could not be
+// read, because an answer whose authoritative half is missing is not an answer.
+diagnostics_report_request :: proc(session_id: session.Session_Id, request_no: session.Request_No) -> bool {
+	row, load_err := diagnostics_request_open(session_id, request_no, context.temp_allocator)
+	if load_err != nil {
+		local := load_err
+		fmt.eprintf("nabla: the stored request could not be read: %s\n", session.error_detail(&local))
+		return false
+	}
+	defer session.request_destroy(&row, context.temp_allocator)
+
+	diagnostics_print_request(&row)
+	return true
+}
+
+// diagnostics_print_request writes the row the database is authoritative for.
+// Only metadata is shown: the stored input, response, error, and configuration
+// are the conversation itself, and the record stream beside this is what a caller
+// reads for what the harness observed.
+@(private)
+diagnostics_print_request :: proc(row: ^session.Request) {
+	started_buffer: [DIAGNOSTICS_TIMESTAMP_BYTES]u8
+	finished_buffer: [DIAGNOSTICS_TIMESTAMP_BYTES]u8
+	started := diagnostics_timestamp(row.started_at_ms, started_buffer[:])
+	finished := "still running"
+	if value, present := row.finished_at_ms.?; present {
+		finished = diagnostics_timestamp(value, finished_buffer[:])
+	}
+
+	fmt.eprintf("nabla: request %d: %s, %s\n", i64(row.request_no), session.request_purpose_name(row.purpose), session.outcome_name(row.outcome))
+	fmt.eprintf("nabla:   started %s, finished %s\n", started, finished)
+	fmt.eprintf("nabla:   provider %s, api %s\n", row.provider, row.api)
+	if row.model_resolved != "" && row.model_resolved != row.model_requested {
+		fmt.eprintf("nabla:   model requested %s, resolved %s\n", row.model_requested, row.model_resolved)
+	} else {
+		fmt.eprintf("nabla:   model %s\n", row.model_requested)
+	}
+	fmt.eprintf("nabla:   usage %s\n", diagnostics_usage_text(row.usage))
+}
+
+// diagnostics_usage_text names each bucket and calls an unreported one
+// unreported. The database stores an absent count as NULL, so reporting it as
+// zero would invent a measurement the provider never made.
+@(private)
+diagnostics_usage_text :: proc(usage: session.Usage) -> string {
+	builder := strings.builder_make(context.temp_allocator)
+	names := [4]string{"input", "output", "cache read", "cache write"}
+	values := [4]Maybe(i64){usage.input, usage.output, usage.cache_read, usage.cache_write}
+	for value, index in values {
+		if index > 0 { fmt.sbprintf(&builder, ", ") }
+		if count, present := value.?; present {
+			fmt.sbprintf(&builder, "%s %d", names[index], count)
+		} else {
+			fmt.sbprintf(&builder, "%s unreported", names[index])
+		}
+	}
+	return strings.to_string(builder)
+}
+
+// diagnostics_timestamp renders a stored millisecond timestamp in UTC. A
+// timestamp that is absent or out of range is reported as unknown rather than
+// printed as a wrong date.
+@(private)
+diagnostics_timestamp :: proc(at_ms: i64, buffer: []u8) -> string {
+	if at_ms <= 0 { return "unknown" }
+	instant := time.unix(at_ms / 1000, (at_ms % 1000) * 1_000_000)
+	datetime, okay := time.time_to_datetime(instant)
+	if !okay { return "unknown" }
+	return fmt.bprintf(buffer, "%04d-%02d-%02dT%02d:%02d:%02dZ", datetime.year, datetime.month, datetime.day, datetime.hour, datetime.minute, datetime.second)
 }
 
 diagnostics_report :: proc(summary: agent.Log_Read_Summary) {

@@ -81,6 +81,7 @@ Column_Type :: enum (c.int) {
 	Null    = 5,
 }
 
+OPEN_READONLY :: 0x00000001
 OPEN_READWRITE :: 0x00000002
 OPEN_CREATE :: 0x00000004
 

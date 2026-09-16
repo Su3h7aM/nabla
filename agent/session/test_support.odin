@@ -68,3 +68,11 @@ _open_claimed_session :: proc(t: ^testing.T, store: ^Store) -> Session {
 	_expect_ok(t, session_claim(store, session.id))
 	return session
 }
+
+// _expect_os_ok checks a filesystem call a test needs to set up its own state.
+// It is separate from _expect_ok because os.Error and session.Error are
+// distinct types and neither converts to the other.
+@(private)
+_expect_os_ok :: proc(t: ^testing.T, err: os.Error) {
+	if err != nil { testing.fail_now(t, strings.concatenate({"unexpected filesystem error: ", os.error_string(err)}, context.temp_allocator)) }
+}
