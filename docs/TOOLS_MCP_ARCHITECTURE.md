@@ -252,26 +252,25 @@ collapsing it into a single failure.
 
 ### Tool names
 
-A remote tool name cannot always become a Nabla tool name. MCP permits dots and
-recommends up to 128 characters; Nabla advertises letters, digits, underscore,
-and hyphen in at most 64 bytes. Two servers may also use the same remote name,
-and a remote name may collide with a native tool.
+Every tool has an explicit namespace. Native tools use `builtin`, such as
+`builtin.read` and `builtin.write`. MCP tools use the configured server id, so a
+`grep` tool from the `fff` server is `fff.grep`. This prevents native and remote
+tools, or tools from two servers, from colliding without requiring user aliases.
 
-The harness does not sanitize or truncate a remote name, because both are lossy
-and can manufacture a collision. The allowlist is a mapping instead:
+The harness exposes every tool returned by `tools/list`. It keeps the remote
+name exactly, including dots. Optional per-tool configuration uses the exact
+case-sensitive remote name as its key:
 
 ```lua
 tools = {
-  github_create_issue = "issues.create",
-  github_list_issues  = "issues.list",
+  ["issues.create"] = {name = "create_issue"},
+  ["issues.delete"] = {enabled = false},
 }
 ```
 
-The key is the advertised name, the value is the exact case-sensitive remote
-name. The key must pass the same validation a native definition does, the value
-must match one tool the server listed, and the pair must not collide with any
-other tool. An empty allowlist advertises nothing. There is no wildcard: every
-exposed remote tool is named by the user.
+`name` replaces only the local part, producing `github.create_issue` in this
+example. `enabled` defaults to true. A tool needs an entry only when the user
+wants to rename or disable it.
 
 ### Retry policy
 
@@ -344,30 +343,45 @@ budget rather than relying on finalization to replace it.
 
 ### Server configuration
 
-Server configuration is explicit user configuration in `config.lua` under
-`mcp.servers`: a stable server id, a trust decision, an endpoint, an allowlist of
-tool aliases, and timeouts. Nothing auto-executes repository-provided MCP
-configuration, and a server that is not trusted is never started. An absent or
-false trust flag is a configuration error rather than a disabled server: a
-process either runs or does not, and the user should not have to guess which.
+Server configuration lives in `config.lua` under `mcp.servers`. The minimal
+stdio configuration is the server id and executable:
+
+```lua
+return {
+  mcp = {
+    servers = {
+      fff = {executable = "/absolute/path/to/fff-mcp"},
+    },
+  },
+}
+```
+
+Add `arguments` only when the program needs flags or other arguments. The act of
+placing the server in the user's configuration is the trust decision. Nabla does
+not load MCP configuration from a repository or start a server that the user did
+not configure.
 
 The transport is chosen by which endpoint field is present rather than by a
 `transport` field. Only stdio exists, so an `executable` is what selects it; a
 later transport brings its own field, and setting two is the error.
 
 A stdio server is launched by executable and argv, never through a shell, in its
-own process group, with an explicit frozen environment and an absolute
-executable path. Its stderr is drained by a thread that keeps a bounded tail, so
-a chatty server cannot block on a full pipe; stderr text is diagnostic only and
-never determines a request outcome. One request is in flight at a time, because
-the harness runs tools serially and nothing in a turn benefits from
-multiplexing.
+own process group, with an absolute executable path. The server inherits the
+environment that launched Nabla. `environment` is an optional map that replaces
+or adds variables for that server. It is needed only when the server expects
+configuration such as an API token, a database URL, or a cache path that is not
+already present. Most local servers need no entries. The resulting environment
+is frozen when the process starts.
 
-The runtime is one client slot and one binding slot per configured server and
-alias, sized once and never grown. A definition borrows the address of a binding,
-so growing that array later would leave every registry entry pointing at freed
-memory. That is also the order teardown follows: the session and its registry go
-first, the clients second.
+The server's stderr is drained by a thread that keeps a bounded tail, so a chatty
+server cannot block on a full pipe. Stderr is diagnostic only and never decides a
+request outcome. One request is in flight at a time because the harness runs
+tools serially.
+
+The runtime keeps one stable client slot per configured server. Discovered tool
+bindings are allocated individually and replaced as one generation after the
+session accepts a refreshed registry. The previous generation stays alive while
+the old registry can still borrow it.
 
 ### Refresh
 
@@ -379,7 +393,10 @@ contribute. A registry that cannot be built at all leaves the installed registry
 untouched.
 
 Configuration problems fail startup. Runtime connectivity problems degrade one
-server for one turn.
+server for one turn. Discovery defaults to 5 seconds, a call defaults to 30
+seconds, and the configurable call ceiling defaults to 120 seconds. These values
+need no configuration for normal local servers. The millisecond fields remain
+available for slow startup or long-running tools.
 
 A call can carry several bounds: the remaining turn deadline, the definition
 maximum, the definition default, and a model-requested timeout where the tool

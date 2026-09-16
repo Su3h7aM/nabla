@@ -987,11 +987,15 @@ test_refresh_degrades_to_native_tools_when_a_server_is_unusable :: proc(t: ^test
 	servers[0] = agent.MCP_Server_Config {
 		id = strings.clone("broken", context.allocator),
 		stdio = {executable = strings.clone("/nonexistent/nabla-no-such-server", context.allocator)},
-		tools = make([]agent.MCP_Tool_Alias, 1, context.allocator),
+		tools = make([]agent.MCP_Tool_Config, 1, context.allocator),
 		discovery_timeout = time.Second,
 		call_timeout = time.Second,
 	}
-	servers[0].tools[0] = {strings.clone("broken_read", context.allocator), strings.clone("read.file", context.allocator)}
+	servers[0].tools[0] = {
+		remote_name = strings.clone("read.file", context.allocator),
+		name        = strings.clone("read", context.allocator),
+		enabled     = true,
+	}
 	app.setup.mcp_servers = servers
 	app.setup.mcp = mcp_runtime_make(servers, context.allocator)
 	// The registry borrows the runtime's bindings, so the session goes first and the

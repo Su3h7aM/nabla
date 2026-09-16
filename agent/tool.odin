@@ -147,9 +147,8 @@ Tool_Registry_Error :: struct {
 	detail: string,
 }
 
-// TOOL_MAX_NAME_BYTES bounds a tool name. Names travel to providers, so the
-// bound keeps them short enough for every provider tool-name field.
-TOOL_MAX_NAME_BYTES :: 64
+// TOOL_MAX_NAME_BYTES bounds a qualified tool name, including its namespace.
+TOOL_MAX_NAME_BYTES :: 128
 
 // TOOL_MAX_DESCRIPTION_BYTES bounds a tool description. Descriptions travel
 // with every request, so an unbounded one would tax the cacheable prefix.
@@ -159,12 +158,9 @@ TOOL_MAX_DESCRIPTION_BYTES :: 4096
 // argument budget so a schema can never admit what arguments cannot carry.
 TOOL_MAX_SCHEMA_BYTES :: 64 * 1024
 
-// tool_name_valid reports whether a name fits the provider-compatible subset:
-// ASCII letters, digits, underscore, and hyphen. An empty name or anything
-// outside that set would fail when the request is encoded, so it is refused
-// here instead.
-tool_name_valid :: proc(name: string) -> bool {
-	if name == "" || len(name) > TOOL_MAX_NAME_BYTES { return false }
+// tool_local_name_valid accepts one namespace or local-name component.
+tool_local_name_valid :: proc(name: string) -> bool {
+	if name == "" { return false }
 	for i in 0 ..< len(name) {
 		c := name[i]
 		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' { continue }
@@ -173,13 +169,33 @@ tool_name_valid :: proc(name: string) -> bool {
 	return true
 }
 
+// tool_name_valid requires a namespace before the first dot. MCP local names may
+// contain further dots, while every component uses the portable character set.
+tool_name_valid :: proc(name: string) -> bool {
+	if name == "" || len(name) > TOOL_MAX_NAME_BYTES { return false }
+	separator := strings.index_byte(name, '.')
+	if separator <= 0 || separator == len(name) - 1 { return false }
+	if !tool_local_name_valid(name[:separator]) { return false }
+	component_start := separator + 1
+	for i in component_start ..< len(name) {
+		if name[i] != '.' { continue }
+		if !tool_local_name_valid(name[component_start:i]) { return false }
+		component_start = i + 1
+	}
+	return tool_local_name_valid(name[component_start:])
+}
+
 // tool_definition_validate checks a definition before it is copied into a
 // registry. The schema is admitted as bounded JSON with an object root, using
 // the same tokenizer admission as argument documents; general JSON Schema
 // semantics stay the definition source's responsibility.
 tool_definition_validate :: proc(definition: Tool_Definition) -> Tool_Registry_Error {
 	if !tool_name_valid(definition.name) {
-		return {kind = .Invalid_Name, tool = definition.name, detail = "a name uses letters, digits, underscore, or hyphen, at most 64 bytes"}
+		return {
+			kind = .Invalid_Name,
+			tool = definition.name,
+			detail = "a name must be namespace.local-name using letters, digits, underscore, or hyphen, at most 128 bytes",
+		}
 	}
 	if definition.description == "" {
 		return {kind = .Missing_Description, tool = definition.name, detail = "a tool needs a description"}

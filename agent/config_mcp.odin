@@ -2,6 +2,7 @@ package agent
 
 import c "core:c/libc"
 import "core:mem"
+import "core:os"
 import "core:strings"
 import "core:time"
 import l "vendor:lua/5.4"
@@ -26,12 +27,13 @@ MCP_Environment :: struct {
 	value: string,
 }
 
-// MCP_Tool_Alias maps one advertised name to the remote name it stands for. The
-// mapping is the allowlist: a remote tool with no alias is not exposed, so nothing
-// reaches the model that the user did not name.
-MCP_Tool_Alias :: struct {
-	name:        string,
+// MCP_Tool_Config overrides one discovered remote tool. Tools are enabled under
+// their remote name by default. A matching entry may disable one or replace its
+// model-visible name.
+MCP_Tool_Config :: struct {
 	remote_name: string,
+	name:        string,
+	enabled:     bool,
 }
 
 // MCP_Stdio_Config is how to launch one server. Every string is owned.
@@ -50,7 +52,7 @@ MCP_Stdio_Config :: struct {
 MCP_Server_Config :: struct {
 	id:                   string,
 	stdio:                MCP_Stdio_Config,
-	tools:                []MCP_Tool_Alias,
+	tools:                []MCP_Tool_Config,
 	discovery_timeout:    time.Duration,
 	call_timeout:         time.Duration,
 	maximum_call_timeout: time.Duration,
@@ -67,9 +69,9 @@ mcp_server_config_destroy :: proc(config: ^MCP_Server_Config, allocator := conte
 		delete(entry.value, allocator)
 	}
 	if config.stdio.environment != nil { delete(config.stdio.environment, allocator) }
-	for alias in config.tools {
-		delete(alias.name, allocator)
-		delete(alias.remote_name, allocator)
+	for tool in config.tools {
+		delete(tool.remote_name, allocator)
+		delete(tool.name, allocator)
 	}
 	if config.tools != nil { delete(config.tools, allocator) }
 	config^ = {}
@@ -106,7 +108,7 @@ mcp_servers_load :: proc(L: ^l.State, idx: c.int, allocator: mem.Allocator) -> (
 			return {}, .Invalid
 		}
 		id, id_ok := lua_string(L, -2, allocator)
-		if !id_ok || id == "" {
+		if !id_ok || !tool_local_name_valid(id) {
 			delete(id, allocator)
 			mcp_servers_destroy(&servers, allocator)
 			return {}, .Invalid
@@ -139,14 +141,6 @@ mcp_server_load :: proc(L: ^l.State, raw_idx: c.int, id: string, allocator: mem.
 	defer if failed { mcp_server_config_destroy(out, allocator) }
 	base := l.gettop(L)
 	defer l.settop(L, base)
-
-	// Trust is a decision the user states. A server that is not trusted is never
-	// started, so an absent or false flag is a configuration error rather than a
-	// silently disabled server.
-	lua_field(L, idx, "trusted")
-	trusted, trusted_ok := lua_bool(L, -1)
-	if !trusted_ok || !trusted { return .Invalid }
-	l.settop(L, base)
 
 	lua_field(L, idx, "executable")
 	executable, executable_ok := lua_string(L, -1, allocator)
@@ -182,10 +176,11 @@ mcp_server_load :: proc(L: ^l.State, raw_idx: c.int, id: string, allocator: mem.
 	l.settop(L, base)
 
 	lua_field(L, idx, "tools")
-	if !lua_plain_table(L, -1) { return .Invalid }
-	aliases, aliases_ok := mcp_tool_aliases_load(L, -1, allocator)
-	if !aliases_ok { return .Invalid }
-	out^.tools = aliases
+	if l.type(L, -1) != .NIL {
+		tools, tools_ok := mcp_tool_configs_load(L, -1, allocator)
+		if !tools_ok { return .Invalid }
+		out^.tools = tools
+	}
 	l.settop(L, base)
 
 	if value, present, value_ok := mcp_timeout_ms(L, idx, "discovery_timeout_ms"); !value_ok {
@@ -301,67 +296,104 @@ mcp_environment_name_valid :: proc(name: string) -> bool {
 	return true
 }
 
-// mcp_tool_aliases_load reads the alias table. The advertised name is validated
-// with the same rule the registry applies, so an alias that could not be registered
-// is refused here where the user can see which one it was.
+// mcp_tool_configs_load reads optional per-tool overrides. The key is the exact
+// remote name. enabled defaults to true within an entry, and name is optional.
 @(private)
-mcp_tool_aliases_load :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]MCP_Tool_Alias, bool) {
+mcp_tool_configs_load :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]MCP_Tool_Config, bool) {
+	if !lua_plain_table(L, raw_idx) { return nil, false }
 	index := l.absindex(L, raw_idx)
-	aliases := make([dynamic]MCP_Tool_Alias, 0, allocator)
+	configs := make([dynamic]MCP_Tool_Config, 0, allocator)
 	count := 0
 	l.pushnil(L)
 	for l.next(L, index) != 0 {
 		count += 1
-		if count > MCP_MAX_ENTRIES || l.type(L, -2) != .STRING {
-			mcp_tool_aliases_release(aliases, allocator)
+		if count > MCP_MAX_ENTRIES || l.type(L, -2) != .STRING || !lua_plain_table(L, -1) {
+			mcp_tool_configs_release(configs, allocator)
 			return nil, false
 		}
-		name, name_ok := lua_string(L, -2, allocator)
-		remote_name, remote_ok := lua_string(L, -1, allocator)
-		// Only the value is popped: the key has to stay for the next call to next.
+		remote_name, remote_ok := lua_string(L, -2, allocator)
+		entry := l.absindex(L, -1)
+		config := MCP_Tool_Config {
+			remote_name = remote_name,
+			enabled     = true,
+		}
+
+		lua_field(L, entry, "enabled")
+		if l.type(L, -1) != .NIL {
+			enabled, enabled_ok := lua_bool(L, -1)
+			if !enabled_ok {
+				delete(remote_name, allocator)
+				l.pop(L, 2)
+				mcp_tool_configs_release(configs, allocator)
+				return nil, false
+			}
+			config.enabled = enabled
+		}
 		l.pop(L, 1)
-		if !name_ok || !remote_ok || !tool_name_valid(name) || remote_name == "" {
-			delete(name, allocator)
-			delete(remote_name, allocator)
-			mcp_tool_aliases_release(aliases, allocator)
+
+		lua_field(L, entry, "name")
+		if l.type(L, -1) != .NIL {
+			name, name_ok := lua_string(L, -1, allocator)
+			if !name_ok || !tool_local_name_valid(name) {
+				delete(name, allocator)
+				delete(remote_name, allocator)
+				l.pop(L, 2)
+				mcp_tool_configs_release(configs, allocator)
+				return nil, false
+			}
+			config.name = name
+		}
+		l.pop(L, 1)
+		// Only the value is popped: the key stays for the next call to next.
+		l.pop(L, 1)
+
+		if !remote_ok || remote_name == "" || (!config.enabled && config.name != "") {
+			delete(config.remote_name, allocator)
+			delete(config.name, allocator)
+			mcp_tool_configs_release(configs, allocator)
 			return nil, false
 		}
-		append(&aliases, MCP_Tool_Alias{name = name, remote_name = remote_name})
+		append(&configs, config)
 	}
-	if len(aliases) == 0 {
-		// An allowlist with nothing in it would expose nothing, which is never what a
-		// configured server means.
-		delete(aliases)
-		return nil, false
-	}
-	return aliases[:], true
+	return configs[:], true
 }
 
 @(private)
-mcp_tool_aliases_release :: proc(aliases: [dynamic]MCP_Tool_Alias, allocator: mem.Allocator) {
-	for alias in aliases {
-		delete(alias.name, allocator)
-		delete(alias.remote_name, allocator)
+mcp_tool_configs_release :: proc(configs: [dynamic]MCP_Tool_Config, allocator: mem.Allocator) {
+	for config in configs {
+		delete(config.remote_name, allocator)
+		delete(config.name, allocator)
 	}
-	delete(aliases)
+	delete(configs)
 }
 
-// mcp_stdio_config is the transport view of a configured server. The strings are
-// borrowed from config, which must outlive the call: mcp.Client clones what it keeps
-// before it spawns anything.
+// mcp_stdio_config is the transport view of a configured server. A normal child
+// inherits the launch environment; configured entries replace or add variables.
+// The strings are borrowed until mcp.Client clones the configuration.
 mcp_stdio_config :: proc(config: MCP_Server_Config) -> mcp.Stdio_Config {
-	environment := make([]mcp.Environment_Entry, len(config.stdio.environment), context.temp_allocator)
-	for entry, index in config.stdio.environment {
-		environment[index] = mcp.Environment_Entry {
-			name  = entry.name,
-			value = entry.value,
+	environment := make([dynamic]mcp.Environment_Entry, 0, context.temp_allocator)
+	if inherited, err := os.environ(context.temp_allocator); err == nil {
+		for pair in inherited {
+			separator := strings.index_byte(pair, '=')
+			if separator <= 0 { continue }
+			append(&environment, mcp.Environment_Entry{name = pair[:separator], value = pair[separator + 1:]})
 		}
+	}
+	for override in config.stdio.environment {
+		replaced := false
+		for &entry in environment {
+			if entry.name != override.name { continue }
+			entry.value = override.value
+			replaced = true
+			break
+		}
+		if !replaced { append(&environment, mcp.Environment_Entry{name = override.name, value = override.value}) }
 	}
 	return mcp.Stdio_Config {
 		executable = config.stdio.executable,
 		arguments = config.stdio.arguments,
 		working_directory = config.stdio.working_directory,
-		environment = environment,
+		environment = environment[:],
 	}
 }
 

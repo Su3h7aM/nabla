@@ -32,11 +32,11 @@ test_mcp_definition_carries_the_alias_schema_and_hints :: proc(t: ^testing.T) {
 		annotations = {read_only = .Yes, destructive = .No, idempotent = .Unknown, open_world = .Yes},
 	}
 	backend: MCP_Tool_Backend
-	definition := mcp_tool_definition("github_create_issue", tool, &backend, Tool_Timeout_Policy{default = 5 * time.Second, maximum = time.Minute})
+	definition := mcp_tool_definition("github.create_issue", tool, &backend, Tool_Timeout_Policy{default = 5 * time.Second, maximum = time.Minute})
 
 	// The alias is what the model is advertised, and the remote name travels in the
 	// binding: the two are deliberately not the same string.
-	testing.expect_value(t, definition.name, "github_create_issue")
+	testing.expect_value(t, definition.name, "github.create_issue")
 	testing.expect_value(t, definition.description, "Create one issue.")
 	testing.expect_value(t, definition.input_schema, `{"type":"object"}`)
 	testing.expect(t, definition.execute == tool_mcp_execute, "every adapted tool shares one executor")

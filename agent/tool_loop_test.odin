@@ -657,14 +657,14 @@ test_result_contract_violation_is_replaced_in_dispatch :: proc(t: ^testing.T) {
 	defer tool_test_end(t, &test)
 
 	rogue := Tool_Definition {
-		name         = "rogue_tool",
+		name         = "test.rogue_tool",
 		description  = "A tool that returns content outside the result contract.",
 		input_schema = `{"type":"object"}`,
 		execute      = tool_loop_rogue_execute,
 	}
 	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, rogue).kind, Tool_Registry_Error_Kind.None) { return }
 
-	result := tool_run(t, &test, "rogue_tool", `{}`)
+	result := tool_run(t, &test, "test.rogue_tool", `{}`)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
 	tool_test_envelope_matches(t, result.content, .Success, TOOL_RESULT_REPLACED_MALFORMED)
 }
@@ -716,7 +716,7 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 	marker_one: u8 = 1
 	marker_two: u8 = 2
 	first := Tool_Definition {
-		name = "probe_first",
+		name = "test.probe_first",
 		description = "First probe tool.",
 		input_schema = `{"type":"object"}`,
 		timeouts = {default = 5 * time.Second, maximum = 10 * time.Second},
@@ -724,7 +724,7 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 		backend = &marker_one,
 	}
 	second := Tool_Definition {
-		name = "probe_second",
+		name = "test.probe_second",
 		description = "Second probe tool.",
 		input_schema = `{"type":"object"}`,
 		timeouts = {default = 30 * time.Second, maximum = 60 * time.Second},
@@ -734,13 +734,13 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, first).kind, Tool_Registry_Error_Kind.None) { return }
 	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, second).kind, Tool_Registry_Error_Kind.None) { return }
 
-	first_result := tool_run(t, &test, "probe_first", `{}`)
+	first_result := tool_run(t, &test, "test.probe_first", `{}`)
 	testing.expect_value(t, first_result.outcome, session.Tool_Outcome.Success)
 	testing.expect_value(t, tool_policy_seen_default, 5 * time.Second)
 	testing.expect_value(t, tool_policy_seen_maximum, 10 * time.Second)
 	testing.expect(t, tool_policy_seen_backend == &marker_one, "the first call carries the first binding")
 
-	second_result := tool_run(t, &test, "probe_second", `{}`)
+	second_result := tool_run(t, &test, "test.probe_second", `{}`)
 	testing.expect_value(t, second_result.outcome, session.Tool_Outcome.Success)
 	testing.expect_value(t, tool_policy_seen_default, 30 * time.Second)
 	testing.expect_value(t, tool_policy_seen_maximum, 60 * time.Second)

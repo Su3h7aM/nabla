@@ -719,7 +719,7 @@ test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
 	// The registry changes after preparation, the way a between-turn refresh
 	// could. The record must still describe what was sent.
 	rogue := Tool_Definition {
-		name         = "rogue_tool",
+		name         = "test.rogue_tool",
 		description  = "A tool added after preparation.",
 		input_schema = `{"type":"object"}`,
 		execute      = tool_test_dummy_execute,
@@ -737,7 +737,7 @@ test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
 		if !testing.expect(t, name_ok, "every recorded tool is named") { return }
 		testing.expect(t, string(name) > previous, "the recorded inventory is in advertised order")
 		previous = string(name)
-		testing.expect(t, string(name) != "rogue_tool", "a later registry change is not recorded")
+		testing.expect(t, string(name) != "test.rogue_tool", "a later registry change is not recorded")
 		if string(name) == TOOL_SHELL_NAME {
 			description, _ := entry["description"].(json.String)
 			testing.expect_value(t, string(description), TOOL_SHELL_DESCRIPTION)

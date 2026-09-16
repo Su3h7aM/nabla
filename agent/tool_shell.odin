@@ -10,7 +10,7 @@ import "core:unicode/utf8"
 
 import "nabla:agent/session"
 
-TOOL_SHELL_NAME :: "shell"
+TOOL_SHELL_NAME :: "builtin.shell"
 
 TOOL_SHELL_DESCRIPTION :: "Execute a command with /bin/sh in a fresh non-interactive process. Standard input is closed. Commands may use shell syntax. Directory and environment changes do not persist between calls. Returns bounded stdout and stderr, exit information, and truncation status. This is not a terminal or background-job service."
 

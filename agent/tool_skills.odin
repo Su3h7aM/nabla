@@ -8,7 +8,7 @@ import "nabla:agent/session"
 import "nabla:agent/skills"
 import "nabla:ai"
 
-TOOL_LIST_SKILLS_NAME :: "list_skills"
+TOOL_LIST_SKILLS_NAME :: "builtin.list_skills"
 TOOL_LIST_SKILLS_DESCRIPTION :: "List available skills by metadata. Returns name and description records with stable pagination; metadata is not the complete instructions."
 TOOL_LIST_SKILLS_SCHEMA :: `{"type":"object","properties":{"query":{"type":["string","null"],"description":"Whitespace-separated terms; every term must occur in the name or description."},"offset":{"type":["integer","null"],"description":"First match to return."},"limit":{"type":["integer","null"],"description":"Maximum matches to return."}},"additionalProperties":false}`
 TOOL_LIST_SKILLS_FIELDS :: []string{"query", "offset", "limit"}
@@ -16,7 +16,7 @@ TOOL_LIST_SKILLS_DEFAULT_LIMIT :: 20
 TOOL_LIST_SKILLS_MAX_LIMIT :: 100
 TOOL_LIST_SKILLS_MAX_QUERY_BYTES :: 4096
 
-TOOL_LOAD_SKILL_NAME :: "load_skill"
+TOOL_LOAD_SKILL_NAME :: "builtin.load_skill"
 TOOL_LOAD_SKILL_DESCRIPTION :: "Load one skill's complete instructions by name. Returns the full body in a single tool result."
 TOOL_LOAD_SKILL_SCHEMA :: `{"type":"object","properties":{"name":{"type":"string","description":"The skill name from the catalog."}},"required":["name"],"additionalProperties":false}`
 TOOL_LOAD_SKILL_FIELDS :: []string{"name"}

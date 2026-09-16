@@ -12,13 +12,12 @@ import "nabla:mcp"
 // MCP_Runtime owns the running MCP clients and the adapter bindings that point into
 // them.
 //
-// Both arrays are sized once, before any definition borrows a binding, and are never
-// grown again. A dynamic-array append would move the backing store and leave every
-// registry definition pointing at freed memory, which is the one mistake this type
-// exists to make impossible.
+// Client slots never move. Each binding has its own allocation, so collecting the
+// pointers cannot invalidate a definition. A refresh keeps the previous generation
+// alive until the session accepts the replacement registry.
 MCP_Runtime :: struct {
 	clients:           [dynamic]mcp.Client,
-	bindings:          [dynamic]agent.MCP_Tool_Backend,
+	bindings:          [dynamic]^agent.MCP_Tool_Backend,
 	// server_started and server_discovered say which clients have been launched and
 	// which have answered discovery since they were launched.
 	server_started:    []bool,
@@ -26,16 +25,13 @@ MCP_Runtime :: struct {
 	alloc:             mem.Allocator,
 }
 
-// mcp_runtime_make reserves a slot for every configured server and every alias. The
-// caller must have finished reading the configuration: the slot count is fixed here.
+// mcp_runtime_make reserves one stable client slot per configured server. Tool
+// bindings are allocated after discovery because the server decides their count.
 mcp_runtime_make :: proc(servers: []agent.MCP_Server_Config, alloc := context.allocator) -> MCP_Runtime {
 	runtime := MCP_Runtime {
 		alloc = alloc,
 	}
-	aliases := 0
-	for server in servers { aliases += len(server.tools) }
 	resize(&runtime.clients, len(servers))
-	resize(&runtime.bindings, aliases)
 	runtime.server_started = make([]bool, len(servers), alloc)
 	runtime.server_discovered = make([]bool, len(servers), alloc)
 	return runtime
@@ -48,7 +44,7 @@ mcp_runtime_destroy :: proc(runtime: ^MCP_Runtime) {
 	allocator := runtime.alloc
 	for &client in runtime.clients { mcp.client_destroy(&client) }
 	delete(runtime.clients)
-	delete(runtime.bindings)
+	mcp_bindings_destroy(&runtime.bindings, allocator)
 	delete(runtime.server_started, allocator)
 	delete(runtime.server_discovered, allocator)
 	runtime^ = {}
@@ -108,12 +104,18 @@ mcp_deadline :: proc(timeout: time.Duration) -> mcp.Control {
 	return {deadline_at = time.tick_add(time.tick_now(), timeout), has_deadline = true}
 }
 
-// mcp_page_find finds the remote tool an alias stands for. The remote name is
-// compared exactly: the protocol treats tool names as case-sensitive.
 @(private)
-mcp_page_find :: proc(page: mcp.Tool_Page, remote_name: string) -> (mcp.Tool, bool) {
-	for tool in page.tools {
-		if tool.name == remote_name { return tool, true }
+mcp_bindings_destroy :: proc(bindings: ^[dynamic]^agent.MCP_Tool_Backend, allocator: mem.Allocator) {
+	for binding in bindings^ { free(binding, allocator) }
+	delete(bindings^)
+	bindings^ = nil
+}
+
+// mcp_tool_config returns the override for one exact, case-sensitive remote name.
+@(private)
+mcp_tool_config :: proc(server: agent.MCP_Server_Config, remote_name: string) -> (agent.MCP_Tool_Config, bool) {
+	for config in server.tools {
+		if config.remote_name == remote_name { return config, true }
 	}
 	return {}, false
 }
@@ -141,39 +143,44 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	defer if !installed { agent.tool_registry_destroy(&registry) }
 
 	warnings := strings.builder_make(context.temp_allocator)
-	alias_index := 0
+	bindings := make([dynamic]^agent.MCP_Tool_Backend, 0, setup.alloc)
+	bindings_installed := false
+	defer if !bindings_installed { mcp_bindings_destroy(&bindings, setup.alloc) }
 	for server, index in setup.mcp_servers {
 		client, available := mcp_runtime_ensure(&setup.mcp, setup.mcp_servers, index, &warnings)
-		if !available {
-			alias_index += len(server.tools)
-			continue
-		}
+		if !available { continue }
 		page, list_err := mcp.client_tools_list(client, mcp_deadline(server.discovery_timeout), setup.alloc)
 		if list_err.kind != .None {
 			fmt.sbprintf(&warnings, "\n%s: %s", server.id, mcp.error_text(list_err, context.temp_allocator))
 			mcp.error_destroy(&list_err, setup.alloc)
-			alias_index += len(server.tools)
 			continue
 		}
-		for alias in server.tools {
-			// The binding lives in the runtime, whose slots are fixed, so a definition
-			// that borrows this address stays valid for the runtime's life.
-			binding := &setup.mcp.bindings[alias_index]
-			alias_index += 1
-			tool, found := mcp_page_find(page, alias.remote_name)
-			if !found {
-				fmt.sbprintf(&warnings, "\n%s: the server did not list %s", server.id, alias.remote_name)
-				continue
-			}
+		for tool in page.tools {
+			config, configured := mcp_tool_config(server, tool.name)
+			if configured && !config.enabled { continue }
+			local_name := tool.name
+			if configured && config.name != "" { local_name = config.name }
+			name := fmt.tprintf("%s.%s", server.id, local_name)
+			binding := new(agent.MCP_Tool_Backend, setup.alloc)
 			binding^ = agent.MCP_Tool_Backend {
 				client      = client,
 				server_id   = server.id,
-				remote_name = alias.remote_name,
+				remote_name = tool.name,
 			}
-			definition := agent.mcp_tool_definition(alias.name, tool, binding, agent.mcp_timeout_policy(server))
+			definition := agent.mcp_tool_definition(name, tool, binding, agent.mcp_timeout_policy(server))
 			if add_err := agent.tool_registry_add(&registry, definition); add_err.kind != .None {
-				fmt.sbprintf(&warnings, "\n%s: %s: %s", server.id, alias.name, add_err.detail)
+				fmt.sbprintf(&warnings, "\n%s: %s: %s", server.id, tool.name, add_err.detail)
+				free(binding, setup.alloc)
+				continue
 			}
+			append(&bindings, binding)
+		}
+		for config in server.tools {
+			found := false
+			for tool in page.tools {
+				if tool.name == config.remote_name { found = true; break }
+			}
+			if !found { fmt.sbprintf(&warnings, "\n%s: the server did not list %s", server.id, config.remote_name) }
 		}
 		mcp.tool_page_destroy(&page, setup.alloc)
 	}
@@ -183,8 +190,10 @@ app_tools_refresh :: proc(app: ^App) -> string {
 		fmt.sbprintf(&warnings, "\nthe tool list could not be replaced")
 		return strings.to_string(warnings)
 	}
-	// The session owns the registry now, and the old one is already destroyed, so
-	// nothing borrows the previous bindings.
+	// Replacement destroys the old registry, so its bindings can now be released.
+	mcp_bindings_destroy(&setup.mcp.bindings, setup.alloc)
+	setup.mcp.bindings = bindings
+	bindings_installed = true
 	installed = true
 	return strings.to_string(warnings)
 }
