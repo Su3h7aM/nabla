@@ -974,6 +974,19 @@ ANTHROPIC_COMPLETION_RESPONSE ::
 
 // --- tool refresh -------------------------------------------------------------
 
+// A binding outlives the discovery page that named its remote tool, so it keeps its
+// own copy rather than borrowing the page's allocation.
+@(test)
+test_mcp_binding_owns_remote_name :: proc(t: ^testing.T) {
+	remote_name := strings.clone("find_files", context.allocator)
+	binding := mcp_binding_make(nil, "fff", remote_name, context.allocator)
+	defer mcp_binding_destroy(binding, context.allocator)
+
+	testing.expect(t, raw_data(binding.remote_name) != raw_data(remote_name), "the binding must not borrow the discovery string")
+	delete(remote_name, context.allocator)
+	testing.expect_value(t, binding.remote_name, "find_files")
+}
+
 // A server that cannot be started contributes no tools and is reported once, and the
 // native tools are still installed. That is what keeps a broken server from costing
 // the user the tools that have nothing to do with it.

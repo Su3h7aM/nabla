@@ -105,8 +105,26 @@ mcp_deadline :: proc(timeout: time.Duration) -> mcp.Control {
 }
 
 @(private)
+mcp_binding_make :: proc(client: ^mcp.Client, server_id, remote_name: string, allocator: mem.Allocator) -> ^agent.MCP_Tool_Backend {
+	binding := new(agent.MCP_Tool_Backend, allocator)
+	binding^ = agent.MCP_Tool_Backend {
+		client      = client,
+		server_id   = server_id,
+		remote_name = strings.clone(remote_name, allocator),
+	}
+	return binding
+}
+
+@(private)
+mcp_binding_destroy :: proc(binding: ^agent.MCP_Tool_Backend, allocator: mem.Allocator) {
+	if binding == nil { return }
+	delete(binding.remote_name, allocator)
+	free(binding, allocator)
+}
+
+@(private)
 mcp_bindings_destroy :: proc(bindings: ^[dynamic]^agent.MCP_Tool_Backend, allocator: mem.Allocator) {
-	for binding in bindings^ { free(binding, allocator) }
+	for binding in bindings^ { mcp_binding_destroy(binding, allocator) }
 	delete(bindings^)
 	bindings^ = nil
 }
@@ -161,16 +179,11 @@ app_tools_refresh :: proc(app: ^App) -> string {
 			local_name := tool.name
 			if configured && config.name != "" { local_name = config.name }
 			name := fmt.tprintf("%s.%s", server.id, local_name)
-			binding := new(agent.MCP_Tool_Backend, setup.alloc)
-			binding^ = agent.MCP_Tool_Backend {
-				client      = client,
-				server_id   = server.id,
-				remote_name = tool.name,
-			}
+			binding := mcp_binding_make(client, server.id, tool.name, setup.alloc)
 			definition := agent.mcp_tool_definition(name, tool, binding, agent.mcp_timeout_policy(server))
 			if add_err := agent.tool_registry_add(&registry, definition); add_err.kind != .None {
 				fmt.sbprintf(&warnings, "\n%s: %s: %s", server.id, tool.name, add_err.detail)
-				free(binding, setup.alloc)
+				mcp_binding_destroy(binding, setup.alloc)
 				continue
 			}
 			append(&bindings, binding)

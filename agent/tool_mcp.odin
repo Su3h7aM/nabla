@@ -9,8 +9,8 @@ import "nabla:ai"
 import "nabla:mcp"
 
 // MCP_Tool_Backend binds one adapted definition to the server and remote tool it
-// came from. Every field is borrowed from the runtime generation that owns the
-// client.
+// came from. client and server_id borrow the runtime generation; remote_name is
+// owned by the binding because discovery pages are released after each refresh.
 //
 // The registry copies the pointer into the definition and the definition into every
 // turn that borrows it, so the generation must outlive every registry that holds a
