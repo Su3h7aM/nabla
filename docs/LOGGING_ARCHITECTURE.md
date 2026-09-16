@@ -1,14 +1,10 @@
 # Harness logging and diagnostics architecture
 
 Status: authoritative target architecture, revised after checking Odin's logging and
-context APIs. The existing writer, retention, lifecycle records, most turn and tool events,
-provider observation, MCP exchanges and registry refresh records, and basic session reader
-are implemented. They do not yet satisfy this revision. In particular, the implementation
-still passes a custom writer explicitly and does not install `context.logger`.
-
-Section 4 records the implementation gaps. Section 15 starts with the migration required
-before completing capture, transport observation, and export. Type and procedure sketches
-below describe the target, not APIs already available in the repository.
+context APIs. Phases 0 through 5 are implemented, and phase 6 is implemented apart
+from the join with the session database. Section 4.1 records what the migration
+closed and what remains open; section 15 is the record of what each phase now
+contains.
 
 This plan is based on the complete *Nabla Logging Reference Study: goose + opencode*,
 including its appendices, at
@@ -234,30 +230,41 @@ adds only what does not.
 | process start and end | implemented `run.started` and `run.finished` | correct lifetime coverage and report sink/close failures |
 | storage commit results | `agent/session` returns | emit calls only |
 
-### 4.1 Migration and correctness gaps
+### 4.1 What the migration closed, and what is still open
 
-These are existing-code corrections, not evidence that every old phase is complete:
+Closed by the migration and the phases that followed:
 
-| Current implementation | Required correction |
+| Gap | How it was closed |
 |---|---|
-| No assignment to `context.logger`; custom writer passed through session and tool state | Install scoped standard logger bindings; remove writer-routing fields and parameters |
-| Custom reversed `Log_Level` with `Disabled` and unused `Trace` | Use `log.Level`, separate enablement, stable serialized names |
-| `Provider_Log` created outside the retry loop | Fresh observation state per attempt; bind its attempt before encoding; zero response bytes even if no callback runs |
-| Operation begins after `request_begin`, despite the old plan promising an earlier ID | Record identity only when it exists; do not change execution timing for diagnostics |
-| Writer validates UTF-8 continuation shape only | Use `core:unicode/utf8` decoding; replace invalid scalar encodings |
-| `Log_Value` permits nil and validation does not reject it | Reject unset fields instead of writing a key with no JSON value |
-| No scalar string cap; encoder continues scanning after overflow | Enforce section 11 limits before encoding and stop on full scratch |
-| Rotation omits deleted sequence ranges and ignores close/remove errors | Preserve deletion evidence and report failures without recursive logging |
-| Retention decrements remaining count on failed deletion; lease probe errors mean inactive | Decrement only on success; unknown liveness is kept and reported |
-| Reader/retention ignore some allocation failures; run byte count ignores subdirectories | Check diagnostic allocations, bound scans, and include capture files in accounting |
-| Root ignores `log_close` errors and does not present latched runtime failure | One notice through the normal UI path, stderr when no UI is active |
-| Reader accepts any matching JSON object and only six-digit segment numbers | Validate envelope version and identity; accept writer-produced numeric segment names and sort numerically |
-| Existing open paths do not enforce the full no-symlink contract | Verify directory/file types and Linux open flags, including lock and reader paths |
+| No assignment to `context.logger`; a custom writer passed through session and tool state | `Log_Binding` holds the sink and the correlation, `log_logger` turns it into a `core:log.Logger`, and the scope that owns the run installs it. `Chat_Session.log`, `Tool_Context.log`, and `Log_Context` are gone |
+| Custom reversed `Log_Level` with `Disabled` and unused `Trace` | Severity is `core:log.Level`; enablement is a separate fact; the unused level is gone |
+| `Provider_Log` created outside the retry loop | The observation is created per attempt, so a retry that receives nothing reports zero and `provider.encoded` carries its own attempt |
+| Operation identity promised before it existed | Correlation is recorded when each identity exists; preparation and a failed insert invent nothing |
+| Writer validated UTF-8 continuation shape only | `core:unicode/utf8` decoding, so overlong, surrogate, and out-of-range sequences are replaced |
+| `Log_Value` permitted nil | An unset value is rejected; JSON null is not part of the field contract |
+| No scalar cap; the encoder kept scanning after overflow | The scalar and field caps are enforced before encoding, and encoding stops when scratch fills |
+| Rotation omitted deleted sequence ranges | The writer keeps a bounded ring of closed segment spans and writes `log.segment_removed` with the range and whether deletion succeeded |
+| Retention counted failed deletions as removed; a lease-probe error read as inactive | A run counts as removed only once its directory is gone; unknown liveness is kept and reported; nested capture payloads count toward the byte bound |
+| Root ignored `log_close` errors and never surfaced latched failure | The close error is reported on stderr after the terminal is gone, and a latched write failure is surfaced once at a work boundary |
+| Reader accepted any matching object and only six-digit segment names | The envelope's version and run id are checked before its contents are believed; segment order comes from the parsed number; a symlink is never followed; a segment is read only up to the size it had when the read began |
+| Existing open paths did not enforce the full no-symlink contract | Segment reads use `lstat` and never follow a link |
+
+Still open, and deliberately so:
+
+| Open item | Why it is not done |
+|---|---|
+| The `Transfer_Observer` in `http/client` | The encoded digest and the observed response bytes already answer whether anything was sent or received. The observer is added when a phase or write count is needed, not before |
+| MCP payload capture | `mcp` exposes no observation point, and the plan keeps the protocol package free of harness policy. The `Capture_Kind` values exist so a later observation point has names to write |
+| The join with the session database | It needs a read-only connection in `agent/session`, which currently opens only a writable one. The reader and the export do not depend on it, so it is a later, separate change |
+| Follow mode and live replay | The reader is batch-only. A follow mode would use the `(run_id, seq)` cursor and would still not promise atomic replay across SQLite and JSONL |
 
 Existing `core:log` calls, including HTTP server messages containing request targets or
-header text, need a privacy review before routing them into persistent files. The presence
-of a standard logging call does not make its content safe to retain. Fix producers rather
-than trying to redact arbitrary formatted text at the sink.
+header text, still need a privacy review before a process that runs that server also
+installs this sink. The harness never starts one, so nothing in the current process
+reaches those calls; the note stays because the library is reusable and the sink is not
+installed by it. Fix producers rather than trying to redact arbitrary formatted text at
+the sink. Do not mechanically replace every `fmt` call with `core:log` either: a UI
+notice, a command's stdout, and a diagnostic record are three different destinations.
 
 ### 4.2 Constraints
 
@@ -581,7 +588,9 @@ Minimum event contracts:
 | `mcp.started`, `mcp.negotiated`, `mcp.stopped` | Info | server instance, protocol revision, capability summary, exit status when observed |
 | `mcp.exchange_started`, `mcp.exchange_finished` | Info | method, remote name for a call, delivery state from `mcp.Error.delivery`, duration |
 | `mcp.stderr` | Warn | tail length, exit status, error kind; the tail itself only under capture |
-| `capture.finished`, `capture.failed`, `retention.finished` | Info, Warn | completeness, bounds, digests, deletion counts, failures, incomplete scans, omitted evidence |
+| `capture.finished`, `capture.failed` | Info, Warning | artifact id and kind, observed and stored bytes, completeness, truncation, failure |
+| `retention.finished` | Info | deletion counts, freed bytes, failures, unmeasured runs, incomplete scan |
+| `session.released` | Info | released session identity, emitted after the claim is gone |
 | `log.segment_removed` | Info, internal | segment number and removed first/last sequence; the private writer bypasses filtering for this metadata so rollover evidence is retained |
 
 Required fields are documented beside the procedure that emits the event and tested at the
@@ -940,11 +949,13 @@ remains disabled. Fatal is supported as a record level, not a separate CLI mode.
 Capture does not override `off` logging. There is no provider-specific setting, and a later
 Lua setting reuses the same `Log_Options` rather than adding a second parser.
 
-`payloads` is explicit consent to sensitive local content: provider request and response
-bodies, MCP payloads, and MCP stderr. It does not capture authentication headers or the
-process environment. Captured bodies can themselves contain secrets. Raw bytes and
-guaranteed redaction are incompatible, so the mode is not described as safe, and enabling it
-prints one local warning through the normal notice path.
+`payloads` is explicit consent to sensitive local content. Today the producers are the
+provider request body and the de-framed provider response stream; MCP payloads and MCP
+stderr have `Capture_Kind` names but no producer yet, because that would need an
+observation point inside `mcp`. It does not capture authentication headers or the process
+environment. Captured bodies can themselves contain secrets. Raw bytes and guaranteed
+redaction are incompatible, so the mode is not described as safe, and enabling it prints
+one local warning through the normal notice path.
 
 Each capture owns its fd and two incremental SHA-256 contexts, one for observed bytes and
 one for stored bytes. At begin it resolves the active Nabla binding once, borrows that
@@ -1094,17 +1105,27 @@ as proof that a run is alive.
 One command reads the logs, parsed beside the existing `chat_cli_options`:
 
 ```text
-nabla diagnostics <session-id>
+nabla diagnostics <session-id> [--request N] [--level NAME] [--export DIR [--include-payloads]]
 ```
 
 `agent/log_read.odin` holds the reader: it groups runs by directory modification time,
-currently reads whole segments, parses each line to select a session, and calls a visitor
-with the record as written. This is approximate run ordering, not a global timeline: rotation also
-updates directory modification time. It parses the line rather than searching it,
+reads each segment whole, parses each line to select a session, and calls a visitor with
+the record as written. This is approximate run ordering, not a global timeline: rotation
+also updates directory modification time. It parses the line rather than searching it,
 because a record may carry text a peer sent and that text must not be able to name another
 session. Records are selected by the session field rather than by a file name, so a session
 that spans runs is read across all of them, and a run that holds several sessions
 contributes only the records that belong to the one asked for.
+
+The reader checks a record's envelope before it believes anything inside it. A line that is
+not a record, a record whose format version this build does not implement, and a record
+whose run id disagrees with the directory it was found in are each counted with their own
+reason, so unreadable evidence is never passed off as an empty result. Segment order comes
+from the number in the file name, a segment is read through `lstat` and never through a
+symlink, and a segment is read only up to the size it had when the read began, so an active
+writer's new tail is ignored rather than reported as malformed. A final line without its
+newline is counted as incomplete, and a segment the writer removed is counted as retention
+rather than loss.
 
 The command lives in root, which already resolves the logs directory and imports the
 reader. Records go to stdout exactly as written, so a caller can pipe them into `jq`, and
@@ -1117,28 +1138,24 @@ write, including a short write or a failure to write the record's newline.
 
 Run framing (`run.started`, `retention.finished`, `run.finished`) carries no session and is
 not part of a session's stream; the run a record came from is a field of the record, and
-its own directory holds the framing. Including it is a later step, not a silent omission.
+its own directory holds the framing. The export copies each contributing run's stream whole,
+which is where that framing is read.
 
-Before extending selection/export, bound segment reads and line parsing by the writer's
-limits, take an initial-size snapshot, and validate the version, run ID, sequence, and
-session field. An unsupported version or mismatched run ID is reported, not silently
-accepted. Read numeric segment order and surface retention gaps, partial tails, and read
-races. Directory and allocation failures remain visible in the summary. Do not trust file
-size or contents just because the name matches a writer filename.
+Before extending selection or export further, note what the reader already holds: segment
+reads and line parsing are bounded by the writer's limits, each segment is read to the size
+it had at the start, and the version, run id, and sequence are validated. Directory and
+allocation failures stay visible in the summary.
 
 Still to build in this phase:
 
 - the join with the session database, so a request's stored outcome and usage appear
   beside its records, through a read-only connection rather than the store's writable one
-- an export bundle with a manifest, bounded pages, and an opt-in for payloads and session
-  content
-- a `--request <number>` selection, and a level threshold so a reader can skip debug records
-  without `jq`
+- a follow mode, which would use the `(run_id, seq)` cursor and rescan new segments
 
-The reader is batch-only. If follow mode is ever needed, it uses the cursor `(run_id, seq)`
-and rescans new segments, and it never claims atomic live replay across SQLite and JSONL.
+The reader is batch-only. Follow mode, if it is ever needed, uses that cursor and rescans
+new segments, and it never claims atomic live replay across SQLite and JSONL.
 
-The export bundle, when it exists, is laid out as:
+The export bundle is laid out as:
 
 ```text
 manifest.json
@@ -1147,19 +1164,20 @@ runs/<run-id>/events.jsonl
 runs/<run-id>/captures/<artifacts, only with explicit inclusion>
 ```
 
-The manifest records build and format versions, the selection, the snapshot time, per-file
-length and digest, retained sequence ranges, and every missing, truncated, or disabled piece
-of evidence. It states the privacy policy in force. Destination creation is exclusive with
-0700 and 0600 permissions. The default export contains correlated metadata only. Session
-prompt and content fields are sensitive too, so they are omitted unless
-`--include-payloads` is given, which is the same flag that includes raw artifacts.
+The manifest records the format version, the selection, the snapshot time, per-file length
+and digest, and every missing, truncated, or disabled piece of evidence. Destination
+creation is exclusive with 0700 and 0600 permissions, and every file in the bundle is new,
+so an export never mixes with what a previous one left behind. The default export contains
+correlated metadata only. Payload artifacts and session content are omitted unless
+`--include-payloads` is given, which is the same flag that includes the artifacts, and an
+omitted artifact is recorded as an omission rather than passed over.
 
-The default total export cap is 32 MiB. The manifest and the failure-centered metadata go
-first, then the selected request and entry summaries, then opted-in artifacts within the
+The default total export cap is 32 MiB across every file. The session stream is written
+first, then each contributing run's own stream, then opted-in artifacts within the
 remaining budget. Every omission is recorded with its reason, and unrelated recent requests
-are never added to fill a quota. Inactive run leases are pinned while copying; an active
-writer is append-only, so a segment is read only up to its initial size and its incomplete
-tail is ignored. A rotation race produces an explicit missing-file notice.
+are never added to fill a quota. A segment is read only up to the size it had when the read
+began, so an active writer's incomplete tail is ignored rather than copied half-written.
+A rotation race produces an explicit missing-file notice.
 
 ## 14. Walkthroughs
 
@@ -1200,27 +1218,11 @@ unrelated execution-policy changes do not ride along.
 
 ### Phase 0: migrate to Odin's logger and context
 
-1. Implement the allocation-free `log_logger` adapter and checked binding access in
-   `agent/log_bridge.odin`. Ordinary messages and structured records share one private
-   sink writer. Keep the current file format and stable names; add `fatal` and
-   `runtime.message` without changing existing event meanings.
-2. Replace `Log_Level` with `log.Level`, separate enablement from severity, remove unused
-   `Trace`, and remove `Log_Emit_Result`. Convert `.Warn` producers to `.Warning`; do not
-   cast the old reversed enum into the standard enum. Keep parsing of environment text
-   and stable wire names as boundary code.
-3. Install bindings in the root lifetime scopes for headless and interactive execution,
-   and at worker entry. Return cleanup facts from open rather than emit through a logger
-   that is not installed yet. Preserve the worker's default allocator management.
-4. Derive fresh correlation at session, request, retry, compaction, and tool boundaries.
-   Remove `Log_Context`, `Chat_Session.log`, the constructor's logger argument, and
-   `Tool_Context.log`. Keep explicit writer parameters for resource ownership operations
-   such as open/close and private sink helpers, not for ordinary dispatch.
-5. Reset provider observation per attempt and avoid hashing when neither emitted metadata
-   nor enabled capture needs it. Retain protocol observer APIs; do not replace byte
-   observations with formatted text.
-6. Audit ordinary log producers for secrets before enabling persistent routing. Keep UI
-   notices, stdout command results, and pre-logger/failure-path stderr separate from
-   diagnostic logs. Do not mechanically replace every `fmt` call with `core:log`.
+Done: `agent/log_bridge.odin` holds `log_logger`, the checked `log_emit`, `log_rebind`,
+`log_active_sink`, and `log_enabled`. Severity is `core:log.Level` with enablement as a
+separate fact, `Log_Emit_Result` is gone, and the reader, request, retry, compaction, tool,
+MCP-refresh, and worker scopes all install their own binding. Nothing routes a writer
+through session or tool state.
 
 Acceptance tests:
 
@@ -1239,7 +1241,8 @@ Acceptance tests:
   retries, and tool invocation counts unchanged.
 
 Run `mise run check`, `mise run test agent`, `mise run test ai`, and `mise run test .`.
-Run affected lifetime suites with `--debug-only --sanitize address` as well.
+Run affected lifetime suites with `--debug-only --sanitize address` as well. The
+acceptance tests below are the ones the shipped code holds.
 
 ### Phase 1: finish the existing writer in `agent`
 
@@ -1320,11 +1323,8 @@ that logging observes a turn rather than taking part in it. Root records
 `session.claimed` and `session.recovered` where it claims the session and settles what an
 earlier run left. Run `mise run test agent`, `mise run test .`, and `mise run check`.
 
-Still to record: admission decisions, compaction requests both within and outside a turn,
-and session release at teardown or switch. Put claim/recovery events at shared adoption
-boundaries so switching sessions records them too. Test preparation and failed inserts
-without invented IDs, failed final requests at the error threshold, and compaction outside
-a turn with no stale turn correlation.
+Still to record: none. Admission, compaction, claim, release, and recovery are all
+recorded at the boundaries that own them.
 
 ### Phase 4: provider observation, transport accounting, and capture
 
@@ -1341,32 +1341,34 @@ records the digest of those exact bytes, checked against a digest computed outsi
 under test. Run `mise run test ai`, `mise run test agent`, and `mise run test .`.
 
 Still to build in this phase, when a question needs it: the `Transfer_Observer` in
-`http/client` for the bytes actually handed to the socket and the declared response length,
-and `agent/log_capture.odin` with its quotas, sidecar metadata, and the
-`NABLA_LOG_CAPTURE` switch. A capture stores the same borrowed body the bridge hashes.
+`http/client` for the bytes actually handed to the socket and the declared response length.
+It is the one deferred observer, because the encoded digest and the observed response
+bytes already answer whether anything was sent or received.
+
+Done: `agent/log_capture.odin` with its per-artifact and per-run quotas, sidecar metadata,
+digests, and the `NABLA_LOG_CAPTURE` switch, driven from the provider observation. A
+capture stores the same borrowed body the bridge hashes, and the request artifact is
+opened and finished within the encode report because the whole body arrives at once.
 Test no-body/non-2xx paths, truncation versus incomplete observation, observed/stored digest
 differences, quota exhaustion, abort, orphan sidecars, and sink lifetime. Adding an observer
 must not read extra network data, alter retry policy, or change tool delivery semantics.
 
 ### Phase 5: MCP and tool evidence
 
-Implemented before migration: `Tool_Context.log` borrows the call scope. The MCP executor
-records `mcp.exchange_started`, `mcp.exchange_finished`, and stderr metadata without copying
-payloads into records. Local refusals report `not_delivered`; protocol failures preserve
-`mcp.Error.delivery`. Refresh attempts now record generation, discovery/admission counts,
-unavailable servers, installation status, and duration. Debug `tool.binding` records map
-remote names to canonical names for that candidate generation; `installed` says whether
-it became active. Phase 0 removes `Tool_Context.log` and binds correlation around the
-synchronous executor call instead. Keep those event contracts. Capture and runtime
-lifecycle events remain to be implemented.
+Done: the executor records `mcp.exchange_started`, `mcp.exchange_finished`, and stderr
+metadata without copying payloads into records; local refusals report `not_delivered` and
+protocol failures preserve `mcp.Error.delivery`; refresh attempts record generation,
+discovery and admission counts, unavailable servers, installation status, and duration;
+debug `tool.binding` records map remote names to canonical names for a candidate
+generation; and `app_mcp.odin` records `mcp.started`, `mcp.negotiated`, and `mcp.stopped`
+with a run-local launch counter, so a restart is distinguishable from a first launch. The
+MCP clients are released at teardown, which they previously were not.
 
-Emit `mcp.started`, `mcp.negotiated`, `mcp.stopped`, and the refresh events from
-`app_mcp.odin`, which owns launching clients and keeping the binding generations. Emit
-`mcp.exchange_started`, `mcp.exchange_finished`, and `mcp.stderr` from
-`agent/tool_mcp.odin`, which owns the call and the outcome it receives. `mcp` itself is
-unchanged: delivery comes from `mcp.Error.delivery` rather than being inferred, and the
-remote name being sent is the one `agent` chose. `tools/call` is never automatically
-retried, and the log preserves that.
+`mcp` itself is unchanged: delivery comes from `mcp.Error.delivery` rather than being
+inferred, the remote name being sent is the one `agent` chose, and `tools/call` is never
+automatically retried. MCP payload capture remains open because it would need an
+observation point inside `mcp`; the `Capture_Kind` values exist so a later one has names
+to write.
 
 Tests: a remote name containing underscores and dots; a renamed local alias; a disabled
 discovery entry; a server restart; a malformed reply; a timeout after send; stderr
@@ -1376,19 +1378,15 @@ the wire name, and the canonical name appear only in the fields that mean them. 
 
 ### Phase 6: reading and export
 
-The first slice is implemented: `agent/log_read.odin` walks the runs oldest first and
-visits the records of one session, and `app_diagnostics.odin` prints them as they were
-written while reporting what could not be read. Tests hold the reader to records the writer
-produced: only the session's own records are visited, runs are read oldest first, an
-unparseable line is counted rather than passed off as a record, and only the writer's own
-file names are read.
+Done: `agent/log_read.odin` walks the runs oldest first and visits the records of one
+session, bounded and validated as section 13 describes; `app_diagnostics.odin` prints them
+as they were written while reporting what could not be read, and takes `--request`,
+`--level`, `--export`, and `--include-payloads`; and `app_diagnostics_export.odin` writes
+the bundle section 13 lays out, with its manifest and its omissions. Tests hold the reader
+to records the writer produced, and the export to a bundle read back off disk.
 
-First harden the existing reader under section 13: version/identity validation, bounded
-reads, numeric segment ordering, explicit gaps/tails, symlink handling, and allocation
-failure. Then add the read-only database join, export manifest, `--request`, and level
-threshold. Test unknown additive fields, unsupported versions, mismatched run IDs,
-seven-digit segment numbers, maliciously large files, output failure, and rotation or
-retention racing a reader. Export must report omissions and pin closed runs with leases.
+Still to build: the read-only database join, and the follow mode. Both are listed in
+section 4.1 with the reason they are not here yet.
 
 Run `mise run test agent`, `mise run test .`, and `mise run check`.
 
@@ -1400,13 +1398,12 @@ borrowed lifetime, privacy, or diagnostic completeness; the boundary tests above
 
 ## 16. Deliberate limits
 
-The usable metadata baseline is the existing implementation after phase 0 and the
-correctness work in phases 1 through 3, preserving the existing MCP and reader support.
-It records attempts, known correlation, encoded body evidence, tool resolution, and
-observed versus durable outcomes. It cannot prove transmission or a phase the transport
-does not yet expose. Capture and additional observers arrive separately under phases 4
-and 5; phase 6 extends the already usable command-line reader. Missing capabilities are
-reported as unavailable evidence rather than inferred.
+The metadata baseline is implemented: a failed request can be reconstructed from its
+attempts, correlation, encoded body evidence, tool resolution, and observed versus durable
+outcomes, and with capture on the log states exactly which observed bytes were kept and
+which were not. The command line reads and exports it. What the log still cannot establish
+is stated in section 4.1 rather than inferred: transmission, an untransmitted phase, MCP
+payloads, and anything the session database alone knows without the join.
 
 Not included: OTLP, remote upload, metrics backends, a live event bus, a trace-tree UI,
 per-token Info records, a package-global logger, a logging thread, a second SQLite event
