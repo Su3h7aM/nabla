@@ -49,14 +49,6 @@ log_rebind :: proc(binding: ^Log_Binding, correlation: Log_Correlation) -> log.L
 	return log_bound_logger(binding, active)
 }
 
-// log_rebound returns a logger for a binding this scope already filled, or the
-// active logger when the binding holds no sink. It is for a scope that updates its
-// own correlation in place as identities become known, rather than rebinding.
-log_rebound :: proc(binding: ^Log_Binding) -> log.Logger {
-	if binding.sink == nil { return context.logger }
-	return log_bound_logger(binding, context.logger)
-}
-
 @(private)
 log_bound_logger :: proc(binding: ^Log_Binding, template: log.Logger) -> log.Logger {
 	return log.Logger{procedure = log_procedure, data = rawptr(binding), lowest_level = template.lowest_level, options = template.options}
