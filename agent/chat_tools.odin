@@ -29,6 +29,7 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		log_emit(call, Log_Record{level = .Info, category = .Tool, event = "tool.call_received", fields = received[:]})
 
 		ctx := Tool_Context {
+			log       = call,
 			call_id   = staged.id,
 			workspace = chat.workspace,
 			control   = control,
@@ -87,6 +88,7 @@ chat_prepare_call :: proc(
 	call := log_scope(chat)
 	call.call_id = staged.id
 	ctx := Tool_Context {
+		log = call,
 		call_id = staged.id,
 		workspace = chat.workspace,
 		control = {interrupt = &chat_cancel, deadline = chat.turn_deadline},

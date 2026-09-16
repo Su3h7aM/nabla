@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:encoding/json"
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -11,6 +12,43 @@ import "nabla:mcp"
 @(private)
 mcp_test_context :: proc() -> Tool_Context {
 	return Tool_Context{call_id = "call_mcp", allocator = context.allocator}
+}
+
+@(test)
+test_mcp_exchange_records_delivery_without_payloads :: proc(t: ^testing.T) {
+	fixture: Log_Test
+	log_test_begin(t, &fixture)
+	defer log_test_end(t, &fixture)
+	backend := MCP_Tool_Backend {
+		server_id   = "files",
+		remote_name = "find_files.by_name",
+	}
+	ctx := mcp_test_context()
+	ctx.backend = &backend
+	ctx.log = {
+		log     = &fixture.log,
+		call_id = ctx.call_id,
+	}
+	result := tool_mcp_execute(&ctx, json.Object{})
+	defer tool_result_destroy(&result)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Unavailable)
+
+	failure := mcp.Error {
+		kind        = .Timed_Out,
+		delivery    = .Delivered,
+		stderr_tail = "secret-token\nprivate output",
+	}
+	log_mcp_exchange_finished(ctx.log, &backend, failure.delivery, failure, .Timed_Out, time.Second)
+	text := log_test_segment_text(t, &fixture, 1)
+	defer delete(text, context.allocator)
+	testing.expect(t, strings.contains(text, `"event":"mcp.exchange_started"`))
+	testing.expect(t, strings.contains(text, `"remote_name":"find_files.by_name"`))
+	testing.expect(t, strings.contains(text, `"delivery":"not_delivered"`))
+	testing.expect(t, strings.contains(text, `"delivery":"delivered"`))
+	testing.expect(t, strings.contains(text, `"event":"mcp.stderr"`))
+	testing.expect(t, strings.contains(text, `"call_id":"call_mcp"`))
+	testing.expect(t, !strings.contains(text, "secret-token"))
+	testing.expect(t, !strings.contains(text, "private output"))
 }
 
 @(private)

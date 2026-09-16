@@ -1025,6 +1025,11 @@ so the pieces that exist are the ones it needs.
 
 ### Phase 5: MCP and tool evidence
 
+Implemented: `Tool_Context.log` borrows the call scope, and the MCP executor records
+`mcp.exchange_started`, `mcp.exchange_finished`, and stderr metadata without copying
+payloads into records. Local refusals report `not_delivered`; protocol failures preserve
+`mcp.Error.delivery`. Capture and runtime lifecycle events remain to be implemented.
+
 Emit `mcp.started`, `mcp.negotiated`, `mcp.stopped`, and the refresh events from
 `app_mcp.odin`, which owns launching clients and keeping the binding generations. Emit
 `mcp.exchange_started`, `mcp.exchange_finished`, and `mcp.stderr` from

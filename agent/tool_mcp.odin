@@ -3,6 +3,7 @@ package agent
 import "core:encoding/json"
 import "core:fmt"
 import "core:strings"
+import "core:time"
 
 import "nabla:agent/session"
 import "nabla:ai"
@@ -71,11 +72,17 @@ mcp_hint :: proc(hint: mcp.Hint) -> Tool_Hint_Value {
 // tool_mcp_execute runs one adapted call. It is the only executor every MCP
 // definition shares, which is what lets a definition carry a backend binding instead
 // of a procedure of its own.
-tool_mcp_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+tool_mcp_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (result: Tool_Result) {
 	// The arguments are already admitted and the object is already parsed; what
 	// travels is the admitted text, so the peer and the dispatch record agree.
 	_ = arguments
 	backend := cast(^MCP_Tool_Backend)ctx.backend
+	started := time.tick_now()
+	exchange_error: mcp.Error
+	delivery := mcp.Delivery_State.Not_Delivered
+	defer mcp.error_destroy(&exchange_error, ctx.allocator)
+	defer log_mcp_exchange_finished(ctx.log, backend, delivery, exchange_error, result.outcome, time.tick_since(started))
+	log_mcp_exchange_started(ctx.log, backend)
 	if backend == nil || backend.client == nil {
 		return tool_result_failure(ctx, .Unavailable, "the server for this tool is not configured", "unavailable")
 	}
@@ -88,10 +95,14 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Res
 		return tool_result_failure(ctx, .Unavailable, fmt.tprintf("the server %s is not running", backend.server_id), "server down")
 	}
 
-	call, err := mcp.client_tools_call(backend.client, backend.remote_name, ctx.arguments_json, tool_mcp_control(ctx), ctx.allocator)
-	defer mcp.error_destroy(&err, ctx.allocator)
+	call: mcp.Call_Result
+	call, exchange_error = mcp.client_tools_call(backend.client, backend.remote_name, ctx.arguments_json, tool_mcp_control(ctx), ctx.allocator)
 	defer mcp.call_result_destroy(&call, ctx.allocator)
-	if err.kind != .None { return tool_mcp_error_result(ctx, backend, err) }
+	if exchange_error.kind != .None {
+		delivery = exchange_error.delivery
+		return tool_mcp_error_result(ctx, backend, exchange_error)
+	}
+	delivery = .Delivered
 	return tool_mcp_call_result(ctx, call)
 }
 
