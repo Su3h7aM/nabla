@@ -1028,7 +1028,10 @@ so the pieces that exist are the ones it needs.
 Implemented: `Tool_Context.log` borrows the call scope, and the MCP executor records
 `mcp.exchange_started`, `mcp.exchange_finished`, and stderr metadata without copying
 payloads into records. Local refusals report `not_delivered`; protocol failures preserve
-`mcp.Error.delivery`. Capture and runtime lifecycle events remain to be implemented.
+`mcp.Error.delivery`. Refresh attempts now record generation, discovery/admission counts,
+unavailable servers, installation status, and duration. Debug `tool.binding` records map
+remote names to canonical names for that candidate generation; `installed` says whether
+it became active. Capture and runtime lifecycle events remain to be implemented.
 
 Emit `mcp.started`, `mcp.negotiated`, `mcp.stopped`, and the refresh events from
 `app_mcp.odin`, which owns launching clients and keeping the binding generations. Emit

@@ -1015,6 +1015,11 @@ test_refresh_degrades_to_native_tools_when_a_server_is_unusable :: proc(t: ^test
 	}
 	app.setup.mcp_servers = servers
 	app.setup.mcp = mcp_runtime_make(servers, context.allocator)
+	if log_error := agent.log_open(&app.setup.log, {directory = directory, level = .Debug}); log_error != nil {
+		testing.fail_now(t, "could not open diagnostics")
+	}
+	defer agent.log_close(&app.setup.log)
+	app.setup.session.log = &app.setup.log
 	// The registry borrows the runtime's bindings, so the session goes first and the
 	// clients second. The directory belongs to app_session_end.
 	defer {
@@ -1034,6 +1039,17 @@ test_refresh_degrades_to_native_tools_when_a_server_is_unusable :: proc(t: ^test
 	testing.expect(t, native_present, "the native tools survive a broken server")
 	_, remote_present := agent.tool_registry_find(&app.setup.session.tools, "broken_read")
 	testing.expect(t, !remote_present, "an unreachable server contributes no tools")
+
+	output_text: strings.Builder
+	defer strings.builder_destroy(&output_text)
+	output := Diagnostics_Output {
+		writer = strings.to_writer(&output_text),
+	}
+	summary := agent.log_read_session(directory, app.setup.session.id, &output, diagnostics_visit)
+	testing.expect_value(t, summary.records, 2)
+	testing.expect(t, strings.contains(strings.to_string(output_text), `"installed":true`))
+	testing.expect(t, strings.contains(strings.to_string(output_text), `"unavailable_servers":1`))
+	testing.expect(t, strings.contains(strings.to_string(output_text), `"accepted":0`))
 }
 
 // With nothing configured, refresh has nothing to do and says nothing.

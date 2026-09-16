@@ -16,13 +16,14 @@ import "nabla:mcp"
 // pointers cannot invalidate a definition. A refresh keeps the previous generation
 // alive until the session accepts the replacement registry.
 MCP_Runtime :: struct {
-	clients:           [dynamic]mcp.Client,
-	bindings:          [dynamic]^agent.MCP_Tool_Backend,
+	clients:            [dynamic]mcp.Client,
+	bindings:           [dynamic]^agent.MCP_Tool_Backend,
 	// server_started and server_discovered say which clients have been launched and
 	// which have answered discovery since they were launched.
-	server_started:    []bool,
-	server_discovered: []bool,
-	alloc:             mem.Allocator,
+	server_started:     []bool,
+	server_discovered:  []bool,
+	alloc:              mem.Allocator,
+	refresh_generation: u64,
 }
 
 // mcp_runtime_make reserves one stable client slot per configured server. Tool
@@ -153,11 +154,31 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	if len(setup.mcp_servers) == 0 { return "" }
 	if agent.chat_session_state(&setup.session) != .Idle { return "" }
 
+	setup.mcp.refresh_generation += 1
+	scope := agent.log_scope(&setup.session)
+	generation := setup.mcp.refresh_generation
+	discovered, accepted, disabled, rejected, unavailable := 0, 0, 0, 0, 0
+	installed := false
+	started := time.tick_now()
+	start_fields := [1]agent.Log_Field{{key = "generation", value = generation}}
+	agent.log_emit(scope, {level = .Info, category = .Tool, event = "tools.refresh_started", fields = start_fields[:]})
+	defer {
+		fields := [8]agent.Log_Field {
+			{key = "generation", value = generation},
+			{key = "discovered", value = i64(discovered)},
+			{key = "accepted", value = i64(accepted)},
+			{key = "disabled", value = i64(disabled)},
+			{key = "rejected", value = i64(rejected)},
+			{key = "unavailable_servers", value = i64(unavailable)},
+			{key = "installed", value = installed},
+			{key = "elapsed_ms", value = agent.log_duration_ms(time.tick_since(started))},
+		}
+		agent.log_emit(scope, {level = .Info, category = .Tool, event = "tools.refresh_finished", fields = fields[:]})
+	}
 	registry, registry_err := agent.tool_registry_make(setup.alloc)
 	if registry_err.kind != .None {
 		return "the tool registry could not be built"
 	}
-	installed := false
 	defer if !installed { agent.tool_registry_destroy(&registry) }
 
 	warnings := strings.builder_make(context.temp_allocator)
@@ -166,26 +187,38 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	defer if !bindings_installed { mcp_bindings_destroy(&bindings, setup.alloc) }
 	for server, index in setup.mcp_servers {
 		client, available := mcp_runtime_ensure(&setup.mcp, setup.mcp_servers, index, &warnings)
-		if !available { continue }
+		if !available { unavailable += 1; continue }
 		page, list_err := mcp.client_tools_list(client, mcp_deadline(server.discovery_timeout), setup.alloc)
 		if list_err.kind != .None {
+			unavailable += 1
 			fmt.sbprintf(&warnings, "\n%s: %s", server.id, mcp.error_text(list_err, context.temp_allocator))
 			mcp.error_destroy(&list_err, setup.alloc)
 			continue
 		}
+		discovered += len(page.tools) + len(page.rejected)
+		rejected += len(page.rejected)
 		for tool in page.tools {
 			config, configured := mcp_tool_config(server, tool.name)
-			if configured && !config.enabled { continue }
+			if configured && !config.enabled { disabled += 1; continue }
 			local_name := tool.name
 			if configured && config.name != "" { local_name = config.name }
 			name := fmt.tprintf("%s.%s", server.id, local_name)
 			binding := mcp_binding_make(client, server.id, tool.name, setup.alloc)
 			definition := agent.mcp_tool_definition(name, tool, binding, agent.mcp_timeout_policy(server))
 			if add_err := agent.tool_registry_add(&registry, definition); add_err.kind != .None {
+				rejected += 1
 				fmt.sbprintf(&warnings, "\n%s: %s: %s", server.id, tool.name, add_err.detail)
 				mcp_binding_destroy(binding, setup.alloc)
 				continue
 			}
+			accepted += 1
+			fields := [4]agent.Log_Field {
+				{key = "generation", value = generation},
+				{key = "server_id", value = server.id},
+				{key = "remote_name", value = tool.name},
+				{key = "tool", value = name},
+			}
+			agent.log_emit(scope, {level = .Debug, category = .Tool, event = "tool.binding", fields = fields[:]})
 			append(&bindings, binding)
 		}
 		for config in server.tools {
