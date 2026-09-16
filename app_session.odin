@@ -209,6 +209,26 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 		fmt.eprintln("nabla: the session claim went missing")
 		return false
 	}
+
+	// The session and what an earlier run left unfinished are one record each, so a
+	// launch that found work to settle says which work it found.
+	claimed_scope := agent.Log_Context {
+		log        = &setup.log,
+		session_id = claimed,
+	}
+	claimed_fields := [1]agent.Log_Field{{key = "resumed", value = start.kind != .New}}
+	agent.log_emit(claimed_scope, agent.Log_Record{level = .Info, category = .Session, event = "session.claimed", fields = claimed_fields[:]})
+	recovery := adoption.recovery
+	if recovery.interrupted_turns > 0 || recovery.interrupted_requests > 0 || recovery.recovered_calls > 0 || recovery.unexecuted_calls > 0 {
+		recovery_fields := [4]agent.Log_Field {
+			{key = "interrupted_turns", value = i64(recovery.interrupted_turns)},
+			{key = "interrupted_requests", value = i64(recovery.interrupted_requests)},
+			{key = "recovered_calls", value = i64(recovery.recovered_calls)},
+			{key = "unexecuted_calls", value = i64(recovery.unexecuted_calls)},
+		}
+		agent.log_emit(claimed_scope, agent.Log_Record{level = .Info, category = .Session, event = "session.recovered", fields = recovery_fields[:]})
+	}
+
 	setup.workspace = strings.clone(adoption.header.workspace, setup.alloc)
 	setup.resumed_provider = strings.clone(adoption.header.provider, setup.alloc)
 	setup.resumed_model = strings.clone(adoption.header.model, setup.alloc)

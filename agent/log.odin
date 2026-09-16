@@ -121,6 +121,9 @@ Log_Context :: struct {
 	request_no:   session.Request_No,
 	attempt:      int,
 	operation_id: u64,
+	// call_id is the provider's own id for one tool call, borrowed from the call
+	// being handled. It is empty for work that is not a tool call.
+	call_id:      string,
 }
 
 // Log_Emit_Result says what became of one record. A caller that only records an
@@ -694,7 +697,8 @@ log_key_reserved :: proc(key: string) -> bool {
 	     "turn_no",
 	     "request_no",
 	     "attempt",
-	     "operation_id":
+	     "operation_id",
+	     "call_id":
 		return true
 	}
 	return false
@@ -745,6 +749,10 @@ log_encode :: proc(log: ^Log, scope: Log_Context, record: Log_Record, sequence: 
 	if scope.operation_id != 0 {
 		log_line_bytes(&line, `,"operation_id":`)
 		log_line_uint(&line, scope.operation_id)
+	}
+	if scope.call_id != "" {
+		log_line_bytes(&line, `,"call_id":`)
+		log_line_json_string(&line, scope.call_id)
 	}
 	for field in record.fields {
 		log_line_byte(&line, ',')

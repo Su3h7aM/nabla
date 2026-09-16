@@ -70,6 +70,21 @@ log_error_kind_name :: proc(kind: session.Error_Kind) -> string {
 	return "invalid_state"
 }
 
+// tool_arguments_status_name is what tool.arguments_prepared records for the
+// admission outcome.
+@(private)
+tool_arguments_status_name :: proc(status: Tool_Arguments_Status) -> string {
+	switch status {
+	case .Valid:
+		return "valid"
+	case .Repaired:
+		return "repaired"
+	case .Rejected:
+		return "rejected"
+	}
+	return "rejected"
+}
+
 @(private)
 log_operation_error_name :: proc(kind: ai.Provider_Operation_Error_Kind) -> string {
 	switch kind {

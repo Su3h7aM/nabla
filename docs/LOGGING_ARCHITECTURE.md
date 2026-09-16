@@ -1,7 +1,7 @@
 # Harness logging and diagnostics architecture
 
-Status: phases 1 and 2 are implemented, together with the request half of phase 3; the
-rest is planned.
+Status: phases 1 and 2 are implemented, together with phase 3 apart from compaction
+requests and the session release record; the rest is planned.
 
 This plan is based on the complete *Nabla Logging Reference Study: goose + opencode*,
 including its appendices, at
@@ -271,6 +271,7 @@ Log_Context :: struct {
 	request_no:   session.Request_No,
 	attempt:      int,
 	operation_id: u64,
+	call_id:      string,
 }
 
 // Log_Emit_Result says what became of one record. Disabled is the zero value:
@@ -340,7 +341,7 @@ pattern in `agent/session/store.odin`.
 One valid UTF-8 JSON object per line:
 
 ```json
-{"version":1,"run_id":"128-bit-lowercase-hex","seq":42,"time_unix_ns":1789550000000000000,"elapsed_ns":123456,"thread_id":8123,"level":"info","category":"provider","event":"provider.encoded","session_id":"32-hex","turn_no":3,"request_no":6,"attempt":1,"operation_id":12,"api":"openai_chat_completions","model":"some-model","body_bytes":174381,"body_sha256":"..."}
+{"version":1,"run_id":"128-bit-lowercase-hex","seq":42,"time_unix_ns":1789550000000000000,"elapsed_ns":123456,"thread_id":8123,"level":"info","category":"provider","event":"provider.encoded","session_id":"32-hex","turn_no":3,"request_no":6,"attempt":1,"operation_id":12,"call_id":"call_abc","api":"openai_chat_completions","model":"some-model","body_bytes":174381,"body_sha256":"..."}
 ```
 
 The ids and timestamp above are illustrative; actual values must pass validation. Envelope
@@ -405,7 +406,8 @@ Minimum event contracts:
 | Events | Level | Facts beyond correlation |
 |---|---|---|
 | `run.started`, `run.finished` | Info | build id, PID, schema version, effective diagnostic policy; close outcome |
-| `session.claimed`, `session.released`, `session.recovered` | Info | recovery counts from `Recovery`, and the unfinished database state found |
+| `session.claimed` | Info | whether the launch resumed rather than started fresh |
+| `session.recovered` | Info | interrupted turns and requests, calls whose outcome is unknown, and calls that never ran; emitted only when there was something to settle |
 | `storage.failed` | Error | the local operation that failed, the store's error kind, and the error detail length |
 | `turn.started`, `turn.finished` | Info | prompt size at the start; outcome, whether the outcome landed, request and call counts at the end |
 | `agent.event_ignored` | Debug | reason, supplied turn and operation, current operation |
@@ -420,10 +422,11 @@ Minimum event contracts:
 | `provider.completion_received`, `provider.completion_delivered` | Debug | finish reason, call count, whether the terminal event was delivered |
 | `request.finished`, `request.commit_failed` | Info, Error | outcome, attempts, finish reason; the storage failure is `storage.failed` |
 | `tools.refresh_started`, `tools.refresh_finished` | Info | generation, discovered, accepted, disabled and rejected counts |
-| `tool.binding` | Debug | canonical name, wire name, remote name, server instance, schema digest |
-| `tool.call_received`, `tool.name_resolved` | Info | proposed wire name and the selected canonical name, or that none or several matched |
-| `tool.arguments_prepared` | Debug | original and effective length and digest, repair classification; not the arguments |
-| `tool.dispatch_committed`, `tool.execution_started`, `tool.execution_finished`, `tool.result_committed` | Info | respective entry sequence, outcome, result size, truncation and finalization |
+| `tool.name_resolved` | Info | the name the model sent and the name the harness resolved it to |
+| `tool.call_received` | Info | the canonical tool name and the argument byte count |
+| `tool.arguments_prepared` | Debug | admission status, repair classification, effective byte count |
+| `tool.dispatch_committed`, `tool.result_committed` | Info | the entry sequence the dispatch and the result were stored as, and the outcome |
+| `tool.execution_started`, `tool.execution_finished` | Info | the tool and the outcome it produced |
 | `mcp.started`, `mcp.negotiated`, `mcp.stopped` | Info | server instance, protocol revision, capability summary, exit status when observed |
 | `mcp.exchange_started`, `mcp.exchange_finished` | Info | method, remote name for a call, delivery state from `mcp.Error.delivery`, duration |
 | `mcp.stderr` | Warn | tail length, exit status, error kind; the tail itself only under capture |
@@ -941,9 +944,12 @@ level names round trip. Run `mise run test agent` and `mise run test .`.
 `agent/log_bridge.odin` holds the scope a record is emitted against and the log's names
 for the enums other packages define. The request lifecycle is recorded from
 `agent/chat.odin`: `request.prepared`, `request.recorded`, `attempt.started`,
-`attempt.finished`, `request.retry`, `request.finished`. `agent/chat_session.odin` records
-`turn.started`, `turn.finished`, `agent.event_ignored`, and `storage.failed` at the single
-place a durable write failure lands.
+`attempt.finished`, `request.retry`, `request.finished`, and `tool.name_resolved` where
+the name the model sent becomes the name the harness resolves. `agent/chat_session.odin`
+records `turn.started`, `turn.finished`, `agent.event_ignored`, and `storage.failed` at
+the single place a durable write failure lands. `agent/chat_tools.odin` records a tool call
+from `tool.call_received` through `tool.dispatch_committed`, `tool.execution_started`, and
+`tool.execution_finished` to `tool.result_committed`, each under the call's own id.
 
 The writer travels in `Chat_Session.log`, borrowed and set once when the session is built,
 so no call site threads one of its own. No new identity is introduced: `chat.turn_no`,
@@ -951,13 +957,16 @@ so no call site threads one of its own. No new identity is introduced: `chat.tur
 records carry, and the schema stays at version 4.
 
 Tests: a cancelled turn records its own start and end with the session and durable turn; an
-event from a superseded turn is recorded with the reason it was refused; and a turn driven
-with a writer records the same durable entries and call count as the same turn driven
-without one, which is the property that logging observes a turn rather than taking part in
-it. Run `mise run test agent` and `mise run test .`.
+event from a superseded turn is recorded with the reason it was refused; a tool call is
+recorded from the proposal through the dispatch and execution to the committed result, in
+that order and under its own call id; and a turn driven with a writer records the same
+durable entries and call count as the same turn driven without one, which is the property
+that logging observes a turn rather than taking part in it. Root records
+`session.claimed` and `session.recovered` where it claims the session and settles what an
+earlier run left. Run `mise run test agent`, `mise run test .`, and `mise run check`.
 
-Still to record: tool call, dispatch, execution, and result events; compaction requests;
-and the session claim and recovery root performs.
+Still to record: compaction requests, which run outside a turn, and the session release
+that root performs at teardown.
 
 ### Phase 4: provider observation, transport accounting, and capture
 

@@ -82,6 +82,13 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 			for call in value.Tool_Calls {
 				wire_call := call
 				wire_call.Name = chat_tool_canonical_name(&runtime.chat.tools, wire_call.Name)
+				// The name the model sent and the name the harness resolved it to are
+				// two different facts, and a mismatch is what a rejected tool name
+				// looks like from here.
+				resolved := log_scope(runtime.chat)
+				resolved.call_id = call.ID
+				fields := [2]Log_Field{{key = "wire_name", value = call.Name}, {key = "tool", value = wire_call.Name}}
+				log_emit(resolved, Log_Record{level = .Info, category = .Tool, event = "tool.name_resolved", fields = fields[:]})
 				append(&calls, wire_call)
 			}
 			notice := chat_session_feed_tool_calls(runtime.chat, runtime.source, calls[:])

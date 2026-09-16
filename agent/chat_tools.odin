@@ -21,6 +21,13 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 	}
 	count := 0
 	for &staged in chat.pending_calls {
+		// Every record for this call carries its own id, so a call can be followed
+		// from what the model proposed to what was committed for it.
+		call := log_scope(chat)
+		call.call_id = staged.id
+		received := [2]Log_Field{{key = "tool", value = staged.name}, {key = "arguments_bytes", value = i64(len(staged.arguments))}}
+		log_emit(call, Log_Record{level = .Info, category = .Tool, event = "tool.call_received", fields = received[:]})
+
 		ctx := Tool_Context {
 			call_id   = staged.id,
 			workspace = chat.workspace,
@@ -46,10 +53,17 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		// so the store only ever receives a valid bounded envelope.
 		finalized := tool_result_finalize(&ctx, result)
 
-		if !chat_record_tool_result(chat, &staged, &finalized) {
+		result_seq, recorded := chat_record_tool_result(chat, &staged, &finalized)
+		if !recorded {
 			tool_result_destroy(&finalized)
 			return count
 		}
+		committed := [3]Log_Field {
+			{key = "tool", value = staged.name},
+			{key = "outcome", value = session.tool_outcome_name(finalized.outcome)},
+			{key = "result_seq", value = i64(result_seq)},
+		}
+		log_emit(call, Log_Record{level = .Info, category = .Tool, event = "tool.result_committed", fields = committed[:]})
 		_observer_tool_result(observer, staged.name, &finalized)
 		tool_result_destroy(&finalized)
 		count += 1
@@ -70,6 +84,8 @@ chat_prepare_call :: proc(
 	result: Tool_Result,
 	ok: bool,
 ) {
+	call := log_scope(chat)
+	call.call_id = staged.id
 	ctx := Tool_Context {
 		call_id = staged.id,
 		workspace = chat.workspace,
@@ -81,6 +97,13 @@ chat_prepare_call :: proc(
 	}
 	arguments := tool_arguments_prepare(staged.arguments, chat.allocator)
 	defer tool_arguments_destroy(&arguments, chat.allocator)
+	prepared := [4]Log_Field {
+		{key = "tool", value = staged.name},
+		{key = "status", value = tool_arguments_status_name(arguments.status)},
+		{key = "repair", value = session.tool_repair_name(arguments.repair)},
+		{key = "effective_bytes", value = i64(len(arguments.effective))},
+	}
+	log_emit(call, Log_Record{level = .Debug, category = .Tool, event = "tool.arguments_prepared", fields = prepared[:]})
 	if arguments.status == .Rejected {
 		return tool_result_refused(&ctx, &arguments.error), true
 	}
@@ -102,23 +125,32 @@ chat_prepare_call :: proc(
 		related_seq = staged.seq,
 		payload = session.Tool_Dispatch_Entry{tool = staged.name, arguments = arguments.effective, repair = arguments.repair},
 	}
-	if _, dispatch_error := session.entry_append(chat.store, chat.id, dispatch); dispatch_error != nil {
+	if dispatch_seq, dispatch_error := session.entry_append(chat.store, chat.id, dispatch); dispatch_error != nil {
 		chat_session_record_failure(chat, "the tool dispatch could not be recorded", dispatch_error)
 		return {}, false
+	} else {
+		dispatched := [2]Log_Field{{key = "tool", value = staged.name}, {key = "dispatch_seq", value = i64(dispatch_seq)}}
+		log_emit(call, Log_Record{level = .Info, category = .Tool, event = "tool.dispatch_committed", fields = dispatched[:]})
 	}
 	// Cancellation can land after the intent was recorded but before execution
 	// begins. The intent is durable, but the call never started.
 	if tool_control_cancelled(ctx.control) {
 		return tool_result_failure(&ctx, .Not_Executed, "the turn was cancelled before this call ran", "not executed"), true
 	}
-	return definition.execute(&ctx, object), true
+	started := [1]Log_Field{{key = "tool", value = staged.name}}
+	log_emit(call, Log_Record{level = .Info, category = .Tool, event = "tool.execution_started", fields = started[:]})
+	result = definition.execute(&ctx, object)
+	finished := [2]Log_Field{{key = "tool", value = staged.name}, {key = "outcome", value = session.tool_outcome_name(result.outcome)}}
+	log_emit(call, Log_Record{level = .Info, category = .Tool, event = "tool.execution_finished", fields = finished[:]})
+	return result, true
 }
 
-// chat_record_tool_result appends the result entry a model later reads. It
-// reports false when the write failed, which stops the turn: a call that ran and
-// left no result is exactly the unanswered call the record must never have.
+// chat_record_tool_result appends the result entry a model later reads. It reports
+// the entry it stored, and reports no entry when the write failed, which stops the
+// turn: a call that ran and left no result is exactly the unanswered call the
+// record must never have.
 @(private)
-chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, result: ^Tool_Result) -> bool {
+chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, result: ^Tool_Result) -> (seq: session.Seq, recorded: bool) {
 	error_text := ""
 	if result.error.kind != .None { error_text = tool_argument_error_text(result.error, context.temp_allocator) }
 	entry := session.New_Entry {
@@ -128,9 +160,10 @@ chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, re
 		related_seq = staged.seq,
 		payload = session.Tool_Result_Entry{outcome = result.outcome, error = error_text, content = result.content, origin = .Observed},
 	}
-	if _, append_error := session.entry_append(chat.store, chat.id, entry); append_error != nil {
+	stored, append_error := session.entry_append(chat.store, chat.id, entry)
+	if append_error != nil {
 		chat_session_record_failure(chat, "the tool result could not be recorded", append_error)
-		return false
+		return {}, false
 	}
-	return true
+	return stored, true
 }

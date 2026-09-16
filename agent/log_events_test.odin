@@ -115,6 +115,51 @@ test_a_superseded_operation_is_recorded :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_tool_call_is_recorded_from_call_to_result :: proc(t: ^testing.T) {
+	fixture: Log_Chat_Test
+	log_chat_begin(t, &fixture, tool_loop_workspace(t), .Debug)
+	defer log_chat_end(t, &fixture)
+	chat := &fixture.chat.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "run printf ok")
+
+	arguments := `{"command":"printf tool-ok","working_directory":null,"timeout_ms":null}`
+	call_seq := _test_append(
+		t,
+		chat,
+		{turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.Tool_Call_Entry{call_id = "call_1", name = TOOL_SHELL_NAME, arguments = arguments}},
+	)
+	append(
+		&chat.pending_calls,
+		Chat_Tool_Call {
+			id = chat_clone_string("call_1", chat.allocator),
+			name = chat_clone_string(TOOL_SHELL_NAME, chat.allocator),
+			arguments = chat_clone_string(arguments, chat.allocator),
+			seq = call_seq,
+		},
+	)
+	chat.state = .Executing_Tools
+	testing.expect_value(t, chat_run_tools(chat, {}), 1)
+
+	text := log_chat_text(t, &fixture)
+	defer delete(text, context.allocator)
+	// Every stage of the call, in the order it happened.
+	previous := -1
+	for event in ([?]string{"tool.call_received", "tool.arguments_prepared", "tool.dispatch_committed", "tool.execution_started", "tool.execution_finished", "tool.result_committed"}) {
+		at := strings.index(text, event)
+		testing.expectf(t, at >= 0, "the log should record %s", event)
+		testing.expectf(t, at > previous, "%s should follow the stage before it", event)
+		previous = at
+	}
+	// The call is followed by its own id, and the dispatch and the result name the
+	// entries they were stored as.
+	testing.expect(t, strings.contains(text, `"call_id":"call_1"`), "every tool record carries the call")
+	testing.expect(t, strings.contains(text, `"repair":"none"`), "the admission says nothing was repaired")
+	testing.expect(t, strings.contains(text, `"outcome":"success"`), "the execution outcome is named")
+	testing.expect(t, strings.contains(text, `"result_seq":`), "the result names the entry it was stored as")
+}
+
+@(test)
 test_a_writer_does_not_change_a_turn :: proc(t: ^testing.T) {
 	// The same turn twice: once with nowhere to record and once with a writer. A
 	// diagnostic that changed the durable outcome would show up as a difference
