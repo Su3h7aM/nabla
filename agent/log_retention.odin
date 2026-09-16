@@ -26,9 +26,10 @@ LOG_RETENTION_AGE :: 14 * 24 * time.Hour
 LOG_CLOSED_RUN_COUNT :: 128
 LOG_CLOSED_RUN_BYTES :: 256 * 1024 * 1024
 
-// LOG_CLEANUP_SCAN_LIMIT bounds how many run directories one pass inspects, so a
-// logs directory that has grown without bound cannot make a launch walk it all.
-LOG_CLEANUP_SCAN_LIMIT :: 4096
+// LOG_RUNS_SCAN_LIMIT bounds how many run directories one pass inspects, so a logs
+// directory that has grown without bound cannot make a launch, or a reader, walk it
+// all.
+LOG_RUNS_SCAN_LIMIT :: 4096
 
 // log_run_is_active reports whether a run still holds its lease. A run directory
 // whose lease is missing or unlocked belongs to a process that is gone, so nothing
@@ -80,7 +81,7 @@ log_cleanup_within :: proc(
 	if !okay { return }
 	defer delete(runs_directory, allocator)
 
-	entries, read_err := os.read_directory_by_path(runs_directory, LOG_CLEANUP_SCAN_LIMIT, allocator)
+	entries, read_err := os.read_directory_by_path(runs_directory, LOG_RUNS_SCAN_LIMIT, allocator)
 	if read_err != nil { return }
 	defer os.file_info_slice_delete(entries, allocator)
 

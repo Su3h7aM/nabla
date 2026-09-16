@@ -1,8 +1,8 @@
 # Harness logging and diagnostics architecture
 
 Status: phases 1 and 2 are implemented, together with phase 3 apart from compaction
-requests and the session release record, and the provider observation of phase 4; the rest
-is planned.
+requests and the session release record, the provider observation of phase 4, and the
+reader of phase 6; the rest is planned.
 
 This plan is based on the complete *Nabla Logging Reference Study: goose + opencode*,
 including its appendices, at
@@ -136,7 +136,8 @@ Inside the root package:
 | File | Contents |
 |---|---|
 | `app_log.odin` | the level from the environment, `log_open`/`log_close` around the run, `run.started` and `run.finished` |
-| `main.odin` | `diagnostics` subcommand parsing, alongside the existing `chat_cli_parse` |
+| `app_diagnostics.odin` | `nabla diagnostics <session-id>`: the reader's records to stdout, what was read and what could not be to stderr |
+| `main.odin` | the `diagnostics` subcommand, alongside `chat_cli_parse` |
 | `app_command_test.odin` | CLI parsing tests |
 
 Inside the libraries, only where a fact currently cannot leave the layer:
@@ -848,26 +849,47 @@ as proof that a run is alive.
 - A partial record followed by an unrecoverable error leaves the sink disabled rather than
   emitting a second half-line.
 
-## 13. Reading: diagnosis and export
+## 13. Reading a session
 
-Root gains one command, parsed beside the existing `chat_cli_options`:
+One command reads the logs, parsed beside the existing `chat_cli_options`:
 
 ```text
-nabla diagnostics <session-id> [--request <number>]
-nabla diagnostics <session-id> --export <new-directory> [--include-payloads]
+nabla diagnostics <session-id>
 ```
 
-The scanner and the record parser live in `agent/log_read.odin`, beside the writer, so the
-format has one owner. The command lives in root, which already imports both `agent` and
-`agent/session` and can join records with rows. The command works with no session row
-present and reports logs-only evidence.
+`agent/log_read.odin` holds the reader: it walks the run directories oldest first, reads
+whole segments, parses each line far enough to know which session it belongs to, and calls
+a visitor with the record as it was written. It parses the line rather than searching it,
+because a record may carry text a peer sent and that text must not be able to name another
+session. Records are selected by the session field rather than by a file name, so a session
+that spans runs is read across all of them, and a run that holds several sessions
+contributes only the records that belong to the one asked for.
 
-Session rows are read through a dedicated read-only store connection on the inspection
-thread. Export takes a consistent short snapshot using bounded pages, never a copy of a live
-database taken while WAL writes are active, and never a raw database file in the bundle. It
-does not claim the writer claim and does not run recovery.
+The command lives in root, which already resolves the logs directory and imports the
+reader. Records go to stdout exactly as written, so a caller can pipe them into `jq`, and
+the count of what was read goes to stderr together with everything the reader could not
+read: an unlistable run directory, an unreadable segment, or a line that does not parse.
+That distinction is the point. A diagnostic view that silently omits evidence is worse than
+one that names it. The command exits 1 when the session left nothing, and 2 for a bad
+argument.
 
-Bundle layout:
+Run framing (`run.started`, `retention.finished`, `run.finished`) carries no session and is
+not part of a session's stream; the run a record came from is a field of the record, and
+its own directory holds the framing. Including it is a later step, not a silent omission.
+
+Still to build in this phase:
+
+- the join with the session database, so a request's stored outcome and usage appear
+  beside its records, through a read-only connection rather than the store's writable one
+- an export bundle with a manifest, bounded pages, and an opt-in for payloads and session
+  content
+- a `--request <number>` selection, and a level threshold so a reader can skip debug records
+  without `jq`
+
+The reader is batch-only. If follow mode is ever needed, it uses the cursor `(run_id, seq)`
+and rescans new segments, and it never claims atomic live replay across SQLite and JSONL.
+
+The export bundle, when it exists, is laid out as:
 
 ```text
 manifest.json
@@ -889,10 +911,6 @@ remaining budget. Every omission is recorded with its reason, and unrelated rece
 are never added to fill a quota. Inactive run leases are pinned while copying; an active
 writer is append-only, so a segment is read only up to its initial size and its incomplete
 tail is ignored. A rotation race produces an explicit missing-file notice.
-
-The first reader is batch-only. If follow mode is ever needed, it uses the cursor
-`(run_id, seq)` and rescans new segments, and it never claims atomic live replay across
-SQLite and JSONL.
 
 ## 14. Walkthroughs
 
@@ -1021,11 +1039,17 @@ the wire name, and the canonical name appear only in the fields that mean them. 
 
 ### Phase 6: reading and export
 
-`agent/log_read.odin` and the root `diagnostics` command, with the four walkthroughs as
-fixtures. Check a large history with bounded pages, a WAL-consistent snapshot, a deleted
-session, expired logs, an incomplete capture, concurrent rotation, and an unknown envelope
-version. Run `mise run test agent`, `mise run test agent/session` if query APIs changed, and
-`mise run test .`.
+The first slice is implemented: `agent/log_read.odin` walks the runs oldest first and
+visits the records of one session, and `app_diagnostics.odin` prints them as they were
+written while reporting what could not be read. Tests hold the reader to records the writer
+produced: only the session's own records are visited, runs are read oldest first, an
+unparseable line is counted rather than passed off as a record, and only the writer's own
+file names are read.
+
+Still to build: the join with the session database, the export bundle with its manifest,
+`--request`, and a level threshold. Each is described in §13.
+
+Run `mise run test agent`, `mise run test .`, and `mise run check`.
 
 `mise run check` accompanies code changes, and `mise run fmt` formats Odin. The full
 monorepo suite is not the per-change gate; a change that stays inside `agent` is covered by
