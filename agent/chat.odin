@@ -163,6 +163,21 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	}
 
 	chat.last_estimate = prep.estimate
+
+	// What the harness intends to send is recorded before it is stored, so a
+	// request that never reaches the store still says what it was going to carry.
+	prepared := [8]Log_Field {
+		{key = "purpose", value = session.request_purpose_name(.Response)},
+		{key = "provider", value = chat.provider_id},
+		{key = "model", value = chat.model_id},
+		{key = "api", value = chat_api_name(connection.API)},
+		{key = "estimate", value = i64(prep.estimate)},
+		{key = "context_window", value = i64(chat.context_window)},
+		{key = "messages", value = i64(len(prep.history.entries))},
+		{key = "tools", value = i64(len(prep.tools))},
+	}
+	log_emit(log_scope(chat), Log_Record{level = .Info, category = .Provider, event = "request.prepared", fields = prepared[:]})
+
 	at_ms := session.now_ms()
 	request_no, begin_err := session.request_begin(
 		chat.store,
@@ -183,6 +198,9 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		return
 	}
 	chat.active_request = request_no
+
+	recorded := [1]Log_Field{{key = "purpose", value = session.request_purpose_name(.Response)}}
+	log_emit(log_scope(chat), Log_Record{level = .Info, category = .Storage, event = "request.recorded", fields = recorded[:]})
 
 	chat_session_begin_operation(chat)
 	operation := chat_session_operation(chat)
@@ -205,10 +223,33 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	operation_error: ai.Provider_Operation_Error
 	for {
 		attempts += 1
+		attempt := log_scope(chat)
+		attempt.attempt = attempts
+		remaining_ms := i64(0)
+		if remaining, active := ai.deadline_remaining(operation.deadline); active { remaining_ms = log_duration_ms(remaining) }
+		deadline := [1]Log_Field{{key = "deadline_ms", value = remaining_ms}}
+		log_emit(attempt, Log_Record{level = .Info, category = .Provider, event = "attempt.started", fields = deadline[:]})
+
+		at := time.tick_now()
 		operation_error = ai.Provider_Request_Operation_Controlled(connection, prep.request, &runtime, chat_provider_event, options, chat.allocator)
+		finished := [5]Log_Field {
+			{key = "error_kind", value = log_operation_error_name(operation_error.kind)},
+			{key = "finish_reason", value = chat_finish_reason_text(runtime.finish_reason)},
+			{key = "status", value = i64(operation_error.status)},
+			{key = "detail_bytes", value = i64(len(operation_error.detail))},
+			{key = "elapsed_ms", value = log_duration_ms(time.tick_since(at))},
+		}
+		log_emit(attempt, Log_Record{level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})
 		if !chat_request_may_retry(chat, operation_error, attempts) { break }
 		_observer_message(observer, .Notice, chat_retry_notice(attempts, operation_error))
-		if !chat_retry_wait(chat, chat_retry_delay(attempts)) { break }
+		delay := chat_retry_delay(attempts)
+		retry := [3]Log_Field {
+			{key = "error_kind", value = log_operation_error_name(operation_error.kind)},
+			{key = "next_attempt", value = i64(attempts + 1)},
+			{key = "delay_ms", value = log_duration_ms(delay)},
+		}
+		log_emit(attempt, Log_Record{level = .Warn, category = .Provider, event = "request.retry", fields = retry[:]})
+		if !chat_retry_wait(chat, delay) { break }
 		chat_session_clear_attempt(chat)
 		delete(operation_error.detail, chat.allocator)
 		operation_error = {}
@@ -350,7 +391,14 @@ chat_commit_response :: proc(
 	)
 	if finish_err != nil {
 		chat_session_record_failure(chat, "the request outcome could not be recorded", finish_err)
+		return
 	}
+	finished := [3]Log_Field {
+		{key = "outcome", value = session.outcome_name(outcome)},
+		{key = "attempts", value = i64(chat.request_attempts)},
+		{key = "finish_reason", value = chat_finish_reason_text(finish_reason)},
+	}
+	log_emit(log_scope(chat), Log_Record{level = .Info, category = .Provider, event = "request.finished", fields = finished[:]})
 }
 
 // --- settling a turn ---------------------------------------------------------
@@ -401,6 +449,14 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 		chat_session_record_failure(chat, "the turn outcome could not be recorded", turn_err)
 		recorded = false
 	}
+	finished := [5]Log_Field {
+		{key = "outcome", value = session.outcome_name(outcome)},
+		{key = "recorded", value = recorded},
+		{key = "requests", value = i64(chat.requests_made)},
+		{key = "calls", value = i64(chat.calls_made)},
+		{key = "status", value = chat_terminal_text(chat.terminal_status)},
+	}
+	log_emit(log_scope(chat), Log_Record{level = .Info, category = .Agent, event = "turn.finished", fields = finished[:]})
 	chat.turn_no = nil
 	chat.active_request = nil
 	// A turn that ended without running its staged calls, such as one a durable

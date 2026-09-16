@@ -75,6 +75,10 @@ Chat_Accept :: enum {
 Chat_Session :: struct {
 	store:                        ^session.Store,
 	id:                           session.Session_Id, // owned
+	// log is the process's diagnostic stream, borrowed and never owned here. Nil
+	// means diagnostics are off, which every emit point treats as a no-op rather
+	// than a reason to branch.
+	log:                          ^Log,
 	allocator:                    mem.Allocator,
 	state:                        Chat_State,
 	terminal_status:              Chat_Terminal_Status,
@@ -170,8 +174,9 @@ chat_context_window :: proc(model: Catalog_Model) -> (window: int, assumed: bool
 // chat_session_init builds the running state for a claimed session. workspace is
 // the validated process directory; it is copied, because the caller's copy may
 // be temporary. The session id is copied too: the chat owns its identity rather
-// than borrowing it from whichever claim happens to be in the store.
-chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspace: string, allocator := context.allocator) -> Chat_Session {
+// than borrowing it from whichever claim happens to be in the store. log is
+// borrowed and must outlive the chat; nil records nothing.
+chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspace: string, log: ^Log, allocator := context.allocator) -> Chat_Session {
 	// The native definitions are compile-time constants, so a build failure
 	// here is a programming error; the registry tests hold them to validity.
 	// A partial registry is never installed: make destroys it before returning.
@@ -179,6 +184,7 @@ chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspa
 	return Chat_Session {
 		store = store,
 		id = session.Session_Id(strings.clone(string(id), allocator)),
+		log = log,
 		allocator = allocator,
 		next_turn_id = 1,
 		next_operation_id = 1,
@@ -305,6 +311,14 @@ chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: sess
 	} else {
 		chat.last_error = strings.concatenate({what, ": ", detail}, chat.allocator)
 	}
+	// The record names the local step that failed and the store's classification,
+	// not the detail text, which the front-end already shows the user.
+	fields := [3]Log_Field {
+		{key = "operation", value = what},
+		{key = "error_kind", value = log_error_kind_name(session.error_kind(local))},
+		{key = "detail_bytes", value = i64(len(detail))},
+	}
+	log_emit(log_scope(chat), Log_Record{level = .Error, category = .Storage, event = "storage.failed", fields = fields[:]})
 	chat.active_failed = true
 	chat.storage_failed = true
 	chat.state = .Finalizing
@@ -381,6 +395,9 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat.last_error = ""
 	delete(chat.partial_assistant)
 	chat.partial_assistant = make([dynamic]u8, 0, 0, chat.allocator)
+
+	fields := [1]Log_Field{{key = "prompt_bytes", value = i64(len(text))}}
+	log_emit(log_scope(chat), Log_Record{level = .Info, category = .Agent, event = "turn.started", fields = fields[:]})
 	return .Accepted
 }
 
@@ -405,12 +422,31 @@ chat_session_event_source :: proc(chat: ^Chat_Session) -> Chat_Event_Source {
 
 // chat_session_accepts_event is the single gate for turn state changes. An event
 // is accepted only while its own operation is the running one, so an event from a
-// cancelled, retired, or superseded operation cannot mutate a newer turn.
+// cancelled, retired, or superseded operation cannot mutate a newer turn. A
+// refusal is recorded with its reason: dropping the event is correct, and the
+// reason is what makes the drop legible later.
 chat_session_accepts_event :: proc(chat: ^Chat_Session, source: Chat_Event_Source) -> bool {
-	if chat.state != .Requesting && chat.state != .Streaming { return false }
-	if chat.active_turn_id != source.turn_id { return false }
-	if chat.operation.id != source.operation_id { return false }
-	return chat.operation.state == .Running
+	reason := ""
+	switch {
+	case chat.state != .Requesting && chat.state != .Streaming:
+		reason = "not_receiving"
+	case chat.active_turn_id != source.turn_id:
+		reason = "superseded_turn"
+	case chat.operation.id != source.operation_id:
+		reason = "superseded_operation"
+	case chat.operation.state != .Running:
+		reason = "operation_retired"
+	}
+	if reason == "" { return true }
+
+	fields := [4]Log_Field {
+		{key = "reason", value = reason},
+		{key = "supplied_turn", value = i64(source.turn_id)},
+		{key = "supplied_operation", value = source.operation_id},
+		{key = "current_operation", value = chat.operation.id},
+	}
+	log_emit(log_scope(chat), Log_Record{level = .Debug, category = .Agent, event = "agent.event_ignored", fields = fields[:]})
+	return false
 }
 
 // chat_session_begin_operation takes ownership of the next operation for the

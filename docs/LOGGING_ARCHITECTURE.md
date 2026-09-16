@@ -1,7 +1,7 @@
 # Harness logging and diagnostics architecture
 
-Status: phases 1 and 2 (the writer, run lifecycle, and retention) implemented; phases 3
-to 6 are planned.
+Status: phases 1 and 2 are implemented, together with the request half of phase 3; the
+rest is planned.
 
 This plan is based on the complete *Nabla Logging Reference Study: goose + opencode*,
 including its appendices, at
@@ -127,7 +127,7 @@ Inside `agent`, beside the state machine:
 | `agent/log_read.odin` | parsing and scanning a run directory for diagnosis and export |
 | `agent/log_bridge.odin` | adapters from `ai` observations and harness state into records |
 | `agent/chat.odin`, `agent/chat_session.odin`, `agent/compact.odin`, `agent/tool*.odin` | emit calls at the boundaries they already own |
-| `agent/log_test.odin`, `agent/log_retention_test.odin`, `agent/log_read_test.odin` | unit tests |
+| `agent/log_test.odin`, `agent/log_events_test.odin`, `agent/log_retention_test.odin`, `agent/log_read_test.odin` | unit tests |
 
 Inside the root package:
 
@@ -406,19 +406,19 @@ Minimum event contracts:
 |---|---|---|
 | `run.started`, `run.finished` | Info | build id, PID, schema version, effective diagnostic policy; close outcome |
 | `session.claimed`, `session.released`, `session.recovered` | Info | recovery counts from `Recovery`, and the unfinished database state found |
-| `session.open_failed`, `storage.failed` | Error | operation name, error kind, whether the connection is broken |
-| `turn.started`, `turn.finished` | Info | state, request and call counts, duration |
-| `agent.transition`, `agent.event_ignored` | Debug | prior and next state, reason, supplied and current operation identities |
-| `request.prepared`, `request.recorded` | Info | purpose, model, provider, API, token estimate, context window, message and tool counts; emitted only after the store commits |
+| `storage.failed` | Error | the local operation that failed, the store's error kind, and the error detail length |
+| `turn.started`, `turn.finished` | Info | prompt size at the start; outcome, whether the outcome landed, request and call counts at the end |
+| `agent.event_ignored` | Debug | reason, supplied turn and operation, current operation |
+| `request.prepared`, `request.recorded` | Info | purpose, model, provider, API, token estimate, context window, message and tool counts; the record marks the durable row separately from the prepare |
 | `request.admission`, `compaction.started`, `compaction.finished` | Info | estimate, budget, decision, covered sequence, checkpoint commit result |
-| `attempt.started`, `attempt.finished` | Info | attempt, remaining deadline, terminal stage, byte and frame counts, duration |
-| `request.retry` | Warn | reason from `chat_request_may_retry`, next attempt, delay, remaining deadline |
+| `attempt.started`, `attempt.finished` | Info | attempt, remaining deadline; error kind, finish reason, status, error detail length, duration |
+| `request.retry` | Warn | error kind, next attempt, delay |
 | `provider.encoded` | Info | body length and digest, api, model, tool count |
 | `provider.response_head` | Debug | status, declared content length if present |
 | `transport.phase`, `transport.bytes` | Debug | phase, plaintext byte count so far, transport error kind |
 | `provider.decode_failed` | Warn | stage, cumulative plaintext response bytes, error kind; no raw frame |
 | `provider.completion_received`, `provider.completion_delivered` | Debug | finish reason, call count, whether the terminal event was delivered |
-| `request.finished`, `request.commit_failed` | Info, Error | final outcome, usage presence, commit success |
+| `request.finished`, `request.commit_failed` | Info, Error | outcome, attempts, finish reason; the storage failure is `storage.failed` |
 | `tools.refresh_started`, `tools.refresh_finished` | Info | generation, discovered, accepted, disabled and rejected counts |
 | `tool.binding` | Debug | canonical name, wire name, remote name, server instance, schema digest |
 | `tool.call_received`, `tool.name_resolved` | Info | proposed wire name and the selected canonical name, or that none or several matched |
@@ -625,12 +625,13 @@ is not done, because it would change error semantics for a diagnostic.
 
 ## 9. Lifetime, threading, startup and shutdown
 
-Root owns one `Log` in its `App` state, opens it before the session store and before any
-MCP process is launched, and closes it after the worker has stopped. It passes `^Log`
-inward: the public turn entry points in `agent` take it as a parameter, and internal
-procedures carry it in the same context structs that already carry runtime state
-(`Chat_Runtime_Context`). It is not a package-level variable, and it is not smuggled
-through `context.user_ptr`.
+Root owns one `Log` in its run setup, opens it before the session store and before any MCP
+process is launched, and closes it after the worker has stopped. The writer reaches the
+harness through `Chat_Session.log`, a borrowed field set when the session is built: every
+procedure that acts on a session already receives the session, so no call site has to
+thread a writer of its own. It is not a package-level variable, and it is not smuggled
+through `context.user_ptr`. A nil log, or one that was never opened, makes every emit a
+no-op, so the harness runs identically with diagnostics off.
 
 Serialization happens entirely under the writer mutex into writer-owned scratch, then one
 write per record with EINTR and short-write handling. There is no logging thread, no queue,
@@ -937,16 +938,26 @@ level names round trip. Run `mise run test agent` and `mise run test .`.
 
 ### Phase 3: harness correlation and events
 
-`agent/log_bridge.odin` plus emit calls in the modules that own each boundary:
-`chat_session.odin`, `chat.odin`, `compact.odin`, `tool.odin`, `tool_mcp.odin`,
-`tool_process.odin`. Reuse `chat.active_request`, `chat.next_operation_id`, and the existing
-`attempts` counter; add no new identity. Thread `^Log` through the public turn entry points
-and the internal context structs. The schema stays at version 4.
+`agent/log_bridge.odin` holds the scope a record is emitted against and the log's names
+for the enums other packages define. The request lifecycle is recorded from
+`agent/chat.odin`: `request.prepared`, `request.recorded`, `attempt.started`,
+`attempt.finished`, `request.retry`, `request.finished`. `agent/chat_session.odin` records
+`turn.started`, `turn.finished`, `agent.event_ignored`, and `storage.failed` at the single
+place a durable write failure lands.
 
-Tests: one request with two attempts; compaction with no turn; an event from a superseded
-operation ignored; execution finished without a result commit; restart recovery; a session
-switch inside one run; identical durable outcomes and tool invocation counts when logging is
-disabled and when the writer has failed. Run `mise run test agent` and `mise run test .`.
+The writer travels in `Chat_Session.log`, borrowed and set once when the session is built,
+so no call site threads one of its own. No new identity is introduced: `chat.turn_no`,
+`chat.active_request`, `chat.request_attempts`, and `chat.active_operation_id` are what the
+records carry, and the schema stays at version 4.
+
+Tests: a cancelled turn records its own start and end with the session and durable turn; an
+event from a superseded turn is recorded with the reason it was refused; and a turn driven
+with a writer records the same durable entries and call count as the same turn driven
+without one, which is the property that logging observes a turn rather than taking part in
+it. Run `mise run test agent` and `mise run test .`.
+
+Still to record: tool call, dispatch, execution, and result events; compaction requests;
+and the session claim and recovery root performs.
 
 ### Phase 4: provider observation, transport accounting, and capture
 
