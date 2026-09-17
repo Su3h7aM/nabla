@@ -190,6 +190,9 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	}
 
 	chat.last_estimate = prep.estimate
+	// The input size is settled here and the request has not been sent yet, so this is
+	// where a front-end learns what the context now holds.
+	_observer_request_prepared(observer)
 
 	// What the harness intends to send is recorded before it is stored, so a
 	// request that never reaches the store still says what it was going to carry.
@@ -343,6 +346,9 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	chat_session_retire_operation(chat)
 
 	chat_commit_response(chat, request_no, runtime.finish_reason, usages)
+	// The request's outcome is recorded, so the provider's own accounting of it is part of
+	// the session the front-end describes.
+	_observer_request_finished(observer)
 }
 
 // chat_commit_response records what the response produced and how the request

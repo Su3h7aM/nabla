@@ -524,7 +524,23 @@ run_observer :: proc(app: ^App) -> agent.Chat_Observer {
 		tool_result = obs_tool_result,
 		message = obs_message,
 		usage = obs_usage,
+		request_prepared = obs_request_prepared,
+		request_finished = obs_request_finished,
 	}
+}
+
+// obs_request_prepared and obs_request_finished both move what the status describes: the
+// first knows how large the request about to be sent is, and the second has the provider's
+// own report of the one that just finished. Refreshing at both is what keeps the footer
+// live while a turn runs, instead of only once the whole prompt is done. Neither runs
+// inside a store transaction, because a request's record is committed before this is
+// called.
+obs_request_prepared :: proc(user_data: rawptr) {
+	refresh_status(cast(^App)user_data)
+}
+
+obs_request_finished :: proc(user_data: rawptr) {
+	refresh_status(cast(^App)user_data)
 }
 
 obs_assistant_begin :: proc(user_data: rawptr) {

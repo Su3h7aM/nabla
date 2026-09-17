@@ -523,7 +523,10 @@ Verified against the code at the time of writing.
 
 - `http/client`, `sse`, and their conformance work. The provider layer sits above them.
 - The observer seam's size and shape (`agent/observer.odin`). It is deliberately narrow; do not
-  widen it toward FX's dependency interface.
+  widen it toward FX's dependency interface. The two request-lifecycle notifications are the
+  deliberate exception, and they are events rather than a dependency: a front-end that shows the
+  context or the session's token totals has to be told when a request is prepared and when its
+  outcome is recorded, or it can only refresh the footer once the whole prompt is done.
 - `agent` stays presentation-free.
 - Everything currently green stays green.
 

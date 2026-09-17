@@ -798,3 +798,62 @@ test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, instructions, prep.request.Instructions)
 }
+
+// Request_Event_Counter is what a front-end sees of one turn. A status line that shows the
+// context or the session's totals needs both moments, so a turn that makes several requests
+// has to report each of them rather than only the end of the turn.
+@(private)
+Request_Event_Counter :: struct {
+	prepared: int,
+	finished: int,
+}
+
+@(private)
+request_event_observer :: proc(counter: ^Request_Event_Counter) -> Chat_Observer {
+	return {user_data = counter, request_prepared = request_event_prepared, request_finished = request_event_finished}
+}
+
+@(private)
+request_event_prepared :: proc(user_data: rawptr) {
+	counter := cast(^Request_Event_Counter)user_data
+	counter.prepared += 1
+}
+
+@(private)
+request_event_finished :: proc(user_data: rawptr) {
+	counter := cast(^Request_Event_Counter)user_data
+	counter.finished += 1
+}
+
+@(test)
+test_every_request_reports_itself_while_the_turn_runs :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 500_000)
+	_test_accept(t, chat, "first")
+
+	// A URL this client refuses fails the attempt without a retry, so each request reaches
+	// its end without a network wait and without a backoff.
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = "ftp://not-a-provider",
+	}
+	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
+	defer delete(usages)
+
+	counter: Request_Event_Counter
+	observer := request_event_observer(&counter)
+
+	chat_perform_request(chat, connection, observer, &usages)
+	testing.expect_value(t, counter.prepared, 1)
+	testing.expect_value(t, counter.finished, 1)
+
+	// The next request of the same turn reports again. That repetition is the whole point:
+	// the context has grown and the provider's accounting of the first request has landed,
+	// so a front-end refreshing on these has something new to show.
+	chat_perform_request(chat, connection, observer, &usages)
+	testing.expect_value(t, counter.prepared, 2)
+	testing.expect_value(t, counter.finished, 2)
+}

@@ -15,15 +15,26 @@ import "nabla:ai"
 // any number of times with arbitrarily split fragments, always in the order the
 // model produced them.
 Chat_Observer :: struct {
-	user_data:       rawptr,
-	assistant_begin: proc(user_data: rawptr),
-	assistant_text:  proc(user_data: rawptr, text: string),
-	assistant_flush: proc(user_data: rawptr),
-	assistant_end:   proc(user_data: rawptr),
-	user_text:       proc(user_data: rawptr, text: string),
-	tool_result:     proc(user_data: rawptr, name: string, result: ^Tool_Result),
-	message:         proc(user_data: rawptr, kind: Chat_Message_Kind, text: string),
-	usage:           proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event),
+	user_data:        rawptr,
+	assistant_begin:  proc(user_data: rawptr),
+	assistant_text:   proc(user_data: rawptr, text: string),
+	assistant_flush:  proc(user_data: rawptr),
+	assistant_end:    proc(user_data: rawptr),
+	user_text:        proc(user_data: rawptr, text: string),
+	tool_result:      proc(user_data: rawptr, name: string, result: ^Tool_Result),
+	message:          proc(user_data: rawptr, kind: Chat_Message_Kind, text: string),
+	usage:            proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event),
+	// request_prepared is called once for each provider request the turn is about to
+	// send, after the request is built and its input size is known. It is a different
+	// moment from request_finished because the context has already grown by then: a
+	// front-end that shows the context can report the new size while the model is still
+	// answering, rather than a round trip later.
+	request_prepared: proc(user_data: rawptr),
+	// request_finished is called once for each provider request the turn made, after its
+	// outcome is recorded. The provider's own accounting of it is in the store by then, so
+	// a front-end that shows the session totals can refresh here instead of waiting for
+	// the turn to end.
+	request_finished: proc(user_data: rawptr),
 }
 
 // Chat_Message_Kind classifies a diagnostic line. The agent decides how serious
@@ -72,4 +83,14 @@ _observer_message :: proc(observer: Chat_Observer, kind: Chat_Message_Kind, text
 @(private)
 _observer_usage :: proc(observer: Chat_Observer, operation: u64, usage: ai.Provider_Usage_Event) {
 	if observer.usage != nil { observer.usage(observer.user_data, operation, usage) }
+}
+
+@(private)
+_observer_request_prepared :: proc(observer: Chat_Observer) {
+	if observer.request_prepared != nil { observer.request_prepared(observer.user_data) }
+}
+
+@(private)
+_observer_request_finished :: proc(observer: Chat_Observer) {
+	if observer.request_finished != nil { observer.request_finished(observer.user_data) }
 }
