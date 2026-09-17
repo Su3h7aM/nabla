@@ -236,28 +236,40 @@ Provider_Request_Operation_Controlled :: proc(
 	options: Provider_Operation_Options,
 	allocator := context.allocator,
 ) -> Provider_Operation_Error {
+	encoded, freeze_err := Provider_Request_Freeze(request, allocator)
+	if freeze_err.kind != .None { return freeze_err }
+	// The body belongs to this call, and is released once the operation that borrows
+	// it has returned.
+	defer delete(encoded.Body, allocator)
+	return Provider_Request_Operation_Encoded(connection, encoded, user_data, callback, options, allocator)
+}
+
+// Provider_Request_Freeze validates a request and encodes it once, so a caller that
+// has to send the same bytes more than once encodes them here and holds them: a
+// retry then sends exactly what the first attempt would have sent, rather than a
+// fresh encoding that has to be assumed equal.
+//
+// The returned Body is owned by allocator and released with delete(encoded.Body,
+// allocator). A request that cannot be encoded yields an Invalid_Request operation
+// error, the same failure the one-shot path reports for it.
+Provider_Request_Freeze :: proc(request: Provider_Request, allocator := context.allocator) -> (Provider_Encoded_Request, Provider_Operation_Error) {
 	if err := Provider_Validate_Request(request); err != .None {
-		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(err), allocator)}
-	}
-	if connection.API != request.API {
-		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("connection/request API mismatch", allocator)}
+		return {}, Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(err), allocator)}
 	}
 	body, encode_err := Provider_Encode_Request(request, allocator)
 	if encode_err != .None {
-		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(encode_err), allocator)}
+		return {}, Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(encode_err), allocator)}
 	}
-	defer delete(body, allocator)
-	encoded := Provider_Encoded_Request {
-		API                = request.API,
-		Body               = transmute([]u8)body,
-		Model              = request.Model,
-		Tools              = len(request.Tools),
+	return Provider_Encoded_Request {
+		API = request.API,
+		Body = transmute([]u8)body,
+		Model = request.Model,
+		Tools = len(request.Tools),
 		Session_Id_Present = request.Session_Id_Present,
-		Session_Id         = request.Session_Id,
+		Session_Id = request.Session_Id,
 		User_Agent_Present = request.User_Agent_Present,
-		User_Agent         = request.User_Agent,
-	}
-	return Provider_Request_Operation_Encoded(connection, encoded, user_data, callback, options, allocator)
+		User_Agent = request.User_Agent,
+	}, {}
 }
 
 // Provider_Request_Operation_Encoded performs one request from a body that was
