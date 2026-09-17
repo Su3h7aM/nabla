@@ -841,9 +841,10 @@ Provider_Operation_Observer :: struct {
 
 `Provider_Operation_Options` gains `observer: Provider_Operation_Observer`.
 
-`Provider_Request_Operation_Controlled` reports `Encoded` immediately after
-`Provider_Encode_Request` succeeds and before `http_post_sse`, over the exact owned buffer
-that is about to be sent. `Response_Body` is reported from the chunk callback the
+`Provider_Request_Operation_Controlled` encodes and then delegates to
+`Provider_Request_Operation_Encoded`, which reports `Encoded` before `http_post_sse` over
+the exact owned buffer that is about to be sent. A caller that froze the bytes earlier,
+such as a background compaction, runs the same path, so the report is made in one place. `Response_Body` is reported from the chunk callback the
 operation already passes to `http_post_sse`, which is the one place the plaintext response
 bytes pass through. `Transfer` is reported once by `ai/http.odin` after mapping the HTTP
 summary into `Provider_Transfer_Summary`. The operation's error still returns through the
