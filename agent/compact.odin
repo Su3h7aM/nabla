@@ -269,17 +269,15 @@ Compact_Request_Result :: enum {
 	Unavailable,
 }
 
-// chat_compact_allocator is the allocator compaction's memory comes from: the
-// caller's allocator behind a mutex, because the worker and the owner are
-// different threads and the harness allocator is not safe to share.
+// chat_compact_job_allocator gives a job one lock over the session's allocator,
+// so both threads may allocate and free the job's memory.
 @(private)
-chat_compact_job_allocator :: proc(job: ^Compact_Job, backing: mem.Allocator) -> mem.Allocator {
+chat_compact_job_allocator :: proc(job: ^Compact_Job, backing: mem.Allocator) {
 	job.backing = backing
 	job.locked = {
 		backing = backing,
 	}
 	job.allocator = mem.mutex_allocator(&job.locked)
-	return job.allocator
 }
 
 @(private)
@@ -474,7 +472,7 @@ chat_compact_start :: proc(
 		request_no = request_no,
 		deadline   = ai.deadline_in(CHAT_OPERATION_DEADLINE),
 	}
-	_ = chat_compact_job_allocator(job, chat.allocator)
+	chat_compact_job_allocator(job, chat.allocator)
 	job.output = make([dynamic]u8, 0, job.allocator)
 
 	snapshot, encode_err := chat_compact_snapshot_make(&compact_prep, connection, prep.history.summary_seq, covered, chat.turn_no, job.allocator)
@@ -669,11 +667,14 @@ chat_compact_install_due :: proc(chat: ^Chat_Session, estimate: int) -> bool {
 	return estimate >= install_at || estimate + CHAT_COMPACT_GROWTH_RESERVE_TOKENS >= chat_usable_input(chat)
 }
 
-// chat_compact_start_due reports whether pressure alone calls for a new job.
+// chat_compact_start_due reports whether pressure alone calls for a new job. An
+// unusable window never calls for one: admission already refuses every request, so
+// there is nothing to make room for.
 @(private)
 chat_compact_start_due :: proc(chat: ^Chat_Session, estimate: int) -> bool {
-	start_at, _ := chat_compact_thresholds(chat)
-	return estimate >= start_at
+	usable := chat_usable_input(chat)
+	if usable <= 0 { return false }
+	return estimate >= usable * CHAT_COMPACT_START_PERCENT / 100
 }
 
 // chat_compact_service adopts a finished job and installs a candidate that is due.
@@ -698,7 +699,11 @@ chat_compact_consider :: proc(chat: ^Chat_Session, observer: Chat_Observer, conn
 		trigger = .Pressure
 	}
 	if !chat_compact_retry_allowed(control, trigger) { return }
-	_ = chat_compact_start(chat, observer, connection, prep, trigger, control.pending_source_seq)
+	if !chat_compact_start(chat, observer, connection, prep, trigger, control.pending_source_seq) {
+		// A refusal is a failure like any other, so the next automatic attempt waits
+		// instead of repeating the same work at every boundary.
+		control.last_failure_at_ms = session.now_ms()
+	}
 }
 
 // chat_compact_relieve is the last thing tried before a request is refused. It

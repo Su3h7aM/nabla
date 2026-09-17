@@ -411,3 +411,47 @@ test_the_compact_command_starts_a_job_while_idle :: proc(t: ^testing.T) {
 		testing.fail_now(t, "the summarizer was never asked")
 	}
 }
+
+// Pressure alone starts the work, before any request has been refused and before
+// the window is full.
+@(test)
+test_pressure_starts_a_compaction_before_the_window_is_full :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.context_window = 500_000
+	_test_accept(t, chat, "first")
+	// Enough context that the next request crosses the start threshold but not the
+	// installation threshold, which is the band pressure exists for.
+	large := strings.repeat("work ", 320_000) or_else ""
+	defer delete(large)
+	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.User_Entry{text = large, origin = .Prompt}})
+	// More entries than the kept tail, so there is a prefix to summarize.
+	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
+		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_100, payload = session.Assistant_Entry{text = text}})
+	}
+
+	dead := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = "http://127.0.0.1:9/",
+	}
+	prep, prep_err := chat_prepare(chat, dead)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+
+	start_at, install_at := chat_compact_thresholds(chat)
+	testing.expect(t, prep.estimate >= start_at, "the fixture must cross the start threshold")
+	testing.expect(t, prep.estimate < install_at, "the fixture must stay below the install threshold")
+
+	chat_compact_consider(chat, {}, dead, &prep)
+	testing.expect_value(t, chat.compact.state, Compact_State.Running)
+	testing.expect_value(t, chat.compact.trigger, Compact_Trigger.Pressure)
+
+	// A request that fits is never held up by the job, and the dead endpoint closes
+	// it without a checkpoint.
+	if !compact_await_state(t, chat, .Idle) { return }
+	_, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
+	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
+	testing.expect(t, !has_checkpoint)
+}
