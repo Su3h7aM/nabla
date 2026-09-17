@@ -40,11 +40,6 @@ chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
 	case .Executing_Tools:
 		return Chat_Effect{kind = .Run_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}
 	case .Preparing:
-		// The turn bound is observed here, at an operation boundary, because a running
-		// request cannot be preempted by a single-threaded control loop.
-		if ai.deadline_expired(chat.turn_deadline) {
-			return chat_session_fail_turn(chat, "turn deadline exceeded")
-		}
 		chat.requests_made += 1
 		chat.state = .Requesting
 		return Chat_Effect{kind = .Start_Request, turn_id = chat.active_turn_id, allocator = chat.allocator}

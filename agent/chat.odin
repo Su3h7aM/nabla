@@ -235,33 +235,30 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 
 	chat_session_begin_operation(chat)
 	binding.correlation = log_correlation(chat)
-	operation := chat_session_operation(chat)
 	runtime := Chat_Runtime_Context {
 		chat      = chat,
 		source    = chat_session_event_source(chat),
 		observer  = observer,
 		usage_log = usages,
 	}
+	// The request carries interruption only. No deadline is set: the request
+	// stays open as long as the provider keeps it open, and ends when the
+	// provider, the transport, or cancellation ends it.
 	options := ai.Provider_Operation_Options {
 		interrupt = &chat_cancel,
-		deadline  = operation.deadline,
 	}
 	// The observation lives in this frame for every attempt, because the operation
 	// borrows it until it returns.
 	// One request may be attempted more than once. A retry happens only while
 	// nothing has been exposed to the model, so the conversation the next request
 	// is built from is the same one, and the model never learns that an attempt
-	// failed. The operation and its deadline span every attempt, so the turn bound
-	// caps the total.
+	// failed.
 	attempts := 0
 	operation_error: ai.Provider_Operation_Error
 	for {
 		attempts += 1
 		binding.correlation = log_correlation_for(chat, attempts)
-		remaining_ms := i64(0)
-		if remaining, active := ai.deadline_remaining(operation.deadline); active { remaining_ms = log_duration_ms(remaining) }
-		deadline := [1]Log_Field{{key = "deadline_ms", value = remaining_ms}}
-		log_emit({level = .Info, category = .Provider, event = "attempt.started", fields = deadline[:]})
+		log_emit({level = .Info, category = .Provider, event = "attempt.started"})
 
 		// The observation belongs to this attempt: a retry that receives no chunk
 		// must not inherit the previous attempt's byte count. It is only attached
@@ -648,14 +645,13 @@ chat_retry_delay :: proc(attempt: int) -> time.Duration {delay := CHAT_RETRY_BAS
 }
 
 // chat_retry_wait sleeps out one backoff delay. It waits in slices and checks
-// cancellation and the operation deadline between them, so a retry never delays
-// a turn that is being stopped.
+// cancellation between them, so a retry never delays a turn that is being
+// stopped.
 @(private)
 chat_retry_wait :: proc(chat: ^Chat_Session, delay: time.Duration) -> bool {
 	remaining := delay
 	for remaining > 0 {
 		if chat_session_cancelled(chat) { return false }
-		if ai.deadline_expired(chat.operation.deadline) { return false }
 		slice := CHAT_RETRY_SLICE
 		if remaining < slice { slice = remaining }
 		time.sleep(slice)

@@ -138,7 +138,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 	}
 	// The requested timeout is clamped to the definition maximum, so no call
 	// outlives the tool's own policy. The turn control stays separate from the
-	// tool budget: cancellation and the turn deadline report Cancelled, while
+	// tool budget: cancellation reports Cancelled, while
 	// only the budget expiring reports Timed_Out.
 	start := time.tick_now()
 	budget := tool_timeout_clamp(time.Duration(args.timeout_ms) * time.Millisecond, TOOL_SHELL_DEFINITION.timeouts.maximum)

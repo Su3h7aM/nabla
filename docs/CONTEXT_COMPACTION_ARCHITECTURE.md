@@ -96,7 +96,7 @@ summary never has to restate the request being answered.
 | Type | What it holds |
 |---|---|
 | `Compact_Snapshot` | The frozen request: API, owned endpoint, credential, encoded body, model, tool count, session id, user agent, `base_seq`, `covered_seq`, `turn_no`, the request estimate, and the estimate of the prefix the summary will replace |
-| `Compact_Job` | A snapshot, a private interrupt and deadline, the thread handle, a mutex allocator over the session's allocator, the output buffer, the finish reason, tool-call count, failure flag, error text, provider usage, and the start tick |
+| `Compact_Job` | A snapshot, a private interrupt, the thread handle, a mutex allocator over the session's allocator, the output buffer, the finish reason, tool-call count, failure flag, error text, provider usage, and the start tick |
 | `Compact_Control` | Owner-side state in `Chat_Session`: `state`, `trigger`, the job pointer, the pending trigger and its source sequence, and the last failure time |
 | `Compact_Trigger` | `None`, `Pressure`, `Agent_Tool`, `User_Command` |
 | `Compact_State` | `Idle`, `Running`, `Ready`, `Retiring` |
@@ -123,7 +123,7 @@ Procedures, all in `agent/compact.odin`:
 ## 4. The worker
 
 `chat_compact_worker` calls `ai.Provider_Request_Operation_Encoded` with the frozen bytes, the
-job's interrupt and deadline, and a callback that appends text into `job.output`. It touches no
+job's interrupt, and a callback that appends text into `job.output`. It touches no
 session state, runs no tool, writes no database row, and logs nothing: the owner reads the result
 when it joins and is the only thing that records the compaction's lifecycle.
 

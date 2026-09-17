@@ -82,9 +82,9 @@ Tool_Behavior_Hints :: struct {
 }
 
 // Tool_Timeout_Policy bounds how long one execution of a tool may run. A zero
-// duration means no tool-specific deadline, not a forgotten configuration: the
-// turn deadline still applies. Durations are time.Duration internally;
-// milliseconds live only at the JSON argument boundary.
+// duration means no tool-specific bound, not a forgotten configuration: nothing
+// else bounds it, because the turn sets no time bound of its own. Durations are
+// time.Duration internally; milliseconds live only at the JSON argument boundary.
 Tool_Timeout_Policy :: struct {
 	default: time.Duration,
 	maximum: time.Duration,
@@ -465,7 +465,7 @@ tool_result_valid :: proc(outcome: session.Tool_Outcome, content: string) -> boo
 // timeout from now: the parent control with its deadline replaced by the
 // earlier of the parent deadline and now plus the timeout. A non-positive
 // timeout leaves the parent control unchanged. An expired parent deadline is
-// never revived by a longer timeout: the turn is over.
+// never revived by a longer timeout.
 tool_control_with_timeout :: proc(parent: Tool_Control, timeout: time.Duration) -> Tool_Control {
 	if timeout <= 0 { return parent }
 	return tool_control_earlier(parent, ai.deadline_in(timeout))
@@ -501,16 +501,17 @@ tool_timeout_clamp :: proc(requested, maximum: time.Duration) -> time.Duration {
 	return requested
 }
 
-// tool_control_cancelled reports whether the turn owning this control ended:
-// interruption was requested or the turn deadline passed. A tool's own timeout
-// is not cancellation; it has its own outcome and its own check.
+// tool_control_cancelled reports whether the execution owning this control
+// ended: interruption was requested or the control's deadline passed. The
+// deadline comes only from tool bounds; the turn itself sets none. A tool's own
+// timeout budget is not cancellation; it has its own outcome and its own check.
 tool_control_cancelled :: proc(control: Tool_Control) -> bool {
 	return ai.interrupt_requested(control.interrupt) || ai.deadline_expired(control.deadline)
 }
 
 // tool_control_stop reports why an execution loop must stop. Cancellation wins
 // over the tool timeout when both are observed: a cancelled turn is never
-// reported as a timeout. control is the turn control and budget is the tool's
+// reported as a timeout. control is the caller's control and budget is the tool's
 // own bound; the two stay separate so the outcome can name which one fired.
 tool_control_stop :: proc(control: Tool_Control, start: time.Tick, budget: time.Duration) -> Tool_Stop {
 	if tool_control_cancelled(control) { return .Cancelled }
@@ -528,8 +529,7 @@ AGENT_SYSTEM_PROMPT :: "You are svan, a coding agent working from a session work
 // The native tools, in the order they are registered. tool_registry_sort fixes
 // the advertised order after this list is read. Only shell states a timeout
 // policy; the file and skill tools carry a zero policy, which means no
-// tool-specific deadline rather than a forgotten configuration. The turn
-// deadline still governs them through the cooperative checks in each tool.
+// tool-specific bound rather than a forgotten configuration.
 @(private)
 TOOL_NATIVE := [?]Tool_Definition {
 	TOOL_EDIT_DEFINITION,

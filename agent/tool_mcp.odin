@@ -110,10 +110,9 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (result:
 	return tool_mcp_call_result(ctx, call)
 }
 
-// tool_mcp_options derives the call's bounds from the turn control and the
-// definition's own timeout policy, and attaches the wire log. The turn deadline
-// has already reached ctx.control, so the effective bound is the earliest
-// applicable one.
+// tool_mcp_options derives the call's bounds from the tool control and the
+// definition's own timeout policy, and attaches the wire log. The effective
+// bound is the earliest applicable one.
 @(private)
 tool_mcp_options :: proc(ctx: ^Tool_Context, wire: ^MCP_Log) -> mcp.Operation_Options {
 	options := mcp.Operation_Options {

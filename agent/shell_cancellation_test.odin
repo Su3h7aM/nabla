@@ -137,30 +137,6 @@ test_shell_timeout_applies_after_pipes_close :: proc(t: ^testing.T) {
 	testing.expectf(t, elapsed < 2 * time.Second, "100ms budget took %v; retirement ignored the deadline", elapsed)
 }
 
-// An expired turn deadline ends the call without waiting out the tool's own
-// timeout: the turn bound wins over a longer tool budget.
-@(test)
-test_shell_turn_deadline_wins_over_tool_timeout :: proc(t: ^testing.T) {
-	allocator := context.temp_allocator
-	workspace := shell_test_workspace(allocator)
-	arguments := tool_arguments_prepare(`{"command":"sleep 30","working_directory":null,"timeout_ms":10000}`)
-	defer tool_arguments_destroy(&arguments)
-	object, is_object := arguments.value.(json.Object)
-	if !testing.expect(t, is_object, "the arguments should parse") { return }
-	ctx := Tool_Context {
-		call_id = "call_deadline",
-		workspace = workspace,
-		control = {deadline = ai.deadline_in(-time.Second)},
-		allocator = allocator,
-	}
-	started := time.tick_now()
-	result := tool_shell_execute(&ctx, object)
-	defer tool_result_destroy(&result)
-	elapsed := time.tick_since(started)
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Cancelled)
-	testing.expectf(t, elapsed < 5 * time.Second, "an expired turn deadline took %v instead of ending the call", elapsed)
-}
-
 @(test)
 test_shell_cancel_terminates_descendants :: proc(t: ^testing.T) {allocator := context.temp_allocator
 	workspace := shell_test_workspace(allocator)

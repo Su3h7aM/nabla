@@ -229,13 +229,12 @@ Compact_State :: enum {
 
 // Compact_Job is one summarization in flight. The worker owns everything it
 // touches until it stops: the snapshot it reads, the output it accumulates, and
-// the interrupt and deadline that bound it. The owner touches none of it between
+// the interrupt that bounds it. The owner touches none of it between
 // start and join.
 Compact_Job :: struct {
 	snapshot:   Compact_Snapshot,
 	request_no: session.Request_No,
 	interrupt:  ai.Interrupt,
-	deadline:   ai.Deadline,
 	thread:     ^thread.Thread,
 	// The job's memory is shared between two threads, so it goes through an
 	// allocator that serializes access. backing is what the job itself was
@@ -332,7 +331,6 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 	}
 	options := ai.Provider_Operation_Options {
 		interrupt = &job.interrupt,
-		deadline  = job.deadline,
 	}
 	job.operation = ai.Provider_Request_Operation_Encoded(connection, request, job, chat_compact_event, options, job.allocator)
 	if job.operation.detail != "" && job.error_text == "" {
@@ -473,7 +471,6 @@ chat_compact_start :: proc(
 	}
 	job^ = Compact_Job {
 		request_no = request_no,
-		deadline   = ai.deadline_in(CHAT_OPERATION_DEADLINE),
 	}
 	chat_compact_job_allocator(job, chat.allocator)
 	job.output = make([dynamic]u8, 0, job.allocator)

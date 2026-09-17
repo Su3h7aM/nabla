@@ -6,7 +6,6 @@ import "core:unicode/utf8"
 
 import "nabla:agent/session"
 import "nabla:agent/skills"
-import "nabla:ai"
 
 // Chat_Tool_Call is a validated tool call awaiting execution. seq is the stored
 // tool-call entry it belongs to, so the dispatch and the result can name it.
@@ -89,7 +88,6 @@ Chat_Session :: struct {
 	active_operation_id:          u64,
 	next_operation_id:            u64,
 	operation:                    Chat_Operation,
-	turn_deadline:                ai.Deadline,
 
 	// storage_failed latches a durable write that did not land. A session that
 	// could not record its own history accepts no further work: continuing would
@@ -387,7 +385,6 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat.requests_made = 0
 	chat.calls_made = 0
 	chat.request_attempts = 0
-	chat.turn_deadline = ai.deadline_in(CHAT_TURN_DEADLINE)
 	// A turn begins uncancelled, so a signal that arrived after the previous turn
 	// finished can never be inherited by this one.
 	chat_cancel_reset()
@@ -419,8 +416,6 @@ chat_session_last_error :: proc(chat: ^Chat_Session) -> string { return chat.las
 chat_session_storage_failed :: proc(chat: ^Chat_Session) -> bool { return chat.storage_failed }
 
 // --- operation ownership -----------------------------------------------------
-
-chat_session_operation :: proc(chat: ^Chat_Session) -> ^Chat_Operation { return &chat.operation }
 
 // chat_session_event_source is the identity the running operation's events must
 // carry. It stays stable for the life of the operation, including while stopping.
@@ -462,17 +457,12 @@ chat_session_accepts_event :: proc(chat: ^Chat_Session, source: Chat_Event_Sourc
 }
 
 // chat_session_begin_operation takes ownership of the next operation for the
-// active turn. Its deadline is the per-operation bound, clamped so an operation
-// can never outlive what remains of the turn bound; that clamp is how the turn
-// bound reaches the transport and preempts a running request.
+// active turn. The operation carries identity only: the request it names runs
+// until the provider, the transport, or cancellation ends it.
 chat_session_begin_operation :: proc(chat: ^Chat_Session) {
-	deadline := ai.deadline_in(CHAT_OPERATION_DEADLINE)
-	if remaining, active := ai.deadline_remaining(chat.turn_deadline); active && remaining < CHAT_OPERATION_DEADLINE {
-		deadline = chat.turn_deadline
-	}
 	chat.active_operation_id = chat.next_operation_id
 	chat.next_operation_id += 1
-	chat_operation_start(&chat.operation, chat.active_operation_id, chat.active_turn_id, deadline)
+	chat_operation_start(&chat.operation, chat.active_operation_id, chat.active_turn_id)
 }
 
 // chat_session_cancellable reports whether the turn still has work a cancellation

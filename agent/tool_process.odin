@@ -146,7 +146,7 @@ tool_drain_pipes :: proc(
 	stdout_done, stderr_done := false, false
 	for !stdout_done || !stderr_done {
 		// One check covers both stops, and cancellation wins: a cancelled turn
-		// is never reported as a timeout. The turn deadline cannot preempt a
+		// is never reported as a timeout. Cancellation cannot preempt a
 		// running tool any other way.
 		if stop := tool_control_stop(control, start, budget); stop != .None {
 			tool_terminate_group(child)

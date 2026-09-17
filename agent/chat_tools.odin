@@ -22,7 +22,6 @@ import "nabla:agent/session"
 chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 	control := Tool_Control {
 		interrupt = &chat_cancel,
-		deadline  = chat.turn_deadline,
 	}
 	// The reader is in this frame for the whole batch, because every execution borrows
 	// it and it must outlive the longest one.
@@ -116,7 +115,7 @@ chat_prepare_call :: proc(
 	ctx := Tool_Context {
 		call_id = staged.id,
 		workspace = chat.workspace,
-		control = {interrupt = &chat_cancel, deadline = chat.turn_deadline},
+		control = {interrupt = &chat_cancel},
 		timeouts = definition.timeouts,
 		allocator = chat.allocator,
 		skills = chat_skill_catalog(chat),

@@ -594,7 +594,7 @@ test_timeout_helpers_compose_deadlines :: proc(t: ^testing.T) {
 		deadline = ai.deadline_in(-time.Second),
 	}
 	revived := tool_control_with_maximum(expired, time.Hour)
-	testing.expect(t, ai.deadline_expired(revived.deadline), "a longer bound never revives an expired turn")
+	testing.expect(t, ai.deadline_expired(revived.deadline), "a longer bound never revives an expired parent")
 }
 
 // Cancellation wins over the tool timeout when both are observed, and the two

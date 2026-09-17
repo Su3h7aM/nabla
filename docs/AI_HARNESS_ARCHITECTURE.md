@@ -291,12 +291,12 @@ Rules:
   testable without transport.
 - Terminal status is exactly `Completed | Failed | Cancelled`. A turn reaches a terminal state
   once, and reports it once.
-- Every in-flight request is an **operation** with its own id and deadline. Events carry their
+- Every in-flight request is an **operation** with its own id. Events carry their
   source `(turn_id, operation_id)` and are rejected unless they match the running operation, so a
   superseded or cancelled operation can never mutate a newer turn.
-- The turn deadline and the operation deadline are separate facts. The operation deadline is
-  clamped to what remains of the turn deadline so the turn bound preempts a running request
-  (`agent/operation.odin`).
+- A model request carries no harness time bound. It stays open as long as the provider keeps it
+  open, and ends when the provider, the transport, or cancellation ends it
+  (`agent/operation.odin`). Only the provider enforces how long deliberation may take.
 - Use Goose's step/effect separation where it simplifies this. **Do not reproduce Goose's
   operation catalogue for architectural similarity** — add a step only when a requirement needs
   one.
@@ -432,8 +432,9 @@ A subagent is a **tool** the orchestrating agent invokes. It is not a configured
 - Cancellation wins over whatever error the transport also reported.
 - A cancelled turn still resolves its committed tool calls with synthetic "not executed" results,
   so history stays valid.
-- Deadlines and cancellation are separate mechanisms: deadline = elapsed-time bound, cancellation =
-  external intent. Both are carried into the transport.
+- Cancellation is the only harness-side stop for a model request: it is external
+  intent carried into the transport. The harness sets no elapsed-time bound on requests; tool
+  executions carry their own definition bounds instead.
 - Signals are recorded by the handler and interpreted by the loop; a handler never mutates turn
   state.
 - A turn begins uncancelled, so a signal that arrived after the previous turn finished is never

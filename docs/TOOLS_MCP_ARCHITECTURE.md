@@ -60,8 +60,7 @@ responsible for model-facing guidance and no generated prose is appended to
 them.
 
 `Tool_Timeout_Policy` states a default and a maximum as durations. Zero means
-no tool-specific deadline, not a forgotten configuration; the turn deadline
-still applies. Milliseconds live only at the JSON argument boundary.
+no tool-specific bound, not a forgotten configuration. Milliseconds live only at the JSON argument boundary.
 
 The backend binding is a borrowed pointer, nil for native tools. The registry
 copies it but never frees it: the adapter that registered the definition owns
@@ -200,8 +199,7 @@ exists.
 `shell` is not a terminal, a background-job service, or a sandbox. Its
 timeout policy lives in its definition: 30 seconds by default, 120 seconds
 maximum. A model-requested timeout above the maximum is refused, never
-silently clamped, and the turn deadline wins over a longer tool budget.
-Cancellation wins over the timeout when both are observed.
+silently clamped. Cancellation wins over the timeout when both are observed.
 
 - `/bin/sh -c` in a fresh process group, stdin closed.
 - The launch environment is captured once, with configured secrets removed, and
@@ -401,11 +399,11 @@ seconds, and the configurable call ceiling defaults to 120 seconds. These values
 need no configuration for normal local servers. The millisecond fields remain
 available for slow startup or long-running tools.
 
-A call can carry several bounds: the remaining turn deadline, the definition
+A call can carry several bounds: the definition
 maximum, the definition default, and a model-requested timeout where the tool
 exposes one. The effective bound is the earliest applicable deadline. The
-file and skill tools state no tool-specific deadline and check the turn
-control cooperatively instead: before expensive reads, before the temporary
+file and skill tools state no tool-specific bound and check cancellation
+cooperatively instead: before expensive reads, before the temporary
 write, while it grows, and before the atomic rename. A cancellation before
 the rename deletes the temporary file and reports Cancelled; once the rename
 succeeds the observed result stands. A hard deadline for synchronous

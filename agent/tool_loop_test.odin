@@ -689,21 +689,6 @@ test_result_contract_violation_is_replaced_in_dispatch :: proc(t: ^testing.T) {
 	tool_test_envelope_matches(t, result.content, .Success, TOOL_RESULT_REPLACED_MALFORMED)
 }
 
-// Cancellation that lands after the dispatch was recorded but before execution
-// begins means the call never started: the intent is durable, the effect is
-// Not_Executed. An expired turn deadline reaches this window even though the
-// pre-dispatch check only observes interruption.
-@(test)
-test_cancel_after_dispatch_is_not_executed :: proc(t: ^testing.T) {
-	test: Tool_Test
-	tool_test_begin(t, &test)
-	defer tool_test_end(t, &test)
-
-	test.fixture.chat.turn_deadline = ai.deadline_in(-time.Second)
-	result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"echo hi"}`)
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Not_Executed)
-}
-
 // --- execution context policy -------------------------------------------------
 
 // The probe records the policy and binding dispatch handed to one execution.
@@ -768,9 +753,9 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 }
 
 // Every dispatch path stores a valid envelope: the unknown tool, the refused
-// arguments, the cancellation before dispatch, and the cancellation after the
-// dispatch was recorded. Finalization sits once before storage rather than in
-// the execute path, so results that never reach a definition cross it too.
+// arguments, and the cancellation before dispatch. Finalization sits once before
+// storage rather than in the execute path, so results that never reach a
+// definition cross it too.
 @(test)
 test_every_dispatch_path_stores_a_valid_envelope :: proc(t: ^testing.T) {
 	{
@@ -801,15 +786,5 @@ test_every_dispatch_path_stores_a_valid_envelope :: proc(t: ^testing.T) {
 		result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"echo hi"}`)
 		testing.expect_value(t, result.outcome, session.Tool_Outcome.Not_Executed)
 		testing.expect(t, tool_result_valid(result.outcome, result.content), "a cancellation before dispatch stores a valid envelope")
-	}
-	{
-		test: Tool_Test
-		tool_test_begin(t, &test)
-		defer tool_test_end(t, &test)
-
-		test.fixture.chat.turn_deadline = ai.deadline_in(-time.Second)
-		result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"echo hi"}`)
-		testing.expect_value(t, result.outcome, session.Tool_Outcome.Not_Executed)
-		testing.expect(t, tool_result_valid(result.outcome, result.content), "a cancellation after dispatch stores a valid envelope")
 	}
 }

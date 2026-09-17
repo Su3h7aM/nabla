@@ -2,7 +2,10 @@
 
 Status: implementation specification, not implemented. Inspected against Nabla change
 `knoqvwwr`, with Odin `dev-2026-09-nightly:a2fb372`. This document is authoritative for the
-work below. The existing compaction lifecycle remains implemented as described in
+work below, with one superseded direction: the deadline-based recovery policy it proposes
+(attempt timeout, recovery budget, retained turn deadline) was rejected. Model requests carry
+no harness time bound; only the provider bounds deliberation. A future implementation must not
+reintroduce harness deadlines. The existing compaction lifecycle remains implemented as described in
 [Context management and non-blocking compaction](CONTEXT_COMPACTION_ARCHITECTURE.md).
 Where this document changes that policy, the change is explicitly identified.
 

@@ -583,7 +583,7 @@ Minimum event contracts:
 | `agent.event_ignored` | Debug | reason, supplied turn and operation, current operation |
 | `request.prepared`, `request.recorded` | Info | purpose, model, provider, API, token estimate, context window, message and tool counts; the record marks the durable row separately from the prepare |
 | `request.admission`, `compaction.started`, `compaction.finished` | Info | estimate, budget, decision, covered sequence, checkpoint commit result |
-| `attempt.started`, `attempt.finished` | Info | attempt, remaining deadline; error kind, finish reason, status, bounded error detail, HTTP stop phase, accepted request-body bytes, request completeness, response-head and declared-length presence, observed streaming response bytes, duration |
+| `attempt.started`, `attempt.finished` | Info | attempt; error kind, finish reason, status, bounded error detail, HTTP stop phase, accepted request-body bytes, request completeness, response-head and declared-length presence, observed streaming response bytes, duration |
 | `request.retry` | Warn | error kind, next attempt, delay |
 | `provider.encoded` | Info | body length and digest, api, model, tool count |
 | `request.finished` | Info or Error | committed outcome, attempts, finish reason; failed requests use Error; failed persistence is recorded once as `storage.failed` |
