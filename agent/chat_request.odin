@@ -27,7 +27,9 @@ Chat_Request_Prep :: struct {
 	tools:      [dynamic]ai.Provider_Tool_Def,
 	tool_names: [dynamic]string, // owned wire names referenced by tools and calls,
 	calls:      [dynamic][dynamic]ai.Provider_Tool_Call,
-	feedback:   [dynamic]string, // owned; what a refused call is said to be,
+	// feedback holds text this preparation owns and the request borrows: what a refused
+	// call is said to be, and what a kept result is replaced by.
+	feedback:   [dynamic]string,
 	estimate:   int,
 }
 
@@ -285,14 +287,21 @@ chat_append_entries :: proc(
 				append(feedback, text)
 				append(&pending, text)
 			} else {
+				// A result that was kept is sent as a handle instead of its content. The
+				// handle is derived from the stored entry, so the model is told the same
+				// thing on every request built from it.
+				text := payload.content
+				if payload.spilled {
+					if call_seq < 0 {
+						text = TOOL_RESULT_SPILLED_MESSAGE
+					} else {
+						text = tool_result_handle(payload.outcome, call_seq, len(payload.content), allocator)
+						append(feedback, text)
+					}
+				}
 				append(
 					messages,
-					ai.Provider_Message {
-						Role = .Tool,
-						Content = payload.content,
-						Tool_Call_ID = call_ids[call_seq],
-						Tool_Is_Error = payload.outcome != .Success,
-					},
+					ai.Provider_Message{Role = .Tool, Content = text, Tool_Call_ID = call_ids[call_seq], Tool_Is_Error = payload.outcome != .Success},
 				)
 			}
 		case session.Tool_Dispatch_Entry, session.Checkpoint_Entry:

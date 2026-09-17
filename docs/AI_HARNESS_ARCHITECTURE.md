@@ -385,10 +385,14 @@ retrievable storage contract for §11. These additions are planned, not implemen
 - Results enter durable conversation state before the next request (§6).
 - **Large output ordering is fixed:**
   ```
-  redact → cap → spill to a result store → hand back a re-readable handle
+  redact → cap → spill to the record → hand back a re-readable handle
   ```
   Never place arbitrarily large tool output into model context. Redaction happens **before** the
-  cap, so a cap cannot split a secret in half.
+  cap, so a cap cannot split a secret in half. A turn's results are bounded as a batch, so one
+  large result cannot crowd out the rest; a result the batch cannot afford stays in the entry it
+  was recorded in and the model is shown a handle it can read back with `context.read_result`.
+  See [Provider failures, retries, and context recovery](ERROR_RETRY_ARCHITECTURE.md) §8.
+  Redaction before retention and a retention cap beyond one result are still open.
 - Tool definitions come from the harness's tool registry; `model.tools` from the catalog decides
   whether they are advertised at all.
 - Tool availability is a capability of the *model*, resolved from the catalog — not a per-provider
@@ -490,7 +494,8 @@ Verified against the code at the time of writing.
 2. **Catalog fields parsed but never consumed:** `input_modalities`, `output_modalities`,
    `display_name`.
 3. **Subagents absent.** No spawn, no process isolation, no lifecycle.
-4. **No redact/cap/spill path for tool output.**
+4. **No redaction pass before tool output is stored**, and no retention cap across a session. A
+   single result is capped, and a batch is now bounded and retrievable.
 5. **System prompt is a message, not a lane**, and is hardcoded (`AGENT_SYSTEM_PROMPT`,
    `CHAT_COMPACT_INSTRUCTIONS`).
 6. **Anthropic unimplemented.** `API_Kind.Anthropic_Messages` exists; `Provider_Validate_Request`

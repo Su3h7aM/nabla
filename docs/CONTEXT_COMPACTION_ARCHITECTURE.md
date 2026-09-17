@@ -319,10 +319,11 @@ Retry policy is one delay: after a failed job, the next automatic attempt waits
 
 These were considered and are not built. Each is additive; none changes the contracts above.
 
-- **Aggregate tool-result admission and spill.** Today one result is capped at
-  `TOOL_MAX_RESULT_BYTES` before it is stored. The implementation plan is now defined in
-  [Error and retry architecture, §8](ERROR_RETRY_ARCHITECTURE.md#8-resolve-aggregate-tool-result-admission-and-spill):
-  reserve a batch budget and atomically store retrievable output with its result reference.
+- **Aggregate tool-result admission and spill.** Built, and described in
+  [Error and retry architecture, §8](ERROR_RETRY_ARCHITECTURE.md#8-aggregate-tool-result-admission-and-spill):
+  a turn's results are bounded as a batch, and a result the batch cannot afford stays in the
+  record while the model is shown a handle it can read back with `context.read_result`. Retention
+  beyond one result's cap, and a cap across a session, remain.
 - **Cache breakpoint control.** `Provider_Message.Cache_Breakpoint` is unused; only Anthropic's
   automatic breakpoint is exercised. Explicit breakpoints would limit lookback and cache-write
   costs on long prefixes where the provider supports them.

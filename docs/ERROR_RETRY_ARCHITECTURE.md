@@ -26,9 +26,10 @@ history deletion, thinking-block stripping, or retry-everything mode.
 The two open compaction items are resolved here:
 
 1. Provider-confirmed context overflow gets one repair using a checkpoint already ready at
-   the failed request boundary. An unfinished compaction never makes the foreground wait.
-2. Aggregate tool-result admission gets a per-response budget and durable, bounded result
-   storage. Large results become small retrieval references before entering history.
+   the failed request boundary. An unfinished compaction never makes the foreground wait. Not yet
+   implemented; it needs the provider classification in §3.
+2. Aggregate tool-result admission gets a per-response budget and durable result storage. Large
+   results become small handles before entering history. Implemented, and described in §8.
 
 Cache breakpoints, prefix prewarming, and measured growth rates remain optional tuning work.
 They are not prerequisites for correct failure recovery. A finite context and an unavailable
@@ -65,8 +66,8 @@ compaction and `context.compact`, but provider failures still take the older ret
 | `http/client/client.odin` | Discards headers; formats a bounded error-body excerpt | Expose bounded, decoded response evidence before formatting |
 | `ai/http.odin` | Transfer observation attached only when diagnostics need it | Make decision facts available independently of logging |
 | `agent/compact.odin` | One send; failure cooldown is 5 seconds; explicit trigger bypasses it | Bounded retry chain and class-sensitive suppression |
-| `agent/tool.odin:tool_result_finalize` | Oversized result replaced irretrievably; 64 KiB per result | Separate validation, durable retention, and model-visible admission |
-| `agent/chat_tools.odin` | Results recorded sequentially without a batch budget | Reserve room for every result before the first tool runs |
+| `agent/tool.odin:tool_result_finalize` | Oversized result replaced irretrievably; 64 KiB per result | Done: the batch budget and the handle decision moved to `tool_result_read.odin`; the per-result cap remains |
+| `agent/chat_tools.odin` | Results recorded sequentially without a batch budget | Done: the batch budget is opened before the first result is recorded |
 | `agent/chat_command.odin` | Failed steering may display an unrelated `last_error` | Return a typed steering outcome and display only its own failure |
 
 Current partial assistant entries are excluded by `chat_build_request_into`. Retain that
@@ -380,122 +381,84 @@ Store the provider rejection and estimate for tuning. If instructions, tool sche
 user entry, or the retained call/result run itself exceeds the available context, this plan does
 not silently discard it. Report which part local accounting identifies as too large.
 
-## 8. Resolve aggregate tool-result admission and spill
+## 8. Aggregate tool-result admission and spill
 
-This is prevention at the point where results enter history, not a rewrite of old results after
-an error. It preserves the warm prefix and bounds a batch rather than merely one result.
+Status: implemented. `agent/tool_result_read.odin` owns the batch budget, the handle, and the read
+tool; `agent/chat_tools.odin` charges each result against that budget; `agent/session` stores the
+result and reads it back.
 
-### 8.1 Budget before dispatch
+A turn's results are bounded as a batch rather than one at a time. One large result must not crowd
+out the rest, and the sum is what makes the next request unsendable.
 
-When a complete response has been committed, build an estimate of that context including all
-new assistant text and calls. Let `remaining_input` be usable input minus that estimate. Count
-all committed calls in the response, including calls that will be refused or cancelled.
+### 8.1 The batch budget
 
-Use these initial bounds:
+When a response has committed its calls, `chat_tool_budget_open` opens the batch's budget: what the
+model's context holds once that response is committed, subtracted from what the window admits.
 
-| Constant | Value |
-|---|---:|
-| `CHAT_TOOL_BATCH_MAX_TOKENS` | 8192 |
-| `CHAT_TOOL_BATCH_RESERVE_TOKENS` | 1024, for accounting error/framing |
-| `TOOL_RESULT_REFERENCE_MAX_BYTES` | 1024, complete encoded envelope |
-| `TOOL_RESULT_STORED_MAX_BYTES` | 8 MiB per retained result |
-| `TOOL_RESULT_SESSION_MAX_BYTES` | 256 MiB per session |
-| `TOOL_RESULT_READ_MAX_BYTES` | 4096 raw bytes per read |
+```text
+remaining = capacity.usable - (last_estimate + response_cost)
+```
 
-`batch_budget = min(CHAT_TOOL_BATCH_MAX_TOKENS,
-max(0, remaining_input - CHAT_TOOL_BATCH_RESERVE_TOKENS))`.
+`response_cost` is what the committed response added: its text, the calls it proposed, the
+harness's notice, and the verbatim output when the API produced one. It is estimated the way the
+projection is, so the batch is charged for what the next request will carry.
 
-Reserve a minimum reference envelope plus tool-message framing for every remaining call. Use
-one conservative result-token accounting procedure for both reservation and consumption. Until
-there is a verified tokenizer, charge at least one token per encoded result byte plus the
-existing message framing estimate. The current chars-per-token estimate must not make a 1024-byte
-reference count as only 256 reserved tokens. This is a conservative text budget, not a universal
-proof about every provider's tokenizer.
+Each result is offered what is left after a handle is set aside for every result still to come. A
+result that fits keeps its content; one that does not is spilled. The decision is made once, as the
+result arrives, and stored, so a request built from these entries sends the same bytes however much
+the context grows afterwards. That stability is the point: rewriting an earlier result's
+representation would invalidate the cache from that point forward.
 
-Process results in call order. A result may consume only the budget left after reserving the
-minimum envelopes for all later calls. Keep it inline if it fits both that allowance and the
-existing 64 KiB per-result cap; otherwise retain it and emit a reference. Earlier results are
-never rewritten to accommodate later ones. References and retrieval results spend the same
-budget as ordinary output.
+`TOOL_RESULT_HANDLE_TOKENS` is the reserved constant. A handle is a fixed envelope carrying a
+sequence number and a byte count, so every handle costs nearly the same, and a test holds the real
+handle to that bound so the constant cannot drift away from the text it stands for. Reserving a
+constant is also what lets the budget be closed before any result is recorded.
 
-If even minimal envelopes cannot fit before dispatch, execute none of the batch. Settle each
-call as `Not_Executed` with the existing minimal outcome, then fail with `Context_Exhausted` and
-request background pressure recovery. Those settlement entries may exceed the local estimate,
-but no provider request sends them until admission succeeds. This is preferable to executing
-side effects whose results have no place in the next request. Do not install a checkpoint between
-committed calls and their results; the normal compaction boundary comes after settlement.
+The budget can go negative when even handles do not fit. The next request then fails admission,
+which is the honest report that the context is full. Nothing waits and nothing is dropped.
 
-Output tokens, user steering, schemas, and summary latency remain separate growth sources. This
-budget removes unbounded tool-batch growth, not the need for final request admission or the right
-to return `Context_Exhausted`.
+### 8.2 The record keeps the result; the model gets a handle
 
-### 8.2 Store and retrieval
+There is no second store. `Tool_Result_Entry` already holds the observed result for every call, so
+a spilled result stays exactly where it was written; only `spilled: true` is added. The handle is
+derived from that entry by the projection and never stored beside it, so the record and the
+projection cannot disagree about what the model was told.
 
-Use one new SQLite table in `agent/session`, not a new package, filesystem cache, or generic blob
-service. Key `tool_result_artifacts` by `(session_id, call_seq)` with a foreign key to the original
-call entry. Store UTF-8 content as a BLOB, retained byte length, original byte length when known,
-and whether the retained content is complete. The primary key's session prefix supports size
-queries; no second index is needed initially. Use a bounded BLOB slice for reads rather than
-loading an entire artifact to return one page. The table is append-only during session life;
-normal session deletion removes its rows. No background eviction invalidates a visible reference.
+The handle is an ordinary result envelope naming the call:
 
-Add migration 5 to the current version-4 session schema. Keep existing tables and historical
-entries unchanged; old binaries reject the newer schema through the existing version check.
+```json
+{"status":"success","message":"the observed output did not fit this context and was kept in the
+session; read it with context.read_result","data":{"call_seq":42,"bytes":48123}}
+```
 
-Add `tool_result_append` to insert an optional artifact and its model-visible result entry in
-one `BEGIN IMMEDIATE` transaction under the writer claim. Validate that the call belongs to this
-session, has no result yet, and that the artifact's relational key names that call. The harness
-validates the reference envelope against the same key before passing it to storage; the session
-package does not parse tool-specific JSON content. An insert cannot leave a
-dangling reference or silently replace a previous result. Enforce per-result and per-session byte
-limits inside the same transaction. Artifact bytes count toward the session's retained-size total.
+`call_seq` is the call the result answers, which is the key `context.read_result` takes.
 
-Expose `tool_result_read` with session id, call sequence, offset, and byte limit. It returns owned
-bytes, next offset, total retained size, and completeness. A native `context.read_result` tool
-uses a narrow borrowed `Tool_Result_Reader` containing the current store and session id. This
-is read-only tool access; all writes remain in the driver. Pass this reader and the current
-result allowance through `Tool_Context` in both construction sites in `chat_tools.odin`,
-including the context used inside `chat_prepare_call`. The tool accepts no other session id
-or filesystem path. Tool declaration/dispatch remains the normal native-tool path.
+Reads go through `session.tool_result_read`, which selects one result entry by its call and returns
+it; the tool slices a page out of it. The window is a byte range rather than a line range, because a
+stored result is not a file and the model is given its size, so an offset is the one thing both
+sides can agree on. The page ends on a character boundary, because half a character is not a string
+the encoder can send. A read never spills into another handle and never mutates the record; a page
+that does not fit the tool's own bound is shortened, and `next_offset` and `eof` say where to
+continue.
 
-A reference envelope preserves the original outcome and says that output was stored. Its data
-contains `call_seq`, retained byte count, completeness, and the retrieval tool name. Keep the
-whole envelope below 1024 encoded bytes; do not include the original unbounded error message.
-The same reference text is stored and sent, so resume does not regenerate different wire bytes.
-The compaction directive must preserve still-needed artifact identifiers in summaries.
+`Result_Reader` carries the store and the session and nothing else, and reaches a tool through
+`Tool_Context.results`. It is borrowed by the whole batch, so a call can read back what an earlier
+call in the same turn kept.
 
-The reader advances only at UTF-8 boundaries and caps JSON-encoded response size as well as raw
-bytes; escaping can expand text. Return `next_offset` and `eof` explicitly. Never spill a read
-result into a reference to another artifact: shrink its returned page to the current tool allowance.
-If no nonempty page fits, return a small capacity notice rather than a recursive reference. A read
-must not mutate the original artifact or claim its retained prefix was the complete command output.
+### 8.3 What remains
 
-### 8.3 Validation, retention limits, and failures
+- **Retention beyond the per-result cap.** `TOOL_MAX_RESULT_BYTES` (64 KiB) still bounds one stored
+  result, and a larger one is replaced by an honest message rather than a prefix. Keeping a
+  UTF-8-safe prefix and marking it incomplete would make the largest results retrievable too. Every
+  producer already bounds its own output well below the cap, so the gap is a large MCP result.
+- **A session-wide retention cap.** Nothing bounds what one session keeps across turns. The bound
+  is per result until a session total exists.
+- **`Context_Exhausted` as a typed reason.** A batch that cannot fit at all currently ends as a
+  failed admission, which is the right outcome but not yet a reason the front-end can name. §7
+  defines it.
 
-Split `tool_result_valid` into envelope validation and inline-size admission. Move oversized
-handling out of `tool_result_finalize` so it cannot delete content before retention. All native,
-MCP, recovered, unavailable, and cancelled result paths use the same admission boundary.
-Malformed envelopes remain a tool-contract failure with the observed outcome preserved; they
-are not provider failures and do not enter this retry policy.
-
-Retain up to 8 MiB of post-redaction output. Beyond that, keep a UTF-8-safe prefix and mark it
-incomplete with original byte count when known. Existing producers may already truncate their
-output; preserve their truncation indicators. This is lossless retention of admitted bytes, not
-an unlimited promise to capture arbitrary process output. Keep producer-side memory bounds.
-Apply existing security/redaction rules before retention; diagnostic log capture is not the
-result store and does not supply its access control. A new general secret scanner is out of scope.
-
-The session retention cap is a typed capacity refusal, not a database malfunction. If storage
-capacity is exhausted, the driver retries only the result-recording transaction without an
-artifact, preserving the observed tool outcome with a minimal notice saying output could not be
-retained. This never repeats tool execution. Stop the turn after settling the batch rather than
-present a nonexistent handle. Remaining unexecuted calls become `Not_Executed`; already-executed
-tools are never rerun. An actual database error trips the existing `storage_failed` latch. Crash
-before the atomic result write leaves an unsettled dispatch, which normal recovery marks `Unknown`
-without re-execution.
-
-Old oversized-result replacements cannot be reconstructed and must remain honest historical
-records. No migration fabricates artifacts from tool commands that might produce different data.
+Malformed envelopes remain a tool-contract failure with the observed outcome preserved. They are
+not provider failures and do not enter this retry policy.
 
 ## 9. Background compaction retries
 
@@ -607,9 +570,8 @@ is usable, rather than enabling a retry path that has not acquired durable recor
    backoff, typed observer reporting, and the steering fix. Reuse the existing HTTP test fixture.
 4. **Recover confirmed overflow.** Add the one-repair branch, typed context exhaustion, pressure
    promotion and idle recovery. Preserve existing conditional checkpoint persistence.
-5. **Retain and admit tool results.** Add session schema migration 5; implement atomic
-   append/read, `context.read_result`, and batch reservation. Update all result producers and
-   `tool_result_finalize` callers, plus the tool and compaction docs.
+5. ~~**Retain and admit tool results.**~~ Done: the batch budget, the stored result, the derived
+   handle, and `context.read_result`. See §8, including what it leaves open.
 6. **Apply retry policy to compaction.** Add owner-driven backoff, one-send request records,
    suppression/cooldown, allocator isolation, and root idle servicing. No foreground wait added.
 7. **Validate and update status.** Mark implemented sections only after their gates pass. Run a

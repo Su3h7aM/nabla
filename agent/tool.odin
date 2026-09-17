@@ -47,6 +47,10 @@ Tool_Context :: struct {
 	// how such a tool names the boundary it was called at.
 	compact:        ^Compact_Control,
 	source_seq:     session.Seq,
+	// results reads a kept tool result back out of the session. It is borrowed and
+	// lives for the whole batch, so every call in one turn can read what an earlier
+	// call kept. Nil means results cannot be read here.
+	results:        ^Result_Reader,
 }
 
 // Tool_Execute runs one admitted call. Returning .Invalid_Arguments promises the
@@ -308,6 +312,35 @@ TOOL_MAX_RESULT_BYTES :: 64 * 1024
 TOOL_RESULT_REPLACED_OVERSIZED :: "the tool result exceeded the harness output limit and was replaced"
 TOOL_RESULT_REPLACED_MALFORMED :: "the tool returned a result the harness could not use"
 
+// TOOL_RESULT_READ_NAME is the tool that reads a result back. It is named here, beside
+// the handle that tells the model to call it, because the tool and the handle are one
+// contract.
+TOOL_RESULT_READ_NAME :: "context.read_result"
+
+// TOOL_RESULT_SPILLED_MESSAGE is what a handle says instead of the output. Every
+// handle says the same thing, so a spilled result is always explained the same way.
+TOOL_RESULT_SPILLED_MESSAGE :: "the observed output did not fit this context and was kept in the session; read it with context.read_result"
+
+// TOOL_RESULT_HANDLE_TOKENS is what one handle costs the model's context. A handle is
+// a fixed envelope carrying a sequence number and a byte count, so every handle costs
+// nearly the same; a test holds the real one to this bound. Reserving a constant is
+// what lets a batch's budget be closed before any result is recorded.
+TOOL_RESULT_HANDLE_TOKENS :: 64
+
+// Tool_Result_Handle is the data of a handle: which call's result was kept, and how
+// much of it there is. call_seq is what the read tool takes.
+Tool_Result_Handle :: struct {
+	call_seq: i64 `json:"call_seq"`,
+	bytes:    int `json:"bytes"`,
+}
+
+// tool_result_handle is the envelope the model is shown in place of a result that was
+// kept rather than sent. It is derived from the stored entry, so it is not itself
+// stored: one fact, one place. The result is owned by allocator.
+tool_result_handle :: proc(outcome: session.Tool_Outcome, call_seq: i64, bytes: int, allocator: mem.Allocator) -> string {
+	return tool_content_json(outcome, TOOL_RESULT_SPILLED_MESSAGE, Tool_Result_Handle{call_seq = call_seq, bytes = bytes}, allocator)
+}
+
 // Tool_Empty is the data of a result that carries none of its own.
 Tool_Empty :: struct {}
 
@@ -506,6 +539,7 @@ TOOL_NATIVE := [?]Tool_Definition {
 	TOOL_LIST_SKILLS_DEFINITION,
 	TOOL_LOAD_SKILL_DEFINITION,
 	TOOL_COMPACT_DEFINITION,
+	TOOL_RESULT_READ_DEFINITION,
 }
 
 // TOOL_RECOVERED_RESULT and TOOL_UNEXECUTED_RESULT are what recovery writes for a

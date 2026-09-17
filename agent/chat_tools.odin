@@ -11,6 +11,11 @@ import "nabla:agent/session"
 // intent is recorded before it runs, and its result after, so an interruption
 // between the two is legible as an unknown outcome rather than a guess.
 //
+// The batch's context budget is opened once, here, before the first result exists.
+// Every result is charged against it and a result that does not fit is kept and
+// replaced by a handle, so one turn cannot put more into the context than the window
+// has left.
+//
 // It returns how many calls it recorded, which is what the caller compares
 // against the number of committed calls before the turn moves on.
 @(private)
@@ -19,6 +24,13 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		interrupt = &chat_cancel,
 		deadline  = chat.turn_deadline,
 	}
+	// The reader is in this frame for the whole batch, because every execution borrows
+	// it and it must outlive the longest one.
+	render := Result_Reader {
+		store      = chat.store,
+		session_id = chat.id,
+	}
+	budget := chat_tool_budget_open(chat, len(chat.pending_calls))
 	count := 0
 	for &staged in chat.pending_calls {
 		// Every record for this call carries its own id, so a call can be followed
@@ -39,6 +51,7 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 			skills     = chat_skill_catalog(chat),
 			compact    = &chat.compact,
 			source_seq = staged.seq,
+			results    = &render,
 		}
 		result: Tool_Result
 
@@ -49,7 +62,7 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		} else {
 			ctx.backend = definition.backend
 			ctx.timeouts = definition.timeouts
-			prepared, prepared_ok := chat_prepare_call(chat, observer, &staged, definition)
+			prepared, prepared_ok := chat_prepare_call(chat, observer, &staged, definition, &render)
 			if !prepared_ok { return count }
 			result = prepared
 		}
@@ -58,15 +71,20 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		// so the store only ever receives a valid bounded envelope.
 		finalized := tool_result_finalize(&ctx, result)
 
-		result_seq, recorded := chat_record_tool_result(chat, &staged, &finalized)
+		// The budget decides whether the model is shown this result or a handle for it.
+		// The decision is made once, here, and stored: a request built later sends the
+		// same bytes however much the context has grown by then.
+		spilled := !tool_budget_take(&budget, finalized.content)
+		result_seq, recorded := chat_record_tool_result(chat, &staged, &finalized, spilled)
 		if !recorded {
 			tool_result_destroy(&finalized)
 			return count
 		}
-		committed := [3]Log_Field {
+		committed := [4]Log_Field {
 			{key = "tool", value = staged.name},
 			{key = "outcome", value = session.tool_outcome_name(finalized.outcome)},
 			{key = "result_seq", value = i64(result_seq)},
+			{key = "spilled", value = spilled},
 		}
 		log_emit({level = .Info, category = .Tool, event = "tool.result_committed", fields = committed[:]})
 		_observer_tool_result(observer, staged.name, &finalized)
@@ -81,13 +99,16 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 // result empty and the turn stopping.
 //
 // The caller installs the call's logging binding before this runs, so every record
-// this makes carries the call id and the tool executor inherits it.
+// this makes carries the call id and the tool executor inherits it. results is the
+// reader the same batch gave every other call, so a tool that reads a kept result
+// back can do so from any call in the turn.
 @(private)
 chat_prepare_call :: proc(
 	chat: ^Chat_Session,
 	observer: Chat_Observer,
 	staged: ^Chat_Tool_Call,
 	definition: ^Tool_Definition,
+	results: ^Result_Reader,
 ) -> (
 	result: Tool_Result,
 	ok: bool,
@@ -102,6 +123,7 @@ chat_prepare_call :: proc(
 		backend = definition.backend,
 		compact = &chat.compact,
 		source_seq = staged.seq,
+		results = results,
 	}
 	arguments := tool_arguments_prepare(staged.arguments, chat.allocator)
 	defer tool_arguments_destroy(&arguments, chat.allocator)
@@ -158,7 +180,7 @@ chat_prepare_call :: proc(
 // turn: a call that ran and left no result is exactly the unanswered call the
 // record must never have.
 @(private)
-chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, result: ^Tool_Result) -> (seq: session.Seq, recorded: bool) {
+chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, result: ^Tool_Result, spilled: bool) -> (seq: session.Seq, recorded: bool) {
 	error_text := ""
 	if result.error.kind != .None { error_text = tool_argument_error_text(result.error, context.temp_allocator) }
 	entry := session.New_Entry {
@@ -166,7 +188,7 @@ chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, re
 		request_no = chat.active_request,
 		created_at_ms = session.now_ms(),
 		related_seq = staged.seq,
-		payload = session.Tool_Result_Entry{outcome = result.outcome, error = error_text, content = result.content, origin = .Observed},
+		payload = session.Tool_Result_Entry{outcome = result.outcome, error = error_text, content = result.content, origin = .Observed, spilled = spilled},
 	}
 	stored, append_error := session.entry_append(chat.store, chat.id, entry)
 	if append_error != nil {

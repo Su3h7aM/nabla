@@ -366,10 +366,13 @@ chat_commit_response :: proc(
 		outcome = .Failed
 	}
 
+	// A response that did not commit adds nothing to the context.
+	chat.response_cost = 0
 	if outcome == .Completed {
 		text := string(chat.partial_assistant[:])
 		response_count := 1 if chat.pending_response_present else 0
 		notice_text := chat_notice_text(chat.pending_notice)
+		chat.response_cost = chat_response_cost(chat, text, notice_text)
 		entries: [dynamic]session.New_Entry = make([dynamic]session.New_Entry, 0, response_count + len(chat.pending_calls) + 2, chat.allocator)
 		defer delete(entries)
 		if chat.pending_response_present {
@@ -480,6 +483,28 @@ chat_commit_response :: proc(
 	level := log.Level.Info
 	if outcome == .Failed { level = .Error }
 	log_emit({level = level, category = .Provider, event = "request.finished", fields = finished[:]})
+}
+
+// chat_response_cost estimates what one committed response adds to the model's
+// context: the text it produced, the calls it proposed, the harness's notice, and the
+// verbatim output the Responses API produced. It counts the same text the projection
+// sends and estimates it the same way, so a tool batch's budget is charged for what
+// the next request will actually carry.
+@(private)
+chat_response_cost :: proc(chat: ^Chat_Session, text, notice: string) -> int {
+	chars := len(text) + len(notice)
+	messages := 0
+	if text != "" { messages += 1 }
+	if notice != "" { messages += 1 }
+	if chat.pending_response_present {
+		chars += len(chat.pending_response.output)
+		messages += 1
+	}
+	if len(chat.pending_calls) > 0 {
+		for call in chat.pending_calls { chars += len(call.name) + len(call.arguments) }
+		messages += 1
+	}
+	return chars / CHAT_CHARS_PER_TOKEN + messages * CHAT_MESSAGE_OVERHEAD_TOKENS
 }
 
 // --- settling a turn ---------------------------------------------------------

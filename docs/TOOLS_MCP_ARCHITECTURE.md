@@ -13,7 +13,8 @@ editing dispatch, the request builder, result rendering, and the storage
 vocabulary.
 
 The goal is one tool system with a fixed set of native tools (`shell`,
-`read`, `write`, `edit`, the skill tools, and `context.compact`) and MCP servers
+`read`, `write`, `edit`, the skill tools, and the conversation tools
+`context.compact` and `context.read_result`) and MCP servers
 as a second source of the same kind of tool. Adding a tool should mean writing one
 declaration and one procedure.
 
@@ -253,11 +254,11 @@ collapsing it into a single failure.
 ### Tool names
 
 Every tool has an explicit namespace. Native tools use `builtin`, such as
-`builtin.read` and `builtin.write`, except the conversation-control tools, which
-use their own subject: `context.compact`. MCP tools use the configured server id,
-so a `grep` tool from the `fff` server is `fff.grep`. This prevents native and
-remote tools, or tools from two servers, from colliding without requiring user
-aliases.
+`builtin.read` and `builtin.write`, except the conversation tools, which use their
+own subject: `context.compact` and `context.read_result`. MCP tools use the
+configured server id, so a `grep` tool from the `fff` server is `fff.grep`. This
+prevents native and remote tools, or tools from two servers, from colliding
+without requiring user aliases.
 
 The harness exposes every tool returned by `tools/list`. It keeps the remote
 name exactly, including dots. Optional per-tool configuration uses the exact

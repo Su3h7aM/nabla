@@ -55,6 +55,9 @@ Tool_Result_Wire :: struct {
 	error:   string `json:"error"`,
 	content: string `json:"content"`,
 	origin:  string `json:"origin"`,
+	// spilled is absent in records written before a result could be kept, and an
+	// absent flag means the model was shown the content, which is what happened.
+	spilled: bool `json:"spilled"`,
 }
 
 @(private)
@@ -104,6 +107,7 @@ entry_payload_encode :: proc(payload: Entry_Payload, allocator := context.alloca
 			error   = value.error,
 			content = value.content,
 			origin  = tool_result_origin_name(value.origin),
+			spilled = value.spilled,
 		}
 		return json_encode(wire, allocator)
 	case Checkpoint_Entry:
@@ -198,6 +202,7 @@ entry_payload_decode :: proc(kind: Entry_Kind, data: string, allocator: mem.Allo
 			error   = wire.error,
 			content = wire.content,
 			origin  = origin,
+			spilled = wire.spilled,
 		}
 	case .Checkpoint:
 		wire: Checkpoint_Wire
