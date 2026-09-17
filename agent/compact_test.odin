@@ -85,7 +85,8 @@ test_a_summary_opens_the_request_before_the_kept_tail :: proc(t: ^testing.T) {
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
 	testing.expect_value(t, len(prep.request.Messages), 3)
-	testing.expect(t, strings.has_prefix(prep.request.Messages[0].Content, "Summary of the conversation so far:"))
+	testing.expect_value(t, prep.request.Messages[0].Role, ai.Provider_Role.User)
+	testing.expect_value(t, prep.request.Messages[0].Content, "earlier work")
 	testing.expect_value(t, prep.request.Messages[1].Content, "kept question")
 	testing.expect_value(t, prep.request.Messages[2].Content, "kept answer")
 }

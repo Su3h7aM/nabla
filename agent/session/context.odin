@@ -146,60 +146,148 @@ unsettled_calls :: proc(store: ^Store, id: Session_Id, allocator: mem.Allocator)
 
 // --- checkpoints ------------------------------------------------------------
 
-// New_Checkpoint is a compaction summary about to be stored. covered_seq is the
-// last entry the summary stands in for; it must already exist.
+// New_Checkpoint is a compaction summary about to be stored. summary is the text
+// that re-enters the conversation, wrapper included, so the bytes a resumed
+// session projects are the bytes that were stored. covered_seq is the last entry
+// the summary stands in for; it must already exist.
 New_Checkpoint :: struct {
 	turn_no:     Maybe(Turn_No),
-	request_no:  Maybe(Request_No),
 	at_ms:       i64,
 	summary:     string,
 	covered_seq: Seq,
 }
 
-// checkpoint_append records a compaction summary. History is never rewritten:
-// the summary is one more entry, and everything before covered_seq stays where
-// it is, readable and analysable, but no longer part of the active context.
-checkpoint_append :: proc(store: ^Store, id: Session_Id, checkpoint: New_Checkpoint) -> (seq: Seq, err: Error) {
+// checkpoint_install records a compaction summary at an exact context boundary.
+// History is never rewritten: the summary is one more entry, and everything
+// before covered_seq stays where it is but leaves the active context.
+//
+// expected_base names the checkpoint this one replaces, nil when the session had
+// none, and compaction_request names the request that produced the summary. The
+// checks and the append are one transaction, so a summary computed against a
+// superseded base, or from a request that never completed, cannot move the
+// context. That is what makes an asynchronous compaction safe to install late.
+checkpoint_install :: proc(
+	store: ^Store,
+	id: Session_Id,
+	checkpoint: New_Checkpoint,
+	expected_base: Maybe(Seq),
+	compaction_request: Request_No,
+) -> (
+	seq: Seq,
+	err: Error,
+) {
 	require_claim(store, id) or_return
 	if checkpoint.summary == "" { return 0, error_make(.Invalid_Argument, "a checkpoint needs a summary") }
 	if checkpoint.covered_seq <= 0 { return 0, error_make(.Invalid_Argument, "a checkpoint must cover some history") }
+	if compaction_request <= 0 { return 0, error_make(.Invalid_Argument, "a checkpoint needs the request that produced it") }
 
 	covered, covered_err := entry_exists(store, id, checkpoint.covered_seq)
 	if covered_err != nil { return 0, covered_err }
 	if !covered { return 0, error_make(.Invalid_Argument, "a checkpoint must cover an entry that exists") }
 
-	previous, previous_err := checkpoint_previous_seq(store, id)
-	if previous_err != nil { return 0, previous_err }
+	if begin_err := db.exec(&store.conn, "BEGIN IMMEDIATE"); begin_err != nil {
+		return 0, storage_error("begin checkpoint install", begin_err)
+	}
+	committed := false
+	defer if !committed { abandon_transaction(store) }
+
+	base, base_err := checkpoint_latest_seq(store, id)
+	if base_err != nil { return 0, base_err }
+	if !maybe_seq_equal(base, expected_base) {
+		return 0, error_make(.Invalid_State, "the checkpoint's base has changed")
+	}
+	origin, origin_err := checkpoint_origin_state(store, id, compaction_request)
+	if origin_err != nil { return 0, origin_err }
+	if !origin.completed {
+		return 0, error_make(.Invalid_Argument, "a checkpoint must come from a completed compaction request")
+	}
+	if origin.installed {
+		return 0, error_make(.Invalid_State, "that compaction request already installed a checkpoint")
+	}
 
 	payload := Checkpoint_Entry {
 		summary     = checkpoint.summary,
 		covered_seq = checkpoint.covered_seq,
 	}
-	if value, present := previous.?; present { payload.previous_seq = Seq(value) }
+	if value, present := base.?; present { payload.previous_seq = Seq(value) }
 
+	next, next_err := scalar_i64(store, ENTRY_NEXT_SEQ, {db.Value(string(id))})
+	if next_err != nil { return 0, next_err }
+	seq = Seq(next)
 	entry := New_Entry {
 		turn_no       = checkpoint.turn_no,
-		request_no    = checkpoint.request_no,
+		request_no    = compaction_request,
 		created_at_ms = checkpoint.at_ms,
 		payload       = payload,
 	}
-	return entry_append(store, id, entry)
+	if validate_err := validate_new_entry(store, id, seq, entry); validate_err != nil { return 0, validate_err }
+	if insert_err := insert_entry(store, id, seq, entry); insert_err != nil { return 0, insert_err }
+
+	if err := db.commit(&store.conn); err != nil {
+		return 0, storage_error("commit checkpoint install", err)
+	}
+	committed = true
+	return seq, nil
 }
 
 @(private)
-checkpoint_previous_seq :: proc(store: ^Store, id: Session_Id) -> (Maybe(Seq), Error) {
+CHECKPOINT_ORIGIN_STATE :: `SELECT r.purpose, r.status, EXISTS (SELECT 1 FROM entries AS c WHERE c.session_id = r.session_id AND c.kind = 'checkpoint' AND c.request_no = r.request_no) FROM requests AS r WHERE r.session_id = ? AND r.request_no = ?`
+
+@(private)
+Checkpoint_Origin :: struct {
+	compaction: bool,
+	completed:  bool,
+	installed:  bool,
+}
+
+@(private)
+checkpoint_origin_state :: proc(store: ^Store, id: Session_Id, request_no: Request_No) -> (origin: Checkpoint_Origin, err: Error) {
 	rows: db.Rows
-	if err := db.query(&store.conn, &rows, CHECKPOINT_LATEST_SEQ, {db.Value(string(id))}); err != nil {
-		return nil, storage_error("find the previous checkpoint", err)
+	args := [?]db.Value{db.Value(string(id)), db.Value(i64(request_no))}
+	if query_err := db.query(&store.conn, &rows, CHECKPOINT_ORIGIN_STATE, args[:]); query_err != nil {
+		return {}, storage_error("read the compaction request", query_err)
 	}
 	defer db.rows_close(&rows)
 
 	values, has_row, next_err := db.rows_next(&rows)
-	if next_err != nil { return nil, storage_error("find the previous checkpoint", next_err) }
+	if next_err != nil { return {}, storage_error("read the compaction request", next_err) }
+	if !has_row { return {}, error_make(.Not_Found, "no compaction request has that number") }
+	purpose, purpose_err := db.as_string(values[0])
+	if purpose_err != nil { return {}, corrupt_error("read the compaction request", purpose_err) }
+	status, status_err := db.as_string(values[1])
+	if status_err != nil { return {}, corrupt_error("read the compaction request", status_err) }
+	installed, installed_err := db.as_i64(values[2])
+	if installed_err != nil { return {}, corrupt_error("read the compaction request", installed_err) }
+
+	origin.compaction = purpose == request_purpose_name(.Compaction)
+	origin.completed = status == outcome_name(.Completed)
+	origin.installed = installed != 0
+	return origin, nil
+}
+
+@(private)
+checkpoint_latest_seq :: proc(store: ^Store, id: Session_Id) -> (Maybe(Seq), Error) {
+	rows: db.Rows
+	if err := db.query(&store.conn, &rows, CHECKPOINT_LATEST_SEQ, {db.Value(string(id))}); err != nil {
+		return nil, storage_error("find the latest checkpoint", err)
+	}
+	defer db.rows_close(&rows)
+
+	values, has_row, next_err := db.rows_next(&rows)
+	if next_err != nil { return nil, storage_error("find the latest checkpoint", next_err) }
 	if !has_row { return nil, nil }
 	seq, convert_err := db.as_i64(values[0])
-	if convert_err != nil { return nil, corrupt_error("find the previous checkpoint", convert_err) }
+	if convert_err != nil { return nil, corrupt_error("find the latest checkpoint", convert_err) }
 	return Seq(seq), nil
+}
+
+// maybe_seq_equal compares two optional sequences by presence and value, which is
+// how a compaction candidate names the checkpoint it was computed against.
+maybe_seq_equal :: proc(a, b: Maybe(Seq)) -> bool {
+	a_value, a_present := a.?
+	b_value, b_present := b.?
+	if a_present != b_present { return false }
+	return !a_present || a_value == b_value
 }
 
 // entry_latest_checkpoint returns the newest checkpoint entry, or false when

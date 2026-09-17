@@ -17,6 +17,17 @@ CHAT_COMPACT_KEEP_MESSAGES :: 10
 CHAT_COMPACT_MAX_OUTPUT :: 2000
 CHAT_COMPACT_INSTRUCTIONS :: "Summarize the conversation so far in a few paragraphs for continued work. Preserve decisions, unresolved tasks, file paths, tool outcomes, and anything the next step depends on. Omit small talk. Plain text only. Name every loaded skill, the decisions made with it, and the paths it used. A summary never retains a complete skill verbatim: reload a skill before relying on its details."
 
+// CHAT_COMPACT_CHECKPOINT_PREAMBLE opens the message a checkpoint re-enters the
+// conversation as. It is stored beside the summary, so a resumed session
+// projects the same bytes the checkpoint was written with.
+CHAT_COMPACT_CHECKPOINT_PREAMBLE :: "The conversation was compacted through this checkpoint. Treat the summary as established background and continue the task from the messages that follow without acknowledging the checkpoint."
+
+// chat_checkpoint_text frames a summary as the checkpoint message the model
+// reads. The result is owned by allocator.
+chat_checkpoint_text :: proc(summary: string, allocator: mem.Allocator) -> string {
+	return strings.concatenate({CHAT_COMPACT_CHECKPOINT_PREAMBLE, "\n\n", summary}, allocator)
+}
+
 // chat_compact_seam finds where the kept tail starts so the last keep entries
 // stay verbatim. Coherence beats the count: the seam must not fall inside a
 // call/result run, because a result kept without its call is malformed history
@@ -198,21 +209,24 @@ chat_compact :: proc(
 		return false
 	}
 
-	// The checkpoint and then the request's outcome. The checkpoint landing
-	// first is what makes an interruption between them harmless: the summary is
-	// valid, and recovery closes the request.
-	_, checkpoint_err := session.checkpoint_append(
-		chat.store,
-		chat.id,
-		{turn_no = chat.turn_no, request_no = request_no, at_ms = at_ms, summary = summary_text, covered_seq = covered},
-	)
-	if checkpoint_err != nil {
-		chat_session_record_failure(chat, "the summary could not be recorded", checkpoint_err)
-		return false
-	}
+	// The request's outcome and then the checkpoint. A candidate that never
+	// installs leaves the old context usable, which is what an interruption
+	// between the two writes falls back to.
 	if finish_err := session.request_finish(chat.store, chat.id, request_no, {outcome = .Completed, usage = outcome.usage, at_ms = session.now_ms()});
 	   finish_err != nil {
 		chat_session_record_failure(chat, "the compaction outcome could not be recorded", finish_err)
+		return false
+	}
+	checkpoint_text := chat_checkpoint_text(summary_text, context.temp_allocator)
+	_, checkpoint_err := session.checkpoint_install(
+		chat.store,
+		chat.id,
+		{turn_no = chat.turn_no, at_ms = at_ms, summary = checkpoint_text, covered_seq = covered},
+		prep.history.summary_seq,
+		request_no,
+	)
+	if checkpoint_err != nil {
+		chat_session_record_failure(chat, "the summary could not be recorded", checkpoint_err)
 		return false
 	}
 	result = "committed"

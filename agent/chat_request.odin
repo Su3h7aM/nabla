@@ -90,10 +90,10 @@ chat_build_request_into :: proc(
 		instructions = chat.skill_instructions
 	}
 	// A checkpoint stands in for the history it covers, so the request opens
-	// with the summary and continues with the entries after it.
+	// with the checkpoint message as the harness stored it and continues with
+	// the entries after it.
 	if summary != "" {
-		summary_text := strings.concatenate({"Summary of the conversation so far:\n", summary}, context.temp_allocator)
-		append(&prep.wire, ai.Provider_Message{Role = .Assistant, Content = summary_text})
+		append(&prep.wire, ai.Provider_Message{Role = .User, Content = summary})
 	}
 	chat_append_entries(&prep.wire, &prep.calls, &prep.tool_names, &prep.feedback, connection.API, entries, dispatches, chat.allocator)
 

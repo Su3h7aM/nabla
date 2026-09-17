@@ -302,13 +302,15 @@ test_checkpoints_chain_and_move_the_context :: proc(t: ^testing.T) {
 		2_400,
 	)
 	_expect_ok(t, compaction_err)
-	checkpoint_seq, checkpoint_err := checkpoint_append(
+	_expect_ok(t, request_finish(&store, session.id, compaction, {outcome = .Completed, at_ms = 2_440}))
+	checkpoint_seq, checkpoint_err := checkpoint_install(
 		&store,
 		session.id,
-		{request_no = compaction, at_ms = 2_450, summary = "the first task is done", covered_seq = covered},
+		{at_ms = 2_450, summary = "the first task is done", covered_seq = covered},
+		nil,
+		compaction,
 	)
 	_expect_ok(t, checkpoint_err)
-	_expect_ok(t, request_finish(&store, session.id, compaction, {outcome = .Completed, at_ms = 2_460}))
 
 	// A second turn continues after the checkpoint.
 	turn_two, turn_two_err := turn_begin(&store, session.id, "second task", .Prompt, 2_500)
@@ -368,7 +370,7 @@ test_checkpoints_chain_and_move_the_context :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_a_checkpoint_must_cover_real_history :: proc(t: ^testing.T) {
+test_a_checkpoint_must_come_from_a_verified_compaction :: proc(t: ^testing.T) {
 	store: Store
 	directory := _open_store(t, &store)
 	defer _close_store(&store, directory)
@@ -379,15 +381,43 @@ test_a_checkpoint_must_cover_real_history :: proc(t: ^testing.T) {
 	_expect_ok(t, turn_err)
 	_ = turn
 
-	_, missing_err := checkpoint_append(&store, session.id, {at_ms = 2_100, summary = "so far", covered_seq = Seq(99)})
+	_, missing_err := checkpoint_install(&store, session.id, {at_ms = 2_100, summary = "so far", covered_seq = Seq(99)}, nil, 0)
 	_expect_error(t, missing_err, .Invalid_Argument)
 
-	_, empty_err := checkpoint_append(&store, session.id, {at_ms = 2_100, summary = "", covered_seq = Seq(1)})
+	_, empty_err := checkpoint_install(&store, session.id, {at_ms = 2_100, summary = "", covered_seq = Seq(1)}, nil, 0)
 	_expect_error(t, empty_err, .Invalid_Argument)
 
-	first, first_err := checkpoint_append(&store, session.id, {at_ms = 2_100, summary = "so far", covered_seq = Seq(1)})
+	// A summary needs a completed compaction request behind it, and it can only be
+	// installed once.
+	first_request, first_request_err := request_begin(
+		&store,
+		session.id,
+		{purpose = .Compaction, provider = "p", model_requested = "m", api = "a", config_json = "{}", input_json = "{}"},
+		2_150,
+	)
+	_expect_ok(t, first_request_err)
+	_, premature_err := checkpoint_install(&store, session.id, {at_ms = 2_160, summary = "so far", covered_seq = Seq(1)}, nil, first_request)
+	_expect_error(t, premature_err, .Invalid_Argument)
+	_expect_ok(t, request_finish(&store, session.id, first_request, {outcome = .Completed, at_ms = 2_170}))
+
+	first, first_err := checkpoint_install(&store, session.id, {at_ms = 2_180, summary = "so far", covered_seq = Seq(1)}, nil, first_request)
 	_expect_ok(t, first_err)
-	second, second_err := checkpoint_append(&store, session.id, {at_ms = 2_200, summary = "still going", covered_seq = Seq(1)})
+	_, duplicate_err := checkpoint_install(&store, session.id, {at_ms = 2_190, summary = "so far", covered_seq = Seq(1)}, nil, first_request)
+	_expect_error(t, duplicate_err, .Invalid_State)
+
+	// A second summary computed against the same base is refused: the base it was
+	// computed against is no longer the installed one.
+	second_request, second_request_err := request_begin(
+		&store,
+		session.id,
+		{purpose = .Compaction, provider = "p", model_requested = "m", api = "a", config_json = "{}", input_json = "{}"},
+		2_200,
+	)
+	_expect_ok(t, second_request_err)
+	_expect_ok(t, request_finish(&store, session.id, second_request, {outcome = .Completed, at_ms = 2_210}))
+	_, stale_err := checkpoint_install(&store, session.id, {at_ms = 2_220, summary = "stale", covered_seq = Seq(1)}, nil, second_request)
+	_expect_error(t, stale_err, .Invalid_State)
+	second, second_err := checkpoint_install(&store, session.id, {at_ms = 2_230, summary = "still going", covered_seq = Seq(1)}, first, second_request)
 	_expect_ok(t, second_err)
 
 	latest, has_latest, latest_err := entry_latest_checkpoint(&store, session.id)
