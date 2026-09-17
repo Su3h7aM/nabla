@@ -4,10 +4,8 @@ import "base:runtime"
 
 import "core:io"
 import "core:slice"
-import "core:strconv"
 import "core:strings"
 import "core:sync"
-import "core:time"
 
 Requestline_Error :: enum {
 	None,
@@ -281,90 +279,6 @@ header_allowed_trailer :: proc(key: string) -> bool {
 	// odinfmt:enable
 }
 
-@(private)
-DATE_LENGTH :: len("Fri, 05 Feb 2023 09:01:10 GMT")
-
-// Formats a time in the HTTP header format (no timezone conversion is done, GMT expected):
-// `<day-name>, <day> <month> <year> <hour>:<minute>:<second> GMT`
-date_write :: proc(w: io.Writer, t: time.Time) -> io.Error {
-	year, month, day := time.date(t)
-	hour, minute, second := time.clock_from_time(t)
-	wday := time.weekday(t)
-	
-	// odinfmt:disable
-	io.write_string(w, DAYS[wday])    or_return // 'Fri, '
-	write_padded_int(w, day)          or_return // 'Fri, 05'
-	io.write_string(w, MONTHS[month]) or_return // 'Fri, 05 Feb '
-	io.write_int(w, year)             or_return // 'Fri, 05 Feb 2023'
-	io.write_byte(w, ' ')             or_return // 'Fri, 05 Feb 2023 '
-	write_padded_int(w, hour)         or_return // 'Fri, 05 Feb 2023 09'
-	io.write_byte(w, ':')             or_return // 'Fri, 05 Feb 2023 09:'
-	write_padded_int(w, minute)       or_return // 'Fri, 05 Feb 2023 09:01'
-	io.write_byte(w, ':')             or_return // 'Fri, 05 Feb 2023 09:01:'
-	write_padded_int(w, second)       or_return // 'Fri, 05 Feb 2023 09:01:10'
-	io.write_string(w, " GMT")        or_return // 'Fri, 05 Feb 2023 09:01:10 GMT'
-	// odinfmt:enable
-
-	return nil
-}
-
-// Formats a time in the HTTP header format (no timezone conversion is done, GMT expected):
-// `<day-name>, <day> <month> <year> <hour>:<minute>:<second> GMT`
-date_string :: proc(t: time.Time, allocator := context.allocator) -> string {
-	b: strings.Builder
-
-	buf := make([]byte, DATE_LENGTH, allocator)
-	b.buf = slice.into_dynamic(buf)
-
-	date_write(strings.to_writer(&b), t)
-
-	return strings.to_string(b)
-}
-
-date_parse :: proc(value: string) -> (t: time.Time, ok: bool) #no_bounds_check {
-	if len(value) != DATE_LENGTH { return }
-
-	// Remove 'Fri, '
-	value := value
-	value = value[5:]
-
-	// Parse '05'
-	day := strconv.parse_i64_of_base(value[:2], 10) or_return
-	value = value[2:]
-
-	// Parse ' Feb ' or '-Feb-' (latter is a deprecated format but should still be parsed).
-	month_index := -1
-	month_str := value[1:4]
-	value = value[5:]
-	for month, i in MONTHS[1:] {
-		if month_str == month[1:4] {
-			month_index = i
-			break
-		}
-	}
-	month_index += 1
-	if month_index <= 0 { return }
-
-	year := strconv.parse_i64_of_base(value[:4], 10) or_return
-	value = value[4:]
-
-	hour := strconv.parse_i64_of_base(value[1:3], 10) or_return
-	value = value[4:]
-
-	minute := strconv.parse_i64_of_base(value[:2], 10) or_return
-	value = value[3:]
-
-	seconds := strconv.parse_i64_of_base(value[:2], 10) or_return
-	value = value[3:]
-
-	// Should have only 'GMT' left now.
-	if value != "GMT" { return }
-
-	t = time.datetime_to_time(int(year), int(month_index), int(day), int(hour), int(minute), int(seconds)) or_return
-	ok = true
-	return
-}
-
 request_path_write :: proc(w: io.Writer, target: URL) -> io.Error {
 	// TODO: maybe net.percent_encode.
 
@@ -397,17 +311,6 @@ _dynamic_add_len :: proc(d: ^[dynamic]$E, len: int) {
 }
 
 @(private)
-write_padded_int :: proc(w: io.Writer, i: int) -> io.Error {
-	if i < 10 {
-		io.write_string(w, PADDED_NUMS[i]) or_return
-		return nil
-	}
-
-	_, err := io.write_int(w, i)
-	return err
-}
-
-@(private)
 write_escaped_newlines :: proc(w: io.Writer, v: string) -> io.Error {
 	for c in v {
 		if c == '\n' {
@@ -417,29 +320,6 @@ write_escaped_newlines :: proc(w: io.Writer, v: string) -> io.Error {
 		}
 	}
 	return nil
-}
-
-@(private)
-PADDED_NUMS := [10]string{"00", "01", "02", "03", "04", "05", "06", "07", "08", "09"}
-
-@(private)
-DAYS := [7]string{"Sun, ", "Mon, ", "Tue, ", "Wed, ", "Thu, ", "Fri, ", "Sat, "}
-
-@(private)
-MONTHS := [13]string {
-	" ", // Jan is 1, so 0 should never be accessed.
-	" Jan ",
-	" Feb ",
-	" Mar ",
-	" Apr ",
-	" May ",
-	" Jun ",
-	" Jul ",
-	" Aug ",
-	" Sep ",
-	" Oct ",
-	" Nov ",
-	" Dec ",
 }
 
 @(private)

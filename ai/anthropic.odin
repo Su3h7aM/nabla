@@ -364,6 +364,49 @@ anthropic_error_event :: proc(object: json.Object, allocator := context.allocato
 	return openai_error_event(.API_Error, message, code, allocator), true
 }
 
+// anthropic_error_rejection decodes the error document this API returns for a
+// refused request, through the same reader an in-stream error event uses, so a
+// refusal read from a response body and one read from a stream cannot drift apart.
+// The returned strings are owned by allocator.
+anthropic_error_rejection :: proc(body: []u8, allocator := context.allocator) -> Provider_Rejection {
+	value, object, parsed := provider_error_document(body, allocator)
+	if !parsed { return {} }
+	defer json.destroy_value(value, allocator)
+	event, is_error := anthropic_error_event(object, allocator)
+	if !is_error { return {} }
+	defer Provider_Event_Destroy(&event, allocator)
+	error_event, is_error_event := event.(Provider_Error_Event)
+	if !is_error_event { return {} }
+	return Provider_Rejection {
+		code = provider_bounded_text(error_event.Provider_Code, PROVIDER_MAX_CODE_BYTES, allocator),
+		message = provider_bounded_text(error_event.Message, PROVIDER_MAX_MESSAGE_BYTES, allocator),
+	}
+}
+
+// ANTHROPIC_CONTEXT_OVERFLOW_MESSAGE is this API's own wording for a rejected
+// payload whose prompt was too long. It is the only prose this package reads, and
+// only ever beside the single code that covers every malformed request.
+ANTHROPIC_CONTEXT_OVERFLOW_MESSAGE :: "prompt is too long"
+
+// anthropic_failure_class names the meaning this API gives to one of its own error
+// types. `invalid_request_error` covers every malformed request, so overflow is
+// read from the provider's own wording for it and nothing else: a mention of
+// tokens or limits is not evidence, the way every other refusal stays unknown.
+anthropic_failure_class :: proc(code, message: string) -> (Provider_Failure_Class, bool) {
+	switch code {
+	case "rate_limit_error":
+		return .Rate_Limited, true
+	case "overloaded_error":
+		return .Provider_Unavailable, true
+	case "authentication_error", "permission_error":
+		return .Authentication, true
+	case "invalid_request_error":
+		if strings.contains(message, ANTHROPIC_CONTEXT_OVERFLOW_MESSAGE) { return .Context_Overflow, true }
+		return .Invalid_Request, true
+	}
+	return .None, false
+}
+
 @(private)
 anthropic_usage_from :: proc(object: json.Object, key: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	raw, present := object[key]

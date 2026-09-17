@@ -11,16 +11,6 @@ import "core:strings"
 import "nabla:http"
 
 
-HTTP_MAX_ERROR_BYTES :: 4096
-HTTP_MAX_ERROR_EXCERPT :: 2000
-HTTP_MAX_HEADER_LINES :: 256
-HTTP_MAX_LINE_BYTES :: 32 * 1024
-
-// HTTP_MAX_INTERIM_RESPONSES bounds how many interim responses are discarded
-// before a final one, so a peer that only ever sends interim responses cannot
-// keep a request running indefinitely.
-HTTP_MAX_INTERIM_RESPONSES :: 16
-
 Failure_Kind :: enum {
 	None,
 	Cancelled,
@@ -34,15 +24,31 @@ Failure_Kind :: enum {
 	Content_Type,
 }
 
-// Failure describes why a request did not deliver a complete response. Only an
-// HTTP_Status detail is allocated, with the request allocator, and the caller
-// owns it; every other detail is a literal.
+// Failure describes why a request did not deliver a usable response. Every kind
+// owns exactly the same field, `detail`, so one destructor releases any of them.
 Failure :: struct {
 	kind:   Failure_Kind,
+	// cause is the transport error this failure came from, and is .None for a
+	// failure that never reached the transport: a URL this client refuses, a
+	// status it will not use, or a media type the caller did not ask for. The kind
+	// is the coarse view of the same fact; the cause is what keeps a peer that
+	// never authenticated distinct from a connection that broke after the request
+	// went out.
+	cause:  Error,
 	status: int,
+	// detail is a short human-readable account, owned by the caller.
 	detail: string,
 }
 
+// failure_destroy releases what a failure owns.
+failure_destroy :: proc(failure: ^Failure, allocator: mem.Allocator) {
+	if failure == nil { return }
+	if failure.detail != "" { delete(failure.detail, allocator) }
+	failure^ = {}
+}
+
+// Chunk_Callback receives response body bytes as they arrive. A nil callback
+// discards the body.
 Chunk_Callback :: #type proc(user_data: rawptr, chunk: []u8)
 
 Header :: struct {
@@ -63,7 +69,12 @@ Request :: struct {
 // stream_request performs one request and delivers the response body through
 // callback. Cancellation and deadlines reach every blocking phase except name
 // resolution, which is bracketed instead of interrupted.
-stream_request :: proc(request: Request, options: Options, user_data: rawptr, callback: Chunk_Callback) -> Failure {
+//
+// The body is delivered whatever the status is. A response this client will not
+// use still carries the peer's own account of what went wrong, and HTTP places no
+// limit on a body (RFC 9110 5.4), so no size is invented here and the caller
+// decides how much of it to keep.
+stream_request :: proc(request: Request, options: Options, user_data: rawptr, callback: Chunk_Callback) -> (failure: Failure) {
 	url := http.url_parse(request.url)
 	// One observation per request, reported on every path once validation has
 	// begun. The phase names the stage about to run, so an error inside a stage is
@@ -73,40 +84,43 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	phase := Transfer_Phase.Validate
 	defer {
 		summary.stopped_at = phase
+		summary.error = failure.cause
 		if options.observer.complete != nil {
 			options.observer.complete(options.observer.user_data, summary)
 		}
 	}
 
-	if url.scheme != "http" && url.scheme != "https" { return failure_from_error(.None, .Invalid_URL, "URL scheme must be http or https") }
-	if url.host == "" { return failure_from_error(.None, .Invalid_URL, "URL host is empty") }
+	if url.scheme != "http" && url.scheme != "https" {
+		return failure_from_error(.None, request.allocator, .Invalid_URL, "URL scheme must be http or https")
+	}
+	if url.host == "" { return failure_from_error(.None, request.allocator, .Invalid_URL, "URL host is empty") }
 
 	// Every wait in this request runs on the calling thread's event loop, which
 	// owns readiness for the socket and for the resolver's.
 	if loop_err := nbio.acquire_thread_event_loop(); loop_err != nil {
-		return failure_from_error(.None, .Transport, "the event loop could not be started")
+		return failure_from_error(.None, request.allocator, .Transport, "the event loop could not be started")
 	}
 	defer nbio.release_thread_event_loop()
 
 	phase = .Resolve
 	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
-		return failure_from_error(error_from_stop(stop))
+		return failure_from_error(error_from_stop(stop), request.allocator)
 	}
 	endpoint, resolve_err := resolve_endpoint(url, options, request.allocator)
-	if resolve_err != .None { return failure_from_error(resolve_err) }
+	if resolve_err != .None { return failure_from_error(resolve_err, request.allocator) }
 	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
-		return failure_from_error(error_from_stop(stop))
+		return failure_from_error(error_from_stop(stop), request.allocator)
 	}
 
 	phase = .Connect
 	connection, dial_err := connection_dial(endpoint, options, request.allocator)
-	if dial_err != .None { return failure_from_error(dial_err) }
+	if dial_err != .None { return failure_from_error(dial_err, request.allocator) }
 	defer connection_destroy(connection)
 
 	if url.scheme == "https" {
 		phase = .TLS
 		if handshake_err := connection_handshake(connection, url.host); handshake_err != .None {
-			return failure_from_error(handshake_err)
+			return failure_from_error(handshake_err, request.allocator)
 		}
 	}
 
@@ -118,7 +132,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	summary.request_bytes_accepted = u64(accepted)
 	summary.request_body_bytes_accepted = u64(max(accepted - body_offset, 0))
 	summary.request_complete = accepted == len(request_bytes)
-	if write_err != .None { return failure_from_error(write_err) }
+	if write_err != .None { return failure_from_error(write_err, request.allocator) }
 
 	phase = .Response_Head
 	reader: Reader
@@ -127,44 +141,75 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 
 	status, headers, head_err := read_final_response_head(&reader, request.allocator)
 	defer headers_destroy(&headers, request.allocator)
-	if head_err != .None { return failure_from_error(head_err) }
+	if head_err != .None { return failure_from_error(head_err, request.allocator) }
 	summary.response_head_received = true
 	summary.status = status
 
-	// The head is where a declared length comes from, whatever the status is. The
-	// framing error itself is reported after the status and content-type checks, so
-	// a refused response is still refused for the reason it was before.
+	// The head is where a declared length comes from, whatever the status is, and a
+	// refusal is reported for what it is however the head's framing turned out.
 	framing, length, framing_err := response_framing(status, request.method, headers)
 	if framing_err == .None && framing == Body_Framing.Exact {
 		summary.declared_body_bytes = u64(length)
 		summary.declared_body_bytes_present = true
 	}
 
+	// The head is reported before its body, so a caller that has to read the
+	// peer's own account of what went wrong knows what arrived in time to decide
+	// how much of that body to keep. The fields are borrowed for this call only.
+	//
 	// Anything outside 2xx ends the request and is reported by its status.
 	// Redirects are deliberately not followed: RFC 9110 15.4 makes automatic
 	// redirection optional for a user agent, and no API this client serves depends
-	// on it.
-	if status < 200 || status >= 300 {
-		return Failure{kind = .HTTP_Status, status = status, detail = error_detail(status, &reader, request.allocator)}
+	// on it. A response whose media type is not the one the caller asked for is a
+	// refusal too: that is the shape a 2xx error document takes.
+	status_usable := status >= 200 && status < 300
+	content_type_usable := true
+	if request.expected_content_type != "" {
+		value, present := http.headers_get_unsafe(headers, "content-type")
+		content_type_usable = present && content_type_matches(value, request.expected_content_type)
+	}
+	if options.response_head.observed != nil {
+		head := Response_Head {
+			status = status,
+			usable = status_usable && content_type_usable,
+		}
+		options.response_head.observed(options.response_head.user_data, head, headers)
 	}
 
-	if request.expected_content_type != "" {
-		content_type, present := http.headers_get_unsafe(headers, "content-type")
-		if !present || !content_type_matches(content_type, request.expected_content_type) {
-			return Failure {
-				kind = .Content_Type,
-				status = status,
-				detail = content_type_detail(status, request.expected_content_type, &reader, request.allocator),
-			}
+	refusal: Failure
+	if !status_usable {
+		refusal = Failure {
+			kind   = .HTTP_Status,
+			status = status,
+			detail = status_detail(status, request.allocator),
+		}
+	} else if !content_type_usable {
+		refusal = Failure {
+			kind   = .Content_Type,
+			status = status,
+			detail = fmt.aprintf("response content-type is not %s (HTTP %d)", request.expected_content_type, status, allocator = request.allocator),
 		}
 	}
 
+	// A refused response still has a body, and that body is the peer's own account
+	// of why. It is framed and delivered exactly as a usable one is, so the caller
+	// keeps what it wants and nothing is decided here on its behalf. The phase stays
+	// in the body: what ended the exchange was the status, not the transport, and the
+	// status is what the caller reads.
 	phase = .Response_Body
 	if framing_err != .None {
-		return failure_from_error(framing_err)
-	} else if body_err := stream_body(&reader, framing, length, user_data, callback); body_err != .None {
-		return failure_from_error(body_err)
+		// The head's framing is unusable, so there is no body this client can frame
+		// or hand over. A refusal is still reported as the refusal it is.
+		if refusal.kind != .None { return refusal }
+		return failure_from_error(framing_err, request.allocator)
 	}
+	if callback != nil {
+		if body_err := stream_body(&reader, framing, length, user_data, callback); body_err != .None {
+			if refusal.kind != .None { return refusal }
+			return failure_from_error(body_err, request.allocator)
+		}
+	}
+	if refusal.kind != .None { return refusal }
 
 	phase = .Complete
 	return {}
@@ -221,6 +266,13 @@ resolve_endpoint :: proc(url: http.URL, options: Options, allocator: mem.Allocat
 	return net.Endpoint{address = address, port = port}, .None
 }
 
+// status_detail names the status a response was refused for. The reason phrase
+// is left out on purpose: RFC 9110 15 tells a client to ignore it because it is
+// not a reliable channel for information.
+status_detail :: proc(status: int, allocator: mem.Allocator) -> string {
+	return fmt.aprintf("HTTP %d: the response status is not 2xx", status, allocator = allocator)
+}
+
 // append_folded_value continues a field with the value of a folded line.
 //
 // RFC 9112 5.2 defines obs-fold as OWS CRLF RWS and requires a user agent that
@@ -252,9 +304,13 @@ read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status
 	// The field a folded line continues. A field line cannot begin with whitespace
 	// (RFC 9112 5 and 5.2), so whitespace here can only be an obs-fold, and one
 	// that continues nothing is a message that cannot be read as a field section.
+	//
+	// The section is read until its empty line, with no bound on how many fields it
+	// may hold or how long any of them may be: RFC 9110 5.4 states that HTTP places
+	// no predefined limit on a field line, a field value, or a field section, and a
+	// client that refuses a long one fails where every other client succeeds.
 	last_key: string
-	for count := 0;; count += 1 {
-		if count > HTTP_MAX_HEADER_LINES { return 0, headers, .Bad_Response }
+	for {
 		header_line, header_err := reader_line(reader)
 		if header_err != .None { return 0, headers, header_err }
 		if header_line == "" { break }
@@ -286,13 +342,16 @@ read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status
 // returned as the final response for the caller to report as a failure rather
 // than being waited past.
 read_final_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status_code: int, headers: http.Headers, err: Error) {
-	for count := 0;; count += 1 {
+	// How many interim responses may precede the final one is not this client's
+	// decision: RFC 9110 15.2 says a client must be able to parse one or more of
+	// them. A peer that only ever sends them is bounded by the caller's own
+	// cancellation and deadline, asked on every read.
+	for {
 		code, head, head_err := read_response_head(reader, allocator)
 		if head_err != .None { return 0, head, head_err }
 		if code == 101 || code >= 200 { return code, head, .None }
 
 		headers_destroy(&head, allocator)
-		if count >= HTTP_MAX_INTERIM_RESPONSES { return 0, {}, .Bad_Response }
 	}
 }
 
@@ -304,8 +363,13 @@ parse_status_line :: proc(line: string) -> (int, bool) {
 	rest := line[space + 1:]
 	code_text := rest
 	if end := strings.index_byte(rest, ' '); end >= 0 { code_text = rest[:end] }
+	// RFC 9112 4: status-code is exactly three digits. A code this client does not
+	// recognize is still reported as the code it is, rather than refused for being
+	// one this build happens to have a name for. The reason phrase after it is
+	// discarded: RFC 9110 15 says a client should ignore it.
+	if len(code_text) != 3 { return 0, false }
 	code, code_ok := strconv.parse_int(code_text)
-	if !code_ok || code < 100 || code > 599 { return 0, false }
+	if !code_ok || code < 100 { return 0, false }
 	return code, true
 }
 
@@ -416,7 +480,7 @@ stream_exact :: proc(reader: ^Reader, length: int, user_data: rawptr, callback: 
 	for remaining > 0 {
 		count := min(len(scratch), remaining)
 		if err := reader_read_full(reader, scratch[:count]); err != .None { return err }
-		callback(user_data, scratch[:count])
+		if callback != nil { callback(user_data, scratch[:count]) }
 		remaining -= count
 	}
 	return .None
@@ -428,7 +492,7 @@ stream_until_closed :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_
 		count, err := reader_read(reader, scratch[:])
 		if err == .Closed { return .None }
 		if err != .None { return err }
-		callback(user_data, scratch[:count])
+		if callback != nil { callback(user_data, scratch[:count]) }
 	}
 }
 
@@ -441,6 +505,8 @@ stream_chunked :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callb
 		size, size_ok := strconv.parse_int(strings.trim_space(size_text), 16)
 		if !size_ok || size < 0 { return .Bad_Response }
 		if size == 0 {
+			// RFC 9112 7.1.2: a trailer section is read to its empty line, and how many
+			// fields it holds is not bounded here either.
 			for {
 				trailer, trailer_err := reader_line(reader)
 				if trailer_err != .None { return trailer_err }
@@ -452,41 +518,6 @@ stream_chunked :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callb
 		if err := reader_read_full(reader, ending[:]); err != .None { return err }
 		if ending[0] != '\r' || ending[1] != '\n' { return .Bad_Response }
 	}
-}
-
-error_detail :: proc(status: int, reader: ^Reader, allocator: mem.Allocator) -> string {
-	body := read_bounded_body(reader, HTTP_MAX_ERROR_BYTES, allocator)
-	defer delete(body, allocator)
-	text := strings.trim_space(body)
-	if text == "" { return fmt.aprintf("HTTP %d: HTTP response was not successful", status, allocator = allocator) }
-	limit := len(text)
-	if limit > HTTP_MAX_ERROR_EXCERPT { limit = HTTP_MAX_ERROR_EXCERPT }
-	return fmt.aprintf("HTTP %d: %s", status, text[:limit], allocator = allocator)
-}
-
-// content_type_detail reports a rejected response content type together with a
-// bounded excerpt of whatever the peer actually sent, so the caller can see
-// whether a 2xx response carried an error document instead of the stream.
-content_type_detail :: proc(status: int, expected: string, reader: ^Reader, allocator: mem.Allocator) -> string {
-	body := read_bounded_body(reader, HTTP_MAX_ERROR_BYTES, allocator)
-	defer delete(body, allocator)
-	text := strings.trim_space(body)
-	if text == "" { return fmt.aprintf("response content-type is not %s (HTTP %d)", expected, status, allocator = allocator) }
-	limit := len(text)
-	if limit > HTTP_MAX_ERROR_EXCERPT { limit = HTTP_MAX_ERROR_EXCERPT }
-	return fmt.aprintf("response content-type is not %s (HTTP %d): %s", expected, status, text[:limit], allocator = allocator)
-}
-
-read_bounded_body :: proc(reader: ^Reader, limit: int, allocator: mem.Allocator) -> string {
-	builder := strings.builder_make(allocator)
-	scratch: [4096]u8
-	for strings.builder_len(builder) < limit {
-		want := min(len(scratch), limit - strings.builder_len(builder))
-		count, err := reader_read(reader, scratch[:want])
-		if count > 0 { strings.write_bytes(&builder, scratch[:count]) }
-		if err != .None || count == 0 { break }
-	}
-	return strings.to_string(builder)
 }
 
 // headers_destroy frees what http.header_parse allocated, which nabla:http does not
@@ -501,7 +532,10 @@ headers_destroy :: proc(headers: ^http.Headers, allocator: mem.Allocator) {
 	headers^ = {}
 }
 
-failure_from_error :: proc(err: Error, override: Failure_Kind = .None, detail: string = "") -> Failure {
+// failure_from_error builds a failure from the transport's own error. The text is
+// cloned so that every failure owns its detail, which is what lets one
+// destructor release any of them.
+failure_from_error :: proc(err: Error, allocator: mem.Allocator, override: Failure_Kind = .None, detail: string = "") -> Failure {
 	kind := override
 	if kind == .None {
 		switch err {
@@ -523,7 +557,7 @@ failure_from_error :: proc(err: Error, override: Failure_Kind = .None, detail: s
 	}
 	text := detail
 	if text == "" { text = error_text(err) }
-	return Failure{kind = kind, detail = text}
+	return Failure{kind = kind, cause = err, detail = strings.clone(text, allocator)}
 }
 
 error_text :: proc(err: Error) -> string {

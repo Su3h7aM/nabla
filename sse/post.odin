@@ -30,18 +30,11 @@ post :: proc(request: Post_Request, options: client.Options, user_data: rawptr, 
 	headers := make([dynamic]client.Header, 0, len(request.headers) + 2, request.allocator)
 	defer delete(headers)
 	append(&headers, client.Header{"content-type", "application/json"})
-	append(&headers, client.Header{"accept", "text/event-stream"})
+	append(&headers, client.Header{"accept", CONTENT_TYPE})
 	append(&headers, ..request.headers)
 
 	return client.stream_request(
-		{
-			url = request.url,
-			method = .Post,
-			headers = headers[:],
-			body = request.body,
-			expected_content_type = "text/event-stream",
-			allocator = request.allocator,
-		},
+		{url = request.url, method = .Post, headers = headers[:], body = request.body, expected_content_type = CONTENT_TYPE, allocator = request.allocator},
 		options,
 		user_data,
 		callback,

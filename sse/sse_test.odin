@@ -183,8 +183,8 @@ test_event_type_state :: proc(t: ^testing.T) {
 @(test)
 test_retry_state :: proc(t: ^testing.T) {
 	// The reconnection time is stream state: it persists until changed, a
-	// malformed value is ignored rather than fatal, and an unrepresentable digit
-	// string is clamped.
+	// malformed value is ignored rather than fatal, and a digit string wider than
+	// the representable time saturates at it.
 	recorder: Recorder
 	recorder_init(&recorder)
 	defer recorder_destroy(&recorder)
@@ -208,7 +208,7 @@ test_retry_state :: proc(t: ^testing.T) {
 			{type = "message", data = "c", retry_ms = 5000, retry_present = true},
 			{type = "message", data = "d", retry_ms = 5000, retry_present = true},
 			{type = "message", data = "e", retry_ms = 5000, retry_present = true},
-			{type = "message", data = "f", retry_ms = MAX_RETRY_MS, retry_present = true},
+			{type = "message", data = "f", retry_ms = max(i64), retry_present = true},
 			{type = "message", data = "g", retry_ms = 0, retry_present = true},
 		},
 	)

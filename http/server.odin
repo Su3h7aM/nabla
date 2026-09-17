@@ -622,7 +622,7 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 // A buffer that will contain the date header for the current second.
 @(private)
 Server_Date :: struct {
-	buf_backing: [DATE_LENGTH]byte,
+	buf_backing: [HTTP_DATE_LENGTH]byte,
 	buf:         bytes.Buffer,
 }
 

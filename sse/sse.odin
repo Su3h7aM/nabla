@@ -15,7 +15,9 @@ package sse
 
 import "core:unicode/utf8"
 
-MAX_RETRY_MS :: 24 * 60 * 60 * 1000
+// CONTENT_TYPE is the media type of an event stream. It is the type a response
+// must declare, and the type a caller asks for when it wants one.
+CONTENT_TYPE :: "text/event-stream"
 
 // DEFAULT_EVENT_TYPE is the type an event has when its block named none.
 DEFAULT_EVENT_TYPE :: "message"
@@ -236,19 +238,20 @@ append_replacement_character :: proc(dst: ^[dynamic]u8) {
 
 // parse_retry reads a reconnection time. The specification accepts a field value
 // of ASCII digits and ignores anything else, so ok is false for a malformed or
-// empty value. A digit string too large to represent is clamped to MAX_RETRY_MS
-// rather than rejected: the bound is this package's memory policy, not a
-// validity rule, and a caller is told the longest delay it will be asked to wait.
+// empty value. A digit string wider than the representable time saturates there:
+// the field is an integer of any length, and the only bound added here is the one
+// the type itself has, not a policy about how long a client should wait.
 @(private)
 parse_retry :: proc(value: []u8) -> (ms: i64, ok: bool) {
 	if len(value) == 0 { return 0, false }
 	result: i64
 	for byte in value {
 		if byte < '0' || byte > '9' { return 0, false }
-		if result >= MAX_RETRY_MS / 10 { return MAX_RETRY_MS, true }
-		result = result * 10 + i64(byte - '0')
+		digit := i64(byte - '0')
+		if result > (max(i64) - digit) / 10 { return max(i64), true }
+		result = result * 10 + digit
 	}
-	return min(result, MAX_RETRY_MS), true
+	return result, true
 }
 
 @(private)

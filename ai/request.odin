@@ -3,7 +3,9 @@ package ai
 import "core:mem"
 import "core:net"
 import "core:strings"
+import "core:time"
 
+import "nabla:http"
 import "nabla:http/client"
 import "nabla:sse"
 
@@ -92,14 +94,49 @@ Provider_Operation_Error_Kind :: enum {
 }
 
 Provider_Operation_Error :: struct {
-	kind:   Provider_Operation_Error_Kind,
-	// detail is owned by the caller and released with the operation's allocator,
-	// so a constant message is cloned into it like any other.
-	detail: string,
+	kind:                Provider_Operation_Error_Kind,
+	// failure_class is the provider's normalized meaning for this failure, and None
+	// when no provider classification applies: a local refusal, or an attempt that
+	// never reached the provider. Neither is a success signal.
+	failure_class:       Provider_Failure_Class,
 	// status is the HTTP response status when the endpoint gave one, and zero when
 	// no response arrived. Retry policy needs the status, and it is a fact about
 	// the request, not about the turn.
-	status: int,
+	status:              int,
+	// provider_code is the provider's own code or type for the refusal, owned by the
+	// caller, and empty when the provider wrote none.
+	provider_code:       string,
+	// provider_request_id is the identifier the provider's own response header
+	// carried, owned by the caller, and empty when it sent none. It is what a
+	// support request or a log search correlates on.
+	provider_request_id: string,
+	// retry_after is the delay the provider asked for, and is absent when it asked
+	// for none. A present zero is not an absent value: it means "as soon as this
+	// client is ready", and policy still decides whether it may send again.
+	retry_after:         Maybe(time.Duration),
+	// retry_directive is what the provider's own response said about sending again,
+	// for the API families that document such a field.
+	retry_directive:     Provider_Retry_Directive,
+	// detail is owned by the caller and released with Provider_Operation_Error_Destroy,
+	// so a constant message is cloned into it like any other.
+	detail:              string,
+	// transfer is the transport's own account of the attempt, in this package's
+	// vocabulary, and is present whenever the request reached the transport.
+	transfer:            Provider_Transfer_Summary,
+	transfer_present:    bool,
+	// transport_cause distinguishes a peer that never authenticated from a
+	// connection that broke after the request went out.
+	transport_cause:     Provider_Transport_Cause,
+}
+
+// Provider_Operation_Error_Destroy releases what an operation error owns. A zero
+// error owns nothing, so destroying one is harmless.
+Provider_Operation_Error_Destroy :: proc(err: ^Provider_Operation_Error, allocator := context.allocator) {
+	if err == nil { return }
+	if err.detail != "" { delete(err.detail, allocator) }
+	if err.provider_code != "" { delete(err.provider_code, allocator) }
+	if err.provider_request_id != "" { delete(err.provider_request_id, allocator) }
+	err^ = {}
 }
 
 // Provider_Encoded_Request is a provider request whose body was encoded before
@@ -286,7 +323,18 @@ Provider_Request_Operation_Encoded :: proc(
 	defer sse.parser_destroy(&state.parser)
 	defer Provider_Event_Destroy(&state.completion, allocator)
 	defer Provider_Stream_Destroy(&state.stream)
+	// Every path releases what the attempt still owns: only a failure hands its
+	// evidence to the caller, and the state clears each field the error takes.
+	defer provider_state_release(&state)
 
+	// The facts a recovery decision needs are collected here rather than through the
+	// diagnostic observer, so turning logging off cannot change what the operation
+	// reports about its own failure.
+	facts := HTTP_Response_Facts {
+		user_data = &state,
+		head      = provider_response_head,
+		transfer  = provider_transfer_summary,
+	}
 	failure := http_post_sse(
 		HTTP_Request {
 			url = endpoint,
@@ -298,16 +346,25 @@ Provider_Request_Operation_Encoded :: proc(
 		},
 		HTTP_Control{interrupt = options.interrupt, deadline = options.deadline},
 		encoded.API,
+		facts,
 		options.observer,
 		&state,
 		provider_http_chunk,
 	)
+	// The transport owns its copy of the failure, and this operation releases it on
+	// every path once it has read what it keeps.
+	defer client.failure_destroy(&failure, allocator)
+
 	if failure.kind != .None {
-		if !state.failed { provider_emit_error(&state, provider_failure_kind(failure.kind), failure.detail) }
+		state.transport_cause = provider_transport_cause(failure.cause)
+		// A refused response carried the provider's own account of the refusal in its
+		// body. It is decoded before that body is released, and one that is absent,
+		// truncated, or malformed simply leaves the status and the transport facts as
+		// the evidence.
+		state.rejection = provider_rejection_parse(encoded.API, state.error_body[:state.error_body_len], allocator)
+		if !state.failed { provider_emit_error(&state, provider_failure_kind(failure), failure.detail) }
 		provider_drain_events(&state)
-		if failure.kind == .HTTP_Status && failure.detail != "" { delete(failure.detail, allocator) }
-		state.failure_status = failure.status
-		return provider_terminal_error(&state, provider_operation_error_kind(failure.kind))
+		return provider_terminal_error(&state, provider_operation_error_kind(failure))
 	}
 	if state.failed { return provider_terminal_error(&state, .Stream) }
 	sse.parser_finish(&state.parser)
@@ -326,30 +383,117 @@ Provider_Request_Operation_Encoded :: proc(
 }
 
 Provider_Request_Stream_State :: struct {
-	stream:         Provider_Stream_State,
-	parser:         sse.Parser,
-	api:            API_Kind,
-	user_data:      rawptr,
-	callback:       Provider_Event_Callback,
-	allocator:      mem.Allocator,
-	interrupt:      ^Interrupt,
-	deadline:       Deadline,
-	observer:       Provider_Operation_Observer,
-	response_bytes: u64,
-	failed:         bool,
-	failure_detail: string,
-	failure_status: int,
-	completion:     Provider_Event,
+	stream:           Provider_Stream_State,
+	parser:           sse.Parser,
+	api:              API_Kind,
+	user_data:        rawptr,
+	callback:         Provider_Event_Callback,
+	allocator:        mem.Allocator,
+	interrupt:        ^Interrupt,
+	deadline:         Deadline,
+	observer:         Provider_Operation_Observer,
+	response_bytes:   u64,
+	failed:           bool,
+	failure_detail:   string,
+	// failure_event is the terminal event the stream layer produced, when it
+	// produced one. It is what separates a stream that ended without its marker from
+	// output this client cannot read.
+	failure_event:    Maybe(Provider_Error_Kind),
+	// response_head is what the final response head said, recorded while the
+	// transport's own fields were still borrowed.
+	response_head:    Provider_Response_Head,
+	// rejection is the provider's own account of a refused request, owned here until
+	// the terminal error hands it to the caller.
+	rejection:        Provider_Rejection,
+	// completion is the terminal response, retained until the transport finishes
+	// cleanly: no call becomes executable while a later failure could still arrive.
+	completion:       Provider_Event,
+	// error_body keeps what a refused response carried, bounded by this package's own
+	// policy: the transport hands over a body of any size, and what is kept here is
+	// enough to read a provider's error document and no more.
+	error_body:       [PROVIDER_MAX_ERROR_BODY_BYTES]u8,
+	error_body_len:   int,
+	transfer:         Provider_Transfer_Summary,
+	transfer_present: bool,
+	transport_cause:  Provider_Transport_Cause,
 }
 
-// provider_operation_error_kind maps a transport failure onto the operation's
-// own outcome, so a caller that only inspects the returned error still learns
-// that the request was interrupted rather than malformed. A content-type
-// rejection is a stream failure: the peer answered 2xx with something other
-// than the expected media type, which an unstable peer can produce on one
-// attempt and not the next, so it retries like any other broken stream.
-provider_operation_error_kind :: proc(kind: HTTP_Failure_Kind) -> Provider_Operation_Error_Kind {
-	switch kind {
+// PROVIDER_MAX_ERROR_BODY_BYTES bounds the copy this package keeps of the body of a
+// response it could not use. It is this layer's policy, not the transport's: HTTP
+// sets no limit on a body, and a provider's error document is small.
+PROVIDER_MAX_ERROR_BODY_BYTES :: 8192
+
+// Provider_Response_Head is what a final response head said, in this package's
+// vocabulary. It is recorded while the transport's headers are borrowed, so the
+// identifier that has to outlive that call is cloned into it.
+Provider_Response_Head :: struct {
+	seen:                bool,
+	status:              int,
+	// stream says the transport will deliver a stream this operation can parse. A
+	// response that is not one carries the provider's error document instead.
+	stream:              bool,
+	// provider_request_id is owned by the operation, and is empty when the provider
+	// sent no such field or when this API documents none.
+	provider_request_id: string,
+	// retry_after is the delay the provider asked for, converted at receipt against
+	// the wall clock. The wait itself is monotonic.
+	retry_after:         Maybe(time.Duration),
+	retry_directive:     Provider_Retry_Directive,
+}
+
+// provider_response_head records what a response head said about this attempt. It
+// runs during the transport call, so everything kept beyond it is cloned here.
+provider_response_head :: proc(user_data: rawptr, head: client.Response_Head, headers: http.Headers) {
+	state := cast(^Provider_Request_Stream_State)user_data
+	if state == nil { return }
+	state.response_head.seen = true
+	state.response_head.status = head.status
+	state.response_head.stream = head.usable
+	if name := provider_request_id_header(state.api); name != "" {
+		if value, present := http.headers_get_unsafe(headers, name); present {
+			state.response_head.provider_request_id = provider_bounded_text(value, PROVIDER_MAX_CODE_BYTES, state.allocator)
+		}
+	}
+	if value, present := http.headers_get_unsafe(headers, "retry-after"); present {
+		state.response_head.retry_after = provider_retry_after(value)
+	}
+	state.response_head.retry_directive = provider_retry_directive(state.api, headers)
+}
+
+// provider_transfer_summary records how the attempt ended. A recovery decision
+// reads it, so it is collected whether or not diagnostics are enabled.
+provider_transfer_summary :: proc(user_data: rawptr, summary: Provider_Transfer_Summary) {
+	state := cast(^Provider_Request_Stream_State)user_data
+	if state == nil { return }
+	state.transfer = summary
+	state.transfer_present = true
+}
+
+// provider_state_release frees what the state still owns once an operation is over.
+// The terminal error takes each field as it claims it, so this releases exactly
+// what is left, including the evidence a successful attempt read from the head.
+provider_state_release :: proc(state: ^Provider_Request_Stream_State) {
+	if state == nil { return }
+	if state.failure_detail != "" { delete(state.failure_detail, state.allocator) }
+	provider_rejection_destroy(&state.rejection, state.allocator)
+	if state.response_head.provider_request_id != "" {
+		delete(state.response_head.provider_request_id, state.allocator)
+	}
+	state.failure_detail = ""
+	state.response_head.provider_request_id = ""
+}
+
+// provider_operation_error_kind maps a transport failure onto the operation's own
+// outcome, so a caller that only inspects the returned error still learns that the
+// request was interrupted rather than malformed.
+//
+// A TLS failure is the peer failing to authenticate, with one exception: a read or
+// a write that fails after the connection was established is a connection that
+// broke. That one is a transport failure, and sending again can succeed. The cause
+// is what tells them apart, because both arrive as the transport's TLS failure.
+provider_operation_error_kind :: proc(failure: client.Failure) -> Provider_Operation_Error_Kind {
+	if failure.cause == .TLS_Read || failure.cause == .TLS_Write { return .Transport }
+	switch failure.kind {
 	case .Cancelled:
 		return .Cancelled
 	case .Timed_Out:
@@ -361,18 +505,21 @@ provider_operation_error_kind :: proc(kind: HTTP_Failure_Kind) -> Provider_Opera
 	case .Invalid_URL:
 		return .Invalid_Request
 	case .Content_Type:
+		// A content-type rejection means the peer answered 2xx with something other
+		// than the expected media type, which an unstable peer can produce on one
+		// attempt and not the next.
 		return .Stream
-	case .Transport:
+	case .Transport, .Truncated, .Closed:
 		return .Transport
 	case .None:
 	}
 	return .Stream
 }
 
-// provider_terminal_error reports why an operation ended. An accepted
-// cancellation or an expired deadline always wins over whichever path happened
-// to notice first, so a late failure is never reported as an ordinary stream
-// defect and a late success can never be reported at all.
+// provider_terminal_error reports why an operation ended. An accepted cancellation
+// or an expired deadline always wins over whichever path happened to notice first,
+// so a late failure is never reported as an ordinary stream defect and a late
+// success can never be reported at all.
 provider_terminal_error :: proc(state: ^Provider_Request_Stream_State, kind: Provider_Operation_Error_Kind) -> Provider_Operation_Error {
 	resolved := kind
 	if interrupt_requested(state.interrupt) {
@@ -380,21 +527,59 @@ provider_terminal_error :: proc(state: ^Provider_Request_Stream_State, kind: Pro
 	} else if deadline_expired(state.deadline) {
 		resolved = .Timed_Out
 	}
-	return Provider_Operation_Error{kind = resolved, detail = provider_take_failure_detail(state), status = state.failure_status}
+	class := provider_classify_failure(
+		Provider_Evidence {
+			api = state.api,
+			kind = resolved,
+			head_seen = state.response_head.seen,
+			status = state.response_head.status,
+			cause = state.transport_cause,
+			event = state.failure_event,
+			rejection = state.rejection,
+		},
+	)
+	result := Provider_Operation_Error {
+		kind                = resolved,
+		failure_class       = class,
+		status              = state.response_head.status,
+		provider_code       = state.rejection.code,
+		provider_request_id = state.response_head.provider_request_id,
+		retry_after         = state.response_head.retry_after,
+		retry_directive     = state.response_head.retry_directive,
+		detail              = provider_take_failure_detail(state),
+		transfer            = state.transfer,
+		transfer_present    = state.transfer_present,
+		transport_cause     = state.transport_cause,
+	}
+	// What the caller now owns is no longer the state's, so the release path cannot
+	// free it twice.
+	state.rejection.code = ""
+	state.response_head.provider_request_id = ""
+	// The provider's own words are the reason a refusal happened, so they are what
+	// the failure carries when the provider wrote any.
+	if state.rejection.message != "" {
+		if result.detail != "" { delete(result.detail, state.allocator) }
+		result.detail = state.rejection.message
+		state.rejection.message = ""
+	}
+	return result
 }
 
 // provider_failure_kind maps a transport failure onto the event kind the caller
 // sees. Interruption is never reported as a stream defect, so a cancelled
-// operation can be distinguished from a broken one.
-provider_failure_kind :: proc(kind: HTTP_Failure_Kind) -> Provider_Error_Kind {
-	switch kind {
+// operation can be distinguished from a broken one. A TLS read or write that failed
+// after the connection was established is a broken stream rather than an
+// unauthenticated peer, which is what lets it be sent again.
+provider_failure_kind :: proc(failure: client.Failure) -> Provider_Error_Kind {
+	if failure.cause == .TLS_Read || failure.cause == .TLS_Write { return .Stream_Truncated }
+	switch failure.kind {
 	case .Cancelled:
 		return .Cancelled
 	case .Timed_Out:
 		return .Timed_Out
 	case .TLS:
 		return .TLS
-	case .None, .Transport, .Invalid_URL, .HTTP_Status, .Content_Type:
+	case .None, .Transport, .Truncated, .Closed, .Invalid_URL, .HTTP_Status, .Content_Type:
 		return .Stream_Truncated
 	}
 	return .Stream_Truncated
@@ -465,6 +650,7 @@ provider_stream_error_text :: proc(err: Provider_Stream_Error) -> string {
 provider_emit_error :: proc(state: ^Provider_Request_Stream_State, kind: Provider_Error_Kind, detail: string) {
 	if state.failed { return }
 	state.failed = true
+	if state.failure_event == nil { state.failure_event = kind }
 	state.failure_detail = strings.clone(detail, state.allocator)
 	event: Provider_Event = Provider_Error_Event {
 		Kind    = kind,
@@ -503,6 +689,15 @@ provider_accept_event :: proc(state: ^Provider_Request_Stream_State, event: Prov
 			return
 		}
 		state.failed = true
+		if state.failure_event == nil { state.failure_event = value.Kind }
+		// The provider's own code and message outlive the event, because the event is
+		// released once the caller's callback returns.
+		if !provider_rejection_present(state.rejection) {
+			state.rejection = Provider_Rejection {
+				code    = provider_bounded_text(value.Provider_Code, PROVIDER_MAX_CODE_BYTES, state.allocator),
+				message = provider_bounded_text(value.Message, PROVIDER_MAX_MESSAGE_BYTES, state.allocator),
+			}
+		}
 		if state.failure_detail == "" { state.failure_detail = strings.clone(value.Message, state.allocator) }
 		provider_deliver(state, event)
 	case Provider_Completed_Event:
@@ -550,5 +745,24 @@ provider_http_chunk :: proc(user_data: rawptr, chunk: []u8) {
 	if state.observer.report != nil {
 		state.observer.report(state.observer.user_data, Provider_Operation_Report{stage = .Response_Body, chunk = chunk, bytes = state.response_bytes})
 	}
+	// A response this operation cannot use is not a stream. Its body is the
+	// provider's own account of the refusal, so it is kept as evidence rather than
+	// fed to a framing parser whose stream would be that error document.
+	if state.response_head.seen && !state.response_head.stream {
+		provider_error_body_append(state, chunk)
+		return
+	}
 	sse.parser_feed(&state.parser, chunk)
+}
+
+// provider_error_body_append keeps what fits of a refused response's body and drops
+// the rest. What is dropped is not reported as absent: the status, the transport's
+// account of the attempt, and the provider's own rejection are separate facts from
+// how much of the body this layer chose to keep.
+provider_error_body_append :: proc(state: ^Provider_Request_Stream_State, chunk: []u8) {
+	space := PROVIDER_MAX_ERROR_BODY_BYTES - state.error_body_len
+	if space <= 0 { return }
+	count := min(space, len(chunk))
+	copy(state.error_body[state.error_body_len:state.error_body_len + count], chunk[:count])
+	state.error_body_len += count
 }

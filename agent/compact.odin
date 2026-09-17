@@ -348,7 +348,7 @@ chat_compact_job_destroy :: proc(job: ^Compact_Job) {
 	chat_compact_snapshot_destroy(&job.snapshot, allocator)
 	delete(job.output)
 	delete(job.error_text, allocator)
-	delete(job.operation.detail, allocator)
+	ai.Provider_Operation_Error_Destroy(&job.operation, allocator)
 	free(job, backing)
 }
 

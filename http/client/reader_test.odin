@@ -2,6 +2,7 @@
 #+private file
 package client
 
+import "core:fmt"
 import "core:strings"
 import "core:testing"
 
@@ -178,21 +179,52 @@ test_interim_responses :: proc(t: ^testing.T) {
 	testing.expect_value(t, switch_err, Error.None)
 	testing.expect_value(t, switch_status, 101)
 
-	// A peer that only ever sends interim responses must not keep the request
-	// running forever.
-	interim := "HTTP/1.1 100 Continue\r\n\r\n"
-	bounded: [dynamic]u8
-	defer delete(bounded)
-	for _ in 0 ..< HTTP_MAX_INTERIM_RESPONSES + 1 {
-		append(&bounded, ..transmute([]u8)interim)
-	}
+	// RFC 9110 15.2: a client must be able to parse one or more interim responses
+	// before the final one, and HTTP sets no count. A long run of them is read
+	// through to the response that ends the exchange.
+	many: [dynamic]u8
+	defer delete(many)
+	for _ in 0 ..< 64 { append(&many, "HTTP/1.1 100 Continue\r\n\r\n") }
+	append(&many, "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi")
 	source := new(Slice_Source, context.temp_allocator)
-	source.bytes = bounded[:]
-	loop_reader: Reader
-	reader_init(&loop_reader, slice_read, source, context.temp_allocator)
-	_, loop_headers, loop_err := read_final_response_head(&loop_reader, context.temp_allocator)
-	defer headers_destroy(&loop_headers, context.temp_allocator)
-	testing.expect_value(t, loop_err, Error.Bad_Response)
+	source.bytes = many[:]
+	many_reader: Reader
+	reader_init(&many_reader, slice_read, source, context.temp_allocator)
+	many_status, many_headers, many_err := read_final_response_head(&many_reader, context.temp_allocator)
+	defer headers_destroy(&many_headers, context.temp_allocator)
+	testing.expect_value(t, many_err, Error.None)
+	testing.expect_value(t, many_status, 200)
+}
+
+// A field section is as long as the peer makes it. RFC 9110 5.4 states that HTTP
+// places no predefined limit on a field line, a field value, or a field section as
+// a whole, so a client that refused a long one would fail where every other client
+// succeeds.
+@(test)
+test_a_field_section_has_no_invented_limit :: proc(t: ^testing.T) {
+	value := strings.repeat("v", 200_000, context.temp_allocator)
+	wire: [dynamic]u8
+	defer delete(wire)
+	append(&wire, "HTTP/1.1 200 OK\r\nx-long: ")
+	append(&wire, value)
+	append(&wire, "\r\n")
+	// More field lines than any count a client would think to invent.
+	field: [64]u8
+	for i in 0 ..< 2000 {
+		append(&wire, fmt.bprintf(field[:], "x-f%d: %d\r\n", i, i))
+	}
+	append(&wire, "\r\n")
+
+	// Delivered in pieces, so the growth of the line buffer is what this covers.
+	reader := _reader(string(wire[:]), 4096)
+	status, headers, err := read_response_head(&reader, context.temp_allocator)
+	defer headers_destroy(&headers, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, status, 200)
+	long, found := http.headers_get_unsafe(headers, "x-long")
+	testing.expect(t, found)
+	testing.expect_value(t, len(long), len(value))
+	testing.expect_value(t, http.headers_count(headers), 2001)
 }
 
 @(test)
@@ -297,21 +329,4 @@ test_close_delimited_bodies :: proc(t: ^testing.T) {
 	truncated_collector: Collector
 	defer delete(truncated_collector.buffer)
 	testing.expect_value(t, stream_body(&truncated, truncated_framing, truncated_length, &truncated_collector, collect), Error.Truncated)
-}
-
-// A rejected content type carries a bounded excerpt of the body, so the caller
-// can see whether a 2xx response was an error document instead of a stream.
-@(test)
-test_content_type_detail_excerpts_the_body :: proc(t: ^testing.T) {
-	reader := _reader("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 26\r\n\r\n{\"error\":\"gateway down\"}")
-	detail := content_type_detail(200, "text/event-stream", &reader, context.temp_allocator)
-	defer delete(detail, context.temp_allocator)
-	testing.expect(t, strings.contains(detail, "(HTTP 200)"), detail)
-	testing.expect(t, strings.contains(detail, `{"error":"gateway down"}`), detail)
-
-	long := strings.repeat("x", HTTP_MAX_ERROR_EXCERPT + 100, context.temp_allocator)
-	padded := _reader(strings.concatenate({"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n", long}, context.temp_allocator))
-	padded_detail := content_type_detail(200, "text/event-stream", &padded, context.temp_allocator)
-	defer delete(padded_detail, context.temp_allocator)
-	testing.expect_value(t, len(padded_detail), len("response content-type is not text/event-stream (HTTP 200): ") + HTTP_MAX_ERROR_EXCERPT)
 }

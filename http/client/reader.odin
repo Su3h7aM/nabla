@@ -1,6 +1,12 @@
 package client
 
+import "base:intrinsics"
 import "core:mem"
+
+// READER_INITIAL_BYTES is the buffer's starting size, not a bound: the buffer
+// grows to hold whatever a peer sends, because HTTP sets no limit on the length of
+// a line (RFC 9110 5.4).
+READER_INITIAL_BYTES :: 8192
 
 // Read_Proc fills buffer and reports .Closed once the stream has ended. It is the
 // signature of connection_read.
@@ -24,7 +30,7 @@ reader_init :: proc(reader: ^Reader, read: Read_Proc, user_data: rawptr, allocat
 	reader.read = read
 	reader.user_data = user_data
 	reader.allocator = allocator
-	reader.buffer = make([]u8, 8192, allocator)
+	reader.buffer = make([]u8, READER_INITIAL_BYTES, allocator)
 }
 
 reader_destroy :: proc(reader: ^Reader) {
@@ -39,10 +45,16 @@ reader_fill :: proc(reader: ^Reader) -> Error {
 		reader.head = 0
 	}
 	if reader.tail == len(reader.buffer) {
-		if len(reader.buffer) >= HTTP_MAX_LINE_BYTES { return .Bad_Response }
-		grown_len := min(len(reader.buffer) * 2, HTTP_MAX_LINE_BYTES)
-		if grown_len <= len(reader.buffer) { return .Bad_Response }
-		grown := make([]u8, grown_len, reader.allocator)
+		// The buffer doubles until it holds the line being read. RFC 9112 2.2 requires
+		// a recipient to handle a line of at least 8000 octets and sets no maximum, so
+		// the only size this refuses is one the machine cannot represent.
+		size := READER_INITIAL_BYTES
+		if len(reader.buffer) > 0 {
+			overflowed: bool
+			size, overflowed = intrinsics.overflow_mul(len(reader.buffer), 2)
+			if overflowed { return .Bad_Response }
+		}
+		grown := make([]u8, size, reader.allocator)
 		copy(grown, reader.buffer[:reader.tail])
 		delete(reader.buffer, reader.allocator)
 		reader.buffer = grown

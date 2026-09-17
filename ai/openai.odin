@@ -54,6 +54,42 @@ openai_error_event :: proc(kind: Provider_Error_Kind, message: string, code := "
 	return Provider_Error_Event{Kind = kind, Message = openai_copy_limited(message, allocator), Provider_Code = openai_copy_limited(code, allocator)}
 }
 
+// openai_error_rejection decodes the error document this API returns for a refused
+// request, through the same reader an in-stream error event uses, so a refusal read
+// from a response body and one read from a stream cannot drift apart. The returned
+// strings are owned by allocator.
+openai_error_rejection :: proc(body: []u8, allocator := context.allocator) -> Provider_Rejection {
+	value, object, parsed := provider_error_document(body, allocator)
+	if !parsed { return {} }
+	defer json.destroy_value(value, allocator)
+	event, is_error := openai_parse_api_error(object, allocator)
+	if !is_error { return {} }
+	defer Provider_Event_Destroy(&event, allocator)
+	error_event, is_error_event := event.(Provider_Error_Event)
+	if !is_error_event { return {} }
+	return Provider_Rejection {
+		code = provider_bounded_text(error_event.Provider_Code, PROVIDER_MAX_CODE_BYTES, allocator),
+		message = provider_bounded_text(error_event.Message, PROVIDER_MAX_MESSAGE_BYTES, allocator),
+	}
+}
+
+// openai_failure_class names the meaning this API gives to one of its own error
+// codes. The codes are matched exactly: they are machine-readable tokens the API
+// documents, and a prefix or substring rule would classify codes it never wrote
+// down. An unrecognized code is left to the status that carried it, which is the
+// fallback a compatible endpoint depends on.
+openai_failure_class :: proc(code: string) -> (Provider_Failure_Class, bool) {
+	switch code {
+	case "context_length_exceeded":
+		return .Context_Overflow, true
+	case "insufficient_quota":
+		return .Quota, true
+	case "content_policy_violation":
+		return .Content_Policy, true
+	}
+	return .None, false
+}
+
 openai_parse_api_error :: proc(object: json.Object, allocator := context.allocator) -> (Provider_Event, bool) {
 	raw, present := object["error"]
 	if !present { return nil, false }

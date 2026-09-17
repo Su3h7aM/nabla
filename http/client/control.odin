@@ -10,6 +10,8 @@ package client
 
 import "core:net"
 
+import "nabla:http"
+
 // Wait_Status is why a probe ended. Ready means the request should continue; the
 // other values end it, and Cancelled and Timed_Out stay distinct so a caller
 // never reports one as the other.
@@ -38,12 +40,34 @@ probe_now :: proc(probe: Probe) -> Wait_Status {
 // a value replaces it. TLS verification is always on. Empty nameservers use the
 // system resolver configuration.
 Options :: struct {
-	probe:       Probe,
-	ca_file:     string,
-	nameservers: []net.Endpoint,
+	probe:         Probe,
+	ca_file:       string,
+	nameservers:   []net.Endpoint,
 	// observer, when set, is told once how the transfer ended and how many
 	// plaintext bytes it accepted. A zero observer observes nothing.
-	observer:    Transfer_Observer,
+	observer:      Transfer_Observer,
+	// response_head, when set, is told the final status and its fields, once per
+	// request, after the head was read and before its body. Everything it sees is
+	// borrowed for that call.
+	response_head: Response_Head_Observer,
+}
+
+// Response_Head is what a response head said and what this client decided about
+// it. `usable` is this client's own verdict: a status it will use, and, when the
+// request asked for one, the media type it asked for. A caller that has to read
+// the peer's own account of a refusal knows from it that the body it is about to
+// receive is that account rather than the response it asked for.
+Response_Head :: struct {
+	status: int,
+	usable: bool,
+}
+
+// Response_Head_Observer is told what a response head said. It is separate from
+// Transfer_Observer because it answers a different question: not how the transfer
+// ended, but what the peer had already said while its body was still ahead.
+Response_Head_Observer :: struct {
+	user_data: rawptr,
+	observed:  proc(user_data: rawptr, head: Response_Head, headers: http.Headers),
 }
 
 // Transfer_Phase is where a request stopped. Complete means the response body

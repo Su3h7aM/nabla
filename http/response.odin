@@ -220,7 +220,7 @@ _response_write_heading :: proc(r: ^Response, content_length: int) {
 	conn := r._conn
 	b := &r._buf
 
-	MIN :: len("HTTP/1.1 200 \r\ndate: \r\ncontent-length: 1000\r\n") + DATE_LENGTH
+	MIN :: len("HTTP/1.1 200 \r\ndate: \r\ncontent-length: 1000\r\n") + HTTP_DATE_LENGTH
 	AVG_HEADER_SIZE :: 20
 	reserve_size := MIN + content_length + (AVG_HEADER_SIZE * headers_count(r.headers))
 	bytes.buffer_grow(&r._buf, reserve_size)

@@ -55,12 +55,17 @@ Fixture_Phase :: enum {
 	// Send the same body with a declared length, which is the only way a head
 	// states how much body follows.
 	Declared,
+	// Send exactly the response the test wrote, then close with close_notify. It is
+	// how a refusal and its fields are exercised without a second server.
+	Custom,
 }
 
 Transport_Fixture :: struct {
 	phase:          Fixture_Phase,
 	cert:           string,
 	key:            string,
+	// response is what the Custom phase writes, byte for byte.
+	response:       string,
 	listener:       net.TCP_Socket,
 	port:           int,
 	// request holds what the client sent, so a test can assert on the fields the
@@ -76,11 +81,12 @@ Transport_Fixture :: struct {
 	failed:         bool,
 }
 
-transport_fixture_start :: proc(t: ^testing.T, fixture: ^Transport_Fixture, phase: Fixture_Phase, cert, key: string) -> bool {
+transport_fixture_start :: proc(t: ^testing.T, fixture: ^Transport_Fixture, phase: Fixture_Phase, cert, key: string, response := "") -> bool {
 	fixture^ = Transport_Fixture {
-		phase = phase,
-		cert  = cert,
-		key   = key,
+		phase    = phase,
+		cert     = cert,
+		key      = key,
+		response = response,
 	}
 	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
 	if listen_err != nil {
@@ -198,6 +204,9 @@ transport_fixture_serve :: proc(thread: ^thread.Thread) {
 		)
 		transport_fixture_write(ssl, TRANSPORT_RESPONSE_BODY)
 		_ = client.SSL_shutdown(ssl)
+	case .Custom:
+		transport_fixture_write(ssl, fixture.response)
+		_ = client.SSL_shutdown(ssl)
 	}
 }
 
@@ -298,7 +307,7 @@ transport_job_join :: proc(job: ^Transport_Job) {
 }
 
 transport_job_destroy :: proc(job: ^Transport_Job, allocator: mem.Allocator) {
-	if job.error.detail != "" { delete(job.error.detail, allocator) }
+	Provider_Operation_Error_Destroy(&job.error, allocator)
 	if job.endpoint != "" { delete(job.endpoint, allocator) }
 	if job.messages != nil { delete(job.messages, allocator) }
 	if job.nameservers != nil { delete(job.nameservers, allocator) }
@@ -588,6 +597,163 @@ test_dns_retires_stalled_resolution :: proc(t: ^testing.T) {
 		testing.expect_value(t, job.completions, 0)
 		testing.expectf(t, elapsed < TRANSPORT_RETIRE_BOUND, "retirement took %v, above the %v bound", elapsed, TRANSPORT_RETIRE_BOUND)
 	}
+}
+
+// --- provider refusals -------------------------------------------------------
+
+// refusal_response builds a response with the fields a refusal carries, so a test
+// writes only the part it is about. extra_fields ends every line it names with CRLF.
+// The response is built in the test's own temporary memory: it has to outlive the
+// request the fixture answers, and no longer.
+refusal_response :: proc(status, content_type, extra_fields, body: string) -> string {
+	return fmt.aprintf(
+		"HTTP/1.1 %s\r\ncontent-type: %s\r\ncontent-length: %d\r\n%s\r\n%s",
+		status,
+		content_type,
+		len(body),
+		extra_fields,
+		body,
+		allocator = context.temp_allocator,
+	)
+}
+
+// transport_refusal_once performs one request against a fixture that answers with
+// exactly `response`, and leaves the attempt in job and observed. The fixture is
+// started and stopped here, so the caller owns only what it named.
+transport_refusal_once :: proc(t: ^testing.T, response: string, job: ^Transport_Job, observed: ^Transport_Observation) -> bool {
+	fixture: Transport_Fixture
+	if !transport_fixture_start(t, &fixture, .Custom, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST, response) {
+		return false
+	}
+	defer transport_fixture_stop(&fixture)
+
+	if !transport_job_init(t, job, "localhost", fixture.port, TRANSPORT_CA) { return false }
+	job.options.observer = {
+		user_data = observed,
+		report    = transport_observation_report,
+	}
+	transport_job_start(job)
+	transport_job_join(job)
+	return true
+}
+
+// A 429 that names a quota is a quota failure, not throttling, and everything the
+// response said about the refusal survives to the operation's error. The body
+// itself reaches the caller's callback, because keeping it is the caller's policy
+// and not a transport one.
+@(test)
+test_a_quota_refusal_keeps_its_evidence :: proc(t: ^testing.T) {
+	body := `{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}`
+	fields := "x-request-id: req_quota\r\nretry-after: 7\r\nx-should-retry: false\r\n"
+
+	job: Transport_Job
+	observed: Transport_Observation
+	if !transport_refusal_once(t, refusal_response("429 Too Many Requests", "application/json", fields, body), &job, &observed) {
+		return
+	}
+	defer transport_job_destroy(&job, job.allocator)
+
+	testing.expect_value(t, job.error.kind, Provider_Operation_Error_Kind.HTTP)
+	testing.expect_value(t, job.error.status, 429)
+	testing.expect_value(t, job.error.failure_class, Provider_Failure_Class.Quota)
+	testing.expect_value(t, job.error.provider_code, "insufficient_quota")
+	testing.expect_value(t, job.error.provider_request_id, "req_quota")
+	testing.expect_value(t, job.error.retry_directive, Provider_Retry_Directive.Forbid)
+	if delay, present := job.error.retry_after.?; testing.expect(t, present, "the provider asked for a delay") {
+		testing.expect_value(t, delay, 7 * time.Second)
+	}
+	// The provider's own words are the reason, so they are what the failure carries.
+	testing.expect(t, strings.contains(job.error.detail, "exceeded your current quota"), job.error.detail)
+	// The transport's own account of the attempt is an independent fact from all of
+	// the above, and it is collected whether or not diagnostics are on.
+	testing.expect(t, job.error.transfer_present)
+	testing.expect_value(t, job.error.transfer.status, 429)
+	testing.expect_value(t, job.error.transfer.stopped_at, Provider_Transfer_Phase.Response_Body)
+	testing.expect_value(t, observed.chunk_bytes, len(body))
+	testing.expect_value(t, job.texts, 0)
+	testing.expect_value(t, job.completions, 0)
+}
+
+// A 429 with nothing in it is throttling, and a provider that says nothing about a
+// delay gets no delay invented for it.
+@(test)
+test_a_rate_limit_without_a_code_is_throttling :: proc(t: ^testing.T) {
+	body := `{"error":{"message":"Rate limit reached"}}`
+
+	job: Transport_Job
+	observed: Transport_Observation
+	if !transport_refusal_once(t, refusal_response("429 Too Many Requests", "application/json", "", body), &job, &observed) {
+		return
+	}
+	defer transport_job_destroy(&job, job.allocator)
+
+	testing.expect_value(t, job.error.kind, Provider_Operation_Error_Kind.HTTP)
+	testing.expect_value(t, job.error.failure_class, Provider_Failure_Class.Rate_Limited)
+	testing.expect_value(t, job.error.provider_code, "")
+	testing.expect_value(t, job.error.retry_directive, Provider_Retry_Directive.Unspecified)
+	testing.expect(t, job.error.retry_after == nil, "a provider that asked for no delay must report none")
+}
+
+// A rejected credential identifies itself without the status that carried it.
+@(test)
+test_an_authentication_refusal_names_itself :: proc(t: ^testing.T) {
+	body := `{"error":{"message":"Incorrect API key provided","code":"invalid_api_key"}}`
+
+	job: Transport_Job
+	observed: Transport_Observation
+	if !transport_refusal_once(t, refusal_response("401 Unauthorized", "application/json", "", body), &job, &observed) {
+		return
+	}
+	defer transport_job_destroy(&job, job.allocator)
+
+	testing.expect_value(t, job.error.kind, Provider_Operation_Error_Kind.HTTP)
+	testing.expect_value(t, job.error.status, 401)
+	testing.expect_value(t, job.error.failure_class, Provider_Failure_Class.Authentication)
+}
+
+// A 2xx that is not the stream the request asked for is still a refusal, and the
+// body of it is the provider's error document. No non-200 status is invented for
+// it: the code it wrote is what classifies it.
+@(test)
+test_a_200_error_document_is_classified_by_its_code :: proc(t: ^testing.T) {
+	body := `{"error":{"message":"This model's maximum context length is 8192 tokens","code":"context_length_exceeded"}}`
+
+	job: Transport_Job
+	observed: Transport_Observation
+	if !transport_refusal_once(t, refusal_response("200 OK", "application/json", "", body), &job, &observed) {
+		return
+	}
+	defer transport_job_destroy(&job, job.allocator)
+
+	testing.expect_value(t, job.error.kind, Provider_Operation_Error_Kind.Stream)
+	testing.expect_value(t, job.error.status, 200)
+	testing.expect_value(t, job.error.failure_class, Provider_Failure_Class.Context_Overflow)
+	testing.expect_value(t, job.error.provider_code, "context_length_exceeded")
+	testing.expect_value(t, observed.chunk_bytes, len(body))
+	testing.expect_value(t, job.completions, 0)
+}
+
+// A stream that framed cleanly but never reached its terminal event is incomplete,
+// which is a different fact from a connection that broke: the text it did deliver
+// is real, and it is what an automatic retry must not repeat.
+@(test)
+test_an_unfinished_stream_is_incomplete :: proc(t: ^testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n"
+
+	job: Transport_Job
+	observed: Transport_Observation
+	if !transport_refusal_once(t, refusal_response("200 OK", "text/event-stream", "", body), &job, &observed) {
+		return
+	}
+	defer transport_job_destroy(&job, job.allocator)
+
+	testing.expect_value(t, job.error.kind, Provider_Operation_Error_Kind.Stream)
+	testing.expect_value(t, job.error.failure_class, Provider_Failure_Class.Incomplete_Stream)
+	testing.expect_value(t, job.error.transport_cause, Provider_Transport_Cause.None)
+	testing.expect(t, job.error.transfer_present)
+	testing.expect_value(t, job.error.transfer.stopped_at, Provider_Transfer_Phase.Complete)
+	testing.expect_value(t, job.texts, 1)
+	testing.expect_value(t, job.completions, 0)
 }
 
 // Authentication is provider policy built from the connection. A credential

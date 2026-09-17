@@ -325,12 +325,11 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		log_emit({level = .Warning, category = .Provider, event = "request.retry", fields = retry[:]})
 		if !chat_retry_wait(chat, delay) { break }
 		chat_session_clear_attempt(chat)
-		delete(operation_error.detail, chat.allocator)
-		operation_error = {}
+		ai.Provider_Operation_Error_Destroy(&operation_error, chat.allocator)
 	}
 	chat.request_attempts = attempts
-	// The error owns its detail, and every path out of the request releases it.
-	defer delete(operation_error.detail, chat.allocator)
+	// The error owns its evidence, and every path out of the request releases it.
+	defer ai.Provider_Operation_Error_Destroy(&operation_error, chat.allocator)
 	_observer_assistant_flush(observer)
 
 	// Cancellation is the reason the turn ended, so it wins over any error the
