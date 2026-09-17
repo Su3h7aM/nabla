@@ -6,20 +6,24 @@ package agent
 // model_capacity, while the catalog is resolved. Nothing downstream recomputes the
 // window arithmetic, so no two features can disagree about what a model can hold.
 //
-// A model's window is shared between what a request sends and what it may
-// generate, so it is divided once:
+// A model's window is shared between what a request sends and what it may generate, so
+// it is divided once:
 //
-//	window   the model's stated context window, or the assumed default
-//	output   what one request may generate
-//	margin   what the estimator's error may cost
-//	usable   the largest input the harness will send
+//	window            the model's stated context window, or the assumed default
+//	model_max_output  what the model states it can generate
+//	output            what an ordinary request asks for
+//	margin            what the estimator's error may cost
+//	usable            the largest input the harness will send
 //
-// with usable = window - output - margin.
+// with usable = window - output - margin. A summarization request asks for more output
+// than `output`, and chat_compact_summary_output derives that bound from the same
+// record rather than from a second copy of these numbers.
 Model_Capacity :: struct {
-	window: int,
-	output: int,
-	margin: int,
-	usable: int,
+	window:           int,
+	model_max_output: int,
+	output:           int,
+	margin:           int,
+	usable:           int,
 }
 
 // CHAT_DEFAULT_CONTEXT_WINDOW is the window assumed for a model that no
@@ -40,15 +44,28 @@ CHAT_DEFAULT_OUTPUT_TOKENS :: 4096
 // thinking.
 CHAT_OUTPUT_MAX_TOKENS :: 32 * 1024
 
-// CHAT_OUTPUT_WINDOW_PERCENT is the share of the window one request may reserve for
-// its own output. A request whose output bound leaves no room for input cannot be
-// sent at all, so the larger part of the window is always kept for input.
-CHAT_OUTPUT_WINDOW_PERCENT :: 25
+// CHAT_OUTPUT_WINDOW_MIN_PERCENT and CHAT_OUTPUT_WINDOW_MAX_PERCENT bound the share of
+// the window an ordinary request may reserve for its own output, and
+// CHAT_OUTPUT_WINDOW_RAMP_TOKENS is the window at which that share reaches its maximum.
+// The share grows with the window because input is the scarce resource on a small one:
+// a constant share made a 32K window give up a quarter of itself for output while a
+// megatoken window gave up a thirtieth, which is the wrong way round.
+CHAT_OUTPUT_WINDOW_MIN_PERCENT :: 12
+CHAT_OUTPUT_WINDOW_MAX_PERCENT :: 25
+CHAT_OUTPUT_WINDOW_RAMP_TOKENS :: 256 * 1024
 
 // CHAT_OUTPUT_MIN_TOKENS keeps a window too small to have a share of its own from
 // asking for an output bound too small to answer with. The model's own maximum still
 // wins, because a request never asks for more than the model allows.
 CHAT_OUTPUT_MIN_TOKENS :: 1024
+
+// chat_output_window_percent is that share at one window size: the smallest at nothing,
+// rising to the largest at the ramp's end.
+chat_output_window_percent :: proc(window: int) -> int {
+	ramp := min(window, CHAT_OUTPUT_WINDOW_RAMP_TOKENS)
+	span := CHAT_OUTPUT_WINDOW_MAX_PERCENT - CHAT_OUTPUT_WINDOW_MIN_PERCENT
+	return CHAT_OUTPUT_WINDOW_MIN_PERCENT + span * ramp / CHAT_OUTPUT_WINDOW_RAMP_TOKENS
+}
 
 // CHAT_MARGIN_PERCENT and CHAT_MARGIN_MIN_TOKENS bound what the estimator's error
 // may cost. The estimate divides characters by CHAT_CHARS_PER_TOKEN, which holds for
@@ -62,7 +79,7 @@ CHAT_MARGIN_MIN_TOKENS :: 1024
 // a stated one is used as stated, including an explicit zero, which admission then
 // refuses rather than quietly running with the default.
 //
-// The output bound is the smallest of three limits, each answering a different
+// The ordinary output bound is the smallest of three limits, each answering a different
 // question: what the model allows, what the harness will ask for, and what the window
 // can spare for one request's own output.
 model_capacity :: proc(model: Catalog_Model) -> Model_Capacity {
@@ -70,18 +87,26 @@ model_capacity :: proc(model: Catalog_Model) -> Model_Capacity {
 	if !model.context_window_present { window = CHAT_DEFAULT_CONTEXT_WINDOW }
 	if window <= 0 { return {} }
 
-	output := model.max_output_tokens
-	if !model.max_output_tokens_present || output <= 0 { output = CHAT_DEFAULT_OUTPUT_TOKENS }
-	share := max(window * CHAT_OUTPUT_WINDOW_PERCENT / 100, CHAT_OUTPUT_MIN_TOKENS)
-	output = min(output, CHAT_OUTPUT_MAX_TOKENS, share)
+	stated := model.max_output_tokens
+	if !model.max_output_tokens_present || stated <= 0 { stated = CHAT_DEFAULT_OUTPUT_TOKENS }
+	share := max(window * chat_output_window_percent(window) / 100, CHAT_OUTPUT_MIN_TOKENS)
+	ordinary := min(stated, CHAT_OUTPUT_MAX_TOKENS, share)
 
 	margin := max(window * CHAT_MARGIN_PERCENT / 100, CHAT_MARGIN_MIN_TOKENS)
-	return {window = window, output = output, margin = margin, usable = max(window - output - margin, 0)}
+	return {window = window, model_max_output = stated, output = ordinary, margin = margin, usable = max(window - ordinary - margin, 0)}
 }
 
-// model_capacity_admits reports whether an input of this size fits. It is the one
-// predicate admission and the compaction thresholds answer with, so a request the
-// harness will send and a context it considers full are the same size.
+// model_capacity_admits_output reports whether an input fits when the request reserves
+// this much for its own output. A summarization request carries a bound of its own, so
+// admission cannot assume one output bound for every request.
+model_capacity_admits_output :: proc(capacity: Model_Capacity, estimate, output: int) -> bool {
+	return capacity.window > 0 && estimate + output + capacity.margin <= capacity.window
+}
+
+// model_capacity_admits is the ordinary case: the request reserves what the capacity
+// set aside for output. It is the one predicate admission and the compaction trigger
+// answer with, so a request the harness will send and a context it considers full are
+// the same size.
 model_capacity_admits :: proc(capacity: Model_Capacity, estimate: int) -> bool {
-	return capacity.window > 0 && estimate <= capacity.usable
+	return model_capacity_admits_output(capacity, estimate, capacity.output)
 }

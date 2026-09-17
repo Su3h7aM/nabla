@@ -95,15 +95,14 @@ Chat_Request_Error :: struct {
 	message: string `json:"message"`,
 }
 
-// chat_request_config_json describes the settings a request is sent with. One shape
-// serves every request because every request carries the same settings: a
-// summarization request is the conversation's own request with a directive appended,
-// which is what lets the summarizer read the conversation's cached prefix.
+// chat_request_config_json describes the settings a request is sent with. output is the
+// bound the request itself carries, not the capacity's ordinary one, because a
+// summarization request asks for more and the record has to say what was asked.
 @(private)
-chat_request_config_json :: proc(chat: ^Chat_Session) -> string {
+chat_request_config_json :: proc(chat: ^Chat_Session, output: int) -> string {
 	config := Chat_Request_Config{}
 	config.effort = chat.effort
-	if chat.capacity.output > 0 { config.max_output_tokens = i64(chat.capacity.output) }
+	if output > 0 { config.max_output_tokens = i64(output) }
 	data, marshal_err := json.marshal(config, allocator = context.temp_allocator)
 	if marshal_err != nil { return "{}" }
 	return string(data)

@@ -215,7 +215,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 			provider = chat.provider_id,
 			model_requested = chat.model_id,
 			api = chat_api_name(connection.API),
-			config_json = chat_request_config_json(chat),
+			config_json = chat_request_config_json(chat, prep.request.Max_Output_Tokens),
 			input_json = chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries)),
 		},
 		at_ms,

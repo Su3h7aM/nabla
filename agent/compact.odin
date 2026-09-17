@@ -421,6 +421,32 @@ chat_compact_retry_allowed :: proc(control: ^Compact_Control, trigger: Compact_T
 	return session.now_ms() - control.last_failure_at_ms >= CHAT_COMPACT_RETRY_DELAY_MS
 }
 
+// CHAT_COMPACT_SUMMARY_MIN_TOKENS is the smallest summary bound worth asking for. A
+// summary the model cannot finish inside its bound is worth nothing, because a cut-off
+// checkpoint is not installed, so a request that cannot hold a usable one is refused
+// rather than sent.
+CHAT_COMPACT_SUMMARY_MIN_TOKENS :: 1024
+
+// chat_compact_summary_output is the output bound a summarization request is given:
+// the room the window has left once the prefix is charged, bounded by what the model
+// allows and by a share of the window.
+//
+// It is not the bound an ordinary answer gets, because a summary is not an ordinary
+// answer. It is the artifact, and it must be complete or the prefix it stands for is
+// lost. Taking whatever room is left is also what keeps a large prefix summarizable:
+// a fixed bound would refuse the request exactly when the context most needs it.
+//
+// A summarization request therefore reserves more output than the capacity set aside
+// for an ordinary response, which is why admission cannot assume one bound for every
+// request. It cannot exceed half the window, so input always keeps the larger part.
+chat_compact_summary_output :: proc(capacity: Model_Capacity, prefix_estimate: int) -> (output: int, fits: bool) {
+	room := capacity.window - prefix_estimate - capacity.margin
+	ceiling := min(capacity.model_max_output, CHAT_OUTPUT_MAX_TOKENS, capacity.window / 2)
+	output = min(room, ceiling)
+	if output < CHAT_COMPACT_SUMMARY_MIN_TOKENS { return 0, false }
+	return output, true
+}
+
 // chat_compact_start freezes the compaction request for the context that prep was
 // built from and runs it on its own thread. The covered boundary is the end of the
 // prefix being summarized, so everything after it stays live.
@@ -450,12 +476,17 @@ chat_compact_start :: proc(
 	chat_build_request_into(chat, &compact_prep, entries[:seam], prep.history.dispatches, prep.history.summary, connection, CHAT_COMPACT_DIRECTIVE)
 	defer chat_request_prep_destroy(&compact_prep, chat.allocator)
 
-	// A summary is only useful if the request that asks for it can be sent. It carries
-	// the same output bound as any other request, so the same capacity decides it.
-	if !model_capacity_admits(chat.capacity, compact_prep.estimate) {
+	// A summary is the artifact this request exists to produce, so it is given the room
+	// the window has left rather than the bound an ordinary answer is given. The estimate
+	// does not depend on the output bound, which is why the bound can be chosen from it
+	// after the build rather than before.
+	summary_output, summarizable := chat_compact_summary_output(chat.capacity, compact_prep.estimate)
+	if !summarizable {
 		_observer_message(observer, .Warning, "the active context is too large to compact in one request; start a fresh session for a new topic")
 		return false
 	}
+	compact_prep.request.Max_Output_Tokens_Present = true
+	compact_prep.request.Max_Output_Tokens = summary_output
 
 	at_ms := session.now_ms()
 	request_no, begin_err := session.request_begin(
@@ -467,7 +498,7 @@ chat_compact_start :: proc(
 			provider = chat.provider_id,
 			model_requested = chat.model_id,
 			api = chat_api_name(connection.API),
-			config_json = chat_request_config_json(chat),
+			config_json = chat_request_config_json(chat, compact_prep.request.Max_Output_Tokens),
 			input_json = chat_request_input_json(&compact_prep, &prep.history, chat.skill_snapshot_seq, seam),
 		},
 		at_ms,

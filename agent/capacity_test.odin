@@ -50,17 +50,67 @@ test_the_output_reservation_never_takes_the_window :: proc(t: ^testing.T) {
 	// it whole is what starved a 32K window: the model states an 8K maximum, and the
 	// harness reserved 8K of output plus a fixed 8K margin before admitting any input.
 	capacity := capacity_of(32_000, 8_000)
-	testing.expect_value(t, capacity.output, 8_000)
+	testing.expect_value(t, capacity.model_max_output, 8_000)
+	testing.expect_value(t, capacity.output, 4_160)
 	testing.expect_value(t, capacity.margin, 3_200)
-	testing.expect_value(t, capacity.usable, 20_800)
+	testing.expect_value(t, capacity.usable, 24_640)
 	testing.expect(t, capacity.usable > 16_236, "the estimate that was refused now fits")
 
 	// A model whose maximum output is its whole window cannot reserve all of it, or
 	// there would be nothing left to send.
 	whole := capacity_of(64_000, 64_000)
-	testing.expect_value(t, whole.output, 16_000)
+	testing.expect_value(t, whole.output, 9_600)
 	testing.expect(t, whole.usable > 0)
 	testing.expect(t, whole.output + whole.margin + whole.usable == whole.window)
+}
+
+@(test)
+test_a_small_window_claims_less_of_what_the_model_can_generate :: proc(t: ^testing.T) {
+	// A constant share of the window made a small one claim the model's whole capability:
+	// an 8K maximum against a 32K window reserved all 8000 of it, while the same model on
+	// a megatoken window would have reserved a fraction. The share grows with the window
+	// so that what a request claims of the model's maximum grows with it too.
+	small := capacity_of(32_000, 128 * 1_024)
+	large := capacity_of(1_000_000, 128 * 1_024)
+	testing.expect(t, small.output * 100 / small.model_max_output < large.output * 100 / large.model_max_output)
+
+	// A model that states a small maximum still has it claimed whole, because a share
+	// never raises what the model allows.
+	modest := capacity_of(32_000, 2_048)
+	testing.expect_value(t, modest.output, 2_048)
+
+	// The share only rises, so a bigger window never asks for proportionally less.
+	previous := 0
+	for window in ([]int{8_000, 32_000, 64_000, 128_000, 256_000, 1_000_000}) {
+		percent := chat_output_window_percent(window)
+		testing.expect(t, percent >= previous)
+		previous = percent
+		testing.expect(t, percent >= CHAT_OUTPUT_WINDOW_MIN_PERCENT)
+		testing.expect(t, percent <= CHAT_OUTPUT_WINDOW_MAX_PERCENT)
+	}
+}
+
+@(test)
+test_a_summarization_request_takes_the_room_that_is_left :: proc(t: ^testing.T) {
+	capacity := capacity_of(32_000, 8_000)
+
+	// A prefix with room to spare gets the ceiling, which is what makes a summary
+	// complete rather than cut off.
+	roomy, roomy_fits := chat_compact_summary_output(capacity, 8_000)
+	testing.expect(t, roomy_fits)
+	testing.expect_value(t, roomy, capacity.model_max_output)
+	testing.expect(t, roomy > capacity.output, "a summary is given more than an answer")
+
+	// A prefix with little room left still compacts, on a smaller bound, rather than
+	// being refused exactly when the context most needs it.
+	tight, tight_fits := chat_compact_summary_output(capacity, 22_000)
+	testing.expect(t, tight_fits)
+	testing.expect(t, tight < roomy)
+	testing.expect(t, model_capacity_admits_output(capacity, 22_000, tight))
+
+	// A prefix that leaves no usable room is the one case that cannot be summarized.
+	_, impossible := chat_compact_summary_output(capacity, capacity.window)
+	testing.expect(t, !impossible)
 }
 
 @(test)

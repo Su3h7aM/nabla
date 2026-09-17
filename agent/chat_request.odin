@@ -152,9 +152,10 @@ chat_build_request_into :: proc(
 	// conversation's prefix.
 	prep.request.Prompt_Cache_Key_Present = true
 	prep.request.Prompt_Cache_Key = string(chat.id)
-	// Every request carries the model's own output bound, including a summarization
-	// request: the budget that reserved room for it is the budget it spends, so the
-	// two cannot disagree about how much of the window is left for input.
+	// Every request carries a bound on what it may generate. This is the ordinary one,
+	// which is also what the capacity reserved room for; a summarization request is given
+	// a larger bound from the same capacity, because its output is the artifact rather
+	// than an answer, and it sets that bound after this build.
 	if chat.capacity.output > 0 {
 		prep.request.Max_Output_Tokens_Present = true
 		prep.request.Max_Output_Tokens = chat.capacity.output
