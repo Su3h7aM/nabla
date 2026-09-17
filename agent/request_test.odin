@@ -767,7 +767,7 @@ test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
 	}
 	if !testing.expect_value(t, tool_registry_add(&chat.tools, rogue).kind, Tool_Registry_Error_Kind.None) { return }
 
-	recorded := chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries), false)
+	recorded := chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries))
 	tools := request_record_tools(t, recorded)
 	if !testing.expect_value(t, len(tools), len(TOOL_NATIVE)) { return }
 	previous := ""
@@ -797,35 +797,4 @@ test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
 		instructions = string(text)
 	}
 	testing.expect_value(t, instructions, prep.request.Instructions)
-}
-
-// A summarization request carries instructions instead of the agent prompt and
-// no tools, because a summary must be text.
-@(test)
-test_compaction_record_carries_no_tools :: proc(t: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
-	chat := &fixture.chat
-	chat.tools_enabled = true
-	_test_accept(t, chat, "hi")
-
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
-	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
-	defer chat_request_prep_destroy(&prep, chat.allocator)
-
-	compact_prep: Chat_Request_Prep
-	chat_build_request_into(chat, &compact_prep, prep.history.entries, prep.history.dispatches, prep.history.summary, tool_loop_connection, true)
-	defer chat_request_prep_destroy(&compact_prep, chat.allocator)
-
-	recorded := chat_request_input_json(&compact_prep, &prep.history, nil, len(prep.history.entries), true)
-	tools := request_record_tools(t, recorded)
-	testing.expect_value(t, len(tools), 0)
-
-	value, parse_err := json.parse_string(recorded, .JSON, true, context.temp_allocator)
-	if parse_err != nil { testing.fail_now(t, "the input record is not valid JSON") }
-	defer json.destroy_value(value, context.temp_allocator)
-	record, _ := value.(json.Object)
-	instructions, _ := record["instructions"].(json.String)
-	testing.expect_value(t, string(instructions), CHAT_COMPACT_INSTRUCTIONS)
 }

@@ -28,7 +28,6 @@ Chat_Request_Prep :: struct {
 	tool_names: [dynamic]string, // owned wire names referenced by tools and calls,
 	calls:      [dynamic][dynamic]ai.Provider_Tool_Call,
 	feedback:   [dynamic]string, // owned; what a refused call is said to be,
-	cache_key:  string, // owned; request.Prompt_Cache_Key borrows it when present,
 	estimate:   int,
 }
 
@@ -42,7 +41,6 @@ chat_request_prep_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Alloc
 	delete(prep.wire)
 	for text in prep.feedback { delete(text, allocator) }
 	delete(prep.feedback)
-	delete(prep.cache_key, allocator)
 	prep^ = {}
 }
 
@@ -54,14 +52,32 @@ chat_prepare :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection) ->
 	ctx, context_err := session.context_load(chat.store, chat.id, chat.allocator)
 	if context_err != nil { return {}, context_err }
 	prep.history = ctx
-	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, connection, false)
+	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, connection, "")
 	return prep, nil
 }
 
+// chat_rebuild_prep replaces prep with a request built from the context as it is
+// now. It is how a request is rebuilt after the active context changed under it,
+// such as when a finished compaction was installed. False leaves prep destroyed
+// and the caller with nothing to send.
+@(private)
+chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, prep: ^Chat_Request_Prep) -> bool {
+	chat_request_prep_destroy(prep, chat.allocator)
+	ctx, context_err := session.context_load(chat.store, chat.id, chat.allocator)
+	if context_err != nil {
+		chat_session_record_failure(chat, "the context could not be read again", context_err)
+		return false
+	}
+	prep.history = ctx
+	chat_build_request_into(chat, prep, ctx.entries, ctx.dispatches, ctx.summary, connection, "")
+	return true
+}
+
 // chat_build_request_into assembles a request from an explicit span of stored
-// entries and the summary that precedes it. compact selects the summarization
-// request, which carries instructions instead of the agent prompt and no tools,
-// because a summary must be text.
+// entries and the summary that precedes it. directive, when not empty, is
+// appended as the final user message: that is how a compaction request asks for a
+// summary while carrying the same instructions, tools, and cache identity as the
+// conversation it is summarizing, so the provider prefix it reads is the warm one.
 @(private)
 chat_build_request_into :: proc(
 	chat: ^Chat_Session,
@@ -70,21 +86,19 @@ chat_build_request_into :: proc(
 	dispatches: []session.Entry,
 	summary: string,
 	connection: ai.Provider_Connection,
-	compact: bool,
+	directive: string,
 ) {
-	prep.wire = make([dynamic]ai.Provider_Message, 0, len(entries) + 2, chat.allocator)
+	compact := directive != ""
+	prep.wire = make([dynamic]ai.Provider_Message, 0, len(entries) + 3, chat.allocator)
 	prep.tools = make([dynamic]ai.Provider_Tool_Def, 0, chat.allocator)
 	prep.tool_names = make([dynamic]string, 0, chat.allocator)
 	prep.calls = make([dynamic][dynamic]ai.Provider_Tool_Call, 0, chat.allocator)
 	prep.feedback = make([dynamic]string, 0, chat.allocator)
 
 	// The instruction lane is the most stable content a request carries, so it
-	// travels beside the conversation rather than as a turn inside it. A
-	// summarization request states what a summary is, not what the agent is.
+	// travels beside the conversation rather than as a turn inside it.
 	instructions := ""
-	if compact {
-		instructions = CHAT_COMPACT_INSTRUCTIONS
-	} else if chat.tools_enabled {
+	if chat.tools_enabled {
 		instructions = chat.skill_instructions if chat.skill_instructions != "" else AGENT_SYSTEM_PROMPT
 	} else if chat.skill_instructions != "" {
 		instructions = chat.skill_instructions
@@ -96,6 +110,9 @@ chat_build_request_into :: proc(
 		append(&prep.wire, ai.Provider_Message{Role = .User, Content = summary})
 	}
 	chat_append_entries(&prep.wire, &prep.calls, &prep.tool_names, &prep.feedback, connection.API, entries, dispatches, chat.allocator)
+	if compact {
+		append(&prep.wire, ai.Provider_Message{Role = .User, Content = directive})
+	}
 
 	prep.request = ai.Provider_Request {
 		API                  = connection.API,
@@ -122,43 +139,35 @@ chat_build_request_into :: proc(
 	// self-contained rather than dependent on server-side state.
 	prep.request.Store_Response_Present = true
 	prep.request.Store_Response = false
-	// The conversation is worth caching because later requests reuse its prefix.
-	// A summarization is not: its content is one-off, so a cache write would pay a
-	// premium for something nothing reads back.
+	// The conversation is worth caching because later requests reuse its prefix,
+	// including a compaction request, which reads that prefix to summarize it.
 	prep.request.Cache_Request_Present = true
-	prep.request.Cache_Request = !compact
+	prep.request.Cache_Request = true
 	// The session id is the cache identity: stable for the session's life, so
 	// related requests route together and account together. On Responses the
 	// implicit breakpoint advances through the newest eligible boundary on its
 	// own; on both APIs the key is the routing hint for models that need one. A
-	// summarization request carries a different identity, so it neither reuses
-	// nor displaces the conversation's cache accounting.
+	// compaction request shares the conversation's identity because it shares the
+	// conversation's prefix.
 	prep.request.Prompt_Cache_Key_Present = true
-	if compact {
-		prep.cache_key = strings.concatenate({string(chat.id), ":summary"}, chat.allocator)
-		prep.request.Prompt_Cache_Key = prep.cache_key
-	} else {
-		prep.request.Prompt_Cache_Key = string(chat.id)
-	}
+	prep.request.Prompt_Cache_Key = string(chat.id)
 	if compact {
 		prep.request.Max_Output_Tokens_Present = true
 		prep.request.Max_Output_Tokens = CHAT_COMPACT_MAX_OUTPUT
-	} else {
-		if chat.max_output_tokens > 0 {
-			prep.request.Max_Output_Tokens_Present = true
-			prep.request.Max_Output_Tokens = chat.max_output_tokens
+	} else if chat.max_output_tokens > 0 {
+		prep.request.Max_Output_Tokens_Present = true
+		prep.request.Max_Output_Tokens = chat.max_output_tokens
+	}
+	if chat.effort != "" {
+		prep.request.Reasoning_Effort_Present = true
+		prep.request.Reasoning_Effort = chat.effort
+	}
+	if chat.tools_enabled {
+		for &definition in chat.tools.definitions {
+			wire_name := chat_tool_wire_name(&prep.tool_names, definition.name, chat.allocator)
+			append(&prep.tools, ai.Provider_Tool_Def{Name = wire_name, Description = definition.description, Parameters_JSON = definition.input_schema})
 		}
-		if chat.effort != "" {
-			prep.request.Reasoning_Effort_Present = true
-			prep.request.Reasoning_Effort = chat.effort
-		}
-		if chat.tools_enabled {
-			for &definition in chat.tools.definitions {
-				wire_name := chat_tool_wire_name(&prep.tool_names, definition.name, chat.allocator)
-				append(&prep.tools, ai.Provider_Tool_Def{Name = wire_name, Description = definition.description, Parameters_JSON = definition.input_schema})
-			}
-			prep.request.Tools = prep.tools[:]
-		}
+		prep.request.Tools = prep.tools[:]
 	}
 	prep.estimate = chat_estimate_input_tokens(instructions, prep.wire[:], prep.tools[:])
 }

@@ -44,6 +44,34 @@ Chat_Request_Response :: struct {
 	attempts: int `json:"attempts"`,
 }
 
+// CHAT_COMPACTION_RESPONSE_VERSION versions the record of a summarization's
+// result. The summary is stored here and nowhere else until a checkpoint installs
+// it, so a request that completed and produced a checkpoint that was never
+// installed is legible after the fact.
+CHAT_COMPACTION_RESPONSE_VERSION :: 1
+
+@(private)
+Chat_Compaction_Response :: struct {
+	format_version: u32 `json:"format_version"`,
+	summary:        string `json:"summary"`,
+	base_seq:       Maybe(i64) `json:"base_seq"`,
+	covered_seq:    i64 `json:"covered_seq"`,
+}
+
+// chat_compaction_response_json records what a summarization produced. The result is
+// temp-allocated, because the caller stores it immediately.
+chat_compaction_response_json :: proc(summary: string, base_seq: Maybe(session.Seq), covered_seq: session.Seq) -> string {
+	record := Chat_Compaction_Response {
+		format_version = CHAT_COMPACTION_RESPONSE_VERSION,
+		summary        = summary,
+		covered_seq    = i64(covered_seq),
+	}
+	if value, present := base_seq.?; present { record.base_seq = i64(value) }
+	data, marshal_err := json.marshal(record, allocator = context.temp_allocator)
+	if marshal_err != nil { return "{}" }
+	return string(data)
+}
+
 // chat_finish_reason_text is the stable name a request record keeps for why the
 // model stopped, so the stored value does not depend on a borrowed event string.
 chat_finish_reason_text :: proc(reason: ai.Provider_Finish_Reason) -> string {
@@ -95,13 +123,7 @@ chat_request_config_json :: proc(chat: ^Chat_Session, compact: bool) -> string {
 // Schema bytes are stored as written: the schema travels as a JSON string
 // value, so no canonical re-encoding touches the definition the model saw.
 @(private)
-chat_request_input_json :: proc(
-	prep: ^Chat_Request_Prep,
-	history: ^session.Context,
-	snapshot_seq: Maybe(session.Seq),
-	entry_count: int,
-	compact: bool,
-) -> string {
+chat_request_input_json :: proc(prep: ^Chat_Request_Prep, history: ^session.Context, snapshot_seq: Maybe(session.Seq), entry_count: int) -> string {
 	tools := make([dynamic]Chat_Request_Tool, 0, len(prep.request.Tools), context.temp_allocator)
 	defer delete(tools)
 	for &definition in prep.request.Tools {
@@ -115,7 +137,7 @@ chat_request_input_json :: proc(
 		covered_seq    = history.covered_seq,
 	}
 	if prep.request.Instructions_Present { input.instructions = prep.request.Instructions }
-	if !compact { input.instruction_snapshot_seq = snapshot_seq }
+	input.instruction_snapshot_seq = snapshot_seq
 	count := entry_count
 	if count > len(history.entries) { count = len(history.entries) }
 	if count > 0 { input.context_through = history.entries[count - 1].seq }

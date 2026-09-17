@@ -1,8 +1,6 @@
 #+test
 package agent
 
-import "core:fmt"
-import "core:strings"
 import "core:testing"
 
 import "nabla:agent/session"
@@ -63,9 +61,9 @@ test_compact_seam_never_lands_inside_a_later_run :: proc(t: ^testing.T) {
 	testing.expect_value(t, chat_compact_seam(grouped, 3), 1)
 }
 
-// A checkpoint is the whole post-compaction context: the summary in front of the
-// entries after the boundary. This is what the model sees, so it is pinned
-// directly rather than through a summarization request.
+// A checkpoint is the whole post-compaction context: the checkpoint message in
+// front of the entries after the boundary. This is what the model sees, so it is
+// pinned directly rather than through a summarization request.
 @(test)
 test_a_summary_opens_the_request_before_the_kept_tail :: proc(t: ^testing.T) {
 	fixture: Chat_Test
@@ -81,7 +79,7 @@ test_a_summary_opens_the_request_before_the_kept_tail :: proc(t: ^testing.T) {
 		},
 	}
 	prep: Chat_Request_Prep
-	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, false)
+	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, "")
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
 	testing.expect_value(t, len(prep.request.Messages), 3)
@@ -107,14 +105,17 @@ test_a_partial_answer_is_never_sent :: proc(t: ^testing.T) {
 		},
 	}
 	prep: Chat_Request_Prep
-	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, false)
+	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, "")
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 	testing.expect_value(t, len(prep.request.Messages), 1)
 	testing.expect_value(t, prep.request.Messages[0].Content, "question")
 }
 
+// A compaction request reads the conversation's own prefix, so the summarizer's
+// input is a cache read rather than a cache write and the summary is written by
+// the same model that will read it back. Only the directive at the end is new.
 @(test)
-test_build_compact_request_has_no_tools :: proc(t: ^testing.T) {
+test_a_compaction_request_shares_the_conversation_prefix :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
@@ -125,135 +126,17 @@ test_build_compact_request_has_no_tools :: proc(t: ^testing.T) {
 		entries = []session.Entry{compact_user_entry(1, "first")},
 	}
 	prep: Chat_Request_Prep
-	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, true)
+	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, CHAT_COMPACT_DIRECTIVE)
 	defer chat_request_prep_destroy(&prep, chat.allocator)
-	testing.expect_value(t, len(prep.request.Tools), 0)
+
+	testing.expect(t, prep.request.Instructions_Present)
+	testing.expect_value(t, prep.request.Instructions, AGENT_SYSTEM_PROMPT)
+	testing.expect(t, len(prep.request.Tools) > 0, "a compaction request keeps the conversation's tools")
+	testing.expect_value(t, prep.request.Prompt_Cache_Key, string(chat.id))
 	testing.expect(t, prep.request.Max_Output_Tokens_Present)
 	testing.expect_value(t, prep.request.Max_Output_Tokens, CHAT_COMPACT_MAX_OUTPUT)
-	testing.expect(t, !prep.request.Reasoning_Effort_Present)
-	// The summary instructions travel in the instruction lane, and the span
-	// being summarized is the whole conversation: a compaction request carries no
-	// agent prompt and no tools, because a summary must be text.
-	testing.expect(t, prep.request.Instructions_Present)
-	testing.expect_value(t, prep.request.Instructions, CHAT_COMPACT_INSTRUCTIONS)
-	if !testing.expect_value(t, len(prep.request.Messages), 1) { return }
+	// The directive is the last message, after the prefix it asks about.
+	if !testing.expect_value(t, len(prep.request.Messages), 2) { return }
 	testing.expect_value(t, prep.request.Messages[0].Content, "first")
-}
-
-@(test)
-test_compaction_failure_records_nothing_and_keeps_history :: proc(t: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
-	chat := &fixture.chat
-	chat.context_window = 500000
-	// Enough history that compaction has something to summarize.
-	_test_accept(t, chat, "first")
-	for text in ([]string{"early", "middle", "late", "more", "most"}) {
-		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.Assistant_Entry{text = text}})
-	}
-	chat.state = .Idle
-
-	dead := ai.Provider_Connection {
-		API      = .OpenAI_Chat_Completions,
-		Endpoint = "http://127.0.0.1:9/",
-	}
-	testing.expect(t, !chat_command_compact(chat, {}, dead, nil))
-
-	// No checkpoint was written and every entry is still there.
-	_, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
-	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
-	testing.expect(t, !has_checkpoint, "a failed compaction must not write a checkpoint")
-
-	entries := _test_entries(t, chat)
-	defer session.entries_destroy(entries, context.allocator)
-	testing.expect_value(t, len(entries), 6)
-	for entry in entries {
-		testing.expect(t, entry.kind != .Checkpoint, "a failed compaction must not write a checkpoint entry")
-	}
-}
-
-@(test)
-test_a_compaction_request_is_recorded_and_closed :: proc(t: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
-	chat := &fixture.chat
-	chat.context_window = 500000
-	// An effort and an output bound the session would normally send, so the record
-	// can be checked against the compaction request's own settings rather than
-	// against an empty session.
-	chat.max_output_tokens = 64_000
-	chat.effort = chat_clone_string("high", chat.allocator)
-	_test_accept(t, chat, "first")
-	// More entries than the kept tail, so compaction has a span to summarize.
-	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
-		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.Assistant_Entry{text = text}})
-	}
-	chat.state = .Idle
-
-	dead := ai.Provider_Connection {
-		API      = .OpenAI_Chat_Completions,
-		Endpoint = "http://127.0.0.1:9/",
-	}
-	testing.expect(t, !chat_command_compact(chat, {}, dead, nil))
-
-	// The attempt itself is a request, and it ends as failed rather than staying
-	// open. That is what makes a session that died mid-compaction legible.
-	request, request_err := session.request_load(chat.store, chat.id, 1)
-	if request_err != nil { testing.fail_now(t, "the compaction request should exist") }
-	defer session.request_destroy(&request)
-	testing.expect_value(t, request.purpose, session.Request_Purpose.Compaction)
-	testing.expect_value(t, request.outcome, session.Outcome.Failed)
-	_, still_running := request.finished_at_ms.?
-	testing.expect(t, still_running, "a finished request records when it finished")
-
-	// The settings describe the request that was sent: the summarization bound and
-	// no reasoning effort, not the settings the session would send ordinarily.
-	testing.expect(
-		t,
-		strings.contains(request.config_json, fmt.tprintf("\"max_output_tokens\":%d", CHAT_COMPACT_MAX_OUTPUT)),
-		"the record should carry the compaction output bound",
-	)
-	testing.expect(t, strings.contains(request.config_json, `"effort":""`), "a summarization request carries no effort")
-}
-
-// A request that fits is sent as it stands. Compaction rewrites the active
-// context, which discards the prefix the provider has cached, and it pays for a
-// summarization request, so it is reserved for a request that would otherwise be
-// refused rather than run early to keep the window small.
-@(test)
-test_a_request_that_fits_is_not_compacted :: proc(t: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
-	chat := &fixture.chat
-	chat.context_window = 70_000
-
-	// About 57k estimated tokens: inside the window, and near enough the top of
-	// it that an eager threshold would have compacted before sending.
-	prompt := strings.repeat("work ", 45_600) or_else ""
-	if !testing.expect(t, len(prompt) > 200_000, "the fixture prompt should be large") { return }
-	_test_accept(t, chat, prompt)
-	delete(prompt)
-	// Enough entries that a summarization would have a span to cover, so an eager
-	// trigger would really have run one instead of finding nothing to compact.
-	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
-		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.Assistant_Entry{text = text}})
-	}
-
-	// An unusable endpoint: the request is attempted and fails, which is what
-	// makes the recorded request observable without a server.
-	dead := ai.Provider_Connection {
-		API      = .OpenAI_Chat_Completions,
-		Endpoint = "http://127.0.0.1:9/",
-	}
-	testing.expect(t, !chat_run_turn(chat, dead, {}))
-
-	// The only request recorded is the one that was attempted: no summarization
-	// ran ahead of it.
-	request, request_err := session.request_load(chat.store, chat.id, 1)
-	if request_err != nil { testing.fail_now(t, "the attempted request should be recorded") }
-	defer session.request_destroy(&request)
-	testing.expect_value(t, request.purpose, session.Request_Purpose.Response)
+	testing.expect_value(t, prep.request.Messages[1].Content, CHAT_COMPACT_DIRECTIVE)
 }

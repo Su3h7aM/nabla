@@ -144,6 +144,11 @@ Chat_Session :: struct {
 	last_input_measured_present:  bool,
 	last_estimate:                int,
 
+	// compact is the background compaction this session owns. It outlives any
+	// single turn: a summary computed while the agent works is installed at a later
+	// request boundary.
+	compact:                      Compact_Control,
+
 	// skill_catalog is the frozen catalog from the instruction snapshot. Nil
 	// means unavailable, never an instruction to rescan.
 	skill_catalog:                Maybe(skills.Catalog),
@@ -238,6 +243,9 @@ chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Regis
 }
 
 chat_session_destroy :: proc(chat: ^Chat_Session) {
+	// Compaction's worker borrows this session's id for its logging correlation, so
+	// it is stopped before anything the session owns is released.
+	chat_compact_destroy(chat)
 	if catalog, present := &chat.skill_catalog.?; present { skills.catalog_destroy(catalog, chat.allocator) }
 	chat.skill_catalog = nil
 	delete(chat.skill_instructions, chat.allocator)

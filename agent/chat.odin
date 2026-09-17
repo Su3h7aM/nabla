@@ -149,6 +149,10 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	binding: Log_Binding
 	context.logger = log_rebind(&binding, log_correlation(chat))
 
+	// A finished summary is installed at a request boundary, so the context the
+	// request is built from is the one this session will actually send.
+	_ = chat_compact_service(chat, observer)
+
 	prep, prep_err := chat_prepare(chat, connection)
 	if prep_err != nil {
 		chat_session_record_failure(chat, "the request context could not be read", prep_err)
@@ -156,16 +160,19 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	}
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
-	// A request that does not fit compacts once and recounts; one that still does
-	// not fit fails here, before any byte is sent. Compaction is deliberately not
-	// eager: it rewrites the active context, which discards the prefix the
-	// provider has cached and pays for a summarization request, so it happens
-	// when a request would otherwise be refused and not before. A turn that
-	// keeps growing can therefore compact more than once, and each time it does
-	// the alternative was failing.
+	// The exact request about to be sent is what a compaction freezes, so it is
+	// considered here, after the boundary above and before admission decides
+	// anything. Compaction never runs in the foreground: this only starts a
+	// background job for a context that is filling up.
+	chat_compact_consider(chat, observer, connection, &prep)
+
+	// A request that does not fit is refused unless a summary that already finished
+	// can be installed right now. Nothing waits for compaction: a request that still
+	// does not fit fails explicitly, and the turn is told why.
 	message, admitted := chat_admission_check(chat, prep.estimate)
 	if !admitted {
-		if chat_compact(chat, observer, connection, &prep, usages) && !chat_session_cancelled(chat) {
+		if chat_compact_relieve(chat, observer) && !chat_session_cancelled(chat) {
+			if !chat_rebuild_prep(chat, connection, &prep) { return }
 			message, admitted = chat_admission_check(chat, prep.estimate)
 		}
 		if !admitted {
@@ -209,7 +216,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 			model_requested = chat.model_id,
 			api = chat_api_name(connection.API),
 			config_json = chat_request_config_json(chat, false),
-			input_json = chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries), false),
+			input_json = chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries)),
 		},
 		at_ms,
 	)

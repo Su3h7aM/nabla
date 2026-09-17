@@ -1,5 +1,6 @@
 package agent
 
+import "base:intrinsics"
 import "core:log"
 import "core:time"
 
@@ -139,6 +140,32 @@ log_correlation :: proc(chat: ^Chat_Session) -> Log_Correlation {
 	if request_no, has_request := chat.active_request.?; has_request { correlation.request_no = request_no }
 	if chat.operation.state == .Running { correlation.operation_id = chat.operation.id }
 	return correlation
+}
+
+// log_active_binding returns the sink and correlation the installed logger
+// carries, or a zero binding when there is none. It is how a worker that must log
+// without borrowing a caller's stack binding copies one it can own.
+log_active_binding :: proc() -> Log_Binding {
+	logger := context.logger
+	if logger.procedure != log_procedure { return {} }
+	binding := cast(^Log_Binding)logger.data
+	if binding == nil { return {} }
+	return binding^
+}
+
+// log_correlation_for_request is log_correlation for work that belongs to a
+// request the session is not currently running, such as a background compaction.
+log_correlation_for_request :: proc(chat: ^Chat_Session, request_no: session.Request_No) -> Log_Correlation {
+	correlation := log_correlation(chat)
+	correlation.request_no = request_no
+	return correlation
+}
+
+// log_optional_i64 writes an unreported measurement as -1, because a log field
+// carries one integer and a reader has to tell "not reported" from zero.
+log_optional_i64 :: proc(value: Maybe($T)) -> i64 where intrinsics.type_is_integer(T) {
+	number, present := value.?
+	return present ? i64(number) : -1
 }
 
 // log_correlation_for is log_correlation for one request attempt: the same

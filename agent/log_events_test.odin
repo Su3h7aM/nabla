@@ -272,44 +272,39 @@ test_an_admission_decision_is_recorded :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_compaction_outside_a_turn_records_its_own_scope :: proc(t: ^testing.T) {
+test_starting_a_compaction_records_its_scope :: proc(t: ^testing.T) {
 	fixture: Log_Chat_Test
 	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
 	defer log_chat_end(t, &fixture)
 	chat := &fixture.chat.chat
-
-	// A session with no context window refuses compaction before it can build a
-	// request, which is the shortest path that still records the attempt.
-	chat.context_window = 0
-	prep: Chat_Request_Prep
-	testing.expect(t, !chat_compact(chat, {}, {}, &prep, nil))
-
-	context.logger = fixture.ambient
-	text := log_chat_text(t, &fixture)
-	defer delete(text, context.allocator)
-	testing.expect(t, strings.contains(text, `"event":"compaction.finished"`), "the attempt is recorded")
-	testing.expect(t, strings.contains(text, `"outcome":"unconfigured"`), "the record says why it stopped")
-	// Compaction outside a turn has no durable turn to name, so the scope must not
-	// invent one.
-	testing.expect(t, !strings.contains(text, `"turn_no"`), "compaction outside a turn carries no turn")
-}
-
-@(test)
-test_a_compaction_inside_a_turn_carries_the_turn :: proc(t: ^testing.T) {
-	fixture: Log_Chat_Test
-	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
-	defer log_chat_end(t, &fixture)
-	chat := &fixture.chat.chat
+	chat.context_window = 500_000
 	_test_accept(t, chat, "compact me")
-	chat.context_window = 0
-	prep: Chat_Request_Prep
-	testing.expect(t, !chat_compact(chat, {}, {}, &prep, nil))
+	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
+		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.Assistant_Entry{text = text}})
+	}
+
+	// A dead endpoint is enough: what is under test is the record the harness
+	// writes when it decides to compact, not the summary itself.
+	dead := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = "http://127.0.0.1:9/",
+	}
+	prep, prep_err := chat_prepare(chat, dead)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	testing.expect_value(t, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
+	chat_compact_consider(chat, {}, dead, &prep)
+	chat_request_prep_destroy(&prep, chat.allocator)
+	testing.expect_value(t, chat.compact.state, Compact_State.Running)
 
 	context.logger = fixture.ambient
 	text := log_chat_text(t, &fixture)
 	defer delete(text, context.allocator)
-	testing.expect(t, strings.contains(text, `"event":"compaction.finished"`), "the attempt is recorded")
+	testing.expect(t, strings.contains(text, `"event":"compaction.started"`), "the start is recorded")
+	testing.expect(t, strings.contains(text, `"trigger":"user_command"`), "the trigger is named")
 	testing.expect(t, strings.contains(text, `"turn_no":1`), "a compaction inside a turn names the turn")
+
+	// Teardown joins the worker; the dead endpoint makes it finish promptly.
+	chat_compact_destroy(chat)
 }
 
 @(test)

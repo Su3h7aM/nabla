@@ -112,3 +112,18 @@ chat_signal_block_current :: proc() {
 	blocked := chat_signal_int_set()
 	_ = linux.rt_sigprocmask(.SIG_BLOCK, &blocked, nil)
 }
+
+// chat_signal_block_watched blocks every signal the interactive lifetime handles
+// and stores the caller's previous mask. A thread inherits the mask its creator
+// had at the moment it was created, so a worker that must never run the process
+// handler is created while these are blocked, and the creator restores its own
+// mask afterwards.
+chat_signal_block_watched :: proc(previous: ^linux.Sig_Set) {
+	blocked := chat_watched_signals()
+	_ = linux.rt_sigprocmask(.SIG_BLOCK, &blocked, previous)
+}
+
+chat_signal_restore :: proc(previous: linux.Sig_Set) {
+	mask := previous
+	_ = linux.rt_sigprocmask(.SIG_SETMASK, &mask, nil)
+}
