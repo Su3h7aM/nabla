@@ -248,12 +248,9 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 
 	chat_session_begin_operation(chat)
 	binding.correlation = log_correlation(chat)
-	runtime := Chat_Runtime_Context {
-		chat      = chat,
-		source    = chat_session_event_source(chat),
-		observer  = observer,
-		usage_log = usages,
-	}
+	// The event source identifies this operation, and it is the same for every
+	// attempt of it: the attempt is told apart by the correlation, not by the source.
+	source := chat_session_event_source(chat)
 	// The request carries interruption only. No deadline is set: the request
 	// stays open as long as the provider keeps it open, and ends when the
 	// provider, the transport, or cancellation ends it.
@@ -267,9 +264,21 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	// an attempt failed.
 	attempts := 0
 	operation_error: ai.Provider_Operation_Error
+	// The finish reason of the attempt that ends the chain is what the response is
+	// committed with. Every attempt starts without one.
+	finish_reason := ai.Provider_Finish_Reason.Unknown
 	for {
 		attempts += 1
 		binding.correlation = log_correlation_for(chat, attempts)
+		// The runtime belongs to one attempt: a retry that produces nothing must not
+		// inherit the finish reason of the attempt before it, nor the record that the
+		// assistant block was already announced.
+		runtime := Chat_Runtime_Context {
+			chat      = chat,
+			source    = source,
+			observer  = observer,
+			usage_log = usages,
+		}
 		log_emit({level = .Info, category = .Provider, event = "attempt.started"})
 
 		// The observation belongs to this attempt: a retry that receives no chunk
@@ -281,6 +290,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 
 		at := time.tick_now()
 		operation_error = ai.Provider_Request_Operation_Encoded(connection, encoded, &runtime, chat_provider_event, options, chat.allocator)
+		finish_reason = runtime.finish_reason
 		// The response artifact covers the whole attempt, so it is settled as soon as
 		// the bytes stop arriving. A cut-short stream is kept and marked incomplete.
 		if provider_log.response_capture.kind != .Invalid {
@@ -349,11 +359,11 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	if chat_session_cancelled(chat) {
 		chat_session_note_cancel(chat)
 	} else if operation_error.kind != .None && chat.state != .Finalizing {
-		chat_session_feed_error(chat, runtime.source, operation_error.detail)
+		chat_session_feed_error(chat, source, operation_error.detail)
 	}
 	chat_session_retire_operation(chat)
 
-	chat_commit_response(chat, request_no, runtime.finish_reason, usages)
+	chat_commit_response(chat, request_no, finish_reason, usages)
 	// The request's outcome is recorded, so the provider's own accounting of it is part of
 	// the session the front-end describes.
 	_observer_request_finished(observer)
