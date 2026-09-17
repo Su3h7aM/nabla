@@ -310,11 +310,7 @@ Provider_Request_Operation_Encoded :: proc(
 		return provider_terminal_error(&state, provider_operation_error_kind(failure.kind))
 	}
 	if state.failed { return provider_terminal_error(&state, .Stream) }
-	if sse.parser_finish(&state.parser) != .None {
-		provider_emit_error(&state, .Invalid_Data, "malformed SSE stream")
-		provider_drain_events(&state)
-		return provider_terminal_error(&state, .Stream)
-	}
+	sse.parser_finish(&state.parser)
 	stream_err := Provider_Stream_Finish(&state.stream)
 	provider_drain_events(&state)
 	if stream_err != .None && !state.failed {
@@ -554,7 +550,5 @@ provider_http_chunk :: proc(user_data: rawptr, chunk: []u8) {
 	if state.observer.report != nil {
 		state.observer.report(state.observer.user_data, Provider_Operation_Report{stage = .Response_Body, chunk = chunk, bytes = state.response_bytes})
 	}
-	if sse.parser_feed(&state.parser, chunk) != .None {
-		provider_emit_error(state, .Invalid_Data, "malformed SSE stream")
-	}
+	sse.parser_feed(&state.parser, chunk)
 }

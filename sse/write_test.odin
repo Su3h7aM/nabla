@@ -35,7 +35,7 @@ test_write_read_round_trip :: proc(t: ^testing.T) {
 	recorder: Recorder
 	recorder_init(&recorder)
 	defer recorder_destroy(&recorder)
-	testing.expect_value(t, parse(&recorder, text), Error.None)
+	parse(&recorder, text)
 	expect_events(t, &recorder, {{type = DEFAULT_EVENT_TYPE, data = "hello"}})
 
 	// Every optional field round-trips.
@@ -44,7 +44,7 @@ test_write_read_round_trip :: proc(t: ^testing.T) {
 	all_recorder: Recorder
 	recorder_init(&all_recorder)
 	defer recorder_destroy(&all_recorder)
-	testing.expect_value(t, parse(&all_recorder, all), Error.None)
+	parse(&all_recorder, all)
 	expect_events(t, &all_recorder, {{type = "add", data = "body", id = "42", retry_ms = 1500, retry_present = true}})
 }
 
@@ -61,7 +61,7 @@ test_write_read_round_trip_of_data_edge_cases :: proc(t: ^testing.T) {
 	multi_recorder: Recorder
 	recorder_init(&multi_recorder)
 	defer recorder_destroy(&multi_recorder)
-	testing.expect_value(t, parse(&multi_recorder, multi), Error.None)
+	parse(&multi_recorder, multi)
 	expect_events(t, &multi_recorder, {{type = DEFAULT_EVENT_TYPE, data = "one\ntwo\nthree"}})
 
 	empty, empty_err := _write_to_string(&wire, "")
@@ -74,7 +74,7 @@ test_write_read_round_trip_of_data_edge_cases :: proc(t: ^testing.T) {
 		testing.expect_value(t, err, Write_Error.None)
 		recorder: Recorder
 		recorder_init(&recorder)
-		testing.expect_value(t, parse(&recorder, text), Error.None)
+		parse(&recorder, text)
 		testing.expectf(t, len(recorder.events) == 1, "data %q: expected one event, got %d", data, len(recorder.events))
 		if len(recorder.events) == 1 {
 			testing.expectf(t, recorder.events[0].data == data, "data: expected %q, got %q (wire %q)", data, recorder.events[0].data, text)
@@ -115,7 +115,7 @@ test_empty_id_resets_the_readers_last_event_id :: proc(t: ^testing.T) {
 	recorder: Recorder
 	recorder_init(&recorder)
 	defer recorder_destroy(&recorder)
-	testing.expect_value(t, parse(&recorder, "id: keep\n\n", absent, present_empty), Error.None)
+	parse(&recorder, "id: keep\n\n", absent, present_empty)
 	expect_events(t, &recorder, {{type = DEFAULT_EVENT_TYPE, data = "a", id = "keep"}, {type = DEFAULT_EVENT_TYPE, data = "b", id = ""}})
 }
 
@@ -131,7 +131,7 @@ test_events_accumulate_in_one_buffer :: proc(t: ^testing.T) {
 	recorder: Recorder
 	recorder_init(&recorder)
 	defer recorder_destroy(&recorder)
-	testing.expect_value(t, parse(&recorder, string(wire[:])), Error.None)
+	parse(&recorder, string(wire[:]))
 	expect_events(t, &recorder, {{type = DEFAULT_EVENT_TYPE, data = "one"}, {type = "add", data = "two"}, {type = DEFAULT_EVENT_TYPE, data = "three"}})
 }
 

@@ -52,18 +52,16 @@ record_event :: proc(user_data: rawptr, event: Event) {
 
 // parse feeds every chunk in order and then finishes the stream, which is what a
 // real reader does when the connection ends.
-parse :: proc(recorder: ^Recorder, chunks: ..string) -> Error {
+parse :: proc(recorder: ^Recorder, chunks: ..string) {
 	parser: Parser
 	parser_init(&parser, record_event, recorder, allocator = recorder.allocator)
 	defer parser_destroy(&parser)
 	for chunk in chunks {
 		// A chunk is bytes on the wire; a string literal is the most readable way
 		// to write one in a test.
-		if err := parser_feed(&parser, transmute([]u8)chunk); err != .None {
-			return err
-		}
+		parser_feed(&parser, transmute([]u8)chunk)
 	}
-	return parser_finish(&parser)
+	parser_finish(&parser)
 }
 
 expect_events :: proc(t: ^testing.T, recorder: ^Recorder, expected: []Recorded_Event, loc := #caller_location) {
@@ -96,7 +94,7 @@ test_field_parsing_and_data_assembly :: proc(t: ^testing.T) {
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "data: YHOO\ndata: +2\ndata: 10\n\n"), Error.None)
+		parse(&recorder, "data: YHOO\ndata: +2\ndata: 10\n\n")
 		expect_events(t, &recorder, {{type = "message", data = "YHOO\n+2\n10"}})
 	}
 	// Standard example: one space after the colon is syntax, and exactly one.
@@ -104,7 +102,7 @@ test_field_parsing_and_data_assembly :: proc(t: ^testing.T) {
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "data: test\n\ndata:test\n\ndata:  third event\n\n"), Error.None)
+		parse(&recorder, "data: test\n\ndata:test\n\ndata:  third event\n\n")
 		expect_events(t, &recorder, {{type = "message", data = "test"}, {type = "message", data = "test"}, {type = "message", data = " third event"}})
 	}
 	// The colon and value are optional, so a bare field has the empty value.
@@ -112,7 +110,7 @@ test_field_parsing_and_data_assembly :: proc(t: ^testing.T) {
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "data\n\n"), Error.None)
+		parse(&recorder, "data\n\n")
 		expect_events(t, &recorder, {{type = "message", data = ""}})
 	}
 	// Standard example: empty data dispatches, a single LF dispatches, and a
@@ -121,7 +119,7 @@ test_field_parsing_and_data_assembly :: proc(t: ^testing.T) {
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "data\n\ndata\ndata\n\ndata:\n"), Error.None)
+		parse(&recorder, "data\n\ndata\ndata\n\ndata:\n")
 		expect_events(t, &recorder, {{type = "message", data = ""}, {type = "message", data = "\n"}})
 	}
 }
@@ -133,7 +131,7 @@ test_comments_are_ignored :: proc(t: ^testing.T) {
 	defer recorder_destroy(&recorder)
 	// A line beginning with a colon is a comment, and a comment-only block on
 	// the standard's four-block example fires nothing.
-	testing.expect_value(t, parse(&recorder, ": a comment\n:data: not a field\n\ndata: kept\n\n: test stream\n\n"), Error.None)
+	parse(&recorder, ": a comment\n:data: not a field\n\ndata: kept\n\n: test stream\n\n")
 	expect_events(t, &recorder, {{type = "message", data = "kept"}})
 }
 
@@ -145,7 +143,7 @@ test_id_state :: proc(t: ^testing.T) {
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "data: first event\nid: 1\n\ndata:second event\nid\n\ndata:  third event\n\n"), Error.None)
+		parse(&recorder, "data: first event\nid: 1\n\ndata:second event\nid\n\ndata:  third event\n\n")
 		expect_events(
 			t,
 			&recorder,
@@ -161,7 +159,7 @@ test_id_state :: proc(t: ^testing.T) {
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "data: a\nid: keep\n\ndata: b\nid: bad\x00value\n\ndata: c\nid: \x00\n\n"), Error.None)
+		parse(&recorder, "data: a\nid: keep\n\ndata: b\nid: bad\x00value\n\ndata: c\nid: \x00\n\n")
 		expect_events(
 			t,
 			&recorder,
@@ -178,7 +176,7 @@ test_event_type_state :: proc(t: ^testing.T) {
 	recorder: Recorder
 	recorder_init(&recorder)
 	defer recorder_destroy(&recorder)
-	testing.expect_value(t, parse(&recorder, "event: add\ndata: 1\n\ndata: 2\n\nevent: add\n\ndata: 3\n\nunknown: value\nData: x\ndata : y\n\n"), Error.None)
+	parse(&recorder, "event: add\ndata: 1\n\ndata: 2\n\nevent: add\n\ndata: 3\n\nunknown: value\nData: x\ndata : y\n\n")
 	expect_events(t, &recorder, {{type = "add", data = "1"}, {type = "message", data = "2"}, {type = "message", data = "3"}})
 }
 
@@ -199,7 +197,7 @@ test_retry_state :: proc(t: ^testing.T) {
 		"retry: -1\ndata: e\n\n" +
 		"retry: 999999999999999999999999\ndata: f\n\n" +
 		"retry: 0\ndata: g\n\n"
-	testing.expect_value(t, parse(&recorder, wire), Error.None)
+	parse(&recorder, wire)
 	expect_events(
 		t,
 		&recorder,
@@ -224,7 +222,7 @@ test_line_endings :: proc(t: ^testing.T) {
 	// LF, CR, and CRLF are each one line terminator, so "\r\n\r\n" is a single
 	// blank line. A CR not followed by LF still terminates a line, and a trailing
 	// CR processes its line without dispatching.
-	testing.expect_value(t, parse(&recorder, "data: lf\n\n", "data: cr\r\r", "data: crlf\r\n\r\n", "data: a\rdata: b\r\r", "data: a\r"), Error.None)
+	parse(&recorder, "data: lf\n\n", "data: cr\r\r", "data: crlf\r\n\r\n", "data: a\rdata: b\r\r", "data: a\r")
 	expect_events(
 		t,
 		&recorder,
@@ -240,28 +238,28 @@ test_byte_order_mark :: proc(t: ^testing.T) {
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "\xEF\xBB\xBFdata: a\n\n"), Error.None)
+		parse(&recorder, "\xEF\xBB\xBFdata: a\n\n")
 		expect_events(t, &recorder, {{type = "message", data = "a"}})
 	}
 	{
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "data: a\n\ndata: \xEF\xBB\xBFb\n\n"), Error.None)
+		parse(&recorder, "data: a\n\ndata: \xEF\xBB\xBFb\n\n")
 		expect_events(t, &recorder, {{type = "message", data = "a"}, {type = "message", data = "\uFEFFb"}})
 	}
 	{
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "\xEF\xBB\xBF"), Error.None)
+		parse(&recorder, "\xEF\xBB\xBF")
 		expect_events(t, &recorder, {})
 	}
 	{
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "da\xFFta: a\n\ndata: b\n\n"), Error.None)
+		parse(&recorder, "da\xFFta: a\n\ndata: b\n\n")
 		expect_events(t, &recorder, {{type = "message", data = "b"}})
 	}
 }
@@ -276,7 +274,7 @@ test_end_of_stream_and_chunk_boundaries :: proc(t: ^testing.T) {
 	whole: Recorder
 	recorder_init(&whole)
 	defer recorder_destroy(&whole)
-	testing.expect_value(t, parse(&whole, stream, "data: incomplete\nid: never"), Error.None)
+	parse(&whole, stream, "data: incomplete\nid: never")
 	expect_events(t, &whole, expected)
 
 	byte_at_a_time: Recorder
@@ -286,39 +284,29 @@ test_end_of_stream_and_chunk_boundaries :: proc(t: ^testing.T) {
 	parser_init(&parser, record_event, &byte_at_a_time, allocator = byte_at_a_time.allocator)
 	defer parser_destroy(&parser)
 	for i in 0 ..< len(stream) {
-		testing.expect_value(t, parser_feed(&parser, transmute([]u8)stream[i:i + 1]), Error.None)
+		parser_feed(&parser, transmute([]u8)stream[i:i + 1])
 	}
-	testing.expect_value(t, parser_finish(&parser), Error.None)
+	parser_finish(&parser)
 	expect_events(t, &byte_at_a_time, expected)
 }
 
 @(test)
-test_line_and_event_bounds :: proc(t: ^testing.T) {
-	// The line bound is inclusive.
+test_large_lines_and_events_parse :: proc(t: ^testing.T) {
+	// The grammar sets no size bound, so neither does the parser. A provider
+	// that sends its answer in one large event must parse like any other
+	// stream: this is the shape that used to fail with "malformed SSE stream".
 	{
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
 		prefix := "data: "
-		filler := strings.repeat("x", MAX_LINE_BYTES - len(prefix), context.temp_allocator)
+		filler := strings.repeat("x", 2 * 1024 * 1024, context.temp_allocator)
 		line := strings.concatenate({prefix, filler}, context.temp_allocator)
-		testing.expect_value(t, len(line), MAX_LINE_BYTES)
-		testing.expect_value(t, parse(&recorder, line, "\n\n"), Error.None)
+		parse(&recorder, line, "\n\n")
 		testing.expect_value(t, len(recorder.events), 1)
-		testing.expect_value(t, len(recorder.events[0].data), MAX_LINE_BYTES - len(prefix))
+		testing.expect_value(t, len(recorder.events[0].data), 2 * 1024 * 1024)
 	}
-	// An overlong line is a sticky, fatal error.
-	{
-		parser: Parser
-		parser_init(&parser, nil)
-		defer parser_destroy(&parser)
-		overlong := strings.repeat("x", MAX_LINE_BYTES + 1, context.temp_allocator)
-		testing.expect_value(t, parser_feed(&parser, transmute([]u8)overlong), Error.Line_Too_Long)
-		testing.expect_value(t, parser_feed(&parser, transmute([]u8)string("\n\n")), Error.Line_Too_Long)
-		testing.expect_value(t, parser_finish(&parser), Error.Line_Too_Long)
-		testing.expect_value(t, parser_error(&parser), Error.Line_Too_Long)
-	}
-	// Many bounded lines still overflow the event budget, and nothing dispatches.
+	// Many lines accumulating into one multi-megabyte event dispatch whole.
 	{
 		recorder: Recorder
 		recorder_init(&recorder)
@@ -327,38 +315,17 @@ test_line_and_event_bounds :: proc(t: ^testing.T) {
 		parser_init(&parser, record_event, &recorder, allocator = recorder.allocator)
 		defer parser_destroy(&parser)
 		prefix := "data: "
-		filler := strings.repeat("x", MAX_LINE_BYTES - len(prefix) - 1, context.temp_allocator)
+		filler := strings.repeat("x", 64 * 1024, context.temp_allocator)
 		line := strings.concatenate({prefix, filler, "\n"}, context.temp_allocator)
-		err := Error.None
 		lines := 0
-		for err == .None {
-			err = parser_feed(&parser, transmute([]u8)line)
+		for lines < 48 {
+			parser_feed(&parser, transmute([]u8)line)
 			lines += 1
-			testing.expect(t, lines <= MAX_EVENT_BYTES / MAX_LINE_BYTES + 2, "budget was never exceeded")
 		}
-		testing.expect_value(t, err, Error.Event_Too_Large)
-		testing.expect_value(t, len(recorder.events), 0)
-	}
-	// The budget counts decoded bytes, so ill-formed bytes reach it sooner.
-	{
-		recorder: Recorder
-		recorder_init(&recorder)
-		defer recorder_destroy(&recorder)
-		parser: Parser
-		parser_init(&parser, record_event, &recorder, allocator = recorder.allocator)
-		defer parser_destroy(&parser)
-		filler := strings.repeat("\xFF", MAX_LINE_BYTES - 6, context.temp_allocator)
-		line := strings.concatenate({"data: ", filler, "\n"}, context.temp_allocator)
-		testing.expect(t, 3 * (MAX_LINE_BYTES - 6) < MAX_EVENT_BYTES, "one line must fit the budget")
-		err := Error.None
-		lines := 0
-		for err == .None {
-			err = parser_feed(&parser, transmute([]u8)line)
-			lines += 1
-			testing.expect(t, lines <= MAX_EVENT_BYTES / (3 * (MAX_LINE_BYTES - 6)) + 2, "budget was never exceeded")
-		}
-		testing.expect_value(t, err, Error.Event_Too_Large)
-		testing.expect_value(t, len(recorder.events), 0)
+		parser_feed(&parser, transmute([]u8)string("\n"))
+		parser_finish(&parser)
+		testing.expect_value(t, len(recorder.events), 1)
+		testing.expect_value(t, len(recorder.events[0].data), 48 * (64 * 1024 + 1) - 1)
 	}
 }
 
@@ -372,17 +339,17 @@ test_parser_lifecycle :: proc(t: ^testing.T) {
 		parser: Parser
 		parser_init(&parser, record_event, &recorder, allocator = recorder.allocator)
 		defer parser_destroy(&parser)
-		testing.expect_value(t, parser_feed(&parser, transmute([]u8)string("data: a\n\n")), Error.None)
-		testing.expect_value(t, parser_finish(&parser), Error.None)
-		testing.expect_value(t, parser_finish(&parser), Error.None)
+		parser_feed(&parser, transmute([]u8)string("data: a\n\n"))
+		parser_finish(&parser)
+		parser_finish(&parser)
 		testing.expect_value(t, len(recorder.events), 1)
 	}
 	{
 		parser: Parser
 		parser_init(&parser, nil)
 		defer parser_destroy(&parser)
-		testing.expect_value(t, parser_feed(&parser, transmute([]u8)string("data: a\n\n")), Error.None)
-		testing.expect_value(t, parser_finish(&parser), Error.None)
+		parser_feed(&parser, transmute([]u8)string("data: a\n\n"))
+		parser_finish(&parser)
 	}
 }
 
@@ -394,14 +361,14 @@ test_utf8_decoding :: proc(t: ^testing.T) {
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "data: héllo → ✅\n\n"), Error.None)
+		parse(&recorder, "data: héllo → ✅\n\n")
 		expect_events(t, &recorder, {{type = "message", data = "héllo → ✅"}})
 	}
 	{
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "data: \xE2\x9C", "\x85\n\n"), Error.None)
+		parse(&recorder, "data: \xE2\x9C", "\x85\n\n")
 		expect_events(t, &recorder, {{type = "message", data = "✅"}})
 	}
 	// Each ill-formed byte becomes one replacement character; an encoded
@@ -410,14 +377,14 @@ test_utf8_decoding :: proc(t: ^testing.T) {
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "data: a\x80b\xFFc\xE2\x82d\n\n"), Error.None)
+		parse(&recorder, "data: a\x80b\xFFc\xE2\x82d\n\n")
 		expect_events(t, &recorder, {{type = "message", data = "a\uFFFDb\uFFFDc\uFFFD\uFFFDd"}})
 	}
 	{
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "data: \xEF\xBF\xBD\n\ndata: \xFF\n\n"), Error.None)
+		parse(&recorder, "data: \xEF\xBF\xBD\n\ndata: \xFF\n\n")
 		expect_events(t, &recorder, {{type = "message", data = "\uFFFD"}, {type = "message", data = "\uFFFD"}})
 	}
 	// The event type and id decode the same way.
@@ -425,7 +392,7 @@ test_utf8_decoding :: proc(t: ^testing.T) {
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
-		testing.expect_value(t, parse(&recorder, "event: b\xFFd\nid: i\xFFd\ndata: a\n\n"), Error.None)
+		parse(&recorder, "event: b\xFFd\nid: i\xFFd\ndata: a\n\n")
 		expect_events(t, &recorder, {{type = "b\uFFFDd", data = "a", id = "i\uFFFDd"}})
 	}
 }

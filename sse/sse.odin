@@ -3,10 +3,11 @@
 // the same format, and the POST that asks for a stream.
 //
 // The behaviour follows the WHATWG HTML Standard, "Server-sent events" -- the
-// event stream format and its interpretation algorithm. Where this package makes
-// a choice the specification leaves open (memory bounds, and how a bounded
-// parser reports them) the choice is documented on the declaration that makes
-// it.
+// event stream format and its interpretation algorithm.
+//
+// The grammar sets no size bound on lines or events (`*any-char` repeats
+// without limit), so the parser accumulates without one: a provider may send
+// an event of any size and it still parses.
 //
 // The parser is a pure state machine over bytes: no I/O, no connection, no
 // retained stream. The caller owns the byte source and the event callbacks.
@@ -14,12 +15,7 @@ package sse
 
 import "core:unicode/utf8"
 
-MAX_LINE_BYTES :: 64 * 1024
-MAX_EVENT_BYTES :: 1024 * 1024
 MAX_RETRY_MS :: 24 * 60 * 60 * 1000
-
-// One worst-case line must always fit the event budget it accumulates into.
-#assert(MAX_LINE_BYTES < MAX_EVENT_BYTES)
 
 // DEFAULT_EVENT_TYPE is the type an event has when its block named none.
 DEFAULT_EVENT_TYPE :: "message"
@@ -40,20 +36,6 @@ Event :: struct {
 // copy them if they must outlive the call.
 Event_Callback :: #type proc(user_data: rawptr, event: Event)
 
-// Error reports why a stream stopped being parseable.
-//
-// The specification defines no memory bound, so the two limits here are this
-// package's policy. Both are fatal rather than skipped: a line that cannot be
-// stored cannot be interpreted, silently dropping it would misparse the stream,
-// and the error is sticky so the caller cannot accidentally continue past it.
-Error :: enum {
-	None,
-	// A single line exceeded MAX_LINE_BYTES.
-	Line_Too_Long,
-	// The accumulated data buffer exceeded MAX_EVENT_BYTES.
-	Event_Too_Large,
-}
-
 Parser :: struct {
 	line:          [dynamic]u8,
 	event_type:    [dynamic]u8,
@@ -65,11 +47,8 @@ Parser :: struct {
 	user_data:     rawptr,
 	bom:           [3]u8,
 	bom_len:       int,
-	line_len:      int,
-	event_bytes:   int,
 	pending_cr:    bool,
 	finished:      bool,
-	error:         Error,
 }
 
 // parser_init prepares parser for one stream. callback may be nil. user_data is
@@ -93,34 +72,23 @@ parser_destroy :: proc(parser: ^Parser) {
 	parser^ = {}
 }
 
-// parser_error reports the parser's sticky error, which is .None until one is
-// raised.
-parser_error :: proc(parser: ^Parser) -> Error {
-	return parser.error
-}
-
 // parser_feed consumes the next chunk of the stream and dispatches any events it
 // completes. A chunk may split anywhere -- mid-line, between CR and LF, or inside
-// the leading BOM -- because the parser carries that state between calls.
-//
-// Once an error is raised it is sticky: this and every later call returns it, and
-// no further events are dispatched.
-parser_feed :: proc(parser: ^Parser, bytes: []u8) -> Error {
-	if parser.finished || parser.error != .None { return parser.error }
+// the leading BOM -- because the parser carries that state between calls. Feeding
+// after the stream was finished is a no-op.
+parser_feed :: proc(parser: ^Parser, bytes: []u8) {
+	if parser.finished { return }
 	for byte in bytes {
 		if parser.bom_len < 3 {
 			parser.bom[parser.bom_len] = byte
 			parser.bom_len += 1
 			if parser.bom_len < 3 { continue }
 			if parser.bom == {0xEF, 0xBB, 0xBF} { continue }
-			for prefix_byte in parser.bom[:] {
-				if parser_byte(parser, prefix_byte) != .None { return parser.error }
-			}
+			for prefix_byte in parser.bom[:] { parser_byte(parser, prefix_byte) }
 			continue
 		}
-		if parser_byte(parser, byte) != .None { return parser.error }
+		parser_byte(parser, byte)
 	}
-	return .None
 }
 
 // parser_finish ends the stream: a trailing CR is treated as a line terminator,
@@ -132,58 +100,46 @@ parser_feed :: proc(parser: ^Parser, bytes: []u8) -> Error {
 // every field to end with CRLF, CR, or LF, so a truncated final line is left
 // unprocessed and discarded with the pending data.
 //
-// Calling it twice is harmless; the second call reports the same result.
-parser_finish :: proc(parser: ^Parser) -> Error {
-	if parser.finished { return parser.error }
+// Calling it twice is harmless.
+parser_finish :: proc(parser: ^Parser) {
+	if parser.finished { return }
 	if parser.bom_len > 0 && parser.bom_len < 3 {
 		saved_bom_len := parser.bom_len
 		parser.bom_len = 3
-		for i in 0 ..< saved_bom_len {
-			if parser_byte(parser, parser.bom[i]) != .None { return parser.error }
-		}
+		for i in 0 ..< saved_bom_len { parser_byte(parser, parser.bom[i]) }
 	}
 	if parser.pending_cr {
 		parser.pending_cr = false
-		if parser_line(parser) != .None { return parser.error }
+		parser_line(parser)
 	}
 	// EOF never dispatches an event without a terminating blank line.
 	parser.finished = true
-	return parser.error
 }
 
 @(private)
-parser_byte :: proc(parser: ^Parser, byte: u8) -> Error {
+parser_byte :: proc(parser: ^Parser, byte: u8) {
 	if parser.pending_cr {
 		parser.pending_cr = false
-		if byte == '\n' { return parser_line(parser) }
-		if parser_line(parser) != .None { return parser.error }
+		if byte == '\n' { parser_line(parser); return }
+		parser_line(parser)
 	}
 	if byte == '\r' {
 		parser.pending_cr = true
-		return .None
+		return
 	}
-	if byte == '\n' { return parser_line(parser) }
-	if parser.line_len >= MAX_LINE_BYTES {
-		parser.error = .Line_Too_Long
-		return parser.error
-	}
+	if byte == '\n' { parser_line(parser); return }
 	append(&parser.line, byte)
-	parser.line_len += 1
-	return .None
 }
 
 @(private)
-parser_line :: proc(parser: ^Parser) -> Error {
-	line := parser.line[:parser.line_len]
+parser_line :: proc(parser: ^Parser) {
+	line := parser.line[:]
 	if len(line) == 0 {
-		if parser_dispatch(parser) != .None { return parser.error }
+		parser_dispatch(parser)
 	} else {
 		parser_field(parser, line)
-		if parser.error != .None { return parser.error }
 	}
 	clear(&parser.line)
-	parser.line_len = 0
-	return .None
 }
 
 @(private)
@@ -211,16 +167,9 @@ parser_field :: proc(parser: ^Parser, line: []u8) {
 		append_decoded_utf8(&parser.event_type, value)
 	case "data":
 		// Appending the value and one LF is what makes several data fields
-		// join with "\n" when the event is dispatched. The budget is charged
-		// after appending, because a decode can expand the value: the
-		// overshoot is bounded by one line's expansion, and the parser is dead
-		// once the error is raised.
-		parser.event_bytes += append_decoded_utf8(&parser.event_data, value) + 1
+		// join with "\n" when the event is dispatched.
+		append_decoded_utf8(&parser.event_data, value)
 		append(&parser.event_data, '\n')
-		if parser.event_bytes > MAX_EVENT_BYTES {
-			parser.error = .Event_Too_Large
-			return
-		}
 	case "id":
 		// A value containing U+0000 NULL means the field is ignored and the
 		// previous last event ID stands. The buffer is not cleared first: the
@@ -246,8 +195,7 @@ contains_null :: proc(value: []u8) -> bool {
 	return false
 }
 
-// append_decoded_utf8 appends value to dst as UTF-8 text and returns the number
-// of bytes appended.
+// append_decoded_utf8 appends value to dst as UTF-8 text.
 //
 // The standard decodes the stream with the UTF-8 decode algorithm, which
 // replaces ill-formed input with U+FFFD. This is that step, applied per field
@@ -261,33 +209,29 @@ contains_null :: proc(value: []u8) -> bool {
 // difference is confined to how many U+FFFD characters malformed input
 // produces: well-formed input is copied byte for byte either way.
 @(private)
-append_decoded_utf8 :: proc(dst: ^[dynamic]u8, value: []u8) -> int {
-	appended := 0
+append_decoded_utf8 :: proc(dst: ^[dynamic]u8, value: []u8) {
 	for i := 0; i < len(value); {
 		r, size := utf8.decode_rune_in_bytes(value[i:])
 		// A well-formed sequence decodes with its own length, including a
 		// literal U+FFFD. An ill-formed byte or a truncated sequence reports
 		// RUNE_ERROR with a length of one.
 		if r == utf8.RUNE_ERROR && size <= 1 {
-			appended += append_replacement_character(dst)
+			append_replacement_character(dst)
 			i += 1
 			continue
 		}
 		width := max(size, 1)
 		append(dst, ..value[i:i + width])
-		appended += width
 		i += width
 	}
-	return appended
 }
 
 @(private)
-append_replacement_character :: proc(dst: ^[dynamic]u8) -> int {
+append_replacement_character :: proc(dst: ^[dynamic]u8) {
 	// U+FFFD REPLACEMENT CHARACTER. Encoded by the standard library rather than
 	// written out as bytes, which is how the wrong character gets in.
 	bytes, size := utf8.encode_rune(utf8.RUNE_ERROR)
 	append(dst, ..bytes[:size])
-	return size
 }
 
 // parse_retry reads a reconnection time. The specification accepts a field value
@@ -308,15 +252,14 @@ parse_retry :: proc(value: []u8) -> (ms: i64, ok: bool) {
 }
 
 @(private)
-parser_dispatch :: proc(parser: ^Parser) -> Error {
+parser_dispatch :: proc(parser: ^Parser) {
 	// A blank line with an empty data buffer dispatches nothing. It still clears
 	// the event type buffer, which the specification requires before returning.
 	// The last event ID buffer is deliberately not cleared: it persists across
 	// dispatches until the stream sets it again.
 	if len(parser.event_data) == 0 {
 		clear(&parser.event_type)
-		parser.event_bytes = 0
-		return .None
+		return
 	}
 
 	data := parser.event_data[:]
@@ -340,6 +283,4 @@ parser_dispatch :: proc(parser: ^Parser) -> Error {
 	if parser.callback != nil { parser.callback(parser.user_data, event) }
 	clear(&parser.event_type)
 	clear(&parser.event_data)
-	parser.event_bytes = 0
-	return .None
 }
