@@ -142,22 +142,14 @@ log_correlation :: proc(chat: ^Chat_Session) -> Log_Correlation {
 	return correlation
 }
 
-// log_active_binding returns the sink and correlation the installed logger
-// carries, or a zero binding when there is none. It is how a worker that must log
-// without borrowing a caller's stack binding copies one it can own.
-log_active_binding :: proc() -> Log_Binding {
-	logger := context.logger
-	if logger.procedure != log_procedure { return {} }
-	binding := cast(^Log_Binding)logger.data
-	if binding == nil { return {} }
-	return binding^
-}
-
 // log_correlation_for_request is log_correlation for work that belongs to a
 // request the session is not currently running, such as a background compaction.
+// The running operation is not this request's, so it contributes nothing.
 log_correlation_for_request :: proc(chat: ^Chat_Session, request_no: session.Request_No) -> Log_Correlation {
 	correlation := log_correlation(chat)
 	correlation.request_no = request_no
+	correlation.operation_id = 0
+	correlation.call_id = ""
 	return correlation
 }
 

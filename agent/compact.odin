@@ -242,8 +242,6 @@ Compact_Job :: struct {
 	locked:     mem.Mutex_Allocator,
 	allocator:  mem.Allocator,
 	backing:    mem.Allocator,
-	binding:    Log_Binding,
-
 	output:     [dynamic]u8, // owner after join
 	reason:     ai.Provider_Finish_Reason,
 	tool_calls: int,
@@ -307,8 +305,8 @@ chat_compact_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 }
 
 // chat_compact_worker is the summarization request itself. It touches no session
-// state, runs no tool, and reports nothing to the front-end: the owner reads its
-// result when it joins.
+// state, runs no tool, and reports nothing: the owner reads its result when it
+// joins, and the owner records the compaction's lifecycle.
 @(private)
 chat_compact_worker :: proc(thread: ^thread.Thread) {
 	job := cast(^Compact_Job)thread.data
@@ -316,7 +314,6 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 	// is the heap. Adopting the job's allocator keeps everything the request
 	// allocates owned by the allocator the owner will release it with.
 	context.allocator = job.allocator
-	context.logger = log_logger(&job.binding)
 	job.started_at = time.tick_now()
 
 	connection := ai.Provider_Connection {
@@ -487,8 +484,6 @@ chat_compact_start :: proc(
 		return false
 	}
 	job.snapshot = snapshot
-	job.binding = log_active_binding()
-	job.binding.correlation = log_correlation_for_request(chat, request_no)
 
 	// The worker must never run the process signal handler, so the handled signals
 	// are blocked across the thread's creation: a thread inherits the mask its
@@ -517,6 +512,10 @@ chat_compact_start :: proc(
 		{key = "estimate", value = i64(compact_prep.estimate)},
 		{key = "context_window", value = i64(chat.context_window)},
 	}
+	// The record names the compaction request, not whichever foreground request
+	// happened to be at the boundary when it started.
+	binding: Log_Binding
+	context.logger = log_rebind(&binding, log_correlation_for_request(chat, request_no))
 	log_emit({level = .Info, category = .Provider, event = "compaction.started", fields = fields[:]})
 	return true
 }
@@ -555,7 +554,7 @@ chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
 		chat_compact_adopt(chat, observer, job)
 	case .Retiring:
 		chat_compact_finish_request(chat, job.request_no, .Cancelled, "", "cancelled")
-		chat_compact_destroy_job(control, job)
+		chat_compact_failed_job(control, job)
 		_observer_message(observer, .Notice, "compaction cancelled")
 	case .Idle, .Ready:
 	}
@@ -576,7 +575,7 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 	if !worthwhile {
 		reason := chat_compact_reason(job)
 		chat_compact_finish_request(chat, job.request_no, .Failed, "", reason)
-		chat_compact_destroy_job(control, job)
+		chat_compact_failed_job(control, job)
 		_observer_message(observer, .Warning, fmt.tprintf("compaction produced nothing usable: %s", reason))
 		return
 	}
@@ -601,11 +600,18 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 
 @(private)
 chat_compact_destroy_job :: proc(control: ^Compact_Control, job: ^Compact_Job) {
-	control.last_failure_at_ms = session.now_ms()
 	control.trigger = .None
 	control.job = nil
 	control.state = .Idle
 	chat_compact_job_destroy(job)
+}
+
+// chat_compact_failed_job releases a job that produced nothing usable and records
+// when it happened, so a later boundary does not immediately try again.
+@(private)
+chat_compact_failed_job :: proc(control: ^Compact_Control, job: ^Compact_Job) {
+	control.last_failure_at_ms = session.now_ms()
+	chat_compact_destroy_job(control, job)
 }
 
 // chat_compact_install commits the candidate's checkpoint and drops the job. The
@@ -632,7 +638,7 @@ chat_compact_install :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 	)
 	if install_err != nil {
 		local := install_err
-		chat_compact_destroy_job(control, job)
+		chat_compact_failed_job(control, job)
 		_observer_message(observer, .Warning, fmt.tprintf("the compaction summary was not installed: %s", session.error_detail(&local)))
 		return false
 	}

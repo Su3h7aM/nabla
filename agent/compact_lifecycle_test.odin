@@ -388,3 +388,26 @@ test_the_compact_tool_records_an_intent_and_returns :: proc(t: ^testing.T) {
 	testing.expect_value(t, chat.compact.pending, Compact_Trigger.Agent_Tool)
 	testing.expect_value(t, chat.compact.state, Compact_State.Idle)
 }
+
+// A command while the session is settled starts the work immediately: there is no
+// request boundary to wait for, and the request it freezes is the one it would
+// send next.
+@(test)
+test_the_compact_command_starts_a_job_while_idle :: proc(t: ^testing.T) {
+	setup: Compact_Setup
+	if !compact_setup_begin(t, &setup) { return }
+	defer compact_setup_end(t, &setup)
+	chat := &setup.chat.chat
+	chat.state = .Idle
+
+	background := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = compact_provider_endpoint(&setup.background, context.temp_allocator),
+	}
+	testing.expect(t, chat_command_compact(chat, {}, background, nil))
+	testing.expect_value(t, chat.compact.state, Compact_State.Running)
+	testing.expect_value(t, chat.compact.trigger, Compact_Trigger.User_Command)
+	if !sync.sema_wait_with_timeout(&setup.background.reached, COMPACT_TEST_BOUND) {
+		testing.fail_now(t, "the summarizer was never asked")
+	}
+}
