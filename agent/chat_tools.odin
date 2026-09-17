@@ -32,11 +32,13 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		log_emit({level = .Info, category = .Tool, event = "tool.call_received", fields = received[:]})
 
 		ctx := Tool_Context {
-			call_id   = staged.id,
-			workspace = chat.workspace,
-			control   = control,
-			allocator = chat.allocator,
-			skills    = chat_skill_catalog(chat),
+			call_id    = staged.id,
+			workspace  = chat.workspace,
+			control    = control,
+			allocator  = chat.allocator,
+			skills     = chat_skill_catalog(chat),
+			compact    = &chat.compact,
+			source_seq = staged.seq,
 		}
 		result: Tool_Result
 
@@ -98,6 +100,8 @@ chat_prepare_call :: proc(
 		allocator = chat.allocator,
 		skills = chat_skill_catalog(chat),
 		backend = definition.backend,
+		compact = &chat.compact,
+		source_seq = staged.seq,
 	}
 	arguments := tool_arguments_prepare(staged.arguments, chat.allocator)
 	defer tool_arguments_destroy(&arguments, chat.allocator)

@@ -502,8 +502,14 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	model := &app.setup.catalog.models[model_index]
 
 	running := &app.setup.session
+	// A different model means a different window and a different cache identity, so
+	// a summary computed for the previous one is no longer a summary of this
+	// conversation. It is stopped here rather than installed against the old base.
+	agent.chat_compact_cancel(running)
 	window, _ := agent.chat_context_window(model^)
 	running.context_window = window
+	running.last_estimate = 0
+	running.last_input_measured_present = false
 	running.max_output_tokens = model.max_output_tokens
 	running.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(api)
 	// The request record names the provider and model each request was sent to,

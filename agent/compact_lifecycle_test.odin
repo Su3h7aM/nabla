@@ -355,3 +355,36 @@ test_destroying_a_session_stops_its_compaction :: proc(t: ^testing.T) {
 	// provider is released so the worker can actually observe the interrupt.
 	compact_setup_end(t, &setup)
 }
+
+// The agent's own trigger reaches the same intent the automatic path and the
+// command reach, and it returns without waiting for anything.
+@(test)
+test_the_compact_tool_records_an_intent_and_returns :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "run it")
+
+	advertised := false
+	for definition in chat.tools.definitions {
+		if definition.name == TOOL_COMPACT_NAME { advertised = true }
+	}
+	testing.expect(t, advertised, "the harness must advertise context.compact")
+
+	_test_stage_call(t, chat, "call_compact", `{}`, TOOL_COMPACT_NAME)
+	testing.expect_value(t, chat_run_tools(chat, {}), 1)
+
+	entries := _test_entries(t, chat)
+	defer session.entries_destroy(entries, context.allocator)
+	result, is_result := entries[len(entries) - 1].payload.(session.Tool_Result_Entry)
+	if !testing.expect(t, is_result, "the call must have a result") { return }
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
+	testing.expect(t, strings.contains(result.content, `"state":"scheduled"`), "the result says the work was queued")
+
+	// The intent is recorded, and nothing has started: a job starts at the next
+	// request boundary, where the prefix it covers is a closed execution.
+	testing.expect_value(t, chat.compact.pending, Compact_Trigger.Agent_Tool)
+	testing.expect_value(t, chat.compact.state, Compact_State.Idle)
+}

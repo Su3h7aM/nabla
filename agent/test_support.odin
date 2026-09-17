@@ -103,7 +103,7 @@ _test_settle :: proc(t: ^testing.T, chat: ^Chat_Session) -> Chat_Effect {
 // _test_stage_call stages a provider call for execution exactly as a completed
 // response does: the call entry is recorded first, and the staged call points at
 // it, so the dispatch and the result can name the same call.
-_test_stage_call :: proc(t: ^testing.T, chat: ^Chat_Session, id, arguments: string) {
+_test_stage_call :: proc(t: ^testing.T, chat: ^Chat_Session, id, arguments: string, name := TOOL_SHELL_NAME) {
 	seq := _test_append(
 		t,
 		chat,
@@ -111,14 +111,14 @@ _test_stage_call :: proc(t: ^testing.T, chat: ^Chat_Session, id, arguments: stri
 			turn_no = chat.turn_no,
 			request_no = chat.active_request,
 			created_at_ms = session.now_ms(),
-			payload = session.Tool_Call_Entry{call_id = id, name = TOOL_SHELL_NAME, arguments = arguments},
+			payload = session.Tool_Call_Entry{call_id = id, name = name, arguments = arguments},
 		},
 	)
 	append(
 		&chat.pending_calls,
 		Chat_Tool_Call {
 			id = chat_clone_string(id, chat.allocator),
-			name = chat_clone_string(TOOL_SHELL_NAME, chat.allocator),
+			name = chat_clone_string(name, chat.allocator),
 			arguments = chat_clone_string(arguments, chat.allocator),
 			seq = seq,
 		},

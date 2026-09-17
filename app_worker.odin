@@ -7,6 +7,7 @@ import "core:strings"
 import "core:sync"
 import "core:sync/chan"
 import "core:thread"
+import "core:time"
 
 import "nabla:agent"
 import "nabla:agent/session"
@@ -26,9 +27,20 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 	// worker touches the store.
 	session_refresh_rows(app)
 	for {
-		work, ok := chan.recv(app.run.work)
+		work, ok := chan.try_recv(app.run.work)
 		if !ok {
-			return
+			// Nothing is queued. A compaction that is still running has to be looked
+			// at even with no work to do, or a finished summary would wait for the
+			// next prompt to be installed.
+			if app_compaction_pending(app) {
+				if app_compaction_tick(app, observer) { refresh_status(app) }
+				time.sleep(WORK_IDLE_POLL)
+				continue
+			}
+			work, ok = chan.recv(app.run.work)
+			if !ok {
+				return
+			}
 		}
 		if runtime_stopping(app) {
 			work_destroy(app, work)
@@ -47,6 +59,28 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 		if !more { break }
 		work_destroy(app, queued)
 	}
+}
+
+// WORK_IDLE_POLL is how often the worker looks at a compaction that is still
+// running. It bounds how long a finished summary waits when no command arrives,
+// and it is a scheduling delay, not a token budget: nothing about the model or
+// the context depends on it.
+WORK_IDLE_POLL :: 50 * time.Millisecond
+
+// app_compaction_pending reports whether the open session has compaction work to
+// look at. A session that is not open has no control to poll, and its zero state
+// is idle.
+app_compaction_pending :: proc(app: ^App) -> bool {
+	if app.setup.session.store == nil { return false }
+	return app.setup.session.compact.state != agent.Compact_State.Idle
+}
+
+// app_compaction_tick advances the session's compaction by one look: it adopts a
+// finished job, and installs a summary whose boundary has arrived. True means the
+// active context changed and the status line it describes is stale.
+app_compaction_tick :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
+	if app.setup.session.store == nil { return false }
+	return agent.chat_compact_service(&app.setup.session, observer)
 }
 
 // work_destroy releases the strings a queued command owns.

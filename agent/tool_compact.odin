@@ -1,0 +1,46 @@
+package agent
+
+import "core:encoding/json"
+
+// context.compact lets the agent ask for a checkpoint at a boundary it chooses.
+// It records the same intent the automatic path and /compact record, and returns
+// immediately: the summary is produced in the background and installed when the
+// context it replaces is nearly full, so nothing the agent is doing is
+// interrupted. A caller that wants the new context now does not get it here.
+
+TOOL_COMPACT_NAME :: "context.compact"
+
+TOOL_COMPACT_DESCRIPTION :: "Record the conversation up to this point as a checkpoint and continue from a shorter context. The summary is produced in the background, so this returns immediately and the current context keeps working until it is nearly full. Call this when one piece of work is finished and the next is about to start."
+
+TOOL_COMPACT_SCHEMA :: `{"type":"object","properties":{},"additionalProperties":false}`
+
+Compact_Tool_Data :: struct {
+	state: string `json:"state"`,
+}
+
+TOOL_COMPACT_DEFINITION :: Tool_Definition {
+	name = TOOL_COMPACT_NAME,
+	description = TOOL_COMPACT_DESCRIPTION,
+	input_schema = TOOL_COMPACT_SCHEMA,
+	// Recording an intent changes nothing the model or the user can observe, and
+	// asking twice is the same as asking once.
+	hints = {read_only = .No, destructive = .No, idempotent = .Yes, open_world = .No},
+	execute = tool_compact_execute,
+}
+
+tool_compact_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+	if known_error := tool_fields_known(arguments, nil, allocator = ctx.allocator); known_error.kind != .None {
+		return tool_result_refused(ctx, &known_error)
+	}
+	if ctx.compact == nil {
+		return tool_result_failure(ctx, .Unavailable, "compaction is not available in this session", "unavailable")
+	}
+	switch compact_request_intent(ctx.compact, .Agent_Tool, ctx.source_seq) {
+	case .Scheduled:
+		return tool_result_success(ctx, Compact_Tool_Data{state = "scheduled"}, "scheduled")
+	case .Already_Scheduled:
+		return tool_result_success(ctx, Compact_Tool_Data{state = "already_running"}, "already running")
+	case .Unavailable:
+	}
+	return tool_result_failure(ctx, .Unavailable, "compaction is not available right now", "unavailable")
+}

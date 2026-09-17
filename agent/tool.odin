@@ -41,6 +41,12 @@ Tool_Context :: struct {
 	// through this struct. The registry owner keeps it alive until no registry
 	// or in-flight turn can use it.
 	backend:        rawptr,
+	// compact is the session's compaction control, available only to native tools
+	// that ask for a context change. It is borrowed and lives as long as the
+	// session. source_seq is the committed call this execution belongs to, which is
+	// how such a tool names the boundary it was called at.
+	compact:        ^Compact_Control,
+	source_seq:     session.Seq,
 }
 
 // Tool_Execute runs one admitted call. Returning .Invalid_Arguments promises the
@@ -499,6 +505,7 @@ TOOL_NATIVE := [?]Tool_Definition {
 	TOOL_WRITE_DEFINITION,
 	TOOL_LIST_SKILLS_DEFINITION,
 	TOOL_LOAD_SKILL_DEFINITION,
+	TOOL_COMPACT_DEFINITION,
 }
 
 // TOOL_RECOVERED_RESULT and TOOL_UNEXECUTED_RESULT are what recovery writes for a

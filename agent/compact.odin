@@ -379,12 +379,13 @@ chat_compact_reason :: proc(job: ^Compact_Job) -> string {
 
 // --- owner-side lifecycle ----------------------------------------------------
 
-// chat_compact_request records an intent to compact. It starts nothing: a job is
-// frozen at a request boundary, where the context is a closed execution and the
-// bytes about to be sent are the bytes the summary will cover.
-chat_compact_request :: proc(chat: ^Chat_Session, trigger: Compact_Trigger, source_seq: Maybe(session.Seq) = nil) -> Compact_Request_Result {
-	control := &chat.compact
-	if chat.storage_failed || control.state == .Retiring { return .Unavailable }
+// compact_request_intent records an intent to compact without starting anything. A
+// job is frozen at a request boundary, where the context is a closed execution and
+// the bytes about to be sent are the bytes the summary will cover. Every trigger
+// meets here, so the automatic path, the tool, and the command cannot disagree
+// about what a request means.
+compact_request_intent :: proc(control: ^Compact_Control, trigger: Compact_Trigger, source_seq: Maybe(session.Seq)) -> Compact_Request_Result {
+	if control.state == .Retiring { return .Unavailable }
 	if control.state == .Running || control.state == .Ready {
 		// The new intent does not change the frozen prefix, so it only makes the
 		// finished summary install sooner.
@@ -395,6 +396,12 @@ chat_compact_request :: proc(chat: ^Chat_Session, trigger: Compact_Trigger, sour
 	control.pending = trigger
 	control.pending_source_seq = source_seq
 	return .Scheduled
+}
+
+// chat_compact_request records an intent to compact for a whole session.
+chat_compact_request :: proc(chat: ^Chat_Session, trigger: Compact_Trigger, source_seq: Maybe(session.Seq) = nil) -> Compact_Request_Result {
+	if chat.storage_failed { return .Unavailable }
+	return compact_request_intent(&chat.compact, trigger, source_seq)
 }
 
 // chat_compact_retry_allowed keeps a failed summarization from being retried at
@@ -764,6 +771,8 @@ chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, conne
 	}
 	if chat.compact.state == .Running {
 		_observer_message(observer, .Notice, "compacting the current context in the background")
+	} else if chat.compact.pending != .None {
+		_observer_message(observer, .Notice, "compaction will start at the next request boundary")
 	} else {
 		_observer_message(observer, .Notice, "nothing to compact")
 	}
