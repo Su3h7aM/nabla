@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:encoding/json"
 import "core:log"
 import "core:os"
 import "core:strings"
@@ -12,12 +13,23 @@ import "nabla:ai"
 // The state machine is driven here through the same helpers the rest of the suite
 // uses, so a test reads back what the harness actually recorded for a real turn
 // rather than what a hand-built record would have said.
+//
+// Every test here installs the harness sink on context.logger, and then has to
+// put the test runner's logger back before it asserts anything. core:testing
+// reports a failure by logging it, so a failure logged while the sink is
+// installed is written into the log under test: the assertion is lost and the
+// test passes. fixture.ambient is the runner's logger, and assigning it in the
+// test's own scope is what restores it, because an assignment to context inside a
+// callee configures only that callee.
 
 Log_Chat_Test :: struct {
 	chat:      Chat_Test,
-	log:       Log,
+	sink:      Log,
 	binding:   Log_Binding,
 	logs_root: string,
+	// ambient is the logger the test runner installed. Every test saves it back onto
+	// context.logger in its own scope before it asserts anything.
+	ambient:   log.Logger,
 }
 
 // log_chat_begin is chat_test_begin with a writer attached, so the turn the test
@@ -25,30 +37,35 @@ Log_Chat_Test :: struct {
 // install: a helper cannot configure its caller's context, so the binding lives in
 // the fixture and the caller assigns it in its own scope.
 log_chat_begin :: proc(t: ^testing.T, fixture: ^Log_Chat_Test, workspace: string, lowest := log.Level.Info) -> log.Logger {
+	fixture.ambient = context.logger
 	logs_root, root_err := os.make_directory_temp("", "nabla-log-events-*", context.allocator)
 	if root_err != nil { testing.fail_now(t, "could not create a temporary logs root") }
 	fixture.logs_root = logs_root
-	if _, open_err := log_open(&fixture.log, {directory = logs_root, enabled = true, lowest = lowest}); open_err != nil {
+	if _, open_err := log_open(&fixture.sink, {directory = logs_root, enabled = true, lowest = lowest}); open_err != nil {
 		testing.fail_now(t, "the log could not be opened")
 	}
 	chat_test_begin(t, &fixture.chat, workspace)
 	fixture.binding = Log_Binding {
-		sink = &fixture.log,
+		sink = &fixture.sink,
 	}
 	return log_logger(&fixture.binding)
 }
 
 log_chat_end :: proc(t: ^testing.T, fixture: ^Log_Chat_Test) {
+	// Restored first, so a failure inside the teardown below still reaches the test
+	// runner rather than the sink being closed.
+	context.logger = fixture.ambient
 	chat_test_end(t, &fixture.chat)
-	_ = log_close(&fixture.log)
+	_ = log_close(&fixture.sink)
 	os.remove_all(fixture.logs_root)
 	delete(fixture.logs_root, context.allocator)
 	fixture^ = {}
 }
 
 log_chat_text :: proc(t: ^testing.T, fixture: ^Log_Chat_Test) -> string {
-	return log_test_text(t, log_test_directory_segment(fixture.log.directory, 1))
+	return log_test_text(t, log_test_directory_segment(fixture.sink.directory, 1))
 }
+
 
 // log_chat_cancel_turn drives one turn to a cancelled end, which is the shortest
 // path that reaches both ends of the turn without a provider.
@@ -78,6 +95,7 @@ test_a_turn_records_its_start_and_end :: proc(t: ^testing.T) {
 	log_chat_cancel_turn(t, chat)
 	chat_cancel_reset()
 
+	context.logger = fixture.ambient
 	text := log_chat_text(t, &fixture)
 	defer delete(text, context.allocator)
 	testing.expect(t, strings.contains(text, `"event":"turn.started"`), "the turn start is recorded")
@@ -116,6 +134,7 @@ test_a_superseded_operation_is_recorded :: proc(t: ^testing.T) {
 	chat_effect_destroy(&effect)
 	chat_session_retire_operation(chat)
 
+	context.logger = fixture.ambient
 	text := log_chat_text(t, &fixture)
 	defer delete(text, context.allocator)
 	testing.expect(t, strings.contains(text, `"event":"agent.event_ignored"`), "the dropped event is recorded")
@@ -149,6 +168,7 @@ test_a_tool_call_is_recorded_from_call_to_result :: proc(t: ^testing.T) {
 	chat.state = .Executing_Tools
 	testing.expect_value(t, chat_run_tools(chat, {}), 1)
 
+	context.logger = fixture.ambient
 	text := log_chat_text(t, &fixture)
 	defer delete(text, context.allocator)
 	// Every stage of the call, in the order it happened.
@@ -186,6 +206,7 @@ test_the_provider_record_names_the_encoded_body :: proc(t: ^testing.T) {
 	observation: Provider_Log
 	log_provider_report(&observation, report)
 
+	context.logger = fixture.ambient
 	text := log_chat_text(t, &fixture)
 	defer delete(text, context.allocator)
 	testing.expect(t, strings.contains(text, `"event":"provider.encoded"`), "the encoded body is recorded")
@@ -230,7 +251,9 @@ test_an_admission_decision_is_recorded :: proc(t: ^testing.T) {
 	defer log_chat_end(t, &fixture)
 	chat := &fixture.chat.chat
 
-	chat.context_window = 1_000
+	// The window has to hold the estimate plus the reserved output plus the margin,
+	// or nothing is ever admitted.
+	chat.context_window = 20_000
 	chat.max_output_tokens = 0
 	message, admitted := chat_admission_check(chat, 10)
 	testing.expect(t, admitted, "a small request fits")
@@ -239,6 +262,7 @@ test_an_admission_decision_is_recorded :: proc(t: ^testing.T) {
 	_, refused := chat_admission_check(chat, 100_000)
 	testing.expect(t, !refused, "an oversized request is refused")
 
+	context.logger = fixture.ambient
 	text := log_chat_text(t, &fixture)
 	defer delete(text, context.allocator)
 	testing.expect(t, strings.contains(text, `"event":"request.admission"`), "the decision is recorded")
@@ -260,6 +284,7 @@ test_compaction_outside_a_turn_records_its_own_scope :: proc(t: ^testing.T) {
 	prep: Chat_Request_Prep
 	testing.expect(t, !chat_compact(chat, {}, {}, &prep, nil))
 
+	context.logger = fixture.ambient
 	text := log_chat_text(t, &fixture)
 	defer delete(text, context.allocator)
 	testing.expect(t, strings.contains(text, `"event":"compaction.finished"`), "the attempt is recorded")
@@ -280,6 +305,7 @@ test_a_compaction_inside_a_turn_carries_the_turn :: proc(t: ^testing.T) {
 	prep: Chat_Request_Prep
 	testing.expect(t, !chat_compact(chat, {}, {}, &prep, nil))
 
+	context.logger = fixture.ambient
 	text := log_chat_text(t, &fixture)
 	defer delete(text, context.allocator)
 	testing.expect(t, strings.contains(text, `"event":"compaction.finished"`), "the attempt is recorded")
@@ -322,4 +348,77 @@ test_a_transfer_account_belongs_to_one_attempt :: proc(t: ^testing.T) {
 	testing.expect_value(t, second.transfer.request_bytes_accepted, u64(0))
 	testing.expect_value(t, second.transfer.stopped_at, ai.Provider_Transfer_Phase.Validate)
 	testing.expect(t, !second.transfer.response_head_received, "no head was received by an attempt that never ran")
+}
+
+@(test)
+test_preparation_never_names_the_previous_request :: proc(t: ^testing.T) {
+	fixture: Log_Chat_Test
+	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
+	defer log_chat_end(t, &fixture)
+	chat := &fixture.chat.chat
+
+	_test_accept(t, chat, "first")
+	// Admission has to accept, or the request would compact instead, and a
+	// compaction is a second provider request this test is not about.
+	chat.context_window = 256_000
+	chat.max_output_tokens = 16_000
+
+	// A URL this client refuses fails the attempt as an invalid request, which is
+	// not retried. So both requests are recorded without being sent, and the test
+	// does not wait out a retry backoff.
+	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
+	defer delete(usages)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = "ftp://not-a-provider",
+	}
+
+	chat_perform_request(chat, connection, {}, &usages)
+	// The second request of one turn is where the defect showed: the durable
+	// number the first request left behind is not this request's identity.
+	chat_perform_request(chat, connection, {}, &usages)
+
+	context.logger = fixture.ambient
+	text := log_chat_text(t, &fixture)
+	defer delete(text, context.allocator)
+
+	// A preparation record is emitted before its request has a number, so it must
+	// carry none. Naming the previous request is worse than naming nothing: a
+	// reader filtering for one request would read the other request's estimate.
+	prepared, recorded := 0, 0
+	for line in strings.split_lines(text, context.temp_allocator) {
+		if line == "" { continue }
+		value, parse_err := parse_log_line(line)
+		if parse_err { continue }
+		object, is_object := value.(json.Object)
+		if !is_object {
+			json.destroy_value(value, context.temp_allocator)
+			continue
+		}
+		event, _ := object["event"].(json.String)
+		switch string(event) {
+		case "request.prepared", "request.admission":
+			prepared += 1
+			_, named := object["request_no"]
+			testing.expectf(t, !named, "%s must not name a request: %s", event, line)
+		case "request.recorded":
+			recorded += 1
+			_, named := object["request_no"]
+			testing.expectf(t, named, "request.recorded must name its request: %s", line)
+		}
+		json.destroy_value(value, context.temp_allocator)
+	}
+	// Two requests were prepared and recorded, so the assertions above saw both
+	// requests rather than passing over an empty stream.
+	testing.expect_value(t, prepared, 4)
+	testing.expect_value(t, recorded, 2)
+}
+
+// parse_log_line reads one record the writer produced. The presence of a key is
+// what these tests ask about, so the object is returned rather than a struct: a
+// zero json.Value is the Null variant, which is not the same as an absent field.
+@(private)
+parse_log_line :: proc(line: string) -> (json.Value, bool) {
+	value, parse_err := json.parse_string(line, parse_integers = true, allocator = context.temp_allocator)
+	return value, parse_err != .None
 }

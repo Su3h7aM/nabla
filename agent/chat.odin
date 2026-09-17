@@ -137,6 +137,12 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 @(private)
 chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, observer: Chat_Observer, usages: ^[dynamic]Chat_Request_Usage) {
 	if chat.skill_instructions == "" && !chat_ensure_instructions(chat) { return }
+	// This request has no durable number yet, and the one the previous request
+	// left behind is not its own. Clearing it here is what keeps the preparation
+	// records from naming the wrong request; the number is set again from what
+	// request_begin returns. The tool loop has already recorded the previous
+	// request's calls by now, so nothing else needs the old value.
+	chat.active_request = nil
 	// This request's correlation is narrowed once and refreshed as each identity
 	// becomes durable: the request number after request_begin, the attempt inside
 	// the retry loop. Nothing here invents an identity before it exists.
