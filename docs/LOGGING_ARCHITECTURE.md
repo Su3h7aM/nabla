@@ -1,11 +1,10 @@
 # Harness logging and diagnostics architecture
 
-Status: authoritative architecture and close-out plan. The writer, context migration,
-correlation, lifecycle records, provider capture, MCP lifecycle evidence, reader, and
-export are implemented. Four bounded changes remain: the read-only request join, the final
-HTTP transfer summary, MCP wire capture, and the ordinary-log privacy audit. Follow mode
-is not part of the logging system. Section 15 gives the implementation order and the gate
-that closes this work.
+Status: authoritative architecture, implemented. The writer, context migration,
+correlation, lifecycle records, provider and MCP capture, transport accounting, reader,
+export, and the request join are all in place. Section 4.1 records what the migration
+closed and what was decided against; section 15 records what each phase now contains and
+the gate this work was held to. Follow mode is the one explicit non-goal.
 
 This plan is based on the complete *Nabla Logging Reference Study: goose + opencode*,
 including its appendices, at
@@ -243,7 +242,7 @@ adds only what does not.
 | process start and end | implemented `run.started` and `run.finished` | correct lifetime coverage and report sink/close failures |
 | storage commit results | `agent/session` returns | emit calls only |
 
-### 4.1 What the migration closed, and the final close-out decisions
+### 4.1 What the migration closed, and what was decided against
 
 Closed by the migration and the phases that followed:
 
@@ -261,23 +260,24 @@ Closed by the migration and the phases that followed:
 | Root ignored `log_close` errors and never surfaced latched failure | The close error is reported on stderr after the terminal is gone, and a latched write failure is surfaced once at a work boundary |
 | Reader accepted any matching object and only six-digit segment names | The envelope's version and run id are checked before its contents are believed; segment order comes from the parsed number; a symlink is never followed; a segment is read only up to the size it had when the read began |
 | Existing open paths did not enforce the full no-symlink contract | Segment reads use `lstat` and never follow a link |
+| The transport could not say how far a request got | `http/client` reports one summary per request: the stopping phase, accepted plaintext bytes, request completeness, status, and declared length. `ai` maps it and `attempt.finished` carries it |
+| Nothing could observe an MCP message before it left or after it arrived | `mcp.Operation_Options` carries an operation-scoped observer that borrows complete JSON-RPC lines; `agent` captures each line as its own artifact |
+| The session database could only be opened for writing | `sqlite.Open_Mode` and `session.store_open_read_only` read it without a claim, creation, or migration; `diagnostics --request` reports the row and the export writes `request.json` |
+| A library diagnostic that reaches `context.logger` now reaches a file | The `http` producers carry structural facts rather than request targets, request and header lines, and file paths. Reviewed: what remains interpolates only error enums, socket numbers, byte counts, and the request method |
+| `storage.failed` carried the store's raw message | It records the classification and the detail's length; the text stays in the session's own last error, which the front-end shows |
 
-The remaining decisions are final:
+Decided against, and why:
 
 | Item | Decision |
 |---|---|
-| HTTP transfer observation | Implement one completion callback per request. It reports the stopping phase, accepted plaintext request bytes, response status, and declared length. It never reports payload or headers and never claims peer receipt |
-| MCP payload capture | Implement an operation-scoped observer in `mcp.Operation_Options`. It borrows complete outgoing and incoming JSON-RPC lines. `agent` captures each line as one bounded artifact and links it through capture metadata |
-| MCP stderr capture | Do not implement it. Stderr belongs to the server process, not one JSON-RPC operation, and the drainer runs on another thread without request correlation. Keep the bounded excerpt and byte metadata on failures |
-| Session database join | Implement a true read-only SQLite and store open path. With `--request`, stderr shows the authoritative outcome and usage; export adds a separate `request.json`. Original log lines on stdout remain untouched |
-| Follow mode and live replay | Do not implement it as part of logging. Batch read and bounded export answer the current debugging need. A live tail would be a separate diagnostics feature with its own rotation and retention contract |
+| MCP stderr capture | Not implemented. Stderr belongs to the server process rather than to one JSON-RPC operation, and the drainer runs on another thread with no request correlation. The bounded excerpt and byte count on failure stay as they were |
+| Follow mode and live replay | Not implemented. Batch read and bounded export answer the current debugging need, and a live tail would need its own rotation and retention contract. The `(run_id, seq)` cursor is in the format if a later feature wants one |
+| Non-2xx response body capture | Not implemented. The transport already reads a bounded excerpt for `Failure.detail`, and draining more would change transport work for diagnostics |
+| SQLite `immutable=1` for the read-only reader | Not used. A harness may be writing the write-ahead log at the same time, and immutable mode disables the change and locking checks that make that safe |
 
-The privacy review is also close-out work. Existing `core:log` producers in `http` that
-print raw request targets, request lines, header lines, or local paths must be removed or
-changed to structural facts before a future process combines the HTTP server with this
-persistent sink. Redaction does not belong in the sink because formatted text has already
-lost field boundaries. A UI notice, command stdout, and a diagnostic record remain three
-different destinations.
+Redaction does not belong in the sink, because formatted text has already lost its field
+boundaries. A UI notice, command stdout, and a diagnostic record remain three different
+destinations.
 
 ### 4.2 Constraints
 
@@ -476,9 +476,8 @@ an enabled open requires a valid directory and returns a concrete error otherwis
 | `Capture` | borrowed `Log`, kind, open fd, storage allowance, observed and stored byte counts, observed and stored SHA-256 contexts, truncated and failed flags, generated basename, owned correlation and descriptor copies | owned by one operation; `log_capture_finish` or `log_capture_abort` closes it exactly once |
 | `Capture_Summary` | identity, counts, digests, completeness and truncation facts | value result with fixed-size ids and digests, no borrowed capture state |
 
-`Capture_Mode :: enum { Off, Payloads }` has `Off` as zero. The final
-`Capture_Kind` is `{ Invalid, Provider_Request, Provider_Response, MCP_Outgoing,
-MCP_Incoming }`. `Run_Seq :: distinct u64` inside the package.
+`Capture_Mode :: enum { Off, Payloads }` has `Off` as zero. `Capture_Kind` is
+`{ Invalid, Provider_Request, Provider_Response, MCP_Outgoing, MCP_Incoming }`. `Run_Seq :: distinct u64` inside the package.
 
 Digests use `core:crypto/sha2`: `Context_256`, `init_256`, `update`, `final(ctx,
 hash[:])`, with `DIGEST_SIZE_256` of 32 bytes. Digests are stored as `[32]u8` and rendered
@@ -1317,6 +1316,14 @@ The command exits 1 for no matching records, unreadable evidence, malformed line
 scan limit, or failed output. Bad arguments exit 2. The visitor stops scanning on a failed
 write, including a short write or a failure to write the record's newline.
 
+A `--request` selection answers with two halves, and the exit code answers whether the
+whole answer was found: the durable row must be read and the record stream must hold
+something. So a session whose rows exist but whose run never logged exits 1 with the row on
+stderr and an empty stdout, which is the honest report rather than a claim of success. The
+export answers a different question, because its bundle states its own omissions: it exits 0
+whenever a complete manifest was written and 1 when the join it was asked for could not be
+made.
+
 Run framing (`run.started`, `retention.finished`, `run.finished`) carries no session and is
 not part of a session's stream; the run a record came from is a field of the record, and
 its own directory holds the framing. The export copies each contributing run's stream whole,
@@ -1398,10 +1405,10 @@ records.
 
 ## 15. Implementation sequence
 
-The original phase numbers remain to locate existing work. Phases 0 through 3 are closed;
-phases 4 through 6 name the three remaining implementation changes. The close-out order at
-the end of this section is normative. Keep each package-boundary change in its own commit;
-unrelated execution policy does not ride along.
+Every phase below is implemented, and the close-out order at the end of this section is the
+record of how the last four changes were split. The phase numbers locate the work; they are
+not a completion certificate, and the acceptance tests each phase names are the ones the
+shipped code holds.
 
 ### Phase 0: migrate to Odin's logger and context
 
@@ -1527,11 +1534,10 @@ Tests: the transport fixture reports what one operation encoded and received, an
 records the digest of those exact bytes, checked against a digest computed outside the code
 under test. Run `mise run test ai`, `mise run test agent`, and `mise run test .`.
 
-Remaining in this phase: implement the one-shot transfer summary in section 8.1, map it
-through `ai`, and add its facts to `attempt.finished`. This is now required close-out work:
-without it a connect failure, partial write, and failure after a response head can collapse
-to the same high-level transport error. The report uses accepted-byte language and never
-claims transmission or receipt.
+Done: the one-shot transfer summary in section 8.1, mapped through `ai` and carried on
+`attempt.finished`. Without it a connect failure, a partial write, and a failure after a
+response head collapse to the same high-level transport error. The report uses
+accepted-byte language and never claims transmission or receipt.
 
 Done: `agent/log_capture.odin` with its per-artifact and per-run quotas, sidecar metadata,
 digests, and the `NABLA_LOG_CAPTURE` switch, driven from the provider observation. A
@@ -1552,11 +1558,10 @@ generation; and `app_mcp.odin` records `mcp.started`, `mcp.negotiated`, and `mcp
 with a run-local launch counter, so a restart is distinguishable from a first launch. The
 MCP clients are released at teardown, which they previously were not.
 
-Remaining in this phase: add the operation-scoped MCP wire observer from section 8.3 and
-bridge it to `MCP_Outgoing` and `MCP_Incoming` captures. Delivery still comes from
-`mcp.Error.delivery`, the remote name remains the one `agent` chose, and `tools/call` is
-never automatically retried. Raw stderr capture is rejected and its unused capture kind is
-removed.
+Done: the operation-scoped MCP wire observer from section 8.3, bridged to `MCP_Outgoing`
+and `MCP_Incoming` captures. Delivery still comes from `mcp.Error.delivery`, the remote name
+remains the one `agent` chose, and `tools/call` is never automatically retried. Raw stderr
+capture is rejected and its unused capture kind is removed.
 
 Tests: a remote name containing underscores and dots; a renamed local alias; a disabled
 discovery entry; a server restart; a malformed reply; a timeout after send; stderr
@@ -1573,34 +1578,32 @@ as they were written while reporting what could not be read, and takes `--reques
 the bundle section 13 lays out, with its manifest and its omissions. Tests hold the reader
 to records the writer produced, and the export to a bundle read back off disk.
 
-Remaining in this phase: the read-only database join in section 7.1. Follow mode is not
-part of this phase or the logging completion gate.
+Done: the read-only database join in section 7.1. Follow mode is not part of this phase or
+of the logging system.
 
 Run `mise run test agent`, `mise run test .`, and `mise run check`.
 
 ### Close-out order
 
-Finish the system in four reviewable changes. Do not combine them: each one crosses a
-different package boundary and has a different failure contract.
+The work was held to four reviewable changes, one per package boundary, in this order:
 
-1. **Read-only store and request join.** Add `sqlite.Open_Mode`, backend tests,
-   `session.store_open_read_only`, diagnostics stderr reporting, `request.json`, and export
-   tests. This change proves the authoritative row can be read without a writer claim,
-   migration, or database creation.
-2. **HTTP transfer summary.** Add accepted-byte accounting to the connection, one final
-   transfer callback, the exhaustive `ai` mapping, and attempt fields. Test partial plain
-   writes, TLS acceptance accounting, and every stop phase before changing the event
-   contract.
-3. **MCP wire capture.** Add `mcp.Operation_Options`, instrument all client
-   message paths, bridge capture in `agent` and root, rename the capture kinds, and remove
-   `MCP_Stderr`. The stdio harness proves exact bytes and unchanged delivery semantics.
-4. **Persistent-log privacy audit.** Remove raw request targets, request/header lines, and
-   local paths from ordinary `core:log` calls in `http`. Keep structural error and phase
-   facts. Add focused tests where formatting policy is testable; otherwise review every
-   remaining producer manually and record the list in the change description.
+1. **Read-only store and request join.** `sqlite.Open_Mode`, `session.store_open_read_only`,
+   the stderr summary, `request.json`, and the export tests. A test reads a row a live
+   writer committed after the reader opened, which is what proves the path is a reader
+   rather than a second writer.
+2. **HTTP transfer summary.** Accepted-byte accounting in the connection, one completion
+   callback, the exhaustive `ai` mapping, and the attempt fields. The `ai` transport
+   fixture proves the three cases that matter: a completed request, a request that stopped
+   inside the response body, and one that never left.
+3. **MCP wire capture.** `mcp.Operation_Options`, every client message path, the capture
+   bridge in `agent` and root, and the renamed capture kinds. The stdio harness proves the
+   observed lines are whole JSON-RPC messages and that observing changes no outcome.
+4. **Persistent-log privacy audit.** The `http` producers carry structural facts, and
+   `storage.failed` carries a length rather than a message. What remains interpolates only
+   error enums, socket numbers, byte counts, and the request method; that list is in the
+   change that made it.
 
-The logging system is complete when all four changes are merged and these statements are
-true:
+The logging system was complete when all four were merged and these statements held:
 
 - a failed provider attempt names the last HTTP phase and accepted request bytes without
   claiming peer receipt;
@@ -1616,19 +1619,22 @@ true:
 - the architecture document has no pending logging item. Follow mode remains an explicit
   non-goal, not unfinished work.
 
+All of them hold: `mise run check`, the full `mise run test` gate including the external
+harnesses, and the address sanitizer run over the changed ownership and lifetime paths are
+green.
+
 `mise run check` accompanies code changes, and `mise run fmt` formats Odin. Run affected
-package tests in release and debug during each change. Before declaring the migration
-complete, run `mise run test`, the full gate including external harnesses, and address
-sanitizer runs for the changed ownership/lifetime paths. Compiler checks do not establish
+package tests in release and debug during each change. Compiler checks do not establish
 borrowed lifetime, privacy, or diagnostic completeness; the boundary tests above do.
 
 ## 16. Deliberate limits
 
-After the close-out changes, a failed request can be reconstructed from its attempts,
-correlation, encoded body evidence, HTTP stop phase, tool resolution, MCP wire evidence,
-and observed versus durable outcomes. The command line reads and exports it. The system
-still cannot prove that an HTTP peer received or acted on accepted bytes, and it never
-claims that it can.
+A failed request can be reconstructed from its attempts, correlation, encoded body
+evidence, HTTP stop phase, tool resolution, MCP wire evidence, and observed versus durable
+outcomes, and the command line reads and exports it. The system still cannot prove that an
+HTTP peer received or acted on accepted bytes, and it never claims that it can. A record is
+evidence, never authority: the session database answers what was decided, and the log
+answers what one process observed.
 
 Not included: OTLP, remote upload, metrics backends, follow mode, a live event bus, a
 trace-tree UI, per-token Info records, raw MCP stderr capture, non-2xx body capture beyond
@@ -1636,7 +1642,6 @@ the bounded error detail, a package-global logger, a logging thread, a second SQ
 store, and a diagnostics package. Not promised: power-loss durability, a hard quota across
 unlimited concurrent processes, and safety to publish metadata or captures without review.
 
-Further work needs a new debugging requirement. It is not part of finishing this logging
-system. The architecture follows one request from preparation through transport, tool
-execution, and committed recovery state without making diagnostics a second execution
-system.
+Further work needs a new debugging requirement rather than a tidy-up. The architecture
+follows one request from preparation through transport, tool execution, and committed
+recovery state without making diagnostics a second execution system.
