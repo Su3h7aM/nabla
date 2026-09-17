@@ -46,12 +46,18 @@ Chat_Request_Usage :: struct {
 }
 
 Chat_Runtime_Context :: struct {
-	chat:           ^Chat_Session,
-	source:         Chat_Event_Source,
-	observer:       Chat_Observer,
-	usage_log:      ^[dynamic]Chat_Request_Usage,
-	assistant_open: bool, // the assistant block is announced once per request,
-	finish_reason:  ai.Provider_Finish_Reason, // the provider's own stop reason,
+	chat:                ^Chat_Session,
+	source:              Chat_Event_Source,
+	observer:            Chat_Observer,
+	usage_log:           ^[dynamic]Chat_Request_Usage,
+	assistant_open:      bool, // the assistant block is announced once per attempt,
+	finish_reason:       ai.Provider_Finish_Reason, // the provider's own stop reason,
+	// text_exposed and completion_accepted are what this attempt made visible. They are
+	// tracked as the events arrive rather than derived afterwards: a delivered body byte
+	// is not exposure, and only the event itself knows whether the harness took what it
+	// carried.
+	text_exposed:        bool,
+	completion_accepted: bool,
 }
 
 chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
@@ -59,6 +65,7 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	#partial switch value in event {
 	case ai.Provider_Text_Event:
 		if chat_session_feed_text(runtime.chat, runtime.source, value.Text) {
+			runtime.text_exposed = true
 			if !runtime.assistant_open {
 				_observer_assistant_begin(runtime.observer)
 				runtime.assistant_open = true
@@ -70,6 +77,9 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	// API the verbatim output array is the replay record, and Chat
 	// Completions has no representation for it at all.
 	case ai.Provider_Completed_Event:
+		// The provider's terminal event arrived and the harness took it, whatever its
+		// reason turns out to mean.
+		runtime.completion_accepted = true
 		// One response feeds one path: tool handoff when the provider
 		// assembled calls, plain completion on stop, failure otherwise.
 		// A length limit or content filter is not a usable answer, so it
@@ -237,9 +247,11 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	// an attempt failed.
 	attempts := 0
 	operation_error: ai.Provider_Operation_Error
-	// The finish reason of the attempt that ends the chain is what the response is
-	// committed with. Every attempt starts without one.
+	// The attempt that ends the chain is what its response is committed with, so what it
+	// observed is read out of its runtime here. Every attempt starts without any of it.
 	finish_reason := ai.Provider_Finish_Reason.Unknown
+	text_exposed := false
+	completion_accepted := false
 	// The event source of the attempt that ends the chain, which is what its staged
 	// output is committed under.
 	source: Chat_Event_Source
@@ -316,6 +328,8 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		at := time.tick_now()
 		operation_error = ai.Provider_Request_Operation_Encoded(connection, encoded, &runtime, chat_provider_event, options, chat.allocator)
 		finish_reason = runtime.finish_reason
+		text_exposed = runtime.text_exposed
+		completion_accepted = runtime.completion_accepted
 		// The response artifact covers the whole attempt, so it is settled as soon as
 		// the bytes stop arriving. A cut-short stream is kept and marked incomplete.
 		if provider_log.response_capture.kind != .Invalid {
@@ -341,7 +355,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 			declared_body_bytes_present = provider_log.transfer.declared_body_bytes_present
 		}
 		finished := [13]Log_Field {
-			{key = "error_kind", value = log_operation_error_name(operation_error.kind)},
+			{key = "error_kind", value = ai.provider_operation_error_name(operation_error.kind)},
 			{key = "finish_reason", value = chat_finish_reason_text(runtime.finish_reason)},
 			{key = "status", value = i64(operation_error.status)},
 			// The provider's own message, which for a refused request is the only
@@ -366,11 +380,16 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		// The send is over, so its row is finished before anything is waited on or sent
 		// again: the failure is in the store before the policy acts on it, with the
 		// numbers and the usage of the send that produced it.
-		chat_finish_request(chat, request_no, .Failed, .Unknown, operation_error.detail, usages)
+		chat_finish_request(
+			chat,
+			request_no,
+			{outcome = .Failed, error = operation_error, error_present = true, text_exposed = text_exposed, completion_accepted = completion_accepted},
+			usages,
+		)
 		settled = true
 		delay := chat_retry_delay(attempts)
 		retry := [3]Log_Field {
-			{key = "error_kind", value = log_operation_error_name(operation_error.kind)},
+			{key = "error_kind", value = ai.provider_operation_error_name(operation_error.kind)},
 			{key = "next_attempt", value = i64(attempts + 1)},
 			{key = "delay_ms", value = log_duration_ms(delay)},
 		}
@@ -393,7 +412,15 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	}
 	chat_session_retire_operation(chat)
 
-	chat_commit_response(chat, request_no, finish_reason, usages, finish_row = !settled)
+	send := Chat_Send_Result {
+		finish_reason       = finish_reason,
+		error               = operation_error,
+		error_present       = operation_error.kind != .None,
+		message             = chat.last_error,
+		text_exposed        = text_exposed,
+		completion_accepted = completion_accepted,
+	}
+	chat_commit_response(chat, request_no, send, usages, finish_row = !settled)
 	// The request's outcome is recorded, so the provider's own accounting of it is part of
 	// the session the front-end describes.
 	_observer_request_finished(observer)
@@ -409,7 +436,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 chat_commit_response :: proc(
 	chat: ^Chat_Session,
 	request_no: session.Request_No,
-	finish_reason: ai.Provider_Finish_Reason,
+	result: Chat_Send_Result,
 	usages: ^[dynamic]Chat_Request_Usage,
 	// finish_row is false when the send this response came from was already finished
 	// for its own failure, before a retry was waited on. A row says how its send ended
@@ -417,12 +444,14 @@ chat_commit_response :: proc(
 	finish_row := true,
 ) {
 	at_ms := session.now_ms()
-	outcome: session.Outcome = .Completed
+	send := result
+	send.outcome = .Completed
 	if chat_session_cancelled(chat) {
-		outcome = .Cancelled
+		send.outcome = .Cancelled
 	} else if chat.active_failed {
-		outcome = .Failed
+		send.outcome = .Failed
 	}
+	outcome := send.outcome
 
 	// A response that did not commit adds nothing to the context.
 	chat.response_cost = 0
@@ -496,13 +525,11 @@ chat_commit_response :: proc(
 	// did not commit, because the turn failed or was cancelled, is dropped.
 	chat.pending_notice = .None
 
-	if finish_row {
-		chat_finish_request(chat, request_no, outcome, finish_reason, chat.last_error, usages)
-	}
+	if finish_row { chat_finish_request(chat, request_no, send, usages) }
 	finished := [3]Log_Field {
 		{key = "outcome", value = session.outcome_name(outcome)},
 		{key = "attempts", value = i64(chat.request_attempts)},
-		{key = "finish_reason", value = chat_finish_reason_text(finish_reason)},
+		{key = "finish_reason", value = chat_finish_reason_text(result.finish_reason)},
 	}
 	// A cancelled request is an ordinary end of the turn; one that failed is an
 	// error. The record keeps the completed request number, and the correlation is
@@ -519,35 +546,32 @@ chat_commit_response :: proc(
 // Every send reaches exactly one of these, including a send an attempt chain
 // abandoned, so no row is left running and each row's numbers are its own.
 @(private)
-chat_finish_request :: proc(
-	chat: ^Chat_Session,
-	request_no: session.Request_No,
-	outcome: session.Outcome,
-	finish_reason: ai.Provider_Finish_Reason,
-	error_text: string,
-	usages: ^[dynamic]Chat_Request_Usage,
-) {
+chat_finish_request :: proc(chat: ^Chat_Session, request_no: session.Request_No, result: Chat_Send_Result, usages: ^[dynamic]Chat_Request_Usage) {
 	response_json := ""
-	if finish_reason != .Unknown {
+	if result.finish_reason != .Unknown {
 		response_json = string(
 			json.marshal(
-				Chat_Request_Response{reason = chat_finish_reason_text(finish_reason), attempts = chat.request_attempts},
+				Chat_Request_Response{reason = chat_finish_reason_text(result.finish_reason), attempts = chat.request_attempts},
 				allocator = context.temp_allocator,
 			) or_else nil,
 		)
 	}
 	error_json := ""
-	if outcome == .Failed && error_text != "" {
-		error_json = chat_error_json(error_text)
-	} else if outcome == .Cancelled {
-		error_json = chat_error_json("cancelled")
+	if result.outcome != .Completed {
+		if result.error_present {
+			error_json = chat_request_error_json(result.error, result.text_exposed, result.completion_accepted)
+		} else if result.message != "" {
+			// A failure the harness detected itself has no operation behind it, so the
+			// record keeps the message and nothing else.
+			error_json = chat_error_json(result.message)
+		}
 	}
 
 	finish_err := session.request_finish(
 		chat.store,
 		chat.id,
 		request_no,
-		{outcome = outcome, response_json = response_json, error_json = error_json, usage = chat_send_usage(chat, usages), at_ms = session.now_ms()},
+		{outcome = result.outcome, response_json = response_json, error_json = error_json, usage = chat_send_usage(chat, usages), at_ms = session.now_ms()},
 	)
 	if finish_err != nil {
 		chat_session_record_failure(chat, "the request outcome could not be recorded", finish_err)

@@ -5,7 +5,6 @@ import "core:log"
 import "core:time"
 
 import "nabla:agent/session"
-import "nabla:ai"
 
 // The bridge is where Odin's logger meets the harness: the adapter that installs
 // this writer into context.logger, the correlation a record is emitted against,
@@ -229,27 +228,4 @@ tool_arguments_status_name :: proc(status: Tool_Arguments_Status) -> string {
 		return "rejected"
 	}
 	return "rejected"
-}
-
-@(private)
-log_operation_error_name :: proc(kind: ai.Provider_Operation_Error_Kind) -> string {
-	switch kind {
-	case .None:
-		return "none"
-	case .Invalid_Request:
-		return "invalid_request"
-	case .HTTP:
-		return "http"
-	case .Transport:
-		return "transport"
-	case .Stream:
-		return "stream"
-	case .Cancelled:
-		return "cancelled"
-	case .Timed_Out:
-		return "timed_out"
-	case .TLS:
-		return "tls"
-	}
-	return "tls"
 }

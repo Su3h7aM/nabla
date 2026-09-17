@@ -20,7 +20,10 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(t: ^testing.T) {
 	_test_accept(t, chat, "say something")
 
 	refusal := `{"error":{"message":"Rate limit reached"}}`
-	responses := []string{agent_provider_refusal("429 Too Many Requests", refusal), agent_provider_reply("second try")}
+	// The refusal carries the provider's own evidence: the request id it answered with
+	// and the delay it asked for.
+	refusal_headers := "x-request-id: req_fixture\r\nretry-after: 2\r\n"
+	responses := []string{agent_provider_refusal("429 Too Many Requests", refusal, refusal_headers), agent_provider_reply("second try")}
 	provider: Agent_Provider
 	if !agent_provider_start(t, &provider, responses) { return }
 	defer agent_provider_stop(&provider)
@@ -78,6 +81,62 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(t: ^testing.T) {
 	testing.expect_value(t, first_attempt, i64(1))
 	testing.expect_value(t, first_recovery, "initial")
 	testing.expect(t, first_previous == nil, "the first send of a chain names no predecessor")
+
+	// The record of that failure is the evidence the layers observed, not the prose a
+	// front-end would show: a reader can tell a rate limit from a bad request without
+	// parsing the message, and the provider's request id and delay survive with it.
+	evidence := error_record(t, first.error_json)
+	testing.expect_value(t, evidence.format_version, i64(CHAT_REQUEST_ERROR_VERSION))
+	testing.expect_value(t, evidence.kind, "http")
+	testing.expect_value(t, evidence.failure_class, "rate_limited")
+	testing.expect_value(t, evidence.status, i64(429))
+	testing.expect_value(t, evidence.provider_request_id, "req_fixture")
+	testing.expect_value(t, evidence.retry_after_ms, i64(2000))
+	testing.expect_value(t, evidence.message, "Rate limit reached")
+	// Nothing of the refused attempt reached the conversation, so nothing of it was
+	// exposed.
+	testing.expect(t, !evidence.text_exposed, "the refused attempt produced no visible text")
+	testing.expect(t, !evidence.completion_accepted, "the refused attempt completed nothing")
+}
+
+// Error_Record is the failure evidence one row's error column carries, as a reader
+// outside the harness would take it.
+Error_Record :: struct {
+	format_version:      i64,
+	kind:                string,
+	failure_class:       string,
+	status:              i64,
+	provider_code:       string,
+	provider_request_id: string,
+	retry_after_ms:      i64,
+	retry_directive:     string,
+	transport_cause:     string,
+	text_exposed:        bool,
+	completion_accepted: bool,
+	message:             string,
+}
+
+// error_record reads the fields of a request row's failure evidence.
+error_record :: proc(t: ^testing.T, error_json: string) -> (record: Error_Record) {
+	if !testing.expect(t, error_json != "", "the row carries failure evidence") { return }
+	value, parse_err := json.parse_string(error_json, .JSON, true, context.temp_allocator)
+	if parse_err != nil { testing.fail_now(t, "the failure record is not valid JSON") }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, is_object := value.(json.Object)
+	if !testing.expect(t, is_object, "the failure record is an object") { return }
+	if number, is_integer := object["format_version"].(json.Integer); is_integer { record.format_version = i64(number) }
+	if text, is_string := object["kind"].(json.String); is_string { record.kind = string(text) }
+	if text, is_string := object["failure_class"].(json.String); is_string { record.failure_class = string(text) }
+	if number, is_integer := object["status"].(json.Integer); is_integer { record.status = i64(number) }
+	if text, is_string := object["provider_code"].(json.String); is_string { record.provider_code = string(text) }
+	if text, is_string := object["provider_request_id"].(json.String); is_string { record.provider_request_id = string(text) }
+	if number, is_integer := object["retry_after_ms"].(json.Integer); is_integer { record.retry_after_ms = i64(number) }
+	if text, is_string := object["retry_directive"].(json.String); is_string { record.retry_directive = string(text) }
+	if text, is_string := object["transport_cause"].(json.String); is_string { record.transport_cause = string(text) }
+	if flag, is_bool := object["text_exposed"].(json.Boolean); is_bool { record.text_exposed = bool(flag) }
+	if flag, is_bool := object["completion_accepted"].(json.Boolean); is_bool { record.completion_accepted = bool(flag) }
+	if text, is_string := object["message"].(json.String); is_string { record.message = string(text) }
+	return
 }
 
 // attempt_record reads the chain fields one request row's input record carries.

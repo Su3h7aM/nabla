@@ -129,6 +129,37 @@ Chat_Request_Error :: struct {
 	message: string `json:"message"`,
 }
 
+// CHAT_REQUEST_ERROR_VERSION versions the record of a send that did not complete.
+// Version 1 kept the harness's message and nothing else; version 2 keeps what the
+// layers observed, so a reader can act on the failure instead of reading prose.
+CHAT_REQUEST_ERROR_VERSION :: 2
+
+// CHAT_ERROR_DETAIL_MAX_BYTES bounds the detail a durable failure record keeps. The
+// provider's own message is bounded where it is read; this bounds what the record
+// stores, whatever produced it, and it cuts on a character boundary.
+CHAT_ERROR_DETAIL_MAX_BYTES :: 2048
+
+// Chat_Request_Error_Evidence is the harness's account of one send that did not
+// complete: the operation's own outcome, what the provider's refusal meant once it was
+// normalized, the evidence the transport kept, and what the attempt had already made
+// visible. Names are stored rather than ordinals, and a measurement the provider never
+// reported is -1 rather than zero.
+@(private)
+Chat_Request_Error_Evidence :: struct {
+	format_version:      u32 `json:"format_version"`,
+	kind:                string `json:"kind"`,
+	failure_class:       string `json:"failure_class"`,
+	status:              i64 `json:"status"`,
+	provider_code:       string `json:"provider_code"`,
+	provider_request_id: string `json:"provider_request_id"`,
+	retry_after_ms:      i64 `json:"retry_after_ms"`,
+	retry_directive:     string `json:"retry_directive"`,
+	transport_cause:     string `json:"transport_cause"`,
+	text_exposed:        bool `json:"text_exposed"`,
+	completion_accepted: bool `json:"completion_accepted"`,
+	message:             string `json:"message"`,
+}
+
 // chat_request_config_json describes the settings a request is sent with. output is the
 // bound the request itself carries, not the capacity's ordinary one, because a
 // summarization request asks for more and the record has to say what was asked.
@@ -190,6 +221,44 @@ chat_request_input_json :: proc(
 @(private)
 chat_send_usage :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) -> session.Usage {
 	return chat_request_usage(usages, u64(chat.operation.id))
+}
+
+// Chat_Send_Result is how one send ended, as the caller knows it: the outcome, what
+// the model stopped for, the operation's own error when the send had one, and what the
+// attempt had already made visible. A failure the callback layer detected instead of
+// the operation leaves error absent and carries only the harness's message.
+Chat_Send_Result :: struct {
+	outcome:             session.Outcome,
+	finish_reason:       ai.Provider_Finish_Reason,
+	error:               ai.Provider_Operation_Error,
+	error_present:       bool,
+	message:             string,
+	text_exposed:        bool,
+	completion_accepted: bool,
+}
+
+// chat_request_error_json records a send that failed, from the evidence the operation
+// returned rather than from the text a front-end would show.
+@(private)
+chat_request_error_json :: proc(error: ai.Provider_Operation_Error, text_exposed, completion_accepted: bool) -> string {
+	record := Chat_Request_Error_Evidence {
+		format_version      = CHAT_REQUEST_ERROR_VERSION,
+		kind                = ai.provider_operation_error_name(error.kind),
+		failure_class       = ai.provider_failure_class_name(error.failure_class),
+		status              = i64(error.status),
+		provider_code       = error.provider_code,
+		provider_request_id = error.provider_request_id,
+		retry_after_ms      = -1,
+		retry_directive     = ai.provider_retry_directive_name(error.retry_directive),
+		transport_cause     = ai.provider_transport_cause_name(error.transport_cause),
+		text_exposed        = text_exposed,
+		completion_accepted = completion_accepted,
+		message             = ai.provider_bounded_text(error.detail, CHAT_ERROR_DETAIL_MAX_BYTES, context.temp_allocator),
+	}
+	if delay, present := error.retry_after.?; present { record.retry_after_ms = log_duration_ms(delay) }
+	data, marshal_err := json.marshal(record, allocator = context.temp_allocator)
+	if marshal_err != nil { return "" }
+	return string(data)
 }
 
 @(private)

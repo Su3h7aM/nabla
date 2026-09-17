@@ -43,9 +43,17 @@ agent_provider_reply :: proc(text: string, allocator := context.temp_allocator) 
 }
 
 // agent_provider_refusal is one response that refuses the request with a provider
-// error document.
-agent_provider_refusal :: proc(status, body: string, allocator := context.temp_allocator) -> string {
-	return fmt.aprintf("HTTP/1.1 %s\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n%s", status, len(body), body, allocator = allocator)
+// error document. headers carries the rest of the refusal, such as the request id and
+// the retry delay the provider reports, each including its own line ending.
+agent_provider_refusal :: proc(status, body: string, headers := "", allocator := context.temp_allocator) -> string {
+	return fmt.aprintf(
+		"HTTP/1.1 %s\r\ncontent-type: application/json\r\n%scontent-length: %d\r\n\r\n%s",
+		status,
+		headers,
+		len(body),
+		body,
+		allocator = allocator,
+	)
 }
 
 Agent_Provider :: struct {

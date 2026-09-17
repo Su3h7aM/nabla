@@ -36,7 +36,7 @@ date_write :: proc(w: io.Writer, t: time.Time) -> io.Error {
 	year, month, day := time.date(t)
 	hour, minute, second := time.clock_from_time(t)
 	wday := time.weekday(t)
-
+	
 	// odinfmt:disable
 	io.write_string(w, HTTP_DATE_WEEKDAYS_SHORT[wday]) or_return // 'Fri'
 	io.write_string(w, ", ")             or_return // 'Fri, '
