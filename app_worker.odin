@@ -84,7 +84,7 @@ app_compaction_pending :: proc(app: ^App) -> bool {
 // active context changed and the status line it describes is stale.
 app_compaction_tick :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 	if app.setup.session.store == nil { return false }
-	return agent.chat_compact_service(&app.setup.session, observer)
+	return agent.chat_compact_idle_service(&app.setup.session, observer, app.run.connection)
 }
 
 // work_destroy releases the strings a queued command owns.

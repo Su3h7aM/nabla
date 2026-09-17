@@ -169,6 +169,13 @@ chat_session_repair_refusal :: proc(chat: ^Chat_Session) -> Chat_Repair_Refusal 
 	return chat.turn_repair_refusal
 }
 
+// chat_session_recovery_reason is why the last turn's chain stopped, and whether a
+// reason was recorded at all. A turn that ended for a reason of its own, such as a tool
+// that failed, carries none.
+chat_session_recovery_reason :: proc(chat: ^Chat_Session) -> (Request_Recovery_Reason, bool) {
+	return chat.turn_recovery, chat.turn_recovery_present
+}
+
 // chat_session_terminal_status is the status the last turn reached. A caller that has to
 // act on how a turn ended reads it after the turn, because the effect that carried it was
 // consumed by the loop that ran it.

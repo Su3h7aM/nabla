@@ -273,6 +273,36 @@ chat_request_error_json :: proc(result: Chat_Send_Result) -> string {
 	return string(data)
 }
 
+// CHAT_TURN_ERROR_VERSION versions the record of a turn that did not complete. Version 1
+// kept the harness's message; version 2 keeps typed facts beside it, so a front-end can
+// tell a retry budget that ran out from a context that did not fit without reading prose.
+CHAT_TURN_ERROR_VERSION :: 2
+
+// Chat_Turn_Error is why a turn ended without completing. The reason is the one the
+// chain's own decision carried, and the cause is what stood in the way when the context
+// did not fit. Either may be absent, and an absent fact stays absent rather than becoming
+// a name that claims something was known.
+@(private)
+Chat_Turn_Error :: struct {
+	format_version: u32 `json:"format_version"`,
+	reason:         string `json:"reason"`,
+	cause:          string `json:"cause"`,
+	message:        string `json:"message"`,
+}
+
+@(private)
+chat_turn_error_json :: proc(message: string, reason: Request_Recovery_Reason, reason_present: bool, refusal: Chat_Repair_Refusal) -> string {
+	record := Chat_Turn_Error {
+		format_version = CHAT_TURN_ERROR_VERSION,
+		cause          = chat_repair_refusal_name(refusal),
+		message        = message,
+	}
+	if reason_present { record.reason = request_recovery_reason_name(reason) }
+	data, marshal_err := json.marshal(record, allocator = context.temp_allocator)
+	if marshal_err != nil { return "" }
+	return string(data)
+}
+
 @(private)
 chat_error_json :: proc(message: string) -> string {
 	data, marshal_err := json.marshal(Chat_Request_Error{message = message}, allocator = context.temp_allocator)

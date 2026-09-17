@@ -143,9 +143,13 @@ Chat_Session :: struct {
 	last_input_measured:          i64,
 	last_input_measured_present:  bool,
 	last_estimate:                int,
-	// turn_repair_refusal is why the last turn's context repair could not proceed. It is
-	// typed rather than read back out of a message, so the turn's record and a front-end
-	// can tell "no summary exists" from "the summary did not free enough".
+	// turn_recovery and turn_repair_refusal are why the last turn ended without
+	// completing: the reason its chain stopped, and, when the context did not fit, what
+	// stood in the way of making room. They are typed rather than read back out of a
+	// message, so the turn's record and a front-end can tell "no summary exists" from
+	// "the summary did not free enough" without parsing prose.
+	turn_recovery:                Request_Recovery_Reason,
+	turn_recovery_present:        bool,
 	turn_repair_refusal:          Chat_Repair_Refusal,
 	// response_cost is what the response the running turn committed added to the
 	// model's context. A tool batch's budget subtracts it, because the response is
@@ -385,6 +389,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat.next_turn_id += 1
 	chat.state = .Preparing
 	chat.terminal_status = .None
+	chat.turn_recovery_present = false
 	chat.turn_repair_refusal = .None
 	chat.active_failed = false
 	chat.requests_made = 0

@@ -31,6 +31,11 @@ Chat_Request_Prep :: struct {
 	// call is said to be, and what a kept result is replaced by.
 	feedback:   [dynamic]string,
 	estimate:   int,
+	// sizes is what each part of this request costs on its own. A part measured alone is
+	// not a share of the whole, and that is the point: one that alone exceeds what the
+	// window can hold will not fit in the whole either, and it is the one thing a person
+	// has to change.
+	sizes:      Chat_Request_Sizes,
 }
 
 chat_request_prep_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Allocator) {
@@ -163,6 +168,7 @@ chat_build_request_into :: proc(
 		}
 		prep.request.Tools = prep.tools[:]
 	}
+	prep.sizes = chat_request_sizes(instructions, prep.wire[:], prep.tools[:])
 	prep.estimate = chat_estimate_input_tokens(instructions, prep.wire[:], prep.tools[:])
 	// What this request may generate depends on what it carries, because the window is one
 	// budget: a fuller context asks for a smaller answer rather than being refused. The
@@ -433,10 +439,47 @@ chat_estimate_input_tokens :: proc(instructions: string, messages: []ai.Provider
 CHAT_CHARS_PER_TOKEN :: 4
 CHAT_MESSAGE_OVERHEAD_TOKENS :: 8
 
+// Chat_Request_Sizes is what one request costs, by part. The parts are what a person can
+// act on: instructions come from configuration, tool schemas from the registry, and the
+// conversation is what they can shorten.
+Chat_Request_Sizes :: struct {
+	instructions: int,
+	tools:        int,
+	conversation: int,
+}
+
+// chat_request_sizes measures each part of a request on its own. The whole request adds
+// the parts before dividing by the same characters-per-token, so a part measured alone
+// bounds what the whole can be: a part larger than the window is a request that cannot be
+// sent, whatever else shrinks.
+chat_request_sizes :: proc(instructions: string, messages: []ai.Provider_Message, tools: []ai.Provider_Tool_Def) -> Chat_Request_Sizes {
+	return {
+		instructions = chat_estimate_input_tokens(instructions, nil, nil),
+		tools = chat_estimate_input_tokens("", nil, tools),
+		conversation = chat_estimate_input_tokens("", messages, nil),
+	}
+}
+
+// chat_admission_advice says what to change when a request does not fit. A part that alone
+// exceeds what the window can hold is the whole reason nothing sent here fits, and naming
+// it is the difference between shortening a prompt that cannot help and changing what can.
+@(private)
+chat_admission_advice :: proc(sizes: Chat_Request_Sizes, ceiling: int) -> string {
+	switch {
+	case sizes.instructions > ceiling:
+		return "the instructions alone are larger than the window can hold; shorten them or raise the limits"
+	case sizes.tools > ceiling:
+		return "the tool schemas alone are larger than the window can hold; disable tools or raise the limits"
+	case sizes.conversation > ceiling:
+		return "the conversation alone is larger than the window can hold; compact or raise the limits"
+	}
+	return "shorten the prompt, compact, or raise the limits"
+}
+
 // chat_admission_check asks whether the estimate leaves room for an answer. It is not a
 // check against a reserved budget: there is none. The message is temp-allocated; the
 // caller clones it when the turn must record the failure.
-chat_admission_check :: proc(chat: ^Chat_Session, estimate: int) -> (message: string, admitted: bool) {
+chat_admission_check :: proc(chat: ^Chat_Session, estimate: int, sizes: Chat_Request_Sizes) -> (message: string, admitted: bool) {
 	// The decision is recorded even when it admits the request: what the harness
 	// estimated and what it compared that against is the whole reason a request was
 	// refused later.
@@ -453,24 +496,30 @@ chat_admission_check :: proc(chat: ^Chat_Session, estimate: int) -> (message: st
 		return "context admission needs context_window: add context_window to the model in config.lua", false
 	}
 	output, fits := chat_request_output_bound(capacity, estimate)
-	admission := [5]Log_Field {
+	admission := [8]Log_Field {
 		{key = "decision", value = fits ? "admitted" : "refused"},
 		{key = "estimate", value = i64(estimate)},
 		{key = "context_window", value = i64(capacity.window)},
 		{key = "output", value = i64(output)},
 		{key = "margin", value = i64(capacity.margin)},
+		// The parts travel with the decision: a refusal nobody can explain is what a
+		// breakdown exists to prevent.
+		{key = "instructions_tokens", value = i64(sizes.instructions)},
+		{key = "tools_tokens", value = i64(sizes.tools)},
+		{key = "conversation_tokens", value = i64(sizes.conversation)},
 	}
 	log_emit({level = .Info, category = .Provider, event = "request.admission", fields = admission[:]})
 	if fits {
 		return "", true
 	}
 	return fmt.tprintf(
-			"request estimated at ~%d input tokens exceeds the ~%d the %d-token window can hold (%d for estimator error, %d for an answer): shorten the prompt, compact, or raise the limits",
+			"request estimated at ~%d input tokens exceeds the ~%d the %d-token window can hold (%d for estimator error, %d for an answer): %s",
 			estimate,
 			chat_capacity_input_ceiling(capacity),
 			capacity.window,
 			capacity.margin,
 			CHAT_OUTPUT_MIN_TOKENS,
+			chat_admission_advice(sizes, chat_capacity_input_ceiling(capacity)),
 		),
 		false
 }

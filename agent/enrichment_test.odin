@@ -169,7 +169,7 @@ test_enrichment_unknown_model_sends_no_reasoning :: proc(t: ^testing.T) {
 	testing.expect_value(t, chat.effort, "")
 
 	// The assumed window is still enough to admit an ordinary request.
-	_, admitted := chat_admission_check(chat, prep.estimate)
+	_, admitted := chat_admission_check(chat, prep.estimate, prep.sizes)
 	testing.expect(t, admitted)
 }
 

@@ -92,19 +92,46 @@ test_admission_refuses_without_window_or_budget :: proc(t: ^testing.T) {
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 
-	message, admitted := chat_admission_check(chat, 100)
+	message, admitted := chat_admission_check(chat, 100, {})
 	testing.expect(t, !admitted)
 	testing.expect(t, strings.contains(message, "context_window"))
 
 	chat_test_capacity(chat, 500000)
-	_, admitted = chat_admission_check(chat, 100)
+	_, admitted = chat_admission_check(chat, 100, {})
 	testing.expect(t, admitted)
 
 	// 490000 estimated plus default reserve plus margin does not fit 500000.
-	message, admitted = chat_admission_check(chat, 490000)
+	message, admitted = chat_admission_check(chat, 490000, {})
 	testing.expect(t, !admitted)
 	testing.expect(t, strings.contains(message, "exceeds"))
 	_ = message
+}
+
+// A part that alone cannot fit is what a refusal names: no prompt is short enough to send
+// a request whose tool schemas do not fit, and saying so is what tells the user what to
+// change.
+@(test)
+test_admission_names_the_part_that_alone_does_not_fit :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 4_000)
+	_test_accept(t, chat, "hi")
+	chat.tools_enabled = true
+
+	schema := strings.repeat("x", 40_000, context.temp_allocator)
+	defer delete(schema, context.temp_allocator)
+	append(&chat.tools.definitions, Tool_Definition{name = "big", description = "big", input_schema = schema})
+
+	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+	// The window cannot hold the schemas alone, and the estimate says so.
+	testing.expect(t, prep.sizes.tools > chat_capacity_input_ceiling(chat.capacity), "the fixture must not fit")
+	message, admitted := chat_admission_check(chat, prep.estimate, prep.sizes)
+	testing.expect(t, !admitted, "a request whose tools alone do not fit is refused")
+	testing.expect(t, strings.contains(message, "tool schemas"), message)
 }
 
 @(test)

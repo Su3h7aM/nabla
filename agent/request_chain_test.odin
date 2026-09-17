@@ -280,6 +280,34 @@ test_a_chain_of_failures_ends_in_one_answer :: proc(t: ^testing.T) {
 	testing.expect_value(t, retries.events[1].request_no, session.Request_No(second_number))
 }
 
+// A turn that did not complete records typed facts beside its message, so a front-end can
+// tell a failed retry budget from a context that did not fit without reading prose. A turn
+// that ended for a reason of its own claims none.
+@(test)
+test_the_turn_record_carries_its_typed_failure :: proc(t: ^testing.T) {
+	exhausted := chat_turn_error_json("the request does not fit the context: no summary", .Context_Exhausted, true, .No_Candidate)
+	value, parse_err := json.parse_string(exhausted, .JSON, true, context.temp_allocator)
+	if parse_err != nil { testing.fail_now(t, "the turn record is not valid JSON") }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, is_object := value.(json.Object)
+	if !testing.expect(t, is_object, "the turn record is an object") { return }
+	reason, _ := object["reason"].(json.String)
+	testing.expect_value(t, string(reason), "context_exhausted")
+	cause, _ := object["cause"].(json.String)
+	testing.expect_value(t, string(cause), "no_candidate")
+	version, _ := object["format_version"].(json.Integer)
+	testing.expect_value(t, i64(version), i64(CHAT_TURN_ERROR_VERSION))
+
+	own := chat_turn_error_json("the tool failed", .Completed, false, .None)
+	value, parse_err = json.parse_string(own, .JSON, true, context.temp_allocator)
+	if parse_err != nil { testing.fail_now(t, "the turn record is not valid JSON") }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, is_object = value.(json.Object)
+	if !testing.expect(t, is_object, "the turn record is an object") { return }
+	reason, _ = object["reason"].(json.String)
+	testing.expect_value(t, string(reason), "")
+}
+
 // attempt_record reads the chain fields one request row's input record carries.
 attempt_record :: proc(t: ^testing.T, input_json: string) -> (attempt: i64, recovery: string, previous: Maybe(i64)) {
 	value, parse_err := json.parse_string(input_json, .JSON, true, context.temp_allocator)

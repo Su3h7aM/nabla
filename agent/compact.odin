@@ -179,6 +179,9 @@ Compact_Trigger :: enum {
 	Pressure,
 	Agent_Tool,
 	User_Command,
+	// Provider_Overflow is a provider that refused the request as too large. It is the
+	// same work as an explicit request, asked for because nothing else made room.
+	Provider_Overflow,
 }
 
 // compact_trigger_explicit reports whether a trigger asks for a context change
@@ -186,7 +189,13 @@ Compact_Trigger :: enum {
 // summary is ready; a pressure one waits until the context reaches the size the
 // summary was started for.
 compact_trigger_explicit :: proc(trigger: Compact_Trigger) -> bool {
-	return trigger == .Agent_Tool || trigger == .User_Command
+	switch trigger {
+	case .Agent_Tool, .User_Command, .Provider_Overflow:
+		return true
+	case .None, .Pressure:
+		return false
+	}
+	return false
 }
 
 // chat_compact_start_notice is what the front-end is told when a summary actually
@@ -201,6 +210,8 @@ chat_compact_start_notice :: proc(trigger: Compact_Trigger) -> string {
 		return "background compaction started: the agent asked for a checkpoint"
 	case .User_Command:
 		return "background compaction started: requested"
+	case .Provider_Overflow:
+		return "background compaction started: the provider rejected the context as too large"
 	case .None:
 	}
 	return "background compaction started"
@@ -216,6 +227,8 @@ compact_trigger_name :: proc(trigger: Compact_Trigger) -> string {
 		return "agent_tool"
 	case .User_Command:
 		return "user_command"
+	case .Provider_Overflow:
+		return "provider_overflow"
 	}
 	return "none"
 }
@@ -708,6 +721,33 @@ chat_compact_consider :: proc(chat: ^Chat_Session, observer: Chat_Observer, conn
 	}
 }
 
+// chat_compact_idle_service is what an idle session does about its context: it polls a
+// finished summary, installs one that is ready and due, and starts the work a boundary
+// recorded but the turn never reached. It never waits, and it starts a prep only when a
+// recorded intent is waiting for one.
+//
+// A session that has capacity again is said so out loud: the user asked for nothing here,
+// and the reason their next prompt can be sent is this summary.
+chat_compact_idle_service :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection) -> bool {
+	if chat.state != .Idle || chat.storage_failed { return false }
+	changed := chat_compact_service(chat, observer)
+	if changed {
+		_observer_message(observer, .Notice, "the summary was installed; this session has its capacity back")
+	}
+	// An intent is consumed by the attempt to start it, so one that cannot start here is
+	// not retried at every tick: the boundary that recorded it asked once.
+	if chat.compact.state == .Idle && chat.compact.pending != .None {
+		prep, prep_err := chat_prepare(chat, connection)
+		if prep_err != nil {
+			chat_session_record_failure(chat, "the context could not be read", prep_err)
+			return changed
+		}
+		defer chat_request_prep_destroy(&prep, chat.allocator)
+		chat_compact_consider(chat, observer, connection, &prep)
+	}
+	return changed
+}
+
 // chat_compact_relieve is the last thing tried before a request is refused. It
 // polls once, installs a candidate that is already ready, and reports whether the
 // context changed. It never starts work and never waits, so a request that cannot
@@ -733,6 +773,23 @@ Chat_Repair_Refusal :: enum {
 	// Repair_Rejected is a candidate the store refused, or a request that could not be
 	// rebuilt or encoded. Nothing was installed.
 	Repair_Rejected,
+}
+
+// chat_repair_refusal_name is the stable spelling a record keeps for a refusal.
+chat_repair_refusal_name :: proc(refusal: Chat_Repair_Refusal) -> string {
+	switch refusal {
+	case .None:
+		return "none"
+	case .Summary_Running:
+		return "summary_running"
+	case .No_Candidate:
+		return "no_candidate"
+	case .No_Reduction:
+		return "no_reduction"
+	case .Repair_Rejected:
+		return "repair_rejected"
+	}
+	return "none"
 }
 
 // chat_repair_refusal_text says why a repair did not happen, in words a person reads.
@@ -789,7 +846,7 @@ chat_repair_context :: proc(
 	// refused, and it has to be smaller by enough to be worth the cache break.
 	if prep.history.summary_seq == previous_checkpoint { return .No_Reduction }
 	if prep.estimate + CHAT_COMPACT_MIN_REDUCTION_TOKENS > previous_estimate { return .No_Reduction }
-	message, admitted := chat_admission_check(chat, prep.estimate)
+	message, admitted := chat_admission_check(chat, prep.estimate, prep.sizes)
 	if !admitted {
 		chat_session_fail_turn(chat, message)
 		return .No_Reduction

@@ -144,3 +144,22 @@ test_a_compaction_request_shares_the_conversation_prefix :: proc(t: ^testing.T) 
 	testing.expect_value(t, prep.request.Messages[0].Content, "first")
 	testing.expect_value(t, prep.request.Messages[1].Content, CHAT_COMPACT_DIRECTIVE)
 }
+
+// A provider that rejected the context is the strongest reason to compact: it promotes a
+// summary that is already running to install at the first safe boundary, and it schedules
+// one when nothing is running. Neither bypasses what a caller asked for.
+@(test)
+test_a_provider_overflow_promotes_a_running_summary :: proc(t: ^testing.T) {
+	testing.expect(t, compact_trigger_explicit(.Provider_Overflow), "a refused payload installs as soon as it can")
+
+	running := Compact_Control {
+		state   = .Running,
+		trigger = .Pressure,
+	}
+	testing.expect_value(t, compact_request_intent(&running, .Provider_Overflow, nil), Compact_Request_Result.Already_Scheduled)
+	testing.expect_value(t, running.trigger, Compact_Trigger.Provider_Overflow)
+
+	idle: Compact_Control
+	testing.expect_value(t, compact_request_intent(&idle, .Provider_Overflow, nil), Compact_Request_Result.Scheduled)
+	testing.expect_value(t, idle.pending, Compact_Trigger.Provider_Overflow)
+}

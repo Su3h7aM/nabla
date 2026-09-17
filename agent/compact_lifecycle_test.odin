@@ -577,6 +577,12 @@ test_a_rejected_payload_with_nothing_to_install_ends_the_turn :: proc(t: ^testin
 	testing.expect_value(t, len(provider.requests), 1)
 	testing.expect_value(t, chat_session_repair_refusal(chat), Chat_Repair_Refusal.No_Candidate)
 	testing.expect_value(t, chat_session_terminal_status(chat), Chat_Terminal_Status.Failed)
+	reason, has_reason := chat_session_recovery_reason(chat)
+	testing.expect(t, has_reason, "the turn records why its chain stopped")
+	testing.expect_value(t, reason, Request_Recovery_Reason.Context_Exhausted)
+	// The session keeps the pressure, so the next safe boundary starts the summary this
+	// refusal was missing.
+	testing.expect_value(t, chat.compact.pending, Compact_Trigger.Provider_Overflow)
 
 	ctx := _test_context(t, chat)
 	defer session.context_destroy(&ctx, context.allocator)
@@ -589,4 +595,52 @@ test_a_rejected_payload_with_nothing_to_install_ends_the_turn :: proc(t: ^testin
 	evidence := error_record(t, row.error_json)
 	testing.expect_value(t, evidence.failure_class, "context_overflow")
 	testing.expect_value(t, evidence.recovery, "context_exhausted")
+}
+
+// An idle session starts the summary a refused boundary recorded, from the prefix the seam
+// picks, and says so when a later tick installs one: the user asked for nothing here.
+@(test)
+test_an_idle_session_starts_the_summary_a_refusal_recorded :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 500_000)
+	_test_accept(t, chat, "first")
+	large := strings.repeat("work ", 320_000) or_else ""
+	defer delete(large)
+	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.User_Entry{text = large, origin = .Prompt}})
+	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
+		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_100, payload = session.Assistant_Entry{text = text}})
+	}
+	// The turn is over, and the refusal left its intent behind.
+	chat.state = .Idle
+	testing.expect_value(t, chat_compact_request(chat, .Provider_Overflow), Compact_Request_Result.Scheduled)
+
+	responses := []string{agent_provider_reply(COMPACT_TEST_SUMMARY)}
+	provider: Agent_Provider
+	if !agent_provider_start(t, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	notices: Chat_Notice_Log
+	observer := chat_notice_log_begin(&notices)
+	defer chat_notice_log_destroy(&notices)
+	testing.expect(t, !chat_compact_idle_service(chat, observer, connection), "an idle tick that starts work changed no context")
+	if !testing.expect_value(t, chat.compact.state, Compact_State.Running) { return }
+	testing.expect_value(t, chat.compact.trigger, Compact_Trigger.Provider_Overflow)
+	// The intent was consumed: a tick that has nothing recorded starts nothing.
+	testing.expect(t, chat_compact_idle_service(chat, observer, connection) == false)
+	if !compact_await_state(t, chat, .Ready) { return }
+
+	testing.expect(t, chat_compact_idle_service(chat, observer, connection), "installing a ready summary changed the context")
+	testing.expect_value(t, chat.compact.state, Compact_State.Idle)
+	testing.expect(t, len(notices.lines) > 0, "an idle install is reported")
+	_, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
+	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
+	testing.expect(t, has_checkpoint, "the checkpoint landed")
 }

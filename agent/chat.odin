@@ -188,13 +188,17 @@ chat_perform_request :: proc(
 	// A request that does not fit is refused unless a summary that already finished
 	// can be installed right now. Nothing waits for compaction: a request that still
 	// does not fit fails explicitly, and the turn is told why.
-	message, admitted := chat_admission_check(chat, prep.estimate)
+	message, admitted := chat_admission_check(chat, prep.estimate, prep.sizes)
 	if !admitted {
 		if chat_compact_relieve(chat, observer) && !chat_session_cancelled(chat) {
 			if !chat_rebuild_prep(chat, connection, &prep) { return }
-			message, admitted = chat_admission_check(chat, prep.estimate)
+			message, admitted = chat_admission_check(chat, prep.estimate, prep.sizes)
 		}
 		if !admitted {
+			// The request never reached a provider, so the turn ends with the reason
+			// admission refused it rather than with a send that did not happen.
+			chat.turn_recovery = .Context_Exhausted
+			chat.turn_recovery_present = true
 			if chat_session_cancelled(chat) {
 				chat_session_note_cancel(chat)
 			} else {
@@ -449,6 +453,10 @@ chat_perform_request :: proc(
 			refusal := chat_repair_context(chat, connection, observer, &prep, &encoded, previous_estimate)
 			if refusal != .None {
 				chat.turn_repair_refusal = refusal
+				// The session keeps the pressure, so the next safe boundary starts the
+				// summary this refusal was missing. A summary already running is promoted
+				// instead: it is the same work, and it installs as soon as it is ready.
+				_ = chat_compact_request(chat, .Provider_Overflow, nil)
 				chat_session_fail_turn(chat, fmt.tprintf("the request does not fit the context: %s", chat_repair_refusal_text(refusal)))
 				break
 			}
@@ -500,6 +508,8 @@ chat_perform_request :: proc(
 	// cannot say: the row reports the outcome of its own send, not the reason the harness
 	// stopped trying.
 	if decision.reason != .Completed {
+		chat.turn_recovery = decision.reason
+		chat.turn_recovery_present = true
 		level := log.Level.Warning
 		if decision.reason == .Cancelled { level = .Info }
 		stopped := [4]Log_Field {
@@ -758,7 +768,9 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 		outcome = .Interrupted
 	}
 	error_json := ""
-	if effect.error != "" { error_json = chat_error_json(effect.error) }
+	if effect.error != "" {
+		error_json = chat_turn_error_json(effect.error, chat.turn_recovery, chat.turn_recovery_present, chat.turn_repair_refusal)
+	}
 
 	if turn_err := session.turn_finish(chat.store, chat.id, turn_no, outcome, error_json, at_ms); turn_err != nil {
 		chat_session_record_failure(chat, "the turn outcome could not be recorded", turn_err)

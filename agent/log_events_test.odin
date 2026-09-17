@@ -254,11 +254,11 @@ test_an_admission_decision_is_recorded :: proc(t: ^testing.T) {
 	// The window has to hold the estimate plus the reserved output plus the margin,
 	// or nothing is ever admitted.
 	chat_test_capacity(chat, 20_000)
-	message, admitted := chat_admission_check(chat, 10)
+	message, admitted := chat_admission_check(chat, 10, {})
 	testing.expect(t, admitted, "a small request fits")
 	testing.expect_value(t, message, "")
 
-	_, refused := chat_admission_check(chat, 100_000)
+	_, refused := chat_admission_check(chat, 100_000, {})
 	testing.expect(t, !refused, "an oversized request is refused")
 
 	context.logger = fixture.ambient
