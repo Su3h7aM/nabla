@@ -31,6 +31,20 @@ test_a_stated_zero_window_admits_nothing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_the_output_bound_is_capped_by_what_one_request_needs :: proc(t: ^testing.T) {
+	// A model that can emit 128K tokens in one response almost never does, and this
+	// window is not asked to hold that much against input on the chance that it might.
+	large := capacity_of(1_000_000, 128 * 1_024)
+	testing.expect_value(t, large.output, CHAT_OUTPUT_MAX_TOKENS)
+	testing.expect(t, large.output < 128 * 1_024)
+	testing.expect(t, large.usable > large.window * 80 / 100, "almost all of the window is left for input")
+
+	// The cap never asks for more than the model allows.
+	modest := capacity_of(1_000_000, 8_000)
+	testing.expect_value(t, modest.output, 8_000)
+}
+
+@(test)
 test_the_output_reservation_never_takes_the_window :: proc(t: ^testing.T) {
 	// The model's stated maximum is a capability, not a per-request need. Reserving
 	// it whole is what starved a 32K window: the model states an 8K maximum, and the

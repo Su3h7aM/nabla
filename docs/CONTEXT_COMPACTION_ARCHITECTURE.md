@@ -166,6 +166,13 @@ Idle servicing is the root package's job: `run_worker` polls with `app_compactio
 `WORK_IDLE_POLL` while `app_compaction_pending`, so a summary that finishes with no work queued is
 still adopted and installed.
 
+A started summary is announced where it starts, in `chat_compact_start`, so the front-end sees one
+notice per attempt and can time it. The notice names the reason, because an automatic summary and a
+requested one are indistinguishable afterwards and only the caller knows which it was. A finished
+one is announced when it is adopted, and installation is not announced separately: the two facts
+arrive at the same boundary. Nothing about either notice is required by the foreground, and a
+front-end that ignores them loses only the narration.
+
 ## 6. Policy
 
 The model's window is divided once, by `model_capacity` in `agent/capacity.odin`, and the
@@ -174,7 +181,7 @@ the recorded request, and the status line all read that one value, so two featur
 partition the window differently.
 
 ```text
-output  = min(model maximum, 25% of window, at least 1024)
+output  = smallest of: the model maximum, 32K, 25% of the window
 margin  = max(10% of window, 1024)
 usable  = window - output - margin
 trigger = usable - reserve
@@ -183,11 +190,14 @@ reserve = min(max(20% of window, 4096), usable / 2)
 
 `usable` is the largest input the harness will send, and therefore also the size at which
 admission refuses a request. The output reservation is what the request itself asks the provider
-for, not the model's capability: a provider validates input plus the requested output against
-the window, so reserving the stated maximum whole would starve a small window, and a model whose
-maximum exceeds its own window would leave no room to send anything. The margin covers the
-estimator's error, which is proportional to how dense the content is rather than to the window,
-so it is a share rather than a constant that happens to suit one window size.
+for, not the model's capability: a provider validates input plus the requested output against the
+window, so reserving the stated maximum whole would starve a small window, and a model whose
+maximum exceeds its own window would leave no room to send anything. It is capped in absolute
+terms as well, because a capability is not a per-request need: a model that can emit 128K tokens
+in one response almost never does, and holding all of it against input costs a tenth of a
+megatoken window for nothing. The margin covers the estimator's error, which grows with how dense
+the content is rather than with the window, so it is a share rather than a constant that happens
+to suit one window size.
 
 `trigger` is one number for two decisions, because both are about the same point. A summary
 starts there, and a finished summary is installed there. Installing sooner would break the cache
@@ -198,7 +208,8 @@ half of `usable` so a window is never reserved away entirely.
 | Constant | Value | Why |
 |---|---|---|
 | `CHAT_COMPACT_KEEP_MESSAGES` | `10` | Entries kept verbatim, extended as needed to keep a call/result run whole |
-| `CHAT_OUTPUT_PERCENT` | `25` | Share of the window one request may generate |
+| `CHAT_OUTPUT_MAX_TOKENS` | `32768` | Most one request asks the model to generate |
+| `CHAT_OUTPUT_WINDOW_PERCENT` | `25` | Share of the window one request may reserve for its own output |
 | `CHAT_MARGIN_PERCENT` | `10` | Estimator error allowance |
 | `CHAT_COMPACT_RESERVE_PERCENT` | `20` | Foreground growth the foreground may still make while a summary runs |
 | `CHAT_COMPACT_RESERVE_MIN_TOKENS` | `4096` | Floor on that reserve, so it is worth having on a small window |

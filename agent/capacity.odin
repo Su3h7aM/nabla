@@ -32,11 +32,22 @@ CHAT_DEFAULT_CONTEXT_WINDOW :: 128 * 1024
 // no maximum of its own.
 CHAT_DEFAULT_OUTPUT_TOKENS :: 4096
 
-// CHAT_OUTPUT_PERCENT bounds what one request may generate. A model's stated
-// maximum is a capability rather than a per-request need: reserving it whole starves
-// a small window, and a model whose maximum is larger than its own window would
-// leave no input room at all.
-CHAT_OUTPUT_PERCENT :: 25
+// CHAT_OUTPUT_MAX_TOKENS is the most one request asks the model to generate. A
+// model's stated maximum is a capability, not a per-request need: one that can emit
+// 128K tokens in a single response almost never does, and reserving all of it would
+// hold a large part of the window against input that needs it. This ceiling covers a
+// long answer, a large file written through a tool call, and a reasoning model's
+// thinking.
+CHAT_OUTPUT_MAX_TOKENS :: 32 * 1024
+
+// CHAT_OUTPUT_WINDOW_PERCENT is the share of the window one request may reserve for
+// its own output. A request whose output bound leaves no room for input cannot be
+// sent at all, so the larger part of the window is always kept for input.
+CHAT_OUTPUT_WINDOW_PERCENT :: 25
+
+// CHAT_OUTPUT_MIN_TOKENS keeps a window too small to have a share of its own from
+// asking for an output bound too small to answer with. The model's own maximum still
+// wins, because a request never asks for more than the model allows.
 CHAT_OUTPUT_MIN_TOKENS :: 1024
 
 // CHAT_MARGIN_PERCENT and CHAT_MARGIN_MIN_TOKENS bound what the estimator's error
@@ -50,6 +61,10 @@ CHAT_MARGIN_MIN_TOKENS :: 1024
 // model_capacity divides one resolved model's window. Presence decides the window:
 // a stated one is used as stated, including an explicit zero, which admission then
 // refuses rather than quietly running with the default.
+//
+// The output bound is the smallest of three limits, each answering a different
+// question: what the model allows, what the harness will ask for, and what the window
+// can spare for one request's own output.
 model_capacity :: proc(model: Catalog_Model) -> Model_Capacity {
 	window := model.context_window
 	if !model.context_window_present { window = CHAT_DEFAULT_CONTEXT_WINDOW }
@@ -57,7 +72,8 @@ model_capacity :: proc(model: Catalog_Model) -> Model_Capacity {
 
 	output := model.max_output_tokens
 	if !model.max_output_tokens_present || output <= 0 { output = CHAT_DEFAULT_OUTPUT_TOKENS }
-	output = min(output, max(window * CHAT_OUTPUT_PERCENT / 100, CHAT_OUTPUT_MIN_TOKENS))
+	share := max(window * CHAT_OUTPUT_WINDOW_PERCENT / 100, CHAT_OUTPUT_MIN_TOKENS)
+	output = min(output, CHAT_OUTPUT_MAX_TOKENS, share)
 
 	margin := max(window * CHAT_MARGIN_PERCENT / 100, CHAT_MARGIN_MIN_TOKENS)
 	return {window = window, output = output, margin = margin, usable = max(window - output - margin, 0)}

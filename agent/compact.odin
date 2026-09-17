@@ -201,6 +201,23 @@ compact_trigger_explicit :: proc(trigger: Compact_Trigger) -> bool {
 	return trigger == .Agent_Tool || trigger == .User_Command
 }
 
+// chat_compact_start_notice is what the front-end is told when a summary actually
+// starts. It names the reason, because an automatic summary and a requested one look
+// the same afterwards and only the caller knows which it was.
+@(private)
+chat_compact_start_notice :: proc(trigger: Compact_Trigger) -> string {
+	switch trigger {
+	case .Pressure:
+		return "background compaction started: the context is filling up"
+	case .Agent_Tool:
+		return "background compaction started: the agent asked for a checkpoint"
+	case .User_Command:
+		return "background compaction started: requested"
+	case .None:
+	}
+	return "background compaction started"
+}
+
 compact_trigger_name :: proc(trigger: Compact_Trigger) -> string {
 	switch trigger {
 	case .None:
@@ -498,6 +515,9 @@ chat_compact_start :: proc(
 	control.job = job
 	control.state = .Running
 	control.trigger = trigger
+	// A job that has started says so, from the one place a job starts. The front-end
+	// can then tell when a summary began and how long it took.
+	_observer_message(observer, .Notice, chat_compact_start_notice(trigger))
 
 	fields := [6]Log_Field {
 		{key = "trigger", value = compact_trigger_name(trigger)},
@@ -590,7 +610,7 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 		{key = "elapsed_ms", value = log_duration_ms(time.tick_since(job.started_at))},
 	}
 	log_emit({level = .Info, category = .Provider, event = "compaction.finished", fields = fields[:]})
-	_observer_message(observer, .Notice, "compaction finished; the summary is installed when the context reaches the size it was started for")
+	_observer_message(observer, .Notice, "background compaction finished; the summary is installed when the context reaches the size it was started for")
 }
 
 @(private)
@@ -775,11 +795,11 @@ chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, conne
 		defer chat_request_prep_destroy(&prep, chat.allocator)
 		chat_compact_consider(chat, observer, connection, &prep)
 	}
-	if chat.compact.state == .Running {
-		_observer_message(observer, .Notice, "compacting the current context in the background")
-	} else if chat.compact.pending != .None {
+	// A job that started has already said so; the rest is the outcome the caller
+	// cannot see from here.
+	if chat.compact.state != .Running && chat.compact.pending != .None {
 		_observer_message(observer, .Notice, "compaction will start at the next request boundary")
-	} else {
+	} else if chat.compact.state != .Running {
 		_observer_message(observer, .Notice, "nothing to compact")
 	}
 	return true

@@ -445,9 +445,17 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(t: ^testing.
 	testing.expect(t, prep.estimate >= trigger, "the fixture must cross the compaction trigger")
 	testing.expect(t, prep.estimate <= chat.capacity.usable, "the fixture must still be sendable")
 
-	chat_compact_consider(chat, {}, dead, &prep)
+	// A started summary says so, once, so the front-end can time it. Nothing was
+	// started before this point, so no notice was emitted.
+	notices: Chat_Notice_Log
+	observer := chat_notice_log_begin(&notices)
+	defer chat_notice_log_destroy(&notices)
+	testing.expect_value(t, chat_notice_log_count(&notices, "background compaction"), 0)
+
+	chat_compact_consider(chat, observer, dead, &prep)
 	testing.expect_value(t, chat.compact.state, Compact_State.Running)
 	testing.expect_value(t, chat.compact.trigger, Compact_Trigger.Pressure)
+	testing.expect_value(t, chat_notice_log_count(&notices, "background compaction started"), 1)
 
 	// A request that fits is never held up by the job, and the dead endpoint closes
 	// it without a checkpoint.

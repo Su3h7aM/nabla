@@ -5,6 +5,7 @@ package agent
 // a real store, because a session's history is the store now and a fake would
 // test the fake instead of the harness.
 
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -17,6 +18,41 @@ Chat_Test :: struct {
 	store: session.Store,
 	dir:   string,
 	chat:  Chat_Session,
+}
+
+// Chat_Notice_Log is what a front-end was told during one call. A notice is the
+// harness's only channel to the user, so a test that cares about one captures it
+// here; the log is a different record and is asserted separately.
+Chat_Notice_Log :: struct {
+	lines:     [dynamic]string,
+	allocator: mem.Allocator,
+}
+
+chat_notice_log_begin :: proc(log: ^Chat_Notice_Log, allocator := context.allocator) -> Chat_Observer {
+	log.allocator = allocator
+	log.lines = make([dynamic]string, 0, allocator)
+	return Chat_Observer{user_data = log, message = chat_notice_log_capture}
+}
+
+@(private)
+chat_notice_log_capture :: proc(user_data: rawptr, kind: Chat_Message_Kind, text: string) {
+	_ = kind
+	log := cast(^Chat_Notice_Log)user_data
+	append(&log.lines, strings.clone(text, log.allocator))
+}
+
+chat_notice_log_destroy :: proc(log: ^Chat_Notice_Log) {
+	for line in log.lines { delete(line, log.allocator) }
+	delete(log.lines)
+	log^ = {}
+}
+
+// chat_notice_log_count is how many notices carried this text. A caller asserts on a
+// count rather than on wording, so a reworded notice does not fail the test.
+chat_notice_log_count :: proc(log: ^Chat_Notice_Log, contains: string) -> int {
+	count := 0
+	for line in log.lines { if strings.contains(line, contains) { count += 1 } }
+	return count
 }
 
 // chat_test_capacity gives a session the context budget a resolved model with this
