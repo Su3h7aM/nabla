@@ -29,11 +29,15 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 	for {
 		work, ok := chan.try_recv(app.run.work)
 		if !ok {
+			// A stop that arrived with nothing queued leaves through the drain loop
+			// below, so shutdown never waits on a compaction to finish.
+			if runtime_stopping(app) { break }
 			// Nothing is queued. A compaction that is still running has to be looked
 			// at even with no work to do, or a finished summary would wait for the
 			// next prompt to be installed.
 			if app_compaction_pending(app) {
 				if app_compaction_tick(app, observer) { refresh_status(app) }
+				free_all(context.temp_allocator)
 				time.sleep(WORK_IDLE_POLL)
 				continue
 			}
