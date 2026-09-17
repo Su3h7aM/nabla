@@ -600,7 +600,7 @@ test_provider_auth_headers_are_optional :: proc(t: ^testing.T) {
 		API        = .OpenAI_Chat_Completions,
 		Credential = "secret",
 	}
-	headers := provider_request_headers(authenticated, {}, context.allocator)
+	headers := provider_encoded_headers(authenticated, {}, context.allocator)
 	defer provider_headers_destroy(headers, context.allocator)
 	if testing.expect_value(t, len(headers), 1) {
 		testing.expect_value(t, headers[0].name, "authorization")
@@ -610,7 +610,7 @@ test_provider_auth_headers_are_optional :: proc(t: ^testing.T) {
 	anonymous := Provider_Connection {
 		API = .OpenAI_Responses,
 	}
-	none := provider_request_headers(anonymous, {}, context.allocator)
+	none := provider_encoded_headers(anonymous, {}, context.allocator)
 	defer provider_headers_destroy(none, context.allocator)
 	testing.expect_value(t, len(none), 0)
 
@@ -619,7 +619,7 @@ test_provider_auth_headers_are_optional :: proc(t: ^testing.T) {
 		API        = .Anthropic_Messages,
 		Credential = "secret",
 	}
-	versioned := provider_request_headers(messages, {}, context.allocator)
+	versioned := provider_encoded_headers(messages, {}, context.allocator)
 	defer provider_headers_destroy(versioned, context.allocator)
 	if testing.expect_value(t, len(versioned), 2) {
 		testing.expect_value(t, versioned[0].name, "x-api-key")
@@ -638,13 +638,13 @@ test_provider_request_headers_carry_the_client_identity :: proc(t: ^testing.T) {
 		API        = .OpenAI_Responses,
 		Credential = "secret",
 	}
-	named := Provider_Request {
+	named := Provider_Encoded_Request {
 		User_Agent_Present = true,
 		User_Agent         = "nabla/0.1.0",
 		Session_Id_Present = true,
 		Session_Id         = "0123456789abcdef0123456789abcdef",
 	}
-	headers := provider_request_headers(connection, named, context.allocator)
+	headers := provider_encoded_headers(connection, named, context.allocator)
 	defer provider_headers_destroy(headers, context.allocator)
 	if testing.expect_value(t, len(headers), 3) { return }
 	testing.expect_value(t, headers[0].name, "authorization")
@@ -654,11 +654,11 @@ test_provider_request_headers_carry_the_client_identity :: proc(t: ^testing.T) {
 	testing.expect_value(t, headers[2].value, "0123456789abcdef0123456789abcdef")
 
 	// A present but empty value is not an identity, so no header is sent for it.
-	blank := Provider_Request {
+	blank := Provider_Encoded_Request {
 		User_Agent_Present = true,
 		Session_Id_Present = true,
 	}
-	headers = provider_request_headers(connection, blank, context.allocator)
+	headers = provider_encoded_headers(connection, blank, context.allocator)
 	defer provider_headers_destroy(headers, context.allocator)
 	testing.expect_value(t, len(headers), 1)
 	testing.expect_value(t, headers[0].name, "authorization")

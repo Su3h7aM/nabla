@@ -102,6 +102,24 @@ Provider_Operation_Error :: struct {
 	status: int,
 }
 
+// Provider_Encoded_Request is a provider request whose body was encoded before
+// the operation runs. It exists so a caller that has to freeze the exact bytes it
+// will send can encode once and hand those bytes to another thread. Every string
+// is borrowed for the life of the operation, and Body comes from
+// Provider_Encode_Request, so it is already validated.
+Provider_Encoded_Request :: struct {
+	API:                API_Kind,
+	Body:               []u8,
+	// Model and Tools describe the body for the observer, which cannot read them
+	// back out of the encoded bytes.
+	Model:              string,
+	Tools:              int,
+	Session_Id_Present: bool,
+	Session_Id:         string,
+	User_Agent_Present: bool,
+	User_Agent:         string,
+}
+
 // Provider_Operation_Options is the caller's interruption and trust policy for
 // one request. A zero value performs the request without cancellation, which is
 // what the synchronous prototype path wants.
@@ -130,7 +148,7 @@ Provider_Operation_Options :: struct {
 // allocator; the names are literals. provider_headers_destroy releases the whole
 // result.
 @(private)
-provider_request_headers :: proc(connection: Provider_Connection, request: Provider_Request, allocator := context.allocator) -> []client.Header {
+provider_encoded_headers :: proc(connection: Provider_Connection, encoded: Provider_Encoded_Request, allocator := context.allocator) -> []client.Header {
 	// Sized for the most any API family needs, so every entry is allocated up
 	// front from the caller's allocator rather than grown through an ambient one.
 	result := make([]client.Header, 4, allocator)
@@ -152,12 +170,12 @@ provider_request_headers :: proc(connection: Provider_Connection, request: Provi
 		count += 1
 	case .Invalid:
 	}
-	if request.User_Agent_Present && request.User_Agent != "" {
-		result[count] = {"user-agent", strings.clone(request.User_Agent, allocator)}
+	if encoded.User_Agent_Present && encoded.User_Agent != "" {
+		result[count] = {"user-agent", strings.clone(encoded.User_Agent, allocator)}
 		count += 1
 	}
-	if request.Session_Id_Present && request.Session_Id != "" {
-		result[count] = {"session-id", strings.clone(request.Session_Id, allocator)}
+	if encoded.Session_Id_Present && encoded.Session_Id != "" {
+		result[count] = {"session-id", strings.clone(encoded.Session_Id, allocator)}
 		count += 1
 	}
 	return result[:count]
@@ -187,12 +205,48 @@ Provider_Request_Operation_Controlled :: proc(
 	if connection.API != request.API {
 		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("connection/request API mismatch", allocator)}
 	}
+	body, encode_err := Provider_Encode_Request(request, allocator)
+	if encode_err != .None {
+		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(encode_err), allocator)}
+	}
+	defer delete(body, allocator)
+	encoded := Provider_Encoded_Request {
+		API                = request.API,
+		Body               = transmute([]u8)body,
+		Model              = request.Model,
+		Tools              = len(request.Tools),
+		Session_Id_Present = request.Session_Id_Present,
+		Session_Id         = request.Session_Id,
+		User_Agent_Present = request.User_Agent_Present,
+		User_Agent         = request.User_Agent,
+	}
+	return Provider_Request_Operation_Encoded(connection, encoded, user_data, callback, options, allocator)
+}
+
+// Provider_Request_Operation_Encoded performs one request from a body that was
+// encoded earlier. Encoding is the only thing it skips: an operation that begins
+// with bytes must behave exactly like one that begins with a request, so this is
+// the one place the send path lives.
+Provider_Request_Operation_Encoded :: proc(
+	connection: Provider_Connection,
+	encoded: Provider_Encoded_Request,
+	user_data: rawptr,
+	callback: Provider_Event_Callback,
+	options: Provider_Operation_Options,
+	allocator := context.allocator,
+) -> Provider_Operation_Error {
+	if connection.API != encoded.API {
+		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("connection/request API mismatch", allocator)}
+	}
+	if len(encoded.Body) == 0 {
+		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("the encoded request body is empty", allocator)}
+	}
 	endpoint := strings.trim_right(connection.Endpoint, "/")
 	owned_endpoint := ""
 	// Each API family names its own resource path. A configured endpoint may
 	// already include it, so the suffix is added only when it is missing.
 	want_suffix: string
-	switch request.API {
+	switch encoded.API {
 	case .OpenAI_Chat_Completions:
 		want_suffix = "/chat/completions"
 	case .OpenAI_Responses:
@@ -208,19 +262,14 @@ Provider_Request_Operation_Controlled :: proc(
 		endpoint = owned_endpoint
 	}
 	defer delete(owned_endpoint, allocator)
-	body, encode_err := Provider_Encode_Request(request, allocator)
-	if encode_err != .None {
-		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(encode_err), allocator)}
-	}
-	defer delete(body, allocator)
 	if options.observer.report != nil {
 		options.observer.report(
 			options.observer.user_data,
-			Provider_Operation_Report{stage = .Encoded, api = request.API, model = request.Model, tools = len(request.Tools), body = transmute([]u8)body},
+			Provider_Operation_Report{stage = .Encoded, api = encoded.API, model = encoded.Model, tools = encoded.Tools, body = encoded.Body},
 		)
 	}
 
-	headers := provider_request_headers(connection, request, allocator)
+	headers := provider_encoded_headers(connection, encoded, allocator)
 	defer provider_headers_destroy(headers, allocator)
 
 	state := Provider_Request_Stream_State {
@@ -241,14 +290,14 @@ Provider_Request_Operation_Controlled :: proc(
 	failure := http_post_sse(
 		HTTP_Request {
 			url = endpoint,
-			body = transmute([]u8)body,
+			body = encoded.Body,
 			headers = headers,
 			ca_file = options.ca_file,
 			nameservers = options.nameservers,
 			allocator = allocator,
 		},
 		HTTP_Control{interrupt = options.interrupt, deadline = options.deadline},
-		request.API,
+		encoded.API,
 		options.observer,
 		&state,
 		provider_http_chunk,
