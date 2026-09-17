@@ -65,6 +65,19 @@ Request :: struct {
 // resolution, which is bracketed instead of interrupted.
 stream_request :: proc(request: Request, options: Options, user_data: rawptr, callback: Chunk_Callback) -> Failure {
 	url := http.url_parse(request.url)
+	// One observation per request, reported on every path once validation has
+	// begun. The phase names the stage about to run, so an error inside a stage is
+	// reported as that stage: a failure before anything was written cannot be
+	// confused with one after the whole request went out.
+	summary: Transfer_Summary
+	phase := Transfer_Phase.Validate
+	defer {
+		summary.stopped_at = phase
+		if options.observer.complete != nil {
+			options.observer.complete(options.observer.user_data, summary)
+		}
+	}
+
 	if url.scheme != "http" && url.scheme != "https" { return failure_from_error(.None, .Invalid_URL, "URL scheme must be http or https") }
 	if url.host == "" { return failure_from_error(.None, .Invalid_URL, "URL host is empty") }
 
@@ -75,6 +88,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	}
 	defer nbio.release_thread_event_loop()
 
+	phase = .Resolve
 	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
 		return failure_from_error(error_from_stop(stop))
 	}
@@ -84,22 +98,29 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 		return failure_from_error(error_from_stop(stop))
 	}
 
+	phase = .Connect
 	connection, dial_err := connection_dial(endpoint, options, request.allocator)
 	if dial_err != .None { return failure_from_error(dial_err) }
 	defer connection_destroy(connection)
 
 	if url.scheme == "https" {
+		phase = .TLS
 		if handshake_err := connection_handshake(connection, url.host); handshake_err != .None {
 			return failure_from_error(handshake_err)
 		}
 	}
 
-	buffer := format_request(url, request)
+	phase = .Request_Write
+	buffer, body_offset := format_request(url, request)
 	defer bytes.buffer_destroy(&buffer)
-	if write_err := connection_write_all(connection, bytes.buffer_to_bytes(&buffer)); write_err != .None {
-		return failure_from_error(write_err)
-	}
+	request_bytes := bytes.buffer_to_bytes(&buffer)
+	accepted, write_err := connection_write_all(connection, request_bytes)
+	summary.request_bytes_accepted = u64(accepted)
+	summary.request_body_bytes_accepted = u64(max(accepted - body_offset, 0))
+	summary.request_complete = accepted == len(request_bytes)
+	if write_err != .None { return failure_from_error(write_err) }
 
+	phase = .Response_Head
 	reader: Reader
 	reader_init(&reader, connection_read_source, connection, request.allocator)
 	defer reader_destroy(&reader)
@@ -107,6 +128,17 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	status, headers, head_err := read_final_response_head(&reader, request.allocator)
 	defer headers_destroy(&headers, request.allocator)
 	if head_err != .None { return failure_from_error(head_err) }
+	summary.response_head_received = true
+	summary.status = status
+
+	// The head is where a declared length comes from, whatever the status is. The
+	// framing error itself is reported after the status and content-type checks, so
+	// a refused response is still refused for the reason it was before.
+	framing, length, framing_err := response_framing(status, request.method, headers)
+	if framing_err == .None && framing == Body_Framing.Exact {
+		summary.declared_body_bytes = u64(length)
+		summary.declared_body_bytes_present = true
+	}
 
 	// Anything outside 2xx ends the request and is reported by its status.
 	// Redirects are deliberately not followed: RFC 9110 15.4 makes automatic
@@ -127,15 +159,21 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 		}
 	}
 
-	if framing, length, framing_err := response_framing(status, request.method, headers); framing_err != .None {
+	phase = .Response_Body
+	if framing_err != .None {
 		return failure_from_error(framing_err)
 	} else if body_err := stream_body(&reader, framing, length, user_data, callback); body_err != .None {
 		return failure_from_error(body_err)
 	}
+
+	phase = .Complete
 	return {}
 }
 
-format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer) {
+// format_request builds the request line, the fields, and the body. body_offset is
+// where the body begins, which is what lets a partial write say how much of the
+// body the transport took rather than how much of the whole request it took.
+format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer, body_offset: int) {
 	// The request target is the origin-form of the URL -- path and query both.
 	request_target := http.request_path(url, request.allocator)
 	defer delete(request_target, request.allocator)
@@ -162,6 +200,7 @@ format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer
 		bytes.buffer_write_string(&buffer, "\r\n")
 	}
 	bytes.buffer_write_string(&buffer, "\r\n")
+	body_offset = len(bytes.buffer_to_bytes(&buffer))
 	bytes.buffer_write(&buffer, request.body)
 	return
 }

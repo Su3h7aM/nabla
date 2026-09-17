@@ -135,8 +135,11 @@ connection_handshake :: proc(connection: ^Connection, host: string) -> Error {
 }
 
 // connection_write_all retries the same buffer after a retryable result and only
-// advances past bytes the peer actually accepted.
-connection_write_all :: proc(connection: ^Connection, buffer: []u8) -> Error {
+// advances past bytes the peer actually accepted. accepted counts plaintext bytes
+// the socket or the TLS layer took, which is not evidence that the peer received
+// them; a failure still reports what was taken before it, so a caller can tell a
+// request that never started from one that stopped halfway.
+connection_write_all :: proc(connection: ^Connection, buffer: []u8) -> (accepted: int, err: Error) {
 	pending := buffer
 	for len(pending) > 0 {
 		written: int
@@ -147,21 +150,21 @@ connection_write_all :: proc(connection: ^Connection, buffer: []u8) -> Error {
 			} else {
 				switch SSL_get_error(connection.ssl, result) {
 				case SSL_ERROR_WANT_READ:
-					if stop := connection_wait(connection, .Read); stop != .None { return error_from_stop(stop) }
+					if stop := connection_wait(connection, .Read); stop != .None { return accepted, error_from_stop(stop) }
 					continue
 				case SSL_ERROR_WANT_WRITE:
-					if stop := connection_wait(connection, .Write); stop != .None { return error_from_stop(stop) }
+					if stop := connection_wait(connection, .Write); stop != .None { return accepted, error_from_stop(stop) }
 					continue
 				case SSL_ERROR_ZERO_RETURN:
 					connection.stop = .Peer_Closed
-					return .Closed
+					return accepted, .Closed
 				case:
 					if ssl_peer_closed() {
 						connection.stop = .Peer_Closed
-						return .Closed
+						return accepted, .Closed
 					}
 					connection.stop = .Truncated
-					return .TLS_Write
+					return accepted, .TLS_Write
 				}
 			}
 		} else {
@@ -170,25 +173,26 @@ connection_write_all :: proc(connection: ^Connection, buffer: []u8) -> Error {
 			case nil:
 				written = count
 			case .Would_Block:
-				if stop := connection_wait(connection, .Write); stop != .None { return error_from_stop(stop) }
+				if stop := connection_wait(connection, .Write); stop != .None { return accepted, error_from_stop(stop) }
 				continue
 			case .Interrupted:
 				continue
 			case .Connection_Closed, .Not_Connected:
 				connection.stop = .Peer_Closed
-				return .Closed
+				return accepted, .Closed
 			case:
 				connection.stop = .Truncated
-				return .Send
+				return accepted, .Send
 			}
 		}
 		if written <= 0 {
 			connection.stop = .Truncated
-			return .Truncated
+			return accepted, .Truncated
 		}
 		pending = pending[written:]
+		accepted += written
 	}
-	return .None
+	return accepted, .None
 }
 
 // connection_read_source adapts connection_read to the Reader's byte source. Odin

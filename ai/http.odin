@@ -48,7 +48,18 @@ HTTP_Failure_Kind :: enum {
 // type -- live in nabla:sse. What stays here is what is provider-specific: the
 // headers the request carries, the interrupt/deadline policy handed to the
 // transport as a wait hook, and the mapping into this package's failure kinds.
-http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: rawptr, callback: client.Chunk_Callback) -> HTTP_Failure {
+//
+// api and observer name the provider operation this transfer belongs to, so the
+// transport's own account of how far the request got can be reported through the
+// same observer that carries the encoded body and the response chunks.
+http_post_sse :: proc(
+	request: HTTP_Request,
+	control: HTTP_Control,
+	api: API_Kind,
+	observer: Provider_Operation_Observer,
+	user_data: rawptr,
+	callback: client.Chunk_Callback,
+) -> HTTP_Failure {
 	// The wait hook needs a pointer that outlives the request, so the control
 	// value lives in a local for the duration of this call.
 	local_control := control
@@ -62,9 +73,81 @@ http_post_sse :: proc(request: HTTP_Request, control: HTTP_Control, user_data: r
 			user_data = &local_control,
 		}
 	}
+	// The relay is in this frame for the whole call, because the transport reports
+	// synchronously before it returns.
+	relay := Transfer_Relay {
+		observer = observer,
+		api      = api,
+	}
+	if observer.report != nil {
+		options.observer = {
+			user_data = &relay,
+			complete  = http_transfer_complete,
+		}
+	}
 
 	failure := sse.post({url = request.url, body = request.body, headers = request.headers, allocator = request.allocator}, options, user_data, callback)
 	return http_failure_from(failure)
+}
+
+// Transfer_Relay is what one HTTP transfer reports into: the provider observer
+// and the api the request belonged to. It is borrowed by the transport for one
+// synchronous call and never retained.
+Transfer_Relay :: struct {
+	observer: Provider_Operation_Observer,
+	api:      API_Kind,
+}
+
+// http_transfer_complete turns the transport's own account of a request into the
+// provider operation's Transfer report. The observer is asked last, after
+// encoding and after every response chunk, so a reader sees the transfer summary
+// as the end of one attempt.
+http_transfer_complete :: proc(user_data: rawptr, summary: client.Transfer_Summary) {
+	relay := cast(^Transfer_Relay)user_data
+	if relay == nil || relay.observer.report == nil { return }
+	relay.observer.report(
+		relay.observer.user_data,
+		Provider_Operation_Report {
+			stage = .Transfer,
+			api = relay.api,
+			transfer = {
+				stopped_at = http_transfer_phase(summary.stopped_at),
+				request_bytes_accepted = summary.request_bytes_accepted,
+				request_body_bytes_accepted = summary.request_body_bytes_accepted,
+				request_complete = summary.request_complete,
+				response_head_received = summary.response_head_received,
+				status = summary.status,
+				declared_body_bytes = summary.declared_body_bytes,
+				declared_body_bytes_present = summary.declared_body_bytes_present,
+			},
+		},
+	)
+}
+
+// http_transfer_phase maps a transport stopping point onto this package's
+// vocabulary. The switch is exhaustive, so a new HTTP phase is a compile error
+// here until this package has decided what it means for a provider operation.
+@(private)
+http_transfer_phase :: proc(phase: client.Transfer_Phase) -> Provider_Transfer_Phase {
+	switch phase {
+	case .Validate:
+		return .Validate
+	case .Resolve:
+		return .Resolve
+	case .Connect:
+		return .Connect
+	case .TLS:
+		return .TLS
+	case .Request_Write:
+		return .Request_Write
+	case .Response_Head:
+		return .Response_Head
+	case .Response_Body:
+		return .Response_Body
+	case .Complete:
+		return .Complete
+	}
+	unreachable()
 }
 
 // http_probe adapts this package's interrupt and deadline policy to the

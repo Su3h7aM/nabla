@@ -285,3 +285,41 @@ test_a_compaction_inside_a_turn_carries_the_turn :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(text, `"event":"compaction.finished"`), "the attempt is recorded")
 	testing.expect(t, strings.contains(text, `"turn_no":1`), "a compaction inside a turn names the turn")
 }
+
+@(test)
+test_a_transfer_account_belongs_to_one_attempt :: proc(t: ^testing.T) {
+	fixture: Log_Chat_Test
+	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
+	defer log_chat_end(t, &fixture)
+
+	// A first attempt that stopped after the head arrived.
+	first: Provider_Log
+	log_provider_report(
+		&first,
+		{
+			stage = .Transfer,
+			api = .OpenAI_Responses,
+			transfer = {
+				stopped_at = .Response_Body,
+				request_bytes_accepted = 120,
+				request_body_bytes_accepted = 90,
+				request_complete = true,
+				response_head_received = true,
+				status = 200,
+			},
+		},
+	)
+	testing.expect(t, first.transfer_seen, "the transport's own account is kept")
+	testing.expect_value(t, first.transfer.stopped_at, ai.Provider_Transfer_Phase.Response_Body)
+	testing.expect_value(t, first.transfer.request_body_bytes_accepted, u64(90))
+	testing.expect(t, first.transfer.request_complete, "the head went out with the body")
+
+	// The next attempt starts from nothing, so a retry that never reaches the
+	// transport cannot inherit the previous attempt's account. This is the same
+	// property that keeps its byte count fresh.
+	second: Provider_Log
+	testing.expect(t, !second.transfer_seen, "an attempt with no transport account says so")
+	testing.expect_value(t, second.transfer.request_bytes_accepted, u64(0))
+	testing.expect_value(t, second.transfer.stopped_at, ai.Provider_Transfer_Phase.Validate)
+	testing.expect(t, !second.transfer.response_head_received, "no head was received by an attempt that never ran")
+}

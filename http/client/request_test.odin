@@ -28,7 +28,7 @@ _render :: proc(t: ^testing.T, request: Request) -> string {
 	owned := request
 	owned.allocator = tracked
 
-	buffer := format_request(http.url_parse(owned.url), owned)
+	buffer, _ := format_request(http.url_parse(owned.url), owned)
 	text := strings.clone(bytes.buffer_to_string(&buffer), context.temp_allocator)
 	bytes.buffer_destroy(&buffer)
 
@@ -91,4 +91,27 @@ test_request_heading_headers :: proc(t: ^testing.T) {
 	// RFC 9112 9.3: a client that does not support persistent connections sends
 	// the "close" connection option in every request.
 	testing.expectf(t, strings.contains(text, "connection: close\r\n"), "missing close in:\n%s", text)
+}
+
+@(test)
+test_the_body_offset_names_where_the_body_begins :: proc(t: ^testing.T) {
+	// The offset is what lets a partial write say how much of the *body* the
+	// transport took, so it must land exactly on the first body byte however
+	// long the head is.
+	for body in ([]string{"", "x", `{"a":1}`}) {
+		request := Request {
+			url       = "https://api.example.com/v1/messages",
+			method    = .Post,
+			headers   = {{"x-extra", "a-value-longer-than-the-line"}},
+			body      = transmute([]u8)body,
+			allocator = context.allocator,
+		}
+		rendered, body_offset := format_request(http.url_parse(request.url), request)
+		defer bytes.buffer_destroy(&rendered)
+
+		text := bytes.buffer_to_string(&rendered)
+		testing.expectf(t, body_offset >= 0 && body_offset <= len(text), "the offset should be inside the request")
+		testing.expect_value(t, text[body_offset:], body)
+		testing.expectf(t, strings.has_suffix(text[:body_offset], "\r\n\r\n"), "the body should begin after the empty line, got %q", text[:body_offset])
+	}
 }

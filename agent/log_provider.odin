@@ -16,11 +16,18 @@ import "nabla:ai"
 // because its metadata may be written after the operation has moved on.
 
 // Provider_Log is what one provider attempt reports into: the running count of
-// what came back, and the response capture when payload capture is on. It is
-// created fresh for each attempt, because a retry is a new attempt with its own
-// bytes rather than a continuation of the previous one.
+// what came back, how far the transport got, and the response capture when
+// payload capture is on. It is created fresh for each attempt, because a retry is
+// a new attempt with its own bytes and its own transfer rather than a
+// continuation of the previous one.
 Provider_Log :: struct {
 	response_bytes:             u64,
+	// transfer is the transport's own account of the attempt, and transfer_seen
+	// says whether it arrived. An attempt that never reached the transport has no
+	// transfer at all, which is a different fact from one that stopped at its first
+	// phase.
+	transfer:                   ai.Provider_Transfer_Summary,
+	transfer_seen:              bool,
 	response_capture:           Capture,
 	response_capture_attempted: bool,
 }
@@ -85,5 +92,34 @@ log_provider_report :: proc(user_data: rawptr, report: ai.Provider_Operation_Rep
 		if observation.response_capture.kind != .Invalid {
 			log_capture_write(&observation.response_capture, report.chunk)
 		}
+	case .Transfer:
+		// The transport's account of the attempt, recorded whether or not anything
+		// was written, because a request that never left says so.
+		observation.transfer = report.transfer
+		observation.transfer_seen = true
 	}
+}
+
+// log_provider_transfer_name names where a transfer stopped. The names are stable
+// wire vocabulary, so a record keeps its meaning when the enum gains a member.
+log_provider_transfer_name :: proc(phase: ai.Provider_Transfer_Phase) -> string {
+	switch phase {
+	case .Validate:
+		return "validate"
+	case .Resolve:
+		return "resolve"
+	case .Connect:
+		return "connect"
+	case .TLS:
+		return "tls"
+	case .Request_Write:
+		return "request_write"
+	case .Response_Head:
+		return "response_head"
+	case .Response_Body:
+		return "response_body"
+	case .Complete:
+		return "complete"
+	}
+	unreachable()
 }

@@ -261,7 +261,26 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		if provider_log.response_capture.kind != .Invalid {
 			log_capture_finish(&provider_log.response_capture, operation_error.kind == .None)
 		}
-		finished := [6]Log_Field {
+		// The transport's own account of the attempt goes beside the provider's,
+		// because "the peer refused the request" and "nothing ever left this machine"
+		// are different findings that the high-level transport error cannot separate.
+		transfer_phase := "not_reached"
+		request_bytes_accepted := i64(0)
+		request_body_bytes_accepted := i64(0)
+		request_complete := false
+		response_head_received := false
+		declared_body_bytes := i64(0)
+		declared_body_bytes_present := false
+		if provider_log.transfer_seen {
+			transfer_phase = log_provider_transfer_name(provider_log.transfer.stopped_at)
+			request_bytes_accepted = i64(provider_log.transfer.request_bytes_accepted)
+			request_body_bytes_accepted = i64(provider_log.transfer.request_body_bytes_accepted)
+			request_complete = provider_log.transfer.request_complete
+			response_head_received = provider_log.transfer.response_head_received
+			declared_body_bytes = i64(provider_log.transfer.declared_body_bytes)
+			declared_body_bytes_present = provider_log.transfer.declared_body_bytes_present
+		}
+		finished := [13]Log_Field {
 			{key = "error_kind", value = log_operation_error_name(operation_error.kind)},
 			{key = "finish_reason", value = chat_finish_reason_text(runtime.finish_reason)},
 			{key = "status", value = i64(operation_error.status)},
@@ -270,6 +289,15 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 			// bounded text, not an unbounded body.
 			{key = "detail", value = operation_error.detail},
 			{key = "response_bytes", value = i64(provider_log.response_bytes)},
+			{key = "transfer_phase", value = transfer_phase},
+			{key = "request_bytes_accepted", value = request_bytes_accepted},
+			{key = "request_body_bytes_accepted", value = request_body_bytes_accepted},
+			{key = "request_complete", value = request_complete},
+			{key = "response_head_received", value = response_head_received},
+			// Presence stays separate from the value: a declared empty body and an
+			// undeclared one are different facts.
+			{key = "declared_body_bytes_present", value = declared_body_bytes_present},
+			{key = "declared_body_bytes", value = declared_body_bytes},
 			{key = "elapsed_ms", value = log_duration_ms(time.tick_since(at))},
 		}
 		log_emit({level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})

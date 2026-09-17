@@ -36,11 +36,11 @@ TRANSPORT_RETIRE_BOUND :: 2 * time.Second
 
 TRANSPORT_PAYLOAD :: "transport-test-payload"
 
-TRANSPORT_RESPONSE_COMPLETE ::
-	"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" +
+TRANSPORT_RESPONSE_BODY ::
 	"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n" +
 	"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
 	"data: [DONE]\n\n"
+TRANSPORT_RESPONSE_COMPLETE :: "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" + TRANSPORT_RESPONSE_BODY
 TRANSPORT_RESPONSE_PARTIAL ::
 	"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" + "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"
 
@@ -52,6 +52,9 @@ Fixture_Phase :: enum {
 	Truncate,
 	// Send headers and part of an event, then hold the connection open.
 	Stall,
+	// Send the same body with a declared length, which is the only way a head
+	// states how much body follows.
+	Declared,
 }
 
 Transport_Fixture :: struct {
@@ -185,6 +188,16 @@ transport_fixture_serve :: proc(thread: ^thread.Thread) {
 	case .Stall:
 		transport_fixture_write(ssl, TRANSPORT_RESPONSE_PARTIAL)
 		transport_fixture_stall(fixture)
+	case .Declared:
+		// The length is computed from the body rather than written down, so the
+		// head cannot disagree with what follows it.
+		head: [96]u8
+		transport_fixture_write(
+			ssl,
+			fmt.bprintf(head[:], "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: %d\r\n\r\n", len(TRANSPORT_RESPONSE_BODY)),
+		)
+		transport_fixture_write(ssl, TRANSPORT_RESPONSE_BODY)
+		_ = client.SSL_shutdown(ssl)
 	}
 }
 
@@ -421,6 +434,10 @@ Transport_Observation :: struct {
 	chunks:          int,
 	chunk_bytes:     int,
 	bytes:           u64,
+	// transfer_seen says the transport reported how the attempt ended, and
+	// transfer is what it reported. The operation's own error is a separate fact.
+	transfer_seen:   bool,
+	transfer:        Provider_Transfer_Summary,
 }
 
 transport_observation_report :: proc(user_data: rawptr, report: Provider_Operation_Report) {
@@ -434,6 +451,9 @@ transport_observation_report :: proc(user_data: rawptr, report: Provider_Operati
 		observed.chunks += 1
 		observed.chunk_bytes += len(report.chunk)
 		observed.bytes = report.bytes
+	case .Transfer:
+		observed.transfer_seen = true
+		observed.transfer = report.transfer
 	}
 }
 
@@ -607,4 +627,99 @@ test_provider_auth_headers_are_optional :: proc(t: ^testing.T) {
 		testing.expect_value(t, versioned[1].name, "anthropic-version")
 		testing.expect_value(t, versioned[1].value, ANTHROPIC_VERSION)
 	}
+}
+
+@(test)
+test_transport_reports_where_a_completed_request_stopped :: proc(t: ^testing.T) {
+	fixture: Transport_Fixture
+	if !transport_fixture_start(t, &fixture, .Declared, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
+	defer transport_fixture_stop(&fixture)
+
+	job: Transport_Job
+	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+	defer transport_job_destroy(&job, job.allocator)
+
+	observed: Transport_Observation
+	job.options.observer = {
+		user_data = &observed,
+		report    = transport_observation_report,
+	}
+	transport_job_start(&job)
+	transport_job_join(&job)
+
+	testing.expectf(t, job.error.kind == .None, "request failed: %v %s", job.error.kind, job.error.detail)
+	// The transport reports once per operation, whatever else the observer saw.
+	testing.expect(t, observed.transfer_seen, "the transport should account for the attempt")
+	testing.expect_value(t, observed.transfer.stopped_at, Provider_Transfer_Phase.Complete)
+	// The whole request was taken: the request line, the fields, and the body.
+	testing.expect(t, observed.transfer.request_complete, "the transport should have taken the whole request")
+	// The body the transport took is exactly the body the provider encoded, which
+	// is the property that makes the two counts comparable across a run.
+	testing.expect_value(t, observed.transfer.request_body_bytes_accepted, u64(observed.body_bytes))
+	testing.expect(t, observed.transfer.request_bytes_accepted > observed.transfer.request_body_bytes_accepted, "the head is counted too")
+
+	testing.expect(t, observed.transfer.response_head_received, "a head arrived")
+	testing.expect_value(t, observed.transfer.status, 200)
+	// The head stated how much body follows, which is a different fact from how
+	// much of it was read.
+	testing.expect(t, observed.transfer.declared_body_bytes_present, "the head declared a length")
+	testing.expect_value(t, observed.transfer.declared_body_bytes, u64(len(TRANSPORT_RESPONSE_BODY)))
+}
+
+@(test)
+test_transport_separates_a_refused_connection_from_a_broken_stream :: proc(t: ^testing.T) {
+	// A truncated stream: the head arrived and the body stopped early. The
+	// high-level failure is a transport error either way, so the phase is the only
+	// thing that says whether anything was sent or received.
+	fixture: Transport_Fixture
+	if !transport_fixture_start(t, &fixture, .Truncate, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
+	defer transport_fixture_stop(&fixture)
+
+	job: Transport_Job
+	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+	defer transport_job_destroy(&job, job.allocator)
+
+	observed: Transport_Observation
+	job.options.observer = {
+		user_data = &observed,
+		report    = transport_observation_report,
+	}
+	transport_job_start(&job)
+	transport_job_join(&job)
+
+	testing.expect(t, job.error.kind != .None, "a truncated stream is not success")
+	testing.expect(t, observed.transfer_seen, "the transport should account for the attempt")
+	testing.expect_value(t, observed.transfer.stopped_at, Provider_Transfer_Phase.Response_Body)
+	testing.expect(t, observed.transfer.request_complete, "the whole request was taken before the stream broke")
+	testing.expect(t, observed.transfer.response_head_received, "the head arrived before the stream broke")
+}
+
+@(test)
+test_transport_reports_a_request_that_never_left :: proc(t: ^testing.T) {
+	// A peer whose certificate is not trusted: TLS never completes, so no request
+	// byte was ever taken. This is what a caller must be able to tell apart from a
+	// stream that broke after the request went out.
+	fixture: Transport_Fixture
+	if !transport_fixture_start(t, &fixture, .Complete, TRANSPORT_CERT_UNTRUSTED, TRANSPORT_KEY_UNTRUSTED) { return }
+	defer transport_fixture_stop(&fixture)
+
+	job: Transport_Job
+	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+	defer transport_job_destroy(&job, job.allocator)
+
+	observed: Transport_Observation
+	job.options.observer = {
+		user_data = &observed,
+		report    = transport_observation_report,
+	}
+	transport_job_start(&job)
+	transport_job_join(&job)
+
+	testing.expect(t, job.error.kind != .None, "an untrusted peer is not success")
+	testing.expect(t, observed.transfer_seen, "the transport should account for the attempt")
+	testing.expect_value(t, observed.transfer.stopped_at, Provider_Transfer_Phase.TLS)
+	testing.expect_value(t, observed.transfer.request_bytes_accepted, u64(0))
+	testing.expect(t, !observed.transfer.request_complete, "nothing was taken, so the request is not complete")
+	testing.expect(t, !observed.transfer.response_head_received, "no head arrives without a handshake")
+	testing.expect(t, !observed.transfer.declared_body_bytes_present, "an absent head declares nothing")
 }

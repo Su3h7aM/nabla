@@ -18,22 +18,57 @@ Provider_Event_Callback :: #type proc(user_data: rawptr, event: Provider_Event)
 Provider_Operation_Stage :: enum {
 	Encoded,
 	Response_Body,
+	Transfer,
+}
+
+// Provider_Transfer_Phase is where one provider request stopped at the HTTP
+// layer. Complete means the response body framing finished without a transport
+// error.
+Provider_Transfer_Phase :: enum {
+	Validate,
+	Resolve,
+	Connect,
+	TLS,
+	Request_Write,
+	Response_Head,
+	Response_Body,
+	Complete,
+}
+
+// Provider_Transfer_Summary is the HTTP layer's account of one provider request,
+// in this package's vocabulary so no transport type reaches a caller.
+//
+// `accepted` means the plaintext bytes were taken by the socket or the TLS layer.
+// It is not evidence that the peer received or acted on them.
+Provider_Transfer_Summary :: struct {
+	stopped_at:                  Provider_Transfer_Phase,
+	request_bytes_accepted:      u64,
+	request_body_bytes_accepted: u64,
+	request_complete:            bool,
+	response_head_received:      bool,
+	status:                      int,
+	declared_body_bytes:         u64,
+	declared_body_bytes_present: bool,
 }
 
 // Provider_Operation_Report is one observation of a provider operation. body and
 // chunk are borrowed for the duration of the call and never retained; an observer
 // that wants them beyond that must copy them itself.
 Provider_Operation_Report :: struct {
-	stage: Provider_Operation_Stage,
-	api:   API_Kind,
+	stage:    Provider_Operation_Stage,
+	api:      API_Kind,
 	// model and tools describe the request the body was built from, and are zero
 	// for a response chunk.
-	model: string,
-	tools: int,
-	body:  []u8,
-	chunk: []u8,
+	model:    string,
+	tools:    int,
+	body:     []u8,
+	chunk:    []u8,
 	// bytes is the running plaintext response byte count for the operation.
-	bytes: u64,
+	bytes:    u64,
+
+	// transfer is set only for the final Transfer report, which is the one
+	// observation the operation itself cannot make: how far its request got.
+	transfer: Provider_Transfer_Summary,
 }
 
 Provider_Operation_Observer :: struct {
@@ -201,6 +236,8 @@ Provider_Request_Operation_Controlled :: proc(
 			allocator = allocator,
 		},
 		HTTP_Control{interrupt = options.interrupt, deadline = options.deadline},
+		request.API,
+		options.observer,
 		&state,
 		provider_http_chunk,
 	)
