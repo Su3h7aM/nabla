@@ -51,9 +51,9 @@ test_session_steer_only_at_request_boundary :: proc(t: ^testing.T) {
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 
-	testing.expect(t, !chat_session_steer(chat, "idle", session.now_ms()))
+	testing.expect_value(t, chat_session_steer(chat, "idle", session.now_ms()), Chat_Steer_Result.Outside_Boundary)
 	_test_accept(t, chat, "start")
-	testing.expect(t, chat_session_steer(chat, "steered", session.now_ms()))
+	testing.expect_value(t, chat_session_steer(chat, "steered", session.now_ms()), Chat_Steer_Result.Accepted)
 
 	ctx := _test_context(t, chat)
 	defer session.context_destroy(&ctx, context.allocator)
@@ -123,4 +123,36 @@ test_drain_quit_discards_what_was_never_sent :: proc(t: ^testing.T) {
 	entries := _test_entries(t, chat)
 	defer session.entries_destroy(entries, context.allocator)
 	testing.expect_value(t, len(entries), 1)
+}
+
+// A line that arrives after the turn already failed was never tried. The turn's own
+// failure is not this line's to report, so the front-end is told about the boundary
+// rather than shown a provider error the line had nothing to do with.
+@(test)
+test_a_late_steering_line_does_not_repeat_the_turn_error :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	_test_accept(t, chat, "start")
+	chat_session_fail_turn(chat, "the provider refused the request")
+
+	queue := steer_queue_init(context.temp_allocator)
+	defer steer_queue_destroy(&queue)
+	testing.expect(t, steer_push(&queue, "check the logs"))
+	quit := false
+	steer := Steer_Context {
+		queue       = &queue,
+		quit        = &quit,
+		provider_id = "p",
+		model_id    = "m",
+	}
+
+	notices: Chat_Notice_Log
+	observer := chat_notice_log_begin(&notices)
+	defer chat_notice_log_destroy(&notices)
+	chat_drain_steering(chat, observer, &steer)
+
+	if !testing.expect_value(t, len(notices.lines), 1) { return }
+	testing.expect(t, notices.lines[0] != "the provider refused the request", "a line that arrived too late must not report the turn's failure as its own")
 }

@@ -154,13 +154,22 @@ chat_session_set_effort :: proc(chat: ^Chat_Session, level: string) -> bool {
 	return false
 }
 
+// Chat_Steer_Result is what recording a steering line did. A line that arrived outside
+// a request boundary was never tried, which is a different fact from a line the store
+// refused, and only the second carries an error that is this line's own.
+Chat_Steer_Result :: enum {
+	Accepted,
+	Outside_Boundary,
+	Storage_Failed,
+}
+
 // chat_session_steer records a queued line as a user entry at a request
 // boundary. Unlike accept_user it starts no turn and resets no budget: the turn
 // keeps its identity and its counters, so steering changes what the next request
 // sends, never work already committed. Only Preparing is safe; anywhere else the
 // line is dropped by the caller.
-chat_session_steer :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> bool {
-	if chat.state != .Preparing { return false }
+chat_session_steer :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> Chat_Steer_Result {
+	if chat.state != .Preparing { return .Outside_Boundary }
 	entry := session.New_Entry {
 		turn_no = chat.turn_no,
 		created_at_ms = at_ms,
@@ -168,9 +177,9 @@ chat_session_steer :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> boo
 	}
 	if _, err := session.entry_append(chat.store, chat.id, entry); err != nil {
 		chat_session_record_failure(chat, "the steering line could not be recorded", err)
-		return false
+		return .Storage_Failed
 	}
-	return true
+	return .Accepted
 }
 
 chat_tool_call_clone :: proc(call: ai.Provider_Tool_Call, allocator: mem.Allocator) -> (Chat_Tool_Call, bool) {

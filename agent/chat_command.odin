@@ -200,8 +200,11 @@ chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer:
 				// A slash is a command, never a message. A command this path does not
 				// answer to is refused rather than sent to the model as steering text.
 				_observer_message(observer, .Notice, fmt.tprintf("%s is not available while a turn is running", line))
-			} else if !chat_session_steer(chat, line, session.now_ms()) {
-				if chat.last_error != "" {
+			} else if result := chat_session_steer(chat, line, session.now_ms()); result != .Accepted {
+				// A line that arrived outside the boundary was never tried, so the turn's
+				// own failure is not this line's to report: only a store that refused the
+				// line has something to say about it.
+				if result == .Storage_Failed {
 					_observer_message(observer, .Error, chat.last_error)
 				} else {
 					_observer_message(observer, .Warning, "steering arrived outside a request boundary; dropped")

@@ -118,7 +118,7 @@ test_steered_line_is_recorded_before_the_request :: proc(t: ^testing.T) {
 
 	// Steering is admitted at a request boundary and recorded as a user entry in
 	// the turn that is already running.
-	testing.expect(t, chat_session_steer(chat, "steered", session.now_ms()))
+	testing.expect_value(t, chat_session_steer(chat, "steered", session.now_ms()), Chat_Steer_Result.Accepted)
 
 	ctx := _test_context(t, chat)
 	defer session.context_destroy(&ctx, context.allocator)
