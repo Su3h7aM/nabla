@@ -222,9 +222,6 @@ chat_perform_request :: proc(
 	defer delete(encoded.Body, chat.allocator)
 
 	chat.last_estimate = prep.estimate
-	// The input size is settled here and the request has not been sent yet, so this is
-	// where a front-end learns what the context now holds.
-	_observer_request_prepared(observer)
 
 	// What the harness intends to send is recorded before it is stored, so a
 	// request that never reaches the store still says what it was going to carry.
@@ -319,6 +316,13 @@ chat_perform_request :: proc(
 
 		recorded := [1]Log_Field{{key = "purpose", value = session.request_purpose_name(.Response)}}
 		log_emit({level = .Info, category = .Storage, event = "request.recorded", fields = recorded[:]})
+		// A send after the first is a retry, and the correlation above is the attempt it
+		// starts, so a reader learns the chain resumed without diffing attempt numbers.
+		if attempts > 1 { log_emit({level = .Info, category = .Provider, event = "request.retry_started"}) }
+		// The input size is settled and this send has not gone out yet, so this is where a
+		// front-end learns what the context now holds, and how a front-end that was showing
+		// a scheduled retry clears it: the send it waited for is about to happen.
+		_observer_request_prepared(observer)
 		// The runtime belongs to one attempt: a retry that produces nothing must not
 		// inherit the finish reason of the attempt before it, nor the record that the
 		// assistant block was already announced.
@@ -404,7 +408,6 @@ chat_perform_request :: proc(
 			chat_retry_fraction(),
 		)
 		if decision.action != .Retry { break }
-		_observer_message(observer, .Notice, chat_retry_notice(attempts, operation_error))
 		// The row is finished before anything is waited on or sent again: how the send
 		// failed, and what the harness decided to do about it, are in the store before the
 		// decision is acted on, with the numbers and the usage of the send that produced
@@ -424,6 +427,18 @@ chat_perform_request :: proc(
 			usages,
 		)
 		settled = true
+		// The row is in the store before the front-end is told, so a front-end that reads
+		// the failure it is told about finds it.
+		_observer_retry_scheduled(
+			observer,
+			{
+				request_no = request_no,
+				next_attempt = attempts + 1,
+				max_attempts = policy.max_attempts,
+				failure_class = operation_error.failure_class,
+				delay = decision.delay,
+			},
+		)
 		retry := [5]Log_Field {
 			{key = "reason", value = request_recovery_reason_name(decision.reason)},
 			{key = "error_kind", value = ai.provider_operation_error_name(operation_error.kind)},
@@ -436,8 +451,6 @@ chat_perform_request :: proc(
 		// Cancellation can arrive between the last slice of a delay and the send that
 		// follows it.
 		if chat_session_cancelled(chat) { break }
-		started := [1]Log_Field{{key = "attempt", value = i64(attempts + 1)}}
-		log_emit({level = .Info, category = .Provider, event = "request.retry_started", fields = started[:]})
 		chat_session_clear_attempt(chat)
 		ai.Provider_Operation_Error_Destroy(&operation_error, chat.allocator)
 	}
@@ -726,15 +739,6 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	chat_response_output_destroy(&chat.pending_response, chat.allocator)
 	chat.pending_response_present = false
 	return recorded
-}
-
-// chat_retry_notice is the line a retry reports to the front-end. It is a diagnostic
-// for whoever is watching the turn, never conversation: the model is told nothing about
-// an attempt it never saw.
-@(private)
-chat_retry_notice :: proc(attempt: int, err: ai.Provider_Operation_Error) -> string {
-	if err.status != 0 { return fmt.tprintf("attempt %d did not complete (status %d); retrying", attempt, err.status) }
-	return fmt.tprintf("attempt %d did not complete; retrying", attempt)
 }
 
 // chat_retry_wait waits before the next send, in slices the policy names, and reports

@@ -288,7 +288,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 	// The rule above the input doubles as the working indicator while a
 	// request is active.
 	if app.run.snap.status.running {
-		draw_working(storage, rule_top_rect, app.spin_frame)
+		draw_working(storage, rule_top_rect, app.spin_frame, working_label(app))
 	} else {
 		draw_rule(storage, rule_top_rect)
 	}
@@ -550,21 +550,32 @@ entry_style :: proc(kind: Entry_Kind) -> term.Style {
 	return {}
 }
 
+// working_label is what the working indicator says: the retry the turn is waiting for,
+// with the time left of it, or the plain label for a turn that is simply working.
+working_label :: proc(app: ^App) -> string {
+	status := &app.run.snap.status
+	if !status.retry_present { return WORKING_LABEL }
+	// The due time is monotonic, so the time left is measured against the same clock the
+	// wait uses; a due time already past reads as no time left rather than as negative.
+	remaining := min(time.tick_since(status.retry_due), time.Duration(0))
+	return fmt.tprintf("Retrying in %s (attempt %d of %d)", display_duration(-remaining), status.retry_next, status.retry_max)
+}
+
 // draw_working renders the rule row as the working indicator: dashes, a gap,
 // the braille frame, a gap, the label, then the rule continuing after it.
-draw_working :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect, frame_index: int) {
+draw_working :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect, frame_index: int, label: string) {
 	if rect.height <= 0 || rect.width <= 0 {
 		return
 	}
 	// "──" + gap + spinner + gap + label + gap.
-	prefix := 2 + 1 + 1 + 1 + len(WORKING_LABEL) + 1
+	prefix := 2 + 1 + 1 + 1 + text.text_columns(label) + 1
 	if rect.width < prefix + 2 {
 		draw_rule(storage, rect)
 		return
 	}
 	tui.fill(&storage.buffer, tui.Cell_Rect{x = rect.x, y = rect.y, width = 2, height = 1}, "─", RULE_STYLE)
 	_ = tui.put(&storage.buffer, rect.x + 3, rect.y, spinner_glyph(frame_index), WORKING_SPINNER)
-	_, _ = tui.draw_text(&storage.buffer, tui.Cell_Rect{x = rect.x + 5, y = rect.y, width = len(WORKING_LABEL), height = 1}, WORKING_LABEL, WORKING_TEXT)
+	_, _ = tui.draw_text(&storage.buffer, tui.Cell_Rect{x = rect.x + 5, y = rect.y, width = text.text_columns(label), height = 1}, label, WORKING_TEXT)
 	tail := rect.width - prefix
 	if tail > 0 {
 		tui.fill(&storage.buffer, tui.Cell_Rect{x = rect.x + prefix, y = rect.y, width = tail, height = 1}, "─", RULE_STYLE)

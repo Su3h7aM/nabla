@@ -4,8 +4,10 @@ package main
 
 import "core:sync/chan"
 import "core:testing"
+import "core:time"
 
 import "nabla:agent"
+import "nabla:ai"
 import "nabla:tui/widgets"
 
 // ctrl_c_app builds the minimum an interrupt reads: the prompt buffer and whether
@@ -94,4 +96,30 @@ test_stopping_refuses_queued_work :: proc(t: ^testing.T) {
 
 	_, more := chan.try_recv(app.run.work)
 	testing.expect(t, !more, "nothing may be accepted after the runtime stops")
+}
+
+// A scheduled retry is what the working indicator shows, and the send that follows is what
+// clears it: the indicator cannot keep claiming a wait that is over.
+@(test)
+test_a_scheduled_retry_is_shown_until_the_send_clears_it :: proc(t: ^testing.T) {
+	app: App
+	app.run.alloc = context.allocator
+	defer {
+		snapshot_clear(&app)
+		delete(app.run.snap.entries)
+	}
+
+	obs_retry_scheduled(&app, {next_attempt = 2, max_attempts = 3, failure_class = ai.Provider_Failure_Class.Rate_Limited, delay = 2 * time.Second})
+	testing.expect(t, app.run.snap.status.retry_present, "the front-end is waiting for a retry")
+	testing.expect_value(t, app.run.snap.status.retry_next, 2)
+	testing.expect_value(t, app.run.snap.status.retry_max, 3)
+	// One notice per scheduled retry, in the transcript the user reads.
+	if testing.expect_value(t, len(app.run.snap.entries), 1) {
+		testing.expect_value(t, app.run.snap.entries[0].kind, Entry_Kind.Notice)
+	}
+	testing.expect(t, working_label(&app) != WORKING_LABEL, "the indicator says the turn is waiting for a retry")
+
+	clear_retry(&app)
+	testing.expect(t, !app.run.snap.status.retry_present, "the send that followed clears the retry")
+	testing.expect_value(t, working_label(&app), WORKING_LABEL)
 }

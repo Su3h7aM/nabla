@@ -69,6 +69,14 @@ Status :: struct {
 	session_hit_rate:      f64,
 	session_hit_measured:  bool,
 	running:               bool,
+	// The retry the turn is waiting for, while it waits for one. The attempt numbers come
+	// from the retry the agent scheduled, and the due time is when the harness sends
+	// again: a front-end showing this clears it when the next send is prepared, and the
+	// worker clears it whenever the session stops running.
+	retry_present:         bool,
+	retry_next:            int,
+	retry_max:             int,
+	retry_due:             time.Tick,
 }
 
 // Snapshot is everything the renderer reads. The worker bumps generation

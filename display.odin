@@ -1,6 +1,8 @@
 package main
 
+import "core:fmt"
 import "core:strings"
+import "core:time"
 import "core:unicode/utf8"
 
 import "nabla:agent"
@@ -177,6 +179,31 @@ display_clean :: proc(text: string, allocator := context.allocator) -> string {
 	joined := strings.concatenate([]string{cleaned, tail}, allocator = allocator)
 	delete(cleaned, allocator)
 	return joined
+}
+
+// retry_display_text says what a scheduled retry is, in words a person reads. The agent
+// reports the failure class and the attempt numbers; turning them into a sentence for a
+// user is the front-end's job, and this is the one place either front-end asks for it.
+retry_display_text :: proc(event: agent.Chat_Retry_Event) -> string {
+	reason := "the attempt did not complete"
+	switch event.failure_class {
+	case .Rate_Limited:
+		reason = "the provider is rate limiting this session"
+	case .Provider_Unavailable:
+		reason = "the provider is unavailable"
+	case .Incomplete_Stream:
+		reason = "the response ended before it was complete"
+	case .None, .Unknown, .Authentication, .Quota, .Context_Overflow, .Payload_Too_Large, .Invalid_Request, .Content_Policy, .Invalid_Output:
+	}
+	return fmt.tprintf("%s; retrying in %s (attempt %d of %d)", reason, display_duration(event.delay), event.next_attempt, event.max_attempts)
+}
+
+// display_duration renders a wait the way a reader measures one: tenths of a second while
+// it is short, whole seconds once it is not.
+display_duration :: proc(delay: time.Duration) -> string {
+	seconds := time.duration_seconds(delay)
+	if seconds < 10 { return fmt.tprintf("%.1fs", seconds) }
+	return fmt.tprintf("%.0fs", seconds)
 }
 
 // tool_display_summary renders one result line for the transcript. The full

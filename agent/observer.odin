@@ -1,5 +1,8 @@
 package agent
 
+import "core:time"
+
+import "nabla:agent/session"
 import "nabla:ai"
 
 // Chat_Observer is where the agent hands user-visible information to whoever
@@ -35,6 +38,24 @@ Chat_Observer :: struct {
 	// a front-end that shows the session totals can refresh here instead of waiting for
 	// the turn to end.
 	request_finished: proc(user_data: rawptr),
+	// retry_scheduled is called once for each retry the harness schedules, after the
+	// failed send's row is finished and before the chain waits. Nothing about the
+	// decision needs the front-end; this is how a front-end says that a turn is waiting
+	// rather than stalled. A chain whose sends all succeeded, and one that stops, calls
+	// it not at all, and the send that follows clears whatever the front-end showed.
+	retry_scheduled:  proc(user_data: rawptr, event: Chat_Retry_Event),
+}
+
+// Chat_Retry_Event is one retry the harness scheduled: which send failed, which one is
+// next, how many the chain may make, what the provider's failure meant, and how long the
+// harness waits before sending again. It is the decision the failed request's own row
+// records, reported in time for a front-end to act on it while the turn is waiting.
+Chat_Retry_Event :: struct {
+	request_no:    session.Request_No,
+	next_attempt:  int,
+	max_attempts:  int,
+	failure_class: ai.Provider_Failure_Class,
+	delay:         time.Duration,
 }
 
 // Chat_Message_Kind classifies a diagnostic line. The agent decides how serious
@@ -93,4 +114,9 @@ _observer_request_prepared :: proc(observer: Chat_Observer) {
 @(private)
 _observer_request_finished :: proc(observer: Chat_Observer) {
 	if observer.request_finished != nil { observer.request_finished(observer.user_data) }
+}
+
+@(private)
+_observer_retry_scheduled :: proc(observer: Chat_Observer, event: Chat_Retry_Event) {
+	if observer.retry_scheduled != nil { observer.retry_scheduled(observer.user_data, event) }
 }

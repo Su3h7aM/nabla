@@ -407,6 +407,62 @@ test_preparation_never_names_the_previous_request :: proc(t: ^testing.T) {
 	testing.expect_value(t, recorded, 2)
 }
 
+// A retry is reported as a structured event, for whoever reads the log after the turn
+// rather than while it runs: the decision taken on the failed send, and the send that
+// followed it, both naming the request they belong to.
+@(test)
+test_a_scheduled_retry_is_reported_as_events :: proc(t: ^testing.T) {
+	fixture: Log_Chat_Test
+	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
+	defer log_chat_end(t, &fixture)
+	chat := &fixture.chat.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(t, chat, "say something")
+
+	refusal := `{"error":{"message":"Rate limit reached"}}`
+	responses := []string{agent_provider_refusal("429 Too Many Requests", refusal, "retry-after: 0\r\n"), agent_provider_reply("second try")}
+	provider: Agent_Provider
+	if !agent_provider_start(t, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed after a retry")
+
+	context.logger = fixture.ambient
+	text := log_chat_text(t, &fixture)
+	defer delete(text, context.allocator)
+
+	scheduled, started := 0, 0
+	for line in strings.split_lines(text, context.temp_allocator) {
+		if line == "" { continue }
+		value, parse_err := parse_log_line(line)
+		if parse_err { continue }
+		object, is_object := value.(json.Object)
+		if !is_object {
+			json.destroy_value(value, context.temp_allocator)
+			continue
+		}
+		event, _ := object["event"].(json.String)
+		switch string(event) {
+		case "request.retry_scheduled":
+			scheduled += 1
+			reason, _ := object["reason"].(json.String)
+			testing.expectf(t, string(reason) == "transient_failure", "a scheduled retry says why: %s", line)
+			_, named := object["request_no"]
+			testing.expectf(t, named, "a scheduled retry names its request: %s", line)
+		case "request.retry_started":
+			started += 1
+		}
+		json.destroy_value(value, context.temp_allocator)
+	}
+	testing.expect_value(t, scheduled, 1)
+	testing.expect_value(t, started, 1)
+}
+
 // parse_log_line reads one record the writer produced. The presence of a key is
 // what these tests ask about, so the object is returned rather than a struct: a
 // zero json.Value is the Null variant, which is not the same as an absent field.

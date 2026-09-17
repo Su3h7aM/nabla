@@ -2,11 +2,29 @@
 package agent
 
 import "core:encoding/json"
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
 import "nabla:agent/session"
 import "nabla:ai"
+
+// Retry_Log is what a turn told a front-end about the retries it scheduled. A chain's
+// report is asserted here rather than through a rendered notice, because the sentence a
+// user reads is worded by the front-end and the facts are the agent's.
+Retry_Log :: struct {
+	events:    [dynamic]Chat_Retry_Event,
+	allocator: mem.Allocator,
+}
+
+retry_log_observer :: proc(log: ^Retry_Log) -> Chat_Observer {
+	return {user_data = log, retry_scheduled = retry_log_append}
+}
+
+retry_log_append :: proc(user_data: rawptr, event: Chat_Retry_Event) {
+	log := cast(^Retry_Log)user_data
+	append(&log.events, event)
+}
 
 // A provider that refuses once and then answers is sent the same bytes again, and the
 // conversation gains exactly one answer: the abandoned attempt contributed nothing.
@@ -175,7 +193,12 @@ test_a_chain_of_failures_ends_in_one_answer :: proc(t: ^testing.T) {
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed after two retries")
+	retries: Retry_Log
+	retries.allocator = context.allocator
+	retries.events = make([dynamic]Chat_Retry_Event, 0, 4, retries.allocator)
+	defer delete(retries.events)
+
+	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), retry_log_observer(&retries)), "the turn completed after two retries")
 	if !testing.expect_value(t, len(provider.requests), 3) { return }
 	for request, i in provider.requests {
 		testing.expectf(t, request == provider.requests[0], "send %d must repeat the frozen bytes", i + 1)
@@ -240,6 +263,21 @@ test_a_chain_of_failures_ends_in_one_answer :: proc(t: ^testing.T) {
 	testing.expect_value(t, first_evidence.failure_class, "rate_limited")
 	testing.expect_value(t, first_evidence.status, i64(429))
 	testing.expect(t, !first_evidence.text_exposed, "the refused attempt published nothing")
+
+	// The front-end was told about both retries as they were scheduled: which send
+	// failed, which one follows it, what the failure meant, and how long the harness
+	// waits before sending again.
+	if !testing.expect_value(t, len(retries.events), 2) { return }
+	for event, i in retries.events {
+		testing.expect_value(t, event.next_attempt, i + 2)
+		testing.expect_value(t, event.max_attempts, test_retry_policy().max_attempts)
+		testing.expect(t, event.delay > 0, "a scheduled retry waits before sending again")
+	}
+	testing.expect_value(t, retries.events[0].failure_class, ai.Provider_Failure_Class.Rate_Limited)
+	testing.expect_value(t, retries.events[1].failure_class, ai.Provider_Failure_Class.Incomplete_Stream)
+	// The report names the send it belongs to, which is the row the failure is in.
+	testing.expect_value(t, retries.events[0].request_no, session.Request_No(first_number))
+	testing.expect_value(t, retries.events[1].request_no, session.Request_No(second_number))
 }
 
 // attempt_record reads the chain fields one request row's input record carries.

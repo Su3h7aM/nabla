@@ -436,6 +436,9 @@ refresh_status :: proc(app: ^App) {
 		status.cwd = strings.clone(running.workspace, app.run.alloc)
 	}
 	status.running = running.state != .Idle
+	// A retry belongs to the turn that scheduled it. A turn that is no longer running has
+	// none, so the working indicator cannot keep showing the attempt it waited for.
+	if !status.running { status.retry_present = false }
 	if status.provider_id != app.setup.provider_id {
 		delete(status.provider_id, app.run.alloc)
 		status.provider_id = strings.clone(app.setup.provider_id, app.run.alloc)
@@ -526,6 +529,7 @@ run_observer :: proc(app: ^App) -> agent.Chat_Observer {
 		usage = obs_usage,
 		request_prepared = obs_request_prepared,
 		request_finished = obs_request_finished,
+		retry_scheduled = obs_retry_scheduled,
 	}
 }
 
@@ -536,7 +540,36 @@ run_observer :: proc(app: ^App) -> agent.Chat_Observer {
 // inside a store transaction, because a request's record is committed before this is
 // called.
 obs_request_prepared :: proc(user_data: rawptr) {
-	refresh_status(cast(^App)user_data)
+	app := cast(^App)user_data
+	// The send the front-end was waiting for is this one, so whatever it showed about the
+	// last retry is over.
+	clear_retry(app)
+	refresh_status(app)
+}
+
+// obs_retry_scheduled reports a scheduled retry twice: the transcript keeps the sentence,
+// and the status keeps the attempt the turn is waiting for, which is what the working
+// indicator reads.
+obs_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Event) {
+	app := cast(^App)user_data
+	snap_append(app, .Notice, retry_display_text(event))
+	sync.mutex_lock(&app.run.mu)
+	defer sync.mutex_unlock(&app.run.mu)
+	status := &app.run.snap.status
+	status.retry_present = true
+	status.retry_next = event.next_attempt
+	status.retry_max = event.max_attempts
+	status.retry_due = time.tick_add(time.tick_now(), event.delay)
+	app.run.snap.generation += 1
+}
+
+// clear_retry forgets a retry the front-end was showing.
+clear_retry :: proc(app: ^App) {
+	sync.mutex_lock(&app.run.mu)
+	defer sync.mutex_unlock(&app.run.mu)
+	if !app.run.snap.status.retry_present { return }
+	app.run.snap.status.retry_present = false
+	app.run.snap.generation += 1
 }
 
 obs_request_finished :: proc(user_data: rawptr) {

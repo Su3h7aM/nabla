@@ -103,7 +103,15 @@ headless_observer :: proc(out: ^Headless_Output) -> agent.Chat_Observer {
 		assistant_end = headless_assistant_end,
 		tool_result = headless_tool_result,
 		message = headless_message,
+		retry_scheduled = headless_retry_scheduled,
 	}
+}
+
+// headless_retry_scheduled prints one line per scheduled retry, to stderr like the rest of
+// the harness's own reporting: a caller watching a headless run learns that an attempt
+// failed while it is still waiting, rather than only when the turn ends.
+headless_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Event) {
+	fmt.eprintln("nabla:", retry_display_text(event))
 }
 
 // The answer goes to stdout as it arrives, and everything else goes to stderr, so
