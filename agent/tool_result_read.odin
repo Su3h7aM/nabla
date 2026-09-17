@@ -128,10 +128,13 @@ Tool_Budget :: struct {
 }
 
 // chat_tool_budget opens the budget for the batch the current response asked for. The
-// projection is the request that produced the calls plus the response itself, because
-// both are committed by the time the tools run.
+// projection is the request that produced the calls plus the response itself, because both
+// are committed by the time the tools run.
+//
+// The wall is the hard ceiling rather than the compaction trigger: the trigger exists to
+// start background work, not to stop the agent from using the window it has.
 chat_tool_budget_open :: proc(chat: ^Chat_Session, count: int) -> Tool_Budget {
-	remaining := chat.capacity.usable - (chat.last_estimate + chat.response_cost)
+	remaining := chat_capacity_input_ceiling(chat.capacity) - (chat.last_estimate + chat.response_cost)
 	if remaining < 0 { remaining = 0 }
 	return {remaining = remaining, pending = count}
 }

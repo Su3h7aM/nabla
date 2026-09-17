@@ -181,68 +181,55 @@ the recorded request, and the status line all read that one value, so two featur
 partition the window differently.
 
 ```text
-share    = 12% rising to 25% over the first 256K of window
-output   = smallest of: the model maximum, 32K, share of the window
 margin   = max(10% of window, 1024)
-usable   = window - output - margin
-trigger  = usable - reserve
-reserve  = min(max(20% of window, 4096), usable / 2)
+trigger  = window - margin - 20% of window
+answer   = smallest of: the room the window has left, the model maximum, 32K
+ceiling  = window - margin - min(1024, the model maximum)
 ```
 
-`usable` is the largest input the harness will send, and therefore also the size at which
-admission refuses a request.
+The provider enforces one limit: the input plus the output a request asks for must fit the
+window. The harness therefore asks for whatever room is left rather than reserving a share of the
+window for output in advance.
 
-The output reservation is what the request itself asks the provider for, not the model's
-capability: a provider validates input plus the requested output against the window, so reserving
-the stated maximum whole would starve a small window, and a model whose maximum exceeds its own
-window would leave no room to send anything. It is capped in absolute terms as well, because a
-capability is not a per-request need: a model that can emit 128K tokens in one response almost
-never does, and holding all of it against input costs a tenth of a megatoken window for nothing.
+`answer` is what a request asks the model to generate, and it shrinks as the context fills. The
+window is one budget, not an input budget plus a reserved output budget: a fuller context asks
+for a smaller answer instead of being refused. On a 32K window with an 8K maximum the bound is the
+model's whole 8000 until the context reaches 20800, then falls away to 1024; the input can reach
+27776, which is 87% of the window. Only `ceiling`, where even the smallest useful answer no longer
+fits, ends the conversation, and that is where the window actually ends.
 
-The share of the window grows with the window, which is the part that keeps the reservation
-proportionate. Input is the scarce resource on a small window, so a small window gives up less of
-itself; on a large window output is cheap. A constant share got this the wrong way round, and it
-also made a small window claim the model's whole capability: an 8K maximum against a 32K window
-reserved all 8000 of it, where the same model on a megatoken window would have reserved a
-fraction. What a request claims of the model's maximum now grows with the window, from about 3%
-at 32K to about 25% at a megatoken.
+What is held back is the estimator's margin and that smallest answer. The margin covers the
+estimator's error, which grows with how dense the content is rather than with the window, so it is
+a share rather than a constant that happens to suit one window size. A model whose own maximum is
+below the floor answers with what it can, so the floor never asks for more than the model allows.
 
-The margin covers the estimator's error, which grows with how dense the content is rather than
-with the window, so it is a share rather than a constant that happens to suit one window size.
+`trigger` is where background compaction starts, and where a finished summary is installed. One
+number serves both, because both decisions are about the same point: the context has reached the
+size where it needs the summary. Installing sooner would break the cache prefix while the old one
+still had life, and starting later would leave the summary less room to finish in.
 
-`trigger` is one number for two decisions, because both are about the same point. A summary
-starts there, and a finished summary is installed there. Installing sooner would break the cache
-prefix while the old one still had life, and starting later would leave the summary less room to
-finish in. `reserve` is what the foreground may still grow by while a summary runs, capped at
-half of `usable` so a window is never reserved away entirely.
+The trigger is not a limit. An agent whose summary has not arrived yet keeps working on the window
+it has, and the answer bound shrinks to keep it inside the window. `20% of window` is what the
+foreground may grow by while a summary is written, which is what that summary has to finish
+inside.
 
 | Constant | Value | Why |
 |---|---|---|
 | `CHAT_COMPACT_KEEP_MESSAGES` | `10` | Entries kept verbatim, extended as needed to keep a call/result run whole |
-| `CHAT_OUTPUT_MAX_TOKENS` | `32768` | Most one request asks the model to generate |
-| `CHAT_OUTPUT_WINDOW_MIN_PERCENT` | `12` | Share of a small window a request may reserve for output |
-| `CHAT_OUTPUT_WINDOW_MAX_PERCENT` | `25` | Share of a large window a request may reserve for output |
-| `CHAT_OUTPUT_WINDOW_RAMP_TOKENS` | `262144` | Window at which that share reaches its maximum |
-| `CHAT_COMPACT_SUMMARY_MIN_TOKENS` | `1024` | Smallest summary bound worth a request |
-| `CHAT_MARGIN_PERCENT` | `10` | Estimator error allowance |
-| `CHAT_COMPACT_RESERVE_PERCENT` | `20` | Foreground growth the foreground may still make while a summary runs |
-| `CHAT_COMPACT_RESERVE_MIN_TOKENS` | `4096` | Floor on that reserve, so it is worth having on a small window |
+| `CHAT_OUTPUT_MAX_TOKENS` | `32768` | Most a request asks the model to generate |
+| `CHAT_OUTPUT_MIN_TOKENS` | `1024` | Smallest answer worth asking for; the window less this and the margin is the input ceiling |
+| `CHAT_MARGIN_PERCENT` | `10` | Estimator error allowance, with a floor of 1024 |
+| `CHAT_COMPACT_RESERVE_PERCENT` | `20` | Window the foreground may still grow into while a summary runs |
 | `CHAT_COMPACT_MIN_REDUCTION_TOKENS` | `1024` | A saving smaller than this is not worth a cache break |
 | `CHAT_COMPACT_RETRY_DELAY_MS` | `5000` | Keeps a failed summarization from being retried at every boundary |
 
 These are engineering defaults, not measurements.
 
-A summarization request does not carry the ordinary output bound. Its output is the artifact
-rather than an answer, and a summary that is cut off is worth nothing because it is never
-installed, so it is given the room the window has left once the prefix is charged, bounded by
-what the model allows and by half the window. Taking whatever room is left is also what keeps a
-large prefix summarizable: a fixed bound would refuse the request exactly when the context most
-needs it. `chat_compact_summary_output` derives that bound from the same `Model_Capacity`, and
-`model_capacity_admits_output` is the admission predicate that accounts for a bound other than
-the ordinary one.
-
-A prefix that leaves less than `CHAT_COMPACT_SUMMARY_MIN_TOKENS` of room cannot be summarized in
-one request, and that is reported rather than silently shortened.
+A summarization request carries the same rule as any other, and needs no bound of its own. Its
+input is the prefix rather than the whole context, so the room left over is larger than the
+foreground request's was, and that is what keeps a summary complete. It also keeps a large prefix
+summarizable, where a fixed bound would have refused the request exactly when the context most
+needed it.
 
 A summary is worth keeping only when it frees at least `CHAT_COMPACT_MIN_REDUCTION_TOKENS` of
 the prefix it replaces. That is checked at adoption, before any checkpoint is written.

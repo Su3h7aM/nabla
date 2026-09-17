@@ -443,7 +443,7 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(t: ^testing.
 	// foreground to keep working, so the fixture stays below what the window admits.
 	trigger := chat_compact_trigger(chat)
 	testing.expect(t, prep.estimate >= trigger, "the fixture must cross the compaction trigger")
-	testing.expect(t, prep.estimate <= chat.capacity.usable, "the fixture must still be sendable")
+	testing.expect(t, prep.estimate <= chat_capacity_input_ceiling(chat.capacity), "the fixture must still be sendable")
 
 	// A started summary says so, once, so the front-end can time it. Nothing was
 	// started before this point, so no notice was emitted.

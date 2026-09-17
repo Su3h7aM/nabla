@@ -93,7 +93,7 @@ test_a_result_the_batch_cannot_afford_is_kept_and_referenced :: proc(t: ^testing
 	// Almost no room left for results, so the batch bound and not the result's own
 	// size is what decides its fate.
 	chat_test_capacity(chat, 8_000, 4_096)
-	chat.last_estimate = chat.capacity.usable - 256
+	chat.last_estimate = chat_capacity_input_ceiling(chat.capacity) - 256
 	chat.response_cost = 0
 
 	_test_stage_call(t, chat, "call_large", `{"path":"large.txt"}`, TOOL_READ_NAME)

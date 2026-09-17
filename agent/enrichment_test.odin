@@ -130,12 +130,12 @@ test_enrichment_unknown_model_assumes_the_default_window :: proc(t: ^testing.T) 
 	testing.expect_value(t, len(resolved.providers), 0)
 	testing.expect_value(t, len(resolved.models), 0)
 
-	// A model no source described still gets a usable budget, derived from the
-	// assumed window rather than left at zero.
+	// A model no source described still gets a capacity, derived from the assumed window
+	// rather than left at zero.
 	assumed := model_capacity(Catalog_Model{})
 	testing.expect_value(t, assumed.window, CHAT_DEFAULT_CONTEXT_WINDOW)
 	testing.expect_value(t, CHAT_DEFAULT_CONTEXT_WINDOW, 128 * 1024)
-	testing.expect(t, assumed.usable > 0)
+	testing.expect(t, chat_capacity_input_ceiling(assumed) > 0)
 
 	// A window a source stated is used as stated, including an explicit zero, which
 	// stays zero and is refused by admission rather than becoming the default.
@@ -143,7 +143,7 @@ test_enrichment_unknown_model_assumes_the_default_window :: proc(t: ^testing.T) 
 	testing.expect_value(t, stated.window, 8192)
 	zeroed := model_capacity(Catalog_Model{context_window_present = true, context_window = 0})
 	testing.expect_value(t, zeroed.window, 0)
-	testing.expect_value(t, zeroed.usable, 0)
+	testing.expect_value(t, chat_capacity_input_ceiling(zeroed), 0)
 }
 
 @(test)

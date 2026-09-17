@@ -135,9 +135,10 @@ test_a_compaction_request_shares_the_conversation_prefix :: proc(t: ^testing.T) 
 	testing.expect(t, len(prep.request.Tools) > 0, "a compaction request keeps the conversation's tools")
 	testing.expect_value(t, prep.request.Prompt_Cache_Key, string(chat.id))
 	testing.expect(t, prep.request.Max_Output_Tokens_Present)
-	// The summarizer generates the same bound as any other request, so the capacity that
-	// reserved room for it is the capacity it spends.
-	testing.expect_value(t, prep.request.Max_Output_Tokens, chat.capacity.output)
+	// A summarization request follows the same rule as any other: it asks for the room the
+	// window has left. Its input is the prefix, so the bound is what the prefix leaves.
+	expected, _ := chat_request_output_bound(chat.capacity, prep.estimate)
+	testing.expect_value(t, prep.request.Max_Output_Tokens, expected)
 	// The directive is the last message, after the prefix it asks about.
 	if !testing.expect_value(t, len(prep.request.Messages), 2) { return }
 	testing.expect_value(t, prep.request.Messages[0].Content, "first")

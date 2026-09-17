@@ -152,14 +152,6 @@ chat_build_request_into :: proc(
 	// conversation's prefix.
 	prep.request.Prompt_Cache_Key_Present = true
 	prep.request.Prompt_Cache_Key = string(chat.id)
-	// Every request carries a bound on what it may generate. This is the ordinary one,
-	// which is also what the capacity reserved room for; a summarization request is given
-	// a larger bound from the same capacity, because its output is the artifact rather
-	// than an answer, and it sets that bound after this build.
-	if chat.capacity.output > 0 {
-		prep.request.Max_Output_Tokens_Present = true
-		prep.request.Max_Output_Tokens = chat.capacity.output
-	}
 	if chat.effort != "" {
 		prep.request.Reasoning_Effort_Present = true
 		prep.request.Reasoning_Effort = chat.effort
@@ -172,6 +164,13 @@ chat_build_request_into :: proc(
 		prep.request.Tools = prep.tools[:]
 	}
 	prep.estimate = chat_estimate_input_tokens(instructions, prep.wire[:], prep.tools[:])
+	// What this request may generate depends on what it carries, because the window is one
+	// budget: a fuller context asks for a smaller answer rather than being refused. The
+	// estimate does not depend on the bound, which is why it is computed first. A
+	// summarization request gets the same rule and a larger answer, because its input is
+	// the prefix rather than the whole context.
+	prep.request.Max_Output_Tokens_Present = true
+	prep.request.Max_Output_Tokens, _ = chat_request_output_bound(chat.capacity, prep.estimate)
 }
 
 // chat_append_entries turns stored entries into provider messages. Consecutive
@@ -434,9 +433,9 @@ chat_estimate_input_tokens :: proc(instructions: string, messages: []ai.Provider
 CHAT_CHARS_PER_TOKEN :: 4
 CHAT_MESSAGE_OVERHEAD_TOKENS :: 8
 
-// chat_admission_check enforces the estimate against what the model's capacity
-// admits. The message is temp-allocated; the caller clones it when the turn must
-// record the failure.
+// chat_admission_check asks whether the estimate leaves room for an answer. It is not a
+// check against a reserved budget: there is none. The message is temp-allocated; the
+// caller clones it when the turn must record the failure.
 chat_admission_check :: proc(chat: ^Chat_Session, estimate: int) -> (message: string, admitted: bool) {
 	// The decision is recorded even when it admits the request: what the harness
 	// estimated and what it compared that against is the whole reason a request was
@@ -453,12 +452,12 @@ chat_admission_check :: proc(chat: ^Chat_Session, estimate: int) -> (message: st
 		log_emit({level = .Warning, category = .Provider, event = "request.admission", fields = fields[:]})
 		return "context admission needs context_window: add context_window to the model in config.lua", false
 	}
-	fits := model_capacity_admits(capacity, estimate)
+	output, fits := chat_request_output_bound(capacity, estimate)
 	admission := [5]Log_Field {
 		{key = "decision", value = fits ? "admitted" : "refused"},
 		{key = "estimate", value = i64(estimate)},
 		{key = "context_window", value = i64(capacity.window)},
-		{key = "reserved", value = i64(capacity.output)},
+		{key = "output", value = i64(output)},
 		{key = "margin", value = i64(capacity.margin)},
 	}
 	log_emit({level = .Info, category = .Provider, event = "request.admission", fields = admission[:]})
@@ -466,12 +465,12 @@ chat_admission_check :: proc(chat: ^Chat_Session, estimate: int) -> (message: st
 		return "", true
 	}
 	return fmt.tprintf(
-			"request estimated at ~%d input tokens exceeds the ~%d the %d-token window admits (%d reserved for output, %d for estimator error): shorten the prompt, compact, or raise the limits",
+			"request estimated at ~%d input tokens exceeds the ~%d the %d-token window can hold (%d for estimator error, %d for an answer): shorten the prompt, compact, or raise the limits",
 			estimate,
-			capacity.usable,
+			chat_capacity_input_ceiling(capacity),
 			capacity.window,
-			capacity.output,
 			capacity.margin,
+			CHAT_OUTPUT_MIN_TOKENS,
 		),
 		false
 }

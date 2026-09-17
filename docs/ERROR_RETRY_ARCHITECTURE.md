@@ -396,12 +396,14 @@ When a response has committed its calls, `chat_tool_budget_open` opens the batch
 model's context holds once that response is committed, subtracted from what the window admits.
 
 ```text
-remaining = capacity.usable - (last_estimate + response_cost)
+remaining = chat_capacity_input_ceiling(capacity) - (last_estimate + response_cost)
 ```
 
 `response_cost` is what the committed response added: its text, the calls it proposed, the
 harness's notice, and the verbatim output when the API produced one. It is estimated the way the
-projection is, so the batch is charged for what the next request will carry.
+projection is, so the batch is charged for what the next request will carry. The wall is the
+window's input ceiling rather than the compaction trigger, because the trigger exists to start
+background work and not to stop the agent from using the window it has.
 
 Each result is offered what is left after a handle is set aside for every result still to come. A
 result that fits keeps its content; one that does not is spilled. The decision is made once, as the

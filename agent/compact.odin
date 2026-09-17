@@ -70,30 +70,18 @@ chat_checkpoint_text :: proc(summary: string, allocator: mem.Allocator) -> strin
 
 // --- pressure ----------------------------------------------------------------
 
-// CHAT_COMPACT_RESERVE_PERCENT is the share of the window the foreground may still
-// grow by after a summary starts. It is what the summary has to finish inside, so a
-// larger share buys more time and a smaller one leaves more of the window usable.
-// The cap at half of what the window admits keeps a window from being reserved away
-// entirely.
-CHAT_COMPACT_RESERVE_PERCENT :: 20
-CHAT_COMPACT_RESERVE_MIN_TOKENS :: 4096
-
-// chat_compact_reserve is how much the foreground may still grow by after a summary
-// starts. A share of the window means a small model does not give up proportionally
-// more than a large one, the floor keeps the share worth having, and the cap keeps a
-// window from being reserved away entirely.
-chat_compact_reserve :: proc(capacity: Model_Capacity) -> int {
-	reserve := max(capacity.window * CHAT_COMPACT_RESERVE_PERCENT / 100, CHAT_COMPACT_RESERVE_MIN_TOKENS)
-	return min(reserve, capacity.usable / 2)
-}
-
 // chat_compact_trigger is the input size at which a summary starts, and at which a
-// finished summary is installed. One threshold serves both, because both decisions
-// are about the same point: the context has reached the size where it needs the
-// summary. Installing before it would break the cache prefix for no gain, and
-// starting after it would leave the summary less room to finish in.
+// finished summary is installed. One threshold serves both, because both decisions are
+// about the same point: the context has reached the size where it needs the summary.
+// Installing before it would break the cache prefix for no gain, and starting after it
+// would leave the summary less room to finish in.
+//
+// It is a threshold for background work and not a limit on what may be sent. The request
+// path keeps sending until the window itself runs out; what the trigger changes is that a
+// summary is already being written by then.
+@(private)
 chat_compact_trigger :: proc(chat: ^Chat_Session) -> int {
-	return chat.capacity.usable - chat_compact_reserve(chat.capacity)
+	return chat.capacity.trigger
 }
 
 // chat_compact_seam finds where the kept tail starts so the newest entries stay
@@ -421,32 +409,6 @@ chat_compact_retry_allowed :: proc(control: ^Compact_Control, trigger: Compact_T
 	return session.now_ms() - control.last_failure_at_ms >= CHAT_COMPACT_RETRY_DELAY_MS
 }
 
-// CHAT_COMPACT_SUMMARY_MIN_TOKENS is the smallest summary bound worth asking for. A
-// summary the model cannot finish inside its bound is worth nothing, because a cut-off
-// checkpoint is not installed, so a request that cannot hold a usable one is refused
-// rather than sent.
-CHAT_COMPACT_SUMMARY_MIN_TOKENS :: 1024
-
-// chat_compact_summary_output is the output bound a summarization request is given:
-// the room the window has left once the prefix is charged, bounded by what the model
-// allows and by a share of the window.
-//
-// It is not the bound an ordinary answer gets, because a summary is not an ordinary
-// answer. It is the artifact, and it must be complete or the prefix it stands for is
-// lost. Taking whatever room is left is also what keeps a large prefix summarizable:
-// a fixed bound would refuse the request exactly when the context most needs it.
-//
-// A summarization request therefore reserves more output than the capacity set aside
-// for an ordinary response, which is why admission cannot assume one bound for every
-// request. It cannot exceed half the window, so input always keeps the larger part.
-chat_compact_summary_output :: proc(capacity: Model_Capacity, prefix_estimate: int) -> (output: int, fits: bool) {
-	room := capacity.window - prefix_estimate - capacity.margin
-	ceiling := min(capacity.model_max_output, CHAT_OUTPUT_MAX_TOKENS, capacity.window / 2)
-	output = min(room, ceiling)
-	if output < CHAT_COMPACT_SUMMARY_MIN_TOKENS { return 0, false }
-	return output, true
-}
-
 // chat_compact_start freezes the compaction request for the context that prep was
 // built from and runs it on its own thread. The covered boundary is the end of the
 // prefix being summarized, so everything after it stays live.
@@ -463,7 +425,7 @@ chat_compact_start :: proc(
 	control.pending = .None
 	control.pending_source_seq = nil
 
-	if chat.capacity.window <= 0 || chat.capacity.usable <= 0 {
+	if chat.capacity.window <= 0 {
 		_observer_message(observer, .Error, "compaction needs a configured context window")
 		return false
 	}
@@ -476,17 +438,13 @@ chat_compact_start :: proc(
 	chat_build_request_into(chat, &compact_prep, entries[:seam], prep.history.dispatches, prep.history.summary, connection, CHAT_COMPACT_DIRECTIVE)
 	defer chat_request_prep_destroy(&compact_prep, chat.allocator)
 
-	// A summary is the artifact this request exists to produce, so it is given the room
-	// the window has left rather than the bound an ordinary answer is given. The estimate
-	// does not depend on the output bound, which is why the bound can be chosen from it
-	// after the build rather than before.
-	summary_output, summarizable := chat_compact_summary_output(chat.capacity, compact_prep.estimate)
-	if !summarizable {
+	// The request carries the same rule as any other: it asks for the room the window has
+	// left. Its input is the prefix rather than the whole context, so it is given more room
+	// than the foreground request that started it, which is what keeps a summary complete.
+	if !model_capacity_admits(chat.capacity, compact_prep.estimate) {
 		_observer_message(observer, .Warning, "the active context is too large to compact in one request; start a fresh session for a new topic")
 		return false
 	}
-	compact_prep.request.Max_Output_Tokens_Present = true
-	compact_prep.request.Max_Output_Tokens = summary_output
 
 	at_ms := session.now_ms()
 	request_no, begin_err := session.request_begin(
@@ -719,8 +677,7 @@ chat_compact_install_due :: proc(chat: ^Chat_Session, estimate: int) -> bool {
 // there is nothing to make room for.
 @(private)
 chat_compact_start_due :: proc(chat: ^Chat_Session, estimate: int) -> bool {
-	if chat.capacity.usable <= 0 { return false }
-	return estimate >= chat_compact_trigger(chat)
+	return chat.capacity.trigger > 0 && estimate >= chat_compact_trigger(chat)
 }
 
 // chat_compact_service adopts a finished job and installs a candidate that is due.
