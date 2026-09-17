@@ -37,6 +37,9 @@ chat_api_name :: proc(api: ai.API_Kind) -> string {
 	return ""
 }
 
+// Chat_Request_Usage is one usage report the endpoint sent, keyed by the send that
+// produced it. A send is one operation, so a report is attributed to the attempt
+// that received it rather than to the request as a whole.
 Chat_Request_Usage :: struct {
 	operation: u64,
 	usage:     ai.Provider_Usage_Event,
@@ -124,7 +127,7 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 			runtime.chat.last_input_measured_present = true
 		}
 		if runtime.usage_log != nil {
-			append(runtime.usage_log, Chat_Request_Usage{operation = u64(runtime.chat.requests_made), usage = value})
+			append(runtime.usage_log, Chat_Request_Usage{operation = u64(runtime.chat.operation.id), usage = value})
 		}
 	}
 }
@@ -246,11 +249,6 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	recorded := [1]Log_Field{{key = "purpose", value = session.request_purpose_name(.Response)}}
 	log_emit({level = .Info, category = .Storage, event = "request.recorded", fields = recorded[:]})
 
-	chat_session_begin_operation(chat)
-	binding.correlation = log_correlation(chat)
-	// The event source identifies this operation, and it is the same for every
-	// attempt of it: the attempt is told apart by the correlation, not by the source.
-	source := chat_session_event_source(chat)
 	// The request carries interruption only. No deadline is set: the request
 	// stays open as long as the provider keeps it open, and ends when the
 	// provider, the transport, or cancellation ends it.
@@ -267,8 +265,18 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	// The finish reason of the attempt that ends the chain is what the response is
 	// committed with. Every attempt starts without one.
 	finish_reason := ai.Provider_Finish_Reason.Unknown
+	// The event source of the attempt that ends the chain, which is what its staged
+	// output is committed under.
+	source: Chat_Event_Source
 	for {
 		attempts += 1
+		// Each send is its own operation. An attempt is over when its call has
+		// returned, so the one before it retires as this one begins: the cancellation
+		// gate, the event source, and the usage reports all name exactly one send, and
+		// nothing an abandoned attempt produced is attributed to the attempt after it.
+		chat_session_retire_operation(chat)
+		chat_session_begin_operation(chat)
+		source = chat_session_event_source(chat)
 		binding.correlation = log_correlation_for(chat, attempts)
 		// The runtime belongs to one attempt: a retry that produces nothing must not
 		// inherit the finish reason of the attempt before it, nor the record that the
@@ -482,13 +490,7 @@ chat_commit_response :: proc(
 		chat.store,
 		chat.id,
 		request_no,
-		{
-			outcome = outcome,
-			response_json = response_json,
-			error_json = error_json,
-			usage = chat_request_usage(usages, u64(chat.requests_made)),
-			at_ms = at_ms,
-		},
+		{outcome = outcome, response_json = response_json, error_json = error_json, usage = chat_send_usage(chat, usages), at_ms = at_ms},
 	)
 	if finish_err != nil {
 		chat_session_record_failure(chat, "the request outcome could not be recorded", finish_err)

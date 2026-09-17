@@ -142,6 +142,13 @@ chat_request_input_json :: proc(prep: ^Chat_Request_Prep, history: ^session.Cont
 	return string(data)
 }
 
+// chat_send_usage totals the usage one send reported. The send is the operation that
+// performed it, which is the identity its reports were recorded under.
+@(private)
+chat_send_usage :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) -> session.Usage {
+	return chat_request_usage(usages, u64(chat.operation.id))
+}
+
 @(private)
 chat_error_json :: proc(message: string) -> string {
 	data, marshal_err := json.marshal(Chat_Request_Error{message = message}, allocator = context.temp_allocator)
@@ -149,7 +156,7 @@ chat_error_json :: proc(message: string) -> string {
 	return string(data)
 }
 
-// chat_request_usage totals one request's usage. The provider's last word wins,
+// chat_request_usage totals one send's usage. The provider's last word wins,
 // because a provider may report the same measurement more than once as it
 // settles, and an absent measurement stays absent rather than becoming zero.
 @(private)

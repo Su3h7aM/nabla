@@ -7,6 +7,47 @@ import "core:testing"
 import "nabla:agent/session"
 import "nabla:ai"
 
+// A provider that refuses once and then answers is sent the same bytes again, and the
+// conversation gains exactly one answer: the abandoned attempt contributed nothing.
+@(test)
+test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(t, chat, "say something")
+
+	refusal := `{"error":{"message":"Rate limit reached"}}`
+	responses := []string{agent_provider_refusal("429 Too Many Requests", refusal), agent_provider_reply("second try")}
+	provider: Agent_Provider
+	if !agent_provider_start(t, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	testing.expect(t, chat_run_turn(chat, connection, {}), "the turn completed after a retry")
+	if !testing.expect_value(t, len(provider.requests), 2) { return }
+	// A retry sends the same request: the bytes of the second attempt are the bytes of
+	// the first, because the harness froze them before either one went out.
+	testing.expectf(t, provider.requests[0] == provider.requests[1], "the retry must send the same bytes")
+
+	ctx := _test_context(t, chat)
+	defer session.context_destroy(&ctx, context.allocator)
+	answers := 0
+	for entry in ctx.entries {
+		#partial switch payload in entry.payload {
+		case session.Assistant_Entry:
+			if payload.text == "second try" { answers += 1 }
+		}
+	}
+	testing.expect_value(t, answers, 1)
+}
+
 // One request, one send, one answer: the scripted provider replies, the harness
 // commits what came back, and the conversation holds the prompt and the answer.
 // This is the base case every retry case is a variation of.
