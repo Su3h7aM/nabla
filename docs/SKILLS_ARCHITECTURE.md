@@ -871,10 +871,10 @@ absent. Recorded context boundaries remain the ones actually projected.
 
 For summarization request construction and cache policy, follow
 [Context management and non-blocking compaction](CONTEXT_COMPACTION_ARCHITECTURE.md)
-§8. Its planned cache-compatible snapshot replaces the current separate summary
-instructions, omitted tools, `:summary` key, and disabled cache writes. The snapshot
-retains the normal instruction-snapshot reference; it never reloads skills from disk.
-A model change may alter provider configuration, but must not rerender skills.
+§7. A compaction request keeps the normal instruction snapshot, the tool inventory,
+the effort, and the prompt-cache key, and appends the directive as the last message,
+so the summarizer reads the conversation's warm prefix. It never reloads skills from
+disk. A model change may alter provider configuration but must not rerender skills.
 
 A skill load leaves all of these unchanged:
 

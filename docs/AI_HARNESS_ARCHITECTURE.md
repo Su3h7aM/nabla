@@ -359,14 +359,10 @@ installation, and compaction lifecycle work, read
 [Context management and non-blocking compaction](CONTEXT_COMPACTION_ARCHITECTURE.md).
 That specification replaces this section's former compact-only-on-refused-admission policy.
 
-The target is background summarization of a fixed committed prefix while the foreground keeps
-its existing context and cache prefix. Installation preserves every entry after the recorded
-coverage boundary. Start and installation thresholds are separate. The session remains one
-logical session and the transcript remains append-only.
-
-Status: the current implementation still compacts synchronously after failed admission. The
-linked specification defines the migration, ownership and persistence contracts, cache limits,
-and the failure policy when background compaction cannot finish within the remaining capacity.
+The active context is a checkpoint followed by every entry after the sequence it covers.
+Compaction summarizes a fixed prefix on its own thread while the foreground keeps using the
+existing context and cache prefix, and the finished summary is installed later at a request
+boundary. Start and installation thresholds are separate, and nothing waits for a summary.
 
 ---
 
