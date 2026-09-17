@@ -322,8 +322,7 @@ anthropic_block_fragment :: proc(state: ^Provider_Stream_State, index: i64) -> (
 	for &fragment in state.Tool_Fragments {
 		if fragment.Wire_Index_Present && fragment.Wire_Index == index { return &fragment, true }
 	}
-	fragment, ok := provider_tool_fragment(state, provider_tool_call_count(state))
-	if !ok { return nil, false }
+	fragment := provider_tool_fragment_append(state)
 	fragment.Wire_Index = index
 	fragment.Wire_Index_Present = true
 	return fragment, true

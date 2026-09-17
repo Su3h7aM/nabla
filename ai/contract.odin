@@ -325,7 +325,6 @@ Provider_Tool_Fragment :: struct {
 	Arguments_Started:  bool,
 }
 
-PROVIDER_MAX_TOOL_CALLS :: 8
 PROVIDER_MAX_TOOL_ARGS_BYTES :: 64 * 1024
 
 Provider_Stream_Start :: proc(api: API_Kind, allocator := context.allocator) -> Provider_Stream_State {
@@ -394,23 +393,23 @@ provider_tool_fragments_present :: proc(state: ^Provider_Stream_State) -> bool {
 	return false
 }
 
-provider_tool_fragment :: proc(state: ^Provider_Stream_State, index: int) -> (fragment: ^Provider_Tool_Fragment, ok: bool) {
-	if index < 0 || index >= PROVIDER_MAX_TOOL_CALLS { return nil, false }
-	for len(state.Tool_Fragments) <= index {
-		fragment := Provider_Tool_Fragment {
-			Arguments = make([dynamic]u8, 0, state.Allocator),
-		}
-		append(&state.Tool_Fragments, fragment)
+provider_tool_fragment_append :: proc(state: ^Provider_Stream_State) -> ^Provider_Tool_Fragment {
+	fragment := Provider_Tool_Fragment {
+		Arguments = make([dynamic]u8, 0, state.Allocator),
 	}
-	return &state.Tool_Fragments[index], true
+	append(&state.Tool_Fragments, fragment)
+	return &state.Tool_Fragments[len(state.Tool_Fragments) - 1]
 }
 
-provider_tool_call_count :: proc(state: ^Provider_Stream_State) -> int {
-	count := 0
+provider_tool_fragment_by_wire_index :: proc(state: ^Provider_Stream_State, index: i64) -> (^Provider_Tool_Fragment, bool) {
+	if index < 0 { return nil, false }
 	for &fragment in state.Tool_Fragments {
-		if fragment.Present { count += 1 }
+		if fragment.Wire_Index_Present && fragment.Wire_Index == index { return &fragment, true }
 	}
-	return count
+	fragment := provider_tool_fragment_append(state)
+	fragment.Wire_Index = index
+	fragment.Wire_Index_Present = true
+	return fragment, true
 }
 
 provider_tool_finalize :: proc(state: ^Provider_Stream_State, allocator := context.allocator) -> ([]Provider_Tool_Call, bool) {
@@ -425,7 +424,7 @@ provider_tool_finalize :: proc(state: ^Provider_Stream_State, allocator := conte
 			if other.ID != "" && other.ID == fragment.ID { return nil, false }
 		}
 	}
-	if count == 0 || count > PROVIDER_MAX_TOOL_CALLS { return nil, false }
+	if count == 0 { return nil, false }
 	calls := make([]Provider_Tool_Call, count, allocator)
 	i := 0
 	for &fragment in state.Tool_Fragments {

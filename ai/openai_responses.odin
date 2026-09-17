@@ -185,8 +185,7 @@ provider_tool_fragment_by_item :: proc(object: json.Object, state: ^Provider_Str
 	for &fragment in state.Tool_Fragments {
 		if fragment.Present && fragment.Item_ID == id { return &fragment, true }
 	}
-	fragment, slot_ok := provider_tool_fragment(state, provider_tool_call_count(state))
-	if !slot_ok { state^.Phase = .Failed; return nil, false }
+	fragment := provider_tool_fragment_append(state)
 	fragment.Item_ID = strings.clone(id, state.Allocator)
 	return fragment, true
 }
@@ -201,14 +200,12 @@ openai_responses_call_slot :: proc(object, item: json.Object, state: ^Provider_S
 		for &fragment in state.Tool_Fragments {
 			if fragment.Present && fragment.Wire_Index == index { return &fragment, true }
 		}
-		fragment, slot_ok := provider_tool_fragment(state, provider_tool_call_count(state))
-		if !slot_ok { state^.Phase = .Failed; return nil, false }
+		fragment := provider_tool_fragment_append(state)
 		fragment.Wire_Index = index
 		fragment.Wire_Index_Present = true
 		return fragment, true
 	}
-	fragment, slot_ok := provider_tool_fragment(state, provider_tool_call_count(state))
-	if !slot_ok { state^.Phase = .Failed; return nil, false }
+	fragment := provider_tool_fragment_append(state)
 	return fragment, true
 }
 

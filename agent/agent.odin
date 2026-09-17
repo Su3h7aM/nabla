@@ -40,9 +40,6 @@ chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
 	case .Executing_Tools:
 		return Chat_Effect{kind = .Run_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}
 	case .Preparing:
-		if chat.requests_made >= TOOL_MAX_REQUESTS_PER_TURN {
-			return chat_session_fail_turn(chat, "tool loop budget exhausted")
-		}
 		// The turn bound is observed here, at an operation boundary, because a running
 		// request cannot be preempted by a single-threaded control loop.
 		if ai.deadline_expired(chat.turn_deadline) {
@@ -201,8 +198,6 @@ Chat_Notice :: enum {
 	None,
 	Ignored,
 	Truncated,
-	Too_Many_Calls,
-	Budget_Exhausted,
 	Missing_Call_Identity,
 	Duplicate_Call_ID,
 }
@@ -215,10 +210,6 @@ chat_notice_text :: proc(notice: Chat_Notice) -> string {
 	switch notice {
 	case .Truncated:
 		return "the previous response was cut off by the output limit before it finished, so none of it was executed; reissue the work in smaller steps"
-	case .Too_Many_Calls:
-		return "the previous response proposed more tool calls than this harness accepts at once, so none of them ran; propose fewer calls"
-	case .Budget_Exhausted:
-		return "this turn has reached its tool-call budget, so none of the calls ran; answer with what you have, or say what still needs doing"
 	case .Missing_Call_Identity:
 		return "a proposed tool call carried no id or no tool name, so none of the calls ran; every call needs the provider's id and the tool's name"
 	case .Duplicate_Call_ID:
@@ -246,8 +237,7 @@ chat_session_note_notice :: proc(chat: ^Chat_Session, source: Chat_Event_Source,
 // response is never half executed.
 chat_session_feed_tool_calls :: proc(chat: ^Chat_Session, source: Chat_Event_Source, calls: []ai.Provider_Tool_Call) -> Chat_Notice {
 	if !chat_session_accepts_event(chat, source) { return .Ignored }
-	if len(calls) == 0 || len(calls) > TOOL_MAX_CALLS_PER_RESPONSE { return .Too_Many_Calls }
-	if chat.calls_made + len(calls) > TOOL_MAX_CALLS_PER_TURN { return .Budget_Exhausted }
+	if len(calls) == 0 { return .Ignored }
 
 	staged := make([dynamic]Chat_Tool_Call, 0, len(calls), chat.allocator)
 	defer delete(staged)

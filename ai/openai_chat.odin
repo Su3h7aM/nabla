@@ -218,7 +218,7 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 					if !fragment_ok { return provider_stream_fail(state, .Invalid_Data, "tool call is not an object") }
 					index, index_present, index_ok := openai_value_integer(fragment_delta, "index")
 					if !index_ok || !index_present { return provider_stream_fail(state, .Invalid_Data, "tool call has no index") }
-					fragment, slot_ok := provider_tool_fragment(state, int(index))
+					fragment, slot_ok := provider_tool_fragment_by_wire_index(state, index)
 					if !slot_ok { return provider_stream_fail(state, .Invalid_Data, "tool call index is invalid", .Tool_Limit) }
 					if id, present, ok := openai_value_string(fragment_delta, "id"); ok && present && id != "" {
 						if fragment.ID != "" && fragment.ID != id { return provider_stream_fail(state, .Invalid_Data, "tool call id changed") }

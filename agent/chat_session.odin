@@ -119,12 +119,12 @@ Chat_Session :: struct {
 	// while the response is still streaming and committed with it, so the
 	// explanation lands after the text it explains.
 	pending_notice:               Chat_Notice,
-	requests_made:                int, // model requests this turn; bounds the tool loop
+	requests_made:                int, // model requests made in this turn
 	// request_attempts counts how many times the current request was sent. A retry
 	// is one request, so the record keeps one row and this is what says whether the
 	// provider was asked more than once.
 	request_attempts:             int,
-	calls_made:                   int, // tool executions this turn
+	calls_made:                   int, // tool executions in this turn
 	active_failed:                bool,
 	workspace:                    string, // owned; validated process directory
 	provider_id:                  string, // owned; the provider requests are addressed to

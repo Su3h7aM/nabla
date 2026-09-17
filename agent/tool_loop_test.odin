@@ -2,6 +2,7 @@
 package agent
 
 import "core:encoding/json"
+import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -415,23 +416,42 @@ test_unknown_tool_is_reported_not_run :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_tool_loop_budget_exhausts :: proc(t: ^testing.T) {
+test_tool_loop_has_no_request_budget :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	_test_accept(t, chat, "loop")
+	chat.requests_made = 1000
+
+	effect := chat_session_advance(chat)
+	defer chat_effect_destroy(&effect)
+	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
+	testing.expect_value(t, chat.requests_made, 1001)
+}
+
+@(test)
+test_tool_loop_accepts_more_than_the_old_batch_limit :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	_test_accept(t, chat, "loop")
-	chat.requests_made = TOOL_MAX_REQUESTS_PER_TURN
+	_test_accept(t, chat, "many calls")
+	request := _test_begin_request(t, chat)
+	defer chat_effect_destroy(&request)
 
-	done := chat_run_turn(chat, tool_loop_connection, {})
-	testing.expect(t, !done)
+	calls := make([dynamic]ai.Provider_Tool_Call, 0, 40, context.temp_allocator)
+	defer delete(calls)
+	for i in 0 ..< 40 {
+		id := fmt.aprintf("call_%d", i, allocator = context.temp_allocator)
+		append(&calls, ai.Provider_Tool_Call{ID = id, Name = TOOL_SHELL_NAME, Arguments = "{}"})
+	}
 
-	entries := _test_entries(t, chat)
-	defer session.entries_destroy(entries, context.allocator)
-	// The turn is closed as a failure, and the prompt it admitted stays.
-	if !testing.expect_value(t, len(entries), 1) { return }
-	testing.expect_value(t, entries[0].kind, session.Entry_Kind.User)
+	source := chat_session_event_source(chat)
+	testing.expect_value(t, chat_session_feed_tool_calls(chat, source, calls[:]), Chat_Notice.None)
+	testing.expect_value(t, len(chat.pending_calls), 40)
+	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, 40))
 }
 
 @(test)
