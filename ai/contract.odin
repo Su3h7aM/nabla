@@ -119,6 +119,15 @@ Provider_Request :: struct {
 	// displace the conversation's own entries. Absent means the provider decides.
 	Cache_Request_Present:          bool,
 	Cache_Request:                  bool,
+	// User_Agent and Session_Id are the identities this client reports to the
+	// endpoint. Both are opaque here: the caller supplies its own names, because
+	// what identifies a client and a conversation is the caller's business. An
+	// endpoint that routes, throttles, or traces by client needs them, and one
+	// that has no use for them is sent no header.
+	User_Agent_Present:             bool,
+	User_Agent:                     string, // borrowed until operation retirement,
+	Session_Id_Present:             bool,
+	Session_Id:                     string, // borrowed until operation retirement,
 }
 
 Provider_Request_Error :: enum {

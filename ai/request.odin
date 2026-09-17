@@ -118,37 +118,49 @@ Provider_Operation_Options :: struct {
 	observer:    Provider_Operation_Observer,
 }
 
-// provider_auth_headers builds the request fields one API family authenticates
-// with, and the version header it requires. Authentication is provider policy, so
-// the transport never learns it: sse.post carries whatever headers it is handed.
+// provider_request_headers builds the fields one request carries: the ones its
+// API family authenticates with, the version header that family requires, and
+// the client and session identities the caller named. Authentication and
+// identity are caller policy, so the transport never learns either: sse.post
+// carries whatever headers it is handed.
 //
 // An empty credential yields no auth header rather than a refused request, which
-// is what an endpoint that needs no credential expects. Every value in the
-// result is owned by allocator; the names are literals. provider_headers_destroy
-// releases the whole result.
+// is what an endpoint that needs no credential expects, and an unnamed client or
+// session sends no header for it. Every value in the result is owned by
+// allocator; the names are literals. provider_headers_destroy releases the whole
+// result.
 @(private)
-provider_auth_headers :: proc(connection: Provider_Connection, allocator := context.allocator) -> []client.Header {
+provider_request_headers :: proc(connection: Provider_Connection, request: Provider_Request, allocator := context.allocator) -> []client.Header {
+	// Sized for the most any API family needs, so every entry is allocated up
+	// front from the caller's allocator rather than grown through an ambient one.
+	result := make([]client.Header, 4, allocator)
+	count := 0
 	switch connection.API {
 	case .OpenAI_Chat_Completions, .OpenAI_Responses:
-		if connection.Credential == "" { return nil }
-		result := make([]client.Header, 1, allocator)
-		result[0] = {"authorization", strings.concatenate({"Bearer ", connection.Credential}, allocator)}
-		return result
+		if connection.Credential != "" {
+			result[count] = {"authorization", strings.concatenate({"Bearer ", connection.Credential}, allocator)}
+			count += 1
+		}
 	case .Anthropic_Messages:
 		// Anthropic authenticates with a key header rather than a bearer token,
 		// and requires the API version on every request.
-		if connection.Credential == "" {
-			result := make([]client.Header, 1, allocator)
-			result[0] = {"anthropic-version", strings.clone(ANTHROPIC_VERSION, allocator)}
-			return result
+		if connection.Credential != "" {
+			result[count] = {"x-api-key", strings.clone(connection.Credential, allocator)}
+			count += 1
 		}
-		result := make([]client.Header, 2, allocator)
-		result[0] = {"x-api-key", strings.clone(connection.Credential, allocator)}
-		result[1] = {"anthropic-version", strings.clone(ANTHROPIC_VERSION, allocator)}
-		return result
+		result[count] = {"anthropic-version", strings.clone(ANTHROPIC_VERSION, allocator)}
+		count += 1
 	case .Invalid:
 	}
-	return nil
+	if request.User_Agent_Present && request.User_Agent != "" {
+		result[count] = {"user-agent", strings.clone(request.User_Agent, allocator)}
+		count += 1
+	}
+	if request.Session_Id_Present && request.Session_Id != "" {
+		result[count] = {"session-id", strings.clone(request.Session_Id, allocator)}
+		count += 1
+	}
+	return result[:count]
 }
 
 @(private)
@@ -208,7 +220,7 @@ Provider_Request_Operation_Controlled :: proc(
 		)
 	}
 
-	headers := provider_auth_headers(connection, allocator)
+	headers := provider_request_headers(connection, request, allocator)
 	defer provider_headers_destroy(headers, allocator)
 
 	state := Provider_Request_Stream_State {

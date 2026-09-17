@@ -10,6 +10,11 @@ import "nabla:ai"
 
 // --- request assembly --------------------------------------------------------
 
+// NABLA_USER_AGENT names this client to a provider endpoint. Every HTTP client
+// sends one, and an endpoint that logs, routes, or throttles by client has only
+// this to read.
+NABLA_USER_AGENT :: "nabla/0.1.0"
+
 // Chat_Request_Prep is one request built from committed history, together with
 // the storage the request borrows. It owns the context it was built from. The
 // wire is one ordered list: a verbatim Responses output is a message in it, at
@@ -100,6 +105,16 @@ chat_build_request_into :: proc(
 		Instructions         = instructions,
 		Messages_Present     = true,
 		Messages             = prep.wire[:],
+		// Every HTTP client names itself, and an endpoint that routes, throttles,
+		// or traces by client has only this to read.
+		User_Agent_Present   = true,
+		User_Agent           = NABLA_USER_AGENT,
+		// The session is this conversation. Reporting it as a header is how a
+		// gateway can tell one conversation from another and keep a session
+		// pinned to whatever it chose; the cache key below is a separate hint
+		// that only some endpoints read.
+		Session_Id_Present   = true,
+		Session_Id           = string(chat.id),
 	}
 	// The harness replays history itself, so the endpoint is asked not to keep a
 	// second copy. On Responses this also makes reasoning items carry their
