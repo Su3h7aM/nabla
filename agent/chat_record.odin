@@ -24,8 +24,39 @@ Chat_Request_Tool :: struct {
 
 // CHAT_REQUEST_INPUT_VERSION versions the request input record. input_json is
 // opaque text, so old rows stay valid; the version tells a future reader which
-// shape a row was written in.
-CHAT_REQUEST_INPUT_VERSION :: 1
+// shape a row was written in. Version 2 adds where the send sat in its chain.
+CHAT_REQUEST_INPUT_VERSION :: 2
+
+// Chat_Recovery_Kind names how one send came to be. A chain is read back through
+// these: a first send, the same frozen bytes sent again, and a send of rebuilt
+// context are three different facts, and a reader that had to infer them from
+// timing or from an outcome would get them wrong.
+Chat_Recovery_Kind :: enum {
+	Initial,
+	Transient_Retry,
+	Checkpoint_Repair,
+}
+
+chat_recovery_kind_name :: proc(kind: Chat_Recovery_Kind) -> string {
+	switch kind {
+	case .Initial:
+		return "initial"
+	case .Transient_Retry:
+		return "transient_retry"
+	case .Checkpoint_Repair:
+		return "checkpoint_repair"
+	}
+	return "initial"
+}
+
+// Chat_Attempt is where one send sits in the chain that produced it. The first send
+// of a chain names no predecessor, and every later one names the send before it, so
+// the chain is stored rather than reconstructed.
+Chat_Attempt :: struct {
+	number:   int,
+	recovery: Chat_Recovery_Kind,
+	previous: Maybe(session.Request_No),
+}
 
 @(private)
 Chat_Request_Input :: struct {
@@ -36,6 +67,9 @@ Chat_Request_Input :: struct {
 	covered_seq:              Maybe(session.Seq) `json:"covered_seq"`,
 	context_through:          Maybe(session.Seq) `json:"context_through"`,
 	instruction_snapshot_seq: Maybe(session.Seq) `json:"instruction_snapshot_seq"`,
+	attempt_number:           i64 `json:"attempt_number"`,
+	recovery_kind:            string `json:"recovery_kind"`,
+	previous_request_no:      Maybe(i64) `json:"previous_request_no"`,
 }
 
 @(private)
@@ -108,7 +142,7 @@ chat_request_config_json :: proc(chat: ^Chat_Session, output: int) -> string {
 	return string(data)
 }
 
-// chat_request_input_json describes what a request carried, serialized from
+// chat_request_input_json describes what one send carried, serialized from
 // the prepared request rather than reconstructed from the session. The
 // inventory in prep.request is the snapshot the request was built with, so the
 // record stays true even if the registry changes before the write lands. The
@@ -118,7 +152,13 @@ chat_request_config_json :: proc(chat: ^Chat_Session, output: int) -> string {
 // Schema bytes are stored as written: the schema travels as a JSON string
 // value, so no canonical re-encoding touches the definition the model saw.
 @(private)
-chat_request_input_json :: proc(prep: ^Chat_Request_Prep, history: ^session.Context, snapshot_seq: Maybe(session.Seq), entry_count: int) -> string {
+chat_request_input_json :: proc(
+	prep: ^Chat_Request_Prep,
+	history: ^session.Context,
+	snapshot_seq: Maybe(session.Seq),
+	entry_count: int,
+	attempt: Chat_Attempt,
+) -> string {
 	tools := make([dynamic]Chat_Request_Tool, 0, len(prep.request.Tools), context.temp_allocator)
 	defer delete(tools)
 	for &definition in prep.request.Tools {
@@ -130,7 +170,10 @@ chat_request_input_json :: proc(prep: ^Chat_Request_Prep, history: ^session.Cont
 		tools          = tools[:],
 		summary_seq    = history.summary_seq,
 		covered_seq    = history.covered_seq,
+		attempt_number = i64(attempt.number),
+		recovery_kind  = chat_recovery_kind_name(attempt.recovery),
 	}
+	if previous, present := attempt.previous.?; present { input.previous_request_no = i64(previous) }
 	if prep.request.Instructions_Present { input.instructions = prep.request.Instructions }
 	input.instruction_snapshot_seq = snapshot_seq
 	count := entry_count

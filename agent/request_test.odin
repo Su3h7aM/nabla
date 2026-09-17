@@ -767,7 +767,7 @@ test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
 	}
 	if !testing.expect_value(t, tool_registry_add(&chat.tools, rogue).kind, Tool_Registry_Error_Kind.None) { return }
 
-	recorded := chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries))
+	recorded := chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries), Chat_Attempt{number = 1})
 	tools := request_record_tools(t, recorded)
 	if !testing.expect_value(t, len(tools), len(TOOL_NATIVE)) { return }
 	previous := ""

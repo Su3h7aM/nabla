@@ -224,31 +224,6 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	}
 	log_emit({level = .Info, category = .Provider, event = "request.prepared", fields = prepared[:]})
 
-	at_ms := session.now_ms()
-	request_no, begin_err := session.request_begin(
-		chat.store,
-		chat.id,
-		{
-			turn_no = chat.turn_no,
-			purpose = .Response,
-			provider = chat.provider_id,
-			model_requested = chat.model_id,
-			api = chat_api_name(connection.API),
-			config_json = chat_request_config_json(chat, prep.request.Max_Output_Tokens),
-			input_json = chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries)),
-		},
-		at_ms,
-	)
-	if begin_err != nil {
-		chat_session_record_failure(chat, "the request could not be recorded", begin_err)
-		return
-	}
-	chat.active_request = request_no
-	binding.correlation = log_correlation(chat)
-
-	recorded := [1]Log_Field{{key = "purpose", value = session.request_purpose_name(.Response)}}
-	log_emit({level = .Info, category = .Storage, event = "request.recorded", fields = recorded[:]})
-
 	// The request carries interruption only. No deadline is set: the request
 	// stays open as long as the provider keeps it open, and ends when the
 	// provider, the transport, or cancellation ends it.
@@ -268,6 +243,13 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	// The event source of the attempt that ends the chain, which is what its staged
 	// output is committed under.
 	source: Chat_Event_Source
+	// The send that ends the chain, which is the row the response is committed under.
+	request_no: session.Request_No
+	// The send before this one, which is how each row names its chain.
+	previous: Maybe(session.Request_No)
+	// settled records that the send which ended the chain was already finished for its
+	// own failure, before a retry was waited on. Such a row is not finished twice.
+	settled := false
 	for {
 		attempts += 1
 		// Each send is its own operation. An attempt is over when its call has
@@ -277,7 +259,42 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		chat_session_retire_operation(chat)
 		chat_session_begin_operation(chat)
 		source = chat_session_event_source(chat)
+		settled = false
+
+		// One row per send. The row identifies the actual provider send, and the chain
+		// it belongs to is written into the row, so a retry is legible from the store
+		// rather than reconstructed from it. The row is recorded before the send: a
+		// request that never finishes still says what it was about to carry.
+		attempt := Chat_Attempt {
+			number   = attempts,
+			recovery = previous == nil ? .Initial : .Transient_Retry,
+			previous = previous,
+		}
+		begin_no, begin_err := session.request_begin(
+			chat.store,
+			chat.id,
+			{
+				turn_no = chat.turn_no,
+				purpose = .Response,
+				provider = chat.provider_id,
+				model_requested = chat.model_id,
+				api = chat_api_name(connection.API),
+				config_json = chat_request_config_json(chat, prep.request.Max_Output_Tokens),
+				input_json = chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries), attempt),
+			},
+			session.now_ms(),
+		)
+		if begin_err != nil {
+			chat_session_record_failure(chat, "the request could not be recorded", begin_err)
+			return
+		}
+		request_no = begin_no
+		previous = begin_no
+		chat.active_request = request_no
 		binding.correlation = log_correlation_for(chat, attempts)
+
+		recorded := [1]Log_Field{{key = "purpose", value = session.request_purpose_name(.Response)}}
+		log_emit({level = .Info, category = .Storage, event = "request.recorded", fields = recorded[:]})
 		// The runtime belongs to one attempt: a retry that produces nothing must not
 		// inherit the finish reason of the attempt before it, nor the record that the
 		// assistant block was already announced.
@@ -346,6 +363,11 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		log_emit({level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})
 		if !chat_request_may_retry(chat, operation_error, attempts) { break }
 		_observer_message(observer, .Notice, chat_retry_notice(attempts, operation_error))
+		// The send is over, so its row is finished before anything is waited on or sent
+		// again: the failure is in the store before the policy acts on it, with the
+		// numbers and the usage of the send that produced it.
+		chat_finish_request(chat, request_no, .Failed, .Unknown, operation_error.detail, usages)
+		settled = true
 		delay := chat_retry_delay(attempts)
 		retry := [3]Log_Field {
 			{key = "error_kind", value = log_operation_error_name(operation_error.kind)},
@@ -371,7 +393,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	}
 	chat_session_retire_operation(chat)
 
-	chat_commit_response(chat, request_no, finish_reason, usages)
+	chat_commit_response(chat, request_no, finish_reason, usages, finish_row = !settled)
 	// The request's outcome is recorded, so the provider's own accounting of it is part of
 	// the session the front-end describes.
 	_observer_request_finished(observer)
@@ -389,6 +411,10 @@ chat_commit_response :: proc(
 	request_no: session.Request_No,
 	finish_reason: ai.Provider_Finish_Reason,
 	usages: ^[dynamic]Chat_Request_Usage,
+	// finish_row is false when the send this response came from was already finished
+	// for its own failure, before a retry was waited on. A row says how its send ended
+	// once, so a turn that ended while waiting does not write over that record.
+	finish_row := true,
 ) {
 	at_ms := session.now_ms()
 	outcome: session.Outcome = .Completed
@@ -470,31 +496,8 @@ chat_commit_response :: proc(
 	// did not commit, because the turn failed or was cancelled, is dropped.
 	chat.pending_notice = .None
 
-	response_json := ""
-	if finish_reason != .Unknown {
-		response_json = string(
-			json.marshal(
-				Chat_Request_Response{reason = chat_finish_reason_text(finish_reason), attempts = chat.request_attempts},
-				allocator = context.temp_allocator,
-			) or_else nil,
-		)
-	}
-	error_json := ""
-	if outcome == .Failed && chat.last_error != "" {
-		error_json = chat_error_json(chat.last_error)
-	} else if outcome == .Cancelled {
-		error_json = chat_error_json("cancelled")
-	}
-
-	finish_err := session.request_finish(
-		chat.store,
-		chat.id,
-		request_no,
-		{outcome = outcome, response_json = response_json, error_json = error_json, usage = chat_send_usage(chat, usages), at_ms = at_ms},
-	)
-	if finish_err != nil {
-		chat_session_record_failure(chat, "the request outcome could not be recorded", finish_err)
-		return
+	if finish_row {
+		chat_finish_request(chat, request_no, outcome, finish_reason, chat.last_error, usages)
 	}
 	finished := [3]Log_Field {
 		{key = "outcome", value = session.outcome_name(outcome)},
@@ -509,6 +512,46 @@ chat_commit_response :: proc(
 	level := log.Level.Info
 	if outcome == .Failed { level = .Error }
 	log_emit({level = level, category = .Provider, event = "request.finished", fields = finished[:]})
+}
+
+// chat_finish_request records how one send ended: its outcome, what the model stopped
+// for, the harness's account of a failure, and the usage the endpoint reported for it.
+// Every send reaches exactly one of these, including a send an attempt chain
+// abandoned, so no row is left running and each row's numbers are its own.
+@(private)
+chat_finish_request :: proc(
+	chat: ^Chat_Session,
+	request_no: session.Request_No,
+	outcome: session.Outcome,
+	finish_reason: ai.Provider_Finish_Reason,
+	error_text: string,
+	usages: ^[dynamic]Chat_Request_Usage,
+) {
+	response_json := ""
+	if finish_reason != .Unknown {
+		response_json = string(
+			json.marshal(
+				Chat_Request_Response{reason = chat_finish_reason_text(finish_reason), attempts = chat.request_attempts},
+				allocator = context.temp_allocator,
+			) or_else nil,
+		)
+	}
+	error_json := ""
+	if outcome == .Failed && error_text != "" {
+		error_json = chat_error_json(error_text)
+	} else if outcome == .Cancelled {
+		error_json = chat_error_json("cancelled")
+	}
+
+	finish_err := session.request_finish(
+		chat.store,
+		chat.id,
+		request_no,
+		{outcome = outcome, response_json = response_json, error_json = error_json, usage = chat_send_usage(chat, usages), at_ms = session.now_ms()},
+	)
+	if finish_err != nil {
+		chat_session_record_failure(chat, "the request outcome could not be recorded", finish_err)
+	}
 }
 
 // chat_response_cost estimates what one committed response adds to the model's

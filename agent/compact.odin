@@ -449,13 +449,15 @@ chat_compact_start :: proc(
 		chat.store,
 		chat.id,
 		{
-			turn_no = chat.turn_no,
-			purpose = .Compaction,
-			provider = chat.provider_id,
+			turn_no         = chat.turn_no,
+			purpose         = .Compaction,
+			provider        = chat.provider_id,
 			model_requested = chat.model_id,
-			api = chat_api_name(connection.API),
-			config_json = chat_request_config_json(chat, compact_prep.request.Max_Output_Tokens),
-			input_json = chat_request_input_json(&compact_prep, &prep.history, chat.skill_snapshot_seq, seam),
+			api             = chat_api_name(connection.API),
+			config_json     = chat_request_config_json(chat, compact_prep.request.Max_Output_Tokens),
+			// A summarization is one send: its chain is one attempt that names no
+			// predecessor.
+			input_json      = chat_request_input_json(&compact_prep, &prep.history, chat.skill_snapshot_seq, seam, Chat_Attempt{number = 1}),
 		},
 		at_ms,
 	)

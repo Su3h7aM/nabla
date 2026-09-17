@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:encoding/json"
 import "core:strings"
 import "core:testing"
 
@@ -39,13 +40,57 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(t: ^testing.T) {
 	ctx := _test_context(t, chat)
 	defer session.context_destroy(&ctx, context.allocator)
 	answers := 0
+	answered: session.Request_No
+	has_answered := false
 	for entry in ctx.entries {
 		#partial switch payload in entry.payload {
 		case session.Assistant_Entry:
-			if payload.text == "second try" { answers += 1 }
+			if payload.text == "second try" {
+				answers += 1
+				answered, has_answered = entry.request_no.?
+			}
 		}
 	}
 	testing.expect_value(t, answers, 1)
+	if !testing.expect(t, has_answered, "the answer names the send that produced it") { return }
+
+	// The chain is in the store rather than in the reader's head: the send that
+	// answered names the send that failed, and each of them says what it was.
+	second, second_err := session.request_load(chat.store, chat.id, answered, chat.allocator)
+	if !testing.expect_value(t, second_err, nil) { return }
+	defer session.request_destroy(&second, chat.allocator)
+	testing.expect_value(t, second.outcome, session.Outcome.Completed)
+	attempt, recovery, previous := attempt_record(t, second.input_json)
+	testing.expect_value(t, attempt, i64(2))
+	testing.expect_value(t, recovery, "transient_retry")
+	first_number, has_previous := previous.?
+	if !testing.expect(t, has_previous, "the second send names the first") { return }
+
+	first, first_err := session.request_load(chat.store, chat.id, session.Request_No(first_number), chat.allocator)
+	if !testing.expect_value(t, first_err, nil) { return }
+	defer session.request_destroy(&first, chat.allocator)
+	// The abandoned send keeps its own numbers, and it says how it ended rather than
+	// being left running.
+	testing.expect_value(t, first.outcome, session.Outcome.Failed)
+	testing.expect(t, first.finished_at_ms != nil, "the abandoned send was finished")
+	testing.expect(t, first.error_json != "", "the abandoned send says why it failed")
+	first_attempt, first_recovery, first_previous := attempt_record(t, first.input_json)
+	testing.expect_value(t, first_attempt, i64(1))
+	testing.expect_value(t, first_recovery, "initial")
+	testing.expect(t, first_previous == nil, "the first send of a chain names no predecessor")
+}
+
+// attempt_record reads the chain fields one request row's input record carries.
+attempt_record :: proc(t: ^testing.T, input_json: string) -> (attempt: i64, recovery: string, previous: Maybe(i64)) {
+	value, parse_err := json.parse_string(input_json, .JSON, true, context.temp_allocator)
+	if parse_err != nil { testing.fail_now(t, "the input record is not valid JSON") }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, is_object := value.(json.Object)
+	if !testing.expect(t, is_object, "the input record is an object") { return }
+	if number, is_integer := object["attempt_number"].(json.Integer); is_integer { attempt = i64(number) }
+	if kind, is_string := object["recovery_kind"].(json.String); is_string { recovery = string(kind) }
+	if number, is_integer := object["previous_request_no"].(json.Integer); is_integer { previous = i64(number) }
+	return
 }
 
 // One request, one send, one answer: the scripted provider replies, the harness
