@@ -504,13 +504,13 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 		rline, err := requestline_parse(token, context.temp_allocator)
 		switch err {
 		case .Method_Not_Implemented:
-			log.infof("request-line %q invalid method", token)
+			log.info("a request line named a method this server does not implement")
 			headers_set_close(&l.res.headers)
 			l.res.status = .Not_Implemented
 			respond(&l.res)
 			return
 		case .Invalid_Version_Format, .Not_Enough_Fields:
-			log.warnf("request-line %q invalid: %s", token, err)
+			log.warnf("a request line is invalid: %s", err)
 			clean_request_loop(l.conn, close = true)
 			return
 		case .None:
@@ -548,7 +548,7 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 		}
 
 		if _, ok := header_parse(&l.req.headers, token); !ok {
-			log.warnf("header-line %s is invalid", token)
+			log.warn("a header line is invalid")
 			headers_set_close(&l.res.headers)
 			l.res.status = .Bad_Request
 			respond(&l.res)

@@ -169,7 +169,10 @@ router_handler :: proc(router: ^Router) -> Handler {
 			return
 		}
 
-		log.infof("no route matched %s %s", method_string(rline.method), rline.target)
+		// The method is a structural fact. The target is peer-supplied text that a
+		// persistent log has no business carrying, and a handler can record it
+		// itself when it decides that is safe.
+		log.infof("no route matched %s", method_string(rline.method))
 		res.status = .Not_Found
 		respond(res)
 	}

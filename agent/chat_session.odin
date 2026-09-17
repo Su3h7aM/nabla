@@ -309,7 +309,9 @@ chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: sess
 		chat.last_error = strings.concatenate({what, ": ", detail}, chat.allocator)
 	}
 	// The record names the local step that failed, the store's classification, and
-	// the store's own message, which is local text rather than anything a peer sent.
+	// how much detail the store gave. The text itself stays out: a storage failure
+	// is a local exception, and one can name a path or a row. The full message is
+	// what the front-end shows, which is outside the persisted stream.
 	// The failure can be reached from any depth, so the binding is narrowed here to
 	// the session the failure belongs to.
 	binding: Log_Binding
@@ -317,7 +319,7 @@ chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: sess
 	fields := [3]Log_Field {
 		{key = "operation", value = what},
 		{key = "error_kind", value = log_error_kind_name(session.error_kind(local))},
-		{key = "detail", value = detail},
+		{key = "detail_bytes", value = i64(len(detail))},
 	}
 	log_emit({level = .Error, category = .Storage, event = "storage.failed", fields = fields[:]})
 	chat.active_failed = true

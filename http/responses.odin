@@ -47,13 +47,16 @@ respond_file :: proc(r: ^Response, path: string, content_type: Maybe(Mime_Type) 
 
 	nbio.open_poly(path, r, on_open)
 
+	// These record the operation and the file error, never the path. The caller
+	// chose the path and is the one that can decide whether naming it is safe, so a
+	// path never reaches a log a different process may persist.
 	on_open :: proc(op: ^nbio.Operation, r: ^Response) {
 		#partial switch op.open.err {
 		case .Not_Found:
-			log.debugf("respond_file, open %q, no such file or directory", op.open.path)
+			log.debug("a file response has no such file")
 			respond_with_status(r, .Not_Found)
 		case:
-			log.warnf("respond_file, open %q error: %i", op.open.path, op.open.err)
+			log.warnf("a file response could not open its file: %i", op.open.err)
 			respond_with_status(r, .Not_Found)
 		case nil:
 			nbio.stat_poly2(op.open.handle, op.open.path, r, on_stat)
@@ -63,7 +66,7 @@ respond_file :: proc(r: ^Response, path: string, content_type: Maybe(Mime_Type) 
 	on_stat :: proc(op: ^nbio.Operation, path: string, r: ^Response) {
 		#partial switch op.stat.err {
 		case:
-			log.errorf("respond_file, could not stat %q: %v", path, op.stat.err)
+			log.errorf("a file response could not stat its file: %v", op.stat.err)
 			nbio.close(op.stat.handle)
 			respond_with_status(r, .Not_Found)
 		case nil:
@@ -82,7 +85,7 @@ respond_file :: proc(r: ^Response, path: string, content_type: Maybe(Mime_Type) 
 		nbio.close(op.read.handle)
 		#partial switch op.read.err {
 		case:
-			log.errorf("respond_file, could not read %q: %v", path, op.read.err)
+			log.errorf("a file response could not read its file: %v", op.read.err)
 			respond_with_status(r, .Internal_Server_Error)
 		case nil:
 			_dynamic_add_len(&r._buf.buf, op.read.read)

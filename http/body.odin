@@ -215,7 +215,7 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 
 		size64, ok := strconv.parse_i64_of_base(string(size_line), 16)
 		if !ok {
-			log.infof("Encountered an invalid chunk size when decoding a chunked body: %q", string(size_line))
+			log.info("a chunked body declared an invalid chunk size")
 			s.cb(s.user_data, "", .Bad_Read_Count)
 			return
 		}
@@ -292,14 +292,14 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 
 		key, ok := header_parse(&s.req.headers, string(line))
 		if !ok {
-			log.infof("Invalid header when decoding chunked body: %q", string(line))
+			log.info("a chunked body carried an invalid header")
 			s.cb(s.user_data, "", .Unknown)
 			return
 		}
 
 		// A recipient MUST ignore (or consider as an error) any fields that are forbidden to be sent in a trailer.
 		if !header_allowed_trailer(key) {
-			log.infof("Invalid trailer header received, discarding it: %q", key)
+			log.info("a chunked body carried a trailer header this server discards")
 			headers_delete(&s.req.headers, key)
 		}
 
