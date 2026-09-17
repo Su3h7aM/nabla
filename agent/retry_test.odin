@@ -26,7 +26,7 @@ test_recovery_decision_follows_the_failure_class :: proc(t: ^testing.T) {
 		{"connection lost", .Transport, .Provider_Unavailable, .Retry, .Transient_Failure},
 		{"credentials", .HTTP, .Authentication, .Stop, .Terminal_Failure},
 		{"quota", .HTTP, .Quota, .Stop, .Terminal_Failure},
-		{"context overflow", .HTTP, .Context_Overflow, .Stop, .Context_Exhausted},
+		{"context overflow", .HTTP, .Context_Overflow, .Repair_Context, .Context_Exhausted},
 		{"payload too large", .HTTP, .Payload_Too_Large, .Stop, .Terminal_Failure},
 		{"invalid request", .HTTP, .Invalid_Request, .Stop, .Terminal_Failure},
 		{"content policy", .HTTP, .Content_Policy, .Stop, .Terminal_Failure},
@@ -64,6 +64,10 @@ test_recovery_decision_stops_for_its_own_facts :: proc(t: ^testing.T) {
 		{"a completion was accepted", {attempts = 1, error = transient, completion_accepted = true}, .Stop, .Output_Exposed},
 		{"last send allowed", {attempts = policy.max_attempts, error = transient}, .Stop, .Attempts_Exhausted},
 		{"operation finished", {attempts = 1, error = {kind = .None}}, .Stop, .Completed},
+		// The one repair is the chain's whole allowance: a second refusal is terminal,
+		// and so is one that arrives when the chain has no send left.
+		{"overflow repaired once", {attempts = 2, error = {kind = .HTTP, failure_class = .Context_Overflow}, repaired = true}, .Stop, .Context_Exhausted},
+		{"overflow on the last send", {attempts = policy.max_attempts, error = {kind = .HTTP, failure_class = .Context_Overflow}}, .Stop, .Attempts_Exhausted},
 	}
 	for c in cases {
 		decision := chat_recovery_decide(policy, c.facts, 0.5)

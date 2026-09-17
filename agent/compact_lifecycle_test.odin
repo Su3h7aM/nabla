@@ -464,3 +464,129 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(t: ^testing.
 	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
 	testing.expect(t, !has_checkpoint)
 }
+
+// A provider that rejects the payload as too large is answered with a rebuilt request: the
+// harness installs the summary it already has, sends the request built against it, and the
+// refused payload is never sent again.
+@(test)
+test_a_rejected_payload_is_repaired_from_a_ready_summary :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 500_000)
+	_test_accept(t, chat, "first")
+	// Enough context that the next request crosses the compaction trigger, and more entries
+	// than the kept tail, so there is a prefix to summarize.
+	large := strings.repeat("work ", 320_000) or_else ""
+	defer delete(large)
+	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.User_Entry{text = large, origin = .Prompt}})
+	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
+		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_100, payload = session.Assistant_Entry{text = text}})
+	}
+
+	overflow := `{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens"}}`
+	responses := []string{agent_provider_reply(COMPACT_TEST_SUMMARY), agent_provider_refusal("400 Bad Request", overflow), agent_provider_reply("repaired")}
+	provider: Agent_Provider
+	if !agent_provider_start(t, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	// Pressure starts the summary, so it waits for the context to reach the size it was
+	// started for instead of installing at the next boundary. It is ready, and not yet
+	// installed, when the provider refuses the payload it does not fit.
+	prep, prep_err := chat_prepare(chat, connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	chat_compact_consider(chat, {}, connection, &prep)
+	chat_request_prep_destroy(&prep, chat.allocator)
+	testing.expect_value(t, chat.compact.trigger, Compact_Trigger.Pressure)
+	if !compact_await_state(t, chat, .Ready) { return }
+
+	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), {}), "the repaired turn completed")
+
+	// Three sends: the summary, the payload the provider refused, and the request rebuilt
+	// from the checkpoint. The refused payload is never sent again, and what replaces it is
+	// smaller.
+	if !testing.expect_value(t, len(provider.requests), 3) { return }
+	testing.expect(t, provider.requests[2] != provider.requests[1], "the repaired request is a new payload")
+	testing.expect(t, len(provider.requests[2]) < len(provider.requests[1]), "the repaired request is smaller")
+
+	ctx := _test_context(t, chat)
+	defer session.context_destroy(&ctx, context.allocator)
+	testing.expect(t, ctx.summary != "", "the checkpoint is installed")
+	answered: session.Request_No
+	has_answered := false
+	for entry in ctx.entries {
+		if answer, is_answer := entry.payload.(session.Assistant_Entry); is_answer && answer.text == "repaired" {
+			answered, has_answered = entry.request_no.?
+		}
+	}
+	if !testing.expect(t, has_answered, "the answer names the send that produced it") { return }
+
+	// The refused send is a row of its own, and the send that replaced it names it.
+	second, second_err := session.request_load(chat.store, chat.id, answered, chat.allocator)
+	if !testing.expect_value(t, second_err, nil) { return }
+	defer session.request_destroy(&second, chat.allocator)
+	testing.expect_value(t, second.outcome, session.Outcome.Completed)
+	attempt, recovery, previous := attempt_record(t, second.input_json)
+	testing.expect_value(t, attempt, i64(2))
+	testing.expect_value(t, recovery, "checkpoint_repair")
+	first_number, has_previous := previous.?
+	if !testing.expect(t, has_previous, "the repaired send names the refused one") { return }
+
+	first, first_err := session.request_load(chat.store, chat.id, session.Request_No(first_number), chat.allocator)
+	if !testing.expect_value(t, first_err, nil) { return }
+	defer session.request_destroy(&first, chat.allocator)
+	testing.expect_value(t, first.outcome, session.Outcome.Failed)
+	evidence := error_record(t, first.error_json)
+	testing.expect_value(t, evidence.failure_class, "context_overflow")
+	testing.expect_value(t, evidence.recovery, "context_exhausted")
+}
+
+// A provider that rejects the payload with nothing to install ends the turn as context
+// exhaustion, names the cause, and never sends the refused payload again.
+@(test)
+test_a_rejected_payload_with_nothing_to_install_ends_the_turn :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 500_000)
+	_test_accept(t, chat, "first")
+	large := strings.repeat("work ", 320_000) or_else ""
+	defer delete(large)
+	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.User_Entry{text = large, origin = .Prompt}})
+
+	overflow := `{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens"}}`
+	responses := []string{agent_provider_refusal("400 Bad Request", overflow)}
+	provider: Agent_Provider
+	if !agent_provider_start(t, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	testing.expect(t, !chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn ends without a repair")
+	// The refused payload is never sent again: there is nothing to send it with.
+	testing.expect_value(t, len(provider.requests), 1)
+	testing.expect_value(t, chat_session_repair_refusal(chat), Chat_Repair_Refusal.No_Candidate)
+	testing.expect_value(t, chat_session_terminal_status(chat), Chat_Terminal_Status.Failed)
+
+	ctx := _test_context(t, chat)
+	defer session.context_destroy(&ctx, context.allocator)
+	testing.expect_value(t, ctx.summary, "")
+	request_no := session.Request_No(1)
+	row, row_err := session.request_load(chat.store, chat.id, request_no, chat.allocator)
+	if !testing.expect_value(t, row_err, nil) { return }
+	defer session.request_destroy(&row, chat.allocator)
+	testing.expect_value(t, row.outcome, session.Outcome.Failed)
+	evidence := error_record(t, row.error_json)
+	testing.expect_value(t, evidence.failure_class, "context_overflow")
+	testing.expect_value(t, evidence.recovery, "context_exhausted")
+}

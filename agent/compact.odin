@@ -718,6 +718,96 @@ chat_compact_relieve :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 	return chat_compact_install(chat, observer)
 }
 
+// Chat_Repair_Refusal names why a rejected payload could not be repaired. It is the
+// cause behind a turn that ends as context exhaustion: the input did not fit, and this is
+// what stood in the way of making room for it.
+Chat_Repair_Refusal :: enum {
+	// None is a repair that proceeded: the context changed and the rebuilt request fits.
+	None,
+	// Summary_Running is a summary that has not finished. A repair never waits for one.
+	Summary_Running,
+	// No_Candidate is no summary to install at all.
+	No_Candidate,
+	// No_Reduction is a candidate that does not free enough to admit the rebuilt request.
+	No_Reduction,
+	// Repair_Rejected is a candidate the store refused, or a request that could not be
+	// rebuilt or encoded. Nothing was installed.
+	Repair_Rejected,
+}
+
+// chat_repair_refusal_text says why a repair did not happen, in words a person reads.
+chat_repair_refusal_text :: proc(refusal: Chat_Repair_Refusal) -> string {
+	switch refusal {
+	case .None:
+		return "the context was repaired"
+	case .Summary_Running:
+		return "a summary of the earlier conversation is still running"
+	case .No_Candidate:
+		return "no summary of the earlier conversation is ready"
+	case .No_Reduction:
+		return "a summary was installed and the request still does not fit"
+	case .Repair_Rejected:
+		return "the summary could not be installed"
+	}
+	return "the request does not fit"
+}
+
+// chat_repair_context makes room for a request the provider rejected as too large. It
+// polls compaction once, installs a candidate that is ready and valid, rebuilds the
+// request against the installed checkpoint, and re-encodes it. It reports what stood in
+// the way when it could not.
+//
+// It never waits for a summary, never resends the rejected payload, and never installs a
+// candidate the store refuses. The caller owns prep and encoded either way: on success
+// they describe the payload the next attempt sends, and the chain's bound does not reset
+// because that payload changed.
+@(private)
+chat_repair_context :: proc(
+	chat: ^Chat_Session,
+	connection: ai.Provider_Connection,
+	observer: Chat_Observer,
+	prep: ^Chat_Request_Prep,
+	encoded: ^ai.Provider_Encoded_Request,
+	previous_estimate: int,
+) -> Chat_Repair_Refusal {
+	// A summary may have finished while the rejected request was being sent.
+	chat_compact_poll(chat, observer)
+	switch chat.compact.state {
+	case .Running:
+		return .Summary_Running
+	case .Idle, .Retiring:
+		return .No_Candidate
+	case .Ready:
+	}
+	// The store checks the base, the coverage, and the request the candidate came from, so
+	// a summary computed against a superseded context is refused rather than installed.
+	if !chat_compact_install(chat, observer) { return .Repair_Rejected }
+
+	previous_checkpoint := prep.history.summary_seq
+	if !chat_rebuild_prep(chat, connection, prep) { return .Repair_Rejected }
+	// The request has to be built from a different checkpoint than the one the provider
+	// refused, and it has to be smaller by enough to be worth the cache break.
+	if prep.history.summary_seq == previous_checkpoint { return .No_Reduction }
+	if prep.estimate + CHAT_COMPACT_MIN_REDUCTION_TOKENS > previous_estimate { return .No_Reduction }
+	message, admitted := chat_admission_check(chat, prep.estimate)
+	if !admitted {
+		chat_session_fail_turn(chat, message)
+		return .No_Reduction
+	}
+
+	rebuilt, encode_err := ai.Provider_Request_Freeze(prep.request, chat.allocator)
+	if encode_err.kind != .None {
+		chat_session_fail_turn(chat, encode_err.detail)
+		ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
+		return .Repair_Rejected
+	}
+	// The rejected bytes are released only now, after the operation that sent them has
+	// returned and the payload that replaces them is built.
+	delete(encoded.Body, chat.allocator)
+	encoded^ = rebuilt
+	return .None
+}
+
 // chat_compact_cancel stops a running job and drops a candidate. Compaction
 // belongs to the session rather than to the turn that triggered it, so only an
 // explicit cancellation, a model change, or teardown calls this.

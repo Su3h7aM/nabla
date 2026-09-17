@@ -163,6 +163,12 @@ Chat_Steer_Result :: enum {
 	Storage_Failed,
 }
 
+// chat_session_repair_refusal is why the last turn could not repair a payload the
+// provider rejected as too large, and None when that is not why it ended.
+chat_session_repair_refusal :: proc(chat: ^Chat_Session) -> Chat_Repair_Refusal {
+	return chat.turn_repair_refusal
+}
+
 // chat_session_terminal_status is the status the last turn reached. A caller that has to
 // act on how a turn ended reads it after the turn, because the effect that carried it was
 // consumed by the loop that ran it.

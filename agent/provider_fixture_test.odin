@@ -161,28 +161,30 @@ agent_provider_serve :: proc(thread: ^thread.Thread) {
 
 // agent_provider_read reads one whole request: its head, then the body that head's
 // own Content-Length declares. Reading only what the first receive returned would
-// make the recorded bytes depend on how the kernel split them.
+// make the recorded bytes depend on how the kernel split them, and a body larger than
+// any fixed buffer is still one request, so what is read grows to what the head
+// promised.
 agent_provider_read :: proc(socket: net.TCP_Socket, allocator: mem.Allocator) -> (string, bool) {
 	_ = net.set_option(socket, .Receive_Timeout, AGENT_PROVIDER_BOUND)
+	received := make([dynamic]u8, 0, 16 * 1024, allocator)
+	defer delete(received)
 	scratch: [16 * 1024]u8
-	used := 0
 	head_end := -1
 	body_length := 0
-	for used < len(scratch) {
-		count, recv_err := net.recv_tcp(socket, scratch[used:])
+	for {
+		count, recv_err := net.recv_tcp(socket, scratch[:])
 		if recv_err != nil || count <= 0 { return "", false }
-		used += count
+		append(&received, ..scratch[:count])
 		if head_end < 0 {
-			at := strings.index(string(scratch[:used]), "\r\n\r\n")
+			at := strings.index(string(received[:]), "\r\n\r\n")
 			if at < 0 { continue }
 			head_end = at + 4
-			body_length = agent_provider_content_length(string(scratch[:head_end]))
+			body_length = agent_provider_content_length(string(received[:head_end]))
 			if body_length < 0 { return "", false }
 		}
-		if used >= head_end + body_length { break }
+		if len(received) >= head_end + body_length { break }
 	}
-	if head_end < 0 { return "", false }
-	return strings.clone(string(scratch[:head_end + body_length]), allocator), true
+	return strings.clone(string(received[:head_end + body_length]), allocator), true
 }
 
 // agent_provider_content_length reads the declared body length, or -1 when the head

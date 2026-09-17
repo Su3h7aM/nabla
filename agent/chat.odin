@@ -262,6 +262,12 @@ chat_perform_request :: proc(
 	request_no: session.Request_No
 	// The send before this one, which is how each row names its chain.
 	previous: Maybe(session.Request_No)
+	// recovery_kind is what the next send is: a retry of the same bytes, or a request
+	// rebuilt from a checkpoint this chain installed.
+	recovery_kind := Chat_Recovery_Kind.Transient_Retry
+	// repaired records that this chain has used its one context repair. It never resets,
+	// because the bound belongs to the chain rather than to the payload it sends.
+	repaired := false
 	// settled records that the send which ended the chain was already finished for its
 	// own failure, before a retry was waited on. Such a row is not finished twice.
 	settled := false
@@ -288,7 +294,7 @@ chat_perform_request :: proc(
 		// request that never finishes still says what it was about to carry.
 		attempt := Chat_Attempt {
 			number   = attempts,
-			recovery = previous == nil ? .Initial : .Transient_Retry,
+			recovery = previous == nil ? .Initial : recovery_kind,
 			previous = previous,
 		}
 		begin_no, begin_err := session.request_begin(
@@ -316,12 +322,18 @@ chat_perform_request :: proc(
 
 		recorded := [1]Log_Field{{key = "purpose", value = session.request_purpose_name(.Response)}}
 		log_emit({level = .Info, category = .Storage, event = "request.recorded", fields = recorded[:]})
-		// A send after the first is a retry, and the correlation above is the attempt it
-		// starts, so a reader learns the chain resumed without diffing attempt numbers.
-		if attempts > 1 { log_emit({level = .Info, category = .Provider, event = "request.retry_started"}) }
+		// A send that repeats the same bytes after a failure is a retry, and the correlation
+		// above is the attempt it starts, so a reader learns the chain resumed without
+		// diffing attempt numbers. A repaired send is a new payload, and it says so itself.
+		if attempts > 1 && recovery_kind == .Transient_Retry {
+			log_emit({level = .Info, category = .Provider, event = "request.retry_started"})
+		}
 		// The input size is settled and this send has not gone out yet, so this is where a
 		// front-end learns what the context now holds, and how a front-end that was showing
 		// a scheduled retry clears it: the send it waited for is about to happen.
+		// A repaired attempt sends a rebuilt payload, so the estimate a front-end shows is
+		// the one this send carries rather than the one the refused send carried.
+		chat.last_estimate = prep.estimate
 		_observer_request_prepared(observer)
 		// The runtime belongs to one attempt: a retry that produces nothing must not
 		// inherit the finish reason of the attempt before it, nor the record that the
@@ -400,6 +412,7 @@ chat_perform_request :: proc(
 				attempts = attempts,
 				error = operation_error,
 				failed = chat.active_failed && operation_error.kind == .None,
+				repaired = repaired,
 				storage_failed = chat_session_storage_failed(chat),
 				text_exposed = text_exposed,
 				completion_accepted = completion_accepted,
@@ -407,7 +420,7 @@ chat_perform_request :: proc(
 			},
 			chat_retry_fraction(),
 		)
-		if decision.action != .Retry { break }
+		if decision.action == .Stop { break }
 		// The row is finished before anything is waited on or sent again: how the send
 		// failed, and what the harness decided to do about it, are in the store before the
 		// decision is acted on, with the numbers and the usage of the send that produced
@@ -427,6 +440,34 @@ chat_perform_request :: proc(
 			usages,
 		)
 		settled = true
+
+		if decision.action == .Repair_Context {
+			// The payload the provider refused is never resent. A repair installs a summary
+			// the harness already has, rebuilds the request against it, and the next attempt
+			// of this same chain sends that instead, with no wait and no reset of the bound.
+			previous_estimate := prep.estimate
+			refusal := chat_repair_context(chat, connection, observer, &prep, &encoded, previous_estimate)
+			if refusal != .None {
+				chat.turn_repair_refusal = refusal
+				chat_session_fail_turn(chat, fmt.tprintf("the request does not fit the context: %s", chat_repair_refusal_text(refusal)))
+				break
+			}
+			repaired = true
+			recovery_kind = .Checkpoint_Repair
+			covered_seq := i64(0)
+			if seq, present := prep.history.covered_seq.?; present { covered_seq = i64(seq) }
+			repaired_fields := [4]Log_Field {
+				{key = "covered_seq", value = covered_seq},
+				{key = "estimate_before", value = i64(previous_estimate)},
+				{key = "estimate_after", value = i64(prep.estimate)},
+				{key = "next_attempt", value = i64(attempts + 1)},
+			}
+			log_emit({level = .Info, category = .Provider, event = "request.context_repaired", fields = repaired_fields[:]})
+			chat_session_clear_attempt(chat)
+			ai.Provider_Operation_Error_Destroy(&operation_error, chat.allocator)
+			continue
+		}
+
 		// The row is in the store before the front-end is told, so a front-end that reads
 		// the failure it is told about finds it.
 		_observer_retry_scheduled(

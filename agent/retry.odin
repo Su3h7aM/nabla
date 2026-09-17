@@ -62,6 +62,9 @@ chat_retry_policy_default :: proc() -> Chat_Retry_Policy {
 Request_Recovery_Action :: enum {
 	Stop,
 	Retry,
+	// Repair_Context makes room for a rebuilt request. The provider refused the payload
+	// itself as too large, so sending it again is pointless and waiting changes nothing.
+	Repair_Context,
 }
 
 // Request_Recovery_Reason names why the chain stopped or waited. A stop is always
@@ -84,7 +87,8 @@ Request_Recovery_Reason :: enum {
 	// stops and keeps what was published as partial.
 	Output_Exposed,
 	// Context_Exhausted is a provider-confirmed refusal because the input does not fit.
-	// Ordinary backoff cannot make it fit.
+	// Ordinary backoff cannot make it fit, so the chain either repairs the context once
+	// or the turn ends here with the cause of the refusal.
 	Context_Exhausted,
 	// Terminal_Failure is a failure class, or a provider directive, that says sending the
 	// same request again cannot help.
@@ -137,6 +141,10 @@ Chat_Attempt_Facts :: struct {
 	// failed records that the harness failed this send itself rather than the provider
 	// refusing it, which happens when it rejected the completion or could not record it.
 	failed:              bool,
+	// repaired records that this chain has already used its one context repair. A second
+	// refusal is terminal even when another candidate appears, and the bound does not
+	// reset because the payload changed.
+	repaired:            bool,
 	storage_failed:      bool,
 	text_exposed:        bool,
 	completion_accepted: bool,
@@ -173,7 +181,13 @@ chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Fact
 		return {action = .Stop, reason = .Output_Exposed}
 	}
 	if facts.error.failure_class == .Context_Overflow {
-		return {action = .Stop, reason = .Context_Exhausted}
+		// A rejected payload is never resent. The chain either makes room for a rebuilt
+		// request, once, or the turn ends as context exhaustion.
+		if facts.repaired { return {action = .Stop, reason = .Context_Exhausted} }
+		if facts.attempts >= policy.max_attempts {
+			return {action = .Stop, reason = .Attempts_Exhausted}
+		}
+		return {action = .Repair_Context, reason = .Context_Exhausted}
 	}
 	if facts.error.retry_directive == .Forbid { return {action = .Stop, reason = .Terminal_Failure} }
 	if !chat_failure_transient(facts.error.failure_class) {
