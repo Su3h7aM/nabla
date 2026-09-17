@@ -168,46 +168,60 @@ still adopted and installed.
 
 ## 6. Policy
 
+The model's window is divided once, by `model_capacity` in `agent/capacity.odin`, and the
+result travels with the resolved model as `Model_Capacity`. Admission, the compaction trigger,
+the recorded request, and the status line all read that one value, so two features cannot
+partition the window differently.
+
 ```text
-reserved      = max_output_tokens, or CHAT_DEFAULT_OUTPUT_RESERVE_TOKENS
-usable        = context_window - reserved - CHAT_ADMISSION_MARGIN_TOKENS
-start_at      = 80% of usable
-install_at    = 90% of usable
+output  = min(model maximum, 25% of window, at least 1024)
+margin  = max(10% of window, 1024)
+usable  = window - output - margin
+trigger = usable - reserve
+reserve = min(max(20% of window, 4096), usable / 2)
 ```
 
-A pressure job starts when the request about to be sent reaches `start_at`. A finished summary from
-a pressure job is installed when the previous request's estimate reached `install_at`, or when
-`estimate + CHAT_COMPACT_GROWTH_RESERVE_TOKENS >= usable`. A summary from `context.compact` or
-`/compact` is installed at the first safe boundary after it is ready, because the caller asked for
-a context change rather than for capacity insurance.
+`usable` is the largest input the harness will send, and therefore also the size at which
+admission refuses a request. The output reservation is what the request itself asks the provider
+for, not the model's capability: a provider validates input plus the requested output against
+the window, so reserving the stated maximum whole would starve a small window, and a model whose
+maximum exceeds its own window would leave no room to send anything. The margin covers the
+estimator's error, which is proportional to how dense the content is rather than to the window,
+so it is a share rather than a constant that happens to suit one window size.
+
+`trigger` is one number for two decisions, because both are about the same point. A summary
+starts there, and a finished summary is installed there. Installing sooner would break the cache
+prefix while the old one still had life, and starting later would leave the summary less room to
+finish in. `reserve` is what the foreground may still grow by while a summary runs, capped at
+half of `usable` so a window is never reserved away entirely.
 
 | Constant | Value | Why |
 |---|---|---|
 | `CHAT_COMPACT_KEEP_MESSAGES` | `10` | Entries kept verbatim, extended as needed to keep a call/result run whole |
-| `CHAT_COMPACT_MAX_OUTPUT` | `4096` | Bound on the summary, and part of the window arithmetic for the compaction request |
-| `CHAT_COMPACT_START_PERCENT` | `80` | Start before the window is full, so the request has room |
-| `CHAT_COMPACT_INSTALL_PERCENT` | `90` | Keep the warm prefix for as long as it is useful |
-| `CHAT_COMPACT_GROWTH_RESERVE_TOKENS` | `16 * 1024` | What a ready summary assumes the foreground will append while it waits |
+| `CHAT_OUTPUT_PERCENT` | `25` | Share of the window one request may generate |
+| `CHAT_MARGIN_PERCENT` | `10` | Estimator error allowance |
+| `CHAT_COMPACT_RESERVE_PERCENT` | `20` | Foreground growth the foreground may still make while a summary runs |
+| `CHAT_COMPACT_RESERVE_MIN_TOKENS` | `4096` | Floor on that reserve, so it is worth having on a small window |
 | `CHAT_COMPACT_MIN_REDUCTION_TOKENS` | `1024` | A saving smaller than this is not worth a cache break |
 | `CHAT_COMPACT_RETRY_DELAY_MS` | `5000` | Keeps a failed summarization from being retried at every boundary |
 
-These are engineering defaults, not measurements. The latency budget is covered by starting at 80%,
-which leaves a fifth of the usable window for the foreground to consume while the request runs.
+These are engineering defaults, not measurements.
 
-A summarization request must also fit: `estimate + CHAT_COMPACT_MAX_OUTPUT + margin <=
-context_window`, checked before the request is recorded. A context too large to summarize in one
-request is reported, never silently shortened.
+A summarization request carries the same output bound as any other request, so the capacity that
+reserved room for it is the capacity it spends, and a summary is refused only when the input
+itself does not fit. A context too large to summarize in one request is reported, never silently
+shortened.
 
-A summary is worth keeping only when it frees at least `CHAT_COMPACT_MIN_REDUCTION_TOKENS` of the
-prefix it replaces. That is checked at adoption, before any checkpoint is written.
+A summary is worth keeping only when it frees at least `CHAT_COMPACT_MIN_REDUCTION_TOKENS` of
+the prefix it replaces. That is checked at adoption, before any checkpoint is written.
 
 ### 6.1 What is deliberately approximate
 
-The growth reserve is one constant rather than a measured growth rate. Per-tool result caps bound
-one result, not a batch, so a turn with many large results can still exceed the reserve. Until
-aggregate result admission exists, the reserve is an estimate and the continuity target is
-best-effort. §11 describes what happens when it is exceeded: nothing waits, and the turn fails with
-a message.
+The reserve is a share of the window rather than a measured growth rate. Per-tool result caps
+bound one result, not a batch, so a turn with many large results can still outgrow the reserve
+faster than a summary completes. Until aggregate result admission exists, the reserve is an
+estimate and the continuity target is best-effort. §11 describes what happens when it is
+exceeded: nothing waits, and the turn fails with a message.
 
 ## 7. The summarization request
 

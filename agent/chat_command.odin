@@ -54,14 +54,19 @@ chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms:
 	chat_status_line(observer, "effort", chat.effort if chat.effort != "" else "provider default")
 	chat_status_line(observer, "tools", "shell" if chat.tools_enabled else "none")
 
-	if chat.context_window > 0 {
-		reserved := chat.max_output_tokens
-		if reserved <= 0 { reserved = CHAT_DEFAULT_OUTPUT_RESERVE_TOKENS }
-		usable := chat.context_window - reserved - CHAT_ADMISSION_MARGIN_TOKENS
+	capacity := chat.capacity
+	if capacity.window > 0 {
 		chat_status_line(
 			observer,
 			"context",
-			fmt.tprintf("%d window, %d reserved, %d margin (%d usable)", chat.context_window, reserved, CHAT_ADMISSION_MARGIN_TOKENS, usable),
+			fmt.tprintf(
+				"%d window, %d reserved for output, %d for estimator error (%d usable, compaction at %d)",
+				capacity.window,
+				capacity.output,
+				capacity.margin,
+				capacity.usable,
+				chat_compact_trigger(chat),
+			),
 		)
 	} else {
 		chat_status_line(observer, "context", "not configured for this model")

@@ -23,6 +23,15 @@ import "nabla:tui/widgets"
 // they are driven here without a terminal: a store, a running session, and the
 // snapshot they append to.
 
+// app_session_capacity gives a session the budget a resolved model with this window
+// and output bound would carry, so a fixture never states the window arithmetic
+// itself.
+app_session_capacity :: proc(app: ^App, window: int, output := 0) {
+	app.setup.session.capacity = agent.model_capacity(
+		agent.Catalog_Model{context_window_present = true, context_window = window, max_output_tokens_present = output > 0, max_output_tokens = output},
+	)
+}
+
 app_session_begin :: proc(t: ^testing.T, app: ^App) -> string {
 	directory, directory_err := os.make_directory_temp("", "nabla-app-test-*", context.allocator)
 	if directory_err != nil { testing.fail_now(t, "could not create a temporary directory") }
@@ -327,36 +336,33 @@ app_workspace_make :: proc(t: ^testing.T) -> string {
 
 // app_test_catalog is the smallest catalog apply_selection can resolve: one
 // usable provider with a literal credential, and one model that states its
-// window and supports tools.
+// window and supports tools. It goes through resolve_catalog rather than filling
+// the resolved lists directly, so a fixture cannot diverge from what resolution
+// derives from its sources.
 app_test_catalog :: proc(allocator: mem.Allocator) -> agent.Catalog {
-	catalog := agent.Catalog {
-		allocator = allocator,
-	}
-	append(
-		&catalog.providers,
-		agent.Catalog_Provider {
-			id = strings.clone("test-provider", allocator),
-			base_url = strings.clone("http://127.0.0.1:1", allocator),
+	sources := []agent.Catalog_Provider_Source {
+		{
+			id = "test-provider",
 			base_url_present = true,
-			api = strings.clone("openai_chat_completions", allocator),
+			base_url = "http://127.0.0.1:1",
 			api_present = true,
-			api_key = strings.clone("test-key", allocator),
+			api = "openai_chat_completions",
 			api_key_present = true,
+			api_key = "test-key",
+			models = []agent.Catalog_Model_Source {
+				{
+					id = "test-model",
+					context_window_present = true,
+					context_window = 128_000,
+					max_output_tokens_present = true,
+					max_output_tokens = 4_096,
+					tools_present = true,
+					tools = true,
+				},
+			},
 		},
-	)
-	append(
-		&catalog.models,
-		agent.Catalog_Model {
-			provider_id = strings.clone("test-provider", allocator),
-			id = strings.clone("test-model", allocator),
-			context_window = 128_000,
-			context_window_present = true,
-			max_output_tokens = 4_096,
-			max_output_tokens_present = true,
-			tools = true,
-			tools_present = true,
-		},
-	)
+	}
+	catalog, _ := agent.resolve_catalog(sources, {}, {}, allocator)
 	return catalog
 }
 
@@ -630,7 +636,7 @@ test_a_switch_applies_the_model_the_session_recorded :: proc(t: ^testing.T) {
 	testing.expect(t, session_switch(&app, id))
 	testing.expect_value(t, app.setup.session.provider_id, "test-provider")
 	testing.expect_value(t, app.setup.session.model_id, "test-model")
-	testing.expect_value(t, app.setup.session.context_window, 128_000)
+	testing.expect_value(t, app.setup.session.capacity.window, 128_000)
 	testing.expect(t, app.setup.session.tools_enabled, "the model states that it supports tools")
 	// The connection follows the selection, or the next request would go to the
 	// model that was running before the switch.
@@ -834,7 +840,7 @@ test_a_headless_turn_answers_against_an_endpoint :: proc(t: ^testing.T) {
 	// test is about the turn rather than about choosing a model.
 	app.setup.session.provider_id = strings.clone("test-provider", app.setup.session.allocator)
 	app.setup.session.model_id = strings.clone("test-model", app.setup.session.allocator)
-	app.setup.session.context_window = 128_000
+	app_session_capacity(&app, 128_000)
 	app.run.connection = ai.Provider_Connection {
 		API        = .OpenAI_Chat_Completions,
 		Endpoint   = fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.temp_allocator),
@@ -923,9 +929,7 @@ test_a_headless_turn_answers_against_an_anthropic_endpoint :: proc(t: ^testing.T
 	defer app_session_end(&app, directory)
 	app.setup.session.provider_id = strings.clone("anthropic", app.setup.session.allocator)
 	app.setup.session.model_id = strings.clone("claude-sonnet-5", app.setup.session.allocator)
-	app.setup.session.context_window = 200_000
-	// The Messages API has no default output bound, so the session states one.
-	app.setup.session.max_output_tokens = 1024
+	app_session_capacity(&app, 200_000, 1024)
 	app.run.connection = ai.Provider_Connection {
 		API        = .Anthropic_Messages,
 		Endpoint   = fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.temp_allocator),

@@ -24,21 +24,6 @@ import "nabla:ai"
 // is never malformed and can be longer than this.
 CHAT_COMPACT_KEEP_MESSAGES :: 10
 
-// CHAT_COMPACT_MAX_OUTPUT bounds the summary itself. It is also part of the window
-// arithmetic below: a summarization request must fit its own input plus this bound.
-CHAT_COMPACT_MAX_OUTPUT :: 4096
-
-// CHAT_COMPACT_START_PERCENT and CHAT_COMPACT_INSTALL_PERCENT are fractions of the
-// input the window can admit. Compaction starts well before the window is full so
-// the request has room to finish, and a finished summary waits until the old
-// context is nearly full so the warm prefix is used for as long as it is useful.
-CHAT_COMPACT_START_PERCENT :: 80
-CHAT_COMPACT_INSTALL_PERCENT :: 90
-
-// CHAT_COMPACT_GROWTH_RESERVE_TOKENS is what a ready summary assumes the
-// foreground will append while it waits to be installed.
-CHAT_COMPACT_GROWTH_RESERVE_TOKENS :: 16 * 1024
-
 // CHAT_COMPACT_MIN_REDUCTION_TOKENS is the smallest saving worth a cache break and
 // a summarization request.
 CHAT_COMPACT_MIN_REDUCTION_TOKENS :: 1024
@@ -85,20 +70,30 @@ chat_checkpoint_text :: proc(summary: string, allocator: mem.Allocator) -> strin
 
 // --- pressure ----------------------------------------------------------------
 
-// chat_usable_input is the input size the window can admit: the window less the
-// output bound a request reserves and the admission margin.
-chat_usable_input :: proc(chat: ^Chat_Session) -> int {
-	reserved := chat.max_output_tokens
-	if reserved <= 0 { reserved = CHAT_DEFAULT_OUTPUT_RESERVE_TOKENS }
-	return max(chat.context_window - reserved - CHAT_ADMISSION_MARGIN_TOKENS, 0)
+// CHAT_COMPACT_RESERVE_PERCENT is the share of the window the foreground may still
+// grow by after a summary starts. It is what the summary has to finish inside, so a
+// larger share buys more time and a smaller one leaves more of the window usable.
+// The cap at half of what the window admits keeps a window from being reserved away
+// entirely.
+CHAT_COMPACT_RESERVE_PERCENT :: 20
+CHAT_COMPACT_RESERVE_MIN_TOKENS :: 4096
+
+// chat_compact_reserve is how much the foreground may still grow by after a summary
+// starts. A share of the window means a small model does not give up proportionally
+// more than a large one, the floor keeps the share worth having, and the cap keeps a
+// window from being reserved away entirely.
+chat_compact_reserve :: proc(capacity: Model_Capacity) -> int {
+	reserve := max(capacity.window * CHAT_COMPACT_RESERVE_PERCENT / 100, CHAT_COMPACT_RESERVE_MIN_TOKENS)
+	return min(reserve, capacity.usable / 2)
 }
 
-// chat_compact_thresholds are the input sizes at which compaction starts and at
-// which a finished summary is installed. Both scale with the window, so a small
-// model reserves proportionally less.
-chat_compact_thresholds :: proc(chat: ^Chat_Session) -> (start_at, install_at: int) {
-	usable := chat_usable_input(chat)
-	return usable * CHAT_COMPACT_START_PERCENT / 100, usable * CHAT_COMPACT_INSTALL_PERCENT / 100
+// chat_compact_trigger is the input size at which a summary starts, and at which a
+// finished summary is installed. One threshold serves both, because both decisions
+// are about the same point: the context has reached the size where it needs the
+// summary. Installing before it would break the cache prefix for no gain, and
+// starting after it would leave the summary less room to finish in.
+chat_compact_trigger :: proc(chat: ^Chat_Session) -> int {
+	return chat.capacity.usable - chat_compact_reserve(chat.capacity)
 }
 
 // chat_compact_seam finds where the kept tail starts so the newest entries stay
@@ -200,7 +195,8 @@ Compact_Trigger :: enum {
 
 // compact_trigger_explicit reports whether a trigger asks for a context change
 // rather than for capacity insurance. An explicit request installs as soon as a
-// summary is ready; a pressure one waits until the old context is nearly full.
+// summary is ready; a pressure one waits until the context reaches the size the
+// summary was started for.
 compact_trigger_explicit :: proc(trigger: Compact_Trigger) -> bool {
 	return trigger == .Agent_Tool || trigger == .User_Command
 }
@@ -424,7 +420,7 @@ chat_compact_start :: proc(
 	control.pending = .None
 	control.pending_source_seq = nil
 
-	if chat.context_window <= 0 || chat_usable_input(chat) <= 0 {
+	if chat.capacity.window <= 0 || chat.capacity.usable <= 0 {
 		_observer_message(observer, .Error, "compaction needs a configured context window")
 		return false
 	}
@@ -437,8 +433,9 @@ chat_compact_start :: proc(
 	chat_build_request_into(chat, &compact_prep, entries[:seam], prep.history.dispatches, prep.history.summary, connection, CHAT_COMPACT_DIRECTIVE)
 	defer chat_request_prep_destroy(&compact_prep, chat.allocator)
 
-	// The summarization request has to fit together with the bound on its own output.
-	if compact_prep.estimate + CHAT_COMPACT_MAX_OUTPUT + CHAT_ADMISSION_MARGIN_TOKENS > chat.context_window {
+	// A summary is only useful if the request that asks for it can be sent. It carries
+	// the same output bound as any other request, so the same capacity decides it.
+	if !model_capacity_admits(chat.capacity, compact_prep.estimate) {
 		_observer_message(observer, .Warning, "the active context is too large to compact in one request; start a fresh session for a new topic")
 		return false
 	}
@@ -453,7 +450,7 @@ chat_compact_start :: proc(
 			provider = chat.provider_id,
 			model_requested = chat.model_id,
 			api = chat_api_name(connection.API),
-			config_json = chat_request_config_json(chat, true),
+			config_json = chat_request_config_json(chat),
 			input_json = chat_request_input_json(&compact_prep, &prep.history, chat.skill_snapshot_seq, seam),
 		},
 		at_ms,
@@ -508,7 +505,7 @@ chat_compact_start :: proc(
 		{key = "base_seq", value = log_optional_i64(snapshot.base_seq)},
 		{key = "source_seq", value = log_optional_i64(source_seq)},
 		{key = "estimate", value = i64(compact_prep.estimate)},
-		{key = "context_window", value = i64(chat.context_window)},
+		{key = "context_window", value = i64(chat.capacity.window)},
 	}
 	// The record names the compaction request, not whichever foreground request
 	// happened to be at the boundary when it started.
@@ -593,7 +590,7 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 		{key = "elapsed_ms", value = log_duration_ms(time.tick_since(job.started_at))},
 	}
 	log_emit({level = .Info, category = .Provider, event = "compaction.finished", fields = fields[:]})
-	_observer_message(observer, .Notice, "compaction finished; the summary is installed when the current context fills up")
+	_observer_message(observer, .Notice, "compaction finished; the summary is installed when the context reaches the size it was started for")
 }
 
 @(private)
@@ -657,14 +654,13 @@ chat_compact_install :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 
 // chat_compact_install_due reports whether a ready candidate should be installed
 // now. An explicit request installs as soon as it is ready; a pressure one waits
-// until the context it is replacing is nearly full.
+// until the context has reached the size it was started for.
 @(private)
 chat_compact_install_due :: proc(chat: ^Chat_Session, estimate: int) -> bool {
 	control := &chat.compact
 	if control.state != .Ready { return false }
 	if compact_trigger_explicit(control.trigger) { return true }
-	_, install_at := chat_compact_thresholds(chat)
-	return estimate >= install_at || estimate + CHAT_COMPACT_GROWTH_RESERVE_TOKENS >= chat_usable_input(chat)
+	return estimate >= chat_compact_trigger(chat)
 }
 
 // chat_compact_start_due reports whether pressure alone calls for a new job. An
@@ -672,9 +668,8 @@ chat_compact_install_due :: proc(chat: ^Chat_Session, estimate: int) -> bool {
 // there is nothing to make room for.
 @(private)
 chat_compact_start_due :: proc(chat: ^Chat_Session, estimate: int) -> bool {
-	usable := chat_usable_input(chat)
-	if usable <= 0 { return false }
-	return estimate >= usable * CHAT_COMPACT_START_PERCENT / 100
+	if chat.capacity.usable <= 0 { return false }
+	return estimate >= chat_compact_trigger(chat)
 }
 
 // chat_compact_service adopts a finished job and installs a candidate that is due.

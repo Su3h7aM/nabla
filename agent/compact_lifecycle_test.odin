@@ -190,7 +190,7 @@ compact_setup_begin :: proc(t: ^testing.T, setup: ^Compact_Setup) -> bool {
 	if !compact_provider_start(t, &setup.background, COMPACT_TEST_BODY, true) { return false }
 	if !compact_provider_start(t, &setup.foreground, FOREGROUND_TEST_BODY, false) { return false }
 	chat := &setup.chat.chat
-	chat.context_window = 500_000
+	chat_test_capacity(chat, 500_000)
 	setup.big_prompt = strings.repeat("context ", 4000) or_else ""
 	if setup.big_prompt == "" { return false }
 	_test_accept(t, chat, setup.big_prompt)
@@ -292,7 +292,7 @@ test_a_failed_compaction_leaves_the_context_alone :: proc(t: ^testing.T) {
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
-	chat.context_window = 500_000
+	chat_test_capacity(chat, 500_000)
 	_test_accept(t, chat, "first")
 	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
 		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.Assistant_Entry{text = text}})
@@ -420,10 +420,9 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(t: ^testing.
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
-	chat.context_window = 500_000
+	chat_test_capacity(chat, 500_000)
 	_test_accept(t, chat, "first")
-	// Enough context that the next request crosses the start threshold but not the
-	// installation threshold, which is the band pressure exists for.
+	// Enough context that the next request crosses the compaction trigger.
 	large := strings.repeat("work ", 320_000) or_else ""
 	defer delete(large)
 	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.User_Entry{text = large, origin = .Prompt}})
@@ -440,9 +439,11 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(t: ^testing.
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
-	start_at, install_at := chat_compact_thresholds(chat)
-	testing.expect(t, prep.estimate >= start_at, "the fixture must cross the start threshold")
-	testing.expect(t, prep.estimate < install_at, "the fixture must stay below the install threshold")
+	// The trigger is where a summary starts, and it has to leave room for the
+	// foreground to keep working, so the fixture stays below what the window admits.
+	trigger := chat_compact_trigger(chat)
+	testing.expect(t, prep.estimate >= trigger, "the fixture must cross the compaction trigger")
+	testing.expect(t, prep.estimate <= chat.capacity.usable, "the fixture must still be sendable")
 
 	chat_compact_consider(chat, {}, dead, &prep)
 	testing.expect_value(t, chat.compact.state, Compact_State.Running)

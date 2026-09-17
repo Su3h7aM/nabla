@@ -130,8 +130,10 @@ Chat_Session :: struct {
 	provider_id:                  string, // owned; the provider requests are addressed to
 	model_id:                     string, // owned; the model requests ask for
 	tools_enabled:                bool, // frozen for the session's life
-	max_output_tokens:            int, // 0 means unset
-	context_window:               int, // 0 means unconfigured
+	// capacity is the resolved model's context budget, copied from the catalog when
+	// the model was selected. It is the only thing that answers how much a request
+	// may send, because it is the only thing that was divided.
+	capacity:                     Model_Capacity,
 	effort_levels:                [dynamic]string, // owned; allowed levels, verbatim
 	effort:                       string, // owned; "" means provider default
 
@@ -155,21 +157,6 @@ Chat_Session :: struct {
 	skill_instructions:           string, // owned; exact normal-request prefix
 	skill_snapshot_seq:           Maybe(session.Seq),
 	disable_project_instructions: bool,
-}
-
-// CHAT_DEFAULT_CONTEXT_WINDOW is the window a session assumes for a model that no
-// enrichment source described. It is a runtime default rather than a metadata
-// source: it applies only after user configuration, provider discovery, and
-// models.dev have all left the window unstated, and it never replaces a stated one.
-CHAT_DEFAULT_CONTEXT_WINDOW :: 128 * 1024
-
-// chat_context_window is the window a session runs with for a resolved model, and
-// whether that window is an assumption rather than a stated fact. Presence decides:
-// a window the catalog carries is used as stated, including an explicit zero, which
-// admission then refuses rather than quietly running with the default.
-chat_context_window :: proc(model: Catalog_Model) -> (window: int, assumed: bool) {
-	if model.context_window_present { return model.context_window, false }
-	return CHAT_DEFAULT_CONTEXT_WINDOW, true
 }
 
 // chat_session_init builds the running state for a claimed session. workspace is

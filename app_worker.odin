@@ -404,7 +404,7 @@ refresh_status :: proc(app: ^App) {
 	// The estimate is the one the agent measured when it built the last request;
 	// the main thread never reads the store, so it cannot compute one itself.
 	status.est_input = running.last_estimate
-	status.context_window = running.context_window
+	status.context_window = running.capacity.window
 	// The footer shows the session's token-weighted hit rate beside the
 	// estimate: the estimate bounds the request being built, the hit rate says
 	// how much of the finished session the provider read from its cache. Both

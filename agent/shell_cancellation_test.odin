@@ -388,7 +388,7 @@ test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
 	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
-	chat.context_window = 500000
+	chat_test_capacity(chat, 500000)
 	_test_accept(t, chat, "hello")
 	first_turn := chat.active_turn_id
 

@@ -4,13 +4,13 @@ import "core:encoding/json"
 
 // context.compact lets the agent ask for a checkpoint at a boundary it chooses.
 // It records the same intent the automatic path and /compact record, and returns
-// immediately: the summary is produced in the background and installed when the
-// context it replaces is nearly full, so nothing the agent is doing is
-// interrupted. A caller that wants the new context now does not get it here.
+// immediately: the summary is produced in the background and installed at the next
+// boundary, so the caller is never interrupted. A caller that wants the shorter
+// context now does not get it here.
 
 TOOL_COMPACT_NAME :: "context.compact"
 
-TOOL_COMPACT_DESCRIPTION :: "Record the conversation up to this point as a checkpoint and continue from a shorter context. The summary is produced in the background, so this returns immediately and the current context keeps working until it is nearly full. Call this when one piece of work is finished and the next is about to start."
+TOOL_COMPACT_DESCRIPTION :: "Record the conversation up to this point as a checkpoint and continue from a shorter context. The summary is produced in the background, so this returns immediately and the current context keeps working until the checkpoint is installed at the next boundary. Call this when one piece of work is finished and the next is about to start."
 
 TOOL_COMPACT_SCHEMA :: `{"type":"object","properties":{},"additionalProperties":false}`
 

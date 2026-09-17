@@ -128,7 +128,7 @@ test_build_request_carries_configured_max_output :: proc(t: ^testing.T) {
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
-	chat.max_output_tokens = 64
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
 	_test_accept(t, chat, "hi")
 
 	prep, prep_err := chat_prepare(chat, tool_loop_connection)
@@ -441,7 +441,7 @@ test_anthropic_request_is_shaped_by_its_adapter :: proc(t: ^testing.T) {
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	chat.max_output_tokens = 1024
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 1024)
 	_test_accept(t, chat, "run printf ok")
 
 	call_seq := _test_append(
@@ -533,7 +533,7 @@ test_error_marker_case :: proc(t: ^testing.T, outcome: session.Tool_Outcome) {
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	chat.max_output_tokens = 1024
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 1024)
 	_test_accept(t, chat, "run it")
 
 	call_seq := _test_append(
@@ -627,7 +627,7 @@ test_a_request_rebuilds_identically_and_only_appends :: proc(t: ^testing.T) {
 		chat_test_begin(t, &fixture, tool_loop_workspace(t))
 		chat := &fixture.chat
 		chat.tools_enabled = true
-		chat.max_output_tokens = 1024
+		chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 1024)
 		_test_accept(t, chat, "run printf ok")
 		call_seq := _test_append(
 			t,

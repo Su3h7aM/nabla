@@ -253,8 +253,7 @@ test_an_admission_decision_is_recorded :: proc(t: ^testing.T) {
 
 	// The window has to hold the estimate plus the reserved output plus the margin,
 	// or nothing is ever admitted.
-	chat.context_window = 20_000
-	chat.max_output_tokens = 0
+	chat_test_capacity(chat, 20_000)
 	message, admitted := chat_admission_check(chat, 10)
 	testing.expect(t, admitted, "a small request fits")
 	testing.expect_value(t, message, "")
@@ -277,7 +276,7 @@ test_starting_a_compaction_records_its_scope :: proc(t: ^testing.T) {
 	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
 	defer log_chat_end(t, &fixture)
 	chat := &fixture.chat.chat
-	chat.context_window = 500_000
+	chat_test_capacity(chat, 500_000)
 	_test_accept(t, chat, "compact me")
 	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
 		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.Assistant_Entry{text = text}})
@@ -355,8 +354,7 @@ test_preparation_never_names_the_previous_request :: proc(t: ^testing.T) {
 	_test_accept(t, chat, "first")
 	// Admission has to accept, or the request would compact instead, and a
 	// compaction is a second provider request this test is not about.
-	chat.context_window = 256_000
-	chat.max_output_tokens = 16_000
+	chat_test_capacity(chat, 256_000, 16_000)
 
 	// A URL this client refuses fails the attempt as an invalid request, which is
 	// not retried. So both requests are recorded without being sent, and the test

@@ -199,7 +199,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		{key = "model", value = chat.model_id},
 		{key = "api", value = chat_api_name(connection.API)},
 		{key = "estimate", value = i64(prep.estimate)},
-		{key = "context_window", value = i64(chat.context_window)},
+		{key = "context_window", value = i64(chat.capacity.window)},
 		{key = "messages", value = i64(len(prep.history.entries))},
 		{key = "tools", value = i64(len(prep.tools))},
 	}
@@ -215,7 +215,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 			provider = chat.provider_id,
 			model_requested = chat.model_id,
 			api = chat_api_name(connection.API),
-			config_json = chat_request_config_json(chat, false),
+			config_json = chat_request_config_json(chat),
 			input_json = chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries)),
 		},
 		at_ms,

@@ -121,6 +121,7 @@ test_a_compaction_request_shares_the_conversation_prefix :: proc(t: ^testing.T) 
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW)
 
 	ctx := session.Context {
 		entries = []session.Entry{compact_user_entry(1, "first")},
@@ -134,7 +135,9 @@ test_a_compaction_request_shares_the_conversation_prefix :: proc(t: ^testing.T) 
 	testing.expect(t, len(prep.request.Tools) > 0, "a compaction request keeps the conversation's tools")
 	testing.expect_value(t, prep.request.Prompt_Cache_Key, string(chat.id))
 	testing.expect(t, prep.request.Max_Output_Tokens_Present)
-	testing.expect_value(t, prep.request.Max_Output_Tokens, CHAT_COMPACT_MAX_OUTPUT)
+	// The summarizer generates the same bound as any other request, so the capacity that
+	// reserved room for it is the capacity it spends.
+	testing.expect_value(t, prep.request.Max_Output_Tokens, chat.capacity.output)
 	// The directive is the last message, after the prefix it asks about.
 	if !testing.expect_value(t, len(prep.request.Messages), 2) { return }
 	testing.expect_value(t, prep.request.Messages[0].Content, "first")

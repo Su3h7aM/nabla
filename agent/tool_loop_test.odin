@@ -96,7 +96,7 @@ test_admission_refuses_without_window_or_budget :: proc(t: ^testing.T) {
 	testing.expect(t, !admitted)
 	testing.expect(t, strings.contains(message, "context_window"))
 
-	chat.context_window = 500000
+	chat_test_capacity(chat, 500000)
 	_, admitted = chat_admission_check(chat, 100)
 	testing.expect(t, admitted)
 
@@ -113,7 +113,7 @@ test_steered_line_is_recorded_before_the_request :: proc(t: ^testing.T) {
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
-	chat.context_window = 500000
+	chat_test_capacity(chat, 500000)
 	_test_accept(t, chat, "hi")
 
 	// Steering is admitted at a request boundary and recorded as a user entry in
@@ -249,7 +249,7 @@ test_malformed_arguments_are_rejected_and_replayed :: proc(t: ^testing.T) {
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	chat.max_output_tokens = 4096
+	chat_test_capacity(chat, chat.capacity.window if chat.capacity.window > 0 else CHAT_DEFAULT_CONTEXT_WINDOW, 4096)
 	_test_accept(t, chat, "malformed call")
 
 	// The provider delivered a call whose argument document never parses. Nothing
@@ -322,7 +322,7 @@ test_a_response_with_an_unparseable_call_is_not_replayed_verbatim :: proc(t: ^te
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	chat.max_output_tokens = 4096
+	chat_test_capacity(chat, chat.capacity.window if chat.capacity.window > 0 else CHAT_DEFAULT_CONTEXT_WINDOW, 4096)
 	_test_accept(t, chat, "native malformed call")
 	effect := _test_begin_request(t, chat)
 	chat_effect_destroy(&effect)
@@ -493,7 +493,7 @@ test_a_recovered_call_reaches_the_model_answered :: proc(t: ^testing.T) {
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	chat.context_window = 200_000
+	chat_test_capacity(chat, 200_000)
 	_test_accept(t, chat, "run it")
 	_test_append(
 		t,

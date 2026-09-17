@@ -19,6 +19,15 @@ Chat_Test :: struct {
 	chat:  Chat_Session,
 }
 
+// chat_test_capacity gives a session the context budget a resolved model with this
+// window and output bound would carry. It goes through model_capacity, so a test
+// states the model it means rather than the window arithmetic.
+chat_test_capacity :: proc(chat: ^Chat_Session, window: int, output := 0) {
+	chat.capacity = model_capacity(
+		Catalog_Model{context_window_present = true, context_window = window, max_output_tokens_present = output > 0, max_output_tokens = output},
+	)
+}
+
 chat_test_begin :: proc(t: ^testing.T, fixture: ^Chat_Test, workspace: string) {
 	directory, directory_err := os.make_directory_temp("", "nabla-agent-test-*", context.allocator)
 	if directory_err != nil { testing.fail_now(t, "could not create a temporary directory") }

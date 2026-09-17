@@ -81,6 +81,9 @@ Catalog_Provider_Source :: struct {
 
 // Catalog_Model is one resolved model. `provider_id` is part of its identity
 // rather than a back-pointer, which keeps the list flat and lookup trivial.
+//
+// `capacity` is derived, not stated: resolution fills it from the merged window and
+// output fields, and everything that needs a context budget reads it from here.
 Catalog_Model :: struct {
 	provider_id:               string,
 	id:                        string,
@@ -90,6 +93,7 @@ Catalog_Model :: struct {
 	context_window_present:    bool,
 	max_output_tokens:         int,
 	max_output_tokens_present: bool,
+	capacity:                  Model_Capacity,
 	input_modalities:          []string,
 	input_modalities_present:  bool,
 	output_modalities:         []string,
@@ -315,6 +319,9 @@ resolve_catalog :: proc(user, provider, models_dev: []Catalog_Provider_Source, a
 	catalog_apply_source(&result, user, user, allocator)
 	catalog_apply_source(&result, provider, user, allocator)
 	catalog_apply_source(&result, models_dev, user, allocator)
+	// The budget is derived after every source has had its say, so it cannot be
+	// computed from a half-merged window.
+	for &model in result.models { model.capacity = model_capacity(model) }
 	return result, .None
 }
 

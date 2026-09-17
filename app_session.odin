@@ -506,11 +506,11 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	// a summary computed for the previous one is no longer a summary of this
 	// conversation. It is stopped here rather than installed against the old base.
 	agent.chat_compact_cancel(running)
-	window, _ := agent.chat_context_window(model^)
-	running.context_window = window
+	// The resolved model carries its own context budget, so the session copies that
+	// rather than a window and an output bound to divide again later.
+	running.capacity = model.capacity
 	running.last_estimate = 0
 	running.last_input_measured_present = false
-	running.max_output_tokens = model.max_output_tokens
 	running.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(api)
 	// The request record names the provider and model each request was sent to,
 	// so the running session carries them.
@@ -609,7 +609,7 @@ selection_publish_locked :: proc(app: ^App, provider_id, model_id: string) {
 	for level in running.effort_levels {
 		append(&status.effort_levels, strings.clone(level, app.run.alloc))
 	}
-	status.context_window = running.context_window
+	status.context_window = running.capacity.window
 	delete(app.run.snap.setup_error, app.run.alloc)
 	app.run.snap.setup_error = ""
 	snap_append_locked(app, .Notice, fmt.tprintf("model set to %s / %s", provider_id, model_id))

@@ -130,19 +130,20 @@ test_enrichment_unknown_model_assumes_the_default_window :: proc(t: ^testing.T) 
 	testing.expect_value(t, len(resolved.providers), 0)
 	testing.expect_value(t, len(resolved.models), 0)
 
-	window, assumed := chat_context_window(Catalog_Model{})
-	testing.expect(t, assumed)
-	testing.expect_value(t, window, CHAT_DEFAULT_CONTEXT_WINDOW)
+	// A model no source described still gets a usable budget, derived from the
+	// assumed window rather than left at zero.
+	assumed := model_capacity(Catalog_Model{})
+	testing.expect_value(t, assumed.window, CHAT_DEFAULT_CONTEXT_WINDOW)
 	testing.expect_value(t, CHAT_DEFAULT_CONTEXT_WINDOW, 128 * 1024)
+	testing.expect(t, assumed.usable > 0)
 
 	// A window a source stated is used as stated, including an explicit zero, which
 	// stays zero and is refused by admission rather than becoming the default.
-	stated_window, stated_assumed := chat_context_window(Catalog_Model{context_window_present = true, context_window = 8192})
-	testing.expect(t, !stated_assumed)
-	testing.expect_value(t, stated_window, 8192)
-	zero_window, zero_assumed := chat_context_window(Catalog_Model{context_window_present = true, context_window = 0})
-	testing.expect(t, !zero_assumed)
-	testing.expect_value(t, zero_window, 0)
+	stated := model_capacity(Catalog_Model{context_window_present = true, context_window = 8192})
+	testing.expect_value(t, stated.window, 8192)
+	zeroed := model_capacity(Catalog_Model{context_window_present = true, context_window = 0})
+	testing.expect_value(t, zeroed.window, 0)
+	testing.expect_value(t, zeroed.usable, 0)
 }
 
 @(test)
@@ -151,9 +152,7 @@ test_enrichment_unknown_model_sends_no_reasoning :: proc(t: ^testing.T) {
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
-	window, assumed := chat_context_window(Catalog_Model{})
-	chat.context_window = window
-	testing.expect(t, assumed)
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW)
 
 	_test_accept(t, chat, "hello")
 	prep, prep_err := chat_prepare(chat, tool_loop_connection)
@@ -182,7 +181,7 @@ test_enrichment_stated_levels_send_the_chosen_effort :: proc(t: ^testing.T) {
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
-	chat.context_window = CHAT_DEFAULT_CONTEXT_WINDOW
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW)
 	testing.expect(t, !chat_session_set_effort(chat, "high"))
 	append(&chat.effort_levels, chat_clone_string("high", chat.allocator))
 	testing.expect(t, chat_session_set_effort(chat, "high"))

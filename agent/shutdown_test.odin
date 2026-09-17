@@ -427,7 +427,7 @@ test_shutdown_during_request_retires_before_session_cleanup :: proc(t: ^testing.
 	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
-	chat.context_window = 500000
+	chat_test_capacity(chat, 500000)
 	_test_accept(t, chat, "block")
 
 	run := Shell_Turn_Run {

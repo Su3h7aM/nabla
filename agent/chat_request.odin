@@ -88,7 +88,6 @@ chat_build_request_into :: proc(
 	connection: ai.Provider_Connection,
 	directive: string,
 ) {
-	compact := directive != ""
 	prep.wire = make([dynamic]ai.Provider_Message, 0, len(entries) + 3, chat.allocator)
 	prep.tools = make([dynamic]ai.Provider_Tool_Def, 0, chat.allocator)
 	prep.tool_names = make([dynamic]string, 0, chat.allocator)
@@ -110,7 +109,7 @@ chat_build_request_into :: proc(
 		append(&prep.wire, ai.Provider_Message{Role = .User, Content = summary})
 	}
 	chat_append_entries(&prep.wire, &prep.calls, &prep.tool_names, &prep.feedback, connection.API, entries, dispatches, chat.allocator)
-	if compact {
+	if directive != "" {
 		append(&prep.wire, ai.Provider_Message{Role = .User, Content = directive})
 	}
 
@@ -151,12 +150,12 @@ chat_build_request_into :: proc(
 	// conversation's prefix.
 	prep.request.Prompt_Cache_Key_Present = true
 	prep.request.Prompt_Cache_Key = string(chat.id)
-	if compact {
+	// Every request carries the model's own output bound, including a summarization
+	// request: the budget that reserved room for it is the budget it spends, so the
+	// two cannot disagree about how much of the window is left for input.
+	if chat.capacity.output > 0 {
 		prep.request.Max_Output_Tokens_Present = true
-		prep.request.Max_Output_Tokens = CHAT_COMPACT_MAX_OUTPUT
-	} else if chat.max_output_tokens > 0 {
-		prep.request.Max_Output_Tokens_Present = true
-		prep.request.Max_Output_Tokens = chat.max_output_tokens
+		prep.request.Max_Output_Tokens = chat.capacity.output
 	}
 	if chat.effort != "" {
 		prep.request.Reasoning_Effort_Present = true
@@ -419,52 +418,50 @@ chat_estimate_input_tokens :: proc(instructions: string, messages: []ai.Provider
 }
 
 // Admission is approximate and says so: character counts divided by four plus
-// a per-message overhead cannot replace endpoint token counting, so the check
-// keeps a safety margin and refuses over-budget requests instead of sending
-// them. Measured usage from the endpoint is evidence, never the estimate.
+// a per-message overhead cannot replace endpoint token counting, so the resolved
+// model's capacity keeps a margin and refuses over-budget requests instead of
+// sending them. Measured usage from the endpoint is evidence, never the estimate.
 CHAT_CHARS_PER_TOKEN :: 4
 CHAT_MESSAGE_OVERHEAD_TOKENS :: 8
-CHAT_ADMISSION_MARGIN_TOKENS :: 8192
-CHAT_DEFAULT_OUTPUT_RESERVE_TOKENS :: 4096
 
-// chat_admission_check enforces input estimate plus reserved generation plus
-// margin against the configured window. The message is temp-allocated; the
-// caller clones it when the turn must record the failure.
+// chat_admission_check enforces the estimate against what the model's capacity
+// admits. The message is temp-allocated; the caller clones it when the turn must
+// record the failure.
 chat_admission_check :: proc(chat: ^Chat_Session, estimate: int) -> (message: string, admitted: bool) {
 	// The decision is recorded even when it admits the request: what the harness
 	// estimated and what it compared that against is the whole reason a request was
 	// refused later.
 	binding: Log_Binding
 	context.logger = log_rebind(&binding, log_correlation(chat))
-	if chat.context_window <= 0 {
+	capacity := chat.capacity
+	if capacity.window <= 0 {
 		fields := [3]Log_Field {
 			{key = "decision", value = "unconfigured"},
 			{key = "estimate", value = i64(estimate)},
-			{key = "context_window", value = i64(chat.context_window)},
+			{key = "context_window", value = i64(capacity.window)},
 		}
 		log_emit({level = .Warning, category = .Provider, event = "request.admission", fields = fields[:]})
 		return "context admission needs context_window: add context_window to the model in config.lua", false
 	}
-	reserved := chat.max_output_tokens
-	if reserved <= 0 { reserved = CHAT_DEFAULT_OUTPUT_RESERVE_TOKENS }
-	fits := estimate + reserved + CHAT_ADMISSION_MARGIN_TOKENS <= chat.context_window
+	fits := model_capacity_admits(capacity, estimate)
 	admission := [5]Log_Field {
 		{key = "decision", value = fits ? "admitted" : "refused"},
 		{key = "estimate", value = i64(estimate)},
-		{key = "context_window", value = i64(chat.context_window)},
-		{key = "reserved", value = i64(reserved)},
-		{key = "margin", value = i64(CHAT_ADMISSION_MARGIN_TOKENS)},
+		{key = "context_window", value = i64(capacity.window)},
+		{key = "reserved", value = i64(capacity.output)},
+		{key = "margin", value = i64(capacity.margin)},
 	}
 	log_emit({level = .Info, category = .Provider, event = "request.admission", fields = admission[:]})
 	if fits {
 		return "", true
 	}
 	return fmt.tprintf(
-			"request estimated at ~%d input tokens exceeds the %d-token window (reserved %d output, %d margin): shorten the prompt, compact, or raise the limits",
+			"request estimated at ~%d input tokens exceeds the ~%d the %d-token window admits (%d reserved for output, %d for estimator error): shorten the prompt, compact, or raise the limits",
 			estimate,
-			chat.context_window,
-			reserved,
-			CHAT_ADMISSION_MARGIN_TOKENS,
+			capacity.usable,
+			capacity.window,
+			capacity.output,
+			capacity.margin,
 		),
 		false
 }

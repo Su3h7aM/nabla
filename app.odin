@@ -310,7 +310,7 @@ tui_run :: proc(
 	// the footer reads the status under the lock, so a borrowed workspace would
 	// dangle as soon as the running session changed.
 	app.run.snap.status.cwd = strings.clone(app.setup.workspace, app.run.alloc)
-	app.run.snap.status.context_window = app.setup.session.context_window
+	app.run.snap.status.context_window = app.setup.session.capacity.window
 	// The resumed conversation is shown before the first prompt, so the screen
 	// matches the history the next request will be built from.
 	session_replay(app, &app.setup.session)
