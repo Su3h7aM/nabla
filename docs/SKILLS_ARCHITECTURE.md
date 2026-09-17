@@ -869,10 +869,12 @@ instruction string, rather than independently reconstructing it in
 `chat_request_input_json`. Preserve old request decoding when that reference is
 absent. Recorded context boundaries remain the ones actually projected.
 
-Summarization requests keep `CHAT_COMPACT_INSTRUCTIONS`, no skill catalog, no
-tools, their separate `:summary` cache identity, and disabled cache writes. Their
-request record has no normal instruction-snapshot reference. A model change may
-alter normal provider configuration, but must not rerender skills from disk.
+For summarization request construction and cache policy, follow
+[Context management and non-blocking compaction](CONTEXT_COMPACTION_ARCHITECTURE.md)
+§8. Its planned cache-compatible snapshot replaces the current separate summary
+instructions, omitted tools, `:summary` key, and disabled cache writes. The snapshot
+retains the normal instruction-snapshot reference; it never reloads skills from disk.
+A model change may alter provider configuration, but must not rerender skills.
 
 A skill load leaves all of these unchanged:
 

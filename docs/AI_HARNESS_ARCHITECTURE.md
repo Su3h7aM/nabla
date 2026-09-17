@@ -354,37 +354,19 @@ Rules:
 
 ## 10. Compaction and context budget
 
-Inputs: durable conversation, resolved `context_window`, resolved `max_output_tokens`, and a local
-estimate.
+For context measurement, admission, automatic or tool-triggered compaction, checkpoint
+installation, and compaction lifecycle work, read
+[Context management and non-blocking compaction](CONTEXT_COMPACTION_ARCHITECTURE.md).
+That specification replaces this section's former compact-only-on-refused-admission policy.
 
-Budget arithmetic:
+The target is background summarization of a fixed committed prefix while the foreground keeps
+its existing context and cache prefix. Installation preserves every entry after the recorded
+coverage boundary. Start and installation thresholds are separate. The session remains one
+logical session and the transcript remains append-only.
 
-```
-usable_input = context_window − (max_output_tokens or DEFAULT_OUTPUT_RESERVE) − safety_margin
-admit(request) = estimate(input) + reserved_output + margin ≤ context_window
-```
-
-Rules:
-
-- **The catalog supplies the limits.** No hardcoded windows or reserves beyond an explicitly named
-  fallback used only when a limit is unconfigured.
-- **Local pre-send estimate is mandatory.** Provider-reported usage arrives after the request and
-  cannot prevent an oversized one. The estimate is approximate and says so; measured usage is
-  evidence, never the estimate. (Current: chars/4 + per-message overhead + margin.)
-- **Compact at complete turn/execution boundaries. Never truncate an individual payload**, tool
-  result, or message body to fit. Cutting a serialized payload produces malformed history.
-- **Preserve the newest exchange.** The most recent turn must survive compaction intact.
-- **Keep call/result runs together.** A seam may back up over a tool call and its result so the
-  retained tail is coherent.
-- **Compaction commits only when the summary request succeeds.** A failed summary leaves history
-  and the active window untouched.
-- **Never delete history.** Compaction advances a window over an append-only record.
-- **Compact only when a request would not be admitted.** Compaction is not eager: it rewrites
-  the active context, which discards the provider's cached prefix and pays for a summarization
-  request. A request that still does not fit after one compaction fails explicitly rather than
-  looping, and a seam that covers nothing cannot make progress, so repeated attempts terminate.
-- Provider-specific compaction belongs behind a **provider/decorator boundary** if it is needed at
-  all. The core loop must not accumulate per-provider compaction rules.
+Status: the current implementation still compacts synchronously after failed admission. The
+linked specification defines the migration, ownership and persistence contracts, cache limits,
+and the failure policy when background compaction cannot finish within the remaining capacity.
 
 ---
 
