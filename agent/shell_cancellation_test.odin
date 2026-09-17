@@ -344,7 +344,7 @@ Shell_Turn_Run :: struct {
 
 shell_turn_serve :: proc(thread: ^thread.Thread) {
 	run := cast(^Shell_Turn_Run)thread.data
-	run.completed = chat_run_turn(run.chat, run.connection, {})
+	run.completed = chat_run_turn(run.chat, run.connection, test_retry_policy(), {})
 }
 
 shell_turn_join :: proc(run: ^Shell_Turn_Run) {

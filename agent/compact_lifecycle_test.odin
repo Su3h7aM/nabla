@@ -248,7 +248,7 @@ test_a_background_compaction_keeps_the_work_that_followed_it :: proc(t: ^testing
 
 	// The foreground completes a whole turn with the old context while the summary
 	// is still in flight.
-	if !testing.expect(t, chat_run_turn(chat, foreground, {})) { return }
+	if !testing.expect(t, chat_run_turn(chat, foreground, test_retry_policy(), {})) { return }
 
 	// And one more entry lands after the fork.
 	appended := _test_append(t, chat, {created_at_ms = 3_000, payload = session.Assistant_Entry{text = "after the fork"}})

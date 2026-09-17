@@ -166,7 +166,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			model_id    = app.setup.model_id,
 			connection  = app.run.connection,
 		}
-		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, observer, &steer)
+		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer)
 		// A steering line applies only at a request boundary inside the turn it was
 		// typed during. One the turn ended before reaching would otherwise be
 		// applied to whatever turn comes next, where it no longer means what the

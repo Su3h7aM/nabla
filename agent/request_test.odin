@@ -9,79 +9,6 @@ import "core:time"
 import "nabla:agent/session"
 import "nabla:ai"
 
-// Only a failure that could plausibly succeed on a second identical attempt is
-// retried. A refusal, a bad request, and an unauthenticated peer are not: the
-// same bytes would fail the same way, and re-sending them only wastes the turn.
-@(test)
-test_request_retry_classification :: proc(t: ^testing.T) {
-	retryable := [?]ai.Provider_Operation_Error {
-		{kind = .Transport},
-		{kind = .Stream},
-		{kind = .HTTP, status = 408},
-		{kind = .HTTP, status = 429},
-		{kind = .HTTP, status = 500},
-		{kind = .HTTP, status = 503},
-	}
-	for err in retryable {
-		testing.expectf(t, chat_request_retryable(err), "%v with status %d must be retryable", err.kind, err.status)
-	}
-	terminal := [?]ai.Provider_Operation_Error {
-		{kind = .None},
-		{kind = .Invalid_Request},
-		{kind = .Cancelled},
-		{kind = .Timed_Out},
-		{kind = .TLS},
-		{kind = .HTTP, status = 400},
-		{kind = .HTTP, status = 401},
-		{kind = .HTTP, status = 403},
-		{kind = .HTTP, status = 422},
-	}
-	for err in terminal {
-		testing.expectf(t, !chat_request_retryable(err), "%v with status %d must not be retryable", err.kind, err.status)
-	}
-
-	// The delay doubles and stops growing, so a bounded number of attempts is also
-	// a bounded wait.
-	testing.expect_value(t, chat_retry_delay(1), 500 * time.Millisecond)
-	testing.expect_value(t, chat_retry_delay(2), 1 * time.Second)
-	testing.expect_value(t, chat_retry_delay(3), 2 * time.Second)
-	testing.expect_value(t, chat_retry_delay(9), CHAT_RETRY_MAX_DELAY)
-}
-
-// A retry is only invisible to the model while nothing was exposed. Once text or
-// a call has been staged, the failure is reported instead of sent again.
-@(test)
-test_request_retry_needs_an_unexposed_attempt :: proc(t: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
-	chat := &fixture.chat
-	// Admission resets the process-wide cancellation flag, which another test may
-	// have left set.
-	_test_accept(t, chat, "go")
-
-	transient := ai.Provider_Operation_Error {
-		kind = .Transport,
-	}
-	testing.expect(t, chat_request_may_retry(chat, transient, 1))
-	// The last allowed attempt is not followed by another.
-	testing.expect(t, !chat_request_may_retry(chat, transient, CHAT_REQUEST_MAX_ATTEMPTS))
-
-	append(&chat.partial_assistant, "half an answer")
-	testing.expect(t, !chat_request_may_retry(chat, transient, 1))
-	clear(&chat.partial_assistant)
-
-	// The staged call's strings are owned by the session, so the id is cloned
-	// the way a response commit clones: chat_pending_calls_clear frees it.
-	append(&chat.pending_calls, Chat_Tool_Call{id = chat_clone_string("call_1", chat.allocator)})
-	testing.expect(t, !chat_request_may_retry(chat, transient, 1))
-	chat_pending_calls_clear(chat)
-
-	chat.pending_response_present = true
-	testing.expect(t, !chat_request_may_retry(chat, transient, 1))
-	chat.pending_response_present = false
-}
-
 // Provider function names allow underscores but not dots. The registry keeps
 // qualified names, while each request carries the provider-safe spelling and
 // the frozen registry restores returned calls before dispatch.
@@ -846,14 +773,14 @@ test_every_request_reports_itself_while_the_turn_runs :: proc(t: ^testing.T) {
 	counter: Request_Event_Counter
 	observer := request_event_observer(&counter)
 
-	chat_perform_request(chat, connection, observer, &usages)
+	chat_perform_request(chat, connection, test_retry_policy(), observer, &usages)
 	testing.expect_value(t, counter.prepared, 1)
 	testing.expect_value(t, counter.finished, 1)
 
 	// The next request of the same turn reports again. That repetition is the whole point:
 	// the context has grown and the provider's accounting of the first request has landed,
 	// so a front-end refreshing on these has something new to show.
-	chat_perform_request(chat, connection, observer, &usages)
+	chat_perform_request(chat, connection, test_retry_policy(), observer, &usages)
 	testing.expect_value(t, counter.prepared, 2)
 	testing.expect_value(t, counter.finished, 2)
 }

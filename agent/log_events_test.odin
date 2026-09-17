@@ -366,10 +366,10 @@ test_preparation_never_names_the_previous_request :: proc(t: ^testing.T) {
 		Endpoint = "ftp://not-a-provider",
 	}
 
-	chat_perform_request(chat, connection, {}, &usages)
+	chat_perform_request(chat, connection, test_retry_policy(), {}, &usages)
 	// The second request of one turn is where the defect showed: the durable
 	// number the first request left behind is not this request's identity.
-	chat_perform_request(chat, connection, {}, &usages)
+	chat_perform_request(chat, connection, test_retry_policy(), {}, &usages)
 
 	context.logger = fixture.ambient
 	text := log_chat_text(t, &fixture)

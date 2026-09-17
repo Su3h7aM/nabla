@@ -159,7 +159,7 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 		fmt.eprintln("nabla: the session is already running")
 		return false
 	}
-	return agent.chat_run_turn_steered(&app.setup.session, app.run.connection, headless_observer(out), nil)
+	return agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), headless_observer(out), nil)
 }
 
 // run_prompt executes one prompt without a terminal and returns the process exit

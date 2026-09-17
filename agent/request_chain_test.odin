@@ -20,9 +20,9 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(t: ^testing.T) {
 	_test_accept(t, chat, "say something")
 
 	refusal := `{"error":{"message":"Rate limit reached"}}`
-	// The refusal carries the provider's own evidence: the request id it answered with
-	// and the delay it asked for.
-	refusal_headers := "x-request-id: req_fixture\r\nretry-after: 2\r\n"
+	// The refusal carries the provider's own evidence: the request id it answered with,
+	// and a delay, which is a value even when it is zero.
+	refusal_headers := "x-request-id: req_fixture\r\nretry-after: 0\r\n"
 	responses := []string{agent_provider_refusal("429 Too Many Requests", refusal, refusal_headers), agent_provider_reply("second try")}
 	provider: Agent_Provider
 	if !agent_provider_start(t, &provider, responses) { return }
@@ -34,7 +34,7 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(t: ^testing.T) {
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	testing.expect(t, chat_run_turn(chat, connection, {}), "the turn completed after a retry")
+	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed after a retry")
 	if !testing.expect_value(t, len(provider.requests), 2) { return }
 	// A retry sends the same request: the bytes of the second attempt are the bytes of
 	// the first, because the harness froze them before either one went out.
@@ -91,7 +91,11 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(t: ^testing.T) {
 	testing.expect_value(t, evidence.failure_class, "rate_limited")
 	testing.expect_value(t, evidence.status, i64(429))
 	testing.expect_value(t, evidence.provider_request_id, "req_fixture")
-	testing.expect_value(t, evidence.retry_after_ms, i64(2000))
+	testing.expect_value(t, evidence.retry_after_ms, i64(0))
+	// The decision taken on the failed send is in the row with it: the chain waited and
+	// sent again, and both facts are readable after the fact.
+	testing.expect_value(t, evidence.recovery, "transient_failure")
+	testing.expect(t, evidence.delay_ms > 0, "the retry waited before sending again")
 	testing.expect_value(t, evidence.message, "Rate limit reached")
 	// Nothing of the refused attempt reached the conversation, so nothing of it was
 	// exposed.
@@ -113,6 +117,8 @@ Error_Record :: struct {
 	transport_cause:     string,
 	text_exposed:        bool,
 	completion_accepted: bool,
+	recovery:            string,
+	delay_ms:            i64,
 	message:             string,
 }
 
@@ -135,8 +141,105 @@ error_record :: proc(t: ^testing.T, error_json: string) -> (record: Error_Record
 	if text, is_string := object["transport_cause"].(json.String); is_string { record.transport_cause = string(text) }
 	if flag, is_bool := object["text_exposed"].(json.Boolean); is_bool { record.text_exposed = bool(flag) }
 	if flag, is_bool := object["completion_accepted"].(json.Boolean); is_bool { record.completion_accepted = bool(flag) }
+	if text, is_string := object["recovery"].(json.String); is_string { record.recovery = string(text) }
+	if number, is_integer := object["delay_ms"].(json.Integer); is_integer { record.delay_ms = i64(number) }
 	if text, is_string := object["message"].(json.String); is_string { record.message = string(text) }
 	return
+}
+
+// A chain that meets a refusal, then a stream that ends before its own marker, then an
+// answer uses three sends and commits one answer. The refused send and the truncated
+// one are different classes, and both come from the same frozen request.
+@(test)
+test_a_chain_of_failures_ends_in_one_answer :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(t, chat, "say something")
+
+	refusal := `{"error":{"message":"Rate limit reached"}}`
+	responses := []string {
+		agent_provider_refusal("429 Too Many Requests", refusal, "retry-after: 0\r\n"),
+		agent_provider_truncated(),
+		agent_provider_reply("third try"),
+	}
+	provider: Agent_Provider
+	if !agent_provider_start(t, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed after two retries")
+	if !testing.expect_value(t, len(provider.requests), 3) { return }
+	for request, i in provider.requests {
+		testing.expectf(t, request == provider.requests[0], "send %d must repeat the frozen bytes", i + 1)
+	}
+
+	ctx := _test_context(t, chat)
+	defer session.context_destroy(&ctx, context.allocator)
+	answers := 0
+	answered: session.Request_No
+	has_answered := false
+	partials := 0
+	for entry in ctx.entries {
+		#partial switch payload in entry.payload {
+		case session.Assistant_Entry:
+			if payload.text == "third try" { answers += 1 }
+			request_no, named := entry.request_no.?
+			if !named { continue }
+			answered, has_answered = request_no, true
+			if payload.partial { partials += 1 }
+		}
+	}
+	testing.expect_value(t, answers, 1)
+	testing.expect_value(t, partials, 0)
+	if !testing.expect(t, has_answered, "the answer names the send that produced it") { return }
+
+	// The chain is three rows, in order: each names the send before it, and each says
+	// what its own send met and what the harness did about it.
+	third, third_err := session.request_load(chat.store, chat.id, answered, chat.allocator)
+	if !testing.expect_value(t, third_err, nil) { return }
+	defer session.request_destroy(&third, chat.allocator)
+	testing.expect_value(t, third.outcome, session.Outcome.Completed)
+	third_attempt, third_recovery, third_previous := attempt_record(t, third.input_json)
+	testing.expect_value(t, third_attempt, i64(3))
+	testing.expect_value(t, third_recovery, "transient_retry")
+	second_number, has_second := third_previous.?
+	if !testing.expect(t, has_second, "the answered send names the send before it") { return }
+
+	second, second_err := session.request_load(chat.store, chat.id, session.Request_No(second_number), chat.allocator)
+	if !testing.expect_value(t, second_err, nil) { return }
+	defer session.request_destroy(&second, chat.allocator)
+	testing.expect_value(t, second.outcome, session.Outcome.Failed)
+	second_attempt, _, second_previous := attempt_record(t, second.input_json)
+	testing.expect_value(t, second_attempt, i64(2))
+	// A stream that ended before its own marker is incomplete, not invalid: the harness
+	// can send the same bytes again.
+	second_evidence := error_record(t, second.error_json)
+	testing.expect_value(t, second_evidence.kind, "stream")
+	testing.expect_value(t, second_evidence.failure_class, "incomplete_stream")
+	testing.expect_value(t, second_evidence.recovery, "transient_failure")
+	first_number, has_first := second_previous.?
+	if !testing.expect(t, has_first, "the second send names the first") { return }
+
+	first, first_err := session.request_load(chat.store, chat.id, session.Request_No(first_number), chat.allocator)
+	if !testing.expect_value(t, first_err, nil) { return }
+	defer session.request_destroy(&first, chat.allocator)
+	testing.expect_value(t, first.outcome, session.Outcome.Failed)
+	first_attempt, first_recovery, first_previous := attempt_record(t, first.input_json)
+	testing.expect_value(t, first_attempt, i64(1))
+	testing.expect_value(t, first_recovery, "initial")
+	testing.expect(t, first_previous == nil, "the first send of a chain names no predecessor")
+	first_evidence := error_record(t, first.error_json)
+	testing.expect_value(t, first_evidence.failure_class, "rate_limited")
+	testing.expect_value(t, first_evidence.status, i64(429))
+	testing.expect(t, !first_evidence.text_exposed, "the refused attempt published nothing")
 }
 
 // attempt_record reads the chain fields one request row's input record carries.
@@ -175,7 +278,7 @@ test_a_scripted_provider_completes_one_request :: proc(t: ^testing.T) {
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	testing.expect(t, chat_run_turn(chat, connection, {}), "the turn completed")
+	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed")
 	testing.expect_value(t, len(provider.requests), 1)
 	testing.expect(t, !provider.failed, "the scripted provider served its response")
 	testing.expect(t, chat.last_error == "", chat.last_error)

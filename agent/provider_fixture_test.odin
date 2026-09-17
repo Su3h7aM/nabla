@@ -42,6 +42,22 @@ agent_provider_reply :: proc(text: string, allocator := context.temp_allocator) 
 	)
 }
 
+// agent_provider_truncated is one response whose stream ends before its own marker,
+// after publishing nothing: the provider accepted the request and the connection broke
+// while it was answering. Its content type makes it a stream to the client, and the
+// missing sentinel is what the stream layer calls incomplete.
+agent_provider_truncated :: proc(allocator := context.temp_allocator) -> string {
+	return strings.concatenate(
+		{
+			"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
+			// An event that carries no text and no finish reason: an attempt can be lost
+			// this way without the conversation ever seeing part of an answer.
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}]}\n\n",
+		},
+		allocator,
+	)
+}
+
 // agent_provider_refusal is one response that refuses the request with a provider
 // error document. headers carries the rest of the refusal, such as the request id and
 // the retry delay the provider reports, each including its own line ending.

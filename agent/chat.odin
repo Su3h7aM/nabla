@@ -148,7 +148,13 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 // runs it, and records what came back. The record exists before the model is
 // asked anything, so a request that never finishes still says what it carried.
 @(private)
-chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, observer: Chat_Observer, usages: ^[dynamic]Chat_Request_Usage) {
+chat_perform_request :: proc(
+	chat: ^Chat_Session,
+	connection: ai.Provider_Connection,
+	policy: Chat_Retry_Policy,
+	observer: Chat_Observer,
+	usages: ^[dynamic]Chat_Request_Usage,
+) {
 	if chat.skill_instructions == "" && !chat_ensure_instructions(chat) { return }
 	// This request has no durable number yet, and the one the previous request
 	// left behind is not its own. Clearing it here is what keeps the preparation
@@ -262,6 +268,12 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	// settled records that the send which ended the chain was already finished for its
 	// own failure, before a retry was waited on. Such a row is not finished twice.
 	settled := false
+	// The decision taken on the send that ended the chain, which says why the harness
+	// stopped or waited and is what its row records.
+	decision := Chat_Recovery_Decision {
+		action = .Stop,
+		reason = .Completed,
+	}
 	for {
 		attempts += 1
 		// Each send is its own operation. An attempt is over when its call has
@@ -375,30 +387,75 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 			{key = "elapsed_ms", value = log_duration_ms(time.tick_since(at))},
 		}
 		log_emit({level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})
-		if !chat_request_may_retry(chat, operation_error, attempts) { break }
+		// The send is over, so the policy answers from the facts the layers observed: what
+		// the operation reported, what this attempt exposed, and whether the turn or the
+		// store had already failed.
+		decision = chat_recovery_decide(
+			policy,
+			{
+				attempts = attempts,
+				error = operation_error,
+				failed = chat.active_failed && operation_error.kind == .None,
+				storage_failed = chat_session_storage_failed(chat),
+				text_exposed = text_exposed,
+				completion_accepted = completion_accepted,
+				cancelled = chat_session_cancelled(chat),
+			},
+			chat_retry_fraction(),
+		)
+		if decision.action != .Retry { break }
 		_observer_message(observer, .Notice, chat_retry_notice(attempts, operation_error))
-		// The send is over, so its row is finished before anything is waited on or sent
-		// again: the failure is in the store before the policy acts on it, with the
-		// numbers and the usage of the send that produced it.
+		// The row is finished before anything is waited on or sent again: how the send
+		// failed, and what the harness decided to do about it, are in the store before the
+		// decision is acted on, with the numbers and the usage of the send that produced
+		// them.
 		chat_finish_request(
 			chat,
 			request_no,
-			{outcome = .Failed, error = operation_error, error_present = true, text_exposed = text_exposed, completion_accepted = completion_accepted},
+			{
+				outcome = .Failed,
+				error = operation_error,
+				error_present = true,
+				text_exposed = text_exposed,
+				completion_accepted = completion_accepted,
+				recovery = decision.reason,
+				delay = decision.delay,
+			},
 			usages,
 		)
 		settled = true
-		delay := chat_retry_delay(attempts)
-		retry := [3]Log_Field {
+		retry := [5]Log_Field {
+			{key = "reason", value = request_recovery_reason_name(decision.reason)},
 			{key = "error_kind", value = ai.provider_operation_error_name(operation_error.kind)},
+			{key = "failure_class", value = ai.provider_failure_class_name(operation_error.failure_class)},
 			{key = "next_attempt", value = i64(attempts + 1)},
-			{key = "delay_ms", value = log_duration_ms(delay)},
+			{key = "delay_ms", value = log_duration_ms(decision.delay)},
 		}
-		log_emit({level = .Warning, category = .Provider, event = "request.retry", fields = retry[:]})
-		if !chat_retry_wait(chat, delay) { break }
+		log_emit({level = .Warning, category = .Provider, event = "request.retry_scheduled", fields = retry[:]})
+		if !chat_retry_wait(chat, policy.slice, decision.delay) { break }
+		// Cancellation can arrive between the last slice of a delay and the send that
+		// follows it.
+		if chat_session_cancelled(chat) { break }
+		started := [1]Log_Field{{key = "attempt", value = i64(attempts + 1)}}
+		log_emit({level = .Info, category = .Provider, event = "request.retry_started", fields = started[:]})
 		chat_session_clear_attempt(chat)
 		ai.Provider_Operation_Error_Destroy(&operation_error, chat.allocator)
 	}
 	chat.request_attempts = attempts
+	// A chain that stopped says why, which is the one thing the finished request row
+	// cannot say: the row reports the outcome of its own send, not the reason the harness
+	// stopped trying.
+	if decision.reason != .Completed {
+		level := log.Level.Warning
+		if decision.reason == .Cancelled { level = .Info }
+		stopped := [4]Log_Field {
+			{key = "reason", value = request_recovery_reason_name(decision.reason)},
+			{key = "error_kind", value = ai.provider_operation_error_name(operation_error.kind)},
+			{key = "failure_class", value = ai.provider_failure_class_name(operation_error.failure_class)},
+			{key = "attempts", value = i64(attempts)},
+		}
+		log_emit({level = level, category = .Provider, event = "request.recovery_stopped", fields = stopped[:]})
+	}
 	// The error owns its evidence, and every path out of the request releases it.
 	defer ai.Provider_Operation_Error_Destroy(&operation_error, chat.allocator)
 	_observer_assistant_flush(observer)
@@ -419,6 +476,8 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		message             = chat.last_error,
 		text_exposed        = text_exposed,
 		completion_accepted = completion_accepted,
+		recovery            = decision.reason,
+		delay               = decision.delay,
 	}
 	chat_commit_response(chat, request_no, send, usages, finish_row = !settled)
 	// The request's outcome is recorded, so the provider's own accounting of it is part of
@@ -559,7 +618,7 @@ chat_finish_request :: proc(chat: ^Chat_Session, request_no: session.Request_No,
 	error_json := ""
 	if result.outcome != .Completed {
 		if result.error_present {
-			error_json = chat_request_error_json(result.error, result.text_exposed, result.completion_accepted)
+			error_json = chat_request_error_json(result)
 		} else if result.message != "" {
 			// A failure the harness detected itself has no operation behind it, so the
 			// record keeps the message and nothing else.
@@ -669,83 +728,32 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	return recorded
 }
 
-// CHAT_REQUEST_MAX_ATTEMPTS bounds how many times one request is sent. A retried
-// request reuses the same prepared bytes and the same operation, so the turn
-// bound and the record both span every attempt.
-CHAT_REQUEST_MAX_ATTEMPTS :: 3
-CHAT_RETRY_BASE_DELAY :: 500 * time.Millisecond
-CHAT_RETRY_MAX_DELAY :: 8 * time.Second
-CHAT_RETRY_SLICE :: 50 * time.Millisecond
-
-// chat_request_may_retry decides whether a failed attempt is followed by
-// another. Every reason is explicit: the failure has to be one that could
-// succeed on identical bytes, nothing may have been exposed, the turn must not be
-// stopping, and there has to be an attempt left.
-@(private)
-chat_request_may_retry :: proc(chat: ^Chat_Session, err: ai.Provider_Operation_Error, attempts: int) -> bool {
-	if err.kind == .None { return false }
-	if chat_session_cancelled(chat) { return false }
-	if attempts >= CHAT_REQUEST_MAX_ATTEMPTS { return false }
-	if !chat_request_retryable(err) { return false }
-	return !chat_request_output_exposed(chat)
-}
-
-// chat_request_retryable says whether sending the same bytes again could
-// succeed. Only a transport that never reached a usable response, or a status
-// that providers use for overload and throttling, qualifies. A refusal, a bad
-// request, an unauthenticated peer, and an expired deadline are deterministic:
-// the same bytes would fail the same way.
-@(private)
-chat_request_retryable :: proc(err: ai.Provider_Operation_Error) -> bool {
-	switch err.kind {
-	case .None, .Invalid_Request, .Cancelled, .Timed_Out, .TLS:
-		return false
-	case .Transport, .Stream:
-		return true
-	case .HTTP:
-		return err.status == 408 || err.status == 409 || err.status == 429 || err.status >= 500
-	}
-	return false
-}
-
-// chat_request_output_exposed reports whether the failed attempt produced
-// anything the model or the user could have seen. Once it has, a retry would
-// duplicate output, so the failure is reported instead.
-@(private)
-chat_request_output_exposed :: proc(chat: ^Chat_Session) -> bool {
-	return len(chat.partial_assistant) > 0 || len(chat.pending_calls) > 0 || chat.pending_response_present
-}
-
-// chat_retry_notice is the line a retry reports to the front-end. It is a
-// diagnostic for whoever is watching the turn, never conversation: the model is
-// told nothing about an attempt it never saw.
+// chat_retry_notice is the line a retry reports to the front-end. It is a diagnostic
+// for whoever is watching the turn, never conversation: the model is told nothing about
+// an attempt it never saw.
 @(private)
 chat_retry_notice :: proc(attempt: int, err: ai.Provider_Operation_Error) -> string {
 	if err.status != 0 { return fmt.tprintf("attempt %d did not complete (status %d); retrying", attempt, err.status) }
 	return fmt.tprintf("attempt %d did not complete; retrying", attempt)
 }
 
+// chat_retry_wait waits before the next send, in slices the policy names, and reports
+// whether the wait finished instead of being stopped. Cancellation is checked before
+// each slice, so a turn stopped during a delay never sends again.
 @(private)
-chat_retry_delay :: proc(attempt: int) -> time.Duration {delay := CHAT_RETRY_BASE_DELAY
-	for _ in 1 ..< attempt {
-		delay *= 2
-		if delay >= CHAT_RETRY_MAX_DELAY { return CHAT_RETRY_MAX_DELAY }
-	}
-	return delay
-}
-
-// chat_retry_wait sleeps out one backoff delay. It waits in slices and checks
-// cancellation between them, so a retry never delays a turn that is being
-// stopped.
-@(private)
-chat_retry_wait :: proc(chat: ^Chat_Session, delay: time.Duration) -> bool {
+chat_retry_wait :: proc(chat: ^Chat_Session, slice, delay: time.Duration) -> bool {
 	remaining := delay
 	for remaining > 0 {
 		if chat_session_cancelled(chat) { return false }
-		slice := CHAT_RETRY_SLICE
-		if remaining < slice { slice = remaining }
-		time.sleep(slice)
-		remaining -= slice
+		step := min(remaining, slice)
+		if step <= 0 {
+			// The policy named no slice, so the delay is waited in one step. The slice
+			// exists to recheck cancellation, not to bound the wait.
+			time.sleep(remaining)
+			return true
+		}
+		time.sleep(step)
+		remaining -= step
 	}
 	return true
 }
@@ -763,8 +771,8 @@ chat_session_clear_attempt :: proc(chat: ^Chat_Session) {
 
 // --- the turn loop -----------------------------------------------------------
 
-chat_run_turn :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, observer: Chat_Observer) -> bool {
-	return chat_run_turn_steered(chat, connection, observer, nil)
+chat_run_turn :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, policy: Chat_Retry_Policy, observer: Chat_Observer) -> bool {
+	return chat_run_turn_steered(chat, connection, policy, observer, nil)
 }
 
 // Steer_Context carries the steering queue into the turn loop. Nil means no
@@ -782,7 +790,13 @@ Steer_Context :: struct {
 	usages:      ^[dynamic]Chat_Request_Usage,
 }
 
-chat_run_turn_steered :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, observer: Chat_Observer, steer: ^Steer_Context) -> bool {
+chat_run_turn_steered :: proc(
+	chat: ^Chat_Session,
+	connection: ai.Provider_Connection,
+	policy: Chat_Retry_Policy,
+	observer: Chat_Observer,
+	steer: ^Steer_Context,
+) -> bool {
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
 	if steer != nil { steer.usages = &usages }
@@ -800,7 +814,7 @@ chat_run_turn_steered :: proc(chat: ^Chat_Session, connection: ai.Provider_Conne
 		switch effect.kind {
 		case .Start_Request:
 			chat_effect_destroy(&effect)
-			chat_perform_request(chat, connection, observer, &usages)
+			chat_perform_request(chat, connection, policy, observer, &usages)
 		case .Run_Tools:
 			chat_effect_destroy(&effect)
 			count := chat_run_tools(chat, observer)

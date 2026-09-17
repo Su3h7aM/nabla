@@ -9,8 +9,22 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 import "nabla:agent/session"
+
+// test_retry_policy is the policy the suites run with: the production bounds, with a
+// wait short enough that a retry costs a test milliseconds instead of a second. A suite
+// that cares about the decision itself states its own policy and calls
+// chat_recovery_decide directly.
+test_retry_policy :: proc() -> Chat_Retry_Policy {
+	policy := chat_retry_policy_default()
+	policy.base_delay = 2 * time.Millisecond
+	policy.max_delay = 4 * time.Millisecond
+	policy.max_provider_delay = 25 * time.Millisecond
+	policy.slice = time.Millisecond
+	return policy
+}
 
 // Chat_Test binds a running session to a temporary store. The store lives in the
 // fixture so its address is stable while the session points at it.

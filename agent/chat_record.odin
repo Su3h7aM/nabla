@@ -1,6 +1,7 @@
 package agent
 
 import "core:encoding/json"
+import "core:time"
 
 import "nabla:agent/session"
 import "nabla:ai"
@@ -157,6 +158,8 @@ Chat_Request_Error_Evidence :: struct {
 	transport_cause:     string `json:"transport_cause"`,
 	text_exposed:        bool `json:"text_exposed"`,
 	completion_accepted: bool `json:"completion_accepted"`,
+	recovery:            string `json:"recovery"`,
+	delay_ms:            i64 `json:"delay_ms"`,
 	message:             string `json:"message"`,
 }
 
@@ -235,12 +238,19 @@ Chat_Send_Result :: struct {
 	message:             string,
 	text_exposed:        bool,
 	completion_accepted: bool,
+	// recovery says why the harness stopped or waited after this send, and delay is what
+	// it waited. They describe the decision taken on this send rather than the send
+	// itself, and they are what tells a bounded chain from a broken one.
+	recovery:            Request_Recovery_Reason,
+	delay:               time.Duration,
 }
 
 // chat_request_error_json records a send that failed, from the evidence the operation
-// returned rather than from the text a front-end would show.
+// returned and the decision the harness took on it, rather than from the text a
+// front-end would show.
 @(private)
-chat_request_error_json :: proc(error: ai.Provider_Operation_Error, text_exposed, completion_accepted: bool) -> string {
+chat_request_error_json :: proc(result: Chat_Send_Result) -> string {
+	error := result.error
 	record := Chat_Request_Error_Evidence {
 		format_version      = CHAT_REQUEST_ERROR_VERSION,
 		kind                = ai.provider_operation_error_name(error.kind),
@@ -251,8 +261,10 @@ chat_request_error_json :: proc(error: ai.Provider_Operation_Error, text_exposed
 		retry_after_ms      = -1,
 		retry_directive     = ai.provider_retry_directive_name(error.retry_directive),
 		transport_cause     = ai.provider_transport_cause_name(error.transport_cause),
-		text_exposed        = text_exposed,
-		completion_accepted = completion_accepted,
+		text_exposed        = result.text_exposed,
+		completion_accepted = result.completion_accepted,
+		recovery            = request_recovery_reason_name(result.recovery),
+		delay_ms            = log_duration_ms(result.delay),
 		message             = ai.provider_bounded_text(error.detail, CHAT_ERROR_DETAIL_MAX_BYTES, context.temp_allocator),
 	}
 	if delay, present := error.retry_after.?; present { record.retry_after_ms = log_duration_ms(delay) }
