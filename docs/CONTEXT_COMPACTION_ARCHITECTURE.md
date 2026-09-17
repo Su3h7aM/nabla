@@ -8,6 +8,11 @@ This document supersedes the earlier compaction policy in `AI_HARNESS_ARCHITECTU
 the summarization-request policy in `SKILLS_ARCHITECTURE.md` §14. It does not change their
 history, instruction-snapshot, replay, or skill-reload contracts.
 
+Planned changes are specified in [Provider failures, retries, and context recovery](ERROR_RETRY_ARCHITECTURE.md).
+That document resolves provider-confirmed overflow recovery and aggregate tool-result admission,
+and specifies bounded, owner-driven background retries to replace the current policy. Those
+changes are not implemented yet; the behavior below describes the current code.
+
 ---
 
 ## 1. Contract
@@ -301,16 +306,18 @@ Retry policy is one delay: after a failed job, the next automatic attempt waits
 These were considered and are not built. Each is additive; none changes the contracts above.
 
 - **Aggregate tool-result admission and spill.** Today one result is capped at
-  `TOOL_MAX_RESULT_BYTES` before it is stored. A bounded, retrievable result store would let a large
-  batch be spilled instead of consuming the growth reserve.
+  `TOOL_MAX_RESULT_BYTES` before it is stored. The implementation plan is now defined in
+  [Error and retry architecture, §8](ERROR_RETRY_ARCHITECTURE.md#8-resolve-aggregate-tool-result-admission-and-spill):
+  reserve a batch budget and atomically store retrievable output with its result reference.
 - **Cache breakpoint control.** `Provider_Message.Cache_Breakpoint` is unused; only Anthropic's
   automatic breakpoint is exercised. Explicit breakpoints would limit lookback and cache-write
   costs on long prefixes where the provider supports them.
 - **Prewarming the compacted prefix.** A provider request could populate the new context's cache
   before a real request needs it. It adds cost and a second in-flight operation.
-- **Provider-normalized overflow evidence.** A confirmed context-limit error could install an
-  already-ready candidate and retry once. That needs an adapter-level classification, and the local
-  admission check already refuses oversized requests.
+- **Provider-normalized overflow evidence.** The implementation plan is now defined in
+  [Error and retry architecture, §7](ERROR_RETRY_ARCHITECTURE.md#7-resolve-provider-confirmed-context-overflow):
+  classify provider rejection, install an already-ready candidate, and resend changed context
+  at most once. An unfinished summary still cannot block the foreground.
 - **Measured growth rate.** Replacing the constant reserve with a recent-rate estimate.
 
 ## 11. Tests

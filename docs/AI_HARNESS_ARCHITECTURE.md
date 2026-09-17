@@ -364,6 +364,12 @@ Compaction summarizes a fixed prefix on its own thread while the foreground keep
 existing context and cache prefix, and the finished summary is installed later at a request
 boundary. Start and installation thresholds are separate, and nothing waits for a summary.
 
+The next implementation is specified in
+[Provider failures, retries, and context recovery](ERROR_RETRY_ARCHITECTURE.md).
+It defines provider error classification, bounded retries, per-send records, and overflow repair
+without waiting for compaction. It also supplies the concrete aggregate result budget and
+retrievable storage contract for §11. These additions are planned, not implemented.
+
 ---
 
 ## 11. Tools
