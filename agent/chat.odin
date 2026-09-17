@@ -189,6 +189,19 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		return
 	}
 
+	// The bytes this request sends are frozen once, before the first attempt, so every
+	// attempt of the chain sends exactly what the first would have sent instead of a
+	// fresh encoding that has to be assumed equal. A request that cannot be encoded
+	// never reaches the provider, so it fails the turn here, before a request row
+	// exists, rather than being recorded as a send that did not happen.
+	encoded, encode_err := ai.Provider_Request_Freeze(prep.request, chat.allocator)
+	if encode_err.kind != .None {
+		chat_session_fail_turn(chat, encode_err.detail)
+		ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
+		return
+	}
+	defer delete(encoded.Body, chat.allocator)
+
 	chat.last_estimate = prep.estimate
 	// The input size is settled here and the request has not been sent yet, so this is
 	// where a front-end learns what the context now holds.
@@ -247,12 +260,11 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 	options := ai.Provider_Operation_Options {
 		interrupt = &chat_cancel,
 	}
-	// The observation lives in this frame for every attempt, because the operation
-	// borrows it until it returns.
-	// One request may be attempted more than once. A retry happens only while
-	// nothing has been exposed to the model, so the conversation the next request
-	// is built from is the same one, and the model never learns that an attempt
-	// failed.
+	// One request may be attempted more than once, and every attempt sends the
+	// frozen bytes: nothing about the request changes between attempts. A retry
+	// happens only while nothing has been exposed to the model, so the conversation
+	// the next request is built from is the same one, and the model never learns that
+	// an attempt failed.
 	attempts := 0
 	operation_error: ai.Provider_Operation_Error
 	for {
@@ -268,7 +280,7 @@ chat_perform_request :: proc(chat: ^Chat_Session, connection: ai.Provider_Connec
 		if log_observation_wanted() { options.observer = provider_log_observer(&provider_log) } else { options.observer = {} }
 
 		at := time.tick_now()
-		operation_error = ai.Provider_Request_Operation_Controlled(connection, prep.request, &runtime, chat_provider_event, options, chat.allocator)
+		operation_error = ai.Provider_Request_Operation_Encoded(connection, encoded, &runtime, chat_provider_event, options, chat.allocator)
 		// The response artifact covers the whole attempt, so it is settled as soon as
 		// the bytes stop arriving. A cut-short stream is kept and marked incomplete.
 		if provider_log.response_capture.kind != .Invalid {
