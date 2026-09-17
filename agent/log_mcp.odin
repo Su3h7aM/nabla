@@ -110,8 +110,6 @@ mcp_log_observer :: proc(log: ^MCP_Log) -> mcp.Wire_Observer {
 log_mcp_wire :: proc(user_data: rawptr, report: mcp.Wire_Report) {
 	log := cast(^MCP_Log)user_data
 	if log == nil { return }
-	sink := log_active_sink()
-	if sink == nil || sink.capture_mode != .Payloads { return }
 
 	kind := Capture_Kind.MCP_Outgoing
 	if report.direction == .Incoming { kind = .MCP_Incoming }
@@ -123,7 +121,9 @@ log_mcp_wire :: proc(user_data: rawptr, report: mcp.Wire_Report) {
 		descriptor.external_id = report.request_id
 		descriptor.external_id_present = true
 	}
-	capture, opened := log_capture_open(sink, log_active_correlation(), kind, descriptor)
+	// Whether capture is on is log_capture_open's decision, so the policy has one
+	// definition rather than one per producer.
+	capture, opened := log_capture_open(log_active_sink(), log_active_correlation(), kind, descriptor)
 	if !opened { return }
 	log_capture_write(&capture, report.message)
 	log_capture_write(&capture, []u8{'\n'})

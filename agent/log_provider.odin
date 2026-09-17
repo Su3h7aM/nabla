@@ -69,24 +69,19 @@ log_provider_report :: proc(user_data: rawptr, report: ai.Provider_Operation_Rep
 		}
 		// The whole request body is handed over at once, so its artifact is opened
 		// and finished in this call: nothing else can arrive for it.
-		if sink := log_active_sink(); sink != nil && sink.capture_mode == .Payloads {
-			capture, opened := log_capture_open(sink, log_active_correlation(), .Provider_Request)
-			if opened {
-				log_capture_write(&capture, report.body)
-				log_capture_finish(&capture, true)
-			}
+		if capture, opened := log_capture_open(log_active_sink(), log_active_correlation(), .Provider_Request); opened {
+			log_capture_write(&capture, report.body)
+			log_capture_finish(&capture, true)
 		}
 	case .Response_Body:
 		// The count is what an attempt reports when it ends; the bytes themselves
 		// are only kept when capture is on.
 		observation.response_bytes = report.bytes
-		sink := log_active_sink()
-		if sink == nil || sink.capture_mode != .Payloads { return }
-		// One artifact covers the whole stream, opened on the first chunk. A refused
-		// admission is remembered so the quota is asked once rather than per chunk.
+		// One artifact covers the whole stream, opened on the first chunk. The attempt
+		// is remembered so the question is asked once rather than per chunk.
 		if !observation.response_capture_attempted {
 			observation.response_capture_attempted = true
-			capture, opened := log_capture_open(sink, log_active_correlation(), .Provider_Response)
+			capture, opened := log_capture_open(log_active_sink(), log_active_correlation(), .Provider_Response)
 			if opened { observation.response_capture = capture }
 		}
 		if observation.response_capture.kind != .Invalid {

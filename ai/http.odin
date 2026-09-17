@@ -93,6 +93,7 @@ http_post_sse :: proc(
 // Transfer_Relay is what one HTTP transfer reports into: the provider observer
 // and the api the request belonged to. It is borrowed by the transport for one
 // synchronous call and never retained.
+@(private)
 Transfer_Relay :: struct {
 	observer: Provider_Operation_Observer,
 	api:      API_Kind,
