@@ -44,6 +44,30 @@ test_steer_queue_bounds_total_bytes :: proc(t: ^testing.T) {
 	testing.expect(t, pushes == 5)
 }
 
+// Taking the queue hands every line over in order and leaves the queue empty with its own
+// budget back: a line that leaves the queue is neither still queued nor charged to it.
+@(test)
+test_taking_the_queue_hands_every_line_over :: proc(t: ^testing.T) {
+	queue := steer_queue_init(context.temp_allocator)
+	defer steer_queue_destroy(&queue)
+	testing.expect(t, steer_push(&queue, "first"))
+	testing.expect(t, steer_push(&queue, "second"))
+
+	taken := steer_take_all(&queue)
+	defer steer_taken_destroy(&queue, taken)
+	if !testing.expect_value(t, len(taken), 2) { return }
+	testing.expect_value(t, taken[0], "first")
+	testing.expect_value(t, taken[1], "second")
+	_, has_line := steer_pop(&queue)
+	testing.expect(t, !has_line, "the queue is empty after taking its lines")
+
+	filler := strings.repeat("x", 6000, context.temp_allocator)
+	defer delete(filler, context.temp_allocator)
+	pushes := 0
+	for steer_push(&queue, filler) { pushes += 1 }
+	testing.expect_value(t, pushes, 5)
+}
+
 @(test)
 test_session_steer_only_at_request_boundary :: proc(t: ^testing.T) {
 	fixture: Chat_Test

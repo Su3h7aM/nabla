@@ -163,6 +163,13 @@ Chat_Steer_Result :: enum {
 	Storage_Failed,
 }
 
+// chat_session_terminal_status is the status the last turn reached. A caller that has to
+// act on how a turn ended reads it after the turn, because the effect that carried it was
+// consumed by the loop that ran it.
+chat_session_terminal_status :: proc(chat: ^Chat_Session) -> Chat_Terminal_Status {
+	return chat.terminal_status
+}
+
 // chat_session_steer records a queued line as a user entry at a request
 // boundary. Unlike accept_user it starts no turn and resets no budget: the turn
 // keeps its identity and its counters, so steering changes what the next request

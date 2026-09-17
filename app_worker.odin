@@ -166,12 +166,27 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			model_id    = app.setup.model_id,
 			connection  = app.run.connection,
 		}
-		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer)
-		// A steering line applies only at a request boundary inside the turn it was
-		// typed during. One the turn ended before reaching would otherwise be
-		// applied to whatever turn comes next, where it no longer means what the
-		// user intended, so it is reported and dropped.
-		if dropped := agent.steer_clear(&app.run.steer); dropped > 0 {
+		completed := agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer)
+		// A steering line applies at a request boundary inside the turn it was typed
+		// during. A turn that failed before reaching one leaves the line unapplied, and it
+		// is still the user's message: it becomes a fresh prompt, or runs as the command it
+		// is, rather than being lost under the failure that stopped it. A turn that ended
+		// any other way, cancelled or abandoned, keeps the discard its stop path promises.
+		failed := agent.chat_session_terminal_status(&app.setup.session) == .Failed
+		if !completed && failed {
+			taken := agent.steer_take_all(&app.run.steer)
+			defer agent.steer_taken_destroy(&app.run.steer, taken)
+			if len(taken) > 0 {
+				snap_append(app, .Notice, fmt.tprintf("%d line(s) queued during the failed turn are being sent", len(taken)))
+			}
+			for line in taken {
+				if strings.has_prefix(line, "/") {
+					dispatch_command(app, line)
+				} else {
+					enqueue(app, .Prompt, "", line)
+				}
+			}
+		} else if dropped := agent.steer_clear(&app.run.steer); dropped > 0 {
 			snap_append(app, .Warning, fmt.tprintf("%d steering line(s) arrived too late to apply; dropped", dropped))
 		}
 	case .Compact:

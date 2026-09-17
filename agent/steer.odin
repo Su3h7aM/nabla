@@ -67,6 +67,27 @@ steer_clear :: proc(queue: ^Steer_Queue) -> int {
 	return dropped
 }
 
+// steer_take_all removes everything queued, oldest first, and returns it in one
+// allocation the caller owns. It is how a line queued for a request boundary the turn
+// never reached leaves the queue: whoever takes it decides what it becomes, and
+// steer_taken_destroy releases it.
+steer_take_all :: proc(queue: ^Steer_Queue) -> [dynamic]string {
+	sync.mutex_lock(&queue.mu)
+	defer sync.mutex_unlock(&queue.mu)
+	taken := make([dynamic]string, 0, len(queue.items), queue.allocator)
+	append(&taken, ..queue.items[:])
+	clear(&queue.items)
+	queue.bytes = 0
+	return taken
+}
+
+// steer_taken_destroy releases what steer_take_all returned. Its lines belong to the
+// queue allocator, never the ambient context.
+steer_taken_destroy :: proc(queue: ^Steer_Queue, taken: [dynamic]string) {
+	for line in taken { delete(line, queue.allocator) }
+	delete(taken)
+}
+
 // steer_line_free releases a popped line. Pops transfer ownership, and the
 // memory belongs to the queue allocator, never the ambient context.
 steer_line_free :: proc(queue: ^Steer_Queue, line: string) {
