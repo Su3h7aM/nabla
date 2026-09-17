@@ -81,3 +81,51 @@ log_mcp_error_name :: proc(kind: mcp.Error_Kind) -> string {
 	}
 	unreachable()
 }
+
+// --- the wire bridge ---------------------------------------------------------
+
+// MCP_Log is what one MCP client operation reports its messages into. It lives in
+// the caller's frame and is borrowed by the operation, so it never outlives the
+// call it observes.
+//
+// It carries no correlation of its own: a message belongs to whatever scope
+// installed the binding, which is the tool call for a call and the refresh for
+// discovery and listing.
+MCP_Log :: struct {
+	server_id: string,
+}
+
+mcp_log_observer :: proc(log: ^MCP_Log) -> mcp.Wire_Observer {
+	return {user_data = log, report = log_mcp_wire}
+}
+
+// log_mcp_wire stores one JSON-RPC message when payload capture is on. Each
+// message is one artifact, opened and finished here because the whole line arrives
+// at once; the artifact holds the exact framed bytes, including the newline the
+// transport adds.
+//
+// A refused admission is counted by the sink rather than recorded here, so a run
+// that exhausts its quota reports that once instead of once per message.
+@(private)
+log_mcp_wire :: proc(user_data: rawptr, report: mcp.Wire_Report) {
+	log := cast(^MCP_Log)user_data
+	if log == nil { return }
+	sink := log_active_sink()
+	if sink == nil || sink.capture_mode != .Payloads { return }
+
+	kind := Capture_Kind.MCP_Outgoing
+	if report.direction == .Incoming { kind = .MCP_Incoming }
+	descriptor := Capture_Descriptor {
+		server_id = log.server_id,
+		operation = report.operation,
+	}
+	if report.request_id != 0 {
+		descriptor.external_id = report.request_id
+		descriptor.external_id_present = true
+	}
+	capture, opened := log_capture_open(sink, log_active_correlation(), kind, descriptor)
+	if !opened { return }
+	log_capture_write(&capture, report.message)
+	log_capture_write(&capture, []u8{'\n'})
+	log_capture_finish(&capture, true)
+}

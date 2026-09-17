@@ -2,6 +2,7 @@ package mcp
 
 import "core:encoding/json"
 import "core:mem"
+import "core:strings"
 import "core:time"
 
 // CLIENT_REQUEST_ATTEMPTS is how many times a request with no effect is sent. It is
@@ -84,8 +85,12 @@ client_restart :: proc(client: ^Client) -> Error {
 // The probe comes first because it is unambiguous: a method only one revision
 // defines cannot be answered by accident, whereas a method both revisions define
 // could be read under the wrong semantics.
-client_connect :: proc(client: ^Client, control: Control, allocator := context.allocator) -> (Connection, Error) {
-	connection, answered, probe_err := client_try_discover(client, control, allocator)
+// Every operation that exchanges a message takes raw Operation_Options rather
+// than a Control, so the observer is an argument to the operation rather than a
+// fact this package keeps. stdio waits receive only its control field.
+client_connect :: proc(client: ^Client, options: Operation_Options, allocator := context.allocator) -> (Connection, Error) {
+	control := options.control
+	connection, answered, probe_err := client_try_discover(client, options, allocator)
 	if probe_err.kind == .None { return connection, {} }
 	if answered {
 		// The server produced a discovery result, so it speaks the stateless
@@ -99,19 +104,21 @@ client_connect :: proc(client: ^Client, control: Control, allocator := context.a
 
 	// A server that met an unknown method may have closed or wedged itself, so the
 	// handshake starts from a fresh process.
+	// A restarted server is a fresh one, so it is negotiated with from the same
+	// observer the caller asked for.
 	if !client_running(client) {
 		if restart_err := client_restart(client); restart_err.kind != .None { return {}, restart_err }
 	}
-	return client_initialize(client, control, allocator)
+	return client_initialize(client, options, allocator)
 }
 
 // client_try_discover probes for the stateless revision. answered reports whether
 // the server produced a discovery result, which is what separates "this server
 // speaks the other era" from "this server speaks this era and refused".
 @(private)
-client_try_discover :: proc(client: ^Client, control: Control, allocator: mem.Allocator) -> (connection: Connection, answered: bool, err: Error) {
+client_try_discover :: proc(client: ^Client, options: Operation_Options, allocator: mem.Allocator) -> (connection: Connection, answered: bool, err: Error) {
 	params := request_params_make(.V2026_07_28, 0, client.allocator)
-	result, exchange_err := client_exchange(client, METHOD_DISCOVER, params, control)
+	result, exchange_err := client_exchange(client, METHOD_DISCOVER, params, options)
 	if exchange_err.kind != .None { return {}, false, exchange_err }
 
 	object, is_object := result.(json.Object)
@@ -131,8 +138,9 @@ client_try_discover :: proc(client: ^Client, control: Control, allocator: mem.Al
 // initialize request, which the server answers with the revision it will use, and
 // one notification saying the client is ready.
 @(private)
-client_initialize :: proc(client: ^Client, control: Control, allocator: mem.Allocator) -> (Connection, Error) {
-	result, exchange_err := client_exchange(client, METHOD_INITIALIZE, initialize_params_make(client.allocator), control)
+client_initialize :: proc(client: ^Client, options: Operation_Options, allocator: mem.Allocator) -> (Connection, Error) {
+	control := options.control
+	result, exchange_err := client_exchange(client, METHOD_INITIALIZE, initialize_params_make(client.allocator), options)
 	if exchange_err.kind != .None { return {}, exchange_err }
 
 	object, is_object := result.(json.Object)
@@ -154,7 +162,10 @@ client_initialize :: proc(client: ^Client, control: Control, allocator: mem.Allo
 		deadline_at  = time.tick_add(time.tick_now(), CLIENT_HANDSHAKE_TIMEOUT),
 		has_deadline = true,
 	}
-	if notify_err := client_notify(client, NOTIFICATION_INITIALIZED, nil, handshake_control); notify_err.kind != .None {
+	// The continuation keeps the caller's observer: the notification is part of
+	// the same handshake the caller asked to watch.
+	if notify_err := client_notify(client, NOTIFICATION_INITIALIZED, nil, Operation_Options{control = handshake_control, observer = options.observer});
+	   notify_err.kind != .None {
 		connection_destroy(&connection, allocator)
 		client.version = .Unknown
 		return {}, notify_err
@@ -163,11 +174,12 @@ client_initialize :: proc(client: ^Client, control: Control, allocator: mem.Allo
 }
 
 @(private)
-client_notify :: proc(client: ^Client, method: string, params: json.Object, control: Control) -> Error {
+client_notify :: proc(client: ^Client, method: string, params: json.Object, options: Operation_Options) -> Error {
 	line, encode_err := notification_encode(method, params, client.allocator)
 	defer delete(line, client.allocator)
 	if encode_err.kind != .None { return encode_err }
-	return stdio_write_line(&client.stdio, line, control)
+	operation_report(options, {direction = .Outgoing, operation = method, message = transmute([]u8)line})
+	return stdio_write_line(&client.stdio, line, options.control)
 }
 
 // client_exchange sends one request and returns its result object. It takes
@@ -179,19 +191,27 @@ client_notify :: proc(client: ^Client, method: string, params: json.Object, cont
 // client declares no capability for any of them. Under the stateless revision such
 // a request is a protocol violation, since that revision carries the interaction
 // inside a result instead.
-client_exchange :: proc(client: ^Client, method: string, params: json.Object, control: Control) -> (result: json.Value, err: Error) {
+client_exchange :: proc(client: ^Client, method: string, params: json.Object, options: Operation_Options) -> (result: json.Value, err: Error) {
+	control := options.control
 	client.next_id += 1
 	id := client.next_id
 	line, encode_err := request_encode(method, params, id, client.allocator)
 	defer delete(line, client.allocator)
 	if encode_err.kind != .None { return nil, encode_err }
 
+	// The line is reported before it is written, because this is the last moment
+	// it is one buffer rather than bytes inside the transport.
+	operation_report(options, {direction = .Outgoing, operation = method, request_id = id, message = transmute([]u8)line})
 	if write_err := stdio_write_line(&client.stdio, line, control); write_err.kind != .None { return nil, write_err }
 
 	notifications := 0
 	for {
 		framed, read_err := stdio_read_line(&client.stdio, control)
 		if read_err.kind != .None { return nil, read_err }
+
+		// Every complete line is reported before it is decoded, so a reader sees
+		// what the peer actually sent rather than what this client made of it.
+		operation_report(options, {direction = .Incoming, operation = method, request_id = id, message = framed})
 
 		message, decode_err := message_decode(string(framed), client.allocator)
 		if decode_err.kind != .None {
@@ -238,9 +258,14 @@ client_exchange :: proc(client: ^Client, method: string, params: json.Object, co
 					"the server sent a request; this revision carries such interaction inside a result",
 				)
 			}
+			// The refusal is written after the message is released, so the method it
+			// answers is copied for the length of this iteration.
 			request_id := message.id
+			refused_method := strings.clone(message.method, client.allocator)
 			message_destroy(&message, client.allocator)
-			if refuse_err := client_refuse_request(client, request_id, control); refuse_err.kind != .None { return nil, refuse_err }
+			refuse_err := client_refuse_request(client, refused_method, request_id, options)
+			delete(refused_method, client.allocator)
+			if refuse_err.kind != .None { return nil, refuse_err }
 		}
 	}
 }
@@ -248,7 +273,7 @@ client_exchange :: proc(client: ^Client, method: string, params: json.Object, co
 // client_refuse_request answers a server-initiated request with an error, which is
 // the only honest reply from a client that declares no capability for it.
 @(private)
-client_refuse_request :: proc(client: ^Client, id: i64, control: Control) -> Error {
+client_refuse_request :: proc(client: ^Client, method: string, id: i64, options: Operation_Options) -> Error {
 	line, encode_err := response_error_encode(
 		id,
 		ERROR_CODE_METHOD_NOT_FOUND,
@@ -257,7 +282,10 @@ client_refuse_request :: proc(client: ^Client, id: i64, control: Control) -> Err
 	)
 	defer delete(line, client.allocator)
 	if encode_err.kind != .None { return encode_err }
-	return stdio_write_line(&client.stdio, line, control)
+	// The refusal is this client's own message, and is reported as such so a trace
+	// shows both sides of the exchange.
+	operation_report(options, {direction = .Outgoing, operation = method, request_id = id, message = transmute([]u8)line})
+	return stdio_write_line(&client.stdio, line, options.control)
 }
 
 // client_stream_error reports a protocol violation observed after the request was
@@ -287,7 +315,8 @@ client_error_is_transport :: proc(err: Error) -> bool {
 //
 // The listing has no effect, so it may be sent again after the server is restarted;
 // a tool call may not.
-client_tools_list :: proc(client: ^Client, control: Control, allocator := context.allocator) -> (Tool_Page, Error) {
+client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator := context.allocator) -> (Tool_Page, Error) {
+	control := options.control
 	if client.version == .Unknown {
 		return {}, error_make(.Protocol_Violation, "the server has not been negotiated with yet", allocator = allocator)
 	}
@@ -308,7 +337,7 @@ client_tools_list :: proc(client: ^Client, control: Control, allocator := contex
 		// The listing is read-only, so a transport failure is retried once against a
 		// fresh server.
 		for attempts := 0;; attempts += 1 {
-			result, exchange_err := client_exchange(client, METHOD_TOOLS_LIST, tools_list_params_make(cursor, client.version, client.allocator), control)
+			result, exchange_err := client_exchange(client, METHOD_TOOLS_LIST, tools_list_params_make(cursor, client.version, client.allocator), options)
 			if exchange_err.kind == .None {
 				object, is_object := result.(json.Object)
 				if !is_object {
@@ -326,7 +355,7 @@ client_tools_list :: proc(client: ^Client, control: Control, allocator := contex
 			error_destroy(&exchange_err, allocator)
 			if restart_err := client_restart(client); restart_err.kind != .None { return {}, restart_err }
 			// A restarted server is a fresh one and must be negotiated with again.
-			if _, connect_err := client_connect(client, control, allocator); connect_err.kind != .None { return {}, connect_err }
+			if _, connect_err := client_connect(client, options, allocator); connect_err.kind != .None { return {}, connect_err }
 		}
 
 		// The page's contents move into the merged page, and the cursor moves into
@@ -350,14 +379,23 @@ client_tools_list :: proc(client: ^Client, control: Control, allocator := contex
 // client_tools_call runs one tool. It is sent exactly once: a server may have
 // performed the call before a lost reply, so a failure after the request was written
 // reports that the outcome is unknown rather than trying again.
-client_tools_call :: proc(client: ^Client, name: string, arguments_json: string, control: Control, allocator := context.allocator) -> (Call_Result, Error) {
+client_tools_call :: proc(
+	client: ^Client,
+	name: string,
+	arguments_json: string,
+	options: Operation_Options,
+	allocator := context.allocator,
+) -> (
+	Call_Result,
+	Error,
+) {
 	if client.version == .Unknown {
 		return {}, error_make(.Protocol_Violation, "the server has not been negotiated with yet", allocator = allocator)
 	}
 	params, params_err := tools_call_params_make(name, arguments_json, client.version, client.allocator)
 	if params_err.kind != .None { return {}, params_err }
 
-	result, exchange_err := client_exchange(client, METHOD_TOOLS_CALL, params, control)
+	result, exchange_err := client_exchange(client, METHOD_TOOLS_CALL, params, options)
 	if exchange_err.kind != .None { return {}, exchange_err }
 
 	object, is_object := result.(json.Object)

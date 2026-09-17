@@ -118,6 +118,14 @@ log_observation_wanted :: proc() -> bool {
 	return sink != nil && sink.capture_mode == .Payloads
 }
 
+// log_capture_wanted reports whether payload capture is on for the active sink.
+// It is the one place a producer asks, so whether an observer is attached and
+// whether an artifact is admitted cannot disagree about the policy.
+log_capture_wanted :: proc() -> bool {
+	sink := log_active_sink()
+	return sink != nil && sink.open && sink.capture_mode == .Payloads
+}
+
 // log_correlation is the correlation work on chat currently carries. Whatever the
 // session has reached is carried; a field the session has not set is left absent
 // rather than guessed, and a retired operation contributes no identity because no

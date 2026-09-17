@@ -34,6 +34,7 @@ main :: proc() {
 		return
 	}
 	scenario_happy_path()
+	scenario_wire_observation()
 	scenario_unusable_tool()
 	scenario_tool_failure()
 	scenario_input_required()
@@ -85,7 +86,7 @@ start :: proc(client: ^mcp.Client, config: mcp.Stdio_Config) -> bool {
 
 @(private)
 negotiate :: proc(client: ^mcp.Client) -> bool {
-	connection, err := mcp.client_connect(client, mcp.Control{})
+	connection, err := mcp.client_connect(client, mcp.Operation_Options{})
 	ok := err.kind == .None
 	mcp.connection_destroy(&connection)
 	mcp.error_destroy(&err)
@@ -100,10 +101,10 @@ scenario_happy_path :: proc() {
 	if !start(&client, scenario_config("ok")) { return }
 	check(true, "a stdio server starts")
 
-	control := mcp.Control{}
+	options := mcp.Operation_Options{}
 	// The fake server refuses to answer a request without the per-request protocol
 	// metadata, so every check below also asserts the envelope.
-	connection, connect_err := mcp.client_connect(&client, control)
+	connection, connect_err := mcp.client_connect(&client, options)
 	if connect_err.kind == .None {
 		check(connection.version == .V2026_07_28, "the probe negotiates the stateless revision")
 		check(connection.tools_supported, "discovery reports the tools capability")
@@ -114,7 +115,7 @@ scenario_happy_path :: proc() {
 	mcp.connection_destroy(&connection)
 	mcp.error_destroy(&connect_err)
 
-	page, page_err := mcp.client_tools_list(&client, control)
+	page, page_err := mcp.client_tools_list(&client, options)
 	if page_err.kind == .None {
 		check(len(page.tools) == 2, "pagination merges both pages in order")
 		check(len(page.rejected) == 1, "one unusable tool is reported rather than dropping the page")
@@ -129,7 +130,7 @@ scenario_happy_path :: proc() {
 	mcp.tool_page_destroy(&page)
 	mcp.error_destroy(&page_err)
 
-	result, call_err := mcp.client_tools_call(&client, "good_a", `{"title":"x"}`, control)
+	result, call_err := mcp.client_tools_call(&client, "good_a", `{"title":"x"}`, options)
 	if call_err.kind == .None {
 		check(!result.is_error, "a successful call is not a failure")
 		check(len(result.content) == 1 && result.content[0].kind == .Text, "the text content is read")
@@ -142,6 +143,99 @@ scenario_happy_path :: proc() {
 	mcp.error_destroy(&call_err)
 }
 
+// Wire_Log is what one scenario observed. Each message is copied, because the
+// report borrows its bytes only until the callback returns.
+Wire_Log :: struct {
+	lines:  [dynamic]string,
+	report: [dynamic]mcp.Wire_Report,
+}
+
+wire_log_report :: proc(user_data: rawptr, report: mcp.Wire_Report) {
+	log := cast(^Wire_Log)user_data
+	append(&log.lines, strings.clone(string(report.message), context.allocator))
+	// The report's own fields are copied too, without the borrowed message.
+	copied := report
+	copied.message = nil
+	append(&log.report, copied)
+}
+
+wire_log_destroy :: proc(log: ^Wire_Log) {
+	for line in log.lines { delete(line, context.allocator) }
+	delete(log.lines)
+	delete(log.report)
+}
+
+// The observer sees the exact JSON-RPC lines each exchange carries, both ways, and
+// observing changes nothing about the operation: the same call succeeds with and
+// without it.
+@(private)
+scenario_wire_observation :: proc() {
+	client: mcp.Client
+	defer mcp.client_destroy(&client)
+	if !start(&client, scenario_config("ok")) { return }
+
+	log: Wire_Log
+	defer wire_log_destroy(&log)
+
+	options := mcp.Operation_Options {
+		observer = {user_data = &log, report = wire_log_report},
+	}
+	connection, connect_err := mcp.client_connect(&client, options)
+	check(connect_err.kind == .None, "an observed connection still negotiates")
+	mcp.connection_destroy(&connection)
+	mcp.error_destroy(&connect_err)
+
+	result, call_err := mcp.client_tools_call(&client, "good_a", `{"title":"x"}`, options)
+	check(call_err.kind == .None, "an observed call still succeeds")
+	mcp.call_result_destroy(&result)
+	mcp.error_destroy(&call_err)
+
+	// Every line is a whole JSON-RPC message, and the observer saw both directions.
+	outgoing, incoming := 0, 0
+	for report, index in log.report {
+		line := log.lines[index]
+		if report.direction == .Outgoing { outgoing += 1 } else { incoming += 1 }
+		// The line is parsed rather than pattern-matched: whether the id or the
+		// version comes first is an encoding detail, but a message that is not one
+		// JSON-RPC object is not a message.
+		value, parse_err := json.parse_string(line, allocator = context.temp_allocator)
+		check(parse_err == .None, "an observed line is JSON")
+		if object, is_object := value.(json.Object); is_object {
+			_, has_version := object["jsonrpc"]
+			_, has_id := object["id"]
+			_, has_method := object["method"]
+			check(has_version, "an observed line is a JSON-RPC message")
+			check(has_id || has_method, "an observed line carries an id or a method")
+		} else {
+			check(false, "an observed line is one JSON object")
+		}
+		json.destroy_value(value, context.temp_allocator)
+		check(report.operation != "", "an observed line names the operation it belongs to")
+		check(!strings.has_suffix(line, "\n"), "the framing newline is not part of the message")
+		// A report that outlived its callback would point into freed memory, so the
+		// copied text is the only thing that is checked after the fact.
+		check(report.message == nil || len(report.message) > 0, "the borrowed message is reported")
+	}
+	check(outgoing > 0, "the observer sees what the client sent")
+	check(incoming > 0, "the observer sees what the server answered")
+
+	// The probe, the initialized notification, and the call are all reported, which
+	// is what makes the trace cover the whole operation rather than one method.
+	joined := strings.join(log.lines[:], "\n", context.temp_allocator)
+	check(strings.contains(joined, `"method":"server/discover"`), "the discovery probe is observed")
+	check(strings.contains(joined, `"method":"tools/call"`), "the tool call is observed")
+	check(strings.contains(joined, `"result"`), "the server's reply is observed")
+
+	// A zero observer changes nothing: the same call produces the same outcome.
+	plain: mcp.Client
+	defer mcp.client_destroy(&plain)
+	if !start(&plain, scenario_config("ok")) { return }
+	plain_connection, plain_err := mcp.client_connect(&plain, mcp.Operation_Options{})
+	check(plain_err.kind == .None, "an unobserved connection negotiates the same way")
+	mcp.connection_destroy(&plain_connection)
+	mcp.error_destroy(&plain_err)
+}
+
 // A stateless server that answers the probe but does not list this client's
 // revision is refused, and the handshake is not attempted: an answer to the probe
 // settles which era the server belongs to.
@@ -151,7 +245,7 @@ scenario_version_refused :: proc() {
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("unsupported")) { return }
 
-	connection, err := mcp.client_connect(&client, mcp.Control{})
+	connection, err := mcp.client_connect(&client, mcp.Operation_Options{})
 	check(err.kind == .Version_Unsupported, "a stateless server without our revision is refused")
 	check(strings.contains(err.message, "2025-06-18"), "the refusal names the revisions it does support")
 	mcp.connection_destroy(&connection)
@@ -164,7 +258,7 @@ scenario_unusable_tool :: proc() {
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("bad_tool")) { return }
 	if !negotiate(&client) { return }
-	page, err := mcp.client_tools_list(&client, mcp.Control{})
+	page, err := mcp.client_tools_list(&client, mcp.Operation_Options{})
 	if err.kind == .None {
 		check(len(page.tools) == 1, "a usable tool survives a malformed sibling")
 		check(len(page.rejected) == 1, "the malformed tool is reported")
@@ -183,7 +277,7 @@ scenario_tool_failure :: proc() {
 	if !start(&client, scenario_config("is_error")) { return }
 	if !negotiate(&client) { return }
 
-	result, err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Control{})
+	result, err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Operation_Options{})
 	if err.kind == .None {
 		check(result.is_error, "a server-reported failure is read as one")
 	} else {
@@ -200,7 +294,7 @@ scenario_input_required :: proc() {
 	if !start(&client, scenario_config("input_required")) { return }
 	if !negotiate(&client) { return }
 
-	result, err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Control{})
+	result, err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Operation_Options{})
 	if err.kind == .None {
 		check(result.input_required, "a request for input is recognised")
 		check(result.request_state == "opaque", "the server's state token is kept")
@@ -228,7 +322,7 @@ scenario_lost_reply :: proc() {
 	if !start(&client, scenario_config("lost_reply", []string{marker})) { return }
 	if !negotiate(&client) { return }
 
-	result, err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Control{})
+	result, err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Operation_Options{})
 	check(err.kind != .None, "a lost reply is a failure")
 	check(mcp.error_delivered(err), "the outcome is reported as delivered, so it is unknown rather than absent")
 	mcp.call_result_destroy(&result)
@@ -246,7 +340,7 @@ scenario_stderr_flood :: proc() {
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("stderr_flood")) { return }
 
-	_, err := mcp.client_connect(&client, mcp.Control{})
+	_, err := mcp.client_connect(&client, mcp.Operation_Options{})
 	check(err.kind != .None, "a server that exits without replying fails the request")
 	check(len(err.stderr_tail) > 0, "the server's own last output is attached")
 	// The flood is larger than the bound, so a bounded tail is exactly full.
@@ -260,7 +354,7 @@ scenario_oversized_message :: proc() {
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("oversized")) { return }
 
-	_, err := mcp.client_connect(&client, mcp.Control{})
+	_, err := mcp.client_connect(&client, mcp.Operation_Options{})
 	check(err.kind == .Message_Too_Large, "a message past the bound is refused")
 	mcp.error_destroy(&err)
 }
@@ -274,7 +368,7 @@ scenario_handshake :: proc() {
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("legacy")) { return }
 
-	connection, connect_err := mcp.client_connect(&client, mcp.Control{})
+	connection, connect_err := mcp.client_connect(&client, mcp.Operation_Options{})
 	if connect_err.kind == .None {
 		check(connection.version == .V2025_11_25, "the handshake takes the revision the server chose")
 		check(connection.tools_supported, "the handshake reports the tools capability")
@@ -286,7 +380,7 @@ scenario_handshake :: proc() {
 	mcp.connection_destroy(&connection)
 	mcp.error_destroy(&connect_err)
 
-	page, page_err := mcp.client_tools_list(&client, mcp.Control{})
+	page, page_err := mcp.client_tools_list(&client, mcp.Operation_Options{})
 	if page_err.kind == .None {
 		check(len(page.tools) == 1, "a listing with no resultType is read")
 	} else {
@@ -295,7 +389,7 @@ scenario_handshake :: proc() {
 	mcp.tool_page_destroy(&page)
 	mcp.error_destroy(&page_err)
 
-	result, call_err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Control{})
+	result, call_err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Operation_Options{})
 	if call_err.kind == .None {
 		check(!result.input_required, "a handshake-era result is always a completion")
 		check(len(result.content) == 1 && result.content[0].text == "legacy ok", "the text is read")
@@ -317,7 +411,7 @@ scenario_handshake_server_request :: proc() {
 	if !start(&client, scenario_config("legacy_server_request")) { return }
 	if !negotiate(&client) { return }
 
-	result, call_err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Control{})
+	result, call_err := mcp.client_tools_call(&client, "good_a", `{}`, mcp.Operation_Options{})
 	if call_err.kind == .None {
 		check(len(result.content) == 1 && result.content[0].text == "legacy ok", "the call completes while the server's own request is answered")
 	} else {
@@ -333,7 +427,7 @@ scenario_handshake_unsupported :: proc() {
 	defer mcp.client_destroy(&client)
 	if !start(&client, scenario_config("legacy_unsupported")) { return }
 
-	connection, err := mcp.client_connect(&client, mcp.Control{})
+	connection, err := mcp.client_connect(&client, mcp.Operation_Options{})
 	check(err.kind == .Version_Unsupported, "a revision this client does not implement is refused")
 	check(strings.contains(err.message, "2024-11-05"), "the refusal names the revision the server chose")
 	mcp.connection_destroy(&connection)

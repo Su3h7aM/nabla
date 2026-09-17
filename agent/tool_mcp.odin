@@ -80,6 +80,10 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (result:
 	started := time.tick_now()
 	exchange_error: mcp.Error
 	delivery := mcp.Delivery_State.Not_Delivered
+	// The wire log belongs to this call, and every message the call exchanges is
+	// captured against it while payload capture is on.
+	wire := MCP_Log{}
+	if backend != nil { wire.server_id = backend.server_id }
 	defer mcp.error_destroy(&exchange_error, ctx.allocator)
 	defer log_mcp_exchange_finished(backend, delivery, exchange_error, result.outcome, time.tick_since(started))
 	log_mcp_exchange_started(backend)
@@ -96,7 +100,7 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (result:
 	}
 
 	call: mcp.Call_Result
-	call, exchange_error = mcp.client_tools_call(backend.client, backend.remote_name, ctx.arguments_json, tool_mcp_control(ctx), ctx.allocator)
+	call, exchange_error = mcp.client_tools_call(backend.client, backend.remote_name, ctx.arguments_json, tool_mcp_options(ctx, &wire), ctx.allocator)
 	defer mcp.call_result_destroy(&call, ctx.allocator)
 	if exchange_error.kind != .None {
 		delivery = exchange_error.delivery
@@ -106,14 +110,15 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (result:
 	return tool_mcp_call_result(ctx, call)
 }
 
-// tool_mcp_control derives the call's bounds from the turn control and the
-// definition's own timeout policy. The turn deadline has already reached
-// ctx.control, so the effective bound is the earliest applicable one.
+// tool_mcp_options derives the call's bounds from the turn control and the
+// definition's own timeout policy, and attaches the wire log. The turn deadline
+// has already reached ctx.control, so the effective bound is the earliest
+// applicable one.
 @(private)
-tool_mcp_control :: proc(ctx: ^Tool_Context) -> mcp.Control {
-	control := mcp.Control {
-		user_data   = ctx.control.interrupt,
-		interrupted = tool_mcp_interrupted,
+tool_mcp_options :: proc(ctx: ^Tool_Context, wire: ^MCP_Log) -> mcp.Operation_Options {
+	options := mcp.Operation_Options {
+		control = {user_data = ctx.control.interrupt, interrupted = tool_mcp_interrupted},
+		observer = mcp_log_observer(wire),
 	}
 	// An adapted tool exposes no timeout argument, so there is nothing for the model
 	// to request and nothing to clamp: the default is the bound, with the maximum as
@@ -123,10 +128,10 @@ tool_mcp_control :: proc(ctx: ^Tool_Context) -> mcp.Control {
 	deadline := ctx.control.deadline
 	if timeout > 0 { deadline = tool_mcp_deadline_earlier(deadline, ai.deadline_in(timeout)) }
 	if deadline.active {
-		control.deadline_at = deadline.at
-		control.has_deadline = true
+		options.control.deadline_at = deadline.at
+		options.control.has_deadline = true
 	}
-	return control
+	return options
 }
 
 @(private)

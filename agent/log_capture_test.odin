@@ -8,6 +8,7 @@ import "core:testing"
 
 import "nabla:agent/session"
 import "nabla:ai"
+import "nabla:mcp"
 
 // Payload capture is tested at the boundary that fills it: the provider report the
 // bridge turns into artifacts. The assertions read the files and the sidecar, which
@@ -236,4 +237,89 @@ test_capture_withdraws_an_artifact_that_never_stored_anything :: proc(t: ^testin
 	defer log_capture_names_destroy(&names)
 	testing.expect_value(t, len(names), 0)
 	testing.expect(t, !log_health(&fixture.log).failed, "an empty capture is not a failure")
+}
+
+@(test)
+test_capture_stores_each_mcp_message_with_its_exchange :: proc(t: ^testing.T) {
+	fixture: Log_Test
+	log_capture_begin(t, &fixture, .Payloads)
+	defer log_test_end(t, &fixture)
+
+	session_id := session.Session_Id("00112233445566778899aabbccddeeff")
+	binding := Log_Binding {
+		sink = &fixture.log,
+		correlation = Log_Correlation{session_id = session_id, call_id = "call_7"},
+	}
+	context.logger = log_logger(&binding)
+
+	wire: MCP_Log = {
+		server_id = "files",
+	}
+	observer := mcp_log_observer(&wire)
+	request := `{"id":4,"jsonrpc":"2.0","method":"tools/call","params":{"name":"read_file"}}`
+	reply := `{"id":4,"jsonrpc":"2.0","result":{"content":[]}}`
+	observer.report(observer.user_data, {direction = .Outgoing, operation = mcp.METHOD_TOOLS_CALL, request_id = 4, message = transmute([]u8)request})
+	observer.report(observer.user_data, {direction = .Incoming, operation = mcp.METHOD_TOOLS_CALL, request_id = 4, message = transmute([]u8)reply})
+	// A notification carries no id, so the descriptor says none rather than zero.
+	progress_line := `{"jsonrpc":"2.0","method":"notifications/progress"}`
+	observer.report(observer.user_data, {direction = .Outgoing, operation = "notifications/progress", message = transmute([]u8)progress_line})
+
+	// Each message is its own artifact, holding the exact bytes plus the newline the
+	// transport frames them with.
+	outgoing := log_test_text(t, log_capture_artifact_path(&fixture, "000001-mcp-outgoing.body"))
+	defer delete(outgoing, context.allocator)
+	testing.expect_value(t, outgoing, strings.concatenate({request, "\n"}, context.temp_allocator))
+
+	incoming := log_test_text(t, log_capture_artifact_path(&fixture, "000002-mcp-incoming.body"))
+	defer delete(incoming, context.allocator)
+	testing.expect_value(t, incoming, strings.concatenate({reply, "\n"}, context.temp_allocator))
+
+	// The sidecar says which exchange the artifact belongs to, which is what makes a
+	// message findable from the log rather than only by file name.
+	sidecar := log_test_text(t, log_capture_artifact_path(&fixture, "000002-mcp-incoming.body.json"))
+	defer delete(sidecar, context.allocator)
+	log_test_expect_all(
+		t,
+		sidecar,
+		{`"kind":"mcp-incoming"`, `"server_id":"files"`, `"operation":"tools/call"`, `"external_id_present":true`, `"external_id":4`, `"call_id":"call_7"`},
+		"the sidecar",
+	)
+
+	// A notification has no exchange id, and the sidecar says so instead of
+	// claiming zero was one.
+	progress := log_test_text(t, log_capture_artifact_path(&fixture, "000003-mcp-outgoing.body.json"))
+	defer delete(progress, context.allocator)
+	log_test_expect_all(t, progress, {`"operation":"notifications/progress"`, `"external_id_present":false`}, "the notification sidecar")
+
+	// The record links the artifact to the call it was observed under.
+	text := log_test_segment_text(t, &fixture, 1)
+	defer delete(text, context.allocator)
+	testing.expect(t, strings.contains(text, `"artifact_kind":"mcp-outgoing"`), "the outgoing message is recorded")
+	testing.expect(t, strings.contains(text, `"artifact_kind":"mcp-incoming"`), "the incoming message is recorded")
+	testing.expect(t, strings.contains(text, `"server_id":"files"`), "the record names the server")
+	testing.expect(t, strings.contains(text, `"operation":"tools/call"`), "the record names the exchange")
+}
+
+@(test)
+test_a_wire_message_is_not_stored_without_permission :: proc(t: ^testing.T) {
+	fixture: Log_Test
+	log_capture_begin(t, &fixture, .Off)
+	defer log_test_end(t, &fixture)
+
+	binding := Log_Binding {
+		sink = &fixture.log,
+	}
+	context.logger = log_logger(&binding)
+	testing.expect(t, !log_capture_wanted(), "capture is off, so no observer is attached")
+
+	wire: MCP_Log = {
+		server_id = "files",
+	}
+	observer := mcp_log_observer(&wire)
+	line := `{"id":1}`
+	observer.report(observer.user_data, {direction = .Outgoing, operation = mcp.METHOD_TOOLS_CALL, request_id = 1, message = transmute([]u8)line})
+
+	names := log_capture_names(t, &fixture)
+	defer log_capture_names_destroy(&names)
+	testing.expect_value(t, len(names), 0)
 }

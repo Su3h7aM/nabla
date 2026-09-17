@@ -48,13 +48,32 @@ Capture_Mode :: enum {
 
 // Capture_Kind names what an artifact holds. Invalid is the zero value, so a zero
 // Capture is never written and never mistaken for a real one.
+//
+// The MCP kinds name one wire message each, because a JSON-RPC line is what a
+// protocol trace needs: the request, the reply, and the notification between them
+// are separate facts about the same operation.
 Capture_Kind :: enum {
 	Invalid,
 	Provider_Request,
 	Provider_Response,
-	MCP_Request,
-	MCP_Response,
-	MCP_Stderr,
+	MCP_Outgoing,
+	MCP_Incoming,
+}
+
+// Capture_Descriptor names what a protocol artifact belongs to, when the generic
+// correlation is not enough. One MCP message is one line rather than one request,
+// so the server and the exchange it belongs to are part of what the artifact means.
+//
+// An artifact that is not protocol traffic leaves this zero. Its fields are still
+// written, as an empty name and a false presence flag, so a reader never has to
+// decide whether a missing key means "none" or "this build is too old to say".
+Capture_Descriptor :: struct {
+	server_id:           string,
+	operation:           string,
+	// external_id is the peer-facing id of the exchange, and means nothing without
+	// external_id_present: a JSON-RPC id is never zero, so zero is "none".
+	external_id:         i64,
+	external_id_present: bool,
 }
 
 // Capture is one artifact being written: an open prefix, two running digests, and
@@ -62,11 +81,13 @@ Capture_Kind :: enum {
 // or aborts it exactly once.
 //
 // It borrows its sink for quota and for the record about itself, and it copies the
-// correlation because its metadata may be written after the state it describes has
-// moved on. Nothing else is retained: bytes are consumed as they arrive.
+// correlation and the descriptor because its metadata may be written after the
+// state it describes has moved on. Nothing else is retained: bytes are consumed as
+// they arrive.
 Capture :: struct {
 	sink:              ^Log, // borrowed; outlives the capture
 	correlation:       Log_Correlation, // copied, owned
+	descriptor:        Capture_Descriptor, // copied, owned
 	kind:              Capture_Kind,
 	artifact:          u64,
 	file:              ^os.File,
@@ -100,7 +121,18 @@ Capture_Summary :: struct {
 // when capture is off, when the run's quota is exhausted, or when the file could
 // not be created; the caller then simply does not capture, because a capture must
 // never fail the work it observes.
-log_capture_open :: proc(sink: ^Log, correlation: Log_Correlation, kind: Capture_Kind) -> (capture: Capture, opened: bool) {
+//
+// The descriptor names a protocol artifact that the generic correlation does not
+// describe; a capture with nothing extra to say passes the zero value.
+log_capture_open :: proc(
+	sink: ^Log,
+	correlation: Log_Correlation,
+	kind: Capture_Kind,
+	descriptor: Capture_Descriptor = {},
+) -> (
+	capture: Capture,
+	opened: bool,
+) {
 	if sink == nil || !sink.open || kind == .Invalid { return {}, false }
 	if sink.capture_mode != .Payloads { return {}, false }
 
@@ -124,6 +156,7 @@ log_capture_open :: proc(sink: ^Log, correlation: Log_Correlation, kind: Capture
 	capture = Capture {
 		sink        = sink,
 		correlation = log_correlation_copy(correlation, sink.allocator),
+		descriptor  = log_capture_descriptor_copy(descriptor, sink.allocator),
 		kind        = kind,
 		artifact    = artifact,
 		allocator   = sink.allocator,
@@ -211,7 +244,7 @@ log_capture_finish :: proc(capture: ^Capture, complete: bool) -> (summary: Captu
 	log_capture_settle(capture, &summary)
 	log_capture_record(capture, summary)
 	allocator := capture.allocator
-	log_correlation_destroy(&capture.correlation, allocator)
+	log_capture_destroy_owned(capture, allocator)
 	capture^ = {}
 	return summary
 }
@@ -237,8 +270,16 @@ log_capture_discard :: proc(capture: ^Capture) {
 	summary: Capture_Summary
 	log_capture_settle(capture, &summary)
 	allocator := capture.allocator
-	log_correlation_destroy(&capture.correlation, allocator)
+	log_capture_destroy_owned(capture, allocator)
 	capture^ = {}
+}
+
+// log_capture_destroy_owned releases what a capture copied from its caller. It is
+// one definition because both finish and abort have to release the same fields.
+@(private)
+log_capture_destroy_owned :: proc(capture: ^Capture, allocator: mem.Allocator) {
+	log_correlation_destroy(&capture.correlation, allocator)
+	log_capture_descriptor_destroy(&capture.descriptor, allocator)
 }
 
 // log_capture_settle replaces the reserved allowance with what was actually stored
@@ -291,7 +332,7 @@ log_capture_record :: proc(capture: ^Capture, summary: Capture_Summary) {
 		event = "capture.failed"
 	}
 	if level < sink.lowest { return }
-	fields := [7]Log_Field {
+	fields := [10]Log_Field {
 		{key = "artifact_id", value = summary.artifact},
 		{key = "artifact_kind", value = log_capture_kind_name(summary.kind)},
 		{key = "observed_bytes", value = summary.observed_bytes},
@@ -299,6 +340,11 @@ log_capture_record :: proc(capture: ^Capture, summary: Capture_Summary) {
 		{key = "observed_complete", value = summary.observed_complete},
 		{key = "truncated", value = summary.truncated},
 		{key = "failed", value = summary.failed},
+		// A protocol artifact says which exchange it belongs to, so the file can be
+		// found from the log rather than guessed at by name.
+		{key = "server_id", value = capture.descriptor.server_id},
+		{key = "operation", value = capture.descriptor.operation},
+		{key = "external_id", value = capture.descriptor.external_id},
 	}
 	record := Log_Record {
 		level    = level,
@@ -370,6 +416,17 @@ log_capture_sidecar_json :: proc(line: ^Log_Line, capture: ^Capture, summary: ^C
 	log_line_bytes(line, summary.truncated ? "true" : "false")
 	log_line_bytes(line, `,"failed":`)
 	log_line_bytes(line, summary.failed ? "true" : "false")
+	// The descriptor names the exchange a protocol artifact belongs to. It is
+	// written even when it is empty, because a reader that finds no server is
+	// better served than one that cannot tell an absent name from an old format.
+	log_line_bytes(line, `,"server_id":`)
+	log_line_json_string(line, capture.descriptor.server_id)
+	log_line_bytes(line, `,"operation":`)
+	log_line_json_string(line, capture.descriptor.operation)
+	log_line_bytes(line, `,"external_id_present":`)
+	log_line_bytes(line, capture.descriptor.external_id_present ? "true" : "false")
+	log_line_bytes(line, `,"external_id":`)
+	log_line_int(line, capture.descriptor.external_id)
 	if len(correlation.session_id) > 0 {
 		log_line_bytes(line, `,"session_id":`)
 		log_line_json_string(line, string(correlation.session_id))
@@ -450,14 +507,42 @@ log_capture_kind_name :: proc(kind: Capture_Kind) -> string {
 		return "request"
 	case .Provider_Response:
 		return "response"
-	case .MCP_Request:
-		return "mcp-request"
-	case .MCP_Response:
-		return "mcp-response"
-	case .MCP_Stderr:
-		return "mcp-stderr"
+	case .MCP_Outgoing:
+		return "mcp-outgoing"
+	case .MCP_Incoming:
+		return "mcp-incoming"
 	}
 	return "invalid"
+}
+
+// log_capture_descriptor_copy duplicates the descriptor's names so an artifact can
+// hold them past the scope that produced them. A name over the record contract's
+// text cap is trimmed, which is what keeps the bounded sidecar writable.
+@(private)
+log_capture_descriptor_copy :: proc(descriptor: Capture_Descriptor, allocator: mem.Allocator) -> Capture_Descriptor {
+	copied := descriptor
+	if descriptor.server_id != "" {
+		copied.server_id = strings.clone(log_capture_bounded(descriptor.server_id), allocator)
+	}
+	if descriptor.operation != "" {
+		copied.operation = strings.clone(log_capture_bounded(descriptor.operation), allocator)
+	}
+	return copied
+}
+
+@(private)
+log_capture_descriptor_destroy :: proc(descriptor: ^Capture_Descriptor, allocator: mem.Allocator) {
+	delete(descriptor.server_id, allocator)
+	delete(descriptor.operation, allocator)
+	descriptor^ = {}
+}
+
+// log_capture_bounded trims a name to the cap every other text value obeys, so a
+// configured server id cannot be the reason a sidecar overflows.
+@(private)
+log_capture_bounded :: proc(text: string) -> string {
+	if len(text) <= LOG_MAX_TEXT_BYTES { return text }
+	return text[:LOG_MAX_TEXT_BYTES]
 }
 
 @(private)
