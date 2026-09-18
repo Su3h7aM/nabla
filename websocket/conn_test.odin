@@ -1,0 +1,145 @@
+#+test
+package websocket
+
+import "core:mem"
+import "core:testing"
+
+// A connection is driven byte for byte: what a server would send is a buffer, and what
+// the connection sends back is kept, so a test states the frames rather than a socket
+// fixture.
+Fixture :: struct {
+	incoming: []u8,
+	at:       int,
+	outgoing: [dynamic]u8,
+}
+
+fixture_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) {
+	fixture := cast(^Fixture)user_data
+	available := len(fixture.incoming) - fixture.at
+	if available <= 0 { return 0, false }
+	count = min(available, len(buffer))
+	copy(buffer, fixture.incoming[fixture.at:fixture.at + count])
+	fixture.at += count
+	return count, true
+}
+
+fixture_write :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) {
+	fixture := cast(^Fixture)user_data
+	append(&fixture.outgoing, ..buffer)
+	return len(buffer), true
+}
+
+fixture_conn :: proc(t: ^testing.T, fixture: ^Fixture, incoming: []u8) -> ^Conn {
+	fixture.incoming = incoming
+	conn, err := init({read = fixture_read, write = fixture_write, user_data = fixture}, context.temp_allocator)
+	if !testing.expect(t, err == .None, "a connection could not be prepared") { return nil }
+	return conn
+}
+
+// A server's frames carry no mask, so what it sends is what the protocol says it may
+// send.
+@(test)
+test_fragmented_message_with_a_ping_between_the_fragments :: proc(t: ^testing.T) {
+	fixture: Fixture
+	defer delete(fixture.outgoing)
+	incoming := []u8 {
+		// A text message that does not end yet: 0x01 0x03 "Hel".
+		0x01, 0x03, 0x48, 0x65, 0x6c,
+		// A ping between the fragments, whose body the client echoes.
+		0x89, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f,
+		// The rest of the message: 0x80 0x02 "lo".
+		0x80, 0x02, 0x6c, 0x6f,
+		// An orderly close, with code 1000.
+		0x88, 0x02, 0x03, 0xe8,
+	}
+	conn := fixture_conn(t, &fixture, incoming)
+	if conn == nil { return }
+	defer destroy(conn)
+
+	buffer: [64]u8
+	count, opcode, complete, err := read(conn, buffer[:])
+	if !testing.expect(t, err == .None, "the first fragment could not be read") { return }
+	testing.expect_value(t, string(buffer[:count]), "Hel")
+	testing.expect_value(t, opcode, Opcode.Text)
+	testing.expect(t, !complete, "the message ended at its first fragment")
+
+	count, opcode, complete, err = read(conn, buffer[:])
+	if !testing.expect(t, err == .None, "the last fragment could not be read") { return }
+	testing.expect_value(t, string(buffer[:count]), "lo")
+	testing.expect_value(t, opcode, Opcode.Text)
+	testing.expect(t, complete, "the message did not end at its last fragment")
+
+	// The ping was answered before the rest of the message was handed over, so the
+	// reply is the first thing on the wire.
+	pong, pong_header, pong_read := outgoing_frame(fixture.outgoing[:])
+	if !testing.expect(t, pong_read, "the client did not answer the ping") { return }
+	testing.expect_value(t, pong_header.opcode, Opcode.Pong)
+	testing.expect(t, pong_header.masked, "a client frame is masked")
+	testing.expect_value(t, string(pong), "Hello")
+
+	count, _, _, err = read(conn, buffer[:])
+	testing.expect(t, err == .Closed, "the close frame did not end the stream")
+	testing.expect_value(t, count, 0)
+	testing.expect_value(t, conn.close_code, Close_Code.Normal)
+
+	// The close was echoed, which is what both ends agreeing the connection is over
+	// means (RFC 6455 section 5.5.1).
+	_, close_header, close_read := outgoing_frame(fixture.outgoing[pong_header.header_length + len(pong):])
+	testing.expect(t, close_read, "the client did not answer the close")
+	testing.expect_value(t, close_header.opcode, Opcode.Close)
+}
+
+@(test)
+test_frames_a_server_may_not_send :: proc(t: ^testing.T) {
+	// A masked frame: a client must close the connection when it sees one (RFC 6455
+	// section 5.3).
+	fixture: Fixture
+	defer delete(fixture.outgoing)
+	conn := fixture_conn(t, &fixture, []u8{0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58})
+	if conn == nil { return }
+	buffer: [64]u8
+	_, _, _, masked_err := read(conn, buffer[:])
+	testing.expect_value(t, masked_err, Error.Protocol)
+	testing.expect(t, close_code_sent(fixture.outgoing[:]) == Close_Code.Protocol_Error, "the close did not name the protocol error")
+	destroy(conn)
+
+	// A control frame whose payload does not fit in one frame: 0x89 0x7e 0x0100
+	// followed by the octets it claims (RFC 6455 section 5.5).
+	clear(&fixture.outgoing)
+	fixture.at = 0
+	conn = fixture_conn(t, &fixture, []u8{0x89, 0x7e, 0x01, 0x00})
+	if conn == nil { return }
+	_, _, _, large_err := read(conn, buffer[:])
+	testing.expect_value(t, large_err, Error.Protocol)
+	testing.expect(t, close_code_sent(fixture.outgoing[:]) == Close_Code.Protocol_Error, "the close did not name the protocol error")
+	destroy(conn)
+
+	// A text message that is not UTF-8: 0x81 0x01 0xff.
+	clear(&fixture.outgoing)
+	fixture.at = 0
+	conn = fixture_conn(t, &fixture, []u8{0x81, 0x01, 0xff})
+	if conn == nil { return }
+	_, _, _, text_err := read(conn, buffer[:])
+	testing.expect_value(t, text_err, Error.Protocol)
+	testing.expect(t, close_code_sent(fixture.outgoing[:]) == Close_Code.Invalid_Payload, "the close did not name the invalid payload")
+	destroy(conn)
+}
+
+// outgoing_frame decodes the frame at the front of what the connection wrote, so a test
+// can assert on a reply without knowing the masking key it chose.
+@(private)
+outgoing_frame :: proc(data: []u8) -> (payload: []u8, header: Header, ok: bool) {
+	decoded_header, decoded := frame_header_decode(data)
+	if !decoded || len(data) < decoded_header.header_length + decoded_header.length { return nil, {}, false }
+	payload = data[decoded_header.header_length:decoded_header.header_length + decoded_header.length]
+	if decoded_header.masked { frame_mask(payload, decoded_header.mask) }
+	return payload, decoded_header, true
+}
+
+// close_code_sent reads the code out of a close frame the connection wrote.
+@(private)
+close_code_sent :: proc(data: []u8) -> Close_Code {
+	payload, header, ok := outgoing_frame(data)
+	if !ok || header.opcode != .Close || len(payload) < 2 { return Close_Code(0) }
+	return Close_Code(u16(payload[0]) << 8 | u16(payload[1]))
+}
