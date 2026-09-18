@@ -1,8 +1,10 @@
 package tls
 
+import "core:crypto"
 import "core:crypto/ecdsa"
 import "core:crypto/ed25519"
 import "core:crypto/hash"
+import "core:crypto/hmac"
 import "core:crypto/rsa"
 import "core:crypto/x509"
 import "core:mem"
@@ -108,4 +110,18 @@ ed25519_verify :: proc(certificate: ^x509.Certificate, input, signature: []byte)
 	public_key: ed25519.Public_Key
 	if !ed25519.public_key_set_bytes(&public_key, certificate.ec_point) { return false }
 	return ed25519.verify(&public_key, input, signature)
+}
+
+// finished_verify checks the verify_data of a Finished message body, which
+// authenticates every handshake message before it under the traffic secret of the
+// sender's direction (RFC 8446 section 4.4.4).
+finished_verify :: proc(suite: Cipher_Suite, secret: []u8, transcript_hash: []u8, verify_data: []u8) -> bool {
+	size := secret_size(suite)
+	finished_key: [MAX_SECRET_SIZE]u8
+	if !hkdf_expand_label(suite, secret, "finished", {}, finished_key[:size]) { return false }
+
+	mac: [hash.MAX_DIGEST_SIZE]u8
+	hmac.sum(CIPHER_SUITES[suite].hash, mac[:size], transcript_hash, finished_key[:size])
+	// compare_constant_time returns 1 for equal and 0 otherwise.
+	return crypto.compare_constant_time(mac[:size], verify_data) == 1
 }
