@@ -2,6 +2,7 @@ package agent
 
 import "core:fmt"
 import "core:mem"
+import "core:os"
 import "core:strings"
 import linux "core:sys/linux"
 import "core:thread"
@@ -265,11 +266,14 @@ Compact_Job :: struct {
 	request_no: session.Request_No,
 	interrupt:  ai.Interrupt,
 	thread:     ^thread.Thread,
-	// The job's memory is shared between two threads, so it goes through an
-	// allocator that serializes access. backing is what the job itself was
-	// allocated with, because freeing the job cannot go through its own lock.
-	locked:     mem.Mutex_Allocator,
+	// allocator is the thread-safe heap the worker-owned storage comes from: the frozen
+	// snapshot, the output it accumulates, and everything the request allocates while it
+	// runs. It is deliberately not the session's allocator: wrapping the worker's own
+	// allocations in a lock would not serialize the owner's writes through the same backing
+	// allocator, so the two threads never share one.
 	allocator:  mem.Allocator,
+	// backing is what the job struct itself was allocated with, which is the session's
+	// allocator: the control object belongs to the thread that drives the session.
 	backing:    mem.Allocator,
 	output:     [dynamic]u8, // owner after join
 	reason:     ai.Provider_Finish_Reason,
@@ -307,15 +311,13 @@ Compact_Request_Result :: enum {
 	Unavailable,
 }
 
-// chat_compact_job_allocator gives a job one lock over the session's allocator,
-// so both threads may allocate and free the job's memory.
+// chat_compact_job_allocator gives a job the heap its worker-owned storage comes from. The
+// heap is process-wide and thread-safe, so the worker allocates with it directly and the
+// owner releases what is left after the join, with the same allocator.
 @(private)
 chat_compact_job_allocator :: proc(job: ^Compact_Job, backing: mem.Allocator) {
 	job.backing = backing
-	job.locked = {
-		backing = backing,
-	}
-	job.allocator = mem.mutex_allocator(&job.locked)
+	job.allocator = os.heap_allocator()
 }
 
 @(private)
@@ -346,9 +348,10 @@ chat_compact_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 @(private)
 chat_compact_worker :: proc(thread: ^thread.Thread) {
 	job := cast(^Compact_Job)thread.data
-	// The thread library gives this thread its own default context, whose allocator
-	// is the heap. Adopting the job's allocator keeps everything the request
-	// allocates owned by the allocator the owner will release it with.
+	// The thread library gives this thread its own default context, whose allocator is the
+	// heap. Adopting the job's allocator keeps everything the request allocates owned by the
+	// allocator the owner releases it with, and that allocator is a thread-safe heap because
+	// the owner is allocating from its own at the same time.
 	context.allocator = job.allocator
 	job.started_at = time.tick_now()
 

@@ -321,8 +321,9 @@ test_a_failed_compaction_leaves_the_context_alone :: proc(t: ^testing.T) {
 	_, beyond_err := session.request_load(chat.store, chat.id, session.Request_No(CHAT_COMPACT_MAX_ATTEMPTS + 1), chat.allocator)
 	testing.expect(t, beyond_err != nil, "an exhausted chain begins no further attempt")
 
-	_, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
+	checkpoint, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
 	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
+	if has_checkpoint { session.entry_destroy(&checkpoint, context.allocator) }
 	testing.expect(t, !has_checkpoint, "a failed compaction must not write a checkpoint")
 
 	ctx := _test_context(t, chat)
@@ -469,8 +470,9 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(t: ^testing.
 	// the chain may make, and a summary that never arrives writes no checkpoint.
 	chat.compact_retry = test_compact_retry_policy()
 	if !compact_service_until(t, chat, .Idle) { return }
-	_, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
+	checkpoint, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
 	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
+	if has_checkpoint { session.entry_destroy(&checkpoint, context.allocator) }
 	testing.expect(t, !has_checkpoint)
 }
 
@@ -649,8 +651,9 @@ test_an_idle_session_starts_the_summary_a_refusal_recorded :: proc(t: ^testing.T
 	testing.expect(t, chat_compact_idle_service(chat, observer, connection), "installing a ready summary changed the context")
 	testing.expect_value(t, chat.compact.state, Compact_State.Idle)
 	testing.expect(t, len(notices.lines) > 0, "an idle install is reported")
-	_, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
+	checkpoint, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
 	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
+	if has_checkpoint { session.entry_destroy(&checkpoint, context.allocator) }
 	testing.expect(t, has_checkpoint, "the checkpoint landed")
 }
 
@@ -829,7 +832,8 @@ test_a_summary_chain_stops_at_its_bound :: proc(t: ^testing.T) {
 	if !compact_service_until(t, chat, .Idle) { return }
 	testing.expect_value(t, len(provider.requests), 2)
 	testing.expect(t, chat.compact.last_failure_at_ms > 0, "an exhausted chain waits out its cooldown")
-	_, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
+	checkpoint, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
 	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
+	if has_checkpoint { session.entry_destroy(&checkpoint, context.allocator) }
 	testing.expect(t, !has_checkpoint)
 }

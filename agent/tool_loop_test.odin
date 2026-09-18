@@ -120,9 +120,13 @@ test_admission_names_the_part_that_alone_does_not_fit :: proc(t: ^testing.T) {
 	_test_accept(t, chat, "hi")
 	chat.tools_enabled = true
 
-	schema := strings.repeat("x", 40_000, context.temp_allocator)
+	// A schema whose description alone is far larger than the window this session runs with.
+	schema := strings.concatenate({"{\"description\":\"", strings.repeat("x", 40_000, context.temp_allocator), "\"}"}, context.temp_allocator)
 	defer delete(schema, context.temp_allocator)
-	append(&chat.tools.definitions, Tool_Definition{name = "big", description = "big", input_schema = schema})
+	// The registry owns what it is given, so this goes through the same call a real tool
+	// does rather than appending by hand.
+	added := tool_registry_add(&chat.tools, {name = "test.big", description = "big", input_schema = schema, execute = tool_policy_probe_execute})
+	testing.expect_value(t, added, Tool_Registry_Error{})
 
 	prep, prep_err := chat_prepare(chat, tool_loop_connection)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
