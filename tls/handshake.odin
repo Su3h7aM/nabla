@@ -4,7 +4,9 @@ package tls
 // TLS fields are big-endian and its structures are length-prefixed, so writing one
 // is writing nested sections and reading one is reading them.
 
-// Handshake_Type is the TLS HandshakeType (RFC 8446 section B.3).
+// Handshake_Type is the TLS HandshakeType (RFC 8446 section B.3). Message_Hash is not a
+// handshake message a peer sends: it stands in the transcript for a ClientHello that a
+// HelloRetryRequest replaced (section 4.4.1).
 Handshake_Type :: enum u8 {
 	Client_Hello        = 1,
 	Server_Hello        = 2,
@@ -14,6 +16,7 @@ Handshake_Type :: enum u8 {
 	Certificate_Verify  = 15,
 	Finished            = 20,
 	Key_Update          = 24,
+	Message_Hash        = 254,
 }
 
 // Extension_Type is a TLS extension type (RFC 8446 section B.3.2).
@@ -24,12 +27,14 @@ Extension_Type :: enum u16 {
 	Application_Layer_Protocol_Negotiation = 0x0010,
 	Pre_Shared_Key                         = 0x0029,
 	Supported_Versions                     = 0x002b,
+	Cookie                                 = 0x002c,
 	Key_Share                              = 0x0033,
 }
 
 // Named_Group is a group a key share can be made for (RFC 8446 section B.3.1.4).
 Named_Group :: enum u16 {
-	X25519 = 0x001d,
+	SECP256R1 = 0x0017,
+	X25519    = 0x001d,
 }
 
 // Signature_Scheme is a signature algorithm a peer may sign with (RFC 8446
@@ -46,6 +51,15 @@ Signature_Scheme :: enum u16 {
 // VERSION_1_3 is the version a peer names in supported_versions (RFC 8446
 // section 4.2.1).
 VERSION_1_3 :: 0x0304
+
+// HELLO_RETRY_REQUEST_RANDOM is what tells a HelloRetryRequest apart from a ServerHello,
+// since they are the same message (RFC 8446 section 4.1.4).
+HELLO_RETRY_REQUEST_RANDOM: [32]u8 = {
+	0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11,
+	0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+	0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e,
+	0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+}
 
 HANDSHAKE_HEADER_SIZE :: 4
 

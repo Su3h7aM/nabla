@@ -2,7 +2,7 @@
 package main
 
 // Hands the tls package to a real TLS 1.3 server and asks for a page over it, once
-// for each suite this client offers.
+// for each way the peer can make this client work for the handshake.
 //
 // This is an executable harness rather than an in-package @(test) suite because it
 // forks: the server is `openssl s_server`, an independent implementation, so a
@@ -24,18 +24,23 @@ REQUEST : string : "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n"
 ALPN :: "http/1.1"
 SERVER_STARTUP_TIMEOUT :: 10 * time.Second
 
-// Suites is each suite this client offers, named as openssl names it. A server
-// restricted to one of them has to choose it, so every suite is exercised and the
-// client's adoption of the server's choice is part of what this harness checks.
-Suite :: struct {
-	openssl_name: string,
-	suite:        tls.Cipher_Suite,
+// Peer is one way of running the server. A server restricted to one suite has to choose
+// it, so the client's adoption of the server's choice is part of what this harness
+// checks. A server restricted to one group answers a key share for another with a
+// HelloRetryRequest, and secp256r1 is the group this client offers without sending a
+// share for it, so that case only completes when the retry is answered.
+Peer :: struct {
+	openssl_suite: string,
+	openssl_group: string,
+	suite:         tls.Cipher_Suite,
 }
 
-SUITES := [?]Suite {
-	{"TLS_AES_128_GCM_SHA256", .AES_128_GCM_SHA256},
-	{"TLS_CHACHA20_POLY1305_SHA256", .CHACHA20_POLY1305_SHA256},
-	{"TLS_AES_256_GCM_SHA384", .AES_256_GCM_SHA384},
+PEERS := [?]Peer {
+	{"TLS_AES_128_GCM_SHA256", "X25519", .AES_128_GCM_SHA256},
+	{"TLS_CHACHA20_POLY1305_SHA256", "X25519", .CHACHA20_POLY1305_SHA256},
+	{"TLS_AES_256_GCM_SHA384", "X25519", .AES_256_GCM_SHA384},
+	{"TLS_AES_128_GCM_SHA256", "P-256", .AES_128_GCM_SHA256},
+	{"TLS_AES_256_GCM_SHA384", "P-256", .AES_256_GCM_SHA384},
 }
 
 Connection :: struct {
@@ -74,29 +79,29 @@ main :: proc() {
 
 	if !check(generate_certificate(), "openssl could not make a certificate") { os.exit(1) }
 
-	for suite in SUITES {
+	for peer in PEERS {
 		port, port_ok := free_port()
 		if !check(port_ok, "no free port could be found") { os.exit(1) }
 
-		server, server_ok := start_server(port, suite.openssl_name)
+		server, server_ok := start_server(port, peer.openssl_suite, peer.openssl_group)
 		if !check(server_ok, "openssl s_server could not be started") { os.exit(1) }
 
-		run_client(port, suite)
+		run_client(port, peer)
 
 		// -naccept 1 makes the server leave after the connection it served, so waiting
 		// for it reaps it and says it saw us.
 		state, wait_err := os.process_wait(server, 10 * time.Second)
 		if wait_err != nil || state.exit_code != 0 {
-			check(false, fmt.tprintf("the server for %s left with an error", suite.openssl_name))
+			check(false, fmt.tprintf("the server for %s over %s left with an error", peer.openssl_suite, peer.openssl_group))
 			if wait_err != nil { fmt.eprintfln("  wait: %v", wait_err) }
 		}
 	}
 
 	if failures > 0 { os.exit(1) }
-	fmt.println("ok: the handshake completed against openssl s_server, for every suite")
+	fmt.println("ok: the handshake completed against openssl s_server, for every suite and group")
 }
 
-run_client :: proc(port: int, expected: Suite) {
+run_client :: proc(port: int, expected: Peer) {
 	roots_text, read_err := os.read_entire_file(
 		strings.concatenate({DIRECTORY, "/", CERTIFICATE_FILE}),
 		context.allocator,
@@ -128,12 +133,12 @@ run_client :: proc(port: int, expected: Suite) {
 	defer tls.destroy(conn)
 
 	if err := tls.handshake(conn, "localhost", []string{ALPN}); err != tls.Error.None {
-		check(false, fmt.tprintf("the handshake with %s failed: %v (peer alert %v)", expected.openssl_name, err, conn.peer_alert))
+		check(false, fmt.tprintf("the handshake with %s over %s failed: %v (peer alert %v)", expected.openssl_suite, expected.openssl_group, err, conn.peer_alert))
 		return
 	}
 	check(conn.alpn == ALPN, "the server did not select the protocol the client offered")
 	// The server picks the suite, and the connection has to be the one it picked.
-	check(conn.suite == expected.suite, fmt.tprintf("the connection is not the %s the server chose", expected.openssl_name))
+	check(conn.suite == expected.suite, fmt.tprintf("the connection is not the %s the server chose", expected.openssl_suite))
 
 	written, write_err := tls.write(conn, transmute([]u8)REQUEST)
 	check(write_err == tls.Error.None && written == len(REQUEST), "the request was not written whole")
@@ -179,7 +184,7 @@ generate_certificate :: proc() -> bool {
 	return err == nil && state.exit_code == 0
 }
 
-start_server :: proc(port: int, suite: string) -> (os.Process, bool) {
+start_server :: proc(port: int, suite: string, group: string) -> (os.Process, bool) {
 	process, err := os.process_start(
 		{
 			working_dir = DIRECTORY,
@@ -195,6 +200,8 @@ start_server :: proc(port: int, suite: string) -> (os.Process, bool) {
 				"-tls1_3",
 				"-ciphersuites",
 				suite,
+				"-groups",
+				group,
 				"-alpn",
 				ALPN,
 				"-www",

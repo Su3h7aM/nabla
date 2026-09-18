@@ -181,14 +181,16 @@ test_rfc_8448_server_hello :: proc(t: ^testing.T) {
 	expect_bytes(t, "shared secret", shared_secret[:], vector(t, RFC8448_ECDHE_SHARED_SECRET))
 }
 
-@(private)
+// vector decodes a test vector the tests of this package share.
+@(private="package")
 vector :: proc(t: ^testing.T, hex_text: string) -> []u8 {
 	decoded, ok := hex.decode(transmute([]u8)hex_text, context.temp_allocator)
 	if !ok { testing.fail_now(t, "a test vector is not hexadecimal") }
 	return decoded
 }
 
-@(private)
+// expect_bytes compares a decoded field against the bytes a vector fixes.
+@(private="package")
 expect_bytes :: proc(t: ^testing.T, what: string, actual, expected: []u8) {
-	testing.expectf(t, bytes.equal(actual, expected), "%s is not the value RFC 8448 records", what)
+	testing.expectf(t, bytes.equal(actual, expected), "%s is not the bytes the vector fixes", what)
 }

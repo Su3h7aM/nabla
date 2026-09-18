@@ -5,7 +5,6 @@ import "core:crypto"
 import "core:crypto/hash"
 import "core:crypto/hmac"
 import "core:crypto/x509"
-import "core:crypto/x25519"
 import "core:mem"
 import "core:net"
 import "core:strings"
@@ -121,71 +120,104 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 
 	random: [32]u8
 	session_id: [32]u8
-	private_key: [x25519.SCALAR_SIZE]u8
-	public_key: [x25519.POINT_SIZE]u8
 	crypto.rand_bytes(random[:])
 	crypto.rand_bytes(session_id[:])
-	crypto.rand_bytes(private_key[:])
-	x25519.scalarmult_basepoint(public_key[:], private_key[:])
 
-	// The ClientHello is the one message that is not protected, and it is built
-	// where the record will read it from. An address literal is not a name, and SNI
-	// carries no address literals (RFC 6066 section 3), so it is verified without
-	// being sent.
+	// An address literal is not a name, and SNI carries no address literals
+	// (RFC 6066 section 3), so it is verified without being sent.
 	sni := server_name
 	if _, is_ip4 := net.parse_ip4_address(sni); is_ip4 { sni = "" }
 	if _, is_ip6 := net.parse_ip6_address(sni); is_ip6 { sni = "" }
 
+	// What a second ClientHello repeats unchanged: a retry differs from the first only
+	// in the key share it was asked for and the cookie it was given (RFC 8446 section
+	// 4.1.2).
 	fields := Client_Hello_Fields {
 		random      = random,
 		session_id  = session_id[:],
 		server_name = sni,
 		alpn        = alpn,
-		group       = .X25519,
-		keyshare    = public_key[:],
 	}
-	body := conn.message[HANDSHAKE_HEADER_SIZE:]
-	body_length, encoded := client_hello_encode(body, fields)
-	if !encoded { return .No_Room }
-	message := conn.message[:HANDSHAKE_HEADER_SIZE + body_length]
-	handshake_encode_header(.Client_Hello, body_length, message)
-	if err := send_message(conn, message); err != .None { return err }
 
-	// A client that named a session id is running in compatibility mode, and the mode
-	// requires a change cipher spec right after the ClientHello so that a middlebox
-	// which does not know TLS 1.3 follows the handshake (RFC 8446 section D.4).
-	change_cipher_spec := conn.message[:1]
-	change_cipher_spec[0] = 1
-	if err := send_record(conn, .Change_Cipher_Spec, change_cipher_spec); err != .None { return err }
+	exchange: Key_Exchange
+	if !key_exchange_generate(&exchange, OFFERED_GROUPS[0]) { return .Unsupported }
+	fields.group = exchange.group
+	fields.keyshare = exchange.share[:exchange.length]
 
-	hello_message, hello_err := handshake_next(conn)
-	if hello_err != .None { return hello_err }
-	hello_type, _, decoded := handshake_decode_header(hello_message)
-	if !decoded || hello_type != .Server_Hello { return .Handshake }
-	hello, hello_decoded := server_hello_decode(hello_message[HANDSHAKE_HEADER_SIZE:])
-	if !hello_decoded { return .Handshake }
+	// The first ClientHello is kept: a server whose own suite is not the one offered
+	// first makes the transcript be taken again, and this is the message it is taken
+	// with (RFC 8446 section 4.1.3).
+	hello_sent, hello_built := client_hello_message(conn, fields)
+	if !hello_built { return .No_Room }
+	if hello_err := send_message(conn, hello_sent); hello_err != .None { return hello_err }
+
+	hello_message, answer_err := handshake_next(conn)
+	if answer_err != .None { return answer_err }
+	hello, hello_ok := server_hello_read(hello_message)
+	if !hello_ok { return .Handshake }
+
+	// Compatibility mode sends one change cipher spec, immediately before the client's
+	// second flight (RFC 8446 section D.4). Which flight that is depends on what the
+	// server answered, so it goes out where that is known.
+	change_cipher_spec_sent := false
+	retried := false
+	if hello.retry {
+		// The server asked for a key exchange in another group. The client names a
+		// session id in its first ClientHello and the server echoes it, so this is
+		// where a middlebox-aware handshake happens (RFC 8446 section D.4).
+		if hello.version != VERSION_1_3 || hello.pre_shared_key { return fail(conn, .Illegal_Parameter, .Unsupported) }
+		if !suite_offered(hello.cipher_suite) { return fail(conn, .Illegal_Parameter, .Unsupported) }
+		if !bytes.equal(hello.session_id, session_id[:]) { return fail(conn, .Illegal_Parameter, .Handshake) }
+		if !key_exchange_generate(&exchange, hello.group) { return fail(conn, .Illegal_Parameter, .Unsupported) }
+
+		// The retry names the suite the rest of the handshake uses, and the ServerHello
+		// must name the same one (RFC 8446 section 4.1.4), so the schedule and the
+		// transcript change to it before the first ClientHello is replaced by its hash.
+		if hello.cipher_suite != suite {
+			suite = hello.cipher_suite
+			conn.suite = suite
+			conn.schedule = key_schedule_init(suite)
+		}
+
+		fields.group = exchange.group
+		fields.keyshare = exchange.share[:exchange.length]
+		fields.cookie = hello.cookie
+		if retry_err := client_hello_retry(conn, fields, hello_sent, hello_message); retry_err != .None { return retry_err }
+		change_cipher_spec_sent = true
+		retried = true
+
+		hello_message, answer_err = handshake_next(conn)
+		if answer_err != .None { return answer_err }
+		hello, hello_ok = server_hello_read(hello_message)
+		// A second retry leaves this client with nothing to answer.
+		if !hello_ok || hello.retry { return fail(conn, .Unexpected_Message, .Handshake) }
+	}
+
 	if hello.version != VERSION_1_3 || hello.pre_shared_key { return .Unsupported }
 	if !suite_offered(hello.cipher_suite) { return .Unsupported }
-	if hello.group != .X25519 || len(hello.keyshare) != x25519.POINT_SIZE { return .Unsupported }
+	if hello.group != exchange.group || len(hello.keyshare) == 0 { return fail(conn, .Illegal_Parameter, .Unsupported) }
 	// A server echoes the session id it was sent, which is what carries a
 	// compatibility-mode handshake through a middlebox (RFC 8446 section 4.1.3).
 	if !bytes.equal(hello.session_id, session_id[:]) { return .Handshake }
 
 	// The server's own choice is the one that protects the connection, and its hash is
 	// the hash of the transcript, so both are taken again for it (RFC 8446 section
-	// 4.1.3). The ClientHello is hashed from the buffer it was built in, which still
-	// holds it: what has been read since went into another.
+	// 4.1.3). The first ClientHello is hashed from the buffer it was built in, which
+	// still holds it: what has been read since went into another.
 	if hello.cipher_suite != suite {
+		// A retry already named the suite, and the ServerHello has to name the same one
+		// (RFC 8446 section 4.1.4).
+		if retried { return fail(conn, .Illegal_Parameter, .Unsupported) }
 		suite = hello.cipher_suite
 		conn.suite = suite
 		conn.schedule = key_schedule_init(suite)
 		hash.init(&conn.transcript, CIPHER_SUITES[suite].hash)
-		hash.update(&conn.transcript, message)
+		hash.update(&conn.transcript, hello_sent)
 	}
 	hash.update(&conn.transcript, hello_message)
 
-	shared_secret: [x25519.POINT_SIZE]u8
-	x25519.scalarmult(shared_secret[:], private_key[:], hello.keyshare)
+	shared_secret: [SHARED_SECRET_MAX]u8
+	if !key_exchange_shared(&exchange, hello.keyshare, shared_secret[:]) { return .Unsupported }
 	// A shared secret of zeros is a small-order peer key, and the protocol refuses
 	// the connection rather than derive keys from it (RFC 8446 section 7.4.2).
 	if all_zero(shared_secret[:]) { return .Unsupported }
@@ -216,6 +248,9 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 	zeroes: [MAX_SECRET_SIZE]u8
 	if !key_schedule_advance(&conn.schedule, zeroes[:secret_size(suite)]) { return .Unsupported }
 
+	if !change_cipher_spec_sent {
+		if change_err := send_change_cipher_spec(conn); change_err != .None { return change_err }
+	}
 	if finished_err := handshake_client_finished(conn); finished_err != .None { return finished_err }
 
 	client_application, server_application: Secret
@@ -341,6 +376,71 @@ close :: proc(conn: ^Conn) -> Error {
 	alert[0] = u8(Alert_Level.Warning)
 	alert[1] = u8(Alert_Description.Close_Notify)
 	return send_record(conn, .Alert, alert)
+}
+
+// --- what this client sends first ---
+
+// server_hello_read decodes the answer to a ClientHello, reporting false for a message
+// that is not one.
+server_hello_read :: proc(message: []u8) -> (hello: Server_Hello, ok: bool) {
+	hello_type, _, decoded := handshake_decode_header(message)
+	if !decoded || hello_type != .Server_Hello { return {}, false }
+	return server_hello_decode(message[HANDSHAKE_HEADER_SIZE:])
+}
+
+// client_hello_message builds a ClientHello in the connection's message buffer and
+// returns it, ready to send. The slice stays valid until the next ClientHello is built.
+client_hello_message :: proc(conn: ^Conn, fields: Client_Hello_Fields) -> (message: []u8, ok: bool) {
+	body := conn.message[HANDSHAKE_HEADER_SIZE:]
+	body_length, encoded := client_hello_encode(body, fields)
+	if !encoded { return nil, false }
+	message = conn.message[:HANDSHAKE_HEADER_SIZE + body_length]
+	handshake_encode_header(.Client_Hello, body_length, message)
+	return message, true
+}
+
+// client_hello_retry answers a HelloRetryRequest. The second ClientHello repeats the
+// first with the key share and the cookie the server asked for, and it is preceded by
+// the one change cipher spec this client sends, which compatibility mode places before
+// its second flight (RFC 8446 sections 4.1.4 and D.4).
+//
+// The transcript becomes the hash of the first ClientHello in a message_hash message,
+// the retry, and the second ClientHello, which is the digest the retry replaces. That
+// hash is the hash of the suite the retry named, which is why the first ClientHello is
+// hashed again here rather than read out of the running transcript (RFC 8446 section
+// 4.4.1).
+client_hello_retry :: proc(conn: ^Conn, fields: Client_Hello_Fields, first: []u8, retry_message: []u8) -> Error {
+	suite_hash := CIPHER_SUITES[conn.suite].hash
+	hash.init(&conn.transcript, suite_hash)
+	hash.update(&conn.transcript, first)
+	digest := transcript_hash(conn)
+
+	hash.init(&conn.transcript, suite_hash)
+	header: [HANDSHAKE_HEADER_SIZE]u8
+	handshake_encode_header(.Message_Hash, len(digest), header[:])
+	hash.update(&conn.transcript, header[:])
+	hash.update(&conn.transcript, digest)
+	hash.update(&conn.transcript, retry_message)
+
+	if change_err := send_change_cipher_spec(conn); change_err != .None { return change_err }
+	message, built := client_hello_message(conn, fields)
+	if !built { return .No_Room }
+	return send_message(conn, message)
+}
+
+// CHANGE_CIPHER_SPEC is the body a change cipher spec record carries, which is all
+// compatibility mode needs of it (RFC 8446 section D.4).
+CHANGE_CIPHER_SPEC :: 1
+
+// send_change_cipher_spec writes the unencrypted change cipher spec record that
+// compatibility mode places before this client's second flight. It goes out unencrypted
+// even when the handshake keys are live, because a peer that is not reading the handshake
+// yet is exactly what it is for.
+send_change_cipher_spec :: proc(conn: ^Conn) -> Error {
+	body: [1]u8 = {CHANGE_CIPHER_SPEC}
+	count, encoded := record_encode(.Change_Cipher_Spec, body[:], conn.send)
+	if !encoded { return .No_Room }
+	return transport_write(conn, conn.send[:count])
 }
 
 // --- records ---

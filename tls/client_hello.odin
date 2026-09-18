@@ -22,6 +22,9 @@ OFFERED_SIGNATURE_SCHEMES := [6]Signature_Scheme {
 // A server_name that is an address literal is not a name, and SNI carries no
 // address literals (RFC 6066 section 3), so a caller reaching a peer by address
 // leaves it empty.
+//
+// A cookie is what a HelloRetryRequest gave, and a second ClientHello repeats it
+// (RFC 8446 section 4.2.2).
 Client_Hello_Fields :: struct {
 	random:      [32]u8,
 	session_id:  []u8,
@@ -29,6 +32,7 @@ Client_Hello_Fields :: struct {
 	alpn:        []string,
 	group:       Named_Group,
 	keyshare:    []u8,
+	cookie:      []u8,
 }
 
 // client_hello_encode writes a ClientHello (RFC 8446 section 4.1.2) and returns
@@ -53,10 +57,11 @@ client_hello_encode :: proc(dst: []u8, fields: Client_Hello_Fields) -> (n: int, 
 	extensions := write_section_start(&w)
 	if fields.server_name != "" { write_server_name(&w, fields.server_name) }
 	write_supported_versions(&w)
-	write_supported_groups(&w, fields.group)
+	write_supported_groups(&w)
 	write_signature_algorithms(&w)
 	write_key_share(&w, fields)
 	if len(fields.alpn) > 0 { write_alpn(&w, fields.alpn) }
+	if len(fields.cookie) > 0 { write_cookie(&w, fields.cookie) }
 	write_section_end(&w, extensions)
 
 	return w.at, w.ok
@@ -83,12 +88,23 @@ write_supported_versions :: proc(w: ^Writer) {
 	write_section_end(w, extension)
 }
 
-write_supported_groups :: proc(w: ^Writer, group: Named_Group) {
+// write_supported_groups offers every group this client can exchange a key with, which
+// is what a server picks the key share it wants from (RFC 8446 section 4.2.7).
+write_supported_groups :: proc(w: ^Writer) {
 	write_u16(w, int(Extension_Type.Supported_Groups))
 	extension := write_section_start(w)
 	groups := write_section_start(w)
-	write_u16(w, int(group))
+	for group in OFFERED_GROUPS { write_u16(w, int(group)) }
 	write_section_end(w, groups)
+	write_section_end(w, extension)
+}
+
+// write_cookie repeats the cookie a HelloRetryRequest carried (RFC 8446 section 4.2.2).
+write_cookie :: proc(w: ^Writer, cookie: []u8) {
+	write_u16(w, int(Extension_Type.Cookie))
+	extension := write_section_start(w)
+	write_u16(w, len(cookie))
+	write_bytes(w, cookie)
 	write_section_end(w, extension)
 }
 
