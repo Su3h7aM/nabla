@@ -98,9 +98,8 @@ position and a verdict. This is the concrete form of rule 1.1.
 |---|---|---|---|
 | `http/client/reader.odin` `READER_INITIAL_BYTES` | 8192, a starting size that doubles | RFC 9112 section 3 sets no maximum and recommends a floor of 8000 | Keep. It is not a cap; the comment already says so |
 | `http/client/wait.odin` `WAIT_SLICE` | 50 ms per event-loop tick | Nothing states or forbids | Keep, but document that it bounds cancellation latency only and never the request |
-| `http/client/resolve.odin` `DNS_TIMEOUT` | 5 s per nameserver attempt | RFC 1035 sets no such requirement | **Change.** A working but slow nameserver is abandoned. Move to `Options` with zero meaning unbounded |
-| `http/client/resolve.odin` `DNS_MAX_RESPONSE` | 4096-byte datagram buffer | RFC 1035 section 4.2.1: 512 octets without EDNS; more requires the TC bit and TCP retry | Keep the buffer. The real gap is that TC is not handled, so a large answer set fails instead of retrying over TCP |
-| `http/scanner.odin` | `INIT_BUF_SIZE` 1024, `DEFAULT_MAX_CONSECUTIVE_EMPTY_READS` 128 | RFC 9112 section 7.1.1 explicitly permits a server to apply length limits and timeouts | Keep. Server-side, and the server half has no caller |
+| `http/client/resolve.odin` `DNS_TIMEOUT` | 5 s per nameserver attempt | RFC 1035 sets no such requirement | **Keep**, which phase 1 settled after this plan first said change: withdrawing an attempt at a timeout is the retransmission step DNS's own algorithm prescribes (section 7.1), and an exhausted attempt moves to the next nameserver rather than ending the lookup |
+| `http/client/resolve.odin` `DNS_MAX_RESPONSE` | 4096-byte datagram buffer | RFC 1035 section 4.2.1: 512 octets without EDNS; more requires the TC bit and TCP retry | Keep the buffer. The real gap is that TC is not handled, so a large answer set fails instead of retrying over TCP || `http/scanner.odin` | `INIT_BUF_SIZE` 1024, `DEFAULT_MAX_CONSECUTIVE_EMPTY_READS` 128 | RFC 9112 section 7.1.1 explicitly permits a server to apply length limits and timeouts | Keep. Server-side, and the server half has no caller |
 | `http/date.odin` | `HTTP_DATE_CENTURY_WINDOW` 50 | RFC 9110 section 5.6.7: a recipient of an rfc850-date two-digit year "MUST interpret a timestamp that appears to be more than 50 years in the future as representing the most recent year in the past that had the same last two digits" | Keep. Spec-mandated, and it applies to the rfc850 form only |
 | `http/client/client.odin` | non-2xx is classified as a `Failure` | RFC 9110 defines 1xx, 3xx, and 4xx as responses, not transport errors | **Review.** The body is still delivered and the status is reported, so the caller can act; but calling a valid status a failure is the client deciding policy. Recorded in section 12 |
 | `ai/interrupt.odin` `Deadline` | zero value means no deadline | Caller policy | Correct by construction. Preserve this in `tls` |
@@ -791,21 +790,19 @@ HTTPS (the work), SSE over both (present, needs HTTPS), and WebSocket over both 
 Each is its own change. Bundling any of them would make the TLS diff unreadable and the
 TLS commit unrevertable.
 
-1. **Remove platform code from `http/client`.** Replace `linux.connect` and
-   `linux.getsockopt_base` with `nbio.dial`, deleting `core:c`, `core:sys/linux`, and the
-   `#7534` padding workaround. This is the clearest case of core superseding hand-written
-   code, and it is first because it makes everything after it OS-agnostic by construction.
-2. **Make `DNS_TIMEOUT` caller policy.** Move it into `Options` with zero meaning
-   unbounded, per section 2.
-3. **Handle DNS truncation.** A response with the TC bit set should retry over TCP rather
-   than fail, per RFC 1035 section 4.2.1.
-4. **Review the harness's hard maximums** listed in section 2: the MCP call maximum, the
+1. **Remove platform code from `http/client`.** Done in phase 1: `nbio.dial` replaced
+   `linux.connect`, and `core:c` and `core:sys/linux` left the package. It was first
+   because it makes everything after it OS-agnostic by construction.
+2. **Handle DNS truncation.** A response with the TC bit set should retry over TCP rather
+   than fail, per RFC 1035 section 4.2.1. This is the one gap section 2 records in the
+   resolver.
+3. **Review the harness's hard maximums** listed in section 2: the MCP call maximum, the
    server and entry counts, and the shell timeout maximum. These are policy, they are
    visible to users, and each one currently overrides a request the user or a provider made.
-5. **Decide the fate of the `http` server half.** About 1450 lines with no caller outside
+4. **Decide the fate of the `http` server half.** About 1450 lines with no caller outside
    `http/`. An HTTP package may reasonably ship a server, and an official one probably
    should, so this is a decision about what the package is for rather than a cleanup.
-6. **Consider a fully asynchronous client.** `nbio.send` with `all`, `nbio.recv`, and
+5. **Consider a fully asynchronous client.** `nbio.send` with `all`, `nbio.recv`, and
    operation-level timeouts would replace `wait.odin`'s 50 ms slices. It is a rewrite of
    three files and nothing needs it.
 
@@ -838,13 +835,15 @@ TLS commit unrevertable.
    1.3, stage 2 is TLS 1.2 in AEAD form, and 1.0/1.1 are never done. The only open item is
    the trigger, and no current endpoint provides one. RFC 9325's MUST is why it belongs on
    the roadmap rather than in a backlog.
-2. **Is `tls` reached through `http/client` only?** It is written to stand alone. If nothing
-   else will use it, the vtable of section 6.5 stays unnecessary.
+2. **Is `tls` reached through `http/client` only?** Yes: the WebSocket client of phase 6
+   opens its connection through `http/client` too, so `http/client` is still the only
+   consumer. `tls` stays written to stand alone, and the vtable of section 6.5 stays
+   unnecessary until a second consumer appears.
 3. **Should the client stop classifying a valid status as a failure?** Section 2 records
    that `stream_request` treats a non-2xx as a `Failure`. The body is still delivered, so
    no caller is blocked, but it is the client making a policy call.
-4. **The harness's hard maximums**, per section 11 item 4, and the `http` server half, per
-   item 5.
+4. **The harness's hard maximums**, per section 11 item 3, and the `http` server half, per
+   item 4.
 
 ## 13. Implementation plan
 
@@ -857,8 +856,8 @@ runs.
 
 **Phase 1: make the client OS-agnostic.** Done: `core:nbio`'s dial replaces the raw
 connect, `core:c` and `core:sys/linux` have left `connection.odin`, and `grep -r 'core:sys'
-http/` is empty. `DNS_TIMEOUT` stayed, and section 11 item 2 records why: retransmitting at
-the next nameserver is DNS's own algorithm rather than a limit this client invented.
+http/` is empty. `DNS_TIMEOUT` stayed, and section 2 records why: withdrawing an attempt at
+a timeout is DNS's own retransmission step rather than a limit this client invented.
 
 **Phase 2: record layer and key schedule, offline.** Done: `tls/record.odin`,
 `tls/handshake.odin`, `tls/key_schedule.odin`, `tls/protect.odin`, with the RFC 8448
@@ -893,11 +892,24 @@ the in-process TLS server fixture is replaced per section 9.1. Gate: `mise run c
 not contain their anchors, and `ldd` on the built binary showing neither libssl nor
 libcrypto.
 
-**Phase 6: WebSocket.** The three `http/client` additions from section 6.7, then
-`websocket/frame.odin`, `websocket/conn.odin`, and `websocket/client.odin`. Gate: masked
-frame output asserted, a fragmented message reassembled, a ping and pong, an orderly close,
-a masked frame from the server failing the connection, and a control frame over 125 bytes
-failing it, over both `ws` and `wss`.
+**Phase 6: WebSocket.** Done: `http/client/upgrade.odin` performs a request the peer may
+take the connection over and hands it back when a 101 answers it, keeping the octets read
+past the response head for the upgraded protocol and requiring a 101 rather than a failure
+with a status; a caller's own fields also replace the ones the request builder would
+supply, which is how the upgrade states its connection. `websocket/frame.odin` holds the
+framing rules, `websocket/handshake.odin` the key and the answer to it, `websocket/conn.odin`
+the protocol rules, and `websocket/client.odin` dials ws and wss by stating the WebSocket
+URL as the HTTP URL it is, then keeps the calling thread's event loop for as long as the
+connection lives, so a caller's cancellation and deadlines reach a WebSocket unchanged.
+Gate: `websocket` holds the codec to the RFC 6455 section 5.7 octets and a connection to a
+byte-for-byte transport fixture, and `websocket/test/echo` runs ws and wss against a
+scripted Python peer that speaks RFC 6455 itself: a message in each direction, a fragmented
+message reassembled, a ping each way, an orderly close, a masked frame from the server and a
+control frame over 125 octets each failing the connection with 1002, and a response that
+does not accept the key refused. That peer found two defects, both fixed in their own
+commit: the connection was protected with the client's own first suite rather than the
+server's choice, and a `defer` inside a block released the trust store path before the dial
+read it.
 
 **Phase 7: cleanup.** Done with phase 5: no `system:ssl` or `system:crypto` reference
 remains, and the fixtures an OpenSSL server needed are gone.
