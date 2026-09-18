@@ -29,9 +29,10 @@ CHAT_COMPACT_KEEP_MESSAGES :: 10
 // a summarization request.
 CHAT_COMPACT_MIN_REDUCTION_TOKENS :: 1024
 
-// CHAT_COMPACT_RETRY_DELAY_MS keeps a failed summarization from being retried at
-// every request boundary. An explicit trigger ignores it.
-CHAT_COMPACT_RETRY_DELAY_MS :: 5_000
+// CHAT_COMPACT_COOLDOWN_MS is how long an exhausted summary chain rests before another
+// snapshot may start. Whoever asks, the context has not changed in the meantime, and the
+// provider has already refused the same work once.
+CHAT_COMPACT_COOLDOWN_MS :: 30_000
 
 // CHAT_COMPACT_DIRECTIVE is appended after the prefix being summarized. It is a
 // literal, so every compaction request ends with the same bytes.
@@ -303,6 +304,18 @@ Compact_Control :: struct {
 	pending:            Compact_Trigger,
 	pending_source_seq: Maybe(session.Seq),
 	last_failure_at_ms: i64,
+	// attempted_seq is the newest entry the last chain covered and attempted_identity is a
+	// digest of what it ran against. A fresh automatic snapshot starts only after the context
+	// has moved past that, or that configuration has changed: repeating the same work over the
+	// same bytes under the same settings cannot produce anything else. attempted_identity is a
+	// digest rather than the values, because the credential is a secret and a suppression key
+	// that carried it would be one too.
+	attempted_seq:      Maybe(session.Seq),
+	attempted_identity: string, // owned
+	// suppressed records a chain that ended for a reason no automatic start can fix: bad
+	// credentials, a spent quota, or a request the provider refuses. An explicit request clears
+	// it, because the user may have corrected whatever caused it.
+	suppressed:         bool,
 }
 
 Compact_Request_Result :: enum {
@@ -441,13 +454,40 @@ chat_compact_request :: proc(chat: ^Chat_Session, trigger: Compact_Trigger, sour
 	return compact_request_intent(&chat.compact, trigger, source_seq)
 }
 
-// chat_compact_retry_allowed keeps a failed summarization from being retried at
-// every boundary. An explicit trigger is a caller asking again and is not held back.
+// chat_compact_retry_allowed keeps a failed summarization from being retried at every
+// boundary, whoever asks for it: an explicit request coalesces with a scheduled one rather
+// than starting the same work over the same context again.
 @(private)
 chat_compact_retry_allowed :: proc(control: ^Compact_Control, trigger: Compact_Trigger) -> bool {
-	if compact_trigger_explicit(trigger) { return true }
 	if control.last_failure_at_ms == 0 { return true }
-	return session.now_ms() - control.last_failure_at_ms >= CHAT_COMPACT_RETRY_DELAY_MS
+	return session.now_ms() - control.last_failure_at_ms >= CHAT_COMPACT_COOLDOWN_MS
+}
+
+// chat_compact_progress reports whether a fresh automatic summary would differ from the last
+// one: the context has grown past what that chain covered, or the configuration it ran under
+// is not the one in hand. Otherwise the same request would be sent again to produce the same
+// answer, and it is not sent.
+@(private)
+chat_compact_progress :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, prep: ^Chat_Request_Prep) -> bool {
+	control := &chat.compact
+	if covered, present := control.attempted_seq.?; present {
+		if len(prep.history.entries) == 0 { return false }
+		newest := prep.history.entries[len(prep.history.entries) - 1].seq
+		if newest <= covered && chat_compact_identity(chat, connection) == control.attempted_identity {
+			return false
+		}
+	}
+	return true
+}
+
+// chat_compact_identity is a digest of what a summary would run against: the model, the API,
+// the endpoint, and the credential. A change to any of them is a change of configuration, and
+// the digest is that generation: comparing it is what lets a corrected credential clear a
+// suppression without the credential itself being stored or logged as a key.
+@(private)
+chat_compact_identity :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection) -> string {
+	text := fmt.tprintf("%s\n%s\n%s\n%s", chat_api_name(connection.API), chat.model_id, connection.Endpoint, connection.Credential)
+	return chat_text_digest(text)
 }
 
 // chat_compact_begin_attempt begins the request row of one send. Every attempt of a chain
@@ -581,6 +621,11 @@ chat_compact_start :: proc(
 	control.job = job
 	control.state = .Running
 	control.trigger = trigger
+	// What this attempt saw, which is the whole context it was built from rather than the
+	// boundary it summarizes: the next automatic attempt has to see something newer.
+	if len(entries) > 0 { control.attempted_seq = entries[len(entries) - 1].seq }
+	delete(control.attempted_identity, chat.allocator)
+	control.attempted_identity = strings.clone(chat_compact_identity(chat, connection), chat.allocator)
 	// A job that has started says so, from the one place a job starts. The front-end
 	// can then tell when a summary began and how long it took.
 	_observer_message(observer, .Notice, chat_compact_start_notice(trigger))
@@ -652,6 +697,20 @@ chat_compact_finish_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job, deci
 	); finish_err != nil {
 		chat_session_record_failure(chat, "the compaction outcome could not be recorded", finish_err)
 	}
+}
+
+// chat_compact_suppressible reports whether a chain's ending is one an automatic start cannot
+// fix: credentials, a spent quota, or a request the provider refuses. An unusable summary is
+// not one of those, because the next one may be usable.
+@(private)
+chat_compact_suppressible :: proc(job: ^Compact_Job) -> bool {
+	switch job.operation.failure_class {
+	case .Authentication, .Quota, .Invalid_Request, .Payload_Too_Large, .Content_Policy:
+		return true
+	case .None, .Unknown, .Rate_Limited, .Context_Overflow, .Provider_Unavailable, .Incomplete_Stream, .Invalid_Output:
+		return false
+	}
+	return false
 }
 
 // chat_compact_retryable reports whether another send of the same bytes could produce a
@@ -776,6 +835,9 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 			_observer_message(observer, .Notice, "the summary did not complete; it will be sent again")
 			return
 		}
+		// A chain that ended for a reason the same configuration cannot fix is not started
+		// again automatically: the credentials, the quota, or the request itself has to change.
+		if decision.reason == .Terminal_Failure && chat_compact_suppressible(job) { control.suppressed = true }
 		chat_compact_failed_job(control, job)
 		_observer_message(observer, .Warning, fmt.tprintf("compaction produced nothing usable: %s", reason))
 		return
@@ -901,7 +963,16 @@ chat_compact_consider :: proc(chat: ^Chat_Session, observer: Chat_Observer, conn
 		if !chat_compact_start_due(chat, prep.estimate) { return }
 		trigger = .Pressure
 	}
+	// An explicit request is the user saying the configuration is worth another try, so it
+	// clears a suppression. It does not clear the cooldown, and an automatic start has to see
+	// something new before it repeats work the provider already refused.
+	if compact_trigger_explicit(trigger) {
+		control.suppressed = false
+	} else if control.suppressed {
+		return
+	}
 	if !chat_compact_retry_allowed(control, trigger) { return }
+	if !compact_trigger_explicit(trigger) && !chat_compact_progress(chat, connection, prep) { return }
 	if !chat_compact_start(chat, observer, connection, prep, trigger, control.pending_source_seq) {
 		// A refusal is a failure like any other, so the next automatic attempt waits
 		// instead of repeating the same work at every boundary.
@@ -1085,6 +1156,7 @@ chat_compact_destroy :: proc(chat: ^Chat_Session) {
 		}
 		chat_compact_job_destroy(job)
 	}
+	delete(control.attempted_identity, chat.allocator)
 	control^ = {}
 }
 

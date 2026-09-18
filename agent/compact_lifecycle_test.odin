@@ -842,3 +842,103 @@ test_a_summary_chain_stops_at_its_bound :: proc(t: ^testing.T) {
 	if has_checkpoint { session.entry_destroy(&checkpoint, context.allocator) }
 	testing.expect(t, !has_checkpoint)
 }
+
+// A summary the provider refuses for a reason the configuration would have to change for is
+// not started again automatically. An explicit request is the user saying it is worth another
+// try, so it clears that suppression.
+@(test)
+test_a_terminal_summary_failure_suppresses_automatic_starts :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 500_000)
+	chat.compact_retry = test_compact_retry_policy()
+	_test_accept(t, chat, "first")
+	large := strings.repeat("work ", 320_000) or_else ""
+	defer delete(large)
+	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.User_Entry{text = large, origin = .Prompt}})
+	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
+		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_100, payload = session.Assistant_Entry{text = text}})
+	}
+
+	responses := []string{agent_provider_refusal("401 Unauthorized", `{"error":{"message":"bad key"}}`)}
+	provider: Agent_Provider
+	if !agent_provider_start(t, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	prep, prep_err := chat_prepare(chat, connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+	chat_compact_consider(chat, {}, connection, &prep)
+	if !compact_service_until(t, chat, .Idle) { return }
+	testing.expect(t, chat.compact.suppressed, "an unauthorized summary suppresses automatic starts")
+
+	// The cooldown would explain a refusal on its own, so it is passed here: the suppression is
+	// what stops the next automatic attempt.
+	chat.compact.last_failure_at_ms = session.now_ms() - CHAT_COMPACT_COOLDOWN_MS - 1
+	chat_compact_consider(chat, {}, connection, &prep)
+	testing.expect_value(t, chat.compact.state, Compact_State.Idle)
+
+	testing.expect_value(t, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
+	chat_compact_consider(chat, {}, connection, &prep)
+	testing.expect(t, !chat.compact.suppressed, "an explicit request clears the suppression")
+	testing.expect_value(t, chat.compact.state, Compact_State.Running)
+}
+
+// A chain that used every attempt it has is not started again from the same context: the next
+// automatic attempt waits for work the failed one never saw, because the same bytes would get
+// the same answer.
+@(test)
+test_an_exhausted_chain_waits_for_the_context_to_move :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 500_000)
+	chat.compact_retry = test_compact_retry_policy()
+	_test_accept(t, chat, "first")
+	large := strings.repeat("work ", 320_000) or_else ""
+	defer delete(large)
+	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.User_Entry{text = large, origin = .Prompt}})
+	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
+		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_100, payload = session.Assistant_Entry{text = text}})
+	}
+
+	refusal := agent_provider_refusal("503 Service Unavailable", `{"error":{"message":"try again later"}}`)
+	responses := []string{refusal, refusal}
+	provider: Agent_Provider
+	if !agent_provider_start(t, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	prep, prep_err := chat_prepare(chat, connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	chat_compact_consider(chat, {}, connection, &prep)
+	if !compact_service_until(t, chat, .Idle) { return }
+	testing.expect_value(t, len(provider.requests), CHAT_COMPACT_MAX_ATTEMPTS)
+
+	// Nothing about the context changed, so pressure starts nothing even with the cooldown
+	// behind it.
+	chat.compact.last_failure_at_ms = session.now_ms() - CHAT_COMPACT_COOLDOWN_MS - 1
+	chat_compact_consider(chat, {}, connection, &prep)
+	testing.expect_value(t, chat.compact.state, Compact_State.Idle)
+
+	// Work the failed chain never saw is what makes another summary worth asking for.
+	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 3_000, payload = session.Assistant_Entry{text = "after the failure"}})
+	chat_request_prep_destroy(&prep, chat.allocator)
+	after, after_err := chat_prepare(chat, connection)
+	if after_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	defer chat_request_prep_destroy(&after, chat.allocator)
+	chat_compact_consider(chat, {}, connection, &after)
+	testing.expect_value(t, chat.compact.state, Compact_State.Running)
+}

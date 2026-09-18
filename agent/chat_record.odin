@@ -242,9 +242,15 @@ chat_request_input_make :: proc(
 // sent the same bytes without either one being kept.
 @(private)
 chat_body_digest :: proc(body: []u8) -> string {
+	return chat_text_digest(string(body))
+}
+
+// chat_text_digest is the same digest over text the harness assembled itself, such as the
+// identity of what a summary would run against.
+chat_text_digest :: proc(text: string) -> string {
 	ctx: sha2.Context_256
 	sha2.init_256(&ctx)
-	sha2.update(&ctx, body)
+	sha2.update(&ctx, transmute([]u8)text)
 	digest: [sha2.DIGEST_SIZE_256]u8
 	sha2.final(&ctx, digest[:])
 	encoded, encode_err := hex.encode(digest[:], context.temp_allocator)
