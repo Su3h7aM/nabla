@@ -547,13 +547,6 @@ chat_compact_start :: proc(
 	}
 	chat_compact_job_allocator(job, chat.allocator)
 	job.output = make([dynamic]u8, 0, job.allocator)
-	// What this chain's request rows are written from. It is kept for the whole chain,
-	// because a retried attempt is a new row over the same frozen bytes and every row has
-	// to say where in the chain it sits.
-	source := chat_request_input_make(&compact_prep, &prep.history, chat.skill_snapshot_seq, seam)
-	chat_request_input_clone(&source, job.allocator)
-	job.input = source
-	job.config = strings.clone(chat_request_config_json(chat, compact_prep.request.Max_Output_Tokens), job.allocator)
 
 	// The bytes are frozen before the row exists: a request that cannot be encoded never
 	// reaches the network, so it is not recorded as an attempt that was sent.
@@ -564,6 +557,14 @@ chat_compact_start :: proc(
 		return false
 	}
 	job.snapshot = snapshot
+
+	// What this chain's request rows are written from. It is kept for the whole chain,
+	// because a retried attempt is a new row over the same frozen bytes and every row has
+	// to say where in the chain it sits.
+	source := chat_request_input_make(&compact_prep, &prep.history, chat.skill_snapshot_seq, seam, transmute([]u8)snapshot.body)
+	chat_request_input_clone(&source, job.allocator)
+	job.input = source
+	job.config = strings.clone(chat_request_config_json(chat, compact_prep.request.Max_Output_Tokens), job.allocator)
 
 	if _, begin_err := chat_compact_begin_attempt(chat, job, nil, session.now_ms()); begin_err != nil {
 		chat_compact_job_destroy(job)

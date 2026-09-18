@@ -1,5 +1,7 @@
 package agent
 
+import "core:crypto/sha2"
+import "core:encoding/hex"
 import "core:encoding/json"
 import "core:mem"
 import "core:strings"
@@ -73,6 +75,10 @@ Chat_Request_Input :: struct {
 	attempt_number:           i64 `json:"attempt_number"`,
 	recovery_kind:            string `json:"recovery_kind"`,
 	previous_request_no:      Maybe(i64) `json:"previous_request_no"`,
+	// body_sha256 is the digest of the bytes this send carries. A chain that repeats the
+	// same bytes says so in the store rather than in a comment, and a repaired request
+	// shows the payload that changed.
+	body_sha256:              string `json:"body_sha256"`,
 }
 
 @(private)
@@ -194,8 +200,9 @@ chat_request_input_json :: proc(
 	snapshot_seq: Maybe(session.Seq),
 	entry_count: int,
 	attempt: Chat_Attempt,
+	body: []u8,
 ) -> string {
-	input := chat_request_input_make(prep, history, snapshot_seq, entry_count)
+	input := chat_request_input_make(prep, history, snapshot_seq, entry_count, body)
 	chat_request_input_situate(&input, attempt)
 	return chat_request_input_encode(input)
 }
@@ -209,6 +216,7 @@ chat_request_input_make :: proc(
 	history: ^session.Context,
 	snapshot_seq: Maybe(session.Seq),
 	entry_count: int,
+	body: []u8,
 ) -> Chat_Request_Input {
 	tools := make([dynamic]Chat_Request_Tool, 0, len(prep.request.Tools), context.temp_allocator)
 	for &definition in prep.request.Tools {
@@ -219,6 +227,7 @@ chat_request_input_make :: proc(
 		tools          = tools[:],
 		summary_seq    = history.summary_seq,
 		covered_seq    = history.covered_seq,
+		body_sha256    = chat_body_digest(body),
 	}
 	if prep.request.Instructions_Present { input.instructions = prep.request.Instructions }
 	input.instruction_snapshot_seq = snapshot_seq
@@ -226,6 +235,21 @@ chat_request_input_make :: proc(
 	if count > len(history.entries) { count = len(history.entries) }
 	if count > 0 { input.context_through = history.entries[count - 1].seq }
 	return input
+}
+
+// chat_body_digest is the digest of the bytes one send carries, written the way the
+// logging capture writes the artifacts it stores. A reader can tell whether two attempts
+// sent the same bytes without either one being kept.
+@(private)
+chat_body_digest :: proc(body: []u8) -> string {
+	ctx: sha2.Context_256
+	sha2.init_256(&ctx)
+	sha2.update(&ctx, body)
+	digest: [sha2.DIGEST_SIZE_256]u8
+	sha2.final(&ctx, digest[:])
+	encoded, encode_err := hex.encode(digest[:], context.temp_allocator)
+	if encode_err != nil { return "" }
+	return string(encoded)
 }
 
 // chat_request_input_situate puts one send in its chain. A chain's rows carry the same
@@ -253,6 +277,7 @@ chat_request_input_encode :: proc(input: Chat_Request_Input) -> string {
 @(private)
 chat_request_input_clone :: proc(input: ^Chat_Request_Input, allocator: mem.Allocator) {
 	input.instructions = strings.clone(input.instructions, allocator)
+	input.body_sha256 = strings.clone(input.body_sha256, allocator)
 	tools := make([]Chat_Request_Tool, len(input.tools), allocator)
 	for &tool, index in tools {
 		source := input.tools[index]
@@ -269,6 +294,7 @@ chat_request_input_clone :: proc(input: ^Chat_Request_Input, allocator: mem.Allo
 @(private)
 chat_request_input_destroy :: proc(input: ^Chat_Request_Input, allocator: mem.Allocator) {
 	delete(input.instructions, allocator)
+	delete(input.body_sha256, allocator)
 	for &tool in input.tools {
 		delete(tool.name, allocator)
 		delete(tool.description, allocator)

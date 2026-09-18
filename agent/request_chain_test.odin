@@ -99,6 +99,11 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(t: ^testing.T) {
 	testing.expect_value(t, first_attempt, i64(1))
 	testing.expect_value(t, first_recovery, "initial")
 	testing.expect(t, first_previous == nil, "the first send of a chain names no predecessor")
+	// The retry sent the same bytes, and the store says so: both rows name the digest of one
+	// payload. Neither payload had to be kept to prove it.
+	first_digest := input_body_digest(t, first.input_json)
+	testing.expect(t, first_digest != "", "a request row records the digest of what it sent")
+	testing.expect_value(t, input_body_digest(t, second.input_json), first_digest)
 
 	// The record of that failure is the evidence the layers observed, not the prose a
 	// front-end would show: a reader can tell a rate limit from a bad request without
@@ -306,6 +311,17 @@ test_the_turn_record_carries_its_typed_failure :: proc(t: ^testing.T) {
 	if !testing.expect(t, is_object, "the turn record is an object") { return }
 	reason, _ = object["reason"].(json.String)
 	testing.expect_value(t, string(reason), "")
+}
+
+// input_body_digest reads the digest of the bytes one request row's input record names.
+input_body_digest :: proc(t: ^testing.T, input_json: string) -> string {
+	value, parse_err := json.parse_string(input_json, .JSON, true, context.temp_allocator)
+	if parse_err != nil { testing.fail_now(t, "the input record is not valid JSON") }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, is_object := value.(json.Object)
+	if !testing.expect(t, is_object, "the input record is an object") { return "" }
+	digest, _ := object["body_sha256"].(json.String)
+	return string(digest)
 }
 
 // attempt_record reads the chain fields one request row's input record carries.

@@ -556,6 +556,8 @@ test_a_rejected_payload_is_repaired_from_a_ready_summary :: proc(t: ^testing.T) 
 	evidence := error_record(t, first.error_json)
 	testing.expect_value(t, evidence.failure_class, "context_overflow")
 	testing.expect_value(t, evidence.recovery, "context_exhausted")
+	// What replaced the refused payload is a different payload, and the digests say so.
+	testing.expect(t, input_body_digest(t, second.input_json) != input_body_digest(t, first.input_json), "a repaired request sends a different payload")
 }
 
 // A provider that rejects the payload with nothing to install ends the turn as context
@@ -738,6 +740,9 @@ test_a_transient_summary_failure_is_retried_on_the_same_bytes :: proc(t: ^testin
 	evidence := error_record(t, first.error_json)
 	testing.expect_value(t, evidence.failure_class, "provider_unavailable")
 	testing.expect_value(t, evidence.recovery, "transient_failure")
+	// The retry repeated the frozen bytes, and the store says so: both rows name the digest
+	// of one payload.
+	testing.expect_value(t, input_body_digest(t, second.input_json), input_body_digest(t, first.input_json))
 
 	testing.expect(t, chat_compact_install(chat, {}), "the summary installs once it is ready")
 }
