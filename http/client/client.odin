@@ -269,7 +269,7 @@ format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer
 	if !request_has_header(request, "connection") {
 		bytes.buffer_write_string(&buffer, "connection: close\r\n")
 	}
-	if !request_has_header(request, "content-length") {
+	if !request_has_header(request, "content-length") && request_states_length(request) {
 		length_line: [48]u8
 		bytes.buffer_write_string(&buffer, fmt.bprintf(length_line[:], "content-length: %d\r\n", len(request.body)))
 	}
@@ -283,6 +283,23 @@ format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer
 	body_offset = len(bytes.buffer_to_bytes(&buffer))
 	bytes.buffer_write(&buffer, request.body)
 	return
+}
+
+// request_states_length reports whether a request says how long its content is.
+//
+// RFC 9110 8.6: a request whose method defines a meaning for enclosed content states its
+// length even when there is none, which is how a server tells an empty body from no body;
+// a request with no content whose method defines no such meaning states nothing, because
+// there is nothing to state.
+request_states_length :: proc(request: Request) -> bool {
+	if len(request.body) > 0 { return true }
+	switch request.method {
+	case .Post, .Put, .Patch:
+		return true
+	case .Get, .Head, .Delete, .Options, .Trace, .Connect:
+		return false
+	}
+	return false
 }
 
 // request_has_header reports whether the caller set a field, so the defaults this

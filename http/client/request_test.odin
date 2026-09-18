@@ -94,6 +94,40 @@ test_request_heading_headers :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_content_length_is_stated_only_where_it_means_something :: proc(t: ^testing.T) {
+	// RFC 9110 8.6: a method that defines a meaning for enclosed content states its
+	// length even when there is none, and a method that does not leaves the field out.
+	empty_post := Request {
+		url    = "https://api.example.com/v1/messages",
+		method = .Post,
+	}
+	post_text := _render(t, empty_post)
+	testing.expectf(t, strings.contains(post_text, "content-length: 0\r\n"), "an empty POST does not state its content:\n%s", post_text)
+
+	empty_get := Request {
+		url    = "https://api.example.com/",
+		method = .Get,
+	}
+	get_text := _render(t, empty_get)
+	testing.expectf(t, !strings.contains(get_text, "content-length"), "a GET states a length it has no content for:\n%s", get_text)
+}
+
+@(test)
+test_a_callers_own_field_replaces_the_one_this_builder_supplies :: proc(t: ^testing.T) {
+	// A request that keeps the connection it opened says so itself, and the field is
+	// written once.
+	request := Request {
+		url     = "https://api.example.com/realtime",
+		method  = .Get,
+		headers = {{"connection", "Upgrade"}, {"upgrade", "websocket"}},
+	}
+	text := _render(t, request)
+	testing.expectf(t, strings.contains(text, "connection: Upgrade\r\n"), "the caller's own connection field is missing:\n%s", text)
+	testing.expectf(t, !strings.contains(text, "connection: close"), "the builder's connection field was written as well:\n%s", text)
+	testing.expectf(t, strings.contains(text, "upgrade: websocket\r\n"), "the caller's upgrade field is missing:\n%s", text)
+}
+
+@(test)
 test_the_body_offset_names_where_the_body_begins :: proc(t: ^testing.T) {
 	// The offset is what lets a partial write say how much of the *body* the
 	// transport took, so it must land exactly on the first body byte however
