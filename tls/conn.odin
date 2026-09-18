@@ -170,6 +170,18 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 	// A server echoes the session id it was sent, which is what carries a
 	// compatibility-mode handshake through a middlebox (RFC 8446 section 4.1.3).
 	if !bytes.equal(hello.session_id, session_id[:]) { return .Handshake }
+
+	// The server's own choice is the one that protects the connection, and its hash is
+	// the hash of the transcript, so both are taken again for it (RFC 8446 section
+	// 4.1.3). The ClientHello is hashed from the buffer it was built in, which still
+	// holds it: what has been read since went into another.
+	if hello.cipher_suite != suite {
+		suite = hello.cipher_suite
+		conn.suite = suite
+		conn.schedule = key_schedule_init(suite)
+		hash.init(&conn.transcript, CIPHER_SUITES[suite].hash)
+		hash.update(&conn.transcript, message)
+	}
 	hash.update(&conn.transcript, hello_message)
 
 	shared_secret: [x25519.POINT_SIZE]u8
