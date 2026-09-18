@@ -4,7 +4,8 @@ import "core:nbio"
 import "core:net"
 import "core:time"
 
-// This file waits for readiness rather than moving data.
+// This file waits: for a connect to complete, and for a connected socket to
+// become ready. It never moves data.
 //
 // The event loop is used to wait for a socket to become ready, and the transfer
 // itself stays a direct call on the socket. core:nbio also offers send and recv
@@ -40,6 +41,57 @@ Wait_Result :: enum {
 	Stopped,
 	// The wait itself failed.
 	Failed,
+}
+
+// Connect_State is a dial operation's answer, taken out of the operation while its
+// callback runs: the operation is reaped as soon as that callback returns.
+//
+// A failed dial leaves a non-zero but already closed socket on the operation, so
+// the socket alone cannot say whether the attempt succeeded.
+@(private)
+Connect_State :: struct {
+	socket: net.TCP_Socket,
+	failed: bool,
+	done:   bool,
+}
+
+@(private)
+on_connect_ready :: proc(op: ^nbio.Operation, state: ^Connect_State) {
+	state.socket = op.dial.socket
+	state.failed = op.dial.err != nil
+	state.done = true
+}
+
+/*
+wait_connected opens a connection on the calling thread's event loop, so the
+caller's probe can end an attempt that is not progressing, which a connect that
+blocks cannot express.
+
+A zero socket means the attempt failed on its own; a stop means the probe ended
+it, and the operation was cancelled rather than left to run on.
+*/
+wait_connected :: proc(endpoint: net.Endpoint, probe: Probe) -> (socket: net.TCP_Socket, stop: Transport_Stop) {
+	state: Connect_State
+	op := nbio.dial_poly(endpoint, &state, on_connect_ready)
+
+	for !state.done {
+		if probe_stop := stop_from_wait(probe_now(probe)); probe_stop != .None {
+			// remove only *requests* cancellation: the operation stays
+			// outstanding, so its callback would still run and would write
+			// through a pointer to this frame. Drain the loop until it is reaped.
+			nbio.remove(op)
+			drain_event_loop()
+			return 0, probe_stop
+		}
+		nbio.tick(WAIT_SLICE)
+	}
+
+	if state.failed {
+		// The operation closed the socket it opened, so there is nothing to
+		// return and nothing to close.
+		return 0, .None
+	}
+	return state.socket, .None
 }
 
 @(private)

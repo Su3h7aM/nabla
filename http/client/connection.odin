@@ -3,7 +3,6 @@ package client
 import "core:c"
 import "core:mem"
 import "core:net"
-import "core:sys/linux"
 
 // Connection owns one socket and, for TLS, its session and context. Its holder is
 // the sole I/O owner, so no thread frees TLS state while a read is in flight.
@@ -22,6 +21,11 @@ Connection :: struct {
 // connection_dial returns nil on failure, so a caller never owns a half-built
 // connection. It waits on the calling thread's core:nbio event loop, which the
 // caller must have acquired.
+//
+// The probe decides which connect core offers. Waiting for a connect and asking
+// the probe whether to stop at the same time needs an event loop, so a probe
+// selects nbio's dial. With nothing to interrupt the attempt, core:net's own
+// blocking dial is the whole requirement, and the socket it returns blocks.
 connection_dial :: proc(endpoint: net.Endpoint, options: Options, allocator: mem.Allocator) -> (^Connection, Error) {
 	if endpoint.port == 0 { return nil, .Connect }
 	connection := new(Connection, allocator)
@@ -30,71 +34,29 @@ connection_dial :: proc(endpoint: net.Endpoint, options: Options, allocator: mem
 	connection.ca_file = options.ca_file
 	connection.nonblocking = options.probe.check != nil
 
-	// core:net owns socket creation, so CLOEXEC and the address family are handled
-	// there rather than restated as raw bits here.
-	family := net.Address_Family.IP4
-	if _, is_v6 := endpoint.address.(net.IP6_Address); is_v6 { family = .IP6 }
-	any_socket, create_err := net.create_socket(family, .TCP)
-	if create_err != nil {
-		connection_destroy(connection)
-		return nil, .Connect
-	}
-	socket, is_tcp := any_socket.(net.TCP_Socket)
-	if !is_tcp {
-		net.close(any_socket)
-		connection_destroy(connection)
-		return nil, .Connect
-	}
-	connection.socket = socket
-
-	// Connect is the reason this file still needs raw syscalls: core:net has no
-	// nonblocking connect, and interruptibility depends on one.
+	socket: net.TCP_Socket
 	if connection.nonblocking {
-		if blocking_err := net.set_blocking(any_socket, false); blocking_err != nil {
-			connection_destroy(connection)
-			return nil, .Connect
-		}
-	}
-
-	address := endpoint_sockaddr(endpoint)
-	connect_errno := linux.connect(linux.Fd(i64(connection.socket)), &address)
-	#partial switch connect_errno {
-	case .NONE:
-		return connection, .None
-	case .EINPROGRESS, .EINTR, .EAGAIN:
-		if !connection.nonblocking {
-			connection_destroy(connection)
-			return nil, .Connect
-		}
-		if stop := connection_wait(connection, .Write); stop != .None {
+		stop: Transport_Stop
+		socket, stop = wait_connected(endpoint, connection.probe)
+		if stop != .None {
 			connection_destroy(connection)
 			return nil, error_from_stop(stop)
 		}
-		socket_error, socket_errno := socket_connect_error(linux.Fd(i64(connection.socket)))
-		if socket_errno != .NONE || socket_error != 0 {
+		if socket == 0 {
 			connection_destroy(connection)
 			return nil, .Connect
 		}
-		return connection, .None
-	case:
-		connection_destroy(connection)
-		return nil, .Connect
+	} else {
+		dialed, dial_err := net.dial_tcp_from_endpoint(endpoint)
+		if dial_err != nil {
+			connection_destroy(connection)
+			return nil, .Connect
+		}
+		socket = dialed
 	}
-}
 
-// socket_connect_error reads SO_ERROR, which is how a failed nonblocking connect
-// reports its cause. The option holds an int, but core:sys/linux derives the option
-// length from `size_of(^T)` rather than from the pointee, so the buffer has to be
-// pointer-sized or the kernel is told to write eight bytes into a four-byte object.
-// The padding is never touched. Keep the workaround here rather than at the call
-// sites; odin-lang/Odin#7534 tracks the wrapper.
-socket_connect_error :: proc(fd: linux.Fd) -> (value: i32, errno: linux.Errno) {
-	option: struct {
-		value: i32,
-		pad:   [4]u8,
-	}
-	_, errno = linux.getsockopt_base(fd, int(linux.SOL_SOCKET), .ERROR, &option)
-	return option.value, errno
+	connection.socket = socket
+	return connection, .None
 }
 
 // connection_handshake completes TLS and verifies the peer chain. A failed
@@ -307,14 +269,4 @@ connection_destroy :: proc(connection: ^Connection) {
 	}
 	allocator := connection.allocator
 	free(connection, allocator)
-}
-
-endpoint_sockaddr :: proc(endpoint: net.Endpoint) -> linux.Sock_Addr_Any {
-	#partial switch address in endpoint.address {
-	case net.IP4_Address:
-		return {ipv4 = {sin_family = .INET, sin_port = u16be(endpoint.port), sin_addr = ([4]u8)(address)}}
-	case net.IP6_Address:
-		return {ipv6 = {sin6_family = .INET6, sin6_port = u16be(endpoint.port), sin6_addr = transmute([16]u8)address}}
-	}
-	return {}
 }
