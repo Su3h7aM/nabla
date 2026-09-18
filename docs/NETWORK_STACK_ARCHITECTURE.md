@@ -628,8 +628,10 @@ Four further facts, each of which shrinks stage 1:
   `api.anthropic.com`. AES-256-GCM and ChaCha20-Poly1305 are a SHOULD, and they cost us
   nothing because `core:crypto/aead` already has both.
 - **X25519 alone works, and P-256 alone works.** Both completed without the peer needing a
-  group we did not offer. HelloRetryRequest handling is still required by the RFC, but no
-  provider here forces it.
+  group we did not offer. HelloRetryRequest handling was left out at first for that reason
+  and is answered now, along with the secp256r1 exchange section 8.1 makes mandatory: a
+  server restricted to P-256 answers the share this client sends with a retry, and
+  `tls/test/openssl_handshake` runs that handshake for each suite.
 - **TLS 1.2 needs one suite for these providers**: `ECDHE-ECDSA-AES128-GCM-SHA256` alone
   completed against both test hosts. CBC suites are not needed for them, which removes the
   padding-oracle surface from stage 2 entirely.
@@ -811,8 +813,8 @@ TLS commit unrevertable.
 ### 12.1 Risks
 
 - **Interoperability is the long tail.** The primitives are core's and already exercised.
-  The failures are a HelloRetryRequest mishandled, a record split at an uncovered offset, a
-  server sending an extension we reject instead of ignore, and a chain shape the corpora lack.
+  The failures are a record split at an uncovered offset, a server sending an extension we
+  reject instead of ignore, and a chain shape the corpora lack.
 - **Certificate verification is where the security lives.** A record-layer bug corrupts; a
   verification bug leaks silently and permanently. The wiring of `verify_chain`,
   `verify_hostname`, and `required_eku = .Server_Auth` is the part to review hardest, and
@@ -870,11 +872,17 @@ and B.3.
 `tls/server_hello.odin`, `tls/auth.odin`, `tls/alert.odin`, `tls/roots.odin`, and the
 `Conn` driver with `Transport`. The trace's own CertificateVerify and Finished verify,
 which is what pins the signature input and the transcript each of them covers.
-Compatibility mode is complete: a session id is named and the change cipher spec record
-that goes with it is sent. Remaining, and both are refusals rather than mistakes: a
-HelloRetryRequest is refused because the driver does not answer one yet, and an alert is
-reported with the peer's description rather than acted on. Gate: `tls/test/openssl_handshake`
-completes a real handshake against `openssl s_server` over a socket and asks it for a page.
+Compatibility mode is complete: a session id is named, the one change cipher spec record
+the appendix places before this client's second flight is sent, and an alert the peer ends
+the handshake with is reported with the description it carried. Gate:
+`tls/test/openssl_handshake` completes a real handshake against `openssl s_server` over a
+socket and asks it for a page.
+
+Two things phase 3 left were finished after it, each for a reason the RFC states rather than
+one a provider forced: a HelloRetryRequest is answered, and the mandatory secp256r1 key
+exchange is offered, so a peer that accepts only the mandatory group is reachable.
+`tls/test/openssl_handshake` now runs each suite against a server restricted to each group,
+which is where both retries are exercised against an independent implementation.
 
 **Phase 4: record protection and public read/write, local.** Done: `Conn.read` and
 `Conn.write` carry application data, a key update from the peer is followed, and a
