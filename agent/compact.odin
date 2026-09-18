@@ -92,15 +92,37 @@ chat_compact_trigger :: proc(chat: ^Chat_Session) -> int {
 // summarized without its result would be sent as an unanswered tool call. A seam
 // on a call is coherent -- its result follows inside the tail -- so only a result,
 // or a position whose predecessor is a call, moves the seam left.
+//
+// Everything one model request committed is one run. On the Responses API the
+// request's replay record carries the endpoint's own output, calls included, so the
+// call that a result answers may be inside a `.Response` entry rather than in an
+// adjacent `.Tool_Call`. Cutting between that record and the entries committed with
+// the same request would send those calls with no results, so the whole request
+// moves left together.
 chat_compact_seam :: proc(entries: []session.Entry, keep: int) -> int {
 	if keep <= 0 { return len(entries) }
 	seam := len(entries) - keep
 	if seam < 0 { seam = 0 }
 	for seam > 0 {
-		if entries[seam].kind != .Tool_Result && entries[seam - 1].kind != .Tool_Call { break }
+		current := entries[seam]
+		previous := entries[seam - 1]
+		split := current.kind == .Tool_Result || previous.kind == .Tool_Call
+		if !split && chat_compact_same_request(previous, current) { split = true }
+		if !split { break }
 		seam -= 1
 	}
 	return seam
+}
+
+// chat_compact_same_request reports whether two entries were committed by one model
+// request. A request's entries -- its replay record, its text, its calls, and the
+// results that answer them -- are one unit, so a seam may not fall between any two
+// of them.
+@(private)
+chat_compact_same_request :: proc(a, b: session.Entry) -> bool {
+	a_request, a_present := a.request_no.?
+	b_request, b_present := b.request_no.?
+	return a_present && b_present && a_request == b_request
 }
 
 // --- the frozen request ------------------------------------------------------

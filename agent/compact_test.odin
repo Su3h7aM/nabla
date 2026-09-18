@@ -61,6 +61,52 @@ test_compact_seam_never_lands_inside_a_later_run :: proc(t: ^testing.T) {
 	testing.expect_value(t, chat_compact_seam(grouped, 3), 1)
 }
 
+// On the Responses API the endpoint's own output is replayed verbatim, so a
+// request's calls live inside its `.Response` entry. A seam between that record
+// and the entries committed with the same request would send the calls without
+// their results even though no adjacent pair looks like a call and its result.
+@(test)
+test_compact_seam_keeps_one_responses_request_together :: proc(t: ^testing.T) {
+	request := session.Request_No(1)
+	record := []session.Entry {
+		compact_user_entry(1, "ask"),
+		{
+			seq = 2,
+			request_no = request,
+			kind = .Response,
+			payload = session.Response_Entry{output = `[{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}]`},
+		},
+		{seq = 3, request_no = request, kind = .Tool_Call, payload = session.Tool_Call_Entry{call_id = "call_1", name = TOOL_SHELL_NAME, arguments = "{}"}},
+		{
+			seq = 4,
+			request_no = request,
+			kind = .Tool_Result,
+			related_seq = 3,
+			payload = session.Tool_Result_Entry{outcome = .Success, content = "{}", origin = .Observed},
+		},
+		compact_user_entry(5, "next"),
+	}
+	// The seam starts on the result and must back over the call and the verbatim
+	// record that carries it, stopping at the user prompt before the request.
+	testing.expect_value(t, chat_compact_seam(record, 2), 1)
+
+	// Assistant text between the record and its calls does not break the run.
+	with_text := []session.Entry {
+		compact_user_entry(1, "ask"),
+		{seq = 2, request_no = request, kind = .Response, payload = session.Response_Entry{output = `[]`}},
+		{seq = 3, request_no = request, kind = .Assistant, payload = session.Assistant_Entry{text = "working"}},
+		{seq = 4, request_no = request, kind = .Tool_Call, payload = session.Tool_Call_Entry{call_id = "call_1", name = TOOL_SHELL_NAME, arguments = "{}"}},
+		{
+			seq = 5,
+			request_no = request,
+			kind = .Tool_Result,
+			related_seq = 4,
+			payload = session.Tool_Result_Entry{outcome = .Success, content = "{}", origin = .Observed},
+		},
+	}
+	testing.expect_value(t, chat_compact_seam(with_text, 2), 1)
+}
+
 // A checkpoint is the whole post-compaction context: the checkpoint message in
 // front of the entries after the boundary. This is what the model sees, so it is
 // pinned directly rather than through a summarization request.
