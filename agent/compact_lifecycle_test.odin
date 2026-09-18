@@ -942,3 +942,56 @@ test_an_exhausted_chain_waits_for_the_context_to_move :: proc(t: ^testing.T) {
 	chat_compact_consider(chat, {}, connection, &after)
 	testing.expect_value(t, chat.compact.state, Compact_State.Running)
 }
+
+// A summary that is still running when the provider rejects the context ends the turn at once:
+// the repair never waits for it, and it never cancels work the session owns.
+@(test)
+test_a_running_summary_ends_the_turn_as_context_exhaustion :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	// A window small enough that the summary's own request stays inside what the stalling
+	// fixture reads, and still large enough for the context to cross the compaction trigger.
+	chat_test_capacity(chat, 16_000)
+	_test_accept(t, chat, "first")
+	large := strings.repeat("work ", 10_000) or_else ""
+	defer delete(large)
+	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.User_Entry{text = large, origin = .Prompt}})
+	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
+		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_100, payload = session.Assistant_Entry{text = text}})
+	}
+
+	overflow := `{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens"}}`
+	background: Compact_Provider
+	if !compact_provider_start(t, &background, COMPACT_TEST_BODY, true) { return }
+	defer compact_provider_stop(&background)
+	defer sync.sema_post(&background.release)
+	// The foreground is a scripted provider because this test needs a refusal, which the
+	// stalling fixture cannot express.
+	foreground: Agent_Provider
+	if !agent_provider_start(t, &foreground, []string{agent_provider_refusal("400 Bad Request", overflow)}) { return }
+	defer agent_provider_stop(&foreground)
+
+	background_connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = compact_provider_endpoint(&background, context.temp_allocator),
+	}
+	foreground_connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&foreground, chat.allocator),
+	}
+	defer delete(foreground_connection.Endpoint, chat.allocator)
+
+	// The summary is in flight and the foreground is refused: there is nothing to install, and
+	// nothing waits for the summary to arrive.
+	prep, prep_err := chat_prepare(chat, background_connection)
+	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
+	chat_compact_consider(chat, {}, background_connection, &prep)
+	chat_request_prep_destroy(&prep, chat.allocator)
+	if !testing.expect_value(t, chat.compact.state, Compact_State.Running) { return }
+
+	testing.expect(t, !chat_run_turn(chat, foreground_connection, test_retry_policy(), {}), "the turn ends without a repair")
+	testing.expect_value(t, chat_session_repair_refusal(chat), Chat_Repair_Refusal.Summary_Running)
+	testing.expect_value(t, chat.compact.state, Compact_State.Running)
+}

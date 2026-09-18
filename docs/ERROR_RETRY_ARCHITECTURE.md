@@ -1,12 +1,16 @@
 # Provider failures, retries, and context recovery
 
-Status: implementation specification, not implemented. Inspected against Nabla change
-`knoqvwwr`, with Odin `dev-2026-09-nightly:a2fb372`. This document is authoritative for the
-work below, with one superseded direction: the deadline-based recovery policy it proposes
-(attempt timeout, recovery budget, retained turn deadline) was rejected. Model requests carry
-no harness time bound; only the provider bounds deliberation. A future implementation must not
-reintroduce harness deadlines. The existing compaction lifecycle remains implemented as described in
-[Context management and non-blocking compaction](CONTEXT_COMPACTION_ARCHITECTURE.md).
+Status: implemented against Nabla change `knopyttl`, with Odin
+`dev-2026-09-nightly:a2fb372`. Every section below is in the tree except where it says
+otherwise; the deadlines it proposed were rejected before that work began, and no harness time
+bound was introduced. What is not established by the tests, and needs a live exercise against a
+real provider, is listed at the end.
+
+One direction was superseded while the work was done: the deadline-based recovery policy this
+document proposed (attempt timeout, recovery budget, retained turn deadline) was rejected. Model
+requests carry no harness time bound; only the provider bounds deliberation. A future change must
+not reintroduce harness deadlines. The existing compaction lifecycle remains implemented as
+described in [Context management and non-blocking compaction](CONTEXT_COMPACTION_ARCHITECTURE.md).
 Where this document changes that policy, the change is explicitly identified.
 
 ## 1. Scope and decisions
@@ -91,15 +95,18 @@ observer. It receives final status and borrowed `http.Headers` after the final r
 has been read, before the body. No provider field names belong in this callback's implementation.
 Headers live only for the call. `sse.post` forwards this option without interpreting it.
 
-Extend `client.Failure` with bounded error-body bytes and a truncation flag. Read non-2xx bodies
+A refused response's body is delivered to the caller's chunk callback like any other body:
 through the existing framing rules, including chunk decoding and content-length, under the same
-probe and deadline as successful bodies. Stop at `HTTP_MAX_ERROR_BYTES`, currently 4096.
-A truncated or malformed body is evidence, not a valid JSON document. Preserve the status even
-when reading its error body fails. Do not parse the existing `"HTTP 400: ..."` display string.
+probe as a successful body. The transport itself bounds what it reads only where the protocol
+does. The size policy belongs to whoever consumes the evidence, and `ai` keeps its own bounded
+copy (`PROVIDER_MAX_ERROR_BODY_BYTES`, 8192 bytes) to decode the provider's error document from.
+A body that ended early or is not a document is evidence, not a valid JSON document, and the
+status survives even when reading that body fails. Do not parse the existing `"HTTP 400: ..."`
+display string.
 
-Use an explicit `client.failure_destroy` contract to release owned body/detail data on all paths,
-including content-type rejection. Current ownership differs by error kind; adding more owned
-fields without one destructor is error-prone. `ai` copies what it needs before destruction.
+Use an explicit `client.failure_destroy` contract to release owned detail data on all paths,
+including content-type rejection. Ownership that differs by error kind is error-prone: one
+destructor releases any of them, so `ai` copies what it needs before destruction.
 Do not retain all headers or raw error bodies in the harness's durable failure record.
 
 Retain the underlying `client.Error` cause in the failure, and collect `Transfer_Summary` even
@@ -193,47 +200,52 @@ eligibility only within the transient classes below; it does not make an unknown
 
 ## 4. Foreground policy
 
-Put the pure decision and delay procedures in `agent/retry.odin`. Keep request execution in
-`chat.odin`; do not add another package. Proposed declarations are data, not interfaces:
+The pure decision and delay procedures are in `agent/retry.odin`; request execution stays in
+`chat.odin`, and no second package was added. The declarations are data, not interfaces:
 
 - `Request_Recovery_Action`: `Stop`, `Retry`, `Repair_Context`.
-- `Request_Recovery_Reason`: named reasons for transient failure, terminal classification,
-  output exposure, cancellation, deadline, attempt limit, excessive provider delay, and
-  context exhaustion. Never a boolean with an unexplained false result.
-- `Request_Recovery_Decision`: action, reason, and `time.Duration` delay.
-- `Request_Recovery`: attempts sent, transient retries used, overflow repair used, monotonic
-  deadline, and previous `Maybe(session.Request_No)`.
+- `Request_Recovery_Reason`: named reasons for a completed send, a failure the harness caused,
+  a store that refused a write, cancellation, output exposure, context exhaustion, a terminal
+  class, an exhausted attempt bound, a provider delay that is too long to wait, and a transient
+  failure that is retried. Never a boolean with an unexplained false result.
+- `Chat_Recovery_Decision`: action, reason, and `time.Duration` delay.
+- `Chat_Attempt_Facts`: the sends made so far, the operation's own error, whether the harness
+  failed the send itself, whether the store failed, what the attempt exposed to a reader,
+  whether the turn was cancelled, and whether this chain has already used its one repair.
 
-Policy defaults:
+Policy defaults, as implemented:
 
 | Constant | Value |
 |---|---:|
 | `CHAT_REQUEST_MAX_ATTEMPTS` | 3 total sends, including a repaired request |
-| `CHAT_REQUEST_RECOVERY_BUDGET` | 120 seconds, retaining the existing total operation bound |
-| `CHAT_REQUEST_ATTEMPT_TIMEOUT` | 45 seconds, clamped to the recovery and turn deadlines |
+| `CHAT_COMPACT_MAX_ATTEMPTS` | 2 sends for one summary chain |
 | `CHAT_RETRY_BASE_DELAY` | 500 milliseconds |
 | `CHAT_RETRY_MAX_DELAY` | 8 seconds for computed backoff |
 | `CHAT_RETRY_MAX_PROVIDER_DELAY` | 30 seconds |
 | `CHAT_RETRY_SLICE` | 50 milliseconds |
+| `CHAT_COMPACT_COOLDOWN_MS` | 30 seconds before another summary may start |
 
-Retain `CHAT_TURN_DEADLINE = 300 seconds`. One response/recovery chain gets 120 seconds in total,
-not 120 seconds per send. An attempt timeout can retry while that total remains; exhaustion of
-the total or turn deadline cannot. A slow but valid provider may require tuning the 45-second
-attempt default. Make the limits one policy struct passed to the runner, with these production
-defaults; tests can use short deadlines without environment-variable bypasses.
+There is no recovery budget, no attempt timeout, and no turn deadline, and none was added: the
+bound on a chain is how many sends it may make and how long it waits between them. The limits
+are one policy struct passed to the runner (`Chat_Retry_Policy`), with those production defaults,
+and the session holds the compaction policy because compaction outlives any turn. Tests pass
+their own policy rather than an environment variable. The chain's own accounting lives in what
+the rows record, so a cancelled turn needs no separate counter.
 
 ### Decision order
 
 After the synchronous send returns and provisional output is settled:
 
-1. Storage failure, cancellation, or expired total deadline: stop.
+1. Cancellation, a failed write, or a send the harness failed itself: stop, each with its own
+   reason.
 2. Successful complete operation and accepted completion: commit normally.
 3. Published text or accepted completion: stop on failure. Preserve text as partial.
 4. Confirmed input overflow: use §7, never ordinary backoff.
 5. Terminal class or `Forbid`: stop.
-6. Retry transient connection/I/O failure, attempt timeout, incomplete stream, rate limiting,
-   or provider unavailability if another attempt and time remain.
-7. Otherwise stop. Unknown provider failure and malformed output are terminal initially.
+6. Retry transient connection/I/O failure, incomplete stream, rate limiting, or provider
+   unavailability if another attempt remains and the provider is not asking for a longer wait
+   than the policy allows.
+7. Otherwise stop. Unknown provider failure, malformed output, and a local expiry are terminal.
 
 Do not make delivered body bytes the exposure test. A usage update, keepalive, or ignored
 reasoning event is not visible output. Track `text_exposed` and `completion_accepted` explicitly
@@ -259,14 +271,12 @@ Compute in checked/saturating integer durations. Use `core:math/rand.float64_ran
 with the thread's generator. Pass a sampled fraction to the pure delay procedure in tests.
 No custom random generator or scheduler framework.
 
-If the provider asks for more than 30 seconds, or the delay reaches the remaining total budget,
-stop with a typed reason and show the delay the provider requested. Do not cap a 10-minute
-instruction to 30 seconds and send early. Check cancellation before scheduling, during each
-50 ms wait slice, and immediately before sending again. Extend `chat_retry_wait`, which already
-sleeps in `CHAT_RETRY_SLICE` slices against a monotonic deadline, to take the recovery deadline
-as an argument and to distinguish cancellation from expiry in its result. Do not switch it to
-wall-clock arithmetic: a delay derived from an `Retry-After` date is converted to a duration
-once, at header receipt, and then waited on monotonically.
+If the provider asks for more than 30 seconds, stop with `Provider_Delay_Too_Long` and report the
+delay it requested. Do not cap a 10-minute instruction to 30 seconds and send early. Check
+cancellation before scheduling, during each 50 ms wait slice, and immediately before sending
+again. `chat_retry_wait` takes the policy's slice and the delay, and reports whether the wait
+finished instead of being stopped. It stays monotonic: a delay derived from a `Retry-After` date
+is converted to a duration once, at header receipt, and waited on from there.
 
 While waiting, the driver may poll/adopt completed compaction work, but cannot install it into
 the frozen request or start unrelated inference. A ready summary waits for the next boundary.
@@ -316,10 +326,12 @@ returned `.None`. Retire each operation only after its call returns.
 
 Usage events can be repeated or cumulative within a send. Keep the latest reported value for
 each bucket, never sum snapshots. Sum sends when reporting turn/session cost, including failed
-sends and compaction. Missing stays nil. Keep a separate count of sends without reported usage
-so a total does not claim to include unreported cost. `last_input_measured` is the latest request's
-input estimate anchor, not the sum across retries. Update `chat_request_usage`, root usage
-consumers, and cache-total readers accordingly.
+sends and compaction. Missing stays nil: a bucket's total carries the count of requests that
+reported it, so a total never claims to include cost nobody reported. There is no count of sends
+that reported nothing at all, which a reader wanting the full denominator would have to add.
+`last_input_measured` is the latest request's input estimate anchor, not the sum across retries.
+`chat_request_usage` reads one operation's reports, and `session.cache_totals` sums every
+finished request, failed and compaction rows included.
 
 Crash recovery still closes running rows as interrupted and never automatically replays them.
 A retry scheduled before a crash is an audit fact, not a durable alarm. A new prompt starts a
@@ -345,6 +357,9 @@ remote side effects are added, automatic ambiguous-delivery retries require a se
 contract or idempotency mechanism. Do not generalize the current policy to such operations.
 
 ## 7. Resolve provider-confirmed context overflow
+
+Implemented as written: the one repair lives in the outer recovery loop, the refusal reasons are
+typed (`Chat_Repair_Refusal`), and a turn that could not repair says which part stood in the way.
 
 Local admission and provider overflow use the same repair opportunity, but they are different
 facts. Local admission is an estimate; a provider can reject a request that passed it.
@@ -467,11 +482,12 @@ not provider failures and do not enter this retry policy.
 
 ## 9. Background compaction retries
 
-Use the same pure classifier and delay computation, but a smaller chain: at most two sends and
-120 seconds total, with a 45-second per-attempt timeout. No hidden retry loop inside the worker.
-An unsuccessful partial summary may be discarded and retried because it was never published or
-installed. A summary with tool calls, length exhaustion, malformed output, or insufficient
-reduction is not repaired by blindly regenerating it.
+Implemented as written, with the deadline parts removed: the same classifier and delay
+computation, and a chain of at most `CHAT_COMPACT_MAX_ATTEMPTS` (two) sends. There is no hidden
+retry loop inside the worker, and no time bound on a summary. An unsuccessful partial summary may
+be discarded and retried because it was never published or installed. A summary with tool calls,
+length exhaustion, malformed output, or insufficient reduction is not repaired by blindly
+regenerating it.
 
 Add `Backoff` to `Compact_State`. The owner polls a completed worker, joins only after it is done,
 finishes that attempt's `.Compaction` request row, and records the retry decision. In `Backoff`,
@@ -485,52 +501,64 @@ They never sleep for it. Headless execution services only ordinary boundaries an
 work at teardown. Cancellation of a foreground turn does not cancel this session-level job.
 Session/model changes and teardown cancel both running and scheduled work.
 
-After chain exhaustion, pressure may start a fresh snapshot only after a 30-second cooldown and
-new foreground context progress. Track the last attempted context-through sequence and resolved
-configuration identity. Repeated explicit triggers coalesce and do not bypass cooldown or
-provider-requested delays. Terminal auth/quota/invalid-request failures suppress automatic starts
-for that configuration; explicit retry after configuration/credential correction may clear that
-suppression, but never a pending Retry-After time. Use an owner-side configuration generation,
-incremented when resolved model, endpoint, credentials, or request options change. Do not log
-credentials or use their plaintext as a suppression key. Overflow or a too-large summary requires a
-changed admissible prefix. This replaces the existing unconditional 5-second retry policy.
+After chain exhaustion, pressure may start a fresh snapshot only after a 30-second cooldown
+(`CHAT_COMPACT_COOLDOWN_MS`) and new foreground context progress: the control records the newest
+entry the last chain saw, and a fresh automatic attempt starts only when the context has moved
+past it. Repeated explicit triggers coalesce through the pending intent, and they obey the
+cooldown rather than bypassing it. Terminal auth/quota/invalid-request failures suppress automatic
+starts for that configuration; an explicit request clears that suppression, because the user may
+have corrected what caused it, but it never sends before a provider-requested delay.
 
-Keep database and policy work on the owner thread. Worker output is read only after join. For
-allocator safety, do not assume that wrapping only worker allocations in `mem.mutex_allocator`
-serializes an unwrapped foreground allocator. Allocate worker-owned snapshot/output/error storage
-from a thread-safe heap independent of the caller's allocator, using `core:os.heap_allocator`.
-Keep owner control objects on the session allocator. Copy across that ownership boundary before
-thread start and destroy with the matching allocator after join. Alternatively, serialization
-would require every caller of the backing allocator to use the same lock; do not introduce that
-larger change here. The signal-mask inheritance rule remains unchanged.
+The configuration identity is a SHA-256 digest of the model, the API, the endpoint, and the
+credential, held by the owner: it is the generation the document asks for, and it is compared
+without the credential being stored as a key or written to a log. A change to any of those is a
+change of configuration, and a suppressed session starts again when it changes. Overflow or a
+too-large summary still requires an admissible prefix that has changed. This replaces the
+unconditional 5-second retry policy.
+
+Database and policy work stays on the owner thread, and worker output is read only after join.
+For allocator safety, the worker does not share the caller's allocator at all: the job's
+snapshot, its output and error, and everything the request allocates while it runs come from a
+thread-safe heap (`core:os.heap_allocator`), while the job struct itself stays on the session
+allocator. A lock around the worker's own allocations would not have serialized the owner's
+writes through the same backing allocator, and the test suite's tracking allocator reported
+exactly that as cross-thread leaks and bad frees before the change. The signal-mask inheritance
+rule is unchanged.
 
 ## 10. User-visible behavior and recovery reporting
 
-Expose a typed retry callback/event through `Chat_Observer`: request number, next attempt, maximum
-attempts, failure class, and due time/delay. Root owns wording and the status snapshot. Headless
-mode prints one notice per scheduled retry; TUI shows the next attempt and clears it on send,
-success, cancellation, or terminal failure. No renderer reaches into `Compact_Control` or policy.
+Implemented as written. `Chat_Observer.retry_scheduled` carries a `Chat_Retry_Event` with the
+request number, the next attempt, the chain's bound, the failure class, and the wait; the root
+words it, keeps it in the transcript, and shows it on the working indicator until the next send is
+prepared or the session stops running. No renderer reads `Compact_Control` or the policy.
 
-Use structured events `request.retry_scheduled`, `request.retry_started`,
-`request.recovery_stopped`, and `request.context_repaired`. Correlate every one with the actual
-request/attempt, and include the changed checkpoint for repair. Keep existing transfer diagnostics,
-but do not make policy depend on them being enabled. Redact credentials and sensitive response
-text; identifiers and bounded error text remain subject to the existing logging policy.
+The structured events are `request.retry_scheduled`, `request.retry_started`,
+`request.recovery_stopped`, `request.context_repaired`, and `compaction.retry_scheduled`, each
+correlated with the request and attempt it belongs to, with the covered checkpoint on a repair.
+Transfer diagnostics stay as they are, and no policy depends on them being enabled. Credentials
+and response text are redacted as before, and identifiers and bounded error text follow the
+existing logging policy.
 
 Persist typed terminal failure data on the turn as well as the last failed request. It includes
 `Context_Exhausted` and its cause, not just a display string. Local admission can fail before a
 request row exists; do not invent a sent request for that case. The frontend should distinguish:
 
-- temporary provider failure exhausted its retry budget;
-- credentials/quota/configuration require a change;
-- partial output prevented safe automatic retry;
-- context is full while a summary is running, or no admissible summary exists.
+- temporary provider failure exhausted its retry budget (`attempts_exhausted`);
+- credentials/quota/configuration require a change (`terminal_failure`);
+- partial output prevented safe automatic retry (`output_exposed`);
+- context is full while a summary is running, or no admissible summary exists
+  (`context_exhausted` with `summary_running`, `no_candidate`, `no_reduction`, or
+  `repair_rejected`).
 
-Fix steering's stale-error path with a small result enum such as `Accepted`, `Outside_Boundary`,
-`Storage_Failed`. Only the last uses a new storage error. Do not display a previous provider error
-because a later message arrived at the wrong boundary. Audit the queue drain after turn failure:
-accepted pending prompts must either start a fresh turn or remain visibly queued, never be lost
-under the old failure. Cancellation/quit retains the existing explicit discard semantics.
+The turn's own record carries those facts beside its message, and the last failed request's row
+carries the operation's evidence and the decision taken on it.
+
+Steering's stale-error path is fixed with `Chat_Steer_Result` (`Accepted`, `Outside_Boundary`,
+`Storage_Failed`): only a store that refused the line reports an error, so a line that arrived at
+the wrong boundary is never shown a previous provider failure. For the queue drain after a failed
+turn, the first of the two options was taken: a line the turn never reached becomes a fresh prompt,
+or runs as the command it spells, while a cancelled or abandoned turn keeps the explicit discard
+its stop path promises.
 
 Do not impose a cross-turn identical-payload circuit breaker. A user may have repaired credentials
 without changing history, and an endpoint may recover. The bounds apply to automatic recovery
@@ -564,23 +592,25 @@ status-message wording.
 Each step is an independently reviewable change. Keep old behavior until the relevant replacement
 is usable, rather than enabling a retry path that has not acquired durable recording or ownership.
 
-1. **Preserve failure evidence.** Extend HTTP response metadata and framed error-body handling;
-   add destructors, provider normalization, Retry-After, and diagnostic-independent transfer facts.
-   Touch `http/client`, `sse`, `ai/http.odin`, `ai/request.odin`, and provider adapters. No harness
-   retry policy changes yet.
-2. **Separate attempts from turn failure.** Freeze foreground bytes, make runtime/error/usage
-   attempt-local, give each send a request row and operation identity, add versioned records.
-   Update `chat_record.odin`, `chat_session.odin`, `chat.odin`, usage consumers, and recovery tests.
-3. **Install the bounded retry policy.** Add `agent/retry.odin`, attempt deadlines, cancellable
-   backoff, typed observer reporting, and the steering fix. Reuse the existing HTTP test fixture.
-4. **Recover confirmed overflow.** Add the one-repair branch, typed context exhaustion, pressure
-   promotion and idle recovery. Preserve existing conditional checkpoint persistence.
+1. ~~**Preserve failure evidence.**~~ Done: the response-head callback, one `failure_destroy` for
+   every kind, provider normalization, Retry-After, and transfer facts that do not depend on
+   diagnostics. The refused body goes to the caller rather than into a bounded excerpt of the
+   transport's own, which is the one place this document's plan was not followed: see §3.1.
+2. ~~**Separate attempts from turn failure.**~~ Done: frozen foreground bytes, attempt-local
+   runtime, error, and usage, a request row and an operation identity per send, and versioned
+   chain and evidence records.
+3. ~~**Install the bounded retry policy.**~~ Done, without the deadlines: `agent/retry.odin`, a
+   cancellable wait, typed retry reporting, and the steering fix.
+4. ~~**Recover confirmed overflow.**~~ Done: the one-repair branch, typed context exhaustion with
+   its cause, the `Provider_Overflow` trigger, pressure promotion, and idle recovery.
 5. ~~**Retain and admit tool results.**~~ Done: the batch budget, the stored result, the derived
    handle, and `context.read_result`. See §8, including what it leaves open.
-6. **Apply retry policy to compaction.** Add owner-driven backoff, one-send request records,
-   suppression/cooldown, allocator isolation, and root idle servicing. No foreground wait added.
-7. **Validate and update status.** Mark implemented sections only after their gates pass. Run a
-   small live failure exercise to tune latency defaults separately from deterministic tests.
+6. ~~**Apply retry policy to compaction.**~~ Done: owner-driven backoff, one-send request rows per
+   attempt, suppression and cooldown, allocator isolation, and root idle servicing, with no
+   foreground wait added.
+7. ~~**Validate and update status.**~~ Done for the sections above. Not established by any test,
+   and needing a live exercise against a real provider: the delay defaults, what a provider's
+   own `Retry-After` costs in practice, cache economics, and summary quality.
 
 Minimum useful test groups:
 
@@ -606,6 +636,13 @@ Use colocated tests and the existing in-package HTTP fixtures rather than a mock
 `mise run check` and `mise run test` are the final gate, including release/debug and external
 harnesses. Focused package tests are sufficient while developing a step. Live cache economics,
 provider latency, and summary quality need measurements; passing a fixture cannot establish them.
+
+The groups above are in the tree: the classifier and delay tables in `ai/classify_test.odin` and
+`agent/retry_test.odin`, the scripted chains in `agent/request_chain_test.odin` and
+`agent/compact_lifecycle_test.odin`, the structured events in `agent/log_events_test.odin`, and
+the typed decisions in `agent/retry_test.odin`. One case is covered at the decision level rather
+than end to end: a second overflow after a repair stops, which the table asserts directly because
+a scripted provider cannot present the second candidate that would tempt it.
 
 ## 13. Reference evidence and choices
 
