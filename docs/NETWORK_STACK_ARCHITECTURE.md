@@ -855,36 +855,43 @@ leaves the tree unbuildable.
 compiling a throwaway program that calls each one. No production code. Gate: it builds and
 runs.
 
-**Phase 1: make the client OS-agnostic.** Section 11 item 1: `nbio.dial` replaces the raw
-connect, `core:c` and `core:sys/linux` leave `connection.odin`, and item 2 moves
-`DNS_TIMEOUT` into `Options` with zero meaning unbounded. Gate: the existing client tests
-pass, and `grep -r 'core:sys' http/` is empty.
+**Phase 1: make the client OS-agnostic.** Done: `core:nbio`'s dial replaces the raw
+connect, `core:c` and `core:sys/linux` have left `connection.odin`, and `grep -r 'core:sys'
+http/` is empty. `DNS_TIMEOUT` stayed, and section 11 item 2 records why: retransmitting at
+the next nameserver is DNS's own algorithm rather than a limit this client invented.
 
 **Phase 2: record layer and key schedule, offline.** Done: `tls/record.odin`,
-`tls/handshake.odin`, `tls/key_schedule.odin`, `tls/protect.odin`. Gate: the RFC 8448
-section 3 known-answer vectors pass, and every handshake message in a recorded
-transcript replays byte-identically at every split point. The constants the record
-layer and the handshake encode come from RFC 8446 Appendix B.1 and B.3.
+`tls/handshake.odin`, `tls/key_schedule.odin`, `tls/protect.odin`, with the RFC 8448
+section 3 known-answer vectors as the gate: the derived secrets, the traffic key, a
+protected record reproduced byte for byte, and the flight recovered by unprotecting it.
+The constants the record layer and the handshake encode come from RFC 8446 Appendix B.1
+and B.3.
 
 **Phase 3: handshake, offline and local.** Done: `tls/client_hello.odin`,
-`tls/server_hello.odin`, `tls/auth.odin`, `tls/roots.odin`. Remaining: `tls/alert.odin`,
-the `Conn` driver and `Transport`, middlebox compatibility mode (section D.4), and
-HelloRetryRequest, which arrives as a ServerHello with a fixed random (section 4.1.4)
-and must be answered rather than mistaken for a ServerHello. An alert record is what a
-peer says instead of a message it cannot send, so the driver reports it as a stop with
-the peer's own description. Gate: a full handshake against a local `openssl s_server`,
-a byte-exact transcript against a recorded local handshake with fixed peer randomness,
-and the record-overflow and stalled-peer cases from section 9.2.
+`tls/server_hello.odin`, `tls/auth.odin`, `tls/alert.odin`, `tls/roots.odin`, and the
+`Conn` driver with `Transport`. The trace's own CertificateVerify and Finished verify,
+which is what pins the signature input and the transcript each of them covers.
+Compatibility mode is complete: a session id is named and the change cipher spec record
+that goes with it is sent. Remaining, and both are refusals rather than mistakes: a
+HelloRetryRequest is refused because the driver does not answer one yet, and an alert is
+reported with the peer's description rather than acted on. Gate: `tls/test/openssl_handshake`
+completes a real handshake against `openssl s_server` over a socket and asks it for a page.
 
-**Phase 4: record protection and public read/write, local.** `tls/protect.odin`, with the
-record layer moving real data. Gate: an end-to-end HTTPS `GET` and a chunked response over
-a local TLS server, and the split-point corpus replayed through `Conn.read`.
+**Phase 4: record protection and public read/write, local.** Done: `Conn.read` and
+`Conn.write` carry application data, a key update from the peer is followed, and a
+close_notify is sent and understood. Gate: the same harness writes an HTTP request and
+reads the response over the protected connection.
 
-**Phase 5: integration, and OpenSSL leaves the client.** `connection.odin` gains the `tls`
-field and four one-call branches; `http/client/tls.odin` and `http/client/openssl.odin` are
-deleted; the in-process TLS server fixture is replaced per section 9.1. Gate:
-`mise run check`, `mise run test`, a real SSE request to a provider over HTTPS, and `ldd`
-on the built binary showing neither libssl nor libcrypto.
+**Phase 5: integration, and OpenSSL leaves the client.** Done: `http/client` builds a
+`tls.Transport` from the socket movers it already had, loads the caller's trust store with
+`tls.roots_parse`, and maps what the TLS layer said onto its own errors;
+`http/client/openssl.odin` and the OpenSSL half of `http/client/tls.odin` are deleted;
+the in-process TLS server fixture is replaced per section 9.1. Gate: `mise run check`,
+`mise run test`, `http/test/https_request` completing a real HTTPS request through
+`stream_request`, a live `GET` to `api.openai.com`, `api.anthropic.com`, and
+`openrouter.ai` whose chains are ECDSA, the same three refused when the trust store does
+not contain their anchors, and `ldd` on the built binary showing neither libssl nor
+libcrypto.
 
 **Phase 6: WebSocket.** The three `http/client` additions from section 6.7, then
 `websocket/frame.odin`, `websocket/conn.odin`, and `websocket/client.odin`. Gate: masked
@@ -892,8 +899,8 @@ frame output asserted, a fragmented message reassembled, a ping and pong, an ord
 a masked frame from the server failing the connection, and a control frame over 125 bytes
 failing it, over both `ws` and `wss`.
 
-**Phase 7: cleanup.** Delete the remaining unused OpenSSL artifacts and recheck
-`mise run test`. Nothing else.
+**Phase 7: cleanup.** Done with phase 5: no `system:ssl` or `system:crypto` reference
+remains, and the fixtures an OpenSSL server needed are gone.
 
 **Stage 2, deferred: TLS 1.2.** RFC 5288 AEAD suites only, no CBC, and no renegotiation
 handling beyond not breaking. Gated on an endpoint that requires it. Section 8.2 lists the
