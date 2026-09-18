@@ -168,6 +168,9 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 		if hello.version != VERSION_1_3 || hello.pre_shared_key { return fail(conn, .Illegal_Parameter, .Unsupported) }
 		if !suite_offered(hello.cipher_suite) { return fail(conn, .Illegal_Parameter, .Unsupported) }
 		if !bytes.equal(hello.session_id, session_id[:]) { return fail(conn, .Illegal_Parameter, .Handshake) }
+		// A retry that asks for the group this client already sent a share for would not
+		// change the second ClientHello, and a retry has to (RFC 8446 section 4.1.4).
+		if hello.group == exchange.group { return fail(conn, .Illegal_Parameter, .Unsupported) }
 		if !key_exchange_generate(&exchange, hello.group) { return fail(conn, .Illegal_Parameter, .Unsupported) }
 
 		// The retry names the suite the rest of the handshake uses, and the ServerHello
