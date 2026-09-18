@@ -860,17 +860,21 @@ connect, `core:c` and `core:sys/linux` leave `connection.odin`, and item 2 moves
 `DNS_TIMEOUT` into `Options` with zero meaning unbounded. Gate: the existing client tests
 pass, and `grep -r 'core:sys' http/` is empty.
 
-**Phase 2: record layer and key schedule, offline.** `tls/record.odin`,
-`tls/handshake.odin`, `tls/key_schedule.odin`. No network, no public `Conn` API. Gate:
-the RFC 8448 section 3 known-answer vectors pass, and every handshake message in a
-recorded transcript replays byte-identically at every split point. The constants the
-record layer and the handshake encode come from RFC 8446 Appendix B.1 and B.3.
+**Phase 2: record layer and key schedule, offline.** Done: `tls/record.odin`,
+`tls/handshake.odin`, `tls/key_schedule.odin`, `tls/protect.odin`. Gate: the RFC 8448
+section 3 known-answer vectors pass, and every handshake message in a recorded
+transcript replays byte-identically at every split point. The constants the record
+layer and the handshake encode come from RFC 8446 Appendix B.1 and B.3.
 
-**Phase 3: handshake, offline and local.** `tls/client_hello.odin`,
-`tls/server_hello.odin`, `tls/auth.odin`, `tls/alert.odin`, `tls/roots.odin`, and the
-`Conn` driver, including compatibility mode. Gate: a full handshake against a local
-`openssl s_server`, a byte-exact transcript against a recorded local handshake with
-fixed peer randomness, and the record-overflow and stalled-peer cases from section 9.2.
+**Phase 3: handshake, offline and local.** Done: `tls/client_hello.odin`,
+`tls/server_hello.odin`, `tls/auth.odin`, `tls/roots.odin`. Remaining: `tls/alert.odin`,
+the `Conn` driver and `Transport`, middlebox compatibility mode (section D.4), and
+HelloRetryRequest, which arrives as a ServerHello with a fixed random (section 4.1.4)
+and must be answered rather than mistaken for a ServerHello. An alert record is what a
+peer says instead of a message it cannot send, so the driver reports it as a stop with
+the peer's own description. Gate: a full handshake against a local `openssl s_server`,
+a byte-exact transcript against a recorded local handshake with fixed peer randomness,
+and the record-overflow and stalled-peer cases from section 9.2.
 
 **Phase 4: record protection and public read/write, local.** `tls/protect.odin`, with the
 record layer moving real data. Gate: an end-to-end HTTPS `GET` and a chunked response over
