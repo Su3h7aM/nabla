@@ -220,8 +220,9 @@ request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase,
 	if url.scheme == "https" {
 		phase^ = .TLS
 		if handshake_err := connection_handshake(dialed, url.host); handshake_err != .None {
+			detail := handshake_failure_detail(dialed, handshake_err, request.allocator)
 			connection_destroy(dialed)
-			return nil, failure_from_error(handshake_err, request.allocator)
+			return nil, failure_from_error(handshake_err, request.allocator, .None, detail)
 		}
 	}
 

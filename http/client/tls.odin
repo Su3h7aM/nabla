@@ -1,5 +1,7 @@
 package client
 
+import "core:fmt"
+import "core:mem"
 import "core:net"
 
 import "nabla:tls"
@@ -54,6 +56,32 @@ tls_error :: proc(connection: ^Connection, tls_err: tls.Error, fallback: Error) 
 		return .TLS_Peer_Rejected
 	}
 	return fallback
+}
+
+// handshake_failure_detail is this client's account of a failed handshake, with the
+// peer's own alert added when it sent one: an alert description is the only reason a
+// server gives, and a server that speaks no version this client does says so that way.
+// An empty string leaves the account to error_text.
+handshake_failure_detail :: proc(connection: ^Connection, err: Error, allocator: mem.Allocator) -> string {
+	alert := peer_alert_text(connection, allocator)
+	if alert == "" { return "" }
+	defer delete(alert, allocator)
+	return fmt.aprintf("%s: %s", error_text(err), alert, allocator = allocator)
+}
+
+// peer_alert_text describes why the peer ended the handshake, and is empty when it did not
+// end it itself. A close_notify carries no reason, and a peer that sends one has given up
+// on the handshake rather than finished it.
+peer_alert_text :: proc(connection: ^Connection, allocator: mem.Allocator) -> string {
+	if connection.tls_conn == nil { return "" }
+	if connection.tls_conn.peer_alert != 0 {
+		description := tls.Alert_Description(connection.tls_conn.peer_alert)
+		return fmt.aprintf("the peer sent the %v alert (%d)", description, connection.tls_conn.peer_alert, allocator = allocator)
+	}
+	if connection.tls_conn.closed {
+		return fmt.aprintf("the peer closed the connection before the handshake finished", allocator = allocator)
+	}
+	return ""
 }
 
 // host_without_port returns the name alone, because a name that keeps its port
