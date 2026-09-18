@@ -26,6 +26,18 @@ test_retry_policy :: proc() -> Chat_Retry_Policy {
 	return policy
 }
 
+// test_compact_retry_policy is what the compaction suites run with: the compaction chain's
+// own bound, with a wait short enough that a retry costs a test milliseconds instead of a
+// second.
+test_compact_retry_policy :: proc() -> Chat_Retry_Policy {
+	policy := chat_compact_retry_policy_default()
+	policy.base_delay = 2 * time.Millisecond
+	policy.max_delay = 4 * time.Millisecond
+	policy.max_provider_delay = 25 * time.Millisecond
+	policy.slice = time.Millisecond
+	return policy
+}
+
 // Chat_Test binds a running session to a temporary store. The store lives in the
 // fixture so its address is stable while the session points at it.
 Chat_Test :: struct {

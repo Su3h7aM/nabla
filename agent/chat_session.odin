@@ -160,6 +160,10 @@ Chat_Session :: struct {
 	// single turn: a summary computed while the agent works is installed at a later
 	// request boundary.
 	compact:                      Compact_Control,
+	// compact_retry bounds a summary's own chain. It is the session's policy rather than
+	// the turn's, because compaction outlives the turn that asked for it and may run while
+	// no turn does.
+	compact_retry:                Chat_Retry_Policy,
 
 	// skill_catalog is the frozen catalog from the instruction snapshot. Nil
 	// means unavailable, never an instruction to rescan.
@@ -183,6 +187,7 @@ chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspa
 	tools, _ := tool_registry_make(allocator)
 	return Chat_Session {
 		store = store,
+		compact_retry = chat_compact_retry_policy_default(),
 		id = session.Session_Id(strings.clone(string(id), allocator)),
 		allocator = allocator,
 		next_turn_id = 1,

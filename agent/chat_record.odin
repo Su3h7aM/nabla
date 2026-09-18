@@ -1,6 +1,8 @@
 package agent
 
 import "core:encoding/json"
+import "core:mem"
+import "core:strings"
 import "core:time"
 
 import "nabla:agent/session"
@@ -193,30 +195,87 @@ chat_request_input_json :: proc(
 	entry_count: int,
 	attempt: Chat_Attempt,
 ) -> string {
+	input := chat_request_input_make(prep, history, snapshot_seq, entry_count)
+	chat_request_input_situate(&input, attempt)
+	return chat_request_input_encode(input)
+}
+
+// chat_request_input_make gathers what a request row records about its input. What it
+// returns borrows the preparation and the history it was read from, so it does not
+// outlive them.
+@(private)
+chat_request_input_make :: proc(
+	prep: ^Chat_Request_Prep,
+	history: ^session.Context,
+	snapshot_seq: Maybe(session.Seq),
+	entry_count: int,
+) -> Chat_Request_Input {
 	tools := make([dynamic]Chat_Request_Tool, 0, len(prep.request.Tools), context.temp_allocator)
-	defer delete(tools)
 	for &definition in prep.request.Tools {
 		append(&tools, Chat_Request_Tool{name = definition.Name, description = definition.Description, input_schema = definition.Parameters_JSON})
 	}
-
 	input := Chat_Request_Input {
 		format_version = CHAT_REQUEST_INPUT_VERSION,
 		tools          = tools[:],
 		summary_seq    = history.summary_seq,
 		covered_seq    = history.covered_seq,
-		attempt_number = i64(attempt.number),
-		recovery_kind  = chat_recovery_kind_name(attempt.recovery),
 	}
-	if previous, present := attempt.previous.?; present { input.previous_request_no = i64(previous) }
 	if prep.request.Instructions_Present { input.instructions = prep.request.Instructions }
 	input.instruction_snapshot_seq = snapshot_seq
 	count := entry_count
 	if count > len(history.entries) { count = len(history.entries) }
 	if count > 0 { input.context_through = history.entries[count - 1].seq }
+	return input
+}
 
+// chat_request_input_situate puts one send in its chain. A chain's rows carry the same
+// ingredients and their own place in it, which is what a reader follows instead of
+// inferring an order from timing.
+@(private)
+chat_request_input_situate :: proc(input: ^Chat_Request_Input, attempt: Chat_Attempt) {
+	input.attempt_number = i64(attempt.number)
+	input.recovery_kind = chat_recovery_kind_name(attempt.recovery)
+	input.previous_request_no = nil
+	if previous, present := attempt.previous.?; present { input.previous_request_no = i64(previous) }
+}
+
+// chat_request_input_encode writes one input record.
+@(private)
+chat_request_input_encode :: proc(input: Chat_Request_Input) -> string {
 	data, marshal_err := json.marshal(input, allocator = context.temp_allocator)
 	if marshal_err != nil { return "{}" }
 	return string(data)
+}
+
+// chat_request_input_clone copies an input record into an allocator that outlives the
+// preparation it was read from. It is how a background chain keeps the ingredients of
+// every row it will write after the request that produced them is long gone.
+@(private)
+chat_request_input_clone :: proc(input: ^Chat_Request_Input, allocator: mem.Allocator) {
+	input.instructions = strings.clone(input.instructions, allocator)
+	tools := make([]Chat_Request_Tool, len(input.tools), allocator)
+	for &tool, index in tools {
+		source := input.tools[index]
+		tool = {
+			name         = strings.clone(source.name, allocator),
+			description  = strings.clone(source.description, allocator),
+			input_schema = strings.clone(source.input_schema, allocator),
+		}
+	}
+	input.tools = tools
+}
+
+// chat_request_input_destroy releases what chat_request_input_clone allocated.
+@(private)
+chat_request_input_destroy :: proc(input: ^Chat_Request_Input, allocator: mem.Allocator) {
+	delete(input.instructions, allocator)
+	for &tool in input.tools {
+		delete(tool.name, allocator)
+		delete(tool.description, allocator)
+		delete(tool.input_schema, allocator)
+	}
+	delete(input.tools, allocator)
+	input^ = {}
 }
 
 // chat_send_usage totals the usage one send reported. The send is the operation that

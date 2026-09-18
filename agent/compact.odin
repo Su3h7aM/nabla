@@ -237,7 +237,23 @@ Compact_State :: enum {
 	Idle,
 	Running,
 	Ready,
+	// Backoff is a summary the owner will send again, after the wait the policy chose. No
+	// worker runs: the frozen snapshot and the time it is due stay with the job until the
+	// owner starts the next attempt.
+	Backoff,
 	Retiring,
+}
+
+// CHAT_COMPACT_MAX_ATTEMPTS is how many sends one summary chain may use. A summary is
+// background work with one job to do, so its chain is shorter than a foreground one.
+CHAT_COMPACT_MAX_ATTEMPTS :: 2
+
+// chat_compact_retry_policy_default is the bound a session's summaries run under: the same
+// delays as a foreground chain, and a shorter chain.
+chat_compact_retry_policy_default :: proc() -> Chat_Retry_Policy {
+	policy := chat_retry_policy_default()
+	policy.max_attempts = CHAT_COMPACT_MAX_ATTEMPTS
+	return policy
 }
 
 // Compact_Job is one summarization in flight. The worker owns everything it
@@ -263,6 +279,15 @@ Compact_Job :: struct {
 	operation:  ai.Provider_Operation_Error,
 	usage:      session.Usage,
 	started_at: time.Tick,
+	// attempts counts the sends this chain has made, including the one in flight.
+	attempts:   int,
+	// due_at is when a job in Backoff is sent again.
+	due_at:     time.Tick,
+	// input and config are what every attempt's request row is written from. A retried
+	// attempt is a new row over the same frozen bytes, so these are kept for the whole
+	// chain and re-encoded with each attempt's own place in it.
+	input:      Chat_Request_Input,
+	config:     string, // owned
 }
 
 // Compact_Control is the owner-side view. Only the thread that drives the session
@@ -359,6 +384,8 @@ chat_compact_job_destroy :: proc(job: ^Compact_Job) {
 	allocator := job.allocator
 	backing := job.backing
 	chat_compact_snapshot_destroy(&job.snapshot, allocator)
+	chat_request_input_destroy(&job.input, allocator)
+	delete(job.config, allocator)
 	delete(job.output)
 	delete(job.error_text, allocator)
 	ai.Provider_Operation_Error_Destroy(&job.operation, allocator)
@@ -420,6 +447,56 @@ chat_compact_retry_allowed :: proc(control: ^Compact_Control, trigger: Compact_T
 	return session.now_ms() - control.last_failure_at_ms >= CHAT_COMPACT_RETRY_DELAY_MS
 }
 
+// chat_compact_begin_attempt begins the request row of one send. Every attempt of a chain
+// has its own row, and every one after the first names the attempt before it, so the chain
+// is stored rather than inferred from when a row was written.
+@(private)
+chat_compact_begin_attempt :: proc(
+	chat: ^Chat_Session,
+	job: ^Compact_Job,
+	previous: Maybe(session.Request_No),
+	at_ms: i64,
+) -> (
+	request_no: session.Request_No,
+	err: session.Error,
+) {
+	input := job.input
+	chat_request_input_situate(&input, {number = job.attempts, recovery = previous == nil ? .Initial : .Transient_Retry, previous = previous})
+	begun, begin_err := session.request_begin(
+		chat.store,
+		chat.id,
+		{
+			turn_no = chat.turn_no,
+			purpose = .Compaction,
+			provider = chat.provider_id,
+			model_requested = chat.model_id,
+			api = chat_api_name(job.snapshot.api),
+			config_json = job.config,
+			input_json = chat_request_input_encode(input),
+		},
+		at_ms,
+	)
+	if begin_err != nil { return 0, begin_err }
+	job.request_no = begun
+	return begun, nil
+}
+
+// chat_compact_launch starts the worker for the attempt whose row already exists. The
+// worker must never run the process signal handler, so the handled signals are blocked
+// across the thread's creation: a thread inherits the mask its creator had, and blocking
+// inside the worker would leave a startup window.
+@(private)
+chat_compact_launch :: proc(job: ^Compact_Job) -> bool {
+	previous: linux.Sig_Set
+	chat_signal_block_watched(&previous)
+	job.thread = thread.create(chat_compact_worker, name = "nabla-compaction")
+	chat_signal_restore(previous)
+	if job.thread == nil { return false }
+	job.thread.data = job
+	thread.start(job.thread)
+	return true
+}
+
 // chat_compact_start freezes the compaction request for the context that prep was
 // built from and runs it on its own thread. The covered boundary is the end of the
 // prefix being summarized, so everything after it stays live.
@@ -457,61 +534,45 @@ chat_compact_start :: proc(
 		return false
 	}
 
-	at_ms := session.now_ms()
-	request_no, begin_err := session.request_begin(
-		chat.store,
-		chat.id,
-		{
-			turn_no         = chat.turn_no,
-			purpose         = .Compaction,
-			provider        = chat.provider_id,
-			model_requested = chat.model_id,
-			api             = chat_api_name(connection.API),
-			config_json     = chat_request_config_json(chat, compact_prep.request.Max_Output_Tokens),
-			// A summarization is one send: its chain is one attempt that names no
-			// predecessor.
-			input_json      = chat_request_input_json(&compact_prep, &prep.history, chat.skill_snapshot_seq, seam, Chat_Attempt{number = 1}),
-		},
-		at_ms,
-	)
-	if begin_err != nil {
-		chat_session_record_failure(chat, "the compaction request could not be recorded", begin_err)
-		return false
-	}
-
 	job := new(Compact_Job, chat.allocator)
 	if job == nil {
-		chat_compact_finish_request(chat, request_no, .Failed, "", "compaction could not be started")
+		_observer_message(observer, .Warning, "compaction could not be started")
 		return false
 	}
 	job^ = Compact_Job {
-		request_no = request_no,
+		attempts = 1,
 	}
 	chat_compact_job_allocator(job, chat.allocator)
 	job.output = make([dynamic]u8, 0, job.allocator)
+	// What this chain's request rows are written from. It is kept for the whole chain,
+	// because a retried attempt is a new row over the same frozen bytes and every row has
+	// to say where in the chain it sits.
+	source := chat_request_input_make(&compact_prep, &prep.history, chat.skill_snapshot_seq, seam)
+	chat_request_input_clone(&source, job.allocator)
+	job.input = source
+	job.config = strings.clone(chat_request_config_json(chat, compact_prep.request.Max_Output_Tokens), job.allocator)
 
+	// The bytes are frozen before the row exists: a request that cannot be encoded never
+	// reaches the network, so it is not recorded as an attempt that was sent.
 	snapshot, encode_err := chat_compact_snapshot_make(&compact_prep, connection, prep.history.summary_seq, covered, chat.turn_no, job.allocator)
 	if encode_err != .None {
 		chat_compact_job_destroy(job)
-		chat_compact_finish_request(chat, request_no, .Failed, "", "the compaction request could not be encoded")
+		_observer_message(observer, .Warning, "the compaction request could not be encoded")
 		return false
 	}
 	job.snapshot = snapshot
 
-	// The worker must never run the process signal handler, so the handled signals
-	// are blocked across the thread's creation: a thread inherits the mask its
-	// creator had, and blocking inside the worker would leave a startup window.
-	previous: linux.Sig_Set
-	chat_signal_block_watched(&previous)
-	job.thread = thread.create(chat_compact_worker, name = "nabla-compaction")
-	chat_signal_restore(previous)
-	if job.thread == nil {
+	if _, begin_err := chat_compact_begin_attempt(chat, job, nil, session.now_ms()); begin_err != nil {
 		chat_compact_job_destroy(job)
-		chat_compact_finish_request(chat, request_no, .Failed, "", "compaction could not be started")
+		chat_session_record_failure(chat, "the compaction request could not be recorded", begin_err)
 		return false
 	}
-	job.thread.data = job
-	thread.start(job.thread)
+
+	if !chat_compact_launch(job) {
+		chat_compact_job_destroy(job)
+		chat_compact_finish_request(chat, job.request_no, .Failed, "", "compaction could not be started")
+		return false
+	}
 
 	control.job = job
 	control.state = .Running
@@ -531,24 +592,128 @@ chat_compact_start :: proc(
 	// The record names the compaction request, not whichever foreground request
 	// happened to be at the boundary when it started.
 	binding: Log_Binding
-	context.logger = log_rebind(&binding, log_correlation_for_request(chat, request_no))
+	context.logger = log_rebind(&binding, log_correlation_for_request(chat, job.request_no))
 	log_emit({level = .Info, category = .Provider, event = "compaction.started", fields = fields[:]})
 	return true
 }
 
-// chat_compact_finish_request closes the durable request a job belongs to.
+// chat_compact_finish_request closes the durable request a job belongs to. The row keeps
+// what the endpoint reported for it, like any other send: a total that left background work
+// out would under-report the session it measures.
 @(private)
-chat_compact_finish_request :: proc(chat: ^Chat_Session, request_no: session.Request_No, outcome: session.Outcome, response_json, error_text: string) {
+chat_compact_finish_request :: proc(
+	chat: ^Chat_Session,
+	request_no: session.Request_No,
+	outcome: session.Outcome,
+	response_json, error_text: string,
+	usage: session.Usage = {},
+) {
 	error_json := ""
 	if outcome != .Completed { error_json = chat_error_json(error_text) }
 	if finish_err := session.request_finish(
 		chat.store,
 		chat.id,
 		request_no,
-		{outcome = outcome, response_json = response_json, error_json = error_json, at_ms = session.now_ms()},
+		{outcome = outcome, response_json = response_json, error_json = error_json, usage = usage, at_ms = session.now_ms()},
 	); finish_err != nil {
 		chat_session_record_failure(chat, "the compaction outcome could not be recorded", finish_err)
 	}
+}
+
+// chat_compact_finish_attempt finishes the row of a summary that produced nothing usable.
+// The row keeps the operation's own evidence and the decision taken on it, so a chain is
+// legible from the store: which attempt failed, what the provider said, and what the owner
+// did next.
+@(private)
+chat_compact_finish_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job, decision: Chat_Recovery_Decision, message: string) {
+	result := Chat_Send_Result {
+		outcome       = .Failed,
+		error         = job.operation,
+		error_present = job.operation.kind != .None,
+		message       = message,
+		recovery      = decision.reason,
+		delay         = decision.delay,
+	}
+	error_json := ""
+	if result.error_present {
+		error_json = chat_request_error_json(result)
+	} else if message != "" {
+		error_json = chat_error_json(message)
+	}
+	if finish_err := session.request_finish(
+		chat.store,
+		chat.id,
+		job.request_no,
+		{outcome = .Failed, error_json = error_json, usage = job.usage, at_ms = session.now_ms()},
+	); finish_err != nil {
+		chat_session_record_failure(chat, "the compaction outcome could not be recorded", finish_err)
+	}
+}
+
+// chat_compact_retryable reports whether another send of the same bytes could produce a
+// summary. A partial one could: it was never published or installed. A summarizer that
+// called a tool, ran out of output room, or wrote nothing usable could not, and
+// regenerating it blindly is what a retry exists to avoid.
+@(private)
+chat_compact_retryable :: proc(job: ^Compact_Job) -> bool {
+	if job.tool_calls > 0 || job.reason == .Length { return false }
+	return job.operation.kind != .None || job.failed || job.error_text != ""
+}
+
+// chat_compact_recovery is the decision taken on a summary that produced nothing usable. It
+// is the same classifier and the same delays as a foreground chain, under the session's
+// compaction policy: a summary is background work with one job to do, so its chain is
+// shorter.
+@(private)
+chat_compact_recovery :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> Chat_Recovery_Decision {
+	facts := Chat_Attempt_Facts {
+		attempts       = job.attempts,
+		error          = job.operation,
+		failed         = !chat_compact_retryable(job),
+		storage_failed = chat_session_storage_failed(chat),
+	}
+	return chat_recovery_decide(chat.compact_retry, facts, chat_retry_fraction())
+}
+
+// chat_compact_resume sends a summary again, at the time the policy chose. The job keeps its
+// frozen snapshot across the wait, so a retry costs a request and nothing else, and the row
+// it begins is a new attempt of the same chain. Nothing here waits.
+@(private)
+chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bool {
+	control := &chat.compact
+	job := control.job
+	if control.state != .Backoff || job == nil { return false }
+	if time.tick_since(job.due_at) < 0 { return false }
+	if chat_session_storage_failed(chat) { return false }
+
+	// What the failed attempt produced belongs to the row that already recorded it: this
+	// attempt starts from nothing but the frozen bytes.
+	previous := job.request_no
+	clear(&job.output)
+	delete(job.error_text, job.allocator)
+	job.error_text = ""
+	job.failed = false
+	job.reason = .Unknown
+	job.tool_calls = 0
+	job.usage = {}
+	ai.Provider_Operation_Error_Destroy(&job.operation, job.allocator)
+	job.attempts += 1
+
+	if _, begin_err := chat_compact_begin_attempt(chat, job, previous, session.now_ms()); begin_err != nil {
+		local := begin_err
+		chat_compact_failed_job(control, job)
+		_observer_message(observer, .Warning, fmt.tprintf("the summary could not be sent again: %s", session.error_detail(&local)))
+		return false
+	}
+	if !chat_compact_launch(job) {
+		chat_compact_finish_request(chat, job.request_no, .Failed, "", "compaction could not be started")
+		chat_compact_failed_job(control, job)
+		_observer_message(observer, .Warning, "the summary could not be sent again")
+		return false
+	}
+	control.state = .Running
+	_observer_message(observer, .Notice, "the summary is being sent again")
+	return true
 }
 
 // chat_compact_poll adopts a finished job without waiting for one. It is called at
@@ -569,10 +734,10 @@ chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
 	case .Running:
 		chat_compact_adopt(chat, observer, job)
 	case .Retiring:
-		chat_compact_finish_request(chat, job.request_no, .Cancelled, "", "cancelled")
+		chat_compact_finish_request(chat, job.request_no, .Cancelled, "", "cancelled", job.usage)
 		chat_compact_failed_job(control, job)
 		_observer_message(observer, .Notice, "compaction cancelled")
-	case .Idle, .Ready:
+	case .Idle, .Ready, .Backoff:
 	}
 }
 
@@ -590,14 +755,30 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 
 	if !worthwhile {
 		reason := chat_compact_reason(job)
-		chat_compact_finish_request(chat, job.request_no, .Failed, "", reason)
+		// The decision is recorded with the attempt it was taken on, before the wait it
+		// asks for: the row says how the send failed and what the owner did about it.
+		decision := chat_compact_recovery(chat, job)
+		chat_compact_finish_attempt(chat, job, decision, reason)
+		if decision.action == .Retry {
+			job.due_at = time.tick_add(time.tick_now(), decision.delay)
+			control.state = .Backoff
+			fields := [4]Log_Field {
+				{key = "reason", value = request_recovery_reason_name(decision.reason)},
+				{key = "error_kind", value = ai.provider_operation_error_name(job.operation.kind)},
+				{key = "failure_class", value = ai.provider_failure_class_name(job.operation.failure_class)},
+				{key = "delay_ms", value = log_duration_ms(decision.delay)},
+			}
+			log_emit({level = .Warning, category = .Provider, event = "compaction.retry_scheduled", fields = fields[:]})
+			_observer_message(observer, .Notice, "the summary did not complete; it will be sent again")
+			return
+		}
 		chat_compact_failed_job(control, job)
 		_observer_message(observer, .Warning, fmt.tprintf("compaction produced nothing usable: %s", reason))
 		return
 	}
 
 	response_json := chat_compaction_response_json(summary, job.snapshot.base_seq, job.snapshot.covered_seq)
-	chat_compact_finish_request(chat, job.request_no, .Completed, response_json, "")
+	chat_compact_finish_request(chat, job.request_no, .Completed, response_json, "", job.usage)
 	control.state = .Ready
 	control.last_failure_at_ms = 0
 
@@ -697,6 +878,9 @@ chat_compact_start_due :: proc(chat: ^Chat_Session, estimate: int) -> bool {
 // built from it is stale.
 chat_compact_service :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bool {
 	chat_compact_poll(chat, observer)
+	// A scheduled attempt is sent at its own time, at a boundary where the session is
+	// already being serviced. Nothing waits for it, here or anywhere else.
+	chat_compact_resume(chat, observer)
 	if !chat_compact_install_due(chat, chat.last_estimate) { return false }
 	return chat_compact_install(chat, observer)
 }
@@ -830,7 +1014,7 @@ chat_repair_context :: proc(
 	// A summary may have finished while the rejected request was being sent.
 	chat_compact_poll(chat, observer)
 	switch chat.compact.state {
-	case .Running:
+	case .Running, .Backoff:
 		return .Summary_Running
 	case .Idle, .Retiring:
 		return .No_Candidate
@@ -876,7 +1060,7 @@ chat_compact_cancel :: proc(chat: ^Chat_Session) {
 	case .Running:
 		ai.interrupt_request(&job.interrupt)
 		control.state = .Retiring
-	case .Ready:
+	case .Ready, .Backoff:
 		chat_compact_destroy_job(control, job)
 	case .Idle, .Retiring:
 	}
