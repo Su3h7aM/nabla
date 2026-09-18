@@ -102,6 +102,13 @@ connection_handshake :: proc(connection: ^Connection, host: string) -> Error {
 // them; a failure still reports what was taken before it, so a caller can tell a
 // request that never started from one that stopped halfway.
 connection_write_all :: proc(connection: ^Connection, buffer: []u8) -> (accepted: int, err: Error) {
+	if connection.ssl != nil { return connection_write_tls(connection, buffer) }
+	return connection_write_socket(connection, buffer)
+}
+
+// connection_write_tls writes plaintext into the TLS session. The session owns the
+// socket's bytes, so nothing here reaches the socket directly.
+connection_write_tls :: proc(connection: ^Connection, buffer: []u8) -> (accepted: int, err: Error) {
 	pending := buffer
 	for len(pending) > 0 {
 		if probed := stop_from_wait(probe_now(connection.probe)); probed != .None {
@@ -109,66 +116,73 @@ connection_write_all :: proc(connection: ^Connection, buffer: []u8) -> (accepted
 			return accepted, error_from_stop(probed)
 		}
 
-		written: int
-		if connection.ssl != nil {
-			result := SSL_write(connection.ssl, raw_data(pending), c.int(len(pending)))
-			if result > 0 {
-				written = int(result)
-			} else {
-				switch SSL_get_error(connection.ssl, result) {
-				case SSL_ERROR_WANT_READ:
-					if stop := connection_wait(connection, .Read); stop != .None { return accepted, error_from_stop(stop) }
-					continue
-				case SSL_ERROR_WANT_WRITE:
-					if stop := connection_wait(connection, .Write); stop != .None { return accepted, error_from_stop(stop) }
-					continue
-				case SSL_ERROR_ZERO_RETURN:
-					connection.stop = .Peer_Closed
-					return accepted, .Closed
-				case:
-					if ssl_peer_closed() {
-						connection.stop = .Peer_Closed
-						return accepted, .Closed
-					}
-					connection.stop = .Truncated
-					return accepted, .TLS_Write
-				}
-			}
-		} else {
-			// net.send_tcp may accept a prefix before a later send would block or
-			// fail. Consume that prefix before handling the error, or a retry writes
-			// the same bytes twice.
-			count, send_err := net.send_tcp(connection.socket, pending)
-			if count > 0 {
-				pending = pending[count:]
-				accepted += count
-			}
-			#partial switch send_err {
-			case nil:
-				if count == 0 {
-					connection.stop = .Truncated
-					return accepted, .Truncated
-				}
+		result := SSL_write(connection.ssl, raw_data(pending), c.int(len(pending)))
+		if result <= 0 {
+			// Every outcome below returns or retries, so getting past this
+			// means the session took bytes and the loop can advance.
+			switch SSL_get_error(connection.ssl, result) {
+			case SSL_ERROR_WANT_READ:
+				if stop := connection_wait(connection, .Read); stop != .None { return accepted, error_from_stop(stop) }
 				continue
-			case .Would_Block:
+			case SSL_ERROR_WANT_WRITE:
 				if stop := connection_wait(connection, .Write); stop != .None { return accepted, error_from_stop(stop) }
 				continue
-			case .Interrupted:
-				continue
-			case .Connection_Closed, .Not_Connected:
+			case SSL_ERROR_ZERO_RETURN:
 				connection.stop = .Peer_Closed
 				return accepted, .Closed
 			case:
+				if ssl_peer_closed() {
+					connection.stop = .Peer_Closed
+					return accepted, .Closed
+				}
 				connection.stop = .Truncated
-				return accepted, .Send
+				return accepted, .TLS_Write
 			}
 		}
-		if written <= 0 {
-			connection.stop = .Truncated
-			return accepted, .Truncated
+		pending = pending[int(result):]
+		accepted += int(result)
+	}
+	return accepted, .None
+}
+
+// connection_write_socket writes plaintext straight to the socket, waiting on the
+// event loop when the socket will not take it. TLS writes through this too, so a
+// record layer has no second way to reach the socket.
+connection_write_socket :: proc(connection: ^Connection, buffer: []u8) -> (accepted: int, err: Error) {
+	pending := buffer
+	for len(pending) > 0 {
+		if probed := stop_from_wait(probe_now(connection.probe)); probed != .None {
+			if connection.stop == .None { connection.stop = probed }
+			return accepted, error_from_stop(probed)
 		}
-		pending = pending[written:]
-		accepted += written
+
+		// net.send_tcp may accept a prefix before a later send would block or
+		// fail. Consume that prefix before handling the error, or a retry writes
+		// the same bytes twice.
+		count, send_err := net.send_tcp(connection.socket, pending)
+		if count > 0 {
+			pending = pending[count:]
+			accepted += count
+		}
+		#partial switch send_err {
+		case nil:
+			if count == 0 {
+				connection.stop = .Truncated
+				return accepted, .Truncated
+			}
+			continue
+		case .Would_Block:
+			if stop := connection_wait(connection, .Write); stop != .None { return accepted, error_from_stop(stop) }
+			continue
+		case .Interrupted:
+			continue
+		case .Connection_Closed, .Not_Connected:
+			connection.stop = .Peer_Closed
+			return accepted, .Closed
+		case:
+			connection.stop = .Truncated
+			return accepted, .Send
+		}
 	}
 	return accepted, .None
 }
@@ -183,6 +197,48 @@ connection_read_source :: proc(user_data: rawptr, buffer: []u8) -> (count: int, 
 // connection_read returns .Closed for an orderly end of stream. The caller decides
 // whether the message was complete.
 connection_read :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {
+	if connection.ssl != nil { return connection_read_tls(connection, buffer) }
+	return connection_read_socket(connection, buffer)
+}
+
+// connection_read_tls reads plaintext out of the TLS session. The session owns the
+// socket's bytes, so nothing here reaches the socket directly.
+connection_read_tls :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {
+	for {
+		if probed := stop_from_wait(probe_now(connection.probe)); probed != .None {
+			if connection.stop == .None { connection.stop = probed }
+			return 0, error_from_stop(probed)
+		}
+		result := SSL_read(connection.ssl, raw_data(buffer), c.int(len(buffer)))
+		if result > 0 { return int(result), .None }
+		switch SSL_get_error(connection.ssl, result) {
+		case SSL_ERROR_WANT_READ:
+			if stop := connection_wait(connection, .Read); stop != .None { return 0, error_from_stop(stop) }
+			continue
+		case SSL_ERROR_WANT_WRITE:
+			if stop := connection_wait(connection, .Write); stop != .None { return 0, error_from_stop(stop) }
+			continue
+		case SSL_ERROR_ZERO_RETURN:
+			connection.stop = .Peer_Closed
+			return 0, .Closed
+		case SSL_ERROR_SYSCALL:
+			connection.stop = .Truncated
+			return 0, .Truncated
+		case:
+			if ssl_peer_closed() {
+				connection.stop = .Truncated
+				return 0, .Truncated
+			}
+			connection.stop = .Truncated
+			return 0, .TLS_Read
+		}
+	}
+}
+
+// connection_read_socket moves plaintext off the socket, waiting on the event loop
+// when there is none. TLS reads the socket through this and nothing else, so a
+// record layer can never see bytes the message path already took.
+connection_read_socket :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {
 	for {
 		// A body that keeps flowing never leaves a read blocked, so waiting
 		// alone would never ask the probe whether to stop. Asking here gives
@@ -190,31 +246,6 @@ connection_read :: proc(connection: ^Connection, buffer: []u8) -> (count: int, e
 		if probed := stop_from_wait(probe_now(connection.probe)); probed != .None {
 			if connection.stop == .None { connection.stop = probed }
 			return 0, error_from_stop(probed)
-		}
-		if connection.ssl != nil {
-			result := SSL_read(connection.ssl, raw_data(buffer), c.int(len(buffer)))
-			if result > 0 { return int(result), .None }
-			switch SSL_get_error(connection.ssl, result) {
-			case SSL_ERROR_WANT_READ:
-				if stop := connection_wait(connection, .Read); stop != .None { return 0, error_from_stop(stop) }
-				continue
-			case SSL_ERROR_WANT_WRITE:
-				if stop := connection_wait(connection, .Write); stop != .None { return 0, error_from_stop(stop) }
-				continue
-			case SSL_ERROR_ZERO_RETURN:
-				connection.stop = .Peer_Closed
-				return 0, .Closed
-			case SSL_ERROR_SYSCALL:
-				connection.stop = .Truncated
-				return 0, .Truncated
-			case:
-				if ssl_peer_closed() {
-					connection.stop = .Truncated
-					return 0, .Truncated
-				}
-				connection.stop = .Truncated
-				return 0, .TLS_Read
-			}
 		}
 		received, recv_err := net.recv_tcp(connection.socket, buffer)
 		#partial switch recv_err {
