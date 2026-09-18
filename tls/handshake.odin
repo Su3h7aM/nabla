@@ -6,8 +6,14 @@ package tls
 
 // Handshake_Type is the TLS HandshakeType (RFC 8446 section B.3).
 Handshake_Type :: enum u8 {
-	Client_Hello = 1,
-	Server_Hello = 2,
+	Client_Hello        = 1,
+	Server_Hello        = 2,
+	New_Session_Ticket  = 4,
+	Encrypted_Extensions = 8,
+	Certificate         = 11,
+	Certificate_Verify  = 15,
+	Finished            = 20,
+	Key_Update          = 24,
 }
 
 // Extension_Type is a TLS extension type (RFC 8446 section B.3.2).

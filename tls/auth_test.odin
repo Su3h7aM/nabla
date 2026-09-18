@@ -14,24 +14,25 @@ FINISHED_SIZE :: 36
 @(test)
 test_rfc_8448_certificate_list :: proc(t: ^testing.T) {
 	message := vector(t, RFC8448_CERTIFICATE)
-	certificates, ok := certificate_list_decode(message[HANDSHAKE_HEADER_SIZE:], context.temp_allocator)
-	defer certificate_list_destroy(certificates, context.temp_allocator)
+	chain, ok := certificate_chain_decode(message[HANDSHAKE_HEADER_SIZE:], context.temp_allocator)
+	defer certificate_chain_destroy(&chain)
 	if !testing.expect(t, ok) { return }
-	if !testing.expect_value(t, len(certificates), 1) { return }
+	if !testing.expect_value(t, len(chain.certificates), 1) { return }
 
 	// The entry's own length decides what x509 was handed: 432 bytes of DER.
-	testing.expect_value(t, len(certificates[0].raw), 432)
+	testing.expect_value(t, len(chain.certificates[0].raw), 432)
 
-	_, truncated_ok := certificate_list_decode(message[HANDSHAKE_HEADER_SIZE:len(message) - 1], context.temp_allocator)
+	truncated, truncated_ok := certificate_chain_decode(message[HANDSHAKE_HEADER_SIZE:len(message) - 1], context.temp_allocator)
+	defer certificate_chain_destroy(&truncated)
 	testing.expect(t, !truncated_ok, "a certificate list missing its last byte was accepted")
 }
 
-// The two messages that authenticate the peer: the CertificateVerify signature,
-// and the Finished that covers every handshake message before it.
+// The two messages that authenticate the peer: the CertificateVerify signature, and
+// the Finished that covers every handshake message before it.
 @(test)
 test_rfc_8448_server_flight_authenticates :: proc(t: ^testing.T) {
-	certificates, decoded := certificate_list_decode(vector(t, RFC8448_CERTIFICATE)[HANDSHAKE_HEADER_SIZE:], context.temp_allocator)
-	defer certificate_list_destroy(certificates, context.temp_allocator)
+	chain, decoded := certificate_chain_decode(vector(t, RFC8448_CERTIFICATE)[HANDSHAKE_HEADER_SIZE:], context.temp_allocator)
+	defer certificate_chain_destroy(&chain)
 	if !testing.expect(t, decoded) { return }
 
 	client_hello := vector(t, RFC8448_CLIENT_HELLO)
@@ -52,12 +53,14 @@ test_rfc_8448_server_flight_authenticates :: proc(t: ^testing.T) {
 	digest := hash.hash_bytes_to_buffer(.SHA256, transcript[:through_certificate_at], certificate_hash[:])
 
 	certificate_verify := flight[through_certificate:][:CERTIFICATE_VERIFY_SIZE]
-	testing.expect(t, certificate_verify_verify(certificate_verify[HANDSHAKE_HEADER_SIZE:], &certificates[0], digest), "the trace's CertificateVerify did not verify")
+	verified := certificate_verify_verify(certificate_verify[HANDSHAKE_HEADER_SIZE:], &chain.certificates[0], digest)
+	testing.expect(t, verified, "the trace's CertificateVerify did not verify")
 
 	finished_hash: [hash.MAX_DIGEST_SIZE]u8
 	finished_digest := hash.hash_bytes_to_buffer(.SHA256, transcript, finished_hash[:])
 
 	finished := flight[through_certificate_verify:][:FINISHED_SIZE]
 	secret := vector(t, RFC8448_SERVER_HANDSHAKE_TRAFFIC_SECRET)
-	testing.expect(t, finished_verify(.AES_128_GCM_SHA256, secret, finished_digest, finished[HANDSHAKE_HEADER_SIZE:]), "the trace's Finished did not verify")
+	finished_ok := finished_verify(.AES_128_GCM_SHA256, secret, finished_digest, finished[HANDSHAKE_HEADER_SIZE:])
+	testing.expect(t, finished_ok, "the trace's Finished did not verify")
 }

@@ -1,5 +1,6 @@
 package tls
 
+import "core:bytes"
 import "core:crypto"
 import "core:crypto/ecdsa"
 import "core:crypto/ed25519"
@@ -8,41 +9,75 @@ import "core:crypto/hmac"
 import "core:crypto/rsa"
 import "core:crypto/x509"
 import "core:mem"
+import "core:net"
 
-// certificate_list_decode reads a Certificate message body, the bytes after its
-// handshake header (RFC 8446 section 4.4.2).
-//
-// A server sends no certificate request context, and every certificate holds views
-// into `message`, so it must outlive them. certificate_list_destroy releases what
-// each parsed certificate allocated, and the list itself.
-certificate_list_decode :: proc(message: []u8, allocator: mem.Allocator) -> (certificates: []x509.Certificate, ok: bool) {
-	r := Reader{data = message, ok = true}
-	if read_u8(&r) != 0 { return nil, false }
-
-	entries := read_section_u24(&r)
-	if !r.ok { return nil, false }
-
-	list := make([dynamic]x509.Certificate, 0, 4, allocator)
-	for entries.ok && entries.at < len(entries.data) {
-		der := read_bytes(&entries, read_u24(&entries))
-		_ = read_bytes(&entries, int(read_u16(&entries)))  // the entry's extensions
-		certificate, parse_err := x509.parse(der, allocator)
-		if parse_err != nil || !entries.ok { break }
-		append(&list, certificate)
-	}
-	if entries.ok && entries.at == len(entries.data) && len(list) > 0 { return list[:], true }
-
-	for &certificate in list { x509.destroy(&certificate, allocator) }
-	delete(list)
-	return nil, false
+// Certificate_Chain is a peer's certificates, in the order the peer sent them, and
+// the DER they were decoded from.
+Certificate_Chain :: struct {
+	certificates: []x509.Certificate,
+	der:          [][]u8,
+	allocator:    mem.Allocator,
 }
 
-// certificate_list_destroy releases a list from certificate_list_decode. The
-// certificates still borrow from the message they were decoded from, which the
-// caller owns and may have released already.
-certificate_list_destroy :: proc(certificates: []x509.Certificate, allocator: mem.Allocator) {
-	for &certificate in certificates { x509.destroy(&certificate, allocator) }
-	delete(certificates, allocator)
+// certificate_chain_decode reads a Certificate message body, the bytes after its
+// handshake header (RFC 8446 section 4.4.2).
+//
+// Every certificate owns the DER it was decoded from, so the message need not
+// outlive it. A server sends no certificate request context.
+certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (chain: Certificate_Chain, ok: bool) {
+	chain.allocator = allocator
+
+	r := Reader{data = message, ok = true}
+	if read_u8(&r) != 0 { return {}, false }
+
+	entries := read_section_u24(&r)
+	if !r.ok { return {}, false }
+
+	certificates := make([dynamic]x509.Certificate, 0, 4, allocator)
+	ders := make([dynamic][]u8, 0, 4, allocator)
+	for entries.ok && entries.at < len(entries.data) {
+		encoded := read_bytes(&entries, read_u24(&entries))
+		_ = read_bytes(&entries, int(read_u16(&entries)))  // the entry's extensions
+		der := make([]u8, len(encoded), allocator)
+		copy(der, encoded)
+		certificate, parse_err := x509.parse(der, allocator)
+		if parse_err != nil || !entries.ok {
+			delete(der, allocator)
+			break
+		}
+		append(&certificates, certificate)
+		append(&ders, der)
+	}
+
+	if !entries.ok || entries.at != len(entries.data) || len(certificates) == 0 {
+		chain.certificates = certificates[:]
+		chain.der = ders[:]
+		certificate_chain_destroy(&chain)
+		return {}, false
+	}
+
+	chain.certificates = certificates[:]
+	chain.der = ders[:]
+	return chain, true
+}
+
+// certificate_chain_destroy releases a chain and the DER its certificates view.
+certificate_chain_destroy :: proc(chain: ^Certificate_Chain) {
+	if chain == nil { return }
+	allocator := chain.allocator
+	for &certificate in chain.certificates { x509.destroy(&certificate, allocator) }
+	delete(chain.certificates, allocator)
+	for der in chain.der { delete(der, allocator) }
+	delete(chain.der, allocator)
+	chain^ = {}
+}
+
+// certificate_pointers returns the certificates as the pointers core's verifier
+// takes, which is the caller's to free.
+certificate_pointers :: proc(certificates: []x509.Certificate, allocator: mem.Allocator) -> []^x509.Certificate {
+	pointers := make([]^x509.Certificate, len(certificates), allocator)
+	for &certificate, at in certificates { pointers[at] = &certificate }
+	return pointers
 }
 
 // SERVER_CERTIFICATE_VERIFY_CONTEXT is the context a server signs its
@@ -51,6 +86,29 @@ certificate_list_destroy :: proc(certificates: []x509.Certificate, allocator: me
 SERVER_CERTIFICATE_VERIFY_CONTEXT :: "TLS 1.3, server CertificateVerify"
 
 CERTIFICATE_VERIFY_INPUT_MAX :: 64 + len(SERVER_CERTIFICATE_VERIFY_CONTEXT) + 1 + MAX_SECRET_SIZE
+
+// identity_verify checks the peer's certificate against the reference identifier the
+// caller reached it by, which is a name or an address literal.
+identity_verify :: proc(certificate: ^x509.Certificate, reference: string) -> bool {
+	if ip4, is_ip4 := net.parse_ip4_address(reference); is_ip4 {
+		address := transmute([4]u8)ip4
+		return san_matches(certificate, address[:])
+	}
+	if ip6, is_ip6 := net.parse_ip6_address(reference); is_ip6 {
+		address := transmute([16]u8)ip6
+		return san_matches(certificate, address[:])
+	}
+	return x509.verify_hostname(certificate, reference) == .None
+}
+
+// A name is matched against the certificate's subject alternative names, and an
+// address literal against the addresses among them.
+san_matches :: proc(certificate: ^x509.Certificate, expected: []u8) -> bool {
+	for san in certificate.ip_addresses {
+		if bytes.equal(san, expected) { return true }
+	}
+	return false
+}
 
 // certificate_verify_verify checks a CertificateVerify message body against the
 // peer's end-entity certificate and the transcript of everything up to and

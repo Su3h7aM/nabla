@@ -76,9 +76,10 @@ write_server_name :: proc(w: ^Writer, server_name: string) {
 write_supported_versions :: proc(w: ^Writer) {
 	write_u16(w, int(Extension_Type.Supported_Versions))
 	extension := write_section_start(w)
-	versions := write_section_start(w)  // a list in a ClientHello, one value in a ServerHello
+	// A ClientHello carries the list of versions under a one-byte length, where a
+	// ServerHello answers with a single version (RFC 8446 section 4.2.1).
+	write_u8(w, 2)
 	write_u16(w, VERSION_1_3)
-	write_section_end(w, versions)
 	write_section_end(w, extension)
 }
 

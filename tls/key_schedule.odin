@@ -173,3 +173,12 @@ traffic_key_derive :: proc(suite: Cipher_Suite, secret: []u8, dst: ^Traffic_Key)
 	dst.sequence = 0
 	return true
 }
+
+// key_schedule_update derives the next traffic secret of one direction from the one
+// in use, which is the whole of a key update (RFC 8446 section 7.2).
+key_schedule_update :: proc(suite: Cipher_Suite, secret: []u8, dst: []u8) -> bool {
+	size := secret_size(suite)
+	empty: Secret
+	hash.hash_bytes_to_buffer(CIPHER_SUITES[suite].hash, {}, empty[:size])
+	return hkdf_expand_label(suite, secret, "traffic upd", empty[:size], dst)
+}
