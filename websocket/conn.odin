@@ -5,11 +5,17 @@ import "core:mem"
 import "core:unicode/utf8"
 
 // Transport is how a connection reaches its peer. Both calls block until they moved
-// bytes, or the caller ended the wait, and report false when they moved none:
-// cancellation and deadlines stay with the side that knows why a wait ended.
+// bytes, or the caller ended the wait: a read that moved none reports why, so a
+// cancellation or a deadline is never mistaken for the peer closing. `err` is one of
+// .None, .Closed for the peer's orderly end of the stream, or .Transport for the
+// caller's own reason for stopping.
+//
+// release, when set, is called once by destroy, so a transport that owns what it
+// reads from closes it there. A transport that borrows the stream leaves it nil.
 Transport :: struct {
-	read:      proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool),
-	write:     proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool),
+	read:      proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error),
+	write:     proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error),
+	release:   proc(user_data: rawptr),
 	user_data: rawptr,
 }
 
@@ -95,6 +101,7 @@ destroy :: proc(conn: ^Conn) {
 	if conn == nil { return }
 	delete(conn.send, conn.allocator)
 	delete(conn.recv, conn.allocator)
+	if conn.transport.release != nil { conn.transport.release(conn.transport.user_data) }
 	free(conn, conn.allocator)
 }
 
@@ -161,6 +168,9 @@ close :: proc(conn: ^Conn, code: Close_Code, reason: string, buffer: []u8) -> Er
 // between the fragments of a message does not disturb it. `buffer` is unmasked in
 // place, so it holds the message's bytes on return.
 read :: proc(conn: ^Conn, buffer: []u8) -> (count: int, opcode: Opcode, complete: bool, err: Error) {
+	// A connection that ended, whether by the peer's close or by this side failing
+	// it, delivers nothing more.
+	if conn.closed { return 0, conn.message_opcode, false, .Closed }
 	for {
 		if conn.frame_remaining > 0 {
 			count, err = frame_payload_read(conn, buffer)
@@ -279,7 +289,7 @@ frame_header_read :: proc(conn: ^Conn) -> (header: Header, err: Error) {
 	if fill_err := recv_fill(conn, 2); fill_err != .None {
 		// A peer that closes between frames ends the stream, which is not a failure
 		// of the protocol.
-		if fill_err == .Transport && conn.header_filled == 0 { return {}, .Closed }
+		if fill_err == .Closed && conn.header_filled == 0 { return {}, .Closed }
 		return {}, fill_err
 	}
 	count := 2
@@ -302,8 +312,8 @@ frame_payload_read :: proc(conn: ^Conn, buffer: []u8) -> (count: int, err: Error
 	if len(buffer) == 0 || conn.frame_remaining == 0 { return 0, .None }
 	count = min(len(buffer), conn.frame_remaining)
 	if read_err := transport_read(conn, buffer[:count]); read_err != .None { return 0, read_err }
-	for byte, at in buffer[:count] {
-		buffer[at] = byte ~ conn.mask[(conn.mask_at + at) % MASK_KEY_SIZE]
+	for octet, at in buffer[:count] {
+		buffer[at] = octet ~ conn.mask[(conn.mask_at + at) % MASK_KEY_SIZE]
 	}
 	conn.mask_at = (conn.mask_at + count) % MASK_KEY_SIZE
 	conn.frame_remaining -= count
@@ -350,8 +360,9 @@ text_validate :: proc(conn: ^Conn, chunk: []u8) -> bool {
 transport_read :: proc(conn: ^Conn, dst: []u8) -> Error {
 	filled := 0
 	for filled < len(dst) {
-		count, ok := conn.transport.read(conn.transport.user_data, dst[filled:])
-		if !ok || count <= 0 { return .Transport }
+		count, err := conn.transport.read(conn.transport.user_data, dst[filled:])
+		if err != .None { return err }
+		if count <= 0 { return .Transport }
 		filled += count
 	}
 	return .None
@@ -368,8 +379,9 @@ recv_fill :: proc(conn: ^Conn, count: int) -> Error {
 transport_write :: proc(conn: ^Conn, data: []u8) -> Error {
 	pending := data
 	for len(pending) > 0 {
-		written, ok := conn.transport.write(conn.transport.user_data, pending)
-		if !ok || written <= 0 { return .Transport }
+		written, err := conn.transport.write(conn.transport.user_data, pending)
+		if err != .None { return err }
+		if written <= 0 { return .Transport }
 		pending = pending[written:]
 	}
 	return .None

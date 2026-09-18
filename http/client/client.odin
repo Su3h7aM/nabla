@@ -75,7 +75,6 @@ Request :: struct {
 // limit on a body (RFC 9110 5.4), so no size is invented here and the caller
 // decides how much of it to keep.
 stream_request :: proc(request: Request, options: Options, user_data: rawptr, callback: Chunk_Callback) -> (failure: Failure) {
-	url := http.url_parse(request.url)
 	// One observation per request, reported on every path once validation has
 	// begun. The phase names the stage about to run, so an error inside a stage is
 	// reported as that stage: a failure before anything was written cannot be
@@ -90,49 +89,12 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 		}
 	}
 
-	if url.scheme != "http" && url.scheme != "https" {
-		return failure_from_error(.None, request.allocator, .Invalid_URL, "URL scheme must be http or https")
-	}
-	if url.host == "" { return failure_from_error(.None, request.allocator, .Invalid_URL, "URL host is empty") }
-
-	// Every wait in this request runs on the calling thread's event loop, which
-	// owns readiness for the socket and for the resolver's.
-	if loop_err := nbio.acquire_thread_event_loop(); loop_err != nil {
-		return failure_from_error(.None, request.allocator, .Transport, "the event loop could not be started")
-	}
+	if loop_failure := event_loop_acquire(request.allocator); loop_failure.kind != .None { return loop_failure }
 	defer nbio.release_thread_event_loop()
 
-	phase = .Resolve
-	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
-		return failure_from_error(error_from_stop(stop), request.allocator)
-	}
-	endpoint, resolve_err := resolve_endpoint(url, options, request.allocator)
-	if resolve_err != .None { return failure_from_error(resolve_err, request.allocator) }
-	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
-		return failure_from_error(error_from_stop(stop), request.allocator)
-	}
-
-	phase = .Connect
-	connection, dial_err := connection_dial(endpoint, options, request.allocator)
-	if dial_err != .None { return failure_from_error(dial_err, request.allocator) }
+	connection, send_failure := request_send(request, options, &phase, &summary)
+	if send_failure.kind != .None { return send_failure }
 	defer connection_destroy(connection)
-
-	if url.scheme == "https" {
-		phase = .TLS
-		if handshake_err := connection_handshake(connection, url.host); handshake_err != .None {
-			return failure_from_error(handshake_err, request.allocator)
-		}
-	}
-
-	phase = .Request_Write
-	buffer, body_offset := format_request(url, request)
-	defer bytes.buffer_destroy(&buffer)
-	request_bytes := bytes.buffer_to_bytes(&buffer)
-	accepted, write_err := connection_write_all(connection, request_bytes)
-	summary.request_bytes_accepted = u64(accepted)
-	summary.request_body_bytes_accepted = u64(max(accepted - body_offset, 0))
-	summary.request_complete = accepted == len(request_bytes)
-	if write_err != .None { return failure_from_error(write_err, request.allocator) }
 
 	phase = .Response_Head
 	reader: Reader
@@ -215,6 +177,69 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	return {}
 }
 
+// event_loop_acquire brackets a request with the calling thread's event loop,
+// which owns readiness for both the socket and the resolver's. The caller releases
+// it, except when the request ends in an upgraded connection: that connection's
+// holder waits on the loop for as long as the connection lives, so the acquisition
+// passes to it.
+event_loop_acquire :: proc(allocator: mem.Allocator) -> Failure {
+	if nbio.acquire_thread_event_loop() != nil {
+		return failure_from_error(.None, allocator, .Transport, "the event loop could not be started")
+	}
+	return {}
+}
+
+// request_send validates a request, opens its connection, and writes it. The
+// connection is returned complete, with its TLS session when the URL is https, and
+// the caller takes ownership of it; a failure is returned with the connection
+// already released. The caller holds the thread's event loop and releases it.
+//
+// phase and summary are written in place, so the caller's single observation covers
+// validation and the request write as well as the response that follows.
+request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase, summary: ^Transfer_Summary) -> (connection: ^Connection, failure: Failure) {
+	url := http.url_parse(request.url)
+	if url.scheme != "http" && url.scheme != "https" {
+		return nil, failure_from_error(.None, request.allocator, .Invalid_URL, "URL scheme must be http or https")
+	}
+	if url.host == "" { return nil, failure_from_error(.None, request.allocator, .Invalid_URL, "URL host is empty") }
+
+	phase^ = .Resolve
+	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
+		return nil, failure_from_error(error_from_stop(stop), request.allocator)
+	}
+	endpoint, resolve_err := resolve_endpoint(url, options, request.allocator)
+	if resolve_err != .None { return nil, failure_from_error(resolve_err, request.allocator) }
+	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
+		return nil, failure_from_error(error_from_stop(stop), request.allocator)
+	}
+
+	phase^ = .Connect
+	dialed, dial_err := connection_dial(endpoint, options, request.allocator)
+	if dial_err != .None { return nil, failure_from_error(dial_err, request.allocator) }
+
+	if url.scheme == "https" {
+		phase^ = .TLS
+		if handshake_err := connection_handshake(dialed, url.host); handshake_err != .None {
+			connection_destroy(dialed)
+			return nil, failure_from_error(handshake_err, request.allocator)
+		}
+	}
+
+	phase^ = .Request_Write
+	buffer, body_offset := format_request(url, request)
+	defer bytes.buffer_destroy(&buffer)
+	request_bytes := bytes.buffer_to_bytes(&buffer)
+	accepted, write_err := connection_write_all(dialed, request_bytes)
+	summary.request_bytes_accepted = u64(accepted)
+	summary.request_body_bytes_accepted = u64(max(accepted - body_offset, 0))
+	summary.request_complete = accepted == len(request_bytes)
+	if write_err != .None {
+		connection_destroy(dialed)
+		return nil, failure_from_error(write_err, request.allocator)
+	}
+	return dialed, {}
+}
+
 // format_request builds the request line, the fields, and the body. body_offset is
 // where the body begins, which is what lets a partial write say how much of the
 // body the transport took rather than how much of the whole request it took.
@@ -233,11 +258,21 @@ format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer
 	bytes.buffer_write_string(&buffer, " ")
 	bytes.buffer_write_string(&buffer, request_target)
 	bytes.buffer_write_string(&buffer, " HTTP/1.1\r\n")
-	bytes.buffer_write_string(&buffer, "host: ")
-	bytes.buffer_write_string(&buffer, url.host)
-	bytes.buffer_write_string(&buffer, "\r\nconnection: close\r\n")
-	length_line: [48]u8
-	bytes.buffer_write_string(&buffer, fmt.bprintf(length_line[:], "content-length: %d\r\n", len(request.body)))
+	// A field this builder supplies is written once: a caller that set the same
+	// field itself meant its own value, which is how a request states a connection
+	// it keeps or a body length it already knows.
+	if !request_has_header(request, "host") {
+		bytes.buffer_write_string(&buffer, "host: ")
+		bytes.buffer_write_string(&buffer, url.host)
+		bytes.buffer_write_string(&buffer, "\r\n")
+	}
+	if !request_has_header(request, "connection") {
+		bytes.buffer_write_string(&buffer, "connection: close\r\n")
+	}
+	if !request_has_header(request, "content-length") {
+		length_line: [48]u8
+		bytes.buffer_write_string(&buffer, fmt.bprintf(length_line[:], "content-length: %d\r\n", len(request.body)))
+	}
 	for header in request.headers {
 		bytes.buffer_write_string(&buffer, header.name)
 		bytes.buffer_write_string(&buffer, ": ")
@@ -248,6 +283,15 @@ format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer
 	body_offset = len(bytes.buffer_to_bytes(&buffer))
 	bytes.buffer_write(&buffer, request.body)
 	return
+}
+
+// request_has_header reports whether the caller set a field, so the defaults this
+// builder would supply do not appear twice.
+request_has_header :: proc(request: Request, name: string) -> bool {
+	for header in request.headers {
+		if strings.equal_fold(header.name, name) { return true }
+	}
+	return false
 }
 
 // resolve_endpoint turns a URL authority into a connectable endpoint. A literal

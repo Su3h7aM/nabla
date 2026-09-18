@@ -13,20 +13,20 @@ Fixture :: struct {
 	outgoing: [dynamic]u8,
 }
 
-fixture_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) {
+fixture_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error) {
 	fixture := cast(^Fixture)user_data
 	available := len(fixture.incoming) - fixture.at
-	if available <= 0 { return 0, false }
+	if available <= 0 { return 0, .Closed }
 	count = min(available, len(buffer))
 	copy(buffer, fixture.incoming[fixture.at:fixture.at + count])
 	fixture.at += count
-	return count, true
+	return count, .None
 }
 
-fixture_write :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) {
+fixture_write :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error) {
 	fixture := cast(^Fixture)user_data
 	append(&fixture.outgoing, ..buffer)
-	return len(buffer), true
+	return len(buffer), .None
 }
 
 fixture_conn :: proc(t: ^testing.T, fixture: ^Fixture, incoming: []u8) -> ^Conn {
@@ -123,6 +123,43 @@ test_frames_a_server_may_not_send :: proc(t: ^testing.T) {
 	testing.expect_value(t, text_err, Error.Protocol)
 	testing.expect(t, close_code_sent(fixture.outgoing[:]) == Close_Code.Invalid_Payload, "the close did not name the invalid payload")
 	destroy(conn)
+}
+
+// A message larger than one frame is fragmented, and every frame carries a mask of
+// its own, which is what a client must do (RFC 6455 section 5.3).
+@(test)
+test_a_large_message_is_fragmented_into_masked_frames :: proc(t: ^testing.T) {
+	fixture: Fixture
+	defer delete(fixture.outgoing)
+	conn := fixture_conn(t, &fixture, nil)
+	if conn == nil { return }
+	defer destroy(conn)
+
+	message := make([]u8, 2 * SEND_CHUNK + 100)
+	defer delete(message)
+	for i in 0 ..< len(message) { message[i] = u8(i) }
+
+	if !testing.expect(t, write(conn, .Text, message) == .None, "the message could not be written") { return }
+
+	Expected :: struct {
+		opcode: Opcode,
+		length: int,
+		final:  bool,
+	}
+	remaining := fixture.outgoing[:]
+	at := 0
+	for want in ([]Expected{{.Text, SEND_CHUNK, false}, {.Continuation, SEND_CHUNK, false}, {.Continuation, 100, true}}) {
+		payload, header, ok := outgoing_frame(remaining)
+		if !testing.expect(t, ok, "a frame was not encoded") { return }
+		testing.expect_value(t, header.opcode, want.opcode)
+		testing.expect_value(t, header.length, want.length)
+		testing.expect_value(t, header.final, want.final)
+		testing.expect(t, header.masked, "a client frame is masked")
+		testing.expect(t, mem.compare(payload, message[at:at + want.length]) == 0, "the payload is not the message's octets")
+		at += want.length
+		remaining = remaining[header.header_length + header.length:]
+	}
+	testing.expect_value(t, len(remaining), 0)
 }
 
 // outgoing_frame decodes the frame at the front of what the connection wrote, so a test
