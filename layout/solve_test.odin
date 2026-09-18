@@ -182,3 +182,33 @@ test_overflow_and_indefinite_diagnostics :: proc(t: ^testing.T) {
 	testing.expect_value(t, definite_error, Frame_Error.None)
 	testing.expect(t, !_has_diagnostic(&ctx, .Grow_Indefinite))
 }
+
+// Diagnostics are advisory, not structural: a frame that produces more of them
+// than the pool holds still publishes. A transcript of long unbreakable tokens
+// is the case that produces many overflow diagnostics, and exhausting the pool
+// must not blank the screen.
+@(test)
+test_diagnostics_exhaustion_does_not_fail_the_frame :: proc(t: ^testing.T) {
+	config := _test_options()
+	config.capacities.diagnostics = 4
+	config.capacities.nodes = 64
+	config.capacities.children = 64
+	ctx: Context
+	testing.expect_value(t, init(&ctx, config), nil)
+	defer destroy(&ctx)
+
+	// Each inner element holds a child wider than itself, so every one records an
+	// overflow: far more than the four-slot diagnostics pool.
+	if frame(&ctx, {10, 10}) {
+		if element(&ctx, {layout = {flow = .Row, sizing = {width = fit(), height = fit()}}}) {
+			for _ in 0 ..< 20 {
+				if element(&ctx, {layout = {sizing = {width = fixed(10), height = fixed(10)}}}) {
+					content(&ctx, {layout = {sizing = {width = fixed(40), height = fixed(10)}}})
+				}
+			}
+		}
+	}
+	_, err := result(&ctx)
+	testing.expect_value(t, err, Frame_Error.None)
+	testing.expect(t, len(diagnostics(&ctx)) <= config.capacities.diagnostics, "diagnostics are capped, not fatal")
+}

@@ -328,7 +328,11 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 				layout.Element_Desc {
 					id = CONVERSATION_ID,
 					layout = layout.Layout_Style{flow = .Column, sizing = layout.Sizing{width = layout.grow(), height = layout.grow()}, align = .Stretch},
-					clip = layout.Clip_Style{axes = {.Y}, offset = {0, layout.Scalar(offset)}},
+					// The conversation is a vertical scroll container, so it clips
+					// horizontally too. An unbreakable token wider than the viewport
+					// must not widen the root, or every entry would wrap at that
+					// width and be truncated at the terminal edge.
+					clip = layout.Clip_Style{axes = {.X, .Y}, offset = {0, layout.Scalar(offset)}},
 				},
 			) {
 				if len(app.run.snap.entries) == 0 {

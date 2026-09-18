@@ -3,6 +3,7 @@
 package main
 
 import "core:fmt"
+import "core:strings"
 import "core:testing"
 
 import "nabla:term"
@@ -152,4 +153,37 @@ test_conversation_solves_a_long_transcript :: proc(t: ^testing.T) {
 	defer frame_storage_destroy(storage)
 
 	testing.expect(t, conversation_render(t, app, storage, 40, 20), "a long transcript must still solve")
+}
+
+// An unbreakable token wider than the viewport must not widen the conversation.
+// Before the root clipped horizontally, one long token set its minimum width, so
+// every entry wrapped at that width and was cut off at the terminal edge instead
+// of wrapping at the viewport.
+@(test)
+test_conversation_wraps_after_a_long_unbreakable_token :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	long := strings.repeat("x", 80) or_else ""
+	defer delete(long)
+	snap_append(app, .Tool, long)
+	snap_append(app, .User, "hello world this is long enough to wrap")
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	scratch: [64]byte
+	if !testing.expect(t, conversation_render(t, app, storage, 20, 10), "the conversation frame must solve") {
+		return
+	}
+
+	// The newest entry is at the bottom and wraps at the viewport width, so the
+	// sentence continues line by line instead of running on to the token's width
+	// and being cut off at the terminal edge.
+	testing.expect_value(t, conversation_glyph_row(storage, 3, scratch[:]), "[user]              ")
+	testing.expect_value(t, conversation_glyph_row(storage, 4, scratch[:]), "  hello world this  ")
+	testing.expect_value(t, conversation_glyph_row(storage, 5, scratch[:]), "  is long enough to ")
+	testing.expect_value(t, conversation_glyph_row(storage, 6, scratch[:]), "  wrap              ")
 }

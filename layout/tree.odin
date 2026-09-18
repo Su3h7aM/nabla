@@ -73,9 +73,11 @@ _append_diagnostic :: proc(
 		}
 	}
 	diagnostic_amount = _canonical_zero(diagnostic_amount)
-	if !_try_append_diagnostic(state, Diagnostic{kind = kind, node = node, id = identifier, axis = axis, amount = diagnostic_amount, pool = pool, loc = loc}) {
-		_latch_capacity_error(state, .Diagnostics, loc)
-	}
+	// Diagnostics are advisory, not structural: a frame that produces more of
+	// them than the pool holds still publishes, and the pool's high-water mark
+	// records that some were dropped. Only running out of a structural pool
+	// fails the frame.
+	_ = _try_append_diagnostic(state, Diagnostic{kind = kind, node = node, id = identifier, axis = axis, amount = diagnostic_amount, pool = pool, loc = loc})
 }
 
 @(private)
