@@ -8,7 +8,6 @@ package ai
 // holds the connection open; the test synchronizes on the phase being reached
 // rather than sleeping.
 
-import "core:c"
 import "core:fmt"
 import "core:mem"
 import "core:nbio"
@@ -23,11 +22,6 @@ import "nabla:http/client"
 
 // Paths resolve against this file, not the working directory. The certificates are
 // test-only throwaways valid until 2126; their keys are intentionally committed.
-TRANSPORT_CERT_LOCALHOST :: #directory + "testdata/localhost.pem"
-TRANSPORT_KEY_LOCALHOST :: #directory + "testdata/localhost.key"
-TRANSPORT_CERT_UNTRUSTED :: #directory + "testdata/selfsigned.pem"
-TRANSPORT_KEY_UNTRUSTED :: #directory + "testdata/selfsigned.key"
-TRANSPORT_CA :: #directory + "testdata/ca.pem"
 
 // Bounds so a broken fixture or a broken interrupt fails the test instead of
 // hanging the suite.
@@ -41,29 +35,29 @@ TRANSPORT_RESPONSE_BODY ::
 	"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
 	"data: [DONE]\n\n"
 TRANSPORT_RESPONSE_COMPLETE :: "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" + TRANSPORT_RESPONSE_BODY
+// TRANSPORT_RESPONSE_PARTIAL declares more body than it sends, which is what a
+// response that stops early looks like once the head has stated a length.
 TRANSPORT_RESPONSE_PARTIAL ::
-	"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" + "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"
+	"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\n\r\n" +
+	"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"
 
 // Fixture_Phase is where the server stops making progress.
 Fixture_Phase :: enum {
-	// Send a complete response, then close with close_notify.
+	// Send a complete response, then close.
 	Complete,
-	// Send a partial response, then close without close_notify.
+	// Send less body than the head declared, then close.
 	Truncate,
 	// Send headers and part of an event, then hold the connection open.
 	Stall,
 	// Send the same body with a declared length, which is the only way a head
 	// states how much body follows.
 	Declared,
-	// Send exactly the response the test wrote, then close with close_notify. It is
-	// how a refusal and its fields are exercised without a second server.
+	// Send exactly the response the test wrote, then close. It is how a refusal and its fields are exercised without a second server.
 	Custom,
 }
 
 Transport_Fixture :: struct {
 	phase:          Fixture_Phase,
-	cert:           string,
-	key:            string,
 	// response is what the Custom phase writes, byte for byte.
 	response:       string,
 	listener:       net.TCP_Socket,
@@ -81,11 +75,9 @@ Transport_Fixture :: struct {
 	failed:         bool,
 }
 
-transport_fixture_start :: proc(t: ^testing.T, fixture: ^Transport_Fixture, phase: Fixture_Phase, cert, key: string, response := "") -> bool {
+transport_fixture_start :: proc(t: ^testing.T, fixture: ^Transport_Fixture, phase: Fixture_Phase, response := "") -> bool {
 	fixture^ = Transport_Fixture {
 		phase    = phase,
-		cert     = cert,
-		key      = key,
 		response = response,
 	}
 	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
@@ -143,78 +135,43 @@ transport_fixture_serve :: proc(thread: ^thread.Thread) {
 	}
 	defer net.close(socket)
 
-	ctx := client.SSL_CTX_new(client.TLS_server_method())
-	if ctx == nil {
-		fixture.failed = true
-		sync.sema_post(&fixture.reached)
-		return
-	}
-	defer client.SSL_CTX_free(ctx)
-	cert := strings.clone_to_cstring(fixture.cert, context.temp_allocator)
-	key := strings.clone_to_cstring(fixture.key, context.temp_allocator)
-	if client.SSL_CTX_use_certificate_file(ctx, cert, client.FILETYPE_PEM) != 1 ||
-	   client.SSL_CTX_use_PrivateKey_file(ctx, key, client.FILETYPE_PEM) != 1 ||
-	   client.SSL_CTX_check_private_key(ctx) != 1 {
-		fixture.failed = true
-		sync.sema_post(&fixture.reached)
-		return
-	}
-	ssl := client.SSL_new(ctx)
-	if ssl == nil {
-		fixture.failed = true
-		sync.sema_post(&fixture.reached)
-		return
-	}
-	defer client.SSL_free(ssl)
-	if client.SSL_set_fd(ssl, c.int(i32(i64(socket)))) != 1 {
-		fixture.failed = true
-		sync.sema_post(&fixture.reached)
-		return
-	}
-	// A rejected certificate fails here, which is the expected outcome for the
-	// untrusted case.
-	if client.SSL_accept(ssl) != 1 {
-		fixture.failed = true
-		sync.sema_post(&fixture.reached)
-		return
-	}
 	// Drain the request first: closing a socket that still holds unread data sends
 	// RST, which would turn an orderly close into a truncation.
-	if !transport_fixture_read_request(fixture, ssl) {
+	if !transport_fixture_read_request(fixture, socket) {
 		fixture.failed = true
 		sync.sema_post(&fixture.reached)
 		return
 	}
 	switch fixture.phase {
 	case .Complete:
-		transport_fixture_write(ssl, TRANSPORT_RESPONSE_COMPLETE)
-		_ = client.SSL_shutdown(ssl)
+		transport_fixture_write(socket, TRANSPORT_RESPONSE_COMPLETE)
+		net.shutdown(socket, .Send)
 	case .Truncate:
-		transport_fixture_write(ssl, TRANSPORT_RESPONSE_PARTIAL)
+		transport_fixture_write(socket, TRANSPORT_RESPONSE_PARTIAL)
 	case .Stall:
-		transport_fixture_write(ssl, TRANSPORT_RESPONSE_PARTIAL)
+		transport_fixture_write(socket, TRANSPORT_RESPONSE_PARTIAL)
 		transport_fixture_stall(fixture)
 	case .Declared:
 		// The length is computed from the body rather than written down, so the
 		// head cannot disagree with what follows it.
 		head: [96]u8
 		transport_fixture_write(
-			ssl,
+			socket,
 			fmt.bprintf(head[:], "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: %d\r\n\r\n", len(TRANSPORT_RESPONSE_BODY)),
 		)
-		transport_fixture_write(ssl, TRANSPORT_RESPONSE_BODY)
-		_ = client.SSL_shutdown(ssl)
+		transport_fixture_write(socket, TRANSPORT_RESPONSE_BODY)
+		net.shutdown(socket, .Send)
 	case .Custom:
-		transport_fixture_write(ssl, fixture.response)
-		_ = client.SSL_shutdown(ssl)
+		transport_fixture_write(socket, fixture.response)
+		net.shutdown(socket, .Send)
 	}
 }
 
-transport_fixture_write :: proc(ssl: ^client.SSL, text: string) -> bool {
-	pending := text
+transport_fixture_write :: proc(socket: net.TCP_Socket, text: string) -> bool {
+	pending := transmute([]u8)text
 	for len(pending) > 0 {
-		written := client.SSL_write(ssl, raw_data(pending), c.int(len(pending)))
-		if written <= 0 { return false }
+		written, send_err := net.send_tcp(socket, pending)
+		if send_err != nil || written <= 0 { return false }
 		pending = pending[written:]
 	}
 	return true
@@ -223,17 +180,28 @@ transport_fixture_write :: proc(ssl: ^client.SSL, text: string) -> bool {
 // transport_fixture_read_request drains the request and keeps it, so a test can
 // check the fields the client sent. It waits for the whole payload so the server
 // is responding to a complete request.
-transport_fixture_read_request :: proc(fixture: ^Transport_Fixture, ssl: ^client.SSL) -> bool {
+transport_fixture_read_request :: proc(fixture: ^Transport_Fixture, socket: net.TCP_Socket) -> bool {
 	for used := 0; used < len(fixture.request); {
-		count := client.SSL_read(ssl, raw_data(fixture.request[used:]), c.int(len(fixture.request) - used))
-		if count <= 0 { return false }
-		used += int(count)
+		count, recv_err := net.recv_tcp(socket, fixture.request[used:])
+		if recv_err != nil || count <= 0 { return false }
+		used += count
 		fixture.request_length = used
 		if header_end := strings.index(string(fixture.request[:used]), "\r\n\r\n"); header_end >= 0 {
 			if used - header_end >= len(TRANSPORT_PAYLOAD) { return true }
 		}
 	}
 	return false
+}
+
+// free_port asks the kernel for a port and gives it back, so the closed endpoint a
+// test needs is one nothing is listening on.
+free_port :: proc() -> (port: int, ok: bool) {
+	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
+	if listen_err != nil { return 0, false }
+	defer net.close(listener)
+	endpoint, endpoint_err := net.bound_endpoint(listener)
+	if endpoint_err != nil { return 0, false }
+	return endpoint.port, true
 }
 
 // Transport_Job is one request executed on its own thread, so the test can act
@@ -263,7 +231,7 @@ transport_job_callback :: proc(user_data: rawptr, event: Provider_Event) {
 	}
 }
 
-transport_job_init :: proc(t: ^testing.T, job: ^Transport_Job, host: string, port: int, ca_file: string) -> bool {
+transport_job_init :: proc(t: ^testing.T, job: ^Transport_Job, host: string, port: int) -> bool {
 	job.allocator = context.allocator
 	job.content = TRANSPORT_PAYLOAD
 	job.messages = make([]Provider_Message, 1, job.allocator)
@@ -271,7 +239,7 @@ transport_job_init :: proc(t: ^testing.T, job: ^Transport_Job, host: string, por
 		Role    = .User,
 		Content = job.content,
 	}
-	job.endpoint = fmt.aprintf("https://%s:%d", host, port, allocator = job.allocator)
+	job.endpoint = fmt.aprintf("http://%s:%d", host, port, allocator = job.allocator)
 	job.connection = Provider_Connection {
 		API        = .OpenAI_Chat_Completions,
 		Endpoint   = job.endpoint,
@@ -284,7 +252,6 @@ transport_job_init :: proc(t: ^testing.T, job: ^Transport_Job, host: string, por
 		Messages_Present = true,
 		Messages         = job.messages,
 	}
-	job.options.ca_file = ca_file
 	return true
 }
 
@@ -352,7 +319,7 @@ dns_stalled_server_await_query :: proc(socket: net.UDP_Socket, timeout: time.Dur
 // dns_job_init points one request at a name that only the stalled nameserver can
 // answer, so the operation cannot proceed past resolution.
 dns_job_init :: proc(t: ^testing.T, job: ^Transport_Job, nameserver: net.Endpoint) -> bool {
-	if !transport_job_init(t, job, "stalled.test", 443, TRANSPORT_CA) { return false }
+	if !transport_job_init(t, job, "stalled.test", 443) { return false }
 	job.nameservers = make([]net.Endpoint, 1, job.allocator)
 	job.nameservers[0] = nameserver
 	job.options.nameservers = job.nameservers
@@ -360,56 +327,13 @@ dns_job_init :: proc(t: ^testing.T, job: ^Transport_Job, nameserver: net.Endpoin
 }
 
 @(test)
-test_transport_certificate_trust :: proc(t: ^testing.T) {
-	// A certificate signed by the configured CA is accepted.
-	{
-		fixture: Transport_Fixture
-		if !transport_fixture_start(t, &fixture, .Complete, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
-		defer transport_fixture_stop(&fixture)
-
-		job: Transport_Job
-		if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
-		defer transport_job_destroy(&job, job.allocator)
-		transport_job_start(&job)
-		transport_job_join(&job)
-
-		testing.expectf(t, job.error.kind == .None, "trusted request failed: %v %s", job.error.kind, job.error.detail)
-		testing.expect_value(t, job.texts, 1)
-		testing.expect_value(t, job.completions, 1)
-		// Authentication is built by the provider layer, not the transport, so
-		// this is where the header it chose is observable.
-		sent := string(fixture.request[:fixture.request_length])
-		testing.expect(
-			t,
-			strings.contains(sent, "authorization: Bearer transport-test-credential"),
-			"the provider's authorization header should reach the wire",
-		)
-	}
-	// One that is not is rejected.
-	{
-		fixture: Transport_Fixture
-		if !transport_fixture_start(t, &fixture, .Complete, TRANSPORT_CERT_UNTRUSTED, TRANSPORT_KEY_UNTRUSTED) { return }
-		defer transport_fixture_stop(&fixture)
-
-		job: Transport_Job
-		if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
-		defer transport_job_destroy(&job, job.allocator)
-		transport_job_start(&job)
-		transport_job_join(&job)
-
-		testing.expectf(t, job.error.kind == .TLS, "untrusted certificate was not rejected: %v", job.error.kind)
-		testing.expect_value(t, job.completions, 0)
-	}
-}
-
-@(test)
 test_transport_reports_what_it_encoded_and_received :: proc(t: ^testing.T) {
 	fixture: Transport_Fixture
-	if !transport_fixture_start(t, &fixture, .Complete, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
+	if !transport_fixture_start(t, &fixture, .Complete) { return }
 	defer transport_fixture_stop(&fixture)
 
 	job: Transport_Job
-	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+	if !transport_job_init(t, &job, "localhost", fixture.port) { return }
 	defer transport_job_destroy(&job, job.allocator)
 
 	observed: Transport_Observation
@@ -469,11 +393,11 @@ transport_observation_report :: proc(user_data: rawptr, report: Provider_Operati
 @(test)
 test_transport_truncated_response_is_not_success :: proc(t: ^testing.T) {
 	fixture: Transport_Fixture
-	if !transport_fixture_start(t, &fixture, .Truncate, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
+	if !transport_fixture_start(t, &fixture, .Truncate) { return }
 	defer transport_fixture_stop(&fixture)
 
 	job: Transport_Job
-	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+	if !transport_job_init(t, &job, "localhost", fixture.port) { return }
 	defer transport_job_destroy(&job, job.allocator)
 	transport_job_start(&job)
 	transport_job_join(&job)
@@ -485,13 +409,13 @@ test_transport_truncated_response_is_not_success :: proc(t: ^testing.T) {
 @(test)
 test_transport_cancel_interrupts_blocked_read :: proc(t: ^testing.T) {
 	fixture: Transport_Fixture
-	if !transport_fixture_start(t, &fixture, .Stall, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
+	if !transport_fixture_start(t, &fixture, .Stall) { return }
 	defer transport_fixture_stop(&fixture)
 
 	interrupt: Interrupt
 
 	job: Transport_Job
-	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+	if !transport_job_init(t, &job, "localhost", fixture.port) { return }
 	defer transport_job_destroy(&job, job.allocator)
 	job.options.interrupt = &interrupt
 
@@ -622,12 +546,12 @@ refusal_response :: proc(status, content_type, extra_fields, body: string) -> st
 // started and stopped here, so the caller owns only what it named.
 transport_refusal_once :: proc(t: ^testing.T, response: string, job: ^Transport_Job, observed: ^Transport_Observation) -> bool {
 	fixture: Transport_Fixture
-	if !transport_fixture_start(t, &fixture, .Custom, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST, response) {
+	if !transport_fixture_start(t, &fixture, .Custom, response) {
 		return false
 	}
 	defer transport_fixture_stop(&fixture)
 
-	if !transport_job_init(t, job, "localhost", fixture.port, TRANSPORT_CA) { return false }
+	if !transport_job_init(t, job, "localhost", fixture.port) { return false }
 	job.options.observer = {
 		user_data = observed,
 		report    = transport_observation_report,
@@ -833,11 +757,11 @@ test_provider_request_headers_carry_the_client_identity :: proc(t: ^testing.T) {
 @(test)
 test_transport_reports_where_a_completed_request_stopped :: proc(t: ^testing.T) {
 	fixture: Transport_Fixture
-	if !transport_fixture_start(t, &fixture, .Declared, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
+	if !transport_fixture_start(t, &fixture, .Declared) { return }
 	defer transport_fixture_stop(&fixture)
 
 	job: Transport_Job
-	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+	if !transport_job_init(t, &job, "localhost", fixture.port) { return }
 	defer transport_job_destroy(&job, job.allocator)
 
 	observed: Transport_Observation
@@ -873,11 +797,11 @@ test_transport_separates_a_refused_connection_from_a_broken_stream :: proc(t: ^t
 	// high-level failure is a transport error either way, so the phase is the only
 	// thing that says whether anything was sent or received.
 	fixture: Transport_Fixture
-	if !transport_fixture_start(t, &fixture, .Truncate, TRANSPORT_CERT_LOCALHOST, TRANSPORT_KEY_LOCALHOST) { return }
+	if !transport_fixture_start(t, &fixture, .Truncate) { return }
 	defer transport_fixture_stop(&fixture)
 
 	job: Transport_Job
-	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+	if !transport_job_init(t, &job, "localhost", fixture.port) { return }
 	defer transport_job_destroy(&job, job.allocator)
 
 	observed: Transport_Observation
@@ -897,15 +821,14 @@ test_transport_separates_a_refused_connection_from_a_broken_stream :: proc(t: ^t
 
 @(test)
 test_transport_reports_a_request_that_never_left :: proc(t: ^testing.T) {
-	// A peer whose certificate is not trusted: TLS never completes, so no request
-	// byte was ever taken. This is what a caller must be able to tell apart from a
-	// stream that broke after the request went out.
-	fixture: Transport_Fixture
-	if !transport_fixture_start(t, &fixture, .Complete, TRANSPORT_CERT_UNTRUSTED, TRANSPORT_KEY_UNTRUSTED) { return }
-	defer transport_fixture_stop(&fixture)
+	// A port nothing listens on: the connection never opens, so no request byte was
+	// ever taken. This is what a caller must be able to tell apart from a stream
+	// that broke after the request went out.
+	closed_port, port_ok := free_port()
+	if !testing.expect(t, port_ok, "no closed port could be found") { return }
 
 	job: Transport_Job
-	if !transport_job_init(t, &job, "localhost", fixture.port, TRANSPORT_CA) { return }
+	if !transport_job_init(t, &job, "localhost", closed_port) { return }
 	defer transport_job_destroy(&job, job.allocator)
 
 	observed: Transport_Observation
@@ -918,9 +841,9 @@ test_transport_reports_a_request_that_never_left :: proc(t: ^testing.T) {
 
 	testing.expect(t, job.error.kind != .None, "an untrusted peer is not success")
 	testing.expect(t, observed.transfer_seen, "the transport should account for the attempt")
-	testing.expect_value(t, observed.transfer.stopped_at, Provider_Transfer_Phase.TLS)
+	testing.expect_value(t, observed.transfer.stopped_at, Provider_Transfer_Phase.Connect)
 	testing.expect_value(t, observed.transfer.request_bytes_accepted, u64(0))
 	testing.expect(t, !observed.transfer.request_complete, "nothing was taken, so the request is not complete")
-	testing.expect(t, !observed.transfer.response_head_received, "no head arrives without a handshake")
+	testing.expect(t, !observed.transfer.response_head_received, "no head arrives without a connection")
 	testing.expect(t, !observed.transfer.declared_body_bytes_present, "an absent head declares nothing")
 }

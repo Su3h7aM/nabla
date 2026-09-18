@@ -91,7 +91,7 @@ CERTIFICATE_VERIFY_INPUT_MAX :: 64 + len(SERVER_CERTIFICATE_VERIFY_CONTEXT) + 1 
 // caller reached it by, which is a name or an address literal.
 identity_verify :: proc(certificate: ^x509.Certificate, reference: string) -> bool {
 	if ip4, is_ip4 := net.parse_ip4_address(reference); is_ip4 {
-		address := transmute([4]u8)ip4
+		address := ip4
 		return san_matches(certificate, address[:])
 	}
 	if ip6, is_ip6 := net.parse_ip6_address(reference); is_ip6 {

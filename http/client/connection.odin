@@ -1,16 +1,22 @@
 package client
 
-import "core:c"
 import "core:mem"
 import "core:net"
+import "core:os"
 
-// Connection owns one socket and, for TLS, its session and context. Its holder is
-// the sole I/O owner, so no thread frees TLS state while a read is in flight.
-// Connect, handshake, writes, and reads are interruptible; name resolution is not.
+import "core:crypto/x509"
+
+import "nabla:tls"
+
+// Connection owns one socket and, once the handshake has run, its TLS session. Its
+// holder is the sole I/O owner, so no thread frees TLS state while a read is in
+// flight. Connect, handshake, writes, and reads are interruptible; name resolution
+// is not.
 Connection :: struct {
 	socket:      net.TCP_Socket,
-	ssl:         ^SSL,
-	ctx:         ^SSL_CTX,
+	tls_conn:    ^tls.Conn,
+	roots:       tls.Roots,
+	anchors:     []^x509.Certificate,
 	probe:       Probe,
 	ca_file:     string,
 	allocator:   mem.Allocator,
@@ -59,42 +65,38 @@ connection_dial :: proc(endpoint: net.Endpoint, options: Options, allocator: mem
 	return connection, .None
 }
 
-// connection_handshake completes TLS and verifies the peer chain. A failed
-// verification never yields a usable connection.
+// connection_handshake loads the trust store, completes TLS, and verifies the peer's
+// chain and its name. A failed verification never yields a usable connection, and a
+// store that cannot be loaded is a failure rather than an unverified connection.
 connection_handshake :: proc(connection: ^Connection, host: string) -> Error {
-	ctx, ctx_err := tls_client_ctx_new(connection.ca_file, connection.allocator)
-	if ctx_err != .None { return ctx_err }
-	connection.ctx = ctx
-	ssl := SSL_new(ctx)
-	if ssl == nil { return .TLS_Config }
-	connection.ssl = ssl
-	if SSL_set_fd(ssl, c.int(i32(i64(connection.socket)))) != 1 { return .TLS_Config }
-	if identity_err := tls_set_peer_identity(ssl, host, connection.allocator); identity_err != .None { return identity_err }
-	for {
-		result := SSL_connect(ssl)
-		if result == 1 { break }
-		switch SSL_get_error(ssl, result) {
-		case SSL_ERROR_WANT_READ:
-			if stop := connection_wait(connection, .Read); stop != .None { return error_from_stop(stop) }
-		case SSL_ERROR_WANT_WRITE:
-			if stop := connection_wait(connection, .Write); stop != .None { return error_from_stop(stop) }
-		case SSL_ERROR_ZERO_RETURN:
-			connection.stop = .Peer_Closed
-			return .Closed
-		case SSL_ERROR_SYSCALL:
-			connection.stop = .Truncated
-			return .Truncated
-		case:
-			if ssl_peer_closed() {
-				connection.stop = .Peer_Closed
-				return .Closed
-			}
-			return .TLS_Handshake
-		}
+	name, _ := host_without_port(host)
+	if name == "" { return .TLS_Hostname }
+
+	store, read_err := os.read_entire_file(connection.ca_file, connection.allocator)
+	if read_err != nil { return .TLS_Trust }
+	defer delete(store, connection.allocator)
+
+	roots, roots_ok := tls.roots_parse(store, connection.allocator)
+	if !roots_ok { return .TLS_Trust }
+	connection.roots = roots
+	connection.anchors = tls.certificate_pointers(roots.certificates, connection.allocator)
+
+	conn, init_err := tls.init(
+		tls_transport(connection),
+		{roots = connection.anchors, allocator = connection.allocator},
+	)
+	if init_err != tls.Error.None { return .TLS_Config }
+	connection.tls_conn = conn
+
+	if err := tls.handshake(conn, name, TLS_ALPN); err != tls.Error.None {
+		return tls_error(connection, err, .TLS_Handshake)
 	}
-	if SSL_get_verify_result(ssl) != 0 { return .TLS_Peer_Rejected }
 	return .None
 }
+
+// TLS_ALPN is what this client speaks over TLS. A server that negotiates something
+// else is not answering in a framing this client can read.
+TLS_ALPN :: []string{"http/1.1"}
 
 // connection_write_all retries the same buffer after a retryable result and only
 // advances past bytes the peer actually accepted. accepted counts plaintext bytes
@@ -102,47 +104,16 @@ connection_handshake :: proc(connection: ^Connection, host: string) -> Error {
 // them; a failure still reports what was taken before it, so a caller can tell a
 // request that never started from one that stopped halfway.
 connection_write_all :: proc(connection: ^Connection, buffer: []u8) -> (accepted: int, err: Error) {
-	if connection.ssl != nil { return connection_write_tls(connection, buffer) }
+	if connection.tls_conn != nil { return connection_write_tls(connection, buffer) }
 	return connection_write_socket(connection, buffer)
 }
 
-// connection_write_tls writes plaintext into the TLS session. The session owns the
-// socket's bytes, so nothing here reaches the socket directly.
+// connection_write_tls hands plaintext to the TLS session, which owns the socket's
+// bytes from there on.
 connection_write_tls :: proc(connection: ^Connection, buffer: []u8) -> (accepted: int, err: Error) {
-	pending := buffer
-	for len(pending) > 0 {
-		if probed := stop_from_wait(probe_now(connection.probe)); probed != .None {
-			if connection.stop == .None { connection.stop = probed }
-			return accepted, error_from_stop(probed)
-		}
-
-		result := SSL_write(connection.ssl, raw_data(pending), c.int(len(pending)))
-		if result <= 0 {
-			// Every outcome below returns or retries, so getting past this
-			// means the session took bytes and the loop can advance.
-			switch SSL_get_error(connection.ssl, result) {
-			case SSL_ERROR_WANT_READ:
-				if stop := connection_wait(connection, .Read); stop != .None { return accepted, error_from_stop(stop) }
-				continue
-			case SSL_ERROR_WANT_WRITE:
-				if stop := connection_wait(connection, .Write); stop != .None { return accepted, error_from_stop(stop) }
-				continue
-			case SSL_ERROR_ZERO_RETURN:
-				connection.stop = .Peer_Closed
-				return accepted, .Closed
-			case:
-				if ssl_peer_closed() {
-					connection.stop = .Peer_Closed
-					return accepted, .Closed
-				}
-				connection.stop = .Truncated
-				return accepted, .TLS_Write
-			}
-		}
-		pending = pending[int(result):]
-		accepted += int(result)
-	}
-	return accepted, .None
+	written, tls_err := tls.write(connection.tls_conn, buffer)
+	if tls_err == tls.Error.None { return written, .None }
+	return written, tls_error(connection, tls_err, .TLS_Write)
 }
 
 // connection_write_socket writes plaintext straight to the socket, waiting on the
@@ -197,42 +168,27 @@ connection_read_source :: proc(user_data: rawptr, buffer: []u8) -> (count: int, 
 // connection_read returns .Closed for an orderly end of stream. The caller decides
 // whether the message was complete.
 connection_read :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {
-	if connection.ssl != nil { return connection_read_tls(connection, buffer) }
+	if connection.tls_conn != nil { return connection_read_tls(connection, buffer) }
 	return connection_read_socket(connection, buffer)
 }
 
 // connection_read_tls reads plaintext out of the TLS session. The session owns the
-// socket's bytes, so nothing here reaches the socket directly.
+// connection_read_tls takes plaintext out of the TLS session. The session owns the
+// socket's bytes from there on.
 connection_read_tls :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {
-	for {
-		if probed := stop_from_wait(probe_now(connection.probe)); probed != .None {
-			if connection.stop == .None { connection.stop = probed }
-			return 0, error_from_stop(probed)
-		}
-		result := SSL_read(connection.ssl, raw_data(buffer), c.int(len(buffer)))
-		if result > 0 { return int(result), .None }
-		switch SSL_get_error(connection.ssl, result) {
-		case SSL_ERROR_WANT_READ:
-			if stop := connection_wait(connection, .Read); stop != .None { return 0, error_from_stop(stop) }
-			continue
-		case SSL_ERROR_WANT_WRITE:
-			if stop := connection_wait(connection, .Write); stop != .None { return 0, error_from_stop(stop) }
-			continue
-		case SSL_ERROR_ZERO_RETURN:
-			connection.stop = .Peer_Closed
-			return 0, .Closed
-		case SSL_ERROR_SYSCALL:
-			connection.stop = .Truncated
-			return 0, .Truncated
-		case:
-			if ssl_peer_closed() {
-				connection.stop = .Truncated
-				return 0, .Truncated
-			}
-			connection.stop = .Truncated
-			return 0, .TLS_Read
-		}
+	read, tls_err := tls.read(connection.tls_conn, buffer)
+	switch tls_err {
+	case .None:
+		// A close_notify is the peer's orderly end of the stream, which reads the
+		// same as a socket that has no more bytes.
+		if read == 0 { return 0, .Closed }
+		return read, .None
+	case .Transport:
+		return 0, tls_error(connection, tls_err, .Truncated)
+	case .Record, .Handshake, .Alert, .Unsupported, .No_Room, .Peer_Rejected, .Signature, .Finished:
+		return 0, tls_error(connection, tls_err, .TLS_Read)
 	}
+	return 0, .TLS_Read
 }
 
 // connection_read_socket moves plaintext off the socket, waiting on the event loop
@@ -285,15 +241,16 @@ connection_wait :: proc(connection: ^Connection, kind: Ready_For) -> Transport_S
 
 connection_destroy :: proc(connection: ^Connection) {
 	if connection == nil { return }
-	if connection.ssl != nil {
-		if connection.stop == .None && !connection.nonblocking { _ = SSL_shutdown(connection.ssl) }
-		SSL_free(connection.ssl)
-		connection.ssl = nil
+	if connection.tls_conn != nil {
+		// A close_notify is the polite end of a TLS stream, but sending it can wait
+		// on a peer that has stopped reading, so it goes out only when this
+		// connection was not the interruptible kind and the request ended well.
+		if connection.stop == .None && !connection.nonblocking { _ = tls.close(connection.tls_conn) }
+		tls.destroy(connection.tls_conn)
+		connection.tls_conn = nil
 	}
-	if connection.ctx != nil {
-		SSL_CTX_free(connection.ctx)
-		connection.ctx = nil
-	}
+	delete(connection.anchors, connection.allocator)
+	tls.roots_destroy(&connection.roots)
 	if connection.socket != 0 {
 		net.close(connection.socket)
 		connection.socket = 0

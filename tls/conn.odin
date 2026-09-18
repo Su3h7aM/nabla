@@ -7,6 +7,7 @@ import "core:crypto/hmac"
 import "core:crypto/x509"
 import "core:crypto/x25519"
 import "core:mem"
+import "core:net"
 import "core:strings"
 import "core:time"
 
@@ -128,11 +129,17 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 	x25519.scalarmult_basepoint(public_key[:], private_key[:])
 
 	// The ClientHello is the one message that is not protected, and it is built
-	// where the record will read it from.
+	// where the record will read it from. An address literal is not a name, and SNI
+	// carries no address literals (RFC 6066 section 3), so it is verified without
+	// being sent.
+	sni := server_name
+	if _, is_ip4 := net.parse_ip4_address(sni); is_ip4 { sni = "" }
+	if _, is_ip6 := net.parse_ip6_address(sni); is_ip6 { sni = "" }
+
 	fields := Client_Hello_Fields {
 		random      = random,
 		session_id  = session_id[:],
-		server_name = server_name,
+		server_name = sni,
 		alpn        = alpn,
 		group       = .X25519,
 		keyshare    = public_key[:],
@@ -144,8 +151,8 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 	handshake_encode_header(.Client_Hello, body_length, message)
 	if err := send_message(conn, message); err != .None { return err }
 
-	hello_message, err := handshake_next(conn)
-	if err != .None { return err }
+	hello_message, hello_err := handshake_next(conn)
+	if hello_err != .None { return hello_err }
 	hello_type, _, decoded := handshake_decode_header(hello_message)
 	if !decoded || hello_type != .Server_Hello { return .Handshake }
 	hello, hello_decoded := server_hello_decode(hello_message[HANDSHAKE_HEADER_SIZE:])
@@ -175,7 +182,7 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 	if !traffic_key_derive(suite, conn.read_secret[:secret_size(suite)], &conn.read_key) { return .Unsupported }
 	if !traffic_key_derive(suite, conn.write_secret[:secret_size(suite)], &conn.write_key) { return .Unsupported }
 
-	if err := handshake_server_flight(conn, server_name); err != .None { return err }
+	if flight_err := handshake_server_flight(conn, server_name); flight_err != .None { return flight_err }
 
 	// The client's Finished is the last thing the handshake keys protect, and it
 	// covers the handshake through the server's Finished. The application secrets
@@ -190,7 +197,7 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 	zeroes: [MAX_SECRET_SIZE]u8
 	if !key_schedule_advance(&conn.schedule, zeroes[:secret_size(suite)]) { return .Unsupported }
 
-	if err := handshake_client_finished(conn); err != .None { return err }
+	if finished_err := handshake_client_finished(conn); finished_err != .None { return finished_err }
 
 	client_application, server_application: Secret
 	if !key_schedule_traffic_secrets(&conn.schedule, application_hash[:len(digest)], &client_application, &server_application) {
@@ -270,7 +277,7 @@ handshake_client_finished :: proc(conn: ^Conn) -> Error {
 read :: proc(conn: ^Conn, buffer: []u8) -> (count: int, err: Error) {
 	for len(conn.payload) == 0 {
 		if conn.closed { return 0, .None }
-		if err := post_handshake_handle(conn); err != .None { return 0, err }
+		if post_err := post_handshake_handle(conn); post_err != .None { return 0, post_err }
 
 		content, record_type, read_err := read_record(conn)
 		if read_err != .None { return 0, read_err }
@@ -298,7 +305,7 @@ write :: proc(conn: ^Conn, buffer: []u8) -> (count: int, err: Error) {
 	for count < len(buffer) {
 		chunk := buffer[count:]
 		if len(chunk) > MAX_PLAINTEXT_RECORD { chunk = chunk[:MAX_PLAINTEXT_RECORD] }
-		if err := send_record(conn, .Application_Data, chunk); err != .None { return count, err }
+		if send_err := send_record(conn, .Application_Data, chunk); send_err != .None { return count, send_err }
 		count += len(chunk)
 	}
 	return count, .None
@@ -326,10 +333,10 @@ close :: proc(conn: ^Conn) -> Error {
 read_record :: proc(conn: ^Conn) -> (content: []u8, record_type: Record_Type, err: Error) {
 	for {
 		conn.recv_filled = 0
-		if err := recv_fill(conn, RECORD_HEADER_SIZE); err != .None { return nil, {}, err }
+		if fill_err := recv_fill(conn, RECORD_HEADER_SIZE); fill_err != .None { return nil, {}, fill_err }
 		outer_type, length, decoded := record_decode_header(conn.recv[:RECORD_HEADER_SIZE])
 		if !decoded || length > MAX_CIPHERTEXT_RECORD { return nil, {}, .Record }
-		if err := recv_fill(conn, RECORD_HEADER_SIZE + length); err != .None { return nil, {}, err }
+		if fill_err := recv_fill(conn, RECORD_HEADER_SIZE + length); fill_err != .None { return nil, {}, fill_err }
 
 		record := conn.recv[:RECORD_HEADER_SIZE + length]
 		// A compatibility-mode peer sends one, and a receiver drops it without
@@ -415,7 +422,7 @@ send_message :: proc(conn: ^Conn, message: []u8) -> Error {
 // whole of it, header included, and it stays valid until the next call.
 handshake_next :: proc(conn: ^Conn) -> (message: []u8, err: Error) {
 	for {
-		if message := handshake_available(conn); message != nil { return message, .None }
+		if available := handshake_available(conn); available != nil { return available, .None }
 
 		content, record_type, read_err := read_record(conn)
 		if read_err != .None { return nil, read_err }
