@@ -160,3 +160,17 @@ read_section_u8 :: proc(r: ^Reader) -> Reader {
 read_section_u16 :: proc(r: ^Reader) -> Reader {
 	return read_section(r, int(read_u16(r)))
 }
+
+read_u24 :: proc(r: ^Reader) -> int {
+	if !r.ok || r.at + 3 > len(r.data) {
+		r.ok = false
+		return 0
+	}
+	value := int(r.data[r.at]) << 16 | int(r.data[r.at + 1]) << 8 | int(r.data[r.at + 2])
+	r.at += 3
+	return value
+}
+
+read_section_u24 :: proc(r: ^Reader) -> Reader {
+	return read_section(r, read_u24(r))
+}
