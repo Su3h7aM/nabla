@@ -25,8 +25,9 @@ CERTIFICATE_FILE :: "certificate.pem"
 KEY_FILE :: "key.pem"
 
 // Plain cases: the message cases, a masked frame from the server, an oversized control
-// frame, and a response that does not accept the key.
-PLAIN_CONNECTIONS :: 4
+// frame, a response that does not accept the key, and a frame the peer sends with its
+// response head.
+PLAIN_CONNECTIONS :: 5
 TLS_CONNECTIONS :: 1
 
 SERVER_STARTUP_TIMEOUT :: 10 * time.Second
@@ -69,6 +70,7 @@ main :: proc() {
 	run_masked_case(plain_port)
 	run_oversized_control_case(plain_port)
 	run_rejected_key_case(plain_port)
+	run_immediate_case(plain_port)
 	run_tls_cases(secure_port)
 
 	// Each peer leaves once it has served the connections it was asked for, and reports
@@ -226,6 +228,19 @@ run_rejected_key_case :: proc(port: int) {
 	}
 	check(failure.kind == .Response, fmt.tprintf("the rejected key failed as %v %s", failure.kind, failure.detail))
 	check(failure.status == 101, fmt.tprintf("the rejection reported status %d", failure.status))
+}
+
+// A frame the peer sends in the same segment as its response head belongs to the
+// WebSocket, not to the HTTP response, and it must still be the first thing read.
+run_immediate_case :: proc(port: int) {
+	conn, failure := open(port, false, "/immediate")
+	if !check(failure.kind == .None, fmt.tprintf("the immediate case did not open: %v %s", failure.kind, failure.detail)) {
+		websocket.dial_failure_destroy(&failure, context.allocator)
+		return
+	}
+	defer websocket.destroy(conn)
+
+	expect_message(conn, .Text, "immediate")
 }
 
 expect_protocol_failure :: proc(conn: ^websocket.Conn, what: string) {
@@ -451,12 +466,20 @@ def handshake(conn):
     accept = base64.b64encode(hashlib.sha1(key + GUID.encode()).digest())
     if target == b"/reject":
         accept = b"a-key-this-client-never-sent="
-    conn.sendall(
+    head = (
         b"HTTP/1.1 101 Switching Protocols\r\n"
         b"upgrade: websocket\r\n"
         b"connection: Upgrade\r\n"
         b"sec-websocket-accept: " + accept + b"\r\n\r\n"
     )
+    if target == b"/immediate":
+        # The head and the frame go out in one write, so they arrive in one segment
+        # and the client has to hand the frame to the WebSocket rather than lose it
+        # with the response.
+        frame = bytes([0x80 | TEXT, len(b"immediate")]) + b"immediate"
+        conn.sendall(head + frame)
+        return False
+    conn.sendall(head)
     return target != b"/reject"
 
 
