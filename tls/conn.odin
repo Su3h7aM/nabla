@@ -451,7 +451,11 @@ handshake_next :: proc(conn: ^Conn) -> (message: []u8, err: Error) {
 			// some to parse.
 			continue
 		case .Alert:
-			return nil, alert_report(conn, content)
+			// An alert ends the handshake whatever it describes: a close_notify
+			// here is a peer that gave up rather than one that finished, and it is
+			// not a handshake message to parse (RFC 8446 section 6.1).
+			_ = alert_report(conn, content)
+			return nil, .Alert
 		case:
 			// Application data has no place in a handshake.
 			return nil, .Handshake
