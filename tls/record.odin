@@ -14,10 +14,11 @@ Record_Type :: enum u8 {
 
 RECORD_HEADER_SIZE :: 5
 
-// RECORD_VERSION is 0x0303, TLS 1.2's version, which TLS 1.3 pins in every
-// record so that what reads it sees a record it recognizes (RFC 8446
-// section 5.1).
-RECORD_VERSION :: 0x0303
+// LEGACY_VERSION is 0x0303, TLS 1.2's version. TLS 1.3 pins it wherever a version
+// field is left for a reader that does not know 1.3: the record header, the
+// ClientHello, and the ServerHello (RFC 8446 sections 4.1.2 and 5.1). The version
+// actually negotiated travels in an extension.
+LEGACY_VERSION :: 0x0303
 
 // MAX_PLAINTEXT_RECORD is the largest TLSPlaintext.fragment (RFC 8446
 // section 5.1) and the largest content an inner plaintext may carry
@@ -30,8 +31,8 @@ MAX_CIPHERTEXT_RECORD :: (1 << 14) + 256
 
 record_encode_header :: proc(record_type: Record_Type, length: int, dst: []u8) {
 	dst[0] = u8(record_type)
-	dst[1] = u8(RECORD_VERSION >> 8)
-	dst[2] = u8(RECORD_VERSION & 0xff)
+	dst[1] = u8(LEGACY_VERSION >> 8)
+	dst[2] = u8(LEGACY_VERSION & 0xff)
 	dst[3] = u8(length >> 8)
 	dst[4] = u8(length)
 }

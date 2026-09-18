@@ -2,6 +2,7 @@
 package tls
 
 import "core:bytes"
+import "core:crypto/x25519"
 import "core:encoding/hex"
 import "core:testing"
 
@@ -83,6 +84,14 @@ RFC8448_SERVER_FLIGHT_PLAINTEXT ::  // 657 octets
 	"65cdf5aea20d53dfacd42f74f3140000209b9b141d906337fbd2cbdce71df4de" +
 	"da4ab42c309572cb7fffee5454b78f0718"
 
+RFC8448_SERVER_HELLO ::  // 90 octets
+	"020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155" +
+	"772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdb" +
+	"f7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"
+
+RFC8448_CLIENT_PRIVATE_KEY ::  // 32 octets
+	"49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005"
+
 @(test)
 test_rfc_8448_simple_handshake :: proc(t: ^testing.T) {
 	schedule := key_schedule_init(.AES_128_GCM_SHA256)
@@ -123,6 +132,28 @@ test_rfc_8448_simple_handshake :: proc(t: ^testing.T) {
 	zeros: [32]u8
 	if !testing.expect(t, key_schedule_advance(&schedule, zeros[:])) { return }
 	expect_bytes(t, "master secret", schedule.secret[:32], vector(t, RFC8448_MASTER_SECRET))
+}
+
+@(test)
+test_rfc_8448_server_hello :: proc(t: ^testing.T) {
+	message := vector(t, RFC8448_SERVER_HELLO)
+	handshake_type, message_length, decoded := handshake_decode_header(message)
+	if !testing.expect(t, decoded) { return }
+	testing.expect_value(t, handshake_type, Handshake_Type.Server_Hello)
+	testing.expect_value(t, message_length, len(message) - HANDSHAKE_HEADER_SIZE)
+
+	hello, ok := server_hello_decode(message[HANDSHAKE_HEADER_SIZE:])
+	if !testing.expect(t, ok) { return }
+	testing.expect_value(t, hello.cipher_suite, Cipher_Suite.AES_128_GCM_SHA256)
+	testing.expect_value(t, hello.version, VERSION_1_3)
+	testing.expect_value(t, hello.group, Named_Group.X25519)
+
+	// The other half of the trace's key exchange: the RFC's server key share and
+	// the RFC's client private key have to produce the RFC's shared secret, which
+	// is what the handshake secret was extracted from.
+	shared_secret: [x25519.POINT_SIZE]u8
+	x25519.scalarmult(shared_secret[:], vector(t, RFC8448_CLIENT_PRIVATE_KEY), hello.keyshare)
+	expect_bytes(t, "shared secret", shared_secret[:], vector(t, RFC8448_ECDHE_SHARED_SECRET))
 }
 
 @(private)
