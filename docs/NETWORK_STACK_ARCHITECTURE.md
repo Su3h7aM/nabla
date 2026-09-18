@@ -862,14 +862,15 @@ pass, and `grep -r 'core:sys' http/` is empty.
 
 **Phase 2: record layer and key schedule, offline.** `tls/record.odin`,
 `tls/handshake.odin`, `tls/key_schedule.odin`. No network, no public `Conn` API. Gate:
-RFC 8446 Appendix B.1, B.2, and B.3.1 known-answer vectors pass, and every handshake
-message in the fixtures replays byte-identically at every split point.
+the RFC 8448 section 3 known-answer vectors pass, and every handshake message in a
+recorded transcript replays byte-identically at every split point. The constants the
+record layer and the handshake encode come from RFC 8446 Appendix B.1 and B.3.
 
 **Phase 3: handshake, offline and local.** `tls/client_hello.odin`,
 `tls/server_hello.odin`, `tls/auth.odin`, `tls/alert.odin`, `tls/roots.odin`, and the
 `Conn` driver, including compatibility mode. Gate: a full handshake against a local
-`openssl s_server`, a byte-exact transcript against Appendix A.1 with fixed peer
-randomness, and the record-overflow and stalled-peer cases from section 9.2.
+`openssl s_server`, a byte-exact transcript against a recorded local handshake with
+fixed peer randomness, and the record-overflow and stalled-peer cases from section 9.2.
 
 **Phase 4: record protection and public read/write, local.** `tls/protect.odin`, with the
 record layer moving real data. Gate: an end-to-end HTTPS `GET` and a chunked response over
