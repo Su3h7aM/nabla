@@ -729,15 +729,11 @@ _place_text_lines :: proc(state: ^_Context_State) {
 		node := Node_Handle(node_index)
 		resolved := &state._nodes[node]
 		resolved.content_size = input.content_size
-		resolved.scroll_range = Vec2 {
-			_finite_scalar(state, node, .X, math.max(f64(input.content_size.x) - f64(resolved.inner.size.x), 0)),
-			_finite_scalar(state, node, .Y, math.max(f64(input.content_size.y) - f64(resolved.inner.size.y), 0)),
-		}
-		_record_overflow(state, node, .X, f64(input.content_size.x) - f64(resolved.inner.size.x))
-		_record_overflow(state, node, .Y, f64(input.content_size.y) - f64(resolved.inner.size.y))
 		box := resolved.inner
+		widest_line: f64
 		for line_index in 0 ..< input.text_line_count {
 			record := &state._text_lines[input.text_line_start + line_index]
+			widest_line = math.max(widest_line, f64(record.size.x))
 			leading: f64
 			switch input.text_style.align {
 			case .Start:
@@ -751,5 +747,16 @@ _place_text_lines :: proc(state: ^_Context_State) {
 				_finite_scalar(state, node, .Y, f64(box.position.y) + f64(input.line_height) * f64(line_index)),
 			}
 		}
+		// Horizontal extent is the widest wrapped line, not the max-content
+		// width: content_size.x stays at max-content as the preferred size for a
+		// later width pass, and reporting it as rendered content would diagnose
+		// an overflow the wrapping already resolved.
+		horizontal_overflow := widest_line - f64(resolved.inner.size.x)
+		resolved.scroll_range = Vec2 {
+			_finite_scalar(state, node, .X, math.max(horizontal_overflow, 0)),
+			_finite_scalar(state, node, .Y, math.max(f64(input.content_size.y) - f64(resolved.inner.size.y), 0)),
+		}
+		_record_overflow(state, node, .X, horizontal_overflow)
+		_record_overflow(state, node, .Y, f64(input.content_size.y) - f64(resolved.inner.size.y))
 	}
 }

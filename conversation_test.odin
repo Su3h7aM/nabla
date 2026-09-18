@@ -131,3 +131,25 @@ test_conversation_follows_the_bottom_when_not_scrolled :: proc(t: ^testing.T) {
 	testing.expect_value(t, conversation_glyph_row(storage, 8, scratch[:]), "30                  ")
 	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), "26                  ")
 }
+
+// A resumed session can carry hundreds of wrapped entries. Every one of them
+// must still solve: when a wrapped text node reported its max-content width as
+// overflow, one bogus diagnostic per entry filled the frame's bounded
+// diagnostics pool and left a resumed session with no frame at all.
+@(test)
+test_conversation_solves_a_long_transcript :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	for value in 0 ..< 200 {
+		snap_append(app, .User, fmt.tprintf("message %d with enough words to wrap across a few columns", value))
+	}
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+
+	testing.expect(t, conversation_render(t, app, storage, 40, 20), "a long transcript must still solve")
+}

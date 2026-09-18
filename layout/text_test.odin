@@ -166,6 +166,55 @@ test_text_wrapping_and_line_geometry :: proc(t: ^testing.T) {
 	_expect_close(t, lines[1].position.y, 32)
 }
 
+// A wrapped text node's horizontal extent is its widest rendered line, not its
+// max-content width. content_size.x stays at max-content as the preferred size
+// for a later width pass, so diagnosing it as rendered content reports an
+// overflow the wrapping already resolved: one bogus diagnostic per text node,
+// which fills a bounded diagnostics pool and fails the whole frame.
+@(test)
+test_wrapped_text_does_not_report_horizontal_overflow :: proc(t: ^testing.T) {
+	ctx: Context
+	testing.expect_value(t, init(&ctx, _test_options()), nil)
+	defer destroy(&ctx)
+
+	set_services(&ctx, _services())
+	if frame(&ctx, {400, 400}) {
+		if element(&ctx, {layout = {sizing = {fixed(100), fit()}}}) {
+			text(&ctx, {text = "aaa bbb ccc ddd"})
+		}
+	}
+	wrapped, wrapped_error := result(&ctx)
+	testing.expect_value(t, wrapped_error, Frame_Error.None)
+	_expect_close(t, wrapped.nodes[2].scroll_range.x, 0)
+	for diagnostic in diagnostics(&ctx) {
+		testing.expectf(
+			t,
+			!(diagnostic.kind == .Overflow && diagnostic.node == 2 && diagnostic.axis == .X),
+			"a wrapped text node must not report horizontal overflow",
+		)
+	}
+
+	// A run the box constrains past its longest unbreakable word still overflows,
+	// measured by the widest line rather than by the max-content width.
+	set_services(&ctx, _services())
+	if frame(&ctx, {400, 400}) {
+		if element(&ctx, {layout = {flow = .Column, align = .Stretch, sizing = {fixed(100), fit()}}}) {
+			text(&ctx, {text = "aaaaaaaaaaaaaaaaaaaa", sizing = {grow(), fit()}})
+		}
+	}
+	over, over_error := result(&ctx)
+	testing.expect_value(t, over_error, Frame_Error.None)
+	_expect_close(t, over.nodes[2].scroll_range.x, 100)
+	found := false
+	for diagnostic in diagnostics(&ctx) {
+		if diagnostic.kind == .Overflow && diagnostic.node == 2 && diagnostic.axis == .X {
+			found = true
+			_expect_close(t, diagnostic.amount, 100)
+		}
+	}
+	testing.expect(t, found, "an unbreakable run wider than the box must report overflow")
+}
+
 @(test)
 test_text_measurement_cache_and_missing_services :: proc(t: ^testing.T) {
 	calls := 0
