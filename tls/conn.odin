@@ -151,6 +151,13 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 	handshake_encode_header(.Client_Hello, body_length, message)
 	if err := send_message(conn, message); err != .None { return err }
 
+	// A client that named a session id is running in compatibility mode, and the mode
+	// requires a change cipher spec right after the ClientHello so that a middlebox
+	// which does not know TLS 1.3 follows the handshake (RFC 8446 section D.4).
+	change_cipher_spec := conn.message[:1]
+	change_cipher_spec[0] = 1
+	if err := send_record(conn, .Change_Cipher_Spec, change_cipher_spec); err != .None { return err }
+
 	hello_message, hello_err := handshake_next(conn)
 	if hello_err != .None { return hello_err }
 	hello_type, _, decoded := handshake_decode_header(hello_message)
