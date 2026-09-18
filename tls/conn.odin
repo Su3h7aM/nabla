@@ -354,7 +354,10 @@ read_record :: proc(conn: ^Conn) -> (content: []u8, record_type: Record_Type, er
 		conn.recv_filled = 0
 		if fill_err := recv_fill(conn, RECORD_HEADER_SIZE); fill_err != .None { return nil, {}, fill_err }
 		outer_type, length, decoded := record_decode_header(conn.recv[:RECORD_HEADER_SIZE])
-		if !decoded || length > MAX_CIPHERTEXT_RECORD { return nil, {}, .Record }
+		if !decoded { return nil, {}, fail(conn, .Decode_Error, .Record) }
+		// A record longer than the protocol allows ends the connection, and the size
+		// is what the peer is told (RFC 8446 section 5.2).
+		if length > MAX_CIPHERTEXT_RECORD { return nil, {}, fail(conn, .Record_Overflow, .Record) }
 		if fill_err := recv_fill(conn, RECORD_HEADER_SIZE + length); fill_err != .None { return nil, {}, fill_err }
 
 		record := conn.recv[:RECORD_HEADER_SIZE + length]
@@ -368,9 +371,11 @@ read_record :: proc(conn: ^Conn) -> (content: []u8, record_type: Record_Type, er
 			// Once the handshake keys are live, everything but a change cipher
 			// spec is protected, and an unprotected record would be a message
 			// anyone could have written.
-			if outer_type != .Application_Data { return nil, {}, .Record }
+			if outer_type != .Application_Data { return nil, {}, fail(conn, .Unexpected_Message, .Record) }
 			inner, inner_type, opened := record_unprotect(conn.suite, &conn.read_key, record)
-			if !opened { return nil, {}, .Record }
+			// A record that does not authenticate ends the connection too (RFC 8446
+			// section 5.2).
+			if !opened { return nil, {}, fail(conn, .Bad_Record_Mac, .Record) }
 			payload, content_type = inner, inner_type
 		} else {
 			decoded_payload, plain_type, plain_decoded := record_decode(record)
@@ -485,6 +490,14 @@ handshake_available :: proc(conn: ^Conn) -> []u8 {
 }
 
 // --- answers to what the peer said ---
+
+// fail tells the peer which rule it broke and reports the failure, which is what the
+// protocol asks of the side that finds a violation (RFC 8446 section 6.2).
+fail :: proc(conn: ^Conn, description: Alert_Description, err: Error) -> Error {
+	alert: [2]u8 = {u8(Alert_Level.Fatal), u8(description)}
+	_ = send_record(conn, .Alert, alert[:])
+	return err
+}
 
 // alert_report records the peer's alert and reports how the connection ended. A
 // close_notify is the end of the stream, and anything else is the peer refusing.

@@ -8,7 +8,7 @@ import "core:testing"
 Fixture :: struct {
 	incoming: []u8,
 	at:       int,
-	outgoing: int,
+	outgoing: [dynamic]u8,
 }
 
 fixture_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) {
@@ -23,7 +23,7 @@ fixture_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) 
 
 fixture_write :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) {
 	fixture := cast(^Fixture)user_data
-	fixture.outgoing += len(buffer)
+	append(&fixture.outgoing, ..buffer)
 	return len(buffer), true
 }
 
@@ -40,6 +40,7 @@ test_a_peer_that_refuses_the_handshake_is_reported :: proc(t: ^testing.T) {
 	}
 	for refusal in REFUSALS {
 		fixture := Fixture{incoming = refusal}
+		defer delete(fixture.outgoing)
 		conn, init_err := init(
 			{read = fixture_read, write = fixture_write, user_data = &fixture},
 			{allocator = context.allocator},
@@ -49,6 +50,31 @@ test_a_peer_that_refuses_the_handshake_is_reported :: proc(t: ^testing.T) {
 
 		testing.expect_value(t, handshake(conn, "example.com", nil), Error.Alert)
 		testing.expect_value(t, conn.peer_alert, refusal[len(refusal) - 1])
-		testing.expect(t, fixture.outgoing > 0, "the client sent no ClientHello")
+		testing.expect(t, len(fixture.outgoing) > 0, "the client sent no ClientHello")
 	}
+}
+
+// A record the protocol does not allow is answered with the alert that names it, so the
+// peer learns which rule it broke rather than seeing a bare close (RFC 8446 section 5.2).
+@(test)
+test_a_record_over_the_protocol_limit_is_refused_with_an_alert :: proc(t: ^testing.T) {
+	// The record header alone: an application data record claiming more than a record may
+	// hold.
+	overflow := []u8{23, 3, 3, 0x41, 0x01}
+	fixture := Fixture{incoming = overflow}
+	defer delete(fixture.outgoing)
+
+	conn, init_err := init(
+		{read = fixture_read, write = fixture_write, user_data = &fixture},
+		{allocator = context.allocator},
+	)
+	if !testing.expect(t, init_err == .None, "a connection could not be prepared") { return }
+	defer destroy(conn)
+
+	testing.expect_value(t, handshake(conn, "example.com", nil), Error.Record)
+
+	// Whatever was written ends with the fatal record_overflow alert, which is 22.
+	written := fixture.outgoing[:]
+	tail := written[len(written) - 7:]
+	expect_bytes(t, "the alert that ends the connection", tail, []u8{21, 3, 3, 0, 2, u8(Alert_Level.Fatal), u8(Alert_Description.Record_Overflow)})
 }
