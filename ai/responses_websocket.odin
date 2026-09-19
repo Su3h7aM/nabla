@@ -71,6 +71,10 @@ Provider_Request_Freeze_WebSocket :: proc(request: Provider_Request, allocator :
 	}, {}
 }
 
+// Provider_WebSocket_Connect binds this operation's interruption and deadline to
+// the session's socket and opens the connection when it is not open yet. Every
+// request clears the binding again when it returns, so the probe never outlives the
+// operation that owns it.
 Provider_WebSocket_Connect :: proc(
 	session: ^Provider_WebSocket_Session,
 	encoded: Provider_Encoded_Request,
@@ -84,7 +88,11 @@ Provider_WebSocket_Connect :: proc(
 		deadline  = options.deadline,
 	}
 	if session.socket != nil { return {} }
-	return provider_websocket_dial(session, encoded, options)
+	if dial_err := provider_websocket_dial(session, encoded, options); dial_err.kind != .None {
+		session.control = {}
+		return dial_err
+	}
+	return {}
 }
 
 // Provider_WebSocket_Request performs one sequential Responses operation. A valid
@@ -123,6 +131,9 @@ Provider_WebSocket_Request :: proc(
 	defer Provider_Event_Destroy(&state.completion, allocator)
 	defer Provider_Stream_Destroy(&state.stream)
 	defer provider_state_release(&state)
+	// The probe binding names interruption storage that belongs to this operation, so
+	// it is cleared before the session can outlive it.
+	defer session.control = {}
 
 	if write_err := websocket.write(session.socket, .Text, encoded.Body); write_err != .None {
 		provider_websocket_drop(session)
@@ -163,8 +174,9 @@ Provider_WebSocket_Request :: proc(
 			provider_emit_error(&state, .Invalid_Data, provider_stream_error_text(stream_err))
 		}
 		if state.failed {
+			provider_websocket_drop(session)
 			err := provider_terminal_error(&state, .Stream)
-			err.delivery = .Terminal_Observed
+			err.delivery = delivery
 			return err
 		}
 		if state.stream.Phase == .Completed && state.completion != nil {
