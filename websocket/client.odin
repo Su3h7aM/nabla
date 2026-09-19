@@ -61,11 +61,15 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 		return nil, Dial_Failure{kind = .Exchange, detail = strings.clone("the URL is not a ws or wss one", allocator)}
 	}
 
+	if detail := handshake_headers_invalid(options.headers); detail != "" {
+		return nil, Dial_Failure{kind = .Exchange, detail = strings.clone(detail, allocator)}
+	}
+
 	nonce: [NONCE_ENCODED_SIZE]u8
 	key := nonce_generate(nonce[:])
 
-	// The caller's fields come first, so a field both supply is written once, by the
-	// caller.
+	// Protocol-owned fields are appended after caller fields only after validation
+	// has established that the caller did not state another value for them.
 	headers := make([dynamic]client.Header, 0, len(options.headers) + 4, allocator)
 	defer delete(headers)
 	append(&headers, ..options.headers)
@@ -91,7 +95,7 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 		return nil, Dial_Failure{kind = kind, cause = exchange_failure.cause, status = exchange_failure.status, detail = exchange_failure.detail}
 	}
 
-	if accept_failure := response_accepts(upgraded, key, allocator); accept_failure.kind != .None {
+	if accept_failure := response_accepts(upgraded, key, options.headers, allocator); accept_failure.kind != .None {
 		client.upgraded_destroy(upgraded)
 		return nil, accept_failure
 	}
@@ -128,7 +132,7 @@ http_url :: proc(url: string, allocator: mem.Allocator) -> (converted: string, o
 // response_accepts reports why a response does not accept the handshake request.
 // RFC 6455 4.1 makes each of these a failure of the WebSocket connection, because a
 // connection that was not accepted is not a WebSocket.
-response_accepts :: proc(upgraded: ^client.Upgraded, key: string, allocator: mem.Allocator) -> Dial_Failure {
+response_accepts :: proc(upgraded: ^client.Upgraded, key: string, request_headers: []client.Header, allocator: mem.Allocator) -> Dial_Failure {
 	upgrade, has_upgrade := http.headers_get_unsafe(upgraded.headers, "upgrade")
 	if !has_upgrade || !field_has_token(upgrade, "websocket") {
 		return response_refusal(allocator, "the response does not upgrade the connection to websocket")
@@ -142,7 +146,39 @@ response_accepts :: proc(upgraded: ^client.Upgraded, key: string, allocator: mem
 	if !has_accept || accept != string(expected[:]) {
 		return response_refusal(allocator, "the response does not accept the key this client sent")
 	}
+	if _, has_extensions := http.headers_get_unsafe(upgraded.headers, "sec-websocket-extensions"); has_extensions {
+		return response_refusal(allocator, "the response selected a WebSocket extension this client did not offer")
+	}
+	if protocol, has_protocol := http.headers_get_unsafe(upgraded.headers, "sec-websocket-protocol"); has_protocol {
+		selected := http.trim_ows(protocol)
+		if selected == "" || strings.contains(selected, ",") || !protocol_offered(request_headers, selected) {
+			return response_refusal(allocator, "the response selected a WebSocket protocol this client did not offer")
+		}
+	}
 	return {}
+}
+
+handshake_headers_invalid :: proc(headers: []client.Header) -> string {
+	for header in headers {
+		switch {
+		case strings.equal_fold(header.name, "upgrade"),
+		     strings.equal_fold(header.name, "connection"),
+		     strings.equal_fold(header.name, "sec-websocket-key"),
+		     strings.equal_fold(header.name, "sec-websocket-version"):
+			return "the WebSocket handshake owns its Upgrade, Connection, key, and version fields"
+		case strings.equal_fold(header.name, "sec-websocket-extensions"):
+			return "WebSocket extensions are not supported"
+		}
+	}
+	return ""
+}
+
+protocol_offered :: proc(headers: []client.Header, selected: string) -> bool {
+	for header in headers {
+		if !strings.equal_fold(header.name, "sec-websocket-protocol") { continue }
+		if field_has_token(header.value, selected) { return true }
+	}
+	return false
 }
 
 response_refusal :: proc(allocator: mem.Allocator, detail: string) -> Dial_Failure {
