@@ -15,7 +15,6 @@ Provider_WebSocket_Session :: struct {
 	socket:     ^websocket.Conn,
 	control:    HTTP_Control,
 	allocator:  mem.Allocator,
-	generation: u64,
 }
 
 Provider_WebSocket_Session_Open :: proc(
@@ -214,7 +213,6 @@ provider_websocket_dial :: proc(
 		return result
 	}
 	session.socket = socket
-	session.generation += 1
 	return {}
 }
 
