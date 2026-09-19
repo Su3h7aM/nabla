@@ -429,6 +429,7 @@ refresh_status :: proc(app: ^App) {
 		status.session_input_present = false
 		status.session_cache_present = false
 		status.session_hit_measured = false
+		status.session_hit_partial = false
 	} else {
 		if totals.input_requests > 0 {
 			status.session_input = totals.input
@@ -445,6 +446,10 @@ refresh_status :: proc(app: ^App) {
 		rate, measured := session.cache_hit_rate(totals)
 		status.session_hit_rate = rate
 		status.session_hit_measured = measured
+		status.session_hit_partial = false
+		if share, coverage_measured := session.cache_coverage(totals); coverage_measured && share < 1 {
+			status.session_hit_partial = true
+		}
 	}
 	if status.cwd != running.workspace {
 		delete(status.cwd, app.run.alloc)

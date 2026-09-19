@@ -92,8 +92,12 @@ chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms:
 		return
 	}
 	rate_text := ""
-	if rate, measured := session.cache_hit_rate(totals); measured {
-		rate_text = fmt.tprintf(" (%.1f%% hit)", rate * 100)
+	if rate, rate_measured := session.cache_hit_rate(totals); rate_measured {
+		if share, coverage_measured := session.cache_coverage(totals); coverage_measured && share < 1 {
+			rate_text = fmt.tprintf(" (%.1f%% hit over %.0f%% of input)", rate * 100, share * 100)
+		} else {
+			rate_text = fmt.tprintf(" (%.1f%% hit)", rate * 100)
+		}
 	}
 	chat_status_line(
 		observer,

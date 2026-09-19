@@ -68,6 +68,9 @@ Status :: struct {
 	session_cache_present: bool,
 	session_hit_rate:      f64,
 	session_hit_measured:  bool,
+	// session_hit_partial says the rate rests on part of the session's input,
+	// because some finished requests reported no cache usage.
+	session_hit_partial:   bool,
 	running:               bool,
 	// The retry the turn is waiting for, while it waits for one. The attempt numbers come
 	// from the retry the agent scheduled, and the due time is when the harness sends

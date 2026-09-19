@@ -29,20 +29,38 @@ Usage :: struct {
 // included by default: hiding them would flatter the hit rate rather than
 // measure the session. A caller that wants the warm-period numbers filters by
 // purpose or outcome in the same query and says so.
+//
+// paired_input and paired_read are the sums over the requests that reported both
+// numbers, which is the only population a hit rate may be measured from: a
+// request whose cache usage is unknown says nothing about the ones that reported.
 Cache_Totals :: struct {
 	input:                i64,
 	cache_read:           i64,
 	cache_write:          i64,
 	output:               i64,
+	paired_input:         i64,
+	paired_read:          i64,
 	// Requests each summed bucket rests on. A bucket the provider never
 	// reported has no denominator of its own; its count stays zero.
 	input_requests:       int,
 	cache_read_requests:  int,
 	cache_write_requests: int,
 	output_requests:      int,
+	// requests counts every finished request, paired_requests those the hit rate
+	// rests on, missing_requests those that reported tokens but no cache bucket,
+	// and invalid_requests those whose stored numbers cannot be used.
+	requests:             int,
+	paired_requests:      int,
+	missing_requests:     int,
+	invalid_requests:     int,
 }
 
 cache_totals_add :: proc(totals: ^Cache_Totals, usage: Usage) {
+	totals.requests += 1
+	if usage_invalid(usage) {
+		totals.invalid_requests += 1
+		return
+	}
 	if value, present := usage.input.?; present {
 		totals.input += value
 		totals.input_requests += 1
@@ -50,6 +68,16 @@ cache_totals_add :: proc(totals: ^Cache_Totals, usage: Usage) {
 	if value, present := usage.cache_read.?; present {
 		totals.cache_read += value
 		totals.cache_read_requests += 1
+	}
+	input, input_present := usage.input.?
+	read, read_present := usage.cache_read.?
+	if input_present && read_present {
+		totals.paired_input += input
+		totals.paired_read += read
+		totals.paired_requests += 1
+	}
+	if _, write_present := usage.cache_write.?; !read_present && !write_present {
+		totals.missing_requests += 1
 	}
 	if value, present := usage.cache_write.?; present {
 		totals.cache_write += value
@@ -61,6 +89,15 @@ cache_totals_add :: proc(totals: ^Cache_Totals, usage: Usage) {
 	}
 }
 
+// usage_invalid reports a stored measurement no accounting may use: a token count
+// is never negative, and a session that reads one cannot trust the row it came from.
+usage_invalid :: proc(usage: Usage) -> bool {
+	for bucket in ([]Maybe(i64){usage.input, usage.output, usage.cache_read, usage.cache_write}) {
+		if value, present := bucket.?; present && value < 0 { return true }
+	}
+	return false
+}
+
 // cache_hit_rate is the token-weighted share of reported input read from the
 // provider's cache: cache-read tokens over all reported input tokens. It counts
 // a session, not a request, because one request's ratio says more about where it
@@ -69,13 +106,22 @@ cache_totals_add :: proc(totals: ^Cache_Totals, usage: Usage) {
 // how stable its prefixes are, so callers pair this with the suffix size before
 // treating it as a regression signal.
 //
-// A read count larger than the total is not a rate, so it is reported as
-// unmeasured rather than as a number over 100%: that shape means an adapter
-// recorded uncached input without normalizing it.
+// Only the requests that reported both an input total and a cache-read count are
+// measured. Treating an unreported cache count as a miss would report a lower rate
+// than the session actually achieved, which is what cache_coverage exists to make
+// visible.
 cache_hit_rate :: proc(totals: Cache_Totals) -> (rate: f64, measured: bool) {
-	if totals.input_requests == 0 || totals.cache_read_requests == 0 || totals.input <= 0 { return 0, false }
-	if totals.cache_read > totals.input { return 0, false }
-	return f64(totals.cache_read) / f64(totals.input), true
+	if totals.paired_requests == 0 || totals.paired_input <= 0 { return 0, false }
+	if totals.paired_read > totals.paired_input { return 0, false }
+	return f64(totals.paired_read) / f64(totals.paired_input), true
+}
+
+// cache_coverage is the share of reported input tokens the hit rate rests on. A
+// rate from part of a session is a rate for that part, and a reader that cannot see
+// the coverage cannot tell the difference.
+cache_coverage :: proc(totals: Cache_Totals) -> (share: f64, measured: bool) {
+	if totals.input_requests == 0 || totals.input <= 0 { return 0, false }
+	return f64(totals.paired_input) / f64(totals.input), true
 }
 
 // New_Request is a model request about to begin. The input description is

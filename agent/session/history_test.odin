@@ -406,24 +406,54 @@ test_cache_totals_sum_finished_requests_and_skip_running :: proc(t: ^testing.T) 
 	testing.expect_value(t, totals.cache_read_requests, 1)
 	testing.expect_value(t, totals.cache_write_requests, 1)
 	testing.expect_value(t, totals.output_requests, 2)
+	testing.expect_value(t, totals.requests, 2)
+	testing.expect_value(t, totals.paired_requests, 1)
+	testing.expect_value(t, totals.invalid_requests, 0)
+	testing.expect_value(t, totals.paired_input, i64(100))
+	testing.expect_value(t, totals.paired_read, i64(90))
 
+	// The second request reported no cache read, so it cannot say the first one
+	// missed: the rate comes from the pair that reported both numbers.
 	rate, measured := cache_hit_rate(totals)
-	testing.expect(t, measured, "two finished requests with input and one cache read are measurable")
-	testing.expect(t, rate > 0.59 && rate < 0.61, "90 of 150 input tokens is a 60% hit rate")
+	testing.expect(t, measured, "a request that reported input and cache read is measurable")
+	testing.expect(t, rate > 0.89 && rate < 0.91, "90 of 100 paired input tokens is a 90% hit rate")
+
+	share, share_measured := cache_coverage(totals)
+	testing.expect(t, share_measured, "the paired input is part of a reported input total")
+	testing.expect(t, share > 0.66 && share < 0.67, "100 of 150 input tokens is 67% coverage")
 
 	// Nothing reported: no input denominator, no hit rate to show.
 	empty := Cache_Totals{}
 	_, empty_measured := cache_hit_rate(empty)
 	testing.expect(t, !empty_measured, "unknown usage must stay unknown, not zero")
+	_, empty_share_measured := cache_coverage(empty)
+	testing.expect(t, !empty_share_measured, "a session with no reported input has no coverage")
 
-	// A read count larger than the total is not a rate: it means an adapter
+	// A row that reported tokens but no cache bucket says nothing about the
+	// cache, so the rate may not read it as a miss; a negative count is not a
+	// measurement at all, so its row is refused whole rather than folded in.
+	sparse: Cache_Totals
+	cache_totals_add(&sparse, Usage{input = 5, output = 1})
+	testing.expect_value(t, sparse.missing_requests, 1)
+	testing.expect_value(t, sparse.paired_requests, 0)
+	_, sparse_measured := cache_hit_rate(sparse)
+	testing.expect(t, !sparse_measured, "a row with no cache bucket must not read as a miss")
+
+	cache_totals_add(&sparse, Usage{input = 10, cache_read = -1})
+	testing.expect_value(t, sparse.requests, 2)
+	testing.expect_value(t, sparse.invalid_requests, 1)
+	testing.expect_value(t, sparse.input, i64(5))
+	testing.expect_value(t, sparse.input_requests, 1)
+
+	// A read count larger than its input total is not a rate: it means an adapter
 	// recorded uncached input without normalizing it, so the number is refused
 	// rather than shown above 100%.
 	inconsistent := Cache_Totals {
-		input               = 10,
-		cache_read          = 20,
-		input_requests      = 1,
-		cache_read_requests = 1,
+		paired_input    = 10,
+		paired_read     = 20,
+		paired_requests = 1,
+		input           = 10,
+		input_requests  = 1,
 	}
 	_, inconsistent_measured := cache_hit_rate(inconsistent)
 	testing.expect(t, !inconsistent_measured)

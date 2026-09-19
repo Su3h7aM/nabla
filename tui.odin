@@ -629,7 +629,10 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 		}
 		cache := "cache n/a"
 		if status.session_hit_measured {
-			cache = fmt.tprintf("cache %.0f%%", status.session_hit_rate * 100)
+			cache = fmt.tprintf("cache %.1f%%", status.session_hit_rate * 100)
+			// A rate measured over part of the session is not the session's rate, and
+			// the footer is the only place a reader can see that from.
+			if status.session_hit_partial { cache = fmt.tprintf("%s (partial)", cache) }
 		} else if status.session_cache_present {
 			cache = fmt.tprintf("cache %dk", (status.session_cache_read + 512) / 1024)
 		}
