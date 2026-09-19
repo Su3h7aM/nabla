@@ -100,6 +100,20 @@ Provider_Delivery_State :: enum {
 	Terminal_Observed,
 }
 
+provider_delivery_state_name :: proc(state: Provider_Delivery_State) -> string {
+	switch state {
+	case .None:
+		return "none"
+	case .Model_Send_Started:
+		return "model_send_started"
+	case .Response_Observed:
+		return "response_observed"
+	case .Terminal_Observed:
+		return "terminal_observed"
+	}
+	return "none"
+}
+
 Provider_Operation_Error :: struct {
 	kind:                Provider_Operation_Error_Kind,
 	// delivery is how far a model request observably progressed. Once sending

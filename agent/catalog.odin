@@ -78,6 +78,18 @@ Provider_Transport :: enum {
 	Auto,
 }
 
+provider_transport_name :: proc(transport: Provider_Transport) -> string {
+	switch transport {
+	case .HTTP:
+		return "http"
+	case .WebSocket:
+		return "websocket"
+	case .Auto:
+		return "auto"
+	}
+	return "http"
+}
+
 Catalog_Provider_Source :: struct {
 	id:                string,
 	base_url_present:  bool,

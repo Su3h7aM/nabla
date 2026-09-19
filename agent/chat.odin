@@ -272,11 +272,12 @@ chat_perform_request :: proc(
 
 	// What the harness intends to send is recorded before it is stored, so a
 	// request that never reaches the store still says what it was going to carry.
-	prepared := [8]Log_Field {
+	prepared := [9]Log_Field {
 		{key = "purpose", value = session.request_purpose_name(.Response)},
 		{key = "provider", value = chat.provider_id},
 		{key = "model", value = chat.model_id},
 		{key = "api", value = chat_api_name(connection.API)},
+		{key = "transport", value = websocket_request ? "websocket" : "http"},
 		{key = "estimate", value = i64(prep.estimate)},
 		{key = "context_window", value = i64(chat.capacity.window)},
 		{key = "messages", value = i64(len(prep.history.entries))},
@@ -427,8 +428,11 @@ chat_perform_request :: proc(
 			declared_body_bytes = i64(provider_log.transfer.declared_body_bytes)
 			declared_body_bytes_present = provider_log.transfer.declared_body_bytes_present
 		}
-		finished := [13]Log_Field {
+		delivery_name := ai.provider_delivery_state_name(operation_error.delivery)
+		if websocket_request && operation_error.kind == .None { delivery_name = ai.provider_delivery_state_name(.Terminal_Observed) }
+		finished := [14]Log_Field {
 			{key = "error_kind", value = ai.provider_operation_error_name(operation_error.kind)},
+			{key = "delivery", value = delivery_name},
 			{key = "finish_reason", value = chat_finish_reason_text(runtime.finish_reason)},
 			{key = "status", value = i64(operation_error.status)},
 			// The provider's own message, which for a refused request is the only
