@@ -249,7 +249,10 @@ Provider_Completed_Event :: struct {
 	// encoder drops the output-only fields the input schema refuses. This is
 	// the lossless-replay record; Tool_Calls stays the execution view.
 	Raw_Output:  string, // owned by receiver,
-} // Tool_Calls and Raw_Output owned by receiver
+	// Response_ID is the provider response identity when one was present. It is
+	// connection-local continuation evidence, not durable conversation state.
+	Response_ID: string, // owned by receiver,
+} // Tool_Calls, Raw_Output, and Response_ID owned by receiver
 Provider_Error_Event :: struct {
 	Kind:          Provider_Error_Kind,
 	Message:       string,
@@ -274,6 +277,7 @@ Provider_Event_Destroy :: proc(event: ^Provider_Event, allocator := context.allo
 	case Provider_Completed_Event:
 		if value.Reason_Text != "" { delete(value.Reason_Text, allocator) }
 		if value.Raw_Output != "" { delete(value.Raw_Output, allocator) }
+		if value.Response_ID != "" { delete(value.Response_ID, allocator) }
 		for call in value.Tool_Calls {
 			if call.ID != "" { delete(call.ID, allocator) }
 			if call.Item_ID != "" { delete(call.Item_ID, allocator) }
@@ -461,6 +465,16 @@ Provider_Encode_Request :: proc(request: Provider_Request, allocator := context.
 	case .Invalid:
 	}
 	return "", .Unsupported_API
+}
+
+Provider_Consume_Event_JSON :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
+	if state == nil { return .Invalid_State }
+	if state^.Batch_Count > 0 { return .Batch_Not_Drained }
+	if state^.API != .OpenAI_Responses {
+		state^.Phase = .Failed
+		return provider_stream_fail(state, .Invalid_Data, "API family has no JSON event transport", .Unsupported_API)
+	}
+	return openai_responses_consume_event(payload, state)
 }
 
 Provider_Consume_SSE_Data :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {

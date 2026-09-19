@@ -122,6 +122,20 @@ test_responses_websocket_encode_uses_event_envelope_without_http_stream_field ::
 }
 
 @(test)
+test_responses_json_event_decoder_retains_response_identity :: proc(t: ^testing.T) {
+	state := Provider_Stream_Start(.OpenAI_Responses, context.temp_allocator)
+	defer Provider_Stream_Destroy(&state)
+	err := Provider_Consume_Event_JSON(`{"type":"response.completed","response":{"id":"resp_123","status":"completed","output":[]}}`, &state)
+	if !testing.expect_value(t, err, Provider_Stream_Error.None) { return }
+	events := drain_events(&state)
+	defer destroy_events(events)
+	if !testing.expect_value(t, len(events), 1) { return }
+	completed := expect_event(t, events[0], Provider_Completed_Event)
+	testing.expect_value(t, completed.Response_ID, "resp_123")
+	testing.expect_value(t, state.Phase, Provider_Stream_Phase.Completed)
+}
+
+@(test)
 test_responses_encode_removes_output_status_from_replay :: proc(t: ^testing.T) {
 	messages := []Provider_Message {
 		{Verbatim_Items = `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[]}]`},
