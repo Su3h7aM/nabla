@@ -55,27 +55,28 @@ MAX_SENT_MESSAGE :: 2048
 // Every buffer is allocated once and reused, so a connection moves no memory while
 // it is in use.
 Conn :: struct {
-	transport:    Transport,
-	config:       Config,
-	suite:        Cipher_Suite,
-	schedule:     Key_Schedule,
-	read_secret:  Secret,
-	write_secret: Secret,
-	read_key:     Traffic_Key,
-	write_key:    Traffic_Key,
-	transcript:   hash.Context,
-	digest:       [MAX_SECRET_SIZE]u8,
-	send:         []u8,
-	message:      []u8,
-	recv:         []u8,
-	recv_filled:  int,
-	stream:       [dynamic]u8,
-	stream_at:    int,
-	payload:      []u8,
-	encrypted:    bool,
-	closed:       bool,
-	alpn:         string,
-	peer_alert:   u8,
+	transport:             Transport,
+	config:                Config,
+	suite:                 Cipher_Suite,
+	schedule:              Key_Schedule,
+	read_secret:           Secret,
+	write_secret:          Secret,
+	read_key:              Traffic_Key,
+	write_key:             Traffic_Key,
+	transcript:            hash.Context,
+	digest:                [MAX_SECRET_SIZE]u8,
+	send:                  []u8,
+	message:               []u8,
+	recv:                  []u8,
+	recv_filled:           int,
+	stream:                [dynamic]u8,
+	stream_at:             int,
+	payload:               []u8,
+	encrypted:             bool,
+	closed:                bool,
+	certificate_requested: bool,
+	alpn:                  string,
+	peer_alert:            u8,
 }
 
 // init prepares a connection. The transport is the caller's and outlives the
@@ -252,6 +253,9 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 	if !change_cipher_spec_sent {
 		if change_err := send_change_cipher_spec(conn); change_err != .None { return change_err }
 	}
+	if conn.certificate_requested {
+		if certificate_err := empty_certificate_send(conn); certificate_err != .None { return certificate_err }
+	}
 	if finished_err := handshake_client_finished(conn); finished_err != .None { return finished_err }
 
 	client_application, server_application: Secret
@@ -279,6 +283,14 @@ handshake_server_flight :: proc(conn: ^Conn, server_name: string, alpn: []string
 	certificate_message, certificate_err := handshake_next(conn)
 	if certificate_err != .None { return certificate_err }
 	certificate_type, _, certificate_decoded := handshake_decode_header(certificate_message)
+	if certificate_decoded && certificate_type == .Certificate_Request {
+		if !certificate_request_read(certificate_message) { return fail(conn, .Decode_Error, .Handshake) }
+		hash.update(&conn.transcript, certificate_message)
+		conn.certificate_requested = true
+		certificate_message, certificate_err = handshake_next(conn)
+		if certificate_err != .None { return certificate_err }
+		certificate_type, _, certificate_decoded = handshake_decode_header(certificate_message)
+	}
 	if !certificate_decoded || certificate_type != .Certificate { return .Handshake }
 	chain, chain_decoded := certificate_chain_decode(certificate_message[HANDSHAKE_HEADER_SIZE:], conn.config.allocator)
 	defer certificate_chain_destroy(&chain)
@@ -305,6 +317,48 @@ handshake_server_flight :: proc(conn: ^Conn, server_name: string, alpn: []string
 	}
 	hash.update(&conn.transcript, finished_message)
 	return .None
+}
+
+// certificate_request_read validates a main-handshake request. This client has no
+// credential to select, but a legal request is answered with an empty Certificate.
+certificate_request_read :: proc(message: []u8) -> bool {
+	message_type, length, decoded := handshake_decode_header(message)
+	if !decoded || message_type != .Certificate_Request || length != len(message) - HANDSHAKE_HEADER_SIZE {
+		return false
+	}
+
+	body := Reader {
+		data = message[HANDSHAKE_HEADER_SIZE:],
+		ok   = true,
+	}
+	request_context := read_section_u8(&body)
+	if !request_context.ok || len(request_context.data) != 0 { return false }
+	extensions := read_section_u16(&body)
+	has_signature_algorithms := false
+	for extensions.ok && extensions.at < len(extensions.data) {
+		start := extensions.at
+		extension_type := Extension_Type(read_u16(&extensions))
+		if extension_seen(extensions.data[:start], extension_type) { return false }
+		extension := read_section_u16(&extensions)
+		if extension_type == .Signature_Algorithms {
+			schemes := read_section_u16(&extension)
+			if !schemes.ok || len(schemes.data) == 0 || len(schemes.data) % 2 != 0 {
+				return false
+			}
+			has_signature_algorithms = true
+		} else {
+			extension.at = len(extension.data)
+		}
+		if !extension.ok || extension.at != len(extension.data) { return false }
+	}
+	return has_signature_algorithms && body.ok && body.at == len(body.data) && extensions.ok && extensions.at == len(extensions.data)
+}
+
+empty_certificate_send :: proc(conn: ^Conn) -> Error {
+	message := conn.message[:HANDSHAKE_HEADER_SIZE + 4]
+	handshake_encode_header(.Certificate, 4, message)
+	mem.zero_slice(message[HANDSHAKE_HEADER_SIZE:])
+	return send_message(conn, message)
 }
 
 // handshake_client_finished proves the handshake to the server, over the transcript

@@ -13,6 +13,7 @@ Handshake_Type :: enum u8 {
 	New_Session_Ticket   = 4,
 	Encrypted_Extensions = 8,
 	Certificate          = 11,
+	Certificate_Request  = 13,
 	Certificate_Verify   = 15,
 	Finished             = 20,
 	Key_Update           = 24,

@@ -30,17 +30,19 @@ SERVER_STARTUP_TIMEOUT :: 10 * time.Second
 // HelloRetryRequest, and secp256r1 is the group this client offers without sending a
 // share for it, so that case only completes when the retry is answered.
 Peer :: struct {
-	openssl_suite: string,
-	openssl_group: string,
-	suite:         tls.Cipher_Suite,
+	openssl_suite:       string,
+	openssl_group:       string,
+	suite:               tls.Cipher_Suite,
+	request_certificate: bool,
 }
 
 PEERS := [?]Peer {
-	{"TLS_AES_128_GCM_SHA256", "X25519", .AES_128_GCM_SHA256},
-	{"TLS_CHACHA20_POLY1305_SHA256", "X25519", .CHACHA20_POLY1305_SHA256},
-	{"TLS_AES_256_GCM_SHA384", "X25519", .AES_256_GCM_SHA384},
-	{"TLS_AES_128_GCM_SHA256", "P-256", .AES_128_GCM_SHA256},
-	{"TLS_AES_256_GCM_SHA384", "P-256", .AES_256_GCM_SHA384},
+	{"TLS_AES_128_GCM_SHA256", "X25519", .AES_128_GCM_SHA256, false},
+	{"TLS_CHACHA20_POLY1305_SHA256", "X25519", .CHACHA20_POLY1305_SHA256, false},
+	{"TLS_AES_256_GCM_SHA384", "X25519", .AES_256_GCM_SHA384, false},
+	{"TLS_AES_128_GCM_SHA256", "P-256", .AES_128_GCM_SHA256, false},
+	{"TLS_AES_256_GCM_SHA384", "P-256", .AES_256_GCM_SHA384, false},
+	{"TLS_AES_128_GCM_SHA256", "X25519", .AES_128_GCM_SHA256, true},
 }
 
 Connection :: struct {
@@ -83,7 +85,7 @@ main :: proc() {
 		port, port_ok := free_port()
 		if !check(port_ok, "no free port could be found") { os.exit(1) }
 
-		server, server_ok := start_server(port, peer.openssl_suite, peer.openssl_group)
+		server, server_ok := start_server(port, peer)
 		if !check(server_ok, "openssl s_server could not be started") { os.exit(1) }
 
 		run_client(port, peer)
@@ -98,7 +100,7 @@ main :: proc() {
 	}
 
 	if failures > 0 { os.exit(1) }
-	fmt.println("ok: the handshake completed against openssl s_server, for every suite and group")
+	fmt.println("ok: the handshake completed against openssl s_server, including retry and optional client authentication")
 }
 
 run_client :: proc(port: int, expected: Peer) {
@@ -131,7 +133,14 @@ run_client :: proc(port: int, expected: Peer) {
 	if err := tls.handshake(conn, "localhost", []string{ALPN}); err != tls.Error.None {
 		check(
 			false,
-			fmt.tprintf("the handshake with %s over %s failed: %v (peer alert %v)", expected.openssl_suite, expected.openssl_group, err, conn.peer_alert),
+			fmt.tprintf(
+				"the handshake with %s over %s failed: %v (peer alert %v, certificate requested %v)",
+				expected.openssl_suite,
+				expected.openssl_group,
+				err,
+				conn.peer_alert,
+				conn.certificate_requested,
+			),
 		)
 		return
 	}
@@ -183,32 +192,32 @@ generate_certificate :: proc() -> bool {
 	return err == nil && state.exit_code == 0
 }
 
-start_server :: proc(port: int, suite: string, group: string) -> (os.Process, bool) {
-	process, err := os.process_start(
-		{
-			working_dir = DIRECTORY,
-			command = {
-				"openssl",
-				"s_server",
-				"-accept",
-				fmt.tprintf("127.0.0.1:%d", port),
-				"-cert",
-				CERTIFICATE_FILE,
-				"-key",
-				KEY_FILE,
-				"-tls1_3",
-				"-ciphersuites",
-				suite,
-				"-groups",
-				group,
-				"-alpn",
-				ALPN,
-				"-www",
-				"-naccept",
-				"1",
-			},
-		},
+start_server :: proc(port: int, peer: Peer) -> (os.Process, bool) {
+	command := make([dynamic]string, 0, 24, context.temp_allocator)
+	append(
+		&command,
+		"openssl",
+		"s_server",
+		"-accept",
+		fmt.tprintf("127.0.0.1:%d", port),
+		"-cert",
+		CERTIFICATE_FILE,
+		"-key",
+		KEY_FILE,
+		"-tls1_3",
+		"-ciphersuites",
+		peer.openssl_suite,
+		"-groups",
+		peer.openssl_group,
+		"-alpn",
+		ALPN,
+		"-www",
+		"-naccept",
+		"1",
 	)
+	if peer.request_certificate { append(&command, "-verify", "1") }
+
+	process, err := os.process_start({working_dir = DIRECTORY, command = command[:]})
 	return process, err == nil
 }
 

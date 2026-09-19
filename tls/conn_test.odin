@@ -76,6 +76,15 @@ test_a_record_over_the_protocol_limit_is_refused_with_an_alert :: proc(t: ^testi
 }
 
 @(test)
+test_a_main_handshake_certificate_request_can_be_answered_empty :: proc(t: ^testing.T) {
+	request := []u8{u8(Handshake_Type.Certificate_Request), 0, 0, 11, 0, 0, 8, 0, 13, 0, 4, 0, 2, 4, 3}
+	testing.expect(t, certificate_request_read(request), "a legal CertificateRequest was refused")
+
+	without_signature_algorithms := []u8{u8(Handshake_Type.Certificate_Request), 0, 0, 3, 0, 0, 0}
+	testing.expect(t, !certificate_request_read(without_signature_algorithms), "a CertificateRequest without signature algorithms was accepted")
+}
+
+@(test)
 test_encrypted_extensions_select_one_offered_protocol :: proc(t: ^testing.T) {
 	message := []u8{u8(Handshake_Type.Encrypted_Extensions), 0, 0, 11, 0, 9, 0, 16, 0, 5, 0, 3, 2, 'h', '2'}
 	selected, ok := encrypted_extensions_read(message, false, []string{"h2"})
