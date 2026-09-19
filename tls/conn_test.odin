@@ -76,6 +76,17 @@ test_a_record_over_the_protocol_limit_is_refused_with_an_alert :: proc(t: ^testi
 }
 
 @(test)
+test_encrypted_extensions_select_one_offered_protocol :: proc(t: ^testing.T) {
+	message := []u8{u8(Handshake_Type.Encrypted_Extensions), 0, 0, 11, 0, 9, 0, 16, 0, 5, 0, 3, 2, 'h', '2'}
+	selected, ok := encrypted_extensions_read(message, false, []string{"h2"})
+	testing.expect(t, ok, "an offered ALPN selection was refused")
+	testing.expect_value(t, selected, "h2")
+
+	_, unsolicited := encrypted_extensions_read(message, false, []string{"http/1.1"})
+	testing.expect(t, !unsolicited, "an ALPN protocol the client did not offer was accepted")
+}
+
+@(test)
 test_a_requested_key_update_is_answered_before_the_write_key_changes :: proc(t: ^testing.T) {
 	fixture: Fixture
 	defer delete(fixture.outgoing)

@@ -43,7 +43,7 @@ server_hello_decode :: proc(message: []u8) -> (hello: Server_Hello, ok: bool) {
 	for extensions.ok && extensions.at < len(extensions.data) {
 		start := extensions.at
 		extension_type := Extension_Type(read_u16(&extensions))
-		if server_hello_extension_seen(extensions.data[:start], extension_type) { return {}, false }
+		if extension_seen(extensions.data[:start], extension_type) { return {}, false }
 		extension := read_section_u16(&extensions)
 		#partial switch extension_type {
 		case .Supported_Versions:
@@ -69,7 +69,7 @@ server_hello_decode :: proc(message: []u8) -> (hello: Server_Hello, ok: bool) {
 	return hello, r.ok && r.at == len(r.data) && extensions.ok && extensions.at == len(extensions.data)
 }
 
-server_hello_extension_seen :: proc(encoded: []u8, wanted: Extension_Type) -> bool {
+extension_seen :: proc(encoded: []u8, wanted: Extension_Type) -> bool {
 	r := Reader {
 		data = encoded,
 		ok   = true,

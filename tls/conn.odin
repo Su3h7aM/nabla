@@ -234,7 +234,7 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 	if !traffic_key_derive(suite, conn.read_secret[:secret_size(suite)], &conn.read_key) { return .Unsupported }
 	if !traffic_key_derive(suite, conn.write_secret[:secret_size(suite)], &conn.write_key) { return .Unsupported }
 
-	if flight_err := handshake_server_flight(conn, server_name); flight_err != .None { return flight_err }
+	if flight_err := handshake_server_flight(conn, server_name, alpn); flight_err != .None { return flight_err }
 
 	// The client's Finished is the last thing the handshake keys protect, and it
 	// covers the handshake through the server's Finished. The application secrets
@@ -268,21 +268,12 @@ handshake :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 // handshake_server_flight reads what the server says once the handshake keys are
 // live: its extensions, its chain, its proof of the chain's key, and its Finished,
 // in the order the protocol fixes (RFC 8446 section 4.4).
-handshake_server_flight :: proc(conn: ^Conn, server_name: string) -> Error {
+handshake_server_flight :: proc(conn: ^Conn, server_name: string, alpn: []string) -> Error {
 	extensions_message, err := handshake_next(conn)
 	if err != .None { return err }
-	extensions_type, _, decoded := handshake_decode_header(extensions_message)
-	if !decoded || extensions_type != .Encrypted_Extensions { return .Handshake }
-	if negotiated := extension_find(extensions_message[HANDSHAKE_HEADER_SIZE:], .Application_Layer_Protocol_Negotiation); negotiated != nil {
-		protocols := Reader {
-			data = negotiated,
-			ok   = true,
-		}
-		names := read_section_u16(&protocols)
-		first := read_bytes(&names, int(read_u8(&names)))
-		if !names.ok { return .Handshake }
-		conn.alpn = strings.clone(string(first), conn.config.allocator)
-	}
+	negotiated, extensions_ok := encrypted_extensions_read(extensions_message, server_name != "", alpn)
+	if !extensions_ok { return fail(conn, .Decode_Error, .Handshake) }
+	if negotiated != "" { conn.alpn = strings.clone(negotiated, conn.config.allocator) }
 	hash.update(&conn.transcript, extensions_message)
 
 	certificate_message, certificate_err := handshake_next(conn)
@@ -679,20 +670,52 @@ transcript_hash :: proc(conn: ^Conn) -> []u8 {
 	return conn.digest[:size]
 }
 
-// extension_find returns the body of one extension of a message whose whole body is
-// an extension list, and nil when the peer did not send it.
-extension_find :: proc(body: []u8, wanted: Extension_Type) -> []u8 {
-	r := Reader {
-		data = body,
+// encrypted_extensions_read validates the server's extension responses and returns
+// the one application protocol it selected, when it selected one.
+encrypted_extensions_read :: proc(message: []u8, server_name_offered: bool, alpn_offered: []string) -> (negotiated: string, ok: bool) {
+	message_type, length, decoded := handshake_decode_header(message)
+	if !decoded || message_type != .Encrypted_Extensions || length != len(message) - HANDSHAKE_HEADER_SIZE {
+		return "", false
+	}
+
+	body := Reader {
+		data = message[HANDSHAKE_HEADER_SIZE:],
 		ok   = true,
 	}
-	extensions := read_section_u16(&r)
+	extensions := read_section_u16(&body)
 	for extensions.ok && extensions.at < len(extensions.data) {
+		start := extensions.at
 		extension_type := Extension_Type(read_u16(&extensions))
+		if extension_seen(extensions.data[:start], extension_type) { return "", false }
 		extension := read_section_u16(&extensions)
-		if extension_type == wanted && extension.ok { return extension.data }
+		#partial switch extension_type {
+		case .Server_Name:
+			if !server_name_offered || len(extension.data) != 0 { return "", false }
+		case .Supported_Groups:
+			groups := read_section_u16(&extension)
+			if !groups.ok || len(groups.data) == 0 || len(groups.data) % 2 != 0 { return "", false }
+			groups.at = len(groups.data)
+		case .Application_Layer_Protocol_Negotiation:
+			protocols := read_section_u16(&extension)
+			selected := read_bytes(&protocols, int(read_u8(&protocols)))
+			if !protocols.ok || len(selected) == 0 || protocols.at != len(protocols.data) {
+				return "", false
+			}
+			negotiated = string(selected)
+			matched := false
+			for offered in alpn_offered {
+				if offered == negotiated {
+					matched = true
+					break
+				}
+			}
+			if !matched { return "", false }
+		case:
+			return "", false
+		}
+		if !extension.ok || extension.at != len(extension.data) { return "", false }
 	}
-	return nil
+	return negotiated, body.ok && body.at == len(body.data) && extensions.ok && extensions.at == len(extensions.data)
 }
 
 // chain_verify checks the peer's chain against the configured anchors, within their
