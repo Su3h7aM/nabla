@@ -1,6 +1,8 @@
 # Network stack architecture and remaining work
 
-Status: reviewed implementation and continuation plan, revision 4 (2026-09-19).
+Status: reviewed implementation and continuation plan, revision 5 (2026-09-19).
+Section 9 specifies provider WebSocket integration; it is approved design, not implemented
+behavior. Sections 4 and 6 distinguish review findings from completed corrections.
 This replaces the pre-implementation proposal and its subsequently appended completion
 notes. The stack is implemented, but passing interoperability tests is not evidence of
 complete protocol compliance. The corrections below remain implementation work.
@@ -297,8 +299,9 @@ parser changes must test server callers; a server-specific audit is separate. Re
 50 ms readiness slices for now. Delete stale OpenSSL explanations when touching that code,
 but do not undertake an asynchronous rewrite without a measured need.
 
-No connection pooling, trust-store caching, ALPN expansion or new provider transport is
-required to complete the current correction plan.
+No connection pooling, trust-store caching or ALPN expansion is required for the correction
+plan. Provider WebSocket integration is now designed in section 9. It adds a session-owned
+connection, not a general-purpose pool, and depends on the transport corrections named there.
 
 ## 6. Implementation progress
 
@@ -378,3 +381,317 @@ Completion means the listed defects have verified fixes, legal supported exchang
 malformed exchanges fail with useful errors, caller cancellation remains effective, and
 ownership is balanced. It does not mean support for every TLS version, every HTTP feature,
 or a completed independent cryptographic security audit.
+
+## 9. Provider WebSocket integration
+
+Status: design for implementation. No provider currently uses `websocket` in Nabla.
+This section is the authoritative WebSocket plan. It belongs here because connection
+ownership, transport selection, interruption and recovery cross the same boundaries as
+HTTP/SSE. The harness and retry architecture documents link here rather than duplicating
+connection policy. No separate WebSocket document or new package is needed.
+
+### 9.1 Scope and defaults
+
+Implement Responses-over-WebSocket for text/tool workflows, using the existing native
+`websocket` client. This is not OpenAI Realtime or Live voice. HTTP/SSE remains the default
+and stays supported for every current API. Chat Completions and Anthropic Messages retain
+HTTP/SSE; sharing a provider name with a Responses endpoint does not give them WS support.
+
+The required result is a persistent connection reused across foreground requests, full
+request replay whenever needed, safe recovery, and optional incremental continuation on a
+verified baseline. Connection reuse and delta input are separate capabilities: correctness
+must not depend on retaining server-side history.
+
+Do not implement multiplexing, prewarming (`generate:false`), provider-side mid-turn
+steering, compression, OAuth/subscription authentication, or a socket pool in this work.
+They are not needed by the current harness. Absence of multiplexing is a client scheduling
+choice, not a claim that the provider protocol prohibits concurrency.
+
+### 9.2 Configuration and routing
+
+Add an optional provider `transport` field with values `http`, `websocket`, and `auto` to
+Lua configuration and the resolved provider catalog. Absent means `http`. Preserve the
+existing presence-based merge: a configured value is authoritative, and neither Models.dev
+nor `/models` supplies a transport value unless its published schema actually defines one.
+There is no model-name heuristic and no hardcoded list of WebSocket-capable models.
+
+| Policy | Behavior |
+|---|---|
+| `http` or absent | Existing HTTP/SSE operation; no WS probe or connection |
+| `websocket` | Require WS for a supported API; return a useful failure rather than silently switching |
+| `auto` | Prefer WS for a supported API; permit safe HTTP fallback under section 9.6 |
+
+A provider-level choice applies after per-model API routing. In `auto`, a selected API
+without an implemented WS protocol uses HTTP directly. In required `websocket` mode it
+fails local validation before any connection. This supports mixed-API providers without
+pretending that every route can use WS. Do not add a model-level transport override until
+an actual deployment needs it.
+
+Setting `websocket` or `auto` is the operator's assertion that the configured Responses
+endpoint may support the protocol. Successful Upgrade and a valid exchange establish what
+that connection supports; the string `openai_responses` alone does not. An arbitrary
+compatible gateway may still reject an Upgrade or implement different behavior.
+
+For Responses, resolve the resource path once, preserving authority, path and query, then
+map `https` to `wss` and `http` to `ws`. Never send credentials to a different authority,
+follow an Upgrade redirect automatically, or downgrade a secure URL on failure. Continue
+to support explicit local `http`/`ws` deployments; verification remains mandatory for TLS.
+Reuse the API family's authentication headers and the caller's identity headers. Do not
+copy Codex subscription URLs, beta headers, affinity tokens or Azure query rewrites into
+the generic Responses adapter. Such differences need a documented endpoint requirement
+and a targeted adapter, not inference from a model ID.
+
+### 9.3 Ownership and Odin shape
+
+Use structs for state and ordinary procedures for operations. Extend `ai` with a concrete
+provider-session value containing a lazily allocated WS connection and Responses
+continuation state. Keep `Provider_Connection` as borrowed endpoint/API/credential data;
+it must not ambiguously become both configuration and an owned socket.
+
+`agent.Chat_Session` owns the foreground provider-session value. `ai` owns its connection,
+JSON encoding/decoding and continuation mechanics. `agent` decides selection, fallback,
+retry and when a prepared result becomes authoritative. The root worker drives the session;
+neither the presentation stack nor durable `agent/session` imports `websocket`.
+
+The existing one-shot provider operation remains available for metadata-independent and
+background callers. A session-aware operation borrows the concrete state explicitly.
+Use direct branching for HTTP versus Responses WS, not a provider transport vtable,
+executor registry or another service package. The existing byte-transport callback boundary
+below `websocket` already serves its actual substitution purpose.
+
+Ownership requirements:
+
+- Exactly one foreground request is active per connection. The driving thread performs
+  all reads, writes, reconnects and destruction. No read pump or mutex is necessary for
+  this sequential flow. A concurrent use attempt is an API misuse, not silently queued.
+- The socket remains on its creating thread because `Upgraded` owns an acquisition of
+  that thread's event loop. Close it on that thread before worker exit, session replacement,
+  or transferring the session to a different driver.
+- Background compaction keeps an independent one-shot HTTP operation initially. It neither
+  borrows nor evicts the foreground socket or continuation cache. This preserves current
+  concurrency without multiplexing or a second persistent session manager.
+- Connection probe storage is owned by the provider session and remains valid as long as
+  the socket. It must not retain a pointer to an operation's stack-local `HTTP_Control`,
+  response observer, encoded request or callback after that operation returns.
+- Active interruption and observer bindings are installed for an operation and cleared on
+  retirement. A cancelled token is never reused implicitly by the next request.
+- Retained IDs, baseline input and affinity fields use the session allocator; event and
+  operation buffers use their documented allocators. Neither borrows the worker's temp
+  allocator across requests. Destruction releases all retained state once.
+
+Compare connection affinity directly: resolved URL, API, model, authentication/header
+values and trust configuration. A changed credential, provider selection, model or trust
+configuration closes the old connection and clears continuation and fallback state.
+Do not retain a secret hash in logs as an affinity identifier. No global session map or
+cross-account cache is introduced.
+
+### 9.4 Request and event path
+
+Keep one Responses request encoder and one Responses event decoder. Separate the common
+JSON request from its transport envelope at preparation time:
+
+- HTTP adds `stream:true` and uses the existing SSE framing.
+- WS sends a text message with top-level `type:"response.create"`, the same request fields,
+  and no `stream` or `background`. `previous_response_id` is added only for an admitted
+  incremental continuation. Omit `stream_id` for the single default lane.
+- Assemble received fragments until `websocket.read` reports a complete text message,
+  then pass the JSON payload to the shared Responses decoder. Do not synthesize SSE lines
+  or maintain a second decoder. Expose a transport-neutral payload-consumption name;
+  leave `[DONE]` handling in the SSE-specific path.
+- Maintain separate request boundaries on a connection. Provider JSON messages are not
+  synonymous with transport chunks or frames. Buffers grow with checked allocation;
+  there is no copied 16 MiB cap or 128-event queue from a reference harness.
+- Unexpected binary messages, malformed JSON, mismatched response identity and unexpected
+  request-scoped events produce protocol failures and discard the connection. Unknown
+  extensible event types remain subject to the shared decoder's documented rules.
+
+Retain response identity from `response.created` and the terminal response, and verify
+consistency before authorizing completion. The current decoder drops that identity; it
+must not be reconstructed from tool-call IDs. Preserve in-band error status/code/headers
+as provider evidence, distinct from the HTTP Upgrade status. A `101` does not mean a
+model request succeeded or even began.
+
+A WS request completes at its valid provider terminal message, not at socket EOF. Keep
+normal tool validation and the one-terminal-callback guarantee, but do not wait for a
+persistent connection to close before releasing a completed response. `response.failed`,
+`response.incomplete`, and `error` retain their provider semantics and cannot become success
+merely because the socket is healthy. The established decoder decides which incomplete
+outputs are usable; transport integration must not change that policy incidentally.
+
+Cancellation is checked before sending, while receiving, before delivering a terminal
+result and before accepting continuation state. A response completed and accepted before
+a later idle socket failure stays completed. A failure before a valid terminal result
+cannot expose executable tool calls. An unexpected old response on the next request is
+not attributed to the new request.
+
+### 9.5 Continuation without losing durable history
+
+The committed local conversation remains the source of truth. Continue constructing a full
+provider projection for each logical request, including replay sanitization, tool-result
+repairs, spill handles, steering, current instructions and installed checkpoints. WS delta
+encoding is an optimization of that projection, not a replacement for it.
+
+For a reusable baseline, retain:
+
+- the connection generation and affinity;
+- the previous response ID;
+- the exact normalized input sequence represented by that response, including its
+  replayable output items;
+- the non-input request settings used to establish the baseline.
+
+Use a delta only when the newly prepared full input has that sequence as an exact prefix
+and the non-input settings match. Compare JSON values or deterministic normalized
+serialization, not hash equality alone and not byte offsets in an unstable map encoding.
+Then transmit only the suffix plus `previous_response_id`. Conservatively sending full
+input when max-output, tools or other settings changed is correct; selectively relaxing
+this equality is later optimization, not required functionality.
+
+Use the same normalization for baseline output and ordinary full replay. Tool calls that
+were repaired or refused, replaced tool outputs, altered instructions, compacted history
+and model changes must not leave a baseline that claims different input than the harness
+would send. If prefix equivalence cannot be proved, send the full projection with no
+`previous_response_id`. Do not silently trim or mutate the projected history to fit a cache.
+
+Stage continuation state after a valid terminal message. Promote it only once the harness
+accepts and durably records the response; otherwise discard it. Cancellation, parser failure,
+storage failure and a rejected completion cannot establish an authoritative baseline.
+The next full projection is still checked even after promotion.
+
+Keep `store:false`. On reconnect or process restart, discard connection-local IDs and send
+full context. A stored response ID is not a durable substitute for conversation entries.
+A `previous_response_not_found` rejection invalidates the baseline and is evidence for one
+full-context retry, subject to section 9.6. Do not rerun tools to reconstruct that request.
+Delta continuation is an explicitly testable milestone after full-context socket reuse,
+not a prerequisite for enabling the transport or a reason to block its initial delivery.
+
+### 9.6 Failures, retries and fallback
+
+`ai` performs one model send per operation and returns facts. Only `agent` authorizes another
+send or changes transport. Do not hide an HTTP retry inside `websocket.dial` or the provider
+adapter. Extend provider-neutral attempt evidence to distinguish:
+
+- no model-message bytes accepted;
+- some/all model-message bytes accepted locally, with provider acceptance unknown;
+- provider response creation observed;
+- provider terminal outcome observed.
+
+A partial write is ambiguous even if the lower API returns zero completed plaintext bytes
+for its last record. Extend write accounting or conservatively report ambiguity once a send
+starts. Neither absence of text nor absence of `response.created` proves non-delivery.
+An Upgrade request does not itself create a model response, so failed setup can be safely
+retried without replaying a model operation.
+
+| Observation | Harness action |
+|---|---|
+| Unsupported API under `auto` | HTTP directly; no WS attempt |
+| Unsupported API under required WS | Local failure |
+| Upgrade rejected as unsupported (for example 405, 426 or 501) under `auto` | Sticky HTTP fallback for this session affinity; no model replay ambiguity |
+| Transient connect/setup failure under `auto` | Allow HTTP fallback through the existing recovery budget; record the reason |
+| Authentication, authorization, TLS trust, invalid URL or local protocol-configuration failure | Stop; no fallback that hides configuration or weakens security |
+| Rate limit or provider availability response | Apply existing provider classification and Retry-After policy; do not treat it as proof that WS is unsupported |
+| Send failure known to precede all model bytes | Retry/fallback under the existing budget; discard the socket |
+| Ambiguous send or disconnect before terminal outcome | Report the unknown outcome and stop automatic replay; discard socket and continuation |
+| Explicit `previous_response_not_found` rejection before output | Invalidate continuation and allow one full-context retry within the same attempt budget |
+| Explicit connection-lifetime rejection before a new request starts | Reconnect, clear continuation and send full context within the existing budget |
+| Failure after visible output | Stop and preserve partial output; never silently switch transport |
+| Valid completed response followed by idle disconnect | Keep the accepted result; reconnect for the next request |
+
+The ambiguous-delivery rule is deliberately stricter than the current generic retry rule
+based only on exposed output. Add the delivery fact to `Chat_Attempt_Facts` and apply it
+when the WS adapter provides it. Do not pretend existing HTTP accounting already proves
+non-delivery. Reconsider HTTP replay separately when its outcome contract is revised.
+
+Fallback is sticky only for the affected live provider session and affinity, not persisted
+in the model catalog or across process restarts. Required `websocket` mode never falls back
+to HTTP. Even in `auto`, `previous_response_not_found` is a continuation failure, not a
+reason to disable WS. Unknown provider errors are not generic retry instructions.
+
+Each model send has its own durable request row, including a retry without a continuation
+ID. Setup attempts and fallback decisions are recorded as transport facts even when no
+model message was sent; bound setup retries through existing recovery policy rather than
+introducing an unbounded pre-send loop. Preserve the frozen full projection across a
+transport change while recording the actual envelope sent for each attempt.
+
+### 9.7 Connection lifetime and interruption
+
+Connect lazily on the first WS request; retain the socket across tool runs and user turns.
+No hardcoded connect deadline, idle read deadline or total request lifetime is added.
+Existing caller-supplied cancellation and deadlines continue to work. Provider-imposed
+connection limits are not generic WebSocket protocol limits.
+
+For the documented OpenAI Responses endpoint, a 60-minute connection lifetime is a provider
+fact. When known, retire an aged connection between requests before starting the next one;
+never abort an active model response at a local 55-minute timer copied from another harness.
+For configured endpoints without a known age limit, react to their close/error evidence.
+No universal provider age is inferred from the API-family enum.
+
+Without an idle read pump, pings are processed when the driver resumes reading and an idle
+connection can be closed by its peer. That is acceptable: probe or reconnect at the next
+request boundary, but a successful liveness probe cannot guarantee the following write
+will arrive. A stale connection whose send has become ambiguous follows section 9.6.
+Do not promise transparent recovery from every idle disconnect.
+
+On cancellation, protocol failure or ambiguous delivery, abort and destroy the connection
+on its owning thread. Do not wait indefinitely for a WS close handshake in a destructor,
+and do not leave unread output for the next request. Normal close is an explicit operation
+under caller control; resource destruction must also provide an abort path that does not
+perform a blocking TLS close write. Clear the continuation and active probe bindings.
+
+### 9.8 Observations, persistence and tests
+
+Extend `Provider_Operation_Report` and transfer facts only with observable distinctions:
+selected transport, connection generation/reuse, full versus delta input, setup outcome,
+model send progress, response ID, terminal result and fallback reason. Request byte counts
+must distinguish the HTTP Upgrade from model JSON. Do not fabricate a new HTTP response
+head for each message on an existing connection.
+
+Log exact sent envelopes through the existing opt-in payload capture path and retain the
+full logical projection in request preparation/persistence as already required for replay.
+Keep secrets and handshake authorization fields out of ordinary logs. Response captures
+must preserve JSON message boundaries rather than concatenating documents into ambiguous
+bytes. Retry policy must not depend on whether diagnostic capture is enabled. No new
+presentation callbacks are needed merely to report the selected transport.
+
+Implementation gates, each a scoped change:
+
+1. **Transport prerequisites:** settle WS handshake-field ownership and unsolicited
+   extension/subprotocol checks, partial-write evidence, abnormal close reporting,
+   event-loop/probe lifetime and nonblocking abort teardown. Finish TLS key-usage and
+   key-transition safeguards required by long-lived wss. Keep parser errors terminal and
+   prevent retained data from being reported as a clean EOF after fatal failure.
+2. **Shared Responses codec:** separate request envelope from common encoding, retain
+   response identity, and reuse payload decoding over SSE and WS. Test equivalent tool,
+   usage, text and terminal behavior without a network.
+3. **Full-context WS operations:** add configuration and explicit session ownership,
+   one in-flight operation, reuse across foreground requests, independent compaction and
+   cancellation. Use local scripted provider peers over ws and wss, not only echo tests.
+4. **Recovery and evidence:** exercise unsupported Upgrade fallback, required-WS errors,
+   auth/TLS failures, partial writes, disconnects before/after creation, output exposure,
+   storage failure and sticky fallback reset on affinity change. Assert actual model-send
+   counts and durable attempt records so duplicate requests cannot hide behind a success.
+5. **Incremental continuation:** verify full versus delta payloads, response-ID validation,
+   repaired tool calls, changed settings, compaction, credential/model changes, missing
+   previous responses and restart. Every delta test compares the effective full input to
+   the ordinary projection. No server cache is required to recover the local conversation.
+6. **Acceptance:** run Fish/Mise check and release/debug tests plus local harnesses. Optional
+   credentialed provider tests must show two dependent requests on one connection and a
+   tool-result continuation. Do not claim provider compatibility from a WS echo alone.
+
+### 9.9 Reference evidence and deliberate differences
+
+The supplied `websocket-sse-study.md` is a research snapshot, not a protocol contract.
+OpenCode's endpoint/call split, Codex's session lifecycle, and Pi's prefix validation and
+account separation inform this design. Their queues, timers, rollover intervals, retry
+counts and subscription-specific headers are not copied into Nabla.
+
+The current [OpenAI WebSocket guide](https://developers.openai.com/api/docs/guides/websocket-mode)
+and [event reference](https://developers.openai.com/api/reference/resources/responses/websocket-events)
+document `response.create`, transport-field exclusions, shared server-event payloads,
+`store:false` continuation, connection limits and named-lane multiplexing. Named lanes are
+optional; Nabla uses the default lane initially. The earlier reference study's sequential
+connection model must not be stated as a universal OpenAI protocol restriction.
+
+Azure documentation gathered in the study describes a sequential Responses connection.
+Do not assume OpenAI's newer lane support applies to Azure, xAI or a compatible gateway.
+No direct credentialed provider WS exchange has yet been performed in Nabla. Subscription
+Codex endpoints and voice APIs remain separate protocols until explicitly implemented.

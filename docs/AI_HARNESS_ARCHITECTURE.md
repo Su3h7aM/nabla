@@ -306,6 +306,15 @@ Rules:
 
 ## 8. Provider replay state
 
+Responses-over-WebSocket is designed in
+[Network stack architecture, section 9](NETWORK_STACK_ARCHITECTURE.md#9-provider-websocket-integration).
+That plan adds foreground session-owned transport state without replacing the committed
+conversation. A connection-local response ID and delta baseline are disposable optimizations;
+full provider projection remains available after reconnect, compaction or process restart.
+Background compaction retains an independent HTTP operation. Transport selection is an
+explicit provider setting applied after per-model API routing, not a Models.dev capability
+or model-name heuristic. These changes are planned, not yet implemented.
+
 Reasoning content is **not** merely display text. Some providers require faithful replay of
 provider-generated structures, particularly adjacent to tool use.
 
