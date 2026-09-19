@@ -227,9 +227,8 @@ The pure decision and delay procedures are in `agent/retry.odin`; request execut
 - `Request_Recovery_Action`: `Stop`, `Retry`, `Repair_Context`.
 - `Request_Recovery_Reason`: named reasons for a completed send, a failure the harness caused,
   a store that refused a write, cancellation, output exposure, context exhaustion, a terminal
-  class, an exhausted attempt bound, a provider delay that is too long to wait, a transient
-  failure that is retried, and a configuration change that arrived mid-chain. Never a boolean
-  with an unexplained false result.
+  class, an exhausted attempt bound, a provider delay that is too long to wait, and a transient
+  failure that is retried. Never a boolean with an unexplained false result.
 - `Chat_Recovery_Decision`: action, reason, and `time.Duration` delay.
 - `Chat_Attempt_Facts`: the sends made so far, the operation's own error, whether the harness
   failed the send itself, whether the store failed, what the attempt exposed to a reader,
@@ -275,10 +274,10 @@ After the synchronous send returns and provisional output is settled:
    retry reason.
 8. Otherwise stop. Unknown provider failure, malformed output, and a local expiry are terminal.
 
-A pending model, provider or effort change is checked at the same points and stops the chain with
-`Configuration_Changed`: the next request is built under the new configuration instead of
-retrying or waiting out a backoff for a configuration the user has left. The change never alters
-frozen bytes, so an attempt that already ran keeps its own evidence.
+A model, provider or effort change is applied at the next request the harness builds, not by the
+retry policy: a chain already in flight keeps its endpoint and its frozen bytes until it ends, and
+only then is the following request built under the new configuration. See
+[ai harness architecture, section 9.1](AI_HARNESS_ARCHITECTURE.md#91-configuration-changes-at-request-boundaries).
 
 Do not make delivered body bytes the exposure test. A usage update, keepalive, or ignored
 reasoning event is not visible output. Track `text_exposed` and `completion_accepted` explicitly

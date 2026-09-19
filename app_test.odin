@@ -84,9 +84,9 @@ test_stopping_refuses_queued_work :: proc(t: ^testing.T) {
 	app.run.work = channel
 	defer chan.destroy(&app.run.work)
 
-	enqueue(&app, .Prompt, "", "queued before the stop")
+	enqueue(&app, .Prompt, "queued before the stop")
 	stop_runtime(&app)
-	enqueue(&app, .Prompt, "", "refused after the stop")
+	enqueue(&app, .Prompt, "refused after the stop")
 	testing.expect(t, runtime_stopping(&app))
 
 	queued, ok := chan.recv(app.run.work)

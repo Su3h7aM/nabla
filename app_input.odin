@@ -301,7 +301,7 @@ submit :: proc(app: ^App) {
 			snap_append(app, .Warning, "steering queue full; line dropped")
 		}
 	} else {
-		enqueue(app, .Prompt, "", text)
+		enqueue(app, .Prompt, text)
 	}
 	widgets.input_clear(&app.input)
 	completion_reset(app)
@@ -335,33 +335,30 @@ dispatch_command :: proc(app: ^App, text: string) {
 	case .Help:
 		command_help(app)
 	case .New_Session:
-		enqueue(app, .New_Session, "", "")
+		enqueue(app, .New_Session)
 	case .Resume:
-		enqueue(app, .Resume_Session, "", argument)
+		enqueue(app, .Resume_Session, argument)
 	case .Compact:
-		enqueue(app, .Compact, "", "")
+		enqueue(app, .Compact)
 	case .Status:
-		enqueue(app, .Status, "", "")
+		enqueue(app, .Status)
 	case .Effort:
-		enqueue(app, .Effort, "", argument)
+		enqueue(app, .Effort, argument)
 	case .Model:
 		provider_id, model_id, ok := resolve_model_reference(app, argument)
 		if ok {
-			enqueue(app, .Model, provider_id, model_id)
+			selection_request(app, provider_id, model_id)
 		}
 	}
 }
 
-enqueue :: proc(app: ^App, kind: Work_Kind, provider, text: string) {
+enqueue :: proc(app: ^App, kind: Work_Kind, text: string = "") {
 	// The worker abandons the queue on the way out, so a command that entered now
 	// would never run. Dropping it here is what makes shutdown's "no new work"
 	// promise hold without reaching through the queue.
 	if runtime_stopping(app) { return }
 	item := Work {
 		kind = kind,
-	}
-	if provider != "" {
-		item.provider = strings.clone(provider, app.run.alloc)
 	}
 	if text != "" {
 		item.text = strings.clone(text, app.run.alloc)
@@ -371,9 +368,6 @@ enqueue :: proc(app: ^App, kind: Work_Kind, provider, text: string) {
 	}
 	if item.text != "" {
 		delete(item.text, app.run.alloc)
-	}
-	if item.provider != "" {
-		delete(item.provider, app.run.alloc)
 	}
 	snap_append(app, .Warning, "input queue full; line dropped")
 }

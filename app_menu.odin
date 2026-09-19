@@ -170,11 +170,11 @@ menu_submit :: proc(app: ^App) {
 	cursor := min(app.menu.cursor, len(app.menu.choices) - 1)
 	switch action in app.menu.choices[cursor].action {
 	case Model_Choice:
-		enqueue(app, .Model, action.provider_id, action.model_id)
+		selection_request(app, action.provider_id, action.model_id)
 	case Effort_Choice:
-		enqueue(app, .Effort, "", action.level)
+		enqueue(app, .Effort, action.level)
 	case Session_Choice:
-		enqueue(app, .Resume_Session, "", string(action.id))
+		enqueue(app, .Resume_Session, string(action.id))
 	}
 	if !app.menu.required { menu_close(app) }
 }

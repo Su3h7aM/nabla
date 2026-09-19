@@ -711,7 +711,7 @@ test_a_stopped_worker_abandons_queued_work :: proc(t: ^testing.T) {
 	if worker == nil { testing.fail_now(t, "the worker could not be created") }
 	worker.data = &app
 
-	enqueue(&app, .Prompt, "", "must not run")
+	enqueue(&app, .Prompt, "must not run")
 	stop_runtime(&app)
 	thread.start(worker)
 	// Closing the queue is what lets the worker finish draining it and return.
@@ -1179,4 +1179,30 @@ test_the_mcp_lifecycle_records_name_the_server_instance :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(text, `"revision":"`), "the negotiated revision is recorded")
 	testing.expect(t, strings.contains(text, `"tools_supported":true`), "the capability answer is recorded")
 	testing.expect(t, strings.contains(text, `"reason":"restart"`), "the stop names why it stopped")
+}
+
+// A selection the user asks for is recorded, not applied: the turn owns the session
+// until its next request boundary, so the choice waits in run state for whichever
+// boundary reaches it first, and only that one installs it.
+@(test)
+test_a_requested_selection_waits_for_a_boundary_and_installs_once :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.catalog = app_test_catalog(app.setup.alloc)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	app.run.work, _ = chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
+	defer chan.destroy(&app.run.work)
+
+	testing.expect(t, apply_selection(&app, "test-provider", "test-model", ""))
+	selection_request(&app, "test-provider", "test-model")
+	testing.expect(t, app.run.pending.present, "a requested selection waits for a boundary")
+	// The wake is what an idle worker blocks on; the choice itself is not in it.
+	wake, queued := chan.recv(app.run.work)
+	if !testing.expect(t, queued, "requesting a selection wakes the worker") { return }
+	testing.expect_value(t, wake.kind, Work_Kind.Model)
+	work_destroy(&app, wake)
+
+	testing.expect(t, apply_pending_selection(&app), "the first boundary installs the selection")
+	testing.expect(t, !apply_pending_selection(&app), "a later boundary has nothing left to install")
 }

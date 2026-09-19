@@ -911,6 +911,12 @@ Steer_Context :: struct {
 	model_id:    string,
 	connection:  ai.Provider_Connection,
 	usages:      ^[dynamic]Chat_Request_Usage,
+	// apply, when not nil, is the caller's request-boundary hook: it installs any
+	// selection the user asked for since the last request and returns the connection
+	// the next request must use. Resolving a selection is the caller's business, so the
+	// agent only asks; apply_data is whatever the caller needs to answer.
+	apply:       proc(steer: ^Steer_Context) -> ai.Provider_Connection,
+	apply_data:  rawptr,
 }
 
 chat_run_turn_steered :: proc(
@@ -929,15 +935,20 @@ chat_run_turn_steered :: proc(
 	chat_signal_arm(&previous)
 	defer chat_signal_disarm(&previous)
 
+	// current is the connection the next request is built for. A boundary hook may
+	// replace it, which is how a selection the user changed mid-turn reaches the
+	// request that follows rather than the turn after this one.
+	current := connection
 	for {
 		if steer != nil && chat.state == .Preparing {
 			chat_drain_steering(chat, observer, steer)
+			if steer.apply != nil { current = steer.apply(steer) }
 		}
 		effect := chat_session_advance(chat)
 		switch effect.kind {
 		case .Start_Request:
 			chat_effect_destroy(&effect)
-			chat_perform_request(chat, connection, policy, observer, &usages)
+			chat_perform_request(chat, current, policy, observer, &usages)
 		case .Run_Tools:
 			chat_effect_destroy(&effect)
 			count := chat_run_tools(chat, observer)

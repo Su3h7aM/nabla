@@ -5,6 +5,70 @@ import "core:strings"
 import "core:testing"
 
 import "nabla:agent/session"
+import "nabla:ai"
+
+// Boundary_Install is a caller's selection change: the connection it wants the next
+// request built for, and how often the turn asked for one.
+Boundary_Install :: struct {
+	connection: ai.Provider_Connection,
+	calls:      int,
+}
+
+boundary_install_connection :: proc(steer: ^Steer_Context) -> ai.Provider_Connection {
+	install := cast(^Boundary_Install)steer.apply_data
+	install.calls += 1
+	return install.connection
+}
+
+// The request boundary is where a caller installs a selection the user changed
+// mid-turn: the connection the hook returns is the one the request that follows is
+// built for. The turn is handed the first endpoint and the hook replaces it before the
+// first request, so which endpoint received the bytes is the proof.
+@(test)
+test_a_boundary_hook_hands_the_next_request_its_connection :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(t, chat, "say something")
+
+	previous: Agent_Provider
+	if !agent_provider_start(t, &previous, []string{}) { return }
+	defer agent_provider_stop(&previous)
+	installed: Agent_Provider
+	if !agent_provider_start(t, &installed, {agent_provider_reply("from the new selection")}) { return }
+	defer agent_provider_stop(&installed)
+
+	initial := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&previous, chat.allocator),
+	}
+	defer delete(initial.Endpoint, chat.allocator)
+	next := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&installed, chat.allocator),
+	}
+	defer delete(next.Endpoint, chat.allocator)
+
+	queue := steer_queue_init(context.temp_allocator)
+	defer steer_queue_destroy(&queue)
+	install := Boundary_Install {
+		connection = next,
+	}
+	steer := Steer_Context {
+		queue      = &queue,
+		connection = initial,
+		apply      = boundary_install_connection,
+		apply_data = &install,
+	}
+
+	testing.expect(t, chat_run_turn_steered(chat, initial, test_retry_policy(), {}, &steer), "the turn completed")
+	testing.expect(t, install.calls > 0, "the turn asked for a selection at its boundary")
+	testing.expect_value(t, len(previous.requests), 0)
+	if !testing.expect_value(t, len(installed.requests), 1) { return }
+	testing.expect(t, strings.contains(installed.requests[0], "say something"), "the request that followed the boundary is the turn's own")
+}
 
 @(test)
 test_steer_queue_is_fifo_and_bounded :: proc(t: ^testing.T) {

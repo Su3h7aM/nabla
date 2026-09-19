@@ -393,29 +393,38 @@ Rules:
 
 A change to model, provider or effort takes effect at the next request boundary. Not the next
 turn, and not the next prompt: inside a turn every tool-loop iteration is a boundary, so a change
-made while a response streams or tools run applies to the next request of that same turn. The
-current behavior, where a queued selection waits for the turn to end, is a defect.
+made while a response streams or tools run applies to the next request of that same turn.
 
-Mechanism, kept as data plus one owner:
+Mechanism, kept as data plus one owner (implemented for provider and model):
 
-- The front-end records the requested selection as one pending intent (provider, model, effort)
-in run state under the existing runtime lock. It does not apply it itself and does not touch the
-session.
-- `apply_selection` stays the only writer of the resolved selection. The idle worker path and the
-turn boundary path both consume the intent; whichever arrives first applies it once.
-- `Steer_Context` carries a boundary hook. `chat_run_turn_steered` calls it where it already
-drains steering, before `chat_prepare`, and uses the connection it returns for the next request.
-Catalog lookup, credential resolution and persistence stay in the root package; `agent` only
-asks, exactly as with the steering queue and the observer.
+- The front-end records the requested selection as one pending intent (`Pending_Selection`) in
+run state under the existing runtime lock, and wakes the worker with a work item of its own kind
+whose payload is nothing: the choice is not in the item, because a turn owns the session until
+its next boundary and only the intent can wait there. It does not apply the change itself and
+does not touch the session.
+- `apply_selection` stays the only writer of the resolved selection, and `apply_pending_selection`
+is its only caller for a requested change. Taking the intent under the lock is what makes it apply
+once: the idle path and the turn boundary both call it, and whoever takes it takes it for good. A
+request that arrives after the first boundary is a new intent and applies at the next one.
+- `Steer_Context` carries a boundary hook (`apply` plus the caller's own data).
+`chat_run_turn_steered` calls it where it already drains steering, before `chat_prepare`, and uses
+the connection it returns for the next request. Catalog lookup, credential resolution and
+persistence stay in the root package; `agent` only asks, exactly as with the steering queue and
+the observer. The hook also republishes the names and connection the agent reads, because the
+steer context borrows strings an install replaces.
 - A pending intent is never lost. If the turn is cancelled or fails, the idle path applies it
 before the next prompt.
 
 Constraints:
 
-- Never apply a change to an in-flight request, its frozen bytes or an attempt chain. A pending
-change ends that chain at its next decision point (retry document, section 4).
-- Effort already lands at a boundary through the steering path; keep that behavior and route both
-kinds of change through the same hook so they cannot diverge.
+- Never apply a change to an in-flight request or its frozen bytes. A chain already in flight keeps
+its endpoint until it ends: its bytes were frozen for the provider they were built for, and
+replaying them is the only safe action on an entered send. Such a chain therefore delays a change
+by at most its remaining attempts, and the change applies to the next request the harness builds.
+- Effort keeps its own two paths, both of which already land at a boundary: a `/effort` line typed
+during a turn is queued as steering and applied by the drain at the same call site, and the effort
+menu applies between turns. Route a future change of either kind through the same boundary site,
+so they cannot diverge.
 - The switch is transparent: same session, durable history, transcript and cache key, no
 conversation entry about it, no rendering difference. Transport and cache consequences are in the
 network document, sections 9.11 and 10.6.

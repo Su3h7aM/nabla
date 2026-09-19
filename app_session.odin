@@ -462,6 +462,64 @@ provider_configured :: proc(app: ^App, provider_id: string) -> bool {
 	return false
 }
 
+// pending_selection_clear releases whatever the intent holds and zeroes it, so it is
+// safe on an empty intent and on one whose strings a boundary already took.
+pending_selection_clear :: proc(pending: ^Pending_Selection, allocator: mem.Allocator) {
+	delete(pending.provider, allocator)
+	delete(pending.model, allocator)
+	pending^ = {}
+}
+
+// selection_request records the selection the user asked for and wakes the worker.
+//
+// The choice cannot travel in the work item: a turn owns the session until its next
+// request boundary, and applying a selection edits the session, so the choice waits in
+// run state for whichever boundary comes first. The wake exists because an idle worker
+// is blocked on the queue and would otherwise never look.
+selection_request :: proc(app: ^App, provider_id, model_id: string) {
+	if runtime_stopping(app) { return }
+	provider := strings.clone(provider_id, app.run.alloc)
+	model := strings.clone(model_id, app.run.alloc)
+	sync.mutex_lock(&app.run.mu)
+	pending_selection_clear(&app.run.pending, app.run.alloc)
+	app.run.pending = Pending_Selection {
+		present  = true,
+		provider = provider,
+		model    = model,
+	}
+	sync.mutex_unlock(&app.run.mu)
+	enqueue(app, .Model)
+}
+
+// apply_pending_selection installs the pending selection, if there is one, and says
+// whether it did. Taking the intent under the lock is what makes it apply once: the idle
+// path and the turn boundary both call this, and whoever takes it takes it for good.
+apply_pending_selection :: proc(app: ^App) -> bool {
+	sync.mutex_lock(&app.run.mu)
+	pending := app.run.pending
+	app.run.pending = {}
+	sync.mutex_unlock(&app.run.mu)
+	if !pending.present { return false }
+	// The intent owns its strings through the install, which clones what it keeps.
+	defer pending_selection_clear(&pending, app.run.alloc)
+	return apply_selection(app, pending.provider, pending.model, "")
+}
+
+// app_steer_apply is the turn's request-boundary hook. It installs the selection the
+// user asked for since the last request, then republishes the names and the connection
+// the agent reads for the next one: the steer context borrows the runtime's strings,
+// which an install replaces.
+app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
+	app := cast(^App)steer.apply_data
+	apply_pending_selection(app)
+	sync.mutex_lock(&app.run.mu)
+	steer.provider_id = app.setup.provider_id
+	steer.model_id = app.setup.model_id
+	steer.connection = app.run.connection
+	sync.mutex_unlock(&app.run.mu)
+	return steer.connection
+}
+
 // apply_selection switches the runtime to one provider's model and applies an
 // effort level. `effort` is an explicit level for the new model; empty means the
 // caller states none, and the level already in effect is then carried over

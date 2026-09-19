@@ -819,8 +819,10 @@ only writer, so the install is serialized by construction. The pending-intent me
 boundary hook are specified in the harness document, section 9.1.
 
 Never mutate an in-flight request, its frozen bytes, its control binding, its projection or an
-attempt chain. A pending change ends the current request chain at its next decision point
-(retry document, section 4) and is applied before the following request is built.
+attempt chain. The change is applied before the next request the harness builds. A chain that is
+already in flight keeps its endpoint until it ends, because its bytes were frozen for the provider
+they were built for, so a change that arrives mid-chain waits for at most the chain's remaining
+attempts.
 
 The switch performs, in this order:
 

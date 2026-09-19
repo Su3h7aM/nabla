@@ -105,14 +105,16 @@ Work_Kind :: enum u8 {
 	Compact,
 	Status,
 	Effort,
+	// Model wakes the worker for a pending selection. The selection itself is not in the
+	// item: the turn owns the session until its next request boundary, so the choice has
+	// to wait in run state for whichever boundary comes first. See Pending_Selection.
 	Model,
 	New_Session,
 	Resume_Session,
 }
 Work :: struct {
-	kind:     Work_Kind,
-	provider: string, // owned; target provider for .Model, empty otherwise,
-	text:     string, // owned; model id for .Model, prompt or effort text otherwise,
+	kind: Work_Kind,
+	text: string, // owned; prompt, effort text, or session reference, empty otherwise,
 }
 
 Work_Chan :: chan.Chan(Work)
@@ -186,12 +188,27 @@ Session_Row :: struct {
 	title: string, // owned
 }
 
+// Pending_Selection is the selection the user asked for and the worker has not
+// installed yet. The front-end only records it; apply_selection is still the only
+// writer of a resolved selection, and it consumes this at the next request boundary
+// so a change made while a response streams reaches the next request of that same
+// turn rather than waiting for the turn to end.
+Pending_Selection :: struct {
+	present:  bool,
+	provider: string, // owned by the runtime allocator,
+	model:    string, // owned by the runtime allocator,
+}
+
 Runtime :: struct {
-	mu:                   sync.Mutex, // guards snapshot,
+	mu:                   sync.Mutex, // guards snapshot and pending,
 	snap:                 Snapshot,
 	work:                 Work_Chan,
 	worker:               ^thread.Thread,
 	connection:           ai.Provider_Connection,
+	// pending is the selection change waiting for a request boundary. It is written
+	// by the front-end and consumed by the worker, so it is guarded by mu like the
+	// snapshot the same boundary is published into.
+	pending:              Pending_Selection,
 	// steer carries lines typed while a turn is running. The front-end pushes
 	// them as they arrive and the worker drains them at request boundaries, which
 	// is why it is written from one thread and read from another.
@@ -475,6 +492,7 @@ app_teardown :: proc(app: ^App) {
 	}
 	chan.destroy(&app.run.work)
 	agent.steer_queue_destroy(&app.run.steer)
+	pending_selection_clear(&app.run.pending, app.run.alloc)
 	snapshot_destroy(app)
 	menu_destroy(&app.menu, app.run.alloc)
 	delete(app.completion_query, app.run.alloc)

@@ -92,9 +92,6 @@ work_destroy :: proc(app: ^App, work: Work) {
 	if work.text != "" {
 		delete(work.text, app.run.alloc)
 	}
-	if work.provider != "" {
-		delete(work.provider, app.run.alloc)
-	}
 }
 
 // session_refresh_rows rebuilds the list the /resume menu shows. Only the worker
@@ -165,6 +162,8 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			provider_id = app.setup.provider_id,
 			model_id    = app.setup.model_id,
 			connection  = app.run.connection,
+			apply       = app_steer_apply,
+			apply_data  = app,
 		}
 		completed := agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer)
 		// A steering line applies at a request boundary inside the turn it was typed
@@ -183,7 +182,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 				if strings.has_prefix(line, "/") {
 					dispatch_command(app, line)
 				} else {
-					enqueue(app, .Prompt, "", line)
+					enqueue(app, .Prompt, line)
 				}
 			}
 		} else if dropped := agent.steer_clear(&app.run.steer); dropped > 0 {
@@ -223,7 +222,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			}
 		}
 	case .Model:
-		apply_selection(app, work.provider, work.text, "")
+		apply_pending_selection(app)
 	case .New_Session:
 		rows_dirty = true
 		// The new session runs the same selection; only the conversation is new.
