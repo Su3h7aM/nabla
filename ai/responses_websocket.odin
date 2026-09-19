@@ -119,14 +119,15 @@ Provider_WebSocket_Request :: proc(
 	}
 
 	state := Provider_Request_Stream_State {
-		stream    = Provider_Stream_Start(.OpenAI_Responses, allocator),
-		api       = .OpenAI_Responses,
-		user_data = user_data,
-		callback  = callback,
-		allocator = allocator,
-		interrupt = options.interrupt,
-		deadline  = options.deadline,
-		observer  = options.observer,
+		stream     = Provider_Stream_Start(.OpenAI_Responses, allocator),
+		api        = .OpenAI_Responses,
+		user_data  = user_data,
+		callback   = callback,
+		allocator  = allocator,
+		interrupt  = options.interrupt,
+		deadline   = options.deadline,
+		observer   = options.observer,
+		error_body = make([dynamic]u8, allocator),
 	}
 	defer Provider_Event_Destroy(&state.completion, allocator)
 	defer Provider_Stream_Destroy(&state.stream)

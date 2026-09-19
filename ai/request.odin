@@ -368,14 +368,15 @@ Provider_Request_Operation_Encoded :: proc(
 	defer provider_headers_destroy(headers, allocator)
 
 	state := Provider_Request_Stream_State {
-		stream    = Provider_Stream_Start(connection.API, allocator),
-		api       = connection.API,
-		user_data = user_data,
-		callback  = callback,
-		allocator = allocator,
-		interrupt = options.interrupt,
-		deadline  = options.deadline,
-		observer  = options.observer,
+		stream     = Provider_Stream_Start(connection.API, allocator),
+		api        = connection.API,
+		user_data  = user_data,
+		callback   = callback,
+		allocator  = allocator,
+		interrupt  = options.interrupt,
+		deadline   = options.deadline,
+		observer   = options.observer,
+		error_body = make([dynamic]u8, allocator),
 	}
 	sse.parser_init(&state.parser, provider_sse_event, &state, allocator = allocator)
 	defer sse.parser_destroy(&state.parser)
@@ -420,7 +421,7 @@ Provider_Request_Operation_Encoded :: proc(
 		// body. It is decoded before that body is released, and one that is absent,
 		// truncated, or malformed simply leaves the status and the transport facts as
 		// the evidence.
-		state.rejection = provider_rejection_parse(encoded.API, state.error_body[:state.error_body_len], allocator)
+		state.rejection = provider_rejection_parse(encoded.API, state.error_body[:], allocator)
 		if !state.failed { provider_emit_error(&state, provider_failure_kind(failure), failure.detail) }
 		provider_drain_events(&state)
 		return provider_terminal_error(&state, provider_operation_error_kind(failure))
@@ -467,11 +468,11 @@ Provider_Request_Stream_State :: struct {
 	// completion is the terminal response, retained until the transport finishes
 	// cleanly: no call becomes executable while a later failure could still arrive.
 	completion:       Provider_Event,
-	// error_body keeps what a refused response carried, bounded by this package's own
-	// policy: the transport hands over a body of any size, and what is kept here is
-	// enough to read a provider's error document and no more.
-	error_body:       [PROVIDER_MAX_ERROR_BODY_BYTES]u8,
-	error_body_len:   int,
+	// error_body keeps a refused response's body. The transport hands over a
+	// body of any size, and all of it is kept: a large valid error document
+	// can carry its rejection evidence past any prefix, and only the complete
+	// body is parsed before classification. Owned here until release.
+	error_body:       [dynamic]u8,
 	transfer:         Provider_Transfer_Summary,
 	transfer_present: bool,
 	// delivery and delivery_present are the model-send evidence this attempt
@@ -481,11 +482,6 @@ Provider_Request_Stream_State :: struct {
 	delivery_present: bool,
 	transport_cause:  Provider_Transport_Cause,
 }
-
-// PROVIDER_MAX_ERROR_BODY_BYTES bounds the copy this package keeps of the body of a
-// response it could not use. It is this layer's policy, not the transport's: HTTP
-// sets no limit on a body, and a provider's error document is small.
-PROVIDER_MAX_ERROR_BODY_BYTES :: 8192
 
 // Provider_Response_Head is what a final response head said, in this package's
 // vocabulary. It is recorded while the transport's headers are borrowed, so the
@@ -555,6 +551,7 @@ provider_transfer_summary :: proc(user_data: rawptr, summary: Provider_Transfer_
 provider_state_release :: proc(state: ^Provider_Request_Stream_State) {
 	if state == nil { return }
 	if state.failure_detail != "" { delete(state.failure_detail, state.allocator) }
+	delete(state.error_body)
 	provider_rejection_destroy(&state.rejection, state.allocator)
 	if state.response_head.provider_request_id != "" {
 		delete(state.response_head.provider_request_id, state.allocator)
@@ -838,14 +835,11 @@ provider_http_chunk :: proc(user_data: rawptr, chunk: []u8) {
 	sse.parser_feed(&state.parser, chunk)
 }
 
-// provider_error_body_append keeps what fits of a refused response's body and drops
-// the rest. What is dropped is not reported as absent: the status, the transport's
-// account of the attempt, and the provider's own rejection are separate facts from
-// how much of the body this layer chose to keep.
+// provider_error_body_append keeps a refused response's body for the
+// classification that follows. All of it is kept: only the complete body is
+// parsed, so a rejection whose evidence arrives late in a large document is
+// still read. The buffer grows with the operation's allocator, and release
+// frees it.
 provider_error_body_append :: proc(state: ^Provider_Request_Stream_State, chunk: []u8) {
-	space := PROVIDER_MAX_ERROR_BODY_BYTES - state.error_body_len
-	if space <= 0 { return }
-	count := min(space, len(chunk))
-	copy(state.error_body[state.error_body_len:state.error_body_len + count], chunk[:count])
-	state.error_body_len += count
+	append(&state.error_body, ..chunk)
 }

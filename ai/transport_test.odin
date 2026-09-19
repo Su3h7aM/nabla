@@ -657,6 +657,33 @@ test_a_200_error_document_is_classified_by_its_code :: proc(t: ^testing.T) {
 	testing.expect_value(t, job.completions, 0)
 }
 
+// A large valid error document carries its rejection evidence wherever it
+// lies: only the complete body is parsed, so a code past the old prefix bound
+// still classifies the refusal instead of leaving the status to decide alone.
+@(test)
+test_a_large_error_document_is_classified_by_its_code :: proc(t: ^testing.T) {
+	pad := strings.repeat("x", 9000, context.temp_allocator)
+	body := strings.concatenate(
+		{`{"error":{"pad":"`, pad, `","message":"This model's maximum context length is 8192 tokens","code":"context_length_exceeded"}}`},
+		context.temp_allocator,
+	)
+	testing.expect(t, len(body) > 8192, "the code must lie past the old prefix bound")
+
+	job: Transport_Job
+	observed: Transport_Observation
+	if !transport_refusal_once(t, refusal_response("400 Bad Request", "application/json", "", body), &job, &observed) {
+		return
+	}
+	defer transport_job_destroy(&job, job.allocator)
+
+	testing.expect_value(t, job.error.kind, Provider_Operation_Error_Kind.HTTP)
+	testing.expect_value(t, job.error.status, 400)
+	testing.expect_value(t, job.error.failure_class, Provider_Failure_Class.Context_Overflow)
+	testing.expect_value(t, job.error.provider_code, "context_length_exceeded")
+	testing.expect_value(t, observed.chunk_bytes, len(body))
+	testing.expect_value(t, job.completions, 0)
+}
+
 // A request that was written and got nothing back may have run: the operation says
 // so, so recovery can refuse to send the same bytes again.
 @(test)
