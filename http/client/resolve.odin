@@ -77,8 +77,11 @@ query_nameservers :: proc(
 		// A datagram from anyone but the queried server cannot answer this query.
 		if count == 0 || source != server { continue }
 		records, xid, parsed := net.parse_response(response_buffer[:count], kind, allocator)
-		if !parsed || xid != id { continue }
-		if len(records) == 0 { continue }
+		if !parsed { continue }
+		if xid != id || len(records) == 0 {
+			net.destroy_dns_records(records, allocator)
+			continue
+		}
 		return records, .None
 	}
 	return nil, .None
