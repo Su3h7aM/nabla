@@ -336,11 +336,6 @@ provider_retry_directive :: proc(api: API_Kind, headers: http.Headers) -> Provid
 	return .Unspecified
 }
 
-// PROVIDER_MAX_DELAY_TEXT bounds the header text read for a delay. A longer value
-// is not a delay any policy would wait for, and reading it would mean copying
-// peer-controlled text to decide that.
-PROVIDER_MAX_DELAY_TEXT :: 256
-
 // PROVIDER_RETRY_AFTER_TOO_LONG is the delay reported for a value that is valid
 // but longer than any policy should wait for. It is a reason to stop and say what
 // the provider asked for, never a delay to sleep for: a ten-minute instruction is
@@ -351,15 +346,18 @@ PROVIDER_RETRY_AFTER_MAX_SECONDS :: i64(PROVIDER_RETRY_AFTER_TOO_LONG / time.Sec
 
 // provider_retry_after reads the delay a provider asked for.
 //
-// RFC 9110 10.2.3: the field is either a nonnegative decimal number of seconds or
-// an HTTP-date. Anything else yields no delay, including a value the transport
-// combined from repeated fields: the field is not a list, so a comma means the peer
-// sent something that is not an instruction this client can read. A date is
+// RFC 9110 10.2.3: the field is either delay-seconds (1*DIGIT, a nonnegative
+// number of seconds) or an HTTP-date, and neither form has a length bound.
+// Anything else yields no delay, including a value the transport combined
+// from repeated fields: the field is not a list, so a comma means the peer
+// sent something that is not an instruction this client can read. Digits are
+// scanned in full no matter how many there are, without allocating a big
+// integer; leading zeros do not overflow. A date is
 // converted once, here at receipt, against the wall clock; the wait itself runs on
 // a monotonic deadline, so the clock moving afterwards cannot shorten it.
 provider_retry_after :: proc(value: string) -> Maybe(time.Duration) {
-	if len(value) == 0 || len(value) > PROVIDER_MAX_DELAY_TEXT { return nil }
-	text := strings.trim_space(value)
+	if len(value) == 0 { return nil }
+	text := http.trim_ows(value)
 	if text == "" { return nil }
 
 	digits := true

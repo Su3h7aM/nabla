@@ -165,8 +165,13 @@ test_retry_after :: proc(t: ^testing.T) {
 	expect_no_delay(t, "5, 10")
 	// An RFC 3339 timestamp is not an HTTP date.
 	expect_no_delay(t, "2030-01-01T00:00:00Z")
-	// Longer than any delay this client inspects, so it decides nothing.
-	expect_no_delay(t, strings.repeat("1", PROVIDER_MAX_DELAY_TEXT + 1, context.temp_allocator))
+
+	// Neither form has a length bound: a long digit string is scanned in full,
+	// and one past any policy still asks for a delay rather than asking for
+	// nothing, because a caller that read that as silence would send again.
+	expect_out_of_policy(t, strings.repeat("1", 300, context.temp_allocator))
+	// Leading zeros do not overflow: this is seven seconds, not a huge one.
+	expect_delay(t, strings.concatenate({strings.repeat("0", 300, context.temp_allocator), "7"}, context.temp_allocator), 7 * time.Second)
 
 	// Valid but beyond any policy: reported as out of policy rather than as absent,
 	// because a caller that read it as silence would send again.
