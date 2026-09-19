@@ -93,8 +93,18 @@ Provider_Operation_Error_Kind :: enum {
 	TLS,
 }
 
+Provider_Delivery_State :: enum {
+	None,
+	Model_Send_Started,
+	Response_Observed,
+	Terminal_Observed,
+}
+
 Provider_Operation_Error :: struct {
 	kind:                Provider_Operation_Error_Kind,
+	// delivery is how far a model request observably progressed. Once sending
+	// starts, replay is ambiguous even when no model output reached the caller.
+	delivery:            Provider_Delivery_State,
 	// failure_class is the provider's normalized meaning for this failure, and None
 	// when no provider classification applies: a local refusal, or an attempt that
 	// never reached the provider. Neither is a success signal.

@@ -505,12 +505,23 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 		selection_fail(app, fmt.tprintf("unsupported api: %s", api_name))
 		return false
 	}
+	if provider.transport == .WebSocket && api != .OpenAI_Responses {
+		delete(credential, app.setup.alloc)
+		selection_fail(app, fmt.tprintf("provider %s requires WebSocket but model %s does not use the Responses API", provider_id, model_id))
+		return false
+	}
 
 	running := &app.setup.session
 	// A different model means a different window and a different cache identity, so
 	// a summary computed for the previous one is no longer a summary of this
 	// conversation. It is stopped here rather than installed against the old base.
 	agent.chat_compact_cancel(running)
+	if running.provider_websocket != nil {
+		ai.Provider_WebSocket_Session_Destroy(running.provider_websocket)
+		running.provider_websocket = nil
+	}
+	running.provider_transport = provider.transport
+	running.websocket_fallback_http = false
 	// The resolved model carries its own context budget, so the session copies that
 	// rather than a window and an output bound to divide again later.
 	running.capacity = model.capacity

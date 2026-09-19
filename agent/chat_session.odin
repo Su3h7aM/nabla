@@ -6,6 +6,7 @@ import "core:unicode/utf8"
 
 import "nabla:agent/session"
 import "nabla:agent/skills"
+import "nabla:ai"
 
 // Chat_Tool_Call is a validated tool call awaiting execution. seq is the stored
 // tool-call entry it belongs to, so the dispatch and the result can name it.
@@ -127,6 +128,9 @@ Chat_Session :: struct {
 	workspace:                    string, // owned; validated process directory
 	provider_id:                  string, // owned; the provider requests are addressed to
 	model_id:                     string, // owned; the model requests ask for
+	provider_transport:           Provider_Transport,
+	provider_websocket:           ^ai.Provider_WebSocket_Session,
+	websocket_fallback_http:      bool,
 	tools_enabled:                bool, // frozen for the session's life
 	// capacity is the resolved model's context budget, copied from the catalog when
 	// the model was selected. It is the only thing that answers how much a request
@@ -248,6 +252,10 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	// Compaction's worker borrows this session's id for its logging correlation, so
 	// it is stopped before anything the session owns is released.
 	chat_compact_destroy(chat)
+	if chat.provider_websocket != nil {
+		ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
+		chat.provider_websocket = nil
+	}
 	if catalog, present := &chat.skill_catalog.?; present { skills.catalog_destroy(catalog, chat.allocator) }
 	chat.skill_catalog = nil
 	delete(chat.skill_instructions, chat.allocator)

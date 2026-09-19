@@ -62,6 +62,12 @@ test_recovery_decision_stops_for_its_own_facts :: proc(t: ^testing.T) {
 		{"harness failed the send", {attempts = 1, error = transient, failed = true}, .Stop, .Harness_Failure},
 		{"text was published", {attempts = 1, error = transient, text_exposed = true}, .Stop, .Output_Exposed},
 		{"a completion was accepted", {attempts = 1, error = transient, completion_accepted = true}, .Stop, .Output_Exposed},
+		{
+			"model send was ambiguous",
+			{attempts = 1, error = {kind = .Transport, failure_class = .Provider_Unavailable, delivery = .Model_Send_Started}},
+			.Stop,
+			.Ambiguous_Delivery,
+		},
 		{"last send allowed", {attempts = policy.max_attempts, error = transient}, .Stop, .Attempts_Exhausted},
 		{"operation finished", {attempts = 1, error = {kind = .None}}, .Stop, .Completed},
 		// The one repair is the chain's whole allowance: a second refusal is terminal,

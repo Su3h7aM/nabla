@@ -217,13 +217,56 @@ chat_perform_request :: proc(
 	// fresh encoding that has to be assumed equal. A request that cannot be encoded
 	// never reaches the provider, so it fails the turn here, before a request row
 	// exists, rather than being recorded as a send that did not happen.
-	encoded, encode_err := ai.Provider_Request_Freeze(prep.request, chat.allocator)
+	// The request carries interruption only. No deadline is set: the request
+	// stays open as long as the provider keeps it open, and ends when the
+	// provider, the transport, or cancellation ends it.
+	options := ai.Provider_Operation_Options {
+		interrupt = &chat_cancel,
+	}
+	websocket_request := connection.API == .OpenAI_Responses && chat.provider_transport != .HTTP && !chat.websocket_fallback_http
+	encoded: ai.Provider_Encoded_Request
+	encode_err: ai.Provider_Operation_Error
+	if websocket_request {
+		encoded, encode_err = ai.Provider_Request_Freeze_WebSocket(prep.request, chat.allocator)
+	} else {
+		encoded, encode_err = ai.Provider_Request_Freeze(prep.request, chat.allocator)
+	}
 	if encode_err.kind != .None {
 		chat_session_fail_turn(chat, encode_err.detail)
 		ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
 		return
 	}
 	defer delete(encoded.Body, chat.allocator)
+	if websocket_request && chat.provider_websocket == nil {
+		chat.provider_websocket, encode_err = ai.Provider_WebSocket_Session_Open(connection, chat.allocator)
+		if encode_err.kind != .None {
+			chat_session_fail_turn(chat, encode_err.detail)
+			ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
+			return
+		}
+	}
+	if websocket_request && chat.provider_transport == .Auto {
+		connect_err := ai.Provider_WebSocket_Connect(chat.provider_websocket, encoded, options)
+		if connect_err.kind != .None {
+			if !chat_websocket_fallback_safe(connect_err) {
+				chat_session_fail_turn(chat, connect_err.detail)
+				ai.Provider_Operation_Error_Destroy(&connect_err, chat.allocator)
+				return
+			}
+			ai.Provider_Operation_Error_Destroy(&connect_err, chat.allocator)
+			ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
+			chat.provider_websocket = nil
+			chat.websocket_fallback_http = true
+			websocket_request = false
+			delete(encoded.Body, chat.allocator)
+			encoded, encode_err = ai.Provider_Request_Freeze(prep.request, chat.allocator)
+			if encode_err.kind != .None {
+				chat_session_fail_turn(chat, encode_err.detail)
+				ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
+				return
+			}
+		}
+	}
 
 	chat.last_estimate = prep.estimate
 
@@ -241,12 +284,6 @@ chat_perform_request :: proc(
 	}
 	log_emit({level = .Info, category = .Provider, event = "request.prepared", fields = prepared[:]})
 
-	// The request carries interruption only. No deadline is set: the request
-	// stays open as long as the provider keeps it open, and ends when the
-	// provider, the transport, or cancellation ends it.
-	options := ai.Provider_Operation_Options {
-		interrupt = &chat_cancel,
-	}
 	// One request may be attempted more than once, and every attempt sends the
 	// frozen bytes: nothing about the request changes between attempts. A retry
 	// happens only while nothing has been exposed to the model, so the conversation
@@ -358,7 +395,11 @@ chat_perform_request :: proc(
 		if log_observation_wanted() { options.observer = provider_log_observer(&provider_log) } else { options.observer = {} }
 
 		at := time.tick_now()
-		operation_error = ai.Provider_Request_Operation_Encoded(connection, encoded, &runtime, chat_provider_event, options, chat.allocator)
+		if websocket_request {
+			operation_error = ai.Provider_WebSocket_Request(chat.provider_websocket, encoded, &runtime, chat_provider_event, options)
+		} else {
+			operation_error = ai.Provider_Request_Operation_Encoded(connection, encoded, &runtime, chat_provider_event, options, chat.allocator)
+		}
 		finish_reason = runtime.finish_reason
 		text_exposed = runtime.text_exposed
 		completion_accepted = runtime.completion_accepted
@@ -450,7 +491,7 @@ chat_perform_request :: proc(
 			// the harness already has, rebuilds the request against it, and the next attempt
 			// of this same chain sends that instead, with no wait and no reset of the bound.
 			previous_estimate := prep.estimate
-			refusal := chat_repair_context(chat, connection, observer, &prep, &encoded, previous_estimate)
+			refusal := chat_repair_context(chat, connection, observer, &prep, &encoded, previous_estimate, websocket_request)
 			if refusal != .None {
 				chat.turn_repair_refusal = refusal
 				// The session keeps the pressure, so the next safe boundary starts the
@@ -835,6 +876,18 @@ chat_run_turn :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, p
 // Steer_Context carries the steering queue into the turn loop. Nil means no
 // steering: queued lines are drained before every model request, which is
 // after tool calls settled and before the request is read from the store.
+chat_websocket_fallback_safe :: proc(err: ai.Provider_Operation_Error) -> bool {
+	if err.delivery != .None { return false }
+	if err.transport_cause == .Trust || err.transport_cause == .Configuration { return false }
+	if err.kind == .Transport { return true }
+	if err.kind != .HTTP { return false }
+	switch err.status {
+	case 404, 405, 426, 501:
+		return true
+	}
+	return false
+}
+
 Steer_Context :: struct {
 	queue:       ^Steer_Queue,
 	// quit, when not nil, is set by a queued line that asks the session to end.

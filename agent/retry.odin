@@ -82,6 +82,10 @@ Request_Recovery_Reason :: enum {
 	Storage_Failed,
 	// Cancelled is a turn the user or the driver stopped.
 	Cancelled,
+	// Ambiguous_Delivery is a failed operation after model-send bytes may have
+	// reached the provider. Replaying could create a second response even when no
+	// output reached the caller.
+	Ambiguous_Delivery,
 	// Output_Exposed is a failure after the attempt had already published text or an
 	// accepted completion. Sending again could publish a second answer, so the chain
 	// stops and keeps what was published as partial.
@@ -114,6 +118,8 @@ request_recovery_reason_name :: proc(reason: Request_Recovery_Reason) -> string 
 		return "storage_failed"
 	case .Cancelled:
 		return "cancelled"
+	case .Ambiguous_Delivery:
+		return "ambiguous_delivery"
 	case .Output_Exposed:
 		return "output_exposed"
 	case .Context_Exhausted:
@@ -179,6 +185,9 @@ chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Fact
 	if facts.error.kind == .None { return {action = .Stop, reason = .Completed} }
 	if facts.text_exposed || facts.completion_accepted {
 		return {action = .Stop, reason = .Output_Exposed}
+	}
+	if facts.error.delivery != .None {
+		return {action = .Stop, reason = .Ambiguous_Delivery}
 	}
 	if facts.error.failure_class == .Context_Overflow {
 		// A rejected payload is never resent. The chain either makes room for a rebuilt

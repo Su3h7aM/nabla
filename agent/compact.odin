@@ -1107,6 +1107,7 @@ chat_repair_context :: proc(
 	prep: ^Chat_Request_Prep,
 	encoded: ^ai.Provider_Encoded_Request,
 	previous_estimate: int,
+	websocket_request: bool,
 ) -> Chat_Repair_Refusal {
 	// A summary may have finished while the rejected request was being sent.
 	chat_compact_poll(chat, observer)
@@ -1133,7 +1134,13 @@ chat_repair_context :: proc(
 		return .No_Reduction
 	}
 
-	rebuilt, encode_err := ai.Provider_Request_Freeze(prep.request, chat.allocator)
+	rebuilt: ai.Provider_Encoded_Request
+	encode_err: ai.Provider_Operation_Error
+	if websocket_request {
+		rebuilt, encode_err = ai.Provider_Request_Freeze_WebSocket(prep.request, chat.allocator)
+	} else {
+		rebuilt, encode_err = ai.Provider_Request_Freeze(prep.request, chat.allocator)
+	}
 	if encode_err.kind != .None {
 		chat_session_fail_turn(chat, encode_err.detail)
 		ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)

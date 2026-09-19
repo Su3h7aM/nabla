@@ -72,6 +72,22 @@ Provider_Request_Freeze_WebSocket :: proc(request: Provider_Request, allocator :
 	}, {}
 }
 
+Provider_WebSocket_Connect :: proc(
+	session: ^Provider_WebSocket_Session,
+	encoded: Provider_Encoded_Request,
+	options: Provider_Operation_Options,
+) -> Provider_Operation_Error {
+	if session == nil || encoded.API != .OpenAI_Responses {
+		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("invalid Responses WebSocket session", session_allocator(session))}
+	}
+	session.control = HTTP_Control {
+		interrupt = options.interrupt,
+		deadline  = options.deadline,
+	}
+	if session.socket != nil { return {} }
+	return provider_websocket_dial(session, encoded, options)
+}
+
 // Provider_WebSocket_Request performs one sequential Responses operation. A valid
 // terminal event completes the request while the socket remains open for reuse.
 Provider_WebSocket_Request :: proc(
@@ -85,14 +101,8 @@ Provider_WebSocket_Request :: proc(
 		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("invalid Responses WebSocket request", session_allocator(session))}
 	}
 	allocator := session.allocator
-	session.control = HTTP_Control {
-		interrupt = options.interrupt,
-		deadline  = options.deadline,
-	}
-	if session.socket == nil {
-		if dial_err := provider_websocket_dial(session, encoded, options); dial_err.kind != .None {
-			return dial_err
-		}
+	if connect_err := Provider_WebSocket_Connect(session, encoded, options); connect_err.kind != .None {
+		return connect_err
 	}
 	if options.observer.report != nil {
 		options.observer.report(
@@ -117,8 +127,9 @@ Provider_WebSocket_Request :: proc(
 
 	if write_err := websocket.write(session.socket, .Text, encoded.Body); write_err != .None {
 		provider_websocket_drop(session)
-		return provider_websocket_error(&state, write_err, "the WebSocket request could not be sent")
+		return provider_websocket_error(&state, write_err, "the WebSocket request could not be sent", .Model_Send_Started)
 	}
+	delivery := Provider_Delivery_State.Model_Send_Started
 
 	message: [dynamic]u8
 	message.allocator = allocator
@@ -128,13 +139,14 @@ Provider_WebSocket_Request :: proc(
 		count, opcode, complete, read_err := websocket.read(session.socket, chunk[:])
 		if read_err != .None {
 			provider_websocket_drop(session)
-			return provider_websocket_error(&state, read_err, "the WebSocket response ended before a terminal event")
+			return provider_websocket_error(&state, read_err, "the WebSocket response ended before a terminal event", delivery)
 		}
 		if opcode != .Text {
 			provider_websocket_drop(session)
-			return provider_websocket_error(&state, .Protocol, "the Responses WebSocket sent a binary message")
+			return provider_websocket_error(&state, .Protocol, "the Responses WebSocket sent a binary message", .Response_Observed)
 		}
 		if count > 0 {
+			delivery = .Response_Observed
 			append(&message, ..chunk[:count])
 			state.response_bytes += u64(count)
 			if options.observer.report != nil {
@@ -151,7 +163,11 @@ Provider_WebSocket_Request :: proc(
 		if stream_err != .None && !state.failed {
 			provider_emit_error(&state, .Invalid_Data, provider_stream_error_text(stream_err))
 		}
-		if state.failed { return provider_terminal_error(&state, .Stream) }
+		if state.failed {
+			err := provider_terminal_error(&state, .Stream)
+			err.delivery = .Terminal_Observed
+			return err
+		}
 		if state.stream.Phase == .Completed && state.completion != nil {
 			provider_deliver(&state, state.completion)
 			state.completion = nil
@@ -186,12 +202,16 @@ provider_websocket_dial :: proc(
 		defer websocket.dial_failure_destroy(&failure, allocator)
 		kind := Provider_Operation_Error_Kind.Transport
 		if failure.kind == .Response { kind = .HTTP }
-		return Provider_Operation_Error {
-			kind = kind,
-			status = failure.status,
+		result := Provider_Operation_Error {
+			kind            = kind,
+			status          = failure.status,
 			transport_cause = provider_transport_cause(failure.cause),
-			detail = strings.clone(failure.detail, allocator),
+			detail          = strings.clone(failure.detail, allocator),
 		}
+		if kind == .Transport && result.transport_cause != .Trust && result.transport_cause != .Configuration {
+			result.failure_class = .Provider_Unavailable
+		}
+		return result
 	}
 	session.socket = socket
 	session.generation += 1
@@ -222,7 +242,12 @@ provider_websocket_drop :: proc(session: ^Provider_WebSocket_Session) {
 	session.socket = nil
 }
 
-provider_websocket_error :: proc(state: ^Provider_Request_Stream_State, cause: websocket.Error, detail: string) -> Provider_Operation_Error {
+provider_websocket_error :: proc(
+	state: ^Provider_Request_Stream_State,
+	cause: websocket.Error,
+	detail: string,
+	delivery: Provider_Delivery_State,
+) -> Provider_Operation_Error {
 	kind := Provider_Operation_Error_Kind.Transport
 	failure_kind := Provider_Error_Kind.Stream_Truncated
 	if interrupt_requested(state.interrupt) {
@@ -237,7 +262,9 @@ provider_websocket_error :: proc(state: ^Provider_Request_Stream_State, cause: w
 	}
 	provider_emit_error(state, failure_kind, detail)
 	provider_drain_events(state)
-	return provider_terminal_error(state, kind)
+	err := provider_terminal_error(state, kind)
+	err.delivery = delivery
+	return err
 }
 
 session_allocator :: proc(session: ^Provider_WebSocket_Session) -> mem.Allocator {
