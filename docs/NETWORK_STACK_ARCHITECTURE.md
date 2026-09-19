@@ -680,11 +680,13 @@ Implementation gates, each a scoped change:
    claim provider compatibility from a WS echo alone.
 
 Two seams cannot be reached by an in-package test: the wire form of a request and the
-reuse of one connection across turns. They were verified with a throwaway scripted peer
-outside the repository, which spoke both transports itself and asserted the handshake, the
-`response.create` envelope, the absence of the HTTP-only fields, one connection carrying
-two model requests, and the fallback decision. No peer script is committed here: the
-repository's tests stay Odin, and a test earns its place by catching a real fault.
+reuse of one connection across turns. The connection seam is covered by
+`websocket/test/echo`, whose peer frames RFC 6455 in Odin rather than borrowing the
+client's encoder, so no foreign language enters this repository. The provider seam was
+verified during development with a throwaway scripted peer outside the repository, which
+asserted the handshake, the `response.create` envelope, the absence of the HTTP-only
+fields, one connection carrying two model requests, and the fallback decision. A test earns
+its place by catching a real fault, so nothing was committed for it.
 
 ### 9.9 Reference evidence and deliberate differences
 
