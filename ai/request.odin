@@ -197,6 +197,40 @@ Provider_Operation_Options :: struct {
 	observer:    Provider_Operation_Observer,
 }
 
+// provider_resource_path is the resource path an API family names. The configured
+// endpoint is the API root, version segment included, so the path is relative to
+// it.
+provider_resource_path :: proc(api: API_Kind) -> string {
+	switch api {
+	case .OpenAI_Chat_Completions:
+		return "/chat/completions"
+	case .OpenAI_Responses:
+		return "/responses"
+	case .Anthropic_Messages:
+		return "/messages"
+	case .Invalid:
+	}
+	return ""
+}
+
+// provider_endpoint places the API's resource path on the configured endpoint. The
+// endpoint may already state the path, and it may state a query, which belongs after
+// the path rather than inside it.
+provider_endpoint :: proc(endpoint: string, api: API_Kind, allocator: mem.Allocator) -> (result: string, ok: bool) {
+	url := http.url_parse(endpoint)
+	if url.scheme == "" || url.host == "" { return "", false }
+	resource := provider_resource_path(api)
+	path := strings.trim_right(url.path, "/")
+	owned := ""
+	defer if owned != "" { delete(owned, allocator) }
+	if !strings.has_suffix(path, resource) {
+		owned = strings.concatenate([]string{path, resource}, allocator = allocator)
+		path = owned
+	}
+	if url.query == "" { return strings.concatenate([]string{url.scheme, "://", url.host, path}, allocator = allocator), true }
+	return strings.concatenate([]string{url.scheme, "://", url.host, path, "?", url.query}, allocator = allocator), true
+}
+
 // provider_request_headers builds the fields one request carries: the ones its
 // API family authenticates with, the version header that family requires, and
 // the client and session identities the caller named. Authentication and
@@ -314,27 +348,11 @@ Provider_Request_Operation_Encoded :: proc(
 	if len(encoded.Body) == 0 {
 		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("the encoded request body is empty", allocator)}
 	}
-	endpoint := strings.trim_right(connection.Endpoint, "/")
-	owned_endpoint := ""
-	// Each API family names its own resource path. A configured endpoint may
-	// already include it, so the suffix is added only when it is missing.
-	want_suffix: string
-	switch encoded.API {
-	case .OpenAI_Chat_Completions:
-		want_suffix = "/chat/completions"
-	case .OpenAI_Responses:
-		want_suffix = "/responses"
-	case .Anthropic_Messages:
-		// The configured endpoint is the API root, version segment included, so the
-		// resource path is relative to it exactly as the OpenAI paths are.
-		want_suffix = "/messages"
-	case .Invalid:
+	endpoint, endpoint_ok := provider_endpoint(connection.Endpoint, connection.API, allocator)
+	if !endpoint_ok {
+		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("the provider endpoint is not an absolute URL", allocator)}
 	}
-	if want_suffix != "" && !strings.has_suffix(endpoint, want_suffix) {
-		owned_endpoint = strings.concatenate([]string{endpoint, want_suffix}, allocator = allocator)
-		endpoint = owned_endpoint
-	}
-	defer delete(owned_endpoint, allocator)
+	defer delete(endpoint, allocator)
 	if options.observer.report != nil {
 		options.observer.report(
 			options.observer.user_data,

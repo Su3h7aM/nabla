@@ -229,21 +229,14 @@ provider_websocket_dial :: proc(
 }
 
 provider_websocket_endpoint :: proc(base: string, allocator: mem.Allocator) -> (string, bool) {
-	// The resource path belongs to the protocol, so a base URL that does not state it gets
-	// it appended. That string is owned for the whole call, not for the block that builds
-	// it: reading it after the block would read freed memory.
-	resource := strings.trim_right(base, "/")
-	owned := ""
-	defer if owned != "" { delete(owned, allocator) }
-	if !strings.has_suffix(resource, "/responses") {
-		owned = strings.concatenate([]string{resource, "/responses"}, allocator)
-		resource = owned
-	}
+	resource, resource_ok := provider_endpoint(base, .OpenAI_Responses, allocator)
+	if !resource_ok { return "", false }
+	defer delete(resource, allocator)
 	switch {
 	case strings.has_prefix(resource, "https://"):
-		return strings.concatenate([]string{"wss://", resource[len("https://"):]}, allocator), true
+		return strings.concatenate([]string{"wss://", resource[len("https://"):]}, allocator = allocator), true
 	case strings.has_prefix(resource, "http://"):
-		return strings.concatenate([]string{"ws://", resource[len("http://"):]}, allocator), true
+		return strings.concatenate([]string{"ws://", resource[len("http://"):]}, allocator = allocator), true
 	case strings.has_prefix(resource, "wss://"), strings.has_prefix(resource, "ws://"):
 		return strings.clone(resource, allocator), true
 	}
