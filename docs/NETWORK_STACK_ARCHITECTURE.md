@@ -319,11 +319,24 @@ Completed after this review:
   transaction mismatch or emptiness.
 - Corrected empty WebSocket messages, valid U+FFFD text, close payload validation, writes
   after Close, and minimal frame-length encoding.
+- Made the WebSocket handshake own its Upgrade, Connection, key and version fields,
+  refused extensions and unoffered subprotocols, and reported an abnormal stream close
+  distinctly from a close frame.
+- Added a nonblocking abort path through WebSocket, upgraded HTTP and TLS, so teardown
+  during cancellation does not wait on the peer.
+- Routed provider transport by API capability rather than by provider or model identity,
+  selected it from a configured `transport` field, and recorded delivery state so an
+  ambiguous model send is not replayed.
+
+Provider Responses over WebSocket is implemented for full-context requests: one
+session-owned connection, reused across foreground requests, with sticky HTTP fallback
+under `auto` and no fallback where the transport is required. Incremental continuation is
+deliberately not implemented; section 9.5 states why.
 
 The remaining bullets in section 4 still apply except where this list explicitly records a
 completed correction. In particular, TLS key-usage thresholds, dynamic outbound handshake
-messages, alert coverage, HTTP syntax and outcome redesign, DNS TCP retry/address fallback,
-and WebSocket handshake-field ownership remain open.
+messages, alert coverage, HTTP syntax and outcome redesign, and DNS TCP retry/address
+fallback remain open.
 
 ## 7. Ordered implementation plan
 
@@ -349,7 +362,8 @@ mark a phase complete from one successful live request.
    controlled cancellation races, not public resolver availability.
 6. **WebSocket correction:** empty messages, Unicode, close validation/state, handshake
    fields, extension selection and minimal frame lengths. Gate: byte fixtures and ws/wss
-   exchange with an independent peer.
+   exchange with an independent peer. Done, including handshake-field ownership and
+   abnormal-close reporting.
 7. **Acceptance and documentation cleanup:** run `mise run check`, appropriate package
    tests and the full `mise run test` gate. Verify formatter stability and no production
    libssl/libcrypto linkage. Optional live provider checks use no embedded credentials.
@@ -384,11 +398,11 @@ or a completed independent cryptographic security audit.
 
 ## 9. Provider WebSocket integration
 
-Status: design for implementation. No provider currently uses `websocket` in Nabla.
-This section is the authoritative WebSocket plan. It belongs here because connection
-ownership, transport selection, interruption and recovery cross the same boundaries as
-HTTP/SSE. The harness and retry architecture documents link here rather than duplicating
-connection policy. No separate WebSocket document or new package is needed.
+Status: implemented for full-context Responses requests over a reused connection. This
+section is the authoritative WebSocket plan. It belongs here because connection ownership,
+transport selection, interruption and recovery cross the same boundaries as HTTP/SSE. The
+harness and retry architecture documents link here rather than duplicating connection
+policy. No separate WebSocket document or new package is needed.
 
 ### 9.1 Scope and defaults
 
@@ -444,9 +458,9 @@ and a targeted adapter, not inference from a model ID.
 ### 9.3 Ownership and Odin shape
 
 Use structs for state and ordinary procedures for operations. Extend `ai` with a concrete
-provider-session value containing a lazily allocated WS connection and Responses
-continuation state. Keep `Provider_Connection` as borrowed endpoint/API/credential data;
-it must not ambiguously become both configuration and an owned socket.
+provider-session value containing a lazily dialed WS connection. Keep `Provider_Connection`
+as borrowed endpoint/API/credential data; it must not ambiguously become both configuration
+and an owned socket.
 
 `agent.Chat_Session` owns the foreground provider-session value. `ai` owns its connection,
 JSON encoding/decoding and continuation mechanics. `agent` decides selection, fallback,
@@ -475,7 +489,7 @@ Ownership requirements:
   response observer, encoded request or callback after that operation returns.
 - Active interruption and observer bindings are installed for an operation and cleared on
   retirement. A cancelled token is never reused implicitly by the next request.
-- Retained IDs, baseline input and affinity fields use the session allocator; event and
+- Whatever a session retains for later requests uses the session allocator; event and
   operation buffers use their documented allocators. Neither borrows the worker's temp
   allocator across requests. Destruction releases all retained state once.
 
@@ -501,15 +515,13 @@ JSON request from its transport envelope at preparation time:
 - Maintain separate request boundaries on a connection. Provider JSON messages are not
   synonymous with transport chunks or frames. Buffers grow with checked allocation;
   there is no copied 16 MiB cap or 128-event queue from a reference harness.
-- Unexpected binary messages, malformed JSON, mismatched response identity and unexpected
-  request-scoped events produce protocol failures and discard the connection. Unknown
-  extensible event types remain subject to the shared decoder's documented rules.
+- Unexpected binary messages, malformed JSON and unexpected request-scoped events produce
+  protocol failures and discard the connection. Unknown extensible event types remain
+  subject to the shared decoder's documented rules.
 
-Retain response identity from `response.created` and the terminal response, and verify
-consistency before authorizing completion. The current decoder drops that identity; it
-must not be reconstructed from tool-call IDs. Preserve in-band error status/code/headers
-as provider evidence, distinct from the HTTP Upgrade status. A `101` does not mean a
-model request succeeded or even began.
+Retain the provider's own in-band error status and code as evidence, distinct from the HTTP
+Upgrade status. A `101` does not mean a model request succeeded or even began, and the
+transport never turns a provider failure into a completion.
 
 A WS request completes at its valid provider terminal message, not at socket EOF. Keep
 normal tool validation and the one-terminal-callback guarantee, but do not wait for a
@@ -526,43 +538,37 @@ not attributed to the new request.
 
 ### 9.5 Continuation without losing durable history
 
-The committed local conversation remains the source of truth. Continue constructing a full
-provider projection for each logical request, including replay sanitization, tool-result
-repairs, spill handles, steering, current instructions and installed checkpoints. WS delta
-encoding is an optimization of that projection, not a replacement for it.
+The committed local conversation remains the source of truth, and every logical request is
+still built as a full provider projection: replay sanitization, tool-result repairs, spill
+handles, steering, current instructions and installed checkpoints. Full-context requests
+over a reused connection are what the transport ships with. Connection-local continuation
+(`previous_response_id` with an input suffix) is not implemented, and the reason is the
+comparison it requires rather than the field itself.
 
-For a reusable baseline, retain:
+A baseline is only valid if the input the provider now represents is exactly the prefix of
+the next projection. That representation includes the response's own output items, while a
+later request replays those items through the encoder's input normalization, which drops
+output-only fields such as `status`. A comparison therefore has to be stated in the same
+normalized vocabulary as the replay encoder and verified item by item. Getting this subtly
+wrong would tell the provider that it already holds input it does not, and the divergence
+would surface as a wrong answer rather than as an error. Until a measured need justifies
+that work, the transport sends the full projection, which is always correct.
 
-- the connection generation and affinity;
-- the previous response ID;
-- the exact normalized input sequence represented by that response, including its
-  replayable output items;
-- the non-input request settings used to establish the baseline.
+Should it return, these constraints are already fixed:
 
-Use a delta only when the newly prepared full input has that sequence as an exact prefix
-and the non-input settings match. Compare JSON values or deterministic normalized
-serialization, not hash equality alone and not byte offsets in an unstable map encoding.
-Then transmit only the suffix plus `previous_response_id`. Conservatively sending full
-input when max-output, tools or other settings changed is correct; selectively relaxing
-this equality is later optimization, not required functionality.
+- Retain the connection identity, the previous response ID, the exact normalized input
+  sequence the response represented, and the non-input settings that established it.
+- Use a suffix only when the new input has that sequence as an exact prefix and the settings
+  match; compare normalized serialization, not hashes or byte offsets in a map.
+- Stage the state on a valid terminal message and promote it only after the harness accepts
+  and durably records the response. Cancellation, parser failure, storage failure and a
+  rejected completion establish nothing.
+- Keep `store:false`, discard connection-local identity on reconnect or process restart, and
+  send full context. A `previous_response_not_found` rejection would invalidate the baseline
+  and permit one full-context retry within the existing attempt budget.
 
-Use the same normalization for baseline output and ordinary full replay. Tool calls that
-were repaired or refused, replaced tool outputs, altered instructions, compacted history
-and model changes must not leave a baseline that claims different input than the harness
-would send. If prefix equivalence cannot be proved, send the full projection with no
-`previous_response_id`. Do not silently trim or mutate the projected history to fit a cache.
-
-Stage continuation state after a valid terminal message. Promote it only once the harness
-accepts and durably records the response; otherwise discard it. Cancellation, parser failure,
-storage failure and a rejected completion cannot establish an authoritative baseline.
-The next full projection is still checked even after promotion.
-
-Keep `store:false`. On reconnect or process restart, discard connection-local IDs and send
-full context. A stored response ID is not a durable substitute for conversation entries.
-A `previous_response_not_found` rejection invalidates the baseline and is evidence for one
-full-context retry, subject to section 9.6. Do not rerun tools to reconstruct that request.
-Delta continuation is an explicitly testable milestone after full-context socket reuse,
-not a prerequisite for enabling the transport or a reason to block its initial delivery.
+Today a reconnect discards the state, which is the correct outcome for every one of those
+cases by a shorter route.
 
 ### 9.6 Failures, retries and fallback
 
@@ -635,15 +641,15 @@ On cancellation, protocol failure or ambiguous delivery, abort and destroy the c
 on its owning thread. Do not wait indefinitely for a WS close handshake in a destructor,
 and do not leave unread output for the next request. Normal close is an explicit operation
 under caller control; resource destruction must also provide an abort path that does not
-perform a blocking TLS close write. Clear the continuation and active probe bindings.
+perform a blocking TLS close write. Clear the active probe bindings.
 
 ### 9.8 Observations, persistence and tests
 
 Extend `Provider_Operation_Report` and transfer facts only with observable distinctions:
-selected transport, connection generation/reuse, full versus delta input, setup outcome,
-model send progress, response ID, terminal result and fallback reason. Request byte counts
-must distinguish the HTTP Upgrade from model JSON. Do not fabricate a new HTTP response
-head for each message on an existing connection.
+selected transport, setup outcome, model send progress, terminal result and fallback reason.
+Delta input, connection generation and response identity would be added with continuation,
+which section 9.5 defers. Request byte counts must distinguish the HTTP Upgrade from model
+JSON. Do not fabricate a new HTTP response head for each message on an existing connection.
 
 Log exact sent envelopes through the existing opt-in payload capture path and retain the
 full logical projection in request preparation/persistence as already required for replay.
@@ -654,28 +660,31 @@ presentation callbacks are needed merely to report the selected transport.
 
 Implementation gates, each a scoped change:
 
-1. **Transport prerequisites:** settle WS handshake-field ownership and unsolicited
-   extension/subprotocol checks, partial-write evidence, abnormal close reporting,
-   event-loop/probe lifetime and nonblocking abort teardown. Finish TLS key-usage and
-   key-transition safeguards required by long-lived wss. Keep parser errors terminal and
-   prevent retained data from being reported as a clean EOF after fatal failure.
-2. **Shared Responses codec:** separate request envelope from common encoding, retain
-   response identity, and reuse payload decoding over SSE and WS. Test equivalent tool,
-   usage, text and terminal behavior without a network.
-3. **Full-context WS operations:** add configuration and explicit session ownership,
-   one in-flight operation, reuse across foreground requests, independent compaction and
-   cancellation. Use local scripted provider peers over ws and wss, not only echo tests.
-4. **Recovery and evidence:** exercise unsupported Upgrade fallback, required-WS errors,
-   auth/TLS failures, partial writes, disconnects before/after creation, output exposure,
-   storage failure and sticky fallback reset on affinity change. Assert actual model-send
-   counts and durable attempt records so duplicate requests cannot hide behind a success.
-5. **Incremental continuation:** verify full versus delta payloads, response-ID validation,
-   repaired tool calls, changed settings, compaction, credential/model changes, missing
-   previous responses and restart. Every delta test compares the effective full input to
-   the ordinary projection. No server cache is required to recover the local conversation.
+1. **Transport prerequisites:** done for handshake-field ownership, unsolicited
+   extension/subprotocol checks, abnormal close reporting and nonblocking abort teardown.
+   Partial-write evidence remains open, and so do the TLS key-usage and key-transition
+   safeguards that long-lived `wss` depends on. Those belong to the TLS plan above.
+2. **Shared Responses codec:** done. The request envelope is separated from common encoding
+   and the payload decoder serves SSE and WS. Response identity was not retained: nothing
+   consumes it while continuation is deferred.
+3. **Full-context WS operations:** done. Configuration, session ownership, one in-flight
+   operation, reuse across foreground requests, independent compaction, capability-driven
+   selection, `auto` fallback and required-transport refusal are implemented.
+4. **Recovery and evidence:** done for unsupported-Upgrade fallback, refusal under a
+   required transport, delivery states and the stop on ambiguous delivery. Remaining:
+   partial-write evidence, auth/TLS failures specific to a WS session, and sticky-fallback
+   reset on affinity change beyond session replacement.
+5. **Incremental continuation:** deferred, with the conditions recorded in section 9.5.
 6. **Acceptance:** run Fish/Mise check and release/debug tests plus local harnesses. Optional
-   credentialed provider tests must show two dependent requests on one connection and a
-   tool-result continuation. Do not claim provider compatibility from a WS echo alone.
+   credentialed provider tests must show two dependent requests on one connection. Do not
+   claim provider compatibility from a WS echo alone.
+
+Two seams cannot be reached by an in-package test: the wire form of a request and the
+reuse of one connection across turns. They were verified with a throwaway scripted peer
+outside the repository, which spoke both transports itself and asserted the handshake, the
+`response.create` envelope, the absence of the HTTP-only fields, one connection carrying
+two model requests, and the fallback decision. No peer script is committed here: the
+repository's tests stay Odin, and a test earns its place by catching a real fault.
 
 ### 9.9 Reference evidence and deliberate differences
 

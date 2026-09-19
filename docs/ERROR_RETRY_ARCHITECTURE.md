@@ -251,13 +251,13 @@ Do not make delivered body bytes the exposure test. A usage update, keepalive, o
 reasoning event is not visible output. Track `text_exposed` and `completion_accepted` explicitly
 in per-attempt runtime state. If reasoning becomes visible later, it must set exposure too.
 `Provider_Completed_Event` remains withheld until clean HTTP message completion on the SSE
-path. For planned WS operations, the request ends at its valid provider terminal message,
-not socket EOF; a persistent connection must remain usable for subsequent requests.
+path. For a WS operation, the request ends at its valid provider terminal message, not at
+socket EOF, so a persistent connection remains usable for subsequent requests.
 The transport-specific completion boundary and delivery-aware recovery rules are specified
-in [Network stack architecture, section 9](NETWORK_STACK_ARCHITECTURE.md#9-provider-websocket-integration).
-That plan adds a stop on ambiguous WS delivery even before text is exposed, and keeps every
-fallback or full-context resend under `agent` policy and attempt accounting. No retry loop
-is added inside `ai`. These WS rules are not implemented yet.
+in [Network stack architecture, section 9](NETWORK_STACK_ARCHITECTURE.md#9-provider-websocket-integration)
+and implemented: the chain stops on ambiguous WS delivery even before text is exposed, and
+every fallback or resend stays under `agent` policy and attempt accounting. No retry loop
+lives inside `ai`.
 A successful HTTP exchange with an unusable completion is not retried by the transport policy.
 
 The policy deliberately does not copy opencode's synthetic continuation prompt. Nabla excludes
