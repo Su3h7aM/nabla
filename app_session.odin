@@ -483,11 +483,6 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 		selection_fail(app, fmt.tprintf("provider %s needs base_url, api, and api_key", provider_id))
 		return false
 	}
-	api, api_ok := agent.chat_api_kind(provider.api)
-	if !api_ok {
-		selection_fail(app, fmt.tprintf("unsupported api: %s", provider.api))
-		return false
-	}
 	credential, credential_ok := agent.config_resolve_credential(provider.api_key, app.setup.alloc)
 	if !credential_ok {
 		selection_fail(app, fmt.tprintf("provider %s needs api_key: name an environment variable that is set, or provide the key", provider_id))
@@ -500,6 +495,16 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 		return false
 	}
 	model := &app.setup.catalog.models[model_index]
+	// Routing is per model: a model that states its own API family is served
+	// through it, and the provider's family is what its other models use.
+	api_name := provider.api
+	if model.api_present { api_name = model.api }
+	api, api_ok := agent.chat_api_kind(api_name)
+	if !api_ok {
+		delete(credential, app.setup.alloc)
+		selection_fail(app, fmt.tprintf("unsupported api: %s", api_name))
+		return false
+	}
 
 	running := &app.setup.session
 	// A different model means a different window and a different cache identity, so

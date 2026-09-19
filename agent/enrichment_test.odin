@@ -122,6 +122,47 @@ test_enrichment_later_sources_fill_only_what_is_missing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_enrichment_a_models_api_family_outranks_its_providers :: proc(t: ^testing.T) {
+	// Routing is stated per model. The endpoint speaks chat completions, the user
+	// says one of its models is served through the Responses API, and models.dev
+	// disagrees about that same model. The user's statement is the model's own, so
+	// it wins, and a model that states no family of its own keeps the provider's.
+	user := []Catalog_Provider_Source {
+		{
+			id = "gateway",
+			api_present = true,
+			api = "openai_chat_completions",
+			models = []Catalog_Model_Source{{id = "gateway/plain"}, {id = "gateway/responses", api_present = true, api = "openai_responses"}},
+		},
+	}
+	models_dev := []Catalog_Provider_Source {
+		{
+			id = "gateway",
+			api_present = true,
+			api = "openai_chat_completions",
+			models = []Catalog_Model_Source{{id = "gateway/plain"}, {id = "gateway/responses", api_present = true, api = "anthropic_messages"}},
+		},
+	}
+
+	resolved, err := resolve_catalog(user, {}, models_dev)
+	testing.expect_value(t, err, Catalog_Error.None)
+	defer catalog_destroy(&resolved)
+
+	plain := catalog_test_find(resolved, "gateway", "gateway/plain")
+	testing.expect(t, plain != nil)
+	testing.expect(t, !plain.api_present)
+	responses := catalog_test_find(resolved, "gateway", "gateway/responses")
+	testing.expect(t, responses != nil)
+	testing.expect_value(t, responses.api, "openai_responses")
+
+	// The provider's own family is untouched, so it remains what its other models
+	// are served through.
+	provider_index, provider_found := catalog_find_provider(&resolved, "gateway")
+	testing.expect(t, provider_found)
+	testing.expect_value(t, resolved.providers[provider_index].api, "openai_chat_completions")
+}
+
+@(test)
 test_enrichment_unknown_model_assumes_the_default_window :: proc(t: ^testing.T) {
 	// No source describes the model at all.
 	resolved, err := resolve_catalog({}, {}, {})

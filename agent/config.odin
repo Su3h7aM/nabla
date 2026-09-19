@@ -117,6 +117,15 @@ load_model :: proc(L: ^l.State, raw_idx: c.int, provider_id, model_id: string, a
 		failed = false
 		return .None
 	}
+	l.settop(L, base)
+	lua_field(L, idx, "api")
+	if l.type(L, -1) != .NIL {
+		value, ok := lua_string(L, -1, allocator)
+		if !ok { return .Invalid }
+		out^.api = value
+		out^.api_present = true
+	}
+	l.settop(L, base)
 	lua_field(L, idx, "display_name")
 	if l.type(L, -1) != .NIL {
 		value, ok := lua_string(L, -1, allocator)

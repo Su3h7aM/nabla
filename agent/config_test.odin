@@ -18,6 +18,7 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 			models = {
 				chat = {
 					display_name = "Chat",
+					api = "openai_chat_completions",
 					context_window = 100000,
 					max_output_tokens = 4096,
 					tools = true,
@@ -58,6 +59,7 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, chat != nil && mini != nil && old != nil)
 	testing.expect_value(t, chat^.display_name, "Chat")
+	testing.expect_value(t, chat^.api, "openai_chat_completions")
 	testing.expect_value(t, chat^.context_window, 100000)
 	testing.expect_value(t, chat^.max_output_tokens, 4096)
 	testing.expect(t, chat^.tools)

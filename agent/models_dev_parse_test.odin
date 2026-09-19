@@ -265,12 +265,12 @@ test_models_dev_parse_drops_non_string_list_entries :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_models_dev_parse_skips_a_model_with_its_own_foreign_routing :: proc(t: ^testing.T) {
-	// Route metadata is represented per provider, so a model that selects a
-	// different API family cannot be stated correctly. Emitting it under its
-	// provider's protocol would send the wrong wire format, so it is left out. A
-	// model whose own route agrees, or names an SDK this harness does not
-	// implement, is kept.
+test_models_dev_parse_records_a_models_own_routing :: proc(t: ^testing.T) {
+	// A model that names its own SDK is served through that family rather than
+	// dropped. Routing is one field: discarding the record over it would discard
+	// the window, modalities, and thinking controls that have nothing to do with
+	// it. A model whose own family agrees states it, and a model naming an SDK this
+	// harness does not implement states no family at all.
 	fixture :: `{"eps": {"id": "eps", "npm": "@ai-sdk/openai-compatible", "models": {
 	  "eps/foreign":   {"id": "eps/foreign",   "provider": {"npm": "@ai-sdk/anthropic"}},
 	  "eps/other-wire":{"id": "eps/other-wire","provider": {"npm": "@ai-sdk/openai"}},
@@ -282,13 +282,15 @@ test_models_dev_parse_skips_a_model_with_its_own_foreign_routing :: proc(t: ^tes
 	defer catalog_sources_destroy(&catalog)
 
 	eps := models_dev_fixture_source(t, "eps", catalog[:])
-	testing.expect_value(t, len(eps.models), 3)
-	testing.expect(t, models_dev_fixture_model(t, eps, "eps/agreeing") != nil)
-	testing.expect(t, models_dev_fixture_model(t, eps, "eps/unknown") != nil)
-	testing.expect(t, models_dev_fixture_model(t, eps, "eps/plain") != nil)
-	for &model in eps.models {
-		testing.expect(t, model.id != "eps/foreign" && model.id != "eps/other-wire")
-	}
+	testing.expect_value(t, len(eps.models), 5)
+	testing.expect_value(t, models_dev_fixture_model(t, eps, "eps/foreign").api, "anthropic_messages")
+	testing.expect_value(t, models_dev_fixture_model(t, eps, "eps/other-wire").api, "openai_responses")
+	testing.expect_value(t, models_dev_fixture_model(t, eps, "eps/agreeing").api, "openai_chat_completions")
+	// An unimplemented or absent family leaves the model's own absent, so the
+	// provider's stands.
+	testing.expect(t, !models_dev_fixture_model(t, eps, "eps/unknown").api_present)
+	testing.expect(t, !models_dev_fixture_model(t, eps, "eps/plain").api_present)
+	testing.expect_value(t, eps.api, "openai_chat_completions")
 }
 
 @(test)

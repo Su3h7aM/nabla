@@ -19,6 +19,11 @@ import "core:strings"
 //
 // Serving identity is the exact, case-sensitive pair of provider ID and model ID.
 // Neither part is ever parsed out of a combined string.
+//
+// Routing is per model. A provider states the API family its endpoint speaks by
+// default, and a model may state its own; the model's statement is the more
+// specific one and therefore wins, so an endpoint that serves mostly one family
+// can still route a single model through another.
 
 // A token-budget control form: the range of reasoning budgets the model accepts.
 // Each bound has its own presence, because upstream states neither, either, or
@@ -49,6 +54,9 @@ Catalog_Model_Source :: struct {
 	id:                        string,
 	disabled_present:          bool,
 	disabled:                  bool,
+	// Absent means the model is served through its provider's family.
+	api_present:               bool,
+	api:                       string,
 	display_name_present:      bool,
 	display_name:              string,
 	context_window_present:    bool,
@@ -87,6 +95,10 @@ Catalog_Provider_Source :: struct {
 Catalog_Model :: struct {
 	provider_id:               string,
 	id:                        string,
+	// The family this model is served through: its own statement where it has
+	// one, otherwise the provider's.
+	api_present:               bool,
+	api:                       string,
 	display_name:              string,
 	display_name_present:      bool,
 	context_window:            int,
@@ -235,6 +247,10 @@ catalog_apply_thinking :: proc(dst: ^Catalog_Thinking_Source, src: Catalog_Think
 }
 
 catalog_apply_model :: proc(dst: ^Catalog_Model, src: Catalog_Model_Source, allocator: mem.Allocator) {
+	if !dst.api_present && src.api_present {
+		dst.api_present = true
+		dst.api = strings.clone(src.api, allocator)
+	}
 	if !dst.display_name_present && src.display_name_present {
 		dst.display_name_present = true
 		dst.display_name = strings.clone(src.display_name, allocator)
@@ -337,6 +353,7 @@ catalog_destroy :: proc(catalog: ^Catalog) {
 	for &model in catalog.models {
 		delete(model.provider_id, allocator)
 		delete(model.id, allocator)
+		if model.api_present { delete(model.api, allocator) }
 		if model.display_name_present { delete(model.display_name, allocator) }
 		if model.input_modalities_present { catalog_strings_destroy(model.input_modalities, allocator) }
 		if model.output_modalities_present { catalog_strings_destroy(model.output_modalities, allocator) }
@@ -357,6 +374,7 @@ catalog_strings_destroy :: proc(values: []string, allocator: mem.Allocator) {
 catalog_model_source_destroy :: proc(model: ^Catalog_Model_Source, allocator: mem.Allocator) {
 	if model == nil { return }
 	delete(model.id, allocator)
+	if model.api_present { delete(model.api, allocator) }
 	if model.display_name_present { delete(model.display_name, allocator) }
 	if model.input_modalities_present { catalog_strings_destroy(model.input_modalities, allocator) }
 	if model.output_modalities_present { catalog_strings_destroy(model.output_modalities, allocator) }

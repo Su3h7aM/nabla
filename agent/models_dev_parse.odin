@@ -17,9 +17,9 @@ import "core:strings"
 // resolved catalog rather than merely be incomplete. Unknown fields are ignored:
 // models.dev carries far more than this harness reads.
 //
-// Nothing here decides precedence, exclusion, credentials, or endpoint defaults
-// for the user. It only transforms bytes, so it performs no I/O, and its input is
-// the raw document the cache layer acquired.
+// Nothing here decides precedence between sources, exclusion, credentials, or
+// endpoint defaults for the user. It only transforms bytes, so it performs no
+// I/O, and its input is the raw document the cache layer acquired.
 
 Models_Dev_Parse_Error :: enum {
 	None,
@@ -95,8 +95,7 @@ models_dev_parse :: proc(data: []u8, providers: []string = {}, allocator := cont
 			model_id, model_id_present := models_dev_member_string(model_object, "id")
 			if !model_id_present || model_id == "" { return {}, .Missing_Identity }
 
-			model, skip := models_dev_model_source(model_object, provider.api, allocator)
-			if skip { continue }
+			model := models_dev_model_source(model_object, allocator)
 			model.id = strings.clone(model_id, allocator)
 			append(&models, model)
 		}
@@ -152,18 +151,21 @@ models_dev_provider_source :: proc(object: json.Object, provider_id: string, all
 	return provider
 }
 
-// models_dev_model_source maps one provider-nested model record. `skip` reports a
-// model whose own routing selects a different API family than its provider's:
-// routing is represented per provider in the source records, so such a model
-// cannot be stated correctly and is left out rather than emitted under the wrong
-// wire protocol. A model is only skipped when both families are known and
-// disagree; an unstated family on either side is not a conflict.
-models_dev_model_source :: proc(object: json.Object, provider_api: string, allocator: mem.Allocator) -> (model: Catalog_Model_Source, skip: bool) {
+// models_dev_model_source maps one provider-nested model record. Everything it
+// states is kept: a model that names its own SDK is served through that family
+// regardless of its provider's, which is a statement about routing alone and not
+// a reason to discard the model's window, modalities, or thinking controls.
+//
+// The model's family is stated only when it is one this harness implements; an
+// unstated or unrecognized family leaves it absent, so the provider's stands.
+models_dev_model_source :: proc(object: json.Object, allocator: mem.Allocator) -> Catalog_Model_Source {
+	model: Catalog_Model_Source
 	if override_value, has_override := object["provider"]; has_override {
 		if override, override_is_object := override_value.(json.Object); override_is_object {
 			if npm, npm_present := models_dev_member_string(override, "npm"); npm_present {
-				if override_api, override_known := models_dev_api_family(npm); override_known {
-					if provider_api != "" && override_api != provider_api { return {}, true }
+				if api, api_known := models_dev_api_family(npm); api_known {
+					model.api_present = true
+					model.api = strings.clone(api, allocator)
 				}
 			}
 		}
@@ -202,7 +204,7 @@ models_dev_model_source :: proc(object: json.Object, provider_api: string, alloc
 		model.tools = tools
 	}
 	model.thinking = models_dev_thinking(object, allocator)
-	return model, false
+	return model
 }
 
 // models_dev_thinking maps the reasoning fields of one model. `reasoning` is the

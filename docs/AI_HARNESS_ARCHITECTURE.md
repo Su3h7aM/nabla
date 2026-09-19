@@ -143,6 +143,7 @@ Resolved_Catalog
         auth:      endpoint, api_kind, api_key_env | api_key, models_url
         models:    []Resolved_Model
             id, display_name
+            api_kind:  its own, else the provider's
             context_window, max_output_tokens
             input_modalities, output_modalities
             tools: bool
@@ -172,7 +173,7 @@ Rules:
 | reasoning support and levels | `model.reasoning.*` |
 | tool calling | `model.tools` |
 | provider endpoint | `provider.auth.endpoint` |
-| API family | `provider.auth.api_kind` |
+| API family | `model.api_kind`, falling back to `provider.auth.api_kind` |
 | credential environment variable | `provider.auth.api_key_env` |
 | available models | `provider.models` |
 
@@ -519,6 +520,12 @@ Verified against the code at the time of writing.
   names an existing environment variable is that variable's value (the `${NAME}` reference form
   included); anything else is the secret itself. A name that exists but is empty fails rather than
   sending the name as a key.
+- **Routing is per model.** A provider states the family its endpoint speaks by default, and a
+  model may state its own: models.dev's model-level SDK, or `api` on a configured model. The
+  model's statement is the more specific one and wins, so an endpoint that serves mostly chat
+  completions can still route one model through the Responses API. A model that states no family
+  is served through its provider's. Routing never costs a model its window, modalities, tools, or
+  thinking controls.
 
 ### Must remain unchanged
 
