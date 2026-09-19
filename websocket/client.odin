@@ -61,7 +61,7 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 		return nil, Dial_Failure{kind = .Exchange, detail = strings.clone("the URL is not a ws or wss one", allocator)}
 	}
 
-	if detail := handshake_headers_invalid(options.headers); detail != "" {
+	if detail := handshake_headers_invalid(options.headers, allocator); detail != "" {
 		return nil, Dial_Failure{kind = .Exchange, detail = strings.clone(detail, allocator)}
 	}
 
@@ -158,7 +158,7 @@ response_accepts :: proc(upgraded: ^client.Upgraded, key: string, request_header
 	return {}
 }
 
-handshake_headers_invalid :: proc(headers: []client.Header) -> string {
+handshake_headers_invalid :: proc(headers: []client.Header, allocator: mem.Allocator) -> string {
 	for header in headers {
 		switch {
 		case strings.equal_fold(header.name, "upgrade"),
@@ -168,15 +168,40 @@ handshake_headers_invalid :: proc(headers: []client.Header) -> string {
 			return "the WebSocket handshake owns its Upgrade, Connection, key, and version fields"
 		case strings.equal_fold(header.name, "sec-websocket-extensions"):
 			return "WebSocket extensions are not supported"
+		case strings.equal_fold(header.name, "sec-websocket-protocol"):
+			// A protocol offer is 1#token (RFC 6455 4.1).
+			if !protocol_offer_valid(header.value, allocator) { return "a WebSocket protocol offer is empty, repeated, or malformed" }
 		}
 	}
 	return ""
 }
 
+// protocol_offer_valid reports whether an offer is 1#token: nonempty tokens, no
+// whitespace inside a token, and no token offered twice (RFC 6455 4.1).
+protocol_offer_valid :: proc(value: string, allocator: mem.Allocator) -> bool {
+	tokens, split_err := strings.split(value, ",", allocator)
+	if split_err != .None { return false }
+	defer delete(tokens, allocator)
+	for token, index in tokens {
+		protocol := http.trim_ows(token)
+		if protocol == "" || strings.contains_any(protocol, " \t") { return false }
+		for earlier in tokens[:index] {
+			if http.trim_ows(earlier) == protocol { return false }
+		}
+	}
+	return true
+}
+
+// protocol_offered reports whether the peer selected a protocol this client
+// offered. A subprotocol is an exact token, not a field value: matching one
+// without case would accept a selection the offer never named (RFC 6455 4.1).
 protocol_offered :: proc(headers: []client.Header, selected: string) -> bool {
 	for header in headers {
 		if !strings.equal_fold(header.name, "sec-websocket-protocol") { continue }
-		if field_has_token(header.value, selected) { return true }
+		remaining := header.value
+		for part in strings.split_iterator(&remaining, ",") {
+			if http.trim_ows(part) == selected { return true }
+		}
 	}
 	return false
 }

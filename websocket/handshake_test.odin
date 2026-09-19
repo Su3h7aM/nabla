@@ -34,10 +34,10 @@ test_nonce_is_random_and_well_formed :: proc(t: ^testing.T) {
 @(test)
 test_handshake_fields_owned_by_the_protocol_are_refused_from_callers :: proc(t: ^testing.T) {
 	for name in ([]string{"upgrade", "Connection", "Sec-WebSocket-Key", "sec-websocket-version", "sec-websocket-extensions"}) {
-		detail := handshake_headers_invalid([]client.Header{{name = name, value = "x"}})
+		detail := handshake_headers_invalid([]client.Header{{name = name, value = "x"}}, context.temp_allocator)
 		testing.expectf(t, detail != "", "%s was accepted from the caller", name)
 	}
-	testing.expect_value(t, handshake_headers_invalid([]client.Header{{name = "authorization", value = "Bearer x"}}), "")
+	testing.expect_value(t, handshake_headers_invalid([]client.Header{{name = "authorization", value = "Bearer x"}}, context.temp_allocator), "")
 }
 
 @(test)
@@ -66,6 +66,19 @@ test_upgrade_response_selects_only_an_offered_protocol_and_no_extension :: proc(
 	}
 	failure = response_accepts(&unoffered, key, request_headers, context.temp_allocator)
 	testing.expect_value(t, failure.kind, Dial_Error.Response)
+
+	// A subprotocol is an exact token, so a different case is a different protocol
+	// and was not offered.
+	cased_headers := accepted_headers
+	http.headers_set_unsafe(&cased_headers, "sec-websocket-protocol", "CHAT.V2")
+	cased := client.Upgraded {
+		headers = cased_headers,
+	}
+	failure = response_accepts(&cased, key, request_headers, context.temp_allocator)
+	testing.expect_value(t, failure.kind, Dial_Error.Response)
+
+	duplicate := []client.Header{{name = "sec-websocket-protocol", value = "chat.v1, chat.v1"}}
+	testing.expect(t, handshake_headers_invalid(duplicate, context.temp_allocator) != "", "a repeated offer was accepted")
 
 	extension_headers := accepted_headers
 	http.headers_set_unsafe(&extension_headers, "sec-websocket-protocol", "chat.v2")

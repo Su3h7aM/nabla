@@ -196,6 +196,7 @@ test_retry_state :: proc(t: ^testing.T) {
 		"retry: 50x\ndata: d\n\n" +
 		"retry: -1\ndata: e\n\n" +
 		"retry: 999999999999999999999999\ndata: f\n\n" +
+		"retry: 999999999999999999999999x\ndata: i\n\n" +
 		"retry: 0\ndata: g\n\n"
 	parse(&recorder, wire)
 	expect_events(
@@ -209,6 +210,7 @@ test_retry_state :: proc(t: ^testing.T) {
 			{type = "message", data = "d", retry_ms = 5000, retry_present = true},
 			{type = "message", data = "e", retry_ms = 5000, retry_present = true},
 			{type = "message", data = "f", retry_ms = max(i64), retry_present = true},
+			{type = "message", data = "i", retry_ms = max(i64), retry_present = true},
 			{type = "message", data = "g", retry_ms = 0, retry_present = true},
 		},
 	)

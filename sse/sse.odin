@@ -240,17 +240,25 @@ append_replacement_character :: proc(dst: ^[dynamic]u8) {
 // of ASCII digits and ignores anything else, so ok is false for a malformed or
 // empty value. A digit string wider than the representable time saturates there:
 // the field is an integer of any length, and the only bound added here is the one
-// the type itself has, not a policy about how long a client should wait.
+// the type itself has, not a policy about how long a client should wait. Every
+// octet is checked before the result is used, so a digit run followed by anything
+// else is malformed rather than a valid saturated time.
 @(private)
 parse_retry :: proc(value: []u8) -> (ms: i64, ok: bool) {
 	if len(value) == 0 { return 0, false }
 	result: i64
+	saturated := false
 	for byte in value {
 		if byte < '0' || byte > '9' { return 0, false }
+		if saturated { continue }
 		digit := i64(byte - '0')
-		if result > (max(i64) - digit) / 10 { return max(i64), true }
+		if result > (max(i64) - digit) / 10 {
+			saturated = true
+			continue
+		}
 		result = result * 10 + digit
 	}
+	if saturated { return max(i64), true }
 	return result, true
 }
 
