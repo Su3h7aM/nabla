@@ -213,14 +213,12 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 			size_line = size_line[:semi]
 		}
 
-		size64, ok := strconv.parse_i64_of_base(string(size_line), 16)
+		size, ok := chunk_size_parse(string(size_line))
 		if !ok {
 			log.info("a chunked body declared an invalid chunk size")
 			s.cb(s.user_data, "", .Bad_Read_Count)
 			return
 		}
-		#assert(size_of(i64) == size_of(int))
-		size := int(size64)
 
 		// start scanning trailer headers.
 		if size == 0 {
@@ -228,7 +226,7 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 			return
 		}
 
-		if size < 0 || (s.max_length > -1 && size > s.max_length - strings.builder_len(s.buf)) {
+		if s.max_length > -1 && size > s.max_length - strings.builder_len(s.buf) {
 			s.cb(s.user_data, "", .Too_Long)
 			return
 		}

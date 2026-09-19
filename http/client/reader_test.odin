@@ -312,6 +312,105 @@ test_incomplete_bodies :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_chunk_size_is_hex_digits_only :: proc(t: ^testing.T) {
+	// RFC 9112 7.1: chunk-size is 1*HEXDIG. A sign prefix is not one, so a
+	// size line the old number parser read as a size is now a framing failure.
+	for size in ([]string{"+5", "-5", "", "5x", "5 5", "0x5"}) {
+		wire := strings.concatenate({"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n", size, "\r\n"}, context.temp_allocator)
+		reader := _reader(wire, 1)
+		status, headers, err := read_response_head(&reader, context.temp_allocator)
+		defer headers_destroy(&headers, context.temp_allocator)
+		testing.expect_value(t, err, Error.None)
+		framing, length, framing_err := response_framing(status, .Post, headers)
+		testing.expect_value(t, framing_err, Error.None)
+		collector: Collector
+		defer delete(collector.buffer)
+		testing.expectf(t, stream_body(&reader, framing, length, &collector, collect) == .Bad_Response, "%q was framed as a chunk size", size)
+	}
+
+	// Uppercase digits are the same size, and a value the machine cannot
+	// represent is invalid framing rather than a size.
+	upper := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nA\r\n0123456789\r\n0\r\n\r\n", 1)
+	upper_status, upper_headers, upper_err := read_response_head(&upper, context.temp_allocator)
+	defer headers_destroy(&upper_headers, context.temp_allocator)
+	testing.expect_value(t, upper_err, Error.None)
+	upper_framing, upper_length, upper_framing_err := response_framing(upper_status, .Post, upper_headers)
+	testing.expect_value(t, upper_framing_err, Error.None)
+	upper_collector: Collector
+	defer delete(upper_collector.buffer)
+	testing.expect_value(t, stream_body(&upper, upper_framing, upper_length, &upper_collector, collect), Error.None)
+	testing.expect_value(t, string(upper_collector.buffer[:]), "0123456789")
+
+	huge := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFF\r\n", 1)
+	huge_status, huge_headers, huge_err := read_response_head(&huge, context.temp_allocator)
+	defer headers_destroy(&huge_headers, context.temp_allocator)
+	testing.expect_value(t, huge_err, Error.None)
+	huge_framing, huge_length, huge_framing_err := response_framing(huge_status, .Post, huge_headers)
+	testing.expect_value(t, huge_framing_err, Error.None)
+	huge_collector: Collector
+	defer delete(huge_collector.buffer)
+	testing.expect_value(t, stream_body(&huge, huge_framing, huge_length, &huge_collector, collect), Error.Bad_Response)
+}
+
+@(test)
+test_chunk_extensions_must_parse :: proc(t: ^testing.T) {
+	// RFC 9112 7.1.1: extensions are ignored, but the sequence still has to
+	// parse. A lone separator or a nameless value is not a chunk.
+	for size in ([]string{"5;", "5;;a", "5;=v", "5;a=;", "5;a=\"open"}) {
+		wire := strings.concatenate({"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n", size, "\r\nhello\r\n0\r\n\r\n"}, context.temp_allocator)
+		reader := _reader(wire, 1)
+		status, headers, err := read_response_head(&reader, context.temp_allocator)
+		defer headers_destroy(&headers, context.temp_allocator)
+		testing.expect_value(t, err, Error.None)
+		framing, length, framing_err := response_framing(status, .Post, headers)
+		testing.expect_value(t, framing_err, Error.None)
+		collector: Collector
+		defer delete(collector.buffer)
+		testing.expectf(t, stream_body(&reader, framing, length, &collector, collect) == .Bad_Response, "%q was framed as a chunk", size)
+	}
+
+	// A quoted value may carry a separator without ending the extension.
+	quoted := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5;ext=\"a;b\";q=1\r\nhello\r\n0\r\n\r\n", 1)
+	quoted_status, quoted_headers, quoted_err := read_response_head(&quoted, context.temp_allocator)
+	defer headers_destroy(&quoted_headers, context.temp_allocator)
+	testing.expect_value(t, quoted_err, Error.None)
+	quoted_framing, quoted_length, quoted_framing_err := response_framing(quoted_status, .Post, quoted_headers)
+	testing.expect_value(t, quoted_framing_err, Error.None)
+	quoted_collector: Collector
+	defer delete(quoted_collector.buffer)
+	testing.expect_value(t, stream_body(&quoted, quoted_framing, quoted_length, &quoted_collector, collect), Error.None)
+	testing.expect_value(t, string(quoted_collector.buffer[:]), "hello")
+}
+
+@(test)
+test_chunk_trailers_are_field_lines :: proc(t: ^testing.T) {
+	// RFC 9112 7.1.2: the body ends with a trailer section, whose lines are
+	// field lines. A line that is not one ends the body in failure.
+	bogus := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nnot a field\r\n\r\n", 1)
+	bogus_status, bogus_headers, bogus_err := read_response_head(&bogus, context.temp_allocator)
+	defer headers_destroy(&bogus_headers, context.temp_allocator)
+	testing.expect_value(t, bogus_err, Error.None)
+	bogus_framing, bogus_length, bogus_framing_err := response_framing(bogus_status, .Post, bogus_headers)
+	testing.expect_value(t, bogus_framing_err, Error.None)
+	bogus_collector: Collector
+	defer delete(bogus_collector.buffer)
+	testing.expect_value(t, stream_body(&bogus, bogus_framing, bogus_length, &bogus_collector, collect), Error.Bad_Response)
+
+	// A well-formed trailer section ends the body normally; its values are
+	// discarded, only the syntax is checked.
+	noted := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nx-note: hi\r\n\r\n", 1)
+	noted_status, noted_headers, noted_err := read_response_head(&noted, context.temp_allocator)
+	defer headers_destroy(&noted_headers, context.temp_allocator)
+	testing.expect_value(t, noted_err, Error.None)
+	noted_framing, noted_length, noted_framing_err := response_framing(noted_status, .Post, noted_headers)
+	testing.expect_value(t, noted_framing_err, Error.None)
+	noted_collector: Collector
+	defer delete(noted_collector.buffer)
+	testing.expect_value(t, stream_body(&noted, noted_framing, noted_length, &noted_collector, collect), Error.None)
+	testing.expect_value(t, string(noted_collector.buffer[:]), "hello")
+}
+
+@(test)
 test_close_delimited_bodies :: proc(t: ^testing.T) {
 	// Without a framing field the body ends at a clean close.
 	reader := _reader("HTTP/1.1 200 OK\r\n\r\nbody", 1)

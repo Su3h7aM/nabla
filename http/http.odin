@@ -118,6 +118,34 @@ trim_ows :: proc(s: string) -> string {
 	return s[start:end]
 }
 
+// chunk_size_parse reads a chunk-size as RFC 9112 7.1 defines it: one or more
+// hexadecimal digits. A general number parser is the wrong tool here: it reads
+// a sign prefix the grammar does not admit, so "+5" would parse as a size.
+// Surrounding BWS is stripped; anything else, including an empty value or one
+// the machine cannot represent, is invalid framing rather than a size.
+chunk_size_parse :: proc(value: string) -> (size: int, ok: bool) {
+	text := trim_ows(value)
+	(len(text) > 0) or_return
+	size = 0
+	for i := 0; i < len(text); i += 1 {
+		digit := 0
+		switch text[i] {
+		case '0' ..= '9':
+			digit = int(text[i] - '0')
+		case 'a' ..= 'f':
+			digit = int(text[i] - 'a') + 10
+		case 'A' ..= 'F':
+			digit = int(text[i] - 'A') + 10
+		case:
+			return 0, false
+		}
+		if size > (max(int) - digit) / 16 { return 0, false }
+		size = size * 16 + digit
+	}
+	ok = true
+	return
+}
+
 version_write :: proc(w: io.Writer, v: Version) -> io.Error {
 	io.write_string(w, "HTTP/") or_return
 	io.write_rune(w, '0' + rune(v.major)) or_return

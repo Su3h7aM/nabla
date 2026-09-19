@@ -363,33 +363,43 @@ read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status
 	status_code = code
 	http.headers_init(&headers, allocator)
 
-	// The field a folded line continues. A field line cannot begin with whitespace
-	// (RFC 9112 5 and 5.2), so whitespace here can only be an obs-fold, and one
-	// that continues nothing is a message that cannot be read as a field section.
-	//
-	// The section is read until its empty line, with no bound on how many fields it
-	// may hold or how long any of them may be: RFC 9110 5.4 states that HTTP places
-	// no predefined limit on a field line, a field value, or a field section, and a
-	// client that refuses a long one fails where every other client succeeds.
+	if section_err := read_field_section(reader, &headers, allocator); section_err != .None {
+		return 0, headers, section_err
+	}
+	return status_code, headers, .None
+}
+
+// read_field_section reads field lines until the empty line that ends them.
+// A line beginning with whitespace continues the previous field as an obs-fold
+// (RFC 9112 5.2); one that continues nothing is a message that cannot be read
+// as a field section. A field line cannot begin with whitespace (RFC 9112 5),
+// so whitespace here can only be an obs-fold.
+//
+// The section is read until its empty line, with no bound on how many fields it
+// may hold or how long any of them may be: RFC 9110 5.4 states that HTTP places
+// no predefined limit on a field line, a field value, or a field section, and a
+// client that refuses a long one fails where every other client succeeds.
+read_field_section :: proc(reader: ^Reader, headers: ^http.Headers, allocator: mem.Allocator) -> Error {
+	// The field a folded line continues.
 	last_key: string
 	for {
 		header_line, header_err := reader_line(reader)
-		if header_err != .None { return 0, headers, header_err }
-		if header_line == "" { break }
+		if header_err != .None { return header_err }
+		if header_line == "" { return .None }
 
 		if header_line[0] == ' ' || header_line[0] == '\t' {
-			if last_key == "" { return 0, headers, .Bad_Response }
-			if !append_folded_value(&headers, last_key, header_line, allocator) {
-				return 0, headers, .Bad_Response
+			if last_key == "" { return .Bad_Response }
+			if !append_folded_value(headers, last_key, header_line, allocator) {
+				return .Bad_Response
 			}
 			continue
 		}
 
-		key, ok := http.header_parse(&headers, header_line, allocator)
-		if !ok { return 0, headers, .Bad_Response }
+		key, ok := http.header_parse(headers, header_line, allocator)
+		if !ok { return .Bad_Response }
 		last_key = key
 	}
-	return status_code, headers, .None
+	return .None
 }
 
 // read_final_response_head reads response heads until a final one arrives.
@@ -563,22 +573,104 @@ stream_chunked :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callb
 		line, line_err := reader_line(reader)
 		if line_err != .None { return line_err }
 		size_text := line
-		if semi := strings.index_byte(line, ';'); semi >= 0 { size_text = line[:semi] }
-		size, size_ok := strconv.parse_int(strings.trim_space(size_text), 16)
-		if !size_ok || size < 0 { return .Bad_Response }
+		extensions := ""
+		if semi := strings.index_byte(line, ';'); semi >= 0 {
+			size_text = line[:semi]
+			extensions = line[semi:]
+		}
+		size, size_ok := http.chunk_size_parse(size_text)
+		if !size_ok || !chunk_extensions_valid(extensions) { return .Bad_Response }
 		if size == 0 {
-			// RFC 9112 7.1.2: a trailer section is read to its empty line, and how many
-			// fields it holds is not bounded here either.
-			for {
-				trailer, trailer_err := reader_line(reader)
-				if trailer_err != .None { return trailer_err }
-				if trailer == "" { return .None }
-			}
+			// RFC 9112 7.1.2: the body ends with a trailer section read to its
+			// empty line. Its lines are field lines like any other, so a line
+			// that is not one ends the body in failure rather than in a body
+			// framed past garbage. The values are discarded; only the syntax
+			// is checked, in scratch storage owned by this call.
+			trailers: http.Headers
+			http.headers_init(&trailers, reader.allocator)
+			section_err := read_field_section(reader, &trailers, reader.allocator)
+			headers_destroy(&trailers, reader.allocator)
+			if section_err != .None { return section_err }
+			return .None
 		}
 		if err := stream_exact(reader, size, user_data, callback); err != .None { return err }
 		ending: [2]u8
 		if err := reader_read_full(reader, ending[:]); err != .None { return err }
 		if ending[0] != '\r' || ending[1] != '\n' { return .Bad_Response }
+	}
+}
+
+// chunk_extensions_valid reports whether the text after the chunk-size on a
+// chunk-size line is a legal chunk-ext sequence. RFC 9112 7.1.1: a recipient
+// ignores unrecognized extensions, but the sequence still has to parse; a size
+// line that is not a chunk at all ends the body in failure rather than in a
+// body framed by a guess. Empty text means no extensions, which is valid.
+chunk_extensions_valid :: proc(text: string) -> bool {
+	rest := text
+	for {
+		rest = http.trim_ows(rest)
+		if rest == "" { return true }
+		if rest[0] != ';' { return false }
+		rest = http.trim_ows(rest[1:])
+		width := 0
+		for width < len(rest) && is_token_char(rest[width]) { width += 1 }
+		if width == 0 { return false }
+		rest = http.trim_ows(rest[width:])
+		if len(rest) > 0 && rest[0] == '=' {
+			rest = http.trim_ows(rest[1:])
+			value_width, value_ok := chunk_ext_value_width(rest)
+			if !value_ok { return false }
+			rest = rest[value_width:]
+		}
+	}
+}
+
+// chunk_ext_value_width measures a chunk extension value at the start of text:
+// a token or a quoted-string, RFC 9112 7.1.1. It returns how many bytes the
+// value occupies and whether one was there at all.
+chunk_ext_value_width :: proc(text: string) -> (width: int, ok: bool) {
+	if text == "" { return 0, false }
+	if text[0] != '"' {
+		for width < len(text) && is_token_char(text[width]) { width += 1 }
+		if width == 0 { return 0, false }
+		return width, true
+	}
+	i := 1
+	for i < len(text) {
+		c := text[i]
+		if c == '\\' {
+			i += 1
+			if i >= len(text) { return 0, false }
+			c = text[i]
+			// quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text ).
+			if c != '\t' && c != ' ' && (c < 0x21 || c > 0x7e) && c < 0x80 {
+				return 0, false
+			}
+			i += 1
+			continue
+		}
+		if c == '"' { return i + 1, true }
+		// qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text.
+		if c == '\t' || c == ' ' || c == 0x21 || (c >= 0x23 && c <= 0x5b) || (c >= 0x5d && c <= 0x7e) || c >= 0x80 {
+			i += 1
+			continue
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+// is_token_char reports whether a byte may appear in an HTTP token, RFC 9110
+// 5.6.2. Chunk extension names are tokens, and so are their values unless
+// quoted.
+is_token_char :: proc(c: byte) -> bool {
+	switch c {
+	case '0' ..= '9', 'a' ..= 'z', 'A' ..= 'Z':
+		return true
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	case:
+		return false
 	}
 }
 
