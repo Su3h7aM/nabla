@@ -20,8 +20,8 @@ Cipher_Suite_Info :: struct {
 }
 
 CIPHER_SUITES := [Cipher_Suite]Cipher_Suite_Info {
-	.AES_128_GCM_SHA256       = {hash = .SHA256, aead = .AES_GCM_128},
-	.AES_256_GCM_SHA384       = {hash = .SHA384, aead = .AES_GCM_256},
+	.AES_128_GCM_SHA256 = {hash = .SHA256, aead = .AES_GCM_128},
+	.AES_256_GCM_SHA384 = {hash = .SHA384, aead = .AES_GCM_256},
 	.CHACHA20_POLY1305_SHA256 = {hash = .SHA256, aead = .CHACHA20POLY1305},
 }
 

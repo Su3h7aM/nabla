@@ -38,7 +38,10 @@ Client_Hello_Fields :: struct {
 // client_hello_encode writes a ClientHello (RFC 8446 section 4.1.2) and returns
 // how many bytes of `dst` it used.
 client_hello_encode :: proc(dst: []u8, fields: Client_Hello_Fields) -> (n: int, ok: bool) {
-	w := Writer{dst = dst, ok = true}
+	w := Writer {
+		dst = dst,
+		ok  = true,
+	}
 	random := fields.random
 	write_u16(&w, LEGACY_VERSION)
 	write_bytes(&w, random[:])
@@ -71,7 +74,7 @@ write_server_name :: proc(w: ^Writer, server_name: string) {
 	write_u16(w, int(Extension_Type.Server_Name))
 	extension := write_section_start(w)
 	list := write_section_start(w)
-	write_u8(w, 0)  // NameType.host_name
+	write_u8(w, 0) // NameType.host_name
 	write_u16(w, len(server_name))
 	write_bytes(w, transmute([]u8)server_name)
 	write_section_end(w, list)

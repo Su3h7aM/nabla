@@ -28,13 +28,16 @@ Server_Hello :: struct {
 // server_hello_decode reads a ServerHello message body, the bytes after its
 // handshake header. The trailing extensions must be exactly consumed.
 server_hello_decode :: proc(message: []u8) -> (hello: Server_Hello, ok: bool) {
-	r := Reader{data = message, ok = true}
-	_ = read_u16(&r)  // legacy_version, fixed at LEGACY_VERSION
+	r := Reader {
+		data = message,
+		ok   = true,
+	}
+	_ = read_u16(&r) // legacy_version, fixed at LEGACY_VERSION
 	copy(hello.random[:], read_bytes(&r, len(hello.random)))
 	hello.retry = bytes.equal(hello.random[:], HELLO_RETRY_REQUEST_RANDOM[:])
 	hello.session_id = read_bytes(&r, int(read_u8(&r)))
 	hello.cipher_suite = Cipher_Suite(read_u16(&r))
-	_ = read_u8(&r)  // legacy_compression_methods, a single null byte
+	_ = read_u8(&r) // legacy_compression_methods, a single null byte
 
 	extensions := read_section_u16(&r)
 	for extensions.ok && extensions.at < len(extensions.data) {
@@ -60,8 +63,8 @@ server_hello_decode :: proc(message: []u8) -> (hello: Server_Hello, ok: bool) {
 			// is answering a ClientHello that was never sent.
 			hello.pre_shared_key = true
 		case:
-			// An extension the peer does not recognize is ignored rather than
-			// refused (RFC 8446 section 4.2).
+		// An extension the peer does not recognize is ignored rather than
+		// refused (RFC 8446 section 4.2).
 		}
 		if !extension.ok { r.ok = false }
 	}

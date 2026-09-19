@@ -97,9 +97,7 @@ open :: proc(port: int, secure: bool, path: string) -> (conn: ^websocket.Conn, f
 	defer delete(url)
 
 	options := websocket.Dial_Options {
-		http = {
-			probe = {check = keep_going},
-		},
+		http = {probe = {check = keep_going}},
 	}
 	// The store has to outlive the dial that reads it, so it is released by this
 	// procedure rather than by the block that sets it.

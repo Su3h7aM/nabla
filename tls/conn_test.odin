@@ -34,17 +34,13 @@ fixture_write :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool)
 test_a_peer_that_refuses_the_handshake_is_reported :: proc(t: ^testing.T) {
 	// The two records a refusing peer sends, each a complete alert of its own: a fatal
 	// handshake_failure, and a close_notify with no reason in it.
-	REFUSALS := [2][]u8 {
-		{21, 3, 3, 0, 2, 2, 40},
-		{21, 3, 3, 0, 2, 1, 0},
-	}
+	REFUSALS := [2][]u8{{21, 3, 3, 0, 2, 2, 40}, {21, 3, 3, 0, 2, 1, 0}}
 	for refusal in REFUSALS {
-		fixture := Fixture{incoming = refusal}
+		fixture := Fixture {
+			incoming = refusal,
+		}
 		defer delete(fixture.outgoing)
-		conn, init_err := init(
-			{read = fixture_read, write = fixture_write, user_data = &fixture},
-			{allocator = context.allocator},
-		)
+		conn, init_err := init({read = fixture_read, write = fixture_write, user_data = &fixture}, {allocator = context.allocator})
 		if !testing.expect(t, init_err == .None, "a connection could not be prepared") { return }
 		defer destroy(conn)
 
@@ -61,13 +57,12 @@ test_a_record_over_the_protocol_limit_is_refused_with_an_alert :: proc(t: ^testi
 	// The record header alone: an application data record claiming more than a record may
 	// hold.
 	overflow := []u8{23, 3, 3, 0x41, 0x01}
-	fixture := Fixture{incoming = overflow}
+	fixture := Fixture {
+		incoming = overflow,
+	}
 	defer delete(fixture.outgoing)
 
-	conn, init_err := init(
-		{read = fixture_read, write = fixture_write, user_data = &fixture},
-		{allocator = context.allocator},
-	)
+	conn, init_err := init({read = fixture_read, write = fixture_write, user_data = &fixture}, {allocator = context.allocator})
 	if !testing.expect(t, init_err == .None, "a connection could not be prepared") { return }
 	defer destroy(conn)
 

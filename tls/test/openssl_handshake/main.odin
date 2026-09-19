@@ -20,7 +20,7 @@ import "nabla:tls"
 DIRECTORY :: "/tmp/nabla-tls-handshake"
 CERTIFICATE_FILE :: "certificate.pem"
 KEY_FILE :: "key.pem"
-REQUEST : string : "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n"
+REQUEST: string : "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n"
 ALPN :: "http/1.1"
 SERVER_STARTUP_TIMEOUT :: 10 * time.Second
 
@@ -102,10 +102,7 @@ main :: proc() {
 }
 
 run_client :: proc(port: int, expected: Peer) {
-	roots_text, read_err := os.read_entire_file(
-		strings.concatenate({DIRECTORY, "/", CERTIFICATE_FILE}),
-		context.allocator,
-	)
+	roots_text, read_err := os.read_entire_file(strings.concatenate({DIRECTORY, "/", CERTIFICATE_FILE}), context.allocator)
 	defer delete(roots_text)
 	if !check(read_err == nil, "the server certificate could not be read") { return }
 
@@ -124,16 +121,18 @@ run_client :: proc(port: int, expected: Peer) {
 	if !check(dial_ok, "the server never accepted a connection") { return }
 	defer net.close(socket)
 
-	connection := Connection{socket = socket}
-	conn, init_err := tls.init(
-		{read = connection_read, write = connection_write, user_data = &connection},
-		{roots = anchors, allocator = context.allocator},
-	)
+	connection := Connection {
+		socket = socket,
+	}
+	conn, init_err := tls.init({read = connection_read, write = connection_write, user_data = &connection}, {roots = anchors, allocator = context.allocator})
 	if !check(init_err == tls.Error.None, "the connection could not be prepared") { return }
 	defer tls.destroy(conn)
 
 	if err := tls.handshake(conn, "localhost", []string{ALPN}); err != tls.Error.None {
-		check(false, fmt.tprintf("the handshake with %s over %s failed: %v (peer alert %v)", expected.openssl_suite, expected.openssl_group, err, conn.peer_alert))
+		check(
+			false,
+			fmt.tprintf("the handshake with %s over %s failed: %v (peer alert %v)", expected.openssl_suite, expected.openssl_group, err, conn.peer_alert),
+		)
 		return
 	}
 	check(conn.alpn == ALPN, "the server did not select the protocol the client offered")
@@ -146,11 +145,11 @@ run_client :: proc(port: int, expected: Peer) {
 	// The server answers a page, and its first record carries the head of it.
 	response: [16 * 1024]u8
 	received, read_response_err := tls.read(conn, response[:])
-	if !check(read_response_err == tls.Error.None, fmt.tprintf("the response could not be read: %v after %v bytes, peer alert %v", read_response_err, received, conn.peer_alert)) { return }
-	check(
-		strings.has_prefix(string(response[:received]), "HTTP/1."),
-		"the response does not begin with an HTTP status line",
-	)
+	if !check(
+		read_response_err == tls.Error.None,
+		fmt.tprintf("the response could not be read: %v after %v bytes, peer alert %v", read_response_err, received, conn.peer_alert),
+	) { return }
+	check(strings.has_prefix(string(response[:received]), "HTTP/1."), "the response does not begin with an HTTP status line")
 	check(tls.close(conn) == tls.Error.None, "the connection could not be closed")
 }
 

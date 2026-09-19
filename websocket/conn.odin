@@ -57,12 +57,11 @@ RECV_CHUNK :: 16 * 1024
 // Every buffer is allocated once, and a payload is unmasked in the caller's own
 // buffer, so a connection moves no memory while it is in use.
 Conn :: struct {
-	transport: Transport,
-	allocator: mem.Allocator,
-
-	send:   []u8,
-	header: [HEADER_MAX_SIZE]u8,
-	recv:   []u8,
+	transport:       Transport,
+	allocator:       mem.Allocator,
+	send:            []u8,
+	header:          [HEADER_MAX_SIZE]u8,
+	recv:            []u8,
 
 	// The frame being read: how much of its payload is left, and where the masking
 	// key has reached. A payload larger than a chunk is read in pieces, so the key
@@ -72,19 +71,17 @@ Conn :: struct {
 	frame_remaining: int,
 	mask:            [MASK_KEY_SIZE]u8,
 	mask_at:         int,
-
-	message_opcode: Opcode,
-	in_message:     bool,
+	message_opcode:  Opcode,
+	in_message:      bool,
 
 	// A rune split by a read boundary, and a control frame's payload, which is small
 	// enough to hold because a control frame may not exceed it.
-	carry:        [utf8.UTF_MAX]u8,
-	carry_length: int,
-	control:      [MAX_CONTROL_PAYLOAD]u8,
-
-	closed:     bool,
-	close_sent: bool,
-	close_code: Close_Code,
+	carry:           [utf8.UTF_MAX]u8,
+	carry_length:    int,
+	control:         [MAX_CONTROL_PAYLOAD]u8,
+	closed:          bool,
+	close_sent:      bool,
+	close_code:      Close_Code,
 }
 
 init :: proc(transport: Transport, allocator: mem.Allocator) -> (conn: ^Conn, err: Error) {
@@ -294,8 +291,10 @@ frame_header_read :: proc(conn: ^Conn) -> (header: Header, err: Error) {
 	}
 	count := 2
 	switch conn.header[1] & 0x7f {
-	case 126: count = 4
-	case 127: count = 10
+	case 126:
+		count = 4
+	case 127:
+		count = 10
 	}
 	if conn.header[1] & 0x80 != 0 { count += MASK_KEY_SIZE }
 	if fill_err := recv_fill(conn, count); fill_err != .None { return {}, fill_err }

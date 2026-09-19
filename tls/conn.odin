@@ -65,19 +65,17 @@ Conn :: struct {
 	write_key:    Traffic_Key,
 	transcript:   hash.Context,
 	digest:       [MAX_SECRET_SIZE]u8,
-
-	send:        []u8,
-	message:     []u8,
-	recv:        []u8,
-	recv_filled: int,
-	stream:      [dynamic]u8,
-	stream_at:   int,
-
-	payload:   []u8,
-	encrypted: bool,
-	closed:    bool,
-	alpn:      string,
-	peer_alert: u8,
+	send:         []u8,
+	message:      []u8,
+	recv:         []u8,
+	recv_filled:  int,
+	stream:       [dynamic]u8,
+	stream_at:    int,
+	payload:      []u8,
+	encrypted:    bool,
+	closed:       bool,
+	alpn:         string,
+	peer_alert:   u8,
 }
 
 // init prepares a connection. The transport is the caller's and outlives the
@@ -276,7 +274,10 @@ handshake_server_flight :: proc(conn: ^Conn, server_name: string) -> Error {
 	extensions_type, _, decoded := handshake_decode_header(extensions_message)
 	if !decoded || extensions_type != .Encrypted_Extensions { return .Handshake }
 	if negotiated := extension_find(extensions_message[HANDSHAKE_HEADER_SIZE:], .Application_Layer_Protocol_Negotiation); negotiated != nil {
-		protocols := Reader{data = negotiated, ok = true}
+		protocols := Reader {
+			data = negotiated,
+			ok   = true,
+		}
 		names := read_section_u16(&protocols)
 		first := read_bytes(&names, int(read_u8(&names)))
 		if !names.ok { return .Handshake }
@@ -657,7 +658,10 @@ transcript_hash :: proc(conn: ^Conn) -> []u8 {
 // extension_find returns the body of one extension of a message whose whole body is
 // an extension list, and nil when the peer did not send it.
 extension_find :: proc(body: []u8, wanted: Extension_Type) -> []u8 {
-	r := Reader{data = body, ok = true}
+	r := Reader {
+		data = body,
+		ok   = true,
+	}
 	extensions := read_section_u16(&r)
 	for extensions.ok && extensions.at < len(extensions.data) {
 		extension_type := Extension_Type(read_u16(&extensions))
@@ -678,13 +682,7 @@ chain_verify :: proc(certificates: []x509.Certificate, server_name: string, conf
 	defer delete(intermediates, config.allocator)
 	_, chain_err := x509.verify_chain(
 		&certificates[0],
-		{
-			roots         = config.roots,
-			intermediates = intermediates,
-			current_time  = time.now(),
-			dns_name      = server_name,
-			required_eku  = x509.EKU_Bit.Server_Auth,
-		},
+		{roots = config.roots, intermediates = intermediates, current_time = time.now(), dns_name = server_name, required_eku = x509.EKU_Bit.Server_Auth},
 		config.allocator,
 	)
 	return chain_err == .None

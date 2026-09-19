@@ -10,7 +10,7 @@ import "core:thread"
 import "core:time"
 
 WRITE_TEST_BYTES :: 8 * 1024 * 1024
-READ_TEST_BYTES : string : "a connection with no probe reads what the peer sent"
+READ_TEST_BYTES: string : "a connection with no probe reads what the peer sent"
 
 Read_Test_Server :: struct {
 	listener: net.TCP_Socket,

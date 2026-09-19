@@ -16,9 +16,7 @@ test_rfc_6455_frame_examples :: proc(t: ^testing.T) {
 	payload := transmute([]u8)string("Hello")
 	count, encoded := frame_encode(.Text, true, MASK, payload, dst[:])
 	if !testing.expect(t, encoded, "a text frame could not be encoded") { return }
-	expect_octets(t, "the masked text frame", dst[:count], {
-		0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58,
-	})
+	expect_octets(t, "the masked text frame", dst[:count], {0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58})
 
 	header, decoded := frame_header_decode(dst[:count])
 	if !testing.expect(t, decoded, "the header could not be decoded") { return }
@@ -67,16 +65,12 @@ test_rfc_6455_frame_examples :: proc(t: ^testing.T) {
 	encoded_short: [HEADER_MAX_SIZE]u8
 	short_count, short_ok := frame_header_encode({final = true, opcode = .Binary, length = 256}, MASK, encoded_short[:])
 	if !testing.expect(t, short_ok, "a 16-bit length could not be encoded") { return }
-	expect_octets(t, "the 16-bit length", encoded_short[:short_count], {
-		0x82, 0xfe, 0x01, 0x00, 0x37, 0xfa, 0x21, 0x3d,
-	})
+	expect_octets(t, "the 16-bit length", encoded_short[:short_count], {0x82, 0xfe, 0x01, 0x00, 0x37, 0xfa, 0x21, 0x3d})
 
 	encoded_long: [HEADER_MAX_SIZE]u8
 	long_count, long_ok := frame_header_encode({final = true, opcode = .Binary, length = 65536}, MASK, encoded_long[:])
 	if !testing.expect(t, long_ok, "a 64-bit length could not be encoded") { return }
-	expect_octets(t, "the 64-bit length", encoded_long[:long_count], {
-		0x82, 0xff, 0, 0, 0, 0, 0, 0x01, 0x00, 0x00, 0x37, 0xfa, 0x21, 0x3d,
-	})
+	expect_octets(t, "the 64-bit length", encoded_long[:long_count], {0x82, 0xff, 0, 0, 0, 0, 0, 0x01, 0x00, 0x00, 0x37, 0xfa, 0x21, 0x3d})
 
 	// A reserved bit is a frame this client has no extension to read.
 	_, reserved_ok := frame_header_decode([]u8{0x91, 0x00})
@@ -85,10 +79,5 @@ test_rfc_6455_frame_examples :: proc(t: ^testing.T) {
 
 @(private)
 expect_octets :: proc(t: ^testing.T, what: string, actual: []u8, expected: []u8) {
-	testing.expectf(
-		t,
-		len(actual) == len(expected) && string(actual) == string(expected),
-		"%s is not the frame RFC 6455 records",
-		what,
-	)
+	testing.expectf(t, len(actual) == len(expected) && string(actual) == string(expected), "%s is not the frame RFC 6455 records", what)
 }

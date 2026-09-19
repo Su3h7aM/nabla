@@ -58,10 +58,7 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 	exchange_url, url_ok := http_url(url, allocator)
 	defer delete(exchange_url, allocator)
 	if !url_ok {
-		return nil, Dial_Failure {
-			kind   = .Exchange,
-			detail = strings.clone("the URL is not a ws or wss one", allocator),
-		}
+		return nil, Dial_Failure{kind = .Exchange, detail = strings.clone("the URL is not a ws or wss one", allocator)}
 	}
 
 	nonce: [NONCE_ENCODED_SIZE]u8
@@ -72,7 +69,8 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 	headers := make([dynamic]client.Header, 0, len(options.headers) + 4, allocator)
 	defer delete(headers)
 	append(&headers, ..options.headers)
-	append(&headers,
+	append(
+		&headers,
 		client.Header{name = "upgrade", value = "websocket"},
 		client.Header{name = "connection", value = "Upgrade"},
 		client.Header{name = "sec-websocket-version", value = "13"},
@@ -90,12 +88,7 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 	if exchange_failure.kind != .None {
 		kind := Dial_Error.Exchange
 		if exchange_failure.kind == .HTTP_Status { kind = .Response }
-		return nil, Dial_Failure {
-			kind   = kind,
-			cause  = exchange_failure.cause,
-			status = exchange_failure.status,
-			detail = exchange_failure.detail,
-		}
+		return nil, Dial_Failure{kind = kind, cause = exchange_failure.cause, status = exchange_failure.status, detail = exchange_failure.detail}
 	}
 
 	if accept_failure := response_accepts(upgraded, key, allocator); accept_failure.kind != .None {
@@ -106,10 +99,7 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 	connection, err := init(transport_for(upgraded), allocator)
 	if err != .None {
 		client.upgraded_destroy(upgraded)
-		return nil, Dial_Failure {
-			kind   = .Exchange,
-			detail = strings.clone("the WebSocket connection could not be prepared", allocator),
-		}
+		return nil, Dial_Failure{kind = .Exchange, detail = strings.clone("the WebSocket connection could not be prepared", allocator)}
 	}
 	return connection, {}
 }
@@ -156,11 +146,7 @@ response_accepts :: proc(upgraded: ^client.Upgraded, key: string, allocator: mem
 }
 
 response_refusal :: proc(allocator: mem.Allocator, detail: string) -> Dial_Failure {
-	return Dial_Failure {
-		kind   = .Response,
-		status = 101,
-		detail = strings.clone(detail, allocator),
-	}
+	return Dial_Failure{kind = .Response, status = 101, detail = strings.clone(detail, allocator)}
 }
 
 // field_has_token reports whether a field value holds one of a list of tokens,
@@ -177,12 +163,7 @@ field_has_token :: proc(value, token: string) -> bool {
 // transport_for reads and writes an upgraded connection, and closes it when the
 // WebSocket is destroyed.
 transport_for :: proc(upgraded: ^client.Upgraded) -> Transport {
-	return Transport {
-		read      = upgraded_read,
-		write     = upgraded_write,
-		release   = upgraded_release,
-		user_data = upgraded,
-	}
+	return Transport{read = upgraded_read, write = upgraded_write, release = upgraded_release, user_data = upgraded}
 }
 
 @(private)

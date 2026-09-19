@@ -27,7 +27,10 @@ Certificate_Chain :: struct {
 certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (chain: Certificate_Chain, ok: bool) {
 	chain.allocator = allocator
 
-	r := Reader{data = message, ok = true}
+	r := Reader {
+		data = message,
+		ok   = true,
+	}
 	if read_u8(&r) != 0 { return {}, false }
 
 	entries := read_section_u24(&r)
@@ -37,7 +40,7 @@ certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (ch
 	ders := make([dynamic][]u8, 0, 4, allocator)
 	for entries.ok && entries.at < len(entries.data) {
 		encoded := read_bytes(&entries, read_u24(&entries))
-		_ = read_bytes(&entries, int(read_u16(&entries)))  // the entry's extensions
+		_ = read_bytes(&entries, int(read_u16(&entries))) // the entry's extensions
 		der := make([]u8, len(encoded), allocator)
 		copy(der, encoded)
 		certificate, parse_err := x509.parse(der, allocator)
@@ -114,7 +117,10 @@ san_matches :: proc(certificate: ^x509.Certificate, expected: []u8) -> bool {
 // peer's end-entity certificate and the transcript of everything up to and
 // including its Certificate message. A scheme this client did not offer fails.
 certificate_verify_verify :: proc(message: []u8, certificate: ^x509.Certificate, transcript_hash: []u8) -> bool {
-	r := Reader{data = message, ok = true}
+	r := Reader {
+		data = message,
+		ok   = true,
+	}
 	scheme := Signature_Scheme(read_u16(&r))
 	signature := read_bytes(&r, int(read_u16(&r)))
 	if !r.ok || r.at != len(message) || len(signature) == 0 { return false }

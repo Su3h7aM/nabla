@@ -4,7 +4,7 @@ package tls
 import "core:testing"
 
 // The trace's certificate, as a trust store would carry it.
-RFC8448_CERTIFICATE_PEM : string : `-----BEGIN CERTIFICATE-----
+RFC8448_CERTIFICATE_PEM: string : `-----BEGIN CERTIFICATE-----
 MIIBrDCCARWgAwIBAgIBAjANBgkqhkiG9w0BAQsFADAOMQwwCgYDVQQDEwNyc2Ew
 HhcNMTYwNzMwMDEyMzU5WhcNMjYwNzMwMDEyMzU5WjAOMQwwCgYDVQQDEwNyc2Ew
 gZ8wDQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBALS7SY+CeTA9mAg2OZs2xpiMDGje

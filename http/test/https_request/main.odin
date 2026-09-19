@@ -15,8 +15,8 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
-import "nabla:http/client"
 import "nabla:http"
+import "nabla:http/client"
 
 DIRECTORY :: "/tmp/nabla-http-tls-handshake"
 CERTIFICATE_FILE :: "certificate.pem"
@@ -74,7 +74,9 @@ run_request :: proc(port: int) {
 		complete  = observe,
 	}
 
-	options.probe = {check = keep_going}
+	options.probe = {
+		check = keep_going,
+	}
 
 	request := client.Request {
 		url       = fmt.aprintf("https://localhost:%d/", port, allocator = context.allocator),

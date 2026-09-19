@@ -81,10 +81,7 @@ connection_handshake :: proc(connection: ^Connection, host: string) -> Error {
 	connection.roots = roots
 	connection.anchors = tls.certificate_pointers(roots.certificates, connection.allocator)
 
-	conn, init_err := tls.init(
-		tls_transport(connection),
-		{roots = connection.anchors, allocator = connection.allocator},
-	)
+	conn, init_err := tls.init(tls_transport(connection), {roots = connection.anchors, allocator = connection.allocator})
 	if init_err != tls.Error.None { return .TLS_Config }
 	connection.tls_conn = conn
 

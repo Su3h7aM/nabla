@@ -18,7 +18,10 @@ test_client_hello_carries_what_the_caller_asked_for :: proc(t: ^testing.T) {
 
 	// Walk the message back: a length that does not add up desynchronizes the
 	// reader, which the extension set and the final position both report.
-	r := Reader{data = dst[:count], ok = true}
+	r := Reader {
+		data = dst[:count],
+		ok   = true,
+	}
 	testing.expect_value(t, read_u16(&r), u16(LEGACY_VERSION))
 	_ = read_bytes(&r, len(fields.random))
 	testing.expect_value(t, len(read_bytes(&r, int(read_u8(&r)))), len(fields.session_id))
@@ -51,7 +54,7 @@ test_client_hello_carries_what_the_caller_asked_for :: proc(t: ^testing.T) {
 test_the_second_client_hello_repeats_the_cookie :: proc(t: ^testing.T) {
 	cookie := []u8{0xde, 0xad, 0xbe, 0xef}
 	share: [65]u8
-	share[0] = 4  // an uncompressed secp256r1 point
+	share[0] = 4 // an uncompressed secp256r1 point
 	fields := Client_Hello_Fields {
 		session_id = make([]u8, 32, context.temp_allocator),
 		group      = .SECP256R1,
@@ -62,7 +65,10 @@ test_the_second_client_hello_repeats_the_cookie :: proc(t: ^testing.T) {
 	count, encoded := client_hello_encode(dst, fields)
 	if !testing.expect(t, encoded) { return }
 
-	r := Reader{data = dst[:count], ok = true}
+	r := Reader {
+		data = dst[:count],
+		ok   = true,
+	}
 	_ = read_u16(&r)
 	_ = read_bytes(&r, len(fields.random))
 	_ = read_bytes(&r, int(read_u8(&r)))

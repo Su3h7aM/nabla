@@ -15,11 +15,7 @@ import "nabla:tls"
 // other has. A connection whose probe ends the request ends the transport too, which
 // is the only interruption the TLS layer needs to know about.
 tls_transport :: proc(connection: ^Connection) -> tls.Transport {
-	return {
-		read = connection_transport_read,
-		write = connection_transport_write,
-		user_data = connection,
-	}
+	return {read = connection_transport_read, write = connection_transport_write, user_data = connection}
 }
 
 connection_transport_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) {

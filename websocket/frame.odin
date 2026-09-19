@@ -31,12 +31,12 @@ MAX_CONTROL_PAYLOAD :: 125
 
 // Header is what a frame states about the payload that follows it.
 Header :: struct {
-	final:    bool,
-	opcode:   Opcode,
+	final:         bool,
+	opcode:        Opcode,
 	// masked says the payload is masked, and mask holds the key that unmasks it.
-	masked:   bool,
-	mask:     [MASK_KEY_SIZE]u8,
-	length:   int,
+	masked:        bool,
+	mask:          [MASK_KEY_SIZE]u8,
+	length:        int,
 	// header_length is how many octets the header took, the masking key included.
 	header_length: int,
 }
@@ -61,9 +61,12 @@ frame_header_encode :: proc(header: Header, mask: [MASK_KEY_SIZE]u8, dst: []u8) 
 
 	length_field: int
 	switch extended {
-	case 0: length_field = length
-	case 2: length_field = 126
-	case 8: length_field = 127
+	case 0:
+		length_field = length
+	case 2:
+		length_field = 126
+	case 8:
+		length_field = 127
 	}
 	dst[1] = u8(length_field) | 0x80
 
@@ -126,16 +129,7 @@ frame_mask :: proc(payload: []u8, mask: [MASK_KEY_SIZE]u8) {
 
 // frame_encode writes one whole masked frame and returns how many octets of `dst` it
 // used. The payload is copied, so it may not overlap `dst`.
-frame_encode :: proc(
-	opcode: Opcode,
-	final: bool,
-	mask: [MASK_KEY_SIZE]u8,
-	payload: []u8,
-	dst: []u8,
-) -> (
-	n: int,
-	ok: bool,
-) {
+frame_encode :: proc(opcode: Opcode, final: bool, mask: [MASK_KEY_SIZE]u8, payload: []u8, dst: []u8) -> (n: int, ok: bool) {
 	header_length, encoded := frame_header_encode({final = final, opcode = opcode, length = len(payload)}, mask, dst)
 	if !encoded || len(dst) < header_length + len(payload) { return 0, false }
 	copy(dst[header_length:], payload)
