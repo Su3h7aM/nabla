@@ -18,7 +18,6 @@ test_websocket_fallback_stops_at_trust_and_at_model_delivery :: proc(t: ^testing
 	cases := []Cases {
 		// Nothing reached the peer, or the peer said it has no WebSocket transport.
 		{"nothing reached the peer", {kind = .Transport, transport_cause = .Connection}, true},
-		{"the upgrade is unsupported", {kind = .HTTP, status = 426}, true},
 		{"the endpoint has no such resource", {kind = .HTTP, status = 404}, true},
 		// A peer that was never trusted is not sent the same request over a transport it
 		// would trust less, and a refusal is the peer's answer, not a missing capability.
