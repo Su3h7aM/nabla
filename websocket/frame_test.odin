@@ -75,6 +75,10 @@ test_rfc_6455_frame_examples :: proc(t: ^testing.T) {
 	// A reserved bit is a frame this client has no extension to read.
 	_, reserved_ok := frame_header_decode([]u8{0x91, 0x00})
 	testing.expect(t, !reserved_ok, "a frame with a reserved bit was accepted")
+
+	_, nonminimal_short := frame_header_decode([]u8{0x82, 0x7e, 0x00, 0x7d})
+	_, nonminimal_long := frame_header_decode([]u8{0x82, 0x7f, 0, 0, 0, 0, 0, 0, 0xff, 0xff})
+	testing.expect(t, !nonminimal_short && !nonminimal_long, "a non-minimal payload length was accepted")
 }
 
 @(private)

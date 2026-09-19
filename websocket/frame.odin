@@ -102,6 +102,7 @@ frame_header_decode :: proc(data: []u8) -> (header: Header, ok: bool) {
 	case 126:
 		if len(data) < 4 { return {}, false }
 		length = int(data[2]) << 8 | int(data[3])
+		if length < 126 { return {}, false }
 		at = 4
 	case 127:
 		if len(data) < 10 { return {}, false }
@@ -109,6 +110,7 @@ frame_header_decode :: proc(data: []u8) -> (header: Header, ok: bool) {
 		if data[2] & 0x80 != 0 { return {}, false }
 		length = 0
 		for i in 2 ..< 10 { length = length << 8 | int(data[i]) }
+		if length <= 0xffff { return {}, false }
 		at = 10
 	}
 	if header.masked {

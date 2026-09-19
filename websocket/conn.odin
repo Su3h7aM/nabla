@@ -107,7 +107,7 @@ destroy :: proc(conn: ^Conn) {
 // (RFC 6455 section 5.3).
 write :: proc(conn: ^Conn, opcode: Opcode, message: []u8) -> Error {
 	if opcode != .Text && opcode != .Binary { return .Protocol }
-	if conn.closed { return .Closed }
+	if conn.closed || conn.close_sent { return .Closed }
 
 	pending := message
 	first := true
@@ -139,6 +139,9 @@ ping :: proc(conn: ^Conn, body: []u8) -> Error {
 // close sends the close frame and waits for the peer's, so that both ends agree the
 // connection is over (RFC 6455 section 5.5.1). The transport is the caller's to close.
 close :: proc(conn: ^Conn, code: Close_Code, reason: string, buffer: []u8) -> Error {
+	if !close_code_valid(code) || len(reason) > MAX_CONTROL_PAYLOAD - 2 || !utf8.valid_string(reason) {
+		return .Protocol
+	}
 	if !conn.close_sent {
 		payload := conn.control[:2 + len(reason)]
 		payload[0] = u8(u16(code) >> 8)
@@ -215,7 +218,15 @@ read :: proc(conn: ^Conn, buffer: []u8) -> (count: int, opcode: Opcode, complete
 		case .Close:
 			payload, read_err := control_read(conn, header.length)
 			if read_err != .None { return 0, conn.message_opcode, false, read_err }
-			if len(payload) >= 2 { conn.close_code = Close_Code(u16(payload[0]) << 8 | u16(payload[1])) }
+			if len(payload) == 1 { return 0, conn.message_opcode, false, fail(conn, .Protocol_Error, .Protocol) }
+			if len(payload) >= 2 {
+				code := Close_Code(u16(payload[0]) << 8 | u16(payload[1]))
+				if !close_code_valid(code) { return 0, conn.message_opcode, false, fail(conn, .Protocol_Error, .Protocol) }
+				if !utf8.valid_string(string(payload[2:])) {
+					return 0, conn.message_opcode, false, fail(conn, .Invalid_Payload, .Protocol)
+				}
+				conn.close_code = code
+			}
 			if !conn.close_sent {
 				_ = control_send(conn, .Close, payload)
 				conn.close_sent = true
@@ -242,6 +253,14 @@ read :: proc(conn: ^Conn, buffer: []u8) -> (count: int, opcode: Opcode, complete
 		conn.frame_remaining = header.length
 		conn.mask = header.mask
 		conn.mask_at = 0
+		if conn.frame_remaining == 0 {
+			if !conn.frame_final { continue }
+			if conn.message_opcode == .Text && conn.carry_length != 0 {
+				return 0, conn.message_opcode, false, fail(conn, .Invalid_Payload, .Protocol)
+			}
+			conn.in_message = false
+			return 0, conn.message_opcode, true, .None
+		}
 	}
 }
 
@@ -335,8 +354,8 @@ text_validate :: proc(conn: ^Conn, chunk: []u8) -> bool {
 			if conn.carry_length == utf8.UTF_MAX { return false }
 			continue
 		}
-		decoded, _ := utf8.decode_rune_in_bytes(window)
-		if decoded == utf8.RUNE_ERROR { return false }
+		decoded, size := utf8.decode_rune_in_bytes(window)
+		if decoded == utf8.RUNE_ERROR && size == 1 { return false }
 		conn.carry_length = 0
 	}
 
@@ -348,10 +367,20 @@ text_validate :: proc(conn: ^Conn, chunk: []u8) -> bool {
 			return true
 		}
 		decoded, size := utf8.decode_rune_in_bytes(remaining)
-		if decoded == utf8.RUNE_ERROR { return false }
+		if decoded == utf8.RUNE_ERROR && size == 1 { return false }
 		remaining = remaining[size:]
 	}
 	return true
+}
+
+close_code_valid :: proc(code: Close_Code) -> bool {
+	value := u16(code)
+	if value >= 3000 && value <= 4999 { return true }
+	switch value {
+	case 1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014:
+		return true
+	}
+	return false
 }
 
 // transport_read reads exactly the bytes it is given, from wherever the connection has

@@ -141,6 +141,61 @@ test_frames_a_server_may_not_send :: proc(t: ^testing.T) {
 	destroy(conn)
 }
 
+@(test)
+test_empty_text_and_replacement_character_messages :: proc(t: ^testing.T) {
+	fixture: Fixture
+	defer delete(fixture.outgoing)
+	conn := fixture_conn(t, &fixture, []u8{0x81, 0x00, 0x81, 0x03, 0xef, 0xbf, 0xbd})
+	if conn == nil { return }
+	defer destroy(conn)
+
+	buffer: [8]u8
+	count, opcode, complete, err := read(conn, buffer[:])
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, count, 0)
+	testing.expect_value(t, opcode, Opcode.Text)
+	testing.expect(t, complete, "the empty message did not complete")
+
+	count, opcode, complete, err = read(conn, buffer[:])
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, opcode, Opcode.Text)
+	testing.expect(t, complete, "the replacement-character message did not complete")
+	testing.expect(t, mem.compare(buffer[:count], []u8{0xef, 0xbf, 0xbd}) == 0, "the replacement character changed")
+}
+
+@(test)
+test_invalid_close_payloads_are_not_echoed :: proc(t: ^testing.T) {
+	Cases := []struct {
+		frame: []u8,
+		code:  Close_Code,
+	}{{[]u8{0x88, 0x01, 0x00}, .Protocol_Error}, {[]u8{0x88, 0x02, 0x03, 0xed}, .Protocol_Error}, {[]u8{0x88, 0x03, 0x03, 0xe8, 0xff}, .Invalid_Payload}}
+	for test_case in Cases {
+		fixture: Fixture
+		conn := fixture_conn(t, &fixture, test_case.frame)
+		if conn == nil { continue }
+		buffer: [8]u8
+		_, _, _, err := read(conn, buffer[:])
+		testing.expect_value(t, err, Error.Protocol)
+		testing.expect_value(t, close_code_sent(fixture.outgoing[:]), test_case.code)
+		destroy(conn)
+		delete(fixture.outgoing)
+	}
+}
+
+@(test)
+test_local_close_input_is_checked_before_the_control_buffer_is_sliced :: proc(t: ^testing.T) {
+	fixture: Fixture
+	conn := fixture_conn(t, &fixture, nil)
+	if conn == nil { return }
+	defer destroy(conn)
+	defer delete(fixture.outgoing)
+
+	reason := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testing.expect_value(t, len(reason), 124)
+	testing.expect_value(t, close(conn, .Normal, reason, nil), Error.Protocol)
+	testing.expect_value(t, len(fixture.outgoing), 0)
+}
+
 // A message larger than one frame is fragmented, and every frame carries a mask of
 // its own, which is what a client must do (RFC 6455 section 5.3).
 @(test)
