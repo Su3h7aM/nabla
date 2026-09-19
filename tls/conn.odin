@@ -628,20 +628,41 @@ post_handshake_handle :: proc(conn: ^Conn) -> Error {
 		#partial switch message_type {
 		case .New_Session_Ticket:
 		case .Key_Update:
-			if len(message) != HANDSHAKE_HEADER_SIZE + 1 || message[HANDSHAKE_HEADER_SIZE] != 0 {
-				// This client never asks for an update, so a peer that asks for one
-				// is answering a request that was never made.
-				return .Handshake
+			if len(message) != HANDSHAKE_HEADER_SIZE + 1 {
+				return fail(conn, .Decode_Error, .Handshake)
 			}
+			request := message[HANDSHAKE_HEADER_SIZE]
+			if request > 1 { return fail(conn, .Illegal_Parameter, .Handshake) }
+
 			size := secret_size(conn.suite)
 			updated: Secret
 			if !key_schedule_update(conn.suite, conn.read_secret[:size], updated[:size]) { return .Unsupported }
 			conn.read_secret = updated
 			if !traffic_key_derive(conn.suite, conn.read_secret[:size], &conn.read_key) { return .Unsupported }
+
+			if request == 1 {
+				if update_err := key_update_send(conn); update_err != .None { return update_err }
+			}
 		case:
 			return .Handshake
 		}
 	}
+}
+
+// key_update_send answers a peer's request under the current write key, then advances
+// that key before any later application data (RFC 9846 section 4.7.3).
+key_update_send :: proc(conn: ^Conn) -> Error {
+	message: [HANDSHAKE_HEADER_SIZE + 1]u8
+	handshake_encode_header(.Key_Update, 1, message[:])
+	message[HANDSHAKE_HEADER_SIZE] = 0
+	if send_err := send_record(conn, .Handshake, message[:]); send_err != .None { return send_err }
+
+	size := secret_size(conn.suite)
+	updated: Secret
+	if !key_schedule_update(conn.suite, conn.write_secret[:size], updated[:size]) { return .Unsupported }
+	conn.write_secret = updated
+	if !traffic_key_derive(conn.suite, conn.write_secret[:size], &conn.write_key) { return .Unsupported }
+	return .None
 }
 
 // --- what a connection can say about itself ---

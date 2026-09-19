@@ -155,6 +155,16 @@ test_rfc_8448_simple_handshake :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_traffic_update_uses_an_empty_context :: proc(t: ^testing.T) {
+	secret: [32]u8
+	for &octet, index in secret { octet = u8(index) }
+
+	updated: Secret
+	if !testing.expect(t, key_schedule_update(.AES_128_GCM_SHA256, secret[:], updated[:32])) { return }
+	expect_bytes(t, "updated traffic secret", updated[:32], vector(t, "2cecd0a17506ef5fa73edc062d6e7b5397cf074ec1b4d8f99a120772932f0b45"))
+}
+
+@(test)
 test_rfc_8448_server_hello :: proc(t: ^testing.T) {
 	message := vector(t, RFC8448_SERVER_HELLO)
 	handshake_type, message_length, decoded := handshake_decode_header(message)
