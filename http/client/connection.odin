@@ -65,6 +65,34 @@ connection_dial :: proc(endpoint: net.Endpoint, options: Options, allocator: mem
 	return connection, .None
 }
 
+// PLATFORM_STORES are the files a Linux system keeps its trust anchors in, in the order
+// this client tries them: Debian, Ubuntu, Arch, and Alpine keep the first, Red Hat and
+// Fedora the second, and openSUSE the third. The bundle is present on every system this
+// targets, and the hash-named directory some distributions keep beside it answers the
+// same question at the cost of a directory scan, so it is not read.
+PLATFORM_STORES := [?]string{"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem"}
+
+// load_roots reads the trust store this connection verifies against: the caller's own
+// when it named one, and the platform's otherwise. A store is either read whole or not
+// used at all, since a store this client could only partly read would refuse peers the
+// platform accepts.
+load_roots :: proc(connection: ^Connection) -> (roots: tls.Roots, ok: bool) {
+	if connection.ca_file != "" {
+		return read_roots(connection, connection.ca_file)
+	}
+	for path in PLATFORM_STORES {
+		if found, found_ok := read_roots(connection, path); found_ok { return found, true }
+	}
+	return {}, false
+}
+
+read_roots :: proc(connection: ^Connection, path: string) -> (roots: tls.Roots, ok: bool) {
+	store, read_err := os.read_entire_file(path, connection.allocator)
+	if read_err != nil { return {}, false }
+	defer delete(store, connection.allocator)
+	return tls.roots_parse(store, connection.allocator)
+}
+
 // connection_handshake loads the trust store, completes TLS, and verifies the peer's
 // chain and its name. A failed verification never yields a usable connection, and a
 // store that cannot be loaded is a failure rather than an unverified connection.
@@ -72,11 +100,7 @@ connection_handshake :: proc(connection: ^Connection, host: string) -> Error {
 	name, _ := host_without_port(host)
 	if name == "" { return .TLS_Hostname }
 
-	store, read_err := os.read_entire_file(connection.ca_file, connection.allocator)
-	if read_err != nil { return .TLS_Trust }
-	defer delete(store, connection.allocator)
-
-	roots, roots_ok := tls.roots_parse(store, connection.allocator)
+	roots, roots_ok := load_roots(connection)
 	if !roots_ok { return .TLS_Trust }
 	connection.roots = roots
 	connection.anchors = tls.certificate_pointers(roots.certificates, connection.allocator)
