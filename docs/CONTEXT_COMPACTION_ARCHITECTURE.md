@@ -244,11 +244,20 @@ exceeded: nothing waits, and the turn fails with a message.
 
 ## 7. The summarization request
 
-The request reuses the conversation's own prefix: same resolved provider and model, same
+The request preserves the conversation's prefix: same resolved provider and model, same
 instruction snapshot, same tool order and schemas, same effort, same prompt-cache key. The
 directive is appended as the last user message. `chat_build_request_into` takes the directive as an
-argument, so there is one projection for both kinds of request and the summarizer's input is a
-cache read rather than a cache write.
+argument, so both request purposes use one projection. This makes the existing prefix eligible
+for cache reuse; it does not guarantee a cache read or prevent a charged cache write for a new
+suffix. Compaction stays on an independent HTTP operation even when foreground requests use WS.
+
+Cache-preservation requirements, corrected usage accounting and the HTTP/WS comparison gate
+are specified in
+[Network stack architecture, section 10](NETWORK_STACK_ARCHITECTURE.md#10-prompt-cache-preservation-and-the-reported-regression).
+Report compaction usage separately as well as in all-work totals. Mark checkpoint installation
+as an intentional prefix change so its expected cold input is not confused with a transport
+regression. Do not trigger compaction solely to improve a cache percentage or suppress needed
+compaction to preserve one.
 
 The worker has no execution authority even though the tool definitions are in its input. A response
 that proposes a tool call is not a summary, so it is rejected at adoption.

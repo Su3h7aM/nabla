@@ -2,7 +2,12 @@
 
 Status: implemented against Nabla change `knopyttl`, with Odin
 `dev-2026-09-nightly:a2fb372`. Every section below is in the tree except where it says
-otherwise; the deadlines it proposed were rejected before that work began, and no harness time
+otherwise. The later transport review in
+[Network stack architecture](NETWORK_STACK_ARCHITECTURE.md) supersedes the HTTP outcome,
+error-evidence size limits and WebSocket recovery details below where explicitly noted.
+Its section 10 also requires paired cache accounting and transport cache-parity gates.
+Those corrections are approved implementation work, not claims about the existing code.
+The deadlines this document proposed were rejected before that work began, and no harness time
 bound was introduced. What is not established by the tests, and needs a live exercise against a
 real provider, is listed at the end.
 
@@ -33,27 +38,31 @@ history deletion, thinking-block stripping, or retry-everything mode.
 The two open compaction items are resolved here:
 
 1. Provider-confirmed context overflow gets one repair using a checkpoint already ready at
-   the failed request boundary. An unfinished compaction never makes the foreground wait. Not yet
-   implemented; it needs the provider classification in §3.
+   the failed request boundary. An unfinished compaction never makes the foreground wait.
+   Implemented for the existing HTTP recovery path; WS rejection evidence is required by the
+   later network design before using the same repair there.
 2. Aggregate tool-result admission gets a per-response budget and durable result storage. Large
    results become small handles before entering history. Implemented, and described in §8.
 
-Cache breakpoints, prefix prewarming, and measured growth rates remain optional tuning work.
-They are not prerequisites for correct failure recovery. A finite context and an unavailable
+Cache-preserving request construction and accurate cache/cost accounting are requirements,
+not optional tuning. The investigation and acceptance contract are in
+[Network stack architecture, section 10](NETWORK_STACK_ARCHITECTURE.md#10-prompt-cache-preservation-and-the-reported-regression).
+Prewarming and incremental continuation are not scheduled. A finite context and an unavailable
 summarizer still cannot guarantee indefinite execution.
 
 ### Invariants
 
-1. One provider operation performs one send. There is no retry loop in `ai`, `sse`, or HTTP.
+1. One provider operation performs at most one model send. Setup may fail before it sends.
+   There is no retry loop in `ai`, `sse`, or HTTP.
 2. A transient retry uses the same endpoint, credentials, model, instructions, tools, effort,
    cache key, and encoded body. A repair is a different request, not a hidden mutation.
 3. No retry after user-visible text or an accepted completion. No tool from an unsuccessful
    attempt executes. Bytes accepted by a socket do not prove provider execution did not occur.
 4. Cancellation and storage failure defeat every recovery decision, including one already
-   scheduled. Time spent waiting counts against the recovery deadline.
+   scheduled. No recovery or turn deadline is introduced.
 5. Each actual send has its own durable request row, recorded before sending. Failed attempts
    and diagnostic messages do not become ordinary model-visible conversation entries.
-6. A retry does not reset the turn deadline, add another user prompt, refresh skills, or drain
+6. A retry does not add another user prompt, refresh skills, rotate cache identity, or drain
    steering into the frozen request. Steering is applied at the next ordinary boundary.
 7. Previously committed tool calls are never replayed to recover a provider failure.
 8. Compaction remains independent of the foreground turn. No foreground path joins a running
@@ -97,10 +106,11 @@ Headers live only for the call. `sse.post` forwards this option without interpre
 
 A refused response's body is delivered to the caller's chunk callback like any other body:
 through the existing framing rules, including chunk decoding and content-length, under the same
-probe as a successful body. The transport itself bounds what it reads only where the protocol
-does. The size policy belongs to whoever consumes the evidence, and `ai` keeps its own bounded
-copy (`PROVIDER_MAX_ERROR_BODY_BYTES`, 8192 bytes) to decode the provider's error document from.
-A body that ended early or is not a document is evidence, not a valid JSON document, and the
+probe as a successful body. The transport bounds reads only where the protocol does.
+The existing 8192-byte error-body copy in `ai` is a known classification restriction, not the
+target design. Section 7.3 of the network architecture requires complete JSON accumulation with
+checked allocation before classification; bounded diagnostic copies are made afterward in
+`agent`. A body that ended early or is not a document remains incomplete evidence, and the
 status survives even when reading that body fails. Do not parse the existing `"HTTP 400: ..."`
 display string.
 
@@ -187,15 +197,17 @@ validation/conversion. HTTP dates require IMF-fixdate and the two obsolete recip
 do not feed them to the RFC 3339 parser.
 
 Convert an absolute date to a nonnegative delay using wall time once at header receipt, then
-wait against a monotonic deadline. Reject invalid, conflicting duplicate, negative, and
-unrepresentable values. Saturate valid but enormous delays to a named out-of-policy sentinel
-rather than overflow or treat them as absent. Limit inspected header values to 256 bytes.
-A delay that exceeds policy is a reason to stop, not permission to retry earlier.
+wait against a monotonic deadline. Reject invalid, conflicting duplicate and negative values.
+Remove the existing 256-byte inspection cap and one-year parser sentinel in the HTTP outcome migration. Scan the complete
+field, accept arbitrarily many leading zeros, and represent a valid unrepresentable delay as
+present with overflow evidence. A delay that exceeds harness policy stops recovery rather than
+becoming absent or being shortened. This preserves the provider's instruction without a big-integer
+implementation.
 
 Use the header first. Provider-specific body delays can be added only for documented fields;
 do not search arbitrary JSON for something resembling a delay. Respect `x-should-retry: false`
 where the adapter recognizes it. `true` cannot override cancellation, trust failure, auth,
-quota, invalid input, output exposure, or the attempt/deadline budgets. `Allow` confirms
+quota, invalid input, output exposure, or the attempt bound. `Allow` confirms
 eligibility only within the transient classes below; it does not make an unknown failure retryable.
 
 ## 4. Foreground policy
@@ -240,12 +252,15 @@ After the synchronous send returns and provisional output is settled:
    reason.
 2. Successful complete operation and accepted completion: commit normally.
 3. Published text or accepted completion: stop on failure. Preserve text as partial.
-4. Confirmed input overflow: use §7, never ordinary backoff.
-5. Terminal class or `Forbid`: stop.
-6. Retry transient connection/I/O failure, incomplete stream, rate limiting, or provider
-   unavailability if another attempt remains and the provider is not asking for a longer wait
-   than the policy allows.
-7. Otherwise stop. Unknown provider failure, malformed output, and a local expiry are terminal.
+4. Uncertain WebSocket model delivery: stop. The planned narrow exception is a recognized
+   pre-execution rejection, as specified in network section 9.6. A terminal event alone does
+   not establish non-execution.
+5. Confirmed input overflow with safe rejection evidence: use §7, never ordinary backoff.
+6. Terminal class or `Forbid`: stop.
+7. Retry transient connection/I/O failure, incomplete stream, rate limiting, or provider
+   unavailability if delivery policy allows it, another attempt remains and the provider is not
+   asking for a longer wait than the policy allows.
+8. Otherwise stop. Unknown provider failure, malformed output, and a local expiry are terminal.
 
 Do not make delivered body bytes the exposure test. A usage update, keepalive, or ignored
 reasoning event is not visible output. Track `text_exposed` and `completion_accepted` explicitly
@@ -255,9 +270,10 @@ path. For a WS operation, the request ends at its valid provider terminal messag
 socket EOF, so a persistent connection remains usable for subsequent requests.
 The transport-specific completion boundary and delivery-aware recovery rules are specified
 in [Network stack architecture, section 9](NETWORK_STACK_ARCHITECTURE.md#9-provider-websocket-integration)
-and implemented: the chain stops on ambiguous WS delivery even before text is exposed, and
-every fallback or resend stays under `agent` policy and attempt accounting. No retry loop
-lives inside `ai`.
+and partly implemented: the chain already stops on all nonzero WS delivery states, even before
+text is exposed. The accepted design adds narrow explicit-rejection evidence, complete Upgrade
+refusal facts and setup attempts within the existing attempt bound. These remain implementation
+work. Every fallback or resend belongs to `agent`; no retry loop lives inside `ai`.
 A successful HTTP exchange with an unusable completion is not retried by the transport policy.
 
 The policy deliberately does not copy opencode's synthetic continuation prompt. Nabla excludes
@@ -306,7 +322,9 @@ Each send has this lifecycle:
 
 1. Build/admit/encode once at the ordinary boundary, then retain the preparation and bytes.
 2. Record `request_begin`; assign a fresh operation/event-source identity for this attempt.
-3. Perform one `Provider_Request_Operation_Encoded` call with the attempt deadline.
+3. Perform one provider operation with cancellation and the selected transport. Record a
+   setup-only attempt explicitly when no model message was sent; network section 9.6 defines
+   the shared attempt bound for setup, fallback and model sends.
 4. Finish its row with success/failure/cancellation, normalized error, and attempt-local usage.
 5. Decide recovery. Persist the decision with the failed request's finish record before waiting.
 6. If retrying, wait, clear all attempt state, record the next row, then send identical bytes.
@@ -334,8 +352,11 @@ returned `.None`. Retire each operation only after its call returns.
 Usage events can be repeated or cumulative within a send. Keep the latest reported value for
 each bucket, never sum snapshots. Sum sends when reporting turn/session cost, including failed
 sends and compaction. Missing stays nil: a bucket's total carries the count of requests that
-reported it, so a total never claims to include cost nobody reported. There is no count of sends
-that reported nothing at all, which a reader wanting the full denominator would have to add.
+reported it, so a total never claims to include cost nobody reported. The current hit-rate
+calculation still divides independently reported buckets and can show missing cache usage as a
+miss. Network section 10.3 requires paired input/cache-read sums and visible coverage, including
+requests that reported nothing. Keep all-work totals and separate foreground/compaction views;
+neither reconnect nor fallback resets the session's accounting.
 `last_input_measured` is the latest request's input estimate anchor, not the sum across retries.
 `chat_request_usage` reads one operation's reports, and `session.cache_totals` sums every
 finished request, failed and compaction rows included.
@@ -373,7 +394,7 @@ facts. Local admission is an estimate; a provider can reject a request that pass
 
 On confirmed overflow with no exposed output:
 
-1. Finish the failed attempt row. Check storage/cancellation/deadline first.
+1. Finish the failed attempt row. Check storage, cancellation and delivery/rejection evidence first.
 2. Refuse if the chain already repaired once or has sent three attempts.
 3. Poll the compaction worker once. It may have completed while the rejected request was sent.
 4. If there is a ready, valid candidate, call the existing conditional checkpoint installation.
@@ -627,8 +648,8 @@ Minimum useful test groups:
 - One scripted provider sequence: 429 then truncated pre-output stream then success. Assert
   identical encoded bytes, three finished request rows, retry links, attempt-local usage, and
   one successful conversation append. Run with diagnostics disabled too.
-- Extend that fixture for cancellation during delay, total deadline exhaustion, and text followed
-  by disconnect. Assert bounded sends, no automatic continuation, no executed partial tool call,
+- Extend that fixture for cancellation during delay and text followed by disconnect. Assert
+  bounded sends, no automatic continuation, no executed partial tool call,
   and a fresh prompt can succeed. No wall-clock tests that sleep for production backoff periods.
 - Extend the existing compaction lifecycle test for provider overflow: a ready summary repairs
   once and preserves the post-fork tail; a stalled summary causes immediate context exhaustion;

@@ -4,7 +4,13 @@ Status: authoritative architecture, implemented. The writer, context migration,
 correlation, lifecycle records, provider and MCP capture, transport accounting, reader,
 export, and the request join are all in place. Section 4.1 records what the migration
 closed and what was decided against; section 15 records what each phase now contains and
-the gate this work was held to. Follow mode is the one explicit non-goal.
+the gate this work was held to. Follow mode is an explicit non-goal.
+
+The provider transport and cache review adds approved, not-yet-implemented corrections in
+[Network stack architecture, sections 9 and 10](NETWORK_STACK_ARCHITECTURE.md#9-provider-websocket-integration):
+WS message boundaries, setup/delivery/rejection evidence, and cache accounting with measurement
+coverage. Those sections supersede earlier claims here that transport and cache evidence are
+complete. Keep the existing observation/capture/export paths; do not add a metrics service.
 
 This plan is based on the complete *Nabla Logging Reference Study: goose + opencode*,
 including its appendices, at
@@ -78,6 +84,10 @@ Given a session and a failed request, identify:
 - Whether execution started, whether a result was observed, and whether that result
   committed to SQLite. These are three different facts.
 - What evidence is absent because capture was disabled, bounded, expired, or failed.
+- Whether a cache-rate change comes with a changed common request prefix, transport/connection
+  change, checkpoint installation, tool refresh, or incomplete usage reporting. Compare only
+  paired input/cache-read measurements and show coverage, foreground/compaction breakdowns and
+  all-work totals. Do not infer provider cache residency from a stable local digest.
 
 A record is a statement about what a process observed at a named boundary. Missing
 completion is not proof of failure, a completed local write is not proof of remote receipt,
@@ -272,7 +282,7 @@ Decided against, and why:
 |---|---|
 | MCP stderr capture | Not implemented. Stderr belongs to the server process rather than to one JSON-RPC operation, and the drainer runs on another thread with no request correlation. The bounded excerpt and byte count on failure stay as they were |
 | Follow mode and live replay | Not implemented. Batch read and bounded export answer the current debugging need, and a live tail would need its own rotation and retention contract. The `(run_id, seq)` cursor is in the format if a later feature wants one |
-| Non-2xx response body capture | Not implemented. The transport already reads a bounded excerpt for `Failure.detail`, and draining more would change transport work for diagnostics |
+| Non-2xx response body capture | The old bounded-transport-excerpt decision is superseded. The HTTP result redesign streams and validates refused bodies for protocol correctness and provider classification regardless of capture. Optional capture uses its existing retention policy and reports truncation; logging does not decide how much the transport reads |
 | SQLite `immutable=1` for the read-only reader | Not used. A harness may be writing the write-ahead log at the same time, and immutable mode disables the change and locking checks that make that safe |
 
 Redaction does not belong in the sink, because formatted text has already lost its field

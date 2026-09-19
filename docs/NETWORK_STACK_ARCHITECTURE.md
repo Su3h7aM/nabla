@@ -1,708 +1,812 @@
-# Network stack architecture and remaining work
+# Network stack architecture and implementation plan
 
-Status: reviewed implementation and continuation plan, revision 5 (2026-09-19).
-Section 9 specifies provider WebSocket integration; it is approved design, not implemented
-behavior. Sections 4 and 6 distinguish review findings from completed corrections.
-This replaces the pre-implementation proposal and its subsequently appended completion
-notes. The stack is implemented, but passing interoperability tests is not evidence of
-complete protocol compliance. The corrections below remain implementation work.
+Status: architectural decisions accepted, revision 6. Reviewed against source at
+`876bc824` and the complete WebSocket transport report. This revision changes documentation,
+not implementation. Sections 4 and 6 describe the implementation; sections 7, 9 and 10 specify
+work still required. A passing test suite is not a claim of complete protocol compliance.
 
-## 1. Scope and evidence
+## 1. Scope and decisions
 
-The harness uses outbound HTTP/1.1 and SSE for model APIs and metadata discovery.
-`http/client` now uses the repository's TLS 1.3 client rather than OpenSSL bindings.
-`websocket` implements client framing and opens ws/wss connections through `http/client`.
-The native protocol implementation is Odin; this does not mean the executable has no
-foreign dependencies. OpenSSL and Python remain independent test peers, not production
-TLS dependencies.
+Nabla needs outbound HTTP/1.1, TLS 1.3, SSE, and Responses-over-WebSocket for AI APIs.
+Keep the native Odin stack and correct the features we use. Do not replace it with a new
+transport framework or implement unrelated protocol features.
 
-This review inspected the HTTP request/response path, resolver and cancellation adapters,
-TLS codecs, authentication, record protection and connection driver, WebSocket framing
-and connection handling, callers, and existing tests. Findings below distinguish source
-observations from behavior covered by tests. No new reproduction tests or production
-fixes were added as part of this documentation revision.
+The decisions are:
 
-Verification during information gathering:
+- HTTP/SSE remains the default. WebSocket is an explicit provider transport setting,
+  selected by the configured API's implemented capabilities, never by a provider/model name.
+- Keep one foreground Responses connection per live chat session, one request at a time,
+  driven on its creating thread. Reuse it for full-context requests. Local committed history
+  remains authoritative.
+- Do not implement incremental continuation, named lanes, connection-age timers, prewarming,
+  a socket pool, compression, or background compaction over WebSocket in this phase.
+- Fix request retirement, event identity, setup evidence, and cancellation before extending
+  reuse. Keep conservative delivery accounting. Do not implement byte-accurate WebSocket
+  write progress merely to recover a few more failed sends.
+- Remove arbitrary parsing and message-size refusal caps from the supported client paths.
+  Keep actual wire bounds, cryptographic bounds, and checked machine representability.
+  Application retention and retry policy must not change protocol parsing.
+- Complete TLS key/record safeguards, legal handshake fragmentation, HTTP syntax/outcome
+  corrections, SSE decoding, and DNS fallback. These are correctness work for the existing
+  feature set, not optional additions for protocol completeness.
+- Preserve provider prompt-cache reuse as a cost requirement, not optional tuning. Fix the
+  incomplete-usage hit-rate calculation and require transport parity and measured cache
+  acceptance under section 10 before expanding WebSocket rollout.
+- Commit deterministic provider and `wss` integration coverage. A discarded development
+  script is not a regression gate.
 
-- Repository check passed.
-- Full release and debug test suites passed, including the HTTPS, TLS/OpenSSL and ws/wss
-  executable harnesses. TLS currently has 11 unit tests and WebSocket has six.
-- Earlier implementation verification found no libssl/libcrypto linkage. That linkage
-  check was not repeated during this review.
-- Earlier live checks reached OpenAI, Anthropic and OpenRouter over TLS 1.3. These are
-  historical observations, not guarantees about every configured endpoint or future chain.
+This design uses Odin's explicit state, ownership, and error values.
 
-Use Fish and Mise for subsequent commands, for example `mise run check` and
-`mise run test agent`. Consult the task script for supported package selection.
+## 2. Package responsibilities
 
-## 2. Architecture decisions
+| Package | Owns | Must not own |
+|---|---|---|
+| `http` | HTTP syntax, fields, URL/request-target handling, framing rules, HTTP dates | Provider acceptance, retries, logging policy |
+| `http/client` | DNS, TCP, trust-store loading, HTTP exchange, cancellation, Upgrade handoff | API status/media-type decisions or fallback to another provider transport |
+| `tls` | TLS messages, authentication, records, alerts, keys; a supplied byte transport and trust anchors | Filesystem trust policy, providers, request lifetimes |
+| `websocket` | RFC 6455 handshake, framing, text validation, control frames and closure | JSON, model requests, reconnect/replay policy |
+| `sse` | Event-stream parsing/writing and the existing HTTP POST convenience operation | Provider events, automatic replay, browser EventSource lifecycle |
+| `ai` | API request/event codecs, provider failure classification, one-send operations, concrete Responses connection state | Retry authorization, durable conversation, presentation |
+| `agent` | Session lifetime, selection, fallback, attempts, committed history, retention policy | Protocol syntax or provider-name guesses in transports |
+| Root | Driving thread and process lifetime | A second transport policy implementation |
 
-### Keep the existing package boundaries
+Keep the HTTP server as a standalone library consumer. Shared parser changes must migrate
+and test its callers, but this review is not a server conformance audit. Foundation packages
+remain independent of these libraries and the harness.
 
-- `http` owns HTTP syntax and semantics, including shared field parsing. It must not
-  acquire provider policy. Its existing server implementation remains in place; lack of
-  a harness caller is not grounds to delete a standalone library's server API.
-- `http/client` owns DNS/TCP transport, the HTTP exchange, interruption and trust-store
-  loading. `tls` receives anchors rather than choosing filesystem paths.
-- `tls` owns TLS framing, negotiation, authentication and traffic keys. It takes a byte
-  transport, not a socket. It currently imports `core:net` for address parsing and uses
-  `time.now()` for verification; the old claim that it has no clock or net import was false.
-- `websocket` owns its Upgrade validation and WebSocket protocol. `http/client` owns the
-  connection handoff, including bytes buffered beyond the HTTP response head.
-- `sse` owns the event-stream format. `ai` owns provider response interpretation.
-  `agent` owns retries, budgets, configuration and recording policy.
+Keep the blocking byte-transport callbacks and existing `core:net` / `core:nbio` integration.
+Do not add a generic network package, backend registry, transport vtable above `ai`, or a
+sans-I/O rewrite. A concrete session struct and ordinary procedures are sufficient.
 
-Retain the blocking transport callbacks and single I/O owner. Do not add a generic network
-package, TLS backend interface, connection pool, or sans-I/O state-machine rewrite to fix
-local bugs. Continue using `core:net`, `core:nbio`, and `core:os`, not platform syscalls.
-The repository targets Linux; platform trust-store paths are data, not a reason for new
-OS-specific code branches.
+## 3. Protocol baseline and limit policy
 
-### Separate HTTP outcomes from application acceptance
+Protocol sources for this design:
 
-Change the client contract in a coordinated implementation change: a valid HTTP status
-is response data, not an exchange failure. Report status and fields independently from
-transport/framing completion. Move the 2xx and expected-media-type acceptance decisions
-into `ai` and metadata callers. Keep upgrade refusal as a distinct outcome of an operation
-whose contract requires a protocol switch.
+- [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846.html), the current TLS 1.3 specification,
+  supersedes RFC 8446. Use sections 4.1.2 and 4.1.4 for ClientHello/retry, 4.7.3 for KeyUpdate,
+  5.1 through 5.5 for records and key usage, and 6 for alerts. Do not mechanically replace
+  old RFC 8446 section numbers. Keep [RFC 8448](https://www.rfc-editor.org/rfc/rfc8448.html)
+  as independent known-answer traces.
+- [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html), especially 5, 7.8, 8.6, 10.2.3,
+  and 15.2.2; [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html), especially 2 through 7.
+  [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986.html) defines URI components.
+- [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html), especially 3, 4.1, 4.3, 5,
+  7, 8, and 10.4, plus the
+  [IANA WebSocket registries](https://www.iana.org/assignments/websocket/websocket.xhtml).
+- [WHATWG SSE](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream)
+  and the [Encoding Standard's UTF-8 decoder](https://encoding.spec.whatwg.org/#utf-8-decoder).
+  SSE is not an RFC. The framing algorithm does not require implementing browser EventSource.
+- [RFC 1035](https://www.rfc-editor.org/rfc/rfc1035.html),
+  [RFC 7766](https://www.rfc-editor.org/rfc/rfc7766.html), and
+  [RFC 5452](https://www.rfc-editor.org/rfc/rfc5452.html) for DNS transport and matching.
+- [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280.html),
+  [RFC 9525](https://www.rfc-editor.org/rfc/rfc9525.html),
+  [RFC 6066](https://www.rfc-editor.org/rfc/rfc6066.html), and
+  [RFC 7301](https://www.rfc-editor.org/rfc/rfc7301.html) for certificate paths, service
+  identity, SNI, and ALPN. Dependency behavior must be verified too.
 
-Migrate `Response_Head.usable`, `Request.expected_content_type`, `Failure.HTTP_Status`
-and their callers together. Preserve error-body delivery, retry classification, cancellation
-and transfer observations. Do not replace the present API with a generic policy framework.
+HTTP does not prescribe universal field/body caps. RFC 6455 section 10.4 explicitly permits
+implementation limits and recommends protection against memory exhaustion. Therefore an
+implementation cap is not automatically an RFC violation. Nabla chooses the stricter project
+rule requested here: no arbitrary protocol refusal cap. This is a project decision, not a
+claim that the RFC forbids limits. Streaming reduces memory use but does not make finite
+memory unlimited. Whole provider JSON events still require memory proportional to their size.
 
-### Keep TLS 1.3 as the current scope
+Distinguish four things in code and documentation:
 
-Finish the implemented version before adding another. TLS 1.2 is deferred until a required
-provider, configured proxy, or supported deployment actually needs it. A public echo
-service requiring TLS 1.2 demonstrates a compatibility gap, not a harness requirement.
-No legacy TLS, PSK, resumption, 0-RTT, client credential provisioning, OCSP/CRL retrieval,
-HTTP/2, HTTP/3, redirects or cookie jar is scheduled now. Mandatory handling of legal
-messages within TLS 1.3 is not an optional feature: an empty response to a handshake
-CertificateRequest and requested KeyUpdate handling belong in the correction work.
+1. Wire/security bounds are mandatory. Examples are WebSocket control payloads of at most
+   125 bytes, its 63-bit frame length, TLS record/vector widths, and TLS key-usage bounds.
+2. Buffer/chunk sizes are implementation choices, not maximum accepted input. HTTP fields
+   and SSE lines grow; WebSocket payloads and HTTP bodies stream in chunks.
+3. Allocation failure and unrepresentable values are local resource failures, not malformed
+   peer input. Check growth, conversions, and allocator results. Never truncate and continue.
+4. Retained log excerpts, tool-result admission, retry counts, and retry waits are harness
+   policy. They may bound retention or decline another operation, not change a parsed fact
+   or label a legal protocol message invalid. No harness deadline bounds model deliberation.
 
-### Preserve fail-closed authentication
+There is no implicit connect, idle, or whole-request timer. Reusable transport callers may
+supply cancellation/deadlines; Nabla model operations supply cancellation without a time bound.
+DNS retransmission intervals and test-process timeouts are not model-request deadlines.
 
-Keep verification always enabled. An explicitly configured CA bundle replaces the default;
-an absent option searches the existing Linux bundle paths. Do not add insecure verification
-or fallback to plaintext. Preserve certificate-path errors sufficiently to diagnose failures
-and choose alerts. Revocation checking is absent, not a implemented "soft-fail" mechanism.
-Do not describe parsing a partially usable CA bundle as loading every certificate.
+## 4. Source audit and required corrections
 
-## 3. Protocol sources
+The following are source observations, not newly reproduced failures. Completed earlier
+corrections are in section 6. This table also records limits that are not protocol requirements.
 
-Use normative text, including current updates, rather than comments or successful provider
-connections as the conformance baseline.
+| Source and current behavior | Specification or boundary | Decision |
+|---|---|---|
+| `tls/conn.odin`: `MAX_SENT_MESSAGE = 2048`, `send_message` emits one record | TLS permits larger ClientHello messages and handshake fragmentation | Remove the cap; checked dynamic encoding and record fragmentation, section 7.2 |
+| `tls/conn.odin`: no outbound key-usage/epoch guard; incomplete transition validation | RFC 9846 4.7.3, 5.1, 5.5 | Implement before calling long-lived `wss` hardened |
+| `tls/record.odin`: inner decoding strips padding without validating the content bound/type | RFC 9846 5.2, 5.4 | Validate content and full inner length separately from authentication |
+| `tls/conn.odin`: cookie-only retry is rejected, CCS is not restricted to its legal window, alert parsing accepts extra bytes | RFC 9846 4.1.4, 5, 6 | Accept legal retry; reject invalid phases and alert lengths with the appropriate alert |
+| Installed core X.509 verifier has `_MAX_CHAIN_DEPTH` and `_MAX_SIG_CHECKS` | These are dependency search budgets, not TLS certificate-list limits | Track as an unresolved dependency restriction; section 7.2 defines the required dependency change |
+| `http/client/reader.odin`: growing response lines; no body cap in client streaming | HTTP has no universal line/body bound | Preserve growth and streaming; distinguish allocation/representation failures from syntax failures |
+| `http/client/client.odin`: status/media-type rejection can hide a later framing failure | HTTP outcome is distinct from application acceptance | Migrate the result and all callers together, section 7.3 |
+| Shared HTTP fields comma-combine every duplicate; request formatting trusts fields and framing | RFC 9110 5; RFC 9112 6 | Preserve repeated fields, validate field-specific framing and request syntax |
+| HTTP chunk parsing uses signed parsing; trailers lack full validation | RFC 9112 7.1 | Parse hexadecimal grammar and trailers; do not accept sign prefixes or silently discard invalid trailers |
+| `http/routing.odin` loses empty-query presence and has no fragment component; client schemes are case-sensitive | RFC 3986; RFC 9112 request-target rules | Parse components once, validate for the calling protocol, preserve raw query and percent encoding |
+| `ai/responses_websocket.odin:provider_websocket_endpoint` appends to the whole URL | `/responses` is a path, not part of a query | Share component-based Responses resource resolution across HTTP and WS |
+| `ai/classify.odin`: ignores Retry-After over 256 bytes | RFC 9110 10.2.3 has no such bound; many leading zeros can still mean a short delay | Remove the cap, validate all digits, preserve overflow as present rather than absent |
+| `ai/request.odin`: retains only 8192 error-body bytes before JSON classification; code/message caps affect extraction | A large valid error document can carry relevant rejection evidence after that prefix | Parse full error JSON with checked growth before classification; bound only diagnostic copies in `agent` |
+| `sse/sse.odin`: no line/event cap, but UTF-8 replacement is per byte | WHATWG requires the Encoding Standard decoder, which consumes malformed prefixes differently | Preserve uncapped framing, correct malformed UTF-8 replacement |
+| `sse/sse.odin:parse_retry` returns on overflow before checking the remaining characters | Only an all-ASCII-digit value updates retry state | Scan the complete field even after overflow; do not accept a digit prefix followed by garbage |
+| `websocket/conn.odin`: 16 KiB send/read chunks | RFC 6455 permits fragmentation; these are not message caps | Keep chunking and streaming, with no total message/fragment-count cap |
+| `websocket/client.odin:protocol_offered` uses case-insensitive token matching and does not validate offer uniqueness/grammar | Subprotocol identity is exact; HTTP field names being case-insensitive does not make every value so | Validate nonempty unique offered tokens and an exact selected token; retain case-folding only where specified |
+| WebSocket refuses extension offers | No extension codec is implemented | Keep refusal as a local unsupported-feature error; never negotiate unimplemented extensions |
+| `http/client/resolve.odin`: 4096-byte receive buffer, no TC-to-TCP retry, only first address returned | DNS supports truncated UDP answers and TCP length-prefixed messages | Do not make the scratch size an answer cap; implement TCP retry and sequential address fallback |
+| `ai/responses_websocket.odin`: any decoder failure becomes `Terminal_Observed`; some failures retain the socket | Malformed JSON is not a provider terminal, and unread messages can contaminate the next request | Separate terminal evidence from local parser failure; abort every unsuccessful operation |
+| Provider control retains the prior operation's interruption pointer; affinity is reset mainly on selection replacement | A session outlives operation storage and option values can change | Clear bindings on every return; check effective affinity before every use |
+| Upgrade failure loses refusal body, retry headers, and some configuration/cancellation causes | A failed Upgrade is still an HTTP response or a typed local failure | Preserve both response and exchange evidence; cancellation must never trigger fallback |
+| `agent/retry.odin` treats every nonzero WS delivery state as ambiguous | A recognized explicit rejection is different from unknown execution | Preserve the stop on uncertain sends; authorize only the narrow proven-rejection cases in 9.6 |
 
-- [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846.html): current TLS 1.3 specification,
-  obsoleting RFC 8446. Section 1.2 identifies changes, including mandatory key-usage
-  updates, an epoch bound, ticket handling and alert clarifications. Existing RFC 8446
-  citations remain useful for the original implementation, but section numbers must be
-  checked rather than mechanically replaced.
-- [RFC 8448](https://www.rfc-editor.org/rfc/rfc8448): independent TLS 1.3 traces used by
-  current known-answer tests. RFC 8446 Appendix B defines structures, not test vectors.
-- [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110),
-  [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112): HTTP semantics and HTTP/1.1 framing.
-  RFC 9111 matters if caching is introduced; no cache implementation is claimed here.
-- [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455): WebSocket, particularly sections
-  4.1, 5.2, 5.4, 5.5, 7 and 8; consult the IANA close-code registry as well.
-- [RFC 1035](https://www.rfc-editor.org/rfc/rfc1035),
-  [RFC 7766](https://www.rfc-editor.org/rfc/rfc7766), and
-  [RFC 5452](https://www.rfc-editor.org/rfc/rfc5452): DNS transport and response matching.
-- [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280),
-  [RFC 9525](https://www.rfc-editor.org/rfc/rfc9525),
-  [RFC 6066](https://www.rfc-editor.org/rfc/rfc6066), and
-  [RFC 7301](https://www.rfc-editor.org/rfc/rfc7301): certificate paths, service identity,
-  SNI and ALPN. Core verification is a dependency to inspect, not a proof of compliance.
-- [WHATWG server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html):
-  SSE is not defined by an RFC.
+No server-wide, certificate-corpus, or cryptographic implementation audit is claimed. Shared
+server scanner/body limits are explicit server resource policy, outside the outbound provider
+path; do not describe them as HTTP limits or silently copy them into the client.
 
-The previous plan overstated what RFCs imply about limits. HTTP permits implementation
-resource limits and caller timeouts; it does not require waiting for a 408 or 504.
-Our stricter rule is a project policy: no hidden request lifetime or arbitrary message cap
-in the reusable client. Protocol limits and caller-selected limits remain valid.
+## 5. Feature scope
 
-## 4. Confirmed source findings
+Implement client HTTP/1.1, TLS 1.3 with currently supported authenticated suites, SSE framing,
+and RFC 6455 version 13 without extensions. Offer only HTTP/1.1 ALPN for this client and
+validate the selected value. Absence of ALPN remains compatible with HTTP/1.1.
 
-These are open corrections, not claims that every case has a failing reproduction yet.
+Do not add TLS 1.2, PSK/resumption, 0-RTT, client-credential provisioning, post-handshake
+client authentication, HTTP/2, HTTP/3, redirects, cookies, proxy CONNECT, or compression in
+this phase. Reject unsupported outgoing CONNECT explicitly rather than sending an invalid
+origin-form tunnel request. These are feature choices, not invented limits on features we
+claim to support. Mandatory legal messages in the selected protocol remain mandatory.
 
-### 4.1 TLS authentication and ownership
+Do not advertise transfer/content codings the client cannot decode. Chunked framing is
+required; unsupported additional codings must remain an explicit unsupported result, not
+bytes mislabeled as decoded provider JSON. Do not add a coding framework for hypothetical use.
 
-1. `tls/conn.odin:chain_verify` discards the successful slice returned by
-   `x509.verify_chain`. The installed core explicitly returns an allocated, caller-owned
-   path. Release that slice without destroying the certificates it points to.
-2. `http/client/client.odin:request_send` obtains an allocated handshake failure detail,
-   then passes it to `failure_from_error`, which clones it. Release the original or
-   transfer ownership explicitly. Cover a failing handshake under a tracking allocator.
-3. `identity_verify` checks address literals against IP SANs, but `chain_verify` then
-   passes the same literal as `dns_name` to core's DNS hostname check. Separate reference
-   identity validation from path validation so a valid IP SAN is not rejected by a second,
-   inappropriate DNS check.
-4. `certificate_chain_decode` can break on a DER parse failure after consuming the last
-   entry and still report success if earlier certificates exist. Track parse failure
-   explicitly and require complete outer and nested consumption. Inspect cleanup when a
-   certificate parses but its entry extensions are malformed.
-5. Core verification has its own path-depth and signature-search budgets. Therefore the
-   previous assertion of unlimited chain verification was inaccurate. Record these as
-   dependency constraints; do not remove security checks or fork X.509 casually to hide
-   them. Audit critical extensions, identity, EKU, signature algorithms and ownership
-   against the exact installed core before claiming broad certificate compatibility.
+Trust verification is always enabled. An explicit CA bundle replaces the defaults. No
+plaintext fallback from TLS, insecure verification switch, or automatic redirect of credentials.
+Revocation retrieval is absent; do not describe it as implemented soft-fail checking.
 
-### 4.2 TLS key transitions and records
+## 6. Implementation baseline
 
-1. `key_schedule_update` passes Hash(empty) as HKDF label context. The traffic-update
-   equation uses the empty byte string. This prevents interoperability after an update.
-2. `post_handshake_handle` rejects `update_requested = 1` with the mistaken explanation
-   that only this client may initiate updates. Either peer can request an update. Update
-   the receive secret and answer under the old send key before the next application record;
-   then change the send secret. Validate the request byte and message length.
-3. Sending has no key-usage or sequence-exhaustion guard. Implement suite-appropriate
-   usage accounting and automatic updates before protocol security bounds, including the
-   current specification's sending epoch bound. Long-lived wss connections already exist;
-   this is not made irrelevant by one HTTP request per connection.
-4. `read_record` drops every outer ChangeCipherSpec regardless of payload or phase, and
-   also accepts an encrypted inner ChangeCipherSpec. Validate the compatibility record's
-   single `0x01` byte and permitted handshake window; reject protected CCS.
-5. `record_decode_inner` does not enforce the decrypted content limit or valid content
-   type. `read_record` silently skips unknown types. Separate authentication failure,
-   invalid inner plaintext and record overflow so the peer receives the appropriate alert.
-6. The handshake stream permits bytes to remain across key transitions without checking
-   required record alignment. Verify ServerHello, Finished and KeyUpdate boundaries,
-   incomplete handshake/application-data interleaving and unexpected queued messages.
-7. `fail` sends an alert but leaves the connection reusable. `write` does not check the
-   closed state. Model terminal failure and separate read/write closure as needed by the
-   protocol; never resume after a fatal error or partially written encrypted record.
-8. `tls_error` maps a bare TCP close during TLS to `.Closed`. `stream_until_closed` treats
-   that as successful completion. Preserve the distinction between authenticated
-   close_notify and truncated TLS, while allowing HTTP framing to establish completion
-   when an exact or chunked body has already ended.
+Already present and retained:
 
-### 4.3 TLS negotiation and message validation
+- Native TLS authentication with repaired verified-path/detail ownership, IP SAN validation,
+  atomic certificate-list parsing, strict ServerHello/EncryptedExtensions checks, and empty
+  client Certificate response to a main-handshake CertificateRequest.
+- Correct traffic-update derivation and requested KeyUpdate response, terminal fatal TLS
+  errors, TLS truncation distinguished from authenticated closure, and protected CCS rejection.
+- HTTP nil-sink body validation and cleanup of rejected parsed DNS answers.
+- WebSocket empty messages/final continuations, valid U+FFFD text, close-payload validation,
+  writes-after-Close rejection, minimal frame-length encoding, handshake-field ownership,
+  abnormal closure, and an abort path without close writes.
+- Shared Responses request encoding and event decoding, API-driven transport capability,
+  provider transport configuration, lazy session socket reuse with full context, and delivery
+  evidence that prevents uncertain WS sends from being replayed.
 
-1. ServerHello parsing ignores legacy version and compression values, does not reject
-   duplicate extensions, ignores unsolicited extensions, and does not require complete
-   consumption of recognized extension bodies or the whole message. Validate structure,
-   placement and offer/response correspondence. Unknown response extensions are not the
-   same as unknown ClientHello offers.
-2. EncryptedExtensions uses `extension_find`, conflating malformed and missing fields.
-   Its ALPN path accepts the first entry without requiring a single offered, nonempty
-   protocol. Neither the TLS driver nor HTTP adapter checks the negotiated result.
-3. A legal handshake CertificateRequest fails because Certificate is expected immediately.
-   Parse the request, incorporate it into the transcript and send an empty Certificate
-   before Finished when no credentials are configured. Do not implement credential
-   provisioning or advertise post-handshake authentication merely to support this case.
-4. HelloRetryRequest handling requires a different group and cannot answer a cookie-only
-   retry. Preserve the existing share when no new share is requested. Validate an actual
-   requested change, allowed extensions, session ID and suite consistency across the retry.
-5. `MAX_SENT_MESSAGE = 2048` is an invented outbound handshake cap. Legal cookies and ALPN
-   lists can exceed it. Size or grow the message buffer using checked protocol lengths,
-   fragment outbound handshake messages across records, and validate nested vector lengths
-   before encoding. `write_section_end` currently narrows lengths without a range check.
-6. Many handshake failures still return without alerts: malformed messages, invalid
-   selections, rejected chains, invalid CertificateVerify and Finished. Use typed failures
-   and correct alerts, distinguish local failures from peer violations, and implement
-   current `user_canceled`/close_notify handling. Do not label all errors Unsupported.
+The report records a passing check and full release/debug test run at the baseline. The
+committed echo harness covers `ws`, not `wss`. TLS/OpenSSL and HTTPS harnesses cover adjacent
+layers separately. No credentialed provider WebSocket exchange has been established. The
+old document's claims of a `wss` echo gate and no remaining optional-client-auth coverage
+were stale. Test counts are not an architectural contract.
 
-### 4.4 HTTP and client
+## 7. Implementation sequence and contracts
 
-1. `stream_request` skips body consumption entirely when callback is nil, despite its
-   documented discard behavior, and reports completion without validating the body.
-   Consume and validate through the same framing path with a nil sink.
-2. An HTTP-status or media-type refusal hides later framing, cancellation and body-read
-   errors. Preserve both the response status and incomplete-exchange fact. This is part of
-   the coordinated response-result change, not an error-precedence patch in `ai` alone.
-3. Request formatting trusts arbitrary field names and values, caller Content-Length and
-   Transfer-Encoding while always writing a raw body. Validate before sending: prevent
-   CR/LF injection, conflicting framing, duplicate singleton fields and length mismatch.
-   Either encode a supported transfer coding or report unsupported request framing.
-4. Shared `http.header_parse` checks only part of field-name syntax and accepts prohibited
-   control characters in values. Tests currently endorse vertical tab and bare CR values.
-   Apply token and field-value rules consistently to requests, responses and trailers;
-   distinguish permitted normalization from silently accepting invalid syntax.
-5. The header map comma-combines every duplicate field, including non-list fields such as
-   Set-Cookie. Separate syntax parsing from field-specific combination rules and preserve
-   repeated values where combination changes meaning. Keep the change scoped to existing
-   consumers rather than creating a generalized header framework.
-6. Duplicate Content-Length handling compares raw strings before framing, rejecting some
-   numerically equivalent lists. Audit this with bodyless-response precedence and
-   Transfer-Encoding precedence. Do not accept conflicting lengths or obscure framing
-   ambiguity in pursuit of permissiveness.
-7. Chunk sizes use a general signed integer parser and trailers are discarded without
-   syntax validation. Validate the actual chunk grammar, checked arithmetic, transfer-coding
-   order and trailer syntax. Framing a transfer-coded response is not decoding its codings;
-   make the delivered-body contract explicit rather than silently presenting encoded bytes
-   as decoded content.
-8. URL parsing has no fragment handling, treats schemes case-sensitively in callers and
-   cannot preserve an explicitly empty query. Audit authority/userinfo, percent encoding and
-   invalid request-target bytes. CONNECT is exposed as a method but receives origin-form
-   formatting and ordinary response-body framing instead of tunnel semantics. Do not claim
-   CONNECT support; implement or explicitly reject it until a required proxy use exists.
+Each item is a scoped commit or short series with colocated unit tests and package-owned
+integration tests. Keep packages buildable throughout. Security and lifetime fixes take
+priority; do not wait for unrelated feature work.
 
-### 4.5 DNS and cancellation
+### 7.1 Provider operation safety
 
-1. Truncated UDP DNS answers are not retried over TCP. Add length-prefixed TCP exchange
-   using the same caller probe and core transports; validate replies before accepting them.
-2. `query_nameservers` skips records on transaction-ID mismatch without releasing them.
-   Release every rejected parsed response and inspect core parse failure ownership.
-3. Source address and transaction ID checks are not the complete DNS response-validation
-   contract. Audit question, QR/opcode, class, type, response code and CNAME processing
-   against core's actual parser. Ignore unrelated datagrams within the current attempt
-   rather than letting the first unrelated packet consume the only attempt.
-4. Resolution returns one IPv4-preferred address and connection failure does not try another.
-   Preserve candidate addresses and try alternatives before reporting failure. Parallel
-   Happy Eyeballs is a possible later optimization, not a prerequisite for basic fallback.
-5. DNS attempt timeouts are appropriate retransmission policy, but the comment claiming
-   they never end a lookup is false: exhausting servers ends it. Check bounded retry paths,
-   including the send-side Would_Block loop. A retry interval is not a whole-request deadline.
-6. Cancellation drains every operation on the thread's event loop, not just the operation
-   being cancelled. Audit shared-loop ownership, dial-completion races and returned-socket
-   cleanup. Keep callback storage alive until its own operation is reaped, without waiting
-   indefinitely for an unrelated upgraded connection's work.
+Implement section 9's retirement, affinity, cancellation, identity, and terminal-evidence
+rules first, alongside section 10's cache accounting and request-parity gates. Fix URL
+resolution as one shared HTTP/WS adapter change, including shared HTTP URL callers. Keep conservative send evidence; remove unreachable continuation recovery
+branches from the plan rather than implementing an unused cache.
 
-### 4.6 WebSocket
+Gate: two dependent full-context operations on one connection, cancellation on every return
+path, malformed event followed by a new request, mismatched response identity, option/credential
+replacement, no replay after an uncertain send, and no tool execution from failed output.
 
-1. Zero-length data frames never reach the completion path, leaving message state open.
-   Cover both empty messages and empty final continuations.
-2. UTF-8 validation rejects a valid encoded U+FFFD because it treats RUNE_ERROR alone as
-   invalid. Use the decoder's consumed width to distinguish a replacement character from
-   malformed encoding, including split code points.
-3. Close payloads of length one, invalid status codes and invalid UTF-8 reasons are not
-   validated. Local `close` slices its 125-byte buffer before checking reason length and
-   can panic. Validate local input and received control payloads before slicing or echoing.
-4. A bare transport EOF is classified as an orderly WebSocket close. Preserve abnormal
-   closure separately from a completed closing handshake. Prevent data writes after sending
-   Close, and document that peer waits remain under caller cancellation.
-5. Extended frame lengths are accepted even when non-minimal. RFC 6455 requires minimal
-   length encoding. Retain streaming payload reads and avoid a message-size cap.
-6. Dial appends mandatory headers even when the caller supplied the same fields; its
-   comment claiming replacement is false. Protect protocol-owned singleton fields and
-   permit ordinary authentication headers without duplicate handshake fields.
-7. Upgrade validation does not check unsolicited extensions or subprotocol selections.
-   Reject extensions the codec cannot process and selections that were not offered.
-   Do not add extension implementations unless the harness needs them.
+### 7.2 TLS correctness for persistent connections
 
-## 5. Limits and deferred work
+Extend existing key/connection structs, not a key-lifecycle service:
 
-Keep allocation starting sizes, transport chunk sizes, control-frame bounds and TLS wire
-bounds distinct from refusal caps. Growing HTTP fields and streaming WebSocket payloads
-are useful existing properties and must survive the fixes. Physical allocation failure
-and representability limits still require explicit error handling.
+- Count protected records under each send key. For AES-GCM, use the integer floor of the
+  RFC 9846 section 5.5 bound of `2^24.5` full-size records as a conservative accounting unit
+  even for shorter records. Reserve room for KeyUpdate under the old key. For ChaCha20,
+  reserve room before the sequence number would wrap. Never encrypt twice with a nonce.
+- Automatically update the send key before exhausting its budget. Send KeyUpdate under the
+  old key, then install the new secret/key and reset its sequence/usage counters. A partial
+  encrypted write is terminal; no retransmission under either epoch.
+- Track sending epoch in `u64`; never advance beyond `2^48 - 1`. Do not enforce that bound
+  on received epochs. At the final sending epoch, ignore a request to advance as permitted
+  by 4.7.3 and close when further sending would exceed key usage. A valid peer update still
+  changes the receive key. No age timer substitutes for cryptographic accounting.
+- Account for all protected record types, including automatic Pong/Close traffic through TLS.
+  Centralize the guard in the record send path; make KeyUpdate emission nonrecursive.
+- Check record alignment at key changes and reject handshake/other-content interleaving
+  forbidden by 5.1. Validate the CCS phase window, complete inner plaintext length, content
+  length/type, and exactly one two-byte alert per alert record. Keep empty application-data
+  records legal; do not invent a count cap on them or session tickets.
+- Allocate the ClientHello buffer from one checked encoded-length calculation.
+  Remove `MAX_SENT_MESSAGE`. Range-check nested 8-, 16-, and 24-bit wire lengths before narrowing.
+  Hash each complete handshake message once, then fragment its bytes into legal records.
+  Key-changing handshake messages end at a record boundary.
+- For cookie-only HelloRetryRequest retain the original key share; generate another only
+  when a legal different group was requested. Preserve original ClientHello bytes until
+  transcript replacement completes. A slice into a growing/reused message buffer is not
+  an owned transcript snapshot. Enforce retry count, offered suite/group and extension rules.
+- Use typed TLS failures and RFC alerts. Preserve peer-alert detail; distinguish local
+  allocation/cancellation failure, malformed input, authentication failure, record overflow,
+  and truncated transport. Separate receive close_notify from send closure; a fatal failure
+  makes both directions unusable. Continue reading after `user_canceled` for its required
+  close_notify under caller cancellation, as section 6.1 specifies. Ignore NewSessionTicket
+  without retaining tickets when resumption is unsupported, as section 4.7.1 requires.
+  Teardown itself must not block trying to report an alert.
 
-The harness's metadata fetch budgets, shell timeout, MCP server/entry caps and MCP call
-maximums are application policy, not HTTP/TLS conformance. Audit them separately. Remove
-hidden clamps on explicit user choices; expose meaningful caller policy without adding
-configuration for every internal buffer. Verify the actual configuration path first:
-`MCP_DEFAULT_MAXIMUM_CALL_TIMEOUT` is a default assigned to a field, not by itself proof
-of an unchangeable clamp. This work must not be bundled with the TLS correction commits.
+Continue using core crypto/X.509 facilities. The installed verifier's fixed chain-depth and
+signature-search budgets are not accepted as protocol limits in the intended architecture.
+Do not remove them blindly or write a second verifier. Make an upstream core change, then
+update the pinned toolchain, to expose search-resource exhaustion distinctly and allow the
+caller to use no arbitrary search budget while retaining pathLenConstraint, cycle detection,
+critical-extension checks, identity, EKU and signature validation. Until that dependency is
+available, keep verification fail-closed and record this as an unresolved compatibility
+restriction. Do not claim the no-arbitrary-limits objective complete while it remains.
 
-Keep the HTTP server, but do not claim this review establishes server conformance. Shared
-parser changes must test server callers; a server-specific audit is separate. Retain the
-50 ms readiness slices for now. Delete stale OpenSSL explanations when touching that code,
-but do not undertake an asynchronous rewrite without a measured need.
+Gate: RFC 8448/independent update vectors, fixture counters immediately around usage and
+epoch boundaries, large and fragmented ClientHello, cookie-only retry, CCS outside its window,
+misaligned KeyUpdate/Finished, malformed and legal alert/inner records, and OpenSSL-initiated
+updates with data afterward in both directions. Test success/failure ownership with a tracking
+allocator. No production-length sleeps or millions of records are needed.
 
-No connection pooling, trust-store caching or ALPN expansion is required for the correction
-plan. Provider WebSocket integration is now designed in section 9. It adds a session-owned
-connection, not a general-purpose pool, and depends on the transport corrections named there.
+### 7.3 HTTP outcomes, syntax, and refusal evidence
 
-## 6. Implementation progress
+Replace `Response_Head.usable`, `Request.expected_content_type`, and status-as-failure in one
+caller migration. A concrete exchange result holds head presence/status, framing completion,
+and a typed local/transport error with owned detail. The response callback borrows fields;
+the chunk callback receives body bytes regardless of status. A nil sink still validates the
+body. A status such as 429 survives a truncated body or cancellation; those facts do not
+compete for one error slot.
 
-Completed after this review:
+`ai` decides which status/media type its API accepts and chooses event versus error parsing
+at the head callback. Metadata callers make their own decision. `sse.post` retains its
+convenience framing/Accept behavior but does not turn a legal HTTP response into a transport
+failure. Keep unsupported Upgrade as the result of an operation specifically requiring 101.
+For a non-101 response, read its ordinarily framed body through the same callbacks before
+closing; for 101, do not read a body or consume upgraded bytes. Transfer buffered suffix bytes
+and connection ownership exactly once only after protocol validation succeeds.
 
-- Balanced verified-chain and handshake-detail ownership, separated IP SAN checking from
-  DNS-name verification, and made certificate-list parsing fail atomically.
-- Corrected traffic-update derivation, answered requested KeyUpdate messages, made fatal
-  TLS failures terminal, and treated a bare TLS transport close as truncation.
-- Strictly validated ServerHello and EncryptedExtensions, including ALPN selection, and
-  answered a main-handshake CertificateRequest with an empty Certificate. The OpenSSL
-  harness now covers optional client authentication.
-- Rejected malformed ChangeCipherSpec records and protected inner CCS messages.
-- Validated discarded HTTP response bodies and released parsed DNS answers rejected for
-  transaction mismatch or emptiness.
-- Corrected empty WebSocket messages, valid U+FFFD text, close payload validation, writes
-  after Close, and minimal frame-length encoding.
-- Made the WebSocket handshake own its Upgrade, Connection, key and version fields,
-  refused extensions and unoffered subprotocols, and reported an abnormal stream close
-  distinctly from a close frame.
-- Added a nonblocking abort path through WebSocket, upgraded HTTP and TLS, so teardown
-  during cancellation does not wait on the peer.
-- Routed provider transport by API capability rather than by provider or model identity,
-  selected it from a configured `transport` field, and recorded delivery state so an
-  ambiguous model send is not replayed.
+Use ordered field entries preserving duplicates, with small field-specific accessors. Do not
+comma-combine non-list fields. Validate field-name tokens, field-value controls, request-target
+bytes, Host ownership, Content-Length and Transfer-Encoding before sending. Reject CR/LF
+injection, conflicting lengths, unsupported outgoing transfer coding, and ambiguous framing.
+Apply response body-length precedence before parsing fields irrelevant to a bodyless response.
+Accept permitted identical decimal Content-Length values by numeric meaning, including leading
+zeros; handle oversized significant values as representation failures rather than wraparound.
+Parse chunk sizes as `1*HEXDIG` with checked arithmetic, validate extensions/trailers, and
+never reuse a connection after incomplete or ambiguous framing.
 
-Provider Responses over WebSocket is implemented for full-context requests: one
-session-owned connection, reused across foreground requests, with sticky HTTP fallback
-under `auto` and no fallback where the transport is required. Incremental continuation is
-deliberately not implemented; section 9.5 states why.
+URI parsing records scheme, authority, path, query presence, and fragment presence. Scheme
+comparison is case-insensitive; path and query bytes are not normalized or decoded/re-encoded.
+HTTP fragments are excluded from the request target; a WebSocket URI with a fragment is
+invalid under RFC 6455 section 3. Reject userinfo for these authenticated client endpoints
+as an explicit unsupported credential form. Preserve bracketed IPv6 and explicit ports.
+For WS resource naming follow RFC 6455 section 3's nonempty-query rule; for HTTP origin-form
+preserve an explicitly empty query. Adding `/responses` changes only the path component.
 
-The remaining bullets in section 4 still apply except where this list explicitly records a
-completed correction. In particular, TLS key-usage thresholds, dynamic outbound handshake
-messages, alert coverage, HTTP syntax and outcome redesign, and DNS TCP retry/address
-fallback remain open.
+Parse complete provider error documents before classification. Growing raw JSON is sufficient
+for this use case; no streaming JSON framework is required. A local resource failure must
+retain the HTTP status and report incomplete evidence, never parse a truncated prefix as a
+complete error. `agent` alone truncates copies for durable detail and diagnostics after the
+full code/message has been classified. A full provider payload capture remains opt-in.
 
-## 7. Ordered implementation plan
+Remove the 256-byte Retry-After inspection cap. Scan all digits, including after numeric
+overflow, without allocating a big integer. Preserve valid-but-unrepresentable delay as a
+typed overflow/presence fact, and retain normal HTTP-date support. Leading zeros do not cause
+overflow. `agent` may stop rather than wait beyond its retry policy, but must not retry early
+because a large valid field was treated as absent. Do not impose a one-year parser ceiling.
 
-Each item is a coherent change or short series, independently buildable and tested. Do not
-mark a phase complete from one successful live request.
+Gate: shared HTTP/server fixtures, bodyless responses, equivalent/conflicting lengths,
+transfer-coding precedence, valid/invalid chunks and trailers, huge legal fields, long leading-zero
+Retry-After, large error JSON with its code beyond byte 8192, truncated 429, cancellation during
+refusal-body reads, and Upgrade plus first frame in one read.
 
-1. **Ownership and authentication:** release verified paths and error details; correct IP
-   identity/path separation; make certificate parsing fail atomically. Gate: tracked
-   success/failure paths and certificates with DNS/IP identities and invalid chains.
-2. **TLS key lifecycle:** correct update derivation, requested updates, key-usage bounds,
-   terminal state and record/key-transition validation. Gate: independent update vectors
-   and an OpenSSL peer that initiates updates with both request values, followed by data
-   in both directions. Exercise thresholds by setting fixture counters, not millions of records.
-3. **TLS negotiation:** strict nested parsing and alerts, offered ALPN, legal cookie-only
-   retries, dynamically sized/fragmented ClientHello and empty client Certificate response.
-   Gate: malformed-message tables plus local optional-client-auth and retry exchanges.
-4. **HTTP outcome and syntax:** migrate status/media-type policy and callers together;
-   preserve truncated error responses and nil-sink validation; correct shared field,
-   request-target and framing behavior. Gate: wire fixtures and AI/metadata regressions,
-   including cancellation during an error response.
-5. **Resolver and interruption:** reply ownership/validation, TC-to-TCP retry, sequential
-   address fallback and operation-specific cancellation. Gate: local DNS/TCP peers and
-   controlled cancellation races, not public resolver availability.
-6. **WebSocket correction:** empty messages, Unicode, close validation/state, handshake
-   fields, extension selection and minimal frame lengths. Gate: byte fixtures and ws/wss
-   exchange with an independent peer. Done, including handshake-field ownership and
-   abnormal-close reporting.
-7. **Acceptance and documentation cleanup:** run `mise run check`, appropriate package
-   tests and the full `mise run test` gate. Verify formatter stability and no production
-   libssl/libcrypto linkage. Optional live provider checks use no embedded credentials.
-   Update this document from actual results; retain unresolved dependency limitations.
+### 7.4 SSE and WebSocket framing
 
-Security or memory defects discovered while implementing a phase take priority over the
-ordering, but belong in their own scoped changes. Do not combine all corrections into one
-commit or use this list as a reason to add speculative abstraction.
+Keep SSE line/event accumulation with no cap. Change parser feed/finish to return a typed
+resource error when growth fails and migrate `ai`/other callers with it. Use core UTF-8 decoding
+for well-formed input and encoding U+FFFD. Add only the small malformed-prefix consumption
+logic required to match the WHATWG decoder; core's width-one error result alone is not that
+algorithm. Preserve split BOM, CR/LF/CRLF, comments, exact field names, persistent IDs, ignored
+NUL IDs, and blank-line-only dispatch. EOF does not synthesize an event.
 
-## 8. Test policy and acceptance
+Retry fields must validate the whole value. Represent overflow separately from a usable delay;
+retain the last valid value when a field is malformed. SSE retry metadata does not authorize
+reposting an AI request. Reconnection remains the caller's responsibility.
 
-Keep useful existing RFC 8448 vectors and independent local peers. Add tests only for
-observable protocol behavior, memory ownership or regressions. Prefer small tables of
-malformed and legal boundary cases over one test per helper. A test that merely asserts
-an internal constant does not demonstrate correctness.
+Finish WebSocket offer token validation and exact selection matching. Keep mandatory header
+ownership; validate outgoing text UTF-8 before starting its first frame. Peer protocol violations
+and partial reads/writes poison the connection; no subsequent call resumes from an unknown frame
+boundary. Reject reserved bits/opcodes without negotiated extensions. Preserve partial UTF-8
+state across continuations and control frames, and preserve distinct Close, abnormal EOF,
+local cancellation, and protocol failure. Check caller arguments before slicing buffers.
 
-Coverage missing from the current passing suite includes key-update interoperability,
-optional client authentication, cookie-only retry, strict extension validation, TLS
-truncation through HTTP, nil-sink incomplete bodies, DNS TCP fallback, empty WebSocket
-messages and valid replacement characters. Split/coalesced records must be tested at
-key changes, not only at arbitrary transport read boundaries.
+Gate: case-different and duplicate subprotocols, forbidden handshake fields/extensions, invalid
+outgoing text with no data sent, partial frame failure followed by attempted reuse, split malformed
+SSE UTF-8 prefixes, valid U+FFFD, overflow digits followed by a nondigit, empty/final continuation,
+interleaved control frames, and legal payloads larger than transport scratch buffers.
 
-Use tracking allocators for success and rejection paths; temp allocation can conceal
-ownership mistakes. Keep process-spawning peers in executable harnesses, and report skips
-explicitly. Do not claim X.509 corpus coverage or fuzzing unless those suites were actually
-run. Live endpoints complement deterministic tests; they do not replace them.
+### 7.5 DNS and interruption
 
-Completion means the listed defects have verified fixes, legal supported exchanges work,
-malformed exchanges fail with useful errors, caller cancellation remains effective, and
-ownership is balanced. It does not mean support for every TLS version, every HTTP feature,
-or a completed independent cryptographic security audit.
+Keep core transports and parsing where they provide the necessary facts. Validate source,
+transaction ID, QR/opcode, question name/type/class, response code and answer/CNAME relation
+before accepting a reply. Release rejected parse results. Ignore unrelated packets within the
+same attempt, using one monotonic attempt interval, not a fresh interval per datagram.
+
+On a matching UDP response with TC set, retry that query using DNS-over-TCP with a two-byte
+length prefix, allocate by that wire length, and read the complete response. Do not require
+EDNS to implement this fallback. Size UDP storage for the supported DNS transport rather than
+silently accepting a truncated scratch buffer. Retain all usable A/AAAA candidates and try them
+sequentially on connection failure. Stop immediately for caller cancellation or trust failure;
+address fallback must not become a way to ignore failed authentication. No parallel Happy Eyeballs
+or resolver cache is required now.
+
+Fix the send-side Would_Block timeout loop and operation cancellation. Reap only the cancelled
+operation; do not drain unrelated work on the thread's event loop. Keep callback storage alive
+until its operation is reaped, including a dial that completes concurrently with cancellation.
+
+Gate: local UDP/TCP peers, mismatched replies before the right reply, TC fallback, TCP split
+length prefixes, several addresses with the first unreachable, and concurrent upgraded/HTTP
+operation cancellation without leaked sockets or cross-operation waits.
+
+## 8. Acceptance and Odin implementation rules
+
+Use structs, explicit enums, exhaustive switches, and trailing error results. Zero-initialized
+state is unopened/inactive with no owned resources, not a falsely successful live connection.
+Use existing public `Provider_*` spellings at that boundary; use `snake_case` for new internal
+procedures/fields, `Ada_Case` types, and named protocol constants with source citations.
+
+Session state uses its explicit allocator; operation/event state has operation lifetime.
+Callback slices are borrowed only until return. Clone only data that must survive, and give
+every owned result one destroy procedure. Check fallible `new`, `make`, `append`, and size
+arithmetic. Do not retain temp-allocator buffers across requests. Defer cleanup in the scope
+that owns the data, not in an inner block that releases it before use. Do not copy a dynamic
+array header and treat it as a separate owner, or retain element pointers across growth.
+
+Use `core:encoding/json`, `core:unicode/utf8`, `core:crypto`, `core:time`, `core:net`, `core:nbio`,
+and `core:os`. The inspected compiler is `dev-2026-09-nightly:a2fb372`. Verify new signatures
+against the installed compiler/core; this design intentionally does not invent APIs for them.
+The core UTF-8 decoder and X.509 search budgets were inspected, not assumed compliant.
+
+Run `mise run check`, focused package tests for each step, then the full `mise run test` gate
+before accepting implementation. The scripts run release/debug suites and executable harnesses.
+Use `mise run test <package>` and `mise run test <harness>` during development. Run tracking
+allocators and supported address/thread sanitizers on affected ownership/concurrency paths.
+Test observable protocol behavior, not internal constants or struct layouts.
+
+All new test logic is Odin. Use the installed OpenSSL command as an independent TLS peer,
+not a production dependency. Extend the echo executable with an OpenSSL `s_server` child using
+a local test CA/certificate; drive its application-data stdin/stdout from the Odin handshake/frame
+peer. This covers TLS, HTTP Upgrade, buffered first-frame handoff, messages and closure on the
+same `wss` connection without implementing a TLS server. Include hostname/CA rejection and
+cancellation. Report missing peer executables as explicit skips; CI acceptance requires the
+harness to run, not skip. Never introduce Python or credential-dependent mandatory tests.
+
+Add a package-owned Responses peer test that uses public operation/session calls and records
+actual wire messages. Cover two dependent requests, fallback/refusal, provider error shapes,
+identity, large events, cancellation and ambiguous delivery. Reuse the existing small Odin
+peer mechanics where practical; do not create a mock-provider framework. An echo alone proves
+neither provider envelopes nor request isolation. Live provider tests are optional, operator-run,
+and credential-redacted. Record provider/endpoint/API evidence without claiming that all compatible
+gateways behave the same.
 
 ## 9. Provider WebSocket integration
 
-Status: implemented for full-context Responses requests over a reused connection. This
-section is the authoritative WebSocket plan. It belongs here because connection ownership,
-transport selection, interruption and recovery cross the same boundaries as HTTP/SSE. The
-harness and retry architecture documents link here rather than duplicating connection
-policy. No separate WebSocket document or new package is needed.
+This is the authoritative target design. Full-context session reuse exists; the corrections
+below are required before declaring the integration complete. The harness and retry documents
+link here so connection/recovery policy has one home.
 
-### 9.1 Scope and defaults
+### 9.1 Routing and wire request
 
-Implement Responses-over-WebSocket for text/tool workflows, using the existing native
-`websocket` client. This is not OpenAI Realtime or Live voice. HTTP/SSE remains the default
-and stays supported for every current API. Chat Completions and Anthropic Messages retain
-HTTP/SSE; sharing a provider name with a Responses endpoint does not give them WS support.
+Keep `transport = "http" | "websocket" | "auto"` in provider configuration, presence-merged
+into the catalog. Absent means `http`. A selected API without a WS adapter uses HTTP under
+`auto` and fails local validation under required `websocket`. A Responses-compatible API name
+states which adapter to try, not proof that a particular endpoint supports Upgrade.
 
-The required result is a persistent connection reused across foreground requests, full
-request replay whenever needed, safe recovery, and optional incremental continuation on a
-verified baseline. Connection reuse and delta input are separate capabilities: correctness
-must not depend on retaining server-side history.
+Resolve the Responses path once as section 7.3 specifies, map `https` to `wss` and `http` to
+`ws`, and preserve authority and query. Reuse API authentication and identity headers. No
+subscription URLs, beta headers, Azure rewrites, or model-name capability guesses. Explicit
+local insecure endpoints are allowed; failed TLS never downgrades to plaintext.
 
-Do not implement multiplexing, prewarming (`generate:false`), provider-side mid-turn
-steering, compression, OAuth/subscription authentication, or a socket pool in this work.
-They are not needed by the current harness. Absence of multiplexing is a client scheduling
-choice, not a claim that the provider protocol prohibits concurrency.
+The common Responses encoder generates the full logical request. HTTP adds `stream:true`;
+WS adds `type:"response.create"` and omits `stream`, `background`, `stream_id`, and
+`previous_response_id`. Keep `store:false`. Re-encode only the envelope on an authorized
+transport change; do not rebuild history, drain steering, or adopt a new checkpoint mid-retry.
+Anthropic Messages and Chat Completions remain HTTP/SSE. This applies equally to OpenAI,
+Anthropic, OpenCode Go, OpenRouter, or another configured gateway according to API capability.
 
-### 9.2 Configuration and routing
+### 9.2 Ownership and affinity
 
-Add an optional provider `transport` field with values `http`, `websocket`, and `auto` to
-Lua configuration and the resolved provider catalog. Absent means `http`. Preserve the
-existing presence-based merge: a configured value is authoritative, and neither Models.dev
-nor `/models` supplies a transport value unless its published schema actually defines one.
-There is no model-name heuristic and no hardcoded list of WebSocket-capable models.
+`agent.Chat_Session` owns a stable allocated `ai.Provider_WebSocket_Session` containing the
+borrowed `Provider_Connection`, owned socket, stable probe storage, allocator and active-state
+flag. Do not introduce a session registry or move this state into durable `agent/session`.
+Open, use, abort and destroy on the thread that acquired the `nbio` loop. Reject concurrent
+use explicitly; no silent queue and no mutex on the connection.
 
-| Policy | Behavior |
+Before every connect/use compare the effective endpoint, API, model, credentials, handshake
+headers, trust configuration, and configured transport with the session's affinity. Compare
+actual values, not a secret digest written to logs. Retain an owned configuration snapshot where
+borrowed catalog storage cannot guarantee immutability/lifetime. Destroy the old connection
+before replacing borrowed storage. A change clears sticky fallback too. Trust-file replacement
+requires an explicit configuration reload/reset; do not add background filesystem watching.
+
+Bind the active interruption/deadline only for the operation. Clear it on every exit, including
+connect-only preflight success/failure, before the caller can destroy operation storage. Socket
+probe storage stays allocated while the socket lives but never points at a retired operation.
+No observer, callback, or encoded-body pointer survives its operation. Session destruction is
+idempotent for a nil handle and aborts without protocol writes or waiting on the peer.
+
+Background compaction permanently stays a separate one-shot HTTP operation for this phase.
+It neither borrows nor evicts the foreground socket. No second persistent connection manager.
+
+### 9.3 Request lifecycle and event identity
+
+One operation performs at most one model send:
+
+1. Validate and freeze the selected envelope from the retained projection. Check cancellation
+   and effective affinity before using the session; local encoding failures send nothing.
+2. Record the attempt and bind its control before network work, including Upgrade. Open and
+   validate Upgrade if needed. A setup failure finishes this row with no model delivery.
+3. Check cancellation again, mark send evidence, then send one text message.
+4. Read complete WebSocket text messages. Accumulate with checked growth; fragments/chunks
+   are not events. Pass each complete JSON object to the shared Responses decoder.
+5. Validate request identity and terminal semantics before staging completion. Check
+   cancellation before publishing completion. Return after the provider terminal, not EOF.
+6. On successful accepted completion clear all operation bindings and retain only the idle
+   connection, affinity and last completed response identity. On every unsuccessful operation
+   abort the socket before returning.
+   Storage or harness completion rejection also invalidates the socket at the owner boundary.
+
+Retain response identity for the active operation to correlate events, not for continuation.
+The shared Responses decoder must recognize creation/terminal identities and check documented
+response IDs on subsequent events when present. A different ID or an unexpected named lane is
+an invalid stream. Remember the last completed response ID on the live connection only to reject
+an old response being replayed as the next request. Clear it on connection destruction; do not
+persist it or create a generation counter. This is a real consumer of identity that the earlier
+implementation did not have. Do not require a response ID on event types whose schema omits it.
+
+Unknown extensible event types may be ignored under the shared decoder contract after checking
+available routing identity. Known malformed, contradictory, binary, or wrong-request events fail
+the operation. A transport chunk is never evidence of response creation or a provider terminal.
+Parser failure keeps the last delivery observation; it must not manufacture `Terminal_Observed`.
+
+Decode the documented WS `error` envelope's nested `error.code`, `error.type`, `error.message`,
+and top-level status, as well as the existing SSE event shape. The current shared
+`openai_parse_api_error` already extracts nested code/message, but does not retain top-level
+WS status or error type as distinct evidence; extend it rather than add a second parser.
+Preserve provider failure facts without synthesizing another HTTP head. `response.failed`,
+`response.incomplete`, and `error`
+keep their shared API meanings. Transport choice must not redefine which incomplete output the
+harness can accept. Only a valid, accepted completion can release executable tool calls.
+
+### 9.4 Full context, not incremental continuation
+
+Do not implement `previous_response_id` in this phase. There is no pending design choice for
+implementation to resolve. Full projection on every request is the selected architecture.
+It already includes replay normalization, tool-result repair, spill handles, steering and the
+installed checkpoint, and survives reconnection/restart without trusting remote history.
+
+Continuation would require a measured benefit and a separate approved change. Its minimum
+proof would be exact normalized item-prefix equality including replayed response output,
+matching non-input settings, connection affinity, and promotion only after durable acceptance.
+Raw output JSON, a hash alone, or matching item counts is insufficient. Do not build the cache,
+unused response-ID persistence, or `previous_response_not_found` retry handling now.
+
+Keep one default lane. Named-lane multiplexing exists in the documented OpenAI protocol but
+Nabla has no concurrent foreground consumer. This scheduling decision is not a protocol limit.
+No prewarming, provider-side mid-turn steering, or speculative future lane abstraction.
+
+### 9.5 Delivery evidence
+
+Keep the conservative policy instead of extending TLS/WS APIs for precise accepted-byte counts:
+
+- `None` means the model-message send was not entered. An HTTP Upgrade alone does not send
+  model input. Invalid local input/cancellation checked before write keeps this state.
+- `Model_Send_Started` means delivery is possible. Entering the frame writer is sufficient;
+  zero completed TLS plaintext bytes does not prove zero ciphertext reached the socket.
+- `Response_Observed` means a valid request-associated provider event was decoded.
+- `Terminal_Observed` means a valid associated provider terminal was decoded, not merely an
+  error returned by our parser. It does not by itself mean retry is safe.
+
+Add a separate zero-safe evidence enum for explicit pre-execution rejection, set only by a
+recognized API rejection contract. Keep unknown as zero. Do not overload delivery stages with
+retry permission, or infer permission from absence of output. Plain byte counts cannot prove
+that a provider did not execute a request.
+
+If accurate write accounting is later needed for diagnostics, implement it through TCP, TLS
+record writes, upgraded HTTP and frame writes together. A frame-only counter cannot establish
+non-delivery over TLS. This work is explicitly deferred, not a prerequisite for safe reuse.
+
+### 9.6 Retry, setup, and fallback
+
+Only `agent` authorizes a further send. Cancellation, storage failure, trust/configuration
+failure, and visible output stop recovery. An uncertain model send stops with
+`Ambiguous_Delivery`, discards the socket, and does not switch to HTTP. A fresh user request
+may redial with full context; that is not automatic replay of the failed attempt.
+
+| Evidence | Required action |
 |---|---|
-| `http` or absent | Existing HTTP/SSE operation; no WS probe or connection |
-| `websocket` | Require WS for a supported API; return a useful failure rather than silently switching |
-| `auto` | Prefer WS for a supported API; permit safe HTTP fallback under section 9.6 |
+| Unsupported API in `auto` | HTTP directly |
+| Unsupported API in required WS | Local failure before network I/O |
+| Valid Upgrade refusal 404, 405, 426 or 501 in `auto`, without stronger auth/quota evidence | Permit HTTP fallback for this affinity; these statuses are an interoperability policy, not proof of a universal WS capability |
+| Transient DNS/connect/setup I/O failure in `auto` | Permit HTTP fallback within the existing attempt bound, after checking cancellation |
+| Required WS setup failure | Never fall back; apply ordinary eligible setup retry policy |
+| 401/403, trust error, malformed/invalid local URL/header, invalid 101 handshake | Stop; fallback must not hide these failures |
+| Upgrade 429/availability response | Preserve status, body classification and Retry-After; apply ordinary retry policy, not sticky unsupported-transport fallback |
+| Model send entered, no valid explicit rejection | Stop automatic replay, even if no visible output |
+| Recognized pre-execution rate-limit/unavailable rejection | Ordinary bounded retry if eligible and no output; a new WS connection, not transport fallback |
+| Recognized input-overflow rejection | Existing one-checkpoint repair within the same attempt bound |
+| Exact documented `websocket_connection_limit_reached` rejection for the sole pending request, before any response/output | Allow one reconnect/full-context resend within the same bound; abort old socket |
+| Unknown error, malformed error, response failure without non-execution evidence | Stop; neither status 5xx nor `Terminal_Observed` proves safe replay |
+| Successful completion followed by an idle disconnect | Keep committed result; next logical request opens another connection |
 
-A provider-level choice applies after per-model API routing. In `auto`, a selected API
-without an implemented WS protocol uses HTTP directly. In required `websocket` mode it
-fails local validation before any connection. This supports mixed-API providers without
-pretending that every route can use WS. Do not add a model-level transport override until
-an actual deployment needs it.
+The explicit-rejection exception is narrow. The adapter records evidence; the harness applies
+classification and policy. A 400 mentioning age in prose, EOF, Close code, or a late event from
+an older response is not the documented lifetime rejection. Do not add provider hostname checks.
+`previous_response_not_found` is not a recovery case because we do not send continuation IDs.
 
-Setting `websocket` or `auto` is the operator's assertion that the configured Responses
-endpoint may support the protocol. Successful Upgrade and a valid exchange establish what
-that connection supports; the string `openai_responses` alone does not. An arbitrary
-compatible gateway may still reject an Upgrade or implement different behavior.
+Move `auto` preflight into the same bounded attempt execution instead of leaving it outside
+recovery. Each transport attempt, including failed setup, consumes one attempt slot; each actual
+model send has its own request row begun before sending. A setup-only row records no model send,
+not a fabricated response or billable operation. Falling back starts the next attempt with the
+same frozen projection and the HTTP envelope. Keep the existing maximum-attempt policy and no
+additional hidden loop. A failed setup cannot multiply model sends or bypass Retry-After.
 
-For Responses, resolve the resource path once, preserving authority, path and query, then
-map `https` to `wss` and `http` to `ws`. Never send credentials to a different authority,
-follow an Upgrade redirect automatically, or downgrade a secure URL on failure. Continue
-to support explicit local `http`/`ws` deployments; verification remains mandatory for TLS.
-Reuse the API family's authentication headers and the caller's identity headers. Do not
-copy Codex subscription URLs, beta headers, affinity tokens or Azure query rewrites into
-the generic Responses adapter. Such differences need a documented endpoint requirement
-and a targeted adapter, not inference from a model ID.
+Sticky HTTP fallback lasts only for the live affinity and resets on explicit session/configuration
+replacement. Record setup outcome and fallback reason without credentials. Selection, delivery,
+rejection evidence and retry decisions must be available with diagnostics disabled.
 
-### 9.3 Ownership and Odin shape
+### 9.7 Lifetime, control frames, and teardown
 
-Use structs for state and ordinary procedures for operations. Extend `ai` with a concrete
-provider-session value containing a lazily dialed WS connection. Keep `Provider_Connection`
-as borrowed endpoint/API/credential data; it must not ambiguously become both configuration
-and an owned socket.
+Do not add a connection-age setting or a 55/60-minute timer now. The official OpenAI endpoint
+currently documents 60 minutes, but RFC 6455 does not. Generic gateways need not share it.
+Handle explicit rejection as above, and otherwise handle close/error evidence. Never abort an
+active response merely because a local connection-age estimate crossed a provider's number.
 
-`agent.Chat_Session` owns the foreground provider-session value. `ai` owns its connection,
-JSON encoding/decoding and continuation mechanics. `agent` decides selection, fallback,
-retry and when a prepared result becomes authoritative. The root worker drives the session;
-neither the presentation stack nor durable `agent/session` imports `websocket`.
+Retain lazy, single-owner reads without an idle read thread or heartbeat timer. RFC 6455
+requires Pong on received Ping and recommends doing so as soon as practical; answer immediately
+when the owner reads one, including between fragments. This design does not promise prompt
+idle servicing while the owner is running tools or waiting for a user. A peer may close an idle
+connection. That is a deliberate tradeoff against a second I/O scheduler, not a protocol timeout
+or a claim that idle liveness is guaranteed. Do not describe it as an idle-Ping compliance test.
+If prompt idle servicing becomes a demonstrated endpoint requirement, revisit scheduling as a
+separate change rather than quietly adding a concurrent reader to this connection.
 
-The existing one-shot provider operation remains available for metadata-independent and
-background callers. A session-aware operation borrows the concrete state explicitly.
-Use direct branching for HTTP versus Responses WS, not a provider transport vtable,
-executor registry or another service package. The existing byte-transport callback boundary
-below `websocket` already serves its actual substitution purpose.
+Do not add a liveness probe to justify retries. Even a successful Pong cannot prove the next
+send will arrive. A stale socket discovered only after write entry remains ambiguous. This is
+less transparent than replaying automatically, but does not risk duplicate provider execution.
 
-Ownership requirements:
+Abort on cancellation, partial transport failure, parser failure, rejected completion, or
+ambiguous delivery. `abort` performs no WS/TLS close write and waits on no peer. Graceful Close
+is a separate caller-controlled operation with interruption; acknowledge valid peer Close while
+actively reading. Protocol-error notification is best effort under the active cancellation
+probe, never a blocking destructor requirement. No unread failed response survives into reuse.
 
-- Exactly one foreground request is active per connection. The driving thread performs
-  all reads, writes, reconnects and destruction. No read pump or mutex is necessary for
-  this sequential flow. A concurrent use attempt is an API misuse, not silently queued.
-- The socket remains on its creating thread because `Upgraded` owns an acquisition of
-  that thread's event loop. Close it on that thread before worker exit, session replacement,
-  or transferring the session to a different driver.
-- Background compaction keeps an independent one-shot HTTP operation initially. It neither
-  borrows nor evicts the foreground socket or continuation cache. This preserves current
-  concurrency without multiplexing or a second persistent session manager.
-- Connection probe storage is owned by the provider session and remains valid as long as
-  the socket. It must not retain a pointer to an operation's stack-local `HTTP_Control`,
-  response observer, encoded request or callback after that operation returns.
-- Active interruption and observer bindings are installed for an operation and cleared on
-  retirement. A cancelled token is never reused implicitly by the next request.
-- Whatever a session retains for later requests uses the session allocator; event and
-  operation buffers use their documented allocators. Neither borrows the worker's temp
-  allocator across requests. Destruction releases all retained state once.
+### 9.8 Observations and regression gates
 
-Compare connection affinity directly: resolved URL, API, model, authentication/header
-values and trust configuration. A changed credential, provider selection, model or trust
-configuration closes the old connection and clears continuation and fallback state.
-Do not retain a secret hash in logs as an affinity identifier. No global session map or
-cross-account cache is introduced.
+Keep full logical request preparation separate from actual encoded envelope capture. Record
+selected transport, setup-only versus model-send attempt, delivery, explicit rejection evidence,
+terminal result and fallback reason through existing observation/persistence paths. Do not
+invent a fresh HTTP response head for each request on an established socket.
 
-### 9.4 Request and event path
+Add a message-complete fact to WS response-body observations, including an empty final chunk.
+Record cumulative message-end byte offsets in the existing capture metadata alongside raw bytes.
+A bounded capture must mark a missing/truncated boundary index as incomplete; that bound never
+limits protocol parsing. Concatenated JSON without boundaries is not an exact event capture.
+Ordinary logs exclude credentials, authorization headers, and response content.
 
-Keep one Responses request encoder and one Responses event decoder. Separate the common
-JSON request from its transport envelope at preparation time:
+The committed provider peer must demonstrate reuse and isolation across two dependent requests;
+proper nested errors; sticky fallback/reset and required refusal; cancellation during dial/send/read
+and at terminal delivery; no replay after partial write/EOF; failure invalidation; a valid explicit
+rejection retry; and request rows/observations with diagnostics disabled. Pair this with the `wss`
+seam in section 8. Tests need not assert every enum/table entry to establish those behaviors.
 
-- HTTP adds `stream:true` and uses the existing SSE framing.
-- WS sends a text message with top-level `type:"response.create"`, the same request fields,
-  and no `stream` or `background`. `previous_response_id` is added only for an admitted
-  incremental continuation. Omit `stream_id` for the single default lane.
-- Assemble received fragments until `websocket.read` reports a complete text message,
-  then pass the JSON payload to the shared Responses decoder. Do not synthesize SSE lines
-  or maintain a second decoder. Expose a transport-neutral payload-consumption name;
-  leave `[DONE]` handling in the SSE-specific path.
-- Maintain separate request boundaries on a connection. Provider JSON messages are not
-  synonymous with transport chunks or frames. Buffers grow with checked allocation;
-  there is no copied 16 MiB cap or 128-event queue from a reference harness.
-- Unexpected binary messages, malformed JSON and unexpected request-scoped events produce
-  protocol failures and discard the connection. Unknown extensible event types remain
-  subject to the shared decoder's documented rules.
+### 9.9 Provider reference and compatibility evidence
 
-Retain the provider's own in-band error status and code as evidence, distinct from the HTTP
-Upgrade status. A `101` does not mean a model request succeeded or even began, and the
-transport never turns a provider failure into a completion.
+The [OpenAI WebSocket guide](https://developers.openai.com/api/docs/guides/websocket-mode)
+and [WebSocket event reference](https://developers.openai.com/api/reference/resources/responses/websocket-events)
+are API contracts, separate from RFC 6455. The guide confirms `response.create`, omitted
+HTTP-only fields, default/named lanes, full-context restart without `previous_response_id`,
+nested error envelopes and a provider-specific connection lifetime. Those facts do not establish
+support at OpenRouter, OpenCode Go, Azure, Anthropic, or any arbitrary compatible gateway.
 
-A WS request completes at its valid provider terminal message, not at socket EOF. Keep
-normal tool validation and the one-terminal-callback guarantee, but do not wait for a
-persistent connection to close before releasing a completed response. `response.failed`,
-`response.incomplete`, and `error` retain their provider semantics and cannot become success
-merely because the socket is healthy. The established decoder decides which incomplete
-outputs are usable; transport integration must not change that policy incidentally.
+The prior implementation report and external reference study are historical evidence, not
+normative dependencies of this plan. Do not copy their queues, timer values, retry counts,
+subscription headers or provider lists. Optional live acceptance must identify the configured
+API/endpoint and show two dependent requests on one connection; it cannot replace local tests.
 
-Cancellation is checked before sending, while receiving, before delivering a terminal
-result and before accepting continuation state. A response completed and accepted before
-a later idle socket failure stays completed. A failure before a valid terminal result
-cannot expose executable tool calls. An unexpected old response on the next request is
-not attributed to the new request.
+## 10. Prompt-cache preservation and the reported regression
 
-### 9.5 Continuation without losing durable history
+Prompt-cache reuse is a cost requirement for every transport. Do not trade it for lower
+connection latency without explicit measured justification. HTTP remains the default while
+the reported drop from roughly 98% or 99% to 80% is unresolved. The target is no avoidable
+loss of reusable prefix or cached-input savings for the same workload, not a guaranteed
+percentage that the provider and workload cannot promise.
 
-The committed local conversation remains the source of truth, and every logical request is
-still built as a full provider projection: replay sanitization, tool-result repairs, spill
-handles, steering, current instructions and installed checkpoints. Full-context requests
-over a reused connection are what the transport ships with. Connection-local continuation
-(`previous_response_id` with an input suffix) is not implemented, and the reason is the
-comparison it requires rather than the field itself.
+### 10.1 What the investigation establishes
 
-A baseline is only valid if the input the provider now represents is exactly the prefix of
-the next projection. That representation includes the response's own output items, while a
-later request replays those items through the encoder's input normalization, which drops
-output-only fields such as `status`. A comparison therefore has to be stated in the same
-normalized vocabulary as the replay encoder and verified item by item. Getting this subtly
-wrong would tell the provider that it already holds input it does not, and the divergence
-would surface as a wrong answer rather than as an error. Until a measured need justifies
-that work, the transport sends the full projection, which is always correct.
+The source comparison from pre-integration `4bedb7ed` to `876bc824` establishes:
 
-Should it return, these constraints are already fixed:
+- Both Responses encoders call `openai_responses_request_object` and the same sorted-key
+  serializer. The WS addition changes `stream:true` to `type:"response.create"`; it does not
+  remove instructions, tools, input items, `store:false`, or `prompt_cache_key`.
+- `agent/chat_request.odin` still derives `Prompt_Cache_Key` and `Session_Id` from the durable
+  chat ID. Neither changes with request number, socket recreation, transport fallback or
+  compaction. Both transport freezes preserve identity-header fields and dial uses the shared
+  `provider_encoded_headers`. The session header is a gateway hint, not an RFC cache feature.
+- Request projection, verbatim replay normalization and usage parsing did not change in that
+  integration diff. HTTP/SSE and WS both reach `openai_responses_parse_usage` on the terminal
+  event; request recording keeps the latest reported value per bucket, not the sum of snapshots.
+- A local Odin probe through the public freeze operations, using instructions, a tool schema,
+  native function-call replay, a tool result, effort and stable cache/session identity, produced
+  identical normalized request JSON after removing only `stream` and the WS envelope `type`.
+  This checks that fixture, not all possible requests or a provider's internal rendering.
+- `agent/session/history.odin:cache_hit_rate` divides independently accumulated cache-read
+  tokens by all reported input tokens. It can label an incomplete sample as measured. The
+  root status display and `/status` both use it. A local probe reproduced 80% from a row with
+  10,000 input and 9,800 cached tokens plus a row with 2,250 input and absent cache usage.
+  The one fully measured row still had 98% cache reuse. The test in `history_test.odin` currently
+  endorses this mixed-denominator behavior. This is a confirmed accounting defect, present
+  before WebSocket, not proof that the user's provider cache actually stayed at 98%.
 
-- Retain the connection identity, the previous response ID, the exact normalized input
-  sequence the response represented, and the non-input settings that established it.
-- Use a suffix only when the new input has that sequence as an exact prefix and the settings
-  match; compare normalized serialization, not hashes or byte offsets in a map.
-- Stage the state on a valid terminal message and promote it only after the harness accepts
-  and durably records the response. Cancellation, parser failure, storage failure and a
-  rejected completion establish nothing.
-- Keep `store:false`, discard connection-local identity on reconnect or process restart, and
-  send full context. A `previous_response_not_found` rejection would invalidate the baseline
-  and permit one full-context retry within the existing attempt budget.
+No matched HTTP/WS traces from the reported sessions or credentialed live measurements were
+available for this review. The actual cause remains unproven. Do not claim the above example
+reproduces the user's workload, and do not claim framing changes inherently lower prompt caching.
 
-Today a reconnect discards the state, which is the correct outcome for every one of those
-cases by a shorter route.
+There are also real prefix/routing risks to measure:
 
-### 9.6 Failures, retries and fallback
+- `app_mcp.odin:app_tools_refresh` sorts tools but refreshes definitions between turns and
+  removes unavailable servers. Changed schemas, descriptions, or membership can invalidate
+  the prefix even with the same names. This predates WS. Keep safety-driven refresh; do not
+  advertise stale/unusable tools merely to inflate cache hits. Record actual inventory changes.
+- Installed compaction replaces a prefix. Cache reuse after that replacement must be measured
+  separately. Background compaction's HTTP requests and failures currently contribute to the
+  same displayed session totals as foreground WS requests.
+- A long-lived WS may route differently from one-shot HTTP at the provider/gateway. Reconnects,
+  cache eviction/TTL, resolved model, account/region and request cadence also matter. A stable
+  cache key helps where supported but neither a key nor a TCP connection guarantees placement.
+- An endpoint may report different or missing usage fields on WS. Terminal-message completion
+  is correct for the documented Responses API; an adapter for a gateway that reports usage
+  elsewhere needs that gateway's documented contract, not an arbitrary post-terminal drain.
+- Full replay preserves the local request prefix but may differ from the provider's internally
+  represented generated output. Continuation and prompt caching are separate mechanisms.
+  Absence of `previous_response_id` is not evidence that prompt caching is disabled.
 
-`ai` performs one model send per operation and returns facts. Only `agent` authorizes another
-send or changes transport. Do not hide an HTTP retry inside `websocket.dial` or the provider
-adapter. Extend provider-neutral attempt evidence to distinguish:
+### 10.2 Request construction contract
 
-- no model-message bytes accepted;
-- some/all model-message bytes accepted locally, with provider acceptance unknown;
-- provider response creation observed;
-- provider terminal outcome observed.
+Keep one common request builder. Transport selection must not change cache-relevant settings,
+instruction bytes, ordered tools/schemas, ordered input, replay IDs/encrypted reasoning, or
+cache controls. Sorted JSON map keys make encoding deterministic; they do not prove equality
+of the provider's rendered/tokenized prefix. Array order, text whitespace, roles and item
+boundaries remain significant. Never sort conversation arrays or normalize tool-argument
+strings just to make an equality check pass.
 
-A partial write is ambiguous even if the lower API returns zero completed plaintext bytes
-for its last record. Extend write accounting or conservatively report ambiguity once a send
-starts. Neither absence of text nor absence of `response.created` proves non-delivery.
-An Upgrade request does not itself create a model response, so failed setup can be safely
-retried without replaying a model operation.
+Within unchanged model/tool/instruction configuration and checkpoint, append new conversation
+items without rewriting the earlier normalized input. Preserve the existing durable instruction
+snapshot, stable spill handles and faithful native output replay. Tool repair, explicit
+instruction/tool/model/effort changes and checkpoint installation are legitimate prefix changes;
+record their reason rather than hiding them. Do not add per-request timestamps, connection IDs,
+mutable skill lists or retry annotations to the prompt prefix. Reconnect/transport change is
+not a reason to reload instructions, rewrite history, rotate the cache key or create a new chat.
 
-| Observation | Harness action |
-|---|---|
-| Unsupported API under `auto` | HTTP directly; no WS attempt |
-| Unsupported API under required WS | Local failure |
-| Upgrade rejected as unsupported (for example 405, 426 or 501) under `auto` | Sticky HTTP fallback for this session affinity; no model replay ambiguity |
-| Transient connect/setup failure under `auto` | Allow HTTP fallback through the existing recovery budget; record the reason |
-| Authentication, authorization, TLS trust, invalid URL or local protocol-configuration failure | Stop; no fallback that hides configuration or weakens security |
-| Rate limit or provider availability response | Apply existing provider classification and Retry-After policy; do not treat it as proof that WS is unsupported |
-| Send failure known to precede all model bytes | Retry/fallback under the existing budget; discard the socket |
-| Ambiguous send or disconnect before terminal outcome | Report the unknown outcome and stop automatic replay; discard socket and continuation |
-| Explicit `previous_response_not_found` rejection before output | Invalidate continuation and allow one full-context retry within the same attempt budget |
-| Explicit connection-lifetime rejection before a new request starts | Reconnect, clear continuation and send full context within the existing budget |
-| Failure after visible output | Stop and preserve partial output; never silently switch transport |
-| Valid completed response followed by idle disconnect | Keep the accepted result; reconnect for the next request |
+Keep the durable session cache key for foreground and compaction. Do not broaden it across
+accounts or unrelated sessions to chase a ratio. Keep `store:false`; prompt-cache retention
+and server-side response storage are different controls. Keep provider-default implicit caching
+for Responses unless the caller deliberately supplies a documented supported cache option.
+Preserve any explicit options identically across HTTP/WS. Do not force explicit-only caching
+with a static instruction breakpoint, which could leave the growing conversation uncached.
+Do not force `24h`, add model-name heuristics, or change privacy/retention policy to improve a
+benchmark. Anthropic's existing automatic `cache_control` remains in its API adapter, not HTTP.
 
-The ambiguous-delivery rule is deliberately stricter than the current generic retry rule
-based only on exposed output. Add the delivery fact to `Chat_Attempt_Facts` and apply it
-when the WS adapter provides it. Do not pretend existing HTTP accounting already proves
-non-delivery. Reconsider HTTP replay separately when its outcome contract is revised.
+Do not implement speculative prewarm requests or continuation as a blind fix for the reported
+regression. First establish the actual sent prefix and measured cache loss. If a controlled
+comparison later establishes that an endpoint needs continuation to meet cost requirements,
+keep HTTP recommended there until a separately reviewed continuation implementation satisfies
+section 9.4. Do not ship a knowingly costlier default on a promise to fix the cache later.
 
-Fallback is sticky only for the affected live provider session and affinity, not persisted
-in the model catalog or across process restarts. Required `websocket` mode never falls back
-to HTTP. Even in `auto`, `previous_response_not_found` is a continuation failure, not a
-reason to disable WS. Unknown provider errors are not generic retry instructions.
+### 10.3 Correct usage and cost accounting
 
-Each model send has its own durable request row, including a retry without a continuation
-ID. Setup attempts and fallback decisions are recorded as transport facts even when no
-model message was sent; bound setup retries through existing recovery policy rather than
-introducing an unbounded pre-send loop. Preserve the frozen full projection across a
-transport change while recording the actual envelope sent for each attempt.
+Preserve raw reported usage and presence per request. For OpenAI Responses, `input_tokens`
+already includes cache reads and writes. For Anthropic, total input is uncached input plus
+cache-read plus cache-creation input. Cache writes are not hits. Validate nonnegative values
+and impossible overlapping totals according to the API; report inconsistent usage, never clamp
+a bad value to 100%. Missing cache usage is unknown, not zero. Latest cumulative values win
+within an operation; only separate attempts are summed.
 
-### 9.7 Connection lifetime and interruption
+Extend the existing session aggregate with paired sums, without inventing historical usage:
 
-Connect lazily on the first WS request; retain the socket across tool runs and user turns.
-No hardcoded connect deadline, idle read deadline or total request lifetime is added.
-Existing caller-supplied cancellation and deadlines continue to work. Provider-imposed
-connection limits are not generic WebSocket protocol limits.
+```text
+paired_input = sum(input for rows with both input and cache_read present and valid)
+paired_read  = sum(cache_read for those same rows)
+hit_rate     = paired_read / paired_input, when paired_input > 0
+coverage     = paired_input / all_valid_reported_input, when that denominator > 0
+```
 
-For the documented OpenAI Responses endpoint, a 60-minute connection lifetime is a provider
-fact. When known, retire an aged connection between requests before starting the next one;
-never abort an active model response at a local 55-minute timer copied from another harness.
-For configured endpoints without a known age limit, react to their close/error evidence.
-No universal provider age is inferred from the API-family enum.
+Keep raw per-row evidence; exclude invalid negative counts from computed token totals.
+Keep the existing independent valid-bucket totals for accounting. Add total, paired, missing
+and invalid row counts,
+including rows that reported no tokens. Surface measurement coverage alongside the hit rate;
+a paired rate with missing rows is a measured-subset rate, not the whole session's rate. Do not
+silently change an 80% label to 98% while hiding the unmeasured requests. Historical rows remain
+nullable and can be reaggregated; no backfill assumes that missing means a cache miss.
 
-Without an idle read pump, pings are processed when the driver resumes reading and an idle
-connection can be closed by its peer. That is acceptable: probe or reconnect at the next
-request boundary, but a successful liveness probe cannot guarantee the following write
-will arrive. A stale connection whose send has become ambiguous follows section 9.6.
-Do not promise transparent recovery from every idle disconnect.
+Provide separate views for foreground, compaction and retries/failures, with an all-work total
+that includes their cost. For transport comparisons filter by recorded transport, endpoint/API,
+resolved model/configuration and checkpoint period; old rows with no transport evidence stay
+unknown. The root display uses these facts from `agent/session`, not its own formula. A new
+WebSocket diagnostic must not erase compaction cost or reset the session-wide totals on reconnect.
 
-On cancellation, protocol failure or ambiguous delivery, abort and destroy the connection
-on its owning thread. Do not wait indefinitely for a WS close handshake in a destructor,
-and do not leave unread output for the next request. Normal close is an explicit operation
-under caller control; resource destruction must also provide an abort path that does not
-perform a blocking TLS close write. Clear the active probe bindings.
+Evaluate uncached, cache-read, cache-write and output costs with the applicable recorded pricing
+when known. Keep price/usage gaps explicit. Do not equate a higher cache percentage with lower
+cost: new useful input lowers the ratio, and charged cache writes or extra prewarm calls can
+increase cost. Acceptance compares cost per equivalent completed workload as well as hit rate.
 
-### 9.8 Observations, persistence and tests
+### 10.4 Evidence without another cache subsystem
 
-Extend `Provider_Operation_Report` and transfer facts only with observable distinctions:
-selected transport, setup outcome, model send progress, terminal result and fallback reason.
-Delta input, connection generation and response identity would be added with continuation,
-which section 9.5 defers. Request byte counts must distinguish the HTTP Upgrade from model
-JSON. Do not fabricate a new HTTP response head for each message on an existing connection.
+Extend existing request preparation/finish metadata and the diagnostics export. Record transport,
+connection reused/reopened and reason, request purpose, instruction snapshot/checkpoint identity,
+cache-control presence/value, and normalized usage/presence. Keep correlation with the durable
+request row. No transport-specific event store or live metrics service is needed.
 
-Log exact sent envelopes through the existing opt-in payload capture path and retain the
-full logical projection in request preparation/persistence as already required for replay.
-Keep secrets and handshake authorization fields out of ordinary logs. Response captures
-must preserve JSON message boundaries rather than concatenating documents into ambiguous
-bytes. Retry policy must not depend on whether diagnostic capture is enabled. No new
-presentation callbacks are needed merely to report the selected transport.
+For an explicit cache investigation, compare canonical common request fields and ordered input
+items, not the whole wire-body digest, which differs by transport envelope. Report the first
+changed section/item and the unchanged item/byte-prefix length relative to the prior logical
+request. Call that a local prefix comparison, not the provider's cacheable-token count. Compare
+full values in local tests; diagnostic digests are only evidence, not permission for continuation.
 
-Implementation gates, each a scoped change:
+Reuse existing digest/capture/export facilities and privacy controls. Do not record credentials,
+a credential hash, raw authorization fields, or prompt contents in ordinary logs. Detailed prefix
+comparison works on opted-in captures or reconstructed durable requests with complete inputs;
+mark it unavailable if evidence is missing/truncated. Retain no second full prompt solely for
+telemetry. Usage collection and all recovery decisions work with capture disabled.
 
-1. **Transport prerequisites:** done for handshake-field ownership, unsolicited
-   extension/subprotocol checks, abnormal close reporting and nonblocking abort teardown.
-   Partial-write evidence remains open, and so do the TLS key-usage and key-transition
-   safeguards that long-lived `wss` depends on. Those belong to the TLS plan above.
-2. **Shared Responses codec:** done. The request envelope is separated from common encoding
-   and the payload decoder serves SSE and WS. Response identity was not retained: nothing
-   consumes it while continuation is deferred.
-3. **Full-context WS operations:** done. Configuration, session ownership, one in-flight
-   operation, reuse across foreground requests, independent compaction, capability-driven
-   selection, `auto` fallback and required-transport refusal are implemented.
-4. **Recovery and evidence:** done for unsupported-Upgrade fallback, refusal under a
-   required transport, delivery states and the stop on ambiguous delivery. Remaining:
-   partial-write evidence, auth/TLS failures specific to a WS session, and sticky-fallback
-   reset on affinity change beyond session replacement.
-5. **Incremental continuation:** deferred, with the conditions recorded in section 9.5.
-6. **Acceptance:** run Fish/Mise check and release/debug tests plus local harnesses. Optional
-   credentialed provider tests must show two dependent requests on one connection. Do not
-   claim provider compatibility from a WS echo alone.
+### 10.5 Implementation and acceptance gates
 
-Two seams cannot be reached by an in-package test: the wire form of a request and the
-reuse of one connection across turns. The connection seam is covered by
-`websocket/test/echo`, whose peer frames RFC 6455 in Odin rather than borrowing the
-client's encoder, so no foreign language enters this repository. The provider seam was
-verified during development with a throwaway scripted peer outside the repository, which
-asserted the handshake, the `response.create` envelope, the absence of the HTTP-only
-fields, one connection carrying two model requests, and the fallback decision. A test earns
-its place by catching a real fault, so nothing was committed for it.
+Implement the accounting correction and deterministic parity fixtures with the provider-safety
+work in section 7.1. This is required work, not a future optimization:
 
-### 9.9 Reference evidence and deliberate differences
+1. In `agent/session/history.odin`, aggregate paired usage and coverage. Migrate `/status`, root
+   status and exports together. Replace the test that treats absent cache usage as a miss.
+   Cover partial coverage, explicit zero, missing-all, invalid per-row counts, unequal request
+   sizes and repeated usage snapshots. Preserve all-work totals and reported costs.
+2. In `ai` tests, freeze the same realistic request for HTTP and WS, remove only the documented
+   envelope fields, and compare all remaining JSON. Cover tool schemas, cache controls,
+   native response replay, encrypted reasoning, repaired calls and Unicode. Feed identical
+   terminal payloads via SSE and WS JSON and assert equal usage, replay output and completion.
+3. In `agent` tests, run an append-only tool chain, reconnect, fallback and session resume.
+   Compare instruction/tool/settings equality and the earlier normalized input prefix at each
+   boundary. Add separate expected-change cases for checkpoint installation and tool refresh.
+   A deliberate context repair cannot be asserted to preserve a prefix it actually replaces.
+4. Commit an opt-in Odin provider comparison harness with explicit endpoint/API/model input
+   and credentials supplied by the operator, never fixtures. Run matched HTTP and WS arms
+   against the same account/region/model/settings with identical fixed prompt/tool histories
+   and append-only suffixes. Freeze replay inputs rather than comparing two freely diverging
+   generated conversations. No real tool side effects are necessary.
+5. Warm each arm with its own stable cache key; alternate arm order and repeat with fresh
+   paired keys. Keys do not universally isolate physical caches, so record the endpoint's key
+   semantics and treat cross-warming as a possible confounder. Report cold requests separately
+   from warm steady-state requests, while retaining all costs. Match cadence and idle gaps. Compare HTTP,
+   reused WS and forced WS reconnects. Test compaction as a separate workload, not a confounder
+   in the primary comparison. Record actual sent fields, provider IDs and usage coverage.
+6. Require deterministic parity to pass and no reproducible unexplained cache/cost loss on a
+   matched provider workload before recommending `auto`/WS for that endpoint. A sustained
+   drop from roughly 98% or 99% to 80% on matched warm inputs fails this gate. Do not invent a
+   universal 99% floor or claim parity from one successful request. If WS remains worse with identical
+   inputs, keep HTTP selected and use provider request IDs to investigate routing/rendering.
 
-The supplied `websocket-sse-study.md` is a research snapshot, not a protocol contract.
-OpenCode's endpoint/call split, Codex's session lifecycle, and Pi's prefix validation and
-account separation inform this design. Their queues, timers, rollover intervals, retry
-counts and subscription-specific headers are not copied into Nabla.
+Live measurements cost money and are operator-authorized acceptance, not a mandatory CI job.
+The current local test suite does not establish live cache neutrality. Required `websocket`
+remains explicit and never silently downgrades; a low hit-rate sample is not a runtime retry or
+fallback signal. Do not send duplicate paid requests or flap transports to optimize a dashboard.
 
-The current [OpenAI WebSocket guide](https://developers.openai.com/api/docs/guides/websocket-mode)
-and [event reference](https://developers.openai.com/api/reference/resources/responses/websocket-events)
-document `response.create`, transport-field exclusions, shared server-event payloads,
-`store:false` continuation, connection limits and named-lane multiplexing. Named lanes are
-optional; Nabla uses the default lane initially. The earlier reference study's sequential
-connection model must not be stated as a universal OpenAI protocol restriction.
+Provider references: [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching)
+describes exact rendered-prefix matching, routing/retention, usage and model-dependent cache
+controls. Its WS guide distinguishes connection-local continuation from full-context restart.
+Do not transplant OpenAI cache parameters, thresholds, or pricing into another API's adapter.
 
-Azure documentation gathered in the study describes a sequential Responses connection.
-Do not assume OpenAI's newer lane support applies to Azure, xAI or a compatible gateway.
-No direct credentialed provider WS exchange has yet been performed in Nabla. Subscription
-Codex endpoints and voice APIs remain separate protocols until explicitly implemented.

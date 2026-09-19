@@ -306,14 +306,21 @@ Rules:
 
 ## 8. Provider replay state
 
-Responses-over-WebSocket is specified in
-[Network stack architecture, section 9](NETWORK_STACK_ARCHITECTURE.md#9-provider-websocket-integration)
-and implemented for full-context requests: a foreground session-owned connection that does
-not replace the committed conversation. Full provider projection is sent on every request,
-and it remains available after reconnect, compaction or process restart, which is why
-connection-local continuation is deferred rather than relied on. Background compaction keeps
-an independent HTTP operation. Transport selection is an explicit provider setting applied
-after per-model API routing, not a Models.dev capability or a model-name heuristic.
+Responses-over-WebSocket uses a foreground session-owned connection and full-context requests.
+The accepted design and remaining correctness work are specified in
+[Network stack architecture, section 9](NETWORK_STACK_ARCHITECTURE.md#9-provider-websocket-integration).
+Committed history remains authoritative across reconnect, compaction and process restart.
+Incremental continuation and multiplexing are not part of this implementation phase.
+Background compaction keeps an independent HTTP operation. Transport selection is an explicit
+provider setting applied after per-model API routing, not a Models.dev capability or a
+model-name heuristic. HTTP/SSE remains the default.
+
+Prompt-cache preservation is a cost requirement. Transport changes must preserve the common
+request, stable session cache key, instruction snapshot, ordered tools and normalized history.
+[Network stack architecture, section 10](NETWORK_STACK_ARCHITECTURE.md#10-prompt-cache-preservation-and-the-reported-regression)
+records the cache investigation, the confirmed mixed-denominator hit-rate defect, the required
+usage-coverage correction and the cache/cost acceptance gate. These corrections are planned,
+not implemented. A stable connection is not proof of a provider cache hit.
 
 Reasoning content is **not** merely display text. Some providers require faithful replay of
 provider-generated structures, particularly adjacent to tool use.
