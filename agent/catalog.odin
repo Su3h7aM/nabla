@@ -72,19 +72,27 @@ Catalog_Model_Source :: struct {
 	thinking:                  Catalog_Thinking_Source,
 }
 
+Provider_Transport :: enum {
+	HTTP,
+	WebSocket,
+	Auto,
+}
+
 Catalog_Provider_Source :: struct {
-	id:               string,
-	base_url_present: bool,
-	base_url:         string,
-	api_present:      bool,
-	api:              string,
+	id:                string,
+	base_url_present:  bool,
+	base_url:          string,
+	api_present:       bool,
+	api:               string,
+	transport_present: bool,
+	transport:         Provider_Transport,
 	// A literal secret, or `${NAME}` naming an environment variable. Resolved
 	// only when a connection is built, so no secret is ever held here.
-	api_key_present:  bool,
-	api_key:          string,
+	api_key_present:   bool,
+	api_key:           string,
 	// Read-only during resolution: sources state models, they are not extended
 	// by it. The resolved catalog's own list is what grows.
-	models:           []Catalog_Model_Source,
+	models:            []Catalog_Model_Source,
 }
 
 // Catalog_Model is one resolved model. `provider_id` is part of its identity
@@ -116,13 +124,15 @@ Catalog_Model :: struct {
 }
 
 Catalog_Provider :: struct {
-	id:               string,
-	base_url:         string,
-	base_url_present: bool,
-	api:              string,
-	api_present:      bool,
-	api_key_present:  bool,
-	api_key:          string,
+	id:                string,
+	base_url:          string,
+	base_url_present:  bool,
+	api:               string,
+	api_present:       bool,
+	transport:         Provider_Transport,
+	transport_present: bool,
+	api_key_present:   bool,
+	api_key:           string,
 }
 
 Catalog_Error :: enum {
@@ -286,6 +296,10 @@ catalog_apply_provider :: proc(dst: ^Catalog_Provider, src: Catalog_Provider_Sou
 	if !dst.api_present && src.api_present {
 		dst.api_present = true
 		dst.api = strings.clone(src.api, allocator)
+	}
+	if !dst.transport_present && src.transport_present {
+		dst.transport_present = true
+		dst.transport = src.transport
 	}
 	if !dst.api_key_present && src.api_key_present {
 		dst.api_key_present = true

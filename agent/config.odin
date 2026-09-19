@@ -273,6 +273,25 @@ load_provider :: proc(L: ^l.State, raw_idx: c.int, provider_id: string, allocato
 		out^.api_present = true
 	}
 	l.settop(L, base)
+	lua_field(L, idx, "transport")
+	if l.type(L, -1) != .NIL {
+		value, ok := lua_string(L, -1, allocator)
+		if !ok { return .Invalid }
+		switch value {
+		case "http":
+			out^.transport = .HTTP
+		case "websocket":
+			out^.transport = .WebSocket
+		case "auto":
+			out^.transport = .Auto
+		case:
+			delete(value, allocator)
+			return .Invalid
+		}
+		delete(value, allocator)
+		out^.transport_present = true
+	}
+	l.settop(L, base)
 	lua_field(L, idx, "api_key")
 	if l.type(L, -1) != .NIL {
 		value, ok := lua_string(L, -1, allocator)

@@ -14,6 +14,7 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 		`return { providers = { acme = {
 			base_url = "https://api.acme.test",
 			api = "openai_responses",
+			transport = "websocket",
 			api_key = "ACME_KEY",
 			models = {
 				chat = {
@@ -41,6 +42,8 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 	testing.expect_value(t, provider.id, "acme")
 	testing.expect_value(t, provider.base_url, "https://api.acme.test")
 	testing.expect_value(t, provider.api, "openai_responses")
+	testing.expect(t, provider.transport_present)
+	testing.expect_value(t, provider.transport, Provider_Transport.WebSocket)
 	testing.expect_value(t, provider.api_key, "ACME_KEY")
 	testing.expect_value(t, len(provider.models), 3)
 
@@ -148,6 +151,7 @@ test_lua_config_failures_leave_no_partial_sources :: proc(t: ^testing.T) {
 	cases := []string {
 		`return { providers = { acme = { models = { chat = { display_name = 42 } } } } }`,
 		`return { providers = { acme = { api_key = 42 } } }`,
+		`return { providers = { acme = { transport = "udp" } } }`,
 		`return { providers = { acme = { models = { chat = { tools = true }, bad = { context_window = -1 } } } } }`,
 		`return { providers = { acme = { models = { chat = { input_modalities = {"text"}, output_modalities = "text" } } } } }`,
 	}
