@@ -38,21 +38,28 @@ certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (ch
 
 	certificates := make([dynamic]x509.Certificate, 0, 4, allocator)
 	ders := make([dynamic][]u8, 0, 4, allocator)
+	failed := false
 	for entries.ok && entries.at < len(entries.data) {
 		encoded := read_bytes(&entries, read_u24(&entries))
 		_ = read_bytes(&entries, int(read_u16(&entries))) // the entry's extensions
+		if !entries.ok {
+			failed = true
+			break
+		}
+
 		der := make([]u8, len(encoded), allocator)
 		copy(der, encoded)
 		certificate, parse_err := x509.parse(der, allocator)
-		if parse_err != nil || !entries.ok {
+		if parse_err != nil {
 			delete(der, allocator)
+			failed = true
 			break
 		}
 		append(&certificates, certificate)
 		append(&ders, der)
 	}
 
-	if !entries.ok || entries.at != len(entries.data) || len(certificates) == 0 {
+	if failed || !r.ok || r.at != len(r.data) || !entries.ok || entries.at != len(entries.data) || len(certificates) == 0 {
 		chain.certificates = certificates[:]
 		chain.der = ders[:]
 		certificate_chain_destroy(&chain)

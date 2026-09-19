@@ -25,6 +25,12 @@ test_rfc_8448_certificate_list :: proc(t: ^testing.T) {
 	truncated, truncated_ok := certificate_chain_decode(message[HANDSHAKE_HEADER_SIZE:len(message) - 1], context.temp_allocator)
 	defer certificate_chain_destroy(&truncated)
 	testing.expect(t, !truncated_ok, "a certificate list missing its last byte was accepted")
+
+	with_trailing := make([]u8, len(message) - HANDSHAKE_HEADER_SIZE + 1, context.temp_allocator)
+	copy(with_trailing, message[HANDSHAKE_HEADER_SIZE:])
+	trailing, trailing_ok := certificate_chain_decode(with_trailing, context.temp_allocator)
+	defer certificate_chain_destroy(&trailing)
+	testing.expect(t, !trailing_ok, "data after the certificate list was accepted")
 }
 
 // The two messages that authenticate the peer: the CertificateVerify signature, and

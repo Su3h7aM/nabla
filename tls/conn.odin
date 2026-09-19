@@ -676,15 +676,21 @@ extension_find :: proc(body: []u8, wanted: Extension_Type) -> []u8 {
 // purpose a TLS server certificate is used for.
 chain_verify :: proc(certificates: []x509.Certificate, server_name: string, config: Config) -> bool {
 	if len(certificates) == 0 || len(config.roots) == 0 { return false }
-	if !identity_verify(&certificates[0], server_name) { return false }
+
+	dns_name := server_name
+	if net.parse_address(server_name) != nil {
+		if !identity_verify(&certificates[0], server_name) { return false }
+		dns_name = ""
+	}
 
 	intermediates := certificate_pointers(certificates[1:], config.allocator)
 	defer delete(intermediates, config.allocator)
-	_, chain_err := x509.verify_chain(
+	verified, chain_err := x509.verify_chain(
 		&certificates[0],
-		{roots = config.roots, intermediates = intermediates, current_time = time.now(), dns_name = server_name, required_eku = x509.EKU_Bit.Server_Auth},
+		{roots = config.roots, intermediates = intermediates, current_time = time.now(), dns_name = dns_name, required_eku = x509.EKU_Bit.Server_Auth},
 		config.allocator,
 	)
+	defer delete(verified, config.allocator)
 	return chain_err == .None
 }
 
