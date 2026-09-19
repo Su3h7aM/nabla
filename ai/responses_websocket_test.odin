@@ -5,6 +5,14 @@ import "core:encoding/json"
 import "core:testing"
 
 @(test)
+test_api_transports_state_a_capability_rather_than_a_provider :: proc(t: ^testing.T) {
+	testing.expect_value(t, Provider_API_Transports(.OpenAI_Responses), bit_set[Provider_Transport_Kind]{.HTTP, .WebSocket})
+	testing.expect_value(t, Provider_API_Transports(.OpenAI_Chat_Completions), bit_set[Provider_Transport_Kind]{.HTTP})
+	testing.expect_value(t, Provider_API_Transports(.Anthropic_Messages), bit_set[Provider_Transport_Kind]{.HTTP})
+	testing.expect_value(t, Provider_API_Transports(.Invalid), bit_set[Provider_Transport_Kind]{})
+}
+
+@(test)
 test_responses_websocket_endpoint_preserves_authority_and_resource :: proc(t: ^testing.T) {
 	cases := []struct {
 		base: string,

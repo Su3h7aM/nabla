@@ -16,6 +16,30 @@ Provider_Connection :: struct {
 	Credential: string, // borrowed until operation retirement; secret,
 }
 
+// Provider_Transport_Kind is one wire transport an API adapter can speak. It names a
+// protocol capability, not a provider: whether an endpoint serves its API over a
+// WebSocket is a property of the API the adapter implements, and nothing here is keyed
+// on a provider or model identity.
+Provider_Transport_Kind :: enum {
+	HTTP,
+	WebSocket,
+}
+
+// Provider_API_Transports reports which wire transports an API adapter implements. Every
+// adapter speaks HTTP; one that also implements a connection-oriented transport says so
+// here. The switch is exhaustive over the API families, so adding a family is a compile
+// error until this package has decided what it can carry.
+Provider_API_Transports :: proc(api: API_Kind) -> bit_set[Provider_Transport_Kind] {
+	switch api {
+	case .OpenAI_Responses:
+		return {.HTTP, .WebSocket}
+	case .OpenAI_Chat_Completions, .Anthropic_Messages:
+		return {.HTTP}
+	case .Invalid:
+	}
+	return {}
+}
+
 Provider_Role :: enum {
 	Invalid,
 	System,

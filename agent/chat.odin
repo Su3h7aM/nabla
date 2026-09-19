@@ -212,18 +212,27 @@ chat_perform_request :: proc(
 		return
 	}
 
-	// The bytes this request sends are frozen once, before the first attempt, so every
-	// attempt of the chain sends exactly what the first would have sent instead of a
-	// fresh encoding that has to be assumed equal. A request that cannot be encoded
-	// never reaches the provider, so it fails the turn here, before a request row
-	// exists, rather than being recorded as a send that did not happen.
 	// The request carries interruption only. No deadline is set: the request
 	// stays open as long as the provider keeps it open, and ends when the
 	// provider, the transport, or cancellation ends it.
 	options := ai.Provider_Operation_Options {
 		interrupt = &chat_cancel,
 	}
-	websocket_request := connection.API == .OpenAI_Responses && chat.provider_transport != .HTTP && !chat.websocket_fallback_http
+	// Transport is capability-driven: the configured mode says what the operator wants and
+	// the API adapter says which wire transports it implements. Neither is keyed on a
+	// provider or model identity.
+	transports := ai.Provider_API_Transports(connection.API)
+	if chat.provider_transport == .WebSocket && .WebSocket not_in transports {
+		chat_session_fail_turn(chat, fmt.tprintf("the %s API has no WebSocket transport", chat_api_name(connection.API)))
+		return
+	}
+	websocket_request := chat.provider_transport != .HTTP && .WebSocket in transports && !chat.websocket_fallback_http
+
+	// The bytes this request sends are frozen once, before the first attempt, so every
+	// attempt of the chain sends exactly what the first would have sent instead of a
+	// fresh encoding that has to be assumed equal. A request that cannot be encoded
+	// never reaches the provider, so it fails the turn here, before a request row
+	// exists, rather than being recorded as a send that did not happen.
 	encoded: ai.Provider_Encoded_Request
 	encode_err: ai.Provider_Operation_Error
 	if websocket_request {

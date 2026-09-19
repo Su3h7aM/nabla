@@ -505,9 +505,11 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 		selection_fail(app, fmt.tprintf("unsupported api: %s", api_name))
 		return false
 	}
-	if provider.transport == .WebSocket && api != .OpenAI_Responses {
+	// A transport the selected API adapter does not implement is refused here, where the
+	// user can still choose another model, rather than mid-turn.
+	if provider.transport == .WebSocket && .WebSocket not_in ai.Provider_API_Transports(api) {
 		delete(credential, app.setup.alloc)
-		selection_fail(app, fmt.tprintf("provider %s requires WebSocket but model %s does not use the Responses API", provider_id, model_id))
+		selection_fail(app, fmt.tprintf("provider %s requires WebSocket, which the %s API has no transport for", provider_id, api_name))
 		return false
 	}
 
