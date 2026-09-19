@@ -1,24 +1,18 @@
 package client
 
-import "base:runtime"
 import "core:mem"
 import "core:net"
 import "core:os"
 import "core:strings"
-import "core:time"
 
-// DNS_TIMEOUT bounds one nameserver attempt. An exhausted attempt moves on to the
-// next nameserver; it only ends the lookup when the caller's own deadline or
-// cancellation says so.
-DNS_TIMEOUT :: 5 * time.Second
+import "nabla:dns"
 
-// DNS_MAX_RESPONSE bounds a single response datagram.
-DNS_MAX_RESPONSE :: 4096
-
-// resolve_host returns one address for hostname, preferring IPv4. Every network
-// wait goes through the wait hook, so a stalled lookup is interrupted by the same
-// cancellation and deadline as the rest of the request. Resolution runs on the
-// calling thread, so an interrupted lookup owns nothing that outlives it.
+// resolve_host returns one address for hostname, preferring IPv4. The hosts
+// file is consulted before any nameserver, so local names resolve without
+// one; the DNS exchange itself lives in the dns package, and this procedure
+// keeps only the caller policy: which servers, and how a lookup outcome maps
+// onto this client's errors. Resolution runs on the calling thread, so an
+// interrupted lookup owns nothing that outlives it.
 resolve_host :: proc(hostname: string, options: Options, allocator: mem.Allocator) -> (address: net.Address, found: bool, err: Error) {
 	if host, ok := hosts_lookup(hostname, allocator); ok { return host, true, .None }
 	if !net.validate_hostname(hostname) { return nil, false, .Resolve }
@@ -34,10 +28,18 @@ resolve_host :: proc(hostname: string, options: Options, allocator: mem.Allocato
 	defer if owned { delete(servers, allocator) }
 	if len(servers) == 0 { return nil, false, .Resolve }
 
+	probe := options.probe
 	for kind in ([2]net.DNS_Record_Type{net.DNS_Record_Type.DNS_TYPE_A, net.DNS_Record_Type.DNS_TYPE_AAAA}) {
-		records, query_err := query_nameservers(hostname, kind, servers, options, allocator)
-		if query_err != .None { return nil, false, query_err }
-		if len(records) == 0 { continue }
+		records, query_err := dns.lookup(
+			hostname,
+			kind,
+			dns.Options{servers = servers, interrupt = {check = dns_interrupt_check, user_data = &probe}},
+			allocator,
+		)
+		if query_err == .Cancelled {
+			return nil, false, error_from_stop(stop_from_wait(probe_now(options.probe)))
+		}
+		if query_err != .None { continue }
 		defer net.destroy_dns_records(records, allocator)
 		for record in records {
 			#partial switch value in record {
@@ -51,131 +53,12 @@ resolve_host :: proc(hostname: string, options: Options, allocator: mem.Allocato
 	return nil, false, .Resolve
 }
 
-// query_nameservers asks each nameserver in turn for one record type, returning an
-// empty result when none of them produced a usable answer.
-query_nameservers :: proc(
-	hostname: string,
-	kind: net.DNS_Record_Type,
-	servers: []net.Endpoint,
-	options: Options,
-	allocator: mem.Allocator,
-) -> (
-	[]net.DNS_Record,
-	Error,
-) {
-	id: u16be
-	if !runtime.random_generator_read_ptr(context.random_generator, &id, size_of(id)) { return nil, .Resolve }
-
-	packet_buffer: [net.DNS_PACKET_MIN_LEN]u8
-	packet, packet_err := net.make_dns_packet(packet_buffer[:], id, hostname, kind)
-	if packet_err != .None { return nil, .Resolve }
-
-	response_buffer: [DNS_MAX_RESPONSE]u8
-	for server in servers {
-		count, source, exchange_err := exchange_udp(server, packet, response_buffer[:], options)
-		if exchange_err != .None { return nil, exchange_err }
-		// A datagram from anyone but the queried server cannot answer this query.
-		if count == 0 || source != server { continue }
-		records, xid, parsed := net.parse_response(response_buffer[:count], kind, allocator)
-		if !parsed { continue }
-		if xid != id || len(records) == 0 {
-			net.destroy_dns_records(records, allocator)
-			continue
-		}
-		return records, .None
-	}
-	return nil, .None
-}
-
-// exchange_udp sends one query and waits for one datagram. A server that cannot be
-// reached is skipped; only cancellation and the operation deadline are terminal.
-// A zero count means no usable reply arrived from this server.
-exchange_udp :: proc(server: net.Endpoint, packet: []u8, buffer: []u8, options: Options) -> (count: int, source: net.Endpoint, err: Error) {
-	created, create_err := net.create_socket(net.family_from_endpoint(server), .UDP)
-	if create_err != .None { return 0, {}, .None }
-	socket := created.(net.UDP_Socket)
-	defer net.close(socket)
-	if options.probe.check != nil {
-		if block_err := net.set_blocking(socket, false); block_err != .None { return 0, {}, .None }
-	} else {
-		// Without a hook there is nothing to interrupt, so the attempt is bounded by
-		// the socket itself. A discarded reply must not turn into an endless wait.
-		_ = net.set_option(socket, .Receive_Timeout, DNS_TIMEOUT)
-		_ = net.set_option(socket, .Send_Timeout, DNS_TIMEOUT)
-	}
-
-	sent, send_err := send_query(socket, packet, server, options)
-	if send_err != .None { return 0, {}, send_err }
-	if !sent { return 0, {}, .None }
-	return receive_reply(socket, buffer, options)
-}
-
-send_query :: proc(socket: net.UDP_Socket, packet: []u8, server: net.Endpoint, options: Options) -> (bool, Error) {
-	for {
-		written, send_err := net.send_udp(socket, packet, server)
-		#partial switch send_err {
-		case nil:
-			// A datagram is all-or-nothing, so a short write is not retryable.
-			return written == len(packet), .None
-		case .Would_Block:
-			result, stop := wait_ready(socket, .Write, options.probe, DNS_TIMEOUT)
-			if err := attempt_end(result, stop, options); err != .None {
-				return false, err
-			}
-		case .Interrupted:
-			continue
-		case:
-			return false, .None
-		}
-	}
-}
-
-receive_reply :: proc(socket: net.UDP_Socket, buffer: []u8, options: Options) -> (count: int, source: net.Endpoint, err: Error) {
-	for {
-		received, from, recv_err := net.recv_udp(socket, buffer)
-		#partial switch recv_err {
-		case nil:
-			if received > 0 { return received, from, .None }
-		case .Would_Block:
-			result, stop := wait_ready(socket, .Read, options.probe, DNS_TIMEOUT)
-			if result == .Ready { continue }
-			if wait_err := attempt_end(result, stop, options); wait_err != .None {
-				return 0, {}, wait_err
-			}
-			return 0, {}, .None
-		case .Timeout:
-			return 0, {}, .None
-		case .Interrupted:
-			continue
-		case:
-			// Includes an ICMP port-unreachable for this server.
-			return 0, {}, .None
-		}
-	}
-}
-
-// attempt_end decides whether an exhausted attempt ends the request or only this
-// attempt. A wait that stopped because the caller's own policy said so ends the
-// request; one that merely ran out its own bound moves on to the next server,
-// which is why the policy is asked again rather than inferred from the stop.
-attempt_end :: proc(result: Wait_Result, stop: Transport_Stop, options: Options) -> Error {
-	if result == .Ready { return .None }
-	if result == .Failed { return .Recv }
-	switch stop_from_wait(probe_now(options.probe)) {
-	case .None:
-		return .None
-	case .Cancelled:
-		return .Cancelled
-	case .Timed_Out:
-		return .Timed_Out
-	case .Peer_Closed:
-		return .Closed
-	case .Truncated:
-		return .Truncated
-	case .Failed:
-		return .Recv
-	}
-	return .None
+// dns_interrupt_check adapts the request probe to the resolver's stop policy:
+// any probe state but Ready stops the lookup. The resolver reports the stop
+// as Cancelled, and the caller re-reads its own probe for the specific cause.
+dns_interrupt_check :: proc(user_data: rawptr) -> bool {
+	probe := (^Probe)(user_data)
+	return probe_now(probe^) != .Ready
 }
 
 // hosts_lookup consults the hosts file before any nameserver, so local names
