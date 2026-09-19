@@ -300,7 +300,29 @@ but do not undertake an asynchronous rewrite without a measured need.
 No connection pooling, trust-store caching, ALPN expansion or new provider transport is
 required to complete the current correction plan.
 
-## 6. Ordered implementation plan
+## 6. Implementation progress
+
+Completed after this review:
+
+- Balanced verified-chain and handshake-detail ownership, separated IP SAN checking from
+  DNS-name verification, and made certificate-list parsing fail atomically.
+- Corrected traffic-update derivation, answered requested KeyUpdate messages, made fatal
+  TLS failures terminal, and treated a bare TLS transport close as truncation.
+- Strictly validated ServerHello and EncryptedExtensions, including ALPN selection, and
+  answered a main-handshake CertificateRequest with an empty Certificate. The OpenSSL
+  harness now covers optional client authentication.
+- Rejected malformed ChangeCipherSpec records and protected inner CCS messages.
+- Validated discarded HTTP response bodies and released parsed DNS answers rejected for
+  transaction mismatch or emptiness.
+- Corrected empty WebSocket messages, valid U+FFFD text, close payload validation, writes
+  after Close, and minimal frame-length encoding.
+
+The remaining bullets in section 4 still apply except where this list explicitly records a
+completed correction. In particular, TLS key-usage thresholds, dynamic outbound handshake
+messages, alert coverage, HTTP syntax and outcome redesign, DNS TCP retry/address fallback,
+and WebSocket handshake-field ownership remain open.
+
+## 7. Ordered implementation plan
 
 Each item is a coherent change or short series, independently buildable and tested. Do not
 mark a phase complete from one successful live request.
@@ -334,7 +356,7 @@ Security or memory defects discovered while implementing a phase take priority o
 ordering, but belong in their own scoped changes. Do not combine all corrections into one
 commit or use this list as a reason to add speculative abstraction.
 
-## 7. Test policy and acceptance
+## 8. Test policy and acceptance
 
 Keep useful existing RFC 8448 vectors and independent local peers. Add tests only for
 observable protocol behavior, memory ownership or regressions. Prefer small tables of
