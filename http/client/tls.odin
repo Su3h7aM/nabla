@@ -35,6 +35,9 @@ connection_transport_write :: proc(user_data: rawptr, buffer: []u8) -> (count: i
 // preferred over anything the TLS layer could guess.
 tls_error :: proc(connection: ^Connection, tls_err: tls.Error, fallback: Error) -> Error {
 	if tls_err == .Transport {
+		// TLS reaches an orderly end only through an authenticated close_notify.
+		// A bare transport close can truncate protected application data.
+		if connection.stop == .Peer_Closed { return .Truncated }
 		if connection.stop != .None { return error_from_stop(connection.stop) }
 		return .Truncated
 	}

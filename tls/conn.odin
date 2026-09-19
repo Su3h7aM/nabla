@@ -360,6 +360,7 @@ read :: proc(conn: ^Conn, buffer: []u8) -> (count: int, err: Error) {
 // write hands the whole buffer to the peer as application data. It counts bytes the
 // record layer accepted, which is not evidence that the peer has them.
 write :: proc(conn: ^Conn, buffer: []u8) -> (count: int, err: Error) {
+	if conn.closed { return 0, .Alert }
 	for count < len(buffer) {
 		chunk := buffer[count:]
 		if len(chunk) > MAX_PLAINTEXT_RECORD { chunk = chunk[:MAX_PLAINTEXT_RECORD] }
@@ -598,8 +599,10 @@ handshake_available :: proc(conn: ^Conn) -> []u8 {
 // fail tells the peer which rule it broke and reports the failure, which is what the
 // protocol asks of the side that finds a violation (RFC 8446 section 6.2).
 fail :: proc(conn: ^Conn, description: Alert_Description, err: Error) -> Error {
+	if conn.closed { return err }
 	alert: [2]u8 = {u8(Alert_Level.Fatal), u8(description)}
 	_ = send_record(conn, .Alert, alert[:])
+	conn.closed = true
 	return err
 }
 
@@ -608,8 +611,8 @@ fail :: proc(conn: ^Conn, description: Alert_Description, err: Error) -> Error {
 alert_report :: proc(conn: ^Conn, content: []u8) -> Error {
 	if len(content) < 2 { return .Record }
 	conn.peer_alert = content[1]
+	conn.closed = true
 	if Alert_Description(content[1]) == .Close_Notify {
-		conn.closed = true
 		return .None
 	}
 	return .Alert

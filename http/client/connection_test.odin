@@ -9,6 +9,8 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 
+import "nabla:tls"
+
 WRITE_TEST_BYTES :: 8 * 1024 * 1024
 READ_TEST_BYTES: string : "a connection with no probe reads what the peer sent"
 
@@ -154,4 +156,12 @@ test_connection_without_a_probe_moves_bytes_on_the_socket :: proc(t: ^testing.T)
 	testing.expect(t, server.sent, "the server did not send the payload")
 	thread.destroy(worker)
 	worker = nil
+}
+
+@(test)
+test_a_bare_tls_transport_close_is_truncation :: proc(t: ^testing.T) {
+	connection := Connection {
+		stop = .Peer_Closed,
+	}
+	testing.expect_value(t, tls_error(&connection, tls.Error.Transport, .TLS_Read), Error.Truncated)
 }
