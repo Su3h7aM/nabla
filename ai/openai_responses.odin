@@ -331,8 +331,6 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 	if !response_present { return provider_stream_fail(state, .Invalid_Data, "response event has no response") }
 	response, ok := raw.(json.Object)
 	if !ok { return provider_stream_fail(state, .Invalid_Data, "response is not an object") }
-	response_id, _, response_id_ok := openai_value_string(response, "id")
-	if !response_id_ok { return provider_stream_fail(state, .Invalid_Data, "response id is invalid") }
 	usage := Provider_Usage_Event{}
 	usage_present := false
 	if raw_usage, present := response["usage"]; present {
@@ -374,18 +372,12 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 					Reason_Text = strings.clone("tool_calls", state.Allocator),
 					Tool_Calls = calls,
 					Raw_Output = raw_output,
-					Response_ID = strings.clone(response_id, state.Allocator),
 				},
 			)
 		} else {
 			provider_stream_push(
 				state,
-				Provider_Completed_Event {
-					Reason = .Stop,
-					Reason_Text = strings.clone("completed", state.Allocator),
-					Raw_Output = raw_output,
-					Response_ID = strings.clone(response_id, state.Allocator),
-				},
+				Provider_Completed_Event{Reason = .Stop, Reason_Text = strings.clone("completed", state.Allocator), Raw_Output = raw_output},
 			)
 		}
 		return .None

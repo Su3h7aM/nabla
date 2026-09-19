@@ -273,10 +273,7 @@ Provider_Completed_Event :: struct {
 	// encoder drops the output-only fields the input schema refuses. This is
 	// the lossless-replay record; Tool_Calls stays the execution view.
 	Raw_Output:  string, // owned by receiver,
-	// Response_ID is the provider response identity when one was present. It is
-	// connection-local continuation evidence, not durable conversation state.
-	Response_ID: string, // owned by receiver,
-} // Tool_Calls, Raw_Output, and Response_ID owned by receiver
+} // Tool_Calls and Raw_Output owned by receiver
 Provider_Error_Event :: struct {
 	Kind:          Provider_Error_Kind,
 	Message:       string,
@@ -301,7 +298,6 @@ Provider_Event_Destroy :: proc(event: ^Provider_Event, allocator := context.allo
 	case Provider_Completed_Event:
 		if value.Reason_Text != "" { delete(value.Reason_Text, allocator) }
 		if value.Raw_Output != "" { delete(value.Raw_Output, allocator) }
-		if value.Response_ID != "" { delete(value.Response_ID, allocator) }
 		for call in value.Tool_Calls {
 			if call.ID != "" { delete(call.ID, allocator) }
 			if call.Item_ID != "" { delete(call.Item_ID, allocator) }
