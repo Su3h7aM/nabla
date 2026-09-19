@@ -5,16 +5,47 @@ import "core:mem"
 import "core:strings"
 
 openai_responses_encode_request :: proc(request: Provider_Request, allocator := context.allocator) -> (string, Provider_Request_Error) {
-	if err := Provider_Validate_Request(request); err != .None { return "", err }
+	object, request_err := openai_responses_request_object(request, allocator)
+	if request_err != .None { return "", request_err }
+	object[strings.clone("stream", allocator)] = json.Boolean(true)
+	return openai_responses_unparse_request(object, allocator)
+}
+
+// The WebSocket request carries the same Responses fields under a response.create
+// event. Streaming is inherent to the connection, so its HTTP-only stream field is
+// not sent.
+openai_responses_encode_websocket_request :: proc(request: Provider_Request, allocator := context.allocator) -> (string, Provider_Request_Error) {
+	object, request_err := openai_responses_request_object(request, allocator)
+	if request_err != .None { return "", request_err }
+	object[strings.clone("type", allocator)] = json.String(strings.clone("response.create", allocator))
+	return openai_responses_unparse_request(object, allocator)
+}
+
+openai_responses_unparse_request :: proc(object: json.Object, allocator: mem.Allocator) -> (string, Provider_Request_Error) {
+	value := json.Value(object)
+	defer json.destroy_value(value, allocator)
+	// Keys are sorted so the same conversation encodes to the same bytes every
+	// time, including in a later process. Map iteration order is otherwise
+	// allocation-dependent, which would move bytes inside the cached prefix.
+	result, err := json.unparse(value, {sort_maps_by_key = true}, allocator)
+	if err != nil { return "", .Invalid_Message }
+	return result, .None
+}
+
+openai_responses_request_object :: proc(request: Provider_Request, allocator: mem.Allocator) -> (object: json.Object, err: Provider_Request_Error) {
+	if request_err := Provider_Validate_Request(request); request_err != .None { return nil, request_err }
 	for tool in request.Tools {
-		if !openai_tool_schema_valid(tool.Parameters_JSON) { return "", .Invalid_Tools }
+		if !openai_tool_schema_valid(tool.Parameters_JSON) { return nil, .Invalid_Tools }
 	}
-	object := make(json.Object, 8, allocator)
+	object = make(json.Object, 8, allocator)
+	defer if err != .None { json.destroy_value(json.Value(object), allocator) }
 	object[strings.clone("model", allocator)] = json.String(strings.clone(request.Model, allocator))
 	if request.Instructions_Present {
 		object[strings.clone("instructions", allocator)] = json.String(strings.clone(request.Instructions, allocator))
 	}
 	input := make(json.Array, 0, len(request.Messages), allocator)
+	input_attached := false
+	defer if err != .None && !input_attached { json.destroy_value(json.Value(input), allocator) }
 	for message in request.Messages {
 		// A verbatim message carries the endpoint's own items. They are emitted
 		// here, where they sit among the projected messages, so the request keeps
@@ -22,11 +53,11 @@ openai_responses_encode_request :: proc(request: Provider_Request, allocator := 
 		// annotations, and summaries, and would send assistant content twice.
 		if message.Verbatim_Items != "" {
 			items, parse_err := json.parse_string(message.Verbatim_Items, .JSON, true, allocator)
-			if parse_err != nil { return "", .Invalid_Message }
+			if parse_err != nil { return nil, .Invalid_Message }
 			array, is_array := items.(json.Array)
 			if !is_array {
 				json.destroy_value(items, allocator)
-				return "", .Invalid_Message
+				return nil, .Invalid_Message
 			}
 			for item in array {
 				// An output item carries a terminal status; the input-item schema
@@ -111,6 +142,7 @@ openai_responses_encode_request :: proc(request: Provider_Request, allocator := 
 		append(&input, json.Value(item))
 	}
 	object[strings.clone("input", allocator)] = json.Value(input)
+	input_attached = true
 	if len(request.Tools) > 0 {
 		tools := make(json.Array, 0, len(request.Tools), allocator)
 		for tool in request.Tools {
@@ -137,15 +169,7 @@ openai_responses_encode_request :: proc(request: Provider_Request, allocator := 
 	}
 	if request.Prompt_Cache_Retention_Present { object[strings.clone("prompt_cache_retention", allocator)] = json.String(strings.clone(request.Prompt_Cache_Retention, allocator)) }
 	if request.Store_Response_Present { object[strings.clone("store", allocator)] = json.Boolean(request.Store_Response) }
-	object[strings.clone("stream", allocator)] = json.Boolean(true)
-	value := json.Value(object)
-	// Keys are sorted so the same conversation encodes to the same bytes every
-	// time, including in a later process. Map iteration order is otherwise
-	// allocation-dependent, which would move bytes inside the cached prefix.
-	result, err := json.unparse(value, {sort_maps_by_key = true}, allocator)
-	json.destroy_value(value, allocator)
-	if err != nil { return "", .Invalid_Message }
-	return result, .None
+	return object, .None
 }
 
 openai_responses_parse_usage :: proc(object: json.Object) -> (Provider_Usage_Event, bool) {

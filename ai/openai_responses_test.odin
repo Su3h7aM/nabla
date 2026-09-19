@@ -105,6 +105,23 @@ test_responses_encode_matches_spec :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_responses_websocket_encode_uses_event_envelope_without_http_stream_field :: proc(t: ^testing.T) {
+	body, err := openai_responses_encode_websocket_request(request_fixture(), context.temp_allocator)
+	if !testing.expect_value(t, err, Provider_Request_Error.None) { return }
+	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
+	if !testing.expect_value(t, parse_err, nil) { return }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, ok := value.(json.Object)
+	if !testing.expect(t, ok, "the WebSocket request is not an object") { return }
+	event_type, present, valid := openai_value_string(object, "type")
+	testing.expect(t, valid && present && event_type == "response.create")
+	_, stream_present := object["stream"]
+	testing.expect(t, !stream_present, "the WebSocket request carried the HTTP stream field")
+	input, input_ok := object["input"].(json.Array)
+	testing.expect(t, input_ok && len(input) == 2)
+}
+
+@(test)
 test_responses_encode_removes_output_status_from_replay :: proc(t: ^testing.T) {
 	messages := []Provider_Message {
 		{Verbatim_Items = `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[]}]`},
