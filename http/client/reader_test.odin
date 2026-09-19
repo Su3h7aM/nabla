@@ -301,6 +301,14 @@ test_incomplete_bodies :: proc(t: ^testing.T) {
 	truncated_collector: Collector
 	defer delete(truncated_collector.buffer)
 	testing.expect_value(t, stream_body(&truncated, truncated_framing, truncated_length, &truncated_collector, collect), Error.Closed)
+
+	discarded := _reader("HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc")
+	discarded_status, discarded_headers, discarded_err := read_response_head(&discarded, context.temp_allocator)
+	defer headers_destroy(&discarded_headers, context.temp_allocator)
+	testing.expect_value(t, discarded_err, Error.None)
+	discarded_framing, discarded_length, discarded_framing_err := response_framing(discarded_status, .Post, discarded_headers)
+	testing.expect_value(t, discarded_framing_err, Error.None)
+	testing.expect_value(t, stream_body(&discarded, discarded_framing, discarded_length, nil, nil), Error.Closed)
 }
 
 @(test)

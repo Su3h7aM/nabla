@@ -165,11 +165,9 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 		if refusal.kind != .None { return refusal }
 		return failure_from_error(framing_err, request.allocator)
 	}
-	if callback != nil {
-		if body_err := stream_body(&reader, framing, length, user_data, callback); body_err != .None {
-			if refusal.kind != .None { return refusal }
-			return failure_from_error(body_err, request.allocator)
-		}
+	if body_err := stream_body(&reader, framing, length, user_data, callback); body_err != .None {
+		if refusal.kind != .None { return refusal }
+		return failure_from_error(body_err, request.allocator)
 	}
 	if refusal.kind != .None { return refusal }
 
