@@ -219,19 +219,23 @@ provider_websocket_dial :: proc(
 }
 
 provider_websocket_endpoint :: proc(base: string, allocator: mem.Allocator) -> (string, bool) {
-	endpoint := strings.trim_right(base, "/")
-	if !strings.has_suffix(endpoint, "/responses") {
-		endpoint = strings.concatenate([]string{endpoint, "/responses"}, allocator)
-		defer delete(endpoint, allocator)
+	// The resource path belongs to the protocol, so a base URL that does not state it gets
+	// it appended. That string is owned for the whole call, not for the block that builds
+	// it: reading it after the block would read freed memory.
+	resource := strings.trim_right(base, "/")
+	owned := ""
+	defer if owned != "" { delete(owned, allocator) }
+	if !strings.has_suffix(resource, "/responses") {
+		owned = strings.concatenate([]string{resource, "/responses"}, allocator)
+		resource = owned
 	}
-	if strings.has_prefix(endpoint, "https://") {
-		return strings.concatenate([]string{"wss://", endpoint[len("https://"):]}, allocator), true
-	}
-	if strings.has_prefix(endpoint, "http://") {
-		return strings.concatenate([]string{"ws://", endpoint[len("http://"):]}, allocator), true
-	}
-	if strings.has_prefix(endpoint, "wss://") || strings.has_prefix(endpoint, "ws://") {
-		return strings.clone(endpoint, allocator), true
+	switch {
+	case strings.has_prefix(resource, "https://"):
+		return strings.concatenate([]string{"wss://", resource[len("https://"):]}, allocator), true
+	case strings.has_prefix(resource, "http://"):
+		return strings.concatenate([]string{"ws://", resource[len("http://"):]}, allocator), true
+	case strings.has_prefix(resource, "wss://"), strings.has_prefix(resource, "ws://"):
+		return strings.clone(resource, allocator), true
 	}
 	return "", false
 }

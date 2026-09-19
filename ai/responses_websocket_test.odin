@@ -20,7 +20,8 @@ test_responses_websocket_endpoint_preserves_authority_and_resource :: proc(t: ^t
 		ok:   bool,
 	} {
 		{"https://api.openai.com/v1", "wss://api.openai.com/v1/responses", true},
-		{"http://127.0.0.1:8080/v1/responses", "ws://127.0.0.1:8080/v1/responses", true},
+		{"https://api.openai.com/v1/responses", "wss://api.openai.com/v1/responses", true},
+		{"http://127.0.0.1:8080/v1/", "ws://127.0.0.1:8080/v1/responses", true},
 		{"wss://example.test/api", "wss://example.test/api/responses", true},
 		{"ftp://example.test", "", false},
 	}
