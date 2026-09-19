@@ -1,7 +1,10 @@
 # Network stack architecture and implementation plan
 
-Status: architectural decisions accepted, revision 6. Reviewed against source at
-`876bc824` and the complete WebSocket transport report. This revision changes documentation,
+Status: architectural decisions accepted, revision 7. Reviewed against source at
+`876bc824`, the complete WebSocket transport report, and the transport reference study.
+Revision 7 chooses automatic WS-first selection with safe HTTP fallback, extends delivery
+safety to HTTP, and specifies provider/model switches across transports. The shipped default
+is still HTTP until the rollout gates in section 9.10 pass. This revision changes documentation,
 not implementation. Sections 4 and 6 describe the implementation; sections 7, 9 and 10 specify
 work still required. A passing test suite is not a claim of complete protocol compliance.
 
@@ -13,15 +16,19 @@ transport framework or implement unrelated protocol features.
 
 The decisions are:
 
-- HTTP/SSE remains the default. WebSocket is an explicit provider transport setting,
-  selected by the configured API's implemented capabilities, never by a provider/model name.
+- Make `auto` the target default: prefer WS for an API with an implemented WS adapter,
+  otherwise use HTTP/SSE. Explicit `http` and required `websocket` remain overrides.
+  Change the shipped default only after section 9.10's correctness and cache-cost gates.
+  Selection uses API capability and observed outcomes, never a provider/model-name list.
 - Keep one foreground Responses connection per live chat session, one request at a time,
   driven on its creating thread. Reuse it for full-context requests. Local committed history
-  remains authoritative.
+  remains authoritative. Switching provider or model uses the new selection's transport, and
+  the switch is invisible to the conversation, the user and the model.
 - Do not implement incremental continuation, named lanes, connection-age timers, prewarming,
   a socket pool, compression, or background compaction over WebSocket in this phase.
 - Fix request retirement, event identity, setup evidence, and cancellation before extending
-  reuse. Keep conservative delivery accounting. Do not implement byte-accurate WebSocket
+  reuse. Apply conservative delivery accounting to both WS and HTTP. A transport switch is
+  another model send, not recovery of the old stream. Do not implement byte-accurate WebSocket
   write progress merely to recover a few more failed sends.
 - Remove arbitrary parsing and message-size refusal caps from the supported client paths.
   Keep actual wire bounds, cryptographic bounds, and checked machine representability.
@@ -67,7 +74,7 @@ Protocol sources for this design:
   5.1 through 5.5 for records and key usage, and 6 for alerts. Do not mechanically replace
   old RFC 8446 section numbers. Keep [RFC 8448](https://www.rfc-editor.org/rfc/rfc8448.html)
   as independent known-answer traces.
-- [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html), especially 5, 7.8, 8.6, 10.2.3,
+- [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html), especially 5, 7.8, 8.6, 9.2.2, 10.2.3,
   and 15.2.2; [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html), especially 2 through 7.
   [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986.html) defines URI components.
 - [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html), especially 3, 4.1, 4.3, 5,
@@ -405,9 +412,31 @@ link here so connection/recovery policy has one home.
 ### 9.1 Routing and wire request
 
 Keep `transport = "http" | "websocket" | "auto"` in provider configuration, presence-merged
-into the catalog. Absent means `http`. A selected API without a WS adapter uses HTTP under
-`auto` and fails local validation under required `websocket`. A Responses-compatible API name
-states which adapter to try, not proof that a particular endpoint supports Upgrade.
+into the catalog. The accepted target is absent means `auto`; the current code still defaults
+to `http`. Do not change that default until section 9.10's gates pass. Explicit `http` always
+uses HTTP/SSE without an Upgrade probe; explicit `websocket` requires WS and never falls back.
+`auto` tries WS first when the selected API implements it and this affinity has not fallen back.
+An API without a WS adapter uses HTTP directly in `auto` and fails local validation in required
+`websocket`. A Responses-compatible API name states which adapter to try, not proof that a
+particular endpoint accepts Upgrade. Successful Upgrade establishes protocol availability,
+not live cache neutrality.
+
+Transport mode belongs to a provider and is read again after every selection change. Switching
+to another provider uses that provider's configured mode; it never carries the previous
+provider's mode, fallback state or socket. Switching mid-session in either direction is a
+supported operation, specified in section 9.11.
+
+When implementing the default, resolve an absent setting to `.Auto` explicitly after source
+merging. Preserve `transport_present` and explicit `.HTTP`; do not reorder enum values to make
+zero initialization silently change existing callers. Update catalog/configuration tests and
+root selection together. Models.dev supplies no transport capability in the inspected study.
+Do not add a discovery request, provider-name allowlist or runtime cache benchmark.
+
+The preference is asymmetric. WS is the reusable fast path; HTTP is the compatibility path.
+Once a qualifying WS transport failure selects HTTP, keep HTTP for that live affinity. There
+is no periodic reprobe and no automatic HTTP-to-WS switch when an HTTP request fails. A new
+session or explicit configuration reset clears the preference; merely starting another turn
+or reconnecting does not. Background compaction stays HTTP regardless of this foreground policy.
 
 Resolve the Responses path once as section 7.3 specifies, map `https` to `wss` and `http` to
 `ws`, and preserve authority and query. Reuse API authentication and identity headers. No
@@ -429,11 +458,22 @@ flag. Do not introduce a session registry or move this state into durable `agent
 Open, use, abort and destroy on the thread that acquired the `nbio` loop. Reject concurrent
 use explicitly; no silent queue and no mutex on the connection.
 
-Before every connect/use compare the effective endpoint, API, model, credentials, handshake
-headers, trust configuration, and configured transport with the session's affinity. Compare
-actual values, not a secret digest written to logs. Retain an owned configuration snapshot where
-borrowed catalog storage cannot guarantee immutability/lifetime. Destroy the old connection
-before replacing borrowed storage. A change clears sticky fallback too. Trust-file replacement
+Before every connect/use compare the effective values with the session's affinity. Two groups
+matter, and conflating them either reconnects needlessly or reuses a socket that no longer
+belongs to the selection:
+
+- Socket and replay affinity: endpoint, API family, credential, identity/handshake headers,
+trust configuration and configured transport mode. A change to any of these destroys the
+socket, clears sticky fallback and clears the retained last-response identity.
+- Request identity: model, effort, instruction snapshot, tool inventory, checkpoint and
+capacity. These shape the request and the conversation's cache identity, so a change may
+cancel compaction and rebuild the projection, but it does not by itself require a new socket.
+The model travels in each request, not in the connection handshake.
+
+Compare actual values, not a secret digest written to logs. Retain an owned configuration
+snapshot where borrowed catalog storage cannot guarantee immutability/lifetime. A socket borrows
+its endpoint and credential strings from the runtime connection, so destroy the socket before
+releasing or replacing those strings. A change clears sticky fallback too. Trust-file replacement
 requires an explicit configuration reload/reset; do not add background filesystem watching.
 
 Bind the active interruption/deadline only for the operation. Clear it on every exit, including
@@ -502,14 +542,24 @@ Keep one default lane. Named-lane multiplexing exists in the documented OpenAI p
 Nabla has no concurrent foreground consumer. This scheduling decision is not a protocol limit.
 No prewarming, provider-side mid-turn steering, or speculative future lane abstraction.
 
-### 9.5 Delivery evidence
+### 9.5 Delivery evidence for both transports
 
-Keep the conservative policy instead of extending TLS/WS APIs for precise accepted-byte counts:
+Use the same non-replay rule for WS and HTTP/SSE. Add explicit delivery-evidence presence to
+`Provider_Operation_Error` and attempt facts. Zero/unset evidence means unknown, not not-sent.
+This matters because the current HTTP adapter leaves `delivery` at `.None`; that default is not
+proof that a POST never reached the provider. Successful operations still complete normally;
+evidence presence controls recovery after failure.
 
-- `None` means the model-message send was not entered. An HTTP Upgrade alone does not send
-  model input. Invalid local input/cancellation checked before write keeps this state.
-- `Model_Send_Started` means delivery is possible. Entering the frame writer is sufficient;
-  zero completed TLS plaintext bytes does not prove zero ciphertext reached the socket.
+Keep conservative accounting instead of extending TLS/WS APIs for precise accepted-byte counts:
+
+- Present `None` means the model-send path was not entered. An HTTP Upgrade alone does not
+  send model input. For HTTP POST, validation/DNS/connect/TLS failures before the request
+  writer is entered can establish this fact. Invalid input/cancellation checked before write
+  also keeps this state, though cancellation/local validation never authorize a retry.
+- `Model_Send_Started` means delivery is possible. Entering the WS frame writer or HTTP
+  model-request writer is sufficient. The HTTP writer currently writes headers and body in
+  one buffer; be conservative even if it may have failed in the headers. Zero completed TLS
+  plaintext bytes does not prove zero ciphertext reached the socket.
 - `Response_Observed` means a valid request-associated provider event was decoded.
 - `Terminal_Observed` means a valid associated provider terminal was decoded, not merely an
   error returned by our parser. It does not by itself mean retry is safe.
@@ -526,25 +576,36 @@ non-delivery over TLS. This work is explicitly deferred, not a prerequisite for 
 ### 9.6 Retry, setup, and fallback
 
 Only `agent` authorizes a further send. Cancellation, storage failure, trust/configuration
-failure, and visible output stop recovery. An uncertain model send stops with
-`Ambiguous_Delivery`, discards the socket, and does not switch to HTTP. A fresh user request
-may redial with full context; that is not automatic replay of the failed attempt.
+failure, and visible output stop recovery. For both transports, an uncertain model send stops
+with `Ambiguous_Delivery`, discards the connection, and cannot be retried by switching protocols.
+A fresh independently admitted request can use another transport. It is not automatic replay
+of the failed attempt. A WS transport failure can select HTTP for those future requests without
+authorizing a resend of the uncertain request.
+
+Neither SSE framing nor WebSocket defines resume for these model POST/create operations.
+Do not send Last-Event-ID, synthesize continuation prompts, or reuse response IDs as idempotency
+keys. RFC 9110 section 9.2.2 does not make a failed POST automatically safe to repeat. A future
+provider-documented resume/idempotency contract would be a separate adapter feature.
 
 | Evidence | Required action |
 |---|---|
 | Unsupported API in `auto` | HTTP directly |
 | Unsupported API in required WS | Local failure before network I/O |
 | Valid Upgrade refusal 404, 405, 426 or 501 in `auto`, without stronger auth/quota evidence | Permit HTTP fallback for this affinity; these statuses are an interoperability policy, not proof of a universal WS capability |
-| Transient DNS/connect/setup I/O failure in `auto` | Permit HTTP fallback within the existing attempt bound, after checking cancellation |
+| Transient DNS/connect/setup I/O failure before a WS model send in `auto` | Select sticky HTTP; permit the next attempt only through ordinary eligibility, backoff and remaining attempt accounting. Switching does not repair a shared network outage |
 | Required WS setup failure | Never fall back; apply ordinary eligible setup retry policy |
 | 401/403, trust error, malformed/invalid local URL/header, invalid 101 handshake | Stop; fallback must not hide these failures |
 | Upgrade 429/availability response | Preserve status, body classification and Retry-After; apply ordinary retry policy, not sticky unsupported-transport fallback |
-| Model send entered, no valid explicit rejection | Stop automatic replay, even if no visible output |
+| WS transport failure after send entry, without a valid explicit rejection | Stop this chain with unknown outcome; mark HTTP for future independently admitted requests in `auto`. Do not send the failed request again |
+| HTTP request failure after writer entry, without a valid explicit rejection | Stop this chain with unknown outcome; do not try WS or another HTTP POST |
+| HTTP failure known before writer entry | Retry HTTP with ordinary backoff when eligible; do not switch to WS |
+| Absent delivery evidence on a failed model operation | Treat delivery as unknown unless valid explicit rejection evidence independently establishes non-execution |
 | Recognized pre-execution rate-limit/unavailable rejection | Ordinary bounded retry if eligible and no output; a new WS connection, not transport fallback |
 | Recognized input-overflow rejection | Existing one-checkpoint repair within the same attempt bound |
 | Exact documented `websocket_connection_limit_reached` rejection for the sole pending request, before any response/output | Allow one reconnect/full-context resend within the same bound; abort old socket |
 | Unknown error, malformed error, response failure without non-execution evidence | Stop; neither status 5xx nor `Terminal_Observed` proves safe replay |
-| Successful completion followed by an idle disconnect | Keep committed result; next logical request opens another connection |
+| Successful completion followed by an observed clean idle Close | Keep committed result; open WS for the next request unless the affinity already uses HTTP |
+| Successful completion followed by an observed abnormal idle transport failure in `auto` | Keep committed result and select HTTP for subsequent requests; no replay is needed |
 
 The explicit-rejection exception is narrow. The adapter records evidence; the harness applies
 classification and policy. A 400 mentioning age in prose, EOF, Close code, or a late event from
@@ -554,13 +615,30 @@ an older response is not the documented lifetime rejection. Do not add provider 
 Move `auto` preflight into the same bounded attempt execution instead of leaving it outside
 recovery. Each transport attempt, including failed setup, consumes one attempt slot; each actual
 model send has its own request row begun before sending. A setup-only row records no model send,
-not a fabricated response or billable operation. Falling back starts the next attempt with the
-same frozen projection and the HTTP envelope. Keep the existing maximum-attempt policy and no
-additional hidden loop. A failed setup cannot multiply model sends or bypass Retry-After.
+not a fabricated response or billable operation. A fallback attempt over the other transport is
+authorized only when evidence says that no model message was sent for the failed attempt. It
+reuses the same frozen projection with the other envelope. Completed setup, an ambiguous send,
+or any model-send evidence authorizes no second attempt of that request; transport selection
+still changes for future independently admitted requests. Keep the existing maximum-attempt
+policy and no additional hidden loop. A failed setup cannot multiply model sends or bypass
+Retry-After.
 
-Sticky HTTP fallback lasts only for the live affinity and resets on explicit session/configuration
-replacement. Record setup outcome and fallback reason without credentials. Selection, delivery,
-rejection evidence and retry decisions must be available with diagnostics disabled.
+Sticky HTTP selection is a transport decision, separate from permission to replay. Set it on
+an eligible unsupported-Upgrade/setup transport failure or an abnormal WS transport break, even
+when delivery ambiguity prevents recovery of that particular request. Do not set it for user
+cancellation, local/storage failure, malformed provider output, authentication, rate limiting,
+quota, ordinary provider rejection, or the documented connection-lifetime rejection. Those
+are not evidence that HTTP will work better. A clean close observed between requests requires
+only a new connection. With lazy reads, a queued idle Close may be discovered after a new send;
+in that case delivery remains ambiguous and the failed chain stops.
+
+Keep this as the existing per-affinity fallback state plus a typed reason, not transport health
+scores, a circuit-breaker service, failure-count thresholds or wall-clock expiry. It lasts only
+for the live affinity, resets on explicit session/configuration replacement, and is not persisted
+as a provider blacklist. If HTTP also fails, follow its eligible same-transport retry policy;
+never bounce back to WS in this affinity. Required modes never switch in either direction.
+Record setup outcome, selection changes and fallback reason without credentials. Selection,
+delivery, rejection evidence and retry decisions must be available with diagnostics disabled.
 
 ### 9.7 Lifetime, control frames, and teardown
 
@@ -607,25 +685,188 @@ and at terminal delivery; no replay after partial write/EOF; failure invalidatio
 rejection retry; and request rows/observations with diagnostics disabled. Pair this with the `wss`
 seam in section 8. Tests need not assert every enum/table entry to establish those behaviors.
 
-### 9.9 Provider reference and compatibility evidence
+### 9.9 Reference harnesses and the transport preference
+
+Source snapshot from the local `websocket-sse-study.md`, sections 2 through 6. It records
+implementation choices, not latency, cache or packet-loss measurements.
+
+| Harness | Text-inference selection | Recovery |
+|---|---|---|
+| Goose | HTTP/SSE; WS only for Live voice | Not evidence for inference fallback |
+| MiniMax-Code | HTTP/SSE for inference; WS for channels/browser control | Channel reconnection is not model replay |
+| OpenCode | Omitted setting is HTTP; Responses WS needs endpoint support plus a per-session executor | Setup or proven not-sent selects sticky HTTP; ambiguous delivery is an error |
+| Codex | WS when the provider enables it and session fallback has not disabled it | 426-to-HTTP and post-retry fallback, both session-sticky |
+| Pi | `openai-codex-responses` defaults to `auto` and tries WS first, with cached continuation | Pre-start failures select sticky SSE; post-start failures throw |
+
+The study's section 8 summaries ("SSE everywhere", "post-start failures are errors") contradict
+its own Pi and Codex sections. Use the per-harness observations above, not those sentences.
+
+Decision: in `auto`, try WS first for an API with an adapter, reuse it while it works, and keep
+HTTP for that affinity after a qualifying transport failure (section 9.6). Do not probe again
+per turn. Required modes never switch.
+
+Why this order:
+
+- Reuse removes repeated TCP/TLS setup, HTTP heads and Upgrade per model request. Our HTTP client
+  sends `Connection: close` and does a fresh exchange per operation, so the benefit is real here.
+  It is not inherent to SSE: HTTP/1.1 keep-alive or HTTP/2 would change the comparison, and neither
+  transport makes inference itself faster. Our full-context mode does not get Pi/Codex-style
+  continuation savings; never quote their numbers.
+- Both transports are reliable ordered streams over the same TCP/TLS path, and neither resumes an
+  interrupted model operation. Packet loss and latency behave the same. SSE is the broader
+  compatibility path, not a more robust protocol for recovery.
+- A reused socket can go stale across long idle or tool gaps, since this design has no idle read
+  pump. That is the cost of reuse and the reason a qualifying failure falls back to HTTP.
+- Never switch transport as a recovery attempt. Same path, and after a POST is entered it can
+  duplicate paid inference. A future concrete HTTP-only intermediary fault is a new decision.
+
+Source anchors: OpenCode `packages/core/src/session/model-transport.ts` and `model-request.ts`,
+Codex `codex-rs/core/src/client.rs` and `core/tests/suite/websocket_fallback.rs`, Pi
+`packages/ai/src/api/openai-codex-responses.ts`. Their thresholds, headers and retry counts are
+not Nabla contracts. Do not adopt a retry rule keyed only on whether streaming visibly started:
+delivery can be ambiguous before the first event.
+
+#### Provider contract evidence
 
 The [OpenAI WebSocket guide](https://developers.openai.com/api/docs/guides/websocket-mode)
 and [WebSocket event reference](https://developers.openai.com/api/reference/resources/responses/websocket-events)
-are API contracts, separate from RFC 6455. The guide confirms `response.create`, omitted
-HTTP-only fields, default/named lanes, full-context restart without `previous_response_id`,
-nested error envelopes and a provider-specific connection lifetime. Those facts do not establish
-support at OpenRouter, OpenCode Go, Azure, Anthropic, or any arbitrary compatible gateway.
+confirm `response.create`, the omitted HTTP-only fields, default/named lanes, full-context restart
+without `previous_response_id`, nested error envelopes and a provider-specific connection lifetime.
+They establish nothing for OpenRouter, OpenCode Go, Azure, Anthropic or an arbitrary gateway.
+Optional live acceptance identifies the configured API/endpoint and shows two dependent requests
+on one connection; it never replaces local tests.
 
-The prior implementation report and external reference study are historical evidence, not
-normative dependencies of this plan. Do not copy their queues, timer values, retry counts,
-subscription headers or provider lists. Optional live acceptance must identify the configured
-API/endpoint and show two dependent requests on one connection; it cannot replace local tests.
+### 9.10 Rollout and recovery acceptance
+
+The target default is decided: `auto`, WS-first for supported APIs. Do not flip the current
+omitted-setting behavior as an isolated config patch. Land these prerequisites first:
+
+1. Finish section 7's protocol/lifetime corrections and committed `wss`/provider operation
+   gates. In particular, validate failed-socket retirement and control-pointer lifetime.
+2. Extend HTTP delivery evidence and conservative recovery with WS in one migration. Add a
+   monotonic `request_write_started` fact to HTTP transfer reporting, set immediately before
+   invoking the request writer. Map it into `ai` model-delivery evidence for inference POSTs,
+   not Upgrade GETs. Collect it even without logging. Missing evidence remains unknown;
+   plaintext accepted-byte counts alone cannot establish non-delivery through TLS.
+3. Put setup and fallback under one bounded attempt runner. Unsupported Upgrade may select
+   HTTP immediately within the remaining attempt count; a transient network failure observes
+   ordinary backoff. Auth/quota/trust/cancellation never authorize alternate-transport sends.
+4. Run fault-injection cases for both transports: before writer entry, partial write including
+   TLS partial-record failure, after send before first event, after visible output, and after
+   a valid terminal. Assert actual peer-received model-send counts and durable attempt rows,
+   not just the chosen enum. A disconnected post-send operation must not create a second
+   request on the other transport. Use local peers, not flaky public networks.
+5. Cover `auto` WS success/reuse, unsupported Upgrade then HTTP, WS ambiguous failure then
+   HTTP only on a new independent request, HTTP failure with no WS bounce, explicit required
+   modes, affinity reset and APIs without WS. Test long tool/idle boundaries so stale-socket
+   limitations remain visible. Never add a production deadline merely to make tests finish.
+6. Pass section 10's accounting/parity and operator-run matched cache/cost comparison for the
+   deployments on which the default change is accepted. Also measure time to first event,
+   total equivalent-workload time, connection count and completion rate under controlled
+   disconnects. No rollout accepts a sustained unexplained cache/cost regression in return
+   for a latency improvement. Keep `transport = "http"` for affected endpoints; do not encode
+   a provider-name exception table or diagnose cache quality through paid runtime probes.
+7. Change omitted configuration to `auto`, with explicit overrides preserved, and publish
+   the default change and unknown-delivery behavior. This documentation revision does not
+   claim that migration, live cache acceptance or unstable-network testing has happened.
+
+### 9.11 Provider and model switches across transports
+
+Selection changes happen inside one conversation (quota, outage, user choice). Both directions
+between WS-capable and HTTP-only providers must work, and the switch must be invisible outside
+diagnostics.
+
+#### Transparency contract
+
+- Transport is not session identity. A switch never starts a new session, rewrites durable
+  history, changes the transcript or rotates the session/cache identity.
+- No transport detail reaches the model or the user. Nothing is appended to the conversation
+  about how a request travels, and no rendering, retry wording or completion semantics depend on
+  it. Observable turn behavior is identical: same streamed events, tool handling, cancellation
+  and terminal results.
+- The front-end shows the selected provider and model because the user chose them. Diagnostics
+  and `/status` may record the selected transport and any fallback for operators. Nothing else
+  discloses it.
+
+| From | To | Required behavior |
+|---|---|---|
+| WS-capable provider | Provider or API without a WS adapter | Destroy the socket, then use HTTP/SSE; no WS probe, no failure, no notice |
+| WS-capable provider | Required-WS provider | Destroy the socket, then require WS; refuse the selection if the new API has no adapter |
+| Provider without a WS adapter | WS-capable provider in `auto` | Attempt WS at the first request of the new affinity |
+| WS-capable provider | Another WS-capable provider | Destroy the socket and open the new endpoint's own connection |
+| Same provider, different model | Same API and endpoint | Keep the socket; the model is a request field, not socket affinity |
+
+#### The upgrade decision
+
+A switch to a WS-capable provider or API attempts WS again, even if the previous provider had
+selected HTTP. Sticky HTTP records one observed relationship between one endpoint, credential and
+transport mode; it is not a property of a provider name, API family, model or network. A new
+affinity has no such evidence, so the default preference applies. Switching back to a provider
+that previously fell back does the same: one failed Upgrade is the whole cost, which is the
+deliberate consequence of keeping no persisted provider blacklist.
+
+A switch never authorizes a second send. An ambiguous model send in the previous affinity stays
+stopped under section 9.6; it is not replayed against the new provider.
+
+#### Where the switch happens
+
+The boundary is any request boundary, including one inside a running turn: a tool-loop
+iteration, a steer drain, or the gap between turns. A change made while a response streams or
+while tools run installs before the next request of that same turn. The owning worker is the
+only writer, so the install is serialized by construction. The pending-intent mechanism and the
+boundary hook are specified in the harness document, section 9.1.
+
+Never mutate an in-flight request, its frozen bytes, its control binding, its projection or an
+attempt chain. A pending change ends the current request chain at its next decision point
+(retry document, section 4) and is applied before the following request is built.
+
+The switch performs, in this order:
+
+1. Resolve the new provider, model, credential and transport mode, and validate them. A required
+   transport the new API cannot carry, or an unusable provider, is refused at the boundary with
+   a turn-visible reason; the previous configuration stays in effect.
+2. Cancel and retire the compaction chain, which belongs to the previous configuration.
+3. Abort and destroy the previous socket when socket affinity changed, before the credential or
+   connection value it borrows is replaced. Clear fallback state, the retained last-response
+   identity and active probe bindings.
+4. Publish the new connection and model identity. The next request opens or reuses a socket for
+   the new affinity.
+
+Background compaction stays an independent HTTP operation across the switch; it is cancelled
+because its summary belongs to the previous model's configuration, not because a transport
+changed.
+
+#### Request identity across a switch
+
+Build every request from the same committed projection with the same instruction snapshot, tool
+inventory, session id and cache key. A switch changes only what genuinely differs for the new
+model or API: per-model capacity, tools when the new model disables them, and provider-specific
+replay items under the existing cross-provider rule. Never reload instructions, rotate the cache
+key or start a new conversation to mark it. Cache consequences, including the expected cold
+cache for a new provider, are in section 10.6.
+
+#### Diagnostics and acceptance
+
+Record a selection or transport-change event carrying the old and new mode, the changed affinity
+facts, the reason (user selection, quota, availability), and whether the socket was reused,
+recreated, or abandoned. Keep credentials and prompt content out of it. The event must be
+available with payload capture disabled.
+
+Test the round trip as a first-class scenario, using local peers or scripted provider responses:
+WS provider to non-WS provider and back, with a quota or availability failure as the trigger; a
+model switch within one provider that keeps the socket; a change applied mid-turn between two
+requests of the same tool loop; and a switch while a compaction chain is running. Assert that the
+conversation id, durable history, transcript and cache key are unchanged, that no transport detail
+appears in the conversation or rendered output, that no request is replayed after an ambiguous
+send, that fallback state does not leak across affinities, and that no socket is leaked,
+double-aborted or destroyed after the strings it borrows.
 
 ## 10. Prompt-cache preservation and the reported regression
 
 Prompt-cache reuse is a cost requirement for every transport. Do not trade it for lower
-connection latency without explicit measured justification. HTTP remains the default while
-the reported drop from roughly 98% or 99% to 80% is unresolved. The target is no avoidable
+connection latency without explicit measured justification. HTTP remains the shipped default
+until the `auto` rollout gates pass, and remains the explicit override for an endpoint with a
+cache/cost regression. The reported drop from roughly 98% or 99% to 80% is unresolved. The target is no avoidable
 loss of reusable prefix or cached-input savings for the same workload, not a guaranteed
 percentage that the provider and workload cannot promise.
 
@@ -805,8 +1046,42 @@ The current local test suite does not establish live cache neutrality. Required 
 remains explicit and never silently downgrades; a low hit-rate sample is not a runtime retry or
 fallback signal. Do not send duplicate paid requests or flap transports to optimize a dashboard.
 
+Add to gate 3 the dynamic cases: a model change, an effort change and a transport change each
+applied mid-turn between two requests of one tool loop must append only the documented items,
+leave the earlier normalized prefix byte-identical, and keep the session cache key unchanged.
+
+### 10.6 Model and effort changes
+
+A model, provider or effort change must not rewrite the cached prefix. Keep the same session id
+and `prompt_cache_key`, instruction snapshot and committed history bytes. Drop provider-specific
+replay items only under the existing cross-provider rule, and omit tools only when the new model
+disables them. Never insert a marker, note or status message into the conversation to record the
+change; that is model-visible content the provider cannot cache with the prefix.
+
+Effort is the case where the prefix can be preserved. OpenAI documents changing reasoning effort
+mid-conversation by appending a `configuration_update` input item and leaving top-level
+`reasoning.effort` at the value that established the prefix, because changing that field can
+rewrite hidden system instructions. Implement that where the API adapter and configuration
+establish the capability, never by model-name check:
+
+- Set top-level `reasoning.effort` from the effort in force when the conversation's prefix is
+  first established, and keep it there for that conversation.
+- Each distinct effort change appends one `configuration_update` item at the boundary where it
+  happened, once, never once per request.
+- The item is durable append-only state, projected at its position like a dispatch or checkpoint
+  entry, so every later request reproduces the same prefix.
+- Where the capability is not established, change the top-level field and record an intentional
+  prefix change. Do not claim preservation that did not happen.
+
+Cross-model cache sharing is not documented for any provider consulted here, and weights differ
+between models. Do not invent a mechanism, assume a shared entry, or rotate identity to imitate
+one. Send the same prefix under the same key and measure. A cold cache after a model change is
+expected provider behavior, not a transport or harness defect, and must not be reported as one.
+Keep model and effort breakdowns visible in the section 10.3 accounting so a real regression
+stays visible behind the expected cold start.
+
 Provider references: [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching)
 describes exact rendered-prefix matching, routing/retention, usage and model-dependent cache
-controls. Its WS guide distinguishes connection-local continuation from full-context restart.
-Do not transplant OpenAI cache parameters, thresholds, or pricing into another API's adapter.
+controls. Do not transplant OpenAI cache parameters, thresholds, or pricing into another API's
+adapter.
 

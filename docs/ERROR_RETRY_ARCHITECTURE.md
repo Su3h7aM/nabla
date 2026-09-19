@@ -27,8 +27,14 @@ exhaustion into a wait for summarization.
 There are three possible decisions after a failed provider attempt:
 
 - Stop this turn. The session remains available for another prompt.
-- Retry the same frozen request after a bounded, cancellable delay.
+- Retry the same frozen request after a bounded, cancellable delay, when delivery is not
+  ambiguous.
 - Install an already-ready checkpoint, rebuild the request, and try the changed context once.
+
+Transport selection is a separate decision from replay. An eligible transport failure may select
+the other transport for later independently admitted requests without authorizing another send
+of this request. A retry is authorized only when evidence says the model message was not sent
+or the provider's own refusal proves it did not execute. Absence of output is not that evidence.
 
 These are an enum and a few procedures in `agent`, not a plugin protocol or a retry service.
 `ai` classifies provider facts. `http/client` reports HTTP and transport facts. Only `agent`
@@ -55,9 +61,11 @@ summarizer still cannot guarantee indefinite execution.
 1. One provider operation performs at most one model send. Setup may fail before it sends.
    There is no retry loop in `ai`, `sse`, or HTTP.
 2. A transient retry uses the same endpoint, credentials, model, instructions, tools, effort,
-   cache key, and encoded body. A repair is a different request, not a hidden mutation.
+   cache key, and encoded body. A repair is a different request, not a hidden mutation. Changing
+   transport is a new send, so it obeys the same rule.
 3. No retry after user-visible text or an accepted completion. No tool from an unsuccessful
-   attempt executes. Bytes accepted by a socket do not prove provider execution did not occur.
+   attempt executes. Bytes accepted by a socket do not prove provider execution did not occur,
+   and neither transport proves a failed model POST was not executed.
 4. Cancellation and storage failure defeat every recovery decision, including one already
    scheduled. No recovery or turn deadline is introduced.
 5. Each actual send has its own durable request row, recorded before sending. Failed attempts
@@ -218,8 +226,9 @@ The pure decision and delay procedures are in `agent/retry.odin`; request execut
 - `Request_Recovery_Action`: `Stop`, `Retry`, `Repair_Context`.
 - `Request_Recovery_Reason`: named reasons for a completed send, a failure the harness caused,
   a store that refused a write, cancellation, output exposure, context exhaustion, a terminal
-  class, an exhausted attempt bound, a provider delay that is too long to wait, and a transient
-  failure that is retried. Never a boolean with an unexplained false result.
+  class, an exhausted attempt bound, a provider delay that is too long to wait, a transient
+  failure that is retried, and a configuration change that arrived mid-chain. Never a boolean
+  with an unexplained false result.
 - `Chat_Recovery_Decision`: action, reason, and `time.Duration` delay.
 - `Chat_Attempt_Facts`: the sends made so far, the operation's own error, whether the harness
   failed the send itself, whether the store failed, what the attempt exposed to a reader,
@@ -252,15 +261,21 @@ After the synchronous send returns and provisional output is settled:
    reason.
 2. Successful complete operation and accepted completion: commit normally.
 3. Published text or accepted completion: stop on failure. Preserve text as partial.
-4. Uncertain WebSocket model delivery: stop. The planned narrow exception is a recognized
-   pre-execution rejection, as specified in network section 9.6. A terminal event alone does
-   not establish non-execution.
+4. Uncertain WebSocket or HTTP model delivery: stop. Protocol fallback never repairs it. A
+   recognized pre-execution rejection is the narrow exception, as specified in network
+   section 9.6. A terminal event alone does not establish non-execution.
 5. Confirmed input overflow with safe rejection evidence: use §7, never ordinary backoff.
 6. Terminal class or `Forbid`: stop.
 7. Retry transient connection/I/O failure, incomplete stream, rate limiting, or provider
    unavailability if delivery policy allows it, another attempt remains and the provider is not
-   asking for a longer wait than the policy allows.
+   asking for a longer wait than the policy allows. A transport change is never itself the
+   retry reason.
 8. Otherwise stop. Unknown provider failure, malformed output, and a local expiry are terminal.
+
+A pending model, provider or effort change is checked at the same points and stops the chain with
+`Configuration_Changed`: the next request is built under the new configuration instead of
+retrying or waiting out a backoff for a configuration the user has left. The change never alters
+frozen bytes, so an attempt that already ran keeps its own evidence.
 
 Do not make delivered body bytes the exposure test. A usage update, keepalive, or ignored
 reasoning event is not visible output. Track `text_exposed` and `completion_accepted` explicitly
@@ -270,10 +285,11 @@ path. For a WS operation, the request ends at its valid provider terminal messag
 socket EOF, so a persistent connection remains usable for subsequent requests.
 The transport-specific completion boundary and delivery-aware recovery rules are specified
 in [Network stack architecture, section 9](NETWORK_STACK_ARCHITECTURE.md#9-provider-websocket-integration)
-and partly implemented: the chain already stops on all nonzero WS delivery states, even before
-text is exposed. The accepted design adds narrow explicit-rejection evidence, complete Upgrade
-refusal facts and setup attempts within the existing attempt bound. These remain implementation
-work. Every fallback or resend belongs to `agent`; no retry loop lives inside `ai`.
+and partly implemented: the chain stops on every nonzero WS delivery state, even before text is
+exposed. The accepted design adds the same requirement to HTTP, narrow explicit-rejection
+evidence, complete Upgrade refusal facts and setup attempts within the existing attempt bound.
+These remain implementation work. Every fallback or resend belongs to `agent`; no retry loop
+lives inside `ai`.
 A successful HTTP exchange with an unusable completion is not retried by the transport policy.
 
 The policy deliberately does not copy opencode's synthetic continuation prompt. Nabla excludes
@@ -591,6 +607,13 @@ its stop path promises.
 Do not impose a cross-turn identical-payload circuit breaker. A user may have repaired credentials
 without changing history, and an endpoint may recover. The bounds apply to automatic recovery
 inside a turn and background compaction chains; a new explicit prompt always gets a fresh decision.
+
+The same rule applies when the user changes model or provider. That is a new configuration, so it
+gets a fresh recovery budget and fresh transport selection rather than inheriting the previous
+configuration's exhausted attempts, suppression or sticky fallback. It is not a way to replay the
+failed request: the previous chain's ambiguous delivery stays stopped, and the switch is admitted
+only at a request boundary. The provider/model switch contract is in
+[Network stack architecture, section 9.11](NETWORK_STACK_ARCHITECTURE.md#911-provider-and-model-switches-across-transports).
 
 ## 11. Odin implementation rules
 

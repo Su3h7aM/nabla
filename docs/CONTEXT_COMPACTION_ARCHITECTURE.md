@@ -277,6 +277,12 @@ prefix; placing the same text after `I` instead is a different sequence. So:
 Cache hits are provider observations, never promises: TTL, eviction, and routing can all miss. No
 prewarm request is issued, and no cache breakpoint beyond the provider's automatic one is placed.
 
+Changing model or provider starts a cold cache for the new provider even though the conversation,
+instructions, tools and cache key are unchanged. That is a property of changing providers, not of
+changing transport, and it is not a reason to rotate the cache identity or rewrite the prefix. The
+switch contract, including the shared cache key across a transport change, is in
+[Network stack architecture, section 9.11](NETWORK_STACK_ARCHITECTURE.md#911-provider-and-model-switches-across-transports).
+
 ### 7.2 Directive and checkpoint text
 
 `CHAT_COMPACT_DIRECTIVE` is appended after the prefix. It asks for fixed headings, requires
@@ -330,7 +336,7 @@ Recovery follows from append-only history:
 | Summary does not free enough | Reported, no checkpoint written, no cache break |
 | Context too large to summarize at all | Reported before the request is recorded |
 | Durable write failure | The existing `storage_failed` latch stops the session |
-| Model or session change | `chat_compact_cancel`; `session_activate` destroys the chat and its job |
+| Model, provider or session change | `chat_compact_cancel`; the new configuration may start its own chain. The installed checkpoint is conversation state and survives the switch; an effort change does not cancel a chain |
 | Explicit turn cancellation | Compaction keeps running: it belongs to the session, not the turn |
 | Admission fails with nothing ready | The turn fails with an explicit message |
 

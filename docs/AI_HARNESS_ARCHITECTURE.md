@@ -313,7 +313,27 @@ Committed history remains authoritative across reconnect, compaction and process
 Incremental continuation and multiplexing are not part of this implementation phase.
 Background compaction keeps an independent HTTP operation. Transport selection is an explicit
 provider setting applied after per-model API routing, not a Models.dev capability or a
-model-name heuristic. HTTP/SSE remains the default.
+model-name heuristic. The accepted target default is `auto`: prefer WebSocket for an API whose
+adapter implements it, otherwise HTTP/SSE, with sticky HTTP after a qualifying WebSocket
+transport failure. The shipped default remains HTTP/SSE until the rollout gates pass.
+
+Two properties of that selection matter for this harness. A transport change is not recovery:
+it never authorizes replaying a request whose model send may have reached the provider, and the
+same conservative delivery rule now applies to HTTP as well as WebSocket. And a transport change
+is not a cache or stability guarantee; neither protocol resumes an interrupted model operation,
+and packet loss on the shared TCP/TLS path is handled the same way by both.
+
+Switching provider or model inside one session is a supported, transparent operation in both
+directions, and its contract is in
+[Network stack architecture, section 9.11](NETWORK_STACK_ARCHITECTURE.md#911-provider-and-model-switches-across-transports).
+Transport is not part of session identity: a switch keeps the same conversation id, durable
+history, transcript, instruction snapshot and cache key, and it never appears in the
+conversation, the rendered output or the model's view. A switch applies between requests on the
+owning thread, so it never mutates an in-flight request. The new selection's transport mode
+governs the next request, and a switch to a WS-capable selection may attempt WebSocket again
+because sticky HTTP belongs to one affinity rather than to a provider name. A switch is also not
+a recovery mechanism: an ambiguous send in the previous affinity stays stopped and is not
+replayed against the new provider.
 
 Prompt-cache preservation is a cost requirement. Transport changes must preserve the common
 request, stable session cache key, instruction snapshot, ordered tools and normalized history.
@@ -368,6 +388,39 @@ Rules:
   the only session writer.
 
 ---
+
+### 9.1 Configuration changes at request boundaries
+
+A change to model, provider or effort takes effect at the next request boundary. Not the next
+turn, and not the next prompt: inside a turn every tool-loop iteration is a boundary, so a change
+made while a response streams or tools run applies to the next request of that same turn. The
+current behavior, where a queued selection waits for the turn to end, is a defect.
+
+Mechanism, kept as data plus one owner:
+
+- The front-end records the requested selection as one pending intent (provider, model, effort)
+in run state under the existing runtime lock. It does not apply it itself and does not touch the
+session.
+- `apply_selection` stays the only writer of the resolved selection. The idle worker path and the
+turn boundary path both consume the intent; whichever arrives first applies it once.
+- `Steer_Context` carries a boundary hook. `chat_run_turn_steered` calls it where it already
+drains steering, before `chat_prepare`, and uses the connection it returns for the next request.
+Catalog lookup, credential resolution and persistence stay in the root package; `agent` only
+asks, exactly as with the steering queue and the observer.
+- A pending intent is never lost. If the turn is cancelled or fails, the idle path applies it
+before the next prompt.
+
+Constraints:
+
+- Never apply a change to an in-flight request, its frozen bytes or an attempt chain. A pending
+change ends that chain at its next decision point (retry document, section 4).
+- Effort already lands at a boundary through the steering path; keep that behavior and route both
+kinds of change through the same hook so they cannot diverge.
+- The switch is transparent: same session, durable history, transcript and cache key, no
+conversation entry about it, no rendering difference. Transport and cache consequences are in the
+network document, sections 9.11 and 10.6.
+- Cancelling or failing to apply a change leaves the previous configuration usable and says why;
+an unusable new selection never leaves the session without a working model.
 
 ## 10. Compaction and context budget
 
