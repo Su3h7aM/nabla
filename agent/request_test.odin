@@ -209,14 +209,15 @@ test_build_request_replays_verbatim_response_output_in_order :: proc(t: ^testing
 	role := item_string(first, "role")
 	testing.expect_value(t, role, "user")
 
-	// The verbatim items keep their native shape and their position.
+	// The verbatim items keep their native shape and their position, minus the
+	// output-only fields the input schema refuses.
 	second := item_object(t, input, 1)
 	item_type := item_string(second, "type")
 	testing.expect_value(t, item_type, "message")
 	role = item_string(second, "role")
 	testing.expect_value(t, role, "assistant")
-	status := item_string(second, "status")
-	testing.expect_value(t, status, "completed")
+	_, status_present := second["status"]
+	testing.expect(t, !status_present)
 
 	third, third_ok := input[2].(json.Object)
 	if !testing.expect(t, third_ok) { return }

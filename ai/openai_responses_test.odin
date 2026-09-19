@@ -105,6 +105,33 @@ test_responses_encode_matches_spec :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_responses_encode_removes_output_status_from_replay :: proc(t: ^testing.T) {
+	messages := []Provider_Message {
+		{Verbatim_Items = `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[]}]`},
+		{Role = .User, Content = "Continue."},
+	}
+	request := Provider_Request {
+		API              = .OpenAI_Responses,
+		Model_Present    = true,
+		Model            = "gpt-5.6",
+		Messages_Present = true,
+		Messages         = messages,
+	}
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	testing.expect_value(t, err, Provider_Request_Error.None)
+	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
+	testing.expect_value(t, parse_err, nil)
+	defer json.destroy_value(value, context.temp_allocator)
+	object := value.(json.Object)
+	input := object["input"].(json.Array)
+	replayed := input[0].(json.Object)
+	_, status_present := replayed["status"]
+	testing.expect(t, !status_present)
+	id, id_present, id_ok := openai_value_string(replayed, "id")
+	testing.expect(t, id_ok && id_present && id == "msg_1")
+}
+
+@(test)
 test_responses_validate_rejects_reasoning_without_id :: proc(t: ^testing.T) {
 	messages := make([]Provider_Message, 1, context.temp_allocator)
 	messages[0] = Provider_Message {

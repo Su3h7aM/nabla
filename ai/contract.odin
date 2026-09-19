@@ -58,12 +58,11 @@ Provider_Message :: struct {
 	Reasoning_ID:        string, // borrowed; set on .Reasoning, the output-item id,
 	Reasoning_Encrypted: string, // borrowed; set on .Reasoning when the endpoint supplied it,
 	Cache_Breakpoint:    bool, // when true, emit prompt_cache_breakpoint explicit on this message,
-	// Verbatim_Items is a JSON array of Responses input items reproduced exactly
-	// as the endpoint produced them, emitted at this message's position. It is
-	// the replay slot: fields the harness does not model, such as assistant
-	// phase, message status, reasoning summaries, and annotations, survive
-	// because nothing here is re-derived. When set, the other fields are ignored
-	// and the Responses encoder splices the array in place. Only the Responses
+	// Verbatim_Items is a JSON array of Responses output items preserved at this
+	// message's position. It is the replay slot: fields the harness does not
+	// model, such as assistant phase, reasoning summaries, and annotations,
+	// survive because nothing here is re-derived. The Responses encoder removes
+	// output-only fields before splicing the array in place. Only the Responses
 	// API accepts it; the harness sets it only for that API.
 	Verbatim_Items:      string, // borrowed until operation retirement,
 }
@@ -245,8 +244,9 @@ Provider_Completed_Event :: struct {
 	// Raw_Output holds the terminal response's output array verbatim, exactly
 	// as the endpoint sent it. Empty when the terminal event carried no
 	// output array. The agent replays this verbatim for its next request, so
-	// fields the stream decoder does not model -- assistant phase, message
-	// status, reasoning summaries, annotations -- still round-trip. This is
+	// the fields the stream decoder does not model -- assistant phase,
+	// reasoning summaries, annotations -- still round-trip; the Responses
+	// encoder drops the output-only fields the input schema refuses. This is
 	// the lossless-replay record; Tool_Calls stays the execution view.
 	Raw_Output:  string, // owned by receiver,
 } // Tool_Calls and Raw_Output owned by receiver

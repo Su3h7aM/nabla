@@ -19,8 +19,7 @@ openai_responses_encode_request :: proc(request: Provider_Request, allocator := 
 		// A verbatim message carries the endpoint's own items. They are emitted
 		// here, where they sit among the projected messages, so the request keeps
 		// the conversation's real order. Re-deriving them would lose phase,
-		// status, annotations, and summaries, and would send assistant content
-		// twice.
+		// annotations, and summaries, and would send assistant content twice.
 		if message.Verbatim_Items != "" {
 			items, parse_err := json.parse_string(message.Verbatim_Items, .JSON, true, allocator)
 			if parse_err != nil { return "", .Invalid_Message }
@@ -29,7 +28,21 @@ openai_responses_encode_request :: proc(request: Provider_Request, allocator := 
 				json.destroy_value(items, allocator)
 				return "", .Invalid_Message
 			}
-			for item in array { append(&input, json.Value(json.clone_value(item, allocator))) }
+			for item in array {
+				// An output item carries a terminal status; the input-item schema
+				// has no such field, and an endpoint refuses a field it does not
+				// know. Everything else survives, so the record stays replayable.
+				if replayed, is_object := item.(json.Object); is_object {
+					clone := make(json.Object, len(replayed), allocator)
+					for key, value in replayed {
+						if key == "status" { continue }
+						clone[strings.clone(key, allocator)] = json.Value(json.clone_value(value, allocator))
+					}
+					append(&input, json.Value(clone))
+				} else {
+					append(&input, json.Value(json.clone_value(item, allocator)))
+				}
+			}
 			json.destroy_value(items, allocator)
 			continue
 		}

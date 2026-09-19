@@ -280,9 +280,9 @@ Reasoning_Entry :: struct {
 // Response_Entry is one completed Responses output, stored verbatim: the
 // terminal output array exactly as the endpoint sent it. Display text and
 // executable calls are projections recorded as their own entries; this entry
-// is the replay record, so assistant phase, message status, reasoning
-// summaries, annotations, and unknown item types survive without the stream
-// decoder modeling them. Only the Responses API writes this entry; Chat
+// is the replay record, so the fields the stream decoder does not model --
+// assistant phase, reasoning summaries, annotations -- and any item type it
+// does not know survive. Only the Responses API writes this entry; Chat
 // Completions has no replayable output items to preserve.
 Response_Entry :: struct {
 	output: string,
