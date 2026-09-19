@@ -511,9 +511,14 @@ read_record :: proc(conn: ^Conn) -> (content: []u8, record_type: Record_Type, er
 		if fill_err := recv_fill(conn, RECORD_HEADER_SIZE + length); fill_err != .None { return nil, {}, fill_err }
 
 		record := conn.recv[:RECORD_HEADER_SIZE + length]
-		// A compatibility-mode peer sends one, and a receiver drops it without
-		// further processing (RFC 8446 section 5).
-		if outer_type == .Change_Cipher_Spec { continue }
+		// Compatibility mode permits only the one-byte change_cipher_spec
+		// message. Any other record with that type is malformed.
+		if outer_type == .Change_Cipher_Spec {
+			if length != 1 || record[RECORD_HEADER_SIZE] != CHANGE_CIPHER_SPEC {
+				return nil, {}, fail(conn, .Unexpected_Message, .Record)
+			}
+			continue
+		}
 
 		payload: []u8
 		content_type: Record_Type
@@ -533,9 +538,7 @@ read_record :: proc(conn: ^Conn) -> (content: []u8, record_type: Record_Type, er
 			payload, content_type = decoded_payload, plain_type
 		}
 
-		#partial switch content_type {
-		case .Change_Cipher_Spec:
-			continue
+		switch content_type {
 		case .Handshake:
 			// Handshake bytes belong to the handshake stream, and the caller has
 			// them to parse now rather than after the next record.
@@ -543,6 +546,10 @@ read_record :: proc(conn: ^Conn) -> (content: []u8, record_type: Record_Type, er
 			return nil, .Handshake, .None
 		case .Alert, .Application_Data:
 			return payload, content_type, .None
+		case .Change_Cipher_Spec:
+			return nil, {}, fail(conn, .Unexpected_Message, .Record)
+		case:
+			return nil, {}, fail(conn, .Unexpected_Message, .Record)
 		}
 	}
 }

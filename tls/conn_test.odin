@@ -76,6 +76,22 @@ test_a_record_over_the_protocol_limit_is_refused_with_an_alert :: proc(t: ^testi
 }
 
 @(test)
+test_a_malformed_change_cipher_spec_is_refused :: proc(t: ^testing.T) {
+	fixture := Fixture {
+		incoming = []u8{u8(Record_Type.Change_Cipher_Spec), 3, 3, 0, 1, 2},
+	}
+	defer delete(fixture.outgoing)
+	conn, init_err := init({read = fixture_read, write = fixture_write, user_data = &fixture}, {allocator = context.allocator})
+	if !testing.expect(t, init_err == .None, "a connection could not be prepared") { return }
+	defer destroy(conn)
+
+	testing.expect_value(t, handshake(conn, "example.com", nil), Error.Record)
+	written := fixture.outgoing[:]
+	tail := written[len(written) - 7:]
+	expect_bytes(t, "unexpected message alert", tail, []u8{21, 3, 3, 0, 2, u8(Alert_Level.Fatal), u8(Alert_Description.Unexpected_Message)})
+}
+
+@(test)
 test_a_main_handshake_certificate_request_can_be_answered_empty :: proc(t: ^testing.T) {
 	request := []u8{u8(Handshake_Type.Certificate_Request), 0, 0, 11, 0, 0, 8, 0, 13, 0, 4, 0, 2, 4, 3}
 	testing.expect(t, certificate_request_read(request), "a legal CertificateRequest was refused")
