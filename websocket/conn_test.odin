@@ -11,6 +11,8 @@ Fixture :: struct {
 	incoming: []u8,
 	at:       int,
 	outgoing: [dynamic]u8,
+	released: int,
+	aborted:  int,
 }
 
 fixture_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error) {
@@ -29,11 +31,47 @@ fixture_write :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Erro
 	return len(buffer), .None
 }
 
+fixture_release :: proc(user_data: rawptr) {
+	fixture := cast(^Fixture)user_data
+	fixture.released += 1
+}
+
+fixture_abort :: proc(user_data: rawptr) {
+	fixture := cast(^Fixture)user_data
+	fixture.aborted += 1
+}
+
 fixture_conn :: proc(t: ^testing.T, fixture: ^Fixture, incoming: []u8) -> ^Conn {
 	fixture.incoming = incoming
-	conn, err := init({read = fixture_read, write = fixture_write, user_data = fixture}, context.temp_allocator)
+	conn, err := init(
+		{read = fixture_read, write = fixture_write, release = fixture_release, abort = fixture_abort, user_data = fixture},
+		context.temp_allocator,
+	)
 	if !testing.expect(t, err == .None, "a connection could not be prepared") { return nil }
 	return conn
+}
+
+@(test)
+test_stream_end_without_a_close_frame_is_abnormal :: proc(t: ^testing.T) {
+	fixture: Fixture
+	conn := fixture_conn(t, &fixture, nil)
+	if conn == nil { return }
+	buffer: [8]u8
+	_, _, _, err := read(conn, buffer[:])
+	testing.expect_value(t, err, Error.Abnormal_Closure)
+	destroy(conn)
+	testing.expect_value(t, fixture.released, 1)
+	testing.expect_value(t, fixture.aborted, 0)
+}
+
+@(test)
+test_abort_uses_nonblocking_transport_teardown :: proc(t: ^testing.T) {
+	fixture: Fixture
+	conn := fixture_conn(t, &fixture, nil)
+	if conn == nil { return }
+	abort(conn)
+	testing.expect_value(t, fixture.released, 0)
+	testing.expect_value(t, fixture.aborted, 1)
 }
 
 // A server's frames carry no mask, so what it sends is what the protocol says it may

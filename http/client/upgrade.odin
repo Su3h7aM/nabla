@@ -111,10 +111,20 @@ upgraded_write :: proc(upgraded: ^Upgraded, buffer: []u8) -> (accepted: int, err
 }
 
 upgraded_destroy :: proc(upgraded: ^Upgraded) {
+	upgraded_release(upgraded, false)
+}
+
+// upgraded_abort releases an upgraded connection without a protocol-level TLS close.
+// Cancellation and shutdown paths use it when teardown must not wait on the peer.
+upgraded_abort :: proc(upgraded: ^Upgraded) {
+	upgraded_release(upgraded, true)
+}
+
+upgraded_release :: proc(upgraded: ^Upgraded, aborted: bool) {
 	if upgraded == nil { return }
 	delete(upgraded.pending, upgraded.allocator)
 	headers_destroy(&upgraded.headers, upgraded.allocator)
-	connection_destroy(upgraded.connection)
+	if aborted { connection_abort(upgraded.connection) } else { connection_destroy(upgraded.connection) }
 	allocator := upgraded.allocator
 	// The loop was acquired for the upgraded connection as much as for the request
 	// that opened it, so it is released once the connection is gone.

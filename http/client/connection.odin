@@ -260,6 +260,12 @@ connection_wait :: proc(connection: ^Connection, kind: Ready_For) -> Transport_S
 	return stop
 }
 
+connection_abort :: proc(connection: ^Connection) {
+	if connection == nil { return }
+	if connection.stop == .None { connection.stop = .Cancelled }
+	connection_destroy(connection)
+}
+
 connection_destroy :: proc(connection: ^Connection) {
 	if connection == nil { return }
 	if connection.tls_conn != nil {

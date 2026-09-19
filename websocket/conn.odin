@@ -15,7 +15,10 @@ import "core:unicode/utf8"
 Transport :: struct {
 	read:      proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error),
 	write:     proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error),
+	// release performs the transport's ordinary teardown. abort, when set, performs
+	// teardown without a protocol-level close that could wait on the peer.
 	release:   proc(user_data: rawptr),
+	abort:     proc(user_data: rawptr),
 	user_data: rawptr,
 }
 
@@ -38,8 +41,10 @@ Error :: enum {
 	// Protocol is a frame, or an order of frames, the protocol does not allow. The
 	// connection is closed with the code the protocol names for it.
 	Protocol,
-	// Closed is the peer's close, which is the orderly end of a connection.
+	// Closed is a valid close frame received from the peer.
 	Closed,
+	// Abnormal_Closure is the underlying stream ending without a close frame.
+	Abnormal_Closure,
 	No_Room,
 }
 
@@ -95,10 +100,24 @@ init :: proc(transport: Transport, allocator: mem.Allocator) -> (conn: ^Conn, er
 }
 
 destroy :: proc(conn: ^Conn) {
+	connection_release(conn, false)
+}
+
+// abort releases a connection without attempting another protocol close. It is for
+// cancellation and teardown paths where waiting on the peer is not allowed.
+abort :: proc(conn: ^Conn) {
+	connection_release(conn, true)
+}
+
+connection_release :: proc(conn: ^Conn, aborted: bool) {
 	if conn == nil { return }
 	delete(conn.send, conn.allocator)
 	delete(conn.recv, conn.allocator)
-	if conn.transport.release != nil { conn.transport.release(conn.transport.user_data) }
+	if aborted && conn.transport.abort != nil {
+		conn.transport.abort(conn.transport.user_data)
+	} else if conn.transport.release != nil {
+		conn.transport.release(conn.transport.user_data)
+	}
 	free(conn, conn.allocator)
 }
 
@@ -302,12 +321,7 @@ control_read :: proc(conn: ^Conn, length: int) -> (payload: []u8, err: Error) {
 // frame_header_read reads one frame header, which is as long as its length field says
 // it is.
 frame_header_read :: proc(conn: ^Conn) -> (header: Header, err: Error) {
-	if fill_err := recv_fill(conn, 2); fill_err != .None {
-		// A peer that closes between frames ends the stream, which is not a failure
-		// of the protocol.
-		if fill_err == .Closed && conn.header_filled == 0 { return {}, .Closed }
-		return {}, fill_err
-	}
+	if fill_err := recv_fill(conn, 2); fill_err != .None { return {}, fill_err }
 	count := 2
 	switch conn.header[1] & 0x7f {
 	case 126:
@@ -389,6 +403,7 @@ transport_read :: proc(conn: ^Conn, dst: []u8) -> Error {
 	filled := 0
 	for filled < len(dst) {
 		count, err := conn.transport.read(conn.transport.user_data, dst[filled:])
+		if err == .Closed { return .Abnormal_Closure }
 		if err != .None { return err }
 		if count <= 0 { return .Transport }
 		filled += count

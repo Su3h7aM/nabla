@@ -199,7 +199,7 @@ field_has_token :: proc(value, token: string) -> bool {
 // transport_for reads and writes an upgraded connection, and closes it when the
 // WebSocket is destroyed.
 transport_for :: proc(upgraded: ^client.Upgraded) -> Transport {
-	return Transport{read = upgraded_read, write = upgraded_write, release = upgraded_release, user_data = upgraded}
+	return Transport{read = upgraded_read, write = upgraded_write, release = upgraded_release, abort = upgraded_abort, user_data = upgraded}
 }
 
 @(private)
@@ -224,4 +224,9 @@ upgraded_write :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Err
 @(private)
 upgraded_release :: proc(user_data: rawptr) {
 	client.upgraded_destroy(cast(^client.Upgraded)user_data)
+}
+
+@(private)
+upgraded_abort :: proc(user_data: rawptr) {
+	client.upgraded_abort(cast(^client.Upgraded)user_data)
 }
