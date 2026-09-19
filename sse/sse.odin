@@ -199,33 +199,67 @@ contains_null :: proc(value: []u8) -> bool {
 
 // append_decoded_utf8 appends value to dst as UTF-8 text.
 //
-// The standard decodes the stream with the UTF-8 decode algorithm, which
-// replaces ill-formed input with U+FFFD. This is that step, applied per field
-// value. A value is complete before it is stored -- line terminators cannot
-// appear inside a UTF-8 sequence, so splitting on them first is safe -- which
-// makes this equivalent to decoding the whole stream up front.
-//
-// One U+FFFD is emitted per ill-formed byte. The Encoding Standard's decoder
-// emits one per maximal subpart of an ill-formed sequence, so a truncated
-// sequence yields more replacement characters here than it would there. The
-// difference is confined to how many U+FFFD characters malformed input
-// produces: well-formed input is copied byte for byte either way.
+// The standard decodes the stream with the WHATWG Encoding Standard's UTF-8
+// decoder, which replaces each maximal ill-formed subsequence with one U+FFFD.
+// A value is complete before it is stored -- line terminators cannot appear
+// inside a UTF-8 sequence, so splitting on them first is safe -- which makes
+// decoding each value with fresh state equivalent to decoding the whole stream
+// up front. A byte that ends a sequence attempt is reprocessed rather than
+// swallowed: it may itself begin a valid sequence. A sequence cut short at the
+// end of the value is one ill-formed subsequence, not one per missing byte.
 @(private)
 append_decoded_utf8 :: proc(dst: ^[dynamic]u8, value: []u8) {
-	for i := 0; i < len(value); {
-		r, size := utf8.decode_rune_in_bytes(value[i:])
-		// A well-formed sequence decodes with its own length, including a
-		// literal U+FFFD. An ill-formed byte or a truncated sequence reports
-		// RUNE_ERROR with a length of one.
-		if r == utf8.RUNE_ERROR && size <= 1 {
+	i := 0
+	for i < len(value) {
+		b := value[i]
+		if b < 0x80 {
+			append(dst, b)
+			i += 1
+			continue
+		}
+		needed, lower, upper := utf8_lead(b)
+		if needed == 0 {
 			append_replacement_character(dst)
 			i += 1
 			continue
 		}
-		width := max(size, 1)
-		append(dst, ..value[i:i + width])
-		i += width
+		end := i + 1
+		for end < len(value) && end - i - 1 < needed {
+			c := value[end]
+			if c < lower || c > upper { break }
+			lower, upper = 0x80, 0xBF
+			end += 1
+		}
+		if end - i - 1 == needed {
+			append(dst, ..value[i:end])
+			i = end
+			continue
+		}
+		append_replacement_character(dst)
+		i = end
 	}
+}
+
+// utf8_lead reads the lead byte of a UTF-8 sequence: how many continuation
+// bytes it needs and the range the first of them must fall in. The ranges
+// exclude overlongs, surrogates, and code points past U+10FFFF, which is what
+// makes those sequences ill-formed rather than merely unusual. A need of zero
+// means the byte never begins a sequence.
+@(private)
+utf8_lead :: proc(b: byte) -> (needed: int, lower, upper: byte) {
+	switch b {
+	case 0xC2 ..= 0xDF:
+		return 1, 0x80, 0xBF
+	case 0xE0 ..= 0xEF:
+		lower = 0xA0 if b == 0xE0 else 0x80
+		upper = 0x9F if b == 0xED else 0xBF
+		return 2, lower, upper
+	case 0xF0 ..= 0xF4:
+		lower = 0x90 if b == 0xF0 else 0x80
+		upper = 0x8F if b == 0xF4 else 0xBF
+		return 3, lower, upper
+	}
+	return 0, 0, 0
 }
 
 @(private)

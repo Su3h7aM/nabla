@@ -373,14 +373,50 @@ test_utf8_decoding :: proc(t: ^testing.T) {
 		parse(&recorder, "data: \xE2\x9C", "\x85\n\n")
 		expect_events(t, &recorder, {{type = "message", data = "✅"}})
 	}
-	// Each ill-formed byte becomes one replacement character; an encoded
-	// U+FFFD is well-formed and kept as itself.
+	// Each maximal ill-formed subsequence becomes one replacement character;
+	// an encoded U+FFFD is well-formed and kept as itself.
 	{
 		recorder: Recorder
 		recorder_init(&recorder)
 		defer recorder_destroy(&recorder)
 		parse(&recorder, "data: a\x80b\xFFc\xE2\x82d\n\n")
-		expect_events(t, &recorder, {{type = "message", data = "a\uFFFDb\uFFFDc\uFFFD\uFFFDd"}})
+		expect_events(t, &recorder, {{type = "message", data = "a\uFFFDb\uFFFDc\uFFFDd"}})
+	}
+	// A sequence cut short at the end of the value is one ill-formed
+	// subsequence, not one replacement per missing byte.
+	{
+		recorder: Recorder
+		recorder_init(&recorder)
+		defer recorder_destroy(&recorder)
+		parse(&recorder, "data: a\xE2\x82\n\ndata: \xF0\x9F\x92\n\n")
+		expect_events(t, &recorder, {{type = "message", data = "a\uFFFD"}, {type = "message", data = "\uFFFD"}})
+	}
+	// A byte that ends one sequence attempt is reprocessed: it may begin a
+	// valid sequence of its own. Overlongs, surrogates, and code points past
+	// U+10FFFF never begin one.
+	{
+		recorder: Recorder
+		recorder_init(&recorder)
+		defer recorder_destroy(&recorder)
+		parse(&recorder, "data: \xE2\xC3\xA9\n\ndata: \xC0\xAF\n\ndata: \xED\xA0\x80\n\ndata: \xF4\x90\x80\x80\n\n")
+		expect_events(
+			t,
+			&recorder,
+			{
+				{type = "message", data = "\uFFFDé"},
+				{type = "message", data = "\uFFFD\uFFFD"},
+				{type = "message", data = "\uFFFD\uFFFD\uFFFD"},
+				{type = "message", data = "\uFFFD\uFFFD\uFFFD\uFFFD"},
+			},
+		)
+	}
+	// Boundary sequences are well-formed and kept byte for byte.
+	{
+		recorder: Recorder
+		recorder_init(&recorder)
+		defer recorder_destroy(&recorder)
+		parse(&recorder, "data: \xE0\xA0\x80\xF4\x8F\xBF\xBF\n\n")
+		expect_events(t, &recorder, {{type = "message", data = "\xE0\xA0\x80\xF4\x8F\xBF\xBF"}})
 	}
 	{
 		recorder: Recorder
