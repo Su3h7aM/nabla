@@ -47,6 +47,7 @@ Provider_Transfer_Summary :: struct {
 	request_bytes_accepted:      u64,
 	request_body_bytes_accepted: u64,
 	request_complete:            bool,
+	request_write_started:       bool,
 	response_head_received:      bool,
 	status:                      int,
 	declared_body_bytes:         u64,
@@ -119,6 +120,9 @@ Provider_Operation_Error :: struct {
 	// delivery is how far a model request observably progressed. Once sending
 	// starts, replay is ambiguous even when no model output reached the caller.
 	delivery:            Provider_Delivery_State,
+	// delivery_present separates "the model send was not entered" from "no attempt
+	// to establish it was made". Only a present state may authorize recovery.
+	delivery_present:    bool,
 	// failure_class is the provider's normalized meaning for this failure, and None
 	// when no provider classification applies: a local refusal, or an attempt that
 	// never reached the provider. Neither is a success signal.
@@ -411,6 +415,7 @@ Provider_Request_Operation_Encoded :: proc(
 
 	if failure.kind != .None {
 		state.transport_cause = provider_transport_cause(failure.cause)
+		provider_record_delivery(&state, failure)
 		// A refused response carried the provider's own account of the refusal in its
 		// body. It is decoded before that body is released, and one that is absent,
 		// truncated, or malformed simply leaves the status and the transport facts as
@@ -469,6 +474,11 @@ Provider_Request_Stream_State :: struct {
 	error_body_len:   int,
 	transfer:         Provider_Transfer_Summary,
 	transfer_present: bool,
+	// delivery and delivery_present are the model-send evidence this attempt
+	// established. Evidence first established on a failure reaches the caller
+	// through provider_terminal_error.
+	delivery:         Provider_Delivery_State,
+	delivery_present: bool,
 	transport_cause:  Provider_Transport_Cause,
 }
 
@@ -512,6 +522,22 @@ provider_response_head :: proc(user_data: rawptr, head: client.Response_Head, he
 		state.response_head.retry_after = provider_retry_after(value)
 	}
 	state.response_head.retry_directive = provider_retry_directive(state.api, headers)
+}
+
+// provider_record_delivery states whether this attempt may have put model input in
+// front of the provider and got nothing back. That is the case a second send cannot
+// repair: the request may have run, and no answer says it did not. A failure after a
+// final response head is the provider's own answer, so classification decides what
+// happens there rather than delivery.
+provider_record_delivery :: proc(state: ^Provider_Request_Stream_State, failure: client.Failure) {
+	if !state.transfer_present || !state.transfer.request_write_started { return }
+	if state.delivery_present || state.response_head.seen { return }
+	switch failure.kind {
+	case .Transport, .Truncated, .Closed:
+		state.delivery = .Model_Send_Started
+		state.delivery_present = true
+	case .None, .Cancelled, .Timed_Out, .TLS, .Invalid_URL, .HTTP_Status, .Content_Type:
+	}
 }
 
 // provider_transfer_summary records how the attempt ended. A recovery decision
@@ -601,6 +627,8 @@ provider_terminal_error :: proc(state: ^Provider_Request_Stream_State, kind: Pro
 		retry_after         = state.response_head.retry_after,
 		retry_directive     = state.response_head.retry_directive,
 		detail              = provider_take_failure_detail(state),
+		delivery            = state.delivery,
+		delivery_present    = state.delivery_present,
 		transfer            = state.transfer,
 		transfer_present    = state.transfer_present,
 		transport_cause     = state.transport_cause,
@@ -673,6 +701,7 @@ provider_request_error_text :: proc(err: Provider_Request_Error) -> string {
 	return "invalid provider request"
 }
 
+// provider_take_failure_detail claims the detail the state still owns.
 provider_take_failure_detail :: proc(state: ^Provider_Request_Stream_State) -> string {
 	detail := state.failure_detail
 	state.failure_detail = ""

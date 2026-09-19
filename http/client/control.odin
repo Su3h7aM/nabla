@@ -97,6 +97,9 @@ Transfer_Summary :: struct {
 	request_bytes_accepted:      u64,
 	request_body_bytes_accepted: u64,
 	request_complete:            bool,
+	// request_write_started says the request writer was entered, which is the last
+	// point at which the caller can still know nothing reached the peer.
+	request_write_started:       bool,
 	// status is the final response status, and is zero when no head arrived.
 	response_head_received:      bool,
 	status:                      int,

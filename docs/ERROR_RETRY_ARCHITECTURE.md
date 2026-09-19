@@ -62,7 +62,8 @@ summarizer still cannot guarantee indefinite execution.
    There is no retry loop in `ai`, `sse`, or HTTP.
 2. A transient retry uses the same endpoint, credentials, model, instructions, tools, effort,
    cache key, and encoded body. A repair is a different request, not a hidden mutation. Changing
-   transport is a new send, so it obeys the same rule.
+   transport is a new send, so it obeys the same rule. Delivery evidence decides whether that
+   send is allowed at all: a request that may have run with no answer back is not resent.
 3. No retry after user-visible text or an accepted completion. No tool from an unsuccessful
    attempt executes. Bytes accepted by a socket do not prove provider execution did not occur,
    and neither transport proves a failed model POST was not executed.
@@ -261,9 +262,11 @@ After the synchronous send returns and provisional output is settled:
    reason.
 2. Successful complete operation and accepted completion: commit normally.
 3. Published text or accepted completion: stop on failure. Preserve text as partial.
-4. Uncertain WebSocket or HTTP model delivery: stop. Protocol fallback never repairs it. A
-   recognized pre-execution rejection is the narrow exception, as specified in network
-   section 9.6. A terminal event alone does not establish non-execution.
+4. Uncertain delivery: the model request may have been sent and nothing came back. Stop for
+   both transports, and never switch transport to repair it. A recognized pre-execution
+   rejection is the narrow exception, as specified in network section 9.6. A terminal event
+   alone does not establish non-execution. A failure after a final response head is classified
+   as any other provider answer.
 5. Confirmed input overflow with safe rejection evidence: use §7, never ordinary backoff.
 6. Terminal class or `Forbid`: stop.
 7. Retry transient connection/I/O failure, incomplete stream, rate limiting, or provider

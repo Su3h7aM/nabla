@@ -177,6 +177,7 @@ Provider_WebSocket_Request :: proc(
 			provider_websocket_drop(session)
 			err := provider_terminal_error(&state, .Stream)
 			err.delivery = delivery
+			err.delivery_present = true
 			return err
 		}
 		if state.stream.Phase == .Completed && state.completion != nil {
@@ -271,6 +272,7 @@ provider_websocket_error :: proc(
 	provider_drain_events(state)
 	err := provider_terminal_error(state, kind)
 	err.delivery = delivery
+	err.delivery_present = true
 	return err
 }
 

@@ -64,7 +64,7 @@ test_recovery_decision_stops_for_its_own_facts :: proc(t: ^testing.T) {
 		{"a completion was accepted", {attempts = 1, error = transient, completion_accepted = true}, .Stop, .Output_Exposed},
 		{
 			"model send was ambiguous",
-			{attempts = 1, error = {kind = .Transport, failure_class = .Provider_Unavailable, delivery = .Model_Send_Started}},
+			{attempts = 1, error = {kind = .Transport, failure_class = .Provider_Unavailable, delivery = .Model_Send_Started, delivery_present = true}},
 			.Stop,
 			.Ambiguous_Delivery,
 		},

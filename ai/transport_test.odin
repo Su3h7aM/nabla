@@ -657,6 +657,22 @@ test_a_200_error_document_is_classified_by_its_code :: proc(t: ^testing.T) {
 	testing.expect_value(t, job.completions, 0)
 }
 
+// A request that was written and got nothing back may have run: the operation says
+// so, so recovery can refuse to send the same bytes again.
+@(test)
+test_a_request_with_no_answer_reports_delivery_evidence :: proc(t: ^testing.T) {
+	job: Transport_Job
+	observed: Transport_Observation
+	if !transport_refusal_once(t, "", &job, &observed) { return }
+	defer transport_job_destroy(&job, job.allocator)
+
+	testing.expect_value(t, job.error.kind, Provider_Operation_Error_Kind.Transport)
+	testing.expect(t, job.error.transfer_present)
+	testing.expect(t, job.error.transfer.request_write_started, "the request writer was entered")
+	testing.expect(t, job.error.delivery_present)
+	testing.expect_value(t, job.error.delivery, Provider_Delivery_State.Model_Send_Started)
+}
+
 // A stream that framed cleanly but never reached its terminal event is incomplete,
 // which is a different fact from a connection that broke: the text it did deliver
 // is real, and it is what an automatic retry must not repeat.

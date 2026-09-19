@@ -127,6 +127,7 @@ http_relay_transfer :: proc(user_data: rawptr, summary: client.Transfer_Summary)
 		request_bytes_accepted      = summary.request_bytes_accepted,
 		request_body_bytes_accepted = summary.request_body_bytes_accepted,
 		request_complete            = summary.request_complete,
+		request_write_started       = summary.request_write_started,
 		response_head_received      = summary.response_head_received,
 		status                      = summary.status,
 		declared_body_bytes         = summary.declared_body_bytes,

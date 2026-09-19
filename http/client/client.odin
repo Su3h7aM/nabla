@@ -229,6 +229,7 @@ request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase,
 	buffer, body_offset := format_request(url, request)
 	defer bytes.buffer_destroy(&buffer)
 	request_bytes := bytes.buffer_to_bytes(&buffer)
+	summary.request_write_started = true
 	accepted, write_err := connection_write_all(dialed, request_bytes)
 	summary.request_bytes_accepted = u64(accepted)
 	summary.request_body_bytes_accepted = u64(max(accepted - body_offset, 0))

@@ -83,8 +83,8 @@ Request_Recovery_Reason :: enum {
 	// Cancelled is a turn the user or the driver stopped.
 	Cancelled,
 	// Ambiguous_Delivery is a failed operation after model-send bytes may have
-	// reached the provider. Replaying could create a second response even when no
-	// output reached the caller.
+	// reached the provider, or an operation that established nothing about delivery.
+	// Replaying could create a second response even when no output reached the caller.
 	Ambiguous_Delivery,
 	// Output_Exposed is a failure after the attempt had already published text or an
 	// accepted completion. Sending again could publish a second answer, so the chain
@@ -186,7 +186,7 @@ chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Fact
 	if facts.text_exposed || facts.completion_accepted {
 		return {action = .Stop, reason = .Output_Exposed}
 	}
-	if facts.error.delivery != .None {
+	if facts.error.delivery_present && facts.error.delivery != .None {
 		return {action = .Stop, reason = .Ambiguous_Delivery}
 	}
 	if facts.error.failure_class == .Context_Overflow {

@@ -554,12 +554,13 @@ Keep conservative accounting instead of extending TLS/WS APIs for precise accept
 
 - Present `None` means the model-send path was not entered. An HTTP Upgrade alone does not
   send model input. For HTTP POST, validation/DNS/connect/TLS failures before the request
-  writer is entered can establish this fact. Invalid input/cancellation checked before write
-  also keeps this state, though cancellation/local validation never authorize a retry.
-- `Model_Send_Started` means delivery is possible. Entering the WS frame writer or HTTP
-  model-request writer is sufficient. The HTTP writer currently writes headers and body in
-  one buffer; be conservative even if it may have failed in the headers. Zero completed TLS
-  plaintext bytes does not prove zero ciphertext reached the socket.
+  writer is entered can establish this fact, as can an invalid input or cancellation checked
+  before write, though neither of those authorizes a retry.
+- `Model_Send_Started` means delivery is possible and nothing came back. Entering the WS frame
+  writer, or the HTTP model-request writer without a final response head, is enough. The HTTP
+  writer currently writes headers and body in one buffer; be conservative even if it may have
+  failed in the headers. Zero completed TLS plaintext bytes does not prove zero ciphertext
+  reached the socket.
 - `Response_Observed` means a valid request-associated provider event was decoded.
 - `Terminal_Observed` means a valid associated provider terminal was decoded, not merely an
   error returned by our parser. It does not by itself mean retry is safe.
@@ -597,9 +598,10 @@ provider-documented resume/idempotency contract would be a separate adapter feat
 | 401/403, trust error, malformed/invalid local URL/header, invalid 101 handshake | Stop; fallback must not hide these failures |
 | Upgrade 429/availability response | Preserve status, body classification and Retry-After; apply ordinary retry policy, not sticky unsupported-transport fallback |
 | WS transport failure after send entry, without a valid explicit rejection | Stop this chain with unknown outcome; mark HTTP for future independently admitted requests in `auto`. Do not send the failed request again |
-| HTTP request failure after writer entry, without a valid explicit rejection | Stop this chain with unknown outcome; do not try WS or another HTTP POST |
+| HTTP request failure after the writer was entered and no final response head arrived, without a valid explicit rejection | Stop this chain with unknown outcome; do not try WS or another HTTP POST. The request may have run and nothing says it did not |
+| HTTP failure after a final response head, such as a truncated or unfinished stream | Ordinary classification: a transient class retries within the bound. The provider answered, the prefix is cached, and a stream that never reached its terminal cannot release a tool call |
 | HTTP failure known before writer entry | Retry HTTP with ordinary backoff when eligible; do not switch to WS |
-| Absent delivery evidence on a failed model operation | Treat delivery as unknown unless valid explicit rejection evidence independently establishes non-execution |
+| Absent delivery evidence | Classification decides, except that no failure may be retried once output was exposed |
 | Recognized pre-execution rate-limit/unavailable rejection | Ordinary bounded retry if eligible and no output; a new WS connection, not transport fallback |
 | Recognized input-overflow rejection | Existing one-checkpoint repair within the same attempt bound |
 | Exact documented `websocket_connection_limit_reached` rejection for the sole pending request, before any response/output | Allow one reconnect/full-context resend within the same bound; abort old socket |
