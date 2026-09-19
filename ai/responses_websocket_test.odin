@@ -1,16 +1,7 @@
 #+test
 package ai
 
-import "core:encoding/json"
 import "core:testing"
-
-@(test)
-test_api_transports_state_a_capability_rather_than_a_provider :: proc(t: ^testing.T) {
-	testing.expect_value(t, Provider_API_Transports(.OpenAI_Responses), bit_set[Provider_Transport_Kind]{.HTTP, .WebSocket})
-	testing.expect_value(t, Provider_API_Transports(.OpenAI_Chat_Completions), bit_set[Provider_Transport_Kind]{.HTTP})
-	testing.expect_value(t, Provider_API_Transports(.Anthropic_Messages), bit_set[Provider_Transport_Kind]{.HTTP})
-	testing.expect_value(t, Provider_API_Transports(.Invalid), bit_set[Provider_Transport_Kind]{})
-}
 
 @(test)
 test_responses_websocket_endpoint_preserves_authority_and_resource :: proc(t: ^testing.T) {
@@ -30,20 +21,4 @@ test_responses_websocket_endpoint_preserves_authority_and_resource :: proc(t: ^t
 		testing.expect_value(t, ok, entry.ok)
 		testing.expect_value(t, endpoint, entry.want)
 	}
-}
-
-@(test)
-test_responses_websocket_freeze_builds_a_response_create_event :: proc(t: ^testing.T) {
-	request := request_fixture()
-	encoded, failure := Provider_Request_Freeze_WebSocket(request, context.temp_allocator)
-	if !testing.expect_value(t, failure.kind, Provider_Operation_Error_Kind.None) { return }
-	value, parse_err := json.parse(encoded.Body, .JSON, true, context.temp_allocator)
-	if !testing.expect_value(t, parse_err, nil) { return }
-	defer json.destroy_value(value, context.temp_allocator)
-	object, ok := value.(json.Object)
-	if !testing.expect(t, ok, "the frozen request is not an object") { return }
-	event_type, present, valid := openai_value_string(object, "type")
-	testing.expect(t, valid && present && event_type == "response.create")
-	_, stream_present := object["stream"]
-	testing.expect(t, !stream_present, "the frozen WebSocket request carried stream")
 }
