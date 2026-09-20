@@ -7,7 +7,7 @@ import "nabla:db"
 // SCHEMA_VERSION is the version this package writes. A database at a higher
 // version was written by newer code, and this package refuses it rather than
 // risk losing columns it does not know about.
-SCHEMA_VERSION :: 4
+SCHEMA_VERSION :: 5
 
 // The schema is deliberately small. Identity, order, ownership, and
 // correlation are columns, because those are the relationships the database has
@@ -178,6 +178,44 @@ MIGRATION_4 := [?]string {
 	`CREATE UNIQUE INDEX entries_snapshot ON entries (session_id) WHERE kind = 'instruction_snapshot'`,
 }
 
+// MIGRATION_5 adds the parent relationship for host-program tool calls. A parent is
+// itself a prior tool call in the same session and turn. Provider projection filters
+// rows carrying it; the rows remain ordinary call, dispatch, and result records for
+// recovery and result lookup.
+@(private)
+MIGRATION_5 := [?]string {
+	`CREATE TABLE entries_new (
+		session_id     TEXT NOT NULL,
+		seq            INTEGER NOT NULL CHECK (seq > 0),
+		turn_no        INTEGER,
+		request_no     INTEGER,
+		created_at_ms  INTEGER NOT NULL CHECK (created_at_ms > 0),
+		kind           TEXT NOT NULL CHECK (kind IN ('user', 'assistant', 'reasoning', 'response', 'tool_call', 'tool_dispatch', 'tool_result', 'checkpoint', 'instruction_snapshot')),
+		related_seq    INTEGER,
+		parent_call_seq INTEGER,
+		payload_json   TEXT NOT NULL,
+		PRIMARY KEY (session_id, seq),
+		FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE,
+		FOREIGN KEY (session_id, turn_no) REFERENCES turns (session_id, turn_no),
+		FOREIGN KEY (session_id, request_no) REFERENCES requests (session_id, request_no),
+		FOREIGN KEY (session_id, related_seq) REFERENCES entries_new (session_id, seq),
+		FOREIGN KEY (session_id, parent_call_seq) REFERENCES entries_new (session_id, seq),
+		CHECK ((kind IN ('tool_dispatch', 'tool_result') AND related_seq IS NOT NULL) OR (kind NOT IN ('tool_dispatch', 'tool_result') AND related_seq IS NULL)),
+		CHECK (related_seq IS NULL OR related_seq < seq),
+		CHECK (parent_call_seq IS NULL OR (kind = 'tool_call' AND parent_call_seq < seq))
+	) STRICT`,
+	`INSERT INTO entries_new (session_id, seq, turn_no, request_no, created_at_ms, kind, related_seq, parent_call_seq, payload_json) SELECT session_id, seq, turn_no, request_no, created_at_ms, kind, related_seq, NULL, payload_json FROM entries`,
+	`DROP TABLE entries`,
+	`ALTER TABLE entries_new RENAME TO entries`,
+	`CREATE INDEX entries_turn ON entries (session_id, turn_no, seq)`,
+	`CREATE INDEX entries_request ON entries (session_id, request_no, seq)`,
+	`CREATE INDEX entries_kind ON entries (session_id, kind, seq)`,
+	`CREATE INDEX entries_parent ON entries (session_id, parent_call_seq, seq) WHERE parent_call_seq IS NOT NULL`,
+	`CREATE UNIQUE INDEX entries_dispatch ON entries (session_id, related_seq) WHERE kind = 'tool_dispatch'`,
+	`CREATE UNIQUE INDEX entries_result ON entries (session_id, related_seq) WHERE kind = 'tool_result'`,
+	`CREATE UNIQUE INDEX entries_snapshot ON entries (session_id) WHERE kind = 'instruction_snapshot'`,
+}
+
 // migration_statements returns the statements that bring version to
 // version + 1, or nil when there is no such migration. MIGRATION_1 carries
 // the older kind list without 'response'; version 3 admits it.
@@ -192,6 +230,8 @@ migration_statements :: proc(version: int) -> []string {
 		return MIGRATION_3[:]
 	case 4:
 		return MIGRATION_4[:]
+	case 5:
+		return MIGRATION_5[:]
 	}
 	return nil
 }

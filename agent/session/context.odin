@@ -397,13 +397,19 @@ TURNS_INTERRUPT :: `UPDATE turns SET status = 'interrupted', finished_at_ms = ? 
 CHECKPOINT_LATEST_SEQ :: `SELECT seq FROM entries WHERE session_id = ? AND kind = 'checkpoint' ORDER BY seq DESC LIMIT 1`
 
 @(private)
-ENTRY_SELECT_LATEST_CHECKPOINT :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ? AND kind = 'checkpoint' ORDER BY seq DESC LIMIT 1`
+ENTRY_SELECT_LATEST_CHECKPOINT :: `SELECT ` + ENTRY_COLUMNS + ` FROM entries WHERE session_id = ? AND kind = 'checkpoint' ORDER BY seq DESC LIMIT 1`
 
 @(private)
-ENTRY_SELECT_CONTEXT :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ? AND seq > COALESCE(?, 0) AND kind NOT IN ('tool_dispatch', 'checkpoint', 'instruction_snapshot') ORDER BY seq`
+ENTRY_SELECT_CONTEXT ::
+	`SELECT ` +
+	ENTRY_COLUMNS +
+	` FROM entries AS e WHERE e.session_id = ? AND e.seq > COALESCE(?, 0) AND e.parent_call_seq IS NULL AND NOT (e.kind = 'tool_result' AND EXISTS (SELECT 1 FROM entries AS c WHERE c.session_id = e.session_id AND c.seq = e.related_seq AND c.parent_call_seq IS NOT NULL)) AND e.kind NOT IN ('tool_dispatch', 'checkpoint', 'instruction_snapshot') ORDER BY e.seq`
 
 @(private)
-ENTRY_SELECT_DISPATCHES :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ? AND seq > COALESCE(?, 0) AND kind = 'tool_dispatch' ORDER BY seq`
+ENTRY_SELECT_DISPATCHES ::
+	`SELECT ` +
+	ENTRY_COLUMNS +
+	` FROM entries AS e WHERE e.session_id = ? AND e.seq > COALESCE(?, 0) AND e.parent_call_seq IS NULL AND NOT EXISTS (SELECT 1 FROM entries AS c WHERE c.session_id = e.session_id AND c.seq = e.related_seq AND c.parent_call_seq IS NOT NULL) AND e.kind = 'tool_dispatch' ORDER BY e.seq`
 
 @(private)
 entry_exists :: proc(store: ^Store, id: Session_Id, seq: Seq) -> (bool, Error) {

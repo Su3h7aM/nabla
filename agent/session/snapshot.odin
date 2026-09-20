@@ -88,4 +88,4 @@ clone_snapshot_text :: proc(value: string, allocator := context.allocator) -> st
 SNAPSHOT_COUNT :: `SELECT COUNT(*) FROM entries WHERE session_id = ? AND kind = 'instruction_snapshot'`
 
 @(private)
-SNAPSHOT_SELECT :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ? AND kind = 'instruction_snapshot' ORDER BY seq LIMIT 1`
+SNAPSHOT_SELECT :: `SELECT ` + ENTRY_COLUMNS + ` FROM entries WHERE session_id = ? AND kind = 'instruction_snapshot' ORDER BY seq LIMIT 1`

@@ -359,23 +359,28 @@ Entry_Payload :: union {
 // Entry is one stored history record. Every string it holds is owned by the
 // allocator it was read with and released by entry_destroy.
 Entry :: struct {
-	seq:           Seq,
-	turn_no:       Maybe(Turn_No),
-	request_no:    Maybe(Request_No),
-	created_at_ms: i64,
-	kind:          Entry_Kind,
-	related_seq:   Maybe(Seq),
-	payload:       Entry_Payload,
+	seq:             Seq,
+	turn_no:         Maybe(Turn_No),
+	request_no:      Maybe(Request_No),
+	created_at_ms:   i64,
+	kind:            Entry_Kind,
+	related_seq:     Maybe(Seq),
+	// parent_call_seq is set only on a host-program tool call. The parent is a
+	// prior tool call in the same turn; provider projection omits the child while
+	// recovery and result lookup keep reading it.
+	parent_call_seq: Maybe(Seq),
+	payload:         Entry_Payload,
 }
 
 // New_Entry is an entry about to be stored. Its strings are borrowed for the
 // call that writes it.
 New_Entry :: struct {
-	turn_no:       Maybe(Turn_No),
-	request_no:    Maybe(Request_No),
-	created_at_ms: i64,
-	related_seq:   Maybe(Seq),
-	payload:       Entry_Payload,
+	turn_no:         Maybe(Turn_No),
+	request_no:      Maybe(Request_No),
+	created_at_ms:   i64,
+	related_seq:     Maybe(Seq),
+	parent_call_seq: Maybe(Seq),
+	payload:         Entry_Payload,
 }
 
 // Entry_Load_Options selects a contiguous run of a session's history. The

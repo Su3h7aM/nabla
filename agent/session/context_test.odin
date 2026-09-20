@@ -456,3 +456,144 @@ test_context_without_a_checkpoint_is_the_whole_conversation :: proc(t: ^testing.
 	}
 	testing.expect_value(t, len(ctx.entries), 2)
 }
+
+// Child calls are durable execution records but not conversation. The context keeps
+// the Code Mode call and its result while omitting the child's call, dispatch, and
+// result, even when the parent lies in the same loaded tail.
+@(test)
+test_context_omits_child_tool_records :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session := _open_claimed_session(t, &store)
+	defer session_destroy(&session)
+	turn, turn_err := turn_begin(&store, session.id, "run code", .Prompt, 2_000)
+	_expect_ok(t, turn_err)
+	request, request_err := request_begin(
+		&store,
+		session.id,
+		{turn_no = turn, purpose = .Response, provider = "p", model_requested = "m", api = "a", config_json = "{}", input_json = "{}"},
+		2_100,
+	)
+	_expect_ok(t, request_err)
+
+	parent, parent_err := entry_append(
+		&store,
+		session.id,
+		{turn_no = turn, request_no = request, created_at_ms = 2_200, payload = Tool_Call_Entry{call_id = "code_1", name = "builtin.code", arguments = "{}"}},
+	)
+	_expect_ok(t, parent_err)
+	_, parent_dispatch_err := entry_append(
+		&store,
+		session.id,
+		{
+			turn_no = turn,
+			request_no = request,
+			created_at_ms = 2_210,
+			related_seq = parent,
+			payload = Tool_Dispatch_Entry{tool = "builtin.code", arguments = "{}"},
+		},
+	)
+	_expect_ok(t, parent_dispatch_err)
+	child, child_err := entry_append(
+		&store,
+		session.id,
+		{
+			turn_no = turn,
+			request_no = request,
+			created_at_ms = 2_220,
+			parent_call_seq = parent,
+			payload = Tool_Call_Entry{call_id = "code_1/1", name = "builtin.read", arguments = "{}"},
+		},
+	)
+	_expect_ok(t, child_err)
+	_, child_dispatch_err := entry_append(
+		&store,
+		session.id,
+		{
+			turn_no = turn,
+			request_no = request,
+			created_at_ms = 2_230,
+			related_seq = child,
+			payload = Tool_Dispatch_Entry{tool = "builtin.read", arguments = "{}"},
+		},
+	)
+	_expect_ok(t, child_dispatch_err)
+	_, child_result_err := entry_append(
+		&store,
+		session.id,
+		{
+			turn_no = turn,
+			request_no = request,
+			created_at_ms = 2_240,
+			related_seq = child,
+			payload = Tool_Result_Entry{outcome = .Success, content = `{"status":"success","message":"","data":{}}`, origin = .Observed},
+		},
+	)
+	_expect_ok(t, child_result_err)
+	_, parent_result_err := entry_append(
+		&store,
+		session.id,
+		{
+			turn_no = turn,
+			request_no = request,
+			created_at_ms = 2_250,
+			related_seq = parent,
+			payload = Tool_Result_Entry{outcome = .Success, content = `{"status":"success","message":"","data":{}}`, origin = .Observed},
+		},
+	)
+	_expect_ok(t, parent_result_err)
+
+	history, history_err := entries_load(&store, session.id, {})
+	_expect_ok(t, history_err)
+	defer entries_destroy(history)
+	testing.expect_value(t, len(history), 7)
+	child_parent, present := history[3].parent_call_seq.?
+	if !testing.expect(t, present, "the child should retain its parent") { return }
+	testing.expect_value(t, child_parent, parent)
+
+	ctx, ctx_err := context_load(&store, session.id)
+	_expect_ok(t, ctx_err)
+	defer context_destroy(&ctx)
+	// Prompt, parent call, and parent result. The three child records are hidden.
+	testing.expect_value(t, len(ctx.entries), 3)
+	testing.expect_value(t, len(ctx.dispatches), 1)
+	call, is_call := ctx.entries[1].payload.(Tool_Call_Entry)
+	if !testing.expect(t, is_call, "the visible call should be the parent") { return }
+	testing.expect_value(t, call.call_id, "code_1")
+}
+
+// The parent relationship is restricted to a prior tool call in the same turn.
+@(test)
+test_child_call_requires_a_parent_in_the_same_turn :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session := _open_claimed_session(t, &store)
+	defer session_destroy(&session)
+	first_turn, first_err := turn_begin(&store, session.id, "first", .Prompt, 2_000)
+	_expect_ok(t, first_err)
+	parent, parent_err := entry_append(
+		&store,
+		session.id,
+		{turn_no = first_turn, created_at_ms = 2_100, payload = Tool_Call_Entry{call_id = "parent", name = "builtin.code", arguments = "{}"}},
+	)
+	_expect_ok(t, parent_err)
+	_expect_ok(t, turn_finish(&store, session.id, first_turn, .Completed, "", 2_200))
+
+	second_turn, second_err := turn_begin(&store, session.id, "second", .Prompt, 3_000)
+	_expect_ok(t, second_err)
+	_, child_err := entry_append(
+		&store,
+		session.id,
+		{
+			turn_no = second_turn,
+			created_at_ms = 3_100,
+			parent_call_seq = parent,
+			payload = Tool_Call_Entry{call_id = "child", name = "builtin.read", arguments = "{}"},
+		},
+	)
+	testing.expect_value(t, error_kind(child_err), Error_Kind.Invalid_Argument)
+}

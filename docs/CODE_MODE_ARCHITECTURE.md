@@ -1128,6 +1128,22 @@ through a condition variable plus the 50 ms bounded wait slice. A root-level wak
 channel can remove that latency when the outer worker becomes a general event pump; it
 is an optimization, not a prerequisite for child calls.
 
+### 14.3 Phase 3 results
+
+Schema version 5 adds `parent_call_seq` to `entries`. Only a `tool_call` may carry it,
+the parent must be an earlier tool call in the same session and turn, and ordinary
+`related_seq` relationships continue to connect each child dispatch and result to the
+child call. The migration copies every older row with a null parent, so existing
+sessions preserve their provider-visible history.
+
+`context_load` now filters both sides of the relationship. It omits a child call by its
+own parent column and omits a child dispatch or result by looking through
+`related_seq` to that call. The full history loader, recovery queries, and
+`tool_result_read` do not filter, so children remain durable execution records and an
+interrupted session settles them independently. Tests cover same-turn validation,
+full-history retention, and a provider context containing only the Code Mode parent
+call, dispatch, and result.
+
 ## 15. Decisions deliberately left open
 
 The runtime direction is settled by this proposal; these choices need implementation

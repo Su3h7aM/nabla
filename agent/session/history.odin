@@ -662,21 +662,24 @@ REQUEST_FINISHED_USAGE_COLUMNS :: [?]string{"input_tokens", "output_tokens", "ca
 REQUEST_SELECT_FINISHED_USAGE :: `SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens FROM requests WHERE session_id = ? AND status <> 'running' ORDER BY request_no`
 
 @(private)
-ENTRY_INSERT :: `INSERT INTO entries (session_id, seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+ENTRY_INSERT :: `INSERT INTO entries (session_id, seq, turn_no, request_no, created_at_ms, kind, related_seq, parent_call_seq, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 @(private)
 ENTRY_NEXT_SEQ :: `SELECT COALESCE(MAX(seq), 0) + 1 FROM entries WHERE session_id = ?`
 
 @(private)
-ENTRY_SELECT_RANGE :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ?`
+ENTRY_COLUMNS :: `seq, turn_no, request_no, created_at_ms, kind, related_seq, parent_call_seq, payload_json`
+
+@(private)
+ENTRY_SELECT_RANGE :: `SELECT ` + ENTRY_COLUMNS + ` FROM entries WHERE session_id = ?`
 
 // TOOL_RESULT_SELECT reads the result of one call. The kind is named so a dispatch
 // entry, which shares the related sequence, can never be mistaken for a result.
 @(private)
-TOOL_RESULT_SELECT :: `SELECT seq, turn_no, request_no, created_at_ms, kind, related_seq, payload_json FROM entries WHERE session_id = ? AND related_seq = ? AND kind = 'tool_result'`
+TOOL_RESULT_SELECT :: `SELECT ` + ENTRY_COLUMNS + ` FROM entries WHERE session_id = ? AND related_seq = ? AND kind = 'tool_result'`
 
 @(private)
-ENTRY_SELECT_KIND :: `SELECT kind FROM entries WHERE session_id = ? AND seq = ?`
+ENTRY_SELECT_KIND :: `SELECT kind, turn_no FROM entries WHERE session_id = ? AND seq = ?`
 
 // --- entry writing ----------------------------------------------------------
 
@@ -693,6 +696,7 @@ insert_entry :: proc(store: ^Store, id: Session_Id, seq: Seq, entry: New_Entry) 
 		db.Value(entry.created_at_ms),
 		db.Value(entry_kind_name(entry_kind_of(entry.payload))),
 		optional_int_value(entry.related_seq),
+		optional_int_value(entry.parent_call_seq),
 		db.Value(string(payload_json)),
 	}
 	if err := db.exec(&store.conn, ENTRY_INSERT, args[:]); err != nil {
@@ -722,6 +726,20 @@ validate_new_entry :: proc(store: ^Store, id: Session_Id, seq: Seq, entry: New_E
 		return error_make(.Invalid_Argument, "only a tool dispatch or result may name a related entry")
 	}
 
+	if parent, present := entry.parent_call_seq.?; present {
+		if kind != .Tool_Call {
+			return error_make(.Invalid_Argument, "only a tool call may name a parent call")
+		}
+		if parent <= 0 || parent >= seq {
+			return error_make(.Invalid_Argument, "the parent call must come before the child call")
+		}
+		turn, has_turn := entry.turn_no.?
+		if !has_turn {
+			return error_make(.Invalid_Argument, "a child tool call must belong to a turn")
+		}
+		if err := require_parent_tool_call(store, id, parent, turn); err != nil { return err }
+	}
+
 	if !entry_payload_complete(kind, entry.payload) {
 		return error_make(.Invalid_Argument, "the entry payload is missing a required field")
 	}
@@ -748,6 +766,32 @@ require_tool_call :: proc(store: ^Store, id: Session_Id, seq: Seq) -> Error {
 	return nil
 }
 
+@(private)
+require_parent_tool_call :: proc(store: ^Store, id: Session_Id, seq: Seq, turn_no: Turn_No) -> Error {
+	rows: db.Rows
+	args := [?]db.Value{db.Value(string(id)), db.Value(i64(seq))}
+	if err := db.query(&store.conn, &rows, ENTRY_SELECT_KIND, args[:]); err != nil {
+		return storage_error("read the parent call", err)
+	}
+	defer db.rows_close(&rows)
+
+	values, has_row, next_err := db.rows_next(&rows)
+	if next_err != nil { return storage_error("read the parent call", next_err) }
+	if !has_row { return error_make(.Invalid_Argument, "the parent call does not exist") }
+	kind, kind_err := db.as_string(values[0])
+	if kind_err != nil { return corrupt_error("read the parent call", kind_err) }
+	if kind != entry_kind_name(.Tool_Call) {
+		return error_make(.Invalid_Argument, "the parent entry is not a tool call")
+	}
+	parent_turn, turn_err := read_optional_i64(values[1])
+	if turn_err != nil { return corrupt_error("read the parent call turn", turn_err) }
+	stored_turn, present := parent_turn.?
+	if !present || Turn_No(stored_turn) != turn_no {
+		return error_make(.Invalid_Argument, "the parent call belongs to another turn")
+	}
+	return nil
+}
+
 // --- entry reading ----------------------------------------------------------
 
 @(private)
@@ -767,7 +811,9 @@ entry_scan :: proc(values: []db.Value, allocator: mem.Allocator) -> (entry: Entr
 	if kind_err != nil { return {}, corrupt_error("read entry kind", kind_err) }
 	related_seq, related_err := read_optional_i64(values[5])
 	if related_err != nil { return {}, corrupt_error("read related sequence", related_err) }
-	payload_json, payload_err := db.as_string(values[6])
+	parent_call_seq, parent_err := read_optional_i64(values[6])
+	if parent_err != nil { return {}, corrupt_error("read parent call sequence", parent_err) }
+	payload_json, payload_err := db.as_string(values[7])
 	if payload_err != nil { return {}, corrupt_error("read entry payload", payload_err) }
 
 	kind, known := entry_kind_from_name(kind_name)
@@ -785,6 +831,7 @@ entry_scan :: proc(values: []db.Value, allocator: mem.Allocator) -> (entry: Entr
 	if value, present := turn_no.?; present { entry.turn_no = Turn_No(value) }
 	if value, present := request_no.?; present { entry.request_no = Request_No(value) }
 	if value, present := related_seq.?; present { entry.related_seq = Seq(value) }
+	if value, present := parent_call_seq.?; present { entry.parent_call_seq = Seq(value) }
 	complete = true
 	return entry, nil
 }
