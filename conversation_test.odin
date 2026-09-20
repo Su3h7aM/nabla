@@ -8,6 +8,7 @@ import "core:testing"
 
 import "nabla:term"
 import "nabla:tui"
+import "nabla:tui/widgets"
 
 // The conversation frame pipeline: snapshot entries go in as declarations,
 // layout solves the scroll container, and the visible text lines land in the
@@ -183,4 +184,72 @@ test_conversation_wraps_after_a_long_unbreakable_token :: proc(t: ^testing.T) {
 	// and being cut off at the terminal edge.
 	testing.expect_value(t, conversation_glyph_row(storage, 4, scratch[:]), "hello world this is ")
 	testing.expect_value(t, conversation_glyph_row(storage, 5, scratch[:]), "long enough to wrap ")
+}
+
+// frame_glyph_column returns the first column of row whose grapheme is glyph,
+// or -1 when the row does not carry it.
+frame_glyph_column :: proc(storage: ^Frame_Storage, row: int, glyph: string) -> int {
+	for column in 0 ..< storage.buffer.columns {
+		if storage.buffer.cells[row * storage.buffer.columns + column].grapheme == glyph {
+			return column
+		}
+	}
+	return -1
+}
+
+// A tool box and the prompt box are the same frame at the same indent: both
+// start on the column the conversation's padding leaves them, and both inset
+// their content one cell. Only the box outline carries the outcome color, so a
+// failed call is marked without tinting the result text.
+@(test)
+test_tool_box_matches_the_prompt_box :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	widgets.input_init(&app.input, context.allocator)
+	defer widgets.input_destroy(&app.input)
+	app.columns = 40
+	app.rows = 14
+	testing.expect(t, widgets.input_insert(&app.input, "prompt"))
+	snap_append(app, .Tool, "builtin.shell\nfirst line")
+	app.run.snap.entries[0].tool_outcome = .Success
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	_, frame_error := render_frame(app, storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+
+	// The tool box sits above the prompt box, so the first corner the frame
+	// carries is the tool's and the last is the prompt's.
+	tool_row := -1
+	prompt_row := -1
+	for row in 0 ..< app.rows {
+		if frame_glyph_column(storage, row, "╭") < 0 { continue }
+		if tool_row < 0 { tool_row = row }
+		prompt_row = row
+	}
+	if !testing.expect(t, tool_row >= 0 && prompt_row > tool_row, "both boxes must be drawn") { return }
+
+	columns := storage.buffer.columns
+	tool_border := frame_glyph_column(storage, tool_row, "╭")
+	prompt_border := frame_glyph_column(storage, prompt_row, "╭")
+	testing.expect_value(t, tool_border, prompt_border)
+
+	// One content row down, the label and the typed text start on one column.
+	content_row := tool_row + 1
+	testing.expect_value(t, frame_glyph_column(storage, content_row, "f"), frame_glyph_column(storage, prompt_row + 1, "p"))
+
+	// The outline is green for a success and the text between the bars is not.
+	testing.expect_value(t, storage.buffer.cells[tool_row * columns + tool_border].style, TOOL_SUCCESS)
+	testing.expect_value(t, storage.buffer.cells[content_row * columns + frame_glyph_column(storage, content_row, "│")].style, TOOL_SUCCESS)
+	testing.expect_value(t, storage.buffer.cells[content_row * columns + frame_glyph_column(storage, content_row, "f")].style, TOOL_BODY)
+
+	// A failed call draws the same box in the failure color.
+	app.run.snap.entries[0].tool_outcome = .Tool_Failed
+	_, frame_error = render_frame(app, storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	testing.expect_value(t, storage.buffer.cells[tool_row * columns + tool_border].style, TOOL_FAILURE)
 }

@@ -62,9 +62,6 @@ USER_TEXT :: term.Style {
 	background = term.Indexed_Color(8),
 }
 AGENT_TEXT :: term.Style{}
-TOOL_TEXT :: term.Style {
-	modifiers = {.Dim},
-}
 NOTICE_TEXT :: term.Style {
 	foreground = term.Indexed_Color(6),
 }
@@ -74,6 +71,9 @@ WARNING_TEXT :: term.Style {
 ERROR_TEXT :: term.Style {
 	foreground = term.Indexed_Color(1),
 }
+// A tool box draws its border in the outcome color and its content in ordinary
+// text, so a failed call is marked without tinting everything inside it.
+TOOL_BODY :: term.Style{}
 TOOL_SUCCESS :: term.Style {
 	foreground = term.Indexed_Color(2),
 }
@@ -101,6 +101,10 @@ PICKED_STYLE :: term.Style {
 // BODY_INDENT is how far message bodies sit under their label, matching the
 // reference layout.
 BODY_INDENT :: 2
+
+// TOOL_PREVIEW_LINES bounds one tool box: the preview is cut to this many
+// content rows.
+TOOL_PREVIEW_LINES :: 10
 
 // STARTUP_HINT is what an empty transcript shows under the title.
 STARTUP_HINT :: "pgup/wheel scroll | escape interrupt | ctrl+c clear/cancel/quit | /help for commands"
@@ -431,9 +435,16 @@ declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 	}
 }
 
+// declare_tool_entry draws one tool call as a bordered box: the call's name on
+// the top border, then a bounded preview of its result.
+//
+// The box starts where the prompt box does and pads its content one cell inside
+// the border, so a call and a prompt line up on the same columns. Only the
+// border carries the outcome color; the content is ordinary text.
 declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
-	box_width := max(width - 2, 4)
-	border_inner_width := box_width - 2
+	outline := widgets.BORDER_ROUNDED
+	box_width := max(width, 4)
+	border_inner_width := max(box_width - 2, 1)
 	content_width := max(box_width - 4, 1)
 	value := string(entry.text[:])
 	name := value
@@ -442,19 +453,23 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 		name = value[:split]
 		preview = value[split + 1:]
 	}
-	name = text.truncate_text(name, max(border_inner_width - 2, 0))
+	// The corner, the leading rule, and the space after the name leave the name
+	// this much room; the rest of the top border is rule.
+	name = text.truncate_text(name, max(border_inner_width - 3, 0))
 	preview = display_clean(preview, context.temp_allocator)
-	top_fill := strings.repeat("─", max(border_inner_width - text.text_columns(name) - 1, 0), context.temp_allocator) or_else ""
-	bottom_fill := strings.repeat("─", border_inner_width, context.temp_allocator) or_else ""
-	top := fmt.tprintf("╭ %s%s╮", name, top_fill)
-	bottom := fmt.tprintf("╰%s╯", bottom_fill)
-	style := TOOL_FAILURE
-	if entry.tool_outcome == .Success { style = TOOL_SUCCESS }
-	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{left = 1, bottom = 1}}}) {
-		text_style := layout_text_style(style)
-		layout.text(ctx, layout.Text_Desc{text = top, style = text_style})
+	rule_fill := strings.repeat(outline.horizontal, max(border_inner_width - text.text_columns(name) - 3, 0), context.temp_allocator) or_else ""
+	bottom_fill := strings.repeat(outline.horizontal, border_inner_width, context.temp_allocator) or_else ""
+	top := fmt.tprintf("%s%s %s %s%s", outline.top_left, outline.horizontal, name, rule_fill, outline.top_right)
+	bottom := fmt.tprintf("%s%s%s", outline.bottom_left, bottom_fill, outline.bottom_right)
+	border_style := TOOL_FAILURE
+	if entry.tool_outcome == .Success { border_style = TOOL_SUCCESS }
+	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{bottom = 1}}}) {
+		border := layout_text_style(border_style)
+		body := layout_text_style(TOOL_BODY)
+		layout.text(ctx, layout.Text_Desc{text = top, style = border})
 		remaining := preview
-		for line_count := 0; line_count < 10 && len(remaining) > 0; line_count += 1 {
+		rows := 0
+		for rows < TOOL_PREVIEW_LINES && len(remaining) > 0 {
 			logical := remaining
 			newline := strings.index(remaining, "\n")
 			if newline >= 0 { logical = remaining[:newline] }
@@ -464,7 +479,8 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 				piece = logical[:end]
 			}
 			fill := strings.repeat(" ", max(content_width - text.text_columns(piece), 0), context.temp_allocator) or_else ""
-			layout.text(ctx, layout.Text_Desc{text = fmt.tprintf("│ %s%s │", piece, fill), style = text_style})
+			declare_tool_row(ctx, fmt.tprintf(" %s%s ", piece, fill), border, body, outline.vertical)
+			rows += 1
 			if len(piece) < len(logical) {
 				remaining = remaining[len(piece):]
 			} else if newline >= 0 {
@@ -473,11 +489,22 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 				remaining = ""
 			}
 		}
-		if preview == "" {
+		if rows == 0 {
 			fill := strings.repeat(" ", content_width, context.temp_allocator) or_else ""
-			layout.text(ctx, layout.Text_Desc{text = fmt.tprintf("│ %s │", fill), style = text_style})
+			declare_tool_row(ctx, fmt.tprintf(" %s ", fill), border, body, outline.vertical)
 		}
-		layout.text(ctx, layout.Text_Desc{text = bottom, style = text_style})
+		layout.text(ctx, layout.Text_Desc{text = bottom, style = border})
+	}
+}
+
+// declare_tool_row adds one framed content row. The vertical bars carry the
+// outline style and the text between them the body style, so the box reads as
+// one outline without tinting the result inside it.
+declare_tool_row :: proc(ctx: ^layout.Context, content: string, border, body: layout.Text_Style, vertical: string) {
+	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Row}}) {
+		layout.text(ctx, layout.Text_Desc{text = vertical, style = border})
+		layout.text(ctx, layout.Text_Desc{text = content, style = body})
+		layout.text(ctx, layout.Text_Desc{text = vertical, style = border})
 	}
 }
 
@@ -629,7 +656,7 @@ entry_style :: proc(kind: Entry_Kind) -> term.Style {
 	case .Assistant:
 		return AGENT_TEXT
 	case .Tool:
-		return TOOL_TEXT
+		return TOOL_BODY
 	case .Notice:
 		return NOTICE_TEXT
 	case .Warning:
