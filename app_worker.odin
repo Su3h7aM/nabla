@@ -129,6 +129,10 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	// A sink that failed during the previous item is reported once, here, where
 	// the snapshot can carry it.
 	run_log_failure(&app.setup, &app.run.log_failure_reported)
+	// Catalog metadata can arrive while the worker is idle or while a turn is in
+	// progress. Apply it before every command; request boundaries do the same for
+	// multi-request turns.
+	catalog_selection_sync(app)
 	// Work that can change which sessions exist, or what they are called, marks the
 	// list the /resume menu reads as needing a rebuild.
 	rows_dirty := false
@@ -221,6 +225,9 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 				snap_append(app, .Error, fmt.tprintf("the selection could not be recorded: %s", session.error_detail(&local)))
 			}
 		}
+	case .Catalog:
+	// catalog_selection_sync above consumed the published revision. This item
+	// exists only to wake an idle worker.
 	case .Model:
 		apply_pending_selection(app)
 	case .New_Session:

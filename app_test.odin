@@ -2,6 +2,8 @@
 #+private file
 package main
 
+import "core:mem"
+import "core:os"
 import "core:strings"
 import "core:sync/chan"
 import "core:testing"
@@ -11,6 +13,144 @@ import "nabla:agent"
 import "nabla:ai"
 import input "nabla:input"
 import "nabla:tui/widgets"
+
+CATALOG_PIPELINE_MODELS_DEV :: `{"test-provider":{"id":"test-provider","models":{"discovered-model":{"id":"discovered-model","limit":{"context":128000,"output":4096},"tool_call":true,"reasoning":true,"reasoning_options":[{"type":"effort","values":["low","high"]}]}}}}`
+
+catalog_pipeline_provider_fetch :: proc(_: rawptr, _: string, _: string, allocator: mem.Allocator) -> ([]u8, bool) {
+	body := `{"data":[{"id":"discovered-model"}]}`
+	bytes := make([]u8, len(body), allocator)
+	copy(bytes, body)
+	return bytes, true
+}
+
+catalog_pipeline_models_dev_fetch :: proc(_: rawptr, allocator: mem.Allocator) -> ([]u8, bool) {
+	bytes := make([]u8, len(CATALOG_PIPELINE_MODELS_DEV), allocator)
+	copy(bytes, CATALOG_PIPELINE_MODELS_DEV)
+	return bytes, true
+}
+
+catalog_pipeline_models_dev_unreachable :: proc(_: rawptr, _: mem.Allocator) -> ([]u8, bool) { return nil, false }
+
+// Catalog_Pipeline_Fixture is the smallest app a refresh runs in: an isolated
+// cache directory, one configured provider, and the catalog the startup path
+// would have published before any refresh. catalog_pipeline_end releases it.
+Catalog_Pipeline_Fixture :: struct {
+	app:          App,
+	user:         []agent.Catalog_Provider_Source,
+	cache:        string,
+	previous:     string,
+	had_previous: bool,
+}
+
+catalog_pipeline_app :: proc(t: ^testing.T) -> Catalog_Pipeline_Fixture {
+	fixture: Catalog_Pipeline_Fixture
+	cache, cache_err := os.make_directory_temp("", "nabla-catalog-pipeline-*", context.allocator)
+	if cache_err != nil { testing.fail_now(t, "could not create a cache directory") }
+	fixture.cache = cache
+	fixture.previous, fixture.had_previous = os.lookup_env("XDG_CACHE_HOME", context.allocator)
+	os.set_env("XDG_CACHE_HOME", cache)
+
+	fixture.user = make([]agent.Catalog_Provider_Source, 1, context.allocator)
+	fixture.user[0] = agent.Catalog_Provider_Source {
+		id               = "test-provider",
+		base_url_present = true,
+		base_url         = "http://provider.test/v1",
+		api_present      = true,
+		api              = "openai_chat_completions",
+		api_key_present  = true,
+		api_key          = "test-key",
+	}
+	fixture.app.run.alloc = context.allocator
+	fixture.app.catalog_sources = fixture.user
+	fixture.app.retired_catalogs.allocator = context.allocator
+	initial, initial_err := agent.resolve_catalog(fixture.user, {}, {}, context.allocator)
+	if initial_err != agent.Catalog_Error.None { testing.fail_now(t, "the fixture catalog did not resolve") }
+	fixture.app.setup.catalog = initial
+	return fixture
+}
+
+catalog_pipeline_end :: proc(fixture: ^Catalog_Pipeline_Fixture) {
+	agent.catalog_destroy(&fixture.app.setup.catalog)
+	catalog_retired_destroy(&fixture.app)
+	if fixture.had_previous {
+		os.set_env("XDG_CACHE_HOME", fixture.previous)
+	} else {
+		os.unset_env("XDG_CACHE_HOME")
+	}
+	delete(fixture.previous, context.allocator)
+	os.remove_all(fixture.cache)
+	delete(fixture.cache, context.allocator)
+	delete(fixture.user)
+	fixture^ = {}
+}
+
+@(test)
+test_catalog_refresh_publishes_one_complete_pipeline :: proc(t: ^testing.T) {
+	fixture := catalog_pipeline_app(t)
+	defer catalog_pipeline_end(&fixture)
+	app := &fixture.app
+
+	catalog_refresh_with(app, catalog_pipeline_provider_fetch, catalog_pipeline_models_dev_fetch)
+
+	// Provider discovery must never become a visible stage-two catalog. One
+	// revision means the worker published only after Models.dev enriched the model.
+	testing.expect_value(t, app.catalog_revision, u64(1))
+	model_index, found := agent.catalog_find_model(&app.setup.catalog, "test-provider", "discovered-model")
+	if !testing.expect(t, found, "the provider model should be present") { return }
+	model := &app.setup.catalog.models[model_index]
+	testing.expect_value(t, model.context_window, 128_000)
+	testing.expect(t, model.tools_present && model.tools)
+	testing.expect_value(t, len(model.thinking.levels), 2)
+	testing.expect_value(t, model.thinking.levels[1], "high")
+}
+
+// A refresh that acquires nothing must leave the enrichment the catalog already
+// has: a request that failed cannot take reasoning controls away from a model.
+@(test)
+test_catalog_refresh_keeps_the_enrichment_a_failed_request_could_not_replace :: proc(t: ^testing.T) {
+	fixture := catalog_pipeline_app(t)
+	defer catalog_pipeline_end(&fixture)
+	app := &fixture.app
+
+	catalog_refresh_with(app, catalog_pipeline_provider_fetch, catalog_pipeline_models_dev_fetch)
+
+	// A stray document in the cache, and a models.dev that cannot be reached.
+	path, path_err := agent.models_dev_cache_path(context.temp_allocator)
+	if !testing.expect_value(t, path_err, agent.Models_Dev_Error.None) { return }
+	stray := `{"stray":{"id":"stray","models":{"stray/model":{"id":"stray/model"}}}}`
+	testing.expect(t, os.write_entire_file(path, transmute([]u8)stray) == nil)
+
+	catalog_refresh_with(app, catalog_pipeline_provider_fetch, catalog_pipeline_models_dev_unreachable)
+
+	model_index, found := agent.catalog_find_model(&app.setup.catalog, "test-provider", "discovered-model")
+	if !testing.expect(t, found, "the model stays in the catalog") { return }
+	testing.expect_value(t, len(app.setup.catalog.models[model_index].thinking.levels), 2)
+}
+
+@(test)
+test_catalog_source_merge_keeps_providers_missing_from_a_refresh :: proc(t: ^testing.T) {
+	allocator := context.allocator
+	current: [dynamic]agent.Catalog_Provider_Source
+	current.allocator = allocator
+	first_models := make([]agent.Catalog_Model_Source, 1, allocator)
+	first_models[0].id = strings.clone("old", allocator)
+	second_models := make([]agent.Catalog_Model_Source, 1, allocator)
+	second_models[0].id = strings.clone("kept", allocator)
+	append(&current, agent.Catalog_Provider_Source{id = strings.clone("first", allocator), models = first_models})
+	append(&current, agent.Catalog_Provider_Source{id = strings.clone("second", allocator), models = second_models})
+	incoming: [dynamic]agent.Catalog_Provider_Source
+	incoming.allocator = allocator
+	incoming_models := make([]agent.Catalog_Model_Source, 1, allocator)
+	incoming_models[0].id = strings.clone("new", allocator)
+	append(&incoming, agent.Catalog_Provider_Source{id = strings.clone("first", allocator), models = incoming_models})
+	defer agent.catalog_sources_destroy(&current, allocator)
+
+	catalog_sources_merge(&current, &incoming, allocator)
+	testing.expect_value(t, len(current), 2)
+	testing.expect_value(t, current[0].models[0].id, "new")
+	testing.expect_value(t, current[1].models[0].id, "kept")
+	testing.expect_value(t, len(incoming), 0)
+}
 
 @(test)
 test_working_duration_changes_units_at_boundaries :: proc(t: ^testing.T) {

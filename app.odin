@@ -118,6 +118,10 @@ Work_Kind :: enum u8 {
 	Compact,
 	Status,
 	Effort,
+	// Catalog wakes the worker after a replacement catalog is published. The
+	// worker reapplies the active selection so metadata that arrived after the
+	// model was chosen reaches the running session and its snapshot.
+	Catalog,
 	// Model wakes the worker for a pending selection. The selection itself is not in the
 	// item: the turn owns the session until its next request boundary, so the choice has
 	// to wait in run state for whichever boundary comes first. See Pending_Selection.
@@ -221,30 +225,33 @@ Pending_Selection :: struct {
 }
 
 Runtime :: struct {
-	mu:                   sync.Mutex, // guards snapshot and pending,
-	snap:                 Snapshot,
-	work:                 Work_Chan,
-	worker:               ^thread.Thread,
-	connection:           ai.Provider_Connection,
+	mu:                       sync.Mutex, // guards snapshot and pending,
+	snap:                     Snapshot,
+	work:                     Work_Chan,
+	worker:                   ^thread.Thread,
+	connection:               ai.Provider_Connection,
 	// pending is the selection change waiting for a request boundary. It is written
 	// by the front-end and consumed by the worker, so it is guarded by mu like the
 	// snapshot the same boundary is published into.
-	pending:              Pending_Selection,
+	pending:                  Pending_Selection,
 	// steer carries lines typed while a turn is running. The front-end pushes
 	// them as they arrive and the worker drains them at request boundaries, which
 	// is why it is written from one thread and read from another.
-	steer:                agent.Steer_Queue,
-	alloc:                mem.Allocator,
-	signals:              agent.Chat_Interactive_Signals,
+	steer:                    agent.Steer_Queue,
+	alloc:                    mem.Allocator,
+	signals:                  agent.Chat_Interactive_Signals,
 	// stopping is set once by the front-end before the worker is stopped. It is
 	// separate from a turn cancellation: a cancel ends the running turn and the
 	// session keeps going, while stopping ends the process. The worker checks it
 	// at its own boundaries, so shutdown does not have to reach the worker
 	// through the command queue.
-	stopping:             bool,
+	stopping:                 bool,
 	// log_failure_reported latches the one warning that diagnostics stopped. Only
 	// the worker reads and writes it, so it needs no lock of its own.
-	log_failure_reported: bool,
+	log_failure_reported:     bool,
+	// catalog_applied_revision is the newest published catalog whose metadata the
+	// worker applied to the active selection. Only the worker reads and writes it.
+	catalog_applied_revision: u64,
 }
 
 // stop_runtime refuses further work. The front-end is the only enqueuer, so once
@@ -461,6 +468,9 @@ tui_run :: proc(
 			widgets.input_clear(&app.input)
 		}
 		catalog_updated := catalog_changed(app)
+		if catalog_updated {
+			catalog_selection_refresh_request(app)
+		}
 		if catalog_updated && app.menu_open && app.menu.kind == .Model {
 			required := app.menu.required
 			menu_rebuild_model(app)

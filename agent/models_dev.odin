@@ -58,26 +58,52 @@ Models_Dev_Error :: enum {
 Models_Dev_Fetch :: #type proc(user_data: rawptr, allocator: mem.Allocator) -> ([]u8, bool)
 
 // models_dev_catalog returns the catalog, preferring a cache that is still fresh
-// and refreshing it otherwise.
+// and that can answer the request, and refreshing it otherwise.
+//
+// `providers` is what the caller will ask the document for, so a cached document
+// that names none of them is not usable data and the refresh below replaces it.
+// Without that, a document this harness cannot enrich from -- a stray or damaged
+// file in the cache -- would keep being served until its freshness window expired.
 //
 // A stale cache is never destroyed before its replacement exists: when the
 // refresh fails the cached copy is returned instead, so a network problem
 // degrades to stale metadata rather than to none. The returned body is owned by
 // the caller.
-models_dev_catalog :: proc(fetch: Models_Dev_Fetch = models_dev_fetch, user_data: rawptr = nil, allocator := context.allocator) -> ([]u8, Models_Dev_Error) {
-	return models_dev_catalog_at(time.now(), fetch, user_data, allocator)
+models_dev_catalog :: proc(
+	fetch: Models_Dev_Fetch = models_dev_fetch,
+	user_data: rawptr = nil,
+	providers: []string = {},
+	allocator := context.allocator,
+) -> (
+	[]u8,
+	Models_Dev_Error,
+) {
+	return models_dev_catalog_at(time.now(), fetch, user_data, providers, allocator)
 }
 
 // models_dev_catalog_at is the same policy against an explicit clock, so the
 // freshness window is testable without waiting for it or forging file times.
-models_dev_catalog_at :: proc(now: time.Time, fetch: Models_Dev_Fetch, user_data: rawptr, allocator: mem.Allocator) -> ([]u8, Models_Dev_Error) {
+models_dev_catalog_at :: proc(
+	now: time.Time,
+	fetch: Models_Dev_Fetch,
+	user_data: rawptr,
+	providers: []string,
+	allocator: mem.Allocator,
+) -> (
+	[]u8,
+	Models_Dev_Error,
+) {
 	path, path_err := models_dev_cache_path(allocator)
 	if path_err != .None { return nil, path_err }
 	defer delete(path, allocator)
 	unusable := false
 	if models_dev_cache_fresh(path, now) {
-		if cached, cached_ok := models_dev_cache_read(path, allocator); cached_ok { return cached, .None }
-		// An unreadable cache counts as absent: the refresh below replaces it.
+		if cached, cached_ok := models_dev_cache_read(path, allocator); cached_ok {
+			if models_dev_cache_answers(cached, providers) { return cached, .None }
+			delete(cached, allocator)
+		}
+		// An unreadable cache counts as absent, and so does one that answers nothing
+		// for these providers: the refresh below replaces either.
 	}
 	if body, fetched := fetch(user_data, allocator); fetched {
 		if models_dev_validate(body) {
@@ -97,6 +123,20 @@ models_dev_catalog_at :: proc(now: time.Time, fetch: Models_Dev_Fetch, user_data
 	if cached, cached_ok := models_dev_cache_read(path, allocator); cached_ok { return cached, .None }
 	if unusable { return nil, .Invalid_Data }
 	return nil, .Unavailable
+}
+
+// models_dev_cache_answers reports whether a cached document can serve a request
+// for these providers: it must parse, and it must yield at least one provider
+// source. A document that parses but names none of the providers asked for cannot
+// enrich a single model, so serving it would deny enrichment for a whole
+// freshness window. An empty request asks for every provider, so any document
+// that yields one answers it. The tree lives in an arena released here.
+models_dev_cache_answers :: proc(body: []u8, providers: []string) -> bool {
+	arena: virtual.Arena
+	if arena_err := virtual.arena_init_growing(&arena); arena_err != nil { return false }
+	defer virtual.arena_destroy(&arena)
+	sources, parse_err := models_dev_parse(body, providers, virtual.arena_allocator(&arena))
+	return parse_err == .None && len(sources) > 0
 }
 
 // models_dev_validate reports whether an acquired document is usable, which is
@@ -150,7 +190,7 @@ models_dev_sources :: proc(
 	[dynamic]Catalog_Provider_Source,
 	Models_Dev_Error,
 ) {
-	body, body_err := models_dev_catalog(fetch, user_data, allocator)
+	body, body_err := models_dev_catalog(fetch, user_data, providers, allocator)
 	if body_err != .None { return {}, body_err }
 	defer delete(body, allocator)
 

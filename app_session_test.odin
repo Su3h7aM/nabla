@@ -1255,6 +1255,73 @@ test_the_mcp_lifecycle_records_name_the_server_instance :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(text, `"reason":"restart"`), "the stop names why it stopped")
 }
 
+@(test)
+test_catalog_refresh_enriches_the_active_selection :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.owns_selection = true
+
+	user := []agent.Catalog_Provider_Source {
+		{
+			id = "test-provider",
+			base_url_present = true,
+			base_url = "http://127.0.0.1:1",
+			api_present = true,
+			api = "openai_chat_completions",
+			api_key_present = true,
+			api_key = "test-key",
+		},
+	}
+	provider := []agent.Catalog_Provider_Source{{id = "test-provider", models = []agent.Catalog_Model_Source{{id = "discovered-model"}}}}
+	models_dev := []agent.Catalog_Provider_Source {
+		{
+			id = "test-provider",
+			models = []agent.Catalog_Model_Source {
+				{
+					id = "discovered-model",
+					context_window_present = true,
+					context_window = 128_000,
+					max_output_tokens_present = true,
+					max_output_tokens = 4_096,
+					tools_present = true,
+					tools = true,
+					thinking = agent.Catalog_Thinking_Source {
+						present = true,
+						supported_present = true,
+						supported = true,
+						levels_present = true,
+						levels = []string{"low", "high"},
+					},
+				},
+			},
+		},
+	}
+
+	stage_two, stage_two_err := agent.resolve_catalog(user, provider, {}, app.setup.alloc)
+	if !testing.expect_value(t, stage_two_err, agent.Catalog_Error.None) { return }
+	app.setup.catalog = stage_two
+	testing.expect(t, apply_selection(&app, "test-provider", "discovered-model", ""))
+	testing.expect_value(t, len(app.setup.session.effort_levels), 0)
+	notices := len(app.run.snap.entries)
+
+	stage_three, stage_three_err := agent.resolve_catalog(user, provider, models_dev, app.setup.alloc)
+	if !testing.expect_value(t, stage_three_err, agent.Catalog_Error.None) { return }
+	old := app.setup.catalog
+	app.setup.catalog = stage_three
+	app.catalog_revision = 1
+	catalog_selection_sync(&app)
+	agent.catalog_destroy(&old)
+	defer agent.catalog_destroy(&app.setup.catalog)
+
+	testing.expect_value(t, len(app.setup.session.effort_levels), 2)
+	testing.expect_value(t, app.setup.session.effort_levels[0], "low")
+	testing.expect(t, app.setup.session.tools_enabled)
+	testing.expect_value(t, app.run.snap.status.context_window, 128_000)
+	testing.expect_value(t, len(app.run.snap.status.effort_levels), 2)
+	testing.expect_value(t, len(app.run.snap.entries), notices)
+}
+
 // A selection the user asks for is recorded, not applied: the turn owns the session
 // until its next request boundary, so the choice waits in run state for whichever
 // boundary reaches it first, and only that one installs it.

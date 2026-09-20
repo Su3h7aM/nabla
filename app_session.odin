@@ -69,58 +69,60 @@ Run_Setup :: struct {
 }
 
 App :: struct {
-	setup:             Run_Setup,
+	setup:              Run_Setup,
 	// catalog_mu protects publication of a replacement catalog. Published
 	// catalogs are retained until teardown because active connections borrow their
 	// endpoint strings.
-	catalog_mu:        sync.Mutex,
-	retired_catalogs:  [dynamic]agent.Catalog,
-	catalog_sources:   []agent.Catalog_Provider_Source, // borrowed for tui_run
-	catalog_refresh:   Catalog_Refresh_Chan,
-	catalog_worker:    ^thread.Thread,
-	catalog_revision:  u64,
-	catalog_seen:      u64,
-	terminal:          ^term.Session,
-	tty:               ^os.File,
-	parser:            input.Parser,
-	raw:               [dynamic]input.Event, // owned; the latest input batch,
-	run:               Runtime,
-	storage:           ^Frame_Storage,
-	home:              string, // owned; shortens the footer path,
-	input:             widgets.Input,
-	scroll:            int, // rows scrolled back; 0 follows the bottom,
+	catalog_mu:         sync.Mutex,
+	retired_catalogs:   [dynamic]agent.Catalog,
+	catalog_sources:    []agent.Catalog_Provider_Source, // borrowed for tui_run
+	provider_sources:   [dynamic]agent.Catalog_Provider_Source, // owned refresh snapshot
+	models_dev_sources: [dynamic]agent.Catalog_Provider_Source, // owned refresh snapshot
+	catalog_refresh:    Catalog_Refresh_Chan,
+	catalog_worker:     ^thread.Thread,
+	catalog_revision:   u64,
+	catalog_seen:       u64,
+	terminal:           ^term.Session,
+	tty:                ^os.File,
+	parser:             input.Parser,
+	raw:                [dynamic]input.Event, // owned; the latest input batch,
+	run:                Runtime,
+	storage:            ^Frame_Storage,
+	home:               string, // owned; shortens the footer path,
+	input:              widgets.Input,
+	scroll:             int, // rows scrolled back; 0 follows the bottom,
 	// conv_scroll_range is the conversation's scrollable height in rows, as
 	// the last completed layout frame reported it. The offset handed to layout
 	// is range - scroll, so a scroll of 0 pins the newest content to the
 	// bottom and the range shrinks and grows with the transcript.
-	conv_scroll_range: int,
-	generation_seen:   u64,
-	cancel_seen:       bool, // the running cancel came from our own keys, not a signal,
-	spin_lap:          time.Tick, // last working-frame advance,
-	spin_frame:        int,
+	conv_scroll_range:  int,
+	generation_seen:    u64,
+	cancel_seen:        bool, // the running cancel came from our own keys, not a signal,
+	spin_lap:           time.Tick, // last working-frame advance,
+	spin_frame:         int,
 	// menu is the open choice list, when menu_open. One component serves every
 	// command whose argument is picked from a list.
-	menu:              Menu,
-	menu_open:         bool,
+	menu:               Menu,
+	menu_open:          bool,
 	// completion_query and completion_index carry a Tab cycle: the prefix the
 	// cycle began with and where it has reached. Any other key ends the cycle.
-	completion_query:  string, // owned,
-	completion_index:  int,
-	completion_active: bool,
-	columns:           int,
-	rows:              int,
+	completion_query:   string, // owned,
+	completion_index:   int,
+	completion_active:  bool,
+	columns:            int,
+	rows:               int,
 	// conversation_rect is the cells the transcript occupied in the last frame. A
 	// mouse report is in screen cells, so this is what converts one into the
 	// conversation's own coordinates.
-	conversation_rect: tui.Cell_Rect,
+	conversation_rect:  tui.Cell_Rect,
 	// selecting marks a drag in progress, and the anchor and cursor are the cells
 	// it spans. The selection lives only while the drag does: the release copies
 	// what it covers, so there is no highlight left to drift when the transcript
 	// moves under it.
-	selecting:         bool,
-	selection_anchor:  Cell_Point,
-	selection_cursor:  Cell_Point,
-	quit:              bool,
+	selecting:          bool,
+	selection_anchor:   Cell_Point,
+	selection_cursor:   Cell_Point,
+	quit:               bool,
 }
 
 // resolve_run_catalog builds the initial resolved catalog from local data only:
@@ -527,6 +529,7 @@ apply_pending_selection :: proc(app: ^App) -> bool {
 // which an install replaces.
 app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
 	app := cast(^App)steer.apply_data
+	catalog_selection_sync(app)
 	apply_pending_selection(app)
 	sync.mutex_lock(&app.run.mu)
 	steer.provider_id = app.setup.provider_id
@@ -546,7 +549,7 @@ app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
 // exists, or at startup before it starts. The selection persists on success, so
 // the next launch restores it. A failure is reported through the snapshot; the
 // previously selected model, if any, stays in place.
-apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> bool {
+apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announce := true) -> bool {
 	sync.mutex_lock(&app.catalog_mu)
 	defer sync.mutex_unlock(&app.catalog_mu)
 	provider_index, provider_found := agent.catalog_find_provider(&app.setup.catalog, provider_id)
@@ -590,11 +593,13 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	}
 
 	running := &app.setup.session
-	// A different model means a different window and a different cache identity, so
-	// a summary computed for the previous one is no longer a summary of this
-	// conversation. It is stopped here rather than installed against the old base.
-	agent.chat_compact_cancel(running)
-	if running.provider_websocket != nil {
+	selection_changed := app.setup.provider_id != provider_id || app.setup.model_id != model_id
+	connection_changed := app.run.connection.API != api || app.run.connection.Endpoint != provider.base_url || running.provider_transport != provider.transport
+	// A different model invalidates a pending summary. A metadata-only refresh of
+	// the same model does not: it updates the facts used by the next request while
+	// preserving compaction already in flight.
+	if selection_changed { agent.chat_compact_cancel(running) }
+	if running.provider_websocket != nil && (selection_changed || connection_changed) {
 		ai.Provider_WebSocket_Session_Destroy(running.provider_websocket)
 		running.provider_websocket = nil
 	}
@@ -656,12 +661,12 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 	app.setup.provider_id = setup_provider
 	delete(app.setup.model_id, app.setup.alloc)
 	app.setup.model_id = setup_model
-	if app.setup.owns_selection { selection_publish_locked(app, provider_id, model_id) }
+	if app.setup.owns_selection { selection_publish_locked(app, provider_id, model_id, announce) }
 	sync.mutex_unlock(&app.run.mu)
 
 	// A run that owns the selection remembers it, so the next launch restores the
 	// user's own last choice. A headless or child run leaves it alone.
-	if app.setup.owns_selection {
+	if app.setup.owns_selection && announce {
 		saved := session.Selection {
 			provider = provider_id,
 			model    = model_id,
@@ -679,7 +684,7 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> boo
 // caller holds the runtime mutex, because the status block is what the frame
 // reads; a headless run has no frame and never calls this.
 @(private)
-selection_publish_locked :: proc(app: ^App, provider_id, model_id: string) {
+selection_publish_locked :: proc(app: ^App, provider_id, model_id: string, announce := true) {
 	running := &app.setup.session
 	status := &app.run.snap.status
 	if status.provider_id != provider_id {
@@ -706,7 +711,7 @@ selection_publish_locked :: proc(app: ^App, provider_id, model_id: string) {
 	status.context_window = running.capacity.window
 	delete(app.run.snap.setup_error, app.run.alloc)
 	app.run.snap.setup_error = ""
-	snap_append_locked(app, .Notice, fmt.tprintf("model set to %s / %s", provider_id, model_id))
+	if announce { snap_append_locked(app, .Notice, fmt.tprintf("model set to %s / %s", provider_id, model_id)) }
 	app.run.snap.generation += 1
 }
 
