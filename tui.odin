@@ -59,7 +59,7 @@ LABEL_STYLE :: term.Style {
 	modifiers = {.Bold},
 }
 USER_TEXT :: term.Style {
-	modifiers = {.Reverse},
+	background = term.Indexed_Color(8),
 }
 AGENT_TEXT :: term.Style{}
 TOOL_TEXT :: term.Style {
@@ -267,16 +267,16 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 
 	// The prompt grows with wrapped input until five content rows, then keeps the
 	// caret visible by scrolling those rows inside its border.
-	viewport := tui.Cell_Rect {
-		x      = 0,
+	content := tui.Cell_Rect {
+		x      = 1,
 		y      = 0,
-		width  = cols,
+		width  = max(cols - 2, 0),
 		height = rows,
 	}
-	input_rows := input_visible_rows(&app.input, max(cols - 4, 1))
+	input_rows := input_visible_rows(&app.input, max(content.width - 4, 1))
 	heights := [4]int{-1, input_rows + 2, 1, 1}
 	regions: [4]tui.Cell_Rect
-	if !tui.rows(viewport, heights[:], regions[:]) {
+	if !tui.rows(content, heights[:], regions[:]) {
 		return {}, .Layout_Failed
 	}
 	conv_rect := regions[0]
@@ -365,7 +365,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 		}
 		corrected := app.conv_scroll_range - app.scroll
 		if corrected == offset || pass == 1 {
-			return draw_conversation_commands(storage, frame_result)
+			return draw_conversation_commands(storage, frame_result, rect)
 		}
 		offset = corrected
 	}
@@ -374,7 +374,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 
 // draw_conversation_commands projects the solved frame's text commands into
 // the cell grid. Culling already dropped every line outside the clip.
-draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result) -> bool {
+draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result, viewport: tui.Cell_Rect) -> bool {
 	for command in frame_result.commands {
 		text_data, is_text := command.data.(layout.Text_Cmd)
 		if !is_text {
@@ -384,9 +384,11 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 		if project_err != nil {
 			return false
 		}
+		line.x += viewport.x
+		line.y += viewport.y
 		style := term_text_style(text_data.style)
 		if text_data.style.font == FONT_USER {
-			tui.fill(&storage.buffer, {x = 0, y = line.y, width = storage.buffer.columns, height = 1}, " ", style)
+			tui.fill(&storage.buffer, {x = viewport.x, y = line.y, width = viewport.width, height = 1}, " ", style)
 		}
 		_, _ = tui.draw_text(&storage.buffer, line, text_data.text, style)
 	}
@@ -431,7 +433,8 @@ declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 
 declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 	box_width := max(width - 2, 4)
-	inner_width := box_width - 2
+	border_inner_width := box_width - 2
+	content_width := max(box_width - 4, 1)
 	value := string(entry.text[:])
 	name := value
 	preview := ""
@@ -439,10 +442,10 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 		name = value[:split]
 		preview = value[split + 1:]
 	}
-	name = text.truncate_text(name, max(inner_width - 2, 0))
+	name = text.truncate_text(name, max(border_inner_width - 2, 0))
 	preview = display_clean(preview, context.temp_allocator)
-	top_fill := strings.repeat("─", max(inner_width - text.text_columns(name) - 1, 0), context.temp_allocator) or_else ""
-	bottom_fill := strings.repeat("─", inner_width, context.temp_allocator) or_else ""
+	top_fill := strings.repeat("─", max(border_inner_width - text.text_columns(name) - 1, 0), context.temp_allocator) or_else ""
+	bottom_fill := strings.repeat("─", border_inner_width, context.temp_allocator) or_else ""
 	top := fmt.tprintf("╭ %s%s╮", name, top_fill)
 	bottom := fmt.tprintf("╰%s╯", bottom_fill)
 	style := TOOL_FAILURE
@@ -452,18 +455,27 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 		layout.text(ctx, layout.Text_Desc{text = top, style = text_style})
 		remaining := preview
 		for line_count := 0; line_count < 10 && len(remaining) > 0; line_count += 1 {
-			piece := text.truncate_text(remaining, inner_width)
-			if piece == "" {
-				end := text.next_grapheme_offset(remaining, 0)
-				piece = remaining[:end]
+			logical := remaining
+			newline := strings.index(remaining, "\n")
+			if newline >= 0 { logical = remaining[:newline] }
+			piece := text.truncate_text(logical, content_width)
+			if piece == "" && len(logical) > 0 {
+				end := text.next_grapheme_offset(logical, 0)
+				piece = logical[:end]
 			}
-			fill := strings.repeat(" ", max(inner_width - text.text_columns(piece), 0), context.temp_allocator) or_else ""
-			layout.text(ctx, layout.Text_Desc{text = fmt.tprintf("│%s%s│", piece, fill), style = text_style})
-			remaining = remaining[len(piece):]
+			fill := strings.repeat(" ", max(content_width - text.text_columns(piece), 0), context.temp_allocator) or_else ""
+			layout.text(ctx, layout.Text_Desc{text = fmt.tprintf("│ %s%s │", piece, fill), style = text_style})
+			if len(piece) < len(logical) {
+				remaining = remaining[len(piece):]
+			} else if newline >= 0 {
+				remaining = remaining[newline + 1:]
+			} else {
+				remaining = ""
+			}
 		}
 		if preview == "" {
-			fill := strings.repeat(" ", inner_width, context.temp_allocator) or_else ""
-			layout.text(ctx, layout.Text_Desc{text = fmt.tprintf("│%s│", fill), style = text_style})
+			fill := strings.repeat(" ", content_width, context.temp_allocator) or_else ""
+			layout.text(ctx, layout.Text_Desc{text = fmt.tprintf("│ %s │", fill), style = text_style})
 		}
 		layout.text(ctx, layout.Text_Desc{text = bottom, style = text_style})
 	}
@@ -480,13 +492,13 @@ layout_text_style :: proc(style: term.Style) -> layout.Text_Style {
 		// terminal adapter, which restores terminal-default or ANSI styling.
 		color = layout.Color{0, 0, 0, 255},
 	}
-	if .Reverse in style.modifiers {
+	if _, background_ok := style.background.(term.Indexed_Color); background_ok {
 		result.font = FONT_USER
 	} else if .Bold in style.modifiers {
 		result.font = FONT_BOLD
 	} else if .Dim in style.modifiers {
 		result.font = FONT_DIM
-	} else if indexed, ok := style.foreground.(term.Indexed_Color); ok {
+	} else if indexed, foreground_ok := style.foreground.(term.Indexed_Color); foreground_ok {
 		switch indexed {
 		case 1:
 			result.font = FONT_RED
@@ -510,7 +522,7 @@ term_text_style :: proc(style: layout.Text_Style) -> term.Style {
 	case FONT_BOLD:
 		result.modifiers = {.Bold}
 	case FONT_USER:
-		result.modifiers = {.Reverse}
+		result.background = term.Indexed_Color(8)
 	case FONT_DIM:
 		result.modifiers = {.Dim}
 	case FONT_RED:
@@ -628,15 +640,14 @@ entry_style :: proc(kind: Entry_Kind) -> term.Style {
 	return {}
 }
 
-// working_label is what the working indicator says: the retry the turn is waiting for,
-// with the time left of it, or the plain label for a turn that is simply working.
+// working_label reports the elapsed time for the complete active turn. The
+// start survives provider requests, tool calls, and retries, and is replaced
+// only when a later prompt starts from idle.
 working_label :: proc(app: ^App) -> string {
 	status := &app.run.snap.status
-	if !status.retry_present { return WORKING_LABEL }
-	// The due time is monotonic, so the time left is measured against the same clock the
-	// wait uses; a due time already past reads as no time left rather than as negative.
-	remaining := min(time.tick_since(status.retry_due), time.Duration(0))
-	return fmt.tprintf("Retrying in %s (attempt %d of %d)", display_duration(-remaining), status.retry_next, status.retry_max)
+	elapsed := time.tick_diff(status.working_since, time.tick_now())
+	seconds := max(i64(time.duration_seconds(elapsed)), 0)
+	return fmt.tprintf("Working for %ds", seconds)
 }
 
 // draw_working renders the rule row as the working indicator: dashes, a gap,
@@ -718,7 +729,7 @@ draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> t
 	border_style := RULE_STYLE
 	widgets.draw_block(&storage.buffer, rect, widgets.Block{border = widgets.BORDER_ROUNDED, style = border_style})
 	if app.run.snap.status.running {
-		title := fmt.tprintf(" %s ", working_label(app))
+		title := fmt.tprintf(" %s %s ", spinner_glyph(app.spin_frame), working_label(app))
 		_, _ = tui.draw_text(
 			&storage.buffer,
 			{x = rect.x + 2, y = rect.y, width = min(text.text_columns(title), rect.width - 4), height = 1},

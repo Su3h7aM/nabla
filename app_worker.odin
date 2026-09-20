@@ -454,7 +454,11 @@ refresh_status :: proc(app: ^App) {
 		delete(status.cwd, app.run.alloc)
 		status.cwd = strings.clone(running.workspace, app.run.alloc)
 	}
+	was_running := status.running
 	status.running = running.state != .Idle
+	if status.running && !was_running {
+		status.working_since = time.tick_now()
+	}
 	// A retry belongs to the turn that scheduled it. A turn that is no longer running has
 	// none, so the working indicator cannot keep showing the attempt it waited for.
 	if !status.running { status.retry_present = false }
@@ -478,7 +482,11 @@ refresh_status :: proc(app: ^App) {
 set_running :: proc(app: ^App, running: bool) {
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
-	app.run.snap.status.running = running
+	status := &app.run.snap.status
+	if running && !status.running {
+		status.working_since = time.tick_now()
+	}
+	status.running = running
 	app.run.snap.generation += 1
 }
 
@@ -649,7 +657,7 @@ obs_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Res
 		text         = make([dynamic]u8, 0, 0, app.run.alloc),
 		tool_outcome = result.outcome,
 	}
-	preview_text := result.content
+	preview_text := tool_display_preview(result)
 	if preview_text == "" { preview_text = tool_display_summary(result) }
 	preview := fmt.tprintf("%s\n%s", name, preview_text)
 	append(&entry.text, ..transmute([]byte)preview)

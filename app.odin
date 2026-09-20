@@ -73,6 +73,9 @@ Status :: struct {
 	// because some finished requests reported no cache usage.
 	session_hit_partial:   bool,
 	running:               bool,
+	// working_since spans the complete execution of one accepted prompt, across
+	// every provider request and tool call, until the session returns to idle.
+	working_since:         time.Tick,
 	// The retry the turn is waiting for, while it waits for one. The attempt numbers come
 	// from the retry the agent scheduled, and the due time is when the harness sends
 	// again: a front-end showing this clears it when the next send is prepared, and the
