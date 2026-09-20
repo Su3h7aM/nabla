@@ -202,6 +202,28 @@ test_empty_text_and_replacement_character_messages :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_invalid_outgoing_text_is_never_sent :: proc(t: ^testing.T) {
+	// RFC 6455 5.6: what this endpoint sends as text is valid UTF-8. The
+	// whole message is checked before its first frame, so a refusal sends
+	// nothing and the connection stays usable.
+	fixture: Fixture
+	defer delete(fixture.outgoing)
+	conn := fixture_conn(t, &fixture, nil)
+	if conn == nil { return }
+	defer destroy(conn)
+
+	testing.expect_value(t, write(conn, .Text, []u8{0xff}), Error.Protocol)
+	testing.expect_value(t, len(fixture.outgoing), 0)
+	testing.expect_value(t, write(conn, .Text, transmute([]u8)string("valid")), Error.None)
+	testing.expect(t, len(fixture.outgoing) > 0, "valid text was not sent")
+	clear(&fixture.outgoing)
+	testing.expect_value(t, write(conn, .Binary, []u8{0xff}), Error.None)
+	testing.expect(t, len(fixture.outgoing) > 0, "binary was refused for its bytes")
+	testing.expect_value(t, write(conn, .Text, nil), Error.None)
+	testing.expect_value(t, write(nil, .Text, transmute([]u8)string("hi")), Error.Protocol)
+}
+
+@(test)
 test_invalid_close_payloads_are_not_echoed :: proc(t: ^testing.T) {
 	Cases := []struct {
 		frame: []u8,
@@ -246,7 +268,12 @@ test_a_large_message_is_fragmented_into_masked_frames :: proc(t: ^testing.T) {
 
 	message := make([]u8, 2 * SEND_CHUNK + 100)
 	defer delete(message)
-	for i in 0 ..< len(message) { message[i] = u8(i) }
+	// Valid UTF-8: cycling letters, with one three-byte rune straddling the
+	// first frame boundary, which whole-message validation accepts.
+	for i in 0 ..< len(message) { message[i] = 'a' + u8(i % 26) }
+	message[SEND_CHUNK - 1] = 0xe2
+	message[SEND_CHUNK] = 0x82
+	message[SEND_CHUNK + 1] = 0xac
 
 	if !testing.expect(t, write(conn, .Text, message) == .None, "the message could not be written") { return }
 

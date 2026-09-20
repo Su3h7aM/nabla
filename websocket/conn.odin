@@ -125,7 +125,11 @@ connection_release :: proc(conn: ^Conn, aborted: bool) {
 // every frame is masked under a key of its own, which is what a client must do
 // (RFC 6455 section 5.3).
 write :: proc(conn: ^Conn, opcode: Opcode, message: []u8) -> Error {
+	if conn == nil { return .Protocol }
 	if opcode != .Text && opcode != .Binary { return .Protocol }
+	// RFC 6455 5.6: a text message is valid UTF-8. The whole message is
+	// checked before its first frame, so a refusal sends nothing.
+	if opcode == .Text && !utf8.valid_string(string(message)) { return .Protocol }
 	if conn.closed || conn.close_sent { return .Closed }
 
 	pending := message
