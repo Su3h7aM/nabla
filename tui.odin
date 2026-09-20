@@ -816,14 +816,36 @@ entry_style :: proc(kind: Entry_Kind) -> term.Style {
 	return {}
 }
 
+WORKING_SECONDS_PER_MINUTE :: i64(60)
+WORKING_MINUTES_PER_HOUR :: i64(60)
+WORKING_SECONDS_PER_HOUR :: WORKING_SECONDS_PER_MINUTE * WORKING_MINUTES_PER_HOUR
+
+// working_duration formats whole seconds with every useful unit. Seconds stand
+// alone below one minute, minutes include seconds, and hours include both.
+working_duration :: proc(total_seconds: i64) -> string {
+	seconds := max(total_seconds, 0)
+	if seconds < WORKING_SECONDS_PER_MINUTE {
+		return fmt.tprintf("%ds", seconds)
+	}
+	if seconds < WORKING_SECONDS_PER_HOUR {
+		minutes := seconds / WORKING_SECONDS_PER_MINUTE
+		remaining_seconds := seconds % WORKING_SECONDS_PER_MINUTE
+		return fmt.tprintf("%dm %ds", minutes, remaining_seconds)
+	}
+	hours := seconds / WORKING_SECONDS_PER_HOUR
+	minutes := seconds % WORKING_SECONDS_PER_HOUR / WORKING_SECONDS_PER_MINUTE
+	remaining_seconds := seconds % WORKING_SECONDS_PER_MINUTE
+	return fmt.tprintf("%dh %dm %ds", hours, minutes, remaining_seconds)
+}
+
 // working_label reports the elapsed time for the complete active turn. The
 // start survives provider requests, tool calls, and retries, and is replaced
 // only when a later prompt starts from idle.
 working_label :: proc(app: ^App) -> string {
 	status := &app.run.snap.status
 	elapsed := time.tick_diff(status.working_since, time.tick_now())
-	seconds := max(i64(time.duration_seconds(elapsed)), 0)
-	return fmt.tprintf("Working for %ds", seconds)
+	seconds := i64(time.duration_seconds(elapsed))
+	return fmt.tprintf("Working for %s", working_duration(seconds))
 }
 
 // draw_working renders the rule row as the working indicator: dashes, a gap,
