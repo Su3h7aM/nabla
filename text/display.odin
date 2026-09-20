@@ -81,6 +81,27 @@ display_next :: proc(it: ^Display_Iterator) -> (cluster: Display_Cluster, status
 	}
 }
 
+// prefix_covering_columns returns the shortest prefix whose drawable width is
+// at least columns, rounded to a grapheme boundary. Invalid text returns the
+// whole value.
+prefix_covering_columns :: proc(value: string, columns: int, profile: Width_Profile = DEFAULT_WIDTH_PROFILE) -> string {
+	if columns <= 0 {
+		return ""
+	}
+	covered := 0
+	iterator := display_iterator_make(value, profile)
+	for {
+		cluster, status := display_next(&iterator)
+		if status != .OK {
+			return value
+		}
+		covered += cluster.width
+		if covered >= columns {
+			return value[:cluster.end]
+		}
+	}
+}
+
 // cluster_width returns grapheme's display width: 0 for the empty placeholder,
 // 1 or 2 for exactly one drawable cluster, and -1 otherwise.
 cluster_width :: proc(grapheme: string, profile: Width_Profile = DEFAULT_WIDTH_PROFILE) -> int {

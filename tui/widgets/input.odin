@@ -136,7 +136,7 @@ draw_input_rect :: proc(
 	if cursor_columns >= rect.width {
 		offset = cursor_columns - rect.width + 1
 	}
-	start := _scrolled_prefix(value, offset, profile)
+	start := text.prefix_covering_columns(value, offset, profile)
 	used := text.text_columns(start, profile)
 	_, _ = tui.draw_text(buffer, {x = rect.x, y = rect.y, width = rect.width, height = 1}, value[len(start):], style, profile)
 	column := clamp(rect.x + cursor_columns - used, rect.x, rect.x + rect.width - 1)
@@ -160,7 +160,7 @@ draw_input_context :: proc(ctx: ^tui.Context, input: Input, style: term.Style) -
 	if cursor_columns >= rect.width {
 		offset = cursor_columns - rect.width + 1
 	}
-	start := _scrolled_prefix(value, offset, profile)
+	start := text.prefix_covering_columns(value, offset, profile)
 	used := text.text_columns(start, profile)
 	_, _ = tui.draw_text(ctx, value[len(start):], style)
 	column := clamp(rect.x + cursor_columns - used, rect.x, rect.x + rect.width - 1)
@@ -176,28 +176,6 @@ draw_input_context :: proc(ctx: ^tui.Context, input: Input, style: term.Style) -
 draw_input :: proc {
 	draw_input_rect,
 	draw_input_context,
-}
-
-// _scrolled_prefix returns the shortest prefix to hide so the rest is scrolled
-// past at least columns cells, rounded up to a cluster boundary. Rounding up
-// leaves room for the caret; rounding down can leave a wide cluster filling the
-// last cell, which no coordinate clamp can fix.
-_scrolled_prefix :: proc(value: string, columns: int, profile: text.Width_Profile) -> string {
-	if columns <= 0 {
-		return ""
-	}
-	scrolled := 0
-	it := text.display_iterator_make(value, profile)
-	for {
-		cluster, status := text.display_next(&it)
-		if status != .OK {
-			return value
-		}
-		scrolled += cluster.width
-		if scrolled >= columns {
-			return value[:cluster.end]
-		}
-	}
 }
 
 _input_skip :: proc(byte: u8) -> bool {
