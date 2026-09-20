@@ -569,7 +569,7 @@ Verified against the code at the time of writing.
 | Area | Evidence |
 |---|---|
 | Presence-flag convention | `Provider_Request` (`ai/contract.odin`), `Catalog_*_Source` (`agent/catalog.odin`) |
-| Step-function loop | `chat_session_advance` → `Chat_Effect_Kind{Start_Request, Run_Tools, Turn_Finished}` |
+| Step-function loop | `chat_session_advance` → `Chat_Effect_Kind{Start_Request, Run_Tools, Step_Tools, Wait_Tools, Finish_Tools, Turn_Finished}`; the tool table lives on `Chat_Session` |
 | Steering at a boundary | `chat_drain_steering` runs when state is `.Preparing` |
 | Operation lifecycle | `Chat_Operation_State{None, Running, Retired}`, event-source gating |
 | Local pre-send estimate | `chat_estimate_input_tokens` + `chat_admission_check` |

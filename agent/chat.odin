@@ -950,9 +950,21 @@ chat_run_turn_steered :: proc(
 			chat_effect_destroy(&effect)
 			chat_perform_request(chat, current, policy, observer, &usages)
 		case .Run_Tools:
+			turn_id := effect.turn_id
 			chat_effect_destroy(&effect)
-			count := chat_run_tools(chat, observer)
-			chat_session_tools_done(chat, chat.active_turn_id, count)
+			chat_tool_jobs_begin(chat, observer)
+			if chat.active_turn_id != turn_id { return false }
+		case .Step_Tools:
+			tool_effect := effect.tool
+			chat_effect_destroy(&effect)
+			chat_tool_jobs_step(chat, observer, tool_effect)
+		case .Wait_Tools:
+			chat_effect_destroy(&effect)
+			chat_tool_jobs_wait(chat)
+		case .Finish_Tools:
+			turn_id := effect.turn_id
+			chat_effect_destroy(&effect)
+			if !chat_tool_jobs_finish(chat, turn_id) { return false }
 			if chat_session_cancelled(chat) { chat_session_note_cancel(chat) }
 		case .Turn_Finished:
 			// A turn whose outcome did not reach the store reports the storage failure,

@@ -9,7 +9,15 @@ import "nabla:ai"
 Chat_Effect_Kind :: enum {
 	None,
 	Start_Request,
+	// Run_Tools admits the response's committed calls into the session-owned job
+	// table. It does not run an executor.
 	Run_Tools,
+	// Step_Tools performs the one job effect carried in tool.
+	Step_Tools,
+	// Wait_Tools sleeps until a worker publishes or the wait slice ends.
+	Wait_Tools,
+	// Finish_Tools releases the settled table and closes the response's tool batch.
+	Finish_Tools,
 	Turn_Finished,
 }
 
@@ -19,6 +27,7 @@ Chat_Effect_Kind :: enum {
 Chat_Effect :: struct {
 	kind:      Chat_Effect_Kind,
 	turn_id:   u64,
+	tool:      Tool_Job_Effect,
 	status:    Chat_Terminal_Status,
 	error:     string, // owned
 	allocator: mem.Allocator,
@@ -31,6 +40,27 @@ chat_effect_destroy :: proc(effect: ^Chat_Effect) {
 	effect^ = {}
 }
 
+// chat_session_tool_effect selects one bounded job-table effect while a batch is
+// active. A batch that has not been admitted starts with Run_Tools; a settled batch
+// ends with Finish_Tools. Nothing here runs an executor, waits, or writes history.
+@(private)
+chat_session_tool_effect :: proc(chat: ^Chat_Session) -> Chat_Effect {
+	if !chat.tool_jobs_active {
+		return Chat_Effect{kind = .Run_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}
+	}
+	tool_jobs_latch_stop(&chat.tool_jobs, chat)
+	next := tool_jobs_next(&chat.tool_jobs)
+	switch next {
+	case .Commit, .Refuse, .Retire, .Dispatch:
+		return Chat_Effect{kind = .Step_Tools, turn_id = chat.active_turn_id, tool = next, allocator = chat.allocator}
+	case .Wait:
+		return Chat_Effect{kind = .Wait_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}
+	case .Done:
+		return Chat_Effect{kind = .Finish_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}
+	}
+	return chat_effect_none()
+}
+
 // chat_session_advance is the control decision for the current state. It touches
 // nothing durable: the driver runs the effect and records what happened.
 chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
@@ -38,12 +68,15 @@ chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
 	case .Idle, .Requesting, .Streaming:
 		return chat_effect_none()
 	case .Executing_Tools:
-		return Chat_Effect{kind = .Run_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}
+		return chat_session_tool_effect(chat)
 	case .Preparing:
 		chat.requests_made += 1
 		chat.state = .Requesting
 		return Chat_Effect{kind = .Start_Request, turn_id = chat.active_turn_id, allocator = chat.allocator}
 	case .Cancelling:
+		// Tool jobs still have to settle their committed calls. Cancellation stops
+		// admission; it does not permit dangling results or freed worker storage.
+		if chat.tool_jobs_active { return chat_session_tool_effect(chat) }
 		// Cancellation requested interruption; it did not stop anything. A cancelled
 		// turn finalizes only after its operation is retired, which is the
 		// confirmation that the request is no longer running.

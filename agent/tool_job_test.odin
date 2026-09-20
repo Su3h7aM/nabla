@@ -400,3 +400,106 @@ test_a_settled_batch_releases_every_thread_and_byte :: proc(t: ^testing.T) {
 	tool_jobs_destroy(&jobs)
 	testing.expect_value(t, len(tracker.allocation_map), 0)
 }
+
+// The chat state machine owns the table and exposes one bounded effect at a time. Two
+// advances before an effect is performed select the same effect and do not admit or
+// launch anything twice.
+@(test)
+test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
+	tool_job_hold_reset()
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+	tool_job_test_register(t, &test, tool_job_hold_definition("test.owned"))
+	_test_stage_call(t, chat, "call_owned", `{}`, "test.owned")
+
+	first := chat_session_advance(chat)
+	defer chat_effect_destroy(&first)
+	second := chat_session_advance(chat)
+	defer chat_effect_destroy(&second)
+	testing.expect_value(t, first.kind, Chat_Effect_Kind.Run_Tools)
+	testing.expect_value(t, second.kind, Chat_Effect_Kind.Run_Tools)
+	testing.expect(t, !chat.tool_jobs_active, "advance must not perform its own effect")
+
+	chat_tool_jobs_begin(chat, {})
+	testing.expect(t, chat.tool_jobs_active, "the submitted table belongs to the session")
+	testing.expect_value(t, len(chat.tool_jobs.jobs), 1)
+
+	dispatch := chat_session_advance(chat)
+	testing.expect_value(t, dispatch.kind, Chat_Effect_Kind.Step_Tools)
+	testing.expect_value(t, dispatch.tool, Tool_Job_Effect.Dispatch)
+	chat_tool_jobs_step(chat, {}, dispatch.tool)
+	chat_effect_destroy(&dispatch)
+	tool_job_test_hold_until(t, 1)
+
+	wait := chat_session_advance(chat)
+	testing.expect_value(t, wait.kind, Chat_Effect_Kind.Wait_Tools)
+	chat_effect_destroy(&wait)
+
+	tool_job_hold_release_all()
+	for _ in 0 ..< 100_000 {
+		effect := chat_session_advance(chat)
+		switch effect.kind {
+		case .Step_Tools:
+			chat_tool_jobs_step(chat, {}, effect.tool)
+		case .Wait_Tools:
+			chat_tool_jobs_wait(chat)
+		case .Finish_Tools:
+			turn_id := effect.turn_id
+			chat_effect_destroy(&effect)
+			testing.expect(t, chat_tool_jobs_finish(chat, turn_id), "the settled batch should close")
+			testing.expect(t, !chat.tool_jobs_active, "finishing releases the session table")
+			testing.expect_value(t, chat.state, Chat_State.Preparing)
+			return
+		case .None, .Start_Request, .Run_Tools, .Turn_Finished:
+			testing.fail_now(t, "the chat selected an invalid tool effect")
+		}
+		chat_effect_destroy(&effect)
+	}
+	testing.expect(t, false, "the session-owned batch never settled")
+}
+
+// Cancellation does not skip the job table. The cancelling state keeps selecting job
+// effects until every committed call has a result and every producer has retired.
+@(test)
+test_cancelling_chat_drains_session_owned_jobs :: proc(t: ^testing.T) {
+	tool_job_hold_reset()
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+	tool_job_test_register(t, &test, tool_job_hold_definition("test.cancel"))
+	_test_stage_call(t, chat, "call_cancel", `{}`, "test.cancel")
+	chat_tool_jobs_begin(chat, {})
+
+	dispatch := chat_session_advance(chat)
+	chat_tool_jobs_step(chat, {}, dispatch.tool)
+	chat_effect_destroy(&dispatch)
+	tool_job_test_hold_until(t, 1)
+
+	chat_session_request_cancel(chat)
+	defer chat_cancel_reset()
+	testing.expect_value(t, chat.state, Chat_State.Cancelling)
+
+	for _ in 0 ..< 100_000 {
+		effect := chat_session_advance(chat)
+		switch effect.kind {
+		case .Step_Tools:
+			chat_tool_jobs_step(chat, {}, effect.tool)
+		case .Wait_Tools:
+			chat_tool_jobs_wait(chat)
+		case .Finish_Tools:
+			turn_id := effect.turn_id
+			chat_effect_destroy(&effect)
+			testing.expect(t, chat_tool_jobs_finish(chat, turn_id), "the cancelled batch should close")
+			testing.expect_value(t, chat.state, Chat_State.Cancelling)
+			testing.expect_value(t, chat.calls_made, 1)
+			return
+		case .None, .Start_Request, .Run_Tools, .Turn_Finished:
+			testing.fail_now(t, "cancellation skipped the tool drain")
+		}
+		chat_effect_destroy(&effect)
+	}
+	testing.expect(t, false, "the cancelled session-owned batch never settled")
+}

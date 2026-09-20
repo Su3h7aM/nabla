@@ -104,6 +104,12 @@ Chat_Session :: struct {
 	// inventory installed.
 	tools:                        Tool_Registry,
 
+	// tool_jobs is the response's in-flight execution table. It belongs to the
+	// session rather than the driver's stack, so a turn can return to its event pump
+	// while a worker blocks and a Lua parent can later suspend on a child.
+	tool_jobs:                    Tool_Jobs,
+	tool_jobs_active:             bool,
+
 	// partial_assistant is streamed text that has not been committed. It stays
 	// provisional until the turn settles.
 	partial_assistant:            [dynamic]u8,
@@ -249,6 +255,12 @@ chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Regis
 }
 
 chat_session_destroy :: proc(chat: ^Chat_Session) {
+	// A tool worker borrows the session's frozen registry and turn data, so it is
+	// joined before any of that storage is released.
+	if chat.tool_jobs_active {
+		tool_jobs_destroy(&chat.tool_jobs)
+		chat.tool_jobs_active = false
+	}
 	// Compaction's worker borrows this session's id for its logging correlation, so
 	// it is stopped before anything the session owns is released.
 	chat_compact_destroy(chat)
@@ -412,6 +424,10 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	// finished can never be inherited by this one.
 	chat_cancel_reset()
 	chat_operation_retire(&chat.operation)
+	if chat.tool_jobs_active {
+		tool_jobs_destroy(&chat.tool_jobs)
+		chat.tool_jobs_active = false
+	}
 	chat_pending_calls_clear(chat)
 	chat.pending_notice = .None
 	if chat.pending_response_present {

@@ -83,11 +83,11 @@ Current implementation facts:
 
 | Location | Current behavior | Required change |
 | --- | --- | --- |
-| `agent/tool.odin` | `Tool_Definition` has a synchronous `Tool_Execute`; `Tool_Context` borrows call-scoped data | Separate execution placement and owned job lifetime from the tool's argument/result contract |
-| `agent/chat_tools.odin` | `chat_run_tools` admits, records, executes, and stores a batch inline | Split submission, starting, completion, and retirement into owner-driven steps |
-| `agent/agent.odin` | `chat_session_tools_done` uses the count of top-level pending calls | Keep the top-level barrier, track child jobs separately |
-| `agent/chat.odin` | `.Run_Tools` blocks in `chat_run_tools` | Return to the driver while jobs are pending and consume completion events |
-| `app_worker.odin` | The root worker owns the store and runs the turn synchronously | Wait on work, tool completion, cancellation, and deadlines without blocking on a tool |
+| `agent/tool.odin` | `Tool_Definition.placement` separates worker and owner execution; `Tool_Context` has local and inherited stop control | Add the Lua placement when the executor exists |
+| `agent/chat_tools.odin` | Submission, one-step execution, waiting, and finish are separate procedures over session-owned jobs | Reuse the same procedures for child calls |
+| `agent/agent.odin` | `chat_session_advance` selects one bounded tool effect and drains jobs while cancelling | Keep the top-level barrier, track child jobs separately |
+| `agent/chat.odin` | The driver performs each selected tool effect and returns to `chat_session_advance` | Add Lua-slice and child-result effects; move the outer worker to a general event pump if more owner events need service |
+| `app_worker.odin` | The root worker owns the store and drives the turn state machine | Wake the driver directly on tool completion instead of relying on the bounded wait slice |
 | `agent/config.odin` | Lua 5.4 text-only execution and an instruction hook, no opened standard libraries | Reuse the binding, not the config VM, limits, or conversion routines |
 | `agent/tool_mcp.odin` | MCP definitions use one executor and the ordinary result envelope | Retain the adapter; schedule calls through a per-client serialization lane |
 | `app_mcp.odin` | Registry refresh and backend replacement happen between turns | Keep each borrowed generation alive through job retirement |
@@ -1114,12 +1114,19 @@ released as `Unrecorded`, and recovery is what records uncertainty for them.
 thread creation, the way compaction does it, so a tool thread is ineligible for the
 handler that cancels its own turn.
 
-What this step deliberately did not do: the batch still lives in the driver's frame
-rather than on the session, so `chat_session_advance` does not yet select job effects
-and section 8's await-events effect is still the transport's wait slice inside
-`chat_run_tools`. Moving the table onto the session is the next slice, and it is the
-one the Lua executor needs, because a suspended script must be able to wait for a
-child without holding the driver's call stack.
+The final slice of step 2 moved the table from the driver's frame onto `Chat_Session`.
+`chat_session_advance` now selects `Run_Tools` (admission), one `Step_Tools` effect,
+`Wait_Tools`, or `Finish_Tools`; the driver performs that effect and asks again. Two
+advances before effect application select the same action and launch or write nothing.
+The `.Cancelling` state uses the same selector until every committed call is answered
+and every producer retires. `chat_run_tools` remains only as a synchronous package
+adapter for focused tests and callers without an event pump.
+
+This is enough for a Lua execution to suspend without keeping a driver frame alive:
+the pending jobs and their wait state are now session data. Completion currently wakes
+through a condition variable plus the 50 ms bounded wait slice. A root-level wakeup
+channel can remove that latency when the outer worker becomes a general event pump; it
+is an optimization, not a prerequisite for child calls.
 
 ## 15. Decisions deliberately left open
 
