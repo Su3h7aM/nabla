@@ -58,8 +58,11 @@ WORKING_BORDER_TEXT :: term.Style {
 LABEL_STYLE :: term.Style {
 	modifiers = {.Bold},
 }
+// A user message is a band across the terminal. Its background is the terminal's
+// own black, the darkest color a theme offers, so light message text keeps its
+// contrast however the theme is set.
 USER_TEXT :: term.Style {
-	background = term.Indexed_Color(8),
+	background = term.Indexed_Color(0),
 }
 AGENT_TEXT :: term.Style{}
 NOTICE_TEXT :: term.Style {
@@ -97,10 +100,6 @@ FOOTER_MUTED :: term.Style {
 PICKED_STYLE :: term.Style {
 	modifiers = {.Bold},
 }
-
-// BODY_INDENT is how far message bodies sit under their label, matching the
-// reference layout.
-BODY_INDENT :: 2
 
 // TOOL_PREVIEW_LINES bounds one tool box: the preview is cut to this many
 // content rows.
@@ -392,7 +391,9 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 		line.y += viewport.y
 		style := term_text_style(text_data.style)
 		if text_data.style.font == FONT_USER {
-			tui.fill(&storage.buffer, {x = viewport.x, y = line.y, width = viewport.width, height = 1}, " ", style)
+			// A user message is a band across the whole terminal, not a block inside
+			// the conversation's indent: the text keeps that indent as its padding.
+			tui.fill(&storage.buffer, {x = 0, y = line.y, width = storage.buffer.columns, height = 1}, " ", style)
 		}
 		_, _ = tui.draw_text(&storage.buffer, line, text_data.text, style)
 	}
@@ -400,39 +401,44 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 }
 
 // declare_entry adds one transcript entry to the open conversation frame: the
-// label when the kind has one, then the cleaned body in a padded element. The
-// element's bottom padding is the blank row that separates entries, so the
-// spacing scrolls with the content instead of being pasted in at draw time.
+// cleaned body in an element whose bottom padding is the blank row that
+// separates entries, so the spacing scrolls with the content instead of being
+// pasted in at draw time.
 declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 	if entry.kind == .Tool {
 		declare_tool_entry(ctx, entry, width)
 		return
 	}
-	label, label_style := entry_label(entry.kind)
-	if label != "" {
-		layout.text(ctx, layout.Text_Desc{text = label, style = layout_text_style(label_style)})
-	}
 	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
-	indent := layout.Scalar(0)
-	if label != "" {
-		indent = BODY_INDENT
-	}
+	body_style := layout_text_style(entry_style(entry.kind))
+	// A user message is a band, and the band's padding rows are painted too, so
+	// they keep the band's style rather than the body's wrapping one.
+	band_style := body_style
+	body_style.wrap = .Words
 	if layout.element(
 		ctx,
 		layout.Element_Desc {
 			layout = layout.Layout_Style {
+				flow = .Column,
 				sizing = layout.Sizing{width = layout.fit(), height = layout.fit()},
 				align = .Stretch,
-				padding = layout.Edges{left = indent, bottom = 1},
+				padding = layout.Edges{bottom = 1},
 			},
 		},
 	) {
+		if entry.kind == .User { declare_band_pad(ctx, band_style) }
 		if len(cleaned) > 0 {
-			body_style := layout_text_style(entry_style(entry.kind))
-			body_style.wrap = .Words
 			layout.text(ctx, layout.Text_Desc{text = cleaned, style = body_style})
 		}
+		if entry.kind == .User { declare_band_pad(ctx, band_style) }
 	}
+}
+
+// declare_band_pad reserves one row of a user message's background. The row is a
+// single cell wide: the renderer paints a user row across the whole terminal, so
+// the row only has to exist, and `Wrap.None` is what keeps one cell one line.
+declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Text_Style) {
+	layout.text(ctx, layout.Text_Desc{text = " ", style = band})
 }
 
 // declare_tool_entry draws one tool call as a bordered box: the call's name on
@@ -549,7 +555,7 @@ term_text_style :: proc(style: layout.Text_Style) -> term.Style {
 	case FONT_BOLD:
 		result.modifiers = {.Bold}
 	case FONT_USER:
-		result.background = term.Indexed_Color(8)
+		result.background = USER_TEXT.background
 	case FONT_DIM:
 		result.modifiers = {.Dim}
 	case FONT_RED:
@@ -638,15 +644,6 @@ draw_input_hint :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect)
 		hint = "up/down move | enter select | esc quit"
 	}
 	_, _ = tui.draw_text(&storage.buffer, rect, hint, HINT_STYLE)
-}
-
-// entry_label returns the label a transcript entry shows and its style. An
-// empty label means the entry has no label row.
-entry_label :: proc(kind: Entry_Kind) -> (string, term.Style) {
-	switch kind {
-	case .User, .Assistant, .Tool, .Notice, .Warning, .Error:
-	}
-	return "", {}
 }
 
 entry_style :: proc(kind: Entry_Kind) -> term.Style {

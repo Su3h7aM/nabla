@@ -62,13 +62,19 @@ test_conversation_wraps_user_message_with_background :: proc(t: ^testing.T) {
 	testing.expect(t, conversation_render(t, app, storage, 20, 6), "the conversation frame must solve")
 
 	scratch: [256]byte
-	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), "hello world this is ")
-	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), "long enough to wrap ")
-	testing.expect_value(t, conversation_glyph_row(storage, 2, scratch[:]), "                    ")
+	// The band's own padding row, the two wrapped text rows, then the band's other
+	// padding row and the blank row that separates entries.
+	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), "hello world this is ")
+	testing.expect_value(t, conversation_glyph_row(storage, 2, scratch[:]), "long enough to wrap ")
+	testing.expect_value(t, conversation_glyph_row(storage, 3, scratch[:]), "                    ")
 
-	// User text is the only conversation role drawn on a distinct background.
+	// Every band row carries the message's background, and the separator row
+	// below the band does not.
 	testing.expect_value(t, storage.buffer.cells[0].style, USER_TEXT)
 	testing.expect_value(t, storage.buffer.cells[19].style, USER_TEXT)
+	testing.expect_value(t, storage.buffer.cells[3 * 20].style, USER_TEXT)
+	testing.expect_value(t, storage.buffer.cells[4 * 20].style, term.Style{})
 }
 
 @(test)
@@ -181,9 +187,10 @@ test_conversation_wraps_after_a_long_unbreakable_token :: proc(t: ^testing.T) {
 
 	// The newest entry is at the bottom and wraps at the viewport width, so the
 	// sentence continues line by line instead of running on to the token's width
-	// and being cut off at the terminal edge.
-	testing.expect_value(t, conversation_glyph_row(storage, 4, scratch[:]), "hello world this is ")
-	testing.expect_value(t, conversation_glyph_row(storage, 5, scratch[:]), "long enough to wrap ")
+	// and being cut off at the terminal edge. The user band adds its own padding
+	// row above the text.
+	testing.expect_value(t, conversation_glyph_row(storage, 5, scratch[:]), "hello world this is ")
+	testing.expect_value(t, conversation_glyph_row(storage, 6, scratch[:]), "long enough to wrap ")
 }
 
 // frame_glyph_column returns the first column of row whose grapheme is glyph,
@@ -252,4 +259,45 @@ test_tool_box_matches_the_prompt_box :: proc(t: ^testing.T) {
 	_, frame_error = render_frame(app, storage)
 	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
 	testing.expect_value(t, storage.buffer.cells[tool_row * columns + tool_border].style, TOOL_FAILURE)
+}
+
+// A user message is a band across the whole terminal, so it reads as a message
+// rather than as a block sitting inside the conversation's indent. The indent is
+// the band's own padding: the text starts one cell in, the band's last cell is
+// empty, and a band row sits above and below the text.
+@(test)
+test_user_message_band_spans_the_terminal_width :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	app.columns = 24
+	app.rows = 12
+	snap_append(app, .User, "hello")
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	_, frame_error := render_frame(app, storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+
+	columns := storage.buffer.columns
+	text_row := -1
+	for row in 0 ..< app.rows {
+		if storage.buffer.cells[row * columns + 1].grapheme == "h" {
+			text_row = row
+			break
+		}
+	}
+	if !testing.expect(t, text_row > 0 && text_row + 1 < app.rows, "the user message must be drawn") { return }
+
+	for row in text_row - 1 ..= text_row + 1 {
+		testing.expect_value(t, storage.buffer.cells[row * columns].style, USER_TEXT)
+		testing.expect_value(t, storage.buffer.cells[row * columns + columns - 1].style, USER_TEXT)
+	}
+	testing.expect_value(t, storage.buffer.cells[text_row * columns].grapheme, " ")
+	testing.expect_value(t, storage.buffer.cells[text_row * columns + 1].grapheme, "h")
+	testing.expect_value(t, storage.buffer.cells[(text_row - 1) * columns].grapheme, " ")
+	testing.expect_value(t, storage.buffer.cells[(text_row + 1) * columns].grapheme, " ")
 }
