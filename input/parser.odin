@@ -281,6 +281,14 @@ parser_sequence_final :: proc(p: ^Parser, state: Parser_State, final: u8, events
 		}
 	} else {
 		param := parser_first_param(p)
+		// Kitty's keyboard protocol reports Enter as CSI 13 ; modifier u.
+		// xterm's modifyOtherKeys mode uses CSI 27 ; modifier ; 13 ~.
+		if final == 'u' && param == 13 {
+			return parser_emit(p, events, Key_Event{code = .Enter, modifiers = parser_key_modifiers(p, 1)}, allocator)
+		}
+		if final == '~' && param == 27 && parser_param(p, 2) == 13 {
+			return parser_emit(p, events, Key_Event{code = .Enter, modifiers = parser_key_modifiers(p, 1)}, allocator)
+		}
 		switch final {
 		case 'A':
 			code, found = .Up, true
@@ -328,19 +336,40 @@ parser_sequence_final :: proc(p: ^Parser, state: Parser_State, final: u8, events
 }
 
 parser_first_param :: proc(p: ^Parser) -> int {
+	value := parser_param(p, 0)
+	if value == 0 { return 1 }
+	return value
+}
+
+parser_param :: proc(p: ^Parser, wanted: int) -> int {
+	field := 0
 	value := 0
 	for i in 0 ..< p.param_count {
 		c := p.params[i]
-		if c >= '0' && c <= '9' {
+		if c == ';' {
+			if field == wanted { return value }
+			field += 1
+			value = 0
+			continue
+		}
+		if c >= '0' && c <= '9' && field == wanted {
 			value = value * 10 + int(c - '0')
-		} else if c == ';' {
-			break
 		}
 	}
-	if value == 0 {
-		return 1
-	}
-	return value
+	if field == wanted { return value }
+	return 0
+}
+
+parser_key_modifiers :: proc(p: ^Parser, field: int) -> Key_Modifiers {
+	encoded := parser_param(p, field)
+	if encoded <= 1 { return {} }
+	bits := encoded - 1
+	result: Key_Modifiers
+	if bits & 1 != 0 { result += {.Shift} }
+	if bits & 2 != 0 { result += {.Alt} }
+	if bits & 4 != 0 { result += {.Control} }
+	if bits & 8 != 0 { result += {.Super} }
+	return result
 }
 
 // parser_mouse_fields splits the parameter bytes of an SGR mouse report (after

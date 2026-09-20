@@ -642,7 +642,19 @@ obs_user_text :: proc(user_data: rawptr, text: string) {
 
 obs_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Result) {
 	app := cast(^App)user_data
-	snap_append(app, .Tool, fmt.tprintf("tool %s: %s", name, tool_display_summary(result)))
+	sync.mutex_lock(&app.run.mu)
+	defer sync.mutex_unlock(&app.run.mu)
+	entry := Entry {
+		kind         = .Tool,
+		text         = make([dynamic]u8, 0, 0, app.run.alloc),
+		tool_outcome = result.outcome,
+	}
+	preview_text := result.content
+	if preview_text == "" { preview_text = tool_display_summary(result) }
+	preview := fmt.tprintf("%s\n%s", name, preview_text)
+	append(&entry.text, ..transmute([]byte)preview)
+	append(&app.run.snap.entries, entry)
+	app.run.snap.generation += 1
 }
 
 obs_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text: string) {

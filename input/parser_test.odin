@@ -55,6 +55,11 @@ test_escape_sequences :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_modified_enter_sequences :: proc(t: ^testing.T) {
+	_feed_events(t, "\e[13;2u\e[27;2;13~", []Event{Key_Event{code = .Enter, modifiers = {.Shift}}, Key_Event{code = .Enter, modifiers = {.Shift}}})
+}
+
+@(test)
 test_lone_escape_resolves_on_deadline :: proc(t: ^testing.T) {
 	p: Parser
 	parser_init(&p)

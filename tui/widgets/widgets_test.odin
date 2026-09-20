@@ -95,6 +95,19 @@ test_input_edits_by_cluster :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_input_keeps_explicit_newlines :: proc(t: ^testing.T) {
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+	testing.expect(t, input_insert(&input, "first"))
+	testing.expect(t, input_insert_newline(&input))
+	testing.expect(t, input_insert(&input, "second"))
+	accounting := "first\nsecond"
+	testing.expect_value(t, input_text(&input), accounting)
+	testing.expect_value(t, input_cursor(&input), len(accounting))
+}
+
+@(test)
 test_input_caret_tracks_the_visible_window :: proc(t: ^testing.T) {
 	input: Input
 	input_init(&input)

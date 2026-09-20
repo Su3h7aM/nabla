@@ -46,7 +46,7 @@ conversation_render :: proc(t: ^testing.T, app: ^App, storage: ^Frame_Storage, c
 }
 
 @(test)
-test_conversation_wraps_bodies_under_their_label :: proc(t: ^testing.T) {
+test_conversation_wraps_user_message_with_background :: proc(t: ^testing.T) {
 	app := new(App)
 	defer {
 		snapshot_destroy(app)
@@ -61,14 +61,13 @@ test_conversation_wraps_bodies_under_their_label :: proc(t: ^testing.T) {
 	testing.expect(t, conversation_render(t, app, storage, 20, 6), "the conversation frame must solve")
 
 	scratch: [256]byte
-	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), "[user]              ")
-	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), "  hello world this  ")
-	testing.expect_value(t, conversation_glyph_row(storage, 2, scratch[:]), "  is long enough to ")
-	testing.expect_value(t, conversation_glyph_row(storage, 3, scratch[:]), "  wrap              ")
-	testing.expect_value(t, conversation_glyph_row(storage, 4, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), "hello world this is ")
+	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), "long enough to wrap ")
+	testing.expect_value(t, conversation_glyph_row(storage, 2, scratch[:]), "                    ")
 
-	// The label keeps the palette's bold amber through the layout round trip.
-	testing.expect_value(t, storage.buffer.cells[0].style, LABEL_STYLE)
+	// User text is the only conversation role drawn on a distinct background.
+	testing.expect_value(t, storage.buffer.cells[0].style, USER_TEXT)
+	testing.expect_value(t, storage.buffer.cells[19].style, USER_TEXT)
 }
 
 @(test)
@@ -182,8 +181,6 @@ test_conversation_wraps_after_a_long_unbreakable_token :: proc(t: ^testing.T) {
 	// The newest entry is at the bottom and wraps at the viewport width, so the
 	// sentence continues line by line instead of running on to the token's width
 	// and being cut off at the terminal edge.
-	testing.expect_value(t, conversation_glyph_row(storage, 3, scratch[:]), "[user]              ")
-	testing.expect_value(t, conversation_glyph_row(storage, 4, scratch[:]), "  hello world this  ")
-	testing.expect_value(t, conversation_glyph_row(storage, 5, scratch[:]), "  is long enough to ")
-	testing.expect_value(t, conversation_glyph_row(storage, 6, scratch[:]), "  wrap              ")
+	testing.expect_value(t, conversation_glyph_row(storage, 4, scratch[:]), "hello world this is ")
+	testing.expect_value(t, conversation_glyph_row(storage, 5, scratch[:]), "long enough to wrap ")
 }

@@ -38,9 +38,10 @@ Entry_Kind :: enum u8 {
 	Error,
 }
 Entry :: struct {
-	kind:     Entry_Kind,
-	text:     [dynamic]u8, // owned,
-	complete: bool,
+	kind:         Entry_Kind,
+	text:         [dynamic]u8, // owned,
+	complete:     bool,
+	tool_outcome: session.Tool_Outcome,
 }
 
 // Status carries the runtime facts the footer shows. provider_id and cwd

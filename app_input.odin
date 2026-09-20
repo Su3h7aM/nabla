@@ -223,7 +223,12 @@ interrupt :: proc(app: ^App) {
 handle_key :: proc(app: ^App, key: input.Key_Event) {
 	switch key.code {
 	case .Enter:
-		submit(app)
+		if .Shift in key.modifiers {
+			completion_reset(app)
+			_ = widgets.input_insert_newline(&app.input)
+		} else {
+			submit(app)
+		}
 	case .Backspace:
 		completion_reset(app)
 		widgets.input_backspace(&app.input)

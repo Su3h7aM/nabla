@@ -24,13 +24,16 @@ import "nabla:tui/widgets"
 // frame; the terminal keeps its previous contents.
 TUI_MAX_CELLS :: 256 * 128
 
-// Fixed rows below the conversation: rule, input, rule, cwd, status.
-TUI_FOOTER_ROWS :: 5
+// The prompt shows at most five wrapped rows. Its border adds two more, then
+// the working directory and status each use one row.
+INPUT_MAX_ROWS :: 5
+TUI_FOOTER_ROWS :: INPUT_MAX_ROWS + 4
 
-// The palette follows the dark theme of the reference TUI: amber labels,
-// muted lavender rules, and grey body text.
+// Styles use the terminal's default foreground/background and ANSI palette.
+// Indexed status colors follow the user's terminal theme instead of defining a
+// Nabla theme.
 RULE_STYLE :: term.Style {
-	foreground = term.RGB_Color{150, 130, 165},
+	modifiers = {.Dim},
 }
 
 // The working indicator: the reference TUI's braille spinner on the rule row
@@ -46,56 +49,53 @@ spinner_glyph :: proc(index: int) -> string {
 	return glyphs[index % len(glyphs)]
 }
 WORKING_SPINNER :: term.Style {
-	foreground = term.RGB_Color{129, 162, 190},
+	foreground = term.Indexed_Color(6),
 }
-WORKING_TEXT :: term.Style {
-	foreground = term.RGB_Color{205, 205, 212},
+WORKING_TEXT :: term.Style{}
+WORKING_BORDER_TEXT :: term.Style {
+	foreground = term.Indexed_Color(5),
 }
 LABEL_STYLE :: term.Style {
-	foreground = term.RGB_Color{240, 198, 116},
-	modifiers  = {.Bold},
+	modifiers = {.Bold},
 }
 USER_TEXT :: term.Style {
-	foreground = term.RGB_Color{228, 228, 234},
+	modifiers = {.Reverse},
 }
-AGENT_TEXT :: term.Style {
-	foreground = term.RGB_Color{205, 205, 212},
-}
+AGENT_TEXT :: term.Style{}
 TOOL_TEXT :: term.Style {
-	foreground = term.RGB_Color{138, 138, 148},
+	modifiers = {.Dim},
 }
 NOTICE_TEXT :: term.Style {
-	foreground = term.RGB_Color{129, 162, 190},
+	foreground = term.Indexed_Color(6),
 }
 WARNING_TEXT :: term.Style {
-	foreground = term.RGB_Color{240, 198, 116},
+	foreground = term.Indexed_Color(3),
 }
 ERROR_TEXT :: term.Style {
-	foreground = term.RGB_Color{204, 102, 102},
+	foreground = term.Indexed_Color(1),
 }
-INPUT_TEXT :: term.Style {
-	foreground = term.RGB_Color{228, 228, 234},
+TOOL_SUCCESS :: term.Style {
+	foreground = term.Indexed_Color(2),
 }
+TOOL_FAILURE :: term.Style {
+	foreground = term.Indexed_Color(1),
+}
+INPUT_TEXT :: term.Style{}
 INPUT_PROMPT :: term.Style {
-	foreground = term.RGB_Color{129, 162, 190},
-	modifiers  = {.Bold},
+	modifiers = {.Bold},
 }
 TITLE_STYLE :: term.Style {
-	foreground = term.RGB_Color{228, 228, 234},
-	modifiers  = {.Bold},
+	modifiers = {.Bold},
 }
 HINT_STYLE :: term.Style {
-	foreground = term.RGB_Color{140, 140, 146},
+	modifiers = {.Dim},
 }
-FOOTER_TEXT :: term.Style {
-	foreground = term.RGB_Color{205, 205, 212},
-}
+FOOTER_TEXT :: term.Style{}
 FOOTER_MUTED :: term.Style {
-	foreground = term.RGB_Color{110, 110, 118},
+	modifiers = {.Dim},
 }
 PICKED_STYLE :: term.Style {
-	foreground = term.RGB_Color{129, 162, 190},
-	modifiers  = {.Bold},
+	modifiers = {.Bold},
 }
 
 // BODY_INDENT is how far message bodies sit under their label, matching the
@@ -113,6 +113,12 @@ CONVERSATION_ID :: layout.Id(1)
 // never interprets: the transcript's one styling distinction beyond color.
 FONT_NORMAL :: layout.Font(0)
 FONT_BOLD :: layout.Font(1)
+FONT_USER :: layout.Font(2)
+FONT_DIM :: layout.Font(3)
+FONT_RED :: layout.Font(4)
+FONT_GREEN :: layout.Font(5)
+FONT_CYAN :: layout.Font(6)
+FONT_YELLOW :: layout.Font(7)
 
 // CONVERSATION_CAPACITIES budgets one transcript frame: three nodes per
 // labeled entry (label, body element, body text) and two per unlabeled one,
@@ -140,6 +146,12 @@ Line :: struct {
 	text:   string,
 	style:  term.Style,
 	indent: int,
+}
+
+Input_Line :: struct {
+	text:  string,
+	start: int,
+	end:   int,
 }
 
 Render_Status :: enum u8 {
@@ -243,7 +255,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 	if cols <= 0 || rows <= 0 {
 		return {}, .None
 	}
-	if rows < TUI_FOOTER_ROWS + 1 {
+	if rows < 6 {
 		return {}, .Too_Small
 	}
 	if !ensure_frame(storage, cols, rows) {
@@ -253,24 +265,24 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 		return {}, .Buffer_Too_Small
 	}
 
-	// One grow region for the conversation, then the fixed footer rows.
+	// The prompt grows with wrapped input until five content rows, then keeps the
+	// caret visible by scrolling those rows inside its border.
 	viewport := tui.Cell_Rect {
 		x      = 0,
 		y      = 0,
 		width  = cols,
 		height = rows,
 	}
-	heights := [TUI_FOOTER_ROWS + 1]int{-1, 1, 1, 1, 1, 1}
-	regions: [TUI_FOOTER_ROWS + 1]tui.Cell_Rect
+	input_rows := input_visible_rows(&app.input, max(cols - 4, 1))
+	heights := [4]int{-1, input_rows + 2, 1, 1}
+	regions: [4]tui.Cell_Rect
 	if !tui.rows(viewport, heights[:], regions[:]) {
 		return {}, .Layout_Failed
 	}
 	conv_rect := regions[0]
-	rule_top_rect := regions[1]
-	input_rect := regions[2]
-	rule_bottom_rect := regions[3]
-	cwd_rect := regions[4]
-	status_rect := regions[5]
+	input_rect := regions[1]
+	cwd_rect := regions[2]
+	status_rect := regions[3]
 
 	if conv_rect.width <= 0 && input_rect.width <= 0 {
 		return {}, .Layout_Failed
@@ -285,14 +297,6 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 		}
 		cursor = draw_input(app, storage, input_rect)
 	}
-	// The rule above the input doubles as the working indicator while a
-	// request is active.
-	if app.run.snap.status.running {
-		draw_working(storage, rule_top_rect, app.spin_frame, working_label(app))
-	} else {
-		draw_rule(storage, rule_top_rect)
-	}
-	draw_rule(storage, rule_bottom_rect)
 	draw_footer(app, storage, cwd_rect, status_rect)
 	return cursor, .None
 }
@@ -342,7 +346,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 					}
 				} else {
 					for &entry in app.run.snap.entries {
-						declare_entry(&storage.layout_ctx, &entry)
+						declare_entry(&storage.layout_ctx, &entry, rect.width)
 					}
 				}
 			}
@@ -380,7 +384,11 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 		if project_err != nil {
 			return false
 		}
-		_, _ = tui.draw_text(&storage.buffer, line, text_data.text, term_text_style(text_data.style))
+		style := term_text_style(text_data.style)
+		if text_data.style.font == FONT_USER {
+			tui.fill(&storage.buffer, {x = 0, y = line.y, width = storage.buffer.columns, height = 1}, " ", style)
+		}
+		_, _ = tui.draw_text(&storage.buffer, line, text_data.text, style)
 	}
 	return true
 }
@@ -389,7 +397,11 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 // label when the kind has one, then the cleaned body in a padded element. The
 // element's bottom padding is the blank row that separates entries, so the
 // spacing scrolls with the content instead of being pasted in at draw time.
-declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry) {
+declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
+	if entry.kind == .Tool {
+		declare_tool_entry(ctx, entry, width)
+		return
+	}
 	label, label_style := entry_label(entry.kind)
 	if label != "" {
 		layout.text(ctx, layout.Text_Desc{text = label, style = layout_text_style(label_style)})
@@ -417,19 +429,75 @@ declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry) {
 	}
 }
 
+declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
+	box_width := max(width - 2, 4)
+	inner_width := box_width - 2
+	value := string(entry.text[:])
+	name := value
+	preview := ""
+	if split := strings.index(value, "\n"); split >= 0 {
+		name = value[:split]
+		preview = value[split + 1:]
+	}
+	name = text.truncate_text(name, max(inner_width - 2, 0))
+	preview = display_clean(preview, context.temp_allocator)
+	top_fill := strings.repeat("─", max(inner_width - text.text_columns(name) - 1, 0), context.temp_allocator) or_else ""
+	bottom_fill := strings.repeat("─", inner_width, context.temp_allocator) or_else ""
+	top := fmt.tprintf("╭ %s%s╮", name, top_fill)
+	bottom := fmt.tprintf("╰%s╯", bottom_fill)
+	style := TOOL_FAILURE
+	if entry.tool_outcome == .Success { style = TOOL_SUCCESS }
+	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{left = 1, bottom = 1}}}) {
+		text_style := layout_text_style(style)
+		layout.text(ctx, layout.Text_Desc{text = top, style = text_style})
+		remaining := preview
+		for line_count := 0; line_count < 10 && len(remaining) > 0; line_count += 1 {
+			piece := text.truncate_text(remaining, inner_width)
+			if piece == "" {
+				end := text.next_grapheme_offset(remaining, 0)
+				piece = remaining[:end]
+			}
+			fill := strings.repeat(" ", max(inner_width - text.text_columns(piece), 0), context.temp_allocator) or_else ""
+			layout.text(ctx, layout.Text_Desc{text = fmt.tprintf("│%s%s│", piece, fill), style = text_style})
+			remaining = remaining[len(piece):]
+		}
+		if preview == "" {
+			fill := strings.repeat(" ", inner_width, context.temp_allocator) or_else ""
+			layout.text(ctx, layout.Text_Desc{text = fmt.tprintf("│%s│", fill), style = text_style})
+		}
+		layout.text(ctx, layout.Text_Desc{text = bottom, style = text_style})
+	}
+}
+
 // layout_text_style converts a palette style into layout's text style: the RGB
 // foreground and the bold distinction. Wrap is the declaration's choice.
 layout_text_style :: proc(style: term.Style) -> layout.Text_Style {
 	result := layout.Text_Style {
-		size = 1,
-		font = FONT_NORMAL,
-		wrap = .None,
+		size  = 1,
+		font  = FONT_NORMAL,
+		wrap  = .None,
+		// Layout uses alpha as command visibility. RGB is ignored by this
+		// terminal adapter, which restores terminal-default or ANSI styling.
+		color = layout.Color{0, 0, 0, 255},
 	}
-	if rgb, ok := style.foreground.(term.RGB_Color); ok {
-		result.color = layout.Color{rgb[0], rgb[1], rgb[2], 255}
-	}
-	if .Bold in style.modifiers {
+	if .Reverse in style.modifiers {
+		result.font = FONT_USER
+	} else if .Bold in style.modifiers {
 		result.font = FONT_BOLD
+	} else if .Dim in style.modifiers {
+		result.font = FONT_DIM
+	} else if indexed, ok := style.foreground.(term.Indexed_Color); ok {
+		switch indexed {
+		case 1:
+			result.font = FONT_RED
+		case 2:
+			result.font = FONT_GREEN
+		case 3:
+			result.font = FONT_YELLOW
+		case 6:
+			result.font = FONT_CYAN
+		case:
+		}
 	}
 	return result
 }
@@ -437,11 +505,23 @@ layout_text_style :: proc(style: term.Style) -> layout.Text_Style {
 // term_text_style maps a solved text command back onto the palette: the
 // inverse of layout_text_style, so the transcript's styles have one origin.
 term_text_style :: proc(style: layout.Text_Style) -> term.Style {
-	result := term.Style {
-		foreground = term.RGB_Color{style.color[0], style.color[1], style.color[2]},
-	}
-	if style.font == FONT_BOLD {
+	result: term.Style
+	switch style.font {
+	case FONT_BOLD:
 		result.modifiers = {.Bold}
+	case FONT_USER:
+		result.modifiers = {.Reverse}
+	case FONT_DIM:
+		result.modifiers = {.Dim}
+	case FONT_RED:
+		result.foreground = term.Indexed_Color(1)
+	case FONT_GREEN:
+		result.foreground = term.Indexed_Color(2)
+	case FONT_CYAN:
+		result.foreground = term.Indexed_Color(6)
+	case FONT_YELLOW:
+		result.foreground = term.Indexed_Color(3)
+	case:
 	}
 	return result
 }
@@ -525,13 +605,7 @@ draw_input_hint :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect)
 // empty label means the entry has no label row.
 entry_label :: proc(kind: Entry_Kind) -> (string, term.Style) {
 	switch kind {
-	case .User:
-		return "[user]", LABEL_STYLE
-	case .Assistant:
-		return "[agent]", LABEL_STYLE
-	case .Tool:
-		return "[tool]", LABEL_STYLE
-	case .Notice, .Warning, .Error:
+	case .User, .Assistant, .Tool, .Notice, .Warning, .Error:
 	}
 	return "", {}
 }
@@ -594,19 +668,88 @@ draw_rule :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	tui.fill(&storage.buffer, rect, "─", RULE_STYLE)
 }
 
-// draw_input draws the prompt and the input line and returns the caret.
+input_lines :: proc(input: ^widgets.Input, width: int) -> [dynamic]Input_Line {
+	lines := make([dynamic]Input_Line, 0, 8, context.temp_allocator)
+	value := widgets.input_text(input)
+	start := 0
+	for {
+		rest := value[start:]
+		relative_end := strings.index(rest, "\n")
+		logical_end := len(value)
+		has_newline := relative_end >= 0
+		if has_newline { logical_end = start + relative_end }
+		if start == logical_end {
+			append(&lines, Input_Line{text = "", start = start, end = start})
+		} else {
+			at := start
+			for at < logical_end {
+				piece := text.truncate_text(value[at:logical_end], width)
+				end := at + len(piece)
+				if end == at { end = text.next_grapheme_offset(value, at) }
+				append(&lines, Input_Line{text = value[at:end], start = at, end = end})
+				at = end
+			}
+		}
+		if !has_newline { break }
+		start = logical_end + 1
+		if start > len(value) { break }
+	}
+	return lines
+}
+
+input_cursor_row :: proc(input: ^widgets.Input, lines: []Input_Line) -> int {
+	cursor := widgets.input_cursor(input)
+	row := 0
+	for line, index in lines {
+		if cursor >= line.start && cursor <= line.end { row = index }
+	}
+	return row
+}
+
+input_visible_rows :: proc(input: ^widgets.Input, width: int) -> int {
+	lines := input_lines(input, width)
+	return clamp(len(lines), 1, INPUT_MAX_ROWS)
+}
+
+// draw_input draws a rounded prompt box and returns the caret. The box grows
+// through five content rows; after that the wrapped rows scroll around the caret.
 draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> term.Cursor {
-	if rect.height <= 0 || rect.width <= 2 {
-		return {}
+	if rect.height < 3 || rect.width <= 4 { return {} }
+	border_style := RULE_STYLE
+	widgets.draw_block(&storage.buffer, rect, widgets.Block{border = widgets.BORDER_ROUNDED, style = border_style})
+	if app.run.snap.status.running {
+		title := fmt.tprintf(" %s ", working_label(app))
+		_, _ = tui.draw_text(
+			&storage.buffer,
+			{x = rect.x + 2, y = rect.y, width = min(text.text_columns(title), rect.width - 4), height = 1},
+			title,
+			WORKING_BORDER_TEXT,
+		)
 	}
-	_, _ = tui.draw_text(&storage.buffer, tui.Cell_Rect{x = rect.x, y = rect.y, width = 2, height = 1}, "> ", INPUT_PROMPT)
-	line := tui.Cell_Rect {
+	content := tui.Cell_Rect {
 		x      = rect.x + 2,
-		y      = rect.y,
-		width  = rect.width - 2,
-		height = 1,
+		y      = rect.y + 1,
+		width  = rect.width - 4,
+		height = rect.height - 2,
 	}
-	return widgets.draw_input(&storage.buffer, line, app.input, INPUT_TEXT)
+	if content.width <= 0 || content.height <= 0 { return {} }
+	lines := input_lines(&app.input, content.width)
+	cursor_row := input_cursor_row(&app.input, lines[:])
+	start := max(cursor_row - content.height + 1, 0)
+	if start > max(len(lines) - content.height, 0) { start = max(len(lines) - content.height, 0) }
+	for row in 0 ..< content.height {
+		index := start + row
+		if index >= len(lines) { break }
+		_, _ = tui.draw_text(&storage.buffer, {x = content.x, y = content.y + row, width = content.width, height = 1}, lines[index].text, INPUT_TEXT)
+	}
+	caret_line := lines[cursor_row]
+	cursor := widgets.input_cursor(&app.input)
+	column := text.text_columns(widgets.input_text(&app.input)[caret_line.start:cursor])
+	return term.Cursor {
+		visible = true,
+		position = {clamp(content.x + column, content.x, content.x + content.width - 1), content.y + cursor_row - start},
+		placed = true,
+	}
 }
 
 // draw_footer paints the two footer rows: the working directory, then the

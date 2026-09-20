@@ -6,8 +6,8 @@ import "nabla:term"
 import "nabla:text"
 import "nabla:tui"
 
-// Input is a single-line text editor: text holds the bytes, cursor is a byte
-// offset at a grapheme cluster boundary. The caller owns text: input_init pins
+// Input is a text editor: text holds the bytes, cursor is a byte offset at a
+// grapheme cluster boundary. The caller owns text: input_init pins
 // its allocator, input_destroy releases it.
 Input :: struct {
 	text:   [dynamic]u8,
@@ -20,6 +20,10 @@ input_init :: proc(input: ^Input, allocator := context.allocator) {
 
 input_text :: proc(input: ^Input) -> string {
 	return string(input.text[:])
+}
+
+input_cursor :: proc(input: ^Input) -> int {
+	return input.cursor
 }
 
 input_clear :: proc(input: ^Input) {
@@ -63,6 +67,15 @@ input_insert :: proc(input: ^Input, value: string) -> bool {
 input_insert_rune :: proc(input: ^Input, value: rune) -> bool {
 	encoded, width := utf8.encode_rune(value)
 	return input_insert(input, string(encoded[:width]))
+}
+
+input_insert_newline :: proc(input: ^Input) -> bool {
+	old := len(input.text)
+	if err := resize(&input.text, old + 1); err != nil { return false }
+	copy(input.text[input.cursor + 1:], input.text[input.cursor:old])
+	input.text[input.cursor] = '\n'
+	input.cursor += 1
+	return true
 }
 
 input_backspace :: proc(input: ^Input) -> bool {
