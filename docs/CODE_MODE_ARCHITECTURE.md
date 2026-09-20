@@ -1144,6 +1144,23 @@ interrupted session settles them independently. Tests cover same-turn validation
 full-history retention, and a provider context containing only the Code Mode parent
 call, dispatch, and result.
 
+### 14.4 Phase 4 results
+
+The first executor slice implements the value boundary in `agent/code_mode_value.odin`.
+A pending Lua wrapper argument is copied into the existing `json.Value` model and then
+encoded with `core:encoding/json`; a completed tool's JSON envelope is parsed through
+the same model and pushed as the wrapper's single Lua return value. No parallel tool
+argument or result representation was introduced.
+
+The conversion accepts booleans, strings, Lua integers, finite JSON numbers,
+string-keyed objects, and dense one-based arrays. An empty table is an object. It
+rejects unsupported Lua types, cycles, mixed tables, sparse arrays, excessive depth,
+and more than 16,384 traversed values. Lua strings retain their explicit length, and
+JSON encoding remains the boundary that validates whether the copied value can be
+represented. Result construction runs inside the Lua boundary's reserved host memory.
+Focused tests cover nested arguments, complete result-envelope delivery, and cycle
+rejection. The executor and nested call scheduling still remain to be connected.
+
 ## 15. Decisions deliberately left open
 
 The runtime direction is settled by this proposal; these choices need implementation
