@@ -68,6 +68,28 @@ test_content_length_framing :: proc(t: ^testing.T) {
 	_, second_ok := http.header_parse(&differing, "content-length: 6", context.temp_allocator)
 	testing.expect(t, !second_ok)
 
+	// RFC 9112 6.3: repeats identical by numeric meaning are one value, so
+	// leading zeros do not conflict, and the first value stands uncombined.
+	zeroed: http.Headers
+	http.headers_init(&zeroed, context.temp_allocator)
+	_, zero_first_ok := http.header_parse(&zeroed, "content-length: 7", context.temp_allocator)
+	testing.expect(t, zero_first_ok)
+	_, zero_second_ok := http.header_parse(&zeroed, "content-length: 007", context.temp_allocator)
+	testing.expect(t, zero_second_ok)
+	stored, stored_ok := http.headers_get_unsafe(zeroed, "content-length")
+	testing.expect(t, stored_ok)
+	testing.expect_value(t, stored, "7")
+
+	// A repeat with another numeric meaning, or none, is refused.
+	for second in ([]string{"content-length: 8", "content-length: 7x", "content-length: "}) {
+		conflicted: http.Headers
+		http.headers_init(&conflicted, context.temp_allocator)
+		_, conflict_first_ok := http.header_parse(&conflicted, "content-length: 7", context.temp_allocator)
+		testing.expect(t, conflict_first_ok)
+		_, conflict_second_ok := http.header_parse(&conflicted, second, context.temp_allocator)
+		testing.expectf(t, !conflict_second_ok, "%q was accepted after content-length: 7", second)
+	}
+
 	// An invalid value is rejected; surrounding whitespace is not part of it.
 	for value in ([]string{"", "5x", "-5", "5 5", "99999999999999999999999999"}) {
 		_, ok := content_length_parse(value)

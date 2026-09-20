@@ -229,12 +229,21 @@ header_parse :: proc(headers: ^Headers, line: string, allocator := context.temp_
 		return
 	}
 
-	// RFC 7230 3.3.3: If a message is received without Transfer-Encoding and with
-	// either multiple Content-Length header fields having differing
-	// field-values or a single Content-Length header field having an
-	// invalid value, then the message framing is invalid and the
-	// recipient MUST treat it as an unrecoverable error.
-	if tmp_key == "content-length" && has_cl && cl != value {
+	// RFC 9112 6.3: a message received without Transfer-Encoding and with
+	// either multiple Content-Length field lines having differing
+	// field values or a single Content-Length field line having an
+	// invalid value is invalid, and the recipient MUST treat it as an
+	// unrecoverable error. Repeated values are identical only by numeric
+	// meaning, so leading zeros do not differ; the first value stands and
+	// no comma list is formed, which keeps a non-list field a single value.
+	if tmp_key == "content-length" && has_cl {
+		if !content_length_values_equal(cl, value) {
+			return
+		}
+		delete(tmp_key, allocator)
+		key_ptr, _, _ := headers_entry_unsafe(headers, "content-length")
+		key = key_ptr^
+		ok = true
 		return
 	}
 
@@ -257,6 +266,33 @@ header_parse :: proc(headers: ^Headers, line: string, allocator := context.temp_
 
 	ok = true
 	return
+}
+
+// content_length_values_equal reports whether two Content-Length field values
+// name the same length. RFC 9112 6.3 permits repeats only when identical, and
+// identical is by numeric meaning: leading zeros state the same length. The
+// comparison strips them instead of parsing, so no representable bound limits
+// which equal values are recognized.
+@(private)
+content_length_values_equal :: proc(a, b: string) -> bool {
+	a_digits, a_ok := decimal_meaning(a)
+	b_digits, b_ok := decimal_meaning(b)
+	if !a_ok || !b_ok { return false }
+	return a_digits == b_digits
+}
+
+// decimal_meaning validates a nonempty all-digit field value and reports its
+// numeric meaning with leading zeros removed. A zero of any width reports
+// "0", so widths of zero compare equal.
+@(private)
+decimal_meaning :: proc(value: string) -> (meaning: string, ok: bool) {
+	if len(value) == 0 { return "", false }
+	for c in value {
+		if c < '0' || c > '9' { return "", false }
+	}
+	stripped := strings.trim_left(value, "0")
+	if stripped == "" { return "0", true }
+	return stripped, true
 }
 
 // Returns if this is a valid trailer header.
