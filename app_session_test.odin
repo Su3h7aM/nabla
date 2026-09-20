@@ -681,6 +681,80 @@ test_new_and_resume_switch_and_replay :: proc(t: ^testing.T) {
 	testing.expect(t, found, "resuming should replay the conversation")
 }
 
+// A replayed tool call is the box a live turn showed: the call's name, the
+// preview of what the tool produced, and the outcome its border is colored by.
+// The model-facing envelope is not the preview, and a resumed session used to
+// show it as the box's title.
+@(test)
+test_resume_replays_a_tool_call_as_a_box :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	id := session.Session_Id(strings.clone(string(app.setup.session.id), context.allocator))
+	defer delete(string(id), context.allocator)
+
+	accepted := agent.chat_session_accept_user(&app.setup.session, "list files", session.now_ms())
+	if !testing.expect_value(t, accepted, agent.Chat_Accept.Accepted) { return }
+	request_no, request_err := session.request_begin(
+		&app.setup.store,
+		app.setup.session.id,
+		{
+			turn_no = app.setup.session.turn_no,
+			purpose = .Response,
+			provider = "test-provider",
+			model_requested = "test-model",
+			api = "openai_chat_completions",
+			config_json = "{}",
+			input_json = "{}",
+		},
+		session.now_ms(),
+	)
+	if !testing.expect(t, request_err == nil, "the request must be recorded") { return }
+
+	call_seq, call_err := session.entry_append(
+		&app.setup.store,
+		app.setup.session.id,
+		{
+			turn_no = app.setup.session.turn_no,
+			request_no = request_no,
+			created_at_ms = 2_000,
+			payload = session.Tool_Call_Entry{call_id = "call_1", name = "builtin.shell", arguments = `{"command":"ls"}`},
+		},
+	)
+	if !testing.expect(t, call_err == nil, "the call entry must be recorded") { return }
+	_, result_err := session.entry_append(
+		&app.setup.store,
+		app.setup.session.id,
+		{
+			turn_no = app.setup.session.turn_no,
+			request_no = request_no,
+			created_at_ms = 2_001,
+			related_seq = call_seq,
+			payload = session.Tool_Result_Entry {
+				outcome = .Success,
+				content = `{"status":"success","message":"","data":{"stdout":"first\nsecond\n","stderr":""}}`,
+				origin = .Observed,
+			},
+		},
+	)
+	if !testing.expect(t, result_err == nil, "the result entry must be recorded") { return }
+
+	testing.expect(t, session_start_new(&app))
+	snapshot_clear(&app)
+	session_resume(&app, string(id)[:8])
+	testing.expect_value(t, app.setup.session.id, id)
+
+	replayed := false
+	for &entry in app.run.snap.entries {
+		if entry.kind != .Tool { continue }
+		replayed = true
+		testing.expect_value(t, entry.tool_outcome, session.Tool_Outcome.Success)
+		testing.expect_value(t, string(entry.text[:]), "builtin.shell\nfirst\nsecond\n")
+	}
+	testing.expect(t, replayed, "resuming should replay the tool call")
+}
+
 @(test)
 test_resume_refuses_an_unknown_reference :: proc(t: ^testing.T) {
 	app: App

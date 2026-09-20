@@ -99,16 +99,17 @@ test_stopping_refuses_queued_work :: proc(t: ^testing.T) {
 	testing.expect(t, !more, "nothing may be accepted after the runtime stops")
 }
 
-// A scheduled retry is what the working indicator shows, and the send that follows is what
-// clears it: the indicator cannot keep claiming a wait that is over.
+// A tool box shows what the call produced, not the envelope the model reads: the
+// preview is taken from the result's data and its JSON escapes are decoded.
 @(test)
 test_tool_display_preview_extracts_and_decodes_shell_output :: proc(t: ^testing.T) {
-	result := agent.Tool_Result {
-		content = `{"status":"success","message":"done","data":{"stdout":"first\nsecond\n","stderr":""}}`,
-	}
-	testing.expect_value(t, tool_display_preview(&result), "first\nsecond\n")
+	content := `{"status":"success","message":"done","data":{"stdout":"first\nsecond\n","stderr":""}}`
+	testing.expect_value(t, tool_display_preview(content), "first\nsecond\n")
+	testing.expect_value(t, tool_entry_text("builtin.shell", content, "success"), "builtin.shell\nfirst\nsecond\n")
 }
 
+// A scheduled retry is what the working indicator shows, and the send that follows is what
+// clears it: the indicator cannot keep claiming a wait that is over.
 @(test)
 test_a_scheduled_retry_is_shown_until_the_send_clears_it :: proc(t: ^testing.T) {
 	app: App

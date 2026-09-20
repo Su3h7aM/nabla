@@ -375,6 +375,10 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 	}
 	defer session.context_destroy(&replayed, app.run.alloc)
 
+	// The name of each call, by the seq its result names.
+	call_names := make(map[session.Seq]string, len(replayed.entries), app.run.alloc)
+	defer delete(call_names)
+
 	if replayed.summary != "" {
 		snap_append(app, .Notice, "(earlier turns are summarized)")
 	}
@@ -388,8 +392,14 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 			}
 		case session.Assistant_Entry:
 			snap_append(app, .Assistant, payload.text)
+		case session.Tool_Call_Entry:
+			// A result names its call, not the tool, so the call's name is kept
+			// for the result that follows it.
+			call_names[entry.seq] = payload.name
 		case session.Tool_Result_Entry:
-			snap_append(app, .Tool, payload.content)
+			name := ""
+			if related, present := entry.related_seq.?; present { name = call_names[related] }
+			snap_append_tool(app, name, payload.content, session.tool_outcome_name(payload.outcome), payload.outcome)
 		}
 	}
 }
@@ -650,17 +660,21 @@ obs_user_text :: proc(user_data: rawptr, text: string) {
 
 obs_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Result) {
 	app := cast(^App)user_data
+	snap_append_tool(app, name, result.content, tool_display_summary(result), result.outcome)
+}
+
+// snap_append_tool records one tool box: the call's name, the preview of its
+// result, and the outcome its border is colored by. The live turn and the
+// replayed session both arrive here, so the box is the same either way.
+snap_append_tool :: proc(app: ^App, name, content, fallback: string, outcome: session.Tool_Outcome) {
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
 	entry := Entry {
 		kind         = .Tool,
 		text         = make([dynamic]u8, 0, 0, app.run.alloc),
-		tool_outcome = result.outcome,
+		tool_outcome = outcome,
 	}
-	preview_text := tool_display_preview(result)
-	if preview_text == "" { preview_text = tool_display_summary(result) }
-	preview := fmt.tprintf("%s\n%s", name, preview_text)
-	append(&entry.text, ..transmute([]byte)preview)
+	append(&entry.text, ..transmute([]byte)tool_entry_text(name, content, fallback))
 	append(&app.run.snap.entries, entry)
 	app.run.snap.generation += 1
 }

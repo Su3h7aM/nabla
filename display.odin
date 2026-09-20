@@ -207,12 +207,22 @@ display_duration :: proc(delay: time.Duration) -> string {
 	return fmt.tprintf("%.0fs", seconds)
 }
 
+// tool_entry_text renders one tool box: the call's name, then the preview of
+// its result. A live turn and a replayed session build the box here, so a
+// resumed conversation shows what the call produced rather than the raw
+// envelope the model reads.
+tool_entry_text :: proc(name, content, fallback: string) -> string {
+	preview := tool_display_preview(content)
+	if preview == "" { preview = fallback }
+	return fmt.tprintf("%s\n%s", name, preview)
+}
+
 // tool_display_preview extracts the tool's useful payload from the model-facing
 // result envelope. JSON string escapes are decoded by the parser, so newlines
 // become display lines instead of literal backslash-n text.
-tool_display_preview :: proc(result: ^agent.Tool_Result) -> string {
-	if result == nil || result.content == "" { return "" }
-	value, parse_err := json.parse_string(result.content, .JSON, true, context.temp_allocator)
+tool_display_preview :: proc(content: string) -> string {
+	if content == "" { return "" }
+	value, parse_err := json.parse_string(content, .JSON, true, context.temp_allocator)
 	if parse_err != nil { return "" }
 	defer json.destroy_value(value, context.temp_allocator)
 	envelope, envelope_ok := value.(json.Object)
@@ -228,8 +238,8 @@ tool_display_preview :: proc(result: ^agent.Tool_Result) -> string {
 		}
 		if stdout != "" { return strings.clone(stdout, context.temp_allocator) }
 		if stderr != "" { return strings.clone(stderr, context.temp_allocator) }
-		if content, ok := data["content"].(json.String); ok {
-			return strings.clone(string(content), context.temp_allocator)
+		if file_text, ok := data["content"].(json.String); ok {
+			return strings.clone(string(file_text), context.temp_allocator)
 		}
 		if blocks, ok := data["content"].(json.Array); ok {
 			for block in blocks {
