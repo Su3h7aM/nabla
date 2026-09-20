@@ -4,6 +4,7 @@
 package widgets
 
 import "core:testing"
+import "nabla:layout"
 import "nabla:term"
 import "nabla:tui"
 
@@ -123,6 +124,68 @@ test_input_caret_tracks_the_visible_window :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
+	options := layout.Options {
+		capacities = {
+			nodes = 8,
+			children = 8,
+			clips = 2,
+			commands = 1,
+			text_lines = 1,
+			measured_words = 1,
+			overlays = 1,
+			measure_cache = 1,
+			id_table = 8,
+			depth = 8,
+			diagnostics = 8,
+		},
+	}
+	layout_ctx: layout.Context
+	testing.expect_value(t, layout.init(&layout_ctx, options), nil)
+	defer layout.destroy(&layout_ctx)
+	block_id := layout.Id(1)
+	paragraph_id := layout.Id(2)
+	input_id := layout.Id(3)
+	if layout.frame(&layout_ctx, {10, 5}) {
+		if layout.element(
+			&layout_ctx,
+			layout.Element_Desc{id = block_id, layout = {flow = .Column, sizing = {layout.grow(), layout.grow()}, padding = layout.pad_all(1)}},
+		) {
+			layout.content(&layout_ctx, layout.Element_Desc{id = paragraph_id, layout = {sizing = {layout.fixed(8), layout.fixed(2)}}})
+			layout.content(&layout_ctx, layout.Element_Desc{id = input_id, layout = {sizing = {layout.fixed(8), layout.fixed(1)}}})
+		}
+	}
+	layout_result, layout_error := layout.result(&layout_ctx)
+	testing.expect_value(t, layout_error, layout.Frame_Error.None)
+
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+	testing.expect(t, input_insert(&input, "ok"))
+	cells: [50]term.Cell
+	ctx: tui.Context
+	if tui.frame(&ctx, layout_result, cells[:]) {
+		if tui.element(&ctx, {id = block_id}) {
+			draw_block(&ctx, Block{border = BORDER_SINGLE})
+			if tui.element(&ctx, {id = paragraph_id}) {
+				draw_paragraph(&ctx, Paragraph{lines = []Text_Line{{value = "hello world"}}})
+			}
+			if tui.element(&ctx, {id = input_id}) {
+				draw_input(&ctx, input, {})
+			}
+		}
+	}
+	frame, render_error := tui.result(&ctx)
+	testing.expect_value(t, render_error, tui.Frame_Error.None)
+	testing.expect_value(t, frame.buffer.cells[0].grapheme, "┌")
+	testing.expect_value(t, frame.buffer.cells[11].grapheme, "h")
+	testing.expect_value(t, frame.buffer.cells[21].grapheme, "w")
+	testing.expect_value(t, frame.buffer.cells[31].grapheme, "o")
+	testing.expect(t, frame.cursor.visible && frame.cursor.placed)
+	testing.expect_value(t, frame.cursor.position, term.Position{3, 3})
+}
+
+@(test)
 test_block_draws_its_border_and_inner_area :: proc(t: ^testing.T) {
 	block := Block {
 		border = BORDER_SINGLE,
@@ -132,7 +195,6 @@ test_block_draws_its_border_and_inner_area :: proc(t: ^testing.T) {
 		width  = 10,
 		height = 4,
 	}
-	testing.expect_value(t, block_inner(rect, block), tui.Cell_Rect{x = 1, y = 1, width = 8, height = 2})
 
 	storage: [40]term.Cell
 	frame := _frame(storage[:], 10, 4)

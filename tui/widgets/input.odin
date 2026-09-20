@@ -120,7 +120,7 @@ input_move_end :: proc(input: ^Input) -> bool {
 
 // draw_input draws the text into rect, scrolling horizontally to keep the
 // cursor visible, and returns the caret for the frame.
-draw_input :: proc(
+draw_input_rect :: proc(
 	buffer: ^term.Frame_Buffer,
 	rect: tui.Cell_Rect,
 	input: Input,
@@ -141,6 +141,41 @@ draw_input :: proc(
 	_, _ = tui.draw_text(buffer, {x = rect.x, y = rect.y, width = rect.width, height = 1}, value[len(start):], style, profile)
 	column := clamp(rect.x + cursor_columns - used, rect.x, rect.x + rect.width - 1)
 	return term.Cursor{visible = true, position = {column, rect.y}, placed = true}
+}
+
+// draw_input draws into the active layout box, keeps the caret visible, and
+// records the cursor intent on the tui frame.
+draw_input_context :: proc(ctx: ^tui.Context, input: Input, style: term.Style) -> term.Cursor {
+	rect, ok := tui.bounds(ctx)
+	if !ok || rect.width <= 0 || rect.height <= 0 {
+		return {}
+	}
+	profile, profile_ok := tui.width_profile(ctx)
+	if !profile_ok {
+		return {}
+	}
+	value := string(input.text[:])
+	cursor_columns := text.text_columns(value[:input.cursor], profile)
+	offset := 0
+	if cursor_columns >= rect.width {
+		offset = cursor_columns - rect.width + 1
+	}
+	start := _scrolled_prefix(value, offset, profile)
+	used := text.text_columns(start, profile)
+	_, _ = tui.draw_text(ctx, value[len(start):], style)
+	column := clamp(rect.x + cursor_columns - used, rect.x, rect.x + rect.width - 1)
+	cursor := term.Cursor {
+		visible  = true,
+		position = {column, rect.y},
+		placed   = true,
+	}
+	_ = tui.set_cursor(ctx, cursor)
+	return cursor
+}
+
+draw_input :: proc {
+	draw_input_rect,
+	draw_input_context,
 }
 
 // _scrolled_prefix returns the shortest prefix to hide so the rest is scrolled

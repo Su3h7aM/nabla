@@ -1,5 +1,28 @@
 package tui
 
+@(private)
+_rect_end :: proc "contextless" (origin, extent: int) -> int {
+	if extent <= 0 {
+		return origin
+	}
+	if origin > max(int) - extent {
+		return max(int)
+	}
+	return origin + extent
+}
+
+@(private)
+_intersect_rect :: proc "contextless" (left, right: Cell_Rect) -> Cell_Rect {
+	x := max(left.x, right.x)
+	y := max(left.y, right.y)
+	x_end := min(_rect_end(left.x, left.width), _rect_end(right.x, right.width))
+	y_end := min(_rect_end(left.y, left.height), _rect_end(right.y, right.height))
+	if left.width <= 0 || left.height <= 0 || right.width <= 0 || right.height <= 0 || x_end <= x || y_end <= y {
+		return {}
+	}
+	return {x = x, y = y, width = x_end - x, height = y_end - y}
+}
+
 // rows splits area top to bottom, cols left to right. A positive size is a
 // cell count, a negative size is a grow child sharing the leftover; the
 // remainder goes to the last grow child. The call is all-or-nothing: it returns

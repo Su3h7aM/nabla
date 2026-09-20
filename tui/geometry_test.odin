@@ -6,6 +6,12 @@ package tui
 import "core:testing"
 
 @(test)
+test_rect_intersection_handles_large_extents :: proc(t: ^testing.T) {
+	actual := _intersect_rect(Cell_Rect{x = max(int) - 2, width = 10, height = 1}, Cell_Rect{x = max(int) - 1, width = 1, height = 1})
+	testing.expect_value(t, actual, Cell_Rect{x = max(int) - 1, width = 1, height = 1})
+}
+
+@(test)
 test_rows_split_fixed_and_grow :: proc(t: ^testing.T) {
 	area := Cell_Rect {
 		x      = 2,

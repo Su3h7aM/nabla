@@ -40,8 +40,8 @@ init :: proc(buffer: ^term.Frame_Buffer, columns, rows: int, storage: []term.Cel
 clip_to_buffer :: proc "contextless" (buffer: term.Frame_Buffer, rect: Cell_Rect) -> Cell_Rect {
 	left := max(rect.x, 0)
 	top := max(rect.y, 0)
-	right := min(rect.x + rect.width, buffer.columns)
-	bottom := min(rect.y + rect.height, buffer.rows)
+	right := min(_rect_end(rect.x, rect.width), buffer.columns)
+	bottom := min(_rect_end(rect.y, rect.height), buffer.rows)
 	if right <= left || bottom <= top {
 		return {}
 	}
@@ -51,8 +51,14 @@ clip_to_buffer :: proc "contextless" (buffer: term.Frame_Buffer, rect: Cell_Rect
 // put writes one grapheme cluster at (x, y), with its placeholder when the
 // cluster is width 2. A cluster the policy cannot draw is refused.
 @(require_results)
-put :: proc(buffer: ^term.Frame_Buffer, x, y: int, grapheme: string, style: term.Style, profile: text.Width_Profile = text.DEFAULT_WIDTH_PROFILE) -> bool {
-	if !_grid_valid(buffer^) || y < 0 || y >= buffer.rows {
+put_cell :: proc(
+	buffer: ^term.Frame_Buffer,
+	x, y: int,
+	grapheme: string,
+	style: term.Style,
+	profile: text.Width_Profile = text.DEFAULT_WIDTH_PROFILE,
+) -> bool {
+	if buffer == nil || !_grid_valid(buffer^) || y < 0 || y >= buffer.rows {
 		return false
 	}
 	width := text.cluster_width(grapheme, profile)
@@ -64,7 +70,7 @@ put :: proc(buffer: ^term.Frame_Buffer, x, y: int, grapheme: string, style: term
 
 // fill writes one width-1 grapheme over every cell of rect inside the grid and
 // returns the cells written. A wide grapheme is refused.
-fill :: proc(
+fill_rect :: proc(
 	buffer: ^term.Frame_Buffer,
 	rect: Cell_Rect,
 	grapheme: string,
@@ -73,10 +79,50 @@ fill :: proc(
 ) -> (
 	written: int,
 ) {
-	if !_grid_valid(buffer^) || text.cluster_width(grapheme, profile) != 1 {
+	if buffer == nil || !_grid_valid(buffer^) || text.cluster_width(grapheme, profile) != 1 {
 		return 0
 	}
-	visible := clip_to_buffer(buffer^, rect)
+	return _fill_clipped(buffer, rect, Cell_Rect{width = buffer.columns, height = buffer.rows}, grapheme, style)
+}
+
+// draw_text writes one line into rect and returns the cells written. A line
+// the policy rejects writes nothing; a cluster crossing the rect's right edge
+// is truncated rather than split.
+@(require_results)
+draw_text_rect :: proc(
+	buffer: ^term.Frame_Buffer,
+	rect: Cell_Rect,
+	value: string,
+	style: term.Style,
+	profile: text.Width_Profile = text.DEFAULT_WIDTH_PROFILE,
+) -> (
+	written: int,
+	ok: bool,
+) {
+	if buffer == nil {
+		return 0, false
+	}
+	return _draw_text_clipped(buffer, rect, Cell_Rect{width = buffer.columns, height = buffer.rows}, value, style, profile)
+}
+
+put :: proc {
+	put_cell,
+	put_context,
+}
+
+fill :: proc {
+	fill_rect,
+	fill_context,
+}
+
+draw_text :: proc {
+	draw_text_rect,
+	draw_text_context,
+}
+
+@(private)
+_fill_clipped :: proc(buffer: ^term.Frame_Buffer, rect, clip: Cell_Rect, grapheme: string, style: term.Style) -> (written: int) {
+	visible := _intersect_rect(clip_to_buffer(buffer^, rect), clip)
 	for row in visible.y ..< visible.y + visible.height {
 		for column in visible.x ..< visible.x + visible.width {
 			if _write_cluster(buffer, column, row, grapheme, style, 1) {
@@ -87,16 +133,13 @@ fill :: proc(
 	return written
 }
 
-// draw_text writes one line into rect and returns the cells written. A line
-// the policy rejects writes nothing; a cluster crossing the rect's right edge
-// is truncated rather than split.
-@(require_results)
-draw_text :: proc(
+@(private)
+_draw_text_clipped :: proc(
 	buffer: ^term.Frame_Buffer,
-	rect: Cell_Rect,
+	rect, clip: Cell_Rect,
 	value: string,
 	style: term.Style,
-	profile: text.Width_Profile = text.DEFAULT_WIDTH_PROFILE,
+	profile: text.Width_Profile,
 ) -> (
 	written: int,
 	ok: bool,
@@ -118,12 +161,12 @@ draw_text :: proc(
 		return 0, true
 	}
 
-	visible := clip_to_buffer(buffer^, {x = rect.x, y = rect.y, width = rect.width, height = 1})
+	visible := _intersect_rect(clip_to_buffer(buffer^, {x = rect.x, y = rect.y, width = rect.width, height = 1}), clip)
 	if visible.width == 0 {
 		return 0, true
 	}
 
-	right := rect.x + rect.width
+	right := _rect_end(rect.x, rect.width)
 	column := rect.x
 	it := text.display_iterator_make(value, profile)
 	for {
@@ -134,7 +177,7 @@ draw_text :: proc(
 		if column + cluster.width > right {
 			break
 		}
-		if column >= visible.x && column + cluster.width <= visible.x + visible.width {
+		if column >= visible.x && column + cluster.width <= _rect_end(visible.x, visible.width) {
 			if _write_cluster(buffer, column, visible.y, cluster.text, style, cluster.width) {
 				written += cluster.width
 			}

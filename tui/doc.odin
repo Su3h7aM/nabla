@@ -1,15 +1,63 @@
-// Package tui is the drawing layer for full-screen terminal applications. It
-// consumes nabla:term (frame grid and presentation), nabla:text (width and
-// break rules), and nabla:layout (layout-to-cell projection), and adds:
+// Package tui renders immediate-mode terminal interfaces from completed
+// nabla:layout frames. layout owns sizing, positioning, padding, clipping, and
+// responsiveness. tui projects that geometry to terminal cells and writes a
+// caller-owned nabla:term.Frame_Buffer using nabla:text width rules.
 //
-//   - Drawing over term.Frame_Buffer: init, put, fill, draw_text
-//     (draw.odin), and rect geometry with rows/cols (geometry.odin,
-//     project.odin).
-//   - The layout.Services binding to text (measure.odin).
+// The preferred API is scoped. Declare and solve the layout tree first, then
+// render the same hierarchy through frame and element:
 //
-// The nabla:tui/widgets subpackage builds reusable components — Block,
-// Paragraph, List, Input — on top of those operations.
+//     if layout.frame(&layout_ctx, viewport) {
+//         if layout.element(&layout_ctx, layout.Element_Desc{
+//             id = panel_id,
+//             layout = {
+//                 sizing = {layout.grow(), layout.grow()},
+//                 padding = layout.pad_all(1),
+//             },
+//         }) {
+//             layout.text(&layout_ctx, layout.Text_Desc{
+//                 id = body_id,
+//                 text = body,
+//                 style = {size = 1, color = layout.rgba(255, 255, 255, 255), wrap = .Words},
+//                 sizing = {layout.grow(), layout.fit()},
+//             })
+//         }
+//     }
+//     solved, layout_error := layout.result(&layout_ctx)
+//     if layout_error != .None {
+//         return
+//     }
 //
-// Events, styles, colors, and the terminal session belong to nabla:input and
-// nabla:term; tui is not a facade over them.
+//     ui: tui.Context
+//     if tui.frame(&ui, solved, cells) {
+//         if tui.element(&ui, {id = panel_id}) {
+//             widgets.draw_block(&ui, panel)
+//             if tui.element(&ui, {id = body_id}) {
+//                 tui.text(&ui, body_style)
+//             }
+//         }
+//     }
+//     rendered, render_error := tui.result(&ui)
+//     if render_error == .None {
+//         term.present(session, rendered.buffer, profile, rendered.cursor, output)
+//     }
+//
+// The render hierarchy must match the solved layout hierarchy. element selects
+// either the resolved outer or inner box and automatically applies the node's
+// effective clip. Its deferred cleanup closes on every block exit, including
+// return, break, and continue. Context uses fixed inline scope storage,
+// allocates nothing, and has a valid zero value.
+//
+// text draws the resolved lines emitted by layout.text, so layout owns wrapping
+// and line placement while nabla:text supplies width measurement.
+//
+// put, fill, and draw_text are overloaded. Their Frame_Buffer forms are the
+// explicit-rectangle escape hatch for small renderers and existing code. Their
+// Context forms draw in the active scope. fill_at, put_at, and draw_text_at let
+// custom widgets address a smaller absolute rectangle while retaining the
+// active layout clip.
+//
+// The widgets subpackage owns reusable UI behavior and caller-owned widget
+// state. Events remain in nabla:input. Terminal sessions, styles, colors,
+// buffers, cursors, and presentation remain in nabla:term. tui is not a facade
+// over those packages.
 package tui
