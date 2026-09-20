@@ -41,6 +41,19 @@ message_truncated :: proc(response: []u8) -> bool {
 	return ok && flags.tc
 }
 
+// Rcode_Name_Error is the response code for a name that does not exist.
+// RFC 1035 4.1.1. No OPT record leaves this endpoint, so the plain four-bit
+// code is authoritative.
+Rcode_Name_Error :: 3
+
+// response_rcode reads the response code of a message with at least a
+// header.
+response_rcode :: proc(response: []u8) -> (rcode: u8, ok: bool) {
+	flags, valid := message_flags(response)
+	if !valid { return 0, false }
+	return flags.rcode, true
+}
+
 // response_matches reports whether a reply answers the query that was sent:
 // the same ID, the QR bit set, and the same question. RFC 5452 9.1 requires
 // matching on ID, name, class, and type before a reply may be trusted; an

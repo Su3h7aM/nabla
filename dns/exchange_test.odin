@@ -139,6 +139,37 @@ test_interruption_stops_a_lookup :: proc(t: ^testing.T) {
 	net.close(udp)
 }
 
+// test_name_error_stops_the_lookup points a lookup at two servers: the
+// first answers Name Error, the second would answer. The lookup reports
+// No_Answer without touching the second server: a name that does not exist
+// has no answer anywhere.
+@(test)
+test_name_error_stops_the_lookup :: proc(t: ^testing.T) {
+	denied: Exchange_Fixture
+	denied.nxdomain = true
+	denied_udp, denied_tcp, denied_port, denied_started := start_peers(t, &denied)
+	if !denied_started { return }
+
+	answering: Exchange_Fixture
+	answering.answer = net.IP4_Address{192, 0, 2, 1}
+	answering_udp, answering_tcp, answering_port, answering_started := start_peers(t, &answering)
+	if !answering_started {
+		stop_peers(&denied, denied_udp, denied_tcp)
+		return
+	}
+
+	servers := [2]net.Endpoint{{address = net.IP4_Address{127, 0, 0, 1}, port = denied_port}, {address = net.IP4_Address{127, 0, 0, 1}, port = answering_port}}
+	records, lookup_err := lookup("example.com", net.DNS_Record_Type.DNS_TYPE_A, Options{servers = servers[:]}, context.temp_allocator)
+	testing.expect_value(t, lookup_err, Error.No_Answer)
+	testing.expect_value(t, len(records), 0)
+
+	stop_peers(&denied, denied_udp, denied_tcp)
+	stop_peers(&answering, answering_udp, answering_tcp)
+	testing.expect(t, denied.udp_hit, "the first server was asked")
+	testing.expect(t, !answering.udp_hit, "the second server was never asked")
+	testing.expect(t, !answering.tcp_hit, "no fallback ran for a name error")
+}
+
 // Interrupt_State counts interrupt checks; the check fires from the third
 // call on, so the lookup starts its attempt before it is stopped.
 Interrupt_State :: struct {
@@ -185,6 +216,7 @@ start_peers :: proc(t: ^testing.T, fixture: ^Exchange_Fixture) -> (udp_thread, t
 		return nil, nil, 0, false
 	}
 	fixture.tcp = listener
+	fixture.port = bound.port
 	if block_err := net.set_blocking(listener, false); block_err != nil {
 		testing.expectf(t, false, "the TCP peer could not poll: %v", block_err)
 		net.close(listener)
@@ -208,8 +240,14 @@ start_peers :: proc(t: ^testing.T, fixture: ^Exchange_Fixture) -> (udp_thread, t
 	return udp_thread, tcp_thread, bound.port, true
 }
 
-// stop_peers joins the peer threads and closes their sockets.
+// stop_peers joins the peer threads and closes their sockets. A TCP peer
+// still polling for a connection that will never come is woken with a
+// self-connect first: it accepts, reads the immediate close, and leaves,
+// instead of polling to its bound.
 stop_peers :: proc(fixture: ^Exchange_Fixture, udp_thread, tcp_thread: ^thread.Thread) {
+	if wake, wake_err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Address{127, 0, 0, 1}, port = fixture.port}); wake_err == nil {
+		net.close(wake)
+	}
 	thread.join(udp_thread)
 	thread.destroy(udp_thread)
 	thread.join(tcp_thread)
@@ -226,11 +264,13 @@ stop_peers :: proc(fixture: ^Exchange_Fixture, udp_thread, tcp_thread: ^thread.T
 Exchange_Fixture :: struct {
 	udp:          net.UDP_Socket,
 	tcp:          net.TCP_Socket,
+	port:         int,
 	answer:       net.IP4_Address,
 	udp_hit:      bool,
 	tcp_hit:      bool,
 	send_decoy:   bool,
 	split_prefix: bool,
+	nxdomain:     bool,
 }
 
 // PEER_BOUND limits one peer exchange. It is hit only when the exchange
@@ -260,6 +300,14 @@ udp_truncate_serve :: proc(thread: ^thread.Thread) {
 	reply[3] = 0x00
 	reply[5] = 0x01
 	copy(reply[HEADER_SIZE:], buffer[HEADER_SIZE:received])
+	if fixture.nxdomain {
+		// A definitive Name Error: QR set, no truncation, no answers. The
+		// name does not exist, so no other server can answer it either.
+		reply[2] = 0x81
+		reply[3] = Rcode_Name_Error
+		net.send_udp(fixture.udp, reply[:received], source)
+		return
+	}
 	if fixture.send_decoy {
 		// A forged reply for another query: same shape, a flipped ID. The
 		// client passes it over within the same attempt.
@@ -295,7 +343,6 @@ tcp_answer :: proc(fixture: ^Exchange_Fixture, conn: net.TCP_Socket) {
 	defer net.close(conn)
 	_ = net.set_option(conn, .Receive_Timeout, DNS_TIMEOUT)
 	_ = net.set_option(conn, .Send_Timeout, DNS_TIMEOUT)
-	fixture.tcp_hit = true
 
 	prefix: [2]u8
 	if !tcp_read_full(conn, prefix[:]) { return }
@@ -304,6 +351,7 @@ tcp_answer :: proc(fixture: ^Exchange_Fixture, conn: net.TCP_Socket) {
 	query := make([]u8, length, context.temp_allocator)
 	defer delete(query, context.temp_allocator)
 	if !tcp_read_full(conn, query) { return }
+	fixture.tcp_hit = true
 
 	// Header with one answer, the question echoed back, and one A record
 	// naming the queried name through a compression pointer at the question.

@@ -31,6 +31,28 @@ test_message_truncated :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_response_rcode :: proc(t: ^testing.T) {
+	rcode, ok := response_rcode(wire(TEST_REPLY))
+	testing.expect(t, ok, "a reply carries a response code")
+	testing.expect_value(t, rcode, 0)
+
+	denied := wire("\x12\x34\x81\x83\x00\x01\x00\x00\x00\x00\x00\x00" + "\x07example\x03com\x00\x00\x01\x00\x01")
+	denied_code, denied_ok := response_rcode(denied)
+	testing.expect(t, denied_ok, "a refusal carries a response code")
+	testing.expect_value(t, denied_code, Rcode_Name_Error)
+
+	failed := wire("\x12\x34\x81\x82\x00\x01\x00\x00\x00\x00\x00\x00" + "\x07example\x03com\x00\x00\x01\x00\x01")
+	failed_code, failed_ok := response_rcode(failed)
+	testing.expect(t, failed_ok, "a failure carries a response code")
+	testing.expect(t, failed_code != Rcode_Name_Error, "only name errors are name errors")
+
+	short := wire(TEST_QUERY)
+	testing.expect(t, len(short) >= HEADER_SIZE, "the test query has a header")
+	_, short_ok := response_rcode(short[:7])
+	testing.expect(t, !short_ok, "a short buffer carries no response code")
+}
+
+@(test)
 test_response_matches :: proc(t: ^testing.T) {
 	query := wire(TEST_QUERY)
 	reply := wire(TEST_REPLY)

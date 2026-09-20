@@ -17,6 +17,19 @@ import "core:time"
 // skipped like any other unusable reply.
 DNS_MAX_UDP :: 4096
 
+// Query_Outcome is what one server attempt established. Answer carries usable
+// records. Skip moves on to the next server. Retry_TCP retries the same
+// query over TCP. Name_Error stops the lookup: the name does not exist, so
+// no other server can answer. Cancelled stops the lookup: the caller's
+// interrupt fired.
+Query_Outcome :: enum {
+	Answer,
+	Skip,
+	Retry_TCP,
+	Name_Error,
+	Cancelled,
+}
+
 // query_id draws the correlation nonce for one lookup from the runtime
 // generator: unpredictable across the full 16-bit range, per RFC 5452 9.2.
 query_id :: proc() -> (id: u16be, ok: bool) {
@@ -26,9 +39,7 @@ query_id :: proc() -> (id: u16be, ok: bool) {
 	return id, true
 }
 
-// query_server asks one server and returns its usable answer, if any. An
-// empty answer with no error means the server was unusable: the caller moves
-// on. Only the caller's interrupt leaves this procedure with an error.
+// query_server asks one server and returns its usable answer, if any.
 query_server :: proc(
 	server: net.Endpoint,
 	packet: []u8,
@@ -39,31 +50,36 @@ query_server :: proc(
 	allocator: mem.Allocator,
 ) -> (
 	records: []net.DNS_Record,
-	err: Error,
+	outcome: Query_Outcome,
 ) {
-	answer, udp_ok := exchange_udp(server, packet, id, kind, timeout, interrupt, allocator)
-	if !udp_ok {
-		if interrupt_now(interrupt) { return nil, .Cancelled }
-		return nil, .None
+	answer, udp_outcome := exchange_udp(server, packet, id, kind, timeout, interrupt, allocator)
+	switch udp_outcome {
+	case .Answer:
+		return answer, .Answer
+	case .Retry_TCP:
+		// Truncation is detected before parsing, so there is nothing to
+		// release: the same query goes over TCP.
+		return exchange_tcp(server, packet, id, kind, timeout, interrupt, allocator)
+	case .Name_Error, .Cancelled:
+		return nil, udp_outcome
+	case .Skip:
+		net.destroy_dns_records(answer, allocator)
+		return nil, outcome_after(interrupt)
 	}
-	if answer == nil {
-		// The reply was truncated: the same query goes over TCP before any
-		// other server is tried. A partial answer is not an answer.
-		tcp_answer, tcp_ok := exchange_tcp(server, packet, id, kind, timeout, interrupt, allocator)
-		if !tcp_ok {
-			if interrupt_now(interrupt) { return nil, .Cancelled }
-			return nil, .None
-		}
-		return tcp_answer, .None
-	}
-	return answer, .None
+	return nil, .Skip
+}
+
+// outcome_after reports a stop that fired during a failed attempt: the
+// attempt's own failure must not hide the caller's interruption.
+outcome_after :: proc(interrupt: Interrupt) -> Query_Outcome {
+	if interrupt_now(interrupt) { return .Cancelled }
+	return .Skip
 }
 
 // exchange_udp sends one query and reads datagrams until the attempt
 // deadline. A datagram from anyone but the queried server, or one that does
 // not answer this query, is passed over: a forgery is not an error, and the
-// genuine reply may still arrive. A nil answer with success means the reply
-// was truncated and the caller retries over TCP.
+// genuine reply may still arrive.
 exchange_udp :: proc(
 	server: net.Endpoint,
 	packet: []u8,
@@ -74,38 +90,50 @@ exchange_udp :: proc(
 	allocator: mem.Allocator,
 ) -> (
 	records: []net.DNS_Record,
-	complete: bool,
+	outcome: Query_Outcome,
 ) {
 	created, create_err := net.create_socket(net.family_from_endpoint(server), .UDP)
-	if create_err != nil { return nil, false }
+	if create_err != nil { return nil, outcome_after(interrupt) }
 	socket := created.(net.UDP_Socket)
-	if socket == 0 { return nil, false }
+	if socket == 0 { return nil, outcome_after(interrupt) }
 	defer net.close(socket)
 	// Short slices keep interruption prompt; the deadline below bounds the
 	// whole attempt no matter how many slices it takes.
 	_ = net.set_option(socket, .Receive_Timeout, DNS_IO_SLICE)
 	_ = net.set_option(socket, .Send_Timeout, DNS_IO_SLICE)
 
-	if !udp_send(socket, packet, server, timeout, interrupt) { return nil, false }
+	if !udp_send(socket, packet, server, timeout, interrupt) { return nil, outcome_after(interrupt) }
 
 	buffer: [DNS_MAX_UDP]u8
 	deadline := time.tick_add(time.tick_now(), timeout)
 	for time.tick_since(deadline) < 0 {
-		if interrupt_now(interrupt) { return nil, false }
+		if interrupt_now(interrupt) { return nil, .Cancelled }
 		count, source, recv_err := net.recv_udp(socket, buffer[:])
 		if recv_err != .None { continue }
 		// A datagram from anyone but the queried server cannot answer this
 		// query. Its arrival does not end the attempt.
 		if count <= 0 || source != server { continue }
-		if message_truncated(buffer[:count]) { return nil, true }
+		if message_truncated(buffer[:count]) { return nil, .Retry_TCP }
 		answer, xid, parsed := net.parse_response(buffer[:count], kind, allocator)
 		if !parsed || xid != id || !response_matches(packet, buffer[:count]) {
 			net.destroy_dns_records(answer, allocator)
 			continue
 		}
-		return answer, true
+		if response_nxdomain(buffer[:count]) {
+			net.destroy_dns_records(answer, allocator)
+			return nil, .Name_Error
+		}
+		return answer, .Answer
 	}
-	return nil, false
+	return nil, outcome_after(interrupt)
+}
+
+// response_nxdomain reports a definitive Name Error on a reply already known
+// to answer the query: no other server can answer it either, so trying them
+// only spends the lookup's time.
+response_nxdomain :: proc(response: []u8) -> bool {
+	rcode, ok := response_rcode(response)
+	return ok && rcode == Rcode_Name_Error
 }
 
 // udp_send writes the whole query, retrying across slices until the attempt
@@ -139,32 +167,36 @@ exchange_tcp :: proc(
 	allocator: mem.Allocator,
 ) -> (
 	records: []net.DNS_Record,
-	complete: bool,
+	outcome: Query_Outcome,
 ) {
-	if len(packet) > int(max(u16)) { return nil, false }
+	if len(packet) > int(max(u16)) { return nil, outcome_after(interrupt) }
 	socket, dialed := dial_tcp_deadline(server, timeout, interrupt)
-	if !dialed { return nil, false }
+	if !dialed { return nil, outcome_after(interrupt) }
 	defer net.close(socket)
 
 	prefix := [2]u8{u8(len(packet) >> 8), u8(len(packet))}
-	if !tcp_send(socket, prefix[:], timeout, interrupt) { return nil, false }
-	if !tcp_send(socket, packet, timeout, interrupt) { return nil, false }
+	if !tcp_send(socket, prefix[:], timeout, interrupt) { return nil, outcome_after(interrupt) }
+	if !tcp_send(socket, packet, timeout, interrupt) { return nil, outcome_after(interrupt) }
 
 	length_prefix := [2]u8{}
-	if !tcp_receive(socket, length_prefix[:], timeout, interrupt) { return nil, false }
+	if !tcp_receive(socket, length_prefix[:], timeout, interrupt) { return nil, outcome_after(interrupt) }
 	length := int(length_prefix[0]) << 8 | int(length_prefix[1])
 	// A reply shorter than a header names nothing; overlong lengths cannot
 	// arrive in two octets, so the wire bound is the only check needed.
-	if length < HEADER_SIZE { return nil, false }
+	if length < HEADER_SIZE { return nil, outcome_after(interrupt) }
 	response := make([]u8, length, allocator)
 	defer delete(response, allocator)
-	if !tcp_receive(socket, response, timeout, interrupt) { return nil, false }
+	if !tcp_receive(socket, response, timeout, interrupt) { return nil, outcome_after(interrupt) }
 	answer, xid, parsed := net.parse_response(response, kind, allocator)
 	if !parsed || xid != id || !response_matches(packet, response) {
 		net.destroy_dns_records(answer, allocator)
-		return nil, false
+		return nil, outcome_after(interrupt)
 	}
-	return answer, true
+	if response_nxdomain(response) {
+		net.destroy_dns_records(answer, allocator)
+		return nil, .Name_Error
+	}
+	return answer, .Answer
 }
 
 // tcp_send writes the whole buffer, consuming prefixes the peer accepted. A

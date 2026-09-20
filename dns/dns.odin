@@ -93,20 +93,31 @@ lookup :: proc(hostname: string, kind: net.DNS_Record_Type, options: Options, al
 	timeout := attempt_timeout(options)
 	for _ in 0 ..< attempt_rounds(options) {
 		for server in options.servers {
-			answer, query_err := query_server(server, packet, id, kind, timeout, options.interrupt, allocator)
-			if query_err == .Cancelled { return nil, .Cancelled }
-			if query_err != .None { continue }
-			if len(answer) == 0 {
+			answer, outcome := query_server(server, packet, id, kind, timeout, options.interrupt, allocator)
+			switch outcome {
+			case .Answer:
+				if len(answer) == 0 {
+					net.destroy_dns_records(answer, allocator)
+					continue
+				}
+				// An answer completed before the interrupt fired is still
+				// reported as interrupted: the caller stopped waiting for it.
+				if interrupt_now(options.interrupt) {
+					net.destroy_dns_records(answer, allocator)
+					return nil, .Cancelled
+				}
+				return answer, .None
+			case .Name_Error:
+				// The name does not exist, so no other server can answer.
 				net.destroy_dns_records(answer, allocator)
-				continue
-			}
-			// An answer completed before the interrupt fired is still
-			// reported as interrupted: the caller stopped waiting for it.
-			if interrupt_now(options.interrupt) {
+				return nil, .No_Answer
+			case .Cancelled:
 				net.destroy_dns_records(answer, allocator)
 				return nil, .Cancelled
+			case .Skip, .Retry_TCP:
+				net.destroy_dns_records(answer, allocator)
+				if interrupt_now(options.interrupt) { return nil, .Cancelled }
 			}
-			return answer, .None
 		}
 		if interrupt_now(options.interrupt) { return nil, .Cancelled }
 	}
