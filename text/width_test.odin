@@ -28,6 +28,23 @@ test_truncate_text_keeps_a_tab_only_when_all_its_cells_fit :: proc(t: ^testing.T
 }
 
 @(test)
+test_truncate_text_at_measures_a_tab_from_its_start_column :: proc(t: ^testing.T) {
+	profile := Width_Profile {
+		tab_width = 4,
+	}
+	// A tab at column 0 is four cells; the same tab at column 1 is three.
+	testing.expect_value(t, truncate_text_at("\t", 4, 0, profile), "\t")
+	testing.expect_value(t, truncate_text_at("\t", 3, 0, profile), "")
+	testing.expect_value(t, truncate_text_at("\t", 3, 1, profile), "\t")
+	testing.expect_value(t, truncate_text_at("\t", 2, 1, profile), "")
+	// From column 0 "a\tb" needs five cells and truncates; from column 1 it
+	// needs four and fits, which is why a piece's start column matters.
+	testing.expect_value(t, truncate_text_at("a\tb", 4, 0, profile), "a\t")
+	testing.expect_value(t, truncate_text_at("a\tb", 4, 1, profile), "a\tb")
+	testing.expect_value(t, text_columns_at("\tfoo", 1, profile), 3 + 3)
+}
+
+@(test)
 test_grapheme_offsets_step_by_cluster :: proc(t: ^testing.T) {
 	// A base plus a combining mark is one edit unit.
 	accent := "e\u0301x"

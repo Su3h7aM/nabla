@@ -43,10 +43,19 @@ text_columns_at :: proc(value: string, start_column: int, profile: Width_Profile
 // cells under profile. The result never splits a grapheme cluster and never
 // occupies more than max_columns, so it is always drawable as-is.
 truncate_text :: proc(value: string, max_columns: int, profile: Width_Profile = DEFAULT_WIDTH_PROFILE) -> string {
+	return truncate_text_at(value, max_columns, 0, profile)
+}
+
+// truncate_text_at is truncate_text for text that starts at start_column: a
+// tab advances to the next stop measured from there, so a caller assembling a
+// line one piece at a time gets the prefix drawing will fit.
+truncate_text_at :: proc(value: string, max_columns, start_column: int, profile: Width_Profile = DEFAULT_WIDTH_PROFILE) -> string {
 	if max_columns <= 0 {
 		return ""
 	}
+	start := max(start_column, 0)
 	it := display_iterator_make(value, profile)
+	it.column = start
 	columns := 0
 	result := 0
 	for {

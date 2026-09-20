@@ -803,16 +803,30 @@ _justification_spacing :: proc "contextless" (mode: Justify, remaining: Scalar, 
 
 @(private)
 _rect_intersects :: proc "contextless" (left, right: Rect) -> bool {
-	return(
-		left.size.x > 0 &&
-		left.size.y > 0 &&
-		right.size.x > 0 &&
-		right.size.y > 0 &&
-		f64(left.position.x) < f64(right.position.x) + f64(right.size.x) &&
-		f64(right.position.x) < f64(left.position.x) + f64(left.size.x) &&
-		f64(left.position.y) < f64(right.position.y) + f64(right.size.y) &&
-		f64(right.position.y) < f64(left.position.y) + f64(left.size.y) \
-	)
+	// A clip or viewport with no area shows nothing.
+	if right.size.x <= 0 || right.size.y <= 0 {
+		return false
+	}
+	if left.size.x < 0 || left.size.y < 0 {
+		return false
+	}
+	// An empty text line still occupies its row: its bounds are width zero but
+	// height one, and culling it would drop the row a renderer paints. A
+	// degenerate axis intersects when its position lies inside the clip, using
+	// the terminal's half-open cell intervals.
+	x_ok: bool
+	if left.size.x > 0 {
+		x_ok = f64(left.position.x) < f64(right.position.x) + f64(right.size.x) && f64(right.position.x) < f64(left.position.x) + f64(left.size.x)
+	} else {
+		x_ok = f64(left.position.x) >= f64(right.position.x) && f64(left.position.x) < f64(right.position.x) + f64(right.size.x)
+	}
+	y_ok: bool
+	if left.size.y > 0 {
+		y_ok = f64(left.position.y) < f64(right.position.y) + f64(right.size.y) && f64(right.position.y) < f64(left.position.y) + f64(left.size.y)
+	} else {
+		y_ok = f64(left.position.y) >= f64(right.position.y) && f64(left.position.y) < f64(right.position.y) + f64(right.size.y)
+	}
+	return x_ok && y_ok
 }
 
 @(private)

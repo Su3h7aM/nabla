@@ -194,6 +194,11 @@ Frame_Storage :: struct {
 frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	storage := new(Frame_Storage, alloc)
 	storage.alloc = alloc
+	// Measurement and drawing share one width policy, so a tab or an
+	// emoji-presentation sequence measures the columns drawing produces.
+	// The zero profile would drop tabs while drawing expands them, and the
+	// box math below would place the border from the wrong width.
+	storage.measure.profile = text.DEFAULT_WIDTH_PROFILE
 	storage.layout_storage = make([]byte, layout.storage_size(CONVERSATION_CAPACITIES), alloc)
 	config := layout.Options {
 		capacities = CONVERSATION_CAPACITIES,
@@ -540,6 +545,12 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width, ordinal: 
 	box_width := max(width, 4)
 	border_inner_width := max(box_width - 2, 1)
 	content_width := max(box_width - 4, 1)
+	// A content row is " piece fill ": the piece starts one cell in, so its
+	// tabs expand from column 1. The top and bottom labels sit after the
+	// corner, one rule, and one space, so theirs expand from column 3. Width
+	// math uses those starts, or a tab puts the border in the wrong column.
+	TOOL_CONTENT_START :: 1
+	TOOL_LABEL_START :: 3
 	value := string(entry.text[:])
 	name := value
 	preview := ""
@@ -549,14 +560,15 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width, ordinal: 
 	}
 	// The corner, the leading rule, and the space after the name leave the name
 	// this much room; the rest of the top border is rule.
-	name = text.truncate_text(name, max(border_inner_width - 3, 0))
+	name = text.truncate_text_at(name, max(border_inner_width - 3, 0), TOOL_LABEL_START)
 	preview = display_clean(preview, context.temp_allocator)
-	rule_fill := strings.repeat(outline.horizontal, max(border_inner_width - text.text_columns(name) - 3, 0), context.temp_allocator) or_else ""
+	rule_fill :=
+		strings.repeat(outline.horizontal, max(border_inner_width - text.text_columns_at(name, TOOL_LABEL_START) - 3, 0), context.temp_allocator) or_else ""
 	top := fmt.tprintf("%s%s %s %s%s", outline.top_left, outline.horizontal, name, rule_fill, outline.top_right)
 	// The window is the part of the result the box shows. Its offset is clamped
 	// here because this is where the row count and the box's width are both known:
 	// a resize or a shorter result can leave a remembered offset past the end.
-	content_rows := tool_preview_rows(preview, content_width)
+	content_rows := tool_preview_rows(preview, content_width, TOOL_CONTENT_START)
 	visible_rows := min(content_rows, TOOL_WINDOW_ROWS)
 	// The bound is kept on the entry because the wheel asks whether the window has
 	// room left before it decides who owns the report.
@@ -576,9 +588,9 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width, ordinal: 
 		row_index := 0
 		drawn := 0
 		for len(remaining) > 0 {
-			piece, rest := tool_row_next(remaining, content_width)
+			piece, rest := tool_row_next(remaining, content_width, TOOL_CONTENT_START)
 			if row_index >= entry.tool_scroll && drawn < visible_rows {
-				fill := strings.repeat(" ", max(content_width - text.text_columns(piece), 0), context.temp_allocator) or_else ""
+				fill := strings.repeat(" ", max(content_width - text.text_columns_at(piece, TOOL_CONTENT_START), 0), context.temp_allocator) or_else ""
 				declare_tool_row(ctx, fmt.tprintf(" %s%s ", piece, fill), border, body, outline.vertical)
 				drawn += 1
 			}
@@ -597,12 +609,13 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width, ordinal: 
 // tool_row_next splits the first row a tool box draws from `value` and returns
 // it with the remainder. A row ends at a newline or at the content width,
 // whichever comes first; a grapheme wider than the width still takes a row, so
-// the split always advances.
-tool_row_next :: proc(value: string, width: int) -> (row: string, rest: string) {
+// the split always advances. start_column is where the row starts inside its
+// drawn line, so tabs stop where drawing puts them.
+tool_row_next :: proc(value: string, width, start_column: int) -> (row: string, rest: string) {
 	newline := strings.index(value, "\n")
 	logical := value
 	if newline >= 0 { logical = value[:newline] }
-	piece := text.truncate_text(logical, width)
+	piece := text.truncate_text_at(logical, width, start_column)
 	if piece == "" && len(logical) > 0 {
 		piece = logical[:text.next_grapheme_offset(logical, 0)]
 	}
@@ -617,11 +630,11 @@ tool_row_next :: proc(value: string, width: int) -> (row: string, rest: string) 
 
 // tool_preview_rows counts the rows a tool box draws for a result: one per
 // wrapped row, so the box knows what its window is holding back.
-tool_preview_rows :: proc(preview: string, width: int) -> int {
+tool_preview_rows :: proc(preview: string, width, start_column: int) -> int {
 	rows := 0
 	remaining := preview
 	for len(remaining) > 0 {
-		_, remaining = tool_row_next(remaining, width)
+		_, remaining = tool_row_next(remaining, width, start_column)
 		rows += 1
 	}
 	return rows
@@ -646,12 +659,12 @@ tool_window_label :: proc(hidden_above, hidden_below: int) -> string {
 // when it has one. The label is truncated to the room the border has, and an
 // empty result is a plain rule.
 tool_border_bottom :: proc(outline: widgets.Border, inner_width: int, label: string) -> string {
-	visible := text.truncate_text(label, max(inner_width - 3, 0))
+	visible := text.truncate_text_at(label, max(inner_width - 3, 0), 3)
 	if visible == "" {
 		fill := strings.repeat(outline.horizontal, inner_width, context.temp_allocator) or_else ""
 		return fmt.tprintf("%s%s%s", outline.bottom_left, fill, outline.bottom_right)
 	}
-	fill := strings.repeat(outline.horizontal, max(inner_width - text.text_columns(visible) - 3, 0), context.temp_allocator) or_else ""
+	fill := strings.repeat(outline.horizontal, max(inner_width - text.text_columns_at(visible, 3) - 3, 0), context.temp_allocator) or_else ""
 	return fmt.tprintf("%s%s %s %s%s", outline.bottom_left, outline.horizontal, visible, fill, outline.bottom_right)
 }
 

@@ -309,3 +309,50 @@ test_command_normalization :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, rules, 2)
 }
+
+@(test)
+test_empty_text_line_survives_visible_culling :: proc(t: ^testing.T) {
+	// An empty line has width zero but still occupies its row. Visible culling
+	// must keep it when that row is on screen, or a renderer painting per row
+	// loses the row.
+	visible_config := _test_options()
+	visible_config.cull = .Visible
+	ctx: Context
+	testing.expect_value(t, init(&ctx, visible_config), nil)
+	defer destroy(&ctx)
+
+	measure_text :: proc(user_data: rawptr, value: string, style: Text_Style, request: Measure_Request) -> (Measure_Result, Measure_Error) {
+		_, _, _, _ = user_data, value, style, request
+		// One cell per byte, one row tall; empty text is width zero, height one.
+		return Measure_Result{size = {Scalar(len(value)), 1}, min_size = {Scalar(len(value)), 1}, baseline = 1}, .None
+	}
+	break_text :: proc(user_data: rawptr, value: string, offset: int) -> (piece_end: int, next_offset: int, kind: Text_Break_Kind, err: Text_Break_Error) {
+		_, _, _ = user_data, value, offset
+		for index in offset ..< len(value) {
+			if value[index] == '\n' {
+				return index, index + 1, .Mandatory, .None
+			}
+		}
+		return len(value), len(value), .None, .None
+	}
+	set_services(&ctx, Services{measure_text = measure_text, break_text = break_text})
+	if frame(&ctx, {100, 100}) {
+		text(&ctx, {text = "ab\n\ncd", style = {color = {255, 255, 255, 255}, wrap = .Words}})
+	}
+	frame_result, err := result(&ctx)
+	testing.expect_value(t, err, Frame_Error.None)
+	texts := 0
+	empty := 0
+	for command in frame_result.commands {
+		data, is_text := command.data.(Text_Cmd)
+		if !is_text {
+			continue
+		}
+		texts += 1
+		if data.text == "" {
+			empty += 1
+		}
+	}
+	testing.expect_value(t, texts, 3)
+	testing.expect_value(t, empty, 1)
+}

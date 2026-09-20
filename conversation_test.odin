@@ -78,6 +78,37 @@ test_conversation_wraps_user_message_with_background :: proc(t: ^testing.T) {
 	testing.expect_value(t, storage.buffer.cells[4 * 20].style, term.Style{})
 }
 
+// An empty line inside one user message is still one message: the band's
+// background covers the empty row instead of splitting the prompt in two.
+@(test)
+test_user_message_empty_line_keeps_the_background :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	snap_append(app, .User, "line1\n\nline2")
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+
+	testing.expect(t, conversation_render(t, app, storage, 20, 6), "the conversation frame must solve")
+
+	scratch: [256]byte
+	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), "line1               ")
+	testing.expect_value(t, conversation_glyph_row(storage, 2, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 3, scratch[:]), "line2               ")
+	testing.expect_value(t, conversation_glyph_row(storage, 4, scratch[:]), "                    ")
+
+	for row in 0 ..< 5 {
+		testing.expect_value(t, storage.buffer.cells[row * 20].style, USER_TEXT)
+		testing.expect_value(t, storage.buffer.cells[row * 20 + 19].style, USER_TEXT)
+	}
+	testing.expect_value(t, storage.buffer.cells[5 * 20].style, term.Style{})
+}
+
 @(test)
 test_conversation_scroll_reveals_older_rows_and_clamps :: proc(t: ^testing.T) {
 	app := new(App)
@@ -260,6 +291,61 @@ test_tool_box_matches_the_prompt_box :: proc(t: ^testing.T) {
 	_, frame_error = render_frame(app, storage)
 	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
 	testing.expect_value(t, storage.buffer.cells[tool_row * columns + tool_border].style, TOOL_FAILURE)
+}
+
+// A tab inside a tool result expands where drawing puts it, so every content
+// row still pads to the same width and the right border stays in one column.
+@(test)
+test_tool_box_with_tabs_keeps_the_right_border :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	widgets.input_init(&app.input, context.allocator)
+	defer widgets.input_destroy(&app.input)
+	app.columns = 40
+	app.rows = 20
+	snap_append(app, .Tool, "builtin.read\n\tfoo[0]\nbar {\"a\": [1]}")
+	app.run.snap.entries[0].tool_outcome = .Success
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	_, frame_error := render_frame(app, storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+
+	tool_row := -1
+	for row in 0 ..< app.rows {
+		if frame_glyph_column(storage, row, "╭") >= 0 {
+			tool_row = row
+			break
+		}
+	}
+	if !testing.expect(t, tool_row >= 0, "the tool box must be drawn") { return }
+
+	columns := storage.buffer.columns
+	right := -1
+	for row in tool_row ..< app.rows {
+		has_left := false
+		for column in 0 ..< columns {
+			grapheme := storage.buffer.cells[row * columns + column].grapheme
+			if grapheme == "╭" || grapheme == "│" || grapheme == "╰" {
+				has_left = true
+				break
+			}
+		}
+		if !has_left { break }
+		column := -1
+		for c in 0 ..< columns {
+			grapheme := storage.buffer.cells[row * columns + c].grapheme
+			if grapheme == "╮" || grapheme == "│" || grapheme == "╯" {
+				column = c
+			}
+		}
+		if right < 0 { right = column }
+		testing.expect_value(t, column, right)
+	}
 }
 
 // A user message is a band across the whole terminal, so it reads as a message
