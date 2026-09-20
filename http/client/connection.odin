@@ -24,6 +24,22 @@ Connection :: struct {
 	nonblocking: bool,
 }
 
+// dial_first dials each candidate in order and returns the first connection
+// that answers. An unreachable address moves on to the next; only the
+// caller's own stop ends the attempts, so fallback never becomes a way to
+// ignore cancellation.
+dial_first :: proc(endpoints: []net.Endpoint, options: Options, allocator: mem.Allocator) -> (connection: ^Connection, err: Error) {
+	for endpoint in endpoints {
+		if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
+			return nil, error_from_stop(stop)
+		}
+		dialed, dial_err := connection_dial(endpoint, options, allocator)
+		if dial_err == .None { return dialed, .None }
+		if dial_err != .Connect { return nil, dial_err }
+	}
+	return nil, .Connect
+}
+
 // connection_dial returns nil on failure, so a caller never owns a half-built
 // connection. It waits on the calling thread's core:nbio event loop, which the
 // caller must have acquired.

@@ -205,14 +205,16 @@ request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase,
 	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
 		return nil, failure_from_error(error_from_stop(stop), request.allocator)
 	}
-	endpoint, resolve_err := resolve_endpoint(url, options, request.allocator)
+	endpoints, resolve_err := resolve_endpoints(url, options, request.allocator)
 	if resolve_err != .None { return nil, failure_from_error(resolve_err, request.allocator) }
+	defer delete(endpoints, request.allocator)
+	if len(endpoints) == 0 { return nil, failure_from_error(.Resolve, request.allocator) }
 	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
 		return nil, failure_from_error(error_from_stop(stop), request.allocator)
 	}
 
 	phase^ = .Connect
-	dialed, dial_err := connection_dial(endpoint, options, request.allocator)
+	dialed, dial_err := dial_first(endpoints, options, request.allocator)
 	if dial_err != .None { return nil, failure_from_error(dial_err, request.allocator) }
 
 	if url.scheme == "https" {
@@ -312,20 +314,35 @@ request_has_header :: proc(request: Request, name: string) -> bool {
 	return false
 }
 
-// resolve_endpoint turns a URL authority into a connectable endpoint. A literal
-// address skips resolution; a name goes through the interruptible resolver, so
-// cancellation during lookup retires with the operation instead of outliving it.
-resolve_endpoint :: proc(url: http.URL, options: Options, allocator: mem.Allocator) -> (net.Endpoint, Error) {
+// resolve_endpoints turns a URL authority into connectable endpoints: every
+// usable address for a name, or the single literal address. A literal
+// address skips resolution; a name goes through the interruptible resolver,
+// so cancellation during lookup retires with the operation instead of
+// outliving it. The caller owns the result on every path.
+resolve_endpoints :: proc(url: http.URL, options: Options, allocator: mem.Allocator) -> (endpoints: []net.Endpoint, err: Error) {
 	hostname, port, ok := host_and_port(url.host)
-	if !ok || hostname == "" { return {}, .Invalid_URL }
+	if !ok || hostname == "" { return nil, .Invalid_URL }
 	if port == 0 { port = 443 if url.scheme == "https" else 80 }
 	if literal := net.parse_address(hostname); literal != nil {
-		return net.Endpoint{address = literal, port = port}, .None
+		found := make([]net.Endpoint, 1, allocator)
+		found[0] = net.Endpoint {
+			address = literal,
+			port    = port,
+		}
+		return found, .None
 	}
-	address, found, resolve_err := resolve_host(hostname, options, allocator)
-	if resolve_err != .None { return {}, resolve_err }
-	if !found { return {}, .Resolve }
-	return net.Endpoint{address = address, port = port}, .None
+	addresses, resolve_err := resolve_addresses(hostname, options, allocator)
+	defer delete(addresses)
+	if resolve_err != .None { return nil, resolve_err }
+	if len(addresses) == 0 { return nil, .Resolve }
+	found := make([]net.Endpoint, len(addresses), allocator)
+	for address, i in addresses {
+		found[i] = net.Endpoint {
+			address = address,
+			port    = port,
+		}
+	}
+	return found, .None
 }
 
 // status_detail names the status a response was refused for. The reason phrase

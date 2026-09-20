@@ -61,6 +61,46 @@ write_test_probe :: proc(_: rawptr) -> Wait_Status {
 	return .Ready
 }
 
+cancelled_probe :: proc(_: rawptr) -> Wait_Status {
+	return .Cancelled
+}
+
+// dial_first dials each candidate in order: an unreachable address moves on
+// to the next, and only the caller's own stop ends the attempts.
+@(test)
+test_dial_first_tries_each_address_in_order :: proc(t: ^testing.T) {
+	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
+	if !testing.expectf(t, listen_err == nil, "the test endpoint could not listen: %v", listen_err) { return }
+	defer net.close(listener)
+	live, live_err := net.bound_endpoint(listener)
+	if !testing.expectf(t, live_err == nil, "the test endpoint could not be read: %v", live_err) { return }
+
+	// A port nothing listens on: bind it, read it, release it.
+	closed_listener, closed_listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
+	if !testing.expectf(t, closed_listen_err == nil, "the closed endpoint could not listen: %v", closed_listen_err) { return }
+	closed, closed_err := net.bound_endpoint(closed_listener)
+	net.close(closed_listener)
+	if !testing.expectf(t, closed_err == nil, "the closed endpoint could not be read: %v", closed_err) { return }
+
+	// The refused address comes first, so reaching the listener proves the
+	// fallback moved on instead of stopping at the first failure.
+	endpoints := [2]net.Endpoint{{address = net.IP4_Address{127, 0, 0, 1}, port = closed.port}, live}
+	connection, dial_err := dial_first(endpoints[:], {}, context.allocator)
+	testing.expect_value(t, dial_err, Error.None)
+	if connection != nil { connection_destroy(connection) }
+
+	// Nothing reachable is a connection failure, not a refusal of the request.
+	alone := [1]net.Endpoint{{address = net.IP4_Address{127, 0, 0, 1}, port = closed.port}}
+	failed, failed_err := dial_first(alone[:], {}, context.allocator)
+	testing.expect_value(t, failed_err, Error.Connect)
+	testing.expect(t, failed == nil, "a failed dial owns no connection")
+
+	// Cancellation ends the attempts before any dial.
+	stopped, stop_err := dial_first(endpoints[:], {probe = {check = cancelled_probe}}, context.allocator)
+	testing.expect_value(t, stop_err, Error.Cancelled)
+	testing.expect(t, stopped == nil, "a stopped dial owns no connection")
+}
+
 @(test)
 test_nonblocking_write_does_not_repeat_a_partially_accepted_prefix :: proc(t: ^testing.T) {
 	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)

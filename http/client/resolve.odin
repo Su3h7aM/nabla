@@ -7,26 +7,30 @@ import "core:strings"
 
 import "nabla:dns"
 
-// resolve_host returns one address for hostname, preferring IPv4. The hosts
-// file is consulted before any nameserver, so local names resolve without
-// one; the DNS exchange itself lives in the dns package, and this procedure
-// keeps only the caller policy: which servers, and how a lookup outcome maps
-// onto this client's errors. Resolution runs on the calling thread, so an
-// interrupted lookup owns nothing that outlives it.
-resolve_host :: proc(hostname: string, options: Options, allocator: mem.Allocator) -> (address: net.Address, found: bool, err: Error) {
-	if host, ok := hosts_lookup(hostname, allocator); ok { return host, true, .None }
-	if !net.validate_hostname(hostname) { return nil, false, .Resolve }
+// resolve_addresses returns every usable address for hostname, IPv4 before
+// IPv6: the A records in answer order, then the AAAA records. The hosts file
+// is consulted before any nameserver, so local names resolve without one.
+// Cancellation ends the lookup; every other failure only empties the result,
+// and the caller reports an empty result as unresolvable. Resolution runs on
+// the calling thread, so an interrupted lookup owns nothing that outlives it.
+resolve_addresses :: proc(hostname: string, options: Options, allocator: mem.Allocator) -> (addresses: [dynamic]net.Address, err: Error) {
+	addresses.allocator = allocator
+	if host, ok := hosts_lookup(hostname, allocator); ok {
+		append(&addresses, host)
+		return addresses, .None
+	}
+	if !net.validate_hostname(hostname) { return addresses, .None }
 
 	servers := options.nameservers
 	owned := false
 	if len(servers) == 0 {
 		loaded, loaded_ok := system_nameservers(allocator)
-		if !loaded_ok { return nil, false, .Resolve }
+		if !loaded_ok { return addresses, .None }
 		servers = loaded
 		owned = true
 	}
 	defer if owned { delete(servers, allocator) }
-	if len(servers) == 0 { return nil, false, .Resolve }
+	if len(servers) == 0 { return addresses, .None }
 
 	probe := options.probe
 	for kind in ([2]net.DNS_Record_Type{net.DNS_Record_Type.DNS_TYPE_A, net.DNS_Record_Type.DNS_TYPE_AAAA}) {
@@ -37,20 +41,21 @@ resolve_host :: proc(hostname: string, options: Options, allocator: mem.Allocato
 			allocator,
 		)
 		if query_err == .Cancelled {
-			return nil, false, error_from_stop(stop_from_wait(probe_now(options.probe)))
+			delete(addresses)
+			return nil, error_from_stop(stop_from_wait(probe_now(options.probe)))
 		}
 		if query_err != .None { continue }
 		defer net.destroy_dns_records(records, allocator)
 		for record in records {
 			#partial switch value in record {
 			case net.DNS_Record_IP4:
-				return value.address, true, .None
+				append(&addresses, value.address)
 			case net.DNS_Record_IP6:
-				return value.address, true, .None
+				append(&addresses, value.address)
 			}
 		}
 	}
-	return nil, false, .Resolve
+	return addresses, .None
 }
 
 // dns_interrupt_check adapts the request probe to the resolver's stop policy:
