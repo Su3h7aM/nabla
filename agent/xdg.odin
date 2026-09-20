@@ -23,7 +23,9 @@ XDG_APP_PERMISSIONS :: os.Permissions{.Read_User, .Write_User, .Execute_User}
 XDG_Kind :: enum {
 	// User configuration.
 	Config,
-	// State that persists across restarts and is regenerable, such as a cache.
+	// Regenerable data whose loss does not remove user state.
+	Cache,
+	// State that persists across restarts and is not configuration.
 	State,
 }
 
@@ -40,6 +42,8 @@ xdg_variable :: proc(kind: XDG_Kind) -> (variable: string, fallback: string) {
 	switch kind {
 	case .Config:
 		variable, fallback = "XDG_CONFIG_HOME", ".config"
+	case .Cache:
+		variable, fallback = "XDG_CACHE_HOME", ".cache"
 	case .State:
 		variable, fallback = "XDG_STATE_HOME", ".local/state"
 	}

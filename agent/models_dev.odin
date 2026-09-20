@@ -37,10 +37,10 @@ MODELS_DEV_MAX_BYTES :: 32 * 1024 * 1024
 
 Models_Dev_Error :: enum {
 	None,
-	// The state directory could not be resolved or created, so the specification
+	// The cache directory could not be resolved or created, so the specification
 	// permits nowhere to cache. Reported rather than worked around with a
 	// home-relative path.
-	State_Directory,
+	Cache_Directory,
 	// The document is neither cached nor reachable.
 	Unavailable,
 	// The document was acquired but is not a usable provider document, and no
@@ -111,6 +111,29 @@ models_dev_validate :: proc(data: []u8) -> bool {
 	return err == .None
 }
 
+// models_dev_cached_sources parses the last cached document without checking its
+// age and never performs a network request. It is the startup path.
+models_dev_cached_sources :: proc(providers: []string = {}, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Models_Dev_Error) {
+	path, path_err := models_dev_cache_path(allocator)
+	if path_err != .None { return {}, path_err }
+	defer delete(path, allocator)
+	body, cached := models_dev_cache_read(path, allocator)
+	if !cached { return {}, .Unavailable }
+	defer delete(body, allocator)
+	sources, parse_err := models_dev_parse(body, providers, allocator)
+	switch parse_err {
+	case .None:
+		return sources, .None
+	case .Invalid_JSON:
+		return {}, .Invalid_JSON
+	case .Invalid_Structure:
+		return {}, .Invalid_Structure
+	case .Missing_Identity:
+		return {}, .Missing_Identity
+	}
+	return {}, .Invalid_Data
+}
+
 // models_dev_sources produces the resolver input from models.dev: the document is
 // taken from the cache when it is fresh and acquired otherwise, then parsed into
 // provider source records. This is the whole ingestion path, so no caller handles
@@ -151,12 +174,12 @@ models_dev_sources :: proc(
 // application directory beneath it is lowercased. The result is owned by the
 // caller.
 models_dev_cache_path :: proc(allocator := context.allocator) -> (string, Models_Dev_Error) {
-	directory, directory_err := xdg_directory(.State, allocator)
-	if directory_err != .None { return "", .State_Directory }
+	directory, directory_err := xdg_directory(.Cache, allocator)
+	if directory_err != .None { return "", .Cache_Directory }
 	defer delete(directory, allocator)
-	if create_err := xdg_directory_create(directory); create_err != .None { return "", .State_Directory }
+	if create_err := xdg_directory_create(directory); create_err != .None { return "", .Cache_Directory }
 	path, join_err := filepath.join([]string{directory, MODELS_DEV_CACHE_FILE}, allocator)
-	if join_err != nil { return "", .State_Directory }
+	if join_err != nil { return "", .Cache_Directory }
 	return path, .None
 }
 
@@ -197,15 +220,18 @@ models_dev_cache_write :: proc(path: string, body: []u8) -> bool {
 // models_dev_fetch performs the one request this source needs. It is deliberately
 // thin: freshness, caching, and persistence are the caller's decisions, so none
 // of them has to be exercised to test them.
-models_dev_fetch :: proc(_: rawptr, allocator: mem.Allocator) -> ([]u8, bool) {
+models_dev_fetch :: proc(user_data: rawptr, allocator: mem.Allocator) -> ([]u8, bool) {
 	body: Fetch_Body
 	body.bytes.allocator = allocator
 	body.limit = MODELS_DEV_MAX_BYTES
 
-	deadline := ai.deadline_in(MODELS_DEV_TIMEOUT)
+	control := Fetch_Control {
+		deadline = ai.deadline_in(MODELS_DEV_TIMEOUT),
+		cancel   = cast(^bool)user_data,
+	}
 	failure := client.stream_request(
 		{url = MODELS_DEV_URL, method = .Get, expected_content_type = "application/json", allocator = allocator},
-		{probe = {check = fetch_probe, user_data = &deadline}},
+		{probe = {check = fetch_control_probe, user_data = &control}},
 		&body,
 		fetch_collect,
 	)

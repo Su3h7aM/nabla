@@ -11,9 +11,10 @@ import "nabla:agent/session"
 import input "nabla:input"
 import "nabla:tui/widgets"
 
-menu_begin :: proc(app: ^App, title: string, choices: [dynamic]Choice, required: bool) {
+menu_begin :: proc(app: ^App, kind: Menu_Kind, title: string, choices: [dynamic]Choice, required: bool) {
 	menu_destroy(&app.menu, app.run.alloc)
 	app.menu = Menu {
+		kind     = kind,
 		title    = strings.clone(title, app.run.alloc),
 		choices  = choices,
 		required = required,
@@ -41,7 +42,12 @@ menu_pick :: proc(app: ^App, label: string) {
 // second column. The catalog's own order follows the loader's table iteration,
 // which varies between runs, so the list is sorted.
 menu_open_model :: proc(app: ^App) {
-	// The catalog is read-only after startup. The current selection is snapshot
+	catalog_refresh_request(app)
+	menu_rebuild_model(app)
+}
+
+menu_rebuild_model :: proc(app: ^App) {
+	// Catalog publication has its own lock. The current selection is snapshot
 	// state, so it is read under the lock the worker writes it with.
 	sync.mutex_lock(&app.run.mu)
 	current_provider := strings.clone(app.run.snap.status.provider_id, context.temp_allocator)
@@ -50,6 +56,7 @@ menu_open_model :: proc(app: ^App) {
 
 	models := make([dynamic]Model_Choice, 0, 16, context.temp_allocator)
 	defer delete(models)
+	sync.mutex_lock(&app.catalog_mu)
 	for &provider in app.setup.catalog.providers {
 		if !provider_usable(&provider) || !provider_configured(app, provider.id) { continue }
 		for &model in app.setup.catalog.models {
@@ -57,6 +64,7 @@ menu_open_model :: proc(app: ^App) {
 			append(&models, Model_Choice{provider_id = provider.id, model_id = model.id})
 		}
 	}
+	sync.mutex_unlock(&app.catalog_mu)
 	slice.sort_by(models[:], model_choice_less)
 
 	choices := make([dynamic]Choice, 0, len(models), app.run.alloc)
@@ -74,7 +82,7 @@ menu_open_model :: proc(app: ^App) {
 	if current_model != "" {
 		menu_title = fmt.tprintf("models (current: %s / %s)", current_provider, current_model)
 	}
-	menu_begin(app, menu_title, choices, false)
+	menu_begin(app, .Model, menu_title, choices, false)
 	for choice, index in app.menu.choices {
 		action := choice.action.(Model_Choice)
 		if action.provider_id == current_provider && action.model_id == current_model {
@@ -108,7 +116,7 @@ menu_open_effort :: proc(app: ^App) {
 		value := "" if level == "provider default" else level
 		append(&choices, Choice{label = strings.clone(level, app.run.alloc), action = Effort_Choice{level = strings.clone(value, app.run.alloc)}})
 	}
-	menu_begin(app, "reasoning effort", choices, false)
+	menu_begin(app, .Effort, "reasoning effort", choices, false)
 	menu_pick(app, "provider default" if current == "" else current)
 }
 
@@ -138,7 +146,7 @@ menu_open_session :: proc(app: ^App) {
 	sync.mutex_unlock(&app.run.mu)
 	defer delete(string(active), app.run.alloc)
 
-	menu_begin(app, "sessions in this workspace", choices, false)
+	menu_begin(app, .Session, "sessions in this workspace", choices, false)
 	menu_pick_session(app, active)
 }
 
@@ -212,6 +220,8 @@ handle_menu_key :: proc(app: ^App, key: input.Key_Event) {
 // current provider is preferred, then any single provider serving that model
 // id, then an explicit "provider/model" pair.
 resolve_model_reference :: proc(app: ^App, text: string) -> (provider_id, model_id: string, ok: bool) {
+	sync.mutex_lock(&app.catalog_mu)
+	defer sync.mutex_unlock(&app.catalog_mu)
 	// The selection is worker state, so it is read through the lock that publishes
 	// it rather than from the live session.
 	current_provider := runtime_selection_provider(app)

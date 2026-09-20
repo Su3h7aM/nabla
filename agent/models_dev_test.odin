@@ -9,21 +9,21 @@ import "core:strings"
 import "core:testing"
 import "core:time"
 
-// models_dev_state_test points the XDG state directory at a fresh temporary root
-// for the duration of one test, so no test touches the real user state and the
+// models_dev_state_test points the XDG cache directory at a fresh temporary root
+// for the duration of one test, so no test touches the real user cache and the
 // environment is restored even when a check fails.
 models_dev_state_test :: proc(t: ^testing.T, name: string, body: proc(t: ^testing.T, root: string)) {
 	root := fmt.tprintf("/tmp/nabla-xdg-%s-%d", name, os.get_pid())
 	os.remove_all(root)
 	defer os.remove_all(root)
 
-	previous, had_previous := os.lookup_env("XDG_STATE_HOME", context.temp_allocator)
+	previous, had_previous := os.lookup_env("XDG_CACHE_HOME", context.temp_allocator)
 	defer if had_previous {
-		os.set_env("XDG_STATE_HOME", previous)
+		os.set_env("XDG_CACHE_HOME", previous)
 	} else {
-		os.unset_env("XDG_STATE_HOME")
+		os.unset_env("XDG_CACHE_HOME")
 	}
-	testing.expect(t, os.set_env("XDG_STATE_HOME", root) == nil)
+	testing.expect(t, os.set_env("XDG_CACHE_HOME", root) == nil)
 
 	body(t, root)
 }
@@ -49,7 +49,7 @@ models_dev_stub_fetch :: proc(user_data: rawptr, allocator: mem.Allocator) -> ([
 }
 
 @(test)
-test_models_dev_cache_path_is_lowercase_xdg_state :: proc(t: ^testing.T) {
+test_models_dev_cache_path_is_lowercase_xdg_cache :: proc(t: ^testing.T) {
 	models_dev_state_test(
 		t,
 		"path",
@@ -59,7 +59,7 @@ test_models_dev_cache_path_is_lowercase_xdg_state :: proc(t: ^testing.T) {
 			testing.expect_value(t, path, fmt.tprintf("%s/nabla/%s", root, MODELS_DEV_CACHE_FILE))
 
 			// The application directory is created so a caller can read and write the
-			// cache, its name is the lowercase application name, and the state variable
+			// cache, its name is the lowercase application name, and the cache variable
 			// is where it came from.
 			testing.expect(t, os.is_directory(fmt.tprintf("%s/nabla", root)))
 			testing.expect_value(t, filepath.base(filepath.dir(path)), XDG_APP_NAME)
@@ -243,8 +243,8 @@ test_models_dev_refresh_replaces_a_stale_cache :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_models_dev_reports_an_unusable_state_directory :: proc(t: ^testing.T) {
-	// A state directory that cannot be created is an explicit error, never a
+test_models_dev_reports_an_unusable_cache_directory :: proc(t: ^testing.T) {
+	// A cache directory that cannot be created is an explicit error, never a
 	// silent fallback to a path under the home directory.
 	root := fmt.tprintf("/tmp/nabla-blocked-%d", os.get_pid())
 	os.remove_all(root)
@@ -253,22 +253,22 @@ test_models_dev_reports_an_unusable_state_directory :: proc(t: ^testing.T) {
 	blocking := fmt.tprintf("%s/blocking", root)
 	testing.expect(t, os.write_entire_file(blocking, transmute([]u8)string("file")) == nil)
 
-	previous, had_previous := os.lookup_env("XDG_STATE_HOME", context.temp_allocator)
+	previous, had_previous := os.lookup_env("XDG_CACHE_HOME", context.temp_allocator)
 	defer if had_previous {
-		os.set_env("XDG_STATE_HOME", previous)
+		os.set_env("XDG_CACHE_HOME", previous)
 	} else {
-		os.unset_env("XDG_STATE_HOME")
+		os.unset_env("XDG_CACHE_HOME")
 	}
-	testing.expect(t, os.set_env("XDG_STATE_HOME", blocking) == nil)
+	testing.expect(t, os.set_env("XDG_CACHE_HOME", blocking) == nil)
 
 	_, path_err := models_dev_cache_path(context.temp_allocator)
-	testing.expect_value(t, path_err, Models_Dev_Error.State_Directory)
+	testing.expect_value(t, path_err, Models_Dev_Error.Cache_Directory)
 
 	stub := Models_Dev_Stub {
 		body = MODELS_DEV_STUB_NEW,
 	}
 	body, err := models_dev_catalog(models_dev_stub_fetch, &stub, context.temp_allocator)
-	testing.expect_value(t, err, Models_Dev_Error.State_Directory)
+	testing.expect_value(t, err, Models_Dev_Error.Cache_Directory)
 	testing.expect(t, body == nil)
 	// Nothing was fetched or written once the location was refused.
 	testing.expect_value(t, stub.calls, 0)

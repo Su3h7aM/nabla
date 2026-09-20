@@ -6,6 +6,7 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 
 import "nabla:agent"
@@ -69,6 +70,16 @@ Run_Setup :: struct {
 
 App :: struct {
 	setup:             Run_Setup,
+	// catalog_mu protects publication of a replacement catalog. Published
+	// catalogs are retained until teardown because active connections borrow their
+	// endpoint strings.
+	catalog_mu:        sync.Mutex,
+	retired_catalogs:  [dynamic]agent.Catalog,
+	catalog_sources:   []agent.Catalog_Provider_Source, // borrowed for tui_run
+	catalog_refresh:   Catalog_Refresh_Chan,
+	catalog_worker:    ^thread.Thread,
+	catalog_revision:  u64,
+	catalog_seen:      u64,
 	terminal:          ^term.Session,
 	tty:               ^os.File,
 	parser:            input.Parser,
@@ -112,11 +123,9 @@ App :: struct {
 	quit:              bool,
 }
 
-// resolve_run_catalog builds the resolved catalog from the user's configuration:
-// the configuration's own statements, then each configured provider's listing,
-// then the models.dev catalog, merged first-value-wins. `configured` holds the
-// provider ids the user set up, which is the set the model menu offers. Both results
-// are owned by the caller.
+// resolve_run_catalog builds the initial resolved catalog from local data only:
+// the user's configuration, any provider listings already cached, and the last
+// models.dev document. Network refresh is owned by the interactive runtime.
 resolve_run_catalog :: proc(
 	sources: []agent.Catalog_Provider_Source,
 	allocator: mem.Allocator,
@@ -131,15 +140,10 @@ resolve_run_catalog :: proc(
 	defer delete(names, context.temp_allocator)
 	for source, index in sources { names[index] = source.id }
 
-	// The provider's own listing comes before the shared catalog, so a model it
-	// introduces is enriched by models.dev in the same pass.
-	discovered := agent.discover_provider_models(sources, allocator = allocator)
+	discovered := agent.provider_models_cached(sources, allocator = allocator)
 	defer agent.catalog_sources_destroy(&discovered, allocator)
-	models_dev, models_dev_err := agent.models_dev_sources(providers = names, allocator = allocator)
+	models_dev, _ := agent.models_dev_cached_sources(providers = names, allocator = allocator)
 	defer agent.catalog_sources_destroy(&models_dev, allocator)
-	if models_dev_err != .None {
-		fmt.eprintln("nabla: warning: models.dev is unavailable; using configured values only")
-	}
 	resolved, resolve_err := agent.resolve_catalog(sources, discovered[:], models_dev[:], allocator)
 	if resolve_err != .None {
 		fmt.eprintln("nabla: invalid configuration: a model cannot be excluded and customized at the same time")
@@ -543,6 +547,8 @@ app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
 // the next launch restores it. A failure is reported through the snapshot; the
 // previously selected model, if any, stays in place.
 apply_selection :: proc(app: ^App, provider_id, model_id, effort: string) -> bool {
+	sync.mutex_lock(&app.catalog_mu)
+	defer sync.mutex_unlock(&app.catalog_mu)
 	provider_index, provider_found := agent.catalog_find_provider(&app.setup.catalog, provider_id)
 	if !provider_found {
 		selection_fail(app, fmt.tprintf("provider not found: %s", provider_id))

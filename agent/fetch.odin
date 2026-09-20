@@ -1,7 +1,7 @@
 package agent
 
 import "core:mem"
-
+import "core:sync"
 import "nabla:ai"
 import "nabla:http/client"
 
@@ -38,6 +38,18 @@ fetch_body_finish :: proc(body: ^Fetch_Body, allocator: mem.Allocator) -> ([]u8,
 	result := make([]u8, len(body.bytes), allocator)
 	copy(result, body.bytes[:])
 	return result, true
+}
+
+Fetch_Control :: struct {
+	deadline: ai.Deadline,
+	cancel:   ^bool,
+}
+
+fetch_control_probe :: proc(user_data: rawptr) -> client.Wait_Status {
+	control := cast(^Fetch_Control)user_data
+	if control.cancel != nil && sync.atomic_load(control.cancel) { return .Cancelled }
+	if ai.deadline_expired(control.deadline) { return .Timed_Out }
+	return .Ready
 }
 
 // fetch_probe stops a request once its deadline passes, so a peer that accepts

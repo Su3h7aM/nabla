@@ -2,16 +2,19 @@ package agent
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:hash"
 import "core:mem"
 import "core:mem/virtual"
+import "core:os"
+import "core:path/filepath"
 import "core:strings"
 import "core:time"
 
 import "nabla:ai"
 import "nabla:http/client"
 
-// The second enrichment stage: each configured provider's own model listing, read
-// live at startup.
+// The second enrichment stage: each configured provider's own model listing,
+// served from cache at startup and refreshed in the background.
 //
 // The endpoint this harness speaks reports model ids and little else, so
 // discovery contributes identity. A model the user did not configure joins the
@@ -29,6 +32,8 @@ PROVIDER_MODELS_TIMEOUT :: 10 * time.Second
 // The bound is a ceiling so a broken or hostile response cannot exhaust memory,
 // not an expectation: a listing is small.
 PROVIDER_MODELS_MAX_BYTES :: 4 * 1024 * 1024
+PROVIDER_MODELS_FRESH :: 5 * time.Minute
+PROVIDER_MODELS_CACHE_PREFIX :: "provider-models"
 
 // Provider_Models_Fetch delivers one provider's model listing, owned by the
 // caller. Production uses provider_models_fetch; a test supplies its own, which
@@ -63,6 +68,118 @@ discover_provider_models :: proc(
 		append(&result, Catalog_Provider_Source{id = strings.clone(provider.id, allocator), models = models})
 	}
 	return result
+}
+
+// provider_models_cached reads every usable cache entry without performing I/O
+// beyond the local filesystem. Stale entries remain valid inputs while a later
+// refresh is in flight.
+provider_models_cached :: proc(providers: []Catalog_Provider_Source, allocator := context.allocator) -> [dynamic]Catalog_Provider_Source {
+	result: [dynamic]Catalog_Provider_Source
+	result.allocator = allocator
+	for provider in providers {
+		path, path_ok := provider_models_cache_path(provider, allocator)
+		if !path_ok { continue }
+		body, cached := provider_models_cache_read(path, allocator)
+		delete(path, allocator)
+		if !cached { continue }
+		models, listed := provider_models_list(body, allocator)
+		delete(body, allocator)
+		if !listed { continue }
+		append(&result, Catalog_Provider_Source{id = strings.clone(provider.id, allocator), models = models})
+	}
+	return result
+}
+
+// provider_models_refresh returns the freshest source available for each
+// provider. A fresh cache avoids the network. A stale cache remains the fallback
+// when acquisition or validation fails.
+provider_models_refresh :: proc(
+	providers: []Catalog_Provider_Source,
+	fetch: Provider_Models_Fetch = provider_models_fetch,
+	user_data: rawptr = nil,
+	allocator := context.allocator,
+) -> [dynamic]Catalog_Provider_Source {
+	result: [dynamic]Catalog_Provider_Source
+	result.allocator = allocator
+	now := time.now()
+	for provider in providers {
+		path, path_ok := provider_models_cache_path(provider, allocator)
+		if !path_ok { continue }
+		body, cached := provider_models_cache_read(path, allocator)
+		cached_models: []Catalog_Model_Source
+		cache_valid := false
+		if cached { cached_models, cache_valid = provider_models_list(body, allocator) }
+		fresh := cache_valid && provider_models_cache_fresh(path, now)
+		if fresh {
+			append(&result, Catalog_Provider_Source{id = strings.clone(provider.id, allocator), models = cached_models})
+			delete(body, allocator)
+			delete(path, allocator)
+			continue
+		}
+		if provider.base_url != "" && provider.api_key != "" {
+			credential, credential_ok := config_resolve_credential(provider.api_key, allocator)
+			if credential_ok {
+				acquired, fetched := fetch(user_data, provider.base_url, credential, allocator)
+				delete(credential, allocator)
+				if fetched {
+					models, listed := provider_models_list(acquired, allocator)
+					if listed {
+						provider_models_cache_write(path, acquired)
+						append(&result, Catalog_Provider_Source{id = strings.clone(provider.id, allocator), models = models})
+						for &cached_model in cached_models { catalog_model_source_destroy(&cached_model, allocator) }
+						if cached_models != nil { delete(cached_models, allocator) }
+						if body != nil { delete(body, allocator) }
+						delete(acquired, allocator)
+						delete(path, allocator)
+						continue
+					}
+					delete(acquired, allocator)
+				}
+			}
+		}
+		if cache_valid {
+			append(&result, Catalog_Provider_Source{id = strings.clone(provider.id, allocator), models = cached_models})
+		}
+		if body != nil { delete(body, allocator) }
+		delete(path, allocator)
+	}
+	return result
+}
+
+provider_models_cache_path :: proc(provider: Catalog_Provider_Source, allocator: mem.Allocator) -> (string, bool) {
+	directory, directory_err := xdg_directory(.Cache, allocator)
+	if directory_err != .None { return "", false }
+	defer delete(directory, allocator)
+	if xdg_directory_create(directory) != .None { return "", false }
+	identity := fmt.aprintf("%s\x00%s", provider.id, provider.base_url, allocator = context.temp_allocator)
+	key := hash.fnv64a(transmute([]byte)identity)
+	name := fmt.aprintf("%s-%016x.json", PROVIDER_MODELS_CACHE_PREFIX, key, allocator = context.temp_allocator)
+	path, join_err := filepath.join([]string{directory, name}, allocator)
+	return path, join_err == nil
+}
+
+provider_models_cache_fresh :: proc(path: string, now: time.Time) -> bool {
+	modified, err := os.modification_time_by_path(path)
+	if err != nil { return false }
+	age := time.diff(modified, now)
+	return age >= 0 && age < PROVIDER_MODELS_FRESH
+}
+
+provider_models_cache_read :: proc(path: string, allocator: mem.Allocator) -> ([]u8, bool) {
+	body, read_err := os.read_entire_file(path, allocator)
+	if read_err == nil && len(body) > 0 && len(body) <= PROVIDER_MODELS_MAX_BYTES { return body, true }
+	if body != nil { delete(body, allocator) }
+	return nil, false
+}
+
+provider_models_cache_write :: proc(path: string, body: []u8) -> bool {
+	temporary := fmt.tprintf("%s.%d.tmp", path, os.get_pid())
+	if os.write_entire_file(temporary, body) != nil { return false }
+	if os.rename(temporary, path) != nil {
+		os.remove(temporary)
+		return false
+	}
+	return true
 }
 
 // provider_models_list reads a listing into model sources that state identity
@@ -122,7 +239,7 @@ provider_models_id :: proc(entry: json.Value) -> (id: string, present: bool) {
 // provider_models_fetch performs the one request this stage needs. The content
 // type is not asserted: the provider is the user's own endpoint, and a body that
 // is not a listing is refused by parsing rather than by a header.
-provider_models_fetch :: proc(_: rawptr, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
+provider_models_fetch :: proc(user_data: rawptr, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
 	url := fmt.aprintf("%s/%s", strings.trim_right(base_url, "/"), PROVIDER_MODELS_SUFFIX, allocator = allocator)
 	defer delete(url, allocator)
 	authorization := strings.concatenate([]string{"Bearer ", api_key}, allocator = allocator)
@@ -133,10 +250,13 @@ provider_models_fetch :: proc(_: rawptr, base_url, api_key: string, allocator: m
 	body.limit = PROVIDER_MODELS_MAX_BYTES
 	headers := [1]client.Header{{"authorization", authorization}}
 
-	deadline := ai.deadline_in(PROVIDER_MODELS_TIMEOUT)
+	control := Fetch_Control {
+		deadline = ai.deadline_in(PROVIDER_MODELS_TIMEOUT),
+		cancel   = cast(^bool)user_data,
+	}
 	failure := client.stream_request(
 		{url = url, method = .Get, headers = headers[:], allocator = allocator},
-		{probe = {check = fetch_probe, user_data = &deadline}},
+		{probe = {check = fetch_control_probe, user_data = &control}},
 		&body,
 		fetch_collect,
 	)

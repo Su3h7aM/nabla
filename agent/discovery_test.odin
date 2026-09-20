@@ -2,6 +2,7 @@
 package agent
 
 import "core:mem"
+import "core:os"
 import "core:testing"
 
 // The listing shape this harness reads: an object whose "data" member is an array
@@ -118,4 +119,49 @@ test_discovery_contributes_to_the_catalog_without_overriding_the_user :: proc(t:
 	discovered_two, two_found := catalog_find_model(&resolved, "proxy", "proxy/two")
 	testing.expect(t, two_found)
 	testing.expect(t, !resolved.models[discovered_two].context_window_present)
+}
+
+@(test)
+test_provider_discovery_refreshes_once_and_serves_the_cache :: proc(t: ^testing.T) {
+	models_dev_state_test(t, "provider-models", proc(t: ^testing.T, _: string) {
+		providers := []Catalog_Provider_Source{discovery_source("proxy", "http://proxy.test/v1", "literal-key")}
+		first := Discovery_Stub {
+			body = DISCOVERY_FIXTURE,
+		}
+		refreshed := provider_models_refresh(providers, discovery_stub_fetch, &first, context.allocator)
+		defer catalog_sources_destroy(&refreshed)
+		testing.expect_value(t, first.calls, 1)
+		testing.expect_value(t, len(refreshed), 1)
+
+		second := Discovery_Stub {
+			body = `{"data":[{"id":"wrong"}]}`,
+		}
+		fresh := provider_models_refresh(providers, discovery_stub_fetch, &second, context.allocator)
+		defer catalog_sources_destroy(&fresh)
+		testing.expect_value(t, second.calls, 0)
+		testing.expect_value(t, fresh[0].models[0].id, "proxy/one")
+
+		cached := provider_models_cached(providers, context.allocator)
+		defer catalog_sources_destroy(&cached)
+		testing.expect_value(t, len(cached), 1)
+		testing.expect_value(t, cached[0].models[1].id, "proxy/two")
+	})
+}
+
+@(test)
+test_provider_discovery_replaces_an_invalid_fresh_cache :: proc(t: ^testing.T) {
+	models_dev_state_test(t, "provider-models-invalid", proc(t: ^testing.T, _: string) {
+		providers := []Catalog_Provider_Source{discovery_source("proxy", "http://proxy.test/v1", "literal-key")}
+		path, path_ok := provider_models_cache_path(providers[0], context.temp_allocator)
+		testing.expect(t, path_ok)
+		testing.expect(t, os.write_entire_file(path, transmute([]u8)string(`{"not":"a listing"}`)) == nil)
+
+		stub := Discovery_Stub {
+			body = DISCOVERY_FIXTURE,
+		}
+		refreshed := provider_models_refresh(providers, discovery_stub_fetch, &stub, context.allocator)
+		defer catalog_sources_destroy(&refreshed)
+		testing.expect_value(t, stub.calls, 1)
+		testing.expect_value(t, refreshed[0].models[0].id, "proxy/one")
+	})
 }

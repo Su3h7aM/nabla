@@ -177,7 +177,15 @@ choice_destroy :: proc(choice: ^Choice, allocator: mem.Allocator) {
 
 // Menu is an open choice list. The prompt is cleared while one is open: the menu
 // owns the keyboard until a choice is made or it is cancelled.
+Menu_Kind :: enum {
+	None,
+	Model,
+	Effort,
+	Session,
+}
+
 Menu :: struct {
+	kind:     Menu_Kind,
 	title:    string, // owned
 	choices:  [dynamic]Choice, // owned
 	cursor:   int,
@@ -411,6 +419,7 @@ tui_run :: proc(
 	worker.data = app
 	app.run.worker = worker
 	thread.start(worker)
+	_ = catalog_refresh_start(app, sources)
 
 	if viewport, vp_err := term.viewport(app.terminal); vp_err == nil {
 		app.columns, app.rows = viewport.columns, viewport.rows
@@ -451,7 +460,13 @@ tui_run :: proc(
 			menu_close(app)
 			widgets.input_clear(&app.input)
 		}
-		if count > 0 || resized || generation_changed(app) || advance_spinner {
+		catalog_updated := catalog_changed(app)
+		if catalog_updated && app.menu_open && app.menu.kind == .Model {
+			required := app.menu.required
+			menu_rebuild_model(app)
+			app.menu.required = required
+		}
+		if count > 0 || resized || generation_changed(app) || advance_spinner || catalog_updated {
 			if advance_spinner {
 				app.spin_frame = (app.spin_frame + 1) % SPINNER_FRAMES
 				app.spin_lap = now
@@ -488,6 +503,7 @@ tui_run :: proc(
 // app_teardown releases everything after the worker stopped. It must be
 // called at most once.
 app_teardown :: proc(app: ^App) {
+	catalog_refresh_stop(app)
 	if app.run.work != {} {
 		chan.close(&app.run.work)
 	}
@@ -515,6 +531,7 @@ app_teardown :: proc(app: ^App) {
 	input.events_destroy(&app.raw, app.run.alloc)
 	frame_storage_destroy(app.storage)
 	run_setup_destroy(&app.setup)
+	catalog_retired_destroy(app)
 }
 
 // snapshot_destroy releases everything the front-end snapshot owns and zeroes it,
