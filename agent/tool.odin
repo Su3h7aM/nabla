@@ -12,8 +12,14 @@ import "nabla:ai"
 
 // Tool_Control is the caller's interruption policy for one execution. A zero
 // value runs with no cancellation and no deadline.
+//
+// interrupt is the execution's own stop token, so one call can be stopped without
+// stopping its siblings. parent is the token of the work that owns it, read on every
+// check: a turn cancellation reaches a running execution without the owner having to
+// walk a table. Both are optional.
 Tool_Control :: struct {
 	interrupt: ^ai.Interrupt,
+	parent:    ^ai.Interrupt,
 	deadline:  ai.Deadline,
 }
 
@@ -90,6 +96,20 @@ Tool_Timeout_Policy :: struct {
 	maximum: time.Duration,
 }
 
+// Tool_Placement says where a definition's execution runs. It is data on the
+// definition rather than behavior in a scheduler: the job table reads it and does the
+// obvious thing.
+//
+// Worker is the zero value, because blocking work is what a tool is assumed to be
+// until it says otherwise: files, processes, and MCP clients belong off the owner's
+// thread. Owner is for short session-control operations that need the session's own
+// storage, such as compaction intent and result lookup. Code Mode adds its own
+// placement when the Lua executor exists.
+Tool_Placement :: enum {
+	Worker,
+	Owner,
+}
+
 // Tool_Definition is one tool the harness can run. The strings are owned by the
 // registry that holds the definition.
 Tool_Definition :: struct {
@@ -97,6 +117,7 @@ Tool_Definition :: struct {
 	description:  string,
 	input_schema: string,
 	hints:        Tool_Behavior_Hints,
+	placement:    Tool_Placement,
 	timeouts:     Tool_Timeout_Policy,
 	execute:      Tool_Execute,
 	// backend is borrowed adapter state, nil for native tools. The registry
@@ -281,6 +302,7 @@ tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition)
 			description = strings.clone(definition.description, registry.allocator),
 			input_schema = strings.clone(definition.input_schema, registry.allocator),
 			hints = definition.hints,
+			placement = definition.placement,
 			timeouts = definition.timeouts,
 			execute = definition.execute,
 			backend = definition.backend,
@@ -512,11 +534,12 @@ tool_timeout_clamp :: proc(requested, maximum: time.Duration) -> time.Duration {
 }
 
 // tool_control_cancelled reports whether the execution owning this control
-// ended: interruption was requested or the control's deadline passed. The
-// deadline comes only from tool bounds; the turn itself sets none. A tool's own
-// timeout budget is not cancellation; it has its own outcome and its own check.
+// ended: interruption was requested locally or by its parent, or the control's
+// deadline passed. The deadline comes only from tool bounds; the turn itself sets
+// none. A tool's own timeout budget is not cancellation; it has its own outcome and
+// its own check.
 tool_control_cancelled :: proc(control: Tool_Control) -> bool {
-	return ai.interrupt_requested(control.interrupt) || ai.deadline_expired(control.deadline)
+	return ai.interrupt_requested(control.interrupt) || ai.interrupt_requested(control.parent) || ai.deadline_expired(control.deadline)
 }
 
 // tool_control_stop reports why an execution loop must stop. Cancellation wins

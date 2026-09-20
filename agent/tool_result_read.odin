@@ -27,6 +27,8 @@ TOOL_RESULT_READ_DEFINITION :: Tool_Definition {
 	description = TOOL_RESULT_READ_DESCRIPTION,
 	input_schema = TOOL_RESULT_READ_SCHEMA,
 	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
+	// Reading a kept result reads the session's store, which belongs to the owner.
+	placement = .Owner,
 	execute = tool_result_read_execute,
 }
 

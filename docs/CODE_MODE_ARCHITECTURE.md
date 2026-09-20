@@ -425,8 +425,10 @@ The registry validates the executor variant and its required data. Use a closed
 set of variants rather than a general start/poll/cancel/destroy plugin vtable.
 If a future native nonblocking backend needs another variant, add it with that use.
 
-The owner-side runtime needs a bounded table of stable job records and per-lane queues.
-Each job carries:
+The owner-side runtime needs a bounded table of stable job records and a lane rule.
+The table holds the records; a lane is a backend identity, and what a lane serializes is
+derived from which jobs are running in it, so there is no second structure to keep in
+sync (section 14.2). Each job carries:
 
 - Unique runtime identity, session/turn identity, and registry generation.
 - Durable call sequence, optional parent call sequence, and submission ordinal.
@@ -1070,6 +1072,54 @@ Measured here with the default limits: opening the restricted libraries and comp
 small chunk costs about 15 KiB of Lua-managed memory, and a first run that builds a
 thousand-element table peaks under 32 KiB. Both are far below the 32 MiB budget, which
 is the point: the budget exists for scripts that compute, not for the interpreter.
+
+### 14.2 Phase 2 results
+
+Step 2 kept direct tool semantics and landed the job machinery under them:
+`agent/tool_job.odin` with `agent/tool_job_test.odin`, a definition's `placement`, and
+`chat_run_tools` reduced to the effect loop that drives the table. The phases are the
+ones section 7.2 lists. The decisions are `tool_jobs_next` (a function of the phases
+and the clock, with no I/O and no executor call) and the effects are separate
+procedures, so the transition order is tested without running a tool. The suite covers
+where a call runs, what a lane serializes, the worker bound, a stop that still answers
+every call, an owner-placed operation among busy workers, and release of every thread
+and byte.
+
+Decisions the implementation settled beyond the proposal:
+
+- **A lane is a backend identity, and occupancy is derived.** A job's lane is the
+definition's borrowed backend pointer; nil is the lane every native tool shares. A
+lane is busy while another job with the same key is dispatching or running, which
+means the table itself answers the question and no lane bookkeeping can be left
+stuck by a job that was released. A queued job is retried in submission order, so
+the per-lane queue is the job order rather than a second structure.
+- **Job-owned storage comes from the process heap.** A worker allocates its admitted
+arguments, its context, and its result from the heap, and the owner releases them
+with the same allocator. The session's allocator is deliberately not shared with a
+worker, because it may be a wrapper the owner is writing through at the same time.
+`tool_jobs_init` takes that allocator explicitly, which is also how a test holds the
+batch to releasing every byte it took.
+- **Results are recorded in submission order.** The earliest job that has not been
+released is the only one that may commit, so the context budget is spent in the order
+the response asked for results and a batch built later sends the same bytes in the
+same order. A slow first call therefore delays a later ready one, which costs
+nothing: the batch waits for every result before the next request either way.
+- **A stop refuses and still answers.** The turn's cancellation reaches a running call
+through the inherited parent token in `Tool_Control`, not only through a check
+between calls. A queued call that the stop reached is refused as `Not_Executed` and
+recorded like any other result, so a cancelled turn's answers stay complete. A
+storage failure is the one case where a result is not recorded: those jobs are
+released as `Unrecorded`, and recovery is what records uncertainty for them.
+- **A worker never runs the process handler.** The watched signals are blocked across
+thread creation, the way compaction does it, so a tool thread is ineligible for the
+handler that cancels its own turn.
+
+What this step deliberately did not do: the batch still lives in the driver's frame
+rather than on the session, so `chat_session_advance` does not yet select job effects
+and section 8's await-events effect is still the transport's wait slice inside
+`chat_run_tools`. Moving the table onto the session is the next slice, and it is the
+one the Lua executor needs, because a suspended script must be able to wait for a
+child without holding the driver's call stack.
 
 ## 15. Decisions deliberately left open
 

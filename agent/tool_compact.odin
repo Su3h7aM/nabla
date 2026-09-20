@@ -25,6 +25,8 @@ TOOL_COMPACT_DEFINITION :: Tool_Definition {
 	// Recording an intent changes nothing the model or the user can observe, and
 	// asking twice is the same as asking once.
 	hints = {read_only = .No, destructive = .No, idempotent = .Yes, open_world = .No},
+	// The intent is session control state, which only the owner thread touches.
+	placement = .Owner,
 	execute = tool_compact_execute,
 }
 
