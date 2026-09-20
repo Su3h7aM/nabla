@@ -101,9 +101,10 @@ PICKED_STYLE :: term.Style {
 	modifiers = {.Bold},
 }
 
-// TOOL_PREVIEW_LINES bounds one tool box: the preview is cut to this many
-// content rows.
-TOOL_PREVIEW_LINES :: 10
+// TOOL_WINDOW_ROWS is how many content rows a tool box shows at once. A result
+// with more rows is a window the wheel scrolls, and the box's bottom border says
+// how many rows it is holding back.
+TOOL_WINDOW_ROWS :: 10
 
 // STARTUP_HINT is what an empty transcript shows under the title.
 STARTUP_HINT :: "pgup/wheel scroll | escape interrupt | ctrl+c clear/cancel/quit | /help for commands"
@@ -111,6 +112,17 @@ STARTUP_HINT :: "pgup/wheel scroll | escape interrupt | ctrl+c clear/cancel/quit
 // CONVERSATION_ID names the transcript's scroll-container root inside the
 // frame, so the solved scroll range can be looked up after the solve.
 CONVERSATION_ID :: layout.Id(1)
+
+// A tool box tags its node with the ordinal of the entry it draws, so a wheel
+// report can find the box under the pointer by reading the solved frame. The
+// ordinal is stored plus one, because zero is layout's untagged value.
+tool_box_tag :: proc(ordinal: int) -> layout.User_Tag {
+	return layout.User_Tag(ordinal + 1)
+}
+
+tool_box_ordinal :: proc(tag: layout.User_Tag) -> int {
+	return int(tag) - 1
+}
 
 // FONT_NORMAL and FONT_BOLD travel in layout.Text_Style.font, which layout
 // never interprets: the transcript's one styling distinction beyond color.
@@ -286,6 +298,10 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 	input_rect := regions[1]
 	cwd_rect := regions[2]
 	status_rect := regions[3]
+	// A mouse report arrives as screen cells, while the frame is solved in the
+	// conversation's own coordinates. Remembering where the conversation landed
+	// is what lets the report be aimed at a tool box inside it.
+	app.conversation_rect = conv_rect
 
 	if conv_rect.width <= 0 && input_rect.width <= 0 {
 		return {}, .Layout_Failed
@@ -348,8 +364,8 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 						layout.text(&storage.layout_ctx, layout.Text_Desc{text = STARTUP_HINT, style = layout_text_style(HINT_STYLE)})
 					}
 				} else {
-					for &entry in app.run.snap.entries {
-						declare_entry(&storage.layout_ctx, &entry, rect.width)
+					for &entry, ordinal in app.run.snap.entries {
+						declare_entry(&storage.layout_ctx, &entry, rect.width, ordinal)
 					}
 				}
 			}
@@ -404,9 +420,9 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 // cleaned body in an element whose bottom padding is the blank row that
 // separates entries, so the spacing scrolls with the content instead of being
 // pasted in at draw time.
-declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
+declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width, ordinal: int) {
 	if entry.kind == .Tool {
-		declare_tool_entry(ctx, entry, width)
+		declare_tool_entry(ctx, entry, width, ordinal)
 		return
 	}
 	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
@@ -442,12 +458,15 @@ declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Text_Style) {
 }
 
 // declare_tool_entry draws one tool call as a bordered box: the call's name on
-// the top border, then a bounded preview of its result.
+// the top border, then a window of its result. A result taller than the window
+// scrolls (see `entry.tool_scroll`), and the bottom border says how many rows
+// the window is holding back, so a box never looks like the whole output when it
+// is a preview of one.
 //
 // The box starts where the prompt box does and pads its content one cell inside
 // the border, so a call and a prompt line up on the same columns. Only the
 // border carries the outcome color; the content is ordinary text.
-declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
+declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width, ordinal: int) {
 	outline := widgets.BORDER_ROUNDED
 	box_width := max(width, 4)
 	border_inner_width := max(box_width - 2, 1)
@@ -464,43 +483,107 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 	name = text.truncate_text(name, max(border_inner_width - 3, 0))
 	preview = display_clean(preview, context.temp_allocator)
 	rule_fill := strings.repeat(outline.horizontal, max(border_inner_width - text.text_columns(name) - 3, 0), context.temp_allocator) or_else ""
-	bottom_fill := strings.repeat(outline.horizontal, border_inner_width, context.temp_allocator) or_else ""
 	top := fmt.tprintf("%s%s %s %s%s", outline.top_left, outline.horizontal, name, rule_fill, outline.top_right)
-	bottom := fmt.tprintf("%s%s%s", outline.bottom_left, bottom_fill, outline.bottom_right)
+	// The window is the part of the result the box shows. Its offset is clamped
+	// here because this is where the row count and the box's width are both known:
+	// a resize or a shorter result can leave a remembered offset past the end.
+	content_rows := tool_preview_rows(preview, content_width)
+	visible_rows := min(content_rows, TOOL_WINDOW_ROWS)
+	// The bound is kept on the entry because the wheel asks whether the window has
+	// room left before it decides who owns the report.
+	entry.tool_scroll_max = max(content_rows - visible_rows, 0)
+	entry.tool_scroll = clamp(entry.tool_scroll, 0, entry.tool_scroll_max)
+	bottom := tool_border_bottom(outline, border_inner_width, tool_window_label(entry.tool_scroll, entry.tool_scroll_max - entry.tool_scroll))
 	border_style := TOOL_FAILURE
 	if entry.tool_outcome == .Success { border_style = TOOL_SUCCESS }
-	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{bottom = 1}}}) {
+	if layout.element(
+		ctx,
+		layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{bottom = 1}}, user = tool_box_tag(ordinal)},
+	) {
 		border := layout_text_style(border_style)
 		body := layout_text_style(TOOL_BODY)
 		layout.text(ctx, layout.Text_Desc{text = top, style = border})
 		remaining := preview
-		rows := 0
-		for rows < TOOL_PREVIEW_LINES && len(remaining) > 0 {
-			logical := remaining
-			newline := strings.index(remaining, "\n")
-			if newline >= 0 { logical = remaining[:newline] }
-			piece := text.truncate_text(logical, content_width)
-			if piece == "" && len(logical) > 0 {
-				end := text.next_grapheme_offset(logical, 0)
-				piece = logical[:end]
+		row_index := 0
+		drawn := 0
+		for len(remaining) > 0 {
+			piece, rest := tool_row_next(remaining, content_width)
+			if row_index >= entry.tool_scroll && drawn < visible_rows {
+				fill := strings.repeat(" ", max(content_width - text.text_columns(piece), 0), context.temp_allocator) or_else ""
+				declare_tool_row(ctx, fmt.tprintf(" %s%s ", piece, fill), border, body, outline.vertical)
+				drawn += 1
 			}
-			fill := strings.repeat(" ", max(content_width - text.text_columns(piece), 0), context.temp_allocator) or_else ""
-			declare_tool_row(ctx, fmt.tprintf(" %s%s ", piece, fill), border, body, outline.vertical)
-			rows += 1
-			if len(piece) < len(logical) {
-				remaining = remaining[len(piece):]
-			} else if newline >= 0 {
-				remaining = remaining[newline + 1:]
-			} else {
-				remaining = ""
-			}
+			row_index += 1
+			remaining = rest
+			if drawn >= visible_rows { break }
 		}
-		if rows == 0 {
+		if content_rows == 0 {
 			fill := strings.repeat(" ", content_width, context.temp_allocator) or_else ""
 			declare_tool_row(ctx, fmt.tprintf(" %s ", fill), border, body, outline.vertical)
 		}
 		layout.text(ctx, layout.Text_Desc{text = bottom, style = border})
 	}
+}
+
+// tool_row_next splits the first row a tool box draws from `value` and returns
+// it with the remainder. A row ends at a newline or at the content width,
+// whichever comes first; a grapheme wider than the width still takes a row, so
+// the split always advances.
+tool_row_next :: proc(value: string, width: int) -> (row: string, rest: string) {
+	newline := strings.index(value, "\n")
+	logical := value
+	if newline >= 0 { logical = value[:newline] }
+	piece := text.truncate_text(logical, width)
+	if piece == "" && len(logical) > 0 {
+		piece = logical[:text.next_grapheme_offset(logical, 0)]
+	}
+	switch {
+	case len(piece) < len(logical):
+		return piece, value[len(piece):]
+	case newline >= 0:
+		return piece, value[newline + 1:]
+	}
+	return piece, ""
+}
+
+// tool_preview_rows counts the rows a tool box draws for a result: one per
+// wrapped row, so the box knows what its window is holding back.
+tool_preview_rows :: proc(preview: string, width: int) -> int {
+	rows := 0
+	remaining := preview
+	for len(remaining) > 0 {
+		_, remaining = tool_row_next(remaining, width)
+		rows += 1
+	}
+	return rows
+}
+
+// tool_window_label names what a window is holding back. The arrows point at the
+// rows they count, and an empty label means nothing is hidden and the border
+// stays a plain rule.
+tool_window_label :: proc(hidden_above, hidden_below: int) -> string {
+	switch {
+	case hidden_above == 0 && hidden_below == 0:
+		return ""
+	case hidden_above == 0:
+		return fmt.tprintf("↓ %d more lines", hidden_below)
+	case hidden_below == 0:
+		return fmt.tprintf("↑ %d more lines", hidden_above)
+	}
+	return fmt.tprintf("↑ %d · ↓ %d lines", hidden_above, hidden_below)
+}
+
+// tool_border_bottom draws the box's bottom edge, carrying the window's label
+// when it has one. The label is truncated to the room the border has, and an
+// empty result is a plain rule.
+tool_border_bottom :: proc(outline: widgets.Border, inner_width: int, label: string) -> string {
+	visible := text.truncate_text(label, max(inner_width - 3, 0))
+	if visible == "" {
+		fill := strings.repeat(outline.horizontal, inner_width, context.temp_allocator) or_else ""
+		return fmt.tprintf("%s%s%s", outline.bottom_left, fill, outline.bottom_right)
+	}
+	fill := strings.repeat(outline.horizontal, max(inner_width - text.text_columns(visible) - 3, 0), context.temp_allocator) or_else ""
+	return fmt.tprintf("%s%s %s %s%s", outline.bottom_left, outline.horizontal, visible, fill, outline.bottom_right)
 }
 
 // declare_tool_row adds one framed content row. The vertical bars carry the

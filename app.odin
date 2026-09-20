@@ -38,10 +38,19 @@ Entry_Kind :: enum u8 {
 	Error,
 }
 Entry :: struct {
-	kind:         Entry_Kind,
-	text:         [dynamic]u8, // owned,
-	complete:     bool,
-	tool_outcome: session.Tool_Outcome,
+	kind:            Entry_Kind,
+	text:            [dynamic]u8, // owned,
+	complete:        bool,
+	tool_outcome:    session.Tool_Outcome,
+	// tool_scroll is the first preview row a tool box shows, so a long result can
+	// be read inside its own box. The box clamps it to the rows it has, which is
+	// why the value is only a request until the next frame resolves it.
+	tool_scroll:     int,
+	// tool_scroll_max is the largest tool_scroll that window has, as the last
+	// frame resolved it. Zero means the result fits and the box has nothing to
+	// scroll, which is what tells the wheel the transcript behind it owns the
+	// report.
+	tool_scroll_max: int,
 }
 
 // Status carries the runtime facts the footer shows. provider_id and cwd

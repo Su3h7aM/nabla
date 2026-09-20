@@ -13,6 +13,7 @@ import "nabla:agent/session"
 import "nabla:ai"
 import input "nabla:input"
 import "nabla:term"
+import "nabla:tui"
 import "nabla:tui/widgets"
 
 session_target_destroy :: proc(target: ^Session_Target, allocator: mem.Allocator) {
@@ -97,6 +98,10 @@ App :: struct {
 	completion_active: bool,
 	columns:           int,
 	rows:              int,
+	// conversation_rect is the cells the transcript occupied in the last frame. A
+	// mouse report is in screen cells, so this is what converts one into the
+	// conversation's own coordinates.
+	conversation_rect: tui.Cell_Rect,
 	quit:              bool,
 }
 

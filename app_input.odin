@@ -3,10 +3,12 @@ package main
 
 import "core:fmt"
 import "core:strings"
+import "core:sync"
 import "core:sync/chan"
 
 import "nabla:agent"
 import input "nabla:input"
+import "nabla:layout"
 import "nabla:tui/widgets"
 
 // --- input handling -------------------------------------------------------
@@ -150,16 +152,69 @@ command_help :: proc(app: ^App) {
 	snap_append(app, .Notice, "  a command that names a list opens it when given no argument")
 	snap_append(app, .Notice, "keys: escape interrupt | ctrl+c clear, cancel, then quit")
 	snap_append(app, .Notice, "  the wheel and page up/page down scroll the transcript")
+	snap_append(app, .Notice, "  over a tool box the wheel scrolls that box's output")
 }
 
-// MOUSE_WHEEL_LINES is how many rows one wheel tick scrolls the transcript.
+// MOUSE_WHEEL_LINES is how many rows one wheel tick scrolls.
 MOUSE_WHEEL_LINES :: 3
 
-// wheel_scroll turns a mouse wheel report over the messages area into a scroll
-// delta with the same units Page Up/Down use. Reports below the conversation
-// (the rules, the input line, the footer) are ignored: they are not the
-// messages area, and the wheel has nothing to say about them.
+// tool_box_entry_at returns the entry ordinal of the tool box covering a screen
+// cell, or -1 when the cell is not on one.
+//
+// It asks the frame that is on screen rather than a rectangle remembered from a
+// previous frame, so a box that scrolled or resized cannot take a report aimed
+// at whatever now covers those cells. A box carries its entry ordinal on its
+// node, which is what the scan reads.
+tool_box_entry_at :: proc(app: ^App, x, y: int) -> int {
+	frame_result, frame_error := layout.result(&app.storage.layout_ctx)
+	if frame_error != .None { return -1 }
+	point := layout.Vec2{layout.Scalar(x - app.conversation_rect.x), layout.Scalar(y - app.conversation_rect.y)}
+	for node in frame_result.nodes {
+		if node.user == 0 { continue }
+		if point.x < node.outer.position.x || point.y < node.outer.position.y { continue }
+		if point.x >= node.outer.position.x + node.outer.size.x { continue }
+		if point.y >= node.outer.position.y + node.outer.size.y { continue }
+		return tool_box_ordinal(node.user)
+	}
+	return -1
+}
+
+// tool_box_scroll moves a tool box's window one wheel tick and reports whether
+// the box could take it. The box owns the wheel only while it has rows left in
+// the direction asked for: at its boundary the report is left to the transcript,
+// so scrolling continues there instead of stopping at the box's edge.
+tool_box_scroll :: proc(entry: ^Entry, button: input.Mouse_Button) -> bool {
+	#partial switch button {
+	case .Wheel_Up:
+		if entry.tool_scroll <= 0 { return false }
+		entry.tool_scroll = max(entry.tool_scroll - MOUSE_WHEEL_LINES, 0)
+		return true
+	case .Wheel_Down:
+		if entry.tool_scroll >= entry.tool_scroll_max { return false }
+		entry.tool_scroll = min(entry.tool_scroll + MOUSE_WHEEL_LINES, entry.tool_scroll_max)
+		return true
+	}
+	return false
+}
+
+// wheel_scroll turns a mouse wheel report into a scroll. Over a tool box that can
+// still move the way the wheel asks, it scrolls that box's window, so a long
+// result can be read without leaving the transcript; everywhere else in the
+// messages area it scrolls the transcript, which is what page up and page down
+// do.
+//
+// The box is asked first, and asked of the frame itself, so a box keeps the wheel
+// wherever it sits in the transcript. The transcript's own guard stays a bound on
+// the footer rather than on the frame, because a report there has nothing to
+// scroll.
 wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
+	// The terminal reports mouse cells one-based; the frame is solved from zero.
+	if ordinal := tool_box_entry_at(app, mouse.x - 1, mouse.y - 1); ordinal >= 0 {
+		sync.mutex_lock(&app.run.mu)
+		consumed := tool_box_scroll(&app.run.snap.entries[ordinal], mouse.button)
+		sync.mutex_unlock(&app.run.mu)
+		if consumed { return }
+	}
 	if mouse.y > app.rows - TUI_FOOTER_ROWS {
 		return
 	}
