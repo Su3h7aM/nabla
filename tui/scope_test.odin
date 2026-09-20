@@ -58,11 +58,13 @@ test_scoped_rendering_uses_layout_boxes_and_clips :: proc(t: ^testing.T) {
 	defer layout.destroy(&layout_ctx)
 
 	cells: [32]term.Cell
+	child, child_found := layout.lookup_handle(frame_result, _SCOPE_CHILD_ID)
+	testing.expect(t, child_found)
 	ctx: Context
 	if frame(&ctx, frame_result, cells[:]) {
 		if element(&ctx, {id = _SCOPE_PARENT_ID}) {
 			testing.expect_value(t, fill(&ctx, ".", {}), 32)
-			if element(&ctx, {id = _SCOPE_CHILD_ID}) {
+			if element_node(&ctx, {node = child}) {
 				written, ok := draw_text(&ctx, "abcdefgh", {})
 				testing.expect(t, ok)
 				testing.expect_value(t, written, 6)

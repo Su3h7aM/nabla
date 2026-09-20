@@ -19,6 +19,11 @@ Element_Desc :: struct {
 	box: Box,
 }
 
+Element_Node_Desc :: struct {
+	node: layout.Node_Handle,
+	box:  Box,
+}
+
 Frame_Error :: enum u8 {
 	None,
 	Frame_Already_Open,
@@ -162,17 +167,35 @@ element :: proc(ctx: ^Context, desc: Element_Desc, loc := #caller_location) -> b
 	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return false
 	}
-	if ctx._scope_count >= len(ctx._scopes) {
-		ctx._error = .Scope_Exhausted
-		return false
-	}
 	handle, found := layout.lookup_handle(ctx._result, desc.id)
 	if !found {
 		ctx._error = .Element_Not_Found
 		return false
 	}
-	resolved, node_found := layout.node(ctx._result, handle)
-	assert(node_found)
+	return _element_enter(ctx, handle, desc.box, loc)
+}
+
+// element_node is the handle-based form used while iterating a Frame_Result.
+// It has the same lexical nesting and clipping contract as element.
+@(deferred_in_out = _element_node_leave)
+element_node :: proc(ctx: ^Context, desc: Element_Node_Desc, loc := #caller_location) -> bool {
+	return _element_enter(ctx, desc.node, desc.box, loc)
+}
+
+@(private)
+_element_enter :: proc(ctx: ^Context, handle: layout.Node_Handle, box: Box, loc: runtime.Source_Code_Location) -> bool {
+	if ctx == nil || !ctx._frame_open || ctx._error != .None {
+		return false
+	}
+	if ctx._scope_count >= len(ctx._scopes) {
+		ctx._error = .Scope_Exhausted
+		return false
+	}
+	resolved, found := layout.node(ctx._result, handle)
+	if !found {
+		ctx._error = .Element_Not_Found
+		return false
+	}
 	parent := ctx._scopes[ctx._scope_count - 1]
 	if resolved.parent != parent.node {
 		ctx._error = .Element_Outside_Scope
@@ -189,7 +212,7 @@ element :: proc(ctx: ^Context, desc: Element_Desc, loc := #caller_location) -> b
 		return false
 	}
 	bounds := outer
-	if desc.box == .Inner {
+	if box == .Inner {
 		bounds = inner
 	}
 	ctx._scopes[ctx._scope_count] = _Scope {
@@ -204,12 +227,7 @@ element :: proc(ctx: ^Context, desc: Element_Desc, loc := #caller_location) -> b
 }
 
 @(private)
-_element_leave :: proc(ctx: ^Context, desc: Element_Desc, loc: runtime.Source_Code_Location, entered: bool) {
-	if !entered {
-		return
-	}
-	_ = desc
-	_ = loc
+_element_pop :: proc(ctx: ^Context) {
 	if ctx == nil || !ctx._frame_open || ctx._scope_count <= 1 {
 		if ctx != nil {
 			ctx._error = .Unbalanced_Scope
@@ -218,6 +236,34 @@ _element_leave :: proc(ctx: ^Context, desc: Element_Desc, loc: runtime.Source_Co
 		return
 	}
 	ctx._scope_count -= 1
+}
+
+@(private)
+_element_leave :: proc(ctx: ^Context, desc: Element_Desc, loc: runtime.Source_Code_Location, entered: bool) {
+	if !entered {
+		return
+	}
+	_ = desc
+	_ = loc
+	_element_pop(ctx)
+}
+
+@(private)
+_element_node_leave :: proc(ctx: ^Context, desc: Element_Node_Desc, loc: runtime.Source_Code_Location, entered: bool) {
+	if !entered {
+		return
+	}
+	_ = desc
+	_ = loc
+	_element_pop(ctx)
+}
+
+// current_node returns the active layout node. The frame root is handle zero.
+current_node :: proc(ctx: ^Context) -> (layout.Node_Handle, bool) #optional_ok {
+	if ctx == nil || !ctx._frame_open || ctx._scope_count == 0 {
+		return 0, false
+	}
+	return ctx._scopes[ctx._scope_count - 1].node, true
 }
 
 // bounds returns the active scope's selected box.

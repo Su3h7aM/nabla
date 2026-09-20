@@ -42,8 +42,9 @@
 //     }
 //
 // The render hierarchy must match the solved layout hierarchy. element selects
-// either the resolved outer or inner box and automatically applies the node's
-// effective clip. Its deferred cleanup closes on every block exit, including
+// by stable Id; element_node selects a Node_Handle while traversing the result.
+// Both select either the resolved outer or inner box and apply the node's
+// effective clip. Their deferred cleanup closes on every block exit, including
 // return, break, and continue. Context uses fixed inline scope storage,
 // allocates nothing, and has a valid zero value.
 //
