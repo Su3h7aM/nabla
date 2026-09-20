@@ -267,6 +267,12 @@ an interrupted session settles it before anything new is admitted.
 Minimal state machine. Cancellation, compaction, steering, and subagents fit inside it; none of
 them gets a competing loop.
 
+The proposed [Lua Code Mode and asynchronous tool execution](CODE_MODE_ARCHITECTURE.md)
+design extends this state/effect model. It does not install a traditional agent loop.
+Section 6 of that document states the state-machine rules both levels follow, section
+7 the tool-job and Lua transitions, and section 8 the chat transitions. The changes
+are not implemented.
+
 ```
 Idle
   ↓ accept user
@@ -287,9 +293,12 @@ Rules:
 
 - One turn = one user prompt and everything it causes until terminal. `requests_made` bounds the
   tool loop.
-- **The loop is a step function, not a callback graph.** `advance(state) -> Effect`; the caller
-  executes the effect (start a request, run tools, finish). This keeps the turn decision pure and
-  testable without transport.
+- **The state machine advances through effects, not a callback graph.** `advance(state) -> Effect`;
+  the driver performs the effect and feeds its observed outcome back as an event. A start effect
+  may leave work pending. Under the asynchronous tool proposal, `Executing_Tools` includes
+  suspended work; with nothing runnable, advance requests an event wait rather than blocking
+  inside tool execution. Tool-job and Lua phases represent waiting without a duplicate chat
+  phase. Transition tests need no transport, threads, or Lua interpreter.
 - Terminal status is exactly `Completed | Failed | Cancelled`. A turn reaches a terminal state
   once, and reports it once.
 - Every in-flight request is an **operation** with its own id. Events carry their
@@ -301,6 +310,10 @@ Rules:
 - Use Goose's step/effect separation where it simplifies this. **Do not reproduce Goose's
   operation catalogue for architectural similarity** — add a step only when a requirement needs
   one.
+- **Answers stay complete.** Every committed call ends the turn with exactly one recorded result,
+  child calls included, and a cancelled turn still settles everything it committed. The proposed
+  [Code Mode architecture](CODE_MODE_ARCHITECTURE.md) §6.3 states the rule, and §6.4 states why
+  an interrupted turn is settled from the journal rather than resumed.
 
 ---
 
@@ -384,8 +397,9 @@ Rules:
 - Commands that must take effect before the next request (`/effort`, `/compact`) run at the
   boundary, ahead of the request build. The interactive front-end sends only text through the
   queue and keeps commands on its own path, which decides what may happen mid-turn.
-- Steering is bounded. **No arbitrary mid-request mutation. No scheduler.** One execution thread is
-  the only session writer.
+- Steering is bounded. No arbitrary mid-request mutation. One owner thread remains the only
+  session writer. The planned tool-job scheduler handles execution readiness and retirement,
+  not steering policy or concurrent model requests. A suspended tool is not a steering boundary.
 
 ---
 

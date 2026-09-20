@@ -5,6 +5,12 @@ detailed design.
 
 Status: **documented, not implemented.** No part of this exists in the code yet.
 
+The planned [Code Mode tool state machines](CODE_MODE_ARCHITECTURE.md) provide the
+shared parent-side execution lifecycle. A subagent backend still owns a separate
+process, but completion arrives as a tool event and the session state machine
+resumes only after recording its result. It must not add a competing agent loop or
+block the session owner in an await.
+
 ---
 
 ## 1. Invariants
@@ -91,10 +97,16 @@ receives status, a bounded result, and optional progress.
     └──▶ Handle (pid, pipes, deadline, parent turn identity)
 ```
 
-`spawn` returns a handle. `await(handle)` returns the outcome. The first tool-facing interface
-calls `spawn` and then `await` immediately, so it is synchronous from the model's point of view,
-but the two are separate operations and nothing about the handle assumes the await follows at
-once. That is what makes concurrency later a scheduling change rather than a redesign.
+`spawn` returns an internal handle. Awaiting that handle suspends its owning tool
+state until a completion event arrives. The first model-facing interface awaits
+immediately, so it produces one ordinary tool result, but it never blocks the
+session owner. The shared tool-job state machine owns submission, result commit,
+and retirement; process supervision supplies events rather than invoking a parent
+continuation directly.
+
+The child process handle is backend state. It is not a model-visible detached-job
+handle or the opaque Lua task handle. Lua can start and await this tool through the
+same task operations as other tools once the subagent backend exists.
 
 **The job record** carries, at minimum:
 
@@ -199,7 +211,8 @@ concurrently with caps and parent/child identities.
 - A fixed role taxonomy (`reviewer`, `coder`, `planner`) in code or configuration.
 - An in-process "subagent" that is really just another thread or coroutine.
 - Automatic recursive delegation. A child does not spawn children in the first version.
-- A workflow engine, a job scheduler, or a process pool.
+- A separate workflow engine, a second tool scheduler, or a reusable process pool.
+  Use the shared tool-job state machine; keep process supervision in this backend.
 - A rich public result type before the lifecycle's real distinctions are implemented.
 
 ---

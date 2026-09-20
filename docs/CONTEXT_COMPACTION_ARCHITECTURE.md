@@ -13,6 +13,14 @@ That document resolves provider-confirmed overflow recovery and aggregate tool-r
 and specifies bounded, owner-driven background retries to replace the current policy. Those
 changes are not implemented yet; the behavior below describes the current code.
 
+The proposed [Lua Code Mode and asynchronous tools](CODE_MODE_ARCHITECTURE.md)
+design adds parent-child tool records and event-driven execution. Compaction must
+use the model-visible projection, excluding child calls and results, and must not
+cut a top-level Code Mode call/result pair. A tool waiting for completion is not an
+installation boundary. The owner may adopt a finished background result while
+tools run, but installs it only at the existing safe request boundary. These are
+planned integration requirements, not implemented changes to the seam algorithm.
+
 ---
 
 ## 1. Contract

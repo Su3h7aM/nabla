@@ -4,6 +4,13 @@ This records why the harness tool system is shaped the way it is. It is the
 design record for `agent/tool*.odin`, `agent/session`, and `mcp`. Read the code
 first; this document only carries the reasoning that the code cannot.
 
+The implemented tool path described here is synchronous. The proposed
+[Lua Code Mode and asynchronous tool execution](CODE_MODE_ARCHITECTURE.md) design
+supersedes that execution constraint. It specifies shared tool-job state machines,
+Lua suspension, explicit concurrency, and nested call recording. Those changes are
+not implemented; the result, admission, and delivery contracts below remain the
+starting point, not a prohibition on refactoring their current interfaces.
+
 ## Why
 
 Nabla originally shipped one tool, `shell`, and the tool system was the shell
@@ -36,12 +43,16 @@ Nabla already had the parts that are hard to retrofit:
 
 None of that changes. The work generalizes the shell-shaped parts around it.
 
-## What we do not build
+## Scope and planned extensions
 
-Code Mode, an embedded interpreter, plugin loading, parallel tool execution,
-background jobs, PTYs, a permission language, and MCP resources, prompts,
-subscriptions, Apps, or Tasks. If a later need appears, it appears with a real
-case attached.
+The implemented tool system has no Code Mode, parallel tool execution, background
+jobs, PTYs, permission language, or MCP resources, prompts, subscriptions, Apps, or
+Tasks. Lua is already embedded for configuration, but not for tool orchestration.
+
+[Code Mode architecture](CODE_MODE_ARCHITECTURE.md) now proposes a Lua execution
+tool and asynchronous, bounded tool jobs. It replaces the synchronous orchestration
+assumption rather than wrapping it in a second tool system. Detached background
+jobs, plugin loading, and the other capabilities above remain outside that work.
 
 ## The tool contract
 
@@ -87,6 +98,12 @@ ranges and produce deterministic diagnostics. A tool that returns
 `Invalid_Arguments` has performed no effect; that is the contract dispatch
 relies on when it decides a call did not run.
 
+For the asynchronous target, this signature remains useful as a blocking worker
+adapter, not as the orchestration interface for every tool. Execution placement
+becomes explicit: worker procedures, short owner-side session operations, and
+resumable Lua executions. Context and allocator ownership extend through job
+retirement; a call-scoped borrowed stack frame is no longer sufficient.
+
 This deliberately avoids the crate of hooks, typed codecs, and adapter traits
 the reference harnesses carry. Four tools do not need a plugin boundary.
 
@@ -125,6 +142,13 @@ The pipeline is fixed and lives in `chat_run_tools`:
 
 A durable write failure stops the turn. Nothing runs after a dispatch record
 failed to land, and no result is continued from memory.
+
+The proposed asynchronous path splits this procedure into state transitions and
+effects for admission, dispatch recording, launch, completion, result recording,
+and retirement. Worker completions are events; only the session owner commits
+them. Direct and Lua-originated calls share that path. A nested call records its
+parent and is excluded from provider replay, while remaining available for
+inspection and recovery. See [Code Mode architecture, sections 6 through 9](CODE_MODE_ARCHITECTURE.md#6-state-machine-model).
 
 ## Results
 
@@ -381,8 +405,11 @@ is frozen when the process starts.
 
 The server's stderr is drained by a thread that keeps a bounded tail, so a chatty
 server cannot block on a full pipe. Stderr is diagnostic only and never decides a
-request outcome. One request is in flight at a time because the harness runs
-tools serially.
+request outcome. One request is currently in flight at a time because the harness
+runs tools serially. The asynchronous design preserves a capacity-one execution
+lane per MCP client until multiplexing is implemented and tested. Independent
+clients may run concurrently; queued calls must not occupy worker slots or read
+the same client's stream from multiple threads.
 
 The runtime keeps one stable client slot per configured server. Discovered tool
 bindings are allocated individually and replaced as one generation after the

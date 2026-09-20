@@ -796,6 +796,12 @@ tool policy, not an expansion of skill-loader authority.
 
 ## 13. State machine and persistence flow
 
+This section describes the current direct skill-call path. The proposed
+[Code Mode architecture](CODE_MODE_ARCHITECTURE.md) moves execution into shared
+asynchronous tool-job states while retaining the loader's data contract. A load
+inside Lua is a child execution record, not a provider message; the script must
+return the body before the model can read and follow it.
+
 Suppose the model has inspected code and decides it needs `pdf`.
 
 1. It knows the name from the inline catalog, or issues `list_skills` and receives
@@ -823,14 +829,15 @@ Preparing -> Requesting -> Streaming -> Executing_Tools
 ```
 
 There is no `Loading_Skill` state, separate activation message, new provider
-message role, or backend callback that edits conversation. `Chat_State` and
-`Chat_Effect_Kind` do not need additional members.
+message role, or backend callback that edits conversation. Skill loading needs no
+skill-specific chat state or effect. Shared asynchronous execution changes are
+specified in the Code Mode design rather than added as a loader-specific mechanism.
 
-Add a typed borrowed catalog pointer to `Tool_Context`; both context construction
-sites in `chat_run_tools` and `chat_prepare_call` must initialize it consistently.
-It lives for the synchronous execution and must not be retained by a tool. Do
-not pass `Chat_Session`, the session store, a service registry, or `rawptr` into
-the loader. Tools still do not write durable history.
+The loader receives a typed borrowed catalog pointer, never `Chat_Session` or the
+session store. It does not write durable history. The current synchronous call
+borrows that catalog for its call frame. In the asynchronous target, the owning job
+keeps the frozen catalog alive through worker retirement, and no pointer to a
+stack-allocated tool context escapes into a worker.
 
 A batch can contain multiple independent skill loads. If a model batches a skill
 load with a shell command that depends on the instructions, the command was
@@ -856,10 +863,10 @@ There is no exemption that allows an unbounded activation loop.
 - Recovery does not rerun loads. A dispatched call without a recorded result is
   `Unknown`; an undispatched call is `Not_Executed`, just as for other tools.
 
-Reads are synchronous like current native file tools. Cancellation cannot
-interrupt a kernel filesystem operation stuck on an unresponsive mount. A worker
-or asynchronous I/O boundary would be needed for that guarantee; this design
-makes no stronger promise than the existing local file tools.
+Reads are currently synchronous like native file tools. The proposed worker boundary
+keeps the session owner responsive, but cannot interrupt a kernel filesystem
+operation stuck on an unresponsive mount. Hard termination requires an appropriate
+process or I/O boundary; adding a worker alone does not provide that guarantee.
 
 ## 14. Context, replay, and prompt caching
 

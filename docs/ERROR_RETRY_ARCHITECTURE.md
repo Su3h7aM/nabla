@@ -79,6 +79,11 @@ summarizer still cannot guarantee indefinite execution.
 
 ## 2. What exists and what needs changing
 
+The proposed [Code Mode and asynchronous tool execution](CODE_MODE_ARCHITECTURE.md)
+design changes when tools run, not what a failure means. A retry still never replays
+an executed tool call, a pending tool job is not a recovery boundary, and cancellation
+still defeats every recovery decision. Nothing in this document changes.
+
 The supplied study's Nabla section describes an older revision. The current code has background
 compaction and `context.compact`, but provider failures still take the older retry path.
 
