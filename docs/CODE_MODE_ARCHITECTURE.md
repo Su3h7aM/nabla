@@ -839,7 +839,11 @@ under the existing diagnostic capture policy, not an unconditional execution tra
 
 ### 13.1 Initial policy values
 
-These are proposed starting values, not measurements or implemented constants:
+The Lua boundary implements the first four rows and the log bound as
+`lua_limits_default` and its constants (`LUA_MEMORY_DEFAULT`,
+`LUA_INSTRUCTIONS_DEFAULT`, `LUA_SLICE_DEFAULT`, `LUA_DURATION_DEFAULT`,
+`LUA_MAX_LOG_BYTES`). The remaining rows arrive with the job, lane, and provider
+steps; until then they are the values those steps must use:
 
 | Resource | Initial bound |
 | --- | --- |
@@ -887,17 +891,22 @@ that a remote effect was rolled back. Record the child outcome supported by evid
 while the parent independently reports its own cancellation or timeout.
 
 At each Lua slice, host request, launch boundary, and completion, check terminal
-control. User `pcall`/`xpcall` may catch ordinary Lua errors but must not neutralize
-cancellation, deadline, instruction, or memory exhaustion. Prefer count-hook yield
-to the owner for scheduling and terminal stop; once terminal, never resume the
-script. Latch terminal causes outside Lua, so even a script that catches an error and
-returns cannot turn a limit failure into success.
+control. Cancellation, deadline, instruction, and memory exhaustion must not be
+neutralized by anything the script can call. The boundary answers this by not raising
+at all: the count hook yields to the owner, terminal causes are latched outside Lua,
+and a stopped run is never resumed. `pcall` and `xpcall` are absent from the
+environment in that step, so a memory refusal cannot be swallowed by the script that
+caused it either; if they are ever exposed, the stop path has to keep this property.
 
 Yieldability through protected calls and native-library boundaries is an implementation
 gate. Do not ship a hook error that a script can catch forever. Restrict non-yieldable
-callback-taking library functions until the chosen hook path is proved safe. If the
-embedded runtime cannot meet the contract, revise execution placement or the exposed
-library set rather than hide the limitation in a comment.
+callback-taking library functions until the chosen hook path is proved safe. The
+boundary checks `lua_isyieldable` before every yield and defers a stop to the next
+firing that can yield, which leaves the instruction budget bounding Lua code rather
+than time inside a C function (section 14.1). Keep the exposed library set small for
+that reason, and bound the inputs to its expensive operations. If the embedded runtime
+cannot meet the contract, revise execution placement or the exposed library set rather
+than hide the limitation in a comment.
 
 A deadline stops new execution; retirement can take longer while a backend cleans
 up. A worker thread keeps the owner responsive but cannot safely be killed in an
@@ -1003,14 +1012,75 @@ Run `mise run check`, focused `agent` and `agent/session` tests, and the full
 ownership where supported. Use process-level test harnesses for crash and forced-stop
 cases rather than pretending they are ordinary in-process unit tests.
 
+### 14.1 Phase 1 results
+
+Step 1 landed as `agent/code_mode_lua.odin` with `agent/code_mode_lua_test.odin`. One
+fresh restricted state per execution, a private coroutine for the chunk, a count hook
+that yields to the owner, and tool wrappers that suspend on a request. No production
+registration yet. The work settled several mechanics the proposal had left open.
+
+**A stop is a suspension, not an error.** The reference manual restricts hook yields:
+only count and line events may yield, and the hook must finish by calling `lua_yield`
+with no results. In the other direction, an unguarded yield inside a C frame raises
+`attempt to yield across a C-call boundary` into the script, where it is catchable.
+A raised error is therefore the wrong stop mechanism, and the boundary does not use
+one: the hook yields, the owner latches the cause in its own struct, and a stopped run
+is never resumed. The coroutine dies with the state.
+
+**Yieldability is per firing.** `lua_isyieldable` is checked before every yield. Inside
+a C frame the stop stays latched and is taken at the next firing that can yield, so the
+instruction budget bounds Lua code and not the time a library call spends inside C. The
+run counts those firings (`non_yieldable`) so the property is observable rather than
+assumed; `lua_stop_in_a_c_frame_defers` exercises it with a `table.sort` comparator.
+
+**Failures are values.** A chunk that does not compile reports `compiled = false` with a
+bounded message. A runtime error comes back as `lua_resume`'s status. A refused
+allocation reaches the owner as `ERRMEM` and is reported as `Failed` with
+`Lua_Failure.Memory`. Nothing is thrown into Odin, and no Lua error unwinds Odin frames.
+
+**Lua 5.4's allocator contract.** `frealloc(ud, NULL, x, s)` creates a new block "no
+matter `x`", so the third argument is not a size for a fresh allocation; a measurement
+saw it non-zero 358 times while the standard libraries were opened. The boundary counts
+a fresh block by its requested size and a reallocation or free by the recorded size,
+which keeps the reported byte count exact: after `lua_close`, every tracked byte is
+released and the tracking map is empty (`lua_destroy_returns_every_byte`). An allocator
+that placed a header before each block aborted inside `luaopen_base`, so the boundary
+passes the caller's allocator through and keeps its own count instead.
+
+**Lua writes are ordered deliberately, because a mistake aborts the process.** The host
+path uses unprotected C API calls, so nothing may guess: `luaL_ref` takes the registry
+index, the key precedes the value for `lua_settable`, a closure's upvalue is pushed
+before the closure, the table index is computed before the pushes rather than relative
+to a changing top, and a registry reference is released before `lua_close` frees the
+registry it lives in. Delivery raises the memory budget by `LUA_HOST_RESERVE` while the
+owner pushes, so a script that spent its budget cannot make the harness abort during a
+result. A wrong host-side index is still a crash and no panic handler is installed; the
+mitigations are small functions and review, and later steps inherit that rule for every
+new host operation.
+
+**The environment is an allowlist.** Base minus `load`, `loadfile`, `dofile`,
+`require`, `collectgarbage`, `warn`, `setmetatable`, `getmetatable`, `rawset`,
+`pcall`, `xpcall`, and `print`; string minus `dump`; plus table, math, and utf8. The
+metatable and raw-write functions are absent so host-side conversion can never run
+script code, and `pcall`/`xpcall` are absent because a tool outcome is a value, which
+leaves nothing to catch and keeps a memory refusal out of the script's reach. `print`
+is the harness's and appends to the run's bounded log.
+
+Measured here with the default limits: opening the restricted libraries and compiling a
+small chunk costs about 15 KiB of Lua-managed memory, and a first run that builds a
+thousand-element table peaks under 32 KiB. Both are far below the 32 MiB budget, which
+is the point: the budget exists for scripts that compute, not for the interpreter.
+
 ## 15. Decisions deliberately left open
 
 The runtime direction is settled by this proposal; these choices need implementation
 evidence, not another architecture framework:
 
-- The exact safe Lua standard-library allowlist and hook/protected-call mechanics.
 - The precise JSON numeric range supported by the installed parser without loss.
 - Final default limits after measured workloads, including the turn-wide job budget.
+- The library set once scripts are written against it: the allowlist is settled as a
+  policy (section 14.1), and adding a library reopens the non-yieldable-callback
+  question for it.
 - Whether later deployments require a subprocess security boundary or hard stop for
   filesystem work. Threads do not satisfy that requirement.
 - A future model-facing detached-job contract, persistent values, or concurrent model
