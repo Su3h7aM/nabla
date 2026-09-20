@@ -53,6 +53,8 @@ Tool_Job_Phase :: enum {
 	Dispatching,
 	// Running: an executor owns the call.
 	Running,
+	// Waiting: a Lua execution is suspended until its current child records a result.
+	Waiting,
 	// Result_Ready: a terminal result exists and is not recorded.
 	Result_Ready,
 	// Committing: the result write is outstanding.
@@ -100,38 +102,49 @@ Tool_Job_Effect :: enum {
 // Tool_Job is one admitted call.
 Tool_Job :: struct {
 	// identity, owned by the table and stable for the job's life
-	id:             u64,
-	turn_id:        u64,
-	ordinal:        int, // submission order, which is the order results are recorded in
-	call:           ^Chat_Tool_Call, // borrowed: the session's staged calls outlive the batch
-	table:          ^Tool_Jobs, // borrowed: where this job publishes completion
-	name:           string, // owned by allocator
-	call_id:        string, // owned by allocator
+	id:               u64,
+	turn_id:          u64,
+	ordinal:          int, // submission order, which is the order results are recorded in
+	call:             ^Chat_Tool_Call, // borrowed: the session's staged calls outlive the batch
+	table:            ^Tool_Jobs, // borrowed: where this job publishes completion
+	name:             string, // owned by allocator
+	call_id:          string, // owned by allocator
 
 	// placement
-	placement:      Tool_Placement,
-	lane:           rawptr, // borrowed backend identity; nil is the shared native lane
-	execute:        Tool_Execute,
+	placement:        Tool_Placement,
+	lane:             rawptr, // borrowed backend identity; nil is the shared native lane
+	execute:          Tool_Execute,
+
+	// Lua execution data. A nested call is embedded in its child job so the call
+	// pointer stays stable when the table grows.
+	lua:              ^Lua_Run,
+	lua_dispatched:   bool,
+	lua_child_no:     int,
+	lua_child:        ^Tool_Job,
+	lua_child_result: string, // owned by allocator until delivered
+	parent:           ^Tool_Job,
+	nested_call:      Chat_Tool_Call,
+	nested:           bool,
 
 	// execution data, owned by allocator, which is a thread-safe heap
-	allocator:      mem.Allocator,
-	arguments:      Tool_Arguments,
-	exec:           Tool_Context, // what the executor is given, for the job's whole life
-	logging:        Log_Binding, // the worker's correlation, captured at admission
+	allocator:        mem.Allocator,
+	arguments:        Tool_Arguments,
+	exec:             Tool_Context, // what the executor is given, for the job's whole life
+	logging:          Log_Binding, // the worker's correlation, captured at admission
 
 	// control
-	phase:          Tool_Job_Phase,
-	interrupt:      ai.Interrupt, // this job's own stop token
+	phase:            Tool_Job_Phase,
+	interrupt:        ai.Interrupt, // this job's own stop token
 
 	// outcome
-	worker:         ^thread.Thread,
-	completed:      bool, // published by the worker, adopted by the owner
-	result:         Tool_Result,
-	result_present: bool,
-	committed:      bool,
+	worker:           ^thread.Thread,
+	completed:        bool, // published by the worker, adopted by the owner
+	result:           Tool_Result,
+	result_present:   bool,
+	committed:        bool,
 	// recorded_seq is the entry this job's result was recorded as. It is the
 	// committed reference a later reader names, such as a Code Mode handle.
-	recorded_seq:   session.Seq,
+	recorded_seq:     session.Seq,
 }
 
 // Tool_Jobs is one batch's table. The owner reads and writes it; a worker only ever
@@ -146,7 +159,8 @@ Tool_Jobs :: struct {
 	woken:            bool,
 	next_id:          u64,
 	active:           int, // worker-placed jobs running now
-	committed:        int, // results recorded for this batch
+	committed:        int, // all durable results, including nested calls
+	committed_roots:  int, // provider calls answered at the turn barrier
 	stop:             Tool_Jobs_Stop,
 	// worker_allocator is where job-owned storage comes from: the arguments a worker
 	// reads, its context, and the result it produces. It is the process heap in
@@ -195,6 +209,14 @@ tool_job_release :: proc(job: ^Tool_Job, table_allocator: mem.Allocator) {
 		thread.destroy(job.worker)
 		job.worker = nil
 	}
+	if job.lua != nil { code_mode_lua_destroy(job.lua) }
+	delete(job.lua_child_result, job.allocator)
+	if job.nested {
+		delete(job.nested_call.id, job.allocator)
+		delete(job.nested_call.item_id, job.allocator)
+		delete(job.nested_call.name, job.allocator)
+		delete(job.nested_call.arguments, job.allocator)
+	}
 	tool_arguments_destroy(&job.arguments, job.allocator)
 	if job.result_present { tool_result_destroy(&job.result) }
 	delete(job.name, job.allocator)
@@ -202,14 +224,14 @@ tool_job_release :: proc(job: ^Tool_Job, table_allocator: mem.Allocator) {
 	mem.free(job, table_allocator)
 }
 
-tool_jobs_committed :: proc(jobs: ^Tool_Jobs) -> int { return jobs.committed }
+tool_jobs_committed :: proc(jobs: ^Tool_Jobs) -> int { return jobs.committed_roots }
 
 // tool_jobs_settled reports whether every job is released, which is what ends the
 // batch's loop.
 tool_jobs_settled :: proc(jobs: ^Tool_Jobs) -> bool {
 	for job in jobs.jobs {
 		switch job.phase {
-		case .Queued, .Dispatching, .Running, .Result_Ready, .Committing, .Retiring:
+		case .Queued, .Dispatching, .Running, .Waiting, .Result_Ready, .Committing, .Retiring:
 			return false
 		case .Retired, .Unrecorded:
 		}
@@ -247,6 +269,9 @@ tool_jobs_earliest_live :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
 	for job in jobs.jobs {
 		switch job.phase {
 		case .Retired, .Unrecorded:
+			continue
+		case .Waiting:
+			if job.lua_child != nil { return job.lua_child }
 			continue
 		case .Queued, .Dispatching, .Running, .Result_Ready, .Committing, .Retiring:
 		}
@@ -439,7 +464,7 @@ tool_jobs_lane_free :: proc(jobs: ^Tool_Jobs, candidate: ^Tool_Job) -> bool {
 		switch job.phase {
 		case .Dispatching, .Running:
 			return false
-		case .Queued, .Result_Ready, .Committing, .Retiring, .Retired, .Unrecorded:
+		case .Queued, .Waiting, .Result_Ready, .Committing, .Retiring, .Retired, .Unrecorded:
 		}
 	}
 	return true
@@ -469,6 +494,14 @@ tool_jobs_latch_stop :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	// repeat is harmless and a job that ignores it is drained, not forgotten.
 	for job in jobs.jobs {
 		if job.phase == .Running { ai.interrupt_request(&job.interrupt) }
+		if job.placement == .Lua && job.lua != nil {
+			code_mode_lua_request_stop(job.lua)
+			if job.phase == .Queued && candidate == .Cancelled {
+				job.result = tool_result_failure(&job.exec, .Cancelled, "the Code Mode execution was cancelled", "cancelled")
+				job.result_present = true
+				job.phase = .Result_Ready
+			}
+		}
 	}
 }
 
@@ -481,6 +514,10 @@ tool_jobs_latch_stop :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	job := tool_jobs_runnable(jobs)
 	if job == nil { return }
+	if job.placement == .Lua && job.lua_dispatched {
+		tool_job_lua_resume(jobs, chat, job, job.lua_child_result != "")
+		return
+	}
 	previous := context.logger
 	context.logger = log_logger(&job.logging)
 	defer context.logger = previous
@@ -514,6 +551,11 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		job.result = tool_job_execute(job)
 		job.result_present = true
 		job.phase = .Result_Ready
+		return
+	}
+	if job.placement == .Lua {
+		job.lua_dispatched = true
+		tool_job_lua_start(jobs, chat, job)
 		return
 	}
 	if !tool_job_launch(job) {
@@ -559,7 +601,8 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	// The budget decides whether the model is shown this result or a handle for it.
 	// The decision is made once, here, and stored: a request built later sends the
 	// same bytes however much the context has grown by then.
-	spilled := !tool_budget_take(&jobs.budget, finalized.content)
+	spilled := false
+	if !job.nested { spilled = !tool_budget_take(&jobs.budget, finalized.content) }
 	result_seq, recorded := chat_record_tool_result(chat, job.call, &finalized, spilled)
 	if !recorded {
 		// The result cannot be recorded, so it must not be reported as if it were.
@@ -571,6 +614,24 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	job.committed = true
 	job.recorded_seq = result_seq
 	jobs.committed += 1
+	if !job.nested { jobs.committed_roots += 1 }
+	if job.parent != nil {
+		job.parent.lua_child_result = strings.clone(finalized.content, job.parent.allocator)
+		job.parent.lua_child = nil
+		if job.parent.lua_child_result == "" {
+			job.parent.result = tool_result_failure(&job.parent.exec, .Tool_Failed, "the nested tool result could not be retained", "allocation failed")
+			job.parent.result_present = true
+			job.parent.phase = .Result_Ready
+		} else if jobs.stop != .None {
+			delete(job.parent.lua_child_result, job.parent.allocator)
+			job.parent.lua_child_result = ""
+			job.parent.result = tool_result_failure(&job.parent.exec, .Cancelled, "the Code Mode execution was cancelled", "cancelled")
+			job.parent.result_present = true
+			job.parent.phase = .Result_Ready
+		} else {
+			job.parent.phase = .Queued
+		}
+	}
 
 	committed := [4]Log_Field {
 		{key = "tool", value = job.name},
@@ -588,7 +649,7 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 // not be recorded. A result that reached the store is already owned by it.
 tool_jobs_retire :: proc(jobs: ^Tool_Jobs) {
 	phases: bit_set[Tool_Job_Phase] = {.Retiring}
-	if jobs.stop == .Storage_Failed { phases = {.Queued, .Result_Ready, .Retiring} }
+	if jobs.stop == .Storage_Failed { phases = {.Queued, .Waiting, .Result_Ready, .Retiring} }
 	job := tool_jobs_earliest(jobs, phases)
 	if job == nil { return }
 

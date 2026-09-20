@@ -516,6 +516,11 @@ code_mode_lua_start :: proc(allocator: mem.Allocator, limits: Lua_Limits, source
 	l.setglobal(run.L, "print")
 	l.newtable(run.L)
 	l.setglobal(run.L, "tools")
+	// Lua nil means absence, so JSON null is a stable light-userdata identity.
+	l.newtable(run.L)
+	l.pushlightuserdata(run.L, rawptr(run))
+	l.setfield(run.L, -2, "null")
+	l.setglobal(run.L, "json")
 
 	run.thread = l.newthread(run.L)
 	// The thread stays on the main stack as a collector anchor: an unreferenced

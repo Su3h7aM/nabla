@@ -83,16 +83,16 @@ Current implementation facts:
 
 | Location | Current behavior | Required change |
 | --- | --- | --- |
-| `agent/tool.odin` | `Tool_Definition.placement` separates worker and owner execution; `Tool_Context` has local and inherited stop control | Add the Lua placement when the executor exists |
-| `agent/chat_tools.odin` | Submission, one-step execution, waiting, and finish are separate procedures over session-owned jobs | Reuse the same procedures for child calls |
-| `agent/agent.odin` | `chat_session_advance` selects one bounded tool effect and drains jobs while cancelling | Keep the top-level barrier, track child jobs separately |
-| `agent/chat.odin` | The driver performs each selected tool effect and returns to `chat_session_advance` | Add Lua-slice and child-result effects; move the outer worker to a general event pump if more owner events need service |
+| `agent/tool.odin` | `Tool_Definition.placement` separates worker, owner, and Lua execution; `Tool_Context` has local and inherited stop control | Add configuration and filtered advertisement |
+| `agent/chat_tools.odin` | Session-owned jobs drive top-level and sequential child calls through the same bounded effects | Add task-handle concurrency later |
+| `agent/agent.odin` | `chat_session_advance` selects one bounded tool effect, drains jobs while cancelling, and counts only top-level results at the turn barrier | No change required for sequential Code Mode |
+| `agent/chat.odin` | The driver performs each selected tool effect and returns to `chat_session_advance` | Move the outer worker to a general event pump if more owner events need service |
 | `app_worker.odin` | The root worker owns the store and drives the turn state machine | Wake the driver directly on tool completion instead of relying on the bounded wait slice |
 | `agent/config.odin` | Lua 5.4 text-only execution and an instruction hook, no opened standard libraries | Reuse the binding, not the config VM, limits, or conversion routines |
 | `agent/tool_mcp.odin` | MCP definitions use one executor and the ordinary result envelope | Retain the adapter; schedule calls through a per-client serialization lane |
 | `app_mcp.odin` | Registry refresh and backend replacement happen between turns | Keep each borrowed generation alive through job retirement |
-| `agent/session` | Call, dispatch, result, and recovery records with no parent-call relation | Add parent relationships and explicit conversation projection filtering |
-| `agent/chat_request.odin` | Every registered definition is advertised; stored calls become provider messages | Separate executable inventory from model advertisement and omit child records |
+| `agent/session` | Schema version 5 records `parent_call_seq`; provider projection omits child calls, dispatches, and results | No change required for sequential Code Mode |
+| `agent/chat_request.odin` | Registered definitions are advertised; stored top-level calls become provider messages and child records are omitted | Add configuration-driven Code Mode advertisement |
 
 The existing result envelope, intent-before-effect recording, immutable turn
 inventory, and single session writer are useful guarantees. None requires the
@@ -1152,14 +1152,34 @@ encoded with `core:encoding/json`; a completed tool's JSON envelope is parsed th
 the same model and pushed as the wrapper's single Lua return value. No parallel tool
 argument or result representation was introduced.
 
-The conversion accepts booleans, strings, Lua integers, finite JSON numbers,
-string-keyed objects, and dense one-based arrays. An empty table is an object. It
+The conversion accepts the host-owned `json.null` sentinel, booleans, strings, Lua
+integers, finite JSON numbers, string-keyed objects, and dense one-based arrays. An
+empty table is an object. It
 rejects unsupported Lua types, cycles, mixed tables, sparse arrays, excessive depth,
 and more than 16,384 traversed values. Lua strings retain their explicit length, and
 JSON encoding remains the boundary that validates whether the copied value can be
 represented. Result construction runs inside the Lua boundary's reserved host memory.
+JSON null is delivered as the same `json.null` identity rather than Lua nil, so null
+object fields and array elements remain present.
 Focused tests cover nested arguments, complete result-envelope delivery, and cycle
-rejection. The executor and nested call scheduling still remain to be connected.
+rejection.
+
+`builtin.code` now uses a `Lua` placement in the same session-owned job table as every
+other call. Its first dispatch creates a bounded Lua run and installs wrappers for the
+session registry except `builtin.code` itself. A wrapper request records a child
+`tool_call` with `parent_call_seq`, admits a normal child job, and moves the parent to
+`Waiting`. The waiting parent occupies no worker slot and is skipped only in favor of
+its own child, so unrelated top-level results cannot pass it. Once the child result is
+durable, the complete envelope is retained, pushed into Lua, and execution resumes.
+This repeats for sequential calls until the script returns, fails, reaches a policy
+limit, or is cancelled.
+
+Nested results remain outside the provider context budget and do not increment the
+turn's top-level result barrier. They still pass through normal admission, dispatch,
+execution, result finalization, durable recording, observer reporting, and retirement.
+The parent result contains its string return value and bounded `print` log. The
+integration test executes two sequential child calls, verifies both parent relations,
+and verifies that three durable results satisfy one provider-call barrier.
 
 ## 15. Decisions deliberately left open
 

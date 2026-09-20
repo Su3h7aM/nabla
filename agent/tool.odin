@@ -103,11 +103,12 @@ Tool_Timeout_Policy :: struct {
 // Worker is the zero value, because blocking work is what a tool is assumed to be
 // until it says otherwise: files, processes, and MCP clients belong off the owner's
 // thread. Owner is for short session-control operations that need the session's own
-// storage, such as compaction intent and result lookup. Code Mode adds its own
-// placement when the Lua executor exists.
+// storage, such as compaction intent and result lookup. Lua is an owner-driven
+// coroutine: it may suspend on child jobs without occupying a worker.
 Tool_Placement :: enum {
 	Worker,
 	Owner,
+	Lua,
 }
 
 // Tool_Definition is one tool the harness can run. The strings are owned by the
@@ -574,6 +575,7 @@ TOOL_DECLARED := [?]Tool_Definition {
 	TOOL_LOAD_SKILL_DEFINITION,
 	TOOL_COMPACT_DEFINITION,
 	TOOL_RESULT_READ_DEFINITION,
+	TOOL_CODE_DEFINITION,
 }
 
 // TOOL_NATIVE_COUNT is how many native tools a registry holds: the declared ones,

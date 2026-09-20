@@ -14,9 +14,10 @@ import l "vendor:lua/5.4"
 CODE_MODE_VALUE_MAX_NODES :: 16_384
 
 Code_Mode_Value_State :: struct {
-	allocator: mem.Allocator,
-	seen:      map[rawptr]bool,
-	nodes:     int,
+	allocator:     mem.Allocator,
+	seen:          map[rawptr]bool,
+	null_identity: rawptr,
+	nodes:         int,
 }
 
 // code_mode_lua_request_json copies the pending request's argument into one bounded
@@ -29,7 +30,8 @@ code_mode_lua_request_json :: proc(run: ^Lua_Run, allocator: mem.Allocator) -> (
 	_ = l.rawgeti(run.thread, l.REGISTRYINDEX, l.Integer(run.request.args_ref))
 	defer l.pop(run.thread, 1)
 	state := Code_Mode_Value_State {
-		allocator = allocator,
+		allocator     = allocator,
+		null_identity = rawptr(run),
 	}
 	state.seen = make(map[rawptr]bool, allocator)
 	defer delete(state.seen)
@@ -70,9 +72,14 @@ code_mode_lua_to_json_value :: proc(L: ^l.State, index: c.int, state: ^Code_Mode
 		bytes := cast([^]u8)pointer
 		text := strings.clone(string(bytes[:int(length)]), state.allocator)
 		return json.Value(json.String(text)), ""
+	case .LIGHTUSERDATA:
+		if state.null_identity != nil && l.touserdata(L, index) == state.null_identity {
+			return json.Value(json.Null(nil)), ""
+		}
+		return {}, "tool arguments may contain only JSON values"
 	case .TABLE:
 		return code_mode_lua_table_to_json(L, index, state, depth)
-	case .NONE, .LIGHTUSERDATA, .FUNCTION, .USERDATA, .THREAD:
+	case .NONE, .FUNCTION, .USERDATA, .THREAD:
 		return {}, "tool arguments may contain only JSON values"
 	}
 	return {}, "the tool arguments contain an unsupported value"
@@ -158,18 +165,19 @@ code_mode_lua_deliver_json :: proc(run: ^Lua_Run, text: string, allocator: mem.A
 	if parse_err != nil { return .Failed }
 	defer json.destroy_value(value, allocator)
 	code_mode_lua_host_enter(run)
-	ok := code_mode_json_push(run.thread, value, 0)
+	ok := code_mode_json_push(run, value, 0)
 	code_mode_lua_host_leave(run)
 	if !ok { return .Failed }
 	return code_mode_lua_deliver(run, 1)
 }
 
 @(private)
-code_mode_json_push :: proc(L: ^l.State, value: json.Value, depth: int) -> bool {
+code_mode_json_push :: proc(run: ^Lua_Run, value: json.Value, depth: int) -> bool {
+	L := run.thread
 	if depth > TOOL_MAX_ARGS_DEPTH { return false }
 	#partial switch item in value {
 	case json.Null:
-		l.pushnil(L)
+		l.pushlightuserdata(L, rawptr(run))
 	case json.Boolean:
 		l.pushboolean(L, b32(item))
 	case json.Integer:
@@ -183,7 +191,7 @@ code_mode_json_push :: proc(L: ^l.State, value: json.Value, depth: int) -> bool 
 		l.createtable(L, c.int(len(item)), 0)
 		table := l.absindex(L, -1)
 		for child, i in item {
-			if !code_mode_json_push(L, child, depth + 1) {
+			if !code_mode_json_push(run, child, depth + 1) {
 				l.pop(L, 1)
 				return false
 			}
@@ -194,7 +202,7 @@ code_mode_json_push :: proc(L: ^l.State, value: json.Value, depth: int) -> bool 
 		table := l.absindex(L, -1)
 		for key, child in item {
 			_ = l.pushlstring(L, cstring(raw_data(key)), c.size_t(len(key)))
-			if !code_mode_json_push(L, child, depth + 1) {
+			if !code_mode_json_push(run, child, depth + 1) {
 				l.pop(L, 2)
 				return false
 			}

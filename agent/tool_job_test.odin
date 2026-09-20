@@ -136,6 +136,44 @@ tool_job_test_hold_until :: proc(t: ^testing.T, count: i32) {
 
 // --- tests ---------------------------------------------------------------------
 
+@(test)
+test_code_mode_suspends_for_a_nested_tool_job :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+	tool_job_test_register(t, &test, tool_job_hold_definition("test.child", nil, tool_job_immediate_execute))
+	_test_stage_call(
+		t,
+		chat,
+		"call_code",
+		`{"code":"local first = tools[\"test.child\"]({value = 7})\nlocal second = tools[\"test.child\"]({value = 8})\nreturn first.status .. \"+\" .. second.status"}`,
+		TOOL_CODE_NAME,
+	)
+
+	jobs: Tool_Jobs
+	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
+	defer tool_jobs_destroy(&jobs)
+	tool_jobs_submit(&jobs, chat, {})
+	tool_job_test_drain(t, &test, &jobs)
+
+	testing.expect_value(t, len(jobs.jobs), 3)
+	parent := jobs.jobs[0]
+	first_child := jobs.jobs[1]
+	second_child := jobs.jobs[2]
+	testing.expect_value(t, parent.phase, Tool_Job_Phase.Retired)
+	testing.expect_value(t, first_child.phase, Tool_Job_Phase.Retired)
+	testing.expect_value(t, second_child.phase, Tool_Job_Phase.Retired)
+	testing.expect(t, first_child.parent == parent, "the first nested call should belong to the Code Mode job")
+	testing.expect(t, second_child.parent == parent, "the second nested call should belong to the Code Mode job")
+	testing.expect(t, first_child.nested && second_child.nested, "nested calls should own their staged records")
+	value, present := code_mode_lua_returned_string(parent.lua)
+	testing.expect(t, present, "the script should return the child envelope statuses")
+	testing.expect_value(t, value, "success+success")
+	testing.expect_value(t, jobs.committed, 3)
+	testing.expect_value(t, tool_jobs_committed(&jobs), 1)
+}
+
 // A worker-placed call runs on its own thread: the test thread keeps going while the
 // call is still inside the executor, and the batch is not advanced by the completion.
 @(test)
