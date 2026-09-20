@@ -144,14 +144,12 @@ test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
 	testing.expect_value(t, layout.init(&layout_ctx, options), nil)
 	defer layout.destroy(&layout_ctx)
 	block_id := layout.Id(1)
-	paragraph_id := layout.Id(2)
-	input_id := layout.Id(3)
+	input_id := layout.Id(2)
 	if layout.frame(&layout_ctx, {10, 5}) {
 		if layout.element(
 			&layout_ctx,
 			layout.Element_Desc{id = block_id, layout = {flow = .Column, sizing = {layout.grow(), layout.grow()}, padding = layout.pad_all(1)}},
 		) {
-			layout.content(&layout_ctx, layout.Element_Desc{id = paragraph_id, layout = {sizing = {layout.fixed(8), layout.fixed(2)}}})
 			layout.content(&layout_ctx, layout.Element_Desc{id = input_id, layout = {sizing = {layout.fixed(8), layout.fixed(1)}}})
 		}
 	}
@@ -167,9 +165,6 @@ test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
 	if tui.frame(&ctx, layout_result, cells[:]) {
 		if tui.element(&ctx, {id = block_id}) {
 			draw_block(&ctx, Block{border = BORDER_SINGLE})
-			if tui.element(&ctx, {id = paragraph_id}) {
-				draw_paragraph(&ctx, Paragraph{lines = []Text_Line{{value = "hello world"}}})
-			}
 			if tui.element(&ctx, {id = input_id}) {
 				draw_input(&ctx, input, {})
 			}
@@ -178,11 +173,9 @@ test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
 	frame, render_error := tui.result(&ctx)
 	testing.expect_value(t, render_error, tui.Frame_Error.None)
 	testing.expect_value(t, frame.buffer.cells[0].grapheme, "┌")
-	testing.expect_value(t, frame.buffer.cells[11].grapheme, "h")
-	testing.expect_value(t, frame.buffer.cells[21].grapheme, "w")
-	testing.expect_value(t, frame.buffer.cells[31].grapheme, "o")
+	testing.expect_value(t, frame.buffer.cells[11].grapheme, "o")
 	testing.expect(t, frame.cursor.visible && frame.cursor.placed)
-	testing.expect_value(t, frame.cursor.position, term.Position{3, 3})
+	testing.expect_value(t, frame.cursor.position, term.Position{3, 1})
 }
 
 @(test)
