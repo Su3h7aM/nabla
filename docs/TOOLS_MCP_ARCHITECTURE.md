@@ -21,7 +21,7 @@ vocabulary.
 
 The goal is one tool system with a fixed set of native tools (`shell`,
 `read`, `write`, `edit`, the skill tools, and the conversation tools
-`context.compact` and `context.read_result`) and MCP servers
+`context_compact` and `context_read_result`) and MCP servers
 as a second source of the same kind of tool. Adding a tool should mean writing one
 declaration and one procedure.
 
@@ -280,27 +280,69 @@ collapsing it into a single failure.
 
 ### Tool names
 
-Every tool has an explicit namespace. Native tools use `builtin`, such as
-`builtin.read` and `builtin.write`, except the conversation tools, which use their
-own subject: `context.compact` and `context.read_result`. MCP tools use the
-configured server id, so a `grep` tool from the `fff` server is `fff.grep`. This
-prevents native and remote tools, or tools from two servers, from colliding
-without requiring user aliases.
+Every canonical tool name is a flat Lua identifier:
 
-The harness exposes every tool returned by `tools/list`. It keeps the remote
-name exactly, including dots. Optional per-tool configuration uses the exact
-case-sensitive remote name as its key:
+```text
+[A-Za-z_][A-Za-z0-9_]{0,63}
+```
+
+An underscore joins the namespace and local name. Native examples are
+`builtin_read`, `builtin_write`, `context_compact`, and `context_read_result`.
+MCP tools use the configured server id, so a `grep` tool from `fff` is
+`fff_grep`. The registry stores exactly this spelling, provider requests borrow it
+unchanged, returned calls dispatch it unchanged, and Lua calls it naturally as
+`tools.fff_grep({...})`.
+
+This is the common subset of every boundary Nabla supports, and the narrower limit is
+chosen deliberately:
+
+- Provider function names. OpenAI's function-name schema allows 64 characters from
+`[a-zA-Z0-9_-]`; Anthropic's tool name allows 64 characters from the same set; the
+DeepSeek Harness records the same contract as a wire-protocol constant rather than
+configuration (`packages/mcp/mcp-client/src/tools.ts`, "at most 64 characters", "only
+`[A-Za-z0-9_-]`"). Dots are not in that set, which is the compatibility problem this
+convention removes. Nabla uses the 64-character bound and the same character set,
+minus hyphen.
+- Lua field syntax. `tools.name(arguments)` requires what Lua calls a name, which is a
+letter or underscore followed by letters, digits, or underscores. Hyphen is a
+subtraction operator, so `tools.fff_grep` works while `tools.fff-grep` is an
+expression.
+
+Underscore is the only useful separator of the three candidates. Dot is outside every
+provider's character set and needs `tools["..."]` in Lua. Hyphen is accepted by
+providers but not by Lua field syntax. Underscore is accepted by both, so one spelling
+serves the registry, the wire, and the script. The DeepSeek Harness reaches the same
+place from the other direction: it normalizes MCP names into `mcp__<server>__<tool>`
+with `_` substitution and a hash suffix when that replacement changes the name, and
+its own catalog names (`run_code`, `str_replace_editor`, `list_mcp_resources`,
+`web_search`, `terminal_open`) are all underscore-joined identifiers.
+
+The underscore does not need to be reversible. A definition retains its backend and,
+for MCP, its exact remote name; dispatch never recovers namespace or remote identity
+by splitting the canonical name. Registry uniqueness handles possible spelling
+collisions directly.
+
+Stored calls keep the name they ran under. A session recorded before this convention
+replays its old names verbatim, and a tool that was renamed is simply unavailable to
+it: no stored record is rewritten, because the name it ran under is part of what
+happened.
+
+The MCP remote name remains exact and case-sensitive for `tools/list`, configuration
+lookup, and `tools/call`. The default local part is the remote name only when it is
+already a valid identifier. Otherwise the definition is rejected with a refresh
+warning unless configuration supplies a valid local alias:
 
 ```lua
 tools = {
   ["issues.create"] = {name = "create_issue"},
-  ["issues.delete"] = {enabled = false},
+  ["issues-delete"] = {enabled = false},
 }
 ```
 
-`name` replaces only the local part, producing `github.create_issue` in this
-example. `enabled` defaults to true. A tool needs an entry only when the user
-wants to rename or disable it.
+The first entry produces `github_create_issue`. `enabled` defaults to true. Requiring
+an explicit alias avoids a lossy punctuation normalizer and makes collisions visible
+in configuration instead of silently rewriting two remote names to the same provider
+name.
 
 ### Retry policy
 

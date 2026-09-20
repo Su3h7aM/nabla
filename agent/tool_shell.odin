@@ -10,7 +10,7 @@ import "core:unicode/utf8"
 
 import "nabla:agent/session"
 
-TOOL_SHELL_NAME :: "builtin.shell"
+TOOL_SHELL_NAME :: "builtin_shell"
 
 // TOOL_SHELL_BODY is what the shell tool does, after the sentence that names the
 // shell it does it with.

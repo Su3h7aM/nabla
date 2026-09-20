@@ -271,7 +271,15 @@ app_tools_refresh :: proc(app: ^App) -> string {
 			if configured && !config.enabled { disabled += 1; continue }
 			local_name := tool.name
 			if configured && config.name != "" { local_name = config.name }
-			name := fmt.tprintf("%s.%s", server.id, local_name)
+			// The remote name is exact and arbitrary; the canonical name must be a flat
+			// identifier. Punctuation is never rewritten, because two remote names could
+			// collapse into one canonical name without the user being told.
+			name := fmt.tprintf("%s_%s", server.id, local_name)
+			if !agent.tool_name_valid(name) {
+				rejected += 1
+				fmt.sbprintf(&warnings, "\n%s: %s cannot become a tool name; shorten it with a tools entry", server.id, tool.name)
+				continue
+			}
 			binding := mcp_binding_make(client, server.id, tool.name, setup.alloc)
 			definition := agent.mcp_tool_definition(name, tool, binding, agent.mcp_timeout_policy(server))
 			if add_err := agent.tool_registry_add(&registry, definition); add_err.kind != .None {

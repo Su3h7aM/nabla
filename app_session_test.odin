@@ -719,7 +719,7 @@ test_resume_replays_a_tool_call_as_a_box :: proc(t: ^testing.T) {
 			turn_no = app.setup.session.turn_no,
 			request_no = request_no,
 			created_at_ms = 2_000,
-			payload = session.Tool_Call_Entry{call_id = "call_1", name = "builtin.shell", arguments = `{"command":"ls"}`},
+			payload = session.Tool_Call_Entry{call_id = "call_1", name = "builtin_shell", arguments = `{"command":"ls"}`},
 		},
 	)
 	if !testing.expect(t, call_err == nil, "the call entry must be recorded") { return }
@@ -750,7 +750,7 @@ test_resume_replays_a_tool_call_as_a_box :: proc(t: ^testing.T) {
 		if entry.kind != .Tool { continue }
 		replayed = true
 		testing.expect_value(t, entry.tool_outcome, session.Tool_Outcome.Success)
-		testing.expect_value(t, string(entry.text[:]), "builtin.shell\nfirst\nsecond\n")
+		testing.expect_value(t, string(entry.text[:]), "builtin_shell\nfirst\nsecond\n")
 	}
 	testing.expect(t, replayed, "resuming should replay the tool call")
 }

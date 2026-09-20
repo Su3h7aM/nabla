@@ -253,7 +253,7 @@ test_tool_box_matches_the_prompt_box :: proc(t: ^testing.T) {
 	app.columns = 40
 	app.rows = 14
 	testing.expect(t, widgets.input_insert(&app.input, "prompt"))
-	snap_append(app, .Tool, "builtin.shell\nfirst line")
+	snap_append(app, .Tool, "builtin_shell\nfirst line")
 	app.run.snap.entries[0].tool_outcome = .Success
 
 	storage := frame_storage_new(context.allocator)
@@ -307,7 +307,7 @@ test_tool_box_with_tabs_keeps_the_right_border :: proc(t: ^testing.T) {
 	defer widgets.input_destroy(&app.input)
 	app.columns = 40
 	app.rows = 20
-	snap_append(app, .Tool, "builtin.read\n\tfoo[0]\nbar {\"a\": [1]}")
+	snap_append(app, .Tool, "builtin_read\n\tfoo[0]\nbar {\"a\": [1]}")
 	app.run.snap.entries[0].tool_outcome = .Success
 
 	storage := frame_storage_new(context.allocator)
@@ -441,7 +441,7 @@ test_tool_box_window_says_what_it_hides :: proc(t: ^testing.T) {
 	app.rows = 20
 	scratch: [8192]byte
 	body := tool_result_fixture(25, scratch[:])
-	snap_append(app, .Tool, fmt.tprintf("builtin.shell\n%s", body))
+	snap_append(app, .Tool, fmt.tprintf("builtin_shell\n%s", body))
 	app.run.snap.entries[0].tool_outcome = .Success
 
 	storage := frame_storage_new(context.allocator)
@@ -451,7 +451,7 @@ test_tool_box_window_says_what_it_hides :: proc(t: ^testing.T) {
 
 	// The name is on the top border, the window's ten rows are under it, and the
 	// count is on the bottom border.
-	testing.expect_value(t, conversation_row_with(storage, "builtin.shell"), 0)
+	testing.expect_value(t, conversation_row_with(storage, "builtin_shell"), 0)
 	testing.expect_value(t, conversation_row_with(storage, "line 1"), 1)
 	testing.expect_value(t, conversation_row_with(storage, "line 10"), 10)
 	testing.expect_value(t, conversation_row_with(storage, "↓ 15 more lines"), 11)
@@ -473,7 +473,7 @@ test_tool_box_window_scrolls_and_clamps :: proc(t: ^testing.T) {
 	app.rows = 20
 	scratch: [8192]byte
 	body := tool_result_fixture(25, scratch[:])
-	snap_append(app, .Tool, fmt.tprintf("builtin.shell\n%s", body))
+	snap_append(app, .Tool, fmt.tprintf("builtin_shell\n%s", body))
 	app.run.snap.entries[0].tool_outcome = .Success
 
 	storage := frame_storage_new(context.allocator)
@@ -515,7 +515,7 @@ test_tool_box_window_without_hidden_rows_has_no_label :: proc(t: ^testing.T) {
 	app.rows = 20
 	scratch: [8192]byte
 	body := tool_result_fixture(3, scratch[:])
-	snap_append(app, .Tool, fmt.tprintf("builtin.shell\n%s", body))
+	snap_append(app, .Tool, fmt.tprintf("builtin_shell\n%s", body))
 	app.run.snap.entries[0].tool_outcome = .Success
 
 	storage := frame_storage_new(context.allocator)
@@ -546,7 +546,7 @@ test_wheel_scrolls_the_tool_box_under_the_pointer :: proc(t: ^testing.T) {
 	scratch: [8192]byte
 	snap_append(app, .Notice, "notice")
 	body := tool_result_fixture(25, scratch[:])
-	snap_append(app, .Tool, fmt.tprintf("builtin.shell\n%s", body))
+	snap_append(app, .Tool, fmt.tprintf("builtin_shell\n%s", body))
 	app.run.snap.entries[1].tool_outcome = .Success
 
 	// The wheel asks the frame that is on screen, so the app's own storage is the
@@ -556,7 +556,7 @@ test_wheel_scrolls_the_tool_box_under_the_pointer :: proc(t: ^testing.T) {
 	_, frame_error := render_frame(app, app.storage)
 	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
 
-	box_row := conversation_row_with(app.storage, "builtin.shell")
+	box_row := conversation_row_with(app.storage, "builtin_shell")
 	notice_row := conversation_row_with(app.storage, "notice")
 	if !testing.expect(t, box_row >= 0 && notice_row >= 0, "both entries must be drawn") { return }
 
@@ -590,7 +590,7 @@ test_wheel_falls_through_a_tool_box_at_its_boundary :: proc(t: ^testing.T) {
 	app.rows = 20
 	scratch: [8192]byte
 	body := tool_result_fixture(25, scratch[:])
-	snap_append(app, .Tool, fmt.tprintf("builtin.shell\n%s", body))
+	snap_append(app, .Tool, fmt.tprintf("builtin_shell\n%s", body))
 	app.run.snap.entries[0].tool_outcome = .Success
 
 	app.storage = frame_storage_new(context.allocator)
@@ -602,7 +602,7 @@ test_wheel_falls_through_a_tool_box_at_its_boundary :: proc(t: ^testing.T) {
 	// before it decides who owns the report.
 	entry := &app.run.snap.entries[0]
 	testing.expect_value(t, entry.tool_scroll_max, 15)
-	box_row := conversation_row_with(app.storage, "builtin.shell")
+	box_row := conversation_row_with(app.storage, "builtin_shell")
 	box_column := frame_glyph_column(app.storage, box_row, "╭")
 	report := input.Mouse_Event {
 		button = .Wheel_Up,

@@ -189,8 +189,8 @@ Tool_Registry_Error :: struct {
 	detail: string,
 }
 
-// TOOL_MAX_NAME_BYTES bounds a qualified tool name, including its namespace.
-TOOL_MAX_NAME_BYTES :: 128
+// TOOL_MAX_NAME_BYTES is the common provider limit for a function name.
+TOOL_MAX_NAME_BYTES :: 64
 
 // TOOL_MAX_DESCRIPTION_BYTES bounds a tool description. Descriptions travel
 // with every request, so an unbounded one would tax the cacheable prefix.
@@ -200,31 +200,19 @@ TOOL_MAX_DESCRIPTION_BYTES :: 4096
 // argument budget so a schema can never admit what arguments cannot carry.
 TOOL_MAX_SCHEMA_BYTES :: 64 * 1024
 
-// tool_local_name_valid accepts one namespace or local-name component.
-tool_local_name_valid :: proc(name: string) -> bool {
-	if name == "" { return false }
-	for i in 0 ..< len(name) {
+// tool_name_valid admits one canonical tool name: a flat Lua identifier of at most
+// 64 bytes. The same grammar is accepted by the provider APIs Nabla supports, so the
+// registry name is used verbatim on the wire and inside Lua.
+tool_name_valid :: proc(name: string) -> bool {
+	if name == "" || len(name) > TOOL_MAX_NAME_BYTES { return false }
+	first := name[0]
+	if !(first >= 'a' && first <= 'z' || first >= 'A' && first <= 'Z' || first == '_') { return false }
+	for i in 1 ..< len(name) {
 		c := name[i]
-		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' { continue }
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' { continue }
 		return false
 	}
 	return true
-}
-
-// tool_name_valid requires a namespace before the first dot. MCP local names may
-// contain further dots, while every component uses the portable character set.
-tool_name_valid :: proc(name: string) -> bool {
-	if name == "" || len(name) > TOOL_MAX_NAME_BYTES { return false }
-	separator := strings.index_byte(name, '.')
-	if separator <= 0 || separator == len(name) - 1 { return false }
-	if !tool_local_name_valid(name[:separator]) { return false }
-	component_start := separator + 1
-	for i in component_start ..< len(name) {
-		if name[i] != '.' { continue }
-		if !tool_local_name_valid(name[component_start:i]) { return false }
-		component_start = i + 1
-	}
-	return tool_local_name_valid(name[component_start:])
 }
 
 // tool_definition_validate checks a definition before it is copied into a
@@ -236,7 +224,7 @@ tool_definition_validate :: proc(definition: Tool_Definition) -> Tool_Registry_E
 		return {
 			kind = .Invalid_Name,
 			tool = definition.name,
-			detail = "a name must be namespace.local-name using letters, digits, underscore, or hyphen, at most 128 bytes",
+			detail = "a name must be a Lua identifier using letters, digits, and underscore, beginning with a letter or underscore, at most 64 bytes",
 		}
 	}
 	if definition.description == "" {
@@ -348,11 +336,11 @@ TOOL_RESULT_REPLACED_MALFORMED :: "the tool returned a result the harness could 
 // TOOL_RESULT_READ_NAME is the tool that reads a result back. It is named here, beside
 // the handle that tells the model to call it, because the tool and the handle are one
 // contract.
-TOOL_RESULT_READ_NAME :: "context.read_result"
+TOOL_RESULT_READ_NAME :: "context_read_result"
 
 // TOOL_RESULT_SPILLED_MESSAGE is what a handle says instead of the output. Every
 // handle says the same thing, so a spilled result is always explained the same way.
-TOOL_RESULT_SPILLED_MESSAGE :: "the observed output did not fit this context and was kept in the session; read it with context.read_result"
+TOOL_RESULT_SPILLED_MESSAGE :: "the observed output did not fit this context and was kept in the session; read it with context_read_result"
 
 // TOOL_RESULT_HANDLE_TOKENS is what one handle costs the model's context. A handle is
 // a fixed envelope carrying a sequence number and a byte count, so every handle costs

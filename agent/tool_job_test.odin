@@ -142,12 +142,12 @@ test_code_mode_suspends_for_a_nested_tool_job :: proc(t: ^testing.T) {
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.child", nil, tool_job_immediate_execute))
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_child", nil, tool_job_immediate_execute))
 	_test_stage_call(
 		t,
 		chat,
 		"call_code",
-		`{"code":"local first = tools[\"test.child\"]({value = 7})\nlocal second = tools[\"test.child\"]({value = 8})\nreturn first.status .. \"+\" .. second.status"}`,
+		`{"code":"local first = tools.test_child({value = 7})\nlocal second = tools.test_child({value = 8})\nreturn first.status .. \"+\" .. second.status"}`,
 		TOOL_CODE_NAME,
 	)
 
@@ -183,8 +183,8 @@ test_a_worker_placed_call_runs_on_another_thread :: proc(t: ^testing.T) {
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.hold"))
-	_test_stage_call(t, chat, "call_hold", `{}`, "test.hold")
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_hold"))
+	_test_stage_call(t, chat, "call_hold", `{}`, "test_hold")
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
@@ -213,10 +213,10 @@ test_native_calls_share_one_lane :: proc(t: ^testing.T) {
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.first"))
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.second"))
-	_test_stage_call(t, chat, "call_first", `{}`, "test.first")
-	_test_stage_call(t, chat, "call_second", `{}`, "test.second")
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_first"))
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_second"))
+	_test_stage_call(t, chat, "call_first", `{}`, "test_first")
+	_test_stage_call(t, chat, "call_second", `{}`, "test_second")
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
@@ -246,10 +246,10 @@ test_calls_to_different_backends_overlap :: proc(t: ^testing.T) {
 	chat := &test.fixture.chat
 	first_backend: u8
 	second_backend: u8
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.first", &first_backend))
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.second", &second_backend))
-	_test_stage_call(t, chat, "call_first", `{}`, "test.first")
-	_test_stage_call(t, chat, "call_second", `{}`, "test.second")
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_first", &first_backend))
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_second", &second_backend))
+	_test_stage_call(t, chat, "call_first", `{}`, "test_first")
+	_test_stage_call(t, chat, "call_second", `{}`, "test_second")
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
@@ -279,7 +279,7 @@ test_running_calls_are_bounded :: proc(t: ^testing.T) {
 	chat := &test.fixture.chat
 	// One lane each, so nothing but the worker bound can hold a call back.
 	lanes: [TOOL_JOBS_MAX_ACTIVE + 1]u8
-	names := [TOOL_JOBS_MAX_ACTIVE + 1]string{"test.one", "test.two", "test.three", "test.four", "test.five"}
+	names := [TOOL_JOBS_MAX_ACTIVE + 1]string{"test_one", "test_two", "test_three", "test_four", "test_five"}
 	for name, index in names {
 		tool_job_test_register(t, &test, tool_job_hold_definition(name, &lanes[index]))
 		_test_stage_call(t, chat, name, `{}`, name)
@@ -319,10 +319,10 @@ test_a_stopped_turn_still_answers_every_call :: proc(t: ^testing.T) {
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.running"))
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.queued"))
-	_test_stage_call(t, chat, "call_running", `{}`, "test.running")
-	_test_stage_call(t, chat, "call_queued", `{}`, "test.queued")
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_running"))
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_queued"))
+	_test_stage_call(t, chat, "call_running", `{}`, "test_running")
+	_test_stage_call(t, chat, "call_queued", `{}`, "test_queued")
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
@@ -365,15 +365,15 @@ test_an_owner_placed_call_takes_no_worker_slot :: proc(t: ^testing.T) {
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
 	lanes: [TOOL_JOBS_MAX_ACTIVE]u8
-	names := [TOOL_JOBS_MAX_ACTIVE]string{"test.one", "test.two", "test.three", "test.four"}
+	names := [TOOL_JOBS_MAX_ACTIVE]string{"test_one", "test_two", "test_three", "test_four"}
 	for name, index in names {
 		tool_job_test_register(t, &test, tool_job_hold_definition(name, &lanes[index]))
 		_test_stage_call(t, chat, name, `{}`, name)
 	}
-	owner_tool := tool_job_hold_definition("test.control", nil, tool_job_immediate_execute)
+	owner_tool := tool_job_hold_definition("test_control", nil, tool_job_immediate_execute)
 	owner_tool.placement = .Owner
 	tool_job_test_register(t, &test, owner_tool)
-	_test_stage_call(t, chat, "call_control", `{}`, "test.control")
+	_test_stage_call(t, chat, "call_control", `{}`, "test_control")
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
@@ -416,10 +416,10 @@ test_a_settled_batch_releases_every_thread_and_byte :: proc(t: ^testing.T) {
 
 	first_backend: u8
 	second_backend: u8
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.first", &first_backend))
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.second", &second_backend))
-	_test_stage_call(t, chat, "call_first", `{"path":"a"}`, "test.first")
-	_test_stage_call(t, chat, "call_second", `{"path":"b"}`, "test.second")
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_first", &first_backend))
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_second", &second_backend))
+	_test_stage_call(t, chat, "call_first", `{"path":"a"}`, "test_first")
+	_test_stage_call(t, chat, "call_second", `{"path":"b"}`, "test_second")
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), mem.tracking_allocator(&tracker))
@@ -449,8 +449,8 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.owned"))
-	_test_stage_call(t, chat, "call_owned", `{}`, "test.owned")
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_owned"))
+	_test_stage_call(t, chat, "call_owned", `{}`, "test_owned")
 
 	first := chat_session_advance(chat)
 	defer chat_effect_destroy(&first)
@@ -507,8 +507,8 @@ test_cancelling_chat_drains_session_owned_jobs :: proc(t: ^testing.T) {
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test.cancel"))
-	_test_stage_call(t, chat, "call_cancel", `{}`, "test.cancel")
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_cancel"))
+	_test_stage_call(t, chat, "call_cancel", `{}`, "test_cancel")
 	chat_tool_jobs_begin(chat, {})
 
 	dispatch := chat_session_advance(chat)

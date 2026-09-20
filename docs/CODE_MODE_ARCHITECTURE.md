@@ -17,7 +17,7 @@ Nothing here changes the implemented behavior until the corresponding work lands
 
 ## 1. Decision
 
-Add `builtin.code`, which executes a Lua 5.4 chunk in a fresh, restricted state.
+Add `builtin_code`, which executes a Lua 5.4 chunk in a fresh, restricted state.
 Scripts compose existing native and MCP tools, inspect intermediate results, and
 return only the information the model needs.
 
@@ -144,13 +144,13 @@ blocking native code. Section 13 defines the actual termination guarantees.
 Register one model tool:
 
 ```text
-builtin.code({ code: string })
+builtin_code({ code: string })
 ```
 
 The input is a Lua chunk, not a file, Markdown fence, or named function.
 
 ```lua
-local result = tools["builtin.read"]({ path = "README.md", limit = 100 })
+local result = tools.builtin_read({ path = "README.md", limit = 100 })
 if result.status ~= "success" then
     return result
 end
@@ -169,18 +169,22 @@ The chunk returns zero or one value. No return becomes JSON null. Multiple retur
 values fail explicitly. Script globals live only until this invocation retires.
 Effects already performed by tools survive script failure. There is no rollback.
 
-Use exact registry names as flat string keys. Do not normalize punctuation or split
-names into namespaces. `tools["server.issues.create"]` is unambiguous even when a
-remote name contains dots or hyphens. Do not copy JavaScript prototype-key filtering:
-a string such as `__proto__` is an ordinary JSON object key in this boundary.
+Canonical names are flat Lua identifiers, so wrappers use ordinary field syntax:
+`tools.fff_grep({...})` and `tools.github_create_issue({...})`. The underscore between
+namespace and local name is part of the one canonical provider name, not a hierarchy
+the runtime later parses. MCP bindings retain the exact remote name separately. A
+remote name containing dots, hyphens, or other punctuation needs an explicit valid
+local alias before it enters the registry. No lossy Lua-side normalization occurs.
+A string such as `__proto__` remains an ordinary JSON object key at the value
+boundary; JavaScript prototype filtering does not apply.
 
 ### 4.2 Explicit concurrency
 
 Expose only the operations needed to compose independent tool calls:
 
 ```lua
-local first = tasks.start("builtin.read", { path = "README.md" })
-local second = tasks.start("builtin.read", { path = "AGENTS.md" })
+local first = tasks.start("builtin_read", { path = "README.md" })
+local second = tasks.start("builtin_read", { path = "AGENTS.md" })
 
 local a = tasks.await(first)
 local b = tasks.await(second)
@@ -215,10 +219,10 @@ ownership, not a background job service.
 ### 4.3 Advertisement and visibility
 
 Introduce an opt-in Code Mode setting. With it disabled, retain direct tools. With
-it enabled, advertise `builtin.code`, `context.compact`, and `context.read_result`.
-Expose ordinary native and enabled MCP tools in Lua. Keep `context.compact`
+it enabled, advertise `builtin_code`, `context_compact`, and `context_read_result`.
+Expose ordinary native and enabled MCP tools in Lua. Keep `context_compact`
 direct-only initially because it asks for a conversation boundary; allow
-`context.read_result` through both paths.
+`context_read_result` through both paths.
 
 Keep one executable registry. Advertisement and Lua availability are filtered views,
 not duplicate registries. Enforce invocation eligibility at admission, not just in
@@ -700,7 +704,7 @@ boundary. Nested results do not consume model-context budget individually. Their
 storage is bounded by call count and per-result limits, not by hiding them behind
 model-visible spill handles.
 
-`context.read_result` may retrieve a finalized child result by call sequence. The
+`context_read_result` may retrieve a finalized child result by call sequence. The
 parent's compact call summary provides those sequences. Keep full native/MCP raw
 payload policies unchanged; a stored finalized result does not recover bytes that
 an adapter intentionally omitted or truncated.
@@ -1164,9 +1168,9 @@ object fields and array elements remain present.
 Focused tests cover nested arguments, complete result-envelope delivery, and cycle
 rejection.
 
-`builtin.code` now uses a `Lua` placement in the same session-owned job table as every
+`builtin_code` now uses a `Lua` placement in the same session-owned job table as every
 other call. Its first dispatch creates a bounded Lua run and installs wrappers for the
-session registry except `builtin.code` itself. A wrapper request records a child
+session registry except `builtin_code` itself. A wrapper request records a child
 `tool_call` with `parent_call_seq`, admits a normal child job, and moves the parent to
 `Waiting`. The waiting parent occupies no worker slot and is skipped only in favor of
 its own child, so unrelated top-level results cannot pass it. Once the child result is

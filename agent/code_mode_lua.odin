@@ -541,9 +541,9 @@ code_mode_lua_start :: proc(allocator: mem.Allocator, limits: Lua_Limits, source
 }
 
 // code_mode_lua_install_tool adds one entry to the `tools` table. The name is the
-// canonical tool name, which is what a script writes between brackets.
+// canonical tool name, which a script writes as an ordinary field: `tools.fff_grep`.
 code_mode_lua_install_tool :: proc(run: ^Lua_Run, name: string) -> bool {
-	if run == nil || run.L == nil || name == "" || len(name) > TOOL_MAX_NAME_BYTES { return false }
+	if run == nil || run.L == nil || !tool_name_valid(name) { return false }
 	if strings.index_byte(name, 0) >= 0 { return false }
 	code_mode_lua_host_enter(run)
 	defer code_mode_lua_host_leave(run)

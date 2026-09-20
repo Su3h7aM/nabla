@@ -9,18 +9,17 @@ import "core:time"
 import "nabla:agent/session"
 import "nabla:ai"
 
-// Provider function names allow underscores but not dots. The registry keeps
-// qualified names, while each request carries the provider-safe spelling and
-// the frozen registry restores returned calls before dispatch.
+// Canonical names already satisfy the common provider grammar, so request assembly
+// borrows them unchanged and dispatch performs no reverse mapping.
 @(test)
-test_build_request_normalizes_tool_names :: proc(t: ^testing.T) {
+test_build_request_uses_canonical_tool_names_directly :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
 	definition := Tool_Definition {
-		name         = "FFF.find_files",
+		name         = "FFF_find_files",
 		description  = "Find files.",
 		input_schema = `{"type":"object"}`,
 		execute      = tool_test_dummy_execute,
@@ -36,14 +35,8 @@ test_build_request_normalizes_tool_names :: proc(t: ^testing.T) {
 	found_mcp := false
 	for tool in prep.request.Tools {
 		testing.expect(t, !strings.contains(tool.Name, "."), "provider tool names must not contain dots")
-		if tool.Name == "builtin_edit" {
-			found_builtin = true
-			testing.expect_value(t, chat_tool_canonical_name(&chat.tools, tool.Name), "builtin.edit")
-		}
-		if tool.Name == "FFF_find_files" {
-			found_mcp = true
-			testing.expect_value(t, chat_tool_canonical_name(&chat.tools, tool.Name), "FFF.find_files")
-		}
+		if tool.Name == "builtin_edit" { found_builtin = true }
+		if tool.Name == "FFF_find_files" { found_mcp = true }
 	}
 	testing.expect(t, found_builtin, "built-in tools are advertised")
 	testing.expect(t, found_mcp, "MCP tools are advertised")
@@ -688,7 +681,7 @@ test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
 	// The registry changes after preparation, the way a between-turn refresh
 	// could. The record must still describe what was sent.
 	rogue := Tool_Definition {
-		name         = "test.rogue_tool",
+		name         = "test_rogue_tool",
 		description  = "A tool added after preparation.",
 		input_schema = `{"type":"object"}`,
 		execute      = tool_test_dummy_execute,
@@ -706,7 +699,7 @@ test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
 		if !testing.expect(t, name_ok, "every recorded tool is named") { return }
 		testing.expect(t, string(name) > previous, "the recorded inventory is in advertised order")
 		previous = string(name)
-		testing.expect(t, string(name) != "test.rogue_tool", "a later registry change is not recorded")
+		testing.expect(t, string(name) != "test_rogue_tool", "a later registry change is not recorded")
 		if string(name) == TOOL_SHELL_NAME {
 			schema, _ := entry["input_schema"].(json.String)
 			testing.expect_value(t, string(schema), TOOL_SHELL_SCHEMA)

@@ -156,7 +156,7 @@ render_instructions :: proc(files: []Agents_File, catalog: skills.Catalog, tools
 			strings.write_string(&builder, encoded)
 			if len(catalog.skills) == 0 { strings.write_string(&builder, "No skills are available.") }
 		} else {
-			strings.write_string(&builder, "\n\nAvailable skills are listed through list_skills.")
+			strings.write_string(&builder, "\n\nAvailable skills are listed through builtin_list_skills.")
 		}
 	}
 	return strings.to_string(builder)

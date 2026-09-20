@@ -19,10 +19,10 @@ code_mode_value_test_start :: proc(t: ^testing.T, source: string) -> ^Lua_Run {
 code_mode_value_converts_tool_arguments_to_json :: proc(t: ^testing.T) {
 	run := code_mode_value_test_start(
 		t,
-		`return tools["test.echo"]({path = "README.md", missing = json.null, flags = {"a", "b"}, nested = {ok = true, count = 3}})`,
+		`return tools.test_echo({path = "README.md", missing = json.null, flags = {"a", "b"}, nested = {ok = true, count = 3}})`,
 	)
 	defer code_mode_lua_destroy(run)
-	testing.expect(t, code_mode_lua_install_tool(run, "test.echo"), "the tool should install")
+	testing.expect(t, code_mode_lua_install_tool(run, "test_echo"), "the tool should install")
 	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Host_Request)
 
 	arguments, message := code_mode_lua_request_json(run, context.allocator)
@@ -40,11 +40,11 @@ code_mode_value_converts_tool_arguments_to_json :: proc(t: ^testing.T) {
 code_mode_value_delivers_a_tool_envelope_as_a_table :: proc(t: ^testing.T) {
 	run := code_mode_value_test_start(
 		t,
-		`local result = tools["test.echo"]({})
+		`local result = tools.test_echo({})
 return result.status .. ":" .. result.data.text .. ":" .. tostring(result.data.items[2]) .. ":" .. tostring(result.data.none == json.null)`,
 	)
 	defer code_mode_lua_destroy(run)
-	testing.expect(t, code_mode_lua_install_tool(run, "test.echo"), "the tool should install")
+	testing.expect(t, code_mode_lua_install_tool(run, "test_echo"), "the tool should install")
 	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Host_Request)
 
 	event := code_mode_lua_deliver_json(run, `{"status":"success","message":"","data":{"text":"done","items":[1,2,3],"none":null}}`, context.allocator)
@@ -59,9 +59,9 @@ return result.status .. ":" .. result.data.text .. ":" .. tostring(result.data.i
 code_mode_value_rejects_cycles :: proc(t: ^testing.T) {
 	run := code_mode_value_test_start(t, `local value = {}
 value.self = value
-return tools["test.echo"](value)`)
+return tools.test_echo(value)`)
 	defer code_mode_lua_destroy(run)
-	testing.expect(t, code_mode_lua_install_tool(run, "test.echo"), "the tool should install")
+	testing.expect(t, code_mode_lua_install_tool(run, "test_echo"), "the tool should install")
 	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Host_Request)
 
 	arguments, message := code_mode_lua_request_json(run, context.allocator)

@@ -2,8 +2,8 @@ package agent
 
 import "core:encoding/json"
 
-TOOL_CODE_NAME :: "builtin.code"
-TOOL_CODE_DESCRIPTION :: "Execute bounded Lua code that can call the available tools through the tools table. Tool calls suspend the script and return their complete JSON result envelope as a Lua table. Use json.null for JSON null because Lua nil means absence."
+TOOL_CODE_NAME :: "builtin_code"
+TOOL_CODE_DESCRIPTION :: "Execute bounded Lua 5.4 code. Call an available tool through the tools table by its name, for example tools.builtin_read({path = 'README.md'}). Each call suspends the script until the tool finishes and returns its complete JSON result envelope as a Lua table. Use json.null for JSON null, because Lua nil means absence."
 TOOL_CODE_SCHEMA :: `{"type":"object","properties":{"code":{"type":"string","description":"Lua 5.4 source code to execute."}},"required":["code"],"additionalProperties":false}`
 
 Code_Mode_Result_Data :: struct {

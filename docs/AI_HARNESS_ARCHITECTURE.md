@@ -483,7 +483,7 @@ retrievable storage contract for §11. These additions are planned, not implemen
   Never place arbitrarily large tool output into model context. Redaction happens **before** the
   cap, so a cap cannot split a secret in half. A turn's results are bounded as a batch, so one
   large result cannot crowd out the rest; a result the batch cannot afford stays in the entry it
-  was recorded in and the model is shown a handle it can read back with `context.read_result`.
+  was recorded in and the model is shown a handle it can read back with `context_read_result`.
   See [Provider failures, retries, and context recovery](ERROR_RETRY_ARCHITECTURE.md) §8.
   Redaction before retention and a retention cap beyond one result are still open.
 - Tool definitions come from the harness's tool registry; `model.tools` from the catalog decides

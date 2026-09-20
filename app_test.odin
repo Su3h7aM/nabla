@@ -257,7 +257,7 @@ test_stopping_refuses_queued_work :: proc(t: ^testing.T) {
 test_tool_display_preview_extracts_and_decodes_shell_output :: proc(t: ^testing.T) {
 	content := `{"status":"success","message":"done","data":{"stdout":"first\nsecond\n","stderr":""}}`
 	testing.expect_value(t, tool_display_preview(content), "first\nsecond\n")
-	testing.expect_value(t, tool_entry_text("builtin.shell", content, "success"), "builtin.shell\nfirst\nsecond\n")
+	testing.expect_value(t, tool_entry_text("builtin_shell", content, "success"), "builtin_shell\nfirst\nsecond\n")
 }
 
 // A scheduled retry is what the working indicator shows, and the send that follows is what

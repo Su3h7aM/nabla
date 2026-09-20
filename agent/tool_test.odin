@@ -319,7 +319,7 @@ tool_test_dummy_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> T
 
 tool_test_valid_definition :: proc(allocator := context.allocator) -> Tool_Definition {
 	return Tool_Definition {
-		name = strings.clone("test.tool", allocator),
+		name = strings.clone("test_tool", allocator),
 		description = strings.clone("A test tool.", allocator),
 		input_schema = strings.clone(`{"type":"object"}`, allocator),
 		execute = tool_test_dummy_execute,
@@ -353,6 +353,14 @@ test_registry_rejects_invalid_definitions :: proc(t: ^testing.T) {
 		{proc(definition: ^Tool_Definition) {
 				delete(definition.name, context.allocator)
 				definition.name = strings.clone("bad..name", context.allocator)
+			}, .Invalid_Name},
+		{proc(definition: ^Tool_Definition) {
+				delete(definition.name, context.allocator)
+				definition.name = strings.clone("bad-name", context.allocator)
+			}, .Invalid_Name},
+		{proc(definition: ^Tool_Definition) {
+				delete(definition.name, context.allocator)
+				definition.name = strings.clone("9bad_name", context.allocator)
 			}, .Invalid_Name},
 		{proc(definition: ^Tool_Definition) { delete(definition.description, context.allocator); definition.description = "" }, .Missing_Description},
 		{proc(definition: ^Tool_Definition) { delete(definition.input_schema, context.allocator); definition.input_schema = "" }, .Invalid_Schema},
@@ -399,11 +407,11 @@ test_registry_rejects_invalid_definitions :: proc(t: ^testing.T) {
 	defer tool_registry_destroy(&registry)
 
 	delete(definition.name, context.allocator)
-	definition.name = strings.concatenate({"test.", strings.repeat("n", TOOL_MAX_NAME_BYTES, context.temp_allocator)}, context.allocator)
+	definition.name = strings.concatenate({"test_", strings.repeat("n", TOOL_MAX_NAME_BYTES, context.temp_allocator)}, context.allocator)
 	testing.expect_value(t, tool_registry_add(&registry, definition).kind, Tool_Registry_Error_Kind.Invalid_Name)
 
 	delete(definition.name, context.allocator)
-	definition.name = strings.clone("test.tool", context.allocator)
+	definition.name = strings.clone("test_tool", context.allocator)
 	delete(definition.description, context.allocator)
 	definition.description = strings.repeat("d", TOOL_MAX_DESCRIPTION_BYTES + 1, context.allocator)
 	testing.expect_value(t, tool_registry_add(&registry, definition).kind, Tool_Registry_Error_Kind.Missing_Description)
@@ -417,6 +425,23 @@ test_registry_rejects_invalid_definitions :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, tool_registry_add(&registry, definition).kind, Tool_Registry_Error_Kind.Invalid_Schema)
 	testing.expect_value(t, len(registry.definitions), 0)
+}
+
+// The canonical grammar is the narrowest of every boundary a name crosses: a Lua field
+// identifier that OpenAI-compatible and Anthropic APIs also accept, inside the 64-byte
+// provider limit. Everything outside it needs no round trip to be refused.
+@(test)
+test_canonical_name_grammar :: proc(t: ^testing.T) {
+	valid := []string{"builtin_read", "fff_grep", "github_create_issue", "a", "_", "A9_z"}
+	for name in valid { testing.expectf(t, tool_name_valid(name), "%q should be a valid tool name", name) }
+
+	invalid := []string{"", "builtin.read", "fff-grep", "builtin read", "9lives", "\u00e9cho", "a.b-c"}
+	for name in invalid { testing.expectf(t, !tool_name_valid(name), "%q should not be a valid tool name", name) }
+
+	under_limit := strings.repeat("n", TOOL_MAX_NAME_BYTES, context.temp_allocator)
+	over_limit := strings.repeat("n", TOOL_MAX_NAME_BYTES + 1, context.temp_allocator)
+	testing.expect(t, tool_name_valid(under_limit), "a name at the provider limit is admitted")
+	testing.expect(t, !tool_name_valid(over_limit), "a name past the provider limit is refused")
 }
 
 // A collision is a configuration error, never a silent replacement. The first
@@ -445,9 +470,9 @@ test_registry_refuses_name_collisions :: proc(t: ^testing.T) {
 		return
 	}
 	tool_test_definition_destroy(&definition, context.allocator)
-	stored, found := tool_registry_find(&registry, "test.tool")
+	stored, found := tool_registry_find(&registry, "test_tool")
 	if !testing.expect(t, found, "the stored definition survives its source") { return }
-	testing.expect_value(t, stored.name, "test.tool")
+	testing.expect_value(t, stored.name, "test_tool")
 	testing.expect_value(t, stored.description, "A test tool.")
 	testing.expect_value(t, stored.input_schema, `{"type":"object"}`)
 
@@ -455,11 +480,11 @@ test_registry_refuses_name_collisions :: proc(t: ^testing.T) {
 	marker: u8 = 13
 	bound := tool_test_valid_definition(context.allocator)
 	delete(bound.name, context.allocator)
-	bound.name = strings.clone("test.bound_tool", context.allocator)
+	bound.name = strings.clone("test_bound_tool", context.allocator)
 	bound.backend = &marker
 	defer tool_test_definition_destroy(&bound, context.allocator)
 	if !testing.expect_value(t, tool_registry_add(&registry, bound).kind, Tool_Registry_Error_Kind.None) { return }
-	found_definition, bound_found := tool_registry_find(&registry, "test.bound_tool")
+	found_definition, bound_found := tool_registry_find(&registry, "test_bound_tool")
 	if !testing.expect(t, bound_found, "the bound definition is registered") { return }
 	testing.expect(t, found_definition.backend == &marker, "the backend binding is preserved")
 }
@@ -703,7 +728,7 @@ test_replace_tools_swaps_only_while_idle :: proc(t: ^testing.T) {
 		return
 	}
 	extra := Tool_Definition {
-		name         = strings.clone("test.extra_tool", context.allocator),
+		name         = strings.clone("test_extra_tool", context.allocator),
 		description  = strings.clone("An extra tool.", context.allocator),
 		input_schema = strings.clone(`{"type":"object"}`, context.allocator),
 		execute      = tool_test_dummy_execute,
@@ -717,7 +742,7 @@ test_replace_tools_swaps_only_while_idle :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, chat_session_replace_tools(chat, &replacement), Tool_Registry_Replace_Error.None)
 	testing.expect_value(t, len(chat.tools.definitions), TOOL_NATIVE_COUNT + 1)
-	_, found := tool_registry_find(&chat.tools, "test.extra_tool")
+	_, found := tool_registry_find(&chat.tools, "test_extra_tool")
 	testing.expect(t, found, "the replacement registry is installed")
 
 	// A turn is in flight, so the registry is frozen: the swap is refused and
@@ -730,7 +755,7 @@ test_replace_tools_swaps_only_while_idle :: proc(t: ^testing.T) {
 	}
 	defer tool_registry_destroy(&second)
 	testing.expect_value(t, chat_session_replace_tools(chat, &second), Tool_Registry_Replace_Error.Busy)
-	_, still_there := tool_registry_find(&chat.tools, "test.extra_tool")
+	_, still_there := tool_registry_find(&chat.tools, "test_extra_tool")
 	testing.expect(t, still_there, "a busy session keeps its registry")
 }
 

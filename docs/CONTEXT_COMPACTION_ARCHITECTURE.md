@@ -32,7 +32,7 @@ summarized; every later entry survives in order.
 
 - No foreground path waits for summarization, retries it inline, or joins a running thread.
   There is no `Compacting` member of `Chat_State`.
-- Pressure, `context.compact`, and `/compact` record the same intent and meet at
+- Pressure, `context_compact`, and `/compact` record the same intent and meet at
   `compact_request_intent`.
 - Compaction changes model-visible context only. The transcript is append-only, and turn, request,
   and session identity are untouched.
@@ -364,7 +364,7 @@ These were considered and are not built. Each is additive; none changes the cont
 - **Aggregate tool-result admission and spill.** Built, and described in
   [Error and retry architecture, §8](ERROR_RETRY_ARCHITECTURE.md#8-aggregate-tool-result-admission-and-spill):
   a turn's results are bounded as a batch, and a result the batch cannot afford stays in the
-  record while the model is shown a handle it can read back with `context.read_result`. Retention
+  record while the model is shown a handle it can read back with `context_read_result`. Retention
   beyond one result's cap, and a cap across a session, remain.
 - **Cache breakpoint control.** `Provider_Message.Cache_Breakpoint` is unused; only Anthropic's
   automatic breakpoint is exercised. Explicit breakpoints would limit lookback and cache-write
@@ -388,7 +388,7 @@ lifecycle:
   the next request is asserted to open with the checkpoint and cost less than the one it replaced.
 - A failed summary leaves no checkpoint, keeps every entry, and closes its request as failed.
 - Destroying a session while a summary is in flight stops the worker.
-- `context.compact` is advertised, records its intent, returns immediately, and leaves the job
+- `context_compact` is advertised, records its intent, returns immediately, and leaves the job
   unstarted until the next boundary.
 
 `agent/compact_test.odin` covers the seam and the request projection; `agent/session/context_test.odin`

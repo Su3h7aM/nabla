@@ -11,7 +11,7 @@ import "core:time"
 
 // --- read --------------------------------------------------------------------
 
-TOOL_READ_NAME :: "builtin.read"
+TOOL_READ_NAME :: "builtin_read"
 
 TOOL_READ_DESCRIPTION :: "Read a text file. Relative paths start at the session workspace, and absolute paths are used as given. Returns the requested lines together with the line range they came from and the file's total line count, so a long file can be read in parts."
 
@@ -172,7 +172,7 @@ tool_line_span :: proc(text: string, start, limit: int) -> (end: int, lines: int
 
 // --- write -------------------------------------------------------------------
 
-TOOL_WRITE_NAME :: "builtin.write"
+TOOL_WRITE_NAME :: "builtin_write"
 
 TOOL_WRITE_DESCRIPTION :: "Write a text file, replacing whatever it held. Relative paths start at the session workspace, and absolute paths are used as given. The write is atomic: a reader sees either the old file or the whole new one. The parent directory must already exist."
 
@@ -341,7 +341,7 @@ tool_write_atomic :: proc(
 
 // --- edit --------------------------------------------------------------------
 
-TOOL_EDIT_NAME :: "builtin.edit"
+TOOL_EDIT_NAME :: "builtin_edit"
 
 TOOL_EDIT_DESCRIPTION :: "Replace exact text in a file. Relative paths start at the session workspace, and absolute paths are used as given. Each replacement's old text must appear in the file exactly once, and no two replacements may overlap. All of them are applied in one write or none is."
 

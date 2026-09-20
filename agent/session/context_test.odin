@@ -481,7 +481,7 @@ test_context_omits_child_tool_records :: proc(t: ^testing.T) {
 	parent, parent_err := entry_append(
 		&store,
 		session.id,
-		{turn_no = turn, request_no = request, created_at_ms = 2_200, payload = Tool_Call_Entry{call_id = "code_1", name = "builtin.code", arguments = "{}"}},
+		{turn_no = turn, request_no = request, created_at_ms = 2_200, payload = Tool_Call_Entry{call_id = "code_1", name = "builtin_code", arguments = "{}"}},
 	)
 	_expect_ok(t, parent_err)
 	_, parent_dispatch_err := entry_append(
@@ -492,7 +492,7 @@ test_context_omits_child_tool_records :: proc(t: ^testing.T) {
 			request_no = request,
 			created_at_ms = 2_210,
 			related_seq = parent,
-			payload = Tool_Dispatch_Entry{tool = "builtin.code", arguments = "{}"},
+			payload = Tool_Dispatch_Entry{tool = "builtin_code", arguments = "{}"},
 		},
 	)
 	_expect_ok(t, parent_dispatch_err)
@@ -504,7 +504,7 @@ test_context_omits_child_tool_records :: proc(t: ^testing.T) {
 			request_no = request,
 			created_at_ms = 2_220,
 			parent_call_seq = parent,
-			payload = Tool_Call_Entry{call_id = "code_1/1", name = "builtin.read", arguments = "{}"},
+			payload = Tool_Call_Entry{call_id = "code_1/1", name = "builtin_read", arguments = "{}"},
 		},
 	)
 	_expect_ok(t, child_err)
@@ -516,7 +516,7 @@ test_context_omits_child_tool_records :: proc(t: ^testing.T) {
 			request_no = request,
 			created_at_ms = 2_230,
 			related_seq = child,
-			payload = Tool_Dispatch_Entry{tool = "builtin.read", arguments = "{}"},
+			payload = Tool_Dispatch_Entry{tool = "builtin_read", arguments = "{}"},
 		},
 	)
 	_expect_ok(t, child_dispatch_err)
@@ -578,7 +578,7 @@ test_child_call_requires_a_parent_in_the_same_turn :: proc(t: ^testing.T) {
 	parent, parent_err := entry_append(
 		&store,
 		session.id,
-		{turn_no = first_turn, created_at_ms = 2_100, payload = Tool_Call_Entry{call_id = "parent", name = "builtin.code", arguments = "{}"}},
+		{turn_no = first_turn, created_at_ms = 2_100, payload = Tool_Call_Entry{call_id = "parent", name = "builtin_code", arguments = "{}"}},
 	)
 	_expect_ok(t, parent_err)
 	_expect_ok(t, turn_finish(&store, session.id, first_turn, .Completed, "", 2_200))
@@ -592,7 +592,7 @@ test_child_call_requires_a_parent_in_the_same_turn :: proc(t: ^testing.T) {
 			turn_no = second_turn,
 			created_at_ms = 3_100,
 			parent_call_seq = parent,
-			payload = Tool_Call_Entry{call_id = "child", name = "builtin.read", arguments = "{}"},
+			payload = Tool_Call_Entry{call_id = "child", name = "builtin_read", arguments = "{}"},
 		},
 	)
 	testing.expect_value(t, error_kind(child_err), Error_Kind.Invalid_Argument)

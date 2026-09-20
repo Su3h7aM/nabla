@@ -110,6 +110,8 @@ test_mcp_config_refuses_what_it_cannot_run :: proc(t: ^testing.T) {
 		`return { mcp = { servers = { ["bad server"] = { executable = "/usr/bin/x" } } } }`,
 		`return { mcp = { servers = { s = { executable = "/usr/bin/x", tools = {a = false} } } } }`,
 		`return { mcp = { servers = { s = { executable = "/usr/bin/x", tools = {a = {name = "bad name"}} } } } }`,
+		`return { mcp = { servers = { s = { executable = "/usr/bin/x", tools = {a = {name = "bad.name"}} } } } }`,
+		`return { mcp = { servers = { s = { executable = "/usr/bin/x", tools = {a = {name = "bad-name"}} } } } }`,
 		`return { mcp = { servers = { s = { executable = "/usr/bin/x", tools = {a = {enabled = false, name = "b"}} } } } }`,
 		`return { mcp = { servers = { s = { executable = "/usr/bin/x", environment = {[" A"] = "b"} } } } }`,
 		`return { mcp = { servers = { s = { executable = "/usr/bin/x", environment = {A = 1} } } } }`,

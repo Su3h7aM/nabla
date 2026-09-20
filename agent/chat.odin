@@ -93,18 +93,7 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 		} else if value.Reason == .Tool_Call && len(value.Tool_Calls) > 0 {
 			calls := make([dynamic]ai.Provider_Tool_Call, 0, len(value.Tool_Calls), context.temp_allocator)
 			defer delete(calls)
-			for call in value.Tool_Calls {
-				wire_call := call
-				wire_call.Name = chat_tool_canonical_name(&runtime.chat.tools, wire_call.Name)
-				// The name the model sent and the name the harness resolved it to are
-				// two different facts, and a mismatch is what a rejected tool name
-				// looks like from here.
-				resolved: Log_Binding
-				context.logger = log_rebind(&resolved, log_correlation_for_call(runtime.chat, call.ID))
-				fields := [2]Log_Field{{key = "wire_name", value = call.Name}, {key = "tool", value = wire_call.Name}}
-				log_emit({level = .Info, category = .Tool, event = "tool.name_resolved", fields = fields[:]})
-				append(&calls, wire_call)
-			}
+			for call in value.Tool_Calls { append(&calls, call) }
 			notice := chat_session_feed_tool_calls(runtime.chat, runtime.source, calls[:])
 			if notice != .None && notice != .Ignored {
 				// The response proposed calls the harness cannot use. Executing

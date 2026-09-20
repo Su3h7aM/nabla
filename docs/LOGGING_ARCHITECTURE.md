@@ -598,8 +598,7 @@ Minimum event contracts:
 | `provider.encoded` | Info | body length and digest, api, model, tool count |
 | `request.finished` | Info or Error | committed outcome, attempts, finish reason; failed requests use Error; failed persistence is recorded once as `storage.failed` |
 | `tools.refresh_started`, `tools.refresh_finished` | Info | generation, discovery/admission counts, unavailable servers, installed flag, duration |
-| `tool.binding` | Debug | candidate generation, remote and canonical names; refresh result establishes installation |
-| `tool.name_resolved` | Info | the name the model sent and the name the harness resolved it to |
+| `tool.binding` | Debug | candidate generation, exact remote name, and canonical provider/Lua name; refresh result establishes installation |
 | `tool.call_received` | Info | the canonical tool name and the argument byte count |
 | `tool.arguments_prepared` | Debug | admission status, repair classification, effective byte count |
 | `tool.dispatch_committed`, `tool.result_committed` | Info | the entry sequence the dispatch and the result were stored as, and the outcome |
@@ -1395,8 +1394,9 @@ with its coverage, status, and failure kind. The bounded excerpt already reaches
 caller through `Failure.detail`. What the log cannot establish is how a gateway routed a
 model it received; it records which model it sent and when.
 
-**A rejected tool name.** Compare the name in `tool.call_received` with the wire and
-canonical names in `tool.name_resolved` and the candidate `tool.binding` inventory.
+**A rejected tool name.** Compare the name in `tool.call_received` with the canonical
+names in the candidate `tool.binding` inventory. Canonical names are sent to providers
+and returned unchanged, so there is no wire-name normalization layer to inspect.
 `provider.encoded` supplies a tool count and body digest, not the full encoded inventory.
 Exact wire definitions require an opted-in capture. Inspect native Responses replay
 separately from projected historical calls. Do not claim a count alone proves which tool
@@ -1505,8 +1505,7 @@ failure to verify no leaked paths or deleted live runs. Run `mise run test agent
 `agent/log_bridge.odin` holds the scope a record is emitted against and the log's names
 for the enums other packages define. The request lifecycle is recorded from
 `agent/chat.odin`: `request.prepared`, `request.recorded`, `attempt.started`,
-`attempt.finished`, `request.retry`, `request.finished`, and `tool.name_resolved` where
-the name the model sent becomes the name the harness resolves. `agent/chat_session.odin`
+`attempt.finished`, `request.retry`, and `request.finished`. `agent/chat_session.odin`
 records `turn.started`, `turn.finished`, `agent.event_ignored`, and `storage.failed` at
 the single place a durable write failure lands. `agent/chat_tools.odin` records a tool call
 from `tool.call_received` through `tool.dispatch_committed`, `tool.execution_started`, and
@@ -1574,10 +1573,11 @@ and `MCP_Incoming` captures. Delivery still comes from `mcp.Error.delivery`, the
 remains the one `agent` chose, and `tools/call` is never automatically retried. Raw stderr
 capture is rejected and its unused capture kind is removed.
 
-Tests: a remote name containing underscores and dots; a renamed local alias; a disabled
+Tests: a remote name that is already an identifier; a remote name that needs a configured
+alias; a renamed local alias; a disabled
 discovery entry; a server restart; a malformed reply; a timeout after send; stderr
-containing a newline and a secret; an unavailable tool. Assert that the encoded remote name,
-the wire name, and the canonical name appear only in the fields that mean them. Run
+containing a newline and a secret; an unavailable tool. Assert that the remote name, the
+canonical name, and the Lua table key appear only in the fields that mean them. Run
 `mise run test mcp`, `mise run test agent`, and `mise run test .`.
 
 ### Phase 6: reading and export

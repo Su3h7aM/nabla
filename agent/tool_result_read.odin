@@ -6,7 +6,7 @@ import "core:unicode/utf8"
 
 import "nabla:agent/session"
 
-// context.read_result reads back a tool result the model was shown only a handle
+// context_read_result reads back a tool result the model was shown only a handle
 // for. A result is kept when the turn's results as a whole did not fit the room the
 // context had left, and it stays in the record in full, so this is the only way the
 // model sees that output. It never changes the record, and it answers the same bytes

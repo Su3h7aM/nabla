@@ -319,7 +319,9 @@ lua_install_refuses_a_bad_name :: proc(t: ^testing.T) {
 	testing.expect(t, !code_mode_lua_install_tool(run, "alpha\x00beta"), "a name with a NUL should be refused")
 	long_name := strings.repeat("a", TOOL_MAX_NAME_BYTES + 1, context.temp_allocator)
 	testing.expect(t, !code_mode_lua_install_tool(run, long_name), "an oversized name should be refused")
-	testing.expect(t, code_mode_lua_install_tool(run, "builtin.read"), "a canonical name should install")
+	testing.expect(t, !code_mode_lua_install_tool(run, "builtin.read"), "a dotted name should be refused")
+	testing.expect(t, !code_mode_lua_install_tool(run, "builtin-read"), "a hyphenated name should be refused")
+	testing.expect(t, code_mode_lua_install_tool(run, "builtin_read"), "a canonical name should install")
 }
 
 @(test)

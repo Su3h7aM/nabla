@@ -85,7 +85,7 @@ an executed tool call, a pending tool job is not a recovery boundary, and cancel
 still defeats every recovery decision. Nothing in this document changes.
 
 The supplied study's Nabla section describes an older revision. The current code has background
-compaction and `context.compact`, but provider failures still take the older retry path.
+compaction and `context_compact`, but provider failures still take the older retry path.
 
 | Current code | Relevant behavior | Required change |
 |---|---|---|
@@ -499,10 +499,10 @@ The handle is an ordinary result envelope naming the call:
 
 ```json
 {"status":"success","message":"the observed output did not fit this context and was kept in the
-session; read it with context.read_result","data":{"call_seq":42,"bytes":48123}}
+session; read it with context_read_result","data":{"call_seq":42,"bytes":48123}}
 ```
 
-`call_seq` is the call the result answers, which is the key `context.read_result` takes.
+`call_seq` is the call the result answers, which is the key `context_read_result` takes.
 
 Reads go through `session.tool_result_read`, which selects one result entry by its call and returns
 it; the tool slices a page out of it. The window is a byte range rather than a line range, because a
@@ -662,7 +662,7 @@ is usable, rather than enabling a retry path that has not acquired durable recor
 4. ~~**Recover confirmed overflow.**~~ Done: the one-repair branch, typed context exhaustion with
    its cause, the `Provider_Overflow` trigger, pressure promotion, and idle recovery.
 5. ~~**Retain and admit tool results.**~~ Done: the batch budget, the stored result, the derived
-   handle, and `context.read_result`. See §8, including what it leaves open.
+   handle, and `context_read_result`. See §8, including what it leaves open.
 6. ~~**Apply retry policy to compaction.**~~ Done: owner-driven backoff, one-send request rows per
    attempt, suppression and cooldown, allocator isolation, and root idle servicing, with no
    foreground wait added.

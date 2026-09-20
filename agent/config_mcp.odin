@@ -108,7 +108,7 @@ mcp_servers_load :: proc(L: ^l.State, idx: c.int, allocator: mem.Allocator) -> (
 			return {}, .Invalid
 		}
 		id, id_ok := lua_string(L, -2, allocator)
-		if !id_ok || !tool_local_name_valid(id) {
+		if !id_ok || !tool_name_valid(id) {
 			delete(id, allocator)
 			mcp_servers_destroy(&servers, allocator)
 			return {}, .Invalid
@@ -334,7 +334,7 @@ mcp_tool_configs_load :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Alloca
 		lua_field(L, entry, "name")
 		if l.type(L, -1) != .NIL {
 			name, name_ok := lua_string(L, -1, allocator)
-			if !name_ok || !tool_local_name_valid(name) {
+			if !name_ok || !tool_name_valid(name) {
 				delete(name, allocator)
 				delete(remote_name, allocator)
 				l.pop(L, 2)
