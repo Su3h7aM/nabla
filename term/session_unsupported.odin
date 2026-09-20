@@ -29,3 +29,7 @@ _session_viewport :: proc(s: ^Session) -> (result: Viewport, err: Error) {
 _session_present :: proc(s: ^Session, bytes: []byte) -> (committed: int, err: Error) {
 	return 0, General_Error.Unsupported
 }
+
+_session_clipboard :: proc(s: ^Session, bytes: []byte) -> (committed: int, err: Error) {
+	return 0, General_Error.Unsupported
+}

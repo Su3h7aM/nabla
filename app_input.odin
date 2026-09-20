@@ -9,6 +9,7 @@ import "core:sync/chan"
 import "nabla:agent"
 import input "nabla:input"
 import "nabla:layout"
+import "nabla:term"
 import "nabla:tui/widgets"
 
 // --- input handling -------------------------------------------------------
@@ -153,6 +154,7 @@ command_help :: proc(app: ^App) {
 	snap_append(app, .Notice, "keys: escape interrupt | ctrl+c clear, cancel, then quit")
 	snap_append(app, .Notice, "  the wheel and page up/page down scroll the transcript")
 	snap_append(app, .Notice, "  over a tool box the wheel scrolls that box's output")
+	snap_append(app, .Notice, "  dragging over the transcript copies the rows it covers")
 }
 
 // MOUSE_WHEEL_LINES is how many rows one wheel tick scrolls.
@@ -230,6 +232,79 @@ wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 	}
 }
 
+// Cell_Point is one cell of the transcript grid, in the transcript's own
+// coordinates: the origin is the conversation rect's top-left cell.
+Cell_Point :: struct {
+	x, y: int,
+}
+
+// selection_point converts a mouse report into a transcript cell, clamped to the
+// transcript so a drag that leaves the area still selects up to its edge. The
+// report is 1-based and in screen cells; the frame is 0-based and solved in the
+// transcript's own coordinates, which is the offset conversation_rect carries.
+selection_point :: proc(app: ^App, mouse: input.Mouse_Event) -> (point: Cell_Point, inside: bool) {
+	x := mouse.x - 1 - app.conversation_rect.x
+	y := mouse.y - 1 - app.conversation_rect.y
+	inside = x >= 0 && y >= 0 && x < app.conversation_rect.width && y < app.conversation_rect.height
+	return {clamp(x, 0, max(app.conversation_rect.width - 1, 0)), clamp(y, 0, max(app.conversation_rect.height - 1, 0))}, inside
+}
+
+// selection_bounds orders the drag's two ends, so a drag in any direction
+// describes the same selection.
+selection_bounds :: proc(app: ^App) -> (start, end: Cell_Point) {
+	start, end = app.selection_anchor, app.selection_cursor
+	if end.y < start.y || (end.y == start.y && end.x < start.x) {
+		return end, start
+	}
+	return
+}
+
+// selection_mouse runs one step of a transcript drag: the press anchors it, the
+// motion extends it, and the release copies what it covers and ends it. A press
+// anywhere else only drops whatever the drag had selected.
+selection_mouse :: proc(app: ^App, mouse: input.Mouse_Event) {
+	point, inside := selection_point(app, mouse)
+	switch {
+	case mouse.motion:
+		if app.selecting { app.selection_cursor = point }
+	case mouse.release:
+		if app.selecting { selection_copy(app) }
+		app.selecting = false
+	case inside:
+		app.selecting = true
+		app.selection_anchor = point
+		app.selection_cursor = point
+	case:
+		app.selecting = false
+	}
+}
+
+// selection_copy puts the selected transcript text on the terminal's clipboard.
+// The cells are read back from the frame that is on screen, so what is copied is
+// what the selection covers rather than what the snapshot holds.
+selection_copy :: proc(app: ^App) {
+	start, end := selection_bounds(app)
+	if start == end { return }
+	text := selection_text(app, app.storage, context.temp_allocator)
+	if text == "" { return }
+	if _, copy_err := term.clipboard_set(app.terminal, text); copy_err != nil {
+		snap_append(app, .Error, fmt.tprintf("the selection could not be copied: %v", copy_err))
+		return
+	}
+	snap_append(app, .Notice, fmt.tprintf("copied %d line(s) to the clipboard", strings.count(text, "\n") + 1))
+}
+
+// handle_mouse routes a mouse report: the wheel scrolls, and the left button
+// selects text in the transcript.
+handle_mouse :: proc(app: ^App, mouse: input.Mouse_Event) {
+	#partial switch mouse.button {
+	case .Wheel_Up, .Wheel_Down, .Wheel_Left, .Wheel_Right:
+		wheel_scroll(app, mouse)
+	case .Left:
+		selection_mouse(app, mouse)
+	}
+}
+
 handle_event :: proc(app: ^App, event: input.Event) {
 	#partial switch data in event {
 	case input.Key_Event:
@@ -240,7 +315,7 @@ handle_event :: proc(app: ^App, event: input.Event) {
 		}
 	case input.Mouse_Event:
 		if !app.menu_open {
-			wheel_scroll(app, data)
+			handle_mouse(app, data)
 		}
 	case input.Resize_Event:
 	case input.Paste:

@@ -26,8 +26,8 @@
 // File/File_Impl split — and session_linux.odin is the platform file, guarded
 // by #+build linux + #+private, implementing the platform operations as
 // direct procs (_session_open, _session_close, ...). Every other file
-// (present, errors, profile, viewport, color, style, cell, frame_buffer) is
-// portable; targets without a backend compile the same public
+// (present, clipboard, errors, profile, viewport, color, style, cell,
+// frame_buffer) is portable; targets without a backend compile the same public
 // surface and return a typed General_Error.Unsupported from session operations
 // (session_unsupported.odin, errors_unsupported.odin).
 //
@@ -98,6 +98,10 @@
 //   recovers with a later successful full frame or by closing the session;
 //   every present re-establishes the Presentation Baseline (viewport origin
 //   + base style) before any output.
+// - clipboard_set is the one write that is not a frame. It hands text to the
+//   terminal through OSC 52 and reports the bytes it wrote, not whether the
+//   terminal kept them: the clipboard belongs to the terminal, and a terminal
+//   that ignores the sequence is indistinguishable from one that accepted it.
 //
 // Frame validation and encoding:
 // - present/encode validate the whole frame before a single byte is written:

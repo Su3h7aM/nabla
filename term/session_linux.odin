@@ -485,6 +485,15 @@ _session_present :: proc(s: ^Session, bytes: []byte) -> (committed: int, err: Er
 	return _session_write_bytes(posix.FD(os.fd(s.impl.file)), bytes)
 }
 
+// _session_clipboard writes a clipboard sequence through the same loop, so a
+// copy is as retryable as a frame is.
+_session_clipboard :: proc(s: ^Session, bytes: []byte) -> (committed: int, err: Error) {
+	if s.impl.file == nil {
+		return 0, General_Error.Not_Open
+	}
+	return _session_write_bytes(posix.FD(os.fd(s.impl.file)), bytes)
+}
+
 // _session_write_bytes writes all of bytes to fd, retrying EINTR, waiting
 // for POLLOUT on EAGAIN (the tty is O_NONBLOCK), and completing short
 // writes. Frames and control sequences share this path, so a transient

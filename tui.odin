@@ -384,7 +384,9 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 		}
 		corrected := app.conv_scroll_range - app.scroll
 		if corrected == offset || pass == 1 {
-			return draw_conversation_commands(storage, frame_result, rect)
+			if !draw_conversation_commands(storage, frame_result, rect) { return false }
+			selection_paint(app, storage, rect)
+			return true
 		}
 		offset = corrected
 	}
@@ -414,6 +416,71 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 		_, _ = tui.draw_text(&storage.buffer, line, text_data.text, style)
 	}
 	return true
+}
+
+// selection_paint marks the cells a drag covers. The mark reverses each cell's
+// own style, so the terminal's colors are what the selection inverts and a
+// themed terminal stays themed.
+//
+// A cell outside the transcript's rect is not painted: a drag that ran past the
+// area is clamped to it, so the highlight stops where the content does.
+selection_paint :: proc(app: ^App, storage: ^Frame_Storage, viewport: tui.Cell_Rect) {
+	if !app.selecting || storage.buffer.cells == nil { return }
+	start, end := selection_bounds(app)
+	for row in max(start.y, 0) ..= min(end.y, viewport.height - 1) {
+		first, last := selection_row_range(app, row, viewport.width)
+		for column in first ..= last {
+			cell := &storage.buffer.cells[(viewport.y + row) * storage.buffer.columns + viewport.x + column]
+			cell.style.modifiers += {.Reverse}
+		}
+	}
+}
+
+// selection_row_range returns the columns one row of the selection covers, both
+// ends included. The first row starts at the drag's anchor and the last ends at
+// its cursor; the rows between are covered whole.
+selection_row_range :: proc(app: ^App, row, columns: int) -> (first, last: int) {
+	start, end := selection_bounds(app)
+	first = 0
+	if row == start.y { first = max(start.x, 0) }
+	last = columns - 1
+	if row == end.y { last = min(end.x, columns - 1) }
+	return
+}
+
+// selection_text reads the selected cells back as text: one line per transcript
+// row, with each line's trailing blanks trimmed, because the frame pads a line
+// out to its box and that padding is not what the user picked. The returned
+// string is allocated with `allocator` and owned by the caller.
+selection_text :: proc(app: ^App, storage: ^Frame_Storage, allocator: mem.Allocator) -> string {
+	if storage == nil || storage.buffer.cells == nil { return "" }
+	start, end := selection_bounds(app)
+	buffer := storage.buffer
+	builder := strings.builder_make(allocator)
+	for row in max(start.y, 0) ..= min(end.y, buffer.rows - 1) {
+		first, last := selection_row_range(app, row, buffer.columns)
+		for last >= first {
+			if !selection_cell_blank(buffer.cells[selection_index(app, buffer, row, last)]) { break }
+			last -= 1
+		}
+		if row > start.y { strings.write_byte(&builder, '\n') }
+		for column in first ..= last {
+			strings.write_string(&builder, buffer.cells[selection_index(app, buffer, row, column)].grapheme)
+		}
+	}
+	return strings.to_string(builder)
+}
+
+// selection_index locates one transcript cell in the screen grid.
+selection_index :: proc(app: ^App, buffer: term.Frame_Buffer, row, column: int) -> int {
+	return (app.conversation_rect.y + row) * buffer.columns + app.conversation_rect.x + column
+}
+
+// selection_cell_blank reports whether a cell carries only the frame's padding.
+// An empty grapheme is a wide character's continuation cell, which is padding
+// for this purpose too.
+selection_cell_blank :: proc(cell: term.Cell) -> bool {
+	return cell.grapheme == "" || cell.grapheme == " "
 }
 
 // declare_entry adds one transcript entry to the open conversation frame: the

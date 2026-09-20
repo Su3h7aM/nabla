@@ -102,6 +102,13 @@ App :: struct {
 	// mouse report is in screen cells, so this is what converts one into the
 	// conversation's own coordinates.
 	conversation_rect: tui.Cell_Rect,
+	// selecting marks a drag in progress, and the anchor and cursor are the cells
+	// it spans. The selection lives only while the drag does: the release copies
+	// what it covers, so there is no highlight left to drift when the transcript
+	// moves under it.
+	selecting:         bool,
+	selection_anchor:  Cell_Point,
+	selection_cursor:  Cell_Point,
 	quit:              bool,
 }
 

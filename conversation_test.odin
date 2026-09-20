@@ -546,3 +546,119 @@ test_wheel_falls_through_a_tool_box_at_its_boundary :: proc(t: ^testing.T) {
 	testing.expect_value(t, entry.tool_scroll, 5 + MOUSE_WHEEL_LINES)
 	testing.expect_value(t, app.scroll, 10)
 }
+
+// selection_report builds a mouse report for a screen cell. The terminal's
+// coordinates are one-based, so a cell gains one.
+selection_report :: proc(button: input.Mouse_Button, column, row: int, motion := false, release := false) -> input.Mouse_Event {
+	return {button = button, x = column + 1, y = row + 1, motion = motion, release = release}
+}
+
+// selection_app builds an app whose transcript holds two short entries and
+// renders it into the app's own storage, so a test can drag over the frame that
+// is on screen. The caller releases it with selection_app_destroy.
+selection_app :: proc(t: ^testing.T) -> ^App {
+	app := new(App)
+	app.run.alloc = context.allocator
+	app.columns = 40
+	app.rows = 20
+	snap_append(app, .Notice, "alpha")
+	snap_append(app, .Notice, "beta")
+	app.storage = frame_storage_new(context.allocator)
+	if !testing.expect(t, app.storage != nil, "the frame storage must initialize") { return app }
+	_, frame_error := render_frame(app, app.storage)
+	testing.expect_value(t, frame_error, Render_Status.None)
+	return app
+}
+
+selection_app_destroy :: proc(app: ^App) {
+	snapshot_destroy(app)
+	if app.storage != nil { frame_storage_destroy(app.storage) }
+	free(app)
+}
+
+// A drag marks the cells it covers and nothing else, so the highlight is the
+// selection rather than the row it sits on.
+@(test)
+test_selection_marks_the_dragged_cells :: proc(t: ^testing.T) {
+	app := selection_app(t)
+	defer selection_app_destroy(app)
+
+	app.selecting = true
+	app.selection_anchor = Cell_Point {
+		x = 0,
+		y = 0,
+	}
+	app.selection_cursor = Cell_Point {
+		x = 4,
+		y = 0,
+	}
+	_, frame_error := render_frame(app, app.storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+
+	// "alpha" starts one cell in, because the transcript's inset is part of the
+	// band a selection covers.
+	columns := app.storage.buffer.columns
+	for column in 1 ..= 5 {
+		testing.expect_value(t, app.storage.buffer.cells[column].style.modifiers, term.Modifiers{.Reverse})
+	}
+	testing.expect(t, .Reverse not_in app.storage.buffer.cells[6].style.modifiers, "a cell past the drag must stay unmarked")
+	testing.expect(t, .Reverse not_in app.storage.buffer.cells[columns + 1].style.modifiers, "the next row must stay unmarked")
+}
+
+// The copied text is the rows the drag covers, one line each, with the padding
+// the frame adds trimmed off and the drag's direction making no difference.
+@(test)
+test_selection_text_reads_the_dragged_rows :: proc(t: ^testing.T) {
+	app := selection_app(t)
+	defer selection_app_destroy(app)
+
+	// Rows 0 to 2 are "alpha", the blank row that separates entries, and "beta".
+	app.selecting = true
+	app.selection_anchor = Cell_Point {
+		x = 0,
+		y = 0,
+	}
+	app.selection_cursor = Cell_Point {
+		x = 30,
+		y = 2,
+	}
+	_, frame_error := render_frame(app, app.storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	testing.expect_value(t, selection_text(app, app.storage, context.temp_allocator), "alpha\n\nbeta")
+
+	// The same drag backwards covers the same rows.
+	app.selection_anchor = Cell_Point {
+		x = 30,
+		y = 2,
+	}
+	app.selection_cursor = Cell_Point {
+		x = 0,
+		y = 0,
+	}
+	testing.expect_value(t, selection_text(app, app.storage, context.temp_allocator), "alpha\n\nbeta")
+}
+
+// The drag follows the mouse: a press in the transcript anchors it, the motion
+// extends it, and the release ends it. A copy that cannot reach the terminal is
+// reported, because a silent failure would look like a successful copy.
+@(test)
+test_selection_follows_the_mouse_and_reports_a_failed_copy :: proc(t: ^testing.T) {
+	app := selection_app(t)
+	defer selection_app_destroy(app)
+
+	selection_mouse(app, selection_report(.Left, 1, 0))
+	testing.expect(t, app.selecting, "a press in the transcript must start a drag")
+	testing.expect_value(t, app.selection_anchor, Cell_Point{x = 0, y = 0})
+
+	selection_mouse(app, selection_report(.Left, 3, 3, motion = true))
+	testing.expect_value(t, app.selection_cursor, Cell_Point{x = 2, y = 3})
+
+	selection_mouse(app, selection_report(.Left, 3, 3, release = true))
+	testing.expect(t, !app.selecting, "the release must end the drag")
+	last := app.run.snap.entries[len(app.run.snap.entries) - 1]
+	testing.expect_value(t, last.kind, Entry_Kind.Error)
+
+	// A press below the transcript is not a drag over it.
+	selection_mouse(app, selection_report(.Left, 1, 19))
+	testing.expect(t, !app.selecting, "a press outside the transcript must not select")
+}
