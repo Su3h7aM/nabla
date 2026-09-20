@@ -109,6 +109,11 @@ exchange_udp :: proc(
 	for time.tick_since(deadline) < 0 {
 		if interrupt_now(interrupt) { return nil, .Cancelled }
 		count, source, recv_err := net.recv_udp(socket, buffer[:])
+		if recv_err == .Excess_Truncated {
+			// The reply did not fit the datagram room. Its prefix is
+			// unusable, and the whole answer is over TCP.
+			return nil, .Retry_TCP
+		}
 		if recv_err != .None { continue }
 		// A datagram from anyone but the queried server cannot answer this
 		// query. Its arrival does not end the attempt.
