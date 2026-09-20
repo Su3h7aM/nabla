@@ -697,7 +697,7 @@ test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
 
 	recorded := chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries), Chat_Attempt{number = 1}, nil)
 	tools := request_record_tools(t, recorded)
-	if !testing.expect_value(t, len(tools), len(TOOL_NATIVE)) { return }
+	if !testing.expect_value(t, len(tools), TOOL_NATIVE_COUNT) { return }
 	previous := ""
 	for item in tools {
 		entry, entry_ok := item.(json.Object)
@@ -708,8 +708,6 @@ test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
 		previous = string(name)
 		testing.expect(t, string(name) != "test.rogue_tool", "a later registry change is not recorded")
 		if string(name) == TOOL_SHELL_NAME {
-			description, _ := entry["description"].(json.String)
-			testing.expect_value(t, string(description), TOOL_SHELL_DESCRIPTION)
 			schema, _ := entry["input_schema"].(json.String)
 			testing.expect_value(t, string(schema), TOOL_SHELL_SCHEMA)
 		}

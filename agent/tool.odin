@@ -119,12 +119,22 @@ tool_registry_make :: proc(allocator := context.allocator) -> (registry: Tool_Re
 	registry = Tool_Registry {
 		allocator = allocator,
 	}
-	registry.definitions = make([dynamic]Tool_Definition, 0, len(TOOL_NATIVE), allocator)
-	for definition in TOOL_NATIVE {
+	registry.definitions = make([dynamic]Tool_Definition, 0, TOOL_NATIVE_COUNT, allocator)
+	// The shell tool's description names the shell this process will run, which is
+	// only known now, so the shell tool is built here rather than declared. The
+	// registry clones the strings it keeps, and this function owns the built
+	// description until it has.
+	shell := tool_shell_definition(tool_shell_preferred(), allocator)
+	defer delete(shell.description, allocator)
+	for definition in TOOL_DECLARED {
 		if add_error := tool_registry_add(&registry, definition); add_error.kind != .None {
 			tool_registry_destroy(&registry)
 			return {}, add_error
 		}
+	}
+	if add_error := tool_registry_add(&registry, shell); add_error.kind != .None {
+		tool_registry_destroy(&registry)
+		return {}, add_error
 	}
 	tool_registry_sort(&registry)
 	return registry, {}
@@ -526,21 +536,27 @@ tool_control_stop :: proc(control: Tool_Control, start: time.Tick, budget: time.
 // repeat them.
 AGENT_SYSTEM_PROMPT :: "You are svan, a coding agent working from a session workspace. The tools available to you are listed with their arguments. Each call returns a JSON object with a status and, on success, a data object. Relative paths start at the workspace, while absolute paths may address the wider system. Use the tools to inspect files, make changes, and run programs. Never invent tool output. Keep chat replies short."
 
-// The native tools, in the order they are registered. tool_registry_sort fixes
-// the advertised order after this list is read. Only shell states a timeout
+// TOOL_DECLARED is the native tools written as constants, in the order they are
+// registered. tool_registry_sort fixes the advertised order after this list is
+// read. The shell tool is not here: its description names the shell this process
+// will run, so tool_registry_make builds it. Only the shell states a timeout
 // policy; the file and skill tools carry a zero policy, which means no
 // tool-specific bound rather than a forgotten configuration.
 @(private)
-TOOL_NATIVE := [?]Tool_Definition {
+TOOL_DECLARED := [?]Tool_Definition {
 	TOOL_EDIT_DEFINITION,
 	TOOL_READ_DEFINITION,
-	TOOL_SHELL_DEFINITION,
 	TOOL_WRITE_DEFINITION,
 	TOOL_LIST_SKILLS_DEFINITION,
 	TOOL_LOAD_SKILL_DEFINITION,
 	TOOL_COMPACT_DEFINITION,
 	TOOL_RESULT_READ_DEFINITION,
 }
+
+// TOOL_NATIVE_COUNT is how many native tools a registry holds: the declared ones,
+// plus the shell tool, whose definition is built at run time.
+@(private)
+TOOL_NATIVE_COUNT :: len(TOOL_DECLARED) + 1
 
 // TOOL_RECOVERED_RESULT and TOOL_UNEXECUTED_RESULT are what recovery writes for a
 // call the harness never observed. They are constants so recovery allocates

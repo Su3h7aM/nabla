@@ -3,12 +3,9 @@ package agent
 import "core:mem"
 import "core:strings"
 import linux "core:sys/linux"
+import "core:sys/posix"
 import "core:time"
 
-TOOL_SHELL_PATH :: "/bin/sh"
-
-// TOOL_KILL_GRACE bounds how long a terminated process group may take to exit on
-// SIGTERM before it is killed outright.
 TOOL_KILL_GRACE :: 500 * time.Millisecond
 
 // Tool_Stop is why a drain loop stopped short of the child exiting on its own.
@@ -27,8 +24,17 @@ Tool_Child :: struct {
 	status: u32,
 }
 
-// tool_spawn_grouped starts the shell in its own process group and returns the
-// child pid.
+// TOOL_SPAWN_EXEC_FAILED is the byte a forked child writes when it could not
+// start the program it was forked for. Its presence, not its value, is the fact:
+// the parent reads it to tell an exec that never happened from one that did,
+// which is what lets a caller try another program without running a command
+// twice.
+@(private)
+TOOL_SPAWN_EXEC_FAILED :: u8(1)
+
+// tool_spawn_grouped starts shell in its own process group, running command with
+// `shell -c`, and reports whether the shell started. It is the shell's caller
+// that decides which shell that is and what to do when it does not start.
 //
 // Odin's os.process_start cannot express this. It forks and execs with no
 // pre-exec hook, so setpgid from the parent always fails with EACCES once the
@@ -39,18 +45,34 @@ Tool_Child :: struct {
 // locks, logs, or enters the Odin runtime: every call below is a raw Linux
 // syscall, and failure paths leave through tool_child_exit, which runs no
 // atexit handler and flushes no stdio.
-tool_spawn_grouped :: proc(command, directory: string, stdout_write, stderr_write: linux.Fd) -> (pid: int, ok: bool) {
+tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stderr_write: linux.Fd) -> (pid: int, started: bool) {
+	shell_cstring := strings.clone_to_cstring(shell, context.temp_allocator)
 	source := strings.clone_to_cstring(command, context.temp_allocator)
 	dash_c := strings.clone_to_cstring("-c", context.temp_allocator)
-	path_env := strings.clone_to_cstring("PATH=/usr/bin:/bin", context.temp_allocator)
-	locale_env := strings.clone_to_cstring("LC_ALL=C.UTF-8", context.temp_allocator)
 	work := strings.clone_to_cstring(directory, context.temp_allocator)
 
-	argv := [4]cstring{TOOL_SHELL_PATH, dash_c, source, nil}
-	envp := [3]cstring{path_env, locale_env, nil}
+	argv := [4]cstring{shell_cstring, dash_c, source, nil}
+
+	// The command inherits the environment this process was started with: the
+	// user's own environment, as the shell that launched the harness exported it.
+	// Nothing is added, removed, or rewritten here, because a tool the user can
+	// run is a tool the command has to be able to run.
+	envp := posix.environ
+
+	// The exec status pipe carries one fact back to the parent: whether the shell
+	// started. Both ends are CLOEXEC, so a successful exec closes the child's
+	// write end and the parent reads end-of-file, while a failed one lets the
+	// child report before it exits. Without it, an exec that never happened is
+	// indistinguishable from a fork that never happened.
+	exec_pipe: [2]linux.Fd
+	if linux.pipe2(&exec_pipe, {.CLOEXEC}) != .NONE { return 0, false }
 
 	child, fork_errno := linux.fork()
-	if fork_errno != .NONE { return 0, false }
+	if fork_errno != .NONE {
+		_ = linux.close(exec_pipe[0])
+		_ = linux.close(exec_pipe[1])
+		return 0, false
+	}
 	if child == 0 {
 		// Standard input is closed: this is explicitly not a terminal.
 		if linux.setpgid(0, 0) != .NONE { tool_child_exit(1) }
@@ -59,10 +81,34 @@ tool_spawn_grouped :: proc(command, directory: string, stdout_write, stderr_writ
 		if _, dup_errno := linux.dup2(stderr_write, 2); dup_errno != .NONE { tool_child_exit(1) }
 		// The pipe read ends close on exec: they were created with CLOEXEC.
 		if linux.chdir(work) != .NONE { tool_child_exit(1) }
-		_ = linux.execve(TOOL_SHELL_PATH, &argv[0], &envp[0])
+		if linux.execve(shell_cstring, &argv[0], envp) != .NONE {
+			reported := [1]u8{TOOL_SPAWN_EXEC_FAILED}
+			_, _ = linux.write(exec_pipe[1], reported[:])
+			tool_child_exit(127)
+		}
 		tool_child_exit(127)
 	}
-	return int(child), true
+
+	_ = linux.close(exec_pipe[1])
+	reported := [1]u8{0}
+	read_bytes, read_errno := linux.read(exec_pipe[0], reported[:])
+	for read_errno == .EINTR {
+		read_bytes, read_errno = linux.read(exec_pipe[0], reported[:])
+	}
+	_ = linux.close(exec_pipe[0])
+	// Only the report says the exec failed. End-of-file means the child exec'd or
+	// died before it could report, and a read that failed says nothing either; in
+	// both cases the command may have run, so the child counts as started and the
+	// caller waits for it the way it waits for any child.
+	if read_bytes <= 0 { return int(child), true }
+
+	// The child never became the shell. Reap it here, so it leaves no zombie and
+	// no pid a caller could mistake for a running command.
+	failed := Tool_Child {
+		pid = int(child),
+	}
+	_, _, _ = tool_child_reap(&failed)
+	return 0, false
 }
 
 // tool_child_exit leaves a forked child without running anything the parent's

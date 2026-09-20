@@ -201,11 +201,16 @@ timeout policy lives in its definition: 30 seconds by default, 120 seconds
 maximum. A model-requested timeout above the maximum is refused, never
 silently clamped. Cancellation wins over the timeout when both are observed.
 
-- `/bin/sh -c` in a fresh process group, stdin closed.
-- The launch environment is captured once, with configured secrets removed, and
-  frozen. It is not the process environment and it is not mutated per call.
-- A close-on-exec setup pipe distinguishes a spawn failure from a command that
-  genuinely exited 127.
+- The shell this process was started from, the one `SHELL` names, runs the
+  command as `<shell> -c` in a fresh process group with stdin closed. A shell
+  that cannot be started, and an environment that names none, fall back to
+  `/bin/sh`, so the tool stays usable when the user's shell does not.
+- The command inherits the environment this process was started with, so the
+  agent works with the same variables, the same tools, and the same versions the
+  user does. Nothing is added, removed, or rewritten.
+- A close-on-exec setup pipe distinguishes a shell that never started from a
+  command that genuinely exited 127, and is what lets the fallback run a command
+  that never ran without ever running one twice.
 - Cancellation and timeout are distinct, and cancel wins when both apply.
 - Group termination escalates from `SIGTERM` to `SIGKILL`.
 - Descendants holding output pipes get a bounded drain before cleanup.

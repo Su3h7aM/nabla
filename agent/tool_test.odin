@@ -288,7 +288,7 @@ test_every_native_tool_is_registered_complete :: proc(t: ^testing.T) {
 	// The registry is sorted, so the advertised order never depends on the order
 	// tools were registered in.
 	chat := &test.fixture.chat
-	if !testing.expect_value(t, len(chat.tools.definitions), len(TOOL_NATIVE)) { return }
+	if !testing.expect_value(t, len(chat.tools.definitions), TOOL_NATIVE_COUNT) { return }
 	for index in 1 ..< len(chat.tools.definitions) {
 		testing.expect(t, chat.tools.definitions[index - 1].name < chat.tools.definitions[index].name, "the advertised order is stable")
 	}
@@ -299,8 +299,8 @@ test_every_native_tool_is_registered_complete :: proc(t: ^testing.T) {
 	}
 }
 
-// The native definitions are compile-time constants, so building the registry
-// from them must never fail. A failure here is a programming error, not a
+// The native definitions are the harness's own, so building the registry from
+// them must never fail. A failure here is a programming error, not a
 // configuration the harness could recover from.
 @(test)
 test_native_registry_builds_without_error :: proc(t: ^testing.T) {
@@ -308,7 +308,7 @@ test_native_registry_builds_without_error :: proc(t: ^testing.T) {
 	defer tool_registry_destroy(&registry)
 	testing.expect_value(t, registry_error.kind, Tool_Registry_Error_Kind.None)
 	if registry_error.kind != .None { return }
-	testing.expect_value(t, len(registry.definitions), len(TOOL_NATIVE))
+	testing.expect_value(t, len(registry.definitions), TOOL_NATIVE_COUNT)
 }
 
 // tool_test_dummy_execute stands in for an executor where only registration
@@ -429,7 +429,8 @@ test_registry_refuses_name_collisions :: proc(t: ^testing.T) {
 	before := len(registry.definitions)
 
 	sentinel: u8 = 7
-	duplicate := TOOL_SHELL_DEFINITION
+	duplicate := tool_shell_definition(TOOL_SHELL_FALLBACK, context.allocator)
+	defer delete(duplicate.description, context.allocator)
 	duplicate.backend = &sentinel
 	add_error := tool_registry_add(&registry, duplicate)
 	testing.expect_value(t, add_error.kind, Tool_Registry_Error_Kind.Name_Collision)
@@ -715,7 +716,7 @@ test_replace_tools_swaps_only_while_idle :: proc(t: ^testing.T) {
 	tool_registry_sort(&replacement)
 
 	testing.expect_value(t, chat_session_replace_tools(chat, &replacement), Tool_Registry_Replace_Error.None)
-	testing.expect_value(t, len(chat.tools.definitions), len(TOOL_NATIVE) + 1)
+	testing.expect_value(t, len(chat.tools.definitions), TOOL_NATIVE_COUNT + 1)
 	_, found := tool_registry_find(&chat.tools, "test.extra_tool")
 	testing.expect(t, found, "the replacement registry is installed")
 

@@ -12,7 +12,22 @@ import "nabla:agent/session"
 
 TOOL_SHELL_NAME :: "builtin.shell"
 
-TOOL_SHELL_DESCRIPTION :: "Execute a command with /bin/sh in a fresh non-interactive process. Standard input is closed. Commands may use shell syntax. Directory and environment changes do not persist between calls. Returns bounded stdout and stderr, exit information, and truncation status. This is not a terminal or background-job service."
+// TOOL_SHELL_BODY is what the shell tool does, after the sentence that names the
+// shell it does it with.
+TOOL_SHELL_BODY :: "Write the command in that shell's own syntax, which may not be POSIX sh. The command runs in a fresh non-interactive process with standard input closed, and it inherits this process's environment. Directory and environment changes do not persist between calls. Returns bounded stdout and stderr, exit information, and truncation status. This is not a terminal or background-job service."
+
+// TOOL_SHELL_FALLBACK is the shell a command ends at when the shell this process
+// was started from cannot run it. /bin/sh is the one shell a POSIX system has.
+TOOL_SHELL_FALLBACK :: "/bin/sh"
+
+// tool_shell_preferred returns the shell to run a command with: the one SHELL
+// names, or the portable fallback when the environment names none. "" is not a
+// shell, so it never reaches an exec.
+tool_shell_preferred :: proc() -> string {
+	shell, found := os.lookup_env("SHELL", context.temp_allocator)
+	if !found || shell == "" { return TOOL_SHELL_FALLBACK }
+	return shell
+}
 
 TOOL_SHELL_SCHEMA :: `{"type":"object","properties":{"command":{"type":"string","description":"Shell source to execute."},"working_directory":{"type":["string","null"],"description":"Directory in which to run the command. Relative paths start at the session workspace. Leave out or pass null for the workspace itself."},"timeout_ms":{"type":["integer","null"],"description":"Positive timeout in milliseconds. Leave out or pass null for the harness default."}},"required":["command"],"additionalProperties":false}`
 
@@ -20,14 +35,15 @@ TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms"}
 
 // TOOL_SHELL_DEFAULT_TIMEOUT and TOOL_SHELL_MAX_TIMEOUT are the tool's own
 // policy, stated as durations. The definition below is the source of truth:
-// argument parsing derives its millisecond bounds from it, so the JSON
-// boundary is the only place milliseconds appear.
+// argument parsing derives its millisecond bounds from it, so the JSON boundary
+// is the only place milliseconds appear.
 TOOL_SHELL_DEFAULT_TIMEOUT :: 30 * time.Second
 TOOL_SHELL_MAX_TIMEOUT :: 120 * time.Second
 
-// TOOL_SHELL_NOT_STARTED is the one thing a failed spawn can say. A pipe that
-// could not be created, a fork that failed, and an exec that never reached the
-// shell all look the same from here, and the harness will not invent a cause.
+// TOOL_SHELL_NOT_STARTED is the one thing a spawn that exhausted its shells can
+// say. A pipe that could not be created, a fork that failed, and an exec of the
+// portable shell that never reached it all look the same from here, and the
+// harness will not invent a cause.
 TOOL_SHELL_NOT_STARTED :: "the command did not start or its output was lost"
 
 TOOL_MAX_STDOUT_BYTES :: 24 * 1024
@@ -47,15 +63,22 @@ Shell_Data :: struct {
 	output_incomplete: bool `json:"output_incomplete"`,
 }
 
-TOOL_SHELL_DEFINITION :: Tool_Definition {
-	name = TOOL_SHELL_NAME,
-	description = TOOL_SHELL_DESCRIPTION,
-	input_schema = TOOL_SHELL_SCHEMA,
-	// The command determines the behavior, so unknown is the only honest
-	// static answer for everything but the open world it can reach.
-	hints = {read_only = .Unknown, destructive = .Unknown, idempotent = .Unknown, open_world = .Yes},
-	timeouts = {default = TOOL_SHELL_DEFAULT_TIMEOUT, maximum = TOOL_SHELL_MAX_TIMEOUT},
-	execute = tool_shell_execute,
+// tool_shell_definition is the shell tool, described for the shell this process
+// will run: the shell decides the syntax the model has to write, and the tool does
+// not translate between shells. The caller owns the description it returns and
+// frees it once the registry has cloned it.
+@(require_results)
+tool_shell_definition :: proc(shell: string, allocator := context.allocator) -> Tool_Definition {
+	return Tool_Definition {
+		name = TOOL_SHELL_NAME,
+		description = fmt.aprintf("Execute a command with %s (%s). " + TOOL_SHELL_BODY, os.base(shell), shell, allocator = allocator),
+		input_schema = TOOL_SHELL_SCHEMA,
+		// The command determines the behavior, so unknown is the only honest
+		// static answer for everything but the open world it can reach.
+		hints = {read_only = .Unknown, destructive = .Unknown, idempotent = .Unknown, open_world = .Yes},
+		timeouts = {default = TOOL_SHELL_DEFAULT_TIMEOUT, maximum = TOOL_SHELL_MAX_TIMEOUT},
+		execute = tool_shell_execute,
+	}
 }
 
 // Tool_Shell_Args is the shell's own view of a call. Its strings borrow the
@@ -85,13 +108,24 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_She
 	timeout_ms, timeout_error := tool_field_optional_int(
 		arguments,
 		"timeout_ms",
-		int(TOOL_SHELL_DEFINITION.timeouts.default / time.Millisecond),
+		int(TOOL_SHELL_DEFAULT_TIMEOUT / time.Millisecond),
 		1,
-		int(TOOL_SHELL_DEFINITION.timeouts.maximum / time.Millisecond),
+		int(TOOL_SHELL_MAX_TIMEOUT / time.Millisecond),
 		allocator = ctx.allocator,
 	)
 	if timeout_error.kind != .None { return {}, timeout_error }
 	return Tool_Shell_Args{command = command, working_directory = working_directory, timeout_ms = timeout_ms}, {}
+}
+
+// tool_shell_start runs a command with the shell this process was started from,
+// and with the portable shell when that shell cannot be started. Only a command
+// that never started is tried twice: a shell that ran it has already had its
+// effects, and running it again would repeat them.
+tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write: linux.Fd) -> (pid: int, started: bool) {
+	shell := tool_shell_preferred()
+	pid, started = tool_spawn_grouped(shell, command, directory, stdout_write, stderr_write)
+	if started || shell == TOOL_SHELL_FALLBACK { return pid, started }
+	return tool_spawn_grouped(TOOL_SHELL_FALLBACK, command, directory, stdout_write, stderr_write)
 }
 
 tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
@@ -124,7 +158,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 		_ = linux.close(stdout_pipe[1])
 		return tool_shell_finish(ctx, .Tool_Failed, TOOL_SHELL_NOT_STARTED, data)
 	}
-	pid, spawned := tool_spawn_grouped(args.command, directory, stdout_pipe[1], stderr_pipe[1])
+	pid, spawned := tool_shell_start(args.command, directory, stdout_pipe[1], stderr_pipe[1])
 	_ = linux.close(stdout_pipe[1])
 	_ = linux.close(stderr_pipe[1])
 	if !spawned {
@@ -141,7 +175,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 	// tool budget: cancellation reports Cancelled, while
 	// only the budget expiring reports Timed_Out.
 	start := time.tick_now()
-	budget := tool_timeout_clamp(time.Duration(args.timeout_ms) * time.Millisecond, TOOL_SHELL_DEFINITION.timeouts.maximum)
+	budget := tool_timeout_clamp(time.Duration(args.timeout_ms) * time.Millisecond, TOOL_SHELL_MAX_TIMEOUT)
 	stop := tool_drain_pipes(&child, stdout_pipe[0], stderr_pipe[0], start, budget, ctx.control, &data, ctx.allocator)
 	_ = linux.close(stdout_pipe[0])
 	_ = linux.close(stderr_pipe[0])
