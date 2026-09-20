@@ -126,6 +126,7 @@ Error :: enum {
 	Closed,
 	Truncated,
 	Invalid_URL,
+	Invalid_Request,
 	Connect,
 	Resolve,
 	TLS_Config,

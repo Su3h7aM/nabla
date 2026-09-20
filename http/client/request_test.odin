@@ -71,6 +71,51 @@ test_request_target :: proc(t: ^testing.T) {
 	line := _request_line_of(t, long_request)
 	testing.expectf(t, strings.contains(line, query), "request line is %d octets and lost its query", len(line))
 	testing.expectf(t, len(line) > 4096, "request line is only %d octets", len(line))
+
+	// RFC 9112 3.2: a fragment is never sent; it names a part of the
+	// response for the caller, not of the request for the peer.
+	fragment_request := Request {
+		url    = "https://api.example.com/v1#section",
+		method = .Get,
+	}
+	testing.expect_value(t, _request_line_of(t, fragment_request), "GET /v1 HTTP/1.1")
+}
+
+// refused_request_case is one request validation expects refused, with the
+// error it is refused with, before anything reaches the peer.
+refused_request_case :: proc(url: string, headers: []Header, body: []u8, err: Error, t: ^testing.T) {
+	request := Request {
+		url     = url,
+		method  = .Post,
+		headers = headers,
+		body    = body,
+	}
+	valid_err, _ := request_validate(http.url_parse(request.url), request, context.temp_allocator)
+	testing.expect_value(t, valid_err, err)
+}
+
+@(test)
+test_invalid_requests_are_refused_before_the_wire :: proc(t: ^testing.T) {
+	// A scheme this client does not speak, and an empty host, stay URL errors.
+	refused_request_case("gopher://api.example.com/", nil, nil, .Invalid_URL, t)
+	refused_request_case("https://", nil, nil, .Invalid_URL, t)
+	// Schemes compare without case; credentials are never sent.
+	refused_request_case("HTTP://api.example.com/v1", nil, nil, .None, t)
+	refused_request_case("https://user:pass@api.example.com/", nil, nil, .Invalid_URL, t)
+	refused_request_case("https://api .example.com/", nil, nil, .Invalid_URL, t)
+	// A target with a space would frame two lines as one request line.
+	refused_request_case("https://api.example.com/v1 with space", nil, nil, .Invalid_Request, t)
+	// Field names are tokens; values carry no control bytes.
+	refused_request_case("https://api.example.com/", {{"x bad", "1"}}, nil, .Invalid_Request, t)
+	refused_request_case("https://api.example.com/", {{"", "1"}}, nil, .Invalid_Request, t)
+	refused_request_case("https://api.example.com/", {{"x-a", "1\r\ninjected: 2"}}, nil, .Invalid_Request, t)
+	// This client frames with Content-Length or close, so a caller coding or
+	// a conflicting length would frame ambiguously.
+	refused_request_case("https://api.example.com/", {{"transfer-encoding", "chunked"}}, nil, .Invalid_Request, t)
+	refused_request_case("https://api.example.com/", {{"content-length", "5"}}, transmute([]u8)string("hi"), .Invalid_Request, t)
+	refused_request_case("https://api.example.com/", {{"content-length", "5x"}}, transmute([]u8)string("hello"), .Invalid_Request, t)
+	// A length that states exactly the body is the caller's own value kept.
+	refused_request_case("https://api.example.com/", {{"content-length", "2"}}, transmute([]u8)string("hi"), .None, t)
 }
 
 @(test)

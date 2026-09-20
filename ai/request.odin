@@ -532,7 +532,7 @@ provider_record_delivery :: proc(state: ^Provider_Request_Stream_State, failure:
 	case .Transport, .Truncated, .Closed:
 		state.delivery = .Model_Send_Started
 		state.delivery_present = true
-	case .None, .Cancelled, .Timed_Out, .TLS, .Invalid_URL, .HTTP_Status, .Content_Type:
+	case .None, .Cancelled, .Timed_Out, .TLS, .Invalid_URL, .Invalid_Request, .HTTP_Status, .Content_Type:
 	}
 }
 
@@ -579,7 +579,7 @@ provider_operation_error_kind :: proc(failure: client.Failure) -> Provider_Opera
 		return .TLS
 	case .HTTP_Status:
 		return .HTTP
-	case .Invalid_URL:
+	case .Invalid_URL, .Invalid_Request:
 		return .Invalid_Request
 	case .Content_Type:
 		// A content-type rejection means the peer answered 2xx with something other
@@ -658,7 +658,7 @@ provider_failure_kind :: proc(failure: client.Failure) -> Provider_Error_Kind {
 		return .Timed_Out
 	case .TLS:
 		return .TLS
-	case .None, .Transport, .Truncated, .Closed, .Invalid_URL, .HTTP_Status, .Content_Type:
+	case .None, .Transport, .Truncated, .Closed, .Invalid_URL, .Invalid_Request, .HTTP_Status, .Content_Type:
 		return .Stream_Truncated
 	}
 	return .Stream_Truncated

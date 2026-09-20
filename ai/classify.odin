@@ -132,7 +132,7 @@ provider_transport_cause :: proc(err: client.Error) -> Provider_Transport_Cause 
 		return .Connection
 	case .Closed, .Truncated, .Send, .Recv, .Bad_Response:
 		return .IO
-	case .Invalid_URL, .TLS_Config:
+	case .Invalid_URL, .Invalid_Request, .TLS_Config:
 		return .Configuration
 	case .TLS_Trust, .TLS_Hostname, .TLS_Peer_Rejected, .TLS_Handshake:
 		return .Trust

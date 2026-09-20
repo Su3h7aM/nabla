@@ -20,6 +20,7 @@ Failure_Kind :: enum {
 	Truncated,
 	Closed,
 	Invalid_URL,
+	Invalid_Request,
 	HTTP_Status,
 	Content_Type,
 }
@@ -196,10 +197,14 @@ event_loop_acquire :: proc(allocator: mem.Allocator) -> Failure {
 // validation and the request write as well as the response that follows.
 request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase, summary: ^Transfer_Summary) -> (connection: ^Connection, failure: Failure) {
 	url := http.url_parse(request.url)
-	if url.scheme != "http" && url.scheme != "https" {
-		return nil, failure_from_error(.None, request.allocator, .Invalid_URL, "URL scheme must be http or https")
+	phase^ = .Validate
+	if valid_err, valid_detail := request_validate(url, request, request.allocator); valid_err != .None {
+		// A refused request never reached the transport, so like a refused
+		// URL it carries no cause; the kind names the refusal.
+		kind := Failure_Kind.Invalid_Request
+		if valid_err == .Invalid_URL { kind = .Invalid_URL }
+		return nil, failure_from_error(.None, request.allocator, kind, valid_detail)
 	}
-	if url.host == "" { return nil, failure_from_error(.None, request.allocator, .Invalid_URL, "URL host is empty") }
 
 	phase^ = .Resolve
 	if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
@@ -243,13 +248,79 @@ request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase,
 	return dialed, {}
 }
 
+// request_validate refuses what this client will not put on the wire: a URL
+// it does not speak, and fields or a target that would frame ambiguously or
+// inject bytes. URL problems report Invalid_URL; everything the caller built
+// reports Invalid_Request. The detail is a static string the failure clones.
+request_validate :: proc(url: http.URL, request: Request, allocator: mem.Allocator) -> (err: Error, detail: string) {
+	// RFC 9110 4.2.3: schemes are case-insensitive.
+	if !strings.equal_fold(url.scheme, "http") && !strings.equal_fold(url.scheme, "https") {
+		return .Invalid_URL, "URL scheme must be http or https"
+	}
+	if url.host == "" { return .Invalid_URL, "URL host is empty" }
+	if strings.index_byte(url.host, '@') >= 0 {
+		return .Invalid_URL, "URL authority states userinfo, which this client does not send"
+	}
+	for i in 0 ..< len(url.host) {
+		if url.host[i] <= 0x20 || url.host[i] == 0x7F { return .Invalid_URL, "URL host holds a control byte or space" }
+	}
+
+	target := http.request_path(url, allocator)
+	defer delete(target, allocator)
+	if cut := strings.index_byte(target, '#'); cut >= 0 { target = target[:cut] }
+	for i in 0 ..< len(target) {
+		if target[i] <= 0x20 || target[i] == 0x7F { return .Invalid_Request, "request target holds a control byte or space" }
+	}
+
+	for header in request.headers {
+		if !field_name_is_token(header.name) { return .Invalid_Request, "a request field name is not a token" }
+		for i in 0 ..< len(header.value) {
+			if header.value[i] < 0x20 || header.value[i] == 0x7F {
+				return .Invalid_Request, "a request field value holds a control byte"
+			}
+		}
+		// This client frames with Content-Length or close, never with transfer
+		// codings, so a caller coding would frame ambiguously.
+		if strings.equal_fold(header.name, "transfer-encoding") {
+			return .Invalid_Request, "this client sends no transfer codings"
+		}
+		// A stated length that is invalid or differs from the body would frame
+		// a different message than the one sent.
+		if strings.equal_fold(header.name, "content-length") {
+			stated, stated_ok := content_length_parse(header.value)
+			if !stated_ok || stated != len(request.body) {
+				return .Invalid_Request, "a stated content length conflicts with the body"
+			}
+		}
+	}
+	return .None, ""
+}
+
+// field_name_is_token reports whether a name is an HTTP token: one or more
+// tchars (RFC 9110 5.1).
+field_name_is_token :: proc(name: string) -> bool {
+	if len(name) == 0 { return false }
+	for i in 0 ..< len(name) {
+		switch name[i] {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		case:
+			if (name[i] < '0' || name[i] > '9') && (name[i] < 'a' || name[i] > 'z') && (name[i] < 'A' || name[i] > 'Z') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // format_request builds the request line, the fields, and the body. body_offset is
 // where the body begins, which is what lets a partial write say how much of the
 // body the transport took rather than how much of the whole request it took.
 format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer, body_offset: int) {
 	// The request target is the origin-form of the URL -- path and query both.
+	// A fragment is never sent: RFC 9112 3.2 excludes it from the target.
 	request_target := http.request_path(url, request.allocator)
 	defer delete(request_target, request.allocator)
+	if cut := strings.index_byte(request_target, '#'); cut >= 0 { request_target = request_target[:cut] }
 
 	bytes.buffer_init_allocator(&buffer, 0, len(request.body) + 512, request.allocator)
 
@@ -722,6 +793,8 @@ failure_from_error :: proc(err: Error, allocator: mem.Allocator, override: Failu
 			kind = .TLS
 		case .Invalid_URL:
 			kind = .Invalid_URL
+		case .Invalid_Request:
+			kind = .Invalid_Request
 		case .None, .Connect, .Resolve, .Send, .Recv, .Bad_Response:
 			kind = .Transport
 		}
@@ -747,6 +820,8 @@ error_text :: proc(err: Error) -> string {
 		return "connection could not be established"
 	case .Invalid_URL:
 		return "request URL host is invalid"
+	case .Invalid_Request:
+		return "request holds a field this client will not send"
 	case .Resolve:
 		return "host could not be resolved"
 	case .TLS_Config:
