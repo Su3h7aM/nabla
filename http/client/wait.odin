@@ -76,11 +76,11 @@ wait_connected :: proc(endpoint: net.Endpoint, probe: Probe) -> (socket: net.TCP
 
 	for !state.done {
 		if probe_stop := stop_from_wait(probe_now(probe)); probe_stop != .None {
-			// remove only *requests* cancellation: the operation stays
-			// outstanding, so its callback would still run and would write
-			// through a pointer to this frame. Drain the loop until it is reaped.
+			// Removal is final and silent: the callback never runs, so the
+			// frame's state is safe to abandon, and the loop frees the
+			// operation on a later tick. Only this operation is reaped;
+			// unrelated work on the thread's loop is never waited on.
 			nbio.remove(op)
-			drain_event_loop()
 			return 0, probe_stop
 		}
 		nbio.tick(WAIT_SLICE)
@@ -133,11 +133,9 @@ wait_ready :: proc(socket: net.Any_Socket, kind: Ready_For, probe: Probe, timeou
 
 	for !state.done {
 		if probe_stop := stop_from_wait(probe_now(probe)); probe_stop != .None {
-			// remove only *requests* cancellation: the operation stays
-			// outstanding, so its callback would still run and would write
-			// through a pointer to this frame. Drain the loop until it is reaped.
+			// Removal is final and silent, as above: only this operation is
+			// reaped, and unrelated work on the thread's loop is left alone.
 			nbio.remove(op)
-			drain_event_loop()
 			return .Stopped, probe_stop
 		}
 
@@ -146,7 +144,6 @@ wait_ready :: proc(socket: net.Any_Socket, kind: Ready_For, probe: Probe, timeou
 			remaining := -time.tick_since(attempt_deadline)
 			if remaining <= 0 {
 				nbio.remove(op)
-				drain_event_loop()
 				return .Stopped, .Timed_Out
 			}
 			if remaining < slice { slice = remaining }
@@ -163,13 +160,4 @@ wait_ready :: proc(socket: net.Any_Socket, kind: Ready_For, probe: Probe, timeou
 		return .Failed, .Failed
 	}
 	return .Failed, .Failed
-}
-
-// drain_event_loop runs the loop until every operation issued on it has been
-// reaped, which is what makes it safe to let a wait return.
-@(private)
-drain_event_loop :: proc() {
-	for nbio.num_waiting() > 0 {
-		nbio.tick(nbio.NO_TIMEOUT)
-	}
 }
