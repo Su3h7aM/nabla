@@ -3,9 +3,11 @@
 // responsiveness. tui projects that geometry to terminal cells and writes a
 // caller-owned nabla:term.Frame_Buffer using nabla:text width rules.
 //
-// The preferred API is scoped. Declare and solve the layout tree first, then
-// render the same hierarchy through frame and element:
+// The preferred API is scoped. Bind layout_services for terminal text,
+// declare and solve the layout tree, then render the same hierarchy through
+// frame and element:
 //
+//     layout.set_services(&layout_ctx, tui.layout_services(&measure_context))
 //     if layout.frame(&layout_ctx, viewport) {
 //         if layout.element(&layout_ctx, layout.Element_Desc{
 //             id = panel_id,

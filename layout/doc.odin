@@ -46,12 +46,7 @@
 //     defer layout.destroy(&ctx)
 //
 //     for running {
-//         layout.set_services(&ctx, layout.Services{
-//             measure_text           = tui.measure_proc,
-//             measure_text_user_data = &measure_context,
-//             break_text             = tui.break_proc,
-//             break_text_user_data   = &break_context,
-//         })
+//         layout.set_services(&ctx, tui.layout_services(&measure_context))
 //
 //         if layout.frame(&ctx, viewport) {
 //             if layout.element(&ctx, layout.Element_Desc{

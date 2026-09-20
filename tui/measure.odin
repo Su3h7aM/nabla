@@ -11,6 +11,13 @@ Measure_Context :: struct {
 	profile: text.Width_Profile,
 }
 
+// layout_services binds terminal measurement and breaking to layout for one
+// frame. measure_context must remain alive through layout.frame's deferred
+// solve.
+layout_services :: proc(measure_context: ^Measure_Context) -> layout.Services {
+	return {measure_text = measure_proc, measure_text_user_data = measure_context, break_text = break_proc}
+}
+
 // measure_proc is the layout.Services.measure_text callback.
 measure_proc :: proc(
 	user_data: rawptr,

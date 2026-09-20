@@ -96,7 +96,7 @@ test_text_draws_layout_wrapped_lines :: proc(t: ^testing.T) {
 	measure_context := Measure_Context {
 		profile = width_text.DEFAULT_WIDTH_PROFILE,
 	}
-	layout.set_services(&layout_ctx, {measure_text = measure_proc, measure_text_user_data = &measure_context, break_text = break_proc})
+	layout.set_services(&layout_ctx, layout_services(&measure_context))
 	parent_id := layout.Id(10)
 	text_id := layout.Id(11)
 	if layout.frame(&layout_ctx, {5, 2}) {

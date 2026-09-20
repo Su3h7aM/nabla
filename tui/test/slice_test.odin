@@ -134,7 +134,7 @@ render :: proc(app: App, storage: ^Render_Storage) -> (frame: term.Frame_Buffer,
 	}
 
 	viewport := layout.Vec2{layout.Scalar(app.columns), layout.Scalar(app.rows)}
-	layout.set_services(&storage.ctx, {measure_text = tui.measure_proc, measure_text_user_data = &storage.measure_context, break_text = tui.break_proc})
+	layout.set_services(&storage.ctx, tui.layout_services(&storage.measure_context))
 	if layout.frame(&storage.ctx, viewport) {
 		if layout.element(
 			&storage.ctx,

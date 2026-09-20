@@ -19,7 +19,7 @@ _wrapped_height :: proc(
 	body: string,
 	style: layout.Text_Style,
 ) -> layout.Scalar {
-	layout.set_services(ui, {measure_text = tui.measure_proc, measure_text_user_data = measure_context, break_text = tui.break_proc})
+	layout.set_services(ui, tui.layout_services(measure_context))
 	if layout.frame(ui, viewport) {
 		layout.text(ui, layout.Text_Desc{text = body, style = style, sizing = {layout.grow(), layout.fit()}})
 	}

@@ -16,8 +16,9 @@ test_measure_proc_counts_cells :: proc(t: ^testing.T) {
 		axes = {.X = {mode = .Unbounded}, .Y = {mode = .Unbounded}},
 	}
 
+	services := layout_services(&measure_context)
 	// An accented cluster is one cell and a wide character is two.
-	result, err := measure_proc(&measure_context, "café", {}, unbounded)
+	result, err := services.measure_text(services.measure_text_user_data, "café", {}, unbounded)
 	testing.expect_value(t, err, layout.Measure_Error.None)
 	testing.expect_value(t, result.size, layout.Vec2{4, 1})
 
