@@ -21,49 +21,9 @@ test_truncated_udp_falls_back_to_tcp :: proc(t: ^testing.T) {
 	fixture: Exchange_Fixture
 	fixture.answer = net.IP4_Address{192, 0, 2, 1}
 
-	udp, udp_err := net.make_bound_udp_socket(net.IP4_Address{127, 0, 0, 1}, 0)
-	if udp_err != nil {
-		testing.expectf(t, false, "the UDP peer could not bind: %v", udp_err)
-		return
-	}
-	fixture.udp = udp
-	_ = net.set_option(udp, .Receive_Timeout, DNS_TIMEOUT)
-	bound, bound_err := net.bound_endpoint(udp)
-	if bound_err != nil {
-		testing.expectf(t, false, "the UDP peer has no port: %v", bound_err)
-		net.close(udp)
-		return
-	}
-	listener, listen_err := net.listen_tcp(net.Endpoint{address = net.IP4_Address{127, 0, 0, 1}, port = bound.port})
-	if listen_err != nil {
-		testing.expectf(t, false, "the TCP peer could not listen: %v", listen_err)
-		net.close(udp)
-		return
-	}
-	fixture.tcp = listener
-	if block_err := net.set_blocking(listener, false); block_err != nil {
-		testing.expectf(t, false, "the TCP peer could not poll: %v", block_err)
-		net.close(listener)
-		net.close(udp)
-		return
-	}
-
-	udp_thread := thread.create(udp_truncate_serve)
-	tcp_thread := thread.create(tcp_answer_serve)
-	if udp_thread == nil || tcp_thread == nil {
-		testing.expect(t, false, "the peer threads could not start")
-		if udp_thread != nil { thread.destroy(udp_thread) }
-		if tcp_thread != nil { thread.destroy(tcp_thread) }
-		net.close(listener)
-		net.close(udp)
-		return
-	}
-	udp_thread.data = &fixture
-	tcp_thread.data = &fixture
-	thread.start(udp_thread)
-	thread.start(tcp_thread)
-
-	servers := [1]net.Endpoint{{address = net.IP4_Address{127, 0, 0, 1}, port = bound.port}}
+	udp_thread, tcp_thread, port, started := start_peers(t, &fixture)
+	if !started { return }
+	servers := [1]net.Endpoint{{address = net.IP4_Address{127, 0, 0, 1}, port = port}}
 	records, lookup_err := lookup("example.com", net.DNS_Record_Type.DNS_TYPE_A, Options{servers = servers[:]}, context.temp_allocator)
 	testing.expect_value(t, lookup_err, Error.None)
 	if lookup_err == .None {
@@ -76,25 +36,201 @@ test_truncated_udp_falls_back_to_tcp :: proc(t: ^testing.T) {
 		}
 	}
 
-	thread.join(udp_thread)
-	thread.destroy(udp_thread)
-	thread.join(tcp_thread)
-	thread.destroy(tcp_thread)
-	net.close(listener)
-	net.close(udp)
+	stop_peers(&fixture, udp_thread, tcp_thread)
 	testing.expect(t, fixture.udp_hit, "the query went out over UDP first")
 	testing.expect(t, fixture.tcp_hit, "the truncated reply was retried over TCP")
 }
 
+// test_mismatched_replies_are_passed_over sends a forged reply for another
+// query before the real truncated one. The client waits out the same attempt
+// for the genuine reply instead of acting on the forgery or abandoning the
+// server.
+@(test)
+test_mismatched_replies_are_passed_over :: proc(t: ^testing.T) {
+	fixture: Exchange_Fixture
+	fixture.answer = net.IP4_Address{192, 0, 2, 1}
+	fixture.send_decoy = true
+
+	udp_thread, tcp_thread, port, started := start_peers(t, &fixture)
+	if !started { return }
+	servers := [1]net.Endpoint{{address = net.IP4_Address{127, 0, 0, 1}, port = port}}
+	records, lookup_err := lookup("example.com", net.DNS_Record_Type.DNS_TYPE_A, Options{servers = servers[:]}, context.temp_allocator)
+	testing.expect_value(t, lookup_err, Error.None)
+	if lookup_err == .None {
+		defer net.destroy_dns_records(records, context.temp_allocator)
+		if testing.expect_value(t, len(records), 1) {
+			address, _ := records[0].(net.DNS_Record_IP4)
+			testing.expect_value(t, address.address, fixture.answer)
+		}
+	}
+
+	stop_peers(&fixture, udp_thread, tcp_thread)
+	testing.expect(t, fixture.udp_hit, "the query went out over UDP first")
+	testing.expect(t, fixture.tcp_hit, "the truncated reply was retried over TCP")
+}
+
+// test_split_length_prefix_is_assembled delivers the TCP length prefix in two
+// pieces. The client assembles the framing rather than reading it whole.
+@(test)
+test_split_length_prefix_is_assembled :: proc(t: ^testing.T) {
+	fixture: Exchange_Fixture
+	fixture.answer = net.IP4_Address{192, 0, 2, 1}
+	fixture.split_prefix = true
+
+	udp_thread, tcp_thread, port, started := start_peers(t, &fixture)
+	if !started { return }
+	servers := [1]net.Endpoint{{address = net.IP4_Address{127, 0, 0, 1}, port = port}}
+	records, lookup_err := lookup("example.com", net.DNS_Record_Type.DNS_TYPE_A, Options{servers = servers[:]}, context.temp_allocator)
+	testing.expect_value(t, lookup_err, Error.None)
+	if lookup_err == .None {
+		defer net.destroy_dns_records(records, context.temp_allocator)
+		if testing.expect_value(t, len(records), 1) {
+			address, _ := records[0].(net.DNS_Record_IP4)
+			testing.expect_value(t, address.address, fixture.answer)
+		}
+	}
+
+	stop_peers(&fixture, udp_thread, tcp_thread)
+	testing.expect(t, fixture.tcp_hit, "the split reply was retried over TCP")
+}
+
+// test_interruption_stops_a_lookup points a lookup at a peer that never
+// answers and fires the interrupt mid-attempt. The lookup reports Cancelled
+// rather than waiting out the attempt bound.
+@(test)
+test_interruption_stops_a_lookup :: proc(t: ^testing.T) {
+	fixture: Exchange_Fixture
+
+	udp, udp_err := net.make_bound_udp_socket(net.IP4_Address{127, 0, 0, 1}, 0)
+	if udp_err != nil {
+		testing.expectf(t, false, "the blackhole peer could not bind: %v", udp_err)
+		return
+	}
+	fixture.udp = udp
+	_ = net.set_option(udp, .Receive_Timeout, DNS_TIMEOUT)
+	bound, bound_err := net.bound_endpoint(udp)
+	if bound_err != nil {
+		testing.expectf(t, false, "the blackhole peer has no port: %v", bound_err)
+		net.close(udp)
+		return
+	}
+	blackhole := thread.create(udp_blackhole_serve)
+	if blackhole == nil {
+		testing.expect(t, false, "the blackhole thread could not start")
+		net.close(udp)
+		return
+	}
+	blackhole.data = &fixture
+	thread.start(blackhole)
+
+	state: Interrupt_State
+	servers := [1]net.Endpoint{{address = net.IP4_Address{127, 0, 0, 1}, port = bound.port}}
+	_, lookup_err := lookup(
+		"example.com",
+		net.DNS_Record_Type.DNS_TYPE_A,
+		Options{servers = servers[:], interrupt = {check = interrupt_fire, user_data = &state}},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, lookup_err, Error.Cancelled)
+	testing.expect(t, state.calls > 0, "the interrupt was asked")
+
+	thread.join(blackhole)
+	thread.destroy(blackhole)
+	net.close(udp)
+}
+
+// Interrupt_State counts interrupt checks; the check fires from the third
+// call on, so the lookup starts its attempt before it is stopped.
+Interrupt_State :: struct {
+	calls: int,
+}
+
+// interrupt_fire stops a lookup once it has begun: the first calls let the
+// attempt start so the stop lands mid-flight rather than at the door.
+interrupt_fire :: proc(user_data: rawptr) -> bool {
+	state := (^Interrupt_State)(user_data)
+	state.calls += 1
+	return state.calls >= 3
+}
+
+// udp_blackhole_serve reads one query and never answers it.
+udp_blackhole_serve :: proc(thread: ^thread.Thread) {
+	fixture := cast(^Exchange_Fixture)thread.data
+	buffer: [512]u8
+	net.recv_udp(fixture.udp, buffer[:])
+}
+
+// start_peers binds the UDP peer and the TCP peer on one shared port and
+// starts their threads. The fixture owns both sockets; stop_peers releases
+// everything. Threads are joined, never abandoned: every blocking call in a
+// peer carries a timeout.
+start_peers :: proc(t: ^testing.T, fixture: ^Exchange_Fixture) -> (udp_thread, tcp_thread: ^thread.Thread, port: int, started: bool) {
+	udp, udp_err := net.make_bound_udp_socket(net.IP4_Address{127, 0, 0, 1}, 0)
+	if udp_err != nil {
+		testing.expectf(t, false, "the UDP peer could not bind: %v", udp_err)
+		return nil, nil, 0, false
+	}
+	fixture.udp = udp
+	_ = net.set_option(udp, .Receive_Timeout, DNS_TIMEOUT)
+	bound, bound_err := net.bound_endpoint(udp)
+	if bound_err != nil {
+		testing.expectf(t, false, "the UDP peer has no port: %v", bound_err)
+		net.close(udp)
+		return nil, nil, 0, false
+	}
+	listener, listen_err := net.listen_tcp(net.Endpoint{address = net.IP4_Address{127, 0, 0, 1}, port = bound.port})
+	if listen_err != nil {
+		testing.expectf(t, false, "the TCP peer could not listen: %v", listen_err)
+		net.close(udp)
+		return nil, nil, 0, false
+	}
+	fixture.tcp = listener
+	if block_err := net.set_blocking(listener, false); block_err != nil {
+		testing.expectf(t, false, "the TCP peer could not poll: %v", block_err)
+		net.close(listener)
+		net.close(udp)
+		return nil, nil, 0, false
+	}
+
+	udp_thread, tcp_thread = thread.create(udp_truncate_serve), thread.create(tcp_answer_serve)
+	if udp_thread == nil || tcp_thread == nil {
+		testing.expect(t, false, "the peer threads could not start")
+		if udp_thread != nil { thread.destroy(udp_thread) }
+		if tcp_thread != nil { thread.destroy(tcp_thread) }
+		net.close(listener)
+		net.close(udp)
+		return nil, nil, 0, false
+	}
+	udp_thread.data = fixture
+	tcp_thread.data = fixture
+	thread.start(udp_thread)
+	thread.start(tcp_thread)
+	return udp_thread, tcp_thread, bound.port, true
+}
+
+// stop_peers joins the peer threads and closes their sockets.
+stop_peers :: proc(fixture: ^Exchange_Fixture, udp_thread, tcp_thread: ^thread.Thread) {
+	thread.join(udp_thread)
+	thread.destroy(udp_thread)
+	thread.join(tcp_thread)
+	thread.destroy(tcp_thread)
+	net.close(fixture.tcp)
+	net.close(fixture.udp)
+}
+
 // Exchange_Fixture is one UDP peer that truncates every query and one TCP
-// peer that answers it, sharing a port. The flags are read after both
-// threads join, so no further synchronization is needed.
+// peer that answers it, sharing a port. The flags ask for hostile shapes:
+// a decoy reply before the real one, and a split length prefix. The result
+// flags are read after both threads join, so no further synchronization is
+// needed.
 Exchange_Fixture :: struct {
-	udp:     net.UDP_Socket,
-	tcp:     net.TCP_Socket,
-	answer:  net.IP4_Address,
-	udp_hit: bool,
-	tcp_hit: bool,
+	udp:          net.UDP_Socket,
+	tcp:          net.TCP_Socket,
+	answer:       net.IP4_Address,
+	udp_hit:      bool,
+	tcp_hit:      bool,
+	send_decoy:   bool,
+	split_prefix: bool,
 }
 
 // PEER_BOUND limits one peer exchange. It is hit only when the exchange
@@ -124,6 +260,13 @@ udp_truncate_serve :: proc(thread: ^thread.Thread) {
 	reply[3] = 0x00
 	reply[5] = 0x01
 	copy(reply[HEADER_SIZE:], buffer[HEADER_SIZE:received])
+	if fixture.send_decoy {
+		// A forged reply for another query: same shape, a flipped ID. The
+		// client passes it over within the same attempt.
+		decoy := reply
+		decoy[0] ~= 0xFF
+		net.send_udp(fixture.udp, decoy[:received], source)
+	}
 	net.send_udp(fixture.udp, reply[:received], source)
 }
 
@@ -177,6 +320,14 @@ tcp_answer :: proc(fixture: ^Exchange_Fixture, conn: net.TCP_Socket) {
 	at += copy(reply[at:], fixture.answer[:])
 	reply[0] = u8((at - 2) >> 8)
 	reply[1] = u8(at - 2)
+	if fixture.split_prefix {
+		// The length prefix arrives in two pieces, so the client must
+		// assemble it rather than read it whole.
+		tcp_write_full(conn, reply[:1])
+		time.sleep(50 * time.Millisecond)
+		tcp_write_full(conn, reply[1:at])
+		return
+	}
 	tcp_write_full(conn, reply[:at])
 }
 
