@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:strings"
 import "core:sync"
 import "core:sync/chan"
+import "core:unicode/utf8"
 
 import "nabla:agent"
 import input "nabla:input"
@@ -369,6 +370,12 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 		widgets.input_move_left(&app.input)
 	case .Right:
 		widgets.input_move_right(&app.input)
+	case .Up:
+		completion_reset(app)
+		widgets.input_move_up(&app.input, input_content_width(app))
+	case .Down:
+		completion_reset(app)
+		widgets.input_move_down(&app.input, input_content_width(app))
 	case .Home:
 		widgets.input_move_home(&app.input)
 	case .End:
@@ -397,7 +404,6 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 		}
 	case .Tab:
 		complete_command(app)
-	case .Up, .Down:
 	case .Character:
 		if .Control in key.modifiers {
 			switch key.character {
@@ -509,20 +515,25 @@ enqueue :: proc(app: ^App, kind: Work_Kind, text: string = "") {
 
 // --- prompt line editing --------------------------------------------------
 
-// paste_insert inserts a bracketed paste at the cursor. A single-line prompt
-// has no place for a line break, so CR/LF become spaces and other controls are
-// dropped.
+// paste_insert inserts a bracketed paste at the caret. Line breaks are kept, so a
+// pasted block stays the block it was; CR and CRLF are read as the one break they
+// mean, and every other control byte is dropped.
 paste_insert :: proc(app: ^App, text_value: string) {
 	if text_value == "" {
 		return
 	}
 	run := strings.builder_make(0, 0, context.temp_allocator)
-	for r in text_value {
+	for index := 0; index < len(text_value); {
+		r, width := utf8.decode_rune(text_value[index:])
+		index += max(width, 1)
 		switch {
-		case r == '\r' || r == '\n':
-			strings.write_byte(&run, ' ')
+		case r == '\n':
+			strings.write_byte(&run, '\n')
+		case r == '\r':
+			strings.write_byte(&run, '\n')
+			if index < len(text_value) && text_value[index] == '\n' { index += 1 }
 		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
-		// A control code point has no place in the prompt line.
+		// A control code point has no place in the prompt.
 		case:
 			strings.write_rune(&run, r)
 		}

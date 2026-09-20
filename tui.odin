@@ -163,10 +163,12 @@ Line :: struct {
 	indent: int,
 }
 
-Input_Line :: struct {
-	text:  string,
-	start: int,
-	end:   int,
+// input_content_width is the columns the prompt's text is drawn in: the frame's
+// content rect, less the box's border and its one-cell inset on each side. The
+// caret's rows are wrapped at this width, so the key handler and the box have to
+// agree on it.
+input_content_width :: proc(app: ^App) -> int {
+	return max(app.columns - 6, 1)
 }
 
 Render_Status :: enum u8 {
@@ -288,7 +290,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 		width  = max(cols - 2, 0),
 		height = rows,
 	}
-	input_rows := input_visible_rows(&app.input, max(content.width - 4, 1))
+	input_rows := input_visible_rows(&app.input, input_content_width(app))
 	heights := [4]int{-1, input_rows + 2, 1, 1}
 	regions: [4]tui.Cell_Rect
 	if !tui.rows(content, heights[:], regions[:]) {
@@ -853,51 +855,14 @@ draw_rule :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	tui.fill(&storage.buffer, rect, "─", RULE_STYLE)
 }
 
-input_lines :: proc(input: ^widgets.Input, width: int) -> [dynamic]Input_Line {
-	lines := make([dynamic]Input_Line, 0, 8, context.temp_allocator)
-	value := widgets.input_text(input)
-	start := 0
-	for {
-		rest := value[start:]
-		relative_end := strings.index(rest, "\n")
-		logical_end := len(value)
-		has_newline := relative_end >= 0
-		if has_newline { logical_end = start + relative_end }
-		if start == logical_end {
-			append(&lines, Input_Line{text = "", start = start, end = start})
-		} else {
-			at := start
-			for at < logical_end {
-				piece := text.truncate_text(value[at:logical_end], width)
-				end := at + len(piece)
-				if end == at { end = text.next_grapheme_offset(value, at) }
-				append(&lines, Input_Line{text = value[at:end], start = at, end = end})
-				at = end
-			}
-		}
-		if !has_newline { break }
-		start = logical_end + 1
-		if start > len(value) { break }
-	}
-	return lines
-}
-
-input_cursor_row :: proc(input: ^widgets.Input, lines: []Input_Line) -> int {
-	cursor := widgets.input_cursor(input)
-	row := 0
-	for line, index in lines {
-		if cursor >= line.start && cursor <= line.end { row = index }
-	}
-	return row
-}
-
 input_visible_rows :: proc(input: ^widgets.Input, width: int) -> int {
-	lines := input_lines(input, width)
+	lines := widgets.input_lines(input, width)
 	return clamp(len(lines), 1, INPUT_MAX_ROWS)
 }
 
 // draw_input draws a rounded prompt box and returns the caret. The box grows
-// through five content rows; after that the wrapped rows scroll around the caret.
+// through five content rows; after that the rows scroll around the caret, which
+// is the widget's own window (draw_input).
 draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> term.Cursor {
 	if rect.height < 3 || rect.width <= 4 { return {} }
 	border_style := RULE_STYLE
@@ -918,23 +883,7 @@ draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> t
 		height = rect.height - 2,
 	}
 	if content.width <= 0 || content.height <= 0 { return {} }
-	lines := input_lines(&app.input, content.width)
-	cursor_row := input_cursor_row(&app.input, lines[:])
-	start := max(cursor_row - content.height + 1, 0)
-	if start > max(len(lines) - content.height, 0) { start = max(len(lines) - content.height, 0) }
-	for row in 0 ..< content.height {
-		index := start + row
-		if index >= len(lines) { break }
-		_, _ = tui.draw_text(&storage.buffer, {x = content.x, y = content.y + row, width = content.width, height = 1}, lines[index].text, INPUT_TEXT)
-	}
-	caret_line := lines[cursor_row]
-	cursor := widgets.input_cursor(&app.input)
-	column := text.text_columns(widgets.input_text(&app.input)[caret_line.start:cursor])
-	return term.Cursor {
-		visible = true,
-		position = {clamp(content.x + column, content.x, content.x + content.width - 1), content.y + cursor_row - start},
-		placed = true,
-	}
+	return widgets.draw_input(&storage.buffer, content, &app.input, INPUT_TEXT)
 }
 
 // draw_footer paints the two footer rows: the working directory, then the

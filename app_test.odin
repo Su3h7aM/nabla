@@ -9,6 +9,7 @@ import "core:time"
 
 import "nabla:agent"
 import "nabla:ai"
+import input "nabla:input"
 import "nabla:tui/widgets"
 
 // ctrl_c_app builds the minimum an interrupt reads: the prompt buffer and whether
@@ -133,4 +134,42 @@ test_a_scheduled_retry_is_shown_until_the_send_clears_it :: proc(t: ^testing.T) 
 	clear_retry(&app)
 	testing.expect(t, !app.run.snap.status.retry_present, "the send that followed clears the retry")
 	testing.expect(t, strings.has_prefix(working_label(&app), "Working for "), "clearing retry state does not reset the turn timer")
+}
+
+// A pasted block keeps its line breaks, so a multi-line paste stays the block it
+// was. CR and CRLF are read as the one break they mean and the other controls are
+// still dropped.
+@(test)
+test_paste_keeps_line_breaks :: proc(t: ^testing.T) {
+	app := new(App)
+	defer free(app)
+	app.run.alloc = context.allocator
+	widgets.input_init(&app.input, context.allocator)
+	defer widgets.input_destroy(&app.input)
+
+	paste_insert(app, "first\r\nsecond\nthird\tend\x07")
+	testing.expect_value(t, widgets.input_text(&app.input), "first\nsecond\nthirdend")
+}
+
+// The arrow keys move the caret between the prompt's rows, so a multi-line prompt
+// can be edited without leaving the keyboard. The column is kept where the row
+// reaches it and falls to that row's end where it does not.
+@(test)
+test_arrow_keys_move_between_prompt_rows :: proc(t: ^testing.T) {
+	app := new(App)
+	defer free(app)
+	app.run.alloc = context.allocator
+	app.columns = 40
+	widgets.input_init(&app.input, context.allocator)
+	defer widgets.input_destroy(&app.input)
+
+	paste_insert(app, "one\ntwo\nthree")
+	testing.expect_value(t, widgets.input_cursor(&app.input), len("one\ntwo\nthree"))
+
+	handle_key(app, input.Key_Event{code = .Up})
+	testing.expect_value(t, widgets.input_cursor(&app.input), len("one\ntwo"))
+	handle_key(app, input.Key_Event{code = .Up})
+	testing.expect_value(t, widgets.input_cursor(&app.input), len("one"))
+	handle_key(app, input.Key_Event{code = .Down})
+	testing.expect_value(t, widgets.input_cursor(&app.input), len("one\ntwo"))
 }

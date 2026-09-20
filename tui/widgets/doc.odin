@@ -3,7 +3,9 @@
 // Block and Input have scoped forms that draw in the active tui element. Their
 // geometry comes from layout: Block uses the resolved outer box and expects
 // layout padding to reserve its border, while Input uses the selected box and
-// only computes horizontal text visibility and caret placement.
+// only computes which rows the box shows and where the caret sits in them. The
+// caret's rows come from input_lines, so the box a caller draws and the rows the
+// caret moves through are the same wrap.
 //
 // Paragraph and List retain explicit Cell_Rect forms for callers using tui's
 // low-level frame-buffer API. They perform local row iteration inside that

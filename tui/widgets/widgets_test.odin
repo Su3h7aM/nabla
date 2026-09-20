@@ -85,13 +85,15 @@ test_input_edits_by_cluster :: proc(t: ^testing.T) {
 
 	testing.expect(t, input_move_end(&input))
 	testing.expect(t, input_insert(&input, "a\nb\tc"))
-	testing.expect_value(t, input_text(&input), "xabc")
+	// The line break is kept and the tab is dropped, so the text keeps the shape
+	// it was pasted in.
+	testing.expect_value(t, input_text(&input), "xa\nbc")
 	testing.expect(t, !input_insert(&input, "\xff"))
-	testing.expect_value(t, input_text(&input), "xabc")
+	testing.expect_value(t, input_text(&input), "xa\nbc")
 
 	testing.expect(t, input_move_home(&input))
 	testing.expect(t, input_delete(&input))
-	testing.expect_value(t, input_text(&input), "abc")
+	testing.expect_value(t, input_text(&input), "a\nbc")
 }
 
 @(test)
@@ -107,6 +109,50 @@ test_input_keeps_explicit_newlines :: proc(t: ^testing.T) {
 	testing.expect_value(t, input_cursor(&input), len(accounting))
 }
 
+// Up and down move by the rows the caller draws, not by logical lines. A row the
+// caret passes that is shorter than the column it came from puts the caret at
+// that row's end, and a wrapped line is walked row by row.
+@(test)
+test_input_moves_between_drawn_rows :: proc(t: ^testing.T) {
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+	testing.expect(t, input_insert(&input, "one\ntwo\nthree"))
+
+	// The caret starts at the end of the last row. Moving up keeps the column
+	// where the row reaches it, and "two" is too short, so the caret falls to its
+	// end instead of a column the row does not have.
+	testing.expect(t, input_move_up(&input, 5))
+	testing.expect_value(t, input_cursor(&input), len("one\ntwo"))
+	testing.expect(t, input_move_down(&input, 5))
+	testing.expect_value(t, input_cursor(&input), len("one\ntwo\n") + len("thr"))
+	testing.expect(t, !input_move_down(&input, 5), "the last row has no row below it")
+
+	// Up again lands on the same end, and the first row has no row above it.
+	testing.expect(t, input_move_up(&input, 5))
+	testing.expect_value(t, input_cursor(&input), len("one\ntwo"))
+	testing.expect(t, input_move_up(&input, 5))
+	testing.expect_value(t, input_cursor(&input), len("one"))
+	testing.expect(t, !input_move_up(&input, 5), "the first row has no row above it")
+
+	// A wrapped line is several rows, so the caret walks it row by row.
+	wrapped: Input
+	input_init(&wrapped)
+	defer input_destroy(&wrapped)
+	testing.expect(t, input_insert(&wrapped, "abcdefgh"))
+	testing.expect(t, input_move_home(&wrapped))
+	testing.expect(t, input_move_down(&wrapped, 3))
+	testing.expect_value(t, input_cursor(&wrapped), 3)
+	testing.expect(t, input_move_down(&wrapped, 3))
+	testing.expect_value(t, input_cursor(&wrapped), 6)
+	testing.expect(t, !input_move_down(&wrapped, 3), "the last row has no row below it")
+	testing.expect(t, input_move_up(&wrapped, 3))
+	testing.expect_value(t, input_cursor(&wrapped), 3)
+}
+
+// The caret's row is what the window follows: a caret below the rect scrolls the
+// rows above it out, and a row wider than the rect wraps instead of running past
+// the edge.
 @(test)
 test_input_caret_tracks_the_visible_window :: proc(t: ^testing.T) {
 	input: Input
@@ -114,26 +160,31 @@ test_input_caret_tracks_the_visible_window :: proc(t: ^testing.T) {
 	defer input_destroy(&input)
 	testing.expect(t, input_insert(&input, "ab界"))
 
+	// The text is exactly as wide as the rect, so it is one row and the caret has
+	// no cell past it to sit in.
 	storage: [8]term.Cell
 	frame := _frame(storage[:], 4, 1)
-	cursor := draw_input(&frame, {width = 4, height = 1}, input, {})
+	cursor := draw_input(&frame, {width = 4, height = 1}, &input, {})
 	testing.expect(t, cursor.visible)
 	testing.expect_value(t, cursor.position, term.Position{3, 0})
-	testing.expect_value(t, frame.cells[0].grapheme, "b")
-	testing.expect_value(t, frame.cells[1].grapheme, "界")
-	testing.expect_value(t, frame.cells[1].width, u8(2))
+	testing.expect_value(t, frame.cells[0].grapheme, "a")
+	testing.expect_value(t, frame.cells[1].grapheme, "b")
+	testing.expect_value(t, frame.cells[2].grapheme, "界")
+	testing.expect_value(t, frame.cells[2].width, u8(2))
 
-	// A wide cluster that would fill the last cell is scrolled out, so the caret
-	// has a free cell after the text.
-	wide: Input
-	input_init(&wide)
-	defer input_destroy(&wide)
-	testing.expect(t, input_insert(&wide, "界a"))
-	wide_storage: [4]term.Cell
-	wide_frame := _frame(wide_storage[:], 3, 1)
-	wide_cursor := draw_input(&wide_frame, {width = 3, height = 1}, wide, {})
-	testing.expect_value(t, wide_cursor.position, term.Position{1, 0})
-	testing.expect_value(t, wide_frame.cells[0].grapheme, "a")
+	// A two-row window keeps the caret's row in view, so the rows above it scroll
+	// out rather than the caret leaving the rect.
+	lines: Input
+	input_init(&lines)
+	defer input_destroy(&lines)
+	testing.expect(t, input_insert(&lines, "one\ntwo\nthree"))
+	line_storage: [10]term.Cell
+	line_frame := _frame(line_storage[:], 5, 2)
+	line_cursor := draw_input(&line_frame, {width = 5, height = 2}, &lines, {})
+	testing.expect_value(t, line_cursor.position, term.Position{4, 1})
+	testing.expect_value(t, line_frame.cells[0].grapheme, "t")
+	testing.expect_value(t, line_frame.cells[5].grapheme, "t")
+	testing.expect_value(t, line_frame.cells[9].grapheme, "e")
 }
 
 @(test)
@@ -179,7 +230,7 @@ test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
 		if tui.element(&ctx, {id = block_id}) {
 			draw_block(&ctx, Block{border = BORDER_SINGLE})
 			if tui.element(&ctx, {id = input_id}) {
-				draw_input(&ctx, input, {})
+				draw_input(&ctx, &input, {})
 			}
 		}
 	}
