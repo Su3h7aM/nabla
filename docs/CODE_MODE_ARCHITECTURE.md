@@ -169,6 +169,21 @@ The chunk returns zero or one value. No return becomes JSON null. Multiple retur
 values fail explicitly. Script globals live only until this invocation retires.
 Effects already performed by tools survive script failure. There is no rollback.
 
+The returned value is converted by the same rule the arguments use, so a script may
+answer with an object or an array as easily as with a string:
+
+| Chunk | `data.output` |
+| --- | --- |
+| `return "done"` | `"done"` |
+| `return 42` | `42` |
+| `return {ok = true}` | `{"ok":true}` |
+| `local x = 1` | `null` |
+
+A value the conversion cannot represent, a cycle, and a second return value are
+`invalid_value` failures, not silent truncations. The envelope is bounded by the same
+64 KiB result limit as every tool, and Code Mode reports its own `output_limit` rather
+than letting finalization replace the result with a generic oversized message.
+
 Canonical names are flat Lua identifiers, so wrappers use ordinary field syntax:
 `tools.fff_grep({...})` and `tools.github_create_issue({...})`. The underscore between
 namespace and local name is part of the one canonical provider name, not a hierarchy
@@ -1181,9 +1196,23 @@ limit, or is cancelled.
 Nested results remain outside the provider context budget and do not increment the
 turn's top-level result barrier. They still pass through normal admission, dispatch,
 execution, result finalization, durable recording, observer reporting, and retirement.
-The parent result contains its string return value and bounded `print` log. The
-integration test executes two sequential child calls, verifies both parent relations,
-and verifies that three durable results satisfy one provider-call barrier.
+The parent result contains its return value as structured JSON, its bounded `print` log,
+and a truncation flag for that log. The integration test executes two sequential child
+calls, verifies both parent relations, and verifies that three durable results satisfy
+one provider-call barrier.
+
+A failure carries a `kind` from a closed vocabulary: `syntax_error`, `runtime_error`,
+`invalid_value`, `memory_limit`, `instruction_limit`, `tool_call_limit`,
+`output_limit`, `cancelled`, `deadline`, and `unavailable`. The kind sits in the
+ordinary envelope's data, so the outer `Tool_Outcome` still reports what the harness
+observed while the kind reports which fault or limit produced it. `output_limit` is
+raised by Code Mode itself before the generic oversized replacement can hide which
+value was too large.
+
+Still to implement from section 12: compact child-call summaries, the
+`unfinished_tasks` kind for the concurrent-handle form, and the per-execution child
+call limit of 32. Today a nested call is bounded by the table's own `TOOL_JOBS_MAX`,
+which is a batch limit rather than a per-script one.
 
 ## 15. Decisions deliberately left open
 

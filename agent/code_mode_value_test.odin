@@ -2,6 +2,7 @@
 #+private file
 package agent
 
+import "core:encoding/json"
 import "core:strings"
 import "core:testing"
 
@@ -67,5 +68,58 @@ return tools.test_echo(value)`)
 	arguments, message := code_mode_lua_request_json(run, context.allocator)
 	defer delete(arguments)
 	testing.expect_value(t, arguments, "")
-	testing.expect_value(t, message, "the tool arguments contain a cycle")
+	testing.expect_value(t, message, "the value contains a cycle")
+}
+
+// The chunk has exactly one answer. Zero values are JSON null, one value is converted
+// as it stands, and more than one is refused rather than silently truncated. Object key
+// order is the map's, so each case names the fragments its encoding must carry.
+@(test)
+code_mode_value_converts_the_chunk_return :: proc(t: ^testing.T) {
+	cases := []struct {
+		source:    string,
+		fragments: []string,
+	} {
+		{`return "text"`, []string{`"text"`}},
+		{`return 42`, []string{`42`}},
+		{`return true`, []string{`true`}},
+		{`return json.null`, []string{`null`}},
+		{`local x = 1`, []string{`null`}},
+		{`return { status = "ok", items = { 1, 2, 3 } }`, []string{`"status":"ok"`, `"items":[1,2,3]`}},
+		{`return { nested = { deep = { flag = false } } }`, []string{`"nested":{"deep":{"flag":false}}`}},
+	}
+	for c in cases {
+		run := code_mode_value_test_start(t, c.source)
+		testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Returned)
+		value, message := code_mode_lua_returned_json(run, context.temp_allocator)
+		if !testing.expectf(t, message == "", "%q should convert: %s", c.source, message) {
+			code_mode_lua_destroy(run)
+			continue
+		}
+		encoded, encode_err := json.marshal(value, allocator = context.temp_allocator)
+		testing.expectf(t, encode_err == nil, "%q should encode", c.source)
+		for fragment in c.fragments {
+			testing.expectf(t, strings.contains(string(encoded), fragment), "%q should carry %s, got %s", c.source, fragment, string(encoded))
+		}
+		json.destroy_value(value, context.temp_allocator)
+		code_mode_lua_destroy(run)
+	}
+}
+
+@(test)
+code_mode_value_refuses_an_ambiguous_return :: proc(t: ^testing.T) {
+	run := code_mode_value_test_start(t, `return "first", "second"`)
+	defer code_mode_lua_destroy(run)
+	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Returned)
+	_, message := code_mode_lua_returned_json(run, context.temp_allocator)
+	testing.expect(t, strings.contains(message, "more than one value"), message)
+}
+
+@(test)
+code_mode_value_refuses_a_return_that_is_not_json :: proc(t: ^testing.T) {
+	run := code_mode_value_test_start(t, `return function() end`)
+	defer code_mode_lua_destroy(run)
+	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Returned)
+	_, message := code_mode_lua_returned_json(run, context.temp_allocator)
+	testing.expect(t, strings.contains(message, "cannot be written as JSON"), message)
 }

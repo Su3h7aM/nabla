@@ -26,14 +26,14 @@ tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job
 
 	run, compiled := code_mode_lua_start(job.allocator, lua_limits_default(), source)
 	if run == nil {
-		job.result = tool_result_failure(&job.exec, .Tool_Failed, "the Lua execution could not be created", "executor unavailable")
+		job.result = code_mode_failure(&job.exec, .Tool_Failed, .Unavailable, "the Lua execution could not be created", "executor unavailable")
 		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
 	job.lua = run
 	if !compiled {
-		job.result = tool_result_failure(&job.exec, .Tool_Failed, code_mode_lua_message(run), "syntax error")
+		job.result = code_mode_failure(&job.exec, .Tool_Failed, .Syntax_Error, code_mode_lua_message(run), "syntax error")
 		job.result_present = true
 		job.phase = .Result_Ready
 		return
@@ -41,7 +41,7 @@ tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job
 	for &definition in chat.tools.definitions {
 		if definition.name == TOOL_CODE_NAME { continue }
 		if !code_mode_lua_install_tool(run, definition.name) {
-			job.result = tool_result_failure(&job.exec, .Tool_Failed, "the Lua tool table could not be built", "executor unavailable")
+			job.result = code_mode_failure(&job.exec, .Tool_Failed, .Unavailable, "the Lua tool table could not be built", "executor unavailable")
 			job.result_present = true
 			job.phase = .Result_Ready
 			return
@@ -67,45 +67,100 @@ tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Jo
 	case .Host_Request:
 		tool_job_lua_submit_child(jobs, chat, job)
 	case .Returned:
-		output, _ := code_mode_lua_returned_string(job.lua)
-		job.result = tool_result_success(&job.exec, Code_Mode_Result_Data{output = output, logs = code_mode_lua_logs(job.lua)}, "completed")
-		job.result_present = true
-		job.phase = .Result_Ready
+		tool_job_lua_finish(job)
 	case .Stopped:
 		outcome := session.Tool_Outcome.Tool_Failed
+		diagnostic := Code_Mode_Diagnostic.Instruction_Limit
 		reason := "stopped"
 		switch job.lua.stop {
 		case .Cancelled:
 			outcome = .Cancelled
+			diagnostic = .Cancelled
 			reason = "cancelled"
 		case .Deadline:
 			outcome = .Timed_Out
+			diagnostic = .Deadline
 			reason = "timed out"
 		case .Instructions:
 			reason = "instruction limit"
 		case .None:
 		}
-		job.result = tool_result_failure(&job.exec, outcome, code_mode_lua_message(job.lua), reason)
+		job.result = code_mode_failure(&job.exec, outcome, diagnostic, code_mode_lua_message(job.lua), reason)
 		job.result_present = true
 		job.phase = .Result_Ready
 	case .Failed:
-		job.result = tool_result_failure(&job.exec, .Tool_Failed, code_mode_lua_message(job.lua), "Lua failed")
+		diagnostic := Code_Mode_Diagnostic.Runtime_Error
+		switch code_mode_lua_failure(job.lua) {
+		case .Syntax:
+			diagnostic = .Syntax_Error
+		case .Memory:
+			diagnostic = .Memory_Limit
+		case .None, .Runtime:
+		}
+		job.result = code_mode_failure(&job.exec, .Tool_Failed, diagnostic, code_mode_lua_message(job.lua), "Lua failed")
 		job.result_present = true
 		job.phase = .Result_Ready
 	}
 }
 
+// tool_job_lua_finish builds the parent result from a chunk that returned. The return
+// value becomes structured JSON, so a script answers with an object or an array as
+// easily as with a string, and the result budget is enforced here rather than by the
+// generic oversized replacement, which would hide which value was too large.
+@(private)
+tool_job_lua_finish :: proc(job: ^Tool_Job) {
+	run := job.lua
+	logs := code_mode_lua_logs(run)
+	output, message := code_mode_lua_returned_json(run, job.allocator)
+	if message != "" {
+		job.result = code_mode_failure(&job.exec, .Tool_Failed, .Invalid_Value, message, "invalid return value")
+		job.result_present = true
+		job.phase = .Result_Ready
+		return
+	}
+	defer json.destroy_value(output, job.allocator)
+	result := tool_result_of(
+		&job.exec,
+		.Success,
+		"",
+		Code_Mode_Result_Data{output = output, logs = logs, logs_truncated = code_mode_lua_logs_truncated(run)},
+		"completed",
+	)
+	if len(result.content) > TOOL_MAX_RESULT_BYTES {
+		tool_result_destroy(&result)
+		job.result = code_mode_failure(
+			&job.exec,
+			.Tool_Failed,
+			.Output_Limit,
+			fmt.tprintf("the returned value and logs exceed the %d-byte result limit; return less from the script", TOOL_MAX_RESULT_BYTES),
+			"output limit",
+		)
+		job.result_present = true
+		job.phase = .Result_Ready
+		return
+	}
+	job.result = result
+	job.result_present = true
+	job.phase = .Result_Ready
+}
+
 @(private)
 tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: ^Tool_Job) {
 	if len(jobs.jobs) >= TOOL_JOBS_MAX {
-		parent.result = tool_result_failure(&parent.exec, .Tool_Failed, "the Code Mode execution created too many tool calls", "tool call limit")
+		parent.result = code_mode_failure(
+			&parent.exec,
+			.Tool_Failed,
+			.Tool_Call_Limit,
+			"the Code Mode execution created too many tool calls",
+			"tool call limit",
+		)
 		parent.result_present = true
 		parent.phase = .Result_Ready
 		return
 	}
 	arguments, message := code_mode_lua_request_json(parent.lua, parent.allocator)
 	if message != "" {
-		parent.result = tool_result_failure(&parent.exec, .Invalid_Arguments, message, "invalid child arguments")
+		parent.result = code_mode_failure(&parent.exec, .Invalid_Arguments, .Invalid_Value, message, "invalid child arguments")
 		parent.result_present = true
 		parent.phase = .Result_Ready
 		return
@@ -114,7 +169,7 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 
 	child, alloc_error := mem.new(Tool_Job, jobs.allocator)
 	if alloc_error != nil {
-		parent.result = tool_result_failure(&parent.exec, .Tool_Failed, "the nested tool call could not be allocated", "allocation failed")
+		parent.result = code_mode_failure(&parent.exec, .Tool_Failed, .Unavailable, "the nested tool call could not be allocated", "allocation failed")
 		parent.result_present = true
 		parent.phase = .Result_Ready
 		return
@@ -134,7 +189,7 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 	if append_error != nil {
 		mem.free(child, jobs.allocator)
 		chat_session_record_failure(chat, "the nested tool call could not be recorded", append_error)
-		parent.result = tool_result_failure(&parent.exec, .Tool_Failed, "the nested tool call could not be recorded", "storage failed")
+		parent.result = code_mode_failure(&parent.exec, .Tool_Failed, .Unavailable, "the nested tool call could not be recorded", "storage failed")
 		parent.result_present = true
 		parent.phase = .Result_Ready
 		return

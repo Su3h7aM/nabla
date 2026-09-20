@@ -45,9 +45,9 @@ code_mode_lua_request_json :: proc(run: ^Lua_Run, allocator: mem.Allocator) -> (
 
 @(private)
 code_mode_lua_to_json_value :: proc(L: ^l.State, index: c.int, state: ^Code_Mode_Value_State, depth: int) -> (json.Value, string) {
-	if depth > TOOL_MAX_ARGS_DEPTH { return {}, "the tool arguments nest too deeply" }
+	if depth > TOOL_MAX_ARGS_DEPTH { return {}, "the value nests more than 32 levels deep" }
 	state.nodes += 1
-	if state.nodes > CODE_MODE_VALUE_MAX_NODES { return {}, "the tool arguments contain too many values" }
+	if state.nodes > CODE_MODE_VALUE_MAX_NODES { return {}, "the value contains more than 16384 elements" }
 
 	switch l.type(L, index) {
 	case .NIL:
@@ -58,17 +58,17 @@ code_mode_lua_to_json_value :: proc(L: ^l.State, index: c.int, state: ^Code_Mode
 		if l.isinteger(L, index) {
 			ok: b32
 			value := l.tointeger(L, index, &ok)
-			if !ok { return {}, "a tool argument is not a usable integer" }
+			if !ok { return {}, "a number is not a usable integer" }
 			return json.Value(json.Integer(value)), ""
 		}
 		ok: b32
 		value := l.tonumber(L, index, &ok)
-		if !ok { return {}, "a tool argument is not a usable number" }
+		if !ok { return {}, "a number is not a usable number" }
 		return json.Value(json.Float(value)), ""
 	case .STRING:
 		length: c.size_t
 		pointer := l.tolstring(L, index, &length)
-		if pointer == nil { return {}, "a tool argument string could not be read" }
+		if pointer == nil { return {}, "a string could not be read" }
 		bytes := cast([^]u8)pointer
 		text := strings.clone(string(bytes[:int(length)]), state.allocator)
 		return json.Value(json.String(text)), ""
@@ -76,20 +76,20 @@ code_mode_lua_to_json_value :: proc(L: ^l.State, index: c.int, state: ^Code_Mode
 		if state.null_identity != nil && l.touserdata(L, index) == state.null_identity {
 			return json.Value(json.Null(nil)), ""
 		}
-		return {}, "tool arguments may contain only JSON values"
+		return {}, "a value of this Lua type cannot be written as JSON"
 	case .TABLE:
 		return code_mode_lua_table_to_json(L, index, state, depth)
 	case .NONE, .FUNCTION, .USERDATA, .THREAD:
-		return {}, "tool arguments may contain only JSON values"
+		return {}, "a value of this Lua type cannot be written as JSON"
 	}
-	return {}, "the tool arguments contain an unsupported value"
+	return {}, "a value of this Lua type cannot be written as JSON"
 }
 
 @(private)
 code_mode_lua_table_to_json :: proc(L: ^l.State, index: c.int, state: ^Code_Mode_Value_State, depth: int) -> (json.Value, string) {
 	absolute := l.absindex(L, index)
 	identity := l.topointer(L, absolute)
-	if identity != nil && state.seen[identity] { return {}, "the tool arguments contain a cycle" }
+	if identity != nil && state.seen[identity] { return {}, "the value contains a cycle" }
 	if identity != nil { state.seen[identity] = true }
 	defer if identity != nil { delete_key(&state.seen, identity) }
 
@@ -108,13 +108,13 @@ code_mode_lua_table_to_json :: proc(L: ^l.State, index: c.int, state: ^Code_Mode
 			array = false
 		} else {
 			l.pop(L, 2)
-			return {}, "a tool argument table has a key that is not a string or dense array index"
+			return {}, "a table has a key that is not a string or a dense array index"
 		}
 		l.pop(L, 1)
 	}
 	if count == 0 { object = true }
 	if array && count != length { array = false }
-	if !array && !object { return {}, "a tool argument table mixes object fields and array indexes" }
+	if !array && !object { return {}, "a table mixes object fields and array indexes" }
 
 	if array {
 		values := make(json.Array, length, state.allocator)
@@ -140,7 +140,7 @@ code_mode_lua_table_to_json :: proc(L: ^l.State, index: c.int, state: ^Code_Mode
 		pointer := l.tolstring(L, -2, &length)
 		if pointer == nil {
 			l.pop(L, 2)
-			return {}, "a tool argument object key could not be read"
+			return {}, "a table key could not be read"
 		}
 		bytes := cast([^]u8)pointer
 		key := strings.clone(string(bytes[:int(length)]), state.allocator)
@@ -154,6 +154,26 @@ code_mode_lua_table_to_json :: proc(L: ^l.State, index: c.int, state: ^Code_Mode
 	}
 	complete = true
 	return json.Value(fields), ""
+}
+
+// code_mode_lua_returned_json converts the chunk's return value into one JSON value.
+// Zero values are JSON null, one is converted, and more than one is refused: a script
+// has exactly one answer, and silently dropping a second one would hide the mistake.
+code_mode_lua_returned_json :: proc(run: ^Lua_Run, allocator: mem.Allocator) -> (json.Value, string) {
+	if run == nil || run.thread == nil || !run.terminal { return {}, "the execution has not finished" }
+	switch {
+	case run.returned_values == 0:
+		return json.Value(json.Null(nil)), ""
+	case run.returned_values > 1:
+		return {}, "the chunk returned more than one value; return one table instead"
+	}
+	state := Code_Mode_Value_State {
+		allocator     = allocator,
+		null_identity = rawptr(run),
+	}
+	state.seen = make(map[rawptr]bool, allocator)
+	defer delete(state.seen)
+	return code_mode_lua_to_json_value(run.thread, c.int(-run.returned_values), &state, 0)
 }
 
 // code_mode_lua_deliver_json decodes one existing tool result envelope and pushes it

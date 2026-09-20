@@ -4,6 +4,7 @@ package agent
 import "core:encoding/json"
 import "core:mem"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import linux "core:sys/linux"
 import "core:testing"
@@ -172,6 +173,35 @@ test_code_mode_suspends_for_a_nested_tool_job :: proc(t: ^testing.T) {
 	testing.expect_value(t, value, "success+success")
 	testing.expect_value(t, jobs.committed, 3)
 	testing.expect_value(t, tool_jobs_committed(&jobs), 1)
+}
+
+// A stopped execution says which limit stopped it, so the failure is branchable rather
+// than prose. The outcome stays what the harness observed; the kind names the fault.
+@(test)
+test_code_mode_reports_which_limit_stopped_it :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+	_test_stage_call(t, chat, "call_code", `{"code":"while true do end"}`, TOOL_CODE_NAME)
+
+	jobs: Tool_Jobs
+	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
+	defer tool_jobs_destroy(&jobs)
+	tool_jobs_submit(&jobs, chat, {})
+	tool_job_test_drain(t, &test, &jobs)
+
+	entries := _test_entries(t, chat)
+	defer session.entries_destroy(entries, context.allocator)
+	recorded := false
+	for entry in entries {
+		result, is_result := entry.payload.(session.Tool_Result_Entry)
+		if !is_result { continue }
+		recorded = true
+		testing.expect_value(t, result.outcome, session.Tool_Outcome.Tool_Failed)
+		testing.expect(t, strings.contains(result.content, `"kind":"instruction_limit"`), result.content)
+	}
+	testing.expect(t, recorded, "a stopped execution still answers its call")
 }
 
 // A worker-placed call runs on its own thread: the test thread keeps going while the
