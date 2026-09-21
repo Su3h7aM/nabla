@@ -1000,9 +1000,10 @@ chat_run_turn_steered :: proc(
 			if steer.apply != nil { current = steer.apply(steer) }
 		}
 		// External facts are applied before the state is read, so the selection below is
-		// a pure read of state.
-		chat_session_observe(chat)
-		effect := chat_session_advance(chat)
+		// a pure read of state. The owner observes the clock once and both steps use it.
+		now := time.tick_now()
+		chat_session_observe_at(chat, now)
+		effect := chat_session_advance_at(chat, now)
 		switch effect.kind {
 		case .Start_Request:
 			chat_effect_destroy(&effect)

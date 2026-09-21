@@ -41,11 +41,17 @@ chat_effect_destroy :: proc(effect: ^Chat_Effect) {
 
 // chat_session_observe applies facts that arrived from outside the owner: a worker's
 // published result, a stop the session asked for, and the first sight of a call that
-// should have stopped. It is the driver's collection step, so chat_session_advance can
-// read the state without changing it.
+// should have stopped. It is the driver's collection step, so the state can be read
+// without changing it.
 chat_session_observe :: proc(chat: ^Chat_Session) {
+	chat_session_observe_at(chat, time.tick_now())
+}
+
+// chat_session_observe_at is the same with the owner's clock supplied, so a driver that
+// has already observed time does not read it twice and a test can supply it.
+chat_session_observe_at :: proc(chat: ^Chat_Session, now: time.Tick) {
 	if !chat.tool_jobs_active { return }
-	tool_jobs_observe(&chat.tool_jobs, chat, time.tick_now())
+	tool_jobs_observe(&chat.tool_jobs, chat, now)
 	if chat.tool_jobs.escaped { chat.worker_escaped = true }
 }
 
@@ -54,11 +60,11 @@ chat_session_observe :: proc(chat: ^Chat_Session) {
 // ends with Finish_Tools. Nothing here runs an executor, waits, writes history, or
 // adopts an observation: chat_session_observe has already brought those in.
 @(private)
-chat_session_tool_effect :: proc(chat: ^Chat_Session) -> Chat_Effect {
+chat_session_tool_effect :: proc(chat: ^Chat_Session, now: time.Tick) -> Chat_Effect {
 	if !chat.tool_jobs_active {
 		return Chat_Effect{kind = .Run_Tools, turn_id = chat.active_turn_id}
 	}
-	next := tool_jobs_next(&chat.tool_jobs, time.tick_now())
+	next := tool_jobs_next(&chat.tool_jobs, now)
 	switch next {
 	case .Commit, .Refuse, .Abandon, .Retire, .Dispatch:
 		return Chat_Effect{kind = .Step_Tools, turn_id = chat.active_turn_id, tool = next}
@@ -70,21 +76,29 @@ chat_session_tool_effect :: proc(chat: ^Chat_Session) -> Chat_Effect {
 	return chat_effect_none()
 }
 
-// chat_session_advance selects the next effect for the current state. It is a read
-// of state, not a transition: the driver applies the transition the effect names, so
-// calling advance twice proposes the same work twice and launches or writes nothing.
+// chat_session_advance selects the next effect for the current state, reading the clock
+// for the caller that has no observation yet. Prefer chat_session_advance_at when the
+// driver has one.
 chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
+	return chat_session_advance_at(chat, time.tick_now())
+}
+
+// chat_session_advance_at selects the next effect from the state as of now. It reads
+// state and nothing else: no I/O, no lock, no logging, no allocation, and no counter
+// change. The driver applies the transition the effect names, so calling it twice
+// proposes the same work twice and launches or writes nothing.
+chat_session_advance_at :: proc(chat: ^Chat_Session, now: time.Tick) -> Chat_Effect {
 	switch chat.state {
 	case .Idle, .Requesting:
 		return chat_effect_none()
 	case .Executing_Tools:
-		return chat_session_tool_effect(chat)
+		return chat_session_tool_effect(chat, now)
 	case .Preparing:
 		return Chat_Effect{kind = .Start_Request, turn_id = chat.active_turn_id}
 	case .Cancelling:
 		// Tool jobs still have to settle their committed calls. Cancellation stops
 		// admission; it does not permit dangling results or freed worker storage.
-		if chat.tool_jobs_active { return chat_session_tool_effect(chat) }
+		if chat.tool_jobs_active { return chat_session_tool_effect(chat, now) }
 		// Cancellation requested interruption; it did not stop anything. A cancelled
 		// turn finalizes only after its operation is retired, which is the
 		// confirmation that the request is no longer running.
