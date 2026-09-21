@@ -440,7 +440,7 @@ tool_content_json :: proc(outcome: session.Tool_Outcome, message: string, data: 
 }
 
 // tool_result_finalize is the boundary between execution and storage, applied
-// once in chat_run_tools immediately before the result is recorded. It
+// once in tool_jobs_commit immediately before the result is recorded. It
 // verifies a tool's result against the result contract and returns it
 // unchanged when it complies. A violation never reaches the store: the content
 // is replaced with a minimal envelope that preserves the observed outcome, so

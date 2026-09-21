@@ -197,3 +197,39 @@ _test_stage_call :: proc(t: ^testing.T, chat: ^Chat_Session, id, arguments: stri
 	)
 	chat.state = .Executing_Tools
 }
+
+// chat_run_tools runs the committed calls through the same job table the driver uses and
+// returns the number of committed root results. It is the synchronous adapter for tests
+// that do not need to observe the intermediate job phases; this file is test-only, so
+// production has exactly one tool driver.
+@(private)
+chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
+	jobs: Tool_Jobs
+	// Job-owned storage comes from the process heap: a worker thread allocates while the
+	// owner may be allocating too, so the two never share one allocator.
+	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
+	defer tool_jobs_destroy(&jobs)
+
+	tool_jobs_submit(&jobs, chat, observer)
+	for _ in 0 ..< 100_000 {
+		now := time.tick_now()
+		tool_jobs_observe(&jobs, chat, now)
+		switch tool_jobs_next(&jobs, now) {
+		case .Commit:
+			tool_jobs_commit(&jobs, chat, observer)
+		case .Refuse:
+			tool_jobs_refuse(&jobs)
+		case .Abandon:
+			tool_jobs_abandon(&jobs, chat, observer, now)
+		case .Retire:
+			tool_jobs_retire(&jobs, now)
+		case .Dispatch:
+			tool_jobs_dispatch(&jobs, chat)
+		case .Wait:
+			tool_jobs_wait(&jobs)
+		case .Done:
+			return tool_jobs_committed(&jobs)
+		}
+	}
+	return 0
+}

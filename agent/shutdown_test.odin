@@ -349,8 +349,8 @@ Shell_Tool_Run :: struct {
 	count:  int,
 }
 
-// chat_run_tools is the production tool path: the control loop calls exactly this
-// to run committed calls.
+// chat_run_tools drives the shared job table directly, which is the path a committed call
+// takes when the control loop is not the one running it.
 shell_tool_serve :: proc(thread: ^thread.Thread) {
 	run := cast(^Shell_Tool_Run)thread.data
 	run.count = chat_run_tools(run.chat, {})
