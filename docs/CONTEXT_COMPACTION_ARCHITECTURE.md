@@ -1,412 +1,202 @@
-# Context management and non-blocking compaction
+# Context, persistence and compaction
 
-Status: implemented. `agent/compact.odin` owns the lifecycle, `agent/compact_lifecycle_test.odin`
-covers it end to end, and `agent/session/context.odin` owns the durable checkpoint. Written
-against `dev-2026-09-nightly:a2fb372`.
+Status: required target. Background compaction, checkpoint installation and paired cache
+accounting exist; the stage boundaries this document shares with execution do not.
+Owns durable history, provider projection, capacity and cache accounting. [Execution](EXECUTION_ARCHITECTURE.md) owns when work advances;
+[errors](ERROR_RETRY_ARCHITECTURE.md) owns retry authorization;
+[tools](TOOLS_MCP_ARCHITECTURE.md) owns retained tool output and paging.
 
-This document supersedes the earlier compaction policy in `AI_HARNESS_ARCHITECTURE.md` §10 and
-the summarization-request policy in `SKILLS_ARCHITECTURE.md` §14. It does not change their
-history, instruction-snapshot, replay, or skill-reload contracts.
+## One record, derived views
 
-Planned changes are specified in [Provider failures, retries, and context recovery](ERROR_RETRY_ARCHITECTURE.md).
-That document resolves provider-confirmed overflow recovery and aggregate tool-result admission,
-and specifies bounded, owner-driven background retries to replace the current policy. Those
-changes are not implemented yet; the behavior below describes the current code.
+SQLite is the durable authority. Keep one session writer with an exclusive claim,
+short transactions, typed entry payloads and stable sequence/turn/request identities.
+Root owns connection lifetime; the session owner performs mutations. Read-only analysis
+uses a separate connection without claims, creation or migrations.
 
-The proposed [Lua Code Mode and asynchronous tools](CODE_MODE_ARCHITECTURE.md)
-design adds parent-child tool records and event-driven execution. Compaction must
-use the model-visible projection, excluding child calls and results, and must not
-cut a top-level Code Mode call/result pair. A tool waiting for completion is not an
-installation boundary. The owner may adopt a finished background result while
-tools run, but installs it only at the existing safe request boundary. These are
-planned integration requirements, not implemented changes to the seam algorithm.
+Retain user input, accepted assistant output, raw calls, effective dispatch arguments,
+observed results, instruction snapshots, checkpoints and attempt metadata. Keep
+correlation and parent relationships enforceable in storage. A dispatch is intent;
+a result is the observed outcome. Do not infer one from diagnostic timestamps.
 
----
+Provider history, frontend transcript and diagnostics are different views. A request
+is a temporary projection, not another mutable conversation. Model-visible input must
+come from committed records or recorded effective configuration. Transient progress
+never becomes a completed message by accident. Explicit harness feedback has its own
+origin and is not forged user intent or assistant output.
 
-## 1. Contract
+Load only the active checkpoint and uncovered tail for normal inference. Full history
+and paged results remain queryable without retaining the entire transcript in memory.
+Record references to immutable artifacts rather than repeatedly copying full bodies
+into several durable formats. Keep enough exact prepared-input provenance to explain
+what was sent. Raw wire capture remains optional diagnostics, not execution authority.
 
-One logical session, one foreground agent. Compaction is an auxiliary model request over an
-immutable prefix, not another agent, turn, or session. The foreground keeps using the old
-context while that request runs. A finished summary replaces only the prefix it actually
-summarized; every later entry survives in order.
+A first accepted prompt creates the session's durable work. Opening and closing an
+unused launch need not create history. Resume claims the selected session and settles
+interrupted work before admitting new input. A failed resume never silently opens a
+different conversation. Format changes use explicit version checks and migrations or
+a diagnosed incompatibility; prototype compatibility is not a reason to retain a
+weaker design.
 
-- No foreground path waits for summarization, retries it inline, or joins a running thread.
-  There is no `Compacting` member of `Chat_State`.
-- Pressure, `context_compact`, and `/compact` record the same intent and meet at
-  `compact_request_intent`.
-- Compaction changes model-visible context only. The transcript is append-only, and turn, request,
-  and session identity are untouched.
-- The active cacheable prefix is preserved until a deliberate installation boundary. Already-sent
-  tool results are never pruned in place.
-- A request in flight keeps its frozen input. Installation happens only between foreground
-  requests, after the preceding response and all its tool results are committed.
-- One unfinished compaction per session, including a completed summary awaiting installation.
+## Projection
 
-### 1.1 What "never wait" guarantees
+Build in a deterministic order:
 
-Foreground execution never waits for a compaction result. It cannot be guaranteed that a session
-runs forever: with finite remaining capacity `H` and appended context `D(t)`, an unbounded
-summarization delay eventually makes `D(t) > H`. Keeping the appended context, keeping the old
-prefix, and continuing requests cannot all hold at that point.
+1. Exact committed instruction snapshot, separate from conversation messages.
+2. Sorted eligible tool definitions from the turn's frozen registry.
+3. Installed checkpoint, if any.
+4. Uncovered model-visible history in its recorded conversational order.
+5. Any purpose-specific directive, such as summarization, in its defined suffix.
 
-The operating target is continuous execution while compaction completes inside the reserved growth
-budget. When it does not, nothing waits, nothing is dropped, no session is reset, and no
-inadmissible request is sent: the turn fails with an explicit message. §11 covers that path.
+Provider encoding places these into that API's fields. Do not sort conversation
+arrays, rerender old text, insert timestamps, or add transport/retry annotations.
+A successful response can retain API-native replay items as opaque, origin-tagged
+bytes. Only its API adapter interprets them. Replay only for compatible origin and
+settings; cross-provider/model projection drops incompatible opaque material while
+retaining neutral text and tool facts. Do not force every provider's signed/encrypted
+reasoning into one lossy universal representation.
 
-## 2. Context algebra
+Native replay must agree with admitted calls. If a call was repaired/refused, do not
+replay an opaque response containing a contradictory proposal as well as normalized
+calls. Project each assistant item once. Partial failed output is audit/display data,
+not a finished assistant message. Call/result runs stay complete and contiguous in
+the provider view even when hidden children occur between their durable sequences.
+Children are filtered by stored parent relationships, not by whether their parent
+happened to be loaded in this tail.
 
-`session.Seq`, `session.Request_No`, and `session.Turn_No` are the only boundary identities.
-Array positions, token counts, and timestamps are not.
+Projection failure is explicit. Repair unanswered calls from durable dispatch evidence
+at recovery, not by synthesizing arbitrary successful results while encoding.
 
-- `B`: the base checkpoint's sequence, `Maybe(Seq)`. Nil means the session had none.
-- `F`: the last entry this summary covers.
-- `P`: the prefix being summarized: the checkpoint at `B`, if any, followed by model-visible
-  entries after its coverage through `F`.
-- `D`: every model-visible entry with `seq > F`.
-- `C`: the summary text.
+## Capacity
 
-```text
-At fork              Background                Foreground
-I + P                summarize(I + P)          I + P
-                                               I + P + D1
-                                               I + P + D1 + D2
-Summary ready        C                         I + P + D1 + D2
-At installation                                I + C + D1 + D2 + D3
-```
+Resolve capacity once per selected model and use it for admission, compaction policy,
+result budgets and reporting. Absence is not zero. Unknown capacity may use a named
+runtime fallback with an assumed flag; explicit invalid or zero capacity refuses
+requests. Never replace a stated zero output limit with a useful default silently.
 
-Installation is a checkpoint append, not a merge:
-
-```text
-new_context = checkpoint(C, covered_seq = F) + context_entries_after(F)
-```
-
-`session.context_load` already implements the right-hand side: it reads the newest checkpoint and
-then every model-visible entry with `seq > covered_seq`. A checkpoint at sequence 150 may cover
-only through 100, so the tail is selected by coverage and never by the checkpoint's own sequence.
-Nothing is copied from the summarizer's view of the tail, which is why `D3` is safe.
-
-A second compaction summarizes the previous checkpoint plus newer entries. It does not resurrect
-covered history or accumulate two summary messages.
-
-### 2.1 The cut
-
-`chat_compact_seam(entries, CHAT_COMPACT_KEEP_MESSAGES)` keeps the newest entries verbatim and
-backs the seam left until it no longer falls inside a call/result run. The test is on neighbouring
-kinds: a seam is bad when the entry at it is a `Tool_Result`, or when its predecessor is a
-`Tool_Call`. Backing up over a whole run keeps every call with its result, and a multi-call
-response stays together.
-
-The retained tail is what preserves the newest user message and any in-progress work, so the
-summary never has to restate the request being answered.
-
-## 3. Data
-
-| Type | What it holds |
-|---|---|
-| `Compact_Snapshot` | The frozen request: API, owned endpoint, credential, encoded body, model, tool count, session id, user agent, `base_seq`, `covered_seq`, `turn_no`, the request estimate, and the estimate of the prefix the summary will replace |
-| `Compact_Job` | A snapshot, a private interrupt, the thread handle, a mutex allocator over the session's allocator, the output buffer, the finish reason, tool-call count, failure flag, error text, provider usage, and the start tick |
-| `Compact_Control` | Owner-side state in `Chat_Session`: `state`, `trigger`, the job pointer, the pending trigger and its source sequence, and the last failure time |
-| `Compact_Trigger` | `None`, `Pressure`, `Agent_Tool`, `User_Command` |
-| `Compact_State` | `Idle`, `Running`, `Ready`, `Retiring` |
-| `Compact_Request_Result` | `Scheduled`, `Already_Scheduled`, `Unavailable` |
-
-`Ready` means a complete, checked summary exists in a joined job. `Retiring` means cancellation was
-requested and the worker still owns its memory. Only the owner thread changes control state.
-
-Procedures, all in `agent/compact.odin`:
-
-| Procedure | Role |
-|---|---|
-| `compact_request_intent` | Records an intent. Starts nothing, reads nothing durable |
-| `chat_compact_request` | `compact_request_intent` for a whole session |
-| `chat_compact_poll` | Adopts a finished job, or releases one that was cancelled. Never waits |
-| `chat_compact_start` | Chooses `F`, freezes the request, records it, starts the worker |
-| `chat_compact_consider` | Starts a job for the request about to be sent, if a trigger calls for it |
-| `chat_compact_service` | Polls and installs a summary whose boundary has arrived |
-| `chat_compact_relieve` | Polls and installs unconditionally. The last resort before a refusal |
-| `chat_compact_install` | Commits the checkpoint. The only place the context changes |
-| `chat_compact_cancel` | Interrupts a running job, or drops a candidate |
-| `chat_compact_destroy` | Teardown: interrupt, join, release |
-
-## 4. The worker
-
-`chat_compact_worker` calls `ai.Provider_Request_Operation_Encoded` with the frozen bytes, the
-job's interrupt, and a callback that appends text into `job.output`. It touches no
-session state, runs no tool, writes no database row, and logs nothing: the owner reads the result
-when it joins and is the only thing that records the compaction's lifecycle.
-
-Three details make the thread safe:
-
-- **The body is frozen as bytes.** `Compact_Snapshot` owns every string and the encoded request
-  body, so the foreground may destroy the preparation it was built from and append as much history
-  as it likes. `ai.Provider_Request_Operation_Encoded` is the same send path as the controlled
-  form, so an encoded request behaves exactly like one encoded on the spot.
-- **The allocator is serialized.** The job's memory is allocated through
-  `mem.mutex_allocator` over the session's allocator. The worker's and the owner's allocations do
-  not overlap in practice, but the session's allocator may be a test's tracking allocator, which is
-  not safe to touch from two threads. The job itself is allocated with the backing allocator,
-  because it cannot be freed through its own lock.
-- **Signals are blocked across creation.** A thread inherits the signal mask its creator had, so
-  `chat_signal_block_watched` is held across `thread.create`. Blocking inside the worker would
-  leave a startup window in which the process handler could run on the wrong thread.
-
-The worker sets `context.allocator` to the job's allocator at entry, so everything the provider
-operation allocates is released by the same allocator after the join.
-
-## 5. Lifecycle in the foreground
-
-At a request boundary, in `chat_perform_request`:
-
-1. `chat_compact_service` polls, and installs a summary if its trigger or the pressure calls for
-   it. The context may change here, before anything is built.
-2. `chat_prepare` builds the request from the context as it is now.
-3. `chat_compact_consider` freezes that exact request when a trigger calls for it. The frozen bytes
-   are what the provider will see, so the prefix the summarizer reads is the warm one.
-4. Admission is checked. If it fails, `chat_compact_relieve` is the only other chance: it installs
-   a summary that is already finished, and the request is rebuilt. If that still does not fit, the
-   turn fails and says so.
-
-Install decisions use `chat.last_estimate`, the size of the previous request, because installing
-after a request is built would invalidate it. Start decisions use the freshly built request's own
-estimate, because the snapshot must be the exact bytes about to be sent.
-
-Idle servicing is the root package's job: `run_worker` polls with `app_compaction_tick` every
-`WORK_IDLE_POLL` while `app_compaction_pending`, so a summary that finishes with no work queued is
-still adopted and installed.
-
-A started summary is announced where it starts, in `chat_compact_start`, so the front-end sees one
-notice per attempt and can time it. The notice names the reason, because an automatic summary and a
-requested one are indistinguishable afterwards and only the caller knows which it was. A finished
-one is announced when it is adopted, and installation is not announced separately: the two facts
-arrive at the same boundary. Nothing about either notice is required by the foreground, and a
-front-end that ignores them loses only the narration.
-
-## 6. Policy
-
-The model's window is divided once, by `model_capacity` in `agent/capacity.odin`, and the
-result travels with the resolved model as `Model_Capacity`. Admission, the compaction trigger,
-the recorded request, and the status line all read that one value, so two features cannot
-partition the window differently.
+Use one checked calculation:
 
 ```text
-margin   = max(10% of window, 1024)
-trigger  = window - margin - 20% of window
-answer   = smallest of: the room the window has left, the model maximum, 32K
-ceiling  = window - margin - min(1024, the model maximum)
+W = resolved or explicitly assumed context window
+M = estimator safety margin
+F = min(minimum useful answer, positive model output maximum)
+input_ceiling = max(W - M - F, 0)
+output_bound = min(W - M - estimated_input, model output maximum, harness output maximum)
 ```
 
-The provider enforces one limit: the input plus the output a request asks for must fit the
-window. The harness therefore asks for whatever room is left rather than reserving a share of the
-window for output in advance.
+Admission requires a positive usable capacity and at least `F` output room. The
+compaction trigger is below the input ceiling with growth reserve. For tiny windows
+where this ordering is impossible, refuse or use a clearly diagnosed constrained
+policy; do not underflow arithmetic or pretend `trigger < ceiling < W` always holds.
 
-`answer` is what a request asks the model to generate, and it shrinks as the context fills. The
-window is one budget, not an input budget plus a reserved output budget: a fuller context asks
-for a smaller answer instead of being refused. On a 32K window with an 8K maximum the bound is the
-model's whole 8000 until the context reaches 20800, then falls away to 1024; the input can reach
-27776, which is 87% of the window. Only `ceiling`, where even the smallest useful answer no longer
-fits, ends the conversation, and that is where the window actually ends.
+Margin covers estimation error; reserve gives background work time to finish; output
+allowance controls the current answer. These are distinct quantities, not competing
+capacity services. Keep named defaults and tune from observations. Report sizes of
+instructions, schemas, history and output allowance separately so an oversized
+instruction block is not blamed on conversation history.
 
-What is held back is the estimator's margin and that smallest answer. The margin covers the
-estimator's error, which grows with how dense the content is rather than with the window, so it is
-a share rather than a constant that happens to suit one window size. A model whose own maximum is
-below the floor answers with what it can, so the floor never asks for more than the model allows.
+Provider token usage is a measurement after a send, not permission to skip pre-send
+admission. Estimator error and unknown model limits remain visible. Do not introduce
+a tokenizer service or provider-name heuristic without evidence it improves admission.
 
-`trigger` is where background compaction starts, and where a finished summary is installed. One
-number serves both, because both decisions are about the same point: the context has reached the
-size where it needs the summary. Installing sooner would break the cache prefix while the old one
-still had life, and starting later would leave the summary less room to finish in.
+## Compaction as a bounded session job
 
-The trigger is not a limit. An agent whose summary has not arrived yet keeps working on the window
-it has, and the answer bound shrinks to keep it inside the window. `20% of window` is what the
-foreground may grow by while a summary is written, which is what that summary has to finish
-inside.
+Keep at most one unfinished summary, including a ready candidate awaiting installation.
+The session owner handles all lifecycle events. No root idle polling policy and no
+second agent loop. One worker performs a tool-free inference operation on immutable
+owned bytes. It writes no SQLite rows and accesses no foreground transport.
 
-| Constant | Value | Why |
-|---|---|---|
-| `CHAT_COMPACT_KEEP_MESSAGES` | `10` | Entries kept verbatim, extended as needed to keep a call/result run whole |
-| `CHAT_OUTPUT_MAX_TOKENS` | `32768` | Most a request asks the model to generate |
-| `CHAT_OUTPUT_MIN_TOKENS` | `1024` | Smallest answer worth asking for; the window less this and the margin is the input ceiling |
-| `CHAT_MARGIN_PERCENT` | `10` | Estimator error allowance, with a floor of 1024 |
-| `CHAT_COMPACT_RESERVE_PERCENT` | `20` | Window the foreground may still grow into while a summary runs |
-| `CHAT_COMPACT_MIN_REDUCTION_TOKENS` | `1024` | A saving smaller than this is not worth a cache break |
-| `CHAT_COMPACT_RETRY_DELAY_MS` | `5000` | Keeps a failed summarization from being retried at every boundary |
+Let `B` be the expected base checkpoint and `F` the last covered entry. Freeze the
+existing checkpoint plus a coherent model-visible prefix through `F`. Preserve the
+recent user task and whole assistant/call/result runs in the tail. A child record is
+not an independent seam. Retain exact instructions and tool definitions for stable
+request construction, but grant the summarizer no execution authority. Reject a
+summary that proposes calls, is incomplete or fails the reduction/content checks.
 
-These are engineering defaults, not measurements.
+```text
+before: instructions + old checkpoint/prefix + growing tail
+worker: summarize fixed prefix through F
+install: instructions + new checkpoint covering F + every visible entry after F
+```
 
-A summarization request carries the same rule as any other, and needs no bound of its own. Its
-input is the prefix rather than the whole context, so the room left over is larger than the
-foreground request's was, and that is what keeps a summary complete. It also keeps a large prefix
-summarizable, where a fixed bound would have refused the request exactly when the context most
-needed it.
+Select tail by `covered_seq`, never by the newer checkpoint entry's own sequence.
+Appended work during summarization cannot disappear. A second compaction summarizes
+the prior checkpoint plus new history; it does not accumulate summary messages.
 
-A summary is worth keeping only when it frees at least `CHAT_COMPACT_MIN_REDUCTION_TOKENS` of
-the prefix it replaces. That is checked at adoption, before any checkpoint is written.
+Install only at an ordinary request boundary or while idle with no active turn. Adoption
+of a completed candidate may happen while tools run; adoption is not installation.
+The install transaction verifies the writer claim, unchanged base, valid coverage,
+successful originating compaction request, and no previous installation from it. Append
+one checkpoint with complete framing. Rebuild preparation after installation.
 
-### 6.1 What is deliberately approximate
+Normal pressure, explicit compaction and provider overflow share one intent. Coalesce
+repeated triggers. Automatic work starts only when pressure and useful context progress
+justify it, under the failure cooldown. Retry uses [the shared policy](ERROR_RETRY_ARCHITECTURE.md).
+Changing selection invalidates pending work through explicit cancellation/retirement,
+not by freeing a snapshot another thread owns. Turn cancellation alone need not cancel
+session-level compaction; session destruction does.
 
-The reserve is a share of the window rather than a measured growth rate. Per-tool result caps
-bound one result, not a batch, so a turn with many large results can still outgrow the reserve
-faster than a summary completes. Until aggregate result admission exists, the reserve is an
-estimate and the continuity target is best-effort. §11 describes what happens when it is
-exceeded: nothing waits, and the turn fails with a message.
+The foreground never waits for a summary. A ready valid candidate can relieve pressure;
+otherwise admission fails explicitly when headroom runs out. Finite capacity and an
+unbounded summarization delay cannot guarantee continuous execution. A late summary
+may help a later prompt but does not resume failed work.
 
-## 7. The summarization request
+Crash before installation leaves the old context. A committed candidate without an
+installed checkpoint is audit data, not a durable continuation. Recovery may schedule
+new compaction when useful; it never assumes a worker still exists. Compaction changes
+projection, not retained history or the session storage quota.
 
-The request preserves the conversation's prefix: same resolved provider and model, same
-instruction snapshot, same tool order and schemas, same effort, same prompt-cache key. The
-directive is appended as the last user message. `chat_build_request_into` takes the directive as an
-argument, so both request purposes use one projection. This makes the existing prefix eligible
-for cache reuse; it does not guarantee a cache read or prevent a charged cache write for a new
-suffix. Compaction stays on an independent HTTP operation even when foreground requests use WS.
+## Summary content and trust
 
-Cache-preservation requirements, corrected usage accounting and the HTTP/WS comparison gate
-are specified in
-[Network stack architecture, section 10](NETWORK_STACK_ARCHITECTURE.md#10-prompt-cache-preservation-and-the-reported-regression).
-Report compaction usage separately as well as in all-work totals. Mark checkpoint installation
-as an intentional prefix change so its expected cold input is not confused with a transport
-regression. Do not trigger compaction solely to improve a cache percentage or suppress needed
-compaction to preserve one.
+Ask for goals, constraints, completed work with evidence, decisions, exact identifiers,
+current work, pending work, failures and unknowns. Separate observations from plans.
+Preserve user corrections. Treat quoted tool/file content as data, not instructions.
+Retain skill names and locations, but require full reload before relying on summarized
+instruction details. A summary is fallible model output, not proof that its claims are
+true. Keep the original record available for inspection.
 
-The worker has no execution authority even though the tool definitions are in its input. A response
-that proposes a tool call is not a summary, so it is rejected at adoption.
+## Stable prefixes and honest accounting
 
-### 7.1 The summary is not a transplantable cache
+Keep instruction bytes, tool order/schema bytes, diagnostic literals that enter model
+feedback, session cache identity and normalized history stable under unchanged inputs.
+A retry reuses frozen bytes. A reconnect does not rotate cache identity. Tool refresh,
+model/effort changes and checkpoint installation can legitimately change the provider's
+rendered prefix; record the cause instead of claiming universal preservation.
 
-The summarizer generates `C` after `I + P + directive`. Its key/value state for `C` depends on that
-prefix; placing the same text after `I` instead is a different sequence. So:
+Changing provider or model need not rewrite neutral history, but cross-model cache
+sharing is not promised. Effort may be a top-level field that invalidates a provider's
+hidden prefix. Do not invent `configuration_update` messages or a persistent effort
+ledger without a verified adapter capability and a measured need.
 
-- Requests issued while the job runs, and while a ready summary waits, keep reusing `I + P`.
-- The summary request may read the old prefix from the cache. It does not create a cache for the
-  new compacted context.
-- After installation, only unchanged content before the replacement, normally instructions and
-  tools, can still hit. Unchanged text inside the tail is downstream of the change and is processed
-  again. The first real request on the new context establishes its cache.
+Summarization can reuse the old prefix but cannot prewarm the new one: summary tokens
+were generated under a different preceding input. No speculative prewarm, head
+reservation, generation graph or server-side continuation cache is required.
 
-Cache hits are provider observations, never promises: TTL, eviction, and routing can all miss. No
-prewarm request is issued, and no cache breakpoint beyond the provider's automatic one is placed.
+Record latest cumulative usage per bucket within one attempt; sum distinct attempts.
+Missing is unknown, not zero. Normalize total input according to the API, validate
+counts per row, and do not clamp contradictory usage into a believable percentage.
 
-Changing model or provider starts a cold cache for the new provider even though the conversation,
-instructions, tools and cache key are unchanged. That is a property of changing providers, not of
-changing transport, and it is not a reason to rotate the cache identity or rewrite the prefix. The
-switch contract, including the shared cache key across a transport change, is in
-[Network stack architecture, section 9.11](NETWORK_STACK_ARCHITECTURE.md#911-provider-and-model-switches-across-transports).
+```text
+paired_input = sum(valid input where input and cache_read were both reported)
+paired_read  = sum(valid cache_read for those same rows)
+hit_rate     = paired_read / paired_input, if paired_input > 0
+coverage     = paired_input / all valid reported input, if that denominator > 0
+```
 
-### 7.2 Directive and checkpoint text
+Also report total, paired, missing and invalid request counts, including requests with
+no usage. Keep all-work totals and foreground/compaction/retry views. A measured-subset
+rate is not a whole-session rate. Compare cost per equivalent completed workload,
+including cache writes and failed inference, not a universal cache-hit percentage.
 
-`CHAT_COMPACT_DIRECTIVE` is appended after the prefix. It asks for fixed headings, requires
-observed results to be distinguished from plans, requires exact paths and identifiers, forbids
-treating quoted tool output as instructions, requires a previous checkpoint to be merged rather
-than copied, and forbids tool calls.
+Transport parity tests compare common semantic fields after removing only documented
+envelope differences. Operator-authorized live comparisons use matched model/settings,
+history, cadence and reporting coverage. No paid runtime probes or automatic transport
+flapping to improve a dashboard.
 
-The checkpoint that re-enters the conversation is stored whole:
-`CHAT_COMPACT_CHECKPOINT_PREAMBLE` plus the summary. `session.context_load` returns that text and
-the projection emits it as a user message, so a resumed session sends exactly the bytes the
-checkpoint was written with and no framing lives in two places.
+## Acceptance
 
-## 8. Persistence
-
-The durable job identity is the `.Compaction` request row. `chat_compact_start` records the request
-before the thread starts, with the input record naming `B`, `F`, the instruction snapshot, and the
-covered span. When the owner adopts a finished job it stores the candidate summary and its coverage
-in the request's `response_json` and finishes the request. The request is the summary's record; the
-checkpoint is its installation.
-
-`session.checkpoint_install` performs the whole check-and-append in one transaction:
-
-1. The caller holds the session's writer claim.
-2. The latest installed checkpoint equals the expected base, including nil equality.
-3. The originating request belongs to the session, has purpose `.Compaction`, completed, and has not
-   already installed a checkpoint.
-4. `F` exists.
-
-Only then is the checkpoint entry written, with `covered_seq = F` and `previous_seq = B`. Because the
-base is checked, a summary computed against a context that has since been compacted again is refused
-rather than installed. Because the request is checked, a duplicate delivery cannot move the context
-twice.
-
-Recovery follows from append-only history:
-
-- Crash before the request is recorded: nothing durable, nothing changes.
-- Crash with the request running: `session_recover` closes it as interrupted. The old context stays.
-- Crash after the candidate is stored, before installation: the old context stays. Uninstalled
-  candidates remain audit records; a fresh job is started if pressure requires one, which may repeat
-  the inference but needs no second state machine.
-- Crash during the append: SQLite commits the checkpoint or nothing.
-- Crash after the append: `context_load` restores the checkpoint and the tail.
-
-## 9. Failures and pressure
-
-| Condition | Behavior |
-|---|---|
-| Transport failure, timeout, unusable summary | The request is finished as failed, the old context stays, the foreground continues |
-| A repeated trigger while a job runs | Coalesced; the trigger is promoted if it was explicit |
-| Candidate superseded by a newer checkpoint | Refused by `checkpoint_install` |
-| Summary does not free enough | Reported, no checkpoint written, no cache break |
-| Context too large to summarize at all | Reported before the request is recorded |
-| Durable write failure | The existing `storage_failed` latch stops the session |
-| Model, provider or session change | `chat_compact_cancel`; the new configuration may start its own chain. The installed checkpoint is conversation state and survives the switch; an effort change does not cancel a chain |
-| Explicit turn cancellation | Compaction keeps running: it belongs to the session, not the turn |
-| Admission fails with nothing ready | The turn fails with an explicit message |
-
-Compaction never blocks a request, never drops history, and never resets a session to recover. When
-the reserved headroom runs out before a summary arrives, the turn fails and says why; the user can
-start a fresh session for a new topic. A provider that admits only one request at a time cannot
-meet the non-blocking target at all: there the summarization occupies the only lane, which is a
-property of the endpoint, not of this design.
-
-Retry policy is one delay: after a failed job, the next automatic attempt waits
-`CHAT_COMPACT_RETRY_DELAY_MS`. An explicit trigger is a caller asking again and is not held back.
-
-## 10. Deliberate deferrals
-
-These were considered and are not built. Each is additive; none changes the contracts above.
-
-- **Aggregate tool-result admission and spill.** Built, and described in
-  [Error and retry architecture, §8](ERROR_RETRY_ARCHITECTURE.md#8-aggregate-tool-result-admission-and-spill):
-  a turn's results are bounded as a batch, and a result the batch cannot afford stays in the
-  record while the model is shown a handle it can read back with `context_read_result`. Retention
-  beyond one result's cap, and a cap across a session, remain.
-- **Cache breakpoint control.** `Provider_Message.Cache_Breakpoint` is unused; only Anthropic's
-  automatic breakpoint is exercised. Explicit breakpoints would limit lookback and cache-write
-  costs on long prefixes where the provider supports them.
-- **Prewarming the compacted prefix.** A provider request could populate the new context's cache
-  before a real request needs it. It adds cost and a second in-flight operation.
-- **Provider-normalized overflow evidence.** The implementation plan is now defined in
-  [Error and retry architecture, §7](ERROR_RETRY_ARCHITECTURE.md#7-resolve-provider-confirmed-context-overflow):
-  classify provider rejection, install an already-ready candidate, and resend changed context
-  at most once. An unfinished summary still cannot block the foreground.
-- **Measured growth rate.** Replacing the constant reserve with a recent-rate estimate.
-
-## 11. Tests
-
-`agent/compact_lifecycle_test.odin` runs real HTTP providers, stalls one on demand, and drives the
-lifecycle:
-
-- A summary is held open while a whole foreground turn completes; an entry is appended while the
-  job still runs; the summary is then installed. The resulting context is asserted to be the
-  checkpoint plus everything after `F`, including the foreground's output and the late entry, and
-  the next request is asserted to open with the checkpoint and cost less than the one it replaced.
-- A failed summary leaves no checkpoint, keeps every entry, and closes its request as failed.
-- Destroying a session while a summary is in flight stops the worker.
-- `context_compact` is advertised, records its intent, returns immediately, and leaves the job
-  unstarted until the next boundary.
-
-`agent/compact_test.odin` covers the seam and the request projection; `agent/session/context_test.odin`
-covers checkpoint installation, base validation, and duplicate refusal.
-
-`mise run check` and `mise run test` are the gate. Provider cache economics and summary quality
-require live experiments; no local test can establish them.
-
-## 12. Provenance
-
-Two harness studies informed the design and are summarized here rather than depended on:
-`/tmp/deepseek-context-management.md` (measurement, blocked triggers, balanced selection,
-cache-aligned summarization, durable transactions) and `/tmp/codex-context-management.md` (provider
-anchored usage, inline triggers, tool-output bounding, durable replacement). Neither implements
-non-blocking compaction, and neither establishes a safe universal threshold.
-
-Provider documentation, consulted 2026-09-17:
-[OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching) (exact
-rendered-prefix matching, cache keys as routing hints rather than guarantees) and
-[Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-(tools/system/messages hierarchy, automatic breakpoints, tool-choice invalidation).
+Test checkpoint installation with a concurrently growing tail, stale and duplicate
+candidates, coherent seams, child filtering with absent parents, failed summaries,
+and admission failure without waiting. Resume must reproduce stored instruction and
+result bytes. Test projection after repaired/refused calls for every supported API.
+Usage tests cover missing/zero/invalid data, unequal request sizes and cumulative
+updates. Local tests do not establish summary quality or live cache savings.

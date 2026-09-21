@@ -1,656 +1,227 @@
-# AI Harness Architecture
+# Nabla architecture
 
-Internal engineering reference. Decisions, invariants, boundaries, and open product questions for
-the `ai` / `agent` stack. Not a tutorial; no rationale beyond what keeps a rule from looking
-arbitrary.
+Status: target architecture for implementation agents. The implementation is a
+prototype, not a compatibility constraint. This document defines what belongs in
+Nabla and why. Required invariants apply to new work; they are not claims that the
+prototype already satisfies them. [Implementation status](ARCHITECTURE_STATUS.md)
+records verified gaps separately. Sections marked future authorize no implementation
+until a task requires that capability.
 
-Status: **specification only — not implemented.** Section 13 maps the current code onto these
-boundaries and is the starting point for implementation.
+## Read by responsibility
 
----
+Read this document before changing harness boundaries or adding a subsystem.
+Then read the contract for the behavior being changed:
 
-## 1. Invariants
+| Work | Authoritative contract |
+| --- | --- |
+| Transitions, requests, async work, cancellation, retirement | [Execution state machine](EXECUTION_ARCHITECTURE.md) |
+| Admission, tool jobs, result bounds, MCP | [Tools](TOOLS_MCP_ARCHITECTURE.md) |
+| Lua execution and child calls | [Code Mode](CODE_MODE_ARCHITECTURE.md) |
+| Failure classification, retries, recovery | [Errors](ERROR_RETRY_ARCHITECTURE.md) |
+| Projection, persistence, compaction, cache accounting | [Context](CONTEXT_COMPACTION_ARCHITECTURE.md) |
+| Instruction sources and skill loading | [Instructions and skills](SKILLS_ARCHITECTURE.md) |
+| Configuration, future Lua hooks, placement decisions | [Customization](CUSTOMIZATION_ARCHITECTURE.md) |
+| Future dynamic delegation | [Subagents](SUBAGENT_ARCHITECTURE.md) |
+| Transport and provider boundaries | [Network](NETWORK_STACK_ARCHITECTURE.md) |
+| Context logger, diagnostics, capture | [Diagnostics](LOGGING_ARCHITECTURE.md) |
 
-1. **First defined value wins.** Enrichment is additive and never overwrites a resolved field.
-2. **One resolved catalog is the sole source of truth** for provider/model metadata. No second
-   lookup table, no provider-local capability constants, no model-name heuristics.
-3. **Absent is not zero.** Every optional catalog field carries an explicit presence flag. A
-   configured `0`, `false`, or `""` is a resolved value; an omitted field is unknown.
-4. **Durable conversation state is not the provider request.** The request is a derived
-   projection rebuilt each time from conversation + catalog + config.
-5. **The core never knows a provider or model by name.** Provider behaviour differences live in
-   the provider implementation; model differences live in the catalog.
-6. **Nothing in the core owns presentation, terminal, or ACP.**
-7. **History is never deleted by budget management.** Compaction moves a window; it does not
-   destroy the record.
+Each contract owns its subject. Link to it instead of copying its rules into another
+plan. Change conflicting contracts together; do not add a paragraph that supersedes
+an earlier paragraph while leaving both as instructions.
 
----
+## Architectural principles
 
-## 2. Enrichment pipeline
+Nabla is a small native harness with one owner-driven execution machine. It turns
+committed input into model requests and admitted tool effects. Lua composes those
+tools. SQLite records what happened. Presentation consumes data, not internal state.
 
-```
-user configuration          (Lua config, authoritative for anything it states)
-        ↓  fill missing fields only
-provider /models discovery  (live, per provider)
-        ↓  fill still-missing fields only
-models.dev catalog          (vendored/remote shared catalog)
-        ↓
-Resolved Catalog            ← the only thing the runtime reads
-```
+Use the simplest idiomatic Odin solution that meets a demonstrated requirement.
+The default design is a concrete struct, a bounded collection, and a procedure with
+explicit inputs and error results. Add indirection only at a real external or
+substitution boundary, such as a provider adapter, tool executor, or caller writer.
+A library-shaped name does not justify a package or interface.
 
-Per-field, per-entity merge. Later stages fill gaps; they never replace.
+The important decomposition is by validated artifacts, not by object hierarchy:
 
-Worked example (the rule, not a special case):
-
-| field | user | /models | models.dev | resolved |
-|---|---|---|---|---|
-| `context_window` | 500000 | 1000000 | 1000000 | **500000** |
-| `max_output` | — | 32000 | 32768 | **32000** |
-| `reasoning` | — | — | present | from models.dev |
-
-Rules:
-
-- **Granularity is the field**, not the entity. A source that supplies only `max_output` for a
-  model still allows models.dev to supply `reasoning` for the same model.
-- **Presence flags drive the merge.** Merging checks `field_present`, never `field == 0`.
-  Zero-value checks are forbidden; they cannot express "explicitly disabled" and are the bug this
-  design exists to prevent.
-- **A composite field merges recursively** (`provider.authentication.*`, `model.reasoning.*`,
-  each modality list). Lists are all-or-nothing per field: a present list is not appended to.
-- **Merge is order-dependent only in the sense of stage order.** Within a stage, one source is
-  authoritative for each entity.
-
-### 2.1 Model list enrichment
-
-The user configuration does **not** define a closed model list.
-
-- Configuring one model adds that model; `/models` and models.dev may add others.
-- The union of all three origins forms the resolved model set, minus explicit exclusions.
-- A model origin is recorded (for diagnostics and for "where did this value come from"), but is
-  not part of identity.
-
-### 2.2 Model identity
-
-Canonical identity is the pair `(provider_id, model_id)` — two separate strings, matched
-exactly. A presentation string such as `"provider/model"` is never parsed, split, or used as a
-key. Provider and model ids come from the source that introduced the entity and are not
-rewritten by a later stage.
-
-### 2.3 Unknown models: the runtime defaults
-
-When the three sources leave a model without metadata, the runtime supplies exactly two defaults
-and invents nothing else. This is not a fourth source: it applies only after every source has been
-consulted, and it can only fill what nothing stated.
-
-**Context window: 128K.** A model no source described runs with `CHAT_DEFAULT_CONTEXT_WINDOW`
-(128 * 1024), applied where the resolved model becomes a session, so a window is always present and
-admission has something to bound a request against. An explicit window is used as stated, including
-an explicit zero -- presence decides, not the value -- and a stated zero refuses every request
-through the existing admission check rather than silently becoming 128K. Whether the window was
-assumed is reported to the observer, so running on a default is visible rather than
-indistinguishable from a fact.
-
-**Reasoning: nothing is sent.** Reasoning stays unspecified and the provider applies its own
-default. `chat_build_request_into` puts `reasoning_effort` on the wire only when an effort was chosen,
-and `chat_session_set_effort` accepts a level only if it appears in the model's level list. A model
-no source described has an empty level list, so no effort can be set and no effort, level, budget,
-or equivalent parameter reaches the provider. The defaults deliberately do not fabricate reasoning
-capability: a "safe lowest level" would have to be asserted *into* the level list, which is a claim
-the harness has no evidence for and the provider may not understand.
-
-**Where an override belongs.** User configuration, in the per-model fields that already exist
-(`context_window`, `max_output_tokens`, `tools`, `thinking.levels`). Earlier sources win, so a
-stated value is never replaced by a default.
-
----
-
-## 3. Explicit model disabling
-
-An entry may be **tombstoned**:
-
-```lua
-models = {
-    ["gpt-4"] = { enabled = false },   -- semantic exclusion, not metadata
-}
+```text
+committed input -> prepared request -> admitted frozen request
+               -> observed response -> validated response and calls
+               -> committed calls -> observed tools -> committed results
 ```
 
-- `enabled` is not a normal metadata field. It is an exclusion marker, resolved during or before
-  enrichment, and no later stage may fill it.
-- A tombstoned model is removed **before** `/models` and models.dev are merged, so a later
-  discovery cannot reintroduce it.
-- A tombstoned model appears in the resolved catalog only as absent from the active set. Whether
-  it is retained as a visible "disabled" entry is a presentation concern, not a catalog one.
-- **Omitted is unspecified; `false` is explicit.** Absent `enabled` must never be treated as
-  disabled.
-
-Implementation note: the existing config key is `disabled` with a matching `disabled_present`
-flag (`agent/catalog.odin`, `agent/config.odin:80`). It already has the required semantics and is
-checked first, short-circuiting the rest of that model's fields. The written form
-`enabled = false` in this document maps onto that mechanism; renaming the key is cosmetic and not
-required.
-
----
-
-## 4. Resolved Catalog
-
-The single runtime-facing structure.
-
-```
-Resolved_Catalog
-    providers: []Resolved_Provider
-        id
-        display_name
-        auth:      endpoint, api_kind, api_key_env | api_key, models_url
-        models:    []Resolved_Model
-            id, display_name
-            api_kind:  its own, else the provider's
-            context_window, max_output_tokens
-            input_modalities, output_modalities
-            tools: bool
-            reasoning: { supported, toggle, levels[] }
-            origin: user | discovery | catalog
-```
-
-Rules:
-
-- Every optional field is `(present: bool, value)`. Absent fields stay absent after enrichment;
-  the catalog does not invent defaults.
-- **No defaults are applied at merge time.** A missing `context_window` stays missing and the
-  runtime decides what an unconfigured window means (today: refuse admission with an explicit
-  message — `chat_admission_check`, `agent/chat.odin`).
-- The catalog is **read-only** to everything downstream. The runtime copies the values it needs
-  (into a frozen session view, or reads them per request); it never mutates the catalog.
-- Adding a provider or model is a discovery/catalog problem, never a code change. If a new model
-  needs a code change to work, the enrichment is incomplete.
-
-### 4.1 What the catalog must be able to answer
-
-| question | catalog field |
-|---|---|
-| context window | `model.context_window` |
-| max output | `model.max_output_tokens` |
-| supported modalities | `model.input_modalities`, `output_modalities` |
-| reasoning support and levels | `model.reasoning.*` |
-| tool calling | `model.tools` |
-| provider endpoint | `provider.auth.endpoint` |
-| API family | `model.api_kind`, falling back to `provider.auth.api_kind` |
-| credential environment variable | `provider.auth.api_key_env` |
-| available models | `provider.models` |
-
-If a runtime question is not answerable from this table, the catalog is missing a field — not the
-runtime a special case.
-
----
-
-## 5. Capabilities and reasoning
-
-**Reasoning is capability metadata, never a model-name heuristic.** No regexes, no
-provider-specific model lists, no `if model starts with ...` anywhere.
-
-The representation must express, without loss:
-
-- simple on/off → `supported: bool`
-- discrete levels → `levels: [](string)` (verbatim)
-- budget-based → a budget field, added when a provider needs it
-- unknown → `supported` absent
-
-Rules:
-
-- **Levels are opaque strings.** The runtime validates a requested level against `levels` by exact
-  match and forwards it verbatim. It never translates `"high"` into a number or into another
-  provider's vocabulary. (Already the behaviour: `Provider_Request.Reasoning_Effort` is documented
-  as "a verbatim level validated against the model's configured levels, never translated".)
-- **Unknown capability is not unsupported.** Absent `supported` means "not established"; an
-  explicit `false` means "cannot". These drive different behaviour and must not collapse.
-- The runtime constructs the provider request from declared capabilities. Providers do not
-  discover or require capabilities themselves; they receive a resolved request.
-
----
-
-## 6. Durable conversation vs provider projection
-
-Two distinct things. Do not conflate them.
-
-**Durable conversation state** — what actually happened. Provider-neutral. Monotonic append plus a
-budget window. Carries:
-user turns, assistant text, tool calls, tool results, and opaque provider replay items in wire
-order.
-
-**Provider projection** — a temporary, per-request derivation. Rebuilt from the conversation, the
-resolved model, the catalog, the tool set, and runtime config. Never stored.
-
-Rules:
-
-- The projection is rebuilt for every request, including tool continuations
-  (`chat_build_request_into`, `agent/chat.odin`).
-- After compaction, rebuild from committed history, never from a pre-compaction view
-  (`chat_rebuild_prep`; the stale-view case is a tested failure mode).
-- The projection is *repairable*: it must not emit a tool call without its result, must not emit a
-  result without its call, and must keep call/result runs contiguous. Recovery enforces the first
-  two at open: a call that was dispatched and never came back is closed as an unknown outcome, and
-  a call that was never dispatched is closed as not executed.
-- **Tool results enter durable state before the next model request.** Never send a projection that
-  contains a tool result the conversation does not have.
-- The durable model must not gain provider-shaped fields beyond an opaque replay slot (§8).
-
-### Where the durable conversation lives
-
-The store is a SQLite database in the XDG state directory, owned by `agent/session`. Four tables:
-a `sessions` header (identity, directory, title, provider, model), `turns`, `requests` (one row per
-model request, carrying the settings it was sent with and the usage it reported), and `entries` (an
-append-only transcript ordered by a per-session sequence). Content is typed JSON in one column;
-identity, order, ownership, and correlation are columns the database enforces.
-
-A `Store` owns one connection and one caller drives it from one thread: the worker. History is read
-back only through `context_load`, which is the newest checkpoint's summary followed by the entries
-the summary does not cover, minus bookkeeping a model is never shown. Memory holds the work in
-flight and nothing else.
-
-One session is claimed for writing at a time through an advisory file lock, so two processes cannot
-run the same session. A claim is also what a mutation requires, which is why opening a session and
-recording anything in it are separate steps. The separation goes one step further for a new
-session: the launch holds an id and a directory in memory, and the `sessions` row is written by the
-first prompt. Nothing a session does can be recorded without that row, so a launch that is opened
-and closed without typing leaves no trace.
-
-A launch opens exactly what it asks for: no flag starts a new session in the current directory,
-`--resume` opens the newest session that recorded work in that directory, and `--resume SESSION`
-opens that session by id wherever it ran. The first prompt is the only interaction that makes a
-session exist, whether or not the request behind it succeeds. Resolving the target is separate from
-claiming it, so a refused resume costs nothing and never falls back to a different session. Opening
-an interrupted session settles it before anything new is admitted.
-
----
-
-## 7. Agent lifecycle
-
-Minimal state machine. Cancellation, compaction, steering, and subagents fit inside it; none of
-them gets a competing loop.
-
-The proposed [Lua Code Mode and asynchronous tool execution](CODE_MODE_ARCHITECTURE.md)
-design extends this state/effect model. It does not install a traditional agent loop.
-Section 6 of that document states the state-machine rules both levels follow, section
-7 the tool-job and Lua transitions, and section 8 the chat transitions. The changes
-are not implemented.
-
-```
-Idle
-  ↓ accept user
-Preparing ──(steering boundary: drain queue)──┐
-  ↓                                           │
-Requesting → Streaming                        │
-  ↓                                           │
-tool calls? ── no ──→ Finalizing → Idle       │
-  │                                           │
- yes                                          │
-  ↓                                           │
-Executing_Tools ──────→ Preparing ────────────┘
-  ↑
-Cancelling → (operation retires) → Finalizing
-```
-
-Rules:
-
-- One turn = one user prompt and everything it causes until terminal. `requests_made` bounds the
-  tool loop.
-- **The state machine advances through effects, not a callback graph.** `advance(state) -> Effect`;
-  the driver performs the effect and feeds its observed outcome back as an event. A start effect
-  may leave work pending. Under the asynchronous tool proposal, `Executing_Tools` includes
-  suspended work; with nothing runnable, advance requests an event wait rather than blocking
-  inside tool execution. Tool-job and Lua phases represent waiting without a duplicate chat
-  phase. Transition tests need no transport, threads, or Lua interpreter.
-- Terminal status is exactly `Completed | Failed | Cancelled`. A turn reaches a terminal state
-  once, and reports it once.
-- Every in-flight request is an **operation** with its own id. Events carry their
-  source `(turn_id, operation_id)` and are rejected unless they match the running operation, so a
-  superseded or cancelled operation can never mutate a newer turn.
-- A model request carries no harness time bound. It stays open as long as the provider keeps it
-  open, and ends when the provider, the transport, or cancellation ends it
-  (`agent/operation.odin`). Only the provider enforces how long deliberation may take.
-- Use Goose's step/effect separation where it simplifies this. **Do not reproduce Goose's
-  operation catalogue for architectural similarity** — add a step only when a requirement needs
-  one.
-- **Answers stay complete.** Every committed call ends the turn with exactly one recorded result,
-  child calls included, and a cancelled turn still settles everything it committed. The proposed
-  [Code Mode architecture](CODE_MODE_ARCHITECTURE.md) §6.3 states the rule, and §6.4 states why
-  an interrupted turn is settled from the journal rather than resumed.
-
----
-
-## 8. Provider replay state
-
-Responses-over-WebSocket uses a foreground session-owned connection and full-context requests.
-The accepted design and remaining correctness work are specified in
-[Network stack architecture, section 9](NETWORK_STACK_ARCHITECTURE.md#9-provider-websocket-integration).
-Committed history remains authoritative across reconnect, compaction and process restart.
-Incremental continuation and multiplexing are not part of this implementation phase.
-Background compaction keeps an independent HTTP operation. Transport selection is an explicit
-provider setting applied after per-model API routing, not a Models.dev capability or a
-model-name heuristic. The accepted target default is `auto`: prefer WebSocket for an API whose
-adapter implements it, otherwise HTTP/SSE, with sticky HTTP after a qualifying WebSocket
-transport failure. The shipped default remains HTTP/SSE until the rollout gates pass.
-
-Two properties of that selection matter for this harness. A transport change is not recovery:
-it never authorizes replaying a request whose model send may have reached the provider, and the
-same conservative delivery rule now applies to HTTP as well as WebSocket. And a transport change
-is not a cache or stability guarantee; neither protocol resumes an interrupted model operation,
-and packet loss on the shared TCP/TLS path is handled the same way by both.
-
-Switching provider or model inside one session is a supported, transparent operation in both
-directions, and its contract is in
-[Network stack architecture, section 9.11](NETWORK_STACK_ARCHITECTURE.md#911-provider-and-model-switches-across-transports).
-Transport is not part of session identity: a switch keeps the same conversation id, durable
-history, transcript, instruction snapshot and cache key, and it never appears in the
-conversation, the rendered output or the model's view. A switch applies between requests on the
-owning thread, so it never mutates an in-flight request. The new selection's transport mode
-governs the next request, and a switch to a WS-capable selection may attempt WebSocket again
-because sticky HTTP belongs to one affinity rather than to a provider name. A switch is also not
-a recovery mechanism: an ambiguous send in the previous affinity stays stopped and is not
-replayed against the new provider.
-
-Prompt-cache preservation is a cost requirement. Transport changes must preserve the common
-request, stable session cache key, instruction snapshot, ordered tools and normalized history.
-[Network stack architecture, section 10](NETWORK_STACK_ARCHITECTURE.md#10-prompt-cache-preservation-and-the-reported-regression)
-records the cache investigation, the confirmed mixed-denominator hit-rate defect, the required
-usage-coverage correction and the cache/cost acceptance gate. These corrections are planned,
-not implemented. A stable connection is not proof of a provider cache hit.
-
-Reasoning content is **not** merely display text. Some providers require faithful replay of
-provider-generated structures, particularly adjacent to tool use.
-
-Rules:
-
-- The conversation carries provider-specific replay items as **opaque blobs in wire order**,
-  attached at the position they occurred. The generic model does not interpret them.
-- Replay items are tagged with the provider/model that produced them. A projection targeting a
-  different provider/model **drops** them rather than guessing a translation.
-- The generic conversation stays provider-neutral. Only the replay slot is provider-specific.
-- Do not force every provider's reasoning representation into one lossy universal form; do not
-  make the conversation itself provider-specific.
-- Current shape: `Chat_Message.reasoning_id` + `reasoning_encrypted`, projected to
-  `Provider_Message.Role = .Reasoning`. This is Responses-shaped (id + encrypted content).
-  Generalising it for Anthropic signed thinking blocks is an open question (§14).
-
----
-
-## 9. Steering
-
-Follow the Goose model. Steering is **queued**, never mid-request.
-
-```
-model request → streaming → request completes
-                                   ↓
-                         apply queued steering
-                                   ↓
-                         build next request
-```
-
-Rules:
-
-- Steering arrives at any time; it is appended to a bounded FIFO
-  (`STEER_MAX_ITEMS`, `STEER_MAX_BYTES`) and read by the loop. The front-end owns reading input and
-  pushes lines into the queue; the agent does not read stdin, and there is no second input path.
-- **Injection happens only at a request boundary** — after tool calls settle, before the request
-  view is frozen. Never mutates an in-flight request or an in-flight projection.
-- A steering line that arrives after the turn's last boundary is reported and dropped when the turn
-  settles; it is never applied to a later turn, where it would no longer mean what the user typed.
-- Commands that must take effect before the next request (`/effort`, `/compact`) run at the
-  boundary, ahead of the request build. The interactive front-end sends only text through the
-  queue and keeps commands on its own path, which decides what may happen mid-turn.
-- Steering is bounded. No arbitrary mid-request mutation. One owner thread remains the only
-  session writer. The planned tool-job scheduler handles execution readiness and retirement,
-  not steering policy or concurrent model requests. A suspended tool is not a steering boundary.
-
----
-
-### 9.1 Configuration changes at request boundaries
-
-A change to model, provider or effort takes effect at the next request boundary. Not the next
-turn, and not the next prompt: inside a turn every tool-loop iteration is a boundary, so a change
-made while a response streams or tools run applies to the next request of that same turn.
-
-Mechanism, kept as data plus one owner (implemented for provider and model):
-
-- The front-end records the requested selection as one pending intent (`Pending_Selection`) in
-run state under the existing runtime lock, and wakes the worker with a work item of its own kind
-whose payload is nothing: the choice is not in the item, because a turn owns the session until
-its next boundary and only the intent can wait there. It does not apply the change itself and
-does not touch the session.
-- `apply_selection` stays the only writer of the resolved selection, and `apply_pending_selection`
-is its only caller for a requested change. Taking the intent under the lock is what makes it apply
-once: the idle path and the turn boundary both call it, and whoever takes it takes it for good. A
-request that arrives after the first boundary is a new intent and applies at the next one.
-- `Steer_Context` carries a boundary hook (`apply` plus the caller's own data).
-`chat_run_turn_steered` calls it where it already drains steering, before `chat_prepare`, and uses
-the connection it returns for the next request. Catalog lookup, credential resolution and
-persistence stay in the root package; `agent` only asks, exactly as with the steering queue and
-the observer. The hook also republishes the names and connection the agent reads, because the
-steer context borrows strings an install replaces.
-- A pending intent is never lost. If the turn is cancelled or fails, the idle path applies it
-before the next prompt.
-
-Constraints:
-
-- Never apply a change to an in-flight request or its frozen bytes. A chain already in flight keeps
-its endpoint until it ends: its bytes were frozen for the provider they were built for, and
-replaying them is the only safe action on an entered send. Such a chain therefore delays a change
-by at most its remaining attempts, and the change applies to the next request the harness builds.
-- Effort keeps its own two paths, both of which already land at a boundary: a `/effort` line typed
-during a turn is queued as steering and applied by the drain at the same call site, and the effort
-menu applies between turns. Route a future change of either kind through the same boundary site,
-so they cannot diverge.
-- The switch is transparent: same session, durable history, transcript and cache key, no
-conversation entry about it, no rendering difference. Transport and cache consequences are in the
-network document, sections 9.11 and 10.6.
-- Cancelling or failing to apply a change leaves the previous configuration usable and says why;
-an unusable new selection never leaves the session without a working model.
-
-## 10. Compaction and context budget
-
-For context measurement, admission, automatic or tool-triggered compaction, checkpoint
-installation, and compaction lifecycle work, read
-[Context management and non-blocking compaction](CONTEXT_COMPACTION_ARCHITECTURE.md).
-That specification replaces this section's former compact-only-on-refused-admission policy.
-
-The active context is a checkpoint followed by every entry after the sequence it covers.
-Compaction summarizes a fixed prefix on its own thread while the foreground keeps using the
-existing context and cache prefix, and the finished summary is installed later at a request
-boundary. Start and installation thresholds are separate, and nothing waits for a summary.
-
-The next implementation is specified in
-[Provider failures, retries, and context recovery](ERROR_RETRY_ARCHITECTURE.md).
-It defines provider error classification, bounded retries, per-send records, and overflow repair
-without waiting for compaction. It also supplies the concrete aggregate result budget and
-retrievable storage contract for §11. These additions are planned, not implemented.
-
----
-
-## 11. Tools
-
-- Tool calls are **structured state**, not embedded in text: `{id, item_id, name, arguments,
-  result, status}`.
-- **Arguments are buffered and validated before dispatch.** Partial argument fragments never reach
-  the executor; only a validated, complete call does. Non-object JSON is not a valid call.
-- A call is bounded (count and argument bytes) and rejected with a typed error when it exceeds the
-  bound, rather than truncated.
-- Every dispatched call produces exactly one result, including synthetic results for calls that
-  did not run because the turn was cancelled. History stays well-formed in every path.
-- Results enter durable conversation state before the next request (§6).
-- **Large output ordering is fixed:**
-  ```
-  redact → cap → spill to the record → hand back a re-readable handle
-  ```
-  Never place arbitrarily large tool output into model context. Redaction happens **before** the
-  cap, so a cap cannot split a secret in half. A turn's results are bounded as a batch, so one
-  large result cannot crowd out the rest; a result the batch cannot afford stays in the entry it
-  was recorded in and the model is shown a handle it can read back with `context_read_result`.
-  See [Provider failures, retries, and context recovery](ERROR_RETRY_ARCHITECTURE.md) §8.
-  Redaction before retention and a retention cap beyond one result are still open.
-- Tool definitions come from the harness's tool registry; `model.tools` from the catalog decides
-  whether they are advertised at all.
-- Tool availability is a capability of the *model*, resolved from the catalog — not a per-provider
-  branch in the loop.
-
----
-
-## 12. Subagents
-
-A subagent is a **tool** the orchestrating agent invokes. It is not a configured persona.
-
-- **No Markdown-defined agents.** No `reviewer.md` / `coder.md` / `planner.md`. No fixed taxonomy
-  of roles.
-- The orchestrator decides the specialisation and expresses it in the instruction. Roles are a
-  prompt-authoring concern, not a harness concept.
-- An invocation specifies at least: `provider`, `model`, `reasoning`, `instruction`.
-- **Process isolation is required.** A subagent runs in a separate OS process. Threads are not
-  sufficient isolation: if a subagent crashes, hangs, or is killed, the harness must survive.
-  ```
-  harness process
-      └── subagent subprocess
-  ```
-- The lifecycle must expose `completed | failed | cancelled`, and internally distinguish normal
-  failure, abnormal termination, cancellation, and timeout.
-- **Design for `spawn → handle → await`** even though the first tool-facing interface is
-  synchronous. Concurrency later must not require redesigning the lifecycle.
-- Do not over-specify the public result shape before the lifecycle requirements are understood.
-- Subagent results re-enter the parent as an ordinary tool result, subject to §11.
-
----
-
-## 13. Cancellation and lifecycle boundaries
-
-- Cancellation is a **request**, never a force. The turn settles only once the in-flight operation
-  has retired and confirmed it stopped. Nothing is released on the strength of the request alone
-  (`Chat_Operation_State`, `agent/operation.odin`).
-- Cancellation wins over whatever error the transport also reported.
-- A cancelled turn still resolves its committed tool calls with synthetic "not executed" results,
-  so history stays valid.
-- Cancellation is the only harness-side stop for a model request: it is external
-  intent carried into the transport. The harness sets no elapsed-time bound on requests; tool
-  executions carry their own definition bounds instead.
-- Signals are recorded by the handler and interpreted by the loop; a handler never mutates turn
-  state.
-- The frame loop interprets them on every iteration, and presentation is never a condition for
-  that: a terminal that reports no size skips the frame, not the stop check. What the front-end
-  can observe about its terminal is not a reason for a run that only a signal can end, and a
-  terminal that never reports a size says so once instead of failing silently.
-- A turn begins uncancelled, so a signal that arrived after the previous turn finished is never
-  inherited.
-
----
-
-## 14. Core versus edge
-
-**Core (`agent`, `ai`) owns:** conversation, model interaction, tools, context/budget, streaming,
-cancellation, steering, compaction, subagents.
-
-**Edge owns:** ACP, CLI/TUI, presentation, rendering, command menus, which session a launch opens,
-telemetry export.
-
-Rules:
-
-- The core emits **semantic** events through a caller-supplied observer and writes to a
-  caller-supplied writer. It never renders.
-- The provider abstraction stays narrow: translate a provider-neutral request into the provider's
-  API, and translate the provider's stream/result back. Discovery and metadata come from the
-  catalog, not from provider code.
-- Streaming vocabulary stays small: `content delta`, `reasoning delta`, `tool started`,
-  `tool input delta`, plus a typed terminal result. Provider wire events do not leak into the core.
-- Finish reasons normalise into a small closed set. Usage distinguishes **exact / deferred /
-  unavailable** rather than assuming every provider always reports it.
-- **ACP must not appear in the core**, and the core must not depend on a front-end's existence.
-- Do not reproduce FX's dependency interface. It is a catalogue of the host's concerns (diff
-  blocks, permission targets, credential refresh, HTTP statuses) leaked into the runtime.
-
----
-
-## 15. Current state and gaps
-
-Verified against the code at the time of writing.
-
-### Already matching
-
-| Area | Evidence |
-|---|---|
-| Presence-flag convention | `Provider_Request` (`ai/contract.odin`), `Catalog_*_Source` (`agent/catalog.odin`) |
-| Step-function loop | `chat_session_advance` → `Chat_Effect_Kind{Start_Request, Run_Tools, Step_Tools, Wait_Tools, Finish_Tools, Turn_Finished}`; the tool table lives on `Chat_Session` |
-| Steering at a boundary | `chat_drain_steering` runs when state is `.Preparing` |
-| Operation lifecycle | `Chat_Operation_State{None, Running, Retired}`, event-source gating |
-| Local pre-send estimate | `chat_estimate_input_tokens` + `chat_admission_check` |
-| Opaque reasoning replay | `is_reasoning` / `reasoning_id` / `reasoning_encrypted`, projected as `.Reasoning` |
-| Tool argument buffering + validation | `Provider_Tool_Fragment`, `provider_tool_finalize` |
-| Cancellation is a request | `chat_session_request_cancel` never finalizes |
-| No hardcoded provider/model knowledge | grep over `ai/` and `agent/` returns nothing |
-| Provider-neutral conversation | `Chat_Message` has no provider-shaped fields beyond the replay slot |
-
-### Needs work
-
-1. **Provider metadata is only partly discoverable.** models.dev supplies the endpoint, the API
-   family, and the credential's environment variable for the providers it knows, but a provider
-   without an endpoint field — including `anthropic` and `openai`, which rely on their SDK's
-   built-in default — still needs `base_url` stated in configuration.
-2. **Catalog fields parsed but never consumed:** `input_modalities`, `output_modalities`,
-   `display_name`.
-3. **Subagents absent.** No spawn, no process isolation, no lifecycle.
-4. **No redaction pass before tool output is stored**, and no retention cap across a session. A
-   single result is capped, and a batch is now bounded and retrievable.
-5. **System prompt is a message, not a lane**, and is hardcoded (`AGENT_SYSTEM_PROMPT`,
-   `CHAT_COMPACT_INSTRUCTIONS`).
-6. **Anthropic unimplemented.** `API_Kind.Anthropic_Messages` exists; `Provider_Validate_Request`
-   rejects it and there is no encoder.
-7. **Prompt-cache fields unused** by the chat path.
-
-### Settled since this document was written
-
-- **Compaction keeps the tail.** The active window is `[summary] + kept tail`, and the seam stays
-  out of a call/result run.
-- **One resolved catalog.** `resolve_catalog(user, provider, models_dev)` merges the sources,
-  first defined value wins, into the `Catalog` the runtime reads.
-- **Provider `/models` discovery.** Each configured provider's own listing is read live at
-  startup (`agent/discovery.odin`) and merged as the middle source, so the catalog holds every
-  model the provider reports while the user's configuration keeps every field it states.
-- **models.dev ingestion.** The API representation is fetched and cached under the XDG state
-  directory, parsed into provider source records, and supplied to the resolver as its third
-  source. A document that cannot become source records never replaces a usable cache.
-- **One provider credential field.** `api_key` is resolved when a connection is built: a value that
-  names an existing environment variable is that variable's value (the `${NAME}` reference form
-  included); anything else is the secret itself. A name that exists but is empty fails rather than
-  sending the name as a key.
-- **Routing is per model.** A provider states the family its endpoint speaks by default, and a
-  model may state its own: models.dev's model-level SDK, or `api` on a configured model. The
-  model's statement is the more specific one and wins, so an endpoint that serves mostly chat
-  completions can still route one model through the Responses API. A model that states no family
-  is served through its provider's. Routing never costs a model its window, modalities, tools, or
-  thinking controls.
-
-### Must remain unchanged
-
-- `http/client`, `sse`, and their conformance work. The provider layer sits above them.
-- The observer seam's size and shape (`agent/observer.odin`). It is deliberately narrow; do not
-  widen it toward FX's dependency interface. The two request-lifecycle notifications are the
-  deliberate exception, and they are events rather than a dependency: a front-end that shows the
-  context or the session's token totals has to be told when a request is prepared and when its
-  outcome is recorded, or it can only refresh the footer once the whole prompt is done.
-- `agent` stays presentation-free.
-- Everything currently green stays green.
-
----
-
-## 16. Open product decisions
-
-Only decisions that cannot be settled from the code, the provider specifications, or the
-requirements. Everything else is an implementation detail to resolve during the work.
-
-1. **System prompt lane.** Keep the system prompt inside `messages` (today), or split
-   `Provider_Request` into `instructions` + `messages` as FX and Goose both do. Splitting is
-   cleaner and enforces the invariant that conversation never contains a system message, but it
-   changes the provider contract and both encoders.
-
-2. **Anthropic reasoning replay representation.** The current replay slot is Responses-shaped
-   (id + encrypted content). Anthropic needs signed thinking blocks, which are a different opaque
-   payload, and the adjacency requirements around tool use differ. Decision: generalise the slot
-   to a tagged opaque blob, or add a second provider-specific variant.
-
-3. **Subagent result shape.** Deliberately unresolved. Decide after the process lifecycle —
-   exit status, timeout, kill, partial output — is implemented and its real distinctions are
-   known. Do not design the public type first.
+Every arrow has a named owner, validator, failure outcome, and release point. A stage
+that waits owns its continuation as data. A short synchronous stage is a procedure,
+not automatically a new machine state. This gives tests useful boundaries without
+turning every helper into a command object.
+
+### Why staged execution
+
+SynapseFlow's workflow decomposition is the main case-study basis for this design.
+Its four-stage fuzz-harness generation separates documentation, snippets, assembly,
+and final validation, with bounded regeneration from earlier artifacts. The supplied
+review reports a larger coverage loss from collapsing those stages than from replacing
+its dataflow grouping. That supports narrow stages and local validators, not a claim
+that Nabla inherits its benchmark results. Its probability argument assumes sufficiently
+independent stages; tool side effects and interactive model requests are not independent.
+See [SynapseFlow](https://arxiv.org/abs/2607.07007) for the source identified by that review.
+The supplied analysis, not an independently reproduced experiment, is the evidence here.
+
+For Nabla, the reusable lesson is to retry only the failed, repeatable work from a
+validated input. Do not translate staged rollback into rerunning shell commands,
+rewinding files, or asking a model to repair an uncertain effect. Deterministic checks
+handle identity, JSON, budgets, and ownership. Semantic task quality remains a model
+and evaluation concern. No function-role taxonomy, structural flow graph, voting
+prompts, universal compile gate, or generic workflow engine belongs in the harness.
+
+DeepSeek's useful precedent is narrower: durable facts distinct from model history,
+stable request bytes, nested calls outside the model projection, and explicit
+interception boundaries. Nabla does not need its plugin lifecycle, service registry,
+event waterfalls, profiles, or background-job platform. Adopt an invariant without
+adopting the machinery that another runtime uses to enforce it.
+
+## Required invariants
+
+1. One owner mutates a live session and writes its store. Workers return observations.
+2. A tool cannot start before durable intent. A continuation cannot consume an
+   uncommitted result. Storage failure stops admission, not cleanup.
+3. Every committed call has one terminal result before normal turn completion or the
+   next model request. Storage loss may prevent settlement; recovery closes the gap.
+4. Cancellation is intent, completion is an observation, commit is durability, and
+   retirement is proof that resource borrows ended. None substitutes for another.
+5. The durable record is authoritative. Runtime tables hold in-flight work, not a
+   second conversation. Provider requests are disposable projections.
+6. Failed or partial responses release no executable calls. Automatic retry never
+   repeats a tool or a model send whose execution may already have happened.
+7. All retained work has an owner and a bound, including hidden Lua children, pending
+   output, input queues, and diagnostic capture. Hiding data from the model is not a
+   storage or memory bound.
+8. Native core checks apply equally to direct calls, Lua calls, future hooks, and
+   future subagents. Customization cannot weaken them.
+9. The zero value is inert or explicitly unknown. Absence, false, zero, empty success,
+   allocation failure, and unobserved outcome are distinct where behavior differs.
+10. Linux is the target. No speculative platform layer or new runtime dependency.
+
+## Package boundaries
+
+| Layer | Owns | Excludes |
+| --- | --- | --- |
+| `text`, `input`, `term`, `layout`, `tui` | Reusable text, terminal, layout and UI facilities | Agents, providers, session policy |
+| `dns`, `tls`, `http`, `http/client`, `sse`, `websocket` | Their protocols, resource ownership, protocol facts | Model names, retries of model work, harness logging policy |
+| `ai` | API encoding/decoding, normalized provider evidence, one-send operations | Turn control, model catalog policy, session storage, presentation |
+| `mcp` | MCP protocol and transport facts | Nabla tool policy and conversation |
+| `db`, `db/sqlite` | Database facilities | Harness record semantics |
+| `agent/session` | Durable identities, records, transactions, claims, recovery queries | Model execution, filesystem instruction discovery, UI |
+| `agent/skills` | Bounded skill format, discovery and loading | Turns, model selection, permissions |
+| `agent` | Execution policy, catalog resolution, tools, Lua, context, diagnostics | Terminal, rendering, process-global UI state |
+| root `nabla` | Process lifetime, configuration wiring, signals, frontends, ACP adaptation | Duplicate retry, admission or projection policy |
+
+`acp` is a protocol boundary, not an agent dependency. Only root combines foundation
+and harness. Moving the frontend behind ACP is future integration work, not a reason
+to build an RPC layer inside `agent` now. Headless and interactive callers drive the
+same machine. The caller-supplied writer and semantic observer carry presentation
+output; neither is a policy hook or a substitute for the session record.
+
+Prefer extending the package that owns a subject. A new subpackage needs a distinct
+contract and consumer, not a folder for a large struct. Foundational and protocol
+packages must remain independently buildable and useful outside Nabla.
+
+## Odin data, memory, and context
+
+Use `snake_case` procedures and fields, `Ada_Case` types and enum members, and
+`SCREAMING_SNAKE_CASE` constants. Prefer enums, tagged unions, `Maybe`, distinct
+identities, slices, and small contiguous tables. Use exhaustive switches for closed
+control domains. Do not erase internal types into strings, `any`, `rawptr`, or
+property maps. Confine unavoidable erased pointers to validated FFI/executor bindings.
+
+Keep data and procedures separate. No class emulation, service locator, dependency
+container, generic reducer framework, or allocator wrapper per component. A procedure
+pointer is appropriate for an actual executor boundary, not for every private helper.
+
+### Context is scoped infrastructure
+
+Use `context.allocator`, `context.temp_allocator`, `context.logger`, and the standard
+random generator where their contracts fit. The implicit context is not a place to
+hide session state, cancellation, authority, or a collection of services. Those are
+explicit typed inputs and owned records. In particular, do not store an execution
+container in `context.user_ptr` to bypass package boundaries.
+
+Allocating APIs normally take a trailing `allocator := context.allocator`. An owner
+that outlives the call retains the allocator needed to release its memory. Scope-wide
+allocator overrides are useful for a deliberate common lifetime, not for concealing
+which allocator owns an escaping result. Copying strings, slices, maps, and dynamic
+arrays copies headers, not ownership.
+
+| Lifetime | Allocation and release rule |
+| --- | --- |
+| One observation/effect | Owner-local scratch; reset only after all borrowed output is consumed |
+| Prepared request and retry chain | Owned bytes/settings until every attempt retires |
+| Worker execution | Stable owned input and result, thread-safe allocator, release after producer retirement |
+| Lua execution | Private Lua state plus bounded host allocations; release after children retire |
+| Session | Decoded snapshot, registry and control data; release after all borrowers retire |
+| Durable history | SQLite and explicitly bounded artifacts, loaded by range rather than retained forever |
+
+A temporary allocator reset belongs to its owner. A library must not reset a caller's
+shared scratch. A long turn needs reset points within the turn, not only after the
+whole prompt. Use arenas only for an actual shared lifetime; ordinary heap allocation
+is the baseline for independently retiring jobs. Avoid a custom allocator, reference
+count, free-list, or structure-of-arrays layout until its workload justifies it.
+
+Threads and C callbacks do not capture the calling scope's context. Establish the
+needed allocator and logger at entry. Do not copy the owner's whole context into a
+worker: that can share scratch and a non-thread-safe allocator. A mutex wrapper is
+insufficient if another thread accesses its backing allocator without that mutex.
+Verify `core:thread` temporary-allocator cleanup when setting `init_context`.
+
+Use `defer` for scope-owned cleanup. Suspended work needs explicit persistent owners;
+Lua yield/error paths must not depend on unwinding Odin defers. Check allocation and
+size arithmetic wherever failure could lose intent, publish empty success, or break
+ownership. Use typed trailing errors and propagate them to the policy owner. Panics
+are not normal input, transport, tool, or storage error handling.
+
+## Minimal core and resource policy
+
+The essential tools are Read, Write, Edit, and Lua Code Mode. Keep existing shell,
+result lookup, compaction intent and skill tools only where they provide a distinct
+capability. Names and the precise inventory are not immutable architecture. Compose
+multi-operation work in Lua; use MCP for external integrations instead of adding a
+native tool for each service.
+
+Keep one foreground model operation per session. Bounded worker threads are justified
+for blocking I/O and useful independent external work. A waiting Lua parent consumes
+no worker slot. Use one owner wake mechanism rather than separate polling loops for
+tools, retries, and compaction. No idle scanning, periodic inference, speculative
+prewarming, or permanent pool solely because multiple cores exist.
+
+Resource improvements need evidence. Measure peak live bytes, allocation count,
+idle wakeups/CPU, executable plus runtime dependency size, owner stop latency, and
+completed-task cost. Measure Lua by saved model round trips and intermediate tokens,
+not just interpreter speed. Keep the simple design when a more complex one has no
+meaningful end-to-end gain. Never disable validation to improve a microbenchmark.
+
+The native implementation should use installed `core:`, `base:`, and `vendor:`
+facilities before adding code or dependencies. Lua and SQLite are deliberate existing
+foreign boundaries, not permission to add Node, Python, a web server, or a plugin
+runtime. Replacing a foreign component requires measured value, not a new home-grown
+interpreter, database, or cryptographic implementation for language purity.
+
+## Making implementation decisions
+
+Before adding a field or subsystem, answer:
+
+1. What behavior needs it now, and which package owns that behavior?
+2. Which existing data or Odin facility already answers the question?
+3. Is this a distinct fact, or a cache/counter duplicating another fact?
+4. Who owns it across waiting, cancellation, failure and shutdown?
+5. What validates it before effects, what bounds it, and what survives restart?
+6. Which test would detect a broken contract rather than a harmless rearrangement?
+
+If the answer is only a future consumer, defer the machinery. Future hooks and
+subagents need stable boundaries, not unused fields, placeholder effects, public task
+handles, event buses, or schema migrations now. Prototype formats may change with an
+explicit migration or diagnosed incompatibility; never silently reinterpret records.
+
+Verify transitions without threads or a provider. Verify effect boundaries with
+small real fixtures, including storage failure and cancellation races. Use ablations
+on representative tasks to evaluate optional mechanisms, but never ship an ablation
+that removes a safety invariant. Report task success, tokens/cost per successful task,
+latency and resource use. Fuzz coverage from another system is not Nabla's metric.

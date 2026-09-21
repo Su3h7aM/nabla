@@ -1,523 +1,221 @@
-# Tool and MCP architecture
+# Tools and MCP
 
-This records why the harness tool system is shaped the way it is. It is the
-design record for `agent/tool*.odin`, `agent/session`, and `mcp`. Read the code
-first; this document only carries the reasoning that the code cannot.
+Status: required target. The shared [execution machine](EXECUTION_ARCHITECTURE.md)
+owns scheduling, cancellation, result commit and retirement. This document owns
+admission, tool authority, result representation and MCP adaptation. No separate
+Lua, MCP, or future subagent dispatcher is permitted.
 
-The implemented tool path described here is synchronous. The proposed
-[Lua Code Mode and asynchronous tool execution](CODE_MODE_ARCHITECTURE.md) design
-supersedes that execution constraint. It specifies shared tool-job state machines,
-Lua suspension, explicit concurrency, and nested call recording. Those changes are
-not implemented; the result, admission, and delivery contracts below remain the
-starting point, not a prohibition on refactoring their current interfaces.
+## Minimal tool contract
 
-## Why
+A definition is data plus a concrete execution choice: canonical name, description,
+input schema, eligibility, limits, executor and backend binding. Worker execution
+handles blocking native/MCP work; short owner operations handle session result reads
+and compaction intent; Lua execution runs bounded slices. Add a placement only for a
+real backend, not a universal start/poll/cancel/destroy interface.
 
-Nabla originally shipped one tool, `shell`, and the tool system was the shell
-tool. Argument reading, result encoding, error taxonomy, dispatch, and the
-system prompt all named shell fields directly. Adding a second tool meant
-editing dispatch, the request builder, result rendering, and the storage
-vocabulary.
+Native tools retain typed field readers and one executor. Where preflight needs
+field validation, reuse a side-effect-free validator with execution rather than
+inventing an erased prepared-argument object. A whole JSON Schema engine is not
+required. Advertised schema constraints and actual native validation must agree.
+For MCP, validate shared structure locally and leave remote semantic validation to
+the server. Do not claim arbitrary external schemas have been fully validated.
 
-The goal is one tool system with a fixed set of native tools (`shell`,
-`read`, `write`, `edit`, the skill tools, and the conversation tools
-`context_compact` and `context_read_result`) and MCP servers
-as a second source of the same kind of tool. Adding a tool should mean writing one
-declaration and one procedure.
+Read, Write, Edit and Code Mode are the essential capability set. Shell is a bounded
+process invocation, not a terminal service. Skill loading, result paging and
+compaction intent reuse the ordinary tool lifecycle. Service-specific integrations
+belong behind MCP; repeated workflows belong in Lua rather than a proliferation of
+native tools.
 
-## What we keep
+## Registry and identity
 
-Nabla already had the parts that are hard to retrofit:
+Build, validate and sort one registry before publication. Reject collisions, malformed
+schema documents, inconsistent limits and missing executors. A failed replacement
+leaves the installed registry intact. Freeze it for a turn, including all child work,
+and retain borrowed backend generations until every producer retires.
 
-- Durable intent before execution. The harness records a dispatch entry before
-  a tool runs, so an interrupted call is legible as an unknown outcome rather
-  than a guess.
-- A single state machine (`Chat_State`) with the driver owning every durable
-  write. Tools never touch the store.
-- Faithful replay. Raw model arguments stay in the call entry; the arguments a
-  call actually ran with live in the dispatch entry; results are stored as the
-  exact text later sent to the model.
-- A controlled `shell`: fresh process group, closed stdin, fixed environment,
-  concurrent pipe draining, group termination, no allocation in the forked
-  child.
+Direct advertisement and Lua discovery are views of this registry, not independent
+inventories. Check eligibility again at admission. Omitting a tool from a prompt is
+not an authority check. Disabling tools must also disable indirect Lua invocation.
 
-None of that changes. The work generalizes the shell-shaped parts around it.
+Canonical names use the flat ASCII identifier subset
+`[A-Za-z_][A-Za-z0-9_]{0,63}`, excluding Lua reserved words when used as field names.
+Native names such as `builtin_read` and MCP names such as `github_create_issue` pass
+unchanged through advertisement and dispatch. Never split a name to reconstruct its
+backend. An MCP binding retains the exact remote name separately. Remote punctuation
+requires an explicit configured alias; do not silently normalize names into collisions.
+Stored names describe what ran and are not rewritten when a registry changes.
 
-## Scope and planned extensions
+Hints such as read-only or idempotent are tri-state metadata with unknown as zero.
+They are neither proof of thread safety nor permission to retry an uncertain effect.
+Descriptions carry model guidance. Do not synthesize a tool dependency manifest from
+hints or require a read-before-edit history ledger. Real preconditions, such as an
+edit's exact-match requirement, belong to that tool's deterministic validator.
 
-The implemented tool system has no Code Mode, parallel tool execution, background
-jobs, PTYs, permission language, or MCP resources, prompts, subscriptions, Apps, or
-Tasks. Lua is already embedded for configuration, but not for tool orchestration.
+## Batch admission before effects
 
-[Code Mode architecture](CODE_MODE_ARCHITECTURE.md) now proposes a Lua execution
-tool and asynchronous, bounded tool jobs. It replaces the synchronous orchestration
-assumption rather than wrapping it in a second tool system. Detached background
-jobs, plugin loading, and the other capabilities above remain outside that work.
+A response is an untrusted proposal. Validate the entire root batch before any call
+runs or any executable call record commits:
 
-## The tool contract
+1. Require a complete accepted provider response, unique nonempty identities, valid
+   names, and bounded call count and argument bytes.
+2. Resolve every name against the frozen registry and check invocation eligibility.
+3. Parse complete JSON objects with duplicate-key and depth checks. Apply only an
+   exact documented syntactic repair, currently escaping raw control bytes inside
+   otherwise unambiguous string literals. Revalidate the whole repaired document.
+4. Validate native field types, ranges and known names without external effects.
+   Preserve the server-validation boundary for MCP.
+5. Reserve job/input capacity and terminal-result allowance for the whole batch.
+6. Commit the accepted response and raw calls atomically, then transfer admitted jobs
+   to the machine. Dispatch records retain the exact effective argument bytes.
 
-A tool is data plus one procedure.
+An invalid name, malformed argument document, oversized batch or local validation
+failure refuses the entire proposal. Execute none of its valid siblings. Record a
+typed rejection and bounded model feedback instead of half an executable batch.
+Do not invent arguments, choose one duplicate key, drop unknown fields or ask another
+model to guess a repair. This gate prevents avoidable partial effects; it is not a
+transaction around tool execution. Files and remote services can change after
+admission, and a later runtime failure does not undo earlier calls.
 
-`Tool_Definition` carries the provider-visible name, description, and input
-schema bytes; static behavior hints; a timeout policy; the execute
-procedure; and a borrowed backend binding.
+Child calls enter the same admission checks one at a time. Their parent may already
+have performed effects, so a rejected child is an ordinary refusal, not rollback of
+the script. If a call has already committed, it owes a result even when cancellation,
+launch failure or a later resource check prevents execution.
 
-`Tool_Behavior_Hints` states read-only, destructive, idempotent, and
-open-world as tri-state values. Unknown is the zero value, so absence of
-knowledge reads as unknown rather than as a claim. The hints are for the
-harness, policy code, and diagnostics, not for the model: provider
-function-tool formats have no portable hint fields, so descriptions stay
-responsible for model-facing guidance and no generated prose is appended to
-them.
+Structural inability to stage the response, such as allocation failure, stops the
+turn rather than manufacturing a model error. Reserve settlement capacity before
+launch. If persistence fails, latch session failure and drain resources without
+another model request.
 
-`Tool_Timeout_Policy` states a default and a maximum as durations. Zero means
-no tool-specific bound, not a forgotten configuration. Milliseconds live only at the JSON argument boundary.
+## Results and execution knowledge
 
-The backend binding is a borrowed pointer, nil for native tools. The registry
-copies it but never frees it: the adapter that registered the definition owns
-the state and keeps it alive until no registry and no in-flight turn can use
-it. Dispatch copies it into `Tool_Context`, and only the execute procedure
-paired with the definition may interpret it.
-
-Registration validates every definition and refuses malformed ones with a
-concrete error: names fit the provider-compatible subset, descriptions are
-non-empty and bounded, schemas are bounded JSON with an object root, timeouts
-are consistent, an executor is present, and collisions are refused rather than
-resolved last-wins. A bad definition never reaches request encoding, where it
-would fail after the request was already recorded.
-
-`Tool_Execute` has one signature for every tool:
-
-```odin
-Tool_Execute :: #type proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result
-```
-
-There is no separate prepare step and no erased per-tool argument state. The
-procedure reads its own fields with the shared helpers, which validate types and
-ranges and produce deterministic diagnostics. A tool that returns
-`Invalid_Arguments` has performed no effect; that is the contract dispatch
-relies on when it decides a call did not run.
-
-For the asynchronous target, this signature remains useful as a blocking worker
-adapter, not as the orchestration interface for every tool. Execution placement
-becomes explicit: worker procedures, short owner-side session operations, and
-resumable Lua executions. Context and allocator ownership extend through job
-retirement; a call-scoped borrowed stack frame is no longer sufficient.
-
-This deliberately avoids the crate of hooks, typed codecs, and adapter traits
-the reference harnesses carry. Four tools do not need a plugin boundary.
-
-## Registry and lifetime
-
-`Tool_Registry` owns a flat array of definitions. It is built separately,
-validated, and sorted before it is installed, so a failed build never leaves
-half of the new inventory behind. It is replaceable while the chat is idle
-and frozen for the entire user turn: all model requests and tool executions
-in a turn borrow the same definitions, and replacement is refused while a
-turn is in flight. The registry is never mutated in place, because
-dynamic-array growth could invalidate borrowed definition pointers.
-
-MCP tools will enter the same registry through an adapter. A refresh happens
-between turns, so a running response always dispatches against the definitions
-it was advertised with.
-
-## Dispatch
-
-The pipeline is fixed and lives in `chat_run_tools`:
-
-1. Admit the response batch (identities, duplicate call ids, budget).
-2. Commit the assistant response and the raw calls.
-3. Resolve the call name against the registry.
-4. Prepare the argument bytes: size, syntax, object root, duplicate keys, then
-   one deterministic repair for raw control bytes inside string literals.
-5. Write the dispatch entry with the effective arguments.
-6. Check cancellation again: a turn that ended after the dispatch was recorded
-   reports Not_Executed, because the call never started.
-7. Execute once through the definition's procedure.
-8. Finalize the result against the result contract: verify the envelope
-   shape, the status match, and the global budget, replacing a violation
-   with bounded feedback that preserves the observed outcome.
-9. Write the result entry.
-10. Report to the observer and continue in assistant source order.
-
-A durable write failure stops the turn. Nothing runs after a dispatch record
-failed to land, and no result is continued from memory.
-
-The proposed asynchronous path splits this procedure into state transitions and
-effects for admission, dispatch recording, launch, completion, result recording,
-and retirement. Worker completions are events; only the session owner commits
-them. Direct and Lua-originated calls share that path. A nested call records its
-parent and is excluded from provider replay, while remaining available for
-inspection and recovery. See [Code Mode architecture, sections 6 through 9](CODE_MODE_ARCHITECTURE.md#6-state-machine-model).
-
-## Results
-
-One envelope shape for every tool:
+The common envelope remains:
 
 ```json
-{"status": "success", "message": "", "data": {...}}
+{"status":"success","message":"","data":{}}
 ```
 
-`data` is the tool's own shape, so `shell` carries stdout, stderr, exit code,
-and truncation flags, while `edit` carries the paths it rewrote. A refusal
-carries the argument diagnostic in `data` and explains itself in `message`.
+Outcome is authoritative typed data. Envelope status must agree with it. Validate
+strict JSON and UTF-8, not merely a permissive parser's acceptance. Finalization can
+replace malformed/oversized content with bounded feedback, but cannot turn an unknown
+or failed effect into success. Empty valid output and missing/failed serialization
+have distinct representations.
 
-The outcome vocabulary is persisted, so it is the contract:
-
-| Outcome | Meaning |
+| Outcome | Evidence required |
 | --- | --- |
-| `Success` | The tool ran and reported success. |
-| `Tool_Failed` | The tool ran and reported failure. A nonzero exit is this. |
-| `Invalid_Arguments` | Refused before any effect. |
-| `Unavailable` | Not registered for this request, or its backend is down. |
-| `Timed_Out` | Bounded and stopped locally. |
-| `Cancelled` | Stopped because the turn was. |
-| `Not_Executed` | Recorded, never started. |
-| `Unknown` | It may have run; the harness could not observe the end. |
-| `Transport_Failed` | The link failed before the request was delivered. |
-
-There is no separate "execution knowledge" field. The outcome already carries
-the distinction: `Invalid_Arguments`, `Unavailable`, `Not_Executed`, and
-`Transport_Failed` mean nothing ran, and `Unknown` means the harness does not
-know. A second field would restate the first.
-
-## Arguments
-
-Structural admission is shared: byte budget, complete JSON, object root,
-duplicate keys at every depth, and a nesting bound. Duplicate keys are refused
-rather than resolved because the harness will not choose which of two values the
-model meant.
-
-One repair exists: raw control bytes inside otherwise unambiguous JSON string
-literals become their escape sequences. The repaired document is re-read in
-full. Nothing else is rewritten and no value is invented. In particular the
-harness does not guess tool names, drop unknown fields, coerce strings into
-numbers, or unwrap argument wrappers.
-
-Field reading is per tool through shared helpers (`tool_args_string`,
-`tool_args_int`, `tool_args_optional_int`, `tool_args_array`), each of which
-checks presence, type, and range and names the constraint it enforced. Known
-field names are declared next to the reader, so an unknown field is reported
-with the accepted set.
-
-Schema documents are advertised as bytes, not interpreted by a general JSON
-Schema engine. MCP schemas come from outside, so the MCP adapter validates what
-it can and refuses a tool whose schema it cannot bound rather than admitting it
-unchecked.
-
-## Output
-
-Model-visible content is bounded to 64 KiB of valid JSON for every tool alike.
-`TOOL_MAX_RESULT_BYTES` lives in `agent/tool.odin` and finalization enforces
-it, so no single call can consume a large part of the model context. Shell
-output is previewed from the tail, spilled to a private file under the session
-directory, and reports when even the spill was incomplete, so a long build is
-recoverable instead of lost. Draining continues after the preview limit so the
-child never blocks on a full pipe. A skill listing that does not fit returns
-fewer records with the usual paging cursor; an oversized single skill body is
-an explicit bounded failure until pagination or another deliberate design
-exists.
-
-Bounded is not enough, so the document is also checked for validity rather than
-for parseability. `core:encoding/json` accepts a JSON5 escape such as `\xff`
-inside a string, reports no error, and stops there, so a result carrying an
-invalid UTF-8 byte would be stored and sent as a document that is not JSON.
-`tool_result_valid` therefore runs `json.is_valid(content, .JSON)` over the
-whole document before it parses it, and finalization replaces anything that
-fails.
-
-A tool that carries file bytes is responsible for the bytes it offers. `read`
-refuses a file that is not valid UTF-8, with the same `is not a text file`
-refusal it already gives a file containing a NUL byte, because a result is JSON
-and JSON is UTF-8. `shell` output is decoded to valid UTF-8 with U+FFFD
-replacement before it becomes a result, so a build log with a stray byte still
-returns. The two tools differ because a shell stream has no better reading,
-while a file that is not text has a correct answer: say so.
-
-## Shell
-
-`shell` is not a terminal, a background-job service, or a sandbox. Its
-timeout policy lives in its definition: 30 seconds by default, 120 seconds
-maximum. A model-requested timeout above the maximum is refused, never
-silently clamped. Cancellation wins over the timeout when both are observed.
-
-- The shell this process was started from, the one `SHELL` names, runs the
-  command as `<shell> -c` in a fresh process group with stdin closed. A shell
-  that cannot be started, and an environment that names none, fall back to
-  `/bin/sh`, so the tool stays usable when the user's shell does not.
-- The command inherits the environment this process was started with, so the
-  agent works with the same variables, the same tools, and the same versions the
-  user does. Nothing is added, removed, or rewritten.
-- A close-on-exec setup pipe distinguishes a shell that never started from a
-  command that genuinely exited 127, and is what lets the fallback run a command
-  that never ran without ever running one twice.
-- Cancellation and timeout are distinct, and cancel wins when both apply.
-- Group termination escalates from `SIGTERM` to `SIGKILL`.
-- Descendants holding output pipes get a bounded drain before cleanup.
-
-Relative paths start at the session workspace. Absolute paths are used as given,
-and relative paths may walk outside the workspace. The tool system is not a
-sandbox. A permission system is a separate project.
-
-## MCP
-
-MCP is an independent client library. It imports nothing from `agent`, `ai`, or
-the presentation stack, and the adapter in `agent` maps its definitions and
-results into the same tool contract.
-
-The client supports two protocol eras. It first probes with the stateless
-`2026-07-28` request shape. A discovery result selects that revision. If the
-server does not return a discovery result, the client restarts it when needed
-and performs the handshake used by `2025-11-25` and `2025-06-18`.
-
-Under `2026-07-28`:
-
-- Every request declares its version and client capabilities in `params._meta`.
-- `server/discover` reports supported versions, capabilities, and identity.
-- `resultType: "input_required"` carries server-to-client input requests.
-
-Under the handshake revisions, `initialize` negotiates the version and is
-followed by `notifications/initialized`. Requests omit the stateless `_meta`
-envelope and results do not require `resultType`. Server requests are answered
-with method-not-found because Nabla advertises no client-side MCP capabilities.
-
-Stateless describes request routing, not effects. A `tools/call` is never
-automatically retried, including after a lost connection, because the server may
-have performed the action before the reply was lost. That case is `Unknown`.
-
-Only stdio transport is implemented. There is no Streamable HTTP or OAuth flow.
-A server that selects or advertises an unsupported revision gets an actionable
-diagnostic naming the revisions involved.
-
-The transport states whether a complete request was written, not whether the
-server ran it. That one fact is what the adapter needs to choose between
-`Transport_Failed` and `Unknown`, so the MCP package reports delivery rather than
-collapsing it into a single failure.
-
-### Tool names
-
-Every canonical tool name is a flat Lua identifier:
-
-```text
-[A-Za-z_][A-Za-z0-9_]{0,63}
-```
-
-An underscore joins the namespace and local name. Native examples are
-`builtin_read`, `builtin_write`, `context_compact`, and `context_read_result`.
-MCP tools use the configured server id, so a `grep` tool from `fff` is
-`fff_grep`. The registry stores exactly this spelling, provider requests borrow it
-unchanged, returned calls dispatch it unchanged, and Lua calls it naturally as
-`tools.fff_grep({...})`.
-
-This is the common subset of every boundary Nabla supports, and the narrower limit is
-chosen deliberately:
-
-- Provider function names. OpenAI's function-name schema allows 64 characters from
-`[a-zA-Z0-9_-]`; Anthropic's tool name allows 64 characters from the same set; the
-DeepSeek Harness records the same contract as a wire-protocol constant rather than
-configuration (`packages/mcp/mcp-client/src/tools.ts`, "at most 64 characters", "only
-`[A-Za-z0-9_-]`"). Dots are not in that set, which is the compatibility problem this
-convention removes. Nabla uses the 64-character bound and the same character set,
-minus hyphen.
-- Lua field syntax. `tools.name(arguments)` requires what Lua calls a name, which is a
-letter or underscore followed by letters, digits, or underscores. Hyphen is a
-subtraction operator, so `tools.fff_grep` works while `tools.fff-grep` is an
-expression.
-
-Underscore is the only useful separator of the three candidates. Dot is outside every
-provider's character set and needs `tools["..."]` in Lua. Hyphen is accepted by
-providers but not by Lua field syntax. Underscore is accepted by both, so one spelling
-serves the registry, the wire, and the script. The DeepSeek Harness reaches the same
-place from the other direction: it normalizes MCP names into `mcp__<server>__<tool>`
-with `_` substitution and a hash suffix when that replacement changes the name, and
-its own catalog names (`run_code`, `str_replace_editor`, `list_mcp_resources`,
-`web_search`, `terminal_open`) are all underscore-joined identifiers.
-
-The underscore does not need to be reversible. A definition retains its backend and,
-for MCP, its exact remote name; dispatch never recovers namespace or remote identity
-by splitting the canonical name. Registry uniqueness handles possible spelling
-collisions directly.
-
-Stored calls keep the name they ran under. A session recorded before this convention
-replays its old names verbatim, and a tool that was renamed is simply unavailable to
-it: no stored record is rewritten, because the name it ran under is part of what
-happened.
-
-The MCP remote name remains exact and case-sensitive for `tools/list`, configuration
-lookup, and `tools/call`. The default local part is the remote name only when it is
-already a valid identifier. Otherwise the definition is rejected with a refresh
-warning unless configuration supplies a valid local alias:
-
-```lua
-tools = {
-  ["issues.create"] = {name = "create_issue"},
-  ["issues-delete"] = {enabled = false},
-}
-```
-
-The first entry produces `github_create_issue`. `enabled` defaults to true. Requiring
-an explicit alias avoids a lossy punctuation normalizer and makes collisions visible
-in configuration instead of silently rewriting two remote names to the same provider
-name.
-
-### Retry policy
-
-Retry is a property of the method, not of the transport failure.
-
-| Method | Policy |
-| --- | --- |
-| `server/discover` | Restart the server and retry once. |
-| `tools/list` | Restart the server and retry once. |
-| `tools/call` | Never automatically retry. |
-| `notifications/cancelled` | Best effort, never retried. |
-
-A `tools/call` that fails before its request was written reports
-`Transport_Failed`. One that fails after the request was written reports
-`Unknown`, because the harness cannot tell whether the effect happened. A remote
-JSON-RPC error response is an observation and is reported as `Tool_Failed`.
-Restarting a stdio server after it exits is fine; reissuing an ambiguous call is
-not.
-
-### Input required
-
-Nabla declares no sampling, elicitation, roots, or subscription capability, so it
-cannot answer a server-initiated input request. A `tools/call` answered with
-`resultType: "input_required"` is parsed, never retried, and reported as
-`Tool_Failed` with the requested interaction described for diagnostics. The
-protocol shape is understood; the interaction is not implemented.
-
-### Tool mapping
-
-Every MCP tool enters the registry through one executor, so a definition carries
-a backend binding instead of a procedure of its own. The binding names the
-server and the remote tool; the definition carries the remote description, the
-remote input schema bytes, the annotations as behavior hints, and the configured
-timeout policy.
-
-Annotated behavior maps one to one, and absence stays unknown rather than
-becoming a claim:
-
-| Remote annotation | Hint |
-| --- | --- |
-| absent | Unknown |
-| `readOnlyHint` | read-only |
-| `destructiveHint` | destructive |
-| `idempotentHint` | idempotent |
-| `openWorldHint` | open-world |
-
-Observations map onto the outcome vocabulary the session already persists:
-
-| Observation | Outcome |
-| --- | --- |
-| completed, `isError` false | `Success` |
-| completed, `isError` true | `Tool_Failed` |
-| input required | `Tool_Failed` |
-| cancelled with the turn | `Cancelled` |
-| the call's own deadline passed | `Timed_Out` |
-| the server is not running | `Unavailable` |
-| the request was never written | `Transport_Failed` |
-| written, reply lost or unreadable | `Unknown` |
-| remote JSON-RPC error | `Tool_Failed` |
-
-A remote error is never `Invalid_Arguments`. That outcome promises the call was
-refused before any effect, and a remote peer is not in a position to establish
-that promise. `Invalid_Arguments` stays what the harness itself decided before
-the call ran.
-
-Only text and structured content reach the model. An image, audio, or embedded
-resource is reported by type and omitted, because a base64 payload would consume
-the result budget to no purpose. The adapter bounds the result below the 64 KiB
-budget rather than relying on finalization to replace it.
-
-### Server configuration
-
-Server configuration lives in `config.lua` under `mcp.servers`. The minimal
-stdio configuration is the server id and executable:
-
-```lua
-return {
-  mcp = {
-    servers = {
-      fff = {executable = "/absolute/path/to/fff-mcp"},
-    },
-  },
-}
-```
-
-Add `arguments` only when the program needs flags or other arguments. The act of
-placing the server in the user's configuration is the trust decision. Nabla does
-not load MCP configuration from a repository or start a server that the user did
-not configure.
-
-The transport is chosen by which endpoint field is present rather than by a
-`transport` field. Only stdio exists, so an `executable` is what selects it; a
-later transport brings its own field, and setting two is the error.
-
-A stdio server is launched by executable and argv, never through a shell, in its
-own process group, with an absolute executable path. The server inherits the
-environment that launched Nabla. `environment` is an optional map that replaces
-or adds variables for that server. It is needed only when the server expects
-configuration such as an API token, a database URL, or a cache path that is not
-already present. Most local servers need no entries. The resulting environment
-is frozen when the process starts.
-
-The server's stderr is drained by a thread that keeps a bounded tail, so a chatty
-server cannot block on a full pipe. Stderr is diagnostic only and never decides a
-request outcome. One request is currently in flight at a time because the harness
-runs tools serially. The asynchronous design preserves a capacity-one execution
-lane per MCP client until multiplexing is implemented and tested. Independent
-clients may run concurrently; queued calls must not occupy worker slots or read
-the same client's stream from multiple threads.
-
-The runtime keeps one stable client slot per configured server. Discovered tool
-bindings are allocated individually and replaced as one generation after the
-session accepts a refreshed registry. The previous generation stays alive while
-the old registry can still borrow it.
-
-### Refresh
-
-Tools are refreshed between turns, while the session is idle. A server that
-cannot be discovered or listed contributes no tools for that turn and is
-reported once; its stale definitions are not kept, because a definition whose
-schema or backend no longer matches is worse than absent. Other servers still
-contribute. A registry that cannot be built at all leaves the installed registry
-untouched.
-
-Configuration problems fail startup. Runtime connectivity problems degrade one
-server for one turn. Discovery defaults to 5 seconds, a call defaults to 30
-seconds, and the configurable call ceiling defaults to 120 seconds. These values
-need no configuration for normal local servers. The millisecond fields remain
-available for slow startup or long-running tools.
-
-A call can carry several bounds: the definition
-maximum, the definition default, and a model-requested timeout where the tool
-exposes one. The effective bound is the earliest applicable deadline. The
-file and skill tools state no tool-specific bound and check cancellation
-cooperatively instead: before expensive reads, before the temporary
-write, while it grows, and before the atomic rename. A cancellation before
-the rename deletes the temporary file and reports Cancelled; once the rename
-succeeds the observed result stands. A hard deadline for synchronous
-filesystem calls would need process isolation or nonblocking I/O, which is
-outside this design.
-
-## Prompt stability
-
-Tool definitions are sorted and serialized deterministically so the cacheable
-prefix does not churn. Descriptions and schemas are frozen within a response.
-Connection state, request ids, timestamps, and credentials never enter a
-description. Request records store the actual prepared inventory, name,
-description, and exact schema bytes taken from the prepared request rather
-than reconstructed from the session, so the record stays true even if the
-registry changes before the write lands. Session tips are not taken from a
-server: MCP instructions are untrusted external text.
-
-## Packages
-
-| Package | Responsibility |
-| --- | --- |
-| `agent` | Tool contract, registry, dispatch, native tools, MCP adapter |
-| `agent/session` | Durable call, dispatch, result, and recovery records |
-| `mcp` | MCP messages, discovery, tools, transports, errors |
-| `http/client`, `sse` | HTTP and event-stream transport |
-| `ai` | Provider tool definitions and response assembly |
-| root `nabla` | Configuration, runtime ownership, presentation |
+| Success | Executor observed successful completion |
+| Tool_Failed | Executor or peer reported failure; partial effects may exist |
+| Invalid_Arguments | Local refusal before any effect |
+| Unavailable | No execution began because capability/backend was unavailable |
+| Not_Executed | Harness knows launch never occurred |
+| Transport_Failed | Adapter proves the operation was not delivered for execution |
+| Cancelled / Timed_Out | Work actually stopped under that control cause; not a promise to undo effects |
+| Unknown | Execution or effects may have occurred but no conclusive outcome is available |
+
+A remote JSON-RPC error is not local Invalid_Arguments. A cancellation notification,
+partial pipe write, lost reply, or timeout alone cannot prove a remote effect stopped.
+Preserve delivery evidence and use Unknown when necessary. No automatic retry of a
+tool call, including reads, based only on hints. The model can decide its next action
+from the recorded result.
+
+Result commit precedes Lua delivery, observer terminal output, and the next request.
+Progress is explicitly provisional. A producer's late result cannot overwrite an
+already committed Unknown outcome or resurrect a cancelled continuation.
+
+## Bounds, storage and projection
+
+Use separate limits for different resources. One number cannot represent all of them:
+
+- Per-call argument and finalized result bytes. The existing 64 KiB JSON result bound
+  is the baseline for every tool, including skills and Code Mode.
+- Live jobs, workers, Lua states, pending completion bytes and total admissions.
+- Aggregate retained bytes per batch, including root and child arguments, results,
+  parent summaries and artifact data.
+- Model-visible root-result allowance derived from context capacity.
+- Session retained-data quota and a small settlement reserve.
+
+The existing count times per-result cap gives a finite worst-case child volume, but
+it is not a separately controlled storage budget and does not bound sessions across
+turns. Set named byte limits from measured workloads before claiming aggregate
+retention is bounded. There is no exemption for hidden children, failed attempts or
+spill files. Budget enforcement belongs to the owner, not Lua bookkeeping.
+
+Reserve a small result for each admitted call. Charge remaining root results in model
+call order, leaving space for a handle for every later root. When full retained content
+fits storage but not model context, store it once and project a small derived handle
+naming its session-local call identity and byte length. Persist that representation
+decision; later requests must not silently resize old results and invalidate prefixes.
+Child results do not individually charge the model-context budget, but do charge the
+retention budget. The parent's selected output charges both.
+
+Storage spill is not infinite retention. If retained output exceeds its allowance,
+keep a valid bounded preview with explicit incomplete/omitted-byte facts where the
+tool contract permits it, otherwise a bounded diagnostic. Structured output must
+remain valid JSON; never cut an arbitrary JSON byte prefix and call it a result.
+Preserve the observed outcome even when content cannot be retained. Refuse new
+admissions when the session quota is exhausted; never delete active history to keep
+working. Reserve settlement space as policy, while treating actual disk-full errors
+as storage failures. Automatic archival and deletion are not implied.
+
+`context_read_result` reads bounded UTF-8-safe byte pages from the existing retained
+result. It is session-scoped, reports next offset/eof/completeness, cannot follow
+arbitrary paths, and never recursively spills its own page. A handle cannot recover
+bytes the producer never retained. Prefer this existing identity over a second blob
+store or backend-agnostic locator framework.
+
+Sensitive-field filtering happens before ordinary diagnostic retention. Exact tool
+results may contain user secrets and need private storage; do not claim a generic
+redactor can recognize every secret. If an explicit output filter exists, apply it
+before preview/cap decisions and record that the content was transformed.
+
+## Native effects
+
+Read refuses nontext bytes rather than emitting invalid JSON. Shell may decode invalid
+UTF-8 with explicit replacement because its output is a stream, not an exact file read.
+Write/Edit validate first, use an explicit workspace path, and never change process-wide
+cwd. Atomic file replacement is one tool effect, not a transaction over a script. Once
+rename succeeds, a later cancellation cannot truthfully report that nothing changed.
+
+Shell launches argv in a fresh process group, closes stdin, drains stdout/stderr even
+after retained-output limits, and reaps the child. Distinguish exec failure from a
+command that exits 127. Cancellation may escalate TERM to KILL with bounded pipe drain.
+Keep the post-fork child path allocation-free. No implicit PTY, detached job or sandbox.
+Absolute paths and inherited process authority remain powerful; a workspace name is
+not confinement.
+
+## MCP boundary
+
+`mcp` is an independent protocol library. `agent` maps discovered definitions and
+results through one adapter into ordinary tools. Root owns configured client lifetimes.
+User configuration is the authority to start a server; repository text and model output
+cannot install servers or obtain credentials.
+
+The initial transport is stdio with explicit executable/argv, private process group,
+bounded stderr draining and one request at a time per client. Each client has a typed
+serialization identity; native tools share a conservative serial lane. Derive occupancy
+from live jobs. A queued call holds no worker. Discovery, refresh and shutdown cannot
+race a call on the same stream.
+
+Protocol negotiation and version strings belong in `mcp` and its tests, not duplicated
+architecture tables. Parse supported input-required/server-request shapes honestly and
+report unsupported interactions; never fabricate sampling or approval responses.
+Discovery/listing may use a bounded retry because they are metadata operations. Tool
+calls never inherit that retry. A complete local write still does not prove completion;
+a partial operation write cannot be assumed harmless without protocol-specific proof.
+
+Refresh builds a new generation between turns. Unavailable servers contribute no stale
+callable definitions; report their absence. Whole-registry construction failure leaves
+the old registry intact. Keep exact descriptions/schema bytes stable when nothing
+changed. MCP text and structured output pass through the shared result bounds; omitted
+image/audio/resource payloads are described, not dumped as unbounded base64.
+
+OAuth, Streamable HTTP, resources, prompts, subscriptions, Apps, Tasks, approval services
+and multiplexing are separate requirements, not prerequisites for a useful MCP tool.
+
+## Acceptance
+
+Fixtures must prove that a malformed batch executes nothing, valid effects have durable
+intent, children use the same checks, and failed writes prevent launch/continuation.
+Cover runtime failure after successful admission, global and child byte exhaustion,
+spilled paging after reopen, same-client serialization, cancellation with ambiguous MCP
+delivery, and registry lifetime through the final producer access. Tests assert outcomes
+and actual execution counts, not internal job layouts or exact prose.

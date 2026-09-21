@@ -5,13 +5,24 @@ A monorepo in three layers that share one philosophy:
 - **Foundation**: `text`, `input`, `term`, `layout`, `tui` (with its `widgets`
   subpackage). Reusable by any Odin program: the terminal, layout, and text stack knows
   nothing about models, agents, or HTTP.
-- **Libraries**: `http` (with its `client` subpackage), `sse`, `ai`, `acp`. Each stands on its
-  own: HTTP and SSE know nothing about agents, and the model client knows nothing about the
+- **Libraries**: `dns`, `tls`, `http` (with its `client` subpackage), `sse`, `websocket`,
+  `ai`, `mcp`, `acp`, and `db` (with its `sqlite` subpackage). Each stands on its own: the
+  protocol libraries know nothing about agents, and the model client knows nothing about the
   turn loop that drives it.
 - **Harness**: `agent` and the `nabla` executable at the repository root. A coding agent built on
   top of both.
 
 The harness is one consumer of the layers beneath it, not their owner.
+
+## Architecture documents
+
+Before changing harness boundaries or adding a subsystem, read
+`docs/AI_HARNESS_ARCHITECTURE.md`. It is the entry point: principles, required
+invariants, package boundaries, and pointers to the contract that owns each subject
+(execution, tools, Code Mode, errors, context, instructions, customization, subagents,
+network, diagnostics). `docs/ARCHITECTURE_STATUS.md` separates what exists from what the
+target requires, so current prototype behavior is never mistaken for a rule. Keep each
+subject in its one owning document and link instead of copying.
 
 ## Philosophy
 
