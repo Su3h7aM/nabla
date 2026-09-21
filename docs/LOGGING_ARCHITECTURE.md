@@ -114,6 +114,7 @@ Minimum contracts, with fields beyond correlation:
 | `tool.stop_requested`, `tool.job_stuck` | Warn/Error | tool, patience, waited time |
 | `mcp.started/negotiated/stopped`, `mcp.exchange_started/finished`, `mcp.stderr` | Info/Warn | server instance, revision, method, delivery state, bounded stderr size |
 | `capture.finished/failed`, `retention.finished`, `log.segment_removed` | Info/Warn | artifact id, counts, completeness, freed bytes, removed sequence range |
+| `runtime.thread_unretired`, `runtime.teardown_abandoned`, `runtime.worker_escaped` | Error | the thread or worker that outlived its stop, and that the release path left its reachable memory to process exit |
 
 Required fields are documented beside the emitting procedure and tested at the real
 boundary. There is no union enumerating every application event; the scalar union

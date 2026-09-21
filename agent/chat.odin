@@ -678,72 +678,7 @@ chat_commit_response :: proc(
 
 	// A response that did not commit adds nothing to the context.
 	chat.response_cost = 0
-	if outcome == .Completed {
-		text := string(chat.partial_assistant[:])
-		response_count := 1 if chat.pending_response_present else 0
-		notice_text := chat_notice_text(chat.pending_notice)
-		chat.response_cost = chat_response_cost(chat, text, notice_text)
-		entries: [dynamic]session.New_Entry = make([dynamic]session.New_Entry, 0, response_count + len(chat.pending_calls) + 2, chat.allocator)
-		defer delete(entries)
-		if chat.pending_response_present {
-			append(
-				&entries,
-				session.New_Entry {
-					turn_no = chat.turn_no,
-					request_no = request_no,
-					created_at_ms = at_ms,
-					payload = session.Response_Entry{output = chat.pending_response.output},
-				},
-			)
-		}
-		if text != "" {
-			append(
-				&entries,
-				session.New_Entry{turn_no = chat.turn_no, request_no = request_no, created_at_ms = at_ms, payload = session.Assistant_Entry{text = text}},
-			)
-		}
-		for call in chat.pending_calls {
-			append(
-				&entries,
-				session.New_Entry {
-					turn_no = chat.turn_no,
-					request_no = request_no,
-					created_at_ms = at_ms,
-					payload = session.Tool_Call_Entry{call_id = call.id, item_id = call.item_id, name = call.name, arguments = call.arguments},
-				},
-			)
-		}
-		// The harness's explanation of an unusable response is committed with the
-		// response itself, after whatever text it produced.
-		if notice_text != "" {
-			append(
-				&entries,
-				session.New_Entry {
-					turn_no = chat.turn_no,
-					request_no = request_no,
-					created_at_ms = at_ms,
-					payload = session.User_Entry{text = notice_text, origin = .Harness},
-				},
-			)
-		}
-
-		seqs, append_err := session.entries_append(chat.store, chat.id, entries[:], chat.allocator)
-		if append_err != nil {
-			delete(seqs, chat.allocator)
-			chat_session_record_failure(chat, "the response could not be recorded", append_err)
-			return
-		}
-		// Each staged call now knows the entry it was stored as, which is what a
-		// later dispatch and result name.
-		offset := response_count + (1 if text != "" else 0)
-		for i in 0 ..< len(chat.pending_calls) { chat.pending_calls[i].seq = seqs[offset + i] }
-		delete(seqs, chat.allocator)
-
-		chat_response_output_destroy(&chat.pending_response, chat.allocator)
-		chat.pending_response_present = false
-		delete(chat.partial_assistant)
-		chat.partial_assistant = make([dynamic]u8, 0, 0, chat.allocator)
-	}
+	if outcome == .Completed && !chat_commit_response_entries(chat, request_no, at_ms) { return }
 	// A notice is only ever committed with the response that raised it. One that
 	// did not commit, because the turn failed or was cancelled, is dropped.
 	chat.pending_notice = .None
@@ -762,6 +697,80 @@ chat_commit_response :: proc(
 	level := log.Level.Info
 	if outcome == .Failed { level = .Error }
 	log_emit({level = level, category = .Provider, event = "request.finished", fields = finished[:]})
+}
+
+// chat_commit_response_entries records the entries one completed response produced: the
+// verbatim Responses output, the assistant text, the calls it proposed, and the harness's
+// notice. It also settles what the response costs the next request and releases the staged
+// response. It reports whether every entry landed; a failed append stops the turn, so the
+// caller must not continue.
+@(private)
+chat_commit_response_entries :: proc(chat: ^Chat_Session, request_no: session.Request_No, at_ms: i64) -> bool {
+	text := string(chat.partial_assistant[:])
+	response_count := 1 if chat.pending_response_present else 0
+	notice_text := chat_notice_text(chat.pending_notice)
+	chat.response_cost = chat_response_cost(chat, text, notice_text)
+	entries: [dynamic]session.New_Entry = make([dynamic]session.New_Entry, 0, response_count + len(chat.pending_calls) + 2, chat.allocator)
+	defer delete(entries)
+	if chat.pending_response_present {
+		append(
+			&entries,
+			session.New_Entry {
+				turn_no = chat.turn_no,
+				request_no = request_no,
+				created_at_ms = at_ms,
+				payload = session.Response_Entry{output = chat.pending_response.output},
+			},
+		)
+	}
+	if text != "" {
+		append(
+			&entries,
+			session.New_Entry{turn_no = chat.turn_no, request_no = request_no, created_at_ms = at_ms, payload = session.Assistant_Entry{text = text}},
+		)
+	}
+	for call in chat.pending_calls {
+		append(
+			&entries,
+			session.New_Entry {
+				turn_no = chat.turn_no,
+				request_no = request_no,
+				created_at_ms = at_ms,
+				payload = session.Tool_Call_Entry{call_id = call.id, item_id = call.item_id, name = call.name, arguments = call.arguments},
+			},
+		)
+	}
+	// The harness's explanation of an unusable response is committed with the response
+	// itself, after whatever text it produced.
+	if notice_text != "" {
+		append(
+			&entries,
+			session.New_Entry {
+				turn_no = chat.turn_no,
+				request_no = request_no,
+				created_at_ms = at_ms,
+				payload = session.User_Entry{text = notice_text, origin = .Harness},
+			},
+		)
+	}
+
+	seqs, append_err := session.entries_append(chat.store, chat.id, entries[:], chat.allocator)
+	if append_err != nil {
+		delete(seqs, chat.allocator)
+		chat_session_record_failure(chat, "the response could not be recorded", append_err)
+		return false
+	}
+	// Each staged call now knows the entry it was stored as, which is what a later
+	// dispatch and result name.
+	offset := response_count + (1 if text != "" else 0)
+	for i in 0 ..< len(chat.pending_calls) { chat.pending_calls[i].seq = seqs[offset + i] }
+	delete(seqs, chat.allocator)
+
+	chat_response_output_destroy(&chat.pending_response, chat.allocator)
+	chat.pending_response_present = false
+	delete(chat.partial_assistant)
+	chat.partial_assistant = make([dynamic]u8, 0, 0, chat.allocator)
+	return true
 }
 
 // chat_finish_request records how one send ended: its outcome, what the model stopped
