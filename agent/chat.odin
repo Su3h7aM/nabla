@@ -132,6 +132,80 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 
 // --- running a request -------------------------------------------------------
 
+// chat_request_transport chooses the wire transport for one request chain and freezes the
+// exact bytes it will send. The configured mode says what the operator wants and the API
+// adapter says which transports it implements; neither is keyed on a provider or model
+// identity. An eligible WebSocket setup failure selects HTTP for this affinity, which is
+// the only fallback: it never authorizes a second send of the same model request.
+//
+// On failure the turn is failed here and no body is returned. On success the caller owns
+// encoded.Body and must release it once the chain is over.
+@(private)
+chat_request_transport :: proc(
+	chat: ^Chat_Session,
+	connection: ai.Provider_Connection,
+	prep: ^Chat_Request_Prep,
+	options: ai.Provider_Operation_Options,
+) -> (
+	encoded: ai.Provider_Encoded_Request,
+	websocket_request: bool,
+	ok: bool,
+) {
+	transports := ai.Provider_API_Transports(connection.API)
+	if chat.provider_transport == .WebSocket && .WebSocket not_in transports {
+		chat_session_fail_turn(chat, fmt.tprintf("the %s API has no WebSocket transport", chat_api_name(connection.API)))
+		return {}, false, false
+	}
+	websocket_request = chat.provider_transport != .HTTP && .WebSocket in transports && !chat.websocket_fallback_http
+
+	// A request that cannot be encoded never reaches the provider, so it fails the turn
+	// before a request row exists rather than being recorded as a send that did not happen.
+	encode_err: ai.Provider_Operation_Error
+	if websocket_request {
+		encoded, encode_err = ai.Provider_Request_Freeze_WebSocket(prep.request, chat.allocator)
+	} else {
+		encoded, encode_err = ai.Provider_Request_Freeze(prep.request, chat.allocator)
+	}
+	if encode_err.kind != .None {
+		chat_session_fail_turn(chat, encode_err.detail)
+		ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
+		return {}, false, false
+	}
+	if websocket_request && chat.provider_websocket == nil {
+		chat.provider_websocket, encode_err = ai.Provider_WebSocket_Session_Open(connection, chat.allocator)
+		if encode_err.kind != .None {
+			delete(encoded.Body, chat.allocator)
+			chat_session_fail_turn(chat, encode_err.detail)
+			ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
+			return {}, false, false
+		}
+	}
+	if websocket_request && chat.provider_transport == .Auto {
+		connect_err := ai.Provider_WebSocket_Connect(chat.provider_websocket, encoded, options)
+		if connect_err.kind != .None {
+			if !chat_websocket_fallback_safe(connect_err) {
+				delete(encoded.Body, chat.allocator)
+				chat_session_fail_turn(chat, connect_err.detail)
+				ai.Provider_Operation_Error_Destroy(&connect_err, chat.allocator)
+				return {}, false, false
+			}
+			ai.Provider_Operation_Error_Destroy(&connect_err, chat.allocator)
+			ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
+			chat.provider_websocket = nil
+			chat.websocket_fallback_http = true
+			websocket_request = false
+			delete(encoded.Body, chat.allocator)
+			encoded, encode_err = ai.Provider_Request_Freeze(prep.request, chat.allocator)
+			if encode_err.kind != .None {
+				chat_session_fail_turn(chat, encode_err.detail)
+				ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
+				return {}, false, false
+			}
+		}
+	}
+	return encoded, websocket_request, true
+}
+
 // chat_perform_request builds one request from committed history, records it,
 // runs it, and records what came back. The record exists before the model is
 // asked anything, so a request that never finishes still says what it carried.
@@ -208,64 +282,12 @@ chat_perform_request :: proc(
 	options := ai.Provider_Operation_Options {
 		interrupt = &chat_cancel,
 	}
-	// Transport is capability-driven: the configured mode says what the operator wants and
-	// the API adapter says which wire transports it implements. Neither is keyed on a
-	// provider or model identity.
-	transports := ai.Provider_API_Transports(connection.API)
-	if chat.provider_transport == .WebSocket && .WebSocket not_in transports {
-		chat_session_fail_turn(chat, fmt.tprintf("the %s API has no WebSocket transport", chat_api_name(connection.API)))
-		return
-	}
-	websocket_request := chat.provider_transport != .HTTP && .WebSocket in transports && !chat.websocket_fallback_http
-
 	// The bytes this request sends are frozen once, before the first attempt, so every
 	// attempt of the chain sends exactly what the first would have sent instead of a
-	// fresh encoding that has to be assumed equal. A request that cannot be encoded
-	// never reaches the provider, so it fails the turn here, before a request row
-	// exists, rather than being recorded as a send that did not happen.
-	encoded: ai.Provider_Encoded_Request
-	encode_err: ai.Provider_Operation_Error
-	if websocket_request {
-		encoded, encode_err = ai.Provider_Request_Freeze_WebSocket(prep.request, chat.allocator)
-	} else {
-		encoded, encode_err = ai.Provider_Request_Freeze(prep.request, chat.allocator)
-	}
-	if encode_err.kind != .None {
-		chat_session_fail_turn(chat, encode_err.detail)
-		ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
-		return
-	}
+	// fresh encoding that has to be assumed equal.
+	encoded, websocket_request, transport_ok := chat_request_transport(chat, connection, &prep, options)
+	if !transport_ok { return }
 	defer delete(encoded.Body, chat.allocator)
-	if websocket_request && chat.provider_websocket == nil {
-		chat.provider_websocket, encode_err = ai.Provider_WebSocket_Session_Open(connection, chat.allocator)
-		if encode_err.kind != .None {
-			chat_session_fail_turn(chat, encode_err.detail)
-			ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
-			return
-		}
-	}
-	if websocket_request && chat.provider_transport == .Auto {
-		connect_err := ai.Provider_WebSocket_Connect(chat.provider_websocket, encoded, options)
-		if connect_err.kind != .None {
-			if !chat_websocket_fallback_safe(connect_err) {
-				chat_session_fail_turn(chat, connect_err.detail)
-				ai.Provider_Operation_Error_Destroy(&connect_err, chat.allocator)
-				return
-			}
-			ai.Provider_Operation_Error_Destroy(&connect_err, chat.allocator)
-			ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
-			chat.provider_websocket = nil
-			chat.websocket_fallback_http = true
-			websocket_request = false
-			delete(encoded.Body, chat.allocator)
-			encoded, encode_err = ai.Provider_Request_Freeze(prep.request, chat.allocator)
-			if encode_err.kind != .None {
-				chat_session_fail_turn(chat, encode_err.detail)
-				ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
-				return
-			}
-		}
-	}
 
 	chat.last_estimate = prep.estimate
 
