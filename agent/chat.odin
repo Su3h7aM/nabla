@@ -868,8 +868,8 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 		outcome = .Interrupted
 	}
 	error_json := ""
-	if effect.error != "" {
-		error_json = chat_turn_error_json(effect.error, chat.turn_recovery, chat.turn_repair_refusal)
+	if chat.last_error != "" {
+		error_json = chat_turn_error_json(chat.last_error, chat.turn_recovery, chat.turn_repair_refusal)
 	}
 
 	if turn_err := session.turn_finish(chat.store, chat.id, turn_no, outcome, error_json, at_ms); turn_err != nil {
@@ -1017,14 +1017,11 @@ chat_run_turn_steered :: proc(
 			if chat_session_cancelled(chat) { chat_session_note_cancel(chat) }
 		case .Turn_Finished:
 			// A turn whose outcome did not reach the store reports the storage failure,
-			// not the status the model reached: the session has no record of it.
-			if !chat_persist_turn_end(chat, effect) {
-				delete(effect.error, effect.allocator)
-				effect.error = chat_clone_string(chat.last_error, effect.allocator)
-				effect.status = .Failed
-			}
-			chat_report_terminal(observer, effect)
+			// not the status the model reached: the session has no record of it. The
+			// session's own error is what the record and the front-end read.
 			status := effect.status
+			if !chat_persist_turn_end(chat, effect) { status = .Failed }
+			chat_report_terminal(chat, observer, status)
 			chat_effect_destroy(&effect)
 			chat_report_usage(observer, usages)
 			return status == .Completed

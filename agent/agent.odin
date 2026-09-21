@@ -22,22 +22,20 @@ Chat_Effect_Kind :: enum {
 	Turn_Finished,
 }
 
-// Chat_Effect is what the current state wants done next. It carries no stored
-// data: the driver reads the committed record when it runs an effect and writes
-// the record when the effect settles.
+// Chat_Effect is what the current state wants done next. It carries no stored data and
+// owns nothing: the driver reads the committed record when it runs an effect and writes
+// the record when the effect settles, and a terminal error is read from the session that
+// owns it.
 Chat_Effect :: struct {
-	kind:      Chat_Effect_Kind,
-	turn_id:   u64,
-	tool:      Tool_Job_Effect,
-	status:    Chat_Terminal_Status,
-	error:     string, // owned
-	allocator: mem.Allocator,
+	kind:    Chat_Effect_Kind,
+	turn_id: u64,
+	tool:    Tool_Job_Effect,
+	status:  Chat_Terminal_Status,
 }
 
 chat_effect_none :: proc() -> Chat_Effect { return Chat_Effect{kind = .None} }
 
 chat_effect_destroy :: proc(effect: ^Chat_Effect) {
-	delete(effect.error, effect.allocator)
 	effect^ = {}
 }
 
@@ -58,16 +56,16 @@ chat_session_observe :: proc(chat: ^Chat_Session) {
 @(private)
 chat_session_tool_effect :: proc(chat: ^Chat_Session) -> Chat_Effect {
 	if !chat.tool_jobs_active {
-		return Chat_Effect{kind = .Run_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}
+		return Chat_Effect{kind = .Run_Tools, turn_id = chat.active_turn_id}
 	}
 	next := tool_jobs_next(&chat.tool_jobs, time.tick_now())
 	switch next {
 	case .Commit, .Refuse, .Abandon, .Retire, .Dispatch:
-		return Chat_Effect{kind = .Step_Tools, turn_id = chat.active_turn_id, tool = next, allocator = chat.allocator}
+		return Chat_Effect{kind = .Step_Tools, turn_id = chat.active_turn_id, tool = next}
 	case .Wait:
-		return Chat_Effect{kind = .Wait_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}
+		return Chat_Effect{kind = .Wait_Tools, turn_id = chat.active_turn_id}
 	case .Done:
-		return Chat_Effect{kind = .Finish_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}
+		return Chat_Effect{kind = .Finish_Tools, turn_id = chat.active_turn_id}
 	}
 	return chat_effect_none()
 }
@@ -82,7 +80,7 @@ chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
 	case .Executing_Tools:
 		return chat_session_tool_effect(chat)
 	case .Preparing:
-		return Chat_Effect{kind = .Start_Request, turn_id = chat.active_turn_id, allocator = chat.allocator}
+		return Chat_Effect{kind = .Start_Request, turn_id = chat.active_turn_id}
 	case .Cancelling:
 		// Tool jobs still have to settle their committed calls. Cancellation stops
 		// admission; it does not permit dangling results or freed worker storage.
@@ -91,10 +89,10 @@ chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
 		// turn finalizes only after its operation is retired, which is the
 		// confirmation that the request is no longer running.
 		if chat.operation.state == .Running { return chat_effect_none() }
-		return chat_finalize_turn(chat, .Cancelled, "")
+		return chat_finalize_turn(chat, .Cancelled)
 	case .Finalizing:
-		if chat.active_failed { return chat_finalize_turn(chat, .Failed, chat.last_error) }
-		return chat_finalize_turn(chat, .Completed, "")
+		if chat.active_failed { return chat_finalize_turn(chat, .Failed) }
+		return chat_finalize_turn(chat, .Completed)
 	}
 	return chat_effect_none()
 }
@@ -121,14 +119,17 @@ chat_session_fail_turn :: proc(chat: ^Chat_Session, message: string) -> Chat_Eff
 // terminal path goes through it and it returns the session to Idle in the same
 // step, so a turn finalizes exactly once and the next turn can start immediately.
 //
+// The error text stays on the session: the driver reads it when it records and reports
+// the terminal status, so the effect owns nothing and a turn costs no clone.
+//
 // Uncommitted assistant text is not dropped here; the driver records it as a
 // partial entry when it settles the turn.
-chat_finalize_turn :: proc(chat: ^Chat_Session, status: Chat_Terminal_Status, error: string) -> Chat_Effect {
+chat_finalize_turn :: proc(chat: ^Chat_Session, status: Chat_Terminal_Status) -> Chat_Effect {
 	turn_id := chat.active_turn_id
 	chat.terminal_status = status
 	chat.state = .Idle
 	chat.active_failed = false
-	return Chat_Effect{kind = .Turn_Finished, turn_id = turn_id, status = status, error = chat_clone_string(error, chat.allocator), allocator = chat.allocator}
+	return Chat_Effect{kind = .Turn_Finished, turn_id = turn_id, status = status}
 }
 
 chat_terminal_text :: proc(status: Chat_Terminal_Status) -> string {
@@ -145,15 +146,15 @@ chat_terminal_text :: proc(status: Chat_Terminal_Status) -> string {
 	return "no status"
 }
 
-chat_report_terminal :: proc(observer: Chat_Observer, finish: Chat_Effect) {
-	if finish.status == .Completed {
+chat_report_terminal :: proc(chat: ^Chat_Session, observer: Chat_Observer, status: Chat_Terminal_Status) {
+	if status == .Completed {
 		_observer_assistant_end(observer)
 		return
 	}
-	if finish.error != "" {
-		_observer_message(observer, .Error, fmt.tprintf("%s: %s", chat_terminal_text(finish.status), finish.error))
+	if chat.last_error != "" {
+		_observer_message(observer, .Error, fmt.tprintf("%s: %s", chat_terminal_text(status), chat.last_error))
 	} else {
-		_observer_message(observer, .Error, chat_terminal_text(finish.status))
+		_observer_message(observer, .Error, chat_terminal_text(status))
 	}
 }
 
