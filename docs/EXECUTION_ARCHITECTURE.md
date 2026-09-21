@@ -58,7 +58,7 @@ as named synchronous helpers; waiting stages retain explicit state.
 | Validate response | Complete observed response -> accepted response/batch or rejection | Completion semantics, call identities, count, names, arguments and admission capacity |
 | Commit response | Validated artifact -> durable response and calls | Atomic accepted batch; no executable intent from partial or failed output |
 | Execute tools | Committed calls -> committed results and retired jobs | Tool lifecycle below; all root answers complete |
-| Continue or finish | Settled result barrier -> next boundary or terminal | Turn step budget, stop cause, storage health |
+| Continue or finish | Settled result barrier -> next boundary or terminal | Turn step budget, stop cause, storage health, no input left unanswered |
 
 Failure names its stage. Preparation failure is not a transport failure. Encoding
 failure creates no fictitious sent request. Rejection before call commit can produce
@@ -67,11 +67,11 @@ it is not a retry of the failed provider operation. Preserve invalid response ev
 outside executable call history. See [errors](ERROR_RETRY_ARCHITECTURE.md).
 
 Boundary is a stage of a proposed request, not work the driver does beside the
-machine: it settles input the user queued while the turn ran, and it runs before the
-claim that counts the request. The claim therefore answers for the state it finds, so a
-boundary that stopped the turn, such as one whose durable write failed, claims nothing
-and no request is prepared from it. Queued input is a stage input, never a second
-writer of the session.
+machine: it installs the selection the user changed, and it runs before the claim that
+counts the request. Input is recorded by the observation that precedes the selector, so
+it is stage input and never a second writer of the session. The claim answers for the
+state it finds, so a boundary that stopped the turn, such as one whose durable write
+failed, claims nothing and no request is prepared from it.
 
 The request path must not hide preparation, compaction, backoff, transport selection
 and response commit in one blocking effect. Conversely, introducing `Encoding` and
@@ -91,8 +91,9 @@ Finishing -> Idle
 any active phase -> Stopping -> Finishing
 ```
 
-A response with no calls goes from validation/commit to finishing. Rejected output
-can return to preparing with recorded feedback. Retry backoff is request state under
+A response with no calls goes from validation/commit to finishing, unless the turn has
+input it has not answered, which sends it back to preparing. Rejected output can return
+to preparing with recorded feedback. Retry backoff is request state under
 Awaiting_Model, not a nested agent loop. Streaming is progress within the active
 attempt; retain a separate Streaming phase only if it changes scheduling behavior.
 A display label alone does not need another control state.
@@ -240,11 +241,24 @@ Queued steering is input for the next request boundary of the current turn, afte
 all tool answers settle. Cancellation is immediate control, not steering. A waiting
 tool does not authorize a new model request or a mid-call registry replacement.
 
+Recording a steering line is what makes it the session's: the line becomes a user
+entry of the running turn, oldest first, and the next request built from that history
+carries it. Input the turn has not answered keeps it running: a line recorded for a
+turn that had finished answering returns that turn to preparing, and its next request
+is the one that answers the line. This is the whole difference between steering and a
+prompt sent while idle, which starts a turn of its own. A turn that failed or was
+cancelled keeps its outcome, and the line waits in the record for the next request from
+that history.
+
+No path may drop a line the user sent: the queue keeps it until the durable record
+owns it, a store that refuses the write leaves it pending with the refusal reported,
+and a line recorded for a request that never ran stays in the record.
+
 One agent-owned bounded input queue defines disposition. Frontends report queued,
-applied or unapplied input; they do not reinterpret a failed turn's leftover steering
-as a new prompt or execute its text as a command. On any terminal outcome, return
-unapplied steering to the caller explicitly. Starting a follow-up turn requires a
-separate accepted prompt. This avoids surprising work after cancellation or failure.
+recorded or pending input; they do not reinterpret steering text as a prompt or execute
+it as a command. Input still queued when the session goes idle is returned to the caller
+explicitly, so only an accepted prompt starts the next turn. This avoids surprising work
+after cancellation or failure.
 
 Pending provider/model/effort changes apply at the next ordinary request boundary,
 not during a retry chain. Validate a candidate before replacing the usable selection.

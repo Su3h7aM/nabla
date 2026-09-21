@@ -436,11 +436,14 @@ submit :: proc(app: ^App) {
 	} else if runtime_busy(app) {
 		// A steering line is not a command: commands keep their own path, which
 		// decides what can happen while a turn is running.
-		if agent.steer_push(&app.run.steer, text) {
-			snap_append(app, .Notice, "queued; the model sees this at its next request boundary")
-		} else {
-			snap_append(app, .Warning, "steering queue full; line dropped")
+		if !agent.steer_push(&app.run.steer, text) {
+			// The queue refused the line, and the prompt still holds it: the text stays
+			// where the user put it rather than being cleared into a warning.
+			snap_append(app, .Warning, "the steering queue is full; the line is still in the prompt")
+			completion_reset(app)
+			return
 		}
+		snap_append(app, .Notice, "queued; the model reads it at the next request")
 	} else {
 		enqueue(app, .Prompt, text)
 	}
@@ -448,11 +451,10 @@ submit :: proc(app: ^App) {
 	completion_reset(app)
 }
 
-// restore_steering returns input queued during a turn that ended before a request
-// boundary could apply it. The text is still the user's, so it goes back to the prompt
-// for an explicit submit; nothing here starts a turn, and nothing here reads it as a
-// command. The turn is over by the time this runs, so no boundary can take the lines
-// this one does.
+// restore_steering returns input the turn never recorded. A turn records what it was sent
+// when it ends, so what is left here arrived after that: the text is still the user's, and
+// it goes back to the prompt for an explicit submit. Nothing here starts a turn, and
+// nothing here reads the text as a command.
 restore_steering :: proc(app: ^App) {
 	taken := agent.steer_take_all(&app.run.steer)
 	defer agent.steer_taken_destroy(&app.run.steer, taken)
@@ -469,9 +471,9 @@ restore_steering :: proc(app: ^App) {
 	}
 	completion_reset(app)
 	if len(taken) == 1 {
-		snap_append(app, .Notice, "the line you typed while that turn ran was never applied; it is back in the prompt")
+		snap_append(app, .Notice, "the line you typed while that turn ran was not sent; it is back in the prompt")
 	} else {
-		snap_append(app, .Notice, fmt.tprintf("%d lines you typed while that turn ran were never applied; they are back in the prompt", len(taken)))
+		snap_append(app, .Notice, fmt.tprintf("%d lines you typed while that turn ran were not sent; they are back in the prompt", len(taken)))
 	}
 }
 

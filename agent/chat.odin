@@ -981,18 +981,19 @@ chat_run_turn_steered :: proc(
 		// a pure read of state. The owner observes the clock once and both steps use it.
 		now := time.tick_now()
 		chat_session_observe_at(chat, now)
+		// Input the front-end queued while the turn ran is applied before the state is read,
+		// so the selector sees a turn that still has a message to answer.
+		if steer != nil { chat_steering_observe(chat, observer, steer) }
 		effect := chat_session_advance_at(chat, now)
 		switch effect.kind {
 		case .Start_Request:
 			chat_effect_destroy(&effect)
-			// The boundary is a stage of the request the selector just proposed, and it
-			// runs before the claim that counts it: the lines the user queued while the
-			// turn ran are recorded at this turn, and the selection they may have changed
-			// is installed. A boundary that stops the turn claims nothing.
-			if steer != nil {
-				chat_drain_steering(chat, observer, steer, current)
-				if steer.apply != nil { current = steer.apply(steer) }
-			}
+			// The boundary is a stage of the request the selector just proposed, and it runs
+			// before the claim that counts it: the selection the user may have changed since
+			// the last request is installed, and a boundary that stops the turn claims
+			// nothing. The input this request carries is already recorded above, so the claim
+			// prepares it from the record.
+			if steer != nil && steer.apply != nil { current = steer.apply(steer) }
 			chat_perform_request(chat, current, policy, observer, &usages)
 		case .Run_Tools:
 			turn_id := effect.turn_id
@@ -1012,6 +1013,16 @@ chat_run_turn_steered :: proc(
 			if !chat_tool_jobs_finish(chat, turn_id) { return false }
 			if chat_session_cancelled(chat) { chat_session_note_cancel(chat) }
 		case .Turn_Finished:
+			// Input the turn never recorded is recorded here, so a turn that ends takes no
+			// message with it: this is input that arrived while a request was in flight, while
+			// a tool batch was settling, or after a failure or cancellation. It is durable, and
+			// the next request built from this history carries it, whether that request belongs
+			// to a later turn or to a resumed session.
+			//
+			// This runs before the turn's own end writes so the line still belongs to the turn
+			// that was sent it. A partial answer is written after it, and that entry is evidence
+			// no model is shown, so the order the next request reads is unaffected.
+			if steer != nil { chat_drain_steering(chat, observer, steer) }
 			// A turn whose outcome did not reach the store reports the storage failure,
 			// not the status the model reached: the session has no record of it. The
 			// session's own error is what the record and the front-end read.

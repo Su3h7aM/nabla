@@ -182,10 +182,9 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			stop_runtime(app)
 			return
 		}
-	// Steering lines left queued here were never applied: the turn reached no
-	// further request boundary, so nothing consumed them. Its end is the caller's
-	// to report, and the front-end returns them to the prompt when it sees the
-	// runtime stop running.
+	// Steering lines left queued here arrived after the turn recorded what it was sent,
+	// so they are not part of its history. Its end is still the caller's to report, and
+	// the front-end returns them to the prompt when it sees the runtime stop running.
 	case .Compact:
 		set_running(app, true)
 		if runtime_stopping(app) { agent.chat_cancel_request() }

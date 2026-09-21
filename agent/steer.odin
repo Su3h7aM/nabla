@@ -1,6 +1,5 @@
 package agent
 
-import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
@@ -8,13 +7,17 @@ import "core:sync"
 import "nabla:agent/session"
 import "nabla:ai"
 
-// Steering accepts input while a turn is running and applies it at the next safe
-// boundary: before the next model request, after tool calls settled. The front-end
-// owns reading input, so it pushes lines here; the execution thread remains the
-// only session writer. There are no parallel model requests and no scheduler.
+// Steering accepts input while a turn is running. A line the user sends is a message the
+// model has not answered, so the turn makes the request that answers it: recording the line
+// puts it in the next request the turn builds, and a turn that had already answered
+// continues instead of finishing. That is the whole difference from a prompt sent while
+// idle, which starts a turn of its own. Nothing here drops a line the user sent: it waits in
+// the queue until the session holds it, and a store that cannot record it leaves it waiting.
 //
-// The queue is written by the front-end's thread and read by the execution
-// thread, so it is guarded.
+// The front-end owns reading input, so it pushes lines here; the execution thread remains
+// the only session writer. There are no parallel model requests and no scheduler. The
+// queue is written by the front-end's thread and read by the execution thread, so it is
+// guarded.
 STEER_MAX_ITEMS :: 8
 STEER_MAX_BYTES :: 32 * 1024
 
@@ -60,21 +63,25 @@ steer_pop :: proc(queue: ^Steer_Queue) -> (string, bool) {
 	return line, true
 }
 
-// steer_clear discards everything queued and reports how many lines went.
-steer_clear :: proc(queue: ^Steer_Queue) -> int {
+// steer_requeue puts a popped line back at the front of the queue and takes its
+// ownership back. The queue is where input waits until the session holds it, so a line
+// the session could not record returns here, in its own order, instead of being dropped.
+// False means the queue could not take it back and the line was released: the one case
+// where input cannot stay pending.
+steer_requeue :: proc(queue: ^Steer_Queue, line: string) -> bool {
 	sync.mutex_lock(&queue.mu)
 	defer sync.mutex_unlock(&queue.mu)
-	dropped := len(queue.items)
-	for line in queue.items { delete(line, queue.allocator) }
-	clear(&queue.items)
-	queue.bytes = 0
-	return dropped
+	if !inject_at(&queue.items, 0, line) {
+		delete(line, queue.allocator)
+		return false
+	}
+	queue.bytes += len(line)
+	return true
 }
 
 // steer_take_all removes everything queued, oldest first, and returns it in one
-// allocation the caller owns. It is how a line queued for a request boundary the turn
-// never reached leaves the queue: whoever takes it decides what it becomes, and
-// steer_taken_destroy releases it.
+// allocation the caller owns. It is how input no turn recorded leaves the queue: whoever
+// takes it decides what it becomes, and steer_taken_destroy releases it.
 steer_take_all :: proc(queue: ^Steer_Queue) -> [dynamic]string {
 	sync.mutex_lock(&queue.mu)
 	defer sync.mutex_unlock(&queue.mu)
@@ -98,17 +105,12 @@ steer_line_free :: proc(queue: ^Steer_Queue, line: string) {
 	delete(line, queue.allocator)
 }
 
-// Steer_Context is the input a running turn may still consume: the queue the
-// front-end pushes lines into, a quit request one of those lines may carry, and the
-// caller's hook for a selection the user changed. It is an observation source, not
-// session state: the caller owns everything it points at, and a turn the caller gives
-// no input passes none at all.
+// Steer_Context is the input a running turn may still consume: the bounded queue the
+// front-end pushes lines into, and the caller's hook for a selection the user changed.
+// It is an observation source, not session state: the caller owns what it points at, and
+// a turn the caller gives no input passes none at all.
 Steer_Context :: struct {
 	queue:      ^Steer_Queue,
-	// quit, when not nil, is set by a queued line that asks the session to end.
-	// A caller with no such flag leaves it nil; the line is then reported and
-	// ignored rather than dereferenced.
-	quit:       ^bool,
 	// apply, when not nil, is the caller's request-boundary hook: it installs any
 	// selection the user asked for since the last request and returns the connection
 	// the next request must use. Resolving a selection is the caller's business, so the
@@ -117,50 +119,51 @@ Steer_Context :: struct {
 	apply_data: rawptr,
 }
 
-// chat_drain_steering applies the lines queued since the last request boundary. The
-// driver runs it on the request the selector proposed and before the claim that counts
-// it, so a line it records belongs to the request about to be prepared, and a write
-// that fails stops the turn before anything is claimed for it.
-//
-// Commands run immediately, so /effort still lands before the request is read from the
-// store; anything else becomes a user entry for the next request. A quit discards what
-// was never sent.
-chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context, connection: ai.Provider_Connection) {
+// chat_drain_steering hands the queued lines to the session, oldest first, and reports how
+// many it recorded. A line leaves the queue only once the session has recorded it: recording
+// is what makes the line the session's, and a store that refuses the write leaves it pending
+// instead of dropping a message the user sent. The refusal is reported, so a line that cannot
+// be delivered yet is diagnosable rather than gone.
+chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) -> int {
+	recorded := 0
 	for {
 		line, ok := steer_pop(steer.queue)
 		if !ok { break }
-		if line == "/quit" {
+		switch chat_session_steer(chat, line, session.now_ms()) {
+		case .Recorded:
+			_observer_user_text(observer, line)
 			steer_line_free(steer.queue, line)
-			if steer.quit != nil { steer.quit^ = true }
-			dropped := steer_clear(steer.queue)
-			if dropped > 0 {
-				_observer_message(observer, .Notice, fmt.tprintf("quitting after this turn finishes; dropped %d queued line(s)", dropped))
-			} else {
-				_observer_message(observer, .Notice, "quitting after this turn finishes")
+			recorded += 1
+		case .No_Turn:
+			// Nothing has run that could carry the line, so it waits for the turn that
+			// will, and the caller is told which condition is holding it up.
+			_observer_message(observer, .Warning, "the steering line is waiting for a turn to carry it")
+			steer_requeue(steer.queue, line)
+			return recorded
+		case .Storage_Failed:
+			// The store refused it, so the line stays pending: the session's own error says
+			// why, and nothing else may drop a message the user sent.
+			_observer_message(observer, .Error, chat.last_error)
+			if !steer_requeue(steer.queue, line) {
+				_observer_message(observer, .Warning, "the steering line could not stay pending")
 			}
-			return
+			return recorded
 		}
-		if !chat_handle_command(chat, observer, steer.queue, line, steer.quit) {
-			if line == "/compact" {
-				chat_command_compact(chat, observer, connection)
-			} else if strings.has_prefix(line, "/") {
-				// A slash is a command, never a message. A command this path does not
-				// answer to is refused rather than sent to the model as steering text.
-				_observer_message(observer, .Notice, fmt.tprintf("%s is not available while a turn is running", line))
-			} else if result := chat_session_steer(chat, line, session.now_ms()); result != .Accepted {
-				// A line that arrived outside the boundary was never tried, so the turn's
-				// own failure is not this line's to report: only a store that refused the
-				// line has something to say about it.
-				if result == .Storage_Failed {
-					_observer_message(observer, .Error, chat.last_error)
-				} else {
-					_observer_message(observer, .Warning, "steering arrived outside a request boundary; dropped")
-				}
-			} else {
-				_observer_user_text(observer, line)
-			}
-		}
-		steer_line_free(steer.queue, line)
-		if steer.quit != nil && steer.quit^ { return }
 	}
+	return recorded
+}
+
+// chat_steering_observe is the driver's collection step for input the front-end queued while
+// the turn ran. It records the lines at a settled point of the turn, and a line recorded for
+// a turn that had finished answering continues that turn: a message the user sent is one the
+// model has not answered, so the next request this turn makes is the one that answers it.
+//
+// That is the whole difference between steering and a prompt sent while idle, which starts a
+// turn of its own. A turn that failed or was cancelled keeps its outcome; its input stays in
+// the record, and the next request built from that history carries it.
+chat_steering_observe :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) {
+	point := chat_session_input_point(chat)
+	if point == .Wait { return }
+	if chat_drain_steering(chat, observer, steer) == 0 { return }
+	if point == .After_Answer { chat_session_continue_for_input(chat) }
 }

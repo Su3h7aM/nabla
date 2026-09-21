@@ -126,6 +126,43 @@ chat_session_begin_request :: proc(chat: ^Chat_Session) -> bool {
 	return true
 }
 
+// Chat_Input_Point is what a running turn can do with input the front-end queued.
+Chat_Input_Point :: enum {
+	// A request boundary: nothing is outstanding, so an entry recorded now reads after every
+	// answer the model has given and before the request the selector is about to propose.
+	Boundary,
+	// The turn answered and has nothing left to do: an entry recorded now is a message the
+	// model has not answered, so the turn continues to the request that answers it.
+	After_Answer,
+	// A request is in flight, a tool batch has not committed its results, or the turn already
+	// failed or was cancelled: recording now would read in the wrong place, so the line waits.
+	Wait,
+}
+
+// chat_session_input_point names where the turn is for input it has not answered. Only the
+// two settled points accept input: a boundary, and the end of an answered turn. A request in
+// flight and a call without its result are not settled, because an entry placed there would
+// be read where a result belongs; a turn that failed keeps its outcome instead of continuing.
+chat_session_input_point :: proc(chat: ^Chat_Session) -> Chat_Input_Point {
+	switch chat.state {
+	case .Preparing:
+		return .Boundary
+	case .Finalizing:
+		if chat.active_failed { return .Wait }
+		return .After_Answer
+	case .Idle, .Requesting, .Executing_Tools, .Cancelling:
+	}
+	return .Wait
+}
+
+// chat_session_continue_for_input returns a turn that had finished answering to preparing.
+// The entry just recorded is a message the model has not answered, so the next request is
+// the one that answers it instead of the turn ending without one.
+chat_session_continue_for_input :: proc(chat: ^Chat_Session) {
+	if chat.state != .Finalizing { return }
+	chat.state = .Preparing
+}
+
 // chat_session_fail_turn records a turn-level failure and moves to finalizing.
 chat_session_fail_turn :: proc(chat: ^Chat_Session, message: string) -> Chat_Effect {
 	delete(chat.last_error, chat.allocator)
@@ -226,12 +263,17 @@ chat_session_set_effort :: proc(chat: ^Chat_Session, level: string) -> bool {
 	return false
 }
 
-// Chat_Steer_Result is what recording a steering line did. A line that arrived outside
-// a request boundary was never tried, which is a different fact from a line the store
-// refused, and only the second carries an error that is this line's own.
+// Chat_Steer_Result is what recording a steering line did. A line the session did not
+// record was never the session's, which is a different fact from a line it recorded and a
+// request has yet to carry.
 Chat_Steer_Result :: enum {
-	Accepted,
-	Outside_Boundary,
+	// Recorded at the running turn. The next request built from this history carries it.
+	Recorded,
+	// No turn has run in this session, so there is no request that could carry the line
+	// and nothing to attach it to. It stays with whoever queued it.
+	No_Turn,
+	// The store refused the write, so the line was not recorded and the session recorded
+	// why in last_error. It stays with whoever queued it.
 	Storage_Failed,
 }
 
@@ -267,15 +309,17 @@ chat_session_worker_escaped :: proc(chat: ^Chat_Session) -> bool {
 // for the user to do but exit.
 CHAT_WORKER_ESCAPED_NOTICE :: "a tool call did not stop; the harness must exit"
 
-// chat_session_steer records a queued line as a user entry at a request
-// boundary. Unlike accept_user it starts no turn and resets no budget: the turn
-// keeps its identity and its counters, so steering changes what the next request
-// sends, never work already committed. Only Preparing is safe; anywhere else the
-// line is dropped by the caller.
+// chat_session_steer records a queued line as a user entry of the running turn. Unlike
+// accept_user it starts no turn and resets no budget: the turn keeps its identity and its
+// counters, so a steering line changes what a later request sends, never work already
+// committed. Recording is what makes the line the session's, and the entry is ordered
+// where it is written, so the request that follows reads the line after everything that
+// was committed before it.
 chat_session_steer :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> Chat_Steer_Result {
-	if chat.state != .Preparing { return .Outside_Boundary }
+	turn_no, has_turn := chat.turn_no.?
+	if !has_turn { return .No_Turn }
 	entry := session.New_Entry {
-		turn_no = chat.turn_no,
+		turn_no = turn_no,
 		created_at_ms = at_ms,
 		payload = session.User_Entry{text = text, origin = .Steering},
 	}
@@ -283,7 +327,7 @@ chat_session_steer :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> Cha
 		chat_session_record_failure(chat, "the steering line could not be recorded", err)
 		return .Storage_Failed
 	}
-	return .Accepted
+	return .Recorded
 }
 
 chat_tool_call_clone :: proc(call: ai.Provider_Tool_Call, allocator: mem.Allocator) -> (Chat_Tool_Call, bool) {

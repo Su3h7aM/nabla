@@ -1,7 +1,6 @@
 package agent
 
 import "core:fmt"
-import "core:strings"
 
 import "nabla:agent/session"
 
@@ -12,22 +11,6 @@ import "nabla:agent/session"
 chat_effort_change_note :: proc(level: string) -> string {
 	if level == "" { return "effort cleared to provider default; the prompt prefix is read again from the start" }
 	return fmt.tprintf("effort set to %s for the next request; the prompt prefix is read again from the start", level)
-}
-
-chat_notice_effort :: proc(chat: ^Chat_Session, observer: Chat_Observer, provider_id, model_id: string) {
-	if chat.effort != "" {
-		_observer_message(observer, .Notice, fmt.tprintf("effort for %s / %s is %s", provider_id, model_id, chat.effort))
-	} else {
-		_observer_message(observer, .Notice, fmt.tprintf("effort for %s / %s is provider default", provider_id, model_id))
-	}
-	if len(chat.effort_levels) > 0 {
-		levels, join_err := strings.join(chat.effort_levels[:], " ", context.temp_allocator)
-		if join_err == nil {
-			_observer_message(observer, .Notice, fmt.tprintf("allowed: %s", levels))
-		}
-	} else {
-		_observer_message(observer, .Notice, "no effort levels configured for this model")
-	}
 }
 
 // chat_notice_status reports what the session is and what it is doing: who it is,
@@ -134,46 +117,4 @@ chat_age_text :: proc(elapsed_ms: i64) -> string {
 	hours := minutes / 60
 	if hours < 24 { return fmt.tprintf("%dh %dm", hours, minutes % 60) }
 	return fmt.tprintf("%dd %dh", hours / 24, hours % 24)
-}
-
-// chat_handle_command runs one input line as a command. True means handled; the
-// caller records anything else as a steering line. /quit during a turn quits after it
-// settles, so shutdown never strands tool children.
-chat_handle_command :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue: ^Steer_Queue, text: string, quit: ^bool) -> bool {
-	if text == "/quit" {
-		if chat.state != .Idle { _observer_message(observer, .Notice, "quitting after this turn finishes") }
-		if quit != nil { quit^ = true }
-		return true
-	}
-	if text == "/effort" {
-		chat_notice_effort(chat, observer, chat.provider_id, chat.model_id)
-		return true
-	}
-	if text == "/status" {
-		chat_notice_status(chat, observer, session.now_ms())
-		return true
-	}
-	if text == "/drop" {
-		dropped := steer_clear(queue)
-		if dropped > 0 {
-			_observer_message(observer, .Notice, fmt.tprintf("dropped %d queued line(s)", dropped))
-		} else {
-			_observer_message(observer, .Notice, "steering queue is empty")
-		}
-		return true
-	}
-	if strings.has_prefix(text, "/effort ") {
-		level := strings.trim_space(text[len("/effort "):])
-		if level == "default" {
-			chat_session_set_effort(chat, "")
-			_observer_message(observer, .Notice, chat_effort_change_note(""))
-		} else if chat_session_set_effort(chat, level) {
-			_observer_message(observer, .Notice, chat_effort_change_note(level))
-		} else {
-			_observer_message(observer, .Notice, fmt.tprintf("effort %s is not allowed for this model", level))
-			chat_notice_effort(chat, observer, chat.provider_id, chat.model_id)
-		}
-		return true
-	}
-	return false
 }

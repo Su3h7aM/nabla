@@ -139,31 +139,6 @@ test_admission_names_the_part_that_alone_does_not_fit :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_steered_line_is_recorded_before_the_request :: proc(t: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
-	chat := &fixture.chat
-	chat_test_capacity(chat, 500000)
-	_test_accept(t, chat, "hi")
-
-	// Steering is admitted at a request boundary and recorded as a user entry in
-	// the turn that is already running.
-	testing.expect_value(t, chat_session_steer(chat, "steered", session.now_ms()), Chat_Steer_Result.Accepted)
-
-	ctx := _test_context(t, chat)
-	defer session.context_destroy(&ctx, context.allocator)
-	found := false
-	for entry in ctx.entries {
-		if user, is_user := entry.payload.(session.User_Entry); is_user && user.text == "steered" {
-			found = true
-			testing.expect_value(t, user.origin, session.User_Origin.Steering)
-		}
-	}
-	testing.expect(t, found, "the steering line should be part of the context")
-}
-
-@(test)
 test_tool_calls_are_recorded_then_run :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))

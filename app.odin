@@ -596,6 +596,14 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 		work_destroy(app, queued)
 	}
 	chan.destroy(&app.run.work)
+	// Input the user sent that no request carried. A turn records what it was sent when it
+	// ends, so what is left here reached no turn at all: the process is the last holder, and
+	// saying so is the only report an exiting front-end can give. This is the difference
+	// between input that was pending and input that was dropped.
+	if undelivered := agent.steer_take_all(&app.run.steer); len(undelivered) > 0 {
+		fmt.eprintf("nabla: %d line(s) typed during a turn were never recorded; they were not delivered\n", len(undelivered))
+		agent.steer_taken_destroy(&app.run.steer, undelivered)
+	}
 	agent.steer_queue_destroy(&app.run.steer)
 	pending_selection_clear(&app.run.pending, app.run.alloc)
 	snapshot_destroy(app)
