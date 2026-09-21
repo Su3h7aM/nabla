@@ -117,28 +117,34 @@ code_mode_lua_table_to_json :: proc(L: ^l.State, index: c.int, state: ^Code_Mode
 	if identity != nil { state.seen[identity] = true }
 	defer if identity != nil { delete_key(&state.seen, identity) }
 
+	// A table is an array only when it is dense from 1, and an object only when every key
+	// is a string. Saying which of those failed is the difference between a script author
+	// fixing a sparse array and guessing at a mixed one.
 	length := int(l.rawlen(L, absolute))
 	count := 0
-	array := length > 0
-	object := true
+	integers := 0
+	strings_seen := 0
+	dense := true
 	l.pushnil(L)
 	for l.next(L, absolute) != 0 {
 		count += 1
 		if l.type(L, -2) == .NUMBER && l.isinteger(L, -2) {
 			key := int(l.tointeger(L, -2))
-			if key < 1 || key > length { array = false }
-			object = false
+			integers += 1
+			if key < 1 || key > length { dense = false }
 		} else if l.type(L, -2) == .STRING {
-			array = false
+			strings_seen += 1
 		} else {
 			l.pop(L, 2)
-			return {}, "a table has a key that is not a string or a dense array index"
+			return {}, "a table has a key that is not a string or an array index"
 		}
 		l.pop(L, 1)
 	}
-	if count == 0 { object = true }
-	if array && count != length { array = false }
-	if !array && !object { return {}, "a table mixes object fields and array indexes" }
+	if integers > 0 && strings_seen > 0 { return {}, "a table mixes object fields and array indexes" }
+	if strings_seen == 0 && count > 0 && !(dense && count == length) {
+		return {}, "a table's array indexes are not dense from 1"
+	}
+	array := count > 0 && strings_seen == 0
 
 	if array {
 		values := make(json.Array, length, state.allocator)

@@ -159,6 +159,28 @@ code_mode_value_keeps_multibyte_text_and_nul :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(string(encoded), `"nul":"a\u0000b"`), string(encoded))
 }
 
+// Table shape decides whether a value is an object or an array, and saying which shape
+// failed is the difference between fixing a sparse array and guessing at a mixed table.
+@(test)
+code_mode_value_classifies_table_shape :: proc(t: ^testing.T) {
+	cases := []struct {
+		source: string,
+		fault:  string,
+	} {
+		{`local t = {} t[1] = "a" t[3] = "c" return t`, "a table's array indexes are not dense from 1"},
+		{`local t = { "a", "b" } t.name = "x" return t`, "a table mixes object fields and array indexes"},
+		{`local t = {} t[true] = 1 return t`, "a table has a key that is not a string or an array index"},
+		{`local t = {} t[1.5] = 1 return t`, "a table has a key that is not a string or an array index"},
+	}
+	for c in cases {
+		run := code_mode_value_test_start(t, c.source)
+		testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Returned)
+		_, message := code_mode_lua_returned_json(run, context.temp_allocator)
+		testing.expectf(t, message == c.fault, "%q should refuse with %q, got %q", c.source, c.fault, message)
+		code_mode_lua_destroy(run)
+	}
+}
+
 @(test)
 code_mode_value_rejects_cycles :: proc(t: ^testing.T) {
 	run := code_mode_value_test_start(t, `local value = {}

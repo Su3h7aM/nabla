@@ -1181,9 +1181,12 @@ the same model and pushed as the wrapper's single Lua return value. No parallel 
 argument or result representation was introduced.
 
 The conversion accepts the host-owned `json.null` sentinel, booleans, strings, Lua
-integers, finite JSON numbers, string-keyed objects, and dense one-based arrays. An
-empty table is an object. It
-rejects unsupported Lua types, cycles, mixed tables, sparse arrays, excessive depth,
+integers, finite JSON numbers, string-keyed objects, and dense one-based arrays. A table
+is an object when every key is a string and an array when its indexes are dense from 1,
+and an empty table is an object. A table that is neither is refused with the shape that
+failed: a sparse array says its indexes are not dense, and a table with both kinds of key
+says it mixes them. It
+also rejects unsupported Lua types, cycles, excessive depth,
 and more than 16,384 traversed values. Lua strings retain their explicit length, and
 every string and table key must be valid UTF-8, because a JSON document is UTF-8 and an
 endpoint refuses one that is not. The boundary is where that is decided rather than
