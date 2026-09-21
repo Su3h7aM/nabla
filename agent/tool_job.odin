@@ -448,14 +448,23 @@ tool_job_logging :: proc(job: ^Tool_Job, chat: ^Chat_Session) -> Log_Binding {
 
 // --- decisions -----------------------------------------------------------------
 
+// tool_jobs_observe applies what happened outside the batch to its state: workers that
+// published a result, a stop the session asked for, and the owner's first sight of a
+// call that should have stopped. It is the only place those facts enter the table, so
+// tool_jobs_next can read the table without changing it.
+tool_jobs_observe :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, now: time.Tick) {
+	tool_jobs_collect(jobs)
+	tool_jobs_latch_stop(jobs, chat)
+	tool_jobs_note_stops(jobs, now)
+}
+
 // tool_jobs_next is the batch's readiness order: answer what ignored its stop, settle what
 // finished, release what settled, start what may start, and sleep only when there is nothing
 // else. now is the owner's clock observation, so a test supplies it instead of waiting out
-// the stop patience. Settling work is never starved behind new work.
+// the stop patience. It reads the table and performs no I/O, no executor call, and no clock
+// read; tool_jobs_observe is what brings the outside facts in first. Settling work is never
+// starved behind new work.
 tool_jobs_next :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> Tool_Job_Effect {
-	tool_jobs_collect(jobs)
-	tool_jobs_note_stops(jobs, now)
-
 	if jobs.stop == .Storage_Failed {
 		// Nothing more can be recorded, so there is nothing left to settle here: release what
 		// can be released now and wait for what cannot.

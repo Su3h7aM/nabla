@@ -103,6 +103,7 @@ tool_job_test_step :: proc(test: ^Tool_Test, jobs: ^Tool_Jobs) -> Tool_Job_Effec
 // reach the stop patience without waiting it out.
 tool_job_test_step_at :: proc(test: ^Tool_Test, jobs: ^Tool_Jobs, now: time.Tick) -> Tool_Job_Effect {
 	chat := &test.fixture.chat
+	tool_jobs_observe(jobs, chat, now)
 	effect := tool_jobs_next(jobs, now)
 	switch effect {
 	case .Commit:
@@ -748,6 +749,7 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
 
 	tool_job_hold_release_all()
 	for _ in 0 ..< 100_000 {
+		chat_session_observe(chat)
 		effect := chat_session_advance(chat)
 		switch effect.kind {
 		case .Step_Tools:
@@ -767,6 +769,46 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
 		chat_effect_destroy(&effect)
 	}
 	testing.expect(t, false, "the session-owned batch never settled")
+}
+
+// Selection is a read. A worker's published result is not adopted by asking the state
+// machine what to do next; the driver's observation step is what brings it in, and only
+// then does the selection propose the commit.
+@(test)
+test_advance_does_not_adopt_a_published_result :: proc(t: ^testing.T) {
+	tool_job_hold_reset()
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_observe"))
+	_test_stage_call(t, chat, "call_observe", `{}`, "test_observe")
+	chat_tool_jobs_begin(chat, {})
+
+	dispatch := chat_session_advance(chat)
+	chat_tool_jobs_step(chat, {}, dispatch.tool)
+	chat_effect_destroy(&dispatch)
+	tool_job_test_hold_until(t, 1)
+
+	tool_job_hold_release_all()
+	for {
+		sync.mutex_guard(&chat.tool_jobs.jobs[0].mu)
+		if chat.tool_jobs.jobs[0].published { break }
+	}
+
+	// The result exists in the job but has not been observed, so selection still proposes
+	// a wait and the phase is untouched.
+	wait := chat_session_advance(chat)
+	defer chat_effect_destroy(&wait)
+	testing.expect_value(t, wait.kind, Chat_Effect_Kind.Wait_Tools)
+	testing.expect_value(t, chat.tool_jobs.jobs[0].phase, Tool_Job_Phase.Running)
+
+	// Observing adopts it, and the next selection is the commit.
+	chat_session_observe(chat)
+	commit := chat_session_advance(chat)
+	defer chat_effect_destroy(&commit)
+	testing.expect_value(t, commit.kind, Chat_Effect_Kind.Step_Tools)
+	testing.expect_value(t, commit.tool, Tool_Job_Effect.Commit)
 }
 
 // Cancellation does not skip the job table. The cancelling state keeps selecting job
@@ -792,6 +834,7 @@ test_cancelling_chat_drains_session_owned_jobs :: proc(t: ^testing.T) {
 	testing.expect_value(t, chat.state, Chat_State.Cancelling)
 
 	for _ in 0 ..< 100_000 {
+		chat_session_observe(chat)
 		effect := chat_session_advance(chat)
 		switch effect.kind {
 		case .Step_Tools:

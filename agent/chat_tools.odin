@@ -80,8 +80,8 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 
 	tool_jobs_submit(&jobs, chat, observer)
 	for {
-		tool_jobs_latch_stop(&jobs, chat)
 		now := time.tick_now()
+		tool_jobs_observe(&jobs, chat, now)
 		switch tool_jobs_next(&jobs, now) {
 		case .Commit:
 			tool_jobs_commit(&jobs, chat, observer)

@@ -41,15 +41,24 @@ chat_effect_destroy :: proc(effect: ^Chat_Effect) {
 	effect^ = {}
 }
 
+// chat_session_observe applies facts that arrived from outside the owner: a worker's
+// published result, a stop the session asked for, and the first sight of a call that
+// should have stopped. It is the driver's collection step, so chat_session_advance can
+// read the state without changing it.
+chat_session_observe :: proc(chat: ^Chat_Session) {
+	if !chat.tool_jobs_active { return }
+	tool_jobs_observe(&chat.tool_jobs, chat, time.tick_now())
+}
+
 // chat_session_tool_effect selects one bounded job-table effect while a batch is
 // active. A batch that has not been admitted starts with Run_Tools; a settled batch
-// ends with Finish_Tools. Nothing here runs an executor, waits, or writes history.
+// ends with Finish_Tools. Nothing here runs an executor, waits, writes history, or
+// adopts an observation: chat_session_observe has already brought those in.
 @(private)
 chat_session_tool_effect :: proc(chat: ^Chat_Session) -> Chat_Effect {
 	if !chat.tool_jobs_active {
 		return Chat_Effect{kind = .Run_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}
 	}
-	tool_jobs_latch_stop(&chat.tool_jobs, chat)
 	next := tool_jobs_next(&chat.tool_jobs, time.tick_now())
 	switch next {
 	case .Commit, .Refuse, .Abandon, .Retire, .Dispatch:

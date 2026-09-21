@@ -936,6 +936,9 @@ chat_run_turn_steered :: proc(
 			chat_drain_steering(chat, observer, steer)
 			if steer.apply != nil { current = steer.apply(steer) }
 		}
+		// External facts are applied before the state is read, so the selection below is
+		// a pure read of state.
+		chat_session_observe(chat)
 		effect := chat_session_advance(chat)
 		switch effect.kind {
 		case .Start_Request:
