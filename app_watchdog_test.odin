@@ -56,64 +56,14 @@ test_watchdog_thread_field_reads_past_the_command_name :: proc(t: ^testing.T) {
 
 // --- the report ---------------------------------------------------------------
 
-// Watchdog_Test holds a real writer, because the point of the report is a record that
-// outlives the process it describes.
-Watchdog_Test :: struct {
-	sink:      agent.Log,
-	binding:   agent.Log_Binding,
-	directory: string,
-	logger:    log.Logger,
-}
-
-watchdog_test_begin :: proc(t: ^testing.T, test: ^Watchdog_Test) {
-	directory, directory_err := os.make_directory_temp("", "nabla-watchdog-test-*", context.allocator)
-	if directory_err != nil { testing.fail_now(t, "the test directory could not be created") }
-	test.directory = directory
-	_, open_err := agent.log_open(&test.sink, {directory = directory, enabled = true, lowest = .Info})
-	if open_err != nil { testing.fail_now(t, "the log could not be opened") }
-	test.binding = agent.Log_Binding {
-		sink = &test.sink,
-	}
-	test.logger = agent.log_logger(&test.binding)
-}
-
-// watchdog_test_install installs the writer in the scope that emits. `context.logger` is
-// implicit state of the calling scope, so a helper cannot install it for its caller: the
-// test that emits is the test that sets it.
-
-watchdog_test_end :: proc(t: ^testing.T, test: ^Watchdog_Test) {
-	_ = agent.log_close(&test.sink)
-	os.remove_all(test.directory)
-	delete(test.directory, context.allocator)
-}
-
-// watchdog_test_records returns everything the run wrote. The writer names its own run
-// directory, so the test finds it rather than rebuilding an id it cannot know.
-watchdog_test_records :: proc(test: ^Watchdog_Test) -> string {
-	builder := strings.builder_make(context.temp_allocator)
-	runs := strings.concatenate({test.directory, "/runs"}, context.temp_allocator)
-	run_dirs, runs_err := os.read_directory_by_path(runs, 8, context.temp_allocator)
-	if runs_err != nil { return "" }
-	for run in run_dirs {
-		segments, segments_err := os.read_directory_by_path(run.fullpath, 8, context.temp_allocator)
-		if segments_err != nil { continue }
-		for segment in segments {
-			data, read_err := os.read_entire_file_from_path(segment.fullpath, context.temp_allocator)
-			if read_err != nil { continue }
-			strings.write_bytes(&builder, data)
-		}
-	}
-	return strings.to_string(builder)
-}
-
 // A stalled front-end leaves the phase it stopped in, what the process was doing, and one
 // record per thread. The last of those is the whole point: it says where a thread that
 // never returned is waiting.
 @(test)
 test_watchdog_report_writes_the_stall_and_the_threads :: proc(t: ^testing.T) {
-	test: Watchdog_Test
-	watchdog_test_begin(t, &test)
-	defer watchdog_test_end(t, &test)
+	test: Log_Fixture
+	log_fixture_open(t, &test)
+	defer log_fixture_close(t, &test)
 
 	watchdog: Watchdog
 	watchdog.binding = test.binding
@@ -124,7 +74,7 @@ test_watchdog_report_writes_the_stall_and_the_threads :: proc(t: ^testing.T) {
 	// reader is looking at everything the run produced.
 	_ = agent.log_close(&test.sink)
 
-	records := watchdog_test_records(&test)
+	records := log_fixture_records(&test)
 	if len(records) == 0 { testing.fail_now(t, "the report reached no log file") }
 	testing.expectf(t, strings.contains(records, `"event":"ui.stalled"`), "no stall record: %s", records)
 	testing.expectf(t, strings.contains(records, `"stage":"drawing"`), "the stall does not name the phase: %s", records)
@@ -137,9 +87,9 @@ test_watchdog_report_writes_the_stall_and_the_threads :: proc(t: ^testing.T) {
 // the log, so a watcher must not outlive the sink it writes to.
 @(test)
 test_watchdog_start_and_stop_own_the_thread :: proc(t: ^testing.T) {
-	test: Watchdog_Test
-	watchdog_test_begin(t, &test)
-	defer watchdog_test_end(t, &test)
+	test: Log_Fixture
+	log_fixture_open(t, &test)
+	defer log_fixture_close(t, &test)
 
 	app := App{}
 	app.setup.log_binding = test.binding
@@ -156,6 +106,6 @@ test_watchdog_start_and_stop_own_the_thread :: proc(t: ^testing.T) {
 	testing.expect(t, sync.atomic_load(&app.watchdog.busy), "a running turn should be published")
 	testing.expect(t, !sync.atomic_load(&app.watchdog.viewport_ok), "an unreported size should be published")
 
-	watchdog_stop(&app)
+	testing.expect(t, watchdog_stop(&app), "the watcher should retire")
 	testing.expect(t, app.watchdog.worker == nil, "the watcher should be joined and released")
 }

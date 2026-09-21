@@ -553,20 +553,33 @@ report_viewport_unavailable :: proc(app: ^App, err: term.Error) {
 }
 
 // app_teardown releases everything after the worker stopped. It must be
-// called at most once.
-app_teardown :: proc(app: ^App) {
+// called at most once. A thread that does not retire stops the release: what such a
+// thread can still reach must not be handed back while it is using it. patience is how
+// long each thread is given, so a test can hold the give-up path without waiting for the
+// bound a real shutdown uses.
+app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 	// Stopping is the phase where a front-end waits for other threads, so the
 	// watcher covers it: a run that will not exit otherwise leaves nothing after
 	// its last frame.
 	watchdog_stage(app, .Teardown)
-	catalog_refresh_stop(app)
+	retired := catalog_refresh_stop(app, patience)
 	if app.run.work != {} {
 		chan.close(&app.run.work)
 	}
 	if app.run.worker != nil {
-		thread.join(app.run.worker)
-		thread.destroy(app.run.worker)
-		app.run.worker = nil
+		if join_retiring(app.run.worker, "nabla-tui-worker", patience) {
+			app.run.worker = nil
+		} else {
+			retired = false
+		}
+	}
+	if !retired {
+		// Nothing below this line may run: the release path would free the channel, the
+		// snapshot, and the log binding that the thread still reads. The process exits
+		// with that memory owned by the thread that is using it, and the record names
+		// which thread it was.
+		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.teardown_abandoned"})
+		return
 	}
 	// The worker frees what it had buffered on the way out; this covers commands
 	// that were queued after it stopped receiving, and a worker that never started.
@@ -588,7 +601,11 @@ app_teardown :: proc(app: ^App) {
 	frame_storage_destroy(app.storage)
 	// The watcher stops here: after every thread it could report has been joined,
 	// and before the log it writes to is closed.
-	watchdog_stop(app)
+	retired = watchdog_stop(app, patience)
+	if !retired {
+		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.teardown_abandoned"})
+		return
+	}
 	run_setup_destroy(&app.setup)
 	catalog_retired_destroy(app)
 }

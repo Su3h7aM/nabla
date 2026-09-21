@@ -141,13 +141,16 @@ catalog_selection_sync :: proc(app: ^App) {
 	}
 }
 
-catalog_refresh_stop :: proc(app: ^App) {
-	if app.catalog_worker == nil { return }
+// catalog_refresh_stop ends the catalog thread and releases its channel. False means the
+// thread did not retire, so neither the channel it reads nor the sources it read may be
+// released.
+catalog_refresh_stop :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
+	if app.catalog_worker == nil { return true }
 	chan.close(&app.catalog_refresh)
-	thread.join(app.catalog_worker)
-	thread.destroy(app.catalog_worker)
+	if !join_retiring(app.catalog_worker, "nabla-catalog-refresh", patience) { return false }
 	app.catalog_worker = nil
 	chan.destroy(&app.catalog_refresh)
+	return true
 }
 
 catalog_retired_destroy :: proc(app: ^App) {

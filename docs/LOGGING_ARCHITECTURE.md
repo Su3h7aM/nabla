@@ -190,6 +190,7 @@ Inside the root package:
 | `app_log.odin` | environment policy, writer lifetime, run-level logger binding, health notices, `run.started` and `run.finished` |
 | `app_worker.odin` | install the worker's logger without replacing its allocator context |
 | `app_watchdog.odin` | the front-end's phase count, the stall decision, and the report a loop that stopped running leaves: the phase it stopped in, the runtime facts around it, and one record per thread with its state and wait |
+| `app_shutdown.odin` | how long shutdown waits for each thread, and the thread that did not retire |
 | `app_diagnostics.odin` | `nabla diagnostics <session-id>`: the reader's records to stdout, what was read and what could not be to stderr |
 | `main.odin` | the `diagnostics` subcommand, alongside `chat_cli_parse` |
 | `app_command_test.odin` | CLI parsing tests |
@@ -602,6 +603,8 @@ Minimum event contracts:
 | `ui.stalled`, `runtime.thread` | Warn | the front-end's phase count stopped moving for the stall bound: the phase it entered last, whether a turn was running, whether a terminal size was reported, whether a stop was requested, and one record per thread with its state, waiting address, and syscall |
 | `ui.resumed` | Info | how long the front-end was silent before it entered a phase again, which is what separates a loop that was slow from one that was stuck |
 | `ui.viewport_unavailable` | Warn | the terminal error that stopped presentation, recorded once per episode, because a screen that stops updating without a record is indistinguishable from a run that died |
+| `runtime.thread_unretired` | Error | the thread shutdown gave up on and how long it waited. A thread that does not return is the one case where the release path must stop, because everything it can still reach stays owned by it |
+| `runtime.teardown_abandoned` | Error | the release path was given up after an unretired thread, so nothing after it was freed. This is why a run ended by a stuck thread has no `run.finished`: the log is closed by the same release path it skipped |
 | `tool.binding` | Debug | candidate generation, exact remote name, and canonical provider/Lua name; refresh result establishes installation |
 | `tool.call_received` | Info | the canonical tool name and the argument byte count |
 | `tool.arguments_prepared` | Debug | admission status, repair classification, effective byte count |
