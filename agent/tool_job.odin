@@ -228,6 +228,11 @@ Tool_Jobs :: struct {
 	// render is the reader owner-placed tools use to read kept results back. It lives
 	// here, not in a frame, so a job can borrow it for its whole life.
 	render:           Result_Reader,
+	// escaped is set when a worker ignored its stop and the owner handed the job to it.
+	// Such a worker still borrows the session's workspace, registry generation, and
+	// backend, so the runtime is no longer safe to continue: the owner propagates this
+	// to the session, and the process exits without releasing what the worker can reach.
+	escaped:          bool,
 }
 
 // --- lifetime ------------------------------------------------------------------
@@ -732,6 +737,7 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 	// returns, which is what keeps a call that ignores its stop from leaking its storage.
 	job.orphan = true
 	job.phase = .Stuck
+	jobs.escaped = true
 	if recorded {
 		job.committed = true
 		job.recorded_seq = result_seq
@@ -855,6 +861,7 @@ tool_jobs_retire :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 		sync.mutex_lock(&job.mu)
 		job.orphan = true
 		job.phase = .Stuck
+		jobs.escaped = true
 		waited := time.tick_diff(job.stop_at, now)
 		fields := [3]Log_Field {
 			{key = "tool", value = job.name},

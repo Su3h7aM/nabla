@@ -147,12 +147,17 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		// paths refresh, so an interactive turn and a headless one see the same tools.
 		if warning := app_tools_refresh(app); warning != "" { snap_append(app, .Warning, warning) }
 		accepted := agent.chat_session_accept_user(&app.setup.session, work.text, session.now_ms())
-		if accepted != .Accepted {
-			if accepted == .Storage_Failed {
-				snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
-			} else {
-				snap_append(app, .Warning, "chat is busy; input dropped")
-			}
+		switch accepted {
+		case .Accepted:
+		case .Storage_Failed:
+			snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
+			return
+		case .Worker_Escaped:
+			snap_append(app, .Error, "a tool call did not stop; the harness is shutting down")
+			stop_runtime(app)
+			return
+		case .Busy:
+			snap_append(app, .Warning, "chat is busy; input dropped")
 			return
 		}
 		snap_append(app, .User, work.text)
@@ -170,6 +175,14 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			apply_data  = app,
 		}
 		completed := agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer)
+		// A tool worker that ignored its stop still borrows the session's workspace, registry
+		// generation, and backends. Nothing else may run in this process: the runtime stops,
+		// and teardown leaves what that worker can reach to process exit.
+		if agent.chat_session_worker_escaped(&app.setup.session) {
+			snap_append(app, .Error, "a tool call did not stop; the harness is shutting down")
+			stop_runtime(app)
+			return
+		}
 		// A steering line applies at a request boundary inside the turn it was typed
 		// during. A turn that failed before reaching one leaves the line unapplied, and it
 		// is still the user's message: it becomes a fresh prompt, or runs as the command it

@@ -606,6 +606,13 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.teardown_abandoned"})
 		return
 	}
+	// A tool worker that ignored its stop still borrows the session's workspace, registry
+	// generation, and backends, so none of that may be released. The process exits with
+	// what that worker can still reach, and the record names why.
+	if agent.chat_session_worker_escaped(&app.setup.session) {
+		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.worker_escaped"})
+		return
+	}
 	run_setup_destroy(&app.setup)
 	catalog_retired_destroy(app)
 }

@@ -550,6 +550,7 @@ test_a_call_that_ignores_its_stop_is_answered_and_released :: proc(t: ^testing.T
 	late := time.tick_add(started, TOOL_JOBS_STOP_PATIENCE + time.Millisecond)
 	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Abandon)
 	testing.expect_value(t, jobs.jobs[0].phase, Tool_Job_Phase.Stuck)
+	testing.expect(t, jobs.escaped, "handing a job to its worker must latch the batch")
 	testing.expect_value(t, jobs.committed, 1)
 	testing.expect(t, tool_jobs_settled(&jobs), "the batch must settle without its stuck call")
 	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Done)
@@ -809,6 +810,34 @@ test_advance_does_not_adopt_a_published_result :: proc(t: ^testing.T) {
 	defer chat_effect_destroy(&commit)
 	testing.expect_value(t, commit.kind, Chat_Effect_Kind.Step_Tools)
 	testing.expect_value(t, commit.tool, Tool_Job_Effect.Commit)
+}
+
+// An escaped worker latches the session. The observation step is what carries the
+// batch's escape into the session, and an escaped session admits no further turn, which
+// is what keeps the workspace, registry generation, and backends it borrows from being
+// released under a worker that is still running.
+@(test)
+test_an_escaped_worker_refuses_another_turn :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+
+	testing.expect(t, !chat_session_worker_escaped(chat))
+	tool_jobs_init(&chat.tool_jobs, chat, 0, os.heap_allocator())
+	chat.tool_jobs_active = true
+	chat.tool_jobs.escaped = true
+	chat_session_observe(chat)
+	testing.expect(t, chat_session_worker_escaped(chat))
+	before_entries := _test_entries(t, chat)
+	before := len(before_entries)
+	session.entries_destroy(before_entries, context.allocator)
+	testing.expect_value(t, chat_session_accept_user(chat, "next", session.now_ms()), Chat_Accept.Worker_Escaped)
+
+	// The refused prompt left no record behind.
+	entries := _test_entries(t, chat)
+	defer session.entries_destroy(entries, context.allocator)
+	testing.expect_value(t, len(entries), before)
 }
 
 // Cancellation does not skip the job table. The cancelling state keeps selecting job

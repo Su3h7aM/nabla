@@ -62,6 +62,9 @@ Chat_Accept :: enum {
 	Busy,
 	// The input could not be recorded, so the turn was not started.
 	Storage_Failed,
+	// A tool worker ignored its stop and still owns borrowed session data, so the
+	// session must not run another turn.
+	Worker_Escaped,
 }
 
 // Chat_Session is the running half of a session. Committed history lives in the
@@ -94,6 +97,11 @@ Chat_Session :: struct {
 	// could not record its own history accepts no further work: continuing would
 	// let the conversation diverge from what was stored.
 	storage_failed:               bool,
+
+	// worker_escaped latches a tool worker that ignored its stop and still owns borrowed
+	// session data. The session accepts no further turn, and the process exits without
+	// releasing anything that worker can reach.
+	worker_escaped:               bool,
 
 	// tools is the set of tools a turn may dispatch, owned by the chat. It is
 	// replaceable while the chat is idle and frozen for the entire user turn,
@@ -360,6 +368,7 @@ chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: sess
 // chat_session_accept_user admits a prompt: it opens a turn and records the
 // prompt as that turn's first entry before any request is made.
 chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> Chat_Accept {
+	if chat.worker_escaped { return .Worker_Escaped }
 	if chat.storage_failed { return .Storage_Failed }
 	if chat.state != .Idle { return .Busy }
 

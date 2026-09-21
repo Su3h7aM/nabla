@@ -48,6 +48,7 @@ chat_effect_destroy :: proc(effect: ^Chat_Effect) {
 chat_session_observe :: proc(chat: ^Chat_Session) {
 	if !chat.tool_jobs_active { return }
 	tool_jobs_observe(&chat.tool_jobs, chat, time.tick_now())
+	if chat.tool_jobs.escaped { chat.worker_escaped = true }
 }
 
 // chat_session_tool_effect selects one bounded job-table effect while a batch is
@@ -232,6 +233,13 @@ chat_session_recovery_reason :: proc(chat: ^Chat_Session) -> (Request_Recovery_R
 // consumed by the loop that ran it.
 chat_session_terminal_status :: proc(chat: ^Chat_Session) -> Chat_Terminal_Status {
 	return chat.terminal_status
+}
+
+// chat_session_worker_escaped reports that a tool worker ignored its stop and still owns
+// borrowed session data. The session can no longer run a turn or be released normally: the
+// owner stops the runtime and the process exits with what that worker can still reach.
+chat_session_worker_escaped :: proc(chat: ^Chat_Session) -> bool {
+	return chat.worker_escaped
 }
 
 // chat_session_steer records a queued line as a user entry at a request
