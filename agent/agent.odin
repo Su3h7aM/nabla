@@ -77,7 +77,7 @@ chat_session_tool_effect :: proc(chat: ^Chat_Session) -> Chat_Effect {
 // calling advance twice proposes the same work twice and launches or writes nothing.
 chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
 	switch chat.state {
-	case .Idle, .Requesting, .Streaming:
+	case .Idle, .Requesting:
 		return chat_effect_none()
 	case .Executing_Tools:
 		return chat_session_tool_effect(chat)
@@ -161,7 +161,6 @@ chat_report_terminal :: proc(observer: Chat_Observer, finish: Chat_Effect) {
 // belongs to the running request.
 chat_session_feed_text :: proc(chat: ^Chat_Session, source: Chat_Event_Source, text: string) -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
-	if chat.state == .Requesting { chat.state = .Streaming }
 	append(&chat.partial_assistant, text)
 	return true
 }

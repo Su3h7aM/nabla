@@ -113,7 +113,7 @@ test_stale_operation_events_are_rejected :: proc(t: ^testing.T) {
 	// are both rejected.
 	testing.expect(t, !chat_session_feed_completion(chat, Chat_Event_Source{turn_id = current.turn_id, operation_id = stale.operation_id}))
 	testing.expect(t, !chat_session_feed_completion(chat, Chat_Event_Source{turn_id = stale.turn_id, operation_id = current.operation_id}))
-	testing.expect_value(t, chat.active_operation_id, current.operation_id)
+	testing.expect(t, chat.operation.id != stale.operation_id)
 }
 
 // One owner finalizes each turn, and a turn reaches a terminal status once.

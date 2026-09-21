@@ -41,7 +41,6 @@ Chat_State :: enum {
 	Idle,
 	Preparing,
 	Requesting,
-	Streaming,
 	Executing_Tools,
 	// Cancellation requested; the turn settles only once its operation retires.
 	Cancelling,
@@ -83,13 +82,12 @@ Chat_Session :: struct {
 	terminal_status:              Chat_Terminal_Status,
 	last_error:                   string, // owned
 
-	// active_turn_id and the operation ids are process-local identities. They
+	// active_turn_id and the operation id are process-local identities. They
 	// name an execution, not a durable turn; turn_no is the durable one.
 	active_turn_id:               u64,
 	next_turn_id:                 u64,
 	turn_no:                      Maybe(session.Turn_No),
 	active_request:               Maybe(session.Request_No),
-	active_operation_id:          u64,
 	next_operation_id:            u64,
 	operation:                    Chat_Operation,
 
@@ -479,7 +477,7 @@ chat_session_event_source :: proc(chat: ^Chat_Session) -> Chat_Event_Source {
 chat_session_accepts_event :: proc(chat: ^Chat_Session, source: Chat_Event_Source) -> bool {
 	reason := ""
 	switch {
-	case chat.state != .Requesting && chat.state != .Streaming:
+	case chat.state != .Requesting:
 		reason = "not_receiving"
 	case chat.active_turn_id != source.turn_id:
 		reason = "superseded_turn"
@@ -508,16 +506,16 @@ chat_session_accepts_event :: proc(chat: ^Chat_Session, source: Chat_Event_Sourc
 // active turn. The operation carries identity only: the request it names runs
 // until the provider, the transport, or cancellation ends it.
 chat_session_begin_operation :: proc(chat: ^Chat_Session) {
-	chat.active_operation_id = chat.next_operation_id
+	id := chat.next_operation_id
 	chat.next_operation_id += 1
-	chat_operation_start(&chat.operation, chat.active_operation_id, chat.active_turn_id)
+	chat_operation_start(&chat.operation, id, chat.active_turn_id)
 }
 
 // chat_session_cancellable reports whether the turn still has work a cancellation
 // request could stop.
 chat_session_cancellable :: proc(chat: ^Chat_Session) -> bool {
 	switch chat.state {
-	case .Preparing, .Requesting, .Streaming, .Executing_Tools:
+	case .Preparing, .Requesting, .Executing_Tools:
 		return true
 	case .Idle, .Cancelling, .Finalizing:
 		return false
