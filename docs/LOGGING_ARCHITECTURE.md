@@ -189,6 +189,7 @@ Inside the root package:
 |---|---|
 | `app_log.odin` | environment policy, writer lifetime, run-level logger binding, health notices, `run.started` and `run.finished` |
 | `app_worker.odin` | install the worker's logger without replacing its allocator context |
+| `app_watchdog.odin` | the front-end's phase count, the stall decision, and the report a loop that stopped running leaves: the phase it stopped in, the runtime facts around it, and one record per thread with its state and wait |
 | `app_diagnostics.odin` | `nabla diagnostics <session-id>`: the reader's records to stdout, what was read and what could not be to stderr |
 | `main.odin` | the `diagnostics` subcommand, alongside `chat_cli_parse` |
 | `app_command_test.odin` | CLI parsing tests |
@@ -598,6 +599,9 @@ Minimum event contracts:
 | `provider.encoded` | Info | body length and digest, api, model, tool count |
 | `request.finished` | Info or Error | committed outcome, attempts, finish reason; failed requests use Error; failed persistence is recorded once as `storage.failed` |
 | `tools.refresh_started`, `tools.refresh_finished` | Info | generation, discovery/admission counts, unavailable servers, installed flag, duration |
+| `ui.stalled`, `runtime.thread` | Warn | the front-end's phase count stopped moving for the stall bound: the phase it entered last, whether a turn was running, whether a terminal size was reported, whether a stop was requested, and one record per thread with its state, waiting address, and syscall |
+| `ui.resumed` | Info | how long the front-end was silent before it entered a phase again, which is what separates a loop that was slow from one that was stuck |
+| `ui.viewport_unavailable` | Warn | the terminal error that stopped presentation, recorded once per episode, because a screen that stops updating without a record is indistinguishable from a run that died |
 | `tool.binding` | Debug | candidate generation, exact remote name, and canonical provider/Lua name; refresh result establishes installation |
 | `tool.call_received` | Info | the canonical tool name and the argument byte count |
 | `tool.arguments_prepared` | Debug | admission status, repair classification, effective byte count |
@@ -1282,7 +1286,10 @@ as proof that a run is alive.
   boolean or convert platform errors to strings before the owner can classify them.
 - No records are written from a fatal signal handler. SIGKILL may leave no final record.
   A missing `run.finished` may also reflect filtering, rollover, or sink failure; it does
-  not by itself prove an unclean shutdown, much less diagnose its cause.
+  not by itself prove an unclean shutdown, much less diagnose its cause. What a killed run
+  can still leave is the front-end watcher's report (`ui.stalled`, `runtime.thread`): it is
+  written while the process is alive, from a thread that holds no lock the stall could be
+  holding, so it names the phase the loop stopped in and what every thread was waiting on.
 - A malformed final line is ignored with a truncation warning. A malformed interior line is
   reported with segment and offset and skipped, never executed.
 - Cancellation is recorded as requested and observed when both are known. Terminal

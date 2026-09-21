@@ -98,6 +98,12 @@ App :: struct {
 	conv_scroll_range:  int,
 	generation_seen:    u64,
 	cancel_seen:        bool, // the running cancel came from our own keys, not a signal,
+	// viewport_reported latches the one warning a terminal that reports no size
+	// produces. The loop reads it on the front-end's thread only.
+	viewport_reported:  bool,
+	// watchdog reports a front-end loop that stops running. Its fields are published
+	// and read as atomics, so it needs no place in the runtime mutex's scope.
+	watchdog:           Watchdog,
 	spin_lap:           time.Tick, // last working-frame advance,
 	spin_frame:         int,
 	// menu is the open choice list, when menu_open. One component serves every

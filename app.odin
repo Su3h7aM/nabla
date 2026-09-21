@@ -417,6 +417,10 @@ tui_run :: proc(
 	agent.chat_interactive_arm(&app.run.signals)
 	defer agent.chat_interactive_disarm(&app.run.signals)
 
+	// The watcher reports a loop that stops returning. It is started with the
+	// worker, so a front-end that never reaches its first frame is covered too.
+	_ = watchdog_start(app)
+
 	worker := thread.create(run_worker, name = "nabla-tui-worker")
 	if worker == nil {
 		fmt.eprintln("nabla: cannot start the worker thread")
@@ -435,31 +439,52 @@ tui_run :: proc(
 
 	read_failed := false
 	for !app.quit {
+		watchdog_stage(app, .Waiting)
 		_, read_err := input.read_events(&app.parser, app.tty, &app.raw, TUI_POLL_MS)
 		if read_err != nil {
 			fmt.eprintln("nabla: input:", read_err)
 			read_failed = true
 			break
 		}
+		watchdog_stage(app, .Events)
 		for event in app.raw {
 			handle_event(app, event)
 		}
 		count := len(app.raw)
 		input.events_clear(&app.raw, app.run.alloc)
 
-		// A terminal that has not reported a size yet (ENODATA) is treated
-		// as "keep waiting": nothing can be drawn until one exists.
+		// A terminal that has reported no size cannot be drawn into: nothing may be
+		// presented until one exists, and the frame it would have drawn is dropped
+		// rather than carried over. It must not stop the rest of the iteration
+		// either. The stop check below runs on this pass too, because a front-end
+		// that silently stopped drawing and stopped listening for a quit is a
+		// process nothing but a signal can end.
+		watchdog_stage(app, .Viewport)
 		viewport, vp_err := term.viewport(app.terminal)
-		if vp_err != nil {
-			continue
+		sizable := vp_err == nil
+		resized := false
+		recovered := false
+		if sizable {
+			// A size that arrived after a reported failure owes one frame even when
+			// nothing else moved, so the screen cannot stay on the last frame it
+			// held before the terminal went quiet.
+			recovered = app.viewport_reported
+			app.viewport_reported = false
+			resized = viewport.columns != app.columns || viewport.rows != app.rows
+			app.columns, app.rows = viewport.columns, viewport.rows
+		} else {
+			report_viewport_unavailable(app, vp_err)
 		}
-		resized := viewport.columns != app.columns || viewport.rows != app.rows
-		app.columns, app.rows = viewport.columns, viewport.rows
 
 		// The working indicator animates only while a request is active, so a
-		// silent request (no stream events, tools running) still advances it.
+		// silent request (no stream events, tools running) still advances it. The
+		// runtime reads that follow wait on the mutex the worker publishes through,
+		// so they are the phase a front-end waits in rather than runs in.
+		watchdog_stage(app, .Runtime)
 		now := time.tick_now()
-		advance_spinner := runtime_busy(app) && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
+		busy := runtime_busy(app)
+		watchdog_observe(app, busy, sizable)
+		advance_spinner := busy && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
 		// A startup chooser closes once its selection applies on the worker; a menu
 		// opened from the prompt closes on submit instead, so browsing it does not
 		// dismiss it.
@@ -476,7 +501,8 @@ tui_run :: proc(
 			menu_rebuild_model(app)
 			app.menu.required = required
 		}
-		if count > 0 || resized || generation_changed(app) || advance_spinner || catalog_updated {
+		if sizable && (count > 0 || resized || recovered || generation_changed(app) || advance_spinner || catalog_updated) {
+			watchdog_stage(app, .Drawing)
 			if advance_spinner {
 				app.spin_frame = (app.spin_frame + 1) % SPINNER_FRAMES
 				app.spin_lap = now
@@ -488,6 +514,7 @@ tui_run :: proc(
 		// quit when idle. A cancel this front-end requested through a key is
 		// cleared once its turn retired, so it ends the turn only; an outside
 		// signal ends the session once the turn retired.
+		watchdog_stage(app, .Stop)
 		if agent.chat_cancel_requested() && !runtime_busy(app) {
 			if app.cancel_seen {
 				app.cancel_seen = false
@@ -510,9 +537,28 @@ tui_run :: proc(
 	return !read_failed
 }
 
+// report_viewport_unavailable says once per episode that the terminal reported no size to
+// draw into. The loop cannot present a frame without one, and not saying so left a run
+// whose screen kept its last frame, whose transcript kept the news, and whose log kept
+// nothing: a front-end waiting on a terminal that never answered looked exactly like a
+// front-end that had died. The latch clears when a size arrives, so a terminal that goes
+// quiet and comes back is reported each time it does.
+report_viewport_unavailable :: proc(app: ^App, err: term.Error) {
+	if app.viewport_reported { return }
+	app.viewport_reported = true
+	reason := fmt.tprintf("%v", err)
+	fields := [1]agent.Log_Field{{key = "viewport_error", value = reason}}
+	agent.log_emit(agent.Log_Record{level = .Warning, category = .Runtime, event = "ui.viewport_unavailable", fields = fields[:]})
+	snap_append(app, .Warning, fmt.tprintf("the terminal reports no size to draw into (%s); waiting for one", reason))
+}
+
 // app_teardown releases everything after the worker stopped. It must be
 // called at most once.
 app_teardown :: proc(app: ^App) {
+	// Stopping is the phase where a front-end waits for other threads, so the
+	// watcher covers it: a run that will not exit otherwise leaves nothing after
+	// its last frame.
+	watchdog_stage(app, .Teardown)
 	catalog_refresh_stop(app)
 	if app.run.work != {} {
 		chan.close(&app.run.work)
@@ -540,6 +586,9 @@ app_teardown :: proc(app: ^App) {
 	input.parser_destroy(&app.parser)
 	input.events_destroy(&app.raw, app.run.alloc)
 	frame_storage_destroy(app.storage)
+	// The watcher stops here: after every thread it could report has been joined,
+	// and before the log it writes to is closed.
+	watchdog_stop(app)
 	run_setup_destroy(&app.setup)
 	catalog_retired_destroy(app)
 }

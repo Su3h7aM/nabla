@@ -530,6 +530,10 @@ A subagent is a **tool** the orchestrating agent invokes. It is not a configured
   executions carry their own definition bounds instead.
 - Signals are recorded by the handler and interpreted by the loop; a handler never mutates turn
   state.
+- The frame loop interprets them on every iteration, and presentation is never a condition for
+  that: a terminal that reports no size skips the frame, not the stop check. What the front-end
+  can observe about its terminal is not a reason for a run that only a signal can end, and a
+  terminal that never reports a size says so once instead of failing silently.
 - A turn begins uncancelled, so a signal that arrived after the previous turn finished is never
   inherited.
 
