@@ -936,9 +936,22 @@ than hide the limitation in a comment.
 
 A deadline stops new execution; retirement can take longer while a backend cleans
 up. A worker thread keeps the owner responsive but cannot safely be killed in an
-arbitrary filesystem syscall. Do not free its storage or claim it retired. Report
-stopping/stuck work and retain ownership. A strict bounded process-shutdown guarantee
-for arbitrary native code requires process isolation, not another cancellation flag.
+arbitrary filesystem syscall. Do not free its storage while it is in use, and do not
+claim it retired.
+
+The implemented rule is a stop patience. `tool_jobs_note_stops` records when the owner
+first saw that a job should have stopped, from its own timeout or from a turn
+cancellation. Past `TOOL_JOBS_STOP_PATIENCE` the owner stops waiting: `tool_jobs_abandon`
+records the outcome it can observe, `unknown`, because the call dispatched and no result
+arrived, and hands the job back to its worker. That worker owns the job's storage from
+then on and releases it when it returns, which is what keeps a call that ignores
+cancellation from leaking. Job threads are created with the runtime's self-cleanup flag,
+so the owner never has to join one: a batch can end while a call is still running, and
+the runtime removes the thread when it exits. A job's own mutex is the handoff: the worker
+publishes or releases through it, the owner marks the handoff through it, and the owner
+stops touching a job it handed back. A thread that never returns at all leaves its
+storage to the process exit, and a strict bound for arbitrary native code needs process
+isolation, not another cancellation flag.
 
 ### 13.3 Restricted Lua, not an OS sandbox
 
@@ -1235,9 +1248,17 @@ raised by Code Mode itself before the generic oversized replacement can hide whi
 value was too large.
 
 Still to implement from section 12: the `unfinished_tasks` kind for the concurrent-handle
-form. The batch's admission budget and its reason to exist are settled, and a script that
-reaches it gets `tool_call_limit`. Child-call summaries are implemented and are what make
-a child's durable result reachable from the model.
+form, and `tasks.start`, `tasks.await`, and `tasks.cancel` themselves. The batch's admission
+budget and its reason to exist are settled, and a script that reaches it gets
+`tool_call_limit`. Child-call summaries are implemented and are what make a child's durable
+result reachable from the model.
+
+A call that ignores its stop is answered rather than waited for (section 13.2). The owner
+records the `unknown` outcome the harness observed and hands the job to its worker, which
+releases it when it returns; the batch then settles without that call. `tool.stop_requested`
+names when the stop was first observed, and `tool.job_stuck` names the call that outlived it.
+The handoff uses a job's own mutex rather than the table's, because the worker has to be able
+to finish after the batch, and the session that owned it, are gone.
 
 The wrapper and `print` contracts are enforced in the same place the arguments are
 converted. A wrapper takes no argument or exactly one table of named arguments, and

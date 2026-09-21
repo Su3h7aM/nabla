@@ -1,6 +1,7 @@
 package agent
 
 import "core:os"
+import "core:time"
 
 import "nabla:agent/session"
 
@@ -39,8 +40,10 @@ chat_tool_jobs_step :: proc(chat: ^Chat_Session, observer: Chat_Observer, effect
 		tool_jobs_commit(&chat.tool_jobs, chat, observer)
 	case .Refuse:
 		tool_jobs_refuse(&chat.tool_jobs)
+	case .Abandon:
+		tool_jobs_abandon(&chat.tool_jobs, chat, observer, time.tick_now())
 	case .Retire:
-		tool_jobs_retire(&chat.tool_jobs)
+		tool_jobs_retire(&chat.tool_jobs, time.tick_now())
 	case .Dispatch:
 		tool_jobs_dispatch(&chat.tool_jobs, chat)
 	case .Wait, .Done:
@@ -78,13 +81,16 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 	tool_jobs_submit(&jobs, chat, observer)
 	for {
 		tool_jobs_latch_stop(&jobs, chat)
-		switch tool_jobs_next(&jobs) {
+		now := time.tick_now()
+		switch tool_jobs_next(&jobs, now) {
 		case .Commit:
 			tool_jobs_commit(&jobs, chat, observer)
 		case .Refuse:
 			tool_jobs_refuse(&jobs)
+		case .Abandon:
+			tool_jobs_abandon(&jobs, chat, observer, now)
 		case .Retire:
-			tool_jobs_retire(&jobs)
+			tool_jobs_retire(&jobs, now)
 		case .Dispatch:
 			tool_jobs_dispatch(&jobs, chat)
 		case .Wait:

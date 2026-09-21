@@ -2,6 +2,7 @@ package agent
 
 import "core:fmt"
 import "core:mem"
+import "core:time"
 
 import "nabla:agent/session"
 import "nabla:ai"
@@ -49,9 +50,9 @@ chat_session_tool_effect :: proc(chat: ^Chat_Session) -> Chat_Effect {
 		return Chat_Effect{kind = .Run_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}
 	}
 	tool_jobs_latch_stop(&chat.tool_jobs, chat)
-	next := tool_jobs_next(&chat.tool_jobs)
+	next := tool_jobs_next(&chat.tool_jobs, time.tick_now())
 	switch next {
-	case .Commit, .Refuse, .Retire, .Dispatch:
+	case .Commit, .Refuse, .Abandon, .Retire, .Dispatch:
 		return Chat_Effect{kind = .Step_Tools, turn_id = chat.active_turn_id, tool = next, allocator = chat.allocator}
 	case .Wait:
 		return Chat_Effect{kind = .Wait_Tools, turn_id = chat.active_turn_id, allocator = chat.allocator}

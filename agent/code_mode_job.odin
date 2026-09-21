@@ -203,7 +203,9 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 	}
 	defer delete(arguments, parent.allocator)
 
-	child, alloc_error := mem.new(Tool_Job, jobs.allocator)
+	// The job struct comes from the same heap as its data: a worker releases a job the owner
+	// handed back, so that allocation has to outlive the batch and its session.
+	child, alloc_error := mem.new(Tool_Job, jobs.worker_allocator)
 	if alloc_error != nil {
 		parent.result = code_mode_job_failure(parent, .Tool_Failed, .Unavailable, "the nested tool call could not be allocated", "allocation failed")
 		parent.result_present = true

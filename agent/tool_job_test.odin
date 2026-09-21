@@ -96,15 +96,23 @@ tool_job_test_register :: proc(t: ^testing.T, test: ^Tool_Test, definition: Tool
 // tool_job_test_step performs exactly one effect and reports which one it was, so a
 // test can assert the decision before its consequence exists.
 tool_job_test_step :: proc(test: ^Tool_Test, jobs: ^Tool_Jobs) -> Tool_Job_Effect {
+	return tool_job_test_step_at(test, jobs, time.tick_now())
+}
+
+// tool_job_test_step_at is the same step with the owner's clock supplied, so a test can
+// reach the stop patience without waiting it out.
+tool_job_test_step_at :: proc(test: ^Tool_Test, jobs: ^Tool_Jobs, now: time.Tick) -> Tool_Job_Effect {
 	chat := &test.fixture.chat
-	effect := tool_jobs_next(jobs)
+	effect := tool_jobs_next(jobs, now)
 	switch effect {
 	case .Commit:
 		tool_jobs_commit(jobs, chat, {})
 	case .Refuse:
 		tool_jobs_refuse(jobs)
+	case .Abandon:
+		tool_jobs_abandon(jobs, chat, {}, now)
 	case .Retire:
-		tool_jobs_retire(jobs)
+		tool_jobs_retire(jobs, now)
 	case .Dispatch:
 		tool_jobs_dispatch(jobs, chat)
 	case .Wait:
@@ -124,6 +132,35 @@ tool_job_test_drain :: proc(t: ^testing.T, test: ^Tool_Test, jobs: ^Tool_Jobs) {
 		if tool_job_test_step(test, jobs) == .Done { return }
 	}
 	testing.fail_now(t, "the batch never settled")
+}
+
+// --- a call that ignores its stop ----------------------------------------------
+
+// A deaf tool never looks at its control: it keeps working until the test releases it,
+// which is what a backend stuck in a syscall looks like to the owner. The counters are
+// package-level because the executor's signature is fixed and tests run serially.
+tool_job_deaf_running: i32
+tool_job_deaf_release: i32
+tool_job_deaf_returned: i32
+
+tool_job_deaf_reset :: proc() {
+	sync.atomic_store(&tool_job_deaf_running, i32(0))
+	sync.atomic_store(&tool_job_deaf_release, i32(0))
+	sync.atomic_store(&tool_job_deaf_returned, i32(0))
+}
+
+tool_job_deaf_release_all :: proc() {
+	sync.atomic_store(&tool_job_deaf_release, i32(1))
+}
+
+tool_job_deaf_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+	sync.atomic_add(&tool_job_deaf_running, 1)
+	for sync.atomic_load(&tool_job_deaf_release) == 0 {
+		time.sleep(time.Millisecond)
+	}
+	sync.atomic_add(&tool_job_deaf_running, -1)
+	sync.atomic_store(&tool_job_deaf_returned, i32(1))
+	return tool_result_success(ctx, Tool_Empty{}, "late")
 }
 
 // tool_job_test_hold_until waits for count held executions to be inside the executor,
@@ -356,7 +393,7 @@ test_a_worker_placed_call_runs_on_another_thread :: proc(t: ^testing.T) {
 	testing.expect(t, tool_job_hold_thread_id() != i64(linux.gettid()), "the call must not run on the owner's thread")
 	testing.expect_value(t, jobs.jobs[0].phase, Tool_Job_Phase.Running)
 	// The only thing left to do is wait: the call owns the lane and the owner.
-	testing.expect_value(t, tool_jobs_next(&jobs), Tool_Job_Effect.Wait)
+	testing.expect_value(t, tool_jobs_next(&jobs, time.tick_now()), Tool_Job_Effect.Wait)
 
 	tool_job_hold_release_all()
 	tool_job_test_drain(t, &test, &jobs)
@@ -463,11 +500,83 @@ test_running_calls_are_bounded :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, queued, 1)
 	// What is left is a wait, not a dispatch: the bound is real, not a preference.
-	testing.expect_value(t, tool_jobs_next(&jobs), Tool_Job_Effect.Wait)
+	testing.expect_value(t, tool_jobs_next(&jobs, time.tick_now()), Tool_Job_Effect.Wait)
 
 	tool_job_hold_release_all()
 	tool_job_test_drain(t, &test, &jobs)
 	testing.expect_value(t, jobs.committed, len(names))
+}
+
+// A call that ignores its stop is answered rather than waited for: the turn is not stuck
+// behind a backend that will not return, and the call is recorded as the unknown outcome
+// the harness actually observed. The job is handed to its worker, which releases every byte
+// of it when it returns, so a backend that ignored cancellation leaves no leak behind.
+@(test)
+test_a_call_that_ignores_its_stop_is_answered_and_released :: proc(t: ^testing.T) {
+	tool_job_deaf_reset()
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_deaf", nil, tool_job_deaf_execute))
+	_test_stage_call(t, chat, "call_deaf", `{}`, "test_deaf")
+
+	// The batch's own heap is tracked, so the test can hold the worker to releasing the job
+	// it took over.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+
+	jobs: Tool_Jobs
+	tool_jobs_init(&jobs, chat, len(chat.pending_calls), mem.tracking_allocator(&track))
+	defer tool_jobs_destroy(&jobs)
+	tool_jobs_submit(&jobs, chat, {})
+
+	// The owner's clock is supplied, so the stop patience passes without waiting it out.
+	started := time.tick_now()
+	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, started), Tool_Job_Effect.Dispatch)
+	for sync.atomic_load(&tool_job_deaf_running) == 0 { time.sleep(time.Millisecond) }
+
+	chat_cancel_request()
+	defer chat_cancel_reset()
+	tool_jobs_latch_stop(&jobs, chat)
+	// The stop is observed at the tick it was asked for, and the call is still running, so
+	// there is nothing to do but wait for it.
+	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, started), Tool_Job_Effect.Wait)
+	testing.expect(t, jobs.jobs[0].stopping, "the batch should have observed that the call must stop")
+
+	// Past the patience the call is answered with what the harness can say about it.
+	late := time.tick_add(started, TOOL_JOBS_STOP_PATIENCE + time.Millisecond)
+	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Abandon)
+	testing.expect_value(t, jobs.jobs[0].phase, Tool_Job_Phase.Stuck)
+	testing.expect_value(t, jobs.committed, 1)
+	testing.expect(t, tool_jobs_settled(&jobs), "the batch must settle without its stuck call")
+	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Done)
+	testing.expect_value(t, sync.atomic_load(&tool_job_deaf_running), i32(1))
+
+	entries := _test_entries(t, chat)
+	defer session.entries_destroy(entries, context.allocator)
+	results: [dynamic]session.Tool_Result_Entry
+	defer delete(results)
+	for entry in entries {
+		if result, is_result := entry.payload.(session.Tool_Result_Entry); is_result { append(&results, result) }
+	}
+	if !testing.expect_value(t, len(results), 1) { return }
+	testing.expect_value(t, results[0].outcome, session.Tool_Outcome.Unknown)
+
+	// The worker still owns the job, and it releases it on its way out.
+	tool_job_deaf_release_all()
+	for sync.atomic_load(&tool_job_deaf_returned) == 0 { time.sleep(time.Millisecond) }
+	for _ in 0 ..< 10_000 {
+		sync.mutex_guard(&track.mutex)
+		if len(track.allocation_map) == 0 { break }
+		time.sleep(time.Millisecond)
+	}
+	sync.mutex_guard(&track.mutex)
+	if !testing.expectf(t, len(track.allocation_map) == 0, "the handed-back job leaked %d allocation(s)", len(track.allocation_map)) {
+		for _, leak in track.allocation_map { testing.expectf(t, false, "leaked %v bytes at %v", leak.size, leak.location) }
+	}
+	testing.expect_value(t, len(track.bad_free_array), 0)
 }
 
 // A cancelled turn still answers every committed call: the running call is stopped
@@ -558,8 +667,11 @@ test_an_owner_placed_call_takes_no_worker_slot :: proc(t: ^testing.T) {
 	testing.expect_value(t, jobs.committed, len(names) + 1)
 }
 
-// Release is complete: every worker is joined, every job-owned byte comes back to the
-// allocator that handed it out, and the recorded results survive in the store.
+// Release is complete: every worker has finished, every job-owned byte comes back to the
+// allocator that handed it out, and the recorded results survive in the store. A finished
+// worker is observed through the job it published rather than through its thread: the
+// thread releases itself, which is what lets the owner give up on a call that ignores its
+// stop without leaking the thread.
 @(test)
 test_a_settled_batch_releases_every_thread_and_byte :: proc(t: ^testing.T) {
 	tool_job_hold_reset()
@@ -590,7 +702,6 @@ test_a_settled_batch_releases_every_thread_and_byte :: proc(t: ^testing.T) {
 
 	for job in jobs.jobs {
 		testing.expect_value(t, job.phase, Tool_Job_Phase.Retired)
-		testing.expect(t, job.worker == nil, "the worker must be joined and released")
 		testing.expect(t, !job.result_present, "the result must be released with the job")
 	}
 	testing.expect_value(t, jobs.active, 0)

@@ -609,6 +609,8 @@ Minimum event contracts:
 | `tool.call_received` | Info | the canonical tool name and the argument byte count |
 | `tool.arguments_prepared` | Debug | admission status, repair classification, effective byte count |
 | `tool.dispatch_committed`, `tool.result_committed` | Info | the entry sequence the dispatch and the result were stored as, and the outcome |
+| `tool.stop_requested` | Warn | the tool and how long it is given to stop, recorded when the owner first observes that the call should have stopped, which is what starts the patience |
+| `tool.job_stuck` | Error | the tool and how long it outlived its stop, recorded when the call is answered as an unknown outcome and its job is handed to the worker that is still running it. Nothing is freed while that worker can reach it |
 | `tool.execution_started`, `tool.execution_finished` | Info | the tool and the outcome it produced |
 | `mcp.started`, `mcp.negotiated`, `mcp.stopped` | Info | server instance, protocol revision, capability summary, stop reason |
 | `mcp.exchange_started`, `mcp.exchange_finished` | Info | method, remote name for a call, delivery state from `mcp.Error.delivery`, duration |
