@@ -242,6 +242,11 @@ chat_session_worker_escaped :: proc(chat: ^Chat_Session) -> bool {
 	return chat.worker_escaped
 }
 
+// CHAT_WORKER_ESCAPED_NOTICE is what a front-end shows for that condition. The runtime is
+// stopping and teardown will not release what the worker can reach, so there is nothing
+// for the user to do but exit.
+CHAT_WORKER_ESCAPED_NOTICE :: "a tool call did not stop; the harness must exit"
+
 // chat_session_steer records a queued line as a user entry at a request
 // boundary. Unlike accept_user it starts no turn and resets no budget: the turn
 // keeps its identity and its counters, so steering changes what the next request

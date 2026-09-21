@@ -167,12 +167,12 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 		fmt.eprintln("nabla: the session is already running")
 		return false
 	case .Worker_Escaped:
-		fmt.eprintln("nabla: a tool call did not stop; the harness must exit")
+		fmt.eprintln("nabla:", agent.CHAT_WORKER_ESCAPED_NOTICE)
 		return false
 	}
 	completed := agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), headless_observer(out), nil)
 	if agent.chat_session_worker_escaped(&app.setup.session) {
-		fmt.eprintln("nabla: a tool call did not stop; the harness must exit")
+		fmt.eprintln("nabla:", agent.CHAT_WORKER_ESCAPED_NOTICE)
 		return false
 	}
 	return completed

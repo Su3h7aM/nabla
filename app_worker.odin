@@ -153,7 +153,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
 			return
 		case .Worker_Escaped:
-			snap_append(app, .Error, "a tool call did not stop; the harness is shutting down")
+			snap_append(app, .Error, agent.CHAT_WORKER_ESCAPED_NOTICE)
 			stop_runtime(app)
 			return
 		case .Busy:
@@ -179,7 +179,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		// generation, and backends. Nothing else may run in this process: the runtime stops,
 		// and teardown leaves what that worker can reach to process exit.
 		if agent.chat_session_worker_escaped(&app.setup.session) {
-			snap_append(app, .Error, "a tool call did not stop; the harness is shutting down")
+			snap_append(app, .Error, agent.CHAT_WORKER_ESCAPED_NOTICE)
 			stop_runtime(app)
 			return
 		}
