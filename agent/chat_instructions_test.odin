@@ -144,6 +144,36 @@ test_a_written_snapshot_restores_the_root_each_skill_came_from :: proc(t: ^testi
 	testing.expect(t, len(loaded.body) > 0, "the restored skill has no body")
 }
 
+// A snapshot written before the manifest recorded the catalog's own roots names the launch's
+// configured roots, so its skills can point at a root that does not hold them. Applying it
+// has to place each skill on the root it is in: the pairing decides whether a local skill may
+// be read, and which origin the model is told it came from.
+@(test)
+test_a_snapshot_the_old_writer_recorded_is_repaired :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, "/tmp")
+	defer chat_test_end(t, &fixture)
+
+	manifest :=
+		`{"version":2,"workspace":"/tmp","disable_project":false,` +
+		`"tools_enabled":true,"metadata_format":1,"instruction_bytes":13,` +
+		`"roots":[{"kind":"local","path":"/tmp/.agents/skills","authority":"/tmp"},` +
+		`{"kind":"generic_user","path":"/tmp/home/.agents/skills","authority":""}],` +
+		`"agents":[],"skills":[{"name":"unslop","description":"cut the tells",` +
+		`"logical_path":"/tmp/home/.agents/skills/unslop/SKILL.md",` +
+		`"directory":"/tmp/home/.agents/skills/unslop",` +
+		`"root_index":0,"metadata_digest":"0000000000000000000000000000000000000000000000000000000000000000"}],` +
+		`"diagnostics":[],"omitted_diagnostics":0,"inline_catalog_truncated":false}`
+	if !testing.expect(t, chat_apply_snapshot(&fixture.chat, "instructions!", manifest)) { return }
+	catalog, has_catalog := &fixture.chat.skill_catalog.?
+	if !testing.expect(t, has_catalog, "the snapshot installed no catalog") { return }
+	if len(catalog.skills) != 1 { testing.fail_now(t, "the restored catalog lost the skill") }
+
+	skill := catalog.skills[0]
+	if !testing.expect(t, skill.root_index == 1, "the skill kept a root that does not hold it") { return }
+	testing.expect_value(t, skill_source_label(catalog, skill), "generic user")
+}
+
 // chat_instructions_test_skill installs one valid skill in a root, so a test can discover
 // a catalog that holds it.
 chat_instructions_test_skill :: proc(t: ^testing.T, root, name: string) {

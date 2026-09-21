@@ -580,6 +580,13 @@ It records:
 - Catalog exposure mode, either inline or tool-only.
 - Discovery diagnostics and selected-fallback provenance.
 
+Applying a snapshot written by an earlier build, whose root list is the launch's
+configured one, rebinds each skill to the recorded root that holds its directory.
+The recorded directory decides the origin a skill is reported from and whether a
+local skill may be read at all, so the rebind is what keeps those sessions
+usable. A skill no recorded root holds keeps its pairing and fails its load by
+name rather than being read through a guessed root.
+
 Do not duplicate complete AGENTS.md bodies inside the manifest. Their exact text
 is already in `instructions`; byte offsets refer to the original inserted text,
 not to source paths that would have to be reread. Validate offsets on decode.

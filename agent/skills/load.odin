@@ -80,6 +80,8 @@ read_control_timed_out :: proc(control: Read_Control) -> bool {
 	return control.has_deadline && time.tick_since(control.deadline) >= 0
 }
 
+// path_within reports whether path is authority itself or a directory inside it. An empty
+// authority holds nothing, and a prefix that stops inside a name does not count.
 path_within :: proc(path, authority: string) -> bool {
 	if authority == "" || path == authority { return path == authority }
 	if !strings.has_prefix(path, authority) { return false }

@@ -236,13 +236,16 @@ chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: st
 			metadata_digest = skill_digest_parse(entry.metadata_digest),
 		}
 	}
+	// The manifest records each root's canonical directory, which is what says whether a root
+	// holds a skill. A restored root has no configured logical path.
 	for entry, index in manifest.roots {
 		catalog.roots[index] = skills.Root {
-			source       = instruction_manifest_source(entry.kind),
-			logical_path = strings.clone(entry.path, chat.allocator),
-			authority    = strings.clone(entry.authority, chat.allocator),
+			source    = instruction_manifest_source(entry.kind),
+			path      = strings.clone(entry.path, chat.allocator),
+			authority = strings.clone(entry.authority, chat.allocator),
 		}
 	}
+	chat_rebind_skill_roots(&catalog)
 	for entry, index in manifest.diagnostics {
 		catalog.diagnostics[index] = skills.Diagnostic {
 			kind       = skills.Diagnostic_Kind(entry.kind),
@@ -259,6 +262,31 @@ chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: st
 	chat.skill_instructions = strings.clone(instructions, chat.allocator)
 	applied = true
 	return true
+}
+
+// chat_rebind_skill_roots puts each restored skill back on the root that holds it. A
+// snapshot written before the manifest recorded the catalog's own roots lists the launch's
+// configured roots instead, so a root_index can name a different one: the pairing decides
+// whether a local skill may be read and which origin is reported, and a skill paired with a
+// root it is not in is refused as outside that root's scope. The directory each skill was
+// found in is the evidence that places it, and a skill no recorded root holds keeps its
+// pairing, so its load still fails by name rather than reading through a guessed root.
+chat_rebind_skill_roots :: proc(catalog: ^skills.Catalog) {
+	for &skill in catalog.skills {
+		if chat_skill_root_holds(skill, catalog.roots) { continue }
+		for root, index in catalog.roots {
+			if root.path != "" && skills.path_within(skill.directory, root.path) {
+				skill.root_index = index
+				break
+			}
+		}
+	}
+}
+
+// chat_skill_root_holds reports whether the recorded pairing places a skill in its root.
+chat_skill_root_holds :: proc(skill: skills.Skill, roots: []skills.Root) -> bool {
+	if skill.root_index < 0 || skill.root_index >= len(roots) { return false }
+	return skills.path_within(skill.directory, roots[skill.root_index].path)
 }
 
 instruction_manifest_source :: proc(kind: string) -> skills.Source_Kind {
