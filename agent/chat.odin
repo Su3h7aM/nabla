@@ -130,6 +130,108 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	}
 }
 
+// Chat_Attempt_Observation is what one model send observed: the operation's own error and
+// the runtime facts the recovery policy reads. The error owns its evidence and transfers
+// to the caller.
+Chat_Attempt_Observation :: struct {
+	error:               ai.Provider_Operation_Error,
+	finish_reason:       ai.Provider_Finish_Reason,
+	text_exposed:        bool,
+	completion_accepted: bool,
+}
+
+// chat_perform_attempt performs one model send and reports what it observed. It owns the
+// per-attempt runtime and provider observation, so a retry cannot inherit the previous
+// attempt's finish reason, exposure, or byte count. It decides nothing: the caller reads
+// the returned facts into the recovery policy.
+@(private)
+chat_perform_attempt :: proc(
+	chat: ^Chat_Session,
+	connection: ai.Provider_Connection,
+	encoded: ai.Provider_Encoded_Request,
+	websocket_request: bool,
+	observer: Chat_Observer,
+	usages: ^[dynamic]Chat_Request_Usage,
+	source: Chat_Event_Source,
+	options: ai.Provider_Operation_Options,
+) -> Chat_Attempt_Observation {
+	runtime := Chat_Runtime_Context {
+		chat      = chat,
+		source    = source,
+		observer  = observer,
+		usage_log = usages,
+	}
+	log_emit({level = .Info, category = .Provider, event = "attempt.started"})
+
+	// The observation belongs to this attempt: a retry that receives no chunk must not
+	// inherit the previous attempt's byte count. It is only attached when something will
+	// come of it, so a run with diagnostics off and capture off pays nothing per chunk.
+	provider_log: Provider_Log
+	attempt_options := options
+	if log_observation_wanted() { attempt_options.observer = provider_log_observer(&provider_log) } else { attempt_options.observer = {} }
+
+	at := time.tick_now()
+	operation_error: ai.Provider_Operation_Error
+	if websocket_request {
+		operation_error = ai.Provider_WebSocket_Request(chat.provider_websocket, encoded, &runtime, chat_provider_event, attempt_options)
+	} else {
+		operation_error = ai.Provider_Request_Operation_Encoded(connection, encoded, &runtime, chat_provider_event, attempt_options, chat.allocator)
+	}
+	// The response artifact covers the whole attempt, so it is settled as soon as the bytes
+	// stop arriving. A cut-short stream is kept and marked incomplete.
+	if provider_log.response_capture.kind != .Invalid {
+		log_capture_finish(&provider_log.response_capture, operation_error.kind == .None)
+	}
+	// The transport's own account of the attempt goes beside the provider's, because "the
+	// peer refused the request" and "nothing ever left this machine" are different findings
+	// the high-level transport error cannot separate.
+	transfer_phase := "not_reached"
+	request_bytes_accepted := i64(0)
+	request_body_bytes_accepted := i64(0)
+	request_complete := false
+	response_head_received := false
+	declared_body_bytes := i64(0)
+	declared_body_bytes_present := false
+	if provider_log.transfer_seen {
+		transfer_phase = log_provider_transfer_name(provider_log.transfer.stopped_at)
+		request_bytes_accepted = i64(provider_log.transfer.request_bytes_accepted)
+		request_body_bytes_accepted = i64(provider_log.transfer.request_body_bytes_accepted)
+		request_complete = provider_log.transfer.request_complete
+		response_head_received = provider_log.transfer.response_head_received
+		declared_body_bytes = i64(provider_log.transfer.declared_body_bytes)
+		declared_body_bytes_present = provider_log.transfer.declared_body_bytes_present
+	}
+	delivery_name := ai.provider_delivery_state_name(operation_error.delivery)
+	if websocket_request && operation_error.kind == .None { delivery_name = ai.provider_delivery_state_name(.Terminal_Observed) }
+	finished := [14]Log_Field {
+		{key = "error_kind", value = ai.provider_operation_error_name(operation_error.kind)},
+		{key = "delivery", value = delivery_name},
+		{key = "finish_reason", value = chat_finish_reason_text(runtime.finish_reason)},
+		{key = "status", value = i64(operation_error.status)},
+		// The provider's own message, which for a refused request is the only thing that
+		// says why. The transport bounds what it reads, so this is bounded text.
+		{key = "detail", value = operation_error.detail},
+		{key = "response_bytes", value = i64(provider_log.response_bytes)},
+		{key = "transfer_phase", value = transfer_phase},
+		{key = "request_bytes_accepted", value = request_bytes_accepted},
+		{key = "request_body_bytes_accepted", value = request_body_bytes_accepted},
+		{key = "request_complete", value = request_complete},
+		{key = "response_head_received", value = response_head_received},
+		// Presence stays separate from the value: a declared empty body and an undeclared
+		// one are different facts.
+		{key = "declared_body_bytes_present", value = declared_body_bytes_present},
+		{key = "declared_body_bytes", value = declared_body_bytes},
+		{key = "elapsed_ms", value = log_duration_ms(time.tick_since(at))},
+	}
+	log_emit({level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})
+	return {
+		error               = operation_error,
+		finish_reason       = runtime.finish_reason,
+		text_exposed        = runtime.text_exposed,
+		completion_accepted = runtime.completion_accepted,
+	}
+}
+
 // --- running a request -------------------------------------------------------
 
 // chat_request_transport chooses the wire transport for one request chain and freezes the
@@ -401,78 +503,11 @@ chat_perform_request :: proc(
 		// The runtime belongs to one attempt: a retry that produces nothing must not
 		// inherit the finish reason of the attempt before it, nor the record that the
 		// assistant block was already announced.
-		runtime := Chat_Runtime_Context {
-			chat      = chat,
-			source    = source,
-			observer  = observer,
-			usage_log = usages,
-		}
-		log_emit({level = .Info, category = .Provider, event = "attempt.started"})
-
-		// The observation belongs to this attempt: a retry that receives no chunk
-		// must not inherit the previous attempt's byte count. It is only attached
-		// when something will come of it, so a run with diagnostics off and capture
-		// off pays nothing per chunk.
-		provider_log: Provider_Log
-		if log_observation_wanted() { options.observer = provider_log_observer(&provider_log) } else { options.observer = {} }
-
-		at := time.tick_now()
-		if websocket_request {
-			operation_error = ai.Provider_WebSocket_Request(chat.provider_websocket, encoded, &runtime, chat_provider_event, options)
-		} else {
-			operation_error = ai.Provider_Request_Operation_Encoded(connection, encoded, &runtime, chat_provider_event, options, chat.allocator)
-		}
-		finish_reason = runtime.finish_reason
-		text_exposed = runtime.text_exposed
-		completion_accepted = runtime.completion_accepted
-		// The response artifact covers the whole attempt, so it is settled as soon as
-		// the bytes stop arriving. A cut-short stream is kept and marked incomplete.
-		if provider_log.response_capture.kind != .Invalid {
-			log_capture_finish(&provider_log.response_capture, operation_error.kind == .None)
-		}
-		// The transport's own account of the attempt goes beside the provider's,
-		// because "the peer refused the request" and "nothing ever left this machine"
-		// are different findings that the high-level transport error cannot separate.
-		transfer_phase := "not_reached"
-		request_bytes_accepted := i64(0)
-		request_body_bytes_accepted := i64(0)
-		request_complete := false
-		response_head_received := false
-		declared_body_bytes := i64(0)
-		declared_body_bytes_present := false
-		if provider_log.transfer_seen {
-			transfer_phase = log_provider_transfer_name(provider_log.transfer.stopped_at)
-			request_bytes_accepted = i64(provider_log.transfer.request_bytes_accepted)
-			request_body_bytes_accepted = i64(provider_log.transfer.request_body_bytes_accepted)
-			request_complete = provider_log.transfer.request_complete
-			response_head_received = provider_log.transfer.response_head_received
-			declared_body_bytes = i64(provider_log.transfer.declared_body_bytes)
-			declared_body_bytes_present = provider_log.transfer.declared_body_bytes_present
-		}
-		delivery_name := ai.provider_delivery_state_name(operation_error.delivery)
-		if websocket_request && operation_error.kind == .None { delivery_name = ai.provider_delivery_state_name(.Terminal_Observed) }
-		finished := [14]Log_Field {
-			{key = "error_kind", value = ai.provider_operation_error_name(operation_error.kind)},
-			{key = "delivery", value = delivery_name},
-			{key = "finish_reason", value = chat_finish_reason_text(runtime.finish_reason)},
-			{key = "status", value = i64(operation_error.status)},
-			// The provider's own message, which for a refused request is the only
-			// thing that says why. The transport bounds what it reads, so this is
-			// bounded text, not an unbounded body.
-			{key = "detail", value = operation_error.detail},
-			{key = "response_bytes", value = i64(provider_log.response_bytes)},
-			{key = "transfer_phase", value = transfer_phase},
-			{key = "request_bytes_accepted", value = request_bytes_accepted},
-			{key = "request_body_bytes_accepted", value = request_body_bytes_accepted},
-			{key = "request_complete", value = request_complete},
-			{key = "response_head_received", value = response_head_received},
-			// Presence stays separate from the value: a declared empty body and an
-			// undeclared one are different facts.
-			{key = "declared_body_bytes_present", value = declared_body_bytes_present},
-			{key = "declared_body_bytes", value = declared_body_bytes},
-			{key = "elapsed_ms", value = log_duration_ms(time.tick_since(at))},
-		}
-		log_emit({level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})
+		observation := chat_perform_attempt(chat, connection, encoded, websocket_request, observer, usages, source, options)
+		operation_error = observation.error
+		finish_reason = observation.finish_reason
+		text_exposed = observation.text_exposed
+		completion_accepted = observation.completion_accepted
 		// The send is over, so the policy answers from the facts the layers observed: what
 		// the operation reported, what this attempt exposed, and whether the turn or the
 		// store had already failed.
