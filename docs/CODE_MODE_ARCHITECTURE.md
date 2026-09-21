@@ -1185,6 +1185,10 @@ integers, finite JSON numbers, string-keyed objects, and dense one-based arrays.
 empty table is an object. It
 rejects unsupported Lua types, cycles, mixed tables, sparse arrays, excessive depth,
 and more than 16,384 traversed values. Lua strings retain their explicit length, and
+every string and table key must be valid UTF-8, because a JSON document is UTF-8 and an
+endpoint refuses one that is not. The boundary is where that is decided rather than
+where a provider discovers it. An embedded NUL is a byte like any other and survives as
+an escape, never silently cut.
 JSON encoding remains the boundary that validates whether the copied value can be
 represented. Result construction runs inside the Lua boundary's reserved host memory.
 JSON null is delivered as the same `json.null` identity rather than Lua nil, so null

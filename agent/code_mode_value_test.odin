@@ -113,6 +113,52 @@ return "done"`,
 	testing.expect_value(t, lines[2], "<table>")
 }
 
+// A JSON document is UTF-8, and an endpoint refuses one that is not. A Lua string is
+// bytes, so the boundary is where that is decided rather than discovered by a provider.
+// A NUL is a byte like any other and survives as an escape, never silently cut.
+@(test)
+code_mode_value_requires_utf8_at_the_boundary :: proc(t: ^testing.T) {
+	cases := []struct {
+		source: string,
+		fault:  string,
+	} {
+		{`return "bad ` + "\xff\xfe" + ` bytes"`, "a string is not valid UTF-8"},
+		{`return { [string.char(255)] = 1 }`, "a table key is not valid UTF-8"},
+		{`return tools.test_echo({ path = "` + "\xc3" + `" })`, "a string is not valid UTF-8"},
+	}
+	for c in cases {
+		run := code_mode_value_test_start(t, c.source)
+		// The tool is installed for every case, so the argument-boundary case reaches the
+		// conversion instead of failing on an absent name.
+		_ = code_mode_lua_install_tool(run, "test_echo")
+		event := code_mode_lua_resume(run)
+		if event == .Host_Request {
+			arguments, message := code_mode_lua_request_json(run, context.temp_allocator)
+			testing.expectf(t, message == c.fault, "%q should refuse with %q, got %q", c.source, c.fault, message)
+			testing.expect_value(t, arguments, "")
+		} else {
+			testing.expect_value(t, event, Lua_Event.Returned)
+			_, message := code_mode_lua_returned_json(run, context.temp_allocator)
+			testing.expectf(t, message == c.fault, "%q should refuse with %q, got %q", c.source, c.fault, message)
+		}
+		code_mode_lua_destroy(run)
+	}
+}
+
+@(test)
+code_mode_value_keeps_multibyte_text_and_nul :: proc(t: ^testing.T) {
+	run := code_mode_value_test_start(t, `return { text = "caf\xc3\xa9 \xe2\x86\x92 ok", nul = "a" .. string.char(0) .. "b" }`)
+	defer code_mode_lua_destroy(run)
+	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Returned)
+	value, message := code_mode_lua_returned_json(run, context.temp_allocator)
+	if !testing.expect_value(t, message, "") { return }
+	defer json.destroy_value(value, context.temp_allocator)
+	encoded, encode_err := json.marshal(value, allocator = context.temp_allocator)
+	if !testing.expect(t, encode_err == nil, "the value should encode") { return }
+	testing.expect(t, strings.contains(string(encoded), `café`), string(encoded))
+	testing.expect(t, strings.contains(string(encoded), `"nul":"a\u0000b"`), string(encoded))
+}
+
 @(test)
 code_mode_value_rejects_cycles :: proc(t: ^testing.T) {
 	run := code_mode_value_test_start(t, `local value = {}

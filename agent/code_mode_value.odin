@@ -5,6 +5,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
+import "core:unicode/utf8"
 import l "vendor:lua/5.4"
 
 // Code Mode crosses one value boundary: Lua values become the JSON argument document
@@ -89,8 +90,12 @@ code_mode_lua_to_json_value :: proc(L: ^l.State, index: c.int, state: ^Code_Mode
 		pointer := l.tolstring(L, index, &length)
 		if pointer == nil { return {}, "a string could not be read" }
 		bytes := cast([^]u8)pointer
-		text := strings.clone(string(bytes[:int(length)]), state.allocator)
-		return json.Value(json.String(text)), ""
+		text := string(bytes[:int(length)])
+		// A JSON document is UTF-8, and an endpoint refuses one that is not. A Lua string
+		// is bytes, so this is the boundary where that is decided rather than discovered
+		// by the provider. A NUL is a byte like any other and survives as an escape.
+		if !utf8.valid_string(text) { return {}, "a string is not valid UTF-8" }
+		return json.Value(json.String(strings.clone(text, state.allocator))), ""
 	case .LIGHTUSERDATA:
 		if state.null_identity != nil && l.touserdata(L, index) == state.null_identity {
 			return json.Value(json.Null(nil)), ""
@@ -162,7 +167,12 @@ code_mode_lua_table_to_json :: proc(L: ^l.State, index: c.int, state: ^Code_Mode
 			return {}, "a table key could not be read"
 		}
 		bytes := cast([^]u8)pointer
-		key := strings.clone(string(bytes[:int(length)]), state.allocator)
+		key := string(bytes[:int(length)])
+		if !utf8.valid_string(key) {
+			l.pop(L, 2)
+			return {}, "a table key is not valid UTF-8"
+		}
+		key = strings.clone(key, state.allocator)
 		value, message := code_mode_lua_to_json_value(L, -1, state, depth + 1)
 		l.pop(L, 1)
 		if message != "" {
