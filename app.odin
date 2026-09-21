@@ -483,6 +483,13 @@ tui_run :: proc(
 		watchdog_stage(app, .Runtime)
 		now := time.tick_now()
 		busy := runtime_busy(app)
+		// A steering line applies at a request boundary inside the turn that was running
+		// when it was typed. The turn is over by the time the runtime reports it stopped,
+		// so whatever is still queued was never applied: it goes back to the prompt as the
+		// user's own text, which is what makes an explicit submit its own decision rather
+		// than work started on their behalf.
+		if app.steer_active && !busy { restore_steering(app) }
+		app.steer_active = busy
 		watchdog_observe(app, busy, sizable)
 		advance_spinner := busy && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
 		// A startup chooser closes once its selection applies on the worker; a menu

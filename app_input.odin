@@ -448,6 +448,33 @@ submit :: proc(app: ^App) {
 	completion_reset(app)
 }
 
+// restore_steering returns input queued during a turn that ended before a request
+// boundary could apply it. The text is still the user's, so it goes back to the prompt
+// for an explicit submit; nothing here starts a turn, and nothing here reads it as a
+// command. The turn is over by the time this runs, so no boundary can take the lines
+// this one does.
+restore_steering :: proc(app: ^App) {
+	taken := agent.steer_take_all(&app.run.steer)
+	defer agent.steer_taken_destroy(&app.run.steer, taken)
+	if len(taken) == 0 { return }
+	restored, join_err := strings.join(taken[:], "\n", app.run.alloc)
+	if join_err != nil {
+		snap_append(app, .Warning, "input queued during that turn could not be restored")
+		return
+	}
+	defer delete(restored, app.run.alloc)
+	if !widgets.input_insert(&app.input, restored) {
+		snap_append(app, .Warning, "input queued during that turn could not be restored")
+		return
+	}
+	completion_reset(app)
+	if len(taken) == 1 {
+		snap_append(app, .Notice, "the line you typed while that turn ran was never applied; it is back in the prompt")
+	} else {
+		snap_append(app, .Notice, fmt.tprintf("%d lines you typed while that turn ran were never applied; they are back in the prompt", len(taken)))
+	}
+}
+
 // dispatch_command routes one slash command. The name comes from the command
 // table, so a command that completion and help know about is always one dispatch
 // can run; the switch decides what that command does. Everything else is reported

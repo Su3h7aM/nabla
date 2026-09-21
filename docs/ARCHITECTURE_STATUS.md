@@ -57,6 +57,9 @@ per-call admission refuses that call. See [tools](TOOLS_MCP_ARCHITECTURE.md).
 - Steering is a request-boundary stage: the driver applies queued input between the
 proposal of a request and the claim that counts it, and the claim refuses a turn its
 boundary stopped. See [execution](EXECUTION_ARCHITECTURE.md).
+- Unapplied steering returns to the front-end's prompt. The worker reports the turn and
+the front-end gives back whatever the turn never applied, so no leftover line starts
+work of its own.
 - Skills use the shared 64 KiB result bound; no separate exception exists.
 
 ## Future capabilities with no implementation

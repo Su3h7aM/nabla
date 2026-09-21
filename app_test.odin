@@ -287,6 +287,33 @@ test_a_scheduled_retry_is_shown_until_the_send_clears_it :: proc(t: ^testing.T) 
 	testing.expect(t, strings.has_prefix(working_label(&app), "Working for "), "clearing retry state does not reset the turn timer")
 }
 
+// Input the user queued while a turn ran, and the turn ended before a request boundary
+// could apply it, is still their text. It goes back to the prompt for an explicit submit
+// rather than starting a turn of its own, and it does not stay in the queue for a later
+// boundary to apply as well.
+@(test)
+test_unapplied_steering_returns_to_the_prompt :: proc(t: ^testing.T) {
+	app: App
+	app.run.alloc = context.allocator
+	app.run.steer = agent.steer_queue_init(app.run.alloc)
+	defer {
+		agent.steer_queue_destroy(&app.run.steer)
+		snapshot_clear(&app)
+		delete(app.run.snap.entries)
+		widgets.input_destroy(&app.input)
+	}
+	widgets.input_init(&app.input, app.run.alloc)
+
+	testing.expect(t, agent.steer_push(&app.run.steer, "check the logs"))
+	testing.expect(t, agent.steer_push(&app.run.steer, "and the config"))
+	restore_steering(&app)
+
+	testing.expect_value(t, widgets.input_text(&app.input), "check the logs\nand the config")
+	if !testing.expect_value(t, len(app.run.snap.entries), 1) { return }
+	testing.expect_value(t, app.run.snap.entries[0].kind, Entry_Kind.Notice)
+	testing.expect_value(t, agent.steer_clear(&app.run.steer), 0)
+}
+
 // A pasted block keeps its line breaks, so a multi-line paste stays the block it
 // was. CR and CRLF are read as the one break they mean and the other controls are
 // still dropped.

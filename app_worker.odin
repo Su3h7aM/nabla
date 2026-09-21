@@ -171,7 +171,9 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			apply      = app_steer_apply,
 			apply_data = app,
 		}
-		completed := agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer)
+		// How the turn ended reaches the front-end through the observer, which reports the
+		// terminal status, so the worker has nothing of its own to do with the return.
+		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer)
 		// A tool worker that ignored its stop still borrows the session's workspace, registry
 		// generation, and backends. Nothing else may run in this process: the runtime stops,
 		// and teardown leaves what that worker can reach to process exit.
@@ -180,28 +182,10 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			stop_runtime(app)
 			return
 		}
-		// A steering line applies at a request boundary inside the turn it was typed
-		// during. A turn that failed before reaching one leaves the line unapplied, and it
-		// is still the user's message: it becomes a fresh prompt, or runs as the command it
-		// is, rather than being lost under the failure that stopped it. A turn that ended
-		// any other way, cancelled or abandoned, keeps the discard its stop path promises.
-		failed := agent.chat_session_terminal_status(&app.setup.session) == .Failed
-		if !completed && failed {
-			taken := agent.steer_take_all(&app.run.steer)
-			defer agent.steer_taken_destroy(&app.run.steer, taken)
-			if len(taken) > 0 {
-				snap_append(app, .Notice, fmt.tprintf("%d line(s) queued during the failed turn are being sent", len(taken)))
-			}
-			for line in taken {
-				if strings.has_prefix(line, "/") {
-					dispatch_command(app, line)
-				} else {
-					enqueue(app, .Prompt, line)
-				}
-			}
-		} else if dropped := agent.steer_clear(&app.run.steer); dropped > 0 {
-			snap_append(app, .Warning, fmt.tprintf("%d steering line(s) arrived too late to apply; dropped", dropped))
-		}
+	// Steering lines left queued here were never applied: the turn reached no
+	// further request boundary, so nothing consumed them. Its end is the caller's
+	// to report, and the front-end returns them to the prompt when it sees the
+	// runtime stop running.
 	case .Compact:
 		set_running(app, true)
 		if runtime_stopping(app) { agent.chat_cancel_request() }

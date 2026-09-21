@@ -98,6 +98,10 @@ App :: struct {
 	conv_scroll_range:  int,
 	generation_seen:    u64,
 	cancel_seen:        bool, // the running cancel came from our own keys, not a signal,
+	// steer_active is whether the runtime was running when this thread last looked. The
+	// transition back to idle is what returns input the turn never applied to the
+	// prompt. The loop reads and writes it on the front-end's thread only.
+	steer_active:       bool,
 	// viewport_reported latches the one warning a terminal that reports no size
 	// produces. The loop reads it on the front-end's thread only.
 	viewport_reported:  bool,
