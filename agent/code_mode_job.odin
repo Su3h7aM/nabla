@@ -26,14 +26,14 @@ tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job
 
 	run, compiled := code_mode_lua_start(job.allocator, lua_limits_default(), source)
 	if run == nil {
-		job.result = code_mode_failure(&job.exec, .Tool_Failed, .Unavailable, "the Lua execution could not be created", "executor unavailable")
+		job.result = code_mode_job_failure(job, .Tool_Failed, .Unavailable, "the Lua execution could not be created", "executor unavailable")
 		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
 	job.lua = run
 	if !compiled {
-		job.result = code_mode_failure(&job.exec, .Tool_Failed, .Syntax_Error, code_mode_lua_message(run), "syntax error")
+		job.result = code_mode_job_failure(job, .Tool_Failed, .Syntax_Error, code_mode_lua_message(run), "syntax error")
 		job.result_present = true
 		job.phase = .Result_Ready
 		return
@@ -41,13 +41,46 @@ tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job
 	for &definition in chat.tools.definitions {
 		if definition.name == TOOL_CODE_NAME { continue }
 		if !code_mode_lua_install_tool(run, definition.name) {
-			job.result = code_mode_failure(&job.exec, .Tool_Failed, .Unavailable, "the Lua tool table could not be built", "executor unavailable")
+			job.result = code_mode_job_failure(job, .Tool_Failed, .Unavailable, "the Lua tool table could not be built", "executor unavailable")
 			job.result_present = true
 			job.phase = .Result_Ready
 			return
 		}
 	}
 	tool_job_lua_resume(jobs, chat, job, false)
+}
+
+// code_mode_job_failure builds a Code Mode failure envelope. The outcome says what the
+// harness observed; the diagnostic says which limit or fault Code Mode hit; and the call
+// summaries say what the script had already done.
+@(private)
+code_mode_job_failure :: proc(job: ^Tool_Job, outcome: session.Tool_Outcome, diagnostic: Code_Mode_Diagnostic, message: string, reason := "") -> Tool_Result {
+	calls, total := code_mode_job_calls(job)
+	defer delete(calls, job.allocator)
+	return tool_result_of(
+		&job.exec,
+		outcome,
+		message,
+		Code_Mode_Error_Data{kind = code_mode_diagnostic_name(diagnostic), calls = calls, calls_total = total},
+		reason,
+	)
+}
+
+// code_mode_job_calls is the script's tool calls as the result reports them. The names
+// are borrowed from the child jobs, which outlive the batch, and the returned slice is
+// owned by the caller.
+@(private)
+code_mode_job_calls :: proc(job: ^Tool_Job) -> ([]Code_Mode_Call, int) {
+	if len(job.lua_calls) == 0 { return nil, job.lua_calls_total }
+	calls := make([]Code_Mode_Call, len(job.lua_calls), job.allocator)
+	for summary, index in job.lua_calls {
+		calls[index] = Code_Mode_Call {
+			call_seq = i64(summary.seq),
+			name     = summary.child.name,
+			outcome  = session.tool_outcome_name(summary.outcome),
+		}
+	}
+	return calls, job.lua_calls_total
 }
 
 @(private)
@@ -85,7 +118,7 @@ tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Jo
 			reason = "instruction limit"
 		case .None:
 		}
-		job.result = code_mode_failure(&job.exec, outcome, diagnostic, code_mode_lua_message(job.lua), reason)
+		job.result = code_mode_job_failure(job, outcome, diagnostic, code_mode_lua_message(job.lua), reason)
 		job.result_present = true
 		job.phase = .Result_Ready
 	case .Failed:
@@ -97,7 +130,7 @@ tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Jo
 			diagnostic = .Memory_Limit
 		case .None, .Runtime:
 		}
-		job.result = code_mode_failure(&job.exec, .Tool_Failed, diagnostic, code_mode_lua_message(job.lua), "Lua failed")
+		job.result = code_mode_job_failure(job, .Tool_Failed, diagnostic, code_mode_lua_message(job.lua), "Lua failed")
 		job.result_present = true
 		job.phase = .Result_Ready
 	}
@@ -113,26 +146,28 @@ tool_job_lua_finish :: proc(job: ^Tool_Job) {
 	logs := code_mode_lua_logs(run)
 	output, message := code_mode_lua_returned_json(run, job.allocator)
 	if message != "" {
-		job.result = code_mode_failure(&job.exec, .Tool_Failed, .Invalid_Value, message, "invalid return value")
+		job.result = code_mode_job_failure(job, .Tool_Failed, .Invalid_Value, message, "invalid return value")
 		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
 	defer json.destroy_value(output, job.allocator)
+	calls, calls_total := code_mode_job_calls(job)
+	defer delete(calls, job.allocator)
 	result := tool_result_of(
 		&job.exec,
 		.Success,
 		"",
-		Code_Mode_Result_Data{output = output, logs = logs, logs_truncated = code_mode_lua_logs_truncated(run)},
+		Code_Mode_Result_Data{output = output, logs = logs, logs_truncated = code_mode_lua_logs_truncated(run), calls = calls, calls_total = calls_total},
 		"completed",
 	)
 	if len(result.content) > TOOL_MAX_RESULT_BYTES {
 		tool_result_destroy(&result)
-		job.result = code_mode_failure(
-			&job.exec,
+		job.result = code_mode_job_failure(
+			job,
 			.Tool_Failed,
 			.Output_Limit,
-			fmt.tprintf("the returned value and logs exceed the %d-byte result limit; return less from the script", TOOL_MAX_RESULT_BYTES),
+			fmt.tprintf("the returned value, logs, and call summaries exceed the %d-byte result limit; return less from the script", TOOL_MAX_RESULT_BYTES),
 			"output limit",
 		)
 		job.result_present = true
@@ -147,8 +182,8 @@ tool_job_lua_finish :: proc(job: ^Tool_Job) {
 @(private)
 tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: ^Tool_Job) {
 	if jobs.admitted >= TOOL_JOBS_MAX_ADMISSIONS {
-		parent.result = code_mode_failure(
-			&parent.exec,
+		parent.result = code_mode_job_failure(
+			parent,
 			.Tool_Failed,
 			.Tool_Call_Limit,
 			fmt.tprintf("the Code Mode execution reached this batch's limit of %d tool calls", TOOL_JOBS_MAX_ADMISSIONS),
@@ -161,7 +196,7 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 	arguments, message := code_mode_lua_request_json(parent.lua, parent.allocator)
 	if message != "" {
 		defer delete(message, parent.allocator)
-		parent.result = code_mode_failure(&parent.exec, .Invalid_Arguments, .Invalid_Value, message, "invalid child arguments")
+		parent.result = code_mode_job_failure(parent, .Invalid_Arguments, .Invalid_Value, message, "invalid child arguments")
 		parent.result_present = true
 		parent.phase = .Result_Ready
 		return
@@ -170,7 +205,7 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 
 	child, alloc_error := mem.new(Tool_Job, jobs.allocator)
 	if alloc_error != nil {
-		parent.result = code_mode_failure(&parent.exec, .Tool_Failed, .Unavailable, "the nested tool call could not be allocated", "allocation failed")
+		parent.result = code_mode_job_failure(parent, .Tool_Failed, .Unavailable, "the nested tool call could not be allocated", "allocation failed")
 		parent.result_present = true
 		parent.phase = .Result_Ready
 		return
@@ -190,7 +225,7 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 	if append_error != nil {
 		mem.free(child, jobs.allocator)
 		chat_session_record_failure(chat, "the nested tool call could not be recorded", append_error)
-		parent.result = code_mode_failure(&parent.exec, .Tool_Failed, .Unavailable, "the nested tool call could not be recorded", "storage failed")
+		parent.result = code_mode_job_failure(parent, .Tool_Failed, .Unavailable, "the nested tool call could not be recorded", "storage failed")
 		parent.result_present = true
 		parent.phase = .Result_Ready
 		return

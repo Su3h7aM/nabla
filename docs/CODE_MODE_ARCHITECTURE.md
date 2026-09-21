@@ -1206,9 +1206,18 @@ Nested results remain outside the provider context budget and do not increment t
 turn's top-level result barrier. They still pass through normal admission, dispatch,
 execution, result finalization, durable recording, observer reporting, and retirement.
 The parent result contains its return value as structured JSON, its bounded `print` log,
-and a truncation flag for that log. The integration test executes two sequential child
-calls, verifies both parent relations, and verifies that three durable results satisfy
-one provider-call barrier.
+a truncation flag for that log, and a summary of every tool call the script made. The
+integration test executes two sequential child calls, verifies both parent relations,
+and verifies that three durable results satisfy one provider-call barrier.
+
+A call summary carries the child's `call_seq`, its name, and its outcome, and the result
+reports `calls_total` separately so a truncated list still says how much a script did.
+At most 32 summaries travel with one result. This is what makes a child's full result
+reachable: the child's result is already durable, and `context_read_result` reads it back
+by the sequence the summary names. A script can therefore return a small answer and the
+model can still fetch the one full result it wants, which is the discard-and-recover
+shape that keeps a hundred calls out of the conversation. Summaries travel on failure
+too, because what a script did before it failed is how the failure is understood.
 
 A failure carries a `kind` from a closed vocabulary: `syntax_error`, `runtime_error`,
 `invalid_value`, `memory_limit`, `instruction_limit`, `tool_call_limit`,
@@ -1218,9 +1227,10 @@ observed while the kind reports which fault or limit produced it. `output_limit`
 raised by Code Mode itself before the generic oversized replacement can hide which
 value was too large.
 
-Still to implement from section 12: compact child-call summaries and the
-`unfinished_tasks` kind for the concurrent-handle form. The batch's admission budget and
-its reason to exist are settled; a script that reaches it gets `tool_call_limit`.
+Still to implement from section 12: the `unfinished_tasks` kind for the concurrent-handle
+form. The batch's admission budget and its reason to exist are settled, and a script that
+reaches it gets `tool_call_limit`. Child-call summaries are implemented and are what make
+a child's durable result reachable from the model.
 
 The wrapper and `print` contracts are enforced in the same place the arguments are
 converted. A wrapper takes no argument or exactly one table of named arguments, and

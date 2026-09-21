@@ -107,6 +107,15 @@ Tool_Job_Effect :: enum {
 	Done,
 }
 
+// Lua_Call_Summary is one child call a Code Mode execution made, as its parent reports
+// it. child is borrowed and stays valid until the batch is destroyed, because a released
+// job keeps its record and its name until then.
+Lua_Call_Summary :: struct {
+	child:   ^Tool_Job,
+	seq:     session.Seq,
+	outcome: session.Tool_Outcome,
+}
+
 // Tool_Job is one admitted call.
 Tool_Job :: struct {
 	// identity, owned by the table and stable for the job's life
@@ -124,12 +133,17 @@ Tool_Job :: struct {
 	execute:          Tool_Execute,
 
 	// Lua execution data. A nested call is embedded in its child job so the call
-	// pointer stays stable when the table grows.
+	// pointer stays stable when the table grows. lua_calls is what the parent reports
+	// about the children it ran: the owner appends one entry as each child commits, and
+	// the parent's result carries them so a model can audit a script and reach one
+	// child's full result by its sequence.
 	lua:              ^Lua_Run,
 	lua_dispatched:   bool,
 	lua_child_no:     int,
 	lua_child:        ^Tool_Job,
 	lua_child_result: string, // owned by allocator until delivered
+	lua_calls:        [dynamic]Lua_Call_Summary,
+	lua_calls_total:  int,
 	parent:           ^Tool_Job,
 	nested_call:      Chat_Tool_Call,
 	nested:           bool,
@@ -219,6 +233,7 @@ tool_job_release :: proc(job: ^Tool_Job, table_allocator: mem.Allocator) {
 		job.worker = nil
 	}
 	if job.lua != nil { code_mode_lua_destroy(job.lua) }
+	delete(job.lua_calls)
 	delete(job.lua_child_result, job.allocator)
 	if job.nested {
 		delete(job.nested_call.id, job.allocator)
@@ -626,6 +641,15 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	jobs.committed += 1
 	if !job.nested { jobs.committed_roots += 1 }
 	if job.parent != nil {
+		// What a script did is reported by its parent, so the model can audit it and read
+		// one child's full result back. The list is bounded and the count is not, because a
+		// long script is the case this exists for.
+		// The sequence is the child's call, because that is the key context_read_result
+		// takes: a reader names the call the result answers, not the result.
+		if len(job.parent.lua_calls) < CODE_MODE_MAX_CALL_SUMMARIES {
+			append(&job.parent.lua_calls, Lua_Call_Summary{child = job, seq = job.call.seq, outcome = finalized.outcome})
+		}
+		job.parent.lua_calls_total += 1
 		job.parent.lua_child_result = strings.clone(finalized.content, job.parent.allocator)
 		job.parent.lua_child = nil
 		if job.parent.lua_child_result == "" {

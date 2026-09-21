@@ -265,6 +265,75 @@ test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 	testing.expect(t, found, "the script should have answered its call")
 }
 
+// A script's result says what the script did. The summaries are what make a child's full
+// result reachable: the model reads it back from call_seq with context_read_result, so a
+// script that ran a hundred calls does not put a hundred results into the conversation.
+@(test)
+test_code_mode_reports_what_its_script_did :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_child", nil, tool_job_immediate_execute))
+	_test_stage_call(t, chat, "call_code", `{"code":"local a = tools.test_child()\nlocal b = tools.test_child()\nreturn \"done\""}`, TOOL_CODE_NAME)
+
+	jobs: Tool_Jobs
+	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
+	defer tool_jobs_destroy(&jobs)
+	tool_jobs_submit(&jobs, chat, {})
+	tool_job_test_drain(t, &test, &jobs)
+
+	entries, load_error := session.entries_load(chat.store, chat.id, {limit = session.ENTRIES_MAX_LIMIT}, context.allocator)
+	if load_error != nil { testing.fail_now(t, "entries_load failed") }
+	defer session.entries_destroy(entries, context.allocator)
+
+	// Every child call the script made, by the sequence a reader would name it by.
+	child_seqs := make([dynamic]session.Seq, 0, 4, context.temp_allocator)
+	parent_seq: session.Seq
+	for entry in entries {
+		call, is_call := entry.payload.(session.Tool_Call_Entry)
+		if !is_call { continue }
+		if call.call_id == "call_code" { parent_seq = entry.seq; continue }
+		append(&child_seqs, entry.seq)
+	}
+	if !testing.expect_value(t, len(child_seqs), 2) { return }
+
+	content := ""
+	for entry in entries {
+		result, is_result := entry.payload.(session.Tool_Result_Entry)
+		if !is_result { continue }
+		related, present := entry.related_seq.?
+		if present && related == parent_seq { content = result.content }
+	}
+	if !testing.expect(t, content != "", "the parent should have recorded its result") { return }
+
+	testing.expect(t, strings.contains(content, `"calls_total":2`), content)
+	for seq in child_seqs {
+		want := strings.concatenate({`{"call_seq":`, fmt.tprintf("%d", seq), `,"name":"test_child","outcome":"success"}`}, context.temp_allocator)
+		testing.expectf(t, strings.contains(content, want), "%s should carry %s", content, want)
+	}
+
+	// The whole point of naming the sequence: a child's full result is reachable by it,
+	// so a script can return a small answer and the model can still read back the one
+	// result it wants.
+	reader := Result_Reader {
+		store      = chat.store,
+		session_id = chat.id,
+	}
+	reader_ctx := Tool_Context {
+		call_id   = "call_read",
+		allocator = context.allocator,
+		results   = &reader,
+	}
+	read_arguments := make(json.Object, context.temp_allocator)
+	defer delete(read_arguments)
+	read_arguments["call_seq"] = json.Integer(child_seqs[0])
+	page := tool_result_read_execute(&reader_ctx, read_arguments)
+	defer tool_result_destroy(&page)
+	testing.expect_value(t, page.outcome, session.Tool_Outcome.Success)
+	testing.expect(t, strings.contains(page.content, `"status":"success"`), page.content)
+}
+
 // A worker-placed call runs on its own thread: the test thread keeps going while the
 // call is still inside the executor, and the batch is not advanced by the completion.
 @(test)

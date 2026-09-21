@@ -8,19 +8,39 @@ TOOL_CODE_NAME :: "builtin_code"
 TOOL_CODE_DESCRIPTION :: "Execute bounded Lua 5.4 code. Call an available tool through the tools table by its name, for example tools.builtin_read({path = 'README.md'}). Each call suspends the script until the tool finishes and returns its complete JSON result envelope as a Lua table. Use json.null for JSON null, because Lua nil means absence. The chunk returns at most one value, which becomes the data field of this result."
 TOOL_CODE_SCHEMA :: `{"type":"object","properties":{"code":{"type":"string","description":"Lua 5.4 source code to execute."}},"required":["code"],"additionalProperties":false}`
 
+// Code_Mode_Call is one tool call a script made, as the script's result reports it. It is
+// a summary, never the child's output: a model that wants the output reads it back from
+// call_seq with context_read_result, so a script that ran a hundred calls does not put a
+// hundred results into the conversation.
+Code_Mode_Call :: struct {
+	call_seq: i64 `json:"call_seq"`,
+	name:     string `json:"name"`,
+	outcome:  string `json:"outcome"`,
+}
+
+// CODE_MODE_MAX_CALL_SUMMARIES bounds how many child summaries a result carries. The
+// count is reported separately, so a truncated list still says how much a script did.
+CODE_MODE_MAX_CALL_SUMMARIES :: 32
+
 // Code_Mode_Result_Data is the data of an execution that finished. output is the
 // chunk's return value as JSON, so a script may answer with an object or an array as
 // easily as with a string. logs is what print produced, bounded by the Lua boundary.
+// calls is what the script's tool calls were.
 Code_Mode_Result_Data :: struct {
 	output:         json.Value `json:"output"`,
 	logs:           string `json:"logs"`,
 	logs_truncated: bool `json:"logs_truncated,omitempty"`,
+	calls:          []Code_Mode_Call `json:"calls,omitempty"`,
+	calls_total:    int `json:"calls_total,omitempty"`,
 }
 
 // Code_Mode_Error_Data is the data of an execution that failed. kind names why, so a
-// caller can branch on the failure instead of reading prose.
+// caller can branch on the failure instead of reading prose. The call summaries are kept
+// on failure too: what a script did before it failed is how the failure is understood.
 Code_Mode_Error_Data :: struct {
-	kind: string `json:"kind"`,
+	kind:        string `json:"kind"`,
+	calls:       []Code_Mode_Call `json:"calls,omitempty"`,
+	calls_total: int `json:"calls_total,omitempty"`,
 }
 
 // Code_Mode_Diagnostic is why an execution did not finish. It is a closed vocabulary
