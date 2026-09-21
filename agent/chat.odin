@@ -144,6 +144,9 @@ chat_perform_request :: proc(
 	observer: Chat_Observer,
 	usages: ^[dynamic]Chat_Request_Usage,
 ) {
+	// The selector proposed this request; claiming it here is what makes the turn
+	// start receiving and counts the request it is about to send.
+	chat_session_begin_request(chat)
 	if chat.skill_instructions == "" && !chat_ensure_instructions(chat) { return }
 	// This request has no durable number yet, and the one the previous request
 	// left behind is not its own. Clearing it here is what keeps the preparation

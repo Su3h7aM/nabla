@@ -62,8 +62,9 @@ chat_session_tool_effect :: proc(chat: ^Chat_Session) -> Chat_Effect {
 	return chat_effect_none()
 }
 
-// chat_session_advance is the control decision for the current state. It touches
-// nothing durable: the driver runs the effect and records what happened.
+// chat_session_advance selects the next effect for the current state. It is a read
+// of state, not a transition: the driver applies the transition the effect names, so
+// calling advance twice proposes the same work twice and launches or writes nothing.
 chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
 	switch chat.state {
 	case .Idle, .Requesting, .Streaming:
@@ -71,8 +72,6 @@ chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
 	case .Executing_Tools:
 		return chat_session_tool_effect(chat)
 	case .Preparing:
-		chat.requests_made += 1
-		chat.state = .Requesting
 		return Chat_Effect{kind = .Start_Request, turn_id = chat.active_turn_id, allocator = chat.allocator}
 	case .Cancelling:
 		// Tool jobs still have to settle their committed calls. Cancellation stops
@@ -88,6 +87,15 @@ chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
 		return chat_finalize_turn(chat, .Completed, "")
 	}
 	return chat_effect_none()
+}
+
+// chat_session_begin_request claims the request the selector proposed. The claim is
+// the transition: the turn starts receiving and the request it is about to send is
+// counted. Only the driver's accepted transition calls it, so a proposal that was
+// merely selected changes nothing.
+chat_session_begin_request :: proc(chat: ^Chat_Session) {
+	chat.requests_made += 1
+	chat.state = .Requesting
 }
 
 // chat_session_fail_turn records a turn-level failure and moves to finalizing.

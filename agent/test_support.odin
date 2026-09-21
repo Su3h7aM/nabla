@@ -140,6 +140,7 @@ _test_accept :: proc(t: ^testing.T, chat: ^Chat_Session, text: string) {
 _test_begin_request :: proc(t: ^testing.T, chat: ^Chat_Session) -> Chat_Effect {
 	effect := chat_session_advance(chat)
 	if effect.kind != .Start_Request { testing.fail_now(t, "expected a request to start") }
+	chat_session_begin_request(chat)
 	chat_session_begin_operation(chat)
 	return effect
 }

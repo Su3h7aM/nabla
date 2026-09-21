@@ -455,10 +455,18 @@ test_tool_loop_has_no_request_budget :: proc(t: ^testing.T) {
 	_test_accept(t, chat, "loop")
 	chat.requests_made = 1000
 
+	// Selecting the request is a read: it proposes the same work however many times
+	// it is asked, and counts nothing. The driver's claim is what starts the turn and
+	// counts the request.
 	effect := chat_session_advance(chat)
 	defer chat_effect_destroy(&effect)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
+	testing.expect_value(t, chat.requests_made, 1000)
+	testing.expect_value(t, chat.state, Chat_State.Preparing)
+
+	chat_session_begin_request(chat)
 	testing.expect_value(t, chat.requests_made, 1001)
+	testing.expect_value(t, chat.state, Chat_State.Requesting)
 }
 
 @(test)
