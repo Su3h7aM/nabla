@@ -137,16 +137,16 @@ chat_age_text :: proc(elapsed_ms: i64) -> string {
 }
 
 // chat_handle_command runs one input line as a command. True means handled; the
-// caller sends anything else as a turn or a steering line. /quit during a turn
-// quits after it settles, so shutdown never strands tool children.
-chat_handle_command :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue: ^Steer_Queue, text, provider_id, model_id: string, quit: ^bool) -> bool {
+// caller records anything else as a steering line. /quit during a turn quits after it
+// settles, so shutdown never strands tool children.
+chat_handle_command :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue: ^Steer_Queue, text: string, quit: ^bool) -> bool {
 	if text == "/quit" {
 		if chat.state != .Idle { _observer_message(observer, .Notice, "quitting after this turn finishes") }
 		if quit != nil { quit^ = true }
 		return true
 	}
 	if text == "/effort" {
-		chat_notice_effort(chat, observer, provider_id, model_id)
+		chat_notice_effort(chat, observer, chat.provider_id, chat.model_id)
 		return true
 	}
 	if text == "/status" {
@@ -171,53 +171,9 @@ chat_handle_command :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue:
 			_observer_message(observer, .Notice, chat_effort_change_note(level))
 		} else {
 			_observer_message(observer, .Notice, fmt.tprintf("effort %s is not allowed for this model", level))
-			chat_notice_effort(chat, observer, provider_id, model_id)
+			chat_notice_effort(chat, observer, chat.provider_id, chat.model_id)
 		}
 		return true
 	}
 	return false
-}
-
-// chat_drain_steering injects queued lines at a request boundary. Commands
-// run immediately, so /effort still lands before the request is read from the
-// store; anything else becomes a user entry for the next request. A quit
-// discards what was never sent.
-chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) {
-	for {
-		line, ok := steer_pop(steer.queue)
-		if !ok { break }
-		if line == "/quit" {
-			steer_line_free(steer.queue, line)
-			if steer.quit != nil { steer.quit^ = true }
-			dropped := steer_clear(steer.queue)
-			if dropped > 0 {
-				_observer_message(observer, .Notice, fmt.tprintf("quitting after this turn finishes; dropped %d queued line(s)", dropped))
-			} else {
-				_observer_message(observer, .Notice, "quitting after this turn finishes")
-			}
-			return
-		}
-		if !chat_handle_command(chat, observer, steer.queue, line, steer.provider_id, steer.model_id, steer.quit) {
-			if line == "/compact" {
-				chat_command_compact(chat, observer, steer.connection, steer.usages)
-			} else if strings.has_prefix(line, "/") {
-				// A slash is a command, never a message. A command this path does not
-				// answer to is refused rather than sent to the model as steering text.
-				_observer_message(observer, .Notice, fmt.tprintf("%s is not available while a turn is running", line))
-			} else if result := chat_session_steer(chat, line, session.now_ms()); result != .Accepted {
-				// A line that arrived outside the boundary was never tried, so the turn's
-				// own failure is not this line's to report: only a store that refused the
-				// line has something to say about it.
-				if result == .Storage_Failed {
-					_observer_message(observer, .Error, chat.last_error)
-				} else {
-					_observer_message(observer, .Warning, "steering arrived outside a request boundary; dropped")
-				}
-			} else {
-				_observer_user_text(observer, line)
-			}
-		}
-		steer_line_free(steer.queue, line)
-		if steer.quit != nil && steer.quit^ { return }
-	}
 }

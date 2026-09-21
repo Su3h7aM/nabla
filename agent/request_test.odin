@@ -771,7 +771,10 @@ test_every_request_reports_itself_while_the_turn_runs :: proc(t: ^testing.T) {
 
 	// The next request of the same turn reports again. That repetition is the whole point:
 	// the context has grown and the provider's accounting of the first request has landed,
-	// so a front-end refreshing on these has something new to show.
+	// so a front-end refreshing on these has something new to show. A request is prepared
+	// from the turn's preparing state, which is where a settled tool batch or a rejected
+	// response leaves it; this request failed instead, so the test states it directly.
+	chat.state = .Preparing
 	chat_perform_request(chat, connection, test_retry_policy(), observer, &usages)
 	testing.expect_value(t, counter.prepared, 2)
 	testing.expect_value(t, counter.finished, 2)

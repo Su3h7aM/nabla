@@ -115,9 +115,15 @@ chat_session_advance_at :: proc(chat: ^Chat_Session, now: time.Tick) -> Chat_Eff
 // the transition: the turn starts receiving and the request it is about to send is
 // counted. Only the driver's accepted transition calls it, so a proposal that was
 // merely selected changes nothing.
-chat_session_begin_request :: proc(chat: ^Chat_Session) {
+//
+// The claim re-reads its own precondition, because the boundary that settles input
+// runs between the proposal and the claim: a boundary that stopped the turn, such as
+// one whose durable write failed, claims nothing and no request is prepared from it.
+chat_session_begin_request :: proc(chat: ^Chat_Session) -> bool {
+	if chat.state != .Preparing { return false }
 	chat.requests_made += 1
 	chat.state = .Requesting
+	return true
 }
 
 // chat_session_fail_turn records a turn-level failure and moves to finalizing.

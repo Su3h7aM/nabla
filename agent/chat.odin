@@ -225,9 +225,9 @@ chat_perform_attempt :: proc(
 	}
 	log_emit({level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})
 	return {
-		error               = operation_error,
-		finish_reason       = runtime.finish_reason,
-		text_exposed        = runtime.text_exposed,
+		error = operation_error,
+		finish_reason = runtime.finish_reason,
+		text_exposed = runtime.text_exposed,
 		completion_accepted = runtime.completion_accepted,
 	}
 }
@@ -320,8 +320,10 @@ chat_perform_request :: proc(
 	usages: ^[dynamic]Chat_Request_Usage,
 ) {
 	// The selector proposed this request; claiming it here is what makes the turn
-	// start receiving and counts the request it is about to send.
-	chat_session_begin_request(chat)
+	// start receiving and counts the request it is about to send. The boundary that
+	// ran between the proposal and this claim may have stopped the turn, and a claim
+	// the state no longer allows prepares nothing.
+	if !chat_session_begin_request(chat) { return }
 	if chat.skill_instructions == "" && !chat_ensure_instructions(chat) { return }
 	// This request has no durable number yet, and the one the previous request
 	// left behind is not its own. Clearing it here is what keeps the preparation
@@ -941,9 +943,6 @@ chat_run_turn :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, p
 	return chat_run_turn_steered(chat, connection, policy, observer, nil)
 }
 
-// Steer_Context carries the steering queue into the turn loop. Nil means no
-// steering: queued lines are drained before every model request, which is
-// after tool calls settled and before the request is read from the store.
 chat_websocket_fallback_safe :: proc(err: ai.Provider_Operation_Error) -> bool {
 	if err.delivery != .None { return false }
 	if err.transport_cause == .Trust || err.transport_cause == .Configuration { return false }
@@ -956,24 +955,9 @@ chat_websocket_fallback_safe :: proc(err: ai.Provider_Operation_Error) -> bool {
 	return false
 }
 
-Steer_Context :: struct {
-	queue:       ^Steer_Queue,
-	// quit, when not nil, is set by a queued line that asks the session to end.
-	// A caller with no such flag leaves it nil; the line is then reported and
-	// ignored rather than dereferenced.
-	quit:        ^bool,
-	provider_id: string,
-	model_id:    string,
-	connection:  ai.Provider_Connection,
-	usages:      ^[dynamic]Chat_Request_Usage,
-	// apply, when not nil, is the caller's request-boundary hook: it installs any
-	// selection the user asked for since the last request and returns the connection
-	// the next request must use. Resolving a selection is the caller's business, so the
-	// agent only asks; apply_data is whatever the caller needs to answer.
-	apply:       proc(steer: ^Steer_Context) -> ai.Provider_Connection,
-	apply_data:  rawptr,
-}
-
+// chat_run_turn_steered runs one turn to its terminal effect. steer is nil for a caller
+// with no input of its own, such as a headless run; otherwise the request boundary
+// consumes what the user queued while the turn ran.
 chat_run_turn_steered :: proc(
 	chat: ^Chat_Session,
 	connection: ai.Provider_Connection,
@@ -983,22 +967,16 @@ chat_run_turn_steered :: proc(
 ) -> bool {
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
-	if steer != nil { steer.usages = &usages }
-	defer if steer != nil { steer.usages = nil }
 
 	previous: posix.sigaction_t
 	chat_signal_arm(&previous)
 	defer chat_signal_disarm(&previous)
 
-	// current is the connection the next request is built for. A boundary hook may
+	// current is the connection the next request is built for. The boundary may
 	// replace it, which is how a selection the user changed mid-turn reaches the
 	// request that follows rather than the turn after this one.
 	current := connection
 	for {
-		if steer != nil && chat.state == .Preparing {
-			chat_drain_steering(chat, observer, steer)
-			if steer.apply != nil { current = steer.apply(steer) }
-		}
 		// External facts are applied before the state is read, so the selection below is
 		// a pure read of state. The owner observes the clock once and both steps use it.
 		now := time.tick_now()
@@ -1007,6 +985,14 @@ chat_run_turn_steered :: proc(
 		switch effect.kind {
 		case .Start_Request:
 			chat_effect_destroy(&effect)
+			// The boundary is a stage of the request the selector just proposed, and it
+			// runs before the claim that counts it: the lines the user queued while the
+			// turn ran are recorded at this turn, and the selection they may have changed
+			// is installed. A boundary that stops the turn claims nothing.
+			if steer != nil {
+				chat_drain_steering(chat, observer, steer, current)
+				if steer.apply != nil { current = steer.apply(steer) }
+			}
 			chat_perform_request(chat, current, policy, observer, &usages)
 		case .Run_Tools:
 			turn_id := effect.turn_id

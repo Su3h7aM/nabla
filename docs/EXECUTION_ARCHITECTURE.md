@@ -66,6 +66,13 @@ bounded, durable harness feedback and another logical request under the turn bud
 it is not a retry of the failed provider operation. Preserve invalid response evidence
 outside executable call history. See [errors](ERROR_RETRY_ARCHITECTURE.md).
 
+Boundary is a stage of a proposed request, not work the driver does beside the
+machine: it settles input the user queued while the turn ran, and it runs before the
+claim that counts the request. The claim therefore answers for the state it finds, so a
+boundary that stopped the turn, such as one whose durable write failed, claims nothing
+and no request is prepared from it. Queued input is a stage input, never a second
+writer of the session.
+
 The request path must not hide preparation, compaction, backoff, transport selection
 and response commit in one blocking effect. Conversely, introducing `Encoding` and
 `Admitting` enum members around the same monolithic body changes nothing. Extract

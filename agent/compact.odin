@@ -1194,8 +1194,7 @@ chat_compact_destroy :: proc(chat: ^Chat_Session) {
 // chat_command_compact starts the same compaction the automatic path starts, at a
 // settled turn or a request boundary. It reports that compaction is under way, not
 // that a summary exists: nothing about it blocks the caller.
-chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection, usages: ^[dynamic]Chat_Request_Usage) -> bool {
-	_ = usages
+chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection) -> bool {
 	if chat.storage_failed { return false }
 	switch chat_compact_request(chat, .User_Command) {
 	case .Unavailable:

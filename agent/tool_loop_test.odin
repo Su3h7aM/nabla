@@ -467,6 +467,33 @@ test_tool_loop_has_no_request_budget :: proc(t: ^testing.T) {
 	chat_session_begin_request(chat)
 	testing.expect_value(t, chat.requests_made, 1001)
 	testing.expect_value(t, chat.state, Chat_State.Requesting)
+	// The claim is not repeatable: the proposal was taken, and claiming it again is
+	// not another request.
+	testing.expect(t, !chat_session_begin_request(chat))
+	testing.expect_value(t, chat.requests_made, 1001)
+}
+
+// The boundary that settles input runs between the proposal and the claim, so the claim
+// has to answer for the state it finds: a turn a boundary stopped claims no request, and
+// no request is prepared from a turn that already failed.
+@(test)
+test_a_claim_refuses_a_turn_that_stopped_at_its_boundary :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	_test_accept(t, chat, "work")
+	chat.requests_made = 3
+
+	effect := chat_session_advance(chat)
+	defer chat_effect_destroy(&effect)
+	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
+
+	// What a boundary does when its own durable write fails.
+	chat_session_fail_turn(chat, "the steering line could not be recorded")
+	testing.expect_value(t, chat.state, Chat_State.Finalizing)
+	testing.expect(t, !chat_session_begin_request(chat), "a stopped turn claims no request")
+	testing.expect_value(t, chat.requests_made, 3)
 }
 
 @(test)

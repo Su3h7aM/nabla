@@ -167,12 +167,9 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		// here: otherwise shutdown would wait out a whole model request.
 		if runtime_stopping(app) { agent.chat_cancel_request() }
 		steer := agent.Steer_Context {
-			queue       = &app.run.steer,
-			provider_id = app.setup.provider_id,
-			model_id    = app.setup.model_id,
-			connection  = app.run.connection,
-			apply       = app_steer_apply,
-			apply_data  = app,
+			queue      = &app.run.steer,
+			apply      = app_steer_apply,
+			apply_data = app,
 		}
 		completed := agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer)
 		// A tool worker that ignored its stop still borrows the session's workspace, registry
@@ -210,7 +207,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		if runtime_stopping(app) { agent.chat_cancel_request() }
 		// Compaction reports why the model side stopped, but a durable write that
 		// failed only latches the session: the reason the user needs is there.
-		if !agent.chat_command_compact(&app.setup.session, observer, app.run.connection, nil) && agent.chat_session_storage_failed(&app.setup.session) {
+		if !agent.chat_command_compact(&app.setup.session, observer, app.run.connection) && agent.chat_session_storage_failed(&app.setup.session) {
 			snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
 		}
 	case .Status:

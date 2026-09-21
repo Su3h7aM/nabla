@@ -54,6 +54,9 @@ driver.
 - Duplicate operation id, the no-op `Streaming` state, and `Chat_Operation.turn_id` are gone.
 - Batch validation is split by meaning: defective call identity refuses the response,
 per-call admission refuses that call. See [tools](TOOLS_MCP_ARCHITECTURE.md).
+- Steering is a request-boundary stage: the driver applies queued input between the
+proposal of a request and the claim that counts it, and the claim refuses a turn its
+boundary stopped. See [execution](EXECUTION_ARCHITECTURE.md).
 - Skills use the shared 64 KiB result bound; no separate exception exists.
 
 ## Future capabilities with no implementation

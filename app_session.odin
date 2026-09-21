@@ -530,19 +530,15 @@ apply_pending_selection :: proc(app: ^App) -> bool {
 }
 
 // app_steer_apply is the turn's request-boundary hook. It installs the selection the
-// user asked for since the last request, then republishes the names and the connection
-// the agent reads for the next one: the steer context borrows the runtime's strings,
-// which an install replaces.
+// user asked for since the last request and returns the connection the next request is
+// built for.
 app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
 	app := cast(^App)steer.apply_data
 	catalog_selection_sync(app)
 	apply_pending_selection(app)
 	sync.mutex_lock(&app.run.mu)
-	steer.provider_id = app.setup.provider_id
-	steer.model_id = app.setup.model_id
-	steer.connection = app.run.connection
-	sync.mutex_unlock(&app.run.mu)
-	return steer.connection
+	defer sync.mutex_unlock(&app.run.mu)
+	return app.run.connection
 }
 
 // apply_selection switches the runtime to one provider's model and applies an

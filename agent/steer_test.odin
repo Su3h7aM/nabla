@@ -58,7 +58,6 @@ test_a_boundary_hook_hands_the_next_request_its_connection :: proc(t: ^testing.T
 	}
 	steer := Steer_Context {
 		queue      = &queue,
-		connection = initial,
 		apply      = boundary_install_connection,
 		apply_data = &install,
 	}
@@ -169,12 +168,10 @@ test_drain_injects_text_and_runs_commands :: proc(t: ^testing.T) {
 	testing.expect(t, steer_push(&queue, "/effort high"))
 	quit := false
 	steer := Steer_Context {
-		queue       = &queue,
-		quit        = &quit,
-		provider_id = "p",
-		model_id    = "m",
+		queue = &queue,
+		quit  = &quit,
 	}
-	chat_drain_steering(chat, {}, &steer)
+	chat_drain_steering(chat, {}, &steer, {})
 
 	testing.expect(t, !quit)
 	testing.expect_value(t, chat.effort, "high")
@@ -200,12 +197,10 @@ test_drain_quit_discards_what_was_never_sent :: proc(t: ^testing.T) {
 	testing.expect(t, steer_push(&queue, "never sent"))
 	quit := false
 	steer := Steer_Context {
-		queue       = &queue,
-		quit        = &quit,
-		provider_id = "p",
-		model_id    = "m",
+		queue = &queue,
+		quit  = &quit,
 	}
-	chat_drain_steering(chat, {}, &steer)
+	chat_drain_steering(chat, {}, &steer, {})
 
 	testing.expect(t, quit)
 	entries := _test_entries(t, chat)
@@ -230,16 +225,14 @@ test_a_late_steering_line_does_not_repeat_the_turn_error :: proc(t: ^testing.T) 
 	testing.expect(t, steer_push(&queue, "check the logs"))
 	quit := false
 	steer := Steer_Context {
-		queue       = &queue,
-		quit        = &quit,
-		provider_id = "p",
-		model_id    = "m",
+		queue = &queue,
+		quit  = &quit,
 	}
 
 	notices: Chat_Notice_Log
 	observer := chat_notice_log_begin(&notices)
 	defer chat_notice_log_destroy(&notices)
-	chat_drain_steering(chat, observer, &steer)
+	chat_drain_steering(chat, observer, &steer, {})
 
 	if !testing.expect_value(t, len(notices.lines), 1) { return }
 	testing.expect(t, notices.lines[0] != "the provider refused the request", "a line that arrived too late must not report the turn's failure as its own")

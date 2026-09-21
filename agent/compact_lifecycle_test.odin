@@ -413,7 +413,7 @@ test_the_compact_command_starts_a_job_while_idle :: proc(t: ^testing.T) {
 		API      = .OpenAI_Chat_Completions,
 		Endpoint = compact_provider_endpoint(&setup.background, context.temp_allocator),
 	}
-	testing.expect(t, chat_command_compact(chat, {}, background, nil))
+	testing.expect(t, chat_command_compact(chat, {}, background))
 	testing.expect_value(t, chat.compact.state, Compact_State.Running)
 	testing.expect_value(t, chat.compact.trigger, Compact_Trigger.User_Command)
 	if !sync.sema_wait_with_timeout(&setup.background.reached, COMPACT_TEST_BOUND) {

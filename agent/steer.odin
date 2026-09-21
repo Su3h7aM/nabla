@@ -1,8 +1,12 @@
 package agent
 
+import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
+
+import "nabla:agent/session"
+import "nabla:ai"
 
 // Steering accepts input while a turn is running and applies it at the next safe
 // boundary: before the next model request, after tool calls settled. The front-end
@@ -16,7 +20,7 @@ STEER_MAX_BYTES :: 32 * 1024
 
 Steer_Queue :: struct {
 	mu:        sync.Mutex,
-	items:     [dynamic]string, // owned FIFO,
+	items:     [dynamic]string, // owned FIFO
 	bytes:     int,
 	allocator: mem.Allocator,
 }
@@ -92,4 +96,71 @@ steer_taken_destroy :: proc(queue: ^Steer_Queue, taken: [dynamic]string) {
 // memory belongs to the queue allocator, never the ambient context.
 steer_line_free :: proc(queue: ^Steer_Queue, line: string) {
 	delete(line, queue.allocator)
+}
+
+// Steer_Context is the input a running turn may still consume: the queue the
+// front-end pushes lines into, a quit request one of those lines may carry, and the
+// caller's hook for a selection the user changed. It is an observation source, not
+// session state: the caller owns everything it points at, and a turn the caller gives
+// no input passes none at all.
+Steer_Context :: struct {
+	queue:      ^Steer_Queue,
+	// quit, when not nil, is set by a queued line that asks the session to end.
+	// A caller with no such flag leaves it nil; the line is then reported and
+	// ignored rather than dereferenced.
+	quit:       ^bool,
+	// apply, when not nil, is the caller's request-boundary hook: it installs any
+	// selection the user asked for since the last request and returns the connection
+	// the next request must use. Resolving a selection is the caller's business, so the
+	// agent only asks; apply_data is whatever the caller needs to answer.
+	apply:      proc(steer: ^Steer_Context) -> ai.Provider_Connection,
+	apply_data: rawptr,
+}
+
+// chat_drain_steering applies the lines queued since the last request boundary. The
+// driver runs it on the request the selector proposed and before the claim that counts
+// it, so a line it records belongs to the request about to be prepared, and a write
+// that fails stops the turn before anything is claimed for it.
+//
+// Commands run immediately, so /effort still lands before the request is read from the
+// store; anything else becomes a user entry for the next request. A quit discards what
+// was never sent.
+chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context, connection: ai.Provider_Connection) {
+	for {
+		line, ok := steer_pop(steer.queue)
+		if !ok { break }
+		if line == "/quit" {
+			steer_line_free(steer.queue, line)
+			if steer.quit != nil { steer.quit^ = true }
+			dropped := steer_clear(steer.queue)
+			if dropped > 0 {
+				_observer_message(observer, .Notice, fmt.tprintf("quitting after this turn finishes; dropped %d queued line(s)", dropped))
+			} else {
+				_observer_message(observer, .Notice, "quitting after this turn finishes")
+			}
+			return
+		}
+		if !chat_handle_command(chat, observer, steer.queue, line, steer.quit) {
+			if line == "/compact" {
+				chat_command_compact(chat, observer, connection)
+			} else if strings.has_prefix(line, "/") {
+				// A slash is a command, never a message. A command this path does not
+				// answer to is refused rather than sent to the model as steering text.
+				_observer_message(observer, .Notice, fmt.tprintf("%s is not available while a turn is running", line))
+			} else if result := chat_session_steer(chat, line, session.now_ms()); result != .Accepted {
+				// A line that arrived outside the boundary was never tried, so the turn's
+				// own failure is not this line's to report: only a store that refused the
+				// line has something to say about it.
+				if result == .Storage_Failed {
+					_observer_message(observer, .Error, chat.last_error)
+				} else {
+					_observer_message(observer, .Warning, "steering arrived outside a request boundary; dropped")
+				}
+			} else {
+				_observer_user_text(observer, line)
+			}
+		}
+		steer_line_free(steer.queue, line)
+		if steer.quit != nil && steer.quit^ { return }
+	}
 }
