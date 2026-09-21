@@ -460,10 +460,13 @@ tool_result_finalize :: proc(ctx: ^Tool_Context, result: Tool_Result) -> Tool_Re
 
 // tool_result_valid reports whether content is a usable result envelope for the
 // outcome: one bounded JSON object carrying a matching status, a message
-// string, and a data value.
+// string, and a data value. It requires the document to be valid JSON, not merely
+// parseable: the parser is lenient about JSON5 escapes and stops silently at one, so a
+// document that only looks like JSON would otherwise be accepted and sent to a provider.
 @(private)
 tool_result_valid :: proc(outcome: session.Tool_Outcome, content: string) -> bool {
 	if content == "" || len(content) > TOOL_MAX_RESULT_BYTES { return false }
+	if !json.is_valid(transmute([]u8)content, .JSON) { return false }
 	value, parse_error := json.parse_string(content, .JSON, true, context.temp_allocator)
 	if parse_error != nil { return false }
 	defer json.destroy_value(value, context.temp_allocator)

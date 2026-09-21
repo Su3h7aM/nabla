@@ -2,6 +2,7 @@
 package agent
 
 import "core:encoding/json"
+import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -232,6 +233,40 @@ test_read_reports_the_lines_it_returned :: proc(t: ^testing.T) {
 
 	missing := tool_run(t, &test, TOOL_READ_NAME, `{"path":"gone.txt"}`)
 	testing.expect_value(t, missing.outcome, session.Tool_Outcome.Tool_Failed)
+}
+
+// A file the read tool cannot hand to the model is refused rather than encoded. A NUL byte
+// and a byte that is not UTF-8 both mean the file is not text, and a result carrying either
+// would not be JSON: the encoder escapes such a byte as a JSON5 sequence, and a reader that
+// silently received only the prefix would not know it had.
+@(test)
+test_read_refuses_a_file_that_is_not_text :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+
+	nul := strings.concatenate({tool_test_workspace(&test), "/nul.bin"}, context.temp_allocator)
+	defer delete(nul, context.temp_allocator)
+	if !tool_write_file(t, nul, "one\x00two\n") { return }
+	nul_arguments := strings.concatenate({`{"path":"`, nul, `"}`}, context.temp_allocator)
+	nul_result := tool_run(t, &test, TOOL_READ_NAME, nul_arguments)
+	tool_test_envelope_matches(t, nul_result.content, .Tool_Failed, fmt.tprintf("%s is not a text file", nul))
+
+	stray := strings.concatenate({tool_test_workspace(&test), "/stray.bin"}, context.temp_allocator)
+	defer delete(stray, context.temp_allocator)
+	if !tool_write_file(t, stray, "good \xff\xfe bad \xc3\n") { return }
+	stray_arguments := strings.concatenate({`{"path":"`, stray, `"}`}, context.temp_allocator)
+	stray_result := tool_run(t, &test, TOOL_READ_NAME, stray_arguments)
+	tool_test_envelope_matches(t, stray_result.content, .Tool_Failed, fmt.tprintf("%s is not a text file", stray))
+
+	// Text outside ASCII is valid UTF-8 and is returned as written.
+	text := strings.concatenate({tool_test_workspace(&test), "/text.txt"}, context.temp_allocator)
+	defer delete(text, context.temp_allocator)
+	if !tool_write_file(t, text, "caf\xc3\xa9\n") { return }
+	text_arguments := strings.concatenate({`{"path":"`, text, `"}`}, context.temp_allocator)
+	text_result := tool_run(t, &test, TOOL_READ_NAME, text_arguments)
+	testing.expect_value(t, text_result.outcome, session.Tool_Outcome.Success)
+	testing.expect(t, strings.contains(text_result.content, "caf\xc3\xa9"), "valid UTF-8 is returned as written")
 }
 
 @(test)
@@ -556,6 +591,9 @@ test_result_finalize_replaces_contract_violations :: proc(t: ^testing.T) {
 	tool_test_finalize_case(t, .Success, "not json", TOOL_RESULT_REPLACED_MALFORMED)
 	tool_test_finalize_case(t, .Success, `{"status":"tool_failed","message":"x","data":{}}`, TOOL_RESULT_REPLACED_MALFORMED)
 	tool_test_finalize_case(t, .Success, `{"status":"success","message":"x"}`, TOOL_RESULT_REPLACED_MALFORMED)
+	// A JSON5 escape is not JSON. The parser stops at one without complaining, so a result
+	// that carries an invalid UTF-8 byte has to be rejected before it is read.
+	tool_test_finalize_case(t, .Success, `{"status":"success","message":"x","data":{"text":"a\xffb"}}`, TOOL_RESULT_REPLACED_MALFORMED)
 	tool_test_finalize_case(t, .Tool_Failed, strings.repeat("a", TOOL_MAX_RESULT_BYTES + 1, context.temp_allocator), TOOL_RESULT_REPLACED_OVERSIZED)
 	// A well-formed refusal envelope is valid and passes through.
 	tool_test_finalize_case(

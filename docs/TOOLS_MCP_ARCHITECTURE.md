@@ -218,6 +218,22 @@ fewer records with the usual paging cursor; an oversized single skill body is
 an explicit bounded failure until pagination or another deliberate design
 exists.
 
+Bounded is not enough, so the document is also checked for validity rather than
+for parseability. `core:encoding/json` accepts a JSON5 escape such as `\xff`
+inside a string, reports no error, and stops there, so a result carrying an
+invalid UTF-8 byte would be stored and sent as a document that is not JSON.
+`tool_result_valid` therefore runs `json.is_valid(content, .JSON)` over the
+whole document before it parses it, and finalization replaces anything that
+fails.
+
+A tool that carries file bytes is responsible for the bytes it offers. `read`
+refuses a file that is not valid UTF-8, with the same `is not a text file`
+refusal it already gives a file containing a NUL byte, because a result is JSON
+and JSON is UTF-8. `shell` output is decoded to valid UTF-8 with U+FFFD
+replacement before it becomes a result, so a build log with a stray byte still
+returns. The two tools differ because a shell stream has no better reading,
+while a file that is not text has a correct answer: say so.
+
 ## Shell
 
 `shell` is not a terminal, a background-job service, or a sandbox. Its

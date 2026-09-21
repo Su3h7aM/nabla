@@ -7,6 +7,7 @@ import "core:os"
 import "core:slice"
 import "core:strings"
 import "core:time"
+import "core:unicode/utf8"
 
 
 // --- read --------------------------------------------------------------------
@@ -99,7 +100,11 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Re
 	}
 
 	text := string(data)
-	if strings.index_byte(text, 0) >= 0 {
+	// A result is JSON, and JSON is UTF-8. A file whose bytes are not valid UTF-8 is not
+	// text the model can be handed: the encoder escapes such a byte as JSON5, which is not
+	// JSON, and a reader that silently received a prefix would not know it had. A NUL is
+	// refused for the same reason, so the two checks sit together.
+	if strings.index_byte(text, 0) >= 0 || !utf8.valid_string(text) {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("%s is not a text file", args.path), "binary")
 	}
 
