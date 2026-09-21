@@ -2,6 +2,7 @@
 package agent
 
 import "core:encoding/json"
+import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -202,6 +203,66 @@ test_code_mode_reports_which_limit_stopped_it :: proc(t: ^testing.T) {
 		testing.expect(t, strings.contains(result.content, `"kind":"instruction_limit"`), result.content)
 	}
 	testing.expect(t, recorded, "a stopped execution still answers its call")
+}
+
+// A script whose point is to loop over many things must not run out of room at the size
+// of one model response: the batch's admission budget counts outer calls and children
+// together, and the table keeps released jobs, so the budget rather than the table size
+// is what bounds a long script.
+@(test)
+test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+	tool_job_test_register(t, &test, tool_job_hold_definition("test_step", nil, tool_job_immediate_execute))
+	// The script makes more calls than one model response could commit.
+	source := fmt.aprintf(
+		`local seen = 0 for i = 1, %d do local r = tools.test_step() if r.status == "success" then seen = seen + 1 end end return seen`,
+		TOOL_JOBS_MAX + 8,
+		allocator = context.temp_allocator,
+	)
+	object := make(json.Object, 1, context.temp_allocator)
+	object["code"] = json.String(source)
+	arguments, marshal_err := json.marshal(object, allocator = context.temp_allocator)
+	if marshal_err != nil { testing.fail_now(t, "the arguments could not be built") }
+	_test_stage_call(t, chat, "call_code", string(arguments), TOOL_CODE_NAME)
+
+	jobs: Tool_Jobs
+	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
+	defer tool_jobs_destroy(&jobs)
+	tool_jobs_submit(&jobs, chat, {})
+	tool_job_test_drain(t, &test, &jobs)
+
+	testing.expect_value(t, jobs.admitted, TOOL_JOBS_MAX + 9)
+	testing.expect_value(t, tool_jobs_committed(&jobs), 1)
+
+	// The parent's answer is what the script computed from every child it ran, which is
+	// only possible if the table kept admitting after one response's worth of calls.
+	// A result is linked to its call by related_seq, so the parent's answer is found by
+	// following that link rather than by guessing which result came first. The load
+	// raises the row limit, because one script's children fill a default page.
+	entries, load_error := session.entries_load(chat.store, chat.id, {limit = session.ENTRIES_MAX_LIMIT}, context.allocator)
+	if load_error != nil { testing.fail_now(t, "entries_load failed") }
+	defer session.entries_destroy(entries, context.allocator)
+	parent_seq: session.Seq
+	for entry in entries {
+		call, is_call := entry.payload.(session.Tool_Call_Entry)
+		if is_call && call.call_id == "call_code" { parent_seq = entry.seq }
+	}
+	if !testing.expect(t, parent_seq != 0, "the parent call should be recorded") { return }
+
+	found := false
+	for entry in entries {
+		result, is_result := entry.payload.(session.Tool_Result_Entry)
+		if !is_result { continue }
+		related, present := entry.related_seq.?
+		if !present || related != parent_seq { continue }
+		found = true
+		testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
+		testing.expect(t, strings.contains(result.content, fmt.tprintf(`"output":%d`, TOOL_JOBS_MAX + 8)), result.content)
+	}
+	testing.expect(t, found, "the script should have answered its call")
 }
 
 // A worker-placed call runs on its own thread: the test thread keeps going while the

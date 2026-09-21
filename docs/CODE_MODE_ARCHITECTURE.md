@@ -875,7 +875,7 @@ steps; until then they are the values those steps must use:
 | Lua instructions | 10 million per execution |
 | Instruction slice | 10,000 instructions before returning control to the owner |
 | Parent execution deadline | 120 seconds, starting at admission and including queued/child time |
-| Child call attempts | 32 per execution, including refused attempts |
+| Child call attempts | The batch's admission budget, `TOOL_JOBS_MAX_ADMISSIONS`, counting outer calls and children together |
 | Active worker calls | Four in the runtime, never more than four per execution |
 | Lane capacity | All native tools share one lane; each MCP client is its own lane; one active call per lane |
 | Retained print logs | 8 KiB inside the parent result budget |
@@ -885,9 +885,12 @@ steps; until then they are the values those steps must use:
 Also bound runnable Code Mode states, queued jobs, catalog pages, handle storage,
 Odin-owned conversion bytes, and progress events. Start at one active top-level
 Code Mode call per response under serial direct-call scheduling. A per-script call
-limit does not bound a long model turn: add an explicit configurable total tool-job
-admission limit per turn, initially 256, counting outer and child attempts. Exhaustion
-stops new work and reports the limit rather than opening another request to evade it.
+limit does not bound a long model turn, so the bound is the batch's admission budget
+rather than a per-script one. A script whose whole point is to loop over a directory
+must not run out of room at the size of one model response, and the execution deadline,
+the instruction budget, and the batch budget already bound a script that runs away. A
+separate per-script cap of 32 would forbid the loop-and-filter shape that Code Mode
+exists for, so there is none.
 Reserve result capacity for already admitted calls when enforcing any limit.
 
 Keep all limits in one harness policy with named defaults. Scripts cannot raise
@@ -1215,10 +1218,9 @@ observed while the kind reports which fault or limit produced it. `output_limit`
 raised by Code Mode itself before the generic oversized replacement can hide which
 value was too large.
 
-Still to implement from section 12: compact child-call summaries, the
-`unfinished_tasks` kind for the concurrent-handle form, and the per-execution child
-call limit of 32. Today a nested call is bounded by the table's own `TOOL_JOBS_MAX`,
-which is a batch limit rather than a per-script one.
+Still to implement from section 12: compact child-call summaries and the
+`unfinished_tasks` kind for the concurrent-handle form. The batch's admission budget and
+its reason to exist are settled; a script that reaches it gets `tool_call_limit`.
 
 The wrapper and `print` contracts are enforced in the same place the arguments are
 converted. A wrapper takes no argument or exactly one table of named arguments, and
@@ -1226,6 +1228,13 @@ converted. A wrapper takes no argument or exactly one table of named arguments, 
 were settled by running the tool from inside a session and watching what a script
 actually received: a second argument was silently discarded, and a table printed as
 `<table>`.
+
+One bound was wrong for the same reason. The table keeps released jobs until the batch
+ends, so counting `len(jobs.jobs)` capped every script at 64 calls including the model's
+own. A script looping over a directory is the shape Code Mode exists for, so the bound is
+now `TOOL_JOBS_MAX_ADMISSIONS`, a batch budget of 256 counting outer calls and children
+together. A test runs 72 child calls in one script and checks the answer the script
+computed from them.
 
 ## 15. Decisions deliberately left open
 

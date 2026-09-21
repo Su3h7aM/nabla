@@ -146,12 +146,12 @@ tool_job_lua_finish :: proc(job: ^Tool_Job) {
 
 @(private)
 tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: ^Tool_Job) {
-	if len(jobs.jobs) >= TOOL_JOBS_MAX {
+	if jobs.admitted >= TOOL_JOBS_MAX_ADMISSIONS {
 		parent.result = code_mode_failure(
 			&parent.exec,
 			.Tool_Failed,
 			.Tool_Call_Limit,
-			"the Code Mode execution created too many tool calls",
+			fmt.tprintf("the Code Mode execution reached this batch's limit of %d tool calls", TOOL_JOBS_MAX_ADMISSIONS),
 			"tool call limit",
 		)
 		parent.result_present = true
@@ -208,6 +208,7 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 		nested    = true,
 	}
 	jobs.next_id += 1
+	jobs.admitted += 1
 	child.nested_call = {
 		id        = strings.clone(call_id, child.allocator),
 		name      = strings.clone(parent.lua.request.name, child.allocator),

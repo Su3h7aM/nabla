@@ -33,9 +33,17 @@ import "nabla:ai"
 // parent block its own child.
 TOOL_JOBS_MAX_ACTIVE :: 4
 
-// TOOL_JOBS_MAX bounds one batch. The model-facing limit on calls per response is
-// smaller; this is the harness's own ceiling on the records it will hold.
+// TOOL_JOBS_MAX bounds one model batch: how many calls a single response may commit.
+// The model-facing limit on calls per response is smaller; this is the harness's own
+// ceiling on the records it will hold for one response.
 TOOL_JOBS_MAX :: 64
+
+// TOOL_JOBS_MAX_ADMISSIONS bounds every admission in one batch, outer calls and Code
+// Mode children together. The table keeps released jobs until the batch ends, so this
+// is what bounds a script that makes many sequential calls, and it is deliberately
+// larger than TOOL_JOBS_MAX: a script whose whole point is to loop over a directory must
+// not run out of room at the size of one model response.
+TOOL_JOBS_MAX_ADMISSIONS :: 256
 
 // TOOL_JOBS_WAIT is how long the owner sleeps when no job is runnable. It bounds how
 // late a turn cancellation is noticed after the last completion, in the same way the
@@ -158,6 +166,7 @@ Tool_Jobs :: struct {
 	// completion that arrived between its decision and its wait.
 	woken:            bool,
 	next_id:          u64,
+	admitted:         int, // every admission in this batch, outer calls and children
 	active:           int, // worker-placed jobs running now
 	committed:        int, // all durable results, including nested calls
 	committed_roots:  int, // provider calls answered at the turn barrier
@@ -301,6 +310,7 @@ tool_jobs_submit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 			allocator = jobs.worker_allocator,
 		}
 		jobs.next_id += 1
+		jobs.admitted += 1
 		job.name = strings.clone(staged.name, job.allocator)
 		job.call_id = strings.clone(staged.id, job.allocator)
 		tool_job_admit(jobs, chat, observer, job)
