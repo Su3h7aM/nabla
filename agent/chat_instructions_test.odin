@@ -1,6 +1,9 @@
 #+test
 package agent
 
+import "core:fmt"
+import "core:os"
+import "core:path/filepath"
 import "core:testing"
 
 import "nabla:agent/skills"
@@ -77,4 +80,76 @@ test_an_instruction_snapshot_never_replaces_a_catalog :: proc(t: ^testing.T) {
 	if !testing.expect(t, chat_apply_snapshot(&fixture.chat, "instructions!", manifest)) { return }
 	testing.expect(t, !chat_apply_snapshot(&fixture.chat, "instructions!", manifest))
 	testing.expect_value(t, fixture.chat.skill_instructions, "instructions!")
+}
+
+// A snapshot the harness wrote is applied to the catalog it describes. The roots it records
+// are the catalog's own, because a skill's root_index is an index into that list: a resume
+// that paired a skill with a root discovery had discarded refused the skill as outside its
+// root, which is exactly how every global skill looked on a resumed session.
+@(test)
+test_a_written_snapshot_restores_the_root_each_skill_came_from :: proc(t: ^testing.T) {
+	workspace, workspace_error := os.make_directory_temp("", "nabla-snapshot-workspace-*", context.allocator)
+	if workspace_error != nil { testing.fail_now(t, "the workspace could not be created") }
+	defer {
+		os.remove_all(workspace)
+		delete(workspace, context.allocator)
+	}
+	// The workspace has no skills of its own and the skill lives outside it, which is the
+	// shape that leaves the catalog with fewer roots than the launch configured.
+	global, global_error := os.make_directory_temp("", "nabla-snapshot-global-*", context.allocator)
+	if global_error != nil { testing.fail_now(t, "the user root could not be created") }
+	defer {
+		os.remove_all(global)
+		delete(global, context.allocator)
+	}
+	chat_instructions_test_skill(t, global, "pdf")
+
+	absent, absent_error := filepath.join({workspace, ".agents", "skills"}, context.allocator)
+	if absent_error != nil { testing.fail_now(t, "the local root path could not be built") }
+	defer delete(absent, context.allocator)
+	catalog, discover_error := skills.discover(
+		[]skills.Root{{source = .Local, logical_path = absent, authority = workspace}, {source = .Generic_User, logical_path = global}},
+		context.allocator,
+	)
+	defer skills.catalog_destroy(&catalog, context.allocator)
+	defer skills.load_error_destroy(&discover_error, context.allocator)
+	if discover_error.kind != .None { testing.fail_now(t, "discovery failed") }
+	if len(catalog.skills) != 1 { testing.fail_now(t, "the user skill was not catalogued") }
+
+	writer: Chat_Test
+	chat_test_begin(t, &writer, workspace)
+	defer chat_test_end(t, &writer)
+	rendered := "instructions!"
+	manifest := chat_encode_manifest(&writer.chat, nil, catalog, rendered, context.allocator)
+	defer delete(manifest, context.allocator)
+	if len(manifest) == 0 { testing.fail_now(t, "the manifest could not be encoded") }
+
+	reader: Chat_Test
+	chat_test_begin(t, &reader, workspace)
+	defer chat_test_end(t, &reader)
+	if !testing.expect(t, chat_apply_snapshot(&reader.chat, rendered, manifest)) { return }
+	restored, has_catalog := &reader.chat.skill_catalog.?
+	if !testing.expect(t, has_catalog, "the snapshot installed no catalog") { return }
+	if len(restored.skills) != 1 { testing.fail_now(t, "the restored catalog lost the skill") }
+
+	// The restored catalog has to hand a load the same root the skill was found under, or
+	// the skill is unreachable for the rest of the session.
+	skill := restored.skills[0]
+	root := restored.roots[skill.root_index]
+	testing.expect_value(t, root.source, skills.Source_Kind.Generic_User)
+	loaded, load_error := skills.load(skill, root, {}, context.allocator)
+	defer skills.loaded_destroy(&loaded, context.allocator)
+	defer skills.load_error_destroy(&load_error, context.allocator)
+	testing.expect_value(t, load_error.kind, skills.Error_Kind.None)
+	testing.expect(t, len(loaded.body) > 0, "the restored skill has no body")
+}
+
+// chat_instructions_test_skill installs one valid skill in a root, so a test can discover
+// a catalog that holds it.
+chat_instructions_test_skill :: proc(t: ^testing.T, root, name: string) {
+	directory := filepath.join({root, name}, context.temp_allocator) or_else ""
+	if !testing.expect(t, os.make_directory_all(directory) == nil) { return }
+	primary := filepath.join({directory, "SKILL.md"}, context.temp_allocator) or_else ""
+	text := fmt.tprintf("---\nname: %s\ndescription: work with %s\n---\nbody\n", name, name)
+	if !testing.expect(t, os.write_entire_file_from_string(primary, text) == nil) { return }
 }

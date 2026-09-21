@@ -22,8 +22,15 @@ Diagnostic_Kind :: enum {
 	Unsupported,
 }
 
+// DIAGNOSTIC_NO_ROOT is the root_index of a diagnostic about a root that never entered the
+// catalog. No index in Catalog.roots names that root, and its path is what says which one it
+// was; naming index 0 would name a different root.
+DIAGNOSTIC_NO_ROOT :: -1
+
 Diagnostic :: struct {
 	kind:       Diagnostic_Kind,
+	// root_index indexes Catalog.roots, the roots that were entered. A diagnostic
+	// about a root that was not carries DIAGNOSTIC_NO_ROOT.
 	root_index: int,
 	path:       string,
 	line:       int,
@@ -67,10 +74,15 @@ discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Cat
 		return
 	}
 
-	for root, index in roots {
+	for root, _ in roots {
 		canonical, canonical_error := canonical_root(root, scratch)
 		if canonical_error.kind != .None {
-			record_diagnostic(&catalog, Diagnostic{.Unreadable_Root, index, root.logical_path, 0, "", canonical_error.detail, "", ""}, scratch, allocator)
+			record_diagnostic(
+				&catalog,
+				Diagnostic{.Unreadable_Root, DIAGNOSTIC_NO_ROOT, root.logical_path, 0, "", canonical_error.detail, "", ""},
+				scratch,
+				allocator,
+			)
 			load_error_destroy(&canonical_error, scratch)
 			continue
 		}
@@ -83,7 +95,12 @@ discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Cat
 			}
 		}
 		if duplicate {
-			record_diagnostic(&catalog, Diagnostic{.Alias, index, canonical, 0, "", "same directory as another source root", "", ""}, scratch, allocator)
+			record_diagnostic(
+				&catalog,
+				Diagnostic{.Alias, DIAGNOSTIC_NO_ROOT, canonical, 0, "", "same directory as another source root", "", ""},
+				scratch,
+				allocator,
+			)
 			continue
 		}
 		append(&seen, canonical)

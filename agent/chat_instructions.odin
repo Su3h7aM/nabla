@@ -80,7 +80,7 @@ chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: str
 		skills.catalog_destroy(&discovered, chat.allocator)
 		return "", "", {}, "initial instructions exceed the byte limit"
 	}
-	encoded := chat_encode_manifest(chat, roots, files, discovered, rendered, chat.allocator)
+	encoded := chat_encode_manifest(chat, files, discovered, rendered, chat.allocator)
 	if len(encoded) > SKILL_MAX_MANIFEST_BYTES {
 		delete(rendered, chat.allocator)
 		delete(encoded, chat.allocator)
@@ -90,14 +90,9 @@ chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: str
 	return rendered, encoded, discovered, ""
 }
 
-chat_encode_manifest :: proc(
-	chat: ^Chat_Session,
-	roots: []Instruction_Root,
-	files: []Agents_File,
-	catalog: skills.Catalog,
-	rendered: string,
-	allocator := context.allocator,
-) -> string {
+// chat_encode_manifest records the snapshot a later resume applies. The roots it writes are
+// the catalog's own, because every root index it also writes refers to that list.
+chat_encode_manifest :: proc(chat: ^Chat_Session, files: []Agents_File, catalog: skills.Catalog, rendered: string, allocator := context.allocator) -> string {
 	scratch := context.temp_allocator
 	inline_catalog := encode_skill_catalog(catalog, scratch)
 	manifest := Instruction_Manifest {
@@ -107,16 +102,16 @@ chat_encode_manifest :: proc(
 		tools_enabled            = chat.tools_enabled,
 		metadata_format          = SKILL_METADATA_FORMAT_VERSION,
 		instruction_bytes        = len(rendered),
-		roots                    = make([]Instruction_Manifest_Root, len(roots), scratch),
+		roots                    = make([]Instruction_Manifest_Root, len(catalog.roots), scratch),
 		agents                   = make([]Instruction_Manifest_File, len(files), scratch),
 		skills                   = make([]Instruction_Manifest_Skill, len(catalog.skills), scratch),
 		diagnostics              = make([]Instruction_Manifest_Diagnostic, len(catalog.diagnostics), scratch),
 		omitted_diagnostics      = catalog.omitted,
 		inline_catalog_truncated = len(inline_catalog) > SKILL_INLINE_CATALOG_BYTES,
 	}
-	for root, index in roots {
+	for root, index in catalog.roots {
 		manifest.roots[index] = Instruction_Manifest_Root {
-			kind      = instruction_manifest_kind(root.kind),
+			kind      = instruction_manifest_kind(root.source),
 			path      = root.path,
 			authority = root.authority,
 		}
@@ -198,7 +193,7 @@ Instruction_Manifest_Diagnostic :: struct {
 	loser:      string `json:"loser"`,
 }
 
-instruction_manifest_kind :: proc(kind: Instruction_Source_Kind) -> string {
+instruction_manifest_kind :: proc(kind: skills.Source_Kind) -> string {
 	switch kind {
 	case .Nabla_User:
 		return "nabla_user"
@@ -206,6 +201,7 @@ instruction_manifest_kind :: proc(kind: Instruction_Source_Kind) -> string {
 		return "local"
 	case .Generic_User:
 		return "generic_user"
+	case .Unknown:
 	}
 	return "unknown"
 }

@@ -369,7 +369,7 @@ Skill :: struct {
     description:     string,
     logical_path:    string, // logical SKILL.md path for provenance
     directory:       string, // canonical selected directory
-    root_index:      int,
+    root_index:      int,    // index into Catalog.roots, the roots that were entered
     metadata_digest: [32]u8,
 }
 
@@ -570,7 +570,12 @@ It records:
 - Renderer and metadata-parser format versions. Version 1 describes this
   document's contracts; future semantic changes need an explicit compatibility
   path rather than silently reinterpreting a resumed catalog.
-- Ordered roots, selected skills, normalized metadata, and metadata digests.
+- Ordered roots, selected skills, normalized metadata, and metadata digests. The
+  roots are the ones the catalog kept: every `root_index` in the document names that
+  list, so a root discovery discarded cannot be named by a skill that came from
+  another one. Recording the launch's configured roots instead would pair each
+  restored skill with whatever root held its index in a longer list, and a load from
+  that root would refuse the skill as outside its scope.
 - AGENTS.md provenance, scope, content digests, and offsets into `instructions`.
 - Catalog exposure mode, either inline or tool-only.
 - Discovery diagnostics and selected-fallback provenance.
