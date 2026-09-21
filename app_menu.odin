@@ -9,7 +9,6 @@ import "core:sync"
 import "nabla:agent"
 import "nabla:agent/session"
 import input "nabla:input"
-import "nabla:tui/widgets"
 
 menu_begin :: proc(app: ^App, kind: Menu_Kind, title: string, choices: [dynamic]Choice, required: bool) {
 	menu_destroy(&app.menu, app.run.alloc)
@@ -21,7 +20,7 @@ menu_begin :: proc(app: ^App, kind: Menu_Kind, title: string, choices: [dynamic]
 	}
 	app.menu_open = true
 	app.completion_active = false
-	widgets.input_clear(&app.input)
+	prompt_clear(app)
 }
 
 // menu_close drops the open menu and returns the prompt.

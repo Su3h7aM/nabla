@@ -119,6 +119,19 @@ App :: struct {
 	completion_query:   string, // owned,
 	completion_index:   int,
 	completion_active:  bool,
+	// history holds the prompts submitted this run, oldest first;
+	// history_index is the entry the prompt line shows, or len(history) while a
+	// fresh line is composed. Only prompts enter it: a slash command is routed
+	// by dispatch_command and is not one. The zero value works: the list grows
+	// on the first submitted prompt.
+	history:            [dynamic]string, // owned,
+	history_index:      int,
+	// history_draft is the fresh line as the arrow keys left it when they first
+	// walked into history: stepping forward past the newest entry puts it back.
+	// It is what the user is typing rather than a submitted prompt, so it never
+	// joins history, and a whole-line clear drops it. The empty string means
+	// nothing is kept.
+	history_draft:      string, // owned,
 	columns:            int,
 	rows:               int,
 	// conversation_rect is the cells the transcript occupied in the last frame. A

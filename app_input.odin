@@ -113,7 +113,7 @@ complete_command :: proc(app: ^App) {
 	if !app.completion_active { completion_query_set(app, typed) }
 	app.completion_index = index
 	app.completion_active = true
-	widgets.input_clear(&app.input)
+	prompt_clear(app)
 	widgets.input_insert(&app.input, command.name)
 }
 
@@ -345,7 +345,7 @@ cancel_or_quit :: proc(app: ^App) {
 // half-written prompt can neither cancel work nor end the session.
 interrupt :: proc(app: ^App) {
 	if len(widgets.input_text(&app.input)) > 0 {
-		widgets.input_clear(&app.input)
+		prompt_clear(app)
 		return
 	}
 	cancel_or_quit(app)
@@ -372,10 +372,18 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 		widgets.input_move_right(&app.input)
 	case .Up:
 		completion_reset(app)
-		widgets.input_move_up(&app.input, input_content_width(app))
+		// The caret moves between the rows of a multi-line prompt. With no row
+		// above it, the key walks back through the prompts submitted this run.
+		if !widgets.input_move_up(&app.input, input_content_width(app)) {
+			history_back(app)
+		}
 	case .Down:
 		completion_reset(app)
-		widgets.input_move_down(&app.input, input_content_width(app))
+		// The other direction: with no row below, the key steps forward through
+		// the history, and past the newest prompt the line is empty again.
+		if !widgets.input_move_down(&app.input, input_content_width(app)) {
+			history_forward(app)
+		}
 	case .Home:
 		widgets.input_move_home(&app.input)
 	case .End:
@@ -385,7 +393,7 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 			app.cancel_seen = true
 			agent.chat_cancel_request()
 		} else {
-			widgets.input_clear(&app.input)
+			prompt_clear(app)
 		}
 	case .Page_Up:
 		page := app.rows - 3
@@ -423,31 +431,36 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 // submit sends the prompt line as a turn prompt, a steering line, or a slash
 // command. A line typed while a turn runs is queued for the next request boundary
 // instead of being dropped, which is the only point at which it can safely change
-// what the model is asked next.
+// what the model is asked next. A prompt line also enters the history the arrow
+// keys walk; a slash command is not a prompt and does not.
 submit :: proc(app: ^App) {
 	text := strings.trim_space(widgets.input_text(&app.input))
 	if text == "" {
-		widgets.input_clear(&app.input)
+		prompt_clear(app)
 		completion_reset(app)
 		return
 	}
 	if strings.has_prefix(text, "/") {
 		dispatch_command(app, text)
-	} else if runtime_busy(app) {
-		// A steering line is not a command: commands keep their own path, which
-		// decides what can happen while a turn is running.
-		if !agent.steer_push(&app.run.steer, text) {
-			// The queue refused the line, and the prompt still holds it: the text stays
-			// where the user put it rather than being cleared into a warning.
-			snap_append(app, .Warning, "the steering queue is full; the line is still in the prompt")
-			completion_reset(app)
-			return
-		}
-		snap_append(app, .Notice, "queued; the model reads it at the next request")
 	} else {
-		enqueue(app, .Prompt, text)
+		if runtime_busy(app) {
+			// A steering line is not a command: commands keep their own path, which
+			// decides what can happen while a turn is running.
+			if !agent.steer_push(&app.run.steer, text) {
+				// The queue refused the line, and the prompt still holds it: the text stays
+				// where the user put it rather than being cleared into a warning.
+				snap_append(app, .Warning, "the steering queue is full; the line is still in the prompt")
+				completion_reset(app)
+				return
+			}
+			snap_append(app, .Notice, "queued; the model reads it at the next request")
+		} else {
+			enqueue(app, .Prompt, text)
+		}
+		// The line left the prompt, so it enters the history the arrow keys walk.
+		history_push(app, text)
 	}
-	widgets.input_clear(&app.input)
+	prompt_clear(app)
 	completion_reset(app)
 }
 
@@ -470,6 +483,9 @@ restore_steering :: proc(app: ^App) {
 		return
 	}
 	completion_reset(app)
+	// The line is a fresh prompt now, restored text or not: the arrow keys must
+	// treat what it holds as a draft rather than as a recalled entry.
+	app.history_index = len(app.history)
 	if len(taken) == 1 {
 		snap_append(app, .Notice, "the line you typed while that turn ran was not sent; it is back in the prompt")
 	} else {
@@ -568,4 +584,82 @@ paste_insert :: proc(app: ^App, text_value: string) {
 		}
 	}
 	widgets.input_insert(&app.input, strings.to_string(run))
+}
+
+// --- prompt history -------------------------------------------------------
+
+// prompt_clear empties the prompt line and forgets any recalled entry and the
+// kept draft, so the next up arrow starts from the newest prompt. Every clear
+// of the whole line goes through it: history_index says which stored prompt
+// the line shows, and a line cleared any other way would leave it naming text
+// that is gone.
+prompt_clear :: proc(app: ^App) {
+	widgets.input_clear(&app.input)
+	app.history_index = len(app.history)
+	history_draft_drop(app)
+}
+
+// history_push stores a submitted prompt so the arrow keys can recall it. Only
+// prompts reach it: submit routes a slash command to dispatch_command.
+history_push :: proc(app: ^App, text: string) {
+	append(&app.history, strings.clone(text, app.run.alloc))
+}
+
+// history_draft_keep saves the composed line just before history navigation
+// replaces it. The draft is the user's current input rather than a submitted
+// prompt: it stays out of history, and stepping forward past the newest entry
+// puts it back. An empty line keeps nothing, so there is nothing to release.
+history_draft_keep :: proc(app: ^App) {
+	history_draft_drop(app)
+	text := widgets.input_text(&app.input)
+	if text != "" {
+		app.history_draft = strings.clone(text, app.run.alloc)
+	}
+}
+
+// history_draft_drop releases the kept draft, if any.
+history_draft_drop :: proc(app: ^App) {
+	if app.history_draft == "" { return }
+	delete(app.history_draft, app.run.alloc)
+	app.history_draft = ""
+}
+
+// history_back replaces the prompt line with the prompt submitted before the
+// one shown, and history_forward steps the other way: past the newest entry
+// the line is the composed one again, draft and all. What a recall shows is
+// ordinary input, so it can be edited and submitted like anything typed.
+history_back :: proc(app: ^App) {
+	if app.history_index <= 0 { return }
+	// The composed line is about to be replaced, so keep what it holds first:
+	// a stray arrow walking into history must not destroy what is being typed.
+	if app.history_index == len(app.history) {
+		history_draft_keep(app)
+	}
+	app.history_index -= 1
+	history_show(app)
+}
+
+history_forward :: proc(app: ^App) {
+	if app.history_index >= len(app.history) { return }
+	app.history_index += 1
+	history_show(app)
+}
+
+// history_show replaces the line with the entry history_index names, or with
+// the kept draft one past the newest entry.
+history_show :: proc(app: ^App) {
+	widgets.input_clear(&app.input)
+	if app.history_index < len(app.history) {
+		widgets.input_insert(&app.input, app.history[app.history_index])
+	} else if app.history_draft != "" {
+		widgets.input_insert(&app.input, app.history_draft)
+	}
+}
+
+// history_destroy releases every stored prompt, the kept draft, and the list
+// itself.
+history_destroy :: proc(app: ^App) {
+	history_draft_drop(app)
+	for entry in app.history { delete(entry, app.run.alloc) }
+	delete(app.history)
 }

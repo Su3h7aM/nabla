@@ -960,6 +960,8 @@ test_input_during_a_turn_is_steered_not_dropped :: proc(t: ^testing.T) {
 	app.input = widgets.Input{}
 	widgets.input_init(&app.input, app.run.alloc)
 	defer widgets.input_destroy(&app.input)
+	// Both lines below are prompts, so submit stores them in the recall history.
+	defer history_destroy(&app)
 
 	// A running turn takes the line as steering.
 	set_running(&app, true)

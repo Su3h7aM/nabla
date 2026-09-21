@@ -497,7 +497,7 @@ tui_run :: proc(
 		// dismiss it.
 		if app.menu.required && runtime_model_selected(app) {
 			menu_close(app)
-			widgets.input_clear(&app.input)
+			prompt_clear(app)
 		}
 		catalog_updated := catalog_changed(app)
 		if catalog_updated {
@@ -609,6 +609,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 	snapshot_destroy(app)
 	menu_destroy(&app.menu, app.run.alloc)
 	delete(app.completion_query, app.run.alloc)
+	history_destroy(app)
 	delete(app.home, app.run.alloc)
 	widgets.input_destroy(&app.input)
 	input.parser_destroy(&app.parser)

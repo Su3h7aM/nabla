@@ -38,6 +38,7 @@ command_app_end :: proc(app: ^App) {
 	for level in app.run.snap.status.effort_levels { delete(level, app.run.alloc) }
 	delete(app.run.snap.status.effort_levels)
 	chan.destroy(&app.run.work)
+	history_destroy(app)
 	widgets.input_destroy(&app.input)
 }
 
@@ -192,4 +193,96 @@ test_a_menu_can_be_cancelled_but_the_chooser_cannot :: proc(t: ^testing.T) {
 	app.menu.required = true
 	handle_menu_key(&app, {code = .Escape})
 	testing.expect(t, app.quit)
+}
+
+// The up arrow walks back through the prompts submitted this run, newest first.
+// A slash command reaches dispatch_command and is not a prompt, so it never
+// enters the history: two commands around one prompt leave one entry. What a
+// recall shows is ordinary input, so it can be edited before it is sent again.
+@(test)
+test_up_arrow_walks_prompt_history :: proc(t: ^testing.T) {
+	app: App
+	command_app(t, &app)
+	defer command_app_end(&app)
+	app.columns = 40
+
+	// The example: two commands around one prompt, and only the prompt counts.
+	sequence := [?]string{"/help", "Explain how this works", "/help"}
+	for typed in sequence {
+		if !testing.expect(t, widgets.input_insert(&app.input, typed)) { return }
+		submit(&app)
+	}
+	if !testing.expect_value(t, len(app.history), 1) { return }
+
+	// One step back shows the only prompt, and there is nowhere further back.
+	handle_key(&app, {code = .Up})
+	testing.expect_value(t, widgets.input_text(&app.input), "Explain how this works")
+	handle_key(&app, {code = .Up})
+	testing.expect_value(t, widgets.input_text(&app.input), "Explain how this works")
+
+	// The recalled prompt is edited like anything typed...
+	handle_key(&app, {code = .Backspace})
+	testing.expect_value(t, widgets.input_text(&app.input), "Explain how this work")
+
+	// ...and down steps forward again, past the newest entry to a fresh line.
+	handle_key(&app, {code = .Down})
+	testing.expect_value(t, widgets.input_text(&app.input), "")
+
+	// A prompt recalled, edited, and sent enters history like any other.
+	handle_key(&app, {code = .Up})
+	handle_key(&app, {code = .Backspace})
+	submit(&app)
+	if !testing.expect_value(t, len(app.history), 2) { return }
+	handle_key(&app, {code = .Up})
+	testing.expect_value(t, widgets.input_text(&app.input), "Explain how this work")
+
+	// The prompts went to the worker queue; release what they carry.
+	for {
+		work, received := chan.try_recv(app.run.work)
+		if !received { break }
+		work_destroy(&app, work)
+	}
+}
+
+// The line being typed is not a submitted prompt, so an up arrow that walks
+// into history must not destroy it: leaving the fresh line keeps what it
+// holds, and stepping forward past the newest entry puts it back exactly as it
+// was. The draft stays out of the stored prompts.
+@(test)
+test_history_keeps_the_line_being_typed :: proc(t: ^testing.T) {
+	app: App
+	command_app(t, &app)
+	defer command_app_end(&app)
+	// Wide enough that neither line wraps, so the up arrow walks history
+	// instead of moving the caret between rows.
+	app.columns = 80
+
+	// One submitted prompt for the history to hold.
+	if !testing.expect(t, widgets.input_insert(&app.input, "Explain how this works")) { return }
+	submit(&app)
+	if !testing.expect_value(t, len(app.history), 1) { return }
+
+	// The user starts composing, then a stray up arrow walks into history.
+	draft := "Write a detailed explanation about..."
+	if !testing.expect(t, widgets.input_insert(&app.input, draft)) { return }
+	handle_key(&app, {code = .Up})
+	testing.expect_value(t, widgets.input_text(&app.input), "Explain how this works")
+
+	// Down returns to exactly what was being typed...
+	handle_key(&app, {code = .Down})
+	testing.expect_value(t, widgets.input_text(&app.input), draft)
+
+	// ...the draft never entered history itself...
+	testing.expect_value(t, len(app.history), 1)
+
+	// ...and the next walk finds the same single entry.
+	handle_key(&app, {code = .Up})
+	testing.expect_value(t, widgets.input_text(&app.input), "Explain how this works")
+
+	// The prompt submit entered the worker queue; release what it carries.
+	for {
+		work, received := chan.try_recv(app.run.work)
+		if !received { break }
+		work_destroy(&app, work)
+	}
 }
