@@ -56,6 +56,63 @@ return result.status .. ":" .. result.data.text .. ":" .. tostring(result.data.i
 	testing.expect_value(t, text, "success:done:2:true")
 }
 
+// A wrapper takes no argument or exactly one table. A second argument is refused rather
+// than discarded, because silently using one of two is a bug the script cannot see.
+@(test)
+code_mode_value_refuses_a_second_argument :: proc(t: ^testing.T) {
+	run := code_mode_value_test_start(t, `return tools.test_echo({}, {})`)
+	defer code_mode_lua_destroy(run)
+	testing.expect(t, code_mode_lua_install_tool(run, "test_echo"), "the tool should install")
+	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Host_Request)
+
+	arguments, message := code_mode_lua_request_json(run, context.allocator)
+	defer delete(arguments, context.allocator)
+	defer delete(message, context.allocator)
+	testing.expect_value(t, arguments, "")
+	testing.expect_value(t, message, "test_echo takes one table of arguments, and was given 2")
+}
+
+// One table is the whole argument contract. A scalar is a mistake in the script, not a
+// call the harness should forward and let the tool refuse.
+@(test)
+code_mode_value_refuses_a_non_table_argument :: proc(t: ^testing.T) {
+	run := code_mode_value_test_start(t, `return tools.test_echo("README.md")`)
+	defer code_mode_lua_destroy(run)
+	testing.expect(t, code_mode_lua_install_tool(run, "test_echo"), "the tool should install")
+	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Host_Request)
+
+	arguments, message := code_mode_lua_request_json(run, context.allocator)
+	defer delete(arguments, context.allocator)
+	defer delete(message, context.allocator)
+	testing.expect_value(t, arguments, "")
+	testing.expect_value(t, message, "test_echo takes one table of named arguments")
+}
+
+// print is the harness's, so it renders the values a script prints while debugging
+// without ever calling into script code.
+@(test)
+code_mode_value_prints_the_values_a_script_debugs_with :: proc(t: ^testing.T) {
+	run := code_mode_value_test_start(
+		t,
+		`print("text", 42, true, false, nil, json.null)
+print({ok = true, items = {1, 2}})
+print({bad = function() end})
+return "done"`,
+	)
+	defer code_mode_lua_destroy(run)
+	event := code_mode_lua_resume(run)
+	for event == .Slice { event = code_mode_lua_resume(run) }
+	testing.expect_value(t, event, Lua_Event.Returned)
+
+	logs := code_mode_lua_logs(run)
+	lines := strings.split(logs, "\n", context.temp_allocator)
+	if !testing.expect_value(t, len(lines), 4) { return }
+	testing.expect_value(t, lines[0], "text 42 true false nil null")
+	testing.expect(t, strings.contains(lines[1], `"ok":true`), lines[1])
+	testing.expect(t, strings.contains(lines[1], `"items":[1,2]`), lines[1])
+	testing.expect_value(t, lines[2], "<table>")
+}
+
 @(test)
 code_mode_value_rejects_cycles :: proc(t: ^testing.T) {
 	run := code_mode_value_test_start(t, `local value = {}

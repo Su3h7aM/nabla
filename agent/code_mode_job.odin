@@ -160,6 +160,7 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 	}
 	arguments, message := code_mode_lua_request_json(parent.lua, parent.allocator)
 	if message != "" {
+		defer delete(message, parent.allocator)
 		parent.result = code_mode_failure(&parent.exec, .Invalid_Arguments, .Invalid_Value, message, "invalid child arguments")
 		parent.result_present = true
 		parent.phase = .Result_Ready

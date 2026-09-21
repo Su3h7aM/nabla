@@ -2,6 +2,7 @@ package agent
 
 import "base:runtime"
 import c "core:c"
+import "core:encoding/json"
 import "core:mem"
 import "core:strings"
 import "core:time"
@@ -123,12 +124,14 @@ Lua_Request_Kind :: enum {
 // Lua_Request is one pending host request. name is owned by the run and valid until
 // the request is answered or the run is destroyed. args_ref is a registry reference
 // to the argument value, so the owner can convert it before answering without holding
-// it on the coroutine stack.
+// it on the coroutine stack. arg_count is how many arguments the wrapper was called
+// with, which the owner checks because only it can report a refusal.
 Lua_Request :: struct {
-	kind:     Lua_Request_Kind,
-	name:     string,
-	args_ref: c.int,
-	pending:  bool,
+	kind:      Lua_Request_Kind,
+	name:      string,
+	args_ref:  c.int,
+	arg_count: int,
+	pending:   bool,
 }
 
 // Lua_Run is one execution. Every field is owned by the run or an observed count.
@@ -306,6 +309,11 @@ code_mode_lua_hook :: proc "c" (L: ^l.State, ar: ^l.Debug) {
 // upvalue is the tool's canonical name. It records the request, takes a reference to
 // the argument value, and suspends; the owner answers with `deliver`, and the
 // continuation returns the delivered value to the script as the call's result.
+//
+// The argument count is recorded rather than enforced here: a boundary refusal is the
+// owner's to raise, and this callback has no allocator to build a message with. A
+// wrapper takes no argument or exactly one, so a second one is refused instead of
+// silently discarded.
 @(private)
 code_mode_lua_tool_call :: proc "c" (L: ^l.State) -> c.int {
 	run := code_mode_lua_run(L)
@@ -318,12 +326,14 @@ code_mode_lua_tool_call :: proc "c" (L: ^l.State) -> c.int {
 		text := l.tolstring(L, l.REGISTRYINDEX - 1, &length)
 		if text != nil { name = code_mode_lua_string_clone(string(text), run.allocator) }
 	}
+	count := int(l.gettop(L))
 	args_ref: c.int = l.REFNIL
-	if l.gettop(L) >= 1 { args_ref = l.L_ref(L, l.REGISTRYINDEX) }
+	if count == 1 { args_ref = l.L_ref(L, l.REGISTRYINDEX) }
 
 	run.request.kind = .Call
 	run.request.name = name
 	run.request.args_ref = args_ref
+	run.request.arg_count = count
 	run.request.pending = true
 	return c.int(l.yield(L, 0, 0, code_mode_lua_tool_resume))
 }
@@ -406,9 +416,10 @@ code_mode_lua_restrict :: proc(L: ^l.State) {
 	code_mode_lua_remove_field(L, "string", "dump")
 }
 
-// code_mode_lua_print appends one line to the run's bounded log. Numbers become their
-// Lua text; anything else becomes a type name, because calling `tostring` would run a
-// metatable the harness does not control.
+// code_mode_lua_print appends one line to the run's bounded log. It never calls
+// `tostring`, because that consults a metatable, and the harness cannot run script code
+// from the host side. It does not need to: the restricted environment removes every way
+// to attach a metatable, so the types a script prints are the types it made.
 @(private)
 code_mode_lua_print :: proc "c" (L: ^l.State) -> c.int {
 	run := code_mode_lua_run(L)
@@ -419,17 +430,67 @@ code_mode_lua_print :: proc "c" (L: ^l.State) -> c.int {
 	count := l.gettop(L)
 	for index in 1 ..= int(count) {
 		if index > 1 { code_mode_lua_log_append(run, " ") }
-		text, ok := code_mode_lua_stack_string(L, c.int(index))
-		if ok {
-			code_mode_lua_log_append(run, text)
-		} else {
-			code_mode_lua_log_append(run, "<")
-			code_mode_lua_log_append(run, string(l.typename(L, l.type(L, c.int(index)))))
-			code_mode_lua_log_append(run, ">")
-		}
+		code_mode_lua_log_value(run, L, c.int(index))
 	}
 	code_mode_lua_log_append(run, "\n")
 	return 0
+}
+
+// code_mode_lua_log_value writes one printed value. Strings and numbers are their own
+// text, booleans and nil have fixed spellings, the null sentinel is spelled as its JSON
+// name, and a table is written as its bounded JSON form, which is what makes `print`
+// usable while debugging a script. Anything else can only be named.
+@(private)
+code_mode_lua_log_value :: proc(run: ^Lua_Run, L: ^l.State, index: c.int) {
+	switch l.type(L, index) {
+	case .NIL:
+		code_mode_lua_log_append(run, "nil")
+	case .BOOLEAN:
+		code_mode_lua_log_append(run, l.toboolean(L, index) != false ? "true" : "false")
+	case .LIGHTUSERDATA:
+		// The only light userdata the environment hands out is the null sentinel.
+		code_mode_lua_log_append(run, l.touserdata(L, index) == rawptr(run) ? "null" : "<lightuserdata>")
+	case .TABLE:
+		code_mode_lua_log_table(run, L, index)
+	case .STRING, .NUMBER:
+		if text, ok := code_mode_lua_stack_string(L, index); ok {
+			code_mode_lua_log_append(run, text)
+		} else {
+			code_mode_lua_log_append(run, "<value>")
+		}
+	case .NONE, .FUNCTION, .USERDATA, .THREAD:
+		code_mode_lua_log_append(run, "<")
+		code_mode_lua_log_append(run, string(l.typename(L, l.type(L, index))))
+		code_mode_lua_log_append(run, ">")
+	}
+}
+
+// code_mode_lua_log_table writes a table as JSON. A table the conversion refuses is a
+// type name: `print` is a diagnostic, and it must not turn a script's own bad value into
+// a boundary failure. The traversal is bounded well below the argument bound because the
+// log it feeds holds 8 KiB.
+@(private)
+code_mode_lua_log_table :: proc(run: ^Lua_Run, L: ^l.State, index: c.int) {
+	state := Code_Mode_Value_State {
+		allocator     = run.allocator,
+		null_identity = rawptr(run),
+		max_nodes     = CODE_MODE_LOG_MAX_NODES,
+	}
+	state.seen = make(map[rawptr]bool, run.allocator)
+	defer delete(state.seen)
+	value, message := code_mode_lua_to_json_value(L, index, &state, 0)
+	if message != "" {
+		code_mode_lua_log_append(run, "<table>")
+		return
+	}
+	defer json.destroy_value(value, run.allocator)
+	encoded, encode_err := json.marshal(value, allocator = run.allocator)
+	if encode_err != nil {
+		code_mode_lua_log_append(run, "<table>")
+		return
+	}
+	defer delete(encoded, run.allocator)
+	code_mode_lua_log_append(run, string(encoded))
 }
 
 // code_mode_lua_stack_string reads a value that is already text. Strings and numbers

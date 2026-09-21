@@ -2,6 +2,7 @@ package agent
 
 import c "core:c"
 import "core:encoding/json"
+import "core:fmt"
 import "core:mem"
 import "core:strings"
 import l "vendor:lua/5.4"
@@ -13,18 +14,31 @@ import l "vendor:lua/5.4"
 
 CODE_MODE_VALUE_MAX_NODES :: 16_384
 
+// CODE_MODE_LOG_MAX_NODES bounds the JSON form of one printed table. The log it feeds
+// holds 8 KiB, so a traversal larger than that could only be discarded.
+CODE_MODE_LOG_MAX_NODES :: 256
+
 Code_Mode_Value_State :: struct {
 	allocator:     mem.Allocator,
 	seen:          map[rawptr]bool,
 	null_identity: rawptr,
 	nodes:         int,
+	max_nodes:     int, // zero means CODE_MODE_VALUE_MAX_NODES
 }
 
 // code_mode_lua_request_json copies the pending request's argument into one bounded
-// JSON document. A wrapper called with no argument gets an empty object, which is the
+// JSON object. A wrapper called with no argument gets an empty object, which is the
 // natural default for a tool call.
+//
+// A wrapper takes no argument or exactly one object. A second argument and a value that
+// is not a table of named arguments are both refused: each is a mistake in the script,
+// and answering the call with an empty or partial object would hide it. A non-empty
+// message is owned by the caller.
 code_mode_lua_request_json :: proc(run: ^Lua_Run, allocator: mem.Allocator) -> (string, string) {
 	if run == nil || run.thread == nil || !run.request.pending { return "", "there is no pending tool request" }
+	if run.request.arg_count > 1 {
+		return "", fmt.aprintf("%s takes one table of arguments, and was given %d", run.request.name, run.request.arg_count, allocator = allocator)
+	}
 	if run.request.args_ref == l.REFNIL || run.request.args_ref == l.NOREF { return strings.clone("{}", allocator), "" }
 
 	_ = l.rawgeti(run.thread, l.REGISTRYINDEX, l.Integer(run.request.args_ref))
@@ -38,6 +52,9 @@ code_mode_lua_request_json :: proc(run: ^Lua_Run, allocator: mem.Allocator) -> (
 	value, message := code_mode_lua_to_json_value(run.thread, -1, &state, 0)
 	if message != "" { return "", message }
 	defer json.destroy_value(value, allocator)
+	if _, is_object := value.(json.Object); !is_object {
+		return "", fmt.aprintf("%s takes one table of named arguments", run.request.name, allocator = allocator)
+	}
 	encoded, encode_err := json.marshal(value, allocator = allocator)
 	if encode_err != nil { return "", "the tool arguments could not be encoded" }
 	return string(encoded), ""
@@ -47,7 +64,9 @@ code_mode_lua_request_json :: proc(run: ^Lua_Run, allocator: mem.Allocator) -> (
 code_mode_lua_to_json_value :: proc(L: ^l.State, index: c.int, state: ^Code_Mode_Value_State, depth: int) -> (json.Value, string) {
 	if depth > TOOL_MAX_ARGS_DEPTH { return {}, "the value nests more than 32 levels deep" }
 	state.nodes += 1
-	if state.nodes > CODE_MODE_VALUE_MAX_NODES { return {}, "the value contains more than 16384 elements" }
+	limit := state.max_nodes
+	if limit <= 0 { limit = CODE_MODE_VALUE_MAX_NODES }
+	if state.nodes > limit { return {}, "the value contains more elements than the boundary allows" }
 
 	switch l.type(L, index) {
 	case .NIL:

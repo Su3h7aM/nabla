@@ -297,6 +297,8 @@ return true
 lua_print_is_captured_and_bounded :: proc(t: ^testing.T) {
 	run := lua_test_start(t, `print("hello", 42)
 print({})
+print({nested = {1, 2}})
+print({bad = function() end})
 print(string.rep("x", 20000))
 return true
 `)
@@ -305,7 +307,9 @@ return true
 	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Returned)
 	logs := code_mode_lua_logs(run)
 	testing.expect(t, strings.has_prefix(logs, "hello 42\n"), "print should capture strings and numbers")
-	testing.expect(t, strings.contains(logs, "<table>"), "a table should be reported as a table")
+	testing.expect(t, strings.contains(logs, "\n{}\n"), "an empty table should print as an empty object")
+	testing.expect(t, strings.contains(logs, `{"nested":[1,2]}`), "a table should print as its JSON form")
+	testing.expect(t, strings.contains(logs, "\n<table>\n"), "a table JSON cannot hold should be named")
 	testing.expect(t, len(logs) <= LUA_MAX_LOG_BYTES, "the log should stay inside its budget")
 	testing.expect(t, code_mode_lua_logs_truncated(run), "the oversized line should mark the log truncated")
 }

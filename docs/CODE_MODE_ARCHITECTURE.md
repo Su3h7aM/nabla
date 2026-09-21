@@ -162,7 +162,9 @@ return {
 ```
 
 A wrapper takes exactly one argument object, with zero arguments normalized to an
-empty object. More than one argument is invalid. Its call submits a child and awaits
+empty object. More than one argument is refused, and so is a value that is not a table
+of named arguments: silently using the last of two arguments, or forwarding a scalar for
+a tool to refuse, would hide a mistake in the script. Its call submits a child and awaits
 it before returning. The script looks sequential; the host does not block.
 
 The chunk returns zero or one value. No return becomes JSON null. Multiple returned
@@ -1085,7 +1087,11 @@ new host operation.
 metatable and raw-write functions are absent so host-side conversion can never run
 script code, and `pcall`/`xpcall` are absent because a tool outcome is a value, which
 leaves nothing to catch and keeps a memory refusal out of the script's reach. `print`
-is the harness's and appends to the run's bounded log.
+is the harness's and appends to the run's bounded log. It renders strings and numbers as
+their own text, booleans and nil with fixed spellings, the null sentinel as `null`, and a
+table as its JSON form, so a script can inspect what it built. It never calls `tostring`:
+with every way to attach a metatable removed, the types a script prints are the types it
+made, and the host still runs no script code while converting a log line.
 
 Measured here with the default limits: opening the restricted libraries and compiling a
 small chunk costs about 15 KiB of Lua-managed memory, and a first run that builds a
@@ -1213,6 +1219,13 @@ Still to implement from section 12: compact child-call summaries, the
 `unfinished_tasks` kind for the concurrent-handle form, and the per-execution child
 call limit of 32. Today a nested call is bounded by the table's own `TOOL_JOBS_MAX`,
 which is a batch limit rather than a per-script one.
+
+The wrapper and `print` contracts are enforced in the same place the arguments are
+converted. A wrapper takes no argument or exactly one table of named arguments, and
+`print` renders the values a script debugs with instead of only naming their types. Both
+were settled by running the tool from inside a session and watching what a script
+actually received: a second argument was silently discarded, and a table printed as
+`<table>`.
 
 ## 15. Decisions deliberately left open
 
