@@ -290,7 +290,7 @@ test_a_chain_of_failures_ends_in_one_answer :: proc(t: ^testing.T) {
 // that ended for a reason of its own claims none.
 @(test)
 test_the_turn_record_carries_its_typed_failure :: proc(t: ^testing.T) {
-	exhausted := chat_turn_error_json("the request does not fit the context: no summary", .Context_Exhausted, true, .No_Candidate)
+	exhausted := chat_turn_error_json("the request does not fit the context: no summary", .Context_Exhausted, .No_Candidate)
 	value, parse_err := json.parse_string(exhausted, .JSON, true, context.temp_allocator)
 	if parse_err != nil { testing.fail_now(t, "the turn record is not valid JSON") }
 	defer json.destroy_value(value, context.temp_allocator)
@@ -303,7 +303,7 @@ test_the_turn_record_carries_its_typed_failure :: proc(t: ^testing.T) {
 	version, _ := object["format_version"].(json.Integer)
 	testing.expect_value(t, i64(version), i64(CHAT_TURN_ERROR_VERSION))
 
-	own := chat_turn_error_json("the tool failed", .Completed, false, .None)
+	own := chat_turn_error_json("the tool failed", nil, .None)
 	value, parse_err = json.parse_string(own, .JSON, true, context.temp_allocator)
 	if parse_err != nil { testing.fail_now(t, "the turn record is not valid JSON") }
 	defer json.destroy_value(value, context.temp_allocator)

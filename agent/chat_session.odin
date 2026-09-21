@@ -156,16 +156,14 @@ Chat_Session :: struct {
 	// the status line without touching the store from another thread. Usage
 	// accumulation lives in the store: a refresh sums finished requests, so the
 	// session totals never depend on which stream events already arrived.
-	last_input_measured:          i64,
-	last_input_measured_present:  bool,
+	last_input_measured:          Maybe(i64),
 	last_estimate:                int,
 	// turn_recovery and turn_repair_refusal are why the last turn ended without
 	// completing: the reason its chain stopped, and, when the context did not fit, what
 	// stood in the way of making room. They are typed rather than read back out of a
 	// message, so the turn's record and a front-end can tell "no summary exists" from
 	// "the summary did not free enough" without parsing prose.
-	turn_recovery:                Request_Recovery_Reason,
-	turn_recovery_present:        bool,
+	turn_recovery:                Maybe(Request_Recovery_Reason),
 	turn_repair_refusal:          Chat_Repair_Refusal,
 	// response_cost is what the response the running turn committed added to the
 	// model's context. A tool batch's budget subtracts it, because the response is
@@ -421,7 +419,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat.next_turn_id += 1
 	chat.state = .Preparing
 	chat.terminal_status = .None
-	chat.turn_recovery_present = false
+	chat.turn_recovery = nil
 	chat.turn_repair_refusal = .None
 	chat.active_failed = false
 	chat.requests_made = 0
@@ -508,7 +506,7 @@ chat_session_accepts_event :: proc(chat: ^Chat_Session, source: Chat_Event_Sourc
 chat_session_begin_operation :: proc(chat: ^Chat_Session) {
 	id := chat.next_operation_id
 	chat.next_operation_id += 1
-	chat_operation_start(&chat.operation, id, chat.active_turn_id)
+	chat_operation_start(&chat.operation, id)
 }
 
 // chat_session_cancellable reports whether the turn still has work a cancellation

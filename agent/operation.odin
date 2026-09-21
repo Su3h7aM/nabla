@@ -23,18 +23,16 @@ Chat_Operation_State :: enum {
 }
 
 // Chat_Operation is one model request within a turn. It carries the operation's
-// identity and the event source its events must match.
+// identity and whether the work it names is still running.
 Chat_Operation :: struct {
-	id:      u64,
-	turn_id: u64,
-	state:   Chat_Operation_State,
+	id:    u64,
+	state: Chat_Operation_State,
 }
 
-chat_operation_start :: proc(operation: ^Chat_Operation, id, turn_id: u64) {
+chat_operation_start :: proc(operation: ^Chat_Operation, id: u64) {
 	operation^ = Chat_Operation {
-		id      = id,
-		turn_id = turn_id,
-		state   = .Running,
+		id    = id,
+		state = .Running,
 	}
 }
 

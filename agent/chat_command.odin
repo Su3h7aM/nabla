@@ -79,7 +79,7 @@ chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms:
 		answer_room = fmt.tprintf("%d", output)
 	}
 	measured := "none"
-	if chat.last_input_measured_present { measured = fmt.tprintf("%d", chat.last_input_measured) }
+	if value, present := chat.last_input_measured.?; present { measured = fmt.tprintf("%d", value) }
 	chat_status_line(observer, "usage", fmt.tprintf("estimate %s, measured %s, answer room %s", estimate, measured, answer_room))
 
 	// Session usage is a query over finished requests, so this line also fails

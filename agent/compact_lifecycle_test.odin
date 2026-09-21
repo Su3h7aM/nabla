@@ -590,9 +590,10 @@ test_a_rejected_payload_with_nothing_to_install_ends_the_turn :: proc(t: ^testin
 	testing.expect_value(t, len(provider.requests), 1)
 	testing.expect_value(t, chat_session_repair_refusal(chat), Chat_Repair_Refusal.No_Candidate)
 	testing.expect_value(t, chat_session_terminal_status(chat), Chat_Terminal_Status.Failed)
-	reason, has_reason := chat_session_recovery_reason(chat)
+	reason := chat_session_recovery_reason(chat)
+	value, has_reason := reason.?
 	testing.expect(t, has_reason, "the turn records why its chain stopped")
-	testing.expect_value(t, reason, Request_Recovery_Reason.Context_Exhausted)
+	testing.expect_value(t, value, Request_Recovery_Reason.Context_Exhausted)
 	// The session keeps the pressure, so the next safe boundary starts the summary this
 	// refusal was missing.
 	testing.expect_value(t, chat.compact.pending, Compact_Trigger.Provider_Overflow)

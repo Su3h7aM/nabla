@@ -938,7 +938,7 @@ chat_compact_install :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 	// The measurement described the context that just went away, and so did the
 	// endpoint's report of it.
 	chat.last_estimate = 0
-	chat.last_input_measured_present = false
+	chat.last_input_measured = nil
 	return true
 }
 

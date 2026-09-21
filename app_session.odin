@@ -615,7 +615,7 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 	// rather than a window and an output bound to divide again later.
 	running.capacity = model.capacity
 	running.last_estimate = 0
-	running.last_input_measured_present = false
+	running.last_input_measured = nil
 	running.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(api)
 	// The request record names the provider and model each request was sent to,
 	// so the running session carries them.

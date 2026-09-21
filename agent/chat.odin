@@ -123,7 +123,6 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	case ai.Provider_Usage_Event:
 		if value.Input_Tokens_Present {
 			runtime.chat.last_input_measured = value.Input_Tokens
-			runtime.chat.last_input_measured_present = true
 		}
 		if runtime.usage_log != nil {
 			append(runtime.usage_log, Chat_Request_Usage{operation = u64(runtime.chat.operation.id), usage = value})
@@ -190,7 +189,6 @@ chat_perform_request :: proc(
 			// The request never reached a provider, so the turn ends with the reason
 			// admission refused it rather than with a send that did not happen.
 			chat.turn_recovery = .Context_Exhausted
-			chat.turn_recovery_present = true
 			if chat_session_cancelled(chat) {
 				chat_session_note_cancel(chat)
 			} else {
@@ -555,7 +553,6 @@ chat_perform_request :: proc(
 	// stopped trying.
 	if decision.reason != .Completed {
 		chat.turn_recovery = decision.reason
-		chat.turn_recovery_present = true
 		level := log.Level.Warning
 		if decision.reason == .Cancelled { level = .Info }
 		stopped := [4]Log_Field {
@@ -815,7 +812,7 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	}
 	error_json := ""
 	if effect.error != "" {
-		error_json = chat_turn_error_json(effect.error, chat.turn_recovery, chat.turn_recovery_present, chat.turn_repair_refusal)
+		error_json = chat_turn_error_json(effect.error, chat.turn_recovery, chat.turn_repair_refusal)
 	}
 
 	if turn_err := session.turn_finish(chat.store, chat.id, turn_no, outcome, error_json, at_ms); turn_err != nil {

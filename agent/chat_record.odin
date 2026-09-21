@@ -382,13 +382,13 @@ Chat_Turn_Error :: struct {
 }
 
 @(private)
-chat_turn_error_json :: proc(message: string, reason: Request_Recovery_Reason, reason_present: bool, refusal: Chat_Repair_Refusal) -> string {
+chat_turn_error_json :: proc(message: string, reason: Maybe(Request_Recovery_Reason), refusal: Chat_Repair_Refusal) -> string {
 	record := Chat_Turn_Error {
 		format_version = CHAT_TURN_ERROR_VERSION,
 		cause          = chat_repair_refusal_name(refusal),
 		message        = message,
 	}
-	if reason_present { record.reason = request_recovery_reason_name(reason) }
+	if value, present := reason.?; present { record.reason = request_recovery_reason_name(value) }
 	data, marshal_err := json.marshal(record, allocator = context.temp_allocator)
 	if marshal_err != nil { return "" }
 	return string(data)
