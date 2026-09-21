@@ -33,17 +33,28 @@ Each is required work, not a design choice. Do not treat current behavior as cor
 
 | Gap | Target |
 | --- | --- |
-| `chat_perform_request` is one blocking procedure covering preparation, compaction, admission, transport setup, retry and commit | Extract prepared artifacts, validators and recovery decisions; make request stages owner-observable per [execution](EXECUTION_ARCHITECTURE.md) |
-| `chat_session_advance` increments turn accounting while selecting an effect | Selector becomes side-effect free; the driver advances counters on the accepted transition |
-| Streaming state changes arrive through callbacks, so tests cannot drive the request path through the machine | Route request/stream facts through the shared owner mailbox |
-| Tool selection (`tool_jobs_next`) collects completions and emits stop logs | Split observation/application from selection; keep selection pure |
-| A worker that ignores its stop is answered Unknown and marked `Stuck`, while the batch releases borrowed session/backend/skill data | Retain producer-owned data and borrowed generations until actual retirement; mark the runtime unusable and let root shut down when a worker does not stop |
-| Batch admission validates each call at dispatch rather than the whole root batch before effects | Add the pre-effect batch gate; keep all-or-nothing staging |
+| `chat_perform_request` still holds the retry loop, the durable attempt row, and the context-repair branch inline; transport setup and one model send are extracted | Keep extracting stages as tests need them; the loop should read as policy over named artifacts |
+| Provider stream facts arrive through callbacks inside the blocking send, so the request path cannot be driven from events alone | Route request/stream facts through the shared owner mailbox so a test can drive the whole turn |
 | No aggregate retained-byte budget or session retention quota; child results are exempt from the model budget but not from a storage bound | Add measured byte limits for root, child and session retention with an explicit settlement reserve |
 | Retry waits, tool waits and idle compaction use separate fixed 50 ms slices | One owner wake mechanism with nearest real deadline; no ordinary polling |
 | WebSocket transport defaults to HTTP and `auto` fallback is partial | Complete the correctness/cache gates, then adopt the target default |
 | Provider prompt-cache parity and complete provider-error classification are not fully verified | Close the [network](NETWORK_STACK_ARCHITECTURE.md) corrections and measure |
-| Skills 2 MiB result exception described by the former design does not exist; code already uses the shared 64 KiB bound | Documented as shared; no code change needed |
+
+Closed since this document was written:
+
+- `chat_session_advance` is a read: the driver claims the request, and counters advance on
+the accepted transition.
+- Tool observation is separate from selection: `tool_jobs_observe` applies external facts,
+and `tool_jobs_next` reads the table.
+- A tool worker that ignores its stop latches the session; no further turn is admitted and
+teardown leaves what the worker can reach to process exit.
+- The test-only tool driver lives in the test support file, so production has one tool
+driver.
+- `Chat_Effect` owns nothing; the session owns the terminal error.
+- Duplicate operation id, the no-op `Streaming` state, and `Chat_Operation.turn_id` are gone.
+- Batch validation is split by meaning: defective call identity refuses the response,
+per-call admission refuses that call. See [tools](TOOLS_MCP_ARCHITECTURE.md).
+- Skills use the shared 64 KiB result bound; no separate exception exists.
 
 ## Future capabilities with no implementation
 

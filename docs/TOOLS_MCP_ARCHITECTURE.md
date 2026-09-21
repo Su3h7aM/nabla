@@ -51,35 +51,40 @@ Descriptions carry model guidance. Do not synthesize a tool dependency manifest 
 hints or require a read-before-edit history ledger. Real preconditions, such as an
 edit's exact-match requirement, belong to that tool's deterministic validator.
 
-## Batch admission before effects
+## Batch staging and per-call admission
 
-A response is an untrusted proposal. Validate the entire root batch before any call
-runs or any executable call record commits:
+A response is an untrusted proposal, and the two levels of validation are deliberate.
 
-1. Require a complete accepted provider response, unique nonempty identities, valid
-   names, and bounded call count and argument bytes.
-2. Resolve every name against the frozen registry and check invocation eligibility.
-3. Parse complete JSON objects with duplicate-key and depth checks. Apply only an
-   exact documented syntactic repair, currently escaping raw control bytes inside
-   otherwise unambiguous string literals. Revalidate the whole repaired document.
-4. Validate native field types, ranges and known names without external effects.
-   Preserve the server-validation boundary for MCP.
-5. Reserve job/input capacity and terminal-result allowance for the whole batch.
-6. Commit the accepted response and raw calls atomically, then transfer admitted jobs
-   to the machine. Dispatch records retain the exact effective argument bytes.
+**Response staging (protocol identity).** Before the response or any call is committed,
+require a complete accepted provider response, unique nonempty call identities, a
+nonempty tool name per call, and bounded call count and argument bytes. A response whose
+identities are defective refuses the whole proposal: the protocol is broken, so nothing
+executes. The harness records the response text and a typed notice as harness feedback
+and the turn continues with another request. It never guesses a missing id, picks one of
+two duplicate ids, or executes the valid-looking siblings of a broken batch.
 
-An invalid name, malformed argument document, oversized batch or local validation
-failure refuses the entire proposal. Execute none of its valid siblings. Record a
-typed rejection and bounded model feedback instead of half an executable batch.
-Do not invent arguments, choose one duplicate key, drop unknown fields or ask another
-model to guess a repair. This gate prevents avoidable partial effects; it is not a
-transaction around tool execution. Files and remote services can change after
-admission, and a later runtime failure does not undo earlier calls.
+**Per-call admission (the call's own contract).** After the batch commits, each call is
+admitted before its dispatch: resolve the name against the frozen registry and check
+invocation eligibility; parse a complete JSON object with duplicate-key and depth checks;
+apply only the documented syntactic repair (escaping raw control bytes inside otherwise
+unambiguous string literals) and revalidate the whole document; validate native field
+types, ranges and known names without external effects; reserve job and terminal-result
+capacity. A call that fails admission is refused with a recorded result and the other
+calls proceed. A batch is never half-committed: every committed call gets exactly one
+result.
 
-Child calls enter the same admission checks one at a time. Their parent may already
-have performed effects, so a rejected child is an ordinary refusal, not rollback of
-the script. If a call has already committed, it owes a result even when cancellation,
-launch failure or a later resource check prevents execution.
+Per-call admission is the right granularity because tool calls are independent. Refusing
+a whole batch because one call names an unknown tool would discard useful work and hide
+which call was wrong. The harness refuses the whole batch only when the response itself
+cannot be trusted as a list of calls. This is not a transaction around tool execution:
+files and remote services can change after admission, and a later runtime failure does
+not undo earlier calls. Preserve the server-validation boundary for MCP; a native field
+check is not a claim about a remote peer's schema.
+
+Child calls enter the same admission one at a time. Their parent may already have
+performed effects, so a rejected child is an ordinary refusal, not rollback of the
+script. If a call has already committed, it owes a result even when cancellation, launch
+failure or a later resource check prevents execution.
 
 Structural inability to stage the response, such as allocation failure, stops the
 turn rather than manufacturing a model error. Reserve settlement capacity before
