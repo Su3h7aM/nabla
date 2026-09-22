@@ -183,6 +183,83 @@ test_recovery_separates_running_from_never_run :: proc(t: ^testing.T) {
 	testing.expect_value(t, outcomes[never_ran], Tool_Outcome.Not_Executed)
 }
 
+// A call a Code Mode script made is a tool call like any other, so a restart settles it the
+// same way. A resumed session must never show a child call that has no answer, and the child a
+// script dispatched is the one whose outcome the harness does not know.
+@(test)
+test_recovery_settles_a_nested_call :: proc(t: ^testing.T) {
+	store: Store
+	directory := _open_store(t, &store)
+	defer _close_store(&store, directory)
+
+	session := _open_claimed_session(t, &store)
+	defer session_destroy(&session)
+
+	turn, turn_err := turn_begin(&store, session.id, "run a script", .Prompt, 2_000)
+	_expect_ok(t, turn_err)
+	request, request_err := request_begin(
+		&store,
+		session.id,
+		{turn_no = turn, purpose = .Response, provider = "p", model_requested = "m", api = "a", config_json = "{}", input_json = "{}"},
+		2_100,
+	)
+	_expect_ok(t, request_err)
+	script, script_err := entry_append(
+		&store,
+		session.id,
+		{
+			turn_no = turn,
+			request_no = request,
+			created_at_ms = 2_200,
+			payload = Tool_Call_Entry{call_id = "call_script", name = "builtin_code", arguments = "{}"},
+		},
+	)
+	_expect_ok(t, script_err)
+	child, child_err := entry_append(
+		&store,
+		session.id,
+		{
+			turn_no = turn,
+			request_no = request,
+			created_at_ms = 2_250,
+			parent_call_seq = script,
+			payload = Tool_Call_Entry{call_id = "call_child", name = "read", arguments = "{}"},
+		},
+	)
+	_expect_ok(t, child_err)
+	_, dispatch_err := entry_append(
+		&store,
+		session.id,
+		{turn_no = turn, request_no = request, created_at_ms = 2_300, related_seq = child, payload = Tool_Dispatch_Entry{tool = "read"}},
+	)
+	_expect_ok(t, dispatch_err)
+
+	recovery, recover_err := session_recover(&store, session.id, {at_ms = 2_400, recovered_content = RECOVERED_RESULT, unexecuted_content = UNEXECUTED_RESULT})
+	_expect_ok(t, recover_err)
+	testing.expect_value(t, recovery.recovered_calls, 1)
+	testing.expect_value(t, recovery.unexecuted_calls, 1)
+
+	entries, load_err := entries_load(&store, session.id, {})
+	_expect_ok(t, load_err)
+	defer entries_destroy(entries)
+	outcomes := map[Seq]Tool_Outcome{}
+	defer delete(outcomes)
+	for entry in entries {
+		result, is_result := entry.payload.(Tool_Result_Entry)
+		if !is_result { continue }
+		related, present := entry.related_seq.?
+		if !present { continue }
+		outcomes[related] = result.outcome
+	}
+	// Unknown is the zero value, so an unanswered call has to be told from an absent one.
+	child_outcome, child_answered := outcomes[child]
+	script_outcome, script_answered := outcomes[script]
+	testing.expect(t, child_answered, "the nested call must have a recovered result")
+	testing.expect(t, script_answered, "the script call must have a recovered result")
+	testing.expect_value(t, child_outcome, Tool_Outcome.Unknown)
+	testing.expect_value(t, script_outcome, Tool_Outcome.Not_Executed)
+}
+
 @(test)
 test_recovery_leaves_resolved_calls_alone :: proc(t: ^testing.T) {
 	store: Store
