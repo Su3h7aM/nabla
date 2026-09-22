@@ -13,6 +13,7 @@ import "core:mem"
 import "core:net"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -82,6 +83,45 @@ Agent_Provider :: struct {
 	requests:  [dynamic]string,
 	thread:    ^thread.Thread,
 	failed:    bool,
+	// lock orders the state the serve thread writes with the test that reads it. The
+	// socket a response crosses does not give that ordering, so the fixture states it.
+	lock:      sync.Mutex,
+}
+
+// The accessors below are the only way a test touches what the serve thread wrote. Each
+// takes the lock, so a recorded request is published to the reader that observes it rather
+// than raced with it.
+agent_provider_record :: proc(provider: ^Agent_Provider, request: string) {
+	sync.mutex_lock(&provider.lock)
+	defer sync.mutex_unlock(&provider.lock)
+	append(&provider.requests, request)
+}
+
+agent_provider_note_failure :: proc(provider: ^Agent_Provider) {
+	sync.mutex_lock(&provider.lock)
+	defer sync.mutex_unlock(&provider.lock)
+	provider.failed = true
+}
+
+agent_provider_request_count :: proc(provider: ^Agent_Provider) -> int {
+	sync.mutex_lock(&provider.lock)
+	defer sync.mutex_unlock(&provider.lock)
+	return len(provider.requests)
+}
+
+// agent_provider_request is one recorded request's bytes, or empty when the fixture has not
+// recorded that many. The bytes are borrowed and live until the fixture stops.
+agent_provider_request :: proc(provider: ^Agent_Provider, index: int) -> string {
+	sync.mutex_lock(&provider.lock)
+	defer sync.mutex_unlock(&provider.lock)
+	if index < 0 || index >= len(provider.requests) { return "" }
+	return provider.requests[index]
+}
+
+agent_provider_failed :: proc(provider: ^Agent_Provider) -> bool {
+	sync.mutex_lock(&provider.lock)
+	defer sync.mutex_unlock(&provider.lock)
+	return provider.failed
 }
 
 agent_provider_start :: proc(t: ^testing.T, provider: ^Agent_Provider, responses: []string) -> bool {
@@ -140,20 +180,20 @@ agent_provider_serve :: proc(thread: ^thread.Thread) {
 	for response in provider.responses {
 		socket, _, accept_err := net.accept_tcp(provider.listener)
 		if accept_err != nil {
-			provider.failed = true
+			agent_provider_note_failure(provider)
 			return
 		}
 		request, read_ok := agent_provider_read(socket, provider.allocator)
 		if !read_ok {
-			provider.failed = true
+			agent_provider_note_failure(provider)
 			net.close(socket)
 			return
 		}
-		append(&provider.requests, request)
+		agent_provider_record(provider, request)
 		write_ok := agent_provider_write(socket, response)
 		net.close(socket)
 		if !write_ok {
-			provider.failed = true
+			agent_provider_note_failure(provider)
 			return
 		}
 	}

@@ -522,9 +522,11 @@ test_a_rejected_payload_is_repaired_from_a_ready_summary :: proc(t: ^testing.T) 
 	// Three sends: the summary, the payload the provider refused, and the request rebuilt
 	// from the checkpoint. The refused payload is never sent again, and what replaces it is
 	// smaller.
-	if !testing.expect_value(t, len(provider.requests), 3) { return }
-	testing.expect(t, provider.requests[2] != provider.requests[1], "the repaired request is a new payload")
-	testing.expect(t, len(provider.requests[2]) < len(provider.requests[1]), "the repaired request is smaller")
+	if !testing.expect_value(t, agent_provider_request_count(&provider), 3) { return }
+	refused := agent_provider_request(&provider, 1)
+	repaired := agent_provider_request(&provider, 2)
+	testing.expect(t, repaired != refused, "the repaired request is a new payload")
+	testing.expect(t, len(repaired) < len(refused), "the repaired request is smaller")
 
 	ctx := _test_context(t, chat)
 	defer session.context_destroy(&ctx, context.allocator)
@@ -587,7 +589,7 @@ test_a_rejected_payload_with_nothing_to_install_ends_the_turn :: proc(t: ^testin
 
 	testing.expect(t, !chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn ends without a repair")
 	// The refused payload is never sent again: there is nothing to send it with.
-	testing.expect_value(t, len(provider.requests), 1)
+	testing.expect_value(t, agent_provider_request_count(&provider), 1)
 	testing.expect_value(t, chat_session_repair_refusal(chat), Chat_Repair_Refusal.No_Candidate)
 	testing.expect_value(t, chat_session_terminal_status(chat), Chat_Terminal_Status.Failed)
 	reason := chat_session_recovery_reason(chat)
@@ -718,8 +720,8 @@ test_a_transient_summary_failure_is_retried_on_the_same_bytes :: proc(t: ^testin
 	if !compact_service_until(t, chat, .Backoff) { return }
 	// Then it sends the same bytes again, and the second attempt produces the summary.
 	if !compact_service_until(t, chat, .Ready) { return }
-	testing.expect_value(t, len(provider.requests), 2)
-	testing.expect(t, provider.requests[0] == provider.requests[1], "the retry must send the same bytes")
+	testing.expect_value(t, agent_provider_request_count(&provider), 2)
+	testing.expect(t, agent_provider_request(&provider, 0) == agent_provider_request(&provider, 1), "the retry must send the same bytes")
 
 	// The chain is two rows: the attempt that failed says what the provider said and that a
 	// retry was decided, and the attempt that followed names it.
@@ -788,7 +790,7 @@ test_a_summary_that_produced_nothing_is_not_sent_again :: proc(t: ^testing.T) {
 	chat_request_prep_destroy(&prep, chat.allocator)
 
 	if !compact_service_until(t, chat, .Idle) { return }
-	testing.expect_value(t, len(provider.requests), 1)
+	testing.expect_value(t, agent_provider_request_count(&provider), 1)
 	testing.expect(t, chat.compact.last_failure_at_ms > 0, "a failed summary waits out its cooldown")
 
 	row, row_err := session.request_load(chat.store, chat.id, session.Request_No(1), chat.allocator)
@@ -836,7 +838,7 @@ test_a_summary_chain_stops_at_its_bound :: proc(t: ^testing.T) {
 
 	// Two sends, one retry, and then the chain is over: the third send never leaves.
 	if !compact_service_until(t, chat, .Idle) { return }
-	testing.expect_value(t, len(provider.requests), 2)
+	testing.expect_value(t, agent_provider_request_count(&provider), 2)
 	testing.expect(t, chat.compact.last_failure_at_ms > 0, "an exhausted chain waits out its cooldown")
 	checkpoint, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
 	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
@@ -926,7 +928,7 @@ test_an_exhausted_chain_waits_for_the_context_to_move :: proc(t: ^testing.T) {
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	chat_compact_consider(chat, {}, connection, &prep)
 	if !compact_service_until(t, chat, .Idle) { return }
-	testing.expect_value(t, len(provider.requests), CHAT_COMPACT_MAX_ATTEMPTS)
+	testing.expect_value(t, agent_provider_request_count(&provider), CHAT_COMPACT_MAX_ATTEMPTS)
 
 	// Nothing about the context changed, so pressure starts nothing even with the cooldown
 	// behind it.

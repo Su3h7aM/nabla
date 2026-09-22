@@ -491,5 +491,5 @@ test_sigint_cuts_a_retry_backoff_short :: proc(t: ^testing.T) {
 	testing.expect_value(t, chat.terminal_status, Chat_Terminal_Status.Cancelled)
 	testing.expectf(t, elapsed < BACKOFF_DELAY / 2, "the retry backoff was not cut short: %v", elapsed)
 	// The second attempt never went out: the stop arrived while the chain was waiting.
-	testing.expect_value(t, len(provider.requests), 1)
+	testing.expect_value(t, agent_provider_request_count(&provider), 1)
 }

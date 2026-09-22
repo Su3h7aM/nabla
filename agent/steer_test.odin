@@ -64,9 +64,9 @@ test_a_boundary_hook_hands_the_next_request_its_connection :: proc(t: ^testing.T
 
 	testing.expect(t, chat_run_turn_steered(chat, initial, test_retry_policy(), {}, &steer), "the turn completed")
 	testing.expect(t, install.calls > 0, "the turn asked for a selection at its boundary")
-	testing.expect_value(t, len(previous.requests), 0)
-	if !testing.expect_value(t, len(installed.requests), 1) { return }
-	testing.expect(t, strings.contains(installed.requests[0], "say something"), "the request that followed the boundary is the turn's own")
+	testing.expect_value(t, agent_provider_request_count(&previous), 0)
+	if !testing.expect_value(t, agent_provider_request_count(&installed), 1) { return }
+	testing.expect(t, strings.contains(agent_provider_request(&installed, 0), "say something"), "the request that followed the boundary is the turn's own")
 }
 
 @(test)
@@ -211,9 +211,9 @@ test_a_steering_line_starts_the_next_request_on_its_own :: proc(t: ^testing.T) {
 
 	testing.expect(t, chat_run_turn_steered(chat, connection, test_retry_policy(), observer, &steer), "the turn completed")
 	testing.expect(t, probe.pushed, "the fixture pushed its line while the first request was running")
-	if !testing.expect_value(t, len(provider.requests), 2) { return }
-	testing.expect(t, !strings.contains(provider.requests[0], "write another one"), "the request already in flight is not rebuilt")
-	testing.expect(t, strings.contains(provider.requests[1], "write another one"), "the line starts the request that follows it")
+	if !testing.expect_value(t, agent_provider_request_count(&provider), 2) { return }
+	testing.expect(t, !strings.contains(agent_provider_request(&provider, 0), "write another one"), "the request already in flight is not rebuilt")
+	testing.expect(t, strings.contains(agent_provider_request(&provider, 1), "write another one"), "the line starts the request that follows it")
 }
 
 // A line recorded for a turn that had finished answering continues that turn instead of
@@ -393,8 +393,8 @@ test_a_steering_line_reaches_the_request_that_follows_it :: proc(t: ^testing.T) 
 	testing.expect(t, steer_push(&queue, "check the logs"))
 
 	testing.expect(t, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, &steer), "the turn completed")
-	if !testing.expect_value(t, len(provider.requests), 1) { return }
-	testing.expect(t, strings.contains(provider.requests[0], "check the logs"), "the request should carry the line the user sent")
+	if !testing.expect_value(t, agent_provider_request_count(&provider), 1) { return }
+	testing.expect(t, strings.contains(agent_provider_request(&provider, 0), "check the logs"), "the request should carry the line the user sent")
 }
 
 // A line the store refuses was never recorded, so the turn that could not record it does

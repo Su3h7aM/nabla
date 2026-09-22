@@ -53,10 +53,10 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(t: ^testing.T) {
 	defer delete(connection.Endpoint, chat.allocator)
 
 	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed after a retry")
-	if !testing.expect_value(t, len(provider.requests), 2) { return }
+	if !testing.expect_value(t, agent_provider_request_count(&provider), 2) { return }
 	// A retry sends the same request: the bytes of the second attempt are the bytes of
 	// the first, because the harness froze them before either one went out.
-	testing.expectf(t, provider.requests[0] == provider.requests[1], "the retry must send the same bytes")
+	testing.expectf(t, agent_provider_request(&provider, 0) == agent_provider_request(&provider, 1), "the retry must send the same bytes")
 
 	ctx := _test_context(t, chat)
 	defer session.context_destroy(&ctx, context.allocator)
@@ -204,9 +204,9 @@ test_a_chain_of_failures_ends_in_one_answer :: proc(t: ^testing.T) {
 	defer delete(retries.events)
 
 	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), retry_log_observer(&retries)), "the turn completed after two retries")
-	if !testing.expect_value(t, len(provider.requests), 3) { return }
-	for request, i in provider.requests {
-		testing.expectf(t, request == provider.requests[0], "send %d must repeat the frozen bytes", i + 1)
+	if !testing.expect_value(t, agent_provider_request_count(&provider), 3) { return }
+	for i in 0 ..< agent_provider_request_count(&provider) {
+		testing.expectf(t, agent_provider_request(&provider, i) == agent_provider_request(&provider, 0), "send %d must repeat the frozen bytes", i + 1)
 	}
 
 	ctx := _test_context(t, chat)
@@ -361,14 +361,14 @@ test_a_scripted_provider_completes_one_request :: proc(t: ^testing.T) {
 	defer delete(connection.Endpoint, chat.allocator)
 
 	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed")
-	testing.expect_value(t, len(provider.requests), 1)
-	testing.expect(t, !provider.failed, "the scripted provider served its response")
+	testing.expect_value(t, agent_provider_request_count(&provider), 1)
+	testing.expect(t, !agent_provider_failed(&provider), "the scripted provider served its response")
 	testing.expect(t, chat.last_error == "", chat.last_error)
 
 	// What left this machine is the request the harness assembled: the model it
 	// resolved and the prompt that asked for an answer.
-	testing.expect(t, strings.contains(provider.requests[0], chat.model_id), "the request names the model")
-	testing.expect(t, strings.contains(provider.requests[0], "say something"), "the request carries the prompt")
+	testing.expect(t, strings.contains(agent_provider_request(&provider, 0), chat.model_id), "the request names the model")
+	testing.expect(t, strings.contains(agent_provider_request(&provider, 0), "say something"), "the request carries the prompt")
 
 	ctx := _test_context(t, chat)
 	defer session.context_destroy(&ctx, context.allocator)
