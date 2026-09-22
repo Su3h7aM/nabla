@@ -554,6 +554,10 @@ test_a_call_that_ignores_its_stop_is_answered_and_released :: proc(t: ^testing.T
 	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Abandon)
 	testing.expect_value(t, jobs.jobs[0].phase, Tool_Job_Phase.Stuck)
 	testing.expect(t, jobs.escaped, "handing a job to its worker must latch the batch")
+	// A job the owner gave up on is the worker's now, so it is not a tick the owner can wait
+	// for: keeping its spent patience would make the wait beside a live call a spin.
+	_, has_deadline := tool_jobs_deadline(&jobs).?
+	testing.expect(t, !has_deadline, "a call handed to its worker must not remain the batch's deadline")
 	testing.expect_value(t, jobs.committed, 1)
 	testing.expect(t, tool_jobs_settled(&jobs), "the batch must settle without its stuck call")
 	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Done)

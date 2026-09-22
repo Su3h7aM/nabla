@@ -482,6 +482,20 @@ tool_jobs_next :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> Tool_Job_Effect {
 	return .Done
 }
 
+// tool_job_under_executor reports whether a call is in one of the two phases where the owner
+// still watches for a stop it asked for: the dispatch write, or an executor running the call.
+// Past those phases the call is out of the owner's hands, either because it was never started
+// or because the job now belongs to a worker that outlived its stop.
+@(private)
+tool_job_under_executor :: proc(job: ^Tool_Job) -> bool {
+	switch job.phase {
+	case .Dispatching, .Running:
+		return true
+	case .Queued, .Waiting, .Result_Ready, .Committing, .Retiring, .Retired, .Unrecorded, .Stuck:
+	}
+	return false
+}
+
 // tool_jobs_note_stops records when the owner first saw that a job should have stopped.
 // The stop itself was requested by tool_jobs_latch_stop or by the job's own timeout; this
 // is what makes the patience measurable without a clock read inside a transition's
@@ -489,12 +503,7 @@ tool_jobs_next :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> Tool_Job_Effect {
 @(private)
 tool_jobs_note_stops :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 	for job in jobs.jobs {
-		if job.stopping || !job.launched { continue }
-		switch job.phase {
-		case .Dispatching, .Running:
-		case .Queued, .Waiting, .Result_Ready, .Committing, .Retiring, .Retired, .Unrecorded, .Stuck:
-			continue
-		}
+		if job.stopping || !job.launched || !tool_job_under_executor(job) { continue }
 		if !tool_control_cancelled(job.exec.control) { continue }
 		job.stopping = true
 		job.stop_at = now
@@ -509,11 +518,7 @@ tool_jobs_note_stops :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 tool_jobs_overdue :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> ^Tool_Job {
 	found: ^Tool_Job
 	for job in jobs.jobs {
-		switch job.phase {
-		case .Dispatching, .Running:
-		case .Queued, .Waiting, .Result_Ready, .Committing, .Retiring, .Retired, .Unrecorded, .Stuck:
-			continue
-		}
+		if !tool_job_under_executor(job) { continue }
 		if !job.launched || !job.stopping || time.tick_diff(job.stop_at, now) < TOOL_JOBS_STOP_PATIENCE { continue }
 		if found == nil || job.ordinal < found.ordinal { found = job }
 	}
@@ -893,11 +898,15 @@ tool_jobs_ready :: proc(jobs: ^Tool_Jobs) -> bool {
 // tool_jobs_deadline is the nearest tick at which the owner must act on its own, and None
 // when only a worker can change the table. A stopped call's patience is measured from when
 // the owner first saw the stop, which is the only deadline a batch has of its own.
+//
+// Only a call the owner can still act on has a patience left to measure. Counting a job it has
+// already handed to a worker would return a tick that has passed, and a wait for a tick that
+// has passed is not a wait: the owner would spin beside whatever call is still running.
 @(private)
 tool_jobs_deadline :: proc(jobs: ^Tool_Jobs) -> Maybe(time.Tick) {
 	earliest: Maybe(time.Tick)
 	for job in jobs.jobs {
-		if !job.launched || !job.stopping { continue }
+		if !job.launched || !job.stopping || !tool_job_under_executor(job) { continue }
 		due := time.tick_add(job.stop_at, TOOL_JOBS_STOP_PATIENCE)
 		if existing, has := earliest.?; !has || time.tick_diff(due, existing) < 0 { earliest = due }
 	}
