@@ -344,6 +344,43 @@ chat_record_attempt :: proc(
 	return number, true
 }
 
+// chat_try_context_repair makes room for a payload the provider refused as too large.
+// It returns None when a summary was installed and the request rebuilt, and otherwise
+// the typed reason the repair failed. A refusal ends the chain and stays on the session,
+// so the record and a front-end can tell why the turn could not make room.
+@(private)
+chat_try_context_repair :: proc(
+	chat: ^Chat_Session,
+	connection: ai.Provider_Connection,
+	observer: Chat_Observer,
+	prep: ^Chat_Request_Prep,
+	encoded: ^ai.Provider_Encoded_Request,
+	websocket_request: bool,
+	attempts: int,
+) -> Chat_Repair_Refusal {
+	previous_estimate := prep.estimate
+	refusal := chat_repair_context(chat, connection, observer, prep, encoded, previous_estimate, websocket_request)
+	if refusal != .None {
+		chat.turn_repair_refusal = refusal
+		// The session keeps the pressure, so the next safe boundary starts the summary
+		// this refusal was missing. A summary already running is promoted instead: it is
+		// the same work, and it installs as soon as it is ready.
+		_ = chat_compact_request(chat, .Provider_Overflow, nil)
+		chat_session_fail_turn(chat, fmt.tprintf("the request does not fit the context: %s", chat_repair_refusal_text(refusal)))
+		return refusal
+	}
+	covered_seq := i64(0)
+	if seq, present := prep.history.covered_seq.?; present { covered_seq = i64(seq) }
+	repaired := [4]Log_Field {
+		{key = "covered_seq", value = covered_seq},
+		{key = "estimate_before", value = i64(previous_estimate)},
+		{key = "estimate_after", value = i64(prep.estimate)},
+		{key = "next_attempt", value = i64(attempts + 1)},
+	}
+	log_emit({level = .Info, category = .Provider, event = "request.context_repaired", fields = repaired[:]})
+	return .None
+}
+
 // chat_perform_request builds one request from committed history, records it,
 // runs it, and records what came back. The record exists before the model is
 // asked anything, so a request that never finishes still says what it carried.
@@ -572,28 +609,11 @@ chat_perform_request :: proc(
 			// The payload the provider refused is never resent. A repair installs a summary
 			// the harness already has, rebuilds the request against it, and the next attempt
 			// of this same chain sends that instead, with no wait and no reset of the bound.
-			previous_estimate := prep.estimate
-			refusal := chat_repair_context(chat, connection, observer, &prep, &encoded, previous_estimate, websocket_request)
-			if refusal != .None {
-				chat.turn_repair_refusal = refusal
-				// The session keeps the pressure, so the next safe boundary starts the
-				// summary this refusal was missing. A summary already running is promoted
-				// instead: it is the same work, and it installs as soon as it is ready.
-				_ = chat_compact_request(chat, .Provider_Overflow, nil)
-				chat_session_fail_turn(chat, fmt.tprintf("the request does not fit the context: %s", chat_repair_refusal_text(refusal)))
+			if chat_try_context_repair(chat, connection, observer, &prep, &encoded, websocket_request, attempts) != .None {
 				break
 			}
 			repaired = true
 			recovery_kind = .Checkpoint_Repair
-			covered_seq := i64(0)
-			if seq, present := prep.history.covered_seq.?; present { covered_seq = i64(seq) }
-			repaired_fields := [4]Log_Field {
-				{key = "covered_seq", value = covered_seq},
-				{key = "estimate_before", value = i64(previous_estimate)},
-				{key = "estimate_after", value = i64(prep.estimate)},
-				{key = "next_attempt", value = i64(attempts + 1)},
-			}
-			log_emit({level = .Info, category = .Provider, event = "request.context_repaired", fields = repaired_fields[:]})
 			chat_session_clear_attempt(chat)
 			ai.Provider_Operation_Error_Destroy(&operation_error, chat.allocator)
 			continue
