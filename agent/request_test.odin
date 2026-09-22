@@ -151,7 +151,7 @@ test_build_request_replays_verbatim_response_output_in_order :: proc(t: ^testing
 	)
 	if !testing.expect_value(t, begin_err, nil) { return }
 
-	output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Working."}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{}"}]`
+	output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Working."}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{\"command\":\"printf tool-ok\",\"working_directory\":null,\"timeout_ms\":null}"}]`
 	source := chat_session_event_source(chat)
 	testing.expect(t, chat_session_feed_response_output(chat, source, output))
 	testing.expect(t, chat_session_feed_text(chat, source, "Working."))

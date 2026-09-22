@@ -122,6 +122,23 @@ test_responses_websocket_encode_uses_event_envelope_without_http_stream_field ::
 }
 
 @(test)
+test_responses_encode_refuses_a_record_the_input_schema_rejects :: proc(t: ^testing.T) {
+	// A record is the endpoint's own output, and the input schema constrains it: a call
+	// whose arguments are not an object cannot be sent back. Splicing it would put bytes on
+	// the wire that the endpoint refuses, and every request built from the same history
+	// would carry them again, so the refusal happens here, before the send.
+	request := Provider_Request {
+		API              = .OpenAI_Responses,
+		Model_Present    = true,
+		Model            = "gpt-5.6",
+		Messages_Present = true,
+		Messages         = []Provider_Message{{Verbatim_Items = `[{"type":"function_call","call_id":"call_1","name":"shell","arguments":""}]`}},
+	}
+	_, err := Provider_Encode_Request(request, context.temp_allocator)
+	testing.expect_value(t, err, Provider_Request_Error.Invalid_Message)
+}
+
+@(test)
 test_responses_encode_removes_output_status_from_replay :: proc(t: ^testing.T) {
 	messages := []Provider_Message {
 		{Verbatim_Items = `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[]}]`},

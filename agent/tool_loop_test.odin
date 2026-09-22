@@ -384,6 +384,87 @@ test_a_response_with_an_unparseable_call_is_not_replayed_verbatim :: proc(t: ^te
 }
 
 @(test)
+test_a_record_that_contradicts_the_call_it_holds_is_not_replayed :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "record the endpoint cannot take back")
+	_test_begin_request(t, chat)
+	request_no, begin_err := session.request_begin(
+		chat.store,
+		chat.id,
+		{turn_no = chat.turn_no, purpose = .Response, provider = "p", model_requested = "m", api = "openai_responses", config_json = "{}", input_json = "{}"},
+		session.now_ms(),
+	)
+	if !testing.expect_value(t, begin_err, nil) { return }
+
+	// The endpoint's argument events delivered an object while its terminal record says
+	// the same call's arguments were empty. Those bytes are not JSON, so the request that
+	// carries them is refused, and so is every later request built from this history.
+	output := `[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"counting\"}]},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"\"}]`
+	_test_append(t, chat, {turn_no = chat.turn_no, request_no = request_no, created_at_ms = 2_000, payload = session.Response_Entry{output = output}})
+	_test_append(t, chat, {turn_no = chat.turn_no, request_no = request_no, created_at_ms = 2_001, payload = session.Assistant_Entry{text = "counting"}})
+	call_seq := _test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			request_no = request_no,
+			created_at_ms = 2_002,
+			payload = session.Tool_Call_Entry{call_id = "call_1", item_id = "fc_1", name = TOOL_SHELL_NAME, arguments = "{}"},
+		},
+	)
+	_test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			request_no = request_no,
+			created_at_ms = 2_003,
+			related_seq = call_seq,
+			payload = session.Tool_Dispatch_Entry{tool = TOOL_SHELL_NAME, arguments = "{}"},
+		},
+	)
+	_test_append(
+		t,
+		chat,
+		{
+			turn_no = chat.turn_no,
+			request_no = request_no,
+			created_at_ms = 2_004,
+			related_seq = call_seq,
+			payload = session.Tool_Result_Entry{outcome = .Success, content = `{\"status\":\"exited\"}`, origin = .Observed},
+		},
+	)
+
+	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Responses})
+	if !testing.expect_value(t, prep_err, nil) { return }
+	defer chat_request_prep_destroy(&prep, chat.allocator)
+	body, encode_err := ai.Provider_Encode_Request(prep.request)
+	if !testing.expect_value(t, encode_err, ai.Provider_Request_Error.None) { return }
+	defer delete(body)
+	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
+	if !testing.expect_value(t, parse_err, nil) { return }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, object_ok := value.(json.Object)
+	if !testing.expect(t, object_ok) { return }
+	input, input_ok := object["input"].(json.Array)
+	if !testing.expect(t, input_ok) { return }
+
+	// The call goes out as what it ran with, which is what the endpoint reads back.
+	sent := ""
+	for item in input {
+		call, is_object := item.(json.Object)
+		if !is_object || item_string(call, "type") != "function_call" { continue }
+		sent = item_string(call, "arguments")
+	}
+	testing.expect_value(t, sent, "{}")
+	testing.expect_value(t, prep.replay_refused, 1)
+}
+
+@(test)
 test_unknown_tool_is_reported_not_run :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))

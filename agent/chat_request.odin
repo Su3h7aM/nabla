@@ -1,6 +1,5 @@
 package agent
 
-import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
@@ -21,20 +20,26 @@ NABLA_USER_AGENT :: "nabla/0.1.0"
 // the position the response occupies in the conversation, so replay order and
 // projection order are the same order.
 Chat_Request_Prep :: struct {
-	history:  session.Context,
-	request:  ai.Provider_Request,
-	wire:     [dynamic]ai.Provider_Message,
-	tools:    [dynamic]ai.Provider_Tool_Def,
-	calls:    [dynamic][dynamic]ai.Provider_Tool_Call,
+	history:        session.Context,
+	request:        ai.Provider_Request,
+	wire:           [dynamic]ai.Provider_Message,
+	tools:          [dynamic]ai.Provider_Tool_Def,
+	calls:          [dynamic][dynamic]ai.Provider_Tool_Call,
 	// feedback holds text this preparation owns and the request borrows: what a refused
 	// call is said to be, and what a kept result is replaced by.
-	feedback: [dynamic]string,
-	estimate: int,
+	feedback:       [dynamic]string,
+	estimate:       int,
 	// sizes is what each part of this request costs on its own. A part measured alone is
 	// not a share of the whole, and that is the point: one that alone exceeds what the
 	// window can hold will not fit in the whole either, and it is the one thing a person
 	// has to change.
-	sizes:    Chat_Request_Sizes,
+	sizes:          Chat_Request_Sizes,
+	// replay_refused counts the endpoint's own response records this request refused to
+	// replay: a record that cannot be sent back as input, or one that does not say what
+	// this projection sends. The projection carries the same conversation, so the request
+	// is complete either way; what it does not carry are the fields only the endpoint
+	// models.
+	replay_refused: int,
 }
 
 chat_request_prep_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Allocator) {
@@ -111,7 +116,7 @@ chat_build_request_into :: proc(
 	if summary != "" {
 		append(&prep.wire, ai.Provider_Message{Role = .User, Content = summary})
 	}
-	chat_append_entries(&prep.wire, &prep.calls, &prep.feedback, connection.API, entries, dispatches, chat.allocator)
+	prep.replay_refused = chat_append_entries(&prep.wire, &prep.calls, &prep.feedback, connection.API, entries, dispatches, chat.allocator)
 	if directive != "" {
 		append(&prep.wire, ai.Provider_Message{Role = .User, Content = directive})
 	}
@@ -189,11 +194,17 @@ chat_build_request_into :: proc(
 //
 // On the Responses API a Response_Entry carries the endpoint's own items, so it
 // becomes one verbatim message at that point in the conversation and the plain
-// text and calls it already contains are not projected a second time. Native
-// items are replayed only when they say exactly what this projection would say,
-// because a response whose calls were repaired or refused carries bytes the
-// endpoint will not take back. The calls are indexed either way, because a
-// result names its call through the sequence the two entries share.
+// text and calls it already contains are not projected a second time. That record
+// is read before it is replayed: only bytes the endpoint's input schema takes back
+// and that say exactly what this projection would say are sent in place of it,
+// because an endpoint's stream and its terminal array can disagree, and the bytes
+// it refuses fail every request built from that history rather than the one that
+// sent them first. The calls are indexed either way, because a result names its
+// call through the sequence the two entries share.
+//
+// It reports how many records it refused, which is a fact about this request: the
+// projection carries the same conversation, so a refusal changes the prefix the
+// endpoint sees and nothing the model is told.
 @(private)
 chat_append_entries :: proc(
 	messages: ^[dynamic]ai.Provider_Message,
@@ -203,6 +214,8 @@ chat_append_entries :: proc(
 	entries: []session.Entry,
 	dispatches: []session.Entry,
 	allocator: mem.Allocator,
+) -> (
+	replay_refused: int,
 ) {
 	group: [dynamic]ai.Provider_Tool_Call
 	group_open := false
@@ -226,16 +239,36 @@ chat_append_entries :: proc(
 	pending: [dynamic]string
 	defer delete(pending)
 
-	// A request whose calls this projection cannot replay from the proposal alone
-	// cannot use its native items either, because those items carry the proposal.
+	// A request whose calls this projection cannot replay from the proposal alone cannot use
+	// its native items either, because those items carry the proposal. It is the same for a
+	// record the endpoint's input schema refuses and for one that does not say what the
+	// projection sends. Both are asked of the record here, where the answer still decides
+	// what the whole request carries.
 	unfaithful := make(map[i64]bool, allocator = context.temp_allocator)
 	defer delete(unfaithful)
-	for entry in entries {
-		call, is_call := entry.payload.(session.Tool_Call_Entry)
-		if !is_call { continue }
-		_, project, faithful := chat_replay_call(call, effective[i64(entry.seq)])
-		if project && faithful { continue }
-		if request, present := entry.request_no.?; present { unfaithful[i64(request)] = true }
+	if api == .OpenAI_Responses {
+		for entry in entries {
+			call, is_call := entry.payload.(session.Tool_Call_Entry)
+			if !is_call { continue }
+			_, project, faithful := chat_replay_call(call, effective[i64(entry.seq)])
+			if project && faithful { continue }
+			if request, present := entry.request_no.?; present { unfaithful[i64(request)] = true }
+		}
+		for entry in entries {
+			payload, is_response := entry.payload.(session.Response_Entry)
+			if !is_response { continue }
+			request, present := entry.request_no.?
+			if !present { continue }
+			// A record that cannot be read is not replayed either: an empty one is a response
+			// whose items were never stored, and the projection is the only copy left.
+			calls, readable := ai.Provider_Replay_Read(payload.output, context.temp_allocator)
+			replay := readable && !unfaithful[i64(request)] && chat_replay_record_agrees(calls, request, entries, effective)
+			if !replay {
+				unfaithful[i64(request)] = true
+				replay_refused += 1
+			}
+			ai.Provider_Tool_Calls_Destroy(calls, context.temp_allocator)
+		}
 	}
 
 	// covered is the request whose assistant side a verbatim output already
@@ -310,6 +343,7 @@ chat_append_entries :: proc(
 	chat_flush_calls(messages, call_lists, &group, &group_open)
 	chat_flush_feedback(messages, &pending)
 	delete(group)
+	return
 }
 
 // CHAT_REFUSED_CALL_SUFFIX joins a call's name to the harness's account of why it
@@ -327,21 +361,43 @@ CHAT_REFUSED_CALL_SUFFIX :: " call was refused before it ran: "
 @(private)
 chat_replay_call :: proc(call: session.Tool_Call_Entry, effective: string) -> (arguments: string, project: bool, faithful: bool) {
 	if effective != "" { return effective, true, effective == call.arguments }
-	if chat_arguments_object(call.arguments) { return call.arguments, true, true }
+	if ai.Provider_Arguments_Object(call.arguments, context.temp_allocator) { return call.arguments, true, true }
 	return "", false, false
 }
 
-// chat_arguments_object reports whether a call's arguments are an object an
-// endpoint can carry. It is a check on the bytes as sent, not a validation of the
-// tool's own fields, which happens where the call is prepared.
+// chat_replay_record_agrees reports whether one response's own items say exactly what this
+// projection will send for that request. Every call the record declares must be a call the
+// projection sends with the same argument bytes, and every call the projection sends must be
+// declared: a record carrying a call the projection does not send shows the model a call
+// nothing answered, and one missing a call the projection sends leaves that call's result
+// naming a call the request never declared. An endpoint refuses both, so the record is not
+// replayed when it cannot be shown to say the same thing.
 @(private)
-chat_arguments_object :: proc(raw: string) -> bool {
-	if raw == "" { return false }
-	value, parse_err := json.parse_string(raw, .JSON, true, context.temp_allocator)
-	if parse_err != nil { return false }
-	defer json.destroy_value(value, context.temp_allocator)
-	_, is_object := value.(json.Object)
-	return is_object
+chat_replay_record_agrees :: proc(
+	declared: []ai.Provider_Tool_Call,
+	request: session.Request_No,
+	entries: []session.Entry,
+	effective: map[i64]string,
+) -> bool {
+	projected := 0
+	for entry in entries {
+		entry_request, present := entry.request_no.?
+		if !present || entry_request != request { continue }
+		call, is_call := entry.payload.(session.Tool_Call_Entry)
+		if !is_call { continue }
+		arguments, send, _ := chat_replay_call(call, effective[i64(entry.seq)])
+		if !send { continue }
+		projected += 1
+		matched := false
+		for item in declared {
+			if item.ID != call.call_id { continue }
+			if item.Arguments != arguments { return false }
+			matched = true
+			break
+		}
+		if !matched { return false }
+	}
+	return projected == len(declared)
 }
 
 @(private)

@@ -283,7 +283,7 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 
 	// What the harness intends to send is recorded before it is stored, so a request that
 	// never reaches the store still says what it was going to carry.
-	prepared := [9]Log_Field {
+	prepared := [10]Log_Field {
 		{key = "purpose", value = session.request_purpose_name(.Response)},
 		{key = "provider", value = chat.provider_id},
 		{key = "model", value = chat.model_id},
@@ -293,6 +293,10 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 		{key = "context_window", value = i64(chat.capacity.window)},
 		{key = "messages", value = i64(len(prep.history.entries))},
 		{key = "tools", value = i64(len(prep.tools))},
+		// The endpoint's own records this request did not carry: a prefix change the
+		// conversation's content survived, and the only trace a contradictory or
+		// unreadable record leaves.
+		{key = "replay_refused", value = i64(prep.replay_refused)},
 	}
 	log_emit({level = .Info, category = .Provider, event = "request.prepared", fields = prepared[:]})
 

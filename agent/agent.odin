@@ -562,13 +562,7 @@ chat_event_destroy :: proc(event: ^Chat_Event, allocator: mem.Allocator) {
 	case Chat_Provider_Completion:
 		delete(value.reason_text, allocator)
 		delete(value.output, allocator)
-		for call in value.calls {
-			delete(call.ID, allocator)
-			delete(call.Item_ID, allocator)
-			delete(call.Name, allocator)
-			delete(call.Arguments, allocator)
-		}
-		delete(value.calls, allocator)
+		ai.Provider_Tool_Calls_Destroy(value.calls, allocator)
 	case Chat_Failure_Event:
 		delete(value.message, allocator)
 	case Chat_Usage_Event:

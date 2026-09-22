@@ -32,12 +32,15 @@ openai_responses_unparse_request :: proc(object: json.Object, allocator: mem.All
 	return result, .None
 }
 
-openai_responses_request_object :: proc(request: Provider_Request, allocator: mem.Allocator) -> (object: json.Object, err: Provider_Request_Error) {
+// openai_responses_request_object builds the request's JSON object. The object is owned by a
+// local rather than by the named result, because an error return assigns the result and a
+// cleanup registered on it would then free nothing: what the scope owns is the local.
+openai_responses_request_object :: proc(request: Provider_Request, allocator: mem.Allocator) -> (result: json.Object, err: Provider_Request_Error) {
 	if request_err := Provider_Validate_Request(request); request_err != .None { return nil, request_err }
 	for tool in request.Tools {
 		if !openai_tool_schema_valid(tool.Parameters_JSON) { return nil, .Invalid_Tools }
 	}
-	object = make(json.Object, 8, allocator)
+	object := make(json.Object, 8, allocator)
 	defer if err != .None { json.destroy_value(json.Value(object), allocator) }
 	object[strings.clone("model", allocator)] = json.String(strings.clone(request.Model, allocator))
 	if request.Instructions_Present {
@@ -47,9 +50,12 @@ openai_responses_request_object :: proc(request: Provider_Request, allocator: me
 	input_attached := false
 	defer if err != .None && !input_attached { json.destroy_value(json.Value(input), allocator) }
 	for message in request.Messages {
-		// A verbatim message carries the endpoint's own items. They are emitted
-		// here, where they sit among the projected messages, so the request keeps
-		// the conversation's real order. Re-deriving them would lose phase,
+		// A verbatim message carries the endpoint's own items. They are read as the input
+		// the request takes back, and an item the input schema refuses fails the request:
+		// this is the last point before the wire, and a record spliced unread would send
+		// bytes the endpoint rejects to every request built from the same history, not only
+		// to this one. They are emitted where they sit among the projected messages, so the
+		// request keeps the conversation's real order. Re-deriving them would lose phase,
 		// annotations, and summaries, and would send assistant content twice.
 		if message.Verbatim_Items != "" {
 			items, parse_err := json.parse_string(message.Verbatim_Items, .JSON, true, allocator)
@@ -60,19 +66,20 @@ openai_responses_request_object :: proc(request: Provider_Request, allocator: me
 				return nil, .Invalid_Message
 			}
 			for item in array {
+				replayed, is_object := item.(json.Object)
+				if !is_object || !openai_responses_replay_item_ok(replayed, allocator) {
+					json.destroy_value(items, allocator)
+					return nil, .Invalid_Message
+				}
 				// An output item carries a terminal status; the input-item schema
 				// has no such field, and an endpoint refuses a field it does not
 				// know. Everything else survives, so the record stays replayable.
-				if replayed, is_object := item.(json.Object); is_object {
-					clone := make(json.Object, len(replayed), allocator)
-					for key, value in replayed {
-						if key == "status" { continue }
-						clone[strings.clone(key, allocator)] = json.Value(json.clone_value(value, allocator))
-					}
-					append(&input, json.Value(clone))
-				} else {
-					append(&input, json.Value(json.clone_value(item, allocator)))
+				clone := make(json.Object, len(replayed), allocator)
+				for key, value in replayed {
+					if key == "status" { continue }
+					clone[strings.clone(key, allocator)] = json.Value(json.clone_value(value, allocator))
 				}
+				append(&input, json.Value(clone))
 			}
 			json.destroy_value(items, allocator)
 			continue
@@ -214,6 +221,90 @@ openai_responses_clone_output :: proc(response: json.Object, allocator := contex
 	text, clone_err := json.unparse(raw_output_value, allocator = allocator)
 	if clone_err != nil { return "", false }
 	return text, true
+}
+
+// Provider_Replay_Read reads one endpoint output array the way a request would carry it
+// back, and reports the calls the record declares. ok is false when the array cannot be
+// sent back at all, which is a fact about the bytes rather than an error: the caller
+// replays its own projection of that response instead, and the conversation loses nothing
+// but the fields only the endpoint models.
+//
+// Nothing is spliced unread. The record is the endpoint's own output, so its items are not
+// the harness's to trust: an item the input schema refuses fails the whole record, because
+// a request cannot carry half a response, and an endpoint that receives one refuses every
+// request built from the same history after it. The returned calls are owned by allocator
+// and released with Provider_Tool_Calls_Destroy.
+Provider_Replay_Read :: proc(output: string, allocator := context.allocator) -> (calls: []Provider_Tool_Call, ok: bool) {
+	value, parse_err := json.parse_string(output, .JSON, true, allocator)
+	if parse_err != nil { return nil, false }
+	defer json.destroy_value(value, allocator)
+	array, is_array := value.(json.Array)
+	if !is_array { return nil, false }
+	for item in array {
+		object, is_object := item.(json.Object)
+		if !is_object || !openai_responses_replay_item_ok(object, allocator) { return nil, false }
+	}
+	declared := make([dynamic]Provider_Tool_Call, 0, len(array), allocator)
+	for item in array {
+		object := item.(json.Object)
+		item_type, _, _ := openai_value_string(object, "type")
+		if item_type != "function_call" { continue }
+		id, _, _ := openai_value_string(object, "id")
+		call_id, _, _ := openai_value_string(object, "call_id")
+		name, _, _ := openai_value_string(object, "name")
+		arguments, _, _ := openai_value_string(object, "arguments")
+		append(
+			&declared,
+			Provider_Tool_Call {
+				ID = strings.clone(call_id, allocator),
+				Item_ID = strings.clone(id, allocator),
+				Name = strings.clone(name, allocator),
+				Arguments = strings.clone(arguments, allocator),
+			},
+		)
+	}
+	return declared[:], true
+}
+
+// openai_responses_replay_item_ok reports whether one item of an endpoint output array can
+// be sent back as request input. An output item carries fields an input item has no place
+// for, and the input schema constrains some values the output schema does not: a call whose
+// arguments are not the object the schema requires is refused here rather than by the
+// endpoint, which would refuse every request that carried it.
+//
+// An item type this adapter does not model replays as it stands. Keeping fields and item
+// types the harness never learned is what the record is for.
+openai_responses_replay_item_ok :: proc(object: json.Object, allocator: mem.Allocator) -> bool {
+	item_type, type_present, type_ok := openai_value_string(object, "type")
+	if !type_ok || !type_present || item_type == "" { return false }
+	switch item_type {
+	case "function_call":
+		// The endpoint validates all three: a call id its results name the call by, a name
+		// its tool registry knows, and arguments that parse as the object the schema wants.
+		call_id, call_present, call_ok := openai_value_string(object, "call_id")
+		if !call_ok || !call_present || call_id == "" { return false }
+		name, name_present, name_ok := openai_value_string(object, "name")
+		if !name_ok || !name_present || name == "" { return false }
+		arguments, arguments_present, arguments_ok := openai_value_string(object, "arguments")
+		if !arguments_ok || !arguments_present { return false }
+		return Provider_Arguments_Object(arguments, allocator)
+	case "reasoning":
+		// A replayed reasoning item is continued from, so the endpoint requires the id and
+		// the encrypted content; a summary alone is display-only and carries nothing the
+		// endpoint can resume.
+		id, id_present, id_ok := openai_value_string(object, "id")
+		if !id_ok || !id_present || id == "" { return false }
+		encrypted, encrypted_present, encrypted_ok := openai_value_string(object, "encrypted_content")
+		return encrypted_ok && encrypted_present && encrypted != ""
+	case "message":
+		role, role_present, role_ok := openai_value_string(object, "role")
+		if !role_ok || !role_present || role == "" { return false }
+		_, content_present := object["content"]
+		return content_present
+	case:
+		return true
+	}
+	return true
 }
 
 provider_tool_fragment_by_item :: proc(object: json.Object, state: ^Provider_Stream_State, allocator := context.allocator) -> (^Provider_Tool_Fragment, bool) {

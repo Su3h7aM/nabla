@@ -1,5 +1,6 @@
 package ai
 
+import "core:encoding/json"
 import "core:mem"
 import "core:strings"
 
@@ -219,6 +220,20 @@ Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request
 	return .None
 }
 
+// Provider_Arguments_Object reports whether raw is the JSON object an endpoint carries as a
+// tool call's arguments. Both OpenAI APIs type the field as text holding an object, so
+// anything else -- empty, malformed, an array -- makes the request that carries it
+// unsendable. This is a check on the bytes alone: whether the tool accepts the fields they
+// name is the tool's own validator's business.
+Provider_Arguments_Object :: proc(raw: string, allocator := context.allocator) -> bool {
+	if raw == "" { return false }
+	value, parse_err := json.parse_string(raw, .JSON, true, allocator)
+	if parse_err != nil { return false }
+	defer json.destroy_value(value, allocator)
+	_, is_object := value.(json.Object)
+	return is_object
+}
+
 Provider_Finish_Reason :: enum {
 	Unknown,
 	Stop,
@@ -287,6 +302,19 @@ Provider_Event :: union {
 	Provider_Error_Event,
 }
 
+// Provider_Tool_Calls_Destroy releases a call list and every string it owns. It is the one
+// release path for calls a provider fact carries, so a new holder of one cannot free half
+// of a call or leak the rest.
+Provider_Tool_Calls_Destroy :: proc(calls: []Provider_Tool_Call, allocator := context.allocator) {
+	for call in calls {
+		if call.ID != "" { delete(call.ID, allocator) }
+		if call.Item_ID != "" { delete(call.Item_ID, allocator) }
+		if call.Name != "" { delete(call.Name, allocator) }
+		if call.Arguments != "" { delete(call.Arguments, allocator) }
+	}
+	if calls != nil { delete(calls, allocator) }
+}
+
 Provider_Event_Destroy :: proc(event: ^Provider_Event, allocator := context.allocator) {
 	if event == nil { return }
 	#partial switch value in event^ {
@@ -298,13 +326,7 @@ Provider_Event_Destroy :: proc(event: ^Provider_Event, allocator := context.allo
 	case Provider_Completed_Event:
 		if value.Reason_Text != "" { delete(value.Reason_Text, allocator) }
 		if value.Raw_Output != "" { delete(value.Raw_Output, allocator) }
-		for call in value.Tool_Calls {
-			if call.ID != "" { delete(call.ID, allocator) }
-			if call.Item_ID != "" { delete(call.Item_ID, allocator) }
-			if call.Name != "" { delete(call.Name, allocator) }
-			if call.Arguments != "" { delete(call.Arguments, allocator) }
-		}
-		if value.Tool_Calls != nil { delete(value.Tool_Calls, allocator) }
+		Provider_Tool_Calls_Destroy(value.Tool_Calls, allocator)
 	case Provider_Error_Event:
 		if value.Message != "" { delete(value.Message, allocator) }
 		if value.Provider_Code != "" { delete(value.Provider_Code, allocator) }

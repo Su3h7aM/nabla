@@ -57,11 +57,14 @@ reasoning into one lossy universal representation.
 
 Native replay must agree with admitted calls. If a call was repaired/refused, do not
 replay an opaque response containing a contradictory proposal as well as normalized
-calls. Project each assistant item once. Partial failed output is audit/display data,
-not a finished assistant message. Call/result runs stay complete and contiguous in
-the provider view even when hidden children occur between their durable sequences.
-Children are filtered by stored parent relationships, not by whether their parent
-happened to be loaded in this tail.
+calls. Project each assistant item once. A record is read as input before it is replayed,
+because the endpoint's stream and its terminal array can disagree: bytes the input schema
+refuses, or that do not say what the projection sends, are not carried, and the request
+reports how many records it refused. Partial failed output is audit/display data, not a
+finished assistant message. Call/result runs stay complete and contiguous in the provider
+view even when hidden children occur between their durable sequences. Children are filtered
+by stored parent relationships, not by whether their parent happened to be loaded in this
+tail.
 
 Projection failure is explicit. Repair unanswered calls from durable dispatch evidence
 at recovery, not by synthesizing arbitrary successful results while encoding.
