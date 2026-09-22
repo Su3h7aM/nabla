@@ -31,10 +31,6 @@ CHAT_RETRY_MAX_DELAY :: 8 * time.Second
 // early against a peer that asked for quiet is not a retry.
 CHAT_RETRY_MAX_PROVIDER_DELAY :: 30 * time.Second
 
-// CHAT_RETRY_SLICE is how often a wait rechecks cancellation. It is a check interval,
-// not a delay: the wait ends when its delay ends, not when a slice count runs out.
-CHAT_RETRY_SLICE :: 50 * time.Millisecond
-
 // Chat_Retry_Policy is every bound one chain runs under, in one value, so a caller can
 // run with its own bounds without an environment variable or a second code path.
 Chat_Retry_Policy :: struct {
@@ -42,7 +38,6 @@ Chat_Retry_Policy :: struct {
 	base_delay:         time.Duration,
 	max_delay:          time.Duration,
 	max_provider_delay: time.Duration,
-	slice:              time.Duration,
 }
 
 // chat_retry_policy_default is the policy a session runs with unless its caller says
@@ -54,7 +49,6 @@ chat_retry_policy_default :: proc() -> Chat_Retry_Policy {
 		base_delay = CHAT_RETRY_BASE_DELAY,
 		max_delay = CHAT_RETRY_MAX_DELAY,
 		max_provider_delay = CHAT_RETRY_MAX_PROVIDER_DELAY,
-		slice = CHAT_RETRY_SLICE,
 	}
 }
 

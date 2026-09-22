@@ -44,7 +44,13 @@ chat_cancel_reset :: proc() {
 	_ = linux.rt_sigprocmask(.SIG_SETMASK, &previous, nil)
 }
 
-chat_cancel_request :: proc() { ai.interrupt_request(&chat_cancel) }
+chat_cancel_request :: proc() {
+	ai.interrupt_request(&chat_cancel)
+	// A wait is not a poll: the thread that asked for the stop wakes the owner, so a
+	// cancellation is noticed while nothing else is happening. The signal handler writes
+	// the token alone, because it cannot take the wake's mutex.
+	owner_wake_signal()
+}
 chat_cancel_requested :: proc() -> bool { return ai.interrupt_requested(&chat_cancel) }
 
 chat_signal_interrupt :: proc "c" (signal: posix.Signal) {

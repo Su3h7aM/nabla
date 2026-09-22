@@ -560,7 +560,7 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 chat_chain_wait :: proc(chat: ^Chat_Session) {
 	chain := &chat.chain
 	if !chain.active || chain.stage != .Backoff { return }
-	if !chat_retry_wait(chat, chain.policy.slice, chain.decision.delay) {
+	if !chat_retry_wait(chat, chain.decision.delay) {
 		chat_chain_stop(chat, .Cancelled)
 		return
 	}

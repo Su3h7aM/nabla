@@ -91,7 +91,6 @@ test_retry_backoff_delay_doubles_and_sampled :: proc(t: ^testing.T) {
 		base_delay         = CHAT_RETRY_BASE_DELAY,
 		max_delay          = CHAT_RETRY_MAX_DELAY,
 		max_provider_delay = CHAT_RETRY_MAX_PROVIDER_DELAY,
-		slice              = CHAT_RETRY_SLICE,
 	}
 	testing.expect_value(t, chat_retry_backoff_delay(policy, 1, 0), CHAT_RETRY_BASE_DELAY / 2)
 	testing.expect_value(t, chat_retry_backoff_delay(policy, 1, 1), CHAT_RETRY_BASE_DELAY)

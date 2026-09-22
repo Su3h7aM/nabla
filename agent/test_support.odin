@@ -23,7 +23,6 @@ test_retry_policy :: proc() -> Chat_Retry_Policy {
 	policy.base_delay = 2 * time.Millisecond
 	policy.max_delay = 4 * time.Millisecond
 	policy.max_provider_delay = 25 * time.Millisecond
-	policy.slice = time.Millisecond
 	return policy
 }
 
@@ -35,7 +34,6 @@ test_compact_retry_policy :: proc() -> Chat_Retry_Policy {
 	policy.base_delay = 2 * time.Millisecond
 	policy.max_delay = 4 * time.Millisecond
 	policy.max_provider_delay = 25 * time.Millisecond
-	policy.slice = time.Millisecond
 	return policy
 }
 

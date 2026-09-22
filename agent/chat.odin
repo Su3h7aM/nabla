@@ -3,6 +3,7 @@ package agent
 import "core:encoding/json"
 import "core:fmt"
 import "core:log"
+import "core:sync"
 import "core:sys/posix"
 import "core:time"
 
@@ -375,25 +376,21 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	return recorded
 }
 
-// chat_retry_wait waits before the next send, in slices the policy names, and reports
-// whether the wait finished instead of being stopped. Cancellation is checked before
-// each slice, so a turn stopped during a delay never sends again.
+// chat_retry_wait waits out the backoff before the next attempt and reports whether the
+// delay elapsed instead of the turn being stopped. The deadline is the delay itself, so
+// nothing polls: a wakeup from any other publication ends the wait early, and the loop
+// recomputes what is left instead of shortening the backoff.
 @(private)
-chat_retry_wait :: proc(chat: ^Chat_Session, slice, delay: time.Duration) -> bool {
-	remaining := delay
-	for remaining > 0 {
+chat_retry_wait :: proc(chat: ^Chat_Session, delay: time.Duration) -> bool {
+	deadline := time.tick_add(time.tick_now(), delay)
+	sync.mutex_lock(&chat_wake.mutex)
+	defer sync.mutex_unlock(&chat_wake.mutex)
+	for {
 		if chat_session_cancelled(chat) { return false }
-		step := min(remaining, slice)
-		if step <= 0 {
-			// The policy named no slice, so the delay is waited in one step. The slice
-			// exists to recheck cancellation, not to bound the wait.
-			time.sleep(remaining)
-			return true
-		}
-		time.sleep(step)
-		remaining -= step
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 { return true }
+		_ = sync.cond_wait_with_timeout(&chat_wake.cond, &chat_wake.mutex, remaining)
 	}
-	return true
 }
 
 // chat_session_clear_attempt forgets the failure of an attempt that exposed
