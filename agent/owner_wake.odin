@@ -27,12 +27,20 @@ Owner_Wake :: struct {
 // owner_wake_signal wakes every waiter. A publication is not addressed to one session, so a
 // waiter that finds nothing new rechecks and waits again; the alternative, signalling one
 // waiter, can hand a wake to a session the publication was not for. Callable from any thread.
-// A signal handler must not use it and does not need to: the handler interrupts a blocked
-// wait, and the owner rechecks its predicates when the wait returns.
 owner_wake_signal :: proc() {
 	sync.mutex_lock(&chat_wake.mutex)
 	owner_wake_notify()
 	sync.mutex_unlock(&chat_wake.mutex)
+}
+
+// owner_wake_interrupt wakes every waiter from a signal handler. It takes no mutex, because a
+// handler cannot take one and does not need to: on Linux signalling a condition variable is one
+// atomic add and one futex wake, with no lock, no allocation, and no libc state, and the mutex a
+// waiter holds protects its predicates rather than the condition variable. A wake is only a
+// hint, so a signal that arrives while the owner is between its check and its wait still ends
+// that wait: the waiter's futex word has already moved.
+owner_wake_interrupt :: proc "contextless" () {
+	sync.cond_broadcast(&chat_wake.cond)
 }
 
 // owner_wake_notify wakes every waiter of a caller that already holds the wake mutex, which

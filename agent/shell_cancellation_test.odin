@@ -408,3 +408,88 @@ test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
 	effect := _test_begin_request(t, chat)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
 }
+
+// Backoff_Wait is signalled when a chain schedules a retry, which is the moment before it waits
+// out the delay.
+Backoff_Wait :: struct {
+	scheduled: sync.Sema,
+}
+
+backoff_note_scheduled :: proc(user_data: rawptr, event: Chat_Retry_Event) {
+	wait := cast(^Backoff_Wait)user_data
+	sync.sema_post(&wait.scheduled)
+}
+
+// backoff_send_signal delivers the stop once the retry is scheduled. The thread blocks SIGINT
+// and so can never run the process handler itself, which is the point: the signal reaches the
+// owner through the handler and the handler's wake, not through this thread.
+backoff_send_signal :: proc(thread: ^thread.Thread) {
+	wait := cast(^Backoff_Wait)thread.data
+	if !sync.sema_wait_with_timeout(&wait.scheduled, SHELL_TEST_BOUND) { return }
+	_ = linux.kill(linux.Pid(os.get_pid()), .SIGINT)
+}
+
+// A stop that no provider or tool event follows still has to reach the owner. During a retry
+// backoff the owner is the only thread left, so the signal handler itself has to wake the wait:
+// nothing else can, and a wait that no longer polls would otherwise run the whole delay.
+@(test)
+test_sigint_cuts_a_retry_backoff_short :: proc(t: ^testing.T) {
+	// A backoff far longer than the bound below, so a turn that returns inside it can only have
+	// been woken rather than waited out.
+	BACKOFF_DELAY :: 3 * time.Second
+
+	responses := []string{agent_provider_refusal("429 Too Many Requests", `{"error":{"message":"Rate limit reached"}}`, "retry-after: 0\r\n")}
+	provider: Agent_Provider
+	if !agent_provider_start(t, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 500_000)
+	_test_accept(t, chat, "hello")
+
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	policy := test_retry_policy()
+	policy.base_delay = BACKOFF_DELAY
+	policy.max_delay = BACKOFF_DELAY
+
+	// The handler stays armed for the whole test, so a signal that arrives after the turn
+	// restored the default disposition cannot terminate this process.
+	previous: sigaction_storage
+	chat_cancel_reset()
+	defer chat_cancel_reset()
+	chat_signal_arm(&previous.saved)
+	defer chat_signal_disarm(&previous.saved)
+
+	wait: Backoff_Wait
+	observer := Chat_Observer {
+		user_data       = &wait,
+		retry_scheduled = backoff_note_scheduled,
+	}
+	sender := test_thread_start(backoff_send_signal, &wait, "nabla-backoff-signal")
+	if sender == nil {
+		testing.expectf(t, false, "the signal sender could not start")
+		return
+	}
+	defer {
+		thread.join(sender)
+		thread.destroy(sender)
+	}
+
+	started := time.tick_now()
+	completed := chat_run_turn(chat, connection, policy, observer)
+	elapsed := time.tick_since(started)
+
+	testing.expect(t, !completed)
+	testing.expect_value(t, chat.terminal_status, Chat_Terminal_Status.Cancelled)
+	testing.expectf(t, elapsed < BACKOFF_DELAY / 2, "the retry backoff was not cut short: %v", elapsed)
+	// The second attempt never went out: the stop arrived while the chain was waiting.
+	testing.expect_value(t, len(provider.requests), 1)
+}
