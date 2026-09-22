@@ -181,6 +181,9 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	// A finished summary is installed at a request boundary, so the context the request is
 	// built from is the one this session will actually send.
 	_ = chat_compact_service(chat, observer)
+	// A boundary whose own durable write failed has nothing to prepare from: the record and
+	// the conversation have diverged, and no request may be built on that.
+	if chat_session_storage_failed(chat) { return }
 
 	prep, prep_err := chat_prepare(chat, connection)
 	if prep_err != nil {
@@ -284,6 +287,12 @@ chat_chain_claim_send :: proc(chat: ^Chat_Session) -> bool {
 	// A turn stopped since the last attempt must not start another send.
 	if chat_session_cancelled(chat) {
 		chat_chain_stop(chat, .Cancelled)
+		return false
+	}
+	// A latched storage failure means the record and the conversation have diverged, so no
+	// further send may be launched against it.
+	if chat_session_storage_failed(chat) {
+		chat_chain_stop(chat, .Storage_Failed)
 		return false
 	}
 	number := chain.attempts + 1
