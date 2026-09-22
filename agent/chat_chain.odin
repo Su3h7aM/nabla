@@ -79,12 +79,16 @@ Chat_Request_Chain :: struct {
 }
 
 // chat_chain_release frees everything the chain owns, joining a live worker first. The
-// zero chain is inert, so releasing one that never ran is safe.
+// zero chain is inert, so releasing one that never ran is safe. It retires the operation the
+// chain began: a release that is not a commit, such as one after an attempt row that could not
+// be written, is the only thing left that can, and an operation left running would leave the
+// turn with no stage it can reach a terminal from.
 chat_chain_release :: proc(chat: ^Chat_Session) {
 	// A producer waiting for room is released before the join, so backpressure cannot
 	// outlive the drain that would have delivered its events.
 	mailbox_close(&chat.mailbox)
 	chat_chain_join(chat)
+	chat_session_retire_operation(chat)
 	chat_request_prep_destroy(&chat.chain.prep, chat.allocator)
 	ai.Provider_Operation_Error_Destroy(&chat.chain.operation_error, chat.mailbox.allocator)
 	delete(chat.chain.encoded.Body, chat.allocator)
