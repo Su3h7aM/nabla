@@ -20,12 +20,10 @@ test_a_turn_outcome_that_cannot_be_recorded_latches_the_session :: proc(t: ^test
 
 	_test_accept(t, chat, "a turn that will not be recorded")
 	effect := _test_begin_request(t, chat)
-	chat_effect_destroy(&effect)
 	testing.expect(t, chat_session_request_cancel(chat))
 	chat_session_retire_operation(chat)
 
 	finish := chat_session_advance(chat)
-	defer chat_effect_destroy(&finish)
 	if !testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished) { return }
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
 
@@ -35,6 +33,7 @@ test_a_turn_outcome_that_cannot_be_recorded_latches_the_session :: proc(t: ^test
 		testing.fail_now(t, "the store could not be made read-only")
 	}
 
+	chat_session_claim_finish(chat, finish)
 	testing.expect(t, !chat_persist_turn_end(chat, finish), "an unrecorded turn must not report that it was recorded")
 	testing.expect(t, chat_session_storage_failed(chat), "the session must latch the failed write")
 	testing.expect(t, chat_session_last_error(chat) != "", "the reason must be kept for the transcript")

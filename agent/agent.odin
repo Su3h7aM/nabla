@@ -35,10 +35,6 @@ Chat_Effect :: struct {
 
 chat_effect_none :: proc() -> Chat_Effect { return Chat_Effect{kind = .None} }
 
-chat_effect_destroy :: proc(effect: ^Chat_Effect) {
-	effect^ = {}
-}
-
 // chat_session_observe applies facts that arrived from outside the owner: a worker's
 // published result, a stop the session asked for, and the first sight of a call that
 // should have stopped. It is the driver's collection step, so the state can be read
@@ -103,10 +99,11 @@ chat_session_advance_at :: proc(chat: ^Chat_Session, now: time.Tick) -> Chat_Eff
 		// turn finalizes only after its operation is retired, which is the
 		// confirmation that the request is no longer running.
 		if chat.operation.state == .Running { return chat_effect_none() }
-		return chat_finalize_turn(chat, .Cancelled)
+		return Chat_Effect{kind = .Turn_Finished, turn_id = chat.active_turn_id, status = .Cancelled}
 	case .Finalizing:
-		if chat.active_failed { return chat_finalize_turn(chat, .Failed) }
-		return chat_finalize_turn(chat, .Completed)
+		status := Chat_Terminal_Status.Completed
+		if chat.active_failed { status = .Failed }
+		return Chat_Effect{kind = .Turn_Finished, turn_id = chat.active_turn_id, status = status}
 	}
 	return chat_effect_none()
 }
@@ -172,21 +169,24 @@ chat_session_fail_turn :: proc(chat: ^Chat_Session, message: string) -> Chat_Eff
 	return chat_effect_none()
 }
 
-// chat_finalize_turn is the only place a turn reaches a terminal status. Every
-// terminal path goes through it and it returns the session to Idle in the same
-// step, so a turn finalizes exactly once and the next turn can start immediately.
+// chat_session_claim_finish applies the transition a selected Turn_Finished proposed:
+// the turn reaches its terminal status and the session returns to Idle, so the next turn
+// can start immediately. Selection reads only, so the transition lives here; the driver
+// claims the effect before it records or reports anything, and a repeated claim is a
+// no-op because the state no longer allows it.
 //
-// The error text stays on the session: the driver reads it when it records and reports
-// the terminal status, so the effect owns nothing and a turn costs no clone.
-//
-// Uncommitted assistant text is not dropped here; the driver records it as a
-// partial entry when it settles the turn.
-chat_finalize_turn :: proc(chat: ^Chat_Session, status: Chat_Terminal_Status) -> Chat_Effect {
-	turn_id := chat.active_turn_id
-	chat.terminal_status = status
+// The error text stays on the session: the driver reads it when it records and reports the
+// terminal status, so the effect owns nothing and a turn costs no clone. Uncommitted
+// assistant text is not dropped here either; the driver records it as a partial entry when
+// it settles the turn.
+chat_session_claim_finish :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> bool {
+	if effect.kind != .Turn_Finished { return false }
+	if chat.state != .Cancelling && chat.state != .Finalizing { return false }
+	if chat.active_turn_id != effect.turn_id { return false }
+	chat.terminal_status = effect.status
 	chat.state = .Idle
 	chat.active_failed = false
-	return Chat_Effect{kind = .Turn_Finished, turn_id = turn_id, status = status}
+	return true
 }
 
 chat_terminal_text :: proc(status: Chat_Terminal_Status) -> string {

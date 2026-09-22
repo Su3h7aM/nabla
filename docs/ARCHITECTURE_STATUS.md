@@ -42,8 +42,9 @@ Each is required work, not a design choice. Do not treat current behavior as cor
 
 Closed since this document was written:
 
-- `chat_session_advance` is a read: the driver claims the request, and counters advance on
-the accepted transition.
+- `chat_session_advance` is a read: the driver claims the request before it counts, and
+claims the turn finish before it records the terminal outcome; a claim, never selection,
+applies the transition.
 - Tool observation is separate from selection: `tool_jobs_observe` applies external facts,
 and `tool_jobs_next` reads the table.
 - A tool worker that ignores its stop latches the session; no further turn is admitted and

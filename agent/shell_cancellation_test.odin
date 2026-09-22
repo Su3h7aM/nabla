@@ -205,14 +205,12 @@ test_shell_cancel_reaps_child_and_allows_next_turn :: proc(t: ^testing.T) {
 
 	effect := _test_begin_request(t, chat)
 	first_turn := effect.turn_id
-	chat_effect_destroy(&effect)
 
 	// The call is recorded first, exactly as a completed response would, and then
 	// the turn is cancelled before the tool would have finished.
 	_test_stage_call(t, chat, "call_long", `{"command":"sleep 30","working_directory":null,"timeout_ms":10000}`)
 	effect = chat_session_advance(chat)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Run_Tools)
-	chat_effect_destroy(&effect)
 
 	chat_session_request_cancel(chat)
 	testing.expect_value(t, chat.state, Chat_State.Cancelling)
@@ -231,7 +229,6 @@ test_shell_cancel_reaps_child_and_allows_next_turn :: proc(t: ^testing.T) {
 	finish := _test_settle(t, chat)
 	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
-	chat_effect_destroy(&finish)
 	testing.expect_value(t, chat.state, Chat_State.Idle)
 
 	// A fresh turn starts immediately, without waiting on anything from the last one.
@@ -240,7 +237,6 @@ test_shell_cancel_reaps_child_and_allows_next_turn :: proc(t: ^testing.T) {
 	testing.expect(t, !chat_session_cancelled(chat))
 	effect = _test_begin_request(t, chat)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
-	chat_effect_destroy(&effect)
 }
 
 // --- SIGINT through the production control loop -------------------------------
@@ -402,5 +398,4 @@ test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
 	testing.expect(t, !chat_session_cancelled(chat))
 	effect := _test_begin_request(t, chat)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
-	chat_effect_destroy(&effect)
 }

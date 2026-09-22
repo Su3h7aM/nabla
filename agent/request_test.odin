@@ -143,7 +143,6 @@ test_build_request_replays_verbatim_response_output_in_order :: proc(t: ^testing
 		API = .OpenAI_Responses,
 	}
 	effect := _test_begin_request(t, chat)
-	chat_effect_destroy(&effect)
 	request_no, begin_err := session.request_begin(
 		chat.store,
 		chat.id,

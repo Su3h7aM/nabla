@@ -331,7 +331,6 @@ test_a_response_with_an_unparseable_call_is_not_replayed_verbatim :: proc(t: ^te
 	chat_test_capacity(chat, chat.capacity.window if chat.capacity.window > 0 else CHAT_DEFAULT_CONTEXT_WINDOW, 4096)
 	_test_accept(t, chat, "native malformed call")
 	effect := _test_begin_request(t, chat)
-	chat_effect_destroy(&effect)
 	request_no, begin_err := session.request_begin(
 		chat.store,
 		chat.id,
@@ -434,7 +433,6 @@ test_tool_loop_has_no_request_budget :: proc(t: ^testing.T) {
 	// it is asked, and counts nothing. The driver's claim is what starts the turn and
 	// counts the request.
 	effect := chat_session_advance(chat)
-	defer chat_effect_destroy(&effect)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
 	testing.expect_value(t, chat.requests_made, 1000)
 	testing.expect_value(t, chat.state, Chat_State.Preparing)
@@ -461,7 +459,6 @@ test_a_claim_refuses_a_turn_that_stopped_at_its_boundary :: proc(t: ^testing.T) 
 	chat.requests_made = 3
 
 	effect := chat_session_advance(chat)
-	defer chat_effect_destroy(&effect)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
 
 	// What a boundary does when its own durable write fails.
@@ -480,7 +477,6 @@ test_tool_loop_accepts_more_than_the_old_batch_limit :: proc(t: ^testing.T) {
 	chat.tools_enabled = true
 	_test_accept(t, chat, "many calls")
 	request := _test_begin_request(t, chat)
-	defer chat_effect_destroy(&request)
 
 	calls := make([dynamic]ai.Provider_Tool_Call, 0, 40, context.temp_allocator)
 	defer delete(calls)
@@ -510,10 +506,8 @@ test_the_first_prompt_names_the_session :: proc(t: ^testing.T) {
 	session.session_destroy(&header)
 
 	effect := _test_begin_request(t, chat)
-	chat_effect_destroy(&effect)
 	testing.expect(t, chat_session_feed_completion(chat, chat_session_event_source(chat)))
 	finish := _test_settle(t, chat)
-	chat_effect_destroy(&finish)
 
 	// A later turn leaves the name alone.
 	_test_accept(t, chat, "something else")
@@ -632,7 +626,6 @@ test_unusable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T) {
 	_test_accept(t, chat, "duplicate calls")
 
 	effect := _test_begin_request(t, chat)
-	chat_effect_destroy(&effect)
 	request_no, begin_err := session.request_begin(
 		chat.store,
 		chat.id,
@@ -677,7 +670,6 @@ test_unusable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T) {
 
 	// The next step is another request, not a stop.
 	next := chat_session_advance(chat)
-	defer chat_effect_destroy(&next)
 	testing.expect_value(t, next.kind, Chat_Effect_Kind.Start_Request)
 }
 

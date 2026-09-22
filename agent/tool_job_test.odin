@@ -726,9 +726,7 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
 	_test_stage_call(t, chat, "call_owned", `{}`, "test_owned")
 
 	first := chat_session_advance(chat)
-	defer chat_effect_destroy(&first)
 	second := chat_session_advance(chat)
-	defer chat_effect_destroy(&second)
 	testing.expect_value(t, first.kind, Chat_Effect_Kind.Run_Tools)
 	testing.expect_value(t, second.kind, Chat_Effect_Kind.Run_Tools)
 	testing.expect(t, !chat.tool_jobs_active, "advance must not perform its own effect")
@@ -741,12 +739,10 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
 	testing.expect_value(t, dispatch.kind, Chat_Effect_Kind.Step_Tools)
 	testing.expect_value(t, dispatch.tool, Tool_Job_Effect.Dispatch)
 	chat_tool_jobs_step(chat, {}, dispatch.tool)
-	chat_effect_destroy(&dispatch)
 	tool_job_test_hold_until(t, 1)
 
 	wait := chat_session_advance(chat)
 	testing.expect_value(t, wait.kind, Chat_Effect_Kind.Wait_Tools)
-	chat_effect_destroy(&wait)
 
 	tool_job_hold_release_all()
 	for _ in 0 ..< 100_000 {
@@ -759,7 +755,6 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
 			chat_tool_jobs_wait(chat)
 		case .Finish_Tools:
 			turn_id := effect.turn_id
-			chat_effect_destroy(&effect)
 			testing.expect(t, chat_tool_jobs_finish(chat, turn_id), "the settled batch should close")
 			testing.expect(t, !chat.tool_jobs_active, "finishing releases the session table")
 			testing.expect_value(t, chat.state, Chat_State.Preparing)
@@ -767,7 +762,6 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
 		case .None, .Start_Request, .Run_Tools, .Turn_Finished:
 			testing.fail_now(t, "the chat selected an invalid tool effect")
 		}
-		chat_effect_destroy(&effect)
 	}
 	testing.expect(t, false, "the session-owned batch never settled")
 }
@@ -788,7 +782,6 @@ test_advance_does_not_adopt_a_published_result :: proc(t: ^testing.T) {
 
 	dispatch := chat_session_advance(chat)
 	chat_tool_jobs_step(chat, {}, dispatch.tool)
-	chat_effect_destroy(&dispatch)
 	tool_job_test_hold_until(t, 1)
 
 	tool_job_hold_release_all()
@@ -800,14 +793,12 @@ test_advance_does_not_adopt_a_published_result :: proc(t: ^testing.T) {
 	// The result exists in the job but has not been observed, so selection still proposes
 	// a wait and the phase is untouched.
 	wait := chat_session_advance(chat)
-	defer chat_effect_destroy(&wait)
 	testing.expect_value(t, wait.kind, Chat_Effect_Kind.Wait_Tools)
 	testing.expect_value(t, chat.tool_jobs.jobs[0].phase, Tool_Job_Phase.Running)
 
 	// Observing adopts it, and the next selection is the commit.
 	chat_session_observe(chat)
 	commit := chat_session_advance(chat)
-	defer chat_effect_destroy(&commit)
 	testing.expect_value(t, commit.kind, Chat_Effect_Kind.Step_Tools)
 	testing.expect_value(t, commit.tool, Tool_Job_Effect.Commit)
 }
@@ -855,7 +846,6 @@ test_cancelling_chat_drains_session_owned_jobs :: proc(t: ^testing.T) {
 
 	dispatch := chat_session_advance(chat)
 	chat_tool_jobs_step(chat, {}, dispatch.tool)
-	chat_effect_destroy(&dispatch)
 	tool_job_test_hold_until(t, 1)
 
 	chat_session_request_cancel(chat)
@@ -872,7 +862,6 @@ test_cancelling_chat_drains_session_owned_jobs :: proc(t: ^testing.T) {
 			chat_tool_jobs_wait(chat)
 		case .Finish_Tools:
 			turn_id := effect.turn_id
-			chat_effect_destroy(&effect)
 			testing.expect(t, chat_tool_jobs_finish(chat, turn_id), "the cancelled batch should close")
 			testing.expect_value(t, chat.state, Chat_State.Cancelling)
 			testing.expect_value(t, chat.calls_made, 1)
@@ -880,7 +869,6 @@ test_cancelling_chat_drains_session_owned_jobs :: proc(t: ^testing.T) {
 		case .None, .Start_Request, .Run_Tools, .Turn_Finished:
 			testing.fail_now(t, "cancellation skipped the tool drain")
 		}
-		chat_effect_destroy(&effect)
 	}
 	testing.expect(t, false, "the cancelled session-owned batch never settled")
 }

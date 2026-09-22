@@ -72,13 +72,12 @@ log_chat_text :: proc(t: ^testing.T, fixture: ^Log_Chat_Test) -> string {
 log_chat_cancel_turn :: proc(t: ^testing.T, chat: ^Chat_Session) -> (entries: int, calls: int) {
 	_test_accept(t, chat, "first")
 	effect := _test_begin_request(t, chat)
-	chat_effect_destroy(&effect)
 	testing.expect(t, chat_session_feed_text(chat, chat_session_event_source(chat), "partial"))
 	testing.expect(t, chat_session_request_cancel(chat))
 	chat_session_retire_operation(chat)
 	finish := chat_session_advance(chat)
+	chat_session_claim_finish(chat, finish)
 	chat_persist_turn_end(chat, finish)
-	chat_effect_destroy(&finish)
 
 	loaded := _test_entries(t, chat)
 	defer session.entries_destroy(loaded, context.allocator)
@@ -119,19 +118,17 @@ test_a_superseded_operation_is_recorded :: proc(t: ^testing.T) {
 	_test_accept(t, chat, "first")
 	effect := _test_begin_request(t, chat)
 	stale := chat_session_event_source(chat)
-	chat_effect_destroy(&effect)
 	testing.expect(t, chat_session_request_cancel(chat))
 	chat_session_retire_operation(chat)
 	finish := chat_session_advance(chat)
+	chat_session_claim_finish(chat, finish)
 	chat_persist_turn_end(chat, finish)
-	chat_effect_destroy(&finish)
 	chat_cancel_reset()
 
 	// The retired operation's event is dropped, and that is what the record says.
 	_test_accept(t, chat, "second")
 	effect = _test_begin_request(t, chat)
 	testing.expect(t, !chat_session_feed_text(chat, stale, "late"))
-	chat_effect_destroy(&effect)
 	chat_session_retire_operation(chat)
 
 	context.logger = fixture.ambient

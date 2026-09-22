@@ -21,7 +21,6 @@ test_cancelled_turn_retires_then_next_turn_runs :: proc(t: ^testing.T) {
 	effect := _test_begin_request(t, chat)
 	first_turn := effect.turn_id
 	first_operation := chat.operation.id
-	chat_effect_destroy(&effect)
 
 	testing.expect(t, chat_session_feed_text(chat, chat_session_event_source(chat), "partial"))
 
@@ -35,15 +34,14 @@ test_cancelled_turn_retires_then_next_turn_runs :: proc(t: ^testing.T) {
 	// The turn cannot settle while its operation is outstanding.
 	pending := chat_session_advance(chat)
 	testing.expect_value(t, pending.kind, Chat_Effect_Kind.None)
-	chat_effect_destroy(&pending)
 	testing.expect_value(t, chat.state, Chat_State.Cancelling)
 
 	chat_session_retire_operation(chat)
 	finish := chat_session_advance(chat)
 	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
+	chat_session_claim_finish(chat, finish)
 	chat_persist_turn_end(chat, finish)
-	chat_effect_destroy(&finish)
 	testing.expect_value(t, chat.state, Chat_State.Idle)
 
 	// The turn's prompt and the text it produced before stopping are both kept:
@@ -65,12 +63,11 @@ test_cancelled_turn_retires_then_next_turn_runs :: proc(t: ^testing.T) {
 	testing.expect(t, chat.active_turn_id == first_turn + 1)
 	effect = _test_begin_request(t, chat)
 	testing.expect_value(t, chat.operation.id, first_operation + 1)
-	chat_effect_destroy(&effect)
 	testing.expect(t, chat_session_feed_completion(chat, chat_session_event_source(chat)))
 	finish = chat_session_advance(chat)
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Completed)
+	chat_session_claim_finish(chat, finish)
 	chat_persist_turn_end(chat, finish)
-	chat_effect_destroy(&finish)
 }
 
 // Events are identified by turn and operation. An event from a superseded operation
@@ -86,18 +83,16 @@ test_stale_operation_events_are_rejected :: proc(t: ^testing.T) {
 
 	effect := _test_begin_request(t, chat)
 	stale := chat_session_event_source(chat)
-	chat_effect_destroy(&effect)
 	testing.expect(t, chat_session_request_cancel(chat))
 	chat_session_retire_operation(chat)
 	finish := chat_session_advance(chat)
+	chat_session_claim_finish(chat, finish)
 	chat_persist_turn_end(chat, finish)
-	chat_effect_destroy(&finish)
 	chat_cancel_reset()
 
 	_test_accept(t, chat, "second")
 	effect = _test_begin_request(t, chat)
 	current := chat_session_event_source(chat)
-	chat_effect_destroy(&effect)
 	testing.expect(t, current.operation_id != stale.operation_id)
 	testing.expect(t, current.turn_id != stale.turn_id)
 
@@ -127,19 +122,17 @@ test_turn_finalizes_exactly_once :: proc(t: ^testing.T) {
 	_test_accept(t, chat, "once")
 
 	effect := _test_begin_request(t, chat)
-	chat_effect_destroy(&effect)
 	testing.expect(t, chat_session_feed_completion(chat, chat_session_event_source(chat)))
 
 	finish := chat_session_advance(chat)
 	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Completed)
+	chat_session_claim_finish(chat, finish)
 	chat_persist_turn_end(chat, finish)
-	chat_effect_destroy(&finish)
 
 	// No second terminal effect, and no later transition.
 	again := chat_session_advance(chat)
 	testing.expect_value(t, again.kind, Chat_Effect_Kind.None)
-	chat_effect_destroy(&again)
 	testing.expect_value(t, chat.state, Chat_State.Idle)
 	testing.expect_value(t, chat.terminal_status, Chat_Terminal_Status.Completed)
 	// A completed turn cannot be relabelled as cancelled.

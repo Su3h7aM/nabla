@@ -987,7 +987,6 @@ chat_run_turn_steered :: proc(
 		effect := chat_session_advance_at(chat, now)
 		switch effect.kind {
 		case .Start_Request:
-			chat_effect_destroy(&effect)
 			// The boundary is a stage of the request the selector just proposed, and it runs
 			// before the claim that counts it: the selection the user may have changed since
 			// the last request is installed, and a boundary that stops the turn claims
@@ -997,22 +996,22 @@ chat_run_turn_steered :: proc(
 			chat_perform_request(chat, current, policy, observer, &usages)
 		case .Run_Tools:
 			turn_id := effect.turn_id
-			chat_effect_destroy(&effect)
 			chat_tool_jobs_begin(chat, observer)
 			if chat.active_turn_id != turn_id { return false }
 		case .Step_Tools:
 			tool_effect := effect.tool
-			chat_effect_destroy(&effect)
 			chat_tool_jobs_step(chat, observer, tool_effect)
 		case .Wait_Tools:
-			chat_effect_destroy(&effect)
 			chat_tool_jobs_wait(chat)
 		case .Finish_Tools:
 			turn_id := effect.turn_id
-			chat_effect_destroy(&effect)
 			if !chat_tool_jobs_finish(chat, turn_id) { return false }
 			if chat_session_cancelled(chat) { chat_session_note_cancel(chat) }
 		case .Turn_Finished:
+			// The claim applies the transition the selector proposed, which only read state.
+			// It runs before the line drain so the line still belongs to the turn that was
+			// sent it, while the turn number still names that turn.
+			_ = chat_session_claim_finish(chat, effect)
 			// Input the turn never recorded is recorded here, so a turn that ends takes no
 			// message with it: this is input that arrived while a request was in flight, while
 			// a tool batch was settling, or after a failure or cancellation. It is durable, and
@@ -1029,11 +1028,9 @@ chat_run_turn_steered :: proc(
 			status := effect.status
 			if !chat_persist_turn_end(chat, effect) { status = .Failed }
 			chat_report_terminal(chat, observer, status)
-			chat_effect_destroy(&effect)
 			chat_report_usage(observer, usages)
 			return status == .Completed
 		case .None:
-			chat_effect_destroy(&effect)
 			if chat.state == .Finalizing || chat.state == .Cancelling { continue }
 			return false
 		}

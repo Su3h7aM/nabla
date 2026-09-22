@@ -242,7 +242,6 @@ test_input_left_at_the_end_of_a_turn_keeps_it_running :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, chat.state, Chat_State.Preparing)
 	effect := chat_session_advance(chat)
-	defer chat_effect_destroy(&effect)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
 
 	// The request that follows is built from the history the line is now part of.
@@ -325,7 +324,6 @@ test_input_does_not_restart_a_turn_that_failed :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, chat.state, Chat_State.Finalizing)
 	effect := chat_session_advance(chat)
-	defer chat_effect_destroy(&effect)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Turn_Finished)
 	testing.expect_value(t, effect.status, Chat_Terminal_Status.Failed)
 }
