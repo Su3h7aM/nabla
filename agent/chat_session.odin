@@ -91,6 +91,12 @@ Chat_Session :: struct {
 	next_operation_id:            u64,
 	operation:                    Chat_Operation,
 
+	// chain is the request in flight between its attempts. It lives here because the
+	// driver returns to its loop between one effect and the next: a retry wait is request
+	// state, not a nested loop. It owns the prepared request and the frozen bytes until
+	// chat_chain_commit releases them.
+	chain:                        Chat_Request_Chain,
+
 	// storage_failed latches a durable write that did not land. A session that
 	// could not record its own history accepts no further work: continuing would
 	// let the conversation diverge from what was stored.
@@ -268,6 +274,7 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	// Compaction's worker borrows this session's id for its logging correlation, so
 	// it is stopped before anything the session owns is released.
 	chat_compact_destroy(chat)
+	chat_chain_release(chat)
 	if chat.provider_websocket != nil {
 		ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
 		chat.provider_websocket = nil
@@ -429,6 +436,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	// finished can never be inherited by this one.
 	chat_cancel_reset()
 	chat_operation_retire(&chat.operation)
+	chat_chain_release(chat)
 	if chat.tool_jobs_active {
 		tool_jobs_destroy(&chat.tool_jobs)
 		chat.tool_jobs_active = false

@@ -12,6 +12,7 @@ import "core:testing"
 import "core:time"
 
 import "nabla:agent/session"
+import "nabla:ai"
 
 // test_retry_policy is the policy the suites run with: the production bounds, with a
 // wait short enough that a retry costs a test milliseconds instead of a second. A suite
@@ -143,6 +144,34 @@ _test_begin_request :: proc(t: ^testing.T, chat: ^Chat_Session) -> Chat_Effect {
 	chat_session_begin_request(chat)
 	chat_session_begin_operation(chat)
 	return effect
+}
+
+// _test_perform_request drives one logical request through the same effects the driver
+// performs, for a suite that needs a settled request without a turn loop. The connection
+// is expected to fail without a retry, so no backoff is waited.
+@(private)
+_test_perform_request :: proc(
+	t: ^testing.T,
+	chat: ^Chat_Session,
+	connection: ai.Provider_Connection,
+	policy: Chat_Retry_Policy,
+	observer: Chat_Observer,
+	usages: ^[dynamic]Chat_Request_Usage,
+) {
+	chat_request_begin(chat, connection, policy, observer)
+	for {
+		effect := chat_session_advance(chat)
+		switch effect.kind {
+		case .Send_Attempt:
+			chat_chain_claim_send(chat)
+			chat_chain_send(chat, usages)
+		case .Commit_Response:
+			chat_chain_commit(chat, usages)
+			return
+		case .None, .Start_Request, .Wait_Retry, .Repair_Context, .Run_Tools, .Step_Tools, .Wait_Tools, .Finish_Tools, .Turn_Finished:
+			testing.fail_now(t, "the request did not settle")
+		}
+	}
 }
 
 _test_append :: proc(t: ^testing.T, chat: ^Chat_Session, entry: session.New_Entry) -> session.Seq {

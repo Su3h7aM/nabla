@@ -33,15 +33,17 @@ Each is required work, not a design choice. Do not treat current behavior as cor
 
 | Gap | Target |
 | --- | --- |
-| Retry and backoff still run in a nested loop inside the blocking request send; transport setup, the durable attempt row, one model send, and the context-repair branch are extracted | Retry and backoff become request state under `Awaiting_Model`, driven from the owner loop |
 | Provider stream facts are decoded into typed `Chat_Event`s that `chat_session_apply` applies, but the callback still runs inside the blocking send, so the request path cannot be driven from events alone | Route request/stream facts through the shared owner mailbox so a test can drive the whole turn |
 | No aggregate retained-byte budget or session retention quota; child results are exempt from the model budget but not from a storage bound | Add measured byte limits for root, child and session retention with an explicit settlement reserve |
-| Retry waits and the tool-wait cap use separate fixed 50 ms checks; tool completions already wake a condition variable, and a finished compaction is adopted at the next request boundary | One owner wake mechanism with the nearest real deadline; no ordinary polling |
-| WebSocket transport defaults to HTTP and `auto` fallback is partial | Complete the correctness/cache gates, then adopt the target default |
+| Retry waits and the tool-wait cap use separate fixed 50 ms checks; tool completions already wake a condition variable, and a finished compaction is adopted at the next request boundary | One owner wake mechanism with the nearest real deadline; no ordinary polling || WebSocket transport defaults to HTTP and `auto` fallback is partial | Complete the correctness/cache gates, then adopt the target default |
 | Provider prompt-cache parity and complete provider-error classification are not fully verified | Close the [network](NETWORK_STACK_ARCHITECTURE.md) corrections and measure |
 
 Closed since this document was written:
 
+- Retry and backoff are request state: `Chat_Request_Chain` carries the prepared request,
+the frozen bytes, and the recovery decision across attempts, and the driver performs
+`Send_Attempt`, `Wait_Retry`, `Repair_Context`, and `Commit_Response` one at a time, so a
+retry wait is a stage the turn can stop rather than a nested loop.
 - `chat_session_advance` is a read: the driver claims the request before it counts, and
 claims the turn finish before it records the terminal outcome; a claim, never selection,
 applies the transition.

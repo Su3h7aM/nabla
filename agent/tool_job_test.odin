@@ -759,7 +759,7 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
 			testing.expect(t, !chat.tool_jobs_active, "finishing releases the session table")
 			testing.expect_value(t, chat.state, Chat_State.Preparing)
 			return
-		case .None, .Start_Request, .Run_Tools, .Turn_Finished:
+		case .None, .Start_Request, .Send_Attempt, .Wait_Retry, .Repair_Context, .Commit_Response, .Run_Tools, .Turn_Finished:
 			testing.fail_now(t, "the chat selected an invalid tool effect")
 		}
 	}
@@ -866,7 +866,7 @@ test_cancelling_chat_drains_session_owned_jobs :: proc(t: ^testing.T) {
 			testing.expect_value(t, chat.state, Chat_State.Cancelling)
 			testing.expect_value(t, chat.calls_made, 1)
 			return
-		case .None, .Start_Request, .Run_Tools, .Turn_Finished:
+		case .None, .Start_Request, .Send_Attempt, .Wait_Retry, .Repair_Context, .Commit_Response, .Run_Tools, .Turn_Finished:
 			testing.fail_now(t, "cancellation skipped the tool drain")
 		}
 	}

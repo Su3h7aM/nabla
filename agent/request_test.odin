@@ -764,7 +764,7 @@ test_every_request_reports_itself_while_the_turn_runs :: proc(t: ^testing.T) {
 	counter: Request_Event_Counter
 	observer := request_event_observer(&counter)
 
-	chat_perform_request(chat, connection, test_retry_policy(), observer, &usages)
+	_test_perform_request(t, chat, connection, test_retry_policy(), observer, &usages)
 	testing.expect_value(t, counter.prepared, 1)
 	testing.expect_value(t, counter.finished, 1)
 
@@ -774,7 +774,7 @@ test_every_request_reports_itself_while_the_turn_runs :: proc(t: ^testing.T) {
 	// from the turn's preparing state, which is where a settled tool batch or a rejected
 	// response leaves it; this request failed instead, so the test states it directly.
 	chat.state = .Preparing
-	chat_perform_request(chat, connection, test_retry_policy(), observer, &usages)
+	_test_perform_request(t, chat, connection, test_retry_policy(), observer, &usages)
 	testing.expect_value(t, counter.prepared, 2)
 	testing.expect_value(t, counter.finished, 2)
 }

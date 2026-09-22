@@ -9,7 +9,17 @@ import "nabla:ai"
 
 Chat_Effect_Kind :: enum {
 	None,
+	// Start_Request is the request boundary and freeze: claim, prepare, admit, and encode
+	// one request. It sends nothing; the first attempt is an effect of its own.
 	Start_Request,
+	// Send_Attempt claims one attempt and performs one provider send.
+	Send_Attempt,
+	// Wait_Retry waits out the chain's backoff before its next attempt.
+	Wait_Retry,
+	// Repair_Context installs a ready summary and rebuilds the refused payload.
+	Repair_Context,
+	// Commit_Response records the chain's response and releases it.
+	Commit_Response,
 	// Run_Tools admits the response's committed calls into the session-owned job
 	// table. It does not run an executor.
 	Run_Tools,
@@ -84,6 +94,36 @@ chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
 // change. The driver applies the transition the effect names, so calling it twice
 // proposes the same work twice and launches or writes nothing.
 chat_session_advance_at :: proc(chat: ^Chat_Session, now: time.Tick) -> Chat_Effect {
+	// An active chain owns the request between its attempts, and its stage is a stronger
+	// fact than the turn state the last provider event left behind: a failed attempt sets
+	// the turn to finalizing before the policy decides to retry it. Only selection of the
+	// state machine proper happens below, and it commits a stopped chain before anything
+	// else so the response is recorded before its calls are dispatched.
+	if chat.chain.active {
+		// A stopped chain commits: the response is recorded before its calls are dispatched,
+		// and cancellation stops a chain between attempts rather than after another send.
+		if chat.chain.stage == .Committing || chat.state == .Cancelling {
+			return Chat_Effect{kind = .Commit_Response, turn_id = chat.active_turn_id}
+		}
+		// The stage is a stronger fact than the turn state the last provider event left
+		// behind: a failed attempt sets the turn to finalizing before the policy decides to
+		// retry it.
+		switch chat.chain.stage {
+		case .Ready:
+			return Chat_Effect{kind = .Send_Attempt, turn_id = chat.active_turn_id}
+		case .Sending:
+			// The claim and the send are one effect step, so selection never observes this
+			// stage; a selection that does is a bug, and proposes nothing.
+			return chat_effect_none()
+		case .Backoff:
+			return Chat_Effect{kind = .Wait_Retry, turn_id = chat.active_turn_id}
+		case .Repairing:
+			return Chat_Effect{kind = .Repair_Context, turn_id = chat.active_turn_id}
+		case .Committing:
+			return Chat_Effect{kind = .Commit_Response, turn_id = chat.active_turn_id}
+		}
+		return chat_effect_none()
+	}
 	switch chat.state {
 	case .Idle, .Requesting:
 		return chat_effect_none()
