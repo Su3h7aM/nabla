@@ -819,3 +819,38 @@ test_every_dispatch_path_stores_a_valid_envelope :: proc(t: ^testing.T) {
 		testing.expect(t, tool_result_valid(result.outcome, result.content), "a cancellation before dispatch stores a valid envelope")
 	}
 }
+
+// A batch that cannot answer every committed call must not leave the turn in a stage that would
+// dispatch those calls again. The turn ends instead, and a cancellation keeps the status the
+// user asked for.
+@(test)
+test_an_incomplete_tool_batch_ends_the_turn :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	_test_accept(t, chat, "run something")
+	_test_stage_call(t, chat, "call_1", `{}`)
+	chat.state = .Executing_Tools
+
+	// The batch answered nothing, so the turn cannot continue to another request.
+	testing.expect(t, !chat_session_tools_done(chat, chat.active_turn_id, 0))
+	testing.expect_value(t, chat.state, Chat_State.Finalizing)
+	testing.expect_value(t, chat.active_failed, true)
+
+	// Cancellation is what the user asked for, so it keeps the status the turn ends with.
+	chat.state = .Cancelling
+	testing.expect(t, !chat_session_tools_done(chat, chat.active_turn_id, 0))
+	testing.expect_value(t, chat.state, Chat_State.Cancelling)
+
+	// The turn ends once, and the calls it could not answer are released rather than carried
+	// into the next turn's batch.
+	finish := chat_session_advance(chat)
+	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
+	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
+	chat_session_claim_finish(chat, finish)
+	chat_persist_turn_end(chat, finish)
+	testing.expect_value(t, chat.state, Chat_State.Idle)
+	_test_accept(t, chat, "next")
+	testing.expect_value(t, len(chat.pending_calls), 0)
+}

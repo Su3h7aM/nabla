@@ -823,6 +823,17 @@ test_an_escaped_worker_refuses_another_turn :: proc(t: ^testing.T) {
 	chat.tool_jobs.escaped = true
 	chat_session_observe(chat)
 	testing.expect(t, chat_session_worker_escaped(chat))
+
+	// The running turn does not ask the model for more work: the batch closes, and the turn
+	// ends as a failure because the runtime can no longer be reused.
+	chat.state = .Executing_Tools
+	testing.expect(t, !chat_session_tools_done(chat, chat.active_turn_id, 0))
+	testing.expect_value(t, chat.state, Chat_State.Finalizing)
+	finish := chat_session_advance(chat)
+	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
+	testing.expect_value(t, finish.status, Chat_Terminal_Status.Failed)
+	chat_session_claim_finish(chat, finish)
+
 	before_entries := _test_entries(t, chat)
 	before := len(before_entries)
 	session.entries_destroy(before_entries, context.allocator)

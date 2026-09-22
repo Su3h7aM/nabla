@@ -462,15 +462,40 @@ chat_session_feed_tool_calls :: proc(chat: ^Chat_Session, source: Chat_Event_Sou
 	return .None
 }
 
+// chat_session_tools_done closes the batch a response committed and reports whether the turn
+// may continue. It is the transition that ends the Execute_Tools stage, and every refusal
+// leaves the turn able to reach a terminal instead of in a state that would dispatch the same
+// committed calls again: an unanswered call is still a call whose intent is in the record.
 chat_session_tools_done :: proc(chat: ^Chat_Session, turn_id: u64, results: int) -> bool {
-	// A cancelled turn still resolves its committed calls, so its history stays
-	// well formed even though no further request will be made.
+	// A turn already stopping keeps the reason it stopped for. A cancelled turn still resolves
+	// its committed calls, so its history stays well formed even though no further request is
+	// made; the check is first so a failed durable write keeps its own message.
 	if chat.state != .Executing_Tools && chat.state != .Cancelling { return false }
-	if chat.active_turn_id != turn_id { return false }
-	if results != len(chat.pending_calls) { return false }
+	if chat.active_turn_id != turn_id {
+		// The batch outlived its turn, which the driver's own loop cannot produce. Ending the
+		// turn is the only safe outcome: re-running the calls would repeat their effects.
+		chat_session_fail_turn(chat, "the tool batch outlived its turn")
+		return false
+	}
+	if results != len(chat.pending_calls) {
+		// The batch is released without an answer for every call it committed. The turn cannot
+		// continue to another request from an incomplete batch, and it must not run those calls
+		// again. Cancellation keeps its own status, because that is what the user asked for.
+		if chat.state == .Executing_Tools {
+			chat_session_fail_turn(chat, "the tool batch did not answer every committed call")
+		}
+		return false
+	}
 	chat.calls_made += len(chat.pending_calls)
 	for &call in chat.pending_calls { chat_tool_call_destroy(&call, chat.allocator) }
 	clear(&chat.pending_calls)
+	if chat.worker_escaped {
+		// A worker that ignored its stop still borrows the storage the next request would reuse,
+		// and the runtime is done after that: the batch is closed, and the turn ends rather than
+		// asking the model for more work.
+		_ = chat_session_fail_turn(chat, "a tool call did not stop")
+		return false
+	}
 	// A cancelled turn resolves its committed calls but must not continue to another
 	// request, so it stays in Cancelling for the finalization owner.
 	if chat.state == .Executing_Tools { chat.state = .Preparing }

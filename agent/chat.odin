@@ -480,7 +480,13 @@ chat_run_turn_steered :: proc(
 		case .Run_Tools:
 			turn_id := effect.turn_id
 			chat_tool_jobs_begin(chat, observer)
-			if chat.active_turn_id != turn_id { return false }
+			if chat.active_turn_id != turn_id {
+				// A batch belongs to the turn that committed its calls. Failing the turn keeps the
+				// session usable and its terminal reachable; abandoning it here would leave the
+				// batch open with nothing that could close it.
+				chat_session_fail_turn(chat, "the turn changed under a tool batch")
+				continue
+			}
 		case .Step_Tools:
 			tool_effect := effect.tool
 			chat_tool_jobs_step(chat, observer, tool_effect)
@@ -488,7 +494,14 @@ chat_run_turn_steered :: proc(
 			chat_tool_jobs_wait(chat)
 		case .Finish_Tools:
 			turn_id := effect.turn_id
-			if !chat_tool_jobs_finish(chat, turn_id) { return false }
+			if !chat_tool_jobs_finish(chat, turn_id) {
+				// The batch is released but the turn cannot continue from it: either it did not answer
+				// every committed call, or the runtime is done because a worker would not stop. The
+				// transition that refused it already moved the turn to a state that ends, so the loop
+				// finishes it here rather than returning with the session still claiming a stage it
+				// cannot leave.
+				continue
+			}
 			if chat_session_cancelled(chat) { chat_session_note_cancel(chat) }
 		case .Turn_Finished:
 			// The claim applies the transition the selector proposed, which only read state.
