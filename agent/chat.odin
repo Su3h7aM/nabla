@@ -614,10 +614,17 @@ chat_perform_request :: proc(
 			{key = "delay_ms", value = log_duration_ms(decision.delay)},
 		}
 		log_emit({level = .Warning, category = .Provider, event = "request.retry_scheduled", fields = retry[:]})
-		if !chat_retry_wait(chat, policy.slice, decision.delay) { break }
-		// Cancellation can arrive between the last slice of a delay and the send that
-		// follows it.
-		if chat_session_cancelled(chat) { break }
+		// Cancellation ends the chain, and it wins over the failure the wait was for: the send
+		// that would have followed never happened, so the chain stopped because the turn was
+		// cancelled. The second check covers the moment between the last slice of a delay and
+		// the send that would follow it.
+		if !chat_retry_wait(chat, policy.slice, decision.delay) || chat_session_cancelled(chat) {
+			decision = {
+				action = .Stop,
+				reason = .Cancelled,
+			}
+			break
+		}
 		chat_session_clear_attempt(chat)
 		ai.Provider_Operation_Error_Destroy(&operation_error, chat.allocator)
 	}
