@@ -35,7 +35,8 @@ Each is required work, not a design choice. Do not treat current behavior as cor
 | --- | --- |
 | Provider stream facts are decoded into typed `Chat_Event`s that `chat_session_apply` applies, but the callback still runs inside the blocking send, so the request path cannot be driven from events alone | Route request/stream facts through the shared owner mailbox so a test can drive the whole turn |
 | No aggregate retained-byte budget or session retention quota; child results are exempt from the model budget but not from a storage bound | Add measured byte limits for root, child and session retention with an explicit settlement reserve |
-| Retry waits and the tool-wait cap use separate fixed 50 ms checks; tool completions already wake a condition variable, and a finished compaction is adopted at the next request boundary | One owner wake mechanism with the nearest real deadline; no ordinary polling || WebSocket transport defaults to HTTP and `auto` fallback is partial | Complete the correctness/cache gates, then adopt the target default |
+| Retry waits and the tool-wait cap use separate fixed 50 ms checks; tool completions already wake a condition variable, and a finished compaction is adopted at the next request boundary | One owner wake mechanism with the nearest real deadline; no ordinary polling |
+| WebSocket transport defaults to HTTP and `auto` fallback is partial | Complete the correctness/cache gates, then adopt the target default |
 | Provider prompt-cache parity and complete provider-error classification are not fully verified | Close the [network](NETWORK_STACK_ARCHITECTURE.md) corrections and measure |
 
 Closed since this document was written:
