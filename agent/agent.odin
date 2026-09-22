@@ -437,3 +437,89 @@ chat_session_feed_error :: proc(chat: ^Chat_Session, source: Chat_Event_Source, 
 	chat.state = .Finalizing
 	return true
 }
+
+// Chat_Text_Event is one streamed fragment of the response being assembled.
+Chat_Text_Event :: struct {
+	source: Chat_Event_Source,
+	text:   string,
+}
+
+// Chat_Provider_Completion is one completed provider response as the endpoint delivered it:
+// the provider's own stop reason and the artifacts it produced. It is a fact, not a decision;
+// chat_session_apply decides what the response means.
+Chat_Provider_Completion :: struct {
+	source:      Chat_Event_Source,
+	reason:      ai.Provider_Finish_Reason,
+	reason_text: string,
+	output:      string,
+	calls:       []ai.Provider_Tool_Call,
+}
+
+// Chat_Failure_Event is a failure the provider, the transport, or a layer above them
+// reported for the running attempt.
+Chat_Failure_Event :: struct {
+	source:  Chat_Event_Source,
+	message: string,
+}
+
+// Chat_Event is one external fact delivered to the owner for application. A provider
+// callback decodes the wire event into one of these; applying it is the only way an
+// external fact changes turn state.
+Chat_Event :: union {
+	Chat_Text_Event,
+	Chat_Provider_Completion,
+	Chat_Failure_Event,
+}
+
+// Chat_Apply is what applying one event did, as the attempt runtime needs it: whether the
+// turn took the text the event carried, and whether it took the provider's terminal event.
+Chat_Apply :: struct {
+	text_exposed:        bool,
+	completion_accepted: bool,
+}
+
+// chat_session_apply applies one external event to state, checking identity and transition
+// legality. The provider callback decides nothing: it decodes, and this is where a completed
+// response becomes staged calls, feedback, a completion, or a failure.
+chat_session_apply :: proc(chat: ^Chat_Session, event: Chat_Event) -> Chat_Apply {
+	switch value in event {
+	case Chat_Text_Event:
+		return {text_exposed = chat_session_feed_text(chat, value.source, value.text)}
+	case Chat_Failure_Event:
+		// A cancelled turn reports cancellation, not the transport error that cancellation
+		// itself produced. Noting it here also stops every later event from reaching a turn
+		// that is already stopping.
+		if chat_session_cancelled(chat) {
+			chat_session_note_cancel(chat)
+		} else {
+			chat_session_feed_error(chat, value.source, value.message)
+		}
+		return {}
+	case Chat_Provider_Completion:
+		// One response feeds one path: tool handoff when the provider assembled calls, plain
+		// completion on stop, failure otherwise. A length limit or content filter is not a
+		// usable answer, so it must not finalize as success. Partial argument fragments never
+		// reach the executor; only a validated completion carries executable calls. The
+		// verbatim output array is staged for the commit, which stores it as the replay record.
+		if !chat_session_feed_response_output(chat, value.source, value.output) {
+			chat_session_feed_error(chat, value.source, "tool response was rejected")
+		} else if value.reason == .Tool_Call && len(value.calls) > 0 {
+			notice := chat_session_feed_tool_calls(chat, value.source, value.calls)
+			if notice != .None && notice != .Ignored {
+				// The response proposed calls the harness cannot use. Executing nothing and
+				// telling the model why keeps the turn alive.
+				chat_session_note_notice(chat, value.source, notice)
+			}
+		} else if value.reason == .Stop {
+			chat_session_feed_completion(chat, value.source)
+		} else if value.reason == .Length {
+			chat_session_note_notice(chat, value.source, .Truncated)
+		} else if value.reason_text != "" {
+			chat_session_feed_error(chat, value.source, fmt.tprintf("response incomplete: %s", value.reason_text))
+		} else {
+			chat_session_feed_error(chat, value.source, "response incomplete")
+		}
+		return {completion_accepted = true}
+	}
+	return {}
+}

@@ -64,7 +64,8 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	runtime := cast(^Chat_Runtime_Context)user_data
 	#partial switch value in event {
 	case ai.Provider_Text_Event:
-		if chat_session_feed_text(runtime.chat, runtime.source, value.Text) {
+		applied := chat_session_apply(runtime.chat, Chat_Event(Chat_Text_Event{source = runtime.source, text = value.Text}))
+		if applied.text_exposed {
 			runtime.text_exposed = true
 			if !runtime.assistant_open {
 				_observer_assistant_begin(runtime.observer)
@@ -77,49 +78,23 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	// API the verbatim output array is the replay record, and Chat
 	// Completions has no representation for it at all.
 	case ai.Provider_Completed_Event:
-		// The provider's terminal event arrived and the harness took it, whatever its
-		// reason turns out to mean.
-		runtime.completion_accepted = true
-		// One response feeds one path: tool handoff when the provider
-		// assembled calls, plain completion on stop, failure otherwise.
-		// A length limit or content filter is not a usable answer, so it
-		// must not finalize as success. Partial argument fragments never
-		// reach the executor; only this validated event carries
-		// executable calls. The verbatim output array is staged for the
-		// commit below, which stores it as the replay record.
+		// The provider's terminal event arrived; what it means is the owner's decision.
 		runtime.finish_reason = value.Reason
-		if !chat_session_feed_response_output(runtime.chat, runtime.source, value.Raw_Output) {
-			chat_session_feed_error(runtime.chat, runtime.source, "tool response was rejected")
-		} else if value.Reason == .Tool_Call && len(value.Tool_Calls) > 0 {
-			calls := make([dynamic]ai.Provider_Tool_Call, 0, len(value.Tool_Calls), context.temp_allocator)
-			defer delete(calls)
-			for call in value.Tool_Calls { append(&calls, call) }
-			notice := chat_session_feed_tool_calls(runtime.chat, runtime.source, calls[:])
-			if notice != .None && notice != .Ignored {
-				// The response proposed calls the harness cannot use. Executing
-				// nothing and telling the model why keeps the turn alive.
-				chat_session_note_notice(runtime.chat, runtime.source, notice)
-			}
-		} else if value.Reason == .Stop {
-			chat_session_feed_completion(runtime.chat, runtime.source)
-		} else if value.Reason == .Length {
-			chat_session_note_notice(runtime.chat, runtime.source, .Truncated)
-		} else {
-			if value.Reason_Text != "" {
-				chat_session_feed_error(runtime.chat, runtime.source, fmt.tprintf("response incomplete: %s", value.Reason_Text))
-			} else {
-				chat_session_feed_error(runtime.chat, runtime.source, "response incomplete")
-			}
-		}
+		applied := chat_session_apply(
+			runtime.chat,
+			Chat_Event(
+				Chat_Provider_Completion {
+					source = runtime.source,
+					reason = value.Reason,
+					reason_text = value.Reason_Text,
+					output = value.Raw_Output,
+					calls = value.Tool_Calls,
+				},
+			),
+		)
+		runtime.completion_accepted = applied.completion_accepted
 	case ai.Provider_Error_Event:
-		// A cancelled turn reports cancellation, not the transport error that
-		// cancellation itself produced. Noting it here also stops every later event
-		// from reaching a turn that is already stopping.
-		if chat_session_cancelled(runtime.chat) {
-			chat_session_note_cancel(runtime.chat)
-		} else {
-			chat_session_feed_error(runtime.chat, runtime.source, value.Message)
-		}
+		chat_session_apply(runtime.chat, Chat_Event(Chat_Failure_Event{source = runtime.source, message = value.Message}))
 	case ai.Provider_Usage_Event:
 		if value.Input_Tokens_Present {
 			runtime.chat.last_input_measured = value.Input_Tokens

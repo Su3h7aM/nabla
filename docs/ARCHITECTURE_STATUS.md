@@ -34,7 +34,7 @@ Each is required work, not a design choice. Do not treat current behavior as cor
 | Gap | Target |
 | --- | --- |
 | `chat_perform_request` still holds the retry loop inline; transport setup, the durable attempt row, one model send, and the context-repair branch are extracted | Keep extracting stages as tests need them; the loop should read as policy over named artifacts |
-| Provider stream facts arrive through callbacks inside the blocking send, so the request path cannot be driven from events alone | Route request/stream facts through the shared owner mailbox so a test can drive the whole turn |
+| Provider stream facts are decoded into typed `Chat_Event`s that `chat_session_apply` applies, but the callback still runs inside the blocking send, so the request path cannot be driven from events alone | Route request/stream facts through the shared owner mailbox so a test can drive the whole turn |
 | No aggregate retained-byte budget or session retention quota; child results are exempt from the model budget but not from a storage bound | Add measured byte limits for root, child and session retention with an explicit settlement reserve |
 | Retry waits, tool waits and idle compaction use separate fixed 50 ms slices | One owner wake mechanism with nearest real deadline; no ordinary polling |
 | WebSocket transport defaults to HTTP and `auto` fallback is partial | Complete the correctness/cache gates, then adopt the target default |
