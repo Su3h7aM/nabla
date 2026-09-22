@@ -279,7 +279,7 @@ test_shell_spawn_is_safe_with_running_threads :: proc(t: ^testing.T) {
 			// The heap allocator is the one they would contend on in a real program.
 			allocator = runtime.heap_allocator(),
 		}
-		threads[i] = test_thread_start(shell_spin_serve, &spinners[i], "svan-spin")
+		threads[i] = test_thread_start(shell_spin_serve, &spinners[i], "nabla-spin")
 		if threads[i] == nil {
 			testing.expectf(t, false, "spin thread %d could not start", i)
 			stop = true
@@ -364,7 +364,7 @@ test_shutdown_during_tool_reaps_child_before_session_cleanup :: proc(t: ^testing
 	run := Shell_Tool_Run {
 		chat = chat,
 	}
-	run.thread = test_thread_start(shell_tool_serve, &run, "svan-shutdown-tool")
+	run.thread = test_thread_start(shell_tool_serve, &run, "nabla-shutdown-tool")
 	if run.thread == nil {
 		testing.expectf(t, false, "shutdown thread could not start")
 		return
@@ -415,7 +415,7 @@ test_shutdown_during_request_retires_before_session_cleanup :: proc(t: ^testing.
 			Endpoint = fmt.aprintf("http://127.0.0.1:%d", server.port, allocator = context.temp_allocator),
 		},
 	}
-	run.thread = test_thread_start(shell_turn_serve, &run, "svan-shutdown-request")
+	run.thread = test_thread_start(shell_turn_serve, &run, "nabla-shutdown-request")
 	if run.thread == nil {
 		testing.expectf(t, false, "shutdown thread could not start")
 		return

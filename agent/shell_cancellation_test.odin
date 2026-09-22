@@ -43,7 +43,7 @@ shell_await_process_gone :: proc(pid: int) -> bool {
 }
 
 shell_test_workspace :: proc(allocator: mem.Allocator) -> string {
-	path := fmt.aprintf("/tmp/svan-shell-test-%d", os.get_pid(), allocator = allocator)
+	path := fmt.aprintf("/tmp/nabla-shell-test-%d", os.get_pid(), allocator = allocator)
 	_ = os.make_directory(path)
 	return path
 }
@@ -63,7 +63,7 @@ shell_run_start :: proc(run: ^Shell_Run, workspace: string, command: string, con
 	run.workspace = workspace
 	run.control = control
 	run.command = command
-	run.thread = test_thread_start(shell_run_serve, run, "svan-shell-run")
+	run.thread = test_thread_start(shell_run_serve, run, "nabla-shell-run")
 	return run.thread != nil
 }
 
@@ -310,7 +310,7 @@ shell_stall_start :: proc(t: ^testing.T, server: ^Shell_Stall_Server) -> bool {
 	}
 	server.listener = listener
 	server.port = endpoint.port
-	server.thread = test_thread_start(shell_stall_serve, server, "svan-stall-server")
+	server.thread = test_thread_start(shell_stall_serve, server, "nabla-stall-server")
 	if server.thread == nil {
 		testing.expectf(t, false, "stall server thread could not start")
 		net.close(listener)
@@ -371,7 +371,7 @@ test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
 			Endpoint = fmt.aprintf("http://127.0.0.1:%d", server.port, allocator = context.temp_allocator),
 		},
 	}
-	run.thread = test_thread_start(shell_turn_serve, &run, "svan-turn-run")
+	run.thread = test_thread_start(shell_turn_serve, &run, "nabla-turn-run")
 	if run.thread == nil {
 		testing.expectf(t, false, "turn thread could not start")
 		return

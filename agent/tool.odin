@@ -549,7 +549,7 @@ tool_control_stop :: proc(control: Tool_Control, start: time.Tick, budget: time.
 // AGENT_SYSTEM_PROMPT states what the agent is for. What each tool does, and
 // what arguments it takes, travels with the tool definitions, so this does not
 // repeat them.
-AGENT_SYSTEM_PROMPT :: "You are svan, a coding agent working from a session workspace. The tools available to you are listed with their arguments. Each call returns a JSON object with a status and, on success, a data object. Relative paths start at the workspace, while absolute paths may address the wider system. Use the tools to inspect files, make changes, and run programs. Never invent tool output. Keep chat replies short."
+AGENT_SYSTEM_PROMPT :: "You are nabla, a coding agent working from a session workspace. The tools available to you are listed with their arguments. Each call returns a JSON object with a status and, on success, a data object. Relative paths start at the workspace, while absolute paths may address the wider system. Use the tools to inspect files, make changes, and run programs. Never invent tool output. Keep chat replies short."
 
 // TOOL_DECLARED is the native tools written as constants, in the order they are
 // registered. tool_registry_sort fixes the advertised order after this list is

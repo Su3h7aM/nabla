@@ -366,7 +366,7 @@ load_lua_config_full :: proc(
 	if len(data) > CONFIG_MAX_BYTES { return {}, {}, {}, .Invalid }
 	L := l.L_newstate(); if L == nil { return {}, {}, {}, .Lua }; defer l.close(L)
 	l.sethook(L, lua_limit_hook, l.MASKCOUNT, CONFIG_INSTRUCTIONS)
-	if l.L_loadbuffer(L, raw_data(data), c.size_t(len(data)), "@svan-config", "t") != .OK { return {}, {}, {}, .Lua }
+	if l.L_loadbuffer(L, raw_data(data), c.size_t(len(data)), "@nabla-config", "t") != .OK { return {}, {}, {}, .Lua }
 	if l.pcall(L, 0, 1, 0) != 0 { return {}, {}, {}, .Lua }
 	if !lua_plain_table(L, -1) { return {}, {}, {}, .Root }
 	base := l.gettop(L)
@@ -446,7 +446,7 @@ load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynam
 	if len(data) > CONFIG_MAX_BYTES { return {}, .Invalid }
 	L := l.L_newstate(); if L == nil { return {}, .Lua }; defer l.close(L)
 	l.sethook(L, lua_limit_hook, l.MASKCOUNT, CONFIG_INSTRUCTIONS)
-	if l.L_loadbuffer(L, raw_data(data), c.size_t(len(data)), "@svan-config", "t") != .OK { return {}, .Lua }
+	if l.L_loadbuffer(L, raw_data(data), c.size_t(len(data)), "@nabla-config", "t") != .OK { return {}, .Lua }
 	if l.pcall(L, 0, 1, 0) != 0 { return {}, .Lua }
 	if !lua_plain_table(L, -1) { return {}, .Root }
 	base := l.gettop(L)

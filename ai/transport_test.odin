@@ -93,7 +93,7 @@ transport_fixture_start :: proc(t: ^testing.T, fixture: ^Transport_Fixture, phas
 	}
 	fixture.listener = listener
 	fixture.port = endpoint.port
-	fixture.thread = thread.create(transport_fixture_serve, name = "svan-transport-fixture")
+	fixture.thread = thread.create(transport_fixture_serve, name = "nabla-transport-fixture")
 	if fixture.thread == nil {
 		testing.expectf(t, false, "fixture thread could not start")
 		net.close(listener)
@@ -256,7 +256,7 @@ transport_job_init :: proc(t: ^testing.T, job: ^Transport_Job, host: string, por
 }
 
 transport_job_start :: proc(job: ^Transport_Job) {
-	job.thread = thread.create(transport_job_serve, name = "svan-transport-job")
+	job.thread = thread.create(transport_job_serve, name = "nabla-transport-job")
 	job.thread.data = job
 	thread.start(job.thread)
 }

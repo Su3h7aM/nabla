@@ -7,7 +7,7 @@ import "core:testing"
 
 @(test)
 test_lua_config_roundtrip :: proc(t: ^testing.T) {
-	path := fmt.aprintf("/tmp/svan-config-test-%d.lua", os.get_pid(), allocator = context.temp_allocator)
+	path := fmt.aprintf("/tmp/nabla-config-test-%d.lua", os.get_pid(), allocator = context.temp_allocator)
 	defer os.remove(path)
 	write_err := os.write_entire_file(
 		path,
@@ -79,7 +79,7 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 
 	// A missing config is a valid empty setup, not an error; a path that exists
 	// but cannot be read as a file still is.
-	_, missing_err := load_lua_config("/tmp/svan-config-test-missing.lua")
+	_, missing_err := load_lua_config("/tmp/nabla-config-test-missing.lua")
 	testing.expect_value(t, missing_err, Config_Error.Missing)
 	_, unreadable_err := load_lua_config("/tmp")
 	testing.expect_value(t, unreadable_err, Config_Error.Read)
@@ -156,7 +156,7 @@ test_lua_config_failures_leave_no_partial_sources :: proc(t: ^testing.T) {
 		`return { providers = { acme = { models = { chat = { input_modalities = {"text"}, output_modalities = "text" } } } } }`,
 	}
 	for config, i in cases {
-		path := fmt.aprintf("/tmp/svan-config-test-fail-%d-%d.lua", os.get_pid(), i, allocator = context.temp_allocator)
+		path := fmt.aprintf("/tmp/nabla-config-test-fail-%d-%d.lua", os.get_pid(), i, allocator = context.temp_allocator)
 		defer os.remove(path)
 		testing.expect(t, os.write_entire_file(path, transmute([]u8)config) == nil)
 		sources, err := load_lua_config(path)
