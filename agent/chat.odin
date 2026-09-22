@@ -64,7 +64,7 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	runtime := cast(^Chat_Runtime_Context)user_data
 	#partial switch value in event {
 	case ai.Provider_Text_Event:
-		applied := chat_session_apply(runtime.chat, Chat_Event(Chat_Text_Event{source = runtime.source, text = value.Text}))
+		applied := chat_session_apply(runtime.chat, Chat_Text_Event{source = runtime.source, text = value.Text})
 		if applied.text_exposed {
 			runtime.text_exposed = true
 			if !runtime.assistant_open {
@@ -82,19 +82,17 @@ chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 		runtime.finish_reason = value.Reason
 		applied := chat_session_apply(
 			runtime.chat,
-			Chat_Event(
-				Chat_Provider_Completion {
-					source = runtime.source,
-					reason = value.Reason,
-					reason_text = value.Reason_Text,
-					output = value.Raw_Output,
-					calls = value.Tool_Calls,
-				},
-			),
+			Chat_Provider_Completion {
+				source = runtime.source,
+				reason = value.Reason,
+				reason_text = value.Reason_Text,
+				output = value.Raw_Output,
+				calls = value.Tool_Calls,
+			},
 		)
 		runtime.completion_accepted = applied.completion_accepted
 	case ai.Provider_Error_Event:
-		chat_session_apply(runtime.chat, Chat_Event(Chat_Failure_Event{source = runtime.source, message = value.Message}))
+		chat_session_apply(runtime.chat, Chat_Failure_Event{source = runtime.source, message = value.Message})
 	case ai.Provider_Usage_Event:
 		if value.Input_Tokens_Present {
 			runtime.chat.last_input_measured = value.Input_Tokens
