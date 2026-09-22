@@ -527,7 +527,15 @@ chat_run_turn_steered :: proc(
 			chat_report_usage(observer, usages)
 			return status == .Completed
 		case .None:
+			// The selector proposes nothing while the turn is between stages it can still leave.
 			if chat.state == .Finalizing || chat.state == .Cancelling { continue }
+			if chat.state != .Idle {
+				// Nothing to take and no stage to leave: a turn reaches a terminal status, so it
+				// fails here instead of returning with the session claiming a stage nothing will
+				// move it out of.
+				_ = chat_session_fail_turn(chat, "the turn reached a state with no effect to take")
+				continue
+			}
 			return false
 		}
 	}
