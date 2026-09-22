@@ -387,9 +387,10 @@ chat_retry_wait :: proc(chat: ^Chat_Session, delay: time.Duration) -> bool {
 	defer sync.mutex_unlock(&chat_wake.mutex)
 	for {
 		if chat_session_cancelled(chat) { return false }
-		remaining := time.tick_diff(time.tick_now(), deadline)
-		if remaining <= 0 { return true }
-		_ = sync.cond_wait_with_timeout(&chat_wake.cond, &chat_wake.mutex, remaining)
+		if time.tick_diff(time.tick_now(), deadline) <= 0 { return true }
+		// A wakeup from any other publication ends the wait early, and the loop recomputes
+		// what is left rather than shortening the backoff.
+		owner_wake_wait(deadline)
 	}
 }
 
