@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import linux "core:sys/linux"
 import "core:testing"
 
 // ISOLATED_CHILD_VARIABLE marks a child test-binary run that owns its process.
@@ -29,35 +30,70 @@ test_isolate_guard: sync.Mutex
 // return.
 test_isolate_process :: proc(t: ^testing.T, procedure: string) -> bool {
 	if len(os.get_env(ISOLATED_CHILD_VARIABLE, context.temp_allocator)) > 0 {
+		test_isolate_clear_signal_mask()
 		return true
 	}
 
 	name := strings.trim_space(procedure)
 	filter := fmt.tprintf("-tests:%s", name)
 
+	// The child is this test binary, not whatever PATH resolves argv[0] to: a runner
+	// may name it without a path, and a directory on PATH can hold another program by
+	// that name.
+	executable, executable_err := os.get_executable_path(context.allocator)
+	if executable_err != nil { testing.fail_now(t, "the test binary could not be located") }
+
 	current_env, env_err := os.environ(context.temp_allocator)
-	if env_err != nil { testing.fail_now(t, "the environment could not be read") }
+	if env_err != nil {
+		delete(executable, context.allocator)
+		testing.fail_now(t, "the environment could not be read")
+	}
 	// Borrowed for the spawn only: temp memory is never deleted.
 	child_env := make([dynamic]string, 0, len(current_env) + 1, context.temp_allocator)
 	append(&child_env, ..current_env)
 	append(&child_env, ISOLATED_CHILD_VARIABLE + "=1")
 
 	sync.mutex_lock(&test_isolate_guard)
-	state, child_out, child_err, exec_err := os.process_exec({command = {os.args[0], filter}, env = child_env[:]}, context.allocator)
+	state, child_out, child_err, exec_err := os.process_exec({command = {executable, filter}, env = child_env[:]}, context.allocator)
 	// The guard is released before every fail path, so a failed child can
 	// never wedge the tests behind it.
 	spawned := exec_err == nil
 	ran_once := spawned && (strings.contains(string(child_out), "Finished 1 test in ") || strings.contains(string(child_err), "Finished 1 test in "))
 	passed := ran_once && state.exit_code == 0
 	sync.mutex_unlock(&test_isolate_guard)
-	if !spawned { testing.fail_now(t, "the isolated child could not start") }
-	defer delete(child_out)
-	defer delete(child_err)
+	if !spawned {
+		test_isolate_release(executable, child_out, child_err)
+		testing.fail_now(t, "the isolated child could not start")
+	}
 
 	// The filter names one test: anything else means the child did not run
 	// what the parent claims it checked.
 	if !passed {
-		testing.fail_now(t, fmt.tprintf("the isolated run of %s failed (exit %d):\n%s\n%s", name, state.exit_code, string(child_out), string(child_err)))
+		message := fmt.tprintf("the isolated run of %s failed (exit %d):\n%s\n%s", name, state.exit_code, string(child_out), string(child_err))
+		test_isolate_release(executable, child_out, child_err)
+		testing.fail_now(t, message)
 	}
+	test_isolate_release(executable, child_out, child_err)
 	return false
+}
+
+// test_isolate_clear_signal_mask clears the calling thread's mask, so the child starts
+// where a process of its own does. A signal mask survives exec, and `odin test` does not
+// always hand the test binary the same one: SIGINT has been observed blocked in it, with
+// the same command passing on another run. A test that raises a signal against itself
+// would then wait for a thread that can run the handler, because the mask reaches every
+// thread the body creates. Threads created after this point inherit the cleared mask.
+@(private)
+test_isolate_clear_signal_mask :: proc() {
+	clear := linux.Sig_Set{}
+	_ = linux.rt_sigprocmask(.SIG_SETMASK, &clear, nil)
+}
+
+// test_isolate_release frees what a parent spawned with. A failing check aborts the
+// test without running deferred statements, so every path releases before it fails.
+@(private)
+test_isolate_release :: proc(executable: string, child_out, child_err: []byte) {
+	delete(executable, context.allocator)
+	delete(child_out)
+	delete(child_err)
 }
