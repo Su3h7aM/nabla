@@ -13,7 +13,7 @@ import "nabla:agent/session"
 
 DIAGNOSTICS_USAGE :: "nabla diagnostics <session-id> [--request N] [--level NAME] [--export DIR [--include-payloads]]"
 
-diagnostics_main :: proc(args: []string) -> int {
+diagnostics_main :: proc(args: []string, stdout, stderr: io.Writer) -> int {
 	session_id := session.Session_Id("")
 	selector: agent.Log_Read_Selector
 	export_directory := ""
@@ -25,26 +25,26 @@ diagnostics_main :: proc(args: []string) -> int {
 			text := arg[len("--request"):]
 			if text == "" {
 				index += 1
-				if index >= len(args) { return diagnostics_bad_usage("--request needs a number") }
+				if index >= len(args) { return diagnostics_bad_usage("--request needs a number", stderr) }
 				text = args[index]
 			} else if text[0] == '=' {
 				text = text[1:]
 			}
 			number, parsed := strconv.parse_i64(text)
-			if !parsed || number <= 0 { return diagnostics_bad_usage("--request needs a positive request number") }
+			if !parsed || number <= 0 { return diagnostics_bad_usage("--request needs a positive request number", stderr) }
 			selector.request_no = session.Request_No(number)
 		case arg == "--level" || strings.has_prefix(arg, "--level="):
 			text := arg[len("--level"):]
 			if text == "" {
 				index += 1
-				if index >= len(args) { return diagnostics_bad_usage("--level needs a level name") }
+				if index >= len(args) { return diagnostics_bad_usage("--level needs a level name", stderr) }
 				text = args[index]
 			} else if text[0] == '=' {
 				text = text[1:]
 			}
 			level, enabled, known := agent.log_level_parse(text)
-			if !known { return diagnostics_bad_usage("--level takes debug, info, warn, error, or fatal") }
-			if !enabled { return diagnostics_bad_usage("--level off would visit nothing; omit it instead") }
+			if !known { return diagnostics_bad_usage("--level takes debug, info, warn, error, or fatal", stderr) }
+			if !enabled { return diagnostics_bad_usage("--level off would visit nothing; omit it instead", stderr) }
 			selector.level = level
 		case arg == "--include-payloads":
 			include_payloads = true
@@ -52,31 +52,31 @@ diagnostics_main :: proc(args: []string) -> int {
 			text := arg[len("--export"):]
 			if text == "" {
 				index += 1
-				if index >= len(args) { return diagnostics_bad_usage("--export needs a directory") }
+				if index >= len(args) { return diagnostics_bad_usage("--export needs a directory", stderr) }
 				text = args[index]
 			} else if text[0] == '=' {
 				text = text[1:]
 			}
-			if text == "" { return diagnostics_bad_usage("--export needs a directory") }
+			if text == "" { return diagnostics_bad_usage("--export needs a directory", stderr) }
 			export_directory = text
 		case strings.has_prefix(arg, "-"):
-			return diagnostics_bad_usage(fmt.tprintf("unknown option %s", arg))
+			return diagnostics_bad_usage(fmt.tprintf("unknown option %s", arg), stderr)
 		case session_id == "":
 			session_id = session.Session_Id(arg)
 		case:
-			return diagnostics_bad_usage("diagnostics reads one session")
+			return diagnostics_bad_usage("diagnostics reads one session", stderr)
 		}
 	}
-	if session_id == "" { return diagnostics_bad_usage("a session id is required") }
-	if !session.session_id_valid(session_id) { return diagnostics_bad_usage("that is not a session id") }
+	if session_id == "" { return diagnostics_bad_usage("a session id is required", stderr) }
+	if !session.session_id_valid(session_id) { return diagnostics_bad_usage("that is not a session id", stderr) }
 
 	if include_payloads && export_directory == "" {
-		return diagnostics_bad_usage("--include-payloads only applies to --export")
+		return diagnostics_bad_usage("--include-payloads only applies to --export", stderr)
 	}
 
 	logs_root, directory_err := agent.log_default_directory(context.temp_allocator)
 	if directory_err != nil {
-		fmt.eprintln("nabla: the log directory could not be resolved")
+		fmt.wprintln(stderr, "nabla: the log directory could not be resolved")
 		return 1
 	}
 
@@ -85,33 +85,33 @@ diagnostics_main :: proc(args: []string) -> int {
 	// attempted first and its absence is reported rather than hidden.
 	durable_ok := true
 	if request_no, selected := selector.request_no.?; selected {
-		durable_ok = diagnostics_report_request(session_id, request_no)
+		durable_ok = diagnostics_report_request(session_id, request_no, stderr)
 	}
 
 	if export_directory != "" {
-		return diagnostics_export(logs_root, session_id, export_directory, selector, include_payloads, durable_ok)
+		return diagnostics_export(logs_root, session_id, export_directory, selector, include_payloads, durable_ok, stderr)
 	}
 
 	output: Diagnostics_Output
-	output.writer = stdout_writer()
+	output.writer = stdout
 	summary := agent.log_read_session(logs_root, session_id, &output, diagnostics_visit, selector)
-	diagnostics_report(summary)
+	diagnostics_report(summary, stderr)
 	if !durable_ok { return 1 }
 	if output.broken {
-		fmt.eprintln("nabla: the output stream failed before the read was done")
+		fmt.wprintln(stderr, "nabla: the output stream failed before the read was done")
 		return 1
 	}
 	if diagnostics_incomplete(summary) { return 1 }
 	if summary.records == 0 {
-		fmt.eprintln("nabla: no diagnostic records matched")
+		fmt.wprintln(stderr, "nabla: no diagnostic records matched")
 		return 1
 	}
 	return 0
 }
 
-diagnostics_bad_usage :: proc(problem: string) -> int {
-	fmt.eprintln("nabla:", problem)
-	fmt.eprintln("usage:", DIAGNOSTICS_USAGE)
+diagnostics_bad_usage :: proc(problem: string, stderr: io.Writer) -> int {
+	fmt.wprintln(stderr, "nabla:", problem)
+	fmt.wprintln(stderr, "usage:", DIAGNOSTICS_USAGE)
 	return 2
 }
 
@@ -180,18 +180,19 @@ diagnostics_request_open :: proc(
 }
 
 // diagnostics_report_request prints the durable row for a --request selection on
-// stderr, beside the records that go to stdout. False means the row could not be
-// read, because an answer whose authoritative half is missing is not an answer.
-diagnostics_report_request :: proc(session_id: session.Session_Id, request_no: session.Request_No) -> bool {
+// the caller's diagnosis writer, beside the records that go to stdout. False means
+// the row could not be read, because an answer whose authoritative half is missing
+// is not an answer.
+diagnostics_report_request :: proc(session_id: session.Session_Id, request_no: session.Request_No, stderr: io.Writer) -> bool {
 	row, load_err := diagnostics_request_open(session_id, request_no, context.temp_allocator)
 	if load_err != nil {
 		local := load_err
-		fmt.eprintf("nabla: the stored request could not be read: %s\n", session.error_detail(&local))
+		fmt.wprintf(stderr, "nabla: the stored request could not be read: %s\n", session.error_detail(&local))
 		return false
 	}
 	defer session.request_destroy(&row, context.temp_allocator)
 
-	diagnostics_print_request(&row)
+	diagnostics_print_request(&row, stderr)
 	return true
 }
 
@@ -200,7 +201,7 @@ diagnostics_report_request :: proc(session_id: session.Session_Id, request_no: s
 // are the conversation itself, and the record stream beside this is what a caller
 // reads for what the harness observed.
 @(private)
-diagnostics_print_request :: proc(row: ^session.Request) {
+diagnostics_print_request :: proc(row: ^session.Request, stderr: io.Writer) {
 	started_buffer: [DIAGNOSTICS_TIMESTAMP_BYTES]u8
 	finished_buffer: [DIAGNOSTICS_TIMESTAMP_BYTES]u8
 	started := diagnostics_timestamp(row.started_at_ms, started_buffer[:])
@@ -209,15 +210,15 @@ diagnostics_print_request :: proc(row: ^session.Request) {
 		finished = diagnostics_timestamp(value, finished_buffer[:])
 	}
 
-	fmt.eprintf("nabla: request %d: %s, %s\n", i64(row.request_no), session.request_purpose_name(row.purpose), session.outcome_name(row.outcome))
-	fmt.eprintf("nabla:   started %s, finished %s\n", started, finished)
-	fmt.eprintf("nabla:   provider %s, api %s\n", row.provider, row.api)
+	fmt.wprintf(stderr, "nabla: request %d: %s, %s\n", i64(row.request_no), session.request_purpose_name(row.purpose), session.outcome_name(row.outcome))
+	fmt.wprintf(stderr, "nabla:   started %s, finished %s\n", started, finished)
+	fmt.wprintf(stderr, "nabla:   provider %s, api %s\n", row.provider, row.api)
 	if row.model_resolved != "" && row.model_resolved != row.model_requested {
-		fmt.eprintf("nabla:   model requested %s, resolved %s\n", row.model_requested, row.model_resolved)
+		fmt.wprintf(stderr, "nabla:   model requested %s, resolved %s\n", row.model_requested, row.model_resolved)
 	} else {
-		fmt.eprintf("nabla:   model %s\n", row.model_requested)
+		fmt.wprintf(stderr, "nabla:   model %s\n", row.model_requested)
 	}
-	fmt.eprintf("nabla:   usage %s\n", diagnostics_usage_text(row.usage))
+	fmt.wprintf(stderr, "nabla:   usage %s\n", diagnostics_usage_text(row.usage))
 }
 
 // diagnostics_usage_text names each bucket and calls an unreported one
@@ -251,15 +252,15 @@ diagnostics_timestamp :: proc(at_ms: i64, buffer: []u8) -> string {
 	return fmt.bprintf(buffer, "%04d-%02d-%02dT%02d:%02d:%02dZ", datetime.year, datetime.month, datetime.day, datetime.hour, datetime.minute, datetime.second)
 }
 
-diagnostics_report :: proc(summary: agent.Log_Read_Summary) {
-	fmt.eprintf("nabla: %d record(s), %d run(s) scanned, %d file(s) read", summary.records, summary.runs_scanned, summary.files_read)
-	if summary.cannot_read > 0 { fmt.eprintf(", %d unreadable", summary.cannot_read) }
-	if summary.records_skipped > 0 { fmt.eprintf(", %d line(s) not records", summary.records_skipped) }
-	if summary.records_unsupported > 0 { fmt.eprintf(", %d unsupported version(s)", summary.records_unsupported) }
-	if summary.records_foreign > 0 { fmt.eprintf(", %d record(s) from another run", summary.records_foreign) }
-	if summary.gaps > 0 { fmt.eprintf(", %d segment(s) removed by retention", summary.gaps) }
-	if summary.partial_tails > 0 { fmt.eprintf(", %d incomplete line(s)", summary.partial_tails) }
-	if summary.runs_truncated { fmt.eprint(", run scan limit reached") }
-	if summary.stopped { fmt.eprint(", read stopped by visitor") }
-	fmt.eprintln()
+diagnostics_report :: proc(summary: agent.Log_Read_Summary, stderr: io.Writer) {
+	fmt.wprintf(stderr, "nabla: %d record(s), %d run(s) scanned, %d file(s) read", summary.records, summary.runs_scanned, summary.files_read)
+	if summary.cannot_read > 0 { fmt.wprintf(stderr, ", %d unreadable", summary.cannot_read) }
+	if summary.records_skipped > 0 { fmt.wprintf(stderr, ", %d line(s) not records", summary.records_skipped) }
+	if summary.records_unsupported > 0 { fmt.wprintf(stderr, ", %d unsupported version(s)", summary.records_unsupported) }
+	if summary.records_foreign > 0 { fmt.wprintf(stderr, ", %d record(s) from another run", summary.records_foreign) }
+	if summary.gaps > 0 { fmt.wprintf(stderr, ", %d segment(s) removed by retention", summary.gaps) }
+	if summary.partial_tails > 0 { fmt.wprintf(stderr, ", %d incomplete line(s)", summary.partial_tails) }
+	if summary.runs_truncated { fmt.wprint(stderr, ", run scan limit reached") }
+	if summary.stopped { fmt.wprint(stderr, ", read stopped by visitor") }
+	fmt.wprintln(stderr)
 }

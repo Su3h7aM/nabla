@@ -86,6 +86,7 @@ log_chat_cancel_turn :: proc(t: ^testing.T, chat: ^Chat_Session) -> (entries: in
 
 @(test)
 test_a_turn_records_its_start_and_end :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	fixture: Log_Chat_Test
 	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
 	defer log_chat_end(t, &fixture)
@@ -221,6 +222,7 @@ test_the_provider_record_names_the_encoded_body :: proc(t: ^testing.T) {
 
 @(test)
 test_a_writer_does_not_change_a_turn :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	// The same turn twice: once with nowhere to record and once with a writer. A
 	// diagnostic that changed the durable outcome would show up as a difference
 	// here.

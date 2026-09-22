@@ -370,6 +370,7 @@ acp_test_run_thread :: proc(thread_handle: ^thread.Thread) {
 
 @(test)
 test_acp_serves_a_turn_and_replays_a_loaded_session :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-workspace-*", context.allocator)
 	if workspace_err != nil {
 		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)

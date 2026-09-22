@@ -866,27 +866,38 @@ test_transport_separates_a_refused_connection_from_a_broken_stream :: proc(t: ^t
 test_transport_reports_a_request_that_never_left :: proc(t: ^testing.T) {
 	// A port nothing listens on: the connection never opens, so no request byte was
 	// ever taken. This is what a caller must be able to tell apart from a stream
-	// that broke after the request went out.
-	closed_port, port_ok := free_port()
-	if !testing.expect(t, port_ok, "no closed port could be found") { return }
+	// that broke after the request went out. Another fixture can bind the freed
+	// port before the dial under a parallel run, so a dial that unexpectedly
+	// opens is retried with a fresh port rather than reported.
+	for _ in 0 ..< 8 {
+		closed_port, port_ok := free_port()
+		if !testing.expect(t, port_ok, "no closed port could be found") { return }
 
-	job: Transport_Job
-	if !transport_job_init(t, &job, "localhost", closed_port) { return }
-	defer transport_job_destroy(&job, job.allocator)
+		job: Transport_Job
+		if !transport_job_init(t, &job, "localhost", closed_port) { return }
 
-	observed: Transport_Observation
-	job.options.observer = {
-		user_data = &observed,
-		report    = transport_observation_report,
+		observed: Transport_Observation
+		job.options.observer = {
+			user_data = &observed,
+			report    = transport_observation_report,
+		}
+		transport_job_start(&job)
+		transport_job_join(&job)
+
+		if observed.transfer_seen && observed.transfer.stopped_at != .Connect {
+			transport_job_destroy(&job, job.allocator)
+			continue
+		}
+
+		testing.expect(t, job.error.kind != .None, "an untrusted peer is not success")
+		testing.expect(t, observed.transfer_seen, "the transport should account for the attempt")
+		testing.expect_value(t, observed.transfer.stopped_at, Provider_Transfer_Phase.Connect)
+		testing.expect_value(t, observed.transfer.request_bytes_accepted, u64(0))
+		testing.expect(t, !observed.transfer.request_complete, "nothing was taken, so the request is not complete")
+		testing.expect(t, !observed.transfer.response_head_received, "no head arrives without a connection")
+		testing.expect(t, !observed.transfer.declared_body_bytes_present, "an absent head declares nothing")
+		transport_job_destroy(&job, job.allocator)
+		return
 	}
-	transport_job_start(&job)
-	transport_job_join(&job)
-
-	testing.expect(t, job.error.kind != .None, "an untrusted peer is not success")
-	testing.expect(t, observed.transfer_seen, "the transport should account for the attempt")
-	testing.expect_value(t, observed.transfer.stopped_at, Provider_Transfer_Phase.Connect)
-	testing.expect_value(t, observed.transfer.request_bytes_accepted, u64(0))
-	testing.expect(t, !observed.transfer.request_complete, "nothing was taken, so the request is not complete")
-	testing.expect(t, !observed.transfer.response_head_received, "no head arrives without a connection")
-	testing.expect(t, !observed.transfer.declared_body_bytes_present, "an absent head declares nothing")
+	testing.fail_now(t, "the closed port kept being reused by another fixture")
 }

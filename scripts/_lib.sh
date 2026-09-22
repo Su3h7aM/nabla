@@ -4,15 +4,15 @@
 
 NABLA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-NABLA_SERIAL_TEST_PACKAGES="agent ai layout"
+# Every package runs its core:testing suite on the runner's default thread
+# count (the machine's cores). Tests that mutate process-global state (the
+# cancel token, signal dispositions, environment variables) isolate themselves
+# by re-running in a child of the test binary; see agent/isolate_test.odin.
+# No package is pinned to one thread.
 # Packages whose core:testing suites must not be discovered by `odin test`
 # because an external harness runs them instead. Empty once every suite is on
 # core:testing.
 NABLA_HARNESS_TEST_PACKAGES=""
-
-# The root package is in the list because its tests point the XDG state directory
-# at a temporary directory, which is process-wide.
-NABLA_SERIAL_TEST_PACKAGES="agent ai layout ."
 
 nabla_packages() {
 	local d sub base
@@ -47,8 +47,8 @@ nabla_check_packages() {
 
 nabla_harnesses() {
 	local d
-	# In-package executable harnesses that cannot run under `odin test`
-	# (for example term/test/lifecycle, which forks).
+	# In-package executable harnesses that cannot run under `odin test`.
+	# Empty: every suite currently runs through the native test interface.
 	for d in "$NABLA_ROOT"/*/test/*/; do
 		d="${d%/}"
 		[[ -f "$d/main.odin" ]] || continue

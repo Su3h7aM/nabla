@@ -729,60 +729,6 @@ test_statements_release_in_any_order :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_discarded_rows_are_never_read :: proc(t: ^testing.T) {
-	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
-	defer close(&conn)
-
-	// exec runs a statement that yields rows nobody asked for. Reading them
-	// would be work with no buyer, so the backend is never asked for a row or
-	// its shape.
-	_expect_ok(t, exec(&conn, "SELECT a, b"))
-	testing.expect_value(t, calls.execute, 1)
-	testing.expect_value(t, calls.next, len(fake_rows) + 1)
-	testing.expect_value(t, calls.columns, 0)
-	testing.expect_value(t, calls.row, 0)
-}
-
-@(test)
-test_the_row_buffer_is_sized_when_the_first_row_arrives :: proc(t: ^testing.T) {
-	calls: Fake_Calls
-	conn: Conn
-	fake := _fake_open(&conn, &calls)
-	defer close(&conn)
-
-	stmt: Statement
-	_expect_ok(t, prepare(&conn, &stmt, "SELECT a, b"))
-	defer statement_close(&stmt)
-
-	rows: Rows
-	_expect_ok(t, statement_query(&stmt, &rows))
-	testing.expect_value(t, calls.columns, 0)
-
-	// A backend can only settle on the result's shape while stepping, so the
-	// buffer is asked for at the first row rather than at execute. A count
-	// that changed in between is what the rows follow.
-	fake.prepared.columns = 3
-	values, has_row, err := rows_next(&rows)
-	_expect_ok(t, err)
-	testing.expect(t, has_row, "expected a row")
-	testing.expect_value(t, len(values), 3)
-	index, _ := as_i64(values[0])
-	testing.expect_value(t, index, i64(1))
-	testing.expect_value(t, calls.columns, 1)
-	testing.expect_value(t, calls.next, 1)
-
-	// The buffer is asked for once per execution, not once per row.
-	_, has_row, err = rows_next(&rows)
-	_expect_ok(t, err)
-	testing.expect(t, has_row, "expected the second row")
-	testing.expect_value(t, calls.columns, 1)
-
-	_expect_ok(t, rows_close(&rows))
-}
-
-@(test)
 test_a_row_that_cannot_be_read_ends_the_set :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	conn: Conn

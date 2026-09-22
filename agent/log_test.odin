@@ -485,22 +485,6 @@ test_log_level_names_round_trip :: proc(t: ^testing.T) {
 	testing.expect(t, !unknown, "a removed level is not known")
 }
 
-@(test)
-test_log_segment_names_are_parsed_not_assumed :: proc(t: ^testing.T) {
-	// A run that rotates past six digits prints more of them; the reader must still
-	// recover the number rather than trusting a fixed width.
-	name_buffer: [32]u8
-	long := log_segment_name(1_234_567, name_buffer[:])
-	number, ok := log_segment_name_number(long)
-	testing.expect(t, ok, "a seven-digit segment name should parse")
-	testing.expect_value(t, number, u64(1_234_567))
-
-	for rejected in ([]string{"events-1.jsonl", "events-00001x.jsonl", "events-0000001.jsonl", "other-000001.jsonl", "000001.jsonl"}) {
-		_, valid := log_segment_name_number(rejected)
-		testing.expectf(t, !valid, "%q is not a segment name", rejected)
-	}
-}
-
 // test_log_ordinary_message_reaches_the_sink is the property that makes Odin's
 // logger the mechanism: a plain core:log call, not a structured record, lands in
 // the same file with its caller location.

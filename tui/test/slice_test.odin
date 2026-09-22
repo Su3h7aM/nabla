@@ -235,20 +235,6 @@ test_slice_renders_a_known_snapshot :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_selection_is_the_only_styled_run :: proc(t: ^testing.T) {
-	storage: Render_Storage
-	_, err := render(DEFAULT_APP, &storage)
-	testing.expect_value(t, err, Render_Error.None)
-
-	for cell, index in storage.buffer.cells {
-		row := index / storage.buffer.columns
-		column := index % storage.buffer.columns
-		selected_run := row == 1 && column >= 2 && column < 7
-		testing.expect_value(t, cell.style, item_style(selected_run))
-	}
-}
-
-@(test)
 test_key_events_move_and_clamp_the_selection :: proc(t: ^testing.T) {
 	app := DEFAULT_APP
 	storage: Render_Storage

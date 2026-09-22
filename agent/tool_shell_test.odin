@@ -57,6 +57,7 @@ shell_test_clear_shell :: proc(t: ^testing.T) {
 // nothing about which shells the machine has.
 @(test)
 test_shell_runs_the_environment_shell :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	scratch := shell_test_scratch(t)
 	defer os.remove_all(scratch)
 	defer delete(scratch, context.allocator)
@@ -108,6 +109,7 @@ test_shell_inherits_the_process_environment :: proc(t: ^testing.T) {
 // was removed from under it.
 @(test)
 test_shell_falls_back_to_the_portable_shell :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
@@ -136,6 +138,7 @@ test_shell_falls_back_to_the_portable_shell :: proc(t: ^testing.T) {
 // environment, and the portable shell is named when the environment names none.
 @(test)
 test_advertised_description_names_the_running_shell :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	scratch := shell_test_scratch(t)
 	defer os.remove_all(scratch)
 	defer delete(scratch, context.allocator)

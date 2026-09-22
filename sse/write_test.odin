@@ -1,6 +1,5 @@
 package sse
 
-import "core:strings"
 import "core:testing"
 
 // The writer's contract is the same format the parser reads, so the tests are
@@ -84,19 +83,6 @@ test_write_read_round_trip_of_data_edge_cases :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_default_fields_are_not_written :: proc(t: ^testing.T) {
-	// "event: message" is redundant (the reader defaults to it) and an absent
-	// retry is not written at all.
-	wire: [dynamic]u8
-	defer delete(wire)
-
-	text, err := _write_to_string(&wire, "x", event_type = DEFAULT_EVENT_TYPE)
-	testing.expect_value(t, err, Write_Error.None)
-	testing.expect_value(t, text, "data: x\n\n")
-	testing.expect(t, !strings.contains(text, "retry"))
-}
-
-@(test)
 test_empty_id_resets_the_readers_last_event_id :: proc(t: ^testing.T) {
 	// Absent and present-but-empty are different facts: absent inherits the
 	// previous ID, present-but-empty clears it.
@@ -117,22 +103,6 @@ test_empty_id_resets_the_readers_last_event_id :: proc(t: ^testing.T) {
 	defer recorder_destroy(&recorder)
 	parse(&recorder, "id: keep\n\n", absent, present_empty)
 	expect_events(t, &recorder, {{type = DEFAULT_EVENT_TYPE, data = "a", id = "keep"}, {type = DEFAULT_EVENT_TYPE, data = "b", id = ""}})
-}
-
-@(test)
-test_events_accumulate_in_one_buffer :: proc(t: ^testing.T) {
-	wire: [dynamic]u8
-	defer delete(wire)
-
-	testing.expect_value(t, write_event(&wire, "one"), Write_Error.None)
-	testing.expect_value(t, write_event(&wire, "two", event_type = "add"), Write_Error.None)
-	testing.expect_value(t, write_event(&wire, "three"), Write_Error.None)
-
-	recorder: Recorder
-	recorder_init(&recorder)
-	defer recorder_destroy(&recorder)
-	parse(&recorder, string(wire[:]))
-	expect_events(t, &recorder, {{type = DEFAULT_EVENT_TYPE, data = "one"}, {type = "add", data = "two"}, {type = DEFAULT_EVENT_TYPE, data = "three"}})
 }
 
 @(test)

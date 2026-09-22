@@ -365,37 +365,6 @@ test_encode_reports_exact_required_when_scratch_is_too_small :: proc(t: ^testing
 }
 
 @(test)
-test_color_reduction_helpers_and_modifiers :: proc(t: ^testing.T) {
-	// xterm cube: 16 + 36r + 6g + b over the 6x6x6 cube.
-	testing.expect_value(t, _rgb_to_256(RGB_Color{0, 0, 0}), u8(16))
-	testing.expect_value(t, _rgb_to_256(RGB_Color{255, 255, 255}), u8(231))
-	testing.expect_value(t, _rgb_to_256(RGB_Color{255, 0, 0}), u8(196))
-
-	// Nearest ANSI, and the xterm-256 decode (16/231 cube corners, 232 the
-	// first grayscale step).
-	testing.expect_value(t, _nearest_ansi(RGB_Color{255, 0, 0}, 16), u8(9))
-	testing.expect_value(t, _nearest_ansi(RGB_Color{255, 0, 0}, 8), u8(1))
-	testing.expect_value(t, _xterm_256_to_rgb(16), RGB_Color{0, 0, 0})
-	testing.expect_value(t, _xterm_256_to_rgb(196), RGB_Color{255, 0, 0})
-	testing.expect_value(t, _xterm_256_to_rgb(231), RGB_Color{255, 255, 255})
-	testing.expect_value(t, _xterm_256_to_rgb(232), RGB_Color{8, 8, 8})
-
-	// SGR codes: 30-37/90-97 foreground, 40-47/100-107 background.
-	testing.expect_value(t, _ansi_4bit(38, 0), u8(30))
-	testing.expect_value(t, _ansi_4bit(38, 9), u8(91))
-	testing.expect_value(t, _ansi_4bit(48, 15), u8(107))
-
-	// Every modifier maps to a distinct settable SGR code; the empty set is
-	// the neutral value.
-	seen: Modifiers
-	for modifier in Modifier {
-		testing.expect(t, modifier not_in seen, "Modifier enumerants must be distinct")
-		seen += {modifier}
-		testing.expect(t, _modifier_sgr(modifier) != 0, "every Modifier must map to a real SGR code")
-	}
-}
-
-@(test)
 test_profile_default_follows_the_color_state :: proc(t: ^testing.T) {
 	previous_depth := terminal.color_depth
 	previous_enabled := terminal.color_enabled

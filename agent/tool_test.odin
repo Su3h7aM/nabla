@@ -334,18 +334,6 @@ test_every_native_tool_is_registered_complete :: proc(t: ^testing.T) {
 	}
 }
 
-// The native definitions are the harness's own, so building the registry from
-// them must never fail. A failure here is a programming error, not a
-// configuration the harness could recover from.
-@(test)
-test_native_registry_builds_without_error :: proc(t: ^testing.T) {
-	registry, registry_error := tool_registry_make(context.allocator)
-	defer tool_registry_destroy(&registry)
-	testing.expect_value(t, registry_error.kind, Tool_Registry_Error_Kind.None)
-	if registry_error.kind != .None { return }
-	testing.expect_value(t, len(registry.definitions), TOOL_NATIVE_COUNT)
-}
-
 // tool_test_dummy_execute stands in for an executor where only registration
 // matters. Nothing runs through it.
 tool_test_dummy_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {

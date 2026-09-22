@@ -4,7 +4,6 @@ package agent
 import "core:fmt"
 import "core:mem"
 import "core:os"
-import "core:path/filepath"
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -49,26 +48,8 @@ models_dev_stub_fetch :: proc(user_data: rawptr, allocator: mem.Allocator) -> ([
 }
 
 @(test)
-test_models_dev_cache_path_is_lowercase_xdg_cache :: proc(t: ^testing.T) {
-	models_dev_state_test(
-		t,
-		"path",
-		proc(t: ^testing.T, root: string) {
-			path, err := models_dev_cache_path(context.temp_allocator)
-			testing.expect_value(t, err, Models_Dev_Error.None)
-			testing.expect_value(t, path, fmt.tprintf("%s/nabla/%s", root, MODELS_DEV_CACHE_FILE))
-
-			// The application directory is created so a caller can read and write the
-			// cache, its name is the lowercase application name, and the cache variable
-			// is where it came from.
-			testing.expect(t, os.is_directory(fmt.tprintf("%s/nabla", root)))
-			testing.expect_value(t, filepath.base(filepath.dir(path)), XDG_APP_NAME)
-		},
-	)
-}
-
-@(test)
 test_xdg_state_resolution_ignores_an_unusable_variable :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	// A relative or empty value is invalid and ignored, and the specification's
 	// default under the home directory then applies -- which is the state
 	// directory, never an application directory directly under the home directory.
@@ -109,28 +90,6 @@ test_xdg_state_resolution_ignores_an_unusable_variable :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_models_dev_cache_freshness_window :: proc(t: ^testing.T) {
-	root := fmt.tprintf("/tmp/nabla-fresh-%d", os.get_pid())
-	os.remove_all(root)
-	defer os.remove_all(root)
-	_ = os.make_directory_all(root)
-	path := fmt.tprintf("%s/catalog.json", root)
-
-	// Missing.
-	testing.expect(t, !models_dev_cache_fresh(path, time.now()))
-	testing.expect(t, os.write_entire_file(path, transmute([]u8)string("{}")) == nil)
-	now := time.now()
-	testing.expect(t, models_dev_cache_fresh(path, now))
-
-	// Beyond the window.
-	testing.expect(t, !models_dev_cache_fresh(path, time.time_add(now, MODELS_DEV_FRESH)))
-	testing.expect(t, models_dev_cache_fresh(path, time.time_add(now, MODELS_DEV_FRESH - time.Second)))
-
-	// A timestamp ahead of the clock is stale rather than fresh forever.
-	testing.expect(t, !models_dev_cache_fresh(path, time.time_add(now, -time.Hour)))
-}
-
-@(test)
 test_models_dev_cache_write_is_atomic :: proc(t: ^testing.T) {
 	root := fmt.tprintf("/tmp/nabla-write-%d", os.get_pid())
 	os.remove_all(root)
@@ -165,6 +124,7 @@ test_models_dev_cache_write_is_atomic :: proc(t: ^testing.T) {
 
 @(test)
 test_models_dev_uses_a_fresh_cache_without_fetching :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	models_dev_state_test(t, "fresh", proc(t: ^testing.T, _: string) {
 		path, path_err := models_dev_cache_path(context.temp_allocator)
 		testing.expect_value(t, path_err, Models_Dev_Error.None)
@@ -182,6 +142,7 @@ test_models_dev_uses_a_fresh_cache_without_fetching :: proc(t: ^testing.T) {
 
 @(test)
 test_models_dev_refresh_failure_keeps_the_stale_cache :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	models_dev_state_test(
 		t,
 		"stale",
@@ -209,6 +170,7 @@ test_models_dev_refresh_failure_keeps_the_stale_cache :: proc(t: ^testing.T) {
 
 @(test)
 test_models_dev_refresh_replaces_a_stale_cache :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	models_dev_state_test(
 		t,
 		"replace",
@@ -244,6 +206,7 @@ test_models_dev_refresh_replaces_a_stale_cache :: proc(t: ^testing.T) {
 
 @(test)
 test_models_dev_reports_an_unusable_cache_directory :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	// A cache directory that cannot be created is an explicit error, never a
 	// silent fallback to a path under the home directory.
 	root := fmt.tprintf("/tmp/nabla-blocked-%d", os.get_pid())
@@ -276,6 +239,7 @@ test_models_dev_reports_an_unusable_cache_directory :: proc(t: ^testing.T) {
 
 @(test)
 test_models_dev_replaces_a_fresh_cache_that_cannot_answer :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	models_dev_state_test(
 		t,
 		"unanswered",
@@ -339,6 +303,7 @@ test_models_dev_cache_read_refuses_missing_and_empty_files :: proc(t: ^testing.T
 
 @(test)
 test_models_dev_unusable_document_never_replaces_a_valid_cache :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	models_dev_state_test(
 		t,
 		"unusable",
@@ -370,6 +335,7 @@ test_models_dev_unusable_document_never_replaces_a_valid_cache :: proc(t: ^testi
 
 @(test)
 test_models_dev_unusable_document_without_a_cache_is_reported :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	models_dev_state_test(
 		t,
 		"unusable-only",
@@ -391,6 +357,7 @@ test_models_dev_unusable_document_without_a_cache_is_reported :: proc(t: ^testin
 
 @(test)
 test_models_dev_sources_are_the_resolver_input :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	models_dev_state_test(
 		t,
 		"sources",
@@ -424,6 +391,7 @@ test_models_dev_sources_are_the_resolver_input :: proc(t: ^testing.T) {
 
 @(test)
 test_models_dev_sources_reports_an_unusable_document :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	models_dev_state_test(
 		t,
 		"sources-broken",

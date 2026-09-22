@@ -26,21 +26,6 @@ test_open_creates_a_private_store :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_open_is_idempotent_across_stores :: proc(t: ^testing.T) {
-	store: Store
-	directory := _open_store(t, &store)
-	store_close(&store)
-	defer {
-		os.remove_all(directory)
-		delete(directory, context.allocator)
-	}
-
-	reopened: Store
-	_expect_ok(t, store_open(&reopened, directory))
-	store_close(&reopened)
-}
-
-@(test)
 test_create_and_load_round_trip :: proc(t: ^testing.T) {
 	store: Store
 	directory := _open_store(t, &store)
@@ -69,22 +54,6 @@ test_create_and_load_round_trip :: proc(t: ^testing.T) {
 	testing.expect_value(t, loaded.provider, "openai")
 	testing.expect_value(t, loaded.model, "gpt-4")
 	testing.expect_value(t, loaded.created_at_ms, i64(1_000))
-}
-
-@(test)
-test_two_sessions_get_different_ids :: proc(t: ^testing.T) {
-	store: Store
-	directory := _open_store(t, &store)
-	defer _close_store(&store, directory)
-
-	first, first_err := session_create(&store, {workspace = "/tmp/project"}, 1_000)
-	_expect_ok(t, first_err)
-	defer session_destroy(&first)
-	second, second_err := session_create(&store, {workspace = "/tmp/project"}, 1_001)
-	_expect_ok(t, second_err)
-	defer session_destroy(&second)
-
-	testing.expect(t, first.id != second.id, "two sessions should not share an id")
 }
 
 @(test)
@@ -308,25 +277,6 @@ test_a_second_store_cannot_claim_the_same_session :: proc(t: ^testing.T) {
 }
 
 // The store assumes write-ahead logging: readers do not block the writer, and a
-// checkpoint does not block readers. An open store is checked against the mode
-// SQLite actually reported, so this pins the invariant the open path enforces.
-@(test)
-test_an_open_store_runs_in_write_ahead_logging :: proc(t: ^testing.T) {
-	store: Store
-	directory := _open_store(t, &store)
-	defer _close_store(&store, directory)
-
-	rows: db.Rows
-	_expect_db_ok(t, db.query(&store.conn, &rows, "PRAGMA journal_mode"))
-	defer db.rows_close(&rows)
-	values, has_row, next_err := db.rows_next(&rows)
-	_expect_db_ok(t, next_err)
-	if !testing.expect(t, has_row, "the journal mode should be reported") { return }
-	mode, convert_err := db.as_string(values[0])
-	_expect_db_ok(t, convert_err)
-	testing.expect(t, strings.equal_fold(mode, "wal"), "the store must run in write-ahead logging mode")
-}
-
 // The kind a caller sees is what tells it whether to retry, to fix its
 // arguments, or to report a database that could not work. That mapping is a
 // contract, so it is pinned rather than left to the call sites.

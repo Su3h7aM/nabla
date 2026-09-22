@@ -4,6 +4,7 @@ package main
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:io"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -11,10 +12,17 @@ import "core:testing"
 import "nabla:agent"
 import "nabla:agent/session"
 
+// diagnostics_test_err collects what the command reports on its diagnosis
+// writer, so a passing test leaves the test runner's own output alone and can
+// assert on the text itself.
+diagnostics_test_err :: proc(builder: ^strings.Builder) -> io.Writer {
+	return strings.to_writer(builder)
+}
+
 // The request join reads the session database, so these tests point the XDG state
-// directory at a temporary root. The root package runs its tests serially for
-// exactly this reason: the environment is process-wide, and a parallel test that
-// resolved a state directory would see this one's root.
+// directory at a temporary root. The environment is process-wide, so each test
+// runs its body in a child of the test binary (see isolate_test.odin) while the
+// parent only checks the child's result.
 
 // diagnostics_request_state points the XDG state directory at a fresh temporary
 // root for one test, so the join reads a store this test created rather than the
@@ -137,6 +145,7 @@ diagnostics_request_export_dir :: proc(t: ^testing.T, name: string) -> string {
 
 @(test)
 test_request_join_reads_the_durable_row :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	diagnostics_request_state(
 		t,
 		"join",
@@ -169,25 +178,37 @@ test_request_join_reads_the_durable_row :: proc(t: ^testing.T) {
 			}
 
 			// The join is the command's contract, not a best-effort extra.
-			testing.expect(t, diagnostics_report_request(created.id, request_no), "a present request should be reported")
+			err_text: strings.Builder
+			defer strings.builder_destroy(&err_text)
+			testing.expect(t, diagnostics_report_request(created.id, request_no, diagnostics_test_err(&err_text)), "a present request should be reported")
+			testing.expect(t, strings.contains(strings.to_string(err_text), "openai"), "the report should name the provider")
 		},
 	)
 }
 
 @(test)
 test_request_join_reports_a_request_the_database_does_not_have :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	diagnostics_request_state(t, "missing-row", proc(t: ^testing.T) {
 		created, _ := diagnostics_request_fixture(t, .Completed, {input = 10})
 		defer session.session_destroy(&created)
 
 		_, load_err := diagnostics_request_open(created.id, 99, context.temp_allocator)
 		testing.expect_value(t, session.error_kind(load_err), session.Error_Kind.Not_Found)
-		testing.expect(t, !diagnostics_report_request(created.id, 99), "a request the database does not have is not an answer")
+		err_text: strings.Builder
+		defer strings.builder_destroy(&err_text)
+		testing.expect(
+			t,
+			!diagnostics_report_request(created.id, 99, diagnostics_test_err(&err_text)),
+			"a request the database does not have is not an answer",
+		)
+		testing.expect(t, strings.contains(strings.to_string(err_text), "could not be read"), "the absence should be reported")
 	})
 }
 
 @(test)
 test_request_join_never_creates_the_store_it_reads :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	diagnostics_request_state(
 		t,
 		"missing-store",
@@ -197,7 +218,9 @@ test_request_join_never_creates_the_store_it_reads :: proc(t: ^testing.T) {
 			// A diagnostics run must never create the store it was pointed at, so a
 			// missing database is an absence the command reports rather than one it
 			// invents.
-			testing.expect(t, !diagnostics_report_request(session_id, 1))
+			err_text: strings.Builder
+			defer strings.builder_destroy(&err_text)
+			testing.expect(t, !diagnostics_report_request(session_id, 1, diagnostics_test_err(&err_text)))
 
 			directory, directory_err := agent.xdg_directory(.State, context.allocator)
 			defer delete(directory, context.allocator)
@@ -211,6 +234,7 @@ test_request_join_never_creates_the_store_it_reads :: proc(t: ^testing.T) {
 
 @(test)
 test_export_writes_the_durable_row_for_a_selected_request :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	diagnostics_request_state(
 		t,
 		"export-row",
@@ -230,7 +254,11 @@ test_export_writes_the_durable_row_for_a_selected_request :: proc(t: ^testing.T)
 			// read, and the export are one path rather than three.
 			number_buffer: [16]u8
 			args := [5]string{string(created.id), "--request", fmt.bprintf(number_buffer[:], "%d", i64(request_no)), "--export", destination}
-			testing.expect_value(t, diagnostics_main(args[:]), 0)
+			out_text, err_text: strings.Builder
+			defer strings.builder_destroy(&out_text)
+			defer strings.builder_destroy(&err_text)
+			testing.expect_value(t, diagnostics_main(args[:], strings.to_writer(&out_text), strings.to_writer(&err_text)), 0)
+			testing.expect(t, strings.contains(strings.to_string(err_text), "exported"), "the export should be reported")
 
 			request_path := fmt.tprintf("%s/%s", destination, EXPORT_REQUEST_NAME)
 			request_text, read_err := os.read_entire_file(request_path, context.allocator)
@@ -274,6 +302,7 @@ test_export_writes_the_durable_row_for_a_selected_request :: proc(t: ^testing.T)
 
 @(test)
 test_export_reports_a_request_the_database_does_not_have :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	diagnostics_request_state(
 		t,
 		"export-missing",
@@ -292,7 +321,10 @@ test_export_reports_a_request_the_database_does_not_have :: proc(t: ^testing.T) 
 			// An answer whose authoritative half is missing is an incomplete answer,
 			// so the bundle is written, says so, and the command fails.
 			args := [5]string{string(created.id), "--request", "99", "--export", destination}
-			testing.expect_value(t, diagnostics_main(args[:]), 1)
+			out_text, err_text: strings.Builder
+			defer strings.builder_destroy(&out_text)
+			defer strings.builder_destroy(&err_text)
+			testing.expect_value(t, diagnostics_main(args[:], strings.to_writer(&out_text), strings.to_writer(&err_text)), 1)
 			testing.expect(t, !os.exists(fmt.tprintf("%s/%s", destination, EXPORT_REQUEST_NAME)), "no row means no request.json")
 
 			manifest_path := fmt.tprintf("%s/%s", destination, EXPORT_MANIFEST_NAME)

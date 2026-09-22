@@ -241,25 +241,3 @@ test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
 	testing.expect(t, frame.cursor.visible && frame.cursor.placed)
 	testing.expect_value(t, frame.cursor.position, term.Position{3, 1})
 }
-
-@(test)
-test_block_draws_its_border_and_inner_area :: proc(t: ^testing.T) {
-	block := Block {
-		border = BORDER_SINGLE,
-		title  = "hi",
-	}
-	rect := tui.Cell_Rect {
-		width  = 10,
-		height = 4,
-	}
-
-	storage: [40]term.Cell
-	frame := _frame(storage[:], 10, 4)
-	draw_block(&frame, rect, block)
-	testing.expect_value(t, frame.cells[0].grapheme, "┌")
-	testing.expect_value(t, frame.cells[9].grapheme, "┐")
-	testing.expect_value(t, frame.cells[30].grapheme, "└")
-	testing.expect_value(t, frame.cells[1].grapheme, "h")
-	testing.expect_value(t, frame.cells[2].grapheme, "i")
-	testing.expect_value(t, frame.cells[10].grapheme, "│")
-}

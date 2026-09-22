@@ -79,9 +79,18 @@ foundation reusable and the harness replaceable.
 
 Tests live inside the package whose behavior they validate: focused unit tests in colocated
 `<source>_test.odin` files, and broader package-level or end-to-end tests under `<package>/test/`.
-A suite that cannot run under `odin test`, such as `term/test/lifecycle`, which forks a child
-process, ships as an in-package executable harness instead, which `scripts/_lib.sh` discovers
-through `nabla_harnesses`.
+Every suite runs under `odin test` through the native test interface; no suite
+ships a separate runner or custom output. A test that needs a process of its
+own (a forked peer, a spawned server) re-executes the test binary or runs
+isolated in a child of it rather than forking the multi-threaded runner.
+
+Every suite runs on the machine's full thread count, so tests share nothing
+process-global: no environment variables, no package-level probe state, and no
+writes to stdout or stderr. The cancel token and signal dispositions stay
+process-wide by design, so a test that sets them runs its body in a child of
+the test binary through `test_isolate_process` (see `agent/isolate_test.odin`),
+and diagnostics and session-open reporting take caller-supplied writers. Fixtures use per-test temporary
+directories, and probe executors report through per-test backend state.
 
 The harness stays presentation-free: `agent` produces data and writes to a caller-supplied
 `io.Writer`. The presentation stack stays agent-free. Long term the TUI should reach the

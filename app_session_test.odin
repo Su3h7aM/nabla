@@ -113,6 +113,9 @@ attach_setup_destroy :: proc(setup: ^Run_Setup) {
 // newest for this directory on a bare resume, and one named session by id.
 @(test)
 test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
 	state, previous, had_previous := app_state_isolate(t)
 	defer app_state_restore(state, previous, had_previous)
 
@@ -123,7 +126,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	first_setup: Run_Setup
 	first_setup.alloc = context.allocator
 	defer attach_setup_destroy(&first_setup)
-	if !testing.expect(t, run_session_attach(&first_setup, workspace, {kind = .New})) { return }
+	if !testing.expect(t, run_session_attach_test(&first_setup, workspace, {kind = .New}, &err_text)) { return }
 	first := session.Session_Id(strings.clone(string(first_setup.session.id), context.allocator))
 	defer delete(string(first), context.allocator)
 	app_session_turn(t, &first_setup)
@@ -136,7 +139,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	second_setup: Run_Setup
 	second_setup.alloc = context.allocator
 	defer attach_setup_destroy(&second_setup)
-	if !testing.expect(t, run_session_attach(&second_setup, workspace, {kind = .New})) { return }
+	if !testing.expect(t, run_session_attach_test(&second_setup, workspace, {kind = .New}, &err_text)) { return }
 	second := session.Session_Id(strings.clone(string(second_setup.session.id), context.allocator))
 	defer delete(string(second), context.allocator)
 	app_session_turn(t, &second_setup)
@@ -146,7 +149,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	latest_setup: Run_Setup
 	latest_setup.alloc = context.allocator
 	defer attach_setup_destroy(&latest_setup)
-	if !testing.expect(t, run_session_attach(&latest_setup, workspace, {kind = .Resume_Latest})) { return }
+	if !testing.expect(t, run_session_attach_test(&latest_setup, workspace, {kind = .Resume_Latest}, &err_text)) { return }
 	testing.expect_value(t, latest_setup.session.id, second)
 	testing.expect_value(t, latest_setup.workspace, workspace)
 	attach_setup_destroy(&latest_setup)
@@ -154,7 +157,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	named_setup: Run_Setup
 	named_setup.alloc = context.allocator
 	defer attach_setup_destroy(&named_setup)
-	if !testing.expect(t, run_session_attach(&named_setup, workspace, {kind = .Resume_Id, id = string(first)})) { return }
+	if !testing.expect(t, run_session_attach_test(&named_setup, workspace, {kind = .Resume_Id, id = string(first)}, &err_text)) { return }
 	testing.expect_value(t, named_setup.session.id, first)
 	attach_setup_destroy(&named_setup)
 
@@ -164,7 +167,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	missing_setup.alloc = context.allocator
 	testing.expect(
 		t,
-		!run_session_attach(&missing_setup, workspace, {kind = .Resume_Id, id = "00000000000000000000000000000000"}),
+		!run_session_attach_test(&missing_setup, workspace, {kind = .Resume_Id, id = "00000000000000000000000000000000"}, &err_text),
 		"an unknown id must not silently become a new session",
 	)
 	attach_setup_destroy(&missing_setup)
@@ -369,8 +372,8 @@ app_test_catalog :: proc(allocator: mem.Allocator) -> agent.Catalog {
 // app_state_isolate points the state directory at a temporary directory, so a
 // test that persists a selection or opens the session database cannot touch the
 // user's own state. It returns the previous value, which app_state_restore puts
-// back. The variable is process-wide, which is why the root package's tests run
-// on one thread.
+// back. The variable is process-wide, so tests using this helper run isolated
+// in a child of the test binary (see isolate_test.odin).
 app_state_isolate :: proc(t: ^testing.T) -> (state: string, previous: string, had_previous: bool) {
 	directory, directory_err := os.make_directory_temp("", "nabla-app-state-*", context.allocator)
 	if directory_err != nil { testing.fail_now(t, "could not create a temporary state directory") }
@@ -390,18 +393,32 @@ app_state_restore :: proc(state, previous: string, had_previous: bool) {
 	delete(state, context.allocator)
 }
 
+// session_open_test opens one target against a captured diagnosis writer, so
+// the test run stays quiet and the failure text itself is assertable.
+session_open_test :: proc(setup: ^Run_Setup, start: Session_Start, workspace: string, err: ^strings.Builder) -> (Session_Target, bool) {
+	return session_open_target(setup, start, workspace, strings.to_writer(err))
+}
+
+// run_session_attach_test attaches one launch against a captured diagnosis
+// writer, for the same reason.
+run_session_attach_test :: proc(setup: ^Run_Setup, workspace: string, start: Session_Start, err: ^strings.Builder) -> bool {
+	return run_session_attach(setup, workspace, start, strings.to_writer(err))
+}
+
 // A launch with nothing to say always starts fresh, so closing and reopening the
 // harness in one directory never returns to the conversation that just ended.
 @(test)
 test_a_launch_without_resume_starts_a_new_session :: proc(t: ^testing.T) {
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
 	app: App
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
 
-	first, first_ok := session_open_target(&app.setup, {kind = .New}, app.setup.workspace)
+	first, first_ok := session_open_test(&app.setup, {kind = .New}, app.setup.workspace, &err_text)
 	if !testing.expect(t, first_ok) { return }
 	defer session_target_destroy(&first, app.setup.alloc)
-	second, second_ok := session_open_target(&app.setup, {kind = .New}, app.setup.workspace)
+	second, second_ok := session_open_test(&app.setup, {kind = .New}, app.setup.workspace, &err_text)
 	if !testing.expect(t, second_ok) { return }
 	defer session_target_destroy(&second, app.setup.alloc)
 
@@ -418,6 +435,9 @@ test_a_launch_without_resume_starts_a_new_session :: proc(t: ^testing.T) {
 // row, nothing to list, and nothing for a later resume to find.
 @(test)
 test_a_launch_that_is_never_prompted_leaves_no_session :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
 	state, previous, had_previous := app_state_isolate(t)
 	defer app_state_restore(state, previous, had_previous)
 
@@ -428,7 +448,7 @@ test_a_launch_that_is_never_prompted_leaves_no_session :: proc(t: ^testing.T) {
 	setup: Run_Setup
 	setup.alloc = context.allocator
 	defer attach_setup_destroy(&setup)
-	if !testing.expect(t, run_session_attach(&setup, workspace, {kind = .New})) { return }
+	if !testing.expect(t, run_session_attach_test(&setup, workspace, {kind = .New}, &err_text)) { return }
 
 	// Choosing a model or an effort is not interaction, and neither is stored with
 	// the session, so a launch that only did that has nothing in the store.
@@ -443,6 +463,8 @@ test_a_launch_that_is_never_prompted_leaves_no_session :: proc(t: ^testing.T) {
 // session in that directory is the one it opens.
 @(test)
 test_resume_latest_is_scoped_to_the_directory :: proc(t: ^testing.T) {
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
 	app: App
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
@@ -463,7 +485,7 @@ test_resume_latest_is_scoped_to_the_directory :: proc(t: ^testing.T) {
 	elsewhere := app_session_use(t, &app.setup, {workspace = other}, 9_000)
 	defer delete(string(elsewhere), app.setup.alloc)
 
-	target, ok := session_open_target(&app.setup, {kind = .Resume_Latest}, app.setup.workspace)
+	target, ok := session_open_test(&app.setup, {kind = .Resume_Latest}, app.setup.workspace, &err_text)
 	if !testing.expect(t, ok) { return }
 	defer session_target_destroy(&target, app.setup.alloc)
 	testing.expect_value(t, target.id, newest)
@@ -476,6 +498,8 @@ test_resume_latest_is_scoped_to_the_directory :: proc(t: ^testing.T) {
 // a later bare resume must still open the conversation.
 @(test)
 test_resume_latest_skips_a_session_that_was_never_used :: proc(t: ^testing.T) {
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
 	app: App
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
@@ -485,7 +509,7 @@ test_resume_latest_skips_a_session_that_was_never_used :: proc(t: ^testing.T) {
 	abandoned := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 3_000)
 	defer delete(string(abandoned), app.setup.alloc)
 
-	target, ok := session_open_target(&app.setup, {kind = .Resume_Latest}, app.setup.workspace)
+	target, ok := session_open_test(&app.setup, {kind = .Resume_Latest}, app.setup.workspace, &err_text)
 	if !testing.expect(t, ok) { return }
 	defer session_target_destroy(&target, app.setup.alloc)
 	testing.expect_value(t, target.id, conversation)
@@ -495,6 +519,8 @@ test_resume_latest_skips_a_session_that_was_never_used :: proc(t: ^testing.T) {
 // Nothing to resume is a refusal, not a fresh session in disguise.
 @(test)
 test_resume_latest_refuses_an_empty_directory :: proc(t: ^testing.T) {
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
 	app: App
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
@@ -509,14 +535,17 @@ test_resume_latest_refuses_an_empty_directory :: proc(t: ^testing.T) {
 	abandoned := app_session_add(t, &app.setup, {workspace = empty}, 4_000)
 	defer delete(string(abandoned), app.setup.alloc)
 
-	_, ok := session_open_target(&app.setup, {kind = .Resume_Latest}, empty)
+	_, ok := session_open_test(&app.setup, {kind = .Resume_Latest}, empty, &err_text)
 	testing.expect(t, !ok, "a resume with nothing to resume must fail")
+	testing.expect(t, strings.contains(strings.to_string(err_text), "nothing to resume"), "the absence should be reported")
 }
 
 // An explicit id opens that session, and the session's own directory is what the
 // continuation runs in.
 @(test)
 test_resume_by_id_leaves_the_launch_directory_behind :: proc(t: ^testing.T) {
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
 	app: App
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
@@ -529,7 +558,7 @@ test_resume_by_id_leaves_the_launch_directory_behind :: proc(t: ^testing.T) {
 	id := app_session_add(t, &app.setup, {workspace = other, provider = "test-provider", model = "test-model"}, 5_000)
 	defer delete(string(id), app.setup.alloc)
 
-	target, ok := session_open_target(&app.setup, {kind = .Resume_Id, id = string(id)}, app.setup.workspace)
+	target, ok := session_open_test(&app.setup, {kind = .Resume_Id, id = string(id)}, app.setup.workspace, &err_text)
 	if !testing.expect(t, ok) { return }
 	defer session_target_destroy(&target, app.setup.alloc)
 	testing.expect_value(t, target.id, id)
@@ -540,15 +569,19 @@ test_resume_by_id_leaves_the_launch_directory_behind :: proc(t: ^testing.T) {
 
 @(test)
 test_resume_by_id_refuses_what_it_cannot_open :: proc(t: ^testing.T) {
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
 	app: App
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
 
-	_, missing_ok := session_open_target(&app.setup, {kind = .Resume_Id, id = "00000000000000000000000000000000"}, app.setup.workspace)
+	_, missing_ok := session_open_test(&app.setup, {kind = .Resume_Id, id = "00000000000000000000000000000000"}, app.setup.workspace, &err_text)
 	testing.expect(t, !missing_ok, "an unknown id must be refused")
+	testing.expect(t, strings.contains(strings.to_string(err_text), "cannot open session"), "the missing row should be reported")
 
-	_, malformed_ok := session_open_target(&app.setup, {kind = .Resume_Id, id = "not-a-session"}, app.setup.workspace)
+	_, malformed_ok := session_open_test(&app.setup, {kind = .Resume_Id, id = "not-a-session"}, app.setup.workspace, &err_text)
 	testing.expect(t, !malformed_ok, "a malformed id must be refused")
+	testing.expect(t, strings.contains(strings.to_string(err_text), "not a session id"), "the malformed id should be reported")
 }
 
 // The target is checked before anything is given up, so a session from a

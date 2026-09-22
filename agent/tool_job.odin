@@ -1,5 +1,6 @@
 package agent
 
+import "base:intrinsics"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
@@ -263,6 +264,9 @@ tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) -> bool {
 			ai.interrupt_request(&job.interrupt)
 			sync.mutex_lock(&job.mu)
 			job.orphan = true
+			if job.thread != nil {
+				intrinsics.atomic_or(&job.thread.flags, {.Self_Cleanup})
+			}
 			job.phase = .Stuck
 			sync.mutex_unlock(&job.mu)
 			escaped = true
@@ -772,7 +776,13 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 
 	// From here the worker owns this job: it releases everything the job holds when it
 	// returns, which is what keeps a call that ignores its stop from leaking its storage.
+	// The worker also reaps its own thread handle on the way out, so the handoff leaves
+	// nothing behind for the owner to release. Only a worker that never returns keeps
+	// its handle for the life of the process.
 	job.orphan = true
+	if job.thread != nil {
+		intrinsics.atomic_or(&job.thread.flags, {.Self_Cleanup})
+	}
 	job.phase = .Stuck
 	jobs.escaped = true
 	if recorded {
@@ -983,8 +993,10 @@ tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
 //
 // The thread's own storage is the owner's to give back, once that worker has published. A
 // thread that released itself would be observed by nobody, and the library's start and that
-// thread's own exit would race over the same bytes; a job handed to a worker that ignores its
-// stop keeps its thread handle instead, for the life of the process.
+// thread's own exit would race over the same bytes. A worker that ignores its stop is
+// therefore flagged for self-cleanup when the owner hands the job over: it detaches and
+// frees its own handle on the way out. Only a worker that never returns keeps anything
+// for the life of the process.
 @(private)
 tool_job_launch :: proc(job: ^Tool_Job) -> bool {
 	previous: linux.Sig_Set
@@ -1023,7 +1035,10 @@ tool_job_worker :: proc(worker: ^thread.Thread) {
 	sync.mutex_lock(&job.mu)
 	if job.orphan {
 		// The owner gave up on this call and released nothing, so the result the worker just
-		// produced is freed here along with the job that held it.
+		// produced is freed here along with the job that held it. The mutex is released
+		// first: the handoff decision is made, and nothing after this point may block on
+		// a mutex the owner can still reach.
+		sync.mutex_unlock(&job.mu)
 		tool_result_destroy(&result)
 		tool_job_release(job)
 		return

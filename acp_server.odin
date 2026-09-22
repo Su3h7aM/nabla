@@ -222,7 +222,7 @@ acp_session_open :: proc(server: ^Acp_Server, workspace: string, start: Session_
 	// conversation, and the harness would refuse to claim it twice.
 	if start.kind == .Resume_Id && string(app.setup.session.id) == start.id { return "", true }
 
-	target, resolved := session_open_target(&app.setup, start, workspace)
+	target, resolved := session_open_target(&app.setup, start, workspace, stderr_writer())
 	if !resolved {
 		if start.id == "" { return strings.clone("a session could not be started", app.setup.alloc), false }
 		return strings.concatenate({"the session could not be opened: ", start.id}, app.setup.alloc), false

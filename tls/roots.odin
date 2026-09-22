@@ -44,6 +44,7 @@ roots_parse :: proc(text: []u8, allocator: mem.Allocator) -> (roots: Roots, ok: 
 				}
 			}
 			delete(block.data)
+			delete(block.label, allocator)
 			free(block, allocator)
 		}
 		if err != nil || block == nil { break }

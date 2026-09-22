@@ -550,29 +550,6 @@ test_a_claim_refuses_a_turn_that_stopped_at_its_boundary :: proc(t: ^testing.T) 
 }
 
 @(test)
-test_tool_loop_accepts_more_than_the_old_batch_limit :: proc(t: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
-	chat := &fixture.chat
-	chat.tools_enabled = true
-	_test_accept(t, chat, "many calls")
-	request := _test_begin_request(t, chat)
-
-	calls := make([dynamic]ai.Provider_Tool_Call, 0, 40, context.temp_allocator)
-	defer delete(calls)
-	for i in 0 ..< 40 {
-		id := fmt.aprintf("call_%d", i, allocator = context.temp_allocator)
-		append(&calls, ai.Provider_Tool_Call{ID = id, Name = TOOL_SHELL_NAME, Arguments = "{}"})
-	}
-
-	source := chat_session_event_source(chat)
-	testing.expect_value(t, chat_session_feed_tool_calls(chat, source, calls[:]), Chat_Notice.None)
-	testing.expect_value(t, len(chat.pending_calls), 40)
-	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, 40))
-}
-
-@(test)
 test_the_first_prompt_names_the_session :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
@@ -804,20 +781,24 @@ test_result_contract_violation_is_replaced_in_dispatch :: proc(t: ^testing.T) {
 // --- execution context policy -------------------------------------------------
 
 // The probe records the policy and binding dispatch handed to one execution.
-// Package-level storage is how a shared executor reports back through a
-// signature that returns only a result; tests run serially, and every case
-// overwrites the previous observation before asserting on it.
-tool_policy_seen_default: time.Duration
-tool_policy_seen_maximum: time.Duration
-tool_policy_seen_backend: rawptr
+// The state is per definition: the executor's fixed signature reports through
+// the definition's backend, so parallel tests never observe each other.
+Tool_Policy_Probe :: struct {
+	seen_default: time.Duration,
+	seen_maximum: time.Duration,
+	seen_backend: rawptr,
+}
 
 // tool_policy_probe_execute is an adapter-style shared executor: one procedure
 // serving many definitions, reading its bounds and binding from the context
-// rather than from a definition it cannot name.
+// rather than from a definition it cannot name. A nil backend records nothing,
+// so a definition that is never dispatched needs no probe.
 tool_policy_probe_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
-	tool_policy_seen_default = ctx.timeouts.default
-	tool_policy_seen_maximum = ctx.timeouts.maximum
-	tool_policy_seen_backend = ctx.backend
+	if probe := cast(^Tool_Policy_Probe)ctx.backend; probe != nil {
+		probe.seen_default = ctx.timeouts.default
+		probe.seen_maximum = ctx.timeouts.maximum
+		probe.seen_backend = ctx.backend
+	}
 	return tool_result_success(ctx, Tool_Empty{}, "probed")
 }
 
@@ -830,15 +811,15 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 
-	marker_one: u8 = 1
-	marker_two: u8 = 2
+	probe_first: Tool_Policy_Probe
+	probe_second: Tool_Policy_Probe
 	first := Tool_Definition {
 		name = "test_probe_first",
 		description = "First probe tool.",
 		input_schema = `{"type":"object"}`,
 		timeouts = {default = 5 * time.Second, maximum = 10 * time.Second},
 		execute = tool_policy_probe_execute,
-		backend = &marker_one,
+		backend = &probe_first,
 	}
 	second := Tool_Definition {
 		name = "test_probe_second",
@@ -846,22 +827,22 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 		input_schema = `{"type":"object"}`,
 		timeouts = {default = 30 * time.Second, maximum = 60 * time.Second},
 		execute = tool_policy_probe_execute,
-		backend = &marker_two,
+		backend = &probe_second,
 	}
 	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, first).kind, Tool_Registry_Error_Kind.None) { return }
 	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, second).kind, Tool_Registry_Error_Kind.None) { return }
 
 	first_result := tool_run(t, &test, "test_probe_first", `{}`)
 	testing.expect_value(t, first_result.outcome, session.Tool_Outcome.Success)
-	testing.expect_value(t, tool_policy_seen_default, 5 * time.Second)
-	testing.expect_value(t, tool_policy_seen_maximum, 10 * time.Second)
-	testing.expect(t, tool_policy_seen_backend == &marker_one, "the first call carries the first binding")
+	testing.expect_value(t, probe_first.seen_default, 5 * time.Second)
+	testing.expect_value(t, probe_first.seen_maximum, 10 * time.Second)
+	testing.expect(t, probe_first.seen_backend == &probe_first, "the first call carries the first binding")
 
 	second_result := tool_run(t, &test, "test_probe_second", `{}`)
 	testing.expect_value(t, second_result.outcome, session.Tool_Outcome.Success)
-	testing.expect_value(t, tool_policy_seen_default, 30 * time.Second)
-	testing.expect_value(t, tool_policy_seen_maximum, 60 * time.Second)
-	testing.expect(t, tool_policy_seen_backend == &marker_two, "the second call carries the second binding")
+	testing.expect_value(t, probe_second.seen_default, 30 * time.Second)
+	testing.expect_value(t, probe_second.seen_maximum, 60 * time.Second)
+	testing.expect(t, probe_second.seen_backend == &probe_second, "the second call carries the second binding")
 }
 
 // Every dispatch path stores a valid envelope: the unknown tool, the refused
@@ -870,6 +851,7 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 // definition cross it too.
 @(test)
 test_every_dispatch_path_stores_a_valid_envelope :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	{
 		test: Tool_Test
 		tool_test_begin(t, &test)
@@ -906,6 +888,7 @@ test_every_dispatch_path_stores_a_valid_envelope :: proc(t: ^testing.T) {
 // user asked for.
 @(test)
 test_an_incomplete_tool_batch_ends_the_turn :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)

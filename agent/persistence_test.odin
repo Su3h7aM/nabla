@@ -12,6 +12,7 @@ import "nabla:db"
 // memory would otherwise diverge from the conversation on disk.
 @(test)
 test_a_turn_outcome_that_cannot_be_recorded_latches_the_session :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	defer chat_cancel_reset()
 
 	fixture: Chat_Test

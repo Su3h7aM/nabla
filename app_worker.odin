@@ -293,7 +293,7 @@ session_resume :: proc(app: ^App, reference: string) {
 // only session.
 session_start_new :: proc(app: ^App) -> bool {
 	setup := &app.setup
-	target, opened := session_open_target(setup, {kind = .New}, setup.workspace)
+	target, opened := session_open_target(setup, {kind = .New}, setup.workspace, stderr_writer())
 	if !opened { return false }
 	defer session_target_destroy(&target, setup.alloc)
 

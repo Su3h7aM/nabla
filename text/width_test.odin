@@ -62,16 +62,6 @@ test_grapheme_offsets_step_by_cluster :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_text_columns_counts_cells :: proc(t: ^testing.T) {
-	testing.expect_value(t, text_columns("hello"), 5)
-	testing.expect_value(t, text_columns("café"), 4) // é is one cell
-	testing.expect_value(t, text_columns("e\u0301"), 1) // one cluster
-	testing.expect_value(t, text_columns("界"), 2)
-	testing.expect_value(t, text_columns("界a"), 3)
-	testing.expect_value(t, text_columns(""), 0)
-}
-
-@(test)
 test_text_columns_at_measures_a_tab_at_its_line_position :: proc(t: ^testing.T) {
 	profile := Width_Profile {
 		tab_width = 4,

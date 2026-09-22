@@ -2,6 +2,7 @@
 package main
 
 import "core:fmt"
+import "core:io"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -206,7 +207,7 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []age
 	}
 	defer delete(workspace, setup.alloc)
 
-	if !run_session_attach(setup, workspace, start) { return false }
+	if !run_session_attach(setup, workspace, start, stderr_writer()) { return false }
 
 	ok = true
 	return true
@@ -219,35 +220,35 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []age
 //
 // The caller installs the launch's logger before this runs, so the store and the
 // adoption below are recorded.
-run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_Start) -> bool {
+run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_Start, stderr: io.Writer) -> bool {
 	directory, directory_err := agent.xdg_directory(.State, setup.alloc)
 	if directory_err != .None {
-		fmt.eprintln("nabla: cannot resolve the state directory for sessions")
+		fmt.wprintln(stderr, "nabla: cannot resolve the state directory for sessions")
 		return false
 	}
 	defer delete(directory, setup.alloc)
 
 	if store_err := session.store_open(&setup.store, directory); store_err != nil {
 		local := store_err
-		fmt.eprintln("nabla: cannot open the session database:", session.error_detail(&local))
+		fmt.wprintln(stderr, "nabla: cannot open the session database:", session.error_detail(&local))
 		return false
 	}
 
-	target, opened := session_open_target(setup, start, workspace)
+	target, opened := session_open_target(setup, start, workspace, stderr)
 	if !opened { return false }
 	defer session_target_destroy(&target, setup.alloc)
 
 	// A session carries the directory it ran in, and an explicit id can name one
 	// from anywhere, so the directory is checked rather than assumed.
 	if !os.is_dir(target.workspace) {
-		fmt.eprintf("nabla: the session's directory is not usable: %s\n", target.workspace)
+		fmt.wprintf(stderr, "nabla: the session's directory is not usable: %s\n", target.workspace)
 		return false
 	}
 
 	adoption, message, adopted := session_adopt_target(setup, start.kind, target)
 	if !adopted {
 		defer delete(message, setup.alloc)
-		fmt.eprintln("nabla:", message)
+		fmt.wprintln(stderr, "nabla:", message)
 		return false
 	}
 	defer adoption_destroy(&adoption, setup.alloc)
@@ -255,7 +256,7 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 
 	claimed, held := session.session_claimed(&setup.store)
 	if !held {
-		fmt.eprintln("nabla: the session claim went missing")
+		fmt.wprintln(stderr, "nabla: the session claim went missing")
 		return false
 	}
 
@@ -277,12 +278,12 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 //
 // Every failure here is the launch's own: the caller reports it and exits rather
 // than falling back to a different session.
-session_open_target :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: string) -> (target: Session_Target, ok: bool) {
+session_open_target :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: string, stderr: io.Writer) -> (target: Session_Target, ok: bool) {
 	switch start.kind {
 	case .New:
 		id := session.session_id_create(setup.alloc)
 		if id == "" {
-			fmt.eprintln("nabla: cannot start a session: a session id could not be created")
+			fmt.wprintln(stderr, "nabla: cannot start a session: a session id could not be created")
 			return {}, false
 		}
 		target.id = id
@@ -296,25 +297,25 @@ session_open_target :: proc(setup: ^Run_Setup, start: Session_Start, launch_work
 		sessions, list_err := session.session_list(&setup.store, {workspace = launch_workspace, limit = 1, used_only = true}, setup.alloc)
 		if list_err != nil {
 			local := list_err
-			fmt.eprintln("nabla: cannot list sessions:", session.error_detail(&local))
+			fmt.wprintln(stderr, "nabla: cannot list sessions:", session.error_detail(&local))
 			return {}, false
 		}
 		defer session.sessions_destroy(sessions, setup.alloc)
 		if len(sessions) == 0 {
-			fmt.eprintf("nabla: no session has run in %s; nothing to resume\n", launch_workspace)
+			fmt.wprintf(stderr, "nabla: no session has run in %s; nothing to resume\n", launch_workspace)
 			return {}, false
 		}
 		return session_target_from(&sessions[0], setup.alloc), true
 
 	case .Resume_Id:
 		if !session.session_id_valid(session.Session_Id(start.id)) {
-			fmt.eprintf("nabla: %s is not a session id\n", start.id)
+			fmt.wprintf(stderr, "nabla: %s is not a session id\n", start.id)
 			return {}, false
 		}
 		header, load_err := session.session_load(&setup.store, session.Session_Id(start.id), setup.alloc)
 		if load_err != nil {
 			local := load_err
-			fmt.eprintf("nabla: cannot open session %s: %s\n", start.id, session.error_detail(&local))
+			fmt.wprintf(stderr, "nabla: cannot open session %s: %s\n", start.id, session.error_detail(&local))
 			return {}, false
 		}
 		defer session.session_destroy(&header)

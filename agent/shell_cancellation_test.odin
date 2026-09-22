@@ -42,8 +42,13 @@ shell_await_process_gone :: proc(pid: int) -> bool {
 	return shell_process_gone(pid)
 }
 
+shell_test_workspace_sequence: i64
+
 shell_test_workspace :: proc(allocator: mem.Allocator) -> string {
-	path := fmt.aprintf("/tmp/nabla-shell-test-%d", os.get_pid(), allocator = allocator)
+	// One directory per call, not per process: parallel tests share nothing, and
+	// a retry of one test never inherits another attempt's files.
+	sequence := sync.atomic_add(&shell_test_workspace_sequence, 1)
+	path := fmt.aprintf("/tmp/nabla-shell-test-%d-%d", os.get_pid(), sequence, allocator = allocator)
 	_ = os.make_directory(path)
 	return path
 }
@@ -196,6 +201,7 @@ test_shell_cancel_escalates_when_sigterm_is_ignored :: proc(t: ^testing.T) {
 
 @(test)
 test_shell_cancel_reaps_child_and_allows_next_turn :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
 	defer chat_test_end(t, &fixture)
@@ -352,6 +358,7 @@ shell_turn_join :: proc(run: ^Shell_Turn_Run) {
 
 @(test)
 test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	server: Shell_Stall_Server
 	if !shell_stall_start(t, &server) { return }
 	defer shell_stall_stop(&server)
@@ -434,6 +441,7 @@ backoff_send_signal :: proc(thread: ^thread.Thread) {
 // nothing else can, and a wait that no longer polls would otherwise run the whole delay.
 @(test)
 test_sigint_cuts_a_retry_backoff_short :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	// A backoff far longer than the bound below, so a turn that returns inside it can only have
 	// been woken rather than waited out.
 	BACKOFF_DELAY :: 3 * time.Second

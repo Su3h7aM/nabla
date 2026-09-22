@@ -1,13 +1,17 @@
-package main
+#+test
+package websocket
 
-// Peer is a scripted RFC 6455 server for this harness. It frames the protocol itself over a
-// plain socket, so a client that agrees with it agrees with something other than its own
-// encoder. It runs on a thread because the client blocks on the answer to each case, and
-// each accepted connection is served by the next case in the script.
+// Live upgrade coverage against the scripted peer below, which frames the
+// protocol itself over a plain socket, so a client that agrees with it agrees
+// with something other than its own encoder.
 //
-// What it covers is what an in-package byte fixture cannot: the Upgrade exchange over a
-// real socket, a frame that arrives in the same segment as the response head, a response
-// that does not accept the key, and the two frames a server may not send.
+// This is what an in-package byte fixture cannot reach: the Upgrade exchange
+// through http/client over a real socket, a frame that arrives in the same
+// segment as the response head, a response that does not accept the key, and
+// the two frames a server may not send. Message framing, fragmentation and
+// control frames are covered by the byte fixtures. The peer runs on a thread
+// because the client blocks on the answer to each case, and every fixture
+// (port, findings, message buffer) is per test.
 
 import "core:crypto/legacy/sha1"
 import "core:encoding/base64"
@@ -15,7 +19,197 @@ import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:strings"
+import "core:testing"
 import "core:thread"
+import "core:time"
+
+import "nabla:http/client"
+
+ECHO_CASE_TIMEOUT :: 30 * time.Second
+
+// Echo_State is one test's side of the conversation: the message buffer and
+// the deadline that ends a case whose peer stopped answering.
+Echo_State :: struct {
+	t:        ^testing.T,
+	buffer:   []u8,
+	deadline: time.Tick,
+}
+
+@(test)
+test_websocket_live_peer_upgrade_and_violations :: proc(t: ^testing.T) {
+	state := Echo_State {
+		t = t,
+	}
+	state.buffer = make([]u8, PEER_BUFFER, context.allocator)
+	defer delete(state.buffer)
+
+	peer: Peer
+	if !testing.expect(t, peer_start(&peer), "the peer could not be started") { return }
+	defer peer_destroy(&peer)
+
+	echo_run_message_cases(&state, peer.port)
+	echo_run_immediate_case(&state, peer.port)
+	echo_run_rejected_key_case(&state, peer.port)
+	echo_run_protocol_violation_case(&state, peer.port, "a masked frame from the server")
+	echo_run_protocol_violation_case(&state, peer.port, "a control frame over 125 octets")
+
+	peer_wait(&peer)
+	testing.expect(t, peer_saw(&peer, "the handshake was answered"), "the peer never answered a handshake")
+	testing.expect(t, peer_saw(&peer, "the client closed with 1000"), "the client's close did not carry code 1000")
+	testing.expect(t, peer_saw(&peer, "a masked frame from the server was closed with 1002"), "a masked frame was not refused as a protocol error")
+	testing.expect(
+		t,
+		peer_saw(&peer, "a control frame over 125 octets was closed with 1002"),
+		"an oversized control frame was not refused as a protocol error",
+	)
+	testing.expect(t, !peer_saw(&peer, "a client frame was not masked"), "the client sent an unmasked frame")
+}
+
+// echo_open dials the peer, which is listening before the first case runs.
+echo_open :: proc(state: ^Echo_State, port: int, path: string) -> (conn: ^Conn, failure: Dial_Failure) {
+	url := fmt.aprintf("ws://localhost:%d%s", port, path)
+	defer delete(url)
+	state.deadline = time.tick_add(time.tick_now(), ECHO_CASE_TIMEOUT)
+	return dial(url, {http = {probe = {check = echo_keep_going, user_data = &state.deadline}}})
+}
+
+// echo_keep_going ends a case that has stalled.
+echo_keep_going :: proc(user_data: rawptr) -> client.Wait_Status {
+	deadline := cast(^time.Tick)user_data
+	if time.tick_since(deadline^) >= 0 { return .Timed_Out }
+	return .Ready
+}
+
+// The message cases run on one connection, in the order the peer's script expects.
+echo_run_message_cases :: proc(state: ^Echo_State, port: int) {
+	t := state.t
+	conn, failure := echo_open(state, port, "/")
+	if !testing.expect_value(t, failure.kind, Dial_Error.None) {
+		dial_failure_destroy(&failure, context.allocator)
+		return
+	}
+	defer destroy(conn)
+
+	echo_send(state, conn, .Text, "echo")
+	echo_expect_message(state, conn, .Text, "echo")
+	echo_send(state, conn, .Binary, "binary")
+	echo_expect_message(state, conn, .Binary, "binary")
+
+	// A message the peer sends as two frames, so the first read ends nothing.
+	echo_send(state, conn, .Text, "fragmented")
+	length := 0
+	count, _, complete, err := read(conn, state.buffer[:])
+	if testing.expect_value(t, err, Error.None) {
+		length += count
+		testing.expect(t, !complete, "the first fragment ended the message")
+		count, _, complete, err = read(conn, state.buffer[length:])
+		if testing.expect_value(t, err, Error.None) {
+			length += count
+			testing.expect(t, complete, "the last fragment did not end the message")
+			testing.expect_value(t, string(state.buffer[:length]), "fragmented")
+		}
+	}
+
+	// A message far larger than one frame, arriving as several.
+	echo_send(state, conn, .Text, "large")
+	message, received := echo_receive(state, conn, .Text)
+	if testing.expect(t, received, "the large message could not be read") {
+		if testing.expect_value(t, len(message), LARGE_MESSAGE) {
+			content_ok := true
+			for octet in transmute([]u8)message { if octet != 'a' { content_ok = false } }
+			testing.expect(t, content_ok, "the large message is not what the peer sent")
+		}
+	}
+
+	// A ping from the peer is answered while the next message is read.
+	echo_send(state, conn, .Text, "ping")
+	echo_expect_message(state, conn, .Text, "pong")
+
+	// An orderly close, with the peer's code and this client's answer to it.
+	echo_send(state, conn, .Text, "close")
+	buffer: [1024]u8
+	err = .None
+	for err == .None { _, _, _, err = read(conn, buffer[:]) }
+	testing.expect_value(t, err, Error.Closed)
+	testing.expect_value(t, conn.close_code, Close_Code.Normal)
+	testing.expect_value(t, close(conn, .Normal, "", buffer[:]), Error.None)
+}
+
+// A frame the peer sends in the same segment as its response head belongs to the WebSocket,
+// not to the HTTP response, and it must still be the first thing read.
+echo_run_immediate_case :: proc(state: ^Echo_State, port: int) {
+	t := state.t
+	conn, failure := echo_open(state, port, "/")
+	if !testing.expect_value(t, failure.kind, Dial_Error.None) {
+		dial_failure_destroy(&failure, context.allocator)
+		return
+	}
+	defer destroy(conn)
+	echo_expect_message(state, conn, .Text, "immediate")
+}
+
+// A response that does not accept the key it was sent is not a WebSocket, so no connection
+// may be handed to a caller (RFC 6455 4.1).
+echo_run_rejected_key_case :: proc(state: ^Echo_State, port: int) {
+	t := state.t
+	conn, failure := echo_open(state, port, "/")
+	defer dial_failure_destroy(&failure, context.allocator)
+	if conn != nil {
+		destroy(conn)
+		testing.fail_now(t, "a connection was opened on a response that did not accept the key")
+	}
+	testing.expect_value(t, failure.kind, Dial_Error.Response)
+}
+
+echo_run_protocol_violation_case :: proc(state: ^Echo_State, port: int, what: string) {
+	t := state.t
+	conn, failure := echo_open(state, port, "/")
+	if !testing.expect_value(t, failure.kind, Dial_Error.None) {
+		dial_failure_destroy(&failure, context.allocator)
+		return
+	}
+	defer destroy(conn)
+
+	buffer: [1024]u8
+	for {
+		_, _, _, err := read(conn, buffer[:])
+		if err == .None { continue }
+		testing.expect_value(t, err, Error.Protocol)
+		return
+	}
+}
+
+echo_send :: proc(state: ^Echo_State, conn: ^Conn, opcode: Opcode, message: string) {
+	t := state.t
+	testing.expect_value(t, write(conn, opcode, transmute([]u8)message), Error.None)
+}
+
+echo_expect_message :: proc(state: ^Echo_State, conn: ^Conn, opcode: Opcode, expected: string) -> string {
+	message, received := echo_receive(state, conn, opcode)
+	if received { testing.expect_value(state.t, message, expected) }
+	return message
+}
+
+// echo_receive reads one whole message of the given type and reports it, which is an empty
+// string when the message failed.
+echo_receive :: proc(state: ^Echo_State, conn: ^Conn, opcode: Opcode) -> (message: string, ok: bool) {
+	t := state.t
+	length := 0
+	for {
+		count, frame_opcode, complete, err := read(conn, state.buffer[length:])
+		if !testing.expect_value(t, err, Error.None) { return "", false }
+		if !testing.expect_value(t, frame_opcode, opcode) { return "", false }
+		length += count
+		if complete { return string(state.buffer[:length]), true }
+	}
+}
+
+// --- the scripted peer --------------------------------------------------------
+
+// Peer is a scripted RFC 6455 server for this test. It frames the protocol itself over a
+// plain socket, so a client that agrees with it agrees with something other than its own
+// encoder. It runs on a thread because the client blocks on the answer to each case, and
+// each accepted connection is served by the next case in the script.
 
 GUID :: "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 

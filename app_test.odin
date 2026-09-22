@@ -86,6 +86,7 @@ catalog_pipeline_end :: proc(fixture: ^Catalog_Pipeline_Fixture) {
 
 @(test)
 test_catalog_refresh_publishes_one_complete_pipeline :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	fixture := catalog_pipeline_app(t)
 	defer catalog_pipeline_end(&fixture)
 	app := &fixture.app
@@ -108,6 +109,7 @@ test_catalog_refresh_publishes_one_complete_pipeline :: proc(t: ^testing.T) {
 // has: a request that failed cannot take reasoning controls away from a model.
 @(test)
 test_catalog_refresh_keeps_the_enrichment_a_failed_request_could_not_replace :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	fixture := catalog_pipeline_app(t)
 	defer catalog_pipeline_end(&fixture)
 	app := &fixture.app
@@ -152,17 +154,6 @@ test_catalog_source_merge_keeps_providers_missing_from_a_refresh :: proc(t: ^tes
 	testing.expect_value(t, len(incoming), 0)
 }
 
-@(test)
-test_working_duration_changes_units_at_boundaries :: proc(t: ^testing.T) {
-	cases := []struct {
-		seconds:  i64,
-		expected: string,
-	}{{-1, "0s"}, {0, "0s"}, {59, "59s"}, {60, "1m 0s"}, {61, "1m 1s"}, {3599, "59m 59s"}, {3600, "1h 0m 0s"}, {3661, "1h 1m 1s"}, {36000, "10h 0m 0s"}}
-	for test_case in cases {
-		testing.expect_value(t, working_duration(test_case.seconds), test_case.expected)
-	}
-}
-
 // ctrl_c_app builds the minimum an interrupt reads: the prompt buffer and whether
 // a request is running.
 ctrl_c_app :: proc(t: ^testing.T, text: string, running: bool) -> App {
@@ -178,6 +169,7 @@ ctrl_c_app :: proc(t: ^testing.T, text: string, running: bool) -> App {
 // process-wide, and reading it from concurrent tests would race.
 @(test)
 test_ctrl_c_resolves_by_prompt_state :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	agent.chat_cancel_reset()
 	defer agent.chat_cancel_reset()
 

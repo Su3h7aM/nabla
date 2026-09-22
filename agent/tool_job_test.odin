@@ -26,38 +26,53 @@ import "nabla:agent/session"
 
 // Held tools let a test look at the table while a call is running. Every field is
 // touched by a worker and by the test thread, so all of them are read and written
-// atomically. Tests run serially, so package-level storage is how an executor with a
-// fixed signature reports what it observed.
-tool_job_hold_running: i32
-// tool_job_hold_thread is the thread the last held call ran on, which is how a test
-// says the call left the owner.
-tool_job_hold_thread: i64
-tool_job_hold_release: i32
-
-tool_job_hold_reset :: proc() {
-	sync.atomic_store(&tool_job_hold_running, i32(0))
-	sync.atomic_store(&tool_job_hold_thread, i64(0))
-	sync.atomic_store(&tool_job_hold_release, i32(0))
+// atomically. The state is per test: the executor's fixed signature reports
+// through the definition's backend, so parallel tests never observe each other.
+// The zero value is ready; no reset is needed.
+Tool_Job_Hold_State :: struct {
+	running:  i32,
+	// thread is the thread the last held call ran on, which is how a test
+	// says the call left the owner.
+	thread:   i64,
+	release:  i32,
+	returned: i32,
 }
 
-tool_job_hold_thread_id :: proc() -> i64 {
-	return sync.atomic_load(&tool_job_hold_thread)
+// Tool_Job_Hold_Lane is the borrowed backend identity a held definition is
+// registered with. Distinct addresses are distinct lanes; definitions sharing
+// one address run one at a time. The lane carries its test's state, so the
+// executor reaches per-test counters through ctx.backend.
+Tool_Job_Hold_Lane :: struct {
+	state: ^Tool_Job_Hold_State,
 }
 
-tool_job_hold_released :: proc() -> bool {
-	return sync.atomic_load(&tool_job_hold_release) != 0
+tool_job_hold_lane :: proc(state: ^Tool_Job_Hold_State) -> Tool_Job_Hold_Lane {
+	return {state = state}
 }
 
-tool_job_hold_release_all :: proc() {
-	sync.atomic_store(&tool_job_hold_release, i32(1))
+tool_job_hold_state :: proc(lane: ^Tool_Job_Hold_Lane) -> ^Tool_Job_Hold_State {
+	return lane.state
+}
+
+tool_job_hold_thread_id :: proc(state: ^Tool_Job_Hold_State) -> i64 {
+	return sync.atomic_load(&state.thread)
+}
+
+tool_job_hold_released :: proc(state: ^Tool_Job_Hold_State) -> bool {
+	return sync.atomic_load(&state.release) != 0
+}
+
+tool_job_hold_release_all :: proc(state: ^Tool_Job_Hold_State) {
+	sync.atomic_store(&state.release, i32(1))
 }
 
 // tool_job_hold_execute blocks until the test releases it or its own control ends.
 tool_job_hold_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
-	sync.atomic_add(&tool_job_hold_running, 1)
-	defer sync.atomic_add(&tool_job_hold_running, -1)
-	sync.atomic_store(&tool_job_hold_thread, i64(linux.gettid()))
-	for !tool_job_hold_released() {
+	state := tool_job_hold_state(cast(^Tool_Job_Hold_Lane)ctx.backend)
+	sync.atomic_add(&state.running, 1)
+	defer sync.atomic_add(&state.running, -1)
+	sync.atomic_store(&state.thread, i64(linux.gettid()))
+	for !tool_job_hold_released(state) {
 		if tool_control_cancelled(ctx.control) {
 			return tool_result_failure(ctx, .Cancelled, "the call was stopped", "cancelled")
 		}
@@ -73,9 +88,9 @@ tool_job_immediate_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -
 }
 
 // tool_job_hold_definition is a held tool in one lane. lane is the borrowed backend
-// identity: two definitions sharing one run one at a time, and nil is the lane every
-// native tool shares.
-tool_job_hold_definition :: proc(name: string, lane: rawptr = nil, execute := tool_job_hold_execute) -> Tool_Definition {
+// identity: two definitions sharing one run one at a time. The lane carries the
+// test's own counters, so parallel tests never observe each other.
+tool_job_hold_definition :: proc(lane: ^Tool_Job_Hold_Lane, name: string, execute := tool_job_hold_execute) -> Tool_Definition {
 	return Tool_Definition {
 		name = name,
 		description = "A tool the job tests control.",
@@ -141,40 +156,47 @@ tool_job_test_drain :: proc(t: ^testing.T, test: ^Tool_Test, jobs: ^Tool_Jobs) {
 // --- a call that ignores its stop ----------------------------------------------
 
 // A deaf tool never looks at its control: it keeps working until the test releases it,
-// which is what a backend stuck in a syscall looks like to the owner. The counters are
-// package-level because the executor's signature is fixed and tests run serially.
-tool_job_deaf_running: i32
-tool_job_deaf_release: i32
-tool_job_deaf_returned: i32
-
-tool_job_deaf_reset :: proc() {
-	sync.atomic_store(&tool_job_deaf_running, i32(0))
-	sync.atomic_store(&tool_job_deaf_release, i32(0))
-	sync.atomic_store(&tool_job_deaf_returned, i32(0))
-}
-
-tool_job_deaf_release_all :: proc() {
-	sync.atomic_store(&tool_job_deaf_release, i32(1))
+// which is what a backend stuck in a syscall looks like to the owner. It reports
+// through its lane's per-test state like a held tool does.
+tool_job_deaf_release_all :: proc(state: ^Tool_Job_Hold_State) {
+	tool_job_hold_release_all(state)
 }
 
 tool_job_deaf_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
-	sync.atomic_add(&tool_job_deaf_running, 1)
-	for sync.atomic_load(&tool_job_deaf_release) == 0 {
+	state := tool_job_hold_state(cast(^Tool_Job_Hold_Lane)ctx.backend)
+	sync.atomic_add(&state.running, 1)
+	for sync.atomic_load(&state.release) == 0 {
 		time.sleep(time.Millisecond)
 	}
-	sync.atomic_add(&tool_job_deaf_running, -1)
-	sync.atomic_store(&tool_job_deaf_returned, i32(1))
+	sync.atomic_add(&state.running, -1)
+	sync.atomic_store(&state.returned, i32(1))
 	return tool_result_success(ctx, Tool_Empty{}, "late")
 }
 
 // tool_job_test_hold_until waits for count held executions to be inside the executor,
-// so a test observes running jobs rather than a scheduling guess.
-tool_job_test_hold_until :: proc(t: ^testing.T, count: i32) {
+// so a test observes running jobs rather than a scheduling guess. The wait is
+// bounded: a job that never started (a failed launch, a stop before dispatch)
+// must fail the test, never hang it.
+tool_job_test_hold_until :: proc(t: ^testing.T, state: ^Tool_Job_Hold_State, count: i32) {
 	for _ in 0 ..< 10_000 {
-		if sync.atomic_load(&tool_job_hold_running) >= count { return }
+		if sync.atomic_load(&state.running) >= count { return }
 		time.sleep(time.Millisecond)
 	}
+	// Release before failing, so a worker still inside the executor leaves
+	// instead of spinning on a test that is already gone.
+	sync.atomic_store(&state.release, 1)
 	testing.fail_now(t, "the held calls never started")
+}
+
+// tool_job_test_returned_until waits for a deaf execution to come back after
+// its release, so teardown observes the worker it handed the job to. Bounded
+// like the hold wait above.
+tool_job_test_returned_until :: proc(t: ^testing.T, state: ^Tool_Job_Hold_State) {
+	for _ in 0 ..< 10_000 {
+		if sync.atomic_load(&state.returned) != 0 { return }
+		time.sleep(time.Millisecond)
+	}
+	testing.fail_now(t, "the released call never returned")
 }
 
 // --- tests ---------------------------------------------------------------------
@@ -185,7 +207,9 @@ test_code_mode_suspends_for_a_nested_tool_job :: proc(t: ^testing.T) {
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_child", nil, tool_job_immediate_execute))
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_child", tool_job_immediate_execute))
 	_test_stage_call(
 		t,
 		chat,
@@ -256,7 +280,9 @@ test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_step", nil, tool_job_immediate_execute))
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_step", tool_job_immediate_execute))
 	// The script makes more calls than one model response could commit.
 	source := fmt.aprintf(
 		`local seen = 0 for i = 1, %d do local r = tools.test_step() if r.status == "success" then seen = seen + 1 end end return seen`,
@@ -315,7 +341,9 @@ test_code_mode_reports_what_its_script_did :: proc(t: ^testing.T) {
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_child", nil, tool_job_immediate_execute))
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_child", tool_job_immediate_execute))
 	_test_stage_call(t, chat, "call_code", `{"code":"local a = tools.test_child()\nlocal b = tools.test_child()\nreturn \"done\""}`, TOOL_CODE_NAME)
 
 	jobs: Tool_Jobs
@@ -379,12 +407,13 @@ test_code_mode_reports_what_its_script_did :: proc(t: ^testing.T) {
 // call is still inside the executor, and the batch is not advanced by the completion.
 @(test)
 test_a_worker_placed_call_runs_on_another_thread :: proc(t: ^testing.T) {
-	tool_job_hold_reset()
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_hold"))
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_hold"))
 	_test_stage_call(t, chat, "call_hold", `{}`, "test_hold")
 
 	jobs: Tool_Jobs
@@ -393,13 +422,13 @@ test_a_worker_placed_call_runs_on_another_thread :: proc(t: ^testing.T) {
 	tool_jobs_submit(&jobs, chat, {})
 
 	testing.expect_value(t, tool_job_test_step(&test, &jobs), Tool_Job_Effect.Dispatch)
-	tool_job_test_hold_until(t, 1)
-	testing.expect(t, tool_job_hold_thread_id() != i64(linux.gettid()), "the call must not run on the owner's thread")
+	tool_job_test_hold_until(t, &hold, 1)
+	testing.expect(t, tool_job_hold_thread_id(&hold) != i64(linux.gettid()), "the call must not run on the owner's thread")
 	testing.expect_value(t, jobs.jobs[0].phase, Tool_Job_Phase.Running)
 	// The only thing left to do is wait: the call owns the lane and the owner.
 	testing.expect_value(t, tool_jobs_next(&jobs, time.tick_now()), Tool_Job_Effect.Wait)
 
-	tool_job_hold_release_all()
+	tool_job_hold_release_all(&hold)
 	tool_job_test_drain(t, &test, &jobs)
 	testing.expect_value(t, jobs.committed, 1)
 	testing.expect_value(t, jobs.jobs[0].phase, Tool_Job_Phase.Retired)
@@ -409,13 +438,14 @@ test_a_worker_placed_call_runs_on_another_thread :: proc(t: ^testing.T) {
 // worker slot is free.
 @(test)
 test_native_calls_share_one_lane :: proc(t: ^testing.T) {
-	tool_job_hold_reset()
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_first"))
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_second"))
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_first"))
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_second"))
 	_test_stage_call(t, chat, "call_first", `{}`, "test_first")
 	_test_stage_call(t, chat, "call_second", `{}`, "test_second")
 
@@ -425,30 +455,30 @@ test_native_calls_share_one_lane :: proc(t: ^testing.T) {
 	tool_jobs_submit(&jobs, chat, {})
 
 	testing.expect_value(t, tool_job_test_step(&test, &jobs), Tool_Job_Effect.Dispatch)
-	tool_job_test_hold_until(t, 1)
+	tool_job_test_hold_until(t, &hold, 1)
 	testing.expect_value(t, jobs.jobs[0].phase, Tool_Job_Phase.Running)
 	testing.expect_value(t, jobs.jobs[1].phase, Tool_Job_Phase.Queued)
 	testing.expect_value(t, jobs.active, 1)
 
-	tool_job_hold_release_all()
+	tool_job_hold_release_all(&hold)
 	tool_job_test_drain(t, &test, &jobs)
 	testing.expect_value(t, jobs.committed, 2)
-	testing.expect_value(t, sync.atomic_load(&tool_job_hold_running), i32(0))
+	testing.expect_value(t, sync.atomic_load(&hold.running), i32(0))
 }
 
 // Two MCP clients are two lanes, so their calls overlap: one stdio stream cannot be
 // read by two calls, but two streams can.
 @(test)
 test_calls_to_different_backends_overlap :: proc(t: ^testing.T) {
-	tool_job_hold_reset()
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	first_backend: u8
-	second_backend: u8
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_first", &first_backend))
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_second", &second_backend))
+	hold: Tool_Job_Hold_State
+	first_lane := tool_job_hold_lane(&hold)
+	second_lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&first_lane, "test_first"))
+	tool_job_test_register(t, &test, tool_job_hold_definition(&second_lane, "test_second"))
 	_test_stage_call(t, chat, "call_first", `{}`, "test_first")
 	_test_stage_call(t, chat, "call_second", `{}`, "test_second")
 
@@ -459,12 +489,12 @@ test_calls_to_different_backends_overlap :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, tool_job_test_step(&test, &jobs), Tool_Job_Effect.Dispatch)
 	testing.expect_value(t, tool_job_test_step(&test, &jobs), Tool_Job_Effect.Dispatch)
-	tool_job_test_hold_until(t, 1)
+	tool_job_test_hold_until(t, &hold, 1)
 	testing.expect_value(t, jobs.active, 2)
 	testing.expect_value(t, jobs.jobs[0].phase, Tool_Job_Phase.Running)
 	testing.expect_value(t, jobs.jobs[1].phase, Tool_Job_Phase.Running)
 
-	tool_job_hold_release_all()
+	tool_job_hold_release_all(&hold)
 	tool_job_test_drain(t, &test, &jobs)
 	testing.expect_value(t, jobs.committed, 2)
 }
@@ -473,16 +503,17 @@ test_calls_to_different_backends_overlap :: proc(t: ^testing.T) {
 // goes the moment a slot frees.
 @(test)
 test_running_calls_are_bounded :: proc(t: ^testing.T) {
-	tool_job_hold_reset()
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
 	// One lane each, so nothing but the worker bound can hold a call back.
-	lanes: [TOOL_JOBS_MAX_ACTIVE + 1]u8
+	hold: Tool_Job_Hold_State
+	lanes: [TOOL_JOBS_MAX_ACTIVE + 1]Tool_Job_Hold_Lane
+	for &lane in lanes { lane = tool_job_hold_lane(&hold) }
 	names := [TOOL_JOBS_MAX_ACTIVE + 1]string{"test_one", "test_two", "test_three", "test_four", "test_five"}
 	for name, index in names {
-		tool_job_test_register(t, &test, tool_job_hold_definition(name, &lanes[index]))
+		tool_job_test_register(t, &test, tool_job_hold_definition(&lanes[index], name))
 		_test_stage_call(t, chat, name, `{}`, name)
 	}
 
@@ -495,9 +526,9 @@ test_running_calls_are_bounded :: proc(t: ^testing.T) {
 		if tool_job_test_step(&test, &jobs) != .Dispatch { break }
 		if jobs.active >= TOOL_JOBS_MAX_ACTIVE { break }
 	}
-	tool_job_test_hold_until(t, i32(TOOL_JOBS_MAX_ACTIVE))
+	tool_job_test_hold_until(t, &hold, i32(TOOL_JOBS_MAX_ACTIVE))
 	testing.expect_value(t, jobs.active, TOOL_JOBS_MAX_ACTIVE)
-	testing.expect_value(t, sync.atomic_load(&tool_job_hold_running), i32(TOOL_JOBS_MAX_ACTIVE))
+	testing.expect_value(t, sync.atomic_load(&hold.running), i32(TOOL_JOBS_MAX_ACTIVE))
 	queued := 0
 	for job in jobs.jobs {
 		if job.phase == .Queued { queued += 1 }
@@ -506,7 +537,7 @@ test_running_calls_are_bounded :: proc(t: ^testing.T) {
 	// What is left is a wait, not a dispatch: the bound is real, not a preference.
 	testing.expect_value(t, tool_jobs_next(&jobs, time.tick_now()), Tool_Job_Effect.Wait)
 
-	tool_job_hold_release_all()
+	tool_job_hold_release_all(&hold)
 	tool_job_test_drain(t, &test, &jobs)
 	testing.expect_value(t, jobs.committed, len(names))
 }
@@ -520,12 +551,14 @@ test_running_calls_are_bounded :: proc(t: ^testing.T) {
 // can still reach.
 @(test)
 test_a_call_that_ignores_its_stop_is_answered_and_released :: proc(t: ^testing.T) {
-	tool_job_deaf_reset()
+	if !test_isolate_process(t, #procedure) { return }
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_deaf", nil, tool_job_deaf_execute))
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_deaf", tool_job_deaf_execute))
 	_test_stage_call(t, chat, "call_deaf", `{}`, "test_deaf")
 
 	// The batch's own heap is tracked, so the test can hold the worker to releasing the job
@@ -542,7 +575,7 @@ test_a_call_that_ignores_its_stop_is_answered_and_released :: proc(t: ^testing.T
 	// The owner's clock is supplied, so the stop patience passes without waiting it out.
 	started := time.tick_now()
 	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, started), Tool_Job_Effect.Dispatch)
-	for sync.atomic_load(&tool_job_deaf_running) == 0 { time.sleep(time.Millisecond) }
+	tool_job_test_hold_until(t, &hold, 1)
 
 	chat_cancel_request()
 	defer chat_cancel_reset()
@@ -564,7 +597,7 @@ test_a_call_that_ignores_its_stop_is_answered_and_released :: proc(t: ^testing.T
 	testing.expect_value(t, jobs.committed, 1)
 	testing.expect(t, tool_jobs_settled(&jobs), "the batch must settle without its stuck call")
 	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Done)
-	testing.expect_value(t, sync.atomic_load(&tool_job_deaf_running), i32(1))
+	testing.expect_value(t, sync.atomic_load(&hold.running), i32(1))
 
 	entries := _test_entries(t, chat)
 	defer session.entries_destroy(entries, context.allocator)
@@ -577,8 +610,8 @@ test_a_call_that_ignores_its_stop_is_answered_and_released :: proc(t: ^testing.T
 	testing.expect_value(t, results[0].outcome, session.Tool_Outcome.Unknown)
 
 	// The worker still owns the job, and it releases it on its way out.
-	tool_job_deaf_release_all()
-	for sync.atomic_load(&tool_job_deaf_returned) == 0 { time.sleep(time.Millisecond) }
+	tool_job_deaf_release_all(&hold)
+	tool_job_test_returned_until(t, &hold)
 	for _ in 0 ..< 10_000 {
 		sync.mutex_guard(&track.mutex)
 		if len(track.allocation_map) == 0 { break }
@@ -595,13 +628,15 @@ test_a_call_that_ignores_its_stop_is_answered_and_released :: proc(t: ^testing.T
 // through its inherited control, and the queued one is refused without ever dispatching.
 @(test)
 test_a_stopped_turn_still_answers_every_call :: proc(t: ^testing.T) {
-	tool_job_hold_reset()
+	if !test_isolate_process(t, #procedure) { return }
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_running"))
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_queued"))
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_running"))
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_queued"))
 	_test_stage_call(t, chat, "call_running", `{}`, "test_running")
 	_test_stage_call(t, chat, "call_queued", `{}`, "test_queued")
 
@@ -611,7 +646,7 @@ test_a_stopped_turn_still_answers_every_call :: proc(t: ^testing.T) {
 	tool_jobs_submit(&jobs, chat, {})
 
 	testing.expect_value(t, tool_job_test_step(&test, &jobs), Tool_Job_Effect.Dispatch)
-	tool_job_test_hold_until(t, 1)
+	tool_job_test_hold_until(t, &hold, 1)
 
 	chat_cancel_request()
 	defer chat_cancel_reset()
@@ -622,7 +657,7 @@ test_a_stopped_turn_still_answers_every_call :: proc(t: ^testing.T) {
 
 	tool_job_test_drain(t, &test, &jobs)
 	testing.expect_value(t, jobs.committed, 2)
-	testing.expect_value(t, sync.atomic_load(&tool_job_hold_running), i32(0))
+	testing.expect_value(t, sync.atomic_load(&hold.running), i32(0))
 
 	entries := _test_entries(t, chat)
 	defer session.entries_destroy(entries, context.allocator)
@@ -640,18 +675,20 @@ test_a_stopped_turn_still_answers_every_call :: proc(t: ^testing.T) {
 // slot is taken by a call that is still running.
 @(test)
 test_an_owner_placed_call_takes_no_worker_slot :: proc(t: ^testing.T) {
-	tool_job_hold_reset()
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	lanes: [TOOL_JOBS_MAX_ACTIVE]u8
+	hold: Tool_Job_Hold_State
+	lanes: [TOOL_JOBS_MAX_ACTIVE]Tool_Job_Hold_Lane
+	for &lane in lanes { lane = tool_job_hold_lane(&hold) }
 	names := [TOOL_JOBS_MAX_ACTIVE]string{"test_one", "test_two", "test_three", "test_four"}
 	for name, index in names {
-		tool_job_test_register(t, &test, tool_job_hold_definition(name, &lanes[index]))
+		tool_job_test_register(t, &test, tool_job_hold_definition(&lanes[index], name))
 		_test_stage_call(t, chat, name, `{}`, name)
 	}
-	owner_tool := tool_job_hold_definition("test_control", nil, tool_job_immediate_execute)
+	control_lane := tool_job_hold_lane(&hold)
+	owner_tool := tool_job_hold_definition(&control_lane, "test_control", tool_job_immediate_execute)
 	owner_tool.placement = .Owner
 	tool_job_test_register(t, &test, owner_tool)
 	_test_stage_call(t, chat, "call_control", `{}`, "test_control")
@@ -664,7 +701,7 @@ test_an_owner_placed_call_takes_no_worker_slot :: proc(t: ^testing.T) {
 	for jobs.active < TOOL_JOBS_MAX_ACTIVE {
 		if tool_job_test_step(&test, &jobs) != .Dispatch { break }
 	}
-	tool_job_test_hold_until(t, i32(TOOL_JOBS_MAX_ACTIVE))
+	tool_job_test_hold_until(t, &hold, i32(TOOL_JOBS_MAX_ACTIVE))
 	testing.expect_value(t, jobs.active, TOOL_JOBS_MAX_ACTIVE)
 	control := jobs.jobs[TOOL_JOBS_MAX_ACTIVE]
 	testing.expect_value(t, control.placement, Tool_Placement.Owner)
@@ -674,7 +711,7 @@ test_an_owner_placed_call_takes_no_worker_slot :: proc(t: ^testing.T) {
 	testing.expect_value(t, control.phase, Tool_Job_Phase.Result_Ready)
 	testing.expect_value(t, jobs.active, TOOL_JOBS_MAX_ACTIVE)
 
-	tool_job_hold_release_all()
+	tool_job_hold_release_all(&hold)
 	tool_job_test_drain(t, &test, &jobs)
 	testing.expect_value(t, jobs.committed, len(names) + 1)
 }
@@ -686,7 +723,6 @@ test_an_owner_placed_call_takes_no_worker_slot :: proc(t: ^testing.T) {
 // stays with the job until the process exits.
 @(test)
 test_a_settled_batch_releases_every_thread_and_byte :: proc(t: ^testing.T) {
-	tool_job_hold_reset()
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
@@ -698,17 +734,18 @@ test_a_settled_batch_releases_every_thread_and_byte :: proc(t: ^testing.T) {
 	mem.tracking_allocator_init(&tracker, context.allocator)
 	defer mem.tracking_allocator_destroy(&tracker)
 
-	first_backend: u8
-	second_backend: u8
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_first", &first_backend))
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_second", &second_backend))
+	hold: Tool_Job_Hold_State
+	first_lane := tool_job_hold_lane(&hold)
+	second_lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&first_lane, "test_first"))
+	tool_job_test_register(t, &test, tool_job_hold_definition(&second_lane, "test_second"))
 	_test_stage_call(t, chat, "call_first", `{"path":"a"}`, "test_first")
 	_test_stage_call(t, chat, "call_second", `{"path":"b"}`, "test_second")
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), mem.tracking_allocator(&tracker))
 	tool_jobs_submit(&jobs, chat, {})
-	tool_job_hold_release_all()
+	tool_job_hold_release_all(&hold)
 	tool_job_test_drain(t, &test, &jobs)
 	testing.expect_value(t, jobs.committed, 2)
 
@@ -727,12 +764,13 @@ test_a_settled_batch_releases_every_thread_and_byte :: proc(t: ^testing.T) {
 // launch anything twice.
 @(test)
 test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
-	tool_job_hold_reset()
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_owned"))
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_owned"))
 	_test_stage_call(t, chat, "call_owned", `{}`, "test_owned")
 
 	first := chat_session_advance(chat)
@@ -749,12 +787,12 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
 	testing.expect_value(t, dispatch.kind, Chat_Effect_Kind.Step_Tools)
 	testing.expect_value(t, dispatch.tool, Tool_Job_Effect.Dispatch)
 	chat_tool_jobs_step(chat, {}, dispatch.tool)
-	tool_job_test_hold_until(t, 1)
+	tool_job_test_hold_until(t, &hold, 1)
 
 	wait := chat_session_advance(chat)
 	testing.expect_value(t, wait.kind, Chat_Effect_Kind.Wait_Tools)
 
-	tool_job_hold_release_all()
+	tool_job_hold_release_all(&hold)
 	for _ in 0 ..< 100_000 {
 		chat_session_observe(chat)
 		effect := chat_session_advance(chat)
@@ -781,20 +819,21 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(t: ^testing.T) {
 // then does the selection propose the commit.
 @(test)
 test_advance_does_not_adopt_a_published_result :: proc(t: ^testing.T) {
-	tool_job_hold_reset()
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_observe"))
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_observe"))
 	_test_stage_call(t, chat, "call_observe", `{}`, "test_observe")
 	chat_tool_jobs_begin(chat, {})
 
 	dispatch := chat_session_advance(chat)
 	chat_tool_jobs_step(chat, {}, dispatch.tool)
-	tool_job_test_hold_until(t, 1)
+	tool_job_test_hold_until(t, &hold, 1)
 
-	tool_job_hold_release_all()
+	tool_job_hold_release_all(&hold)
 	for {
 		sync.mutex_guard(&chat.tool_jobs.jobs[0].mu)
 		if chat.tool_jobs.jobs[0].published { break }
@@ -856,18 +895,20 @@ test_an_escaped_worker_refuses_another_turn :: proc(t: ^testing.T) {
 // effects until every committed call has a result and every producer has retired.
 @(test)
 test_cancelling_chat_drains_session_owned_jobs :: proc(t: ^testing.T) {
-	tool_job_hold_reset()
+	if !test_isolate_process(t, #procedure) { return }
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 	chat := &test.fixture.chat
-	tool_job_test_register(t, &test, tool_job_hold_definition("test_cancel"))
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_cancel"))
 	_test_stage_call(t, chat, "call_cancel", `{}`, "test_cancel")
 	chat_tool_jobs_begin(chat, {})
 
 	dispatch := chat_session_advance(chat)
 	chat_tool_jobs_step(chat, {}, dispatch.tool)
-	tool_job_test_hold_until(t, 1)
+	tool_job_test_hold_until(t, &hold, 1)
 
 	chat_session_request_cancel(chat)
 	defer chat_cancel_reset()

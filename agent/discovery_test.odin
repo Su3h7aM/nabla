@@ -123,6 +123,7 @@ test_discovery_contributes_to_the_catalog_without_overriding_the_user :: proc(t:
 
 @(test)
 test_provider_discovery_refreshes_once_and_serves_the_cache :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	models_dev_state_test(t, "provider-models", proc(t: ^testing.T, _: string) {
 		providers := []Catalog_Provider_Source{discovery_source("proxy", "http://proxy.test/v1", "literal-key")}
 		first := Discovery_Stub {

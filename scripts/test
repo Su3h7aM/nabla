@@ -36,6 +36,9 @@ done
 timeout_secs=300
 collection="-collection:nabla=$NABLA_ROOT"
 
+# Both configurations run: -debug carries extra contract asserts (notably in
+# layout and tui) that release compiles out, while release tests the exact
+# codegen that ships. One mode cannot stand in for the other.
 configs=()
 "$debug_only" || configs+=(release)
 "$release_only" || configs+=(debug)
@@ -47,12 +50,14 @@ failed=()
 for config in "${configs[@]}"; do
 	for pkg in "${packages[@]}"; do
 		[[ -n "$target" && "$target" != "$pkg" ]] && continue
-		extra=()
+		extra=(
+			-define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
+		)
 		[[ $config == debug ]] && extra+=(-debug)
 		[[ -n $sanitize ]] && extra+=("-sanitize:$sanitize")
-		case " $NABLA_SERIAL_TEST_PACKAGES " in
-			*" $pkg "*) extra+=(-define:ODIN_TEST_THREADS=1) ;;
-		esac
+		# The PTY lifecycle test needs the term fault-injection hooks; without
+		# the define its file contributes no tests.
+		[[ "$pkg" == term ]] && extra+=(-define:NABLA_TERM_TEST_HOOKS=true)
 		nabla_step "test $pkg ($config)"
 		timeout --foreground "$timeout_secs" odin test "$pkg" "$collection" "${extra[@]}" || failed+=("$pkg ($config)")
 	done
@@ -61,7 +66,7 @@ done
 for h in "${harnesses[@]}"; do
 	[[ -n "$target" && "$target" != "$h" && "$target" != "$(basename "$h")" ]] && continue
 	nabla_step "harness $h"
-	timeout --foreground "$timeout_secs" odin run "$h" "$collection" -define:NABLA_TERM_TEST_HOOKS=true || failed+=("$h")
+	timeout --foreground "$timeout_secs" odin run "$h" "$collection" || failed+=("$h")
 done
 
 if ((${#failed[@]})); then

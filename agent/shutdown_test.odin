@@ -24,6 +24,7 @@ import "nabla:ai"
 
 @(test)
 test_repeated_cancellation_is_idempotent :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
 	defer chat_test_end(t, &fixture)
@@ -53,6 +54,7 @@ test_repeated_cancellation_is_idempotent :: proc(t: ^testing.T) {
 
 @(test)
 test_cancel_racing_successful_completion_yields_one_status :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	// Completion first: a cancellation arriving after the response completed must
 	// not relabel a successful turn.
 	completed: Chat_Test
@@ -93,6 +95,7 @@ test_cancel_racing_successful_completion_yields_one_status :: proc(t: ^testing.T
 
 @(test)
 test_cancellation_is_not_inherited_by_next_turn :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
 	defer chat_test_end(t, &fixture)
@@ -131,6 +134,7 @@ sigaction_storage :: struct {
 // access if the handler still dereferenced session memory.
 @(test)
 test_signal_handler_outlives_sessions :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	for round in 0 ..< 24 {
 		chat_cancel_reset()
 		// Installation and removal are exercised repeatedly, and the session is
@@ -198,6 +202,7 @@ test_interrupt_generation_rejects_stale_request :: proc(t: ^testing.T) {
 // unconditional.
 @(test)
 test_stale_handler_cannot_cancel_next_turn :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
 	defer chat_test_end(t, &fixture)
@@ -339,6 +344,7 @@ shell_tool_serve :: proc(thread: ^thread.Thread) {
 
 @(test)
 test_shutdown_during_tool_reaps_child_before_session_cleanup :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	allocator := context.temp_allocator
 	workspace := shell_test_workspace(allocator)
 	pid_file := fmt.aprintf("%s/shutdown.pid", workspace, allocator = allocator)
@@ -397,6 +403,7 @@ test_shutdown_during_tool_reaps_child_before_session_cleanup :: proc(t: ^testing
 // runner and the real SIGINT handler, then destroyed.
 @(test)
 test_shutdown_during_request_retires_before_session_cleanup :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	server: Shell_Stall_Server
 	if !shell_stall_start(t, &server) { return }
 	defer shell_stall_stop(&server)

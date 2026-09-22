@@ -81,6 +81,12 @@ test_log_segment_names_are_recognized :: proc(t: ^testing.T) {
 	testing.expect(t, !temporary, "a temporary file is not a segment")
 	_, nondigit := log_segment_name_number("events-00000a.jsonl")
 	testing.expect(t, !nondigit, "a non-digit is not a segment")
+	_, embedded := log_segment_name_number("events-00001x.jsonl")
+	testing.expect(t, !embedded, "a mixed name is not a segment")
+	_, other := log_segment_name_number("other-000001.jsonl")
+	testing.expect(t, !other, "another prefix is not a segment")
+	_, bare := log_segment_name_number("000001.jsonl")
+	testing.expect(t, !bare, "a bare number is not a segment")
 
 	// A run that rotated past six digits keeps its numbers, which is what the
 	// reader sorts by.

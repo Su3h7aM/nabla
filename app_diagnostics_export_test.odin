@@ -2,6 +2,7 @@
 #+private file
 package main
 
+import "core:io"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -9,6 +10,12 @@ import "core:testing"
 
 import "nabla:agent"
 import "nabla:agent/session"
+
+// diagnostics_export_err collects what the export reports, so a passing test
+// leaves the test runner's own output alone.
+diagnostics_export_err :: proc(builder: ^strings.Builder) -> io.Writer {
+	return strings.to_writer(builder)
+}
 
 // The export is driven through the real writer and the real reader: a run is
 // written with a logger, then the bundle is read back off disk. The manifest is part
@@ -78,7 +85,10 @@ test_export_writes_a_bounded_bundle_with_a_manifest :: proc(t: ^testing.T) {
 	run_id := export_test_run(t, logs_root, session_id)
 	defer delete(run_id, context.allocator)
 
-	testing.expect_value(t, diagnostics_export(logs_root, session_id, destination, {}, false, true), 0)
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
+	testing.expect_value(t, diagnostics_export(logs_root, session_id, destination, {}, false, true, diagnostics_export_err(&err_text)), 0)
+	testing.expect(t, strings.contains(strings.to_string(err_text), "exported"), "the export should be reported")
 
 	session_text := export_test_text(t, destination, "session.jsonl")
 	defer delete(session_text, context.allocator)
@@ -116,7 +126,9 @@ test_export_refuses_a_destination_that_already_exists :: proc(t: ^testing.T) {
 
 	// An export never writes where something already is, so a bundle cannot be mixed
 	// with what a previous one left behind.
-	testing.expect_value(t, diagnostics_export(logs_root, session_id, destination, {}, false, true), 1)
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
+	testing.expect_value(t, diagnostics_export(logs_root, session_id, destination, {}, false, true, diagnostics_export_err(&err_text)), 1)
 	testing.expect(t, !os.exists(export_test_join(destination, EXPORT_MANIFEST_NAME)), "nothing is written into an existing directory")
 }
 
@@ -146,7 +158,10 @@ test_export_omits_payloads_unless_asked :: proc(t: ^testing.T) {
 	}
 	if metadata_err != nil { testing.fail_now(t, "the destination could not be created") }
 	_ = os.remove_all(metadata_only)
-	testing.expect_value(t, diagnostics_export(logs_root, session_id, metadata_only, {}, false, true), 0)
+	err_meta, err_payloads: strings.Builder
+	defer strings.builder_destroy(&err_meta)
+	defer strings.builder_destroy(&err_payloads)
+	testing.expect_value(t, diagnostics_export(logs_root, session_id, metadata_only, {}, false, true, diagnostics_export_err(&err_meta)), 0)
 	testing.expect(t, !os.exists(export_test_join(metadata_only, "runs", run_id, EXPORT_CAPTURES_DIRECTORY)), "payloads are not copied by default")
 	manifest := export_test_text(t, metadata_only, "manifest.json")
 	defer delete(manifest, context.allocator)
@@ -159,7 +174,7 @@ test_export_omits_payloads_unless_asked :: proc(t: ^testing.T) {
 	}
 	if payloads_err != nil { testing.fail_now(t, "the destination could not be created") }
 	_ = os.remove_all(with_payloads)
-	testing.expect_value(t, diagnostics_export(logs_root, session_id, with_payloads, {}, true, true), 0)
+	testing.expect_value(t, diagnostics_export(logs_root, session_id, with_payloads, {}, true, true, diagnostics_export_err(&err_payloads)), 0)
 	artifact := export_test_text(t, with_payloads, "runs", run_id, EXPORT_CAPTURES_DIRECTORY, "000001-request.body")
 	defer delete(artifact, context.allocator)
 	testing.expect_value(t, artifact, "payload")
@@ -186,7 +201,9 @@ test_export_selector_narrows_the_session_stream :: proc(t: ^testing.T) {
 	selector := agent.Log_Read_Selector {
 		level = .Error,
 	}
-	testing.expect_value(t, diagnostics_export(logs_root, session_id, destination, selector, false, true), 0)
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
+	testing.expect_value(t, diagnostics_export(logs_root, session_id, destination, selector, false, true, diagnostics_export_err(&err_text)), 0)
 	session_text := export_test_text(t, destination, "session.jsonl")
 	defer delete(session_text, context.allocator)
 	testing.expect_value(t, session_text, "")

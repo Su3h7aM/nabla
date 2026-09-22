@@ -3,6 +3,7 @@ package main
 import "core:crypto/sha2"
 import "core:encoding/json"
 import "core:fmt"
+import "core:io"
 import "core:mem"
 import "core:os"
 import "core:path/filepath"
@@ -107,15 +108,16 @@ diagnostics_export :: proc(
 	selector: agent.Log_Read_Selector,
 	include_payloads: bool,
 	join_okay: bool,
+	stderr: io.Writer,
 ) -> int {
 	if destination == "" {
-		fmt.eprintln("nabla: --export needs a directory")
+		fmt.wprintln(stderr, "nabla: --export needs a directory")
 		return 2
 	}
 	// Exclusive creation: an export never writes into a directory that already holds
 	// something, so a previous bundle cannot be silently mixed with this one.
 	if make_err := os.make_directory(destination, EXPORT_DIRECTORY_PERMISSIONS); make_err != nil {
-		fmt.eprintf("nabla: the export directory could not be created: %s\n", os.error_string(make_err))
+		fmt.wprintf(stderr, "nabla: the export directory could not be created: %s\n", os.error_string(make_err))
 		return 1
 	}
 
@@ -138,7 +140,7 @@ diagnostics_export :: proc(
 		}
 	}
 
-	summary := diagnostics_export_session(&files, &state, logs_root, destination, session_id, selector)
+	summary := diagnostics_export_session(&files, &state, logs_root, destination, session_id, selector, stderr)
 	if !state.written_okay { return 1 }
 	defer {
 		for run_id in state.runs { delete(run_id, context.allocator) }
@@ -168,14 +170,14 @@ diagnostics_export :: proc(
 		files            = files[:],
 		omissions        = omissions[:],
 	}
-	joined_okay := diagnostics_export_manifest(destination, &manifest, &files)
+	joined_okay := diagnostics_export_manifest(destination, &manifest, &files, stderr)
 	if !joined_okay { return 1 }
 	// A --request whose durable half is missing is an incomplete answer, so the
 	// bundle is written, says so, and the command fails.
 	if !export_request_joined(selector, join_okay) { return 1 }
 
-	fmt.eprintf("nabla: exported %d record(s) from %d run(s) into %s\n", summary.records, len(state.runs), destination)
-	if len(omissions) > 0 { fmt.eprintf("nabla: %d omission(s) recorded in the manifest\n", len(omissions)) }
+	fmt.wprintf(stderr, "nabla: exported %d record(s) from %d run(s) into %s\n", summary.records, len(state.runs), destination)
+	if len(omissions) > 0 { fmt.wprintf(stderr, "nabla: %d omission(s) recorded in the manifest\n", len(omissions)) }
 	return 0
 }
 
@@ -190,6 +192,7 @@ diagnostics_export_session :: proc(
 	destination: string,
 	session_id: session.Session_Id,
 	selector: agent.Log_Read_Selector,
+	stderr: io.Writer,
 ) -> agent.Log_Read_Summary {
 	path, joined := export_join(destination, EXPORT_SESSION_NAME, context.allocator)
 	if !joined {
@@ -199,7 +202,7 @@ diagnostics_export_session :: proc(
 	defer delete(path, context.allocator)
 	file, hash, open_okay := export_open(path, context.allocator)
 	if !open_okay {
-		fmt.eprintln("nabla: the session file could not be created")
+		fmt.wprintln(stderr, "nabla: the session file could not be created")
 		state.written_okay = false
 		return {}
 	}
@@ -422,19 +425,19 @@ export_has_captures :: proc(run_directory: string) -> bool {
 // diagnostics_export_manifest writes the manifest last: it describes files that must
 // already exist, so a manifest without them would be a claim about nothing.
 @(private)
-diagnostics_export_manifest :: proc(destination: string, manifest: ^Export_Manifest, files: ^[dynamic]Export_File) -> bool {
+diagnostics_export_manifest :: proc(destination: string, manifest: ^Export_Manifest, files: ^[dynamic]Export_File, stderr: io.Writer) -> bool {
 	path, joined := export_join(destination, EXPORT_MANIFEST_NAME, context.allocator)
 	if !joined { return false }
 	defer delete(path, context.allocator)
 	data, marshal_err := json.marshal(manifest^, {pretty = true, sort_maps_by_key = true}, context.allocator)
 	if marshal_err != nil {
-		fmt.eprintln("nabla: the manifest could not be encoded")
+		fmt.wprintln(stderr, "nabla: the manifest could not be encoded")
 		return false
 	}
 	defer delete(data, context.allocator)
 	file, hash, open_okay := export_open(path, context.allocator)
 	if !open_okay {
-		fmt.eprintln("nabla: the manifest could not be created")
+		fmt.wprintln(stderr, "nabla: the manifest could not be created")
 		return false
 	}
 	if !export_write(file, data, hash) { return false }

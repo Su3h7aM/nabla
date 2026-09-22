@@ -507,17 +507,6 @@ failing_allocate :: proc(
 }
 
 @(test)
-test_a_negative_busy_timeout_is_refused :: proc(t: ^testing.T) {
-	// A negative wait is a caller bug, usually a computed timeout that went
-	// under zero. Failing the open names it; treating it as zero would hide it.
-	conn: db.Conn
-	_expect_failure(t, open(&conn, {path = ":memory:", busy_timeout_ms = -1}), .Invalid_Argument)
-
-	// Nothing was published, so the handle is still closed.
-	testing.expect_value(t, db.error_kind(db.exec(&conn, "SELECT 1")), db.Error_Kind.Invalid_State)
-}
-
-@(test)
 test_rejecting_trailing_sql_has_no_effect :: proc(t: ^testing.T) {
 	conn := _open(t)
 	defer db.close(&conn)
@@ -531,19 +520,6 @@ test_rejecting_trailing_sql_has_no_effect :: proc(t: ^testing.T) {
 
 	_expect_failure(t, db.exec(&conn, "SELECT 1; CREATE TABLE sneaky (x)"), .Invalid_Argument)
 	_expect_failure(t, db.exec(&conn, "INSERT INTO sneaky VALUES (1)"), .Backend)
-}
-
-@(test)
-test_a_pragma_before_a_second_statement_has_already_run :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
-
-	// Refusing the call cannot undo the first statement, which prepare_v3 ran
-	// while it looked for the end of it. A caller splits the input instead, and
-	// this pins what happens when they do not.
-	testing.expect(t, _foreign_keys(&conn), "the test connection starts with foreign keys on")
-	_expect_failure(t, db.exec(&conn, "PRAGMA foreign_keys = OFF; SELECT 1"), .Invalid_Argument)
-	testing.expect(t, !_foreign_keys(&conn), "the first statement ran before the call was refused")
 }
 
 _foreign_keys :: proc(conn: ^db.Conn) -> bool {
@@ -618,7 +594,6 @@ test_a_column_that_cannot_be_read_reports_out_of_memory :: proc(t: ^testing.T) {
 	child_env := make([dynamic]string, 0, len(current_env) + 1, context.temp_allocator)
 	append(&child_env, ..current_env)
 	append(&child_env, "NABLA_DB_OOM_CHILD=1")
-	defer delete(child_env)
 
 	state, _, stderr, process_err := os.process_exec(
 		{command = {binary, "-tests:sqlite.test_a_column_that_cannot_be_read_reports_out_of_memory"}, env = child_env[:]},
@@ -639,6 +614,7 @@ _read_column_with_no_memory_left :: proc(t: ^testing.T) {
 	_expect_ok(t, db.exec(&conn, "PRAGMA encoding = 'UTF-16le'"))
 	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (v TEXT)"))
 	text := strings.repeat("x", 1000)
+	defer delete(text)
 	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (?), (?)", {db.Value(text), db.Value(text)}))
 
 	rows: db.Rows

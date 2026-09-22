@@ -244,7 +244,7 @@ chat_main :: proc() -> int {
 	args := os.args[1:]
 	// A subcommand is recognized before the launch options, because its argument is
 	// a session id rather than a flag.
-	if len(args) > 0 && args[0] == "diagnostics" { return diagnostics_main(args[1:]) }
+	if len(args) > 0 && args[0] == "diagnostics" { return diagnostics_main(args[1:], stdout_writer(), stderr_writer()) }
 	// The ACP agent is a front-end of its own: it takes over the process's standard
 	// streams, so it is a subcommand rather than a launch option.
 	if len(args) > 0 && args[0] == "acp" { return acp_main(args[1:]) }
@@ -313,4 +313,10 @@ main :: proc() {
 // stdout_writer is where a real headless run's answer goes.
 stdout_writer :: proc() -> io.Writer {
 	return io.to_writer(os.to_stream(os.stdout))
+}
+
+// stderr_writer is where a real run's human-facing notices go. Records go to
+// stdout exactly as written; the summary and unreadable evidence go here.
+stderr_writer :: proc() -> io.Writer {
+	return io.to_writer(os.to_stream(os.stderr))
 }

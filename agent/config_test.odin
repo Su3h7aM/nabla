@@ -115,6 +115,7 @@ test_config_env_reference_accepts_only_plain_names :: proc(t: ^testing.T) {
 
 @(test)
 test_config_resolve_credential_reads_env_and_keeps_a_literal :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	literal, literal_ok := config_resolve_credential("sk-literal", context.temp_allocator)
 	testing.expect(t, literal_ok)
 	testing.expect_value(t, literal, "sk-literal")
