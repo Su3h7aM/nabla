@@ -167,7 +167,7 @@ test_build_request_replays_verbatim_response_output_in_order :: proc(t: ^testing
 
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
-	chat_commit_response(chat, request_no, {finish_reason = .Tool_Call}, &usages)
+	chat_commit_response(chat, request_no, 1, {finish_reason = .Tool_Call}, &usages)
 	chat_run_tools(chat, {})
 	chat_session_tools_done(chat, chat.active_turn_id, 1)
 

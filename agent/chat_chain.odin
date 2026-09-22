@@ -355,7 +355,6 @@ chat_chain_claim_send :: proc(chat: ^Chat_Session) -> bool {
 	chain.request_no = row_no
 	chain.previous = row_no
 	chat.active_request = row_no
-	chat.request_attempts = number
 	chain.stage = .Sending
 	return true
 }
@@ -514,6 +513,7 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	chat_finish_request(
 		chat,
 		chain.request_no,
+		chain.attempts,
 		{
 			outcome = .Failed,
 			error = chain.operation_error,
@@ -616,7 +616,6 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 		chat_chain_release(chat)
 		return
 	}
-	chat.request_attempts = chain.attempts
 	// Cancellation wins over the failure the chain was recovering from: the send that would
 	// have followed never happened.
 	reason := chain.decision.reason
@@ -654,7 +653,7 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 		chat_session_feed_error(chat, chain.source, chain.operation_error.detail)
 	}
 	chat_session_retire_operation(chat)
-	chat_commit_response(chat, chain.request_no, send, usages, finish_row = !chain.settled)
+	chat_commit_response(chat, chain.request_no, chain.attempts, send, usages, finish_row = !chain.settled)
 	// The request's outcome is recorded, so the provider's own accounting of it is part of
 	// the session the front-end describes.
 	_observer_request_finished(observer)

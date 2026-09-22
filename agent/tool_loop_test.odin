@@ -653,7 +653,7 @@ test_unusable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T) {
 
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
-	chat_commit_response(chat, request_no, {finish_reason = .Tool_Call}, &usages)
+	chat_commit_response(chat, request_no, 1, {finish_reason = .Tool_Call}, &usages)
 	chat_session_retire_operation(chat)
 
 	entries := _test_entries(t, chat)

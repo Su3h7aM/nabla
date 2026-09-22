@@ -132,6 +132,9 @@ chat_request_transport :: proc(
 chat_commit_response :: proc(
 	chat: ^Chat_Session,
 	request_no: session.Request_No,
+	// attempts is how many sends this logical request used, which is the chain's fact and the
+	// row's to record. It is a parameter rather than session state so the count has one home.
+	attempts: int,
 	result: Chat_Send_Result,
 	usages: ^[dynamic]Chat_Request_Usage,
 	// finish_row is false when the send this response came from was already finished
@@ -156,10 +159,10 @@ chat_commit_response :: proc(
 	// did not commit, because the turn failed or was cancelled, is dropped.
 	chat.pending_notice = .None
 
-	if finish_row { chat_finish_request(chat, request_no, send, usages) }
+	if finish_row { chat_finish_request(chat, request_no, attempts, send, usages) }
 	finished := [3]Log_Field {
 		{key = "outcome", value = session.outcome_name(outcome)},
-		{key = "attempts", value = i64(chat.request_attempts)},
+		{key = "attempts", value = i64(attempts)},
 		{key = "finish_reason", value = chat_finish_reason_text(result.finish_reason)},
 	}
 	// A cancelled request is an ordinary end of the turn; one that failed is an
@@ -251,12 +254,18 @@ chat_commit_response_entries :: proc(chat: ^Chat_Session, request_no: session.Re
 // Every send reaches exactly one of these, including a send an attempt chain
 // abandoned, so no row is left running and each row's numbers are its own.
 @(private)
-chat_finish_request :: proc(chat: ^Chat_Session, request_no: session.Request_No, result: Chat_Send_Result, usages: ^[dynamic]Chat_Request_Usage) {
+chat_finish_request :: proc(
+	chat: ^Chat_Session,
+	request_no: session.Request_No,
+	attempts: int,
+	result: Chat_Send_Result,
+	usages: ^[dynamic]Chat_Request_Usage,
+) {
 	response_json := ""
 	if result.finish_reason != .Unknown {
 		response_json = string(
 			json.marshal(
-				Chat_Request_Response{reason = chat_finish_reason_text(result.finish_reason), attempts = chat.request_attempts},
+				Chat_Request_Response{reason = chat_finish_reason_text(result.finish_reason), attempts = attempts},
 				allocator = context.temp_allocator,
 			) or_else nil,
 		)
