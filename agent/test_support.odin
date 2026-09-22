@@ -164,7 +164,10 @@ _test_perform_request :: proc(
 		switch effect.kind {
 		case .Send_Attempt:
 			chat_chain_claim_send(chat)
-			chat_chain_send(chat, usages)
+			chat_chain_launch_send(chat)
+		case .Await_Provider:
+			// The attempt runs on a worker, so this is a real wait for its terminal outcome.
+			chat_chain_await(chat, usages)
 		case .Commit_Response:
 			chat_chain_commit(chat, usages)
 			return

@@ -33,14 +33,19 @@ Each is required work, not a design choice. Do not treat current behavior as cor
 
 | Gap | Target |
 | --- | --- |
-| Provider stream facts are decoded into typed `Chat_Event`s that `chat_session_apply` applies, but the callback still runs inside the blocking send, so the request path cannot be driven from events alone | Route request/stream facts through the shared owner mailbox so a test can drive the whole turn |
+| The owner mailbox carries the request path's provider facts, but tool completions and compaction completion still publish through their own condition variables | One bounded owner mailbox and wake primitive for input/control, provider facts, tool completions and compaction completion |
 | No aggregate retained-byte budget or session retention quota; child results are exempt from the model budget but not from a storage bound | Add measured byte limits for root, child and session retention with an explicit settlement reserve |
-| Retry waits and the tool-wait cap use separate fixed 50 ms checks; tool completions already wake a condition variable, and a finished compaction is adopted at the next request boundary | One owner wake mechanism with the nearest real deadline; no ordinary polling |
-| WebSocket transport defaults to HTTP and `auto` fallback is partial | Complete the correctness/cache gates, then adopt the target default |
+| Retry waits, the request mailbox wait, and the tool-wait cap use separate fixed 50 ms checks; a finished compaction is adopted at the next request boundary | One owner wake mechanism with the nearest real deadline; no ordinary polling |
+| WebSocket transport defaults to HTTP and `auto` fallback is partial, and the persistent WebSocket is session-owned and borrowed by each attempt's worker rather than owned by one worker across operations | Complete the correctness/cache gates, then adopt the target default and connection ownership |
 | Provider prompt-cache parity and complete provider-error classification are not fully verified | Close the [network](NETWORK_STACK_ARCHITECTURE.md) corrections and measure |
 
 Closed since this document was written:
 
+- Provider facts reach the owner through one bounded mailbox instead of through the send
+that produced them: one attempt is one worker thread, it owns the blocking send, and it
+publishes owned `Chat_Event`s and a terminal outcome. The owner applies them and awaits the
+outcome as the `Await_Provider` effect, and it joins the worker before the frozen bytes are
+reused or released, so the request path is driven from collected facts.
 - Retry and backoff are request state: `Chat_Request_Chain` carries the prepared request,
 the frozen bytes, and the recovery decision across attempts, and the driver performs
 `Send_Attempt`, `Wait_Retry`, `Repair_Context`, and `Commit_Response` one at a time, so a

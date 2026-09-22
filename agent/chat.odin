@@ -45,166 +45,6 @@ Chat_Request_Usage :: struct {
 	usage:     ai.Provider_Usage_Event,
 }
 
-Chat_Runtime_Context :: struct {
-	chat:                ^Chat_Session,
-	source:              Chat_Event_Source,
-	observer:            Chat_Observer,
-	usage_log:           ^[dynamic]Chat_Request_Usage,
-	assistant_open:      bool, // the assistant block is announced once per attempt,
-	finish_reason:       ai.Provider_Finish_Reason, // the provider's own stop reason,
-	// text_exposed and completion_accepted are what this attempt made visible. They are
-	// tracked as the events arrive rather than derived afterwards: a delivered body byte
-	// is not exposure, and only the event itself knows whether the harness took what it
-	// carried.
-	text_exposed:        bool,
-	completion_accepted: bool,
-}
-
-chat_provider_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
-	runtime := cast(^Chat_Runtime_Context)user_data
-	#partial switch value in event {
-	case ai.Provider_Text_Event:
-		applied := chat_session_apply(runtime.chat, Chat_Text_Event{source = runtime.source, text = value.Text})
-		if applied.text_exposed {
-			runtime.text_exposed = true
-			if !runtime.assistant_open {
-				_observer_assistant_begin(runtime.observer)
-				runtime.assistant_open = true
-			}
-			_observer_assistant_text(runtime.observer, value.Text)
-		}
-	case ai.Provider_Reasoning_Event:
-	// Reasoning never displays, and it needs no staging: on the Responses
-	// API the verbatim output array is the replay record, and Chat
-	// Completions has no representation for it at all.
-	case ai.Provider_Completed_Event:
-		// The provider's terminal event arrived; what it means is the owner's decision.
-		runtime.finish_reason = value.Reason
-		applied := chat_session_apply(
-			runtime.chat,
-			Chat_Provider_Completion {
-				source = runtime.source,
-				reason = value.Reason,
-				reason_text = value.Reason_Text,
-				output = value.Raw_Output,
-				calls = value.Tool_Calls,
-			},
-		)
-		runtime.completion_accepted = applied.completion_accepted
-	case ai.Provider_Error_Event:
-		chat_session_apply(runtime.chat, Chat_Failure_Event{source = runtime.source, message = value.Message})
-	case ai.Provider_Usage_Event:
-		if value.Input_Tokens_Present {
-			runtime.chat.last_input_measured = value.Input_Tokens
-		}
-		if runtime.usage_log != nil {
-			append(runtime.usage_log, Chat_Request_Usage{operation = u64(runtime.chat.operation.id), usage = value})
-		}
-	}
-}
-
-// Chat_Attempt_Observation is what one model send observed: the operation's own error and
-// the runtime facts the recovery policy reads. The error owns its evidence and transfers
-// to the caller.
-Chat_Attempt_Observation :: struct {
-	error:               ai.Provider_Operation_Error,
-	finish_reason:       ai.Provider_Finish_Reason,
-	text_exposed:        bool,
-	completion_accepted: bool,
-}
-
-// chat_perform_attempt performs one model send and reports what it observed. It owns the
-// per-attempt runtime and provider observation, so a retry cannot inherit the previous
-// attempt's finish reason, exposure, or byte count. It decides nothing: the caller reads
-// the returned facts into the recovery policy.
-@(private)
-chat_perform_attempt :: proc(
-	chat: ^Chat_Session,
-	connection: ai.Provider_Connection,
-	encoded: ai.Provider_Encoded_Request,
-	websocket_request: bool,
-	observer: Chat_Observer,
-	usages: ^[dynamic]Chat_Request_Usage,
-	source: Chat_Event_Source,
-	options: ai.Provider_Operation_Options,
-) -> Chat_Attempt_Observation {
-	runtime := Chat_Runtime_Context {
-		chat      = chat,
-		source    = source,
-		observer  = observer,
-		usage_log = usages,
-	}
-	log_emit({level = .Info, category = .Provider, event = "attempt.started"})
-
-	// The observation belongs to this attempt: a retry that receives no chunk must not
-	// inherit the previous attempt's byte count. It is only attached when something will
-	// come of it, so a run with diagnostics off and capture off pays nothing per chunk.
-	provider_log: Provider_Log
-	attempt_options := options
-	if log_observation_wanted() { attempt_options.observer = provider_log_observer(&provider_log) } else { attempt_options.observer = {} }
-
-	at := time.tick_now()
-	operation_error: ai.Provider_Operation_Error
-	if websocket_request {
-		operation_error = ai.Provider_WebSocket_Request(chat.provider_websocket, encoded, &runtime, chat_provider_event, attempt_options)
-	} else {
-		operation_error = ai.Provider_Request_Operation_Encoded(connection, encoded, &runtime, chat_provider_event, attempt_options, chat.allocator)
-	}
-	// The response artifact covers the whole attempt, so it is settled as soon as the bytes
-	// stop arriving. A cut-short stream is kept and marked incomplete.
-	if provider_log.response_capture.kind != .Invalid {
-		log_capture_finish(&provider_log.response_capture, operation_error.kind == .None)
-	}
-	// The transport's own account of the attempt goes beside the provider's, because "the
-	// peer refused the request" and "nothing ever left this machine" are different findings
-	// the high-level transport error cannot separate.
-	transfer_phase := "not_reached"
-	request_bytes_accepted := i64(0)
-	request_body_bytes_accepted := i64(0)
-	request_complete := false
-	response_head_received := false
-	declared_body_bytes := i64(0)
-	declared_body_bytes_present := false
-	if provider_log.transfer_seen {
-		transfer_phase = log_provider_transfer_name(provider_log.transfer.stopped_at)
-		request_bytes_accepted = i64(provider_log.transfer.request_bytes_accepted)
-		request_body_bytes_accepted = i64(provider_log.transfer.request_body_bytes_accepted)
-		request_complete = provider_log.transfer.request_complete
-		response_head_received = provider_log.transfer.response_head_received
-		declared_body_bytes = i64(provider_log.transfer.declared_body_bytes)
-		declared_body_bytes_present = provider_log.transfer.declared_body_bytes_present
-	}
-	delivery_name := ai.provider_delivery_state_name(operation_error.delivery)
-	if websocket_request && operation_error.kind == .None { delivery_name = ai.provider_delivery_state_name(.Terminal_Observed) }
-	finished := [14]Log_Field {
-		{key = "error_kind", value = ai.provider_operation_error_name(operation_error.kind)},
-		{key = "delivery", value = delivery_name},
-		{key = "finish_reason", value = chat_finish_reason_text(runtime.finish_reason)},
-		{key = "status", value = i64(operation_error.status)},
-		// The provider's own message, which for a refused request is the only thing that
-		// says why. The transport bounds what it reads, so this is bounded text.
-		{key = "detail", value = operation_error.detail},
-		{key = "response_bytes", value = i64(provider_log.response_bytes)},
-		{key = "transfer_phase", value = transfer_phase},
-		{key = "request_bytes_accepted", value = request_bytes_accepted},
-		{key = "request_body_bytes_accepted", value = request_body_bytes_accepted},
-		{key = "request_complete", value = request_complete},
-		{key = "response_head_received", value = response_head_received},
-		// Presence stays separate from the value: a declared empty body and an undeclared
-		// one are different facts.
-		{key = "declared_body_bytes_present", value = declared_body_bytes_present},
-		{key = "declared_body_bytes", value = declared_body_bytes},
-		{key = "elapsed_ms", value = log_duration_ms(time.tick_since(at))},
-	}
-	log_emit({level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})
-	return {
-		error = operation_error,
-		finish_reason = runtime.finish_reason,
-		text_exposed = runtime.text_exposed,
-		completion_accepted = runtime.completion_accepted,
-	}
-}
-
 // --- running a request -------------------------------------------------------
 
 // chat_request_transport chooses the wire transport for one request chain and freezes the
@@ -625,10 +465,14 @@ chat_run_turn_steered :: proc(
 			if steer != nil && steer.apply != nil { current = steer.apply(steer) }
 			chat_request_begin(chat, current, policy, observer)
 		case .Send_Attempt:
-			// The claim records the attempt and its row; the send follows it, in the same
-			// step, so the durable intent exists before any network work.
+			// The claim records the attempt and its row before any network work, and the
+			// launch hands the frozen bytes to a worker and returns. The send is not observed
+			// here: Await_Provider collects what the worker published and waits for its
+			// terminal outcome.
 			chat_chain_claim_send(chat)
-			chat_chain_send(chat, &usages)
+			chat_chain_launch_send(chat)
+		case .Await_Provider:
+			chat_chain_await(chat, &usages)
 		case .Wait_Retry:
 			chat_chain_wait(chat)
 		case .Repair_Context:

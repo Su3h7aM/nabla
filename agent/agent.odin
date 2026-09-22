@@ -12,8 +12,11 @@ Chat_Effect_Kind :: enum {
 	// Start_Request is the request boundary and freeze: claim, prepare, admit, and encode
 	// one request. It sends nothing; the first attempt is an effect of its own.
 	Start_Request,
-	// Send_Attempt claims one attempt and performs one provider send.
+	// Send_Attempt claims one attempt's durable row and launches its request worker.
 	Send_Attempt,
+	// Await_Provider collects the facts the attempt's worker published and waits for
+	// its terminal outcome.
+	Await_Provider,
 	// Wait_Retry waits out the chain's backoff before its next attempt.
 	Wait_Retry,
 	// Repair_Context installs a ready summary and rebuilds the refused payload.
@@ -112,9 +115,10 @@ chat_session_advance_at :: proc(chat: ^Chat_Session, now: time.Tick) -> Chat_Eff
 		case .Ready:
 			return Chat_Effect{kind = .Send_Attempt, turn_id = chat.active_turn_id}
 		case .Sending:
-			// The claim and the send are one effect step, so selection never observes this
-			// stage; a selection that does is a bug, and proposes nothing.
-			return chat_effect_none()
+			// The attempt's worker is live. Whatever it has published is collected, and the
+			// stage outlives this effect: the producer owns the send until it publishes its
+			// terminal outcome.
+			return Chat_Effect{kind = .Await_Provider, turn_id = chat.active_turn_id}
 		case .Backoff:
 			return Chat_Effect{kind = .Wait_Retry, turn_id = chat.active_turn_id}
 		case .Repairing:
@@ -478,7 +482,8 @@ chat_session_feed_error :: proc(chat: ^Chat_Session, source: Chat_Event_Source, 
 	return true
 }
 
-// Chat_Text_Event is one streamed fragment of the response being assembled.
+// Chat_Text_Event is one streamed fragment of the response being assembled. text is owned
+// by the event.
 Chat_Text_Event :: struct {
 	source: Chat_Event_Source,
 	text:   string,
@@ -486,7 +491,7 @@ Chat_Text_Event :: struct {
 
 // Chat_Provider_Completion is one completed provider response as the endpoint delivered it:
 // the provider's own stop reason and the artifacts it produced. It is a fact, not a decision;
-// chat_session_apply decides what the response means.
+// chat_session_apply decides what the response means. Its strings and calls are owned.
 Chat_Provider_Completion :: struct {
 	source:      Chat_Event_Source,
 	reason:      ai.Provider_Finish_Reason,
@@ -496,19 +501,50 @@ Chat_Provider_Completion :: struct {
 }
 
 // Chat_Failure_Event is a failure the provider, the transport, or a layer above them
-// reported for the running attempt.
+// reported for the running attempt. message is owned.
 Chat_Failure_Event :: struct {
 	source:  Chat_Event_Source,
 	message: string,
 }
 
+// Chat_Usage_Event is the endpoint's own accounting for the running request. A provider may
+// report usage more than once for one response, so the last measurement is the one that stands.
+Chat_Usage_Event :: struct {
+	usage: ai.Provider_Usage_Event,
+}
+
 // Chat_Event is one external fact delivered to the owner for application. A provider
-// callback decodes the wire event into one of these; applying it is the only way an
-// external fact changes turn state.
+// callback decodes the wire event into one of these, and applying it is the only way an
+// external fact changes turn state. A queued event owns its payload: the producer clones it,
+// the owner applies it by borrowing, and chat_event_destroy releases it.
 Chat_Event :: union {
 	Chat_Text_Event,
 	Chat_Provider_Completion,
 	Chat_Failure_Event,
+	Chat_Usage_Event,
+}
+
+// chat_event_destroy releases an event's owned payload. An event is released with the
+// allocator it was cloned with, which for a queued event is the mailbox's, not the session's.
+chat_event_destroy :: proc(event: ^Chat_Event, allocator: mem.Allocator) {
+	#partial switch value in event^ {
+	case Chat_Text_Event:
+		delete(value.text, allocator)
+	case Chat_Provider_Completion:
+		delete(value.reason_text, allocator)
+		delete(value.output, allocator)
+		for call in value.calls {
+			delete(call.ID, allocator)
+			delete(call.Item_ID, allocator)
+			delete(call.Name, allocator)
+			delete(call.Arguments, allocator)
+		}
+		delete(value.calls, allocator)
+	case Chat_Failure_Event:
+		delete(value.message, allocator)
+	case Chat_Usage_Event:
+	}
+	event^ = nil
 }
 
 // Chat_Apply is what applying one event did, as the attempt runtime needs it: whether the
@@ -519,10 +555,12 @@ Chat_Apply :: struct {
 }
 
 // chat_session_apply applies one external event to state, checking identity and transition
-// legality. The provider callback decides nothing: it decodes, and this is where a completed
-// response becomes staged calls, feedback, a completion, or a failure.
-chat_session_apply :: proc(chat: ^Chat_Session, event: Chat_Event) -> Chat_Apply {
-	switch value in event {
+// legality. The worker that receives a provider event decides nothing: it decodes, and this
+// is where a completed response becomes staged calls, feedback, a completion, or a failure.
+// Applying borrows the event; releasing it stays with its owner.
+chat_session_apply :: proc(chat: ^Chat_Session, event: ^Chat_Event) -> Chat_Apply {
+	if event == nil { return {} }
+	switch value in event^ {
 	case Chat_Text_Event:
 		return {text_exposed = chat_session_feed_text(chat, value.source, value.text)}
 	case Chat_Failure_Event:
@@ -534,6 +572,10 @@ chat_session_apply :: proc(chat: ^Chat_Session, event: Chat_Event) -> Chat_Apply
 		} else {
 			chat_session_feed_error(chat, value.source, value.message)
 		}
+		return {}
+	case Chat_Usage_Event:
+		// Usage is a measurement the driver records for the request, not a turn
+		// transition; nothing about the turn changes here.
 		return {}
 	case Chat_Provider_Completion:
 		// One response feeds one path: tool handoff when the provider assembled calls, plain

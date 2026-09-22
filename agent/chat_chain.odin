@@ -2,6 +2,7 @@ package agent
 
 import "core:fmt"
 import "core:log"
+import "core:thread"
 
 import "nabla:agent/session"
 import "nabla:ai"
@@ -10,17 +11,18 @@ import "nabla:ai"
 //
 // One logical request is a chain of bounded attempts. The chain is session state because
 // the driver performs one effect at a time and returns to its loop between them: a retry
-// is request state under Awaiting_Model, not a nested loop. The chain owns the prepared
-// request, the frozen bytes, and the last attempt's error, and chat_chain_release is the
-// one place they are freed.
+// is request state under Awaiting_Model, not a nested loop. Each attempt is one worker
+// thread, and the chain owns the prepared request, the frozen bytes, the worker's handle,
+// and the last attempt's error. chat_chain_release is the one place they are freed.
 
 // Chat_Request_Stage is where a chain is between attempts. Only the stages that must
 // survive a return to the driver are here, and each stage names exactly one effect.
 Chat_Request_Stage :: enum {
 	// Ready: the next attempt may be sent.
 	Ready,
-	// Sending: the attempt was claimed and its durable row is written. The send follows
-	// in the same effect step, so selection never observes this stage.
+	// Sending: the attempt was claimed, its row is written, and its worker is live. The
+	// owner collects what the worker has published and waits for its terminal outcome; the
+	// stage changes only once the owner has that outcome.
 	Sending,
 	// Backoff: the chain waits out the delay before its next attempt.
 	Backoff,
@@ -40,6 +42,10 @@ Chat_Request_Chain :: struct {
 	policy:              Chat_Retry_Policy,
 	observer:            Chat_Observer,
 	options:             ai.Provider_Operation_Options,
+	// worker is the thread running the current attempt, nil when none is live. worker_data
+	// is the argument the owner allocated for it, freed only after the join.
+	worker:              ^thread.Thread,
+	worker_data:         ^Chat_Request_Worker,
 	prep:                Chat_Request_Prep,
 	encoded:             ai.Provider_Encoded_Request,
 	websocket_request:   bool,
@@ -51,6 +57,9 @@ Chat_Request_Chain :: struct {
 	finish_reason:       ai.Provider_Finish_Reason,
 	text_exposed:        bool,
 	completion_accepted: bool,
+	// assistant_open records that the observer was told a response is streaming. A retry
+	// after partial text continues the same response, so it opens once per chain.
+	assistant_open:      bool,
 	// source is the event source of the last attempt, which its staged output commits under.
 	source:              Chat_Event_Source,
 	// request_no is the last attempt's row, which its response is committed under.
@@ -69,13 +78,33 @@ Chat_Request_Chain :: struct {
 	decision:            Chat_Recovery_Decision,
 }
 
-// chat_chain_release frees everything the chain owns. The zero chain is inert, so
-// releasing one that never ran is safe.
+// chat_chain_release frees everything the chain owns, joining a live worker first. The
+// zero chain is inert, so releasing one that never ran is safe.
 chat_chain_release :: proc(chat: ^Chat_Session) {
+	chat_chain_join(chat)
 	chat_request_prep_destroy(&chat.chain.prep, chat.allocator)
-	ai.Provider_Operation_Error_Destroy(&chat.chain.operation_error, chat.allocator)
+	ai.Provider_Operation_Error_Destroy(&chat.chain.operation_error, chat.mailbox.allocator)
 	delete(chat.chain.encoded.Body, chat.allocator)
 	chat.chain = {}
+	// Nothing can publish after the join, so what the mailbox still holds is the owner's to
+	// release. A released chain leaves the mailbox empty for the next request.
+	mailbox_reset(&chat.mailbox)
+}
+
+// chat_chain_join waits for the attempt's worker to finish and frees its argument. The
+// worker's last mailbox access is its terminal publication, so after the join the frozen
+// bytes it borrowed are the owner's to reuse or release.
+@(private)
+chat_chain_join :: proc(chat: ^Chat_Session) {
+	if chat.chain.worker != nil {
+		thread.join(chat.chain.worker)
+		thread.destroy(chat.chain.worker)
+		chat.chain.worker = nil
+	}
+	if chat.chain.worker_data != nil {
+		free(chat.chain.worker_data, chat.allocator)
+		chat.chain.worker_data = nil
+	}
 }
 
 // chat_chain_stop latches why the chain stopped and moves it to its commit. Selection
@@ -303,6 +332,10 @@ chat_chain_claim_send :: proc(chat: ^Chat_Session) -> bool {
 	chat_session_begin_operation(chat)
 	chain.source = chat_session_event_source(chat)
 	chain.settled = false
+	// Exposure and acceptance belong to one attempt: a retry that produces nothing must not
+	// inherit the exposure or the accepted completion of the attempt before it.
+	chain.text_exposed = false
+	chain.completion_accepted = false
 	attempt := Chat_Attempt {
 		number   = number,
 		recovery = chain.previous == nil ? .Initial : chain.recovery_kind,
@@ -324,11 +357,12 @@ chat_chain_claim_send :: proc(chat: ^Chat_Session) -> bool {
 	return true
 }
 
-// chat_chain_send performs the claimed attempt and reads the recovery decision out of what
-// it observed. The provider callback has already applied the response's events, so this
-// decides only what happens next: stop, wait, or repair.
+// chat_chain_launch_send starts the worker for a claimed attempt: the claim wrote the row,
+// and this hands the frozen bytes to the transport and returns without waiting. Selection
+// never sees the send; the owner collects the worker's facts and awaits its outcome under
+// Await_Provider.
 @(private)
-chat_chain_send :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) {
+chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 	chain := &chat.chain
 	if !chain.active || chain.stage != .Sending { return }
 	// This attempt's correlation: the request number became durable in the claim, and the
@@ -350,13 +384,105 @@ chat_chain_send :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usag
 	chat.last_estimate = chain.prep.estimate
 	_observer_request_prepared(chain.observer)
 
-	// The runtime belongs to one attempt: a retry that produces nothing must not inherit
-	// the finish reason, the exposure, or the accepted completion of the attempt before it.
-	observation := chat_perform_attempt(chat, chain.connection, chain.encoded, chain.websocket_request, chain.observer, usages, chain.source, chain.options)
-	chain.operation_error = observation.error
-	chain.finish_reason = observation.finish_reason
-	chain.text_exposed = observation.text_exposed
-	chain.completion_accepted = observation.completion_accepted
+	// The attempt runs on its own thread so the owner can keep observing while the send
+	// blocks, and its facts reach the owner through the mailbox. The worker borrows the
+	// frozen bytes; the join in chat_chain_await is what makes their reuse safe.
+	worker := new(Chat_Request_Worker, chat.allocator)
+	worker^ = Chat_Request_Worker {
+		allocator         = chat.mailbox.allocator,
+		mailbox           = &chat.mailbox,
+		interrupt         = chain.options.interrupt,
+		source            = chain.source,
+		connection        = chain.connection,
+		websocket         = chat.provider_websocket,
+		websocket_request = chain.websocket_request,
+		encoded           = chain.encoded,
+		options           = chain.options,
+		logging           = binding,
+	}
+	new_thread := thread.create(chat_request_worker_main, name = "nabla-request")
+	if new_thread == nil {
+		// No producer exists, so nothing will send. The row that was already written stays
+		// as the record of a send that was attempted but not performed.
+		free(worker, chat.allocator)
+		chat_session_fail_turn(chat, "the request worker could not be started")
+		chat_chain_stop(chat, .Harness_Failure)
+		return
+	}
+	new_thread.data = worker
+	thread.start(new_thread)
+	chain.worker = new_thread
+	chain.worker_data = worker
+}
+
+// chat_chain_await collects the facts the attempt's worker has published and adopts its
+// terminal outcome. Nothing is decided while the producer can still publish: the worker's
+// last act is the terminal, so every fact it observed arrives before the decision, and the
+// join that follows is what lets the frozen bytes be reused or released.
+@(private)
+chat_chain_await :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) {
+	chain := &chat.chain
+	if !chain.active || chain.stage != .Sending { return }
+	for {
+		event, ok := mailbox_take(&chat.mailbox)
+		if !ok { break }
+		chat_chain_apply_event(chat, usages, &event)
+		chat_event_destroy(&event, chat.mailbox.allocator)
+	}
+	terminal, published := mailbox_take_terminal(&chat.mailbox)
+	if !published {
+		// A wakeup is a hint: the next selection rechecks the stage and comes back here.
+		mailbox_wait(&chat.mailbox)
+		return
+	}
+	chat_chain_join(chat)
+	chain.operation_error = terminal.error
+	chain.finish_reason = terminal.finish_reason
+	chat_chain_settle(chat, usages)
+}
+
+// chat_chain_apply_event gives one collected provider fact to state and tells the observer
+// about text the turn took. Only the owner applies events, so this is where an external
+// fact changes turn state; the worker that received it decided nothing.
+@(private)
+chat_chain_apply_event :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage, event: ^Chat_Event) {
+	if usage, is_usage := event^.(Chat_Usage_Event); is_usage {
+		// The endpoint's own accounting of the request, kept against its usage log.
+		chat_session_observe_usage(chat, usages, usage.usage)
+		return
+	}
+	chain := &chat.chain
+	applied := chat_session_apply(chat, event)
+	if applied.completion_accepted { chain.completion_accepted = true }
+	if !applied.text_exposed { return }
+	if !chain.assistant_open {
+		_observer_assistant_begin(chain.observer)
+		chain.assistant_open = true
+	}
+	if text, is_text := event^.(Chat_Text_Event); is_text {
+		_observer_assistant_text(chain.observer, text.text)
+	}
+}
+
+// chat_session_observe_usage records the endpoint's own accounting of the running request:
+// the last input measurement, and one usage entry per report for the request's usage log.
+@(private)
+chat_session_observe_usage :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage, usage: ai.Provider_Usage_Event) {
+	if usage.Input_Tokens_Present { chat.last_input_measured = usage.Input_Tokens }
+	append(usages, Chat_Request_Usage{operation = u64(chat.operation.id), usage = usage})
+}
+
+// chat_chain_settle turns the terminal outcome into the next stage. The row is finished
+// before anything is waited on or sent again: how the send failed, and what the harness
+// decided to do about it, are in the store before the decision is acted on, with the numbers
+// and the usage of the send that produced them.
+@(private)
+chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) {
+	chain := &chat.chain
+	// This attempt's correlation: the request number became durable in the claim, and the
+	// attempt number is counted there too. Everything this settles belongs to that attempt.
+	binding: Log_Binding
+	context.logger = log_rebind(&binding, log_correlation_for(chat, chain.attempts))
 	// The send is over, so the policy answers from the facts the layers observed: what the
 	// operation reported, what this attempt exposed, and whether the turn or the store had
 	// already failed.
@@ -443,8 +569,9 @@ chat_chain_wait :: proc(chat: ^Chat_Session) {
 		chat_chain_stop(chat, .Cancelled)
 		return
 	}
-	// The attempt is over, so the next one owns its own error.
-	ai.Provider_Operation_Error_Destroy(&chain.operation_error, chat.allocator)
+	// The attempt is over, so the next one owns its own error. The error came from the
+	// attempt's worker, so it is released with the allocator the worker allocated it from.
+	ai.Provider_Operation_Error_Destroy(&chain.operation_error, chat.mailbox.allocator)
 	chain.stage = .Ready
 }
 
@@ -462,7 +589,7 @@ chat_chain_repair :: proc(chat: ^Chat_Session) {
 	chain.repaired = true
 	chain.recovery_kind = .Checkpoint_Repair
 	chat_session_clear_attempt(chat)
-	ai.Provider_Operation_Error_Destroy(&chain.operation_error, chat.allocator)
+	ai.Provider_Operation_Error_Destroy(&chain.operation_error, chat.mailbox.allocator)
 	chain.stage = .Ready
 }
 

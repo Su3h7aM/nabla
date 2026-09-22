@@ -1,6 +1,7 @@
 package agent
 
 import "core:mem"
+import "core:os"
 import "core:strings"
 import "core:unicode/utf8"
 
@@ -96,6 +97,11 @@ Chat_Session :: struct {
 	// state, not a nested loop. It owns the prepared request and the frozen bytes until
 	// chat_chain_commit releases them.
 	chain:                        Chat_Request_Chain,
+
+	// mailbox is how the request worker hands facts to the owner thread. It is fixed-size,
+	// owns only its queued payloads, and allocates them with its own allocator, which must be
+	// safe to use from a worker.
+	mailbox:                      Owner_Mailbox,
 
 	// storage_failed latches a durable write that did not land. A session that
 	// could not record its own history accepts no further work: continuing would
@@ -205,19 +211,23 @@ chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspa
 	// here is a programming error; the registry tests hold them to validity.
 	// A partial registry is never installed: make destroys it before returning.
 	tools, _ := tool_registry_make(allocator)
-	return Chat_Session {
-		store = store,
-		compact_retry = chat_compact_retry_policy_default(),
-		id = session.Session_Id(strings.clone(string(id), allocator)),
-		allocator = allocator,
-		next_turn_id = 1,
+	chat := Chat_Session {
+		store             = store,
+		compact_retry     = chat_compact_retry_policy_default(),
+		id                = session.Session_Id(strings.clone(string(id), allocator)),
+		allocator         = allocator,
+		next_turn_id      = 1,
 		next_operation_id = 1,
 		partial_assistant = make([dynamic]u8, 0, allocator),
-		pending_calls = make([dynamic]Chat_Tool_Call, 0, allocator),
-		effort_levels = make([dynamic]string, 0, allocator),
-		workspace = strings.clone(workspace, allocator),
-		tools = tools,
+		pending_calls     = make([dynamic]Chat_Tool_Call, 0, allocator),
+		effort_levels     = make([dynamic]string, 0, allocator),
+		workspace         = strings.clone(workspace, allocator),
+		tools             = tools,
 	}
+	// A worker publishes through the mailbox, so its payloads come from the process heap
+	// rather than from the allocator the owner may be writing through at the same time.
+	mailbox_init(&chat.mailbox, os.heap_allocator())
+	return chat
 }
 
 chat_tool_call_destroy :: proc(call: ^Chat_Tool_Call, allocator: mem.Allocator) {

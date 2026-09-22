@@ -580,16 +580,14 @@ test_usage_is_collected_per_request :: proc(t: ^testing.T) {
 
 	usages := make([dynamic]Chat_Request_Usage, 0, context.temp_allocator)
 	defer delete(usages)
-	runtime := Chat_Runtime_Context {
-		chat      = chat,
-		usage_log = &usages,
-	}
-	chat_provider_event(
-		&runtime,
+	chat_session_observe_usage(
+		chat,
+		&usages,
 		ai.Provider_Usage_Event{Input_Tokens = 12000, Input_Tokens_Present = true, Cached_Input_Tokens = 9000, Cached_Input_Tokens_Present = true},
 	)
-	chat_provider_event(
-		&runtime,
+	chat_session_observe_usage(
+		chat,
+		&usages,
 		ai.Provider_Usage_Event{Input_Tokens = 12100, Input_Tokens_Present = true, Cached_Input_Tokens = 11800, Cached_Input_Tokens_Present = true},
 	)
 	testing.expect_value(t, len(usages), 2)
