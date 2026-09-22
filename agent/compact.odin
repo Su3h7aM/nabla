@@ -298,6 +298,10 @@ Compact_Job :: struct {
 	// backing is what the job struct itself was allocated with, which is the session's
 	// allocator: the control object belongs to the thread that drives the session.
 	backing:    mem.Allocator,
+	// finished is the worker's word that everything below is on the struct. It is published
+	// through the owner wake and read under it, so the owner learns the job ended without
+	// asking the thread library; the join that follows the flag proves the payload.
+	finished:   bool,
 	output:     [dynamic]u8, // owner after join
 	reason:     ai.Provider_Finish_Reason,
 	tool_calls: int,
@@ -415,6 +419,10 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 		job.error_text = job.operation.detail
 		job.operation.detail = ""
 	}
+	// The result is complete. Publishing it here rather than letting the owner ask whether the
+	// thread has exited is what makes this job return through the same wake every other producer
+	// uses, and what frees its storage at the next observation instead of at the next boundary.
+	owner_wake_publish(&job.finished)
 }
 
 @(private)
@@ -801,15 +809,16 @@ chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> boo
 	return true
 }
 
-// chat_compact_poll adopts a finished job without waiting for one. It is called at
-// every control boundary, so a summary that arrives while the agent is busy is
-// picked up as soon as there is a safe place to put it.
+// chat_compact_poll adopts a finished job without waiting for one. The worker publishes its
+// completion through the owner wake, so this is read wherever the owner observes, which is
+// every step of a turn as well as every control boundary: a summary that arrives while the
+// agent is busy is picked up as soon as there is a safe place to put it.
 @(private)
 chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
 	control := &chat.compact
 	job := control.job
 	if job == nil || job.thread == nil { return }
-	if !thread.is_done(job.thread) { return }
+	if !owner_wake_published(&job.finished) { return }
 
 	thread.join(job.thread)
 	thread.destroy(job.thread)

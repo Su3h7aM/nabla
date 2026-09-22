@@ -49,6 +49,24 @@ owner_wake_notify :: proc() {
 	sync.cond_broadcast(&chat_wake.cond)
 }
 
+// owner_wake_publish sets a flag the owner reads under the same mutex and wakes every waiter.
+// A producer whose only fact is that flag uses this instead of keeping a lock beside the
+// rendezvous: the mutex it takes here is what the owner's check of the flag is ordered by.
+owner_wake_publish :: proc(flag: ^bool) {
+	sync.mutex_lock(&chat_wake.mutex)
+	flag^ = true
+	owner_wake_notify()
+	sync.mutex_unlock(&chat_wake.mutex)
+}
+
+// owner_wake_published reads a flag published with owner_wake_publish.
+owner_wake_published :: proc(flag: ^bool) -> bool {
+	sync.mutex_lock(&chat_wake.mutex)
+	published := flag^
+	sync.mutex_unlock(&chat_wake.mutex)
+	return published
+}
+
 // owner_wake_wait releases the wake mutex and blocks until a producer signals, the deadline
 // arrives, or a signal interrupts the wait. The caller holds the wake mutex and has already
 // checked the predicate it is waiting on, so a publication that lands while it checks either

@@ -458,6 +458,10 @@ chat_run_turn_steered :: proc(
 		// a pure read of state. The owner observes the clock once and both steps use it.
 		now := time.tick_now()
 		chat_session_observe_at(chat, now)
+		// A summarizer that finished is adopted here, where its completion is read, so the job's
+		// storage and its thread are released without waiting for a request boundary. The summary
+		// itself still installs at a boundary, because a frozen prefix is chosen there.
+		chat_compact_poll(chat, observer)
 		// Input the front-end queued while the turn ran is applied before the state is read,
 		// so the selector sees a turn that still has a message to answer.
 		if steer != nil { chat_steering_observe(chat, observer, steer) }
