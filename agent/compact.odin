@@ -860,8 +860,11 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 		// A chain that ended for a reason the same configuration cannot fix is not started
 		// again automatically: the credentials, the quota, or the request itself has to change.
 		if decision.reason == .Terminal_Failure && chat_compact_suppressible(job) { control.suppressed = true }
+		// The sentence is built before the job is released: it borrows the job's own failure
+		// text, which releasing the job frees.
+		message := fmt.tprintf("compaction produced nothing usable: %s", reason)
 		chat_compact_failed_job(control, job)
-		_observer_message(observer, .Warning, fmt.tprintf("compaction produced nothing usable: %s", reason))
+		_observer_message(observer, .Warning, message)
 		return
 	}
 
