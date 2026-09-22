@@ -20,6 +20,21 @@ Frame_Error :: enum {
 frame_decoder_init :: proc(max_frame_bytes := MAX_FRAME_BYTES, allocator := context.allocator) -> Frame_Decoder {
 	return Frame_Decoder{buffer = make([dynamic]u8, 0, max_frame_bytes + 1, allocator), max_frame_bytes = max_frame_bytes, allocator = allocator}
 }
+// frame_error_text says what a decoder refused, in the words the client reads.
+frame_error_text :: proc(err: Frame_Error) -> string {
+	switch err {
+	case .None:
+		return ""
+	case .Frame_Too_Large:
+		return "the message exceeds the maximum frame size"
+	case .Invalid_UTF8:
+		return "the message is not valid UTF-8"
+	case .Empty_Frame:
+		return "the message is empty"
+	}
+	return "the message could not be read"
+}
+
 frame_decoder_destroy :: proc(decoder: ^Frame_Decoder) { delete(decoder.buffer); decoder^ = {} }
 frame_strings_destroy :: proc(frames: ^[dynamic]string, allocator := context.allocator) { for frame in frames^ { delete(frame, allocator) }; delete(frames^) }
 frame_decoder_feed :: proc(decoder: ^Frame_Decoder, chunk: []byte, frames: ^[dynamic]string) -> Frame_Error {

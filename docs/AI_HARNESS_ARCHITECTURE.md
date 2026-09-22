@@ -24,6 +24,7 @@ Then read the contract for the behavior being changed:
 | Future dynamic delegation | [Subagents](SUBAGENT_ARCHITECTURE.md) |
 | Transport and provider boundaries | [Network](NETWORK_STACK_ARCHITECTURE.md) |
 | Context logger, diagnostics, capture | [Diagnostics](LOGGING_ARCHITECTURE.md) |
+| ACP frontend: protocol layer, stdio loop, session mapping | [ACP frontend](ACP_ARCHITECTURE.md) |
 
 Each contract owns its subject. Link to it instead of copying its rules into another
 plan. Change conflicting contracts together; do not add a paragraph that supersedes
@@ -116,10 +117,11 @@ adopting the machinery that another runtime uses to enforce it.
 | root `nabla` | Process lifetime, configuration wiring, signals, frontends, ACP adaptation | Duplicate retry, admission or projection policy |
 
 `acp` is a protocol boundary, not an agent dependency. Only root combines foundation
-and harness. Moving the frontend behind ACP is future integration work, not a reason
-to build an RPC layer inside `agent` now. Headless and interactive callers drive the
-same machine. The caller-supplied writer and semantic observer carry presentation
-output; neither is a policy hook or a substitute for the session record.
+and harness. The ACP frontend is a root frontend beside the interactive and headless
+ones: it drives the same session machine, and the `acp` package holds the protocol facts
+it speaks. Headless and interactive callers drive the same machine. The caller-supplied
+writer and semantic observer carry presentation output; neither is a policy hook or a
+substitute for the session record. See [ACP frontend](ACP_ARCHITECTURE.md).
 
 Prefer extending the package that owns a subject. A new subpackage needs a distinct
 contract and consumer, not a folder for a large struct. Foundational and protocol

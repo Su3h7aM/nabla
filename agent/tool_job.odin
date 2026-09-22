@@ -395,6 +395,10 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	}
 	received := [2]Log_Field{{key = "tool", value = job.name}, {key = "arguments_bytes", value = i64(len(job.call.arguments))}}
 	log_emit({level = .Info, category = .Tool, event = "tool.call_received", fields = received[:]})
+	// The call is announced before anything decides whether it runs, so a front-end sees
+	// the proposal itself. The result that follows names the same call id whatever the
+	// harness decided here.
+	_observer_tool_call(observer, Chat_Tool_Event{call_id = job.call_id, name = job.name, arguments = job.call.arguments})
 
 	// A cancelled turn still answers every committed call, so a call that never ran
 	// becomes a not-executed result rather than a silent gap in the record.

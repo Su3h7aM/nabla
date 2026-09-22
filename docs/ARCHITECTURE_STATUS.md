@@ -29,6 +29,10 @@ reimplementing something that exists. Update it when the gap it names closes.
   read-only `diagnostics` reader/export.
 - Native HTTP/1.1, TLS 1.3, SSE, DNS and Responses WebSocket with provider delivery
   evidence on the WebSocket path.
+- The ACP frontend: `nabla acp` speaks ACP v1 on stdio with `initialize`,
+  `session/new`, `session/load` (with a replayed conversation), `session/prompt`,
+  `session/cancel`, and `session/update` for assistant text, harness notices, tool calls,
+  and context usage. See the [ACP frontend](ACP_ARCHITECTURE.md).
 
 ## Gaps against the target
 
@@ -87,7 +91,9 @@ Do not build these without a task that requires them:
 - Durable input inbox or restart-surviving steering.
 - Public Lua task handles (`tasks.start/await/cancel`) and Code Mode discovery helpers.
 - Subagent tool, process protocol and supervision.
-- ACP as the frontend path into the harness.
+- Tool call permission requests over ACP, client filesystem and terminal delegation,
+  client-provided MCP servers, session modes and config options, and more than one live
+  session per process. See the [ACP frontend](ACP_ARCHITECTURE.md).
 - Feedback, rating, evaluation or auto-improvement storage and services.
 
 ## Known non-goals

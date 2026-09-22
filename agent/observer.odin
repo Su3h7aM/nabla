@@ -24,6 +24,12 @@ Chat_Observer :: struct {
 	assistant_flush:  proc(user_data: rawptr),
 	assistant_end:    proc(user_data: rawptr),
 	user_text:        proc(user_data: rawptr, text: string),
+	// tool_call is called once for each call the harness admits, before the call runs
+	// and before its result exists. A call that is refused or cancelled announces itself
+	// here too and still reports a result, so a front-end sees every committed call
+	// exactly once as pending and exactly once as settled. Calls a Code Mode script makes
+	// are not reported: the script's own result is what the turn shows.
+	tool_call:        proc(user_data: rawptr, event: Chat_Tool_Event),
 	tool_result:      proc(user_data: rawptr, name: string, result: ^Tool_Result),
 	message:          proc(user_data: rawptr, kind: Chat_Message_Kind, text: string),
 	usage:            proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event),
@@ -44,6 +50,15 @@ Chat_Observer :: struct {
 	// rather than stalled. A chain whose sends all succeeded, and one that stops, calls
 	// it not at all, and the send that follows clears whatever the front-end showed.
 	retry_scheduled:  proc(user_data: rawptr, event: Chat_Retry_Event),
+}
+
+// Chat_Tool_Event is one tool call the harness admitted. The strings are borrowed and
+// live until the batch that admitted the call is released, which is after the result of
+// that call has been reported.
+Chat_Tool_Event :: struct {
+	call_id:   string,
+	name:      string,
+	arguments: string, // the argument text the model sent, before any repair
 }
 
 // Chat_Retry_Event is one retry the harness scheduled: which send failed, which one is
@@ -89,6 +104,11 @@ _observer_assistant_end :: proc(observer: Chat_Observer) {
 @(private)
 _observer_user_text :: proc(observer: Chat_Observer, text: string) {
 	if observer.user_text != nil { observer.user_text(observer.user_data, text) }
+}
+
+@(private)
+_observer_tool_call :: proc(observer: Chat_Observer, event: Chat_Tool_Event) {
+	if observer.tool_call != nil { observer.tool_call(observer.user_data, event) }
 }
 
 @(private)

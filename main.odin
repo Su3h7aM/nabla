@@ -76,6 +76,7 @@ chat_cli_parse :: proc(args: []string) -> (chat_cli_options, bool) {
 
 chat_cli_usage :: proc() {
 	fmt.println("nabla [--config PATH] [--resume [SESSION]] [--provider ID --model ID] [--prompt TEXT]")
+	fmt.println("nabla acp                         run an Agent Client Protocol agent on stdin and stdout")
 	fmt.println("nabla diagnostics <session-id>    print what one session left in the diagnostic logs")
 	fmt.println("default config: $XDG_CONFIG_HOME/nabla/config.lua (~/.config/nabla/config.lua)")
 	fmt.println("without --resume, a new session starts in the current directory")
@@ -244,6 +245,9 @@ chat_main :: proc() -> int {
 	// A subcommand is recognized before the launch options, because its argument is
 	// a session id rather than a flag.
 	if len(args) > 0 && args[0] == "diagnostics" { return diagnostics_main(args[1:]) }
+	// The ACP agent is a front-end of its own: it takes over the process's standard
+	// streams, so it is a subcommand rather than a launch option.
+	if len(args) > 0 && args[0] == "acp" { return acp_main(args[1:]) }
 
 	options, parsed := chat_cli_parse(args)
 	if !parsed {

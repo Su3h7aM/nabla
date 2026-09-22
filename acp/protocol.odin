@@ -95,6 +95,41 @@ parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Enve
 	return result, .None
 }
 
+// envelope_error_text says what a message failed to be, in the words the client reads.
+envelope_error_text :: proc(err: Envelope_Error) -> string {
+	switch err {
+	case .None:
+		return ""
+	case .Invalid_JSON:
+		return "the message is not valid JSON"
+	case .Invalid_Envelope:
+		return "the message is not a JSON-RPC envelope"
+	case .Invalid_Version:
+		return "the message does not declare JSON-RPC 2.0"
+	case .Invalid_ID:
+		return "the message's id is neither a number nor a string"
+	case .Invalid_Method:
+		return "the message names no method"
+	case .Invalid_Result:
+		return "the message is neither a request nor a response"
+	case .Invalid_Error:
+		return "the message's error object is malformed"
+	}
+	return "the message could not be read"
+}
+
+// params_decode reads one message's params into a typed payload. The parsed value is
+// encoded again because the JSON package decodes from bytes, and a request payload is
+// small. False means the document does not match the payload the method takes; the
+// target's own strings are owned by allocator.
+params_decode :: proc(value: json.Value, target: ^$T, allocator := context.allocator) -> bool {
+	if value == nil { return false }
+	encoded, marshal_err := json.marshal(value, allocator = allocator)
+	if marshal_err != nil { return false }
+	defer delete(encoded, allocator)
+	return json.unmarshal(encoded, target, allocator = allocator) == nil
+}
+
 object_string_present :: proc(obj: json.Object, key: string) -> (string, bool, bool) {
 	value, present := obj[key]
 	if !present { return "", false, true }
