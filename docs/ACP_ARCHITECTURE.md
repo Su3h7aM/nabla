@@ -21,6 +21,20 @@ Two packages divide the work:
 The agent sends no client requests in this version, so the package has no client-side
 request plumbing and no pending-response table.
 
+## Pointing a client at it
+
+The client starts `nabla acp` and speaks to the process's standard streams, so the binary
+must be on the client's `PATH` and the harness must have a provider configured. Zed, for
+example, takes this entry in its settings:
+
+```json
+{
+  "agent_servers": {
+    "nabla": { "type": "custom", "command": "nabla", "args": ["acp"] }
+  }
+}
+```
+
 ## Threads and ownership
 
 The reader thread owns the protocol conversation. It reads frames, answers `initialize`
