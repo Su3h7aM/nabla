@@ -22,6 +22,9 @@ reimplementing something that exists. Update it when the gap it names closes.
   job table, hidden children, bounded limits and a shared result envelope.
 - Tool admission with argument repair, durable dispatch, all-or-nothing call staging,
   worker/owner/Lua placement, lanes, worker bounds and answer completeness on cancel.
+- One owner thread with one wake primitive for every wait and every producer: provider facts
+  queue in the bounded mailbox, a tool completion and a finished compaction publish through the
+  same wake, and the owner collects them by observing instead of polling.
 - Context logger integration, typed JSONL diagnostics, capture, retention and the
   read-only `diagnostics` reader/export.
 - Native HTTP/1.1, TLS 1.3, SSE, DNS and Responses WebSocket with provider delivery
@@ -33,7 +36,7 @@ Each is required work, not a design choice. Do not treat current behavior as cor
 
 | Gap | Target |
 | --- | --- |
-| The owner mailbox carries provider facts; a tool worker publishes into the shared wake and its own table rather than into the mailbox, and a finished compaction is adopted at the next request boundary | One bounded owner mailbox and wake primitive for input/control, provider facts, tool completions and compaction completion |
+| The owner mailbox queues provider facts; a tool worker publishes into the shared wake and its own job table rather than into the mailbox, which the tool lifecycle section allows where synchronization requires a handoff record, and a compaction worker publishes its completion through the same wake | One bounded owner mailbox and wake primitive for input/control, provider facts, tool completions and compaction completion |
 | No aggregate retained-byte budget or session retention quota; child results are exempt from the model budget but not from a storage bound | Add measured byte limits for root, child and session retention with an explicit settlement reserve |
 | WebSocket transport defaults to HTTP and `auto` fallback is partial, and the persistent WebSocket is session-owned and borrowed by each attempt's worker rather than owned by one worker across operations | Complete the correctness/cache gates, then adopt the target default and connection ownership |
 | Provider prompt-cache parity and complete provider-error classification are not fully verified | Close the [network](NETWORK_STACK_ARCHITECTURE.md) corrections and measure |
