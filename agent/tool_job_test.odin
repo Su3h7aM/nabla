@@ -117,7 +117,10 @@ tool_job_test_step_at :: proc(test: ^Tool_Test, jobs: ^Tool_Jobs, now: time.Tick
 	case .Dispatch:
 		tool_jobs_dispatch(jobs, chat)
 	case .Wait:
-		tool_jobs_wait(jobs, time.Millisecond)
+		// A stepped test advances its own clock, so the wait is bounded by the real one: what
+		// it is waiting for is a worker's publication, not a deadline its own simulation has
+		// already moved past.
+		tool_jobs_await(jobs, time.tick_add(time.tick_now(), time.Millisecond))
 	case .Done:
 	}
 	return effect

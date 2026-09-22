@@ -81,6 +81,9 @@ Chat_Request_Chain :: struct {
 // chat_chain_release frees everything the chain owns, joining a live worker first. The
 // zero chain is inert, so releasing one that never ran is safe.
 chat_chain_release :: proc(chat: ^Chat_Session) {
+	// A producer waiting for room is released before the join, so backpressure cannot
+	// outlive the drain that would have delivered its events.
+	mailbox_close(&chat.mailbox)
 	chat_chain_join(chat)
 	chat_request_prep_destroy(&chat.chain.prep, chat.allocator)
 	ai.Provider_Operation_Error_Destroy(&chat.chain.operation_error, chat.mailbox.allocator)
@@ -431,8 +434,9 @@ chat_chain_await :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usa
 	}
 	terminal, published := mailbox_take_terminal(&chat.mailbox)
 	if !published {
-		// A wakeup is a hint: the next selection rechecks the stage and comes back here.
-		mailbox_wait(&chat.mailbox)
+		// An attempt has no deadline of its own: the provider, the transport, or a requested
+		// stop ends it, so the owner waits for a publication rather than for a clock.
+		mailbox_await(&chat.mailbox, nil)
 		return
 	}
 	chat_chain_join(chat)

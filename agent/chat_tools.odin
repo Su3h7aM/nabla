@@ -53,7 +53,9 @@ chat_tool_jobs_step :: proc(chat: ^Chat_Session, observer: Chat_Observer, effect
 @(private)
 chat_tool_jobs_wait :: proc(chat: ^Chat_Session) {
 	if !chat.tool_jobs_active { return }
-	tool_jobs_wait(&chat.tool_jobs)
+	// An unsettled batch has one deadline of its own, the patience a stopped call is given,
+	// and no other reason to wake on its own: a completion wakes the owner instead.
+	tool_jobs_await(&chat.tool_jobs, tool_jobs_deadline(&chat.tool_jobs))
 }
 
 // chat_tool_jobs_finish releases a settled batch and applies its committed result

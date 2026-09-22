@@ -257,7 +257,7 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		case .Dispatch:
 			tool_jobs_dispatch(&jobs, chat)
 		case .Wait:
-			tool_jobs_wait(&jobs)
+			tool_jobs_await(&jobs, tool_jobs_deadline(&jobs))
 		case .Done:
 			return tool_jobs_committed(&jobs)
 		}

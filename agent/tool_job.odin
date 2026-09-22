@@ -45,16 +45,12 @@ TOOL_JOBS_MAX :: 64
 // not run out of room at the size of one model response.
 TOOL_JOBS_MAX_ADMISSIONS :: 256
 
-// TOOL_JOBS_WAIT is how long the owner sleeps when no job is runnable. It bounds how
-// late a turn cancellation is noticed after the last completion, in the same way the
-// transport's wait slice bounds it during a request.
-TOOL_JOBS_WAIT :: 50 * time.Millisecond
-
 // TOOL_JOBS_STOP_PATIENCE is how long a call may keep running after its stop was asked for,
 // by the turn's cancellation or by its own timeout. A backend that never returns cannot be
 // stopped cooperatively, so past this the owner stops waiting: the call is answered with the
 // outcome the harness can observe, and the job is handed to its worker, which releases it
-// when it returns. Only process isolation can bound arbitrary native code harder.
+// when it returns. Only process isolation can bound arbitrary native code harder. It is the
+// batch's only deadline of its own, and the owner waits for exactly it.
 TOOL_JOBS_STOP_PATIENCE :: 10 * time.Second
 
 // Tool_Job_Phase is what a job has done and what it still owes. The phase answers one
@@ -201,15 +197,14 @@ Tool_Job :: struct {
 }
 
 // Tool_Jobs is one batch's table. The owner reads and writes it; a worker only ever
-// publishes its own completion, under the mutex.
+// publishes its own completion, under the mutex. pending says a publication the owner has not
+// adopted yet may exist; it is cleared before the owner reads the jobs, so a publication that
+// lands while it reads either leaves the flag set or is read by that pass.
 Tool_Jobs :: struct {
 	jobs:             [dynamic]^Tool_Job,
 	allocator:        mem.Allocator, // the session's: it owns the table, not the jobs
 	mutex:            sync.Mutex,
-	cond:             sync.Cond,
-	// woken is set by a worker when it publishes, so the owner never sleeps past a
-	// completion that arrived between its decision and its wait.
-	woken:            bool,
+	pending:          bool,
 	next_id:          u64,
 	admitted:         int, // every admission in this batch, outer calls and children
 	active:           int, // worker-placed jobs running now
@@ -562,6 +557,12 @@ tool_jobs_stopped_long_enough :: proc(job: ^Tool_Job, now: time.Tick) -> bool {
 // where the worker publishes it.
 @(private)
 tool_jobs_collect :: proc(jobs: ^Tool_Jobs) {
+	// The flag is cleared before the jobs are read: a publication that lands while this runs
+	// either leaves the flag set for the next check or is read by this pass, so the owner can
+	// never sleep past a completion it has not adopted.
+	sync.mutex_lock(&jobs.mutex)
+	jobs.pending = false
+	sync.mutex_unlock(&jobs.mutex)
 	for job in jobs.jobs {
 		sync.mutex_lock(&job.mu)
 		if !job.published || job.adopted || job.phase != .Running {
@@ -880,13 +881,41 @@ tool_jobs_retire :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 	job.phase = job.committed ? .Retired : .Unrecorded
 }
 
-// tool_jobs_wait sleeps until a worker publishes or the wait slice ends. The wait
-// releases the table's mutex, so a completion that arrives first is never missed.
-tool_jobs_wait :: proc(jobs: ^Tool_Jobs, timeout := TOOL_JOBS_WAIT) {
+// tool_jobs_ready reports whether a worker has published something the owner has not adopted.
+// It is the one fact a wait needs that selection cannot see, because adopting it is the
+// observation step's work.
+@(private)
+tool_jobs_ready :: proc(jobs: ^Tool_Jobs) -> bool {
 	sync.mutex_lock(&jobs.mutex)
-	if !jobs.woken { _ = sync.cond_wait_with_timeout(&jobs.cond, &jobs.mutex, timeout) }
-	jobs.woken = false
-	sync.mutex_unlock(&jobs.mutex)
+	defer sync.mutex_unlock(&jobs.mutex)
+	return jobs.pending
+}
+
+// tool_jobs_deadline is the nearest tick at which the owner must act on its own, and None
+// when only a worker can change the table. A stopped call's patience is measured from when
+// the owner first saw the stop, which is the only deadline a batch has of its own.
+@(private)
+tool_jobs_deadline :: proc(jobs: ^Tool_Jobs) -> Maybe(time.Tick) {
+	earliest: Maybe(time.Tick)
+	for job in jobs.jobs {
+		if !job.launched || !job.stopping { continue }
+		due := time.tick_add(job.stop_at, TOOL_JOBS_STOP_PATIENCE)
+		if existing, has := earliest.?; !has || time.tick_diff(due, existing) < 0 { earliest = due }
+	}
+	return earliest
+}
+
+// tool_jobs_await blocks until a worker publishes, the deadline arrives, or a signal
+// interrupts the wait. The check is narrow and the collection stays outside it: the owner
+// must not hold the wake across work that joins a worker, and a worker publishes under the
+// wake's rendezvous before it finishes.
+@(private)
+tool_jobs_await :: proc(jobs: ^Tool_Jobs, deadline: Maybe(time.Tick)) {
+	sync.mutex_lock(&chat_wake.mutex)
+	defer sync.mutex_unlock(&chat_wake.mutex)
+	if tool_jobs_ready(jobs) { return }
+	if tool_jobs_next(jobs, time.tick_now()) != .Wait { return }
+	owner_wake_wait(deadline)
 }
 
 // --- the executor --------------------------------------------------------------
@@ -964,7 +993,9 @@ tool_job_worker :: proc(worker: ^thread.Thread) {
 	sync.mutex_unlock(&job.mu)
 
 	sync.mutex_lock(&table.mutex)
-	table.woken = true
-	sync.cond_signal(&table.cond)
+	table.pending = true
 	sync.mutex_unlock(&table.mutex)
+	// A publication is the owner's work, so it wakes the owner rather than a condition
+	// variable of its own.
+	owner_wake_signal()
 }

@@ -31,8 +31,14 @@ Owner_Wake :: struct {
 // wait, and the owner rechecks its predicates when the wait returns.
 owner_wake_signal :: proc() {
 	sync.mutex_lock(&chat_wake.mutex)
-	sync.cond_broadcast(&chat_wake.cond)
+	owner_wake_notify()
 	sync.mutex_unlock(&chat_wake.mutex)
+}
+
+// owner_wake_notify wakes every waiter of a caller that already holds the wake mutex, which
+// is how a producer signals after publishing with that mutex held.
+owner_wake_notify :: proc() {
+	sync.cond_broadcast(&chat_wake.cond)
 }
 
 // owner_wake_wait releases the wake mutex and blocks until a producer signals, the deadline
