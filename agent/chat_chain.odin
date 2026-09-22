@@ -80,6 +80,7 @@ chat_chain_release :: proc(chat: ^Chat_Session) {
 
 // chat_chain_stop latches why the chain stopped and moves it to its commit. Selection
 // only reads, so the transition lives here and in the effect that observed the stop.
+@(private)
 chat_chain_stop :: proc(chat: ^Chat_Session, reason: Request_Recovery_Reason) {
 	chat.chain.decision = {
 		action = .Stop,
