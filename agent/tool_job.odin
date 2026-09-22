@@ -181,6 +181,12 @@ Tool_Job :: struct {
 	launched:         bool,
 	// orphan is the owner's handoff: the worker releases this job itself.
 	orphan:           bool,
+	// thread is the worker that runs a placed call. The owner keeps the handle and destroys it
+	// once the worker has published, because a thread that releases its own storage cannot be
+	// observed: the library's start and that thread's exit would then race over the same bytes.
+	// A job handed to a worker that never returns keeps its handle for the life of the process,
+	// which is the same rule the contract applies to everything else that worker can reach.
+	thread:           ^thread.Thread,
 	// stopping and stop_at are the owner's observation that this job should have stopped and
 	// when that was first seen, which is what the stop patience is measured from.
 	stopping:         bool,
@@ -244,16 +250,30 @@ tool_jobs_init :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, capacity: int, wor
 	jobs.budget = chat_tool_budget_open(chat, len(chat.pending_calls))
 }
 
-// tool_jobs_destroy releases the table and everything still in it. A job the owner handed
-// to its worker is not freed here: that worker releases it when it returns, and this table
-// is then the last thing the batch's owner releases.
-tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) {
+// tool_jobs_destroy releases the table and everything no worker owns any more. A call a worker
+// is still running is that worker's until it returns, so the owner interrupts it and hands the
+// job over instead of freeing storage the worker is writing, and the answer says that happened.
+// What that means is the caller's decision: such a worker still borrows the workspace, the
+// registry generation and the backends the caller is about to release, and the contract's rule
+// for it is to retain what it can reach until the process exits.
+tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) -> bool {
+	escaped := false
 	for job in jobs.jobs {
+		if job.phase == .Running && job.launched {
+			ai.interrupt_request(&job.interrupt)
+			sync.mutex_lock(&job.mu)
+			job.orphan = true
+			job.phase = .Stuck
+			sync.mutex_unlock(&job.mu)
+			escaped = true
+			continue
+		}
 		if job.phase == .Stuck { continue }
 		tool_job_release(job)
 	}
 	delete(jobs.jobs)
 	jobs^ = {}
+	return escaped
 }
 
 // tool_job_release frees everything one job owns. The job struct and its data come from the
@@ -558,8 +578,10 @@ tool_jobs_stopped_long_enough :: proc(job: ^Tool_Job, now: time.Tick) -> bool {
 
 // tool_jobs_collect adopts what the workers published. It is the only place a phase moves out
 // of Running for a worker that finished, and it reads a job's result under that job's own
-// mutex, which is where the worker publishes it. The abandon step is the other place, and it
-// hands the job to the worker instead of keeping it.
+// mutex, which is where the worker publishes it. It is also where the worker's thread storage
+// comes back: the publication is the last thing that thread does with the job. The abandon step
+// is the other place a phase out of Running is decided, and it hands the job to the worker
+// instead of keeping it.
 @(private)
 tool_jobs_collect :: proc(jobs: ^Tool_Jobs) {
 	// The flag is cleared before the jobs are read: a publication that lands while this runs
@@ -575,7 +597,13 @@ tool_jobs_collect :: proc(jobs: ^Tool_Jobs) {
 			continue
 		}
 		job.phase = .Result_Ready
+		handle := job.thread
+		job.thread = nil
 		sync.mutex_unlock(&job.mu)
+		// The worker stored its result and is on its way out; this is where the owner takes the
+		// thread's own storage back. Destroying the handle waits for that thread to return, which
+		// is a few instructions after the publication this step adopted.
+		if handle != nil { thread.destroy(handle) }
 		if job.placement == .Worker && jobs.active > 0 { jobs.active -= 1 }
 	}
 }
@@ -949,9 +977,10 @@ tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
 // creation so the worker inherits a mask that keeps it ineligible for the process
 // handler: a tool must never run the handler that cancels its own turn.
 //
-// The thread releases itself. The owner must be able to give up on a call that ignores its
-// stop, and a thread nobody joins is a thread nobody can free: a self-cleaning thread is
-// removed by the runtime, and a job the owner handed back is released by its own worker.
+// The thread's own storage is the owner's to give back, once that worker has published. A
+// thread that released itself would be observed by nobody, and the library's start and that
+// thread's own exit would race over the same bytes; a job handed to a worker that ignores its
+// stop keeps its thread handle instead, for the life of the process.
 @(private)
 tool_job_launch :: proc(job: ^Tool_Job) -> bool {
 	previous: linux.Sig_Set
@@ -959,8 +988,8 @@ tool_job_launch :: proc(job: ^Tool_Job) -> bool {
 	worker := thread.create(tool_job_worker, name = "nabla-tool")
 	chat_signal_restore(previous)
 	if worker == nil { return false }
-	worker.flags += {.Self_Cleanup}
 	worker.data = job
+	job.thread = worker
 	thread.start(worker)
 	job.launched = true
 	return true

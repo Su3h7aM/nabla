@@ -65,7 +65,10 @@ chat_tool_jobs_finish :: proc(chat: ^Chat_Session, turn_id: u64) -> bool {
 	if !chat.tool_jobs_active || !tool_jobs_settled(&chat.tool_jobs) { return false }
 	count := tool_jobs_committed(&chat.tool_jobs)
 	if chat.tool_jobs.escaped { chat.worker_escaped = true }
-	tool_jobs_destroy(&chat.tool_jobs)
+	// The batch is settled here, so no call is still running: a worker that was handed its job
+	// instead is exactly the case the session's own flag exists for, and it must not continue
+	// with work that borrows what such a worker still holds.
+	if tool_jobs_destroy(&chat.tool_jobs) { chat.worker_escaped = true }
 	chat.tool_jobs_active = false
 	return chat_session_tools_done(chat, turn_id, count)
 }

@@ -514,7 +514,10 @@ test_running_calls_are_bounded :: proc(t: ^testing.T) {
 // A call that ignores its stop is answered rather than waited for: the turn is not stuck
 // behind a backend that will not return, and the call is recorded as the unknown outcome
 // the harness actually observed. The job is handed to its worker, which releases every byte
-// of it when it returns, so a backend that ignored cancellation leaves no leak behind.
+// of it when it returns, so a backend that ignored cancellation leaves no leak behind but
+// its thread: the owner keeps the thread handle, and a worker that never returns is a thread
+// storage the process holds until it exits, which is the same rule as the memory the worker
+// can still reach.
 @(test)
 test_a_call_that_ignores_its_stop_is_answered_and_released :: proc(t: ^testing.T) {
 	tool_job_deaf_reset()
@@ -678,9 +681,9 @@ test_an_owner_placed_call_takes_no_worker_slot :: proc(t: ^testing.T) {
 
 // Release is complete: every worker has finished, every job-owned byte comes back to the
 // allocator that handed it out, and the recorded results survive in the store. A finished
-// worker is observed through the job it published rather than through its thread: the
-// thread releases itself, which is what lets the owner give up on a call that ignores its
-// stop without leaking the thread.
+// worker is observed through the job it published, and the owner takes that worker's thread
+// storage back in the same step; a call that ignores its stop never publishes, so its handle
+// stays with the job until the process exits.
 @(test)
 test_a_settled_batch_releases_every_thread_and_byte :: proc(t: ^testing.T) {
 	tool_job_hold_reset()

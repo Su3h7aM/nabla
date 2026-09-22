@@ -271,10 +271,11 @@ chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Regis
 }
 
 chat_session_destroy :: proc(chat: ^Chat_Session) {
-	// A tool worker borrows the session's frozen registry and turn data, so it is
-	// joined before any of that storage is released.
+	// A worker still running a call keeps the job it owns and the workspace, registry generation
+	// and backends it borrows. The session says so rather than pretending the batch retired: what
+	// to do with what such a worker can still reach is the caller's decision.
 	if chat.tool_jobs_active {
-		tool_jobs_destroy(&chat.tool_jobs)
+		if tool_jobs_destroy(&chat.tool_jobs) { chat.worker_escaped = true }
 		chat.tool_jobs_active = false
 	}
 	// Compaction's worker borrows this session's id for its logging correlation, so
@@ -443,7 +444,9 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat_operation_retire(&chat.operation)
 	chat_chain_release(chat)
 	if chat.tool_jobs_active {
-		tool_jobs_destroy(&chat.tool_jobs)
+		// The batch is released, and a worker still running a call keeps what it borrows from
+		// this session: the session refuses further work rather than reusing a busy backend.
+		if tool_jobs_destroy(&chat.tool_jobs) { chat.worker_escaped = true }
 		chat.tool_jobs_active = false
 	}
 	chat_pending_calls_clear(chat)
