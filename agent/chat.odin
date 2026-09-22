@@ -308,6 +308,42 @@ chat_request_transport :: proc(
 	return encoded, websocket_request, true
 }
 
+// chat_record_attempt writes the durable row for one send and returns its number. The
+// row identifies the actual provider send and names the send before it, so a retry is
+// legible from the store rather than reconstructed. It reports false after latching a
+// storage failure, which stops the turn: a send whose row did not land is not sent.
+@(private)
+chat_record_attempt :: proc(
+	chat: ^Chat_Session,
+	connection: ai.Provider_Connection,
+	prep: ^Chat_Request_Prep,
+	attempt: Chat_Attempt,
+	encoded: ai.Provider_Encoded_Request,
+) -> (
+	request_no: session.Request_No,
+	recorded: bool,
+) {
+	number, begin_err := session.request_begin(
+		chat.store,
+		chat.id,
+		{
+			turn_no = chat.turn_no,
+			purpose = .Response,
+			provider = chat.provider_id,
+			model_requested = chat.model_id,
+			api = chat_api_name(connection.API),
+			config_json = chat_request_config_json(chat, prep.request.Max_Output_Tokens),
+			input_json = chat_request_input_json(prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries), attempt, encoded.Body),
+		},
+		session.now_ms(),
+	)
+	if begin_err != nil {
+		chat_session_record_failure(chat, "the request could not be recorded", begin_err)
+		return {}, false
+	}
+	return number, true
+}
+
 // chat_perform_request builds one request from committed history, records it,
 // runs it, and records what came back. The record exists before the model is
 // asked anything, so a request that never finishes still says what it carried.
@@ -464,26 +500,10 @@ chat_perform_request :: proc(
 			recovery = previous == nil ? .Initial : recovery_kind,
 			previous = previous,
 		}
-		begin_no, begin_err := session.request_begin(
-			chat.store,
-			chat.id,
-			{
-				turn_no = chat.turn_no,
-				purpose = .Response,
-				provider = chat.provider_id,
-				model_requested = chat.model_id,
-				api = chat_api_name(connection.API),
-				config_json = chat_request_config_json(chat, prep.request.Max_Output_Tokens),
-				input_json = chat_request_input_json(&prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries), attempt, encoded.Body),
-			},
-			session.now_ms(),
-		)
-		if begin_err != nil {
-			chat_session_record_failure(chat, "the request could not be recorded", begin_err)
-			return
-		}
-		request_no = begin_no
-		previous = begin_no
+		row_no, row_ok := chat_record_attempt(chat, connection, &prep, attempt, encoded)
+		if !row_ok { return }
+		request_no = row_no
+		previous = request_no
 		chat.active_request = request_no
 		binding.correlation = log_correlation_for(chat, attempts)
 
