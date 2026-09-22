@@ -172,14 +172,13 @@ Tool_Job :: struct {
 	// lives in the job rather than in the table because the worker keeps it after the batch
 	// is gone, and the table is the owner's.
 	mu:               sync.Mutex,
-	// published is set by the worker once it has finished with this job, and the owner never
-	// clears it: it is what says a released job's storage is the owner's again.
+	// published is the worker's last word about this job: it stored its result and is done with
+	// everything the job owns. Only the collection step reads it, and the phase is what makes a
+	// released job's storage the owner's again, because selection reads the phase without a lock.
 	published:        bool,
 	// launched says a worker thread owns this call. A job that never started one, an
 	// owner-placed operation or a Lua execution, is the owner's for its whole life.
 	launched:         bool,
-	// adopted is the owner's record that it took the published result into its own care.
-	adopted:          bool,
 	// orphan is the owner's handoff: the worker releases this job itself.
 	orphan:           bool,
 	// stopping and stop_at are the owner's observation that this job should have stopped and
@@ -537,14 +536,14 @@ tool_jobs_retirable :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> ^Tool_Job {
 }
 
 // tool_job_releasable reports whether the owner may release a job's storage: the job never
-// started a worker, or its worker finished with it. Reading it takes the job's own mutex,
-// which the worker holds until it is done with the job's fields.
+// started a worker, or its worker is done with it. The phase is what says so, and reading it
+// takes no lock. A launched job leaves Running in exactly two places, and neither one leaves a
+// worker using the job's storage: the collection step moves it after the worker published, and
+// the abandon step moves it to Stuck only by handing the job to that worker. Selection calls
+// this, and selection takes no locks and adopts nothing.
 @(private)
 tool_job_releasable :: proc(job: ^Tool_Job) -> bool {
-	if !job.launched { return true }
-	sync.mutex_lock(&job.mu)
-	defer sync.mutex_unlock(&job.mu)
-	return job.published
+	return !job.launched || job.phase != .Running
 }
 
 @(private)
@@ -552,9 +551,10 @@ tool_jobs_stopped_long_enough :: proc(job: ^Tool_Job, now: time.Tick) -> bool {
 	return job.stopping && time.tick_diff(job.stop_at, now) >= TOOL_JOBS_STOP_PATIENCE
 }
 
-// tool_jobs_collect adopts what the workers published. It is the only place a phase
-// moves out of Running, and it reads a job's result under that job's own mutex, which is
-// where the worker publishes it.
+// tool_jobs_collect adopts what the workers published. It is the only place a phase moves out
+// of Running for a worker that finished, and it reads a job's result under that job's own
+// mutex, which is where the worker publishes it. The abandon step is the other place, and it
+// hands the job to the worker instead of keeping it.
 @(private)
 tool_jobs_collect :: proc(jobs: ^Tool_Jobs) {
 	// The flag is cleared before the jobs are read: a publication that lands while this runs
@@ -565,11 +565,10 @@ tool_jobs_collect :: proc(jobs: ^Tool_Jobs) {
 	sync.mutex_unlock(&jobs.mutex)
 	for job in jobs.jobs {
 		sync.mutex_lock(&job.mu)
-		if !job.published || job.adopted || job.phase != .Running {
+		if !job.published || job.phase != .Running {
 			sync.mutex_unlock(&job.mu)
 			continue
 		}
-		job.adopted = true
 		job.phase = .Result_Ready
 		sync.mutex_unlock(&job.mu)
 		if job.placement == .Worker && jobs.active > 0 { jobs.active -= 1 }
