@@ -392,6 +392,15 @@ test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
 	testing.expect_value(t, chat.state, Chat_State.Idle)
 	testing.expect(t, !run.completed)
 
+	// The attempt that was in flight is awaited, so its row is finished from its own
+	// outcome: the turn's status is the cancellation, and the row still says how the send
+	// that was running ended.
+	request, request_err := session.request_load(chat.store, chat.id, 1)
+	if !testing.expect_value(t, request_err, nil) { return }
+	defer session.request_destroy(&request)
+	testing.expect_value(t, request.outcome, session.Outcome.Cancelled)
+	testing.expect(t, request.error_json != "", "the cancelled send's own error must be recorded")
+
 	// The turn is over and the session is immediately reusable.
 	_test_accept(t, chat, "again")
 	testing.expect_value(t, chat.active_turn_id, first_turn + 1)

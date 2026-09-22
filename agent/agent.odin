@@ -99,10 +99,18 @@ chat_session_advance :: proc(chat: ^Chat_Session) -> Chat_Effect {
 chat_session_advance_at :: proc(chat: ^Chat_Session, now: time.Tick) -> Chat_Effect {
 	// An active chain owns the request between its attempts, and its stage is a stronger
 	// fact than the turn state the last provider event left behind: a failed attempt sets
-	// the turn to finalizing before the policy decides to retry it. Only selection of the
-	// state machine proper happens below, and it commits a stopped chain before anything
-	// else so the response is recorded before its calls are dispatched.
+	// the turn to finalizing before the policy decides to retry it. A live attempt is
+	// awaited before any decision, so the chain's own stage is read first.
 	if chat.chain.active {
+		// A live attempt is always awaited, cancellation included: the send already
+		// happened, so its row is finished from its own outcome rather than from a stop that
+		// arrived while it was in flight. Adopting the terminal is also what confirms the
+		// producer stopped before the operation retires. The window is real: the driver
+		// returns to selection between waits, and a stop latched then would otherwise commit
+		// while the worker still holds the send.
+		if chat.chain.stage == .Sending {
+			return Chat_Effect{kind = .Await_Provider, turn_id = chat.active_turn_id}
+		}
 		// A stopped chain commits: the response is recorded before its calls are dispatched,
 		// and cancellation stops a chain between attempts rather than after another send.
 		if chat.chain.stage == .Committing || chat.state == .Cancelling {
@@ -114,17 +122,13 @@ chat_session_advance_at :: proc(chat: ^Chat_Session, now: time.Tick) -> Chat_Eff
 		switch chat.chain.stage {
 		case .Ready:
 			return Chat_Effect{kind = .Send_Attempt, turn_id = chat.active_turn_id}
-		case .Sending:
-			// The attempt's worker is live. Whatever it has published is collected, and the
-			// stage outlives this effect: the producer owns the send until it publishes its
-			// terminal outcome.
-			return Chat_Effect{kind = .Await_Provider, turn_id = chat.active_turn_id}
 		case .Backoff:
 			return Chat_Effect{kind = .Wait_Retry, turn_id = chat.active_turn_id}
 		case .Repairing:
 			return Chat_Effect{kind = .Repair_Context, turn_id = chat.active_turn_id}
-		case .Committing:
-			return Chat_Effect{kind = .Commit_Response, turn_id = chat.active_turn_id}
+		case .Sending, .Committing:
+			// Both are handled above; this keeps the switch total and proposes no work.
+			return chat_effect_none()
 		}
 		return chat_effect_none()
 	}
