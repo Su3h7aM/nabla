@@ -1213,7 +1213,13 @@ chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, conne
 		_observer_message(observer, .Error, "compaction is not available right now")
 		return false
 	case .Already_Scheduled:
-		_observer_message(observer, .Notice, "compaction is already under way")
+		// A candidate that is ready is not work under way. Saying so would leave the user
+		// waiting for a summary that already exists and installs at the next boundary.
+		if chat.compact.state == .Ready {
+			_observer_message(observer, .Notice, "a summary is ready; the next request boundary installs it")
+		} else {
+			_observer_message(observer, .Notice, "compaction is already under way")
+		}
 		return true
 	case .Scheduled:
 	}

@@ -41,6 +41,12 @@ tool_compact_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool
 	case .Scheduled:
 		return tool_result_success(ctx, Compact_Tool_Data{state = "scheduled"}, "scheduled")
 	case .Already_Scheduled:
+		// A summary that is ready is not a summary being made, and a caller told the wrong one
+		// waits for something else: an explicit request has already made this candidate install
+		// at the next boundary.
+		if ctx.compact.state == .Ready {
+			return tool_result_success(ctx, Compact_Tool_Data{state = "ready"}, "ready")
+		}
 		return tool_result_success(ctx, Compact_Tool_Data{state = "already_running"}, "already running")
 	case .Unavailable:
 	}
