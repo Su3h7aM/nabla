@@ -165,6 +165,7 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 		if !ok { break }
 		acp_run_work(server, work)
 		acp_work_destroy(&work, server.alloc)
+		if agent.chat_session_worker_escaped(&server.app.setup.session) { break }
 		// Temp scratch belongs to one request: the worker is long-lived, so its pool is
 		// recycled here rather than left to grow with the conversation.
 		free_all(context.temp_allocator)
@@ -178,6 +179,7 @@ acp_run_work :: proc(server: ^Acp_Server, work: Acp_Work) {
 	case .Prompt:
 		acp_work_prompt(server, work)
 	}
+	if agent.chat_session_worker_escaped(&server.app.setup.session) { return }
 	// The request is answered, so the next one may be admitted. The cancellation belongs
 	// to the turn that just ended; a client that cancels a finished turn is ignored.
 	sync.atomic_store(&server.cancel_seen, false)
@@ -218,6 +220,9 @@ acp_work_open_session :: proc(server: ^Acp_Server, work: Acp_Work) {
 // The message of a refusal is owned by the setup's allocator.
 acp_session_open :: proc(server: ^Acp_Server, workspace: string, start: Session_Start) -> (message: string, ok: bool) {
 	app := &server.app
+	if agent.chat_session_worker_escaped(&app.setup.session) {
+		return strings.clone(agent.CHAT_WORKER_ESCAPED_NOTICE, app.setup.alloc), false
+	}
 	// Loading the session this process already runs is not a switch: it is the same
 	// conversation, and the harness would refuse to claim it twice.
 	if start.kind == .Resume_Id && string(app.setup.session.id) == start.id { return "", true }
