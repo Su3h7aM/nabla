@@ -421,7 +421,12 @@ acp_run :: proc(
 	if !run_catalog(sources, mcp_servers, &server.app.setup, Session_Start{kind = .New}) { return false }
 	defer acp_server_destroy(server)
 
-	server.writer = acp.writer_init(output, server.alloc)
+	writer, writer_err := acp.writer_init(output, server.alloc)
+	if writer_err != nil {
+		fmt.eprintln("nabla: cannot create the ACP writer")
+		return false
+	}
+	server.writer = writer
 	channel, channel_err := chan.create_buffered(Acp_Work_Chan, ACP_WORK_CAPACITY, server.alloc)
 	if channel_err != nil {
 		fmt.eprintln("nabla: cannot create the request queue")

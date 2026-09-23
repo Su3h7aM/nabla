@@ -1,8 +1,8 @@
 package acp
 
 import "core:encoding/json"
-import "core:fmt"
 import "core:io"
+import "core:mem"
 import "core:strings"
 import "core:sync"
 
@@ -20,8 +20,10 @@ Writer :: struct {
 	failed:  bool, // atomic; written by whoever writes, read by whoever asks
 }
 
-writer_init :: proc(out: io.Writer, allocator := context.allocator) -> Writer {
-	return Writer{out = out, builder = strings.builder_make(allocator)}
+writer_init :: proc(out: io.Writer, allocator := context.allocator) -> (Writer, mem.Allocator_Error) {
+	builder, err := strings.builder_make(allocator)
+	if err != nil { return {}, err }
+	return Writer{out = out, builder = builder}, nil
 }
 
 writer_destroy :: proc(w: ^Writer) {
@@ -65,11 +67,14 @@ writer_write_notification :: proc(w: ^Writer, method: string, params: $T) -> boo
 	defer sync.mutex_unlock(&w.mutex)
 	b := &w.builder
 	strings.builder_reset(b)
-	strings.write_string(b, `{"jsonrpc":"2.0","method":`)
-	writer_write_quoted(b, method)
-	strings.write_string(b, `,"params":`)
-	strings.write_bytes(b, body)
-	strings.write_string(b, "}\n")
+	if !writer_builder_string(b, `{"jsonrpc":"2.0","method":`) ||
+		!writer_write_quoted(b, method) ||
+		!writer_builder_string(b, `,"params":`) ||
+		!writer_builder_bytes(b, body) ||
+		!writer_builder_string(b, "}\n") {
+		sync.atomic_store(&w.failed, true)
+		return false
+	}
 	return writer_flush(w, b)
 }
 
@@ -80,12 +85,15 @@ writer_frame :: proc(w: ^Writer, id: Jsonrpc_Id, key: string, body: []byte) -> b
 	defer sync.mutex_unlock(&w.mutex)
 	b := &w.builder
 	strings.builder_reset(b)
-	strings.write_string(b, `{"jsonrpc":"2.0","id":`)
-	writer_write_id(b, id)
-	strings.write_byte(b, ',')
-	strings.write_string(b, key)
-	strings.write_bytes(b, body)
-	strings.write_string(b, "}\n")
+	if !writer_builder_string(b, `{"jsonrpc":"2.0","id":`) ||
+		!writer_write_id(b, id) ||
+		!writer_builder_byte(b, ',') ||
+		!writer_builder_string(b, key) ||
+		!writer_builder_bytes(b, body) ||
+		!writer_builder_string(b, "}\n") {
+		sync.atomic_store(&w.failed, true)
+		return false
+	}
 	return writer_flush(w, b)
 }
 
@@ -103,50 +111,74 @@ writer_flush :: proc(w: ^Writer, b: ^strings.Builder) -> bool {
 }
 
 @(private)
-writer_write_id :: proc(b: ^strings.Builder, id: Jsonrpc_Id) {
+writer_builder_string :: proc(b: ^strings.Builder, value: string) -> bool {
+	return strings.write_string(b, value) == len(value)
+}
+
+@(private)
+writer_builder_bytes :: proc(b: ^strings.Builder, value: []byte) -> bool {
+	return strings.write_bytes(b, value) == len(value)
+}
+
+@(private)
+writer_builder_byte :: proc(b: ^strings.Builder, value: byte) -> bool {
+	return strings.write_byte(b, value) == 1
+}
+
+@(private)
+writer_write_id :: proc(b: ^strings.Builder, id: Jsonrpc_Id) -> bool {
 	switch value in id {
-	case i64:
-		strings.write_i64(b, value)
-	case f64:
-		fmt.sbprint(b, value)
+	case i64, f64:
+		body, err := json.marshal(value, allocator = context.temp_allocator)
+		if err != nil { return false }
+		defer delete(body, context.temp_allocator)
+		return writer_builder_bytes(b, body)
 	case string:
-		writer_write_quoted(b, value)
+		return writer_write_quoted(b, value)
 	case:
 		// An id the envelope parser would have refused cannot name a request, so a
 		// response to it is written as the JSON null a client can still match.
-		strings.write_string(b, "null")
+		return writer_builder_string(b, "null")
 	}
 }
 
 // writer_write_quoted writes one JSON string. It is the only place outbound text is
 // escaped, so every string the writer emits is valid whatever it contains.
 @(private)
-writer_write_quoted :: proc(b: ^strings.Builder, value: string) {
-	strings.write_byte(b, '"')
+writer_write_quoted :: proc(b: ^strings.Builder, value: string) -> bool {
+	if !writer_builder_byte(b, '"') { return false }
 	for i := 0; i < len(value); i += 1 {
 		c := value[i]
 		switch c {
 		case '"':
-			strings.write_string(b, `\"`)
+			if !writer_builder_string(b, `\"`) { return false }
 		case '\\':
-			strings.write_string(b, `\\`)
+			if !writer_builder_string(b, `\\`) { return false }
 		case '\n':
-			strings.write_string(b, `\n`)
+			if !writer_builder_string(b, `\n`) { return false }
 		case '\r':
-			strings.write_string(b, `\r`)
+			if !writer_builder_string(b, `\r`) { return false }
 		case '\t':
-			strings.write_string(b, `\t`)
+			if !writer_builder_string(b, `\t`) { return false }
 		case '\b':
-			strings.write_string(b, `\b`)
+			if !writer_builder_string(b, `\b`) { return false }
 		case '\f':
-			strings.write_string(b, `\f`)
+			if !writer_builder_string(b, `\f`) { return false }
 		case:
 			if c < 0x20 {
-				fmt.sbprintf(b, `\u00%02x`, c)
-			} else {
-				strings.write_byte(b, c)
+				if !writer_builder_string(b, `\u00`) ||
+					!writer_builder_byte(b, writer_hex_digit(c >> 4)) ||
+					!writer_builder_byte(b, writer_hex_digit(c & 0x0F)) { return false }
+			} else if !writer_builder_byte(b, c) {
+				return false
 			}
 		}
 	}
-	strings.write_byte(b, '"')
+	return writer_builder_byte(b, '"')
+}
+
+@(private)
+writer_hex_digit :: proc(value: byte) -> byte {
+	if value < 10 { return '0' + value }
+	return 'a' + (value - 10)
 }

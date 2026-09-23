@@ -18,7 +18,9 @@ test_acp_refuses_to_replace_an_escaped_session :: proc(t: ^testing.T) {
 
 	output := strings.builder_make(context.allocator)
 	defer strings.builder_destroy(&output)
-	server.writer = acp.writer_init(strings.to_writer(&output), context.allocator)
+	writer, writer_err := acp.writer_init(strings.to_writer(&output), context.allocator)
+	if writer_err != nil { testing.fail_now(t, "the ACP writer could not be created") }
+	server.writer = writer
 	defer acp.writer_destroy(&server.writer)
 
 	work := Acp_Work {

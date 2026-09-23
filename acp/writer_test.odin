@@ -34,7 +34,8 @@ test_writer_frames_response_error_and_notification :: proc(t: ^testing.T) {
 	buffer: bytes.Buffer
 	bytes.buffer_init_allocator(&buffer, 0, 0, context.allocator)
 	defer bytes.buffer_destroy(&buffer)
-	writer := writer_init(test_writer_stream(&buffer))
+	writer, writer_err := writer_init(test_writer_stream(&buffer))
+	if writer_err != nil { testing.fail_now(t, "the writer could not be created") }
 	defer writer_destroy(&writer)
 
 	testing.expect(t, writer_write_response(&writer, i64(7), Session_New_Result{session_id = "sess_1"}))
