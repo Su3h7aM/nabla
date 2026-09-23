@@ -80,7 +80,7 @@ openai_responses_encode_request_body :: proc(
 			// encrypted content: without it the item carries nothing the
 			// endpoint can continue from, and it is skipped rather than sent.
 			if message.Reasoning_Encrypted == "" { continue }
-			openai_responses_item_start(&body, &item_first)
+			encode_write_item(&body, &item_first)
 			field_first := true
 			encode_write_raw(&body, "{")
 			encode_write_field(&body, &field_first, "encrypted_content")
@@ -98,7 +98,7 @@ openai_responses_encode_request_body :: proc(
 			continue
 		}
 		if message.Role == .Tool {
-			openai_responses_item_start(&body, &item_first)
+			encode_write_item(&body, &item_first)
 			field_first := true
 			encode_write_raw(&body, "{")
 			encode_write_field(&body, &field_first, "call_id")
@@ -112,7 +112,7 @@ openai_responses_encode_request_body :: proc(
 		}
 		if len(message.Tool_Calls) > 0 {
 			for call in message.Tool_Calls {
-				openai_responses_item_start(&body, &item_first)
+				encode_write_item(&body, &item_first)
 				call_first := true
 				encode_write_raw(&body, "{")
 				encode_write_field(&body, &call_first, "arguments")
@@ -130,7 +130,7 @@ openai_responses_encode_request_body :: proc(
 				encode_write_raw(&body, "}")
 			}
 			if message.Content != "" {
-				openai_responses_item_start(&body, &item_first)
+				encode_write_item(&body, &item_first)
 				text_first := true
 				encode_write_raw(&body, "{")
 				encode_write_field(&body, &text_first, "content")
@@ -141,7 +141,7 @@ openai_responses_encode_request_body :: proc(
 			}
 			continue
 		}
-		openai_responses_item_start(&body, &item_first)
+		encode_write_item(&body, &item_first)
 		field_first := true
 		encode_write_raw(&body, "{")
 		if message.Cache_Breakpoint {
@@ -250,13 +250,6 @@ openai_responses_encode_request_body :: proc(
 	encode_finish(&cursor)
 	encode_body_store(&cursor, &body)
 	return strings.clone(strings.to_string(body), allocator), .None
-}
-
-// openai_responses_item_start starts one item of the request's input array.
-@(private = "package")
-openai_responses_item_start :: proc(body: ^strings.Builder, first: ^bool) {
-	if !first^ { strings.write_byte(body, ',') }
-	first^ = false
 }
 
 // openai_responses_record_write writes the items one response record replays as, where

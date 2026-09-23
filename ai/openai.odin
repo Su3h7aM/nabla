@@ -2,7 +2,6 @@ package ai
 
 import "core:encoding/json"
 import "core:fmt"
-import "core:mem"
 import "core:strings"
 
 // Shared OpenAI helpers used by the Chat Completions and Responses adapters.
@@ -130,48 +129,14 @@ openai_tool_schema_valid :: proc(raw: string) -> bool {
 	return openai_json_skip(bytes, end) == len(bytes)
 }
 
-// openai_tool_parameters_bytes writes the object a tool's parameters are sent as into
-// out: the tool's own schema text, read once into the value the wire carries, with the
-// keys sorted like the rest of the body. It reports false when the text is not that
-// object, which is what makes a request carrying it unsendable.
-@(private = "package")
-openai_tool_parameters_bytes :: proc(schema: string, out: ^strings.Builder, allocator: mem.Allocator) -> bool {
-	value, parse_err := json.parse_string(schema, .JSON, true, allocator)
-	if parse_err != nil { return false }
-	defer json.destroy_value(value, allocator)
-	if _, is_object := value.(json.Object); !is_object { return false }
-	text, unparse_err := json.unparse(value, {sort_maps_by_key = true}, allocator)
-	if unparse_err != nil { return false }
-	defer delete(text, allocator)
-	strings.write_string(out, text)
-	return true
-}
-
 // openai_tool_parameters_write writes the parameters field of one tool definition and
-// reports whether the wire can carry it. The field is written only once the object it
-// carries is known, so a schema the wire cannot carry leaves nothing behind.
-//
-// A schema does not change between the requests of one conversation, so it is read once
-// and the bytes are kept: every later request copies what was already written.
+// reports whether the wire can carry it. The object itself comes from the shared writer,
+// which reads a schema once and keeps the bytes: a schema does not change between the
+// requests of one conversation.
 @(private = "package")
 openai_tool_parameters_write :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, first: ^bool, schema: string, allocator := context.allocator) -> bool {
-	slot, hit := encode_slot_for(cursor, schema, .Parameters)
-	if slot == nil {
-		scratch := strings.builder_make(allocator)
-		defer strings.builder_destroy(&scratch)
-		if !openai_tool_parameters_bytes(schema, &scratch, allocator) { return false }
-		encode_write_field(body, first, "parameters")
-		strings.write_string(body, strings.to_string(scratch))
-		return true
-	}
-	if !hit {
-		slot.ok = openai_tool_parameters_bytes(schema, &slot.bytes, allocator)
-		encode_slot_store(cursor, slot, schema)
-	}
-	if !slot.ok { return false }
 	encode_write_field(body, first, "parameters")
-	strings.write_string(body, strings.to_string(slot.bytes))
-	return true
+	return encode_write_object(cursor, body, schema, allocator)
 }
 
 openai_json_skip :: proc(raw: []u8, pos: int) -> int {

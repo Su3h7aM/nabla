@@ -1,21 +1,22 @@
 package ai
 
+import "core:encoding/json"
 import "core:io"
 import "core:mem"
 import "core:strings"
 
-// The OpenAI adapters write a request body as bytes rather than building a JSON value
-// and writing that out. A conversation is mostly text the request carries again: the
+// Every adapter writes a request body as bytes rather than building a JSON value and
+// writing that out. A conversation is mostly text the request carries again: the
 // instruction prefix, every tool schema, every tool result, and every response record
 // the endpoint sent. A value built from that text is cloned and freed on every send,
 // while the text itself rarely changed.
 //
 // What repeats is kept. A slot is one text and the exact bytes it was written as, and
 // every string the adapters put on the wire passes through one: a quoted literal, a
-// tool's parameters, or a response record's items. The cache is an accelerator and
-// never a source of truth, because bytes are reused only when the text they were
-// written for is the text the request carries now. A body encoded with a cache is
-// therefore byte for byte the body encoded without one: the cache decides how much
+// tool's schema, a call's arguments, or a response record's items. The cache is an
+// accelerator and never a source of truth, because bytes are reused only when the text
+// they were written for is the text the request carries now. A body encoded with a cache
+// is therefore byte for byte the body encoded without one: the cache decides how much
 // work repeats, never what is sent.
 //
 // A zero cache holds nothing and needs no initialization. One cache is walked by one
@@ -72,7 +73,8 @@ Encode_Slot :: struct {
 Encode_Text_Kind :: enum {
 	// Literal is a request's text as the JSON string it goes on the wire as.
 	Literal,
-	// Parameters is a tool's own schema, as the object the wire carries.
+	// Parameters is a text the wire carries as the object itself: a tool's schema, or a
+	// call's arguments as the Messages API sends them.
 	Parameters,
 	// Record is one response record the endpoint sent, as the items it replays as.
 	Record,
@@ -201,6 +203,14 @@ encode_write_field :: proc(body: ^strings.Builder, first: ^bool, name: string) {
 	encode_write_raw(body, "\":")
 }
 
+// encode_write_item starts one element of the array being written, adding the comma the
+// previous element needs.
+@(private = "package")
+encode_write_item :: proc(body: ^strings.Builder, first: ^bool) {
+	if !first^ { strings.write_byte(body, ',') }
+	first^ = false
+}
+
 // encode_write_literal_string writes a JSON string this package chose, such as a role
 // or a name for a value it decided. Nothing in it needs escaping.
 @(private = "package")
@@ -243,4 +253,46 @@ encode_write_text :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: 
 		encode_slot_store(cursor, slot, text)
 	}
 	strings.write_string(body, strings.to_string(slot.bytes))
+}
+
+// encode_write_object writes a text the wire carries as a JSON object and reports whether
+// it is one. The object is written with the keys of every object in it sorted, which is
+// how the standard library's writer writes a parsed value, and it is written once: a tool
+// schema and a call's arguments are the same bytes on every request that carries them.
+// A text that is not an object is remembered as one, so it is read once too and the caller
+// decides what the wire carries in its place.
+@(private = "package")
+encode_write_object :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: string, allocator: mem.Allocator) -> bool {
+	slot, hit := encode_slot_for(cursor, text, .Parameters)
+	if slot == nil {
+		scratch := strings.builder_make(allocator)
+		defer strings.builder_destroy(&scratch)
+		if !encode_object_bytes(text, &scratch, allocator) { return false }
+		strings.write_string(body, strings.to_string(scratch))
+		return true
+	}
+	if !hit {
+		slot.ok = encode_object_bytes(text, &slot.bytes, allocator)
+		encode_slot_store(cursor, slot, text)
+	}
+	if !slot.ok { return false }
+	strings.write_string(body, strings.to_string(slot.bytes))
+	return true
+}
+
+// encode_object_bytes writes the object a text carries. It is the one place a request's
+// text is parsed on the way out, and only because the keys of every object in it are
+// sorted so that the same conversation writes the same bytes, in this process and in the
+// next one. Its result is what a slot keeps, so the parse happens once per text.
+@(private = "package")
+encode_object_bytes :: proc(text: string, out: ^strings.Builder, allocator: mem.Allocator) -> bool {
+	value, parse_err := json.parse_string(text, .JSON, true, allocator)
+	if parse_err != nil { return false }
+	defer json.destroy_value(value, allocator)
+	if _, is_object := value.(json.Object); !is_object { return false }
+	rendered, unparse_err := json.unparse(value, {sort_maps_by_key = true}, allocator)
+	if unparse_err != nil { return false }
+	defer delete(rendered, allocator)
+	strings.write_string(out, rendered)
+	return true
 }

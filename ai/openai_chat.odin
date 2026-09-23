@@ -39,8 +39,7 @@ openai_chat_encode_request :: proc(
 		// Chat Completions has no instruction field, so the lane becomes the leading
 		// message it does understand. It is emitted here rather than carried in
 		// request.Messages, because an instruction is not a conversation turn.
-		if !item_first { strings.write_byte(&body, ',') }
-		item_first = false
+		encode_write_item(&body, &item_first)
 		field_first := true
 		encode_write_raw(&body, "{")
 		encode_write_field(&body, &field_first, "content")
@@ -53,8 +52,7 @@ openai_chat_encode_request :: proc(
 		// Chat Completions has no reasoning input; reasoning continuity is
 		// a Responses replay contract, so these items are dropped here.
 		if message.Role == .Reasoning { continue }
-		if !item_first { strings.write_byte(&body, ',') }
-		item_first = false
+		encode_write_item(&body, &item_first)
 		field_first := true
 		encode_write_raw(&body, "{")
 		if message.Cache_Breakpoint {

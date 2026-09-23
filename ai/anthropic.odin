@@ -1,6 +1,7 @@
 package ai
 
 import "core:encoding/json"
+import "core:mem"
 import "core:strings"
 
 // The Anthropic Messages API. It shares the request contract but not the wire
@@ -24,7 +25,18 @@ ANTHROPIC_BLOCK_TOOL_RESULT :: "tool_result"
 
 // --- encoding ----------------------------------------------------------------
 
-anthropic_encode_request :: proc(request: Provider_Request, allocator := context.allocator) -> (string, Provider_Request_Error) {
+// anthropic_encode_request writes one Messages request body as bytes. The body is mostly
+// text the cache already holds: the instruction lane, every tool's schema, every tool
+// result, and the arguments of every call. A text that did not change is copied rather
+// than read and written again.
+anthropic_encode_request :: proc(
+	request: Provider_Request,
+	cache: ^Provider_Encode_Cache,
+	allocator := context.allocator,
+) -> (
+	string,
+	Provider_Request_Error,
+) {
 	if err := Provider_Validate_Request(request); err != .None { return "", err }
 	// max_tokens has no default in this API: it is required, and inventing one
 	// would either truncate an answer or silently pick a bound the model does not
@@ -34,217 +46,269 @@ anthropic_encode_request :: proc(request: Provider_Request, allocator := context
 		if !openai_tool_schema_valid(tool.Parameters_JSON) { return "", .Invalid_Tools }
 	}
 
-	object := make(json.Object, 8, allocator)
-	anthropic_object_set(&object, "model", json.String(strings.clone(request.Model, allocator)), allocator)
-	anthropic_object_set(&object, "max_tokens", json.Integer(request.Max_Output_Tokens), allocator)
-	anthropic_object_set(&object, "stream", json.Boolean(true), allocator)
-	if request.Instructions_Present {
-		anthropic_object_set(&object, "system", json.String(strings.clone(request.Instructions, allocator)), allocator)
-	}
-	if request.Reasoning_Effort_Present {
-		// The effort name is opaque and travels verbatim. Anthropic states it as a
-		// level under output_config, which is the same shape the harness stores.
-		output := make(json.Object, 1, allocator)
-		anthropic_object_set(&output, "effort", json.String(strings.clone(request.Reasoning_Effort, allocator)), allocator)
-		anthropic_object_set(&object, "output_config", json.Value(output), allocator)
-	}
+	cursor := encode_cursor(cache, allocator)
+	body := encode_body_make(&cursor, allocator)
+	defer strings.builder_destroy(&body)
+
+	// Fields are written in the order the standard library's writer sorts them in, so a
+	// body is the bytes a parsed request would be written as, and the same conversation
+	// writes the same bytes in any process.
+	first := true
+	encode_write_raw(&body, "{")
 	if request.Cache_Request_Present && request.Cache_Request {
 		// Top-level cache control marks the last cacheable block and advances as
 		// the conversation grows, so an append-only history reuses its whole
 		// prefix without the harness naming a breakpoint.
-		cache := make(json.Object, 1, allocator)
-		anthropic_object_set(&cache, "type", json.String(strings.clone("ephemeral", allocator)), allocator)
-		anthropic_object_set(&object, "cache_control", json.Value(cache), allocator)
+		encode_write_field(&body, &first, "cache_control")
+		encode_write_raw(&body, "{\"type\":")
+		encode_write_literal_string(&body, "ephemeral")
+		encode_write_raw(&body, "}")
 	}
-
-	messages, messages_err := anthropic_encode_messages(request.Messages, allocator)
-	if messages_err != .None { return "", messages_err }
-	anthropic_object_set(&object, "messages", json.Value(messages), allocator)
-
+	encode_write_field(&body, &first, "max_tokens")
+	encode_write_int(&body, request.Max_Output_Tokens)
+	encode_write_field(&body, &first, "messages")
+	encode_write_raw(&body, "[")
+	if messages_err := anthropic_write_messages(&cursor, &body, request.Messages, allocator); messages_err != .None {
+		return "", messages_err
+	}
+	encode_write_raw(&body, "]")
+	encode_write_field(&body, &first, "model")
+	encode_write_text(&cursor, &body, request.Model)
+	if request.Reasoning_Effort_Present {
+		// The effort name is opaque and travels verbatim. Anthropic states it as a
+		// level under output_config, which is the same shape the harness stores.
+		encode_write_field(&body, &first, "output_config")
+		encode_write_raw(&body, "{\"effort\":")
+		encode_write_text(&cursor, &body, request.Reasoning_Effort)
+		encode_write_raw(&body, "}")
+	}
+	encode_write_field(&body, &first, "stream")
+	encode_write_bool(&body, true)
+	if request.Instructions_Present {
+		encode_write_field(&body, &first, "system")
+		encode_write_text(&cursor, &body, request.Instructions)
+	}
 	if len(request.Tools) > 0 {
-		tools := make(json.Array, 0, len(request.Tools), allocator)
+		encode_write_field(&body, &first, "tools")
+		encode_write_raw(&body, "[")
+		tool_first := true
 		for tool in request.Tools {
-			definition, ok := anthropic_tool_def(tool, allocator)
-			if !ok { return "", .Invalid_Tools }
-			append(&tools, definition)
+			encode_write_item(&body, &tool_first)
+			if !anthropic_write_tool_def(&cursor, &body, tool, allocator) { return "", .Invalid_Tools }
 		}
-		anthropic_object_set(&object, "tools", json.Value(tools), allocator)
+		encode_write_raw(&body, "]")
 	}
-
-	value := json.Value(object)
-	// Keys are sorted so the same conversation encodes to the same bytes every
-	// time, including in a later process. Map iteration order is otherwise
-	// allocation-dependent, which would move bytes inside the cached prefix.
-	result, err := json.unparse(value, {sort_maps_by_key = true}, allocator)
-	json.destroy_value(value, allocator)
-	if err != nil { return "", .Invalid_Message }
-	return result, .None
+	encode_write_raw(&body, "}")
+	encode_finish(&cursor)
+	encode_body_store(&cursor, &body)
+	return strings.clone(strings.to_string(body), allocator), .None
 }
 
-// anthropic_object_set inserts one member. A map is passed by pointer because
-// Odin does not let a map be written through a value parameter.
-@(private)
-anthropic_object_set :: proc(object: ^json.Object, key: string, value: json.Value, allocator := context.allocator) {
-	object^[strings.clone(key, allocator)] = value
-}
-
-// anthropic_encode_messages projects the conversation onto the Messages API. The
+// anthropic_write_messages projects the conversation onto the Messages API. The
 // projection is not mechanical: this API requires roles to alternate, so
 // consecutive user content is one user turn. Text and tool results accumulate
 // into the open user turn until something that is not user content ends it. A
 // turn that ends up holding exactly one text block is emitted in the plain
 // string form, so an ordinary conversation encodes to the bytes it always has.
 @(private)
-anthropic_encode_messages :: proc(messages: []Provider_Message, allocator := context.allocator) -> (json.Array, Provider_Request_Error) {
-	result := make(json.Array, 0, len(messages), allocator)
-	// The open user turn. A dynamic array owns its buffer, so the one buffer is
-	// released once and each flushed turn gets its own copy that the message then
-	// owns.
-	pending_user := make([dynamic]json.Value, 0, 4, allocator)
-	defer delete(pending_user)
+anthropic_write_messages :: proc(
+	cursor: ^Encode_Cursor,
+	body: ^strings.Builder,
+	messages: []Provider_Message,
+	allocator: mem.Allocator,
+) -> Provider_Request_Error {
+	item_first := true
+	// The open user turn: the text and tool results the messages in it carry, and
+	// whether exactly one text block is among them. The turn is written when a message
+	// that is not user content ends it, so what it holds is counted as it is handed over.
+	open := -1
+	open_blocks := 0
+	open_texts := 0
+	turns := 0
 
-	for message in messages {
+	for message, index in messages {
 		switch message.Role {
 		case .System, .Reasoning:
 			// The system prompt is the instruction lane, and a replayed reasoning
 			// item has no representation here. Neither may be sent as a turn.
 			continue
 		case .User:
-			anthropic_user_add_text(&pending_user, message.Content, allocator)
+			if message.Content == "" { continue }
+			if open < 0 { open = index }
+			open_blocks += 1
+			open_texts += 1
+		case .Tool:
+			if message.Tool_Call_ID == "" { return .Invalid_Message }
+			if open < 0 { open = index }
+			open_blocks += 1
 		case .Assistant:
-			anthropic_flush_user(&result, &pending_user, allocator)
+			if open_blocks > 0 {
+				if err := anthropic_write_user_turn(cursor, body, messages[open:index], open_blocks, open_texts, &item_first); err != .None {
+					return err
+				}
+				turns += 1
+				open = -1
+				open_blocks = 0
+				open_texts = 0
+			}
 			// This API opens a conversation with a user turn. The only assistant
 			// turn that can come first is the checkpoint summary the harness
 			// carries, which is harness-authored context rather than something the
 			// model said, so it opens the conversation instead of being a message
 			// the API would refuse.
 			role := "assistant"
-			if len(result) == 0 && len(message.Tool_Calls) == 0 { role = "user" }
+			if turns == 0 && len(message.Tool_Calls) == 0 { role = "user" }
+			encode_write_item(body, &item_first)
+			field_first := true
+			encode_write_raw(body, "{")
+			encode_write_field(body, &field_first, "content")
 			if len(message.Tool_Calls) == 0 {
-				append(&result, json.Value(anthropic_text_message(role, message.Content, allocator)))
+				encode_write_text(cursor, body, message.Content)
+			} else {
+				encode_write_raw(body, "[")
+				block_first := true
+				if message.Content != "" {
+					encode_write_item(body, &block_first)
+					anthropic_write_text_block(cursor, body, message.Content)
+				}
+				for call in message.Tool_Calls {
+					encode_write_item(body, &block_first)
+					if err := anthropic_write_tool_use(cursor, body, call, allocator); err != .None { return err }
+				}
+				encode_write_raw(body, "]")
+			}
+			encode_write_field(body, &field_first, "role")
+			encode_write_literal_string(body, role)
+			encode_write_raw(body, "}")
+			turns += 1
+		case .Invalid:
+			return .Invalid_Message
+		}
+	}
+	if open_blocks > 0 {
+		if err := anthropic_write_user_turn(cursor, body, messages[open:], open_blocks, open_texts, &item_first); err != .None { return err }
+	}
+	return .None
+}
+
+// anthropic_write_user_turn writes the open user turn. One text block goes out as the
+// plain string this API has always accepted for a text turn; anything else is written as
+// the blocks it carries, in the order the conversation hands them over.
+@(private)
+anthropic_write_user_turn :: proc(
+	cursor: ^Encode_Cursor,
+	body: ^strings.Builder,
+	turn: []Provider_Message,
+	blocks: int,
+	texts: int,
+	item_first: ^bool,
+) -> Provider_Request_Error {
+	encode_write_item(body, item_first)
+	field_first := true
+	encode_write_raw(body, "{")
+	encode_write_field(body, &field_first, "content")
+	if blocks == 1 && texts == 1 {
+		for message in turn {
+			if message.Role != .User || message.Content == "" { continue }
+			encode_write_text(cursor, body, message.Content)
+			break
+		}
+	} else {
+		encode_write_raw(body, "[")
+		block_first := true
+		for message in turn {
+			switch message.Role {
+			case .User:
+				if message.Content == "" { continue }
+				encode_write_item(body, &block_first)
+				anthropic_write_text_block(cursor, body, message.Content)
+			case .Tool:
+				encode_write_item(body, &block_first)
+				if err := anthropic_write_tool_result(cursor, body, message); err != .None { return err }
+			case .System, .Reasoning, .Assistant, .Invalid:
 				continue
 			}
-			blocks := make(json.Array, 0, len(message.Tool_Calls) + 1, allocator)
-			if message.Content != "" {
-				append(&blocks, json.Value(anthropic_text_block(message.Content, allocator)))
-			}
-			for call in message.Tool_Calls {
-				block, ok := anthropic_tool_use_block(call, allocator)
-				if !ok { return nil, .Invalid_Tool_Call }
-				append(&blocks, json.Value(block))
-			}
-			turn := make(json.Object, 2, allocator)
-			anthropic_object_set(&turn, "role", json.String(strings.clone(role, allocator)), allocator)
-			anthropic_object_set(&turn, "content", json.Value(blocks), allocator)
-			append(&result, json.Value(turn))
-		case .Tool:
-			block, ok := anthropic_tool_result_block(message, allocator)
-			if !ok { return nil, .Invalid_Message }
-			append(&pending_user, block)
-		case .Invalid:
-			return nil, .Invalid_Message
 		}
+		encode_write_raw(body, "]")
 	}
-	anthropic_flush_user(&result, &pending_user, allocator)
-	return result, .None
+	encode_write_field(body, &field_first, "role")
+	encode_write_literal_string(body, "user")
+	encode_write_raw(body, "}")
+	return .None
 }
 
 @(private)
-anthropic_user_add_text :: proc(pending: ^[dynamic]json.Value, text: string, allocator := context.allocator) {
-	if text == "" { return }
-	append(pending, json.Value(anthropic_text_block(text, allocator)))
+anthropic_write_text_block :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: string) {
+	field_first := true
+	encode_write_raw(body, "{")
+	encode_write_field(body, &field_first, "text")
+	encode_write_text(cursor, body, text)
+	encode_write_field(body, &field_first, "type")
+	encode_write_literal_string(body, ANTHROPIC_BLOCK_TEXT)
+	encode_write_raw(body, "}")
 }
 
-// anthropic_flush_user closes the open user turn. The blocks are moved into the
-// message, which owns them, and the buffer is reused. One text block is emitted
-// as the plain string content this API has always accepted for a text turn.
+// anthropic_write_tool_use writes a call as its content block. The arguments are a JSON
+// object on the wire, so a call whose arguments are not one is replayed with an empty
+// object: the id and name are preserved so the paired result still answers this call, and
+// the rejection travels in that result rather than in invented arguments.
 @(private)
-anthropic_flush_user :: proc(result: ^json.Array, pending: ^[dynamic]json.Value, allocator := context.allocator) {
-	if len(pending^) == 0 { return }
-	if len(pending^) == 1 {
-		if object, is_object := pending^[0].(json.Object); is_object {
-			block_type, is_text := object["type"].(json.String)
-			text, has_text := object["text"].(json.String)
-			if is_text && has_text && block_type == ANTHROPIC_BLOCK_TEXT {
-				message := anthropic_text_message("user", string(text), allocator)
-				json.destroy_value(pending^[0], allocator)
-				clear(pending)
-				append(result, message)
-				return
-			}
-		}
+anthropic_write_tool_use :: proc(
+	cursor: ^Encode_Cursor,
+	body: ^strings.Builder,
+	call: Provider_Tool_Call,
+	allocator: mem.Allocator,
+) -> Provider_Request_Error {
+	if call.ID == "" || call.Name == "" { return .Invalid_Tool_Call }
+	field_first := true
+	encode_write_raw(body, "{")
+	encode_write_field(body, &field_first, "id")
+	encode_write_text(cursor, body, call.ID)
+	encode_write_field(body, &field_first, "input")
+	if !encode_write_object(cursor, body, call.Arguments, allocator) { encode_write_raw(body, "{}") }
+	encode_write_field(body, &field_first, "name")
+	encode_write_text(cursor, body, call.Name)
+	encode_write_field(body, &field_first, "type")
+	encode_write_literal_string(body, ANTHROPIC_BLOCK_TOOL_USE)
+	encode_write_raw(body, "}")
+	return .None
+}
+
+@(private)
+anthropic_write_tool_result :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, message: Provider_Message) -> Provider_Request_Error {
+	if message.Tool_Call_ID == "" { return .Invalid_Message }
+	field_first := true
+	encode_write_raw(body, "{")
+	encode_write_field(body, &field_first, "content")
+	encode_write_text(cursor, body, message.Content)
+	if message.Tool_Is_Error {
+		encode_write_field(body, &field_first, "is_error")
+		encode_write_bool(body, true)
 	}
-	blocks := make(json.Array, len(pending^), allocator)
-	for value, i in pending^ { blocks[i] = value }
-	turn := make(json.Object, 2, allocator)
-	anthropic_object_set(&turn, "role", json.String(strings.clone("user", allocator)), allocator)
-	anthropic_object_set(&turn, "content", json.Value(blocks), allocator)
-	append(result, json.Value(turn))
-	clear(&pending^)
+	encode_write_field(body, &field_first, "tool_use_id")
+	encode_write_text(cursor, body, message.Tool_Call_ID)
+	encode_write_field(body, &field_first, "type")
+	encode_write_literal_string(body, ANTHROPIC_BLOCK_TOOL_RESULT)
+	encode_write_raw(body, "}")
+	return .None
 }
 
+// anthropic_write_tool_def writes one tool definition. Its schema is the object the tool
+// declared, written once and kept: a schema does not change between the requests of one
+// conversation. Strict schema enforcement is not set: an optional argument has to stay
+// optional, and the harness reads and validates the arguments itself.
 @(private)
-anthropic_text_message :: proc(role, text: string, allocator := context.allocator) -> json.Value {
-	message := make(json.Object, 2, allocator)
-	anthropic_object_set(&message, "role", json.String(strings.clone(role, allocator)), allocator)
-	anthropic_object_set(&message, "content", json.String(strings.clone(text, allocator)), allocator)
-	return json.Value(message)
-}
-
-@(private)
-anthropic_text_block :: proc(text: string, allocator := context.allocator) -> json.Value {
-	block := make(json.Object, 2, allocator)
-	anthropic_object_set(&block, "type", json.String(strings.clone(ANTHROPIC_BLOCK_TEXT, allocator)), allocator)
-	anthropic_object_set(&block, "text", json.String(strings.clone(text, allocator)), allocator)
-	return json.Value(block)
-}
-
-// anthropic_tool_use_block turns a call into its content block. The arguments are
-// a JSON object on the wire, so a call whose arguments are not one is replayed
-// with an empty object: the id and name are preserved so the paired result still
-// answers this call, and the rejection travels in that result rather than in
-// invented arguments.
-@(private)
-anthropic_tool_use_block :: proc(call: Provider_Tool_Call, allocator := context.allocator) -> (json.Value, bool) {
-	if call.ID == "" || call.Name == "" { return nil, false }
-	input: json.Value
-	if parsed, parse_err := json.parse_string(call.Arguments, .JSON, true, allocator); parse_err == nil {
-		if _, is_object := parsed.(json.Object); is_object { input = json.clone_value(parsed, allocator) }
-		json.destroy_value(parsed, allocator)
-	}
-	if input == nil { input = json.Value(make(json.Object, 0, allocator)) }
-	block := make(json.Object, 4, allocator)
-	anthropic_object_set(&block, "type", json.String(strings.clone(ANTHROPIC_BLOCK_TOOL_USE, allocator)), allocator)
-	anthropic_object_set(&block, "id", json.String(strings.clone(call.ID, allocator)), allocator)
-	anthropic_object_set(&block, "name", json.String(strings.clone(call.Name, allocator)), allocator)
-	anthropic_object_set(&block, "input", input, allocator)
-	return json.Value(block), true
-}
-
-@(private)
-anthropic_tool_result_block :: proc(message: Provider_Message, allocator := context.allocator) -> (json.Value, bool) {
-	if message.Tool_Call_ID == "" { return nil, false }
-	block := make(json.Object, 4, allocator)
-	anthropic_object_set(&block, "type", json.String(strings.clone(ANTHROPIC_BLOCK_TOOL_RESULT, allocator)), allocator)
-	anthropic_object_set(&block, "tool_use_id", json.String(strings.clone(message.Tool_Call_ID, allocator)), allocator)
-	anthropic_object_set(&block, "content", json.String(strings.clone(message.Content, allocator)), allocator)
-	if message.Tool_Is_Error { anthropic_object_set(&block, "is_error", json.Boolean(true), allocator) }
-	return json.Value(block), true
-}
-
-@(private)
-anthropic_tool_def :: proc(tool: Provider_Tool_Def, allocator := context.allocator) -> (json.Value, bool) {
-	schema, parse_err := json.parse_string(tool.Parameters_JSON, .JSON, true, allocator)
-	if parse_err != nil { return nil, false }
-	defer json.destroy_value(schema, allocator)
-	if _, is_object := schema.(json.Object); !is_object { return nil, false }
-	definition := make(json.Object, 4, allocator)
-	anthropic_object_set(&definition, "name", json.String(strings.clone(tool.Name, allocator)), allocator)
-	anthropic_object_set(&definition, "description", json.String(strings.clone(tool.Description, allocator)), allocator)
-	// Strict schema enforcement is not set: an optional argument has to stay
-	// optional, and the harness reads and validates the arguments itself.
-	anthropic_object_set(&definition, "input_schema", json.Value(json.clone_value(schema, allocator)), allocator)
-	return json.Value(definition), true
+anthropic_write_tool_def :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, tool: Provider_Tool_Def, allocator: mem.Allocator) -> bool {
+	field_first := true
+	encode_write_raw(body, "{")
+	encode_write_field(body, &field_first, "description")
+	encode_write_text(cursor, body, tool.Description)
+	encode_write_field(body, &field_first, "input_schema")
+	if !encode_write_object(cursor, body, tool.Parameters_JSON, allocator) { return false }
+	encode_write_field(body, &field_first, "name")
+	encode_write_text(cursor, body, tool.Name)
+	encode_write_raw(body, "}")
+	return true
 }
 
 // --- decoding ----------------------------------------------------------------
