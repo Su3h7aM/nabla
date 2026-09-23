@@ -135,6 +135,13 @@ FONT_GREEN :: layout.Font(5)
 FONT_CYAN :: layout.Font(6)
 FONT_YELLOW :: layout.Font(7)
 
+// TUI_COMMAND_CAPACITY bounds the command nodes retained for one transcript frame.
+TUI_COMMAND_CAPACITY :: 4096
+
+// FOOTER_KIB_ROUNDING and KIBIBYTE keep footer token counts rounded to the nearest KiB.
+FOOTER_KIB_ROUNDING :: 512
+KIBIBYTE :: 1024
+
 // CONVERSATION_CAPACITIES budgets one transcript frame: three nodes per
 // labeled entry (label, body element, body text) and two per unlabeled one,
 // plus the root. Commands stay bounded by the viewport because culling drops
@@ -146,7 +153,7 @@ CONVERSATION_CAPACITIES :: layout.Capacities {
 	nodes          = 16384,
 	children       = 32768,
 	clips          = 8,
-	commands       = 4096,
+	commands       = TUI_COMMAND_CAPACITY,
 	text_lines     = 32768,
 	measured_words = 131072,
 	measure_cache  = 8192,
@@ -958,9 +965,15 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 			// the footer is the only place a reader can see that from.
 			if status.session_hit_partial { cache = fmt.tprintf("%s (partial)", cache) }
 		} else if status.session_cache_present {
-			cache = fmt.tprintf("cache %dk", (status.session_cache_read + 512) / 1024)
+			cache = fmt.tprintf("cache %dk", (status.session_cache_read + FOOTER_KIB_ROUNDING) / KIBIBYTE)
 		}
-		left = fmt.tprintf("%dk/%dk | cost %s | %s", (status.est_input + 512) / 1024, (status.context_window + 512) / 1024, cost, cache)
+		left = fmt.tprintf(
+			"%dk/%dk | cost %s | %s",
+			(status.est_input + FOOTER_KIB_ROUNDING) / KIBIBYTE,
+			(status.context_window + FOOTER_KIB_ROUNDING) / KIBIBYTE,
+			cost,
+			cache,
+		)
 		right = fmt.tprintf("(%s) %s", status.provider_id, status.model_id)
 		if effort_text := strings.trim_space(status.effort); effort_text != "" {
 			right = fmt.tprintf("%s | %s", right, effort_text)
