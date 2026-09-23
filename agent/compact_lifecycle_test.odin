@@ -17,7 +17,7 @@ import "nabla:ai"
 // property worth testing is a timing one: the summary arrives while the foreground
 // is working and the context it replaces has already moved on.
 
-COMPACT_TEST_BOUND :: 10 * time.Second
+COMPACT_TEST_BOUND :: 2 * time.Second
 
 COMPACT_TEST_SUMMARY :: "the earlier fixtures are built and their paths are recorded"
 
@@ -754,6 +754,7 @@ test_a_transient_summary_failure_is_retried_on_the_same_bytes :: proc(t: ^testin
 // waits out the cooldown before any new snapshot starts.
 @(test)
 test_a_summary_that_produced_nothing_is_not_sent_again :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, "test_a_summary_that_produced_nothing_is_not_sent_again") { return }
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
