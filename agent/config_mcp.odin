@@ -107,8 +107,12 @@ mcp_servers_load :: proc(L: ^l.State, idx: c.int, allocator: mem.Allocator) -> (
 			mcp_servers_destroy(&servers, allocator)
 			return {}, .Invalid
 		}
-		id, id_ok := lua_string(L, -2, allocator)
-		if !id_ok || !tool_name_valid(id) {
+		id, id_error := lua_string(L, -2, allocator)
+		if id_error != .None {
+			mcp_servers_destroy(&servers, allocator)
+			return {}, id_error
+		}
+		if !tool_name_valid(id) {
 			delete(id, allocator)
 			mcp_servers_destroy(&servers, allocator)
 			return {}, .Invalid
@@ -121,7 +125,12 @@ mcp_servers_load :: proc(L: ^l.State, idx: c.int, allocator: mem.Allocator) -> (
 			mcp_servers_destroy(&servers, allocator)
 			return {}, load_err
 		}
-		append(&servers, server)
+		appended := append(&servers, server)
+		if appended != 1 {
+			if appended == 0 { mcp_server_config_destroy(&server, allocator) }
+			mcp_servers_destroy(&servers, allocator)
+			return {}, .Allocation
+		}
 		l.pop(L, 1)
 	}
 	return servers, .None
@@ -131,8 +140,10 @@ mcp_servers_load :: proc(L: ^l.State, idx: c.int, allocator: mem.Allocator) -> (
 mcp_server_load :: proc(L: ^l.State, raw_idx: c.int, id: string, allocator: mem.Allocator, out: ^MCP_Server_Config) -> Config_Error {
 	if !lua_plain_table(L, raw_idx) { return .Invalid }
 	idx := l.absindex(L, raw_idx)
+	server_id, server_id_error := strings.clone(id, allocator)
+	if server_id_error != nil { return .Allocation }
 	out^ = MCP_Server_Config {
-		id                   = strings.clone(id, allocator),
+		id                   = server_id,
 		discovery_timeout    = MCP_DEFAULT_DISCOVERY_TIMEOUT,
 		call_timeout         = MCP_DEFAULT_CALL_TIMEOUT,
 		maximum_call_timeout = MCP_DEFAULT_MAXIMUM_CALL_TIMEOUT,
@@ -143,8 +154,9 @@ mcp_server_load :: proc(L: ^l.State, raw_idx: c.int, id: string, allocator: mem.
 	defer l.settop(L, base)
 
 	lua_field(L, idx, "executable")
-	executable, executable_ok := lua_string(L, -1, allocator)
-	if !executable_ok || !strings.has_prefix(executable, "/") {
+	executable, executable_error := lua_string(L, -1, allocator)
+	if executable_error != .None { return executable_error }
+	if !strings.has_prefix(executable, "/") {
 		delete(executable, allocator)
 		return .Invalid
 	}
@@ -153,32 +165,32 @@ mcp_server_load :: proc(L: ^l.State, raw_idx: c.int, id: string, allocator: mem.
 
 	lua_field(L, idx, "arguments")
 	if l.type(L, -1) != .NIL {
-		arguments, arguments_ok := mcp_string_list(L, -1, allocator)
-		if !arguments_ok { return .Invalid }
+		arguments, arguments_error := mcp_string_list(L, -1, allocator)
+		if arguments_error != .None { return arguments_error }
 		out^.stdio.arguments = arguments
 	}
 	l.settop(L, base)
 
 	lua_field(L, idx, "working_directory")
 	if l.type(L, -1) != .NIL {
-		directory, directory_ok := lua_string(L, -1, allocator)
-		if !directory_ok { return .Invalid }
+		directory, directory_error := lua_string(L, -1, allocator)
+		if directory_error != .None { return directory_error }
 		out^.stdio.working_directory = directory
 	}
 	l.settop(L, base)
 
 	lua_field(L, idx, "environment")
 	if l.type(L, -1) != .NIL {
-		environment, environment_ok := mcp_environment_load(L, -1, allocator)
-		if !environment_ok { return .Invalid }
+		environment, environment_error := mcp_environment_load(L, -1, allocator)
+		if environment_error != .None { return environment_error }
 		out^.stdio.environment = environment
 	}
 	l.settop(L, base)
 
 	lua_field(L, idx, "tools")
 	if l.type(L, -1) != .NIL {
-		tools, tools_ok := mcp_tool_configs_load(L, -1, allocator)
-		if !tools_ok { return .Invalid }
+		tools, tools_error := mcp_tool_configs_load(L, -1, allocator)
+		if tools_error != .None { return tools_error }
 		out^.tools = tools
 	}
 	l.settop(L, base)
@@ -218,23 +230,29 @@ mcp_timeout_ms :: proc(L: ^l.State, idx: c.int, field: string) -> (value: time.D
 }
 
 @(private)
-mcp_string_list :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]string, bool) {
-	if !lua_plain_table(L, raw_idx) { return nil, false }
+mcp_string_list :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]string, Config_Error) {
+	if !lua_plain_table(L, raw_idx) { return nil, .Invalid }
 	index := l.absindex(L, raw_idx)
 	length := int(l.rawlen(L, index))
-	if length > MCP_MAX_ENTRIES { return nil, false }
-	values := make([dynamic]string, 0, length, allocator)
+	if length > MCP_MAX_ENTRIES { return nil, .Invalid }
+	values, values_error := make([dynamic]string, 0, length, allocator)
+	if values_error != nil { return nil, .Allocation }
 	for position in 1 ..= length {
 		l.rawgeti(L, index, l.Integer(position))
-		value, value_ok := lua_string(L, -1, allocator)
+		value, value_error := lua_string(L, -1, allocator)
 		l.pop(L, 1)
-		if !value_ok {
+		if value_error != .None {
 			mcp_strings_release(values, allocator)
-			return nil, false
+			return nil, value_error
 		}
-		append(&values, value)
+		appended := append(&values, value)
+		if appended != 1 {
+			if appended == 0 { delete(value, allocator) }
+			mcp_strings_release(values, allocator)
+			return nil, .Allocation
+		}
 	}
-	return values[:], true
+	return values[:], .None
 }
 
 @(private)
@@ -247,30 +265,45 @@ mcp_strings_release :: proc(values: [dynamic]string, allocator: mem.Allocator) {
 // usable as an environment variable so a malformed entry is refused here rather
 // than by a server that silently sees nothing.
 @(private)
-mcp_environment_load :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]MCP_Environment, bool) {
+mcp_environment_load :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]MCP_Environment, Config_Error) {
 	index := l.absindex(L, raw_idx)
-	entries := make([dynamic]MCP_Environment, 0, allocator)
+	entries, entries_error := make([dynamic]MCP_Environment, 0, allocator)
+	if entries_error != nil { return nil, .Allocation }
 	count := 0
 	l.pushnil(L)
 	for l.next(L, index) != 0 {
 		count += 1
 		if count > MCP_MAX_ENTRIES || l.type(L, -2) != .STRING {
 			mcp_environment_release(entries, allocator)
-			return nil, false
+			return nil, .Invalid
 		}
-		name, name_ok := lua_string(L, -2, allocator)
-		value, value_ok := lua_string(L, -1, allocator)
+		name, name_error := lua_string(L, -2, allocator)
+		value, value_error := lua_string(L, -1, allocator)
 		// Only the value is popped: the key has to stay for the next call to next.
 		l.pop(L, 1)
-		if !name_ok || !value_ok || !mcp_environment_name_valid(name) {
+		if name_error != .None { delete(value, allocator); mcp_environment_release(entries, allocator); return nil, name_error }
+		if value_error != .None { delete(name, allocator); mcp_environment_release(entries, allocator); return nil, value_error }
+		if !mcp_environment_name_valid(name) {
 			delete(name, allocator)
 			delete(value, allocator)
 			mcp_environment_release(entries, allocator)
-			return nil, false
+			return nil, .Invalid
 		}
-		append(&entries, MCP_Environment{name = name, value = value})
+		entry := MCP_Environment {
+			name  = name,
+			value = value,
+		}
+		appended := append(&entries, entry)
+		if appended != 1 {
+			if appended == 0 {
+				delete(name, allocator)
+				delete(value, allocator)
+			}
+			mcp_environment_release(entries, allocator)
+			return nil, .Allocation
+		}
 	}
-	return entries[:], true
+	return entries[:], .None
 }
 
 @(private)
@@ -299,19 +332,31 @@ mcp_environment_name_valid :: proc(name: string) -> bool {
 // mcp_tool_configs_load reads optional per-tool overrides. The key is the exact
 // remote name. enabled defaults to true within an entry, and name is optional.
 @(private)
-mcp_tool_configs_load :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]MCP_Tool_Config, bool) {
-	if !lua_plain_table(L, raw_idx) { return nil, false }
+mcp_tool_configs_load :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]MCP_Tool_Config, Config_Error) {
+	if !lua_plain_table(L, raw_idx) { return nil, .Invalid }
 	index := l.absindex(L, raw_idx)
-	configs := make([dynamic]MCP_Tool_Config, 0, allocator)
+	configs, configs_error := make([dynamic]MCP_Tool_Config, 0, allocator)
+	if configs_error != nil { return nil, .Allocation }
 	count := 0
 	l.pushnil(L)
 	for l.next(L, index) != 0 {
 		count += 1
 		if count > MCP_MAX_ENTRIES || l.type(L, -2) != .STRING || !lua_plain_table(L, -1) {
 			mcp_tool_configs_release(configs, allocator)
-			return nil, false
+			return nil, .Invalid
 		}
-		remote_name, remote_ok := lua_string(L, -2, allocator)
+		remote_name, remote_error := lua_string(L, -2, allocator)
+		if remote_error != .None {
+			l.pop(L, 1)
+			mcp_tool_configs_release(configs, allocator)
+			return nil, remote_error
+		}
+		if remote_name == "" {
+			delete(remote_name, allocator)
+			l.pop(L, 1)
+			mcp_tool_configs_release(configs, allocator)
+			return nil, .Invalid
+		}
 		entry := l.absindex(L, -1)
 		config := MCP_Tool_Config {
 			remote_name = remote_name,
@@ -325,7 +370,7 @@ mcp_tool_configs_load :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Alloca
 				delete(remote_name, allocator)
 				l.pop(L, 2)
 				mcp_tool_configs_release(configs, allocator)
-				return nil, false
+				return nil, .Invalid
 			}
 			config.enabled = enabled
 		}
@@ -333,13 +378,19 @@ mcp_tool_configs_load :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Alloca
 
 		lua_field(L, entry, "name")
 		if l.type(L, -1) != .NIL {
-			name, name_ok := lua_string(L, -1, allocator)
-			if !name_ok || !tool_name_valid(name) {
+			name, name_error := lua_string(L, -1, allocator)
+			if name_error != .None {
+				delete(remote_name, allocator)
+				l.pop(L, 2)
+				mcp_tool_configs_release(configs, allocator)
+				return nil, name_error
+			}
+			if !tool_name_valid(name) {
 				delete(name, allocator)
 				delete(remote_name, allocator)
 				l.pop(L, 2)
 				mcp_tool_configs_release(configs, allocator)
-				return nil, false
+				return nil, .Invalid
 			}
 			config.name = name
 		}
@@ -347,15 +398,23 @@ mcp_tool_configs_load :: proc(L: ^l.State, raw_idx: c.int, allocator: mem.Alloca
 		// Only the value is popped: the key stays for the next call to next.
 		l.pop(L, 1)
 
-		if !remote_ok || remote_name == "" || (!config.enabled && config.name != "") {
+		if !config.enabled && config.name != "" {
 			delete(config.remote_name, allocator)
 			delete(config.name, allocator)
 			mcp_tool_configs_release(configs, allocator)
-			return nil, false
+			return nil, .Invalid
 		}
-		append(&configs, config)
+		appended := append(&configs, config)
+		if appended != 1 {
+			if appended == 0 {
+				delete(config.remote_name, allocator)
+				delete(config.name, allocator)
+			}
+			mcp_tool_configs_release(configs, allocator)
+			return nil, .Allocation
+		}
 	}
-	return configs[:], true
+	return configs[:], .None
 }
 
 @(private)

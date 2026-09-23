@@ -426,14 +426,25 @@ record_diagnostic :: proc(catalog: ^Catalog, diagnostic: Diagnostic, scratch, al
 	owned := Diagnostic {
 		kind       = diagnostic.kind,
 		root_index = diagnostic.root_index,
-		path       = strings.clone(diagnostic.path, allocator),
 		line       = diagnostic.line,
-		field      = strings.clone(diagnostic.field, allocator),
-		detail     = strings.clone(diagnostic.detail, allocator),
-		winner     = strings.clone(diagnostic.winner, allocator),
-		loser      = strings.clone(diagnostic.loser, allocator),
 	}
-	grown := make([]Diagnostic, len(catalog.diagnostics) + 1, allocator)
+	clone_error: mem.Allocator_Error
+	owned.path, clone_error = strings.clone(diagnostic.path, allocator)
+	if clone_error != nil { catalog.omitted += 1; return }
+	owned.field, clone_error = strings.clone(diagnostic.field, allocator)
+	if clone_error != nil { diagnostic_destroy(&owned, allocator); catalog.omitted += 1; return }
+	owned.detail, clone_error = strings.clone(diagnostic.detail, allocator)
+	if clone_error != nil { diagnostic_destroy(&owned, allocator); catalog.omitted += 1; return }
+	owned.winner, clone_error = strings.clone(diagnostic.winner, allocator)
+	if clone_error != nil { diagnostic_destroy(&owned, allocator); catalog.omitted += 1; return }
+	owned.loser, clone_error = strings.clone(diagnostic.loser, allocator)
+	if clone_error != nil { diagnostic_destroy(&owned, allocator); catalog.omitted += 1; return }
+	grown, grow_error := make([]Diagnostic, len(catalog.diagnostics) + 1, allocator)
+	if grow_error != nil {
+		diagnostic_destroy(&owned, allocator)
+		catalog.omitted += 1
+		return
+	}
 	copy(grown, catalog.diagnostics)
 	grown[len(catalog.diagnostics)] = owned
 	delete(catalog.diagnostics, allocator)

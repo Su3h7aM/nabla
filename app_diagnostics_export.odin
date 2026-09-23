@@ -242,9 +242,11 @@ export_note_run :: proc(state: ^Export_State, run_id: string) -> bool {
 	for existing in state.runs {
 		if existing == run_id { return true }
 	}
-	name := strings.clone(run_id, context.allocator) or_else ""
-	if _, append_err := append(&state.runs, name); append_err != nil {
-		delete(name, context.allocator)
+	name, clone_error := strings.clone(run_id, context.allocator)
+	if clone_error != nil { return false }
+	appended := append(&state.runs, name)
+	if appended != 1 {
+		if appended == 0 { delete(name, context.allocator) }
 		return false
 	}
 	return true
@@ -452,8 +454,8 @@ diagnostics_export_manifest :: proc(destination: string, manifest: ^Export_Manif
 export_open :: proc(path: string, allocator: mem.Allocator) -> (file: ^os.File, hash: ^sha2.Context_256, okay: bool) {
 	handle, open_err := os.open(path, {.Write, .Create, .Excl}, EXPORT_FILE_PERMISSIONS)
 	if open_err != nil { return nil, nil, false }
-	state := new(sha2.Context_256, allocator)
-	if state == nil {
+	state, state_error := new(sha2.Context_256, allocator)
+	if state_error != nil {
 		os.close(handle)
 		return nil, nil, false
 	}
@@ -480,15 +482,29 @@ export_close :: proc(
 	text: [sha2.DIGEST_SIZE_256 * 2]u8
 	export_hex(text[:], digest[:])
 	entry := Export_File {
-		path      = strings.clone(relative, allocator) or_else "",
 		bytes     = bytes,
-		sha256    = strings.clone(string(text[:]), allocator) or_else "",
 		truncated = truncated,
 	}
-	if _, append_err := append(files, entry); append_err != nil {
-		delete(entry.path, allocator)
-		delete(entry.sha256, allocator)
-		okay = false
+	clone_error: mem.Allocator_Error
+	entry.path, clone_error = strings.clone(relative, allocator)
+	if clone_error != nil { okay = false }
+	if okay {
+		entry.sha256, clone_error = strings.clone(string(text[:]), allocator)
+		if clone_error != nil {
+			delete(entry.path, allocator)
+			entry.path = ""
+			okay = false
+		}
+	}
+	if okay {
+		appended := append(files, entry)
+		if appended != 1 {
+			if appended == 0 {
+				delete(entry.path, allocator)
+				delete(entry.sha256, allocator)
+			}
+			okay = false
+		}
 	}
 	free(hash, allocator)
 	return okay
@@ -532,10 +548,10 @@ export_join :: proc(directory, name: string, allocator: mem.Allocator) -> (strin
 
 @(private)
 export_note :: proc(omissions: ^[dynamic]string, text: string) {
-	note := strings.clone(text, context.allocator) or_else ""
-	if _, append_err := append(omissions, note); append_err != nil {
-		delete(note, context.allocator)
-	}
+	note, clone_error := strings.clone(text, context.allocator)
+	if clone_error != nil { return }
+	appended := append(omissions, note)
+	if appended != 1 && appended == 0 { delete(note, context.allocator) }
 }
 
 @(private)
