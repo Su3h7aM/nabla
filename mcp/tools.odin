@@ -182,7 +182,9 @@ tools_list_decode :: proc(result: json.Object, version: Protocol_Version, alloca
 		if !is_string {
 			return {}, error_make(.Malformed_Message, "the tool listing's next cursor is not a string", allocator = allocator)
 		}
-		page.next_cursor = mcp_clone_bounded(string(text), MAX_CURSOR_BYTES, allocator)
+		next_cursor, clone_error := mcp_clone_bounded_result(string(text), MAX_CURSOR_BYTES, allocator)
+		if clone_error.kind != .None { return {}, clone_error }
+		page.next_cursor = next_cursor
 	}
 
 	failed = false
@@ -292,7 +294,9 @@ tool_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Tool, strin
 	name, name_is_string := name_value.(json.String)
 	if !has_name || !name_is_string || string(name) == "" { return {}, "the tool definition has no usable name" }
 	if len(name) > MAX_TOOL_NAME_BYTES { return {}, "the tool name is longer than 128 bytes" }
-	tool.name = mcp_clone_bounded(string(name), MAX_TOOL_NAME_BYTES, allocator)
+	owned_name, name_error := mcp_clone_bounded_result(string(name), MAX_TOOL_NAME_BYTES, allocator)
+	if name_error.kind != .None { return {}, "the tool definition could not be allocated" }
+	tool.name = owned_name
 
 	// A description is required here even though the protocol makes it optional:
 	// the harness advertises a description with every definition, and a tool
@@ -304,12 +308,16 @@ tool_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Tool, strin
 		return {}, "the tool definition has no description"
 	}
 	if len(description) > MAX_TOOL_DESCRIPTION_BYTES { return {}, "the tool description is longer than 4096 bytes" }
-	tool.description = mcp_clone_bounded(string(description), MAX_TOOL_DESCRIPTION_BYTES, allocator)
+	owned_description, description_error := mcp_clone_bounded_result(string(description), MAX_TOOL_DESCRIPTION_BYTES, allocator)
+	if description_error.kind != .None { return {}, "the tool definition could not be allocated" }
+	tool.description = owned_description
 
 	if title_value, present := object["title"]; present {
 		title, title_is_string := title_value.(json.String)
 		if !title_is_string { return {}, "the tool title is not a string" }
-		tool.title = mcp_clone_bounded(string(title), MAX_TOOL_TITLE_BYTES, allocator)
+		owned_title, title_error := mcp_clone_bounded_result(string(title), MAX_TOOL_TITLE_BYTES, allocator)
+		if title_error.kind != .None { return {}, "the tool definition could not be allocated" }
+		tool.title = owned_title
 	}
 
 	schema_value, has_schema := object["inputSchema"]
@@ -347,7 +355,9 @@ tool_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Tool, strin
 			if annotation_title, annotation_has_title := annotations["title"]; annotation_has_title {
 				title, title_is_string := annotation_title.(json.String)
 				if !title_is_string { return {}, "the tool annotation title is not a string" }
-				tool.title = mcp_clone_bounded(string(title), MAX_TOOL_TITLE_BYTES, allocator)
+				owned_title, title_error := mcp_clone_bounded_result(string(title), MAX_TOOL_TITLE_BYTES, allocator)
+				if title_error.kind != .None { return {}, "the tool definition could not be allocated" }
+				tool.title = owned_title
 			}
 		}
 	}
@@ -474,7 +484,13 @@ tools_call_params_make :: proc(name, arguments_json: string, version: Protocol_V
 		json.destroy_value(arguments, allocator)
 		return {}, error_make(.Out_Of_Memory, allocator = allocator)
 	}
-	name_value := mcp_clone_bounded(name, MAX_TOOL_NAME_BYTES, allocator)
+	name_value, name_value_error := mcp_clone_bounded_result(name, MAX_TOOL_NAME_BYTES, allocator)
+	if name_value_error.kind != .None {
+		delete(name_key, allocator)
+		json.destroy_value(json.Value(built_params), allocator)
+		json.destroy_value(arguments, allocator)
+		return {}, name_value_error
+	}
 	built_params[name_key] = json.String(name_value)
 	arguments_key, arguments_key_error := strings.clone("arguments", allocator)
 	if arguments_key_error != nil {

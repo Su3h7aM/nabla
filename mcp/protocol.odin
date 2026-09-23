@@ -640,13 +640,23 @@ meta_identity_field :: proc(info: json.Object, field: string, allocator: mem.All
 // mcp_clone_bounded clones at most limit bytes of text, cut back to a rune
 // boundary so a bounded copy is still valid UTF-8. Nothing this package reports
 // may be text a server chose the size of.
-mcp_clone_bounded :: proc(text: string, limit: int, allocator: mem.Allocator) -> string {
-	if len(text) <= limit { return strings.clone(text, allocator) }
-	cut := text[:limit]
-	for len(cut) > 0 {
-		_, width := utf8.decode_last_rune_in_string(cut)
-		if width > 0 { break }
-		cut = cut[:len(cut) - 1]
+mcp_clone_bounded_result :: proc(text: string, limit: int, allocator: mem.Allocator) -> (string, Error) {
+	value := text
+	if len(value) > limit {
+		cut := value[:limit]
+		for len(cut) > 0 {
+			_, width := utf8.decode_last_rune_in_string(cut)
+			if width > 0 { break }
+			cut = cut[:len(cut) - 1]
+		}
+		value = cut
 	}
-	return strings.clone(cut, allocator)
+	owned, clone_error := strings.clone(value, allocator)
+	if clone_error != nil { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	return owned, {}
+}
+
+mcp_clone_bounded :: proc(text: string, limit: int, allocator: mem.Allocator) -> string {
+	value, _ := mcp_clone_bounded_result(text, limit, allocator)
+	return value
 }

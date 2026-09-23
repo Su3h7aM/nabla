@@ -75,7 +75,8 @@ connection_from_stateless :: proc(result: json.Object, allocator := context.allo
 	// The client can only speak what it implements, so a list that omits its own
 	// revision is a server it cannot use. Which revisions the server does speak is
 	// reported so the reader knows what to look for.
-	advertised := make([dynamic]string, 0, len(versions), allocator)
+	advertised, advertised_error := make([dynamic]string, 0, len(versions), allocator)
+	if advertised_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 	defer delete(advertised)
 	supported := false
 	for value in versions {
@@ -83,9 +84,14 @@ connection_from_stateless :: proc(result: json.Object, allocator := context.allo
 		if !is_string {
 			return {}, error_make(.Malformed_Message, "a supported version is not a string", allocator = allocator)
 		}
-		name := mcp_clone_bounded(string(text), MAX_VERSION_BYTES, allocator)
+		name, clone_error := mcp_clone_bounded_result(string(text), MAX_VERSION_BYTES, allocator)
+		if clone_error.kind != .None { return {}, clone_error }
 		if name == VERSION_2026_07_28 { supported = true }
-		append(&advertised, name)
+		appended := append(&advertised, name)
+		if appended != 1 {
+			if appended == 0 { delete(name, allocator) }
+			return {}, error_make(.Out_Of_Memory, allocator = allocator)
+		}
 	}
 	if !supported {
 		message := fmt.tprintf("the server does not support %s; it supports %s", VERSION_2026_07_28, version_list_text(advertised[:], context.temp_allocator))
@@ -161,7 +167,9 @@ connection_read_capabilities :: proc(connection: ^Connection, result: json.Objec
 		if !is_string {
 			return error_make(.Malformed_Message, "the instructions are not a string", allocator = allocator)
 		}
-		connection.instructions = mcp_clone_bounded(string(text), MAX_INSTRUCTIONS_BYTES, allocator)
+		instructions, clone_error := mcp_clone_bounded_result(string(text), MAX_INSTRUCTIONS_BYTES, allocator)
+		if clone_error.kind != .None { return clone_error }
+		connection.instructions = instructions
 	}
 	return {}
 }
