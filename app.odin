@@ -108,9 +108,11 @@ Snapshot :: struct {
 	// the worker can replace at any moment.
 	active_session: session.Session_Id, // owned,
 	// setup_error is why the last selection attempt failed; the model menu shows
-	// it because it has no transcript.
-	setup_error:    string, // owned,
-	generation:     u64,
+	// it because it has no transcript. setup_error_failed means the reason could
+	// not be cloned, so the presentation uses its static fallback instead.
+	setup_error:        string, // owned,
+	setup_error_failed: bool,
+	generation:         u64,
 }
 
 Work_Kind :: enum u8 {
@@ -401,7 +403,7 @@ tui_run :: proc(
 	app.raw = make([dynamic]input.Event, 0, 16, app.run.alloc)
 
 	if !apply_startup_selection(app, flag_provider, flag_model) {
-		fmt.eprintln("nabla:", app.run.snap.setup_error)
+		fmt.eprintln("nabla:", setup_error_text(app))
 		app_teardown(app)
 		return false
 	}

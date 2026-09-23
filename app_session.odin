@@ -758,6 +758,7 @@ selection_publish_locked :: proc(app: ^App, provider_id, model_id: string, annou
 	status.context_window = running.capacity.window
 	delete(app.run.snap.setup_error, app.run.alloc)
 	app.run.snap.setup_error = ""
+	app.run.snap.setup_error_failed = false
 	if announce { snap_append_locked(app, .Notice, fmt.tprintf("model set to %s / %s", provider_id, model_id)) }
 	app.run.snap.generation += 1
 }
@@ -795,13 +796,29 @@ apply_startup_selection :: proc(app: ^App, flag_provider, flag_model: string) ->
 	return true
 }
 
+// SETUP_ERROR_ALLOCATION is shown when the selection reason itself could not be
+// copied into the snapshot.
+SETUP_ERROR_ALLOCATION :: "the setup error could not be allocated"
+
+setup_error_text :: proc(app: ^App) -> string {
+	if app.run.snap.setup_error_failed { return SETUP_ERROR_ALLOCATION }
+	return app.run.snap.setup_error
+}
+
 // selection_fail records why a selection could not apply. The model menu shows it
 // directly; chat mode sees it as a transcript warning.
 selection_fail :: proc(app: ^App, message: string) {
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
 	delete(app.run.snap.setup_error, app.run.alloc)
-	app.run.snap.setup_error = strings.clone(message, app.run.alloc)
+	app.run.snap.setup_error = ""
+	app.run.snap.setup_error_failed = false
+	cloned, clone_err := strings.clone(message, app.run.alloc)
+	if clone_err != nil {
+		app.run.snap.setup_error_failed = true
+	} else {
+		app.run.snap.setup_error = cloned
+	}
 	snap_append_locked(app, .Warning, message)
 	app.run.snap.generation += 1
 }

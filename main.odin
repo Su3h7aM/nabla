@@ -231,7 +231,7 @@ run_prompt :: proc(
 	}
 
 	if !apply_startup_selection(app, options.provider_id, options.model_id) {
-		fmt.eprintln("nabla:", app.run.snap.setup_error)
+		fmt.eprintln("nabla:", setup_error_text(app))
 		return 1
 	}
 	if app.setup.model_id == "" {

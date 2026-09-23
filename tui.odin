@@ -745,8 +745,8 @@ draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	}
 	lines := make([dynamic]Line, 0, 64, context.temp_allocator)
 	append(&lines, Line{text = app.menu.title, style = TITLE_STYLE})
-	if app.run.snap.setup_error != "" {
-		append(&lines, Line{text = strings.clone(app.run.snap.setup_error, context.temp_allocator), style = ERROR_TEXT})
+	if setup_error := setup_error_text(app); setup_error != "" {
+		append(&lines, Line{text = strings.clone(setup_error, context.temp_allocator), style = ERROR_TEXT})
 	}
 	cursor := app.menu.cursor
 	if cursor >= len(app.menu.choices) {
