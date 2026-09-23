@@ -2,6 +2,7 @@ package mcp
 
 import "core:mem"
 import "core:strings"
+import "core:sync"
 import linux "core:sys/linux"
 import "core:time"
 
@@ -113,21 +114,44 @@ stdio_close_pair :: proc(pair: [2]linux.Fd) {
 	_ = linux.close(pair[1])
 }
 
-// stdio_ignore_sigpipe makes a write to a pipe whose reader is gone fail with EPIPE
-// instead of terminating the writer. The default disposition of SIGPIPE kills the
-// process, which would make a server that dies mid-request fatal to the harness
-// rather than an error it reports. The disposition is process-wide and installing it
-// is idempotent, and the transport installs it because writing to a subprocess's
-// pipes is what creates the hazard.
-//
-// Every other write in the process then reports EPIPE too, which is the behaviour a
-// program with error handling wants: a closed output is a failure to handle, not a
-// reason to die without unwinding.
-stdio_ignore_sigpipe :: proc() {
-	action := linux.Sig_Action {
-		special = .SIG_IGN,
+// SIGPIPE is process-wide, but the stdio transport is not. These fields hold the
+// saved disposition while at least one stdio server is running. The lock makes
+// concurrent starts and stops agree on which one owns the restore.
+stdio_sigpipe_mutex: sync.Mutex
+stdio_sigpipe_users: int
+stdio_sigpipe_previous: linux.Sig_Action
+stdio_sigpipe_saved: bool
+
+// stdio_sigpipe_acquire makes a pipe write report EPIPE instead of terminating the
+// process, and saves the disposition that was in force before the first stdio server.
+stdio_sigpipe_acquire :: proc(previous: ^linux.Sig_Action) -> bool {
+	sync.mutex_lock(&stdio_sigpipe_mutex)
+	defer sync.mutex_unlock(&stdio_sigpipe_mutex)
+	if stdio_sigpipe_users == 0 {
+		action := linux.Sig_Action {
+			special = .SIG_IGN,
+		}
+		old: linux.Sig_Action
+		if linux.rt_sigaction(.SIGPIPE, &action, &old) != .NONE { return false }
+		stdio_sigpipe_previous = old
+		stdio_sigpipe_saved = true
+		previous^ = old
 	}
-	_ = linux.rt_sigaction(.SIGPIPE, &action, nil)
+	stdio_sigpipe_users += 1
+	return true
+}
+
+// stdio_sigpipe_release restores the process disposition when the last stdio server
+// stops. A failed restore is left to the process owner; the transport must not keep
+// a stale reference count and prevent a later owner from trying again.
+stdio_sigpipe_release :: proc() {
+	sync.mutex_lock(&stdio_sigpipe_mutex)
+	defer sync.mutex_unlock(&stdio_sigpipe_mutex)
+	if stdio_sigpipe_users == 0 { return }
+	stdio_sigpipe_users -= 1
+	if stdio_sigpipe_users != 0 || !stdio_sigpipe_saved { return }
+	_ = linux.rt_sigaction(.SIGPIPE, &stdio_sigpipe_previous, nil)
+	stdio_sigpipe_saved = false
 }
 
 // stdio_set_nonblocking makes a pipe end usable from a poll loop, so reading and

@@ -65,16 +65,17 @@ stdio_config_destroy :: proc(config: ^Stdio_Config, allocator := context.allocat
 // diagnostic text only: a thread drains it into a bounded tail so a chatty server
 // cannot block on a full pipe, and a request outcome never depends on it.
 Stdio :: struct {
-	pipes:         Stdio_Pipes,
-	child:         Stdio_Child,
-	started:       bool,
-	line:          [dynamic]u8,
-	line_offset:   int,
-	out:           [dynamic]u8,
-	stderr_tail:   [dynamic]u8,
-	stderr_mutex:  sync.Mutex,
+	pipes:            Stdio_Pipes,
+	child:            Stdio_Child,
+	started:          bool,
+	line:             [dynamic]u8,
+	line_offset:      int,
+	out:              [dynamic]u8,
+	stderr_tail:      [dynamic]u8,
+	stderr_mutex:     sync.Mutex,
 	stderr_thread: ^thread.Thread,
 	stderr_stop:   bool,
+	sigpipe_owned: bool,
 	allocator:     mem.Allocator,
 }
 
@@ -97,9 +98,17 @@ stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.al
 	}
 
 	// A dead peer must be an error, not a signal that kills the harness.
-	stdio_ignore_sigpipe()
+	previous_sigpipe: linux.Sig_Action
+	if !stdio_sigpipe_acquire(&previous_sigpipe) {
+		return error_make(.Spawn_Failed, "the SIGPIPE disposition could not be saved", allocator = allocator)
+	}
+	stdio.sigpipe_owned = true
 	pipes, child, spawned := stdio_spawn(name, raw_data(argv), raw_data(envp), directory)
-	if !spawned { return error_make(.Spawn_Failed, allocator = allocator) }
+	if !spawned {
+		stdio_sigpipe_release()
+		stdio.sigpipe_owned = false
+		return error_make(.Spawn_Failed, allocator = allocator)
+	}
 
 	stdio.pipes = pipes
 	stdio.child = child
@@ -154,6 +163,10 @@ stdio_stop :: proc(stdio: ^Stdio) {
 	delete(stdio.line)
 	delete(stdio.out)
 	delete(stdio.stderr_tail)
+	if stdio.sigpipe_owned {
+		stdio_sigpipe_release()
+		stdio.sigpipe_owned = false
+	}
 	stdio^ = {}
 }
 
