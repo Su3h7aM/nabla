@@ -25,9 +25,26 @@ Provider_Encode_Cache :: struct {
 	// allocator is what everything this cache holds was allocated with. The first encode
 	// that fills it fixes one, and every later encode and the destroy use it, so a cache
 	// never mixes two allocators and cannot free what another allocated.
-	allocator: mem.Allocator,
-	slots:     [dynamic]Encode_Slot,
+	allocator:  mem.Allocator,
+	slots:      [dynamic]Encode_Slot,
+	// body_bytes is how large the last body this cache encoded was. The next body carries
+	// nearly the same bytes, so this is what it is given room for to start with. It is a
+	// size to guess with, never a fact the encoding depends on: a body that outgrows it is
+	// written all the same.
+	body_bytes: int,
 }
+
+// How much larger than the body before it a body is expected to be. Between two requests a
+// conversation grows by one turn: the messages and records the turn added, which are small
+// next to the history that already sits in the cache. A body that outgrows the room it was
+// given pays one grow, and doubling carries it past the rest of the turn.
+@(private = "package")
+ENCODE_BODY_GROWTH_DIVISOR :: 8
+
+// The floor under that growth, for the first body after a small one and for a cache whose
+// body_bytes is still zero.
+@(private = "package")
+ENCODE_BODY_GROWTH_FLOOR :: 4096
 
 // Encode_Slot is one text and the bytes it was written as.
 @(private = "package")
@@ -125,6 +142,24 @@ encode_finish :: proc(cursor: ^Encode_Cursor) {
 	slots := &cursor.cache.slots
 	for i := cursor.next; i < len(slots); i += 1 { encode_slot_destroy(&slots[i], cursor.cache.allocator) }
 	resize(slots, cursor.next)
+}
+
+// encode_body_make starts one request body. Most of a body is bytes this cache already
+// holds, so the size of the body before it is a close guess at this one's: starting there
+// is one allocation instead of the sequence a builder takes to double its way up.
+@(private = "package")
+encode_body_make :: proc(cursor: ^Encode_Cursor, allocator: mem.Allocator) -> strings.Builder {
+	hint := cursor.cache == nil ? 0 : cursor.cache.body_bytes
+	if hint <= 0 { return strings.builder_make(allocator) }
+	return strings.builder_make_len_cap(0, hint + hint / ENCODE_BODY_GROWTH_DIVISOR + ENCODE_BODY_GROWTH_FLOOR, allocator)
+}
+
+// encode_body_store records how large the body just written was. The next body starts from
+// it, so what a growing conversation costs is the new turn's bytes rather than all of it.
+@(private = "package")
+encode_body_store :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder) {
+	if cursor.cache == nil { return }
+	cursor.cache.body_bytes = len(body.buf)
 }
 
 @(private = "package")

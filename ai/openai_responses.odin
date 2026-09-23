@@ -50,7 +50,7 @@ openai_responses_encode_request_body :: proc(
 	}
 
 	cursor := encode_cursor(cache, allocator)
-	body := strings.builder_make(allocator)
+	body := encode_body_make(&cursor, allocator)
 	defer strings.builder_destroy(&body)
 
 	// Fields are written in the order the standard library's writer sorts them in, so a
@@ -248,6 +248,7 @@ openai_responses_encode_request_body :: proc(
 	}
 	encode_write_raw(&body, "}")
 	encode_finish(&cursor)
+	encode_body_store(&cursor, &body)
 	return strings.clone(strings.to_string(body), allocator), .None
 }
 
