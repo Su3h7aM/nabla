@@ -42,7 +42,9 @@ Client :: struct {
 // to.
 client_start :: proc(client: ^Client, config: Stdio_Config, allocator := context.allocator) -> Error {
 	client.allocator = allocator
-	client.config = stdio_config_clone(config, allocator)
+	cloned_config, clone_error := stdio_config_clone(config, allocator)
+	if clone_error.kind != .None { return clone_error }
+	client.config = cloned_config
 	if start_err := stdio_start(&client.stdio, client.config, allocator); start_err.kind != .None {
 		stdio_config_destroy(&client.config, allocator)
 		return start_err

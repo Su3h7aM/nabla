@@ -28,21 +28,46 @@ Stdio_Config :: struct {
 	environment:       []Environment_Entry,
 }
 
-stdio_config_clone :: proc(config: Stdio_Config, allocator: mem.Allocator) -> Stdio_Config {
-	clone := Stdio_Config {
-		executable        = strings.clone(config.executable, allocator),
-		working_directory = strings.clone(config.working_directory, allocator),
-		arguments         = make([]string, len(config.arguments), allocator),
-		environment       = make([]Environment_Entry, len(config.environment), allocator),
+stdio_config_clone :: proc(config: Stdio_Config, allocator: mem.Allocator) -> (Stdio_Config, Error) {
+	clone: Stdio_Config
+	clone_error: mem.Allocator_Error
+	clone.executable, clone_error = strings.clone(config.executable, allocator)
+	if clone_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	clone.working_directory, clone_error = strings.clone(config.working_directory, allocator)
+	if clone_error != nil {
+		stdio_config_destroy(&clone, allocator)
+		return {}, error_make(.Out_Of_Memory, allocator = allocator)
 	}
-	for argument, index in config.arguments { clone.arguments[index] = strings.clone(argument, allocator) }
-	for entry, index in config.environment {
-		clone.environment[index] = Environment_Entry {
-			name  = strings.clone(entry.name, allocator),
-			value = strings.clone(entry.value, allocator),
+	clone.arguments, clone_error = make([]string, len(config.arguments), allocator)
+	if clone_error != nil {
+		stdio_config_destroy(&clone, allocator)
+		return {}, error_make(.Out_Of_Memory, allocator = allocator)
+	}
+	clone.environment, clone_error = make([]Environment_Entry, len(config.environment), allocator)
+	if clone_error != nil {
+		stdio_config_destroy(&clone, allocator)
+		return {}, error_make(.Out_Of_Memory, allocator = allocator)
+	}
+	for argument, index in config.arguments {
+		clone.arguments[index], clone_error = strings.clone(argument, allocator)
+		if clone_error != nil {
+			stdio_config_destroy(&clone, allocator)
+			return {}, error_make(.Out_Of_Memory, allocator = allocator)
 		}
 	}
-	return clone
+	for entry, index in config.environment {
+		clone.environment[index].name, clone_error = strings.clone(entry.name, allocator)
+		if clone_error != nil {
+			stdio_config_destroy(&clone, allocator)
+			return {}, error_make(.Out_Of_Memory, allocator = allocator)
+		}
+		clone.environment[index].value, clone_error = strings.clone(entry.value, allocator)
+		if clone_error != nil {
+			stdio_config_destroy(&clone, allocator)
+			return {}, error_make(.Out_Of_Memory, allocator = allocator)
+		}
+	}
+	return clone, {}
 }
 
 stdio_config_destroy :: proc(config: ^Stdio_Config, allocator := context.allocator) {
@@ -65,14 +90,14 @@ stdio_config_destroy :: proc(config: ^Stdio_Config, allocator := context.allocat
 // diagnostic text only: a thread drains it into a bounded tail so a chatty server
 // cannot block on a full pipe, and a request outcome never depends on it.
 Stdio :: struct {
-	pipes:            Stdio_Pipes,
-	child:            Stdio_Child,
-	started:          bool,
-	line:             [dynamic]u8,
-	line_offset:      int,
-	out:              [dynamic]u8,
-	stderr_tail:      [dynamic]u8,
-	stderr_mutex:     sync.Mutex,
+	pipes:         Stdio_Pipes,
+	child:         Stdio_Child,
+	started:       bool,
+	line:          [dynamic]u8,
+	line_offset:   int,
+	out:           [dynamic]u8,
+	stderr_tail:   [dynamic]u8,
+	stderr_mutex:  sync.Mutex,
 	stderr_thread: ^thread.Thread,
 	stderr_stop:   bool,
 	sigpipe_owned: bool,
@@ -114,10 +139,29 @@ stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.al
 	stdio.child = child
 	stdio.started = true
 	stdio.allocator = allocator
-	if stdio.line == nil { stdio.line = make([dynamic]u8, 0, allocator) }
-	if stdio.out == nil { stdio.out = make([dynamic]u8, 0, allocator) }
+	if stdio.line == nil {
+		line, line_error := make([dynamic]u8, 0, allocator)
+		if line_error != nil {
+			stdio_stop(stdio)
+			return error_make(.Out_Of_Memory, allocator = allocator)
+		}
+		stdio.line = line
+	}
+	if stdio.out == nil {
+		out, out_error := make([dynamic]u8, 0, allocator)
+		if out_error != nil {
+			stdio_stop(stdio)
+			return error_make(.Out_Of_Memory, allocator = allocator)
+		}
+		stdio.out = out
+	}
 	if stdio.stderr_tail == nil {
-		stdio.stderr_tail = make([dynamic]u8, 0, allocator)
+		stderr_tail, stderr_error := make([dynamic]u8, 0, allocator)
+		if stderr_error != nil {
+			stdio_stop(stdio)
+			return error_make(.Out_Of_Memory, allocator = allocator)
+		}
+		stdio.stderr_tail = stderr_tail
 		stdio.stderr_tail.allocator = allocator
 	}
 	// An end that is never polled would leave the server able to block mid-write.
