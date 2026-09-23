@@ -31,7 +31,6 @@ Run_Setup :: struct {
 	catalog:          agent.Catalog,
 	api:              ai.API_Kind,
 	credential:       string, // owned,
-	connection:       ai.Provider_Connection,
 	store:            session.Store,
 	// log is this launch's diagnostic stream. It is opened before the store and
 	// closed after it, so a launch that cannot reach the store still says so.
@@ -71,11 +70,31 @@ Run_Setup :: struct {
 
 App :: struct {
 	setup:              Run_Setup,
-	// catalog_mu protects publication of a replacement catalog. Published
-	// catalogs are retained until teardown because active connections borrow their
-	// endpoint strings.
+	// catalog_mu protects publication of a replacement catalog. A publication
+	// releases the catalog it replaces, so anything read out of a catalog is either
+	// copied while the lock is held or owned by this run.
 	catalog_mu:         sync.Mutex,
-	retired_catalogs:   [dynamic]agent.Catalog,
+	// catalog_refresh_at is when the last catalog refresh was asked for, on the
+	// monotonic clock, and catalog_refreshed says one was asked for at all: a zero
+	// tick is not a time. It is the cooldown's own record: a refresh runs because a
+	// person asked to see the catalog, and asking twice in a row is the same
+	// question. Only the front-end asks, so it is front-end state.
+	catalog_refresh_at: time.Tick,
+	catalog_refreshed:  bool,
+	// models_dev_read_at is when this run last read models.dev into sources. The
+	// document behind it changes on the order of days, so a run re-reads it far less
+	// often than the provider listings, which change when a provider adds a model. It
+	// is only meaningful while models_dev_sources is non-empty, which is what says a
+	// read happened.
+	models_dev_read_at: time.Tick,
+	// endpoint is the base_url the running connection borrows. The catalog a model
+	// was selected from is released when a refresh replaces it, so the endpoint is
+	// owned here rather than borrowed from a catalog entry a publication frees.
+	endpoint:           string, // owned,
+	// retired_endpoints are endpoints a turn in flight may still be talking to. A
+	// selection can change at a request boundary inside a turn, so the endpoint the
+	// request before it was given stays valid until the run ends.
+	retired_endpoints:  [dynamic]string, // owned,
 	catalog_sources:    []agent.Catalog_Provider_Source, // borrowed for tui_run
 	provider_sources:   [dynamic]agent.Catalog_Provider_Source, // owned refresh snapshot
 	models_dev_sources: [dynamic]agent.Catalog_Provider_Source, // owned refresh snapshot
@@ -667,14 +686,22 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 	// the old values are released.
 	setup_provider := strings.clone(provider_id, app.setup.alloc)
 	setup_model := strings.clone(model_id, app.setup.alloc)
+	// The endpoint is copied out of the catalog while it is still the published one:
+	// the catalog this entry lives in is released when a refresh replaces it, and
+	// the connection that borrows this string outlives that moment.
+	setup_endpoint := strings.clone(provider.base_url, app.run.alloc)
 
 	sync.mutex_lock(&app.run.mu)
 	delete(app.setup.credential, app.setup.alloc)
 	app.setup.credential = credential
 	app.setup.api = api
+	// The endpoint the connection being replaced borrowed stays valid for any turn
+	// that already holds it.
+	if app.endpoint != "" { append(&app.retired_endpoints, app.endpoint) }
+	app.endpoint = setup_endpoint
 	app.run.connection = ai.Provider_Connection {
 		API        = api,
-		Endpoint   = provider.base_url,
+		Endpoint   = app.endpoint,
 		Credential = credential,
 	}
 	delete(app.setup.provider_id, app.setup.alloc)

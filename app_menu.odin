@@ -60,10 +60,19 @@ menu_rebuild_model :: proc(app: ^App) {
 		if !provider_usable(&provider) || !provider_configured(app, provider.id) { continue }
 		for &model in app.setup.catalog.models {
 			if model.provider_id != provider.id { continue }
-			append(&models, Model_Choice{provider_id = provider.id, model_id = model.id})
+			// The names are copied while the lock is held: a publication releases the
+			// catalog they were read from, and the list below outlives this scope.
+			append(
+				&models,
+				Model_Choice{provider_id = strings.clone(provider.id, context.temp_allocator), model_id = strings.clone(model.id, context.temp_allocator)},
+			)
 		}
 	}
 	sync.mutex_unlock(&app.catalog_mu)
+	defer for model in models {
+		delete(model.provider_id, context.temp_allocator)
+		delete(model.model_id, context.temp_allocator)
+	}
 	slice.sort_by(models[:], model_choice_less)
 
 	choices := make([dynamic]Choice, 0, len(models), app.run.alloc)

@@ -286,17 +286,43 @@ acp_select_startup_model :: proc(server: ^Acp_Server) -> bool {
 // and its first model, in catalog order, so the choice is the same on every launch.
 // Nothing is persisted: a model chosen for an editor conversation is not the user's own
 // last choice for the harness.
+//
+// Every candidate is named before any of them is tried: applying a selection takes the
+// catalog lock, and a publication releases the catalog the names were read from, so a
+// borrow would not survive the attempts below.
 acp_select_first_model :: proc(server: ^Acp_Server) -> bool {
 	app := &server.app
+	candidates := acp_servable_models(app, app.run.alloc)
+	defer {
+		for &candidate in candidates {
+			delete(candidate.provider_id, app.run.alloc)
+			delete(candidate.model_id, app.run.alloc)
+		}
+		delete(candidates)
+	}
+	for candidate in candidates {
+		if apply_selection(app, candidate.provider_id, candidate.model_id, "") { return true }
+	}
+	return false
+}
+
+// acp_servable_models names every serving identity this process may choose, in catalog
+// order: each configured provider that states a usable endpoint, and each of its models.
+// The names are copied under the catalog lock and owned by allocator.
+acp_servable_models :: proc(app: ^App, allocator: mem.Allocator) -> [dynamic]Model_Choice {
+	candidates: [dynamic]Model_Choice
+	candidates.allocator = allocator
+	sync.mutex_lock(&app.catalog_mu)
+	defer sync.mutex_unlock(&app.catalog_mu)
 	for &provider in app.setup.catalog.providers {
 		if !provider_usable(&provider) { continue }
 		if !provider_configured(app, provider.id) { continue }
 		for &model in app.setup.catalog.models {
 			if model.provider_id != provider.id { continue }
-			if apply_selection(app, provider.id, model.id, "") { return true }
+			append(&candidates, Model_Choice{provider_id = strings.clone(provider.id, allocator), model_id = strings.clone(model.id, allocator)})
 		}
 	}
-	return false
+	return candidates
 }
 
 // --- running a prompt --------------------------------------------------------

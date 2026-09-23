@@ -6,15 +6,34 @@ import "core:strings"
 import "core:sync"
 import "core:sync/chan"
 import "core:thread"
+import "core:time"
 
 import "nabla:agent"
 
 CATALOG_REFRESH_CAPACITY :: 1
 Catalog_Refresh_Chan :: chan.Chan(bool)
 
+// CATALOG_REFRESH_COOLDOWN is how long the published catalog is left alone after a
+// refresh was asked for. The freshness windows in `agent` are not clocks: nothing
+// consults them on its own. A refresh runs because a person asked to see the catalog,
+// and this cooldown is what keeps a burst of asks from rebuilding it: opening the
+// model menu three times in a row is one question, and the answer is already held.
+//
+// The count starts when the refresh is asked for rather than when it finishes, so a
+// refresh that is still running is not asked for again.
+CATALOG_REFRESH_COOLDOWN :: 10 * time.Minute
+
+// MODELS_DEV_INGEST_COOLDOWN is how long a run keeps the models.dev sources it
+// already read. models.dev states which endpoints serve which models, and that
+// changes on the order of days: re-reading the cached document sooner would parse
+// the same bytes into the same records. It is longer than the catalog cooldown
+// because the provider listing is what actually changes while a person works, and it
+// is not a fetch window: whether the document is fetched or read from the cache is
+// the cache's own freshness decision.
+MODELS_DEV_INGEST_COOLDOWN :: 24 * time.Hour
+
 catalog_refresh_start :: proc(app: ^App, sources: []agent.Catalog_Provider_Source) -> bool {
 	app.catalog_sources = sources
-	app.retired_catalogs.allocator = app.run.alloc
 	refresh, channel_err := chan.create_buffered(Catalog_Refresh_Chan, CATALOG_REFRESH_CAPACITY, app.run.alloc)
 	if channel_err != nil { return false }
 	app.catalog_refresh = refresh
@@ -32,7 +51,33 @@ catalog_refresh_start :: proc(app: ^App, sources: []agent.Catalog_Provider_Sourc
 
 catalog_refresh_request :: proc(app: ^App) {
 	if app.catalog_worker == nil { return }
-	_ = chan.try_send(app.catalog_refresh, true)
+	if !catalog_refresh_due(app) { return }
+	if chan.try_send(app.catalog_refresh, true) {
+		catalog_refresh_note(app)
+	}
+}
+
+// catalog_refresh_note records that a refresh was asked for, which is what the cooldown
+// counts from.
+@(private)
+catalog_refresh_note :: proc(app: ^App) {
+	app.catalog_refresh_at = time.tick_now()
+	app.catalog_refreshed = true
+}
+
+// catalog_refresh_due reports whether the catalog may be rebuilt again. A refresh that
+// was never asked for is due, and one that was asked for within the cooldown is not.
+catalog_refresh_due :: proc(app: ^App) -> bool {
+	if !app.catalog_refreshed { return true }
+	return time.tick_since(app.catalog_refresh_at) >= CATALOG_REFRESH_COOLDOWN
+}
+
+// models_dev_read_due reports whether the run's models.dev sources are old enough to read
+// again. A run that holds none is due, so a launch that found no cached document still
+// reads one.
+models_dev_read_due :: proc(app: ^App) -> bool {
+	if len(app.models_dev_sources) == 0 { return true }
+	return time.tick_since(app.models_dev_read_at) >= MODELS_DEV_INGEST_COOLDOWN
 }
 
 catalog_refresh_worker :: proc(thread_handle: ^thread.Thread) {
@@ -63,13 +108,19 @@ catalog_refresh_with :: proc(app: ^App, provider_fetch: agent.Provider_Models_Fe
 	providers := agent.provider_models_refresh(app.catalog_sources, provider_fetch, &app.run.stopping, allocator)
 	catalog_sources_merge(&app.provider_sources, &providers, allocator)
 
-	models_dev, models_dev_err := agent.models_dev_sources(models_dev_fetch, &app.run.stopping, names, allocator)
-	// A refresh that produced nothing leaves the enrichment already published in
-	// place, so a failed request cannot remove models.dev data from the catalog.
-	if models_dev_err == .None && len(models_dev) > 0 {
-		catalog_sources_replace(&app.models_dev_sources, &models_dev, allocator)
-	} else {
-		agent.catalog_sources_destroy(&models_dev, allocator)
+	// models.dev is read on its own, much longer cooldown: the records a re-read would
+	// produce are the ones the run already holds, and parsing the cached document is
+	// the largest thing one refresh does.
+	if models_dev_read_due(app) {
+		models_dev, models_dev_err := agent.models_dev_sources(models_dev_fetch, &app.run.stopping, names, allocator)
+		// A refresh that produced nothing leaves the enrichment already published in
+		// place, so a failed request cannot remove models.dev data from the catalog.
+		if models_dev_err == .None && len(models_dev) > 0 {
+			catalog_sources_replace(&app.models_dev_sources, &models_dev, allocator)
+			app.models_dev_read_at = time.tick_now()
+		} else {
+			agent.catalog_sources_destroy(&models_dev, allocator)
+		}
 	}
 	catalog_publish(app, app.provider_sources[:], app.models_dev_sources[:])
 }
@@ -111,9 +162,13 @@ catalog_publish :: proc(app: ^App, providers, models_dev: []agent.Catalog_Provid
 	if resolve_err != .None { return }
 
 	sync.mutex_lock(&app.catalog_mu)
-	append(&app.retired_catalogs, app.setup.catalog)
+	replaced := app.setup.catalog
 	app.setup.catalog = catalog
 	sync.mutex_unlock(&app.catalog_mu)
+	// The catalog this one replaces is released rather than kept: everything read out
+	// of a catalog is copied while the lock is held, and the running connection owns
+	// its endpoint. Nothing borrows a replaced catalog after this returns.
+	agent.catalog_destroy(&replaced)
 	sync.atomic_add(&app.catalog_revision, 1)
 }
 
@@ -153,12 +208,17 @@ catalog_refresh_stop :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> b
 	return true
 }
 
-catalog_retired_destroy :: proc(app: ^App) {
+// catalog_run_destroy releases what the catalog side of a run owns: the refresh
+// snapshots, and the endpoints this run's connections borrowed. It runs after the
+// worker and the refresh thread stopped, so nothing can still be reading one.
+catalog_run_destroy :: proc(app: ^App) {
 	agent.catalog_sources_destroy(&app.provider_sources, app.run.alloc)
 	agent.catalog_sources_destroy(&app.models_dev_sources, app.run.alloc)
-	for &catalog in app.retired_catalogs { agent.catalog_destroy(&catalog) }
-	delete(app.retired_catalogs)
-	app.retired_catalogs = nil
+	delete(app.endpoint, app.run.alloc)
+	app.endpoint = ""
+	for endpoint in app.retired_endpoints { delete(endpoint, app.run.alloc) }
+	delete(app.retired_endpoints)
+	app.retired_endpoints = nil
 }
 
 catalog_changed :: proc(app: ^App) -> bool {

@@ -62,7 +62,6 @@ catalog_pipeline_app :: proc(t: ^testing.T) -> Catalog_Pipeline_Fixture {
 	}
 	fixture.app.run.alloc = context.allocator
 	fixture.app.catalog_sources = fixture.user
-	fixture.app.retired_catalogs.allocator = context.allocator
 	initial, initial_err := agent.resolve_catalog(fixture.user, {}, {}, context.allocator)
 	if initial_err != agent.Catalog_Error.None { testing.fail_now(t, "the fixture catalog did not resolve") }
 	fixture.app.setup.catalog = initial
@@ -71,7 +70,7 @@ catalog_pipeline_app :: proc(t: ^testing.T) -> Catalog_Pipeline_Fixture {
 
 catalog_pipeline_end :: proc(fixture: ^Catalog_Pipeline_Fixture) {
 	agent.catalog_destroy(&fixture.app.setup.catalog)
-	catalog_retired_destroy(&fixture.app)
+	catalog_run_destroy(&fixture.app)
 	if fixture.had_previous {
 		os.set_env("XDG_CACHE_HOME", fixture.previous)
 	} else {
@@ -105,6 +104,35 @@ test_catalog_refresh_publishes_one_complete_pipeline :: proc(t: ^testing.T) {
 	testing.expect_value(t, model.thinking.levels[1], "high")
 }
 
+// A publication releases the catalog it replaces, so a run that refreshes twice holds
+// one catalog rather than every catalog it ever resolved.
+@(test)
+test_catalog_publication_releases_the_replaced_catalog :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	// Every allocation the fixture and the refreshes make is tracked, so the two
+	// publications are measured against one account.
+	previous_allocator := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, previous_allocator)
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = previous_allocator
+		mem.tracking_allocator_destroy(&track)
+	}
+
+	fixture := catalog_pipeline_app(t)
+	defer catalog_pipeline_end(&fixture)
+	app := &fixture.app
+
+	catalog_refresh_with(app, catalog_pipeline_provider_fetch, catalog_pipeline_models_dev_fetch)
+	testing.expect_value(t, app.catalog_revision, u64(1))
+	first := track.current_memory_allocated
+
+	catalog_refresh_with(app, catalog_pipeline_provider_fetch, catalog_pipeline_models_dev_fetch)
+	testing.expect_value(t, app.catalog_revision, u64(2))
+	testing.expect(t, track.current_memory_allocated <= first, "the replaced catalog should have been released")
+}
+
 // A refresh that acquires nothing must leave the enrichment the catalog already
 // has: a request that failed cannot take reasoning controls away from a model.
 @(test)
@@ -121,6 +149,9 @@ test_catalog_refresh_keeps_the_enrichment_a_failed_request_could_not_replace :: 
 	if !testing.expect_value(t, path_err, agent.Models_Dev_Error.None) { return }
 	stray := `{"stray":{"id":"stray","models":{"stray/model":{"id":"stray/model"}}}}`
 	testing.expect(t, os.write_entire_file(path, transmute([]u8)stray) == nil)
+	// The refresh reads models.dev again rather than reusing what the previous one
+	// read, so the acquisition below is the one that fails.
+	app.models_dev_read_at = time.tick_add(time.tick_now(), -MODELS_DEV_INGEST_COOLDOWN)
 
 	catalog_refresh_with(app, catalog_pipeline_provider_fetch, catalog_pipeline_models_dev_unreachable)
 

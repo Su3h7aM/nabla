@@ -85,6 +85,9 @@ app_session_end :: proc(app: ^App, directory: string) {
 	delete(app.run.snap.status.effort_levels)
 	delete(app.run.snap.setup_error, app.run.alloc)
 	menu_destroy(&app.menu, app.run.alloc)
+	// The run's catalog-side state belongs to the same teardown: an endpoint a
+	// selection copied, and the refresh snapshots.
+	catalog_run_destroy(app)
 	os.remove_all(app.setup.workspace)
 	delete(app.setup.workspace, app.setup.alloc)
 	delete(app.setup.resumed_provider, app.setup.alloc)

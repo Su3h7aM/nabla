@@ -358,7 +358,6 @@ tui_run :: proc(
 	if !run_catalog(sources, mcp_servers, &app.setup, start) {
 		return false
 	}
-	app.run.connection = app.setup.connection
 	app.run.snap.entries = make([dynamic]Entry, 0, 16, app.run.alloc)
 	app.run.snap.status.provider_id = strings.clone(app.setup.provider_id, app.run.alloc)
 	app.run.snap.status.model_id = strings.clone(app.setup.model_id, app.run.alloc)
@@ -630,7 +629,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 		return
 	}
 	run_setup_destroy(&app.setup)
-	catalog_retired_destroy(app)
+	catalog_run_destroy(app)
 }
 
 // snapshot_destroy releases everything the front-end snapshot owns and zeroes it,
