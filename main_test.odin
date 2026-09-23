@@ -2,6 +2,7 @@
 #+private file
 package main
 
+import "core:io"
 import "core:testing"
 
 // A launch says which session to open through the command line, so the three
@@ -95,4 +96,19 @@ test_a_prompt_without_a_value_is_refused :: proc(t: ^testing.T) {
 
 	_, empty_ok := chat_cli_parse({"--prompt="})
 	testing.expect(t, !empty_ok, "an empty prompt is a mistake, not a headless run")
+}
+
+headless_test_closed_stream :: proc(data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (i64, io.Error) {
+	if mode == .Write { return 0, io.Error(.Closed) }
+	return 0, .Unsupported
+}
+
+@(test)
+test_headless_output_latches_a_closed_answer_writer :: proc(t: ^testing.T) {
+	out := Headless_Output {
+		answer = io.Writer{procedure = headless_test_closed_stream},
+	}
+	headless_assistant_text(rawptr(&out), "hello")
+	headless_assistant_end(rawptr(&out))
+	testing.expect(t, out.write_failed, "a closed answer writer must not look successful")
 }

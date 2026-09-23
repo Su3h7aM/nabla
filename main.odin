@@ -92,8 +92,9 @@ chat_cli_usage :: proc() {
 // and whether the turn has produced any of it, so a turn that produced none does
 // not print a blank line.
 Headless_Output :: struct {
-	answer:   io.Writer,
-	answered: bool,
+	answer:       io.Writer,
+	answered:     bool,
+	write_failed: bool,
 }
 
 headless_observer :: proc(out: ^Headless_Output) -> agent.Chat_Observer {
@@ -125,12 +126,16 @@ headless_assistant_begin :: proc(user_data: rawptr) {
 headless_assistant_text :: proc(user_data: rawptr, text: string) {
 	out := cast(^Headless_Output)user_data
 	out.answered = true
-	_, _ = io.write_string(out.answer, text)
+	written, write_err := io.write_string(out.answer, text)
+	if write_err != nil || written != len(text) { out.write_failed = true }
 }
 
 headless_assistant_end :: proc(user_data: rawptr) {
 	out := cast(^Headless_Output)user_data
-	if out.answered { _, _ = io.write_string(out.answer, "\n") }
+	if out.answered {
+		written, write_err := io.write_string(out.answer, "\n")
+		if write_err != nil || written != 1 { out.write_failed = true }
+	}
 }
 
 headless_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Result) {
@@ -174,6 +179,10 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 	completed := agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), headless_observer(out), nil)
 	if agent.chat_session_worker_escaped(&app.setup.session) {
 		fmt.eprintln("nabla:", agent.CHAT_WORKER_ESCAPED_NOTICE)
+		return false
+	}
+	if out.write_failed {
+		fmt.eprintln("nabla: the answer could not be written")
 		return false
 	}
 	return completed
