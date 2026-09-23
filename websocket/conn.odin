@@ -91,11 +91,20 @@ Conn :: struct {
 
 init :: proc(transport: Transport, allocator: mem.Allocator) -> (conn: ^Conn, err: Error) {
 	if transport.read == nil || transport.write == nil { return nil, .Transport }
-	self := new(Conn, allocator)
+	self, alloc_error := new(Conn, allocator)
+	if alloc_error != nil { return nil, .No_Room }
 	self.transport = transport
 	self.allocator = allocator
-	self.send = make([]u8, HEADER_MAX_SIZE + SEND_CHUNK, allocator)
-	self.recv = make([]u8, RECV_CHUNK, allocator)
+	self.send, alloc_error = make([]u8, HEADER_MAX_SIZE + SEND_CHUNK, allocator)
+	if alloc_error != nil {
+		destroy(self)
+		return nil, .No_Room
+	}
+	self.recv, alloc_error = make([]u8, RECV_CHUNK, allocator)
+	if alloc_error != nil {
+		destroy(self)
+		return nil, .No_Room
+	}
 	return self, .None
 }
 

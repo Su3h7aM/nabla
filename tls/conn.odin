@@ -85,13 +85,30 @@ init :: proc(transport: Transport, config: Config) -> (conn: ^Conn, err: Error) 
 	if transport.read == nil || transport.write == nil { return nil, .Transport }
 
 	allocator := config.allocator
-	self := new(Conn, allocator)
+	self, alloc_error := new(Conn, allocator)
+	if alloc_error != nil { return nil, .No_Room }
 	self.transport = transport
 	self.config = config
-	self.send = make([]u8, RECORD_HEADER_SIZE + MAX_CIPHERTEXT_RECORD, allocator)
-	self.message = make([]u8, HANDSHAKE_HEADER_SIZE + MAX_SENT_MESSAGE, allocator)
-	self.recv = make([]u8, RECORD_HEADER_SIZE + MAX_CIPHERTEXT_RECORD, allocator)
-	self.stream = make([dynamic]u8, 0, MAX_CIPHERTEXT_RECORD, allocator)
+	self.send, alloc_error = make([]u8, RECORD_HEADER_SIZE + MAX_CIPHERTEXT_RECORD, allocator)
+	if alloc_error != nil {
+		destroy(self)
+		return nil, .No_Room
+	}
+	self.message, alloc_error = make([]u8, HANDSHAKE_HEADER_SIZE + MAX_SENT_MESSAGE, allocator)
+	if alloc_error != nil {
+		destroy(self)
+		return nil, .No_Room
+	}
+	self.recv, alloc_error = make([]u8, RECORD_HEADER_SIZE + MAX_CIPHERTEXT_RECORD, allocator)
+	if alloc_error != nil {
+		destroy(self)
+		return nil, .No_Room
+	}
+	self.stream, alloc_error = make([dynamic]u8, 0, MAX_CIPHERTEXT_RECORD, allocator)
+	if alloc_error != nil {
+		destroy(self)
+		return nil, .No_Room
+	}
 	return self, .None
 }
 
