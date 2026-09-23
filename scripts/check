@@ -8,7 +8,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
 cd "$NABLA_ROOT"
 
 # Flags mirror checker_args in ols.json.
-flags=(-vet -strict-style -vet-tabs -disallow-do -warnings-as-errors -no-entry-point "-collection:nabla=$NABLA_ROOT")
+flags=(-vet -strict-style -vet-tabs -disallow-do -warnings-as-errors -no-entry-point "${NABLA_DEFINES[@]}" "-collection:nabla=$NABLA_ROOT")
 
 target="${usage_package:-${1:-}}"
 mapfile -t packages < <(nabla_check_packages)

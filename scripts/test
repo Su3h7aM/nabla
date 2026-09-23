@@ -52,6 +52,7 @@ for config in "${configs[@]}"; do
 		[[ -n "$target" && "$target" != "$pkg" ]] && continue
 		extra=(
 			-define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
+			"${NABLA_DEFINES[@]}"
 		)
 		[[ $config == debug ]] && extra+=(-debug)
 		[[ -n $sanitize ]] && extra+=("-sanitize:$sanitize")
@@ -66,7 +67,7 @@ done
 for h in "${harnesses[@]}"; do
 	[[ -n "$target" && "$target" != "$h" && "$target" != "$(basename "$h")" ]] && continue
 	nabla_step "harness $h"
-	timeout --foreground "$timeout_secs" odin run "$h" "$collection" || failed+=("$h")
+	timeout --foreground "$timeout_secs" odin run "$h" "$collection" "${NABLA_DEFINES[@]}" || failed+=("$h")
 done
 
 if ((${#failed[@]})); then

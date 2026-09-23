@@ -4,6 +4,18 @@
 
 NABLA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Defines every build, check, and test runs with.
+#
+# A temporary arena is where the standard library and this harness put memory that
+# lives for one call: the arena behind `context.temp_allocator` and the two `core:os`
+# keeps for its own path handling. Odin sizes a new arena's first block at four
+# mebibytes, and a thread that touches one reserves that whole block. Every tool call
+# runs on a fresh thread, so a call needing a few kilobytes for its arguments, a path,
+# and a stat would reserve eight mebibytes across those arenas, once per call. The
+# define sets the block granularity instead: a call commits what it touches, and an
+# arena still grows by whole blocks when one call needs more.
+NABLA_DEFINES=(-define:DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE=65536)
+
 # Every package runs its core:testing suite on the runner's default thread
 # count (the machine's cores). Tests that mutate process-global state (the
 # cancel token, signal dispositions, environment variables) isolate themselves

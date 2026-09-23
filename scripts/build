@@ -18,7 +18,7 @@ failed=()
 for pkg in "${packages[@]}"; do
 	nabla_step "build $pkg"
 	lib="${pkg//\//-}"
-	odin build "$pkg" -build-mode:shared "$collection" -out:"$out/lib$lib.so" || failed+=("$pkg")
+	odin build "$pkg" -build-mode:shared "$collection" "${NABLA_DEFINES[@]}" -out:"$out/lib$lib.so" || failed+=("$pkg")
 done
 
 mapfile -t executables < <(nabla_executables)
@@ -28,7 +28,7 @@ for bin in "${executables[@]}"; do
 	name="$(basename "$bin")"
 	[[ "$bin" == "." ]] && name="$(basename "$NABLA_ROOT")"
 	nabla_step "build $name"
-	odin build "$bin" "$collection" -out:"$out/$name" || failed+=("$bin")
+	odin build "$bin" "$collection" "${NABLA_DEFINES[@]}" -out:"$out/$name" || failed+=("$bin")
 done
 if ((${#failed[@]})); then
 	nabla_die "build failed: ${failed[*]}"
