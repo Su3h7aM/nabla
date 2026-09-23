@@ -68,7 +68,9 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 // WORK_IDLE_POLL is how often the worker looks at a compaction that is still
 // running. It bounds how long a finished summary waits when no command arrives,
 // and it is a scheduling delay, not a token budget: nothing about the model or
-// the context depends on it.
+// the context depends on it. This is the front-end's explicit policy for the
+// period before an owner wake is connected to the work mailbox; it is not a
+// model-request deadline.
 WORK_IDLE_POLL :: 50 * time.Millisecond
 
 // app_compaction_pending reports whether the open session has compaction work to

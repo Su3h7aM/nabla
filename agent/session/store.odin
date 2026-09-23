@@ -80,7 +80,13 @@ Claim :: struct {
 	session:   Session_Id, // owned
 }
 
-// claim_acquire takes the writer claim for id. It consults no store and does not
+// claim_acquire takes the writer claim for id. Its inline flock is deliberate:
+// `agent/session` is a lower package and cannot import the parent agent's log
+// lock seam. The claim also has a different file mode and result policy, so
+// sharing that seam would couple two unrelated ownership contracts. Revisit this
+// only if a real lower-level consumer needs the same claim operation.
+//
+// It consults no store and does not
 // disturb a claim the caller already holds, which is what lets a switch take the
 // candidate while the running session is still claimed. A second process holding
 // the same session is refused with .Claimed.

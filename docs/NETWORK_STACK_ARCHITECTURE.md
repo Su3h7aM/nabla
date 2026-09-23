@@ -60,6 +60,13 @@ Distinguish four things in code and documentation:
    policy. They may bound retention or decline an operation; they never change a parsed
    fact or label a legal message invalid.
 
+The HTTP client and SSE reader are used with configured provider endpoints, not as a
+public server. Their response heads, lines, and events therefore grow until the provider
+closes them, the caller cancels, or the process runs out of memory. This is an explicit
+trust and resource policy, not a claim that a hostile peer is bounded by the HTTP or SSE
+grammar. A deployment that exposes either parser to an untrusted peer must add a
+per-request byte budget at that trust boundary before accepting the parser's result.
+
 There is no implicit connect, idle or whole-request timer. Reusable transport callers
 may supply cancellation/deadlines; model operations supply cancellation without a time
 bound. DNS retransmission intervals and test timeouts are not model-request deadlines.
