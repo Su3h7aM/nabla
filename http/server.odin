@@ -40,14 +40,6 @@ Server_Opts :: struct {
 	// The thread count to use, defaults to your core count - 1.
 	thread_count:         int,
 
-	// // The initial size of the temp_allocator for each connection, defaults to 256KiB and doubles
-	// // each time it needs to grow.
-	// // NOTE: this value is assigned globally, running multiple servers with a different value will
-	// // not work.
-	// initial_temp_block_cap:  uint,
-	// // The amount of free blocks each thread is allowed to hold on to before deallocating excess.
-	// // Defaults to 64.
-	// max_free_blocks_queued:  uint,
 }
 
 Default_Server_Opts := Server_Opts {
@@ -55,8 +47,6 @@ Default_Server_Opts := Server_Opts {
 	redirect_head_to_get = true,
 	limit_request_line   = 8000,
 	limit_headers        = 8000,
-	// initial_temp_block_cap  = 256 * mem.Kilobyte,
-	// max_free_blocks_queued  = 64,
 }
 
 Server_State :: enum {
@@ -98,8 +88,6 @@ Server_Thread :: struct {
 	state:      Server_State,
 	accept:     ^nbio.Operation,
 
-	// free_temp_blocks:       map[int]queue.Queue(^Block),
-	// free_temp_blocks_count: int,
 }
 
 @(private, disabled = ODIN_DISABLE_ASSERT)
@@ -118,8 +106,6 @@ Default_Endpoint := net.Endpoint {
 listen :: proc(s: ^Server, endpoint: net.Endpoint = Default_Endpoint, opts: Server_Opts = Default_Server_Opts) -> (err: net.Network_Error) {
 	s.opts = opts
 	s.conn_allocator = context.allocator
-	// initial_block_cap = int(s.opts.initial_temp_block_cap)
-	// max_free_blocks_queued = int(s.opts.max_free_blocks_queued)
 
 	acquire_err := nbio.acquire_thread_event_loop()
 	// TODO: error handling.
@@ -403,8 +389,6 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
 					log.debugf("closed connection: %i", c.socket)
 
 					c.state = .Closed
-
-					// allocator_destroy(&c.temp_allocator)
 					virtual.arena_destroy(&c.temp_allocator)
 
 					scanner_destroy(&c.scanner)
