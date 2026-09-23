@@ -244,8 +244,6 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 		parent    = parent,
 		nested    = true,
 	}
-	jobs.next_id += 1
-	jobs.admitted += 1
 	child.nested_call = {
 		id        = strings.clone(call_id, child.allocator),
 		name      = strings.clone(parent.lua.request.name, child.allocator),
@@ -256,7 +254,12 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 	child.name = strings.clone(child.nested_call.name, child.allocator)
 	child.call_id = strings.clone(child.nested_call.id, child.allocator)
 	tool_job_admit(jobs, chat, {}, child)
-	append(&jobs.jobs, child)
+	if !tool_jobs_publish(jobs, child) {
+		parent.result = code_mode_job_failure(parent, .Tool_Failed, .Unavailable, "the nested tool job could not be admitted", "allocation failed")
+		parent.result_present = true
+		parent.phase = .Result_Ready
+		return
+	}
 	parent.lua_child = child
 	parent.phase = .Waiting
 }

@@ -350,6 +350,21 @@ tool_jobs_earliest_live :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
 
 // --- submission ----------------------------------------------------------------
 
+// tool_jobs_publish makes a fully initialized job visible to the owner table. The
+// table append is part of admission: a job that is not published has no owner, so
+// it must be released with the worker allocator before the batch changes state.
+@(private)
+tool_jobs_publish :: proc(jobs: ^Tool_Jobs, job: ^Tool_Job) -> bool {
+	if append(&jobs.jobs, job) != 1 {
+		tool_job_release(job)
+		if jobs.stop == .None { jobs.stop = .Storage_Failed }
+		return false
+	}
+	jobs.next_id += 1
+	jobs.admitted += 1
+	return true
+}
+
 // tool_jobs_submit admits the calls a response committed into jobs. Admission is the
 // owner's work: it resolves the definition, admits the arguments, and turns anything
 // that cannot run into a result now, so the batch only ever executes admitted calls.
@@ -368,12 +383,10 @@ tool_jobs_submit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 			phase     = .Queued,
 			allocator = jobs.worker_allocator,
 		}
-		jobs.next_id += 1
-		jobs.admitted += 1
 		job.name = strings.clone(staged.name, job.allocator)
 		job.call_id = strings.clone(staged.id, job.allocator)
 		tool_job_admit(jobs, chat, observer, job)
-		append(&jobs.jobs, job)
+		if !tool_jobs_publish(jobs, job) { return }
 	}
 }
 
