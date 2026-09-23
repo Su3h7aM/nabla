@@ -174,6 +174,10 @@ display_clean :: proc(text: string, allocator := context.allocator) -> string {
 	return joined
 }
 
+// The display helpers below return text from the default temporary arena. Their callers
+// consume it synchronously while building or flushing a frame, then the arena is reset;
+// they do not transfer ownership to a later turn or session.
+
 // retry_display_text says what a scheduled retry is, in words a person reads. The agent
 // reports the failure class and the attempt numbers; turning them into a sentence for a
 // user is the front-end's job, and this is the one place either front-end asks for it.

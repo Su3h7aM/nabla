@@ -581,6 +581,9 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width, ordinal: 
 	// this much room; the rest of the top border is rule.
 	name = text.truncate_text_at(name, max(border_inner_width - 3, 0), TOOL_LABEL_START)
 	preview = display_clean(preview, context.temp_allocator)
+	// These presentation scratch strings are best effort. A failed repeat leaves a
+	// shorter border or spacer, never a tool result or a model-visible field; the
+	// next frame retries with a fresh temporary arena.
 	rule_fill :=
 		strings.repeat(outline.horizontal, max(border_inner_width - text.text_columns_at(name, TOOL_LABEL_START) - 3, 0), context.temp_allocator) or_else ""
 	top := fmt.tprintf("%s%s %s %s%s", outline.top_left, outline.horizontal, name, rule_fill, outline.top_right)
