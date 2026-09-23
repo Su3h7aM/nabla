@@ -22,9 +22,11 @@ reimplementing something that exists. Update it when the gap it names closes.
   job table, hidden children, bounded limits and a shared result envelope.
 - Tool admission with argument repair, durable dispatch, all-or-nothing call staging,
   worker/owner/Lua placement, lanes, worker bounds and answer completeness on cancel.
-- One owner thread with one wake primitive for every wait and every producer: provider facts
+- One owner thread with one wake primitive for agent waits and producers: provider facts
   queue in the bounded mailbox, a tool completion and a finished compaction publish through the
-  same wake, and the owner collects them by observing instead of polling.
+  same wake, and the agent owner collects them by observing instead of polling. The root worker
+  retains one documented 50 ms front-end scheduling poll for adopting a completed compaction
+  while its command mailbox is empty.
 - Context logger integration, typed JSONL diagnostics, capture, retention and the
   read-only `diagnostics` reader/export.
 - Native HTTP/1.1, TLS 1.3, SSE, DNS and Responses WebSocket with provider delivery
@@ -47,10 +49,11 @@ Each is required work, not a design choice. Do not treat current behavior as cor
 
 Closed since this document was written:
 
-- One owner wake serves every wait: the request mailbox, the tool table, the retry backoff, and
-a requested stop all signal or wait on one condition variable, and each wait is bounded by its
-own real deadline (the retry delay, a stopped call's patience) or by nothing at all. The three
-50 ms checks and the retry policy's slice are gone.
+- One owner wake serves every agent wait: the request mailbox, the tool table, the retry backoff,
+  a requested stop all signal or wait on one condition variable, and each wait is bounded by its
+  own real deadline (the retry delay, a stopped call's patience) or by nothing at all. The
+  agent's three 50 ms checks and the retry policy's slice are gone; the root worker's separate
+  compaction-adoption poll is a front-end scheduling policy, not an agent wait.
 - Provider facts reach the owner through one bounded mailbox instead of through the send
 that produced them: one attempt is one worker thread, it owns the blocking send, and it
 publishes owned `Chat_Event`s and a terminal outcome. The owner applies them and awaits the
