@@ -28,6 +28,16 @@ test_sanitize_strips_control_sequences :: proc(t: ^testing.T) {
 
 	// An invalid byte becomes the replacement character.
 	testing.expect_value(t, _sanitize_one(t, "a\xffi"), "a\uFFFDi")
+
+	// Reject encodings with valid-looking continuation bytes but invalid scalar
+	// values. The sanitizer must not pass overlong, surrogate, or out-of-range
+	// sequences through as if they were text.
+	testing.expect_value(t, _sanitize_one(t, "\xE0\x80\x80"), "\uFFFD\uFFFD\uFFFD")
+	testing.expect_value(t, _sanitize_one(t, "\xED\xA0\x80"), "\uFFFD\uFFFD\uFFFD")
+	testing.expect_value(t, _sanitize_one(t, "\xF4\x90\x80\x80"), "\uFFFD\uFFFD\uFFFD\uFFFD")
+
+	// A deliberately encoded U+FFFD is valid UTF-8 and remains one rune.
+	testing.expect_value(t, _sanitize_one(t, "\xEF\xBF\xBD"), "\uFFFD")
 }
 
 @(test)

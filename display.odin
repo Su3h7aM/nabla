@@ -36,20 +36,6 @@ Display_Sanitizer :: struct {
 	skip_one: bool, // drop one byte: a charset-designation final,
 }
 
-display_utf8_len :: proc(lead: u8) -> int {
-	switch {
-	case lead < 0x80:
-		return 1
-	case lead >> 5 == 0b110:
-		return 2
-	case lead >> 4 == 0b1110:
-		return 3
-	case lead >> 3 == 0b11110:
-		return 4
-	}
-	return 0
-}
-
 // display_sanitize_chunk renders one fragment and returns owned text.
 // display_sanitize_flush closes the stream: a dangling escape is dropped and
 // a dangling rune fragment becomes U+FFFD.
@@ -94,26 +80,19 @@ display_sanitize_chunk :: proc(san: ^Display_Sanitizer, chunk: string, allocator
 				san.after_cr = false
 				i += 1
 			case:
-				need := display_utf8_len(c)
-				if need == 0 {
-					strings.write_rune(&builder, utf8.RUNE_ERROR)
-					san.after_cr = false
-					i += 1
-				} else if i + need > len(combined) {
-					copy(san.hold[:], combined[i:])
-					san.hold_len = len(combined) - i
+				remaining := combined[i:]
+				if !utf8.full_rune_in_bytes(remaining) {
+					copy(san.hold[:], remaining)
+					san.hold_len = len(remaining)
 					i = len(combined)
 				} else {
-					valid := true
-					for k in 1 ..< need {
-						if combined[i + k] < 0x80 || combined[i + k] > 0xBF { valid = false }
-					}
-					if valid {
-						for k in 0 ..< need { strings.write_byte(&builder, combined[i + k]) }
-						i += need
-					} else {
+					r, size := utf8.decode_rune_in_bytes(remaining)
+					if r == utf8.RUNE_ERROR && size == 1 {
 						strings.write_rune(&builder, utf8.RUNE_ERROR)
 						i += 1
+					} else {
+						strings.write_rune(&builder, r)
+						i += size
 					}
 					san.after_cr = false
 				}
