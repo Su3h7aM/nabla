@@ -2,6 +2,7 @@ package agent
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 
 import "nabla:agent/session"
@@ -9,6 +10,12 @@ import "nabla:agent/skills"
 
 INSTRUCTION_MANIFEST_VERSION :: 2
 SKILL_METADATA_FORMAT_VERSION :: 1
+
+Instruction_Manifest_Error :: enum {
+	None,
+	Allocation,
+	Encode,
+}
 
 chat_ensure_instructions :: proc(chat: ^Chat_Session) -> bool {
 	if chat.skill_instructions != "" { return true }
@@ -54,14 +61,17 @@ chat_ensure_instructions :: proc(chat: ^Chat_Session) -> bool {
 }
 
 chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: string, catalog: skills.Catalog, error_text: string) {
-	files, files_error := collect_agents_files(chat.workspace, chat.disable_project_instructions, chat.allocator)
-	if files_error != "" {
+	files, files_error, files_kind := collect_agents_files(chat.workspace, chat.disable_project_instructions, chat.allocator)
+	if files_kind == .Allocation { return "", "", {}, "local instructions could not be allocated" }
+	if files_kind == .Read {
 		return "", "", {}, fmt.tprintf("local instructions could not be read: %s", files_error)
 	}
 	defer agents_files_destroy(files, chat.allocator)
-	roots := instruction_roots(chat.workspace, chat.disable_project_instructions, chat.allocator)
+	roots, roots_error := instruction_roots(chat.workspace, chat.disable_project_instructions, chat.allocator)
+	if roots_error != nil { return "", "", {}, "instruction roots could not be allocated" }
 	defer instruction_roots_destroy(roots, chat.allocator)
-	skill_roots := instruction_skill_roots(roots, chat.allocator)
+	skill_roots, skill_roots_error := instruction_skill_roots(roots, chat.allocator)
+	if skill_roots_error != nil { return "", "", {}, "instruction roots could not be copied" }
 	defer {
 		for &root in skill_roots {
 			delete(root.logical_path, chat.allocator)
@@ -74,13 +84,19 @@ chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: str
 	if discover_error.kind != .None {
 		return "", "", {}, "skill discovery failed"
 	}
-	rendered := render_instructions(files, discovered, chat.tools_enabled, chat.allocator)
+	rendered, rendered_error := render_instructions(files, discovered, chat.tools_enabled, chat.allocator)
+	if rendered_error != nil { return "", "", {}, "local instructions could not be allocated" }
 	if len(rendered) > INSTRUCTIONS_MAX_BYTES {
 		delete(rendered, chat.allocator)
 		skills.catalog_destroy(&discovered, chat.allocator)
 		return "", "", {}, "initial instructions exceed the byte limit"
 	}
-	encoded := chat_encode_manifest(chat, files, discovered, rendered, chat.allocator)
+	encoded, manifest_error := chat_encode_manifest(chat, files, discovered, rendered, chat.allocator)
+	if manifest_error != .None {
+		delete(rendered, chat.allocator)
+		skills.catalog_destroy(&discovered, chat.allocator)
+		return "", "", {}, "the instruction manifest could not be allocated"
+	}
 	if len(encoded) > SKILL_MAX_MANIFEST_BYTES {
 		delete(rendered, chat.allocator)
 		delete(encoded, chat.allocator)
@@ -92,9 +108,27 @@ chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: str
 
 // chat_encode_manifest records the snapshot a later resume applies. The roots it writes are
 // the catalog's own, because every root index it also writes refers to that list.
-chat_encode_manifest :: proc(chat: ^Chat_Session, files: []Agents_File, catalog: skills.Catalog, rendered: string, allocator := context.allocator) -> string {
+chat_encode_manifest :: proc(
+	chat: ^Chat_Session,
+	files: []Agents_File,
+	catalog: skills.Catalog,
+	rendered: string,
+	allocator := context.allocator,
+) -> (
+	string,
+	Instruction_Manifest_Error,
+) {
 	scratch := context.temp_allocator
-	inline_catalog := encode_skill_catalog(catalog, scratch)
+	inline_catalog, inline_error := encode_skill_catalog(catalog, scratch)
+	if inline_error != nil { return "", .Allocation }
+	roots, roots_error := make([]Instruction_Manifest_Root, len(catalog.roots), scratch)
+	if roots_error != nil { return "", .Allocation }
+	agents, agents_error := make([]Instruction_Manifest_File, len(files), scratch)
+	if agents_error != nil { return "", .Allocation }
+	skills_data, skills_error := make([]Instruction_Manifest_Skill, len(catalog.skills), scratch)
+	if skills_error != nil { return "", .Allocation }
+	diagnostics, diagnostics_error := make([]Instruction_Manifest_Diagnostic, len(catalog.diagnostics), scratch)
+	if diagnostics_error != nil { return "", .Allocation }
 	manifest := Instruction_Manifest {
 		version                  = INSTRUCTION_MANIFEST_VERSION,
 		workspace                = chat.workspace,
@@ -102,10 +136,10 @@ chat_encode_manifest :: proc(chat: ^Chat_Session, files: []Agents_File, catalog:
 		tools_enabled            = chat.tools_enabled,
 		metadata_format          = SKILL_METADATA_FORMAT_VERSION,
 		instruction_bytes        = len(rendered),
-		roots                    = make([]Instruction_Manifest_Root, len(catalog.roots), scratch),
-		agents                   = make([]Instruction_Manifest_File, len(files), scratch),
-		skills                   = make([]Instruction_Manifest_Skill, len(catalog.skills), scratch),
-		diagnostics              = make([]Instruction_Manifest_Diagnostic, len(catalog.diagnostics), scratch),
+		roots                    = roots,
+		agents                   = agents,
+		skills                   = skills_data,
+		diagnostics              = diagnostics,
 		omitted_diagnostics      = catalog.omitted,
 		inline_catalog_truncated = len(inline_catalog) > SKILL_INLINE_CATALOG_BYTES,
 	}
@@ -124,13 +158,15 @@ chat_encode_manifest :: proc(chat: ^Chat_Session, files: []Agents_File, catalog:
 		}
 	}
 	for skill, index in catalog.skills {
+		digest, digest_error := skill_digest_text(skill.metadata_digest, scratch)
+		if digest_error != nil { return "", .Allocation }
 		manifest.skills[index] = Instruction_Manifest_Skill {
 			name            = skill.name,
 			description     = skill.description,
 			logical_path    = skill.logical_path,
 			directory       = skill.directory,
 			root_index      = skill.root_index,
-			metadata_digest = skill_digest_text(skill.metadata_digest, scratch),
+			metadata_digest = digest,
 		}
 	}
 	for diagnostic, index in catalog.diagnostics {
@@ -144,8 +180,8 @@ chat_encode_manifest :: proc(chat: ^Chat_Session, files: []Agents_File, catalog:
 		}
 	}
 	encoded, marshal_error := json.marshal(manifest, allocator = allocator)
-	if marshal_error != nil { return "" }
-	return string(encoded)
+	if marshal_error != nil { return "", .Encode }
+	return string(encoded), .None
 }
 
 Instruction_Manifest :: struct {
@@ -206,6 +242,57 @@ instruction_manifest_kind :: proc(kind: skills.Source_Kind) -> string {
 	return "unknown"
 }
 
+snapshot_skill_make :: proc(entry: Instruction_Manifest_Skill, allocator: mem.Allocator) -> (skills.Skill, bool) {
+	skill: skills.Skill
+	clone_error: mem.Allocator_Error
+	skill.name, clone_error = strings.clone(entry.name, allocator)
+	if clone_error != nil { return {}, false }
+	skill.description, clone_error = strings.clone(entry.description, allocator)
+	if clone_error != nil { delete(skill.name, allocator); return {}, false }
+	skill.logical_path, clone_error = strings.clone(entry.logical_path, allocator)
+	if clone_error != nil { delete(skill.name, allocator); delete(skill.description, allocator); return {}, false }
+	skill.directory, clone_error = strings.clone(entry.directory, allocator)
+	if clone_error != nil { delete(skill.name, allocator); delete(skill.description, allocator); delete(skill.logical_path, allocator); return {}, false }
+	skill.root_index = entry.root_index
+	skill.metadata_digest = skill_digest_parse(entry.metadata_digest)
+	return skill, true
+}
+
+snapshot_root_make :: proc(entry: Instruction_Manifest_Root, allocator: mem.Allocator) -> (skills.Root, bool) {
+	root: skills.Root
+	path, path_error := strings.clone(entry.path, allocator)
+	if path_error != nil { return {}, false }
+	authority, authority_error := strings.clone(entry.authority, allocator)
+	if authority_error != nil { delete(path, allocator); return {}, false }
+	root = skills.Root {
+		source    = instruction_manifest_source(entry.kind),
+		path      = path,
+		authority = authority,
+	}
+	return root, true
+}
+
+snapshot_diagnostic_make :: proc(entry: Instruction_Manifest_Diagnostic, allocator: mem.Allocator) -> (skills.Diagnostic, bool) {
+	diagnostic: skills.Diagnostic
+	path, path_error := strings.clone(entry.path, allocator)
+	if path_error != nil { return {}, false }
+	detail, detail_error := strings.clone(entry.detail, allocator)
+	if detail_error != nil { delete(path, allocator); return {}, false }
+	winner, winner_error := strings.clone(entry.winner, allocator)
+	if winner_error != nil { delete(path, allocator); delete(detail, allocator); return {}, false }
+	loser, loser_error := strings.clone(entry.loser, allocator)
+	if loser_error != nil { delete(path, allocator); delete(detail, allocator); delete(winner, allocator); return {}, false }
+	diagnostic = skills.Diagnostic {
+		kind       = skills.Diagnostic_Kind(entry.kind),
+		root_index = entry.root_index,
+		path       = path,
+		detail     = detail,
+		winner     = winner,
+		loser      = loser,
+	}
+	return diagnostic, true
+}
+
 chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: string) -> bool {
 	// A second catalog never replaces the first: the check comes before any
 	// allocation, so refusing costs nothing and leaks nothing.
@@ -219,47 +306,43 @@ chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: st
 	if manifest.workspace != chat.workspace { return false }
 	if manifest.instruction_bytes != len(instructions) { return false }
 	catalog: skills.Catalog
-	catalog.skills = make([]skills.Skill, len(manifest.skills), chat.allocator)
-	catalog.roots = make([]skills.Root, len(manifest.roots), chat.allocator)
-	catalog.diagnostics = make([]skills.Diagnostic, len(manifest.diagnostics), chat.allocator)
-	// A corrupt entry below must not strand what the earlier entries cloned.
+	// A corrupt entry or allocation failure must not strand what earlier entries cloned.
 	applied := false
 	defer if !applied { skills.catalog_destroy(&catalog, chat.allocator) }
+	catalog_skills, skills_error := make([]skills.Skill, len(manifest.skills), chat.allocator)
+	if skills_error != nil { return false }
+	catalog.skills = catalog_skills
+	catalog_roots, roots_error := make([]skills.Root, len(manifest.roots), chat.allocator)
+	if roots_error != nil { return false }
+	catalog.roots = catalog_roots
+	catalog_diagnostics, diagnostics_error := make([]skills.Diagnostic, len(manifest.diagnostics), chat.allocator)
+	if diagnostics_error != nil { return false }
+	catalog.diagnostics = catalog_diagnostics
 	for entry, index in manifest.skills {
 		if !skills.skill_name_valid(entry.name) { return false }
-		catalog.skills[index] = skills.Skill {
-			name            = strings.clone(entry.name, chat.allocator),
-			description     = strings.clone(entry.description, chat.allocator),
-			logical_path    = strings.clone(entry.logical_path, chat.allocator),
-			directory       = strings.clone(entry.directory, chat.allocator),
-			root_index      = entry.root_index,
-			metadata_digest = skill_digest_parse(entry.metadata_digest),
-		}
+		skill, skill_ok := snapshot_skill_make(entry, chat.allocator)
+		if !skill_ok { return false }
+		catalog.skills[index] = skill
 	}
 	// The manifest records each root's canonical directory, which is what says whether a root
 	// holds a skill. A restored root has no configured logical path.
 	for entry, index in manifest.roots {
-		catalog.roots[index] = skills.Root {
-			source    = instruction_manifest_source(entry.kind),
-			path      = strings.clone(entry.path, chat.allocator),
-			authority = strings.clone(entry.authority, chat.allocator),
-		}
+		root, root_ok := snapshot_root_make(entry, chat.allocator)
+		if !root_ok { return false }
+		catalog.roots[index] = root
 	}
 	chat_rebind_skill_roots(&catalog)
 	for entry, index in manifest.diagnostics {
-		catalog.diagnostics[index] = skills.Diagnostic {
-			kind       = skills.Diagnostic_Kind(entry.kind),
-			root_index = entry.root_index,
-			path       = strings.clone(entry.path, chat.allocator),
-			detail     = strings.clone(entry.detail, chat.allocator),
-			winner     = strings.clone(entry.winner, chat.allocator),
-			loser      = strings.clone(entry.loser, chat.allocator),
-		}
+		diagnostic, diagnostic_ok := snapshot_diagnostic_make(entry, chat.allocator)
+		if !diagnostic_ok { return false }
+		catalog.diagnostics[index] = diagnostic
 	}
 	catalog.omitted = manifest.omitted_diagnostics
+	owned_instructions, instructions_error := strings.clone(instructions, chat.allocator)
+	if instructions_error != nil { return false }
 	chat.skill_catalog = catalog
 	delete(chat.skill_instructions, chat.allocator)
-	chat.skill_instructions = strings.clone(instructions, chat.allocator)
+	chat.skill_instructions = owned_instructions
 	applied = true
 	return true
 }

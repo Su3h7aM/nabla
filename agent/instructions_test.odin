@@ -22,7 +22,8 @@ test_instruction_roots_order_and_rendering :: proc(t: ^testing.T) {
 	defer delete(workspace, context.allocator)
 	testing.expect(t, os.make_directory_all(workspace) == nil)
 
-	roots := instruction_roots(workspace, false)
+	roots, roots_error := instruction_roots(workspace, false)
+	if roots_error != nil { testing.fail_now(t, "instruction roots could not be allocated") }
 	defer instruction_roots_destroy(roots)
 	testing.expect_value(t, len(roots), 3)
 	if len(roots) == 3 {
@@ -35,7 +36,8 @@ test_instruction_roots_order_and_rendering :: proc(t: ^testing.T) {
 		testing.expect_value(t, roots[2].kind, Instruction_Source_Kind.Generic_User)
 	}
 
-	disabled := instruction_roots(workspace, true)
+	disabled, disabled_error := instruction_roots(workspace, true)
+	if disabled_error != nil { testing.fail_now(t, "disabled instruction roots could not be allocated") }
 	defer instruction_roots_destroy(disabled)
 	for root in disabled { testing.expect(t, root.kind != .Local) }
 
@@ -43,7 +45,8 @@ test_instruction_roots_order_and_rendering :: proc(t: ^testing.T) {
 	defer delete(files)
 	append(&files, Agents_File{path = "/home/user/.agents/AGENTS.md", scope = "personal", body = "Be brief."})
 	catalog: skills.Catalog
-	rendered := render_instructions(files[:], catalog, true)
+	rendered, rendered_error := render_instructions(files[:], catalog, true)
+	if rendered_error != nil { testing.fail_now(t, "instructions could not be rendered") }
 	defer delete(rendered, context.allocator)
 	testing.expect(t, len(rendered) > len(AGENT_SYSTEM_PROMPT))
 	testing.expect(t, strings.contains(rendered, "Be brief."))
@@ -64,29 +67,30 @@ test_read_agents_file_treats_empty_as_missing :: proc(t: ^testing.T) {
 	path := filepath.join({base, "AGENTS.md"}, context.allocator) or_else ""
 	defer delete(path, context.allocator)
 
-	body, err := read_agents_file(path)
+	body, err, err_kind := read_agents_file(path)
+	testing.expect_value(t, err_kind, Instruction_Error.None)
 	testing.expect_value(t, err, "missing")
 	testing.expect_value(t, body, "")
 	delete(body, context.allocator)
 
 	testing.expect(t, os.write_entire_file(path, "") == nil)
-	body, err = read_agents_file(path)
+	body, err, err_kind = read_agents_file(path)
 	testing.expect_value(t, err, "missing")
 	delete(body, context.allocator)
 
 	testing.expect(t, os.write_entire_file(path, "\n\n   \n") == nil)
-	body, err = read_agents_file(path)
+	body, err, err_kind = read_agents_file(path)
 	testing.expect_value(t, err, "missing")
 	delete(body, context.allocator)
 
 	testing.expect(t, os.write_entire_file(path, "Be concise.\n") == nil)
-	body, err = read_agents_file(path)
+	body, err, err_kind = read_agents_file(path)
 	testing.expect_value(t, err, "")
 	testing.expect_value(t, body, "Be concise.\n")
 	delete(body, context.allocator)
 
 	testing.expect(t, os.write_entire_file(path, "broken\x00text") == nil)
-	body, err = read_agents_file(path)
+	body, err, err_kind = read_agents_file(path)
 	defer delete(body, context.allocator)
 	testing.expect(t, strings.contains(err, path), err)
 }

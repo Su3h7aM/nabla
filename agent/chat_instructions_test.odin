@@ -120,7 +120,8 @@ test_a_written_snapshot_restores_the_root_each_skill_came_from :: proc(t: ^testi
 	chat_test_begin(t, &writer, workspace)
 	defer chat_test_end(t, &writer)
 	rendered := "instructions!"
-	manifest := chat_encode_manifest(&writer.chat, nil, catalog, rendered, context.allocator)
+	manifest, manifest_error := chat_encode_manifest(&writer.chat, nil, catalog, rendered, context.allocator)
+	if manifest_error != .None { testing.fail_now(t, "the manifest could not be encoded") }
 	defer delete(manifest, context.allocator)
 	if len(manifest) == 0 { testing.fail_now(t, "the manifest could not be encoded") }
 

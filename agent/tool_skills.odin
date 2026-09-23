@@ -2,6 +2,7 @@ package agent
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 
 import "nabla:agent/session"
@@ -157,9 +158,11 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> T
 	if load_error.kind != .None {
 		return tool_result_failure(ctx, tool_skill_outcome(load_error.kind), skills.error_text(load_error), "load failed")
 	}
-	digest := skill_digest_text(loaded.content_digest, ctx.allocator)
+	digest, digest_error := skill_digest_text(loaded.content_digest, ctx.allocator)
+	if digest_error != nil { return tool_result_failure(ctx, .Tool_Failed, "the skill digest could not be allocated", "encoding failed") }
 	defer delete(digest, ctx.allocator)
-	primary := skill_primary_path(skill, ctx.allocator)
+	primary, primary_error := skill_primary_path(skill, ctx.allocator)
+	if primary_error != nil { return tool_result_failure(ctx, .Tool_Failed, "the skill path could not be allocated", "encoding failed") }
 	defer delete(primary, ctx.allocator)
 	data := Load_Skill_Data {
 		name           = skill.name,
@@ -281,14 +284,15 @@ tool_skill_outcome :: proc(kind: skills.Error_Kind) -> session.Tool_Outcome {
 	return .Tool_Failed
 }
 
-skill_digest_text :: proc(digest: [32]u8, allocator := context.allocator) -> string {
-	out := make([]u8, 64, allocator)
+skill_digest_text :: proc(digest: [32]u8, allocator := context.allocator) -> (string, mem.Allocator_Error) {
+	out, out_error := make([]u8, 64, allocator)
+	if out_error != nil { return "", out_error }
 	for value, index in digest {
 		high, low := skill_hex_nibbles(value)
 		out[index * 2] = high
 		out[index * 2 + 1] = low
 	}
-	return string(out)
+	return string(out), nil
 }
 
 skill_hex_nibbles :: proc(value: u8) -> (u8, u8) {
@@ -300,7 +304,7 @@ skill_hex_digit :: proc(nibble: u8) -> u8 {
 	return 'a' + (nibble - 10)
 }
 
-skill_primary_path :: proc(skill: skills.Skill, allocator := context.allocator) -> string {
+skill_primary_path :: proc(skill: skills.Skill, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	if strings.has_suffix(skill.directory, "/") { return strings.concatenate({skill.directory, "SKILL.md"}, allocator) }
 	return strings.concatenate({skill.directory, "/SKILL.md"}, allocator)
 }
