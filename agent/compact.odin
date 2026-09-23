@@ -301,6 +301,9 @@ Compact_Job :: struct {
 	// backing is what the job struct itself was allocated with, which is the session's
 	// allocator: the control object belongs to the thread that drives the session.
 	backing:    mem.Allocator,
+	// logging is the immutable binding the worker uses for provider and runtime records.
+	// It points at the session's sink and owns no strings.
+	logging:    Log_Binding,
 	// finished is the worker's word that everything below is on the struct. It is published
 	// through the owner wake and read under it, so the owner learns the job ended without
 	// asking the thread library; the join that follows the flag proves the payload.
@@ -395,6 +398,7 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 	// allocator the owner releases it with, and that allocator is a thread-safe heap because
 	// the owner is allocating from its own at the same time.
 	context.allocator = job.allocator
+	context.logger = log_logger(&job.logging)
 	job.started_at = time.tick_now()
 
 	connection := ai.Provider_Connection {
@@ -415,7 +419,14 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 	options := ai.Provider_Operation_Options {
 		interrupt = &job.interrupt,
 	}
+	provider_log: Provider_Log
+	if log_observation_wanted() {
+		options.observer = provider_log_observer(&provider_log)
+	}
 	job.operation = ai.Provider_Request_Operation_Encoded(connection, request, job, chat_compact_event, options, job.allocator)
+	if provider_log.response_capture.kind != .Invalid {
+		log_capture_finish(&provider_log.response_capture, job.operation.kind == .None)
+	}
 	if job.operation.detail != "" && job.error_text == "" {
 		// The transport's account becomes the job's, so there is one string to
 		// release rather than two owners for one fact.
@@ -672,10 +683,12 @@ chat_compact_start :: proc(
 		{key = "context_window", value = i64(chat.capacity.window)},
 	}
 	// The record names the compaction request, not whichever foreground request
-	// happened to be at the boundary when it started.
-	binding: Log_Binding
-	context.logger = log_rebind(&binding, log_correlation_for_request(chat, job.request_no))
+	// happened to be at the boundary when it started. The binding belongs to the
+	// job so the worker can use the same sink after this owner scope returns.
+	previous_logger := context.logger
+	context.logger = log_rebind(&job.logging, log_correlation_for_request(chat, job.request_no))
 	log_emit({level = .Info, category = .Provider, event = "compaction.started", fields = fields[:]})
+	context.logger = previous_logger
 	return true
 }
 
