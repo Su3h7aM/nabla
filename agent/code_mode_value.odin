@@ -40,7 +40,11 @@ code_mode_lua_request_json :: proc(run: ^Lua_Run, allocator: mem.Allocator) -> (
 	if run.request.arg_count > 1 {
 		return "", fmt.aprintf("%s takes one table of arguments, and was given %d", run.request.name, run.request.arg_count, allocator = allocator)
 	}
-	if run.request.args_ref == l.REFNIL || run.request.args_ref == l.NOREF { return strings.clone("{}", allocator), "" }
+	if run.request.args_ref == l.REFNIL || run.request.args_ref == l.NOREF {
+		empty, clone_err := strings.clone("{}", allocator)
+		if clone_err != nil { return "", "the empty tool arguments could not be allocated" }
+		return empty, ""
+	}
 
 	_ = l.rawgeti(run.thread, l.REGISTRYINDEX, l.Integer(run.request.args_ref))
 	defer l.pop(run.thread, 1)
@@ -95,7 +99,9 @@ code_mode_lua_to_json_value :: proc(L: ^l.State, index: c.int, state: ^Code_Mode
 		// is bytes, so this is the boundary where that is decided rather than discovered
 		// by the provider. A NUL is a byte like any other and survives as an escape.
 		if !utf8.valid_string(text) { return {}, "a string is not valid UTF-8" }
-		return json.Value(json.String(strings.clone(text, state.allocator))), ""
+		owned, clone_err := strings.clone(text, state.allocator)
+		if clone_err != nil { return {}, "a string could not be allocated" }
+		return json.Value(json.String(owned)), ""
 	case .LIGHTUSERDATA:
 		if state.null_identity != nil && l.touserdata(L, index) == state.null_identity {
 			return json.Value(json.Null(nil)), ""
@@ -178,14 +184,18 @@ code_mode_lua_table_to_json :: proc(L: ^l.State, index: c.int, state: ^Code_Mode
 			l.pop(L, 2)
 			return {}, "a table key is not valid UTF-8"
 		}
-		key = strings.clone(key, state.allocator)
+		owned_key, clone_err := strings.clone(key, state.allocator)
+		if clone_err != nil {
+			l.pop(L, 2)
+			return {}, "a table key could not be allocated"
+		}
 		value, message := code_mode_lua_to_json_value(L, -1, state, depth + 1)
 		l.pop(L, 1)
 		if message != "" {
-			delete(key, state.allocator)
+			delete(owned_key, state.allocator)
 			return {}, message
 		}
-		fields[key] = value
+		fields[owned_key] = value
 	}
 	complete = true
 	return json.Value(fields), ""

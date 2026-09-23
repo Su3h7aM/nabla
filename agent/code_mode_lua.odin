@@ -199,12 +199,13 @@ CODE_MODE_LUA_ALLOCATION_SITE :: runtime.Source_Code_Location {
 // code_mode_lua_string_clone copies a string with an explicit allocator. It exists
 // because C callbacks have no context and so cannot call `strings.clone`.
 @(private)
-code_mode_lua_string_clone :: proc(text: string, allocator: mem.Allocator) -> string {
-	if text == "" || allocator.procedure == nil { return "" }
+code_mode_lua_string_clone :: proc(text: string, allocator: mem.Allocator) -> (string, bool) {
+	if text == "" { return "", true }
+	if allocator.procedure == nil { return "", false }
 	block, err := allocator.procedure(allocator.data, .Alloc, len(text), 1, nil, 0, CODE_MODE_LUA_ALLOCATION_SITE)
-	if err != nil || block == nil || len(block) < len(text) { return "" }
+	if err != nil || block == nil || len(block) < len(text) { return "", false }
 	mem.copy(raw_data(block), raw_data(text), len(text))
-	return string(block[:len(text)])
+	return string(block[:len(text)]), true
 }
 
 // code_mode_lua_string_free releases a string made by code_mode_lua_string_clone.
@@ -324,7 +325,16 @@ code_mode_lua_tool_call :: proc "c" (L: ^l.State) -> c.int {
 	if l.type(L, l.REGISTRYINDEX - 1) == .STRING {
 		length: c.size_t
 		text := l.tolstring(L, l.REGISTRYINDEX - 1, &length)
-		if text != nil { name = code_mode_lua_string_clone(string(text), run.allocator) }
+		if text != nil {
+			name_ok: bool
+			name, name_ok = code_mode_lua_string_clone(string(text), run.allocator)
+			if !name_ok {
+				run.failure = .Memory
+				run.terminal = true
+				run.last_event = .Failed
+				return c.int(l.L_error(L, cstring("Code Mode could not allocate a tool name")))
+			}
+		}
 	}
 	count := int(l.gettop(L))
 	args_ref: c.int = l.REFNIL
@@ -584,6 +594,14 @@ code_mode_lua_start :: proc(allocator: mem.Allocator, limits: Lua_Limits, source
 	l.setglobal(run.L, "json")
 
 	run.thread = l.newthread(run.L)
+	if run.thread == nil {
+		code_mode_lua_host_leave(run)
+		run.failure = .Memory
+		run.terminal = true
+		run.last_event = .Failed
+		run.message = strings.clone("the Code Mode coroutine could not be created", backend) or_else ""
+		return run, false
+	}
 	// The thread stays on the main stack as a collector anchor: an unreferenced
 	// suspended coroutine could otherwise be collected.
 	code_mode_lua_bind(run, run.thread)
