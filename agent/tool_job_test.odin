@@ -12,6 +12,7 @@ import "core:testing"
 import "core:time"
 
 import "nabla:agent/session"
+import "nabla:db"
 
 // The tool job suite. It holds the properties the batch's phases exist for: a call
 // runs off the owner's thread, a lane serializes what must not overlap, the worker
@@ -239,6 +240,67 @@ test_code_mode_suspends_for_a_nested_tool_job :: proc(t: ^testing.T) {
 	testing.expect_value(t, value, "success+success")
 	testing.expect_value(t, jobs.committed, 3)
 	testing.expect_value(t, tool_jobs_committed(&jobs), 1)
+}
+
+// A nested child that cannot be recorded is released with the allocator that owns
+// worker job storage, not the session allocator that owns the table.
+@(test)
+test_nested_tool_storage_failure_frees_with_worker_allocator :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+
+	if exec_err := db.exec(&test.fixture.store.conn, "PRAGMA query_only = ON"); exec_err != nil {
+		testing.fail_now(t, "the store could not be made read-only")
+	}
+
+	worker_track: mem.Tracking_Allocator
+	session_track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&worker_track, context.allocator)
+	mem.tracking_allocator_init(&session_track, context.allocator)
+	session_track.bad_free_callback = mem.tracking_allocator_bad_free_callback_add_to_array
+	defer mem.tracking_allocator_destroy(&worker_track)
+	defer mem.tracking_allocator_destroy(&session_track)
+
+	jobs: Tool_Jobs
+	tool_jobs_init(&jobs, chat, 0, mem.tracking_allocator(&worker_track))
+	jobs.allocator = mem.tracking_allocator(&session_track)
+	defer tool_jobs_destroy(&jobs)
+
+	run, compiled := code_mode_lua_start(context.allocator, lua_limits_default(), `return tools.test({})`)
+	if run == nil { testing.fail_now(t, "the Lua run could not be created") }
+	defer code_mode_lua_destroy(run)
+	if !compiled { testing.fail_now(t, "the Lua test chunk did not compile") }
+	if !code_mode_lua_install_tool(run, "test") { testing.fail_now(t, "the Lua tool could not be installed") }
+	if !testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Host_Request) { return }
+
+	call := Chat_Tool_Call {
+		seq = 1,
+	}
+	parent := Tool_Job {
+		table     = &jobs,
+		placement = .Lua,
+		allocator = context.allocator,
+		call_id   = chat_clone_string("parent", context.allocator),
+		lua       = run,
+		call      = &call,
+		turn_id   = chat.active_turn_id,
+	}
+	parent.exec = Tool_Context {
+		call_id   = parent.call_id,
+		allocator = parent.allocator,
+	}
+	defer delete(parent.call_id, parent.allocator)
+	defer if parent.result_present { tool_result_destroy(&parent.result) }
+
+	tool_job_lua_submit_child(&jobs, chat, &parent)
+
+	testing.expect_value(t, parent.phase, Tool_Job_Phase.Result_Ready)
+	testing.expect_value(t, len(jobs.jobs), 0)
+	testing.expect(t, chat_session_storage_failed(chat), "the refused child record latches storage failure")
+	testing.expect_value(t, len(worker_track.allocation_map), 0)
+	testing.expect_value(t, len(session_track.bad_free_array), 0)
 }
 
 // A stopped execution says which limit stopped it, so the failure is branchable rather

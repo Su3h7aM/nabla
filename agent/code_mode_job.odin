@@ -225,7 +225,7 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 	}
 	call_seq, append_error := session.entry_append(chat.store, chat.id, entry)
 	if append_error != nil {
-		mem.free(child, jobs.allocator)
+		mem.free(child, jobs.worker_allocator)
 		chat_session_record_failure(chat, "the nested tool call could not be recorded", append_error)
 		parent.result = code_mode_job_failure(parent, .Tool_Failed, .Unavailable, "the nested tool call could not be recorded", "storage failed")
 		parent.result_present = true
