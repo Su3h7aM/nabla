@@ -33,17 +33,40 @@ MCP_Runtime :: struct {
 
 // mcp_runtime_make reserves one stable client slot per configured server. Tool
 // bindings are allocated after discovery because the server decides their count.
-mcp_runtime_make :: proc(servers: []agent.MCP_Server_Config, alloc := context.allocator) -> MCP_Runtime {
+mcp_runtime_make :: proc(servers: []agent.MCP_Server_Config, alloc := context.allocator) -> (MCP_Runtime, bool) {
 	runtime := MCP_Runtime {
 		alloc = alloc,
 	}
-	resize(&runtime.clients, len(servers))
-	runtime.server_started = make([]bool, len(servers), alloc)
-	runtime.server_discovered = make([]bool, len(servers), alloc)
-	runtime.server_launch = make([]u64, len(servers), alloc)
-	runtime.server_ids = make([]string, len(servers), alloc)
-	for server, index in servers { runtime.server_ids[index] = strings.clone(server.id, alloc) }
-	return runtime
+	if resize(&runtime.clients, len(servers)) != nil { return {}, false }
+	alloc_error: mem.Allocator_Error
+	runtime.server_started, alloc_error = make([]bool, len(servers), alloc)
+	if alloc_error != nil {
+		mcp_runtime_destroy(&runtime)
+		return {}, false
+	}
+	runtime.server_discovered, alloc_error = make([]bool, len(servers), alloc)
+	if alloc_error != nil {
+		mcp_runtime_destroy(&runtime)
+		return {}, false
+	}
+	runtime.server_launch, alloc_error = make([]u64, len(servers), alloc)
+	if alloc_error != nil {
+		mcp_runtime_destroy(&runtime)
+		return {}, false
+	}
+	runtime.server_ids, alloc_error = make([]string, len(servers), alloc)
+	if alloc_error != nil {
+		mcp_runtime_destroy(&runtime)
+		return {}, false
+	}
+	for server, index in servers {
+		runtime.server_ids[index], alloc_error = strings.clone(server.id, alloc)
+		if alloc_error != nil {
+			mcp_runtime_destroy(&runtime)
+			return {}, false
+		}
+	}
+	return runtime, true
 }
 
 // mcp_runtime_destroy stops every server and releases the runtime. It must run only
@@ -54,8 +77,12 @@ mcp_runtime_destroy :: proc(runtime: ^MCP_Runtime) {
 	if runtime == nil || runtime.alloc.procedure == nil { return }
 	allocator := runtime.alloc
 	for &client, index in runtime.clients {
-		if runtime.server_started[index] && mcp.client_running(&client) {
-			log_mcp_stopped(runtime.server_ids[index], runtime.server_launch[index], "released")
+		if index < len(runtime.server_started) && runtime.server_started[index] && mcp.client_running(&client) {
+			server_id := ""
+			if index < len(runtime.server_ids) { server_id = runtime.server_ids[index] }
+			launch: u64
+			if index < len(runtime.server_launch) { launch = runtime.server_launch[index] }
+			log_mcp_stopped(server_id, launch, "released")
 		}
 		mcp.client_destroy(&client)
 	}

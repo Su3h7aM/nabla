@@ -212,7 +212,12 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []age
 
 	setup.mcp_servers = mcp_servers
 	// The runtime's slots are fixed before any definition can borrow a binding.
-	setup.mcp = mcp_runtime_make(mcp_servers, setup.alloc)
+	mcp_ok: bool
+	setup.mcp, mcp_ok = mcp_runtime_make(mcp_servers, setup.alloc)
+	if !mcp_ok {
+		fmt.eprintln("nabla: the MCP runtime could not be allocated")
+		return false
+	}
 
 	catalog, configured, resolved := resolve_run_catalog(sources, setup.alloc)
 	if !resolved { return false }

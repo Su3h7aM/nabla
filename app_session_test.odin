@@ -1132,7 +1132,9 @@ test_refresh_degrades_to_native_tools_when_a_server_is_unusable :: proc(t: ^test
 		enabled     = true,
 	}
 	app.setup.mcp_servers = servers
-	app.setup.mcp = mcp_runtime_make(servers, context.allocator)
+	mcp_ok: bool
+	app.setup.mcp, mcp_ok = mcp_runtime_make(servers, context.allocator)
+	if !mcp_ok { testing.fail_now(t, "the MCP runtime could not be created") }
 	_, log_error := agent.log_open(&app.setup.log, {directory = directory, enabled = true, lowest = .Debug})
 	if log_error != nil {
 		testing.fail_now(t, "could not open diagnostics")
