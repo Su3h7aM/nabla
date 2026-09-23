@@ -437,7 +437,8 @@ append_folded_value :: proc(headers: ^http.Headers, key, line: string, allocator
 	_, value_ptr, just_inserted := http.headers_entry_unsafe(headers, key)
 	if just_inserted { return false }
 
-	continued := strings.concatenate({value_ptr^, " ", value}, allocator)
+	continued, concat_err := strings.concatenate({value_ptr^, " ", value}, allocator)
+	if concat_err != nil { return false }
 	delete(value_ptr^, allocator)
 	value_ptr^ = continued
 	return true
