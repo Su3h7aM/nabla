@@ -39,7 +39,6 @@ Server_Opts :: struct {
 	limit_headers:        int,
 	// The thread count to use, defaults to your core count - 1.
 	thread_count:         int,
-
 }
 
 Default_Server_Opts := Server_Opts {
@@ -87,7 +86,6 @@ Server_Thread :: struct {
 	conns:      map[net.TCP_Socket]^Connection,
 	state:      Server_State,
 	accept:     ^nbio.Operation,
-
 }
 
 @(private, disabled = ODIN_DISABLE_ASSERT)
@@ -378,26 +376,18 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
 	// to process the closing and receive any remaining data.
 	net.shutdown(c.socket, net.Shutdown_Manner.Send)
 
-	nbio.timeout_poly(
-		Conn_Close_Delay,
-		c,
-		proc(_: ^nbio.Operation, c: ^Connection) {
-			nbio.close_poly(
-				c.socket,
-				c,
-				proc(_: ^nbio.Operation, c: ^Connection) {
-					log.debugf("closed connection: %i", c.socket)
+	nbio.timeout_poly(Conn_Close_Delay, c, proc(_: ^nbio.Operation, c: ^Connection) {
+		nbio.close_poly(c.socket, c, proc(_: ^nbio.Operation, c: ^Connection) {
+			log.debugf("closed connection: %i", c.socket)
 
-					c.state = .Closed
-					virtual.arena_destroy(&c.temp_allocator)
+			c.state = .Closed
+			virtual.arena_destroy(&c.temp_allocator)
 
-					scanner_destroy(&c.scanner)
-					delete_key(&td.conns, c.socket)
-					free(c, c.server.conn_allocator)
-				},
-			)
-		},
-	)
+			scanner_destroy(&c.scanner)
+			delete_key(&td.conns, c.socket)
+			free(c, c.server.conn_allocator)
+		})
+	})
 }
 
 @(private)
