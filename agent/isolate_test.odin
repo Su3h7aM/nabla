@@ -9,8 +9,10 @@ import linux "core:sys/linux"
 import "core:testing"
 
 // ISOLATED_CHILD_VARIABLE marks a child test-binary run that owns its process.
-// A test isolated below sets nothing in its parent: the parent only spawns and
-// checks.
+// This copy is test-only package code because agent tests also need a clear signal
+// mask after exec. The root helper cannot provide that without making the root test
+// package depend on agent internals. A test isolated below sets nothing in its
+// parent: the parent only spawns and checks.
 ISOLATED_CHILD_VARIABLE :: "NABLA_ISOLATED_CHILD"
 
 // test_isolate_guard serializes isolated children. The children are the

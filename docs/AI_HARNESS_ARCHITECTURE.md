@@ -102,6 +102,19 @@ adopting the machinery that another runtime uses to enforce it.
    allocation failure, and unobserved outcome are distinct where behavior differs.
 10. Linux is the target. No speculative platform layer or new runtime dependency.
 
+## Platform and syscall policy
+
+Linux is the build target, not a promise of portable syscall wrappers. Keep raw
+process, signal, descriptor, and file-lock operations in a `_linux.odin` file or
+behind the smallest seam that owns their result and lifetime. The `input` and
+root presentation packages are Linux-only for the same reason as `term`; do not
+add a fake non-Linux implementation without a real target and its contract.
+
+Use `core:sys/posix` for standard Unix-shaped APIs when libc linkage is already
+accepted. Use `core:sys/linux` for raw process and signal control where libc must
+not be touched or no suitable wrapper exists. Keep this choice at the call site
+when the distinction is local, and document it when a package seam is introduced.
+
 ## Package boundaries
 
 | Layer | Owns | Excludes |

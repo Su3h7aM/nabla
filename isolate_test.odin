@@ -8,8 +8,10 @@ import "core:sync"
 import "core:testing"
 
 // ISOLATED_CHILD_VARIABLE marks a child test-binary run that owns its process.
-// See agent's isolate_test.odin for the mechanism: the parent spawns the child
-// filtered to one test and checks it ran exactly once and passed.
+// This helper stays in the root test package because the root and agent test
+// binaries are separate packages. The agent copy additionally clears an inherited
+// signal mask, a requirement that does not belong in the root helper. The parent
+// spawns the child filtered to one test and checks it ran exactly once and passed.
 ISOLATED_CHILD_VARIABLE :: "NABLA_ISOLATED_CHILD"
 
 // test_isolate_guard serializes isolated children. The children are the
