@@ -404,8 +404,8 @@ acp_run :: proc(
 	input: io.Reader,
 	output: io.Writer,
 ) -> bool {
-	server := new(Acp_Server)
-	if server == nil { return false }
+	server, server_error := new(Acp_Server)
+	if server_error != nil { return false }
 	defer free(server)
 	server.alloc = context.allocator
 	server.app.run.alloc = server.alloc

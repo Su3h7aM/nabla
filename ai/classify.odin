@@ -130,7 +130,7 @@ provider_transport_cause :: proc(err: client.Error) -> Provider_Transport_Cause 
 		return .None
 	case .Connect, .Resolve:
 		return .Connection
-	case .Closed, .Truncated, .Send, .Recv, .Bad_Response:
+	case .Closed, .Truncated, .Send, .Recv, .Bad_Response, .No_Room:
 		return .IO
 	case .Invalid_URL, .Invalid_Request, .TLS_Config:
 		return .Configuration

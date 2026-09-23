@@ -342,7 +342,8 @@ tui_run :: proc(
 ) -> (
 	ok: bool,
 ) {
-	app := new(App)
+	app, app_error := new(App)
+	if app_error != nil { return false }
 	defer free(app)
 	app.run.alloc = context.allocator
 	// This run is the user's own, so its model choice is published to the frame and

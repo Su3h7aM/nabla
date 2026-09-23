@@ -208,7 +208,8 @@ run_prompt :: proc(
 	options: chat_cli_options,
 	answer: io.Writer,
 ) -> int {
-	app := new(App)
+	app, app_error := new(App)
+	if app_error != nil { return 1 }
 	defer free(app)
 	app.run.alloc = context.allocator
 

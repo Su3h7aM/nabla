@@ -192,14 +192,19 @@ Frame_Storage :: struct {
 }
 
 frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
-	storage := new(Frame_Storage, alloc)
+	storage, storage_error := new(Frame_Storage, alloc)
+	if storage_error != nil { return nil }
 	storage.alloc = alloc
 	// Measurement and drawing share one width policy, so a tab or an
 	// emoji-presentation sequence measures the columns drawing produces.
 	// The zero profile would drop tabs while drawing expands them, and the
 	// box math below would place the border from the wrong width.
 	storage.measure.profile = text.DEFAULT_WIDTH_PROFILE
-	storage.layout_storage = make([]byte, layout.storage_size(CONVERSATION_CAPACITIES), alloc)
+	storage.layout_storage, storage_error = make([]byte, layout.storage_size(CONVERSATION_CAPACITIES), alloc)
+	if storage_error != nil {
+		free(storage, alloc)
+		return nil
+	}
 	config := layout.Options {
 		capacities = CONVERSATION_CAPACITIES,
 		cull       = .Visible,
@@ -230,8 +235,10 @@ ensure_frame :: proc(storage: ^Frame_Storage, cols, rows: int) -> bool {
 		return false
 	}
 	if len(storage.cells) < need {
+		cells, alloc_error := make([]term.Cell, need, storage.alloc)
+		if alloc_error != nil { return false }
 		if storage.cells != nil { delete(storage.cells, storage.alloc) }
-		storage.cells = make([]term.Cell, need, storage.alloc)
+		storage.cells = cells
 	}
 	return true
 }
@@ -256,8 +263,13 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	if present_err == term.General_Error.Presentation_Workspace_Too_Small {
 		// The encoder reports the exact required count before writing anything,
 		// so the scratch can be grown once and the frame retried.
+		output, alloc_error := make([]byte, required, storage.alloc)
+		if alloc_error != nil {
+			fmt.eprintln("nabla: present: the frame scratch could not be allocated")
+			return
+		}
 		delete(storage.output, storage.alloc)
-		storage.output = make([]byte, required, storage.alloc)
+		storage.output = output
 		_, _, present_err = term.present(app.terminal, storage.buffer, term.profile_default(), cursor, storage.output)
 	}
 	if present_err != nil {
