@@ -28,7 +28,8 @@ _render :: proc(t: ^testing.T, request: Request) -> string {
 	owned := request
 	owned.allocator = tracked
 
-	buffer, _ := format_request(http.url_parse(owned.url), owned)
+	buffer, _, formatted := format_request(http.url_parse(owned.url), owned)
+	if !formatted { testing.fail_now(t, "the request could not be formatted") }
 	text := strings.clone(bytes.buffer_to_string(&buffer), context.temp_allocator)
 	bytes.buffer_destroy(&buffer)
 
@@ -185,8 +186,9 @@ test_the_body_offset_names_where_the_body_begins :: proc(t: ^testing.T) {
 			body      = transmute([]u8)body,
 			allocator = context.allocator,
 		}
-		rendered, body_offset := format_request(http.url_parse(request.url), request)
+		rendered, body_offset, formatted := format_request(http.url_parse(request.url), request)
 		defer bytes.buffer_destroy(&rendered)
+		if !formatted { testing.fail_now(t, "the request could not be formatted") }
 
 		text := bytes.buffer_to_string(&rendered)
 		testing.expectf(t, body_offset >= 0 && body_offset <= len(text), "the offset should be inside the request")

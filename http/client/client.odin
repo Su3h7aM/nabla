@@ -233,8 +233,12 @@ request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase,
 	}
 
 	phase^ = .Request_Write
-	buffer, body_offset := format_request(url, request)
+	buffer, body_offset, formatted := format_request(url, request)
 	defer bytes.buffer_destroy(&buffer)
+	if !formatted {
+		connection_destroy(dialed)
+		return nil, failure_from_error(.Send, request.allocator, .Transport, "the request could not be built")
+	}
 	request_bytes := bytes.buffer_to_bytes(&buffer)
 	summary.request_write_started = true
 	accepted, write_err := connection_write_all(dialed, request_bytes)
@@ -315,7 +319,7 @@ field_name_is_token :: proc(name: string) -> bool {
 // format_request builds the request line, the fields, and the body. body_offset is
 // where the body begins, which is what lets a partial write say how much of the
 // body the transport took rather than how much of the whole request it took.
-format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer, body_offset: int) {
+format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer, body_offset: int, formatted: bool) {
 	// The request target is the origin-form of the URL -- path and query both.
 	// A fragment is never sent: RFC 9112 3.2 excludes it from the target.
 	request_target := http.request_path(url, request.allocator)
@@ -328,35 +332,55 @@ format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer
 	// A URL has no length limit, and a line that outgrows such a buffer makes fmt
 	// allocate from the ambient context allocator, which this call does not own
 	// and never releases.
-	bytes.buffer_write_string(&buffer, http.method_string(request.method))
-	bytes.buffer_write_string(&buffer, " ")
-	bytes.buffer_write_string(&buffer, request_target)
-	bytes.buffer_write_string(&buffer, " HTTP/1.1\r\n")
+	if !request_buffer_string(&buffer, http.method_string(request.method)) ||
+		!request_buffer_string(&buffer, " ") ||
+		!request_buffer_string(&buffer, request_target) ||
+		!request_buffer_string(&buffer, " HTTP/1.1\r\n") {
+		return buffer, 0, false
+	}
 	// A field this builder supplies is written once: a caller that set the same
 	// field itself meant its own value, which is how a request states a connection
 	// it keeps or a body length it already knows.
 	if !request_has_header(request, "host") {
-		bytes.buffer_write_string(&buffer, "host: ")
-		bytes.buffer_write_string(&buffer, url.host)
-		bytes.buffer_write_string(&buffer, "\r\n")
+		if !request_buffer_string(&buffer, "host: ") ||
+			!request_buffer_string(&buffer, url.host) ||
+			!request_buffer_string(&buffer, "\r\n") {
+			return buffer, 0, false
+		}
 	}
-	if !request_has_header(request, "connection") {
-		bytes.buffer_write_string(&buffer, "connection: close\r\n")
+	if !request_has_header(request, "connection") && !request_buffer_string(&buffer, "connection: close\r\n") {
+		return buffer, 0, false
 	}
 	if !request_has_header(request, "content-length") && request_states_length(request) {
 		length_line: [48]u8
-		bytes.buffer_write_string(&buffer, fmt.bprintf(length_line[:], "content-length: %d\r\n", len(request.body)))
+		if !request_buffer_string(&buffer, fmt.bprintf(length_line[:], "content-length: %d\r\n", len(request.body))) {
+			return buffer, 0, false
+		}
 	}
 	for header in request.headers {
-		bytes.buffer_write_string(&buffer, header.name)
-		bytes.buffer_write_string(&buffer, ": ")
-		bytes.buffer_write_string(&buffer, header.value)
-		bytes.buffer_write_string(&buffer, "\r\n")
+		if !request_buffer_string(&buffer, header.name) ||
+			!request_buffer_string(&buffer, ": ") ||
+			!request_buffer_string(&buffer, header.value) ||
+			!request_buffer_string(&buffer, "\r\n") {
+			return buffer, 0, false
+		}
 	}
-	bytes.buffer_write_string(&buffer, "\r\n")
-	body_offset = len(bytes.buffer_to_bytes(&buffer))
-	bytes.buffer_write(&buffer, request.body)
-	return
+	if !request_buffer_string(&buffer, "\r\n") { return buffer, 0, false }
+	body_offset = bytes.buffer_length(&buffer)
+	if !request_buffer_bytes(&buffer, request.body) { return buffer, 0, false }
+	return buffer, body_offset, true
+}
+
+@(private)
+request_buffer_string :: proc(buffer: ^bytes.Buffer, value: string) -> bool {
+	written, err := bytes.buffer_write_string(buffer, value)
+	return err == nil && written == len(value)
+}
+
+@(private)
+request_buffer_bytes :: proc(buffer: ^bytes.Buffer, value: []u8) -> bool {
+	written, err := bytes.buffer_write(buffer, value)
+	return err == nil && written == len(value)
 }
 
 // request_states_length reports whether a request says how long its content is.
