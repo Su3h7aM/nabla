@@ -214,7 +214,10 @@ wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 	// The terminal reports mouse cells one-based; the frame is solved from zero.
 	if ordinal := tool_box_entry_at(app, mouse.x - 1, mouse.y - 1); ordinal >= 0 {
 		sync.mutex_lock(&app.run.mu)
-		consumed := tool_box_scroll(&app.run.snap.entries[ordinal], mouse.button)
+		consumed := false
+		if ordinal < len(app.run.snap.entries) {
+			consumed = tool_box_scroll(&app.run.snap.entries[ordinal], mouse.button)
+		}
 		sync.mutex_unlock(&app.run.mu)
 		if consumed { return }
 	}

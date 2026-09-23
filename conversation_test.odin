@@ -575,6 +575,42 @@ test_wheel_scrolls_the_tool_box_under_the_pointer :: proc(t: ^testing.T) {
 	testing.expect_value(t, app.scroll, MOUSE_WHEEL_LINES)
 }
 
+// A rendered frame can outlive the entry ordinal it was solved from. A worker
+// may clear the snapshot before the next wheel report is handled.
+@(test)
+test_wheel_ignores_a_stale_tool_box_ordinal :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	app.columns = 40
+	app.rows = 20
+	scratch: [8192]byte
+	body := tool_result_fixture(25, scratch[:])
+	snap_append(app, .Tool, fmt.tprintf("builtin_shell\n%s", body))
+	app.run.snap.entries[0].tool_outcome = .Success
+
+	app.storage = frame_storage_new(context.allocator)
+	defer frame_storage_destroy(app.storage)
+	_, frame_error := render_frame(app, app.storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	box_row := conversation_row_with(app.storage, "builtin_shell")
+	if !testing.expect(t, box_row >= 0, "the tool box must be drawn") { return }
+	box_column := frame_glyph_column(app.storage, box_row, "╭")
+	report := input.Mouse_Event {
+		button = .Wheel_Up,
+		x      = box_column + 2,
+		y      = box_row + 2,
+	}
+
+	snapshot_clear(app)
+	app.scroll = 0
+	wheel_scroll(app, report)
+	testing.expect_value(t, app.scroll, MOUSE_WHEEL_LINES)
+}
+
 // A tool box owns the wheel only while it can move the way the wheel asks. At its
 // first or last row the report belongs to the transcript behind it, so scrolling
 // over a box never traps the pointer inside the box.
