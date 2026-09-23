@@ -311,7 +311,11 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 		buf:        strings.Builder,
 	}
 
-	s := new(Chunked_State, context.temp_allocator)
+	s, s_error := new(Chunked_State, context.temp_allocator)
+	if s_error != nil {
+		cb(user_data, "", .Unknown)
+		return
+	}
 
 	s.buf.buf.allocator = context.temp_allocator
 

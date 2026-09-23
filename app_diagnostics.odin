@@ -226,7 +226,8 @@ diagnostics_print_request :: proc(row: ^session.Request, stderr: io.Writer) {
 // zero would invent a measurement the provider never made.
 @(private)
 diagnostics_usage_text :: proc(usage: session.Usage) -> string {
-	builder := strings.builder_make(context.temp_allocator)
+	builder, builder_error := strings.builder_make(context.temp_allocator)
+	if builder_error != nil { return "usage unavailable" }
 	names := [4]string{"input", "output", "cache read", "cache write"}
 	values := [4]Maybe(i64){usage.input, usage.output, usage.cache_read, usage.cache_write}
 	for value, index in values {

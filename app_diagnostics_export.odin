@@ -121,9 +121,17 @@ diagnostics_export :: proc(
 		return 1
 	}
 
-	files := make([dynamic]Export_File, 0, 8, context.allocator)
+	files, files_error := make([dynamic]Export_File, 0, 8, context.allocator)
+	if files_error != nil {
+		fmt.wprintln(stderr, "nabla: the export file table could not be allocated")
+		return 1
+	}
 	defer export_files_destroy(&files)
-	omissions := make([dynamic]string, 0, 8, context.allocator)
+	omissions, omissions_error := make([dynamic]string, 0, 8, context.allocator)
+	if omissions_error != nil {
+		fmt.wprintln(stderr, "nabla: the export omission table could not be allocated")
+		return 1
+	}
 	defer {
 		for omission in omissions { delete(omission, context.allocator) }
 		delete(omissions)

@@ -37,6 +37,7 @@ mcp_runtime_make :: proc(servers: []agent.MCP_Server_Config, alloc := context.al
 	runtime := MCP_Runtime {
 		alloc = alloc,
 	}
+	runtime.clients.allocator = alloc
 	if resize(&runtime.clients, len(servers)) != nil { return {}, false }
 	alloc_error: mem.Allocator_Error
 	runtime.server_started, alloc_error = make([]bool, len(servers), alloc)
@@ -280,7 +281,8 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	}
 	defer if !installed { agent.tool_registry_destroy(&registry) }
 
-	warnings := strings.builder_make(context.temp_allocator)
+	warnings, warnings_error := strings.builder_make(context.temp_allocator)
+	if warnings_error != nil { return "the MCP warning buffer could not be allocated" }
 	bindings, bindings_error := make([dynamic]^agent.MCP_Tool_Backend, 0, setup.alloc)
 	if bindings_error != nil { return "the MCP binding table could not be allocated" }
 	bindings_installed := false
