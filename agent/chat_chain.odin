@@ -397,7 +397,12 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 	// The attempt runs on its own thread so the owner can keep observing while the send
 	// blocks, and its facts reach the owner through the mailbox. The worker borrows the
 	// frozen bytes; the join in chat_chain_await is what makes their reuse safe.
-	worker := new(Chat_Request_Worker, chat.allocator)
+	worker, worker_error := new(Chat_Request_Worker, chat.allocator)
+	if worker_error != nil {
+		chat_session_fail_turn(chat, "the request worker could not be allocated")
+		chat_chain_stop(chat, .Harness_Failure)
+		return
+	}
 	worker^ = Chat_Request_Worker {
 		allocator         = chat.mailbox.allocator,
 		mailbox           = &chat.mailbox,
