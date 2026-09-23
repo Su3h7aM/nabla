@@ -63,7 +63,7 @@ test_isolate_process :: proc(t: ^testing.T, procedure: string) -> bool {
 	sync.mutex_unlock(&test_isolate_guard)
 	if !spawned {
 		test_isolate_release(executable, child_out, child_err)
-		testing.fail_now(t, "the isolated child could not start")
+		testing.fail_now(t, fmt.tprintf("the isolated child could not start: %v", exec_err))
 	}
 
 	// The filter names one test: anything else means the child did not run

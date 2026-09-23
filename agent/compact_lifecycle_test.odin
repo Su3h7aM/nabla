@@ -173,7 +173,7 @@ compact_await_state :: proc(t: ^testing.T, chat: ^Chat_Session, wanted: Compact_
 		if chat.compact.state == .Idle && wanted != .Idle { break }
 		time.sleep(2 * time.Millisecond)
 	}
-	testing.fail_now(t, "the compaction never reached the expected state")
+	testing.fail_now(t, fmt.tprintf("the compaction never reached %v, it is %v", wanted, chat.compact.state))
 }
 
 // compact_fixture_begin opens a session with a large prefix, so a summary of it
