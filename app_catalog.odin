@@ -141,7 +141,10 @@ catalog_sources_merge :: proc(current, incoming: ^[dynamic]agent.Catalog_Provide
 			break
 		}
 		if !replaced {
-			append(current, source)
+			if append(current, source) != 1 {
+				agent.catalog_provider_source_destroy(&source, allocator)
+				continue
+			}
 			source = {}
 		}
 	}
