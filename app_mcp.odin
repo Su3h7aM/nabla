@@ -196,14 +196,20 @@ mcp_operation :: proc(timeout: time.Duration, wire: ^agent.MCP_Log) -> mcp.Opera
 }
 
 @(private)
-mcp_binding_make :: proc(client: ^mcp.Client, server_id, remote_name: string, allocator: mem.Allocator) -> ^agent.MCP_Tool_Backend {
-	binding := new(agent.MCP_Tool_Backend, allocator)
+mcp_binding_make :: proc(client: ^mcp.Client, server_id, remote_name: string, allocator: mem.Allocator) -> (^agent.MCP_Tool_Backend, bool) {
+	binding, alloc_error := new(agent.MCP_Tool_Backend, allocator)
+	if alloc_error != nil { return nil, false }
+	remote, clone_error := strings.clone(remote_name, allocator)
+	if clone_error != nil {
+		free(binding, allocator)
+		return nil, false
+	}
 	binding^ = agent.MCP_Tool_Backend {
 		client      = client,
 		server_id   = server_id,
-		remote_name = strings.clone(remote_name, allocator),
+		remote_name = remote,
 	}
-	return binding
+	return binding, true
 }
 
 @(private)
@@ -275,7 +281,8 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	defer if !installed { agent.tool_registry_destroy(&registry) }
 
 	warnings := strings.builder_make(context.temp_allocator)
-	bindings := make([dynamic]^agent.MCP_Tool_Backend, 0, setup.alloc)
+	bindings, bindings_error := make([dynamic]^agent.MCP_Tool_Backend, 0, setup.alloc)
+	if bindings_error != nil { return "the MCP binding table could not be allocated" }
 	bindings_installed := false
 	defer if !bindings_installed { mcp_bindings_destroy(&bindings, setup.alloc) }
 	for server, index in setup.mcp_servers {
@@ -307,11 +314,24 @@ app_tools_refresh :: proc(app: ^App) -> string {
 				fmt.sbprintf(&warnings, "\n%s: %s cannot become a tool name; shorten it with a tools entry", server.id, tool.name)
 				continue
 			}
-			binding := mcp_binding_make(client, server.id, tool.name, setup.alloc)
+			binding, binding_ok := mcp_binding_make(client, server.id, tool.name, setup.alloc)
+			if !binding_ok {
+				rejected += 1
+				fmt.sbprintf(&warnings, "\n%s: %s: the binding could not be allocated", server.id, tool.name)
+				continue
+			}
+			if append(&bindings, binding) != 1 {
+				rejected += 1
+				fmt.sbprintf(&warnings, "\n%s: %s: the binding table could not grow", server.id, tool.name)
+				mcp_binding_destroy(binding, setup.alloc)
+				continue
+			}
 			definition := agent.mcp_tool_definition(name, tool, binding, agent.mcp_timeout_policy(server))
 			if add_err := agent.tool_registry_add(&registry, definition); add_err.kind != .None {
 				rejected += 1
 				fmt.sbprintf(&warnings, "\n%s: %s: %s", server.id, tool.name, add_err.detail)
+				bindings[len(bindings) - 1] = nil
+				resize(&bindings, len(bindings) - 1)
 				mcp_binding_destroy(binding, setup.alloc)
 				continue
 			}
@@ -323,7 +343,6 @@ app_tools_refresh :: proc(app: ^App) -> string {
 				{key = "tool", value = name},
 			}
 			agent.log_emit({level = .Debug, category = .Tool, event = "tool.binding", fields = fields[:]})
-			append(&bindings, binding)
 		}
 		for config in server.tools {
 			found := false

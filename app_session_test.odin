@@ -1101,7 +1101,8 @@ ANTHROPIC_COMPLETION_RESPONSE ::
 @(test)
 test_mcp_binding_owns_remote_name :: proc(t: ^testing.T) {
 	remote_name := strings.clone("find_files", context.allocator)
-	binding := mcp_binding_make(nil, "fff", remote_name, context.allocator)
+	binding, binding_ok := mcp_binding_make(nil, "fff", remote_name, context.allocator)
+	if !binding_ok { testing.fail_now(t, "the MCP binding could not be created") }
 	defer mcp_binding_destroy(binding, context.allocator)
 
 	testing.expect(t, raw_data(binding.remote_name) != raw_data(remote_name), "the binding must not borrow the discovery string")
