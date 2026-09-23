@@ -333,18 +333,16 @@ format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer
 	// allocate from the ambient context allocator, which this call does not own
 	// and never releases.
 	if !request_buffer_string(&buffer, http.method_string(request.method)) ||
-		!request_buffer_string(&buffer, " ") ||
-		!request_buffer_string(&buffer, request_target) ||
-		!request_buffer_string(&buffer, " HTTP/1.1\r\n") {
+	   !request_buffer_string(&buffer, " ") ||
+	   !request_buffer_string(&buffer, request_target) ||
+	   !request_buffer_string(&buffer, " HTTP/1.1\r\n") {
 		return buffer, 0, false
 	}
 	// A field this builder supplies is written once: a caller that set the same
 	// field itself meant its own value, which is how a request states a connection
 	// it keeps or a body length it already knows.
 	if !request_has_header(request, "host") {
-		if !request_buffer_string(&buffer, "host: ") ||
-			!request_buffer_string(&buffer, url.host) ||
-			!request_buffer_string(&buffer, "\r\n") {
+		if !request_buffer_string(&buffer, "host: ") || !request_buffer_string(&buffer, url.host) || !request_buffer_string(&buffer, "\r\n") {
 			return buffer, 0, false
 		}
 	}
@@ -359,9 +357,9 @@ format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer
 	}
 	for header in request.headers {
 		if !request_buffer_string(&buffer, header.name) ||
-			!request_buffer_string(&buffer, ": ") ||
-			!request_buffer_string(&buffer, header.value) ||
-			!request_buffer_string(&buffer, "\r\n") {
+		   !request_buffer_string(&buffer, ": ") ||
+		   !request_buffer_string(&buffer, header.value) ||
+		   !request_buffer_string(&buffer, "\r\n") {
 			return buffer, 0, false
 		}
 	}
@@ -820,7 +818,7 @@ failure_from_error :: proc(err: Error, allocator: mem.Allocator, override: Failu
 			kind = .Invalid_URL
 		case .Invalid_Request:
 			kind = .Invalid_Request
-		case .None, .Connect, .Resolve, .Send, .Recv, .Bad_Response:
+		case .None, .Connect, .Resolve, .Send, .Recv, .Bad_Response, .No_Room:
 			kind = .Transport
 		}
 	}
@@ -869,6 +867,8 @@ error_text :: proc(err: Error) -> string {
 		return "response could not be read"
 	case .Bad_Response:
 		return "HTTP response was malformed"
+	case .No_Room:
+		return "the client could not allocate a connection"
 	}
 	return "request failed"
 }

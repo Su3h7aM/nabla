@@ -139,6 +139,8 @@ Error :: enum {
 	Send,
 	Recv,
 	Bad_Response,
+	// No_Room is a local allocation failure before a request can be sent.
+	No_Room,
 }
 
 // Transport_Stop records why a connection stopped making progress.

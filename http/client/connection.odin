@@ -50,7 +50,8 @@ dial_first :: proc(endpoints: []net.Endpoint, options: Options, allocator: mem.A
 // blocking dial is the whole requirement, and the socket it returns blocks.
 connection_dial :: proc(endpoint: net.Endpoint, options: Options, allocator: mem.Allocator) -> (^Connection, Error) {
 	if endpoint.port == 0 { return nil, .Connect }
-	connection := new(Connection, allocator)
+	connection, alloc_error := new(Connection, allocator)
+	if alloc_error != nil { return nil, .No_Room }
 	connection.allocator = allocator
 	connection.probe = options.probe
 	connection.ca_file = options.ca_file
