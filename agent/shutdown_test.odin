@@ -394,9 +394,10 @@ test_shutdown_during_tool_reaps_child_before_session_cleanup :: proc(t: ^testing
 	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
 
 	// Retirement and reaping must already have happened, so cleanup cannot race a
-	// live child.
+	// live child. What is left is the kernel's own teardown of a descendant reaped by
+	// whoever adopted it, so the check waits for it rather than reading one instant.
 	testing.expect_value(t, chat.operation.state, Chat_Operation_State.Retired)
-	testing.expectf(t, shell_process_gone(descendant), "descendant %d outlived the turn, so reaping did not precede cleanup", descendant)
+	testing.expectf(t, shell_await_process_gone(descendant), "descendant %d outlived the turn, so reaping did not precede cleanup", descendant)
 }
 
 // Shutdown while the model request is in flight, driven through the real turn
