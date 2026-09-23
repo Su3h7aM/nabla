@@ -8,6 +8,13 @@ import "core:strings"
 import "nabla:agent"
 import "nabla:agent/session"
 
+Cli_Parse_Error :: enum {
+	None,
+	Unknown_Option,
+	Missing_Value,
+	Empty_Prompt,
+}
+
 chat_cli_options :: struct {
 	config_path: string,
 	provider_id: string,
@@ -24,7 +31,7 @@ chat_cli_options :: struct {
 	list:        bool,
 }
 
-chat_cli_parse :: proc(args: []string) -> (chat_cli_options, bool) {
+chat_cli_parse :: proc(args: []string) -> (chat_cli_options, Cli_Parse_Error) {
 	result: chat_cli_options
 	for i := 0; i < len(args); i += 1 {
 		arg := args[i]
@@ -48,30 +55,31 @@ chat_cli_parse :: proc(args: []string) -> (chat_cli_options, bool) {
 		if arg == "--prompt" {
 			// A prompt is the whole instruction, so an empty one is a launch
 			// mistake rather than a request for the interactive harness.
-			if i + 1 >= len(args) || args[i + 1] == "" { return result, false }
+			if i + 1 >= len(args) { return result, .Missing_Value }
+			if args[i + 1] == "" { return result, .Empty_Prompt }
 			i += 1
 			result.prompt = args[i]
 			continue
 		}
 		if strings.has_prefix(arg, "--prompt=") {
 			result.prompt = arg[len("--prompt="):]
-			if result.prompt == "" { return result, false }
+			if result.prompt == "" { return result, .Empty_Prompt }
 			continue
 		}
 		if strings.has_prefix(arg, "--config=") { result.config_path = arg[len("--config="):]; continue }
 		if strings.has_prefix(arg, "--provider=") { result.provider_id = arg[len("--provider="):]; continue }
 		if strings.has_prefix(arg, "--model=") { result.model_id = arg[len("--model="):]; continue }
 		if arg == "--config" || arg == "--provider" || arg == "--model" {
-			if i + 1 >= len(args) { return result, false }
+			if i + 1 >= len(args) { return result, .Missing_Value }
 			i += 1
 			if arg == "--config" { result.config_path = args[i] }
 			if arg == "--provider" { result.provider_id = args[i] }
 			if arg == "--model" { result.model_id = args[i] }
 			continue
 		}
-		return result, false
+		return result, .Unknown_Option
 	}
-	return result, true
+	return result, .None
 }
 
 chat_cli_usage :: proc() {
@@ -258,8 +266,17 @@ chat_main :: proc() -> int {
 	// streams, so it is a subcommand rather than a launch option.
 	if len(args) > 0 && args[0] == "acp" { return acp_main(args[1:]) }
 
-	options, parsed := chat_cli_parse(args)
-	if !parsed {
+	options, parse_error := chat_cli_parse(args)
+	if parse_error != .None {
+		switch parse_error {
+		case .Unknown_Option:
+			fmt.eprintln("nabla: unknown option")
+		case .Missing_Value:
+			fmt.eprintln("nabla: option is missing its value")
+		case .Empty_Prompt:
+			fmt.eprintln("nabla: --prompt cannot be empty")
+		case .None:
+		}
 		chat_cli_usage()
 		return 2
 	}
