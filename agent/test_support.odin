@@ -111,7 +111,9 @@ chat_test_begin :: proc(t: ^testing.T, fixture: ^Chat_Test, workspace: string) {
 	// The running session borrows the id the claim owns, so the two cannot drift.
 	claimed, held := session.session_claimed(&fixture.store)
 	if !held { testing.fail_now(t, "the claim went missing") }
-	fixture.chat = chat_session_init(&fixture.store, claimed, workspace, context.allocator)
+	tool_error: Tool_Registry_Error
+	fixture.chat, tool_error = chat_session_init(&fixture.store, claimed, workspace, context.allocator)
+	if tool_error.kind != .None { testing.fail_now(t, "the tool registry could not be created") }
 	fixture.chat.provider_id = chat_clone_string("test-provider", context.allocator)
 	fixture.chat.model_id = chat_clone_string("test-model", context.allocator)
 	fixture.chat.skill_instructions = test_skill_instructions(&fixture.chat)

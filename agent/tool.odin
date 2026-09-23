@@ -141,7 +141,9 @@ tool_registry_make :: proc(allocator := context.allocator) -> (registry: Tool_Re
 	registry = Tool_Registry {
 		allocator = allocator,
 	}
-	registry.definitions = make([dynamic]Tool_Definition, 0, TOOL_NATIVE_COUNT, allocator)
+	definitions, alloc_error := make([dynamic]Tool_Definition, 0, TOOL_NATIVE_COUNT, allocator)
+	if alloc_error != nil { return {}, Tool_Registry_Error{kind = .Allocation} }
+	registry.definitions = definitions
 	// The shell tool's description names the shell this process will run, which is
 	// only known now, so the shell tool is built here rather than declared. The
 	// registry clones the strings it keeps, and this function owns the built
@@ -178,6 +180,8 @@ Tool_Registry_Error_Kind :: enum {
 	Invalid_Timeout,
 	Missing_Execute,
 	Name_Collision,
+	// Allocation means the registry's owned definition table could not be created.
+	Allocation,
 }
 
 // Tool_Registry_Error is why a definition was not registered. tool borrows the

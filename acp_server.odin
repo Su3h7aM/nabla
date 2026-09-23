@@ -253,7 +253,11 @@ acp_session_open :: proc(server: ^Acp_Server, workspace: string, start: Session_
 	app.setup.resumed_provider = strings.clone(adoption.header.provider, app.setup.alloc)
 	delete(app.setup.resumed_model, app.setup.alloc)
 	app.setup.resumed_model = strings.clone(adoption.header.model, app.setup.alloc)
-	app.setup.session = agent.chat_session_init(&app.setup.store, claimed, app.setup.workspace, app.setup.alloc)
+	tool_error: agent.Tool_Registry_Error
+	app.setup.session, tool_error = agent.chat_session_init(&app.setup.store, claimed, app.setup.workspace, app.setup.alloc)
+	if tool_error.kind != .None {
+		return strings.clone("the tool registry could not be allocated", app.setup.alloc), false
+	}
 	app.setup.session.disable_project_instructions = app.setup.harness_options.disable_project_instructions
 	return "", true
 }

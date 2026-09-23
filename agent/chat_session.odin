@@ -207,11 +207,12 @@ Chat_Session :: struct {
 //
 // Diagnostics are not a field here. The session's work inherits the writer from
 // context.logger, which is what lets a call site emit without threading one.
-chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspace: string, allocator := context.allocator) -> Chat_Session {
+chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspace: string, allocator := context.allocator) -> (Chat_Session, Tool_Registry_Error) {
 	// The native definitions are compile-time constants, so a build failure
 	// here is a programming error; the registry tests hold them to validity.
 	// A partial registry is never installed: make destroys it before returning.
-	tools, _ := tool_registry_make(allocator)
+	tools, tool_error := tool_registry_make(allocator)
+	if tool_error.kind != .None { return {}, tool_error }
 	chat := Chat_Session {
 		store             = store,
 		compact_retry     = chat_compact_retry_policy_default(),
@@ -228,7 +229,7 @@ chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspa
 	// A worker publishes through the mailbox, so its payloads come from the process heap
 	// rather than from the allocator the owner may be writing through at the same time.
 	mailbox_init(&chat.mailbox, os.heap_allocator())
-	return chat
+	return chat, {}
 }
 
 chat_tool_call_destroy :: proc(call: ^Chat_Tool_Call, allocator: mem.Allocator) {

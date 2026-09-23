@@ -285,7 +285,12 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 	setup.workspace = strings.clone(adoption.header.workspace, setup.alloc)
 	setup.resumed_provider = strings.clone(adoption.header.provider, setup.alloc)
 	setup.resumed_model = strings.clone(adoption.header.model, setup.alloc)
-	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
+	tool_error: agent.Tool_Registry_Error
+	setup.session, tool_error = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
+	if tool_error.kind != .None {
+		fmt.wprintln(stderr, "nabla: the tool registry could not be allocated")
+		return false
+	}
 	setup.session.disable_project_instructions = setup.harness_options.disable_project_instructions
 	return true
 }
@@ -489,7 +494,12 @@ session_activate :: proc(app: ^App, adoption: ^Adoption) {
 	agent.chat_session_destroy(&setup.session)
 	delete(setup.workspace, setup.alloc)
 	setup.workspace = strings.clone(adoption.header.workspace, setup.alloc)
-	setup.session = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
+	tool_error: agent.Tool_Registry_Error
+	setup.session, tool_error = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
+	if tool_error.kind != .None {
+		snap_append(app, .Error, "the tool registry could not be allocated")
+		return
+	}
 	setup.session.disable_project_instructions = setup.harness_options.disable_project_instructions
 }
 

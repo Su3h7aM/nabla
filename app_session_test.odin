@@ -58,7 +58,9 @@ app_session_begin :: proc(t: ^testing.T, app: ^App) -> string {
 
 	app.setup.workspace = workspace
 	claimed, _ := session.session_claimed(&app.setup.store)
-	app.setup.session = agent.chat_session_init(&app.setup.store, claimed, workspace, context.allocator)
+	tool_error: agent.Tool_Registry_Error
+	app.setup.session, tool_error = agent.chat_session_init(&app.setup.store, claimed, workspace, context.allocator)
+	if tool_error.kind != .None { testing.fail_now(t, "the tool registry could not be created") }
 	app.setup.session.skill_instructions = agent.test_skill_instructions(&app.setup.session)
 	return directory
 }
