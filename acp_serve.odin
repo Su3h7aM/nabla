@@ -340,48 +340,64 @@ acp_enqueue :: proc(server: ^Acp_Server, work: Acp_Work) -> bool {
 //
 // reason is static text when ok is false.
 acp_prompt_text :: proc(blocks: []acp.Content_Block, allocator := context.allocator) -> (text: string, reason: string, ok: bool) {
-	builder := strings.builder_make(allocator)
+	builder, builder_error := strings.builder_make(allocator)
+	if builder_error != nil { return "", "the prompt could not be allocated", false }
+	complete := false
+	defer if !complete { strings.builder_destroy(&builder) }
 	for block in blocks {
 		switch block.type {
 		case acp.CONTENT_TEXT:
-			acp_prompt_append(&builder, block.text)
+			if !acp_prompt_append(&builder, block.text) {
+				return "", "the prompt could not be allocated", false
+			}
 		case acp.CONTENT_RESOURCE_LINK:
 			if block.uri == "" { continue }
-			path := acp_resource_path(block.uri, context.temp_allocator)
+			path, path_ok := acp_resource_path(block.uri, context.temp_allocator)
 			defer delete(path, context.temp_allocator)
-			acp_prompt_append(&builder, path)
+			if !path_ok || !acp_prompt_append(&builder, path) {
+				return "", "the resource path could not be allocated", false
+			}
 		case acp.CONTENT_RESOURCE:
 			if block.resource.text != "" {
-				acp_prompt_append(&builder, block.resource.text)
+				if !acp_prompt_append(&builder, block.resource.text) {
+					return "", "the prompt could not be allocated", false
+				}
 			} else if block.resource.uri != "" {
-				path := acp_resource_path(block.resource.uri, context.temp_allocator)
+				path, path_ok := acp_resource_path(block.resource.uri, context.temp_allocator)
 				defer delete(path, context.temp_allocator)
-				acp_prompt_append(&builder, path)
+				if !path_ok || !acp_prompt_append(&builder, path) {
+					return "", "the resource path could not be allocated", false
+				}
 			}
 		case:
 			strings.builder_destroy(&builder)
 			return "", fmt.tprintf("prompt content of type %q is not supported", block.type), false
 		}
 	}
-	return strings.to_string(builder), "", true
+	text = strings.to_string(builder)
+	complete = true
+	return text, "", true
 }
 
 // acp_prompt_append keeps the blocks of one message apart, so two blocks do not run
 // together into one sentence the user never wrote.
 @(private)
-acp_prompt_append :: proc(builder: ^strings.Builder, text: string) {
-	if text == "" { return }
-	if strings.builder_len(builder^) > 0 { strings.write_string(builder, "\n\n") }
-	strings.write_string(builder, text)
+acp_prompt_append :: proc(builder: ^strings.Builder, text: string) -> bool {
+	if text == "" { return true }
+	if strings.builder_len(builder^) > 0 && strings.write_string(builder, "\n\n") != 2 { return false }
+	return strings.write_string(builder, text) == len(text)
 }
 
 // acp_resource_path is the path behind a resource uri. A `file://` uri names a file the
 // harness can open itself, which is what its tools take; anything else is passed through
 // as the client wrote it.
-acp_resource_path :: proc(uri: string, allocator := context.allocator) -> string {
+acp_resource_path :: proc(uri: string, allocator := context.allocator) -> (string, bool) {
 	FILE_URI_PREFIX :: "file://"
-	if strings.has_prefix(uri, FILE_URI_PREFIX) { return strings.clone(uri[len(FILE_URI_PREFIX):], allocator) }
-	return strings.clone(uri, allocator)
+	value := uri
+	if strings.has_prefix(uri, FILE_URI_PREFIX) { value = uri[len(FILE_URI_PREFIX):] }
+	path, clone_error := strings.clone(value, allocator)
+	if clone_error != nil { return "", false }
+	return path, true
 }
 
 // --- entry point -------------------------------------------------------------

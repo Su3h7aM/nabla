@@ -36,16 +36,20 @@ Display_Sanitizer :: struct {
 	skip_one: bool, // drop one byte: a charset-designation final,
 }
 
-// display_sanitize_chunk renders one fragment and returns owned text.
-// display_sanitize_flush closes the stream: a dangling escape is dropped and
-// a dangling rune fragment becomes U+FFFD.
+// display_sanitize_chunk renders one fragment and returns text owned by allocator.
+// A successful result transfers the builder's backing allocation to the caller.
+// An allocation failure returns an empty string and releases the partial builder.
 display_sanitize_chunk :: proc(san: ^Display_Sanitizer, chunk: string, allocator := context.allocator) -> string {
-	combined := make([dynamic]u8, 0, san.hold_len + len(chunk), context.temp_allocator)
+	combined, combined_error := make([dynamic]u8, 0, san.hold_len + len(chunk), context.temp_allocator)
+	if combined_error != nil { return "" }
 	defer delete(combined)
-	append(&combined, ..san.hold[:san.hold_len])
-	append(&combined, chunk)
+	if append(&combined, ..san.hold[:san.hold_len]) != san.hold_len { return "" }
+	if append(&combined, chunk) != len(chunk) { return "" }
 	san.hold_len = 0
-	builder := strings.builder_make(allocator)
+	builder, builder_error := strings.builder_make(allocator)
+	if builder_error != nil { return "" }
+	failed := false
+	defer if failed { strings.builder_destroy(&builder) }
 	i := 0
 	for i < len(combined) {
 		if san.skip_one {
@@ -141,13 +145,18 @@ display_sanitize_chunk :: proc(san: ^Display_Sanitizer, chunk: string, allocator
 	return strings.to_string(builder)
 }
 
+// display_sanitize_flush closes the stream: a dangling escape is dropped and
+// a dangling rune fragment becomes U+FFFD. The returned replacement is owned by
+// allocator.
 display_sanitize_flush :: proc(san: ^Display_Sanitizer, allocator := context.allocator) -> string {
 	san.state = .Text
 	san.after_cr = false
 	san.skip_one = false
 	if san.hold_len == 0 { return "" }
 	san.hold_len = 0
-	return strings.clone("�", allocator)
+	replacement, replacement_error := strings.clone("�", allocator)
+	if replacement_error != nil { return "" }
+	return replacement
 }
 
 display_clean :: proc(text: string, allocator := context.allocator) -> string {
@@ -156,7 +165,11 @@ display_clean :: proc(text: string, allocator := context.allocator) -> string {
 	tail := display_sanitize_flush(&san, allocator)
 	defer delete(tail, allocator)
 	if tail == "" { return cleaned }
-	joined := strings.concatenate([]string{cleaned, tail}, allocator = allocator)
+	joined, join_error := strings.concatenate([]string{cleaned, tail}, allocator = allocator)
+	if join_error != nil {
+		delete(cleaned, allocator)
+		return ""
+	}
 	delete(cleaned, allocator)
 	return joined
 }
