@@ -65,7 +65,9 @@ Session :: struct {
 // open never leaks a half-configured terminal or an allocation.
 @(require_results)
 open :: proc(options: Options = {}, allocator := context.allocator, loc := #caller_location) -> (session: ^Session, err: Error) {
-	session = new(Session, allocator, loc)
+	alloc_error: runtime.Allocator_Error
+	session, alloc_error = new(Session, allocator, loc)
+	if alloc_error != nil { return nil, alloc_error }
 	session.allocator = allocator
 	if err = _session_open(session, options); err != nil {
 		free(session, allocator)
