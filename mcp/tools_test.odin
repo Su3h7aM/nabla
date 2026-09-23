@@ -332,12 +332,16 @@ test_handshake_era_results_carry_no_result_type :: proc(t: ^testing.T) {
 // version is what decides.
 @(test)
 test_request_envelope_follows_the_revision :: proc(t: ^testing.T) {
-	stateless := tools_list_params_make("", .V2026_07_28, context.allocator)
+	stateless, stateless_error := tools_list_params_make("", .V2026_07_28, context.allocator)
+	if !testing.expect_value(t, stateless_error.kind, Error_Kind.None) { return }
+	defer error_destroy(&stateless_error, context.allocator)
 	defer json.destroy_value(json.Value(stateless), context.allocator)
 	_, stateless_has_meta := stateless["_meta"]
 	testing.expect(t, stateless_has_meta, "a stateless revision declares its version on every request")
 
-	handshake := tools_list_params_make("", .V2025_11_25, context.allocator)
+	handshake, handshake_error := tools_list_params_make("", .V2025_11_25, context.allocator)
+	if !testing.expect_value(t, handshake_error.kind, Error_Kind.None) { return }
+	defer error_destroy(&handshake_error, context.allocator)
 	defer json.destroy_value(json.Value(handshake), context.allocator)
 	_, handshake_has_meta := handshake["_meta"]
 	testing.expect(t, !handshake_has_meta, "a handshake revision negotiated once and carries nothing per request")
@@ -345,7 +349,9 @@ test_request_envelope_follows_the_revision :: proc(t: ^testing.T) {
 
 	// The handshake itself is where the version is offered, and it carries no `_meta`
 	// either: the revision is not known until the server answers.
-	initialize := initialize_params_make(context.allocator)
+	initialize, initialize_error := initialize_params_make(context.allocator)
+	if !testing.expect_value(t, initialize_error.kind, Error_Kind.None) { return }
+	defer error_destroy(&initialize_error, context.allocator)
 	defer json.destroy_value(json.Value(initialize), context.allocator)
 	testing.expect_value(t, wire_string(t, initialize, "protocolVersion"), PROTOCOL_VERSION_PREFERRED)
 	_, initialize_has_meta := initialize["_meta"]

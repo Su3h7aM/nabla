@@ -41,7 +41,9 @@ wire_object_field :: proc(t: ^testing.T, object: json.Object, key: string) -> js
 
 @(test)
 test_request_carries_the_per_request_metadata :: proc(t: ^testing.T) {
-	params := request_params_make(.V2026_07_28, 1, context.allocator)
+	params, params_error := request_params_make(.V2026_07_28, 1, context.allocator)
+	if !testing.expect_value(t, params_error.kind, Error_Kind.None) { return }
+	defer error_destroy(&params_error, context.allocator)
 	params[strings.clone("cursor", context.allocator)] = json.String(strings.clone("page-2", context.allocator))
 	line, err := request_encode(METHOD_TOOLS_LIST, params, 7, context.allocator)
 	defer error_destroy(&err, context.allocator)
@@ -74,9 +76,14 @@ test_request_carries_the_per_request_metadata :: proc(t: ^testing.T) {
 @(test)
 test_encoding_is_deterministic_and_a_notification_has_no_id :: proc(t: ^testing.T) {
 	encode := proc() -> string {
-		params := request_params_make(.V2026_07_28, 1, context.allocator)
+		params, params_error := request_params_make(.V2026_07_28, 1, context.allocator)
+		if params_error.kind != .None {
+			error_destroy(&params_error, context.allocator)
+			return ""
+		}
 		params[strings.clone("name", context.allocator)] = json.String(strings.clone("do_thing", context.allocator))
-		line, _ := request_encode(METHOD_TOOLS_CALL, params, 11, context.allocator)
+		line, encode_error := request_encode(METHOD_TOOLS_CALL, params, 11, context.allocator)
+		error_destroy(&encode_error, context.allocator)
 		return line
 	}
 	first := encode()

@@ -100,12 +100,15 @@ MAX_CURSOR_BYTES :: 4096
 
 // tools_list_params_make builds the params for one tools/list page. An empty
 // cursor asks for the first page.
-tools_list_params_make :: proc(cursor: string, version: Protocol_Version, allocator := context.allocator) -> json.Object {
-	params := request_params_make(version, 1 if cursor != "" else 0, allocator)
+tools_list_params_make :: proc(cursor: string, version: Protocol_Version, allocator := context.allocator) -> (json.Object, Error) {
+	params, build_error := request_params_make(version, 1 if cursor != "" else 0, allocator)
+	if build_error.kind != .None { return {}, build_error }
 	if cursor != "" {
-		params[strings.clone("cursor", allocator)] = json.String(mcp_clone_bounded(cursor, MAX_CURSOR_BYTES, allocator))
+		key, clone_error := strings.clone("cursor", allocator)
+		if clone_error != nil { json.destroy_value(json.Value(params), allocator); return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		params[key] = json.String(mcp_clone_bounded(cursor, MAX_CURSOR_BYTES, allocator))
 	}
-	return params
+	return params, {}
 }
 
 // tools_list_decode reads one tools/list page. A tool that cannot be used is
@@ -144,18 +147,34 @@ tools_list_decode :: proc(result: json.Object, version: Protocol_Version, alloca
 		return {}, error_make(.Malformed_Message, "the tool listing page is larger than 1024 tools", allocator = allocator)
 	}
 
-	page.tools = make([dynamic]Tool, 0, len(tools), allocator)
-	page.rejected = make([dynamic]Rejected_Tool, 0, allocator)
+	page_tools, tools_error := make([dynamic]Tool, 0, len(tools), allocator)
+	if tools_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	page.tools = page_tools
+	page_rejected, rejected_error := make([dynamic]Rejected_Tool, 0, allocator)
+	if rejected_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	page.rejected = page_rejected
 	for value in tools {
 		tool, reason := tool_decode(value, allocator)
 		if reason != "" {
-			append(
-				&page.rejected,
-				Rejected_Tool{name = tool_rejected_name(value, allocator), reason = mcp_clone_bounded(reason, MAX_TOOL_DESCRIPTION_BYTES, allocator)},
-			)
+			rejected := Rejected_Tool {
+				name   = tool_rejected_name(value, allocator),
+				reason = mcp_clone_bounded(reason, MAX_TOOL_DESCRIPTION_BYTES, allocator),
+			}
+			appended := append(&page.rejected, rejected)
+			if appended != 1 {
+				if appended == 0 {
+					delete(rejected.name, allocator)
+					delete(rejected.reason, allocator)
+				}
+				return {}, error_make(.Out_Of_Memory, allocator = allocator)
+			}
 			continue
 		}
-		append(&page.tools, tool)
+		appended := append(&page.tools, tool)
+		if appended != 1 {
+			if appended == 0 { tool_destroy(&tool, allocator) }
+			return {}, error_make(.Out_Of_Memory, allocator = allocator)
+		}
 	}
 
 	if cursor_value, present := result["nextCursor"]; present {
@@ -444,10 +463,27 @@ tools_call_params_make :: proc(name, arguments_json: string, version: Protocol_V
 		return {}, error_make(.Malformed_Message, "the call arguments are not a JSON object", allocator = allocator)
 	}
 
-	params = request_params_make(version, 2, allocator)
-	params[strings.clone("name", allocator)] = json.String(mcp_clone_bounded(name, MAX_TOOL_NAME_BYTES, allocator))
-	params[strings.clone("arguments", allocator)] = json.Value(object)
-	return params, {}
+	built_params, build_error := request_params_make(version, 2, allocator)
+	if build_error.kind != .None {
+		json.destroy_value(arguments, allocator)
+		return {}, build_error
+	}
+	name_key, name_key_error := strings.clone("name", allocator)
+	if name_key_error != nil {
+		json.destroy_value(json.Value(built_params), allocator)
+		json.destroy_value(arguments, allocator)
+		return {}, error_make(.Out_Of_Memory, allocator = allocator)
+	}
+	name_value := mcp_clone_bounded(name, MAX_TOOL_NAME_BYTES, allocator)
+	built_params[name_key] = json.String(name_value)
+	arguments_key, arguments_key_error := strings.clone("arguments", allocator)
+	if arguments_key_error != nil {
+		json.destroy_value(json.Value(built_params), allocator)
+		json.destroy_value(arguments, allocator)
+		return {}, error_make(.Out_Of_Memory, allocator = allocator)
+	}
+	built_params[arguments_key] = json.Value(object)
+	return built_params, {}
 }
 
 // call_result_decode reads one tools/call result, of either shape the revision

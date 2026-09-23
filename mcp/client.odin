@@ -117,7 +117,8 @@ client_connect :: proc(client: ^Client, options: Operation_Options, allocator :=
 // speaks the other era" from "this server speaks this era and refused".
 @(private)
 client_try_discover :: proc(client: ^Client, options: Operation_Options, allocator: mem.Allocator) -> (connection: Connection, answered: bool, err: Error) {
-	params := request_params_make(.V2026_07_28, 0, client.allocator)
+	params, build_error := request_params_make(.V2026_07_28, 0, client.allocator)
+	if build_error.kind != .None { return {}, false, build_error }
 	result, exchange_err := client_exchange(client, METHOD_DISCOVER, params, options)
 	if exchange_err.kind != .None { return {}, false, exchange_err }
 
@@ -140,7 +141,9 @@ client_try_discover :: proc(client: ^Client, options: Operation_Options, allocat
 @(private)
 client_initialize :: proc(client: ^Client, options: Operation_Options, allocator: mem.Allocator) -> (Connection, Error) {
 	control := options.control
-	result, exchange_err := client_exchange(client, METHOD_INITIALIZE, initialize_params_make(client.allocator), options)
+	params, build_error := initialize_params_make(client.allocator)
+	if build_error.kind != .None { return {}, build_error }
+	result, exchange_err := client_exchange(client, METHOD_INITIALIZE, params, options)
 	if exchange_err.kind != .None { return {}, exchange_err }
 
 	object, is_object := result.(json.Object)
@@ -322,8 +325,12 @@ client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator
 	}
 	page: Tool_Page
 	page.allocator = allocator
-	page.tools = make([dynamic]Tool, 0, allocator)
-	page.rejected = make([dynamic]Rejected_Tool, 0, allocator)
+	page_tools, tools_error := make([dynamic]Tool, 0, allocator)
+	if tools_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	page.tools = page_tools
+	page_rejected, rejected_error := make([dynamic]Rejected_Tool, 0, allocator)
+	if rejected_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	page.rejected = page_rejected
 	failed := true
 	defer if failed { tool_page_destroy(&page, allocator) }
 
@@ -337,7 +344,9 @@ client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator
 		// The listing is read-only, so a transport failure is retried once against a
 		// fresh server.
 		for attempts := 0;; attempts += 1 {
-			result, exchange_err := client_exchange(client, METHOD_TOOLS_LIST, tools_list_params_make(cursor, client.version, client.allocator), options)
+			params, build_error := tools_list_params_make(cursor, client.version, client.allocator)
+			if build_error.kind != .None { return {}, build_error }
+			result, exchange_err := client_exchange(client, METHOD_TOOLS_LIST, params, options)
 			if exchange_err.kind == .None {
 				object, is_object := result.(json.Object)
 				if !is_object {
@@ -362,9 +371,21 @@ client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator
 		// the loop's own variable, so clearing the page releases only what is left.
 		moved_cursor := next.next_cursor
 		next.next_cursor = ""
-		append(&page.tools, ..next.tools[:])
-		append(&page.rejected, ..next.rejected[:])
+		old_tools_len := len(page.tools)
+		tools_appended := append(&page.tools, ..next.tools[:])
+		if tools_appended != len(next.tools) {
+			resize(&page.tools, old_tools_len)
+			tool_page_destroy(&next, allocator)
+			return {}, error_make(.Out_Of_Memory, allocator = allocator)
+		}
 		clear(&next.tools)
+		old_rejected_len := len(page.rejected)
+		rejected_appended := append(&page.rejected, ..next.rejected[:])
+		if rejected_appended != len(next.rejected) {
+			resize(&page.rejected, old_rejected_len)
+			tool_page_destroy(&next, allocator)
+			return {}, error_make(.Out_Of_Memory, allocator = allocator)
+		}
 		clear(&next.rejected)
 		tool_page_destroy(&next, allocator)
 		if cursor != "" { delete(cursor, allocator) }

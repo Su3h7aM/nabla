@@ -156,21 +156,57 @@ MAX_STDERR_TAIL_BYTES :: 32 * 1024
 // text the harness repeats, so it is cut to size rather than trusted.
 MAX_IDENTITY_BYTES :: 256
 
+mcp_object_make :: proc(capacity: int, allocator: mem.Allocator) -> (json.Object, Error) {
+	object, make_error := make(json.Object, capacity, allocator)
+	if make_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	return object, {}
+}
+
+mcp_object_put_string :: proc(object: ^json.Object, key, value: string, allocator: mem.Allocator) -> bool {
+	owned_key, key_error := strings.clone(key, allocator)
+	if key_error != nil { return false }
+	owned_value, value_error := strings.clone(value, allocator)
+	if value_error != nil {
+		delete(owned_key, allocator)
+		return false
+	}
+	object^[owned_key] = json.String(owned_value)
+	return true
+}
+
+mcp_object_put_integer :: proc(object: ^json.Object, key: string, value: i64, allocator: mem.Allocator) -> bool {
+	owned_key, key_error := strings.clone(key, allocator)
+	if key_error != nil { return false }
+	object^[owned_key] = json.Integer(value)
+	return true
+}
+
+mcp_object_put_value :: proc(object: ^json.Object, key: string, value: json.Value, allocator: mem.Allocator) -> bool {
+	owned_key, key_error := strings.clone(key, allocator)
+	if key_error != nil { return false }
+	object^[owned_key] = value
+	return true
+}
+
 // client_capabilities_make declares what this client can do, which is nothing
 // beyond the operations it initiates. Sampling, elicitation, roots, and
 // subscriptions are all unimplemented, and declaring one would invite a server to
 // require it: a server must not rely on a capability the client did not state.
-client_capabilities_make :: proc(allocator: mem.Allocator) -> json.Object {
-	return make(json.Object, 0, allocator)
+client_capabilities_make :: proc(allocator: mem.Allocator) -> (json.Object, Error) {
+	return mcp_object_make(0, allocator)
 }
 
 // client_info_make names this client. The protocol treats identity as self
 // reported and unverified, so it is advisory: nothing may depend on it.
-client_info_make :: proc(allocator: mem.Allocator) -> json.Object {
-	info := make(json.Object, 2, allocator)
-	info[strings.clone("name", allocator)] = json.String(strings.clone(CLIENT_NAME, allocator))
-	info[strings.clone("version", allocator)] = json.String(strings.clone(CLIENT_VERSION, allocator))
-	return info
+client_info_make :: proc(allocator: mem.Allocator) -> (json.Object, Error) {
+	info, build_error := mcp_object_make(2, allocator)
+	if build_error.kind != .None { return {}, build_error }
+	failed := true
+	defer if failed { json.destroy_value(json.Value(info), allocator) }
+	if !mcp_object_put_string(&info, "name", CLIENT_NAME, allocator) { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	if !mcp_object_put_string(&info, "version", CLIENT_VERSION, allocator) { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	failed = false
+	return info, {}
 }
 
 // request_params_make starts a params object for one request under version. A
@@ -178,38 +214,91 @@ client_info_make :: proc(allocator: mem.Allocator) -> json.Object {
 // built here so a method encoder adds its own fields and cannot forget the
 // envelope. A handshake revision negotiated the version once and carries none of
 // it. The result is passed to request_encode, which consumes it.
-request_params_make :: proc(version: Protocol_Version, capacity := 0, allocator := context.allocator) -> json.Object {
-	params := make(json.Object, capacity + 1, allocator)
-	if protocol_version_era(version) != .Stateless { return params }
-	meta := make(json.Object, 3, allocator)
-	meta[strings.clone(META_PROTOCOL_VERSION, allocator)] = json.String(strings.clone(protocol_version_name(version), allocator))
-	meta[strings.clone(META_CLIENT_CAPABILITIES, allocator)] = json.Value(client_capabilities_make(allocator))
-	meta[strings.clone(META_CLIENT_INFO, allocator)] = json.Value(client_info_make(allocator))
-	params[strings.clone("_meta", allocator)] = json.Value(meta)
-	return params
+request_params_make :: proc(version: Protocol_Version, capacity := 0, allocator := context.allocator) -> (json.Object, Error) {
+	params, build_error := mcp_object_make(capacity + 1, allocator)
+	if build_error.kind != .None { return {}, build_error }
+	params_complete := false
+	defer if !params_complete { json.destroy_value(json.Value(params), allocator) }
+	if protocol_version_era(version) != .Stateless { params_complete = true; return params, {} }
+	meta, meta_error := mcp_object_make(3, allocator)
+	if meta_error.kind != .None {
+		return {}, meta_error
+	}
+	installed := false
+	defer if !installed { json.destroy_value(json.Value(meta), allocator) }
+	if !mcp_object_put_string(
+		&meta,
+		META_PROTOCOL_VERSION,
+		protocol_version_name(version),
+		allocator,
+	) { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	capabilities, capabilities_error := client_capabilities_make(allocator)
+	if capabilities_error.kind != .None { return {}, capabilities_error }
+	if !mcp_object_put_value(&meta, META_CLIENT_CAPABILITIES, json.Value(capabilities), allocator) {
+		json.destroy_value(json.Value(capabilities), allocator)
+		return {}, error_make(.Out_Of_Memory, allocator = allocator)
+	}
+	info, info_error := client_info_make(allocator)
+	if info_error.kind != .None { return {}, info_error }
+	if !mcp_object_put_value(&meta, META_CLIENT_INFO, json.Value(info), allocator) {
+		json.destroy_value(json.Value(info), allocator)
+		return {}, error_make(.Out_Of_Memory, allocator = allocator)
+	}
+	if !mcp_object_put_value(&params, "_meta", json.Value(meta), allocator) { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	installed = true
+	params_complete = true
+	return params, {}
 }
 
 // initialize_params_make builds the handshake a 2025 revision expects. It offers
 // this client's preferred revision and carries no `_meta`: the version lives in
 // the request body, and which revision is in force is not known until the server
 // answers.
-initialize_params_make :: proc(allocator := context.allocator) -> json.Object {
-	params := make(json.Object, 3, allocator)
-	params[strings.clone("protocolVersion", allocator)] = json.String(strings.clone(PROTOCOL_VERSION_PREFERRED, allocator))
-	params[strings.clone("capabilities", allocator)] = json.Value(client_capabilities_make(allocator))
-	params[strings.clone("clientInfo", allocator)] = json.Value(client_info_make(allocator))
-	return params
+initialize_params_make :: proc(allocator := context.allocator) -> (json.Object, Error) {
+	params, build_error := mcp_object_make(3, allocator)
+	if build_error.kind != .None { return {}, build_error }
+	failed := true
+	defer if failed { json.destroy_value(json.Value(params), allocator) }
+	if !mcp_object_put_string(
+		&params,
+		"protocolVersion",
+		PROTOCOL_VERSION_PREFERRED,
+		allocator,
+	) { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	capabilities, capabilities_error := client_capabilities_make(allocator)
+	if capabilities_error.kind != .None { return {}, capabilities_error }
+	if !mcp_object_put_value(&params, "capabilities", json.Value(capabilities), allocator) {
+		json.destroy_value(json.Value(capabilities), allocator)
+		return {}, error_make(.Out_Of_Memory, allocator = allocator)
+	}
+	info, info_error := client_info_make(allocator)
+	if info_error.kind != .None { return {}, info_error }
+	if !mcp_object_put_value(&params, "clientInfo", json.Value(info), allocator) {
+		json.destroy_value(json.Value(info), allocator)
+		return {}, error_make(.Out_Of_Memory, allocator = allocator)
+	}
+	failed = false
+	return params, {}
 }
 
 // request_encode frames one JSON-RPC request. It takes ownership of params, including
 // on failure, so a caller cannot leak a partially built envelope.
 request_encode :: proc(method: string, params: json.Object, id: i64, allocator := context.allocator) -> (string, Error) {
-	envelope := make(json.Object, 4, allocator)
-	envelope[strings.clone("jsonrpc", allocator)] = json.String(strings.clone("2.0", allocator))
-	envelope[strings.clone("id", allocator)] = json.Integer(id)
-	envelope[strings.clone("method", allocator)] = json.String(strings.clone(method, allocator))
-	envelope[strings.clone("params", allocator)] = json.Value(params)
-
+	envelope, build_error := mcp_object_make(4, allocator)
+	if build_error.kind != .None {
+		json.destroy_value(json.Value(params), allocator)
+		return "", build_error
+	}
+	failed := true
+	defer if failed { json.destroy_value(json.Value(envelope), allocator) }
+	params_installed := false
+	defer if !params_installed { json.destroy_value(json.Value(params), allocator) }
+	if !mcp_object_put_string(&envelope, "jsonrpc", "2.0", allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	if !mcp_object_put_integer(&envelope, "id", id, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	if !mcp_object_put_string(&envelope, "method", method, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	if !mcp_object_put_value(&envelope, "params", json.Value(params), allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	params_installed = true
+	failed = false
 	value := json.Value(envelope)
 	defer json.destroy_value(value, allocator)
 	return mcp_frame(value, allocator)
@@ -219,11 +308,22 @@ request_encode :: proc(method: string, params: json.Object, id: i64, allocator :
 // params, which may be nil for a notification that carries none, and has no id,
 // which is what makes it a notification rather than a request.
 notification_encode :: proc(method: string, params: json.Object, allocator := context.allocator) -> (string, Error) {
-	envelope := make(json.Object, 3, allocator)
-	envelope[strings.clone("jsonrpc", allocator)] = json.String(strings.clone("2.0", allocator))
-	envelope[strings.clone("method", allocator)] = json.String(strings.clone(method, allocator))
-	if params != nil { envelope[strings.clone("params", allocator)] = json.Value(params) }
-
+	envelope, build_error := mcp_object_make(3, allocator)
+	if build_error.kind != .None {
+		if params != nil { json.destroy_value(json.Value(params), allocator) }
+		return "", build_error
+	}
+	failed := true
+	defer if failed { json.destroy_value(json.Value(envelope), allocator) }
+	params_installed := params == nil
+	defer if !params_installed { json.destroy_value(json.Value(params), allocator) }
+	if !mcp_object_put_string(&envelope, "jsonrpc", "2.0", allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	if !mcp_object_put_string(&envelope, "method", method, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	if params != nil {
+		if !mcp_object_put_value(&envelope, "params", json.Value(params), allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+		params_installed = true
+	}
+	failed = false
 	value := json.Value(envelope)
 	defer json.destroy_value(value, allocator)
 	return mcp_frame(value, allocator)
@@ -234,15 +334,22 @@ notification_encode :: proc(method: string, params: json.Object, allocator := co
 // capability for: the specification requires a reply to every request, and there
 // is nothing else honest to say.
 response_error_encode :: proc(id: i64, code: i64, message: string, allocator := context.allocator) -> (string, Error) {
-	remote := make(json.Object, 2, allocator)
-	remote[strings.clone("code", allocator)] = json.Integer(code)
-	remote[strings.clone("message", allocator)] = json.String(strings.clone(message, allocator))
+	remote, build_error := mcp_object_make(2, allocator)
+	if build_error.kind != .None { return "", build_error }
+	remote_failed := true
+	defer if remote_failed { json.destroy_value(json.Value(remote), allocator) }
+	if !mcp_object_put_integer(&remote, "code", code, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	if !mcp_object_put_string(&remote, "message", message, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
 
-	envelope := make(json.Object, 3, allocator)
-	envelope[strings.clone("jsonrpc", allocator)] = json.String(strings.clone("2.0", allocator))
-	envelope[strings.clone("id", allocator)] = json.Integer(id)
-	envelope[strings.clone("error", allocator)] = json.Value(remote)
-
+	envelope, envelope_error := mcp_object_make(3, allocator)
+	if envelope_error.kind != .None { return "", envelope_error }
+	envelope_failed := true
+	defer if envelope_failed { json.destroy_value(json.Value(envelope), allocator) }
+	if !mcp_object_put_string(&envelope, "jsonrpc", "2.0", allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	if !mcp_object_put_integer(&envelope, "id", id, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	if !mcp_object_put_value(&envelope, "error", json.Value(remote), allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	remote_failed = false
+	envelope_failed = false
 	value := json.Value(envelope)
 	defer json.destroy_value(value, allocator)
 	return mcp_frame(value, allocator)
