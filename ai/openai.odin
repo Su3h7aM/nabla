@@ -135,7 +135,7 @@ openai_tool_schema_valid :: proc(raw: string) -> bool {
 // requests of one conversation.
 @(private = "package")
 openai_tool_parameters_write :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, first: ^bool, schema: string, allocator := context.allocator) -> bool {
-	encode_write_field(body, first, "parameters")
+	encode_write_field(cursor, body, first, "parameters")
 	return encode_write_object(cursor, body, schema, allocator)
 }
 

@@ -710,6 +710,8 @@ provider_request_error_text :: proc(err: Provider_Request_Error) -> string {
 		return "prompt cache options need implicit/explicit mode and 30m ttl"
 	case .Invalid_Prompt_Cache_Retention:
 		return "prompt cache retention must be in_memory or 24h (deprecated)"
+	case .Allocation:
+		return "the provider request could not be allocated"
 	}
 	return "invalid provider request"
 }

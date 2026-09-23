@@ -169,6 +169,8 @@ Provider_Request_Error :: enum {
 	Invalid_Prompt_Cache_Key,
 	Invalid_Prompt_Cache_Options,
 	Invalid_Prompt_Cache_Retention,
+	// Allocation means the local request body or cache could not be built.
+	Allocation,
 }
 
 Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request_Error {

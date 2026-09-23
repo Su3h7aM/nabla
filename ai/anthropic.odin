@@ -47,61 +47,71 @@ anthropic_encode_request :: proc(
 	}
 
 	cursor := encode_cursor(cache, allocator)
-	body := encode_body_make(&cursor, allocator)
+	body, body_error := encode_body_make(&cursor, allocator)
+	if body_error != .None { return "", body_error }
 	defer strings.builder_destroy(&body)
 
 	// Fields are written in the order the standard library's writer sorts them in, so a
 	// body is the bytes a parsed request would be written as, and the same conversation
 	// writes the same bytes in any process.
 	first := true
-	encode_write_raw(&body, "{")
+	encode_write_raw(&cursor, &body, "{")
 	if request.Cache_Request_Present && request.Cache_Request {
 		// Top-level cache control marks the last cacheable block and advances as
 		// the conversation grows, so an append-only history reuses its whole
 		// prefix without the harness naming a breakpoint.
-		encode_write_field(&body, &first, "cache_control")
-		encode_write_raw(&body, "{\"type\":")
-		encode_write_literal_string(&body, "ephemeral")
-		encode_write_raw(&body, "}")
+		encode_write_field(&cursor, &body, &first, "cache_control")
+		encode_write_raw(&cursor, &body, "{\"type\":")
+		encode_write_literal_string(&cursor, &body, "ephemeral")
+		encode_write_raw(&cursor, &body, "}")
 	}
-	encode_write_field(&body, &first, "max_tokens")
-	encode_write_int(&body, request.Max_Output_Tokens)
-	encode_write_field(&body, &first, "messages")
-	encode_write_raw(&body, "[")
+	encode_write_field(&cursor, &body, &first, "max_tokens")
+	encode_write_int(&cursor, &body, request.Max_Output_Tokens)
+	encode_write_field(&cursor, &body, &first, "messages")
+	encode_write_raw(&cursor, &body, "[")
 	if messages_err := anthropic_write_messages(&cursor, &body, request.Messages, allocator); messages_err != .None {
+		encode_finish(&cursor)
+		if cursor.error != .None { return "", cursor.error }
 		return "", messages_err
 	}
-	encode_write_raw(&body, "]")
-	encode_write_field(&body, &first, "model")
+	encode_write_raw(&cursor, &body, "]")
+	encode_write_field(&cursor, &body, &first, "model")
 	encode_write_text(&cursor, &body, request.Model)
 	if request.Reasoning_Effort_Present {
 		// The effort name is opaque and travels verbatim. Anthropic states it as a
 		// level under output_config, which is the same shape the harness stores.
-		encode_write_field(&body, &first, "output_config")
-		encode_write_raw(&body, "{\"effort\":")
+		encode_write_field(&cursor, &body, &first, "output_config")
+		encode_write_raw(&cursor, &body, "{\"effort\":")
 		encode_write_text(&cursor, &body, request.Reasoning_Effort)
-		encode_write_raw(&body, "}")
+		encode_write_raw(&cursor, &body, "}")
 	}
-	encode_write_field(&body, &first, "stream")
-	encode_write_bool(&body, true)
+	encode_write_field(&cursor, &body, &first, "stream")
+	encode_write_bool(&cursor, &body, true)
 	if request.Instructions_Present {
-		encode_write_field(&body, &first, "system")
+		encode_write_field(&cursor, &body, &first, "system")
 		encode_write_text(&cursor, &body, request.Instructions)
 	}
 	if len(request.Tools) > 0 {
-		encode_write_field(&body, &first, "tools")
-		encode_write_raw(&body, "[")
+		encode_write_field(&cursor, &body, &first, "tools")
+		encode_write_raw(&cursor, &body, "[")
 		tool_first := true
 		for tool in request.Tools {
-			encode_write_item(&body, &tool_first)
-			if !anthropic_write_tool_def(&cursor, &body, tool, allocator) { return "", .Invalid_Tools }
+			encode_write_item(&cursor, &body, &tool_first)
+			if !anthropic_write_tool_def(&cursor, &body, tool, allocator) {
+				encode_finish(&cursor)
+				if cursor.error != .None { return "", cursor.error }
+				return "", .Invalid_Tools
+			}
 		}
-		encode_write_raw(&body, "]")
+		encode_write_raw(&cursor, &body, "]")
 	}
-	encode_write_raw(&body, "}")
+	encode_write_raw(&cursor, &body, "}")
 	encode_finish(&cursor)
+	if cursor.error != .None { return "", cursor.error }
 	encode_body_store(&cursor, &body)
-	return strings.clone(strings.to_string(body), allocator), .None
+	result, clone_error := strings.clone(strings.to_string(body), allocator)
+	if clone_error != nil { return "", .Allocation }
+	return result, .None
 }
 
 // anthropic_write_messages projects the conversation onto the Messages API. The
@@ -158,28 +168,28 @@ anthropic_write_messages :: proc(
 			// the API would refuse.
 			role := "assistant"
 			if turns == 0 && len(message.Tool_Calls) == 0 { role = "user" }
-			encode_write_item(body, &item_first)
+			encode_write_item(cursor, body, &item_first)
 			field_first := true
-			encode_write_raw(body, "{")
-			encode_write_field(body, &field_first, "content")
+			encode_write_raw(cursor, body, "{")
+			encode_write_field(cursor, body, &field_first, "content")
 			if len(message.Tool_Calls) == 0 {
 				encode_write_text(cursor, body, message.Content)
 			} else {
-				encode_write_raw(body, "[")
+				encode_write_raw(cursor, body, "[")
 				block_first := true
 				if message.Content != "" {
-					encode_write_item(body, &block_first)
+					encode_write_item(cursor, body, &block_first)
 					anthropic_write_text_block(cursor, body, message.Content)
 				}
 				for call in message.Tool_Calls {
-					encode_write_item(body, &block_first)
+					encode_write_item(cursor, body, &block_first)
 					if err := anthropic_write_tool_use(cursor, body, call, allocator); err != .None { return err }
 				}
-				encode_write_raw(body, "]")
+				encode_write_raw(cursor, body, "]")
 			}
-			encode_write_field(body, &field_first, "role")
-			encode_write_literal_string(body, role)
-			encode_write_raw(body, "}")
+			encode_write_field(cursor, body, &field_first, "role")
+			encode_write_literal_string(cursor, body, role)
+			encode_write_raw(cursor, body, "}")
 			turns += 1
 		case .Invalid:
 			return .Invalid_Message
@@ -203,10 +213,10 @@ anthropic_write_user_turn :: proc(
 	texts: int,
 	item_first: ^bool,
 ) -> Provider_Request_Error {
-	encode_write_item(body, item_first)
+	encode_write_item(cursor, body, item_first)
 	field_first := true
-	encode_write_raw(body, "{")
-	encode_write_field(body, &field_first, "content")
+	encode_write_raw(cursor, body, "{")
+	encode_write_field(cursor, body, &field_first, "content")
 	if blocks == 1 && texts == 1 {
 		for message in turn {
 			if message.Role != .User || message.Content == "" { continue }
@@ -214,38 +224,38 @@ anthropic_write_user_turn :: proc(
 			break
 		}
 	} else {
-		encode_write_raw(body, "[")
+		encode_write_raw(cursor, body, "[")
 		block_first := true
 		for message in turn {
 			switch message.Role {
 			case .User:
 				if message.Content == "" { continue }
-				encode_write_item(body, &block_first)
+				encode_write_item(cursor, body, &block_first)
 				anthropic_write_text_block(cursor, body, message.Content)
 			case .Tool:
-				encode_write_item(body, &block_first)
+				encode_write_item(cursor, body, &block_first)
 				if err := anthropic_write_tool_result(cursor, body, message); err != .None { return err }
 			case .System, .Reasoning, .Assistant, .Invalid:
 				continue
 			}
 		}
-		encode_write_raw(body, "]")
+		encode_write_raw(cursor, body, "]")
 	}
-	encode_write_field(body, &field_first, "role")
-	encode_write_literal_string(body, "user")
-	encode_write_raw(body, "}")
+	encode_write_field(cursor, body, &field_first, "role")
+	encode_write_literal_string(cursor, body, "user")
+	encode_write_raw(cursor, body, "}")
 	return .None
 }
 
 @(private)
 anthropic_write_text_block :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: string) {
 	field_first := true
-	encode_write_raw(body, "{")
-	encode_write_field(body, &field_first, "text")
+	encode_write_raw(cursor, body, "{")
+	encode_write_field(cursor, body, &field_first, "text")
 	encode_write_text(cursor, body, text)
-	encode_write_field(body, &field_first, "type")
-	encode_write_literal_string(body, ANTHROPIC_BLOCK_TEXT)
-	encode_write_raw(body, "}")
+	encode_write_field(cursor, body, &field_first, "type")
+	encode_write_literal_string(cursor, body, ANTHROPIC_BLOCK_TEXT)
+	encode_write_raw(cursor, body, "}")
 }
 
 // anthropic_write_tool_use writes a call as its content block. The arguments are a JSON
@@ -261,16 +271,19 @@ anthropic_write_tool_use :: proc(
 ) -> Provider_Request_Error {
 	if call.ID == "" || call.Name == "" { return .Invalid_Tool_Call }
 	field_first := true
-	encode_write_raw(body, "{")
-	encode_write_field(body, &field_first, "id")
+	encode_write_raw(cursor, body, "{")
+	encode_write_field(cursor, body, &field_first, "id")
 	encode_write_text(cursor, body, call.ID)
-	encode_write_field(body, &field_first, "input")
-	if !encode_write_object(cursor, body, call.Arguments, allocator) { encode_write_raw(body, "{}") }
-	encode_write_field(body, &field_first, "name")
+	encode_write_field(cursor, body, &field_first, "input")
+	if !encode_write_object(cursor, body, call.Arguments, allocator) {
+		if cursor.error != .None { return cursor.error }
+		encode_write_raw(cursor, body, "{}")
+	}
+	encode_write_field(cursor, body, &field_first, "name")
 	encode_write_text(cursor, body, call.Name)
-	encode_write_field(body, &field_first, "type")
-	encode_write_literal_string(body, ANTHROPIC_BLOCK_TOOL_USE)
-	encode_write_raw(body, "}")
+	encode_write_field(cursor, body, &field_first, "type")
+	encode_write_literal_string(cursor, body, ANTHROPIC_BLOCK_TOOL_USE)
+	encode_write_raw(cursor, body, "}")
 	return .None
 }
 
@@ -278,18 +291,18 @@ anthropic_write_tool_use :: proc(
 anthropic_write_tool_result :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, message: Provider_Message) -> Provider_Request_Error {
 	if message.Tool_Call_ID == "" { return .Invalid_Message }
 	field_first := true
-	encode_write_raw(body, "{")
-	encode_write_field(body, &field_first, "content")
+	encode_write_raw(cursor, body, "{")
+	encode_write_field(cursor, body, &field_first, "content")
 	encode_write_text(cursor, body, message.Content)
 	if message.Tool_Is_Error {
-		encode_write_field(body, &field_first, "is_error")
-		encode_write_bool(body, true)
+		encode_write_field(cursor, body, &field_first, "is_error")
+		encode_write_bool(cursor, body, true)
 	}
-	encode_write_field(body, &field_first, "tool_use_id")
+	encode_write_field(cursor, body, &field_first, "tool_use_id")
 	encode_write_text(cursor, body, message.Tool_Call_ID)
-	encode_write_field(body, &field_first, "type")
-	encode_write_literal_string(body, ANTHROPIC_BLOCK_TOOL_RESULT)
-	encode_write_raw(body, "}")
+	encode_write_field(cursor, body, &field_first, "type")
+	encode_write_literal_string(cursor, body, ANTHROPIC_BLOCK_TOOL_RESULT)
+	encode_write_raw(cursor, body, "}")
 	return .None
 }
 
@@ -300,14 +313,14 @@ anthropic_write_tool_result :: proc(cursor: ^Encode_Cursor, body: ^strings.Build
 @(private)
 anthropic_write_tool_def :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, tool: Provider_Tool_Def, allocator: mem.Allocator) -> bool {
 	field_first := true
-	encode_write_raw(body, "{")
-	encode_write_field(body, &field_first, "description")
+	encode_write_raw(cursor, body, "{")
+	encode_write_field(cursor, body, &field_first, "description")
 	encode_write_text(cursor, body, tool.Description)
-	encode_write_field(body, &field_first, "input_schema")
+	encode_write_field(cursor, body, &field_first, "input_schema")
 	if !encode_write_object(cursor, body, tool.Parameters_JSON, allocator) { return false }
-	encode_write_field(body, &field_first, "name")
+	encode_write_field(cursor, body, &field_first, "name")
 	encode_write_text(cursor, body, tool.Name)
-	encode_write_raw(body, "}")
+	encode_write_raw(cursor, body, "}")
 	return true
 }
 

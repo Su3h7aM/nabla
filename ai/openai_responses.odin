@@ -50,16 +50,17 @@ openai_responses_encode_request_body :: proc(
 	}
 
 	cursor := encode_cursor(cache, allocator)
-	body := encode_body_make(&cursor, allocator)
+	body, body_error := encode_body_make(&cursor, allocator)
+	if body_error != .None { return "", body_error }
 	defer strings.builder_destroy(&body)
 
 	// Fields are written in the order the standard library's writer sorts them in, so a
 	// body is the bytes a parsed request would be written as, and the same conversation
 	// writes the same bytes in any process.
 	first := true
-	encode_write_raw(&body, "{")
-	encode_write_field(&body, &first, "input")
-	encode_write_raw(&body, "[")
+	encode_write_raw(&cursor, &body, "{")
+	encode_write_field(&cursor, &body, &first, "input")
+	encode_write_raw(&cursor, &body, "[")
 	item_first := true
 	for message in request.Messages {
 		// A verbatim message carries the endpoint's own items. They are read as the input
@@ -71,6 +72,8 @@ openai_responses_encode_request_body :: proc(
 		// annotations, and summaries, and would send assistant content twice.
 		if message.Verbatim_Items != "" {
 			if !openai_responses_record_write(&cursor, &body, &item_first, message.Verbatim_Items) {
+				encode_finish(&cursor)
+				if cursor.error != .None { return "", cursor.error }
 				return "", .Invalid_Message
 			}
 			continue
@@ -80,154 +83,154 @@ openai_responses_encode_request_body :: proc(
 			// encrypted content: without it the item carries nothing the
 			// endpoint can continue from, and it is skipped rather than sent.
 			if message.Reasoning_Encrypted == "" { continue }
-			encode_write_item(&body, &item_first)
+			encode_write_item(&cursor, &body, &item_first)
 			field_first := true
-			encode_write_raw(&body, "{")
-			encode_write_field(&body, &field_first, "encrypted_content")
+			encode_write_raw(&cursor, &body, "{")
+			encode_write_field(&cursor, &body, &field_first, "encrypted_content")
 			encode_write_text(&cursor, &body, message.Reasoning_Encrypted)
-			encode_write_field(&body, &field_first, "id")
+			encode_write_field(&cursor, &body, &field_first, "id")
 			encode_write_text(&cursor, &body, message.Reasoning_ID)
 			// The request schema requires a summary on every replayed reasoning
 			// item, empty or not; summaries are display-only and were never
 			// kept, so the replayed one is empty.
-			encode_write_field(&body, &field_first, "summary")
-			encode_write_raw(&body, "[]")
-			encode_write_field(&body, &field_first, "type")
-			encode_write_literal_string(&body, "reasoning")
-			encode_write_raw(&body, "}")
+			encode_write_field(&cursor, &body, &field_first, "summary")
+			encode_write_raw(&cursor, &body, "[]")
+			encode_write_field(&cursor, &body, &field_first, "type")
+			encode_write_literal_string(&cursor, &body, "reasoning")
+			encode_write_raw(&cursor, &body, "}")
 			continue
 		}
 		if message.Role == .Tool {
-			encode_write_item(&body, &item_first)
+			encode_write_item(&cursor, &body, &item_first)
 			field_first := true
-			encode_write_raw(&body, "{")
-			encode_write_field(&body, &field_first, "call_id")
+			encode_write_raw(&cursor, &body, "{")
+			encode_write_field(&cursor, &body, &field_first, "call_id")
 			encode_write_text(&cursor, &body, message.Tool_Call_ID)
-			encode_write_field(&body, &field_first, "output")
+			encode_write_field(&cursor, &body, &field_first, "output")
 			encode_write_text(&cursor, &body, message.Content)
-			encode_write_field(&body, &field_first, "type")
-			encode_write_literal_string(&body, "function_call_output")
-			encode_write_raw(&body, "}")
+			encode_write_field(&cursor, &body, &field_first, "type")
+			encode_write_literal_string(&cursor, &body, "function_call_output")
+			encode_write_raw(&cursor, &body, "}")
 			continue
 		}
 		if len(message.Tool_Calls) > 0 {
 			for call in message.Tool_Calls {
-				encode_write_item(&body, &item_first)
+				encode_write_item(&cursor, &body, &item_first)
 				call_first := true
-				encode_write_raw(&body, "{")
-				encode_write_field(&body, &call_first, "arguments")
+				encode_write_raw(&cursor, &body, "{")
+				encode_write_field(&cursor, &body, &call_first, "arguments")
 				encode_write_text(&cursor, &body, call.Arguments)
-				encode_write_field(&body, &call_first, "call_id")
+				encode_write_field(&cursor, &body, &call_first, "call_id")
 				encode_write_text(&cursor, &body, call.ID)
 				if call.Item_ID != "" {
-					encode_write_field(&body, &call_first, "id")
+					encode_write_field(&cursor, &body, &call_first, "id")
 					encode_write_text(&cursor, &body, call.Item_ID)
 				}
-				encode_write_field(&body, &call_first, "name")
+				encode_write_field(&cursor, &body, &call_first, "name")
 				encode_write_text(&cursor, &body, call.Name)
-				encode_write_field(&body, &call_first, "type")
-				encode_write_literal_string(&body, "function_call")
-				encode_write_raw(&body, "}")
+				encode_write_field(&cursor, &body, &call_first, "type")
+				encode_write_literal_string(&cursor, &body, "function_call")
+				encode_write_raw(&cursor, &body, "}")
 			}
 			if message.Content != "" {
-				encode_write_item(&body, &item_first)
+				encode_write_item(&cursor, &body, &item_first)
 				text_first := true
-				encode_write_raw(&body, "{")
-				encode_write_field(&body, &text_first, "content")
+				encode_write_raw(&cursor, &body, "{")
+				encode_write_field(&cursor, &body, &text_first, "content")
 				encode_write_text(&cursor, &body, message.Content)
-				encode_write_field(&body, &text_first, "role")
-				encode_write_literal_string(&body, openai_role_name(message.Role))
-				encode_write_raw(&body, "}")
+				encode_write_field(&cursor, &body, &text_first, "role")
+				encode_write_literal_string(&cursor, &body, openai_role_name(message.Role))
+				encode_write_raw(&cursor, &body, "}")
 			}
 			continue
 		}
-		encode_write_item(&body, &item_first)
+		encode_write_item(&cursor, &body, &item_first)
 		field_first := true
-		encode_write_raw(&body, "{")
+		encode_write_raw(&cursor, &body, "{")
 		if message.Cache_Breakpoint {
-			encode_write_field(&body, &field_first, "content")
-			encode_write_raw(&body, "[{")
+			encode_write_field(&cursor, &body, &field_first, "content")
+			encode_write_raw(&cursor, &body, "[{")
 			part_first := true
-			encode_write_field(&body, &part_first, "prompt_cache_breakpoint")
-			encode_write_raw(&body, "{")
+			encode_write_field(&cursor, &body, &part_first, "prompt_cache_breakpoint")
+			encode_write_raw(&cursor, &body, "{")
 			breakpoint_first := true
-			encode_write_field(&body, &breakpoint_first, "mode")
-			encode_write_literal_string(&body, "explicit")
-			encode_write_raw(&body, "}")
-			encode_write_field(&body, &part_first, "text")
+			encode_write_field(&cursor, &body, &breakpoint_first, "mode")
+			encode_write_literal_string(&cursor, &body, "explicit")
+			encode_write_raw(&cursor, &body, "}")
+			encode_write_field(&cursor, &body, &part_first, "text")
 			encode_write_text(&cursor, &body, message.Content)
-			encode_write_field(&body, &part_first, "type")
-			encode_write_literal_string(&body, "input_text")
-			encode_write_raw(&body, "}]")
+			encode_write_field(&cursor, &body, &part_first, "type")
+			encode_write_literal_string(&cursor, &body, "input_text")
+			encode_write_raw(&cursor, &body, "}]")
 		} else {
-			encode_write_field(&body, &field_first, "content")
+			encode_write_field(&cursor, &body, &field_first, "content")
 			encode_write_text(&cursor, &body, message.Content)
 		}
-		encode_write_field(&body, &field_first, "role")
-		encode_write_literal_string(&body, openai_role_name(message.Role))
-		encode_write_raw(&body, "}")
+		encode_write_field(&cursor, &body, &field_first, "role")
+		encode_write_literal_string(&cursor, &body, openai_role_name(message.Role))
+		encode_write_raw(&cursor, &body, "}")
 	}
-	encode_write_raw(&body, "]")
+	encode_write_raw(&cursor, &body, "]")
 	if request.Instructions_Present {
-		encode_write_field(&body, &first, "instructions")
+		encode_write_field(&cursor, &body, &first, "instructions")
 		encode_write_text(&cursor, &body, request.Instructions)
 	}
 	if request.Max_Output_Tokens_Present {
-		encode_write_field(&body, &first, "max_output_tokens")
-		encode_write_int(&body, request.Max_Output_Tokens)
+		encode_write_field(&cursor, &body, &first, "max_output_tokens")
+		encode_write_int(&cursor, &body, request.Max_Output_Tokens)
 	}
-	encode_write_field(&body, &first, "model")
+	encode_write_field(&cursor, &body, &first, "model")
 	encode_write_text(&cursor, &body, request.Model)
 	if request.Prompt_Cache_Key_Present {
-		encode_write_field(&body, &first, "prompt_cache_key")
+		encode_write_field(&cursor, &body, &first, "prompt_cache_key")
 		encode_write_text(&cursor, &body, request.Prompt_Cache_Key)
 	}
 	if request.Prompt_Cache_Options_Present {
-		encode_write_field(&body, &first, "prompt_cache_options")
-		encode_write_raw(&body, "{")
+		encode_write_field(&cursor, &body, &first, "prompt_cache_options")
+		encode_write_raw(&cursor, &body, "{")
 		options_first := true
 		if request.Prompt_Cache_Options.Mode_Present {
 			mode := "implicit"
 			if request.Prompt_Cache_Options.Mode == .Explicit { mode = "explicit" }
-			encode_write_field(&body, &options_first, "mode")
-			encode_write_literal_string(&body, mode)
+			encode_write_field(&cursor, &body, &options_first, "mode")
+			encode_write_literal_string(&cursor, &body, mode)
 		}
 		if request.Prompt_Cache_Options.TTL_Present {
-			encode_write_field(&body, &options_first, "ttl")
-			encode_write_literal_string(&body, request.Prompt_Cache_Options.TTL)
+			encode_write_field(&cursor, &body, &options_first, "ttl")
+			encode_write_literal_string(&cursor, &body, request.Prompt_Cache_Options.TTL)
 		}
-		encode_write_raw(&body, "}")
+		encode_write_raw(&cursor, &body, "}")
 	}
 	if request.Prompt_Cache_Retention_Present {
-		encode_write_field(&body, &first, "prompt_cache_retention")
+		encode_write_field(&cursor, &body, &first, "prompt_cache_retention")
 		encode_write_text(&cursor, &body, request.Prompt_Cache_Retention)
 	}
 	if request.Reasoning_Effort_Present {
-		encode_write_field(&body, &first, "reasoning")
-		encode_write_raw(&body, "{")
+		encode_write_field(&cursor, &body, &first, "reasoning")
+		encode_write_raw(&cursor, &body, "{")
 		effort_first := true
-		encode_write_field(&body, &effort_first, "effort")
+		encode_write_field(&cursor, &body, &effort_first, "effort")
 		encode_write_text(&cursor, &body, request.Reasoning_Effort)
-		encode_write_raw(&body, "}")
+		encode_write_raw(&cursor, &body, "}")
 	}
 	if request.Store_Response_Present {
-		encode_write_field(&body, &first, "store")
-		encode_write_bool(&body, request.Store_Response)
+		encode_write_field(&cursor, &body, &first, "store")
+		encode_write_bool(&cursor, &body, request.Store_Response)
 	}
 	if !websocket {
-		encode_write_field(&body, &first, "stream")
-		encode_write_bool(&body, true)
+		encode_write_field(&cursor, &body, &first, "stream")
+		encode_write_bool(&cursor, &body, true)
 	}
 	if len(request.Tools) > 0 {
-		encode_write_field(&body, &first, "tools")
-		encode_write_raw(&body, "[")
+		encode_write_field(&cursor, &body, &first, "tools")
+		encode_write_raw(&cursor, &body, "[")
 		for tool, index in request.Tools {
-			if index > 0 { strings.write_byte(&body, ',') }
+			if index > 0 { encode_write_byte(&cursor, &body, ',') }
 			tool_first := true
-			encode_write_raw(&body, "{")
-			encode_write_field(&body, &tool_first, "description")
+			encode_write_raw(&cursor, &body, "{")
+			encode_write_field(&cursor, &body, &tool_first, "description")
 			encode_write_text(&cursor, &body, tool.Description)
-			encode_write_field(&body, &tool_first, "name")
+			encode_write_field(&cursor, &body, &tool_first, "name")
 			encode_write_text(&cursor, &body, tool.Name)
 			// A tool's parameters are the one part of a request that is JSON inside JSON:
 			// the schema text is read once and the bytes are kept with the request's other
@@ -235,21 +238,28 @@ openai_responses_encode_request_body :: proc(
 			// required, which would make an optional argument mandatory and push the model
 			// into filling it with an empty value. The tool's own schema and the harness's
 			// reading of it are the contract.
-			_ = openai_tool_parameters_write(&cursor, &body, &tool_first, tool.Parameters_JSON, allocator)
-			encode_write_field(&body, &tool_first, "type")
-			encode_write_literal_string(&body, "function")
-			encode_write_raw(&body, "}")
+			if !openai_tool_parameters_write(&cursor, &body, &tool_first, tool.Parameters_JSON, allocator) {
+				encode_finish(&cursor)
+				if cursor.error != .None { return "", cursor.error }
+				return "", .Invalid_Tools
+			}
+			encode_write_field(&cursor, &body, &tool_first, "type")
+			encode_write_literal_string(&cursor, &body, "function")
+			encode_write_raw(&cursor, &body, "}")
 		}
-		encode_write_raw(&body, "]")
+		encode_write_raw(&cursor, &body, "]")
 	}
 	if websocket {
-		encode_write_field(&body, &first, "type")
-		encode_write_literal_string(&body, "response.create")
+		encode_write_field(&cursor, &body, &first, "type")
+		encode_write_literal_string(&cursor, &body, "response.create")
 	}
-	encode_write_raw(&body, "}")
+	encode_write_raw(&cursor, &body, "}")
 	encode_finish(&cursor)
+	if cursor.error != .None { return "", cursor.error }
 	encode_body_store(&cursor, &body)
-	return strings.clone(strings.to_string(body), allocator), .None
+	result, clone_error := strings.clone(strings.to_string(body), allocator)
+	if clone_error != nil { return "", .Allocation }
+	return result, .None
 }
 
 // openai_responses_record_write writes the items one response record replays as, where
@@ -263,30 +273,45 @@ openai_responses_encode_request_body :: proc(
 @(private = "package")
 openai_responses_record_write :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, first: ^bool, record: string, allocator := context.allocator) -> bool {
 	slot, hit := encode_slot_for(cursor, record, .Record)
+	if cursor.error != .None { return false }
 	if slot == nil {
-		scratch := strings.builder_make(allocator)
+		scratch, build_error := strings.builder_make(allocator)
+		if build_error != nil {
+			encode_fail(cursor, .Allocation)
+			return false
+		}
 		defer strings.builder_destroy(&scratch)
-		if !openai_responses_record_bytes(record, &scratch, allocator) { return false }
-		openai_responses_items_write(body, first, strings.to_string(scratch))
-		return true
+		ok, record_error := openai_responses_record_bytes(record, &scratch, allocator)
+		if record_error != .None {
+			if record_error != .Invalid_Message { encode_fail(cursor, record_error) }
+			return false
+		}
+		if !ok { return false }
+		openai_responses_items_write(cursor, body, first, strings.to_string(scratch))
+		return cursor.error == .None
 	}
 	if !hit {
-		slot.ok = openai_responses_record_bytes(record, &slot.bytes, allocator)
-		encode_slot_store(cursor, slot, record)
+		ok, record_error := openai_responses_record_bytes(record, &slot.bytes, allocator)
+		if record_error != .None {
+			if record_error != .Invalid_Message { encode_fail(cursor, record_error) }
+			return false
+		}
+		if !encode_slot_store(cursor, slot, record) { return false }
+		slot.ok = ok
 	}
 	if !slot.ok { return false }
-	openai_responses_items_write(body, first, strings.to_string(slot.bytes))
-	return true
+	openai_responses_items_write(cursor, body, first, strings.to_string(slot.bytes))
+	return cursor.error == .None
 }
 
 // openai_responses_items_write appends written items to the array being built. A record
 // that carries no items adds nothing and takes no separator.
 @(private = "package")
-openai_responses_items_write :: proc(body: ^strings.Builder, first: ^bool, items: string) {
+openai_responses_items_write :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, first: ^bool, items: string) {
 	if items == "" { return }
-	if !first^ { strings.write_byte(body, ',') }
+	if !first^ { encode_write_byte(cursor, body, ',') }
 	first^ = false
-	strings.write_string(body, items)
+	encode_write_raw(cursor, body, items)
 }
 
 // openai_responses_record_bytes writes the items one response record is sent back as: the
@@ -295,33 +320,42 @@ openai_responses_items_write :: proc(body: ^strings.Builder, first: ^bool, items
 // not an array of items the input schema takes back, which is what makes the request that
 // carries it unsendable.
 @(private = "package")
-openai_responses_record_bytes :: proc(record: string, out: ^strings.Builder, allocator: mem.Allocator) -> bool {
+openai_responses_record_bytes :: proc(record: string, out: ^strings.Builder, allocator: mem.Allocator) -> (bool, Provider_Request_Error) {
 	items, parse_err := json.parse_string(record, .JSON, true, allocator)
-	if parse_err != nil { return false }
+	if parse_err != nil { return false, .Invalid_Message }
 	defer json.destroy_value(items, allocator)
 	array, is_array := items.(json.Array)
-	if !is_array { return false }
+	if !is_array { return false, .Invalid_Message }
 	first := true
 	for item in array {
 		replayed, is_object := item.(json.Object)
-		if !is_object || !openai_responses_replay_item_ok(replayed, allocator) { return false }
+		if !is_object || !openai_responses_replay_item_ok(replayed, allocator) { return false, .Invalid_Message }
 		// An output item carries a terminal status; the input-item schema has no such
 		// field, and an endpoint refuses a field it does not know. Everything else
 		// survives, so the record stays replayable.
-		clone := make(json.Object, len(replayed), allocator)
+		clone, clone_error := make(json.Object, len(replayed), allocator)
+		if clone_error != nil { return false, .Allocation }
 		for key, value in replayed {
 			if key == "status" { continue }
-			clone[strings.clone(key, allocator)] = json.Value(json.clone_value(value, allocator))
+			owned_key, key_error := strings.clone(key, allocator)
+			if key_error != nil {
+				json.destroy_value(json.Value(clone), allocator)
+				return false, .Allocation
+			}
+			clone[owned_key] = json.Value(json.clone_value(value, allocator))
 		}
 		text, unparse_err := json.unparse(json.Value(clone), {sort_maps_by_key = true}, allocator)
 		json.destroy_value(json.Value(clone), allocator)
-		if unparse_err != nil { return false }
-		if !first { strings.write_byte(out, ',') }
+		if unparse_err != nil { return false, .Allocation }
+		if !first && strings.write_byte(out, ',') != 1 { delete(text, allocator); return false, .Allocation }
 		first = false
-		strings.write_string(out, text)
+		if strings.write_string(out, text) != len(text) {
+			delete(text, allocator)
+			return false, .Allocation
+		}
 		delete(text, allocator)
 	}
-	return true
+	return true, .None
 }
 
 openai_responses_parse_usage :: proc(object: json.Object) -> (Provider_Usage_Event, bool) {

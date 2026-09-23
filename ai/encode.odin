@@ -87,6 +87,7 @@ Encode_Text_Kind :: enum {
 Encode_Cursor :: struct {
 	cache: ^Provider_Encode_Cache,
 	next:  int,
+	error: Provider_Request_Error,
 }
 
 @(private = "package")
@@ -101,18 +102,33 @@ encode_cursor :: proc(cache: ^Provider_Encode_Cache, allocator := context.alloca
 	return Encode_Cursor{cache = cache}
 }
 
+// encode_fail records the first local encoding failure. The body is never sent after
+// one, so later writes cannot replace the cause with a less useful one.
+@(private = "package")
+encode_fail :: proc(cursor: ^Encode_Cursor, err: Provider_Request_Error) {
+	if cursor.error == .None { cursor.error = err }
+}
+
 // encode_slot_for returns the slot this text is written to and whether it already holds
 // the bytes for it. A slot that holds another text, or the same text written as something
 // else, is released before it is written again. A nil slot means there is no cache: the
-// caller writes the bytes itself.
+// caller writes the bytes itself. An allocation failure also returns nil, with the error
+// recorded on the cursor.
 @(private = "package")
 encode_slot_for :: proc(cursor: ^Encode_Cursor, text: string, kind: Encode_Text_Kind) -> (slot: ^Encode_Slot, hit: bool) {
 	if cursor.cache == nil { return nil, false }
 	allocator := cursor.cache.allocator
 	slots := &cursor.cache.slots
 	if cursor.next >= len(slots) {
-		append(slots, Encode_Slot{})
-		strings.builder_init(&slots[len(slots) - 1].bytes, allocator)
+		if append(slots, Encode_Slot{}) != 1 {
+			encode_fail(cursor, .Allocation)
+			return nil, false
+		}
+		if _, init_error := strings.builder_init(&slots[len(slots) - 1].bytes, allocator); init_error != nil {
+			resize(slots, len(slots) - 1)
+			encode_fail(cursor, .Allocation)
+			return nil, false
+		}
 	}
 	slot = &slots[cursor.next]
 	cursor.next += 1
@@ -129,11 +145,22 @@ encode_slot_for :: proc(cursor: ^Encode_Cursor, text: string, kind: Encode_Text_
 }
 
 // encode_slot_store records the text a slot's bytes were written for. The bytes it
-// holds now answer for that text from here on.
+// holds now answer for that text from here on. A failed text clone invalidates the
+// bytes and prevents a later request from treating a partial slot as a cache hit.
 @(private = "package")
-encode_slot_store :: proc(cursor: ^Encode_Cursor, slot: ^Encode_Slot, text: string) {
-	slot.text = strings.clone(text, cursor.cache.allocator)
+encode_slot_store :: proc(cursor: ^Encode_Cursor, slot: ^Encode_Slot, text: string) -> bool {
+	owned, clone_error := strings.clone(text, cursor.cache.allocator)
+	if clone_error != nil {
+		strings.builder_reset(&slot.bytes)
+		slot.text = ""
+		slot.written = false
+		slot.ok = false
+		encode_fail(cursor, .Allocation)
+		return false
+	}
+	slot.text = owned
 	slot.written = true
+	return true
 }
 
 // encode_finish drops the slots this request did not reach. A request that carries less
@@ -143,17 +170,23 @@ encode_finish :: proc(cursor: ^Encode_Cursor) {
 	if cursor.cache == nil { return }
 	slots := &cursor.cache.slots
 	for i := cursor.next; i < len(slots); i += 1 { encode_slot_destroy(&slots[i], cursor.cache.allocator) }
-	resize(slots, cursor.next)
+	if resize(slots, cursor.next) != nil { encode_fail(cursor, .Allocation) }
 }
 
 // encode_body_make starts one request body. Most of a body is bytes this cache already
 // holds, so the size of the body before it is a close guess at this one's: starting there
 // is one allocation instead of the sequence a builder takes to double its way up.
 @(private = "package")
-encode_body_make :: proc(cursor: ^Encode_Cursor, allocator: mem.Allocator) -> strings.Builder {
+encode_body_make :: proc(cursor: ^Encode_Cursor, allocator: mem.Allocator) -> (strings.Builder, Provider_Request_Error) {
 	hint := cursor.cache == nil ? 0 : cursor.cache.body_bytes
-	if hint <= 0 { return strings.builder_make(allocator) }
-	return strings.builder_make_len_cap(0, hint + hint / ENCODE_BODY_GROWTH_DIVISOR + ENCODE_BODY_GROWTH_FLOOR, allocator)
+	if hint <= 0 {
+		body, build_error := strings.builder_make(allocator)
+		if build_error != nil { return body, .Allocation }
+		return body, .None
+	}
+	body, build_error := strings.builder_make_len_cap(0, hint + hint / ENCODE_BODY_GROWTH_DIVISOR + ENCODE_BODY_GROWTH_FLOOR, allocator)
+	if build_error != nil { return body, .Allocation }
+	return body, .None
 }
 
 // encode_body_store records how large the body just written was. The next body starts from
@@ -186,8 +219,13 @@ Provider_Encode_Cache_Destroy :: proc(cache: ^Provider_Encode_Cache) {
 // number. Text the request carries goes through encode_write_text, so what is reused and
 // what is written is visible where it is written.
 @(private = "package")
-encode_write_raw :: proc(body: ^strings.Builder, text: string) {
-	strings.write_string(body, text)
+encode_write_raw :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: string) {
+	if strings.write_string(body, text) != len(text) { encode_fail(cursor, .Allocation) }
+}
+
+@(private = "package")
+encode_write_byte :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, value: byte) {
+	if strings.write_byte(body, value) != 1 { encode_fail(cursor, .Allocation) }
 }
 
 // encode_write_field starts one field of the object being written, adding the comma the
@@ -195,46 +233,47 @@ encode_write_raw :: proc(body: ^strings.Builder, text: string) {
 // escaped, and they are written in the order the standard library's writer would sort
 // them in: a body is stable across requests and across processes.
 @(private = "package")
-encode_write_field :: proc(body: ^strings.Builder, first: ^bool, name: string) {
-	if !first^ { strings.write_byte(body, ',') }
+encode_write_field :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, first: ^bool, name: string) {
+	if !first^ { encode_write_byte(cursor, body, ',') }
 	first^ = false
-	strings.write_byte(body, '"')
-	strings.write_string(body, name)
-	encode_write_raw(body, "\":")
+	encode_write_byte(cursor, body, '"')
+	encode_write_raw(cursor, body, name)
+	encode_write_raw(cursor, body, "\":")
 }
 
 // encode_write_item starts one element of the array being written, adding the comma the
 // previous element needs.
 @(private = "package")
-encode_write_item :: proc(body: ^strings.Builder, first: ^bool) {
-	if !first^ { strings.write_byte(body, ',') }
+encode_write_item :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, first: ^bool) {
+	if !first^ { encode_write_byte(cursor, body, ',') }
 	first^ = false
 }
 
 // encode_write_literal_string writes a JSON string this package chose, such as a role
 // or a name for a value it decided. Nothing in it needs escaping.
 @(private = "package")
-encode_write_literal_string :: proc(body: ^strings.Builder, text: string) {
-	strings.write_byte(body, '"')
-	strings.write_string(body, text)
-	strings.write_byte(body, '"')
+encode_write_literal_string :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: string) {
+	encode_write_byte(cursor, body, '"')
+	encode_write_raw(cursor, body, text)
+	encode_write_byte(cursor, body, '"')
 }
 
 @(private = "package")
-encode_write_int :: proc(body: ^strings.Builder, value: int) {
-	strings.write_int(body, value)
+encode_write_int :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, value: int) {
+	if strings.write_int(body, value) <= 0 { encode_fail(cursor, .Allocation) }
 }
 
 @(private = "package")
-encode_write_bool :: proc(body: ^strings.Builder, value: bool) {
-	strings.write_string(body, value ? "true" : "false")
+encode_write_bool :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, value: bool) {
+	encode_write_raw(cursor, body, value ? "true" : "false")
 }
 
 // encode_write_quoted writes text as the JSON string it is, with the standard
 // library's own escaping, so the bytes are the ones a parsed value would be written as.
 @(private = "package")
-encode_write_quoted :: proc(builder: ^strings.Builder, text: string) {
-	io.write_quoted_string(strings.to_writer(builder), text, '"', nil, true)
+encode_write_quoted :: proc(cursor: ^Encode_Cursor, builder: ^strings.Builder, text: string) {
+	_, write_error := io.write_quoted_string(strings.to_writer(builder), text, '"', nil, true)
+	if write_error != .None { encode_fail(cursor, .Allocation) }
 }
 
 // encode_write_text writes the JSON string a request's text goes on the wire as,
@@ -243,16 +282,21 @@ encode_write_quoted :: proc(builder: ^strings.Builder, text: string) {
 @(private = "package")
 encode_write_text :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: string) {
 	slot, hit := encode_slot_for(cursor, text, .Literal)
+	if cursor.error != .None { return }
 	if slot == nil {
-		encode_write_quoted(body, text)
+		encode_write_quoted(cursor, body, text)
 		return
 	}
 	if !hit {
-		encode_write_quoted(&slot.bytes, text)
-		slot.ok = true
-		encode_slot_store(cursor, slot, text)
+		encode_write_quoted(cursor, &slot.bytes, text)
+		if cursor.error != .None { return }
+		if encode_slot_store(cursor, slot, text) {
+			slot.ok = true
+		} else {
+			return
+		}
 	}
-	strings.write_string(body, strings.to_string(slot.bytes))
+	encode_write_raw(cursor, body, strings.to_string(slot.bytes))
 }
 
 // encode_write_object writes a text the wire carries as a JSON object and reports whether
@@ -264,20 +308,35 @@ encode_write_text :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: 
 @(private = "package")
 encode_write_object :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: string, allocator: mem.Allocator) -> bool {
 	slot, hit := encode_slot_for(cursor, text, .Parameters)
+	if cursor.error != .None { return false }
 	if slot == nil {
-		scratch := strings.builder_make(allocator)
+		scratch, build_error := strings.builder_make(allocator)
+		if build_error != nil {
+			encode_fail(cursor, .Allocation)
+			return false
+		}
 		defer strings.builder_destroy(&scratch)
-		if !encode_object_bytes(text, &scratch, allocator) { return false }
-		strings.write_string(body, strings.to_string(scratch))
-		return true
+		ok, object_error := encode_object_bytes(text, &scratch, allocator)
+		if object_error != .None {
+			if object_error != .Invalid_Tools { encode_fail(cursor, object_error) }
+			return false
+		}
+		if !ok { return false }
+		encode_write_raw(cursor, body, strings.to_string(scratch))
+		return cursor.error == .None
 	}
 	if !hit {
-		slot.ok = encode_object_bytes(text, &slot.bytes, allocator)
-		encode_slot_store(cursor, slot, text)
+		ok, object_error := encode_object_bytes(text, &slot.bytes, allocator)
+		if object_error != .None {
+			if object_error != .Invalid_Tools { encode_fail(cursor, object_error) }
+			return false
+		}
+		if !encode_slot_store(cursor, slot, text) { return false }
+		slot.ok = ok
 	}
 	if !slot.ok { return false }
-	strings.write_string(body, strings.to_string(slot.bytes))
-	return true
+	encode_write_raw(cursor, body, strings.to_string(slot.bytes))
+	return cursor.error == .None
 }
 
 // encode_object_bytes writes the object a text carries. It is the one place a request's
@@ -285,14 +344,14 @@ encode_write_object :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text
 // sorted so that the same conversation writes the same bytes, in this process and in the
 // next one. Its result is what a slot keeps, so the parse happens once per text.
 @(private = "package")
-encode_object_bytes :: proc(text: string, out: ^strings.Builder, allocator: mem.Allocator) -> bool {
+encode_object_bytes :: proc(text: string, out: ^strings.Builder, allocator: mem.Allocator) -> (bool, Provider_Request_Error) {
 	value, parse_err := json.parse_string(text, .JSON, true, allocator)
-	if parse_err != nil { return false }
+	if parse_err != nil { return false, .Invalid_Tools }
 	defer json.destroy_value(value, allocator)
-	if _, is_object := value.(json.Object); !is_object { return false }
+	if _, is_object := value.(json.Object); !is_object { return false, .Invalid_Tools }
 	rendered, unparse_err := json.unparse(value, {sort_maps_by_key = true}, allocator)
-	if unparse_err != nil { return false }
+	if unparse_err != nil { return false, .Allocation }
 	defer delete(rendered, allocator)
-	strings.write_string(out, rendered)
-	return true
+	if strings.write_string(out, rendered) != len(rendered) { return false, .Allocation }
+	return true, .None
 }
