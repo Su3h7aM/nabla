@@ -24,6 +24,8 @@ provider_operation_error_name :: proc(kind: Provider_Operation_Error_Kind) -> st
 		return "timed_out"
 	case .TLS:
 		return "tls"
+	case .Allocation:
+		return "allocation"
 	}
 	return "unknown"
 }

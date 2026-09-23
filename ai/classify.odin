@@ -180,7 +180,7 @@ Provider_Evidence :: struct {
 // does not know, and a stream defect nobody named all stay Unknown.
 provider_classify_failure :: proc(evidence: Provider_Evidence) -> Provider_Failure_Class {
 	switch evidence.kind {
-	case .Cancelled, .Timed_Out, .Invalid_Request:
+	case .Cancelled, .Timed_Out, .Invalid_Request, .Allocation:
 		return .None
 	case .HTTP, .Transport, .Stream, .TLS, .None:
 	}
@@ -206,7 +206,7 @@ provider_classify_failure :: proc(evidence: Provider_Evidence) -> Provider_Failu
 		return .Unknown
 	case .None:
 		return .Unknown
-	case .Cancelled, .Timed_Out, .Invalid_Request:
+	case .Cancelled, .Timed_Out, .Invalid_Request, .Allocation:
 		return .None
 	}
 	return .Unknown

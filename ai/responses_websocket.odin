@@ -33,7 +33,10 @@ Provider_WebSocket_Session_Open :: proc(
 	if connection.Endpoint == "" {
 		return nil, Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("the provider endpoint is empty", allocator)}
 	}
-	session := new(Provider_WebSocket_Session, allocator)
+	session, alloc_error := new(Provider_WebSocket_Session, allocator)
+	if alloc_error != nil {
+		return nil, Provider_Operation_Error{kind = .Allocation}
+	}
 	session.connection = connection
 	session.allocator = allocator
 	return session, {}

@@ -92,6 +92,8 @@ Provider_Operation_Error_Kind :: enum {
 	Timed_Out,
 	// TLS means the peer did not authenticate; the response was never usable.
 	TLS,
+	// Allocation means the local request state could not be constructed.
+	Allocation,
 }
 
 Provider_Delivery_State :: enum {
