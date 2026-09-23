@@ -60,24 +60,27 @@ Server_State :: enum {
 }
 
 Server :: struct {
-	opts:           Server_Opts,
-	tcp_sock:       net.TCP_Socket,
-	conn_allocator: mem.Allocator,
-	handler:        Handler,
-	threads:        []Server_Thread,
+	opts:              Server_Opts,
+	tcp_sock:          net.TCP_Socket,
+	conn_allocator:    mem.Allocator,
+	handler:           Handler,
+	threads:           []Server_Thread,
 	// Once the server starts closing/shutdown this is set to true, all threads will check it
 	// and start their thread local shutdown procedure.
 	//
 	// NOTE: This is only ever set from false to true, and checked repeatedly,
 	// so it doesn't have to be atomic, this is purely to keep the thread sanitizer happy.
-	closing:        Atomic(bool),
+	closing:           Atomic(bool),
+	// interrupt_pending is the only state a signal handler writes. Server threads
+	// observe it and perform the shutdown work in ordinary thread context.
+	interrupt_pending: bool,
 	// Threads will decrement the wait group when they have fully closed/shutdown.
 	// The main thread waits on this to clean up global data and return.
-	threads_closed: sync.Wait_Group,
+	threads_closed:    sync.Wait_Group,
 
 	// Updated every second with an updated date, this speeds up the server considerably
 	// because it would otherwise need to call time.now() and format the date on each response.
-	date:           Server_Date,
+	date:              Server_Date,
 }
 
 Server_Thread :: struct {
@@ -183,6 +186,7 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 	log.debug("starting event loop")
 	td.state = .Serving
 	for {
+		if sync.atomic_load(&s.interrupt_pending) { server_shutdown(s) }
 		if atomic_load(&s.closing) { _server_thread_shutdown(s) }
 		if td.state == .Closed { break }
 		if td.state == .Cleaning { continue }
@@ -280,28 +284,19 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 
 @(private)
 on_interrupt_server: ^Server
-@(private)
-on_interrupt_context: runtime.Context
 
-// Registers a signal handler to shutdown the server gracefully on interrupt signal.
-// Can only be called once in the lifetime of the program because of a hacky interaction with libc.
+// Registers a signal handler to request a graceful shutdown. The callback only
+// publishes an atomic bit; a server thread performs the actual shutdown in normal
+// thread context. Can only be called once in the lifetime of the program because
+// of the libc signal-restorer interaction.
 server_shutdown_on_interrupt :: proc(s: ^Server) {
 	on_interrupt_server = s
-	on_interrupt_context = context
 
-	libc.signal(
-		libc.SIGINT,
-		proc "cdecl" (_: i32) {
-			context = on_interrupt_context
-
-			// Force close on second signal.
-			if td.state == .Closing {
-				os.exit(1)
-			}
-
-			server_shutdown(on_interrupt_server)
-		},
-	)
+	libc.signal(libc.SIGINT, proc "cdecl" (_: i32) {
+		if on_interrupt_server != nil {
+			sync.atomic_store(&on_interrupt_server.interrupt_pending, true)
+		}
+	})
 }
 
 // Taken from Go's implementation,
