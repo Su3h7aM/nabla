@@ -377,12 +377,13 @@ Tool_Content :: struct($T: typeid) {
 // Tool_Result is one finished call. content is the envelope the model reads, and
 // it is exactly what the session stores.
 Tool_Result :: struct {
-	call_id:   string,
-	outcome:   session.Tool_Outcome,
-	reason:    string, // short line for the front-end
-	content:   string, // the JSON envelope
-	error:     Tool_Argument_Error, // set only when the outcome is .Invalid_Arguments
-	allocator: mem.Allocator,
+	call_id:           string,
+	outcome:           session.Tool_Outcome,
+	reason:            string, // short line for the front-end
+	content:           string, // the JSON envelope
+	error:             Tool_Argument_Error, // set only when the outcome is .Invalid_Arguments
+	allocation_failed: bool,
+	allocator:         mem.Allocator,
 }
 
 tool_result_destroy :: proc(result: ^Tool_Result) {
@@ -397,13 +398,25 @@ tool_result_destroy :: proc(result: ^Tool_Result) {
 // tool_result_of builds a result from a tool's own data.
 // reason is a short line for the front-end; the model reads the envelope.
 tool_result_of :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, message: string, data: $T, reason := "") -> Tool_Result {
-	return Tool_Result {
-		call_id = strings.clone(ctx.call_id, ctx.allocator),
-		outcome = outcome,
-		reason = strings.clone(reason, ctx.allocator),
-		content = tool_content_json(outcome, message, data, ctx.allocator),
+	result := Tool_Result {
+		outcome   = outcome,
 		allocator = ctx.allocator,
 	}
+	call_id, call_error := strings.clone(ctx.call_id, ctx.allocator)
+	if call_error != nil {
+		result.allocation_failed = true
+	} else {
+		result.call_id = call_id
+	}
+	reason_text, reason_error := strings.clone(reason, ctx.allocator)
+	if reason_error != nil {
+		result.allocation_failed = true
+	} else {
+		result.reason = reason_text
+	}
+	result.content = tool_content_json(outcome, message, data, ctx.allocator)
+	if result.content == "" { result.allocation_failed = true }
+	return result
 }
 
 tool_result_success :: proc(ctx: ^Tool_Context, data: $T, reason := "") -> Tool_Result {
@@ -450,11 +463,13 @@ tool_content_json :: proc(outcome: session.Tool_Outcome, message: string, data: 
 // failure (or the reverse) would rewrite what happened.
 tool_result_finalize :: proc(ctx: ^Tool_Context, result: Tool_Result) -> Tool_Result {
 	finalized := result
+	if finalized.allocation_failed { return finalized }
 	if tool_result_valid(finalized.outcome, finalized.content) { return finalized }
 	message := TOOL_RESULT_REPLACED_MALFORMED
 	if len(finalized.content) > TOOL_MAX_RESULT_BYTES { message = TOOL_RESULT_REPLACED_OVERSIZED }
 	delete(finalized.content, ctx.allocator)
 	finalized.content = tool_content_json(finalized.outcome, message, Tool_Empty{}, ctx.allocator)
+	if finalized.content == "" { finalized.allocation_failed = true }
 	return finalized
 }
 

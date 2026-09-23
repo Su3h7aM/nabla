@@ -135,11 +135,12 @@ Tool_Arguments_Status :: enum {
 // value owns the parsed object, effective owns the bytes the call runs with, and
 // error owns the refusal when the status is Rejected.
 Tool_Arguments :: struct {
-	status:    Tool_Arguments_Status,
-	value:     json.Value,
-	effective: string,
-	repair:    session.Tool_Repair,
-	error:     Tool_Argument_Error,
+	status:            Tool_Arguments_Status,
+	value:             json.Value,
+	effective:         string,
+	repair:            session.Tool_Repair,
+	error:             Tool_Argument_Error,
+	allocation_failed: bool,
 }
 
 tool_arguments_destroy :: proc(arguments: ^Tool_Arguments, allocator := context.allocator) {
@@ -167,9 +168,15 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 	if admit_error.kind == .None {
 		value, parse_err := json.parse_string(raw, .JSON, true, allocator)
 		if parse_err == nil {
+			effective, clone_err := strings.clone(raw, allocator)
+			if clone_err != nil {
+				json.destroy_value(value, allocator)
+				arguments.allocation_failed = true
+				return
+			}
 			arguments.status = .Valid
 			arguments.value = value
-			arguments.effective = strings.clone(raw, allocator)
+			arguments.effective = effective
 			return
 		}
 		// Admission guarantees the parser accepts the document, so this is

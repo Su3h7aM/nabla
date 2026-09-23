@@ -455,6 +455,12 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	}
 	log_emit({level = .Debug, category = .Tool, event = "tool.arguments_prepared", fields = prepared[:]})
 
+	if job.arguments.allocation_failed {
+		job.result = tool_result_failure(&job.exec, .Tool_Failed, "the tool arguments could not be allocated", "allocation failed")
+		job.result_present = true
+		job.phase = .Result_Ready
+		return
+	}
 	if job.arguments.status == .Rejected {
 		job.result = tool_result_refused(&job.exec, &job.arguments.error)
 		job.result_present = true
@@ -784,8 +790,12 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 	message := fmt.tprintf("the tool did not stop within %v of its stop being requested; its outcome is unknown", TOOL_JOBS_STOP_PATIENCE)
 	finalized := tool_result_finalize(&job.exec, tool_result_failure(&job.exec, .Unknown, message, "did not stop"))
 	spilled := false
-	if !job.nested { spilled = !tool_budget_take(&jobs.budget, finalized.content) }
-	result_seq, recorded := chat_record_tool_result(chat, job.call, &finalized, spilled)
+	result_seq: session.Seq
+	recorded := false
+	if !finalized.allocation_failed {
+		if !job.nested { spilled = !tool_budget_take(&jobs.budget, finalized.content) }
+		result_seq, recorded = chat_record_tool_result(chat, job.call, &finalized, spilled)
+	}
 
 	// From here the worker owns this job: it releases everything the job holds when it
 	// returns, which is what keeps a call that ignores its stop from leaking its storage.
@@ -811,7 +821,7 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 		{key = "waited_ms", value = i64(waited / time.Millisecond)},
 	}
 	log_emit({level = .Error, category = .Tool, event = "tool.job_stuck", fields = fields[:]})
-	_observer_tool_result(observer, job.name, &finalized)
+	if recorded { _observer_tool_result(observer, job.name, &finalized) }
 	sync.mutex_unlock(&job.mu)
 	tool_result_destroy(&finalized)
 	if !recorded {
@@ -849,6 +859,12 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	job.result = {}
 	job.result_present = false
 	finalized := tool_result_finalize(&job.exec, result)
+	if finalized.allocation_failed {
+		tool_result_destroy(&finalized)
+		job.phase = .Retiring
+		if jobs.stop == .None { jobs.stop = .Storage_Failed }
+		return
+	}
 	// The budget decides whether the model is shown this result or a handle for it.
 	// The decision is made once, here, and stored: a request built later sends the
 	// same bytes however much the context has grown by then.
