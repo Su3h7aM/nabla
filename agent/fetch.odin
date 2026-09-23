@@ -16,16 +16,19 @@ import "nabla:http/client"
 Fetch_Body :: struct {
 	bytes:    [dynamic]u8,
 	overflow: bool,
+	failed:   bool,
 	limit:    int,
 }
 
 fetch_collect :: proc(user_data: rawptr, chunk: []u8) {
 	body := cast(^Fetch_Body)user_data
+	if body.failed { return }
 	if len(body.bytes) + len(chunk) > body.limit {
 		body.overflow = true
 		return
 	}
-	append(&body.bytes, ..chunk)
+	written := append(&body.bytes, ..chunk)
+	if written != len(chunk) { body.failed = true }
 }
 
 // fetch_body_finish hands the accumulated body to the caller as an exactly-sized
@@ -34,8 +37,9 @@ fetch_collect :: proc(user_data: rawptr, chunk: []u8) {
 // allocation could not be freed correctly.
 fetch_body_finish :: proc(body: ^Fetch_Body, allocator: mem.Allocator) -> ([]u8, bool) {
 	defer delete(body.bytes)
-	if body.overflow || len(body.bytes) == 0 { return nil, false }
-	result := make([]u8, len(body.bytes), allocator)
+	if body.failed || body.overflow || len(body.bytes) == 0 { return nil, false }
+	result, alloc_err := make([]u8, len(body.bytes), allocator)
+	if alloc_err != nil { return nil, false }
 	copy(result, body.bytes[:])
 	return result, true
 }
