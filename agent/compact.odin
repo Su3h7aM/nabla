@@ -941,7 +941,7 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 				{key = "reason", value = request_recovery_reason_name(decision.reason)},
 				{key = "error_kind", value = ai.provider_operation_error_name(job.operation.kind)},
 				{key = "failure_class", value = ai.provider_failure_class_name(job.operation.failure_class)},
-				{key = "delay_ms", value = log_duration_ms(decision.delay)},
+				{key = "delay_ms", value = Log_Duration_Milliseconds(decision.delay)},
 			}
 			log_emit({level = .Warning, category = .Provider, event = "compaction.retry_scheduled", fields = fields[:]})
 			_observer_message(observer, .Notice, "the summary did not complete; it will be sent again")
@@ -976,7 +976,7 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 		{key = "head_estimate", value = i64(job.snapshot.head_estimate)},
 		{key = "input_tokens", value = log_optional_i64(job.usage.input)},
 		{key = "output_tokens", value = log_optional_i64(job.usage.output)},
-		{key = "elapsed_ms", value = log_duration_ms(time.tick_since(job.started_at))},
+		{key = "elapsed_ms", value = Log_Duration_Milliseconds(time.tick_since(job.started_at))},
 	}
 	log_emit({level = .Info, category = .Provider, event = "compaction.finished", fields = fields[:]})
 	_observer_message(observer, .Notice, "background compaction finished; the summary is installed when the context reaches the size it was started for")

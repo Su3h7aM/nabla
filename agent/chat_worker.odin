@@ -119,7 +119,7 @@ chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attemp
 		// one are different facts.
 		{key = "declared_body_bytes_present", value = declared_body_bytes_present},
 		{key = "declared_body_bytes", value = declared_body_bytes},
-		{key = "elapsed_ms", value = log_duration_ms(time.tick_since(at))},
+		{key = "elapsed_ms", value = Log_Duration_Milliseconds(time.tick_since(at))},
 	}
 	log_emit({level = .Info, category = .Provider, event = "attempt.finished", fields = finished[:]})
 	return {error = operation_error, finish_reason = runtime.finish_reason}

@@ -270,7 +270,7 @@ app_tools_refresh :: proc(app: ^App) -> string {
 			{key = "rejected", value = i64(rejected)},
 			{key = "unavailable_servers", value = i64(unavailable)},
 			{key = "installed", value = installed},
-			{key = "elapsed_ms", value = agent.log_duration_ms(time.tick_since(started))},
+			{key = "elapsed_ms", value = agent.Log_Duration_Milliseconds(time.tick_since(started))},
 		}
 		agent.log_emit({level = .Info, category = .Tool, event = "tools.refresh_finished", fields = fields[:]})
 	}

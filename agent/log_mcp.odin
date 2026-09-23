@@ -32,7 +32,7 @@ log_mcp_exchange_finished :: proc(
 		{key = "delivery", value = delivery_name},
 		{key = "error_kind", value = log_mcp_error_name(exchange_error.kind)},
 		{key = "outcome", value = session.tool_outcome_name(outcome)},
-		{key = "elapsed_ms", value = log_duration_ms(elapsed)},
+		{key = "elapsed_ms", value = Log_Duration_Milliseconds(elapsed)},
 		{key = "remote_code", value = exchange_error.code},
 	}
 	log_emit({level = .Info, category = .MCP, event = "mcp.exchange_finished", fields = fields[:]})

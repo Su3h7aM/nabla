@@ -574,7 +574,7 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 		{key = "error_kind", value = ai.provider_operation_error_name(chain.operation_error.kind)},
 		{key = "failure_class", value = ai.provider_failure_class_name(chain.operation_error.failure_class)},
 		{key = "next_attempt", value = i64(chain.attempts + 1)},
-		{key = "delay_ms", value = log_duration_ms(chain.decision.delay)},
+		{key = "delay_ms", value = Log_Duration_Milliseconds(chain.decision.delay)},
 	}
 	log_emit({level = .Warning, category = .Provider, event = "request.retry_scheduled", fields = retry[:]})
 	chain.stage = .Backoff

@@ -176,9 +176,9 @@ log_correlation_for_call :: proc(chat: ^Chat_Session, call_id: string) -> Log_Co
 	return correlation
 }
 
-// log_duration_ms is a duration in whole milliseconds, which is the unit every
+// Log_Duration_Milliseconds is a duration in whole milliseconds, which is the unit every
 // numeric duration in a record uses.
-log_duration_ms :: proc(duration: time.Duration) -> i64 {
+Log_Duration_Milliseconds :: proc(duration: time.Duration) -> i64 {
 	return time.duration_nanoseconds(duration) / 1_000_000
 }
 

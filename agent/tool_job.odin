@@ -554,7 +554,7 @@ tool_jobs_note_stops :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 		if !tool_control_cancelled(job.exec.control) { continue }
 		job.stopping = true
 		job.stop_at = now
-		fields := [2]Log_Field{{key = "tool", value = job.name}, {key = "patience_ms", value = log_duration_ms(TOOL_JOBS_STOP_PATIENCE)}}
+		fields := [2]Log_Field{{key = "tool", value = job.name}, {key = "patience_ms", value = Log_Duration_Milliseconds(TOOL_JOBS_STOP_PATIENCE)}}
 		log_emit({level = .Warning, category = .Tool, event = "tool.stop_requested", fields = fields[:]})
 	}
 }

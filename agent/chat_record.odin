@@ -394,10 +394,10 @@ chat_request_error_json :: proc(result: Chat_Send_Result) -> (string, Chat_Recor
 		text_exposed        = result.text_exposed,
 		completion_accepted = result.completion_accepted,
 		recovery            = request_recovery_reason_name(result.recovery),
-		delay_ms            = log_duration_ms(result.delay),
+		delay_ms            = Log_Duration_Milliseconds(result.delay),
 		message             = ai.provider_bounded_text(error.detail, CHAT_ERROR_DETAIL_MAX_BYTES, context.temp_allocator),
 	}
-	if delay, present := error.retry_after.?; present { record.retry_after_ms = log_duration_ms(delay) }
+	if delay, present := error.retry_after.?; present { record.retry_after_ms = Log_Duration_Milliseconds(delay) }
 	data, marshal_err := json.marshal(record, allocator = context.temp_allocator)
 	if marshal_err != nil { return "", .Encode }
 	return string(data), .None

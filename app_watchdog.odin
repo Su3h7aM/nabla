@@ -194,7 +194,7 @@ watchdog_worker :: proc(handle: ^thread.Thread) {
 // agree to within one poll.
 watchdog_report :: proc(watchdog: ^Watchdog, silent: time.Duration) {
 	fields := [6]agent.Log_Field {
-		{key = "silent_ms", value = duration_ms(silent)},
+		{key = "silent_ms", value = agent.Log_Duration_Milliseconds(silent)},
 		{key = "stage", value = ui_stage_names[Ui_Stage(sync.atomic_load(&watchdog.stage))]},
 		{key = "turn_running", value = sync.atomic_load(&watchdog.busy)},
 		{key = "viewport_ok", value = sync.atomic_load(&watchdog.viewport_ok)},
@@ -208,7 +208,7 @@ watchdog_report :: proc(watchdog: ^Watchdog, silent: time.Duration) {
 // watchdog_report_resumed closes a stall with how long it lasted, which is what separates a
 // loop that was slow from one that was stuck.
 watchdog_report_resumed :: proc(watchdog: ^Watchdog, stalled: time.Duration) {
-	fields := [1]agent.Log_Field{{key = "stalled_ms", value = duration_ms(stalled)}}
+	fields := [1]agent.Log_Field{{key = "stalled_ms", value = agent.Log_Duration_Milliseconds(stalled)}}
 	agent.log_emit(agent.Log_Record{level = .Info, category = .Runtime, event = "ui.resumed", fields = fields[:]})
 }
 

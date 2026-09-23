@@ -28,15 +28,10 @@ join_retiring :: proc(worker: ^thread.Thread, name: string, patience := SHUTDOWN
 		time.sleep(SHUTDOWN_JOIN_POLL)
 	}
 	if !thread.is_done(worker) {
-		fields := [2]agent.Log_Field{{key = "thread", value = name}, {key = "waited_ms", value = duration_ms(patience)}}
+		fields := [2]agent.Log_Field{{key = "thread", value = name}, {key = "waited_ms", value = agent.Log_Duration_Milliseconds(patience)}}
 		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.thread_unretired", fields = fields[:]})
 		return false
 	}
 	thread.destroy(worker)
 	return true
-}
-
-// duration_ms is a duration as the whole milliseconds a record carries.
-duration_ms :: proc(d: time.Duration) -> i64 {
-	return i64(d / time.Millisecond)
 }
