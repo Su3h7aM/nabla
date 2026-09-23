@@ -80,3 +80,18 @@ test_version_parse :: proc(t: ^testing.T) {
 		testing.expectf(t, !malformed, "%q was accepted as a version", text)
 	}
 }
+
+@(test)
+test_content_length_parse_requires_decimal_digits :: proc(t: ^testing.T) {
+	size, ok := content_length_parse("42")
+	testing.expect(t, ok)
+	testing.expect_value(t, size, 42)
+
+	// A sign or surrounding whitespace is not part of the field grammar. An
+	// unrepresentable value must be refused before it becomes a byte count.
+	for text in ([]string{"", "-1", "+1", " 1", "1 ", "1x", "999999999999999999999999999999999999999999"}) {
+		value, valid := content_length_parse(text)
+		testing.expectf(t, !valid, "%q was accepted as a Content-Length", text)
+		testing.expect_value(t, value, 0)
+	}
+}

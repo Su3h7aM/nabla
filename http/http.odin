@@ -118,6 +118,24 @@ trim_ows :: proc(s: string) -> string {
 	return s[start:end]
 }
 
+// content_length_parse reads a Content-Length as RFC 9112 6.3 defines it:
+// one or more decimal digits. A sign, whitespace, or an empty value is invalid
+// framing rather than a negative or padded body size. The arithmetic is checked
+// before multiplying so an unrepresentable value cannot become a truncated
+// count.
+content_length_parse :: proc(value: string) -> (size: int, ok: bool) {
+	(len(value) > 0) or_return
+	size = 0
+	for character in value {
+		if character < '0' || character > '9' { return 0, false }
+		digit := int(character - '0')
+		if size > (max(int) - digit) / 10 { return 0, false }
+		size = size * 10 + digit
+	}
+	ok = true
+	return
+}
+
 // chunk_size_parse reads a chunk-size as RFC 9112 7.1 defines it: one or more
 // hexadecimal digits. A general number parser is the wrong tool here: it reads
 // a sign prefix the grammar does not admit, so "+5" would parse as a size.

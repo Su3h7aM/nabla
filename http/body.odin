@@ -4,7 +4,6 @@ import "core:bufio"
 import "core:io"
 import "core:log"
 import "core:net"
-import "core:strconv"
 import "core:strings"
 
 Body :: string
@@ -140,7 +139,7 @@ _body_length :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb:
 		return
 	}
 
-	ilen, lenok := strconv.parse_int(len, 10)
+	ilen, lenok := content_length_parse(len)
 	if !lenok {
 		cb(user_data, "", .Bad_Read_Count)
 		return
