@@ -111,6 +111,7 @@ test_a_turn_records_its_start_and_end :: proc(t: ^testing.T) {
 
 @(test)
 test_a_superseded_operation_is_recorded :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	fixture: Log_Chat_Test
 	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t), .Debug)
 	defer log_chat_end(t, &fixture)
@@ -141,6 +142,7 @@ test_a_superseded_operation_is_recorded :: proc(t: ^testing.T) {
 
 @(test)
 test_a_tool_call_is_recorded_from_call_to_result :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	fixture: Log_Chat_Test
 	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t), .Debug)
 	defer log_chat_end(t, &fixture)

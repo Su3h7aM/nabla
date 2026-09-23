@@ -50,6 +50,7 @@ test_a_turn_outcome_that_cannot_be_recorded_latches_the_session :: proc(t: ^test
 // state never reaches a status its caller can see.
 @(test)
 test_a_released_chain_retires_the_operation_it_began :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
 	defer chat_cancel_reset()
 
 	fixture: Chat_Test
