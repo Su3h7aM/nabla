@@ -256,17 +256,36 @@ tool_append_bounded :: proc(kept: ^string, truncated: ^bool, chunk: []u8, limit:
 // tool_terminate_group asks the whole tree to stop, escalates to SIGKILL once
 // the grace period expires, and reaps the direct child. A process that ignores
 // SIGTERM is why the escalation exists; descendants are why the group does.
+tool_terminate_direct_child :: proc(child: ^Tool_Child) {
+	if child.pid <= 0 || child.reaped { return }
+	_ = linux.kill(linux.Pid(child.pid), .SIGTERM)
+	grace := time.tick_add(time.tick_now(), TOOL_KILL_GRACE)
+	for time.tick_since(grace) < 0 {
+		if tool_child_poll(child) { return }
+		time.sleep(5 * time.Millisecond)
+	}
+	_ = linux.kill(linux.Pid(child.pid), .SIGKILL)
+	_, _, _ = tool_child_reap(child)
+}
+
 tool_terminate_group :: proc(child: ^Tool_Child) {
 	if child.pid <= 0 { return }
+	if tool_group_gone(child.pid) {
+		tool_terminate_direct_child(child)
+		return
+	}
 	tool_signal_group(child.pid, false)
 	grace := time.tick_add(time.tick_now(), TOOL_KILL_GRACE)
 	for time.tick_since(grace) < 0 {
 		_ = tool_child_poll(child)
-		if tool_group_gone(child.pid) { return }
+		if tool_group_gone(child.pid) {
+			tool_terminate_direct_child(child)
+			return
+		}
 		time.sleep(5 * time.Millisecond)
 	}
 	tool_signal_group(child.pid, true)
-	tool_child_reap(child)
+	tool_terminate_direct_child(child)
 }
 
 tool_group_gone :: proc(pid: int) -> bool {

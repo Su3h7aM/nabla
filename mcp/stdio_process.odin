@@ -195,21 +195,39 @@ stdio_child_reap :: proc(child: ^Stdio_Child) {
 	child.status = status
 }
 
+stdio_terminate_direct_child :: proc(child: ^Stdio_Child) {
+	if child.pid <= 0 || child.reaped { return }
+	_ = linux.kill(linux.Pid(child.pid), .SIGTERM)
+	grace := time.tick_add(time.tick_now(), STDIO_KILL_GRACE)
+	for time.tick_since(grace) < 0 {
+		if stdio_child_poll(child) { return }
+		time.sleep(5 * time.Millisecond)
+	}
+	_ = linux.kill(linux.Pid(child.pid), .SIGKILL)
+	stdio_child_reap(child)
+}
+
 // stdio_terminate_group asks the whole tree to stop, escalates to SIGKILL once the
 // grace period expires, and reaps the direct child. A server that ignores SIGTERM
 // is why the escalation exists; the server's own children are why the group does.
 stdio_terminate_group :: proc(child: ^Stdio_Child) {
 	if child.pid <= 0 { return }
-	if stdio_group_gone(child.pid) { return }
+	if stdio_group_gone(child.pid) {
+		stdio_terminate_direct_child(child)
+		return
+	}
 	stdio_signal_group(child.pid, false)
 	grace := time.tick_add(time.tick_now(), STDIO_KILL_GRACE)
 	for time.tick_since(grace) < 0 {
 		_ = stdio_child_poll(child)
-		if stdio_group_gone(child.pid) { return }
+		if stdio_group_gone(child.pid) {
+			stdio_terminate_direct_child(child)
+			return
+		}
 		time.sleep(5 * time.Millisecond)
 	}
 	stdio_signal_group(child.pid, true)
-	stdio_child_reap(child)
+	stdio_terminate_direct_child(child)
 }
 
 @(private)
