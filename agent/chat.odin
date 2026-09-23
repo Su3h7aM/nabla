@@ -78,9 +78,9 @@ chat_request_transport :: proc(
 	// before a request row exists rather than being recorded as a send that did not happen.
 	encode_err: ai.Provider_Operation_Error
 	if websocket_request {
-		encoded, encode_err = ai.Provider_Request_Freeze_WebSocket(prep.request, chat.allocator)
+		encoded, encode_err = ai.Provider_Request_Freeze_WebSocket_Reusing(prep.request, &chat.encode_cache, chat.allocator)
 	} else {
-		encoded, encode_err = ai.Provider_Request_Freeze(prep.request, chat.allocator)
+		encoded, encode_err = ai.Provider_Request_Freeze_Reusing(prep.request, &chat.encode_cache, chat.allocator)
 	}
 	if encode_err.kind != .None {
 		chat_session_fail_turn(chat, encode_err.detail)
@@ -111,7 +111,7 @@ chat_request_transport :: proc(
 			chat.websocket_fallback_http = true
 			websocket_request = false
 			delete(encoded.Body, chat.allocator)
-			encoded, encode_err = ai.Provider_Request_Freeze(prep.request, chat.allocator)
+			encoded, encode_err = ai.Provider_Request_Freeze_Reusing(prep.request, &chat.encode_cache, chat.allocator)
 			if encode_err.kind != .None {
 				chat_session_fail_turn(chat, encode_err.detail)
 				ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)

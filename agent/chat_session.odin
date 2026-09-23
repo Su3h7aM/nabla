@@ -151,6 +151,11 @@ Chat_Session :: struct {
 	provider_transport:           Provider_Transport,
 	provider_websocket:           ^ai.Provider_WebSocket_Session,
 	websocket_fallback_http:      bool,
+	// encode_cache is what this session's own requests already wrote, kept so each
+	// request writes only what changed since the one before it. One cache is walked by
+	// one encode at a time: the requests of a turn are encoded by its thread, while the
+	// background compaction encodes its own request with no cache at all.
+	encode_cache:                 ai.Provider_Encode_Cache,
 	tools_enabled:                bool, // frozen for the session's life
 	// capacity is the resolved model's context budget, copied from the catalog when
 	// the model was selected. It is the only thing that answers how much a request
@@ -282,6 +287,7 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	// it is stopped before anything the session owns is released.
 	chat_compact_destroy(chat)
 	chat_chain_release(chat)
+	ai.Provider_Encode_Cache_Destroy(&chat.encode_cache)
 	if chat.provider_websocket != nil {
 		ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
 		chat.provider_websocket = nil

@@ -497,11 +497,28 @@ Provider_Stream_Error :: enum {
 }
 
 Provider_Encode_Request :: proc(request: Provider_Request, allocator := context.allocator) -> (string, Provider_Request_Error) {
+	return Provider_Encode_Request_Reusing(request, nil, allocator)
+}
+
+// Provider_Encode_Request_Reusing encodes a request, reusing what cache already holds for
+// the texts this request carries again. A nil cache encodes every byte now.
+//
+// Reuse never changes what is sent: bytes are written from the cache only for the text
+// they were written for. The Anthropic adapter encodes in full, because it does not
+// reuse yet.
+Provider_Encode_Request_Reusing :: proc(
+	request: Provider_Request,
+	cache: ^Provider_Encode_Cache,
+	allocator := context.allocator,
+) -> (
+	string,
+	Provider_Request_Error,
+) {
 	switch request.API {
 	case .OpenAI_Chat_Completions:
-		return openai_chat_encode_request(request, allocator)
+		return openai_chat_encode_request(request, cache, allocator)
 	case .OpenAI_Responses:
-		return openai_responses_encode_request(request, allocator)
+		return openai_responses_encode_request(request, cache, allocator)
 	case .Anthropic_Messages:
 		return anthropic_encode_request(request, allocator)
 	case .Invalid:

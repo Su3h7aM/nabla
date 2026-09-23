@@ -52,10 +52,24 @@ Provider_WebSocket_Session_Destroy :: proc(session: ^Provider_WebSocket_Session)
 // Provider_Request_Freeze_WebSocket encodes one full-context Responses request for
 // a WebSocket session. The returned body is owned by allocator.
 Provider_Request_Freeze_WebSocket :: proc(request: Provider_Request, allocator := context.allocator) -> (Provider_Encoded_Request, Provider_Operation_Error) {
+	return Provider_Request_Freeze_WebSocket_Reusing(request, nil, allocator)
+}
+
+// Provider_Request_Freeze_WebSocket_Reusing freezes a WebSocket request, reusing what
+// cache already holds for the texts the request carries again. A nil cache encodes every
+// byte now.
+Provider_Request_Freeze_WebSocket_Reusing :: proc(
+	request: Provider_Request,
+	cache: ^Provider_Encode_Cache,
+	allocator := context.allocator,
+) -> (
+	Provider_Encoded_Request,
+	Provider_Operation_Error,
+) {
 	if request.API != .OpenAI_Responses {
 		return {}, Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("WebSocket transport is available only for the Responses API", allocator)}
 	}
-	body, encode_err := openai_responses_encode_websocket_request(request, allocator)
+	body, encode_err := openai_responses_encode_websocket_request(request, cache, allocator)
 	if encode_err != .None {
 		return {}, Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(encode_err), allocator)}
 	}

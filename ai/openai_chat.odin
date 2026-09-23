@@ -3,116 +3,183 @@ package ai
 import "core:encoding/json"
 import "core:strings"
 
-openai_chat_tool_def :: proc(tool: Provider_Tool_Def, allocator := context.allocator) -> (json.Value, bool) {
-	schema, parse_err := json.parse_string(tool.Parameters_JSON, .JSON, true, allocator)
-	if parse_err != nil { return nil, false }
-	defer json.destroy_value(schema, allocator)
-	if _, is_object := schema.(json.Object); !is_object { return nil, false }
-	function := make(json.Object, 3, allocator)
-	function[strings.clone("name", allocator)] = json.String(strings.clone(tool.Name, allocator))
-	function[strings.clone("description", allocator)] = json.String(strings.clone(tool.Description, allocator))
-	function[strings.clone("parameters", allocator)] = json.Value(json.clone_value(schema, allocator))
-	definition := make(json.Object, 2, allocator)
-	definition[strings.clone("type", allocator)] = json.String(strings.clone("function", allocator))
-	definition[strings.clone("function", allocator)] = json.Value(function)
-	return json.Value(definition), true
-}
-
-openai_chat_encode_request :: proc(request: Provider_Request, allocator := context.allocator) -> (string, Provider_Request_Error) {
+// openai_chat_encode_request writes one Chat Completions request body. A body is
+// bytes: each string the request carries is written through its slot in the cache, so
+// the part of the conversation that did not change since the last request is copied
+// rather than written again.
+openai_chat_encode_request :: proc(
+	request: Provider_Request,
+	cache: ^Provider_Encode_Cache,
+	allocator := context.allocator,
+) -> (
+	string,
+	Provider_Request_Error,
+) {
 	if err := Provider_Validate_Request(request); err != .None { return "", err }
-	object := make(json.Object, 8, allocator)
-	object[strings.clone("model", allocator)] = json.String(strings.clone(request.Model, allocator))
-	// Chat Completions has no instruction field, so the lane becomes the leading
-	// message it does understand. It is emitted here rather than carried in
-	// request.Messages, because an instruction is not a conversation turn.
-	capacity := len(request.Messages) + (1 if request.Instructions_Present else 0)
-	messages := make(json.Array, 0, capacity, allocator)
+	cursor := encode_cursor(cache, allocator)
+	body := strings.builder_make(allocator)
+	defer strings.builder_destroy(&body)
+
+	// Fields are written in the order the standard library's writer sorts them in, so a
+	// body is the bytes a parsed request would be written as, and the same conversation
+	// writes the same bytes in any process.
+	first := true
+	encode_write_raw(&body, "{")
+	if request.Max_Output_Tokens_Present {
+		// The output bound is sent in the field every current model accepts. The older
+		// `max_tokens` spelling is deprecated and is rejected outright by the reasoning
+		// models, so there is no model for which it is the right choice.
+		encode_write_field(&body, &first, "max_completion_tokens")
+		encode_write_int(&body, request.Max_Output_Tokens)
+	}
+	encode_write_field(&body, &first, "messages")
+	encode_write_raw(&body, "[")
+	item_first := true
 	if request.Instructions_Present {
-		instructions := make(json.Object, 2, allocator)
-		instructions[strings.clone("role", allocator)] = json.String(strings.clone("system", allocator))
-		instructions[strings.clone("content", allocator)] = json.String(strings.clone(request.Instructions, allocator))
-		append(&messages, json.Value(instructions))
+		// Chat Completions has no instruction field, so the lane becomes the leading
+		// message it does understand. It is emitted here rather than carried in
+		// request.Messages, because an instruction is not a conversation turn.
+		if !item_first { strings.write_byte(&body, ',') }
+		item_first = false
+		field_first := true
+		encode_write_raw(&body, "{")
+		encode_write_field(&body, &field_first, "content")
+		encode_write_text(&cursor, &body, request.Instructions)
+		encode_write_field(&body, &field_first, "role")
+		encode_write_literal_string(&body, "system")
+		encode_write_raw(&body, "}")
 	}
 	for message in request.Messages {
 		// Chat Completions has no reasoning input; reasoning continuity is
 		// a Responses replay contract, so these items are dropped here.
 		if message.Role == .Reasoning { continue }
-		item := make(json.Object, 4, allocator)
-		item[strings.clone("role", allocator)] = json.String(strings.clone(openai_role_name(message.Role), allocator))
-		if message.Role == .Assistant && len(message.Tool_Calls) > 0 {
-			calls := make(json.Array, 0, len(message.Tool_Calls), allocator)
-			for call in message.Tool_Calls {
-				entry := make(json.Object, 3, allocator)
-				entry[strings.clone("id", allocator)] = json.String(strings.clone(call.ID, allocator))
-				entry[strings.clone("type", allocator)] = json.String(strings.clone("function", allocator))
-				function := make(json.Object, 2, allocator)
-				function[strings.clone("name", allocator)] = json.String(strings.clone(call.Name, allocator))
-				function[strings.clone("arguments", allocator)] = json.String(strings.clone(call.Arguments, allocator))
-				entry[strings.clone("function", allocator)] = json.Value(function)
-				append(&calls, json.Value(entry))
-			}
-			item[strings.clone("tool_calls", allocator)] = json.Value(calls)
-		}
-		if message.Role == .Tool {
-			item[strings.clone("tool_call_id", allocator)] = json.String(strings.clone(message.Tool_Call_ID, allocator))
-		}
+		if !item_first { strings.write_byte(&body, ',') }
+		item_first = false
+		field_first := true
+		encode_write_raw(&body, "{")
 		if message.Cache_Breakpoint {
-			part := make(json.Object, 3, allocator)
-			part[strings.clone("type", allocator)] = json.String(strings.clone("text", allocator))
-			part[strings.clone("text", allocator)] = json.String(strings.clone(message.Content, allocator))
-			bp := make(json.Object, 1, allocator)
-			bp[strings.clone("mode", allocator)] = json.String(strings.clone("explicit", allocator))
-			part[strings.clone("prompt_cache_breakpoint", allocator)] = json.Value(bp)
-			parts := make(json.Array, 0, 1, allocator)
-			append(&parts, json.Value(part))
-			item[strings.clone("content", allocator)] = json.Value(parts)
+			encode_write_field(&body, &field_first, "content")
+			encode_write_raw(&body, "[{")
+			part_first := true
+			encode_write_field(&body, &part_first, "prompt_cache_breakpoint")
+			encode_write_raw(&body, "{")
+			breakpoint_first := true
+			encode_write_field(&body, &breakpoint_first, "mode")
+			encode_write_literal_string(&body, "explicit")
+			encode_write_raw(&body, "}")
+			encode_write_field(&body, &part_first, "text")
+			encode_write_text(&cursor, &body, message.Content)
+			encode_write_field(&body, &part_first, "type")
+			encode_write_literal_string(&body, "text")
+			encode_write_raw(&body, "}]")
 		} else {
-			item[strings.clone("content", allocator)] = json.String(strings.clone(message.Content, allocator))
+			encode_write_field(&body, &field_first, "content")
+			encode_write_text(&cursor, &body, message.Content)
 		}
-		append(&messages, json.Value(item))
-	}
-	object[strings.clone("messages", allocator)] = json.Value(messages)
-	if len(request.Tools) > 0 {
-		tools := make(json.Array, 0, len(request.Tools), allocator)
-		for tool in request.Tools {
-			definition, ok := openai_chat_tool_def(tool, allocator)
-			if !ok { return "", .Invalid_Tools }
-			append(&tools, definition)
+		encode_write_field(&body, &field_first, "role")
+		encode_write_literal_string(&body, openai_role_name(message.Role))
+		if message.Role == .Tool {
+			encode_write_field(&body, &field_first, "tool_call_id")
+			encode_write_text(&cursor, &body, message.Tool_Call_ID)
 		}
-		object[strings.clone("tools", allocator)] = json.Value(tools)
+		if message.Role == .Assistant && len(message.Tool_Calls) > 0 {
+			encode_write_field(&body, &field_first, "tool_calls")
+			encode_write_raw(&body, "[")
+			for call, index in message.Tool_Calls {
+				if index > 0 { strings.write_byte(&body, ',') }
+				call_first := true
+				encode_write_raw(&body, "{")
+				encode_write_field(&body, &call_first, "function")
+				encode_write_raw(&body, "{")
+				function_first := true
+				encode_write_field(&body, &function_first, "arguments")
+				encode_write_text(&cursor, &body, call.Arguments)
+				encode_write_field(&body, &function_first, "name")
+				encode_write_text(&cursor, &body, call.Name)
+				encode_write_raw(&body, "}")
+				encode_write_field(&body, &call_first, "id")
+				encode_write_text(&cursor, &body, call.ID)
+				encode_write_field(&body, &call_first, "type")
+				encode_write_literal_string(&body, "function")
+				encode_write_raw(&body, "}")
+			}
+			encode_write_raw(&body, "]")
+		}
+		encode_write_raw(&body, "}")
 	}
-	// The output bound is sent in the field every current model accepts. The older
-	// `max_tokens` spelling is deprecated and is rejected outright by the reasoning
-	// models, so there is no model for which it is the right choice.
-	if request.Max_Output_Tokens_Present { object[strings.clone("max_completion_tokens", allocator)] = json.Integer(request.Max_Output_Tokens) }
-	if request.Reasoning_Effort_Present {
-		object[strings.clone("reasoning_effort", allocator)] = json.String(strings.clone(request.Reasoning_Effort, allocator))
+	encode_write_raw(&body, "]")
+	encode_write_field(&body, &first, "model")
+	encode_write_text(&cursor, &body, request.Model)
+	if request.Prompt_Cache_Key_Present {
+		encode_write_field(&body, &first, "prompt_cache_key")
+		encode_write_text(&cursor, &body, request.Prompt_Cache_Key)
 	}
-	if request.Prompt_Cache_Key_Present { object[strings.clone("prompt_cache_key", allocator)] = json.String(strings.clone(request.Prompt_Cache_Key, allocator)) }
 	if request.Prompt_Cache_Options_Present {
-		opts := make(json.Object, 2, allocator)
+		encode_write_field(&body, &first, "prompt_cache_options")
+		encode_write_raw(&body, "{")
+		options_first := true
 		if request.Prompt_Cache_Options.Mode_Present {
-			mode_text := "implicit"
-			if request.Prompt_Cache_Options.Mode == .Explicit { mode_text = "explicit" }
-			opts[strings.clone("mode", allocator)] = json.String(strings.clone(mode_text, allocator))
+			mode := "implicit"
+			if request.Prompt_Cache_Options.Mode == .Explicit { mode = "explicit" }
+			encode_write_field(&body, &options_first, "mode")
+			encode_write_literal_string(&body, mode)
 		}
-		if request.Prompt_Cache_Options.TTL_Present { opts[strings.clone("ttl", allocator)] = json.String(strings.clone(request.Prompt_Cache_Options.TTL, allocator)) }
-		object[strings.clone("prompt_cache_options", allocator)] = json.Value(opts)
+		if request.Prompt_Cache_Options.TTL_Present {
+			encode_write_field(&body, &options_first, "ttl")
+			encode_write_literal_string(&body, request.Prompt_Cache_Options.TTL)
+		}
+		encode_write_raw(&body, "}")
 	}
-	if request.Prompt_Cache_Retention_Present { object[strings.clone("prompt_cache_retention", allocator)] = json.String(strings.clone(request.Prompt_Cache_Retention, allocator)) }
-	if request.Store_Response_Present { object[strings.clone("store", allocator)] = json.Boolean(request.Store_Response) }
-	object[strings.clone("stream", allocator)] = json.Boolean(true)
-	options := make(json.Object, 1, allocator)
-	options[strings.clone("include_usage", allocator)] = json.Boolean(true)
-	object[strings.clone("stream_options", allocator)] = json.Value(options)
-	value := json.Value(object)
-	// Keys are sorted so the same conversation encodes to the same bytes every
-	// time, including in a later process. Map iteration order is otherwise
-	// allocation-dependent, which would move bytes inside the cached prefix.
-	result, err := json.unparse(value, {sort_maps_by_key = true}, allocator)
-	json.destroy_value(value, allocator)
-	if err != nil { return "", .Invalid_Message }
-	return result, .None
+	if request.Prompt_Cache_Retention_Present {
+		encode_write_field(&body, &first, "prompt_cache_retention")
+		encode_write_text(&cursor, &body, request.Prompt_Cache_Retention)
+	}
+	if request.Reasoning_Effort_Present {
+		encode_write_field(&body, &first, "reasoning_effort")
+		encode_write_text(&cursor, &body, request.Reasoning_Effort)
+	}
+	if request.Store_Response_Present {
+		encode_write_field(&body, &first, "store")
+		encode_write_bool(&body, request.Store_Response)
+	}
+	encode_write_field(&body, &first, "stream")
+	encode_write_bool(&body, true)
+	encode_write_field(&body, &first, "stream_options")
+	encode_write_raw(&body, "{")
+	usage_first := true
+	encode_write_field(&body, &usage_first, "include_usage")
+	encode_write_bool(&body, true)
+	encode_write_raw(&body, "}")
+	if len(request.Tools) > 0 {
+		encode_write_field(&body, &first, "tools")
+		encode_write_raw(&body, "[")
+		for tool, index in request.Tools {
+			if index > 0 { strings.write_byte(&body, ',') }
+			tool_first := true
+			encode_write_raw(&body, "{")
+			encode_write_field(&body, &tool_first, "function")
+			encode_write_raw(&body, "{")
+			function_first := true
+			encode_write_field(&body, &function_first, "description")
+			encode_write_text(&cursor, &body, tool.Description)
+			encode_write_field(&body, &function_first, "name")
+			encode_write_text(&cursor, &body, tool.Name)
+			// A tool's parameters are the one part of a request that is JSON inside JSON:
+			// the schema text is read once and the bytes are kept with the request's other
+			// texts.
+			if !openai_tool_parameters_write(&cursor, &body, &function_first, tool.Parameters_JSON) {
+				return "", .Invalid_Tools
+			}
+			encode_write_raw(&body, "}")
+			encode_write_field(&body, &tool_first, "type")
+			encode_write_literal_string(&body, "function")
+			encode_write_raw(&body, "}")
+		}
+		encode_write_raw(&body, "]")
+	}
+	encode_write_raw(&body, "}")
+	encode_finish(&cursor)
+	return strings.clone(strings.to_string(body), allocator), .None
 }
 
 openai_chat_calls_open :: proc(state: ^Provider_Stream_State) -> bool {

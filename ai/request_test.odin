@@ -1,6 +1,7 @@
 #+test
 package ai
 
+import "core:strings"
 import "core:testing"
 
 // A frozen request holds the bytes a one-shot send would have produced, so a retry
@@ -47,4 +48,84 @@ test_freeze_refuses_an_invalid_request :: proc(t: ^testing.T) {
 	testing.expect_value(t, freeze_err.kind, Provider_Operation_Error_Kind.Invalid_Request)
 	testing.expect(t, freeze_err.detail != "", "a refused request says why")
 	testing.expect_value(t, len(frozen.Body), 0)
+}
+
+// A cache decides how much of a request is written again, never what is written: a
+// request that repeats a conversation, one that extends it, and one whose middle changed
+// all encode to the bytes the same request encodes to with no cache.
+@(test)
+test_encode_cache_writes_what_the_request_says :: proc(t: ^testing.T) {
+	tools := []Provider_Tool_Def {
+		{
+			Name = "shell",
+			Description = "Run a command.",
+			Parameters_JSON = `{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`,
+		},
+	}
+	// An endpoint record, which carries a field the input schema has no place for.
+	record := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"one"}]}]`
+	messages := []Provider_Message {
+		{Role = .User, Content = "first", Cache_Breakpoint = true},
+		{Role = .Assistant, Tool_Calls = []Provider_Tool_Call{{ID = "call_a", Item_ID = "fc_1", Name = "shell", Arguments = `{"command":"pwd"}`}}},
+		{Role = .Tool, Content = "workspace", Tool_Call_ID = "call_a"},
+		{Verbatim_Items = record},
+	}
+	request := Provider_Request {
+		API                       = .OpenAI_Responses,
+		Model_Present             = true,
+		Model                     = "cache-model",
+		Instructions_Present      = true,
+		Instructions              = "Be brief.",
+		Messages_Present          = true,
+		Messages                  = messages,
+		Tools                     = tools,
+		Max_Output_Tokens_Present = true,
+		Max_Output_Tokens         = 128,
+	}
+
+	cache: Provider_Encode_Cache
+	defer Provider_Encode_Cache_Destroy(&cache)
+	expect_encoded :: proc(t: ^testing.T, request: Provider_Request, cache: ^Provider_Encode_Cache) {
+		reused, reused_err := Provider_Encode_Request_Reusing(request, cache, context.temp_allocator)
+		fresh, fresh_err := Provider_Encode_Request(request, context.temp_allocator)
+		if !testing.expect_value(t, reused_err, Provider_Request_Error.None) { return }
+		if !testing.expect_value(t, fresh_err, Provider_Request_Error.None) { return }
+		testing.expect_value(t, reused, fresh)
+	}
+	expect_encoded(t, request, &cache)
+	expect_encoded(t, request, &cache)
+
+	grown_messages := make([]Provider_Message, len(messages) + 1, context.temp_allocator)
+	copy(grown_messages, messages)
+	grown_messages[len(messages)] = Provider_Message {
+		Role    = .Assistant,
+		Content = "an answer",
+	}
+	grown := request
+	grown.Messages = grown_messages
+	expect_encoded(t, grown, &cache)
+
+	// A call the harness repaired is replayed with its repair, which changes one message
+	// and leaves every message after it as it was.
+	changed_messages := make([]Provider_Message, len(messages), context.temp_allocator)
+	copy(changed_messages, messages)
+	changed_messages[1].Tool_Calls = []Provider_Tool_Call{{ID = "call_a", Item_ID = "fc_1", Name = "shell", Arguments = `{"command":"ls"}`}}
+	changed := request
+	changed.Messages = changed_messages
+	expect_encoded(t, changed, &cache)
+
+	// Bytes answer for the text they were written for, not for the storage they were read
+	// from: a record whose bytes changed in place, at the same address and the same
+	// length, is read again.
+	record_buffer := make([]u8, len(record), context.temp_allocator)
+	copy(record_buffer, record)
+	in_place_messages := make([]Provider_Message, len(messages), context.temp_allocator)
+	copy(in_place_messages, messages)
+	in_place_messages[3].Verbatim_Items = string(record_buffer)
+	in_place := request
+	in_place.Messages = in_place_messages
+	expect_encoded(t, in_place, &cache)
+	replaced, _ := strings.replace_all(record, "one", "two", context.temp_allocator)
+	copy(record_buffer, replaced)
+	expect_encoded(t, in_place, &cache)
 }

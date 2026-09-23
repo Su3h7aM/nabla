@@ -4,51 +4,63 @@ import "core:encoding/json"
 import "core:mem"
 import "core:strings"
 
-openai_responses_encode_request :: proc(request: Provider_Request, allocator := context.allocator) -> (string, Provider_Request_Error) {
-	object, request_err := openai_responses_request_object(request, allocator)
-	if request_err != .None { return "", request_err }
-	object[strings.clone("stream", allocator)] = json.Boolean(true)
-	return openai_responses_unparse_request(object, allocator)
+openai_responses_encode_request :: proc(
+	request: Provider_Request,
+	cache: ^Provider_Encode_Cache,
+	allocator := context.allocator,
+) -> (
+	string,
+	Provider_Request_Error,
+) {
+	return openai_responses_encode_request_body(request, cache, false, allocator)
 }
 
 // The WebSocket request carries the same Responses fields under a response.create
 // event. Streaming is inherent to the connection, so its HTTP-only stream field is
 // not sent.
-openai_responses_encode_websocket_request :: proc(request: Provider_Request, allocator := context.allocator) -> (string, Provider_Request_Error) {
-	object, request_err := openai_responses_request_object(request, allocator)
-	if request_err != .None { return "", request_err }
-	object[strings.clone("type", allocator)] = json.String(strings.clone("response.create", allocator))
-	return openai_responses_unparse_request(object, allocator)
+openai_responses_encode_websocket_request :: proc(
+	request: Provider_Request,
+	cache: ^Provider_Encode_Cache,
+	allocator := context.allocator,
+) -> (
+	string,
+	Provider_Request_Error,
+) {
+	return openai_responses_encode_request_body(request, cache, true, allocator)
 }
 
-openai_responses_unparse_request :: proc(object: json.Object, allocator: mem.Allocator) -> (string, Provider_Request_Error) {
-	value := json.Value(object)
-	defer json.destroy_value(value, allocator)
-	// Keys are sorted so the same conversation encodes to the same bytes every
-	// time, including in a later process. Map iteration order is otherwise
-	// allocation-dependent, which would move bytes inside the cached prefix.
-	result, err := json.unparse(value, {sort_maps_by_key = true}, allocator)
-	if err != nil { return "", .Invalid_Message }
-	return result, .None
-}
-
-// openai_responses_request_object builds the request's JSON object. The object is owned by a
-// local rather than by the named result, because an error return assigns the result and a
-// cleanup registered on it would then free nothing: what the scope owns is the local.
-openai_responses_request_object :: proc(request: Provider_Request, allocator: mem.Allocator) -> (result: json.Object, err: Provider_Request_Error) {
-	if request_err := Provider_Validate_Request(request); request_err != .None { return nil, request_err }
+// openai_responses_encode_request_body writes one Responses request body. The body is
+// bytes: every string the request carries is written through its slot in the cache, so a
+// request that repeats or extends a conversation copies the bytes already written for
+// the texts it carries again instead of reading and writing them a second time. What
+// that saves is largest here, because a record the endpoint sent is read from the
+// conversation and written back unchanged on every request that follows it.
+openai_responses_encode_request_body :: proc(
+	request: Provider_Request,
+	cache: ^Provider_Encode_Cache,
+	websocket: bool,
+	allocator := context.allocator,
+) -> (
+	string,
+	Provider_Request_Error,
+) {
+	if request_err := Provider_Validate_Request(request); request_err != .None { return "", request_err }
 	for tool in request.Tools {
-		if !openai_tool_schema_valid(tool.Parameters_JSON) { return nil, .Invalid_Tools }
+		if !openai_tool_schema_valid(tool.Parameters_JSON) { return "", .Invalid_Tools }
 	}
-	object := make(json.Object, 8, allocator)
-	defer if err != .None { json.destroy_value(json.Value(object), allocator) }
-	object[strings.clone("model", allocator)] = json.String(strings.clone(request.Model, allocator))
-	if request.Instructions_Present {
-		object[strings.clone("instructions", allocator)] = json.String(strings.clone(request.Instructions, allocator))
-	}
-	input := make(json.Array, 0, len(request.Messages), allocator)
-	input_attached := false
-	defer if err != .None && !input_attached { json.destroy_value(json.Value(input), allocator) }
+
+	cursor := encode_cursor(cache, allocator)
+	body := strings.builder_make(allocator)
+	defer strings.builder_destroy(&body)
+
+	// Fields are written in the order the standard library's writer sorts them in, so a
+	// body is the bytes a parsed request would be written as, and the same conversation
+	// writes the same bytes in any process.
+	first := true
+	encode_write_raw(&body, "{")
+	encode_write_field(&body, &first, "input")
+	encode_write_raw(&body, "[")
+	item_first := true
 	for message in request.Messages {
 		// A verbatim message carries the endpoint's own items. They are read as the input
 		// the request takes back, and an item the input schema refuses fails the request:
@@ -58,125 +70,264 @@ openai_responses_request_object :: proc(request: Provider_Request, allocator: me
 		// request keeps the conversation's real order. Re-deriving them would lose phase,
 		// annotations, and summaries, and would send assistant content twice.
 		if message.Verbatim_Items != "" {
-			items, parse_err := json.parse_string(message.Verbatim_Items, .JSON, true, allocator)
-			if parse_err != nil { return nil, .Invalid_Message }
-			array, is_array := items.(json.Array)
-			if !is_array {
-				json.destroy_value(items, allocator)
-				return nil, .Invalid_Message
+			if !openai_responses_record_write(&cursor, &body, &item_first, message.Verbatim_Items) {
+				return "", .Invalid_Message
 			}
-			for item in array {
-				replayed, is_object := item.(json.Object)
-				if !is_object || !openai_responses_replay_item_ok(replayed, allocator) {
-					json.destroy_value(items, allocator)
-					return nil, .Invalid_Message
-				}
-				// An output item carries a terminal status; the input-item schema
-				// has no such field, and an endpoint refuses a field it does not
-				// know. Everything else survives, so the record stays replayable.
-				clone := make(json.Object, len(replayed), allocator)
-				for key, value in replayed {
-					if key == "status" { continue }
-					clone[strings.clone(key, allocator)] = json.Value(json.clone_value(value, allocator))
-				}
-				append(&input, json.Value(clone))
-			}
-			json.destroy_value(items, allocator)
 			continue
 		}
 		if message.Role == .Reasoning {
 			// A reasoning item is replayable only when the endpoint returned
 			// encrypted content: without it the item carries nothing the
 			// endpoint can continue from, and it is skipped rather than sent.
-			if message.Reasoning_Encrypted == "" {
-				continue
-			}
+			if message.Reasoning_Encrypted == "" { continue }
+			openai_responses_item_start(&body, &item_first)
+			field_first := true
+			encode_write_raw(&body, "{")
+			encode_write_field(&body, &field_first, "encrypted_content")
+			encode_write_text(&cursor, &body, message.Reasoning_Encrypted)
+			encode_write_field(&body, &field_first, "id")
+			encode_write_text(&cursor, &body, message.Reasoning_ID)
 			// The request schema requires a summary on every replayed reasoning
 			// item, empty or not; summaries are display-only and were never
 			// kept, so the replayed one is empty.
-			summaries := make(json.Array, 0, 0, allocator)
-			reasoning := make(json.Object, 4, allocator)
-			reasoning[strings.clone("type", allocator)] = json.String(strings.clone("reasoning", allocator))
-			reasoning[strings.clone("id", allocator)] = json.String(strings.clone(message.Reasoning_ID, allocator))
-			reasoning[strings.clone("summary", allocator)] = json.Value(summaries)
-			if message.Reasoning_Encrypted != "" {
-				reasoning[strings.clone("encrypted_content", allocator)] = json.String(strings.clone(message.Reasoning_Encrypted, allocator))
-			}
-			append(&input, json.Value(reasoning))
+			encode_write_field(&body, &field_first, "summary")
+			encode_write_raw(&body, "[]")
+			encode_write_field(&body, &field_first, "type")
+			encode_write_literal_string(&body, "reasoning")
+			encode_write_raw(&body, "}")
 			continue
 		}
 		if message.Role == .Tool {
-			output := make(json.Object, 3, allocator)
-			output[strings.clone("type", allocator)] = json.String(strings.clone("function_call_output", allocator))
-			output[strings.clone("call_id", allocator)] = json.String(strings.clone(message.Tool_Call_ID, allocator))
-			output[strings.clone("output", allocator)] = json.String(strings.clone(message.Content, allocator))
-			append(&input, json.Value(output))
+			openai_responses_item_start(&body, &item_first)
+			field_first := true
+			encode_write_raw(&body, "{")
+			encode_write_field(&body, &field_first, "call_id")
+			encode_write_text(&cursor, &body, message.Tool_Call_ID)
+			encode_write_field(&body, &field_first, "output")
+			encode_write_text(&cursor, &body, message.Content)
+			encode_write_field(&body, &field_first, "type")
+			encode_write_literal_string(&body, "function_call_output")
+			encode_write_raw(&body, "}")
 			continue
 		}
 		if len(message.Tool_Calls) > 0 {
 			for call in message.Tool_Calls {
-				entry := make(json.Object, 5, allocator)
-				entry[strings.clone("type", allocator)] = json.String(strings.clone("function_call", allocator))
-				if call.Item_ID != "" { entry[strings.clone("id", allocator)] = json.String(strings.clone(call.Item_ID, allocator)) }
-				entry[strings.clone("call_id", allocator)] = json.String(strings.clone(call.ID, allocator))
-				entry[strings.clone("name", allocator)] = json.String(strings.clone(call.Name, allocator))
-				entry[strings.clone("arguments", allocator)] = json.String(strings.clone(call.Arguments, allocator))
-				append(&input, json.Value(entry))
+				openai_responses_item_start(&body, &item_first)
+				call_first := true
+				encode_write_raw(&body, "{")
+				encode_write_field(&body, &call_first, "arguments")
+				encode_write_text(&cursor, &body, call.Arguments)
+				encode_write_field(&body, &call_first, "call_id")
+				encode_write_text(&cursor, &body, call.ID)
+				if call.Item_ID != "" {
+					encode_write_field(&body, &call_first, "id")
+					encode_write_text(&cursor, &body, call.Item_ID)
+				}
+				encode_write_field(&body, &call_first, "name")
+				encode_write_text(&cursor, &body, call.Name)
+				encode_write_field(&body, &call_first, "type")
+				encode_write_literal_string(&body, "function_call")
+				encode_write_raw(&body, "}")
 			}
 			if message.Content != "" {
-				text_item := make(json.Object, 2, allocator)
-				text_item[strings.clone("role", allocator)] = json.String(strings.clone(openai_role_name(message.Role), allocator))
-				text_item[strings.clone("content", allocator)] = json.String(strings.clone(message.Content, allocator))
-				append(&input, json.Value(text_item))
+				openai_responses_item_start(&body, &item_first)
+				text_first := true
+				encode_write_raw(&body, "{")
+				encode_write_field(&body, &text_first, "content")
+				encode_write_text(&cursor, &body, message.Content)
+				encode_write_field(&body, &text_first, "role")
+				encode_write_literal_string(&body, openai_role_name(message.Role))
+				encode_write_raw(&body, "}")
 			}
 			continue
 		}
-		item := make(json.Object, 2, allocator)
-		item[strings.clone("role", allocator)] = json.String(strings.clone(openai_role_name(message.Role), allocator))
+		openai_responses_item_start(&body, &item_first)
+		field_first := true
+		encode_write_raw(&body, "{")
 		if message.Cache_Breakpoint {
-			part := make(json.Object, 3, allocator)
-			part[strings.clone("type", allocator)] = json.String(strings.clone("input_text", allocator))
-			part[strings.clone("text", allocator)] = json.String(strings.clone(message.Content, allocator))
-			breakpoint := make(json.Object, 1, allocator)
-			breakpoint[strings.clone("mode", allocator)] = json.String(strings.clone("explicit", allocator))
-			part[strings.clone("prompt_cache_breakpoint", allocator)] = json.Value(breakpoint)
-			parts := make(json.Array, 0, 1, allocator)
-			append(&parts, json.Value(part))
-			item[strings.clone("content", allocator)] = json.Value(parts)
+			encode_write_field(&body, &field_first, "content")
+			encode_write_raw(&body, "[{")
+			part_first := true
+			encode_write_field(&body, &part_first, "prompt_cache_breakpoint")
+			encode_write_raw(&body, "{")
+			breakpoint_first := true
+			encode_write_field(&body, &breakpoint_first, "mode")
+			encode_write_literal_string(&body, "explicit")
+			encode_write_raw(&body, "}")
+			encode_write_field(&body, &part_first, "text")
+			encode_write_text(&cursor, &body, message.Content)
+			encode_write_field(&body, &part_first, "type")
+			encode_write_literal_string(&body, "input_text")
+			encode_write_raw(&body, "}]")
 		} else {
-			item[strings.clone("content", allocator)] = json.String(strings.clone(message.Content, allocator))
+			encode_write_field(&body, &field_first, "content")
+			encode_write_text(&cursor, &body, message.Content)
 		}
-		append(&input, json.Value(item))
+		encode_write_field(&body, &field_first, "role")
+		encode_write_literal_string(&body, openai_role_name(message.Role))
+		encode_write_raw(&body, "}")
 	}
-	object[strings.clone("input", allocator)] = json.Value(input)
-	input_attached = true
-	if len(request.Tools) > 0 {
-		tools := make(json.Array, 0, len(request.Tools), allocator)
-		for tool in request.Tools {
-			append(&tools, openai_responses_tool_def(tool, allocator))
-		}
-		object[strings.clone("tools", allocator)] = json.Value(tools)
+	encode_write_raw(&body, "]")
+	if request.Instructions_Present {
+		encode_write_field(&body, &first, "instructions")
+		encode_write_text(&cursor, &body, request.Instructions)
 	}
-	if request.Max_Output_Tokens_Present { object[strings.clone("max_output_tokens", allocator)] = json.Integer(request.Max_Output_Tokens) }
-	if request.Reasoning_Effort_Present {
-		reasoning := make(json.Object, 1, allocator)
-		reasoning[strings.clone("effort", allocator)] = json.String(strings.clone(request.Reasoning_Effort, allocator))
-		object[strings.clone("reasoning", allocator)] = json.Value(reasoning)
+	if request.Max_Output_Tokens_Present {
+		encode_write_field(&body, &first, "max_output_tokens")
+		encode_write_int(&body, request.Max_Output_Tokens)
 	}
-	if request.Prompt_Cache_Key_Present { object[strings.clone("prompt_cache_key", allocator)] = json.String(strings.clone(request.Prompt_Cache_Key, allocator)) }
+	encode_write_field(&body, &first, "model")
+	encode_write_text(&cursor, &body, request.Model)
+	if request.Prompt_Cache_Key_Present {
+		encode_write_field(&body, &first, "prompt_cache_key")
+		encode_write_text(&cursor, &body, request.Prompt_Cache_Key)
+	}
 	if request.Prompt_Cache_Options_Present {
-		options := make(json.Object, 2, allocator)
+		encode_write_field(&body, &first, "prompt_cache_options")
+		encode_write_raw(&body, "{")
+		options_first := true
 		if request.Prompt_Cache_Options.Mode_Present {
-			mode_text := "implicit"
-			if request.Prompt_Cache_Options.Mode == .Explicit { mode_text = "explicit" }
-			options[strings.clone("mode", allocator)] = json.String(strings.clone(mode_text, allocator))
+			mode := "implicit"
+			if request.Prompt_Cache_Options.Mode == .Explicit { mode = "explicit" }
+			encode_write_field(&body, &options_first, "mode")
+			encode_write_literal_string(&body, mode)
 		}
-		if request.Prompt_Cache_Options.TTL_Present { options[strings.clone("ttl", allocator)] = json.String(strings.clone(request.Prompt_Cache_Options.TTL, allocator)) }
-		object[strings.clone("prompt_cache_options", allocator)] = json.Value(options)
+		if request.Prompt_Cache_Options.TTL_Present {
+			encode_write_field(&body, &options_first, "ttl")
+			encode_write_literal_string(&body, request.Prompt_Cache_Options.TTL)
+		}
+		encode_write_raw(&body, "}")
 	}
-	if request.Prompt_Cache_Retention_Present { object[strings.clone("prompt_cache_retention", allocator)] = json.String(strings.clone(request.Prompt_Cache_Retention, allocator)) }
-	if request.Store_Response_Present { object[strings.clone("store", allocator)] = json.Boolean(request.Store_Response) }
-	return object, .None
+	if request.Prompt_Cache_Retention_Present {
+		encode_write_field(&body, &first, "prompt_cache_retention")
+		encode_write_text(&cursor, &body, request.Prompt_Cache_Retention)
+	}
+	if request.Reasoning_Effort_Present {
+		encode_write_field(&body, &first, "reasoning")
+		encode_write_raw(&body, "{")
+		effort_first := true
+		encode_write_field(&body, &effort_first, "effort")
+		encode_write_text(&cursor, &body, request.Reasoning_Effort)
+		encode_write_raw(&body, "}")
+	}
+	if request.Store_Response_Present {
+		encode_write_field(&body, &first, "store")
+		encode_write_bool(&body, request.Store_Response)
+	}
+	if !websocket {
+		encode_write_field(&body, &first, "stream")
+		encode_write_bool(&body, true)
+	}
+	if len(request.Tools) > 0 {
+		encode_write_field(&body, &first, "tools")
+		encode_write_raw(&body, "[")
+		for tool, index in request.Tools {
+			if index > 0 { strings.write_byte(&body, ',') }
+			tool_first := true
+			encode_write_raw(&body, "{")
+			encode_write_field(&body, &tool_first, "description")
+			encode_write_text(&cursor, &body, tool.Description)
+			encode_write_field(&body, &tool_first, "name")
+			encode_write_text(&cursor, &body, tool.Name)
+			// A tool's parameters are the one part of a request that is JSON inside JSON:
+			// the schema text is read once and the bytes are kept with the request's other
+			// texts. Strict schema enforcement is not set: it requires every property to be
+			// required, which would make an optional argument mandatory and push the model
+			// into filling it with an empty value. The tool's own schema and the harness's
+			// reading of it are the contract.
+			_ = openai_tool_parameters_write(&cursor, &body, &tool_first, tool.Parameters_JSON, allocator)
+			encode_write_field(&body, &tool_first, "type")
+			encode_write_literal_string(&body, "function")
+			encode_write_raw(&body, "}")
+		}
+		encode_write_raw(&body, "]")
+	}
+	if websocket {
+		encode_write_field(&body, &first, "type")
+		encode_write_literal_string(&body, "response.create")
+	}
+	encode_write_raw(&body, "}")
+	encode_finish(&cursor)
+	return strings.clone(strings.to_string(body), allocator), .None
+}
+
+// openai_responses_item_start starts one item of the request's input array.
+@(private = "package")
+openai_responses_item_start :: proc(body: ^strings.Builder, first: ^bool) {
+	if !first^ { strings.write_byte(body, ',') }
+	first^ = false
+}
+
+// openai_responses_record_write writes the items one response record replays as, where
+// they sit among the projected items, and reports whether the record can be sent back at
+// all. Nothing is spliced unread: an item the input schema refuses fails the whole
+// record, because a request cannot carry half a response, and an endpoint that receives
+// one refuses every request built from the same history after it.
+//
+// A record does not change once it is stored, so reading it is work that happens once per
+// record rather than once per request.
+@(private = "package")
+openai_responses_record_write :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, first: ^bool, record: string, allocator := context.allocator) -> bool {
+	slot, hit := encode_slot_for(cursor, record, .Record)
+	if slot == nil {
+		scratch := strings.builder_make(allocator)
+		defer strings.builder_destroy(&scratch)
+		if !openai_responses_record_bytes(record, &scratch, allocator) { return false }
+		openai_responses_items_write(body, first, strings.to_string(scratch))
+		return true
+	}
+	if !hit {
+		slot.ok = openai_responses_record_bytes(record, &slot.bytes, allocator)
+		encode_slot_store(cursor, slot, record)
+	}
+	if !slot.ok { return false }
+	openai_responses_items_write(body, first, strings.to_string(slot.bytes))
+	return true
+}
+
+// openai_responses_items_write appends written items to the array being built. A record
+// that carries no items adds nothing and takes no separator.
+@(private = "package")
+openai_responses_items_write :: proc(body: ^strings.Builder, first: ^bool, items: string) {
+	if items == "" { return }
+	if !first^ { strings.write_byte(body, ',') }
+	first^ = false
+	strings.write_string(body, items)
+}
+
+// openai_responses_record_bytes writes the items one response record is sent back as: the
+// endpoint's own output array, with the fields the input schema has no place for removed,
+// written with sorted keys like the rest of the body. It reports false when the record is
+// not an array of items the input schema takes back, which is what makes the request that
+// carries it unsendable.
+@(private = "package")
+openai_responses_record_bytes :: proc(record: string, out: ^strings.Builder, allocator: mem.Allocator) -> bool {
+	items, parse_err := json.parse_string(record, .JSON, true, allocator)
+	if parse_err != nil { return false }
+	defer json.destroy_value(items, allocator)
+	array, is_array := items.(json.Array)
+	if !is_array { return false }
+	first := true
+	for item in array {
+		replayed, is_object := item.(json.Object)
+		if !is_object || !openai_responses_replay_item_ok(replayed, allocator) { return false }
+		// An output item carries a terminal status; the input-item schema has no such
+		// field, and an endpoint refuses a field it does not know. Everything else
+		// survives, so the record stays replayable.
+		clone := make(json.Object, len(replayed), allocator)
+		for key, value in replayed {
+			if key == "status" { continue }
+			clone[strings.clone(key, allocator)] = json.Value(json.clone_value(value, allocator))
+		}
+		text, unparse_err := json.unparse(json.Value(clone), {sort_maps_by_key = true}, allocator)
+		json.destroy_value(json.Value(clone), allocator)
+		if unparse_err != nil { return false }
+		if !first { strings.write_byte(out, ',') }
+		first = false
+		strings.write_string(out, text)
+		delete(text, allocator)
+	}
+	return true
 }
 
 openai_responses_parse_usage :: proc(object: json.Object) -> (Provider_Usage_Event, bool) {

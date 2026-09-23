@@ -106,7 +106,7 @@ test_responses_encode_matches_spec :: proc(t: ^testing.T) {
 
 @(test)
 test_responses_websocket_encode_uses_event_envelope_without_http_stream_field :: proc(t: ^testing.T) {
-	body, err := openai_responses_encode_websocket_request(request_fixture(), context.temp_allocator)
+	body, err := openai_responses_encode_websocket_request(request_fixture(), nil, context.temp_allocator)
 	if !testing.expect_value(t, err, Provider_Request_Error.None) { return }
 	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
 	if !testing.expect_value(t, parse_err, nil) { return }

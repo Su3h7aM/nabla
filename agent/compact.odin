@@ -151,6 +151,9 @@ Compact_Snapshot :: struct {
 // chat_compact_snapshot_make freezes a prepared request. Every string it keeps is
 // copied, because the preparation it was built from is released by its caller and
 // the worker outlives it.
+//
+// The worker encodes with no cache: the session's cache belongs to the thread that
+// walks it, and this request is read once, by the thread that sends it.
 chat_compact_snapshot_make :: proc(
 	prep: ^Chat_Request_Prep,
 	connection: ai.Provider_Connection,
@@ -1149,9 +1152,9 @@ chat_repair_context :: proc(
 	rebuilt: ai.Provider_Encoded_Request
 	encode_err: ai.Provider_Operation_Error
 	if websocket_request {
-		rebuilt, encode_err = ai.Provider_Request_Freeze_WebSocket(prep.request, chat.allocator)
+		rebuilt, encode_err = ai.Provider_Request_Freeze_WebSocket_Reusing(prep.request, &chat.encode_cache, chat.allocator)
 	} else {
-		rebuilt, encode_err = ai.Provider_Request_Freeze(prep.request, chat.allocator)
+		rebuilt, encode_err = ai.Provider_Request_Freeze_Reusing(prep.request, &chat.encode_cache, chat.allocator)
 	}
 	if encode_err.kind != .None {
 		chat_session_fail_turn(chat, encode_err.detail)

@@ -315,10 +315,24 @@ Provider_Request_Operation_Controlled :: proc(
 // allocator). A request that cannot be encoded yields an Invalid_Request operation
 // error, the same failure the one-shot path reports for it.
 Provider_Request_Freeze :: proc(request: Provider_Request, allocator := context.allocator) -> (Provider_Encoded_Request, Provider_Operation_Error) {
+	return Provider_Request_Freeze_Reusing(request, nil, allocator)
+}
+
+// Provider_Request_Freeze_Reusing freezes a request, reusing what cache already holds
+// for the texts the request carries again. A nil cache encodes every byte now. The
+// caller owns the cache: one cache is walked by one encode at a time.
+Provider_Request_Freeze_Reusing :: proc(
+	request: Provider_Request,
+	cache: ^Provider_Encode_Cache,
+	allocator := context.allocator,
+) -> (
+	Provider_Encoded_Request,
+	Provider_Operation_Error,
+) {
 	if err := Provider_Validate_Request(request); err != .None {
 		return {}, Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(err), allocator)}
 	}
-	body, encode_err := Provider_Encode_Request(request, allocator)
+	body, encode_err := Provider_Encode_Request_Reusing(request, cache, allocator)
 	if encode_err != .None {
 		return {}, Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(encode_err), allocator)}
 	}
