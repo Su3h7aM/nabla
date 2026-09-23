@@ -32,6 +32,14 @@ Chat_Request_Tool :: struct {
 // shape a row was written in. Version 2 adds where the send sat in its chain.
 CHAT_REQUEST_INPUT_VERSION :: 2
 
+// Chat_Record_Error keeps a failed local record distinct from an empty record.
+// A durable row is not written when one of these values is returned.
+Chat_Record_Error :: enum {
+	None,
+	Encode,
+	Allocation,
+}
+
 // Chat_Recovery_Kind names how one send came to be. A chain is read back through
 // these: a first send, the same frozen bytes sent again, and a send of rebuilt
 // context are three different facts, and a reader that had to infer them from
@@ -103,7 +111,7 @@ Chat_Compaction_Response :: struct {
 
 // chat_compaction_response_json records what a summarization produced. The result is
 // temp-allocated, because the caller stores it immediately.
-chat_compaction_response_json :: proc(summary: string, base_seq: Maybe(session.Seq), covered_seq: session.Seq) -> string {
+chat_compaction_response_json :: proc(summary: string, base_seq: Maybe(session.Seq), covered_seq: session.Seq) -> (string, Chat_Record_Error) {
 	record := Chat_Compaction_Response {
 		format_version = CHAT_COMPACTION_RESPONSE_VERSION,
 		summary        = summary,
@@ -111,8 +119,8 @@ chat_compaction_response_json :: proc(summary: string, base_seq: Maybe(session.S
 	}
 	if value, present := base_seq.?; present { record.base_seq = i64(value) }
 	data, marshal_err := json.marshal(record, allocator = context.temp_allocator)
-	if marshal_err != nil { return "{}" }
-	return string(data)
+	if marshal_err != nil { return "", .Encode }
+	return string(data), .None
 }
 
 // chat_finish_reason_text is the stable name a request record keeps for why the
@@ -175,13 +183,13 @@ Chat_Request_Error_Evidence :: struct {
 // bound the request itself carries, not the capacity's ordinary one, because a
 // summarization request asks for more and the record has to say what was asked.
 @(private)
-chat_request_config_json :: proc(chat: ^Chat_Session, output: int) -> string {
+chat_request_config_json :: proc(chat: ^Chat_Session, output: int) -> (string, Chat_Record_Error) {
 	config := Chat_Request_Config{}
 	config.effort = chat.effort
 	if output > 0 { config.max_output_tokens = i64(output) }
 	data, marshal_err := json.marshal(config, allocator = context.temp_allocator)
-	if marshal_err != nil { return "{}" }
-	return string(data)
+	if marshal_err != nil { return "", .Encode }
+	return string(data), .None
 }
 
 // chat_request_input_json describes what one send carried, serialized from
@@ -201,8 +209,9 @@ chat_request_input_json :: proc(
 	entry_count: int,
 	attempt: Chat_Attempt,
 	body: []u8,
-) -> string {
-	input := chat_request_input_make(prep, history, snapshot_seq, entry_count, body)
+) -> (string, Chat_Record_Error) {
+	input, input_error := chat_request_input_make(prep, history, snapshot_seq, entry_count, body)
+	if input_error != .None { return "", input_error }
 	chat_request_input_situate(&input, attempt)
 	return chat_request_input_encode(input)
 }
@@ -217,45 +226,55 @@ chat_request_input_make :: proc(
 	snapshot_seq: Maybe(session.Seq),
 	entry_count: int,
 	body: []u8,
-) -> Chat_Request_Input {
-	tools := make([dynamic]Chat_Request_Tool, 0, len(prep.request.Tools), context.temp_allocator)
-	for &definition in prep.request.Tools {
-		append(&tools, Chat_Request_Tool{name = definition.Name, description = definition.Description, input_schema = definition.Parameters_JSON})
+) -> (Chat_Request_Input, Chat_Record_Error) {
+	tools, tools_error := make([dynamic]Chat_Request_Tool, len(prep.request.Tools), context.temp_allocator)
+	if tools_error != nil { return {}, .Allocation }
+	for definition, index in prep.request.Tools {
+		tools[index] = Chat_Request_Tool {
+			name         = definition.Name,
+			description  = definition.Description,
+			input_schema = definition.Parameters_JSON,
+		}
+	}
+	digest, digest_ok := chat_body_digest(body)
+	if !digest_ok {
+		delete(tools)
+		return {}, .Allocation
 	}
 	input := Chat_Request_Input {
 		format_version = CHAT_REQUEST_INPUT_VERSION,
 		tools          = tools[:],
 		summary_seq    = history.summary_seq,
 		covered_seq    = history.covered_seq,
-		body_sha256    = chat_body_digest(body),
+		body_sha256    = digest,
 	}
 	if prep.request.Instructions_Present { input.instructions = prep.request.Instructions }
 	input.instruction_snapshot_seq = snapshot_seq
 	count := entry_count
 	if count > len(history.entries) { count = len(history.entries) }
 	if count > 0 { input.context_through = history.entries[count - 1].seq }
-	return input
+	return input, .None
 }
 
 // chat_body_digest is the digest of the bytes one send carries, written the way the
 // logging capture writes the artifacts it stores. A reader can tell whether two attempts
 // sent the same bytes without either one being kept.
 @(private)
-chat_body_digest :: proc(body: []u8) -> string {
+chat_body_digest :: proc(body: []u8) -> (string, bool) {
 	return chat_text_digest(string(body))
 }
 
 // chat_text_digest is the same digest over text the harness assembled itself, such as the
 // identity of what a summary would run against.
-chat_text_digest :: proc(text: string) -> string {
+chat_text_digest :: proc(text: string) -> (string, bool) {
 	ctx: sha2.Context_256
 	sha2.init_256(&ctx)
 	sha2.update(&ctx, transmute([]u8)text)
 	digest: [sha2.DIGEST_SIZE_256]u8
 	sha2.final(&ctx, digest[:])
 	encoded, encode_err := hex.encode(digest[:], context.temp_allocator)
-	if encode_err != nil { return "" }
-	return string(encoded)
+	if encode_err != nil { return "", false }
+	return string(encoded), true
 }
 
 // chat_request_input_situate puts one send in its chain. A chain's rows carry the same
@@ -271,29 +290,49 @@ chat_request_input_situate :: proc(input: ^Chat_Request_Input, attempt: Chat_Att
 
 // chat_request_input_encode writes one input record.
 @(private)
-chat_request_input_encode :: proc(input: Chat_Request_Input) -> string {
+chat_request_input_encode :: proc(input: Chat_Request_Input) -> (string, Chat_Record_Error) {
 	data, marshal_err := json.marshal(input, allocator = context.temp_allocator)
-	if marshal_err != nil { return "{}" }
-	return string(data)
+	if marshal_err != nil { return "", .Encode }
+	return string(data), .None
 }
 
 // chat_request_input_clone copies an input record into an allocator that outlives the
 // preparation it was read from. It is how a background chain keeps the ingredients of
 // every row it will write after the request that produced them is long gone.
 @(private)
-chat_request_input_clone :: proc(input: ^Chat_Request_Input, allocator: mem.Allocator) {
-	input.instructions = strings.clone(input.instructions, allocator)
-	input.body_sha256 = strings.clone(input.body_sha256, allocator)
-	tools := make([]Chat_Request_Tool, len(input.tools), allocator)
-	for &tool, index in tools {
-		source := input.tools[index]
-		tool = {
-			name         = strings.clone(source.name, allocator),
-			description  = strings.clone(source.description, allocator),
-			input_schema = strings.clone(source.input_schema, allocator),
+chat_request_input_clone :: proc(input: ^Chat_Request_Input, allocator: mem.Allocator) -> bool {
+	cloned := input^
+	cloned.tools = nil
+	complete := false
+	defer if !complete {
+		delete(cloned.instructions, allocator)
+		delete(cloned.body_sha256, allocator)
+		for &tool in cloned.tools {
+			delete(tool.name, allocator)
+			delete(tool.description, allocator)
+			delete(tool.input_schema, allocator)
 		}
+		delete(cloned.tools, allocator)
 	}
-	input.tools = tools
+
+	clone_error: mem.Allocator_Error
+	cloned.instructions, clone_error = strings.clone(input.instructions, allocator)
+	if clone_error != nil { return false }
+	cloned.body_sha256, clone_error = strings.clone(input.body_sha256, allocator)
+	if clone_error != nil { return false }
+	cloned.tools, clone_error = make([]Chat_Request_Tool, len(input.tools), allocator)
+	if clone_error != nil { return false }
+	for source, index in input.tools {
+		cloned.tools[index].name, clone_error = strings.clone(source.name, allocator)
+		if clone_error != nil { return false }
+		cloned.tools[index].description, clone_error = strings.clone(source.description, allocator)
+		if clone_error != nil { return false }
+		cloned.tools[index].input_schema, clone_error = strings.clone(source.input_schema, allocator)
+		if clone_error != nil { return false }
+	}
+	input^ = cloned
+	complete = true
+	return true
 }
 
 // chat_request_input_destroy releases what chat_request_input_clone allocated.
@@ -340,7 +379,7 @@ Chat_Send_Result :: struct {
 // returned and the decision the harness took on it, rather than from the text a
 // front-end would show.
 @(private)
-chat_request_error_json :: proc(result: Chat_Send_Result) -> string {
+chat_request_error_json :: proc(result: Chat_Send_Result) -> (string, Chat_Record_Error) {
 	error := result.error
 	record := Chat_Request_Error_Evidence {
 		format_version      = CHAT_REQUEST_ERROR_VERSION,
@@ -360,8 +399,8 @@ chat_request_error_json :: proc(result: Chat_Send_Result) -> string {
 	}
 	if delay, present := error.retry_after.?; present { record.retry_after_ms = log_duration_ms(delay) }
 	data, marshal_err := json.marshal(record, allocator = context.temp_allocator)
-	if marshal_err != nil { return "" }
-	return string(data)
+	if marshal_err != nil { return "", .Encode }
+	return string(data), .None
 }
 
 // CHAT_TURN_ERROR_VERSION versions the record of a turn that did not complete. Version 1
@@ -382,7 +421,7 @@ Chat_Turn_Error :: struct {
 }
 
 @(private)
-chat_turn_error_json :: proc(message: string, reason: Maybe(Request_Recovery_Reason), refusal: Chat_Repair_Refusal) -> string {
+chat_turn_error_json :: proc(message: string, reason: Maybe(Request_Recovery_Reason), refusal: Chat_Repair_Refusal) -> (string, Chat_Record_Error) {
 	record := Chat_Turn_Error {
 		format_version = CHAT_TURN_ERROR_VERSION,
 		cause          = chat_repair_refusal_name(refusal),
@@ -390,15 +429,15 @@ chat_turn_error_json :: proc(message: string, reason: Maybe(Request_Recovery_Rea
 	}
 	if value, present := reason.?; present { record.reason = request_recovery_reason_name(value) }
 	data, marshal_err := json.marshal(record, allocator = context.temp_allocator)
-	if marshal_err != nil { return "" }
-	return string(data)
+	if marshal_err != nil { return "", .Encode }
+	return string(data), .None
 }
 
 @(private)
-chat_error_json :: proc(message: string) -> string {
+chat_error_json :: proc(message: string) -> (string, Chat_Record_Error) {
 	data, marshal_err := json.marshal(Chat_Request_Error{message = message}, allocator = context.temp_allocator)
-	if marshal_err != nil { return "" }
-	return string(data)
+	if marshal_err != nil { return "", .Encode }
+	return string(data), .None
 }
 
 // chat_request_usage totals one send's usage. The provider's last word wins,

@@ -263,21 +263,34 @@ chat_finish_request :: proc(
 ) {
 	response_json := ""
 	if result.finish_reason != .Unknown {
-		response_json = string(
-			json.marshal(
-				Chat_Request_Response{reason = chat_finish_reason_text(result.finish_reason), attempts = attempts},
-				allocator = context.temp_allocator,
-			) or_else nil,
+		response_data, response_error := json.marshal(
+			Chat_Request_Response{reason = chat_finish_reason_text(result.finish_reason), attempts = attempts},
+			allocator = context.temp_allocator,
 		)
+		if response_error != nil {
+			chat_session_record_failure_detail(chat, "the request outcome could not be recorded", "the response record could not be encoded", .Encode)
+			return
+		}
+		response_json = string(response_data)
 	}
 	error_json := ""
 	if result.outcome != .Completed {
 		if result.error_present {
-			error_json = chat_request_error_json(result)
+			encode_error: Chat_Record_Error
+			error_json, encode_error = chat_request_error_json(result)
+			if encode_error != .None {
+				chat_session_record_failure_detail(chat, "the request outcome could not be recorded", "the error record could not be encoded", .Encode)
+				return
+			}
 		} else if result.message != "" {
 			// A failure the harness detected itself has no operation behind it, so the
 			// record keeps the message and nothing else.
-			error_json = chat_error_json(result.message)
+			encode_error: Chat_Record_Error
+			error_json, encode_error = chat_error_json(result.message)
+			if encode_error != .None {
+				chat_session_record_failure_detail(chat, "the request outcome could not be recorded", "the error record could not be encoded", .Encode)
+				return
+			}
 		}
 	}
 
@@ -359,13 +372,22 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 		outcome = .Interrupted
 	}
 	error_json := ""
+	turn_record_ready := true
 	if chat.last_error != "" {
-		error_json = chat_turn_error_json(chat.last_error, chat.turn_recovery, chat.turn_repair_refusal)
+		encode_error: Chat_Record_Error
+		error_json, encode_error = chat_turn_error_json(chat.last_error, chat.turn_recovery, chat.turn_repair_refusal)
+		if encode_error != .None {
+			chat_session_record_failure_detail(chat, "the turn outcome could not be recorded", "the turn error record could not be encoded", .Encode)
+			recorded = false
+			turn_record_ready = false
+		}
 	}
 
-	if turn_err := session.turn_finish(chat.store, chat.id, turn_no, outcome, error_json, at_ms); turn_err != nil {
-		chat_session_record_failure(chat, "the turn outcome could not be recorded", turn_err)
-		recorded = false
+	if turn_record_ready {
+		if turn_err := session.turn_finish(chat.store, chat.id, turn_no, outcome, error_json, at_ms); turn_err != nil {
+			chat_session_record_failure(chat, "the turn outcome could not be recorded", turn_err)
+			recorded = false
+		}
 	}
 	finished := [5]Log_Field {
 		{key = "outcome", value = session.outcome_name(outcome)},

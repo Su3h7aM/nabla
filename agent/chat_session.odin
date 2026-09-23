@@ -356,7 +356,14 @@ chat_title_from_prompt :: proc(prompt: string, allocator := context.allocator) -
 // reason about which failures are safe to continue past.
 chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: session.Error) {
 	local := err
-	detail := session.error_detail(&local)
+	chat_session_record_failure_detail(chat, what, session.error_detail(&local), session.error_kind(local))
+}
+
+// chat_session_record_failure_detail is the same storage stop for failures that
+// happen before the store sees a row, such as encoding a request record. Keeping
+// the detail separate lets those failures join the same latched state without
+// inventing a fake session-store error.
+chat_session_record_failure_detail :: proc(chat: ^Chat_Session, what: string, detail: string, kind: session.Error_Kind) {
 	delete(chat.last_error, chat.allocator)
 	if what == "" {
 		chat.last_error = chat_clone_string(detail, chat.allocator)
@@ -373,7 +380,7 @@ chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: sess
 	context.logger = log_rebind(&binding, log_correlation(chat))
 	fields := [3]Log_Field {
 		{key = "operation", value = what},
-		{key = "error_kind", value = log_error_kind_name(session.error_kind(local))},
+		{key = "error_kind", value = log_error_kind_name(kind)},
 		{key = "detail_bytes", value = i64(len(detail))},
 	}
 	log_emit({level = .Error, category = .Storage, event = "storage.failed", fields = fields[:]})

@@ -140,6 +140,16 @@ chat_record_attempt :: proc(
 	request_no: session.Request_No,
 	recorded: bool,
 ) {
+	config_json, config_error := chat_request_config_json(chat, prep.request.Max_Output_Tokens)
+	if config_error != .None {
+		chat_session_record_failure_detail(chat, "the request record could not be encoded", "the request configuration could not be encoded", .Encode)
+		return {}, false
+	}
+	input_json, input_error := chat_request_input_json(prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries), attempt, encoded.Body)
+	if input_error != .None {
+		chat_session_record_failure_detail(chat, "the request record could not be encoded", "the request input could not be encoded", .Encode)
+		return {}, false
+	}
 	number, begin_err := session.request_begin(
 		chat.store,
 		chat.id,
@@ -149,8 +159,8 @@ chat_record_attempt :: proc(
 			provider = chat.provider_id,
 			model_requested = chat.model_id,
 			api = chat_api_name(connection.API),
-			config_json = chat_request_config_json(chat, prep.request.Max_Output_Tokens),
-			input_json = chat_request_input_json(prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries), attempt, encoded.Body),
+			config_json = config_json,
+			input_json = input_json,
 		},
 		session.now_ms(),
 	)

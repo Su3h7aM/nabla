@@ -517,7 +517,8 @@ chat_compact_progress :: proc(chat: ^Chat_Session, connection: ai.Provider_Conne
 	if covered, present := control.attempted_seq.?; present {
 		if len(prep.history.entries) == 0 { return false }
 		newest := prep.history.entries[len(prep.history.entries) - 1].seq
-		if newest <= covered && chat_compact_identity(chat, connection) == control.attempted_identity {
+		identity, identity_ok := chat_compact_identity(chat, connection)
+		if newest <= covered && identity_ok && identity == control.attempted_identity {
 			return false
 		}
 	}
@@ -529,7 +530,7 @@ chat_compact_progress :: proc(chat: ^Chat_Session, connection: ai.Provider_Conne
 // the digest is that generation: comparing it is what lets a corrected credential clear a
 // suppression without the credential itself being stored or logged as a key.
 @(private)
-chat_compact_identity :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection) -> string {
+chat_compact_identity :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection) -> (string, bool) {
 	text := fmt.tprintf("%s\n%s\n%s\n%s", chat_api_name(connection.API), chat.model_id, connection.Endpoint, connection.Credential)
 	return chat_text_digest(text)
 }
@@ -549,6 +550,11 @@ chat_compact_begin_attempt :: proc(
 ) {
 	input := job.input
 	chat_request_input_situate(&input, {number = job.attempts, recovery = previous == nil ? .Initial : .Transient_Retry, previous = previous})
+	input_json, encode_error := chat_request_input_encode(input)
+	if encode_error != .None {
+		chat_session_record_failure_detail(chat, "the compaction request could not be recorded", "the request input could not be encoded", .Encode)
+		return 0, nil
+	}
 	begun, begin_err := session.request_begin(
 		chat.store,
 		chat.id,
@@ -559,7 +565,7 @@ chat_compact_begin_attempt :: proc(
 			model_requested = chat.model_id,
 			api = chat_api_name(job.snapshot.api),
 			config_json = job.config,
-			input_json = chat_request_input_encode(input),
+			input_json = input_json,
 		},
 		at_ms,
 	)
@@ -645,14 +651,51 @@ chat_compact_start :: proc(
 	// What this chain's request rows are written from. It is kept for the whole chain,
 	// because a retried attempt is a new row over the same frozen bytes and every row has
 	// to say where in the chain it sits.
-	source := chat_request_input_make(&compact_prep, &prep.history, chat.skill_snapshot_seq, seam, transmute([]u8)snapshot.body)
-	chat_request_input_clone(&source, job.allocator)
-	job.input = source
-	job.config = strings.clone(chat_request_config_json(chat, compact_prep.request.Max_Output_Tokens), job.allocator)
-
-	if _, begin_err := chat_compact_begin_attempt(chat, job, nil, session.now_ms()); begin_err != nil {
+	source, source_ok := chat_request_input_make(&compact_prep, &prep.history, chat.skill_snapshot_seq, seam, transmute([]u8)snapshot.body)
+	if source_ok != .None {
 		chat_compact_job_destroy(job)
-		chat_session_record_failure(chat, "the compaction request could not be recorded", begin_err)
+		_observer_message(observer, .Warning, "the compaction request record could not be prepared")
+		return false
+	}
+	if !chat_request_input_clone(&source, job.allocator) {
+		chat_compact_job_destroy(job)
+		_observer_message(observer, .Warning, "the compaction request record could not be copied")
+		return false
+	}
+	config_json, config_error := chat_request_config_json(chat, compact_prep.request.Max_Output_Tokens)
+	if config_error != .None {
+		chat_request_input_destroy(&source, job.allocator)
+		chat_compact_job_destroy(job)
+		_observer_message(observer, .Warning, "the compaction request record could not be encoded")
+		return false
+	}
+	config, config_alloc_error := strings.clone(config_json, job.allocator)
+	if config_alloc_error != nil {
+		chat_request_input_destroy(&source, job.allocator)
+		chat_compact_job_destroy(job)
+		_observer_message(observer, .Warning, "the compaction request record could not be copied")
+		return false
+	}
+	job.config = config
+	job.input = source
+	identity, identity_ok := chat_compact_identity(chat, connection)
+	if !identity_ok {
+		chat_compact_job_destroy(job)
+		_observer_message(observer, .Warning, "the compaction request identity could not be prepared")
+		return false
+	}
+	new_identity, identity_error := strings.clone(identity, chat.allocator)
+	if identity_error != nil {
+		chat_compact_job_destroy(job)
+		_observer_message(observer, .Warning, "the compaction request identity could not be copied")
+		return false
+	}
+	identity_installed := false
+	defer if !identity_installed { delete(new_identity, chat.allocator) }
+
+	if _, begin_err := chat_compact_begin_attempt(chat, job, nil, session.now_ms()); begin_err != nil || chat_session_storage_failed(chat) {
+		chat_compact_job_destroy(job)
+		if begin_err != nil { chat_session_record_failure(chat, "the compaction request could not be recorded", begin_err) }
 		return false
 	}
 
@@ -669,7 +712,8 @@ chat_compact_start :: proc(
 	// boundary it summarizes: the next automatic attempt has to see something newer.
 	if len(entries) > 0 { control.attempted_seq = entries[len(entries) - 1].seq }
 	delete(control.attempted_identity, chat.allocator)
-	control.attempted_identity = strings.clone(chat_compact_identity(chat, connection), chat.allocator)
+	control.attempted_identity = new_identity
+	identity_installed = true
 	// A job that has started says so, from the one place a job starts. The front-end
 	// can then tell when a summary began and how long it took.
 	_observer_message(observer, .Notice, chat_compact_start_notice(trigger))
@@ -704,7 +748,14 @@ chat_compact_finish_request :: proc(
 	usage: session.Usage = {},
 ) {
 	error_json := ""
-	if outcome != .Completed { error_json = chat_error_json(error_text) }
+	if outcome != .Completed {
+		encode_error: Chat_Record_Error
+		error_json, encode_error = chat_error_json(error_text)
+		if encode_error != .None {
+			chat_session_record_failure_detail(chat, "the compaction outcome could not be recorded", "the error record could not be encoded", .Encode)
+			return
+		}
+	}
 	if finish_err := session.request_finish(
 		chat.store,
 		chat.id,
@@ -731,9 +782,19 @@ chat_compact_finish_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job, deci
 	}
 	error_json := ""
 	if result.error_present {
-		error_json = chat_request_error_json(result)
+		encode_error: Chat_Record_Error
+		error_json, encode_error = chat_request_error_json(result)
+		if encode_error != .None {
+			chat_session_record_failure_detail(chat, "the compaction outcome could not be recorded", "the error record could not be encoded", .Encode)
+			return
+		}
 	} else if message != "" {
-		error_json = chat_error_json(message)
+		encode_error: Chat_Record_Error
+		error_json, encode_error = chat_error_json(message)
+		if encode_error != .None {
+			chat_session_record_failure_detail(chat, "the compaction outcome could not be recorded", "the error record could not be encoded", .Encode)
+			return
+		}
 	}
 	if finish_err := session.request_finish(
 		chat.store,
@@ -808,10 +869,14 @@ chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> boo
 	ai.Provider_Operation_Error_Destroy(&job.operation, job.allocator)
 	job.attempts += 1
 
-	if _, begin_err := chat_compact_begin_attempt(chat, job, previous, session.now_ms()); begin_err != nil {
-		local := begin_err
+	if _, begin_err := chat_compact_begin_attempt(chat, job, previous, session.now_ms()); begin_err != nil || chat_session_storage_failed(chat) {
 		chat_compact_failed_job(control, job)
-		_observer_message(observer, .Warning, fmt.tprintf("the summary could not be sent again: %s", session.error_detail(&local)))
+		if begin_err != nil {
+			local := begin_err
+			_observer_message(observer, .Warning, fmt.tprintf("the summary could not be sent again: %s", session.error_detail(&local)))
+		} else {
+			_observer_message(observer, .Warning, "the summary request could not be recorded")
+		}
 		return false
 	}
 	if !chat_compact_launch(job) {
@@ -893,7 +958,13 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 		return
 	}
 
-	response_json := chat_compaction_response_json(summary, job.snapshot.base_seq, job.snapshot.covered_seq)
+	response_json, response_error := chat_compaction_response_json(summary, job.snapshot.base_seq, job.snapshot.covered_seq)
+	if response_error != .None {
+		chat_session_record_failure_detail(chat, "the compaction outcome could not be recorded", "the summary record could not be encoded", .Encode)
+		chat_compact_failed_job(control, job)
+		_observer_message(observer, .Warning, "the compaction summary could not be recorded")
+		return
+	}
 	chat_compact_finish_request(chat, job.request_no, .Completed, response_json, "", job.usage)
 	control.state = .Ready
 	control.last_failure_at_ms = 0
