@@ -82,7 +82,10 @@ models_dev_read_due :: proc(app: ^App) -> bool {
 
 catalog_refresh_worker :: proc(thread_handle: ^thread.Thread) {
 	app := cast(^App)thread_handle.data
+	// The worker adopts the run's logger and allocator, so what it allocates belongs to
+	// the run rather than to the process default a fresh thread context starts with.
 	context.logger = agent.log_logger(&app.setup.log_binding)
+	context.allocator = app.setup.alloc
 	for {
 		_, open := chan.recv(app.catalog_refresh)
 		if !open { return }

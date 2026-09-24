@@ -19,10 +19,11 @@ import "nabla:ai"
 run_worker :: proc(thread_handle: ^thread.Thread) {
 	app := cast(^App)thread_handle.data
 	// A thread started without init_context gets the default context, not the one
-	// the creating scope modified, so the run's logger is installed here. Only the
-	// logger is taken: leaving init_context unset is what keeps the thread library
-	// managing this thread's temporary allocator.
+	// the creating scope modified, so the run's logger and allocator are installed
+	// here. Leaving init_context unset is what keeps the thread library managing
+	// this thread's temporary allocator.
 	context.logger = agent.log_logger(&app.setup.log_binding)
+	context.allocator = app.setup.alloc
 	observer := run_observer(app)
 	// The session list the /resume menu offers is built here, because only the
 	// worker touches the store.

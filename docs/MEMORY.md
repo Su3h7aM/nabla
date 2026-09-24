@@ -303,6 +303,10 @@ tracking allocator, and keeps the invariant true if the run allocator changes.
 How: one assignment beside the existing logger assignment, using the owner's
 allocator.
 
+Landed for the four workers that did not have it: `run_worker` (`app_worker.odin`), `catalog_refresh_worker` (`app_catalog.odin`) and `watchdog_worker` (`app_watchdog.odin`) take `app.setup.alloc`, and `acp_worker` (`acp_server.odin`) takes `server.alloc`, which is the allocator the work it destroys was allocated with. The agent workers already adopted theirs: `chat_request_worker_main` takes `worker.allocator`, `chat_compact_worker` and `tool_job_worker` take the job's.
+
+The point is not which allocator it is, since today all of them are the same heap. It is that a thread started without `init_context` otherwise allocates from the process default, where a tracking allocator in a test cannot see it and where a run that adopts a different allocator would be bypassed. Every worker entry now states the two things it adopts: the logger that makes its facts readable, and the allocator that owns the memory behind them.
+
 ### 8. Later: page ACP replay
 
 `acp_replay_session` loads the whole retained history through `history_load`. It

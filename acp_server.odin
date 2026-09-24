@@ -289,8 +289,10 @@ acp_server_destroy :: proc(server: ^Acp_Server) {
 acp_worker :: proc(thread_handle: ^thread.Thread) {
 	server := cast(^Acp_Server)thread_handle.data
 	// A thread started without init_context gets the default context, so the run's
-	// logger is installed here.
+	// logger and the server's allocator, which the work it destroys was allocated
+	// with, are installed here.
 	context.logger = agent.log_logger(&server.app.setup.log_binding)
+	context.allocator = server.alloc
 	for {
 		work, ok := chan.recv(server.work)
 		if !ok { break }

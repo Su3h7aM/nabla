@@ -153,7 +153,10 @@ watchdog_verdict :: proc(still, since_report: time.Duration, reporting: bool) ->
 watchdog_worker :: proc(handle: ^thread.Thread) {
 	app := cast(^App)handle.data
 	watchdog := &app.watchdog
+	// A thread started without init_context gets the process default context, so the run's
+	// logger and allocator are installed here.
 	context.logger = agent.log_logger(&watchdog.binding)
+	context.allocator = app.setup.alloc
 
 	seen := sync.atomic_load(&watchdog.beat)
 	seen_at := time.tick_now()
