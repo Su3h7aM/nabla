@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
@@ -120,6 +121,9 @@ chat_encode_manifest :: proc(
 	string,
 	Instruction_Manifest_Error,
 ) {
+	// The manifest slices and the digests are scratch: the record that is returned is
+	// marshalled with the allocator the caller passed.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	scratch := context.temp_allocator
 	inline_catalog, inline_error := encode_skill_catalog(catalog, scratch)
 	if inline_error != nil { return "", .Allocation }
@@ -296,6 +300,9 @@ snapshot_diagnostic_make :: proc(entry: Instruction_Manifest_Diagnostic, allocat
 }
 
 chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: string) -> bool {
+	// The manifest is parsed out of temp memory and everything the catalog keeps is cloned
+	// into the session's allocator.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	// A second catalog never replaces the first: the check comes before any
 	// allocation, so refusing costs nothing and leaks nothing.
 	if chat.skill_catalog != nil { return false }

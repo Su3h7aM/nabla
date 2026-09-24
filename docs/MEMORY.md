@@ -202,19 +202,9 @@ somewhere else. The aim is the memory each phase actually needs, not the smalles
 number a run can be pushed to: a buffer that is reused and one that is bounded
 both cost what they use, and a computation that needs its scratch keeps it.
 
-Remaining, same mechanism, each one per turn or per request: the settle path in
-`chat.odin`, `chat_command.odin`, `chat_instructions.odin`, `instructions.odin`,
-`compact.odin` (`chat_compact_start`, `chat_compact_install`, and the compaction
-record), `log_capture.odin`, `config.odin`, `config_mcp.odin`,
-`discovery.odin`, the `tool_*.odin` validators, and the `store.odin` helpers
-that take paths. The session release path also allocates 2.5 MiB of temp memory
-at teardown: a one-off, and the same mistake.
+Closed. The guards cover the session writes, the chat phases, the tool path, and the instruction and skill scan: `skills.discover`, `discover_root`, `frontmatter_block`, `chat_encode_manifest` and `chat_apply_snapshot`, the last three with `ignore` because each returns a value built in the allocator it was handed.
 
-Those in `chat_record.odin` and `log_capture.odin` are the awkward ones: they
-*return* temp-allocated strings, so the guard belongs at the caller that
-consumes the value, or the procedure takes an explicit allocator like every
-other allocating procedure in the harness. That choice is worth making once for
-the file rather than per call.
+The sites this section used to name as remaining are left alone, each for a reason. The instruction path (`instructions.odin`, the rest of `skills`) runs once for a run rather than once per turn: the store records one instruction snapshot for a seventeen-request repro, so a guard there is noise on a cold path. `config.odin`, `config_mcp.odin`, `discovery.odin`, the `store.odin` helpers, and the session release allocate once per run or once per session, for the same reason. The procedures that return temp memory (`chat_request_config_json`, `chat_text_digest`, `log_capture_basename`, `tool_shell_preferred`, `tool_field_path`, `mcp_stdio_config`) cannot carry a guard at all: the caller keeps what they return, so releasing at the return would free it, and the choice is theirs to make or theirs to avoid by taking an allocator. `chat_command.chat_notice_status` is the one worth naming separately: the strings it hands the observer are temp, and whether an observer may keep them is the observer's contract rather than this scope's, so its guard belongs wherever that contract is written down.
 
 ### 5. Borrow the text instead of copying it per phase
 

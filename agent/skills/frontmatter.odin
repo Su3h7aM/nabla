@@ -1,5 +1,6 @@
 package skills
 
+import "base:runtime"
 import "core:crypto/sha2"
 import "core:encoding/endian"
 import "core:mem"
@@ -256,6 +257,9 @@ frontmatter_hex4 :: proc(text: string) -> (u32, bool) {
 }
 
 frontmatter_block :: proc(text, marker: string, next_line, line_number: int, allocator: mem.Allocator) -> (Frontmatter_Value, Load_Error) {
+	// The block's text is assembled in temp memory and cloned into the allocator the value
+	// is returned in.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	folded := marker[0] == '>'
 	chomp := marker[len(marker) - 1]
 	builder := strings.builder_make(allocator)
