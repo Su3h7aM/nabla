@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
@@ -217,6 +218,10 @@ chat_append_entries :: proc(
 ) -> (
 	replay_refused: int,
 ) {
+	// The projection reads the entries it is handed and keeps nothing of its own beyond the
+	// messages it appends, which borrow them: the temp memory its lookups and replay parses
+	// use is released when the projection ends.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	group: [dynamic]ai.Provider_Tool_Call
 	group_open := false
 	call_ids := make(map[i64]string, allocator = context.temp_allocator)

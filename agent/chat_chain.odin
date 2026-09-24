@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:fmt"
 import "core:log"
 import "core:thread"
@@ -140,6 +141,9 @@ chat_record_attempt :: proc(
 	request_no: session.Request_No,
 	recorded: bool,
 ) {
+	// The config and input records are built in temp memory and handed to the row: the
+	// scope that made them is the scope that releases them.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	config_json, config_error := chat_request_config_json(chat, prep.request.Max_Output_Tokens)
 	if config_error != .None {
 		chat_session_record_failure_detail(chat, "the request record could not be encoded", "the request configuration could not be encoded", .Encode)

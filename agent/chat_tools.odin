@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:os"
 import "core:time"
 
@@ -79,6 +80,9 @@ chat_tool_jobs_finish :: proc(chat: ^Chat_Session, turn_id: u64) -> bool {
 // have.
 @(private)
 chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, result: ^Tool_Result, spilled: bool) -> (seq: session.Seq, recorded: bool) {
+	// The entry's fields, error text included, are written before this returns, so the temp
+	// memory they were built in is released here.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	error_text := ""
 	if result.error.kind != .None { error_text = tool_argument_error_text(result.error, context.temp_allocator) }
 	entry := session.New_Entry {

@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:log"
@@ -261,6 +262,9 @@ chat_finish_request :: proc(
 	result: Chat_Send_Result,
 	usages: ^[dynamic]Chat_Request_Usage,
 ) {
+	// The outcome and error records are built in temp memory and handed to the row: the
+	// scope that made them is the scope that releases them.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	response_json := ""
 	if result.finish_reason != .Unknown {
 		response_data, response_error := json.marshal(

@@ -163,16 +163,26 @@ advances, unguarded ones advance it by the request size every call.
 
 Landed: `insert_entry` and `entry_append` (`agent/session/history.odin`) and
 `context_load` (`agent/session/context.odin`), the two per-entry writes and the
-per-request read. The same ten turns now end at 0.85 MiB instead of 5.57 MiB.
+per-request read: 5.57 MiB to 0.85 MiB on the same ten turns. Then the phases a
+turn writes with: `chat_record_attempt` (`agent/chat_chain.odin`),
+`chat_finish_request` (`agent/chat.odin`), `chat_record_tool_result`
+(`agent/chat_tools.odin`), and `chat_append_entries` (`agent/chat_request.odin`):
+0.85 MiB to 0.44 MiB.
 
-Remaining, same mechanism, each one per turn or per request: `chat_record.odin`
-(`chat_request_config_json`, `chat_request_input_make`, `chat_request_input_encode`,
-`chat_text_digest`, `chat_request_error_json`, `chat_turn_error_json`,
-`chat_error_json`, `chat_compaction_response_json`), `chat_request.odin`
-(`chat_append_entries`, `chat_replay_call`), `chat.odin` (`chat_finish_request`),
-`chat_tools.odin` (`chat_record_tool_result`), `chat_command.odin`,
-`chat_instructions.odin`, `instructions.odin`, `compact.odin`,
-`log_capture.odin`, `config.odin`, `config_mcp.odin`, `discovery.odin`.
+A guard is a mark and a reset, so it also removes the block mapping the next turn
+would otherwise take. It is a performance change as much as a memory one, and it
+states the lifetime where the memory is chosen rather than adding a rule
+somewhere else. The aim is the memory each phase actually needs, not the smallest
+number a run can be pushed to: a buffer that is reused and one that is bounded
+both cost what they use, and a computation that needs its scratch keeps it.
+
+Remaining, same mechanism, each one per turn or per request: the settle path in
+`chat.odin`, `chat_command.odin`, `chat_instructions.odin`, `instructions.odin`,
+`compact.odin` (`chat_compact_start`, `chat_compact_install`, and the compaction
+record), `log_capture.odin`, `config.odin`, `config_mcp.odin`,
+`discovery.odin`, the `tool_*.odin` validators, and the `store.odin` helpers
+that take paths. The session release path also allocates 2.5 MiB of temp memory
+at teardown: a one-off, and the same mistake.
 
 Those in `chat_record.odin` and `log_capture.odin` are the awkward ones: they
 *return* temp-allocated strings, so the guard belongs at the caller that
