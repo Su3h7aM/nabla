@@ -173,3 +173,54 @@ test_advertised_description_names_the_running_shell :: proc(t: ^testing.T) {
 		unnamed.description,
 	)
 }
+
+// The spawn keeps tool commands out of the user's shell history without
+// changing which configuration the shell reads: fish runs private because it
+// is the one shell that consults history even for `shell -c`, and anything
+// else runs unchanged.
+@(test)
+test_spawn_shell_flags_keep_history_private :: proc(t: ^testing.T) {
+	first, second := tool_spawn_shell_flags("/usr/bin/fish")
+	testing.expect_value(t, string(first), "--private")
+	testing.expect(t, second == nil, "fish takes no second flag")
+
+	first, second = tool_spawn_shell_flags("fish")
+	testing.expect_value(t, string(first), "--private")
+
+	first, second = tool_spawn_shell_flags("/bin/bash")
+	testing.expect(t, first == nil && second == nil, "bash runs unchanged")
+
+	first, second = tool_spawn_shell_flags(TOOL_SHELL_FALLBACK)
+	testing.expect(t, first == nil && second == nil, "the portable shell runs unchanged")
+
+	first, second = tool_spawn_shell_flags("/usr/bin/zsh")
+	testing.expect(t, first == nil && second == nil, "zsh runs unchanged")
+}
+
+// A shell named fish receives --private on its command line, so the command
+// runs with history disabled while the shell keeps its configuration. A
+// fixture stands in for fish, so the test says nothing about whether the
+// machine has fish.
+@(test)
+test_shell_runs_fish_without_touching_history :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	scratch := shell_test_scratch(t)
+	defer os.remove_all(scratch)
+	defer delete(scratch, context.allocator)
+	fixture := fmt.aprintf("%s/fish", scratch, allocator = context.temp_allocator)
+	shell_test_program(t, fixture, "#!/bin/sh\necho ran-as-fish \"$@\"\n")
+	shell_test_set_shell(t, fixture)
+	defer shell_test_set_shell(t, TOOL_SHELL_FALLBACK)
+
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+
+	result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"printf payload"}`)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
+	testing.expect(
+		t,
+		strings.contains(result.content, `ran-as-fish --private -c printf payload`),
+		"fish runs the command with history disabled",
+	)
+}

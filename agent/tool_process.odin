@@ -33,8 +33,26 @@ Tool_Child :: struct {
 @(private)
 TOOL_SPAWN_EXEC_FAILED :: u8(1)
 
+// tool_spawn_shell_flags reports the extra argv entries that keep a shell
+// from touching the user's personal history without changing which
+// configuration it reads. Fish is the one shell that needs one: unlike the
+// POSIX shells, it consults its history even for `shell -c`, so it needs
+// --private to neither read old nor store new history. History managers such
+// as Atuin hook into fish through events that honor private mode, so tool
+// commands stay out of the user's history while the shell keeps its full
+// functionality. Bash and zsh already write no history for `-c`, and their rc
+// files are only read by interactive or login shells, so they run as
+// `shell -c command`, unchanged.
+tool_spawn_shell_flags :: proc(shell: string) -> (first, second: cstring) {
+	name := shell
+	if i := strings.last_index_byte(shell, '/'); i >= 0 { name = shell[i+1:] }
+	if name == "fish" { return cstring("--private"), nil }
+	return nil, nil
+}
+
 // tool_spawn_grouped starts shell in its own process group, running command with
-// `shell -c`, and reports whether the shell started. It is the shell's caller
+// `shell -c` plus the history-isolation flags tool_spawn_shell_flags reports,
+// and reports whether the shell started. It is the shell's caller
 // that decides which shell that is and what to do when it does not start.
 //
 // Odin's os.process_start cannot express this. It forks and execs with no
@@ -54,8 +72,24 @@ tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stde
 	source := strings.clone_to_cstring(command, context.temp_allocator)
 	dash_c := strings.clone_to_cstring("-c", context.temp_allocator)
 	work := strings.clone_to_cstring(directory, context.temp_allocator)
+	flag_first, flag_second := tool_spawn_shell_flags(shell)
 
-	argv := [4]cstring{shell_cstring, dash_c, source, nil}
+	argv: [5]cstring
+	argv[0] = shell_cstring
+	count := 1
+	if flag_first != nil {
+		argv[count] = flag_first
+		count += 1
+	}
+	if flag_second != nil {
+		argv[count] = flag_second
+		count += 1
+	}
+	argv[count] = dash_c
+	count += 1
+	argv[count] = source
+	count += 1
+	argv[count] = nil
 
 	// The command inherits the environment this process was started with: the
 	// user's own environment, as the shell that launched the harness exported it.
