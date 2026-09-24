@@ -187,3 +187,5 @@ No em-dashes. No mannered prose. Mannered prose substitutes metaphor and flouris
 statement: "a dial worth turning" instead of "a parameter worth varying", "earns its keep" instead
 of "still matters". It exists to display the writer, makes the reader work harder, and drags in
 connotations you did not choose. Say what you mean. When a literal phrase is available, use it.
+
+Prose is not wrapped to a column limit. The `character_width` of 160 in `odinfmt.json` is a source rule and stays in the source files; a Markdown document, a design note, and a commit message break a line only where a new paragraph starts. Where the text wraps on screen is the reader's window to decide, not the writer's. Do not reflow prose that is already written to fit a narrower or wider line.
