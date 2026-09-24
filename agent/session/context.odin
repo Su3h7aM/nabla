@@ -1,5 +1,6 @@
 package session
 
+import "base:runtime"
 import "core:mem"
 
 import "nabla:db"
@@ -386,6 +387,9 @@ context_load :: proc(store: ^Store, id: Session_Id, allocator := context.allocat
 		entry_destroy(&checkpoint, allocator)
 	}
 
+	// The query's arguments are this read's own, so the temp arena is released with them
+	// rather than keeping the request's copy of them for the session's life.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	args := make([dynamic]db.Value, 0, 2, context.temp_allocator)
 	append(&args, db.Value(string(id)))
 	if value, present := boundary.?; present {

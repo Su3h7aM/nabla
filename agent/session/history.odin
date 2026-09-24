@@ -1,5 +1,6 @@
 package session
 
+import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
@@ -529,6 +530,9 @@ entries_append :: proc(store: ^Store, id: Session_Id, entries: []New_Entry, allo
 
 // entry_append stores one entry and returns its sequence number.
 entry_append :: proc(store: ^Store, id: Session_Id, entry: New_Entry) -> (Seq, Error) {
+	// The batch and the sequence numbers it is given are this call's own. Releasing them
+	// keeps the thread's temp arena to one block across a turn's entries.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	batch := [1]New_Entry{entry}
 	seqs, append_err := entries_append(store, id, batch[:], context.temp_allocator)
 	if append_err != nil { return 0, append_err }
@@ -685,6 +689,10 @@ ENTRY_SELECT_KIND :: `SELECT kind, turn_no FROM entries WHERE session_id = ? AND
 
 @(private)
 insert_entry :: proc(store: ^Store, id: Session_Id, seq: Seq, entry: New_Entry) -> Error {
+	// The payload's JSON is this write's own: encoded, handed to sqlite, and released here.
+	// Releasing it keeps the thread's temp arena to one block for a session's writes instead
+	// of a block per entry.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	payload_json, encode_err := entry_payload_encode(entry.payload, context.temp_allocator)
 	if encode_err != nil { return encode_err }
 

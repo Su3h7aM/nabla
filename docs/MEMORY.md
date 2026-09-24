@@ -143,24 +143,64 @@ reused, the cache costs one request's bytes rather than one per turn, and the
 size hint that only existed to make a fresh allocation affordable on the first
 try is gone with it.
 
-### 4. Stop copying the same text per phase
+### 4. Release the scratch a phase uses
 
-Where: the prepared request (`agent/chat_request.odin`), the store's payload
-JSON (`agent/session/*`), the response accumulator, and the transcript append
-(`app_worker.odin`).
+Where: every procedure that allocates from `context.temp_allocator`.
 
-Why: this is the remaining per-turn growth, about eight copies of each message
-per turn, each allocated fresh and freed. The allocator keeps the pages.
+The temp allocator is a per-thread arena that grows by adding a memory block
+whenever the current one cannot serve a request. Nothing in `agent` released it,
+so each phase of each turn left its block behind: 64 KiB to 512 KiB per turn, on
+every turn, for the life of the session. Measured on the scripted repro, the
+arena on the session thread went from 64 KiB to 5.57 MiB over ten turns.
 
-How: reuse one buffer per phase for the life of a session or a turn, as step 3
-did for the encode body. The transcript append is the cheapest of these: the
-entry's `[dynamic]u8` grows by doubling as deltas arrive, and a text that is
-replaced rather than appended can be written once.
+How: `runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()` at the top of the scope that
+chose temp memory. It is the runtime's own mechanism, documented on the
+allocator: the temp allocator "is typically called with `free_all` once per
+frame-loop to prevent it from leaking". The guard releases what the scope
+allocated and leaves the arena reusing one block. A standalone check confirms
+the difference: guarded calls return the same address and the block never
+advances, unguarded ones advance it by the request size every call.
+
+Landed: `insert_entry` and `entry_append` (`agent/session/history.odin`) and
+`context_load` (`agent/session/context.odin`), the two per-entry writes and the
+per-request read. The same ten turns now end at 0.85 MiB instead of 5.57 MiB.
+
+Remaining, same mechanism, each one per turn or per request: `chat_record.odin`
+(`chat_request_config_json`, `chat_request_input_make`, `chat_request_input_encode`,
+`chat_text_digest`, `chat_request_error_json`, `chat_turn_error_json`,
+`chat_error_json`, `chat_compaction_response_json`), `chat_request.odin`
+(`chat_append_entries`, `chat_replay_call`), `chat.odin` (`chat_finish_request`),
+`chat_tools.odin` (`chat_record_tool_result`), `chat_command.odin`,
+`chat_instructions.odin`, `instructions.odin`, `compact.odin`,
+`log_capture.odin`, `config.odin`, `config_mcp.odin`, `discovery.odin`.
+
+Those in `chat_record.odin` and `log_capture.odin` are the awkward ones: they
+*return* temp-allocated strings, so the guard belongs at the caller that
+consumes the value, or the procedure takes an explicit allocator like every
+other allocating procedure in the harness. That choice is worth making once for
+the file rather than per call.
+
+### 5. Borrow the text instead of copying it per phase
+
+Where: the prepared request and its projection into provider messages
+(`agent/chat_request.odin`), the response accumulator, and the transcript
+append (`app_worker.odin`).
+
+Why: beyond the temp arena, each phase still copies the conversation on the
+heap, and the allocator holds what it is given back. An entry's text already
+lives for the whole request, so a message can point at it instead of cloning
+it.
+
+How: keep one buffer per phase for the life of the session or the turn, as step
+3 did for the encode body, and pass slices rather than clones wherever the
+source outlives the use. The transcript append is the cheapest of these: the
+entry's `[dynamic]u8` doubles as deltas arrive, and a text that is replaced
+rather than appended can be written once.
 
 Verification: the scripted repro in this document's method section, before and
-after, and the store's own `sum(length(payload_json))` as the denominator.
+after, with the store's own `sum(length(payload_json))` as the denominator.
 
-### 5. One arena per request chain
+### 6. One arena per request chain
 
 Where: `agent/chat_chain.odin` (`Chat_Request_Chain` and `chat_chain_release`),
 the prepared request, and the worker that encodes it.
@@ -176,7 +216,7 @@ worker is joined. The rule that keeps it safe: the arena may only back data
 whose lifetime ends at that release. Published `Chat_Event`s stay on the session
 allocator, because the owner reads them after the worker exits.
 
-### 6. Name the allocator every worker uses
+### 7. Name the allocator every worker uses
 
 Where: the worker entry points that already assign `context.logger`:
 `agent/chat_chain.odin`, `agent/chat_worker.odin`, `agent/tool_job.odin`,
@@ -192,7 +232,7 @@ tracking allocator, and keeps the invariant true if the run allocator changes.
 How: one assignment beside the existing logger assignment, using the owner's
 allocator.
 
-### 7. Later: page ACP replay
+### 8. Later: page ACP replay
 
 `acp_replay_session` loads the whole retained history through `history_load`. It
 is temp-allocated and freed, so it is a spike rather than steady growth. Page it
@@ -202,20 +242,47 @@ by sequence order only if long-session replay becomes a problem.
 
 - No custom allocator layer, no global arena for everything, no reference
   counting, no pooling framework.
+- No `free_all(context.temp_allocator)` call sites. A guard states where the
+  memory a phase used is released; a bare `free_all` states only that someone
+  decided to wipe the thread's arena here.
 - `agent`'s explicit `allocator := context.allocator` parameters stay. They are
   already the right shape and this plan builds on them.
 - The `DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE` define stays.
 - No cap on how long a session runs or how much work it does. Growth comes from
   the sizes and lifetimes of the buffers, never from a limit on the session.
 
+## Toolchain note
+
+The harness is verified with two Odin builds. `~/.local/bin/odin` is the fork,
+and `mise`'s install is the baseline. Both compile against `ODIN_ROOT`, which is
+exported as `~/Projects/Odin` in this shell, so the runtime in both cases is the
+fork's slab allocator.
+
+That allocator asserts while running the `agent` suite, which blocks the gate:
+
+```
+base/runtime/heap_allocator_implementation.odin(814:2) runtime assertion:
+The heap allocator miscalculated the number of bins for a new slab.
+[FATAL] Caught signal to stop test #110 agent.test_capture_keeps_a_prefix_and_says_so
+```
+
+It is the runtime rather than the frontend: it reproduces with the mise compiler
+against the same root, and it reproduces with one test thread as well as sixteen.
+The same test alone passes, so it depends on what the suite did before it. Until
+it is fixed, the harness suites are verified with `ODIN_ROOT` unset, which uses
+the install's own heap allocator.
+
 ## Order and expected effect
 
 1. Layout budget. Landed.
 2. Transcript budget. Landed.
 3. Encode body reuse. Landed.
-4. Per-phase copies of message text. This is where the measured growth lives.
-5. Chain arena, if 4 leaves a residual.
-6. Worker allocators: makes what is left attributable.
+4. Temp arena release where a phase ends. Landed for the session layer; the rest
+   of `agent` listed above still grows a block per turn.
+5. Borrow instead of copying per phase. This is where the remaining per-turn
+   growth is.
+6. Chain arena, if 5 leaves a residual.
+7. Worker allocators: makes what is left attributable.
 
 Expected result once step 4 lands: a session's RSS tracks the largest message it
 handles rather than the sum of every message it ever handled.
