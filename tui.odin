@@ -135,32 +135,34 @@ FONT_GREEN :: layout.Font(5)
 FONT_CYAN :: layout.Font(6)
 FONT_YELLOW :: layout.Font(7)
 
-// TUI_COMMAND_CAPACITY bounds the command nodes retained for one transcript frame.
-TUI_COMMAND_CAPACITY :: 4096
-
 // FOOTER_KIB_ROUNDING and KIBIBYTE keep footer token counts rounded to the nearest KiB.
 FOOTER_KIB_ROUNDING :: 512
 KIBIBYTE :: 1024
 
-// CONVERSATION_CAPACITIES budgets one transcript frame: three nodes per
-// labeled entry (label, body element, body text) and two per unlabeled one,
-// plus the root. Commands stay bounded by the viewport because culling drops
-// every line outside the conversation's clip. A frame whose transcript
-// outgrows a pool fails and leaves the previous screen up.
-// ponytail: layout storage is fixed at init, so measured_words bounds a frame
-// at ~131k transcript words; the upgrade path is a reserve API in layout.
+// CONVERSATION_CAPACITIES is where one transcript frame's budget starts: room
+// for about a screen of entries, not for every entry a session ever produced.
+// A frame that outgrows a pool reports which one, and conversation_solve raises
+// it through layout.reserve, so the storage settles at the transcript's own
+// high-water mark. Reserving the worst case instead held about 16 MiB for the
+// life of the process.
 CONVERSATION_CAPACITIES :: layout.Capacities {
-	nodes          = 16384,
-	children       = 32768,
-	clips          = 8,
-	commands       = TUI_COMMAND_CAPACITY,
-	text_lines     = 32768,
-	measured_words = 131072,
-	measure_cache  = 8192,
+	nodes          = 512,
+	children       = 1024,
+	clips          = 16,
+	commands       = 512,
+	text_lines     = 1024,
+	measured_words = 4096,
+	measure_cache  = 512,
 	id_table       = 8,
 	depth          = 8,
 	diagnostics    = 64,
 }
+
+// CONVERSATION_GROW_ATTEMPTS bounds how many times one solve may raise the
+// budget. A frame reports one exhausted pool at a time, and growth doubles it,
+// so the attempts cover several pools raised in sequence; the bound is what
+// fails the frame instead of looping when a pool cannot be satisfied.
+CONVERSATION_GROW_ATTEMPTS :: 16
 
 // Line is one wrapped display line: text is borrowed from frame scratch and
 // lives until the frame is presented.
@@ -186,16 +188,19 @@ Render_Status :: enum u8 {
 }
 
 // Frame_Storage is the caller-owned frame budget: the cell grid backing, the
-// presentation scratch, and the layout context with its fixed storage, sized
-// to the current viewport.
+// presentation scratch, and the layout context, whose storage grows to the
+// transcript it is given.
 Frame_Storage :: struct {
-	cells:          []term.Cell,
-	buffer:         term.Frame_Buffer,
-	output:         []byte,
-	alloc:          mem.Allocator,
-	layout_ctx:     layout.Context,
-	layout_storage: []byte, // owned,
-	measure:        tui.Measure_Context,
+	cells:      []term.Cell,
+	buffer:     term.Frame_Buffer,
+	output:     []byte,
+	alloc:      mem.Allocator,
+	layout_ctx: layout.Context,
+	// capacities is what layout_ctx is currently sized for. The context owns its
+	// storage, so the budget is raised through layout.reserve as the transcript
+	// outgrows it, and this is the base a raise is computed from.
+	capacities: layout.Capacities,
+	measure:    tui.Measure_Context,
 }
 
 frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
@@ -207,17 +212,15 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	// The zero profile would drop tabs while drawing expands them, and the
 	// box math below would place the border from the wrong width.
 	storage.measure.profile = text.DEFAULT_WIDTH_PROFILE
-	storage.layout_storage, storage_error = make([]byte, layout.storage_size(CONVERSATION_CAPACITIES), alloc)
-	if storage_error != nil {
-		free(storage, alloc)
-		return nil
-	}
+	storage.capacities = CONVERSATION_CAPACITIES
 	config := layout.Options {
-		capacities = CONVERSATION_CAPACITIES,
+		capacities = storage.capacities,
 		cull       = .Visible,
 	}
-	if layout.init_from_buffer(&storage.layout_ctx, config, storage.layout_storage) != nil {
-		delete(storage.layout_storage, alloc)
+	// layout.init gives the context storage of its own, which is what makes the
+	// budget raisable: init_from_buffer storage belongs to the caller, and a
+	// context built on it cannot reserve.
+	if layout.init(&storage.layout_ctx, config, alloc) != nil {
 		free(storage, alloc)
 		return nil
 	}
@@ -228,7 +231,6 @@ frame_storage_destroy :: proc(storage: ^Frame_Storage) {
 	if storage.cells != nil { delete(storage.cells, storage.alloc) }
 	if storage.output != nil { delete(storage.output, storage.alloc) }
 	layout.destroy(&storage.layout_ctx)
-	if storage.layout_storage != nil { delete(storage.layout_storage, storage.alloc) }
 	free(storage, storage.alloc)
 }
 
@@ -366,38 +368,8 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 	viewport := layout.Vec2{layout.Scalar(rect.width), layout.Scalar(rect.height)}
 
 	for pass in 0 ..< 2 {
-		// Services bind for one frame only, so both passes re-bind.
-		layout.set_services(
-			&storage.layout_ctx,
-			layout.Services{measure_text = tui.measure_proc, measure_text_user_data = &storage.measure, break_text = tui.break_proc},
-		)
-		if layout.frame(&storage.layout_ctx, viewport) {
-			if layout.element(
-				&storage.layout_ctx,
-				layout.Element_Desc {
-					id = CONVERSATION_ID,
-					layout = layout.Layout_Style{flow = .Column, sizing = layout.Sizing{width = layout.grow(), height = layout.grow()}, align = .Stretch},
-					// The conversation is a vertical scroll container, so it clips
-					// horizontally too. An unbreakable token wider than the viewport
-					// must not widen the root, or every entry would wrap at that
-					// width and be truncated at the terminal edge.
-					clip = layout.Clip_Style{axes = {.X, .Y}, offset = {0, layout.Scalar(offset)}},
-				},
-			) {
-				if len(app.run.snap.entries) == 0 {
-					if layout.element(&storage.layout_ctx, layout.Element_Desc{layout = {flow = .Column}}) {
-						layout.text(&storage.layout_ctx, layout.Text_Desc{text = "nabla", style = layout_text_style(TITLE_STYLE)})
-						layout.text(&storage.layout_ctx, layout.Text_Desc{text = STARTUP_HINT, style = layout_text_style(HINT_STYLE)})
-					}
-				} else {
-					for &entry, ordinal in app.run.snap.entries {
-						declare_entry(&storage.layout_ctx, &entry, rect.width, ordinal)
-					}
-				}
-			}
-		}
-		frame_result, frame_error := layout.result(&storage.layout_ctx)
-		if frame_error != .None {
+		frame_result, solved := conversation_solve(app, storage, viewport, rect.width, offset)
+		if !solved {
 			return false
 		}
 		node, found := layout.lookup(frame_result, CONVERSATION_ID)
@@ -417,6 +389,138 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 		offset = corrected
 	}
 	return false
+}
+
+// conversation_solve declares one conversation frame and returns its solved
+// result, raising the layout budget when the frame ran out of a pool.
+//
+// reserve is layout's own recovery from exhaustion: the frame names the pool it
+// exhausted, growth doubles it, and the raised budget is kept. Each pool pays
+// this once per session, so the storage settles at what this session used
+// instead of a reservation sized for the worst case.
+conversation_solve :: proc(
+	app: ^App,
+	storage: ^Frame_Storage,
+	viewport: layout.Vec2,
+	width: int,
+	offset: int,
+) -> (
+	layout.Frame_Result,
+	bool,
+) {
+	declare_conversation(app, storage, viewport, width, offset)
+	frame_result, frame_error := layout.result(&storage.layout_ctx)
+	for _ in 0 ..< CONVERSATION_GROW_ATTEMPTS {
+		if frame_error != .Capacity_Exhausted {
+			break
+		}
+		if !conversation_budget_raise(storage) {
+			return {}, false
+		}
+		declare_conversation(app, storage, viewport, width, offset)
+		frame_result, frame_error = layout.result(&storage.layout_ctx)
+	}
+	if frame_error != .None {
+		return {}, false
+	}
+	return frame_result, true
+}
+
+// declare_conversation declares one frame's tree: the transcript column, the
+// startup hint when there is nothing to show, and one element per entry.
+//
+// The declarations live inside the frame's own `if` block because that block is
+// what layout closes the frame on: the frame resolves and publishes its result
+// when the block exits, so a declaration outside it is not part of the frame.
+declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int) {
+	// Services bind for one frame only, so every solve re-binds them.
+	layout.set_services(
+		&storage.layout_ctx,
+		layout.Services{measure_text = tui.measure_proc, measure_text_user_data = &storage.measure, break_text = tui.break_proc},
+	)
+	if layout.frame(&storage.layout_ctx, viewport) {
+		if layout.element(
+			&storage.layout_ctx,
+			layout.Element_Desc {
+				id = CONVERSATION_ID,
+				layout = layout.Layout_Style{flow = .Column, sizing = layout.Sizing{width = layout.grow(), height = layout.grow()}, align = .Stretch},
+				// The conversation is a vertical scroll container, so it clips
+				// horizontally too. An unbreakable token wider than the viewport
+				// must not widen the root, or every entry would wrap at that
+				// width and be truncated at the terminal edge.
+				clip = layout.Clip_Style{axes = {.X, .Y}, offset = {0, layout.Scalar(offset)}},
+			},
+		) {
+			if len(app.run.snap.entries) == 0 {
+				if layout.element(&storage.layout_ctx, layout.Element_Desc{layout = {flow = .Column}}) {
+					layout.text(&storage.layout_ctx, layout.Text_Desc{text = "nabla", style = layout_text_style(TITLE_STYLE)})
+					layout.text(&storage.layout_ctx, layout.Text_Desc{text = STARTUP_HINT, style = layout_text_style(HINT_STYLE)})
+				}
+			} else {
+				for &entry, ordinal in app.run.snap.entries {
+					declare_entry(&storage.layout_ctx, &entry, width, ordinal)
+				}
+			}
+		}
+	}
+}
+
+// conversation_budget_raise doubles the pool the last frame ran out of and
+// raises the context's budget to match. False means the frame failed for
+// another reason, or the raise itself failed; either way the context is left
+// usable at its previous capacities.
+conversation_budget_raise :: proc(storage: ^Frame_Storage) -> bool {
+	pool := layout.Pool_Id.None
+	for diagnostic in layout.diagnostics(&storage.layout_ctx) {
+		if diagnostic.kind == .Pool_Exhausted {
+			pool = diagnostic.pool
+			break
+		}
+	}
+	if pool == .None {
+		return false
+	}
+	next := conversation_capacities_raise(storage.capacities, pool)
+	if layout.reserve(&storage.layout_ctx, next) != nil {
+		return false
+	}
+	storage.capacities = next
+	return true
+}
+
+// conversation_capacities_raise doubles the capacity behind one exhausted pool.
+// Growth is per pool, so a transcript of text does not also buy node room it
+// never used. The pools without a capacity of their own are carved from nodes,
+// so raising nodes is what makes room for them.
+conversation_capacities_raise :: proc(current: layout.Capacities, pool: layout.Pool_Id) -> layout.Capacities {
+	next := current
+	switch pool {
+	case .Nodes, .None, .Solver_Scratch, .Hit_Order, .Id_Index:
+		next.nodes = max(current.nodes * 2, 256)
+	case .Children:
+		next.children = max(current.children * 2, 512)
+	case .Clips:
+		next.clips = max(current.clips * 2, 8)
+	case .Commands:
+		next.commands = max(current.commands * 2, 256)
+	case .Text_Lines:
+		next.text_lines = max(current.text_lines * 2, 256)
+	case .Measured_Words:
+		next.measured_words = max(current.measured_words * 2, 1024)
+	case .Overlays:
+		next.overlays = max(current.overlays * 2, 4)
+	case .Measure_Cache:
+		next.measure_cache = max(current.measure_cache * 2, 256)
+	case .Id_Table:
+		next.id_table = max(current.id_table * 2, 8)
+	case .Depth:
+		next.depth = max(current.depth * 2, 8)
+	case .Diagnostics:
+		next.diagnostics = max(current.diagnostics * 2, 64)
+	case .Debug_Labels:
+		next.debug_labels = max(current.debug_labels * 2, 64)
+	}
+	return next
 }
 
 // draw_conversation_commands projects the solved frame's text commands into

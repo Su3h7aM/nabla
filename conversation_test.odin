@@ -3,10 +3,12 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
 import "nabla:input"
+import "nabla:layout"
 import "nabla:term"
 import "nabla:tui"
 import "nabla:tui/widgets"
@@ -191,6 +193,38 @@ test_conversation_solves_a_long_transcript :: proc(t: ^testing.T) {
 	defer frame_storage_destroy(storage)
 
 	testing.expect(t, conversation_render(t, app, storage, 40, 20), "a long transcript must still solve")
+}
+
+// The frame budget starts at room for about a screen and grows to what the
+// transcript actually declared, so a long session keeps its own high-water mark
+// instead of a reservation sized for the worst case. Growth is layout's own
+// recovery from exhaustion: the frame names the pool it ran out of, reserve
+// raises it, and the raised budget is kept.
+@(test)
+test_conversation_raises_its_budget_instead_of_reserving_the_worst_case :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	for value in 0 ..< 600 {
+		snap_append(app, .User, fmt.tprintf("message %d with enough words to wrap across a few columns", value))
+	}
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	if !testing.expect(t, storage != nil, "the frame storage must be allocated") { return }
+
+	initial := storage.capacities
+	testing.expect(t, layout.storage_size(initial) < mem.Megabyte, "the starting budget is sized for a screen, not a session")
+
+	testing.expect(t, conversation_render(t, app, storage, 60, 20), "a transcript larger than the starting budget must still solve")
+	testing.expect(
+		t,
+		storage.capacities.nodes > initial.nodes || storage.capacities.measured_words > initial.measured_words,
+		"the frame must raise its budget rather than fail",
+	)
 }
 
 // An unbreakable token wider than the viewport must not widen the conversation.
