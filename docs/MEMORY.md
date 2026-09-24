@@ -250,9 +250,17 @@ ends, so the conversation is built on the heap once per request. That is the cop
 step 6 should move into one arena per chain, where it is one allocation and one
 unmap instead of a load, a copy, and a release per request.
 
-This change is an allocation traffic reduction in the tens to hundreds of
-kilobytes per turn, below what the repro's RSS sampling resolves, so it is argued
-from the allocation counts in the code rather than from a measured difference.
+A transcript line whose text arrives in one piece was appended into an empty
+buffer, which doubles to reach the text and leaves up to twice the text as
+capacity behind, and the transcript budget counts the capacity an entry holds, so
+that slack cost lines. `snap_entry_set_text` sizes the buffer to the line and
+writes it once, while streamed fragments still append because their length is not
+known until the answer ends.
+
+Both changes are allocation traffic reductions in the tens to hundreds of
+kilobytes per turn, below what the repro's RSS sampling resolves, so they are
+argued from the allocation counts in the code rather than from a measured
+difference.
 
 Verification: the scripted repro in this document's method section, before and
 after, with the store's own `sum(length(payload_json))` as the denominator.

@@ -551,8 +551,21 @@ snap_entry_make :: proc(app: ^App, kind: Entry_Kind, text: string) -> Entry {
 	entry.text.allocator = app.run.alloc
 	app.run.snap.next_entry_id += 1
 	entry.id = app.run.snap.next_entry_id
-	snap_entry_append_text(app, &entry, text)
+	snap_entry_set_text(app, &entry, text)
 	return entry
+}
+
+// snap_entry_set_text writes text that arrived in one piece. The buffer is sized for
+// the text exactly, because a buffer grown to reach it holds up to twice the text and
+// the transcript budget counts the capacity an entry holds.
+snap_entry_set_text :: proc(app: ^App, entry: ^Entry, text: string) {
+	if len(text) == 0 { return }
+	if resize_error := resize(&entry.text, len(text)); resize_error != nil {
+		snap_report_dropped(app, resize_error)
+		return
+	}
+	copy(entry.text[:], text)
+	snap_entry_account(entry)
 }
 
 // snap_entry_account charges one entry for everything it holds: its own slot in
