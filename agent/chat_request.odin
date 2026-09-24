@@ -78,13 +78,12 @@ chat_prepare :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, al
 @(private)
 chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, prep: ^Chat_Request_Prep, allocator: mem.Allocator) -> bool {
 	chat_request_prep_destroy(prep, allocator)
-	ctx, context_err := session.context_load(chat.store, chat.id, allocator)
-	if context_err != nil {
-		chat_session_record_failure(chat, "the context could not be read again", context_err)
+	fresh, prep_err := chat_prepare(chat, connection, allocator)
+	if prep_err != nil {
+		chat_session_record_failure(chat, "the context could not be read again", prep_err)
 		return false
 	}
-	prep.history = ctx
-	chat_build_request_into(chat, prep, ctx.entries, ctx.dispatches, ctx.summary, connection, "", allocator)
+	prep^ = fresh
 	return true
 }
 
