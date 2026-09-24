@@ -125,7 +125,7 @@ test_a_summary_opens_the_request_before_the_kept_tail :: proc(t: ^testing.T) {
 		},
 	}
 	prep: Chat_Request_Prep
-	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, "")
+	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, "", chat.allocator)
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
 	testing.expect_value(t, len(prep.request.Messages), 3)
@@ -151,7 +151,7 @@ test_a_partial_answer_is_never_sent :: proc(t: ^testing.T) {
 		},
 	}
 	prep: Chat_Request_Prep
-	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, "")
+	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, "", chat.allocator)
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 	testing.expect_value(t, len(prep.request.Messages), 1)
 	testing.expect_value(t, prep.request.Messages[0].Content, "question")
@@ -173,7 +173,7 @@ test_a_compaction_request_shares_the_conversation_prefix :: proc(t: ^testing.T) 
 		entries = []session.Entry{compact_user_entry(1, "first")},
 	}
 	prep: Chat_Request_Prep
-	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, CHAT_COMPACT_DIRECTIVE)
+	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, tool_loop_connection, CHAT_COMPACT_DIRECTIVE, chat.allocator)
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
 	testing.expect(t, prep.request.Instructions_Present)

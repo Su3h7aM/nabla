@@ -114,7 +114,7 @@ test_a_result_the_batch_cannot_afford_is_kept_and_referenced :: proc(t: ^testing
 
 	// The request that follows carries a handle instead of the content, and the handle
 	// names the call the read tool takes.
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 	handles := 0

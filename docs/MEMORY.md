@@ -281,6 +281,12 @@ worker is joined. The rule that keeps it safe: the arena may only back data
 whose lifetime ends at that release. Published `Chat_Event`s stay on the session
 allocator, because the owner reads them after the worker exits.
 
+Landed, with one correction to the shape above. The arena is created in the procedure that builds a request and adopted by the chain literal at the end of it, because that literal replaces the whole chain and would have dropped an arena held in the chain beforehand; the scope that created the arena destroys it on every path that does not adopt it. What it backs: the context read out of the store and the entries and dispatches in it, the messages, tool definitions, call groups and feedback text the projection makes, and the worker argument that each attempt allocated and freed on its own. `chat_request_prep_destroy` is no longer called for a chain's request, and the ownership rule is in the signatures: `chat_prepare`, `chat_rebuild_prep` and `chat_build_request_into` take the allocator that owns the request they build, so the chain hands them its arena and a caller that keeps owning the request names the session allocator.
+
+Odin does not allow a default parameter value to name another parameter, so those three take the allocator as a required argument rather than defaulting to `chat.allocator`. That costs a named allocator at every call site, the tests included, and it is worth it: no caller can build a request with one allocator and release it with another.
+
+Verification: the scripted repro, which reports `VmRSS` as the turns run. The load, the projection and the worker argument are one mapping and one unmap per request instead of a few hundred allocations the allocator keeps as it likes.
+
 ### 7. Name the allocator every worker uses
 
 Where: the worker entry points that already assign `context.logger`:

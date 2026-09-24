@@ -3,6 +3,7 @@ package agent
 import "base:runtime"
 import "core:fmt"
 import "core:log"
+import "core:mem/virtual"
 import "core:thread"
 
 import "nabla:agent/session"
@@ -47,6 +48,11 @@ Chat_Request_Chain :: struct {
 	// is the argument the owner allocated for it, freed only after the join.
 	worker:              ^thread.Thread,
 	worker_data:         ^Chat_Request_Worker,
+	// scratch is the arena the chain builds its request in: the context read out of the
+	// store, the messages the projection makes, the entries it points at, and the worker's
+	// argument. Releasing the chain returns all of it in one unmap. A zero arena is inert,
+	// so a chain that never ran holds nothing.
+	scratch:             virtual.Arena,
 	prep:                Chat_Request_Prep,
 	encoded:             ai.Provider_Encoded_Request,
 	websocket_request:   bool,
@@ -90,7 +96,9 @@ chat_chain_release :: proc(chat: ^Chat_Session) {
 	mailbox_close(&chat.mailbox)
 	chat_chain_join(chat)
 	chat_session_retire_operation(chat)
-	chat_request_prep_destroy(&chat.chain.prep, chat.allocator)
+	// The request the chain built came from its arena, so there is one release for it rather
+	// than a walk over the context it read and the projection it made.
+	virtual.arena_destroy(&chat.chain.scratch)
 	ai.Provider_Operation_Error_Destroy(&chat.chain.operation_error, chat.mailbox.allocator)
 	if !chat.chain.encoded.Body_Borrowed { delete(chat.chain.encoded.Body, chat.allocator) }
 	chat.chain = {}
@@ -99,9 +107,10 @@ chat_chain_release :: proc(chat: ^Chat_Session) {
 	mailbox_reset(&chat.mailbox)
 }
 
-// chat_chain_join waits for the attempt's worker to finish and frees its argument. The
-// worker's last mailbox access is its terminal publication, so after the join the frozen
-// bytes it borrowed are the owner's to reuse or release.
+// chat_chain_join waits for the attempt's worker to finish and drops its argument,
+// which came from the chain's arena. The worker's last mailbox access is its
+// terminal publication, so after the join the frozen bytes it borrowed are the
+// owner's to reuse or release.
 @(private)
 chat_chain_join :: proc(chat: ^Chat_Session) {
 	if chat.chain.worker != nil {
@@ -109,10 +118,7 @@ chat_chain_join :: proc(chat: ^Chat_Session) {
 		thread.destroy(chat.chain.worker)
 		chat.chain.worker = nil
 	}
-	if chat.chain.worker_data != nil {
-		free(chat.chain.worker_data, chat.allocator)
-		chat.chain.worker_data = nil
-	}
+	chat.chain.worker_data = nil
 }
 
 // chat_chain_stop latches why the chain stopped and moves it to its commit. Selection
@@ -190,7 +196,7 @@ chat_try_context_repair :: proc(
 	attempts: int,
 ) -> Chat_Repair_Refusal {
 	previous_estimate := prep.estimate
-	refusal := chat_repair_context(chat, connection, observer, prep, encoded, previous_estimate, websocket_request)
+	refusal := chat_repair_context(chat, connection, observer, prep, encoded, previous_estimate, websocket_request, virtual.arena_allocator(&chat.chain.scratch))
 	if refusal != .None {
 		chat.turn_repair_refusal = refusal
 		// The session keeps the pressure, so the next safe boundary starts the summary
@@ -236,16 +242,25 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	// the conversation have diverged, and no request may be built on that.
 	if chat_session_storage_failed(chat) { return }
 
-	prep, prep_err := chat_prepare(chat, connection)
+	// The request this attempt builds is made in the chain's own arena, so the read of the
+	// store behind it and the projection over it have one owner. The chain literal at the
+	// end of this procedure adopts the arena; until then this scope destroys it on every
+	// return.
+	scratch: virtual.Arena
+	if arena_error := virtual.arena_init_growing(&scratch); arena_error != nil {
+		chat_session_fail_turn(chat, "the request scratch could not be allocated")
+		return
+	}
+	scratch_owned := true
+	defer {
+		if scratch_owned { virtual.arena_destroy(&scratch) }
+	}
+	scratch_allocator := virtual.arena_allocator(&scratch)
+
+	prep, prep_err := chat_prepare(chat, connection, scratch_allocator)
 	if prep_err != nil {
 		chat_session_record_failure(chat, "the request context could not be read", prep_err)
 		return
-	}
-	// The chain takes ownership of the preparation and the frozen bytes at the end of this
-	// procedure; until then this scope releases them on every return.
-	prep_owned := true
-	defer {
-		if prep_owned { chat_request_prep_destroy(&prep, chat.allocator) }
 	}
 
 	// The exact request about to be sent is what a compaction freezes, so it is considered
@@ -259,7 +274,7 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	message, admitted := chat_admission_check(chat, prep.estimate, prep.sizes)
 	if !admitted {
 		if chat_compact_relieve(chat, observer) && !chat_session_cancelled(chat) {
-			if !chat_rebuild_prep(chat, connection, &prep) { return }
+			if !chat_rebuild_prep(chat, connection, &prep, scratch_allocator) { return }
 			message, admitted = chat_admission_check(chat, prep.estimate, prep.sizes)
 		}
 		if !admitted {
@@ -323,11 +338,12 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 		observer          = observer,
 		options           = options,
 		prep              = prep,
+		scratch           = scratch,
 		encoded           = encoded,
 		websocket_request = websocket_request,
 		recovery_kind     = .Transient_Retry,
 	}
-	prep_owned = false
+	scratch_owned = false
 	body_owned = false
 }
 
@@ -411,7 +427,7 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 	// The attempt runs on its own thread so the owner can keep observing while the send
 	// blocks, and its facts reach the owner through the mailbox. The worker borrows the
 	// frozen bytes; the join in chat_chain_await is what makes their reuse safe.
-	worker, worker_error := new(Chat_Request_Worker, chat.allocator)
+	worker, worker_error := new(Chat_Request_Worker, virtual.arena_allocator(&chain.scratch))
 	if worker_error != nil {
 		chat_session_fail_turn(chat, "the request worker could not be allocated")
 		chat_chain_stop(chat, .Harness_Failure)
@@ -433,7 +449,6 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 	if new_thread == nil {
 		// No producer exists, so nothing will send. The row that was already written stays
 		// as the record of a send that was attempted but not performed.
-		free(worker, chat.allocator)
 		chat_session_fail_turn(chat, "the request worker could not be started")
 		chat_chain_stop(chat, .Harness_Failure)
 		return

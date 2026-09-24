@@ -616,7 +616,7 @@ chat_compact_start :: proc(
 	covered := entries[seam - 1].seq
 
 	compact_prep: Chat_Request_Prep
-	chat_build_request_into(chat, &compact_prep, entries[:seam], prep.history.dispatches, prep.history.summary, connection, CHAT_COMPACT_DIRECTIVE)
+	chat_build_request_into(chat, &compact_prep, entries[:seam], prep.history.dispatches, prep.history.summary, connection, CHAT_COMPACT_DIRECTIVE, chat.allocator)
 	defer chat_request_prep_destroy(&compact_prep, chat.allocator)
 
 	// The request carries the same rule as any other: it asks for the room the window has
@@ -1117,7 +1117,7 @@ chat_compact_idle_service :: proc(chat: ^Chat_Session, observer: Chat_Observer, 
 	// An intent is consumed by the attempt to start it, so one that cannot start here is
 	// not retried at every tick: the boundary that recorded it asked once.
 	if chat.compact.state == .Idle && chat.compact.pending != .None {
-		prep, prep_err := chat_prepare(chat, connection)
+		prep, prep_err := chat_prepare(chat, connection, chat.allocator)
 		if prep_err != nil {
 			chat_session_record_failure(chat, "the context could not be read", prep_err)
 			return changed
@@ -1207,6 +1207,10 @@ chat_repair_context :: proc(
 	encoded: ^ai.Provider_Encoded_Request,
 	previous_estimate: int,
 	websocket_request: bool,
+	// allocator is the one the request under repair was built in, and the one the repaired
+	// request is built in: a chain hands its arena here, and a caller keeping the request
+	// on the session allocator hands that.
+	allocator: mem.Allocator,
 ) -> Chat_Repair_Refusal {
 	// A summary may have finished while the rejected request was being sent.
 	chat_compact_poll(chat, observer)
@@ -1222,7 +1226,7 @@ chat_repair_context :: proc(
 	if !chat_compact_install(chat, observer) { return .Repair_Rejected }
 
 	previous_checkpoint := prep.history.summary_seq
-	if !chat_rebuild_prep(chat, connection, prep) { return .Repair_Rejected }
+	if !chat_rebuild_prep(chat, connection, prep, allocator) { return .Repair_Rejected }
 	// The request has to be built from a different checkpoint than the one the provider
 	// refused, and it has to be smaller by enough to be worth the cache break.
 	if prep.history.summary_seq == previous_checkpoint { return .No_Reduction }
@@ -1314,7 +1318,7 @@ chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, conne
 	// there no request boundary to wait for. Inside a turn, the next boundary
 	// freezes the request the summary will cover.
 	if chat.state == .Idle {
-		prep, prep_err := chat_prepare(chat, connection)
+		prep, prep_err := chat_prepare(chat, connection, chat.allocator)
 		if prep_err != nil {
 			chat_session_record_failure(chat, "the context could not be read", prep_err)
 			return false

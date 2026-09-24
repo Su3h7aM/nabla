@@ -16,7 +16,10 @@ import "nabla:ai"
 NABLA_USER_AGENT :: "nabla/0.1.0"
 
 // Chat_Request_Prep is one request built from committed history, together with
-// the storage the request borrows. It owns the context it was built from. The
+// the storage the request borrows. It owns the context it was built from, and the
+// allocator it was built in owns the request: the chain hands it an arena and
+// destroys that arena when the request ends, while a caller that hands it a
+// freeing allocator releases it with chat_request_prep_destroy. The
 // wire is one ordered list: a verbatim Responses output is a message in it, at
 // the position the response occupies in the conversation, so replay order and
 // projection order are the same order.
@@ -58,36 +61,40 @@ chat_request_prep_destroy :: proc(prep: ^Chat_Request_Prep, allocator: mem.Alloc
 // from it. Every request is built this way: there is no other copy of the
 // conversation to fall out of step with.
 @(private)
-chat_prepare :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection) -> (prep: Chat_Request_Prep, err: session.Error) {
-	ctx, context_err := session.context_load(chat.store, chat.id, chat.allocator)
+chat_prepare :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, allocator: mem.Allocator) -> (prep: Chat_Request_Prep, err: session.Error) {
+	ctx, context_err := session.context_load(chat.store, chat.id, allocator)
 	if context_err != nil { return {}, context_err }
 	prep.history = ctx
-	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, connection, "")
+	chat_build_request_into(chat, &prep, ctx.entries, ctx.dispatches, ctx.summary, connection, "", allocator)
 	return prep, nil
 }
 
 // chat_rebuild_prep replaces prep with a request built from the context as it is
 // now. It is how a request is rebuilt after the active context changed under it,
 // such as when a finished compaction was installed. False leaves prep destroyed
-// and the caller with nothing to send.
+// and the caller with nothing to send. Destroying the request it replaces
+// reclaims nothing when prep was built in an arena: the arena returns all of it
+// when the chain is released, which is where a chain's requests are reclaimed.
 @(private)
-chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, prep: ^Chat_Request_Prep) -> bool {
-	chat_request_prep_destroy(prep, chat.allocator)
-	ctx, context_err := session.context_load(chat.store, chat.id, chat.allocator)
+chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, prep: ^Chat_Request_Prep, allocator: mem.Allocator) -> bool {
+	chat_request_prep_destroy(prep, allocator)
+	ctx, context_err := session.context_load(chat.store, chat.id, allocator)
 	if context_err != nil {
 		chat_session_record_failure(chat, "the context could not be read again", context_err)
 		return false
 	}
 	prep.history = ctx
-	chat_build_request_into(chat, prep, ctx.entries, ctx.dispatches, ctx.summary, connection, "")
+	chat_build_request_into(chat, prep, ctx.entries, ctx.dispatches, ctx.summary, connection, "", allocator)
 	return true
 }
 
 // chat_build_request_into assembles a request from an explicit span of stored
-// entries and the summary that precedes it. directive, when not empty, is
-// appended as the final user message: that is how a compaction request asks for a
-// summary while carrying the same instructions, tools, and cache identity as the
-// conversation it is summarizing, so the provider prefix it reads is the warm one.
+// entries and the summary that precedes it. allocator owns everything the request
+// takes for itself; the entry text it points at stays the entries'. directive,
+// when not empty, is appended as the final user message: that is how a compaction
+// request asks for a summary while carrying the same instructions, tools, and
+// cache identity as the conversation it is summarizing, so the provider prefix it
+// reads is the warm one.
 @(private)
 chat_build_request_into :: proc(
 	chat: ^Chat_Session,
@@ -97,11 +104,12 @@ chat_build_request_into :: proc(
 	summary: string,
 	connection: ai.Provider_Connection,
 	directive: string,
+	allocator: mem.Allocator,
 ) {
-	prep.wire = make([dynamic]ai.Provider_Message, 0, len(entries) + 3, chat.allocator)
-	prep.tools = make([dynamic]ai.Provider_Tool_Def, 0, chat.allocator)
-	prep.calls = make([dynamic][dynamic]ai.Provider_Tool_Call, 0, chat.allocator)
-	prep.feedback = make([dynamic]string, 0, chat.allocator)
+	prep.wire = make([dynamic]ai.Provider_Message, 0, len(entries) + 3, allocator)
+	prep.tools = make([dynamic]ai.Provider_Tool_Def, 0, allocator)
+	prep.calls = make([dynamic][dynamic]ai.Provider_Tool_Call, 0, allocator)
+	prep.feedback = make([dynamic]string, 0, allocator)
 
 	// The instruction lane is the most stable content a request carries, so it
 	// travels beside the conversation rather than as a turn inside it.
@@ -117,7 +125,7 @@ chat_build_request_into :: proc(
 	if summary != "" {
 		append(&prep.wire, ai.Provider_Message{Role = .User, Content = summary})
 	}
-	prep.replay_refused = chat_append_entries(&prep.wire, &prep.calls, &prep.feedback, connection.API, entries, dispatches, chat.allocator)
+	prep.replay_refused = chat_append_entries(&prep.wire, &prep.calls, &prep.feedback, connection.API, entries, dispatches, allocator)
 	if directive != "" {
 		append(&prep.wire, ai.Provider_Message{Role = .User, Content = directive})
 	}

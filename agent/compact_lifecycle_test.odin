@@ -227,14 +227,14 @@ test_a_background_compaction_keeps_the_work_that_followed_it :: proc(t: ^testing
 	}
 
 	// What the foreground would send before any compaction, for comparison.
-	before, before_err := chat_prepare(chat, background)
+	before, before_err := chat_prepare(chat, background, chat.allocator)
 	if before_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	before_estimate := before.estimate
 	chat_request_prep_destroy(&before, chat.allocator)
 
 	// The agent asks for a compaction; the fork is frozen from the request it was
 	// about to send.
-	prep, prep_err := chat_prepare(chat, background)
+	prep, prep_err := chat_prepare(chat, background, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	testing.expect_value(t, chat_compact_request(chat, .Agent_Tool, nil), Compact_Request_Result.Scheduled)
 	chat_compact_consider(chat, {}, background, &prep)
@@ -276,7 +276,7 @@ test_a_background_compaction_keeps_the_work_that_followed_it :: proc(t: ^testing
 	// The next request opens with the checkpoint, and it is smaller than what it
 	// replaced. The old prefix was the frozen request's messages; the new one is
 	// the checkpoint plus the tail.
-	after, after_err := chat_prepare(chat, background)
+	after, after_err := chat_prepare(chat, background, chat.allocator)
 	if after_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&after, chat.allocator)
 	testing.expect(t, len(after.request.Messages) > 0)
@@ -306,7 +306,7 @@ test_a_failed_compaction_leaves_the_context_alone :: proc(t: ^testing.T) {
 		Endpoint = "http://127.0.0.1:9/",
 	}
 	chat.compact_retry = test_compact_retry_policy()
-	prep, prep_err := chat_prepare(chat, dead)
+	prep, prep_err := chat_prepare(chat, dead, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	testing.expect_value(t, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
 	chat_compact_consider(chat, {}, dead, &prep)
@@ -350,7 +350,7 @@ test_destroying_a_session_stops_its_compaction :: proc(t: ^testing.T) {
 		API      = .OpenAI_Chat_Completions,
 		Endpoint = compact_provider_endpoint(&setup.background, context.temp_allocator),
 	}
-	prep, prep_err := chat_prepare(chat, background)
+	prep, prep_err := chat_prepare(chat, background, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	testing.expect_value(t, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
 	chat_compact_consider(chat, {}, background, &prep)
@@ -444,7 +444,7 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(t: ^testing.
 		API      = .OpenAI_Chat_Completions,
 		Endpoint = "http://127.0.0.1:9/",
 	}
-	prep, prep_err := chat_prepare(chat, dead)
+	prep, prep_err := chat_prepare(chat, dead, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
@@ -510,7 +510,7 @@ test_a_rejected_payload_is_repaired_from_a_ready_summary :: proc(t: ^testing.T) 
 	// Pressure starts the summary, so it waits for the context to reach the size it was
 	// started for instead of installing at the next boundary. It is ready, and not yet
 	// installed, when the provider refuses the payload it does not fit.
-	prep, prep_err := chat_prepare(chat, connection)
+	prep, prep_err := chat_prepare(chat, connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	chat_compact_consider(chat, {}, connection, &prep)
 	chat_request_prep_destroy(&prep, chat.allocator)
@@ -707,7 +707,7 @@ test_a_transient_summary_failure_is_retried_on_the_same_bytes :: proc(t: ^testin
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	prep, prep_err := chat_prepare(chat, connection)
+	prep, prep_err := chat_prepare(chat, connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	// Pressure starts the summary, so it waits for the context to reach the size it was
 	// started for instead of installing at the next boundary: the test drives every attempt
@@ -781,7 +781,7 @@ test_a_summary_that_produced_nothing_is_not_sent_again :: proc(t: ^testing.T) {
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	prep, prep_err := chat_prepare(chat, connection)
+	prep, prep_err := chat_prepare(chat, connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	// Pressure starts the summary, so it waits for the context to reach the size it was
 	// started for instead of installing at the next boundary: the test drives every attempt
@@ -828,7 +828,7 @@ test_a_summary_chain_stops_at_its_bound :: proc(t: ^testing.T) {
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	prep, prep_err := chat_prepare(chat, connection)
+	prep, prep_err := chat_prepare(chat, connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	// Pressure starts the summary, so it waits for the context to reach the size it was
 	// started for instead of installing at the next boundary: the test drives every attempt
@@ -876,7 +876,7 @@ test_a_terminal_summary_failure_suppresses_automatic_starts :: proc(t: ^testing.
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	prep, prep_err := chat_prepare(chat, connection)
+	prep, prep_err := chat_prepare(chat, connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 	chat_compact_consider(chat, {}, connection, &prep)
@@ -925,7 +925,7 @@ test_an_exhausted_chain_waits_for_the_context_to_move :: proc(t: ^testing.T) {
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	prep, prep_err := chat_prepare(chat, connection)
+	prep, prep_err := chat_prepare(chat, connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	chat_compact_consider(chat, {}, connection, &prep)
 	if !compact_service_until(t, chat, .Idle) { return }
@@ -940,7 +940,7 @@ test_an_exhausted_chain_waits_for_the_context_to_move :: proc(t: ^testing.T) {
 	// Work the failed chain never saw is what makes another summary worth asking for.
 	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 3_000, payload = session.Assistant_Entry{text = "after the failure"}})
 	chat_request_prep_destroy(&prep, chat.allocator)
-	after, after_err := chat_prepare(chat, connection)
+	after, after_err := chat_prepare(chat, connection, chat.allocator)
 	if after_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&after, chat.allocator)
 	chat_compact_consider(chat, {}, connection, &after)
@@ -989,7 +989,7 @@ test_a_running_summary_ends_the_turn_as_context_exhaustion :: proc(t: ^testing.T
 
 	// The summary is in flight and the foreground is refused: there is nothing to install, and
 	// nothing waits for the summary to arrive.
-	prep, prep_err := chat_prepare(chat, background_connection)
+	prep, prep_err := chat_prepare(chat, background_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	chat_compact_consider(chat, {}, background_connection, &prep)
 	chat_request_prep_destroy(&prep, chat.allocator)

@@ -27,7 +27,7 @@ test_build_request_uses_canonical_tool_names_directly :: proc(t: ^testing.T) {
 	if !testing.expect_value(t, tool_registry_add(&chat.tools, definition).kind, Tool_Registry_Error_Kind.None) { return }
 	_test_accept(t, chat, "hi")
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
@@ -51,7 +51,7 @@ test_build_request_carries_configured_max_output :: proc(t: ^testing.T) {
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
 	_test_accept(t, chat, "hi")
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 	testing.expect(t, prep.request.Max_Output_Tokens_Present)
@@ -80,7 +80,7 @@ test_build_request_keeps_reasoning_before_calls :: proc(t: ^testing.T) {
 		},
 	)
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
@@ -109,7 +109,7 @@ test_build_request_sets_stable_response_cache_key :: proc(t: ^testing.T) {
 	responses := ai.Provider_Connection {
 		API = .OpenAI_Responses,
 	}
-	prep, prep_err := chat_prepare(chat, responses)
+	prep, prep_err := chat_prepare(chat, responses, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
@@ -118,7 +118,7 @@ test_build_request_sets_stable_response_cache_key :: proc(t: ^testing.T) {
 	testing.expect(t, prep.request.Prompt_Cache_Key_Present)
 	testing.expect_value(t, prep.request.Prompt_Cache_Key, string(chat.id))
 
-	chat_prep, chat_err := chat_prepare(chat, tool_loop_connection)
+	chat_prep, chat_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if chat_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&chat_prep, chat.allocator)
 	testing.expect(t, chat_prep.request.Prompt_Cache_Key_Present)
@@ -171,7 +171,7 @@ test_build_request_replays_verbatim_response_output_in_order :: proc(t: ^testing
 	chat_run_tools(chat, {})
 	chat_session_tools_done(chat, chat.active_turn_id, 1)
 
-	prep, prep_err := chat_prepare(chat, responses)
+	prep, prep_err := chat_prepare(chat, responses, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
@@ -296,7 +296,7 @@ test_chat_completions_projects_entries_a_response_entry_covers :: proc(t: ^testi
 		},
 	)
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
@@ -340,7 +340,7 @@ test_a_stored_result_names_its_call :: proc(t: ^testing.T) {
 		},
 	)
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
@@ -393,7 +393,7 @@ test_anthropic_request_is_shaped_by_its_adapter :: proc(t: ^testing.T) {
 		API      = .Anthropic_Messages,
 		Endpoint = "https://api.anthropic.com",
 	}
-	prep, prep_err := chat_prepare(chat, anthropic)
+	prep, prep_err := chat_prepare(chat, anthropic, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
@@ -489,7 +489,7 @@ test_error_marker_case :: proc(t: ^testing.T, outcome: session.Tool_Outcome) {
 		API      = .Anthropic_Messages,
 		Endpoint = "https://api.anthropic.com",
 	}
-	prep, prep_err := chat_prepare(chat, anthropic)
+	prep, prep_err := chat_prepare(chat, anthropic, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	body, encode_err := ai.Provider_Encode_Request(prep.request)
 	failed := !testing.expect_value(t, encode_err, ai.Provider_Request_Error.None)
@@ -609,7 +609,7 @@ test_a_request_rebuilds_identically_and_only_appends :: proc(t: ^testing.T) {
 
 @(private)
 encode_request_body :: proc(t: ^testing.T, chat: ^Chat_Session, connection: ai.Provider_Connection) -> string {
-	prep, prep_err := chat_prepare(chat, connection)
+	prep, prep_err := chat_prepare(chat, connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 	body, encode_err := ai.Provider_Encode_Request(prep.request)
@@ -673,7 +673,7 @@ test_request_record_carries_the_prepared_inventory :: proc(t: ^testing.T) {
 	chat.tools_enabled = true
 	_test_accept(t, chat, "hi")
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 

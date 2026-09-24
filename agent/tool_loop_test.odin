@@ -72,14 +72,14 @@ test_build_request_carries_selected_effort :: proc(t: ^testing.T) {
 	testing.expect(t, chat_session_set_effort(chat, "high"))
 	_test_accept(t, chat, "hi")
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	testing.expect(t, prep.request.Reasoning_Effort_Present)
 	testing.expect_value(t, prep.request.Reasoning_Effort, "high")
 	chat_request_prep_destroy(&prep, chat.allocator)
 
 	testing.expect(t, chat_session_set_effort(chat, ""))
-	prep, prep_err = chat_prepare(chat, tool_loop_connection)
+	prep, prep_err = chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 	testing.expect(t, !prep.request.Reasoning_Effort_Present)
@@ -128,7 +128,7 @@ test_admission_names_the_part_that_alone_does_not_fit :: proc(t: ^testing.T) {
 	added := tool_registry_add(&chat.tools, {name = "test_big", description = "big", input_schema = schema, execute = tool_policy_probe_execute})
 	testing.expect_value(t, added, Tool_Registry_Error{})
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 	// The window cannot hold the schemas alone, and the estimate says so.
@@ -279,7 +279,7 @@ test_malformed_arguments_are_rejected_and_replayed :: proc(t: ^testing.T) {
 	// The refusal is spoken in the call's place, for every API family.
 	apis := []ai.API_Kind{.OpenAI_Chat_Completions, .OpenAI_Responses, .Anthropic_Messages}
 	for api in apis {
-		prep, prep_err := chat_prepare(chat, {API = api})
+		prep, prep_err := chat_prepare(chat, {API = api}, chat.allocator)
 		if !testing.expectf(t, prep_err == nil, "%v must build a request", api) { continue }
 		body, encode_err := ai.Provider_Encode_Request(prep.request)
 		testing.expectf(t, encode_err == ai.Provider_Request_Error.None, "%v must encode a refused call", api)
@@ -306,7 +306,7 @@ test_a_repaired_call_is_replayed_as_what_ran :: proc(t: ^testing.T) {
 	testing.expect_value(t, count, 1)
 	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, count))
 
-	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Chat_Completions})
+	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Chat_Completions}, chat.allocator)
 	if !testing.expect_value(t, prep_err, nil) { return }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
@@ -372,7 +372,7 @@ test_a_response_with_an_unparseable_call_is_not_replayed_verbatim :: proc(t: ^te
 		},
 	)
 
-	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Responses})
+	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Responses}, chat.allocator)
 	if !testing.expect_value(t, prep_err, nil) { return }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 	body, encode_err := ai.Provider_Encode_Request(prep.request)
@@ -439,7 +439,7 @@ test_a_record_that_contradicts_the_call_it_holds_is_not_replayed :: proc(t: ^tes
 		},
 	)
 
-	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Responses})
+	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Responses}, chat.allocator)
 	if !testing.expect_value(t, prep_err, nil) { return }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 	body, encode_err := ai.Provider_Encode_Request(prep.request)
@@ -606,7 +606,7 @@ test_a_recovered_call_reaches_the_model_answered :: proc(t: ^testing.T) {
 	if recover_err != nil { testing.fail_now(t, "recovery failed") }
 	testing.expect_value(t, recovery.unexecuted_calls, 1)
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 

@@ -196,7 +196,7 @@ test_enrichment_unknown_model_sends_no_reasoning :: proc(t: ^testing.T) {
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW)
 
 	_test_accept(t, chat, "hello")
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
@@ -228,7 +228,7 @@ test_enrichment_stated_levels_send_the_chosen_effort :: proc(t: ^testing.T) {
 	testing.expect(t, chat_session_set_effort(chat, "high"))
 
 	_test_accept(t, chat, "hello")
-	prep, prep_err := chat_prepare(chat, tool_loop_connection)
+	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 	testing.expect(t, prep.request.Reasoning_Effort_Present)

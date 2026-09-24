@@ -289,7 +289,7 @@ test_starting_a_compaction_records_its_scope :: proc(t: ^testing.T) {
 		API      = .OpenAI_Chat_Completions,
 		Endpoint = "http://127.0.0.1:9/",
 	}
-	prep, prep_err := chat_prepare(chat, dead)
+	prep, prep_err := chat_prepare(chat, dead, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	testing.expect_value(t, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
 	chat_compact_consider(chat, {}, dead, &prep)
