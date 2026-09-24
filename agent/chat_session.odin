@@ -129,7 +129,8 @@ Chat_Session :: struct {
 	tool_jobs_active:             bool,
 
 	// partial_assistant is streamed text that has not been committed. It stays
-	// provisional until the turn settles.
+	// provisional until the turn settles, and its storage is kept once the answer
+	// is committed, so the next answer reuses it rather than growing a new buffer.
 	partial_assistant:            [dynamic]u8,
 
 	// pending_response and pending_calls are what the current response produced
@@ -344,6 +345,13 @@ chat_pending_calls_clear :: proc(chat: ^Chat_Session) {
 	clear(&chat.pending_calls)
 }
 
+// chat_partial_assistant_clear empties the streamed answer and keeps its storage.
+// The longest answer of the session sizes the buffer, and every answer after it
+// is written into what is already there instead of into a new, growing buffer.
+chat_partial_assistant_clear :: proc(chat: ^Chat_Session) {
+	clear(&chat.partial_assistant)
+}
+
 // CHAT_TITLE_MAX_BYTES bounds the derived title. It is a listing line, not a
 // summary: enough to recognise a session and no more.
 CHAT_TITLE_MAX_BYTES :: 80
@@ -491,8 +499,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	}
 	delete(chat.last_error, chat.allocator)
 	chat.last_error = ""
-	delete(chat.partial_assistant)
-	chat.partial_assistant = make([dynamic]u8, 0, 0, chat.allocator)
+	chat_partial_assistant_clear(chat)
 
 	fields := [1]Log_Field{{key = "prompt_bytes", value = i64(len(text))}}
 	binding.correlation = log_correlation(chat)

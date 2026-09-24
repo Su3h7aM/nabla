@@ -245,8 +245,7 @@ chat_commit_response_entries :: proc(chat: ^Chat_Session, request_no: session.Re
 
 	chat_response_output_destroy(&chat.pending_response, chat.allocator)
 	chat.pending_response_present = false
-	delete(chat.partial_assistant)
-	chat.partial_assistant = make([dynamic]u8, 0, 0, chat.allocator)
+	chat_partial_assistant_clear(chat)
 	return true
 }
 
@@ -360,8 +359,7 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 			chat_session_record_failure(chat, "the partial answer could not be recorded", append_err)
 			recorded = false
 		}
-		delete(chat.partial_assistant)
-		chat.partial_assistant = make([dynamic]u8, 0, 0, chat.allocator)
+		chat_partial_assistant_clear(chat)
 	}
 
 	outcome: session.Outcome = .Completed

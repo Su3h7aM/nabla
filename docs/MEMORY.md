@@ -233,6 +233,27 @@ source outlives the use. The transcript append is the cheapest of these: the
 entry's `[dynamic]u8` doubles as deltas arrive, and a text that is replaced
 rather than appended can be written once.
 
+Landed: the streamed answer was a fresh byte buffer per request, grown by
+doubling as the fragments arrived and released when the answer was committed, so
+every request allocated and copied the answer again. The session now empties that
+buffer and keeps it (`chat_partial_assistant_clear`), and only session release
+frees it, so the longest answer of the session sizes it once.
+
+The projection already borrowed: `chat_append_entries` points provider messages
+at the entry text rather than cloning it, so there was nothing to fix there. The
+per-request tool catalog copy in `chat_record.odin` is not waste either: the row
+records what was sent, tools included, and the store owns it.
+
+Remaining, and the largest item of this step: every request loads the whole
+conversation from the store with `context_load` and frees it when the request
+ends, so the conversation is built on the heap once per request. That is the copy
+step 6 should move into one arena per chain, where it is one allocation and one
+unmap instead of a load, a copy, and a release per request.
+
+This change is an allocation traffic reduction in the tens to hundreds of
+kilobytes per turn, below what the repro's RSS sampling resolves, so it is argued
+from the allocation counts in the code rather than from a measured difference.
+
 Verification: the scripted repro in this document's method section, before and
 after, with the store's own `sum(length(payload_json))` as the denominator.
 
