@@ -101,6 +101,32 @@ introduced:
   Every worker in the repo already assigns `context.logger` at its entry for the
   same reason.
 - `mem.Tracking_Allocator` is the standard leak and retention check for tests.
+- `runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()` is the scope-scratch release for a
+  procedure. It is `#force_inline`, marks the calling thread's default temp arena,
+  and ends the mark at scope exit, so it releases exactly what that scope took from
+  temp memory. It does nothing when the temp allocator is not the default one. Core
+  uses it the same way, in 29 places (`json/marshal`, `json/unparse`, `image/png`,
+  `log`, `path/slashpath`, `nbio`, `os/process`), and its `ignore` parameter is part
+  of the idiom rather than an option: a scope that builds its result with the
+  allocator it was handed has to pass
+  `ignore = allocator == context.temp_allocator`, or it releases what the caller is
+  keeping. A test that asked `xdg_directory` for its answer in temp memory failed on
+  exactly that, and `acp_serve.odin` and `app_diagnostics.odin` ask the same way.
+- `free_all(context.temp_allocator)` is the loop-scratch release, and the runtime
+  documents it for that: the default temp allocator is "typically called with
+  `free_all(context.temp_allocator)` once per frame-loop to prevent it from
+  leaking". Every long-lived loop in this repo already does it: `run_worker` after
+  each work item, plus `app_catalog`, `app_watchdog`, `acp_server`, `acp_serve`, and
+  `tui.odin`. The agent's own worker threads run one operation and exit, so their
+  arena dies with the thread and needs no reset. The per-phase guards below lower
+  the peak inside a loop iteration; the loop reset is what bounds what is retained.
+- `os.TEMP_ALLOCATOR_GUARD({allocator})` is the other scratch idiom and the more
+  common one in core, 110 uses to 29. It hands the scope one of two thread-local
+  arenas of its own, takes the caller's allocator as a collision so the two cannot
+  be the same arena, and the scope passes that allocator explicitly to the calls
+  that need scratch. It is the right tool when a scope must not touch the caller's
+  arena at all. It is not used here because it means threading a scratch allocator
+  through the record helpers, and `ignore` covers the case these procedures have.
 
 ## Steps
 

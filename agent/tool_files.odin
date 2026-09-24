@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
@@ -252,6 +253,8 @@ Tool_Path_Problem :: enum {
 // anything but a regular file, or that is a symbolic link, is refused rather than
 // replaced: renaming over a link would silently turn it into a regular file.
 tool_write_mode :: proc(path: string) -> (os.Permissions, Tool_Path_Problem) {
+	// The mode is the answer; the info the lstat filled in is scratch.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	info, info_error := os.lstat(path, context.temp_allocator)
 	if info_error != nil {
 		if info_error == os.General_Error.Not_Exist { return os.Permissions_Default_File, .None }

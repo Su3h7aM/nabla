@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
@@ -224,6 +225,8 @@ tool_skill_cancel_check :: proc() -> bool {
 }
 
 list_skills_matches :: proc(skill: ^skills.Skill, terms: []string) -> bool {
+	// The folded copies exist to be searched and are released with the answer.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	if len(terms) == 0 { return true }
 	name := strings.to_lower(skill.name, context.temp_allocator)
 	description := strings.to_lower(skill.description, context.temp_allocator)

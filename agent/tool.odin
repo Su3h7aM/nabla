@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:encoding/json"
 import "core:mem"
 import "core:slice"
@@ -484,6 +485,9 @@ tool_result_finalize :: proc(ctx: ^Tool_Context, result: Tool_Result) -> Tool_Re
 // document that only looks like JSON would otherwise be accepted and sent to a provider.
 @(private)
 tool_result_valid :: proc(outcome: session.Tool_Outcome, content: string) -> bool {
+	// Whether the result is well formed is the only question asked here, so the
+	// parse is scratch: nothing it builds outlives the answer.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	if content == "" || len(content) > TOOL_MAX_RESULT_BYTES { return false }
 	if !json.is_valid(transmute([]u8)content, .JSON) { return false }
 	value, parse_error := json.parse_string(content, .JSON, true, context.temp_allocator)

@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:os"
 import "core:path/filepath"
 
@@ -53,6 +54,10 @@ xdg_variable :: proc(kind: XDG_Kind) -> (variable: string, fallback: string) {
 // xdg_directory resolves this application's directory for one XDG category
 // without touching the filesystem. The result is owned by the caller.
 xdg_directory :: proc(kind: XDG_Kind, allocator := context.allocator) -> (string, XDG_Error) {
+	// The environment lookup and the base it falls back to are scratch, but the
+	// directory handed back may be the caller's temp memory itself, so a caller
+	// that asks for temp keeps it: only its own arena is left alone.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	variable, fallback := xdg_variable(kind)
 	base: string
 	if value, found := os.lookup_env(variable, context.temp_allocator); found && filepath.is_abs(value) {

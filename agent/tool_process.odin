@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:mem"
 import "core:strings"
 import linux "core:sys/linux"
@@ -46,6 +47,9 @@ TOOL_SPAWN_EXEC_FAILED :: u8(1)
 // syscall, and failure paths leave through tool_child_exit, which runs no
 // atexit handler and flushes no stdio.
 tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stderr_write: linux.Fd) -> (pid: int, started: bool) {
+	// The C strings live only as long as the spawn: exec takes its own copy of the
+	// arguments, so the parent releases its own when the call returns.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	shell_cstring := strings.clone_to_cstring(shell, context.temp_allocator)
 	source := strings.clone_to_cstring(command, context.temp_allocator)
 	dash_c := strings.clone_to_cstring("-c", context.temp_allocator)

@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:strings"
@@ -166,6 +167,9 @@ Tool_MCP_Block :: struct {
 
 @(private)
 tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_Result {
+	// The omitted-block details and the message are built in temp memory and
+	// encoded into the result before this returns.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	if call.input_required {
 		// No sampling, elicitation, or roots capability is declared, so a server
 		// asking for input is asking for something this harness does not do. The
@@ -264,6 +268,8 @@ tool_mcp_data_json :: proc(ctx: ^Tool_Context, data: Tool_MCP_Data, structured_j
 // tool_mcp_error_result reports a call that delivered no usable result.
 @(private)
 tool_mcp_error_result :: proc(ctx: ^Tool_Context, backend: ^MCP_Tool_Backend, err: mcp.Error) -> Tool_Result {
+	// The message is assembled in temp memory and cloned into the result.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	outcome, reason := tool_mcp_outcome(err)
 	message := mcp.error_text(err, context.temp_allocator)
 	if err.stderr_tail != "" {
