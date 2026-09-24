@@ -161,25 +161,38 @@ command_help :: proc(app: ^App) {
 // MOUSE_WHEEL_LINES is how many rows one wheel tick scrolls.
 MOUSE_WHEEL_LINES :: 3
 
-// tool_box_entry_at returns the entry ordinal of the tool box covering a screen
-// cell, or -1 when the cell is not on one.
+// tool_box_entry_id returns the entry id of the tool box covering a screen cell,
+// or 0 when the cell is not on one.
 //
 // It asks the frame that is on screen rather than a rectangle remembered from a
 // previous frame, so a box that scrolled or resized cannot take a report aimed
-// at whatever now covers those cells. A box carries its entry ordinal on its
-// node, which is what the scan reads.
-tool_box_entry_at :: proc(app: ^App, x, y: int) -> int {
+// at whatever now covers those cells. The id travels on the node, so the report
+// still names the right box after the transcript dropped older entries.
+tool_box_entry_id :: proc(app: ^App, x, y: int) -> u64 {
 	frame_result, frame_error := layout.result(&app.storage.layout_ctx)
-	if frame_error != .None { return -1 }
+	if frame_error != .None { return 0 }
 	point := layout.Vec2{layout.Scalar(x - app.conversation_rect.x), layout.Scalar(y - app.conversation_rect.y)}
 	for node in frame_result.nodes {
 		if node.user == 0 { continue }
 		if point.x < node.outer.position.x || point.y < node.outer.position.y { continue }
 		if point.x >= node.outer.position.x + node.outer.size.x { continue }
 		if point.y >= node.outer.position.y + node.outer.size.y { continue }
-		return tool_box_ordinal(node.user)
+		return u64(node.user)
 	}
-	return -1
+	return 0
+}
+
+// snap_entry_by_id finds the resident entry carrying id, or nil when the
+// transcript no longer holds it. The scan runs from the newest entry, which is
+// where the box under the pointer almost always is.
+//
+// The caller holds the runtime mutex.
+snap_entry_by_id :: proc(app: ^App, id: u64) -> ^Entry {
+	for index := len(app.run.snap.entries) - 1; index >= 0; index -= 1 {
+		entry := &app.run.snap.entries[index]
+		if entry.id == id { return entry }
+	}
+	return nil
 }
 
 // tool_box_scroll moves a tool box's window one wheel tick and reports whether
@@ -212,11 +225,11 @@ tool_box_scroll :: proc(entry: ^Entry, button: input.Mouse_Button) -> bool {
 // scroll.
 wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 	// The terminal reports mouse cells one-based; the frame is solved from zero.
-	if ordinal := tool_box_entry_at(app, mouse.x - 1, mouse.y - 1); ordinal >= 0 {
+	if entry_id := tool_box_entry_id(app, mouse.x - 1, mouse.y - 1); entry_id != 0 {
 		sync.mutex_lock(&app.run.mu)
 		consumed := false
-		if ordinal < len(app.run.snap.entries) {
-			consumed = tool_box_scroll(&app.run.snap.entries[ordinal], mouse.button)
+		if entry := snap_entry_by_id(app, entry_id); entry != nil {
+			consumed = tool_box_scroll(entry, mouse.button)
 		}
 		sync.mutex_unlock(&app.run.mu)
 		if consumed { return }

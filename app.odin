@@ -40,6 +40,14 @@ Entry_Kind :: enum u8 {
 Entry :: struct {
 	kind:            Entry_Kind,
 	text:            [dynamic]u8, // owned,
+	// id names this entry for as long as it is on screen. The frame carries it on
+	// a tool box, and the mouse report is answered by id rather than by position,
+	// which is what keeps a box under the pointer its own after the transcript
+	// dropped older lines. Zero is not an entry.
+	id:              u64,
+	// bytes is what this entry costs the transcript's budget: its own slot and the
+	// text it keeps, so one budget covers everything the transcript holds.
+	bytes:           int,
 	complete:        bool,
 	tool_outcome:    session.Tool_Outcome,
 	// tool_scroll is the first preview row a tool box shows, so a long result can
@@ -95,10 +103,44 @@ Status :: struct {
 	retry_due:             time.Tick,
 }
 
+// TRANSCRIPT_MAX_BYTES bounds the rendered transcript: the entries the screen keeps
+// for scrolling, and the text they hold. The session store keeps the whole
+// conversation, so past the budget the oldest entries are dropped and their text
+// released, which is what keeps a run that continues for days from holding its
+// whole history in view. The budget is a display bound, not a limit on the run:
+// nothing about the agent's work depends on it.
+TRANSCRIPT_MAX_BYTES :: 1 * mem.Megabyte
+
+// TRANSCRIPT_TRIMMED_NOTICE is said once, when the transcript first drops an old
+// line. A screen that quietly loses its oldest rows looks like a screen that lost
+// them for another reason.
+TRANSCRIPT_TRIMMED_NOTICE :: "older transcript lines are not shown; the session store keeps them and /resume replays them"
+
+// snapshot_transcript_own points the transcript at the run's allocator, so every
+// entry is allocated with the allocator the run releases it with rather than with
+// whatever default the appending thread carries. Both front-ends call it before
+// anything can append.
+snapshot_transcript_own :: proc(app: ^App) {
+	app.run.snap.entries.allocator = app.run.alloc
+}
+
 // Snapshot is everything the renderer reads. The worker bumps generation
 // after any change; the main thread redraws when it moves.
 Snapshot :: struct {
 	entries:        [dynamic]Entry, // owned,
+	// entries_bytes is what the resident entries hold: each entry's own slot and
+	// the text it keeps, the number the transcript's budget is spent from.
+	entries_bytes:  int,
+	// transcript_failed records that a line could not be kept, so the run says
+	// so once instead of dropping lines quietly.
+	transcript_failed: bool,
+	// transcript_trimmed records that the transcript dropped old lines, so the
+	// notice is said once rather than at every drop.
+	transcript_trimmed: bool,
+	// next_entry_id numbers the entries the transcript keeps. An entry's id
+	// travels on its tool box node to the mouse, so a report still finds its box
+	// after older entries were dropped.
+	next_entry_id:  u64,
 	status:         Status,
 	// sessions is what the /resume menu offers. Only the worker reads the store,
 	// so only the worker rebuilds this.
@@ -361,7 +403,11 @@ tui_run :: proc(
 	if !run_catalog(sources, mcp_servers, &app.setup, start) {
 		return false
 	}
-	app.run.snap.entries = make([dynamic]Entry, 0, 16, app.run.alloc)
+	// The transcript's text belongs to the run's allocator, not to whatever
+	// default the appending thread happens to carry, so the array's allocator is
+	// set before its first line. The slots grow with the transcript and are
+	// bounded by its budget.
+	snapshot_transcript_own(app)
 	app.run.snap.status.provider_id = strings.clone(app.setup.provider_id, app.run.alloc)
 	app.run.snap.status.model_id = strings.clone(app.setup.model_id, app.run.alloc)
 	// cwd is owned by the snapshot: a session switch replaces the workspace, and

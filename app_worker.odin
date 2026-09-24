@@ -2,6 +2,7 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -415,6 +416,8 @@ snapshot_clear :: proc(app: ^App) {
 		if entry.text != nil { delete(entry.text) }
 	}
 	clear(&app.run.snap.entries)
+	app.run.snap.entries_bytes = 0
+	app.run.snap.transcript_trimmed = false
 	app.run.snap.generation += 1
 }
 
@@ -541,17 +544,83 @@ snap_append :: proc(app: ^App, kind: Entry_Kind, text: string) {
 	snap_append_locked(app, kind, text)
 }
 
+// snap_entry_make builds one transcript entry: the allocator its text belongs to,
+// a fresh identity, and the display text when there is any.
+snap_entry_make :: proc(app: ^App, kind: Entry_Kind, text: string) -> Entry {
+	entry := Entry{kind = kind}
+	entry.text.allocator = app.run.alloc
+	app.run.snap.next_entry_id += 1
+	entry.id = app.run.snap.next_entry_id
+	snap_entry_append_text(app, &entry, text)
+	return entry
+}
+
+// snap_entry_account charges one entry for everything it holds: its own slot in
+// the transcript and the text buffer behind it. One budget then covers both costs,
+// so a very long run of very short lines is bounded by the same number as a short
+// run of very long ones.
+snap_entry_account :: proc(entry: ^Entry) {
+	entry.bytes = size_of(Entry) + cap(entry.text)
+}
+
+// snap_entry_append_text adds display text to one entry. A buffer that cannot
+// hold it is reported once rather than silently truncating the line.
+snap_entry_append_text :: proc(app: ^App, entry: ^Entry, text: string) {
+	if len(text) > 0 {
+		if _, append_error := append(&entry.text, ..transmute([]byte)text); append_error != nil {
+			snap_report_dropped(app, append_error)
+		}
+	}
+	snap_entry_account(entry)
+}
+
+// snap_report_dropped says once that the transcript could not hold a line. The
+// line's record is already in the store, so only its display is lost, and the
+// run continues without a screen that quietly disagrees with what it kept.
+snap_report_dropped :: proc(app: ^App, alloc_error: mem.Allocator_Error) {
+	if app.run.snap.transcript_failed { return }
+	app.run.snap.transcript_failed = true
+	detail := fmt.tprintf("%v", alloc_error)
+	fields := [1]agent.Log_Field{{key = "allocation_error", value = detail}}
+	agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "ui.transcript_line_dropped", fields = fields[:]})
+}
+
+// snap_push_locked appends one entry and trims the transcript to its budget.
+snap_push_locked :: proc(app: ^App, entry: Entry) {
+	app.run.snap.entries_bytes += entry.bytes
+	if _, append_error := append(&app.run.snap.entries, entry); append_error != nil {
+		app.run.snap.entries_bytes -= entry.bytes
+		// Nothing holds the buffer now: the array did not take the entry. A
+		// dynamic array releases through its own allocator, which the entry's text
+		// was given when it was made.
+		delete(entry.text)
+		snap_report_dropped(app, append_error)
+		return
+	}
+	app.run.snap.generation += 1
+	snap_trim_locked(app)
+}
+
+// snap_trim_locked drops the oldest entries, and their text, while the transcript
+// passes its budget, and says once that it did. The newest entry is always kept:
+// one entry larger than the budget is still the newest thing said.
+snap_trim_locked :: proc(app: ^App) {
+	was_trimmed := app.run.snap.transcript_trimmed
+	for len(app.run.snap.entries) > 1 && app.run.snap.entries_bytes > TRANSCRIPT_MAX_BYTES {
+		dropped := app.run.snap.entries[0]
+		app.run.snap.entries_bytes -= dropped.bytes
+		ordered_remove(&app.run.snap.entries, 0)
+		delete(dropped.text)
+		app.run.snap.transcript_trimmed = true
+	}
+	if app.run.snap.transcript_trimmed && !was_trimmed {
+		snap_push_locked(app, snap_entry_make(app, .Notice, TRANSCRIPT_TRIMMED_NOTICE))
+	}
+}
+
 // snap_append_locked appends under a held runtime mutex.
 snap_append_locked :: proc(app: ^App, kind: Entry_Kind, text: string) {
-	entry := Entry {
-		kind = kind,
-		text = make([dynamic]u8, 0, 0, app.run.alloc),
-	}
-	if len(text) > 0 {
-		append(&entry.text, ..transmute([]byte)text)
-	}
-	append(&app.run.snap.entries, entry)
-	app.run.snap.generation += 1
+	snap_push_locked(app, snap_entry_make(app, kind, text))
 }
 
 // --- observer -------------------------------------------------------------
@@ -619,8 +688,7 @@ obs_assistant_begin :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
-	append(&app.run.snap.entries, Entry{kind = .Assistant, text = make([dynamic]u8, 0, 0, app.run.alloc)})
-	app.run.snap.generation += 1
+	snap_push_locked(app, snap_entry_make(app, .Assistant, ""))
 }
 
 obs_assistant_text :: proc(user_data: rawptr, text: string) {
@@ -631,18 +699,15 @@ obs_assistant_text :: proc(user_data: rawptr, text: string) {
 	if count > 0 {
 		last := &app.run.snap.entries[count - 1]
 		if last.kind == .Assistant && !last.complete {
-			append(&last.text, ..transmute([]byte)text)
+			before := last.bytes
+			snap_entry_append_text(app, last, text)
+			app.run.snap.entries_bytes += last.bytes - before
+			snap_trim_locked(app)
 			app.run.snap.generation += 1
 			return
 		}
 	}
-	entry := Entry {
-		kind = .Assistant,
-		text = make([dynamic]u8, 0, 0, app.run.alloc),
-	}
-	append(&entry.text, ..transmute([]byte)text)
-	append(&app.run.snap.entries, entry)
-	app.run.snap.generation += 1
+	snap_push_locked(app, snap_entry_make(app, .Assistant, text))
 }
 
 obs_assistant_end :: proc(user_data: rawptr) {
@@ -671,14 +736,9 @@ obs_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Res
 snap_append_tool :: proc(app: ^App, name, content, fallback: string, outcome: session.Tool_Outcome) {
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
-	entry := Entry {
-		kind         = .Tool,
-		text         = make([dynamic]u8, 0, 0, app.run.alloc),
-		tool_outcome = outcome,
-	}
-	append(&entry.text, ..transmute([]byte)tool_entry_text(name, content, fallback))
-	append(&app.run.snap.entries, entry)
-	app.run.snap.generation += 1
+	entry := snap_entry_make(app, .Tool, tool_entry_text(name, content, fallback))
+	entry.tool_outcome = outcome
+	snap_push_locked(app, entry)
 }
 
 obs_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text: string) {

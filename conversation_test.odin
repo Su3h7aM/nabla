@@ -227,6 +227,73 @@ test_conversation_raises_its_budget_instead_of_reserving_the_worst_case :: proc(
 	)
 }
 
+// The rendered transcript is bounded. The store keeps the conversation, so once
+// the budget is passed the oldest line leaves the screen, its text is released,
+// and the run says so once instead of quietly showing a shorter conversation.
+@(test)
+test_transcript_drops_the_oldest_line_at_its_budget :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	previous := context.allocator
+	context.allocator = mem.tracking_allocator(&track)
+	defer {
+		context.allocator = previous
+		mem.tracking_allocator_destroy(&track)
+	}
+
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	snapshot_transcript_own(app)
+
+	// Lines of 64 KiB against a 1 MiB budget: enough that most of what was
+	// appended has to be released, and each line's buffer is a power of two, so
+	// its capacity is its length and the accounting is exact.
+	line, line_error := strings.repeat("x", 64 * 1024, context.allocator)
+	if line_error != nil { testing.fail_now(t, "the fixture line could not be allocated") }
+
+	for _ in 0 ..< 32 {
+		snap_append(app, .User, line)
+	}
+	delete(line)
+
+	testing.expect(t, app.run.snap.transcript_trimmed, "the transcript must record that it dropped lines")
+	testing.expect(t, app.run.snap.entries_bytes <= TRANSCRIPT_MAX_BYTES, "the resident transcript must stay within its budget")
+	testing.expect(t, len(app.run.snap.entries) < 32, "the oldest lines must leave the screen")
+	// The dropped lines' text is released, not merely hidden: two mebibytes were
+	// appended and the live set is the budget plus the notice.
+	testing.expect(
+		t,
+		track.current_memory_allocated <= TRANSCRIPT_MAX_BYTES + 64 * 1024,
+		"dropped lines must release their text",
+	)
+}
+
+// The budget covers the entries themselves, not only their text: a run of very
+// short lines is bounded by the same number as a run of long ones.
+@(test)
+test_transcript_accounts_for_the_entries_it_keeps :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	snapshot_transcript_own(app)
+
+	count := 4 * TRANSCRIPT_MAX_BYTES / size_of(Entry)
+	for value in 0 ..< count {
+		snap_append(app, .Notice, fmt.tprintf("%d", value))
+	}
+
+	testing.expect(t, app.run.snap.transcript_trimmed, "the transcript must record that it dropped lines")
+	testing.expect(t, app.run.snap.entries_bytes <= TRANSCRIPT_MAX_BYTES, "the resident transcript must stay within its budget")
+	testing.expect(t, len(app.run.snap.entries) < count, "the oldest entries must leave the screen")
+}
+
 // An unbreakable token wider than the viewport must not widen the conversation.
 // Before the root clipped horizontally, one long token set its minimum width, so
 // every entry wrapped at that width and was cut off at the terminal edge instead

@@ -212,6 +212,9 @@ run_prompt :: proc(
 	if app_error != nil { return 1 }
 	defer free(app)
 	app.run.alloc = context.allocator
+	// The headless run shows nothing, but a refusal or a selection notice still
+	// reaches the transcript, so it owns its allocator here too.
+	snapshot_transcript_own(app)
 
 	start := Session_Start {
 		kind = .New,

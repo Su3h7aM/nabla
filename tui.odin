@@ -113,17 +113,6 @@ STARTUP_HINT :: "pgup/wheel scroll | escape interrupt | ctrl+c clear/cancel/quit
 // frame, so the solved scroll range can be looked up after the solve.
 CONVERSATION_ID :: layout.Id(1)
 
-// A tool box tags its node with the ordinal of the entry it draws, so a wheel
-// report can find the box under the pointer by reading the solved frame. The
-// ordinal is stored plus one, because zero is layout's untagged value.
-tool_box_tag :: proc(ordinal: int) -> layout.User_Tag {
-	return layout.User_Tag(ordinal + 1)
-}
-
-tool_box_ordinal :: proc(tag: layout.User_Tag) -> int {
-	return int(tag) - 1
-}
-
 // FONT_NORMAL and FONT_BOLD travel in layout.Text_Style.font, which layout
 // never interprets: the transcript's one styling distinction beyond color.
 FONT_NORMAL :: layout.Font(0)
@@ -457,8 +446,8 @@ declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layou
 					layout.text(&storage.layout_ctx, layout.Text_Desc{text = STARTUP_HINT, style = layout_text_style(HINT_STYLE)})
 				}
 			} else {
-				for &entry, ordinal in app.run.snap.entries {
-					declare_entry(&storage.layout_ctx, &entry, width, ordinal)
+				for &entry in app.run.snap.entries {
+					declare_entry(&storage.layout_ctx, &entry, width)
 				}
 			}
 		}
@@ -617,9 +606,9 @@ selection_cell_blank :: proc(cell: term.Cell) -> bool {
 // cleaned body in an element whose bottom padding is the blank row that
 // separates entries, so the spacing scrolls with the content instead of being
 // pasted in at draw time.
-declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width, ordinal: int) {
+declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 	if entry.kind == .Tool {
-		declare_tool_entry(ctx, entry, width, ordinal)
+		declare_tool_entry(ctx, entry, width)
 		return
 	}
 	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
@@ -663,7 +652,7 @@ declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Text_Style) {
 // The box starts where the prompt box does and pads its content one cell inside
 // the border, so a call and a prompt line up on the same columns. Only the
 // border carries the outcome color; the content is ordinary text.
-declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width, ordinal: int) {
+declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 	outline := widgets.BORDER_ROUNDED
 	box_width := max(width, 4)
 	border_inner_width := max(box_width - 2, 1)
@@ -705,7 +694,7 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width, ordinal: 
 	if entry.tool_outcome == .Success { border_style = TOOL_SUCCESS }
 	if layout.element(
 		ctx,
-		layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{bottom = 1}}, user = tool_box_tag(ordinal)},
+		layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{bottom = 1}}, user = layout.User_Tag(entry.id)},
 	) {
 		border := layout_text_style(border_style)
 		body := layout_text_style(TOOL_BODY)
