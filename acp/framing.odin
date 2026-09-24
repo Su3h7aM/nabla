@@ -4,9 +4,9 @@ import "core:mem"
 import "core:strings"
 import "core:unicode/utf8"
 
-// MAX_FRAME_BYTES bounds one incoming line. ACP itself does not impose a frame
-// limit; this is Nabla's allocation and denial-of-service boundary.
-MAX_FRAME_BYTES :: 1024 * 1024
+// MAX_FRAME_BYTES matches Buzz's ACP line budget. ACP itself does not impose a
+// frame limit; this is Nabla's allocation and denial-of-service boundary.
+MAX_FRAME_BYTES :: 10_000_000
 Frame_Decoder :: struct {
 	buffer:                [dynamic]u8,
 	max_frame_bytes:       int,

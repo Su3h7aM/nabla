@@ -44,6 +44,8 @@ Acp_Work_Kind :: enum {
 	Open_Session,
 	// Prompt runs one turn on the open session.
 	Prompt,
+	// Set_Model applies Buzz's model-selection extension on the worker thread.
+	Set_Model,
 	// Set_Config_Option applies the stable ACP model configuration method.
 	Set_Config_Option,
 	// List_Sessions answers the v2 session/list method.
@@ -62,6 +64,7 @@ Acp_Work :: struct {
 	text:               string,
 	workspace:          string,
 	session_ref:        string,
+	model_id:           string,
 	config_id:          string,
 	config_value:       string,
 	list_cwd:           string,
@@ -127,7 +130,7 @@ acp_work_session_valid :: proc(server: ^Acp_Server, work: Acp_Work) -> bool {
 	if valid {
 		switch work.kind {
 		case .Open_Session:
-		case .Prompt, .Set_Config_Option:
+		case .Prompt, .Set_Model, .Set_Config_Option:
 			valid = server.session_id != ""
 		case .Close_Session:
 			valid = server.session_id != "" && server.session_id == work.session_ref
@@ -211,6 +214,7 @@ acp_work_destroy :: proc(work: ^Acp_Work, allocator: mem.Allocator) {
 	delete(work.text, allocator)
 	delete(work.workspace, allocator)
 	delete(work.session_ref, allocator)
+	delete(work.model_id, allocator)
 	delete(work.config_id, allocator)
 	delete(work.config_value, allocator)
 	delete(work.list_cwd, allocator)
@@ -308,6 +312,8 @@ acp_run_work :: proc(server: ^Acp_Server, work: Acp_Work) {
 			acp_work_open_session(server, work)
 		case .Prompt:
 			acp_work_prompt(server, work)
+		case .Set_Model:
+			acp_work_set_model(server, work)
 		case .Set_Config_Option:
 			acp_work_set_config_option(server, work)
 		case .List_Sessions:
@@ -415,7 +421,12 @@ acp_work_open_session :: proc(server: ^Acp_Server, work: Acp_Work) {
 	} else if acp_is_v2(server) {
 		_ = acp.writer_write_response(&server.writer, work.id, acp.V2_Session_New_Result{session_id = session_id, config_options = v2_options})
 	} else {
-		_ = acp.writer_write_response(&server.writer, work.id, acp.Session_New_Result{session_id = session_id, config_options = v1_options})
+		models, models_ok := acp_models_state(server)
+		if !models_ok {
+			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the model catalog could not be allocated")
+			return
+		}
+		_ = acp.writer_write_response(&server.writer, work.id, acp.Session_New_Result{session_id = session_id, config_options = v1_options, models = models})
 	}
 }
 
@@ -661,6 +672,14 @@ acp_apply_model_id :: proc(server: ^Acp_Server, model_id: string) -> bool {
 	return false
 }
 
+acp_work_set_model :: proc(server: ^Acp_Server, work: Acp_Work) {
+	if acp_apply_model_id(server, work.model_id) {
+		_ = acp.writer_write_response(&server.writer, work.id, acp.Session_Set_Model_Result{session_id = acp_session_id(server), model_id = work.model_id})
+		return
+	}
+	_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_PARAMS, fmt.tprintf("the model %q is not available", work.model_id))
+}
+
 acp_work_set_config_option :: proc(server: ^Acp_Server, work: Acp_Work) {
 	if work.config_id != "model" || !acp_apply_model_id(server, work.config_value) {
 		_ = acp.writer_write_error(
@@ -872,6 +891,24 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 		if message == "" { message = "the turn did not complete" }
 		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, message)
 	}
+}
+
+acp_models_state :: proc(server: ^Acp_Server) -> (acp.Models_State, bool) {
+	if len(server.app.setup.catalog.models) == 0 { return {}, true }
+	result: acp.Models_State
+	result.current_model_id = server.app.setup.model_id
+	available, available_error := make([]acp.Model_Info, len(server.app.setup.catalog.models), context.temp_allocator)
+	if available_error != nil { return {}, false }
+	for model, index in server.app.setup.catalog.models {
+		name := model.id
+		if model.display_name_present && model.display_name != "" { name = model.display_name }
+		available[index] = acp.Model_Info {
+			model_id = model.id,
+			name     = name,
+		}
+	}
+	result.available_models = available
+	return result, true
 }
 
 acp_model_config_values :: proc(server: ^Acp_Server) -> ([]acp.Config_Value, bool) {

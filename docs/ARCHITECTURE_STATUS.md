@@ -33,10 +33,10 @@ reimplementing something that exists. Update it when the gap it names closes.
   evidence on the WebSocket path.
 - The ACP frontend: `nabla acp` speaks ACP v1 and v2 on stdio. It negotiates the
   connection profile, supports v1 `session/load`, v2 `session/resume` with optional
-  replay, v2 session listing and close, model config options, stdio MCP servers, client
-  standing instructions, prompt cancellation, and version-appropriate message/tool
-  updates. The v2 prompt response acknowledges insertion and completion is reported
-  through `state_update`. See the [ACP frontend](ACP_ARCHITECTURE.md).
+  replay, v2 session listing and close, model config options, Buzz metadata, stdio MCP
+  servers, client standing instructions, prompt cancellation, and version-appropriate
+  message/tool updates. The v2 prompt response acknowledges insertion and completion
+  is reported through `state_update`. See the [ACP frontend](ACP_ARCHITECTURE.md).
 
 ## Gaps against the target
 

@@ -860,3 +860,153 @@ test_acp_v2_batch_answers_reader_owned_requests_as_one_frame :: proc(t: ^testing
 	testing.expect(t, strings.contains(frame, `"id":1`) && strings.contains(frame, `"id":2`))
 	testing.expect(t, strings.contains(frame, `"protocolVersion":2`))
 }
+
+@(test)
+test_acp_buzz_v2_request_uses_the_v1_wire_profile :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	state, state_err := os.make_directory_temp("", "nabla-acp-buzz-state-*", context.allocator)
+	if state_err != nil {
+		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
+		return
+	}
+	defer {
+		os.remove_all(state)
+		delete(state, context.allocator)
+	}
+	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
+
+	client: Acp_Test_Client
+	defer acp_test_client_destroy(&client)
+	run := Acp_Test_Run {
+		client = &client,
+	}
+	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-buzz-run")
+	if run_thread == nil {
+		testing.expect(t, false, "the run thread could not be started")
+		return
+	}
+	run_thread.data = &run
+	thread.start(run_thread)
+	defer {
+		acp_test_client_hang_up(&client)
+		thread.join(run_thread)
+		testing.expect(t, run.served, "the run did not end cleanly")
+		thread.destroy(run_thread)
+		free_all(context.temp_allocator)
+	}
+
+	message :=
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"clientCapabilities":{},"clientInfo":{"name":"buzz-acp","version":"test"}}}` +
+		"\n"
+	acp_test_client_send(&client, message)
+	frame := acp_test_client_expect(t, &client, `"protocolVersion":1`, "Buzz did not receive the v1 profile")
+	if frame == "" { return }
+	testing.expect(t, strings.contains(frame, `"agentCapabilities"`))
+	testing.expect(t, strings.contains(frame, `"agentInfo"`))
+	testing.expect(t, !strings.contains(frame, `"capabilities":{"session"`))
+}
+
+@(test)
+test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-model-workspace-*", context.allocator)
+	if workspace_err != nil {
+		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
+		return
+	}
+	defer {
+		os.remove_all(workspace)
+		delete(workspace, context.allocator)
+	}
+	state, state_err := os.make_directory_temp("", "nabla-acp-model-state-*", context.allocator)
+	if state_err != nil {
+		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
+		return
+	}
+	defer {
+		os.remove_all(state)
+		delete(state, context.allocator)
+	}
+	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
+
+	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
+	defer delete(sources, context.allocator)
+	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
+	defer delete(models, context.allocator)
+	models[0] = {
+		id                     = "buzzmodel",
+		context_window_present = true,
+		context_window         = 100000,
+		tools_present          = true,
+		tools                  = true,
+	}
+	sources[0] = {
+		id               = "buzzprovider",
+		base_url_present = true,
+		base_url         = "http://127.0.0.1:1/v1",
+		api_present      = true,
+		api              = "openai_chat_completions",
+		api_key_present  = true,
+		api_key          = "test-key",
+		models           = models,
+	}
+
+	client: Acp_Test_Client
+	defer acp_test_client_destroy(&client)
+	run := Acp_Test_Run {
+		client  = &client,
+		sources = sources,
+	}
+	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-model-run")
+	if run_thread == nil {
+		testing.expect(t, false, "the run thread could not be started")
+		return
+	}
+	run_thread.data = &run
+	thread.start(run_thread)
+	defer {
+		acp_test_client_hang_up(&client)
+		thread.join(run_thread)
+		testing.expect(t, run.served, "the run did not end cleanly")
+		thread.destroy(run_thread)
+		free_all(context.temp_allocator)
+	}
+
+	handshake := strings.builder_make(context.temp_allocator)
+	acp_test_initialize_message(&handshake, 1)
+	acp_test_client_send(&client, strings.to_string(handshake))
+	if acp_test_client_expect(t, &client, `"protocolVersion":1`, "initialize was not answered") == "" { return }
+
+	opening := strings.builder_make(context.temp_allocator)
+	acp_test_new_session_message(&opening, 2, workspace)
+	acp_test_client_send(&client, strings.to_string(opening))
+	opened := acp_test_client_expect(t, &client, `"sessionId"`, "session/new was not answered")
+	if opened == "" { return }
+	if !acp_test_client_carries(t, opened, {`"currentModelId":"buzzmodel"`, `"modelId":"buzzmodel"`}, "the session answer") { return }
+	session_id := acp_test_client_session_id_from_frame(t, opened)
+	if session_id == "" { return }
+	defer delete(session_id, context.allocator)
+
+	switching := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(&switching, `{"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"sessionId":"`)
+	strings.write_string(&switching, session_id)
+	strings.write_string(&switching, `","modelId":"buzzmodel"}}`)
+	acp_test_end(&switching)
+	acp_test_client_send(&client, strings.to_string(switching))
+	switched := acp_test_client_expect(t, &client, `"modelId":"buzzmodel"`, "session/set_model was not answered")
+	if switched == "" { return }
+
+	unknown := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(&unknown, `{"jsonrpc":"2.0","id":4,"method":"session/set_model","params":{"sessionId":"`)
+	strings.write_string(&unknown, session_id)
+	strings.write_string(&unknown, `","modelId":"no-such-model"}}`)
+	acp_test_end(&unknown)
+	acp_test_client_send(&client, strings.to_string(unknown))
+	if acp_test_client_expect(t, &client, `"code":-32602`, "an unknown model was not refused") == "" { return }
+}

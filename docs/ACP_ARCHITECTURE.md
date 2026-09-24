@@ -6,7 +6,11 @@ records what is still missing.
 
 The frontend speaks the stable v1 wire contract and the current v2 contract. The
 version is negotiated per connection: a client that asks for version 2 or newer
-receives the v2 profile, anything older receives v1.
+receives the v2 profile, anything older receives v1. Buzz currently asks for version
+2 while sending its v1-shaped initialize fields, so the frontend gives that
+connection the v1 profile; this preserves Buzz's v1 prompt response and
+`session/set_model` extensions. A client that sends the v2 `info` object receives
+the v2 profile.
 
 ## What it is
 
@@ -66,7 +70,9 @@ stream as the prompt it cancels, so nothing may block the reader while a turn ru
   requests while the worker streams updates. One lock hold covers each frame, so a
   frame a client reads is whole. A write error latches: a client that stopped
   reading will not read the next frame either, and the run stops.
-- One JSON-RPC value travels per line, up to 1 MiB. An oversized, invalid, or
+- The stdio decoder accepts one JSON-RPC value per line, up to 10,000,000 bytes,
+  matching Buzz's line budget. It grows its buffer as needed, so the compatibility
+  bound does not reserve that much memory at startup. An oversized, invalid, or
   un-storable frame is refused with an error and the conversation continues; broken
   JSON is a parse error, anything else about the envelope is an invalid request.
   JSON-RPC batches are written as one array frame; a batch carries at most 1024
@@ -116,7 +122,9 @@ from every other frontend.
   Nothing is persisted, because a model chosen for an editor conversation is not the
   user's own last choice for the harness. The `session/set_config_option` method
   switches the model mid-session, and the answer carries the updated selector: the v1
-  option names its `id`, the v2 option its `configId`.
+  option names its `id`, the v2 option its `configId`. The v1 `session/new` answer
+  additionally carries Buzz's pre-standard `models` catalog, and Buzz switches through
+  `session/set_model`.
 
 ## What a turn reports
 

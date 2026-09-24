@@ -39,3 +39,10 @@ test_frame_oversized_and_invalid_utf8 :: proc(t: ^testing.T) {
 	testing.expect_value(t, frame_decoder_feed(&decoder, []byte{0xff, '\n'}, &frames), Frame_Error.Invalid_UTF8)
 	frame_decoder_destroy(&decoder)
 }
+
+@(test)
+test_frame_budget_matches_buzz_line_limit :: proc(t: ^testing.T) {
+	// Buzz reads ACP lines up to 10,000,000 bytes; a tighter bound here would cut
+	// Buzz's own messages off, a looser one would waste the comparison.
+	testing.expect_value(t, MAX_FRAME_BYTES, 10_000_000)
+}

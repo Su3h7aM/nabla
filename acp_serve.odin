@@ -129,6 +129,7 @@ acp_handle_batch_frame :: proc(server: ^Acp_Server, frame: string) {
 		     acp.METHOD_SESSION_LIST,
 		     acp.METHOD_SESSION_CLOSE,
 		     acp.METHOD_SESSION_PROMPT,
+		     acp.METHOD_SESSION_SET_MODEL,
 		     acp.METHOD_SESSION_SET_CONFIG_OPTION:
 			_ = acp.writer_write_error(&server.writer, envelope.id, acp.ERROR_INVALID_REQUEST, "lifecycle requests must not be sent in a JSON-RPC batch")
 			return
@@ -182,6 +183,8 @@ acp_handle_request :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "nabla advertises no authentication methods")
 	case acp.METHOD_SESSION_PROMPT:
 		acp_request_prompt(server, envelope)
+	case acp.METHOD_SESSION_SET_MODEL:
+		acp_request_set_model(server, envelope)
 	case acp.SESSION_CANCEL:
 		acp_request_cancel(server, envelope)
 	case:
@@ -227,11 +230,15 @@ acp_request_initialize :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "initialize needs a positive protocol version")
 		return
 	}
-	// A client that asks for version 2 or newer receives the v2 surface; anything
-	// older receives v1.
-	negotiated := acp.PROTOCOL_VERSION
-	if params.protocol_version >= acp.PROTOCOL_VERSION_V2 {
+	// A v2 request is valid only when it carries the v2 info object. Buzz currently
+	// asks for version 2 while sending the v1 field names, so it deliberately receives
+	// the v1 surface instead of being forced through a lifecycle it does not implement.
+	v2_request := params.protocol_version >= acp.PROTOCOL_VERSION_V2 && params.info.name != "" && params.info.version != ""
+	negotiated := params.protocol_version
+	if v2_request {
 		negotiated = acp.PROTOCOL_VERSION_V2
+	} else if negotiated > acp.PROTOCOL_VERSION {
+		negotiated = acp.PROTOCOL_VERSION
 	}
 	server.protocol_version = negotiated
 	server.profile = .V2 if negotiated == acp.PROTOCOL_VERSION_V2 else .V1
@@ -816,6 +823,50 @@ acp_request_prompt :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		kind = .Prompt,
 		id   = id,
 		text = prompt_text,
+	}
+	work.session_generation = acp_capture_session_generation(server)
+	if !acp_enqueue(server, work) {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
+	}
+}
+
+acp_request_set_model :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
+	if acp_is_v2(server) {
+		acp_reply_error(server, envelope, acp.ERROR_METHOD_NOT_FOUND, "session/set_model is a Buzz v1 extension; use session/set_config_option")
+		return
+	}
+	if !server.initialized {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "initialize must be answered before a model can be selected")
+		return
+	}
+	if acp_server_has_work(server) {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "a request is already in flight")
+		return
+	}
+	params: acp.Session_Set_Model_Params
+	if !acp.params_decode(envelope.params, &params, context.temp_allocator) || params.session_id == "" || params.model_id == "" {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/set_model needs a session id and model id")
+		return
+	}
+	if !acp_session_matches(server, params.session_id) {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id; call session/new first")
+		return
+	}
+	model_id, model_error := strings.clone(params.model_id, server.alloc)
+	if model_error != nil {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the model id could not be allocated")
+		return
+	}
+	id, id_ok := acp_work_id(envelope.id, server.alloc)
+	if !id_ok {
+		delete(model_id, server.alloc)
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
+		return
+	}
+	work := Acp_Work {
+		kind     = .Set_Model,
+		id       = id,
+		model_id = model_id,
 	}
 	work.session_generation = acp_capture_session_generation(server)
 	if !acp_enqueue(server, work) {
