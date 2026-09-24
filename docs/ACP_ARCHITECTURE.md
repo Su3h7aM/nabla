@@ -124,7 +124,10 @@ from every other frontend.
   switches the model mid-session, and the answer carries the updated selector: the v1
   option names its `id`, the v2 option its `configId`. The v1 `session/new` answer
   additionally carries Buzz's pre-standard `models` catalog, and Buzz switches through
-  `session/set_model`.
+  `session/set_model`. A model that states thinking levels also advertises an `effort`
+  option in the `thought_level` category, with the session's current effort as its
+  value; setting it validates the level against the model and applies it to the next
+  request, and an unknown level is refused.
 
 ## What a turn reports
 

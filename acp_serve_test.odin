@@ -1010,3 +1010,123 @@ test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
 	acp_test_client_send(&client, strings.to_string(unknown))
 	if acp_test_client_expect(t, &client, `"code":-32602`, "an unknown model was not refused") == "" { return }
 }
+
+@(test)
+test_acp_buzz_effort_option_selects_thinking_level :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-effort-workspace-*", context.allocator)
+	if workspace_err != nil {
+		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
+		return
+	}
+	defer {
+		os.remove_all(workspace)
+		delete(workspace, context.allocator)
+	}
+	state, state_err := os.make_directory_temp("", "nabla-acp-effort-state-*", context.allocator)
+	if state_err != nil {
+		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
+		return
+	}
+	defer {
+		os.remove_all(state)
+		delete(state, context.allocator)
+	}
+	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
+
+	levels := make([]string, 2, context.allocator)
+	levels[0] = "low"
+	levels[1] = "high"
+	defer delete(levels, context.allocator)
+	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
+	defer delete(sources, context.allocator)
+	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
+	defer delete(models, context.allocator)
+	models[0] = {
+		id = "effortmodel",
+		context_window_present = true,
+		context_window = 100000,
+		tools_present = true,
+		tools = true,
+		thinking = agent.Catalog_Thinking_Source{present = true, levels_present = true, levels = levels},
+	}
+	sources[0] = {
+		id               = "effortprovider",
+		base_url_present = true,
+		base_url         = "http://127.0.0.1:1/v1",
+		api_present      = true,
+		api              = "openai_chat_completions",
+		api_key_present  = true,
+		api_key          = "test-key",
+		models           = models,
+	}
+
+	client: Acp_Test_Client
+	defer acp_test_client_destroy(&client)
+	run := Acp_Test_Run {
+		client  = &client,
+		sources = sources,
+	}
+	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-effort-run")
+	if run_thread == nil {
+		testing.expect(t, false, "the run thread could not be started")
+		return
+	}
+	run_thread.data = &run
+	thread.start(run_thread)
+	defer {
+		acp_test_client_hang_up(&client)
+		thread.join(run_thread)
+		testing.expect(t, run.served, "the run did not end cleanly")
+		thread.destroy(run_thread)
+		free_all(context.temp_allocator)
+	}
+
+	handshake := strings.builder_make(context.temp_allocator)
+	acp_test_initialize_message(&handshake, 1)
+	acp_test_client_send(&client, strings.to_string(handshake))
+	if acp_test_client_expect(t, &client, `"protocolVersion":1`, "initialize was not answered") == "" { return }
+
+	opening := strings.builder_make(context.temp_allocator)
+	acp_test_new_session_message(&opening, 2, workspace)
+	acp_test_client_send(&client, strings.to_string(opening))
+	opened := acp_test_client_expect(t, &client, `"sessionId"`, "session/new was not answered")
+	if opened == "" { return }
+	if !acp_test_client_carries(
+		t,
+		opened,
+		{`"category":"thought_level"`, `"id":"effort"`, `"value":"low"`, `"value":"high"`},
+		"the thought level option",
+	) { return }
+	session_id := acp_test_client_session_id_from_frame(t, opened)
+	if session_id == "" { return }
+	defer delete(session_id, context.allocator)
+
+	selecting := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(&selecting, `{"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{"sessionId":"`)
+	strings.write_string(&selecting, session_id)
+	strings.write_string(&selecting, `","configId":"effort","value":"high"}}`)
+	acp_test_end(&selecting)
+	acp_test_client_send(&client, strings.to_string(selecting))
+	selected := acp_test_client_expect(t, &client, `"currentValue":"high"`, "the effort level was not applied")
+	if selected == "" { return }
+
+	rejected := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(&rejected, `{"jsonrpc":"2.0","id":4,"method":"session/set_config_option","params":{"sessionId":"`)
+	strings.write_string(&rejected, session_id)
+	strings.write_string(&rejected, `","configId":"effort","value":"extreme"}}`)
+	acp_test_end(&rejected)
+	acp_test_client_send(&client, strings.to_string(rejected))
+	if acp_test_client_expect(t, &client, `"code":-32602`, "an unknown effort level was not refused") == "" { return }
+
+	unknown_option := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(&unknown_option, `{"jsonrpc":"2.0","id":5,"method":"session/set_config_option","params":{"sessionId":"`)
+	strings.write_string(&unknown_option, session_id)
+	strings.write_string(&unknown_option, `","configId":"no-such-option","value":"high"}}`)
+	acp_test_end(&unknown_option)
+	acp_test_client_send(&client, strings.to_string(unknown_option))
+	if acp_test_client_expect(t, &client, `"code":-32602`, "an unknown config option was not refused") == "" { return }
+}

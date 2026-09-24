@@ -681,7 +681,13 @@ acp_work_set_model :: proc(server: ^Acp_Server, work: Acp_Work) {
 }
 
 acp_work_set_config_option :: proc(server: ^Acp_Server, work: Acp_Work) {
-	if work.config_id != "model" || !acp_apply_model_id(server, work.config_value) {
+	applied := false
+	if work.config_id == "model" {
+		applied = acp_apply_model_id(server, work.config_value)
+	} else if work.config_id == "effort" {
+		applied = agent.chat_session_set_effort(&server.app.setup.session, work.config_value)
+	}
+	if !applied {
 		_ = acp.writer_write_error(
 			&server.writer,
 			work.id,
@@ -925,13 +931,34 @@ acp_model_config_values :: proc(server: ^Acp_Server) -> ([]acp.Config_Value, boo
 	return values, true
 }
 
+// acp_effort_config_values names the thinking levels the open session's model states,
+// verbatim. An empty result means the model states none, and no effort option is
+// advertised for it.
+acp_effort_config_values :: proc(server: ^Acp_Server) -> ([]acp.Config_Value, bool) {
+	levels := server.app.setup.session.effort_levels[:]
+	values, values_error := make([]acp.Config_Value, len(levels), context.temp_allocator)
+	if values_error != nil { return nil, false }
+	for level, index in levels {
+		values[index] = acp.Config_Value {
+			value = level,
+			name  = level,
+		}
+	}
+	return values, true
+}
+
 acp_model_config_options_v1 :: proc(server: ^Acp_Server) -> ([]acp.V1_Config_Option, bool) {
-	values, values_ok := acp_model_config_values(server)
-	if !values_ok { return nil, false }
-	options, options_error := make([]acp.V1_Config_Option, 0 if len(values) == 0 else 1, context.temp_allocator)
+	model_count := 0
+	if len(server.app.setup.catalog.models) > 0 { model_count = 1 }
+	effort_count := 0
+	if len(server.app.setup.session.effort_levels) > 0 { effort_count = 1 }
+	options, options_error := make([]acp.V1_Config_Option, model_count + effort_count, context.temp_allocator)
 	if options_error != nil { return nil, false }
-	if len(values) > 0 {
-		options[0] = acp.V1_Config_Option {
+	index := 0
+	if model_count == 1 {
+		values, values_ok := acp_model_config_values(server)
+		if !values_ok { return nil, false }
+		options[index] = acp.V1_Config_Option {
 			id            = "model",
 			name          = "Model",
 			category      = "model",
@@ -939,23 +966,54 @@ acp_model_config_options_v1 :: proc(server: ^Acp_Server) -> ([]acp.V1_Config_Opt
 			current_value = server.app.setup.model_id,
 			options       = values,
 		}
+		index += 1
+	}
+	if effort_count == 1 {
+		levels, levels_ok := acp_effort_config_values(server)
+		if !levels_ok { return nil, false }
+		options[index] = acp.V1_Config_Option {
+			id            = "effort",
+			name          = "Effort",
+			category      = "thought_level",
+			type          = "select",
+			current_value = server.app.setup.session.effort,
+			options       = levels,
+		}
 	}
 	return options, true
 }
 
 acp_model_config_options_v2 :: proc(server: ^Acp_Server) -> ([]acp.V2_Config_Option, bool) {
-	values, values_ok := acp_model_config_values(server)
-	if !values_ok { return nil, false }
-	options, options_error := make([]acp.V2_Config_Option, 0 if len(values) == 0 else 1, context.temp_allocator)
+	model_count := 0
+	if len(server.app.setup.catalog.models) > 0 { model_count = 1 }
+	effort_count := 0
+	if len(server.app.setup.session.effort_levels) > 0 { effort_count = 1 }
+	options, options_error := make([]acp.V2_Config_Option, model_count + effort_count, context.temp_allocator)
 	if options_error != nil { return nil, false }
-	if len(values) > 0 {
-		options[0] = acp.V2_Config_Option {
+	index := 0
+	if model_count == 1 {
+		values, values_ok := acp_model_config_values(server)
+		if !values_ok { return nil, false }
+		options[index] = acp.V2_Config_Option {
 			config_id     = "model",
 			name          = "Model",
 			category      = "model",
 			type          = "select",
 			current_value = server.app.setup.model_id,
 			options       = values,
+		}
+		index += 1
+	}
+	if effort_count == 1 {
+		levels, levels_ok := acp_effort_config_values(server)
+		if !levels_ok { return nil, false }
+		options[index] = acp.V2_Config_Option {
+			config_id     = "effort",
+			name          = "Effort",
+			category      = "thought_level",
+			type          = "select",
+			current_value = server.app.setup.session.effort,
+			options       = levels,
 		}
 	}
 	return options, true
