@@ -43,6 +43,7 @@ Envelope_Error :: enum {
 	Invalid_Method,
 	Invalid_Result,
 	Invalid_Error,
+	Allocation,
 }
 
 parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Envelope, Envelope_Error) {
@@ -116,8 +117,54 @@ envelope_error_text :: proc(err: Envelope_Error) -> string {
 		return "the message is neither a request nor a response"
 	case .Invalid_Error:
 		return "the message's error object is malformed"
+	case .Allocation:
+		return "the message could not be stored"
 	}
 	return "the message could not be read"
+}
+
+// MAX_BATCH_ENTRIES bounds how many requests one batch line may carry. The frame
+// itself is already size-bounded; this bounds the dispatch work one line can cause.
+// A batch carries a handful of requests in practice.
+MAX_BATCH_ENTRIES :: 1024
+
+// parse_batch recognizes a JSON-RPC batch without changing the single-envelope
+// parser. Individual entries are returned as text so the normal dispatcher owns
+// their validation and response rules.
+parse_batch :: proc(payload: string, allocator := context.allocator) -> (frames: [dynamic]string, is_batch: bool, err: Envelope_Error) {
+	trimmed := strings.trim_space(payload)
+	if len(trimmed) == 0 || trimmed[0] != '[' { return {}, false, .None }
+	value, parse_err := json.parse_string(payload, .JSON, true, allocator)
+	if parse_err != nil { return {}, true, .Invalid_JSON }
+	defer json.destroy_value(value, allocator)
+	items, is_array := value.(json.Array)
+	if !is_array || len(items) == 0 || len(items) > MAX_BATCH_ENTRIES { return {}, true, .Invalid_Envelope }
+	batch, allocation_error := make([dynamic]string, 0, len(items), allocator)
+	if allocation_error != nil { return {}, true, .Allocation }
+	frames = batch
+	for item in items {
+		body, marshal_err := json.marshal(item, allocator = allocator)
+		if marshal_err != nil {
+			for frame in frames { delete(frame, allocator) }
+			delete(frames)
+			return {}, true, .Allocation
+		}
+		frame, clone_err := strings.clone(string(body), allocator)
+		delete(body, allocator)
+		if clone_err != nil {
+			for owned in frames { delete(owned, allocator) }
+			delete(frames)
+			return {}, true, .Allocation
+		}
+		appended := append(&frames, frame)
+		if appended != 1 {
+			if appended == 0 { delete(frame, allocator) }
+			for owned in frames { delete(owned, allocator) }
+			delete(frames)
+			return {}, true, .Allocation
+		}
+	}
+	return frames, true, .None
 }
 
 // params_decode reads one message's params into a typed payload. The parsed value is

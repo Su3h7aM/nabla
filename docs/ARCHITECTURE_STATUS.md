@@ -31,11 +31,12 @@ reimplementing something that exists. Update it when the gap it names closes.
   read-only `diagnostics` reader/export.
 - Native HTTP/1.1, TLS 1.3, SSE, DNS and Responses WebSocket with provider delivery
   evidence on the WebSocket path.
-- The ACP frontend: `nabla acp` speaks ACP v1 on stdio with `initialize`,
-  `session/new`, `session/load` (with a replayed conversation), `session/prompt`,
-  `session/cancel`, `session/set_config_option` for model selection, client stdio MCP
-  servers, client standing instructions, and `session/update` for assistant text,
-  harness notices, tool calls, and context usage. See the [ACP frontend](ACP_ARCHITECTURE.md).
+- The ACP frontend: `nabla acp` speaks ACP v1 and v2 on stdio. It negotiates the
+  connection profile, supports v1 `session/load`, v2 `session/resume` with optional
+  replay, v2 session listing and close, model config options, stdio MCP servers, client
+  standing instructions, prompt cancellation, and version-appropriate message/tool
+  updates. The v2 prompt response acknowledges insertion and completion is reported
+  through `state_update`. See the [ACP frontend](ACP_ARCHITECTURE.md).
 
 ## Gaps against the target
 

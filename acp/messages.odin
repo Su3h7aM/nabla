@@ -11,18 +11,22 @@ import "core:encoding/json"
 // and an update is a JSON document.
 
 // PROTOCOL_VERSION is the version this package speaks. A client that asks for a
-// newer version receives this one.
+// newer version receives the latest one implemented here.
 PROTOCOL_VERSION :: 1
+PROTOCOL_VERSION_V2 :: 2
 
 // Methods a client calls.
 METHOD_INITIALIZE :: "initialize"
 METHOD_AUTHENTICATE :: "authenticate"
 METHOD_SESSION_NEW :: "session/new"
 METHOD_SESSION_LOAD :: "session/load"
-METHOD_SESSION_PROMPT :: "session/prompt"
+METHOD_SESSION_RESUME :: "session/resume"
+METHOD_SESSION_LIST :: "session/list"
+METHOD_SESSION_CLOSE :: "session/close"
 METHOD_SESSION_SET_CONFIG_OPTION :: "session/set_config_option"
 METHOD_AUTH_LOGIN :: "auth/login"
 METHOD_AUTH_LOGOUT :: "auth/logout"
+METHOD_SESSION_PROMPT :: "session/prompt"
 
 // Notifications. A session update is the agent's only streaming channel: everything a
 // turn produces arrives as one of the update kinds below. Cancellation travels on the
@@ -126,12 +130,15 @@ tool_kind_name :: proc(kind: Tool_Kind) -> string {
 }
 
 // Tool_Status is where a call is in its life. Pending is a call the agent has
-// announced, In_Progress is one an executor owns, and the last two are terminal.
+// announced, In_Progress is one an executor owns, and the last three are terminal.
+// Cancelled is v2 only: v1 has no cancelled state, so a cancelled call reads as failed
+// there.
 Tool_Status :: enum {
 	Pending,
 	In_Progress,
 	Completed,
 	Failed,
+	Cancelled,
 }
 
 tool_status_name :: proc(status: Tool_Status) -> string {
@@ -144,6 +151,8 @@ tool_status_name :: proc(status: Tool_Status) -> string {
 		return "completed"
 	case .Failed:
 		return "failed"
+	case .Cancelled:
+		return "cancelled"
 	}
 	return "pending"
 }
@@ -172,6 +181,44 @@ Initialize_Params :: struct {
 	protocol_version:    int `json:"protocolVersion"`,
 	client_capabilities: Client_Capabilities `json:"clientCapabilities"`,
 	client_info:         Implementation `json:"clientInfo"`,
+	capabilities:        V2_Client_Capabilities `json:"capabilities"`,
+	info:                Implementation `json:"info"`,
+}
+
+// V2_Client_Capabilities is deliberately limited to the v2 fields Nabla needs to
+// recognize. Unknown client capabilities remain forward-compatible and are ignored.
+V2_Client_Capabilities :: struct {
+	auth: V2_Client_Auth_Capabilities `json:"auth"`,
+}
+
+V2_Client_Auth_Capabilities :: struct {
+	terminal: bool `json:"terminal"`,
+}
+
+V2_Support :: struct {}
+
+V2_Prompt_Capabilities :: struct {
+	embedded_context: V2_Support `json:"embeddedContext"`,
+}
+
+V2_Mcp_Capabilities :: struct {
+	stdio: V2_Support `json:"stdio"`,
+}
+
+V2_Session_Capabilities :: struct {
+	prompt: V2_Prompt_Capabilities `json:"prompt"`,
+	mcp:    V2_Mcp_Capabilities `json:"mcp"`,
+}
+
+V2_Agent_Capabilities :: struct {
+	session: V2_Session_Capabilities `json:"session"`,
+}
+
+V2_Initialize_Result :: struct {
+	protocol_version: int `json:"protocolVersion"`,
+	info:             Implementation `json:"info"`,
+	capabilities:     V2_Agent_Capabilities `json:"capabilities"`,
+	auth_methods:     []json.Value `json:"authMethods"`,
 }
 
 Mcp_Environment :: struct {
@@ -180,7 +227,8 @@ Mcp_Environment :: struct {
 }
 
 // Mcp_Server is the stdio MCP server configuration carried by ACP. The optional
-// type accepts the stdio discriminator; only stdio is implemented by this agent.
+// type is accepted for v1 clients and is required by v2 clients, but only stdio is
+// implemented by this agent.
 Mcp_Server :: struct {
 	name:    string `json:"name"`,
 	type:    string `json:"type,omitempty"`,
@@ -208,6 +256,29 @@ Session_Load_Params :: struct {
 	mcp_servers:   []Mcp_Server `json:"mcpServers"`,
 	system_prompt: string `json:"systemPrompt"`,
 	meta:          Session_Meta `json:"_meta"`,
+}
+
+Replay_From :: struct {
+	type: string `json:"type"`,
+}
+
+Session_Resume_Params :: struct {
+	session_id:             string `json:"sessionId"`,
+	cwd:                    string `json:"cwd"`,
+	mcp_servers:            []Mcp_Server `json:"mcpServers"`,
+	additional_directories: []string `json:"additionalDirectories"`,
+	system_prompt:          string `json:"systemPrompt"`,
+	meta:                   Session_Meta `json:"_meta"`,
+	replay_from:            Maybe(Replay_From) `json:"replayFrom"`,
+}
+
+Session_List_Params :: struct {
+	cursor: string `json:"cursor"`,
+	cwd:    string `json:"cwd"`,
+}
+
+Session_Close_Params :: struct {
+	session_id: string `json:"sessionId"`,
 }
 
 // Embedded_Resource is a resource the client inlined into the prompt: the file's text
@@ -267,7 +338,8 @@ Session_New_Result :: struct {
 	config_options: []V1_Config_Option `json:"configOptions,omitempty"`,
 }
 
-// Config_Value is one choice of the model selector.
+// Config_Value is one choice of a model selector. v1 and v2 options share it; only
+// the option wrapper differs between the two wire shapes.
 Config_Value :: struct {
 	value: string `json:"value"`,
 	name:  string `json:"name"`,
@@ -280,6 +352,20 @@ V1_Config_Option :: struct {
 	type:          string `json:"type"`,
 	current_value: string `json:"currentValue"`,
 	options:       []Config_Value `json:"options"`,
+}
+
+V2_Config_Option :: struct {
+	config_id:     string `json:"configId"`,
+	name:          string `json:"name"`,
+	category:      string `json:"category"`,
+	type:          string `json:"type"`,
+	current_value: string `json:"currentValue"`,
+	options:       []Config_Value `json:"options"`,
+}
+
+V2_Session_New_Result :: struct {
+	session_id:     string `json:"sessionId"`,
+	config_options: []V2_Config_Option `json:"configOptions"`,
 }
 
 // Empty_Result is the answer of a method that reports success by returning.
@@ -298,6 +384,59 @@ Session_Set_Config_Option_Params :: struct {
 
 V1_Session_Set_Config_Option_Result :: struct {
 	config_options: []V1_Config_Option `json:"configOptions"`,
+}
+
+V2_Session_Set_Config_Option_Result :: struct {
+	config_options: []V2_Config_Option `json:"configOptions"`,
+}
+
+Session_Resume_Result :: struct {
+	config_options: []V2_Config_Option `json:"configOptions,omitempty"`,
+}
+
+Session_Info :: struct {
+	session_id: string `json:"sessionId"`,
+	cwd:        string `json:"cwd"`,
+	title:      string `json:"title,omitempty"`,
+	updated_at: string `json:"updatedAt,omitempty"`,
+}
+
+Session_List_Result :: struct {
+	sessions:    []Session_Info `json:"sessions"`,
+	next_cursor: string `json:"nextCursor,omitempty"`,
+}
+
+Prompt_Accepted_Result :: struct {
+	message_id: string `json:"messageId"`,
+}
+
+Message_Update :: struct {
+	session_update: string `json:"sessionUpdate"`,
+	message_id:     string `json:"messageId"`,
+	content:        []Text_Content `json:"content"`,
+}
+
+State_Update :: struct {
+	session_update: string `json:"sessionUpdate"`,
+	state:          string `json:"state"`,
+	stop_reason:    string `json:"stopReason,omitempty"`,
+}
+
+Tool_Call_Update_V2 :: struct {
+	session_update: string `json:"sessionUpdate"`,
+	tool_call_id:   string `json:"toolCallId"`,
+	name:           string `json:"name,omitempty"`,
+	title:          string `json:"title,omitempty"`,
+	kind:           string `json:"kind,omitempty"`,
+	status:         string `json:"status,omitempty"`,
+	raw_input:      json.Value `json:"rawInput,omitempty"`,
+	content:        []Tool_Call_Content `json:"content,omitempty"`,
+}
+
+Tool_Call_Content_Chunk :: struct {
+	session_update: string `json:"sessionUpdate"`,
+	tool_call_id:   string `json:"toolCallId"`,
+	content:        Tool_Call_Content `json:"content"`,
 }
 
 Session_Info_Update :: struct {

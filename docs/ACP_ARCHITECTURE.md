@@ -4,6 +4,10 @@ Status: the implemented contract for the Agent Client Protocol frontend. Read it
 changing the `acp` package or `nabla acp`. [Implementation status](ARCHITECTURE_STATUS.md)
 records what is still missing.
 
+The frontend speaks the stable v1 wire contract and the current v2 contract. The
+version is negotiated per connection: a client that asks for version 2 or newer
+receives the v2 profile, anything older receives v1.
+
 ## What it is
 
 `nabla acp` runs this harness as an ACP agent. An editor (or any other ACP client) starts
@@ -46,10 +50,12 @@ The split exists for one protocol requirement: `session/cancel` arrives on the s
 stream as the prompt it cancels, so nothing may block the reader while a turn runs.
 
 - `busy` (atomic) is the reader's and the worker's agreement about the requests in
-  flight. The reader accepts a session request or a prompt only when it is false; the
-  worker clears it once the last queued request is answered. `pending_work`, guarded by
-  `queue_mu`, keeps the flag set while a request waits, and `session_generation`
-  invalidates requests queued against a session that has since been replaced.
+  flight. The reader accepts a session request only when it is false. A v2 prompt may
+  wait in the bounded work queue, and the pending-work count keeps `busy` set until the
+  last queued request is answered. A v2 close or list request may also wait behind an
+  active turn, and a config change is applied by the worker after that turn.
+  `session_generation` invalidates requests queued against a session that has since
+  been replaced, and an admitted close invalidates everything queued behind it.
 - `cancel_seen` (atomic) carries a cancellation that arrived while the prompt was still
   being recorded. Accepting a prompt clears the process's cancellation token, so the
   worker re-issues the request for the turn that must see it.
@@ -63,6 +69,10 @@ stream as the prompt it cancels, so nothing may block the reader while a turn ru
 - One JSON-RPC value travels per line, up to 1 MiB. An oversized, invalid, or
   un-storable frame is refused with an error and the conversation continues; broken
   JSON is a parse error, anything else about the envelope is an invalid request.
+  JSON-RPC batches are written as one array frame; a batch carries at most 1024
+  entries, lifecycle-sensitive requests are rejected inside a batch, and batch failures
+  use invalid-request codes. A notification produced while a batch is collected is
+  still its own frame: a batch answer may only carry responses.
 
 The harness reports each tool call to the observer once when it is admitted and once when
 it settles (`Chat_Observer.tool_call` and `tool_result`), which is what gives the client
@@ -80,6 +90,11 @@ from every other frontend.
   session is stored once it has a conversation, so an id that was never prompted names
   nothing yet and the load is refused rather than answered with an empty session. An
   unreadable store is an internal error, not an unknown id.
+- A v2 client uses `session/resume` instead of load: it adopts the stored session by id,
+  checks the working directory the same way, and replays only when
+  `replayFrom: {"type":"start"}` is present. A v2 client can list sessions with
+  `session/list` and release the open one with `session/close`; close cancels the
+  running turn and invalidates whatever was queued behind it.
 - A replayed conversation skips partial assistant entries: they are text from a turn
   that never finished, and replaying them as complete messages would misstate the
   record.
@@ -91,30 +106,41 @@ from every other frontend.
   `session/new` replaces the first. Concurrent sessions would need an owner per session,
   which does not exist.
 - Client-provided stdio `mcpServers` are installed for the session and released when a
-  later session replaces them. A server needs an absolute command path; any other
-  transport is refused. `additionalDirectories` is refused rather than ignored: a
-  client that asked for a directory and got silence would believe it was there.
+  later session replaces them or closes the session. A server needs an absolute command
+  path; any other transport is refused. The `type` discriminator is required on v2 and
+  optional on v1, where only stdio is accepted either way. `additionalDirectories` is
+  refused rather than ignored: a client that asked for a directory and got silence
+  would believe it was there.
 - The model is chosen the way a headless run chooses one: the stored selection, then the
   model the session recorded, then the first configured model that can serve a request.
   Nothing is persisted, because a model chosen for an editor conversation is not the
   user's own last choice for the harness. The `session/set_config_option` method
-  switches the model mid-session, and the answer carries the updated selector.
+  switches the model mid-session, and the answer carries the updated selector: the v1
+  option names its `id`, the v2 option its `configId`.
 
 ## What a turn reports
 
-| Harness event | Session update |
-| --- | --- |
-| Assistant text | `agent_message_chunk`, one message id per assistant message |
-| Harness notice, warning, error, retry decision | `agent_message_chunk`, one message each |
-| A call is admitted | `tool_call`: pending, kind, title, raw input |
-| A call settles | `tool_call_update`: completed or failed, with the result preview |
-| A request finishes | `usage_update`: measured input (or the harness's estimate) against the model window |
+The v1 profile keeps the turn request open until the harness finishes and answers
+`session/prompt` with `stopReason`. The v2 profile answers once the user entry is
+recorded, then reports progress and completion through `session/update`:
 
-A cancelled turn answers `session/prompt` with the `cancelled` stop reason, which is an
-answer rather than an error. A turn the harness could not finish answers with an error,
-and the transcript already carries the reason. A turn the store could not record
-answers as a failure even when the model finished it: the record is what the answer
-may claim.
+| Harness event | v1 update | v2 update |
+| --- | --- | --- |
+| User entry | implicit in the request | `user_message` with the response `messageId` |
+| Assistant text | `agent_message_chunk` | `agent_message_chunk` with a required `messageId` |
+| Harness notice, warning, error, retry decision | `agent_message_chunk` | `agent_message_chunk` with a required `messageId` |
+| A call is admitted | `tool_call` | `tool_call_update` |
+| A call settles | `tool_call_update` | `tool_call_update` with the result content |
+| A call is cancelled | `tool_call_update`: failed | `tool_call_update`: cancelled |
+| Foreground starts or ends | prompt response | `state_update: running` / `state_update: idle` |
+| A request finishes | `usage_update` | `usage_update` |
+
+A v1 cancellation answers the prompt with the `cancelled` stop reason. A v2
+cancellation emits any final updates and then an idle `state_update` with the same stop
+reason. A turn the harness could not finish is reported in the transcript and ends the
+v2 state as idle with no stop reason: a failure is not a refusal. A turn the store
+could not record answers as a failure even when the model finished it: the record is
+what the answer may claim. The v1 profile answers the request with an error.
 
 ## Not implemented
 
@@ -130,5 +156,4 @@ first.
 3. Modes, `session/delete`, and `session/fork`. The model follows the opened session
    through `session/set_config_option`, but nothing else about the session is
    configurable while the process runs.
-4. `session/list`, `session/resume`, and `session/close`.
-5. Slash commands and `available_commands_update`.
+4. Slash commands and `available_commands_update`.

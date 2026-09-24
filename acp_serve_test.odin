@@ -566,3 +566,297 @@ test_acp_serves_a_turn_and_replays_a_loaded_session :: proc(t: ^testing.T) {
 	acp_test_client_send(&client, strings.to_string(missing))
 	if acp_test_client_expect(t, &client, `"code":-32602`, "loading an unknown session was not refused") == "" { return }
 }
+
+@(test)
+test_acp_v2_negotiates_and_exposes_the_session_surface :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-v2-workspace-*", context.allocator)
+	if workspace_err != nil {
+		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
+		return
+	}
+	defer {
+		os.remove_all(workspace)
+		delete(workspace, context.allocator)
+	}
+	state, state_err := os.make_directory_temp("", "nabla-acp-v2-state-*", context.allocator)
+	if state_err != nil {
+		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
+		return
+	}
+	defer {
+		os.remove_all(state)
+		delete(state, context.allocator)
+	}
+	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
+
+	client: Acp_Test_Client
+	defer acp_test_client_destroy(&client)
+	run := Acp_Test_Run {
+		client = &client,
+	}
+	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-v2-test-run")
+	if run_thread == nil {
+		testing.expect(t, false, "the run thread could not be started")
+		return
+	}
+	run_thread.data = &run
+	thread.start(run_thread)
+	defer {
+		acp_test_client_hang_up(&client)
+		thread.join(run_thread)
+		testing.expect(t, run.served, "the run did not end cleanly")
+		thread.destroy(run_thread)
+		free_all(context.temp_allocator)
+	}
+
+	handshake := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(
+		&handshake,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"acp-test","version":"1"}}}`,
+	)
+	strings.write_byte(&handshake, '\n')
+	acp_test_client_send(&client, strings.to_string(handshake))
+	hello := acp_test_client_expect(t, &client, `"protocolVersion":2`, "v2 initialize was not answered")
+	if hello == "" { return }
+	testing.expect(t, strings.contains(hello, `"capabilities":{"session":{"prompt":{"embeddedContext":{}},"mcp":{"stdio":{}}}}`))
+	testing.expect(t, strings.contains(hello, `"info":{"name":"nabla","title":"Nabla","version":"0.1.0"}`))
+
+	opening := strings.builder_make(context.temp_allocator)
+	strings.write_string(&opening, `{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"`)
+	strings.write_string(&opening, workspace)
+	strings.write_string(&opening, `","mcpServers":[]}}`)
+	strings.write_byte(&opening, '\n')
+	acp_test_client_send(&client, strings.to_string(opening))
+	opening_frame := acp_test_client_expect(t, &client, `"sessionId"`, "v2 session/new was not answered")
+	if opening_frame == "" { return }
+	if !strings.contains(opening_frame, `"configOptions":[]`) {
+		testing.expectf(t, false, "v2 session/new did not expose configuration: %s", opening_frame)
+		return
+	}
+	session_id := acp_test_client_session_id_from_frame(t, opening_frame)
+	if session_id == "" { return }
+	defer delete(session_id, context.allocator)
+
+	listing := strings.builder_make(context.temp_allocator)
+	strings.write_string(&listing, `{"jsonrpc":"2.0","id":3,"method":"session/list","params":{}}`)
+	strings.write_byte(&listing, '\n')
+	acp_test_client_send(&client, strings.to_string(listing))
+	listing_frame := acp_test_client_expect(t, &client, `"sessions"`, "v2 session/list was not answered")
+	if listing_frame == "" || !strings.contains(listing_frame, session_id) {
+		testing.expectf(t, false, "v2 session/list omitted the active session: %s", listing_frame)
+		return
+	}
+
+	closing := strings.builder_make(context.temp_allocator)
+	strings.write_string(&closing, `{"jsonrpc":"2.0","id":4,"method":"session/close","params":{"sessionId":"`)
+	strings.write_string(&closing, session_id)
+	strings.write_string(&closing, `"}}`)
+	strings.write_byte(&closing, '\n')
+	acp_test_client_send(&client, strings.to_string(closing))
+	if acp_test_client_expect(t, &client, `"id":4,"result":{}`, "v2 session/close was not answered") == "" { return }
+}
+
+@(test)
+test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-v2-prompt-workspace-*", context.allocator)
+	if workspace_err != nil {
+		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
+		return
+	}
+	defer {
+		os.remove_all(workspace)
+		delete(workspace, context.allocator)
+	}
+	state, state_err := os.make_directory_temp("", "nabla-acp-v2-prompt-state-*", context.allocator)
+	if state_err != nil {
+		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
+		return
+	}
+	defer {
+		os.remove_all(state)
+		delete(state, context.allocator)
+	}
+	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
+
+	replies := []string {
+		acp_test_stream_reply(
+			acp_test_sse_body({`{"choices":[{"delta":{"content":"v2 answer"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`}),
+		),
+	}
+	defer for reply in replies { delete(reply, context.allocator) }
+	provider: Acp_Test_Provider
+	if !acp_test_provider_start(t, &provider, replies) { return }
+	defer acp_test_provider_stop(t, &provider)
+
+	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
+	defer delete(sources, context.allocator)
+	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
+	defer delete(models, context.allocator)
+	models[0] = {
+		id                        = "v2model",
+		context_window_present    = true,
+		context_window            = 100000,
+		max_output_tokens_present = true,
+		max_output_tokens         = 4096,
+		tools_present             = true,
+		tools                     = true,
+	}
+	sources[0] = {
+		id               = "v2provider",
+		base_url_present = true,
+		base_url         = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
+		api_present      = true,
+		api              = "openai_chat_completions",
+		api_key_present  = true,
+		api_key          = "test-key",
+		models           = models,
+	}
+	defer delete(sources[0].base_url, context.allocator)
+
+	client: Acp_Test_Client
+	defer acp_test_client_destroy(&client)
+	run := Acp_Test_Run {
+		client  = &client,
+		sources = sources,
+	}
+	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-v2-prompt-run")
+	if run_thread == nil {
+		testing.expect(t, false, "the run thread could not be started")
+		return
+	}
+	run_thread.data = &run
+	thread.start(run_thread)
+	defer {
+		acp_test_client_hang_up(&client)
+		thread.join(run_thread)
+		testing.expect(t, run.served, "the run did not end cleanly")
+		thread.destroy(run_thread)
+		free_all(context.temp_allocator)
+	}
+
+	handshake := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(
+		&handshake,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"acp-test","version":"1"}}}`,
+	)
+	strings.write_byte(&handshake, '\n')
+	acp_test_client_send(&client, strings.to_string(handshake))
+	if acp_test_client_expect(t, &client, `"protocolVersion":2`, "v2 initialize was not answered") == "" { return }
+
+	opening := strings.builder_make(context.temp_allocator)
+	strings.write_string(&opening, `{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"`)
+	strings.write_string(&opening, workspace)
+	strings.write_string(&opening, `","mcpServers":[]}}`)
+	strings.write_byte(&opening, '\n')
+	acp_test_client_send(&client, strings.to_string(opening))
+	opening_frame := acp_test_client_expect(t, &client, `"sessionId"`, "v2 session/new was not answered")
+	if opening_frame == "" { return }
+	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2model"`) {
+		testing.expectf(t, false, "v2 session/new did not expose the model catalog: %s", opening_frame)
+		return
+	}
+	session_id := acp_test_client_session_id_from_frame(t, opening_frame)
+	if session_id == "" { return }
+	defer delete(session_id, context.allocator)
+
+	prompting := strings.builder_make(context.temp_allocator)
+	strings.write_string(&prompting, `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"`)
+	strings.write_string(&prompting, session_id)
+	strings.write_string(&prompting, `","prompt":[{"type":"text","text":"say hello"}]}}`)
+	strings.write_byte(&prompting, '\n')
+	acp_test_client_send(&client, strings.to_string(prompting))
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "v2 did not acknowledge the user message") == "" { return }
+	if acp_test_client_expect(t, &client, `"result":{"messageId":"msg-user-1-1"}`, "v2 did not return the inserted message id") == "" { return }
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"state_update","state":"running"`, "v2 did not report running state") == "" { return }
+	agent_frame := acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message_chunk"`, "v2 did not stream the agent message")
+	if agent_frame == "" { return }
+	if !strings.contains(agent_frame, "v2 answer") {
+		testing.expectf(t, false, "v2 did not deliver the model text: %s", agent_frame)
+		return
+	}
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "v2 did not report usage") == "" { return }
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"`, "v2 did not report completion") ==
+	   "" { return }
+
+	resuming := strings.builder_make(context.temp_allocator)
+	strings.write_string(&resuming, `{"jsonrpc":"2.0","id":4,"method":"session/resume","params":{"sessionId":"`)
+	strings.write_string(&resuming, session_id)
+	strings.write_string(&resuming, `","cwd":"`)
+	strings.write_string(&resuming, workspace)
+	strings.write_string(&resuming, `","mcpServers":[],"replayFrom":{"type":"start"}}}`)
+	strings.write_byte(&resuming, '\n')
+	acp_test_client_send(&client, strings.to_string(resuming))
+	replayed_user := acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "v2 replay did not include the user message")
+	if replayed_user == "" || !strings.contains(replayed_user, `"messageId":"msg-user-1-1"`) {
+		testing.expectf(t, false, "v2 replay changed the user message id: %s", replayed_user)
+		return
+	}
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message"`, "v2 replay did not include the assistant message") == "" { return }
+	if acp_test_client_expect(t, &client, `"id":4,"result"`, "v2 resume did not answer after replay") == "" { return }
+
+	plain_resume := strings.builder_make(context.temp_allocator)
+	strings.write_string(&plain_resume, `{"jsonrpc":"2.0","id":5,"method":"session/resume","params":{"sessionId":"`)
+	strings.write_string(&plain_resume, session_id)
+	strings.write_string(&plain_resume, `","cwd":"`)
+	strings.write_string(&plain_resume, workspace)
+	strings.write_string(&plain_resume, `","mcpServers":[]}}`)
+	strings.write_byte(&plain_resume, '\n')
+	acp_test_client_send(&client, strings.to_string(plain_resume))
+	if acp_test_client_expect(t, &client, `"id":5,"result"`, "v2 plain resume did not answer") == "" { return }
+}
+
+@(test)
+test_acp_v2_batch_answers_reader_owned_requests_as_one_frame :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	state, state_err := os.make_directory_temp("", "nabla-acp-batch-state-*", context.allocator)
+	if state_err != nil {
+		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
+		return
+	}
+	defer {
+		os.remove_all(state)
+		delete(state, context.allocator)
+	}
+	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
+
+	client: Acp_Test_Client
+	defer acp_test_client_destroy(&client)
+	run := Acp_Test_Run {
+		client = &client,
+	}
+	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-batch-run")
+	if run_thread == nil {
+		testing.expect(t, false, "the run thread could not be started")
+		return
+	}
+	run_thread.data = &run
+	thread.start(run_thread)
+	defer {
+		acp_test_client_hang_up(&client)
+		thread.join(run_thread)
+		testing.expect(t, run.served, "the run did not end cleanly")
+		thread.destroy(run_thread)
+		free_all(context.temp_allocator)
+	}
+
+	batch :=
+		`[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"batch-test","version":"1"}}},{"jsonrpc":"2.0","id":2,"method":"unknown/method","params":{}}]` +
+		"\n"
+	acp_test_client_send(&client, batch)
+	frame := acp_test_client_receive(&client)
+	if frame == "" { return }
+	testing.expect(t, strings.has_prefix(frame, `[`))
+	testing.expect(t, strings.contains(frame, `"id":1`) && strings.contains(frame, `"id":2`))
+	testing.expect(t, strings.contains(frame, `"protocolVersion":2`))
+}

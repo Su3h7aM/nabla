@@ -53,7 +53,7 @@ acp_serve :: proc(server: ^Acp_Server, input: io.Reader) -> bool {
 				_ = acp.writer_write_error(&server.writer, nil, acp.ERROR_PARSE, acp.frame_error_text(frame_err))
 			}
 			for frame in frames {
-				acp_handle_single_frame(server, frame)
+				acp_handle_frame(server, frame)
 				delete(frame, server.alloc)
 				// Temp scratch belongs to one message: a request is decoded into it and
 				// whatever outlives the message is cloned.
@@ -75,15 +75,66 @@ acp_serve :: proc(server: ^Acp_Server, input: io.Reader) -> bool {
 }
 
 // acp_frame_error_code maps a frame failure to JSON-RPC codes: broken JSON is a parse
-// error, anything else about the envelope is an invalid request.
+// error, anything else about the envelope is an invalid request, and a failure to
+// store the message is internal.
 acp_frame_error_code :: proc(err: acp.Envelope_Error) -> i64 {
 	switch err {
 	case .Invalid_JSON:
 		return acp.ERROR_PARSE
+	case .Allocation:
+		return acp.ERROR_INTERNAL
 	case .None, .Invalid_Envelope, .Invalid_Version, .Invalid_ID, .Invalid_Method, .Invalid_Result, .Invalid_Error:
 		return acp.ERROR_INVALID_REQUEST
 	}
 	return acp.ERROR_INVALID_REQUEST
+}
+
+acp_handle_frame :: proc(server: ^Acp_Server, frame: string) {
+	frames, is_batch, batch_err := acp.parse_batch(frame, server.alloc)
+	if is_batch {
+		if batch_err != .None {
+			_ = acp.writer_write_error(&server.writer, nil, acp_frame_error_code(batch_err), acp.envelope_error_text(batch_err))
+			for batch_frame in frames { delete(batch_frame, server.alloc) }
+			delete(frames)
+			return
+		}
+		if !acp.writer_begin_batch(&server.writer) {
+			for batch_frame in frames { delete(batch_frame, server.alloc) }
+			delete(frames)
+			return
+		}
+		for batch_frame in frames {
+			acp_handle_batch_frame(server, batch_frame)
+			delete(batch_frame, server.alloc)
+		}
+		delete(frames)
+		_ = acp.writer_end_batch(&server.writer)
+		return
+	}
+	acp_handle_single_frame(server, frame)
+}
+
+acp_handle_batch_frame :: proc(server: ^Acp_Server, frame: string) {
+	envelope, envelope_err := acp.parse_envelope(frame, context.temp_allocator)
+	defer acp.destroy_envelope(&envelope, context.temp_allocator)
+	if envelope_err != .None {
+		_ = acp.writer_write_error(&server.writer, nil, acp_frame_error_code(envelope_err), acp.envelope_error_text(envelope_err))
+		return
+	}
+	if envelope.kind == .Request {
+		switch envelope.method {
+		case acp.METHOD_SESSION_NEW,
+		     acp.METHOD_SESSION_LOAD,
+		     acp.METHOD_SESSION_RESUME,
+		     acp.METHOD_SESSION_LIST,
+		     acp.METHOD_SESSION_CLOSE,
+		     acp.METHOD_SESSION_PROMPT,
+		     acp.METHOD_SESSION_SET_CONFIG_OPTION:
+			_ = acp.writer_write_error(&server.writer, envelope.id, acp.ERROR_INVALID_REQUEST, "lifecycle requests must not be sent in a JSON-RPC batch")
+			return
+		}
+	}
+	acp_handle_single_frame(server, frame)
 }
 
 acp_handle_single_frame :: proc(server: ^Acp_Server, frame: string) {
@@ -119,6 +170,12 @@ acp_handle_request :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_request_session_new(server, envelope)
 	case acp.METHOD_SESSION_LOAD:
 		acp_request_session_load(server, envelope)
+	case acp.METHOD_SESSION_RESUME:
+		acp_request_session_resume(server, envelope)
+	case acp.METHOD_SESSION_LIST:
+		acp_request_session_list(server, envelope)
+	case acp.METHOD_SESSION_CLOSE:
+		acp_request_session_close(server, envelope)
 	case acp.METHOD_SESSION_SET_CONFIG_OPTION:
 		acp_request_set_config_option(server, envelope)
 	case acp.METHOD_AUTH_LOGIN, acp.METHOD_AUTH_LOGOUT:
@@ -170,12 +227,14 @@ acp_request_initialize :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "initialize needs a positive protocol version")
 		return
 	}
-	// A client that asks for a newer version receives the one implemented here.
-	negotiated := params.protocol_version
-	if negotiated > acp.PROTOCOL_VERSION {
-		negotiated = acp.PROTOCOL_VERSION
+	// A client that asks for version 2 or newer receives the v2 surface; anything
+	// older receives v1.
+	negotiated := acp.PROTOCOL_VERSION
+	if params.protocol_version >= acp.PROTOCOL_VERSION_V2 {
+		negotiated = acp.PROTOCOL_VERSION_V2
 	}
 	server.protocol_version = negotiated
+	server.profile = .V2 if negotiated == acp.PROTOCOL_VERSION_V2 else .V1
 	server.initialized = true
 	auth_methods, auth_error := make([]json.Value, 0, server.alloc)
 	if auth_error != nil {
@@ -184,6 +243,20 @@ acp_request_initialize :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		return
 	}
 	defer delete(auth_methods, server.alloc)
+	if negotiated == acp.PROTOCOL_VERSION_V2 {
+		result := acp.V2_Initialize_Result {
+			protocol_version = negotiated,
+			info = {name = NABLA_ACP_NAME, title = "Nabla", version = NABLA_ACP_VERSION},
+			capabilities = {
+				// The v2 session surface is implemented below. Nabla does not expose
+				// image or audio prompt variants, and it exposes stdio MCP only.
+				session = {prompt = {embedded_context = {}}, mcp = {stdio = {}}},
+			},
+			auth_methods = auth_methods,
+		}
+		_ = acp.writer_write_response(&server.writer, envelope.id, result)
+		return
+	}
 	result := acp.Initialize_Result {
 		protocol_version = negotiated,
 		agent_capabilities = {
@@ -219,7 +292,7 @@ acp_request_session_new :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/new needs a working directory")
 		return
 	}
-	if reason := acp_session_params_reason(params.mcp_servers, params.additional_directories); reason != "" {
+	if reason := acp_session_params_reason(params.mcp_servers, params.additional_directories, acp_is_v2(server)); reason != "" {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, reason)
 		return
 	}
@@ -276,7 +349,7 @@ acp_request_session_load :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/load needs a session id")
 		return
 	}
-	if reason := acp_session_params_reason(params.mcp_servers, nil); reason != "" {
+	if reason := acp_session_params_reason(params.mcp_servers, nil, acp_is_v2(server)); reason != "" {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, reason)
 		return
 	}
@@ -322,6 +395,161 @@ acp_request_session_load :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		return
 	}
 	acp_enqueue_open_session(server, envelope, id, {kind = .Resume_Id, id = reference}, workspace, reference, system_prompt, title, client_mcp, true)
+}
+
+acp_request_session_resume :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
+	if !acp_is_v2(server) {
+		acp_reply_error(server, envelope, acp.ERROR_METHOD_NOT_FOUND, "session/resume requires ACP v2")
+		return
+	}
+	if !server.initialized {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "initialize must be answered before a session is opened")
+		return
+	}
+	if acp_server_has_work(server) {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "a request is already in flight")
+		return
+	}
+	params: acp.Session_Resume_Params
+	if !acp.params_decode(envelope.params, &params, context.temp_allocator) || params.session_id == "" || params.cwd == "" {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/resume needs a session id and working directory")
+		return
+	}
+	if reason := acp_session_params_reason(params.mcp_servers, params.additional_directories, acp_is_v2(server)); reason != "" {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, reason)
+		return
+	}
+	if !session.session_id_valid(session.Session_Id(params.session_id)) {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("%s is not a session id", params.session_id))
+		return
+	}
+	header, header_ok := acp_stored_session(server, envelope, params.session_id)
+	if !header_ok { return }
+	defer session.session_destroy(&header, context.temp_allocator)
+	if header.workspace != params.cwd {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the resume working directory does not match the session")
+		return
+	}
+	replay := false
+	if cursor, present := params.replay_from.?; present {
+		if cursor.type != "start" {
+			acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "only the start replay cursor is supported")
+			return
+		}
+		replay = true
+	}
+	workspace, reference, system_prompt, title, strings_ok := acp_clone_open_strings(
+		"",
+		params.session_id,
+		acp_session_prompt_text(params.system_prompt, &params.meta),
+		params.meta.session_title,
+		server.alloc,
+	)
+	if !strings_ok {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session parameters could not be allocated")
+		return
+	}
+	client_mcp, mcp_ok := acp_mcp_servers_make(params.mcp_servers, server.alloc)
+	if !mcp_ok {
+		acp_destroy_open_strings(workspace, reference, system_prompt, title, server.alloc)
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "a client-provided MCP server could not be prepared")
+		return
+	}
+	id, id_ok := acp_work_id(envelope.id, server.alloc)
+	if !id_ok {
+		acp_destroy_open_strings(workspace, reference, system_prompt, title, server.alloc)
+		agent.MCP_Server_Configs_Destroy(&client_mcp, server.alloc)
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
+		return
+	}
+	acp_enqueue_open_session(server, envelope, id, {kind = .Resume_Id, id = reference}, workspace, reference, system_prompt, title, client_mcp, replay)
+}
+
+acp_request_session_list :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
+	if !acp_is_v2(server) {
+		acp_reply_error(server, envelope, acp.ERROR_METHOD_NOT_FOUND, "session/list requires ACP v2")
+		return
+	}
+	if !server.initialized {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "initialize must be answered before sessions are listed")
+		return
+	}
+	params: acp.Session_List_Params
+	if envelope.params != nil && !acp.params_decode(envelope.params, &params, context.temp_allocator) {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/list has invalid parameters")
+		return
+	}
+	if params.cwd != "" && !strings.has_prefix(params.cwd, "/") {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the session/list working directory must be absolute")
+		return
+	}
+	cwd, cwd_error := strings.clone(params.cwd, server.alloc)
+	if cwd_error != nil {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list filter could not be allocated")
+		return
+	}
+	cursor, cursor_error := strings.clone(params.cursor, server.alloc)
+	if cursor_error != nil {
+		delete(cwd, server.alloc)
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list cursor could not be allocated")
+		return
+	}
+	id, id_ok := acp_work_id(envelope.id, server.alloc)
+	if !id_ok {
+		delete(cwd, server.alloc)
+		delete(cursor, server.alloc)
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
+		return
+	}
+	work := Acp_Work {
+		kind        = .List_Sessions,
+		id          = id,
+		list_cwd    = cwd,
+		list_cursor = cursor,
+	}
+	work.session_generation = acp_capture_session_generation(server)
+	if !acp_enqueue(server, work) {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
+	}
+}
+
+acp_request_session_close :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
+	if !acp_is_v2(server) {
+		acp_reply_error(server, envelope, acp.ERROR_METHOD_NOT_FOUND, "session/close requires ACP v2")
+		return
+	}
+	params: acp.Session_Close_Params
+	if !acp.params_decode(envelope.params, &params, context.temp_allocator) || params.session_id == "" {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/close needs a session id")
+		return
+	}
+	if !acp_session_matches(server, params.session_id) {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id")
+		return
+	}
+	acp_cancel_session(server, params.session_id)
+	reference, reference_error := strings.clone(params.session_id, server.alloc)
+	if reference_error != nil {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session reference could not be allocated")
+		return
+	}
+	id, id_ok := acp_work_id(envelope.id, server.alloc)
+	if !id_ok {
+		delete(reference, server.alloc)
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
+		return
+	}
+	work := Acp_Work {
+		kind        = .Close_Session,
+		id          = id,
+		session_ref = reference,
+	}
+	acp_mark_session_closing(server)
+	work.session_generation = acp_capture_session_generation(server)
+	if !acp_enqueue(server, work) {
+		acp_unmark_session_closing(server, work.session_generation)
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
+	}
 }
 
 acp_request_set_config_option :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
@@ -475,10 +703,15 @@ acp_session_meta_system_prompt :: proc(meta: ^acp.Session_Meta) -> string {
 }
 
 // acp_session_params_reason reports a named capability that Nabla cannot honor.
-// Refusing is safer than silently dropping tools or directories.
-acp_session_params_reason :: proc(mcp_servers: []acp.Mcp_Server, additional_directories: []string) -> string {
+// Refusing is safer than silently dropping tools or directories. The MCP type is
+// required on v2 and optional on v1, matching what each profile's clients send.
+acp_session_params_reason :: proc(mcp_servers: []acp.Mcp_Server, additional_directories: []string, is_v2: bool) -> string {
 	for server in mcp_servers {
-		if server.type != "" && server.type != "stdio" {
+		if is_v2 {
+			if server.type != "stdio" {
+				return fmt.tprintf("MCP server %q needs the stdio transport", server.name)
+			}
+		} else if server.type != "" && server.type != "stdio" {
 			return fmt.tprintf("MCP server %q uses an unsupported transport %q", server.name, server.type)
 		}
 		if server.command == "" || !strings.has_prefix(server.command, "/") {
@@ -539,7 +772,7 @@ acp_request_prompt :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "initialize must be answered before a prompt")
 		return
 	}
-	if acp_server_has_work(server) {
+	if acp_server_has_work(server) && !acp_is_v2(server) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "a request is already in flight")
 		return
 	}
@@ -596,7 +829,13 @@ acp_request_prompt :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 acp_session_matches :: proc(server: ^Acp_Server, session_id: string) -> bool {
 	sync.mutex_lock(&server.mu)
 	defer sync.mutex_unlock(&server.mu)
-	return server.session_id != "" && server.session_id == session_id
+	return !server.closing && server.session_id != "" && server.session_id == session_id
+}
+
+acp_closing_session_matches :: proc(server: ^Acp_Server, session_id: string) -> bool {
+	sync.mutex_lock(&server.mu)
+	defer sync.mutex_unlock(&server.mu)
+	return server.closing && server.session_id != "" && server.session_id == session_id
 }
 
 // acp_cancel_session asks the running turn to stop. A cancellation for a session that is
@@ -617,7 +856,8 @@ acp_cancel_session :: proc(server: ^Acp_Server, session_id: string) {
 acp_enqueue :: proc(server: ^Acp_Server, work: Acp_Work) -> bool {
 	item := work
 	// The request is marked in flight before it is queued, so a worker that finishes it
-	// immediately cannot clear a flag that was never set.
+	// immediately cannot clear a flag that was never set. The count keeps that flag set
+	// while a v2 prompt waits behind the active turn.
 	acp_queue_add(server)
 	if chan.try_send(server.work, item) { return true }
 	acp_queue_remove(server)
