@@ -45,9 +45,11 @@ everything a turn produces.
 The split exists for one protocol requirement: `session/cancel` arrives on the same
 stream as the prompt it cancels, so nothing may block the reader while a turn runs.
 
-- `busy` (atomic) is the reader's and the worker's agreement about the one request in
+- `busy` (atomic) is the reader's and the worker's agreement about the requests in
   flight. The reader accepts a session request or a prompt only when it is false; the
-  worker clears it once the request is answered.
+  worker clears it once the last queued request is answered. `pending_work`, guarded by
+  `queue_mu`, keeps the flag set while a request waits, and `session_generation`
+  invalidates requests queued against a session that has since been replaced.
 - `cancel_seen` (atomic) carries a cancellation that arrived while the prompt was still
   being recorded. Accepting a prompt clears the process's cancellation token, so the
   worker re-issues the request for the turn that must see it.
@@ -55,8 +57,12 @@ stream as the prompt it cancels, so nothing may block the reader while a turn ru
   cancellation against, so a request for a session the client never opened cannot reach
   the session the process started with.
 - `acp.Writer` serializes frames under its own mutex, because the reader answers
-  requests while the worker streams updates. A write error latches: a client that stopped
+  requests while the worker streams updates. One lock hold covers each frame, so a
+  frame a client reads is whole. A write error latches: a client that stopped
   reading will not read the next frame either, and the run stops.
+- One JSON-RPC value travels per line, up to 1 MiB. An oversized, invalid, or
+  un-storable frame is refused with an error and the conversation continues; broken
+  JSON is a parse error, anything else about the envelope is an invalid request.
 
 The harness reports each tool call to the observer once when it is admitted and once when
 it settles (`Chat_Observer.tool_call` and `tool_result`), which is what gives the client
@@ -66,21 +72,33 @@ from every other frontend.
 ## Session mapping
 
 - `session/new` adopts a session in the client's `cwd`, replacing whatever session the
-  process held, and answers with its id.
+  process held, and answers with its id and the model selector. The directory must be
+  absolute and exist.
 - `session/load` adopts the stored session by id and replays its conversation as updates
-  before answering. Loading the session the process already runs is not a switch. A
+  before answering. A `cwd` that names a different directory than the stored session is
+  refused. Loading the session the process already runs is not a switch. A
   session is stored once it has a conversation, so an id that was never prompted names
-  nothing yet and the load is refused rather than answered with an empty session.
+  nothing yet and the load is refused rather than answered with an empty session. An
+  unreadable store is an internal error, not an unknown id.
+- A replayed conversation skips partial assistant entries: they are text from a turn
+  that never finished, and replaying them as complete messages would misstate the
+  record.
+- The client's standing instructions travel on `session/new` and `session/load` as the
+  `systemPrompt` field or the `_meta.systemPrompt` forms, with the optional
+  `_meta.sessionTitle`. They are stored outside the conversational history and rendered
+  into the harness system prompt, so resuming never shows them as chat.
 - One session per process. The harness claims one session at a time, and a second
   `session/new` replaces the first. Concurrent sessions would need an owner per session,
   which does not exist.
-- Client-provided `mcpServers` and `additionalDirectories` are refused by name rather than
-  ignored: a client that asked for a server and got silence would believe the tools were
-  there.
+- Client-provided stdio `mcpServers` are installed for the session and released when a
+  later session replaces them. A server needs an absolute command path; any other
+  transport is refused. `additionalDirectories` is refused rather than ignored: a
+  client that asked for a directory and got silence would believe it was there.
 - The model is chosen the way a headless run chooses one: the stored selection, then the
   model the session recorded, then the first configured model that can serve a request.
   Nothing is persisted, because a model chosen for an editor conversation is not the
-  user's own last choice for the harness.
+  user's own last choice for the harness. The `session/set_config_option` method
+  switches the model mid-session, and the answer carries the updated selector.
 
 ## What a turn reports
 
@@ -94,7 +112,9 @@ from every other frontend.
 
 A cancelled turn answers `session/prompt` with the `cancelled` stop reason, which is an
 answer rather than an error. A turn the harness could not finish answers with an error,
-and the transcript already carries the reason.
+and the transcript already carries the reason. A turn the store could not record
+answers as a failure even when the model finished it: the record is what the answer
+may claim.
 
 ## Not implemented
 
@@ -107,7 +127,8 @@ first.
 2. Client filesystem and terminal (`fs/read_text_file`, `fs/write_text_file`,
    `terminal/*`). Tools run against the local filesystem, which for a local client is the
    same machine.
-3. Modes, config options, and `session/set_config_option`. The model follows the opened
-   session and cannot be changed while the process runs.
-4. `session/list`, `session/delete`, `session/fork`, `session/resume`, and `session/close`.
+3. Modes, `session/delete`, and `session/fork`. The model follows the opened session
+   through `session/set_config_option`, but nothing else about the session is
+   configurable while the process runs.
+4. `session/list`, `session/resume`, and `session/close`.
 5. Slash commands and `available_commands_update`.

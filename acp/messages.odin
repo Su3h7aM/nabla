@@ -2,7 +2,7 @@ package acp
 
 import "core:encoding/json"
 
-// Protocol facts for the Agent Client Protocol, version 1.
+// Protocol facts for the Agent Client Protocol.
 //
 // The agent side is what this package describes: the methods a client calls, the
 // notifications an agent sends, and the payload shapes of both. The envelope and the
@@ -11,7 +11,7 @@ import "core:encoding/json"
 // and an update is a JSON document.
 
 // PROTOCOL_VERSION is the version this package speaks. A client that asks for a
-// different one is answered with this one and decides whether it can continue.
+// newer version receives this one.
 PROTOCOL_VERSION :: 1
 
 // Methods a client calls.
@@ -20,10 +20,15 @@ METHOD_AUTHENTICATE :: "authenticate"
 METHOD_SESSION_NEW :: "session/new"
 METHOD_SESSION_LOAD :: "session/load"
 METHOD_SESSION_PROMPT :: "session/prompt"
+METHOD_SESSION_SET_CONFIG_OPTION :: "session/set_config_option"
+METHOD_AUTH_LOGIN :: "auth/login"
+METHOD_AUTH_LOGOUT :: "auth/logout"
 
 // Notifications. A session update is the agent's only streaming channel: everything a
-// turn produces arrives as one of the update kinds below.
-NOTIFICATION_SESSION_CANCEL :: "session/cancel"
+// turn produces arrives as one of the update kinds below. Cancellation travels on the
+// same name in both directions: ACP defines it as a notification, but a few clients
+// send it as a request, and accepting that shape keeps cancellation draining.
+SESSION_CANCEL :: "session/cancel"
 NOTIFICATION_SESSION_UPDATE :: "session/update"
 
 // JSON-RPC error codes: the specification's four, then the code ACP defines.
@@ -36,8 +41,14 @@ ERROR_INTERNAL :: -32603
 // Session update kinds, as they appear in the `sessionUpdate` field.
 UPDATE_USER_MESSAGE_CHUNK :: "user_message_chunk"
 UPDATE_AGENT_MESSAGE_CHUNK :: "agent_message_chunk"
+UPDATE_USER_MESSAGE :: "user_message"
+UPDATE_AGENT_MESSAGE :: "agent_message"
+UPDATE_AGENT_THOUGHT :: "agent_thought"
+UPDATE_STATE :: "state_update"
 UPDATE_TOOL_CALL :: "tool_call"
 UPDATE_TOOL_CALL_UPDATE :: "tool_call_update"
+UPDATE_TOOL_CALL_CONTENT_CHUNK :: "tool_call_content_chunk"
+UPDATE_SESSION_INFO :: "session_info_update"
 UPDATE_USAGE :: "usage_update"
 
 // Content block kinds, as they appear in the `type` field.
@@ -143,6 +154,7 @@ tool_status_name :: proc(status: Tool_Status) -> string {
 // initialize; an agent answers with this one.
 Implementation :: struct {
 	name:    string `json:"name"`,
+	title:   string `json:"title,omitempty"`,
 	version: string `json:"version"`,
 }
 
@@ -162,22 +174,40 @@ Initialize_Params :: struct {
 	client_info:         Implementation `json:"clientInfo"`,
 }
 
-// Mcp_Server is one server the client asks the agent to connect to. Only the name is
-// read: an agent that cannot accept the list says so by name.
+Mcp_Environment :: struct {
+	name:  string `json:"name"`,
+	value: string `json:"value"`,
+}
+
+// Mcp_Server is the stdio MCP server configuration carried by ACP. The optional
+// type accepts the stdio discriminator; only stdio is implemented by this agent.
 Mcp_Server :: struct {
-	name: string `json:"name"`,
+	name:    string `json:"name"`,
+	type:    string `json:"type,omitempty"`,
+	command: string `json:"command"`,
+	args:    []string `json:"args"`,
+	env:     []Mcp_Environment `json:"env"`,
+}
+
+Session_Meta :: struct {
+	session_title: string `json:"sessionTitle"`,
+	system_prompt: json.Value `json:"systemPrompt"`,
 }
 
 Session_New_Params :: struct {
 	cwd:                    string `json:"cwd"`,
 	additional_directories: []string `json:"additionalDirectories"`,
 	mcp_servers:            []Mcp_Server `json:"mcpServers"`,
+	system_prompt:          string `json:"systemPrompt"`,
+	meta:                   Session_Meta `json:"_meta"`,
 }
 
 Session_Load_Params :: struct {
-	session_id:  string `json:"sessionId"`,
-	cwd:         string `json:"cwd"`,
-	mcp_servers: []Mcp_Server `json:"mcpServers"`,
+	session_id:    string `json:"sessionId"`,
+	cwd:           string `json:"cwd"`,
+	mcp_servers:   []Mcp_Server `json:"mcpServers"`,
+	system_prompt: string `json:"systemPrompt"`,
+	meta:          Session_Meta `json:"_meta"`,
 }
 
 // Embedded_Resource is a resource the client inlined into the prompt: the file's text
@@ -214,9 +244,15 @@ Prompt_Capabilities :: struct {
 	embedded_context: bool `json:"embeddedContext"`,
 }
 
+Mcp_Capabilities :: struct {
+	http: bool `json:"http"`,
+	sse:  bool `json:"sse"`,
+}
+
 Agent_Capabilities :: struct {
 	load_session:        bool `json:"loadSession"`,
 	prompt_capabilities: Prompt_Capabilities `json:"promptCapabilities"`,
+	mcp_capabilities:    Mcp_Capabilities `json:"mcpCapabilities"`,
 }
 
 Initialize_Result :: struct {
@@ -227,7 +263,23 @@ Initialize_Result :: struct {
 }
 
 Session_New_Result :: struct {
-	session_id: string `json:"sessionId"`,
+	session_id:     string `json:"sessionId"`,
+	config_options: []V1_Config_Option `json:"configOptions,omitempty"`,
+}
+
+// Config_Value is one choice of the model selector.
+Config_Value :: struct {
+	value: string `json:"value"`,
+	name:  string `json:"name"`,
+}
+
+V1_Config_Option :: struct {
+	id:            string `json:"id"`,
+	name:          string `json:"name"`,
+	category:      string `json:"category"`,
+	type:          string `json:"type"`,
+	current_value: string `json:"currentValue"`,
+	options:       []Config_Value `json:"options"`,
 }
 
 // Empty_Result is the answer of a method that reports success by returning.
@@ -235,6 +287,22 @@ Empty_Result :: struct {}
 
 Prompt_Result :: struct {
 	stop_reason: string `json:"stopReason"`,
+}
+
+Session_Set_Config_Option_Params :: struct {
+	session_id: string `json:"sessionId"`,
+	config_id:  string `json:"configId"`,
+	type:       string `json:"type"`,
+	value:      string `json:"value"`,
+}
+
+V1_Session_Set_Config_Option_Result :: struct {
+	config_options: []V1_Config_Option `json:"configOptions"`,
+}
+
+Session_Info_Update :: struct {
+	session_update: string `json:"sessionUpdate"`,
+	title:          string `json:"title,omitempty"`,
 }
 
 Text_Content :: struct {

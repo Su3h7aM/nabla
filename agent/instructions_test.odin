@@ -45,7 +45,7 @@ test_instruction_roots_order_and_rendering :: proc(t: ^testing.T) {
 	defer delete(files)
 	append(&files, Agents_File{path = "/home/user/.agents/AGENTS.md", scope = "personal", body = "Be brief."})
 	catalog: skills.Catalog
-	rendered, rendered_error := render_instructions(files[:], catalog, true)
+	rendered, rendered_error := render_instructions(files[:], catalog, "", true)
 	if rendered_error != nil { testing.fail_now(t, "instructions could not be rendered") }
 	defer delete(rendered, context.allocator)
 	testing.expect(t, len(rendered) > len(AGENT_SYSTEM_PROMPT))

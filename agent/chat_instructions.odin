@@ -20,18 +20,20 @@ Instruction_Manifest_Error :: enum {
 chat_ensure_instructions :: proc(chat: ^Chat_Session) -> bool {
 	if chat.skill_instructions != "" { return true }
 
-	snapshot, present, read_error := session.instruction_snapshot_read(chat.store, chat.id, chat.allocator)
-	if read_error == nil && present {
-		defer session.instruction_snapshot_destroy(&snapshot, chat.allocator)
-		if !chat_apply_snapshot(chat, snapshot.instructions, snapshot.manifest_json) {
-			chat_session_record_failure(chat, "the instruction snapshot is invalid", session.error_make(.Corrupt, ""))
+	if chat.client_instructions == "" {
+		snapshot, present, read_error := session.instruction_snapshot_read(chat.store, chat.id, chat.allocator)
+		if read_error == nil && present {
+			defer session.instruction_snapshot_destroy(&snapshot, chat.allocator)
+			if !chat_apply_snapshot(chat, snapshot.instructions, snapshot.manifest_json) {
+				chat_session_record_failure(chat, "the instruction snapshot is invalid", session.error_make(.Corrupt, ""))
+				return false
+			}
+			chat.skill_snapshot_seq = snapshot.seq
+			return true
+		} else if read_error != nil {
+			chat_session_record_failure(chat, "the instruction snapshot could not be read", read_error)
 			return false
 		}
-		chat.skill_snapshot_seq = snapshot.seq
-		return true
-	} else if read_error != nil {
-		chat_session_record_failure(chat, "the instruction snapshot could not be read", read_error)
-		return false
 	}
 	instructions, manifest, catalog, manifest_error := chat_build_snapshot(chat)
 	if manifest_error != "" {
@@ -84,7 +86,7 @@ chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: str
 	if discover_error.kind != .None {
 		return "", "", {}, "skill discovery failed"
 	}
-	rendered, rendered_error := render_instructions(files, discovered, chat.tools_enabled, chat.allocator)
+	rendered, rendered_error := render_instructions(files, discovered, chat.client_instructions, chat.tools_enabled, chat.allocator)
 	if rendered_error != nil { return "", "", {}, "local instructions could not be allocated" }
 	if len(rendered) > INSTRUCTIONS_MAX_BYTES {
 		delete(rendered, chat.allocator)

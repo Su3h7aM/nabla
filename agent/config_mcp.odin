@@ -58,6 +58,11 @@ MCP_Server_Config :: struct {
 	maximum_call_timeout: time.Duration,
 }
 
+// MCP_Server_Config_Destroy releases one configuration built by a client adapter.
+MCP_Server_Config_Destroy :: proc(config: ^MCP_Server_Config, allocator := context.allocator) {
+	mcp_server_config_destroy(config, allocator)
+}
+
 mcp_server_config_destroy :: proc(config: ^MCP_Server_Config, allocator := context.allocator) {
 	delete(config.id, allocator)
 	delete(config.stdio.executable, allocator)
@@ -82,6 +87,195 @@ mcp_servers_destroy :: proc(servers: ^[dynamic]MCP_Server_Config, allocator := c
 	for &server in servers^ { mcp_server_config_destroy(&server, allocator) }
 	delete(servers^)
 	servers^ = nil
+}
+
+// MCP_Server_Config_From_Stdio builds a server from the stdio transport shape.
+// Names and values are parallel borrowed slices so callers need not manufacture this
+// package's private environment representation.
+MCP_Server_Config_From_Stdio :: proc(
+	id: string,
+	executable: string,
+	arguments: []string,
+	environment_names: []string,
+	environment_values: []string,
+	allocator := context.allocator,
+) -> (
+	MCP_Server_Config,
+	Config_Error,
+) {
+	if !tool_name_valid(id) ||
+	   executable == "" ||
+	   !strings.has_prefix(executable, "/") ||
+	   len(environment_names) != len(environment_values) ||
+	   len(arguments) > MCP_MAX_ENTRIES ||
+	   len(environment_names) > MCP_MAX_ENTRIES {
+		return {}, .Invalid
+	}
+	config := MCP_Server_Config {
+		discovery_timeout    = MCP_DEFAULT_DISCOVERY_TIMEOUT,
+		call_timeout         = MCP_DEFAULT_CALL_TIMEOUT,
+		maximum_call_timeout = MCP_DEFAULT_MAXIMUM_CALL_TIMEOUT,
+	}
+	failed := true
+	defer if failed { mcp_server_config_destroy(&config, allocator) }
+	clone_error: mem.Allocator_Error
+	config.id, clone_error = strings.clone(id, allocator)
+	if clone_error != nil { return {}, .Allocation }
+	config.stdio.executable, clone_error = strings.clone(executable, allocator)
+	if clone_error != nil { return {}, .Allocation }
+	arguments_copy, arguments_error := mcp_string_slice_clone(arguments, allocator)
+	if arguments_error != .None { return {}, arguments_error }
+	config.stdio.arguments = arguments_copy
+	environment, environment_error := mcp_environment_from_pairs(environment_names, environment_values, allocator)
+	if environment_error != .None { return {}, environment_error }
+	config.stdio.environment = environment
+	failed = false
+	return config, .None
+}
+
+// MCP_Server_Configs_Clone copies a configuration list so a client-provided stdio
+// session can extend the launch configuration without borrowing its lifetime.
+MCP_Server_Configs_Clone :: proc(servers: []MCP_Server_Config, allocator := context.allocator) -> ([dynamic]MCP_Server_Config, Config_Error) {
+	result, result_error := make([dynamic]MCP_Server_Config, 0, len(servers), allocator)
+	if result_error != nil { return {}, .Allocation }
+	failed := true
+	defer if failed { mcp_servers_destroy(&result, allocator) }
+	for server in servers {
+		copy, copy_error := mcp_server_config_clone(server, allocator)
+		if copy_error != .None { return {}, copy_error }
+		appended := append(&result, copy)
+		if appended != 1 {
+			if appended == 0 { mcp_server_config_destroy(&copy, allocator) }
+			return {}, .Allocation
+		}
+	}
+	failed = false
+	return result, .None
+}
+
+MCP_Server_Configs_Destroy :: proc(servers: ^[dynamic]MCP_Server_Config, allocator := context.allocator) {
+	mcp_servers_destroy(servers, allocator)
+}
+
+mcp_string_slice_clone :: proc(values: []string, allocator: mem.Allocator) -> ([]string, Config_Error) {
+	result, result_error := make([]string, len(values), allocator)
+	if result_error != nil { return nil, .Allocation }
+	for value, index in values {
+		result[index], result_error = strings.clone(value, allocator)
+		if result_error != nil {
+			for owned in result[:index] { delete(owned, allocator) }
+			delete(result, allocator)
+			return nil, .Allocation
+		}
+	}
+	return result, .None
+}
+
+mcp_environment_from_pairs :: proc(names, values: []string, allocator: mem.Allocator) -> ([]MCP_Environment, Config_Error) {
+	result, result_error := make([]MCP_Environment, len(names), allocator)
+	if result_error != nil { return nil, .Allocation }
+	for name, index in names {
+		if !mcp_environment_name_valid(name) {
+			for owned in result {
+				delete(owned.name, allocator)
+				delete(owned.value, allocator)
+			}
+			delete(result, allocator)
+			return nil, .Invalid
+		}
+		result[index].name, result_error = strings.clone(name, allocator)
+		if result_error != nil {
+			for owned in result[:index] {
+				delete(owned.name, allocator)
+				delete(owned.value, allocator)
+			}
+			delete(result, allocator)
+			return nil, .Allocation
+		}
+		result[index].value, result_error = strings.clone(values[index], allocator)
+		if result_error != nil {
+			delete(result[index].name, allocator)
+			for owned in result[:index] {
+				delete(owned.name, allocator)
+				delete(owned.value, allocator)
+			}
+			delete(result, allocator)
+			return nil, .Allocation
+		}
+	}
+	return result, .None
+}
+
+mcp_environment_clone :: proc(source: []MCP_Environment, allocator: mem.Allocator) -> ([]MCP_Environment, Config_Error) {
+	result, result_error := make([]MCP_Environment, len(source), allocator)
+	if result_error != nil { return nil, .Allocation }
+	for entry, index in source {
+		if !mcp_environment_name_valid(entry.name) {
+			for owned in result {
+				delete(owned.name, allocator)
+				delete(owned.value, allocator)
+			}
+			delete(result, allocator)
+			return nil, .Invalid
+		}
+		result[index].name, result_error = strings.clone(entry.name, allocator)
+		if result_error != nil {
+			for owned in result[:index] {
+				delete(owned.name, allocator)
+				delete(owned.value, allocator)
+			}
+			delete(result, allocator)
+			return nil, .Allocation
+		}
+		result[index].value, result_error = strings.clone(entry.value, allocator)
+		if result_error != nil {
+			delete(result[index].name, allocator)
+			for owned in result[:index] {
+				delete(owned.name, allocator)
+				delete(owned.value, allocator)
+			}
+			delete(result, allocator)
+			return nil, .Allocation
+		}
+	}
+	return result, .None
+}
+
+mcp_server_config_clone :: proc(source: MCP_Server_Config, allocator: mem.Allocator) -> (MCP_Server_Config, Config_Error) {
+	config := MCP_Server_Config {
+		discovery_timeout    = source.discovery_timeout,
+		call_timeout         = source.call_timeout,
+		maximum_call_timeout = source.maximum_call_timeout,
+	}
+	failed := true
+	defer if failed { mcp_server_config_destroy(&config, allocator) }
+	clone_error: mem.Allocator_Error
+	config.id, clone_error = strings.clone(source.id, allocator)
+	if clone_error != nil { return {}, .Allocation }
+	config.stdio.executable, clone_error = strings.clone(source.stdio.executable, allocator)
+	if clone_error != nil { return {}, .Allocation }
+	config.stdio.working_directory, clone_error = strings.clone(source.stdio.working_directory, allocator)
+	if clone_error != nil { return {}, .Allocation }
+	arguments_copy, arguments_error := mcp_string_slice_clone(source.stdio.arguments, allocator)
+	if arguments_error != .None { return {}, arguments_error }
+	config.stdio.arguments = arguments_copy
+	environment_copy, environment_error := mcp_environment_clone(source.stdio.environment, allocator)
+	if environment_error != .None { return {}, environment_error }
+	config.stdio.environment = environment_copy
+	if len(source.tools) > 0 {
+		tools, tools_error := make([]MCP_Tool_Config, len(source.tools), allocator)
+		if tools_error != nil { return {}, .Allocation }
+		config.tools = tools
+		for tool, index in source.tools {
+			config.tools[index].remote_name, clone_error = strings.clone(tool.remote_name, allocator)
+			if clone_error != nil { return {}, .Allocation }
+			config.tools[index].name, clone_error = strings.clone(tool.name, allocator)
+			if clone_error != nil { return {}, .Allocation }
+			config.tools[index].enabled = tool.enabled
+		}
+	}
+	failed = false
+	return config, .None
 }
 
 // mcp_servers_load reads the `mcp.servers` table. A server is refused rather than

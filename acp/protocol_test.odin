@@ -23,6 +23,11 @@ test_envelope_kinds_and_validation :: proc(t: ^testing.T) {
 	testing.expect(t, response.result_present)
 	destroy_envelope(&response)
 
+	null_request, null_request_err := parse_envelope("{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"}")
+	testing.expect_value(t, null_request_err, Envelope_Error.None)
+	testing.expect(t, null_request.id_present)
+	destroy_envelope(&null_request)
+
 	// Malformed envelopes are classified rather than accepted.
 	invalid_cases := []struct {
 		wire: string,
@@ -30,7 +35,6 @@ test_envelope_kinds_and_validation :: proc(t: ^testing.T) {
 	} {
 		{"not-json", .Invalid_JSON},
 		{"{\"jsonrpc\":\"1.0\",\"method\":\"x\"}", .Invalid_Version},
-		{"{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"x\"}", .Invalid_ID},
 		{"{\"jsonrpc\":\"2.0\",\"id\":\"abc\"}", .Invalid_Result},
 		{"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":1,\"error\":{}}", .Invalid_Result},
 	}

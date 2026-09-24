@@ -196,6 +196,7 @@ Chat_Session :: struct {
 	// means unavailable, never an instruction to rescan.
 	skill_catalog:                Maybe(skills.Catalog),
 	skill_instructions:           string, // owned; exact normal-request prefix
+	client_instructions:          string, // owned; client-supplied standing system instructions
 	skill_snapshot_seq:           Maybe(session.Seq),
 	disable_project_instructions: bool,
 }
@@ -230,6 +231,23 @@ chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspa
 	// rather than from the allocator the owner may be writing through at the same time.
 	mailbox_init(&chat.mailbox, os.heap_allocator())
 	return chat, {}
+}
+
+// chat_session_set_client_instructions replaces the standing instructions supplied by
+// a client. The replacement invalidates the generated instruction snapshot so the next
+// request renders the client's text together with the harness instructions.
+chat_session_set_client_instructions :: proc(chat: ^Chat_Session, instructions: string) -> bool {
+	if chat.state != .Idle { return false }
+	owned, clone_error := strings.clone(instructions, chat.allocator)
+	if clone_error != nil { return false }
+	delete(chat.client_instructions, chat.allocator)
+	chat.client_instructions = owned
+	delete(chat.skill_instructions, chat.allocator)
+	chat.skill_instructions = ""
+	if catalog, present := &chat.skill_catalog.?; present { skills.catalog_destroy(catalog, chat.allocator) }
+	chat.skill_catalog = nil
+	chat.skill_snapshot_seq = nil
+	return true
 }
 
 chat_tool_call_destroy :: proc(call: ^Chat_Tool_Call, allocator: mem.Allocator) {
@@ -297,6 +315,8 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	chat.skill_catalog = nil
 	delete(chat.skill_instructions, chat.allocator)
 	chat.skill_instructions = ""
+	delete(chat.client_instructions, chat.allocator)
+	chat.client_instructions = ""
 	delete(string(chat.id), chat.allocator)
 	delete(chat.partial_assistant)
 	if chat.pending_response_present { chat_response_output_destroy(&chat.pending_response, chat.allocator) }

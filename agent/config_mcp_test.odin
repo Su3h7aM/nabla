@@ -126,6 +126,27 @@ test_mcp_config_refuses_what_it_cannot_run :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_mcp_constructor_clones_stdio_values_and_rejects_bad_environment :: proc(t: ^testing.T) {
+	arguments := []string{"--stdio"}
+	names := []string{"TOKEN"}
+	values := []string{"secret"}
+	config, config_err := MCP_Server_Config_From_Stdio("client", "/usr/bin/mcp", arguments, names, values)
+	if !testing.expect_value(t, config_err, Config_Error.None) { return }
+	defer MCP_Server_Config_Destroy(&config)
+	clone, clone_err := mcp_server_config_clone(config, context.allocator)
+	if !testing.expect_value(t, clone_err, Config_Error.None) { return }
+	defer MCP_Server_Config_Destroy(&clone)
+	testing.expect_value(t, clone.id, "client")
+	testing.expect_value(t, clone.stdio.executable, "/usr/bin/mcp")
+	testing.expect_value(t, clone.stdio.arguments[0], "--stdio")
+	testing.expect_value(t, clone.stdio.environment[0].name, "TOKEN")
+	testing.expect_value(t, clone.stdio.environment[0].value, "secret")
+
+	_, invalid_err := MCP_Server_Config_From_Stdio("client", "/usr/bin/mcp", arguments, []string{"GOOD", " BAD"}, []string{"one", "two"})
+	testing.expect_value(t, invalid_err, Config_Error.Invalid)
+}
+
+@(test)
 test_mcp_config_absent_is_empty :: proc(t: ^testing.T) {
 	servers, err := mcp_config_load(t, "absent", `return { }`)
 	defer mcp_servers_destroy(&servers)

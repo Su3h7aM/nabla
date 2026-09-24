@@ -6,7 +6,8 @@ import "core:testing"
 
 @(test)
 test_frame_chunk_boundaries_and_multiple_frames :: proc(t: ^testing.T) {
-	decoder := frame_decoder_init(128)
+	decoder, decoder_error := frame_decoder_init(128)
+	testing.expect(t, decoder_error == nil)
 	defer frame_decoder_destroy(&decoder)
 	frames: [dynamic]string
 	defer frame_strings_destroy(&frames)
@@ -27,12 +28,14 @@ test_frame_oversized_and_invalid_utf8 :: proc(t: ^testing.T) {
 	defer frame_strings_destroy(&frames)
 
 	// A frame larger than the configured bound is rejected.
-	decoder := frame_decoder_init(4)
+	decoder, decoder_error := frame_decoder_init(4)
+	testing.expect(t, decoder_error == nil)
 	testing.expect_value(t, frame_decoder_feed(&decoder, transmute([]u8)string("12345"), &frames), Frame_Error.Frame_Too_Large)
 	frame_decoder_destroy(&decoder)
 
 	// A frame that is not valid UTF-8 is rejected.
-	decoder = frame_decoder_init(4)
+	decoder, decoder_error = frame_decoder_init(4)
+	testing.expect(t, decoder_error == nil)
 	testing.expect_value(t, frame_decoder_feed(&decoder, []byte{0xff, '\n'}, &frames), Frame_Error.Invalid_UTF8)
 	frame_decoder_destroy(&decoder)
 }

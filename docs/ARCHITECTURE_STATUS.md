@@ -33,8 +33,9 @@ reimplementing something that exists. Update it when the gap it names closes.
   evidence on the WebSocket path.
 - The ACP frontend: `nabla acp` speaks ACP v1 on stdio with `initialize`,
   `session/new`, `session/load` (with a replayed conversation), `session/prompt`,
-  `session/cancel`, and `session/update` for assistant text, harness notices, tool calls,
-  and context usage. See the [ACP frontend](ACP_ARCHITECTURE.md).
+  `session/cancel`, `session/set_config_option` for model selection, client stdio MCP
+  servers, client standing instructions, and `session/update` for assistant text,
+  harness notices, tool calls, and context usage. See the [ACP frontend](ACP_ARCHITECTURE.md).
 
 ## Gaps against the target
 
@@ -95,8 +96,8 @@ Do not build these without a task that requires them:
 - Public Lua task handles (`tasks.start/await/cancel`) and Code Mode discovery helpers.
 - Subagent tool, process protocol and supervision.
 - Tool call permission requests over ACP, client filesystem and terminal delegation,
-  client-provided MCP servers, session modes and config options, and more than one live
-  session per process. See the [ACP frontend](ACP_ARCHITECTURE.md).
+  session modes, HTTP MCP transport, additional session directories, and more than one
+  live session per process. See the [ACP frontend](ACP_ARCHITECTURE.md).
 - Feedback, rating, evaluation or auto-improvement storage and services.
 
 ## Known non-goals

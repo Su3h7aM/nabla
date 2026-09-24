@@ -3,10 +3,12 @@ package acp
 import "core:encoding/json"
 import "core:strings"
 
+Jsonrpc_Null :: struct {}
 Jsonrpc_Id :: union {
 	i64,
 	f64,
 	string,
+	Jsonrpc_Null,
 }
 Rpc_Error :: struct {
 	code:         i64,
@@ -154,6 +156,8 @@ object_id :: proc(obj: json.Object, key: string, allocator := context.allocator)
 		return f64(v), true, true
 	case json.String:
 		return strings.clone(string(v), allocator), true, true
+	case json.Null:
+		return Jsonrpc_Null{}, true, true
 	}
 	return nil, true, false
 }

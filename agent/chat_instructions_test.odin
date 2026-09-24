@@ -4,9 +4,21 @@ package agent
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:strings"
 import "core:testing"
 
 import "nabla:agent/skills"
+
+@(test)
+test_client_system_prompt_is_kept_out_of_history_and_rendered_as_instructions :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, "/tmp")
+	defer chat_test_end(t, &fixture)
+	if !testing.expect(t, chat_session_set_client_instructions(&fixture.chat, "client standing context")) { return }
+	testing.expect_value(t, fixture.chat.client_instructions, "client standing context")
+	if !testing.expect(t, chat_ensure_instructions(&fixture.chat)) { return }
+	testing.expect(t, strings.contains(fixture.chat.skill_instructions, "client standing context"))
+}
 
 // A snapshot written by an older build must still apply: resume reads it
 // instead of rediscovering, so an unreadable snapshot would strand the session.

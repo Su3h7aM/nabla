@@ -209,6 +209,7 @@ read_agents_file :: proc(path: string, allocator := context.allocator) -> (strin
 render_instructions :: proc(
 	files: []Agents_File,
 	catalog: skills.Catalog,
+	client_instructions: string,
 	tools_enabled: bool,
 	allocator := context.allocator,
 ) -> (
@@ -220,6 +221,9 @@ render_instructions :: proc(
 	failed := true
 	defer if failed { strings.builder_destroy(&builder) }
 	if !instruction_write_string(&builder, AGENT_SYSTEM_PROMPT) { return "", .Out_Of_Memory }
+	if client_instructions != "" && (!instruction_write_string(&builder, "\n\n") || !instruction_write_string(&builder, client_instructions)) {
+		return "", .Out_Of_Memory
+	}
 	if tools_enabled {
 		if !instruction_write_string(
 			&builder,

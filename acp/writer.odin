@@ -14,16 +14,17 @@ import "core:sync"
 // A write error latches. A client that stopped reading will not read the next frame
 // either, so there is nothing to retry and the caller stops the run.
 Writer :: struct {
-	out:     io.Writer,
-	mutex:   sync.Mutex,
-	builder: strings.Builder,
-	failed:  bool, // atomic; written by whoever writes, read by whoever asks
+	out:       io.Writer,
+	allocator: mem.Allocator,
+	mutex:     sync.Mutex,
+	builder:   strings.Builder,
+	failed:    bool, // atomic; written by whoever writes, read by whoever asks
 }
 
 writer_init :: proc(out: io.Writer, allocator := context.allocator) -> (Writer, mem.Allocator_Error) {
 	builder, err := strings.builder_make(allocator)
 	if err != nil { return {}, err }
-	return Writer{out = out, builder = builder}, nil
+	return Writer{out = out, allocator = allocator, builder = builder}, nil
 }
 
 writer_destroy :: proc(w: ^Writer) {
@@ -35,15 +36,19 @@ writer_destroy :: proc(w: ^Writer) {
 
 writer_failed :: proc(w: ^Writer) -> bool { return sync.atomic_load(&w.failed) }
 
-// writer_write_response answers one request with a result payload.
+// writer_write_response answers one request with a result payload. The write happens
+// under one lock hold, so a frame a client reads is whole whatever two threads do at
+// once.
 writer_write_response :: proc(w: ^Writer, id: Jsonrpc_Id, result: $T) -> bool {
 	body, marshal_err := json.marshal(result, allocator = context.temp_allocator)
 	if marshal_err != nil { return false }
 	defer delete(body, context.temp_allocator)
+	sync.mutex_lock(&w.mutex)
+	defer sync.mutex_unlock(&w.mutex)
 	return writer_frame(w, id, `"result":`, body)
 }
 
-// Rpc_Error_Wire is the error object of a failed request.
+// Rpc_Error_Wire is the error document an error answer carries.
 Rpc_Error_Wire :: struct {
 	code:    i64 `json:"code"`,
 	message: string `json:"message"`,
@@ -54,10 +59,13 @@ writer_write_error :: proc(w: ^Writer, id: Jsonrpc_Id, code: i64, message: strin
 	body, marshal_err := json.marshal(Rpc_Error_Wire{code = code, message = message}, allocator = context.temp_allocator)
 	if marshal_err != nil { return false }
 	defer delete(body, context.temp_allocator)
+	sync.mutex_lock(&w.mutex)
+	defer sync.mutex_unlock(&w.mutex)
 	return writer_frame(w, id, `"error":`, body)
 }
 
-// writer_write_notification sends one notification, which no one answers.
+// writer_write_notification sends one notification, which no one answers. It is
+// always its own frame.
 writer_write_notification :: proc(w: ^Writer, method: string, params: $T) -> bool {
 	body, marshal_err := json.marshal(params, allocator = context.temp_allocator)
 	if marshal_err != nil { return false }
@@ -68,36 +76,34 @@ writer_write_notification :: proc(w: ^Writer, method: string, params: $T) -> boo
 	b := &w.builder
 	strings.builder_reset(b)
 	if !writer_builder_string(b, `{"jsonrpc":"2.0","method":`) ||
-		!writer_write_quoted(b, method) ||
-		!writer_builder_string(b, `,"params":`) ||
-		!writer_builder_bytes(b, body) ||
-		!writer_builder_string(b, "}\n") {
+	   !writer_write_quoted(b, method) ||
+	   !writer_builder_string(b, `,"params":`) ||
+	   !writer_builder_bytes(b, body) ||
+	   !writer_builder_string(b, "}\n") {
 		sync.atomic_store(&w.failed, true)
 		return false
 	}
 	return writer_flush(w, b)
 }
 
+// writer_frame writes one response frame. The caller holds the mutex.
 @(private)
 writer_frame :: proc(w: ^Writer, id: Jsonrpc_Id, key: string, body: []byte) -> bool {
 	if w.out.procedure == nil { return false }
-	sync.mutex_lock(&w.mutex)
-	defer sync.mutex_unlock(&w.mutex)
 	b := &w.builder
 	strings.builder_reset(b)
 	if !writer_builder_string(b, `{"jsonrpc":"2.0","id":`) ||
-		!writer_write_id(b, id) ||
-		!writer_builder_byte(b, ',') ||
-		!writer_builder_string(b, key) ||
-		!writer_builder_bytes(b, body) ||
-		!writer_builder_string(b, "}\n") {
+	   !writer_write_id(b, id) ||
+	   !writer_builder_byte(b, ',') ||
+	   !writer_builder_string(b, key) ||
+	   !writer_builder_bytes(b, body) ||
+	   !writer_builder_string(b, "}\n") {
 		sync.atomic_store(&w.failed, true)
 		return false
 	}
 	return writer_flush(w, b)
 }
 
-// writer_flush writes the frame the builder holds. The caller holds the lock, so the
 // builder is the writer's own scratch and no two frames can interleave.
 @(private)
 writer_flush :: proc(w: ^Writer, b: ^strings.Builder) -> bool {
@@ -135,6 +141,8 @@ writer_write_id :: proc(b: ^strings.Builder, id: Jsonrpc_Id) -> bool {
 		return writer_builder_bytes(b, body)
 	case string:
 		return writer_write_quoted(b, value)
+	case Jsonrpc_Null:
+		return writer_builder_string(b, "null")
 	case:
 		// An id the envelope parser would have refused cannot name a request, so a
 		// response to it is written as the JSON null a client can still match.
@@ -167,8 +175,8 @@ writer_write_quoted :: proc(b: ^strings.Builder, value: string) -> bool {
 		case:
 			if c < 0x20 {
 				if !writer_builder_string(b, `\u00`) ||
-					!writer_builder_byte(b, writer_hex_digit(c >> 4)) ||
-					!writer_builder_byte(b, writer_hex_digit(c & 0x0F)) { return false }
+				   !writer_builder_byte(b, writer_hex_digit(c >> 4)) ||
+				   !writer_builder_byte(b, writer_hex_digit(c & 0x0F)) { return false }
 			} else if !writer_builder_byte(b, c) {
 				return false
 			}

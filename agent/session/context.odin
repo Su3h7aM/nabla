@@ -331,6 +331,34 @@ context_destroy :: proc(ctx: ^Context, allocator := context.allocator) {
 	ctx^ = {}
 }
 
+Replay_History :: struct {
+	entries: []Entry, // owned
+}
+
+history_destroy :: proc(history: ^Replay_History, allocator := context.allocator) {
+	if history == nil { return }
+	entries_destroy(history.entries, allocator)
+	history^ = {}
+}
+
+// history_load reads the retained conversation rather than the compacted model
+// context. ACP replay needs every user, assistant, and tool record, including
+// entries before the latest checkpoint.
+history_load :: proc(store: ^Store, id: Session_Id, allocator := context.allocator) -> (history: Replay_History, err: Error) {
+	if !store.open { return {}, error_make(.Invalid_State, "the store is closed") }
+	entries, read_err := entries_read(
+		store,
+		`SELECT ` +
+		ENTRY_COLUMNS +
+		` FROM entries WHERE session_id = ? AND parent_call_seq IS NULL AND kind NOT IN ('tool_dispatch', 'checkpoint', 'instruction_snapshot') ORDER BY seq`,
+		{db.Value(string(id))},
+		false,
+		allocator,
+	)
+	if read_err != nil { return {}, read_err }
+	return Replay_History{entries = entries}, nil
+}
+
 // context_load reads what a request would be built from right now. Entries a
 // model is never shown are left out: a tool dispatch is bookkeeping, and a
 // partial assistant entry is text from a turn that never finished.

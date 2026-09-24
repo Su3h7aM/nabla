@@ -14,6 +14,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 
+import "nabla:acp"
 import "nabla:agent"
 
 // The ACP frontend is driven the way a client drives it: a scripted provider behind a
@@ -32,6 +33,18 @@ import "nabla:agent"
 // reads a brace as a directive, and these documents are full of them.
 
 ACP_TEST_BOUND :: 10 * time.Second
+
+@(test)
+test_acp_session_meta_reads_client_system_prompt_extensions :: proc(t: ^testing.T) {
+	meta: acp.Session_Meta
+	object: json.Object
+	object["append"] = json.String("client standing context")
+	meta.system_prompt = object
+	testing.expect_value(t, acp_session_meta_system_prompt(&meta), "client standing context")
+	delete(object)
+	meta.system_prompt = json.String("plain context")
+	testing.expect_value(t, acp_session_meta_system_prompt(&meta), "plain context")
+}
 
 // --- messages on the wire ----------------------------------------------------
 
@@ -317,12 +330,7 @@ acp_test_client_carries :: proc(t: ^testing.T, frame: string, facts: []string, w
 }
 
 // acp_test_client_session_id reads the id a session/new answer names.
-acp_test_client_session_id :: proc(t: ^testing.T, client: ^Acp_Test_Client, allocator := context.allocator) -> string {
-	frame := acp_test_client_receive(client)
-	if frame == "" {
-		testing.expectf(t, false, "session/new: the run did not answer")
-		return ""
-	}
+acp_test_client_session_id_from_frame :: proc(t: ^testing.T, frame: string, allocator := context.allocator) -> string {
 	answer: struct {
 		result: struct {
 			session_id: string `json:"sessionId"`,
@@ -333,6 +341,15 @@ acp_test_client_session_id :: proc(t: ^testing.T, client: ^Acp_Test_Client, allo
 		return ""
 	}
 	return answer.result.session_id
+}
+
+acp_test_client_session_id :: proc(t: ^testing.T, client: ^Acp_Test_Client, allocator := context.allocator) -> string {
+	frame := acp_test_client_receive(client)
+	if frame == "" {
+		testing.expectf(t, false, "session/new: the run did not answer")
+		return ""
+	}
+	return acp_test_client_session_id_from_frame(t, frame, allocator = allocator)
 }
 
 // --- environment -------------------------------------------------------------
@@ -498,11 +515,15 @@ test_acp_serves_a_turn_and_replays_a_loaded_session :: proc(t: ^testing.T) {
 	testing.expectf(t, strings.contains(hello, `"loadSession":true`), "initialize did not announce loadSession: %s", hello)
 	testing.expectf(t, strings.contains(hello, `"embeddedContext":true`), "initialize did not announce embedded context: %s", hello)
 
-	// session/new: the client gets the id it will name from then on.
+	// session/new: the client gets the id it will name from then on, with the model
+	// selector it may switch.
 	opening := strings.builder_make(context.temp_allocator)
 	acp_test_new_session_message(&opening, 2, workspace)
 	acp_test_client_send(&client, strings.to_string(opening))
-	session_id := acp_test_client_session_id(t, &client)
+	opened := acp_test_client_expect(t, &client, `"sessionId"`, "session/new was not answered")
+	if opened == "" { return }
+	if !acp_test_client_carries(t, opened, {`"configOptions"`, `"value":"testmodel"`, `"currentValue":"testmodel"`}, "the session answer") { return }
+	session_id := acp_test_client_session_id_from_frame(t, opened)
 	if session_id == "" { return }
 	defer delete(session_id, context.allocator)
 
