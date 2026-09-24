@@ -60,7 +60,7 @@ Provider_Request_Freeze_WebSocket :: proc(request: Provider_Request, allocator :
 
 // Provider_Request_Freeze_WebSocket_Reusing freezes a WebSocket request, reusing what
 // cache already holds for the texts the request carries again. A nil cache encodes every
-// byte now.
+// byte now, and its body belongs to the caller.
 Provider_Request_Freeze_WebSocket_Reusing :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -79,6 +79,7 @@ Provider_Request_Freeze_WebSocket_Reusing :: proc(
 	return Provider_Encoded_Request {
 		API = request.API,
 		Body = transmute([]u8)body,
+		Body_Borrowed = cache != nil,
 		Model = request.Model,
 		Tools = len(request.Tools),
 		Session_Id_Present = request.Session_Id_Present,

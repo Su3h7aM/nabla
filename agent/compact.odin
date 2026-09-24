@@ -1247,7 +1247,7 @@ chat_repair_context :: proc(
 	}
 	// The rejected bytes are released only now, after the operation that sent them has
 	// returned and the payload that replaces them is built.
-	delete(encoded.Body, chat.allocator)
+	if !encoded.Body_Borrowed { delete(encoded.Body, chat.allocator) }
 	encoded^ = rebuilt
 	return .None
 }

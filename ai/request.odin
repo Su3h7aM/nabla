@@ -177,6 +177,11 @@ Provider_Operation_Error_Destroy :: proc(err: ^Provider_Operation_Error, allocat
 Provider_Encoded_Request :: struct {
 	API:                API_Kind,
 	Body:               []u8,
+	// Body_Borrowed says Body lives in the encode cache that wrote it, which the next
+	// request encoded through that cache writes over. Nothing frees a borrowed body, and
+	// it stays readable until the cache encodes again. A body encoded without a cache is
+	// the caller's instead, released with delete(encoded.Body, allocator).
+	Body_Borrowed:      bool,
 	// Model and Tools describe the body for the observer, which cannot read them
 	// back out of the encoded bytes.
 	Model:              string,
@@ -322,7 +327,9 @@ Provider_Request_Freeze :: proc(request: Provider_Request, allocator := context.
 
 // Provider_Request_Freeze_Reusing freezes a request, reusing what cache already holds
 // for the texts the request carries again. A nil cache encodes every byte now. The
-// caller owns the cache: one cache is walked by one encode at a time.
+// caller owns the cache: one cache is walked by one encode at a time, and a cache's body
+// belongs to the cache, so it stays readable only until that cache encodes the request
+// after this one.
 Provider_Request_Freeze_Reusing :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -341,6 +348,7 @@ Provider_Request_Freeze_Reusing :: proc(
 	return Provider_Encoded_Request {
 		API = request.API,
 		Body = transmute([]u8)body,
+		Body_Borrowed = cache != nil,
 		Model = request.Model,
 		Tools = len(request.Tools),
 		Session_Id_Present = request.Session_Id_Present,

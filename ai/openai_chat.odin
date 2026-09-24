@@ -17,173 +17,172 @@ openai_chat_encode_request :: proc(
 ) {
 	if err := Provider_Validate_Request(request); err != .None { return "", err }
 	cursor := encode_cursor(cache, allocator)
-	body, body_error := encode_body_make(&cursor, allocator)
+	body, body_error := encode_body_begin(&cursor, allocator)
 	if body_error != .None { return "", body_error }
-	defer strings.builder_destroy(&body)
+	defer encode_body_end(&cursor)
 
 	// Fields are written in the order the standard library's writer sorts them in, so a
 	// body is the bytes a parsed request would be written as, and the same conversation
 	// writes the same bytes in any process.
 	first := true
-	encode_write_raw(&cursor, &body, "{")
+	encode_write_raw(&cursor, body, "{")
 	if request.Max_Output_Tokens_Present {
 		// The output bound is sent in the field every current model accepts. The older
 		// `max_tokens` spelling is deprecated and is rejected outright by the reasoning
 		// models, so there is no model for which it is the right choice.
-		encode_write_field(&cursor, &body, &first, "max_completion_tokens")
-		encode_write_int(&cursor, &body, request.Max_Output_Tokens)
+		encode_write_field(&cursor, body, &first, "max_completion_tokens")
+		encode_write_int(&cursor, body, request.Max_Output_Tokens)
 	}
-	encode_write_field(&cursor, &body, &first, "messages")
-	encode_write_raw(&cursor, &body, "[")
+	encode_write_field(&cursor, body, &first, "messages")
+	encode_write_raw(&cursor, body, "[")
 	item_first := true
 	if request.Instructions_Present {
 		// Chat Completions has no instruction field, so the lane becomes the leading
 		// message it does understand. It is emitted here rather than carried in
 		// request.Messages, because an instruction is not a conversation turn.
-		encode_write_item(&cursor, &body, &item_first)
+		encode_write_item(&cursor, body, &item_first)
 		field_first := true
-		encode_write_raw(&cursor, &body, "{")
-		encode_write_field(&cursor, &body, &field_first, "content")
-		encode_write_text(&cursor, &body, request.Instructions)
-		encode_write_field(&cursor, &body, &field_first, "role")
-		encode_write_literal_string(&cursor, &body, "system")
-		encode_write_raw(&cursor, &body, "}")
+		encode_write_raw(&cursor, body, "{")
+		encode_write_field(&cursor, body, &field_first, "content")
+		encode_write_text(&cursor, body, request.Instructions)
+		encode_write_field(&cursor, body, &field_first, "role")
+		encode_write_literal_string(&cursor, body, "system")
+		encode_write_raw(&cursor, body, "}")
 	}
 	for message in request.Messages {
 		// Chat Completions has no reasoning input; reasoning continuity is
 		// a Responses replay contract, so these items are dropped here.
 		if message.Role == .Reasoning { continue }
-		encode_write_item(&cursor, &body, &item_first)
+		encode_write_item(&cursor, body, &item_first)
 		field_first := true
-		encode_write_raw(&cursor, &body, "{")
+		encode_write_raw(&cursor, body, "{")
 		if message.Cache_Breakpoint {
-			encode_write_field(&cursor, &body, &field_first, "content")
-			encode_write_raw(&cursor, &body, "[{")
+			encode_write_field(&cursor, body, &field_first, "content")
+			encode_write_raw(&cursor, body, "[{")
 			part_first := true
-			encode_write_field(&cursor, &body, &part_first, "prompt_cache_breakpoint")
-			encode_write_raw(&cursor, &body, "{")
+			encode_write_field(&cursor, body, &part_first, "prompt_cache_breakpoint")
+			encode_write_raw(&cursor, body, "{")
 			breakpoint_first := true
-			encode_write_field(&cursor, &body, &breakpoint_first, "mode")
-			encode_write_literal_string(&cursor, &body, "explicit")
-			encode_write_raw(&cursor, &body, "}")
-			encode_write_field(&cursor, &body, &part_first, "text")
-			encode_write_text(&cursor, &body, message.Content)
-			encode_write_field(&cursor, &body, &part_first, "type")
-			encode_write_literal_string(&cursor, &body, "text")
-			encode_write_raw(&cursor, &body, "}]")
+			encode_write_field(&cursor, body, &breakpoint_first, "mode")
+			encode_write_literal_string(&cursor, body, "explicit")
+			encode_write_raw(&cursor, body, "}")
+			encode_write_field(&cursor, body, &part_first, "text")
+			encode_write_text(&cursor, body, message.Content)
+			encode_write_field(&cursor, body, &part_first, "type")
+			encode_write_literal_string(&cursor, body, "text")
+			encode_write_raw(&cursor, body, "}]")
 		} else {
-			encode_write_field(&cursor, &body, &field_first, "content")
-			encode_write_text(&cursor, &body, message.Content)
+			encode_write_field(&cursor, body, &field_first, "content")
+			encode_write_text(&cursor, body, message.Content)
 		}
-		encode_write_field(&cursor, &body, &field_first, "role")
-		encode_write_literal_string(&cursor, &body, openai_role_name(message.Role))
+		encode_write_field(&cursor, body, &field_first, "role")
+		encode_write_literal_string(&cursor, body, openai_role_name(message.Role))
 		if message.Role == .Tool {
-			encode_write_field(&cursor, &body, &field_first, "tool_call_id")
-			encode_write_text(&cursor, &body, message.Tool_Call_ID)
+			encode_write_field(&cursor, body, &field_first, "tool_call_id")
+			encode_write_text(&cursor, body, message.Tool_Call_ID)
 		}
 		if message.Role == .Assistant && len(message.Tool_Calls) > 0 {
-			encode_write_field(&cursor, &body, &field_first, "tool_calls")
-			encode_write_raw(&cursor, &body, "[")
+			encode_write_field(&cursor, body, &field_first, "tool_calls")
+			encode_write_raw(&cursor, body, "[")
 			for call, index in message.Tool_Calls {
-				if index > 0 { encode_write_byte(&cursor, &body, ',') }
+				if index > 0 { encode_write_byte(&cursor, body, ',') }
 				call_first := true
-				encode_write_raw(&cursor, &body, "{")
-				encode_write_field(&cursor, &body, &call_first, "function")
-				encode_write_raw(&cursor, &body, "{")
+				encode_write_raw(&cursor, body, "{")
+				encode_write_field(&cursor, body, &call_first, "function")
+				encode_write_raw(&cursor, body, "{")
 				function_first := true
-				encode_write_field(&cursor, &body, &function_first, "arguments")
-				encode_write_text(&cursor, &body, call.Arguments)
-				encode_write_field(&cursor, &body, &function_first, "name")
-				encode_write_text(&cursor, &body, call.Name)
-				encode_write_raw(&cursor, &body, "}")
-				encode_write_field(&cursor, &body, &call_first, "id")
-				encode_write_text(&cursor, &body, call.ID)
-				encode_write_field(&cursor, &body, &call_first, "type")
-				encode_write_literal_string(&cursor, &body, "function")
-				encode_write_raw(&cursor, &body, "}")
+				encode_write_field(&cursor, body, &function_first, "arguments")
+				encode_write_text(&cursor, body, call.Arguments)
+				encode_write_field(&cursor, body, &function_first, "name")
+				encode_write_text(&cursor, body, call.Name)
+				encode_write_raw(&cursor, body, "}")
+				encode_write_field(&cursor, body, &call_first, "id")
+				encode_write_text(&cursor, body, call.ID)
+				encode_write_field(&cursor, body, &call_first, "type")
+				encode_write_literal_string(&cursor, body, "function")
+				encode_write_raw(&cursor, body, "}")
 			}
-			encode_write_raw(&cursor, &body, "]")
+			encode_write_raw(&cursor, body, "]")
 		}
-		encode_write_raw(&cursor, &body, "}")
+		encode_write_raw(&cursor, body, "}")
 	}
-	encode_write_raw(&cursor, &body, "]")
-	encode_write_field(&cursor, &body, &first, "model")
-	encode_write_text(&cursor, &body, request.Model)
+	encode_write_raw(&cursor, body, "]")
+	encode_write_field(&cursor, body, &first, "model")
+	encode_write_text(&cursor, body, request.Model)
 	if request.Prompt_Cache_Key_Present {
-		encode_write_field(&cursor, &body, &first, "prompt_cache_key")
-		encode_write_text(&cursor, &body, request.Prompt_Cache_Key)
+		encode_write_field(&cursor, body, &first, "prompt_cache_key")
+		encode_write_text(&cursor, body, request.Prompt_Cache_Key)
 	}
 	if request.Prompt_Cache_Options_Present {
-		encode_write_field(&cursor, &body, &first, "prompt_cache_options")
-		encode_write_raw(&cursor, &body, "{")
+		encode_write_field(&cursor, body, &first, "prompt_cache_options")
+		encode_write_raw(&cursor, body, "{")
 		options_first := true
 		if request.Prompt_Cache_Options.Mode_Present {
 			mode := "implicit"
 			if request.Prompt_Cache_Options.Mode == .Explicit { mode = "explicit" }
-			encode_write_field(&cursor, &body, &options_first, "mode")
-			encode_write_literal_string(&cursor, &body, mode)
+			encode_write_field(&cursor, body, &options_first, "mode")
+			encode_write_literal_string(&cursor, body, mode)
 		}
 		if request.Prompt_Cache_Options.TTL_Present {
-			encode_write_field(&cursor, &body, &options_first, "ttl")
-			encode_write_literal_string(&cursor, &body, request.Prompt_Cache_Options.TTL)
+			encode_write_field(&cursor, body, &options_first, "ttl")
+			encode_write_literal_string(&cursor, body, request.Prompt_Cache_Options.TTL)
 		}
-		encode_write_raw(&cursor, &body, "}")
+		encode_write_raw(&cursor, body, "}")
 	}
 	if request.Prompt_Cache_Retention_Present {
-		encode_write_field(&cursor, &body, &first, "prompt_cache_retention")
-		encode_write_text(&cursor, &body, request.Prompt_Cache_Retention)
+		encode_write_field(&cursor, body, &first, "prompt_cache_retention")
+		encode_write_text(&cursor, body, request.Prompt_Cache_Retention)
 	}
 	if request.Reasoning_Effort_Present {
-		encode_write_field(&cursor, &body, &first, "reasoning_effort")
-		encode_write_text(&cursor, &body, request.Reasoning_Effort)
+		encode_write_field(&cursor, body, &first, "reasoning_effort")
+		encode_write_text(&cursor, body, request.Reasoning_Effort)
 	}
 	if request.Store_Response_Present {
-		encode_write_field(&cursor, &body, &first, "store")
-		encode_write_bool(&cursor, &body, request.Store_Response)
+		encode_write_field(&cursor, body, &first, "store")
+		encode_write_bool(&cursor, body, request.Store_Response)
 	}
-	encode_write_field(&cursor, &body, &first, "stream")
-	encode_write_bool(&cursor, &body, true)
-	encode_write_field(&cursor, &body, &first, "stream_options")
-	encode_write_raw(&cursor, &body, "{")
+	encode_write_field(&cursor, body, &first, "stream")
+	encode_write_bool(&cursor, body, true)
+	encode_write_field(&cursor, body, &first, "stream_options")
+	encode_write_raw(&cursor, body, "{")
 	usage_first := true
-	encode_write_field(&cursor, &body, &usage_first, "include_usage")
-	encode_write_bool(&cursor, &body, true)
-	encode_write_raw(&cursor, &body, "}")
+	encode_write_field(&cursor, body, &usage_first, "include_usage")
+	encode_write_bool(&cursor, body, true)
+	encode_write_raw(&cursor, body, "}")
 	if len(request.Tools) > 0 {
-		encode_write_field(&cursor, &body, &first, "tools")
-		encode_write_raw(&cursor, &body, "[")
+		encode_write_field(&cursor, body, &first, "tools")
+		encode_write_raw(&cursor, body, "[")
 		for tool, index in request.Tools {
-			if index > 0 { encode_write_byte(&cursor, &body, ',') }
+			if index > 0 { encode_write_byte(&cursor, body, ',') }
 			tool_first := true
-			encode_write_raw(&cursor, &body, "{")
-			encode_write_field(&cursor, &body, &tool_first, "function")
-			encode_write_raw(&cursor, &body, "{")
+			encode_write_raw(&cursor, body, "{")
+			encode_write_field(&cursor, body, &tool_first, "function")
+			encode_write_raw(&cursor, body, "{")
 			function_first := true
-			encode_write_field(&cursor, &body, &function_first, "description")
-			encode_write_text(&cursor, &body, tool.Description)
-			encode_write_field(&cursor, &body, &function_first, "name")
-			encode_write_text(&cursor, &body, tool.Name)
+			encode_write_field(&cursor, body, &function_first, "description")
+			encode_write_text(&cursor, body, tool.Description)
+			encode_write_field(&cursor, body, &function_first, "name")
+			encode_write_text(&cursor, body, tool.Name)
 			// A tool's parameters are the one part of a request that is JSON inside JSON:
 			// the schema text is read once and the bytes are kept with the request's other
 			// texts.
-			if !openai_tool_parameters_write(&cursor, &body, &function_first, tool.Parameters_JSON) {
+			if !openai_tool_parameters_write(&cursor, body, &function_first, tool.Parameters_JSON) {
 				encode_finish(&cursor)
 				if cursor.error != .None { return "", cursor.error }
 				return "", .Invalid_Tools
 			}
-			encode_write_raw(&cursor, &body, "}")
-			encode_write_field(&cursor, &body, &tool_first, "type")
-			encode_write_literal_string(&cursor, &body, "function")
-			encode_write_raw(&cursor, &body, "}")
+			encode_write_raw(&cursor, body, "}")
+			encode_write_field(&cursor, body, &tool_first, "type")
+			encode_write_literal_string(&cursor, body, "function")
+			encode_write_raw(&cursor, body, "}")
 		}
-		encode_write_raw(&cursor, &body, "]")
+		encode_write_raw(&cursor, body, "]")
 	}
-	encode_write_raw(&cursor, &body, "}")
+	encode_write_raw(&cursor, body, "}")
 	encode_finish(&cursor)
 	if cursor.error != .None { return "", cursor.error }
-	encode_body_store(&cursor, &body)
-	result, clone_error := strings.clone(strings.to_string(body), allocator)
-	if clone_error != nil { return "", .Allocation }
+	result, take_error := encode_body_take(&cursor)
+	if take_error != .None { return "", take_error }
 	return result, .None
 }
 

@@ -90,7 +90,7 @@ chat_request_transport :: proc(
 	if websocket_request && chat.provider_websocket == nil {
 		chat.provider_websocket, encode_err = ai.Provider_WebSocket_Session_Open(connection, chat.allocator)
 		if encode_err.kind != .None {
-			delete(encoded.Body, chat.allocator)
+			if !encoded.Body_Borrowed { delete(encoded.Body, chat.allocator) }
 			chat_session_fail_turn(chat, encode_err.detail)
 			ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
 			return {}, false, false
@@ -100,7 +100,7 @@ chat_request_transport :: proc(
 		connect_err := ai.Provider_WebSocket_Connect(chat.provider_websocket, encoded, options)
 		if connect_err.kind != .None {
 			if !chat_websocket_fallback_safe(connect_err) {
-				delete(encoded.Body, chat.allocator)
+				if !encoded.Body_Borrowed { delete(encoded.Body, chat.allocator) }
 				chat_session_fail_turn(chat, connect_err.detail)
 				ai.Provider_Operation_Error_Destroy(&connect_err, chat.allocator)
 				return {}, false, false
@@ -110,7 +110,7 @@ chat_request_transport :: proc(
 			chat.provider_websocket = nil
 			chat.websocket_fallback_http = true
 			websocket_request = false
-			delete(encoded.Body, chat.allocator)
+			if !encoded.Body_Borrowed { delete(encoded.Body, chat.allocator) }
 			encoded, encode_err = ai.Provider_Request_Freeze_Reusing(prep.request, &chat.encode_cache, chat.allocator)
 			if encode_err.kind != .None {
 				chat_session_fail_turn(chat, encode_err.detail)

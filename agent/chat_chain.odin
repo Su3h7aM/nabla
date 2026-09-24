@@ -91,7 +91,7 @@ chat_chain_release :: proc(chat: ^Chat_Session) {
 	chat_session_retire_operation(chat)
 	chat_request_prep_destroy(&chat.chain.prep, chat.allocator)
 	ai.Provider_Operation_Error_Destroy(&chat.chain.operation_error, chat.mailbox.allocator)
-	delete(chat.chain.encoded.Body, chat.allocator)
+	if !chat.chain.encoded.Body_Borrowed { delete(chat.chain.encoded.Body, chat.allocator) }
 	chat.chain = {}
 	// Nothing can publish after the join, so what the mailbox still holds is the owner's to
 	// release. A released chain leaves the mailbox empty for the next request.
@@ -286,7 +286,7 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	// encoding that has to be assumed equal.
 	encoded, websocket_request, transport_ok := chat_request_transport(chat, connection, &prep, options)
 	if !transport_ok { return }
-	body_owned := true
+	body_owned := !encoded.Body_Borrowed
 	defer {
 		if body_owned { delete(encoded.Body, chat.allocator) }
 	}

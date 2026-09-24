@@ -19,6 +19,11 @@ import "core:strings"
 // is therefore byte for byte the body encoded without one: the cache decides how much
 // work repeats, never what is sent.
 //
+// What repeats is also written in place. The cache holds the body buffer, and each request
+// it encodes is written into that one buffer rather than into a new one: a session allocates
+// a request body once, where a buffer per request would leave the allocator holding a size
+// for every turn the conversation grew through.
+//
 // A zero cache holds nothing and needs no initialization. One cache is walked by one
 // encode at a time, so a caller that encodes on a second thread passes a cache of its own
 // or none at all.
@@ -28,24 +33,13 @@ Provider_Encode_Cache :: struct {
 	// never mixes two allocators and cannot free what another allocated.
 	allocator:  mem.Allocator,
 	slots:      [dynamic]Encode_Slot,
-	// body_bytes is how large the last body this cache encoded was. The next body carries
-	// nearly the same bytes, so this is what it is given room for to start with. It is a
-	// size to guess with, never a fact the encoding depends on: a body that outgrows it is
-	// written all the same.
-	body_bytes: int,
+	// body is the buffer every request this cache encodes is written into, and the bytes the
+	// last one was sent as. A conversation carries most of the request before it again, so on
+	// the first encode of a session the buffer reaches the size of a whole request and is
+	// written over after that: a session allocates one request body, where a body per request
+	// would leave the allocator holding a size for every turn the conversation grew through.
+	body:       strings.Builder,
 }
-
-// How much larger than the body before it a body is expected to be. Between two requests a
-// conversation grows by one turn: the messages and records the turn added, which are small
-// next to the history that already sits in the cache. A body that outgrows the room it was
-// given pays one grow, and doubling carries it past the rest of the turn.
-@(private = "package")
-ENCODE_BODY_GROWTH_DIVISOR :: 8
-
-// The floor under that growth, for the first body after a small one and for a cache whose
-// body_bytes is still zero.
-@(private = "package")
-ENCODE_BODY_GROWTH_FLOOR :: 4096
 
 // Encode_Slot is one text and the bytes it was written as.
 @(private = "package")
@@ -88,6 +82,10 @@ Encode_Cursor :: struct {
 	cache: ^Provider_Encode_Cache,
 	next:  int,
 	error: Provider_Request_Error,
+	// body is the buffer this request is written into, and temporary is what holds it when
+	// there is no cache to keep one between requests.
+	body:      ^strings.Builder,
+	temporary: strings.Builder,
 }
 
 @(private = "package")
@@ -173,28 +171,52 @@ encode_finish :: proc(cursor: ^Encode_Cursor) {
 	if resize(slots, cursor.next) != nil { encode_fail(cursor, .Allocation) }
 }
 
-// encode_body_make starts one request body. Most of a body is bytes this cache already
-// holds, so the size of the body before it is a close guess at this one's: starting there
-// is one allocation instead of the sequence a builder takes to double its way up.
+// encode_body_begin starts one request body and returns the buffer to write it into. With a
+// cache the buffer is the cache's, and it holds the request before this one: the bytes that
+// request was sent as stop being valid here. Without a cache the cursor holds a temporary
+// buffer for this encode alone, which encode_body_take hands to the caller.
 @(private = "package")
-encode_body_make :: proc(cursor: ^Encode_Cursor, allocator: mem.Allocator) -> (strings.Builder, Provider_Request_Error) {
-	hint := cursor.cache == nil ? 0 : cursor.cache.body_bytes
-	if hint <= 0 {
-		body, build_error := strings.builder_make(allocator)
-		if build_error != nil { return body, .Allocation }
+encode_body_begin :: proc(cursor: ^Encode_Cursor, allocator: mem.Allocator) -> (^strings.Builder, Provider_Request_Error) {
+	if cursor.cache != nil {
+		body := &cursor.cache.body
+		if body.buf.allocator.procedure == nil {
+			if _, init_error := strings.builder_init(body, cursor.cache.allocator); init_error != nil {
+				return nil, .Allocation
+			}
+		}
+		strings.builder_reset(body)
+		cursor.body = body
 		return body, .None
 	}
-	body, build_error := strings.builder_make_len_cap(0, hint + hint / ENCODE_BODY_GROWTH_DIVISOR + ENCODE_BODY_GROWTH_FLOOR, allocator)
-	if build_error != nil { return body, .Allocation }
-	return body, .None
+	if _, init_error := strings.builder_init(&cursor.temporary, allocator); init_error != nil {
+		return nil, .Allocation
+	}
+	cursor.body = &cursor.temporary
+	return &cursor.temporary, .None
 }
 
-// encode_body_store records how large the body just written was. The next body starts from
-// it, so what a growing conversation costs is the new turn's bytes rather than all of it.
+// encode_body_take ends the body this cursor wrote and returns the bytes to send. With a
+// cache they are the cache's own buffer: they stay valid until that cache encodes another
+// request, and the caller must not free them. Without one the cursor's temporary buffer is
+// handed over, so the caller owns the bytes and releases them with
+// delete(transmute([]byte)text, allocator).
 @(private = "package")
-encode_body_store :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder) {
-	if cursor.cache == nil { return }
-	cursor.cache.body_bytes = len(body.buf)
+encode_body_take :: proc(cursor: ^Encode_Cursor) -> (string, Provider_Request_Error) {
+	body := cursor.body
+	if body == nil { return "", .None }
+	text := strings.to_string(body^)
+	// The buffer moves to the caller, so the cursor no longer holds anything to release.
+	if body == &cursor.temporary { cursor.temporary = {} }
+	cursor.body = nil
+	return text, .None
+}
+
+// encode_body_end releases what encode_body_begin started. A cache's buffer is kept for the
+// next request; a temporary one was either handed over by encode_body_take or is freed here.
+@(private = "package")
+encode_body_end :: proc(cursor: ^Encode_Cursor) {
+	if cursor.body == &cursor.temporary { strings.builder_destroy(&cursor.temporary) }
+	cursor.body = nil
 }
 
 @(private = "package")
@@ -210,6 +232,7 @@ Provider_Encode_Cache_Destroy :: proc(cache: ^Provider_Encode_Cache) {
 	if cache == nil { return }
 	for &slot in cache.slots { encode_slot_destroy(&slot, cache.allocator) }
 	delete(cache.slots)
+	strings.builder_destroy(&cache.body)
 	cache^ = {}
 }
 

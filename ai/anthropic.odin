@@ -47,70 +47,69 @@ anthropic_encode_request :: proc(
 	}
 
 	cursor := encode_cursor(cache, allocator)
-	body, body_error := encode_body_make(&cursor, allocator)
+	body, body_error := encode_body_begin(&cursor, allocator)
 	if body_error != .None { return "", body_error }
-	defer strings.builder_destroy(&body)
+	defer encode_body_end(&cursor)
 
 	// Fields are written in the order the standard library's writer sorts them in, so a
 	// body is the bytes a parsed request would be written as, and the same conversation
 	// writes the same bytes in any process.
 	first := true
-	encode_write_raw(&cursor, &body, "{")
+	encode_write_raw(&cursor, body, "{")
 	if request.Cache_Request_Present && request.Cache_Request {
 		// Top-level cache control marks the last cacheable block and advances as
 		// the conversation grows, so an append-only history reuses its whole
 		// prefix without the harness naming a breakpoint.
-		encode_write_field(&cursor, &body, &first, "cache_control")
-		encode_write_raw(&cursor, &body, "{\"type\":")
-		encode_write_literal_string(&cursor, &body, "ephemeral")
-		encode_write_raw(&cursor, &body, "}")
+		encode_write_field(&cursor, body, &first, "cache_control")
+		encode_write_raw(&cursor, body, "{\"type\":")
+		encode_write_literal_string(&cursor, body, "ephemeral")
+		encode_write_raw(&cursor, body, "}")
 	}
-	encode_write_field(&cursor, &body, &first, "max_tokens")
-	encode_write_int(&cursor, &body, request.Max_Output_Tokens)
-	encode_write_field(&cursor, &body, &first, "messages")
-	encode_write_raw(&cursor, &body, "[")
-	if messages_err := anthropic_write_messages(&cursor, &body, request.Messages, allocator); messages_err != .None {
+	encode_write_field(&cursor, body, &first, "max_tokens")
+	encode_write_int(&cursor, body, request.Max_Output_Tokens)
+	encode_write_field(&cursor, body, &first, "messages")
+	encode_write_raw(&cursor, body, "[")
+	if messages_err := anthropic_write_messages(&cursor, body, request.Messages, allocator); messages_err != .None {
 		encode_finish(&cursor)
 		if cursor.error != .None { return "", cursor.error }
 		return "", messages_err
 	}
-	encode_write_raw(&cursor, &body, "]")
-	encode_write_field(&cursor, &body, &first, "model")
-	encode_write_text(&cursor, &body, request.Model)
+	encode_write_raw(&cursor, body, "]")
+	encode_write_field(&cursor, body, &first, "model")
+	encode_write_text(&cursor, body, request.Model)
 	if request.Reasoning_Effort_Present {
 		// The effort name is opaque and travels verbatim. Anthropic states it as a
 		// level under output_config, which is the same shape the harness stores.
-		encode_write_field(&cursor, &body, &first, "output_config")
-		encode_write_raw(&cursor, &body, "{\"effort\":")
-		encode_write_text(&cursor, &body, request.Reasoning_Effort)
-		encode_write_raw(&cursor, &body, "}")
+		encode_write_field(&cursor, body, &first, "output_config")
+		encode_write_raw(&cursor, body, "{\"effort\":")
+		encode_write_text(&cursor, body, request.Reasoning_Effort)
+		encode_write_raw(&cursor, body, "}")
 	}
-	encode_write_field(&cursor, &body, &first, "stream")
-	encode_write_bool(&cursor, &body, true)
+	encode_write_field(&cursor, body, &first, "stream")
+	encode_write_bool(&cursor, body, true)
 	if request.Instructions_Present {
-		encode_write_field(&cursor, &body, &first, "system")
-		encode_write_text(&cursor, &body, request.Instructions)
+		encode_write_field(&cursor, body, &first, "system")
+		encode_write_text(&cursor, body, request.Instructions)
 	}
 	if len(request.Tools) > 0 {
-		encode_write_field(&cursor, &body, &first, "tools")
-		encode_write_raw(&cursor, &body, "[")
+		encode_write_field(&cursor, body, &first, "tools")
+		encode_write_raw(&cursor, body, "[")
 		tool_first := true
 		for tool in request.Tools {
-			encode_write_item(&cursor, &body, &tool_first)
-			if !anthropic_write_tool_def(&cursor, &body, tool, allocator) {
+			encode_write_item(&cursor, body, &tool_first)
+			if !anthropic_write_tool_def(&cursor, body, tool, allocator) {
 				encode_finish(&cursor)
 				if cursor.error != .None { return "", cursor.error }
 				return "", .Invalid_Tools
 			}
 		}
-		encode_write_raw(&cursor, &body, "]")
+		encode_write_raw(&cursor, body, "]")
 	}
-	encode_write_raw(&cursor, &body, "}")
+	encode_write_raw(&cursor, body, "}")
 	encode_finish(&cursor)
 	if cursor.error != .None { return "", cursor.error }
-	encode_body_store(&cursor, &body)
-	result, clone_error := strings.clone(strings.to_string(body), allocator)
-	if clone_error != nil { return "", .Allocation }
+	result, take_error := encode_body_take(&cursor)
+	if take_error != .None { return "", take_error }
 	return result, .None
 }
 
