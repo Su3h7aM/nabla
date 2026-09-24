@@ -243,8 +243,7 @@ chat_commit_response_entries :: proc(chat: ^Chat_Session, request_no: session.Re
 	for i in 0 ..< len(chat.pending_calls) { chat.pending_calls[i].seq = seqs[offset + i] }
 	delete(seqs, chat.allocator)
 
-	chat_response_output_destroy(&chat.pending_response, chat.allocator)
-	chat.pending_response_present = false
+	chat_pending_response_clear(chat)
 	chat_partial_assistant_clear(chat)
 	return true
 }
@@ -404,8 +403,7 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	// A turn that ended without running its staged calls, such as one a durable
 	// write stopped, releases them here.
 	chat_pending_calls_clear(chat)
-	chat_response_output_destroy(&chat.pending_response, chat.allocator)
-	chat.pending_response_present = false
+	chat_pending_response_clear(chat)
 	return recorded
 }
 

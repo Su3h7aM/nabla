@@ -36,6 +36,14 @@ chat_response_output_destroy :: proc(output: ^Chat_Response_Output, allocator: m
 	output^ = {}
 }
 
+// chat_pending_response_clear drops the response output staged for the response being
+// assembled, and with it the fact that one is staged. Every move of a staged response
+// into the store ends this way.
+chat_pending_response_clear :: proc(chat: ^Chat_Session) {
+	chat_response_output_destroy(&chat.pending_response, chat.allocator)
+	chat.pending_response_present = false
+}
+
 // Chat_State is the control state of the session. Durable state lives in the
 // store: these are transitions in flight, not conversation.
 Chat_State :: enum {
@@ -320,7 +328,7 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	chat.client_instructions = ""
 	delete(string(chat.id), chat.allocator)
 	delete(chat.partial_assistant)
-	if chat.pending_response_present { chat_response_output_destroy(&chat.pending_response, chat.allocator) }
+	chat_pending_response_clear(chat)
 	for &call in chat.pending_calls { chat_tool_call_destroy(&call, chat.allocator) }
 	delete(chat.pending_calls)
 	delete(chat.last_error, chat.allocator)
@@ -493,10 +501,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	}
 	chat_pending_calls_clear(chat)
 	chat.pending_notice = .None
-	if chat.pending_response_present {
-		chat_response_output_destroy(&chat.pending_response, chat.allocator)
-		chat.pending_response_present = false
-	}
+	chat_pending_response_clear(chat)
 	delete(chat.last_error, chat.allocator)
 	chat.last_error = ""
 	chat_partial_assistant_clear(chat)
