@@ -305,9 +305,6 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 								if fragment.Name == "" { fragment.Name = strings.clone(name, state.Allocator) }
 							} else if !ok { return provider_stream_fail(state, .Invalid_Data, "tool call name is invalid") }
 							if args, present, ok := openai_value_string(function, "arguments"); ok && present && args != "" {
-								if len(fragment.Arguments) + len(args) > PROVIDER_MAX_TOOL_ARGS_BYTES {
-									return provider_stream_fail(state, .Invalid_Data, "tool arguments exceed limit", .Tool_Limit)
-								}
 								append(&fragment.Arguments, args)
 							} else if !ok { return provider_stream_fail(state, .Invalid_Data, "tool arguments are invalid") }
 						}

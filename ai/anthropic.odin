@@ -618,9 +618,6 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 					clear(&fragment.Arguments)
 					fragment.Arguments_Started = true
 				}
-				if len(fragment.Arguments) + len(partial) > PROVIDER_MAX_TOOL_ARGS_BYTES {
-					return provider_stream_fail(state, .Invalid_Data, "tool arguments exceed limit", .Tool_Limit)
-				}
 				append(&fragment.Arguments, partial)
 			}
 		case "thinking_delta", "signature_delta", "citations_delta":

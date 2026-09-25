@@ -159,7 +159,7 @@ chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 		}
 		chat_worker_push(worker, completion)
 	case ai.Provider_Error_Event:
-		chat_worker_push(worker, Chat_Failure_Event{source = runtime.source, message = strings.clone(value.Message, worker.allocator)})
+		chat_worker_push(worker, Chat_Failure_Event{source = runtime.source, kind = value.Kind, message = strings.clone(value.Message, worker.allocator)})
 	case ai.Provider_Usage_Event:
 		// Usage is a measurement, not text: it is copied whole and needs no ownership.
 		chat_worker_push(worker, Chat_Usage_Event{usage = value})

@@ -585,7 +585,6 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 		if args, present, ok := openai_value_string(item, "arguments"); ok && present && args != "" {
 			// The done item repeats the full arguments already streamed
 			// as deltas; replace so a replayed payload is not doubled.
-			if len(args) > PROVIDER_MAX_TOOL_ARGS_BYTES { return provider_stream_fail(state, .Invalid_Data, "tool arguments exceed limit", .Tool_Limit) }
 			clear(&fragment.Arguments)
 			append(&fragment.Arguments, args)
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call arguments are invalid") }
@@ -762,9 +761,6 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		delta, delta_present, delta_ok := openai_value_string(object, "delta")
 		if !delta_ok { return provider_stream_fail(state, .Invalid_Data, "arguments delta is not text") }
 		if delta_present && delta != "" {
-			if len(fragment.Arguments) + len(delta) > PROVIDER_MAX_TOOL_ARGS_BYTES {
-				return provider_stream_fail(state, .Invalid_Data, "tool arguments exceed limit", .Tool_Limit)
-			}
 			append(&fragment.Arguments, delta)
 		}
 		fragment.Present = true
@@ -780,7 +776,6 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		if args, present, ok := openai_value_string(object, "arguments"); ok && present && args != "" {
 			// The done event repeats full arguments; replace the
 			// accumulated bytes so a replayed prefix is not doubled.
-			if len(args) > PROVIDER_MAX_TOOL_ARGS_BYTES { return provider_stream_fail(state, .Invalid_Data, "tool arguments exceed limit", .Tool_Limit) }
 			clear(&fragment.Arguments)
 			append(&fragment.Arguments, args)
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call arguments are invalid") }

@@ -662,10 +662,13 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	// have followed never happened.
 	reason := chain.decision.reason
 	if chat_session_cancelled(chat) { reason = .Cancelled }
+	// A response answered with a notice is feedback for the model, not the end of the turn:
+	// the turn goes on to another request whatever this chain decided about its own send.
+	turn_continues := chat.pending_notice != .None && !chat_session_cancelled(chat)
 	// A chain that stopped says why, which is the one thing the finished request row cannot
 	// say: the row reports the outcome of its own send, not the reason the harness stopped.
 	if reason != .Completed {
-		chat.turn_recovery = reason
+		if !turn_continues { chat.turn_recovery = reason }
 		level := log.Level.Warning
 		if reason == .Cancelled { level = .Info }
 		stopped := [4]Log_Field {
@@ -691,7 +694,7 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	// also reported.
 	if chat_session_cancelled(chat) {
 		chat_session_note_cancel(chat)
-	} else if chain.operation_error.kind != .None && chat.state != .Finalizing {
+	} else if chain.operation_error.kind != .None && chat.state != .Finalizing && !turn_continues {
 		chat_session_feed_error(chat, chain.source, chain.operation_error.detail)
 	}
 	chat_session_retire_operation(chat)

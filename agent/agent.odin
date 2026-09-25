@@ -400,6 +400,8 @@ Chat_Notice :: enum {
 	Truncated,
 	Missing_Call_Identity,
 	Duplicate_Call_ID,
+	Unreadable_Response,
+	Incomplete_Response,
 }
 
 // chat_notice_text is the harness's own explanation of an unusable response. The
@@ -414,6 +416,10 @@ chat_notice_text :: proc(notice: Chat_Notice) -> string {
 		return "a proposed tool call carried no id or no tool name, so none of the calls ran; every call needs the provider's id and the tool's name"
 	case .Duplicate_Call_ID:
 		return "two proposed tool calls shared one id, so none of them ran; every call needs its own id"
+	case .Unreadable_Response:
+		return "the previous response arrived in a form that could not be decoded, so none of it was executed; continue the work by sending it again"
+	case .Incomplete_Response:
+		return "the provider ended the previous response before it was complete, so none of it was executed; continue the work by sending it again"
 	case .None, .Ignored:
 		return ""
 	}
@@ -533,6 +539,7 @@ Chat_Provider_Completion :: struct {
 // reported for the running attempt. message is owned.
 Chat_Failure_Event :: struct {
 	source:  Chat_Event_Source,
+	kind:    ai.Provider_Error_Kind,
 	message: string,
 }
 
@@ -592,6 +599,10 @@ chat_session_apply :: proc(chat: ^Chat_Session, event: ^Chat_Event) -> Chat_Appl
 		// that is already stopping.
 		if chat_session_cancelled(chat) {
 			chat_session_note_cancel(chat)
+		} else if value.kind == .Invalid_Data {
+			// The response itself could not be decoded. The model can still be reached, so
+			// it is told and the turn goes on instead of ending on a failure it cannot see.
+			chat_session_note_notice(chat, value.source, .Unreadable_Response)
 		} else {
 			chat_session_feed_error(chat, value.source, value.message)
 		}
@@ -619,10 +630,8 @@ chat_session_apply :: proc(chat: ^Chat_Session, event: ^Chat_Event) -> Chat_Appl
 			chat_session_feed_completion(chat, value.source)
 		} else if value.reason == .Length {
 			chat_session_note_notice(chat, value.source, .Truncated)
-		} else if value.reason_text != "" {
-			chat_session_feed_error(chat, value.source, fmt.tprintf("response incomplete: %s", value.reason_text))
 		} else {
-			chat_session_feed_error(chat, value.source, "response incomplete")
+			chat_session_note_notice(chat, value.source, .Incomplete_Response)
 		}
 		return {completion_accepted = true}
 	}

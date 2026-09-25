@@ -729,6 +729,79 @@ test_unusable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T) {
 	testing.expect_value(t, next.kind, Chat_Effect_Kind.Start_Request)
 }
 
+// A response the stream could not decode does not end the turn either. The failure
+// becomes the same kind of harness feedback as an unusable response, and the chain
+// commit that follows the failed attempt must not turn it back into a failure.
+@(test)
+test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(t, chat, "work that gets an unreadable response")
+
+	_test_begin_request(t, chat)
+	request_no, begin_err := session.request_begin(
+		chat.store,
+		chat.id,
+		{
+			turn_no = chat.turn_no,
+			purpose = .Response,
+			provider = "p",
+			model_requested = "m",
+			api = "openai_chat_completions",
+			config_json = "{}",
+			input_json = "{}",
+		},
+		session.now_ms(),
+	)
+	if !testing.expect_value(t, begin_err, nil) { return }
+
+	// The stream could not be decoded. The model can still be reached, so the turn
+	// must not fail: the failure becomes feedback and the turn prepares again.
+	source := chat_session_event_source(chat)
+	message := strings.clone("malformed provider stream event", chat.mailbox.allocator)
+	event: Chat_Event = Chat_Failure_Event{source = source, kind = .Invalid_Data, message = message}
+	chat_session_apply(chat, &event)
+	chat_event_destroy(&event, chat.mailbox.allocator)
+	testing.expect(t, !chat.active_failed, "an unreadable response must not fail the turn")
+	testing.expect_value(t, chat.pending_notice, Chat_Notice.Unreadable_Response)
+	testing.expect_value(t, chat.state, Chat_State.Preparing)
+
+	// The chain ends the way a real attempt does: the operation failed, and the retry
+	// policy stopped the chain. Its commit must keep the turn going.
+	chat.chain.active = true
+	chat.chain.stage = .Committing
+	chat.chain.attempts = 1
+	chat.chain.request_no = request_no
+	chat.chain.source = source
+	chat.chain.operation_error = {
+		kind          = .Stream,
+		failure_class = .Invalid_Output,
+		detail        = strings.clone("malformed provider stream event", chat.mailbox.allocator),
+	}
+	chat.chain.decision = {action = .Stop, reason = .Terminal_Failure}
+	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
+	defer delete(usages)
+	chat_chain_commit(chat, &usages)
+	testing.expect(t, !chat.active_failed, "the chain commit must not turn feedback into a failure")
+
+	entries := _test_entries(t, chat)
+	defer session.entries_destroy(entries, context.allocator)
+	// The prompt and the harness explanation; no call and no result were recorded.
+	if !testing.expect_value(t, len(entries), 2) { return }
+	notice, is_notice := entries[1].payload.(session.User_Entry)
+	if !testing.expect(t, is_notice, "the harness explanation is conversation") { return }
+	testing.expect_value(t, notice.origin, session.User_Origin.Harness)
+	testing.expect(t, strings.contains(notice.text, "sending it again"), "the explanation names the correction")
+	testing.expect_value(t, chat.state, Chat_State.Preparing)
+
+	// The next step is another request, not a stop.
+	next := chat_session_advance(chat)
+	testing.expect_value(t, next.kind, Chat_Effect_Kind.Start_Request)
+}
+
 // --- result envelope guarantees -------------------------------------------------
 
 // tool_loop_rogue_execute violates the result contract: it reports success with

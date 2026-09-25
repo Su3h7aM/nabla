@@ -373,8 +373,6 @@ Provider_Tool_Fragment :: struct {
 	Arguments_Started:  bool,
 }
 
-PROVIDER_MAX_TOOL_ARGS_BYTES :: 64 * 1024
-
 Provider_Stream_Start :: proc(api: API_Kind, allocator := context.allocator) -> Provider_Stream_State {
 	return {API = api, Phase = .Open, Allocator = allocator}
 }
@@ -466,7 +464,6 @@ provider_tool_finalize :: proc(state: ^Provider_Stream_State, allocator := conte
 		if !fragment.Present { continue }
 		count += 1
 		if fragment.ID == "" || fragment.Name == "" { return nil, false }
-		if len(fragment.Arguments) > PROVIDER_MAX_TOOL_ARGS_BYTES { return nil, false }
 		for &other in state.Tool_Fragments {
 			if &other == &fragment || !other.Present { continue }
 			if other.ID != "" && other.ID == fragment.ID { return nil, false }
