@@ -28,8 +28,8 @@
 //
 // For workloads 3 and 4 the harness also prints `sim_passes` — the number of
 // saturation passes a faithful simulation of `_grow_children` (equal weights,
-// same maxes) predicts, cross-checked against the real loop in an instrumented
-// scratch copy (see docs/C6B_BENCHMARK_BASELINE.md).
+// same maxes) predicts; it was cross-checked against the real loop in a
+// temporary instrumented copy.
 //
 // Results are printed as a table by the `bench_c6b_baseline` test.
 

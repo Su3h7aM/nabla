@@ -16,13 +16,7 @@ The harness is one consumer of the layers beneath it, not their owner.
 
 ## Architecture documents
 
-Before changing harness boundaries or adding a subsystem, read
-`docs/AI_HARNESS_ARCHITECTURE.md`. It is the entry point: principles, required
-invariants, package boundaries, and pointers to the contract that owns each subject
-(execution, tools, Code Mode, errors, context, instructions, customization, subagents,
-network, diagnostics). `docs/ARCHITECTURE_STATUS.md` separates what exists from what the
-target requires, so current prototype behavior is never mistaken for a rule. Keep each
-subject in its one owning document and link instead of copying.
+Before changing harness boundaries, adding a subsystem, adding a limit, or handling a failure, read `docs/ARCHITECTURE.md`. It is the only architecture document: invariants, limits and failure feedback, Odin rules, package boundaries, and one section per subject (runtime, jobs, journal, recovery, session tree, requests, catalog, configuration, tools, Lua, Tasks, material, hooks, subagents, frontends, compaction, diagnostics). Its replacement table names the current mechanisms the target removes, so current prototype behavior is never mistaken for a rule. Change a rule in the section where it is written instead of copying it into another document.
 
 ## Philosophy
 
@@ -109,7 +103,8 @@ express: running a build, a test, or a script, or a genuine pipeline.
 
 Verification is part of the work, not a step after it: run `mise run check` and whichever tests
 cover what you touched, and leave them green before committing. `mise run test` is the full
-gate: every in-package suite in release and `-debug`, then the external harnesses.
+gate: every in-package suite in release and `-debug`, then the external harnesses. A change to a
+document or a comment runs nothing, because it compiles nothing and asserts nothing.
 
 Linux is the only target. Do not write Windows or macOS branches for platforms this project
 does not build.
@@ -179,7 +174,8 @@ Document the contract a declaration cannot express on its own, such as ownership
 preconditions, and error behavior, and delete a comment that restates the code or compensates
 for a poor name. Comment only on non-obvious intent or constraints. Mark a deliberate shortcut
 with a `ponytail` comment that names the limit and the upgrade path. Keep long rationale in
-`docs/`, not inline, so the reasoning has one home that can be kept current.
+`docs/`, not inline, so the reasoning has one home that can be kept current. A comment never
+points at a document, a task, or a discussion: the source reads on its own.
 
 ## Writing style
 

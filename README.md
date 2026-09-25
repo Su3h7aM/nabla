@@ -11,8 +11,7 @@ for the philosophy and the package boundaries.
 
 ## Status
 
-Under construction. The two source repositories are being moved in; see the current
-milestone tracker in `docs/` once it lands.
+Under construction. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the target harness.
 
 ## Tasks
 
