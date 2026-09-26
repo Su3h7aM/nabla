@@ -145,15 +145,7 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> T
 		return tool_result_failure(ctx, .Tool_Failed, "the skill catalog is invalid", "unavailable")
 	}
 	root := ctx.skills.roots[skill.root_index]
-	control := skills.Read_Control {
-		deadline     = ctx.control.deadline.at,
-		has_deadline = ctx.control.deadline.active,
-		// Cancel_Check carries no context, so the check reads the process-wide
-		// turn token directly: one turn runs at a time, and the token is reset
-		// when a turn starts.
-		cancelled    = tool_skill_cancel_check,
-	}
-	loaded, load_error := skills.load(skill, root, control, ctx.allocator)
+	loaded, load_error := skills.load(skill, root, tool_skill_cancel_check, ctx.allocator)
 	defer skills.loaded_destroy(&loaded, ctx.allocator)
 	defer skills.load_error_destroy(&load_error, ctx.allocator)
 	if load_error.kind != .None {
@@ -268,8 +260,6 @@ tool_skill_outcome :: proc(kind: skills.Error_Kind) -> session.Tool_Outcome {
 	switch kind {
 	case .Cancelled:
 		return .Cancelled
-	case .Timed_Out:
-		return .Timed_Out
 	case .None,
 	     .Missing,
 	     .Unreadable,

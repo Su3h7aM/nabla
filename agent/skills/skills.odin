@@ -51,7 +51,6 @@ Error_Kind :: enum {
 	Outside_Authority,
 	Changed_During_Read,
 	Cancelled,
-	Timed_Out,
 	Allocation,
 }
 

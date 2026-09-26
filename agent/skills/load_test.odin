@@ -33,7 +33,7 @@ test_load_returns_complete_body_and_rejects_stale_metadata :: proc(t: ^testing.T
 		source = .Generic_User,
 		path   = root_path,
 	}
-	loaded, load_error := load(skill, root, {})
+	loaded, load_error := load(skill, root, nil)
 	defer loaded_destroy(&loaded)
 	defer load_error_destroy(&load_error)
 	testing.expect_value(t, load_error.kind, Error_Kind.None)
@@ -41,7 +41,7 @@ test_load_returns_complete_body_and_rejects_stale_metadata :: proc(t: ^testing.T
 
 	changed := "---\nname: pdf\ndescription: Changed\n---\nbody\n"
 	testing.expect(t, os.write_entire_file(primary_path, changed) == nil)
-	stale, stale_error := load(skill, root, {})
+	stale, stale_error := load(skill, root, nil)
 	defer loaded_destroy(&stale)
 	defer load_error_destroy(&stale_error)
 	testing.expect_value(t, stale_error.kind, Error_Kind.Stale_Metadata)
@@ -67,7 +67,7 @@ test_load_rejects_invalid_or_empty_body :: proc(t: ^testing.T) {
 		root_index      = 0,
 		metadata_digest = metadata.digest,
 	}
-	loaded, load_error := load(skill, Root{source = .Generic_User}, {})
+	loaded, load_error := load(skill, Root{source = .Generic_User}, nil)
 	defer loaded_destroy(&loaded)
 	defer load_error_destroy(&load_error)
 	testing.expect_value(t, load_error.kind, Error_Kind.Invalid_Text)

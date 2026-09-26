@@ -32,13 +32,13 @@ TOOL_MCP_STDERR_EXCERPT :: 1024
 // the advertised alias the user chose, and the returned strings borrow tool, so the
 // definition must be registered before tool is released: tool_registry_add clones
 // what it keeps.
-mcp_tool_definition :: proc(name: string, tool: mcp.Tool, backend: ^MCP_Tool_Backend, timeouts: Tool_Timeout_Policy) -> Tool_Definition {
+mcp_tool_definition :: proc(name: string, tool: mcp.Tool, backend: ^MCP_Tool_Backend, timeout: time.Duration) -> Tool_Definition {
 	return Tool_Definition {
 		name = name,
 		description = tool.description,
 		input_schema = tool.input_schema,
 		hints = mcp_tool_hints(tool.annotations),
-		timeouts = timeouts,
+		timeout = timeout,
 		execute = tool_mcp_execute,
 		backend = backend,
 	}
@@ -111,24 +111,16 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (result:
 	return tool_mcp_call_result(ctx, call)
 }
 
-// tool_mcp_options derives the call's bounds from the tool control and the
-// definition's own timeout policy, and attaches the wire log. The effective
-// bound is the earliest applicable one.
+// tool_mcp_options bounds the call by the definition's timeout, measured from now, and
+// attaches the wire log.
 @(private)
 tool_mcp_options :: proc(ctx: ^Tool_Context, wire: ^MCP_Log) -> mcp.Operation_Options {
 	options := mcp.Operation_Options {
 		control = {user_data = ctx.control.interrupt, interrupted = tool_mcp_interrupted},
 		observer = mcp_log_observer(wire),
 	}
-	// An adapted tool exposes no timeout argument, so there is nothing for the model
-	// to request and nothing to clamp: the default is the bound, with the maximum as
-	// a ceiling in case the configuration states them the wrong way round.
-	timeout := ctx.timeouts.default
-	if ctx.timeouts.maximum > 0 && (timeout <= 0 || ctx.timeouts.maximum < timeout) { timeout = ctx.timeouts.maximum }
-	deadline := ctx.control.deadline
-	if timeout > 0 { deadline = tool_mcp_deadline_earlier(deadline, ai.deadline_in(timeout)) }
-	if deadline.active {
-		options.control.deadline_at = deadline.at
+	if ctx.timeout > 0 {
+		options.control.deadline_at = time.tick_add(time.tick_now(), ctx.timeout)
 		options.control.has_deadline = true
 	}
 	return options
@@ -137,15 +129,6 @@ tool_mcp_options :: proc(ctx: ^Tool_Context, wire: ^MCP_Log) -> mcp.Operation_Op
 @(private)
 tool_mcp_interrupted :: proc(user_data: rawptr) -> bool {
 	return ai.interrupt_requested(cast(^ai.Interrupt)user_data)
-}
-
-@(private)
-tool_mcp_deadline_earlier :: proc(a, b: ai.Deadline) -> ai.Deadline {
-	if !a.active { return b }
-	if !b.active { return a }
-	a_remaining, _ := ai.deadline_remaining(a)
-	b_remaining, _ := ai.deadline_remaining(b)
-	return a if a_remaining <= b_remaining else b
 }
 
 // --- results -----------------------------------------------------------------

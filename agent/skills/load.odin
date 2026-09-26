@@ -5,20 +5,13 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
-import "core:time"
 import "core:unicode/utf8"
 
 Cancel_Check :: proc() -> bool
 
-Read_Control :: struct {
-	cancelled:    Cancel_Check,
-	deadline:     time.Tick,
-	has_deadline: bool,
-}
-
-load :: proc(skill: Skill, root: Root, control: Read_Control, allocator := context.allocator) -> (Loaded, Load_Error) {
-	if read_control_cancelled(control) { return {}, error_make(.Cancelled, allocator = allocator) }
-	if read_control_timed_out(control) { return {}, error_make(.Timed_Out, allocator = allocator) }
+// load reads a skill body and verifies it against its catalog metadata. cancelled may be nil.
+load :: proc(skill: Skill, root: Root, cancelled: Cancel_Check, allocator := context.allocator) -> (Loaded, Load_Error) {
+	if cancelled != nil && cancelled() { return {}, error_make(.Cancelled, allocator = allocator) }
 	if skill.root_index < 0 { return {}, error_make(.Outside_Authority, detail = "skill has no source root", allocator = allocator) }
 	if root.source == .Local && !path_within(skill.directory, root.authority) {
 		return {}, error_make(.Outside_Authority, detail = "skill directory is outside the workspace scope", allocator = allocator)
@@ -39,15 +32,13 @@ load :: proc(skill: Skill, root: Root, control: Read_Control, allocator := conte
 	defer os.file_info_delete(before, allocator)
 	if before.type != .Regular { return {}, error_make(.Not_Regular, detail = "SKILL.md is not a regular file", allocator = allocator) }
 	if before.size > SKILL_MAX_FILE_BYTES { return {}, error_make(.Too_Large, detail = "SKILL.md exceeds the byte limit", allocator = allocator) }
-	if read_control_cancelled(control) { return {}, error_make(.Cancelled, allocator = allocator) }
-	if read_control_timed_out(control) { return {}, error_make(.Timed_Out, allocator = allocator) }
+	if cancelled != nil && cancelled() { return {}, error_make(.Cancelled, allocator = allocator) }
 
 	data, read_error := os.read_entire_file(file, allocator)
 	if read_error != nil { return {}, error_make(.Unreadable, detail = os.error_string(read_error), allocator = allocator) }
 	defer delete(data, allocator)
 	if len(data) > SKILL_MAX_FILE_BYTES { return {}, error_make(.Too_Large, detail = "SKILL.md exceeds the byte limit", allocator = allocator) }
-	if read_control_cancelled(control) { return {}, error_make(.Cancelled, allocator = allocator) }
-	if read_control_timed_out(control) { return {}, error_make(.Timed_Out, allocator = allocator) }
+	if cancelled != nil && cancelled() { return {}, error_make(.Cancelled, allocator = allocator) }
 	after, after_error := os.fstat(file, allocator)
 	if after_error != nil { return {}, error_make(.Unreadable, detail = os.error_string(after_error), allocator = allocator) }
 	defer os.file_info_delete(after, allocator)
@@ -70,14 +61,6 @@ load :: proc(skill: Skill, root: Root, control: Read_Control, allocator := conte
 	if !skill_body_valid(body) { return {}, error_make(.Invalid_Text, detail = "skill body is empty or contains invalid text", allocator = allocator) }
 	owned := strings.clone(body, allocator)
 	return Loaded{body = owned, content_digest = content_digest(owned)}, {}
-}
-
-read_control_cancelled :: proc(control: Read_Control) -> bool {
-	return control.cancelled != nil && control.cancelled()
-}
-
-read_control_timed_out :: proc(control: Read_Control) -> bool {
-	return control.has_deadline && time.tick_since(control.deadline) >= 0
 }
 
 // path_within reports whether path is authority itself or a directory inside it. An empty

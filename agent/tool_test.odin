@@ -394,11 +394,7 @@ test_registry_rejects_invalid_definitions :: proc(t: ^testing.T) {
 				delete(definition.input_schema, context.allocator)
 				definition.input_schema = strings.clone(`{"a":1} trailing`, context.allocator)
 			}, .Invalid_Schema},
-		{proc(definition: ^Tool_Definition) { definition.timeouts.default = -time.Second }, .Invalid_Timeout},
-		{proc(definition: ^Tool_Definition) {
-				definition.timeouts.default = 2 * time.Second
-				definition.timeouts.maximum = time.Second
-			}, .Invalid_Timeout},
+		{proc(definition: ^Tool_Definition) { definition.timeout = -time.Second }, .Invalid_Timeout},
 		{proc(definition: ^Tool_Definition) { definition.execute = nil }, .Missing_Execute},
 	}
 	for c in cases {
@@ -613,37 +609,6 @@ test_read_reports_single_line_byte_truncation :: proc(t: ^testing.T) {
 
 // --- timeout policy ------------------------------------------------------------
 
-// The timeout layers compose with the earliest deadline winning: a requested
-// bound is clamped to the definition maximum, and a tool timeout never revives
-// an expired turn.
-@(test)
-test_timeout_helpers_compose_deadlines :: proc(t: ^testing.T) {
-	testing.expect_value(t, tool_timeout_clamp(5 * time.Second, 120 * time.Second), 5 * time.Second)
-	testing.expect_value(t, tool_timeout_clamp(time.Hour, 120 * time.Second), 120 * time.Second)
-	testing.expect_value(t, tool_timeout_clamp(time.Hour, 0), time.Hour)
-
-	parent := Tool_Control {
-		deadline = ai.deadline_in(time.Hour),
-	}
-	shorter := tool_control_with_timeout(parent, time.Second)
-	remaining, remaining_ok := ai.deadline_remaining(shorter.deadline)
-	testing.expect(t, remaining_ok)
-	testing.expect(t, remaining > 0 && remaining <= time.Second, "the shorter timeout applies")
-
-	longer := tool_control_with_timeout(parent, 2 * time.Hour)
-	parent_remaining, _ := ai.deadline_remaining(longer.deadline)
-	testing.expect(t, parent_remaining > 59 * time.Minute, "the longer timeout keeps the parent deadline")
-
-	unchanged := tool_control_with_timeout(parent, 0)
-	testing.expect(t, unchanged.deadline == parent.deadline, "no timeout keeps the parent control")
-
-	expired := Tool_Control {
-		deadline = ai.deadline_in(-time.Second),
-	}
-	revived := tool_control_with_maximum(expired, time.Hour)
-	testing.expect(t, ai.deadline_expired(revived.deadline), "a longer bound never revives an expired parent")
-}
-
 // Cancellation wins over the tool timeout when both are observed, and the two
 // stops are distinguishable: only the budget expiring reports Timed_Out.
 @(test)
@@ -658,24 +623,18 @@ test_control_stop_names_the_stop :: proc(t: ^testing.T) {
 	}
 	past := time.tick_add(time.tick_now(), -2 * time.Second)
 	testing.expect_value(t, tool_control_stop(cancelled, past, time.Second), Tool_Stop.Cancelled)
-
-	expired := Tool_Control {
-		deadline = ai.deadline_in(-time.Second),
-	}
-	testing.expect_value(t, tool_control_stop(expired, start, time.Hour), Tool_Stop.Cancelled)
 	testing.expect_value(t, tool_control_stop({}, past, time.Second), Tool_Stop.Timed_Out)
 }
 
-// A model-requested timeout above the definition maximum is refused, never
-// silently clamped: the model is told the constraint it must change.
+// A model-requested timeout is honored as given: the shell has no maximum.
 @(test)
-test_shell_refuses_timeout_above_maximum :: proc(t: ^testing.T) {
+test_shell_honors_a_long_timeout :: proc(t: ^testing.T) {
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 
 	result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"echo hi","timeout_ms":999999999}`)
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
 }
 
 // tool_test_cancelled_moment runs one file-tool execution with cancellation

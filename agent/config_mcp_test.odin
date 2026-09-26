@@ -32,7 +32,6 @@ test_mcp_config_reads_a_minimal_stdio_server :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(server.tools), 0)
 	testing.expect_value(t, server.discovery_timeout, MCP_DEFAULT_DISCOVERY_TIMEOUT)
 	testing.expect_value(t, server.call_timeout, MCP_DEFAULT_CALL_TIMEOUT)
-	testing.expect_value(t, server.maximum_call_timeout, MCP_DEFAULT_MAXIMUM_CALL_TIMEOUT)
 }
 
 @(test)
@@ -77,7 +76,6 @@ test_mcp_config_reads_optional_launch_and_tool_overrides :: proc(t: ^testing.T) 
 	testing.expect_value(t, matched, 2)
 	testing.expect_value(t, server.discovery_timeout, time.Second)
 	testing.expect_value(t, server.call_timeout, 2 * time.Second)
-	testing.expect_value(t, server.maximum_call_timeout, MCP_DEFAULT_MAXIMUM_CALL_TIMEOUT)
 }
 
 @(test)
@@ -115,7 +113,6 @@ test_mcp_config_refuses_what_it_cannot_run :: proc(t: ^testing.T) {
 		`return { mcp = { servers = { s = { executable = "/usr/bin/x", tools = {a = {enabled = false, name = "b"}} } } } }`,
 		`return { mcp = { servers = { s = { executable = "/usr/bin/x", environment = {[" A"] = "b"} } } } }`,
 		`return { mcp = { servers = { s = { executable = "/usr/bin/x", environment = {A = 1} } } } }`,
-		`return { mcp = { servers = { s = { executable = "/usr/bin/x", call_timeout_ms = 5000, maximum_call_timeout_ms = 1000 } } } }`,
 		`return { mcp = { servers = { s = { executable = "/usr/bin/x", call_timeout_ms = 0 } } } }`,
 	}
 	for body in cases {

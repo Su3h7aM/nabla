@@ -396,9 +396,9 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	job.placement = definition.placement
 	job.lane = definition.backend
 	job.execute = definition.execute
-	job.exec.timeouts = definition.timeouts
+	job.exec.timeout = definition.timeout
 	job.exec.backend = definition.backend
-	job.exec.control = tool_control_with_timeout({interrupt = &job.interrupt, parent = &chat_cancel}, definition.timeouts.default)
+	job.exec.control = {interrupt = &job.interrupt, parent = &chat_cancel}
 	// A worker must not reach the session's storage, and it does not have to: the
 	// tools that read a kept result or change the context are owner-placed.
 	if definition.placement == .Owner {

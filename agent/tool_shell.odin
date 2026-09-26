@@ -33,12 +33,8 @@ TOOL_SHELL_SCHEMA :: `{"type":"object","properties":{"command":{"type":"string",
 
 TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms"}
 
-// TOOL_SHELL_DEFAULT_TIMEOUT and TOOL_SHELL_MAX_TIMEOUT are the tool's own
-// policy, stated as durations. The definition below is the source of truth:
-// argument parsing derives its millisecond bounds from it, so the JSON boundary
-// is the only place milliseconds appear.
-TOOL_SHELL_DEFAULT_TIMEOUT :: 30 * time.Second
-TOOL_SHELL_MAX_TIMEOUT :: 120 * time.Second
+// TOOL_SHELL_DEFAULT_TIMEOUT applies when the model gives no timeout. There is no maximum.
+TOOL_SHELL_DEFAULT_TIMEOUT :: 120 * time.Second
 
 // TOOL_SHELL_NOT_STARTED is the one thing a spawn that exhausted its shells can
 // say. A pipe that could not be created, a fork that failed, and an exec of the
@@ -76,7 +72,7 @@ tool_shell_definition :: proc(shell: string, allocator := context.allocator) -> 
 		// The command determines the behavior, so unknown is the only honest
 		// static answer for everything but the open world it can reach.
 		hints = {read_only = .Unknown, destructive = .Unknown, idempotent = .Unknown, open_world = .Yes},
-		timeouts = {default = TOOL_SHELL_DEFAULT_TIMEOUT, maximum = TOOL_SHELL_MAX_TIMEOUT},
+		timeout = TOOL_SHELL_DEFAULT_TIMEOUT,
 		execute = tool_shell_execute,
 	}
 }
@@ -86,13 +82,12 @@ tool_shell_definition :: proc(shell: string, allocator := context.allocator) -> 
 Tool_Shell_Args :: struct {
 	command:           string,
 	working_directory: string, // "" means the workspace root
-	timeout_ms:        int,
+	timeout:           time.Duration,
 }
 
 // tool_shell_args reads the shell's arguments and reports the first defect
-// instead of a value, so a refused call is described exactly. The timeout
-// bounds come from the tool definition: a model-requested timeout above the
-// maximum is refused, never silently clamped.
+// instead of a value, so a refused call is described exactly. A timeout the
+// model gives is honored as given; otherwise the definition's default applies.
 tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_Shell_Args, Tool_Argument_Error) {
 	if known_error := tool_fields_known(arguments, TOOL_SHELL_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
 	command, command_error := tool_field_string(arguments, "command", allocator = ctx.allocator)
@@ -108,13 +103,13 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_She
 	timeout_ms, timeout_error := tool_field_optional_int(
 		arguments,
 		"timeout_ms",
-		int(TOOL_SHELL_DEFAULT_TIMEOUT / time.Millisecond),
+		int(ctx.timeout / time.Millisecond),
 		1,
-		int(TOOL_SHELL_MAX_TIMEOUT / time.Millisecond),
+		int(max(time.Duration) / time.Millisecond),
 		allocator = ctx.allocator,
 	)
 	if timeout_error.kind != .None { return {}, timeout_error }
-	return Tool_Shell_Args{command = command, working_directory = working_directory, timeout_ms = timeout_ms}, {}
+	return {command = command, working_directory = working_directory, timeout = time.Duration(timeout_ms) * time.Millisecond}, {}
 }
 
 // tool_shell_start runs a command with the shell this process was started from,
@@ -170,13 +165,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 	child := Tool_Child {
 		pid = pid,
 	}
-	// The requested timeout is clamped to the definition maximum, so no call
-	// outlives the tool's own policy. The turn control stays separate from the
-	// tool budget: cancellation reports Cancelled, while
-	// only the budget expiring reports Timed_Out.
-	start := time.tick_now()
-	budget := tool_timeout_clamp(time.Duration(args.timeout_ms) * time.Millisecond, TOOL_SHELL_MAX_TIMEOUT)
-	stop := tool_drain_pipes(&child, stdout_pipe[0], stderr_pipe[0], start, budget, ctx.control, &data, ctx.allocator)
+	stop := tool_drain_pipes(&child, stdout_pipe[0], stderr_pipe[0], time.tick_now(), args.timeout, ctx.control, &data, ctx.allocator)
 	_ = linux.close(stdout_pipe[0])
 	_ = linux.close(stderr_pipe[0])
 	switch stop {

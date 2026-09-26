@@ -12,16 +12,14 @@ import "nabla:agent/skills"
 import "nabla:ai"
 
 // Tool_Control is the caller's interruption policy for one execution. A zero
-// value runs with no cancellation and no deadline.
+// value runs with no cancellation.
 //
 // interrupt is the execution's own stop token, so one call can be stopped without
 // stopping its siblings. parent is the token of the work that owns it, read on every
-// check: a turn cancellation reaches a running execution without the owner having to
-// walk a table. Both are optional.
+// check. Both are optional.
 Tool_Control :: struct {
 	interrupt: ^ai.Interrupt,
 	parent:    ^ai.Interrupt,
-	deadline:  ai.Deadline,
 }
 
 // Tool_Context is what one execution is given besides its arguments. Every
@@ -35,11 +33,9 @@ Tool_Context :: struct {
 	// executor that forwards the call elsewhere sends this, so the record and the
 	// remote peer see the same bytes rather than two encodings of one value.
 	arguments_json: string,
-	// timeouts is the calling definition's own policy, copied here by
-	// dispatch. A shared executor, one procedure serving many definitions
-	// with different bindings, reads its bounds here instead of duplicating
-	// them into adapter state. The definition stays the source of truth.
-	timeouts:       Tool_Timeout_Policy,
+	// timeout is the definition's default, copied here so a shared executor reads the
+	// value of the definition it runs for.
+	timeout:        time.Duration,
 	allocator:      mem.Allocator,
 	skills:         ^skills.Catalog,
 	// backend is the borrowed binding the definition was registered with, copied
@@ -88,15 +84,6 @@ Tool_Behavior_Hints :: struct {
 	open_world:  Tool_Hint_Value,
 }
 
-// Tool_Timeout_Policy bounds how long one execution of a tool may run. A zero
-// duration means no tool-specific bound, not a forgotten configuration: nothing
-// else bounds it, because the turn sets no time bound of its own. Durations are
-// time.Duration internally; milliseconds live only at the JSON argument boundary.
-Tool_Timeout_Policy :: struct {
-	default: time.Duration,
-	maximum: time.Duration,
-}
-
 // Tool_Placement says where a definition's execution runs. It is data on the
 // definition rather than behavior in a scheduler: the job table reads it and does the
 // obvious thing.
@@ -120,7 +107,9 @@ Tool_Definition :: struct {
 	input_schema: string,
 	hints:        Tool_Behavior_Hints,
 	placement:    Tool_Placement,
-	timeouts:     Tool_Timeout_Policy,
+	// timeout applies from the start of an execution when the model gives none. Zero
+	// means none. There is no maximum.
+	timeout:      time.Duration,
 	execute:      Tool_Execute,
 	// backend is borrowed adapter state, nil for native tools. The registry
 	// copies the pointer but never frees what it points to: the adapter that
@@ -241,11 +230,8 @@ tool_definition_validate :: proc(definition: Tool_Definition) -> Tool_Registry_E
 	if schema_error := tool_schema_valid(definition.input_schema); schema_error != "" {
 		return {kind = .Invalid_Schema, tool = definition.name, detail = schema_error}
 	}
-	if definition.timeouts.default < 0 || definition.timeouts.maximum < 0 {
+	if definition.timeout < 0 {
 		return {kind = .Invalid_Timeout, tool = definition.name, detail = "a timeout cannot be negative"}
-	}
-	if definition.timeouts.default > 0 && definition.timeouts.maximum > 0 && definition.timeouts.default > definition.timeouts.maximum {
-		return {kind = .Invalid_Timeout, tool = definition.name, detail = "the default timeout exceeds the maximum"}
 	}
 	if definition.execute == nil {
 		return {kind = .Missing_Execute, tool = definition.name, detail = "a tool needs an execute procedure"}
@@ -297,7 +283,7 @@ tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition)
 			input_schema = strings.clone(definition.input_schema, registry.allocator),
 			hints = definition.hints,
 			placement = definition.placement,
-			timeouts = definition.timeouts,
+			timeout = definition.timeout,
 			execute = definition.execute,
 			backend = definition.backend,
 		},
@@ -506,64 +492,17 @@ tool_result_valid :: proc(outcome: session.Tool_Outcome, content: string) -> boo
 	return data_present
 }
 
-// --- timeout policy ------------------------------------------------------------
-
-// tool_control_with_timeout derives the control for one execution bounded by
-// timeout from now: the parent control with its deadline replaced by the
-// earlier of the parent deadline and now plus the timeout. A non-positive
-// timeout leaves the parent control unchanged. An expired parent deadline is
-// never revived by a longer timeout.
-tool_control_with_timeout :: proc(parent: Tool_Control, timeout: time.Duration) -> Tool_Control {
-	if timeout <= 0 { return parent }
-	return tool_control_earlier(parent, ai.deadline_in(timeout))
-}
-
-// tool_control_with_maximum clamps a requested bound the same way: the parent
-// control with its deadline replaced by the earlier of the parent deadline and
-// now plus the maximum. A non-positive maximum leaves the parent unchanged.
-tool_control_with_maximum :: proc(parent: Tool_Control, maximum: time.Duration) -> Tool_Control {
-	if maximum <= 0 { return parent }
-	return tool_control_earlier(parent, ai.deadline_in(maximum))
-}
-
-@(private)
-tool_control_earlier :: proc(parent: Tool_Control, candidate: ai.Deadline) -> Tool_Control {
-	control := parent
-	if !candidate.active { return control }
-	if !control.deadline.active {
-		control.deadline = candidate
-		return control
-	}
-	parent_remaining, parent_ok := ai.deadline_remaining(control.deadline)
-	candidate_remaining, candidate_ok := ai.deadline_remaining(candidate)
-	if candidate_ok && (!parent_ok || candidate_remaining < parent_remaining) { control.deadline = candidate }
-	return control
-}
-
-// tool_timeout_clamp bounds a requested timeout by the definition maximum. A
-// non-positive maximum means no bound: the request stands as asked. Durations
-// stay in time.Duration here; milliseconds live only at the JSON boundary.
-tool_timeout_clamp :: proc(requested, maximum: time.Duration) -> time.Duration {
-	if maximum > 0 && requested > maximum { return maximum }
-	return requested
-}
-
-// tool_control_cancelled reports whether the execution owning this control
-// ended: interruption was requested locally or by its parent, or the control's
-// deadline passed. The deadline comes only from tool bounds; the turn itself sets
-// none. A tool's own timeout budget is not cancellation; it has its own outcome and
-// its own check.
+// tool_control_cancelled reports whether the execution was asked to stop, by itself or by
+// its parent.
 tool_control_cancelled :: proc(control: Tool_Control) -> bool {
-	return ai.interrupt_requested(control.interrupt) || ai.interrupt_requested(control.parent) || ai.deadline_expired(control.deadline)
+	return ai.interrupt_requested(control.interrupt) || ai.interrupt_requested(control.parent)
 }
 
-// tool_control_stop reports why an execution loop must stop. Cancellation wins
-// over the tool timeout when both are observed: a cancelled turn is never
-// reported as a timeout. control is the caller's control and budget is the tool's
-// own bound; the two stay separate so the outcome can name which one fired.
-tool_control_stop :: proc(control: Tool_Control, start: time.Tick, budget: time.Duration) -> Tool_Stop {
+// tool_control_stop reports why an execution loop must stop. Cancellation wins over the
+// timeout, which is measured from start; a zero timeout never expires.
+tool_control_stop :: proc(control: Tool_Control, start: time.Tick, timeout: time.Duration) -> Tool_Stop {
 	if tool_control_cancelled(control) { return .Cancelled }
-	if budget > 0 && time.tick_since(start) > budget { return .Timed_Out }
+	if timeout > 0 && time.tick_since(start) > timeout { return .Timed_Out }
 	return .None
 }
 

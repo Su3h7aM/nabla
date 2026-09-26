@@ -9,12 +9,10 @@ import l "vendor:lua/5.4"
 
 import "nabla:mcp"
 
-// MCP_DEFAULT_DISCOVERY_TIMEOUT, MCP_DEFAULT_CALL_TIMEOUT, and
-// MCP_DEFAULT_MAXIMUM_CALL_TIMEOUT are what a server gets when the configuration
-// states none. They live here so a server's bounds are visible in one place.
+// MCP_DEFAULT_DISCOVERY_TIMEOUT and MCP_DEFAULT_CALL_TIMEOUT are what a server gets when
+// the configuration states none.
 MCP_DEFAULT_DISCOVERY_TIMEOUT :: 5 * time.Second
 MCP_DEFAULT_CALL_TIMEOUT :: 30 * time.Second
-MCP_DEFAULT_MAXIMUM_CALL_TIMEOUT :: 120 * time.Second
 
 // MCP_MAX_SERVERS bounds how many servers one configuration may declare, and
 // MCP_MAX_ENTRIES bounds one server's arguments, environment, and aliases.
@@ -50,12 +48,11 @@ MCP_Stdio_Config :: struct {
 // MCP_Server_Config is one configured server. Every string is owned, and the
 // timeouts are already resolved from their defaults.
 MCP_Server_Config :: struct {
-	id:                   string,
-	stdio:                MCP_Stdio_Config,
-	tools:                []MCP_Tool_Config,
-	discovery_timeout:    time.Duration,
-	call_timeout:         time.Duration,
-	maximum_call_timeout: time.Duration,
+	id:                string,
+	stdio:             MCP_Stdio_Config,
+	tools:             []MCP_Tool_Config,
+	discovery_timeout: time.Duration,
+	call_timeout:      time.Duration,
 }
 
 // MCP_Server_Config_Destroy releases one configuration built by a client adapter.
@@ -112,9 +109,8 @@ MCP_Server_Config_From_Stdio :: proc(
 		return {}, .Invalid
 	}
 	config := MCP_Server_Config {
-		discovery_timeout    = MCP_DEFAULT_DISCOVERY_TIMEOUT,
-		call_timeout         = MCP_DEFAULT_CALL_TIMEOUT,
-		maximum_call_timeout = MCP_DEFAULT_MAXIMUM_CALL_TIMEOUT,
+		discovery_timeout = MCP_DEFAULT_DISCOVERY_TIMEOUT,
+		call_timeout      = MCP_DEFAULT_CALL_TIMEOUT,
 	}
 	failed := true
 	defer if failed { mcp_server_config_destroy(&config, allocator) }
@@ -243,9 +239,8 @@ mcp_environment_clone :: proc(source: []MCP_Environment, allocator: mem.Allocato
 
 mcp_server_config_clone :: proc(source: MCP_Server_Config, allocator: mem.Allocator) -> (MCP_Server_Config, Config_Error) {
 	config := MCP_Server_Config {
-		discovery_timeout    = source.discovery_timeout,
-		call_timeout         = source.call_timeout,
-		maximum_call_timeout = source.maximum_call_timeout,
+		discovery_timeout = source.discovery_timeout,
+		call_timeout      = source.call_timeout,
 	}
 	failed := true
 	defer if failed { mcp_server_config_destroy(&config, allocator) }
@@ -337,10 +332,9 @@ mcp_server_load :: proc(L: ^l.State, raw_idx: c.int, id: string, allocator: mem.
 	server_id, server_id_error := strings.clone(id, allocator)
 	if server_id_error != nil { return .Allocation }
 	out^ = MCP_Server_Config {
-		id                   = server_id,
-		discovery_timeout    = MCP_DEFAULT_DISCOVERY_TIMEOUT,
-		call_timeout         = MCP_DEFAULT_CALL_TIMEOUT,
-		maximum_call_timeout = MCP_DEFAULT_MAXIMUM_CALL_TIMEOUT,
+		id                = server_id,
+		discovery_timeout = MCP_DEFAULT_DISCOVERY_TIMEOUT,
+		call_timeout      = MCP_DEFAULT_CALL_TIMEOUT,
 	}
 	failed := true
 	defer if failed { mcp_server_config_destroy(out, allocator) }
@@ -399,12 +393,6 @@ mcp_server_load :: proc(L: ^l.State, raw_idx: c.int, id: string, allocator: mem.
 	} else if present {
 		out^.call_timeout = value
 	}
-	if value, present, value_ok := mcp_timeout_ms(L, idx, "maximum_call_timeout_ms"); !value_ok {
-		return .Invalid
-	} else if present {
-		out^.maximum_call_timeout = value
-	}
-	if out^.call_timeout > out^.maximum_call_timeout { return .Invalid }
 
 	failed = false
 	return .None
@@ -648,11 +636,4 @@ mcp_stdio_config :: proc(config: MCP_Server_Config) -> mcp.Stdio_Config {
 		working_directory = config.stdio.working_directory,
 		environment = environment[:],
 	}
-}
-
-// mcp_timeout_policy is a configured server's bounds as a tool definition's policy.
-// An adapted tool exposes no timeout argument to the model, so the call timeout is
-// the bound and the maximum is the ceiling above it.
-mcp_timeout_policy :: proc(config: MCP_Server_Config) -> Tool_Timeout_Policy {
-	return {default = config.call_timeout, maximum = config.maximum_call_timeout}
 }

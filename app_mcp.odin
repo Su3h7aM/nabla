@@ -328,7 +328,7 @@ app_tools_refresh :: proc(app: ^App) -> string {
 				mcp_binding_destroy(binding, setup.alloc)
 				continue
 			}
-			definition := agent.mcp_tool_definition(name, tool, binding, agent.mcp_timeout_policy(server))
+			definition := agent.mcp_tool_definition(name, tool, binding, server.call_timeout)
 			if add_err := agent.tool_registry_add(&registry, definition); add_err.kind != .None {
 				rejected += 1
 				fmt.sbprintf(&warnings, "\n%s: %s: %s", server.id, tool.name, add_err.detail)

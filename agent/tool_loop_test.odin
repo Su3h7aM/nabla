@@ -857,8 +857,7 @@ test_result_contract_violation_is_replaced_in_dispatch :: proc(t: ^testing.T) {
 // The state is per definition: the executor's fixed signature reports through
 // the definition's backend, so parallel tests never observe each other.
 Tool_Policy_Probe :: struct {
-	seen_default: time.Duration,
-	seen_maximum: time.Duration,
+	seen_timeout: time.Duration,
 	seen_backend: rawptr,
 }
 
@@ -868,8 +867,7 @@ Tool_Policy_Probe :: struct {
 // so a definition that is never dispatched needs no probe.
 tool_policy_probe_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
 	if probe := cast(^Tool_Policy_Probe)ctx.backend; probe != nil {
-		probe.seen_default = ctx.timeouts.default
-		probe.seen_maximum = ctx.timeouts.maximum
+		probe.seen_timeout = ctx.timeout
 		probe.seen_backend = ctx.backend
 	}
 	return tool_result_success(ctx, Tool_Empty{}, "probed")
@@ -890,7 +888,7 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 		name = "test_probe_first",
 		description = "First probe tool.",
 		input_schema = `{"type":"object"}`,
-		timeouts = {default = 5 * time.Second, maximum = 10 * time.Second},
+		timeout = 5 * time.Second,
 		execute = tool_policy_probe_execute,
 		backend = &probe_first,
 	}
@@ -898,7 +896,7 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 		name = "test_probe_second",
 		description = "Second probe tool.",
 		input_schema = `{"type":"object"}`,
-		timeouts = {default = 30 * time.Second, maximum = 60 * time.Second},
+		timeout = 30 * time.Second,
 		execute = tool_policy_probe_execute,
 		backend = &probe_second,
 	}
@@ -907,14 +905,12 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 
 	first_result := tool_run(t, &test, "test_probe_first", `{}`)
 	testing.expect_value(t, first_result.outcome, session.Tool_Outcome.Success)
-	testing.expect_value(t, probe_first.seen_default, 5 * time.Second)
-	testing.expect_value(t, probe_first.seen_maximum, 10 * time.Second)
+	testing.expect_value(t, probe_first.seen_timeout, 5 * time.Second)
 	testing.expect(t, probe_first.seen_backend == &probe_first, "the first call carries the first binding")
 
 	second_result := tool_run(t, &test, "test_probe_second", `{}`)
 	testing.expect_value(t, second_result.outcome, session.Tool_Outcome.Success)
-	testing.expect_value(t, probe_second.seen_default, 30 * time.Second)
-	testing.expect_value(t, probe_second.seen_maximum, 60 * time.Second)
+	testing.expect_value(t, probe_second.seen_timeout, 30 * time.Second)
 	testing.expect(t, probe_second.seen_backend == &probe_second, "the second call carries the second binding")
 }
 
