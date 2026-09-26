@@ -247,24 +247,11 @@ test_shell_cancel_reaps_child_and_allows_next_turn :: proc(t: ^testing.T) {
 
 // --- SIGINT through the production control loop -------------------------------
 
-// test_thread_start creates a thread with SIGINT already blocked, then restores the
-// creating thread's mask.
-//
-// Masking inside the new thread would leave a startup window: the OS thread exists
-// from thread.create (it waits on a condition variable until start), so a
-// process-directed SIGINT can be delivered to it before its own mask is applied. A
-// handler running there could be entered before a turn reset and capture the next
-// generation afterwards, cancelling a turn it does not own. Blocking before the
-// spawn and letting the child inherit closes that window; the mask is inherited from
-// the creating thread at pthread_create.
+// test_thread_start creates a thread that inherits a mask blocking the watched signals,
+// so a signal a test raises is handled by the thread under test, never by a helper.
 test_thread_start :: proc(routine: thread.Thread_Proc, data: rawptr, name: string) -> ^thread.Thread {
-	// Block SIGINT for the whole spawn so the new thread inherits the mask. Masking
-	// at thread entry would leave a startup window: thread.create already spawns the
-	// OS thread, so a process-directed SIGINT could reach it first.
-	blocked := chat_signal_int_set()
-	previous: linux.Sig_Set
-	_ = linux.rt_sigprocmask(.SIG_BLOCK, &blocked, &previous)
-	defer _ = linux.rt_sigprocmask(.SIG_SETMASK, &previous, nil)
+	previous := chat_signal_block_watched()
+	defer chat_signal_restore(previous)
 
 	started := thread.create(routine, name = name)
 	if started == nil { return nil }

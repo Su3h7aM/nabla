@@ -5,7 +5,6 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sync"
-import linux "core:sys/linux"
 import "core:thread"
 import "core:time"
 
@@ -565,8 +564,7 @@ chat_compact_begin_attempt :: proc(
 // inside the worker would leave a startup window.
 @(private)
 chat_compact_launch :: proc(job: ^Compact_Job) -> bool {
-	previous: linux.Sig_Set
-	chat_signal_block_watched(&previous)
+	previous := chat_signal_block_watched()
 	job.thread = thread.create(chat_compact_worker, name = "nabla-compaction")
 	chat_signal_restore(previous)
 	if job.thread == nil { return false }

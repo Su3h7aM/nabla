@@ -5,7 +5,6 @@ import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
-import linux "core:sys/linux"
 import "core:thread"
 import "core:time"
 
@@ -902,8 +901,7 @@ tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
 // creation so the worker inherits a mask that keeps it from running the process handler.
 @(private)
 tool_job_launch :: proc(job: ^Tool_Job) -> bool {
-	previous: linux.Sig_Set
-	chat_signal_block_watched(&previous)
+	previous := chat_signal_block_watched()
 	worker := thread.create(tool_job_worker, name = "nabla-tool")
 	chat_signal_restore(previous)
 	if worker == nil { return false }
