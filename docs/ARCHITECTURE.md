@@ -17,7 +17,7 @@ Terms: "must" is a hard rule, "default" is a named, tunable value. Every numeric
 9. Repair changes representation only, is unambiguous, and is journaled. It never supplies semantic intent.
 10. Every live work item has an owner, a release point, and a cancellation path. Its limits are the external ones in section 2.1; the harness adds none.
 11. Idle means zero periodic wakeups in every thread the process owns.
-12. A failure the model can act on is fed back to the model and the turn continues (section 2.2). Only the user, or a model that cannot be reached, ends a turn.
+12. The model decides when its work is done. A failure the model can act on is fed back to the model and the turn continues (section 2.2). Only the model finishing, the user, or a model that cannot be reached ends a turn; an external failure never does.
 13. Native data stays typed. JSON exists only at provider, MCP, ACP, journal payload, and export boundaries.
 14. The resolved model catalog is the only runtime source of model facts.
 15. Configuration is live. Admitted work keeps the immutable snapshot it was admitted with; new work uses the newest valid snapshot.
@@ -52,6 +52,8 @@ When a request, a response, or a tool fails, the next step is to tell the model 
 | user cancel, storage failure | nothing | ends |
 
 - Feedback is actionable: it names the failing call or response, the cause, the external limit with its value when one applies, and what was not executed.
+- A malformed call is feedback, not an error path: an unknown tool, arguments that are not JSON, a missing or mistyped field, or a value outside the schema returns a result that names the field, what was expected, and what was received, so the model can correct the call and retry.
+- Every layer of the loop handles its failures: the state machine, the request path, tool dispatch, and each tool map an error to one row of this table. No failure escapes as a panic, an unhandled return value, or a silent stop.
 - A notice is committed as a node, so resume, forks, and the cache see the same bytes.
 - A failure recorded in the journal is always also visible where it matters: to the model when it can act, to the user when only the user can.
 
@@ -75,7 +77,8 @@ When a request, a response, or a tool fails, the next step is to tell the model 
 
 ### 3.2 Errors
 
-- Errors are trailing return values. Each package defines `Error`: an enum of local causes, or `union #shared_nil { Local_Error, os.Error, mem.Allocator_Error, ... }` when it composes lower errors. Propagate with `or_return`; default with `or_else`.
+- Errors are trailing return values. Each package defines `Error`: an enum of local causes, or `union #shared_nil { Local_Error, os.Error, mem.Allocator_Error, ... }` when it composes lower errors. Propagate with `or_return`; default with `or_else`; branch with `or_break`/`or_continue` or an explicit check.
+- Every error is handled: propagated, converted into feedback or a `Failure`, or acted on. Discarding one with `_ =` is allowed only in cleanup whose failure changes no outcome, such as closing a descriptor that is being abandoned.
 - Constructors and state-changing procedures are `@(require_results)`.
 - A harness failure recorded in the journal is `Failure :: struct { stage: Stage, kind: Failure_Kind, detail: string }` with the full `detail` the source reported. `Stage` names where it happened (Prepare, Encode, Admit, Send, Stream, Validate, Commit, Dispatch, Execute, Persist, Hook, Recover).
 - `assert` checks internal invariants in debug; `ensure` checks invariants whose violation would corrupt durable state. Neither handles input, transport, tool, or storage errors. No `panic` on external input.

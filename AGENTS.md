@@ -120,6 +120,8 @@ readability for a smaller diff.
 
 Avoid magic values. Name any literal whose meaning is not obvious at the call site.
 
+Handle every error with Odin's own mechanisms (`or_return`, `or_else`, `or_break`, an explicit check). In the harness, a failure the model can act on, such as a failed tool, a malformed call, or a rejected request, becomes feedback to the model and the turn continues; only the model, the user, or an unreachable model ends it. See sections 2.2 and 3.2 of `docs/ARCHITECTURE.md`.
+
 For a bug, inspect every caller of the procedure being changed, fix the shared root cause, and
 check the sibling paths that reach it.
 
