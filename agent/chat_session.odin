@@ -105,7 +105,6 @@ Chat_Session :: struct {
 	// state, not a nested loop. It owns the prepared request and the frozen bytes until
 	// chat_chain_commit releases them.
 	chain:                        Chat_Request_Chain,
-
 	mailbox:                      Owner_Mailbox,
 
 	// storage_failed latches a durable write that did not land. A session that
@@ -219,7 +218,15 @@ Chat_Session :: struct {
 //
 // Diagnostics are not a field here. The session's work inherits the writer from
 // context.logger, which is what lets a call site emit without threading one.
-chat_session_init :: proc(store: ^session.Store, id: session.Session_Id, workspace: string, allocator := context.allocator) -> (Chat_Session, Tool_Registry_Error) {
+chat_session_init :: proc(
+	store: ^session.Store,
+	id: session.Session_Id,
+	workspace: string,
+	allocator := context.allocator,
+) -> (
+	Chat_Session,
+	Tool_Registry_Error,
+) {
 	// The native definitions are compile-time constants, so a build failure
 	// here is a programming error; the registry tests hold them to validity.
 	// A partial registry is never installed: make destroys it before returning.

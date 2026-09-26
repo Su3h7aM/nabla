@@ -31,14 +31,14 @@ Provider_Encode_Cache :: struct {
 	// allocator is what everything this cache holds was allocated with. The first encode
 	// that fills it fixes one, and every later encode and the destroy use it, so a cache
 	// never mixes two allocators and cannot free what another allocated.
-	allocator:  mem.Allocator,
-	slots:      [dynamic]Encode_Slot,
+	allocator: mem.Allocator,
+	slots:     [dynamic]Encode_Slot,
 	// body is the buffer every request this cache encodes is written into, and the bytes the
 	// last one was sent as. A conversation carries most of the request before it again, so on
 	// the first encode of a session the buffer reaches the size of a whole request and is
 	// written over after that: a session allocates one request body, where a body per request
 	// would leave the allocator holding a size for every turn the conversation grew through.
-	body:       strings.Builder,
+	body:      strings.Builder,
 }
 
 // Encode_Slot is one text and the bytes it was written as.
@@ -79,9 +79,9 @@ Encode_Text_Kind :: enum {
 // this request meets the n-th text of the previous one.
 @(private = "package")
 Encode_Cursor :: struct {
-	cache: ^Provider_Encode_Cache,
-	next:  int,
-	error: Provider_Request_Error,
+	cache:     ^Provider_Encode_Cache,
+	next:      int,
+	error:     Provider_Request_Error,
 	// body is the buffer this request is written into, and temporary is what holds it when
 	// there is no cache to keep one between requests.
 	body:      ^strings.Builder,

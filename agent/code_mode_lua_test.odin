@@ -6,12 +6,10 @@ import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:testing"
-import "core:time"
 
-// The Lua boundary suite. It proves the four things Code Mode depends on and that no
-// later layer can compensate for: limits a script cannot swallow, slices that return
-// control to the owner, a suspension a script cannot catch, and a restricted
-// environment with nothing else in it.
+// The Lua boundary suite. It proves the things Code Mode depends on and that no later
+// layer can compensate for: slices that return control to the owner, a stop a script
+// cannot catch, and a restricted environment with nothing else in it.
 
 // LUA_TEST_REFNIL is `luaL_ref`'s "no reference" value. A request with no arguments
 // carries it, and the test asserts it rather than importing the binding.
@@ -51,10 +49,10 @@ lua_test_drive :: proc(t: ^testing.T, run: ^Lua_Run, requests: ^[dynamic]string)
 	testing.fail_now(t, "the Lua run never settled")
 }
 
-// lua_test_start compiles one chunk with the default limits and fails the test when it
-// does not compile. The caller owns the returned run.
+// lua_test_start compiles one chunk and fails the test when it does not compile. The
+// caller owns the returned run.
 lua_test_start :: proc(t: ^testing.T, source: string) -> ^Lua_Run {
-	run, compiled := code_mode_lua_start(context.allocator, lua_limits_default(), source)
+	run, compiled := code_mode_lua_start(source)
 	if run == nil { testing.fail_now(t, "the execution could not be created") }
 	if !compiled {
 		testing.expectf(t, false, "the chunk did not compile: %s", code_mode_lua_message(run))
@@ -84,7 +82,7 @@ lua_run_allows_an_empty_return :: proc(t: ^testing.T) {
 
 @(test)
 lua_syntax_error_is_a_value :: proc(t: ^testing.T) {
-	run, compiled := code_mode_lua_start(context.allocator, lua_limits_default(), "return 1 +")
+	run, compiled := code_mode_lua_start("return 1 +")
 	defer code_mode_lua_destroy(run)
 
 	testing.expect(t, run != nil, "a failed compile still returns a run to read")
@@ -184,33 +182,9 @@ lua_request_carries_its_arguments :: proc(t: ^testing.T) {
 }
 
 @(test)
-lua_instruction_budget_stops_the_run :: proc(t: ^testing.T) {
-	limits := lua_limits_default()
-	limits.instructions = 50_000
-	limits.slice = 5_000
-	run, compiled := code_mode_lua_start(context.allocator, limits, "while true do end")
-	defer code_mode_lua_destroy(run)
-	testing.expect(t, compiled, "the chunk should compile")
-
-	event, _ := lua_test_settle(t, run)
-	testing.expect_value(t, event, Lua_Event.Stopped)
-	testing.expect_value(t, code_mode_lua_stop(run), Lua_Stop.Instructions)
-	testing.expect_value(t, code_mode_lua_failure(run), Lua_Failure.None)
-	testing.expect(t, code_mode_lua_instructions(run) >= 50_000, "the run should have spent its whole budget")
-
-	// The stop is final: asking again runs nothing and reports the same observation.
-	steps := run.steps
-	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Stopped)
-	testing.expect_value(t, run.steps, steps)
-}
-
-@(test)
 lua_slices_return_control_to_the_owner :: proc(t: ^testing.T) {
-	limits := lua_limits_default()
-	limits.slice = 1_000
-	run, compiled := code_mode_lua_start(context.allocator, limits, "local x = 0\nfor i = 1, 200000 do x = x + i end\nreturn x\n")
+	run := lua_test_start(t, "local x = 0\nfor i = 1, 200000 do x = x + i end\nreturn x\n")
 	defer code_mode_lua_destroy(run)
-	testing.expect(t, compiled, "the chunk should compile")
 
 	event, slices := lua_test_settle(t, run)
 	testing.expect_value(t, event, Lua_Event.Returned)
@@ -218,52 +192,16 @@ lua_slices_return_control_to_the_owner :: proc(t: ^testing.T) {
 }
 
 @(test)
-lua_cancellation_stops_without_an_error :: proc(t: ^testing.T) {
-	limits := lua_limits_default()
-	limits.slice = 1_000
-	run, compiled := code_mode_lua_start(context.allocator, limits, "while true do end")
+lua_stop_is_final_and_not_an_error :: proc(t: ^testing.T) {
+	run := lua_test_start(t, "while true do end")
 	defer code_mode_lua_destroy(run)
-	testing.expect(t, compiled, "the chunk should compile")
 
 	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Slice)
 	code_mode_lua_request_stop(run)
-	event, _ := lua_test_settle(t, run)
-	testing.expect_value(t, event, Lua_Event.Stopped)
-	testing.expect_value(t, code_mode_lua_stop(run), Lua_Stop.Cancelled)
-	// Cancellation is not a script error, and a script cannot turn it into one.
+	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Stopped)
 	testing.expect_value(t, code_mode_lua_failure(run), Lua_Failure.None)
 	testing.expect_value(t, code_mode_lua_message(run), "the execution was cancelled")
-}
-
-@(test)
-lua_deadline_stops_the_run :: proc(t: ^testing.T) {
-	limits := lua_limits_default()
-	limits.slice = 10_000
-	limits.duration = 20 * time.Millisecond
-	run, compiled := code_mode_lua_start(context.allocator, limits, "while true do end")
-	defer code_mode_lua_destroy(run)
-	testing.expect(t, compiled, "the chunk should compile")
-
-	event, _ := lua_test_settle(t, run)
-	testing.expect_value(t, event, Lua_Event.Stopped)
-	testing.expect_value(t, code_mode_lua_stop(run), Lua_Stop.Deadline)
-}
-
-@(test)
-lua_memory_budget_stops_the_run :: proc(t: ^testing.T) {
-	limits := lua_limits_default()
-	limits.memory_bytes = 256 * 1024
-	run, compiled := code_mode_lua_start(context.allocator, limits, `local held = {}
-for i = 1, 100000 do held[i] = string.rep("x", 1000) end
-return #held
-`)
-	defer code_mode_lua_destroy(run)
-	testing.expect(t, compiled, "the chunk should compile")
-
-	event, _ := lua_test_settle(t, run)
-	testing.expect_value(t, event, Lua_Event.Failed)
-	testing.expect_value(t, code_mode_lua_failure(run), Lua_Failure.Memory)
-	testing.expect(t, code_mode_lua_memory_peak(run) <= limits.memory_bytes, "the peak should never pass the budget")
+	testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Stopped)
 }
 
 @(test)
@@ -335,19 +273,17 @@ lua_destroy_returns_every_byte :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&tracker)
 
 	run, compiled := code_mode_lua_start(
-		mem.tracking_allocator(&tracker),
-		lua_limits_default(),
 		`local held = {}
 for i = 1, 5000 do held[i] = string.format("%d", i) end
 return #held
 `,
+		allocator = mem.tracking_allocator(&tracker),
 	)
 	testing.expect(t, compiled, "the chunk should compile")
 	if run == nil { testing.fail_now(t, "the execution could not be created") }
 
 	event, _ := lua_test_settle(t, run)
 	testing.expect_value(t, event, Lua_Event.Returned)
-	testing.expect(t, code_mode_lua_memory_used(run) > 0, "the run should hold Lua memory")
 	code_mode_lua_destroy(run)
 
 	testing.expect_value(t, len(tracker.allocation_map), 0)
@@ -356,25 +292,17 @@ return #held
 @(test)
 lua_stop_in_a_c_frame_defers :: proc(t: ^testing.T) {
 	// A comparator runs inside a C function, where a hook cannot yield. The hook must
-	// defer instead of raising, and the run must finish normally.
-	limits := lua_limits_default()
-	limits.slice = 300
-	run, compiled := code_mode_lua_start(
-		context.allocator,
-		limits,
-		`local t = {}
+	// wait instead of raising, and the run must finish normally.
+	run := lua_test_start(t, `local t = {}
 for i = 1, 3000 do t[i] = (i * 7919) % 3001 end
 table.sort(t, function(a, b) return a < b end)
 return t[1]
-`,
-	)
+`)
 	defer code_mode_lua_destroy(run)
-	testing.expect(t, compiled, "the chunk should compile")
 
 	event, slices := lua_test_settle(t, run)
 	testing.expect_value(t, event, Lua_Event.Returned)
 	testing.expect(t, slices > 0, "the sort should cross slice boundaries")
-	testing.expect(t, run.non_yieldable > 0, "the hook should have fired inside the C frame")
 	value, present := code_mode_lua_returned_number(run)
 	testing.expect(t, present, "the sort result should be a number")
 	testing.expect_value(t, value, i64(1))

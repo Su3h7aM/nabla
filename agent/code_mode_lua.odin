@@ -5,7 +5,6 @@ import c "core:c"
 import "core:encoding/json"
 import "core:mem"
 import "core:strings"
-import "core:time"
 import "core:unicode/utf8"
 import l "vendor:lua/5.4"
 
@@ -20,47 +19,24 @@ import l "vendor:lua/5.4"
 // Two things bring control back to the owner:
 //
 // - A tool wrapper yields a request. The owner answers it with `deliver`.
-// - The count hook yields. The owner resumes for an ordinary slice, or stops for good
-//   when a limit was reached. Every limit is enforced by not resuming.
+// - The count hook yields. The owner resumes for an ordinary slice, or never resumes
+//   a run whose stop was requested.
 //
-// Yielding rather than raising is what makes the limits non-negotiable. Lua 5.4
-// permits a count hook to yield with no values (`lua_sethook` in the reference
-// manual), and a script cannot catch a suspension: it simply never runs again. A
-// limit raised as an error from the hook would be catchable by `pcall`, which is the
-// failure this design exists to avoid.
+// Yielding rather than raising is what makes a stop final. Lua 5.4 permits a count
+// hook to yield with no values (`lua_sethook` in the reference manual), and a script
+// cannot catch a suspension: it simply never runs again.
 //
 // The hook can only yield where the coroutine is yieldable. Inside a C library call,
-// such as a comparator passed to `table.sort`, it is not, and yielding there raises
-// "attempt to yield across a C-call boundary" into the script. The hook therefore
-// checks `isyieldable` and defers a stop to the next firing instead of raising. The
-// consequence to keep in mind: an instruction budget bounds Lua code, not work inside
-// a C function, which is why the exposed library set is small and the inputs to its
-// expensive operations are bounded hosts.
+// such as a comparator passed to `table.sort`, it is not, so the hook waits for a
+// later firing instead of raising "attempt to yield across a C-call boundary" into
+// the script.
+//
+// A run carries no limit of its own: memory is the system's, and only a stop ends a
+// script that does not return.
 
-// --- policy -------------------------------------------------------------------
-
-// Lua_Limits is the resource policy for one execution. Zero means no bound, which is
-// only ever a deliberate choice: the defaults below are real limits.
-Lua_Limits :: struct {
-	// memory_bytes bounds Lua-managed memory. The allocator refuses a block that
-	// would exceed it, which Lua reports as an out-of-memory error.
-	memory_bytes: int,
-	// instructions bounds VM instructions, the unit a count hook can measure.
-	instructions: u64,
-	// slice is how many instructions pass between owner checkpoints. It is the
-	// granularity of cancellation, not a limit: a run at its slice boundary is
-	// resumable.
-	slice:        u64,
-	// duration bounds wall-clock time from the first resume. It catches what an
-	// instruction count cannot: a script parked inside a C function.
-	duration:     time.Duration,
-}
-
-LUA_MEMORY_DEFAULT :: 32 * 1024 * 1024
-LUA_INSTRUCTIONS_DEFAULT :: 10_000_000
-LUA_SLICE_DEFAULT :: 10_000
-LUA_SLICE_MAX :: 1_000_000
-LUA_DURATION_DEFAULT :: 120 * time.Second
+// LUA_SLICE_INSTRUCTIONS is how many VM instructions run between owner checkpoints.
+// It is a scheduling quantum, not a limit: a run at a slice boundary is resumable.
+LUA_SLICE_INSTRUCTIONS :: 10_000
 
 // LUA_MAX_MESSAGE_BYTES bounds a diagnostic read out of Lua. An error is a value in
 // this harness, and the harness bounds every value it keeps.
@@ -69,26 +45,6 @@ LUA_MAX_MESSAGE_BYTES :: 1024
 // LUA_MAX_LOG_BYTES bounds what `print` may keep. Output is returned, not streamed,
 // so it is bounded where it is produced.
 LUA_MAX_LOG_BYTES :: 8 * 1024
-
-// LUA_HOST_RESERVE is extra memory available while the owner pushes values into Lua.
-// A host-side push that runs out of memory raises an error with no protected frame to
-// unwind to, which aborts the process. Host work therefore runs with a small reserve,
-// so a script that has spent its budget cannot make the harness abort while a result
-// is being delivered.
-LUA_HOST_RESERVE :: 64 * 1024
-
-lua_limits_default :: proc() -> Lua_Limits {
-	return {memory_bytes = LUA_MEMORY_DEFAULT, instructions = LUA_INSTRUCTIONS_DEFAULT, slice = LUA_SLICE_DEFAULT, duration = LUA_DURATION_DEFAULT}
-}
-
-// Lua_Stop is why a run was stopped by policy. None is the zero value, so a run that
-// was never stopped reads as running.
-Lua_Stop :: enum {
-	None,
-	Cancelled,
-	Deadline,
-	Instructions,
-}
 
 // Lua_Failure is how a run failed on its own. None is the zero value: a run that
 // suspended or returned has failed at nothing.
@@ -108,7 +64,7 @@ Lua_Event :: enum {
 	Host_Request,
 	// Slice: the instruction slice ended with nothing terminal. Resuming continues.
 	Slice,
-	// Stopped: policy ended the run. It is never resumed.
+	// Stopped: the owner stopped the run. It is never resumed.
 	Stopped,
 	// Failed: syntax, runtime, or memory failure. It is never resumed.
 	Failed,
@@ -136,31 +92,19 @@ Lua_Request :: struct {
 
 // Lua_Run is one execution. Every field is owned by the run or an observed count.
 Lua_Run :: struct {
-	allocator:         mem.Allocator,
-	limits:            Lua_Limits,
-	L:                 ^l.State, // the main state; owns every value
-	thread:            ^l.State, // the private coroutine the chunk runs on
-	started:           time.Tick,
-	instructions:      u64, // counted in slices, because the hook only knows the interval
-	hook_fires:        int,
-	non_yieldable:     int, // hook firings that could not yield; a stop waits for one that can
-	memory_used:       int, // Lua-managed bytes, headers included
-	memory_peak:       int,
-	memory_limited:    bool, // the policy refused a block, rather than the system allocator
-	host_reserve:      int, // extra headroom while the owner pushes values
-	stop:              Lua_Stop, // latched; never cleared once set
-	stop_requested:    bool, // the owner asked for cancellation
-	failure:           Lua_Failure,
-	terminal:          bool, // the run cannot be resumed
-	message:           string, // owned; why it stopped or failed
-	message_truncated: bool,
-	logs:              [dynamic]u8, // owned; what print produced
-	logs_truncated:    bool,
-	request:           Lua_Request,
-	steps:             int, // resumes, for diagnostics
-	delivered:         int, // values the last delivery pushed, for the tool continuation
-	last_event:        Lua_Event, // what resume and deliver report for a terminal run
-	returned_values:   int,
+	allocator:       mem.Allocator,
+	L:               ^l.State, // the main state; owns every value
+	thread:          ^l.State, // the private coroutine the chunk runs on
+	stop_requested:  bool, // latched; the run is never resumed past its next slice
+	failure:         Lua_Failure,
+	terminal:        bool, // the run cannot be resumed
+	message:         string, // owned; why it stopped or failed
+	logs:            [dynamic]u8, // owned; what print produced
+	logs_truncated:  bool,
+	request:         Lua_Request,
+	delivered:       int, // values the last delivery pushed, for the tool continuation
+	last_event:      Lua_Event, // what resume and deliver report for a terminal run
+	returned_values: int,
 }
 
 // --- state access --------------------------------------------------------------
@@ -215,93 +159,32 @@ code_mode_lua_string_free :: proc(text: string, allocator: mem.Allocator) {
 	_, _ = allocator.procedure(allocator.data, .Free, 0, 0, raw_data(text), len(text), CODE_MODE_LUA_ALLOCATION_SITE)
 }
 
-// code_mode_lua_alloc is Lua's allocator. It runs from a C callback, so it calls the
-// caller's allocator value directly and keeps its own byte count: the live blocks'
-// requested sizes, exactly. Returning nil makes Lua raise an out-of-memory error,
-// which the resuming call reports as a value.
-//
-// The old size Lua passes is only meaningful for a reallocation. Lua passes a
-// non-zero old size for fresh allocations too (358 times while opening the standard
-// libraries in one measurement), so a fresh block is counted by its new size and
-// never by a difference.
+// code_mode_lua_alloc is Lua's allocator over the run's allocator. Returning nil makes
+// Lua raise an out-of-memory error, which the resuming call reports as a value. Lua
+// passes a type tag rather than a size in osize when ptr is nil, and it requires that
+// shrinking a block never fails.
 @(private)
 code_mode_lua_alloc :: proc "c" (ud: rawptr, ptr: rawptr, osize, nsize: c.size_t) -> rawptr {
 	run := cast(^Lua_Run)ud
-	if run == nil { return nil }
-	// Calling through an Odin allocator value needs a context, and a C callback has
-	// none. Nothing here logs; every allocation goes through the run's own allocator.
 	context = runtime.default_context()
-
+	old_size := ptr == nil ? 0 : int(osize)
 	if nsize == 0 {
-		if ptr != nil {
-			run.memory_used -= int(osize)
-			_, _ = run.allocator.procedure(run.allocator.data, .Free, 0, 0, ptr, int(osize), CODE_MODE_LUA_ALLOCATION_SITE)
-		}
+		if ptr != nil { _ = mem.free_with_size(ptr, old_size, run.allocator, CODE_MODE_LUA_ALLOCATION_SITE) }
 		return nil
 	}
-
-	limit := run.limits.memory_bytes + run.host_reserve
-	if limit > 0 && run.memory_used + int(nsize) > limit {
-		run.memory_limited = true
-		return nil
-	}
-
-	block, err := run.allocator.procedure(run.allocator.data, .Alloc, int(nsize), CODE_MODE_LUA_ALLOC_ALIGN, nil, 0, CODE_MODE_LUA_ALLOCATION_SITE)
-	if err != nil || block == nil { return nil }
-
-	if ptr != nil {
-		copy_size := int(osize)
-		if int(nsize) < copy_size { copy_size = int(nsize) }
-		mem.copy(raw_data(block), ptr, copy_size)
-		_, _ = run.allocator.procedure(run.allocator.data, .Free, 0, 0, ptr, int(osize), CODE_MODE_LUA_ALLOCATION_SITE)
-		run.memory_used += int(nsize) - int(osize)
-	} else {
-		run.memory_used += int(nsize)
-	}
-	if run.memory_used > run.memory_peak { run.memory_peak = run.memory_used }
-	return raw_data(block)
-}
-
-@(private)
-code_mode_lua_host_enter :: proc(run: ^Lua_Run) {
-	run.host_reserve = LUA_HOST_RESERVE
-}
-
-@(private)
-code_mode_lua_host_leave :: proc(run: ^Lua_Run) {
-	run.host_reserve = 0
+	block, err := mem.resize_non_zeroed(ptr, old_size, int(nsize), CODE_MODE_LUA_ALLOC_ALIGN, run.allocator, CODE_MODE_LUA_ALLOCATION_SITE)
+	if err != nil { return int(nsize) <= old_size ? ptr : nil }
+	return block
 }
 
 // --- the count hook ------------------------------------------------------------
 
-// code_mode_lua_hook runs every `slice` instructions. It counts what has been spent,
-// latches any stop the policy calls for, and yields. It never raises: a raised error
-// would be script-catchable, while a suspension is not.
+// code_mode_lua_hook runs every LUA_SLICE_INSTRUCTIONS and yields, so the owner decides
+// whether the run continues. It never raises: a raised error would be script-catchable,
+// while a suspension is not.
 @(private)
 code_mode_lua_hook :: proc "c" (L: ^l.State, ar: ^l.Debug) {
-	run := code_mode_lua_run(L)
-	if run == nil { return }
-	run.hook_fires += 1
-	run.instructions += run.limits.slice
-
-	if run.stop == .None {
-		switch {
-		case run.stop_requested:
-			run.stop = .Cancelled
-		case run.limits.duration > 0 && time.tick_since(run.started) >= run.limits.duration:
-			run.stop = .Deadline
-		case run.limits.instructions > 0 && run.instructions >= run.limits.instructions:
-			run.stop = .Instructions
-		}
-	}
-
-	// A hook may yield only from a yieldable frame, and only with no values. When the
-	// frame is not yieldable the stop stays latched and is taken at the next firing.
-	if !l.isyieldable(L) {
-		run.non_yieldable += 1
-		return
-	}
-	l.yield(L, 0)
+	if l.isyieldable(L) { l.yield(L, 0) }
 }
 
 // --- tool suspension -----------------------------------------------------------
@@ -554,33 +437,26 @@ code_mode_lua_truncate_runes :: proc(text: string, limit: int) -> string {
 // A run is returned even when the chunk does not compile, so the caller can read the
 // message and must still destroy it. A nil run means the execution itself could not be
 // allocated.
-code_mode_lua_start :: proc(allocator: mem.Allocator, limits: Lua_Limits, source: string, name := "@code") -> (run: ^Lua_Run, compiled: bool) {
-	backend := allocator
-	if backend.procedure == nil { backend = context.allocator }
-
-	block, block_error := mem.alloc(size_of(Lua_Run), align_of(Lua_Run), backend)
-	if block == nil || block_error != nil { return nil, false }
-	run = cast(^Lua_Run)block
+code_mode_lua_start :: proc(source: string, name := "@code", allocator := context.allocator) -> (run: ^Lua_Run, compiled: bool) {
+	alloc_error: mem.Allocator_Error
+	run, alloc_error = new(Lua_Run, allocator)
+	if alloc_error != nil { return nil, false }
 	run^ = Lua_Run {
-		allocator = backend,
-		limits = limits,
+		allocator = allocator,
 		request = {args_ref = l.NOREF},
+		logs = make([dynamic]u8, allocator),
 	}
-	run.logs.allocator = backend
-	if run.limits.slice == 0 { run.limits.slice = LUA_SLICE_DEFAULT }
-	if run.limits.slice > LUA_SLICE_MAX { run.limits.slice = LUA_SLICE_MAX }
 
 	run.L = l.newstate(code_mode_lua_alloc, rawptr(run))
 	if run.L == nil {
 		run.failure = .Memory
 		run.terminal = true
 		run.last_event = .Failed
-		run.message = strings.clone("the Lua state could not be created", backend) or_else ""
+		run.message = strings.clone("the Lua state could not be created", allocator) or_else ""
 		return run, false
 	}
 	code_mode_lua_bind(run, run.L)
 
-	code_mode_lua_host_enter(run)
 	code_mode_lua_open_libraries(run.L)
 	code_mode_lua_restrict(run.L)
 	l.pushcclosure(run.L, code_mode_lua_print, 0)
@@ -595,20 +471,18 @@ code_mode_lua_start :: proc(allocator: mem.Allocator, limits: Lua_Limits, source
 
 	run.thread = l.newthread(run.L)
 	if run.thread == nil {
-		code_mode_lua_host_leave(run)
 		run.failure = .Memory
 		run.terminal = true
 		run.last_event = .Failed
-		run.message = strings.clone("the Code Mode coroutine could not be created", backend) or_else ""
+		run.message = strings.clone("the Code Mode coroutine could not be created", allocator) or_else ""
 		return run, false
 	}
 	// The thread stays on the main stack as a collector anchor: an unreferenced
 	// suspended coroutine could otherwise be collected.
 	code_mode_lua_bind(run, run.thread)
-	l.sethook(run.thread, code_mode_lua_hook, l.MASKCOUNT, c.int(run.limits.slice))
+	l.sethook(run.thread, code_mode_lua_hook, l.MASKCOUNT, LUA_SLICE_INSTRUCTIONS)
 
 	status := l.L_loadbuffer(run.thread, raw_data(source), c.size_t(len(source)), cstring(raw_data(name)), "t")
-	code_mode_lua_host_leave(run)
 	if status != .OK {
 		run.failure = .Syntax
 		run.terminal = true
@@ -624,8 +498,6 @@ code_mode_lua_start :: proc(allocator: mem.Allocator, limits: Lua_Limits, source
 code_mode_lua_install_tool :: proc(run: ^Lua_Run, name: string) -> bool {
 	if run == nil || run.L == nil || !tool_name_valid(name) { return false }
 	if strings.index_byte(name, 0) >= 0 { return false }
-	code_mode_lua_host_enter(run)
-	defer code_mode_lua_host_leave(run)
 
 	// lua_getglobal answers with the type it pushed, not an index, so the index is read
 	// from the stack top.
@@ -668,17 +540,12 @@ code_mode_lua_deliver :: proc(run: ^Lua_Run, nargs: int) -> Lua_Event {
 	return code_mode_lua_step(run, nargs)
 }
 
-// code_mode_lua_deliver_string answers the pending request with one string. It is the
-// simple case of delivery: the push happens under the host reserve, so a script cannot
-// turn a spent budget into an abort.
+// code_mode_lua_deliver_string answers the pending request with one string.
 code_mode_lua_deliver_string :: proc(run: ^Lua_Run, text: string) -> Lua_Event {
 	if run == nil || run.thread == nil { return .Failed }
 	if run.terminal { return run.last_event }
 	if !run.request.pending { return .Failed }
-	code_mode_lua_host_enter(run)
-	pushed := l.pushlstring(run.thread, cstring(raw_data(text)), c.size_t(len(text))) != nil
-	code_mode_lua_host_leave(run)
-	if !pushed { return .Failed }
+	if l.pushlstring(run.thread, cstring(raw_data(text)), c.size_t(len(text))) == nil { return .Failed }
 	return code_mode_lua_deliver(run, 1)
 }
 
@@ -695,11 +562,7 @@ code_mode_lua_request_clear :: proc(run: ^Lua_Run) {
 
 @(private)
 code_mode_lua_step :: proc(run: ^Lua_Run, nargs: int) -> Lua_Event {
-	run.steps += 1
 	run.delivered = nargs
-	// The wall-clock bound starts at the first resume, not at creation: a run may wait
-	// for its turn, and time spent waiting is not execution time.
-	if run.steps == 1 { run.started = time.tick_now() }
 	results: c.int
 	status := l.resume(run.thread, run.L, c.int(nargs), &results)
 	switch status {
@@ -709,28 +572,22 @@ code_mode_lua_step :: proc(run: ^Lua_Run, nargs: int) -> Lua_Event {
 		run.last_event = .Returned
 		return .Returned
 	case .YIELD:
-		if run.stop != .None {
-			// The hook suspended the coroutine so the run would stop here. It is never
-			// resumed, which is what makes the stop uncatchable.
-			run.terminal = true
-			code_mode_lua_latch_message(run, lua_stop_message(run.stop))
-			run.last_event = .Stopped
-			return .Stopped
-		}
 		if run.request.pending {
 			run.last_event = .Host_Request
 			return .Host_Request
+		}
+		if run.stop_requested {
+			run.terminal = true
+			code_mode_lua_latch_message(run, "the execution was cancelled")
+			run.last_event = .Stopped
+			return .Stopped
 		}
 		run.last_event = .Slice
 		return .Slice
 	case .ERRMEM:
 		run.terminal = true
 		run.failure = .Memory
-		if run.memory_limited {
-			run.message = strings.clone("the execution exceeded its memory budget", run.allocator) or_else ""
-		} else {
-			code_mode_lua_capture_message(run)
-		}
+		code_mode_lua_capture_message(run)
 		run.last_event = .Failed
 		return .Failed
 	case .ERRRUN, .ERRSYNTAX, .ERRERR, .ERRFILE:
@@ -745,21 +602,6 @@ code_mode_lua_step :: proc(run: ^Lua_Run, nargs: int) -> Lua_Event {
 	code_mode_lua_latch_message(run, "the execution ended in an unknown state")
 	run.last_event = .Failed
 	return .Failed
-}
-
-@(private)
-lua_stop_message :: proc(stop: Lua_Stop) -> string {
-	switch stop {
-	case .None:
-		return ""
-	case .Cancelled:
-		return "the execution was cancelled"
-	case .Deadline:
-		return "the execution exceeded its time budget"
-	case .Instructions:
-		return "the execution exceeded its instruction budget"
-	}
-	return ""
 }
 
 // code_mode_lua_capture_message copies the error on top of the coroutine stack,
@@ -778,16 +620,12 @@ code_mode_lua_capture_message :: proc(run: ^Lua_Run) {
 code_mode_lua_latch_message :: proc(run: ^Lua_Run, text: string) {
 	delete(run.message, run.allocator)
 	body := text
-	if len(body) > LUA_MAX_MESSAGE_BYTES {
-		body = code_mode_lua_truncate_runes(body, LUA_MAX_MESSAGE_BYTES)
-		run.message_truncated = true
-	}
+	if len(body) > LUA_MAX_MESSAGE_BYTES { body = code_mode_lua_truncate_runes(body, LUA_MAX_MESSAGE_BYTES) }
 	run.message = strings.clone(body, run.allocator) or_else ""
 }
 
-// code_mode_lua_request_stop asks the run to stop at its next checkpoint. The request
-// is latched: a script cannot cancel it, and a run that already stopped keeps its
-// first reason.
+// code_mode_lua_request_stop asks the run to stop at its next slice. The request is
+// latched: a script cannot cancel it.
 code_mode_lua_request_stop :: proc(run: ^Lua_Run) {
 	if run == nil { return }
 	run.stop_requested = true
@@ -835,26 +673,6 @@ code_mode_lua_logs_truncated :: proc(run: ^Lua_Run) -> bool {
 code_mode_lua_failure :: proc(run: ^Lua_Run) -> Lua_Failure {
 	if run == nil { return .Runtime }
 	return run.failure
-}
-
-code_mode_lua_stop :: proc(run: ^Lua_Run) -> Lua_Stop {
-	if run == nil { return .None }
-	return run.stop
-}
-
-code_mode_lua_instructions :: proc(run: ^Lua_Run) -> u64 {
-	if run == nil { return 0 }
-	return run.instructions
-}
-
-code_mode_lua_memory_used :: proc(run: ^Lua_Run) -> int {
-	if run == nil { return 0 }
-	return run.memory_used
-}
-
-code_mode_lua_memory_peak :: proc(run: ^Lua_Run) -> int {
-	if run == nil { return 0 }
-	return run.memory_peak
 }
 
 code_mode_lua_returned_values :: proc(run: ^Lua_Run) -> int {

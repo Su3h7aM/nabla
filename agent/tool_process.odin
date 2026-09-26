@@ -46,7 +46,7 @@ TOOL_SPAWN_EXEC_FAILED :: u8(1)
 // `shell -c command`, unchanged.
 tool_spawn_shell_flags :: proc(shell: string) -> (first, second: cstring) {
 	name := shell
-	if i := strings.last_index_byte(shell, '/'); i >= 0 { name = shell[i+1:] }
+	if i := strings.last_index_byte(shell, '/'); i >= 0 { name = shell[i + 1:] }
 	if name == "fish" { return cstring("--private"), nil }
 	return nil, nil
 }

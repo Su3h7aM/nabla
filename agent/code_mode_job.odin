@@ -24,7 +24,7 @@ tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job
 		return
 	}
 
-	run, compiled := code_mode_lua_start(job.allocator, lua_limits_default(), source)
+	run, compiled := code_mode_lua_start(source, allocator = job.allocator)
 	if run == nil {
 		job.result = code_mode_job_failure(job, .Tool_Failed, .Unavailable, "the Lua execution could not be created", "executor unavailable")
 		job.result_present = true
@@ -102,23 +102,7 @@ tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Jo
 	case .Returned:
 		tool_job_lua_finish(job)
 	case .Stopped:
-		outcome := session.Tool_Outcome.Tool_Failed
-		diagnostic := Code_Mode_Diagnostic.Instruction_Limit
-		reason := "stopped"
-		switch job.lua.stop {
-		case .Cancelled:
-			outcome = .Cancelled
-			diagnostic = .Cancelled
-			reason = "cancelled"
-		case .Deadline:
-			outcome = .Timed_Out
-			diagnostic = .Deadline
-			reason = "timed out"
-		case .Instructions:
-			reason = "instruction limit"
-		case .None:
-		}
-		job.result = code_mode_job_failure(job, outcome, diagnostic, code_mode_lua_message(job.lua), reason)
+		job.result = code_mode_job_failure(job, .Cancelled, .Cancelled, code_mode_lua_message(job.lua), "cancelled")
 		job.result_present = true
 		job.phase = .Result_Ready
 	case .Failed:
@@ -127,7 +111,7 @@ tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Jo
 		case .Syntax:
 			diagnostic = .Syntax_Error
 		case .Memory:
-			diagnostic = .Memory_Limit
+			diagnostic = .Out_Of_Memory
 		case .None, .Runtime:
 		}
 		job.result = code_mode_job_failure(job, .Tool_Failed, diagnostic, code_mode_lua_message(job.lua), "Lua failed")

@@ -54,7 +54,9 @@ shell_test_clear_shell :: proc(t: ^testing.T) {
 
 @(test)
 test_shell_missing_child_is_not_a_successful_exit :: proc(t: ^testing.T) {
-	child := Tool_Child{pid = 1}
+	child := Tool_Child {
+		pid = 1,
+	}
 	testing.expect(t, tool_child_poll(&child), "a process that is not our child cannot be waited on")
 	exited, _, waited := tool_child_reap(&child)
 	testing.expect(t, !waited && !exited, "an absent child has no known exit status")
@@ -226,9 +228,5 @@ test_shell_runs_fish_without_touching_history :: proc(t: ^testing.T) {
 
 	result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"printf payload"}`)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-	testing.expect(
-		t,
-		strings.contains(result.content, `ran-as-fish --private -c printf payload`),
-		"fish runs the command with history disabled",
-	)
+	testing.expect(t, strings.contains(result.content, `ran-as-fish --private -c printf payload`), "fish runs the command with history disabled")
 }

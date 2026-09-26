@@ -193,7 +193,16 @@ chat_try_context_repair :: proc(
 	attempts: int,
 ) -> Chat_Repair_Refusal {
 	previous_estimate := prep.estimate
-	refusal := chat_repair_context(chat, connection, observer, prep, encoded, previous_estimate, websocket_request, virtual.arena_allocator(&chat.chain.scratch))
+	refusal := chat_repair_context(
+		chat,
+		connection,
+		observer,
+		prep,
+		encoded,
+		previous_estimate,
+		websocket_request,
+		virtual.arena_allocator(&chat.chain.scratch),
+	)
 	if refusal != .None {
 		chat.turn_repair_refusal = refusal
 		// The session keeps the pressure, so the next safe boundary starts the summary
@@ -576,12 +585,7 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	// failure it is told about finds it.
 	_observer_retry_scheduled(
 		chain.observer,
-		{
-			request_no = chain.request_no,
-			next_attempt = chain.attempts + 1,
-			failure_class = chain.operation_error.failure_class,
-			delay = chain.decision.delay,
-		},
+		{request_no = chain.request_no, next_attempt = chain.attempts + 1, failure_class = chain.operation_error.failure_class, delay = chain.decision.delay},
 	)
 	binding: Log_Binding
 	previous_logger := context.logger

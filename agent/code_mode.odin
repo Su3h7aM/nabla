@@ -5,7 +5,7 @@ import "core:encoding/json"
 import "nabla:agent/session"
 
 TOOL_CODE_NAME :: "builtin_code"
-TOOL_CODE_DESCRIPTION :: "Execute bounded Lua 5.4 code. Call an available tool through the tools table by its name, for example tools.builtin_read({path = 'README.md'}). Each call suspends the script until the tool finishes and returns its complete JSON result envelope as a Lua table. Use json.null for JSON null, because Lua nil means absence. The chunk returns at most one value, which becomes the data field of this result."
+TOOL_CODE_DESCRIPTION :: "Execute Lua 5.4 code. Call an available tool through the tools table by its name, for example tools.builtin_read({path = 'README.md'}). Each call suspends the script until the tool finishes and returns its complete JSON result envelope as a Lua table. Use json.null for JSON null, because Lua nil means absence. The chunk returns at most one value, which becomes the data field of this result."
 TOOL_CODE_SCHEMA :: `{"type":"object","properties":{"code":{"type":"string","description":"Lua 5.4 source code to execute."}},"required":["code"],"additionalProperties":false}`
 
 // Code_Mode_Call is one tool call a script made, as the script's result reports it. It is
@@ -50,25 +50,21 @@ Code_Mode_Diagnostic :: enum {
 	Syntax_Error,
 	Runtime_Error,
 	Invalid_Value,
-	Memory_Limit,
-	Instruction_Limit,
+	Out_Of_Memory,
 	Output_Limit,
 	Cancelled,
-	Deadline,
 	Unavailable,
 }
 
 @(private)
 code_mode_diagnostic_names := [Code_Mode_Diagnostic]string {
-	.Syntax_Error      = "syntax_error",
-	.Runtime_Error     = "runtime_error",
-	.Invalid_Value     = "invalid_value",
-	.Memory_Limit      = "memory_limit",
-	.Instruction_Limit = "instruction_limit",
-	.Output_Limit      = "output_limit",
-	.Cancelled         = "cancelled",
-	.Deadline          = "deadline",
-	.Unavailable       = "unavailable",
+	.Syntax_Error  = "syntax_error",
+	.Runtime_Error = "runtime_error",
+	.Invalid_Value = "invalid_value",
+	.Out_Of_Memory = "out_of_memory",
+	.Output_Limit  = "output_limit",
+	.Cancelled     = "cancelled",
+	.Unavailable   = "unavailable",
 }
 
 code_mode_diagnostic_name :: proc(diagnostic: Code_Mode_Diagnostic) -> string {

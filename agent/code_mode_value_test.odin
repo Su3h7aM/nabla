@@ -7,7 +7,7 @@ import "core:strings"
 import "core:testing"
 
 code_mode_value_test_start :: proc(t: ^testing.T, source: string) -> ^Lua_Run {
-	run, compiled := code_mode_lua_start(context.allocator, lua_limits_default(), source)
+	run, compiled := code_mode_lua_start(source)
 	if run == nil { testing.fail_now(t, "the execution could not be created") }
 	if !compiled {
 		code_mode_lua_destroy(run)

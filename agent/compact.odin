@@ -601,7 +601,16 @@ chat_compact_start :: proc(
 	covered := entries[seam - 1].seq
 
 	compact_prep: Chat_Request_Prep
-	chat_build_request_into(chat, &compact_prep, entries[:seam], prep.history.dispatches, prep.history.summary, connection, CHAT_COMPACT_DIRECTIVE, chat.allocator)
+	chat_build_request_into(
+		chat,
+		&compact_prep,
+		entries[:seam],
+		prep.history.dispatches,
+		prep.history.summary,
+		connection,
+		CHAT_COMPACT_DIRECTIVE,
+		chat.allocator,
+	)
 	defer chat_request_prep_destroy(&compact_prep, chat.allocator)
 
 	// The request carries the same rule as any other: it asks for the room the window has

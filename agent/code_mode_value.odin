@@ -222,17 +222,13 @@ code_mode_lua_returned_json :: proc(run: ^Lua_Run, allocator: mem.Allocator) -> 
 }
 
 // code_mode_lua_deliver_json decodes one existing tool result envelope and pushes it
-// as the pending call's single Lua result. It uses the boundary's host reserve for the
-// allocation-capable C API calls.
+// as the pending call's single Lua result.
 code_mode_lua_deliver_json :: proc(run: ^Lua_Run, text: string, allocator: mem.Allocator) -> Lua_Event {
 	if run == nil || run.thread == nil || !run.request.pending { return .Failed }
 	value, parse_err := json.parse_string(text, .JSON, true, allocator)
 	if parse_err != nil { return .Failed }
 	defer json.destroy_value(value, allocator)
-	code_mode_lua_host_enter(run)
-	ok := code_mode_json_push(run, value, 0)
-	code_mode_lua_host_leave(run)
-	if !ok { return .Failed }
+	if !code_mode_json_push(run, value, 0) { return .Failed }
 	return code_mode_lua_deliver(run, 1)
 }
 

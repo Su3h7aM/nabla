@@ -762,7 +762,11 @@ test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T
 	// must not fail: the failure becomes feedback and the turn prepares again.
 	source := chat_session_event_source(chat)
 	message := strings.clone("malformed provider stream event", chat.mailbox.allocator)
-	event: Chat_Event = Chat_Failure_Event{source = source, kind = .Invalid_Data, message = message}
+	event: Chat_Event = Chat_Failure_Event {
+		source  = source,
+		kind    = .Invalid_Data,
+		message = message,
+	}
 	chat_session_apply(chat, &event)
 	chat_event_destroy(&event, chat.mailbox.allocator)
 	testing.expect(t, !chat.active_failed, "an unreadable response must not fail the turn")
@@ -781,7 +785,10 @@ test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T
 		failure_class = .Invalid_Output,
 		detail        = strings.clone("malformed provider stream event", chat.mailbox.allocator),
 	}
-	chat.chain.decision = {action = .Stop, reason = .Terminal_Failure}
+	chat.chain.decision = {
+		action = .Stop,
+		reason = .Terminal_Failure,
+	}
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
 	chat_chain_commit(chat, &usages)
@@ -885,20 +892,20 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 	probe_first: Tool_Policy_Probe
 	probe_second: Tool_Policy_Probe
 	first := Tool_Definition {
-		name = "test_probe_first",
-		description = "First probe tool.",
+		name         = "test_probe_first",
+		description  = "First probe tool.",
 		input_schema = `{"type":"object"}`,
-		timeout = 5 * time.Second,
-		execute = tool_policy_probe_execute,
-		backend = &probe_first,
+		timeout      = 5 * time.Second,
+		execute      = tool_policy_probe_execute,
+		backend      = &probe_first,
 	}
 	second := Tool_Definition {
-		name = "test_probe_second",
-		description = "Second probe tool.",
+		name         = "test_probe_second",
+		description  = "Second probe tool.",
 		input_schema = `{"type":"object"}`,
-		timeout = 30 * time.Second,
-		execute = tool_policy_probe_execute,
-		backend = &probe_second,
+		timeout      = 30 * time.Second,
+		execute      = tool_policy_probe_execute,
+		backend      = &probe_second,
 	}
 	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, first).kind, Tool_Registry_Error_Kind.None) { return }
 	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, second).kind, Tool_Registry_Error_Kind.None) { return }

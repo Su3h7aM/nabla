@@ -387,16 +387,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 // exhausted, growth doubles it, and the raised budget is kept. Each pool pays
 // this once per session, so the storage settles at what this session used
 // instead of a reservation sized for the worst case.
-conversation_solve :: proc(
-	app: ^App,
-	storage: ^Frame_Storage,
-	viewport: layout.Vec2,
-	width: int,
-	offset: int,
-) -> (
-	layout.Frame_Result,
-	bool,
-) {
+conversation_solve :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int) -> (layout.Frame_Result, bool) {
 	declare_conversation(app, storage, viewport, width, offset)
 	frame_result, frame_error := layout.result(&storage.layout_ctx)
 	for _ in 0 ..< CONVERSATION_GROW_ATTEMPTS {

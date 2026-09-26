@@ -265,11 +265,7 @@ test_transcript_drops_the_oldest_line_at_its_budget :: proc(t: ^testing.T) {
 	testing.expect(t, len(app.run.snap.entries) < 32, "the oldest lines must leave the screen")
 	// The dropped lines' text is released, not merely hidden: two mebibytes were
 	// appended and the live set is the budget plus the notice.
-	testing.expect(
-		t,
-		track.current_memory_allocated <= TRANSCRIPT_MAX_BYTES + 64 * 1024,
-		"dropped lines must release their text",
-	)
+	testing.expect(t, track.current_memory_allocated <= TRANSCRIPT_MAX_BYTES + 64 * 1024, "dropped lines must release their text")
 }
 
 // The budget covers the entries themselves, not only their text: a run of very

@@ -209,7 +209,10 @@ chat_request_input_json :: proc(
 	entry_count: int,
 	attempt: Chat_Attempt,
 	body: []u8,
-) -> (string, Chat_Record_Error) {
+) -> (
+	string,
+	Chat_Record_Error,
+) {
 	input, input_error := chat_request_input_make(prep, history, snapshot_seq, entry_count, body)
 	if input_error != .None { return "", input_error }
 	chat_request_input_situate(&input, attempt)
@@ -226,7 +229,10 @@ chat_request_input_make :: proc(
 	snapshot_seq: Maybe(session.Seq),
 	entry_count: int,
 	body: []u8,
-) -> (Chat_Request_Input, Chat_Record_Error) {
+) -> (
+	Chat_Request_Input,
+	Chat_Record_Error,
+) {
 	tools, tools_error := make([dynamic]Chat_Request_Tool, len(prep.request.Tools), context.temp_allocator)
 	if tools_error != nil { return {}, .Allocation }
 	for definition, index in prep.request.Tools {

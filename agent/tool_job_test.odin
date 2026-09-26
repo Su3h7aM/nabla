@@ -252,7 +252,7 @@ test_nested_tool_storage_failure_frees_with_worker_allocator :: proc(t: ^testing
 	jobs.allocator = mem.tracking_allocator(&session_track)
 	defer tool_jobs_destroy(&jobs)
 
-	run, compiled := code_mode_lua_start(context.allocator, lua_limits_default(), `return tools.test({})`)
+	run, compiled := code_mode_lua_start(`return tools.test({})`)
 	if run == nil { testing.fail_now(t, "the Lua run could not be created") }
 	defer code_mode_lua_destroy(run)
 	if !compiled { testing.fail_now(t, "the Lua test chunk did not compile") }
@@ -284,35 +284,6 @@ test_nested_tool_storage_failure_frees_with_worker_allocator :: proc(t: ^testing
 	testing.expect(t, chat_session_storage_failed(chat), "the refused child record latches storage failure")
 	testing.expect_value(t, len(worker_track.allocation_map), 0)
 	testing.expect_value(t, len(session_track.bad_free_array), 0)
-}
-
-// A stopped execution says which limit stopped it, so the failure is branchable rather
-// than prose. The outcome stays what the harness observed; the kind names the fault.
-@(test)
-test_code_mode_reports_which_limit_stopped_it :: proc(t: ^testing.T) {
-	test: Tool_Test
-	tool_test_begin(t, &test)
-	defer tool_test_end(t, &test)
-	chat := &test.fixture.chat
-	_test_stage_call(t, chat, "call_code", `{"code":"while true do end"}`, TOOL_CODE_NAME)
-
-	jobs: Tool_Jobs
-	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
-	defer tool_jobs_destroy(&jobs)
-	tool_jobs_submit(&jobs, chat, {})
-	tool_job_test_drain(t, &test, &jobs)
-
-	entries := _test_entries(t, chat)
-	defer session.entries_destroy(entries, context.allocator)
-	recorded := false
-	for entry in entries {
-		result, is_result := entry.payload.(session.Tool_Result_Entry)
-		if !is_result { continue }
-		recorded = true
-		testing.expect_value(t, result.outcome, session.Tool_Outcome.Tool_Failed)
-		testing.expect(t, strings.contains(result.content, `"kind":"instruction_limit"`), result.content)
-	}
-	testing.expect(t, recorded, "a stopped execution still answers its call")
 }
 
 // Admission must preserve every call the provider committed, including a batch larger

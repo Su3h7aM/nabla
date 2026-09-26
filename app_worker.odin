@@ -548,7 +548,9 @@ snap_append :: proc(app: ^App, kind: Entry_Kind, text: string) {
 // snap_entry_make builds one transcript entry: the allocator its text belongs to,
 // a fresh identity, and the display text when there is any.
 snap_entry_make :: proc(app: ^App, kind: Entry_Kind, text: string) -> Entry {
-	entry := Entry{kind = kind}
+	entry := Entry {
+		kind = kind,
+	}
 	entry.text.allocator = app.run.alloc
 	app.run.snap.next_entry_id += 1
 	entry.id = app.run.snap.next_entry_id
