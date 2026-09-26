@@ -106,7 +106,7 @@ cover what you touched, and leave them green before committing. `mise run test` 
 gate: every in-package suite in release and `-debug`, then the external harnesses. A change to a
 document or a comment runs nothing, because it compiles nothing and asserts nothing.
 
-Linux is the only platform built and tested today; macOS and the BSDs are expected later. Reach the operating system through Odin's portable packages first: `core:os`, `core:sync`, `core:thread`, `core:time`, `core:net`, `core:nbio`, and `core:sys/posix` where POSIX covers the need. When no portable interface exists, keep the platform call in a `_linux.odin` file behind a package-local procedure, so another platform adds a file instead of changing its callers. Do not write branches for platforms the project does not build yet.
+Linux is the only platform built and tested today; macOS and the BSDs are expected later. Reach the operating system through Odin's portable packages first: `core:os`, `core:sync`, `core:thread`, `core:time`, `core:net`, `core:nbio`, and `core:sys/posix` where POSIX covers the need. When no portable interface exists, keep the platform call in a `_linux.odin` file behind a package-local procedure, so another platform adds a file instead of changing its callers. Do not write branches for platforms the project does not build yet. Keep C types (`core:c`, `posix.FD`, `posix.pid_t`, errno enums) inside the code that makes the foreign call, and convert to Odin types (`int`, `^os.File`, `os.Error`, a local enum) before anything leaves it.
 
 ## Writing code
 

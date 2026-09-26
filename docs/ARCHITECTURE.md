@@ -71,6 +71,7 @@ When a request, a response, or a tool fails, the next step is to tell the model 
 
 - Concrete structs, enums, `bit_set`, enumerated arrays (`[Enum]T`), tagged unions, `Maybe(T)`, `distinct` integer IDs, slices, and small fixed arrays. Closed control domains use a union or enum with an exhaustive `switch`; `#partial switch` only where the ignored cases are listed in a comment.
 - Stable wire names use enumerated-array tables (`[Record_Kind]string`), never enum formatting.
+- C types (`core:c`, `posix.FD`, `posix.pid_t`, `linux.Fd`, errno enums) stay inside the procedure or platform file that makes the foreign call. What that code exposes to the rest of the codebase uses Odin types (`int`, `bool`, `^os.File`, `os.Error`, a local enum), converted at that boundary.
 - No `any`, `rawptr`, property maps, or string-typed fields where the shape is known. `rawptr` is confined to FFI (Lua, SQLite) and to procedure-pointer executor boundaries.
 - No service locators, interfaces for single implementations, generic reducers, event buses, plugin lifecycles, or allocator wrappers per component. Procedure pointers exist only at real substitution boundaries: provider API family in `ai`, MCP backend, journal writer sink for tests, frontend output writer.
 - Fixed-size temporary data uses fixed arrays (`[2]db.Value`), not dynamic arrays in scratch.
