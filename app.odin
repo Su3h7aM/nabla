@@ -466,10 +466,6 @@ tui_run :: proc(
 	agent.chat_interactive_arm(&app.run.signals)
 	defer agent.chat_interactive_disarm(&app.run.signals)
 
-	// The watcher reports a loop that stops returning. It is started with the
-	// worker, so a front-end that never reaches its first frame is covered too.
-	_ = watchdog_start(app)
-
 	worker := thread.create(run_worker, name = "nabla-tui-worker")
 	if worker == nil {
 		fmt.eprintln("nabla: cannot start the worker thread")
@@ -488,14 +484,12 @@ tui_run :: proc(
 
 	read_failed := false
 	for !app.quit {
-		watchdog_stage(app, .Waiting)
 		_, read_err := input.read_events(&app.parser, app.tty, &app.raw, TUI_POLL_MS)
 		if read_err != nil {
 			fmt.eprintln("nabla: input:", read_err)
 			read_failed = true
 			break
 		}
-		watchdog_stage(app, .Events)
 		for event in app.raw {
 			handle_event(app, event)
 		}
@@ -508,7 +502,6 @@ tui_run :: proc(
 		// either. The stop check below runs on this pass too, because a front-end
 		// that silently stopped drawing and stopped listening for a quit is a
 		// process nothing but a signal can end.
-		watchdog_stage(app, .Viewport)
 		viewport, vp_err := term.viewport(app.terminal)
 		sizable := vp_err == nil
 		resized := false
@@ -526,10 +519,7 @@ tui_run :: proc(
 		}
 
 		// The working indicator animates only while a request is active, so a
-		// silent request (no stream events, tools running) still advances it. The
-		// runtime reads that follow wait on the mutex the worker publishes through,
-		// so they are the phase a front-end waits in rather than runs in.
-		watchdog_stage(app, .Runtime)
+		// silent request (no stream events, tools running) still advances it.
 		now := time.tick_now()
 		busy := runtime_busy(app)
 		// A steering line applies at a request boundary inside the turn that was running
@@ -539,7 +529,6 @@ tui_run :: proc(
 		// than work started on their behalf.
 		if app.steer_active && !busy { restore_steering(app) }
 		app.steer_active = busy
-		watchdog_observe(app, busy, sizable)
 		advance_spinner := busy && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
 		// A startup chooser closes once its selection applies on the worker; a menu
 		// opened from the prompt closes on submit instead, so browsing it does not
@@ -558,7 +547,6 @@ tui_run :: proc(
 			app.menu.required = required
 		}
 		if sizable && (count > 0 || resized || recovered || generation_changed(app) || advance_spinner || catalog_updated) {
-			watchdog_stage(app, .Drawing)
 			if advance_spinner {
 				app.spin_frame = (app.spin_frame + 1) % SPINNER_FRAMES
 				app.spin_lap = now
@@ -570,7 +558,6 @@ tui_run :: proc(
 		// quit when idle. A cancel this front-end requested through a key is
 		// cleared once its turn retired, so it ends the turn only; an outside
 		// signal ends the session once the turn retired.
-		watchdog_stage(app, .Stop)
 		if agent.chat_cancel_requested() && !runtime_busy(app) {
 			if app.cancel_seen {
 				app.cancel_seen = false
@@ -614,10 +601,6 @@ report_viewport_unavailable :: proc(app: ^App, err: term.Error) {
 // long each thread is given, so a test can hold the give-up path without waiting for the
 // bound a real shutdown uses.
 app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
-	// Stopping is the phase where a front-end waits for other threads, so the
-	// watcher covers it: a run that will not exit otherwise leaves nothing after
-	// its last frame.
-	watchdog_stage(app, .Teardown)
 	retired := catalog_refresh_stop(app, patience)
 	if app.run.work != {} {
 		chan.close(&app.run.work)
@@ -665,13 +648,6 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 	input.parser_destroy(&app.parser)
 	input.events_destroy(&app.raw, app.run.alloc)
 	frame_storage_destroy(app.storage)
-	// The watcher stops here: after every thread it could report has been joined,
-	// and before the log it writes to is closed.
-	retired = watchdog_stop(app, patience)
-	if !retired {
-		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.teardown_abandoned"})
-		return
-	}
 	// A tool worker that ignored its stop still borrows the session's workspace, registry
 	// generation, and backends, so none of that may be released. The process exits with
 	// what that worker can still reach, and the record names why.
