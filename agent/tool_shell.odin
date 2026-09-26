@@ -4,7 +4,6 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:strings"
-import "core:sys/posix"
 import "core:time"
 import "core:unicode/utf8"
 
@@ -116,7 +115,7 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_She
 // and with the portable shell when that shell cannot be started. Only a command
 // that never started is tried twice: a shell that ran it has already had its
 // effects, and running it again would repeat them.
-tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write: posix.FD) -> (pid: posix.pid_t, started: bool) {
+tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write: ^os.File) -> (pid: int, started: bool) {
 	shell := tool_shell_preferred()
 	pid, started = tool_spawn_grouped(shell, command, directory, stdout_write, stderr_write)
 	if started || shell == TOOL_SHELL_FALLBACK { return pid, started }
@@ -153,7 +152,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 		return tool_shell_not_started(ctx, stderr_error, data)
 	}
 	defer os.close(stderr_read)
-	pid, spawned := tool_shell_start(args.command, directory, posix.FD(os.fd(stdout_write)), posix.FD(os.fd(stderr_write)))
+	pid, spawned := tool_shell_start(args.command, directory, stdout_write, stderr_write)
 	_ = os.close(stdout_write)
 	_ = os.close(stderr_write)
 	if !spawned { return tool_shell_finish(ctx, .Tool_Failed, TOOL_SHELL_NOT_STARTED, data) }
@@ -161,16 +160,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 	child := Tool_Child {
 		pid = pid,
 	}
-	stop := tool_drain_pipes(
-		&child,
-		posix.FD(os.fd(stdout_read)),
-		posix.FD(os.fd(stderr_read)),
-		time.tick_now(),
-		args.timeout,
-		ctx.control,
-		&data,
-		ctx.allocator,
-	)
+	stop := tool_drain_pipes(&child, stdout_read, stderr_read, time.tick_now(), args.timeout, ctx.control, &data, ctx.allocator)
 	switch stop {
 	case .Cancelled:
 		return tool_shell_finish(ctx, .Cancelled, "the command was cancelled", data, "cancelled")
