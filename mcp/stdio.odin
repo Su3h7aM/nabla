@@ -1,9 +1,10 @@
 package mcp
 
+import "core:fmt"
 import "core:mem"
+import "core:os"
 import "core:strings"
 import "core:sync"
-import linux "core:sys/linux"
 import "core:thread"
 import "core:time"
 
@@ -123,16 +124,15 @@ stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.al
 	}
 
 	// A dead peer must be an error, not a signal that kills the harness.
-	previous_sigpipe: linux.Sig_Action
-	if !stdio_sigpipe_acquire(&previous_sigpipe) {
-		return error_make(.Spawn_Failed, "the SIGPIPE disposition could not be saved", allocator = allocator)
+	if sigpipe_error := stdio_sigpipe_acquire(); sigpipe_error != nil {
+		return stdio_spawn_error("the SIGPIPE disposition could not be saved", sigpipe_error, allocator)
 	}
 	stdio.sigpipe_owned = true
-	pipes, child, spawned := stdio_spawn(name, raw_data(argv), raw_data(envp), directory)
-	if !spawned {
+	pipes, child, spawn_error := stdio_spawn(name, raw_data(argv), raw_data(envp), directory)
+	if spawn_error != nil {
 		stdio_sigpipe_release()
 		stdio.sigpipe_owned = false
-		return error_make(.Spawn_Failed, allocator = allocator)
+		return stdio_spawn_error("the server process could not be started", spawn_error, allocator)
 	}
 
 	stdio.pipes = pipes
@@ -165,9 +165,12 @@ stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.al
 		stdio.stderr_tail.allocator = allocator
 	}
 	// An end that is never polled would leave the server able to block mid-write.
-	stdio_set_nonblocking(stdio.pipes.stdin)
-	stdio_set_nonblocking(stdio.pipes.stdout)
-	stdio_set_nonblocking(stdio.pipes.stderr)
+	for file in ([3]^os.File{stdio.pipes.stdin, stdio.pipes.stdout, stdio.pipes.stderr}) {
+		if blocking_error := stdio_set_nonblocking(file); blocking_error != nil {
+			stdio_stop(stdio)
+			return stdio_spawn_error("the server's pipes could not be made non-blocking", blocking_error, allocator)
+		}
+	}
 
 	stdio.stderr_stop = false
 	stdio.stderr_thread = thread.create(stdio_stderr_serve)
@@ -180,29 +183,38 @@ stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.al
 	return {}
 }
 
+// stdio_spawn_error is a start failure that names what failed and the system's
+// reason for it.
+@(private)
+stdio_spawn_error :: proc(what: string, cause: os.Error, allocator: mem.Allocator) -> Error {
+	return error_make(.Spawn_Failed, fmt.tprintf("%s: %s", what, os.error_string(cause)), allocator)
+}
+
 // stdio_stop shuts the server down and releases the transport's buffers. Closing
 // the server's input is the portable graceful signal, so it is tried first, and
 // the process group is escalated to only if the server does not go.
 stdio_stop :: proc(stdio: ^Stdio) {
 	if stdio.started {
-		_ = linux.close(stdio.pipes.stdin)
+		_ = os.close(stdio.pipes.stdin)
 		grace := time.tick_add(time.tick_now(), STDIO_KILL_GRACE)
 		for !stdio_child_poll(&stdio.child) {
 			if time.tick_since(grace) >= 0 { break }
 			time.sleep(5 * time.Millisecond)
 		}
 		if !stdio.child.reaped { stdio_terminate_group(&stdio.child) }
-		// The child is gone, so its ends of the remaining pipes are closed and the
-		// drainer reaches end of stream on its own.
-		_ = linux.close(stdio.pipes.stdout)
-		_ = linux.close(stdio.pipes.stderr)
-		stdio.started = false
 	}
+	// The drainer still reads standard error, so it is joined before that pipe
+	// end closes.
 	if stdio.stderr_thread != nil {
 		sync.atomic_store(&stdio.stderr_stop, true)
 		thread.join(stdio.stderr_thread)
 		thread.destroy(stdio.stderr_thread)
 		stdio.stderr_thread = nil
+	}
+	if stdio.started {
+		_ = os.close(stdio.pipes.stdout)
+		_ = os.close(stdio.pipes.stderr)
+		stdio.started = false
 	}
 	delete(stdio.line)
 	delete(stdio.out)
@@ -239,7 +251,7 @@ stdio_write_line :: proc(stdio: ^Stdio, message: string, control: Control) -> Er
 
 	written := 0
 	for written < len(stdio.out) {
-		ready, stop := stdio_wait(stdio.pipes.stdin, {.OUT}, control)
+		ready, stop := stdio_wait(stdio.pipes.stdin, .Write, control)
 		if stop != .None { return control_error(stop, .Not_Delivered, stdio.allocator) }
 		if !ready {
 			if stdio_child_poll(&stdio.child) {
@@ -247,12 +259,9 @@ stdio_write_line :: proc(stdio: ^Stdio, message: string, control: Control) -> Er
 			}
 			continue
 		}
-		count, write_errno := linux.write(stdio.pipes.stdin, stdio.out[written:])
-		if write_errno == .EAGAIN || write_errno == .EINTR { continue }
-		if write_errno != .NONE {
-			return stdio_transport_error(stdio, .Write_Failed, .Not_Delivered)
-		}
-		if count <= 0 { return stdio_transport_error(stdio, .Write_Failed, .Not_Delivered) }
+		count, status := stdio_write(stdio.pipes.stdin, stdio.out[written:])
+		if status == .Again { continue }
+		if status == .Failed || count <= 0 { return stdio_transport_error(stdio, .Write_Failed, .Not_Delivered) }
 		written += count
 	}
 	return {}
@@ -275,7 +284,7 @@ stdio_read_line :: proc(stdio: ^Stdio, control: Control) -> (line: []u8, err: Er
 		if stop := control_stop(control); stop != .None {
 			return nil, control_error(stop, .Delivered, stdio.allocator)
 		}
-		ready, stop := stdio_wait(stdio.pipes.stdout, {.IN}, control)
+		ready, stop := stdio_wait(stdio.pipes.stdout, .Read, control)
 		if stop != .None { return nil, control_error(stop, .Delivered, stdio.allocator) }
 		if !ready {
 			// A hangup with nothing left to read is the end of the stream, and a
@@ -286,9 +295,9 @@ stdio_read_line :: proc(stdio: ^Stdio, control: Control) -> (line: []u8, err: Er
 			continue
 		}
 		buffer: [4096]u8
-		count, read_errno := linux.read(stdio.pipes.stdout, buffer[:])
-		if read_errno == .EAGAIN || read_errno == .EINTR { continue }
-		if read_errno != .NONE || count <= 0 {
+		count, status := stdio_read(stdio.pipes.stdout, buffer[:])
+		if status == .Again { continue }
+		if status == .Failed || count <= 0 {
 			kind := Error_Kind.End_Of_Stream
 			if stdio_child_poll(&stdio.child) { kind = .Server_Exited }
 			return nil, stdio_transport_error(stdio, kind, .Delivered)
@@ -348,13 +357,12 @@ stdio_stderr_serve :: proc(thread: ^thread.Thread) {
 	stdio := cast(^Stdio)thread.data
 	buffer: [4096]u8
 	for !sync.atomic_load(&stdio.stderr_stop) {
-		fds := [1]linux.Poll_Fd{{fd = stdio.pipes.stderr, events = {.IN}}}
-		count, poll_errno := linux.poll(fds[:], STDIO_POLL_SLICE_MS)
-		if poll_errno != .NONE { return }
-		if count <= 0 { continue }
-		read_count, read_errno := linux.read(stdio.pipes.stderr, buffer[:])
-		if read_errno == .EAGAIN || read_errno == .EINTR { continue }
-		if read_errno != .NONE || read_count <= 0 { return }
+		ready, failed := stdio_poll(stdio.pipes.stderr, .Read, STDIO_POLL_SLICE_MS)
+		if failed { return }
+		if !ready { continue }
+		read_count, status := stdio_read(stdio.pipes.stderr, buffer[:])
+		if status == .Again { continue }
+		if status == .Failed || read_count <= 0 { return }
 		sync.mutex_lock(&stdio.stderr_mutex)
 		stdio_tail_append(&stdio.stderr_tail, buffer[:read_count], stdio.allocator)
 		sync.mutex_unlock(&stdio.stderr_mutex)

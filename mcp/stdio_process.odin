@@ -1,209 +1,251 @@
 package mcp
 
 import "core:mem"
+import "core:os"
 import "core:strings"
 import "core:sync"
-import linux "core:sys/linux"
+import "core:sys/posix"
 import "core:time"
 
 // STDIO_KILL_GRACE bounds how long a server may take to exit on SIGTERM before
 // its whole process group is killed outright.
 STDIO_KILL_GRACE :: 500 * time.Millisecond
 
-// Stdio_Pipes is the parent's end of a spawned server's three streams.
+// STDIO_CHILD_SETUP_FAILED is the exit status of a forked child that could not
+// prepare its process group, streams, or directory before exec.
+@(private)
+STDIO_CHILD_SETUP_FAILED :: 1
+
+// STDIO_CHILD_EXEC_FAILED is the exit status of a forked child whose exec failed.
+@(private)
+STDIO_CHILD_EXEC_FAILED :: 127
+
+// Stdio_Pipes is the parent's end of a spawned server's three streams. Each end
+// closes on exec, so no other child the process starts inherits it.
 Stdio_Pipes :: struct {
-	stdin:  linux.Fd,
-	stdout: linux.Fd,
-	stderr: linux.Fd,
+	stdin:  ^os.File,
+	stdout: ^os.File,
+	stderr: ^os.File,
 }
 
-// Stdio_Child tracks one spawned server. The exit status is recorded the first
-// time it is observed, so a caller that polls cannot lose it.
+// Stdio_Child tracks one spawned server until it is reaped.
 Stdio_Child :: struct {
 	pid:    int,
 	reaped: bool,
-	status: u32,
+}
+
+// Stdio_Direction is what a wait on a pipe end waits for.
+Stdio_Direction :: enum {
+	Read,
+	Write,
+}
+
+// Stdio_Io is the outcome of one read or write on a non-blocking pipe end.
+Stdio_Io :: enum {
+	// Ok moved the reported count of bytes; a read of zero bytes is end of stream.
+	Ok,
+	// Again moved nothing: the end was not ready or a signal interrupted the call.
+	Again,
+	Failed,
+}
+
+// stdio_errno is the calling thread's last POSIX error as an os.Error.
+@(private)
+stdio_errno :: proc() -> os.Error {
+	return os.Platform_Error(i32(posix.errno()))
+}
+
+@(private)
+stdio_fd :: proc(file: ^os.File) -> posix.FD {
+	return posix.FD(os.fd(file))
 }
 
 // stdio_spawn starts name in its own process group with a pipe on each standard
 // stream. argv and envp are already-built, nil-terminated vectors, and directory
-// is nil to inherit the parent's.
+// is nil to inherit the parent's. A failure reports the system's reason, including
+// the reason exec gave when the program could not be run.
 //
 // Odin's os.process_start cannot express this: it has no pre-exec hook, so the
 // child cannot create its own process group before it execs, and a group kill
 // would then miss the server's descendants.
 //
-// The child calls nothing that allocates, locks, logs, or enters the runtime:
-// every call below is a raw syscall, and every failure path leaves through
-// exit_group, which runs no atexit handler and flushes no stdio. The harness may
-// have other threads, so none of that would be safe after a fork.
-stdio_spawn :: proc(name: cstring, argv: [^]cstring, envp: [^]cstring, directory: cstring) -> (pipes: Stdio_Pipes, child: Stdio_Child, ok: bool) {
-	stdin_pipe, stdout_pipe, stderr_pipe, setup: [2]linux.Fd
-	if linux.pipe2(&stdin_pipe, {.CLOEXEC}) != .NONE { return {}, {}, false }
-	if linux.pipe2(&stdout_pipe, {.CLOEXEC}) != .NONE {
-		stdio_close_pair(stdin_pipe)
-		return {}, {}, false
-	}
-	if linux.pipe2(&stderr_pipe, {.CLOEXEC}) != .NONE {
-		stdio_close_pair(stdin_pipe)
-		stdio_close_pair(stdout_pipe)
-		return {}, {}, false
-	}
-	// The setup pipe is close-on-exec, so a successful exec closes it and the
-	// parent reads end of stream. A byte arriving instead is the one thing a failed
-	// exec can report.
-	if linux.pipe2(&setup, {.CLOEXEC}) != .NONE {
-		stdio_close_pair(stdin_pipe)
-		stdio_close_pair(stdout_pipe)
-		stdio_close_pair(stderr_pipe)
-		return {}, {}, false
-	}
+// The harness may have other threads, so between fork and exec the child makes
+// only async-signal-safe calls: it allocates, locks, and logs nothing, and every
+// failure leaves through _exit, which runs no atexit handler and flushes no stdio.
+stdio_spawn :: proc(name: cstring, argv: [^]cstring, envp: [^]cstring, directory: cstring) -> (pipes: Stdio_Pipes, child: Stdio_Child, err: os.Error) {
+	stdin_read, stdin_write := os.pipe() or_return
+	defer if err != nil { _ = os.close(stdin_write) }
+	defer _ = os.close(stdin_read)
+	stdout_read, stdout_write := os.pipe() or_return
+	defer if err != nil { _ = os.close(stdout_read) }
+	defer _ = os.close(stdout_write)
+	stderr_read, stderr_write := os.pipe() or_return
+	defer if err != nil { _ = os.close(stderr_read) }
+	defer _ = os.close(stderr_write)
+	// The setup pipe closes on exec, so a successful exec closes it and the parent
+	// reads end of stream. A byte arriving instead is the errno of a failed exec.
+	setup_read, setup_write := os.pipe() or_return
+	defer _ = os.close(setup_read)
 
-	pid, fork_errno := linux.fork()
-	if fork_errno != .NONE {
-		stdio_close_pair(stdin_pipe)
-		stdio_close_pair(stdout_pipe)
-		stdio_close_pair(stderr_pipe)
-		stdio_close_pair(setup)
-		return {}, {}, false
+	child_stdin, child_stdout, child_stderr := stdio_fd(stdin_read), stdio_fd(stdout_write), stdio_fd(stderr_write)
+	report_fd := stdio_fd(setup_write)
+	pid := posix.fork()
+	if pid == -1 {
+		err = stdio_errno()
+		_ = os.close(setup_write)
+		return
 	}
 	if pid == 0 {
-		if linux.setpgid(0, 0) != .NONE { linux.exit_group(1) }
-		_ = linux.close(stdin_pipe[1])
-		if _, dup_errno := linux.dup2(stdin_pipe[0], 0); dup_errno != .NONE { linux.exit_group(1) }
-		_ = linux.close(stdin_pipe[0])
-		_ = linux.close(stdout_pipe[0])
-		if _, dup_errno := linux.dup2(stdout_pipe[1], 1); dup_errno != .NONE { linux.exit_group(1) }
-		_ = linux.close(stdout_pipe[1])
-		_ = linux.close(stderr_pipe[0])
-		if _, dup_errno := linux.dup2(stderr_pipe[1], 2); dup_errno != .NONE { linux.exit_group(1) }
-		_ = linux.close(stderr_pipe[1])
-		_ = linux.close(setup[0])
-		if directory != nil && linux.chdir(directory) != .NONE { linux.exit_group(1) }
-		exec_errno := linux.execve(name, argv, envp)
-		code := [1]u8{u8(exec_errno)}
-		_, _ = linux.write(setup[1], code[:])
-		linux.exit_group(127)
+		if posix.setpgid(0, 0) != .OK { posix._exit(STDIO_CHILD_SETUP_FAILED) }
+		if posix.dup2(child_stdin, 0) == -1 { posix._exit(STDIO_CHILD_SETUP_FAILED) }
+		if posix.dup2(child_stdout, 1) == -1 { posix._exit(STDIO_CHILD_SETUP_FAILED) }
+		if posix.dup2(child_stderr, 2) == -1 { posix._exit(STDIO_CHILD_SETUP_FAILED) }
+		if directory != nil && posix.chdir(directory) != .OK { posix._exit(STDIO_CHILD_SETUP_FAILED) }
+		posix.execve(name, argv, envp)
+		code := [1]u8{u8(posix.errno())}
+		_ = posix.write(report_fd, &code[0], len(code))
+		posix._exit(STDIO_CHILD_EXEC_FAILED)
 	}
+	_ = os.close(setup_write)
 
-	_ = linux.close(stdin_pipe[0])
-	_ = linux.close(stdout_pipe[1])
-	_ = linux.close(stderr_pipe[1])
-	_ = linux.close(setup[1])
-
+	spawned := Stdio_Child {
+		pid = int(pid),
+	}
 	report: [1]u8
-	reported, _ := linux.read(setup[0], report[:])
-	_ = linux.close(setup[0])
-	if reported > 0 {
-		spawned := Stdio_Child {
-			pid = int(pid),
-		}
-		_ = linux.close(stdin_pipe[1])
-		_ = linux.close(stdout_pipe[0])
-		_ = linux.close(stderr_pipe[0])
-		stdio_terminate_group(&spawned)
-		return {}, {}, false
+	reported, status := stdio_read(setup_read, report[:])
+	for status == .Again {
+		reported, status = stdio_read(setup_read, report[:])
 	}
+	if status == .Ok && reported > 0 {
+		stdio_terminate_group(&spawned)
+		err = os.Platform_Error(i32(report[0]))
+		return
+	}
+	return Stdio_Pipes{stdin = stdin_write, stdout = stdout_read, stderr = stderr_read}, spawned, nil
+}
 
-	return Stdio_Pipes{stdin = stdin_pipe[1], stdout = stdout_pipe[0], stderr = stderr_pipe[0]}, Stdio_Child{pid = int(pid)}, true
+// stdio_pipes_close closes the parent's ends of a server's streams.
+stdio_pipes_close :: proc(pipes: Stdio_Pipes) {
+	_ = os.close(pipes.stdin)
+	_ = os.close(pipes.stdout)
+	_ = os.close(pipes.stderr)
+}
+
+// stdio_read reads what one pipe end holds into buffer.
+stdio_read :: proc(file: ^os.File, buffer: []u8) -> (count: int, status: Stdio_Io) {
+	n := posix.read(stdio_fd(file), raw_data(buffer), uint(len(buffer)))
+	if n >= 0 { return n, .Ok }
+	return 0, stdio_io_failure()
+}
+
+// stdio_write writes as much of data as one pipe end accepts.
+stdio_write :: proc(file: ^os.File, data: []u8) -> (count: int, status: Stdio_Io) {
+	n := posix.write(stdio_fd(file), raw_data(data), uint(len(data)))
+	if n >= 0 { return n, .Ok }
+	return 0, stdio_io_failure()
 }
 
 @(private)
-stdio_close_pair :: proc(pair: [2]linux.Fd) {
-	_ = linux.close(pair[0])
-	_ = linux.close(pair[1])
+stdio_io_failure :: proc() -> Stdio_Io {
+	#partial switch posix.errno() {
+	case .EAGAIN, .EINTR:
+		return .Again
+	}
+	return .Failed
+}
+
+// stdio_poll waits up to timeout_ms for a pipe end to become ready. A poll error
+// reports not ready, so the following read or write reports the real failure.
+stdio_poll :: proc(file: ^os.File, direction: Stdio_Direction, timeout_ms: int) -> (ready: bool, failed: bool) {
+	events: posix.Poll_Event = {.IN} if direction == .Read else {.OUT}
+	fds := [1]posix.pollfd{{fd = stdio_fd(file), events = events}}
+	count := posix.poll(&fds[0], len(fds), i32(timeout_ms))
+	if count == -1 { return false, posix.errno() != .EINTR }
+	return count > 0, false
 }
 
 // SIGPIPE is process-wide, but the stdio transport is not. These fields hold the
 // saved disposition while at least one stdio server is running. The lock makes
 // concurrent starts and stops agree on which one owns the restore.
+@(private)
 stdio_sigpipe_mutex: sync.Mutex
+@(private)
 stdio_sigpipe_users: int
-stdio_sigpipe_previous: linux.Sig_Action
+@(private)
+stdio_sigpipe_previous: posix.sigaction_t
+@(private)
 stdio_sigpipe_saved: bool
 
 // stdio_sigpipe_acquire makes a pipe write report EPIPE instead of terminating the
 // process, and saves the disposition that was in force before the first stdio server.
-stdio_sigpipe_acquire :: proc(previous: ^linux.Sig_Action) -> bool {
-	sync.mutex_lock(&stdio_sigpipe_mutex)
-	defer sync.mutex_unlock(&stdio_sigpipe_mutex)
+stdio_sigpipe_acquire :: proc() -> os.Error {
+	sync.mutex_guard(&stdio_sigpipe_mutex)
 	if stdio_sigpipe_users == 0 {
-		action := linux.Sig_Action {
-			special = .SIG_IGN,
+		action := posix.sigaction_t {
+			sa_handler = auto_cast posix.SIG_IGN,
 		}
-		old: linux.Sig_Action
-		if linux.rt_sigaction(.SIGPIPE, &action, &old) != .NONE { return false }
-		stdio_sigpipe_previous = old
+		if posix.sigaction(.SIGPIPE, &action, &stdio_sigpipe_previous) != .OK { return stdio_errno() }
 		stdio_sigpipe_saved = true
-		previous^ = old
 	}
 	stdio_sigpipe_users += 1
-	return true
+	return nil
 }
 
 // stdio_sigpipe_release restores the process disposition when the last stdio server
 // stops. A failed restore is left to the process owner; the transport must not keep
 // a stale reference count and prevent a later owner from trying again.
 stdio_sigpipe_release :: proc() {
-	sync.mutex_lock(&stdio_sigpipe_mutex)
-	defer sync.mutex_unlock(&stdio_sigpipe_mutex)
+	sync.mutex_guard(&stdio_sigpipe_mutex)
 	if stdio_sigpipe_users == 0 { return }
 	stdio_sigpipe_users -= 1
 	if stdio_sigpipe_users != 0 || !stdio_sigpipe_saved { return }
-	_ = linux.rt_sigaction(.SIGPIPE, &stdio_sigpipe_previous, nil)
+	_ = posix.sigaction(.SIGPIPE, &stdio_sigpipe_previous, nil)
 	stdio_sigpipe_saved = false
 }
 
 // stdio_set_nonblocking makes a pipe end usable from a poll loop, so reading and
 // writing can observe cancellation instead of blocking through it.
-stdio_set_nonblocking :: proc(fd: linux.Fd) -> bool {
-	flags, get_errno := linux.fcntl_getfl(fd, linux.F_GETFL)
-	if get_errno != .NONE { return false }
-	return linux.fcntl_setfl(fd, linux.F_SETFL, flags + {.NONBLOCK}) == .NONE
+stdio_set_nonblocking :: proc(file: ^os.File) -> os.Error {
+	fd := stdio_fd(file)
+	flags := posix.fcntl(fd, .GETFL)
+	if flags == -1 { return stdio_errno() }
+	if posix.fcntl(fd, .SETFL, flags | posix.O_NONBLOCK) == -1 { return stdio_errno() }
+	return nil
 }
 
 // stdio_child_poll reaps the child if it has finished, and reports whether it is
 // gone. It never blocks.
 stdio_child_poll :: proc(child: ^Stdio_Child) -> bool {
 	if child.reaped { return true }
-	status: u32
-	reaped, wait_errno := linux.wait4(linux.Pid(child.pid), &status, {.WNOHANG}, nil)
-	if reaped == linux.Pid(child.pid) {
-		child.reaped = true
-		child.status = status
-		return true
-	}
-	// No child left to wait for: it was already reaped.
-	if wait_errno == .ECHILD { child.reaped = true }
+	status: i32
+	reaped := posix.waitpid(posix.pid_t(child.pid), &status, {.NOHANG})
+	// No child left to wait for means it was already reaped.
+	if int(reaped) == child.pid || (reaped == -1 && posix.errno() == .ECHILD) { child.reaped = true }
 	return child.reaped
 }
 
 // stdio_child_reap blocks until the child is reaped.
 stdio_child_reap :: proc(child: ^Stdio_Child) {
 	if child.reaped { return }
-	status: u32
+	status: i32
 	for {
-		reaped, wait_errno := linux.wait4(linux.Pid(child.pid), &status, {}, nil)
-		if reaped == linux.Pid(child.pid) { break }
-		if wait_errno == .ECHILD {
-			child.reaped = true
-			return
-		}
-		if wait_errno != .EINTR { return }
+		if int(posix.waitpid(posix.pid_t(child.pid), &status, {})) == child.pid { break }
+		errno := posix.errno()
+		if errno == .ECHILD { break }
+		if errno != .EINTR { return }
 	}
 	child.reaped = true
-	child.status = status
 }
 
 stdio_terminate_direct_child :: proc(child: ^Stdio_Child) {
 	if child.pid <= 0 || child.reaped { return }
-	_ = linux.kill(linux.Pid(child.pid), .SIGTERM)
+	_ = posix.kill(posix.pid_t(child.pid), .SIGTERM)
 	grace := time.tick_add(time.tick_now(), STDIO_KILL_GRACE)
 	for time.tick_since(grace) < 0 {
 		if stdio_child_poll(child) { return }
 		time.sleep(5 * time.Millisecond)
 	}
-	_ = linux.kill(linux.Pid(child.pid), .SIGKILL)
+	_ = posix.kill(posix.pid_t(child.pid), .SIGKILL)
 	stdio_child_reap(child)
 }
 
@@ -216,7 +258,7 @@ stdio_terminate_group :: proc(child: ^Stdio_Child) {
 		stdio_terminate_direct_child(child)
 		return
 	}
-	stdio_signal_group(child.pid, false)
+	_ = posix.killpg(posix.pid_t(child.pid), .SIGTERM)
 	grace := time.tick_add(time.tick_now(), STDIO_KILL_GRACE)
 	for time.tick_since(grace) < 0 {
 		_ = stdio_child_poll(child)
@@ -226,33 +268,25 @@ stdio_terminate_group :: proc(child: ^Stdio_Child) {
 		}
 		time.sleep(5 * time.Millisecond)
 	}
-	stdio_signal_group(child.pid, true)
+	_ = posix.killpg(posix.pid_t(child.pid), .SIGKILL)
 	stdio_terminate_direct_child(child)
 }
 
 @(private)
-stdio_group_gone :: proc(pid: int) -> bool {
-	if pid <= 0 { return true }
-	return linux.kill(linux.Pid(-pid), linux.Signal(0)) == .ESRCH
+stdio_group_gone :: proc(group: int) -> bool {
+	if group <= 0 { return true }
+	return posix.killpg(posix.pid_t(group), .NONE) == .FAIL && posix.errno() == .ESRCH
 }
 
-@(private)
-stdio_signal_group :: proc(pid: int, kill: bool) {
-	signal: linux.Signal = .SIGKILL if kill else .SIGTERM
-	_ = linux.kill(linux.Pid(-pid), signal)
-}
-
-// stdio_wait waits until fd is ready for the requested events. It reports a stop
-// rather than blocking through one, and treats a poll error as "not ready" so the
-// following read or write reports the real failure.
-stdio_wait :: proc(fd: linux.Fd, events: linux.Fd_Poll_Events, control: Control) -> (ready: bool, stop: Stop) {
+// stdio_wait waits until a pipe end is ready. It reports a stop rather than
+// blocking through one, and treats a poll error as not ready so the following
+// read or write reports the real failure.
+stdio_wait :: proc(file: ^os.File, direction: Stdio_Direction, control: Control) -> (ready: bool, stop: Stop) {
 	for {
 		if stop = control_stop(control); stop != .None { return false, stop }
-		fds := [1]linux.Poll_Fd{{fd = fd, events = events}}
-		count, poll_errno := linux.poll(fds[:], STDIO_POLL_SLICE_MS)
-		if poll_errno == .EINTR { continue }
-		if poll_errno != .NONE { return false, .None }
-		if count > 0 { return true, .None }
+		polled, failed := stdio_poll(file, direction, STDIO_POLL_SLICE_MS)
+		if polled { return true, .None }
+		if failed { return false, .None }
 	}
 }
 
