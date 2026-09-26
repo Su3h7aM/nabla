@@ -59,6 +59,7 @@ chat_session_observe :: proc(chat: ^Chat_Session) {
 // chat_session_observe_at is the same with the owner's clock supplied, so a driver that
 // has already observed time does not read it twice and a test can supply it.
 chat_session_observe_at :: proc(chat: ^Chat_Session, now: time.Tick) {
+	chat_session_observe_stop(chat)
 	if !chat.tool_jobs_active { return }
 	tool_jobs_observe(&chat.tool_jobs, chat, now)
 	if chat.tool_jobs.escaped { chat.worker_escaped = true }

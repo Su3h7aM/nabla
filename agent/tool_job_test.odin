@@ -13,6 +13,7 @@ import "core:thread"
 import "core:time"
 
 import "nabla:agent/session"
+import "nabla:ai"
 import "nabla:db"
 
 // The tool job suite. It holds the properties the batch's phases exist for: a call
@@ -584,7 +585,6 @@ test_running_calls_are_bounded :: proc(t: ^testing.T) {
 // abandoned: the batch settles and the escape is latched.
 @(test)
 test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
@@ -604,8 +604,7 @@ test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(t: ^testing.
 	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, started), Tool_Job_Effect.Dispatch)
 	tool_job_test_hold_until(t, &hold, 1)
 
-	chat_cancel_request()
-	defer chat_cancel_reset()
+	ai.interrupt_request(&chat.stop)
 	tool_jobs_latch_stop(&jobs, chat)
 	// The stop is observed at the tick it was asked for, and the call is still running, so
 	// there is nothing to do but wait for it.
@@ -645,7 +644,6 @@ test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(t: ^testing.
 // through its inherited control, and the queued one is refused without ever dispatching.
 @(test)
 test_a_stopped_turn_still_answers_every_call :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
@@ -665,8 +663,7 @@ test_a_stopped_turn_still_answers_every_call :: proc(t: ^testing.T) {
 	testing.expect_value(t, tool_job_test_step(&test, &jobs), Tool_Job_Effect.Dispatch)
 	tool_job_test_hold_until(t, &hold, 1)
 
-	chat_cancel_request()
-	defer chat_cancel_reset()
+	ai.interrupt_request(&chat.stop)
 	tool_jobs_latch_stop(&jobs, chat)
 	testing.expect_value(t, jobs.stop, Tool_Jobs_Stop.Cancelled)
 	testing.expect_value(t, tool_job_test_step(&test, &jobs), Tool_Job_Effect.Refuse)
@@ -909,7 +906,6 @@ test_an_escaped_worker_refuses_another_turn :: proc(t: ^testing.T) {
 // effects until every committed call has a result and every producer has retired.
 @(test)
 test_cancelling_chat_drains_session_owned_jobs :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
@@ -925,7 +921,6 @@ test_cancelling_chat_drains_session_owned_jobs :: proc(t: ^testing.T) {
 	tool_job_test_hold_until(t, &hold, 1)
 
 	chat_session_request_cancel(chat)
-	defer chat_cancel_reset()
 	testing.expect_value(t, chat.state, Chat_State.Cancelling)
 
 	for _ in 0 ..< 100_000 {

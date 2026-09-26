@@ -3,7 +3,7 @@ package agent
 import "core:sync"
 import "core:time"
 
-// chat_wake is process-wide because the cancel token is: a signal handler holds no session.
+// chat_wake is process-wide because a signal handler holds no session.
 chat_wake: Owner_Wake
 
 // Owner_Wake is a monotonic sequence. A producer publishes its fact, then signals. A waiter

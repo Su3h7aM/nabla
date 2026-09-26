@@ -394,7 +394,7 @@ test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
 	testing.expect(t, linux.kill(linux.Pid(os.get_pid()), .SIGINT) == .NONE)
 	shell_turn_join(&run)
 
-	testing.expectf(t, chat_cancel_requested(), "the SIGINT handler never requested cancellation")
+	testing.expectf(t, process_interrupted(), "the SIGINT handler never latched the interrupt")
 	testing.expect_value(t, chat.terminal_status, Chat_Terminal_Status.Cancelled)
 	testing.expect_value(t, chat.state, Chat_State.Idle)
 	testing.expect(t, !run.completed)
@@ -471,8 +471,6 @@ test_sigint_cuts_a_retry_backoff_short :: proc(t: ^testing.T) {
 	// The handler stays armed for the whole test, so a signal that arrives after the turn
 	// restored the default disposition cannot terminate this process.
 	previous: sigaction_storage
-	chat_cancel_reset()
-	defer chat_cancel_reset()
 	chat_signal_arm(&previous.saved)
 	defer chat_signal_disarm(&previous.saved)
 

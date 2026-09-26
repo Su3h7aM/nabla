@@ -342,13 +342,10 @@ handle_event :: proc(app: ^App, event: input.Event) {
 	}
 }
 
-// cancel_or_quit cancels the running request, or exits when nothing is running. A
-// cancel this front-end requested is remembered, so the retirement that follows
-// ends the turn rather than the session.
+// cancel_or_quit cancels the running turn, or exits when nothing is running.
 cancel_or_quit :: proc(app: ^App) {
 	if runtime_busy(app) {
-		app.cancel_seen = true
-		agent.chat_cancel_request()
+		agent.turn_control_stop(&app.run.control)
 		return
 	}
 	app.quit = true
@@ -405,8 +402,7 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 		widgets.input_move_end(&app.input)
 	case .Escape:
 		if runtime_busy(app) {
-			app.cancel_seen = true
-			agent.chat_cancel_request()
+			agent.turn_control_stop(&app.run.control)
 		} else {
 			prompt_clear(app)
 		}
@@ -528,10 +524,7 @@ dispatch_command :: proc(app: ^App, text: string) {
 	}
 	switch command.id {
 	case .Quit:
-		if runtime_busy(app) {
-			app.cancel_seen = true
-			agent.chat_cancel_request()
-		}
+		if runtime_busy(app) { agent.turn_control_stop(&app.run.control) }
 		app.quit = true
 	case .Help:
 		command_help(app)

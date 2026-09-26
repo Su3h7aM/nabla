@@ -86,14 +86,12 @@ log_chat_cancel_turn :: proc(t: ^testing.T, chat: ^Chat_Session) -> (entries: in
 
 @(test)
 test_a_turn_records_its_start_and_end :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
 	fixture: Log_Chat_Test
 	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t))
 	defer log_chat_end(t, &fixture)
 	chat := &fixture.chat.chat
 
 	log_chat_cancel_turn(t, chat)
-	chat_cancel_reset()
 
 	context.logger = fixture.ambient
 	text := log_chat_text(t, &fixture)
@@ -111,7 +109,6 @@ test_a_turn_records_its_start_and_end :: proc(t: ^testing.T) {
 
 @(test)
 test_a_superseded_operation_is_recorded :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
 	fixture: Log_Chat_Test
 	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t), .Debug)
 	defer log_chat_end(t, &fixture)
@@ -125,7 +122,6 @@ test_a_superseded_operation_is_recorded :: proc(t: ^testing.T) {
 	finish := chat_session_advance(chat)
 	chat_session_claim_finish(chat, finish)
 	chat_persist_turn_end(chat, finish)
-	chat_cancel_reset()
 
 	// The retired operation's event is dropped, and that is what the record says.
 	_test_accept(t, chat, "second")
@@ -142,7 +138,6 @@ test_a_superseded_operation_is_recorded :: proc(t: ^testing.T) {
 
 @(test)
 test_a_tool_call_is_recorded_from_call_to_result :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
 	fixture: Log_Chat_Test
 	context.logger = log_chat_begin(t, &fixture, tool_loop_workspace(t), .Debug)
 	defer log_chat_end(t, &fixture)
@@ -224,7 +219,6 @@ test_the_provider_record_names_the_encoded_body :: proc(t: ^testing.T) {
 
 @(test)
 test_a_writer_does_not_change_a_turn :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
 	// The same turn twice: once with nowhere to record and once with a writer. A
 	// diagnostic that changed the durable outcome would show up as a difference
 	// here.
@@ -232,13 +226,11 @@ test_a_writer_does_not_change_a_turn :: proc(t: ^testing.T) {
 	chat_test_begin(t, &plain, tool_loop_workspace(t))
 	defer chat_test_end(t, &plain)
 	plain_entries, plain_calls := log_chat_cancel_turn(t, &plain.chat)
-	chat_cancel_reset()
 
 	logged: Log_Chat_Test
 	log_chat_begin(t, &logged, tool_loop_workspace(t))
 	defer log_chat_end(t, &logged)
 	logged_entries, logged_calls := log_chat_cancel_turn(t, &logged.chat.chat)
-	chat_cancel_reset()
 
 	testing.expect_value(t, plain_entries, 2)
 	testing.expect_value(t, logged_entries, plain_entries)

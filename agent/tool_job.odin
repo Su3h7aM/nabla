@@ -383,7 +383,7 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	job.exec.backend = definition.backend
 	job.exec.control = {
 		interrupt = &job.interrupt,
-		parent    = &chat_cancel,
+		parent    = &chat.stop,
 	}
 	// A worker must not reach the session's storage, and it does not have to: the
 	// tools that read a kept result or change the context are owner-placed.

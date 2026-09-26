@@ -307,7 +307,7 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	// the provider keeps it open, and ends when the provider, the transport, or
 	// cancellation ends it.
 	options := ai.Provider_Operation_Options {
-		interrupt = &chat_cancel,
+		interrupt = &chat.stop,
 	}
 	// The bytes this request sends are frozen once, before the first attempt, so every
 	// attempt of the chain sends exactly what the first would have sent instead of a fresh

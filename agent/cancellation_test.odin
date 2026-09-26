@@ -11,7 +11,6 @@ import "nabla:ai"
 // settle the turn.
 @(test)
 test_cancelled_turn_retires_then_next_turn_runs :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
@@ -75,7 +74,6 @@ test_cancelled_turn_retires_then_next_turn_runs :: proc(t: ^testing.T) {
 // must not reach the current turn, even when it arrives after a new turn started.
 @(test)
 test_stale_operation_events_are_rejected :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
@@ -90,7 +88,6 @@ test_stale_operation_events_are_rejected :: proc(t: ^testing.T) {
 	finish := chat_session_advance(chat)
 	chat_session_claim_finish(chat, finish)
 	chat_persist_turn_end(chat, finish)
-	chat_cancel_reset()
 
 	_test_accept(t, chat, "second")
 	effect = _test_begin_request(t, chat)

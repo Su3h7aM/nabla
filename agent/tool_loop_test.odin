@@ -927,7 +927,6 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 // definition cross it too.
 @(test)
 test_every_dispatch_path_stores_a_valid_envelope :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
 	{
 		test: Tool_Test
 		tool_test_begin(t, &test)
@@ -951,8 +950,7 @@ test_every_dispatch_path_stores_a_valid_envelope :: proc(t: ^testing.T) {
 		tool_test_begin(t, &test)
 		defer tool_test_end(t, &test)
 
-		chat_cancel_request()
-		defer chat_cancel_reset()
+		ai.interrupt_request(&test.fixture.chat.stop)
 		result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"echo hi"}`)
 		testing.expect_value(t, result.outcome, session.Tool_Outcome.Not_Executed)
 		testing.expect(t, tool_result_valid(result.outcome, result.content), "a cancellation before dispatch stores a valid envelope")
@@ -964,7 +962,6 @@ test_every_dispatch_path_stores_a_valid_envelope :: proc(t: ^testing.T) {
 // user asked for.
 @(test)
 test_an_incomplete_tool_batch_ends_the_turn :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)

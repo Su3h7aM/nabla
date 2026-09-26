@@ -136,7 +136,7 @@ sigaction_storage :: struct {
 test_signal_handler_outlives_sessions :: proc(t: ^testing.T) {
 	if !test_isolate_process(t, #procedure) { return }
 	for round in 0 ..< 24 {
-		chat_cancel_reset()
+		sync.atomic_store(&process_interrupt, false)
 		// Installation and removal are exercised repeatedly, and the session is
 		// destroyed while the handler may still be returning from this round's signal.
 		// If the handler referenced session memory rather than static storage, that
@@ -154,10 +154,10 @@ test_signal_handler_outlives_sessions :: proc(t: ^testing.T) {
 		// Wait for the handler to actually run, so this covers handler execution
 		// overlapping session teardown rather than only a pending signal.
 		deadline := time.tick_add(time.tick_now(), SHELL_TEST_BOUND)
-		for !chat_cancel_requested() && time.tick_since(deadline) < 0 { time.sleep(time.Millisecond) }
-		testing.expectf(t, chat_cancel_requested(), "round %d never observed the signal", round)
+		for !process_interrupted() && time.tick_since(deadline) < 0 { time.sleep(time.Millisecond) }
+		testing.expectf(t, process_interrupted(), "round %d never observed the signal", round)
 
-		chat_session_note_cancel(chat)
+		chat_session_observe_stop(chat)
 		chat_session_retire_operation(chat)
 		finish := _test_settle(t, chat)
 		testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
@@ -165,7 +165,6 @@ test_signal_handler_outlives_sessions :: proc(t: ^testing.T) {
 
 		chat_signal_disarm(&previous.saved)
 	}
-	chat_cancel_reset()
 }
 
 // --- stale handler requests ----------------------------------------------------
@@ -192,57 +191,6 @@ test_interrupt_generation_rejects_stale_request :: proc(t: ^testing.T) {
 	ai.interrupt_request_captured(&token, current)
 	ai.interrupt_request(&token)
 	testing.expect(t, ai.interrupt_requested(&token))
-}
-
-// The interleaving this guards against: a handler enters during one turn, is
-// descheduled before its write, the turn advances and the next turn resets the
-// token, and only then does the handler resume. Splitting the request into a capture
-// and a conditional write reproduces that ordering deterministically, and a live
-// stale request is written on resume, so the test would fail if the request were
-// unconditional.
-@(test)
-test_stale_handler_cannot_cancel_next_turn :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
-	defer chat_test_end(t, &fixture)
-	chat := &fixture.chat
-	chat.tools_enabled = true
-
-	_test_accept(t, chat, "first")
-	effect := _test_begin_request(t, chat)
-	first_turn := effect.turn_id
-
-	// The handler runs only as far as observing the token, then stops.
-	captured := ai.interrupt_capture(&chat_cancel)
-	chat_session_request_cancel(chat)
-	chat_session_retire_operation(chat)
-	finish := _test_settle(t, chat)
-
-	_test_accept(t, chat, "second")
-	testing.expect_value(t, chat.active_turn_id, first_turn + 1)
-	effect = _test_begin_request(t, chat)
-
-	// The stale handler resumes and completes its write against a reset token.
-	ai.interrupt_request_captured(&chat_cancel, captured)
-
-	testing.expectf(t, !chat_cancel_requested(), "a stale handler cancelled the current turn")
-	testing.expect_value(t, chat.state, Chat_State.Requesting)
-	testing.expect(t, chat_session_feed_completion(chat, chat_session_event_source(chat)))
-	finish = _test_settle(t, chat)
-	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
-	testing.expect_value(t, finish.status, Chat_Terminal_Status.Completed)
-
-	// A signal observed in the current generation still cancels.
-	_test_accept(t, chat, "third")
-	effect = _test_begin_request(t, chat)
-	fresh := ai.interrupt_capture(&chat_cancel)
-	ai.interrupt_request_captured(&chat_cancel, fresh)
-	testing.expect(t, chat_cancel_requested())
-	chat_session_note_cancel(chat)
-	chat_session_retire_operation(chat)
-	finish = _test_settle(t, chat)
-	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
 }
 
 // --- post-fork child path -----------------------------------------------------
@@ -439,14 +387,9 @@ test_shutdown_during_request_retires_before_session_cleanup :: proc(t: ^testing.
 	thread.join(run.thread)
 	thread.destroy(run.thread)
 
-	testing.expectf(t, chat_cancel_requested(), "the SIGINT handler never requested cancellation")
+	testing.expectf(t, process_interrupted(), "the SIGINT handler never latched the interrupt")
 	testing.expect_value(t, chat.terminal_status, Chat_Terminal_Status.Cancelled)
 	testing.expect_value(t, chat.state, Chat_State.Idle)
 	testing.expect_value(t, chat.operation.state, Chat_Operation_State.Retired)
 	testing.expect(t, !run.completed)
-
-	// The token is static and outlives the session; clearing it here is what keeps a
-	// later turn from inheriting this cancellation.
-	chat_cancel_reset()
-	testing.expect(t, !chat_cancel_requested())
 }

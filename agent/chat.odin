@@ -419,6 +419,7 @@ chat_retry_wait :: proc(chat: ^Chat_Session, delay: time.Duration) -> bool {
 	deadline := time.tick_add(time.tick_now(), delay)
 	for {
 		seen := owner_wake_seen()
+		chat_session_observe_stop(chat)
 		if chat_session_cancelled(chat) { return false }
 		if time.tick_diff(time.tick_now(), deadline) <= 0 { return true }
 		owner_wake_wait(seen, deadline)
@@ -456,16 +457,21 @@ chat_websocket_fallback_safe :: proc(err: ai.Provider_Operation_Error) -> bool {
 
 // chat_run_turn_steered runs one turn to its terminal effect. steer is nil for a caller
 // with no input of its own, such as a headless run; otherwise the request boundary
-// consumes what the user queued while the turn ran.
+// consumes what the user queued while the turn ran. control is nil for a caller that
+// never stops a turn itself; a process interrupt stops the turn either way.
 chat_run_turn_steered :: proc(
 	chat: ^Chat_Session,
 	connection: ai.Provider_Connection,
 	policy: Chat_Retry_Policy,
 	observer: Chat_Observer,
 	steer: ^Steer_Context,
+	control: ^Turn_Control = nil,
 ) -> bool {
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
+
+	chat.control = control
+	defer chat.control = nil
 
 	previous: posix.sigaction_t
 	chat_signal_arm(&previous)

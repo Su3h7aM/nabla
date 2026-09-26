@@ -3,6 +3,7 @@ package agent
 import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:unicode/utf8"
 
 import "nabla:agent/session"
@@ -99,6 +100,14 @@ Chat_Session :: struct {
 	active_request:               Maybe(session.Request_No),
 	next_operation_id:            u64,
 	operation:                    Chat_Operation,
+
+	// stop is the running turn's cancellation token. The owner requests it; the request
+	// worker and tool executions read it. It is reset when a turn starts, while no worker
+	// of an earlier turn remains.
+	stop:                         ai.Interrupt,
+	// control is the front-end's stop request for the turn in flight, borrowed for the
+	// duration of chat_run_turn_steered and nil otherwise.
+	control:                      ^Turn_Control,
 
 	// chain is the request in flight between its attempts. It lives here because the
 	// driver returns to its loop between one effect and the next: a retry wait is request
@@ -502,9 +511,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat.active_failed = false
 	chat.requests_made = 0
 	chat.calls_made = 0
-	// A turn begins uncancelled, so a signal that arrived after the previous turn
-	// finished can never be inherited by this one.
-	chat_cancel_reset()
+	ai.interrupt_reset(&chat.stop)
 	chat_operation_retire(&chat.operation)
 	chat_chain_release(chat)
 	if chat.tool_jobs_active {
@@ -599,9 +606,8 @@ chat_session_cancellable :: proc(chat: ^Chat_Session) -> bool {
 	return false
 }
 
-// chat_session_note_cancel reconciles a turn whose interruption was requested
-// outside the control loop, such as from a signal handler. The handler records the
-// request; the loop decides what it means.
+// chat_session_note_cancel moves a turn whose stop was requested into Cancelling, so
+// the loop settles it.
 chat_session_note_cancel :: proc(chat: ^Chat_Session) {
 	if chat_session_cancellable(chat) { chat.state = .Cancelling }
 }
@@ -610,13 +616,42 @@ chat_session_note_cancel :: proc(chat: ^Chat_Session) {
 // settles only once retirement confirms the operation stopped.
 chat_session_request_cancel :: proc(chat: ^Chat_Session) -> bool {
 	if !chat_session_cancellable(chat) { return false }
-	chat_cancel_request()
+	ai.interrupt_request(&chat.stop)
 	chat_session_note_cancel(chat)
 	return true
 }
 
 chat_session_cancelled :: proc(chat: ^Chat_Session) -> bool {
-	return chat_cancel_requested()
+	return ai.interrupt_requested(&chat.stop)
+}
+
+// chat_session_observe_stop applies a stop the front-end or the process asked for to the
+// running turn. It is part of the owner's collection step.
+chat_session_observe_stop :: proc(chat: ^Chat_Session) {
+	if process_interrupted() || chat.control != nil && turn_control_stop_requested(chat.control) {
+		_ = chat_session_request_cancel(chat)
+	}
+}
+
+// Turn_Control is how a front-end stops the turns it runs. The front-end owns it at an
+// address that outlives every turn given it. Any thread may request a stop; the owner
+// applies it at its next observation. The front-end clears it before starting a turn it
+// has not asked to stop.
+Turn_Control :: struct {
+	stop_requested: bool,
+}
+
+turn_control_stop :: proc "contextless" (control: ^Turn_Control) {
+	sync.atomic_store(&control.stop_requested, true)
+	owner_wake_signal()
+}
+
+turn_control_clear :: proc "contextless" (control: ^Turn_Control) {
+	sync.atomic_store(&control.stop_requested, false)
+}
+
+turn_control_stop_requested :: proc "contextless" (control: ^Turn_Control) -> bool {
+	return sync.atomic_load(&control.stop_requested)
 }
 
 // chat_session_retire_operation is the confirmation that the turn's work stopped.

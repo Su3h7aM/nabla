@@ -70,7 +70,7 @@ acp_serve :: proc(server: ^Acp_Server, input: io.Reader) -> bool {
 	}
 	// A turn still running is stopped before the worker is joined: it settles as
 	// cancelled, so the record says the session was interrupted rather than guessing.
-	if acp_server_has_work(server) { agent.chat_cancel_request() }
+	if acp_server_has_work(server) { agent.turn_control_stop(&server.app.run.control) }
 	return !read_failed && !acp.writer_failed(&server.writer)
 }
 
@@ -895,10 +895,7 @@ acp_closing_session_matches :: proc(server: ^Acp_Server, session_id: string) -> 
 acp_cancel_session :: proc(server: ^Acp_Server, session_id: string) {
 	if !acp_server_has_work(server) { return }
 	if !acp_session_matches(server, session_id) { return }
-	// The request is recorded, because accepting the prompt clears the process's
-	// cancellation token and the worker re-issues it for the turn that must see it.
-	sync.atomic_store(&server.cancel_seen, true)
-	agent.chat_cancel_request()
+	agent.turn_control_stop(&server.app.run.control)
 }
 
 // acp_enqueue hands one request to the worker. It owns work on both paths: on success the
@@ -1100,8 +1097,8 @@ acp_main :: proc(args: []string) -> int {
 	defer agent.chat_interactive_disarm(&signals)
 
 	served := acp_run(sources[:], harness_options, mcp_servers[:], io.to_reader(os.to_stream(os.stdin)), io.to_writer(os.to_stream(os.stdout)))
-	// A signal ends the run the way a client closing the stream does: the handler set the
-	// process's cancellation token, and stopping for it is not a stream failure.
-	if served || agent.chat_cancel_requested() { return 0 }
+	// A signal ends the run the way a client closing the stream does, and stopping for it
+	// is not a stream failure.
+	if served || agent.process_interrupted() { return 0 }
 	return 1
 }

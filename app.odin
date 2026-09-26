@@ -279,6 +279,9 @@ Runtime :: struct {
 	// them as they arrive and the worker drains them at request boundaries, which
 	// is why it is written from one thread and read from another.
 	steer:                    agent.Steer_Queue,
+	// control stops the turn the worker runs. The front-end requests; the worker clears it
+	// before each turn it starts.
+	control:                  agent.Turn_Control,
 	alloc:                    mem.Allocator,
 	signals:                  agent.Chat_Interactive_Signals,
 	// stopping is set once by the front-end before the worker is stopped. It is
@@ -551,18 +554,11 @@ tui_run :: proc(
 			present_frame(app, app.storage)
 		}
 
-		// SIGINT/SIGTERM through the agent handler: cancel a running turn, or
-		// quit when idle. A cancel this front-end requested through a key is
-		// cleared once its turn retired, so it ends the turn only; an outside
-		// signal ends the session once the turn retired.
-		if agent.chat_cancel_requested() && !runtime_busy(app) {
-			if app.cancel_seen {
-				app.cancel_seen = false
-				agent.chat_cancel_reset()
-			} else {
-				app.quit = true
-				break
-			}
+		// SIGINT or SIGTERM stops the running turn through the owner, and ends the
+		// process once no turn runs.
+		if agent.process_interrupted() && !runtime_busy(app) {
+			app.quit = true
+			break
 		}
 	}
 
@@ -570,9 +566,7 @@ tui_run :: proc(
 	// then stop it and join. Join is safe only after the turn retired;
 	// cancellation guarantees that.
 	stop_runtime(app)
-	if runtime_busy(app) {
-		agent.chat_cancel_request()
-	}
+	if runtime_busy(app) { agent.turn_control_stop(&app.run.control) }
 	app_teardown(app)
 	return !read_failed
 }

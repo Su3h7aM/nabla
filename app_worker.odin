@@ -165,11 +165,12 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			return
 		}
 		snap_append(app, .User, work.text)
+		// A stop the front-end asked for is for a running turn, and none runs until the flag
+		// below is set, so an older request is cleared first. Shutdown that already began
+		// stops this turn too, rather than waiting out a whole model request.
+		agent.turn_control_clear(&app.run.control)
 		set_running(app, true)
-		// Accepting the prompt reset the cancellation token for the new turn, so a
-		// stop that arrived while the prompt was being recorded has to be re-issued
-		// here: otherwise shutdown would wait out a whole model request.
-		if runtime_stopping(app) { agent.chat_cancel_request() }
+		if runtime_stopping(app) { agent.turn_control_stop(&app.run.control) }
 		steer := agent.Steer_Context {
 			queue      = &app.run.steer,
 			apply      = app_steer_apply,
@@ -177,7 +178,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		}
 		// How the turn ended reaches the front-end through the observer, which reports the
 		// terminal status, so the worker has nothing of its own to do with the return.
-		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer)
+		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)
 		// A tool worker that ignored its stop still borrows the session's workspace, registry
 		// generation, and backends. Nothing else may run in this process: the runtime stops,
 		// and teardown leaves what that worker can reach to process exit.
@@ -191,7 +192,6 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	// the front-end returns them to the prompt when it sees the runtime stop running.
 	case .Compact:
 		set_running(app, true)
-		if runtime_stopping(app) { agent.chat_cancel_request() }
 		// Compaction reports why the model side stopped, but a durable write that
 		// failed only latches the session: the reason the user needs is there.
 		if !agent.chat_command_compact(&app.setup.session, observer, app.run.connection) && agent.chat_session_storage_failed(&app.setup.session) {

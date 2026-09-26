@@ -179,10 +179,6 @@ Acp_Server :: struct {
 	queue_mu:           sync.Mutex,
 	busy:               bool, // atomic mirror, read by teardown and tests
 	pending_work:       int,
-	// cancel_seen is set when a cancellation arrived while a turn was still being
-	// recorded. Accepting a prompt clears the process's cancellation token, so the worker
-	// re-issues a cancellation it must not lose. Cleared by the worker between requests.
-	cancel_seen:        bool, // atomic
 	// initialized is set once initialize has been answered. Only the reader writes it.
 	initialized:        bool,
 	// protocol_version is the number agreed with the client. profile is the
@@ -246,7 +242,7 @@ acp_work_id :: proc(id: acp.Jsonrpc_Id, allocator: mem.Allocator) -> (acp.Jsonrp
 acp_server_destroy :: proc(server: ^Acp_Server) {
 	// A turn still running is stopped before the worker is joined, so it settles as
 	// cancelled and the record says the session was interrupted.
-	if acp_server_has_work(server) { agent.chat_cancel_request() }
+	if acp_server_has_work(server) { agent.turn_control_stop(&server.app.run.control) }
 	if server.work != {} { chan.close(&server.work) }
 	if server.worker != nil {
 		if join_retiring(server.worker, "nabla-acp-worker") {
@@ -327,7 +323,7 @@ acp_run_work :: proc(server: ^Acp_Server, work: Acp_Work) {
 	if agent.chat_session_worker_escaped(&server.app.setup.session) { return }
 	// The request is answered, so the next one may be admitted. The cancellation belongs
 	// to the turn that just ended; a client that cancels a finished turn is ignored.
-	sync.atomic_store(&server.cancel_seen, false)
+	agent.turn_control_clear(&server.app.run.control)
 	acp_queue_remove(server)
 }
 
@@ -844,10 +840,6 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_REQUEST, "the session is already running a turn")
 		return
 	}
-	// Accepting a prompt clears the process's cancellation token for the new turn, so a
-	// cancellation that arrived while the prompt was being recorded is re-issued here.
-	if sync.atomic_load(&server.cancel_seen) { agent.chat_cancel_request() }
-
 	if acp_is_v2(server) {
 		acp_clear_active_message_id(server)
 		message_id := acp_user_message_id(server)
@@ -859,7 +851,14 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 	// The completion flag is read because the terminal status alone cannot report a
 	// turn the store could not record: the status still names what the model reached,
 	// so an unrecorded completion is corrected to a failure below.
-	turn_completed := agent.chat_run_turn_steered(chat, server.app.run.connection, agent.chat_retry_policy_default(), acp_observer(server), nil)
+	turn_completed := agent.chat_run_turn_steered(
+		chat,
+		server.app.run.connection,
+		agent.chat_retry_policy_default(),
+		acp_observer(server),
+		nil,
+		&server.app.run.control,
+	)
 
 	if agent.chat_session_worker_escaped(chat) {
 		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, agent.CHAT_WORKER_ESCAPED_NOTICE)

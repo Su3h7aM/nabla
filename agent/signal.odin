@@ -1,23 +1,19 @@
 package agent
 
+import "core:sync"
 import linux "core:sys/linux"
 import "core:sys/posix"
-import "nabla:ai"
 
-// chat_cancel is the process-wide cancellation token, observed by the signal
-// handler, the model request, and tool execution. It is a global so the handler can
-// only ever write to static storage: it can never touch a session that may already
-// be freed, and there is no pointer that can dangle underneath it. One interactive
-// turn runs at a time, so one token is sufficient; it is cleared when a turn starts,
-// so a late signal is never inherited by the next turn.
-chat_cancel: ai.Interrupt
+// process_interrupt latches a SIGINT or SIGTERM: the process was asked to stop. A signal
+// handler may only write static storage, so this is the one process-wide stop; the owner
+// applies it to the turn it runs, and the root ends the process once no turn runs.
+@(private)
+process_interrupt: bool
 
-// chat_cancel_reset begins a new cancellation generation. SIGINT is blocked across
-// the change because a handler running between the generation load and the store
-// would set the request bit on the outgoing generation, which the store then erases:
-// the signal would be silently lost. Blocking keeps it pending until the new
-// generation is published, so a signal arriving at that instant lands on the turn
-// that is starting rather than on neither.
+process_interrupted :: proc "contextless" () -> bool {
+	return sync.atomic_load(&process_interrupt)
+}
+
 // chat_signal_int_set builds a one-signal mask. `Sig_Set` is a word array, so the
 // canonical construction is a bit_set transmute rather than a libc sigaddset.
 chat_signal_int_set :: proc() -> linux.Sig_Set {
@@ -36,24 +32,8 @@ chat_watched_signals :: proc() -> linux.Sig_Set {
 	return transmute(linux.Sig_Set)mask
 }
 
-chat_cancel_reset :: proc() {
-	blocked := chat_watched_signals()
-	previous: linux.Sig_Set
-	_ = linux.rt_sigprocmask(.SIG_BLOCK, &blocked, &previous)
-	ai.interrupt_reset(&chat_cancel)
-	_ = linux.rt_sigprocmask(.SIG_SETMASK, &previous, nil)
-}
-
-chat_cancel_request :: proc() {
-	ai.interrupt_request(&chat_cancel)
-	owner_wake_signal()
-}
-chat_cancel_requested :: proc() -> bool { return ai.interrupt_requested(&chat_cancel) }
-
 chat_signal_interrupt :: proc "c" (signal: posix.Signal) {
-	// Written directly rather than through the helper so the whole handler path is
-	// contextless: a signal handler cannot depend on a context.
-	ai.interrupt_request(&chat_cancel)
+	sync.atomic_store(&process_interrupt, true)
 	owner_wake_signal()
 }
 
@@ -79,10 +59,9 @@ chat_signal_arm :: proc(previous: ^posix.sigaction_t) {
 	_ = posix.sigaction(.SIGINT, &action, previous)
 }
 
-// chat_signal_disarm restores the previous disposition. Nothing is freed and no
-// pointer is cleared, because the handler references only chat_cancel: a signal
-// that arrives while this runs either sets the token or terminates the process
-// under the restored default, and neither can reach stale memory.
+// chat_signal_disarm restores the previous disposition. The handler references only
+// static storage, so a signal that arrives while this runs either latches the
+// interrupt or terminates the process under the restored default.
 chat_signal_disarm :: proc(previous: ^posix.sigaction_t) {
 	if previous == nil { return }
 	_ = posix.sigaction(.SIGINT, previous, nil)
