@@ -16,6 +16,12 @@ test_url_parse_and_request_target :: proc(t: ^testing.T) {
 	// path is sent as "/".
 	testing.expect_value(t, request_path(url_parse("https://a.example/b?c=d"), context.temp_allocator), "/b?c=d")
 	testing.expect_value(t, request_path(url_parse("https://a.example"), context.temp_allocator), "/")
+
+	// RFC 3986 3.5: the fragment starts at the first "#", even before a "?", and
+	// is never sent.
+	fragmented := url_parse("https://a.example/b#c?d")
+	testing.expect_value(t, fragmented.fragment, "c?d")
+	testing.expect_value(t, request_path(fragmented, context.temp_allocator), "/b")
 }
 
 @(test)
@@ -36,7 +42,7 @@ test_header_field_lines :: proc(t: ^testing.T) {
 	{
 		headers: Headers
 		headers_init(&headers, context.temp_allocator)
-		_, ok := header_parse(&headers, "x:\ta\vb\t", context.temp_allocator)
+		_, ok := header_parse(&headers, "x:\ta\vb\t")
 		testing.expect(t, ok)
 		value, found := headers_get_unsafe(headers, "x")
 		testing.expect(t, found)
@@ -45,7 +51,7 @@ test_header_field_lines :: proc(t: ^testing.T) {
 	{
 		headers: Headers
 		headers_init(&headers, context.temp_allocator)
-		_, ok := header_parse(&headers, "x: a\r", context.temp_allocator)
+		_, ok := header_parse(&headers, "x: a\r")
 		testing.expect(t, ok)
 		value, _ := headers_get_unsafe(headers, "x")
 		testing.expect_value(t, value, "a\r")
@@ -56,7 +62,7 @@ test_header_field_lines :: proc(t: ^testing.T) {
 	headers: Headers
 	headers_init(&headers, context.temp_allocator)
 	for line in ([]string{" x: 1", "\tx: 1", "\t: 1", " \t: 1"}) {
-		_, ok := header_parse(&headers, line, context.temp_allocator)
+		_, ok := header_parse(&headers, line)
 		testing.expectf(t, !ok, "%q was accepted as a field line", line)
 	}
 }

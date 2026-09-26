@@ -1,3 +1,9 @@
+/*
+Package http is the HTTP/1.1 message vocabulary: methods, versions, field
+sections, request targets, framing values, and dates, each read and written
+as RFC 9110 and RFC 9112 define them. It moves no bytes; the client that does
+lives in http/client.
+*/
 package http
 
 import "base:runtime"
@@ -111,11 +117,7 @@ is_digit :: #force_inline proc(c: byte) -> bool {
 // strings.trim_space, which also removes VT, FF, CR and LF -- bytes the field
 // value grammar does not admit in the first place.
 trim_ows :: proc(s: string) -> string {
-	start := 0
-	for start < len(s) && (s[start] == ' ' || s[start] == '\t') { start += 1 }
-	end := len(s)
-	for end > start && (s[end - 1] == ' ' || s[end - 1] == '\t') { end -= 1 }
-	return s[start:end]
+	return strings.trim(s, " \t")
 }
 
 // content_length_parse reads a Content-Length as RFC 9112 6.3 defines it:
@@ -144,24 +146,22 @@ content_length_parse :: proc(value: string) -> (size: int, ok: bool) {
 chunk_size_parse :: proc(value: string) -> (size: int, ok: bool) {
 	text := trim_ows(value)
 	(len(text) > 0) or_return
-	size = 0
-	for i := 0; i < len(text); i += 1 {
-		digit := 0
-		switch text[i] {
+	for c in transmute([]u8)text {
+		digit: int
+		switch c {
 		case '0' ..= '9':
-			digit = int(text[i] - '0')
+			digit = int(c - '0')
 		case 'a' ..= 'f':
-			digit = int(text[i] - 'a') + 10
+			digit = int(c - 'a') + 10
 		case 'A' ..= 'F':
-			digit = int(text[i] - 'A') + 10
+			digit = int(c - 'A') + 10
 		case:
 			return 0, false
 		}
 		if size > (max(int) - digit) / 16 { return 0, false }
 		size = size * 16 + digit
 	}
-	ok = true
-	return
+	return size, true
 }
 
 version_write :: proc(w: io.Writer, v: Version) -> io.Error {
@@ -198,27 +198,39 @@ Method :: enum {
 	Trace,
 }
 
-_method_strings := [?]string{"GET", "POST", "DELETE", "PATCH", "PUT", "HEAD", "CONNECT", "OPTIONS", "TRACE"}
-
-method_string :: proc(m: Method) -> string #no_bounds_check {
-	if m < .Get || m > .Trace { return "" }
-	return _method_strings[m]
+@(rodata, private)
+METHOD_STRINGS := [Method]string {
+	.Get     = "GET",
+	.Post    = "POST",
+	.Delete  = "DELETE",
+	.Patch   = "PATCH",
+	.Put     = "PUT",
+	.Head    = "HEAD",
+	.Connect = "CONNECT",
+	.Options = "OPTIONS",
+	.Trace   = "TRACE",
 }
 
-method_parse :: proc(m: string) -> (method: Method, ok: bool) #no_bounds_check {
-	// PERF: I assume this is faster than a map with this amount of items.
+method_string :: proc(m: Method) -> string {
+	return METHOD_STRINGS[m]
+}
 
-	for r in Method {
-		if _method_strings[r] == m {
-			return r, true
-		}
+// method_parse reads a method token. Methods are case-sensitive (RFC 9110 9.1).
+method_parse :: proc(m: string) -> (method: Method, ok: bool) {
+	for text, candidate in METHOD_STRINGS {
+		if text == m { return candidate, true }
 	}
-
 	return nil, false
 }
 
-// Parses the header and adds it to the headers if valid. The given string is copied.
-header_parse :: proc(headers: ^Headers, line: string, allocator := context.temp_allocator) -> (key: string, ok: bool) {
+// header_parse adds one field line to headers and returns its lowercase name.
+// The name and value are copied with the headers' allocator.
+//
+// A repeated field is combined into one comma-separated value (RFC 9110 5.3),
+// except Host, which may appear once (RFC 9112 3.2), and Content-Length: RFC
+// 9112 6.3 makes differing repeats an unrecoverable error, and identical
+// repeats stand for the first value.
+header_parse :: proc(headers: ^Headers, line: string) -> (key: string, ok: bool) {
 	// RFC 9112 5: field-line = field-name ":" OWS field-value OWS, and a field name
 	// is a token, so a field line cannot begin with whitespace. RFC 9112 5.2 defines
 	// obs-fold as OWS CRLF RWS, and RWS is SP or HTAB, so a line beginning with
@@ -227,86 +239,83 @@ header_parse :: proc(headers: ^Headers, line: string, allocator := context.temp_
 
 	colon := strings.index_byte(line, ':')
 	(colon > 0) or_return
-
-	// There must not be a space before the colon.
-	(line[colon - 1] != ' ') or_return
-
-	// TODO/PERF: only actually relevant/needed if the key is one of these.
-	has_host := headers_has_unsafe(headers^, "host")
-	cl, has_cl := headers_get_unsafe(headers^, "content-length")
+	// RFC 9112 5.1: no whitespace is allowed between the field name and colon.
+	(line[colon - 1] != ' ' && line[colon - 1] != '\t') or_return
 
 	// RFC 9112 5.1: the field line value excludes the optional whitespace that
-	// may precede and follow it, and OWS is SP and HTAB only.
+	// may precede and follow it.
 	value := trim_ows(line[colon + 1:])
-	tmp_key := sanitize_key(headers^, line[:colon])
-	defer if !ok { delete(tmp_key, allocator) }
+	allocator := headers._kv.allocator
+	name := sanitize_key(headers^, line[:colon])
 
-	// RFC 7230 5.4: Server MUST respond with 400 to any request
-	// with multiple "Host" header fields.
-	if tmp_key == "host" && has_host {
+	key_ptr, value_ptr, just_inserted, insert_err := map_entry(&headers._kv, name)
+	if insert_err != nil {
+		delete(name, allocator)
 		return
 	}
-
-	// RFC 9112 6.3: a message received without Transfer-Encoding and with
-	// either multiple Content-Length field lines having differing
-	// field values or a single Content-Length field line having an
-	// invalid value is invalid, and the recipient MUST treat it as an
-	// unrecoverable error. Repeated values are identical only by numeric
-	// meaning, so leading zeros do not differ; the first value stands and
-	// no comma list is formed, which keeps a non-list field a single value.
-	if tmp_key == "content-length" && has_cl {
-		if !content_length_values_equal(cl, value) {
+	if just_inserted {
+		cloned, clone_err := strings.clone(value, allocator)
+		if clone_err != nil {
+			delete_key(&headers._kv, name)
+			delete(name, allocator)
 			return
 		}
-		delete(tmp_key, allocator)
-		key_ptr, _, _ := headers_entry_unsafe(headers, "content-length")
-		key = key_ptr^
-		ok = true
-		return
+		value_ptr^ = cloned
+		return key_ptr^, true
 	}
+	delete(name, allocator)
 
-	// RFC 9110 5.3: A recipient MAY combine multiple field lines within a field section
-	// that have the same field name into one field line, without changing
-	// the semantics of the message, by appending each subsequent field line
-	// value to the initial field line value in order, separated by a comma
-	// (",") and optional whitespace (OWS, defined in Section 5.6.3). For
-	// consistency, use comma SP.
-	key_ptr, value_ptr, just_inserted := headers_entry_unsafe(headers, tmp_key)
-	if just_inserted {
-		value = strings.clone(value, allocator)
-	} else {
-		value = strings.concatenate({value_ptr^, ", ", value}, allocator)
-		delete(tmp_key, allocator)
-		delete(value_ptr^, allocator)
+	// RFC 9112 3.2: a server responds 400 to a request with more than one Host
+	// field line, so a repeated Host is never combined.
+	if key_ptr^ == "host" { return }
+	if key_ptr^ == "content-length" {
+		return key_ptr^, content_length_values_equal(value_ptr^, value)
 	}
-	key = key_ptr^
-	value_ptr^ = value
+	combined, concat_err := strings.concatenate({value_ptr^, ", ", value}, allocator)
+	if concat_err != nil { return }
+	delete(value_ptr^, allocator)
+	value_ptr^ = combined
+	return key_ptr^, true
+}
 
-	ok = true
-	return
+// header_fold continues field key with the value of an obs-fold line.
+//
+// RFC 9112 5.2 defines obs-fold as OWS CRLF RWS and requires a user agent that
+// receives one in a response to replace it with one or more SP octets before the
+// field value is interpreted. The continuation's leading whitespace is the RWS,
+// and a continuation carrying nothing adds nothing, because trailing whitespace is
+// excluded from the field value. A fold that continues no field is refused.
+header_fold :: proc(headers: ^Headers, key, line: string) -> bool {
+	value := trim_ows(line)
+	if value == "" { return true }
+	previous, found := &headers._kv[key]
+	if !found { return false }
+	allocator := headers._kv.allocator
+	continued, concat_err := strings.concatenate({previous^, " ", value}, allocator)
+	if concat_err != nil { return false }
+	delete(previous^, allocator)
+	previous^ = continued
+	return true
 }
 
 // content_length_values_equal reports whether two Content-Length field values
-// name the same length. RFC 9112 6.3 permits repeats only when identical, and
-// identical is by numeric meaning: leading zeros state the same length. The
-// comparison strips them instead of parsing, so no representable bound limits
-// which equal values are recognized.
+// name the same length. Identical is by numeric meaning: leading zeros state the
+// same length. The comparison strips them instead of parsing, so no representable
+// bound limits which equal values are recognized.
 @(private)
 content_length_values_equal :: proc(a, b: string) -> bool {
 	a_digits, a_ok := decimal_meaning(a)
 	b_digits, b_ok := decimal_meaning(b)
-	if !a_ok || !b_ok { return false }
-	return a_digits == b_digits
+	return a_ok && b_ok && a_digits == b_digits
 }
 
 // decimal_meaning validates a nonempty all-digit field value and reports its
-// numeric meaning with leading zeros removed. A zero of any width reports
-// "0", so widths of zero compare equal.
+// numeric meaning with leading zeros removed. A zero of any width reports "0".
 @(private)
 decimal_meaning :: proc(value: string) -> (meaning: string, ok: bool) {
 	if len(value) == 0 { return "", false }
-	for c in value {
-		if c < '0' || c > '9' { return "", false }
+	for c in transmute([]u8)value {
+		if !is_digit(c) { return "", false }
 	}
 	stripped := strings.trim_left(value, "0")
 	if stripped == "" { return "0", true }
@@ -359,29 +368,6 @@ header_allowed_trailer :: proc(key: string) -> bool {
 		key != "content-range" &&
 		key != "trailer")
 	// odinfmt:enable
-}
-
-request_path_write :: proc(w: io.Writer, target: URL) -> io.Error {
-	// TODO: maybe net.percent_encode.
-
-	if target.path == "" {
-		io.write_byte(w, '/') or_return
-	} else {
-		io.write_string(w, target.path) or_return
-	}
-
-	if len(target.query) > 0 {
-		io.write_byte(w, '?') or_return
-		io.write_string(w, target.query) or_return
-	}
-
-	return nil
-}
-
-request_path :: proc(target: URL, allocator := context.allocator) -> (rq_path: string) {
-	res := strings.builder_make(0, len(target.path), allocator)
-	request_path_write(strings.to_writer(&res), target)
-	return strings.to_string(res)
 }
 
 _dynamic_unwritten :: proc(d: [dynamic]$E) -> []E {

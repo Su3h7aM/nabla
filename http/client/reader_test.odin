@@ -65,7 +65,7 @@ collect :: proc(user_data: rawptr, chunk: []u8) {
 test_response_head :: proc(t: ^testing.T) {
 	reader := _reader("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-A: 1\r\nx-a: 2\r\n\r\nabc")
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
-	defer headers_destroy(&headers, context.temp_allocator)
+	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, status, 200)
 
@@ -82,7 +82,7 @@ test_response_head :: proc(t: ^testing.T) {
 	// A head arriving one octet at a time parses the same way.
 	split := _reader("HTTP/1.1 204 No Content\r\nserver: x\r\n\r\n", 1)
 	split_status, split_headers, split_err := read_response_head(&split, context.temp_allocator)
-	defer headers_destroy(&split_headers, context.temp_allocator)
+	defer http.headers_destroy(&split_headers)
 	testing.expect_value(t, split_err, Error.None)
 	testing.expect_value(t, split_status, 204)
 }
@@ -93,7 +93,7 @@ test_chunked_body :: proc(t: ^testing.T) {
 	// a zero-sized chunk.
 	reader := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", 1)
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
-	defer headers_destroy(&headers, context.temp_allocator)
+	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
 	framing, length, framing_err := response_framing(status, .Post, headers)
 	testing.expect_value(t, framing_err, Error.None)
@@ -106,7 +106,7 @@ test_chunked_body :: proc(t: ^testing.T) {
 	// RFC 9112 7.1.1: unrecognized chunk extensions are ignored.
 	extended := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5;a=b;c\r\nhello\r\n0\r\n\r\n", 1)
 	ext_status, ext_headers, ext_err := read_response_head(&extended, context.temp_allocator)
-	defer headers_destroy(&ext_headers, context.temp_allocator)
+	defer http.headers_destroy(&ext_headers)
 	testing.expect_value(t, ext_err, Error.None)
 	ext_framing, ext_length, ext_framing_err := response_framing(ext_status, .Post, ext_headers)
 	testing.expect_value(t, ext_framing_err, Error.None)
@@ -122,7 +122,7 @@ test_content_length_and_bodyless_bodies :: proc(t: ^testing.T) {
 	// length is what proves the framing.
 	reader := _reader("HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nabcEXTRA")
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
-	defer headers_destroy(&headers, context.temp_allocator)
+	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
 	framing, length, framing_err := response_framing(status, .Post, headers)
 	testing.expect_value(t, framing_err, Error.None)
@@ -137,7 +137,7 @@ test_content_length_and_bodyless_bodies :: proc(t: ^testing.T) {
 	// same connection is readable immediately.
 	bodyless := _reader("HTTP/1.1 204 No Content\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi")
 	bodyless_status, bodyless_headers, bodyless_err := read_response_head(&bodyless, context.temp_allocator)
-	defer headers_destroy(&bodyless_headers, context.temp_allocator)
+	defer http.headers_destroy(&bodyless_headers)
 	testing.expect_value(t, bodyless_err, Error.None)
 	bodyless_framing, bodyless_length, bodyless_framing_err := response_framing(bodyless_status, .Post, bodyless_headers)
 	testing.expect_value(t, bodyless_framing_err, Error.None)
@@ -148,7 +148,7 @@ test_content_length_and_bodyless_bodies :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(bodyless_collector.buffer), 0)
 
 	next_status, next_headers, next_err := read_response_head(&bodyless, context.temp_allocator)
-	defer headers_destroy(&next_headers, context.temp_allocator)
+	defer http.headers_destroy(&next_headers)
 	testing.expect_value(t, next_err, Error.None)
 	testing.expect_value(t, next_status, 200)
 }
@@ -159,7 +159,7 @@ test_interim_responses :: proc(t: ^testing.T) {
 	wire := "HTTP/1.1 100 Continue\r\n\r\n" + "HTTP/1.1 103 Early Hints\r\nlink: </s.css>\r\n\r\n" + "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi"
 	reader := _reader(wire, 1)
 	status, headers, err := read_final_response_head(&reader, context.temp_allocator)
-	defer headers_destroy(&headers, context.temp_allocator)
+	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, status, 200)
 	framing, length, framing_err := response_framing(status, .Post, headers)
@@ -175,7 +175,7 @@ test_interim_responses :: proc(t: ^testing.T) {
 	// client never asks to upgrade.
 	switched := _reader("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\r\n", 1)
 	switch_status, switch_headers, switch_err := read_final_response_head(&switched, context.temp_allocator)
-	defer headers_destroy(&switch_headers, context.temp_allocator)
+	defer http.headers_destroy(&switch_headers)
 	testing.expect_value(t, switch_err, Error.None)
 	testing.expect_value(t, switch_status, 101)
 
@@ -191,7 +191,7 @@ test_interim_responses :: proc(t: ^testing.T) {
 	many_reader: Reader
 	reader_init(&many_reader, slice_read, source, context.temp_allocator)
 	many_status, many_headers, many_err := read_final_response_head(&many_reader, context.temp_allocator)
-	defer headers_destroy(&many_headers, context.temp_allocator)
+	defer http.headers_destroy(&many_headers)
 	testing.expect_value(t, many_err, Error.None)
 	testing.expect_value(t, many_status, 200)
 }
@@ -218,7 +218,7 @@ test_a_field_section_has_no_invented_limit :: proc(t: ^testing.T) {
 	// Delivered in pieces, so the growth of the line buffer is what this covers.
 	reader := _reader(string(wire[:]), 4096)
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
-	defer headers_destroy(&headers, context.temp_allocator)
+	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, status, 200)
 	long, found := http.headers_get_unsafe(headers, "x-long")
@@ -232,7 +232,7 @@ test_folded_fields :: proc(t: ^testing.T) {
 	// RFC 9112 5.2: an obs-fold becomes one or more SP octets.
 	reader := _reader("HTTP/1.1 200 OK\r\nx-a: one\r\n  two\r\n\tthree\r\ncontent-length: 0\r\n\r\n")
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
-	defer headers_destroy(&headers, context.temp_allocator)
+	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, status, 200)
 	value, found := http.headers_get_unsafe(headers, "x-a")
@@ -244,7 +244,7 @@ test_folded_fields :: proc(t: ^testing.T) {
 	// A fold split across reads joins the same way.
 	split := _reader("HTTP/1.1 200 OK\r\nx-a: one\r\n   two\r\n\r\n", 1)
 	_, split_headers, split_err := read_response_head(&split, context.temp_allocator)
-	defer headers_destroy(&split_headers, context.temp_allocator)
+	defer http.headers_destroy(&split_headers)
 	testing.expect_value(t, split_err, Error.None)
 	split_value, split_found := http.headers_get_unsafe(split_headers, "x-a")
 	testing.expect(t, split_found)
@@ -253,7 +253,7 @@ test_folded_fields :: proc(t: ^testing.T) {
 	// A whitespace-only continuation adds nothing.
 	blank := _reader("HTTP/1.1 200 OK\r\nx-a: one\r\n \t \r\n\r\n", 1)
 	_, blank_headers, blank_err := read_response_head(&blank, context.temp_allocator)
-	defer headers_destroy(&blank_headers, context.temp_allocator)
+	defer http.headers_destroy(&blank_headers)
 	testing.expect_value(t, blank_err, Error.None)
 	blank_value, _ := http.headers_get_unsafe(blank_headers, "x-a")
 	testing.expect_value(t, blank_value, "one")
@@ -261,7 +261,7 @@ test_folded_fields :: proc(t: ^testing.T) {
 	// A line beginning with whitespace cannot begin a field section.
 	stray := _reader("HTTP/1.1 200 OK\r\n  stray\r\n\r\n", 1)
 	_, stray_headers, stray_err := read_response_head(&stray, context.temp_allocator)
-	defer headers_destroy(&stray_headers, context.temp_allocator)
+	defer http.headers_destroy(&stray_headers)
 	testing.expect_value(t, stray_err, Error.Bad_Response)
 }
 
@@ -270,7 +270,7 @@ test_incomplete_bodies :: proc(t: ^testing.T) {
 	// A chunked body without its terminating zero-sized chunk is incomplete.
 	no_last := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n", 1)
 	status, headers, err := read_response_head(&no_last, context.temp_allocator)
-	defer headers_destroy(&headers, context.temp_allocator)
+	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
 	framing, length, framing_err := response_framing(status, .Post, headers)
 	testing.expect_value(t, framing_err, Error.None)
@@ -282,7 +282,7 @@ test_incomplete_bodies :: proc(t: ^testing.T) {
 	// short too.
 	no_trailer := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n", 1)
 	no_trailer_status, no_trailer_headers, no_trailer_err := read_response_head(&no_trailer, context.temp_allocator)
-	defer headers_destroy(&no_trailer_headers, context.temp_allocator)
+	defer http.headers_destroy(&no_trailer_headers)
 	testing.expect_value(t, no_trailer_err, Error.None)
 	no_trailer_framing, no_trailer_length, no_trailer_framing_err := response_framing(no_trailer_status, .Post, no_trailer_headers)
 	testing.expect_value(t, no_trailer_framing_err, Error.None)
@@ -294,7 +294,7 @@ test_incomplete_bodies :: proc(t: ^testing.T) {
 	// what ends it.
 	truncated := _reader("HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc")
 	truncated_status, truncated_headers, truncated_err := read_response_head(&truncated, context.temp_allocator)
-	defer headers_destroy(&truncated_headers, context.temp_allocator)
+	defer http.headers_destroy(&truncated_headers)
 	testing.expect_value(t, truncated_err, Error.None)
 	truncated_framing, truncated_length, truncated_framing_err := response_framing(truncated_status, .Post, truncated_headers)
 	testing.expect_value(t, truncated_framing_err, Error.None)
@@ -304,7 +304,7 @@ test_incomplete_bodies :: proc(t: ^testing.T) {
 
 	discarded := _reader("HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc")
 	discarded_status, discarded_headers, discarded_err := read_response_head(&discarded, context.temp_allocator)
-	defer headers_destroy(&discarded_headers, context.temp_allocator)
+	defer http.headers_destroy(&discarded_headers)
 	testing.expect_value(t, discarded_err, Error.None)
 	discarded_framing, discarded_length, discarded_framing_err := response_framing(discarded_status, .Post, discarded_headers)
 	testing.expect_value(t, discarded_framing_err, Error.None)
@@ -319,7 +319,7 @@ test_chunk_size_is_hex_digits_only :: proc(t: ^testing.T) {
 		wire := strings.concatenate({"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n", size, "\r\n"}, context.temp_allocator)
 		reader := _reader(wire, 1)
 		status, headers, err := read_response_head(&reader, context.temp_allocator)
-		defer headers_destroy(&headers, context.temp_allocator)
+		defer http.headers_destroy(&headers)
 		testing.expect_value(t, err, Error.None)
 		framing, length, framing_err := response_framing(status, .Post, headers)
 		testing.expect_value(t, framing_err, Error.None)
@@ -332,7 +332,7 @@ test_chunk_size_is_hex_digits_only :: proc(t: ^testing.T) {
 	// represent is invalid framing rather than a size.
 	upper := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nA\r\n0123456789\r\n0\r\n\r\n", 1)
 	upper_status, upper_headers, upper_err := read_response_head(&upper, context.temp_allocator)
-	defer headers_destroy(&upper_headers, context.temp_allocator)
+	defer http.headers_destroy(&upper_headers)
 	testing.expect_value(t, upper_err, Error.None)
 	upper_framing, upper_length, upper_framing_err := response_framing(upper_status, .Post, upper_headers)
 	testing.expect_value(t, upper_framing_err, Error.None)
@@ -343,7 +343,7 @@ test_chunk_size_is_hex_digits_only :: proc(t: ^testing.T) {
 
 	huge := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFF\r\n", 1)
 	huge_status, huge_headers, huge_err := read_response_head(&huge, context.temp_allocator)
-	defer headers_destroy(&huge_headers, context.temp_allocator)
+	defer http.headers_destroy(&huge_headers)
 	testing.expect_value(t, huge_err, Error.None)
 	huge_framing, huge_length, huge_framing_err := response_framing(huge_status, .Post, huge_headers)
 	testing.expect_value(t, huge_framing_err, Error.None)
@@ -360,7 +360,7 @@ test_chunk_extensions_must_parse :: proc(t: ^testing.T) {
 		wire := strings.concatenate({"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n", size, "\r\nhello\r\n0\r\n\r\n"}, context.temp_allocator)
 		reader := _reader(wire, 1)
 		status, headers, err := read_response_head(&reader, context.temp_allocator)
-		defer headers_destroy(&headers, context.temp_allocator)
+		defer http.headers_destroy(&headers)
 		testing.expect_value(t, err, Error.None)
 		framing, length, framing_err := response_framing(status, .Post, headers)
 		testing.expect_value(t, framing_err, Error.None)
@@ -372,7 +372,7 @@ test_chunk_extensions_must_parse :: proc(t: ^testing.T) {
 	// A quoted value may carry a separator without ending the extension.
 	quoted := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5;ext=\"a;b\";q=1\r\nhello\r\n0\r\n\r\n", 1)
 	quoted_status, quoted_headers, quoted_err := read_response_head(&quoted, context.temp_allocator)
-	defer headers_destroy(&quoted_headers, context.temp_allocator)
+	defer http.headers_destroy(&quoted_headers)
 	testing.expect_value(t, quoted_err, Error.None)
 	quoted_framing, quoted_length, quoted_framing_err := response_framing(quoted_status, .Post, quoted_headers)
 	testing.expect_value(t, quoted_framing_err, Error.None)
@@ -388,7 +388,7 @@ test_chunk_trailers_are_field_lines :: proc(t: ^testing.T) {
 	// field lines. A line that is not one ends the body in failure.
 	bogus := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nnot a field\r\n\r\n", 1)
 	bogus_status, bogus_headers, bogus_err := read_response_head(&bogus, context.temp_allocator)
-	defer headers_destroy(&bogus_headers, context.temp_allocator)
+	defer http.headers_destroy(&bogus_headers)
 	testing.expect_value(t, bogus_err, Error.None)
 	bogus_framing, bogus_length, bogus_framing_err := response_framing(bogus_status, .Post, bogus_headers)
 	testing.expect_value(t, bogus_framing_err, Error.None)
@@ -400,7 +400,7 @@ test_chunk_trailers_are_field_lines :: proc(t: ^testing.T) {
 	// discarded, only the syntax is checked.
 	noted := _reader("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nx-note: hi\r\n\r\n", 1)
 	noted_status, noted_headers, noted_err := read_response_head(&noted, context.temp_allocator)
-	defer headers_destroy(&noted_headers, context.temp_allocator)
+	defer http.headers_destroy(&noted_headers)
 	testing.expect_value(t, noted_err, Error.None)
 	noted_framing, noted_length, noted_framing_err := response_framing(noted_status, .Post, noted_headers)
 	testing.expect_value(t, noted_framing_err, Error.None)
@@ -415,7 +415,7 @@ test_close_delimited_bodies :: proc(t: ^testing.T) {
 	// Without a framing field the body ends at a clean close.
 	reader := _reader("HTTP/1.1 200 OK\r\n\r\nbody", 1)
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
-	defer headers_destroy(&headers, context.temp_allocator)
+	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
 	framing, length, framing_err := response_framing(status, .Post, headers)
 	testing.expect_value(t, framing_err, Error.None)
@@ -429,7 +429,7 @@ test_close_delimited_bodies :: proc(t: ^testing.T) {
 	// shape of an incomplete TLS close.
 	truncated := _reader("HTTP/1.1 200 OK\r\n\r\nbody", 1, truncated = true)
 	truncated_status, truncated_headers, truncated_err := read_response_head(&truncated, context.temp_allocator)
-	defer headers_destroy(&truncated_headers, context.temp_allocator)
+	defer http.headers_destroy(&truncated_headers)
 	testing.expect_value(t, truncated_err, Error.None)
 	truncated_framing, truncated_length, truncated_framing_err := response_framing(truncated_status, .Post, truncated_headers)
 	testing.expect_value(t, truncated_framing_err, Error.None)

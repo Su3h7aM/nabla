@@ -12,7 +12,7 @@ _framing_headers :: proc(t: ^testing.T, fields: ..string) -> http.Headers {
 	headers: http.Headers
 	http.headers_init(&headers, context.temp_allocator)
 	for field in fields {
-		_, ok := http.header_parse(&headers, field, context.temp_allocator)
+		_, ok := http.header_parse(&headers, field)
 		testing.expectf(t, ok, "%q was rejected", field)
 	}
 	return headers
@@ -63,18 +63,18 @@ test_content_length_framing :: proc(t: ^testing.T) {
 	// Differing values are an unrecoverable error, reported by the field parser.
 	differing: http.Headers
 	http.headers_init(&differing, context.temp_allocator)
-	_, first_ok := http.header_parse(&differing, "content-length: 5", context.temp_allocator)
+	_, first_ok := http.header_parse(&differing, "content-length: 5")
 	testing.expect(t, first_ok)
-	_, second_ok := http.header_parse(&differing, "content-length: 6", context.temp_allocator)
+	_, second_ok := http.header_parse(&differing, "content-length: 6")
 	testing.expect(t, !second_ok)
 
 	// RFC 9112 6.3: repeats identical by numeric meaning are one value, so
 	// leading zeros do not conflict, and the first value stands uncombined.
 	zeroed: http.Headers
 	http.headers_init(&zeroed, context.temp_allocator)
-	_, zero_first_ok := http.header_parse(&zeroed, "content-length: 7", context.temp_allocator)
+	_, zero_first_ok := http.header_parse(&zeroed, "content-length: 7")
 	testing.expect(t, zero_first_ok)
-	_, zero_second_ok := http.header_parse(&zeroed, "content-length: 007", context.temp_allocator)
+	_, zero_second_ok := http.header_parse(&zeroed, "content-length: 007")
 	testing.expect(t, zero_second_ok)
 	stored, stored_ok := http.headers_get_unsafe(zeroed, "content-length")
 	testing.expect(t, stored_ok)
@@ -84,9 +84,9 @@ test_content_length_framing :: proc(t: ^testing.T) {
 	for second in ([]string{"content-length: 8", "content-length: 7x", "content-length: "}) {
 		conflicted: http.Headers
 		http.headers_init(&conflicted, context.temp_allocator)
-		_, conflict_first_ok := http.header_parse(&conflicted, "content-length: 7", context.temp_allocator)
+		_, conflict_first_ok := http.header_parse(&conflicted, "content-length: 7")
 		testing.expect(t, conflict_first_ok)
-		_, conflict_second_ok := http.header_parse(&conflicted, second, context.temp_allocator)
+		_, conflict_second_ok := http.header_parse(&conflicted, second)
 		testing.expectf(t, !conflict_second_ok, "%q was accepted after content-length: 7", second)
 	}
 

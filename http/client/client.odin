@@ -103,7 +103,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	defer reader_destroy(&reader)
 
 	status, headers, head_err := read_final_response_head(&reader, request.allocator)
-	defer headers_destroy(&headers, request.allocator)
+	defer http.headers_destroy(&headers)
 	if head_err != .None { return failure_from_error(head_err, request.allocator) }
 	summary.response_head_received = true
 	summary.status = status
@@ -198,7 +198,7 @@ event_loop_acquire :: proc(allocator: mem.Allocator) -> Failure {
 request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase, summary: ^Transfer_Summary) -> (connection: ^Connection, failure: Failure) {
 	url := http.url_parse(request.url)
 	phase^ = .Validate
-	if valid_err, valid_detail := request_validate(url, request, request.allocator); valid_err != .None {
+	if valid_err, valid_detail := request_validate(url, request); valid_err != .None {
 		// A refused request never reached the transport, so like a refused
 		// URL it carries no cause; the kind names the refusal.
 		kind := Failure_Kind.Invalid_Request
@@ -256,7 +256,7 @@ request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase,
 // it does not speak, and fields or a target that would frame ambiguously or
 // inject bytes. URL problems report Invalid_URL; everything the caller built
 // reports Invalid_Request. The detail is a static string the failure clones.
-request_validate :: proc(url: http.URL, request: Request, allocator: mem.Allocator) -> (err: Error, detail: string) {
+request_validate :: proc(url: http.URL, request: Request) -> (err: Error, detail: string) {
 	// RFC 9110 4.2.3: schemes are case-insensitive.
 	if !strings.equal_fold(url.scheme, "http") && !strings.equal_fold(url.scheme, "https") {
 		return .Invalid_URL, "URL scheme must be http or https"
@@ -269,11 +269,10 @@ request_validate :: proc(url: http.URL, request: Request, allocator: mem.Allocat
 		if url.host[i] <= 0x20 || url.host[i] == 0x7F { return .Invalid_URL, "URL host holds a control byte or space" }
 	}
 
-	target := http.request_path(url, allocator)
-	defer delete(target, allocator)
-	if cut := strings.index_byte(target, '#'); cut >= 0 { target = target[:cut] }
-	for i in 0 ..< len(target) {
-		if target[i] <= 0x20 || target[i] == 0x7F { return .Invalid_Request, "request target holds a control byte or space" }
+	for part in ([2]string{url.path, url.query}) {
+		for i in 0 ..< len(part) {
+			if part[i] <= 0x20 || part[i] == 0x7F { return .Invalid_Request, "request target holds a control byte or space" }
+		}
 	}
 
 	for header in request.headers {
@@ -320,21 +319,18 @@ field_name_is_token :: proc(name: string) -> bool {
 // where the body begins, which is what lets a partial write say how much of the
 // body the transport took rather than how much of the whole request it took.
 format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer, body_offset: int, formatted: bool) {
-	// The request target is the origin-form of the URL -- path and query both.
-	// A fragment is never sent: RFC 9112 3.2 excludes it from the target.
-	request_target := http.request_path(url, request.allocator)
-	defer delete(request_target, request.allocator)
-	if cut := strings.index_byte(request_target, '#'); cut >= 0 { request_target = request_target[:cut] }
-
 	bytes.buffer_init_allocator(&buffer, 0, len(request.body) + 512, request.allocator)
 
 	// The request line is appended rather than formatted through a fixed buffer.
 	// A URL has no length limit, and a line that outgrows such a buffer makes fmt
 	// allocate from the ambient context allocator, which this call does not own
 	// and never releases.
+	// The request target is the origin-form of the URL (RFC 9112 3.2.1): the path,
+	// "/" when it is empty, and the query. A fragment is never sent.
 	if !request_buffer_string(&buffer, http.method_string(request.method)) ||
 	   !request_buffer_string(&buffer, " ") ||
-	   !request_buffer_string(&buffer, request_target) ||
+	   !request_buffer_string(&buffer, url.path if url.path != "" else "/") ||
+	   (url.query != "" && (!request_buffer_string(&buffer, "?") || !request_buffer_string(&buffer, url.query))) ||
 	   !request_buffer_string(&buffer, " HTTP/1.1\r\n") {
 		return buffer, 0, false
 	}
@@ -445,27 +441,6 @@ status_detail :: proc(status: int, allocator: mem.Allocator) -> string {
 	return fmt.aprintf("HTTP %d: the response status is not 2xx", status, allocator = allocator)
 }
 
-// append_folded_value continues a field with the value of a folded line.
-//
-// RFC 9112 5.2 defines obs-fold as OWS CRLF RWS and requires a user agent that
-// receives one in a response to replace it with one or more SP octets before the
-// field value is interpreted. The continuation's leading whitespace is the RWS,
-// and a continuation carrying nothing adds nothing, because trailing whitespace is
-// excluded from the field value when it is extracted.
-append_folded_value :: proc(headers: ^http.Headers, key, line: string, allocator: mem.Allocator) -> bool {
-	value := http.trim_ows(line)
-	if value == "" { return true }
-
-	_, value_ptr, just_inserted := http.headers_entry_unsafe(headers, key)
-	if just_inserted { return false }
-
-	continued, concat_err := strings.concatenate({value_ptr^, " ", value}, allocator)
-	if concat_err != nil { return false }
-	delete(value_ptr^, allocator)
-	value_ptr^ = continued
-	return true
-}
-
 read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status_code: int, headers: http.Headers, err: Error) {
 	line, line_err := reader_line(reader)
 	if line_err != .None { return 0, headers, line_err }
@@ -474,7 +449,7 @@ read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status
 	status_code = code
 	http.headers_init(&headers, allocator)
 
-	if section_err := read_field_section(reader, &headers, allocator); section_err != .None {
+	if section_err := read_field_section(reader, &headers); section_err != .None {
 		return 0, headers, section_err
 	}
 	return status_code, headers, .None
@@ -490,7 +465,7 @@ read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status
 // may hold or how long any of them may be: RFC 9110 5.4 states that HTTP places
 // no predefined limit on a field line, a field value, or a field section, and a
 // client that refuses a long one fails where every other client succeeds.
-read_field_section :: proc(reader: ^Reader, headers: ^http.Headers, allocator: mem.Allocator) -> Error {
+read_field_section :: proc(reader: ^Reader, headers: ^http.Headers) -> Error {
 	// The field a folded line continues.
 	last_key: string
 	for {
@@ -500,13 +475,13 @@ read_field_section :: proc(reader: ^Reader, headers: ^http.Headers, allocator: m
 
 		if header_line[0] == ' ' || header_line[0] == '\t' {
 			if last_key == "" { return .Bad_Response }
-			if !append_folded_value(headers, last_key, header_line, allocator) {
+			if !http.header_fold(headers, last_key, header_line) {
 				return .Bad_Response
 			}
 			continue
 		}
 
-		key, ok := http.header_parse(headers, header_line, allocator)
+		key, ok := http.header_parse(headers, header_line)
 		if !ok { return .Bad_Response }
 		last_key = key
 	}
@@ -534,7 +509,7 @@ read_final_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (
 		if head_err != .None { return 0, head, head_err }
 		if code == 101 || code >= 200 { return code, head, .None }
 
-		headers_destroy(&head, allocator)
+		http.headers_destroy(&head)
 	}
 }
 
@@ -657,25 +632,25 @@ stream_body :: proc(reader: ^Reader, framing: Body_Framing, length: int, user_da
 	return .None
 }
 
+// stream_exact delivers exactly length octets. Each chunk is a view of the
+// reader's buffer, borrowed for the callback.
 stream_exact :: proc(reader: ^Reader, length: int, user_data: rawptr, callback: Chunk_Callback) -> Error {
-	scratch: [16384]u8
 	remaining := length
 	for remaining > 0 {
-		count := min(len(scratch), remaining)
-		if err := reader_read_full(reader, scratch[:count]); err != .None { return err }
-		if callback != nil { callback(user_data, scratch[:count]) }
-		remaining -= count
+		chunk := reader_take(reader, remaining) or_return
+		if callback != nil { callback(user_data, chunk) }
+		remaining -= len(chunk)
 	}
 	return .None
 }
 
+// stream_until_closed delivers everything until the peer closes the stream.
 stream_until_closed :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callback) -> Error {
-	scratch: [16384]u8
 	for {
-		count, err := reader_read(reader, scratch[:])
+		chunk, err := reader_take(reader, max(int))
 		if err == .Closed { return .None }
 		if err != .None { return err }
-		if callback != nil { callback(user_data, scratch[:count]) }
+		if callback != nil { callback(user_data, chunk) }
 	}
 }
 
@@ -699,8 +674,8 @@ stream_chunked :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callb
 			// is checked, in scratch storage owned by this call.
 			trailers: http.Headers
 			http.headers_init(&trailers, reader.allocator)
-			section_err := read_field_section(reader, &trailers, reader.allocator)
-			headers_destroy(&trailers, reader.allocator)
+			section_err := read_field_section(reader, &trailers)
+			http.headers_destroy(&trailers)
 			if section_err != .None { return section_err }
 			return .None
 		}
@@ -783,18 +758,6 @@ is_token_char :: proc(c: byte) -> bool {
 	case:
 		return false
 	}
-}
-
-// headers_destroy frees what http.header_parse allocated, which nabla:http does not
-// provide.
-@(private)
-headers_destroy :: proc(headers: ^http.Headers, allocator: mem.Allocator) {
-	for key, value in headers._kv {
-		delete(value, allocator)
-		delete(key, allocator)
-	}
-	delete(headers._kv)
-	headers^ = {}
 }
 
 // failure_from_error builds a failure from the transport's own error. The text is

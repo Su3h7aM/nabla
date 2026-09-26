@@ -91,7 +91,7 @@ refused_request_case :: proc(url: string, headers: []Header, body: []u8, err: Er
 		headers = headers,
 		body    = body,
 	}
-	valid_err, _ := request_validate(http.url_parse(request.url), request, context.temp_allocator)
+	valid_err, _ := request_validate(http.url_parse(request.url), request)
 	testing.expect_value(t, valid_err, err)
 }
 

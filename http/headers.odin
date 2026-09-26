@@ -2,36 +2,45 @@ package http
 
 import "core:strings"
 
-// A case-insensitive ASCII map for storing headers.
+// Headers is a field section keyed by lowercase field name. Field names are
+// case-insensitive (RFC 9110 5.1). The _unsafe procedures take a name that is
+// already lowercase; the others lowercase it first.
 Headers :: struct {
 	_kv:      map[string]string,
 	readonly: bool,
 }
 
+// headers_init sets the allocator the section's map, and every name and value
+// header_parse copies into it, is owned by.
 headers_init :: proc(h: ^Headers, allocator := context.temp_allocator) {
 	h._kv.allocator = allocator
+}
+
+// headers_destroy releases a section filled by header_parse: its names, its
+// values, and the map.
+headers_destroy :: proc(h: ^Headers) {
+	allocator := h._kv.allocator
+	for key, value in h._kv {
+		delete(value, allocator)
+		delete(key, allocator)
+	}
+	delete(h._kv)
+	h^ = {}
 }
 
 headers_count :: #force_inline proc(h: Headers) -> int {
 	return len(h._kv)
 }
 
-/*
-Sets a header, given key is first sanitized, final (sanitized) key is returned.
-*/
+// headers_set stores a value under a name it lowercases first, and returns that
+// name. The section borrows the value.
 headers_set :: proc(h: ^Headers, k: string, v: string, loc := #caller_location) -> string {
-	if h.readonly {
-		panic("these headers are readonly, did you accidentally try to set a header on the request?", loc)
-	}
-
+	assert(!h.readonly, "these headers are readonly, did you accidentally try to set a header on the request?", loc)
 	l := sanitize_key(h^, k)
 	h._kv[l] = v
 	return l
 }
 
-/*
-Unsafely set header, given key is assumed to be a lowercase string and to be without newlines.
-*/
 headers_set_unsafe :: #force_inline proc(h: ^Headers, k: string, v: string, loc := #caller_location) {
 	assert(!h.readonly, "these headers are readonly, did you accidentally try to set a header on the request?", loc)
 	h._kv[k] = v
@@ -41,9 +50,6 @@ headers_get :: proc(h: Headers, k: string) -> (string, bool) #optional_ok {
 	return h._kv[sanitize_key(h, k)]
 }
 
-/*
-Unsafely get header, given key is assumed to be a lowercase string.
-*/
 headers_get_unsafe :: #force_inline proc(h: Headers, k: string) -> (string, bool) #optional_ok {
 	return h._kv[k]
 }
@@ -64,9 +70,6 @@ headers_has :: proc(h: Headers, k: string) -> bool {
 	return sanitize_key(h, k) in h._kv
 }
 
-/*
-Unsafely check for a header, given key is assumed to be a lowercase string.
-*/
 headers_has_unsafe :: #force_inline proc(h: Headers, k: string) -> bool {
 	return k in h._kv
 }
@@ -75,14 +78,9 @@ headers_delete :: proc(h: ^Headers, k: string) -> (deleted_key: string, deleted_
 	return delete_key(&h._kv, sanitize_key(h^, k))
 }
 
-/*
-Unsafely delete a header, given key is assumed to be a lowercase string.
-*/
 headers_delete_unsafe :: #force_inline proc(h: ^Headers, k: string) {
 	delete_key(&h._kv, k)
 }
-
-/* Common Helpers */
 
 headers_set_content_type :: proc {
 	headers_set_content_type_mime,
@@ -101,15 +99,12 @@ headers_set_close :: #force_inline proc(h: ^Headers) {
 	headers_set_unsafe(h, "connection", "close")
 }
 
-/*
-Escapes any newlines and converts ASCII to lowercase.
-*/
+// sanitize_key lowercases ASCII and escapes newlines, so a name can neither
+// miss a lookup by case nor split a field line when written.
 @(private = "package")
 sanitize_key :: proc(h: Headers, k: string) -> string {
 	allocator := h._kv.allocator if h._kv.allocator.procedure != nil else context.temp_allocator
-
-	// general +4 in rare case of newlines, so we might not need to reallocate.
-	b := strings.builder_make(0, len(k) + 4, allocator)
+	b := strings.builder_make(0, len(k), allocator)
 	for c in k {
 		switch c {
 		case 'A' ..= 'Z':
@@ -121,33 +116,4 @@ sanitize_key :: proc(h: Headers, k: string) -> string {
 		}
 	}
 	return strings.to_string(b)
-
-	// NOTE: implementation that only allocates if needed, but we use arena's anyway so just allocating
-	// some space should be about as fast?
-	//
-	// b: strings.Builder = ---
-	// i: int
-	// for c in v {
-	// 	if c == '\n' || (c >= 'A' && c <= 'Z') {
-	// 		b = strings.builder_make(0, len(v)+4, allocator)
-	// 		strings.write_string(&b, v[:i])
-	// 		alloc = true
-	// 		break
-	// 	}
-	// 	i+=1
-	// }
-	//
-	// if !alloc {
-	// 	return v, false
-	// }
-	//
-	// for c in v[i:] {
-	//  switch c {
-	//  case 'A'..='Z': strings.write_rune(&b, c + 32)
-	//  case '\n':      strings.write_string(&b, "\\n")
-	//  case:           strings.write_rune(&b, c)
-	//  }
-	// }
-	//
-	// return strings.to_string(b), true
 }

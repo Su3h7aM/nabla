@@ -79,6 +79,16 @@ reader_line :: proc(reader: ^Reader) -> (line: string, err: Error) {
 	}
 }
 
+// reader_take returns up to limit buffered bytes without copying them, filling
+// first when none are buffered. The view stays valid until the next fill.
+reader_take :: proc(reader: ^Reader, limit: int) -> (bytes: []u8, err: Error) {
+	if reader.head == reader.tail { reader_fill(reader) or_return }
+	count := min(limit, reader.tail - reader.head)
+	bytes = reader.buffer[reader.head:][:count]
+	reader.head += count
+	return bytes, .None
+}
+
 // reader_read returns buffered bytes, filling first when the buffer is empty.
 reader_read :: proc(reader: ^Reader, out: []u8) -> (int, Error) {
 	for {

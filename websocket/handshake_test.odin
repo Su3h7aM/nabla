@@ -50,7 +50,7 @@ test_upgrade_response_selects_only_an_offered_protocol_and_no_extension :: proc(
 	http.headers_init(&accepted_headers, context.temp_allocator)
 	accept_field := fmt.aprintf("sec-websocket-accept: %s", string(accept[:]), allocator = context.temp_allocator)
 	for field in ([]string{"upgrade: websocket", "connection: Upgrade", accept_field, "sec-websocket-protocol: chat.v2"}) {
-		_, ok := http.header_parse(&accepted_headers, field, context.temp_allocator)
+		_, ok := http.header_parse(&accepted_headers, field)
 		if !testing.expectf(t, ok, "%q was not a response field", field) { return }
 	}
 	accepted := client.Upgraded {

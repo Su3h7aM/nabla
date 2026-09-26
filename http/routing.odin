@@ -8,43 +8,6 @@ import "core:strconv"
 import "core:strings"
 import "core:text/match"
 
-URL :: struct {
-	raw:    string, // All other fields are views/slices into this string.
-	scheme: string,
-	host:   string,
-	path:   string,
-	query:  string,
-}
-
-url_parse :: proc(raw: string) -> (url: URL) {
-	url.raw = raw
-	s := raw
-
-	// Per RFC 3986 3.4 the query component can contain both ':' and '/' characters unescaped.
-	// Since the scheme may be absent in a HTTP request line, the query should be separated first.
-	i := strings.index(s, "?")
-	if i != -1 {
-		url.query = s[i + 1:]
-		s = s[:i]
-	}
-
-	i = strings.index(s, "://")
-	if i >= 0 {
-		url.scheme = s[:i]
-		s = s[i + 3:]
-	}
-
-	i = strings.index(s, "/")
-	if i == -1 {
-		url.host = s
-	} else {
-		url.host = s[:i]
-		url.path = s[i:]
-	}
-
-	return
-}
-
 Query_Entry :: struct {
 	key, value: string,
 }

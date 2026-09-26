@@ -56,7 +56,7 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 
 	status, headers, head_err := read_final_response_head(&reader, request.allocator)
 	if head_err != .None {
-		headers_destroy(&headers, request.allocator)
+		http.headers_destroy(&headers)
 		connection_destroy(connection)
 		return nil, failure_from_error(head_err, request.allocator)
 	}
@@ -71,7 +71,7 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 		options.response_head.observed(options.response_head.user_data, head, headers)
 	}
 	if status != 101 {
-		headers_destroy(&headers, request.allocator)
+		http.headers_destroy(&headers)
 		connection_destroy(connection)
 		detail := fmt.aprintf("HTTP %d: the response did not upgrade the connection", status, allocator = request.allocator)
 		return nil, Failure{kind = .HTTP_Status, status = status, detail = detail}
@@ -123,7 +123,7 @@ upgraded_abort :: proc(upgraded: ^Upgraded) {
 upgraded_release :: proc(upgraded: ^Upgraded, aborted: bool) {
 	if upgraded == nil { return }
 	delete(upgraded.pending, upgraded.allocator)
-	headers_destroy(&upgraded.headers, upgraded.allocator)
+	http.headers_destroy(&upgraded.headers)
 	if aborted { connection_abort(upgraded.connection) } else { connection_destroy(upgraded.connection) }
 	allocator := upgraded.allocator
 	// The loop was acquired for the upgraded connection as much as for the request
