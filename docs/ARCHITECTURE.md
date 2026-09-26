@@ -195,7 +195,7 @@ Zero means absent for every ID. IDs render as lowercase hex or decimal only at b
 | MCP server | per configured server, started lazily | (external) | its own process |
 | subagent child | 0..`SUBAGENTS_MAX_RUNNING` | (external) | its own session |
 
-An idle process has the main, owner, and watcher threads (plus the ACP reader) asleep in the calls above and nothing else.
+An idle process has the main, owner, and watcher threads (plus the ACP reader) asleep in the calls above and nothing else. The table names the Linux mechanisms; another platform supplies its equivalents behind the same package-local procedures (section 3.5).
 
 ### 6.2 Owner loop
 
@@ -982,12 +982,8 @@ A default changes only with a measurement from the journal or a benchmark test. 
 | --- | --- |
 | `agent/session` tables `turns`, `requests`, `entries`; JSON strings inside JSON | `agent/journal` records, nodes, branches; typed columns, one-level JSON `data`, exact `body` |
 | JSONL run logs, segments, retention, `log_read` | journal records, diag ring, SQL views, artifacts |
-| `chat_wake` condition broadcast, 64-slot mailbox, root 50 ms idle poll, TUI 50 ms poll | futex-sequence owner wake, per-job handoff with terminal slot, `ppoll` with eventfd |
-| process-global `chat_cancel` reset per turn | per-turn and per-job `Stop`; the signal maps to the active session |
-| orphan and `Self_Cleanup` job retirement | owner frees after join; abandoned jobs retained and the session poisoned |
-| admission deadline plus a separate shell budget | one effective timeout from job start |
-| 64 KiB tool-argument cap in `ai`; failed responses end the turn | no harness caps; unusable responses and refusals become `Notice` feedback |
-| attempt counts, request caps, Code Mode instruction and wall limits, result retention caps | external limits only (section 2.1) |
+| TUI 50 ms input poll | `ppoll` with the view eventfd |
+| result and output caps (`TOOL_MAX_RESULT_BYTES`, the read window cap, Lua log and message caps) | whole results projected through the context budget (section 14.3) |
 | one native lane, serial Code Mode children | access-class scheduler, `job.start` / `job.wait` |
 | JSON envelope for native results and Lua transport | typed `Tool_Args` / `Tool_Output`, rendered once at commit |
 | `builtin_edit` old/new replacements | `builtin_patch` |
