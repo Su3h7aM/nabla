@@ -426,11 +426,40 @@ chat_notice_text :: proc(notice: Chat_Notice) -> string {
 	return ""
 }
 
+// CHAT_NOTICE_DETAIL_MAX_BYTES bounds the provider's own words inside a notice. It is what
+// the model has to work with, and it is the provider's account of the refusal, not a
+// document to be carried whole.
+CHAT_NOTICE_DETAIL_MAX_BYTES :: 2048
+
+// chat_notice_committed_text is the exact text a notice puts into the conversation: the
+// harness's explanation of the refusal, and, when the provider gave one, the provider's own
+// account of it. The explanation is a literal and the provider's words vary, so the composed
+// text is built in the caller's memory. A refusal the model cannot read is one it cannot
+// correct, so nothing the provider said is dropped.
+chat_notice_committed_text :: proc(chat: ^Chat_Session, allocator: mem.Allocator) -> string {
+	explanation := chat_notice_text(chat.pending_notice)
+	if chat.notice_detail == "" { return explanation }
+	return fmt.aprintf("%s The provider reported: %s", explanation, chat.notice_detail, allocator = allocator)
+}
+
+// chat_notice_clear drops a notice that was committed or abandoned, with whatever the
+// provider said about it.
+chat_notice_clear :: proc(chat: ^Chat_Session) {
+	delete(chat.notice_detail, chat.allocator)
+	chat.notice_detail = ""
+	chat.pending_notice = .None
+}
+
 // chat_session_note_notice records that the running response was unusable and
 // moves the turn on to another request. The notice itself is committed with the
-// response that caused it, so the explanation follows the text it explains.
-chat_session_note_notice :: proc(chat: ^Chat_Session, source: Chat_Event_Source, notice: Chat_Notice) -> bool {
+// response that caused it, so the explanation follows the text it explains. detail
+// is the provider's account of the refusal, kept when it gave one so the model is
+// told what happened and can correct the work it asked for.
+chat_session_note_notice :: proc(chat: ^Chat_Session, source: Chat_Event_Source, notice: Chat_Notice, detail := "") -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
+	delete(chat.notice_detail, chat.allocator)
+	chat.notice_detail = ""
+	if detail != "" { chat.notice_detail = ai.provider_bounded_text(detail, CHAT_NOTICE_DETAIL_MAX_BYTES, chat.allocator) }
 	chat.pending_notice = notice
 	chat.state = .Preparing
 	return true
@@ -601,8 +630,9 @@ chat_session_apply :: proc(chat: ^Chat_Session, event: ^Chat_Event) -> Chat_Appl
 			chat_session_note_cancel(chat)
 		} else if value.kind == .Invalid_Data {
 			// The response itself could not be decoded. The model can still be reached, so
-			// it is told and the turn goes on instead of ending on a failure it cannot see.
-			chat_session_note_notice(chat, value.source, .Unreadable_Response)
+			// it is told, in the provider's own words when it gave any, and the turn goes on
+			// instead of ending on a failure the model cannot see.
+			chat_session_note_notice(chat, value.source, .Unreadable_Response, value.message)
 		} else {
 			chat_session_feed_error(chat, value.source, value.message)
 		}
@@ -631,7 +661,7 @@ chat_session_apply :: proc(chat: ^Chat_Session, event: ^Chat_Event) -> Chat_Appl
 		} else if value.reason == .Length {
 			chat_session_note_notice(chat, value.source, .Truncated)
 		} else {
-			chat_session_note_notice(chat, value.source, .Incomplete_Response)
+			chat_session_note_notice(chat, value.source, .Incomplete_Response, value.reason_text)
 		}
 		return {completion_accepted = true}
 	}

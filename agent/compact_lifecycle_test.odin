@@ -305,7 +305,7 @@ test_a_failed_compaction_leaves_the_context_alone :: proc(t: ^testing.T) {
 		API      = .OpenAI_Chat_Completions,
 		Endpoint = "http://127.0.0.1:9/",
 	}
-	chat.compact_retry = test_compact_retry_policy()
+	chat.compact_retry = test_retry_policy()
 	prep, prep_err := chat_prepare(chat, dead, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	testing.expect_value(t, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
@@ -468,7 +468,7 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(t: ^testing.
 
 	// A request that fits is never held up by the job. The dead endpoint fails every attempt
 	// the chain may make, and a summary that never arrives writes no checkpoint.
-	chat.compact_retry = test_compact_retry_policy()
+	chat.compact_retry = test_retry_policy()
 	if !compact_service_until(t, chat, .Idle) { return }
 	checkpoint, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
 	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
@@ -685,7 +685,7 @@ test_a_transient_summary_failure_is_retried_on_the_same_bytes :: proc(t: ^testin
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 500_000)
-	chat.compact_retry = test_compact_retry_policy()
+	chat.compact_retry = test_retry_policy()
 	_test_accept(t, chat, "first")
 	large := strings.repeat("work ", 320_000) or_else ""
 	defer delete(large)
@@ -760,7 +760,7 @@ test_a_summary_that_produced_nothing_is_not_sent_again :: proc(t: ^testing.T) {
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 500_000)
-	chat.compact_retry = test_compact_retry_policy()
+	chat.compact_retry = test_retry_policy()
 	_test_accept(t, chat, "first")
 	large := strings.repeat("work ", 320_000) or_else ""
 	defer delete(large)
@@ -808,7 +808,7 @@ test_a_summary_chain_stops_at_its_bound :: proc(t: ^testing.T) {
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 500_000)
-	chat.compact_retry = test_compact_retry_policy()
+	chat.compact_retry = test_retry_policy()
 	_test_accept(t, chat, "first")
 	large := strings.repeat("work ", 320_000) or_else ""
 	defer delete(large)
@@ -857,7 +857,7 @@ test_a_terminal_summary_failure_suppresses_automatic_starts :: proc(t: ^testing.
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 500_000)
-	chat.compact_retry = test_compact_retry_policy()
+	chat.compact_retry = test_retry_policy()
 	_test_accept(t, chat, "first")
 	large := strings.repeat("work ", 320_000) or_else ""
 	defer delete(large)
@@ -905,7 +905,7 @@ test_an_exhausted_chain_waits_for_the_context_to_move :: proc(t: ^testing.T) {
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 500_000)
-	chat.compact_retry = test_compact_retry_policy()
+	chat.compact_retry = test_retry_policy()
 	_test_accept(t, chat, "first")
 	large := strings.repeat("work ", 320_000) or_else ""
 	defer delete(large)

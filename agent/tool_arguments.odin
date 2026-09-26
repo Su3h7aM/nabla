@@ -7,13 +7,15 @@ import "core:strings"
 
 import "nabla:agent/session"
 
-// TOOL_MAX_ARGS_BYTES bounds an argument document before it is parsed, so a
-// model cannot make the harness allocate in proportion to its own output.
-TOOL_MAX_ARGS_BYTES :: 64 * 1024
+// An argument document is admitted at whatever size the model sent. The harness does not
+// bound the model's own output: the model and the provider are the only parties that may,
+// and a model that asked for more than the provider allows hears it from the provider that
+// refused it, not from this package guessing the bound.
 
 // TOOL_MAX_ARGS_DEPTH bounds nesting. It is checked before parsing because the
 // JSON parser recurses once per level, so a deeply nested document would reach
-// the stack before any later check could refuse it.
+// the stack before any later check could refuse it. It is the parser's bound, not
+// a bound on what the model may say.
 TOOL_MAX_ARGS_DEPTH :: 32
 
 // A tool argument defect. field is the JSON pointer path of the argument the
@@ -103,7 +105,8 @@ tool_argument_error_text :: proc(err: Tool_Argument_Error, allocator := context.
 		if err.expected != "" { return fmt.aprintf("field %q must be %s", err.field, err.expected, allocator = allocator) }
 		return fmt.aprintf("field %q is invalid", err.field, allocator = allocator)
 	case .Too_Large:
-		return fmt.aprintf("the arguments exceed %d bytes", TOOL_MAX_ARGS_BYTES, allocator = allocator)
+		if err.expected != "" { return fmt.aprintf("field %q must be %s", err.field, err.expected, allocator = allocator) }
+		return fmt.aprintf("field %q is too large", err.field, allocator = allocator)
 	case .Too_Deep:
 		return fmt.aprintf("the arguments nest more than %d levels deep", TOOL_MAX_ARGS_DEPTH, allocator = allocator)
 	}
@@ -157,10 +160,6 @@ tool_arguments_destroy :: proc(arguments: ^Tool_Arguments, allocator := context.
 tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (arguments: Tool_Arguments) {
 	if raw == "" {
 		arguments.error = tool_argument_error(.Syntax, allocator = allocator)
-		return
-	}
-	if len(raw) > TOOL_MAX_ARGS_BYTES {
-		arguments.error = tool_argument_error(.Too_Large, allocator = allocator)
 		return
 	}
 
@@ -356,7 +355,6 @@ tool_arguments_escape_control_chars :: proc(raw: string, allocator := context.al
 			strings.write_byte(&builder, c)
 			i += 1
 		}
-		if strings.builder_len(builder) > TOOL_MAX_ARGS_BYTES { return "", false }
 	}
 	if !changed { return "", false }
 	return strings.to_string(builder), true

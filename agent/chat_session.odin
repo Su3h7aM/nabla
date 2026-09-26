@@ -151,6 +151,11 @@ Chat_Session :: struct {
 	// while the response is still streaming and committed with it, so the
 	// explanation lands after the text it explains.
 	pending_notice:               Chat_Notice,
+	// notice_detail is the provider's own account of the failure the notice explains:
+	// owned, bounded, and empty when the harness refused the response itself. It is
+	// committed with the notice, because a refusal the model cannot read is one it
+	// cannot correct.
+	notice_detail:                string,
 	requests_made:                int, // model requests made in this turn
 	calls_made:                   int, // tool executions in this turn
 	active_failed:                bool,
@@ -500,7 +505,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 		chat.tool_jobs_active = false
 	}
 	chat_pending_calls_clear(chat)
-	chat.pending_notice = .None
+	chat_notice_clear(chat)
 	chat_pending_response_clear(chat)
 	delete(chat.last_error, chat.allocator)
 	chat.last_error = ""

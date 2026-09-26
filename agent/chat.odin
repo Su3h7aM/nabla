@@ -158,7 +158,7 @@ chat_commit_response :: proc(
 	if outcome == .Completed && !chat_commit_response_entries(chat, request_no, at_ms) { return }
 	// A notice is only ever committed with the response that raised it. One that
 	// did not commit, because the turn failed or was cancelled, is dropped.
-	chat.pending_notice = .None
+	chat_notice_clear(chat)
 
 	if finish_row { chat_finish_request(chat, request_no, attempts, send, usages) }
 	finished := [3]Log_Field {
@@ -183,9 +183,12 @@ chat_commit_response :: proc(
 // caller must not continue.
 @(private)
 chat_commit_response_entries :: proc(chat: ^Chat_Session, request_no: session.Request_No, at_ms: i64) -> bool {
+	// The notice's committed text is composed here and handed to the entries, so the scope
+	// that made it is the scope that releases it.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	text := string(chat.partial_assistant[:])
 	response_count := 1 if chat.pending_response_present else 0
-	notice_text := chat_notice_text(chat.pending_notice)
+	notice_text := chat_notice_committed_text(chat, context.temp_allocator)
 	chat.response_cost = chat_response_cost(chat, text, notice_text)
 	entries: [dynamic]session.New_Entry = make([dynamic]session.New_Entry, 0, response_count + len(chat.pending_calls) + 2, chat.allocator)
 	defer delete(entries)
