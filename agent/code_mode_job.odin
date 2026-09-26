@@ -181,18 +181,6 @@ tool_job_lua_finish :: proc(job: ^Tool_Job) {
 
 @(private)
 tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: ^Tool_Job) {
-	if jobs.admitted >= TOOL_JOBS_MAX_ADMISSIONS {
-		parent.result = code_mode_job_failure(
-			parent,
-			.Tool_Failed,
-			.Tool_Call_Limit,
-			fmt.tprintf("the Code Mode execution reached this batch's limit of %d tool calls", TOOL_JOBS_MAX_ADMISSIONS),
-			"tool call limit",
-		)
-		parent.result_present = true
-		parent.phase = .Result_Ready
-		return
-	}
 	arguments, message := code_mode_lua_request_json(parent.lua, parent.allocator)
 	if message != "" {
 		defer delete(message, parent.allocator)

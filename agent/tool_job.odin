@@ -31,18 +31,6 @@ import "nabla:ai"
 // parent block its own child.
 TOOL_JOBS_MAX_ACTIVE :: 4
 
-// TOOL_JOBS_MAX bounds one model batch: how many calls a single response may commit.
-// The model-facing limit on calls per response is smaller; this is the harness's own
-// ceiling on the records it will hold for one response.
-TOOL_JOBS_MAX :: 64
-
-// TOOL_JOBS_MAX_ADMISSIONS bounds every admission in one batch, outer calls and Code
-// Mode children together. The table keeps released jobs until the batch ends, so this
-// is what bounds a script that makes many sequential calls, and it is deliberately
-// larger than TOOL_JOBS_MAX: a script whose whole point is to loop over a directory must
-// not run out of room at the size of one model response.
-TOOL_JOBS_MAX_ADMISSIONS :: 256
-
 // TOOL_JOBS_STOP_PATIENCE is how long a call may keep running after its stop was asked for,
 // by the turn's cancellation or by its own timeout. A backend that never returns cannot be
 // stopped cooperatively, so past this the call is answered as unknown and its job is
@@ -187,7 +175,6 @@ Tool_Jobs :: struct {
 	jobs:             [dynamic]^Tool_Job,
 	allocator:        mem.Allocator, // the session's: it owns the table, not the jobs
 	next_id:          u64,
-	admitted:         int, // every admission in this batch, outer calls and children
 	active:           int, // worker-placed jobs running now
 	committed:        int, // all durable results, including nested calls
 	committed_roots:  int, // provider calls answered at the turn barrier
@@ -214,9 +201,7 @@ Tool_Jobs :: struct {
 tool_jobs_init :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, capacity: int, worker_allocator: mem.Allocator) {
 	jobs.allocator = chat.allocator
 	jobs.worker_allocator = worker_allocator
-	bounded := capacity
-	if bounded > TOOL_JOBS_MAX { bounded = TOOL_JOBS_MAX }
-	jobs.jobs = make([dynamic]^Tool_Job, 0, bounded, chat.allocator)
+	jobs.jobs = make([dynamic]^Tool_Job, 0, capacity, chat.allocator)
 	jobs.render = Result_Reader {
 		store      = chat.store,
 		session_id = chat.id,
@@ -322,7 +307,6 @@ tool_jobs_publish :: proc(jobs: ^Tool_Jobs, job: ^Tool_Job) -> bool {
 		return false
 	}
 	jobs.next_id += 1
-	jobs.admitted += 1
 	return true
 }
 
@@ -331,7 +315,6 @@ tool_jobs_publish :: proc(jobs: ^Tool_Jobs, job: ^Tool_Job) -> bool {
 // that cannot run into a result now, so the batch only ever executes admitted calls.
 tool_jobs_submit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer) {
 	for &staged in chat.pending_calls {
-		if len(jobs.jobs) >= TOOL_JOBS_MAX { return }
 		job, alloc_err := mem.new(Tool_Job, jobs.worker_allocator)
 		if alloc_err != nil { return }
 		job^ = {

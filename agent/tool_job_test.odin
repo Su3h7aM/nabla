@@ -315,10 +315,33 @@ test_code_mode_reports_which_limit_stopped_it :: proc(t: ^testing.T) {
 	testing.expect(t, recorded, "a stopped execution still answers its call")
 }
 
-// A script whose point is to loop over many things must not run out of room at the size
-// of one model response: the batch's admission budget counts outer calls and children
-// together, and the table keeps released jobs, so the budget rather than the table size
-// is what bounds a long script.
+// Admission must preserve every call the provider committed, including a batch larger
+// than the old fixed table size. Unknown tools get results instead of disappearing.
+@(test)
+test_tool_batch_admits_every_committed_call :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+	call_count :: 65
+	for i in 0 ..< call_count {
+		_test_stage_call(t, chat, fmt.tprintf("call_%d", i), "{}", "missing_tool")
+	}
+
+	jobs: Tool_Jobs
+	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
+	defer tool_jobs_destroy(&jobs)
+	tool_jobs_submit(&jobs, chat, {})
+	testing.expect_value(t, len(jobs.jobs), call_count)
+	for job in jobs.jobs {
+		testing.expect_value(t, job.phase, Tool_Job_Phase.Result_Ready)
+	}
+}
+
+// A script can submit more child calls than the old one-response table size. The
+// table keeps every job until the batch ends, even after a child has committed.
+CODE_MODE_TEST_CHILD_CALLS :: 72
+
 @(test)
 test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 	test: Tool_Test
@@ -328,10 +351,10 @@ test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 	hold: Tool_Job_Hold_State
 	lane := tool_job_hold_lane(&hold)
 	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_step", tool_job_immediate_execute))
-	// The script makes more calls than one model response could commit.
+	// More children than the old fixed batch size.
 	source := fmt.aprintf(
 		`local seen = 0 for i = 1, %d do local r = tools.test_step() if r.status == "success" then seen = seen + 1 end end return seen`,
-		TOOL_JOBS_MAX + 8,
+		CODE_MODE_TEST_CHILD_CALLS,
 		allocator = context.temp_allocator,
 	)
 	object := make(json.Object, 1, context.temp_allocator)
@@ -346,11 +369,10 @@ test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 	tool_jobs_submit(&jobs, chat, {})
 	tool_job_test_drain(t, &test, &jobs)
 
-	testing.expect_value(t, jobs.admitted, TOOL_JOBS_MAX + 9)
+	testing.expect_value(t, len(jobs.jobs), CODE_MODE_TEST_CHILD_CALLS + 1)
 	testing.expect_value(t, tool_jobs_committed(&jobs), 1)
 
-	// The parent's answer is what the script computed from every child it ran, which is
-	// only possible if the table kept admitting after one response's worth of calls.
+	// The parent's answer is what the script computed from every child it ran.
 	// A result is linked to its call by related_seq, so the parent's answer is found by
 	// following that link rather than by guessing which result came first. The load
 	// raises the row limit, because one script's children fill a default page.
@@ -372,7 +394,7 @@ test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 		if !present || related != parent_seq { continue }
 		found = true
 		testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-		testing.expect(t, strings.contains(result.content, fmt.tprintf(`"output":%d`, TOOL_JOBS_MAX + 8)), result.content)
+		testing.expect(t, strings.contains(result.content, fmt.tprintf(`"output":%d`, CODE_MODE_TEST_CHILD_CALLS)), result.content)
 	}
 	testing.expect(t, found, "the script should have answered its call")
 }
