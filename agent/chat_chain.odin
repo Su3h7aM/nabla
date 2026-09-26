@@ -239,20 +239,21 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	// the conversation have diverged, and no request may be built on that.
 	if chat_session_storage_failed(chat) { return }
 
-	// The request this attempt builds is made in the chain's own arena, so the read of the
-	// store behind it and the projection over it have one owner. The chain literal at the
-	// end of this procedure adopts the arena; until then this scope destroys it on every
-	// return.
-	scratch: virtual.Arena
-	if arena_error := virtual.arena_init_growing(&scratch); arena_error != nil {
+	// Request data borrows this arena, so initialize it at the address the chain keeps
+	// through every attempt. Until the chain is ready, this scope releases it on failure.
+	chain := &chat.chain
+	if arena_error := virtual.arena_init_growing(&chain.scratch); arena_error != nil {
 		chat_session_fail_turn(chat, "the request scratch could not be allocated")
 		return
 	}
 	scratch_owned := true
 	defer {
-		if scratch_owned { virtual.arena_destroy(&scratch) }
+		if scratch_owned {
+			virtual.arena_destroy(&chain.scratch)
+			chain^ = {}
+		}
 	}
-	scratch_allocator := virtual.arena_allocator(&scratch)
+	scratch_allocator := virtual.arena_allocator(&chain.scratch)
 
 	prep, prep_err := chat_prepare(chat, connection, scratch_allocator)
 	if prep_err != nil {
@@ -327,19 +328,16 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	log_emit({level = .Info, category = .Provider, event = "request.prepared", fields = prepared[:]})
 
 	chat.last_estimate = prep.estimate
-	chat.chain = Chat_Request_Chain {
-		active            = true,
-		stage             = .Ready,
-		connection        = connection,
-		policy            = policy,
-		observer          = observer,
-		options           = options,
-		prep              = prep,
-		scratch           = scratch,
-		encoded           = encoded,
-		websocket_request = websocket_request,
-		recovery_kind     = .Transient_Retry,
-	}
+	chain.active = true
+	chain.stage = .Ready
+	chain.connection = connection
+	chain.policy = policy
+	chain.observer = observer
+	chain.options = options
+	chain.prep = prep
+	chain.encoded = encoded
+	chain.websocket_request = websocket_request
+	chain.recovery_kind = .Transient_Retry
 	scratch_owned = false
 	body_owned = false
 }

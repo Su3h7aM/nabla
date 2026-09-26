@@ -67,6 +67,7 @@ test_a_released_chain_retires_the_operation_it_began :: proc(t: ^testing.T) {
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
 	chat_request_begin(chat, connection, test_retry_policy(), {})
+	testing.expect(t, chat.chain.prep.wire.allocator.data == rawptr(&chat.chain.scratch), "the prepared request uses its chain's arena")
 
 	// A connection that refuses writes stands in for storage that went away, or filled up,
 	// after the boundary and before the attempt's own row. Only that row is refused.
