@@ -511,7 +511,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat.active_failed = false
 	chat.requests_made = 0
 	chat.calls_made = 0
-	ai.interrupt_reset(&chat.stop)
+	chat.stop = {}
 	chat_operation_retire(&chat.operation)
 	chat_chain_release(chat)
 	if chat.tool_jobs_active {

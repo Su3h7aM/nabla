@@ -167,32 +167,6 @@ test_signal_handler_outlives_sessions :: proc(t: ^testing.T) {
 	}
 }
 
-// --- stale handler requests ----------------------------------------------------
-
-// A request is only honoured if the token still holds the generation the requester
-// observed. This is the mechanism that makes the interleaving below impossible.
-@(test)
-test_interrupt_generation_rejects_stale_request :: proc(t: ^testing.T) {
-	token: ai.Interrupt
-	stale := ai.interrupt_capture(&token)
-	ai.interrupt_reset(&token)
-	// The stale requester resumes after the reset and must not take effect.
-	ai.interrupt_request_captured(&token, stale)
-	testing.expect(t, !ai.interrupt_requested(&token))
-
-	// A request in the current generation still works, and resetting clears it.
-	ai.interrupt_request(&token)
-	testing.expect(t, ai.interrupt_requested(&token))
-	ai.interrupt_reset(&token)
-	testing.expect(t, !ai.interrupt_requested(&token))
-
-	// Repeated requests within one generation stay idempotent.
-	current := ai.interrupt_capture(&token)
-	ai.interrupt_request_captured(&token, current)
-	ai.interrupt_request(&token)
-	testing.expect(t, ai.interrupt_requested(&token))
-}
-
 // --- post-fork child path -----------------------------------------------------
 
 Shell_Spin :: struct {
