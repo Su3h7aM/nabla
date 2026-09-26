@@ -91,9 +91,6 @@ Chat_Request_Chain :: struct {
 // be written, is the only thing left that can, and an operation left running would leave the
 // turn with no stage it can reach a terminal from.
 chat_chain_release :: proc(chat: ^Chat_Session) {
-	// A producer waiting for room is released before the join, so backpressure cannot
-	// outlive the drain that would have delivered its events.
-	mailbox_close(&chat.mailbox)
 	chat_chain_join(chat)
 	chat_session_retire_operation(chat)
 	// The request the chain built came from its arena, so there is one release for it rather
@@ -467,17 +464,17 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 chat_chain_await :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) {
 	chain := &chat.chain
 	if !chain.active || chain.stage != .Sending { return }
-	for {
-		event, ok := mailbox_take(&chat.mailbox)
-		if !ok { break }
+	seen := owner_wake_seen()
+	// The terminal is taken first: the worker publishes it after its last event.
+	terminal, published := mailbox_take_terminal(&chat.mailbox)
+	events := mailbox_take_all(&chat.mailbox)
+	defer delete(events)
+	for &event in events {
 		chat_chain_apply_event(chat, usages, &event)
 		chat_event_destroy(&event, chat.mailbox.allocator)
 	}
-	terminal, published := mailbox_take_terminal(&chat.mailbox)
 	if !published {
-		// An attempt has no deadline of its own: the provider, the transport, or a requested
-		// stop ends it, so the owner waits for a publication rather than for a clock.
-		mailbox_await(&chat.mailbox, nil)
+		if len(events) == 0 { owner_wake_wait(seen, nil) }
 		return
 	}
 	chat_chain_join(chat)

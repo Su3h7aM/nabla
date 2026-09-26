@@ -106,9 +106,6 @@ Chat_Session :: struct {
 	// chat_chain_commit releases them.
 	chain:                        Chat_Request_Chain,
 
-	// mailbox is how the request worker hands facts to the owner thread. It is fixed-size,
-	// owns only its queued payloads, and allocates them with its own allocator, which must be
-	// safe to use from a worker.
 	mailbox:                      Owner_Mailbox,
 
 	// storage_failed latches a durable write that did not land. A session that
@@ -320,6 +317,7 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	// it is stopped before anything the session owns is released.
 	chat_compact_destroy(chat)
 	chat_chain_release(chat)
+	mailbox_destroy(&chat.mailbox)
 	ai.Provider_Encode_Cache_Destroy(&chat.encode_cache)
 	if chat.provider_websocket != nil {
 		ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)

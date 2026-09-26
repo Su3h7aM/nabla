@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import linux "core:sys/linux"
 import "core:thread"
 import "core:time"
@@ -304,9 +305,7 @@ Compact_Job :: struct {
 	// logging is the immutable binding the worker uses for provider and runtime records.
 	// It points at the session's sink and owns no strings.
 	logging:    Log_Binding,
-	// finished is the worker's word that everything below is on the struct. It is published
-	// through the owner wake and read under it, so the owner learns the job ended without
-	// asking the thread library; the join that follows the flag proves the payload.
+	// finished is atomic: the worker stores it once the fields below are final.
 	finished:   bool,
 	output:     [dynamic]u8, // owner after join
 	reason:     ai.Provider_Finish_Reason,
@@ -433,10 +432,8 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 		job.error_text = job.operation.detail
 		job.operation.detail = ""
 	}
-	// The result is complete. Publishing it here rather than letting the owner ask whether the
-	// thread has exited is what makes this job return through the same wake every other producer
-	// uses, and what frees its storage at the next observation instead of at the next boundary.
-	owner_wake_publish(&job.finished)
+	sync.atomic_store(&job.finished, true)
+	owner_wake_signal()
 }
 
 @(private)
@@ -899,7 +896,7 @@ chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
 	control := &chat.compact
 	job := control.job
 	if job == nil || job.thread == nil { return }
-	if !owner_wake_published(&job.finished) { return }
+	if !sync.atomic_load(&job.finished) { return }
 
 	thread.join(job.thread)
 	thread.destroy(job.thread)

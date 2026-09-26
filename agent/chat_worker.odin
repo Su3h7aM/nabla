@@ -166,12 +166,12 @@ chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	}
 }
 
-// chat_worker_push hands one owned event to the mailbox, or releases it when the turn
-// stopped while the queue was full. The release uses the worker allocator, which is the one
-// the payload was cloned with.
+// chat_worker_push hands one owned event to the mailbox, or releases it when the queue
+// could not grow. The release uses the worker allocator, which is the one the payload was
+// cloned with.
 @(private)
 chat_worker_push :: proc(worker: ^Chat_Request_Worker, event: Chat_Event) {
-	if mailbox_push(worker.mailbox, event, worker.interrupt) { return }
+	if mailbox_push(worker.mailbox, event) { return }
 	owned := event
 	chat_event_destroy(&owned, worker.allocator)
 }

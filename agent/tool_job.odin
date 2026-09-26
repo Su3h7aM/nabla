@@ -202,14 +202,11 @@ Tool_Job :: struct {
 	recorded_seq:     session.Seq,
 }
 
-// Tool_Jobs is one batch's table. The owner reads and writes it; a worker only ever
-// publishes its own completion, under the mutex. pending says a publication the owner has not
-// adopted yet may exist; it is cleared before the owner reads the jobs, so a publication that
-// lands while it reads either leaves the flag set or is read by that pass.
+// Tool_Jobs is one batch's table. Only the owner reads and writes it; a worker publishes its
+// own job's result and then sets pending, an atomic the owner clears before it collects.
 Tool_Jobs :: struct {
 	jobs:             [dynamic]^Tool_Job,
 	allocator:        mem.Allocator, // the session's: it owns the table, not the jobs
-	mutex:            sync.Mutex,
 	pending:          bool,
 	next_id:          u64,
 	admitted:         int, // every admission in this batch, outer calls and children
@@ -611,12 +608,7 @@ tool_jobs_stopped_long_enough :: proc(job: ^Tool_Job, now: time.Tick) -> bool {
 // instead of keeping it.
 @(private)
 tool_jobs_collect :: proc(jobs: ^Tool_Jobs) {
-	// The flag is cleared before the jobs are read: a publication that lands while this runs
-	// either leaves the flag set for the next check or is read by this pass, so the owner can
-	// never sleep past a completion it has not adopted.
-	sync.mutex_lock(&jobs.mutex)
-	jobs.pending = false
-	sync.mutex_unlock(&jobs.mutex)
+	sync.atomic_store(&jobs.pending, false)
 	for job in jobs.jobs {
 		sync.mutex_lock(&job.mu)
 		if !job.published || job.phase != .Running {
@@ -956,16 +948,6 @@ tool_jobs_retire :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 	job.phase = job.committed ? .Retired : .Unrecorded
 }
 
-// tool_jobs_ready reports whether a worker has published something the owner has not adopted.
-// It is the one fact a wait needs that selection cannot see, because adopting it is the
-// observation step's work.
-@(private)
-tool_jobs_ready :: proc(jobs: ^Tool_Jobs) -> bool {
-	sync.mutex_lock(&jobs.mutex)
-	defer sync.mutex_unlock(&jobs.mutex)
-	return jobs.pending
-}
-
 // tool_jobs_deadline is the nearest tick at which the owner must act on its own, and None
 // when only a worker can change the table. A stopped call's patience is measured from when
 // the owner first saw the stop, which is the only deadline a batch has of its own.
@@ -985,16 +967,13 @@ tool_jobs_deadline :: proc(jobs: ^Tool_Jobs) -> Maybe(time.Tick) {
 }
 
 // tool_jobs_await blocks until a worker publishes, the deadline arrives, or a signal
-// interrupts the wait. The check is narrow and the collection stays outside it: the owner
-// must not hold the wake across work that joins a worker, and a worker publishes under the
-// wake's rendezvous before it finishes.
+// interrupts the wait.
 @(private)
 tool_jobs_await :: proc(jobs: ^Tool_Jobs, deadline: Maybe(time.Tick)) {
-	sync.mutex_lock(&chat_wake.mutex)
-	defer sync.mutex_unlock(&chat_wake.mutex)
-	if tool_jobs_ready(jobs) { return }
+	seen := owner_wake_seen()
+	if sync.atomic_load(&jobs.pending) { return }
 	if tool_jobs_next(jobs, time.tick_now()) != .Wait { return }
-	owner_wake_wait(deadline)
+	owner_wake_wait(seen, deadline)
 }
 
 // --- the executor --------------------------------------------------------------
@@ -1077,10 +1056,6 @@ tool_job_worker :: proc(worker: ^thread.Thread) {
 	job.published = true
 	sync.mutex_unlock(&job.mu)
 
-	sync.mutex_lock(&table.mutex)
-	table.pending = true
-	sync.mutex_unlock(&table.mutex)
-	// A publication is the owner's work, so it wakes the owner rather than a condition
-	// variable of its own.
+	sync.atomic_store(&table.pending, true)
 	owner_wake_signal()
 }

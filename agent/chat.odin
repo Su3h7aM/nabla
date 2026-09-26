@@ -4,7 +4,6 @@ import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:log"
-import "core:sync"
 import "core:sys/posix"
 import "core:time"
 
@@ -410,21 +409,15 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	return recorded
 }
 
-// chat_retry_wait waits out the backoff before the next attempt and reports whether the
-// delay elapsed instead of the turn being stopped. The deadline is the delay itself, so
-// nothing polls: a wakeup from any other publication ends the wait early, and the loop
-// recomputes what is left instead of shortening the backoff.
+// chat_retry_wait waits out a backoff and reports whether it elapsed without a cancel.
 @(private)
 chat_retry_wait :: proc(chat: ^Chat_Session, delay: time.Duration) -> bool {
 	deadline := time.tick_add(time.tick_now(), delay)
-	sync.mutex_lock(&chat_wake.mutex)
-	defer sync.mutex_unlock(&chat_wake.mutex)
 	for {
+		seen := owner_wake_seen()
 		if chat_session_cancelled(chat) { return false }
 		if time.tick_diff(time.tick_now(), deadline) <= 0 { return true }
-		// A wakeup from any other publication ends the wait early, and the loop recomputes
-		// what is left rather than shortening the backoff.
-		owner_wake_wait(deadline)
+		owner_wake_wait(seen, deadline)
 	}
 }
 
