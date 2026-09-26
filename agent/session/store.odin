@@ -5,7 +5,6 @@ import "core:mem"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
-import "core:sys/linux"
 import "core:time"
 
 import "nabla:db"
@@ -37,7 +36,6 @@ JOURNAL_MODE_RETRY :: 100 * time.Millisecond
 // nothing else on the machine has any business reading it.
 PRIVATE_DIRECTORY_PERMISSIONS :: os.Permissions{.Read_User, .Write_User, .Execute_User}
 PRIVATE_FILE_PERMISSIONS :: os.Permissions{.Read_User, .Write_User}
-LOCK_FILE_MODE :: linux.Mode{.IRUSR, .IWUSR}
 
 @(private)
 OTHER_ACCESS :: os.Permissions{.Read_Group, .Write_Group, .Execute_Group, .Read_Other, .Write_Other, .Execute_Other}
@@ -75,18 +73,12 @@ Store :: struct {
 // unclaimed. Nothing else holds one, and nothing but a switch holds two.
 Claim :: struct {
 	allocator: mem.Allocator,
-	fd:        linux.Fd,
+	file:      ^os.File,
 	held:      bool,
 	session:   Session_Id, // owned
 }
 
-// claim_acquire takes the writer claim for id. Its inline flock is deliberate:
-// `agent/session` is a lower package and cannot import the parent agent's log
-// lock seam. The claim also has a different file mode and result policy, so
-// sharing that seam would couple two unrelated ownership contracts. Revisit this
-// only if a real lower-level consumer needs the same claim operation.
-//
-// It consults no store and does not
+// claim_acquire takes the writer claim for id. It consults no store and does not
 // disturb a claim the caller already holds, which is what lets a switch take the
 // candidate while the running session is still claimed. A second process holding
 // the same session is refused with .Claimed.
@@ -102,24 +94,20 @@ claim_acquire :: proc(directory: string, id: Session_Id, allocator: mem.Allocato
 
 	lock_path, path_err := filepath.join({lock_directory, fmt.tprintf("%s.lock", string(id))}, context.temp_allocator)
 	if path_err != nil { return {}, error_make(.Storage, "the lock path could not be built") }
-	lock_cstring, convert_err := strings.clone_to_cstring(lock_path, context.temp_allocator)
-	if convert_err != nil { return {}, error_make(.Storage, "the lock path could not be converted") }
-
-	fd, open_errno := linux.open(lock_cstring, {.RDWR, .CREAT, .CLOEXEC}, LOCK_FILE_MODE)
-	if open_errno != .NONE {
-		return {}, error_make(.Storage, fmt.tprintf("the session lock could not be opened: %v", open_errno))
+	file, open_err := os.open(lock_path, {.Read, .Write, .Create}, PRIVATE_FILE_PERMISSIONS)
+	if open_err != nil {
+		return {}, error_make(.Storage, fmt.tprintf("the session lock could not be opened: %s", os.error_string(open_err)))
 	}
-	if lock_errno := linux.flock(fd, {.EX, .NB}); lock_errno != .NONE {
-		linux.close(fd)
-		if lock_errno == .EAGAIN || lock_errno == .EACCES {
-			return {}, error_make(.Claimed, "another process is running that session")
-		}
-		return {}, error_make(.Storage, fmt.tprintf("the session lock could not be taken: %v", lock_errno))
+	held_elsewhere, lock_err := claim_lock_take(file)
+	if held_elsewhere || lock_err != nil {
+		_ = os.close(file)
+		if held_elsewhere { return {}, error_make(.Claimed, "another process is running that session") }
+		return {}, error_make(.Storage, fmt.tprintf("the session lock could not be taken: %s", os.error_string(lock_err)))
 	}
 
 	claim = Claim {
 		allocator = allocator,
-		fd        = fd,
+		file      = file,
 		held      = true,
 	}
 	claim.session = Session_Id(strings.clone(string(id), allocator))
@@ -135,15 +123,15 @@ claim_acquire :: proc(directory: string, id: Session_Id, allocator: mem.Allocato
 claim_release :: proc(claim: ^Claim) -> Error {
 	if !claim.held { return nil }
 	allocator := claim.allocator
-	unlock_errno := linux.flock(claim.fd, {.UN})
-	close_errno := linux.close(claim.fd)
+	unlock_err := claim_lock_drop(claim.file)
+	close_err := os.close(claim.file)
 	delete(string(claim.session), allocator)
 	claim^ = {}
-	if unlock_errno != .NONE && unlock_errno != .EINVAL {
-		return error_make(.Storage, fmt.tprintf("the session lock could not be released: %v", unlock_errno))
+	if unlock_err != nil {
+		return error_make(.Storage, fmt.tprintf("the session lock could not be released: %s", os.error_string(unlock_err)))
 	}
-	if close_errno != .NONE {
-		return error_make(.Storage, fmt.tprintf("the session lock could not be closed: %v", close_errno))
+	if close_err != nil {
+		return error_make(.Storage, fmt.tprintf("the session lock could not be closed: %s", os.error_string(close_err)))
 	}
 	return nil
 }
