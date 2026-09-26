@@ -891,6 +891,7 @@ The estimate is bytes / 4 plus 8 per message, reported per part (instructions, t
 ### 23.2 Compaction
 
 - At most one per session: a `Compaction` job (tool-free provider request) over a frozen prefix through `F`, keeping the newest `COMPACT_KEEP_MESSAGES` and never splitting an assistant/results pair.
+- Compaction runs in the background and never pauses the agent. While the job runs, the turn keeps sending requests over the unchanged projection, so the provider prefix and its cache stay intact. Install swaps only the prefix through `F` for the summary: every node committed after `F`, including the steps the agent took while the summary was computed, stays in the projection after the checkpoint (section 10.3).
 - Triggers: estimate at `trigger`, explicit command or `context_compact`, proven provider overflow. Triggers coalesce. Automatic starts require new nodes since the last attempt and respect `COMPACT_COOLDOWN`. Auth, quota, and invalid-request failures suppress automatic starts until configuration or explicit intent changes.
 - A summary is accepted only with a normal stop reason, no tool calls, non-empty text, and a saving of at least `COMPACT_MIN_REDUCTION` tokens.
 - Install at a request boundary or while idle: verify base and coverage, commit the `Checkpoint` node (section 10.3) and `checkpoint.installed` in one transaction, reload the projection, reset the encode cache.
