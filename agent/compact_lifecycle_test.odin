@@ -284,6 +284,12 @@ test_a_background_compaction_keeps_the_work_that_followed_it :: proc(t: ^testing
 	testing.expect(t, after.estimate < before_estimate, "the compacted context must cost less than the one it replaced")
 }
 
+// compact_test_final_refusal is a transient refusal the provider forbids resending, so a summary
+// chain ends after one send without suppressing later automatic starts.
+compact_test_final_refusal :: proc() -> string {
+	return agent_provider_refusal("503 Service Unavailable", `{"error":{"message":"try again later"}}`, "x-should-retry: false\r\n")
+}
+
 // A summary that never arrives leaves the session exactly as it was: no
 // checkpoint, every entry still active, and the attempt recorded and closed.
 @(test)
@@ -301,25 +307,23 @@ test_a_failed_compaction_leaves_the_context_alone :: proc(t: ^testing.T) {
 	expected_entries := len(before_entries)
 	session.entries_destroy(before_entries, context.allocator)
 
-	dead := ai.Provider_Connection {
+	provider: Agent_Provider
+	responses := []string{compact_test_final_refusal()}
+	if !agent_provider_start(t, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
 		API      = .OpenAI_Chat_Completions,
-		Endpoint = "http://127.0.0.1:9/",
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
 	}
-	chat.compact_retry = test_compact_retry_policy()
-	prep, prep_err := chat_prepare(chat, dead, chat.allocator)
+	defer delete(connection.Endpoint, chat.allocator)
+	prep, prep_err := chat_prepare(chat, connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	testing.expect_value(t, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
-	chat_compact_consider(chat, {}, dead, &prep)
+	chat_compact_consider(chat, {}, connection, &prep)
 	chat_request_prep_destroy(&prep, chat.allocator)
 	testing.expect_value(t, chat.compact.state, Compact_State.Running)
-	// A dead endpoint fails every attempt a chain may make, and the chain then ends.
 	if !compact_service_until(t, chat, .Idle) { return }
-	// The chain is exactly what the bound allows, and no further attempt begins.
-	last, last_err := session.request_load(chat.store, chat.id, session.Request_No(CHAT_COMPACT_MAX_ATTEMPTS), chat.allocator)
-	if !testing.expect_value(t, last_err, nil) { return }
-	session.request_destroy(&last, chat.allocator)
-	_, beyond_err := session.request_load(chat.store, chat.id, session.Request_No(CHAT_COMPACT_MAX_ATTEMPTS + 1), chat.allocator)
-	testing.expect(t, beyond_err != nil, "an exhausted chain begins no further attempt")
+	testing.expect_value(t, agent_provider_request_count(&provider), 1)
 
 	checkpoint, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
 	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
@@ -440,11 +444,16 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(t: ^testing.
 		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_100, payload = session.Assistant_Entry{text = text}})
 	}
 
-	dead := ai.Provider_Connection {
+	provider: Agent_Provider
+	responses := []string{compact_test_final_refusal()}
+	if !agent_provider_start(t, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
 		API      = .OpenAI_Chat_Completions,
-		Endpoint = "http://127.0.0.1:9/",
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
 	}
-	prep, prep_err := chat_prepare(chat, dead, chat.allocator)
+	defer delete(connection.Endpoint, chat.allocator)
+	prep, prep_err := chat_prepare(chat, connection, chat.allocator)
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	defer chat_request_prep_destroy(&prep, chat.allocator)
 
@@ -461,14 +470,13 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(t: ^testing.
 	defer chat_notice_log_destroy(&notices)
 	testing.expect_value(t, chat_notice_log_count(&notices, "background compaction"), 0)
 
-	chat_compact_consider(chat, observer, dead, &prep)
+	chat_compact_consider(chat, observer, connection, &prep)
 	testing.expect_value(t, chat.compact.state, Compact_State.Running)
 	testing.expect_value(t, chat.compact.trigger, Compact_Trigger.Pressure)
 	testing.expect_value(t, chat_notice_log_count(&notices, "background compaction started"), 1)
 
-	// A request that fits is never held up by the job. The dead endpoint fails every attempt
-	// the chain may make, and a summary that never arrives writes no checkpoint.
-	chat.compact_retry = test_compact_retry_policy()
+	// A request that fits is never held up by the job, and a summary that never arrives
+	// writes no checkpoint.
 	if !compact_service_until(t, chat, .Idle) { return }
 	checkpoint, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
 	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
@@ -685,7 +693,7 @@ test_a_transient_summary_failure_is_retried_on_the_same_bytes :: proc(t: ^testin
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 500_000)
-	chat.compact_retry = test_compact_retry_policy()
+	chat.compact_retry = test_retry_policy()
 	_test_accept(t, chat, "first")
 	large := strings.repeat("work ", 320_000) or_else ""
 	defer delete(large)
@@ -760,7 +768,7 @@ test_a_summary_that_produced_nothing_is_not_sent_again :: proc(t: ^testing.T) {
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 500_000)
-	chat.compact_retry = test_compact_retry_policy()
+	chat.compact_retry = test_retry_policy()
 	_test_accept(t, chat, "first")
 	large := strings.repeat("work ", 320_000) or_else ""
 	defer delete(large)
@@ -798,53 +806,7 @@ test_a_summary_that_produced_nothing_is_not_sent_again :: proc(t: ^testing.T) {
 	if !testing.expect_value(t, row_err, nil) { return }
 	defer session.request_destroy(&row, chat.allocator)
 	testing.expect_value(t, row.outcome, session.Outcome.Failed)
-}
 
-// The chain is bounded: a second transient failure ends it, and nothing is sent again.
-@(test)
-test_a_summary_chain_stops_at_its_bound :: proc(t: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
-	chat := &fixture.chat
-	chat_test_capacity(chat, 500_000)
-	chat.compact_retry = test_compact_retry_policy()
-	_test_accept(t, chat, "first")
-	large := strings.repeat("work ", 320_000) or_else ""
-	defer delete(large)
-	_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.User_Entry{text = large, origin = .Prompt}})
-	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
-		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_100, payload = session.Assistant_Entry{text = text}})
-	}
-
-	refusal := agent_provider_refusal("503 Service Unavailable", `{"error":{"message":"try again later"}}`)
-	responses := []string{refusal, refusal}
-	provider: Agent_Provider
-	if !agent_provider_start(t, &provider, responses) { return }
-	defer agent_provider_stop(&provider)
-	connection := ai.Provider_Connection {
-		API      = .OpenAI_Chat_Completions,
-		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
-	}
-	defer delete(connection.Endpoint, chat.allocator)
-
-	prep, prep_err := chat_prepare(chat, connection, chat.allocator)
-	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
-	// Pressure starts the summary, so it waits for the context to reach the size it was
-	// started for instead of installing at the next boundary: the test drives every attempt
-	// itself.
-	chat_compact_consider(chat, {}, connection, &prep)
-	testing.expect_value(t, chat.compact.trigger, Compact_Trigger.Pressure)
-	chat_request_prep_destroy(&prep, chat.allocator)
-
-	// Two sends, one retry, and then the chain is over: the third send never leaves.
-	if !compact_service_until(t, chat, .Idle) { return }
-	testing.expect_value(t, agent_provider_request_count(&provider), 2)
-	testing.expect(t, chat.compact.last_failure_at_ms > 0, "an exhausted chain waits out its cooldown")
-	checkpoint, has_checkpoint, checkpoint_err := session.entry_latest_checkpoint(chat.store, chat.id)
-	if checkpoint_err != nil { testing.fail_now(t, "entry_latest_checkpoint failed") }
-	if has_checkpoint { session.entry_destroy(&checkpoint, context.allocator) }
-	testing.expect(t, !has_checkpoint)
 }
 
 // A summary the provider refuses for a reason the configuration would have to change for is
@@ -857,7 +819,7 @@ test_a_terminal_summary_failure_suppresses_automatic_starts :: proc(t: ^testing.
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 500_000)
-	chat.compact_retry = test_compact_retry_policy()
+	chat.compact_retry = test_retry_policy()
 	_test_accept(t, chat, "first")
 	large := strings.repeat("work ", 320_000) or_else ""
 	defer delete(large)
@@ -895,17 +857,17 @@ test_a_terminal_summary_failure_suppresses_automatic_starts :: proc(t: ^testing.
 	testing.expect_value(t, chat.compact.state, Compact_State.Running)
 }
 
-// A chain that used every attempt it has is not started again from the same context: the next
+// A chain that ended without a summary is not started again from the same context: the next
 // automatic attempt waits for work the failed one never saw, because the same bytes would get
 // the same answer.
 @(test)
-test_an_exhausted_chain_waits_for_the_context_to_move :: proc(t: ^testing.T) {
+test_a_failed_chain_waits_for_the_context_to_move :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
 	defer chat_test_end(t, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 500_000)
-	chat.compact_retry = test_compact_retry_policy()
+	chat.compact_retry = test_retry_policy()
 	_test_accept(t, chat, "first")
 	large := strings.repeat("work ", 320_000) or_else ""
 	defer delete(large)
@@ -914,9 +876,8 @@ test_an_exhausted_chain_waits_for_the_context_to_move :: proc(t: ^testing.T) {
 		_test_append(t, chat, {turn_no = chat.turn_no, created_at_ms = 2_100, payload = session.Assistant_Entry{text = text}})
 	}
 
-	refusal := agent_provider_refusal("503 Service Unavailable", `{"error":{"message":"try again later"}}`)
-	responses := []string{refusal, refusal}
 	provider: Agent_Provider
+	responses := []string{compact_test_final_refusal()}
 	if !agent_provider_start(t, &provider, responses) { return }
 	defer agent_provider_stop(&provider)
 	connection := ai.Provider_Connection {
@@ -929,7 +890,7 @@ test_an_exhausted_chain_waits_for_the_context_to_move :: proc(t: ^testing.T) {
 	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
 	chat_compact_consider(chat, {}, connection, &prep)
 	if !compact_service_until(t, chat, .Idle) { return }
-	testing.expect_value(t, agent_provider_request_count(&provider), CHAT_COMPACT_MAX_ATTEMPTS)
+	testing.expect_value(t, agent_provider_request_count(&provider), 1)
 
 	// Nothing about the context changed, so pressure starts nothing even with the cooldown
 	// behind it.

@@ -93,13 +93,10 @@ Status :: struct {
 	// working_since spans the complete execution of one accepted prompt, across
 	// every provider request and tool call, until the session returns to idle.
 	working_since:         time.Tick,
-	// The retry the turn is waiting for, while it waits for one. The attempt numbers come
-	// from the retry the agent scheduled, and the due time is when the harness sends
-	// again: a front-end showing this clears it when the next send is prepared, and the
+	// The retry the turn is waiting for, while it waits for one. The due time is when the
+	// harness sends again: a front-end showing this clears it when the next send is prepared, and the
 	// worker clears it whenever the session stops running.
 	retry_present:         bool,
-	retry_next:            int,
-	retry_max:             int,
 	retry_due:             time.Tick,
 }
 
@@ -127,28 +124,28 @@ snapshot_transcript_own :: proc(app: ^App) {
 // Snapshot is everything the renderer reads. The worker bumps generation
 // after any change; the main thread redraws when it moves.
 Snapshot :: struct {
-	entries:        [dynamic]Entry, // owned,
+	entries:            [dynamic]Entry, // owned,
 	// entries_bytes is what the resident entries hold: each entry's own slot and
 	// the text it keeps, the number the transcript's budget is spent from.
-	entries_bytes:  int,
+	entries_bytes:      int,
 	// transcript_failed records that a line could not be kept, so the run says
 	// so once instead of dropping lines quietly.
-	transcript_failed: bool,
+	transcript_failed:  bool,
 	// transcript_trimmed records that the transcript dropped old lines, so the
 	// notice is said once rather than at every drop.
 	transcript_trimmed: bool,
 	// next_entry_id numbers the entries the transcript keeps. An entry's id
 	// travels on its tool box node to the mouse, so a report still finds its box
 	// after older entries were dropped.
-	next_entry_id:  u64,
-	status:         Status,
+	next_entry_id:      u64,
+	status:             Status,
 	// sessions is what the /resume menu offers. Only the worker reads the store,
 	// so only the worker rebuilds this.
-	sessions:       [dynamic]Session_Row, // owned,
+	sessions:           [dynamic]Session_Row, // owned,
 	// active_session is the session the worker is running. It travels with the row
 	// list so the menu can open on it without reading the running session, which
 	// the worker can replace at any moment.
-	active_session: session.Session_Id, // owned,
+	active_session:     session.Session_Id, // owned,
 	// setup_error is why the last selection attempt failed; the model menu shows
 	// it because it has no transcript. setup_error_failed means the reason could
 	// not be cloned, so the presentation uses its static fallback instead.

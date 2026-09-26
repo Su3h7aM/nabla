@@ -580,7 +580,6 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 		{
 			request_no = chain.request_no,
 			next_attempt = chain.attempts + 1,
-			max_attempts = chain.policy.max_attempts,
 			failure_class = chain.operation_error.failure_class,
 			delay = chain.decision.delay,
 		},

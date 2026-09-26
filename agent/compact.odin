@@ -272,18 +272,6 @@ Compact_State :: enum {
 	Retiring,
 }
 
-// CHAT_COMPACT_MAX_ATTEMPTS is how many sends one summary chain may use. A summary is
-// background work with one job to do, so its chain is shorter than a foreground one.
-CHAT_COMPACT_MAX_ATTEMPTS :: 2
-
-// chat_compact_retry_policy_default is the bound a session's summaries run under: the same
-// delays as a foreground chain, and a shorter chain.
-chat_compact_retry_policy_default :: proc() -> Chat_Retry_Policy {
-	policy := chat_retry_policy_default()
-	policy.max_attempts = CHAT_COMPACT_MAX_ATTEMPTS
-	return policy
-}
-
 // Compact_Job is one summarization in flight. The worker owns everything it
 // touches until it stops: the snapshot it reads, the output it accumulates, and
 // the interrupt that bounds it. The owner touches none of it between
@@ -829,8 +817,7 @@ chat_compact_retryable :: proc(job: ^Compact_Job) -> bool {
 
 // chat_compact_recovery is the decision taken on a summary that produced nothing usable. It
 // is the same classifier and the same delays as a foreground chain, under the session's
-// compaction policy: a summary is background work with one job to do, so its chain is
-// shorter.
+// compaction policy.
 @(private)
 chat_compact_recovery :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> Chat_Recovery_Decision {
 	facts := Chat_Attempt_Facts {

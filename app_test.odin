@@ -295,10 +295,8 @@ test_a_scheduled_retry_is_shown_until_the_send_clears_it :: proc(t: ^testing.T) 
 	}
 
 	app.run.snap.status.working_since = time.tick_now()
-	obs_retry_scheduled(&app, {next_attempt = 2, max_attempts = 3, failure_class = ai.Provider_Failure_Class.Rate_Limited, delay = 2 * time.Second})
+	obs_retry_scheduled(&app, {next_attempt = 2, failure_class = ai.Provider_Failure_Class.Rate_Limited, delay = 2 * time.Second})
 	testing.expect(t, app.run.snap.status.retry_present, "the front-end is waiting for a retry")
-	testing.expect_value(t, app.run.snap.status.retry_next, 2)
-	testing.expect_value(t, app.run.snap.status.retry_max, 3)
 	// One notice per scheduled retry, in the transcript the user reads.
 	if testing.expect_value(t, len(app.run.snap.entries), 1) {
 		testing.expect_value(t, app.run.snap.entries[0].kind, Entry_Kind.Notice)

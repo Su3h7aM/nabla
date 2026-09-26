@@ -275,7 +275,6 @@ test_a_chain_of_failures_ends_in_one_answer :: proc(t: ^testing.T) {
 	if !testing.expect_value(t, len(retries.events), 2) { return }
 	for event, i in retries.events {
 		testing.expect_value(t, event.next_attempt, i + 2)
-		testing.expect_value(t, event.max_attempts, test_retry_policy().max_attempts)
 		testing.expect(t, event.delay > 0, "a scheduled retry waits before sending again")
 	}
 	testing.expect_value(t, retries.events[0].failure_class, ai.Provider_Failure_Class.Rate_Limited)

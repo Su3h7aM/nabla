@@ -679,8 +679,6 @@ obs_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Event) {
 	defer sync.mutex_unlock(&app.run.mu)
 	status := &app.run.snap.status
 	status.retry_present = true
-	status.retry_next = event.next_attempt
-	status.retry_max = event.max_attempts
 	status.retry_due = time.tick_add(time.tick_now(), event.delay)
 	app.run.snap.generation += 1
 }

@@ -1,55 +1,34 @@
 package agent
 
-// Recovery policy for one response chain: how many sends it may use, and how long it
-// waits between them.
-//
-// The provider and the transport bound a single send, and nothing here shortens one
-// that is still making progress. What this file bounds is the chain: a failure a second
-// send could plausibly repair is retried, and everything else stops and says why. The
-// decision is plain data, so the request row, the log line, and the test read the same
-// answer instead of each deciding for itself.
+// Recovery policy for one response chain: whether a failed send is sent again, and how
+// long the chain waits first. A transient failure is resent for as long as delivery
+// evidence proves the model never received it; there is no attempt count, and a delay the
+// provider asks for is honored as given.
 
 import "core:math/rand"
 import "core:time"
 
 import "nabla:ai"
 
-// CHAT_REQUEST_MAX_ATTEMPTS is how many sends one response chain may use, including a
-// request rebuilt from a checkpoint.
-CHAT_REQUEST_MAX_ATTEMPTS :: 3
-
 // CHAT_RETRY_BASE_DELAY is the first backoff ceiling. Each retry after it doubles the
-// ceiling until CHAT_RETRY_MAX_DELAY.
+// ceiling until CHAT_RETRY_BACKOFF_CEILING.
 CHAT_RETRY_BASE_DELAY :: 500 * time.Millisecond
 
-// CHAT_RETRY_MAX_DELAY bounds computed backoff. It does not bound a wait the provider
-// asked for by name.
-CHAT_RETRY_MAX_DELAY :: 8 * time.Second
+// CHAT_RETRY_BACKOFF_CEILING bounds computed backoff. It never shortens a wait the
+// provider asked for.
+CHAT_RETRY_BACKOFF_CEILING :: 60 * time.Second
 
-// CHAT_RETRY_MAX_PROVIDER_DELAY is the longest wait a provider's own Retry-After may
-// schedule. A longer instruction stops the chain instead of being shortened: sending
-// early against a peer that asked for quiet is not a retry.
-CHAT_RETRY_MAX_PROVIDER_DELAY :: 30 * time.Second
-
-// Chat_Retry_Policy is every bound one chain runs under, in one value, so a caller can
-// run with its own bounds without an environment variable or a second code path.
+// Chat_Retry_Policy is the backoff one chain waits with.
 Chat_Retry_Policy :: struct {
-	max_attempts:       int,
-	base_delay:         time.Duration,
-	max_delay:          time.Duration,
-	max_provider_delay: time.Duration,
+	base_delay: time.Duration,
+	max_delay:  time.Duration,
 }
 
 // chat_retry_policy_default is the policy a session runs with unless its caller says
 // otherwise. A caller that wants only a shorter wait starts from this and changes the
 // fields it means to change.
 chat_retry_policy_default :: proc() -> Chat_Retry_Policy {
-	return {
-		max_attempts = CHAT_REQUEST_MAX_ATTEMPTS,
-		base_delay = CHAT_RETRY_BASE_DELAY,
-		max_delay = CHAT_RETRY_MAX_DELAY,
-		max_provider_delay = CHAT_RETRY_MAX_PROVIDER_DELAY,
-	}
+	return {base_delay = CHAT_RETRY_BASE_DELAY, max_delay = CHAT_RETRY_BACKOFF_CEILING}
 }
 
 // Request_Recovery_Action is what the chain does with a send that did not complete.
@@ -91,11 +70,6 @@ Request_Recovery_Reason :: enum {
 	// Terminal_Failure is a failure class, or a provider directive, that says sending the
 	// same request again cannot help.
 	Terminal_Failure,
-	// Attempts_Exhausted is a chain that has used every send it may.
-	Attempts_Exhausted,
-	// Provider_Delay_Too_Long is a Retry-After longer than the policy waits. The
-	// provider's own instruction is reported as it was, never shortened.
-	Provider_Delay_Too_Long,
 	// Transient_Failure is a failure the chain retries after the reported delay.
 	Transient_Failure,
 }
@@ -120,10 +94,6 @@ request_recovery_reason_name :: proc(reason: Request_Recovery_Reason) -> string 
 		return "context_exhausted"
 	case .Terminal_Failure:
 		return "terminal_failure"
-	case .Attempts_Exhausted:
-		return "attempts_exhausted"
-	case .Provider_Delay_Too_Long:
-		return "provider_delay_too_long"
 	case .Transient_Failure:
 		return "transient_failure"
 	}
@@ -170,8 +140,7 @@ Chat_Recovery_Decision :: struct {
 //  3. Published output, because a retry could publish a second answer.
 //  4. Confirmed overflow, which ordinary backoff cannot fix.
 //  5. A failure class, or a provider directive, that says the same request cannot work.
-//  6. A transient class, while the chain has a send left and the provider is not asking
-//     for a longer wait than the policy allows.
+//  6. A transient class, after the backoff or the provider's own delay, whichever is longer.
 chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Facts, fraction: f64) -> Chat_Recovery_Decision {
 	if facts.cancelled || facts.error.kind == .Cancelled { return {action = .Stop, reason = .Cancelled} }
 	if facts.storage_failed { return {action = .Stop, reason = .Storage_Failed} }
@@ -187,25 +156,14 @@ chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Fact
 		// A rejected payload is never resent. The chain either makes room for a rebuilt
 		// request, once, or the turn ends as context exhaustion.
 		if facts.repaired { return {action = .Stop, reason = .Context_Exhausted} }
-		if facts.attempts >= policy.max_attempts {
-			return {action = .Stop, reason = .Attempts_Exhausted}
-		}
 		return {action = .Repair_Context, reason = .Context_Exhausted}
 	}
 	if facts.error.retry_directive == .Forbid { return {action = .Stop, reason = .Terminal_Failure} }
 	if !chat_failure_transient(facts.error.failure_class) {
 		return {action = .Stop, reason = .Terminal_Failure}
 	}
-	if facts.attempts >= policy.max_attempts {
-		return {action = .Stop, reason = .Attempts_Exhausted}
-	}
 	delay := chat_retry_backoff_delay(policy, facts.attempts, fraction)
-	if asked, present := facts.error.retry_after.?; present {
-		if asked > policy.max_provider_delay {
-			return {action = .Stop, reason = .Provider_Delay_Too_Long}
-		}
-		delay = max(delay, asked)
-	}
+	if asked, present := facts.error.retry_after.?; present { delay = max(delay, asked) }
 	return {action = .Retry, reason = .Transient_Failure, delay = delay}
 }
 

@@ -14,7 +14,7 @@ import "core:time"
 import "nabla:agent/session"
 import "nabla:ai"
 
-// test_retry_policy is the policy the suites run with: the production bounds, with a
+// test_retry_policy is the policy the suites run with: the production backoff, with a
 // wait short enough that a retry costs a test milliseconds instead of a second. A suite
 // that cares about the decision itself states its own policy and calls
 // chat_recovery_decide directly.
@@ -22,18 +22,6 @@ test_retry_policy :: proc() -> Chat_Retry_Policy {
 	policy := chat_retry_policy_default()
 	policy.base_delay = 2 * time.Millisecond
 	policy.max_delay = 4 * time.Millisecond
-	policy.max_provider_delay = 25 * time.Millisecond
-	return policy
-}
-
-// test_compact_retry_policy is what the compaction suites run with: the compaction chain's
-// own bound, with a wait short enough that a retry costs a test milliseconds instead of a
-// second.
-test_compact_retry_policy :: proc() -> Chat_Retry_Policy {
-	policy := chat_compact_retry_policy_default()
-	policy.base_delay = 2 * time.Millisecond
-	policy.max_delay = 4 * time.Millisecond
-	policy.max_provider_delay = 25 * time.Millisecond
 	return policy
 }
 

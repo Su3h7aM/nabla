@@ -192,7 +192,7 @@ retry_display_text :: proc(event: agent.Chat_Retry_Event) -> string {
 		reason = "the response ended before it was complete"
 	case .None, .Unknown, .Authentication, .Quota, .Context_Overflow, .Payload_Too_Large, .Invalid_Request, .Content_Policy, .Invalid_Output:
 	}
-	return fmt.tprintf("%s; retrying in %s (attempt %d of %d)", reason, display_duration(event.delay), event.next_attempt, event.max_attempts)
+	return fmt.tprintf("%s; retrying in %s (attempt %d)", reason, display_duration(event.delay), event.next_attempt)
 }
 
 // display_duration renders a wait the way a reader measures one: tenths of a second while
