@@ -50,7 +50,6 @@ Error_Kind :: enum {
 	Too_Large,
 	Outside_Authority,
 	Changed_During_Read,
-	Cancelled,
 	Allocation,
 }
 

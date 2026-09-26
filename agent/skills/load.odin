@@ -7,11 +7,8 @@ import "core:path/filepath"
 import "core:strings"
 import "core:unicode/utf8"
 
-Cancel_Check :: proc() -> bool
-
-// load reads a skill body and verifies it against its catalog metadata. cancelled may be nil.
-load :: proc(skill: Skill, root: Root, cancelled: Cancel_Check, allocator := context.allocator) -> (Loaded, Load_Error) {
-	if cancelled != nil && cancelled() { return {}, error_make(.Cancelled, allocator = allocator) }
+// load reads a skill body and verifies it against its catalog metadata.
+load :: proc(skill: Skill, root: Root, allocator := context.allocator) -> (Loaded, Load_Error) {
 	if skill.root_index < 0 { return {}, error_make(.Outside_Authority, detail = "skill has no source root", allocator = allocator) }
 	if root.source == .Local && !path_within(skill.directory, root.authority) {
 		return {}, error_make(.Outside_Authority, detail = "skill directory is outside the workspace scope", allocator = allocator)
@@ -32,13 +29,11 @@ load :: proc(skill: Skill, root: Root, cancelled: Cancel_Check, allocator := con
 	defer os.file_info_delete(before, allocator)
 	if before.type != .Regular { return {}, error_make(.Not_Regular, detail = "SKILL.md is not a regular file", allocator = allocator) }
 	if before.size > SKILL_MAX_FILE_BYTES { return {}, error_make(.Too_Large, detail = "SKILL.md exceeds the byte limit", allocator = allocator) }
-	if cancelled != nil && cancelled() { return {}, error_make(.Cancelled, allocator = allocator) }
 
 	data, read_error := os.read_entire_file(file, allocator)
 	if read_error != nil { return {}, error_make(.Unreadable, detail = os.error_string(read_error), allocator = allocator) }
 	defer delete(data, allocator)
 	if len(data) > SKILL_MAX_FILE_BYTES { return {}, error_make(.Too_Large, detail = "SKILL.md exceeds the byte limit", allocator = allocator) }
-	if cancelled != nil && cancelled() { return {}, error_make(.Cancelled, allocator = allocator) }
 	after, after_error := os.fstat(file, allocator)
 	if after_error != nil { return {}, error_make(.Unreadable, detail = os.error_string(after_error), allocator = allocator) }
 	defer os.file_info_delete(after, allocator)

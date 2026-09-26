@@ -6,9 +6,7 @@ import "core:fmt"
 import "core:mem"
 import "core:strings"
 
-import "nabla:agent/session"
 import "nabla:agent/skills"
-import "nabla:ai"
 
 TOOL_LIST_SKILLS_NAME :: "builtin_list_skills"
 TOOL_LIST_SKILLS_DESCRIPTION :: "List available skills by metadata. Returns name and description records with stable pagination; metadata is not the complete instructions."
@@ -145,11 +143,11 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> T
 		return tool_result_failure(ctx, .Tool_Failed, "the skill catalog is invalid", "unavailable")
 	}
 	root := ctx.skills.roots[skill.root_index]
-	loaded, load_error := skills.load(skill, root, tool_skill_cancel_check, ctx.allocator)
+	loaded, load_error := skills.load(skill, root, ctx.allocator)
 	defer skills.loaded_destroy(&loaded, ctx.allocator)
 	defer skills.load_error_destroy(&load_error, ctx.allocator)
 	if load_error.kind != .None {
-		return tool_result_failure(ctx, tool_skill_outcome(load_error.kind), skills.error_text(load_error), "load failed")
+		return tool_result_failure(ctx, .Tool_Failed, skills.error_text(load_error), "load failed")
 	}
 	digest, digest_error := skill_digest_text(loaded.content_digest, ctx.allocator)
 	if digest_error != nil { return tool_result_failure(ctx, .Tool_Failed, "the skill digest could not be allocated", "encoding failed") }
@@ -212,10 +210,6 @@ list_skills_terms :: proc(query: string, allocator := context.allocator) -> ([]s
 	return terms[:], true
 }
 
-tool_skill_cancel_check :: proc() -> bool {
-	return ai.interrupt_requested(&chat_cancel)
-}
-
 list_skills_matches :: proc(skill: ^skills.Skill, terms: []string) -> bool {
 	// The folded copies exist to be searched and are released with the answer.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -254,27 +248,6 @@ tool_skill_suggestions :: proc(catalog: ^skills.Catalog, name: string, allocator
 	joined := strings.join(suggestions[:], ", ", allocator)
 	defer delete(joined, allocator)
 	return fmt.tprintf("no skill named %q is available; did you mean %s", name, joined)
-}
-
-tool_skill_outcome :: proc(kind: skills.Error_Kind) -> session.Tool_Outcome {
-	switch kind {
-	case .Cancelled:
-		return .Cancelled
-	case .None,
-	     .Missing,
-	     .Unreadable,
-	     .Not_Regular,
-	     .Invalid_Metadata,
-	     .Unsupported_Metadata,
-	     .Stale_Metadata,
-	     .Invalid_Text,
-	     .Too_Large,
-	     .Outside_Authority,
-	     .Changed_During_Read,
-	     .Allocation:
-		return .Tool_Failed
-	}
-	return .Tool_Failed
 }
 
 skill_digest_text :: proc(digest: [32]u8, allocator := context.allocator) -> (string, mem.Allocator_Error) {

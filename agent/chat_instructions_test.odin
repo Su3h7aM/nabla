@@ -150,7 +150,7 @@ test_a_written_snapshot_restores_the_root_each_skill_came_from :: proc(t: ^testi
 	skill := restored.skills[0]
 	root := restored.roots[skill.root_index]
 	testing.expect_value(t, root.source, skills.Source_Kind.Generic_User)
-	loaded, load_error := skills.load(skill, root, nil, context.allocator)
+	loaded, load_error := skills.load(skill, root, context.allocator)
 	defer skills.loaded_destroy(&loaded, context.allocator)
 	defer skills.load_error_destroy(&load_error, context.allocator)
 	testing.expect_value(t, load_error.kind, skills.Error_Kind.None)

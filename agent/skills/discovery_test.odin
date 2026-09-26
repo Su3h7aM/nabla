@@ -122,7 +122,7 @@ test_discover_indexes_the_roots_it_kept :: proc(t: ^testing.T) {
 	// The index is what a load is handed, so it has to name the root the skill is under.
 	root := catalog.roots[skill.root_index]
 	testing.expect_value(t, root.source, Source_Kind.Generic_User)
-	loaded, load_failure := load(skill, root, nil)
+	loaded, load_failure := load(skill, root)
 	defer loaded_destroy(&loaded)
 	defer load_error_destroy(&load_failure)
 	testing.expect_value(t, load_failure.kind, Error_Kind.None)
