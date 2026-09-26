@@ -1,9 +1,10 @@
 package agent
 
 import "base:runtime"
+import "core:c"
 import "core:mem"
+import "core:os"
 import "core:strings"
-import linux "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
 
@@ -20,10 +21,10 @@ Tool_Stop :: enum {
 // time it is observed, because the drain loop may reap the child while it is
 // still reading pipes and the caller must not lose the exit code as a result.
 Tool_Child :: struct {
-	pid:          int,
+	pid:          posix.pid_t,
 	reaped:       bool,
 	status_known: bool,
-	status:       u32,
+	status:       c.int,
 }
 
 // TOOL_SPAWN_EXEC_FAILED is the byte a forked child writes when it could not
@@ -33,6 +34,16 @@ Tool_Child :: struct {
 // twice.
 @(private)
 TOOL_SPAWN_EXEC_FAILED :: u8(1)
+
+// TOOL_CHILD_SETUP_FAILED is the exit status of a forked child that could not
+// prepare its process group, streams, or directory before exec.
+@(private)
+TOOL_CHILD_SETUP_FAILED :: 1
+
+// TOOL_CHILD_EXEC_FAILED is the exit status of a forked child whose exec failed,
+// the status a shell reports for a command it cannot run.
+@(private)
+TOOL_CHILD_EXEC_FAILED :: 127
 
 // tool_spawn_shell_flags reports the extra argv entries that keep a shell
 // from touching the user's personal history without changing which
@@ -58,14 +69,13 @@ tool_spawn_shell_flags :: proc(shell: string) -> (first, second: cstring) {
 //
 // Odin's os.process_start cannot express this. It forks and execs with no
 // pre-exec hook, so setpgid from the parent always fails with EACCES once the
-// child has exec'd, and kill(-pid) then fails with ESRCH while descendants
-// survive. The child therefore has to create the group itself, before it execs.
+// child has exec'd, and a group kill then misses the descendants. The child
+// therefore has to create the group itself, before it execs.
 //
-// The harness may have other threads, so the child calls nothing that allocates,
-// locks, logs, or enters the Odin runtime: every call below is a raw Linux
-// syscall, and failure paths leave through tool_child_exit, which runs no
-// atexit handler and flushes no stdio.
-tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stderr_write: linux.Fd) -> (pid: int, started: bool) {
+// The harness may have other threads, so between fork and exec the child makes
+// only async-signal-safe calls: it allocates, locks, and logs nothing, and every
+// failure leaves through _exit, which runs no atexit handler and flushes no stdio.
+tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stderr_write: posix.FD) -> (pid: posix.pid_t, started: bool) {
 	// The C strings live only as long as the spawn: exec takes its own copy of the
 	// arguments, so the parent releases its own when the call returns.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -99,77 +109,76 @@ tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stde
 	envp := posix.environ
 
 	// The exec status pipe carries one fact back to the parent: whether the shell
-	// started. Both ends are CLOEXEC, so a successful exec closes the child's
+	// started. Both ends close on exec, so a successful exec closes the child's
 	// write end and the parent reads end-of-file, while a failed one lets the
 	// child report before it exits. Without it, an exec that never happened is
 	// indistinguishable from a fork that never happened.
-	exec_pipe: [2]linux.Fd
-	if linux.pipe2(&exec_pipe, {.CLOEXEC}) != .NONE { return 0, false }
+	exec_read, exec_write, pipe_error := os.pipe()
+	if pipe_error != nil { return 0, false }
+	report_fd := posix.FD(os.fd(exec_write))
 
-	child, fork_errno := linux.fork()
-	if fork_errno != .NONE {
-		_ = linux.close(exec_pipe[0])
-		_ = linux.close(exec_pipe[1])
+	child := posix.fork()
+	if child == -1 {
+		_ = os.close(exec_read)
+		_ = os.close(exec_write)
 		return 0, false
 	}
 	if child == 0 {
 		// Standard input is closed: this is explicitly not a terminal.
-		if linux.setpgid(0, 0) != .NONE { tool_child_exit(1) }
-		_ = linux.close(0)
-		if _, dup_errno := linux.dup2(stdout_write, 1); dup_errno != .NONE { tool_child_exit(1) }
-		if _, dup_errno := linux.dup2(stderr_write, 2); dup_errno != .NONE { tool_child_exit(1) }
-		// The pipe read ends close on exec: they were created with CLOEXEC.
-		if linux.chdir(work) != .NONE { tool_child_exit(1) }
-		if linux.execve(shell_cstring, &argv[0], envp) != .NONE {
-			reported := [1]u8{TOOL_SPAWN_EXEC_FAILED}
-			_, _ = linux.write(exec_pipe[1], reported[:])
-			tool_child_exit(127)
-		}
-		tool_child_exit(127)
+		if posix.setpgid(0, 0) != .OK { posix._exit(TOOL_CHILD_SETUP_FAILED) }
+		_ = posix.close(0)
+		if posix.dup2(stdout_write, 1) == -1 { posix._exit(TOOL_CHILD_SETUP_FAILED) }
+		if posix.dup2(stderr_write, 2) == -1 { posix._exit(TOOL_CHILD_SETUP_FAILED) }
+		// Every pipe end closes on exec: os.pipe creates them that way.
+		if posix.chdir(work) != .OK { posix._exit(TOOL_CHILD_SETUP_FAILED) }
+		posix.execve(shell_cstring, &argv[0], envp)
+		reported := [1]u8{TOOL_SPAWN_EXEC_FAILED}
+		_ = posix.write(report_fd, &reported[0], len(reported))
+		posix._exit(TOOL_CHILD_EXEC_FAILED)
 	}
 
-	_ = linux.close(exec_pipe[1])
+	_ = os.close(exec_write)
 	reported := [1]u8{0}
-	read_bytes, read_errno := linux.read(exec_pipe[0], reported[:])
-	for read_errno == .EINTR {
-		read_bytes, read_errno = linux.read(exec_pipe[0], reported[:])
-	}
-	_ = linux.close(exec_pipe[0])
+	read_bytes := tool_read_retrying(posix.FD(os.fd(exec_read)), reported[:])
+	_ = os.close(exec_read)
 	// Only the report says the exec failed. End-of-file means the child exec'd or
 	// died before it could report, and a read that failed says nothing either; in
 	// both cases the command may have run, so the child counts as started and the
 	// caller waits for it the way it waits for any child.
-	if read_bytes <= 0 { return int(child), true }
+	if read_bytes <= 0 { return child, true }
 
 	// The child never became the shell. Reap it here, so it leaves no zombie and
 	// no pid a caller could mistake for a running command.
 	failed := Tool_Child {
-		pid = int(child),
+		pid = child,
 	}
 	_, _, _ = tool_child_reap(&failed)
 	return 0, false
 }
 
-// tool_child_exit leaves a forked child without running anything the parent's
-// other threads could be holding, which is why it is exit_group and not exit.
-tool_child_exit :: proc(code: i32) -> ! {
-	linux.exit_group(code)
+// tool_read_retrying reads once into buffer, retrying a read a signal
+// interrupted. It returns what read returns: a count, 0 at end of stream, or -1.
+tool_read_retrying :: proc(fd: posix.FD, buffer: []u8) -> int {
+	for {
+		n := posix.read(fd, raw_data(buffer), c.size_t(len(buffer)))
+		if n != -1 || posix.errno() != .EINTR { return n }
+	}
 }
 
 // tool_child_poll reports whether the child has finished, reaping it if it has.
 // It never blocks.
 tool_child_poll :: proc(child: ^Tool_Child) -> bool {
 	if child.reaped { return true }
-	status: u32
-	reaped, wait_errno := linux.wait4(linux.Pid(child.pid), &status, {.WNOHANG}, nil)
-	if reaped == linux.Pid(child.pid) {
+	status: c.int
+	reaped := posix.waitpid(child.pid, &status, {.NOHANG})
+	if reaped == child.pid {
 		child.reaped = true
 		child.status_known = true
 		child.status = status
 		return true
 	}
 	// No child left to wait for: it was already reaped.
-	if wait_errno == .ECHILD { child.reaped = true }
+	if reaped == -1 && posix.errno() == .ECHILD { child.reaped = true }
 	return child.reaped
 }
 
@@ -180,15 +189,15 @@ tool_child_reap :: proc(child: ^Tool_Child) -> (exited: bool, exit_code: int, wa
 		if !child.status_known { return false, 0, false }
 		return tool_child_status(child.status)
 	}
-	status: u32
+	status: c.int
 	for {
-		reaped, wait_errno := linux.wait4(linux.Pid(child.pid), &status, {}, nil)
-		if reaped == linux.Pid(child.pid) { break }
-		if wait_errno == .ECHILD {
+		if posix.waitpid(child.pid, &status, {}) == child.pid { break }
+		errno := posix.errno()
+		if errno == .ECHILD {
 			child.reaped = true
 			return false, 0, false
 		}
-		if wait_errno != .EINTR { return false, 0, false }
+		if errno != .EINTR { return false, 0, false }
 	}
 	child.reaped = true
 	child.status_known = true
@@ -196,9 +205,9 @@ tool_child_reap :: proc(child: ^Tool_Child) -> (exited: bool, exit_code: int, wa
 	return tool_child_status(status)
 }
 
-tool_child_status :: proc(status: u32) -> (exited: bool, exit_code: int, waited: bool) {
-	if status & 0x7f != 0 { return false, int((status >> 8) & 0xff), true }
-	return true, int((status >> 8) & 0xff), true
+tool_child_status :: proc(status: c.int) -> (exited: bool, exit_code: int, waited: bool) {
+	if !posix.WIFEXITED(status) { return false, 0, true }
+	return true, int(posix.WEXITSTATUS(status)), true
 }
 
 // tool_retire_child waits for retirement without ever blocking unobservably.
@@ -224,7 +233,7 @@ tool_retire_child :: proc(child: ^Tool_Child, start: time.Tick, budget: time.Dur
 // only ever sees a finished process.
 tool_drain_pipes :: proc(
 	child: ^Tool_Child,
-	stdout_fd, stderr_fd: linux.Fd,
+	stdout_fd, stderr_fd: posix.FD,
 	start: time.Tick,
 	budget: time.Duration,
 	control: Tool_Control,
@@ -258,18 +267,20 @@ tool_drain_pipes :: proc(
 }
 
 // tool_drain_ready consumes whatever a pipe already holds. It never blocks.
-tool_drain_ready :: proc(fd: linux.Fd, scratch: []u8, limit: int, kept: ^string, truncated: ^bool, done: ^bool, allocator: mem.Allocator) -> bool {
-	fds := [1]linux.Poll_Fd{{fd = fd, events = {.IN}}}
-	ready, poll_errno := linux.poll(fds[:], 0)
-	if poll_errno != .NONE || ready <= 0 {
+tool_drain_ready :: proc(fd: posix.FD, scratch: []u8, limit: int, kept: ^string, truncated: ^bool, done: ^bool, allocator: mem.Allocator) -> bool {
+	fds := [1]posix.pollfd{{fd = fd, events = {.IN}}}
+	if posix.poll(&fds[0], len(fds), 0) <= 0 {
 		// A hangup ends the stream once nothing is left to read.
 		if .HUP in fds[0].revents { done^ = true }
 		return false
 	}
-	n, read_errno := linux.read(fd, scratch)
-	if read_errno == .EAGAIN || read_errno == .EINTR { return false }
-	// Zero bytes with no error is end of stream; any other error ends it too.
-	if read_errno != .NONE || n <= 0 {
+	n := posix.read(fd, raw_data(scratch), c.size_t(len(scratch)))
+	if n == -1 {
+		errno := posix.errno()
+		if errno == .EAGAIN || errno == .EINTR { return false }
+	}
+	// Zero bytes is end of stream; any other error ends it too.
+	if n <= 0 {
 		done^ = true
 		return false
 	}
@@ -297,28 +308,30 @@ tool_append_bounded :: proc(kept: ^string, truncated: ^bool, chunk: []u8, limit:
 	kept^ = string(grown[:])
 }
 
-// tool_terminate_group asks the whole tree to stop, escalates to SIGKILL once
-// the grace period expires, and reaps the direct child. A process that ignores
-// SIGTERM is why the escalation exists; descendants are why the group does.
+// tool_terminate_direct_child asks the direct child to stop, escalates to
+// SIGKILL once the grace period expires, and reaps it.
 tool_terminate_direct_child :: proc(child: ^Tool_Child) {
 	if child.pid <= 0 || child.reaped { return }
-	_ = linux.kill(linux.Pid(child.pid), .SIGTERM)
+	_ = posix.kill(child.pid, .SIGTERM)
 	grace := time.tick_add(time.tick_now(), TOOL_KILL_GRACE)
 	for time.tick_since(grace) < 0 {
 		if tool_child_poll(child) { return }
 		time.sleep(5 * time.Millisecond)
 	}
-	_ = linux.kill(linux.Pid(child.pid), .SIGKILL)
+	_ = posix.kill(child.pid, .SIGKILL)
 	_, _, _ = tool_child_reap(child)
 }
 
+// tool_terminate_group asks the whole tree to stop, escalates to SIGKILL once
+// the grace period expires, and reaps the direct child. A process that ignores
+// SIGTERM is why the escalation exists; descendants are why the group does.
 tool_terminate_group :: proc(child: ^Tool_Child) {
 	if child.pid <= 0 { return }
 	if tool_group_gone(child.pid) {
 		tool_terminate_direct_child(child)
 		return
 	}
-	tool_signal_group(child.pid, false)
+	_ = posix.killpg(child.pid, .SIGTERM)
 	grace := time.tick_add(time.tick_now(), TOOL_KILL_GRACE)
 	for time.tick_since(grace) < 0 {
 		_ = tool_child_poll(child)
@@ -328,16 +341,11 @@ tool_terminate_group :: proc(child: ^Tool_Child) {
 		}
 		time.sleep(5 * time.Millisecond)
 	}
-	tool_signal_group(child.pid, true)
+	_ = posix.killpg(child.pid, .SIGKILL)
 	tool_terminate_direct_child(child)
 }
 
-tool_group_gone :: proc(pid: int) -> bool {
-	if pid <= 0 { return true }
-	return linux.kill(linux.Pid(-pid), linux.Signal(0)) == .ESRCH
-}
-
-tool_signal_group :: proc(pid: int, kill: bool) {
-	signal: linux.Signal = .SIGKILL if kill else .SIGTERM
-	_ = linux.kill(linux.Pid(-pid), signal)
+tool_group_gone :: proc(group: posix.pid_t) -> bool {
+	if group <= 0 { return true }
+	return posix.killpg(group, .NONE) == .FAIL && posix.errno() == .ESRCH
 }

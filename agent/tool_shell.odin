@@ -4,7 +4,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:strings"
-import linux "core:sys/linux"
+import "core:sys/posix"
 import "core:time"
 import "core:unicode/utf8"
 
@@ -116,7 +116,7 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_She
 // and with the portable shell when that shell cannot be started. Only a command
 // that never started is tried twice: a shell that ran it has already had its
 // effects, and running it again would repeat them.
-tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write: linux.Fd) -> (pid: int, started: bool) {
+tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write: posix.FD) -> (pid: posix.pid_t, started: bool) {
 	shell := tool_shell_preferred()
 	pid, started = tool_spawn_grouped(shell, command, directory, stdout_write, stderr_write)
 	if started || shell == TOOL_SHELL_FALLBACK { return pid, started }
@@ -144,30 +144,33 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 		delete(data.stderr, ctx.allocator)
 	}
 
-	stdout_pipe, stderr_pipe: [2]linux.Fd
-	if linux.pipe2(&stdout_pipe, {.CLOEXEC}) != .NONE {
-		return tool_shell_finish(ctx, .Tool_Failed, TOOL_SHELL_NOT_STARTED, data)
+	stdout_read, stdout_write, stdout_error := os.pipe()
+	if stdout_error != nil { return tool_shell_not_started(ctx, stdout_error, data) }
+	defer os.close(stdout_read)
+	stderr_read, stderr_write, stderr_error := os.pipe()
+	if stderr_error != nil {
+		_ = os.close(stdout_write)
+		return tool_shell_not_started(ctx, stderr_error, data)
 	}
-	if linux.pipe2(&stderr_pipe, {.CLOEXEC}) != .NONE {
-		_ = linux.close(stdout_pipe[0])
-		_ = linux.close(stdout_pipe[1])
-		return tool_shell_finish(ctx, .Tool_Failed, TOOL_SHELL_NOT_STARTED, data)
-	}
-	pid, spawned := tool_shell_start(args.command, directory, stdout_pipe[1], stderr_pipe[1])
-	_ = linux.close(stdout_pipe[1])
-	_ = linux.close(stderr_pipe[1])
-	if !spawned {
-		_ = linux.close(stdout_pipe[0])
-		_ = linux.close(stderr_pipe[0])
-		return tool_shell_finish(ctx, .Tool_Failed, TOOL_SHELL_NOT_STARTED, data)
-	}
+	defer os.close(stderr_read)
+	pid, spawned := tool_shell_start(args.command, directory, posix.FD(os.fd(stdout_write)), posix.FD(os.fd(stderr_write)))
+	_ = os.close(stdout_write)
+	_ = os.close(stderr_write)
+	if !spawned { return tool_shell_finish(ctx, .Tool_Failed, TOOL_SHELL_NOT_STARTED, data) }
 
 	child := Tool_Child {
 		pid = pid,
 	}
-	stop := tool_drain_pipes(&child, stdout_pipe[0], stderr_pipe[0], time.tick_now(), args.timeout, ctx.control, &data, ctx.allocator)
-	_ = linux.close(stdout_pipe[0])
-	_ = linux.close(stderr_pipe[0])
+	stop := tool_drain_pipes(
+		&child,
+		posix.FD(os.fd(stdout_read)),
+		posix.FD(os.fd(stderr_read)),
+		time.tick_now(),
+		args.timeout,
+		ctx.control,
+		&data,
+		ctx.allocator,
+	)
 	switch stop {
 	case .Cancelled:
 		return tool_shell_finish(ctx, .Cancelled, "the command was cancelled", data, "cancelled")
@@ -188,6 +191,12 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 		return tool_shell_finish(ctx, .Tool_Failed, fmt.tprintf("the command exited with status %d", exit_code), data, fmt.tprintf("exited %d", exit_code))
 	}
 	return tool_shell_finish(ctx, .Success, "", data, "exited 0")
+}
+
+// tool_shell_not_started reports a command that could not start because the
+// system refused a resource it needs, naming the system's reason.
+tool_shell_not_started :: proc(ctx: ^Tool_Context, cause: os.Error, data: Shell_Data) -> Tool_Result {
+	return tool_shell_finish(ctx, .Tool_Failed, fmt.tprintf("the command did not start: %s", os.error_string(cause)), data)
 }
 
 // tool_shell_finish bounds the captured streams to valid UTF-8 inside the model

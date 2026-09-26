@@ -117,7 +117,7 @@ When a request, a response, or a tool fails, the next step is to tell the model 
 - A condition broadcast is not a retained notification. Every wait uses a sequence or predicate that closes the check-to-sleep window (section 6.3).
 - Signal handlers only perform atomic stores/adds and `sync.futex_broadcast` (both async-signal-safe). No locks, no allocation, no I/O.
 - Operating-system access goes through Odin's portable packages first: `core:os` for files, processes, and environment, `core:sync`, `core:thread`, `core:time`, `core:net`, `core:nbio`, and `core:sys/posix` where POSIX covers the need. Linux is the only platform built today, and macOS and the BSDs are expected; a facility with no portable interface (`inotify`, `eventfd`, `pidfd_open`, `prctl`, `/proc`) is reached through a package-local procedure implemented in a `_linux.odin` file, so a new platform adds a file and changes no caller. No branches for platforms that are not built.
-- The post-fork child path is allocation-free and lock-free (raw syscalls only).
+- The post-fork child path is allocation-free and lock-free: between `fork` and `exec` it makes only async-signal-safe `core:sys/posix` calls and leaves through `_exit`.
 
 ### 3.6 Serialization
 
