@@ -327,6 +327,7 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 		// unreadable record leaves.
 		{key = "replay_refused", value = i64(prep.replay_refused)},
 	}
+	context.logger = log_rebind(&binding, log_correlation(chat))
 	log_emit({level = .Info, category = .Provider, event = "request.prepared", fields = prepared[:]})
 
 	chat.last_estimate = prep.estimate

@@ -397,6 +397,10 @@ test_preparation_never_names_the_previous_request :: proc(t: ^testing.T) {
 		switch string(event) {
 		case "request.prepared", "request.admission":
 			prepared += 1
+			if string(event) == "request.prepared" {
+				_, turn_named := object["turn_no"]
+				testing.expectf(t, turn_named, "request.prepared must name its turn: %s", line)
+			}
 			_, named := object["request_no"]
 			testing.expectf(t, !named, "%s must not name a request: %s", event, line)
 		case "request.recorded":
