@@ -470,8 +470,13 @@ chat_run_turn_steered :: proc(
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
 
+	if control != nil { control.stop.parent = &process_interrupt }
 	chat.control = control
-	defer chat.control = nil
+	chat.stop.parent = chat_stop_parent(chat)
+	defer {
+		chat.control = nil
+		chat.stop.parent = chat_stop_parent(chat)
+	}
 
 	previous: posix.sigaction_t
 	chat_signal_arm(&previous)

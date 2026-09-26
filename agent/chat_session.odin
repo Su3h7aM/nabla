@@ -511,7 +511,9 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat.active_failed = false
 	chat.requests_made = 0
 	chat.calls_made = 0
-	chat.stop = {}
+	chat.stop = {
+		parent = chat_stop_parent(chat),
+	}
 	chat_operation_retire(&chat.operation)
 	chat_chain_release(chat)
 	if chat.tool_jobs_active {
@@ -625,33 +627,42 @@ chat_session_cancelled :: proc(chat: ^Chat_Session) -> bool {
 	return ai.interrupt_requested(&chat.stop)
 }
 
-// chat_session_observe_stop applies a stop the front-end or the process asked for to the
-// running turn. It is part of the owner's collection step.
+// chat_session_observe_stop moves a turn the front-end or the process stopped into
+// Cancelling. The stop itself already reached everything that reads the turn's token,
+// including a request blocked on the owner's thread; this is the state machine's side.
 chat_session_observe_stop :: proc(chat: ^Chat_Session) {
-	if process_interrupted() || chat.control != nil && turn_control_stop_requested(chat.control) {
-		_ = chat_session_request_cancel(chat)
-	}
+	if chat_session_cancelled(chat) { chat_session_note_cancel(chat) }
+}
+
+// chat_stop_parent is the token a turn's stop chains to: the front-end's control while
+// one drives the turn, else the process interrupt.
+@(private)
+chat_stop_parent :: proc(chat: ^Chat_Session) -> ^ai.Interrupt {
+	if chat.control != nil { return &chat.control.stop }
+	return &process_interrupt
 }
 
 // Turn_Control is how a front-end stops the turns it runs. The front-end owns it at an
-// address that outlives every turn given it. Any thread may request a stop; the owner
-// applies it at its next observation. The front-end clears it before starting a turn it
-// has not asked to stop.
+// address that outlives every turn given it. Any thread may request a stop, which every
+// wait of the running turn observes; the owner also wakes to apply it. The front-end
+// clears it before starting a turn it has not asked to stop.
 Turn_Control :: struct {
-	stop_requested: bool,
+	stop: ai.Interrupt,
 }
 
 turn_control_stop :: proc "contextless" (control: ^Turn_Control) {
-	sync.atomic_store(&control.stop_requested, true)
+	ai.interrupt_request(&control.stop)
 	owner_wake_signal()
 }
 
 turn_control_clear :: proc "contextless" (control: ^Turn_Control) {
-	sync.atomic_store(&control.stop_requested, false)
+	sync.atomic_store(&control.stop.requested, false)
 }
 
+// turn_control_stop_requested reports whether the front-end asked to stop, apart from
+// the process interrupt.
 turn_control_stop_requested :: proc "contextless" (control: ^Turn_Control) -> bool {
-	return sync.atomic_load(&control.stop_requested)
+	return sync.atomic_load(&control.stop.requested)
 }
 
 // chat_session_retire_operation is the confirmation that the turn's work stopped.

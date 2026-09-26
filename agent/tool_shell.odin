@@ -35,12 +35,6 @@ TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms"}
 // TOOL_SHELL_DEFAULT_TIMEOUT applies when the model gives no timeout. There is no maximum.
 TOOL_SHELL_DEFAULT_TIMEOUT :: 120 * time.Second
 
-// TOOL_SHELL_NOT_STARTED is the one thing a spawn that exhausted its shells can
-// say. A pipe that could not be created, a fork that failed, and an exec of the
-// portable shell that never reached it all look the same from here, and the
-// harness will not invent a cause.
-TOOL_SHELL_NOT_STARTED :: "the command did not start or its output was lost"
-
 TOOL_MAX_STDOUT_BYTES :: 24 * 1024
 TOOL_MAX_STDERR_BYTES :: 24 * 1024
 
@@ -115,10 +109,10 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_She
 // and with the portable shell when that shell cannot be started. Only a command
 // that never started is tried twice: a shell that ran it has already had its
 // effects, and running it again would repeat them.
-tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write: ^os.File) -> (pid: int, started: bool) {
+tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write: ^os.File) -> (child: Tool_Child, spawn: Tool_Spawn, err: os.Error) {
 	shell := tool_shell_preferred()
-	pid, started = tool_spawn_grouped(shell, command, directory, stdout_write, stderr_write)
-	if started || shell == TOOL_SHELL_FALLBACK { return pid, started }
+	child, spawn, err = tool_spawn_grouped(shell, command, directory, stdout_write, stderr_write)
+	if spawn != .Exec_Failed || shell == TOOL_SHELL_FALLBACK { return }
 	return tool_spawn_grouped(TOOL_SHELL_FALLBACK, command, directory, stdout_write, stderr_write)
 }
 
@@ -152,16 +146,17 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 		return tool_shell_not_started(ctx, stderr_error, data)
 	}
 	defer os.close(stderr_read)
-	pid, spawned := tool_shell_start(args.command, directory, stdout_write, stderr_write)
+	child, spawn, spawn_error := tool_shell_start(args.command, directory, stdout_write, stderr_write)
 	_ = os.close(stdout_write)
 	_ = os.close(stderr_write)
-	if !spawned { return tool_shell_finish(ctx, .Tool_Failed, TOOL_SHELL_NOT_STARTED, data) }
+	if spawn != .Started { return tool_shell_not_started(ctx, spawn_error, data) }
+	defer tool_child_close(&child)
 
-	child := Tool_Child {
-		pid = pid,
-	}
-	stop := tool_drain_pipes(&child, stdout_read, stderr_read, time.tick_now(), args.timeout, ctx.control, &data, ctx.allocator)
+	stop, wait_error := tool_drain_pipes(&child, stdout_read, stderr_read, time.tick_now(), args.timeout, ctx.control, &data, ctx.allocator)
 	switch stop {
+	case .Wait_Failed:
+		message := fmt.tprintf("the harness could not wait for the command, so it was stopped: %s", os.error_string(wait_error))
+		return tool_shell_finish(ctx, .Tool_Failed, message, data, "wait failed")
 	case .Cancelled:
 		return tool_shell_finish(ctx, .Cancelled, "the command was cancelled", data, "cancelled")
 	case .Timed_Out:
@@ -183,8 +178,8 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 	return tool_shell_finish(ctx, .Success, "", data, "exited 0")
 }
 
-// tool_shell_not_started reports a command that could not start because the
-// system refused a resource it needs, naming the system's reason.
+// tool_shell_not_started reports a command that did not start, naming the
+// system's reason.
 tool_shell_not_started :: proc(ctx: ^Tool_Context, cause: os.Error, data: Shell_Data) -> Tool_Result {
 	return tool_shell_finish(ctx, .Tool_Failed, fmt.tprintf("the command did not start: %s", os.error_string(cause)), data)
 }

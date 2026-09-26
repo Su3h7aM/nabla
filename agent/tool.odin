@@ -3,6 +3,7 @@ package agent
 import "base:runtime"
 import "core:encoding/json"
 import "core:mem"
+import "core:os"
 import "core:slice"
 import "core:strings"
 import "core:time"
@@ -17,9 +18,41 @@ import "nabla:ai"
 // interrupt is the execution's own stop token, so one call can be stopped without
 // stopping its siblings. parent is the token of the work that owns it, read on every
 // check. Both are optional.
+//
+// wake, when present, is the read end of a Tool_Wake that is signalled once
+// interrupt is requested, so a tool that sleeps in poll wakes for the stop. It is
+// borrowed and stays open for the whole execution. Without it a sleeping tool sees
+// the stop only when its own wait ends.
 Tool_Control :: struct {
 	interrupt: ^ai.Interrupt,
 	parent:    ^ai.Interrupt,
+	wake:      ^os.File,
+}
+
+// Tool_Wake is a pipe that becomes readable for good when it is signalled, which
+// is how a stop reaches a tool asleep in poll. Its zero value is closed.
+Tool_Wake :: struct {
+	read:  ^os.File,
+	write: ^os.File,
+}
+
+tool_wake_open :: proc() -> (wake: Tool_Wake, err: os.Error) {
+	wake.read, wake.write = os.pipe() or_return
+	return
+}
+
+// tool_wake_signal wakes every waiter on wake.read, now and later. Signalling again
+// does nothing.
+tool_wake_signal :: proc(wake: ^Tool_Wake) {
+	if wake.write == nil { return }
+	_ = os.close(wake.write)
+	wake.write = nil
+}
+
+tool_wake_close :: proc(wake: ^Tool_Wake) {
+	tool_wake_signal(wake)
+	if wake.read != nil { _ = os.close(wake.read) }
+	wake^ = {}
 }
 
 // Tool_Context is what one execution is given besides its arguments. Every

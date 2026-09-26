@@ -57,18 +57,22 @@ shell_test_workspace :: proc(allocator: mem.Allocator) -> string {
 // descendant is gone rather than trusting that the group was signalled.
 Shell_Run :: struct {
 	thread:    ^thread.Thread,
-	control:   Tool_Control,
+	interrupt: ai.Interrupt,
+	wake:      Tool_Wake,
 	command:   string,
 	workspace: string,
 	result:    Tool_Result,
 	started:   sync.Sema,
 }
 
-shell_run_start :: proc(run: ^Shell_Run, workspace: string, command: string, control: Tool_Control) -> bool {
+shell_run_start :: proc(run: ^Shell_Run, workspace: string, command: string) -> bool {
+	wake, wake_err := tool_wake_open()
+	if wake_err != nil { return false }
+	run.wake = wake
 	run.workspace = workspace
-	run.control = control
 	run.command = command
 	run.thread = test_thread_start(shell_run_serve, run, "nabla-shell-run")
+	if run.thread == nil { tool_wake_close(&run.wake) }
 	return run.thread != nil
 }
 
@@ -80,9 +84,9 @@ shell_run_serve :: proc(thread: ^thread.Thread) {
 	defer tool_arguments_destroy(&arguments)
 
 	ctx := Tool_Context {
-		call_id   = "call_shell",
+		call_id = "call_shell",
 		workspace = run.workspace,
-		control   = run.control,
+		control = {interrupt = &run.interrupt, wake = run.wake.read},
 		allocator = context.allocator,
 	}
 	object, is_object := arguments.value.(json.Object)
@@ -98,6 +102,13 @@ shell_run_join :: proc(run: ^Shell_Run) {
 	thread.join(run.thread)
 	thread.destroy(run.thread)
 	run.thread = nil
+	tool_wake_close(&run.wake)
+}
+
+// shell_run_stop stops the command the way the owner stops a job.
+shell_run_stop :: proc(run: ^Shell_Run) {
+	ai.interrupt_request(&run.interrupt)
+	tool_wake_signal(&run.wake)
 }
 
 // shell_read_pid file is the synchronization point: the command has reached the
@@ -148,12 +159,11 @@ test_shell_cancel_terminates_descendants :: proc(t: ^testing.T) {allocator := co
 	pid_file := fmt.aprintf("%s/descendant.pid", workspace, allocator = allocator)
 	defer os.remove(pid_file)
 
-	interrupt: ai.Interrupt
 	run: Shell_Run
 	// The background child is a descendant of the direct child: only signalling the
 	// process group reaches it.
 	command := fmt.aprintf("sleep 30 & echo $! > %s; wait", pid_file, allocator = allocator)
-	if !shell_run_start(&run, workspace, command, Tool_Control{interrupt = &interrupt}) {
+	if !shell_run_start(&run, workspace, command) {
 		testing.expectf(t, false, "shell run could not start")
 		return
 	}
@@ -165,7 +175,7 @@ test_shell_cancel_terminates_descendants :: proc(t: ^testing.T) {allocator := co
 	}
 	testing.expectf(t, !shell_process_gone(descendant), "descendant %d was not running before cancellation", descendant)
 
-	ai.interrupt_request(&interrupt)
+	shell_run_stop(&run)
 	shell_run_join(&run)
 	defer tool_result_destroy(&run.result)
 
@@ -178,19 +188,18 @@ test_shell_cancel_escalates_when_sigterm_is_ignored :: proc(t: ^testing.T) {
 	allocator := context.temp_allocator
 	workspace := shell_test_workspace(allocator)
 
-	interrupt: ai.Interrupt
 	run: Shell_Run
 	// The shell ignores SIGTERM and keeps running, so only SIGKILL ends it. If the
 	// escalation were missing this call would block on the final reap instead of
 	// returning, which the suite's external timeout would catch.
-	if !shell_run_start(&run, workspace, `trap "" TERM; while :; do sleep 0.05; done`, Tool_Control{interrupt = &interrupt}) {
+	if !shell_run_start(&run, workspace, `trap "" TERM; while :; do sleep 0.05; done`) {
 		testing.expectf(t, false, "shell run could not start")
 		return
 	}
 	defer shell_run_join(&run)
 	time.sleep(100 * time.Millisecond)
 	started := time.tick_now()
-	ai.interrupt_request(&interrupt)
+	shell_run_stop(&run)
 	shell_run_join(&run)
 	elapsed := time.tick_since(started)
 	defer tool_result_destroy(&run.result)
@@ -395,7 +404,9 @@ test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
 	testing.expect_value(t, request.outcome, session.Outcome.Cancelled)
 	testing.expect(t, request.error_json != "", "the cancelled send's own error must be recorded")
 
-	// The turn is over and the session is immediately reusable.
+	// The turn is over and the session is immediately reusable. The process would exit on
+	// the signal, so the latch is cleared to show the session itself holds no stop.
+	sync.atomic_store(&process_interrupt.requested, false)
 	_test_accept(t, chat, "again")
 	testing.expect_value(t, chat.active_turn_id, first_turn + 1)
 	testing.expect(t, !chat_session_cancelled(chat))

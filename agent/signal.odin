@@ -1,20 +1,22 @@
 package agent
 
-import "core:sync"
 import "core:sys/posix"
+
+import "nabla:ai"
 
 // process_interrupt latches a SIGINT or SIGTERM: the process was asked to stop. A signal
 // handler may only write static storage, so this is the one process-wide stop; the owner
 // applies it to the turn it runs, and the root ends the process once no turn runs.
+// Every turn's stop chains to it, so a wait blocked inside the turn sees it at once.
 @(private)
-process_interrupt: bool
+process_interrupt: ai.Interrupt
 
 process_interrupted :: proc "contextless" () -> bool {
-	return sync.atomic_load(&process_interrupt)
+	return ai.interrupt_requested(&process_interrupt)
 }
 
 chat_signal_interrupt :: proc "c" (signal: posix.Signal) {
-	sync.atomic_store(&process_interrupt, true)
+	ai.interrupt_request(&process_interrupt)
 	owner_wake_signal()
 }
 

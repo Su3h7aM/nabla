@@ -402,7 +402,8 @@ A queued job starts when no earlier-admitted, unretired job conflicts with it an
 
 - The effective timeout is resolved once at admission: `args.timeout` when the model gave one, else `definition.default`, else none. There is no maximum. The clock starts at `Start_Job`, not at admission. A timed-out job returns `Timed_Out` with its partial output, so the model can rerun it with a longer timeout.
 - Outcomes distinguish `Timed_Out` (own deadline), `Cancelled` (turn or job stop), and `Unknown` (stop not confirmed).
-- `Stop` is per turn and per job. Workers check `job.stop` and `turn.stop` (the turn outlives every job it owns). There is no process-global token that gets reset.
+- `Stop` is per turn and per job. Each token chains to the wider one that owns it: a job's stop to its turn's, the turn's to the front-end's control, and that to the process interrupt, so a check anywhere sees every stop above it without the owner relaying it. The turn outlives every job it owns, and no token is ever reset while work still reads it.
+- A worker blocked in a wait wakes for its stop: the owner signals the job's wake pipe when it requests the stop, and the worker includes that pipe in the same `poll` as its I/O.
 - Provider attempts receive cancellation only; model deliberation has no harness deadline.
 
 ## 8. Journal
@@ -704,7 +705,7 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 
 - Read: open once, `fstat` that descriptor; text only (no NUL, valid UTF-8); the model chooses the line window, and the result is projected through the context budget like any other.
 - Write: validate, temp file in the same directory, write, fsync, rename; refuse symlinks and non-regular targets; keep the mode.
-- Shell: `$SHELL -c` (fallback `/bin/sh` only when exec failed), fresh process group, stdin closed, inherited environment, raw-syscall child path, both pipes drained under `poll`, TERM then KILL after `SHELL_KILL_GRACE`, reap, exec failure distinct from exit 127, UTF-8-sanitized output retained whole and projected through the context budget. The timeout is the model's value when given, else the default; there is no maximum.
+- Shell: `$SHELL -c` (fallback `/bin/sh` only when exec failed), fresh process group, stdin closed, inherited environment, async-signal-safe child path, one `poll` over both pipes, the child's exit handle, and the job's stop wake with the deadline as its timeout, TERM to the group then KILL after `SHELL_KILL_GRACE`, reap, exec failure distinct from exit 127, UTF-8-sanitized output retained whole and projected through the context budget. The timeout is the model's value when given, else the default; there is no maximum.
 - MCP: one shared executor; one request at a time per client lane. Delivery state maps to `Transport_Failed` (not delivered) or `Unknown` (delivered, no reply). Non-text blocks are described, not dumped.
 
 ## 15. Deterministic repair

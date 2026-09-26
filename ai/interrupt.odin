@@ -7,16 +7,24 @@ import "core:time"
 // observed by whoever performs it. Requesting is idempotent and safe from any thread.
 // The zero value is not requested; the owner reuses a token only after every observer
 // of the previous request has finished.
+//
+// parent, when set, is a wider token whose request also stops this work, such as the
+// turn a call belongs to. It is read on every check and must outlive this token.
 Interrupt :: struct {
 	requested: bool,
+	parent:    ^Interrupt,
 }
 
 interrupt_request :: proc "contextless" (interrupt: ^Interrupt) {
 	if interrupt != nil { sync.atomic_store(&interrupt.requested, true) }
 }
 
+// interrupt_requested reports whether interrupt or any of its parents was requested.
 interrupt_requested :: proc "contextless" (interrupt: ^Interrupt) -> bool {
-	return interrupt != nil && sync.atomic_load(&interrupt.requested)
+	for token := interrupt; token != nil; token = token.parent {
+		if sync.atomic_load(&token.requested) { return true }
+	}
+	return false
 }
 
 // Deadline is a monotonic bound. The zero value means "no deadline"; a deadline

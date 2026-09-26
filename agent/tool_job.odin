@@ -3,6 +3,7 @@ package agent
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -148,6 +149,9 @@ Tool_Job :: struct {
 	// control
 	phase:            Tool_Job_Phase,
 	interrupt:        ai.Interrupt, // this job's own stop token
+	// wake is a worker job's stop pipe: the owner signals it with the stop request,
+	// which wakes a worker sleeping in poll, and closes it when it releases the job.
+	wake:             Tool_Wake,
 	// published is atomic. The worker sets it after writing result, and the owner reads result
 	// only after seeing it.
 	published:        bool,
@@ -215,7 +219,7 @@ tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) -> (escaped: bool) {
 	tool_jobs_collect(jobs)
 	for job in jobs.jobs {
 		if job.phase == .Running && job.launched {
-			ai.interrupt_request(&job.interrupt)
+			tool_job_request_stop(job)
 			job.phase = .Abandoned
 		}
 		if job.phase == .Abandoned {
@@ -242,6 +246,7 @@ tool_job_release :: proc(job: ^Tool_Job) {
 	}
 	tool_arguments_destroy(&job.arguments, job.allocator)
 	if job.result_present { tool_result_destroy(&job.result) }
+	tool_wake_close(&job.wake)
 	delete(job.name, job.allocator)
 	delete(job.call_id, job.allocator)
 	mem.free(job, job.allocator)
@@ -617,7 +622,7 @@ tool_jobs_latch_stop :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	// A running job is asked once; the request is latched in its own token, so a
 	// repeat is harmless and a job that ignores it is drained, not forgotten.
 	for job in jobs.jobs {
-		if job.phase == .Running { ai.interrupt_request(&job.interrupt) }
+		if job.phase == .Running { tool_job_request_stop(job) }
 		if job.placement == .Lua && job.lua != nil {
 			code_mode_lua_request_stop(job.lua)
 			if job.phase == .Queued && candidate == .Cancelled {
@@ -682,10 +687,11 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		tool_job_lua_start(jobs, chat, job)
 		return
 	}
-	if !tool_job_launch(job) {
-		// A thread that could not start is a backend the harness could not run. The
+	if launch_error := tool_job_launch(job); launch_error != nil {
+		// A worker that could not start is a backend the harness could not run. The
 		// dispatch entry stands, so the outcome is recorded honestly.
-		job.result = tool_result_failure(&job.exec, .Tool_Failed, "the tool could not be started", "not started")
+		message := fmt.tprintf("the tool could not be started: %s", os.error_string(launch_error))
+		job.result = tool_result_failure(&job.exec, .Tool_Failed, message, "not started")
 		job.result_present = true
 		job.phase = .Result_Ready
 		return
@@ -900,16 +906,26 @@ tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
 // tool_job_launch starts one worker-placed job. The watched signals are blocked across
 // creation so the worker inherits a mask that keeps it from running the process handler.
 @(private)
-tool_job_launch :: proc(job: ^Tool_Job) -> bool {
+tool_job_launch :: proc(job: ^Tool_Job) -> os.Error {
+	job.wake = tool_wake_open() or_return
+	job.exec.control.wake = job.wake.read
 	previous := chat_signal_block_watched()
 	worker := thread.create(tool_job_worker, name = "nabla-tool")
 	chat_signal_restore(previous)
-	if worker == nil { return false }
+	if worker == nil { return mem.Allocator_Error.Out_Of_Memory }
 	worker.data = job
 	job.thread = worker
 	thread.start(worker)
 	job.launched = true
-	return true
+	return nil
+}
+
+// tool_job_request_stop asks a running job to stop and wakes its worker. A repeat
+// is harmless: the request is latched in the job's own token.
+@(private)
+tool_job_request_stop :: proc(job: ^Tool_Job) {
+	ai.interrupt_request(&job.interrupt)
+	tool_wake_signal(&job.wake)
 }
 
 // tool_job_worker runs one call and publishes its result. It touches nothing after the wake.

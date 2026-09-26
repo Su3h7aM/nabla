@@ -136,7 +136,7 @@ sigaction_storage :: struct {
 test_signal_handler_outlives_sessions :: proc(t: ^testing.T) {
 	if !test_isolate_process(t, #procedure) { return }
 	for round in 0 ..< 24 {
-		sync.atomic_store(&process_interrupt, false)
+		sync.atomic_store(&process_interrupt.requested, false)
 		// Installation and removal are exercised repeatedly, and the session is
 		// destroyed while the handler may still be returning from this round's signal.
 		// If the handler referenced session memory rather than static storage, that
@@ -289,6 +289,10 @@ test_shutdown_during_tool_reaps_child_before_session_cleanup :: proc(t: ^testing
 	effect = chat_session_advance(chat)
 	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Run_Tools)
 
+	// The stop comes from this thread, as a front-end's would, so the turn's token
+	// chains to a control this thread owns.
+	control: Turn_Control
+	chat.stop.parent = &control.stop
 	run := Shell_Tool_Run {
 		chat = chat,
 	}
@@ -305,9 +309,12 @@ test_shutdown_during_tool_reaps_child_before_session_cleanup :: proc(t: ^testing
 		thread.destroy(run.thread)
 		return
 	}
-	testing.expect(t, chat_session_request_cancel(chat))
+	turn_control_stop(&control)
 	thread.join(run.thread)
 	thread.destroy(run.thread)
+	// The tool driver does not observe the session, so this thread, the owner again,
+	// applies the stop to the state machine as the owner's collection step would.
+	chat_session_observe_stop(chat)
 
 	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, run.count))
 	chat_session_retire_operation(chat)
