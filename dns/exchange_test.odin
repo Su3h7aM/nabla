@@ -240,12 +240,20 @@ start_peers :: proc(t: ^testing.T, fixture: ^Exchange_Fixture) -> (udp_thread, t
 	return udp_thread, tcp_thread, bound.port, true
 }
 
-// stop_peers joins the peer threads and closes their sockets. A TCP peer
-// still polling for a connection that will never come is woken with a
-// self-connect first: it accepts, reads the immediate close, and leaves,
-// instead of polling to its bound.
+// stop_peers joins the peer threads and closes their sockets. Peers still
+// waiting for a query that will never come are woken first, so they leave
+// instead of waiting to their bound: the UDP peer with an empty datagram it
+// ignores, and the TCP peer with a self-connect it accepts and sees closed.
 stop_peers :: proc(fixture: ^Exchange_Fixture, udp_thread, tcp_thread: ^thread.Thread) {
-	if wake, wake_err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Address{127, 0, 0, 1}, port = fixture.port}); wake_err == nil {
+	peer := net.Endpoint {
+		address = net.IP4_Address{127, 0, 0, 1},
+		port    = fixture.port,
+	}
+	if waker, waker_err := net.make_unbound_udp_socket(.IP4); waker_err == nil {
+		_, _ = net.send_udp(waker, nil, peer)
+		net.close(waker)
+	}
+	if wake, wake_err := net.dial_tcp_from_endpoint(peer); wake_err == nil {
 		net.close(wake)
 	}
 	thread.join(udp_thread)

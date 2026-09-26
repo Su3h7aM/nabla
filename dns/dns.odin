@@ -1,19 +1,19 @@
 // Package dns is a stub DNS resolver: it asks the caller's nameservers for
-// records and reports what they answer. It owns the DNS mechanism — message
+// records and reports what they answer. It owns the DNS mechanism (message
 // validation, UDP/TCP exchange framing, truncation fallback, and the
-// attempts-over-servers policy — and nothing else. Which servers to ask, how
+// attempts-over-servers policy) and nothing else. Which servers to ask, how
 // long to wait, when to stop, and what to do with answers are the caller's
 // policy, carried in Options.
 //
 // The message codec, record model, and OS configuration readers live in
 // core:net and are reused, not repeated here. What core does not provide is
 // truncation-aware transport selection and response validation, which is
-// what this package adds.
-//
-// Linux is the only target, like the rest of this repository.
+// what this package adds. Every wait runs on the calling thread's core:nbio
+// event loop, which a lookup acquires for its own duration.
 package dns
 
 import "core:mem"
+import "core:nbio"
 import "core:net"
 import "core:time"
 
@@ -21,25 +21,26 @@ import "core:time"
 // matches the resolv.conf, Go, and hickory defaults of five seconds.
 DNS_TIMEOUT :: 5 * time.Second
 
-// DNS_IO_SLICE bounds one blocking wait inside an attempt. Short slices keep
-// interruption prompt: the interrupt is checked between slices rather than
-// after a whole timeout.
+// DNS_IO_SLICE is how often a wait asks the caller's interrupt check whether
+// to stop. A lookup without a check waits on its deadline alone.
 DNS_IO_SLICE :: 50 * time.Millisecond
 
 // Error is why a lookup ended. Invalid_Request is caller misuse (a bad name,
 // no servers, an oversized query). No_Answer means every server was tried
 // without a usable answer, including attempts that ran out their own bound.
-// Cancelled is the caller's interrupt.
+// Cancelled is the caller's interrupt. No_Event_Loop means the thread's event
+// loop could not be started, so no server could be asked.
 Error :: enum {
 	None,
 	Invalid_Request,
 	No_Answer,
 	Cancelled,
+	No_Event_Loop,
 }
 
-// Interrupt is the caller's stop policy for one lookup. The check runs
-// between wait slices and answers only whether to stop now; an empty check
-// never stops.
+// Interrupt is the caller's stop policy for one lookup. The check runs at
+// least every DNS_IO_SLICE while a lookup waits, and answers only whether to
+// stop now; an empty check never stops.
 Interrupt :: struct {
 	check:     proc(user_data: rawptr) -> bool,
 	user_data: rawptr,
@@ -76,13 +77,16 @@ attempt_rounds :: proc(options: Options) -> int {
 
 // lookup asks the configured servers for records of one type and returns the
 // first usable answer. Servers are tried in order, and the order is repeated
-// for the configured attempts; an interruption stops the lookup at the next
-// slice boundary. Returned records are owned by the caller, released with
+// for the configured attempts; an interruption stops the lookup within
+// DNS_IO_SLICE. Returned records are owned by the caller, released with
 // net.destroy_dns_records.
 lookup :: proc(hostname: string, kind: net.DNS_Record_Type, options: Options, allocator: mem.Allocator) -> (records: []net.DNS_Record, err: Error) {
 	if !net.validate_hostname(hostname) { return nil, .Invalid_Request }
 	if len(options.servers) == 0 { return nil, .Invalid_Request }
 	if interrupt_now(options.interrupt) { return nil, .Cancelled }
+
+	if nbio.acquire_thread_event_loop() != nil { return nil, .No_Event_Loop }
+	defer nbio.release_thread_event_loop()
 
 	id, id_ok := query_id()
 	if !id_ok { return nil, .Invalid_Request }
@@ -109,13 +113,10 @@ lookup :: proc(hostname: string, kind: net.DNS_Record_Type, options: Options, al
 				return answer, .None
 			case .Name_Error:
 				// The name does not exist, so no other server can answer.
-				net.destroy_dns_records(answer, allocator)
 				return nil, .No_Answer
 			case .Cancelled:
-				net.destroy_dns_records(answer, allocator)
 				return nil, .Cancelled
 			case .Skip, .Retry_TCP:
-				net.destroy_dns_records(answer, allocator)
 				if interrupt_now(options.interrupt) { return nil, .Cancelled }
 			}
 		}

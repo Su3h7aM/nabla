@@ -31,25 +31,17 @@ test_message_truncated :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_response_rcode :: proc(t: ^testing.T) {
-	rcode, ok := response_rcode(wire(TEST_REPLY))
-	testing.expect(t, ok, "a reply carries a response code")
-	testing.expect_value(t, rcode, 0)
+test_response_nxdomain :: proc(t: ^testing.T) {
+	testing.expect(t, !response_nxdomain(wire(TEST_REPLY)), "an answer is not a name error")
 
 	denied := wire("\x12\x34\x81\x83\x00\x01\x00\x00\x00\x00\x00\x00" + "\x07example\x03com\x00\x00\x01\x00\x01")
-	denied_code, denied_ok := response_rcode(denied)
-	testing.expect(t, denied_ok, "a refusal carries a response code")
-	testing.expect_value(t, denied_code, Rcode_Name_Error)
+	testing.expect(t, response_nxdomain(denied), "RCODE 3 is a name error")
 
 	failed := wire("\x12\x34\x81\x82\x00\x01\x00\x00\x00\x00\x00\x00" + "\x07example\x03com\x00\x00\x01\x00\x01")
-	failed_code, failed_ok := response_rcode(failed)
-	testing.expect(t, failed_ok, "a failure carries a response code")
-	testing.expect(t, failed_code != Rcode_Name_Error, "only name errors are name errors")
+	testing.expect(t, !response_nxdomain(failed), "only name errors are name errors")
 
 	short := wire(TEST_QUERY)
-	testing.expect(t, len(short) >= HEADER_SIZE, "the test query has a header")
-	_, short_ok := response_rcode(short[:7])
-	testing.expect(t, !short_ok, "a short buffer carries no response code")
+	testing.expect(t, !response_nxdomain(short[:7]), "a short buffer carries no response code")
 }
 
 @(test)
@@ -81,6 +73,16 @@ test_response_matches :: proc(t: ^testing.T) {
 	// A question that points at itself is a pointer loop, not a question.
 	self_pointer := wire("\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00" + "\xC0\x0C\x00\x01\x00\x01")
 	testing.expect(t, !response_matches(query, self_pointer), "a pointer loop is not a question")
+
+	// RFC 1035 4.1.4: a pointer names a prior occurrence. One that points back
+	// into its own name loops however few jumps it takes.
+	own_name := wire("\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00" + "\x07example\xC0\x0C\x00\x01\x00\x01")
+	testing.expect(t, !response_matches(query, own_name), "a pointer into its own name is a loop")
+
+	// The answer name in TEST_REPLY is a pointer to the question name, so it is
+	// the same name.
+	answer_name := wire(TEST_REPLY)
+	testing.expect(t, names_equal_fold(answer_name, HEADER_SIZE + 17, answer_name, HEADER_SIZE), "a pointer reads as the name it points to")
 
 	// Short buffers match nothing.
 	testing.expect(t, !response_matches(query, reply[:11]), "a short reply matches nothing")

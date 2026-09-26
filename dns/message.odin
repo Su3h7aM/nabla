@@ -2,9 +2,9 @@
 //
 // The message codec itself lives in core:net and is reused, not repeated
 // here. What this file adds is the small set of predicates a stub resolver
-// needs before it may act on a reply: the truncation bit, and whether the
-// reply answers the query that was sent. Both are pure functions over the
-// received bytes, with no allocation and no network.
+// needs before it may act on a reply: the truncation bit, the response code,
+// and whether the reply answers the query that was sent. All of them are pure
+// functions over the received bytes, with no allocation and no network.
 package dns
 
 // HEADER_SIZE is the DNS header: ID, flags, and four section counts.
@@ -27,11 +27,15 @@ Flags :: bit_field u16 {
 	qr:     bool | 1,
 }
 
+// Rcode_Name_Error is the response code for a name that does not exist.
+// RFC 1035 4.1.1. No OPT record leaves this endpoint, so the plain four-bit
+// code is authoritative.
+Rcode_Name_Error :: 3
+
 // message_flags reads the header flags of a message with at least a header.
 message_flags :: proc(message: []u8) -> (flags: Flags, ok: bool) {
 	if len(message) < HEADER_SIZE { return {}, false }
-	bits := u16(message[2]) << 8 | u16(message[3])
-	return transmute(Flags)bits, true
+	return transmute(Flags)read_u16(message, 2), true
 }
 
 // message_truncated reports the TC bit: the reply answers the query but its
@@ -41,17 +45,10 @@ message_truncated :: proc(response: []u8) -> bool {
 	return ok && flags.tc
 }
 
-// Rcode_Name_Error is the response code for a name that does not exist.
-// RFC 1035 4.1.1. No OPT record leaves this endpoint, so the plain four-bit
-// code is authoritative.
-Rcode_Name_Error :: 3
-
-// response_rcode reads the response code of a message with at least a
-// header.
-response_rcode :: proc(response: []u8) -> (rcode: u8, ok: bool) {
-	flags, valid := message_flags(response)
-	if !valid { return 0, false }
-	return flags.rcode, true
+// response_nxdomain reports a definitive Name Error.
+response_nxdomain :: proc(response: []u8) -> bool {
+	flags, ok := message_flags(response)
+	return ok && flags.rcode == Rcode_Name_Error
 }
 
 // response_matches reports whether a reply answers the query that was sent:
@@ -60,120 +57,100 @@ response_rcode :: proc(response: []u8) -> (rcode: u8, ok: bool) {
 // off-path packet that matches none of those is passed over, never acted on.
 response_matches :: proc(query, response: []u8) -> bool {
 	if len(query) < HEADER_SIZE || len(response) < HEADER_SIZE { return false }
-	if response[0] != query[0] || response[1] != query[1] { return false }
-	flags, ok := message_flags(response)
-	if !ok || !flags.qr { return false }
-	return question_matches(query, response)
+	if read_u16(query, 0) != read_u16(response, 0) { return false }
+	flags, _ := message_flags(response)
+	if !flags.qr { return false }
+	if read_u16(query, 4) != 1 || read_u16(response, 4) != 1 { return false }
+
+	query_end, query_ok := name_end(query, HEADER_SIZE)
+	response_end, response_ok := name_end(response, HEADER_SIZE)
+	if !query_ok || !response_ok { return false }
+	// The question's type and class follow its name.
+	if query_end + 4 > len(query) || response_end + 4 > len(response) { return false }
+	if string(query[query_end:][:4]) != string(response[response_end:][:4]) { return false }
+	return names_equal_fold(query, HEADER_SIZE, response, HEADER_SIZE)
 }
 
-// question_matches compares the single question of two messages: type, class,
-// and name. Names compare label by label in ASCII case-insensitive form;
-// compression pointers are followed with a loop guard, so a hostile pointer
-// cycle mismatches rather than looping.
-question_matches :: proc(query, response: []u8) -> bool {
-	if question_count(query) != 1 || question_count(response) != 1 { return false }
-	qname, qtype, qclass, qok := question_at(query)
-	if !qok { return false }
-	rname, rtype, rclass, rok := question_at(response)
-	if !rok { return false }
-	if qtype != rtype || qclass != rclass { return false }
-	return name_equal_fold(query, qname, response, rname)
+// read_u16 reads a big-endian u16 at offset of a message known to hold it.
+read_u16 :: proc(message: []u8, offset: int) -> u16 {
+	return u16(message[offset]) << 8 | u16(message[offset + 1])
 }
 
-// question_count reads QDCOUNT without parsing anything else.
-question_count :: proc(message: []u8) -> int {
-	if len(message) < HEADER_SIZE { return -1 }
-	return int(message[4]) << 8 | int(message[5])
+// Name_Walk steps through the labels of a possibly compressed name.
+//
+// RFC 1035 4.1.4 lets a pointer name only a prior occurrence of a name, which
+// begins before the one that points to it. Each pointer must therefore land
+// before the start of the labels being read, so the walk moves strictly
+// backward on every jump and ends on any message, a hostile one included.
+Name_Walk :: struct {
+	message: []u8,
+	at:      int,
+	// start is where the labels being read began: the name itself, or the
+	// target of the last pointer.
+	start:   int,
+	// end is the first byte past the name where it is written, known once the
+	// walk reaches the root label or its first pointer.
+	end:     int,
 }
 
-// question_at locates the question of a single-question message: the name
-// span, and the type and class that follow it.
-question_at :: proc(message: []u8) -> (name: Span, qtype, qclass: u16, ok: bool) {
-	end, found := name_end(message, HEADER_SIZE, 0)
-	if !found { return {}, 0, 0, false }
-	if end + 4 > len(message) { return {}, 0, 0, false }
-	qtype = u16(message[end]) << 8 | u16(message[end + 1])
-	qclass = u16(message[end + 2]) << 8 | u16(message[end + 3])
-	return Span{HEADER_SIZE, end}, qtype, qclass, true
+name_walk :: proc(message: []u8, offset: int) -> Name_Walk {
+	return {message = message, at = offset, start = offset}
 }
 
-// Span is a byte range inside a message: offset of its first byte and one
-// past its last.
-Span :: struct {
-	start, end: int,
-}
-
-// name_end finds the end of the possibly compressed name at offset: the first
-// byte past it, following at most a few pointers. A name that runs off the
-// message or chains pointers too deep is not a name this resolver reads.
-name_end :: proc(message: []u8, offset, depth: int) -> (end: int, ok: bool) {
-	if depth > 8 { return 0, false }
-	pos := offset
+// name_next returns the next label of the name. done reports the root label,
+// which ends the name; ok is false for anything that is not a name.
+name_next :: proc(walk: ^Name_Walk) -> (label: []u8, done: bool, ok: bool) {
 	for {
-		if pos >= len(message) { return 0, false }
-		length := message[pos]
-		if length & 0xC0 == 0xC0 {
-			if pos + 1 >= len(message) { return 0, false }
-			target := int(length & 0x3F) << 8 | int(message[pos + 1])
-			if target >= len(message) { return 0, false }
-			_, valid := name_end(message, target, depth + 1)
-			if !valid { return 0, false }
-			return pos + 2, true
+		if walk.at >= len(walk.message) { return nil, false, false }
+		length := walk.message[walk.at]
+		switch length & 0xC0 {
+		case 0x00:
+			if length == 0 {
+				if walk.end == 0 { walk.end = walk.at + 1 }
+				return nil, true, true
+			}
+			first := walk.at + 1
+			past := first + int(length)
+			if past > len(walk.message) { return nil, false, false }
+			walk.at = past
+			return walk.message[first:past], false, true
+		case 0xC0:
+			if walk.at + 1 >= len(walk.message) { return nil, false, false }
+			target := int(read_u16(walk.message, walk.at) & 0x3FFF)
+			if target >= walk.start { return nil, false, false }
+			if walk.end == 0 { walk.end = walk.at + 2 }
+			walk.at = target
+			walk.start = target
+		case:
+			// 0x40 and 0x80 are reserved label types (RFC 1035 4.1.4).
+			return nil, false, false
 		}
-		if length & 0xC0 != 0 { return 0, false }
-		if length == 0 { return pos + 1, true }
-		pos += 1 + int(length)
 	}
 }
 
-// name_equal_fold compares two possibly compressed names label by label,
-// ASCII case-insensitive. Only ASCII folds: DNS names are LDH, and a
-// Unicode-aware fold would give a non-name comparison.
-name_equal_fold :: proc(a: []u8, a_span: Span, b: []u8, b_span: Span) -> bool {
-	a_labels := labels(a, a_span)
-	b_labels := labels(b, b_span)
-	defer delete(a_labels)
-	defer delete(b_labels)
-	if len(a_labels) != len(b_labels) { return false }
-	for i in 0 ..< len(a_labels) {
-		a_label := a[a_labels[i].start:a_labels[i].end]
-		b_label := b[b_labels[i].start:b_labels[i].end]
+// name_end finds the first byte past the name written at offset.
+name_end :: proc(message: []u8, offset: int) -> (end: int, ok: bool) {
+	walk := name_walk(message, offset)
+	for {
+		_, done := name_next(&walk) or_return
+		if done { return walk.end, true }
+	}
+}
+
+// names_equal_fold compares two possibly compressed names label by label,
+// ASCII case-insensitive (RFC 4343). Only ASCII folds: a Unicode-aware fold
+// would equate labels DNS treats as different.
+names_equal_fold :: proc(a: []u8, a_offset: int, b: []u8, b_offset: int) -> bool {
+	a_walk := name_walk(a, a_offset)
+	b_walk := name_walk(b, b_offset)
+	for {
+		a_label, a_done := name_next(&a_walk) or_return
+		b_label, b_done := name_next(&b_walk) or_return
+		if a_done || b_done { return a_done == b_done }
 		if !label_equal_fold(a_label, b_label) { return false }
 	}
-	return true
 }
 
-// labels splits the name at span into its label spans, following compression
-// pointers. The array carries its allocator for release; a malformed name
-// yields no labels, which never equals a well-formed one. The root name
-// yields no labels either, and equals only itself.
-labels :: proc(message: []u8, span: Span, allocator := context.temp_allocator) -> [dynamic]Span {
-	found: [dynamic]Span
-	found.allocator = allocator
-	pos := span.start
-	depth := 0
-	for pos < span.end {
-		if pos >= len(message) { break }
-		length := message[pos]
-		if length & 0xC0 == 0xC0 {
-			if pos + 1 >= len(message) { break }
-			target := int(length & 0x3F) << 8 | int(message[pos + 1])
-			if target >= len(message) { break }
-			depth += 1
-			if depth > 8 { break }
-			pos = target
-			continue
-		}
-		if length & 0xC0 != 0 || length == 0 { break }
-		if pos + 1 + int(length) > len(message) { break }
-		append(&found, Span{pos + 1, pos + 1 + int(length)})
-		pos += 1 + int(length)
-	}
-	return found
-}
-
-// label_equal_fold compares two label spans byte by byte, folding ASCII
-// uppercase to lowercase on the fly.
 label_equal_fold :: proc(a, b: []u8) -> bool {
 	if len(a) != len(b) { return false }
 	for i in 0 ..< len(a) {
@@ -182,9 +159,6 @@ label_equal_fold :: proc(a, b: []u8) -> bool {
 	return true
 }
 
-// fold_ascii folds an ASCII uppercase byte to lowercase and leaves every
-// other byte alone.
 fold_ascii :: proc(c: byte) -> byte {
-	if c >= 'A' && c <= 'Z' { return c + ('a' - 'A') }
-	return c
+	return c + ('a' - 'A') if c >= 'A' && c <= 'Z' else c
 }
