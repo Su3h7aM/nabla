@@ -4,7 +4,6 @@ package main
 import "core:fmt"
 import "core:strings"
 import "core:sync"
-import "core:sync/chan"
 import "core:unicode/utf8"
 
 import "nabla:agent"
@@ -565,9 +564,7 @@ enqueue :: proc(app: ^App, kind: Work_Kind, text: string = "") {
 	if text != "" {
 		item.text = strings.clone(text, app.run.alloc)
 	}
-	if chan.try_send(app.run.work, item) {
-		return
-	}
+	if work_send(app, item) { return }
 	if item.text != "" {
 		delete(item.text, app.run.alloc)
 	}

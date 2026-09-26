@@ -29,18 +29,18 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 	// worker touches the store.
 	session_refresh_rows(app)
 	for {
+		seen := agent.owner_wake_seen()
 		work, ok := chan.try_recv(app.run.work)
 		if !ok {
 			// A stop that arrived with nothing queued leaves through the drain loop
 			// below, so shutdown never waits on a compaction to finish.
 			if runtime_stopping(app) { break }
-			// Nothing is queued. A compaction that is still running has to be looked
-			// at even with no work to do, or a finished summary would wait for the
-			// next prompt to be installed.
+			// An outstanding compaction is serviced while idle, so a finished summary does
+			// not wait for the next prompt. Work senders signal the same wake.
 			if app_compaction_pending(app) {
 				if app_compaction_tick(app, observer) { refresh_status(app) }
 				free_all(context.temp_allocator)
-				time.sleep(WORK_IDLE_POLL)
+				agent.owner_wake_wait(seen, agent.chat_compact_deadline(&app.setup.session))
 				continue
 			}
 			work, ok = chan.recv(app.run.work)
@@ -67,14 +67,6 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 	}
 }
 
-// WORK_IDLE_POLL is how often the worker looks at a compaction that is still
-// running. It bounds how long a finished summary waits when no command arrives,
-// and it is a scheduling delay, not a token budget: nothing about the model or
-// the context depends on it. This is the front-end's explicit policy for the
-// period before an owner wake is connected to the work mailbox; it is not a
-// model-request deadline.
-WORK_IDLE_POLL :: 50 * time.Millisecond
-
 // app_compaction_pending reports whether the open session has compaction work to
 // look at. A session that is not open has no control to poll, and its zero state
 // is idle.
@@ -89,6 +81,14 @@ app_compaction_pending :: proc(app: ^App) -> bool {
 app_compaction_tick :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 	if app.setup.session.store == nil { return false }
 	return agent.chat_compact_idle_service(&app.setup.session, observer, app.run.connection)
+}
+
+// work_send queues one command for the worker without blocking and wakes it. False means
+// the queue is full or closed, and the caller still owns the item.
+work_send :: proc(app: ^App, item: Work) -> bool {
+	if !chan.try_send(app.run.work, item) { return false }
+	agent.owner_wake_signal()
+	return true
 }
 
 // work_destroy releases the strings a queued command owns.

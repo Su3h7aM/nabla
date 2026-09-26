@@ -303,6 +303,7 @@ Runtime :: struct {
 // already in it.
 stop_runtime :: proc(app: ^App) {
 	sync.atomic_store(&app.run.stopping, true)
+	agent.owner_wake_signal()
 }
 
 runtime_stopping :: proc(app: ^App) -> bool {
@@ -620,6 +621,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 	retired := catalog_refresh_stop(app, patience)
 	if app.run.work != {} {
 		chan.close(&app.run.work)
+		agent.owner_wake_signal()
 	}
 	if app.run.worker != nil {
 		if join_retiring(app.run.worker, "nabla-tui-worker", patience) {

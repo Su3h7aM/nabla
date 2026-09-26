@@ -842,6 +842,13 @@ chat_compact_recovery :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> Chat_Re
 	return chat_recovery_decide(chat.compact_retry, facts, chat_retry_fraction())
 }
 
+// chat_compact_deadline is when compaction next acts without a publication: the due time
+// of a summary in backoff, or nil.
+chat_compact_deadline :: proc(chat: ^Chat_Session) -> Maybe(time.Tick) {
+	if chat.compact.state != .Backoff || chat.compact.job == nil { return nil }
+	return chat.compact.job.due_at
+}
+
 // chat_compact_resume sends a summary again, at the time the policy chose. The job keeps its
 // frozen snapshot across the wait, so a retry costs a request and nothing else, and the row
 // it begins is a new attempt of the same chain. Nothing here waits.

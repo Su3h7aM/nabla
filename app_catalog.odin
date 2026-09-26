@@ -180,7 +180,7 @@ catalog_publish :: proc(app: ^App, providers, models_dev: []agent.Catalog_Provid
 
 catalog_selection_refresh_request :: proc(app: ^App) {
 	if runtime_stopping(app) || app.run.work == {} { return }
-	_ = chan.try_send(app.run.work, Work{kind = .Catalog})
+	_ = work_send(app, Work{kind = .Catalog})
 }
 
 // catalog_selection_sync reapplies catalog-derived fields to the selected model.
