@@ -230,6 +230,8 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	// request; the number is set again from what request_begin returns.
 	chat.active_request = nil
 	binding: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation(chat))
 
 	// A finished summary is installed at a request boundary, so the context the request is
@@ -403,6 +405,8 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 	// This attempt's correlation: the request number became durable in the claim, and the
 	// attempt number is counted there too.
 	binding: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation_for(chat, chain.attempts))
 
 	recorded := [1]Log_Field{{key = "purpose", value = session.request_purpose_name(.Response)}}
@@ -519,10 +523,6 @@ chat_session_observe_usage :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_R
 @(private)
 chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) {
 	chain := &chat.chain
-	// This attempt's correlation: the request number became durable in the claim, and the
-	// attempt number is counted there too. Everything this settles belongs to that attempt.
-	binding: Log_Binding
-	context.logger = log_rebind(&binding, log_correlation_for(chat, chain.attempts))
 	// The send is over, so the policy answers from the facts the layers observed: what the
 	// operation reported, what this attempt exposed, and whether the turn or the store had
 	// already failed.
@@ -582,6 +582,10 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 			delay = chain.decision.delay,
 		},
 	)
+	binding: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
+	context.logger = log_rebind(&binding, log_correlation_for(chat, chain.attempts))
 	retry := [5]Log_Field {
 		{key = "reason", value = request_recovery_reason_name(chain.decision.reason)},
 		{key = "error_kind", value = ai.provider_operation_error_name(chain.operation_error.kind)},

@@ -416,6 +416,8 @@ chat_session_record_failure_detail :: proc(chat: ^Chat_Session, what: string, de
 	// The failure can be reached from any depth, so the binding is narrowed here to
 	// the session the failure belongs to.
 	binding: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation(chat))
 	fields := [3]Log_Field {
 		{key = "operation", value = what},
@@ -438,6 +440,8 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	// The turn does not exist yet, so the binding is installed with what is known
 	// and its correlation is refreshed once the durable turn number is.
 	binding: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation(chat))
 
 	// The first prompt is what records the session. Everything below needs the row
@@ -554,6 +558,8 @@ chat_session_accepts_event :: proc(chat: ^Chat_Session, source: Chat_Event_Sourc
 	// The refused event is recorded against the session and the operation the
 	// harness is actually running, not the one the event claimed.
 	binding: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation(chat))
 	fields := [4]Log_Field {
 		{key = "reason", value = reason},

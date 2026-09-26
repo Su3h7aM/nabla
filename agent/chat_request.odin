@@ -519,6 +519,8 @@ chat_admission_check :: proc(chat: ^Chat_Session, estimate: int, sizes: Chat_Req
 	// estimated and what it compared that against is the whole reason a request was
 	// refused later.
 	binding: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation(chat))
 	capacity := chat.capacity
 	if capacity.window <= 0 {

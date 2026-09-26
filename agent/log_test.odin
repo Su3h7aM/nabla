@@ -43,6 +43,8 @@ log_test_end :: proc(t: ^testing.T, fixture: ^Log_Test) {
 // proves a nested scope does not disturb its parent's correlation.
 log_test_narrow_scope :: proc(session_id: string) {
 	inner: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
 	context.logger = log_rebind(&inner, Log_Correlation{session_id = session.Session_Id(session_id), turn_no = 4})
 	log_emit({level = .Info, category = .Agent, event = "agent.transition"})
 }
@@ -549,6 +551,7 @@ test_log_rebind_preserves_and_narrows :: proc(t: ^testing.T) {
 	context.logger = log_logger(&parent)
 
 	log_test_narrow_scope("fedcba9876543210fedcba9876543210")
+	testing.expect(t, context.logger.data == rawptr(&parent), "the nested binding must not outlive its stack frame")
 
 	// The parent's correlation is unchanged, which is what a nested scope returning
 	// must leave behind.

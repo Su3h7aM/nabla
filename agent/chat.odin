@@ -169,6 +169,8 @@ chat_commit_response :: proc(
 	// error. The record keeps the completed request number, and the correlation is
 	// taken before the operation is retired.
 	finished_binding: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
 	context.logger = log_rebind(&finished_binding, log_correlation(chat))
 	level := log.Level.Info
 	if outcome == .Failed { level = .Error }
@@ -348,6 +350,8 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	recorded = true
 	// The turn is still identifiable here, which is what the end record carries.
 	binding: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation(chat))
 
 	if text := string(chat.partial_assistant[:]); text != "" {
