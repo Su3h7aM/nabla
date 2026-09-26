@@ -69,6 +69,14 @@ connection_dial :: proc(endpoint: net.Endpoint, options: Options, allocator: mem
 			connection_destroy(connection)
 			return nil, .Connect
 		}
+		// nbio's dial may hand back a blocking socket. Reads and writes must report
+		// Would_Block instead, so a stalled peer is waited on through the event loop
+		// where the probe can end the wait.
+		connection.socket = socket
+		if net.set_blocking(socket, false) != nil {
+			connection_destroy(connection)
+			return nil, .Connect
+		}
 	} else {
 		dialed, dial_err := net.dial_tcp_from_endpoint(endpoint)
 		if dial_err != nil {
