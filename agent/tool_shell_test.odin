@@ -52,6 +52,14 @@ shell_test_clear_shell :: proc(t: ^testing.T) {
 	if !os.unset_env("SHELL") { testing.fail_now(t, "SHELL could not be removed") }
 }
 
+@(test)
+test_shell_missing_child_is_not_a_successful_exit :: proc(t: ^testing.T) {
+	child := Tool_Child{pid = 1}
+	testing.expect(t, tool_child_poll(&child), "a process that is not our child cannot be waited on")
+	exited, _, waited := tool_child_reap(&child)
+	testing.expect(t, !waited && !exited, "an absent child has no known exit status")
+}
+
 // The shell the environment names is the program that runs the command, invoked
 // as `shell -c command`. A fixture stands in for a shell, so the test says
 // nothing about which shells the machine has.

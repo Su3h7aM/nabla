@@ -20,9 +20,10 @@ Tool_Stop :: enum {
 // time it is observed, because the drain loop may reap the child while it is
 // still reading pipes and the caller must not lose the exit code as a result.
 Tool_Child :: struct {
-	pid:    int,
-	reaped: bool,
-	status: u32,
+	pid:          int,
+	reaped:       bool,
+	status_known: bool,
+	status:       u32,
 }
 
 // TOOL_SPAWN_EXEC_FAILED is the byte a forked child writes when it could not
@@ -163,6 +164,7 @@ tool_child_poll :: proc(child: ^Tool_Child) -> bool {
 	reaped, wait_errno := linux.wait4(linux.Pid(child.pid), &status, {.WNOHANG}, nil)
 	if reaped == linux.Pid(child.pid) {
 		child.reaped = true
+		child.status_known = true
 		child.status = status
 		return true
 	}
@@ -174,18 +176,22 @@ tool_child_poll :: proc(child: ^Tool_Child) -> bool {
 // tool_child_reap blocks until the child is reaped and reports its exit state. A
 // process killed by a signal did not exit, so exited is false.
 tool_child_reap :: proc(child: ^Tool_Child) -> (exited: bool, exit_code: int, waited: bool) {
-	if child.reaped { return tool_child_status(child.status) }
+	if child.reaped {
+		if !child.status_known { return false, 0, false }
+		return tool_child_status(child.status)
+	}
 	status: u32
 	for {
 		reaped, wait_errno := linux.wait4(linux.Pid(child.pid), &status, {}, nil)
 		if reaped == linux.Pid(child.pid) { break }
 		if wait_errno == .ECHILD {
 			child.reaped = true
-			return false, 0, true
+			return false, 0, false
 		}
 		if wait_errno != .EINTR { return false, 0, false }
 	}
 	child.reaped = true
+	child.status_known = true
 	child.status = status
 	return tool_child_status(status)
 }
