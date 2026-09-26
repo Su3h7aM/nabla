@@ -195,7 +195,7 @@ test_a_steering_line_starts_the_next_request_on_its_own :: proc(t: ^testing.T) {
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	queue := steer_queue_init(context.temp_allocator)
+	queue := steer_queue_init(chat.allocator)
 	defer steer_queue_destroy(&queue)
 	steer := Steer_Context {
 		queue = &queue,

@@ -472,6 +472,9 @@ chat_run_turn_steered :: proc(
 	// request that follows rather than the turn after this one.
 	current := connection
 	for {
+		// The session keeps only heap- or chain-owned data between effects. Scratch from
+		// one effect is released before the next request or tool step begins.
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		// External facts are applied before the state is read, so the selection below is
 		// a pure read of state. The owner observes the clock once and both steps use it.
 		now := time.tick_now()
