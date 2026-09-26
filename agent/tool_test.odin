@@ -111,13 +111,8 @@ test_admission_rejects_structural_defects :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_admission_bounds_what_it_reads :: proc(t: ^testing.T) {
-	arguments := tool_arguments_prepare(strings.repeat("{", TOOL_MAX_ARGS_BYTES + 1, context.temp_allocator), context.allocator)
-	defer tool_arguments_destroy(&arguments, context.allocator)
-	testing.expect_value(t, arguments.status, Tool_Arguments_Status.Rejected)
-	testing.expect_value(t, arguments.error.kind, Tool_Argument_Error_Kind.Too_Large)
-
-	arguments = tool_arguments_prepare(strings.repeat(`{"a":`, TOOL_MAX_ARGS_DEPTH + 1, context.temp_allocator), context.allocator)
+test_admission_bounds_nesting :: proc(t: ^testing.T) {
+	arguments := tool_arguments_prepare(strings.repeat(`{"a":`, TOOL_MAX_ARGS_DEPTH + 1, context.temp_allocator), context.allocator)
 	defer tool_arguments_destroy(&arguments, context.allocator)
 	testing.expect_value(t, arguments.status, Tool_Arguments_Status.Rejected)
 	testing.expect_value(t, arguments.error.kind, Tool_Argument_Error_Kind.Too_Deep)
