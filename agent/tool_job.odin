@@ -1,6 +1,5 @@
 package agent
 
-import "base:intrinsics"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
@@ -21,10 +20,8 @@ import "nabla:ai"
 // keep working while a tool blocks, and what lets one call stop without stopping its
 // siblings.
 //
-// Only the owner changes a phase and only the owner writes history. A worker
-// publishes exactly one fact, its result, under the table's mutex, and exits; the
-// owner adopts that fact into a phase. Nothing else crosses the boundary, so a worker
-// never touches the session, the store, or another job.
+// Only the owner changes a phase, writes history, and frees a job, after joining its
+// worker. A worker publishes exactly one fact, its result, and exits.
 //
 // The table's records are allocated one at a time and never move, because an effect
 // names a job and a running worker holds that address.
@@ -48,10 +45,8 @@ TOOL_JOBS_MAX_ADMISSIONS :: 256
 
 // TOOL_JOBS_STOP_PATIENCE is how long a call may keep running after its stop was asked for,
 // by the turn's cancellation or by its own timeout. A backend that never returns cannot be
-// stopped cooperatively, so past this the owner stops waiting: the call is answered with the
-// outcome the harness can observe, and the job is handed to its worker, which releases it
-// when it returns. Only process isolation can bound arbitrary native code harder. It is the
-// batch's only deadline of its own, and the owner waits for exactly it.
+// stopped cooperatively, so past this the call is answered as unknown and its job is
+// abandoned: retained with everything its worker can reach until the process exits.
 TOOL_JOBS_STOP_PATIENCE :: 10 * time.Second
 
 // Tool_Job_Phase is what a job has done and what it still owes. The phase answers one
@@ -79,10 +74,9 @@ Tool_Job_Phase :: enum {
 	// Unrecorded: released without a result in the record, because the session's
 	// storage failed. Recovery records uncertainty for it later.
 	Unrecorded,
-	// Stuck: the owner stopped waiting and handed the job to its worker, which releases
-	// it when it returns. The owner never touches a stuck job again, and nothing else may
-	// either: the worker is the only owner left.
-	Stuck,
+	// Abandoned: the worker ignored its stop. The job, its thread handle, and everything the
+	// worker can reach are retained until the process exits.
+	Abandoned,
 }
 
 // Tool_Jobs_Stop is why a batch stopped admitting work. None is the zero value, so a
@@ -134,7 +128,6 @@ Tool_Job :: struct {
 	turn_id:          u64,
 	ordinal:          int, // submission order, which is the order results are recorded in
 	call:             ^Chat_Tool_Call, // borrowed: the session's staged calls outlive the batch
-	table:            ^Tool_Jobs, // borrowed: where this job publishes completion
 	name:             string, // owned by allocator
 	call_id:          string, // owned by allocator
 
@@ -168,25 +161,12 @@ Tool_Job :: struct {
 	// control
 	phase:            Tool_Job_Phase,
 	interrupt:        ai.Interrupt, // this job's own stop token
-	// mu guards what separates the owner from the worker that runs this job: the published
-	// result, whether the worker is done, and whether the owner handed the job back. It
-	// lives in the job rather than in the table because the worker keeps it after the batch
-	// is gone, and the table is the owner's.
-	mu:               sync.Mutex,
-	// published is the worker's last word about this job: it stored its result and is done with
-	// everything the job owns. Only the collection step reads it, and the phase is what makes a
-	// released job's storage the owner's again, because selection reads the phase without a lock.
+	// published is atomic. The worker sets it after writing result, and the owner reads result
+	// only after seeing it.
 	published:        bool,
-	// launched says a worker thread owns this call. A job that never started one, an
-	// owner-placed operation or a Lua execution, is the owner's for its whole life.
+	// launched says a worker thread runs this call; otherwise the job is the owner's alone.
 	launched:         bool,
-	// orphan is the owner's handoff: the worker releases this job itself.
-	orphan:           bool,
-	// thread is the worker that runs a placed call. The owner keeps the handle and destroys it
-	// once the worker has published, because a thread that releases its own storage cannot be
-	// observed: the library's start and that thread's exit would then race over the same bytes.
-	// A job handed to a worker that never returns keeps its handle for the life of the process,
-	// which is the same rule the contract applies to everything else that worker can reach.
+	// thread is created and destroyed by the owner, after the worker published.
 	thread:           ^thread.Thread,
 	// stopping and stop_at are the owner's observation that this job should have stopped and
 	// when that was first seen, which is what the stop patience is measured from.
@@ -202,12 +182,10 @@ Tool_Job :: struct {
 	recorded_seq:     session.Seq,
 }
 
-// Tool_Jobs is one batch's table. Only the owner reads and writes it; a worker publishes its
-// own job's result and then sets pending, an atomic the owner clears before it collects.
+// Tool_Jobs is one batch's table. Only the owner reads and writes it.
 Tool_Jobs :: struct {
 	jobs:             [dynamic]^Tool_Job,
 	allocator:        mem.Allocator, // the session's: it owns the table, not the jobs
-	pending:          bool,
 	next_id:          u64,
 	admitted:         int, // every admission in this batch, outer calls and children
 	active:           int, // worker-placed jobs running now
@@ -226,10 +204,8 @@ Tool_Jobs :: struct {
 	// render is the reader owner-placed tools use to read kept results back. It lives
 	// here, not in a frame, so a job can borrow it for its whole life.
 	render:           Result_Reader,
-	// escaped is set when a worker ignored its stop and the owner handed the job to it.
-	// Such a worker still borrows the session's workspace, registry generation, and
-	// backend, so the runtime is no longer safe to continue: the owner propagates this
-	// to the session, and the process exits without releasing what the worker can reach.
+	// escaped is set when a job was abandoned. Its worker still borrows the session's
+	// workspace, registry, and backends, so the session must not continue.
 	escaped:          bool,
 }
 
@@ -248,38 +224,27 @@ tool_jobs_init :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, capacity: int, wor
 	jobs.budget = chat_tool_budget_open(chat, len(chat.pending_calls))
 }
 
-// tool_jobs_destroy releases the table and everything no worker owns any more. A call a worker
-// is still running is that worker's until it returns, so the owner interrupts it and hands the
-// job over instead of freeing storage the worker is writing, and the answer says that happened.
-// What that means is the caller's decision: such a worker still borrows the workspace, the
-// registry generation and the backends the caller is about to release, and the contract's rule
-// for it is to retain what it can reach until the process exits.
-tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) -> bool {
-	escaped := false
+// tool_jobs_destroy releases the table and every job no worker can still reach. A job whose
+// worker is still running is asked to stop and abandoned, and the result reports it: the
+// caller must then retain the workspace, registry, and backends that worker borrows.
+tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) -> (escaped: bool) {
+	tool_jobs_collect(jobs)
 	for job in jobs.jobs {
 		if job.phase == .Running && job.launched {
 			ai.interrupt_request(&job.interrupt)
-			sync.mutex_lock(&job.mu)
-			job.orphan = true
-			if job.thread != nil {
-				intrinsics.atomic_or(&job.thread.flags, {.Self_Cleanup})
-			}
-			job.phase = .Stuck
-			sync.mutex_unlock(&job.mu)
+			job.phase = .Abandoned
+		}
+		if job.phase == .Abandoned {
 			escaped = true
 			continue
 		}
-		if job.phase == .Stuck { continue }
 		tool_job_release(job)
 	}
 	delete(jobs.jobs)
 	jobs^ = {}
-	return escaped
+	return
 }
 
-// tool_job_release frees everything one job owns. The job struct and its data come from the
-// worker allocator, which is the process heap in production: a worker releases a job the
-// owner handed back, so that storage has to outlive the batch.
 @(private)
 tool_job_release :: proc(job: ^Tool_Job) {
 	if job.lua != nil { code_mode_lua_destroy(job.lua) }
@@ -301,14 +266,13 @@ tool_job_release :: proc(job: ^Tool_Job) {
 tool_jobs_committed :: proc(jobs: ^Tool_Jobs) -> int { return jobs.committed_roots }
 
 // tool_jobs_settled reports whether every job is released, which is what ends the
-// batch's loop. A job the owner handed to its worker is settled: waiting for it again is
-// exactly what the stop patience exists to avoid.
+// batch's loop. An abandoned job counts as settled.
 tool_jobs_settled :: proc(jobs: ^Tool_Jobs) -> bool {
 	for job in jobs.jobs {
 		switch job.phase {
 		case .Queued, .Dispatching, .Running, .Waiting, .Result_Ready, .Committing, .Retiring:
 			return false
-		case .Retired, .Unrecorded, .Stuck:
+		case .Retired, .Unrecorded, .Abandoned:
 		}
 	}
 	return true
@@ -333,7 +297,7 @@ tool_jobs_earliest_live :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
 	found: ^Tool_Job
 	for job in jobs.jobs {
 		switch job.phase {
-		case .Retired, .Unrecorded, .Stuck:
+		case .Retired, .Unrecorded, .Abandoned:
 			continue
 		case .Waiting:
 			if job.lua_child != nil { return job.lua_child }
@@ -375,7 +339,6 @@ tool_jobs_submit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 			turn_id   = chat.active_turn_id,
 			ordinal   = len(jobs.jobs),
 			call      = &staged,
-			table     = jobs,
 			placement = .Worker,
 			phase     = .Queued,
 			allocator = jobs.worker_allocator,
@@ -528,14 +491,13 @@ tool_jobs_next :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> Tool_Job_Effect {
 
 // tool_job_under_executor reports whether a call is in one of the two phases where the owner
 // still watches for a stop it asked for: the dispatch write, or an executor running the call.
-// Past those phases the call is out of the owner's hands, either because it was never started
-// or because the job now belongs to a worker that outlived its stop.
+
 @(private)
 tool_job_under_executor :: proc(job: ^Tool_Job) -> bool {
 	switch job.phase {
 	case .Dispatching, .Running:
 		return true
-	case .Queued, .Waiting, .Result_Ready, .Committing, .Retiring, .Retired, .Unrecorded, .Stuck:
+	case .Queued, .Waiting, .Result_Ready, .Committing, .Retiring, .Retired, .Unrecorded, .Abandoned:
 	}
 	return false
 }
@@ -569,8 +531,7 @@ tool_jobs_overdue :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> ^Tool_Job {
 	return found
 }
 
-// tool_jobs_retirable returns the earliest job the owner can release or hand back now: one
-// whose worker published, or one that ignored its stop long enough to be the worker's.
+// tool_jobs_retirable returns the earliest job the owner can release or abandon now.
 @(private)
 tool_jobs_retirable :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> ^Tool_Job {
 	phases: bit_set[Tool_Job_Phase] = {.Retiring}
@@ -584,12 +545,8 @@ tool_jobs_retirable :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> ^Tool_Job {
 	return found
 }
 
-// tool_job_releasable reports whether the owner may release a job's storage: the job never
-// started a worker, or its worker is done with it. The phase is what says so, and reading it
-// takes no lock. A launched job leaves Running in exactly two places, and neither one leaves a
-// worker using the job's storage: the collection step moves it after the worker published, and
-// the abandon step moves it to Stuck only by handing the job to that worker. Selection calls
-// this, and selection takes no locks and adopts nothing.
+// tool_job_releasable reports whether no worker can still reach the job. A launched job
+// leaves Running only when collection joined its worker or when it is abandoned.
 @(private)
 tool_job_releasable :: proc(job: ^Tool_Job) -> bool {
 	return !job.launched || job.phase != .Running
@@ -600,30 +557,24 @@ tool_jobs_stopped_long_enough :: proc(job: ^Tool_Job, now: time.Tick) -> bool {
 	return job.stopping && time.tick_diff(job.stop_at, now) >= TOOL_JOBS_STOP_PATIENCE
 }
 
-// tool_jobs_collect adopts what the workers published. It is the only place a phase moves out
-// of Running for a worker that finished, and it reads a job's result under that job's own
-// mutex, which is where the worker publishes it. It is also where the worker's thread storage
-// comes back: the publication is the last thing that thread does with the job. The abandon step
-// is the other place a phase out of Running is decided, and it hands the job to the worker
-// instead of keeping it.
+// tool_jobs_published returns the earliest running job whose worker has published.
+@(private)
+tool_jobs_published :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
+	for job in jobs.jobs {
+		if job.phase == .Running && sync.atomic_load(&job.published) { return job }
+	}
+	return nil
+}
+
+// tool_jobs_collect adopts published results and joins their workers, which is the proof
+// that nothing else reaches the job.
 @(private)
 tool_jobs_collect :: proc(jobs: ^Tool_Jobs) {
-	sync.atomic_store(&jobs.pending, false)
-	for job in jobs.jobs {
-		sync.mutex_lock(&job.mu)
-		if !job.published || job.phase != .Running {
-			sync.mutex_unlock(&job.mu)
-			continue
-		}
-		job.phase = .Result_Ready
-		handle := job.thread
+	for job := tool_jobs_published(jobs); job != nil; job = tool_jobs_published(jobs) {
+		thread.destroy(job.thread)
 		job.thread = nil
-		sync.mutex_unlock(&job.mu)
-		// The worker stored its result and is on its way out; this is where the owner takes the
-		// thread's own storage back. Destroying the handle waits for that thread to return, which
-		// is a few instructions after the publication this step adopted.
-		if handle != nil { thread.destroy(handle) }
-		if job.placement == .Worker && jobs.active > 0 { jobs.active -= 1 }
+		job.phase = .Result_Ready
+		if job.placement == .Worker { jobs.active -= 1 }
 	}
 }
 
@@ -650,7 +601,7 @@ tool_jobs_lane_free :: proc(jobs: ^Tool_Jobs, candidate: ^Tool_Job) -> bool {
 	for job in jobs.jobs {
 		if job == candidate || job.lane != candidate.lane { continue }
 		switch job.phase {
-		case .Dispatching, .Running, .Stuck:
+		case .Dispatching, .Running, .Abandoned:
 			return false
 		case .Queued, .Waiting, .Result_Ready, .Committing, .Retiring, .Retired, .Unrecorded:
 		}
@@ -758,14 +709,8 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	jobs.active += 1
 }
 
-// tool_jobs_abandon answers a call that ignored its stop and hands its job to the worker
-// that is still running it. The answer is what the harness can honestly observe: the call
-// dispatched and no result arrived, so its outcome is unknown rather than cancelled.
-//
-// The job's own mutex is held for the whole step, because the worker publishes through it:
-// taking the lock is what makes "the worker has not published" a decision instead of a
-// guess. It is the last thing the owner does with this job, so the worker may take over the
-// job's storage as soon as it can lock the mutex and read orphan.
+// tool_jobs_abandon answers a call that ignored its stop with an unknown outcome and retains
+// its job: the worker may still be running and may still publish into it.
 tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer, now: time.Tick) {
 	job := tool_jobs_overdue(jobs, now)
 	if job == nil { return }
@@ -773,12 +718,7 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 	context.logger = log_logger(&job.logging)
 	defer context.logger = previous
 
-	sync.mutex_lock(&job.mu)
-	if job.published {
-		// The worker published while the patience ran out: its result is the answer.
-		sync.mutex_unlock(&job.mu)
-		return
-	}
+	if sync.atomic_load(&job.published) { return }
 	message := fmt.tprintf("the tool did not stop within %v of its stop being requested; its outcome is unknown", TOOL_JOBS_STOP_PATIENCE)
 	finalized := tool_result_finalize(&job.exec, tool_result_failure(&job.exec, .Unknown, message, "did not stop"))
 	spilled := false
@@ -789,16 +729,7 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 		result_seq, recorded = chat_record_tool_result(chat, job.call, &finalized, spilled)
 	}
 
-	// From here the worker owns this job: it releases everything the job holds when it
-	// returns, which is what keeps a call that ignores its stop from leaking its storage.
-	// The worker also reaps its own thread handle on the way out, so the handoff leaves
-	// nothing behind for the owner to release. Only a worker that never returns keeps
-	// its handle for the life of the process.
-	job.orphan = true
-	if job.thread != nil {
-		intrinsics.atomic_or(&job.thread.flags, {.Self_Cleanup})
-	}
-	job.phase = .Stuck
+	job.phase = .Abandoned
 	jobs.escaped = true
 	if recorded {
 		job.committed = true
@@ -814,7 +745,6 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 	}
 	log_emit({level = .Error, category = .Tool, event = "tool.job_stuck", fields = fields[:]})
 	if recorded { _observer_tool_result(observer, job.name, &finalized) }
-	sync.mutex_unlock(&job.mu)
 	tool_result_destroy(&finalized)
 	if !recorded {
 		// The answer could not be recorded, so the session's storage failed. Recovery still
@@ -914,21 +844,14 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 }
 
 // tool_jobs_retire releases one settled job's execution resources and drops what could
-// not be recorded. A result that reached the store is already owned by it. A job whose
-// worker never published is the worker's, and the owner hands it back instead of waiting:
-// now is the same observation the abandon step used, and the stop patience is measured from
-// the job's own stop.
+// not be recorded. A job whose worker ignored its stop is abandoned instead; this is the
+// only abandon path for a batch that can no longer record anything.
 tool_jobs_retire :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 	job := tool_jobs_retirable(jobs, now)
 	if job == nil { return }
 
 	if !tool_job_releasable(job) {
-		// The worker ignored its stop, so the batch answers the call and leaves the job to
-		// that worker. This is unreachable for a job the abandon step answered first, and it
-		// is the only path for a batch that cannot record anything at all.
-		sync.mutex_lock(&job.mu)
-		job.orphan = true
-		job.phase = .Stuck
+		job.phase = .Abandoned
 		jobs.escaped = true
 		waited := time.tick_diff(job.stop_at, now)
 		fields := [3]Log_Field {
@@ -937,7 +860,6 @@ tool_jobs_retire :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 			{key = "waited_ms", value = i64(waited / time.Millisecond)},
 		}
 		log_emit({level = .Error, category = .Tool, event = "tool.job_stuck", fields = fields[:]})
-		sync.mutex_unlock(&job.mu)
 		return
 	}
 	if job.result_present {
@@ -948,13 +870,8 @@ tool_jobs_retire :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 	job.phase = job.committed ? .Retired : .Unrecorded
 }
 
-// tool_jobs_deadline is the nearest tick at which the owner must act on its own, and None
-// when only a worker can change the table. A stopped call's patience is measured from when
-// the owner first saw the stop, which is the only deadline a batch has of its own.
-//
-// Only a call the owner can still act on has a patience left to measure. Counting a job it has
-// already handed to a worker would return a tick that has passed, and a wait for a tick that
-// has passed is not a wait: the owner would spin beside whatever call is still running.
+// tool_jobs_deadline is the nearest stop-patience expiry among calls the owner still waits
+// for, or nil when only a worker can change the table.
 @(private)
 tool_jobs_deadline :: proc(jobs: ^Tool_Jobs) -> Maybe(time.Tick) {
 	earliest: Maybe(time.Tick)
@@ -971,7 +888,7 @@ tool_jobs_deadline :: proc(jobs: ^Tool_Jobs) -> Maybe(time.Tick) {
 @(private)
 tool_jobs_await :: proc(jobs: ^Tool_Jobs, deadline: Maybe(time.Tick)) {
 	seen := owner_wake_seen()
-	if sync.atomic_load(&jobs.pending) { return }
+	if tool_jobs_published(jobs) != nil { return }
 	if tool_jobs_next(jobs, time.tick_now()) != .Wait { return }
 	owner_wake_wait(seen, deadline)
 }
@@ -996,15 +913,7 @@ tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
 }
 
 // tool_job_launch starts one worker-placed job. The watched signals are blocked across
-// creation so the worker inherits a mask that keeps it ineligible for the process
-// handler: a tool must never run the handler that cancels its own turn.
-//
-// The thread's own storage is the owner's to give back, once that worker has published. A
-// thread that released itself would be observed by nobody, and the library's start and that
-// thread's own exit would race over the same bytes. A worker that ignores its stop is
-// therefore flagged for self-cleanup when the owner hands the job over: it detaches and
-// frees its own handle on the way out. Only a worker that never returns keeps anything
-// for the life of the process.
+// creation so the worker inherits a mask that keeps it from running the process handler.
 @(private)
 tool_job_launch :: proc(job: ^Tool_Job) -> bool {
 	previous: linux.Sig_Set
@@ -1019,43 +928,15 @@ tool_job_launch :: proc(job: ^Tool_Job) -> bool {
 	return true
 }
 
-// tool_job_worker runs one call off the owner's thread and publishes its result. It touches
-// nothing belonging to the session: no store, no second job, and no context it did not set
-// itself.
-//
-// A job the owner handed back is released here, and the mutex is held across that release:
-// the owner takes the same mutex to decide the handoff, so a job is freed only once its
-// owner has stopped using it.
+// tool_job_worker runs one call and publishes its result. It touches nothing after the wake.
 @(private)
 tool_job_worker :: proc(worker: ^thread.Thread) {
 	job := cast(^Tool_Job)worker.data
-	if job == nil { return }
-	// A thread started without an explicit context gets the default one, so both the
-	// allocator and the logger are set here rather than inherited.
 	context.allocator = job.allocator
 	context.logger = log_logger(&job.logging)
 
-	result := tool_job_execute(job)
-	// The table is read before the publish below: from that point the owner may release this
-	// job, and the wake it needs is a local copy.
-	table := job.table
-
-	sync.mutex_lock(&job.mu)
-	if job.orphan {
-		// The owner gave up on this call and released nothing, so the result the worker just
-		// produced is freed here along with the job that held it. The mutex is released
-		// first: the handoff decision is made, and nothing after this point may block on
-		// a mutex the owner can still reach.
-		sync.mutex_unlock(&job.mu)
-		tool_result_destroy(&result)
-		tool_job_release(job)
-		return
-	}
-	job.result = result
+	job.result = tool_job_execute(job)
 	job.result_present = true
-	job.published = true
-	sync.mutex_unlock(&job.mu)
-
-	sync.atomic_store(&table.pending, true)
+	sync.atomic_store(&job.published, true)
 	owner_wake_signal()
 }

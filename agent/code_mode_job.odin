@@ -237,7 +237,6 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 		id        = jobs.next_id,
 		turn_id   = parent.turn_id,
 		ordinal   = len(jobs.jobs),
-		table     = jobs,
 		placement = .Worker,
 		phase     = .Queued,
 		allocator = jobs.worker_allocator,
