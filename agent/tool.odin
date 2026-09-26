@@ -16,8 +16,8 @@ import "nabla:ai"
 // value runs with no cancellation.
 //
 // interrupt is the execution's own stop token, so one call can be stopped without
-// stopping its siblings. parent is the token of the work that owns it, read on every
-// check. Both are optional.
+// stopping its siblings; it chains to the token of the work that owns it. It is
+// optional.
 //
 // wake, when present, is the read end of a Tool_Wake that is signalled once
 // interrupt is requested, so a tool that sleeps in poll wakes for the stop. It is
@@ -25,7 +25,6 @@ import "nabla:ai"
 // the stop only when its own wait ends.
 Tool_Control :: struct {
 	interrupt: ^ai.Interrupt,
-	parent:    ^ai.Interrupt,
 	wake:      ^os.File,
 }
 
@@ -525,10 +524,10 @@ tool_result_valid :: proc(outcome: session.Tool_Outcome, content: string) -> boo
 	return data_present
 }
 
-// tool_control_cancelled reports whether the execution was asked to stop, by itself or by
-// its parent.
+// tool_control_cancelled reports whether the execution, or the work that owns it, was
+// asked to stop.
 tool_control_cancelled :: proc(control: Tool_Control) -> bool {
-	return ai.interrupt_requested(control.interrupt) || ai.interrupt_requested(control.parent)
+	return ai.interrupt_requested(control.interrupt)
 }
 
 // tool_control_stop reports why an execution loop must stop. Cancellation wins over the

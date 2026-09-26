@@ -166,6 +166,7 @@ client_initialize :: proc(client: ^Client, options: Operation_Options, allocator
 		interrupted  = control.interrupted,
 		deadline_at  = time.tick_add(time.tick_now(), CLIENT_HANDSHAKE_TIMEOUT),
 		has_deadline = true,
+		wake         = control.wake,
 	}
 	// The continuation keeps the caller's observer: the notification is part of
 	// the same handshake the caller asked to watch.

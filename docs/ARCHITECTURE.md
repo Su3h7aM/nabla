@@ -988,6 +988,7 @@ A default changes only with a measurement from the journal or a benchmark test. 
 | `agent/session` tables `turns`, `requests`, `entries`; JSON strings inside JSON | `agent/journal` records, nodes, branches; typed columns, one-level JSON `data`, exact `body` |
 | JSONL run logs, segments, retention, `log_read` | journal records, diag ring, SQL views, artifacts |
 | TUI 50 ms input poll | `ppoll` with the view eventfd |
+| `http/client` 50 ms `WAIT_SLICE` probe checks, `SHUTDOWN_JOIN_POLL` | one wait on the socket or thread and a stop wake, with a real deadline as the only timeout |
 | result and output caps (`TOOL_MAX_RESULT_BYTES`, the read window cap, Lua log and message caps) | whole results projected through the context budget (section 14.3) |
 | one native lane, serial Code Mode children | access-class scheduler, `job.start` / `job.wait` |
 | JSON envelope for native results and Lua transport | typed `Tool_Args` / `Tool_Output`, rendered once at commit |

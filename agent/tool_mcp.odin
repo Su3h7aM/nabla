@@ -116,7 +116,7 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (result:
 @(private)
 tool_mcp_options :: proc(ctx: ^Tool_Context, wire: ^MCP_Log) -> mcp.Operation_Options {
 	options := mcp.Operation_Options {
-		control = {user_data = ctx.control.interrupt, interrupted = tool_mcp_interrupted},
+		control = {user_data = ctx.control.interrupt, interrupted = tool_mcp_interrupted, wake = ctx.control.wake},
 		observer = mcp_log_observer(wire),
 	}
 	if ctx.timeout > 0 {

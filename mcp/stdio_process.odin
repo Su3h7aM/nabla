@@ -28,9 +28,11 @@ Stdio_Pipes :: struct {
 	stderr: ^os.File,
 }
 
-// Stdio_Child tracks one spawned server until it is reaped.
+// Stdio_Child tracks one spawned server until it is reaped. exit watches for the
+// server's exit and is released with stdio_child_close.
 Stdio_Child :: struct {
 	pid:    int,
+	exit:   Stdio_Exit_Watch,
 	reaped: bool,
 }
 
@@ -111,6 +113,13 @@ stdio_spawn :: proc(name: cstring, argv: [^]cstring, envp: [^]cstring, directory
 	spawned := Stdio_Child {
 		pid = int(pid),
 	}
+	// The watch is taken before the report is read: the child cannot be reaped
+	// before then, so the pid still names it.
+	spawned.exit, err = stdio_exit_watch_open(spawned.pid)
+	if err != nil {
+		stdio_terminate_group(&spawned)
+		return
+	}
 	report: [1]u8
 	reported, status := stdio_read(setup_read, report[:])
 	for status == .Again {
@@ -118,10 +127,16 @@ stdio_spawn :: proc(name: cstring, argv: [^]cstring, envp: [^]cstring, directory
 	}
 	if status == .Ok && reported > 0 {
 		stdio_terminate_group(&spawned)
+		stdio_child_close(&spawned)
 		err = os.Platform_Error(i32(report[0]))
 		return
 	}
 	return Stdio_Pipes{stdin = stdin_write, stdout = stdout_read, stderr = stderr_read}, spawned, nil
+}
+
+// stdio_child_close releases the exit watch. The child must already be reaped.
+stdio_child_close :: proc(child: ^Stdio_Child) {
+	stdio_exit_watch_close(&child.exit)
 }
 
 // stdio_pipes_close closes the parent's ends of a server's streams.
@@ -154,14 +169,27 @@ stdio_io_failure :: proc() -> Stdio_Io {
 	return .Failed
 }
 
-// stdio_poll waits up to timeout_ms for a pipe end to become ready. A poll error
-// reports not ready, so the following read or write reports the real failure.
-stdio_poll :: proc(file: ^os.File, direction: Stdio_Direction, timeout_ms: int) -> (ready: bool, failed: bool) {
-	events: posix.Poll_Event = {.IN} if direction == .Read else {.OUT}
-	fds := [1]posix.pollfd{{fd = stdio_fd(file), events = events}}
-	count := posix.poll(&fds[0], len(fds), i32(timeout_ms))
-	if count == -1 { return false, posix.errno() != .EINTR }
-	return count > 0, false
+// stdio_poll blocks until one of fds is ready or the deadline passes, and never
+// wakes on its own otherwise. A signal restarts the wait with the time left.
+@(private)
+stdio_poll :: proc(fds: []posix.pollfd, deadline: time.Tick, has_deadline: bool) -> os.Error {
+	for {
+		timeout: i32 = -1
+		if has_deadline {
+			remaining := time.tick_diff(time.tick_now(), deadline)
+			timeout = remaining <= 0 ? 0 : i32(min((remaining + time.Millisecond - 1) / time.Millisecond, time.Duration(max(i32))))
+		}
+		if posix.poll(raw_data(fds), posix.nfds_t(len(fds)), timeout) != -1 { return nil }
+		if posix.errno() != .EINTR { return stdio_errno() }
+	}
+}
+
+// stdio_await_readable blocks until file has data or reaches end of stream, or
+// until stop becomes readable, which wins.
+stdio_await_readable :: proc(file: ^os.File, stop: ^os.File) -> (stopped: bool, err: os.Error) {
+	fds := [2]posix.pollfd{{fd = stdio_fd(file), events = {.IN}}, {fd = stdio_fd(stop), events = {.IN}}}
+	stdio_poll(fds[:], {}, false) or_return
+	return fds[1].revents != {}, nil
 }
 
 // SIGPIPE is process-wide, but the stdio transport is not. These fields hold the
@@ -237,62 +265,70 @@ stdio_child_reap :: proc(child: ^Stdio_Child) {
 	child.reaped = true
 }
 
-stdio_terminate_direct_child :: proc(child: ^Stdio_Child) {
-	if child.pid <= 0 || child.reaped { return }
-	_ = posix.kill(posix.pid_t(child.pid), .SIGTERM)
-	grace := time.tick_add(time.tick_now(), STDIO_KILL_GRACE)
-	for time.tick_since(grace) < 0 {
-		if stdio_child_poll(child) { return }
-		time.sleep(5 * time.Millisecond)
+// stdio_child_await blocks until the child exits or deadline passes, and reaps it
+// if it exited.
+stdio_child_await :: proc(child: ^Stdio_Child, deadline: time.Tick) {
+	if !child.exit.open { return }
+	for !stdio_child_poll(child) && time.tick_diff(time.tick_now(), deadline) > 0 {
+		fds := [1]posix.pollfd{{fd = stdio_exit_watch_fd(child.exit), events = {.IN}}}
+		if stdio_poll(fds[:], deadline, true) != nil { return }
 	}
-	_ = posix.kill(posix.pid_t(child.pid), .SIGKILL)
+}
+
+// stdio_terminate_group asks the whole tree to stop, waits up to the grace period
+// for the server to exit, then kills whatever of the group is left and reaps the
+// server. A server that ignores SIGTERM is why the escalation exists; the server's
+// own children are why the signals go to the group.
+stdio_terminate_group :: proc(child: ^Stdio_Child) {
+	if child.pid <= 0 { return }
+	group := posix.pid_t(child.pid)
+	_ = posix.killpg(group, .SIGTERM)
+	stdio_child_await(child, time.tick_add(time.tick_now(), STDIO_KILL_GRACE))
+	_ = posix.killpg(group, .SIGKILL)
+	if !child.reaped { _ = posix.kill(group, .SIGKILL) }
 	stdio_child_reap(child)
 }
 
-// stdio_terminate_group asks the whole tree to stop, escalates to SIGKILL once the
-// grace period expires, and reaps the direct child. A server that ignores SIGTERM
-// is why the escalation exists; the server's own children are why the group does.
-stdio_terminate_group :: proc(child: ^Stdio_Child) {
-	if child.pid <= 0 { return }
-	if stdio_group_gone(child.pid) {
-		stdio_terminate_direct_child(child)
-		return
-	}
-	_ = posix.killpg(posix.pid_t(child.pid), .SIGTERM)
-	grace := time.tick_add(time.tick_now(), STDIO_KILL_GRACE)
-	for time.tick_since(grace) < 0 {
-		_ = stdio_child_poll(child)
-		if stdio_group_gone(child.pid) {
-			stdio_terminate_direct_child(child)
-			return
-		}
-		time.sleep(5 * time.Millisecond)
-	}
-	_ = posix.killpg(posix.pid_t(child.pid), .SIGKILL)
-	stdio_terminate_direct_child(child)
+// Stdio_Wait is what ended a wait on a pipe end.
+Stdio_Wait :: enum {
+	Ready,
+	// Server_Gone means the pipe is not ready and the server has exited.
+	Server_Gone,
+	Stopped,
+	Failed,
 }
 
-@(private)
-stdio_group_gone :: proc(group: int) -> bool {
-	if group <= 0 { return true }
-	return posix.killpg(posix.pid_t(group), .NONE) == .FAIL && posix.errno() == .ESRCH
-}
-
-// stdio_wait waits until a pipe end is ready. It reports a stop rather than
-// blocking through one, and treats a poll error as not ready so the following
-// read or write reports the real failure.
-stdio_wait :: proc(file: ^os.File, direction: Stdio_Direction, control: Control) -> (ready: bool, stop: Stop) {
+// stdio_wait sleeps until a pipe end is ready, the server exits, the control's wake
+// is signalled, or its deadline passes. stop says why a Stopped wait ended, and err
+// why a Failed one did.
+stdio_wait :: proc(file: ^os.File, direction: Stdio_Direction, child: ^Stdio_Child, control: Control) -> (result: Stdio_Wait, stop: Stop, err: os.Error) {
 	for {
-		if stop = control_stop(control); stop != .None { return false, stop }
-		polled, failed := stdio_poll(file, direction, STDIO_POLL_SLICE_MS)
-		if polled { return true, .None }
-		if failed { return false, .None }
+		if stop = control_stop(control); stop != .None { return .Stopped, stop, nil }
+		fds: [3]posix.pollfd
+		fds[0] = {
+			fd     = stdio_fd(file),
+			events = {.IN} if direction == .Read else {.OUT},
+		}
+		count := 1
+		if child.exit.open {
+			fds[count] = {
+				fd     = stdio_exit_watch_fd(child.exit),
+				events = {.IN},
+			}
+			count += 1
+		}
+		if control.wake != nil {
+			fds[count] = {
+				fd     = stdio_fd(control.wake),
+				events = {.IN},
+			}
+			count += 1
+		}
+		if err = stdio_poll(fds[:count], control.deadline_at, control.has_deadline); err != nil { return .Failed, .None, err }
+		if fds[0].revents != {} { return .Ready, .None, nil }
+		if stdio_child_poll(child) { return .Server_Gone, .None, nil }
 	}
 }
-
-// Stdio_Poll_Slice is how long one poll waits before re-checking cancellation and
-// the deadline. A short slice is what keeps a cancel prompt.
-STDIO_POLL_SLICE_MS :: 20
 
 // stdio_alloc_vectors builds the nil-terminated argv and envp vectors a spawn
 // needs. It is called before the fork, where allocating is still safe, and the

@@ -91,18 +91,21 @@ stdio_config_destroy :: proc(config: ^Stdio_Config, allocator := context.allocat
 // diagnostic text only: a thread drains it into a bounded tail so a chatty server
 // cannot block on a full pipe, and a request outcome never depends on it.
 Stdio :: struct {
-	pipes:         Stdio_Pipes,
-	child:         Stdio_Child,
-	started:       bool,
-	line:          [dynamic]u8,
-	line_offset:   int,
-	out:           [dynamic]u8,
-	stderr_tail:   [dynamic]u8,
-	stderr_mutex:  sync.Mutex,
-	stderr_thread: ^thread.Thread,
-	stderr_stop:   bool,
-	sigpipe_owned: bool,
-	allocator:     mem.Allocator,
+	pipes:            Stdio_Pipes,
+	child:            Stdio_Child,
+	started:          bool,
+	line:             [dynamic]u8,
+	line_offset:      int,
+	out:              [dynamic]u8,
+	stderr_tail:      [dynamic]u8,
+	stderr_mutex:     sync.Mutex,
+	stderr_thread:    ^thread.Thread,
+	// drain_stop_read and drain_stop_write stop the drainer: closing the write end
+	// wakes it from its poll for good.
+	drain_stop_read:  ^os.File,
+	drain_stop_write: ^os.File,
+	sigpipe_owned:    bool,
+	allocator:        mem.Allocator,
 }
 
 // stdio_start launches a server and begins draining its standard error. On failure
@@ -172,7 +175,12 @@ stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.al
 		}
 	}
 
-	stdio.stderr_stop = false
+	stop_read, stop_write, stop_error := os.pipe()
+	if stop_error != nil {
+		stdio_stop(stdio)
+		return stdio_spawn_error("the standard error drain could not be prepared", stop_error, allocator)
+	}
+	stdio.drain_stop_read, stdio.drain_stop_write = stop_read, stop_write
 	stdio.stderr_thread = thread.create(stdio_stderr_serve)
 	if stdio.stderr_thread == nil {
 		stdio_stop(stdio)
@@ -196,21 +204,19 @@ stdio_spawn_error :: proc(what: string, cause: os.Error, allocator: mem.Allocato
 stdio_stop :: proc(stdio: ^Stdio) {
 	if stdio.started {
 		_ = os.close(stdio.pipes.stdin)
-		grace := time.tick_add(time.tick_now(), STDIO_KILL_GRACE)
-		for !stdio_child_poll(&stdio.child) {
-			if time.tick_since(grace) >= 0 { break }
-			time.sleep(5 * time.Millisecond)
-		}
+		stdio_child_await(&stdio.child, time.tick_add(time.tick_now(), STDIO_KILL_GRACE))
 		if !stdio.child.reaped { stdio_terminate_group(&stdio.child) }
+		stdio_child_close(&stdio.child)
 	}
 	// The drainer still reads standard error, so it is joined before that pipe
 	// end closes.
+	if stdio.drain_stop_write != nil { _ = os.close(stdio.drain_stop_write) }
 	if stdio.stderr_thread != nil {
-		sync.atomic_store(&stdio.stderr_stop, true)
 		thread.join(stdio.stderr_thread)
 		thread.destroy(stdio.stderr_thread)
 		stdio.stderr_thread = nil
 	}
+	if stdio.drain_stop_read != nil { _ = os.close(stdio.drain_stop_read) }
 	if stdio.started {
 		_ = os.close(stdio.pipes.stdout)
 		_ = os.close(stdio.pipes.stderr)
@@ -251,13 +257,15 @@ stdio_write_line :: proc(stdio: ^Stdio, message: string, control: Control) -> Er
 
 	written := 0
 	for written < len(stdio.out) {
-		ready, stop := stdio_wait(stdio.pipes.stdin, .Write, control)
-		if stop != .None { return control_error(stop, .Not_Delivered, stdio.allocator) }
-		if !ready {
-			if stdio_child_poll(&stdio.child) {
-				return stdio_transport_error(stdio, .Server_Exited, .Not_Delivered)
-			}
-			continue
+		waited, stop, wait_error := stdio_wait(stdio.pipes.stdin, .Write, &stdio.child, control)
+		switch waited {
+		case .Ready:
+		case .Stopped:
+			return control_error(stop, .Not_Delivered, stdio.allocator)
+		case .Server_Gone:
+			return stdio_transport_error(stdio, .Server_Exited, .Not_Delivered)
+		case .Failed:
+			return stdio_wait_error(stdio, .Write_Failed, .Not_Delivered, wait_error)
 		}
 		count, status := stdio_write(stdio.pipes.stdin, stdio.out[written:])
 		if status == .Again { continue }
@@ -284,15 +292,15 @@ stdio_read_line :: proc(stdio: ^Stdio, control: Control) -> (line: []u8, err: Er
 		if stop := control_stop(control); stop != .None {
 			return nil, control_error(stop, .Delivered, stdio.allocator)
 		}
-		ready, stop := stdio_wait(stdio.pipes.stdout, .Read, control)
-		if stop != .None { return nil, control_error(stop, .Delivered, stdio.allocator) }
-		if !ready {
-			// A hangup with nothing left to read is the end of the stream, and a
-			// server that has exited is a more specific fact than that.
-			if stdio_child_poll(&stdio.child) {
-				return nil, stdio_transport_error(stdio, .Server_Exited, .Delivered)
-			}
-			continue
+		waited, stop, wait_error := stdio_wait(stdio.pipes.stdout, .Read, &stdio.child, control)
+		switch waited {
+		case .Ready:
+		case .Stopped:
+			return nil, control_error(stop, .Delivered, stdio.allocator)
+		case .Server_Gone:
+			return nil, stdio_transport_error(stdio, .Server_Exited, .Delivered)
+		case .Failed:
+			return nil, stdio_wait_error(stdio, .Read_Failed, .Delivered, wait_error)
 		}
 		buffer: [4096]u8
 		count, status := stdio_read(stdio.pipes.stdout, buffer[:])
@@ -341,6 +349,15 @@ stdio_transport_error :: proc(stdio: ^Stdio, kind: Error_Kind, delivery: Deliver
 	return err
 }
 
+// stdio_wait_error is a transport failure caused by the system refusing the wait
+// itself, naming the system's reason.
+@(private)
+stdio_wait_error :: proc(stdio: ^Stdio, kind: Error_Kind, delivery: Delivery_State, cause: os.Error) -> Error {
+	err := stdio_transport_error(stdio, kind, delivery)
+	err.message = fmt.aprintf("the server's pipe could not be waited on: %s", os.error_string(cause), allocator = stdio.allocator)
+	return err
+}
+
 // stdio_stderr_excerpt copies the bounded tail of what the server wrote to standard
 // error. It is diagnostic text and never decides an outcome.
 stdio_stderr_excerpt :: proc(stdio: ^Stdio, allocator := context.allocator) -> string {
@@ -356,10 +373,11 @@ stdio_stderr_excerpt :: proc(stdio: ^Stdio, allocator := context.allocator) -> s
 stdio_stderr_serve :: proc(thread: ^thread.Thread) {
 	stdio := cast(^Stdio)thread.data
 	buffer: [4096]u8
-	for !sync.atomic_load(&stdio.stderr_stop) {
-		ready, failed := stdio_poll(stdio.pipes.stderr, .Read, STDIO_POLL_SLICE_MS)
-		if failed { return }
-		if !ready { continue }
+	// The drain ends at end of stream, on a read error, or when stdio_stop closes the
+	// stop pipe: descendants of the server can hold standard error open after it exits.
+	for {
+		stopped, wait_error := stdio_await_readable(stdio.pipes.stderr, stdio.drain_stop_read)
+		if stopped || wait_error != nil { return }
 		read_count, status := stdio_read(stdio.pipes.stderr, buffer[:])
 		if status == .Again { continue }
 		if status == .Failed || read_count <= 0 { return }

@@ -1,5 +1,6 @@
 package mcp
 
+import "core:os"
 import "core:time"
 
 // Stop says why an operation stopped short of finishing.
@@ -9,8 +10,14 @@ Stop :: enum {
 	Timed_Out,
 }
 
-// Control bounds one operation. Its callback and deadline are borrowed and polled,
+// Control bounds one operation. Its callback and deadline are borrowed and checked,
 // never retained, and a nil callback means the condition never holds.
+//
+// A transport sleeps until its I/O is ready or the deadline passes, and consults the
+// callback when it wakes. wake is what lets a stop end that sleep: a readable
+// descriptor the caller makes readable, for good, once interrupted would report
+// true. Without it, a stop is seen only when the operation's own I/O or deadline
+// wakes the transport.
 //
 // Cancellation wins over the deadline, so a cancelled turn is never reported as a
 // timeout. The caller keeps its own cancellation vocabulary: this package only
@@ -23,6 +30,7 @@ Control :: struct {
 	// cannot make it fire early.
 	deadline_at:  time.Tick,
 	has_deadline: bool,
+	wake:         ^os.File,
 }
 
 // Wire_Direction is which way one message travelled.
