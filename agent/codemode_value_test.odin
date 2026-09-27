@@ -62,7 +62,7 @@ return r.outcome == "success" and r.output.stdout == "done" and r.output.exit_co
 	}
 	result := tool_result_success(&ctx, Shell_Output{stdout = "done", exit_code = 2})
 	defer tool_result_destroy(&result)
-	codemode_lua_keep_result(run, 1, &result)
+	testing.expect(t, codemode_lua_keep_result(run, 1, &result), "the result should be kept")
 	codemode_lua_answer_kept(run, 1)
 	testing.expect_value(t, codemode_value_test_settle(run), Lua_Event.Returned)
 	value, _ := codemode_lua_returned_string(run)

@@ -192,7 +192,16 @@ codemode_job_child_committed :: proc(jobs: ^Tool_Jobs, child: ^Tool_Job, result:
 		if codemode_job_settled(parent) { codemode_job_finish(parent) }
 		return
 	}
-	codemode_lua_keep_result(parent.lua, handle, result)
+	if !codemode_lua_keep_result(parent.lua, handle, result) {
+		codemode_job_answer(
+			parent,
+			.Tool_Failed,
+			.Out_Of_Memory,
+			"the result of a call the script made could not be handed to it: out of memory",
+			"out of memory",
+		)
+		return
+	}
 	if parent.lua_waiting == handle { codemode_job_deliver(parent, handle) }
 }
 
@@ -301,6 +310,7 @@ codemode_job_answer :: proc(job: ^Tool_Job, outcome: session.Tool_Outcome, diagn
 	if job.lua != nil {
 		output.logs = string(job.lua.logs[:])
 		output.logs_truncated = job.lua.logs_truncated
+		output.traceback = job.lua.traceback
 	}
 	job.result = codemode_job_result(job, outcome, message, output, reason)
 	job.result_present = true

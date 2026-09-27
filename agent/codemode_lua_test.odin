@@ -21,8 +21,8 @@ lua_test_start :: proc(t: ^testing.T, source: string, timeout: time.Duration = 0
 	return run
 }
 
-// lua_test_drive resumes a run until it settles. Each tool call is answered with the text
-// `result:<name>`, and a step cap turns a suspension bug into a failure instead of a hang.
+// lua_test_drive resumes a run until it settles. Each request is answered with the count of
+// requests so far, and a step cap turns a suspension bug into a failure instead of a hang.
 lua_test_drive :: proc(t: ^testing.T, run: ^Lua_Run) -> (event: Lua_Event, slices: int, calls: [dynamic]string) {
 	calls = make([dynamic]string, context.temp_allocator)
 	for _ in 0 ..< 1_000_000 {
@@ -31,10 +31,8 @@ lua_test_drive :: proc(t: ^testing.T, run: ^Lua_Run) -> (event: Lua_Event, slice
 		case .Slice:
 			slices += 1
 		case .Host_Request:
-			name := strings.clone(run.request.name, context.temp_allocator)
-			append(&calls, name)
-			codemode_lua_push_string(run.thread, strings.concatenate({"result:", name}, context.temp_allocator))
-			run.answers += 1
+			append(&calls, strings.clone(run.request.name, context.temp_allocator))
+			codemode_lua_answer_handle(run, len(calls))
 		case .Returned, .Stopped, .Failed:
 			return
 		}
@@ -64,8 +62,19 @@ lua_failures_are_values_with_their_position :: proc(t: ^testing.T) {
 	testing.expect_value(t, codemode_lua_resume(runtime_error), Lua_Event.Failed)
 	testing.expect_value(t, runtime_error.failure, Lua_Failure.Runtime)
 	testing.expect(t, strings.has_prefix(runtime_error.message, "code:1: attempt to index a nil value"), runtime_error.message)
-	testing.expect(t, strings.contains(runtime_error.message, "stack traceback:"), runtime_error.message)
-	testing.expect(t, strings.contains(runtime_error.message, "in local 'inner'"), runtime_error.message)
+	testing.expect_value(t, runtime_error.traceback, "code:1: in local 'inner'\ncode:2: in main chunk")
+
+	table_error := lua_test_start(t, `error({code = 1})`)
+	defer codemode_lua_destroy(table_error)
+	testing.expect_value(t, codemode_lua_resume(table_error), Lua_Event.Failed)
+	testing.expect_value(t, table_error.message, "the script raised a non-string error: {code = 1}")
+
+	unknown := lua_test_start(t, `return tools.gamma`)
+	defer codemode_lua_destroy(unknown)
+	testing.expect(t, codemode_lua_install_tool(unknown, "beta"), "beta should install")
+	testing.expect(t, codemode_lua_install_tool(unknown, "alpha"), "alpha should install")
+	testing.expect_value(t, codemode_lua_resume(unknown), Lua_Event.Failed)
+	testing.expect(t, strings.has_prefix(unknown.message, `code:1: no tool named "gamma"; the tools are: alpha, beta.`), unknown.message)
 }
 
 @(test)
@@ -75,20 +84,20 @@ local handle = job.start("beta", {n = 2})
 return first .. "|" .. handle`)
 	defer codemode_lua_destroy(run)
 	testing.expect(t, codemode_lua_install_tool(run, "alpha"), "alpha should install")
+	testing.expect(t, codemode_lua_install_tool(run, "beta"), "beta should install")
 
 	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Host_Request)
 	testing.expect_value(t, run.request.kind, Lua_Request_Kind.Call)
 	testing.expect_value(t, run.request.name, "alpha")
 	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Host_Request)
-	codemode_lua_push_string(run.thread, "one")
-	run.answers += 1
+	codemode_lua_answer_handle(run, 3)
 	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Host_Request)
 	testing.expect_value(t, run.request.kind, Lua_Request_Kind.Start)
 	testing.expect_value(t, run.request.name, "beta")
 	codemode_lua_answer_handle(run, 7)
 	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Returned)
 	value, _ := codemode_lua_returned_string(run)
-	testing.expect_value(t, value, "one|7")
+	testing.expect_value(t, value, "3|7")
 }
 
 // Refusals are Lua errors at the script's line, so a script can catch them with pcall.

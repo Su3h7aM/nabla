@@ -2,7 +2,10 @@ package agent
 
 import "base:runtime"
 import c "core:c"
+import "core:fmt"
 import "core:mem"
+import "core:mem/virtual"
+import "core:slice"
 import "core:strings"
 import "core:time"
 import "core:unicode/utf8"
@@ -19,7 +22,9 @@ import "nabla:ai"
 // back to the owner:
 //
 // - A host function (`tools.<name>`, `job.start`, `job.wait`) yields a request. The owner
-//   answers it through one of the `codemode_lua_answer_*` procedures and resumes.
+//   records an answer through one of the `codemode_lua_answer_*` procedures and resumes;
+//   the host function's continuation pushes the answer, so every push the owner causes
+//   runs inside the resume, where a Lua error is caught.
 // - The count hook yields. The owner resumes for another slice, or never resumes a run
 //   that was stopped.
 //
@@ -27,6 +32,10 @@ import "nabla:ai"
 // suspension. Inside a C call, such as a `table.sort` comparator, the coroutine cannot
 // yield, so the hook raises instead once the run should stop; the stop is final at the
 // next point that can yield.
+//
+// A Lua error unwinds a C callback without running its defers, so callbacks allocate only
+// from the run's scratch arena, inside an arena_temp that the error path ends before it
+// raises. Whatever an error raised by Lua itself skips is reclaimed after the resume.
 
 // LUA_SLICE_INSTRUCTIONS is how many VM instructions run between owner checkpoints.
 // It is a scheduling quantum, not a limit.
@@ -102,9 +111,22 @@ Lua_Request :: struct {
 	pending:  bool,
 }
 
+// Lua_Answer is how the owner answered the pending request.
+Lua_Answer :: enum {
+	// None: not answered yet.
+	None,
+	// Handle: job.start returns answer_handle.
+	Handle,
+	// Result: the call returns the result kept under answer_handle.
+	Result,
+	// Error: the call raises answer_message at the script's line.
+	Error,
+}
+
 // Lua_Run is one execution. Every field is owned by the run or an observed count.
 Lua_Run :: struct {
 	allocator:       mem.Allocator,
+	scratch:         virtual.Arena, // callback memory, reset after every resume
 	state:           ^lua.State, // the main state; owns every value
 	thread:          ^lua.State, // the private coroutine the chunk runs on
 	interrupt:       ^ai.Interrupt, // borrowed; a requested interrupt stops the run
@@ -113,14 +135,15 @@ Lua_Run :: struct {
 	failure:         Lua_Failure,
 	terminal:        bool, // the run cannot be resumed
 	message:         string, // why it stopped or failed
+	traceback:       string, // the frames a runtime error unwound
 	logs:            [dynamic]u8, // what print produced
 	logs_truncated:  bool,
 	request:         Lua_Request,
-	answers:         int, // values answering the pending request, not yet delivered
-	delivered:       int, // values the last resume delivered
-	raise:           bool, // the delivered value is an error message the request raises
+	answer:          Lua_Answer,
+	answer_handle:   int,
+	answer_message:  string, // owned; released after the resume that raised it
 	results_ref:     i32, // registry table of committed child results by handle
-	last_event:      Lua_Event, // what resume and deliver report for a terminal run
+	last_event:      Lua_Event, // what resume reports for a terminal run
 	returned_values: int,
 }
 
@@ -133,13 +156,25 @@ codemode_lua_run :: proc "contextless" (state: ^lua.State) -> ^Lua_Run {
 	return (cast(^^Lua_Run)lua.getextraspace(state))^
 }
 
-// codemode_lua_context is the context a C callback runs Odin code with. Its allocator
-// is the run's.
+// codemode_lua_context is the context a C callback runs Odin code with: the run's
+// allocator, and its scratch arena as the temporary allocator.
 @(private)
 codemode_lua_context :: proc "contextless" (run: ^Lua_Run) -> runtime.Context {
 	context = runtime.default_context()
 	context.allocator = run.allocator
+	context.temp_allocator = virtual.arena_allocator(&run.scratch)
 	return context
+}
+
+// codemode_lua_raise raises message at the calling line after ending temp, which message
+// may live in: the push copies it first. It does not return.
+@(private)
+codemode_lua_raise :: proc(state: ^lua.State, message: string, temp: virtual.Arena_Temp) -> c.int {
+	lua.L_where(state, 1)
+	codemode_lua_push_string(state, message)
+	lua.concat(state, 2)
+	virtual.arena_temp_end(temp)
+	return c.int(lua.error(state))
 }
 
 // --- memory --------------------------------------------------------------------
@@ -232,19 +267,30 @@ codemode_lua_suspend :: proc "c" (state: ^lua.State, kind: Lua_Request_Kind, nam
 	return c.int(lua.yield(state, 0, 0, codemode_lua_answered))
 }
 
-// codemode_lua_answered continues a host function once the owner answered it: with
-// the values it delivered, or by raising the message it delivered.
+// codemode_lua_answered continues a host function with the owner's answer.
 @(private)
 codemode_lua_answered :: proc "c" (state: ^lua.State, status: c.int, ctx: lua.KContext) -> c.int {
 	run := codemode_lua_run(state)
-	if run.raise {
-		run.raise = false
+	answer := run.answer
+	run.answer = .None
+	switch answer {
+	case .Handle:
+		lua.pushinteger(state, lua.Integer(run.answer_handle))
+	case .Result:
+		lua.rawgeti(state, lua.REGISTRYINDEX, lua.Integer(run.results_ref))
+		lua.rawgeti(state, -1, lua.Integer(run.answer_handle))
+		lua.pushnil(state)
+		lua.rawseti(state, -3, lua.Integer(run.answer_handle))
+		lua.remove(state, -2)
+	case .Error:
 		lua.L_where(state, 1)
-		lua.insert(state, -2)
+		codemode_lua_push_string(state, run.answer_message)
 		lua.concat(state, 2)
 		return c.int(lua.error(state))
+	case .None:
+		lua.pushnil(state)
 	}
-	return c.int(run.delivered)
+	return 1
 }
 
 // codemode_lua_tool_call is the body of one `tools` entry. Its upvalue is the tool name.
@@ -253,9 +299,14 @@ codemode_lua_tool_call :: proc "c" (state: ^lua.State) -> c.int {
 	return codemode_lua_suspend(state, .Call, LUA_FIRST_UPVALUE, 1, 0)
 }
 
+// codemode_lua_job_start checks the name against its upvalue, the tools table, so an
+// unknown tool is refused before a call is recorded.
 @(private)
 codemode_lua_job_start :: proc "c" (state: ^lua.State) -> c.int {
 	lua.L_checkstring(state, 1)
+	lua.pushvalue(state, 1)
+	if lua.Type(lua.rawget(state, LUA_FIRST_UPVALUE)) == .NIL { return codemode_lua_unknown_tool(state, LUA_FIRST_UPVALUE, 1) }
+	lua.pop(state, 1)
 	return codemode_lua_suspend(state, .Start, 1, 2, 0)
 }
 
@@ -263,6 +314,36 @@ codemode_lua_job_start :: proc "c" (state: ^lua.State) -> c.int {
 codemode_lua_job_wait :: proc "c" (state: ^lua.State) -> c.int {
 	handle := lua.L_checkinteger(state, 1)
 	return codemode_lua_suspend(state, .Wait, 0, 0, int(handle))
+}
+
+// codemode_lua_tools_index is the `tools` table's __index: reading a name that is not a
+// tool is a mistake, so it raises with the names that are, rather than returning nil.
+@(private)
+codemode_lua_tools_index :: proc "c" (state: ^lua.State) -> c.int {
+	return codemode_lua_unknown_tool(state, 1, 2)
+}
+
+// codemode_lua_unknown_tool raises for the name at name_index, listing the tools table at
+// table_index in name order.
+@(private)
+codemode_lua_unknown_tool :: proc "c" (state: ^lua.State, table_index, name_index: c.int) -> c.int {
+	run := codemode_lua_run(state)
+	context = codemode_lua_context(run)
+	temp := virtual.arena_temp_begin(&run.scratch)
+	names := make([dynamic]string, context.temp_allocator)
+	lua.pushnil(state)
+	for lua.next(state, table_index) != 0 {
+		lua.pop(state, 1)
+		if name, is_text := codemode_lua_stack_string(state, -1); is_text { append(&names, name) }
+	}
+	slice.sort(names[:])
+	name, _ := codemode_lua_stack_string(state, name_index)
+	message := fmt.tprintf(
+		"no tool named %q; the tools are: %s. Use rawget(tools, name) to test whether a tool exists",
+		name,
+		strings.join(names[:], ", ", context.temp_allocator),
+	)
+	return codemode_lua_raise(state, message, temp)
 }
 
 // --- restricted environment ----------------------------------------------------
@@ -345,11 +426,13 @@ codemode_lua_install_table :: proc(state: ^lua.State, name: cstring, functions: 
 codemode_lua_print :: proc "c" (state: ^lua.State) -> c.int {
 	run := codemode_lua_run(state)
 	context = codemode_lua_context(run)
+	temp := virtual.arena_temp_begin(&run.scratch)
 	for index in 1 ..= lua.gettop(state) {
 		if index > 1 { codemode_lua_log_append(run, " ") }
 		codemode_lua_log_value(run, state, index)
 	}
 	codemode_lua_log_append(run, "\n")
+	virtual.arena_temp_end(temp)
 	return 0
 }
 
@@ -378,9 +461,7 @@ codemode_lua_log_value :: proc(run: ^Lua_Run, state: ^lua.State, index: c.int) {
 // conversion refuses it: `print` is a diagnostic and never fails the script.
 @(private)
 codemode_lua_log_table :: proc(run: ^Lua_Run, state: ^lua.State, index: c.int) {
-	literal, message, _ := codemode_lua_convert(run, state, index, .Lua, CODEMODE_LOG_MAX_NODES)
-	defer delete(literal)
-	defer delete(message)
+	literal, message, _ := codemode_lua_convert(run, state, index, .Lua, CODEMODE_LOG_MAX_NODES, context.temp_allocator)
 	codemode_lua_log_append(run, message == "" ? literal : "<table>")
 }
 
@@ -463,9 +544,20 @@ codemode_lua_start :: proc(
 	codemode_lua_open_libraries(state)
 	lua.pushcfunction(state, codemode_lua_print)
 	lua.setglobal(state, "print")
+	// `tools` raises on a name that is not a tool, and job.start checks names against it.
 	lua.newtable(state)
+	lua.createtable(state, 0, 1)
+	lua.pushcfunction(state, codemode_lua_tools_index)
+	lua.setfield(state, -2, "__index")
+	lua.setmetatable(state, -2)
+	lua.createtable(state, 0, 2)
+	lua.pushvalue(state, -2)
+	lua.pushcclosure(state, codemode_lua_job_start, 1)
+	lua.setfield(state, -2, "start")
+	lua.pushcfunction(state, codemode_lua_job_wait)
+	lua.setfield(state, -2, "wait")
+	lua.setglobal(state, "job")
 	lua.setglobal(state, "tools")
-	codemode_lua_install_table(state, "job", {{"start", codemode_lua_job_start}, {"wait", codemode_lua_job_wait}})
 	codemode_lua_install_table(state, "json", {{"encode", codemode_lua_json_encode}, {"decode", codemode_lua_json_decode}})
 	// Lua nil means absence, so JSON null is a stable light-userdata identity.
 	lua.getglobal(state, "json")
@@ -497,7 +589,7 @@ codemode_lua_install_tool :: proc(run: ^Lua_Run, name: string) -> bool {
 	codemode_lua_push_string(state, name)
 	codemode_lua_push_string(state, name)
 	lua.pushcclosure(state, codemode_lua_tool_call, 1)
-	lua.settable(state, -3)
+	lua.rawset(state, -3)
 	lua.pop(state, 1)
 	return true
 }
@@ -508,19 +600,29 @@ codemode_lua_install_tool :: proc(run: ^Lua_Run, name: string) -> bool {
 codemode_lua_resume :: proc(run: ^Lua_Run) -> Lua_Event {
 	if run.terminal { return run.last_event }
 	if !run.request.pending { return codemode_lua_step(run, 0) }
-	if run.answers == 0 { return .Host_Request }
-	count := run.answers
-	run.answers = 0
+	if run.answer == .None { return .Host_Request }
 	codemode_lua_request_clear(run)
-	return codemode_lua_step(run, count)
+	return codemode_lua_step(run, 0)
 }
 
 // codemode_lua_answer_error answers the pending request by raising message at the
-// script's line, where the script may catch it with pcall.
+// script's line, where the script may catch it with pcall. message is copied.
 codemode_lua_answer_error :: proc(run: ^Lua_Run, message: string) {
-	codemode_lua_push_string(run.thread, message)
-	run.raise = true
-	run.answers += 1
+	run.answer = .Error
+	run.answer_message = strings.clone(message, run.allocator) or_else ""
+}
+
+// codemode_lua_answer_handle answers job.start with the child's handle.
+codemode_lua_answer_handle :: proc(run: ^Lua_Run, handle: int) {
+	run.answer = .Handle
+	run.answer_handle = handle
+}
+
+// codemode_lua_answer_kept answers the pending request with the result kept under handle,
+// which the answer releases.
+codemode_lua_answer_kept :: proc(run: ^Lua_Run, handle: int) {
+	run.answer = .Result
+	run.answer_handle = handle
 }
 
 // codemode_lua_request_stop latches a stop. The run ends at its next slice.
@@ -536,7 +638,10 @@ codemode_lua_destroy :: proc(run: ^Lua_Run) {
 		codemode_lua_request_clear(run)
 		lua.close(run.state)
 	}
+	delete(run.answer_message)
+	virtual.arena_destroy(&run.scratch)
 	delete(run.message)
+	delete(run.traceback)
 	delete(run.logs)
 	free(run)
 }
@@ -552,9 +657,11 @@ codemode_lua_request_clear :: proc(run: ^Lua_Run) {
 
 @(private)
 codemode_lua_step :: proc(run: ^Lua_Run, count: int) -> Lua_Event {
-	run.delivered = count
 	results: c.int
 	status := lua.resume(run.thread, run.state, c.int(count), &results)
+	delete(run.answer_message, run.allocator)
+	run.answer_message = ""
+	virtual.arena_free_all(&run.scratch)
 	switch status {
 	case .OK:
 		run.returned_values = int(results)
@@ -584,17 +691,28 @@ codemode_lua_settle_stop :: proc(run: ^Lua_Run) -> Lua_Event {
 	return codemode_lua_settle(run, .Stopped, .None, "the execution was cancelled")
 }
 
-// codemode_lua_settle_error keeps the error and the traceback of the frames it unwound,
-// which the coroutine still holds after a failed resume.
+// codemode_lua_settle_error keeps the error and, apart, the traceback of the frames it
+// unwound, which the coroutine still holds after a failed resume. An error value that is
+// not a string is written as its Lua literal, so `error({code = 1})` reads as itself.
 @(private)
 codemode_lua_settle_error :: proc(run: ^Lua_Run) -> Lua_Event {
+	context.allocator = run.allocator
 	text, is_text := codemode_lua_stack_string(run.thread, -1)
-	if !is_text { text = "the script raised an error that is not a string" }
+	literal, refusal, _ := codemode_lua_convert(run, run.thread, -1, .Lua, CODEMODE_LOG_MAX_NODES)
+	defer delete(literal)
+	defer delete(refusal)
+	if !is_text {
+		text = refusal == "" ? literal : string(lua.typename(run.thread, lua.type(run.thread, -1)))
+		text = strings.concatenate({"the script raised a non-string error: ", text}, context.temp_allocator)
+	}
 	lua.L_traceback(run.state, run.thread, nil, 0)
 	traceback, _ := codemode_lua_stack_string(run.state, -1)
-	message := strings.concatenate({text, "\n", traceback}, context.temp_allocator)
+	traceback = strings.trim_prefix(traceback, "stack traceback:\n")
+	delete(run.traceback)
+	run.traceback, _ = strings.replace_all(codemode_lua_truncate_runes(traceback, LUA_MAX_MESSAGE_BYTES), "\t", "")
+	if raw_data(run.traceback) == raw_data(traceback) { run.traceback = strings.clone(run.traceback) or_else "" }
 	lua.pop(run.state, 1)
-	return codemode_lua_settle(run, .Failed, .Runtime, message)
+	return codemode_lua_settle(run, .Failed, .Runtime, text)
 }
 
 // codemode_lua_settle makes the run terminal with its bounded message.

@@ -5,6 +5,7 @@ import c "core:c"
 import "core:encoding/json"
 import "core:fmt"
 import "core:math"
+import "core:mem/virtual"
 import "core:reflect"
 import "core:slice"
 import "core:strconv"
@@ -55,20 +56,21 @@ Codemode_Walk :: struct {
 }
 
 // codemode_lua_convert writes the value at index in notation. The text, or the message that
-// says what was refused and where, is owned by the run's allocator; out_of_memory says the
-// refusal was a lack of memory rather than the value.
+// says what was refused and where, is owned by allocator; out_of_memory says the refusal
+// was a lack of memory rather than the value.
 codemode_lua_convert :: proc(
 	run: ^Lua_Run,
 	state: ^lua.State,
 	index: i32,
 	notation: Codemode_Notation,
 	max_nodes := CODEMODE_VALUE_MAX_NODES,
+	allocator := context.allocator,
 ) -> (
 	text: string,
 	message: string,
 	out_of_memory: bool,
 ) {
-	context.allocator = run.allocator
+	context.allocator = allocator
 	walk := Codemode_Walk {
 		run       = run,
 		state     = state,
@@ -366,26 +368,16 @@ codemode_identifier :: proc(name: string) -> bool {
 
 // --- json.encode and json.decode -------------------------------------------------
 
-// codemode_lua_raise raises message, owned by the run's allocator, at the calling line.
-// Nothing Odin owns may be live when it is called, because the raise does not return.
-@(private)
-codemode_lua_raise :: proc(state: ^lua.State, message: string) -> c.int {
-	lua.L_where(state, 1)
-	codemode_lua_push_string(state, message)
-	delete(message)
-	lua.concat(state, 2)
-	return c.int(lua.error(state))
-}
-
 @(private)
 codemode_lua_json_encode :: proc "c" (state: ^lua.State) -> c.int {
 	run := codemode_lua_run(state)
 	context = codemode_lua_context(run)
+	temp := virtual.arena_temp_begin(&run.scratch)
 	lua.settop(state, 1)
-	text, message, _ := codemode_lua_convert(run, state, 1, .JSON)
-	if message != "" { return codemode_lua_raise(state, message) }
+	text, message, _ := codemode_lua_convert(run, state, 1, .JSON, allocator = context.temp_allocator)
+	if message != "" { return codemode_lua_raise(state, strings.concatenate({"json.encode refused ", message}, context.temp_allocator), temp) }
 	codemode_lua_push_string(state, text)
-	delete(text)
+	virtual.arena_temp_end(temp)
 	return 1
 }
 
@@ -395,15 +387,24 @@ codemode_lua_json_decode :: proc "c" (state: ^lua.State) -> c.int {
 	context = codemode_lua_context(run)
 	length: c.size_t
 	pointer := lua.L_checkstring(state, 1, &length)
-	value, parse_error := json.parse_string(string((cast([^]u8)pointer)[:length]), .JSON, true)
+	temp := virtual.arena_temp_begin(&run.scratch)
+	value, parse_error := json.parse_string(string((cast([^]u8)pointer)[:length]), .JSON, true, context.temp_allocator)
 	if parse_error != nil {
-		json.destroy_value(value)
-		return codemode_lua_raise(state, fmt.aprintf("json.decode could not read the text: %v", parse_error))
+		return codemode_lua_raise(state, fmt.tprintf("json.decode could not read the text: %s", codemode_json_error_text(parse_error)), temp)
 	}
-	pushed := codemode_json_push(run, state, value, 0)
-	json.destroy_value(value)
-	if !pushed { return codemode_lua_raise(state, strings.clone("json.decode refused a document nested more than 32 levels deep")) }
+	if !codemode_json_push(run, state, value, 0) {
+		return codemode_lua_raise(state, "json.decode refused a document nested more than 32 levels deep", temp)
+	}
+	virtual.arena_temp_end(temp)
 	return 1
+}
+
+// codemode_json_error_text spells a parse error as words: `Expected_String_For_Object_Key`
+// reads "expected string for object key". The text is temporary.
+@(private)
+codemode_json_error_text :: proc(parse_error: json.Error) -> string {
+	name, _ := strings.replace_all(fmt.tprint(parse_error), "_", " ", context.temp_allocator)
+	return strings.to_lower(name, context.temp_allocator)
 }
 
 // codemode_json_push pushes a JSON document as the Lua value with the same shape. JSON null
@@ -448,9 +449,25 @@ codemode_json_push :: proc(run: ^Lua_Run, state: ^lua.State, value: json.Value, 
 // --- tool results ----------------------------------------------------------------
 
 // codemode_lua_keep_result holds a committed child result under its handle until the script
-// waits for it: a table of the outcome, the message, and the typed output.
-codemode_lua_keep_result :: proc(run: ^Lua_Run, handle: int, result: ^Tool_Result) {
+// waits for it: a table of the outcome, the message, and the typed output. The table is
+// built in protected mode, so a lack of memory is reported rather than aborting the process.
+codemode_lua_keep_result :: proc(run: ^Lua_Run, handle: int, result: ^Tool_Result) -> (kept: bool) {
 	state := run.state
+	lua.pushcfunction(state, codemode_lua_keep_body)
+	lua.pushlightuserdata(state, result)
+	lua.pushinteger(state, lua.Integer(handle))
+	kept = lua.pcall(state, 2, 0, 0) == c.int(lua.Status.OK)
+	if !kept { lua.pop(state, 1) }
+	virtual.arena_free_all(&run.scratch)
+	return
+}
+
+@(private)
+codemode_lua_keep_body :: proc "c" (state: ^lua.State) -> c.int {
+	run := codemode_lua_run(state)
+	context = codemode_lua_context(run)
+	result := cast(^Tool_Result)lua.touserdata(state, 1)
+	handle := lua.tointeger(state, 2)
 	lua.rawgeti(state, lua.REGISTRYINDEX, lua.Integer(run.results_ref))
 	lua.createtable(state, 0, 3)
 	codemode_lua_push_string(state, session.tool_outcome_name(result.outcome))
@@ -461,39 +478,21 @@ codemode_lua_keep_result :: proc(run: ^Lua_Run, handle: int, result: ^Tool_Resul
 		codemode_push_value(run, state, reflect.get_union_variant(result.output), "")
 		lua.setfield(state, -2, "output")
 	}
-	lua.rawseti(state, -2, lua.Integer(handle))
-	lua.pop(state, 1)
-}
-
-// codemode_lua_answer_kept answers the pending request with the result kept under handle,
-// and releases it.
-codemode_lua_answer_kept :: proc(run: ^Lua_Run, handle: int) {
-	thread := run.thread
-	lua.rawgeti(thread, lua.REGISTRYINDEX, lua.Integer(run.results_ref))
-	lua.rawgeti(thread, -1, lua.Integer(handle))
-	lua.pushnil(thread)
-	lua.rawseti(thread, -3, lua.Integer(handle))
-	lua.remove(thread, -2)
-	run.answers += 1
-}
-
-// codemode_lua_answer_handle answers the pending request with a job handle.
-codemode_lua_answer_handle :: proc(run: ^Lua_Run, handle: int) {
-	lua.pushinteger(run.thread, lua.Integer(handle))
-	run.answers += 1
+	lua.rawseti(state, -2, handle)
+	return 0
 }
 
 // codemode_push_value pushes a typed value as the Lua value with the same shape: a struct
 // becomes a table keyed by its field names, a slice an array, an absent Maybe nil. A string
-// field tagged lua:"json" holds JSON from a peer and is pushed decoded.
+// field tagged lua:"json" holds JSON from a peer and is pushed decoded. It allocates only
+// from the temporary allocator, which the caller resets.
 @(private)
 codemode_push_value :: proc(run: ^Lua_Run, state: ^lua.State, value: any, tag: reflect.Struct_Tag) {
 	#partial switch info in runtime.type_info_base(type_info_of(value.id)).variant {
 	case runtime.Type_Info_String:
 		text := (^string)(value.data)^
 		if format, _ := reflect.struct_tag_lookup(tag, "lua"); format == "json" {
-			decoded, parse_error := json.parse_string(text, .JSON, true, run.allocator)
-			defer json.destroy_value(decoded, run.allocator)
+			decoded, parse_error := json.parse_string(text, .JSON, true, context.temp_allocator)
 			if parse_error != nil || text == "" || !codemode_json_push(run, state, decoded, 0) { lua.pushnil(state) }
 			return
 		}

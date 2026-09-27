@@ -103,13 +103,15 @@ Codemode_Call :: struct {
 
 // Codemode_Output is what a Code Mode execution did. failure is empty when the chunk
 // returned, and otherwise names why it did not. value is the returned value written as
-// a Lua literal, logs is what print produced, and calls are the script's tool calls.
+// a Lua literal, traceback the frames a runtime error unwound, logs what print produced,
+// and calls the script's tool calls.
 Codemode_Output :: struct {
 	failure:        string,
 	value:          string,
 	calls_total:    int,
 	calls:          []Codemode_Call,
 	logs_truncated: bool,
+	traceback:      string,
 	logs:           string,
 }
 
@@ -222,7 +224,8 @@ tool_result_render :: proc(
 			render_byte(&head, '\n') or_return
 		}
 		render_field(&head, "logs_truncated", value.logs_truncated) or_return
-		render_text(&body, value.logs) or_return
+		render_section(&body, "traceback", value.traceback) or_return
+		render_section(&body, "logs", value.logs) or_return
 	case MCP_Output:
 		render_field(&head, "truncated", value.truncated) or_return
 		for block in value.content {
@@ -441,10 +444,12 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		borrowed := value
 		value.failure = ""
 		value.value = ""
+		value.traceback = ""
 		value.logs = ""
 		value.calls = nil
 		value.failure = strings.clone(borrowed.failure, allocator) or_return
 		value.value = strings.clone(borrowed.value, allocator) or_return
+		value.traceback = strings.clone(borrowed.traceback, allocator) or_return
 		value.logs = strings.clone(borrowed.logs, allocator) or_return
 		value.calls = make([]Codemode_Call, len(borrowed.calls), allocator) or_return
 		for item, index in borrowed.calls {
@@ -508,6 +513,7 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 	case Codemode_Output:
 		delete(value.failure, allocator)
 		delete(value.value, allocator)
+		delete(value.traceback, allocator)
 		delete(value.logs, allocator)
 		for item in value.calls {
 			delete(item.name, allocator)
