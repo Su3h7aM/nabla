@@ -142,6 +142,27 @@ test_writer_batches_responses_and_keeps_notifications_as_own_frames :: proc(t: ^
 }
 
 @(test)
+test_writer_frames_a_request :: proc(t: ^testing.T) {
+	buffer: bytes.Buffer
+	bytes.buffer_init_allocator(&buffer, 0, 0, context.allocator)
+	defer bytes.buffer_destroy(&buffer)
+	writer, writer_err := writer_init(test_writer_stream(&buffer))
+	if writer_err != nil { testing.fail_now(t, "the writer could not be created") }
+	defer writer_destroy(&writer)
+
+	params := Session_Prompt_Params {
+		session_id = "s",
+		prompt     = {{type = "text", text = "hi"}},
+	}
+	testing.expect(t, writer_write_request(&writer, 7, METHOD_SESSION_PROMPT, params))
+
+	want :=
+		`{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"text","text":"hi","uri":"","resource":{"uri":"","text":""}}]}}` +
+		"\n"
+	testing.expect_value(t, bytes.buffer_to_string(&buffer), want)
+}
+
+@(test)
 test_v2_initialize_result_uses_v2_capability_shape :: proc(t: ^testing.T) {
 	buffer: bytes.Buffer
 	bytes.buffer_init_allocator(&buffer, 0, 0, context.allocator)

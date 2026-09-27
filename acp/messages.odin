@@ -27,6 +27,9 @@ METHOD_SESSION_SET_CONFIG_OPTION :: "session/set_config_option"
 METHOD_AUTH_LOGIN :: "auth/login"
 METHOD_AUTH_LOGOUT :: "auth/logout"
 METHOD_SESSION_PROMPT :: "session/prompt"
+// An agent calls this on its client: one tool call needs the user's answer before it runs.
+METHOD_SESSION_REQUEST_PERMISSION :: "session/request_permission"
+
 // Buzz's model selector uses this pre-standard ACP method when an agent advertises
 // its model catalog. It is harmless for other ACP clients to ignore.
 METHOD_SESSION_SET_MODEL :: "session/set_model"
@@ -528,4 +531,38 @@ Usage_Update :: struct {
 	session_update: string `json:"sessionUpdate"`,
 	used:           i64 `json:"used"`,
 	size:           i64 `json:"size"`,
+}
+
+// --- the client role ---------------------------------------------------------
+
+// Permission_Option is one answer an agent offers for a tool call. kind is one of
+// allow_once, allow_always, reject_once, or reject_always.
+Permission_Option :: struct {
+	option_id: string `json:"optionId"`,
+	name:      string `json:"name"`,
+	kind:      string `json:"kind"`,
+}
+
+// Request_Permission_Params is what an agent sends with METHOD_SESSION_REQUEST_PERMISSION.
+// toolCall is left undecoded; a client that shows the call decodes it separately.
+Request_Permission_Params :: struct {
+	session_id: string `json:"sessionId"`,
+	options:    []Permission_Option `json:"options"`,
+}
+
+// Permission_Outcome is the client's answer. outcome is "selected" or "cancelled", and
+// option_id is present only when it is "selected".
+Permission_Outcome :: struct {
+	outcome:   string `json:"outcome"`,
+	option_id: string `json:"optionId,omitempty"`,
+}
+
+Request_Permission_Result :: struct {
+	outcome: Permission_Outcome `json:"outcome"`,
+}
+
+// Update_Kind is the part of a session update that names its kind. A client decodes
+// Session_Notification(Update_Kind) first to learn which update the document carries.
+Update_Kind :: struct {
+	session_update: string `json:"sessionUpdate"`,
 }

@@ -99,6 +99,29 @@ writer_write_notification :: proc(w: ^Writer, method: string, params: $T) -> boo
 	return writer_flush(w, b)
 }
 
+// writer_write_request sends one request as its own frame, which the agent answers by id.
+writer_write_request :: proc(w: ^Writer, id: i64, method: string, params: $T) -> bool {
+	body, marshal_err := json.marshal(params, allocator = context.temp_allocator)
+	if marshal_err != nil { return false }
+	defer delete(body, context.temp_allocator)
+	if w.out.procedure == nil { return false }
+	sync.mutex_lock(&w.mutex)
+	defer sync.mutex_unlock(&w.mutex)
+	b := &w.builder
+	strings.builder_reset(b)
+	if !writer_builder_string(b, `{"jsonrpc":"2.0","id":`) ||
+	   !writer_write_id(b, Jsonrpc_Id(id)) ||
+	   !writer_builder_string(b, `,"method":`) ||
+	   !writer_write_quoted(b, method) ||
+	   !writer_builder_string(b, `,"params":`) ||
+	   !writer_builder_bytes(b, body) ||
+	   !writer_builder_string(b, "}\n") {
+		sync.atomic_store(&w.failed, true)
+		return false
+	}
+	return writer_flush(w, b)
+}
+
 // writer_frame writes one response frame. The caller holds the mutex.
 @(private)
 writer_frame :: proc(w: ^Writer, id: Jsonrpc_Id, key: string, body: []byte) -> bool {
