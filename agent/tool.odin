@@ -1,7 +1,6 @@
 package agent
 
 import "core:encoding/json"
-import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:slice"
@@ -82,10 +81,6 @@ Tool_Context :: struct {
 	// how such a tool names the boundary it was called at.
 	compact:        ^Compact_Control,
 	source_seq:     session.Seq,
-	// results reads a kept tool result back out of the session. It is borrowed and
-	// lives for the whole batch, so every call in one turn can read what an earlier
-	// call kept. Nil means results cannot be read here.
-	results:        ^Result_Reader,
 	// repairs collects what reading the arguments changed in their values, which the owner
 	// records with the call and writes back into the arguments the call runs with.
 	repairs:        session.Tool_Repairs,
@@ -410,30 +405,6 @@ tool_definition_destroy :: proc(definition: ^Tool_Definition, allocator: mem.All
 
 // --- results -----------------------------------------------------------------
 
-// TOOL_RESULT_READ_NAME is the tool that reads a result back. It is named here, beside
-// the handle that tells the model to call it, because the tool and the handle are one
-// contract.
-TOOL_RESULT_READ_NAME :: "context_read_result"
-
-// TOOL_RESULT_SPILLED_MESSAGE is what a handle says instead of the output. Every
-// handle says the same thing, so a spilled result is always explained the same way.
-TOOL_RESULT_SPILLED_MESSAGE :: "the observed output did not fit this context and was kept in the session; read it with context_read_result"
-
-// TOOL_RESULT_HANDLE_TOKENS is what one handle costs the model's context. A handle is a
-// fixed line carrying a sequence number and a byte count, so every handle costs nearly the
-// same; a test holds the real one to this bound. Reserving a constant is what lets a batch's
-// budget be closed before any result is recorded.
-TOOL_RESULT_HANDLE_TOKENS :: 64
-
-// tool_result_handle is the text the model is shown in place of a result that was kept
-// rather than sent. It is derived from the stored entry, so it is not itself stored:
-// one fact, one place. call_seq is what the read tool takes. The text is owned by
-// allocator.
-tool_result_handle :: proc(outcome: session.Tool_Outcome, call_seq: i64, bytes: int, allocator: mem.Allocator) -> string {
-	head, _ := tool_result_render(outcome, TOOL_RESULT_SPILLED_MESSAGE, nil, context.temp_allocator)
-	return fmt.aprintf("%scall_seq: %d\nbytes: %d\n", head, call_seq, bytes, allocator = allocator)
-}
-
 // Tool_Result is one finished call. output is what the tool produced, typed, and
 // content is its rendering: the text the model reads, exactly as the session stores it.
 // Every string and slice is owned by allocator.
@@ -539,7 +510,6 @@ TOOL_DECLARED := [?]Tool_Definition {
 	TOOL_LIST_SKILLS_DEFINITION,
 	TOOL_LOAD_SKILL_DEFINITION,
 	TOOL_COMPACT_DEFINITION,
-	TOOL_RESULT_READ_DEFINITION,
 	TOOL_CODEMODE_DEFINITION,
 }
 

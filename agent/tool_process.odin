@@ -316,11 +316,9 @@ tool_retire_child :: proc(child: ^Tool_Child, start: time.Tick, budget: time.Dur
 // Tool_Stream is one captured output stream while it is drained.
 @(private)
 Tool_Stream :: struct {
-	file:      ^os.File,
-	limit:     int,
-	kept:      ^string,
-	truncated: ^bool,
-	open:      bool,
+	file: ^os.File,
+	kept: [dynamic]u8,
+	open: bool,
 }
 
 // tool_drain_pipes reads both pipes to end of stream and reports why draining
@@ -342,8 +340,13 @@ tool_drain_pipes :: proc(
 ) {
 	deadline := time.tick_add(start, budget)
 	streams := [2]Tool_Stream {
-		{file = stdout_read, limit = TOOL_MAX_STDOUT_BYTES, kept = &data.stdout, truncated = &data.stdout_truncated, open = true},
-		{file = stderr_read, limit = TOOL_MAX_STDERR_BYTES, kept = &data.stderr, truncated = &data.stderr_truncated, open = true},
+		{file = stdout_read, kept = make([dynamic]u8, allocator), open = true},
+		{file = stderr_read, kept = make([dynamic]u8, allocator), open = true},
+	}
+	// Everything the command wrote is kept, whatever the drain ends with.
+	defer {
+		data.stdout = string(streams[0].kept[:])
+		data.stderr = string(streams[1].kept[:])
 	}
 	scratch: [4096]u8
 	for streams[0].open || streams[1].open {
@@ -389,8 +392,9 @@ tool_drain_pipes :: proc(
 			case .Ok:
 				if n == 0 {
 					stream.open = false
-				} else {
-					tool_append_bounded(stream.kept, stream.truncated, scratch[:n], stream.limit, allocator)
+				} else if _, append_error := append(&stream.kept, ..scratch[:n]); append_error != nil {
+					tool_terminate_group(child)
+					return .Wait_Failed, append_error
 				}
 			}
 		}
@@ -400,26 +404,6 @@ tool_drain_pipes :: proc(
 		if !progress && fds[exit_slot].revents != {} { break }
 	}
 	return tool_retire_child(child, start, budget, control)
-}
-
-// tool_append_bounded keeps at most limit bytes and records that anything beyond
-// it was dropped.
-tool_append_bounded :: proc(kept: ^string, truncated: ^bool, chunk: []u8, limit: int, allocator: mem.Allocator) {
-	if len(kept^) >= limit {
-		truncated^ = true
-		return
-	}
-	space := limit - len(kept^)
-	kept_chunk := chunk
-	if len(kept_chunk) > space {
-		kept_chunk = kept_chunk[:space]
-		truncated^ = true
-	}
-	grown := make([dynamic]u8, len(kept^) + len(kept_chunk), allocator)
-	copy(grown[:], transmute([]u8)kept^)
-	copy(grown[len(kept^):], kept_chunk)
-	if kept^ != "" { delete(kept^, allocator) }
-	kept^ = string(grown[:])
 }
 
 // tool_terminate_group asks the whole tree to stop, waits up to the grace period

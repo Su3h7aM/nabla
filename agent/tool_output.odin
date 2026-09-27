@@ -19,7 +19,6 @@ Tool_Output :: union {
 	Shell_Output,
 	Skills_Output,
 	Skill_Output,
-	Result_Read_Output,
 	Compact_Output,
 	Codemode_Output,
 	MCP_Output,
@@ -51,11 +50,9 @@ Patch_Output :: struct {
 // Shell_Output is what a command produced. exit_code is present only when the command
 // exited rather than being ended by a signal.
 Shell_Output :: struct {
-	exit_code:        Maybe(int),
-	stdout_truncated: bool,
-	stderr_truncated: bool,
-	stdout:           string,
-	stderr:           string,
+	exit_code: Maybe(int),
+	stdout:    string,
+	stderr:    string,
 }
 
 Skill_Record :: struct {
@@ -78,22 +75,12 @@ Skill_Output :: struct {
 	instructions:   string,
 }
 
-// Result_Read_Output is one page of a kept result. bytes is the size of the whole
-// result, and next_offset is where the following page starts.
-Result_Read_Output :: struct {
-	bytes:       int,
-	next_offset: int,
-	eof:         bool,
-	text:        string,
-}
-
 Compact_Output :: struct {
 	state: string,
 }
 
 // Codemode_Call is one tool call a script made, as its parent reports it. It is a summary,
-// never the child's output: a model that wants the output reads it back from call_seq
-// with context_read_result.
+// never the child's output: the script returns whatever of that output the model needs.
 Codemode_Call :: struct {
 	call_seq: i64,
 	name:     string,
@@ -179,8 +166,6 @@ tool_result_render :: proc(
 		render_text(&body, value.summary) or_return
 	case Shell_Output:
 		if code, exited := value.exit_code.?; exited { render_field(&head, "exit_code", code) or_return }
-		render_field(&head, "stdout_truncated", value.stdout_truncated) or_return
-		render_field(&head, "stderr_truncated", value.stderr_truncated) or_return
 		render_section(&body, "stdout", value.stdout) or_return
 		render_section(&body, "stderr", value.stderr) or_return
 	case Skills_Output:
@@ -198,11 +183,6 @@ tool_result_render :: proc(
 		render_field(&head, "directory", value.directory) or_return
 		render_field(&head, "content_digest", value.content_digest) or_return
 		render_text(&body, value.instructions) or_return
-	case Result_Read_Output:
-		render_field(&head, "bytes", value.bytes) or_return
-		render_field(&head, "next_offset", value.next_offset) or_return
-		render_field(&head, "eof", value.eof) or_return
-		render_text(&body, value.text) or_return
 	case Compact_Output:
 		render_field(&head, "state", value.state) or_return
 	case Codemode_Output:
@@ -430,10 +410,6 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		value.directory = strings.clone(borrowed.directory, allocator) or_return
 		value.content_digest = strings.clone(borrowed.content_digest, allocator) or_return
 		value.instructions = strings.clone(borrowed.instructions, allocator) or_return
-	case Result_Read_Output:
-		borrowed := value
-		value.text = ""
-		value.text = strings.clone(borrowed.text, allocator) or_return
 	case Compact_Output:
 		borrowed := value
 		value.state = ""
@@ -504,8 +480,6 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 		delete(value.directory, allocator)
 		delete(value.content_digest, allocator)
 		delete(value.instructions, allocator)
-	case Result_Read_Output:
-		delete(value.text, allocator)
 	case Compact_Output:
 		delete(value.state, allocator)
 	case Codemode_Output:

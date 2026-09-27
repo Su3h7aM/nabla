@@ -324,19 +324,14 @@ Tool_Dispatch_Entry :: struct {
 	repairs:   Tool_Repairs,
 }
 
-// Tool_Result_Entry is what the harness observed, together with the exact text
-// the model was given. outcome and error are the analysis-facing summary; content
-// is the whole observed result and the only place tool-specific output lives; and
-// spilled says the model was shown a handle for it instead of the text, because
-// the turn's results as a whole did not fit the room the context had left. A handle
-// is derived from this entry and never stored beside it, so the record and the
-// projection cannot disagree about what the model was told.
+// Tool_Result_Entry is what the harness observed. outcome and error are the
+// analysis-facing summary, and content is the exact text the model was given: the
+// whole result, or its beginning and a notice naming the file that keeps the rest.
 Tool_Result_Entry :: struct {
 	outcome: Tool_Outcome,
 	error:   string,
 	content: string,
 	origin:  Tool_Result_Origin,
-	spilled: bool,
 }
 
 // Checkpoint_Entry is a summary that stands in for the history up to

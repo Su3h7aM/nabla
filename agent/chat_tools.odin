@@ -75,7 +75,7 @@ chat_tool_jobs_finish :: proc(chat: ^Chat_Session, turn_id: u64) -> bool {
 // call that ran and left no result is exactly the unanswered call the record must never
 // have.
 @(private)
-chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, result: ^Tool_Result, spilled: bool) -> (seq: session.Seq, recorded: bool) {
+chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, result: ^Tool_Result) -> (seq: session.Seq, recorded: bool) {
 	// The entry's fields, error text included, are written before this returns, so the temp
 	// memory they were built in is released here.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -86,7 +86,7 @@ chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, re
 		request_no = chat.active_request,
 		created_at_ms = session.now_ms(),
 		related_seq = staged.seq,
-		payload = session.Tool_Result_Entry{outcome = result.outcome, error = error_text, content = result.content, origin = .Observed, spilled = spilled},
+		payload = session.Tool_Result_Entry{outcome = result.outcome, error = error_text, content = result.content, origin = .Observed},
 	}
 	stored, append_error := session.entry_append(chat.store, chat.id, entry)
 	if append_error != nil {

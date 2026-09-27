@@ -162,6 +162,9 @@ Chat_Session :: struct {
 	calls_made:                   int, // tool executions in this turn
 	active_failed:                bool,
 	workspace:                    string, // owned; validated process directory
+	// tool_output_directory is where outputs larger than what the model is shown are kept
+	// whole; owned, and "" when none resolves.
+	tool_output_directory:        string,
 	provider_id:                  string, // owned; the provider requests are addressed to
 	model_id:                     string, // owned; the model requests ask for
 	provider_transport:           Provider_Transport,
@@ -252,6 +255,7 @@ chat_session_init :: proc(
 		workspace         = strings.clone(workspace, allocator),
 		tools             = tools,
 	}
+	chat.tool_output_directory = tool_output_directory(string(chat.id), allocator)
 	// A worker publishes through the mailbox, so its payloads come from the process heap
 	// rather than from the allocator the owner may be writing through at the same time.
 	mailbox_init(&chat.mailbox, os.heap_allocator())
@@ -369,6 +373,7 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	for level in chat.effort_levels { delete(level, chat.allocator) }
 	delete(chat.effort_levels)
 	delete(chat.effort, chat.allocator)
+	delete(chat.tool_output_directory, chat.allocator)
 	delete(chat.provider_id, chat.allocator)
 	delete(chat.model_id, chat.allocator)
 	tool_registry_destroy(&chat.tools)

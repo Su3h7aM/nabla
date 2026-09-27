@@ -105,6 +105,9 @@ chat_test_begin :: proc(t: ^testing.T, fixture: ^Chat_Test, workspace: string) {
 	fixture.chat.provider_id = chat_clone_string("test-provider", context.allocator)
 	fixture.chat.model_id = chat_clone_string("test-model", context.allocator)
 	fixture.chat.skill_instructions = test_skill_instructions(&fixture.chat)
+	// Kept outputs go under the fixture's own directory, never the user's state directory.
+	delete(fixture.chat.tool_output_directory, context.allocator)
+	fixture.chat.tool_output_directory, _ = os.join_path({directory, "tool-output"}, context.allocator)
 }
 
 test_skill_instructions :: proc(chat: ^Chat_Session) -> string {

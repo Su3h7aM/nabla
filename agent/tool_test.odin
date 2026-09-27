@@ -595,10 +595,10 @@ tool_test_result_matches :: proc(t: ^testing.T, content: string, outcome: sessio
 	return testing.expect(t, strings.has_prefix(content, expected), content)
 }
 
-// The harness adds no size limit of its own: a long line is returned whole, and the context
-// budget decides later whether the model sees it inline or through a handle.
+// The read tool adds no size limit of its own: a long line is read whole, the model is shown
+// its beginning, and the complete output is kept in a file it can read.
 @(test)
-test_read_returns_a_long_line_whole :: proc(t: ^testing.T) {
+test_read_keeps_a_long_line_whole :: proc(t: ^testing.T) {
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
@@ -610,8 +610,8 @@ test_read_returns_a_long_line_whole :: proc(t: ^testing.T) {
 
 	result := tool_run(t, &test, TOOL_READ_NAME, `{"path":"long.txt"}`)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, !strings.contains(result.content, "truncated: true\n"), "a whole file must not report truncation")
-	testing.expect(t, strings.contains(result.content, long), "the line must be returned whole")
+	testing.expect(t, !strings.contains(result.content, "truncated: true\n"), "the read itself took the whole file")
+	testing.expect(t, strings.contains(budget_test_kept_file(t, result.content), long), "the line must be kept whole")
 }
 
 // --- timeout policy ------------------------------------------------------------

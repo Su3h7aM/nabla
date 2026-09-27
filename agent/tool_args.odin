@@ -15,7 +15,6 @@ Tool_Kind :: enum {
 	Shell,
 	List_Skills,
 	Load_Skill,
-	Result_Read,
 	Compact,
 	Codemode,
 	MCP,
@@ -33,7 +32,6 @@ Tool_Args :: union {
 	Shell_Args,
 	List_Skills_Args,
 	Load_Skill_Args,
-	Result_Read_Args,
 	Codemode_Args,
 }
 
@@ -70,12 +68,6 @@ Load_Skill_Args :: struct {
 	name: string,
 }
 
-Result_Read_Args :: struct {
-	call_seq: int,
-	offset:   int,
-	limit:    int,
-}
-
 // Codemode_Args is one Lua program. A zero timeout means none.
 Codemode_Args :: struct {
 	code:    string,
@@ -99,8 +91,6 @@ tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object
 		return tool_list_skills_args(ctx, object)
 	case .Load_Skill:
 		return tool_load_skill_args(ctx, object)
-	case .Result_Read:
-		return tool_result_read_args(ctx, object)
 	case .Compact:
 		return nil, tool_fields_known(object, nil, allocator = ctx.allocator)
 	case .Codemode:

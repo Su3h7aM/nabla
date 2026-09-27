@@ -410,9 +410,8 @@ test_codemode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 	testing.expect(t, found, "the script should have answered its call")
 }
 
-// A script's result says what the script did. The summaries are what make a child's full
-// result reachable: the model reads it back from call_seq with context_read_result, so a
-// script that ran a hundred calls does not put a hundred results into the conversation.
+// A script's result says what the script did: one summary line per call, so a script that
+// ran a hundred calls does not put a hundred results into the conversation.
 @(test)
 test_codemode_reports_what_its_script_did :: proc(t: ^testing.T) {
 	test: Tool_Test
@@ -459,26 +458,6 @@ test_codemode_reports_what_its_script_did :: proc(t: ^testing.T) {
 		want := fmt.tprintf("call: %d test_child success", seq)
 		testing.expectf(t, strings.contains(content, want), "%s should carry %s", content, want)
 	}
-
-	// The whole point of naming the sequence: a child's full result is reachable by it,
-	// so a script can return a small answer and the model can still read back the one
-	// result it wants.
-	reader := Result_Reader {
-		store      = chat.store,
-		session_id = chat.id,
-	}
-	reader_ctx := Tool_Context {
-		call_id   = "call_read",
-		allocator = context.allocator,
-		results   = &reader,
-	}
-	read_arguments := make(json.Object, context.temp_allocator)
-	defer delete(read_arguments)
-	read_arguments["call_seq"] = json.Integer(child_seqs[0])
-	page := tool_test_execute(&reader_ctx, TOOL_RESULT_READ_DEFINITION, read_arguments)
-	defer tool_result_destroy(&page)
-	testing.expect_value(t, page.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(page.content, "ok\n"), page.content)
 }
 
 // A worker-placed call runs on its own thread: the test thread keeps going while the

@@ -582,30 +582,6 @@ entries_read :: proc(store: ^Store, sql: string, args: []db.Value, skip_partial_
 	return entries_scan(&rows, skip_partial_assistant, allocator)
 }
 
-// tool_result_read returns the result stored for one tool call. A result the model
-// was shown only a handle for is still in the record in full, so this is what reads
-// it back. found is false when the call has no result, which is a different fact
-// from a read that failed. The entry is owned by allocator.
-tool_result_read :: proc(store: ^Store, id: Session_Id, call_seq: Seq, allocator := context.allocator) -> (entry: Entry, found: bool, err: Error) {
-	if call_seq <= 0 { return {}, false, error_make(.Invalid_Argument, "a result read needs the call sequence") }
-	rows, read_err := entries_read(store, TOOL_RESULT_SELECT, {db.Value(string(id)), db.Value(i64(call_seq))}, false, allocator)
-	if read_err != nil { return {}, false, read_err }
-	if len(rows) == 0 {
-		delete(rows)
-		return {}, false, nil
-	}
-	// One call has at most one result, so the rest of the slice is released here and
-	// the single row is handed to the caller.
-	entry = rows[0]
-	for row, i in rows {
-		if i == 0 { continue }
-		remaining := row
-		entry_destroy(&remaining, allocator)
-	}
-	delete(rows)
-	return entry, true, nil
-}
-
 @(private)
 entries_scan :: proc(rows: ^db.Rows, skip_partial_assistant: bool, allocator: mem.Allocator) -> ([]Entry, Error) {
 	entries := make([dynamic]Entry, 0, allocator)
@@ -676,11 +652,6 @@ ENTRY_COLUMNS :: `seq, turn_no, request_no, created_at_ms, kind, related_seq, pa
 
 @(private)
 ENTRY_SELECT_RANGE :: `SELECT ` + ENTRY_COLUMNS + ` FROM entries WHERE session_id = ?`
-
-// TOOL_RESULT_SELECT reads the result of one call. The kind is named so a dispatch
-// entry, which shares the related sequence, can never be mistaken for a result.
-@(private)
-TOOL_RESULT_SELECT :: `SELECT ` + ENTRY_COLUMNS + ` FROM entries WHERE session_id = ? AND related_seq = ? AND kind = 'tool_result'`
 
 @(private)
 ENTRY_SELECT_KIND :: `SELECT kind, turn_no FROM entries WHERE session_id = ? AND seq = ?`

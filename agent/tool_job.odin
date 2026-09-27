@@ -183,9 +183,6 @@ Tool_Jobs :: struct {
 	// budget decides what each result may put into the model's context. It is taken in
 	// submission order, so a batch spends the window in the order the model asked.
 	budget:           Tool_Budget,
-	// render is the reader owner-placed tools use to read kept results back. It lives
-	// here, not in a frame, so a job can borrow it for its whole life.
-	render:           Result_Reader,
 	// abandoned is the session's list of jobs whose workers ignored their stop, borrowed.
 	// Destroying the table moves its abandoned jobs there, and they block only their own
 	// external lane.
@@ -199,10 +196,6 @@ tool_jobs_init :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, capacity: int, wor
 	jobs.worker_allocator = worker_allocator
 	jobs.abandoned = &chat.abandoned_jobs
 	jobs.jobs = make([dynamic]^Tool_Job, 0, capacity, chat.allocator)
-	jobs.render = Result_Reader {
-		store      = chat.store,
-		session_id = chat.id,
-	}
 	jobs.budget = chat_tool_budget_open(chat, len(chat.pending_calls))
 }
 
@@ -404,12 +397,9 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	job.exec.control = {
 		interrupt = &job.interrupt,
 	}
-	// A worker must not reach the session's storage, and it does not have to: the
-	// tools that read a kept result or change the context are owner-placed.
-	if definition.placement == .Owner {
-		job.exec.compact = &chat.compact
-		job.exec.results = &jobs.render
-	}
+	// A worker must not reach the session's state, and it does not have to: the tool that
+	// changes the context is owner-placed.
+	if definition.placement == .Owner { job.exec.compact = &chat.compact }
 
 	// A provider call is admitted here, from the text it arrived as. A Lua child call arrives
 	// admitted, because its value came from Lua and was checked where it was read.
@@ -774,12 +764,11 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 	if sync.atomic_load(&job.published) { return }
 	message := fmt.tprintf("the tool did not stop within %v of its stop being requested; its outcome is unknown", TOOL_JOBS_STOP_PATIENCE)
 	result := tool_result_failure(&job.exec, .Unknown, message, "did not stop")
-	spilled := false
 	result_seq: session.Seq
 	recorded := false
 	if !result.allocation_failed {
-		if !job.nested { spilled = !tool_budget_take(&jobs.budget, result.content) }
-		result_seq, recorded = chat_record_tool_result(chat, job.call, &result, spilled)
+		if !job.nested { tool_result_keep(&result, &jobs.budget, chat_tool_output_path(chat, i64(job.call.seq))) }
+		result_seq, recorded = chat_record_tool_result(chat, job.call, &result)
 	}
 
 	tool_jobs_mark_abandoned(jobs, job)
@@ -847,12 +836,10 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 		if jobs.stop == .None { jobs.stop = .Storage_Failed }
 		return
 	}
-	// The budget decides whether the model is shown this result or a handle for it.
-	// The decision is made once, here, and stored: a request built later sends the
-	// same bytes however much the context has grown by then.
-	spilled := false
-	if !job.nested { spilled = !tool_budget_take(&jobs.budget, result.content) }
-	result_seq, recorded := chat_record_tool_result(chat, job.call, &result, spilled)
+	// The budget decides how much of this result the model is shown; the rest goes to a
+	// file. The decision is stored, so a request built later sends the same bytes.
+	if !job.nested { tool_result_keep(&result, &jobs.budget, chat_tool_output_path(chat, i64(job.call.seq))) }
+	result_seq, recorded := chat_record_tool_result(chat, job.call, &result)
 	if !recorded {
 		// The result cannot be recorded, so it must not be reported as if it were.
 		tool_result_destroy(&result)
@@ -868,11 +855,10 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 		codemode_job_child_committed(jobs, job, &result)
 	}
 
-	committed := [4]Log_Field {
+	committed := [3]Log_Field {
 		{key = "tool", value = job.name},
 		{key = "outcome", value = session.tool_outcome_name(result.outcome)},
 		{key = "result_seq", value = i64(result_seq)},
-		{key = "spilled", value = spilled},
 	}
 	log_emit({level = .Info, category = .Tool, event = "tool.result_committed", fields = committed[:]})
 	_observer_tool_result(observer, job.name, &result)

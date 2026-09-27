@@ -35,9 +35,6 @@ TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms"}
 // TOOL_SHELL_DEFAULT_TIMEOUT applies when the model gives no timeout. There is no maximum.
 TOOL_SHELL_DEFAULT_TIMEOUT :: 120 * time.Second
 
-TOOL_MAX_STDOUT_BYTES :: 24 * 1024
-TOOL_MAX_STDERR_BYTES :: 24 * 1024
-
 // tool_shell_definition is the shell tool, described for the shell this process
 // will run: the shell decides the syntax the model has to write, and the tool does
 // not translate between shells. The caller owns the description it returns and
@@ -162,41 +159,20 @@ tool_shell_not_started :: proc(ctx: ^Tool_Context, cause: os.Error, data: Shell_
 // tool_shell_finish sanitizes the captured streams to valid UTF-8 and builds the result.
 tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, message: string, captured: Shell_Output, reason := "") -> Tool_Result {
 	data := captured
-	stdout_sanitized, stdout_cut := tool_sanitize_stream(data.stdout, TOOL_MAX_STDOUT_BYTES, ctx.allocator)
+	stdout_sanitized := tool_sanitize_stream(data.stdout, ctx.allocator)
 	defer delete(stdout_sanitized, ctx.allocator)
-	stderr_sanitized, stderr_cut := tool_sanitize_stream(data.stderr, TOOL_MAX_STDERR_BYTES, ctx.allocator)
+	stderr_sanitized := tool_sanitize_stream(data.stderr, ctx.allocator)
 	defer delete(stderr_sanitized, ctx.allocator)
 	data.stdout = stdout_sanitized
 	data.stderr = stderr_sanitized
-	data.stdout_truncated = data.stdout_truncated || stdout_cut
-	data.stderr_truncated = data.stderr_truncated || stderr_cut
 	return tool_result_of(ctx, outcome, message, data, reason)
 }
 
-// tool_truncate_runes returns the longest prefix of s that is at most limit
-// bytes and ends on a rune boundary. s must already be valid UTF-8.
-@(private)
-tool_truncate_runes :: proc(s: string, limit: int) -> string {
-	if limit >= len(s) { return s }
-	end := limit
-	for end > 0 && s[end] & 0xC0 == 0x80 { end -= 1 }
-	return s[:end]
-}
-
-// tool_sanitize_stream caps a captured stream, ends it on a rune boundary, and
-// replaces bytes that would make the result invalid text. A tool result is read
-// by a model, so invalid UTF-8 and control bytes become the replacement
+// tool_sanitize_stream replaces bytes that would make the result invalid text. A tool
+// result is read by a model, so invalid UTF-8 and control bytes become the replacement
 // character instead of reaching the provider.
-tool_sanitize_stream :: proc(raw: string, limit: int, allocator := context.allocator) -> (string, bool) {
-	truncated := len(raw) > limit
-	end := len(raw)
-	if end > limit { end = limit }
-	for end > 0 {
-		_, width := utf8.decode_last_rune_in_string(raw[:end])
-		if width > 0 { break }
-		end -= 1
-	}
-	valid, _ := strings.to_valid_utf8(raw[:end], "\ufffd", allocator)
+tool_sanitize_stream :: proc(raw: string, allocator := context.allocator) -> string {
+	valid, _ := strings.to_valid_utf8(raw, "\ufffd", allocator)
 	defer delete(valid, allocator)
 	builder := strings.builder_make(allocator)
 	for r in valid {
@@ -208,7 +184,7 @@ tool_sanitize_stream :: proc(raw: string, limit: int, allocator := context.alloc
 			strings.write_rune(&builder, r)
 		}
 	}
-	return strings.to_string(builder), truncated
+	return strings.to_string(builder)
 }
 
 tool_resolve_path :: proc(workspace, path: string, field := "path", allocator := context.allocator) -> (string, Tool_Argument_Error) {

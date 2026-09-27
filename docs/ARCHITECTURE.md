@@ -34,7 +34,7 @@ The harness gets out of the model's way. It adds no limit of its own, and it tur
 A limit exists only when an external constraint imposes it: the provider or its API (request size, rate, error responses), the model (context window, maximum output), a protocol (a frame format, a JSON-RPC rule), or the operating system (memory, file descriptors, process limits). Nabla and its packages never invent a cap on tool arguments, tool output, calls per response, requests per turn, retries, script size, instruction counts, or execution time. `http`, `sse`, `ai`, `mcp`, and `acp` report what the peer sent in full; they do not refuse data for being large.
 
 - A limit is data from its source: a catalog fact (`context_window`, `max_output`), a provider refusal classified by `ai`, or an OS error. A constant in source that caps model-driven work is a defect.
-- The context window is the one limit the harness applies before sending, because it is the model's own. Large content is kept whole and projected within it through previews and handles (section 14.3); the bytes are never discarded.
+- The context window is the one limit the harness applies before sending, because it is the model's own. Large content is kept whole in a file and the model is shown a preview that names it (section 14.3); the bytes are never discarded.
 - A timeout is a default the model may override with any value, never a maximum. A model-supplied timeout is honored as given.
 - Internal buffers (view queue, diagnostic ring, journal batch) size memory, not work. When one fills, the producer degrades its own output (drops a redraw delta and resyncs, drops a diagnostic line and counts it) and never refuses or truncates model-visible data.
 - Hooks, config, and material metadata run user code on the owner or the watcher. Their wall-time bound (section 17) keeps those threads responsive; it is a system constraint on the harness's own threads, not a limit on the model.
@@ -690,7 +690,6 @@ The registry is built, validated (names, schemas, collisions), and sorted inside
 | `skill_load` | Read(skill file) | Worker |
 | `task_run` | None | Lua |
 | `agent_spawn` (main sessions only) | Read(all) or Process, by scope | Child_Process |
-| `context_read_result` | Session | Owner |
 | `context_compact` | Session | Owner |
 | MCP tools `<server>_<tool>` | External(client lane) | Worker |
 
@@ -715,8 +714,9 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 - `Tool_Result :: struct { outcome: Outcome, failure: Maybe(Failure), output: Tool_Output }` is typed and lives in the job arena until committed.
 - At commit the owner renders the model-visible bytes once with the tool's `render` procedure and stores them in the `tool.completed` body; typed fields go to `data`. The projection uses those stored bytes from then on, so resume and cache stay byte-stable. Lua parents receive typed values converted from `Tool_Output`, never the rendering.
 - Rendering format: first line `ok` or `error <kind>: <message>`, then tool-specific `key: value` lines, then a blank line and the raw body (file text, stdout and stderr sections). Raw text avoids JSON escaping inside provider JSON; the format is kept only while measured tokens per successful task confirm it.
-- Retention: the journal keeps every result whole. Output beyond `TOOL_RESULT_INLINE_BYTES` is stored as an artifact and referenced from the record; the tool streams it there instead of holding it in memory.
-- Context budget: a batch charges root results in call order against the room left in the context, reserving `TOOL_RESULT_HANDLE_TOKENS` for each later result. A result that does not fit projects a head and tail preview within its allowance plus a handle line naming the call and total bytes. `context_read_result{call, offset}` pages the retained bytes in UTF-8-safe windows. The allowance is stored with the result, so later requests project identical bytes.
+- Retention: a result is never discarded. One larger than what the model is shown is written whole to `$XDG_STATE_HOME/nabla/tool-output/<session>/<call_seq>.txt`, which outlives the process so a resumed session can still read it. The journal stores the text the model was shown. If the file cannot be written, the result is sent whole instead.
+- Preview: the model is shown at most `TOOL_RESULT_PREVIEW_BYTES` of one result, cut at a line break, followed by a notice with the shown and total byte counts and the file path. The model reads the rest with `builtin_read`; there is no separate result-reading tool.
+- Context budget: a batch charges root results in call order against the room left in the context, reserving `TOOL_RESULT_NOTICE_TOKENS` for each later result, and a result's preview shrinks to its allowance, down to the notice alone. The decision is stored with the result, so later requests project identical bytes.
 
 ### 14.4 Native tools
 
@@ -986,8 +986,8 @@ These values schedule work, size internal buffers, and time the harness's own th
 | `SHELL_KILL_GRACE` | 500 ms | TERM to KILL |
 | shell timeout | 120 s | default when the model gives none; no maximum |
 | read window | 2000 lines | default when the model gives none; no maximum |
-| `TOOL_RESULT_INLINE_BYTES` | 64 KiB | journal row versus artifact storage |
-| `TOOL_RESULT_HANDLE_TOKENS` | 64 | context reserved per later result in a batch |
+| `TOOL_RESULT_PREVIEW_BYTES` | 32 KiB | what one result shows the model; the rest is kept in a file |
+| `TOOL_RESULT_NOTICE_TOKENS` | 128 | context reserved per later result in a batch |
 | `LUA_SLICE_INSTRUCTIONS` | 10,000 | scheduling quantum |
 | `LUA_HOST_RESERVE` | 64 KiB | host headroom inside a quota |
 | `LUA_HOOK_MEMORY` / `_WALL` | 4 MiB / 100 ms | keeps the owner responsive |
@@ -1023,7 +1023,7 @@ A default changes only with a measurement from the journal or a benchmark test. 
 | JSONL run logs, segments, retention, `log_read` | journal records, diag ring, SQL views, artifacts |
 | TUI 50 ms input poll | `ppoll` with the view eventfd |
 | `http/client` 50 ms `WAIT_SLICE` probe checks, `SHUTDOWN_JOIN_POLL` | one wait on the socket or thread and a stop wake, with a real deadline as the only timeout |
-| result and output caps (`TOOL_MAX_RESULT_BYTES`, the read window cap, Lua log and message caps) | whole results projected through the context budget (section 14.3) |
+| Lua log and message caps | whole results previewed and kept through section 14.3 |
 | one native lane, so native Code Mode children run one at a time | access-class scheduler |
 | a result rendered where the executor built it | typed output kept until commit, rendered once at commit |
 | instruction snapshot frozen per session | snapshot per turn from live config, digests recorded |
