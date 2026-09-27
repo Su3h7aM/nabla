@@ -54,6 +54,8 @@ MIGRATION_1 := [?]string {
 	`CREATE INDEX records_session_seq ON records (session, seq)`,
 	`CREATE INDEX records_session_call ON records (session, call) WHERE call IS NOT NULL`,
 	`CREATE INDEX records_session_kind_seq ON records (session, kind, seq)`,
+	`CREATE INDEX records_session_node ON records (session, node) WHERE node IS NOT NULL`,
+	`CREATE INDEX records_session_request ON records (session, request) WHERE request IS NOT NULL`,
 	`CREATE TABLE nodes (
 		session BLOB NOT NULL CHECK (length(session) = 16),
 		node    INTEGER NOT NULL,

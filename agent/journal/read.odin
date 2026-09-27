@@ -7,12 +7,14 @@ import "core:strings"
 import "nabla:db"
 
 // Filter selects records to read. A zero field means "any"; an empty kinds set
-// means every kind.
+// means every kind, and an empty node list means any node.
 Filter :: struct {
 	session: Session_Id,
 	kinds:   bit_set[Record_Kind;u128],
 	turn:    Turn_Id,
+	request: Request_Id,
 	call:    Call_Id,
+	nodes:   []Node_Id,
 }
 
 // Session_Filter selects sessions to list. The zero value lists every session
@@ -52,15 +54,17 @@ Branch_Summary :: struct {
 	seq:            Journal_Seq,
 }
 
-// READ_RECORDS_MAX_ARGS is the most arguments read_records builds: the cursor,
-// the session, one per kind, the turn, the call, and the page.
-@(private)
-READ_RECORDS_MAX_ARGS :: 2 + len(Record_Kind) + 3
-
 // read_records returns the records of one session in commit order: those with a
 // seq above `after`, at most `page` of them, and the seq of the last row read.
 // With nothing to return that seq is `after`, so a caller continues from the
 // same position. A page of zero or less reads every matching record.
+//
+// The filter's node list is the long one: a projection names every Assistant
+// node of the session, which can be hundreds of ids. Its bound arguments are
+// therefore one temp-allocated array sized from the filter, because the list is
+// as long as the session's own history and no fixed array is. SQLite's ceiling
+// on host parameters, 32766 by default, stays the only bound, and hundreds of
+// nodes is far below it.
 //
 // Every string and every body of the result is owned by allocator. Release the
 // result with records_destroy.
@@ -68,44 +72,21 @@ READ_RECORDS_MAX_ARGS :: 2 + len(Record_Kind) + 3
 read_records :: proc(j: ^Journal, f: Filter, after: Journal_Seq, page: int, allocator: mem.Allocator) -> ([]Record, Journal_Seq, Error) {
 	if !j.open { return nil, after, Journal_Error.Invalid_State }
 
+	// The filter is a local because a bound value aliases what it names: the
+	// session id has to stay put until the query has read it, and a procedure
+	// parameter has no address to borrow.
+	filter := f
+	args, args_err := make([]db.Value, 1 + filter_arguments(filter) + 1, context.temp_allocator)
+	if args_err != nil { return nil, after, args_err }
+
 	builder := strings.builder_make(context.temp_allocator)
 	strings.write_string(&builder, "SELECT ")
 	strings.write_string(&builder, RECORD_COLUMNS)
 	strings.write_string(&builder, " FROM records WHERE seq > ?")
-	args: [READ_RECORDS_MAX_ARGS]db.Value
 	count := 0
 	args[count] = db.Value(i64(after))
 	count += 1
-
-	session := f.session
-	if !session_id_is_absent(session) {
-		strings.write_string(&builder, " AND session = ?")
-		args[count] = db.Value(session[:])
-		count += 1
-	}
-	if card(f.kinds) > 0 {
-		strings.write_string(&builder, " AND kind IN (")
-		first := true
-		for kind in Record_Kind {
-			if kind not_in f.kinds { continue }
-			if !first { strings.write_string(&builder, ", ") }
-			first = false
-			strings.write_string(&builder, "?")
-			args[count] = db.Value(RECORD_KIND_NAMES[kind])
-			count += 1
-		}
-		strings.write_string(&builder, ")")
-	}
-	if f.turn != 0 {
-		strings.write_string(&builder, " AND turn = ?")
-		args[count] = db.Value(i64(f.turn))
-		count += 1
-	}
-	if f.call != 0 {
-		strings.write_string(&builder, " AND call = ?")
-		args[count] = db.Value(i64(f.call))
-		count += 1
-	}
+	count += write_filter(&builder, args[count:], &filter)
 	strings.write_string(&builder, " ORDER BY seq ASC")
 	if page > 0 {
 		strings.write_string(&builder, " LIMIT ?")
@@ -139,6 +120,43 @@ read_records :: proc(j: ^Journal, f: Filter, after: Journal_Seq, page: int, allo
 
 	transferred = true
 	return records[:], last, nil
+}
+
+// read_latest returns the matching record with the highest seq, and false when
+// no record matches. It is how a reader finds the current value of a fact that
+// later records replace: a session's selection, its title, or the instructions
+// of its latest turn.
+//
+// Every string and body of the record is owned by allocator. Release it with
+// record_destroy.
+@(require_results)
+read_latest :: proc(j: ^Journal, f: Filter, allocator: mem.Allocator) -> (Record, bool, Error) {
+	if !j.open { return {}, false, Journal_Error.Invalid_State }
+
+	filter := f
+	args, args_err := make([]db.Value, filter_arguments(filter), context.temp_allocator)
+	if args_err != nil { return {}, false, args_err }
+
+	builder := strings.builder_make(context.temp_allocator)
+	strings.write_string(&builder, "SELECT ")
+	strings.write_string(&builder, RECORD_COLUMNS)
+	strings.write_string(&builder, " FROM records WHERE 1 = 1")
+	count := write_filter(&builder, args, &filter)
+	strings.write_string(&builder, " ORDER BY seq DESC LIMIT 1")
+
+	rows: db.Rows
+	if err := db.query(&j.conn, &rows, strings.to_string(builder), args[:count]); err != nil {
+		return {}, false, err
+	}
+	defer db.rows_close(&rows)
+
+	values, has_row, next_err := db.rows_next(&rows)
+	if next_err != nil { return {}, false, next_err }
+	if !has_row { return {}, false, nil }
+
+	record, record_err := scan_record(j, values, allocator)
+	if record_err != nil { return {}, false, record_err }
+	return record, true, nil
 }
 
 // read_ancestry returns the nodes a projection walks from head, oldest first.
@@ -213,6 +231,122 @@ read_ancestry :: proc(j: ^Journal, s: Session_Id, head: Node_Id, allocator: mem.
 
 	transferred = true
 	return nodes[:], nil
+}
+
+// session_head returns the branch a session is on and the node it is at. The
+// active branch is the one the latest `branch.selected` record names, or the
+// session's initial branch when none does. The head is the highest node on that
+// branch, or the branch's base node when the branch holds no node yet.
+@(require_results)
+session_head :: proc(j: ^Journal, s: Session_Id) -> (Branch_Id, Node_Id, Error) {
+	if !j.open { return 0, 0, Journal_Error.Invalid_State }
+
+	owner := s
+	args := [4]db.Value{db.Value(owner[:]), db.Value(i64(INITIAL_BRANCH)), db.Value(owner[:]), db.Value(owner[:])}
+	rows: db.Rows
+	if err := db.query(&j.conn, &rows, SESSION_HEAD_QUERY, args[:]); err != nil { return 0, 0, err }
+	defer db.rows_close(&rows)
+
+	values, has_row, next_err := db.rows_next(&rows)
+	if next_err != nil { return 0, 0, next_err }
+	if !has_row { return 0, 0, corrupt_row(j, s, 0) }
+	branch, branch_err := db.as_i64(values[0])
+	if branch_err != nil { return 0, 0, corrupt_row(j, s, 0) }
+	head, head_err := db.as_i64(values[1])
+	if head_err != nil { return 0, 0, corrupt_row(j, s, 0) }
+	return Branch_Id(branch), Node_Id(head), nil
+}
+
+// read_artifact returns the bytes stored under digest, and false when the
+// journal holds no row for it. The bytes are owned by allocator.
+@(require_results)
+read_artifact :: proc(j: ^Journal, digest: Digest, allocator: mem.Allocator) -> ([]u8, bool, Error) {
+	if !j.open { return nil, false, Journal_Error.Invalid_State }
+
+	key := digest
+	rows: db.Rows
+	if err := db.query(&j.conn, &rows, ARTIFACT_SELECT_ONE, {db.Value(key[:])}); err != nil {
+		return nil, false, err
+	}
+	defer db.rows_close(&rows)
+
+	values, has_row, next_err := db.rows_next(&rows)
+	if next_err != nil { return nil, false, next_err }
+	if !has_row { return nil, false, nil }
+	bytes, bytes_ok := clone_bytes(values[0], allocator)
+	if !bytes_ok { return nil, false, Journal_Error.Corrupt }
+	return bytes, true, nil
+}
+
+// Usage_Totals is what a session's committed responses reported. A request
+// contributes to a sum only when it reported that number, so each sum rests on
+// the requests that measured it. paired_input and paired_read are the sums over
+// the requests that reported both, which is the only population a hit rate may
+// be measured from.
+Usage_Totals :: struct {
+	requests:        int,
+	paired_requests: int,
+	input:           i64,
+	output:          i64,
+	cache_read:      i64,
+	cache_write:     i64,
+	paired_input:    i64,
+	paired_read:     i64,
+}
+
+// usage_totals sums the token counts the session's committed responses
+// reported. A count the provider did not report is absent, not zero, so it
+// stays out of that sum and out of the paired population.
+@(require_results)
+usage_totals :: proc(j: ^Journal, s: Session_Id) -> (Usage_Totals, Error) {
+	if !j.open { return {}, Journal_Error.Invalid_State }
+
+	owner := s
+	rows: db.Rows
+	if err := db.query(&j.conn, &rows, USAGE_TOTALS_QUERY, {db.Value(owner[:])}); err != nil { return {}, err }
+	defer db.rows_close(&rows)
+
+	values, has_row, next_err := db.rows_next(&rows)
+	if next_err != nil { return {}, next_err }
+	if !has_row || len(values) < USAGE_TOTALS_COLUMNS { return {}, corrupt_row(j, s, 0) }
+
+	numbers: [USAGE_TOTALS_COLUMNS]i64
+	for i in 0 ..< USAGE_TOTALS_COLUMNS {
+		number, number_err := db.as_i64(values[i])
+		if number_err != nil { return {}, corrupt_row(j, s, 0) }
+		numbers[i] = number
+	}
+	return Usage_Totals {
+			requests = int(numbers[0]),
+			paired_requests = int(numbers[1]),
+			input = numbers[2],
+			output = numbers[3],
+			cache_read = numbers[4],
+			cache_write = numbers[5],
+			paired_input = numbers[6],
+			paired_read = numbers[7],
+		},
+		nil
+}
+
+// cache_hit_rate is the token-weighted share of reported input the provider
+// read from its cache. It counts a session, not a request, because one
+// request's ratio says more about where it sits in the conversation than about
+// how much of the prefix was reused. Only the requests that reported both an
+// input total and a cache-read count are measured, which is what cache_coverage
+// makes visible.
+cache_hit_rate :: proc(totals: Usage_Totals) -> (rate: f64, measured: bool) {
+	if totals.paired_requests == 0 || totals.paired_input <= 0 { return 0, false }
+	if totals.paired_read > totals.paired_input { return 0, false }
+	return f64(totals.paired_read) / f64(totals.paired_input), true
+}
+
+// cache_coverage is the share of reported input tokens the hit rate rests on. A
+// rate from part of a session is a rate for that part, and a reader that cannot
+// see the coverage cannot tell the difference.
+cache_coverage :: proc(totals: Usage_Totals) -> (share: f64, measured: bool) {
+	if totals.input <= 0 { return 0, false }
+	return f64(totals.paired_input) / f64(totals.input), true
 }
 
 // SESSION_LIST_MAX_ARGS is the most arguments list_sessions builds: the
@@ -412,6 +546,134 @@ ORDER BY branches.branch ASC`
 
 @(private)
 NODE_SELECT_ONE :: `SELECT session, node, parent, branch, kind, turn, covers, seq, data, body FROM nodes WHERE session = ? AND node = ?`
+
+@(private)
+ARTIFACT_SELECT_ONE :: `SELECT bytes FROM artifacts WHERE digest = ?`
+
+// SESSION_HEAD_QUERY resolves a session's active branch and the node it is at.
+// The branch is the one the latest branch.selected record names, or the initial
+// branch; the head is the highest node on it, or the branch's base node when it
+// holds no node yet.
+@(private)
+SESSION_HEAD_QUERY :: `WITH active AS (
+	SELECT COALESCE(
+		(SELECT records.branch FROM records
+			WHERE records.session = ? AND records.kind = 'branch.selected' AND records.branch IS NOT NULL
+			ORDER BY records.seq DESC LIMIT 1),
+		?) AS branch
+)
+SELECT active.branch,
+	COALESCE(
+		(SELECT MAX(nodes.node) FROM nodes WHERE nodes.session = ? AND nodes.branch = active.branch),
+		(SELECT branches.base_node FROM branches WHERE branches.session = ? AND branches.branch = active.branch),
+		0)
+FROM active`
+
+// USAGE_TOTALS_COLUMNS is how many columns USAGE_TOTALS_QUERY returns, in the
+// order Usage_Totals reads them.
+@(private)
+USAGE_TOTALS_COLUMNS :: 8
+
+// USAGE_TOTALS_QUERY sums the token counts the session's committed responses
+// reported, read straight out of their payloads. A count the provider never
+// reported is JSON null, so it is SQL NULL, and a sum and a count both skip it:
+// an unmeasured number never enters a total as zero. paired_input and
+// paired_read are summed over the same requests paired_requests counts, so a
+// rate and the population it rests on cannot disagree.
+@(private)
+USAGE_TOTALS_QUERY :: `WITH reported AS (
+	SELECT json_extract(records.data, '$.input_tokens') IS NOT NULL
+			AND json_extract(records.data, '$.output_tokens') IS NOT NULL
+			AND json_extract(records.data, '$.cache_read_tokens') IS NOT NULL
+			AND json_extract(records.data, '$.cache_write_tokens') IS NOT NULL AS paired,
+		json_extract(records.data, '$.input_tokens') AS input_tokens,
+		json_extract(records.data, '$.output_tokens') AS output_tokens,
+		json_extract(records.data, '$.cache_read_tokens') AS cache_read_tokens,
+		json_extract(records.data, '$.cache_write_tokens') AS cache_write_tokens
+	FROM records
+	WHERE records.session = ? AND records.kind = 'response.committed'
+)
+SELECT COUNT(*),
+	COALESCE(SUM(paired), 0),
+	COALESCE(SUM(input_tokens), 0),
+	COALESCE(SUM(output_tokens), 0),
+	COALESCE(SUM(cache_read_tokens), 0),
+	COALESCE(SUM(cache_write_tokens), 0),
+	COALESCE(SUM(CASE WHEN paired THEN input_tokens END), 0),
+	COALESCE(SUM(CASE WHEN paired THEN cache_read_tokens END), 0)
+FROM reported`
+
+// filter_arguments is how many bound parameters a filter contributes, so a
+// caller can allocate one argument array for the whole query: the session, one
+// per kind, the turn, the request, the call, and the node list.
+@(private)
+filter_arguments :: proc(f: Filter) -> int {
+	count := 0
+	if !session_id_is_absent(f.session) { count += 1 }
+	count += card(f.kinds)
+	if f.turn != 0 { count += 1 }
+	if f.request != 0 { count += 1 }
+	if f.call != 0 { count += 1 }
+	if len(f.nodes) > 0 { count += 1 + len(f.nodes) }
+	return count
+}
+
+// write_filter appends the conditions of a filter to builder and writes their
+// values into args, returning how many it wrote. args must hold at least
+// filter_arguments(of^) values. A node list becomes one IN list of bound
+// parameters, so the query is compiled once whatever its length.
+//
+// The filter is taken by pointer because a bound value aliases what it points
+// at: the session id has to outlive the call that binds it, so the caller keeps
+// the filter in a local of its own frame rather than in a parameter.
+@(private)
+write_filter :: proc(builder: ^strings.Builder, args: []db.Value, of: ^Filter) -> int {
+	count := 0
+	if !session_id_is_absent(of.session) {
+		strings.write_string(builder, " AND session = ?")
+		args[count] = db.Value(of.session[:])
+		count += 1
+	}
+	if card(of.kinds) > 0 {
+		strings.write_string(builder, " AND kind IN (")
+		first := true
+		for kind in Record_Kind {
+			if kind not_in of.kinds { continue }
+			if !first { strings.write_string(builder, ", ") }
+			first = false
+			strings.write_string(builder, "?")
+			args[count] = db.Value(RECORD_KIND_NAMES[kind])
+			count += 1
+		}
+		strings.write_string(builder, ")")
+	}
+	if of.turn != 0 {
+		strings.write_string(builder, " AND turn = ?")
+		args[count] = db.Value(i64(of.turn))
+		count += 1
+	}
+	if of.request != 0 {
+		strings.write_string(builder, " AND request = ?")
+		args[count] = db.Value(i64(of.request))
+		count += 1
+	}
+	if of.call != 0 {
+		strings.write_string(builder, " AND call = ?")
+		args[count] = db.Value(i64(of.call))
+		count += 1
+	}
+	if len(of.nodes) > 0 {
+		strings.write_string(builder, " AND node IN (")
+		for node, i in of.nodes {
+			if i > 0 { strings.write_string(builder, ", ") }
+			strings.write_string(builder, "?")
+			args[count] = db.Value(i64(node))
+			count += 1
+		}
+		strings.write_string(builder, ")")
+	}
+	return count
+}
 
 @(private)
 ANCESTRY_HEADROOM :: 16

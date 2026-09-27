@@ -160,6 +160,7 @@ Journal :: struct {
 	node_stmt:     db.Statement,
 	branch_stmt:   db.Statement,
 	session_stmt:  db.Statement,
+	artifact_stmt: db.Statement,
 
 	// failure latches the first failure that made the journal unable to write
 	// and is what every later commit returns. failure_cause keeps the lower
@@ -247,6 +248,7 @@ close :: proc(j: ^Journal) -> Error {
 	if err := db.statement_close(&j.node_stmt); err != nil && statement_err == nil { statement_err = err }
 	if err := db.statement_close(&j.branch_stmt); err != nil && statement_err == nil { statement_err = err }
 	if err := db.statement_close(&j.session_stmt); err != nil && statement_err == nil { statement_err = err }
+	if err := db.statement_close(&j.artifact_stmt); err != nil && statement_err == nil { statement_err = err }
 	connection_err := db.close(&j.conn)
 
 	clear(&j.pending)

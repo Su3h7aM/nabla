@@ -1,5 +1,6 @@
 package journal
 
+import "core:crypto/hash"
 import "core:encoding/json"
 import "core:mem"
 import "core:mem/virtual"
@@ -24,6 +25,7 @@ Pending :: union {
 	Node,
 	Branch_Row,
 	Session_Row,
+	Artifact_Row,
 }
 
 // Branch_Row is the `branches` row of one append_branch, written after the
@@ -48,6 +50,16 @@ Session_Row :: struct {
 	role:           string, // the batch arena owns it
 }
 
+// Artifact_Row is the `artifacts` row of one put_artifact: exact bytes and what
+// they are. The digest keys it, so storing the same bytes twice writes one row.
+@(private)
+Artifact_Row :: struct {
+	digest:     Digest,
+	kind:       string, // the batch arena owns it
+	created_ms: i64,
+	bytes:      []u8, // the batch arena owns it
+}
+
 // append_record buffers one fact. The header's strings are borrowed for the
 // call, the payload is marshalled into the journal's batch arena, and the
 // record reaches the database at the next commit.
@@ -68,6 +80,9 @@ append_record :: proc(j: ^Journal, header: Record, data: $T, body: []u8 = nil) {
 	record.time_ms = now_ms()
 	record.mono_ns = now_mono_ns()
 	record.seq = 0
+	// The body is the call's own argument, as it is for a node: a header
+	// carries the correlation columns, not content.
+	record.body = body
 
 	encoded, encoded_ok := arena_json(j, data, arena)
 	if !encoded_ok { return }
@@ -131,6 +146,39 @@ append_branch :: proc(j: ^Journal, base: Node_Id) -> Branch_Id {
 	return j.counters.branch
 }
 
+// put_artifact buffers exact bytes for a record to point at by digest: a
+// prompt, an instruction set, a rendered result, a captured stream. The digest
+// is the SHA-256 of the bytes, and it is what read_artifact reads them back by.
+//
+// The insert ignores a digest the table already holds, so storing the same
+// bytes twice writes one row. The row reaches the database at the next commit,
+// with the same latching as append_record: a refused or failed append surfaces
+// at that commit, and the returned digest is absent.
+//
+// A read of a digest that was buffered but not committed does not see it.
+@(require_results)
+put_artifact :: proc(j: ^Journal, kind: string, bytes: []u8) -> Digest {
+	if append_refused(j, Session_Id{}) { return {} }
+	if kind == "" {
+		fail(j, Journal_Error.Invalid_State)
+		return {}
+	}
+
+	arena := virtual.arena_allocator(&j.batch)
+	row := Artifact_Row {
+		digest     = digest_of(bytes),
+		created_ms = now_ms(),
+	}
+	kind_text, kind_ok := arena_text(j, kind, arena)
+	if !kind_ok { return {} }
+	body, body_ok := arena_bytes(j, bytes, arena)
+	if !body_ok { return {} }
+	row.kind = kind_text
+	row.bytes = body
+	push(j, Pending(row), len(row.kind) + len(row.bytes))
+	return row.digest
+}
+
 // commit writes every buffered item in one immediate transaction and returns
 // the last seq written. Committing with nothing buffered opens no transaction
 // and returns the seq the database was last at.
@@ -170,6 +218,8 @@ commit :: proc(j: ^Journal) -> (Journal_Seq, Error) {
 			if branch_err := insert_branch(j, value, last); branch_err != nil { return fail_commit(j, branch_err) }
 		case Session_Row:
 			if session_err := insert_session(j, value); session_err != nil { return fail_commit(j, session_err) }
+		case Artifact_Row:
+			if artifact_err := insert_artifact(j, value); artifact_err != nil { return fail_commit(j, artifact_err) }
 		}
 	}
 
@@ -366,6 +416,7 @@ prepare_inserts :: proc(j: ^Journal) -> Error {
 	db.prepare(&j.conn, &j.node_stmt, NODE_INSERT) or_return
 	db.prepare(&j.conn, &j.branch_stmt, BRANCH_INSERT) or_return
 	db.prepare(&j.conn, &j.session_stmt, SESSION_INSERT) or_return
+	db.prepare(&j.conn, &j.artifact_stmt, ARTIFACT_INSERT) or_return
 	j.inserts_ready = true
 	return nil
 }
@@ -381,6 +432,9 @@ BRANCH_INSERT :: `INSERT INTO branches (session, branch, base_node, seq) VALUES 
 
 @(private)
 SESSION_INSERT :: `INSERT INTO sessions (session, created_ms, workspace, parent_session, parent_call, role) VALUES (?, ?, ?, ?, ?, ?)`
+
+@(private)
+ARTIFACT_INSERT :: `INSERT OR IGNORE INTO artifacts (digest, kind, created_ms, bytes) VALUES (?, ?, ?, ?)`
 
 // insert_record writes one record and returns the seq SQLite assigned it.
 @(private)
@@ -456,6 +510,24 @@ insert_session :: proc(j: ^Journal, session: Session_Row) -> Error {
 		db.Value(row.role),
 	}
 	return db.statement_exec(&j.session_stmt, args[:])
+}
+
+// insert_artifact writes one artifact row. The digest is the primary key, so
+// the same bytes stored twice leave one row behind.
+@(private)
+insert_artifact :: proc(j: ^Journal, artifact: Artifact_Row) -> Error {
+	row := artifact
+	args := [4]db.Value{db.Value(row.digest[:]), db.Value(row.kind), db.Value(row.created_ms), db.Value(row.bytes)}
+	return db.statement_exec(&j.artifact_stmt, args[:])
+}
+
+// digest_of is the SHA-256 of the bytes an artifact holds, which is the key it
+// is stored and read back under.
+@(private)
+digest_of :: proc(bytes: []u8) -> Digest {
+	digest: Digest
+	hash.hash_bytes_to_buffer(.SHA256, bytes, digest[:])
+	return digest
 }
 
 // insert_returning_seq runs one insert that reports the seq SQLite assigned it.

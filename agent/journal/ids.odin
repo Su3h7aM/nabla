@@ -8,7 +8,7 @@ import "core:crypto"
 // Zero means absent for every one of them, and an absent id is stored as SQL
 // NULL. A session, a run, and a subagent are 16 bytes; the rest are counters,
 // allocated by the journal (branch, node) or by the harness (turn, request,
-// call, job).
+// call, job). A digest is the 32 bytes of a SHA-256.
 Run_Id :: distinct [16]u8
 Session_Id :: distinct [16]u8
 Branch_Id :: distinct u32
@@ -20,9 +20,17 @@ Attempt_No :: distinct u8
 Job_Id :: distinct u64
 Call_Id :: distinct u64
 
+// Digest is the SHA-256 of one artifact's bytes. An artifact is stored under
+// it, so the bytes and the name they are read back by cannot drift apart.
+Digest :: distinct [32]u8
+
 // SESSION_ID_HEX_LENGTH is how many characters a session or run id takes in
 // lowercase hexadecimal.
 SESSION_ID_HEX_LENGTH :: 32
+
+// DIGEST_HEX_LENGTH is how many characters a digest takes in lowercase
+// hexadecimal.
+DIGEST_HEX_LENGTH :: 64
 
 // session_id_create returns a fresh session id from the operating system's
 // entropy source. Randomness is what makes the id unique without a lookup and
@@ -76,6 +84,32 @@ session_id_is_absent :: proc(id: Session_Id) -> bool {
 // run_id_is_absent reports whether no run is named.
 run_id_is_absent :: proc(id: Run_Id) -> bool {
 	return id == Run_Id{}
+}
+
+// digest_to_hex writes the 64 lowercase hexadecimal characters of digest into
+// buffer, which must hold at least DIGEST_HEX_LENGTH bytes, and returns them.
+// The result aliases buffer.
+digest_to_hex :: proc(digest: Digest, buffer: []u8) -> string {
+	assert(len(buffer) >= DIGEST_HEX_LENGTH, "the digest buffer is too small")
+	for byte, i in digest {
+		buffer[i * 2] = hex_character(byte >> 4)
+		buffer[i * 2 + 1] = hex_character(byte & 0x0f)
+	}
+	return string(buffer[:DIGEST_HEX_LENGTH])
+}
+
+// digest_from_hex reads a digest from its hexadecimal form. Anything but
+// exactly 64 lowercase hexadecimal characters is refused.
+digest_from_hex :: proc(text: string) -> (Digest, bool) {
+	if len(text) != DIGEST_HEX_LENGTH { return Digest{}, false }
+	bytes: [32]u8
+	for i in 0 ..< 32 {
+		high, high_ok := hex_digit(text[i * 2])
+		low, low_ok := hex_digit(text[i * 2 + 1])
+		if !high_ok || !low_ok { return Digest{}, false }
+		bytes[i] = high << 4 | low
+	}
+	return Digest(bytes), true
 }
 
 // hex_character is the lowercase hexadecimal character of a nibble.

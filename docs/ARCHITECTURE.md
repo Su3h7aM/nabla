@@ -182,6 +182,7 @@ Attempt_No   :: distinct u8      // per request
 Job_Id       :: distinct u64     // per process, monotonic, never reused
 Call_Id      :: distinct u64     // per session; provider call ids are stored separately as strings
 Snapshot_Gen :: distinct u64     // config/catalog snapshot generation
+Digest       :: distinct [32]u8  // SHA-256 of one artifact's bytes
 ```
 
 Zero means absent for every ID. IDs render as lowercase hex or decimal only at boundaries.
@@ -436,11 +437,18 @@ release        :: proc(j: ^Journal) -> Error
 append_record  :: proc(j: ^Journal, header: Record, data: $T, body: []u8 = nil) // buffered, owner-only
 append_node    :: proc(j: ^Journal, node: Node, data: $T, body: []u8 = nil) -> Node_Id
 append_branch  :: proc(j: ^Journal, base: Node_Id) -> Branch_Id
+put_artifact   :: proc(j: ^Journal, kind: string, bytes: []u8) -> Digest         // buffered; INSERT OR IGNORE by SHA-256
 commit         :: proc(j: ^Journal) -> (Journal_Seq, Error)                      // durable barrier; flushes the buffer
 flush_due      :: proc(j: ^Journal, now: time.Tick) -> Error                     // commits observations past a batch limit
 flush_deadline :: proc(j: ^Journal) -> Maybe(time.Tick)
 read_records   :: proc(j: ^Journal, f: Filter, after: Journal_Seq, page: int, allocator: mem.Allocator) -> ([]Record, Journal_Seq, Error)
+read_latest    :: proc(j: ^Journal, f: Filter, allocator: mem.Allocator) -> (Record, bool, Error) // the matching record with the highest seq
 read_ancestry  :: proc(j: ^Journal, s: Session_Id, head: Node_Id, allocator: mem.Allocator) -> ([]Node, Error) // stops at the covering checkpoint
+read_artifact  :: proc(j: ^Journal, digest: Digest, allocator: mem.Allocator) -> ([]u8, bool, Error)
+session_head   :: proc(j: ^Journal, s: Session_Id) -> (Branch_Id, Node_Id, Error)
+usage_totals   :: proc(j: ^Journal, s: Session_Id) -> (Usage_Totals, Error)
+cache_hit_rate :: proc(totals: Usage_Totals) -> (rate: f64, measured: bool)
+cache_coverage :: proc(totals: Usage_Totals) -> (share: f64, measured: bool)
 list_sessions  :: proc(j: ^Journal, f: Session_Filter, allocator: mem.Allocator) -> ([]Session_Summary, Error)
 list_branches  :: proc(j: ^Journal, s: Session_Id, allocator: mem.Allocator) -> ([]Branch_Summary, Error)
 recover        :: proc(j: ^Journal) -> (Recovery, Error)                         // the claimed session, one transaction
@@ -454,7 +462,7 @@ Records and nodes are journal-owned plain data (strings, integers, enums). `agen
 - `data` is encoded from a typed payload struct declared in `agent/journal`, one per kind, named after it (`Tool_Completed` for `tool.completed`). Records and nodes are copied into a batch arena at append, so the caller's memory is borrowed only for the call.
 - The journal allocates `Node_Id` and `Branch_Id` at append, from the counters loaded by `claim`. `Counters` also carries the highest turn, request, and call ids, so the owner continues numbering after a restart.
 - Each node append also writes a `node.committed` record in the same transaction, and the node's `seq` is that record's seq. Branches (`branch.created`) and sessions (`session.created`) follow the same rule, so the records table is the one global order.
-- `append_record`, `append_node`, and `append_branch` return no error. An encoding or allocation failure latches in the journal and is returned by the next `commit`. A failed commit rolls back and latches `Storage_Failed`: every later append is dropped and every later commit returns the latched error.
+- `append_record`, `append_node`, `append_branch`, and `put_artifact` return no error. An encoding or allocation failure latches in the journal and is returned by the next `commit`. A failed commit rolls back and latches `Storage_Failed`: every later append is dropped and every later commit returns the latched error.
 - Corrupt or unreadable data returns `.Corrupt`, and the journal keeps the session and seq of the offending row in `j.corrupt` for the message.
 
 ### 8.2 Schema
@@ -476,8 +484,9 @@ schema(version INTEGER)
 ```
 
 - Every table is append-only. Mutable facts (title, active branch, selection, ratings) are the latest record of their kind. A branch head is `max(node) WHERE branch = b`.
-- Indexes: `records(session, seq)`, `records(session, call) WHERE call IS NOT NULL`, `records(session, kind, seq)`, `nodes(session, branch, node)`.
+- Indexes: `records(session, seq)`, `records(session, call) WHERE call IS NOT NULL`, `records(session, kind, seq)`, `records(session, node) WHERE node IS NOT NULL`, `records(session, request) WHERE request IS NOT NULL`, `nodes(session, branch, node)`.
 - `data` is one JSON object per record, shaped by a versioned struct per kind (`v` field). `body` holds exact bytes. Diagnostics queries use SQLite JSON functions over `data`; analysis needs no custom decoder.
+- `body` holds what the model sees: a `User` node's is the user's text, an `Assistant` node's is the model's visible text, `tool.proposed`'s is the argument document exactly as the model sent it, `tool.admitted`'s is the arguments the tool runs with, `tool.completed`'s is the rendered result, and `response.committed`'s is the endpoint's native output items when it returned any. A `Checkpoint` node's body is its summary and a `Notice` node's is the feedback text. A Lua child's records carry a parent call and no node, so they never enter the projection or a `Results` node.
 - WAL, `synchronous = FULL`, `busy_timeout`, private 0700 directory and 0600 files. Several processes (TUI, subagent children, diagnostics readers) share the file; each session has one writer claim.
 - Migrations are explicit steps stamped in the same transaction. A newer schema is refused. Corrupt or unreadable data is a typed error naming the session and seq; the harness never guesses.
 
