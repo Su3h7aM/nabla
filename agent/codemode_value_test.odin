@@ -146,11 +146,13 @@ codemode_value_encodes_and_decodes_json :: proc(t: ^testing.T) {
 		t,
 		`local value = json.decode('{"b":"x\\n\\u00e9","a":[1,2.5,null]}')
 local ok, err = pcall(json.decode, "{")
-return json.encode(value) .. "|" .. tostring(value.a[3] == json.null) .. "|" .. tostring(ok) .. "|" .. err`,
+local _, wrapped = pcall(json.decode, "[99999999999999999999]")
+return json.encode(value) .. "|" .. tostring(value.a[3] == json.null) .. "|" .. tostring(ok) .. "|" .. err .. "|" .. wrapped`,
 	)
 	defer codemode_lua_destroy(run)
 	testing.expect_value(t, codemode_value_test_settle(run), Lua_Event.Returned)
 	value, _ := codemode_lua_returned_string(run)
 	testing.expect(t, strings.has_prefix(value, `{"a":[1,2.5,null],"b":"x\né"}|true|false|`), value)
-	testing.expect(t, strings.contains(value, "json.decode could not read the text"), value)
+	testing.expect(t, strings.contains(value, "json.decode refused the text: it is not valid JSON"), value)
+	testing.expect(t, strings.contains(value, "no 64-bit integer"), value)
 }

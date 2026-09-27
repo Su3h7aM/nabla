@@ -230,6 +230,7 @@ codemode_walk_quoted :: proc(walk: ^Codemode_Walk, text: string) -> bool {
 @(private)
 codemode_walk_table :: proc(walk: ^Codemode_Walk, table: c.int, depth: int) -> bool {
 	state := walk.state
+	// The problem is kept past this frame, so it is static text; the bound it names is TOOL_MAX_ARGS_DEPTH.
 	if depth > TOOL_MAX_ARGS_DEPTH { return codemode_walk_fail(walk, "table", "nests more than 32 levels deep") }
 	identity := lua.topointer(state, table)
 	if slice.contains(walk.inside[:depth], identity) { return codemode_walk_fail(walk, "table", "contains itself") }
@@ -388,23 +389,35 @@ codemode_lua_json_decode :: proc "c" (state: ^lua.State) -> c.int {
 	length: c.size_t
 	pointer := lua.L_checkstring(state, 1, &length)
 	temp := virtual.arena_temp_begin(&run.scratch)
-	value, parse_error := json.parse_string(string((cast([^]u8)pointer)[:length]), .JSON, true, context.temp_allocator)
-	if parse_error != nil {
-		return codemode_lua_raise(state, fmt.tprintf("json.decode could not read the text: %s", codemode_json_error_text(parse_error)), temp)
+	text := string((cast([^]u8)pointer)[:length])
+	if admit_error := tool_json_admit(text, context.temp_allocator); admit_error.kind != .None {
+		return codemode_lua_raise(
+			state,
+			strings.concatenate({"json.decode refused the text: ", codemode_json_defect_text(admit_error.kind)}, context.temp_allocator),
+			temp,
+		)
 	}
+	value, parse_error := json.parse_string(text, .JSON, true, context.temp_allocator)
+	if parse_error != nil { return codemode_lua_raise(state, "json.decode refused the text: it is not valid JSON", temp) }
 	if !codemode_json_push(run, state, value, 0) {
-		return codemode_lua_raise(state, "json.decode refused a document nested more than 32 levels deep", temp)
+		return codemode_lua_raise(state, fmt.tprintf("json.decode refused a document nested more than %d levels deep", TOOL_MAX_ARGS_DEPTH), temp)
 	}
 	virtual.arena_temp_end(temp)
 	return 1
 }
 
-// codemode_json_error_text spells a parse error as words: `Expected_String_For_Object_Key`
-// reads "expected string for object key". The text is temporary.
+// codemode_json_defect_text says what makes a text unreadable as JSON.
 @(private)
-codemode_json_error_text :: proc(parse_error: json.Error) -> string {
-	name, _ := strings.replace_all(fmt.tprint(parse_error), "_", " ", context.temp_allocator)
-	return strings.to_lower(name, context.temp_allocator)
+codemode_json_defect_text :: proc(kind: Tool_Argument_Error_Kind) -> string {
+	#partial switch kind {
+	case .Duplicate_Field:
+		return "an object repeats a field name"
+	case .Too_Deep:
+		return fmt.tprintf("it nests more than %d levels deep", TOOL_MAX_ARGS_DEPTH)
+	case .Number_Out_Of_Range:
+		return "it holds a number that no 64-bit integer or finite float can hold"
+	}
+	return "it is not valid JSON"
 }
 
 // codemode_json_push pushes a JSON document as the Lua value with the same shape. JSON null

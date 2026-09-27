@@ -261,14 +261,26 @@ tool_repairs_text :: proc(repairs: session.Tool_Repairs, allocator := context.al
 // bound. A repeated field name is refused rather than resolved: the harness will
 // not choose which of two values the model meant.
 //
-// Admission walks the tokenizer instead of calling the parser because the parser
-// both accepts trailing input and leaks on some malformed documents.
 tool_arguments_admit :: proc(raw: string, allocator: mem.Allocator) -> Tool_Argument_Error {
 	tokenizer := json.make_tokenizer(raw, .JSON, true)
 	token, token_err := json.get_token(&tokenizer)
 	if tool_token_bad(token, token_err) { return tool_argument_error(.Syntax, allocator = allocator) }
 	if token.kind != .Open_Brace { return tool_argument_error(.Not_Object, allocator = allocator) }
-	if object_error := tool_admit_object(&tokenizer, 1, allocator); object_error.kind != .None { return object_error }
+	return tool_json_admit(raw, allocator)
+}
+
+// tool_json_admit reports the first defect in a JSON document of any kind: one value alone
+// in its input, no repeated field name, no nesting past the argument bound, and no number
+// the parser cannot hold. A document it admits parses to exactly what it says.
+//
+// Admission walks the tokenizer instead of calling the parser because the parser accepts
+// trailing input, keeps one of two repeated fields, recurses before any depth check, and
+// leaks on some malformed documents.
+tool_json_admit :: proc(text: string, allocator: mem.Allocator) -> Tool_Argument_Error {
+	tokenizer := json.make_tokenizer(text, .JSON, true)
+	token, token_err := json.get_token(&tokenizer)
+	if tool_token_bad(token, token_err) { return tool_argument_error(.Syntax, allocator = allocator) }
+	if value_error := tool_admit_value(&tokenizer, token, 1, allocator); value_error.kind != .None { return value_error }
 
 	token, token_err = json.get_token(&tokenizer)
 	if (token_err != nil && token_err != .EOF) || token.kind != .EOF {
