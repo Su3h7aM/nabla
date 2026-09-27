@@ -1,15 +1,14 @@
 /*
-Package http is the HTTP/1.1 message vocabulary: methods, versions, field
-sections, request targets, framing values, and dates, each read and written
-as RFC 9110 and RFC 9112 define them. It moves no bytes; the client that does
-lives in http/client.
+Package http is HTTP/1.1 as RFC 9110 and RFC 9112 define it: the message
+grammar (methods, versions, request lines, field sections, framing values,
+URLs, dates, status codes, cookies) and a server that runs on core:nbio. The
+client lives in http/client and shares this grammar.
 */
 package http
 
 import "base:runtime"
 
 import "core:io"
-import "core:slice"
 import "core:strings"
 import "core:sync"
 
@@ -29,50 +28,37 @@ Requestline :: struct {
 	version: Version,
 }
 
-// A request-line begins with a method token, followed by a single space
-// (SP), the request-target, another single space (SP), the protocol
-// version, and ends with CRLF.
-//
-// This allocates a clone of the target, because this is intended to be used with a scanner,
-// which has a buffer that changes every read.
+// requestline_parse reads a request-line (RFC 9112 3): a method token, SP, a
+// non-empty request-target, SP, and the protocol version. The target is cloned,
+// because the line is a view into a buffer that changes on the next read.
 requestline_parse :: proc(s: string, allocator := context.temp_allocator) -> (line: Requestline, err: Requestline_Error) {
-	s := s
-
-	next_space := strings.index_byte(s, ' ')
-	if next_space == -1 { return line, .Not_Enough_Fields }
+	method_end := strings.index_byte(s, ' ')
+	if method_end <= 0 { return line, .Not_Enough_Fields }
+	rest := s[method_end + 1:]
+	target_end := strings.index_byte(rest, ' ')
+	if target_end <= 0 { return line, .Not_Enough_Fields }
 
 	ok: bool
-	line.method, ok = method_parse(s[:next_space])
-	if !ok { return line, .Method_Not_Implemented }
-	s = s[next_space + 1:]
-
-	next_space = strings.index_byte(s, ' ')
-	if next_space == -1 { return line, .Not_Enough_Fields }
-
-	line.target = strings.clone(s[:next_space], allocator)
-	s = s[len(line.target.(string)) + 1:]
-
-	line.version, ok = version_parse(s)
+	line.version, ok = version_parse(rest[target_end + 1:])
 	if !ok { return line, .Invalid_Version_Format }
-
-	return
+	line.method, ok = method_parse(s[:method_end])
+	if !ok { return line, .Method_Not_Implemented }
+	line.target = strings.clone(rest[:target_end], allocator)
+	return line, .None
 }
 
 requestline_write :: proc(w: io.Writer, rline: Requestline) -> io.Error {
-	// odinfmt:disable
-	io.write_string(w, method_string(rline.method)) or_return // <METHOD>
-	io.write_byte(w, ' ')                           or_return // <METHOD> <SP>
-
+	io.write_string(w, method_string(rline.method)) or_return
+	io.write_byte(w, ' ') or_return
 	switch t in rline.target {
-	case string: io.write_string(w, t)              or_return // <METHOD> <SP> <TARGET>
-	case URL:    request_path_write(w, t)           or_return // <METHOD> <SP> <TARGET>
+	case string:
+		io.write_string(w, t) or_return
+	case URL:
+		request_path_write(w, t) or_return
 	}
-
-	io.write_byte(w, ' ')                           or_return // <METHOD> <SP> <TARGET> <SP>
-	version_write(w, rline.version)                 or_return // <METHOD> <SP> <TARGET> <SP> <VERSION>
-	io.write_string(w, "\r\n")                      or_return // <METHOD> <SP> <TARGET> <SP> <VERSION> <CRLF>
-	// odinfmt:enable
-
+	io.write_byte(w, ' ') or_return
+	version_write(w, rline.version) or_return
+	io.write_string(w, "\r\n") or_return
 	return nil
 }
 
@@ -106,9 +92,41 @@ version_parse :: proc(s: string) -> (version: Version, ok: bool) {
 	return
 }
 
+// version_write writes the eight-octet HTTP-version (RFC 9112 2.3).
+version_write :: proc(w: io.Writer, v: Version) -> io.Error {
+	text := [8]byte{'H', 'T', 'T', 'P', '/', '0' + v.major, '.', '0' + v.minor}
+	_, err := io.write(w, text[:])
+	return err
+}
+
+version_string :: proc(v: Version, allocator := context.allocator) -> (string, runtime.Allocator_Error) #optional_allocator_error {
+	text := [8]byte{'H', 'T', 'T', 'P', '/', '0' + v.major, '.', '0' + v.minor}
+	return strings.clone(string(text[:]), allocator)
+}
+
 @(private = "package")
 is_digit :: #force_inline proc(c: byte) -> bool {
 	return c >= '0' && c <= '9'
+}
+
+// is_tchar reports whether a byte may appear in a token (RFC 9110 5.6.2).
+is_tchar :: proc(c: byte) -> bool {
+	switch c {
+	case '0' ..= '9', 'a' ..= 'z', 'A' ..= 'Z':
+		return true
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	}
+	return false
+}
+
+// token_valid reports whether text is a token: one or more tchars.
+token_valid :: proc(text: string) -> bool {
+	if text == "" { return false }
+	for i in 0 ..< len(text) {
+		if !is_tchar(text[i]) { return false }
+	}
+	return true
 }
 
 // trim_ows strips optional whitespace, which is SP and HTAB only.
@@ -120,22 +138,51 @@ trim_ows :: proc(s: string) -> string {
 	return strings.trim(s, " \t")
 }
 
-// content_length_parse reads a Content-Length as RFC 9112 6.3 defines it:
-// one or more decimal digits. A sign, whitespace, or an empty value is invalid
-// framing rather than a negative or padded body size. The arithmetic is checked
-// before multiplying so an unrepresentable value cannot become a truncated
-// count.
-content_length_parse :: proc(value: string) -> (size: int, ok: bool) {
-	(len(value) > 0) or_return
-	size = 0
-	for character in value {
-		if character < '0' || character > '9' { return 0, false }
-		digit := int(character - '0')
-		if size > (max(int) - digit) / 10 { return 0, false }
-		size = size * 10 + digit
+// list_has_token reports whether a comma-separated field value lists token,
+// compared case-insensitively, as Connection and Transfer-Encoding options are
+// (RFC 9110 5.6.1, 7.6.1).
+list_has_token :: proc(value, token: string) -> bool {
+	rest := value
+	for element in strings.split_iterator(&rest, ",") {
+		if strings.equal_fold(trim_ows(element), token) { return true }
 	}
-	ok = true
-	return
+	return false
+}
+
+// final_transfer_coding_is_chunked reports whether the last coding of a
+// Transfer-Encoding field is chunked. The final coding decides the framing, not
+// the presence of the name anywhere in the list, and coding names are
+// case-insensitive (RFC 9112 6.1 and 7).
+final_transfer_coding_is_chunked :: proc(value: string) -> bool {
+	last := value
+	if comma := strings.last_index_byte(value, ','); comma >= 0 { last = value[comma + 1:] }
+	return strings.equal_fold(trim_ows(last), "chunked")
+}
+
+// content_length_parse reads a Content-Length field value: one or more decimal
+// digits. RFC 9112 6.3 item 5 also allows a comma-separated list when every
+// member is valid and identical, in which case the message is framed by that
+// single value. A sign, differing members, or a value the machine cannot
+// represent is invalid framing rather than a body size.
+content_length_parse :: proc(value: string) -> (length: int, ok: bool) {
+	length = -1
+	rest := value
+	for part in strings.split_iterator(&rest, ",") {
+		// RFC 9110 5.6.1.2: a recipient ignores empty list elements.
+		text := trim_ows(part)
+		if text == "" { continue }
+		number := 0
+		for c in transmute([]u8)text {
+			if !is_digit(c) { return 0, false }
+			digit := int(c - '0')
+			if number > (max(int) - digit) / 10 { return 0, false }
+			number = number * 10 + digit
+		}
+		if length >= 0 && length != number { return 0, false }
+		length = number
+	}
+	if length < 0 { return 0, false }
+	return length, true
 }
 
 // chunk_size_parse reads a chunk-size as RFC 9112 7.1 defines it: one or more
@@ -164,26 +211,73 @@ chunk_size_parse :: proc(value: string) -> (size: int, ok: bool) {
 	return size, true
 }
 
-version_write :: proc(w: io.Writer, v: Version) -> io.Error {
-	io.write_string(w, "HTTP/") or_return
-	io.write_rune(w, '0' + rune(v.major)) or_return
-	if v.minor > 0 {
-		io.write_rune(w, '.')
-		io.write_rune(w, '0' + rune(v.minor))
+// chunk_line_parse reads a chunk-size line: the size and its chunk-ext
+// sequence. RFC 9112 7.1.1: a recipient ignores unrecognized extensions, but
+// the sequence still has to parse, so a line that is not a chunk ends the body
+// in failure rather than in a body framed by a guess.
+chunk_line_parse :: proc(line: string) -> (size: int, ok: bool) {
+	size_text, extensions := line, ""
+	if semi := strings.index_byte(line, ';'); semi >= 0 {
+		size_text, extensions = line[:semi], line[semi:]
 	}
-
-	return nil
+	size = chunk_size_parse(size_text) or_return
+	chunk_extensions_valid(extensions) or_return
+	return size, true
 }
 
-version_string :: proc(v: Version, allocator := context.allocator) -> string {
-	buf := make([]byte, 8, allocator)
+// chunk_extensions_valid reports whether text is a chunk-ext sequence:
+// *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] ), where a value
+// is a token or a quoted-string (RFC 9112 7.1.1). Empty text is valid.
+chunk_extensions_valid :: proc(text: string) -> bool {
+	rest := text
+	for {
+		rest = trim_ows(rest)
+		if rest == "" { return true }
+		if rest[0] != ';' { return false }
+		rest = trim_ows(rest[1:])
+		width := token_width(rest)
+		if width == 0 { return false }
+		rest = trim_ows(rest[width:])
+		if len(rest) > 0 && rest[0] == '=' {
+			rest = trim_ows(rest[1:])
+			value_width := token_width(rest) if rest == "" || rest[0] != '"' else quoted_string_width(rest)
+			if value_width == 0 { return false }
+			rest = rest[value_width:]
+		}
+	}
+}
 
-	b: strings.Builder
-	b.buf = slice.into_dynamic(buf)
+// token_width measures the token at the start of text.
+@(private)
+token_width :: proc(text: string) -> int {
+	width := 0
+	for width < len(text) && is_tchar(text[width]) { width += 1 }
+	return width
+}
 
-	version_write(strings.to_writer(&b), v)
-
-	return strings.to_string(b)
+// quoted_string_width measures the quoted-string at the start of text, and is
+// zero when there is none (RFC 9110 5.6.4).
+@(private)
+quoted_string_width :: proc(text: string) -> int {
+	if text == "" || text[0] != '"' { return 0 }
+	for i := 1; i < len(text); i += 1 {
+		c := text[i]
+		switch {
+		case c == '"':
+			return i + 1
+		case c == '\\':
+			// quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
+			i += 1
+			if i >= len(text) { return 0 }
+			escaped := text[i]
+			if escaped != '\t' && escaped != ' ' && escaped < 0x21 || escaped == 0x7F { return 0 }
+		case c == '\t' || c == ' ' || c == 0x21 || (c >= 0x23 && c <= 0x5B) || (c >= 0x5D && c <= 0x7E) || c >= 0x80:
+		// qdtext
+		case:
+			return 0
+		}
+	}
+	return 0
 }
 
 Method :: enum {
@@ -226,21 +320,19 @@ method_parse :: proc(m: string) -> (method: Method, ok: bool) {
 // header_parse adds one field line to headers and returns its lowercase name.
 // The name and value are copied with the headers' allocator.
 //
-// A repeated field is combined into one comma-separated value (RFC 9110 5.3),
-// except Host, which may appear once (RFC 9112 3.2), and Content-Length: RFC
-// 9112 6.3 makes differing repeats an unrecoverable error, and identical
-// repeats stand for the first value.
+// The field name must be a token (RFC 9110 5.1). A CR, LF, or NUL in the value
+// is replaced with SP, as RFC 9110 5.5 lets a recipient do instead of rejecting
+// the message. A repeated field is combined into one comma-separated value
+// (RFC 9110 5.3), except Host, which may appear once (RFC 9112 3.2), and
+// Content-Length: RFC 9112 6.3 makes differing repeats an unrecoverable error,
+// and identical repeats stand for the first value.
 header_parse :: proc(headers: ^Headers, line: string) -> (key: string, ok: bool) {
-	// RFC 9112 5: field-line = field-name ":" OWS field-value OWS, and a field name
-	// is a token, so a field line cannot begin with whitespace. RFC 9112 5.2 defines
-	// obs-fold as OWS CRLF RWS, and RWS is SP or HTAB, so a line beginning with
-	// either is a continuation rather than a field line.
-	(len(line) > 0 && line[0] != ' ' && line[0] != '\t') or_return
-
 	colon := strings.index_byte(line, ':')
 	(colon > 0) or_return
-	// RFC 9112 5.1: no whitespace is allowed between the field name and colon.
-	(line[colon - 1] != ' ' && line[colon - 1] != '\t') or_return
+	// RFC 9112 5.1: no whitespace is allowed between the field name and colon,
+	// and a line beginning with whitespace is an obs-fold (RFC 9112 5.2); a token
+	// holds neither.
+	token_valid(line[:colon]) or_return
 
 	// RFC 9112 5.1: the field line value excludes the optional whitespace that
 	// may precede and follow it.
@@ -254,7 +346,7 @@ header_parse :: proc(headers: ^Headers, line: string) -> (key: string, ok: bool)
 		return
 	}
 	if just_inserted {
-		cloned, clone_err := strings.clone(value, allocator)
+		cloned, clone_err := field_value_clone(value, allocator)
 		if clone_err != nil {
 			delete_key(&headers._kv, name)
 			delete(name, allocator)
@@ -265,14 +357,13 @@ header_parse :: proc(headers: ^Headers, line: string) -> (key: string, ok: bool)
 	}
 	delete(name, allocator)
 
-	// RFC 9112 3.2: a server responds 400 to a request with more than one Host
-	// field line, so a repeated Host is never combined.
 	if key_ptr^ == "host" { return }
 	if key_ptr^ == "content-length" {
 		return key_ptr^, content_length_values_equal(value_ptr^, value)
 	}
 	combined, concat_err := strings.concatenate({value_ptr^, ", ", value}, allocator)
 	if concat_err != nil { return }
+	field_value_sanitize(combined)
 	delete(value_ptr^, allocator)
 	value_ptr^ = combined
 	return key_ptr^, true
@@ -293,9 +384,26 @@ header_fold :: proc(headers: ^Headers, key, line: string) -> bool {
 	allocator := headers._kv.allocator
 	continued, concat_err := strings.concatenate({previous^, " ", value}, allocator)
 	if concat_err != nil { return false }
+	field_value_sanitize(continued)
 	delete(previous^, allocator)
 	previous^ = continued
 	return true
+}
+
+@(private)
+field_value_clone :: proc(value: string, allocator: runtime.Allocator) -> (cloned: string, err: runtime.Allocator_Error) {
+	cloned = strings.clone(value, allocator) or_return
+	field_value_sanitize(cloned)
+	return cloned, nil
+}
+
+// field_value_sanitize replaces each CR, LF, and NUL with SP (RFC 9110 5.5).
+@(private)
+field_value_sanitize :: proc(value: string) {
+	bytes := transmute([]u8)value
+	for &c in bytes {
+		if c == '\r' || c == '\n' || c == 0 { c = ' ' }
+	}
 }
 
 // content_length_values_equal reports whether two Content-Length field values
@@ -322,52 +430,42 @@ decimal_meaning :: proc(value: string) -> (meaning: string, ok: bool) {
 	return stripped, true
 }
 
-// Returns if this is a valid trailer header.
-//
-// RFC 7230 4.1.2:
-// A sender MUST NOT generate a trailer that contains a field necessary
-// for message framing (e.g., Transfer-Encoding and Content-Length),
-// routing (e.g., Host), request modifiers (e.g., controls and
-// conditionals in Section 5 of [RFC7231]), authentication (e.g., see
-// [RFC7235] and [RFC6265]), response control data (e.g., see Section
-// 7.1 of [RFC7231]), or determining how to process the payload (e.g.,
-// Content-Encoding, Content-Type, Content-Range, and Trailer).
+// header_allowed_trailer reports whether a field may be taken from a trailer
+// section. RFC 9110 6.5.1: a sender must not put a field in a trailer that is
+// needed for framing, routing, request modifiers, authentication, response
+// control data, or deciding how to process the content, and a recipient
+// ignores such a field.
 header_allowed_trailer :: proc(key: string) -> bool {
-	// odinfmt:disable
-	return (
-		// Message framing:
-		key != "transfer-encoding" &&
-		key != "content-length" &&
-		// Routing:
-		key != "host" &&
-		// Request modifiers:
-		key != "if-match" &&
-		key != "if-none-match" &&
-		key != "if-modified-since" &&
-		key != "if-unmodified-since" &&
-		key != "if-range" &&
-		// Authentication:
-		key != "www-authenticate" &&
-		key != "authorization" &&
-		key != "proxy-authenticate" &&
-		key != "proxy-authorization" &&
-		key != "cookie" &&
-		key != "set-cookie" &&
-		// Control data:
-		key != "age" &&
-		key != "cache-control" &&
-		key != "expires" &&
-		key != "date" &&
-		key != "location" &&
-		key != "retry-after" &&
-		key != "vary" &&
-		key != "warning" &&
-		// How to process:
-		key != "content-encoding" &&
-		key != "content-type" &&
-		key != "content-range" &&
-		key != "trailer")
-	// odinfmt:enable
+	switch key {
+	case "transfer-encoding",
+	     "content-length",
+	     "host",
+	     "if-match",
+	     "if-none-match",
+	     "if-modified-since",
+	     "if-unmodified-since",
+	     "if-range",
+	     "www-authenticate",
+	     "authorization",
+	     "proxy-authenticate",
+	     "proxy-authorization",
+	     "cookie",
+	     "set-cookie",
+	     "age",
+	     "cache-control",
+	     "expires",
+	     "date",
+	     "location",
+	     "retry-after",
+	     "vary",
+	     "warning",
+	     "content-encoding",
+	     "content-type",
+	     "content-range",
+	     "trailer":
+		return false
+	}
+	return true
 }
 
 _dynamic_unwritten :: proc(d: [dynamic]$E) -> []E {

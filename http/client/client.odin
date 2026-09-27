@@ -5,7 +5,6 @@ import "core:fmt"
 import "core:mem"
 import "core:nbio"
 import "core:net"
-import "core:strconv"
 import "core:strings"
 
 import "nabla:http"
@@ -102,15 +101,16 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	reader_init(&reader, connection_read_source, connection, request.allocator)
 	defer reader_destroy(&reader)
 
-	status, headers, head_err := read_final_response_head(&reader, request.allocator)
+	head, headers, head_err := read_final_response_head(&reader, request.allocator)
 	defer http.headers_destroy(&headers)
 	if head_err != .None { return failure_from_error(head_err, request.allocator) }
+	status := head.code
 	summary.response_head_received = true
 	summary.status = status
 
 	// The head is where a declared length comes from, whatever the status is, and a
 	// refusal is reported for what it is however the head's framing turned out.
-	framing, length, framing_err := response_framing(status, request.method, headers)
+	framing, length, framing_err := response_framing(status, head.version, request.method, headers)
 	if framing_err == .None && framing == Body_Framing.Exact {
 		summary.declared_body_bytes = u64(length)
 		summary.declared_body_bytes_present = true
@@ -276,7 +276,7 @@ request_validate :: proc(url: http.URL, request: Request) -> (err: Error, detail
 	}
 
 	for header in request.headers {
-		if !field_name_is_token(header.name) { return .Invalid_Request, "a request field name is not a token" }
+		if !http.token_valid(header.name) { return .Invalid_Request, "a request field name is not a token" }
 		for i in 0 ..< len(header.value) {
 			if header.value[i] < 0x20 || header.value[i] == 0x7F {
 				return .Invalid_Request, "a request field value holds a control byte"
@@ -290,29 +290,13 @@ request_validate :: proc(url: http.URL, request: Request) -> (err: Error, detail
 		// A stated length that is invalid or differs from the body would frame
 		// a different message than the one sent.
 		if strings.equal_fold(header.name, "content-length") {
-			stated, stated_ok := content_length_parse(header.value)
+			stated, stated_ok := http.content_length_parse(header.value)
 			if !stated_ok || stated != len(request.body) {
 				return .Invalid_Request, "a stated content length conflicts with the body"
 			}
 		}
 	}
 	return .None, ""
-}
-
-// field_name_is_token reports whether a name is an HTTP token: one or more
-// tchars (RFC 9110 5.1).
-field_name_is_token :: proc(name: string) -> bool {
-	if len(name) == 0 { return false }
-	for i in 0 ..< len(name) {
-		switch name[i] {
-		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
-		case:
-			if (name[i] < '0' || name[i] > '9') && (name[i] < 'a' || name[i] > 'z') && (name[i] < 'A' || name[i] > 'Z') {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 // format_request builds the request line, the fields, and the body. body_offset is
@@ -441,18 +425,24 @@ status_detail :: proc(status: int, allocator: mem.Allocator) -> string {
 	return fmt.aprintf("HTTP %d: the response status is not 2xx", status, allocator = allocator)
 }
 
-read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status_code: int, headers: http.Headers, err: Error) {
+// Response_Status is what a status line says: the code and the version the
+// peer speaks.
+Response_Status :: struct {
+	code:    int,
+	version: http.Version,
+}
+
+read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status: Response_Status, headers: http.Headers, err: Error) {
 	line, line_err := reader_line(reader)
-	if line_err != .None { return 0, headers, line_err }
-	code, parsed := parse_status_line(line)
-	if !parsed { return 0, headers, .Bad_Response }
-	status_code = code
+	if line_err != .None { return {}, headers, line_err }
+	code, version, parsed := parse_status_line(line)
+	if !parsed { return {}, headers, .Bad_Response }
 	http.headers_init(&headers, allocator)
 
 	if section_err := read_field_section(reader, &headers); section_err != .None {
-		return 0, headers, section_err
+		return {}, headers, section_err
 	}
-	return status_code, headers, .None
+	return {code, version}, headers, .None
 }
 
 // read_field_section reads field lines until the empty line that ends them.
@@ -499,25 +489,26 @@ read_field_section :: proc(reader: ^Reader, headers: ^http.Headers) -> Error {
 // response, and this client never asks to upgrade, so an unexpected 101 is
 // returned as the final response for the caller to report as a failure rather
 // than being waited past.
-read_final_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status_code: int, headers: http.Headers, err: Error) {
+read_final_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status: Response_Status, headers: http.Headers, err: Error) {
 	// How many interim responses may precede the final one is not this client's
 	// decision: RFC 9110 15.2 says a client must be able to parse one or more of
 	// them. A peer that only ever sends them is bounded by the caller's own
 	// cancellation and deadline, asked on every read.
 	for {
-		code, head, head_err := read_response_head(reader, allocator)
-		if head_err != .None { return 0, head, head_err }
-		if code == 101 || code >= 200 { return code, head, .None }
+		head_status, head, head_err := read_response_head(reader, allocator)
+		if head_err != .None { return {}, head, head_err }
+		if head_status.code == 101 || head_status.code >= 200 { return head_status, head, .None }
 
 		http.headers_destroy(&head)
 	}
 }
 
-parse_status_line :: proc(line: string) -> (int, bool) {
+parse_status_line :: proc(line: string) -> (code: int, version: http.Version, ok: bool) {
 	space := strings.index_byte(line, ' ')
-	if space < 0 { return 0, false }
-	version, version_ok := http.version_parse(line[:space])
-	if !version_ok || version.major != 1 { return 0, false }
+	if space < 0 { return }
+	version_ok: bool
+	version, version_ok = http.version_parse(line[:space])
+	if !version_ok || version.major != 1 { return }
 	rest := line[space + 1:]
 	code_text := rest
 	if end := strings.index_byte(rest, ' '); end >= 0 { code_text = rest[:end] }
@@ -525,15 +516,18 @@ parse_status_line :: proc(line: string) -> (int, bool) {
 	// recognize is still reported as the code it is, rather than refused for being
 	// one this build happens to have a name for. The reason phrase after it is
 	// discarded: RFC 9110 15 says a client should ignore it.
-	if len(code_text) != 3 { return 0, false }
-	code, code_ok := strconv.parse_int(code_text)
-	if !code_ok || code < 100 { return 0, false }
-	return code, true
+	if len(code_text) != 3 { return }
+	for c in transmute([]u8)code_text {
+		if c < '0' || c > '9' { return }
+		code = code * 10 + int(c - '0')
+	}
+	if code < 100 { return }
+	return code, version, true
 }
 
 content_type_matches :: proc(value, expected: string) -> bool {
 	semi := strings.index_byte(value, ';')
-	media := strings.trim_space(value if semi < 0 else value[:semi])
+	media := http.trim_ows(value if semi < 0 else value[:semi])
 	return strings.equal_fold(media, expected)
 }
 
@@ -558,7 +552,7 @@ Body_Framing :: enum {
 // response delimited by the connection closing; a Content-Length gives the
 // length in octets; and with neither, the body is delimited by the connection
 // closing.
-response_framing :: proc(status: int, method: http.Method, headers: http.Headers) -> (framing: Body_Framing, length: int, err: Error) {
+response_framing :: proc(status: int, version: http.Version, method: http.Method, headers: http.Headers) -> (framing: Body_Framing, length: int, err: Error) {
 	// 1. Responses that never carry content, whatever their fields say.
 	if method == .Head || (status >= 100 && status < 200) || status == 204 || status == 304 {
 		return .None, 0, .None
@@ -567,55 +561,21 @@ response_framing :: proc(status: int, method: http.Method, headers: http.Headers
 	// 3 and 4. A Transfer-Encoding overrides Content-Length, and it is the final
 	// coding that decides the framing.
 	if encoding, has_encoding := http.headers_get_unsafe(headers, "transfer-encoding"); has_encoding {
-		if final_transfer_coding_is_chunked(encoding) { return .Chunked, 0, .None }
+		// RFC 9112 6.1: Transfer-Encoding in an HTTP/1.0 message is faulty
+		// framing, which a response survives only by reading to the close.
+		if version.minor >= 1 && http.final_transfer_coding_is_chunked(encoding) { return .Chunked, 0, .None }
 		return .Until_Close, 0, .None
 	}
 
 	// 5 and 6. Content-Length.
 	if length_text, has_length := http.headers_get_unsafe(headers, "content-length"); has_length {
-		value, value_ok := content_length_parse(length_text)
+		value, value_ok := http.content_length_parse(length_text)
 		if !value_ok { return .None, 0, .Bad_Response }
 		return .Exact, value, .None
 	}
 
 	// 8. No framing field at all.
 	return .Until_Close, 0, .None
-}
-
-// final_transfer_coding_is_chunked reports whether the last coding of a
-// Transfer-Encoding field is chunked. The final coding decides the framing, not
-// the presence of the name anywhere in the list, and coding names are
-// case-insensitive (RFC 9112 6.1 and 7).
-final_transfer_coding_is_chunked :: proc(value: string) -> bool {
-	last := value
-	for {
-		comma := strings.index_byte(last, ',')
-		if comma < 0 { break }
-		last = last[comma + 1:]
-	}
-	return strings.equal_fold(http.trim_ows(last), "chunked")
-}
-
-// content_length_parse reads a Content-Length field value. RFC 9112 6.3 item 5
-// allows a comma-separated list only when every value is valid and identical, in
-// which case the message is framed by that single value.
-content_length_parse :: proc(value: string) -> (length: int, ok: bool) {
-	parsed := -1
-	remaining := value
-	for part in strings.split_iterator(&remaining, ",") {
-		text := http.trim_ows(part)
-		if text == "" { return 0, false }
-		number := 0
-		for c in text {
-			if c < '0' || c > '9' { return 0, false }
-			if number > (max(int) - int(c - '0')) / 10 { return 0, false }
-			number = number * 10 + int(c - '0')
-		}
-		if parsed >= 0 && parsed != number { return 0, false }
-		parsed = number
-	}
-	if parsed < 0 { return 0, false }
-	return parsed, true
 }
 
 stream_body :: proc(reader: ^Reader, framing: Body_Framing, length: int, user_data: rawptr, callback: Chunk_Callback) -> Error {
@@ -658,14 +618,8 @@ stream_chunked :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callb
 	for {
 		line, line_err := reader_line(reader)
 		if line_err != .None { return line_err }
-		size_text := line
-		extensions := ""
-		if semi := strings.index_byte(line, ';'); semi >= 0 {
-			size_text = line[:semi]
-			extensions = line[semi:]
-		}
-		size, size_ok := http.chunk_size_parse(size_text)
-		if !size_ok || !chunk_extensions_valid(extensions) { return .Bad_Response }
+		size, size_ok := http.chunk_line_parse(line)
+		if !size_ok { return .Bad_Response }
 		if size == 0 {
 			// RFC 9112 7.1.2: the body ends with a trailer section read to its
 			// empty line. Its lines are field lines like any other, so a line
@@ -683,80 +637,6 @@ stream_chunked :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callb
 		ending: [2]u8
 		if err := reader_read_full(reader, ending[:]); err != .None { return err }
 		if ending[0] != '\r' || ending[1] != '\n' { return .Bad_Response }
-	}
-}
-
-// chunk_extensions_valid reports whether the text after the chunk-size on a
-// chunk-size line is a legal chunk-ext sequence. RFC 9112 7.1.1: a recipient
-// ignores unrecognized extensions, but the sequence still has to parse; a size
-// line that is not a chunk at all ends the body in failure rather than in a
-// body framed by a guess. Empty text means no extensions, which is valid.
-chunk_extensions_valid :: proc(text: string) -> bool {
-	rest := text
-	for {
-		rest = http.trim_ows(rest)
-		if rest == "" { return true }
-		if rest[0] != ';' { return false }
-		rest = http.trim_ows(rest[1:])
-		width := 0
-		for width < len(rest) && is_token_char(rest[width]) { width += 1 }
-		if width == 0 { return false }
-		rest = http.trim_ows(rest[width:])
-		if len(rest) > 0 && rest[0] == '=' {
-			rest = http.trim_ows(rest[1:])
-			value_width, value_ok := chunk_ext_value_width(rest)
-			if !value_ok { return false }
-			rest = rest[value_width:]
-		}
-	}
-}
-
-// chunk_ext_value_width measures a chunk extension value at the start of text:
-// a token or a quoted-string, RFC 9112 7.1.1. It returns how many bytes the
-// value occupies and whether one was there at all.
-chunk_ext_value_width :: proc(text: string) -> (width: int, ok: bool) {
-	if text == "" { return 0, false }
-	if text[0] != '"' {
-		for width < len(text) && is_token_char(text[width]) { width += 1 }
-		if width == 0 { return 0, false }
-		return width, true
-	}
-	i := 1
-	for i < len(text) {
-		c := text[i]
-		if c == '\\' {
-			i += 1
-			if i >= len(text) { return 0, false }
-			c = text[i]
-			// quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text ).
-			if c != '\t' && c != ' ' && (c < 0x21 || c > 0x7e) && c < 0x80 {
-				return 0, false
-			}
-			i += 1
-			continue
-		}
-		if c == '"' { return i + 1, true }
-		// qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text.
-		if c == '\t' || c == ' ' || c == 0x21 || (c >= 0x23 && c <= 0x5b) || (c >= 0x5d && c <= 0x7e) || c >= 0x80 {
-			i += 1
-			continue
-		}
-		return 0, false
-	}
-	return 0, false
-}
-
-// is_token_char reports whether a byte may appear in an HTTP token, RFC 9110
-// 5.6.2. Chunk extension names are tokens, and so are their values unless
-// quoted.
-is_token_char :: proc(c: byte) -> bool {
-	switch c {
-	case '0' ..= '9', 'a' ..= 'z', 'A' ..= 'Z':
-		return true
-	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
-		return true
-	case:
-		return false
 	}
 }
 

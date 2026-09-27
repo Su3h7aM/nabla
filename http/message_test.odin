@@ -37,8 +37,9 @@ test_method_round_trips :: proc(t: ^testing.T) {
 
 @(test)
 test_header_field_lines :: proc(t: ^testing.T) {
-	// RFC 9112 5.1 excludes only SP and HTAB from the field value, and RFC 9112
-	// 2.2 forbids quietly deleting a bare CR, so a non-OWS byte survives.
+	// RFC 9112 5.1 excludes only SP and HTAB from the field value, so another
+	// byte survives, except CR, LF, and NUL, which RFC 9110 5.5 lets a recipient
+	// replace with SP instead of rejecting the message.
 	{
 		headers: Headers
 		headers_init(&headers, context.temp_allocator)
@@ -54,7 +55,7 @@ test_header_field_lines :: proc(t: ^testing.T) {
 		_, ok := header_parse(&headers, "x: a\r")
 		testing.expect(t, ok)
 		value, _ := headers_get_unsafe(headers, "x")
-		testing.expect_value(t, value, "a\r")
+		testing.expect_value(t, value, "a ")
 	}
 
 	// A field name is a token, so a line beginning with SP or HTAB is an
@@ -93,9 +94,15 @@ test_content_length_parse_requires_decimal_digits :: proc(t: ^testing.T) {
 	testing.expect(t, ok)
 	testing.expect_value(t, size, 42)
 
-	// A sign or surrounding whitespace is not part of the field grammar. An
-	// unrepresentable value must be refused before it becomes a byte count.
-	for text in ([]string{"", "-1", "+1", " 1", "1 ", "1x", "999999999999999999999999999999999999999999"}) {
+	// RFC 9112 6.3 item 5: a list of identical values frames by that value.
+	listed, listed_ok := content_length_parse("7, 7")
+	testing.expect(t, listed_ok)
+	testing.expect_value(t, listed, 7)
+
+	// A sign is not part of the field grammar, differing list members are
+	// invalid, and an unrepresentable value must be refused before it becomes a
+	// byte count.
+	for text in ([]string{"", "-1", "+1", "1x", "1, 2", ",", "999999999999999999999999999999999999999999"}) {
 		value, valid := content_length_parse(text)
 		testing.expectf(t, !valid, "%q was accepted as a Content-Length", text)
 		testing.expect_value(t, value, 0)

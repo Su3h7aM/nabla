@@ -54,7 +54,8 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 	reader_init(&reader, connection_read_source, connection, request.allocator)
 	defer reader_destroy(&reader)
 
-	status, headers, head_err := read_final_response_head(&reader, request.allocator)
+	head, headers, head_err := read_final_response_head(&reader, request.allocator)
+	status := head.code
 	if head_err != .None {
 		http.headers_destroy(&headers)
 		connection_destroy(connection)

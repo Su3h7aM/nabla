@@ -67,7 +67,7 @@ test_response_head :: proc(t: ^testing.T) {
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
 	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
-	testing.expect_value(t, status, 200)
+	testing.expect_value(t, status.code, 200)
 
 	// RFC 9112 5: field names are case-insensitive.
 	length, found := http.headers_get_unsafe(headers, "content-length")
@@ -84,7 +84,7 @@ test_response_head :: proc(t: ^testing.T) {
 	split_status, split_headers, split_err := read_response_head(&split, context.temp_allocator)
 	defer http.headers_destroy(&split_headers)
 	testing.expect_value(t, split_err, Error.None)
-	testing.expect_value(t, split_status, 204)
+	testing.expect_value(t, split_status.code, 204)
 }
 
 @(test)
@@ -95,7 +95,7 @@ test_chunked_body :: proc(t: ^testing.T) {
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
 	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
-	framing, length, framing_err := response_framing(status, .Post, headers)
+	framing, length, framing_err := response_framing(status.code, status.version, .Post, headers)
 	testing.expect_value(t, framing_err, Error.None)
 	testing.expect_value(t, framing, Body_Framing.Chunked)
 	collector: Collector
@@ -108,7 +108,7 @@ test_chunked_body :: proc(t: ^testing.T) {
 	ext_status, ext_headers, ext_err := read_response_head(&extended, context.temp_allocator)
 	defer http.headers_destroy(&ext_headers)
 	testing.expect_value(t, ext_err, Error.None)
-	ext_framing, ext_length, ext_framing_err := response_framing(ext_status, .Post, ext_headers)
+	ext_framing, ext_length, ext_framing_err := response_framing(ext_status.code, ext_status.version, .Post, ext_headers)
 	testing.expect_value(t, ext_framing_err, Error.None)
 	ext_collector: Collector
 	defer delete(ext_collector.buffer)
@@ -124,7 +124,7 @@ test_content_length_and_bodyless_bodies :: proc(t: ^testing.T) {
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
 	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
-	framing, length, framing_err := response_framing(status, .Post, headers)
+	framing, length, framing_err := response_framing(status.code, status.version, .Post, headers)
 	testing.expect_value(t, framing_err, Error.None)
 	testing.expect_value(t, framing, Body_Framing.Exact)
 	testing.expect_value(t, length, 3)
@@ -139,7 +139,7 @@ test_content_length_and_bodyless_bodies :: proc(t: ^testing.T) {
 	bodyless_status, bodyless_headers, bodyless_err := read_response_head(&bodyless, context.temp_allocator)
 	defer http.headers_destroy(&bodyless_headers)
 	testing.expect_value(t, bodyless_err, Error.None)
-	bodyless_framing, bodyless_length, bodyless_framing_err := response_framing(bodyless_status, .Post, bodyless_headers)
+	bodyless_framing, bodyless_length, bodyless_framing_err := response_framing(bodyless_status.code, bodyless_status.version, .Post, bodyless_headers)
 	testing.expect_value(t, bodyless_framing_err, Error.None)
 	testing.expect_value(t, bodyless_framing, Body_Framing.None)
 	bodyless_collector: Collector
@@ -150,7 +150,7 @@ test_content_length_and_bodyless_bodies :: proc(t: ^testing.T) {
 	next_status, next_headers, next_err := read_response_head(&bodyless, context.temp_allocator)
 	defer http.headers_destroy(&next_headers)
 	testing.expect_value(t, next_err, Error.None)
-	testing.expect_value(t, next_status, 200)
+	testing.expect_value(t, next_status.code, 200)
 }
 
 @(test)
@@ -161,8 +161,8 @@ test_interim_responses :: proc(t: ^testing.T) {
 	status, headers, err := read_final_response_head(&reader, context.temp_allocator)
 	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
-	testing.expect_value(t, status, 200)
-	framing, length, framing_err := response_framing(status, .Post, headers)
+	testing.expect_value(t, status.code, 200)
+	framing, length, framing_err := response_framing(status.code, status.version, .Post, headers)
 	testing.expect_value(t, framing_err, Error.None)
 	testing.expect_value(t, framing, Body_Framing.Exact)
 	testing.expect_value(t, length, 2)
@@ -177,7 +177,7 @@ test_interim_responses :: proc(t: ^testing.T) {
 	switch_status, switch_headers, switch_err := read_final_response_head(&switched, context.temp_allocator)
 	defer http.headers_destroy(&switch_headers)
 	testing.expect_value(t, switch_err, Error.None)
-	testing.expect_value(t, switch_status, 101)
+	testing.expect_value(t, switch_status.code, 101)
 
 	// RFC 9110 15.2: a client must be able to parse one or more interim responses
 	// before the final one, and HTTP sets no count. A long run of them is read
@@ -193,7 +193,7 @@ test_interim_responses :: proc(t: ^testing.T) {
 	many_status, many_headers, many_err := read_final_response_head(&many_reader, context.temp_allocator)
 	defer http.headers_destroy(&many_headers)
 	testing.expect_value(t, many_err, Error.None)
-	testing.expect_value(t, many_status, 200)
+	testing.expect_value(t, many_status.code, 200)
 }
 
 // A field section is as long as the peer makes it. RFC 9110 5.4 states that HTTP
@@ -220,7 +220,7 @@ test_a_field_section_has_no_invented_limit :: proc(t: ^testing.T) {
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
 	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
-	testing.expect_value(t, status, 200)
+	testing.expect_value(t, status.code, 200)
 	long, found := http.headers_get_unsafe(headers, "x-long")
 	testing.expect(t, found)
 	testing.expect_value(t, len(long), len(value))
@@ -234,7 +234,7 @@ test_folded_fields :: proc(t: ^testing.T) {
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
 	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
-	testing.expect_value(t, status, 200)
+	testing.expect_value(t, status.code, 200)
 	value, found := http.headers_get_unsafe(headers, "x-a")
 	testing.expect(t, found)
 	testing.expect_value(t, value, "one two three")
@@ -272,7 +272,7 @@ test_incomplete_bodies :: proc(t: ^testing.T) {
 	status, headers, err := read_response_head(&no_last, context.temp_allocator)
 	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
-	framing, length, framing_err := response_framing(status, .Post, headers)
+	framing, length, framing_err := response_framing(status.code, status.version, .Post, headers)
 	testing.expect_value(t, framing_err, Error.None)
 	collector: Collector
 	defer delete(collector.buffer)
@@ -284,7 +284,12 @@ test_incomplete_bodies :: proc(t: ^testing.T) {
 	no_trailer_status, no_trailer_headers, no_trailer_err := read_response_head(&no_trailer, context.temp_allocator)
 	defer http.headers_destroy(&no_trailer_headers)
 	testing.expect_value(t, no_trailer_err, Error.None)
-	no_trailer_framing, no_trailer_length, no_trailer_framing_err := response_framing(no_trailer_status, .Post, no_trailer_headers)
+	no_trailer_framing, no_trailer_length, no_trailer_framing_err := response_framing(
+		no_trailer_status.code,
+		no_trailer_status.version,
+		.Post,
+		no_trailer_headers,
+	)
 	testing.expect_value(t, no_trailer_framing_err, Error.None)
 	no_trailer_collector: Collector
 	defer delete(no_trailer_collector.buffer)
@@ -296,7 +301,7 @@ test_incomplete_bodies :: proc(t: ^testing.T) {
 	truncated_status, truncated_headers, truncated_err := read_response_head(&truncated, context.temp_allocator)
 	defer http.headers_destroy(&truncated_headers)
 	testing.expect_value(t, truncated_err, Error.None)
-	truncated_framing, truncated_length, truncated_framing_err := response_framing(truncated_status, .Post, truncated_headers)
+	truncated_framing, truncated_length, truncated_framing_err := response_framing(truncated_status.code, truncated_status.version, .Post, truncated_headers)
 	testing.expect_value(t, truncated_framing_err, Error.None)
 	truncated_collector: Collector
 	defer delete(truncated_collector.buffer)
@@ -306,7 +311,7 @@ test_incomplete_bodies :: proc(t: ^testing.T) {
 	discarded_status, discarded_headers, discarded_err := read_response_head(&discarded, context.temp_allocator)
 	defer http.headers_destroy(&discarded_headers)
 	testing.expect_value(t, discarded_err, Error.None)
-	discarded_framing, discarded_length, discarded_framing_err := response_framing(discarded_status, .Post, discarded_headers)
+	discarded_framing, discarded_length, discarded_framing_err := response_framing(discarded_status.code, discarded_status.version, .Post, discarded_headers)
 	testing.expect_value(t, discarded_framing_err, Error.None)
 	testing.expect_value(t, stream_body(&discarded, discarded_framing, discarded_length, nil, nil), Error.Closed)
 }
@@ -321,7 +326,7 @@ test_chunk_size_is_hex_digits_only :: proc(t: ^testing.T) {
 		status, headers, err := read_response_head(&reader, context.temp_allocator)
 		defer http.headers_destroy(&headers)
 		testing.expect_value(t, err, Error.None)
-		framing, length, framing_err := response_framing(status, .Post, headers)
+		framing, length, framing_err := response_framing(status.code, status.version, .Post, headers)
 		testing.expect_value(t, framing_err, Error.None)
 		collector: Collector
 		defer delete(collector.buffer)
@@ -334,7 +339,7 @@ test_chunk_size_is_hex_digits_only :: proc(t: ^testing.T) {
 	upper_status, upper_headers, upper_err := read_response_head(&upper, context.temp_allocator)
 	defer http.headers_destroy(&upper_headers)
 	testing.expect_value(t, upper_err, Error.None)
-	upper_framing, upper_length, upper_framing_err := response_framing(upper_status, .Post, upper_headers)
+	upper_framing, upper_length, upper_framing_err := response_framing(upper_status.code, upper_status.version, .Post, upper_headers)
 	testing.expect_value(t, upper_framing_err, Error.None)
 	upper_collector: Collector
 	defer delete(upper_collector.buffer)
@@ -345,7 +350,7 @@ test_chunk_size_is_hex_digits_only :: proc(t: ^testing.T) {
 	huge_status, huge_headers, huge_err := read_response_head(&huge, context.temp_allocator)
 	defer http.headers_destroy(&huge_headers)
 	testing.expect_value(t, huge_err, Error.None)
-	huge_framing, huge_length, huge_framing_err := response_framing(huge_status, .Post, huge_headers)
+	huge_framing, huge_length, huge_framing_err := response_framing(huge_status.code, huge_status.version, .Post, huge_headers)
 	testing.expect_value(t, huge_framing_err, Error.None)
 	huge_collector: Collector
 	defer delete(huge_collector.buffer)
@@ -362,7 +367,7 @@ test_chunk_extensions_must_parse :: proc(t: ^testing.T) {
 		status, headers, err := read_response_head(&reader, context.temp_allocator)
 		defer http.headers_destroy(&headers)
 		testing.expect_value(t, err, Error.None)
-		framing, length, framing_err := response_framing(status, .Post, headers)
+		framing, length, framing_err := response_framing(status.code, status.version, .Post, headers)
 		testing.expect_value(t, framing_err, Error.None)
 		collector: Collector
 		defer delete(collector.buffer)
@@ -374,7 +379,7 @@ test_chunk_extensions_must_parse :: proc(t: ^testing.T) {
 	quoted_status, quoted_headers, quoted_err := read_response_head(&quoted, context.temp_allocator)
 	defer http.headers_destroy(&quoted_headers)
 	testing.expect_value(t, quoted_err, Error.None)
-	quoted_framing, quoted_length, quoted_framing_err := response_framing(quoted_status, .Post, quoted_headers)
+	quoted_framing, quoted_length, quoted_framing_err := response_framing(quoted_status.code, quoted_status.version, .Post, quoted_headers)
 	testing.expect_value(t, quoted_framing_err, Error.None)
 	quoted_collector: Collector
 	defer delete(quoted_collector.buffer)
@@ -390,7 +395,7 @@ test_chunk_trailers_are_field_lines :: proc(t: ^testing.T) {
 	bogus_status, bogus_headers, bogus_err := read_response_head(&bogus, context.temp_allocator)
 	defer http.headers_destroy(&bogus_headers)
 	testing.expect_value(t, bogus_err, Error.None)
-	bogus_framing, bogus_length, bogus_framing_err := response_framing(bogus_status, .Post, bogus_headers)
+	bogus_framing, bogus_length, bogus_framing_err := response_framing(bogus_status.code, bogus_status.version, .Post, bogus_headers)
 	testing.expect_value(t, bogus_framing_err, Error.None)
 	bogus_collector: Collector
 	defer delete(bogus_collector.buffer)
@@ -402,7 +407,7 @@ test_chunk_trailers_are_field_lines :: proc(t: ^testing.T) {
 	noted_status, noted_headers, noted_err := read_response_head(&noted, context.temp_allocator)
 	defer http.headers_destroy(&noted_headers)
 	testing.expect_value(t, noted_err, Error.None)
-	noted_framing, noted_length, noted_framing_err := response_framing(noted_status, .Post, noted_headers)
+	noted_framing, noted_length, noted_framing_err := response_framing(noted_status.code, noted_status.version, .Post, noted_headers)
 	testing.expect_value(t, noted_framing_err, Error.None)
 	noted_collector: Collector
 	defer delete(noted_collector.buffer)
@@ -417,7 +422,7 @@ test_close_delimited_bodies :: proc(t: ^testing.T) {
 	status, headers, err := read_response_head(&reader, context.temp_allocator)
 	defer http.headers_destroy(&headers)
 	testing.expect_value(t, err, Error.None)
-	framing, length, framing_err := response_framing(status, .Post, headers)
+	framing, length, framing_err := response_framing(status.code, status.version, .Post, headers)
 	testing.expect_value(t, framing_err, Error.None)
 	testing.expect_value(t, framing, Body_Framing.Until_Close)
 	collector: Collector
@@ -431,7 +436,7 @@ test_close_delimited_bodies :: proc(t: ^testing.T) {
 	truncated_status, truncated_headers, truncated_err := read_response_head(&truncated, context.temp_allocator)
 	defer http.headers_destroy(&truncated_headers)
 	testing.expect_value(t, truncated_err, Error.None)
-	truncated_framing, truncated_length, truncated_framing_err := response_framing(truncated_status, .Post, truncated_headers)
+	truncated_framing, truncated_length, truncated_framing_err := response_framing(truncated_status.code, truncated_status.version, .Post, truncated_headers)
 	testing.expect_value(t, truncated_framing_err, Error.None)
 	truncated_collector: Collector
 	defer delete(truncated_collector.buffer)
