@@ -24,6 +24,8 @@ Config_Error :: enum {
 
 Harness_Options :: struct {
 	disable_project_instructions: bool,
+	// acp_agents is owned by the loaded configuration for the process lifetime.
+	acp_agents:                   []ACP_Agent_Config,
 }
 
 config_error_text :: proc(e: Config_Error) -> string {
@@ -399,44 +401,42 @@ load_lua_config_full :: proc(
 	options, options_err := load_harness_options(state, -1)
 	if options_err != .None { return {}, {}, {}, options_err }
 	lua.settop(state, base)
-	lua_field(state, -1, "providers")
-	if lua.type(state, -1) == .NIL {
-		lua.settop(state, base)
-		return {}, options, load_mcp_servers_from(state, -1, allocator)
-	}
-	if !lua_plain_table(state, -1) { return {}, {}, {}, .Invalid }
 	result: [dynamic]Catalog_Provider_Source
-	result.allocator = allocator
-	count := 0
-	providers_idx := lua.absindex(state, -1)
-	lua.pushnil(state)
-	for {
-		if lua.next(state, providers_idx) == 0 { break }
-		count += 1
-		if count > CONFIG_MAX_ENTRIES || lua.type(state, -2) != .STRING {
-			catalog_sources_destroy(&result, allocator)
-			return {}, {}, {}, .Invalid
+	lua_field(state, -1, "providers")
+	if lua.type(state, -1) != .NIL {
+		if !lua_plain_table(state, -1) { return {}, {}, {}, .Invalid }
+		result.allocator = allocator
+		count := 0
+		providers_idx := lua.absindex(state, -1)
+		lua.pushnil(state)
+		for {
+			if lua.next(state, providers_idx) == 0 { break }
+			count += 1
+			if count > CONFIG_MAX_ENTRIES || lua.type(state, -2) != .STRING {
+				catalog_sources_destroy(&result, allocator)
+				return {}, {}, {}, .Invalid
+			}
+			provider_id, provider_id_error := lua_string(state, -2, allocator)
+			if provider_id_error != .None {
+				catalog_sources_destroy(&result, allocator)
+				return {}, {}, {}, provider_id_error
+			}
+			provider: Catalog_Provider_Source
+			err := load_provider(state, -1, provider_id, allocator, &provider)
+			delete(provider_id, allocator)
+			if err != .None {
+				catalog_provider_source_destroy(&provider, allocator)
+				catalog_sources_destroy(&result, allocator)
+				return {}, {}, {}, err
+			}
+			appended := append(&result, provider)
+			if appended != 1 {
+				if appended == 0 { catalog_provider_source_destroy(&provider, allocator) }
+				catalog_sources_destroy(&result, allocator)
+				return {}, {}, {}, .Allocation
+			}
+			lua.settop(state, providers_idx + 1)
 		}
-		provider_id, provider_id_error := lua_string(state, -2, allocator)
-		if provider_id_error != .None {
-			catalog_sources_destroy(&result, allocator)
-			return {}, {}, {}, provider_id_error
-		}
-		provider: Catalog_Provider_Source
-		err := load_provider(state, -1, provider_id, allocator, &provider)
-		delete(provider_id, allocator)
-		if err != .None {
-			catalog_provider_source_destroy(&provider, allocator)
-			catalog_sources_destroy(&result, allocator)
-			return {}, {}, {}, err
-		}
-		appended := append(&result, provider)
-		if appended != 1 {
-			if appended == 0 { catalog_provider_source_destroy(&provider, allocator) }
-			catalog_sources_destroy(&result, allocator)
-			return {}, {}, {}, .Allocation
-		}
-		lua.settop(state, providers_idx + 1)
 	}
 	lua.settop(state, base)
 	servers, servers_err := load_mcp_servers_from(state, -1, allocator)
@@ -445,6 +445,13 @@ load_lua_config_full :: proc(
 		return {}, {}, {}, servers_err
 	}
 	lua.settop(state, base)
+	acp_agents, acp_agents_err := load_acp_agents_from(state, -1, allocator)
+	if acp_agents_err != .None {
+		catalog_sources_destroy(&result, allocator)
+		mcp_servers_destroy(&servers, allocator)
+		return {}, {}, {}, acp_agents_err
+	}
+	options.acp_agents = acp_agents[:]
 	return result, options, servers, .None
 }
 
@@ -461,6 +468,15 @@ load_mcp_servers_from :: proc(state: ^lua.State, root_idx: c.int, allocator: mem
 	lua_field(state, mcp_idx, "servers")
 	if lua.type(state, -1) == .NIL { return {}, .None }
 	return mcp_servers_load(state, -1, allocator)
+}
+
+// load_acp_agents_from reads the `agents` table. The state is reset by the caller.
+@(private)
+load_acp_agents_from :: proc(state: ^lua.State, root_idx: c.int, allocator: mem.Allocator) -> ([dynamic]ACP_Agent_Config, Config_Error) {
+	base := lua.gettop(state)
+	defer lua.settop(state, base)
+	lua_field(state, root_idx, "agents")
+	return acp_agents_load(state, -1, allocator)
 }
 
 load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Config_Error) {
