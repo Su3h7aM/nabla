@@ -24,12 +24,7 @@ TOOL_MAX_ARGS_DEPTH :: 32
 // so a whole float within it names exactly one integer and one beyond it may not.
 TOOL_EXACT_FLOAT_INTEGER :: 1 << 53
 
-// A tool argument defect. field is the JSON pointer path of the argument the
-// defect is about, and expected names the constraint that was not met: the
-// declared type, the accepted range, or the set of accepted fields. Both are
-// owned by the error.
 Tool_Argument_Error_Kind :: enum {
-	None,
 	Not_Object,
 	Syntax,
 	Duplicate_Field,
@@ -42,7 +37,25 @@ Tool_Argument_Error_Kind :: enum {
 	Number_Out_Of_Range,
 }
 
-Tool_Argument_Error :: struct {
+@(private)
+tool_argument_error_codes := [Tool_Argument_Error_Kind]string {
+	.Not_Object          = "not_object",
+	.Syntax              = "syntax",
+	.Duplicate_Field     = "duplicate_field",
+	.Unknown_Field       = "unknown_field",
+	.Missing_Field       = "missing_field",
+	.Wrong_Type          = "wrong_type",
+	.Invalid_Value       = "invalid_value",
+	.Too_Large           = "too_large",
+	.Too_Deep            = "too_deep",
+	.Number_Out_Of_Range = "number_out_of_range",
+}
+
+// Tool_Argument_Defect is what is wrong with one argument document. field is the JSON
+// pointer path of the argument the defect is about, and expected names the constraint that
+// was not met: the declared type, the accepted range, or the set of accepted fields. Both
+// are owned by the defect.
+Tool_Argument_Defect :: struct {
 	kind:     Tool_Argument_Error_Kind,
 	field:    string, // owned
 	expected: string, // owned
@@ -52,64 +65,49 @@ Tool_Argument_Error :: struct {
 	column:   int,
 }
 
+// Tool_Argument_Error is nil when the arguments are sound, so a reader can use or_return.
+Tool_Argument_Error :: union {
+	Tool_Argument_Defect,
+}
+
 tool_argument_error :: proc(kind: Tool_Argument_Error_Kind, field := "", expected := "", allocator := context.allocator) -> Tool_Argument_Error {
-	err := Tool_Argument_Error {
+	defect := Tool_Argument_Defect {
 		kind = kind,
 	}
-	if field != "" { err.field = strings.clone(field, allocator) }
-	if expected != "" { err.expected = strings.clone(expected, allocator) }
-	return err
+	if field != "" { defect.field = strings.clone(field, allocator) }
+	if expected != "" { defect.expected = strings.clone(expected, allocator) }
+	return defect
 }
 
 tool_argument_error_destroy :: proc(err: ^Tool_Argument_Error, allocator := context.allocator) {
-	delete(err.field, allocator)
-	delete(err.expected, allocator)
-	err^ = {}
+	if defect, failed := err.?; failed {
+		delete(defect.field, allocator)
+		delete(defect.expected, allocator)
+	}
+	err^ = nil
 }
 
 tool_argument_error_code :: proc(err: Tool_Argument_Error) -> string {
-	switch err.kind {
-	case .None:
-		return ""
-	case .Not_Object:
-		return "not_object"
-	case .Syntax:
-		return "syntax"
-	case .Duplicate_Field:
-		return "duplicate_field"
-	case .Unknown_Field:
-		return "unknown_field"
-	case .Missing_Field:
-		return "missing_field"
-	case .Wrong_Type:
-		return "wrong_type"
-	case .Invalid_Value:
-		return "invalid_value"
-	case .Too_Large:
-		return "too_large"
-	case .Too_Deep:
-		return "too_deep"
-	case .Number_Out_Of_Range:
-		return "number_out_of_range"
-	}
-	return ""
+	defect, failed := err.?
+	if !failed { return "" }
+	return tool_argument_error_codes[defect.kind]
 }
 
 // tool_argument_error_text renders a defect as one sentence, ending with where the defect is
 // when it was found in the document text. The same defect always renders the same bytes, so
 // a recovery turn adds no wording churn to the cacheable prefix.
 tool_argument_error_text :: proc(err: Tool_Argument_Error, allocator := context.allocator) -> string {
-	sentence := tool_argument_error_sentence(err)
-	if err.line == 0 { return strings.clone(sentence, allocator) }
-	return fmt.aprintf("%s, at line %d column %d", sentence, err.line, err.column, allocator = allocator)
+	defect, failed := err.?
+	if !failed { return "" }
+	sentence := tool_argument_error_sentence(defect)
+	if defect.line == 0 { return strings.clone(sentence, allocator) }
+	return fmt.aprintf("%s, at line %d column %d", sentence, defect.line, defect.column, allocator = allocator)
 }
 
 // tool_argument_error_sentence says what a defect is. The text is temporary.
 @(private)
-tool_argument_error_sentence :: proc(err: Tool_Argument_Error) -> string {
+tool_argument_error_sentence :: proc(err: Tool_Argument_Defect) -> string {
 	switch err.kind {
-	case .None:
-		return ""
 	case .Not_Object:
 		return "the arguments must be a JSON object"
 	case .Syntax:
@@ -146,7 +144,8 @@ Argument_Failure :: struct {
 }
 
 tool_argument_failure :: proc(err: Tool_Argument_Error) -> Argument_Failure {
-	return {kind = tool_argument_error_code(err), field = err.field, expected = err.expected}
+	defect := err.? or_else {}
+	return {kind = tool_argument_error_code(err), field = defect.field, expected = defect.expected}
 }
 
 // --- admitting a document ----------------------------------------------------
@@ -220,7 +219,7 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 		}
 	}
 
-	if admit_error := tool_arguments_admit(document, allocator); admit_error.kind != .None {
+	if admit_error := tool_arguments_admit(document, allocator); admit_error != nil {
 		arguments.error = admit_error
 		return
 	}
@@ -295,18 +294,18 @@ tool_json_admit :: proc(text: string, allocator: mem.Allocator) -> Tool_Argument
 	tokenizer := json.make_tokenizer(text, .JSON, true)
 	token, token_err := json.get_token(&tokenizer)
 	if tool_token_bad(token, token_err) { return tool_document_error(.Syntax, tokenizer.data, token) }
-	if value_error := tool_admit_value(&tokenizer, token, 1, allocator); value_error.kind != .None { return value_error }
+	if value_error := tool_admit_value(&tokenizer, token, 1, allocator); value_error != nil { return value_error }
 
 	token, token_err = json.get_token(&tokenizer)
 	if (token_err != nil && token_err != .EOF) || token.kind != .EOF { return tool_document_error(.Syntax, tokenizer.data, token) }
-	return {}
+	return nil
 }
 
 // tool_document_error is a defect found at a token of text, placed by its line and column
 // counted from 1. The column is counted here from the token's byte offset, because the
 // tokenizer counts it from 0 on the first line and from 1 on every other.
 @(private)
-tool_document_error :: proc(kind: Tool_Argument_Error_Kind, text: string, at: json.Token) -> Tool_Argument_Error {
+tool_document_error :: proc(kind: Tool_Argument_Error_Kind, text: string, at: json.Token) -> Tool_Argument_Defect {
 	offset := min(at.offset, len(text))
 	line_start := strings.last_index_byte(text[:offset], '\n') + 1
 	return {kind = kind, line = strings.count(text[:line_start], "\n") + 1, column = offset - line_start + 1}
@@ -330,7 +329,7 @@ tool_admit_object :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem
 		if tool_token_bad(token, token_err) { return tool_document_error(.Syntax, tokenizer.data, token) }
 		if token.kind == .Close_Brace {
 			if comma { return tool_document_error(.Syntax, tokenizer.data, token) }
-			return {}
+			return nil
 		}
 		if token.kind != .String { return tool_document_error(.Syntax, tokenizer.data, token) }
 
@@ -347,12 +346,12 @@ tool_admit_object :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem
 		if tool_token_bad(colon, colon_err) || colon.kind != .Colon { return tool_document_error(.Syntax, tokenizer.data, colon) }
 		value, value_err := json.get_token(tokenizer)
 		if tool_token_bad(value, value_err) { return tool_document_error(.Syntax, tokenizer.data, value) }
-		if value_error := tool_admit_value(tokenizer, value, depth + 1, allocator); value_error.kind != .None { return value_error }
+		if value_error := tool_admit_value(tokenizer, value, depth + 1, allocator); value_error != nil { return value_error }
 
 		separator, separator_err := json.get_token(tokenizer)
 		if tool_token_bad(separator, separator_err) { return tool_document_error(.Syntax, tokenizer.data, separator) }
 		if separator.kind == .Comma { comma = true; continue }
-		if separator.kind == .Close_Brace { return {} }
+		if separator.kind == .Close_Brace { return nil }
 		return tool_document_error(.Syntax, tokenizer.data, separator)
 	}
 }
@@ -365,14 +364,14 @@ tool_admit_array :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.
 		if tool_token_bad(token, token_err) { return tool_document_error(.Syntax, tokenizer.data, token) }
 		if token.kind == .Close_Bracket {
 			if comma { return tool_document_error(.Syntax, tokenizer.data, token) }
-			return {}
+			return nil
 		}
-		if value_error := tool_admit_value(tokenizer, token, depth + 1, allocator); value_error.kind != .None { return value_error }
+		if value_error := tool_admit_value(tokenizer, token, depth + 1, allocator); value_error != nil { return value_error }
 
 		separator, separator_err := json.get_token(tokenizer)
 		if tool_token_bad(separator, separator_err) { return tool_document_error(.Syntax, tokenizer.data, separator) }
 		if separator.kind == .Comma { comma = true; continue }
-		if separator.kind == .Close_Bracket { return {} }
+		if separator.kind == .Close_Bracket { return nil }
 		return tool_document_error(.Syntax, tokenizer.data, separator)
 	}
 }
@@ -392,13 +391,13 @@ tool_admit_value :: proc(tokenizer: ^json.Tokenizer, token: json.Token, depth: i
 		return tool_admit_array(tokenizer, depth, allocator)
 	case .Integer:
 		if _, fits := tool_decimal_integer(token.text); !fits { return tool_document_error(.Number_Out_Of_Range, tokenizer.data, token) }
-		return {}
+		return nil
 	case .Float:
 		number, parsed := strconv.parse_f64(token.text)
 		if !parsed || math.is_inf(number) { return tool_document_error(.Number_Out_Of_Range, tokenizer.data, token) }
-		return {}
+		return nil
 	case .String, .True, .False, .Null:
-		return {}
+		return nil
 	}
 	return tool_document_error(.Syntax, tokenizer.data, token)
 }
@@ -514,17 +513,17 @@ tool_field_string :: proc(object: json.Object, name: string, path := "", allocat
 	if !present { return "", tool_argument_error(.Missing_Field, tool_field_path(path, name), allocator = allocator) }
 	text, is_string := value.(json.String)
 	if !is_string { return "", tool_argument_error(.Wrong_Type, tool_field_path(path, name), "a string", allocator = allocator) }
-	return string(text), {}
+	return string(text), nil
 }
 
 tool_field_optional_string :: proc(object: json.Object, name: string, path := "", allocator := context.allocator) -> (string, Tool_Argument_Error) {
 	value, present := object[name]
-	if !present { return "", {} }
+	if !present { return "", nil }
 	#partial switch v in value {
 	case json.Null:
-		return "", {}
+		return "", nil
 	case json.String:
-		return string(v), {}
+		return string(v), nil
 	}
 	return "", tool_argument_error(.Wrong_Type, tool_field_path(path, name), "a string or null", allocator = allocator)
 }
@@ -561,8 +560,8 @@ tool_field_optional_int :: proc(
 ) {
 	object := object
 	slot, present := &object[name]
-	if !present { return fallback, {} }
-	if _, is_null := slot.(json.Null); is_null { return fallback, {} }
+	if !present { return fallback, nil }
+	if _, is_null := slot.(json.Null); is_null { return fallback, nil }
 	return tool_field_int_value(slot, tool_field_path(path, name), minimum, maximum, repairs, allocator)
 }
 
@@ -585,7 +584,7 @@ tool_field_int_value :: proc(
 		return 0, tool_argument_error(.Invalid_Value, path, expected, allocator = allocator)
 	}
 	tool_integer_write_back(slot, number, repair, repairs, allocator)
-	return number, {}
+	return number, nil
 }
 
 // tool_fields_repair_integers repairs the named integer fields of a document whose fields
@@ -669,7 +668,7 @@ tool_field_array :: proc(
 		defer delete(expected, allocator)
 		return nil, tool_argument_error(.Invalid_Value, field, expected, allocator = allocator)
 	}
-	return array[:], {}
+	return array[:], nil
 }
 
 // tool_field_object reads an object that is already known to be there, naming it
@@ -677,7 +676,7 @@ tool_field_array :: proc(
 tool_field_object :: proc(value: json.Value, path: string, allocator := context.allocator) -> (json.Object, Tool_Argument_Error) {
 	object, is_object := value.(json.Object)
 	if !is_object { return nil, tool_argument_error(.Wrong_Type, path, "an object", allocator = allocator) }
-	return object, {}
+	return object, nil
 }
 
 // tool_fields_known refuses a field the tool does not declare. A model that

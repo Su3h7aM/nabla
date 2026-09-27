@@ -37,13 +37,11 @@ TOOL_RESULT_READ_DEFINITION :: Tool_Definition {
 TOOL_RESULT_READ_FIELDS := []string{"call_seq", "offset", "limit"}
 
 @(private)
-tool_result_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Result_Read_Args, Tool_Argument_Error) {
-	if known_error := tool_fields_known(arguments, TOOL_RESULT_READ_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
-	call_seq, call_seq_error := tool_field_int(arguments, "call_seq", 1, max(int), &ctx.repairs, allocator = ctx.allocator)
-	if call_seq_error.kind != .None { return {}, call_seq_error }
-	offset, offset_error := tool_field_optional_int(arguments, "offset", 0, 0, max(int), &ctx.repairs, allocator = ctx.allocator)
-	if offset_error.kind != .None { return {}, offset_error }
-	limit, limit_error := tool_field_optional_int(
+tool_result_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Result_Read_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, TOOL_RESULT_READ_FIELDS, allocator = ctx.allocator) or_return
+	args.call_seq = tool_field_int(arguments, "call_seq", 1, max(int), &ctx.repairs, allocator = ctx.allocator) or_return
+	args.offset = tool_field_optional_int(arguments, "offset", 0, 0, max(int), &ctx.repairs, allocator = ctx.allocator) or_return
+	args.limit = tool_field_optional_int(
 		arguments,
 		"limit",
 		TOOL_RESULT_READ_MAX_BYTES,
@@ -51,9 +49,8 @@ tool_result_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Re
 		TOOL_RESULT_READ_MAX_BYTES,
 		&ctx.repairs,
 		allocator = ctx.allocator,
-	)
-	if limit_error.kind != .None { return {}, limit_error }
-	return Result_Read_Args{call_seq = call_seq, offset = offset, limit = limit}, {}
+	) or_return
+	return
 }
 
 // tool_result_read_page slices one page out of a kept result. It walks the end back to

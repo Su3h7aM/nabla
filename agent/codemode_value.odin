@@ -390,13 +390,9 @@ codemode_lua_json_decode :: proc "c" (state: ^lua.State) -> c.int {
 	pointer := lua.L_checkstring(state, 1, &length)
 	temp := virtual.arena_temp_begin(&run.scratch)
 	text := string((cast([^]u8)pointer)[:length])
-	if admit_error := tool_json_admit(text, context.temp_allocator); admit_error.kind != .None {
-		defect := codemode_json_defect_text(admit_error)
-		return codemode_lua_raise(
-			state,
-			fmt.tprintf("json.decode refused the text: %s, at line %d column %d", defect, admit_error.line, admit_error.column),
-			temp,
-		)
+	if defect, refused := tool_json_admit(text, context.temp_allocator).?; refused {
+		reason := codemode_json_defect_text(defect)
+		return codemode_lua_raise(state, fmt.tprintf("json.decode refused the text: %s, at line %d column %d", reason, defect.line, defect.column), temp)
 	}
 	value, parse_error := json.parse_string(text, .JSON, true, context.temp_allocator)
 	if parse_error != nil { return codemode_lua_raise(state, "json.decode refused the text: it is not valid JSON", temp) }
@@ -409,7 +405,7 @@ codemode_lua_json_decode :: proc "c" (state: ^lua.State) -> c.int {
 
 // codemode_json_defect_text says what makes a text unreadable as JSON. The text is temporary.
 @(private)
-codemode_json_defect_text :: proc(defect: Tool_Argument_Error) -> string {
+codemode_json_defect_text :: proc(defect: Tool_Argument_Defect) -> string {
 	#partial switch defect.kind {
 	case .Duplicate_Field:
 		return fmt.tprintf("field %q appears twice in one object", defect.field)

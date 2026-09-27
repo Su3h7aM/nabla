@@ -39,15 +39,11 @@ TOOL_LOAD_SKILL_DEFINITION :: Tool_Definition {
 	execute = tool_load_skill_execute,
 }
 
-tool_list_skills_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (List_Skills_Args, Tool_Argument_Error) {
-	if known_error := tool_fields_known(arguments, TOOL_LIST_SKILLS_FIELDS, allocator = ctx.allocator); known_error.kind != .None {
-		return {}, known_error
-	}
-	query, query_error := tool_field_optional_string(arguments, "query", allocator = ctx.allocator)
-	if query_error.kind != .None { return {}, query_error }
-	offset, offset_error := tool_field_optional_int(arguments, "offset", 0, 0, max(int) / 2, &ctx.repairs, allocator = ctx.allocator)
-	if offset_error.kind != .None { return {}, offset_error }
-	limit, limit_error := tool_field_optional_int(
+tool_list_skills_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: List_Skills_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, TOOL_LIST_SKILLS_FIELDS, allocator = ctx.allocator) or_return
+	args.query = tool_field_optional_string(arguments, "query", allocator = ctx.allocator) or_return
+	args.offset = tool_field_optional_int(arguments, "offset", 0, 0, max(int) / 2, &ctx.repairs, allocator = ctx.allocator) or_return
+	args.limit = tool_field_optional_int(
 		arguments,
 		"limit",
 		TOOL_LIST_SKILLS_DEFAULT_LIMIT,
@@ -55,9 +51,8 @@ tool_list_skills_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Li
 		TOOL_LIST_SKILLS_MAX_LIMIT,
 		&ctx.repairs,
 		allocator = ctx.allocator,
-	)
-	if limit_error.kind != .None { return {}, limit_error }
-	return {query = query, offset = offset, limit = limit}, {}
+	) or_return
+	return
 }
 
 tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
@@ -112,13 +107,10 @@ tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	}
 }
 
-tool_load_skill_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Load_Skill_Args, Tool_Argument_Error) {
-	if known_error := tool_fields_known(arguments, TOOL_LOAD_SKILL_FIELDS, allocator = ctx.allocator); known_error.kind != .None {
-		return {}, known_error
-	}
-	name, name_error := tool_field_string(arguments, "name", allocator = ctx.allocator)
-	if name_error.kind != .None { return {}, name_error }
-	return {name = name}, {}
+tool_load_skill_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Load_Skill_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, TOOL_LOAD_SKILL_FIELDS, allocator = ctx.allocator) or_return
+	args.name = tool_field_string(arguments, "name", allocator = ctx.allocator) or_return
+	return
 }
 
 tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {

@@ -63,19 +63,17 @@ tool_shell_definition :: proc(shell: string, allocator := context.allocator) -> 
 // tool_shell_args reads the shell's arguments and reports the first defect
 // instead of a value, so a refused call is described exactly. A timeout the
 // model gives is honored as given; otherwise the definition's default applies.
-tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Shell_Args, Tool_Argument_Error) {
-	if known_error := tool_fields_known(arguments, TOOL_SHELL_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
-	command, command_error := tool_field_string(arguments, "command", allocator = ctx.allocator)
-	if command_error.kind != .None { return {}, command_error }
+tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Shell_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, TOOL_SHELL_FIELDS, allocator = ctx.allocator) or_return
+	command := tool_field_string(arguments, "command", allocator = ctx.allocator) or_return
 	if strings.trim_space(command) == "" {
 		return {}, tool_argument_error(.Invalid_Value, "command", "a non-empty shell command", ctx.allocator)
 	}
-	working_directory, directory_error := tool_field_optional_string(arguments, "working_directory", allocator = ctx.allocator)
-	if directory_error.kind != .None { return {}, directory_error }
+	working_directory := tool_field_optional_string(arguments, "working_directory", allocator = ctx.allocator) or_return
 	if strings.contains_rune(working_directory, 0) {
 		return {}, tool_argument_error(.Invalid_Value, "working_directory", "a path without a NUL byte", ctx.allocator)
 	}
-	timeout_ms, timeout_error := tool_field_optional_int(
+	timeout_ms := tool_field_optional_int(
 		arguments,
 		"timeout_ms",
 		int(ctx.timeout / time.Millisecond),
@@ -83,9 +81,8 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Shell_Ar
 		int(max(time.Duration) / time.Millisecond),
 		&ctx.repairs,
 		allocator = ctx.allocator,
-	)
-	if timeout_error.kind != .None { return {}, timeout_error }
-	return {command = command, working_directory = working_directory, timeout = time.Duration(timeout_ms) * time.Millisecond}, {}
+	) or_return
+	return {command = command, working_directory = working_directory, timeout = time.Duration(timeout_ms) * time.Millisecond}, nil
 }
 
 // tool_shell_start runs a command with the shell this process was started from,
@@ -103,7 +100,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	args := arguments.(Shell_Args)
 
 	directory, resolve_error := tool_resolve_path(ctx.workspace, args.working_directory, "working_directory", ctx.allocator)
-	if resolve_error.kind != .None { return tool_result_refused(ctx, &resolve_error) }
+	if resolve_error != nil { return tool_result_refused(ctx, &resolve_error) }
 	defer delete(directory, ctx.allocator)
 	info, info_error := os.stat(directory, ctx.allocator)
 	defer os.file_info_delete(info, ctx.allocator)
@@ -241,10 +238,10 @@ tool_resolve_path :: proc(workspace, path: string, field := "path", allocator :=
 	if strings.contains_rune(path, 0) {
 		return "", tool_argument_error(.Invalid_Value, field, "a path without a NUL byte", allocator)
 	}
-	if path != "" && path[0] == '/' { return strings.clone(path, allocator), {} }
+	if path != "" && path[0] == '/' { return strings.clone(path, allocator), nil }
 	joined, join_error := os.join_path([]string{workspace, path}, allocator)
 	if join_error != nil {
 		return "", tool_argument_error(.Invalid_Value, field, "a valid path", allocator)
 	}
-	return joined, {}
+	return joined, nil
 }

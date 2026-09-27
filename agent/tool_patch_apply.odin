@@ -114,7 +114,7 @@ patch_failure :: proc(kind: Patch_Failure_Kind, allocator: mem.Allocator, format
 @(private = "file")
 patch_resolve :: proc(workspace, path: string, allocator: mem.Allocator) -> (string, Patch_Error) {
 	resolved, resolve_error := tool_resolve_path(workspace, path, allocator = allocator)
-	if resolve_error.kind != .None { return "", patch_failure(.Invalid_Path, allocator, "%s is not a valid path", path) }
+	if resolve_error != nil { return "", patch_failure(.Invalid_Path, allocator, "%s is not a valid path", path) }
 	return resolved, nil
 }
 

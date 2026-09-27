@@ -75,14 +75,13 @@ Patch_Error :: union {
 	mem.Allocator_Error,
 }
 
-tool_patch_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Patch_Args, Tool_Argument_Error) {
-	if fields_error := tool_fields_known(arguments, TOOL_PATCH_FIELDS, allocator = ctx.allocator); fields_error.kind != .None { return {}, fields_error }
-	patch, patch_error := tool_field_string(arguments, "patch", allocator = ctx.allocator)
-	if patch_error.kind != .None { return {}, patch_error }
-	args, problem, allocation_error := patch_parse(patch, ctx.allocator)
+tool_patch_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Patch_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, TOOL_PATCH_FIELDS, allocator = ctx.allocator) or_return
+	patch := tool_field_string(arguments, "patch", allocator = ctx.allocator) or_return
+	parsed, problem, allocation_error := patch_parse(patch, ctx.allocator)
 	if allocation_error != nil { return {}, tool_argument_error(.Too_Large, "patch", "a patch that fits in memory", ctx.allocator) }
 	if problem != "" { return {}, tool_argument_error(.Invalid_Value, "patch", problem, ctx.allocator) }
-	return args, {}
+	return parsed, nil
 }
 
 tool_patch_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {

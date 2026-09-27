@@ -80,37 +80,36 @@ tool_run :: proc(t: ^testing.T, test: ^Tool_Test, name, arguments: string) -> se
 
 @(test)
 test_admission_rejects_structural_defects :: proc(t: ^testing.T) {
+	for raw in ([]string{`{"command":"echo"}`, `{}`, `{"a":9223372036854775807}`}) {
+		arguments := tool_arguments_prepare(raw, context.allocator)
+		defer tool_arguments_destroy(&arguments, context.allocator)
+		testing.expectf(t, arguments.status == .Valid, "%s was read as %v", raw, arguments.status)
+	}
+
 	cases := []struct {
-		raw:      string,
-		kind:     Tool_Argument_Error_Kind,
-		accepted: bool,
+		raw:  string,
+		kind: Tool_Argument_Error_Kind,
 	} {
-		{`{"command":"echo"}`, .None, true},
-		{`{}`, .None, true},
-		{`[1,2]`, .Not_Object, false},
-		{`{"a":1,"a":2}`, .Duplicate_Field, false},
-		{`{"a":{"b":1,"b":2}}`, .Duplicate_Field, false},
-		{`{"a":[{"b":1,"b":2}]}`, .Duplicate_Field, false},
-		{`{"a":1} {"b":2}`, .Syntax, false},
-		{`{"a":1} trailing`, .Syntax, false},
-		{`{"a":1,}`, .Syntax, false},
-		{`{,}`, .Syntax, false},
-		{`{"a":1`, .Syntax, false},
-		{`{"a" 1}`, .Syntax, false},
-		{`{"a":`, .Syntax, false},
-		{`{"a":9223372036854775807}`, .None, true},
-		{`{"a":[99999999999999999999]}`, .Number_Out_Of_Range, false},
-		{`{"a":-9223372036854775809}`, .Number_Out_Of_Range, false},
-		{`{"a":1e400}`, .Number_Out_Of_Range, false},
+		{`[1,2]`, .Not_Object},
+		{`{"a":1,"a":2}`, .Duplicate_Field},
+		{`{"a":{"b":1,"b":2}}`, .Duplicate_Field},
+		{`{"a":[{"b":1,"b":2}]}`, .Duplicate_Field},
+		{`{"a":1} {"b":2}`, .Syntax},
+		{`{"a":1} trailing`, .Syntax},
+		{`{"a":1,}`, .Syntax},
+		{`{,}`, .Syntax},
+		{`{"a":1`, .Syntax},
+		{`{"a" 1}`, .Syntax},
+		{`{"a":`, .Syntax},
+		{`{"a":[99999999999999999999]}`, .Number_Out_Of_Range},
+		{`{"a":-9223372036854775809}`, .Number_Out_Of_Range},
+		{`{"a":1e400}`, .Number_Out_Of_Range},
 	}
 	for c in cases {
 		arguments := tool_arguments_prepare(c.raw, context.allocator)
 		defer tool_arguments_destroy(&arguments, context.allocator)
-		rejected := arguments.status == .Rejected
-		testing.expectf(t, rejected != c.accepted, "%s was read as %v", c.raw, arguments.status)
-		if rejected {
-			testing.expectf(t, arguments.error.kind == c.kind, "%s reported %v", c.raw, arguments.error.kind)
-		}
+		defect, refused := arguments.error.?
+		testing.expectf(t, refused && defect.kind == c.kind, "%s reported %v", c.raw, arguments.error)
 	}
 }
 
@@ -119,7 +118,7 @@ test_admission_bounds_nesting :: proc(t: ^testing.T) {
 	arguments := tool_arguments_prepare(strings.repeat(`{"a":`, TOOL_MAX_ARGS_DEPTH + 1, context.temp_allocator), context.allocator)
 	defer tool_arguments_destroy(&arguments, context.allocator)
 	testing.expect_value(t, arguments.status, Tool_Arguments_Status.Rejected)
-	testing.expect_value(t, arguments.error.kind, Tool_Argument_Error_Kind.Too_Deep)
+	testing.expect_value(t, tool_test_defect(arguments.error).kind, Tool_Argument_Error_Kind.Too_Deep)
 }
 
 // A document is repaired only where it has one reading, and the repaired document is read
@@ -159,7 +158,8 @@ test_admission_repairs_only_what_has_one_reading :: proc(t: ^testing.T) {
 	for c in refused {
 		arguments := tool_arguments_prepare(c.raw, context.allocator)
 		defer tool_arguments_destroy(&arguments, context.allocator)
-		testing.expectf(t, arguments.error.kind == c.kind, "%s reported %v", c.raw, arguments.error.kind)
+		defect, failed := arguments.error.?
+		testing.expectf(t, failed && defect.kind == c.kind, "%s reported %v", c.raw, arguments.error)
 	}
 
 	placed := tool_arguments_prepare("{\"path\":\"a\",\n \"path\":\"b\"}", context.allocator)
@@ -181,7 +181,7 @@ test_integer_fields_repair_one_reading :: proc(t: ^testing.T) {
 		allocator = context.allocator,
 	}
 	args, args_error := tool_args_decode(&ctx, TOOL_READ_DEFINITION, arguments.value.(json.Object))
-	if !testing.expect_value(t, args_error.kind, Tool_Argument_Error_Kind.None) { return }
+	if !testing.expect_value(t, args_error, nil) { return }
 	testing.expect_value(t, args.(Read_Args).offset, 5)
 	testing.expect_value(t, args.(Read_Args).limit, 2)
 	testing.expect_value(t, ctx.repairs, session.Tool_Repairs{.Integer_From_String, .Integer_From_Float})
@@ -194,7 +194,8 @@ test_integer_fields_repair_one_reading :: proc(t: ^testing.T) {
 		if !testing.expect_value(t, arguments.status, Tool_Arguments_Status.Valid) { continue }
 		_, refused := tool_args_decode(&ctx, TOOL_READ_DEFINITION, arguments.value.(json.Object))
 		defer tool_argument_error_destroy(&refused, context.allocator)
-		testing.expectf(t, refused.kind == .Wrong_Type, "%s was read as an integer", raw)
+		defect, failed := refused.?
+		testing.expectf(t, failed && defect.kind == .Wrong_Type, "%s was read as an integer", raw)
 	}
 }
 
@@ -209,18 +210,18 @@ test_field_readers_report_the_defect :: proc(t: ^testing.T) {
 
 	known_error := tool_fields_known(args, TOOL_SHELL_FIELDS, allocator = context.allocator)
 	defer tool_argument_error_destroy(&known_error, context.allocator)
-	testing.expect_value(t, known_error.kind, Tool_Argument_Error_Kind.Unknown_Field)
-	testing.expect_value(t, known_error.field, "extra")
-	testing.expect(t, strings.contains(known_error.expected, "timeout_ms"), "the accepted fields are listed")
+	unknown := tool_test_defect(known_error)
+	testing.expect_value(t, unknown.kind, Tool_Argument_Error_Kind.Unknown_Field)
+	testing.expect_value(t, unknown.field, "extra")
+	testing.expect(t, strings.contains(unknown.expected, "timeout_ms"), "the accepted fields are listed")
 	testing.expect(t, tool_argument_error_text(known_error, context.temp_allocator) != "")
 
-	if _, nested_error := tool_field_object(json.String("x"), "edits/0", context.allocator); nested_error.kind != .None {
-		defer tool_argument_error_destroy(&nested_error, context.allocator)
-		testing.expect_value(t, nested_error.kind, Tool_Argument_Error_Kind.Wrong_Type)
-		testing.expect_value(t, nested_error.field, "edits/0")
-	} else {
-		testing.fail_now(t, "a non-object is refused")
-	}
+	_, nested_error := tool_field_object(json.String("x"), "edits/0", context.allocator)
+	defer tool_argument_error_destroy(&nested_error, context.allocator)
+	nested := tool_test_defect(nested_error)
+	testing.expect(t, nested_error != nil, "a non-object is refused")
+	testing.expect_value(t, nested.kind, Tool_Argument_Error_Kind.Wrong_Type)
+	testing.expect_value(t, nested.field, "edits/0")
 }
 
 // --- the four tools ----------------------------------------------------------
@@ -814,6 +815,11 @@ tool_test_execute :: proc(ctx: ^Tool_Context, definition: Tool_Definition, objec
 	args, err := tool_args_decode(ctx, definition, object)
 	defer tool_args_destroy(&args, ctx.allocator)
 	defer tool_argument_error_destroy(&err, ctx.allocator)
-	if err.kind != .None { return tool_result_refused(ctx, &err) }
+	if err != nil { return tool_result_refused(ctx, &err) }
 	return definition.execute(ctx, args)
+}
+
+// tool_test_defect is the defect an argument error holds, or the zero defect when it holds none.
+tool_test_defect :: proc(err: Tool_Argument_Error) -> Tool_Argument_Defect {
+	return err.? or_else {}
 }

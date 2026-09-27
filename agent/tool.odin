@@ -288,23 +288,17 @@ tool_schema_valid :: proc(schema: string) -> string {
 	if len(schema) > TOOL_MAX_SCHEMA_BYTES { return "the schema exceeds 64 KiB" }
 	admit_error := tool_arguments_admit(schema, context.temp_allocator)
 	defer tool_argument_error_destroy(&admit_error, context.temp_allocator)
-	switch admit_error.kind {
-	case .None:
-		return ""
+	defect, failed := admit_error.?
+	if !failed { return "" }
+	#partial switch defect.kind {
 	case .Not_Object:
 		return "the schema root must be a JSON object"
-	case .Too_Large:
-		return "the schema exceeds 64 KiB"
 	case .Too_Deep:
 		return "the schema nests too deeply"
 	case .Duplicate_Field:
 		return "the schema repeats a field name"
-	case .Syntax:
-		return "the schema is not valid JSON"
 	case .Number_Out_Of_Range:
 		return "the schema holds a number no 64-bit integer or finite float can hold"
-	case .Unknown_Field, .Missing_Field, .Wrong_Type, .Invalid_Value:
-		return "the schema is not valid JSON"
 	}
 	return "the schema is not valid JSON"
 }

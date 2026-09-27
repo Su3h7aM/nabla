@@ -35,22 +35,27 @@ TOOL_READ_DEFINITION :: Tool_Definition {
 }
 
 // tool_read_args reads the read tool's arguments.
-tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Read_Args, Tool_Argument_Error) {
-	if known_error := tool_fields_known(arguments, TOOL_READ_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
-	path, path_error := tool_field_string(arguments, "path", allocator = ctx.allocator)
-	if path_error.kind != .None { return {}, path_error }
-	offset, offset_error := tool_field_optional_int(arguments, "offset", 1, 1, TOOL_READ_MAX_LINES, &ctx.repairs, allocator = ctx.allocator)
-	if offset_error.kind != .None { return {}, offset_error }
-	limit, limit_error := tool_field_optional_int(arguments, "limit", TOOL_READ_DEFAULT_LINES, 1, TOOL_READ_MAX_LINES, &ctx.repairs, allocator = ctx.allocator)
-	if limit_error.kind != .None { return {}, limit_error }
-	return Read_Args{path = path, offset = offset, limit = limit}, {}
+tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Read_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, TOOL_READ_FIELDS, allocator = ctx.allocator) or_return
+	args.path = tool_field_string(arguments, "path", allocator = ctx.allocator) or_return
+	args.offset = tool_field_optional_int(arguments, "offset", 1, 1, TOOL_READ_MAX_LINES, &ctx.repairs, allocator = ctx.allocator) or_return
+	args.limit = tool_field_optional_int(
+		arguments,
+		"limit",
+		TOOL_READ_DEFAULT_LINES,
+		1,
+		TOOL_READ_MAX_LINES,
+		&ctx.repairs,
+		allocator = ctx.allocator,
+	) or_return
+	return
 }
 
 tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Read_Args)
 
 	path, resolve_error := tool_resolve_path(ctx.workspace, args.path, allocator = ctx.allocator)
-	if resolve_error.kind != .None { return tool_result_refused(ctx, &resolve_error) }
+	if resolve_error != nil { return tool_result_refused(ctx, &resolve_error) }
 	defer delete(path, ctx.allocator)
 
 	info, info_error := os.stat(path, ctx.allocator)
@@ -176,20 +181,18 @@ TOOL_WRITE_DEFINITION :: Tool_Definition {
 	execute = tool_write_execute,
 }
 
-tool_write_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Write_Args, Tool_Argument_Error) {
-	if known_error := tool_fields_known(arguments, TOOL_WRITE_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
-	path, path_error := tool_field_string(arguments, "path", allocator = ctx.allocator)
-	if path_error.kind != .None { return {}, path_error }
-	content, content_error := tool_field_string(arguments, "content", allocator = ctx.allocator)
-	if content_error.kind != .None { return {}, content_error }
-	return Write_Args{path = path, content = content}, {}
+tool_write_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Write_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, TOOL_WRITE_FIELDS, allocator = ctx.allocator) or_return
+	args.path = tool_field_string(arguments, "path", allocator = ctx.allocator) or_return
+	args.content = tool_field_string(arguments, "content", allocator = ctx.allocator) or_return
+	return
 }
 
 tool_write_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Write_Args)
 
 	path, resolve_error := tool_resolve_path(ctx.workspace, args.path, allocator = ctx.allocator)
-	if resolve_error.kind != .None { return tool_result_refused(ctx, &resolve_error) }
+	if resolve_error != nil { return tool_result_refused(ctx, &resolve_error) }
 	defer delete(path, ctx.allocator)
 
 	mode, mode_error := tool_write_mode(path)

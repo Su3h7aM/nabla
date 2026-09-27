@@ -417,7 +417,7 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	}
 	args, args_error := tool_args_decode(&job.exec, definition^, job.admitted.value.(json.Object))
 	job.arguments = args
-	if args_error.kind != .None {
+	if args_error != nil {
 		defer tool_argument_error_destroy(&args_error, job.allocator)
 		job.result = tool_result_refused(&job.exec, &args_error)
 		job.result_present = true

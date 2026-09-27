@@ -117,7 +117,7 @@ test_mcp_integer_fields_are_repaired_from_the_schema :: proc(t: ^testing.T) {
 		allocator = context.allocator,
 	}
 	_, decode_error := tool_args_decode(&ctx, definition^, arguments.value.(json.Object))
-	testing.expect_value(t, decode_error.kind, Tool_Argument_Error_Kind.None)
+	testing.expect_value(t, decode_error, nil)
 	testing.expect_value(t, ctx.repairs, session.Tool_Repairs{.Integer_From_String, .Integer_From_Float})
 	object := arguments.value.(json.Object)
 	testing.expect_value(t, object["count"].(json.Integer), 7)

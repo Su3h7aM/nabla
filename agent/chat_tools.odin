@@ -84,7 +84,7 @@ chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, re
 	// memory they were built in is released here.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	error_text := ""
-	if result.error.kind != .None { error_text = tool_argument_error_text(result.error, context.temp_allocator) }
+	if result.error != nil { error_text = tool_argument_error_text(result.error, context.temp_allocator) }
 	entry := session.New_Entry {
 		turn_no = chat.turn_no,
 		request_no = chat.active_request,

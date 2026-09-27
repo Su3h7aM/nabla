@@ -88,38 +88,30 @@ Codemode_Args :: struct {
 tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object: json.Object) -> (Tool_Args, Tool_Argument_Error) {
 	switch definition.kind {
 	case .Read:
-		args, err := tool_read_args(ctx, object)
-		return args, err
+		return tool_read_args(ctx, object)
 	case .Write:
-		args, err := tool_write_args(ctx, object)
-		return args, err
+		return tool_write_args(ctx, object)
 	case .Patch:
-		args, err := tool_patch_args(ctx, object)
-		return args, err
+		return tool_patch_args(ctx, object)
 	case .Shell:
-		args, err := tool_shell_args(ctx, object)
-		return args, err
+		return tool_shell_args(ctx, object)
 	case .List_Skills:
-		args, err := tool_list_skills_args(ctx, object)
-		return args, err
+		return tool_list_skills_args(ctx, object)
 	case .Load_Skill:
-		args, err := tool_load_skill_args(ctx, object)
-		return args, err
+		return tool_load_skill_args(ctx, object)
 	case .Result_Read:
-		args, err := tool_result_read_args(ctx, object)
-		return args, err
+		return tool_result_read_args(ctx, object)
 	case .Compact:
 		return nil, tool_fields_known(object, nil, allocator = ctx.allocator)
 	case .Codemode:
-		args, err := tool_codemode_args(ctx, object)
-		return args, err
+		return tool_codemode_args(ctx, object)
 	case .Custom, .MCP:
 		// The tool validates its own arguments, so none are handed over and the document
 		// travels as admitted, with only its integer fields repaired from the schema.
 		tool_fields_repair_integers(object, definition.integer_fields, &ctx.repairs, ctx.allocator)
-		return nil, {}
+		return nil, nil
 	}
-	return nil, {}
+	return nil, nil
 }
 
 // tool_args_destroy releases what one typed call owns: the patch arrays, which are the only

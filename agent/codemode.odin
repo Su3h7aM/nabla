@@ -53,11 +53,10 @@ TOOL_CODEMODE_DEFINITION :: Tool_Definition {
 }
 
 // tool_codemode_args reads the program and its optional timeout. Zero means no timeout.
-tool_codemode_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Codemode_Args, Tool_Argument_Error) {
-	if known_error := tool_fields_known(arguments, TOOL_CODEMODE_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
-	code, code_error := tool_field_string(arguments, "code", allocator = ctx.allocator)
-	if code_error.kind != .None { return {}, code_error }
-	timeout_ms, timeout_error := tool_field_optional_int(
+tool_codemode_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Codemode_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, TOOL_CODEMODE_FIELDS, allocator = ctx.allocator) or_return
+	code := tool_field_string(arguments, "code", allocator = ctx.allocator) or_return
+	timeout_ms := tool_field_optional_int(
 		arguments,
 		"timeout_ms",
 		0,
@@ -65,9 +64,8 @@ tool_codemode_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Codem
 		int(max(time.Duration) / time.Millisecond),
 		&ctx.repairs,
 		allocator = ctx.allocator,
-	)
-	if timeout_error.kind != .None { return {}, timeout_error }
-	return {code = code, timeout = time.Duration(timeout_ms) * time.Millisecond}, {}
+	) or_return
+	return {code = code, timeout = time.Duration(timeout_ms) * time.Millisecond}, nil
 }
 
 @(private)
