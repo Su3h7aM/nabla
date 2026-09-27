@@ -4,6 +4,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:math"
 import "core:mem"
+import "core:strconv"
 import "core:strings"
 
 import "nabla:agent/session"
@@ -38,6 +39,7 @@ Tool_Argument_Error_Kind :: enum {
 	Invalid_Value,
 	Too_Large,
 	Too_Deep,
+	Number_Out_Of_Range,
 }
 
 Tool_Argument_Error :: struct {
@@ -83,6 +85,8 @@ tool_argument_error_code :: proc(err: Tool_Argument_Error) -> string {
 		return "too_large"
 	case .Too_Deep:
 		return "too_deep"
+	case .Number_Out_Of_Range:
+		return "number_out_of_range"
 	}
 	return ""
 }
@@ -114,6 +118,8 @@ tool_argument_error_text :: proc(err: Tool_Argument_Error, allocator := context.
 		return fmt.aprintf("field %q is too large", err.field, allocator = allocator)
 	case .Too_Deep:
 		return fmt.aprintf("the arguments nest more than %d levels deep", TOOL_MAX_ARGS_DEPTH, allocator = allocator)
+	case .Number_Out_Of_Range:
+		return strings.clone("the arguments hold a number that no 64-bit integer or finite float can hold", allocator)
 	}
 	return ""
 }
@@ -339,6 +345,10 @@ tool_admit_array :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.
 
 // tool_admit_value continues from a token that has already been read, which is
 // what keeps a container's element token from being read twice.
+//
+// A number is admitted only if the parser can hold it as written: the parser wraps an
+// integer past the 64-bit range and reads an enormous float as infinity, and either would
+// run the call with a number the model never sent.
 @(private)
 tool_admit_value :: proc(tokenizer: ^json.Tokenizer, token: json.Token, depth: int, allocator: mem.Allocator) -> Tool_Argument_Error {
 	#partial switch token.kind {
@@ -346,7 +356,14 @@ tool_admit_value :: proc(tokenizer: ^json.Tokenizer, token: json.Token, depth: i
 		return tool_admit_object(tokenizer, depth, allocator)
 	case .Open_Bracket:
 		return tool_admit_array(tokenizer, depth, allocator)
-	case .String, .Integer, .Float, .True, .False, .Null:
+	case .Integer:
+		if _, fits := tool_decimal_integer(token.text); !fits { return tool_argument_error(.Number_Out_Of_Range, allocator = allocator) }
+		return {}
+	case .Float:
+		number, parsed := strconv.parse_f64(token.text)
+		if !parsed || math.is_inf(number) { return tool_argument_error(.Number_Out_Of_Range, allocator = allocator) }
+		return {}
+	case .String, .True, .False, .Null:
 		return {}
 	}
 	return tool_argument_error(.Syntax, allocator = allocator)
@@ -556,20 +573,27 @@ tool_integer_reading :: proc(value: json.Value) -> (number: int, repair: Maybe(s
 		if math.trunc(v) != v || abs(v) > TOOL_EXACT_FLOAT_INTEGER { return 0, nil, false }
 		return int(v), .Integer_From_Float, true
 	case json.String:
-		text := string(v)
-		digits := strings.trim_prefix(text, "-")
-		if digits == "" || (len(digits) > 1 && digits[0] == '0') { return 0, nil, false }
-		for digit in transmute([]u8)digits {
-			if digit < '0' || digit > '9' { return 0, nil, false }
-			place := int(digit - '0')
-			// A number past the int range names no value this reader can hold.
-			if number > (max(int) - place) / 10 { return 0, nil, false }
-			number = number * 10 + place
-		}
-		if len(digits) < len(text) { number = -number }
+		number, readable = tool_decimal_integer(string(v))
+		if !readable { return 0, nil, false }
 		return number, .Integer_From_String, true
 	}
 	return 0, nil, false
+}
+
+// tool_decimal_integer reads text that is exactly one decimal integer: an optional leading
+// minus, then digits with no leading zero. A number past the int range is not one.
+@(private)
+tool_decimal_integer :: proc(text: string) -> (number: int, ok: bool) {
+	digits := strings.trim_prefix(text, "-")
+	if digits == "" || (len(digits) > 1 && digits[0] == '0') { return 0, false }
+	for digit in transmute([]u8)digits {
+		if digit < '0' || digit > '9' { return 0, false }
+		place := int(digit - '0')
+		if number > (max(int) - place) / 10 { return 0, false }
+		number = number * 10 + place
+	}
+	if len(digits) < len(text) { number = -number }
+	return number, true
 }
 
 // tool_field_array reads a required array field and returns its elements.

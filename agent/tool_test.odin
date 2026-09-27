@@ -98,6 +98,10 @@ test_admission_rejects_structural_defects :: proc(t: ^testing.T) {
 		{`{"a":1`, .Syntax, false},
 		{`{"a" 1}`, .Syntax, false},
 		{`{"a":`, .Syntax, false},
+		{`{"a":9223372036854775807}`, .None, true},
+		{`{"a":[99999999999999999999]}`, .Number_Out_Of_Range, false},
+		{`{"a":-9223372036854775809}`, .Number_Out_Of_Range, false},
+		{`{"a":1e400}`, .Number_Out_Of_Range, false},
 	}
 	for c in cases {
 		arguments := tool_arguments_prepare(c.raw, context.allocator)

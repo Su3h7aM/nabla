@@ -295,6 +295,8 @@ tool_schema_valid :: proc(schema: string) -> string {
 		return "the schema repeats a field name"
 	case .Syntax:
 		return "the schema is not valid JSON"
+	case .Number_Out_Of_Range:
+		return "the schema holds a number no 64-bit integer or finite float can hold"
 	case .Unknown_Field, .Missing_Field, .Wrong_Type, .Invalid_Value:
 		return "the schema is not valid JSON"
 	}
