@@ -95,7 +95,9 @@ Stdio :: struct {
 	child:            Stdio_Child,
 	started:          bool,
 	line:             [dynamic]u8,
-	line_offset:      int,
+	// line_start is where the unconsumed bytes of line begin: everything before it has been
+	// returned to a reader already.
+	line_start:       int,
 	out:              [dynamic]u8,
 	stderr_tail:      [dynamic]u8,
 	stderr_mutex:     sync.Mutex,
@@ -281,9 +283,10 @@ stdio_write_line :: proc(stdio: ^Stdio, message: string, control: Control) -> Er
 // outcome unknown rather than absent.
 stdio_read_line :: proc(stdio: ^Stdio, control: Control) -> (line: []u8, err: Error) {
 	for {
-		if start := stdio_find_newline(stdio.line[:], stdio.line_offset); start >= 0 {
-			stdio.line_offset = start + 1
-			return stdio.line[:start], {}
+		if start := stdio_find_newline(stdio.line[:], stdio.line_start); start >= 0 {
+			line = stdio.line[stdio.line_start:start]
+			stdio.line_start = start + 1
+			return
 		}
 		stdio_compact(stdio)
 		if len(stdio.line) > MAX_MESSAGE_BYTES {
@@ -323,11 +326,11 @@ stdio_read_line :: proc(stdio: ^Stdio, control: Control) -> (line: []u8, err: Er
 // only the unconsumed tail.
 @(private)
 stdio_compact :: proc(stdio: ^Stdio) {
-	if stdio.line_offset == 0 { return }
-	remaining := len(stdio.line) - stdio.line_offset
-	copy(stdio.line[:remaining], stdio.line[stdio.line_offset:])
+	if stdio.line_start == 0 { return }
+	remaining := len(stdio.line) - stdio.line_start
+	copy(stdio.line[:remaining], stdio.line[stdio.line_start:])
 	resize(&stdio.line, remaining)
-	stdio.line_offset = 0
+	stdio.line_start = 0
 }
 
 @(private)

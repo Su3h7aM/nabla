@@ -48,6 +48,29 @@ test_stdio_write_line_rejects_short_allocation_before_io :: proc(t: ^testing.T) 
 	testing.expect_value(t, err.delivery, Delivery_State.Not_Delivered)
 }
 
+// Two messages that arrive in one read are framed apart: the second read returns the second
+// message alone, not the bytes the first read already returned.
+@(test)
+test_stdio_frames_two_messages_from_one_read :: proc(t: ^testing.T) {
+	stdio: Stdio
+	stdio.started = true
+	stdio.allocator = context.allocator
+	stdio.line = make([dynamic]u8, context.allocator)
+	defer delete(stdio.line)
+	text := "one\ntwo\n"
+	append(&stdio.line, ..transmute([]u8)text)
+
+	first, first_error := stdio_read_line(&stdio, {})
+	defer error_destroy(&first_error, context.allocator)
+	testing.expect_value(t, first_error.kind, Error_Kind.None)
+	testing.expect_value(t, string(first), "one")
+
+	second, second_error := stdio_read_line(&stdio, {})
+	defer error_destroy(&second_error, context.allocator)
+	testing.expect_value(t, second_error.kind, Error_Kind.None)
+	testing.expect_value(t, string(second), "two")
+}
+
 // A server is a program with a pipe on each stream: a line written to cat comes
 // back unchanged.
 @(test)
