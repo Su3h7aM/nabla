@@ -145,7 +145,7 @@ RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, job, call,
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND turn = open.turn AND kind = 'turn.completed')
 	UNION ALL
 	SELECT 1, * FROM records AS open WHERE session = ?1 AND kind = 'request.sent'
-		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND request = open.request
+		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND request = open.request AND attempt IS open.attempt
 			AND kind IN ('response.committed', 'response.rejected', 'request.interrupted'))
 	UNION ALL
 	SELECT 2, * FROM records AS open WHERE session = ?1 AND kind = 'tool.proposed'
