@@ -98,9 +98,18 @@ tool_preview_cut :: proc(text: string, limit: int) -> string {
 // tool_output_write writes one kept output, creating its directory, readable by its owner only.
 @(private)
 tool_output_write :: proc(path: string, content: string) -> os.Error {
+	file := tool_output_create(path) or_return
+	defer os.close(file)
+	_, write_error := os.write_string(file, content)
+	return write_error
+}
+
+// tool_output_create creates one kept output file for writing, and its directory, readable
+// by its owner only.
+tool_output_create :: proc(path: string) -> (^os.File, os.Error) {
 	directory, _ := filepath.split(path)
-	if make_error := os.make_directory_all(directory, XDG_APP_PERMISSIONS); make_error != nil && make_error != .Exist { return make_error }
-	return os.write_entire_file(path, content, os.Permissions{.Read_User, .Write_User})
+	if make_error := os.make_directory_all(directory, XDG_APP_PERMISSIONS); make_error != nil && make_error != .Exist { return nil, make_error }
+	return os.open(path, {.Write, .Create, .Trunc}, os.Permissions{.Read_User, .Write_User})
 }
 
 // tool_output_directory is where a session keeps the outputs it did not show in full:
@@ -114,11 +123,11 @@ tool_output_directory :: proc(id: string, allocator := context.allocator) -> str
 	return directory
 }
 
-// chat_tool_output_path is the temp-allocated file that keeps the output of the call
-// recorded at call_seq, or "" when the session has no output directory.
-chat_tool_output_path :: proc(chat: ^Chat_Session, call_seq: i64) -> string {
+// chat_tool_output_path is the temp-allocated path that names the kept output of the call
+// recorded at call_seq, followed by suffix, or "" when the session has no output directory.
+chat_tool_output_path :: proc(chat: ^Chat_Session, call_seq: i64, suffix := ".txt", allocator := context.temp_allocator) -> string {
 	if chat.tool_output_directory == "" { return "" }
-	path, join_error := filepath.join({chat.tool_output_directory, fmt.tprintf("%d.txt", call_seq)}, context.temp_allocator)
+	path, join_error := filepath.join({chat.tool_output_directory, fmt.tprintf("%d%s", call_seq, suffix)}, allocator)
 	if join_error != nil { return "" }
 	return path
 }

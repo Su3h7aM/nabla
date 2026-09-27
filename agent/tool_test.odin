@@ -249,6 +249,30 @@ test_shell_runs_a_command_and_reports_what_it_did :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(outside.content, "stdout:\n/tmp\n"), "an absolute working directory is used as given")
 }
 
+// A stream larger than memory holds is written whole to its file as it arrives, and the
+// model is shown where to read it.
+@(test)
+test_shell_keeps_output_larger_than_memory_in_a_file :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+
+	size :: 3 * TOOL_STREAM_MEMORY_BYTES
+	command := fmt.tprintf(`{{"command":"head -c %d /dev/zero | tr '\\\\000' a"}}`, size)
+	result := tool_run(t, &test, TOOL_SHELL_NAME, command)
+	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
+	testing.expect(t, strings.contains(result.content, fmt.tprintf("stdout_bytes: %d\n", size)), "the whole size is reported")
+
+	marker := "stdout_complete_in: "
+	start := strings.index(result.content, marker)
+	if !testing.expect(t, start >= 0, "the result names the file that keeps the stream") { return }
+	rest := result.content[start + len(marker):]
+	path := rest[:strings.index_byte(rest, '\n')]
+	info, stat_error := os.stat(path, context.temp_allocator)
+	testing.expect(t, stat_error == nil, "the stream file exists")
+	testing.expect_value(t, info.size, i64(size))
+}
+
 @(test)
 test_shell_refuses_arguments_before_dispatch :: proc(t: ^testing.T) {
 	test: Tool_Test

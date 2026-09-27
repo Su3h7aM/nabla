@@ -136,6 +136,7 @@ Tool_Job :: struct {
 	admitted:       Tool_Arguments,
 	arguments:      Tool_Args,
 	exec:           Tool_Context, // what the executor is given, for the job's whole life
+	output_base:    string, // owned by allocator; what exec.output_base borrows
 	logging:        Log_Binding, // the worker's correlation, captured at admission
 
 	// control
@@ -257,6 +258,7 @@ tool_job_release :: proc(job: ^Tool_Job) {
 	tool_arguments_destroy(&job.admitted, job.allocator)
 	if job.result_present { tool_result_destroy(&job.result) }
 	tool_wake_close(&job.wake)
+	delete(job.output_base, job.allocator)
 	delete(job.name, job.allocator)
 	delete(job.call_id, job.allocator)
 	mem.free(job, job.allocator)
@@ -364,6 +366,10 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		allocator  = job.allocator,
 		skills     = chat_skill_catalog(chat),
 		source_seq = job.call.seq,
+	}
+	if job.call.seq > 0 {
+		job.output_base = chat_tool_output_path(chat, i64(job.call.seq), "", job.allocator)
+		job.exec.output_base = job.output_base
 	}
 	received := [2]Log_Field{{key = "tool", value = job.name}, {key = "arguments_bytes", value = i64(len(job.call.arguments))}}
 	log_emit({level = .Info, category = .Tool, event = "tool.call_received", fields = received[:]})

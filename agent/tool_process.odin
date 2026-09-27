@@ -313,12 +313,48 @@ tool_retire_child :: proc(child: ^Tool_Child, start: time.Tick, budget: time.Dur
 	return .None, nil
 }
 
-// Tool_Stream is one captured output stream while it is drained.
+// TOOL_STREAM_MEMORY_BYTES is how much of one output stream is held in memory. A stream
+// that grows past it is written whole to its spool file as it arrives, and only its
+// beginning stays in memory, so a command that prints without end cannot exhaust memory.
+TOOL_STREAM_MEMORY_BYTES :: 1024 * 1024
+
+// Tool_Stream is one captured output stream while it is drained. kept holds the whole
+// stream until it outgrows memory, and its beginning after that. spool_path names the
+// file the whole stream goes to then; "" means the stream stays in memory whatever its size.
 @(private)
 Tool_Stream :: struct {
-	file: ^os.File,
-	kept: [dynamic]u8,
-	open: bool,
+	file:       ^os.File,
+	kept:       [dynamic]u8,
+	open:       bool,
+	total:      int,
+	spool_path: string,
+	spool:      ^os.File,
+}
+
+// tool_stream_take adds one chunk. The spool is opened the first time the stream outgrows
+// memory, and receives everything kept so far. When it cannot be opened the stream stays in
+// memory, because output is never discarded.
+@(private)
+tool_stream_take :: proc(stream: ^Tool_Stream, chunk: []u8) -> os.Error {
+	stream.total += len(chunk)
+	if stream.spool == nil && stream.spool_path != "" && len(stream.kept) + len(chunk) > TOOL_STREAM_MEMORY_BYTES {
+		spool, open_error := tool_output_create(stream.spool_path)
+		if open_error == nil {
+			stream.spool = spool
+			os.write(spool, stream.kept[:]) or_return
+		}
+	}
+	if stream.spool == nil {
+		_, append_error := append(&stream.kept, ..chunk)
+		return append_error
+	}
+	os.write(stream.spool, chunk) or_return
+	head := min(len(chunk), TOOL_STREAM_MEMORY_BYTES - len(stream.kept))
+	if head > 0 {
+		_, append_error := append(&stream.kept, ..chunk[:head])
+		return append_error
+	}
+	return nil
 }
 
 // tool_drain_pipes reads both pipes to end of stream and reports why draining
@@ -333,6 +369,7 @@ tool_drain_pipes :: proc(
 	budget: time.Duration,
 	control: Tool_Control,
 	data: ^Shell_Output,
+	spool_base: string,
 	allocator: mem.Allocator,
 ) -> (
 	Tool_Stop,
@@ -343,10 +380,24 @@ tool_drain_pipes :: proc(
 		{file = stdout_read, kept = make([dynamic]u8, allocator), open = true},
 		{file = stderr_read, kept = make([dynamic]u8, allocator), open = true},
 	}
+	if spool_base != "" {
+		streams[0].spool_path = strings.concatenate({spool_base, ".stdout.txt"}, context.temp_allocator)
+		streams[1].spool_path = strings.concatenate({spool_base, ".stderr.txt"}, context.temp_allocator)
+	}
 	// Everything the command wrote is kept, whatever the drain ends with.
 	defer {
 		data.stdout = string(streams[0].kept[:])
 		data.stderr = string(streams[1].kept[:])
+		data.stdout_bytes = streams[0].total
+		data.stderr_bytes = streams[1].total
+		if streams[0].spool != nil {
+			_ = os.close(streams[0].spool)
+			data.stdout_file = strings.clone(streams[0].spool_path, allocator)
+		}
+		if streams[1].spool != nil {
+			_ = os.close(streams[1].spool)
+			data.stderr_file = strings.clone(streams[1].spool_path, allocator)
+		}
 	}
 	scratch: [4096]u8
 	for streams[0].open || streams[1].open {
@@ -392,9 +443,9 @@ tool_drain_pipes :: proc(
 			case .Ok:
 				if n == 0 {
 					stream.open = false
-				} else if _, append_error := append(&stream.kept, ..scratch[:n]); append_error != nil {
+				} else if take_error := tool_stream_take(&stream, scratch[:n]); take_error != nil {
 					tool_terminate_group(child)
-					return .Wait_Failed, append_error
+					return .Wait_Failed, take_error
 				}
 			}
 		}

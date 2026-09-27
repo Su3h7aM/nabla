@@ -107,6 +107,8 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	defer {
 		delete(data.stdout, ctx.allocator)
 		delete(data.stderr, ctx.allocator)
+		delete(data.stdout_file, ctx.allocator)
+		delete(data.stderr_file, ctx.allocator)
 	}
 
 	stdout_read, stdout_write, stdout_error := os.pipe()
@@ -124,7 +126,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	if spawn != .Started { return tool_shell_not_started(ctx, spawn_error, data) }
 	defer tool_child_close(&child)
 
-	stop, wait_error := tool_drain_pipes(&child, stdout_read, stderr_read, time.tick_now(), args.timeout, ctx.control, &data, ctx.allocator)
+	stop, wait_error := tool_drain_pipes(&child, stdout_read, stderr_read, time.tick_now(), args.timeout, ctx.control, &data, ctx.output_base, ctx.allocator)
 	switch stop {
 	case .Wait_Failed:
 		message := fmt.tprintf("the harness could not wait for the command, so it was stopped: %s", os.error_string(wait_error))

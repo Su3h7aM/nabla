@@ -64,6 +64,9 @@ Tool_Context :: struct {
 	// executor that forwards the call elsewhere sends this, so the record and the
 	// remote peer see the same bytes rather than two encodings of one value.
 	arguments_json: string,
+	// output_base is where a tool may keep output too large to hold in memory, as
+	// output_base plus a suffix; "" when there is nowhere to keep it.
+	output_base:    string,
 	// timeout is the definition's default, copied here so a shared executor reads the
 	// value of the definition it runs for.
 	timeout:        time.Duration,

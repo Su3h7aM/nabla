@@ -48,11 +48,16 @@ Patch_Output :: struct {
 }
 
 // Shell_Output is what a command produced. exit_code is present only when the command
-// exited rather than being ended by a signal.
+// exited rather than being ended by a signal. A stream too large to hold in memory is
+// kept whole in its file, and stdout or stderr then holds only its beginning.
 Shell_Output :: struct {
-	exit_code: Maybe(int),
-	stdout:    string,
-	stderr:    string,
+	exit_code:    Maybe(int),
+	stdout:       string,
+	stderr:       string,
+	stdout_bytes: int,
+	stderr_bytes: int,
+	stdout_file:  string,
+	stderr_file:  string,
 }
 
 Skill_Record :: struct {
@@ -166,6 +171,14 @@ tool_result_render :: proc(
 		render_text(&body, value.summary) or_return
 	case Shell_Output:
 		if code, exited := value.exit_code.?; exited { render_field(&head, "exit_code", code) or_return }
+		if value.stdout_file != "" {
+			render_field(&head, "stdout_bytes", value.stdout_bytes) or_return
+			render_field(&head, "stdout_complete_in", value.stdout_file) or_return
+		}
+		if value.stderr_file != "" {
+			render_field(&head, "stderr_bytes", value.stderr_bytes) or_return
+			render_field(&head, "stderr_complete_in", value.stderr_file) or_return
+		}
 		render_section(&body, "stdout", value.stdout) or_return
 		render_section(&body, "stderr", value.stderr) or_return
 	case Skills_Output:
@@ -387,8 +400,12 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		borrowed := value
 		value.stdout = ""
 		value.stderr = ""
+		value.stdout_file = ""
+		value.stderr_file = ""
 		value.stdout = strings.clone(borrowed.stdout, allocator) or_return
 		value.stderr = strings.clone(borrowed.stderr, allocator) or_return
+		value.stdout_file = strings.clone(borrowed.stdout_file, allocator) or_return
+		value.stderr_file = strings.clone(borrowed.stderr_file, allocator) or_return
 	case Skills_Output:
 		borrowed := value
 		value.skills = nil
@@ -467,6 +484,8 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 	case Shell_Output:
 		delete(value.stdout, allocator)
 		delete(value.stderr, allocator)
+		delete(value.stdout_file, allocator)
+		delete(value.stderr_file, allocator)
 	case Skills_Output:
 		for item in value.skills {
 			delete(item.name, allocator)
