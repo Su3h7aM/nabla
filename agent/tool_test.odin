@@ -96,8 +96,9 @@ test_admission_rejects_structural_defects :: proc(t: ^testing.T) {
 		{`{"a":[{"b":1,"b":2}]}`, .Duplicate_Field},
 		{`{"a":1} {"b":2}`, .Syntax},
 		{`{"a":1} trailing`, .Syntax},
-		{`{"a":1,}`, .Syntax},
 		{`{,}`, .Syntax},
+		{`{"a":1,,}`, .Syntax},
+		{`{"a":[,]}`, .Syntax},
 		{`{"a":1`, .Syntax},
 		{`{"a" 1}`, .Syntax},
 		{`{"a":`, .Syntax},
@@ -136,6 +137,7 @@ test_admission_repairs_only_what_has_one_reading :: proc(t: ^testing.T) {
 		{" null ", `{}`, {.Empty_Arguments}},
 		{`"{\"command\":\"echo\"}"`, `{"command":"echo"}`, {.Double_Encoded_Object}},
 		{`"{\"command\":\"a\nb\"}"`, `{"command":"a\nb"}`, {.Double_Encoded_Object, .Escaped_Control_Characters}},
+		{`{"command":"x,}", "list":[1, 2,] ,}`, `{"command":"x,}", "list":[1, 2 ]  }`, {.Trailing_Comma}},
 	}
 	for c in repaired {
 		arguments := tool_arguments_prepare(c.raw, context.allocator)

@@ -190,7 +190,7 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 	document := raw
 	repairs: session.Tool_Repairs
 	// Each repair that rewrites the text leaves its result here, released on the way out.
-	rewritten: [3]string
+	rewritten: [4]string
 	defer for text in rewritten { delete(text, allocator) }
 
 	trimmed := strings.trim_space(raw)
@@ -217,6 +217,12 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 			rewritten[2], document = escaped, escaped
 			repairs += {.Escaped_Control_Characters}
 		}
+	}
+	blanked, blanked_any, blank_error := tool_arguments_blank_trailing_commas(document, allocator)
+	if blank_error != nil { arguments.allocation_failed = true; return }
+	if blanked_any {
+		rewritten[3], document = blanked, blanked
+		repairs += {.Trailing_Comma}
 	}
 
 	if admit_error := tool_arguments_admit(document, allocator); admit_error != nil {
@@ -467,6 +473,50 @@ tool_escape_valid :: proc(c: u8) -> bool {
 @(private)
 tool_hex_digit :: proc(c: u8) -> bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+// tool_arguments_blank_trailing_commas writes a space over every comma that follows a value
+// and is followed only by whitespace and the bracket closing its object or array, outside
+// string literals, in a copy owned by allocator. A space keeps every other byte where it
+// was, so a defect found later is placed in the text as the model sent it. A comma after
+// another comma or after an opening bracket is left, because it has no one reading.
+@(private)
+tool_arguments_blank_trailing_commas :: proc(raw: string, allocator: mem.Allocator) -> (repaired: string, changed: bool, err: mem.Allocator_Error) {
+	output: []u8
+	in_string, escaped := false, false
+	previous: u8
+	for current, index in transmute([]u8)raw {
+		if in_string {
+			switch {
+			case escaped:
+				escaped = false
+			case current == '\\':
+				escaped = true
+			case current == '"':
+				in_string = false
+				previous = current
+			}
+			continue
+		}
+		switch current {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '"':
+			in_string = true
+		case ',':
+			ends_value := previous != 0 && previous != ',' && previous != '{' && previous != '[' && previous != ':'
+			rest := strings.trim_left(raw[index + 1:], " \t\n\r")
+			closes := strings.has_prefix(rest, "}") || strings.has_prefix(rest, "]")
+			if ends_value && closes {
+				if output == nil { output = transmute([]u8)(strings.clone(raw, allocator) or_return) }
+				output[index] = ' '
+				continue
+			}
+		}
+		previous = current
+	}
+	if output == nil { return "", false, nil }
+	return string(output), true, nil
 }
 
 // tool_control_escape is the JSON escape of one control byte: its short form where JSON has

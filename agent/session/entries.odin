@@ -105,6 +105,8 @@ Tool_Repair :: enum {
 	Integer_From_String,
 	// An integer field held a number with no fractional part.
 	Integer_From_Float,
+	// A comma after the last value of an object or array was dropped.
+	Trailing_Comma,
 }
 
 Tool_Repairs :: bit_set[Tool_Repair]
@@ -116,6 +118,7 @@ tool_repair_names := [Tool_Repair]string {
 	.Double_Encoded_Object      = "double_encoded_object",
 	.Integer_From_String        = "integer_from_string",
 	.Integer_From_Float         = "integer_from_float",
+	.Trailing_Comma             = "trailing_comma",
 }
 
 tool_repair_name :: proc(repair: Tool_Repair) -> string {

@@ -712,7 +712,7 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 
 A call the model got slightly wrong is repaired whenever its intent has exactly one reading, and refused only when it has none or more than one. Repair is part of admission, not a per-tool feature: every call, whether from the provider, a Lua script, a Task, or MCP, passes through the same two places, so a new tool gets every repair by using the shared readers.
 
-- Document repairs, in `tool_arguments_prepare`, run on the argument text before it is admitted: empty or `null` arguments are the empty object; a raw control byte inside a string literal is its escape; a document that is one JSON string whose content is an object is that object. A Lua table always writes a well-formed document, so these only ever change provider text.
+- Document repairs, in `tool_arguments_prepare`, run on the argument text before it is admitted: empty or `null` arguments are the empty object; a raw control byte inside a string literal is its escape; a document that is one JSON string whose content is an object is that object; a comma after the last value of an object or array is blanked with a space, which keeps every other byte in place so a remaining defect is reported where the model wrote it. A comma after another comma or after an opening bracket has no one reading and is refused. A Lua table always writes a well-formed document, so these only ever change provider text.
 - Value repairs, in the shared field readers, run while a tool reads its declared fields, because only the reader knows the declared type: an integer field accepts a whole number within 2^53 and a string holding exactly one decimal integer (optional leading minus, no leading zero, nothing else). The reader writes the integer back into the document. For a tool whose arguments the harness does not read (MCP and custom tools), the registry reads the top-level fields whose schema type accepts an integer but neither a string nor a number, and admission applies the same repair to them; every other value travels as sent for the tool to judge.
 
 Admission also refuses a number the parser cannot hold as written, an integer past the 64-bit range or a float that overflows to infinity, because the parser would otherwise wrap or saturate it and run the call with a number the model never sent.
@@ -724,6 +724,7 @@ Tool_Repair :: enum {
 	Double_Encoded_Object,
 	Integer_From_String,
 	Integer_From_Float,
+	Trailing_Comma,
 }
 Tool_Repairs :: bit_set[Tool_Repair]
 ```
