@@ -6,6 +6,8 @@ import "core:path/filepath"
 import "core:strings"
 import "core:unicode/utf8"
 
+import "nabla:agent/journal"
+
 // A tool result is always kept whole, but the model is shown at most a preview of it. A
 // result larger than the preview, or larger than the room the batch has left in the
 // context, is written to a file under the session's output directory, and the model sees
@@ -124,10 +126,10 @@ tool_output_directory :: proc(id: string, allocator := context.allocator) -> str
 }
 
 // chat_tool_output_path is the temp-allocated path that names the kept output of the call
-// recorded at call_seq, followed by suffix, or "" when the session has no output directory.
-chat_tool_output_path :: proc(chat: ^Chat_Session, call_seq: i64, suffix := ".txt", allocator := context.temp_allocator) -> string {
+// call, followed by suffix, or "" when the session has no output directory.
+chat_tool_output_path :: proc(chat: ^Chat_Session, call: journal.Call_Id, suffix := ".txt", allocator := context.temp_allocator) -> string {
 	if chat.tool_output_directory == "" { return "" }
-	path, join_error := filepath.join({chat.tool_output_directory, fmt.tprintf("%d%s", call_seq, suffix)}, allocator)
+	path, join_error := filepath.join({chat.tool_output_directory, fmt.tprintf("%d%s", call, suffix)}, allocator)
 	if join_error != nil { return "" }
 	return path
 }

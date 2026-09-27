@@ -7,8 +7,6 @@ import "core:mem"
 import "core:strconv"
 import "core:strings"
 
-import "nabla:agent/session"
-
 // An argument document is admitted at whatever size the model sent. The harness does not
 // bound the model's own output: the model and the provider are the only parties that may,
 // and a model that asked for more than the provider allows hears it from the provider that
@@ -23,6 +21,36 @@ TOOL_MAX_ARGS_DEPTH :: 32
 // TOOL_EXACT_FLOAT_INTEGER is the largest magnitude at which every integer has its own f64,
 // so a whole float within it names exactly one integer and one beyond it may not.
 TOOL_EXACT_FLOAT_INTEGER :: 1 << 53
+
+// Tool_Repair is one change of representation the harness made to a proposed call so it
+// could be read. A call's repairs are recorded as a set beside the arguments it actually ran
+// with, so a reader can tell a repaired call from an untouched one without diffing the
+// proposal. An empty set means nothing was changed.
+Tool_Repair :: enum {
+	// A raw control byte inside a string literal was written as its escape.
+	Escaped_Control_Characters,
+	// Empty or null arguments were read as the empty object.
+	Empty_Arguments,
+	// The arguments were a JSON string holding one object, which was read as that object.
+	Double_Encoded_Object,
+	// An integer field held a string of exactly one integer in decimal.
+	Integer_From_String,
+	// An integer field held a number with no fractional part.
+	Integer_From_Float,
+	// A comma after the last value of an object or array was dropped.
+	Trailing_Comma,
+}
+
+Tool_Repairs :: bit_set[Tool_Repair]
+
+TOOL_REPAIR_NAMES := [Tool_Repair]string {
+	.Escaped_Control_Characters = "escaped_control_characters",
+	.Empty_Arguments            = "empty_arguments",
+	.Double_Encoded_Object      = "double_encoded_object",
+	.Integer_From_String        = "integer_from_string",
+	.Integer_From_Float         = "integer_from_float",
+	.Trailing_Comma             = "trailing_comma",
+}
 
 Tool_Argument_Error_Kind :: enum {
 	Not_Object,
@@ -166,7 +194,7 @@ Tool_Arguments :: struct {
 	status:            Tool_Arguments_Status,
 	value:             json.Value,
 	effective:         string,
-	repairs:           session.Tool_Repairs,
+	repairs:           Tool_Repairs,
 	error:             Tool_Argument_Error,
 	allocation_failed: bool,
 }
@@ -188,7 +216,7 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 	// it, so the status is never left to mean two things.
 	arguments.status = .Rejected
 	document := raw
-	repairs: session.Tool_Repairs
+	repairs: Tool_Repairs
 	// Each repair that rewrites the text leaves its result here, released on the way out.
 	rewritten: [4]string
 	defer for text in rewritten { delete(text, allocator) }
@@ -271,11 +299,11 @@ tool_arguments_string_document :: proc(document: string, allocator: mem.Allocato
 }
 
 // tool_repairs_text names a set of repairs in declaration order, joined by commas.
-tool_repairs_text :: proc(repairs: session.Tool_Repairs, allocator := context.allocator) -> string {
+tool_repairs_text :: proc(repairs: Tool_Repairs, allocator := context.allocator) -> string {
 	builder := strings.builder_make(allocator)
 	for repair in repairs {
 		if strings.builder_len(builder) > 0 { strings.write_string(&builder, ", ") }
-		strings.write_string(&builder, session.tool_repair_name(repair))
+		strings.write_string(&builder, TOOL_REPAIR_NAMES[repair])
 	}
 	return strings.to_string(builder)
 }
@@ -596,7 +624,7 @@ tool_field_int :: proc(
 	object: json.Object,
 	name: string,
 	minimum, maximum: int,
-	repairs: ^session.Tool_Repairs,
+	repairs: ^Tool_Repairs,
 	path := "",
 	allocator := context.allocator,
 ) -> (
@@ -613,7 +641,7 @@ tool_field_optional_int :: proc(
 	object: json.Object,
 	name: string,
 	fallback, minimum, maximum: int,
-	repairs: ^session.Tool_Repairs,
+	repairs: ^Tool_Repairs,
 	path := "",
 	allocator := context.allocator,
 ) -> (
@@ -632,7 +660,7 @@ tool_field_int_value :: proc(
 	slot: ^json.Value,
 	path: string,
 	minimum, maximum: int,
-	repairs: ^session.Tool_Repairs,
+	repairs: ^Tool_Repairs,
 	allocator: mem.Allocator,
 ) -> (
 	int,
@@ -652,7 +680,7 @@ tool_field_int_value :: proc(
 // tool_fields_repair_integers repairs the named integer fields of a document whose fields
 // the harness does not read itself. A value with one integer reading is written back as
 // that integer; any other value is left for the tool to judge.
-tool_fields_repair_integers :: proc(object: json.Object, names: []string, repairs: ^session.Tool_Repairs, allocator := context.allocator) {
+tool_fields_repair_integers :: proc(object: json.Object, names: []string, repairs: ^Tool_Repairs, allocator := context.allocator) {
 	object := object
 	for name in names {
 		slot, present := &object[name]
@@ -665,7 +693,7 @@ tool_fields_repair_integers :: proc(object: json.Object, names: []string, repair
 // tool_integer_write_back replaces a value read as an integer with that integer when
 // reading it was a repair, so the document says what the call runs with.
 @(private)
-tool_integer_write_back :: proc(slot: ^json.Value, number: int, repair: Maybe(session.Tool_Repair), repairs: ^session.Tool_Repairs, allocator: mem.Allocator) {
+tool_integer_write_back :: proc(slot: ^json.Value, number: int, repair: Maybe(Tool_Repair), repairs: ^Tool_Repairs, allocator: mem.Allocator) {
 	repair, repaired := repair.?
 	if !repaired { return }
 	json.destroy_value(slot^, allocator)
@@ -678,7 +706,7 @@ tool_integer_write_back :: proc(slot: ^json.Value, number: int, repair: Maybe(se
 // no sign other than a leading minus, no leading zero, and nothing around it. repair names
 // the change when the value was not already an integer.
 @(private)
-tool_integer_reading :: proc(value: json.Value) -> (number: int, repair: Maybe(session.Tool_Repair), readable: bool) {
+tool_integer_reading :: proc(value: json.Value) -> (number: int, repair: Maybe(Tool_Repair), readable: bool) {
 	#partial switch v in value {
 	case json.Integer:
 		return int(v), nil, true

@@ -7,7 +7,7 @@ import "core:strings"
 import "core:time"
 import "core:unicode/utf8"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 TOOL_SHELL_NAME :: "builtin_shell"
 
@@ -159,7 +159,7 @@ tool_shell_not_started :: proc(ctx: ^Tool_Context, cause: os.Error, data: Shell_
 }
 
 // tool_shell_finish sanitizes the captured streams to valid UTF-8 and builds the result.
-tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, message: string, captured: Shell_Output, reason := "") -> Tool_Result {
+tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, message: string, captured: Shell_Output, reason := "") -> Tool_Result {
 	data := captured
 	stdout_sanitized := tool_sanitize_stream(data.stdout, ctx.allocator)
 	defer delete(stdout_sanitized, ctx.allocator)

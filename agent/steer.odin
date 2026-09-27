@@ -4,7 +4,7 @@ import "core:mem"
 import "core:strings"
 import "core:sync"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 // Steering accepts input while a turn is running. A line the user or another agent sends is
@@ -130,12 +130,12 @@ chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer:
 // what makes the line the session's, and a store that refuses the write leaves it pending
 // instead of dropping a message. The refusal is reported, so a line that cannot be delivered
 // yet is diagnosable rather than gone.
-chat_drain_queue :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue: ^Steer_Queue, origin: session.User_Origin) -> int {
+chat_drain_queue :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue: ^Steer_Queue, origin: journal.User_Origin) -> int {
 	recorded := 0
 	for {
 		line, ok := steer_pop(queue)
 		if !ok { break }
-		switch chat_session_steer(chat, line, session.now_ms(), origin) {
+		switch chat_session_steer(chat, line, origin) {
 		case .Recorded:
 			_observer_user_text(observer, line)
 			steer_line_free(queue, line)

@@ -3,14 +3,14 @@ package agent
 import "core:fmt"
 import "core:strings"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 // Codemode_Child is one call a script started. Its handle is its position plus one. job is
 // borrowed and stays valid until the batch is destroyed, because a retired job keeps its
 // record and its name until then.
 Codemode_Child :: struct {
 	job:       ^Tool_Job,
-	outcome:   session.Tool_Outcome,
+	outcome:   journal.Tool_Outcome,
 	committed: bool, // the result is recorded and kept for job.wait
 	consumed:  bool, // job.wait took the result
 }
@@ -118,19 +118,14 @@ codemode_job_start_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: 
 	defer delete(arguments, run.allocator)
 
 	call_id := fmt.tprintf("%s/%d", parent.call_id, len(parent.lua_children) + 1)
-	entry := session.New_Entry {
-		turn_no = chat.turn_no,
-		request_no = chat.active_request,
-		created_at_ms = session.now_ms(),
-		parent_call_seq = parent.call.seq,
-		payload = session.Tool_Call_Entry{call_id = call_id, name = name, arguments = arguments},
-	}
-	call_seq, append_error := session.entry_append(chat.store, chat.id, entry)
-	if append_error != nil {
-		chat_session_record_failure(chat, "the nested tool call could not be recorded", append_error)
-		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool call could not be recorded", "storage failed")
-		return
-	}
+	// The proposal is buffered here and committed with the child's admission.
+	call := journal.next_call(chat.store)
+	chat_record(
+		chat,
+		{kind = .Tool_Proposed, request = chat.request, call = call, parent_call = parent.call.call},
+		journal.Tool_Proposed{provider_id = call_id, name = name},
+		transmute([]u8)arguments,
+	)
 
 	// The job struct comes from the same heap as its data: a worker releases a job the owner
 	// handed back, so that allocation has to outlive the batch and its session.
@@ -153,7 +148,7 @@ codemode_job_start_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: 
 			id = strings.clone(call_id, allocator),
 			name = strings.clone(name, allocator),
 			arguments = strings.clone(arguments, allocator),
-			seq = call_seq,
+			call = call,
 		},
 	}
 	child.call = &child.nested_call
@@ -293,7 +288,7 @@ codemode_job_answer_value :: proc(job: ^Tool_Job) {
 // no longer waits for. The outcome says what the harness observed, and the diagnostic which
 // limit or fault Code Mode hit.
 @(private)
-codemode_job_answer :: proc(job: ^Tool_Job, outcome: session.Tool_Outcome, diagnostic: Codemode_Diagnostic, message: string, reason: string) {
+codemode_job_answer :: proc(job: ^Tool_Job, outcome: journal.Tool_Outcome, diagnostic: Codemode_Diagnostic, message: string, reason: string) {
 	codemode_job_stop_children(job)
 	output := Codemode_Output {
 		failure = codemode_diagnostic_names[diagnostic],
@@ -309,18 +304,18 @@ codemode_job_answer :: proc(job: ^Tool_Job, outcome: session.Tool_Outcome, diagn
 }
 
 // codemode_job_result adds the summaries of the calls the script made, so a model can audit
-// it and read one child's full result back by its sequence.
+// it and read one child's full result back by its call id.
 @(private)
-codemode_job_result :: proc(job: ^Tool_Job, outcome: session.Tool_Outcome, message: string, output: Codemode_Output, reason: string) -> Tool_Result {
+codemode_job_result :: proc(job: ^Tool_Job, outcome: journal.Tool_Outcome, message: string, output: Codemode_Output, reason: string) -> Tool_Result {
 	output := output
 	summaries: [CODEMODE_MAX_CALL_SUMMARIES]Codemode_Call
 	for entry in job.lua_children {
 		if !entry.committed { continue }
 		if output.calls_total < len(summaries) {
 			summaries[output.calls_total] = {
-				call_seq = i64(entry.job.call.seq),
-				name     = entry.job.name,
-				outcome  = session.tool_outcome_name(entry.outcome),
+				call    = entry.job.call.call,
+				name    = entry.job.name,
+				outcome = journal.TOOL_OUTCOME_NAMES[entry.outcome],
 			}
 		}
 		output.calls_total += 1

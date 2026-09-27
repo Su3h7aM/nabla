@@ -2,7 +2,7 @@ package agent
 
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:mcp"
 
 @(private)
@@ -18,7 +18,7 @@ log_mcp_exchange_finished :: proc(
 	backend: ^MCP_Tool_Backend,
 	delivery: mcp.Delivery_State,
 	exchange_error: mcp.Error,
-	outcome: session.Tool_Outcome,
+	outcome: journal.Tool_Outcome,
 	elapsed: time.Duration,
 ) {
 	server_id, remote_name := "", ""
@@ -31,7 +31,7 @@ log_mcp_exchange_finished :: proc(
 		{key = "remote_name", value = remote_name},
 		{key = "delivery", value = delivery_name},
 		{key = "error_kind", value = log_mcp_error_name(exchange_error.kind)},
-		{key = "outcome", value = session.tool_outcome_name(outcome)},
+		{key = "outcome", value = journal.TOOL_OUTCOME_NAMES[outcome]},
 		{key = "elapsed_ms", value = Log_Duration_Milliseconds(elapsed)},
 		{key = "remote_code", value = exchange_error.code},
 	}

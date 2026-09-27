@@ -6,18 +6,18 @@ import "core:strings"
 import "core:sync"
 import "core:unicode/utf8"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:agent/skills"
 import "nabla:ai"
 
-// Chat_Tool_Call is a validated tool call awaiting execution. seq is the stored
-// tool-call entry it belongs to, so the dispatch and the result can name it.
+// Chat_Tool_Call is a validated tool call awaiting execution. call is the id its
+// tool.proposed record carries, which its admission and completion name.
 Chat_Tool_Call :: struct {
 	id:        string, // owned
 	item_id:   string, // owned
 	name:      string, // owned
 	arguments: string, // owned; raw JSON, exactly as the model sent it
-	seq:       session.Seq,
+	call:      journal.Call_Id,
 }
 
 // Chat_Response_Output stages one completed Responses output for commit: the
@@ -74,27 +74,33 @@ Chat_Accept :: enum {
 }
 
 // Chat_Session is the running half of a session. Committed history lives in the
-// store; this holds only what the turn in flight needs.
+// journal; this holds only what the turn in flight needs.
 //
-// store is borrowed and must outlive the chat; id is owned by the chat, because
-// the claim that produced it can be released while the chat is still alive
-// (a refused switch puts the running claim back, and the chat must not depend on
-// that claim's storage). The caller owns the store, holds the writer claim for
-// id, and keeps both alive for the session's lifetime.
+// store is borrowed: the caller opens it, claims session, and keeps both for
+// the chat's life. The chat writes through it from the owner thread only.
 Chat_Session :: struct {
-	store:                        ^session.Store,
-	id:                           session.Session_Id, // owned
+	store:                        ^journal.Journal,
+	session:                      journal.Session_Id,
+	session_hex:                  [journal.SESSION_ID_HEX_LENGTH]u8, // read through chat_session_text
+	// branch and head are where the next node is appended: the active branch and
+	// its newest node.
+	branch:                       journal.Branch_Id,
+	head:                         journal.Node_Id,
 	allocator:                    mem.Allocator,
 	state:                        Chat_State,
 	terminal_status:              Chat_Terminal_Status,
 	last_error:                   string, // owned
 
 	// active_turn_id and the operation id are process-local identities. They
-	// name an execution, not a durable turn; turn_no is the durable one.
+	// name an execution, not a durable turn; turn is the durable one, 0 between turns.
 	active_turn_id:               u64,
 	next_turn_id:                 u64,
-	turn_no:                      Maybe(session.Turn_No),
-	active_request:               Maybe(session.Request_No),
+	turn:                         journal.Turn_Id,
+	// request is the response request in flight or last sent in the turn, 0 before one.
+	request:                      journal.Request_Id,
+	// response_node is the Assistant node of the response whose calls are running,
+	// which their tool records name.
+	response_node:                journal.Node_Id,
 	next_operation_id:            u64,
 	operation:                    Chat_Operation,
 
@@ -216,7 +222,10 @@ Chat_Session :: struct {
 	skill_catalog:                Maybe(skills.Catalog),
 	skill_instructions:           string, // owned; exact normal-request prefix
 	client_instructions:          string, // owned; client-supplied standing system instructions
-	skill_snapshot_seq:           Maybe(session.Seq),
+	// instructions_digest and manifest_digest name the snapshot artifacts that
+	// skill_instructions and skill_catalog came from; zero until one is settled.
+	instructions_digest:          journal.Digest,
+	manifest_digest:              journal.Digest,
 	disable_project_instructions: bool,
 
 	// role_instructions are appended after everything else the instructions hold, so a
@@ -241,16 +250,17 @@ Chat_Session :: struct {
 	stop_parent:                  ^ai.Interrupt,
 }
 
-// chat_session_init builds the running state for a claimed session. workspace is
-// the validated process directory; it is copied, because the caller's copy may
-// be temporary. The session id is copied too: the chat owns its identity rather
-// than borrowing it from whichever claim happens to be in the store.
+// chat_session_init builds the running state for a session the caller claimed in
+// store, positioned at branch and head. workspace is the validated process
+// directory; it is copied, because the caller's copy may be temporary.
 //
 // Diagnostics are not a field here. The session's work inherits the writer from
 // context.logger, which is what lets a call site emit without threading one.
 chat_session_init :: proc(
-	store: ^session.Store,
-	id: session.Session_Id,
+	store: ^journal.Journal,
+	session: journal.Session_Id,
+	branch: journal.Branch_Id,
+	head: journal.Node_Id,
 	workspace: string,
 	allocator := context.allocator,
 ) -> (
@@ -264,8 +274,10 @@ chat_session_init :: proc(
 	if tool_error.kind != .None { return {}, tool_error }
 	chat := Chat_Session {
 		store             = store,
+		session           = session,
+		branch            = branch,
+		head              = head,
 		compact_retry     = chat_retry_policy_default(),
-		id                = session.Session_Id(strings.clone(string(id), allocator)),
 		allocator         = allocator,
 		next_turn_id      = 1,
 		next_operation_id = 1,
@@ -276,7 +288,7 @@ chat_session_init :: proc(
 		workspace         = strings.clone(workspace, allocator),
 		tools             = tools,
 	}
-	chat.tool_output_directory = tool_output_directory(string(chat.id), allocator)
+	chat.tool_output_directory = tool_output_directory(chat_session_text(&chat), allocator)
 	// A worker publishes through the mailbox, so its payloads come from the process heap
 	// rather than from the allocator the owner may be writing through at the same time.
 	mailbox_init(&chat.mailbox, os.heap_allocator())
@@ -297,7 +309,8 @@ chat_session_set_client_instructions :: proc(chat: ^Chat_Session, instructions: 
 	delete(chat.skill_instructions, chat.allocator)
 	chat.skill_instructions = ""
 	chat_skill_catalog_release(chat)
-	chat.skill_snapshot_seq = nil
+	chat.instructions_digest = {}
+	chat.manifest_digest = {}
 	return true
 }
 
@@ -405,7 +418,6 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	delete(chat.client_instructions, chat.allocator)
 	chat.client_instructions = ""
 	delete(chat.role_instructions, chat.allocator)
-	delete(string(chat.id), chat.allocator)
 	delete(chat.partial_assistant)
 	chat_pending_response_clear(chat)
 	for &call in chat.pending_calls { chat_tool_call_destroy(&call, chat.allocator) }
@@ -471,52 +483,43 @@ chat_title_from_prompt :: proc(prompt: string, allocator := context.allocator) -
 // failed for any reason leaves the record's state in question, and separating
 // the kinds here would buy a more permissive policy at the cost of having to
 // reason about which failures are safe to continue past.
-chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, err: session.Error) {
-	local := err
-	chat_session_record_failure_detail(chat, what, session.error_detail(&local), session.error_kind(local))
+chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, error: journal.Error) {
+	detail := journal.error_text(error, chat.allocator)
+	defer delete(detail, chat.allocator)
+	chat_session_fail(chat, what, detail)
 }
 
-// chat_session_record_failure_detail is the same storage stop for failures that
-// happen before the store sees a row, such as encoding a request record. Keeping
-// the detail separate lets those failures join the same latched state without
-// inventing a fake session-store error.
-chat_session_record_failure_detail :: proc(chat: ^Chat_Session, what: string, detail: string, kind: session.Error_Kind) {
+// chat_session_fail is the same stop for a failure the journal did not report,
+// such as a snapshot the harness could not build.
+chat_session_fail :: proc(chat: ^Chat_Session, what: string, detail := "") {
 	delete(chat.last_error, chat.allocator)
-	if what == "" {
-		chat.last_error = chat_clone_string(detail, chat.allocator)
+	if detail == "" {
+		chat.last_error = chat_clone_string(what, chat.allocator)
 	} else {
 		chat.last_error = strings.concatenate({what, ": ", detail}, chat.allocator)
 	}
-	// The record names the local step that failed, the store's classification, and
-	// how much detail the store gave. The text itself stays out: a storage failure
-	// is a local exception, and one can name a path or a row. The full message is
-	// what the front-end shows, which is outside the persisted stream.
 	// The failure can be reached from any depth, so the binding is narrowed here to
 	// the session the failure belongs to.
 	binding: Log_Binding
 	previous_logger := context.logger
 	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation(chat))
-	fields := [3]Log_Field {
-		{key = "operation", value = what},
-		{key = "error_kind", value = log_error_kind_name(kind)},
-		{key = "detail_bytes", value = i64(len(detail))},
-	}
+	fields := [2]Log_Field{{key = "operation", value = what}, {key = "detail_bytes", value = i64(len(detail))}}
 	log_emit({level = .Error, category = .Storage, event = "storage.failed", fields = fields[:]})
 	chat.active_failed = true
 	chat.storage_failed = true
 	chat.state = .Finalizing
 }
 
-// chat_session_accept_user admits a prompt: it opens a turn and records the
-// prompt as that turn's first entry before any request is made.
-chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> Chat_Accept {
-	return chat_session_accept_message(chat, text, at_ms, .Prompt)
+// chat_session_accept_user admits a prompt: it opens a turn and commits the
+// prompt as that turn's User node before any request is made.
+chat_session_accept_user :: proc(chat: ^Chat_Session, text: string) -> Chat_Accept {
+	return chat_session_accept_message(chat, text, .Prompt)
 }
 
 // chat_session_accept_message is chat_session_accept_user for text that did not come from
 // the user, such as a subagent's report that arrived while no turn ran.
-chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, at_ms: i64, origin: session.User_Origin) -> Chat_Accept {
+chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: journal.User_Origin) -> Chat_Accept {
 	if chat.storage_failed { return .Storage_Failed }
 	if chat.state != .Idle { return .Busy }
 
@@ -527,48 +530,41 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, at_ms: i6
 	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation(chat))
 
-	// The first prompt is what records the session. Everything below needs the row
-	// to exist, and the write leaves a session that already has one alone, so a
-	// resumed session keeps the time and title it was created with.
-	header := session.Session {
-		id            = chat.id,
-		created_at_ms = at_ms,
-		updated_at_ms = at_ms,
-		workspace     = chat.workspace,
-		provider      = chat.provider_id,
-		model         = chat.model_id,
-	}
-	if record_err := session.session_record(chat.store, header); record_err != nil {
-		chat_session_record_failure(chat, "the session could not be recorded", record_err)
+	// The turn names the instruction snapshot it runs with, so it is settled first.
+	// A failure latches the session with no turn open, so the chat stays idle.
+	if !chat_ensure_instructions(chat) {
+		chat.state = .Idle
 		return .Storage_Failed
 	}
 
-	// The header records which model the session last ran with, so a later
-	// continuation starts from it rather than from nothing.
-	if chat.provider_id != "" && chat.model_id != "" {
-		if model_err := session.session_set_model(chat.store, chat.id, chat.provider_id, chat.model_id); model_err != nil {
-			chat_session_record_failure(chat, "the session model could not be recorded", model_err)
-			return .Storage_Failed
-		}
-	}
-	// The first prompt names the session, so a listing says what each session was
-	// about without asking the user to name it.
-	if chat.next_turn_id == 1 {
+	// The first turn names the session, so a listing says what each session was about
+	// without asking the user to name it. Its commit is also what first writes the
+	// session, so a session nobody prompted is never recorded.
+	first := chat.store.counters.turn == 0
+	chat.turn = journal.next_turn(chat.store)
+	chat.request = 0
+	if first {
 		title := chat_title_from_prompt(text, chat.allocator)
 		defer delete(title, chat.allocator)
-		if title_err := session.session_set_title_if_untitled(chat.store, chat.id, title); title_err != nil {
-			chat_session_record_failure(chat, "the session title could not be recorded", title_err)
-			return .Storage_Failed
-		}
+		chat_record(chat, {kind = .Session_Titled}, journal.Session_Titled{title = title})
 	}
-
-	turn_no, turn_err := session.turn_begin(chat.store, chat.id, text, origin, at_ms)
-	if turn_err != nil {
-		chat_session_record_failure(chat, "the prompt could not be recorded", turn_err)
+	started := journal.Turn_Started {
+		model  = chat.model_id,
+		effort = chat.effort,
+	}
+	instructions_hex: [journal.DIGEST_HEX_LENGTH]u8
+	manifest_hex: [journal.DIGEST_HEX_LENGTH]u8
+	if chat.instructions_digest != {} {
+		started.instructions = journal.digest_to_hex(chat.instructions_digest, instructions_hex[:])
+		started.manifest = journal.digest_to_hex(chat.manifest_digest, manifest_hex[:])
+	}
+	chat_record(chat, {kind = .Turn_Started, provider = chat.provider_id, model = chat.model_id}, started)
+	chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin]}, transmute([]u8)text)
+	if !chat_commit(chat, "the prompt could not be recorded") {
+		chat.turn = 0
 		return .Storage_Failed
 	}
 
-	chat.turn_no = turn_no
 	chat.active_turn_id = chat.next_turn_id
 	chat.next_turn_id += 1
 	chat.state = .Preparing

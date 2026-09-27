@@ -4,7 +4,7 @@ import "core:fmt"
 import "core:mem"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 Chat_Effect_Kind :: enum {
@@ -347,24 +347,15 @@ chat_session_terminal_status :: proc(chat: ^Chat_Session) -> Chat_Terminal_Statu
 	return chat.terminal_status
 }
 
-// chat_session_steer records a queued line as a user entry of the running turn. Unlike
+// chat_session_steer commits a queued line as a User node of the running turn. Unlike
 // accept_user it starts no turn and resets no budget: the turn keeps its identity and its
 // counters, so a steering line changes what a later request sends, never work already
-// committed. Recording is what makes the line the session's, and the entry is ordered
-// where it is written, so the request that follows reads the line after everything that
-// was committed before it.
-chat_session_steer :: proc(chat: ^Chat_Session, text: string, at_ms: i64, origin := session.User_Origin.Steering) -> Chat_Steer_Result {
-	turn_no, has_turn := chat.turn_no.?
-	if !has_turn { return .No_Turn }
-	entry := session.New_Entry {
-		turn_no = turn_no,
-		created_at_ms = at_ms,
-		payload = session.User_Entry{text = text, origin = origin},
-	}
-	if _, err := session.entry_append(chat.store, chat.id, entry); err != nil {
-		chat_session_record_failure(chat, "the steering line could not be recorded", err)
-		return .Storage_Failed
-	}
+// committed. Committing is what makes the line the session's, and the node follows the
+// head, so the request that follows reads the line after everything committed before it.
+chat_session_steer :: proc(chat: ^Chat_Session, text: string, origin := journal.User_Origin.Steering) -> Chat_Steer_Result {
+	if chat.turn == 0 { return .No_Turn }
+	chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin]}, transmute([]u8)text)
+	if !chat_commit(chat, "the steering line could not be recorded") { return .Storage_Failed }
 	return .Recorded
 }
 

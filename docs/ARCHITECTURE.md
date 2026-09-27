@@ -438,6 +438,7 @@ append_record  :: proc(journal: ^Journal, header: Record, data: $Payload, body: 
 append_node    :: proc(journal: ^Journal, node: Node, data: $Payload, body: []u8 = nil) -> Node_Id
 append_branch  :: proc(journal: ^Journal, base: Node_Id) -> Branch_Id
 put_artifact   :: proc(journal: ^Journal, kind: string, bytes: []u8) -> Digest         // buffered; INSERT OR IGNORE by SHA-256
+next_turn      :: proc(journal: ^Journal) -> Turn_Id                                  // also next_request, next_call
 commit         :: proc(journal: ^Journal) -> (Journal_Seq, Error)                      // durable barrier; flushes the buffer
 flush_due      :: proc(journal: ^Journal, now: time.Tick) -> Error                     // commits observations past a batch limit
 flush_deadline :: proc(journal: ^Journal) -> Maybe(time.Tick)
@@ -452,6 +453,8 @@ cache_coverage :: proc(totals: Usage_Totals) -> (share: f64, measured: bool)
 list_sessions  :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.Allocator) -> ([]Session_Summary, Error)
 list_branches  :: proc(journal: ^Journal, session: Session_Id, allocator: mem.Allocator) -> ([]Branch_Summary, Error)
 recover        :: proc(journal: ^Journal) -> (Recovery, Error)                         // the claimed session, one transaction
+payload_decode :: proc(data: string, payload: ^$Payload, allocator: mem.Allocator) -> Error // Corrupt when data does not decode
+error_text     :: proc(error: Error, allocator := context.allocator) -> string
 ```
 
 Records and nodes are journal-owned plain data (strings, integers, enums). `agent` maps its execution types to them; `agent/journal` never imports `agent`. The identities of section 5 are declared in `agent/journal`, the innermost package that stores them, and `agent` uses them from there.
@@ -460,7 +463,7 @@ Records and nodes are journal-owned plain data (strings, integers, enums). `agen
 - A `Journal` is one connection used by one thread. Each owner opens its own and claims one session; frontends and diagnostics open `Read_Only` journals that never claim, migrate, or write.
 - The journal fills `time_ms`, `mono_ns`, and `run` on every record. The caller fills the correlation columns.
 - `data` is encoded from a typed payload struct declared in `agent/journal`, one per kind, named after it (`Tool_Completed` for `tool.completed`). Records and nodes are copied into a batch arena at append, so the caller's memory is borrowed only for the call.
-- The journal allocates `Node_Id` and `Branch_Id` at append, from the counters loaded by `claim`. `Counters` also carries the highest turn, request, and call ids, so the owner continues numbering after a restart.
+- The journal allocates `Node_Id` and `Branch_Id` at append, and turn, request, and call ids through `next_turn`, `next_request`, and `next_call`, all from the counters loaded by `claim`, so the owner continues numbering after a restart.
 - Each node append also writes a `node.committed` record in the same transaction, and the node's `seq` is that record's seq. Branches (`branch.created`) and sessions (`session.created`) follow the same rule, so the records table is the one global order.
 - `append_record`, `append_node`, `append_branch`, and `put_artifact` return no error. An encoding or allocation failure latches in `journal.failure` and is returned by the next `commit`. A failed commit rolls back and latches its cause the same way: the session is `Storage_Failed`, every later append is dropped, and every later commit returns that cause. Appending through a read-only journal or for a session the journal did not claim is a programming error and asserts.
 - Corrupt or unreadable data returns `.Corrupt`, and the journal keeps the session and seq of the offending row in `journal.corrupt` for the message.
@@ -741,7 +744,7 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 - `Tool_Result :: struct { outcome: Outcome, failure: Maybe(Failure), output: Tool_Output }` is typed and lives in the job arena until committed.
 - At commit the owner renders the model-visible bytes once with the tool's `render` procedure and stores them in the `tool.completed` body; typed fields go to `data`. The projection uses those stored bytes from then on, so resume and cache stay byte-stable. Lua parents receive typed values converted from `Tool_Output`, never the rendering.
 - Rendering format: first line `ok` or `error <kind>: <message>`, then tool-specific `key: value` lines, then a blank line and the raw body (file text, stdout and stderr sections). Raw text avoids JSON escaping inside provider JSON; the format is kept only while measured tokens per successful task confirm it.
-- Retention: a result is never discarded. One larger than what the model is shown is written whole to `$XDG_STATE_HOME/nabla/tool-output/<session>/<call_seq>.txt`, which outlives the process so a resumed session can still read it. The journal stores the text the model was shown. If the file cannot be written, the result is sent whole instead.
+- Retention: a result is never discarded. One larger than what the model is shown is written whole to `$XDG_STATE_HOME/nabla/tool-output/<session>/<call>.txt`, which outlives the process so a resumed session can still read it. The journal stores the text the model was shown. If the file cannot be written, the result is sent whole instead.
 - Preview: the model is shown at most `TOOL_RESULT_PREVIEW_BYTES` of one result, cut at a line break, followed by a notice with the shown and total byte counts and the file path. The model reads the rest with `builtin_read`; there is no separate result-reading tool.
 - Context budget: a batch charges root results in call order against the room left in the context, reserving `TOOL_RESULT_NOTICE_TOKENS` for each later result, and a result's preview shrinks to its allowance, down to the notice alone. The decision is stored with the result, so later requests project identical bytes.
 
@@ -749,7 +752,7 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 
 - Read: open once, `fstat` that descriptor; text only (no NUL, valid UTF-8); the model chooses the line window, and the result is projected through the context budget like any other.
 - Write: validate, temp file in the same directory, write, fsync, rename; refuse symlinks and non-regular targets; keep the mode.
-- Shell: `$SHELL -c` (fallback `/bin/sh` only when exec failed), fresh process group, stdin closed, inherited environment, async-signal-safe child path, one `poll` over both pipes, the child's exit handle, and the job's stop wake with the deadline as its timeout, TERM to the group then KILL after `SHELL_KILL_GRACE`, reap, exec failure distinct from exit 127, UTF-8-sanitized output retained whole: each stream is held in memory up to `TOOL_STREAM_MEMORY_BYTES` and past that written as it arrives to `<call_seq>.stdout.txt` or `<call_seq>.stderr.txt` beside the other kept outputs, with only its beginning in the result. The timeout is the model's value when given, else the default; there is no maximum.
+- Shell: `$SHELL -c` (fallback `/bin/sh` only when exec failed), fresh process group, stdin closed, inherited environment, async-signal-safe child path, one `poll` over both pipes, the child's exit handle, and the job's stop wake with the deadline as its timeout, TERM to the group then KILL after `SHELL_KILL_GRACE`, reap, exec failure distinct from exit 127, UTF-8-sanitized output retained whole: each stream is held in memory up to `TOOL_STREAM_MEMORY_BYTES` and past that written as it arrives to `<call>.stdout.txt` or `<call>.stderr.txt` beside the other kept outputs, with only its beginning in the result. The timeout is the model's value when given, else the default; there is no maximum.
 - MCP: one shared executor; one request at a time per client lane. Delivery state maps to `Transport_Failed` (not delivered) or `Unknown` (delivered, no reply). Non-text blocks are described, not dumped.
 
 ## 15. Deterministic repair

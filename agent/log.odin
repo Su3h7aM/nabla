@@ -10,13 +10,11 @@ import "core:sync"
 import "core:time"
 import "core:unicode/utf8"
 
-import "nabla:agent/session"
-
 // A Log is one process run's diagnostic stream: JSON Lines records written
 // synchronously under a mutex, one file per segment inside a private run
 // directory. It records what the harness observed at named boundaries, which
 // request was prepared, what was encoded, where a failure happened. It is not
-// durable like the session database and never authoritative over it.
+// durable like the journal and never authoritative over it.
 //
 // The log owns its run directory, its segment file, and its run id. Everything a
 // record borrows is consumed by the emit call and never retained, so a caller can
@@ -135,13 +133,13 @@ Log_Record :: struct {
 
 // Log_Correlation is the correlation a record is emitted against. Every identity
 // in it already exists in the harness, so the log keeps no second copy of
-// anything it cannot read from the session itself. Identifiers are borrowed for
+// anything it cannot read from the chat itself. Identifiers are borrowed for
 // one synchronous scope. A zero correlation is a run-level record, not a
 // disabled log.
 Log_Correlation :: struct {
-	session_id:   session.Session_Id,
-	turn_no:      session.Turn_No,
-	request_no:   session.Request_No,
+	session_id:   string,
+	turn_no:      i64,
+	request_no:   i64,
 	attempt:      int,
 	operation_id: u64,
 	call_id:      string,
@@ -809,15 +807,15 @@ log_encode :: proc(log: ^Log, correlation: Log_Correlation, record: Log_Record, 
 	log_line_json_string(&line, record.event)
 	if len(correlation.session_id) > 0 {
 		log_line_bytes(&line, `,"session_id":`)
-		log_line_json_string(&line, string(correlation.session_id))
+		log_line_json_string(&line, correlation.session_id)
 	}
-	if i64(correlation.turn_no) != 0 {
+	if correlation.turn_no != 0 {
 		log_line_bytes(&line, `,"turn_no":`)
-		log_line_int(&line, i64(correlation.turn_no))
+		log_line_int(&line, correlation.turn_no)
 	}
-	if i64(correlation.request_no) != 0 {
+	if correlation.request_no != 0 {
 		log_line_bytes(&line, `,"request_no":`)
-		log_line_int(&line, i64(correlation.request_no))
+		log_line_int(&line, correlation.request_no)
 	}
 	if correlation.attempt != 0 {
 		log_line_bytes(&line, `,"attempt":`)

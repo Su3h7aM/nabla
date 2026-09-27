@@ -1,12 +1,11 @@
 package agent
 
-import "base:runtime"
 import "core:fmt"
 import "core:log"
 import "core:mem/virtual"
 import "core:thread"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 // --- the request chain ---------------------------------------------------------
@@ -69,10 +68,9 @@ Chat_Request_Chain :: struct {
 	assistant_open:      bool,
 	// source is the event source of the last attempt, which its staged output commits under.
 	source:              Chat_Event_Source,
-	// request_no is the last attempt's row, which its response is committed under.
-	request_no:          session.Request_No,
-	// previous is the send before the last one, which the next row names.
-	previous:            Maybe(session.Request_No),
+	// request is the id every attempt of this chain is recorded under, allocated by the
+	// first claim.
+	request:             journal.Request_Id,
 	recovery_kind:       Chat_Recovery_Kind,
 	// repaired records that this chain has used its one context repair. It never resets,
 	// because the bound belongs to the chain rather than to the payload it sends.
@@ -129,53 +127,26 @@ chat_chain_stop :: proc(chat: ^Chat_Session, reason: Request_Recovery_Reason) {
 	chat.chain.stage = .Committing
 }
 
-// chat_record_attempt writes the durable row for one send and returns its number. The
-// row identifies the actual provider send and names the send before it, so a retry is
-// legible from the store rather than reconstructed. It reports false after latching a
-// storage failure, which stops the turn: a send whose row did not land is not sent.
+// chat_record_attempt commits request.sent for one send before it goes out. It reports
+// false after latching a storage failure, which stops the turn: a send whose record did
+// not land is not sent.
 @(private)
-chat_record_attempt :: proc(
-	chat: ^Chat_Session,
-	connection: ai.Provider_Connection,
-	prep: ^Chat_Request_Prep,
-	attempt: Chat_Attempt,
-	encoded: ai.Provider_Encoded_Request,
-) -> (
-	request_no: session.Request_No,
-	recorded: bool,
-) {
-	// The config and input records are built in temp memory and handed to the row: the
-	// scope that made them is the scope that releases them.
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	config_json, config_error := chat_request_config_json(chat, prep.request.Max_Output_Tokens)
-	if config_error != .None {
-		chat_session_record_failure_detail(chat, "the request record could not be encoded", "the request configuration could not be encoded", .Encode)
-		return {}, false
+chat_record_attempt :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, request: journal.Request_Id, attempt: Chat_Attempt) -> bool {
+	header := journal.Record {
+		kind     = .Request_Sent,
+		request  = request,
+		attempt  = journal.Attempt_No(attempt.number),
+		provider = chat.provider_id,
+		model    = chat.model_id,
 	}
-	input_json, input_error := chat_request_input_json(prep, &prep.history, chat.skill_snapshot_seq, len(prep.history.entries), attempt, encoded.Body)
-	if input_error != .None {
-		chat_session_record_failure_detail(chat, "the request record could not be encoded", "the request input could not be encoded", .Encode)
-		return {}, false
+	sent := journal.Request_Sent {
+		purpose         = journal.REQUEST_PURPOSE_NAMES[.Response],
+		api             = chat_api_name(connection.API),
+		model_requested = chat.model_id,
+		recovery        = CHAT_RECOVERY_KIND_NAMES[attempt.recovery],
 	}
-	number, begin_err := session.request_begin(
-		chat.store,
-		chat.id,
-		{
-			turn_no = chat.turn_no,
-			purpose = .Response,
-			provider = chat.provider_id,
-			model_requested = chat.model_id,
-			api = chat_api_name(connection.API),
-			config_json = config_json,
-			input_json = input_json,
-		},
-		session.now_ms(),
-	)
-	if begin_err != nil {
-		chat_session_record_failure(chat, "the request could not be recorded", begin_err)
-		return {}, false
-	}
-	return number, true
+	chat_record(chat, header, sent)
+	return chat_commit(chat, "the request could not be recorded")
 }
 
 // chat_try_context_repair makes room for a payload the provider refused as too large.
@@ -208,14 +179,12 @@ chat_try_context_repair :: proc(
 		// The session keeps the pressure, so the next safe boundary starts the summary
 		// this refusal was missing. A summary already running is promoted instead: it is
 		// the same work, and it installs as soon as it is ready.
-		_ = chat_compact_request(chat, .Provider_Overflow, nil)
+		_ = chat_compact_request(chat, .Provider_Overflow)
 		chat_session_fail_turn(chat, fmt.tprintf("the request does not fit the context: %s", chat_repair_refusal_text(refusal)))
 		return refusal
 	}
-	covered_seq := i64(0)
-	if seq, present := prep.history.covered_seq.?; present { covered_seq = i64(seq) }
 	repaired := [4]Log_Field {
-		{key = "covered_seq", value = covered_seq},
+		{key = "covers", value = i64(prep.projection.covers)},
 		{key = "estimate_before", value = i64(previous_estimate)},
 		{key = "estimate_after", value = i64(prep.estimate)},
 		{key = "next_attempt", value = i64(attempts + 1)},
@@ -234,10 +203,9 @@ chat_try_context_repair :: proc(
 chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, policy: Chat_Retry_Policy, observer: Chat_Observer) {
 	if !chat_session_begin_request(chat) { return }
 	if chat.skill_instructions == "" && !chat_ensure_instructions(chat) { return }
-	// This request has no durable number yet, and the one the previous request left behind
-	// is not its own. Clearing it here keeps the preparation records from naming the wrong
-	// request; the number is set again from what request_begin returns.
-	chat.active_request = nil
+	// This request has no id yet, and the one the previous request left behind is not its
+	// own; the first claim allocates it.
+	chat.request = 0
 	binding: Log_Binding
 	previous_logger := context.logger
 	defer context.logger = previous_logger
@@ -322,14 +290,14 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	// What the harness intends to send is recorded before it is stored, so a request that
 	// never reaches the store still says what it was going to carry.
 	prepared := [10]Log_Field {
-		{key = "purpose", value = session.request_purpose_name(.Response)},
+		{key = "purpose", value = journal.REQUEST_PURPOSE_NAMES[.Response]},
 		{key = "provider", value = chat.provider_id},
 		{key = "model", value = chat.model_id},
 		{key = "api", value = chat_api_name(connection.API)},
 		{key = "transport", value = websocket_request ? "websocket" : "http"},
 		{key = "estimate", value = i64(prep.estimate)},
 		{key = "context_window", value = i64(chat.capacity.window)},
-		{key = "messages", value = i64(len(prep.history.entries))},
+		{key = "messages", value = i64(len(prep.projection.items))},
 		{key = "tools", value = i64(len(prep.tools))},
 		// The endpoint's own records this request did not carry: a prefix change the
 		// conversation's content survived, and the only trace a contradictory or
@@ -386,20 +354,17 @@ chat_chain_claim_send :: proc(chat: ^Chat_Session) -> bool {
 	chain.completion_accepted = false
 	attempt := Chat_Attempt {
 		number   = number,
-		recovery = chain.previous == nil ? .Initial : chain.recovery_kind,
-		previous = chain.previous,
+		recovery = number == 1 ? .Initial : chain.recovery_kind,
 	}
-	row_no, row_ok := chat_record_attempt(chat, chain.connection, &chain.prep, attempt, chain.encoded)
-	if !row_ok {
-		// The row did not land, so nothing is sent. The session already latched the storage
-		// failure; the chain stops with it and commits nothing, because no attempt began.
+	if chain.request == 0 { chain.request = journal.next_request(chat.store) }
+	if !chat_record_attempt(chat, chain.connection, chain.request, attempt) {
+		// The record did not land, so nothing is sent. The session already latched the
+		// storage failure; the chain stops with it and commits nothing, because no attempt began.
 		chat_chain_stop(chat, .Storage_Failed)
 		return false
 	}
 	chain.attempts = number
-	chain.request_no = row_no
-	chain.previous = row_no
-	chat.active_request = row_no
+	chat.request = chain.request
 	chain.stage = .Sending
 	return true
 }
@@ -419,7 +384,7 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation_for(chat, chain.attempts))
 
-	recorded := [1]Log_Field{{key = "purpose", value = session.request_purpose_name(.Response)}}
+	recorded := [1]Log_Field{{key = "purpose", value = journal.REQUEST_PURPOSE_NAMES[.Response]}}
 	log_emit({level = .Info, category = .Storage, event = "request.recorded", fields = recorded[:]})
 	// A send that repeats the same bytes after a failure is a retry, so a reader learns the
 	// chain resumed without diffing attempt numbers. A repaired send is a new payload, and
@@ -554,12 +519,12 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 		chain.stage = .Committing
 		return
 	}
-	// The row is finished before anything is waited on or sent again: how the send failed,
-	// and what the harness decided to do about it, are in the store before the decision is
-	// acted on, with the numbers and the usage of the send that produced them.
-	chat_finish_request(
+	// The send is recorded as ended before anything is waited on or sent again: how it
+	// failed, and what the harness decided to do about it, are in the journal before the
+	// decision is acted on.
+	chat_finish_send(
 		chat,
-		chain.request_no,
+		chain.request,
 		chain.attempts,
 		{
 			outcome = .Failed,
@@ -570,7 +535,6 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 			recovery = chain.decision.reason,
 			delay = chain.decision.delay,
 		},
-		usages,
 	)
 	chain.settled = true
 
@@ -585,7 +549,7 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	// failure it is told about finds it.
 	_observer_retry_scheduled(
 		chain.observer,
-		{request_no = chain.request_no, next_attempt = chain.attempts + 1, failure_class = chain.operation_error.failure_class, delay = chain.decision.delay},
+		{request = chain.request, next_attempt = chain.attempts + 1, failure_class = chain.operation_error.failure_class, delay = chain.decision.delay},
 	)
 	binding: Log_Binding
 	previous_logger := context.logger
@@ -701,7 +665,7 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 		chat_session_feed_error(chat, chain.source, chain.operation_error.detail)
 	}
 	chat_session_retire_operation(chat)
-	chat_commit_response(chat, chain.request_no, chain.attempts, send, usages, finish_row = !chain.settled)
+	chat_commit_response(chat, chain.request, chain.attempts, send, usages, finish_send = !chain.settled)
 	// The request's outcome is recorded, so the provider's own accounting of it is part of
 	// the session the front-end describes.
 	_observer_request_finished(observer)

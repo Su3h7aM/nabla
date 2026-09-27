@@ -6,11 +6,15 @@ import "core:fmt"
 import "core:mem"
 import "core:strings"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:agent/skills"
 
 INSTRUCTION_MANIFEST_VERSION :: 2
 SKILL_METADATA_FORMAT_VERSION :: 1
+
+// The artifact kinds an instruction snapshot is stored under.
+INSTRUCTIONS_ARTIFACT :: "instructions"
+INSTRUCTION_MANIFEST_ARTIFACT :: "instruction_manifest"
 
 Instruction_Manifest_Error :: enum {
 	None,
@@ -18,49 +22,59 @@ Instruction_Manifest_Error :: enum {
 	Encode,
 }
 
+// chat_ensure_instructions settles the instructions the session runs with: the
+// snapshot its latest turn recorded, or a new one rendered from the workspace. A
+// new snapshot is buffered as artifacts that the next turn.started names.
 chat_ensure_instructions :: proc(chat: ^Chat_Session) -> bool {
 	if chat.skill_instructions != "" { return true }
 
 	if chat.client_instructions == "" {
-		snapshot, present, read_error := session.instruction_snapshot_read(chat.store, chat.id, chat.allocator)
-		if read_error == nil && present {
-			defer session.instruction_snapshot_destroy(&snapshot, chat.allocator)
-			if !chat_apply_snapshot(chat, snapshot.instructions, snapshot.manifest_json) {
-				chat_session_record_failure(chat, "the instruction snapshot is invalid", session.error_make(.Corrupt, ""))
-				return false
-			}
-			chat.skill_snapshot_seq = snapshot.seq
-			return true
-		} else if read_error != nil {
-			chat_session_record_failure(chat, "the instruction snapshot could not be read", read_error)
+		applied, restore_error := chat_restore_instructions(chat)
+		if restore_error != nil {
+			chat_session_record_failure(chat, "the instruction snapshot could not be restored", restore_error)
 			return false
 		}
+		if applied { return true }
 	}
 	instructions, manifest, catalog, manifest_error := chat_build_snapshot(chat)
 	if manifest_error != "" {
-		chat_session_record_failure(chat, manifest_error, session.error_make(.Storage, ""))
+		chat_session_fail(chat, manifest_error)
 		return false
 	}
-	seq, append_error := session.instruction_snapshot_append(
-		chat.store,
-		chat.id,
-		{format_version = session.INSTRUCTION_SNAPSHOT_VERSION, instructions = instructions, manifest_json = manifest},
-		session.now_ms(),
-	)
-	if append_error != nil {
-		delete(instructions, chat.allocator)
-		delete(manifest, chat.allocator)
-		skills.catalog_destroy(&catalog, chat.allocator)
-		chat_session_record_failure(chat, "the instruction snapshot could not be recorded", append_error)
-		return false
-	}
+	chat.instructions_digest = journal.put_artifact(chat.store, INSTRUCTIONS_ARTIFACT, transmute([]u8)instructions)
+	chat.manifest_digest = journal.put_artifact(chat.store, INSTRUCTION_MANIFEST_ARTIFACT, transmute([]u8)manifest)
 	chat_skill_catalog_release(chat)
 	chat.skill_catalog = catalog
 	delete(chat.skill_instructions, chat.allocator)
 	chat.skill_instructions = instructions
 	delete(manifest, chat.allocator)
-	chat.skill_snapshot_seq = seq
 	return true
+}
+
+// chat_restore_instructions applies the snapshot named by the session's latest
+// turn.started, and reports whether there was one.
+@(private)
+chat_restore_instructions :: proc(chat: ^Chat_Session) -> (applied: bool, error: journal.Error) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	filter := journal.Filter {
+		session = chat.session,
+		kinds   = {.Turn_Started},
+	}
+	record, found := journal.read_latest(chat.store, filter, context.temp_allocator) or_return
+	if !found { return false, nil }
+	started: journal.Turn_Started
+	journal.payload_decode(record.data, &started, context.temp_allocator) or_return
+	if started.instructions == "" { return false, nil }
+	instructions_digest, instructions_valid := journal.digest_from_hex(started.instructions)
+	manifest_digest, manifest_valid := journal.digest_from_hex(started.manifest)
+	if !instructions_valid || !manifest_valid { return false, journal.Journal_Error.Corrupt }
+	instructions, instructions_found := journal.read_artifact(chat.store, instructions_digest, context.temp_allocator) or_return
+	manifest, manifest_found := journal.read_artifact(chat.store, manifest_digest, context.temp_allocator) or_return
+	if !instructions_found || !manifest_found { return false, journal.Journal_Error.Corrupt }
+	if !chat_apply_snapshot(chat, string(instructions), string(manifest)) { return false, journal.Journal_Error.Corrupt }
+	chat.instructions_digest = instructions_digest
+	chat.manifest_digest = manifest_digest
+	return true, nil
 }
 
 chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: string, catalog: skills.Catalog, error_text: string) {

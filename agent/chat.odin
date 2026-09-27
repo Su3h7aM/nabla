@@ -1,13 +1,12 @@
 package agent
 
 import "base:runtime"
-import "core:encoding/json"
 import "core:fmt"
 import "core:log"
 import "core:sys/posix"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 chat_api_kind :: proc(value: string) -> (ai.API_Kind, bool) {
@@ -122,27 +121,24 @@ chat_request_transport :: proc(
 	return encoded, websocket_request, true
 }
 
-// chat_commit_response records what the response produced and how the request
-// ended. A completed response becomes entries: the verbatim Responses output
-// when the API produced one, then any text, then the calls it proposed. A
-// failed or cancelled one records only its outcome here; the text it produced
-// becomes a partial entry when the turn settles, because an unfinished answer
-// must never be replayed as a finished one.
+// chat_commit_response records what the response produced and how the send
+// ended. A completed response becomes an Assistant node with its native output,
+// the calls it proposed, and the harness's notice. A failed or cancelled one
+// records only how it ended; the text it produced becomes a partial Assistant
+// node when the turn settles, because an unfinished answer must never be
+// replayed as a finished one.
 @(private)
 chat_commit_response :: proc(
 	chat: ^Chat_Session,
-	request_no: session.Request_No,
-	// attempts is how many sends this logical request used, which is the chain's fact and the
-	// row's to record. It is a parameter rather than session state so the count has one home.
-	attempts: int,
+	request: journal.Request_Id,
+	// attempt is the number of the send this response came from within its request.
+	attempt: int,
 	result: Chat_Send_Result,
 	usages: ^[dynamic]Chat_Request_Usage,
-	// finish_row is false when the send this response came from was already finished
-	// for its own failure, before a retry was waited on. A row says how its send ended
-	// once, so a turn that ended while waiting does not write over that record.
-	finish_row := true,
+	// finish_send is false when the send this response came from was already
+	// recorded as ended for its own failure, before a retry was waited on.
+	finish_send := true,
 ) {
-	at_ms := session.now_ms()
 	send := result
 	send.outcome = .Completed
 	if chat_session_cancelled(chat) {
@@ -154,20 +150,22 @@ chat_commit_response :: proc(
 
 	// A response that did not commit adds nothing to the context.
 	chat.response_cost = 0
-	if outcome == .Completed && !chat_commit_response_entries(chat, request_no, at_ms) { return }
+	if outcome == .Completed {
+		if !chat_commit_response_nodes(chat, request, attempt, result.finish_reason, usages) { return }
+	} else if finish_send {
+		chat_finish_send(chat, request, attempt, send)
+	}
 	// A notice is only ever committed with the response that raised it. One that
 	// did not commit, because the turn failed or was cancelled, is dropped.
 	chat_notice_clear(chat)
 
-	if finish_row { chat_finish_request(chat, request_no, attempts, send, usages) }
 	finished := [3]Log_Field {
-		{key = "outcome", value = session.outcome_name(outcome)},
-		{key = "attempts", value = i64(attempts)},
+		{key = "outcome", value = CHAT_SEND_OUTCOME_NAMES[outcome]},
+		{key = "attempts", value = i64(attempt)},
 		{key = "finish_reason", value = chat_finish_reason_text(result.finish_reason)},
 	}
 	// A cancelled request is an ordinary end of the turn; one that failed is an
-	// error. The record keeps the completed request number, and the correlation is
-	// taken before the operation is retired.
+	// error.
 	finished_binding: Log_Binding
 	previous_logger := context.logger
 	defer context.logger = previous_logger
@@ -177,138 +175,79 @@ chat_commit_response :: proc(
 	log_emit({level = level, category = .Provider, event = "request.finished", fields = finished[:]})
 }
 
-// chat_commit_response_entries records the entries one completed response produced: the
-// verbatim Responses output, the assistant text, the calls it proposed, and the harness's
-// notice. It also settles what the response costs the next request and releases the staged
-// response. It reports whether every entry landed; a failed append stops the turn, so the
-// caller must not continue.
+// chat_commit_response_nodes commits one completed response: its Assistant node,
+// the response.committed record with the endpoint's native output and usage, a
+// tool.proposed record per call, and the harness's notice. It also settles what
+// the response costs the next request and releases the staged response. It
+// reports whether the commit landed; a failure stops the turn.
 @(private)
-chat_commit_response_entries :: proc(chat: ^Chat_Session, request_no: session.Request_No, at_ms: i64) -> bool {
-	// The notice's committed text is composed here and handed to the entries, so the scope
-	// that made it is the scope that releases it.
+chat_commit_response_nodes :: proc(
+	chat: ^Chat_Session,
+	request: journal.Request_Id,
+	attempt: int,
+	finish: ai.Provider_Finish_Reason,
+	usages: ^[dynamic]Chat_Request_Usage,
+) -> bool {
+	// The notice's text is composed in temp memory and copied by the journal.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	text := string(chat.partial_assistant[:])
-	response_count := 1 if chat.pending_response_present else 0
 	notice_text := chat_notice_committed_text(chat, context.temp_allocator)
 	chat.response_cost = chat_response_cost(chat, text, notice_text)
-	entries: [dynamic]session.New_Entry = make([dynamic]session.New_Entry, 0, response_count + len(chat.pending_calls) + 2, chat.allocator)
-	defer delete(entries)
-	if chat.pending_response_present {
-		append(
-			&entries,
-			session.New_Entry {
-				turn_no = chat.turn_no,
-				request_no = request_no,
-				created_at_ms = at_ms,
-				payload = session.Response_Entry{output = chat.pending_response.output},
-			},
-		)
-	}
-	if text != "" {
-		append(
-			&entries,
-			session.New_Entry{turn_no = chat.turn_no, request_no = request_no, created_at_ms = at_ms, payload = session.Assistant_Entry{text = text}},
-		)
-	}
-	for call in chat.pending_calls {
-		append(
-			&entries,
-			session.New_Entry {
-				turn_no = chat.turn_no,
-				request_no = request_no,
-				created_at_ms = at_ms,
-				payload = session.Tool_Call_Entry{call_id = call.id, item_id = call.item_id, name = call.name, arguments = call.arguments},
-			},
-		)
-	}
-	// The harness's explanation of an unusable response is committed with the response
-	// itself, after whatever text it produced.
-	if notice_text != "" {
-		append(
-			&entries,
-			session.New_Entry {
-				turn_no = chat.turn_no,
-				request_no = request_no,
-				created_at_ms = at_ms,
-				payload = session.User_Entry{text = notice_text, origin = .Harness},
-			},
-		)
-	}
 
-	seqs, append_err := session.entries_append(chat.store, chat.id, entries[:], chat.allocator)
-	if append_err != nil {
-		delete(seqs, chat.allocator)
-		chat_session_record_failure(chat, "the response could not be recorded", append_err)
-		return false
+	assistant := chat_node(chat, .Assistant, journal.Assistant{request = request}, transmute([]u8)text)
+	chat.response_node = assistant
+	committed := chat_send_usage(chat, usages)
+	committed.finish = chat_finish_reason_text(finish)
+	output: []u8
+	if chat.pending_response_present { output = transmute([]u8)chat.pending_response.output }
+	header := journal.Record {
+		kind     = .Response_Committed,
+		node     = assistant,
+		request  = request,
+		attempt  = journal.Attempt_No(attempt),
+		provider = chat.provider_id,
+		model    = chat.model_id,
 	}
-	// Each staged call now knows the entry it was stored as, which is what a later
-	// dispatch and result name.
-	offset := response_count + (1 if text != "" else 0)
-	for i in 0 ..< len(chat.pending_calls) { chat.pending_calls[i].seq = seqs[offset + i] }
-	delete(seqs, chat.allocator)
+	chat_record(chat, header, committed, output)
+	for &call in chat.pending_calls {
+		call.call = journal.next_call(chat.store)
+		proposal := journal.Tool_Proposed {
+			provider_id = call.id,
+			item_id     = call.item_id,
+			name        = call.name,
+		}
+		chat_record(chat, {kind = .Tool_Proposed, node = assistant, request = request, call = call.call}, proposal, transmute([]u8)call.arguments)
+	}
+	// The harness's explanation of an unusable response follows the response it explains.
+	if notice_text != "" { chat_node(chat, .Notice, journal.Notice{}, transmute([]u8)notice_text) }
+	if !chat_commit(chat, "the response could not be recorded") { return false }
 
 	chat_pending_response_clear(chat)
 	chat_partial_assistant_clear(chat)
 	return true
 }
 
-// chat_finish_request records how one send ended: its outcome, what the model stopped
-// for, the harness's account of a failure, and the usage the endpoint reported for it.
-// Every send reaches exactly one of these, including a send an attempt chain
-// abandoned, so no row is left running and each row's numbers are its own.
+// chat_finish_send records how one send that produced no usable response ended:
+// response.rejected with the evidence of a failure, or request.interrupted for a
+// send the turn cancelled. Every send that did not commit reaches exactly one of
+// these, including a send an attempt chain abandoned, so none is left open.
 @(private)
-chat_finish_request :: proc(
-	chat: ^Chat_Session,
-	request_no: session.Request_No,
-	attempts: int,
-	result: Chat_Send_Result,
-	usages: ^[dynamic]Chat_Request_Usage,
-) {
-	// The outcome and error records are built in temp memory and handed to the row: the
-	// scope that made them is the scope that releases them.
+chat_finish_send :: proc(chat: ^Chat_Session, request: journal.Request_Id, attempt: int, result: Chat_Send_Result) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	response_json := ""
-	if result.finish_reason != .Unknown {
-		response_data, response_error := json.marshal(
-			Chat_Request_Response{reason = chat_finish_reason_text(result.finish_reason), attempts = attempts},
-			allocator = context.temp_allocator,
-		)
-		if response_error != nil {
-			chat_session_record_failure_detail(chat, "the request outcome could not be recorded", "the response record could not be encoded", .Encode)
-			return
-		}
-		response_json = string(response_data)
+	header := journal.Record {
+		request  = request,
+		attempt  = journal.Attempt_No(attempt),
+		provider = chat.provider_id,
+		model    = chat.model_id,
 	}
-	error_json := ""
-	if result.outcome != .Completed {
-		if result.error_present {
-			encode_error: Chat_Record_Error
-			error_json, encode_error = chat_request_error_json(result)
-			if encode_error != .None {
-				chat_session_record_failure_detail(chat, "the request outcome could not be recorded", "the error record could not be encoded", .Encode)
-				return
-			}
-		} else if result.message != "" {
-			// A failure the harness detected itself has no operation behind it, so the
-			// record keeps the message and nothing else.
-			encode_error: Chat_Record_Error
-			error_json, encode_error = chat_error_json(result.message)
-			if encode_error != .None {
-				chat_session_record_failure_detail(chat, "the request outcome could not be recorded", "the error record could not be encoded", .Encode)
-				return
-			}
-		}
+	if result.outcome == .Cancelled {
+		header.kind = .Request_Interrupted
+		chat_record(chat, header, journal.Request_Interrupted{detail = "the turn was cancelled"})
+	} else {
+		header.kind = .Response_Rejected
+		chat_record(chat, header, chat_send_rejection(result))
 	}
-
-	finish_err := session.request_finish(
-		chat.store,
-		chat.id,
-		request_no,
-		{outcome = result.outcome, response_json = response_json, error_json = error_json, usage = chat_send_usage(chat, usages), at_ms = session.now_ms()},
-	)
-	if finish_err != nil {
-		chat_session_record_failure(chat, "the request outcome could not be recorded", finish_err)
-	}
+	_ = chat_commit(chat, "the request outcome could not be recorded")
 }
 
 // chat_response_cost estimates what one committed response adds to the model's
@@ -336,18 +275,15 @@ chat_response_cost :: proc(chat: ^Chat_Session, text, notice: string) -> int {
 // --- settling a turn ---------------------------------------------------------
 
 // chat_persist_turn_end records the turn's outcome and keeps whatever text the
-// turn produced but never committed. That text is marked partial, so it is
-// evidence in the record and never a finished answer in a later request.
+// turn produced but never committed. That text is a partial Assistant node, so it
+// is evidence in the record and never a finished answer in a later request.
 //
-// It reports whether every write landed. A turn whose outcome did not reach the
-// store must not be reported as the status the model reached, because that would
-// claim a record the database does not have.
+// It reports whether the commit landed. A turn whose outcome did not reach the
+// journal must not be reported as the status the model reached, because that
+// would claim a record the journal does not have.
 @(private)
 chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (recorded: bool) {
-	turn_no, has_turn := chat.turn_no.?
-	if !has_turn { return true }
-	at_ms := session.now_ms()
-	recorded = true
+	if chat.turn == 0 { return true }
 	// The turn is still identifiable here, which is what the end record carries.
 	binding: Log_Binding
 	previous_logger := context.logger
@@ -355,19 +291,11 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	context.logger = log_rebind(&binding, log_correlation(chat))
 
 	if text := string(chat.partial_assistant[:]); text != "" {
-		entry := session.New_Entry {
-			turn_no = turn_no,
-			created_at_ms = at_ms,
-			payload = session.Assistant_Entry{text = text, partial = true},
-		}
-		if _, append_err := session.entry_append(chat.store, chat.id, entry); append_err != nil {
-			chat_session_record_failure(chat, "the partial answer could not be recorded", append_err)
-			recorded = false
-		}
+		chat_node(chat, .Assistant, journal.Assistant{request = chat.request, partial = true}, transmute([]u8)text)
 		chat_partial_assistant_clear(chat)
 	}
 
-	outcome: session.Outcome = .Completed
+	outcome: journal.Turn_Outcome
 	switch effect.status {
 	case .Completed:
 		outcome = .Completed
@@ -378,34 +306,25 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	case .None:
 		outcome = .Interrupted
 	}
-	error_json := ""
-	turn_record_ready := true
-	if chat.last_error != "" {
-		encode_error: Chat_Record_Error
-		error_json, encode_error = chat_turn_error_json(chat.last_error, chat.turn_recovery, chat.turn_repair_refusal)
-		if encode_error != .None {
-			chat_session_record_failure_detail(chat, "the turn outcome could not be recorded", "the turn error record could not be encoded", .Encode)
-			recorded = false
-			turn_record_ready = false
-		}
+	completed := journal.Turn_Completed {
+		outcome = journal.TURN_OUTCOME_NAMES[outcome],
+		detail  = chat.last_error,
 	}
+	if reason, present := chat.turn_recovery.?; present { completed.reason = request_recovery_reason_name(reason) }
+	if chat.turn_repair_refusal != .None { completed.cause = chat_repair_refusal_name(chat.turn_repair_refusal) }
+	chat_record(chat, {kind = .Turn_Completed}, completed)
+	recorded = chat_commit(chat, "the turn outcome could not be recorded")
 
-	if turn_record_ready {
-		if turn_err := session.turn_finish(chat.store, chat.id, turn_no, outcome, error_json, at_ms); turn_err != nil {
-			chat_session_record_failure(chat, "the turn outcome could not be recorded", turn_err)
-			recorded = false
-		}
-	}
 	finished := [5]Log_Field {
-		{key = "outcome", value = session.outcome_name(outcome)},
+		{key = "outcome", value = journal.TURN_OUTCOME_NAMES[outcome]},
 		{key = "recorded", value = recorded},
 		{key = "requests", value = i64(chat.requests_made)},
 		{key = "calls", value = i64(chat.calls_made)},
 		{key = "status", value = chat_terminal_text(chat.terminal_status)},
 	}
 	log_emit({level = .Info, category = .Agent, event = "turn.finished", fields = finished[:]})
-	chat.turn_no = nil
-	chat.active_request = nil
+	chat.turn = 0
+	chat.request = 0
 	// A turn that ended without running its staged calls, such as one a durable
 	// write stopped, releases them here.
 	chat_pending_calls_clear(chat)

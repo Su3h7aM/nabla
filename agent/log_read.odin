@@ -8,8 +8,6 @@ import "core:slice"
 import "core:strings"
 import "core:time"
 
-import "nabla:agent/session"
-
 // The reader walks the runs it can find and visits the records of one session as
 // they were written, so a caller can pipe them somewhere else. It parses each line
 // rather than searching it: a record may carry text a peer sent, and that text must
@@ -26,7 +24,7 @@ Log_Read_Selector :: struct {
 	// level is the lowest severity to visit.
 	level:      log.Level,
 	// request_no, when set, visits only one logical request.
-	request_no: Maybe(session.Request_No),
+	request_no: Maybe(i64),
 }
 
 // Log_Read_Summary is what one read did and what it could not do. cannot_read counts
@@ -123,7 +121,7 @@ log_read_segment_bytes :: proc(path: string, limit: int, allocator := context.al
 
 log_read_session :: proc(
 	logs_root: string,
-	session_id: session.Session_Id,
+	session_id: string,
 	user_data: rawptr,
 	visit: Log_Read_Visit,
 	selector: Log_Read_Selector = {},
@@ -186,7 +184,7 @@ Log_Read_Run :: struct {
 log_read_run :: proc(
 	summary: ^Log_Read_Summary,
 	run: Log_Read_Run,
-	session_id: session.Session_Id,
+	session_id: string,
 	selector: Log_Read_Selector,
 	user_data: rawptr,
 	visit: Log_Read_Visit,
@@ -230,7 +228,7 @@ log_read_segment_lines :: proc(
 	summary: ^Log_Read_Summary,
 	run_id: string,
 	content: []u8,
-	session_id: session.Session_Id,
+	session_id: string,
 	selector: Log_Read_Selector,
 	user_data: rawptr,
 	visit: Log_Read_Visit,
@@ -264,7 +262,7 @@ log_read_line :: proc(
 	summary: ^Log_Read_Summary,
 	run_id: string,
 	line: string,
-	session_id: session.Session_Id,
+	session_id: string,
 	selector: Log_Read_Selector,
 	user_data: rawptr,
 	visit: Log_Read_Visit,
@@ -309,7 +307,7 @@ log_read_line :: proc(
 	}
 
 	owner, has_session := log_read_string(object, "session_id")
-	if !has_session || owner != string(session_id) { return true }
+	if !has_session || owner != session_id { return true }
 
 	if selector.level > log.Level.Debug {
 		level_text, has_level := log_read_string(object, "level")
@@ -318,7 +316,7 @@ log_read_line :: proc(
 	}
 	if wanted, filtered := selector.request_no.?; filtered {
 		request_no, has_request := log_read_integer(object, "request_no")
-		if !has_request || session.Request_No(request_no) != wanted { return true }
+		if !has_request || request_no != wanted { return true }
 	}
 
 	summary.records += 1

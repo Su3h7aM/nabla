@@ -8,8 +8,6 @@ import "core:os"
 import "core:strings"
 import "core:sync"
 
-import "nabla:agent/session"
-
 // Payload capture is opt-in consent to store bytes a record would never carry: the
 // exact request a provider was handed, the response stream it answered with, and
 // the MCP traffic in between. Metadata records are not affected by it, and capture
@@ -429,15 +427,15 @@ log_capture_sidecar_json :: proc(line: ^Log_Line, capture: ^Capture, summary: ^C
 	log_line_int(line, capture.descriptor.external_id)
 	if len(correlation.session_id) > 0 {
 		log_line_bytes(line, `,"session_id":`)
-		log_line_json_string(line, string(correlation.session_id))
+		log_line_json_string(line, correlation.session_id)
 	}
-	if i64(correlation.turn_no) != 0 {
+	if correlation.turn_no != 0 {
 		log_line_bytes(line, `,"turn_no":`)
-		log_line_int(line, i64(correlation.turn_no))
+		log_line_int(line, correlation.turn_no)
 	}
-	if i64(correlation.request_no) != 0 {
+	if correlation.request_no != 0 {
 		log_line_bytes(line, `,"request_no":`)
-		log_line_int(line, i64(correlation.request_no))
+		log_line_int(line, correlation.request_no)
 	}
 	if correlation.attempt != 0 {
 		log_line_bytes(line, `,"attempt":`)
@@ -560,7 +558,7 @@ log_capture_hex :: proc(destination: []u8, digest: []u8) {
 log_correlation_copy :: proc(correlation: Log_Correlation, allocator: mem.Allocator) -> Log_Correlation {
 	copied := correlation
 	if correlation.session_id != "" {
-		copied.session_id = session.Session_Id(strings.clone(string(correlation.session_id), allocator))
+		copied.session_id = strings.clone(correlation.session_id, allocator)
 	}
 	if correlation.call_id != "" { copied.call_id = strings.clone(correlation.call_id, allocator) }
 	return copied
@@ -568,7 +566,7 @@ log_correlation_copy :: proc(correlation: Log_Correlation, allocator: mem.Alloca
 
 @(private)
 log_correlation_destroy :: proc(correlation: ^Log_Correlation, allocator: mem.Allocator) {
-	delete(string(correlation.session_id), allocator)
+	delete(correlation.session_id, allocator)
 	delete(correlation.call_id, allocator)
 	correlation^ = {}
 }

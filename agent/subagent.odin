@@ -8,7 +8,7 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 Subagent_Status :: enum {
@@ -42,7 +42,10 @@ Subagent :: struct {
 	tools:                        Tool_Registry,
 	workspace:                    string,
 	store_directory:              string,
-	parent_session:               string,
+	parent_session:               journal.Session_Id,
+	parent_call:                  journal.Call_Id, // the orchestrator's call that started it
+	parent_session_hex:           [journal.SESSION_ID_HEX_LENGTH]u8, // read through chat_parent_session
+	run:                          journal.Run_Id, // the run the subagent's own journal writes under
 	disable_project_instructions: bool,
 	background:                   bool,
 	log_sink:                     ^Log,
@@ -85,7 +88,8 @@ Agent_Team :: struct {
 }
 
 Agent_Parent :: struct {
-	session_id:                   string,
+	session:                      journal.Session_Id,
+	run:                          journal.Run_Id,
 	workspace:                    string,
 	store_directory:              string,
 	provider_id:                  string,
@@ -109,7 +113,6 @@ agent_team_make :: proc(allocator: mem.Allocator) -> ^Agent_Team {
 
 @(private)
 agent_parent_destroy :: proc(parent: ^Agent_Parent, allocator: mem.Allocator) {
-	delete(parent.session_id, allocator)
 	delete(parent.workspace, allocator)
 	delete(parent.store_directory, allocator)
 	delete(parent.provider_id, allocator)
@@ -133,8 +136,10 @@ agent_team_note_parent :: proc(chat: ^Chat_Session) {
 	for level, index in chat.effort_levels { effort_levels[index] = strings.clone(level, allocator) }
 	agent_parent_destroy(&team.parent, allocator)
 	directory := chat.store.directory if chat.store != nil else ""
+	run := chat.store.run if chat.store != nil else {}
 	team.parent = Agent_Parent {
-		session_id                   = strings.clone(string(chat.id), allocator),
+		session                      = chat.session,
+		run                          = run,
 		workspace                    = strings.clone(chat.workspace, allocator),
 		store_directory              = strings.clone(directory, allocator),
 		provider_id                  = strings.clone(chat.provider_id, allocator),
@@ -222,7 +227,6 @@ subagent_destroy :: proc(member: ^Subagent) {
 	tool_registry_destroy(&member.tools)
 	delete(member.workspace, allocator)
 	delete(member.store_directory, allocator)
-	delete(member.parent_session, allocator)
 	steer_queue_destroy(&member.inbox)
 	delete(member.session_id, allocator)
 	delete(member.answer, allocator)
@@ -232,7 +236,7 @@ subagent_destroy :: proc(member: ^Subagent) {
 // subagent_start defines one subagent from a start call and adds it to the team. It resolves
 // the model, the orchestrator's by default, and the effort, one level below the orchestrator's
 // by default. problem, temp-allocated, says why nothing started. Worker thread.
-subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, allocator: mem.Allocator) -> (member: ^Subagent, problem: string) {
+subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, call: journal.Call_Id, allocator: mem.Allocator) -> (member: ^Subagent, problem: string) {
 	sync.mutex_lock(&team.mutex)
 	if team.closing { sync.mutex_unlock(&team.mutex); return nil, "the orchestrator is closing; nothing started" }
 	team.starting += 1
@@ -244,7 +248,6 @@ subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, allocator: mem
 	levels := make([]string, len(parent.effort_levels), context.temp_allocator)
 	for level, index in parent.effort_levels { levels[index] = strings.clone(level, context.temp_allocator) }
 	parent.effort_levels = levels
-	parent.session_id = strings.clone(parent.session_id, context.temp_allocator)
 	parent.workspace = strings.clone(parent.workspace, context.temp_allocator)
 	parent.store_directory = strings.clone(parent.store_directory, context.temp_allocator)
 	sync.mutex_unlock(&team.mutex)
@@ -290,7 +293,9 @@ subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, allocator: mem
 		tools                        = tools,
 		workspace                    = strings.clone(parent.workspace, allocator),
 		store_directory              = strings.clone(parent.store_directory, allocator),
-		parent_session               = strings.clone(parent.session_id, allocator),
+		parent_session               = parent.session,
+		parent_call                  = call,
+		run                          = parent.run,
 		disable_project_instructions = parent.disable_project_instructions,
 		background                   = args.background,
 		log_sink                     = subagent_log_sink(),
@@ -458,31 +463,35 @@ subagent_run :: proc(member: ^Subagent) {
 		subagent_acp_run(member)
 		return
 	}
-	store: session.Store
-	if open_error := session.store_open(&store, member.store_directory, allocator); open_error != nil {
-		local := open_error
-		subagent_fail(member, .Failed, fmt.tprintf("the subagent's session store could not be opened: %s", session.error_detail(&local)))
+	store: journal.Journal
+	if open_error := journal.open(&store, member.store_directory, member.run, .Read_Write, allocator); open_error != nil {
+		subagent_fail(
+			member,
+			.Failed,
+			fmt.tprintf("the subagent's session store could not be opened: %s", journal.error_text(open_error, context.temp_allocator)),
+		)
 		return
 	}
-	defer session.store_close(&store)
-	options := session.Create_Options {
-		workspace = member.workspace,
-		title     = member.name,
-		provider  = member.selection.provider_id,
-		model     = member.selection.model_id,
-		parent    = session.Session_Id(member.parent_session),
-	}
-	header, create_error := session.session_create(&store, options, session.now_ms(), allocator)
-	if create_error == nil { create_error = session.session_claim(&store, header.id) }
-	defer session.session_destroy(&header, allocator)
-	if create_error != nil {
-		local := create_error
-		subagent_fail(member, .Failed, fmt.tprintf("the subagent's session could not be created: %s", session.error_detail(&local)))
-		return
-	}
-	member.session_id = strings.clone(string(header.id), allocator)
+	// The subagent's session is over when this returns, so the claim the journal
+	// holds with it is never released by anyone else.
+	defer _ = journal.close(&store)
 
-	chat, init_error := chat_session_init(&store, header.id, member.workspace, allocator)
+	session_id, create_error := journal.create_session(
+		&store,
+		journal.New_Session{workspace = member.workspace, role = .Subagent, parent_session = member.parent_session, parent_call = member.parent_call},
+	)
+	if create_error != nil {
+		subagent_fail(
+			member,
+			.Failed,
+			fmt.tprintf("the subagent's session could not be created: %s", journal.error_text(create_error, context.temp_allocator)),
+		)
+		return
+	}
+	session_hex: [journal.SESSION_ID_HEX_LENGTH]u8
+	member.session_id = strings.clone(journal.session_id_to_hex(session_id, session_hex[:]), allocator)
+
+	chat, init_error := chat_session_init(&store, session_id, journal.INITIAL_BRANCH, 0, member.workspace, allocator)
 	if init_error.kind != .None {
 		subagent_fail(member, .Failed, "the subagent's session could not be initialized")
 		return
@@ -516,9 +525,9 @@ subagent_run :: proc(member: ^Subagent) {
 		request_prepared = subagent_answer_restart,
 		assistant_text   = subagent_answer_text,
 	}
-	text, origin, from_inbox := member.prompt, session.User_Origin.Prompt, false
+	text, origin, from_inbox := member.prompt, journal.User_Origin.Prompt, false
 	for {
-		accepted := chat_session_accept_message(&chat, text, session.now_ms(), origin)
+		accepted := chat_session_accept_message(&chat, text, origin)
 		if from_inbox { steer_line_free(&member.inbox, text) }
 		if accepted != .Accepted {
 			subagent_fail(member, .Failed, chat.last_error if chat.last_error != "" else "the task could not be recorded")
@@ -618,7 +627,7 @@ subagent_report_message :: proc(member: ^Subagent, text: string) -> bool {
 // chat_parent_session is the orchestrator's session id for a subagent's session, else "".
 chat_parent_session :: proc(chat: ^Chat_Session) -> string {
 	if chat.member == nil { return "" }
-	return chat.member.parent_session
+	return journal.session_id_to_hex(chat.member.parent_session, chat.member.parent_session_hex[:])
 }
 
 // chat_agents_pending reports whether a subagent's message waits or a subagent still runs.
@@ -647,7 +656,7 @@ chat_session_accept_agent_message :: proc(chat: ^Chat_Session, observer: Chat_Ob
 	if chat.team == nil { return .Accepted, false }
 	text, ok := steer_pop(&chat.team.inbox)
 	if !ok { return .Accepted, false }
-	accepted = chat_session_accept_message(chat, text, session.now_ms(), .Agent)
+	accepted = chat_session_accept_message(chat, text, .Agent)
 	if accepted == .Accepted {
 		_observer_user_text(observer, text)
 		steer_line_free(&chat.team.inbox, text)

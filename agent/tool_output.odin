@@ -5,7 +5,7 @@ import "core:mem"
 import "core:strings"
 import "core:unicode/utf8"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 // Tool_Output is what one call produced, typed by the tool that produced it. A result
 // with nothing of its own to report, such as a refusal or a timeout, carries nil.
@@ -100,9 +100,9 @@ Agent_Output :: struct {
 // Codemode_Call is one tool call a script made, as its parent reports it. It is a summary,
 // never the child's output: the script returns whatever of that output the model needs.
 Codemode_Call :: struct {
-	call_seq: i64,
-	name:     string,
-	outcome:  string,
+	call:    journal.Call_Id,
+	name:    string,
+	outcome: string,
 }
 
 // Codemode_Output is what a Code Mode execution did. failure is empty when the chunk
@@ -141,7 +141,7 @@ MCP_Block :: struct {
 // needs no escaping inside the provider's own encoding, which is why the body is not
 // quoted. The text is owned by allocator.
 tool_result_render :: proc(
-	outcome: session.Tool_Outcome,
+	outcome: journal.Tool_Outcome,
 	message: string,
 	output: Tool_Output,
 	allocator: mem.Allocator,
@@ -160,7 +160,7 @@ tool_result_render :: proc(
 	defer strings.builder_destroy(&body)
 
 	render_text(&head, "ok" if outcome == .Success else "error ") or_return
-	if outcome != .Success { render_text(&head, session.tool_outcome_name(outcome)) or_return }
+	if outcome != .Success { render_text(&head, journal.TOOL_OUTCOME_NAMES[outcome]) or_return }
 	if message != "" {
 		render_text(&head, ": ") or_return
 		render_value(&head, message) or_return
@@ -228,7 +228,7 @@ tool_result_render :: proc(
 		render_field(&head, "calls_total", value.calls_total) or_return
 		for call in value.calls {
 			render_text(&head, "call: ") or_return
-			render_integer(&head, call.call_seq) or_return
+			render_integer(&head, i64(call.call)) or_return
 			render_byte(&head, ' ') or_return
 			render_value(&head, call.name) or_return
 			render_byte(&head, ' ') or_return
@@ -475,7 +475,7 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		value.logs = strings.clone(borrowed.logs, allocator) or_return
 		value.calls = make([]Codemode_Call, len(borrowed.calls), allocator) or_return
 		for item, index in borrowed.calls {
-			value.calls[index].call_seq = item.call_seq
+			value.calls[index].call = item.call
 			value.calls[index].name = strings.clone(item.name, allocator) or_return
 			value.calls[index].outcome = strings.clone(item.outcome, allocator) or_return
 		}

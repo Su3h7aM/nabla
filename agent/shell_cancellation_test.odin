@@ -14,7 +14,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 // Shell cancellation runs the real executor against real processes. The test
@@ -66,8 +66,8 @@ Shell_Run :: struct {
 }
 
 shell_run_start :: proc(run: ^Shell_Run, workspace: string, command: string) -> bool {
-	wake, wake_err := tool_wake_open()
-	if wake_err != nil { return false }
+	wake, wake_error := tool_wake_open()
+	if wake_error != nil { return false }
 	run.wake = wake
 	run.workspace = workspace
 	run.command = command
@@ -83,7 +83,7 @@ shell_run_serve :: proc(thread: ^thread.Thread) {
 	arguments := tool_arguments_prepare(raw)
 	defer tool_arguments_destroy(&arguments)
 
-	ctx := Tool_Context {
+	tool_context := Tool_Context {
 		call_id = "call_shell",
 		workspace = run.workspace,
 		control = {interrupt = &run.interrupt, wake = run.wake.read},
@@ -91,10 +91,10 @@ shell_run_serve :: proc(thread: ^thread.Thread) {
 	}
 	object, is_object := arguments.value.(json.Object)
 	if !is_object {
-		run.result = tool_result_failure(&ctx, .Invalid_Arguments, "the test arguments did not parse")
+		run.result = tool_result_failure(&tool_context, .Invalid_Arguments, "the test arguments did not parse")
 		return
 	}
-	run.result = tool_test_execute(&ctx, Tool_Definition{kind = .Shell, execute = tool_shell_execute}, object)
+	run.result = tool_test_execute(&tool_context, Tool_Definition{kind = .Shell, execute = tool_shell_execute}, object)
 }
 
 shell_run_join :: proc(run: ^Shell_Run) {
@@ -114,8 +114,8 @@ shell_run_stop :: proc(run: ^Shell_Run) {
 // shell_read_pid file is the synchronization point: the command has reached the
 // point where its descendant exists.
 shell_read_pid_file :: proc(path: string) -> (int, bool) {
-	contents, read_err := os.read_entire_file(path, context.temp_allocator)
-	if read_err != nil { return 0, false }
+	contents, read_error := os.read_entire_file(path, context.temp_allocator)
+	if read_error != nil { return 0, false }
 	text := strings.trim_space(string(contents))
 	if text == "" { return 0, false }
 	pid, parsed := strconv.parse_int(text)
@@ -126,35 +126,35 @@ shell_read_pid_file :: proc(path: string) -> (int, bool) {
 shell_await_pid_file :: proc(path: string) -> (int, bool) {
 	deadline := time.tick_add(time.tick_now(), SHELL_TEST_BOUND)
 	for time.tick_since(deadline) < 0 {
-		if pid, ok := shell_read_pid_file(path); ok { return pid, true }
+		if pid, found := shell_read_pid_file(path); found { return pid, true }
 		time.sleep(5 * time.Millisecond)
 	}
 	return 0, false
 }
 
 @(test)
-test_shell_timeout_applies_after_pipes_close :: proc(t: ^testing.T) {
+test_shell_timeout_applies_after_pipes_close :: proc(test: ^testing.T) {
 	allocator := context.temp_allocator
 	workspace := shell_test_workspace(allocator)
 	arguments := tool_arguments_prepare(`{"command":"exec 1>&- 2>&-; sleep 5","working_directory":null,"timeout_ms":100}`)
 	defer tool_arguments_destroy(&arguments)
 	object, is_object := arguments.value.(json.Object)
-	if !testing.expect(t, is_object, "the arguments should parse") { return }
-	ctx := Tool_Context {
+	if !testing.expect(test, is_object, "the arguments should parse") { return }
+	tool_context := Tool_Context {
 		call_id   = "call_timeout",
 		workspace = workspace,
 		allocator = allocator,
 	}
 	started := time.tick_now()
-	result := tool_test_execute(&ctx, Tool_Definition{kind = .Shell, execute = tool_shell_execute}, object)
+	result := tool_test_execute(&tool_context, Tool_Definition{kind = .Shell, execute = tool_shell_execute}, object)
 	defer tool_result_destroy(&result)
 	elapsed := time.tick_since(started)
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Timed_Out)
-	testing.expectf(t, elapsed < 2 * time.Second, "100ms budget took %v; retirement ignored the deadline", elapsed)
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Timed_Out)
+	testing.expectf(test, elapsed < 2 * time.Second, "100ms budget took %v; retirement ignored the deadline", elapsed)
 }
 
 @(test)
-test_shell_cancel_terminates_descendants :: proc(t: ^testing.T) {allocator := context.temp_allocator
+test_shell_cancel_terminates_descendants :: proc(test: ^testing.T) {allocator := context.temp_allocator
 	workspace := shell_test_workspace(allocator)
 	pid_file := fmt.aprintf("%s/descendant.pid", workspace, allocator = allocator)
 	defer os.remove(pid_file)
@@ -162,29 +162,31 @@ test_shell_cancel_terminates_descendants :: proc(t: ^testing.T) {allocator := co
 	run: Shell_Run
 	// The background child is a descendant of the direct child: only signalling the
 	// process group reaches it.
-	command := fmt.aprintf("sleep 30 & echo $! > %s; wait", pid_file, allocator = allocator)
+	// The command is POSIX shell source, so it names the shell that runs it rather than
+	// inheriting whatever shell started the suite.
+	command := fmt.aprintf("exec sh -c 'sleep 30 & echo $! > %s; wait'", pid_file, allocator = allocator)
 	if !shell_run_start(&run, workspace, command) {
-		testing.expectf(t, false, "shell run could not start")
+		testing.expectf(test, false, "shell run could not start")
 		return
 	}
 	descendant, found := shell_await_pid_file(pid_file)
 	defer shell_run_join(&run)
 	if !found {
-		testing.expectf(t, false, "command never reported its descendant")
+		testing.expectf(test, false, "command never reported its descendant")
 		return
 	}
-	testing.expectf(t, !shell_process_gone(descendant), "descendant %d was not running before cancellation", descendant)
+	testing.expectf(test, !shell_process_gone(descendant), "descendant %d was not running before cancellation", descendant)
 
 	shell_run_stop(&run)
 	shell_run_join(&run)
 	defer tool_result_destroy(&run.result)
 
-	testing.expect_value(t, run.result.outcome, session.Tool_Outcome.Cancelled)
-	testing.expectf(t, shell_await_process_gone(descendant), "descendant %d survived cancellation", descendant)
+	testing.expect_value(test, run.result.outcome, journal.Tool_Outcome.Cancelled)
+	testing.expectf(test, shell_await_process_gone(descendant), "descendant %d survived cancellation", descendant)
 }
 
 @(test)
-test_shell_cancel_escalates_when_sigterm_is_ignored :: proc(t: ^testing.T) {
+test_shell_cancel_escalates_when_sigterm_is_ignored :: proc(test: ^testing.T) {
 	allocator := context.temp_allocator
 	workspace := shell_test_workspace(allocator)
 
@@ -192,8 +194,11 @@ test_shell_cancel_escalates_when_sigterm_is_ignored :: proc(t: ^testing.T) {
 	// The shell ignores SIGTERM and keeps running, so only SIGKILL ends it. If the
 	// escalation were missing this call would block on the final reap instead of
 	// returning, which the suite's external timeout would catch.
-	if !shell_run_start(&run, workspace, `trap "" TERM; while :; do sleep 0.05; done`) {
-		testing.expectf(t, false, "shell run could not start")
+	// The command is POSIX shell source, so it names the shell that runs it rather than
+	// inheriting whatever shell started the suite. exec leaves that shell as the direct
+	// child, so the SIGTERM the group receives is the one it ignores.
+	if !shell_run_start(&run, workspace, `exec sh -c 'trap "" TERM; while :; do sleep 0.05; done'`) {
+		testing.expectf(test, false, "shell run could not start")
 		return
 	}
 	defer shell_run_join(&run)
@@ -204,54 +209,57 @@ test_shell_cancel_escalates_when_sigterm_is_ignored :: proc(t: ^testing.T) {
 	elapsed := time.tick_since(started)
 	defer tool_result_destroy(&run.result)
 
-	testing.expect_value(t, run.result.outcome, session.Tool_Outcome.Cancelled)
-	testing.expectf(t, elapsed >= TOOL_KILL_GRACE, "returned in %v without waiting out the SIGTERM grace, so SIGKILL was not the escalation path", elapsed)
+	testing.expect_value(test, run.result.outcome, journal.Tool_Outcome.Cancelled)
+	testing.expectf(test, elapsed >= TOOL_KILL_GRACE, "returned in %v without waiting out the SIGTERM grace, so SIGKILL was not the escalation path", elapsed)
 }
 
 @(test)
-test_shell_cancel_reaps_child_and_allows_next_turn :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
+test_shell_cancel_reaps_child_and_allows_next_turn :: proc(test: ^testing.T) {
+	if !test_isolate_process(test, #procedure) { return }
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	_test_accept(t, chat, "run something long")
+	_test_accept(test, chat, "run something long")
 
-	effect := _test_begin_request(t, chat)
+	effect := _test_begin_request(test, chat)
 	first_turn := effect.turn_id
 
 	// The call is recorded first, exactly as a completed response would, and then
 	// the turn is cancelled before the tool would have finished.
-	_test_stage_call(t, chat, "call_long", `{"command":"sleep 30","working_directory":null,"timeout_ms":10000}`)
+	_test_stage_call(test, chat, "call_long", `{"command":"sleep 30","working_directory":null,"timeout_ms":10000}`)
 	effect = chat_session_advance(chat)
-	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Run_Tools)
+	testing.expect_value(test, effect.kind, Chat_Effect_Kind.Run_Tools)
 
 	chat_session_request_cancel(chat)
-	testing.expect_value(t, chat.state, Chat_State.Cancelling)
+	testing.expect_value(test, chat.state, Chat_State.Cancelling)
 	count := chat_run_tools(chat, {})
-	testing.expect_value(t, count, 1)
-	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, count))
+	testing.expect_value(test, count, 1)
+	testing.expect(test, chat_session_tools_done(chat, chat.active_turn_id, count))
 
-	// The committed call is resolved rather than left dangling.
-	entries := _test_entries(t, chat)
-	defer session.entries_destroy(entries, context.allocator)
-	result, is_result := entries[len(entries) - 1].payload.(session.Tool_Result_Entry)
-	if !testing.expect(t, is_result, "the last entry should be a result") { return }
-	testing.expect(t, result.outcome == .Cancelled || result.outcome == .Not_Executed, "a cancelled call is resolved, not left dangling")
+	// The committed call is resolved rather than left dangling: its result reached the
+	// journal with an outcome the harness named.
+	completions := _test_records(test, chat, {.Tool_Completed})
+	if !testing.expect_value(test, len(completions), 1) { return }
+	completion: journal.Tool_Completed
+	if !testing.expect_value(test, journal.payload_decode(completions[0].data, &completion, context.temp_allocator), nil) { return }
+	outcome, known := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
+	if !testing.expect(test, known, "the recorded outcome is one the harness names") { return }
+	testing.expect(test, outcome == .Cancelled || outcome == .Not_Executed, "a cancelled call is resolved, not left dangling")
 	chat_session_retire_operation(chat)
 
-	finish := _test_settle(t, chat)
-	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
-	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
-	testing.expect_value(t, chat.state, Chat_State.Idle)
+	finish := _test_settle(test, chat)
+	testing.expect_value(test, finish.kind, Chat_Effect_Kind.Turn_Finished)
+	testing.expect_value(test, finish.status, Chat_Terminal_Status.Cancelled)
+	testing.expect_value(test, chat.state, Chat_State.Idle)
 
 	// A fresh turn starts immediately, without waiting on anything from the last one.
-	_test_accept(t, chat, "next")
-	testing.expect_value(t, chat.active_turn_id, first_turn + 1)
-	testing.expect(t, !chat_session_cancelled(chat))
-	effect = _test_begin_request(t, chat)
-	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
+	_test_accept(test, chat, "next")
+	testing.expect_value(test, chat.active_turn_id, first_turn + 1)
+	testing.expect(test, !chat_session_cancelled(chat))
+	effect = _test_begin_request(test, chat)
+	testing.expect_value(test, effect.kind, Chat_Effect_Kind.Start_Request)
 }
 
 // --- SIGINT through the production control loop -------------------------------
@@ -281,8 +289,8 @@ Shell_Stall_Server :: struct {
 
 shell_stall_serve :: proc(thread: ^thread.Thread) {
 	server := cast(^Shell_Stall_Server)thread.data
-	socket, _, accept_err := net.accept_tcp(server.listener)
-	if accept_err != nil {
+	socket, _, accept_error := net.accept_tcp(server.listener)
+	if accept_error != nil {
 		sync.sema_post(&server.accepted)
 		return
 	}
@@ -297,16 +305,16 @@ shell_stall_serve :: proc(thread: ^thread.Thread) {
 
 // The server is owned by the caller: the worker thread keeps a pointer to it, so
 // returning it by value would leave that pointer aimed at a dead stack frame.
-shell_stall_start :: proc(t: ^testing.T, server: ^Shell_Stall_Server) -> bool {
+shell_stall_start :: proc(test: ^testing.T, server: ^Shell_Stall_Server) -> bool {
 	server^ = {}
-	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
-	if listen_err != nil {
-		testing.expectf(t, false, "stall server could not listen: %v", listen_err)
+	listener, listen_error := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
+	if listen_error != nil {
+		testing.expectf(test, false, "stall server could not listen: %v", listen_error)
 		return false
 	}
-	endpoint, endpoint_err := net.bound_endpoint(listener)
-	if endpoint_err != nil {
-		testing.expectf(t, false, "stall server had no endpoint: %v", endpoint_err)
+	endpoint, endpoint_error := net.bound_endpoint(listener)
+	if endpoint_error != nil {
+		testing.expectf(test, false, "stall server had no endpoint: %v", endpoint_error)
 		net.close(listener)
 		return false
 	}
@@ -314,7 +322,7 @@ shell_stall_start :: proc(t: ^testing.T, server: ^Shell_Stall_Server) -> bool {
 	server.port = endpoint.port
 	server.thread = test_thread_start(shell_stall_serve, server, "nabla-stall-server")
 	if server.thread == nil {
-		testing.expectf(t, false, "stall server thread could not start")
+		testing.expectf(test, false, "stall server thread could not start")
 		net.close(listener)
 		return false
 	}
@@ -353,18 +361,18 @@ shell_turn_join :: proc(run: ^Shell_Turn_Run) {
 }
 
 @(test)
-test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
+test_sigint_cancels_turn_through_control_loop :: proc(test: ^testing.T) {
+	if !test_isolate_process(test, #procedure) { return }
 	server: Shell_Stall_Server
-	if !shell_stall_start(t, &server) { return }
+	if !shell_stall_start(test, &server) { return }
 	defer shell_stall_stop(&server)
 
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 500000)
-	_test_accept(t, chat, "hello")
+	_test_accept(test, chat, "hello")
 	first_turn := chat.active_turn_id
 
 	run := Shell_Turn_Run {
@@ -376,7 +384,7 @@ test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
 	}
 	run.thread = test_thread_start(shell_turn_serve, &run, "nabla-turn-run")
 	if run.thread == nil {
-		testing.expectf(t, false, "turn thread could not start")
+		testing.expectf(test, false, "turn thread could not start")
 		return
 	}
 	defer shell_turn_join(&run)
@@ -384,34 +392,35 @@ test_sigint_cancels_turn_through_control_loop :: proc(t: ^testing.T) {
 	// The server has the request, so the handler is armed and the request is blocked
 	// in a read: this is the real Ctrl-C window.
 	if !sync.sema_wait_with_timeout(&server.accepted, SHELL_TEST_BOUND) {
-		testing.expectf(t, false, "request never reached the stall server")
+		testing.expectf(test, false, "request never reached the stall server")
 		return
 	}
-	testing.expect(t, linux.kill(linux.Pid(os.get_pid()), .SIGINT) == .NONE)
+	testing.expect(test, linux.kill(linux.Pid(os.get_pid()), .SIGINT) == .NONE)
 	shell_turn_join(&run)
 
-	testing.expectf(t, process_interrupted(), "the SIGINT handler never latched the interrupt")
-	testing.expect_value(t, chat.terminal_status, Chat_Terminal_Status.Cancelled)
-	testing.expect_value(t, chat.state, Chat_State.Idle)
-	testing.expect(t, !run.completed)
+	testing.expectf(test, process_interrupted(), "the SIGINT handler never latched the interrupt")
+	testing.expect_value(test, chat.terminal_status, Chat_Terminal_Status.Cancelled)
+	testing.expect_value(test, chat.state, Chat_State.Idle)
+	testing.expect(test, !run.completed)
 
-	// The attempt that was in flight is awaited, so its row is finished from its own
-	// outcome: the turn's status is the cancellation, and the row still says how the send
-	// that was running ended.
-	request, request_err := session.request_load(chat.store, chat.id, 1)
-	if !testing.expect_value(t, request_err, nil) { return }
-	defer session.request_destroy(&request)
-	testing.expect_value(t, request.outcome, session.Outcome.Cancelled)
-	testing.expect(t, request.error_json != "", "the cancelled send's own error must be recorded")
+	// The attempt that was in flight is awaited, so the send that was running records its
+	// own end: the turn's status is the cancellation, and the interrupted send names the
+	// request it was.
+	interruptions := _test_records(test, chat, {.Request_Interrupted})
+	if !testing.expect_value(test, len(interruptions), 1) { return }
+	testing.expect(test, interruptions[0].request != 0, "the interrupted send names its request")
+	interruption: journal.Request_Interrupted
+	if !testing.expect_value(test, journal.payload_decode(interruptions[0].data, &interruption, context.temp_allocator), nil) { return }
+	testing.expect(test, interruption.detail != "", "the cancelled send's own account must be recorded")
 
 	// The turn is over and the session is immediately reusable. The process would exit on
 	// the signal, so the latch is cleared to show the session itself holds no stop.
 	sync.atomic_store(&process_interrupt.requested, false)
-	_test_accept(t, chat, "again")
-	testing.expect_value(t, chat.active_turn_id, first_turn + 1)
-	testing.expect(t, !chat_session_cancelled(chat))
-	effect := _test_begin_request(t, chat)
-	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
+	_test_accept(test, chat, "again")
+	testing.expect_value(test, chat.active_turn_id, first_turn + 1)
+	testing.expect(test, !chat_session_cancelled(chat))
+	effect := _test_begin_request(test, chat)
+	testing.expect_value(test, effect.kind, Chat_Effect_Kind.Start_Request)
 }
 
 // Backoff_Wait is signalled when a chain schedules a retry, which is the moment before it waits
@@ -438,23 +447,23 @@ backoff_send_signal :: proc(thread: ^thread.Thread) {
 // backoff the owner is the only thread left, so the signal handler itself has to wake the wait:
 // nothing else can, and a wait that no longer polls would otherwise run the whole delay.
 @(test)
-test_sigint_cuts_a_retry_backoff_short :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
+test_sigint_cuts_a_retry_backoff_short :: proc(test: ^testing.T) {
+	if !test_isolate_process(test, #procedure) { return }
 	// A backoff far longer than the bound below, so a turn that returns inside it can only have
 	// been woken rather than waited out.
 	BACKOFF_DELAY :: 3 * time.Second
 
 	responses := []string{agent_provider_refusal("429 Too Many Requests", `{"error":{"message":"Rate limit reached"}}`, "retry-after: 0\r\n")}
 	provider: Agent_Provider
-	if !agent_provider_start(t, &provider, responses) { return }
+	if !agent_provider_start(test, &provider, responses) { return }
 	defer agent_provider_stop(&provider)
 
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, shell_test_workspace(context.temp_allocator))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, shell_test_workspace(context.temp_allocator))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 500_000)
-	_test_accept(t, chat, "hello")
+	_test_accept(test, chat, "hello")
 
 	connection := ai.Provider_Connection {
 		API      = .OpenAI_Chat_Completions,
@@ -479,7 +488,7 @@ test_sigint_cuts_a_retry_backoff_short :: proc(t: ^testing.T) {
 	}
 	sender := test_thread_start(backoff_send_signal, &wait, "nabla-backoff-signal")
 	if sender == nil {
-		testing.expectf(t, false, "the signal sender could not start")
+		testing.expectf(test, false, "the signal sender could not start")
 		return
 	}
 	defer {
@@ -491,9 +500,9 @@ test_sigint_cuts_a_retry_backoff_short :: proc(t: ^testing.T) {
 	completed := chat_run_turn(chat, connection, policy, observer)
 	elapsed := time.tick_since(started)
 
-	testing.expect(t, !completed)
-	testing.expect_value(t, chat.terminal_status, Chat_Terminal_Status.Cancelled)
-	testing.expectf(t, elapsed < BACKOFF_DELAY / 2, "the retry backoff was not cut short: %v", elapsed)
+	testing.expect(test, !completed)
+	testing.expect_value(test, chat.terminal_status, Chat_Terminal_Status.Cancelled)
+	testing.expectf(test, elapsed < BACKOFF_DELAY / 2, "the retry backoff was not cut short: %v", elapsed)
 	// The second attempt never went out: the stop arrived while the chain was waiting.
-	testing.expect_value(t, agent_provider_request_count(&provider), 1)
+	testing.expect_value(test, agent_provider_request_count(&provider), 1)
 }

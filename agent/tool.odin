@@ -7,7 +7,7 @@ import "core:slice"
 import "core:strings"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:agent/skills"
 import "nabla:ai"
 
@@ -80,13 +80,13 @@ Tool_Context :: struct {
 	backend:        rawptr,
 	// compact is the session's compaction control, available only to native tools
 	// that ask for a context change. It is borrowed and lives as long as the
-	// session. source_seq is the committed call this execution belongs to, which is
-	// how such a tool names the boundary it was called at.
+	// session. call is the id of the call being run, which is how such a tool names
+	// the boundary it was called at.
 	compact:        ^Compact_Control,
-	source_seq:     session.Seq,
+	call:           journal.Call_Id,
 	// repairs collects what reading the arguments changed in their values, which the owner
 	// records with the call and writes back into the arguments the call runs with.
-	repairs:        session.Tool_Repairs,
+	repairs:        Tool_Repairs,
 	// agents is the calling orchestrator's team and member the calling subagent's own record,
 	// set only for the agent tools; the other is nil. Both outlive the call.
 	agents:         ^Agent_Team,
@@ -433,7 +433,7 @@ tool_definition_destroy :: proc(definition: ^Tool_Definition, allocator: mem.All
 // Every string and slice is owned by allocator.
 Tool_Result :: struct {
 	call_id:           string,
-	outcome:           session.Tool_Outcome,
+	outcome:           journal.Tool_Outcome,
 	reason:            string, // short line for the front-end
 	message:           string, // why the outcome is what it is; "" for a plain success
 	output:            Tool_Output,
@@ -456,7 +456,7 @@ tool_result_destroy :: proc(result: ^Tool_Result) {
 
 // tool_result_of builds a result from what a tool produced. output may borrow; the
 // result keeps its own copy. reason is a short line for the front-end.
-tool_result_of :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, message: string, output: Tool_Output, reason := "") -> Tool_Result {
+tool_result_of :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, message: string, output: Tool_Output, reason := "") -> Tool_Result {
 	result := Tool_Result {
 		outcome   = outcome,
 		allocator = ctx.allocator,
@@ -483,7 +483,7 @@ tool_result_success :: proc(ctx: ^Tool_Context, output: Tool_Output, reason := "
 
 // tool_result_failure is a result with no output of its own: a refusal, a timeout,
 // a transport failure, or anything else the harness observed without output.
-tool_result_failure :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, message: string, reason := "") -> Tool_Result {
+tool_result_failure :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, message: string, reason := "") -> Tool_Result {
 	return tool_result_of(ctx, outcome, message, nil, reason)
 }
 

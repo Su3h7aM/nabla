@@ -110,26 +110,51 @@ RESPONSE_FINISH_NAMES := [Response_Finish]string {
 	.Tool_Call      = "tool_call",
 }
 
-// Completion ends a unit of work: outcome is a TURN_OUTCOME_NAMES name for a
-// turn and a TOOL_OUTCOME_NAMES name for a call, Lua run, Task, or subagent.
+// Completion ends a unit of work: outcome is a TOOL_OUTCOME_NAMES name for a
+// call, Lua run, Task, or subagent.
 Completion :: struct {
 	version: int,
 	outcome: string,
 	detail:  string,
 }
 
-Turn_Completed :: Completion
 Tool_Completed :: Completion
 Call_Completed :: Completion // lua.completed, task.completed, subagent.completed
 
-// Detail carries only an explanation: request.interrupted and response.rejected.
-Detail :: struct {
+// Turn_Completed ends a turn. reason is why its request chain stopped and cause
+// what kept the context from fitting, both "" when absent.
+Turn_Completed :: struct {
+	version: int,
+	outcome: string, // TURN_OUTCOME_NAMES
+	detail:  string,
+	reason:  string,
+	cause:   string,
+}
+
+Request_Interrupted :: struct {
 	version: int,
 	detail:  string,
 }
 
-Request_Interrupted :: Detail
-Response_Rejected :: Detail
+// Response_Rejected is why one send produced no usable response: the failure as
+// the provider layer classified it, the evidence it kept, and what the harness
+// decided. A retry delay the provider did not give is null.
+Response_Rejected :: struct {
+	version:             int,
+	kind:                string,
+	failure_class:       string,
+	status:              int,
+	provider_code:       string,
+	provider_request_id: string,
+	retry_after_ms:      Maybe(i64),
+	retry_directive:     string,
+	transport_cause:     string,
+	text_exposed:        bool,
+	completion_accepted: bool,
+	recovery:            string,
+	delay_ms:            i64,
+	detail:              string,
+}
 
 Session_Created :: struct {
 	version:        int,
@@ -177,10 +202,12 @@ Node_Committed :: struct {
 	kind:    string, // NODE_KIND_NAMES
 }
 
-// Turn_Started names the instruction artifact by hex digest.
+// Turn_Started names the instruction and manifest artifacts the turn runs with
+// by hex digest.
 Turn_Started :: struct {
 	version:      int,
 	instructions: string,
+	manifest:     string,
 	model:        string,
 	effort:       string,
 }
@@ -190,6 +217,8 @@ Request_Sent :: struct {
 	purpose:         string, // REQUEST_PURPOSE_NAMES
 	api:             string,
 	model_requested: string,
+	// recovery is how the send came to be: initial, transient_retry, or checkpoint_repair.
+	recovery:        string,
 }
 
 // Response_Committed carries the endpoint's native output items in the body. A

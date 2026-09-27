@@ -4,14 +4,14 @@ import "base:intrinsics"
 import "core:log"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 // The bridge is where Odin's logger meets the harness: the adapter that installs
 // this writer into context.logger, the correlation a record is emitted against,
 // and the names the log's own fields use for enums other packages define.
 //
 // Everything here is derived from state the harness already keeps, so a record
-// carries no identity the session database does not also have, and no procedure
+// carries no identity the journal does not also have, and no procedure
 // here retains what it borrows.
 //
 // Enum names are written out rather than derived from ordinals, because an ordinal
@@ -127,26 +127,26 @@ log_capture_wanted :: proc() -> bool {
 }
 
 // log_correlation is the correlation work on chat currently carries. Whatever the
-// session has reached is carried; a field the session has not set is left absent
+// chat has reached is carried; a field the chat has not set is left absent
 // rather than guessed, and a retired operation contributes no identity because no
 // operation is running.
 log_correlation :: proc(chat: ^Chat_Session) -> Log_Correlation {
 	if chat == nil { return {} }
 	correlation := Log_Correlation {
-		session_id = chat.id,
+		session_id = chat_session_text(chat),
 	}
-	if turn_no, has_turn := chat.turn_no.?; has_turn { correlation.turn_no = turn_no }
-	if request_no, has_request := chat.active_request.?; has_request { correlation.request_no = request_no }
+	if chat.turn != 0 { correlation.turn_no = i64(chat.turn) }
+	if chat.request != 0 { correlation.request_no = i64(chat.request) }
 	if chat.operation.state == .Running { correlation.operation_id = chat.operation.id }
 	return correlation
 }
 
 // log_correlation_for_request is log_correlation for work that belongs to a
-// request the session is not currently running, such as a background compaction.
+// request the chat is not currently running, such as a background compaction.
 // The running operation is not this request's, so it contributes nothing.
-log_correlation_for_request :: proc(chat: ^Chat_Session, request_no: session.Request_No) -> Log_Correlation {
+log_correlation_for_request :: proc(chat: ^Chat_Session, request: journal.Request_Id) -> Log_Correlation {
 	correlation := log_correlation(chat)
-	correlation.request_no = request_no
+	correlation.request_no = i64(request)
 	correlation.operation_id = 0
 	correlation.call_id = ""
 	return correlation
@@ -180,39 +180,6 @@ log_correlation_for_call :: proc(chat: ^Chat_Session, call_id: string) -> Log_Co
 // numeric duration in a record uses.
 Log_Duration_Milliseconds :: proc(duration: time.Duration) -> i64 {
 	return time.duration_nanoseconds(duration) / 1_000_000
-}
-
-@(private)
-log_error_kind_name :: proc(kind: session.Error_Kind) -> string {
-	switch kind {
-	case .None:
-		return "none"
-	case .Invalid_Argument:
-		return "invalid_argument"
-	case .Not_Found:
-		return "not_found"
-	case .Claimed:
-		return "claimed"
-	case .Contended:
-		return "contended"
-	case .Stale_Snapshot:
-		return "stale_snapshot"
-	case .Constraint:
-		return "constraint"
-	case .Storage:
-		return "storage"
-	case .Schema_Too_New:
-		return "schema_too_new"
-	case .Schema_Unknown:
-		return "schema_unknown"
-	case .Corrupt:
-		return "corrupt"
-	case .Encode:
-		return "encode"
-	case .Invalid_State:
-		return "invalid_state"
-	}
-	return "invalid_state"
 }
 
 // tool_arguments_status_name is what tool.arguments_prepared records for the

@@ -1,6 +1,7 @@
 package journal
 
 import "core:encoding/json"
+import "core:fmt"
 import "core:mem"
 import "core:os"
 
@@ -37,4 +38,32 @@ Error :: union #shared_nil {
 error_is :: proc(error: Error, kind: Journal_Error) -> bool {
 	own, is_own := error.(Journal_Error)
 	return is_own && own == kind
+}
+
+JOURNAL_ERROR_TEXT := [Journal_Error]string {
+	.None           = "no error",
+	.Claimed        = "another process holds the session",
+	.Not_Found      = "the session or journal does not exist",
+	.Schema_Too_New = "the journal was written by a newer version",
+	.Schema_Unknown = "the journal has an unknown schema",
+	.Corrupt        = "the journal holds damaged data",
+	.Storage_Failed = "the storage cannot keep the journal durable",
+}
+
+// error_text describes error for a person, in allocator.
+error_text :: proc(error: Error, allocator := context.allocator) -> string {
+	switch value in error {
+	case Journal_Error:
+		return fmt.aprint(JOURNAL_ERROR_TEXT[value], allocator = allocator)
+	case db.Error:
+		local := value
+		return fmt.aprintf("database error: %s", db.error_message(&local), allocator = allocator)
+	case os.Error:
+		return fmt.aprintf("filesystem error: %s", os.error_string(value), allocator = allocator)
+	case mem.Allocator_Error:
+		return fmt.aprintf("allocation failed: %v", value, allocator = allocator)
+	case json.Marshal_Error:
+		return fmt.aprintf("a record could not be encoded: %v", value, allocator = allocator)
+	}
+	return fmt.aprint("no error", allocator = allocator)
 }

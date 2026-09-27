@@ -132,6 +132,26 @@ put_artifact :: proc(journal: ^Journal, kind: string, bytes: []u8) -> (digest: D
 	return
 }
 
+// next_turn, next_request, and next_call allocate the claimed session's next
+// harness id, continuing from the counters its claim loaded.
+next_turn :: proc(journal: ^Journal) -> Turn_Id {
+	assert(journal.claimed != {}, "ids belong to the claimed session")
+	journal.counters.turn += 1
+	return journal.counters.turn
+}
+
+next_request :: proc(journal: ^Journal) -> Request_Id {
+	assert(journal.claimed != {}, "ids belong to the claimed session")
+	journal.counters.request += 1
+	return journal.counters.request
+}
+
+next_call :: proc(journal: ^Journal) -> Call_Id {
+	assert(journal.claimed != {}, "ids belong to the claimed session")
+	journal.counters.call += 1
+	return journal.counters.call
+}
+
 // commit writes every pending item in one immediate transaction and returns the
 // last seq written. A failure rolls back and latches: the journal stops writing.
 @(require_results)

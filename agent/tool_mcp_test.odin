@@ -7,7 +7,7 @@ import "core:strings"
 import "core:testing"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:mcp"
 
 @(private)
@@ -16,26 +16,26 @@ mcp_test_context :: proc() -> Tool_Context {
 }
 
 @(test)
-test_mcp_exchange_records_delivery_without_payloads :: proc(t: ^testing.T) {
+test_mcp_exchange_records_delivery_without_payloads :: proc(test: ^testing.T) {
 	fixture: Log_Test
-	log_test_begin(t, &fixture)
-	defer log_test_end(t, &fixture)
+	log_test_begin(test, &fixture)
+	defer log_test_end(test, &fixture)
 	backend := MCP_Tool_Backend {
 		server_id   = "files",
 		remote_name = "find_files.by_name",
 	}
-	ctx := mcp_test_context()
-	ctx.backend = &backend
+	tool_context := mcp_test_context()
+	tool_context.backend = &backend
 	// The executor is given its call's binding by its caller, so the test installs
 	// one here and the exchange below records against it.
 	binding := Log_Binding {
 		sink = &fixture.log,
-		correlation = Log_Correlation{call_id = ctx.call_id},
+		correlation = Log_Correlation{call_id = tool_context.call_id},
 	}
 	context.logger = log_logger(&binding)
-	result := tool_mcp_execute(&ctx, nil)
+	result := tool_mcp_execute(&tool_context, nil)
 	defer tool_result_destroy(&result)
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Unavailable)
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Unavailable)
 
 	failure := mcp.Error {
 		kind        = .Timed_Out,
@@ -43,16 +43,16 @@ test_mcp_exchange_records_delivery_without_payloads :: proc(t: ^testing.T) {
 		stderr_tail = "secret-token\nprivate output",
 	}
 	log_mcp_exchange_finished(&backend, failure.delivery, failure, .Timed_Out, time.Second)
-	text := log_test_segment_text(t, &fixture, 1)
+	text := log_test_segment_text(test, &fixture, 1)
 	defer delete(text, context.allocator)
-	testing.expect(t, strings.contains(text, `"event":"mcp.exchange_started"`))
-	testing.expect(t, strings.contains(text, `"remote_name":"find_files.by_name"`))
-	testing.expect(t, strings.contains(text, `"delivery":"not_delivered"`))
-	testing.expect(t, strings.contains(text, `"delivery":"delivered"`))
-	testing.expect(t, strings.contains(text, `"event":"mcp.stderr"`))
-	testing.expect(t, strings.contains(text, `"call_id":"call_mcp"`))
-	testing.expect(t, !strings.contains(text, "secret-token"))
-	testing.expect(t, !strings.contains(text, "private output"))
+	testing.expect(test, strings.contains(text, `"event":"mcp.exchange_started"`))
+	testing.expect(test, strings.contains(text, `"remote_name":"find_files.by_name"`))
+	testing.expect(test, strings.contains(text, `"delivery":"not_delivered"`))
+	testing.expect(test, strings.contains(text, `"delivery":"delivered"`))
+	testing.expect(test, strings.contains(text, `"event":"mcp.stderr"`))
+	testing.expect(test, strings.contains(text, `"call_id":"call_mcp"`))
+	testing.expect(test, !strings.contains(text, "secret-token"))
+	testing.expect(test, !strings.contains(text, "private output"))
 }
 
 @(private)
@@ -66,7 +66,7 @@ mcp_test_content :: proc(kind: mcp.Content_Kind, type_name, text, mime_type: str
 }
 
 @(test)
-test_mcp_definition_carries_the_alias_schema_and_hints :: proc(t: ^testing.T) {
+test_mcp_definition_carries_the_alias_schema_and_hints :: proc(test: ^testing.T) {
 	tool := mcp.Tool {
 		name = "issues_create",
 		description = "Create one issue.",
@@ -78,25 +78,25 @@ test_mcp_definition_carries_the_alias_schema_and_hints :: proc(t: ^testing.T) {
 
 	// The alias is what the model is advertised, and the remote name travels in the
 	// binding: the two are deliberately not the same string.
-	testing.expect_value(t, definition.name, "github_create_issue")
-	testing.expect_value(t, definition.description, "Create one issue.")
-	testing.expect_value(t, definition.input_schema, `{"type":"object"}`)
-	testing.expect(t, definition.execute == tool_mcp_execute, "every adapted tool shares one executor")
-	testing.expect_value(t, definition.timeout, 5 * time.Second)
-	testing.expect(t, definition.backend == rawptr(&backend), "the binding is borrowed, not copied")
-	testing.expect_value(t, definition.hints.read_only, Tool_Hint_Value.Yes)
-	testing.expect_value(t, definition.hints.destructive, Tool_Hint_Value.No)
+	testing.expect_value(test, definition.name, "github_create_issue")
+	testing.expect_value(test, definition.description, "Create one issue.")
+	testing.expect_value(test, definition.input_schema, `{"type":"object"}`)
+	testing.expect(test, definition.execute == tool_mcp_execute, "every adapted tool shares one executor")
+	testing.expect_value(test, definition.timeout, 5 * time.Second)
+	testing.expect(test, definition.backend == rawptr(&backend), "the binding is borrowed, not copied")
+	testing.expect_value(test, definition.hints.read_only, Tool_Hint_Value.Yes)
+	testing.expect_value(test, definition.hints.destructive, Tool_Hint_Value.No)
 	// An annotation the server left out stays unknown rather than becoming "no".
-	testing.expect_value(t, definition.hints.idempotent, Tool_Hint_Value.Unknown)
-	testing.expect_value(t, definition.hints.open_world, Tool_Hint_Value.Yes)
+	testing.expect_value(test, definition.hints.idempotent, Tool_Hint_Value.Unknown)
+	testing.expect_value(test, definition.hints.open_world, Tool_Hint_Value.Yes)
 }
 
 // A tool whose arguments the server validates has its integer fields repaired from its own
 // schema, and every other field travels exactly as it was sent.
 @(test)
-test_mcp_integer_fields_are_repaired_from_the_schema :: proc(t: ^testing.T) {
+test_mcp_integer_fields_are_repaired_from_the_schema :: proc(test: ^testing.T) {
 	registry, registry_error := tool_registry_make()
-	if !testing.expect_value(t, registry_error.kind, Tool_Registry_Error_Kind.None) { return }
+	if !testing.expect_value(test, registry_error.kind, Tool_Registry_Error_Kind.None) { return }
 	defer tool_registry_destroy(&registry)
 	schema := `{"type":"object","properties":{"count":{"type":"integer"},"page":{"type":["integer","null"]},"label":{"type":"string"},"either":{"type":["integer","string"]}}}`
 	tool := mcp.Tool {
@@ -106,35 +106,35 @@ test_mcp_integer_fields_are_repaired_from_the_schema :: proc(t: ^testing.T) {
 	}
 	backend: MCP_Tool_Backend
 	added := tool_registry_add(&registry, mcp_tool_definition("remote_search", tool, &backend, 0))
-	if !testing.expect_value(t, added.kind, Tool_Registry_Error_Kind.None) { return }
+	if !testing.expect_value(test, added.kind, Tool_Registry_Error_Kind.None) { return }
 	definition, found := tool_registry_find(&registry, "remote_search")
-	if !testing.expect(t, found, "the tool is registered") { return }
-	testing.expect_value(t, len(definition.integer_fields), 2)
+	if !testing.expect(test, found, "the tool is registered") { return }
+	testing.expect_value(test, len(definition.integer_fields), 2)
 
 	arguments := tool_arguments_prepare(`{"count":"7","page":3.0,"label":"12","either":"5"}`)
 	defer tool_arguments_destroy(&arguments)
-	ctx := Tool_Context {
+	tool_context := Tool_Context {
 		allocator = context.allocator,
 	}
-	_, decode_error := tool_args_decode(&ctx, definition^, arguments.value.(json.Object))
-	testing.expect_value(t, decode_error, nil)
-	testing.expect_value(t, ctx.repairs, session.Tool_Repairs{.Integer_From_String, .Integer_From_Float})
+	_, decode_error := tool_args_decode(&tool_context, definition^, arguments.value.(json.Object))
+	testing.expect_value(test, decode_error, nil)
+	testing.expect_value(test, tool_context.repairs, Tool_Repairs{.Integer_From_String, .Integer_From_Float})
 	object := arguments.value.(json.Object)
-	testing.expect_value(t, object["count"].(json.Integer), 7)
-	testing.expect_value(t, object["page"].(json.Integer), 3)
-	testing.expect_value(t, string(object["label"].(json.String)), "12")
-	testing.expect_value(t, string(object["either"].(json.String)), "5")
+	testing.expect_value(test, object["count"].(json.Integer), 7)
+	testing.expect_value(test, object["page"].(json.Integer), 3)
+	testing.expect_value(test, string(object["label"].(json.String)), "12")
+	testing.expect_value(test, string(object["either"].(json.String)), "5")
 }
 
 // The only question that decides an outcome is whether the call can have happened.
 @(private)
 Mcp_Failure_Case :: struct {
-	err:     mcp.Error,
-	outcome: session.Tool_Outcome,
+	failure: mcp.Error,
+	outcome: journal.Tool_Outcome,
 }
 
 @(test)
-test_mcp_failures_map_by_delivery :: proc(t: ^testing.T) {
+test_mcp_failures_map_by_delivery :: proc(test: ^testing.T) {
 	cases := []Mcp_Failure_Case {
 		{{kind = .Cancelled}, .Cancelled},
 		{{kind = .Timed_Out}, .Timed_Out},
@@ -151,15 +151,15 @@ test_mcp_failures_map_by_delivery :: proc(t: ^testing.T) {
 		{{kind = .Malformed_Message, delivery = .Delivered}, .Unknown},
 	}
 	for item in cases {
-		outcome, reason := tool_mcp_outcome(item.err)
-		testing.expectf(t, outcome == item.outcome, "%v should map to %v, got %v", item.err.kind, item.outcome, outcome)
-		testing.expectf(t, reason != "", "%v should say why in one line", item.err.kind)
+		outcome, reason := tool_mcp_outcome(item.failure)
+		testing.expectf(test, outcome == item.outcome, "%v should map to %v, got %v", item.failure.kind, item.outcome, outcome)
+		testing.expectf(test, reason != "", "%v should say why in one line", item.failure.kind)
 	}
 }
 
 @(test)
-test_mcp_result_shows_text_and_reports_what_it_omits :: proc(t: ^testing.T) {
-	ctx := mcp_test_context()
+test_mcp_result_shows_text_and_reports_what_it_omits :: proc(test: ^testing.T) {
+	tool_context := mcp_test_context()
 	call := mcp.Call_Result {
 		allocator       = context.allocator,
 		content         = make([dynamic]mcp.Content, 0, 2, context.allocator),
@@ -169,22 +169,22 @@ test_mcp_result_shows_text_and_reports_what_it_omits :: proc(t: ^testing.T) {
 	append(&call.content, mcp_test_content(.Text, "text", "created issue 12", ""))
 	append(&call.content, mcp_test_content(.Image, "image", "", "image/png"))
 
-	result := tool_mcp_call_result(&ctx, call)
+	result := tool_mcp_call_result(&tool_context, call)
 	defer tool_result_destroy(&result)
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(result.content, "created issue 12"), "the text reaches the model")
-	testing.expect(t, strings.contains(result.content, "image/png"), "an omitted block says what it was")
-	testing.expect(t, !strings.contains(result.content, "aGVsbG8"), "the payload is not carried")
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Success)
+	testing.expect(test, strings.contains(result.content, "created issue 12"), "the text reaches the model")
+	testing.expect(test, strings.contains(result.content, "image/png"), "an omitted block says what it was")
+	testing.expect(test, !strings.contains(result.content, "aGVsbG8"), "the payload is not carried")
 	testing.expect(
-		t,
+		test,
 		strings.contains(result.content, "structured_content:\n{\"number\":12}"),
 		"structured content is spliced in as a value rather than escaped as a string",
 	)
 }
 
 @(test)
-test_mcp_failure_flag_and_truncation_reach_the_model :: proc(t: ^testing.T) {
-	ctx := mcp_test_context()
+test_mcp_failure_flag_and_truncation_reach_the_model :: proc(test: ^testing.T) {
+	tool_context := mcp_test_context()
 	failed := mcp.Call_Result {
 		allocator = context.allocator,
 		is_error  = true,
@@ -193,9 +193,9 @@ test_mcp_failure_flag_and_truncation_reach_the_model :: proc(t: ^testing.T) {
 	defer mcp.call_result_destroy(&failed, context.allocator)
 	append(&failed.content, mcp_test_content(.Text, "text", "no such repo", ""))
 
-	result := tool_mcp_call_result(&ctx, failed)
+	result := tool_mcp_call_result(&tool_context, failed)
 	defer tool_result_destroy(&result)
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Tool_Failed)
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Tool_Failed)
 
 	truncated := mcp.Call_Result {
 		allocator = context.allocator,
@@ -203,16 +203,16 @@ test_mcp_failure_flag_and_truncation_reach_the_model :: proc(t: ^testing.T) {
 		content   = make([dynamic]mcp.Content, 0, context.allocator),
 	}
 	defer mcp.call_result_destroy(&truncated, context.allocator)
-	message_result := tool_mcp_call_result(&ctx, truncated)
+	message_result := tool_mcp_call_result(&tool_context, truncated)
 	defer tool_result_destroy(&message_result)
-	testing.expect(t, strings.contains(message_result.content, "longer than the harness shows"), "truncation is reported")
+	testing.expect(test, strings.contains(message_result.content, "longer than the harness shows"), "truncation is reported")
 }
 
 // No sampling, elicitation, or roots capability is declared, so a server asking for
 // input is asking for something this harness does not do.
 @(test)
-test_mcp_input_required_is_a_failure_that_says_so :: proc(t: ^testing.T) {
-	ctx := mcp_test_context()
+test_mcp_input_required_is_a_failure_that_says_so :: proc(test: ^testing.T) {
+	tool_context := mcp_test_context()
 	call := mcp.Call_Result {
 		allocator      = context.allocator,
 		input_required = true,
@@ -221,9 +221,9 @@ test_mcp_input_required_is_a_failure_that_says_so :: proc(t: ^testing.T) {
 	}
 	defer mcp.call_result_destroy(&call, context.allocator)
 
-	result := tool_mcp_call_result(&ctx, call)
+	result := tool_mcp_call_result(&tool_context, call)
 	defer tool_result_destroy(&result)
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Tool_Failed)
-	testing.expect(t, strings.contains(result.content, "cannot supply"), "the message says what happened")
-	testing.expect(t, strings.contains(result.content, "elicitation/create"), "the request is described for the reader")
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Tool_Failed)
+	testing.expect(test, strings.contains(result.content, "cannot supply"), "the message says what happened")
+	testing.expect(test, strings.contains(result.content, "elicitation/create"), "the request is described for the reader")
 }

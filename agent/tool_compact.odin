@@ -30,7 +30,7 @@ tool_compact_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_R
 	if ctx.compact == nil {
 		return tool_result_failure(ctx, .Unavailable, "compaction is not available in this session", "unavailable")
 	}
-	switch compact_request_intent(ctx.compact, .Agent_Tool, ctx.source_seq) {
+	switch compact_request_intent(ctx.compact, .Agent_Tool, ctx.call) {
 	case .Scheduled:
 		return tool_result_success(ctx, Compact_Output{state = "scheduled"}, "scheduled")
 	case .Already_Scheduled:

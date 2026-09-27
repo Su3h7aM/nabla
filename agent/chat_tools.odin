@@ -4,7 +4,7 @@ import "base:runtime"
 import "core:os"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 // --- running tools -----------------------------------------------------------
 
@@ -60,38 +60,60 @@ chat_tool_jobs_wait :: proc(chat: ^Chat_Session) {
 }
 
 // chat_tool_jobs_finish releases a settled batch and applies its committed result
-// count to the chat barrier. It is the only production path that clears the table.
+// count to the chat barrier. A batch that answered every call it was given commits
+// the Results node that lists them in proposal order. It is the only production path
+// that clears the table.
 @(private)
 chat_tool_jobs_finish :: proc(chat: ^Chat_Session, turn_id: u64) -> bool {
 	if !chat.tool_jobs_active || !tool_jobs_settled(&chat.tool_jobs) { return false }
 	count := tool_jobs_committed(&chat.tool_jobs)
+	roots := chat.tool_jobs.committed_roots
 	tool_jobs_destroy(&chat.tool_jobs)
 	chat.tool_jobs_active = false
+	if !chat_commit_results(chat, roots) { return false }
 	return chat_session_tools_done(chat, turn_id, count)
 }
 
-// chat_record_tool_result appends the result entry a model later reads. It reports the
-// entry it stored, and reports no entry when the write failed, which stops the turn: a
-// call that ran and left no result is exactly the unanswered call the record must never
-// have.
+// chat_commit_results commits the Results node answering the staged calls, in proposal
+// order, once roots results were committed for all of them. It reports false only when
+// the commit failed.
 @(private)
-chat_record_tool_result :: proc(chat: ^Chat_Session, staged: ^Chat_Tool_Call, result: ^Tool_Result) -> (seq: session.Seq, recorded: bool) {
-	// The entry's fields, error text included, are written before this returns, so the temp
-	// memory they were built in is released here.
+chat_commit_results :: proc(chat: ^Chat_Session, roots: int) -> bool {
+	if roots != len(chat.pending_calls) || roots == 0 { return true }
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	calls := make([]journal.Call_Id, roots, context.temp_allocator)
+	for staged, index in chat.pending_calls { calls[index] = staged.call }
+	chat_node(chat, .Results, journal.Results{calls = calls})
+	return chat_commit(chat, "the tool results could not be recorded")
+}
+
+// chat_record_tool_result commits the tool.completed record a model later reads. node is
+// the Assistant node of a root call and parent_call the call that started a Lua child. It
+// reports false when the commit failed, which stops the turn: a call that ran and left no
+// result is exactly the unanswered call the record must never have.
+@(private)
+chat_record_tool_result :: proc(
+	chat: ^Chat_Session,
+	call: journal.Call_Id,
+	node: journal.Node_Id,
+	parent_call: journal.Call_Id,
+	result: ^Tool_Result,
+) -> bool {
+	// The journal copies the error text, so the temp memory it was built in is released here.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	error_text := ""
 	if result.error != nil { error_text = tool_argument_error_text(result.error, context.temp_allocator) }
-	entry := session.New_Entry {
-		turn_no = chat.turn_no,
-		request_no = chat.active_request,
-		created_at_ms = session.now_ms(),
-		related_seq = staged.seq,
-		payload = session.Tool_Result_Entry{outcome = result.outcome, error = error_text, content = result.content, origin = .Observed},
+	header := journal.Record {
+		kind        = .Tool_Completed,
+		node        = node,
+		request     = chat.request,
+		call        = call,
+		parent_call = parent_call,
 	}
-	stored, append_error := session.entry_append(chat.store, chat.id, entry)
-	if append_error != nil {
-		chat_session_record_failure(chat, "the tool result could not be recorded", append_error)
-		return {}, false
+	completed := journal.Tool_Completed {
+		outcome = journal.TOOL_OUTCOME_NAMES[result.outcome],
+		detail  = error_text,
 	}
-	return stored, true
+	chat_record(chat, header, completed, transmute([]u8)result.content)
+	return chat_commit(chat, "the tool result could not be recorded")
 }

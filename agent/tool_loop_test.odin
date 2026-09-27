@@ -2,22 +2,22 @@
 package agent
 
 import "core:encoding/json"
-import "core:fmt"
+import "core:mem/virtual"
 import "core:os"
 import "core:strings"
 import "core:testing"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 // item_object and item_string read the encoded request body the way a provider
 // would: by item type, role, and field. They exist so a test can assert wire
 // order and absence of duplicates instead of asserting a struct it built itself.
 @(private)
-item_object :: proc(t: ^testing.T, items: json.Array, index: int) -> json.Object {
+item_object :: proc(test: ^testing.T, items: json.Array, index: int) -> json.Object {
 	object, ok := items[index].(json.Object)
-	testing.expect(t, ok)
+	testing.expect(test, ok)
 	return object
 }
 
@@ -34,76 +34,76 @@ tool_loop_connection :: ai.Provider_Connection {
 	API = .OpenAI_Chat_Completions,
 }
 
-tool_loop_workspace :: proc(t: ^testing.T) -> string {
-	workspace, err := os.get_working_directory(context.temp_allocator)
-	testing.expect(t, err == nil)
-	testing.expect(t, workspace != "")
+tool_loop_workspace :: proc(test: ^testing.T) -> string {
+	workspace, workspace_error := os.get_working_directory(context.temp_allocator)
+	testing.expect(test, workspace_error == nil)
+	testing.expect(test, workspace != "")
 	return workspace
 }
 
 @(test)
-test_effort_selection_validates_levels :: proc(t: ^testing.T) {
+test_effort_selection_validates_levels :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 
 	// No levels configured: only the default is selectable.
-	testing.expect(t, chat_session_set_effort(chat, ""))
-	testing.expect(t, !chat_session_set_effort(chat, "high"))
+	testing.expect(test, chat_session_set_effort(chat, ""))
+	testing.expect(test, !chat_session_set_effort(chat, "high"))
 
 	append(&chat.effort_levels, strings.clone("low", chat.allocator))
 	append(&chat.effort_levels, strings.clone("high", chat.allocator))
-	testing.expect(t, chat_session_set_effort(chat, "high"))
-	testing.expect_value(t, chat.effort, "high")
-	testing.expect(t, !chat_session_set_effort(chat, "max"))
-	testing.expect_value(t, chat.effort, "high")
-	testing.expect(t, chat_session_set_effort(chat, ""))
-	testing.expect_value(t, chat.effort, "")
+	testing.expect(test, chat_session_set_effort(chat, "high"))
+	testing.expect_value(test, chat.effort, "high")
+	testing.expect(test, !chat_session_set_effort(chat, "max"))
+	testing.expect_value(test, chat.effort, "high")
+	testing.expect(test, chat_session_set_effort(chat, ""))
+	testing.expect_value(test, chat.effort, "")
 }
 
 @(test)
-test_build_request_carries_selected_effort :: proc(t: ^testing.T) {
+test_build_request_carries_selected_effort :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	append(&chat.effort_levels, strings.clone("high", chat.allocator))
-	testing.expect(t, chat_session_set_effort(chat, "high"))
-	_test_accept(t, chat, "hi")
+	testing.expect(test, chat_session_set_effort(chat, "high"))
+	_test_accept(test, chat, "hi")
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
-	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
-	testing.expect(t, prep.request.Reasoning_Effort_Present)
-	testing.expect_value(t, prep.request.Reasoning_Effort, "high")
-	chat_request_prep_destroy(&prep, chat.allocator)
+	first: virtual.Arena
+	first_request := request_test_prepare(test, chat, tool_loop_connection, &first)
+	testing.expect(test, first_request.request.Reasoning_Effort_Present)
+	testing.expect_value(test, first_request.request.Reasoning_Effort, "high")
+	virtual.arena_destroy(&first)
 
-	testing.expect(t, chat_session_set_effort(chat, ""))
-	prep, prep_err = chat_prepare(chat, tool_loop_connection, chat.allocator)
-	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
-	defer chat_request_prep_destroy(&prep, chat.allocator)
-	testing.expect(t, !prep.request.Reasoning_Effort_Present)
+	testing.expect(test, chat_session_set_effort(chat, ""))
+	second: virtual.Arena
+	second_request := request_test_prepare(test, chat, tool_loop_connection, &second)
+	testing.expect(test, !second_request.request.Reasoning_Effort_Present)
+	virtual.arena_destroy(&second)
 }
 
 @(test)
-test_admission_refuses_without_window_or_budget :: proc(t: ^testing.T) {
+test_admission_refuses_without_window_or_budget :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 
 	message, admitted := chat_admission_check(chat, 100, {})
-	testing.expect(t, !admitted)
-	testing.expect(t, strings.contains(message, "context_window"))
+	testing.expect(test, !admitted)
+	testing.expect(test, strings.contains(message, "context_window"))
 
 	chat_test_capacity(chat, 500000)
 	_, admitted = chat_admission_check(chat, 100, {})
-	testing.expect(t, admitted)
+	testing.expect(test, admitted)
 
 	// 490000 estimated plus default reserve plus margin does not fit 500000.
 	message, admitted = chat_admission_check(chat, 490000, {})
-	testing.expect(t, !admitted)
-	testing.expect(t, strings.contains(message, "exceeds"))
+	testing.expect(test, !admitted)
+	testing.expect(test, strings.contains(message, "exceeds"))
 	_ = message
 }
 
@@ -111,13 +111,13 @@ test_admission_refuses_without_window_or_budget :: proc(t: ^testing.T) {
 // a request whose tool schemas do not fit, and saying so is what tells the user what to
 // change.
 @(test)
-test_admission_names_the_part_that_alone_does_not_fit :: proc(t: ^testing.T) {
+test_admission_names_the_part_that_alone_does_not_fit :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, 4_000)
-	_test_accept(t, chat, "hi")
+	_test_accept(test, chat, "hi")
 	chat.tools_enabled = true
 
 	// A schema whose description alone is far larger than the window this session runs with.
@@ -126,287 +126,233 @@ test_admission_names_the_part_that_alone_does_not_fit :: proc(t: ^testing.T) {
 	// The registry owns what it is given, so this goes through the same call a real tool
 	// does rather than appending by hand.
 	added := tool_registry_add(&chat.tools, {name = "test_big", description = "big", input_schema = schema, execute = tool_policy_probe_execute})
-	testing.expect_value(t, added, Tool_Registry_Error{})
+	testing.expect_value(test, added, Tool_Registry_Error{})
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
-	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
-	defer chat_request_prep_destroy(&prep, chat.allocator)
+	arena: virtual.Arena
+	preparation := request_test_prepare(test, chat, tool_loop_connection, &arena)
+	defer virtual.arena_destroy(&arena)
 	// The window cannot hold the schemas alone, and the estimate says so.
-	testing.expect(t, prep.sizes.tools > chat_capacity_input_ceiling(chat.capacity), "the fixture must not fit")
-	message, admitted := chat_admission_check(chat, prep.estimate, prep.sizes)
-	testing.expect(t, !admitted, "a request whose tools alone do not fit is refused")
-	testing.expect(t, strings.contains(message, "tool schemas"), message)
+	testing.expect(test, preparation.sizes.tools > chat_capacity_input_ceiling(chat.capacity), "the fixture must not fit")
+	message, admitted := chat_admission_check(chat, preparation.estimate, preparation.sizes)
+	testing.expect(test, !admitted, "a request whose tools alone do not fit is refused")
+	testing.expect(test, strings.contains(message, "tool schemas"), message)
 }
 
 @(test)
-test_tool_calls_are_recorded_then_run :: proc(t: ^testing.T) {
+test_tool_calls_are_recorded_then_run :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	_test_accept(t, chat, "run printf ok")
+	_test_accept(test, chat, "run printf ok")
 
-	// The response committed a call; the driver now runs it. The call entry, the
-	// dispatch, and the result are three separate records.
-	call_seq := _test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			created_at_ms = 2_000,
-			payload = session.Tool_Call_Entry {
-				call_id = "call_1",
-				name = TOOL_SHELL_NAME,
-				arguments = `{"command":"printf tool-ok","working_directory":null,"timeout_ms":null}`,
-			},
-		},
-	)
-	append(
-		&chat.pending_calls,
-		Chat_Tool_Call {
-			id = chat_clone_string("call_1", chat.allocator),
-			name = chat_clone_string(TOOL_SHELL_NAME, chat.allocator),
-			arguments = chat_clone_string(`{"command":"printf tool-ok","working_directory":null,"timeout_ms":null}`, chat.allocator),
-			seq = call_seq,
-		},
-	)
-	chat.state = .Executing_Tools
+	arguments := `{"command":"printf tool-ok","working_directory":null,"timeout_ms":null}`
+	_test_stage_call(test, chat, "call_1", arguments)
+	call := chat.pending_calls[0].call
 
+	// The response proposed the call, the driver admitted and ran it, and the batch was
+	// closed with the Results node that lists what it answered.
 	count := chat_run_tools(chat, {})
-	testing.expect_value(t, count, 1)
-	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, count))
+	testing.expect_value(test, count, 1)
+	testing.expect(test, chat_session_tools_done(chat, chat.active_turn_id, count), "the batch must answer every committed call")
 
-	entries := _test_entries(t, chat)
-	defer session.entries_destroy(entries, context.allocator)
-	if !testing.expect_value(t, len(entries), 4) { return }
-	testing.expect_value(t, entries[0].kind, session.Entry_Kind.User)
-	testing.expect_value(t, entries[1].kind, session.Entry_Kind.Tool_Call)
-	testing.expect_value(t, entries[2].kind, session.Entry_Kind.Tool_Dispatch)
-	testing.expect_value(t, entries[3].kind, session.Entry_Kind.Tool_Result)
+	records := _test_records(test, chat, {.Tool_Proposed, .Tool_Admitted, .Tool_Completed})
+	if !testing.expect_value(test, len(records), 3) { return }
+	testing.expect_value(test, records[0].kind, journal.Record_Kind.Tool_Proposed)
+	testing.expect_value(test, records[1].kind, journal.Record_Kind.Tool_Admitted)
+	testing.expect_value(test, records[2].kind, journal.Record_Kind.Tool_Completed)
+	for record in records { testing.expect_value(test, record.call, call) }
+	testing.expect_value(test, string(records[0].body), arguments)
 
-	dispatch, is_dispatch := entries[2].payload.(session.Tool_Dispatch_Entry)
-	if !testing.expect(t, is_dispatch, "the third entry should be a dispatch") { return }
-	testing.expect_value(t, dispatch.tool, TOOL_SHELL_NAME)
+	admitted: journal.Tool_Admitted
+	if decode_error := journal.payload_decode(records[1].data, &admitted, context.temp_allocator);
+	   decode_error != nil { testing.fail_now(test, "the admission could not be decoded") }
+	testing.expect_value(test, admitted.tool, TOOL_SHELL_NAME)
+	testing.expect_value(test, len(admitted.repairs), 0)
+	testing.expect_value(test, string(records[1].body), arguments)
 
-	result, is_result := entries[3].payload.(session.Tool_Result_Entry)
-	if !testing.expect(t, is_result, "the fourth entry should be a result") { return }
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-	testing.expect_value(t, result.origin, session.Tool_Result_Origin.Observed)
-	testing.expect(t, strings.contains(result.content, "tool-ok"), "the model-visible result should carry the output")
+	completed: journal.Tool_Completed
+	if decode_error := journal.payload_decode(records[2].data, &completed, context.temp_allocator);
+	   decode_error != nil { testing.fail_now(test, "the result could not be decoded") }
+	testing.expect_value(test, completed.outcome, journal.TOOL_OUTCOME_NAMES[.Success])
+	testing.expect(test, strings.contains(string(records[2].body), "tool-ok"), "the model-visible result should carry the output")
 
-	for entry in entries[2:] {
-		related, present := entry.related_seq.?
-		if !testing.expect(t, present, "a dispatch and result must name their call") { return }
-		testing.expect_value(t, related, call_seq)
+	ancestry, ancestry_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
+	if !testing.expect_value(test, ancestry_error, nil) { return }
+	results: journal.Results
+	found := false
+	for node in ancestry {
+		if node.kind != .Results { continue }
+		if decode_error := journal.payload_decode(node.data, &results, context.temp_allocator);
+		   decode_error != nil { testing.fail_now(test, "the results node could not be decoded") }
+		found = true
 	}
+	if !testing.expect(test, found, "the answered batch commits a Results node") { return }
+	if !testing.expect_value(test, len(results.calls), 1) { return }
+	testing.expect_value(test, results.calls[0], call)
 }
 
 @(test)
-test_malformed_arguments_are_rejected_and_replayed :: proc(t: ^testing.T) {
+test_malformed_arguments_are_rejected_and_replayed :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
 	chat_test_capacity(chat, chat.capacity.window if chat.capacity.window > 0 else CHAT_DEFAULT_CONTEXT_WINDOW, 4096)
-	_test_accept(t, chat, "malformed call")
+	_test_accept(test, chat, "malformed call")
 
 	// The provider delivered a call whose argument document never parses. Nothing
 	// runs, the model is told what is wrong, and the turn keeps going.
-	_test_stage_call(t, chat, "call_bad", `{"command":`)
+	_test_stage_call(test, chat, "call_bad", `{"command":`)
+	call := chat.pending_calls[0].call
 	count := chat_run_tools(chat, {})
-	testing.expect_value(t, count, 1)
-	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, count))
-	testing.expect_value(t, chat.state, Chat_State.Preparing)
+	testing.expect_value(test, count, 1)
+	testing.expect(test, chat_session_tools_done(chat, chat.active_turn_id, count))
+	testing.expect_value(test, chat.state, Chat_State.Preparing)
 
-	entries := _test_entries(t, chat)
-	defer session.entries_destroy(entries, context.allocator)
-	if !testing.expect_value(t, len(entries), 3) { return }
-	result, is_result := entries[2].payload.(session.Tool_Result_Entry)
-	if !testing.expect(t, is_result, "a rejected call still gets a result") { return }
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
-	testing.expect(t, strings.contains(result.content, `kind: syntax`), "the result names the defect")
+	// A call that never ran has a proposal and a result, and no admission.
+	records := _test_records(test, chat, {.Tool_Proposed, .Tool_Admitted, .Tool_Completed})
+	if !testing.expect_value(test, len(records), 2) { return }
+	testing.expect_value(test, records[0].kind, journal.Record_Kind.Tool_Proposed)
+	testing.expect_value(test, records[1].kind, journal.Record_Kind.Tool_Completed)
+	for record in records { testing.expect_value(test, record.call, call) }
+	completed: journal.Tool_Completed
+	if decode_error := journal.payload_decode(records[1].data, &completed, context.temp_allocator);
+	   decode_error != nil { testing.fail_now(test, "the result could not be decoded") }
+	testing.expect_value(test, completed.outcome, journal.TOOL_OUTCOME_NAMES[.Invalid_Arguments])
+	testing.expect(test, strings.contains(string(records[1].body), `kind: syntax`), "the result names the defect")
 
 	// The proposal must never reach the wire: an endpoint refuses tool arguments it
 	// cannot parse, and one unsendable request would poison every request after it.
 	// The refusal is spoken in the call's place, for every API family.
 	apis := []ai.API_Kind{.OpenAI_Chat_Completions, .OpenAI_Responses, .Anthropic_Messages}
 	for api in apis {
-		prep, prep_err := chat_prepare(chat, {API = api}, chat.allocator)
-		if !testing.expectf(t, prep_err == nil, "%v must build a request", api) { continue }
-		body, encode_err := ai.Provider_Encode_Request(prep.request)
-		testing.expectf(t, encode_err == ai.Provider_Request_Error.None, "%v must encode a refused call", api)
-		testing.expectf(t, !strings.contains(body, `{\"command\":`), "%v must not carry the malformed proposal", api)
-		testing.expectf(t, strings.contains(body, "was refused before it ran"), "%v must say the call did not run", api)
+		arena: virtual.Arena
+		preparation := request_test_prepare(test, chat, {API = api}, &arena)
+		body, encode_error := ai.Provider_Encode_Request(preparation.request)
+		if !testing.expectf(test, encode_error == ai.Provider_Request_Error.None, "%v must encode a refused call", api) {
+			virtual.arena_destroy(&arena)
+			continue
+		}
+		testing.expectf(test, !strings.contains(body, `{\"command\":`), "%v must not carry the malformed proposal", api)
+		testing.expectf(test, strings.contains(body, "was refused before it ran"), "%v must say the call did not run", api)
 		delete(body)
-		chat_request_prep_destroy(&prep, chat.allocator)
+		virtual.arena_destroy(&arena)
 	}
 }
 
 @(test)
-test_a_repaired_call_is_replayed_as_what_ran :: proc(t: ^testing.T) {
+test_a_repaired_call_is_replayed_as_what_ran :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	_test_accept(t, chat, "repaired call")
+	_test_accept(test, chat, "repaired call")
 
 	// A raw newline inside the command string and a timeout written as a string: the repairs
 	// escape one and write the other as an integer, so the proposal and what ran differ.
-	_test_stage_call(t, chat, "call_fix", "{\"command\":\"echo hello\n\",\"working_directory\":null,\"timeout_ms\":\"5000\"}")
+	_test_stage_call(test, chat, "call_fix", "{\"command\":\"echo hello\n\",\"working_directory\":null,\"timeout_ms\":\"5000\"}")
 	count := chat_run_tools(chat, {})
-	testing.expect_value(t, count, 1)
-	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, count))
+	testing.expect_value(test, count, 1)
+	testing.expect(test, chat_session_tools_done(chat, chat.active_turn_id, count))
 
-	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Chat_Completions}, chat.allocator)
-	if !testing.expect_value(t, prep_err, nil) { return }
-	defer chat_request_prep_destroy(&prep, chat.allocator)
+	// What was admitted names the repairs and holds the arguments the call ran with.
+	records := _test_records(test, chat, {.Tool_Admitted})
+	if !testing.expect_value(test, len(records), 1) { return }
+	admitted: journal.Tool_Admitted
+	if decode_error := journal.payload_decode(records[0].data, &admitted, context.temp_allocator);
+	   decode_error != nil { testing.fail_now(test, "the admission could not be decoded") }
+	testing.expect(test, len(admitted.repairs) > 0, "the repair is recorded with the call")
+	testing.expect(test, strings.contains(string(records[0].body), `"timeout_ms":5000`), "the admission holds what ran")
+
+	arena: virtual.Arena
+	preparation := request_test_prepare(test, chat, {API = .OpenAI_Chat_Completions}, &arena)
+	defer virtual.arena_destroy(&arena)
 
 	seen := false
-	for message in prep.wire {
+	for message in preparation.wire {
 		for call in message.Tool_Calls {
 			seen = true
-			testing.expect(t, !strings.contains(call.Arguments, "\n"), "the repair is what the provider is told")
-			testing.expect(t, strings.contains(call.Arguments, "echo hello"), "the command survives the repair")
-			testing.expect(t, strings.contains(call.Arguments, `"timeout_ms":5000`), call.Arguments)
+			testing.expect(test, !strings.contains(call.Arguments, "\n"), "the repair is what the provider is told")
+			testing.expect(test, strings.contains(call.Arguments, "echo hello"), "the command survives the repair")
+			testing.expect(test, strings.contains(call.Arguments, `"timeout_ms":5000`), call.Arguments)
 		}
 	}
-	testing.expect(t, seen, "a repaired call is still replayed as a call")
+	testing.expect(test, seen, "a repaired call is still replayed as a call")
 }
 
 @(test)
-test_a_response_with_an_unparseable_call_is_not_replayed_verbatim :: proc(t: ^testing.T) {
+test_a_response_with_an_unparseable_call_is_not_replayed_verbatim :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
 	chat_test_capacity(chat, chat.capacity.window if chat.capacity.window > 0 else CHAT_DEFAULT_CONTEXT_WINDOW, 4096)
-	_test_accept(t, chat, "native malformed call")
-	effect := _test_begin_request(t, chat)
-	request_no, begin_err := session.request_begin(
-		chat.store,
-		chat.id,
-		{turn_no = chat.turn_no, purpose = .Response, provider = "p", model_requested = "m", api = "openai_responses", config_json = "{}", input_json = "{}"},
-		session.now_ms(),
-	)
-	if !testing.expect_value(t, begin_err, nil) { return }
+	_test_accept(test, chat, "native malformed call")
 
 	// A native Responses output whose function_call carries arguments that do not
 	// parse. Replaying it verbatim is exactly what the endpoint refuses, so the
 	// response has to fall back to the projection, which can say it correctly.
-	output := `[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"trying\"}]},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_v\",\"name\":\"shell\",\"arguments\":\"{\\\"command\\\": not_a_number}\"}]`
-	_test_append(t, chat, {turn_no = chat.turn_no, request_no = request_no, created_at_ms = 2_000, payload = session.Response_Entry{output = output}})
-	_test_append(t, chat, {turn_no = chat.turn_no, request_no = request_no, created_at_ms = 2_001, payload = session.Assistant_Entry{text = "trying"}})
-	call_seq := _test_append(
-		t,
+	request := journal.next_request(chat.store)
+	output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"trying"}]},{"type":"function_call","id":"fc_1","call_id":"call_v","name":"shell","arguments":"{\"command\": not_a_number}"}]`
+	_test_response(test, chat, request, "trying", output)
+	call := _test_propose(test, chat, "call_v", `{"command": not_a_number}`, TOOL_SHELL_NAME, request)
+	content := `{"status":"invalid_arguments"}`
+	chat_record(
 		chat,
-		{
-			turn_no = chat.turn_no,
-			request_no = request_no,
-			created_at_ms = 2_002,
-			payload = session.Tool_Call_Entry{call_id = "call_v", item_id = "fc_1", name = TOOL_SHELL_NAME, arguments = `{\"command\": not_a_number}`},
-		},
+		{kind = .Tool_Completed, node = chat.response_node, request = request, call = call},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Invalid_Arguments], detail = "the arguments are not valid JSON"},
+		transmute([]u8)content,
 	)
-	_test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			request_no = request_no,
-			created_at_ms = 2_003,
-			related_seq = call_seq,
-			payload = session.Tool_Result_Entry {
-				outcome = .Invalid_Arguments,
-				error = "the arguments are not valid JSON",
-				content = `{\"status\":\"invalid_arguments\"}`,
-				origin = .Observed,
-			},
-		},
-	)
+	_test_commit(test, chat)
+	chat_node(chat, .Results, journal.Results{calls = []journal.Call_Id{call}})
+	_test_commit(test, chat)
 
-	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Responses}, chat.allocator)
-	if !testing.expect_value(t, prep_err, nil) { return }
-	defer chat_request_prep_destroy(&prep, chat.allocator)
-	body, encode_err := ai.Provider_Encode_Request(prep.request)
-	if !testing.expect_value(t, encode_err, ai.Provider_Request_Error.None) { return }
+	arena: virtual.Arena
+	preparation := request_test_prepare(test, chat, {API = .OpenAI_Responses}, &arena)
+	defer virtual.arena_destroy(&arena)
+	body, encode_error := ai.Provider_Encode_Request(preparation.request)
+	if !testing.expect_value(test, encode_error, ai.Provider_Request_Error.None) { return }
 	defer delete(body)
 
-	testing.expect(t, !strings.contains(body, `{\"command\":`), "the native record must not be replayed as it stands")
-	testing.expect(t, strings.contains(body, "was refused before it ran"), "the refusal is spoken instead")
+	testing.expect(test, !strings.contains(body, `{\"command\":`), "the native record must not be replayed as it stands")
+	testing.expect(test, strings.contains(body, "was refused before it ran"), "the refusal is spoken instead")
 }
 
 @(test)
-test_a_record_that_contradicts_the_call_it_holds_is_not_replayed :: proc(t: ^testing.T) {
+test_a_record_that_contradicts_the_call_it_holds_is_not_replayed :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	_test_accept(t, chat, "record the endpoint cannot take back")
-	_test_begin_request(t, chat)
-	request_no, begin_err := session.request_begin(
-		chat.store,
-		chat.id,
-		{turn_no = chat.turn_no, purpose = .Response, provider = "p", model_requested = "m", api = "openai_responses", config_json = "{}", input_json = "{}"},
-		session.now_ms(),
-	)
-	if !testing.expect_value(t, begin_err, nil) { return }
+	_test_accept(test, chat, "record the endpoint cannot take back")
 
-	// The endpoint's argument events delivered an object while its terminal record says
-	// the same call's arguments were empty. Those bytes are not JSON, so the request that
-	// carries them is refused, and so is every later request built from this history.
-	output := `[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"counting\"}]},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"\"}]`
-	_test_append(t, chat, {turn_no = chat.turn_no, request_no = request_no, created_at_ms = 2_000, payload = session.Response_Entry{output = output}})
-	_test_append(t, chat, {turn_no = chat.turn_no, request_no = request_no, created_at_ms = 2_001, payload = session.Assistant_Entry{text = "counting"}})
-	call_seq := _test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			request_no = request_no,
-			created_at_ms = 2_002,
-			payload = session.Tool_Call_Entry{call_id = "call_1", item_id = "fc_1", name = TOOL_SHELL_NAME, arguments = "{}"},
-		},
-	)
-	_test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			request_no = request_no,
-			created_at_ms = 2_003,
-			related_seq = call_seq,
-			payload = session.Tool_Dispatch_Entry{tool = TOOL_SHELL_NAME, arguments = "{}"},
-		},
-	)
-	_test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			request_no = request_no,
-			created_at_ms = 2_004,
-			related_seq = call_seq,
-			payload = session.Tool_Result_Entry{outcome = .Success, content = `{\"status\":\"exited\"}`, origin = .Observed},
-		},
-	)
+	// The endpoint's terminal record delivered an empty argument document while the call
+	// that ran holds an object. Those bytes are not what ran, so the request that carries
+	// them is refused, and the projection is what the endpoint reads back.
+	request := journal.next_request(chat.store)
+	output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"counting"}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":""}]`
+	_test_response(test, chat, request, "counting", output)
+	request_test_call(test, chat, request, "call_1", "{}", .Success, "fc_1")
 
-	prep, prep_err := chat_prepare(chat, {API = .OpenAI_Responses}, chat.allocator)
-	if !testing.expect_value(t, prep_err, nil) { return }
-	defer chat_request_prep_destroy(&prep, chat.allocator)
-	body, encode_err := ai.Provider_Encode_Request(prep.request)
-	if !testing.expect_value(t, encode_err, ai.Provider_Request_Error.None) { return }
+	arena: virtual.Arena
+	preparation := request_test_prepare(test, chat, {API = .OpenAI_Responses}, &arena)
+	defer virtual.arena_destroy(&arena)
+	body, encode_error := ai.Provider_Encode_Request(preparation.request)
+	if !testing.expect_value(test, encode_error, ai.Provider_Request_Error.None) { return }
 	defer delete(body)
-	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
-	if !testing.expect_value(t, parse_err, nil) { return }
+	value, parse_error := json.parse_string(body, .JSON, true, context.temp_allocator)
+	if !testing.expect_value(test, parse_error, nil) { return }
 	defer json.destroy_value(value, context.temp_allocator)
 	object, object_ok := value.(json.Object)
-	if !testing.expect(t, object_ok) { return }
+	if !testing.expect(test, object_ok) { return }
 	input, input_ok := object["input"].(json.Array)
-	if !testing.expect(t, input_ok) { return }
+	if !testing.expect(test, input_ok) { return }
 
 	// The call goes out as what it ran with, which is what the endpoint reads back.
 	sent := ""
@@ -415,180 +361,158 @@ test_a_record_that_contradicts_the_call_it_holds_is_not_replayed :: proc(t: ^tes
 		if !is_object || item_string(call, "type") != "function_call" { continue }
 		sent = item_string(call, "arguments")
 	}
-	testing.expect_value(t, sent, "{}")
-	testing.expect_value(t, prep.replay_refused, 1)
+	testing.expect_value(test, sent, "{}")
+	testing.expect_value(test, preparation.replay_refused, 1)
 }
 
 @(test)
-test_unknown_tool_is_reported_not_run :: proc(t: ^testing.T) {
+test_unknown_tool_is_reported_not_run :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	_test_accept(t, chat, "mystery")
+	_test_accept(test, chat, "mystery")
 
-	call_seq := _test_append(
-		t,
-		chat,
-		{turn_no = chat.turn_no, created_at_ms = 2_000, payload = session.Tool_Call_Entry{call_id = "call_x", name = "nope", arguments = "{}"}},
-	)
-	append(
-		&chat.pending_calls,
-		Chat_Tool_Call {
-			id = chat_clone_string("call_x", chat.allocator),
-			name = chat_clone_string("nope", chat.allocator),
-			arguments = chat_clone_string("{}", chat.allocator),
-			seq = call_seq,
-		},
-	)
-	chat.state = .Executing_Tools
-
+	_test_stage_call(test, chat, "call_x", "{}", "nope")
+	call := chat.pending_calls[0].call
 	count := chat_run_tools(chat, {})
-	testing.expect_value(t, count, 1)
+	testing.expect_value(test, count, 1)
 	chat_session_tools_done(chat, chat.active_turn_id, count)
 
-	entries := _test_entries(t, chat)
-	defer session.entries_destroy(entries, context.allocator)
-	result, is_result := entries[len(entries) - 1].payload.(session.Tool_Result_Entry)
-	if !testing.expect(t, is_result, "the last entry should be a result") { return }
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Unavailable)
-	testing.expect(t, strings.contains(result.content, "nope"), "the result names the tool the model asked for")
+	// The call never dispatched, so it has a result and no admission.
+	records := _test_records(test, chat, {.Tool_Admitted, .Tool_Completed})
+	if !testing.expect_value(test, len(records), 1) { return }
+	testing.expect_value(test, records[0].call, call)
+	completed: journal.Tool_Completed
+	if decode_error := journal.payload_decode(records[0].data, &completed, context.temp_allocator);
+	   decode_error != nil { testing.fail_now(test, "the result could not be decoded") }
+	testing.expect_value(test, completed.outcome, journal.TOOL_OUTCOME_NAMES[.Unavailable])
+	testing.expect(test, strings.contains(string(records[0].body), "nope"), "the result names the tool the model asked for")
 }
 
 @(test)
-test_tool_loop_has_no_request_budget :: proc(t: ^testing.T) {
+test_tool_loop_has_no_request_budget :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
-	_test_accept(t, chat, "loop")
+	_test_accept(test, chat, "loop")
 	chat.requests_made = 1000
 
 	// Selecting the request is a read: it proposes the same work however many times
 	// it is asked, and counts nothing. The driver's claim is what starts the turn and
 	// counts the request.
 	effect := chat_session_advance(chat)
-	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
-	testing.expect_value(t, chat.requests_made, 1000)
-	testing.expect_value(t, chat.state, Chat_State.Preparing)
+	testing.expect_value(test, effect.kind, Chat_Effect_Kind.Start_Request)
+	testing.expect_value(test, chat.requests_made, 1000)
+	testing.expect_value(test, chat.state, Chat_State.Preparing)
 
 	chat_session_begin_request(chat)
-	testing.expect_value(t, chat.requests_made, 1001)
-	testing.expect_value(t, chat.state, Chat_State.Requesting)
+	testing.expect_value(test, chat.requests_made, 1001)
+	testing.expect_value(test, chat.state, Chat_State.Requesting)
 	// The claim is not repeatable: the proposal was taken, and claiming it again is
 	// not another request.
-	testing.expect(t, !chat_session_begin_request(chat))
-	testing.expect_value(t, chat.requests_made, 1001)
+	testing.expect(test, !chat_session_begin_request(chat))
+	testing.expect_value(test, chat.requests_made, 1001)
 }
 
 // The boundary that settles input runs between the proposal and the claim, so the claim
 // has to answer for the state it finds: a turn a boundary stopped claims no request, and
 // no request is prepared from a turn that already failed.
 @(test)
-test_a_claim_refuses_a_turn_that_stopped_at_its_boundary :: proc(t: ^testing.T) {
+test_a_claim_refuses_a_turn_that_stopped_at_its_boundary :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
-	_test_accept(t, chat, "work")
+	_test_accept(test, chat, "work")
 	chat.requests_made = 3
 
 	effect := chat_session_advance(chat)
-	testing.expect_value(t, effect.kind, Chat_Effect_Kind.Start_Request)
+	testing.expect_value(test, effect.kind, Chat_Effect_Kind.Start_Request)
 
 	// What a boundary does when its own durable write fails.
 	chat_session_fail_turn(chat, "the steering line could not be recorded")
-	testing.expect_value(t, chat.state, Chat_State.Finalizing)
-	testing.expect(t, !chat_session_begin_request(chat), "a stopped turn claims no request")
-	testing.expect_value(t, chat.requests_made, 3)
+	testing.expect_value(test, chat.state, Chat_State.Finalizing)
+	testing.expect(test, !chat_session_begin_request(chat), "a stopped turn claims no request")
+	testing.expect_value(test, chat.requests_made, 3)
 }
 
 @(test)
-test_the_first_prompt_names_the_session :: proc(t: ^testing.T) {
+test_the_first_prompt_names_the_session :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 
 	// The title is the first line of the prompt that opened the session.
-	_test_accept(t, chat, "explain the parser\nand then stop")
-	header, header_err := session.session_load(chat.store, chat.id, context.allocator)
-	if header_err != nil { testing.fail_now(t, "session_load failed") }
-	testing.expect_value(t, header.title, "explain the parser")
-	session.session_destroy(&header)
+	_test_accept(test, chat, "explain the parser\nand then stop")
+	testing.expect_value(test, _test_session_title(test, chat), "explain the parser")
 
-	effect := _test_begin_request(t, chat)
-	testing.expect(t, chat_session_feed_completion(chat, chat_session_event_source(chat)))
-	finish := _test_settle(t, chat)
+	_test_begin_request(test, chat)
+	testing.expect(test, chat_session_feed_completion(chat, chat_session_event_source(chat)))
+	_test_settle(test, chat)
 
 	// A later turn leaves the name alone.
-	_test_accept(t, chat, "something else")
-	reloaded, reload_err := session.session_load(chat.store, chat.id, context.allocator)
-	if reload_err != nil { testing.fail_now(t, "session_load failed") }
-	defer session.session_destroy(&reloaded)
-	testing.expect_value(t, reloaded.title, "explain the parser")
+	_test_accept(test, chat, "something else")
+	testing.expect_value(test, _test_session_title(test, chat), "explain the parser")
 }
 
 // A response commits its tool calls and then the harness dispatches them. A
-// process that dies between those two writes leaves a call with neither a
-// dispatch nor a result, and recovery has to close it, because the provider is
+// process that dies between those two writes leaves a call with neither a dispatch
+// nor a result, and recovery has to close it, because the provider is
 // sent the call and its result together.
 @(test)
-test_a_recovered_call_reaches_the_model_answered :: proc(t: ^testing.T) {
+test_a_recovered_call_reaches_the_model_answered :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
 	chat_test_capacity(chat, 200_000)
-	_test_accept(t, chat, "run it")
-	_test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			created_at_ms = 2_000,
-			payload = session.Tool_Call_Entry{call_id = "call_1", name = TOOL_SHELL_NAME, arguments = `{"command":"echo hi"}`},
-		},
-	)
+	_test_accept(test, chat, "run it")
+	request := journal.next_request(chat.store)
+	_test_response(test, chat, request, "")
+	_test_propose(test, chat, "call_1", `{"command":"echo hi"}`, TOOL_SHELL_NAME, request)
 
-	recovery, recover_err := session.session_recover(
-		chat.store,
-		chat.id,
-		{at_ms = session.now_ms(), recovered_content = TOOL_RECOVERED_RESULT, unexecuted_content = TOOL_UNEXECUTED_RESULT},
-	)
-	if recover_err != nil { testing.fail_now(t, "recovery failed") }
-	testing.expect_value(t, recovery.unexecuted_calls, 1)
+	recovery, recover_error := journal.recover(chat.store)
+	if recover_error != nil { testing.fail_now(test, "recovery failed") }
+	testing.expect_value(test, recovery.calls, 1)
 
-	prep, prep_err := chat_prepare(chat, tool_loop_connection, chat.allocator)
-	if prep_err != nil { testing.fail_now(t, "chat_prepare failed") }
-	defer chat_request_prep_destroy(&prep, chat.allocator)
+	// The process is gone: the head the reopened session reads is the one recovery wrote.
+	_, head, head_error := journal.session_head(chat.store, chat.session)
+	if head_error != nil { testing.fail_now(test, "the session head could not be read") }
+	chat.head = head
+
+	arena: virtual.Arena
+	preparation := request_test_prepare(test, chat, tool_loop_connection, &arena)
+	defer virtual.arena_destroy(&arena)
 
 	// The call and its recovered result are adjacent, and the result names the
 	// call it answers.
 	calls_opened := 0
 	answered := false
 	call_id := ""
-	for message in prep.wire {
+	for message in preparation.wire {
 		if len(message.Tool_Calls) > 0 {
 			calls_opened += 1
 			call_id = message.Tool_Calls[0].ID
 		}
-		if message.Role == .Tool && strings.contains(message.Content, `error not_executed`) {
+		if message.Role == .Tool && strings.contains(message.Content, "did not run") {
 			answered = true
-			testing.expect_value(t, message.Tool_Call_ID, call_id)
+			testing.expect_value(test, message.Tool_Call_ID, call_id)
 		}
 	}
-	testing.expect_value(t, calls_opened, 1)
-	testing.expect(t, answered, "the recovered call must reach the model with a result")
+	testing.expect_value(test, calls_opened, 1)
+	testing.expect(test, answered, "the recovered call must reach the model with a result")
 }
 
 @(test)
-test_usage_is_collected_per_request :: proc(t: ^testing.T) {
+test_usage_is_collected_per_request :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 
 	usages := make([dynamic]Chat_Request_Usage, 0, context.temp_allocator)
@@ -603,55 +527,34 @@ test_usage_is_collected_per_request :: proc(t: ^testing.T) {
 		&usages,
 		ai.Provider_Usage_Event{Input_Tokens = 12100, Input_Tokens_Present = true, Cached_Input_Tokens = 11800, Cached_Input_Tokens_Present = true},
 	)
-	testing.expect_value(t, len(usages), 2)
-	testing.expect_value(t, usages[0].usage.Cached_Input_Tokens, 9000)
-	testing.expect_value(t, usages[1].usage.Cached_Input_Tokens, 11800)
+	testing.expect_value(test, len(usages), 2)
+	testing.expect_value(test, usages[0].usage.Cached_Input_Tokens, 9000)
+	testing.expect_value(test, usages[1].usage.Cached_Input_Tokens, 11800)
 
 	// The last measurement wins, and a field the provider never sent stays absent.
 	total := chat_request_usage(&usages, 0)
-	if value, present := total.input.?; present {
-		testing.expect_value(t, value, i64(12100))
+	if value, present := total.input_tokens.?; present {
+		testing.expect_value(test, value, i64(12100))
 	} else {
-		testing.fail_now(t, "reported input tokens should be recorded")
+		testing.fail_now(test, "reported input tokens should be recorded")
 	}
-	if _, present := total.cache_write.?; present {
-		testing.fail_now(t, "an unreported measurement must stay unknown")
+	if _, present := total.cache_write_tokens.?; present {
+		testing.fail_now(test, "an unreported measurement must stay unknown")
 	}
 }
-
-// The Messages API needs an output bound, its system prompt in its own field, and
-// tool calls and results as typed content blocks. The harness projection is
-// provider-neutral, so the adapter is what has to shape it, and this checks the
-// two fit together.
 
 // A response the harness cannot use does not end the turn. Nothing runs, the
 // harness records why, and the state machine goes back to preparing a request so
 // the model can correct itself.
 @(test)
-test_unusable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T) {
+test_unusable_response_becomes_feedback_not_a_failure :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	_test_accept(t, chat, "duplicate calls")
-
-	effect := _test_begin_request(t, chat)
-	request_no, begin_err := session.request_begin(
-		chat.store,
-		chat.id,
-		{
-			turn_no = chat.turn_no,
-			purpose = .Response,
-			provider = "p",
-			model_requested = "m",
-			api = "openai_chat_completions",
-			config_json = "{}",
-			input_json = "{}",
-		},
-		session.now_ms(),
-	)
-	if !testing.expect_value(t, begin_err, nil) { return }
+	_test_accept(test, chat, "duplicate calls")
+	_test_begin_request(test, chat)
 
 	// Two calls under one id: the harness will not pick a winner, so it runs
 	// neither and says so.
@@ -660,58 +563,46 @@ test_unusable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T) {
 		{ID = "call_1", Name = TOOL_SHELL_NAME, Arguments = `{"command":"a","working_directory":null,"timeout_ms":null}`},
 		{ID = "call_1", Name = TOOL_SHELL_NAME, Arguments = `{"command":"b","working_directory":null,"timeout_ms":null}`},
 	}
-	testing.expect_value(t, chat_session_feed_tool_calls(chat, source, calls), Chat_Notice.Duplicate_Call_ID)
-	testing.expect(t, chat_session_note_notice(chat, source, .Duplicate_Call_ID))
-	testing.expect_value(t, chat.state, Chat_State.Preparing)
+	testing.expect_value(test, chat_session_feed_tool_calls(chat, source, calls), Chat_Notice.Duplicate_Call_ID)
+	testing.expect(test, chat_session_note_notice(chat, source, .Duplicate_Call_ID))
+	testing.expect_value(test, chat.state, Chat_State.Preparing)
 
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
-	chat_commit_response(chat, request_no, 1, {finish_reason = .Tool_Call}, &usages)
+	request := journal.next_request(chat.store)
+	chat_commit_response(chat, request, 1, {finish_reason = .Tool_Call}, &usages)
 	chat_session_retire_operation(chat)
 
-	entries := _test_entries(t, chat)
-	defer session.entries_destroy(entries, context.allocator)
 	// The prompt and the harness explanation; no call and no result were recorded.
-	if !testing.expect_value(t, len(entries), 2) { return }
-	notice, is_notice := entries[1].payload.(session.User_Entry)
-	if !testing.expect(t, is_notice, "the harness explanation is conversation") { return }
-	testing.expect_value(t, notice.origin, session.User_Origin.Harness)
-	testing.expect(t, strings.contains(notice.text, "own id"), "the explanation names the defect")
-	testing.expect_value(t, chat.state, Chat_State.Preparing)
+	testing.expect_value(test, len(_test_records(test, chat, {.Tool_Proposed, .Tool_Admitted, .Tool_Completed})), 0)
+	arena: virtual.Arena
+	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
+	defer virtual.arena_destroy(&arena)
+	projection := _test_projection(test, chat, &arena)
+	if !testing.expect_value(test, len(projection.items), 2) { return }
+	notice, is_notice := projection.items[1].payload.(Projected_User)
+	if !testing.expect(test, is_notice, "the harness explanation is conversation") { return }
+	testing.expect_value(test, notice.origin, journal.User_Origin.Harness)
+	testing.expect(test, strings.contains(notice.text, "own id"), "the explanation names the defect")
+	testing.expect_value(test, chat.state, Chat_State.Preparing)
 
 	// The next step is another request, not a stop.
 	next := chat_session_advance(chat)
-	testing.expect_value(t, next.kind, Chat_Effect_Kind.Start_Request)
+	testing.expect_value(test, next.kind, Chat_Effect_Kind.Start_Request)
 }
 
 // A response the stream could not decode does not end the turn either. The failure
 // becomes the same kind of harness feedback as an unusable response, and the chain
 // commit that follows the failed attempt must not turn it back into a failure.
 @(test)
-test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T) {
+test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
-	_test_accept(t, chat, "work that gets an unreadable response")
-
-	_test_begin_request(t, chat)
-	request_no, begin_err := session.request_begin(
-		chat.store,
-		chat.id,
-		{
-			turn_no = chat.turn_no,
-			purpose = .Response,
-			provider = "p",
-			model_requested = "m",
-			api = "openai_chat_completions",
-			config_json = "{}",
-			input_json = "{}",
-		},
-		session.now_ms(),
-	)
-	if !testing.expect_value(t, begin_err, nil) { return }
+	_test_accept(test, chat, "work that gets an unreadable response")
+	_test_begin_request(test, chat)
 
 	// The stream could not be decoded. The model can still be reached, so the turn
 	// must not fail: the failure becomes feedback and the turn prepares again.
@@ -724,16 +615,17 @@ test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T
 	}
 	chat_session_apply(chat, &event)
 	chat_event_destroy(&event, chat.mailbox.allocator)
-	testing.expect(t, !chat.active_failed, "an unreadable response must not fail the turn")
-	testing.expect_value(t, chat.pending_notice, Chat_Notice.Unreadable_Response)
-	testing.expect_value(t, chat.state, Chat_State.Preparing)
+	testing.expect(test, !chat.active_failed, "an unreadable response must not fail the turn")
+	testing.expect_value(test, chat.pending_notice, Chat_Notice.Unreadable_Response)
+	testing.expect_value(test, chat.state, Chat_State.Preparing)
 
 	// The chain ends the way a real attempt does: the operation failed, and the retry
 	// policy stopped the chain. Its commit must keep the turn going.
+	request := journal.next_request(chat.store)
 	chat.chain.active = true
 	chat.chain.stage = .Committing
 	chat.chain.attempts = 1
-	chat.chain.request_no = request_no
+	chat.chain.request = request
 	chat.chain.source = source
 	chat.chain.operation_error = {
 		kind          = .Stream,
@@ -747,21 +639,24 @@ test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
 	chat_chain_commit(chat, &usages)
-	testing.expect(t, !chat.active_failed, "the chain commit must not turn feedback into a failure")
+	testing.expect(test, !chat.active_failed, "the chain commit must not turn feedback into a failure")
 
-	entries := _test_entries(t, chat)
-	defer session.entries_destroy(entries, context.allocator)
 	// The prompt and the harness explanation; no call and no result were recorded.
-	if !testing.expect_value(t, len(entries), 2) { return }
-	notice, is_notice := entries[1].payload.(session.User_Entry)
-	if !testing.expect(t, is_notice, "the harness explanation is conversation") { return }
-	testing.expect_value(t, notice.origin, session.User_Origin.Harness)
-	testing.expect(t, strings.contains(notice.text, "sending it again"), "the explanation names the correction")
-	testing.expect_value(t, chat.state, Chat_State.Preparing)
+	testing.expect_value(test, len(_test_records(test, chat, {.Tool_Proposed, .Tool_Admitted, .Tool_Completed})), 0)
+	arena: virtual.Arena
+	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
+	defer virtual.arena_destroy(&arena)
+	projection := _test_projection(test, chat, &arena)
+	if !testing.expect_value(test, len(projection.items), 2) { return }
+	notice, is_notice := projection.items[1].payload.(Projected_User)
+	if !testing.expect(test, is_notice, "the harness explanation is conversation") { return }
+	testing.expect_value(test, notice.origin, journal.User_Origin.Harness)
+	testing.expect(test, strings.contains(notice.text, "sending it again"), "the explanation names the correction")
+	testing.expect_value(test, chat.state, Chat_State.Preparing)
 
 	// The next step is another request, not a stop.
 	next := chat_session_advance(chat)
-	testing.expect_value(t, next.kind, Chat_Effect_Kind.Start_Request)
+	testing.expect_value(test, next.kind, Chat_Effect_Kind.Start_Request)
 }
 
 // --- result rendering ---------------------------------------------------------
@@ -769,14 +664,14 @@ test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T
 // An unavailable tool never executes, and the result stored for it says so in the
 // line the model reads.
 @(test)
-test_an_unavailable_tool_names_itself :: proc(t: ^testing.T) {
-	test: Tool_Test
-	tool_test_begin(t, &test)
-	defer tool_test_end(t, &test)
+test_an_unavailable_tool_names_itself :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
 
-	result := tool_run(t, &test, "no_such_tool", `{}`)
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Unavailable)
-	tool_test_result_matches(t, result.content, .Unavailable, `no tool named "no_such_tool" is available`)
+	result := tool_run(test, &tool_test, "no_such_tool", `{}`)
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Unavailable)
+	tool_test_result_matches(test, result.content, .Unavailable, `no tool named "no_such_tool" is available`)
 }
 
 // --- execution context policy -------------------------------------------------
@@ -793,22 +688,22 @@ Tool_Policy_Probe :: struct {
 // serving many definitions, reading its bounds and binding from the context
 // rather than from a definition it cannot name. A nil backend records nothing,
 // so a definition that is never dispatched needs no probe.
-tool_policy_probe_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
-	if probe := cast(^Tool_Policy_Probe)ctx.backend; probe != nil {
-		probe.seen_timeout = ctx.timeout
-		probe.seen_backend = ctx.backend
+tool_policy_probe_execute :: proc(tool_context: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	if probe := cast(^Tool_Policy_Probe)tool_context.backend; probe != nil {
+		probe.seen_timeout = tool_context.timeout
+		probe.seen_backend = tool_context.backend
 	}
-	return tool_result_success(ctx, nil, "probed")
+	return tool_result_success(tool_context, nil, "probed")
 }
 
 // One executor serves two definitions with different policies and bindings.
 // Dispatch must hand each call the policy of the definition that was resolved
 // for it, so no policy needs duplicating into adapter state.
 @(test)
-test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
-	test: Tool_Test
-	tool_test_begin(t, &test)
-	defer tool_test_end(t, &test)
+test_shared_executor_sees_definition_policy :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
 
 	probe_first: Tool_Policy_Probe
 	probe_second: Tool_Policy_Probe
@@ -828,51 +723,65 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 		execute      = tool_policy_probe_execute,
 		backend      = &probe_second,
 	}
-	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, first).kind, Tool_Registry_Error_Kind.None) { return }
-	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, second).kind, Tool_Registry_Error_Kind.None) { return }
+	if !testing.expect_value(test, tool_registry_add(&tool_test.fixture.chat.tools, first).kind, Tool_Registry_Error_Kind.None) { return }
+	if !testing.expect_value(test, tool_registry_add(&tool_test.fixture.chat.tools, second).kind, Tool_Registry_Error_Kind.None) { return }
 
-	first_result := tool_run(t, &test, "test_probe_first", `{}`)
-	testing.expect_value(t, first_result.outcome, session.Tool_Outcome.Success)
-	testing.expect_value(t, probe_first.seen_timeout, 5 * time.Second)
-	testing.expect(t, probe_first.seen_backend == &probe_first, "the first call carries the first binding")
+	first_result := tool_run(test, &tool_test, "test_probe_first", `{}`)
+	testing.expect_value(test, first_result.outcome, journal.Tool_Outcome.Success)
+	testing.expect_value(test, probe_first.seen_timeout, 5 * time.Second)
+	testing.expect(test, probe_first.seen_backend == &probe_first, "the first call carries the first binding")
 
-	second_result := tool_run(t, &test, "test_probe_second", `{}`)
-	testing.expect_value(t, second_result.outcome, session.Tool_Outcome.Success)
-	testing.expect_value(t, probe_second.seen_timeout, 30 * time.Second)
-	testing.expect(t, probe_second.seen_backend == &probe_second, "the second call carries the second binding")
+	second_result := tool_run(test, &tool_test, "test_probe_second", `{}`)
+	testing.expect_value(test, second_result.outcome, journal.Tool_Outcome.Success)
+	testing.expect_value(test, probe_second.seen_timeout, 30 * time.Second)
+	testing.expect(test, probe_second.seen_backend == &probe_second, "the second call carries the second binding")
 }
 
 // A batch that cannot answer every committed call must not leave the turn in a stage that would
 // dispatch those calls again. The turn ends instead, and a cancellation keeps the status the
 // user asked for.
 @(test)
-test_an_incomplete_tool_batch_ends_the_turn :: proc(t: ^testing.T) {
+test_an_incomplete_tool_batch_ends_the_turn :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
-	_test_accept(t, chat, "run something")
-	_test_stage_call(t, chat, "call_1", `{}`)
+	_test_accept(test, chat, "run something")
+	_test_stage_call(test, chat, "call_1", `{}`)
 	chat.state = .Executing_Tools
 
 	// The batch answered nothing, so the turn cannot continue to another request.
-	testing.expect(t, !chat_session_tools_done(chat, chat.active_turn_id, 0))
-	testing.expect_value(t, chat.state, Chat_State.Finalizing)
-	testing.expect_value(t, chat.active_failed, true)
+	testing.expect(test, !chat_session_tools_done(chat, chat.active_turn_id, 0))
+	testing.expect_value(test, chat.state, Chat_State.Finalizing)
+	testing.expect_value(test, chat.active_failed, true)
 
 	// Cancellation is what the user asked for, so it keeps the status the turn ends with.
 	chat.state = .Cancelling
-	testing.expect(t, !chat_session_tools_done(chat, chat.active_turn_id, 0))
-	testing.expect_value(t, chat.state, Chat_State.Cancelling)
+	testing.expect(test, !chat_session_tools_done(chat, chat.active_turn_id, 0))
+	testing.expect_value(test, chat.state, Chat_State.Cancelling)
 
 	// The turn ends once, and the calls it could not answer are released rather than carried
 	// into the next turn's batch.
 	finish := chat_session_advance(chat)
-	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
-	testing.expect_value(t, finish.status, Chat_Terminal_Status.Cancelled)
+	testing.expect_value(test, finish.kind, Chat_Effect_Kind.Turn_Finished)
+	testing.expect_value(test, finish.status, Chat_Terminal_Status.Cancelled)
 	chat_session_claim_finish(chat, finish)
 	chat_persist_turn_end(chat, finish)
-	testing.expect_value(t, chat.state, Chat_State.Idle)
-	_test_accept(t, chat, "next")
-	testing.expect_value(t, len(chat.pending_calls), 0)
+	testing.expect_value(test, chat.state, Chat_State.Idle)
+	_test_accept(test, chat, "next")
+	testing.expect_value(test, len(chat.pending_calls), 0)
+}
+
+// --- helpers ------------------------------------------------------------------
+
+// _test_session_title is the name the journal holds for a session.
+@(private)
+_test_session_title :: proc(test: ^testing.T, chat: ^Chat_Session) -> string {
+	record, found, read_error := journal.read_latest(chat.store, {session = chat.session, kinds = {.Session_Titled}}, context.temp_allocator)
+	if read_error != nil { testing.fail_now(test, "the title could not be read") }
+	if !testing.expect(test, found, "the session must be named") { return "" }
+	title: journal.Session_Titled
+	if decode_error := journal.payload_decode(record.data, &title, context.temp_allocator);
+	   decode_error != nil { testing.fail_now(test, "the title could not be decoded") }
+	return title.title
 }

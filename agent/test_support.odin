@@ -2,16 +2,17 @@
 package agent
 
 // Support shared by the agent package's test files. The chat suites run against
-// a real store, because a session's history is the store now and a fake would
+// a real journal, because a session's history is the journal and a fake would
 // test the fake instead of the harness.
 
 import "core:mem"
+import "core:mem/virtual"
 import "core:os"
 import "core:strings"
 import "core:testing"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 // test_retry_policy is the policy the suites run with: the production backoff, with a
@@ -25,12 +26,12 @@ test_retry_policy :: proc() -> Chat_Retry_Policy {
 	return policy
 }
 
-// Chat_Test binds a running session to a temporary store. The store lives in the
-// fixture so its address is stable while the session points at it.
+// Chat_Test binds a running session to a journal in a temporary directory. The
+// journal lives in the fixture so its address is stable while the session points at it.
 Chat_Test :: struct {
-	store: session.Store,
-	dir:   string,
-	chat:  Chat_Session,
+	store:     journal.Journal,
+	directory: string,
+	chat:      Chat_Session,
 }
 
 // Chat_Notice_Log is what a front-end was told during one call. A notice is the
@@ -77,31 +78,23 @@ chat_test_capacity :: proc(chat: ^Chat_Session, window: int, output := 0) {
 	)
 }
 
-chat_test_begin :: proc(t: ^testing.T, fixture: ^Chat_Test, workspace: string) {
-	directory, directory_err := os.make_directory_temp("", "nabla-agent-test-*", context.allocator)
-	if directory_err != nil { testing.fail_now(t, "could not create a temporary directory") }
-	fixture.dir = directory
+chat_test_begin :: proc(test: ^testing.T, fixture: ^Chat_Test, workspace: string) {
+	directory, directory_error := os.make_directory_temp("", "nabla-agent-test-*", context.allocator)
+	if directory_error != nil { testing.fail_now(test, "could not create a temporary directory") }
+	fixture.directory = directory
 
-	if err := session.store_open(&fixture.store, directory); err != nil {
-		local := err
-		testing.fail_now(t, strings.concatenate({"store_open failed: ", session.error_detail(&local)}, context.temp_allocator))
+	if open_error := journal.open(&fixture.store, directory, journal.run_id_create(), .Read_Write); open_error != nil {
+		testing.fail_now(
+			test,
+			strings.concatenate({"the journal could not be opened: ", journal.error_text(open_error, context.temp_allocator)}, context.temp_allocator),
+		)
 	}
-	created, create_err := session.session_create(&fixture.store, {workspace = workspace}, 1_000)
-	if create_err != nil { testing.fail_now(t, "session_create failed") }
-	id := session.Session_Id(strings.clone(string(created.id), context.allocator))
-	session.session_destroy(&created)
+	session, create_error := journal.create_session(&fixture.store, {workspace = workspace, role = .Main})
+	if create_error != nil { testing.fail_now(test, "the session could not be created") }
 
-	if claim_err := session.session_claim(&fixture.store, id); claim_err != nil {
-		testing.fail_now(t, "session_claim failed")
-	}
-	delete(string(id), context.allocator)
-
-	// The running session borrows the id the claim owns, so the two cannot drift.
-	claimed, held := session.session_claimed(&fixture.store)
-	if !held { testing.fail_now(t, "the claim went missing") }
 	tool_error: Tool_Registry_Error
-	fixture.chat, tool_error = chat_session_init(&fixture.store, claimed, workspace, context.allocator)
-	if tool_error.kind != .None { testing.fail_now(t, "the tool registry could not be created") }
+	fixture.chat, tool_error = chat_session_init(&fixture.store, session, journal.INITIAL_BRANCH, 0, workspace, context.allocator)
+	if tool_error.kind != .None { testing.fail_now(test, "the tool registry could not be created") }
 	fixture.chat.provider_id = chat_clone_string("test-provider", context.allocator)
 	fixture.chat.model_id = chat_clone_string("test-model", context.allocator)
 	fixture.chat.skill_instructions = test_skill_instructions(&fixture.chat)
@@ -114,24 +107,25 @@ test_skill_instructions :: proc(chat: ^Chat_Session) -> string {
 	return strings.clone(AGENT_SYSTEM_PROMPT, chat.allocator)
 }
 
-chat_test_end :: proc(t: ^testing.T, fixture: ^Chat_Test) {
+chat_test_end :: proc(test: ^testing.T, fixture: ^Chat_Test) {
 	chat_session_destroy(&fixture.chat)
-	session.session_release(&fixture.store)
-	session.store_close(&fixture.store)
-	os.remove_all(fixture.dir)
-	delete(fixture.dir, context.allocator)
+	if close_error := journal.close(&fixture.store); close_error != nil {
+		testing.expectf(test, false, "the journal did not close: %s", journal.error_text(close_error, context.temp_allocator))
+	}
+	_ = os.remove_all(fixture.directory)
+	delete(fixture.directory, context.allocator)
 	fixture^ = {}
 }
 
-_test_accept :: proc(t: ^testing.T, chat: ^Chat_Session, text: string) {
-	if chat_session_accept_user(chat, text, session.now_ms()) != .Accepted {
-		testing.fail_now(t, "the prompt was not admitted")
+_test_accept :: proc(test: ^testing.T, chat: ^Chat_Session, text: string) {
+	if chat_session_accept_user(chat, text) != .Accepted {
+		testing.fail_now(test, "the prompt was not admitted")
 	}
 }
 
-_test_begin_request :: proc(t: ^testing.T, chat: ^Chat_Session) -> Chat_Effect {
+_test_begin_request :: proc(test: ^testing.T, chat: ^Chat_Session) -> Chat_Effect {
 	effect := chat_session_advance(chat)
-	if effect.kind != .Start_Request { testing.fail_now(t, "expected a request to start") }
+	if effect.kind != .Start_Request { testing.fail_now(test, "expected a request to start") }
 	chat_session_begin_request(chat)
 	chat_session_begin_operation(chat)
 	return effect
@@ -142,7 +136,7 @@ _test_begin_request :: proc(t: ^testing.T, chat: ^Chat_Session) -> Chat_Effect {
 // is expected to fail without a retry, so no backoff is waited.
 @(private)
 _test_perform_request :: proc(
-	t: ^testing.T,
+	test: ^testing.T,
 	chat: ^Chat_Session,
 	connection: ai.Provider_Connection,
 	policy: Chat_Retry_Policy,
@@ -163,63 +157,104 @@ _test_perform_request :: proc(
 			chat_chain_commit(chat, usages)
 			return
 		case .None, .Start_Request, .Wait_Retry, .Repair_Context, .Run_Tools, .Step_Tools, .Wait_Tools, .Finish_Tools, .Turn_Finished:
-			testing.fail_now(t, "the request did not settle")
+			testing.fail_now(test, "the request did not settle")
 		}
 	}
 }
 
-_test_append :: proc(t: ^testing.T, chat: ^Chat_Session, entry: session.New_Entry) -> session.Seq {
-	seq, err := session.entry_append(chat.store, chat.id, entry)
-	if err != nil { testing.fail_now(t, "entry_append failed") }
-	return seq
+// _test_commit commits what a test buffered through the chat's journal.
+_test_commit :: proc(test: ^testing.T, chat: ^Chat_Session) {
+	if !chat_commit(chat, "the test history could not be recorded") { testing.fail_now(test, chat.last_error) }
 }
 
-_test_entries :: proc(t: ^testing.T, chat: ^Chat_Session, allocator := context.allocator) -> []session.Entry {
-	entries, err := session.entries_load(chat.store, chat.id, {}, allocator)
-	if err != nil { testing.fail_now(t, "entries_load failed") }
-	return entries
+// _test_user commits a User node, as a prompt or steering line would.
+_test_user :: proc(test: ^testing.T, chat: ^Chat_Session, text: string, origin := journal.User_Origin.Steering) -> journal.Node_Id {
+	node := chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin]}, transmute([]u8)text)
+	_test_commit(test, chat)
+	return node
 }
 
-_test_context :: proc(t: ^testing.T, chat: ^Chat_Session, allocator := context.allocator) -> session.Context {
-	ctx, err := session.context_load(chat.store, chat.id, allocator)
-	if err != nil { testing.fail_now(t, "context_load failed") }
-	return ctx
+// _test_response commits an Assistant node for a response of request, with its native
+// output when one is given, as a completed response would, and makes it the node the
+// next calls belong to.
+_test_response :: proc(test: ^testing.T, chat: ^Chat_Session, request: journal.Request_Id, text: string, output := "") -> journal.Node_Id {
+	node := chat_node(chat, .Assistant, journal.Assistant{request = request}, transmute([]u8)text)
+	header := journal.Record {
+		kind     = .Response_Committed,
+		node     = node,
+		request  = request,
+		attempt  = 1,
+		provider = chat.provider_id,
+		model    = chat.model_id,
+	}
+	chat_record(chat, header, journal.Response_Committed{finish = journal.RESPONSE_FINISH_NAMES[.Stop]}, transmute([]u8)output)
+	_test_commit(test, chat)
+	chat.response_node = node
+	return node
 }
 
-// _test_settle drives the turn to its terminal effect and records it, which is
-// what the driver does when it sees a finished turn.
-_test_settle :: proc(t: ^testing.T, chat: ^Chat_Session) -> Chat_Effect {
-	finish := chat_session_advance(chat)
-	if finish.kind != .Turn_Finished { testing.fail_now(t, "expected the turn to finish") }
-	chat_session_claim_finish(chat, finish)
-	chat_persist_turn_end(chat, finish)
-	return finish
+// _test_propose commits a tool.proposed record under the chat's response node and
+// returns its call id.
+_test_propose :: proc(
+	test: ^testing.T,
+	chat: ^Chat_Session,
+	id, arguments: string,
+	name := TOOL_SHELL_NAME,
+	request: journal.Request_Id = 0,
+) -> journal.Call_Id {
+	call := journal.next_call(chat.store)
+	chat_record(
+		chat,
+		{kind = .Tool_Proposed, node = chat.response_node, request = request, call = call},
+		journal.Tool_Proposed{provider_id = id, name = name},
+		transmute([]u8)arguments,
+	)
+	_test_commit(test, chat)
+	return call
 }
 
 // _test_stage_call stages a provider call for execution exactly as a completed
-// response does: the call entry is recorded first, and the staged call points at
-// it, so the dispatch and the result can name the same call.
-_test_stage_call :: proc(t: ^testing.T, chat: ^Chat_Session, id, arguments: string, name := TOOL_SHELL_NAME) {
-	seq := _test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			request_no = chat.active_request,
-			created_at_ms = session.now_ms(),
-			payload = session.Tool_Call_Entry{call_id = id, name = name, arguments = arguments},
-		},
-	)
+// response does: its proposal is committed under an Assistant node first, and the
+// staged call carries its id, so the admission and the result name the same call.
+_test_stage_call :: proc(test: ^testing.T, chat: ^Chat_Session, id, arguments: string, name := TOOL_SHELL_NAME) {
+	if chat.response_node == 0 { _test_response(test, chat, chat.request, "") }
+	call := _test_propose(test, chat, id, arguments, name, chat.request)
 	append(
 		&chat.pending_calls,
 		Chat_Tool_Call {
 			id = chat_clone_string(id, chat.allocator),
 			name = chat_clone_string(name, chat.allocator),
 			arguments = chat_clone_string(arguments, chat.allocator),
-			seq = seq,
+			call = call,
 		},
 	)
 	chat.state = .Executing_Tools
+}
+
+// _test_records reads the session's records of the given kinds, oldest first, into the
+// temp allocator.
+_test_records :: proc(test: ^testing.T, chat: ^Chat_Session, kinds: bit_set[journal.Record_Kind;u128]) -> []journal.Record {
+	records, _, read_error := journal.read_records(chat.store, {session = chat.session, kinds = kinds}, 0, 0, context.temp_allocator)
+	if read_error != nil { testing.fail_now(test, "the records could not be read") }
+	return records
+}
+
+// _test_projection reads the projection from the chat's head into arena, which the
+// caller initializes and destroys.
+_test_projection :: proc(test: ^testing.T, chat: ^Chat_Session, arena: ^virtual.Arena) -> Projection {
+	projection, load_error := projection_load(chat.store, chat.session, chat.head, virtual.arena_allocator(arena))
+	if load_error != nil { testing.fail_now(test, "the projection could not be read") }
+	return projection
+}
+
+// _test_settle drives the turn to its terminal effect and records it, which is
+// what the driver does when it sees a finished turn.
+_test_settle :: proc(test: ^testing.T, chat: ^Chat_Session) -> Chat_Effect {
+	finish := chat_session_advance(chat)
+	if finish.kind != .Turn_Finished { testing.fail_now(test, "expected the turn to finish") }
+	chat_session_claim_finish(chat, finish)
+	chat_persist_turn_end(chat, finish)
+	return finish
 }
 
 // chat_run_tools runs the committed calls through the same job table the driver uses and
@@ -252,7 +287,9 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		case .Wait:
 			tool_jobs_await(&jobs, tool_jobs_deadline(&jobs))
 		case .Done:
-			return tool_jobs_committed(&jobs)
+			committed := tool_jobs_committed(&jobs)
+			if !chat_commit_results(chat, jobs.committed_roots) { return 0 }
+			return committed
 		}
 	}
 	return 0

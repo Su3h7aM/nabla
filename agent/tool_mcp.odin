@@ -4,7 +4,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 import "nabla:mcp"
 
@@ -160,7 +160,7 @@ tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_
 		append(&blocks, block)
 	}
 
-	outcome := session.Tool_Outcome.Success
+	outcome := journal.Tool_Outcome.Success
 	reason := "completed"
 	message := ""
 	if call.is_error {
@@ -224,7 +224,7 @@ tool_mcp_error_result :: proc(ctx: ^Tool_Context, backend: ^MCP_Tool_Backend, er
 // vocabulary. The only question that matters is whether the call can have happened:
 // a request that was never written did not, and one whose reply was lost may have.
 @(private)
-tool_mcp_outcome :: proc(err: mcp.Error) -> (session.Tool_Outcome, string) {
+tool_mcp_outcome :: proc(err: mcp.Error) -> (journal.Tool_Outcome, string) {
 	switch err.kind {
 	case .Cancelled:
 		return .Cancelled, "cancelled"

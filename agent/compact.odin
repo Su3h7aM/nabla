@@ -8,7 +8,8 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
-import "nabla:agent/session"
+import "core:mem/virtual"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 // Compaction is a memory operation that never stops the agent. The full history
@@ -29,10 +30,10 @@ CHAT_COMPACT_KEEP_MESSAGES :: 10
 // a summarization request.
 CHAT_COMPACT_MIN_REDUCTION_TOKENS :: 1024
 
-// CHAT_COMPACT_COOLDOWN_MS is how long an exhausted summary chain rests before another
+// CHAT_COMPACT_COOLDOWN is how long an exhausted summary chain rests before another
 // snapshot may start. Whoever asks, the context has not changed in the meantime, and the
 // provider has already refused the same work once.
-CHAT_COMPACT_COOLDOWN_MS :: 30_000
+CHAT_COMPACT_COOLDOWN :: 30 * time.Second
 
 // CHAT_COMPACT_DIRECTIVE is appended after the prefix being summarized. It is a
 // literal, so every compaction request ends with the same bytes.
@@ -99,37 +100,26 @@ chat_compact_trigger :: proc(chat: ^Chat_Session) -> int {
 // adjacent `.Tool_Call`. Cutting between that record and the entries committed with
 // the same request would send those calls with no results, so the whole request
 // moves left together.
-chat_compact_seam :: proc(entries: []session.Entry, keep: int) -> int {
-	if keep <= 0 { return len(entries) }
-	seam := len(entries) - keep
+chat_compact_seam :: proc(items: []Projection_Item, keep: int) -> int {
+	if keep <= 0 { return len(items) }
+	seam := len(items) - keep
 	if seam < 0 { seam = 0 }
 	for seam > 0 {
-		current := entries[seam]
-		previous := entries[seam - 1]
-		split := current.kind == .Tool_Result || previous.kind == .Tool_Call
-		if !split && chat_compact_same_request(previous, current) { split = true }
-		if !split { break }
+		current := items[seam]
+		previous := items[seam - 1]
+		_, is_result := current.payload.(Projected_Result)
+		_, is_call := previous.payload.(Projected_Call)
+		if !(is_result || is_call || (previous.request != 0 && previous.request == current.request)) { break }
 		seam -= 1
 	}
 	return seam
-}
-
-// chat_compact_same_request reports whether two entries were committed by one model
-// request. A request's entries -- its replay record, its text, its calls, and the
-// results that answer them -- are one unit, so a seam may not fall between any two
-// of them.
-@(private)
-chat_compact_same_request :: proc(a, b: session.Entry) -> bool {
-	a_request, a_present := a.request_no.?
-	b_request, b_present := b.request_no.?
-	return a_present && b_present && a_request == b_request
 }
 
 // --- the frozen request ------------------------------------------------------
 
 // Compact_Snapshot is the exact compaction request, frozen at the moment the
 // boundary was chosen and owned outright. Encoding it here is what lets the worker
-// run on another thread: the foreground may destroy the preparation it was built
+// run on another thread: the foreground may release the arena it was built
 // from, and may append as much history as it likes, without disturbing the bytes
 // that will be sent.
 Compact_Snapshot :: struct {
@@ -142,15 +132,15 @@ Compact_Snapshot :: struct {
 	session_id:        string, // owned
 	parent_session_id: string, // owned; "" for a main session
 	user_agent:        string, // owned
-	base_seq:          Maybe(session.Seq), // the checkpoint this summary replaces
-	covered_seq:       session.Seq, // the last entry the summary stands in for
-	turn_no:           Maybe(session.Turn_No),
+	base:              journal.Node_Id,
+	covers:            journal.Node_Id,
+	turn:              journal.Turn_Id,
 	estimate:          int, // the whole compaction request
 	head_estimate:     int, // the prefix the summary replaces, without instructions or tools
 }
 
 // chat_compact_snapshot_make freezes a prepared request. Every string it keeps is
-// copied, because the preparation it was built from is released by its caller and
+// copied, because the preparation it was built from lives in a temporary arena and
 // the worker outlives it.
 //
 // The worker encodes with no cache: the session's cache belongs to the thread that
@@ -158,9 +148,9 @@ Compact_Snapshot :: struct {
 chat_compact_snapshot_make :: proc(
 	prep: ^Chat_Request_Prep,
 	connection: ai.Provider_Connection,
-	base_seq: Maybe(session.Seq),
-	covered_seq: session.Seq,
-	turn_no: Maybe(session.Turn_No),
+	base: journal.Node_Id,
+	covers: journal.Node_Id,
+	turn: journal.Turn_Id,
 	allocator: mem.Allocator,
 ) -> (
 	snapshot: Compact_Snapshot,
@@ -182,9 +172,9 @@ chat_compact_snapshot_make :: proc(
 			session_id = strings.clone(prep.request.Session_Id, allocator),
 			parent_session_id = strings.clone(prep.request.Parent_Session_Id, allocator),
 			user_agent = strings.clone(prep.request.User_Agent, allocator),
-			base_seq = base_seq,
-			covered_seq = covered_seq,
-			turn_no = turn_no,
+			base = base,
+			covers = covers,
+			turn = turn,
 			estimate = prep.estimate,
 			head_estimate = chat_estimate_input_tokens("", prep.wire[:head_count], nil),
 		},
@@ -280,7 +270,7 @@ Compact_State :: enum {
 // start and join.
 Compact_Job :: struct {
 	snapshot:   Compact_Snapshot,
-	request_no: session.Request_No,
+	request:    journal.Request_Id,
 	interrupt:  ai.Interrupt,
 	thread:     ^thread.Thread,
 	// allocator is the thread-safe heap the worker-owned storage comes from: the frozen
@@ -303,17 +293,12 @@ Compact_Job :: struct {
 	failed:     bool,
 	error_text: string, // owned; the transport's or the provider's account
 	operation:  ai.Provider_Operation_Error,
-	usage:      session.Usage,
+	usage:      journal.Response_Committed,
 	started_at: time.Tick,
 	// attempts counts the sends this chain has made, including the one in flight.
 	attempts:   int,
 	// due_at is when a job in Backoff is sent again.
 	due_at:     time.Tick,
-	// input and config are what every attempt's request row is written from. A retried
-	// attempt is a new row over the same frozen bytes, so these are kept for the whole
-	// chain and re-encoded with each attempt's own place in it.
-	input:      Chat_Request_Input,
-	config:     string, // owned
 }
 
 // Compact_Control is the owner-side view. Only the thread that drives the session
@@ -323,15 +308,16 @@ Compact_Control :: struct {
 	trigger:            Compact_Trigger,
 	job:                ^Compact_Job,
 	pending:            Compact_Trigger,
-	pending_source_seq: Maybe(session.Seq),
-	last_failure_at_ms: i64,
-	// attempted_seq is the newest entry the last chain covered and attempted_identity is a
+	pending_source:     journal.Call_Id,
+	checkpoint:         journal.Node_Id,
+	last_failure_at:    time.Tick,
+	// attempted is the newest node the last chain covered and attempted_identity is a
 	// digest of what it ran against. A fresh automatic snapshot starts only after the context
 	// has moved past that, or that configuration has changed: repeating the same work over the
 	// same bytes under the same settings cannot produce anything else. attempted_identity is a
 	// digest rather than the values, because the credential is a secret and a suppression key
 	// that carried it would be one too.
-	attempted_seq:      Maybe(session.Seq),
+	attempted:          journal.Node_Id,
 	attempted_identity: string, // owned
 	// suppressed records a chain that ended for a reason no automatic start can fix: bad
 	// credentials, a spent quota, or a request the provider refuses. An explicit request clears
@@ -369,10 +355,10 @@ chat_compact_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 		delete(job.error_text, job.allocator)
 		job.error_text = strings.clone(value.Message, job.allocator)
 	case ai.Provider_Usage_Event:
-		if value.Input_Tokens_Present { job.usage.input = value.Input_Tokens }
-		if value.Output_Tokens_Present { job.usage.output = value.Output_Tokens }
-		if value.Cached_Input_Tokens_Present { job.usage.cache_read = value.Cached_Input_Tokens }
-		if value.Cache_Write_Tokens_Present { job.usage.cache_write = value.Cache_Write_Tokens }
+		if value.Input_Tokens_Present { job.usage.input_tokens = value.Input_Tokens }
+		if value.Output_Tokens_Present { job.usage.output_tokens = value.Output_Tokens }
+		if value.Cached_Input_Tokens_Present { job.usage.cache_read_tokens = value.Cached_Input_Tokens }
+		if value.Cache_Write_Tokens_Present { job.usage.cache_write_tokens = value.Cache_Write_Tokens }
 	}
 }
 
@@ -432,8 +418,6 @@ chat_compact_job_destroy :: proc(job: ^Compact_Job) {
 	allocator := job.allocator
 	backing := job.backing
 	chat_compact_snapshot_destroy(&job.snapshot, allocator)
-	chat_request_input_destroy(&job.input, allocator)
-	delete(job.config, allocator)
 	delete(job.output)
 	delete(job.error_text, allocator)
 	ai.Provider_Operation_Error_Destroy(&job.operation, allocator)
@@ -466,24 +450,24 @@ chat_compact_reason :: proc(job: ^Compact_Job) -> string {
 // the bytes about to be sent are the bytes the summary will cover. Every trigger
 // meets here, so the automatic path, the tool, and the command cannot disagree
 // about what a request means.
-compact_request_intent :: proc(control: ^Compact_Control, trigger: Compact_Trigger, source_seq: Maybe(session.Seq)) -> Compact_Request_Result {
+compact_request_intent :: proc(control: ^Compact_Control, trigger: Compact_Trigger, source: journal.Call_Id = 0) -> Compact_Request_Result {
 	if control.state == .Retiring { return .Unavailable }
 	if control.state == .Running || control.state == .Ready {
 		// The new intent does not change the frozen prefix, so it only makes the
 		// finished summary install sooner.
 		if compact_trigger_explicit(trigger) { control.trigger = trigger }
-		if value, present := source_seq.?; present { control.pending_source_seq = value }
+		if source != 0 { control.pending_source = source }
 		return .Already_Scheduled
 	}
 	control.pending = trigger
-	control.pending_source_seq = source_seq
+	control.pending_source = source
 	return .Scheduled
 }
 
 // chat_compact_request records an intent to compact for a whole session.
-chat_compact_request :: proc(chat: ^Chat_Session, trigger: Compact_Trigger, source_seq: Maybe(session.Seq) = nil) -> Compact_Request_Result {
+chat_compact_request :: proc(chat: ^Chat_Session, trigger: Compact_Trigger, source: journal.Call_Id = 0) -> Compact_Request_Result {
 	if chat.storage_failed { return .Unavailable }
-	return compact_request_intent(&chat.compact, trigger, source_seq)
+	return compact_request_intent(&chat.compact, trigger, source)
 }
 
 // chat_compact_retry_allowed keeps a failed summarization from being retried at every
@@ -491,8 +475,8 @@ chat_compact_request :: proc(chat: ^Chat_Session, trigger: Compact_Trigger, sour
 // than starting the same work over the same context again.
 @(private)
 chat_compact_retry_allowed :: proc(control: ^Compact_Control, trigger: Compact_Trigger) -> bool {
-	if control.last_failure_at_ms == 0 { return true }
-	return session.now_ms() - control.last_failure_at_ms >= CHAT_COMPACT_COOLDOWN_MS
+	if control.last_failure_at == {} { return true }
+	return time.tick_since(control.last_failure_at) >= CHAT_COMPACT_COOLDOWN
 }
 
 // chat_compact_progress reports whether a fresh automatic summary would differ from the last
@@ -502,13 +486,11 @@ chat_compact_retry_allowed :: proc(control: ^Compact_Control, trigger: Compact_T
 @(private)
 chat_compact_progress :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, prep: ^Chat_Request_Prep) -> bool {
 	control := &chat.compact
-	if covered, present := control.attempted_seq.?; present {
-		if len(prep.history.entries) == 0 { return false }
-		newest := prep.history.entries[len(prep.history.entries) - 1].seq
+	if control.attempted != 0 {
+		if len(prep.projection.items) == 0 { return false }
+		newest := prep.projection.items[len(prep.projection.items) - 1].node
 		identity, identity_ok := chat_compact_identity(chat, connection)
-		if newest <= covered && identity_ok && identity == control.attempted_identity {
-			return false
-		}
+		if newest <= control.attempted && identity_ok && identity == control.attempted_identity { return false }
 	}
 	return true
 }
@@ -523,43 +505,29 @@ chat_compact_identity :: proc(chat: ^Chat_Session, connection: ai.Provider_Conne
 	return chat_text_digest(text)
 }
 
-// chat_compact_begin_attempt begins the request row of one send. Every attempt of a chain
-// has its own row, and every one after the first names the attempt before it, so the chain
-// is stored rather than inferred from when a row was written.
+/// chat_compact_begin_attempt records a send before its worker starts.
 @(private)
-chat_compact_begin_attempt :: proc(
-	chat: ^Chat_Session,
-	job: ^Compact_Job,
-	previous: Maybe(session.Request_No),
-	at_ms: i64,
-) -> (
-	request_no: session.Request_No,
-	err: session.Error,
-) {
-	input := job.input
-	chat_request_input_situate(&input, {number = job.attempts, recovery = previous == nil ? .Initial : .Transient_Retry, previous = previous})
-	input_json, encode_error := chat_request_input_encode(input)
-	if encode_error != .None {
-		chat_session_record_failure_detail(chat, "the compaction request could not be recorded", "the request input could not be encoded", .Encode)
-		return 0, nil
+chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bool {
+	header := journal.Record {
+		kind     = .Request_Sent,
+		request  = job.request,
+		attempt  = journal.Attempt_No(job.attempts),
+		provider = chat.provider_id,
+		model    = chat.model_id,
 	}
-	begun, begin_err := session.request_begin(
-		chat.store,
-		chat.id,
-		{
-			turn_no = chat.turn_no,
-			purpose = .Compaction,
-			provider = chat.provider_id,
-			model_requested = chat.model_id,
+	recovery := Chat_Recovery_Kind.Initial
+	if job.attempts > 1 { recovery = .Transient_Retry }
+	chat_record(
+		chat,
+		header,
+		journal.Request_Sent {
+			purpose = journal.REQUEST_PURPOSE_NAMES[.Compaction],
 			api = chat_api_name(job.snapshot.api),
-			config_json = job.config,
-			input_json = input_json,
+			model_requested = chat.model_id,
+			recovery = CHAT_RECOVERY_KIND_NAMES[recovery],
 		},
-		at_ms,
 	)
-	if begin_err != nil { return 0, begin_err }
-	job.request_no = begun
-	return begun, nil
+	return chat_commit(chat, "the compaction request could not be recorded")
 }
 
 // chat_compact_launch starts the worker for the attempt whose row already exists. The
@@ -587,33 +555,29 @@ chat_compact_start :: proc(
 	connection: ai.Provider_Connection,
 	prep: ^Chat_Request_Prep,
 	trigger: Compact_Trigger,
-	source_seq: Maybe(session.Seq),
+	source: journal.Call_Id,
 ) -> bool {
 	control := &chat.compact
 	control.pending = .None
-	control.pending_source_seq = nil
+	control.pending_source = 0
 
 	if chat.capacity.window <= 0 {
 		_observer_message(observer, .Error, "compaction needs a configured context window")
 		return false
 	}
-	entries := prep.history.entries
+	entries := prep.projection.items
 	seam := chat_compact_seam(entries, CHAT_COMPACT_KEEP_MESSAGES)
 	if seam <= 0 { return false }
-	covered := entries[seam - 1].seq
+	covered := entries[seam - 1].node
 
+	arena: virtual.Arena
+	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil {
+		_observer_message(observer, .Warning, "compaction could not be started")
+		return false
+	}
+	defer virtual.arena_destroy(&arena)
 	compact_prep: Chat_Request_Prep
-	chat_build_request_into(
-		chat,
-		&compact_prep,
-		entries[:seam],
-		prep.history.dispatches,
-		prep.history.summary,
-		connection,
-		CHAT_COMPACT_DIRECTIVE,
-		chat.allocator,
-	)
-	defer chat_request_prep_destroy(&compact_prep, chat.allocator)
+	chat_build_request_into(chat, &compact_prep, entries[:seam], prep.projection.summary, connection, CHAT_COMPACT_DIRECTIVE, virtual.arena_allocator(&arena))
 
 	// The request carries the same rule as any other: it asks for the room the window has
 	// left. Its input is the prefix rather than the whole context, so it is given more room
@@ -636,7 +600,7 @@ chat_compact_start :: proc(
 
 	// The bytes are frozen before the row exists: a request that cannot be encoded never
 	// reaches the network, so it is not recorded as an attempt that was sent.
-	snapshot, encode_err := chat_compact_snapshot_make(&compact_prep, connection, prep.history.summary_seq, covered, chat.turn_no, job.allocator)
+	snapshot, encode_err := chat_compact_snapshot_make(&compact_prep, connection, prep.projection.checkpoint, covered, chat.turn, job.allocator)
 	if encode_err != .None {
 		chat_compact_job_destroy(job)
 		_observer_message(observer, .Warning, "the compaction request could not be encoded")
@@ -644,36 +608,7 @@ chat_compact_start :: proc(
 	}
 	job.snapshot = snapshot
 
-	// What this chain's request rows are written from. It is kept for the whole chain,
-	// because a retried attempt is a new row over the same frozen bytes and every row has
-	// to say where in the chain it sits.
-	source, source_ok := chat_request_input_make(&compact_prep, &prep.history, chat.skill_snapshot_seq, seam, transmute([]u8)snapshot.body)
-	if source_ok != .None {
-		chat_compact_job_destroy(job)
-		_observer_message(observer, .Warning, "the compaction request record could not be prepared")
-		return false
-	}
-	if !chat_request_input_clone(&source, job.allocator) {
-		chat_compact_job_destroy(job)
-		_observer_message(observer, .Warning, "the compaction request record could not be copied")
-		return false
-	}
-	config_json, config_error := chat_request_config_json(chat, compact_prep.request.Max_Output_Tokens)
-	if config_error != .None {
-		chat_request_input_destroy(&source, job.allocator)
-		chat_compact_job_destroy(job)
-		_observer_message(observer, .Warning, "the compaction request record could not be encoded")
-		return false
-	}
-	config, config_alloc_error := strings.clone(config_json, job.allocator)
-	if config_alloc_error != nil {
-		chat_request_input_destroy(&source, job.allocator)
-		chat_compact_job_destroy(job)
-		_observer_message(observer, .Warning, "the compaction request record could not be copied")
-		return false
-	}
-	job.config = config
-	job.input = source
+	job.request = journal.next_request(chat.store)
 	identity, identity_ok := chat_compact_identity(chat, connection)
 	if !identity_ok {
 		chat_compact_job_destroy(job)
@@ -689,15 +624,13 @@ chat_compact_start :: proc(
 	identity_installed := false
 	defer if !identity_installed { delete(new_identity, chat.allocator) }
 
-	if _, begin_err := chat_compact_begin_attempt(chat, job, nil, session.now_ms()); begin_err != nil || chat_session_storage_failed(chat) {
+	if !chat_compact_begin_attempt(chat, job) {
 		chat_compact_job_destroy(job)
-		if begin_err != nil { chat_session_record_failure(chat, "the compaction request could not be recorded", begin_err) }
 		return false
 	}
-
 	if !chat_compact_launch(job) {
+		chat_finish_send(chat, job.request, job.attempts, {outcome = .Failed, message = "compaction could not be started"})
 		chat_compact_job_destroy(job)
-		chat_compact_finish_request(chat, job.request_no, .Failed, "", "compaction could not be started")
 		return false
 	}
 
@@ -706,7 +639,7 @@ chat_compact_start :: proc(
 	control.trigger = trigger
 	// What this attempt saw, which is the whole context it was built from rather than the
 	// boundary it summarizes: the next automatic attempt has to see something newer.
-	if len(entries) > 0 { control.attempted_seq = entries[len(entries) - 1].seq }
+	if len(entries) > 0 { control.attempted = entries[len(entries) - 1].node }
 	delete(control.attempted_identity, chat.allocator)
 	control.attempted_identity = new_identity
 	identity_installed = true
@@ -716,9 +649,9 @@ chat_compact_start :: proc(
 
 	fields := [6]Log_Field {
 		{key = "trigger", value = compact_trigger_name(trigger)},
-		{key = "covered_seq", value = i64(covered)},
-		{key = "base_seq", value = log_optional_i64(snapshot.base_seq)},
-		{key = "source_seq", value = log_optional_i64(source_seq)},
+		{key = "covers", value = i64(covered)},
+		{key = "base", value = i64(snapshot.base)},
+		{key = "source", value = i64(source)},
 		{key = "estimate", value = i64(compact_prep.estimate)},
 		{key = "context_window", value = i64(chat.capacity.window)},
 	}
@@ -726,80 +659,30 @@ chat_compact_start :: proc(
 	// happened to be at the boundary when it started. The binding belongs to the
 	// job so the worker can use the same sink after this owner scope returns.
 	previous_logger := context.logger
-	context.logger = log_rebind(&job.logging, log_correlation_for_request(chat, job.request_no))
+	context.logger = log_rebind(&job.logging, log_correlation_for_request(chat, job.request))
 	log_emit({level = .Info, category = .Provider, event = "compaction.started", fields = fields[:]})
 	context.logger = previous_logger
 	return true
 }
 
-// chat_compact_finish_request closes the durable request a job belongs to. The row keeps
-// what the endpoint reported for it, like any other send: a total that left background work
-// out would under-report the session it measures.
-@(private)
-chat_compact_finish_request :: proc(
-	chat: ^Chat_Session,
-	request_no: session.Request_No,
-	outcome: session.Outcome,
-	response_json, error_text: string,
-	usage: session.Usage = {},
-) {
-	error_json := ""
-	if outcome != .Completed {
-		encode_error: Chat_Record_Error
-		error_json, encode_error = chat_error_json(error_text)
-		if encode_error != .None {
-			chat_session_record_failure_detail(chat, "the compaction outcome could not be recorded", "the error record could not be encoded", .Encode)
-			return
-		}
-	}
-	if finish_err := session.request_finish(
-		chat.store,
-		chat.id,
-		request_no,
-		{outcome = outcome, response_json = response_json, error_json = error_json, usage = usage, at_ms = session.now_ms()},
-	); finish_err != nil {
-		chat_session_record_failure(chat, "the compaction outcome could not be recorded", finish_err)
-	}
-}
-
-// chat_compact_finish_attempt finishes the row of a summary that produced nothing usable.
-// The row keeps the operation's own evidence and the decision taken on it, so a chain is
-// legible from the store: which attempt failed, what the provider said, and what the owner
-// did next.
+// chat_compact_finish_attempt records a send that produced no usable summary.
 @(private)
 chat_compact_finish_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job, decision: Chat_Recovery_Decision, message: string) {
-	result := Chat_Send_Result {
-		outcome       = .Failed,
-		error         = job.operation,
-		error_present = job.operation.kind != .None,
-		message       = message,
-		recovery      = decision.reason,
-		delay         = decision.delay,
-	}
-	error_json := ""
-	if result.error_present {
-		encode_error: Chat_Record_Error
-		error_json, encode_error = chat_request_error_json(result)
-		if encode_error != .None {
-			chat_session_record_failure_detail(chat, "the compaction outcome could not be recorded", "the error record could not be encoded", .Encode)
-			return
-		}
-	} else if message != "" {
-		encode_error: Chat_Record_Error
-		error_json, encode_error = chat_error_json(message)
-		if encode_error != .None {
-			chat_session_record_failure_detail(chat, "the compaction outcome could not be recorded", "the error record could not be encoded", .Encode)
-			return
-		}
-	}
-	if finish_err := session.request_finish(
-		chat.store,
-		chat.id,
-		job.request_no,
-		{outcome = .Failed, error_json = error_json, usage = job.usage, at_ms = session.now_ms()},
-	); finish_err != nil {
-		chat_session_record_failure(chat, "the compaction outcome could not be recorded", finish_err)
-	}
+	operation_error := job.operation
+	if operation_error.detail == "" { operation_error.detail = job.error_text }
+	chat_finish_send(
+		chat,
+		job.request,
+		job.attempts,
+		Chat_Send_Result {
+			outcome = .Failed,
+			error = operation_error,
+			error_present = job.operation.kind != .None,
+			message = message,
+			recovery = decision.reason,
+			delay = decision.delay,
+		},
+	)
 }
 
 // chat_compact_suppressible reports whether a chain's ending is one an automatic start cannot
@@ -860,7 +743,6 @@ chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> boo
 
 	// What the failed attempt produced belongs to the row that already recorded it: this
 	// attempt starts from nothing but the frozen bytes.
-	previous := job.request_no
 	clear(&job.output)
 	delete(job.error_text, job.allocator)
 	job.error_text = ""
@@ -870,23 +752,18 @@ chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> boo
 	job.usage = {}
 	ai.Provider_Operation_Error_Destroy(&job.operation, job.allocator)
 	job.attempts += 1
-
-	if _, begin_err := chat_compact_begin_attempt(chat, job, previous, session.now_ms()); begin_err != nil || chat_session_storage_failed(chat) {
+	if !chat_compact_begin_attempt(chat, job) {
 		chat_compact_failed_job(control, job)
-		if begin_err != nil {
-			local := begin_err
-			_observer_message(observer, .Warning, fmt.tprintf("the summary could not be sent again: %s", session.error_detail(&local)))
-		} else {
-			_observer_message(observer, .Warning, "the summary request could not be recorded")
-		}
+		_observer_message(observer, .Warning, "the summary request could not be recorded")
 		return false
 	}
 	if !chat_compact_launch(job) {
-		chat_compact_finish_request(chat, job.request_no, .Failed, "", "compaction could not be started")
+		chat_finish_send(chat, job.request, job.attempts, {outcome = .Failed, message = "compaction could not be started"})
 		chat_compact_failed_job(control, job)
 		_observer_message(observer, .Warning, "the summary could not be sent again")
 		return false
 	}
+
 	control.state = .Running
 	_observer_message(observer, .Notice, "the summary is being sent again")
 	return true
@@ -911,7 +788,7 @@ chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
 	case .Running:
 		chat_compact_adopt(chat, observer, job)
 	case .Retiring:
-		chat_compact_finish_request(chat, job.request_no, .Cancelled, "", "cancelled", job.usage)
+		chat_finish_send(chat, job.request, job.attempts, {outcome = .Cancelled})
 		chat_compact_failed_job(control, job)
 		_observer_message(observer, .Notice, "compaction cancelled")
 	case .Idle, .Ready, .Backoff:
@@ -960,24 +837,29 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 		return
 	}
 
-	response_json, response_error := chat_compaction_response_json(summary, job.snapshot.base_seq, job.snapshot.covered_seq)
-	if response_error != .None {
-		chat_session_record_failure_detail(chat, "the compaction outcome could not be recorded", "the summary record could not be encoded", .Encode)
+	job.usage.finish = chat_finish_reason_text(job.reason)
+	chat_record(
+		chat,
+		{kind = .Compaction_Completed, request = job.request, attempt = journal.Attempt_No(job.attempts), provider = chat.provider_id, model = chat.model_id},
+		job.usage,
+		transmute([]u8)summary,
+	)
+	if !chat_commit(chat, "the compaction outcome could not be recorded") {
 		chat_compact_failed_job(control, job)
 		_observer_message(observer, .Warning, "the compaction summary could not be recorded")
 		return
 	}
-	chat_compact_finish_request(chat, job.request_no, .Completed, response_json, "", job.usage)
+
 	control.state = .Ready
-	control.last_failure_at_ms = 0
+	control.last_failure_at = {}
 
 	fields := [7]Log_Field {
 		{key = "trigger", value = compact_trigger_name(control.trigger)},
-		{key = "covered_seq", value = i64(job.snapshot.covered_seq)},
+		{key = "covers", value = i64(job.snapshot.covers)},
 		{key = "summary_bytes", value = i64(len(summary))},
 		{key = "head_estimate", value = i64(job.snapshot.head_estimate)},
-		{key = "input_tokens", value = log_optional_i64(job.usage.input)},
-		{key = "output_tokens", value = log_optional_i64(job.usage.output)},
+		{key = "input_tokens", value = log_optional_i64(job.usage.input_tokens)},
+		{key = "output_tokens", value = log_optional_i64(job.usage.output_tokens)},
 		{key = "elapsed_ms", value = Log_Duration_Milliseconds(time.tick_since(job.started_at))},
 	}
 	log_emit({level = .Info, category = .Provider, event = "compaction.finished", fields = fields[:]})
@@ -996,13 +878,12 @@ chat_compact_destroy_job :: proc(control: ^Compact_Control, job: ^Compact_Job) {
 // when it happened, so a later boundary does not immediately try again.
 @(private)
 chat_compact_failed_job :: proc(control: ^Compact_Control, job: ^Compact_Job) {
-	control.last_failure_at_ms = session.now_ms()
+	control.last_failure_at = time.tick_now()
 	chat_compact_destroy_job(control, job)
 }
 
-// chat_compact_install commits the candidate's checkpoint and drops the job. The
-// store checks the base and the originating request, so a candidate computed
-// against a superseded context is refused rather than installed.
+// chat_compact_install commits the candidate's checkpoint and drops the job. A
+// candidate built against a superseded checkpoint is refused.
 @(private)
 chat_compact_install :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bool {
 	control := &chat.compact
@@ -1014,25 +895,25 @@ chat_compact_install :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 		return false
 	}
 
-	checkpoint_text := chat_checkpoint_text(summary, context.temp_allocator)
-	_, install_err := session.checkpoint_install(
-		chat.store,
-		chat.id,
-		{turn_no = job.snapshot.turn_no, at_ms = session.now_ms(), summary = checkpoint_text, covered_seq = job.snapshot.covered_seq},
-		job.snapshot.base_seq,
-		job.request_no,
-	)
-	if install_err != nil {
-		local := install_err
+	if job.snapshot.base != control.checkpoint {
 		chat_compact_failed_job(control, job)
-		_observer_message(observer, .Warning, fmt.tprintf("the compaction summary was not installed: %s", session.error_detail(&local)))
+		_observer_message(observer, .Warning, "the compaction summary was not installed: another checkpoint was installed")
 		return false
 	}
+	checkpoint_text := chat_checkpoint_text(summary, context.temp_allocator)
+	node := chat_node(chat, .Checkpoint, journal.Checkpoint{request = job.request}, transmute([]u8)checkpoint_text, covers = job.snapshot.covers)
+	chat_record(chat, {kind = .Checkpoint_Installed, node = node, request = job.request}, journal.Checkpoint{request = job.request})
+	if !chat_commit(chat, "the checkpoint could not be installed") {
+		chat_compact_failed_job(control, job)
+		_observer_message(observer, .Warning, "the compaction summary was not installed")
+		return false
+	}
+	control.checkpoint = node
 
 	fields := [3]Log_Field {
 		{key = "trigger", value = compact_trigger_name(control.trigger)},
-		{key = "covered_seq", value = i64(job.snapshot.covered_seq)},
-		{key = "request_no", value = i64(job.request_no)},
+		{key = "covers", value = i64(job.snapshot.covers)},
+		{key = "request", value = i64(job.request)},
 	}
 	log_emit({level = .Info, category = .Provider, event = "compaction.installed", fields = fields[:]})
 	chat_compact_destroy_job(control, job)
@@ -1080,6 +961,7 @@ chat_compact_service :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 // one the provider has warm.
 chat_compact_consider :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection, prep: ^Chat_Request_Prep) {
 	control := &chat.compact
+	control.checkpoint = prep.projection.checkpoint
 	if control.state != .Idle || chat.storage_failed { return }
 	trigger := control.pending
 	if trigger == .None {
@@ -1096,10 +978,10 @@ chat_compact_consider :: proc(chat: ^Chat_Session, observer: Chat_Observer, conn
 	}
 	if !chat_compact_retry_allowed(control, trigger) { return }
 	if !compact_trigger_explicit(trigger) && !chat_compact_progress(chat, connection, prep) { return }
-	if !chat_compact_start(chat, observer, connection, prep, trigger, control.pending_source_seq) {
+	if !chat_compact_start(chat, observer, connection, prep, trigger, control.pending_source) {
 		// A refusal is a failure like any other, so the next automatic attempt waits
 		// instead of repeating the same work at every boundary.
-		control.last_failure_at_ms = session.now_ms()
+		control.last_failure_at = time.tick_now()
 	}
 }
 
@@ -1119,12 +1001,18 @@ chat_compact_idle_service :: proc(chat: ^Chat_Session, observer: Chat_Observer, 
 	// An intent is consumed by the attempt to start it, so one that cannot start here is
 	// not retried at every tick: the boundary that recorded it asked once.
 	if chat.compact.state == .Idle && chat.compact.pending != .None {
-		prep, prep_err := chat_prepare(chat, connection, chat.allocator)
+		arena: virtual.Arena
+		if arena_error := virtual.arena_init_growing(&arena); arena_error != nil {
+			_observer_message(observer, .Warning, "the context could not be prepared")
+			return changed
+		}
+		defer virtual.arena_destroy(&arena)
+		prep, prep_err := chat_prepare(chat, connection, virtual.arena_allocator(&arena))
 		if prep_err != nil {
 			chat_session_record_failure(chat, "the context could not be read", prep_err)
 			return changed
 		}
-		defer chat_request_prep_destroy(&prep, chat.allocator)
+
 		chat_compact_consider(chat, observer, connection, &prep)
 	}
 	return changed
@@ -1223,15 +1111,14 @@ chat_repair_context :: proc(
 		return .No_Candidate
 	case .Ready:
 	}
-	// The store checks the base, the coverage, and the request the candidate came from, so
-	// a summary computed against a superseded context is refused rather than installed.
+	// A summary computed against a superseded checkpoint is refused rather than installed.
 	if !chat_compact_install(chat, observer) { return .Repair_Rejected }
 
-	previous_checkpoint := prep.history.summary_seq
+	previous_checkpoint := prep.projection.checkpoint
 	if !chat_rebuild_prep(chat, connection, prep, allocator) { return .Repair_Rejected }
 	// The request has to be built from a different checkpoint than the one the provider
 	// refused, and it has to be smaller by enough to be worth the cache break.
-	if prep.history.summary_seq == previous_checkpoint { return .No_Reduction }
+	if prep.projection.checkpoint == previous_checkpoint { return .No_Reduction }
 	if prep.estimate + CHAT_COMPACT_MIN_REDUCTION_TOKENS > previous_estimate { return .No_Reduction }
 	message, admitted := chat_admission_check(chat, prep.estimate, prep.sizes)
 	if !admitted {
@@ -1320,12 +1207,18 @@ chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, conne
 	// there no request boundary to wait for. Inside a turn, the next boundary
 	// freezes the request the summary will cover.
 	if chat.state == .Idle {
-		prep, prep_err := chat_prepare(chat, connection, chat.allocator)
+		arena: virtual.Arena
+		if arena_error := virtual.arena_init_growing(&arena); arena_error != nil {
+			_observer_message(observer, .Warning, "the context could not be prepared")
+			return false
+		}
+		defer virtual.arena_destroy(&arena)
+		prep, prep_err := chat_prepare(chat, connection, virtual.arena_allocator(&arena))
 		if prep_err != nil {
 			chat_session_record_failure(chat, "the context could not be read", prep_err)
 			return false
 		}
-		defer chat_request_prep_destroy(&prep, chat.allocator)
+
 		chat_compact_consider(chat, observer, connection, &prep)
 	}
 	// A job that started has already said so; the rest is the outcome the caller

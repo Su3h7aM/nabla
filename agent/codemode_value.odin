@@ -13,7 +13,7 @@ import "core:strings"
 import "core:unicode/utf8"
 import lua "vendor:lua/5.4"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 // Code Mode crosses its value boundary here. One walk over a Lua value writes it as text: a
 // Lua literal for what the model reads, or JSON where JSON is the format, which is a tool
@@ -480,7 +480,7 @@ codemode_lua_keep_body :: proc "c" (state: ^lua.State) -> c.int {
 	handle := lua.tointeger(state, 2)
 	lua.rawgeti(state, lua.REGISTRYINDEX, lua.Integer(run.results_ref))
 	lua.createtable(state, 0, 3)
-	codemode_lua_push_string(state, session.tool_outcome_name(result.outcome))
+	codemode_lua_push_string(state, journal.TOOL_OUTCOME_NAMES[result.outcome])
 	lua.setfield(state, -2, "outcome")
 	codemode_lua_push_string(state, result.message)
 	lua.setfield(state, -2, "message")

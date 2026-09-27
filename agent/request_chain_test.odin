@@ -1,17 +1,13 @@
 #+test
 package agent
 
-import "core:encoding/json"
 import "core:mem"
 import "core:strings"
 import "core:testing"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
-// Retry_Log is what a turn told a front-end about the retries it scheduled. A chain's
-// report is asserted here rather than through a rendered notice, because the sentence a
-// user reads is worded by the front-end and the facts are the agent's.
 Retry_Log :: struct {
 	events:    [dynamic]Chat_Retry_Event,
 	allocator: mem.Allocator,
@@ -26,162 +22,95 @@ retry_log_append :: proc(user_data: rawptr, event: Chat_Retry_Event) {
 	append(&log.events, event)
 }
 
-// A provider that refuses once and then answers is sent the same bytes again, and the
-// conversation gains exactly one answer: the abandoned attempt contributed nothing.
+@(private)
+request_chain_assert :: proc(test: ^testing.T, chat: ^Chat_Session, expected_attempts: int, expected_answer: string) -> []journal.Record {
+	sent := _test_records(test, chat, {.Request_Sent})
+	if !testing.expect_value(test, len(sent), expected_attempts) { return sent }
+	request := sent[0].request
+	for record, index in sent {
+		testing.expect_value(test, record.request, request)
+		testing.expect_value(test, record.attempt, journal.Attempt_No(index + 1))
+		payload: journal.Request_Sent
+		if testing.expect_value(test, journal.payload_decode(record.data, &payload, context.temp_allocator), nil) {
+			testing.expect_value(test, payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
+			testing.expect_value(test, payload.model_requested, chat.model_id)
+			testing.expect_value(test, payload.recovery, "initial" if index == 0 else "transient_retry")
+		}
+	}
+	responses := _test_records(test, chat, {.Response_Committed})
+	if testing.expect_value(test, len(responses), 1) {
+		testing.expect_value(test, responses[0].request, request)
+		testing.expect_value(test, responses[0].attempt, journal.Attempt_No(expected_attempts))
+	}
+	ancestry, ancestry_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
+	if testing.expect_value(test, ancestry_error, nil) {
+		answers := 0
+		for node in ancestry {
+			if node.kind == .Assistant && string(node.body) == expected_answer {
+				answers += 1
+				payload: journal.Assistant
+				if testing.expect_value(test, journal.payload_decode(node.data, &payload, context.temp_allocator), nil) {
+					testing.expect_value(test, payload.request, request)
+					testing.expect(test, !payload.partial)
+				}
+			}
+		}
+		testing.expect_value(test, answers, 1)
+	}
+	return sent
+}
+
 @(test)
-test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(t: ^testing.T) {
+test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
-	_test_accept(t, chat, "say something")
-
+	_test_accept(test, chat, "say something")
 	refusal := `{"error":{"message":"Rate limit reached"}}`
-	// The refusal carries the provider's own evidence: the request id it answered with,
-	// and a delay, which is a value even when it is zero.
-	refusal_headers := "x-request-id: req_fixture\r\nretry-after: 0\r\n"
-	responses := []string{agent_provider_refusal("429 Too Many Requests", refusal, refusal_headers), agent_provider_reply("second try")}
+	responses := []string {
+		agent_provider_refusal("429 Too Many Requests", refusal, "x-request-id: req_fixture\r\nretry-after: 0\r\n"),
+		agent_provider_reply("second try"),
+	}
 	provider: Agent_Provider
-	if !agent_provider_start(t, &provider, responses) { return }
+	if !agent_provider_start(test, &provider, responses) { return }
 	defer agent_provider_stop(&provider)
-
 	connection := ai.Provider_Connection {
 		API      = .OpenAI_Chat_Completions,
 		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
 	}
 	defer delete(connection.Endpoint, chat.allocator)
-
-	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed after a retry")
-	if !testing.expect_value(t, agent_provider_request_count(&provider), 2) { return }
-	// A retry sends the same request: the bytes of the second attempt are the bytes of
-	// the first, because the harness froze them before either one went out.
-	testing.expectf(t, agent_provider_request(&provider, 0) == agent_provider_request(&provider, 1), "the retry must send the same bytes")
-
-	ctx := _test_context(t, chat)
-	defer session.context_destroy(&ctx, context.allocator)
-	answers := 0
-	answered: session.Request_No
-	has_answered := false
-	for entry in ctx.entries {
-		#partial switch payload in entry.payload {
-		case session.Assistant_Entry:
-			if payload.text == "second try" {
-				answers += 1
-				answered, has_answered = entry.request_no.?
-			}
-		}
-	}
-	testing.expect_value(t, answers, 1)
-	if !testing.expect(t, has_answered, "the answer names the send that produced it") { return }
-
-	// The chain is in the store rather than in the reader's head: the send that
-	// answered names the send that failed, and each of them says what it was.
-	second, second_err := session.request_load(chat.store, chat.id, answered, chat.allocator)
-	if !testing.expect_value(t, second_err, nil) { return }
-	defer session.request_destroy(&second, chat.allocator)
-	testing.expect_value(t, second.outcome, session.Outcome.Completed)
-	attempt, recovery, previous := attempt_record(t, second.input_json)
-	testing.expect_value(t, attempt, i64(2))
-	testing.expect_value(t, recovery, "transient_retry")
-	first_number, has_previous := previous.?
-	if !testing.expect(t, has_previous, "the second send names the first") { return }
-
-	first, first_err := session.request_load(chat.store, chat.id, session.Request_No(first_number), chat.allocator)
-	if !testing.expect_value(t, first_err, nil) { return }
-	defer session.request_destroy(&first, chat.allocator)
-	// The abandoned send keeps its own numbers, and it says how it ended rather than
-	// being left running.
-	testing.expect_value(t, first.outcome, session.Outcome.Failed)
-	testing.expect(t, first.finished_at_ms != nil, "the abandoned send was finished")
-	testing.expect(t, first.error_json != "", "the abandoned send says why it failed")
-	first_attempt, first_recovery, first_previous := attempt_record(t, first.input_json)
-	testing.expect_value(t, first_attempt, i64(1))
-	testing.expect_value(t, first_recovery, "initial")
-	testing.expect(t, first_previous == nil, "the first send of a chain names no predecessor")
-	// The retry sent the same bytes, and the store says so: both rows name the digest of one
-	// payload. Neither payload had to be kept to prove it.
-	first_digest := input_body_digest(t, first.input_json)
-	testing.expect(t, first_digest != "", "a request row records the digest of what it sent")
-	testing.expect_value(t, input_body_digest(t, second.input_json), first_digest)
-
-	// The record of that failure is the evidence the layers observed, not the prose a
-	// front-end would show: a reader can tell a rate limit from a bad request without
-	// parsing the message, and the provider's request id and delay survive with it.
-	evidence := error_record(t, first.error_json)
-	testing.expect_value(t, evidence.format_version, i64(CHAT_REQUEST_ERROR_VERSION))
-	testing.expect_value(t, evidence.kind, "http")
-	testing.expect_value(t, evidence.failure_class, "rate_limited")
-	testing.expect_value(t, evidence.status, i64(429))
-	testing.expect_value(t, evidence.provider_request_id, "req_fixture")
-	testing.expect_value(t, evidence.retry_after_ms, i64(0))
-	// The decision taken on the failed send is in the row with it: the chain waited and
-	// sent again, and both facts are readable after the fact.
-	testing.expect_value(t, evidence.recovery, "transient_failure")
-	testing.expect(t, evidence.delay_ms > 0, "the retry waited before sending again")
-	testing.expect_value(t, evidence.message, "Rate limit reached")
-	// Nothing of the refused attempt reached the conversation, so nothing of it was
-	// exposed.
-	testing.expect(t, !evidence.text_exposed, "the refused attempt produced no visible text")
-	testing.expect(t, !evidence.completion_accepted, "the refused attempt completed nothing")
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed after a retry")
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
+	testing.expect(test, agent_provider_request(&provider, 0) == agent_provider_request(&provider, 1), "the retry repeats the frozen request")
+	sent := request_chain_assert(test, chat, 2, "second try")
+	if len(sent) != 2 { return }
+	rejected := _test_records(test, chat, {.Response_Rejected})
+	if !testing.expect_value(test, len(rejected), 1) { return }
+	testing.expect_value(test, rejected[0].request, sent[0].request)
+	testing.expect_value(test, rejected[0].attempt, journal.Attempt_No(1))
+	evidence: journal.Response_Rejected
+	if !testing.expect_value(test, journal.payload_decode(rejected[0].data, &evidence, context.temp_allocator), nil) { return }
+	testing.expect_value(test, evidence.kind, "http")
+	testing.expect_value(test, evidence.failure_class, "rate_limited")
+	testing.expect_value(test, evidence.status, 429)
+	testing.expect_value(test, evidence.provider_request_id, "req_fixture")
+	if delay, present := evidence.retry_after_ms.?; testing.expect(test, present) { testing.expect_value(test, delay, i64(0)) }
+	testing.expect_value(test, evidence.recovery, "transient_failure")
+	testing.expect(test, evidence.delay_ms > 0)
+	testing.expect_value(test, evidence.detail, "Rate limit reached")
+	testing.expect(test, !evidence.text_exposed && !evidence.completion_accepted)
 }
 
-// Error_Record is the failure evidence one row's error column carries, as a reader
-// outside the harness would take it.
-Error_Record :: struct {
-	format_version:      i64,
-	kind:                string,
-	failure_class:       string,
-	status:              i64,
-	provider_code:       string,
-	provider_request_id: string,
-	retry_after_ms:      i64,
-	retry_directive:     string,
-	transport_cause:     string,
-	text_exposed:        bool,
-	completion_accepted: bool,
-	recovery:            string,
-	delay_ms:            i64,
-	message:             string,
-}
-
-// error_record reads the fields of a request row's failure evidence.
-error_record :: proc(t: ^testing.T, error_json: string) -> (record: Error_Record) {
-	if !testing.expect(t, error_json != "", "the row carries failure evidence") { return }
-	value, parse_err := json.parse_string(error_json, .JSON, true, context.temp_allocator)
-	if parse_err != nil { testing.fail_now(t, "the failure record is not valid JSON") }
-	defer json.destroy_value(value, context.temp_allocator)
-	object, is_object := value.(json.Object)
-	if !testing.expect(t, is_object, "the failure record is an object") { return }
-	if number, is_integer := object["format_version"].(json.Integer); is_integer { record.format_version = i64(number) }
-	if text, is_string := object["kind"].(json.String); is_string { record.kind = string(text) }
-	if text, is_string := object["failure_class"].(json.String); is_string { record.failure_class = string(text) }
-	if number, is_integer := object["status"].(json.Integer); is_integer { record.status = i64(number) }
-	if text, is_string := object["provider_code"].(json.String); is_string { record.provider_code = string(text) }
-	if text, is_string := object["provider_request_id"].(json.String); is_string { record.provider_request_id = string(text) }
-	if number, is_integer := object["retry_after_ms"].(json.Integer); is_integer { record.retry_after_ms = i64(number) }
-	if text, is_string := object["retry_directive"].(json.String); is_string { record.retry_directive = string(text) }
-	if text, is_string := object["transport_cause"].(json.String); is_string { record.transport_cause = string(text) }
-	if flag, is_bool := object["text_exposed"].(json.Boolean); is_bool { record.text_exposed = bool(flag) }
-	if flag, is_bool := object["completion_accepted"].(json.Boolean); is_bool { record.completion_accepted = bool(flag) }
-	if text, is_string := object["recovery"].(json.String); is_string { record.recovery = string(text) }
-	if number, is_integer := object["delay_ms"].(json.Integer); is_integer { record.delay_ms = i64(number) }
-	if text, is_string := object["message"].(json.String); is_string { record.message = string(text) }
-	return
-}
-
-// A chain that meets a refusal, then a stream that ends before its own marker, then an
-// answer uses three sends and commits one answer. The refused send and the truncated
-// one are different classes, and both come from the same frozen request.
 @(test)
-test_a_chain_of_failures_ends_in_one_answer :: proc(t: ^testing.T) {
+test_a_chain_of_failures_ends_in_one_answer :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
-	_test_accept(t, chat, "say something")
-
+	_test_accept(test, chat, "say something")
 	refusal := `{"error":{"message":"Rate limit reached"}}`
 	responses := []string {
 		agent_provider_refusal("429 Too Many Requests", refusal, "retry-after: 0\r\n"),
@@ -189,219 +118,87 @@ test_a_chain_of_failures_ends_in_one_answer :: proc(t: ^testing.T) {
 		agent_provider_reply("third try"),
 	}
 	provider: Agent_Provider
-	if !agent_provider_start(t, &provider, responses) { return }
+	if !agent_provider_start(test, &provider, responses) { return }
 	defer agent_provider_stop(&provider)
-
 	connection := ai.Provider_Connection {
 		API      = .OpenAI_Chat_Completions,
 		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
 	}
 	defer delete(connection.Endpoint, chat.allocator)
-
 	retries: Retry_Log
 	retries.allocator = context.allocator
 	retries.events = make([dynamic]Chat_Retry_Event, 0, 4, retries.allocator)
 	defer delete(retries.events)
-
-	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), retry_log_observer(&retries)), "the turn completed after two retries")
-	if !testing.expect_value(t, agent_provider_request_count(&provider), 3) { return }
-	for i in 0 ..< agent_provider_request_count(&provider) {
-		testing.expectf(t, agent_provider_request(&provider, i) == agent_provider_request(&provider, 0), "send %d must repeat the frozen bytes", i + 1)
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), retry_log_observer(&retries)), "the turn completed after two retries")
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 3) { return }
+	for index in 0 ..< 3 { testing.expect(test, agent_provider_request(&provider, index) == agent_provider_request(&provider, 0)) }
+	sent := request_chain_assert(test, chat, 3, "third try")
+	if len(sent) != 3 { return }
+	rejected := _test_records(test, chat, {.Response_Rejected})
+	if !testing.expect_value(test, len(rejected), 2) { return }
+	for record, index in rejected {
+		testing.expect_value(test, record.request, sent[0].request)
+		testing.expect_value(test, record.attempt, journal.Attempt_No(index + 1))
+		evidence: journal.Response_Rejected
+		if !testing.expect_value(test, journal.payload_decode(record.data, &evidence, context.temp_allocator), nil) { continue }
+		testing.expect_value(test, evidence.failure_class, "rate_limited" if index == 0 else "incomplete_stream")
+		testing.expect_value(test, evidence.recovery, "transient_failure")
+		if index == 0 { testing.expect_value(test, evidence.status, 429) }
+		if index == 1 { testing.expect_value(test, evidence.kind, "stream") }
 	}
-
-	ctx := _test_context(t, chat)
-	defer session.context_destroy(&ctx, context.allocator)
-	answers := 0
-	answered: session.Request_No
-	has_answered := false
-	partials := 0
-	for entry in ctx.entries {
-		#partial switch payload in entry.payload {
-		case session.Assistant_Entry:
-			if payload.text == "third try" { answers += 1 }
-			request_no, named := entry.request_no.?
-			if !named { continue }
-			answered, has_answered = request_no, true
-			if payload.partial { partials += 1 }
-		}
+	if !testing.expect_value(test, len(retries.events), 2) { return }
+	for event, index in retries.events {
+		testing.expect_value(test, event.next_attempt, index + 2)
+		testing.expect_value(test, event.request, sent[0].request)
+		testing.expect(test, event.delay > 0)
 	}
-	testing.expect_value(t, answers, 1)
-	testing.expect_value(t, partials, 0)
-	if !testing.expect(t, has_answered, "the answer names the send that produced it") { return }
-
-	// The chain is three rows, in order: each names the send before it, and each says
-	// what its own send met and what the harness did about it.
-	third, third_err := session.request_load(chat.store, chat.id, answered, chat.allocator)
-	if !testing.expect_value(t, third_err, nil) { return }
-	defer session.request_destroy(&third, chat.allocator)
-	testing.expect_value(t, third.outcome, session.Outcome.Completed)
-	third_attempt, third_recovery, third_previous := attempt_record(t, third.input_json)
-	testing.expect_value(t, third_attempt, i64(3))
-	testing.expect_value(t, third_recovery, "transient_retry")
-	second_number, has_second := third_previous.?
-	if !testing.expect(t, has_second, "the answered send names the send before it") { return }
-
-	second, second_err := session.request_load(chat.store, chat.id, session.Request_No(second_number), chat.allocator)
-	if !testing.expect_value(t, second_err, nil) { return }
-	defer session.request_destroy(&second, chat.allocator)
-	testing.expect_value(t, second.outcome, session.Outcome.Failed)
-	second_attempt, _, second_previous := attempt_record(t, second.input_json)
-	testing.expect_value(t, second_attempt, i64(2))
-	// A stream that ended before its own marker is incomplete, not invalid: the harness
-	// can send the same bytes again.
-	second_evidence := error_record(t, second.error_json)
-	testing.expect_value(t, second_evidence.kind, "stream")
-	testing.expect_value(t, second_evidence.failure_class, "incomplete_stream")
-	testing.expect_value(t, second_evidence.recovery, "transient_failure")
-	first_number, has_first := second_previous.?
-	if !testing.expect(t, has_first, "the second send names the first") { return }
-
-	first, first_err := session.request_load(chat.store, chat.id, session.Request_No(first_number), chat.allocator)
-	if !testing.expect_value(t, first_err, nil) { return }
-	defer session.request_destroy(&first, chat.allocator)
-	testing.expect_value(t, first.outcome, session.Outcome.Failed)
-	first_attempt, first_recovery, first_previous := attempt_record(t, first.input_json)
-	testing.expect_value(t, first_attempt, i64(1))
-	testing.expect_value(t, first_recovery, "initial")
-	testing.expect(t, first_previous == nil, "the first send of a chain names no predecessor")
-	first_evidence := error_record(t, first.error_json)
-	testing.expect_value(t, first_evidence.failure_class, "rate_limited")
-	testing.expect_value(t, first_evidence.status, i64(429))
-	testing.expect(t, !first_evidence.text_exposed, "the refused attempt published nothing")
-
-	// The front-end was told about both retries as they were scheduled: which send
-	// failed, which one follows it, what the failure meant, and how long the harness
-	// waits before sending again.
-	if !testing.expect_value(t, len(retries.events), 2) { return }
-	for event, i in retries.events {
-		testing.expect_value(t, event.next_attempt, i + 2)
-		testing.expect(t, event.delay > 0, "a scheduled retry waits before sending again")
-	}
-	testing.expect_value(t, retries.events[0].failure_class, ai.Provider_Failure_Class.Rate_Limited)
-	testing.expect_value(t, retries.events[1].failure_class, ai.Provider_Failure_Class.Incomplete_Stream)
-	// The report names the send it belongs to, which is the row the failure is in.
-	testing.expect_value(t, retries.events[0].request_no, session.Request_No(first_number))
-	testing.expect_value(t, retries.events[1].request_no, session.Request_No(second_number))
+	testing.expect_value(test, retries.events[0].failure_class, ai.Provider_Failure_Class.Rate_Limited)
+	testing.expect_value(test, retries.events[1].failure_class, ai.Provider_Failure_Class.Incomplete_Stream)
 }
 
-// A turn that did not complete records typed facts beside its message, so a front-end can
-// tell a failed retry budget from a context that did not fit without reading prose. A turn
-// that ended for a reason of its own claims none.
 @(test)
-test_the_turn_record_carries_its_typed_failure :: proc(t: ^testing.T) {
-	exhausted, marshal_error := chat_turn_error_json("the request does not fit the context: no summary", .Context_Exhausted, .No_Candidate)
-	if marshal_error != .None { testing.fail_now(t, "the turn record could not be encoded") }
-	value, parse_err := json.parse_string(exhausted, .JSON, true, context.temp_allocator)
-	if parse_err != nil { testing.fail_now(t, "the turn record is not valid JSON") }
-	defer json.destroy_value(value, context.temp_allocator)
-	object, is_object := value.(json.Object)
-	if !testing.expect(t, is_object, "the turn record is an object") { return }
-	reason, _ := object["reason"].(json.String)
-	testing.expect_value(t, string(reason), "context_exhausted")
-	cause, _ := object["cause"].(json.String)
-	testing.expect_value(t, string(cause), "no_candidate")
-	version, _ := object["format_version"].(json.Integer)
-	testing.expect_value(t, i64(version), i64(CHAT_TURN_ERROR_VERSION))
-
-	own: string
-	own, marshal_error = chat_turn_error_json("the tool failed", nil, .None)
-	if marshal_error != .None { testing.fail_now(t, "the turn record could not be encoded") }
-	value, parse_err = json.parse_string(own, .JSON, true, context.temp_allocator)
-	if parse_err != nil { testing.fail_now(t, "the turn record is not valid JSON") }
-	defer json.destroy_value(value, context.temp_allocator)
-	object, is_object = value.(json.Object)
-	if !testing.expect(t, is_object, "the turn record is an object") { return }
-	reason, _ = object["reason"].(json.String)
-	testing.expect_value(t, string(reason), "")
-}
-
-// input_body_digest reads the digest of the bytes one request row's input record names.
-input_body_digest :: proc(t: ^testing.T, input_json: string) -> string {
-	value, parse_err := json.parse_string(input_json, .JSON, true, context.temp_allocator)
-	if parse_err != nil { testing.fail_now(t, "the input record is not valid JSON") }
-	defer json.destroy_value(value, context.temp_allocator)
-	object, is_object := value.(json.Object)
-	if !testing.expect(t, is_object, "the input record is an object") { return "" }
-	digest, _ := object["body_sha256"].(json.String)
-	return string(digest)
-}
-
-// attempt_record reads the chain fields one request row's input record carries.
-attempt_record :: proc(t: ^testing.T, input_json: string) -> (attempt: i64, recovery: string, previous: Maybe(i64)) {
-	value, parse_err := json.parse_string(input_json, .JSON, true, context.temp_allocator)
-	if parse_err != nil { testing.fail_now(t, "the input record is not valid JSON") }
-	defer json.destroy_value(value, context.temp_allocator)
-	object, is_object := value.(json.Object)
-	if !testing.expect(t, is_object, "the input record is an object") { return }
-	if number, is_integer := object["attempt_number"].(json.Integer); is_integer { attempt = i64(number) }
-	if kind, is_string := object["recovery_kind"].(json.String); is_string { recovery = string(kind) }
-	if number, is_integer := object["previous_request_no"].(json.Integer); is_integer { previous = i64(number) }
-	return
-}
-
-// One request, one send, one answer: the scripted provider replies, the harness
-// commits what came back, and the conversation holds the prompt and the answer.
-// This is the base case every retry case is a variation of.
-@(test)
-test_a_scripted_provider_completes_one_request :: proc(t: ^testing.T) {
+test_a_scripted_provider_completes_one_request :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
-	_test_accept(t, chat, "say something")
-
+	_test_accept(test, chat, "say something")
 	responses := []string{agent_provider_reply("scripted reply")}
 	provider: Agent_Provider
-	if !agent_provider_start(t, &provider, responses) { return }
+	if !agent_provider_start(test, &provider, responses) { return }
 	defer agent_provider_stop(&provider)
-
 	connection := ai.Provider_Connection {
 		API      = .OpenAI_Chat_Completions,
 		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
 	}
 	defer delete(connection.Endpoint, chat.allocator)
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed")
+	testing.expect_value(test, agent_provider_request_count(&provider), 1)
+	testing.expect(test, !agent_provider_failed(&provider), "the scripted provider served its response")
+	testing.expect_value(test, chat.last_error, "")
+	testing.expect(test, strings.contains(agent_provider_request(&provider, 0), chat.model_id))
+	testing.expect(test, strings.contains(agent_provider_request(&provider, 0), "say something"))
+	request_chain_assert(test, chat, 1, "scripted reply")
+}
 
-	testing.expect(t, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed")
-	testing.expect_value(t, agent_provider_request_count(&provider), 1)
-	testing.expect(t, !agent_provider_failed(&provider), "the scripted provider served its response")
-	testing.expect(t, chat.last_error == "", chat.last_error)
-
-	// What left this machine is the request the harness assembled: the model it
-	// resolved and the prompt that asked for an answer.
-	testing.expect(t, strings.contains(agent_provider_request(&provider, 0), chat.model_id), "the request names the model")
-	testing.expect(t, strings.contains(agent_provider_request(&provider, 0), "say something"), "the request carries the prompt")
-
-	ctx := _test_context(t, chat)
-	defer session.context_destroy(&ctx, context.allocator)
-	found_prompt := false
-	found_reply := false
-	request_no: session.Request_No
-	has_request := false
-	for entry in ctx.entries {
-		#partial switch payload in entry.payload {
-		case session.User_Entry:
-			if payload.text == "say something" { found_prompt = true }
-		case session.Assistant_Entry:
-			if payload.text == "scripted reply" {
-				found_reply = true
-				testing.expect(t, !payload.partial, "a completed answer is not partial")
-			}
-			// The answer names the send that produced it, which is how the entry and
-			// the request row are tied together.
-			request_no, has_request = entry.request_no.?
-		}
-	}
-	testing.expect(t, found_prompt, "the prompt is in the conversation")
-	testing.expect(t, found_reply, "the answer is in the conversation")
-
-	if testing.expect(t, has_request, "the answer names the send that produced it") {
-		row, load_err := session.request_load(chat.store, chat.id, request_no, chat.allocator)
-		if testing.expect_value(t, load_err, nil) {
-			defer session.request_destroy(&row, chat.allocator)
-			testing.expect_value(t, row.purpose, session.Request_Purpose.Response)
-			testing.expect_value(t, row.outcome, session.Outcome.Completed)
-			testing.expect(t, row.finished_at_ms != nil, "a request that ended says when")
-		}
-	}
+@(test)
+test_the_turn_record_carries_its_typed_failure :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	_test_accept(test, chat, "say something")
+	chat.turn_recovery = .Context_Exhausted
+	chat.turn_repair_refusal = .No_Candidate
+	chat_session_fail_turn(chat, "the request does not fit the context: no summary")
+	_test_settle(test, chat)
+	records := _test_records(test, chat, {.Turn_Completed})
+	if !testing.expect_value(test, len(records), 1) { return }
+	completion: journal.Turn_Completed
+	if !testing.expect_value(test, journal.payload_decode(records[0].data, &completion, context.temp_allocator), nil) { return }
+	testing.expect_value(test, completion.outcome, "failed")
+	testing.expect_value(test, completion.reason, "context_exhausted")
+	testing.expect_value(test, completion.cause, "no_candidate")
+	testing.expect_value(test, completion.detail, "the request does not fit the context: no summary")
 }

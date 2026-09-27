@@ -9,7 +9,7 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 // --- owned tool jobs -----------------------------------------------------------
@@ -161,9 +161,6 @@ Tool_Job :: struct {
 	result:         Tool_Result,
 	result_present: bool,
 	committed:      bool,
-	// recorded_seq is the entry this job's result was recorded as. It is the
-	// committed reference a later reader names, such as a Code Mode handle.
-	recorded_seq:   session.Seq,
 }
 
 // Tool_Jobs is one batch's table. Only the owner reads and writes it.
@@ -361,14 +358,14 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	defer context.logger = previous
 
 	job.exec = Tool_Context {
-		call_id    = job.call_id,
-		workspace  = chat.workspace,
-		allocator  = job.allocator,
-		skills     = chat_skill_catalog(chat),
-		source_seq = job.call.seq,
+		call_id   = job.call_id,
+		workspace = chat.workspace,
+		allocator = job.allocator,
+		skills    = chat_skill_catalog(chat),
+		call      = job.call.call,
 	}
-	if job.call.seq > 0 {
-		job.output_base = chat_tool_output_path(chat, i64(job.call.seq), "", job.allocator)
+	if job.call.call > 0 {
+		job.output_base = chat_tool_output_path(chat, job.call.call, "", job.allocator)
 		job.exec.output_base = job.output_base
 	}
 	received := [2]Log_Field{{key = "tool", value = job.name}, {key = "arguments_bytes", value = i64(len(job.call.arguments))}}
@@ -703,6 +700,15 @@ tool_jobs_latch_stop :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 
 // --- effects -------------------------------------------------------------------
 
+// tool_job_record_placement names where a job's tool records belong: a provider call hangs
+// on the assistant node that proposed it, while a Lua child hangs on the call that started
+// it.
+@(private)
+tool_job_record_placement :: proc(chat: ^Chat_Session, job: ^Tool_Job) -> (node: journal.Node_Id, parent_call: journal.Call_Id) {
+	if job.nested { return 0, job.parent.call.call }
+	return chat.response_node, 0
+}
+
 // tool_jobs_dispatch records one call's dispatch entry and starts its executor. The
 // write comes first: a dispatch entry without a result is recovered as an unknown
 // outcome, while a result without a dispatch entry would claim knowledge the harness
@@ -719,20 +725,24 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	defer context.logger = previous
 	job.phase = .Dispatching
 
-	dispatch := session.New_Entry {
-		turn_no = chat.turn_no,
-		request_no = chat.active_request,
-		created_at_ms = session.now_ms(),
-		related_seq = job.call.seq,
-		payload = session.Tool_Dispatch_Entry{tool = job.name, arguments = job.admitted.effective, repairs = job.admitted.repairs},
+	repair_names: [len(Tool_Repair)]string
+	repair_count := 0
+	for repair in job.admitted.repairs {
+		repair_names[repair_count] = TOOL_REPAIR_NAMES[repair]
+		repair_count += 1
 	}
-	dispatch_seq, dispatch_error := session.entry_append(chat.store, chat.id, dispatch)
-	if dispatch_error != nil {
-		chat_session_record_failure(chat, "the tool dispatch could not be recorded", dispatch_error)
+	node, parent_call := tool_job_record_placement(chat, job)
+	chat_record(
+		chat,
+		{kind = .Tool_Admitted, node = node, request = chat.request, call = job.call.call, parent_call = parent_call},
+		journal.Tool_Admitted{tool = job.name, repairs = repair_names[:repair_count]},
+		transmute([]u8)job.admitted.effective,
+	)
+	if !chat_commit(chat, "the tool dispatch could not be recorded") {
 		tool_jobs_latch_stop(jobs, chat)
 		return
 	}
-	dispatched := [2]Log_Field{{key = "tool", value = job.name}, {key = "dispatch_seq", value = i64(dispatch_seq)}}
+	dispatched := [2]Log_Field{{key = "tool", value = job.name}, {key = "call", value = i64(job.call.call)}}
 	log_emit({level = .Info, category = .Tool, event = "tool.dispatch_committed", fields = dispatched[:]})
 
 	// Cancellation can land after the intent was recorded but before execution
@@ -779,24 +789,23 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 	if sync.atomic_load(&job.published) { return }
 	message := fmt.tprintf("the tool did not stop within %v of its stop being requested; its outcome is unknown", TOOL_JOBS_STOP_PATIENCE)
 	result := tool_result_failure(&job.exec, .Unknown, message, "did not stop")
-	result_seq: session.Seq
 	recorded := false
 	if !result.allocation_failed {
-		if !job.nested { tool_result_keep(&result, &jobs.budget, chat_tool_output_path(chat, i64(job.call.seq))) }
-		result_seq, recorded = chat_record_tool_result(chat, job.call, &result)
+		if !job.nested { tool_result_keep(&result, &jobs.budget, chat_tool_output_path(chat, job.call.call)) }
+		node, parent_call := tool_job_record_placement(chat, job)
+		recorded = chat_record_tool_result(chat, job.call.call, node, parent_call, &result)
 	}
 
 	tool_jobs_mark_abandoned(jobs, job)
 	if recorded {
 		job.committed = true
-		job.recorded_seq = result_seq
 		jobs.committed += 1
 		if !job.nested { jobs.committed_roots += 1 }
 	}
 	waited := time.tick_diff(job.stop_at, now)
 	fields := [3]Log_Field {
 		{key = "tool", value = job.name},
-		{key = "outcome", value = session.tool_outcome_name(.Unknown)},
+		{key = "outcome", value = journal.TOOL_OUTCOME_NAMES[.Unknown]},
 		{key = "waited_ms", value = i64(waited / time.Millisecond)},
 	}
 	log_emit({level = .Error, category = .Tool, event = "tool.job_stuck", fields = fields[:]})
@@ -853,9 +862,9 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	}
 	// The budget decides how much of this result the model is shown; the rest goes to a
 	// file. The decision is stored, so a request built later sends the same bytes.
-	if !job.nested { tool_result_keep(&result, &jobs.budget, chat_tool_output_path(chat, i64(job.call.seq))) }
-	result_seq, recorded := chat_record_tool_result(chat, job.call, &result)
-	if !recorded {
+	if !job.nested { tool_result_keep(&result, &jobs.budget, chat_tool_output_path(chat, job.call.call)) }
+	node, parent_call := tool_job_record_placement(chat, job)
+	if !chat_record_tool_result(chat, job.call.call, node, parent_call, &result) {
 		// The result cannot be recorded, so it must not be reported as if it were.
 		tool_result_destroy(&result)
 		job.phase = .Result_Ready
@@ -863,7 +872,6 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 		return
 	}
 	job.committed = true
-	job.recorded_seq = result_seq
 	jobs.committed += 1
 	if !job.nested { jobs.committed_roots += 1 }
 	if job.parent != nil {
@@ -872,8 +880,8 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 
 	committed := [3]Log_Field {
 		{key = "tool", value = job.name},
-		{key = "outcome", value = session.tool_outcome_name(result.outcome)},
-		{key = "result_seq", value = i64(result_seq)},
+		{key = "outcome", value = journal.TOOL_OUTCOME_NAMES[result.outcome]},
+		{key = "call", value = i64(job.call.call)},
 	}
 	log_emit({level = .Info, category = .Tool, event = "tool.result_committed", fields = committed[:]})
 	_observer_tool_result(observer, job.name, &result)
@@ -893,7 +901,7 @@ tool_jobs_retire :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 		waited := time.tick_diff(job.stop_at, now)
 		fields := [3]Log_Field {
 			{key = "tool", value = job.name},
-			{key = "outcome", value = session.tool_outcome_name(.Unknown)},
+			{key = "outcome", value = journal.TOOL_OUTCOME_NAMES[.Unknown]},
 			{key = "waited_ms", value = i64(waited / time.Millisecond)},
 		}
 		log_emit({level = .Error, category = .Tool, event = "tool.job_stuck", fields = fields[:]})
@@ -944,7 +952,7 @@ tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
 	started := [1]Log_Field{{key = "tool", value = job.name}}
 	log_emit({level = .Info, category = .Tool, event = "tool.execution_started", fields = started[:]})
 	result := job.execute(&job.exec, job.arguments)
-	finished := [2]Log_Field{{key = "tool", value = job.name}, {key = "outcome", value = session.tool_outcome_name(result.outcome)}}
+	finished := [2]Log_Field{{key = "tool", value = job.name}, {key = "outcome", value = journal.TOOL_OUTCOME_NAMES[result.outcome]}}
 	log_emit({level = .Info, category = .Tool, event = "tool.execution_finished", fields = finished[:]})
 	return result
 }

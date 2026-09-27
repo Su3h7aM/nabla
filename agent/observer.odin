@@ -2,7 +2,7 @@ package agent
 
 import "core:time"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 // Chat_Observer is where the agent hands user-visible information to whoever
@@ -66,7 +66,7 @@ Chat_Tool_Event :: struct {
 // again. It is the decision the failed request's own row
 // records, reported in time for a front-end to act on it while the turn is waiting.
 Chat_Retry_Event :: struct {
-	request_no:    session.Request_No,
+	request:       journal.Request_Id,
 	next_attempt:  int,
 	failure_class: ai.Provider_Failure_Class,
 	delay:         time.Duration,

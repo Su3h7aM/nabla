@@ -21,6 +21,7 @@ Filter :: struct {
 // Session_Filter selects sessions. The zero value lists all of them, newest
 // activity first.
 Session_Filter :: struct {
+	session:   Session_Id,
 	workspace: string,
 	role:      Maybe(Session_Role),
 	limit:     int, // 0 lists every match
@@ -257,6 +258,8 @@ list_sessions :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.
 	assert(journal.open)
 	query := Query{}
 	query_start(&query, SESSION_LIST_QUERY) or_return
+	session := filter.session
+	if session != {} { query_add(&query, " AND session = ?", db.Value(session[:])) or_return }
 	if filter.workspace != "" { query_add(&query, " AND workspace = ?", filter.workspace) or_return }
 	if role, has_role := filter.role.?; has_role { query_add(&query, " AND role = ?", SESSION_ROLE_NAMES[role]) or_return }
 	if filter.before != 0 { query_add(&query, " AND last_seq < ?", i64(filter.before)) or_return }

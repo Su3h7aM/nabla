@@ -2,7 +2,7 @@ package agent
 
 import "core:fmt"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 // chat_effort_change_note is what a caller reports after changing the effort.
 // The change reaches the provider: reasoning effort is rendered into the prompt
@@ -17,20 +17,22 @@ chat_effort_change_note :: proc(level: string) -> string {
 // where it runs, how long it has run, which model and effort it uses, and the
 // context and usage numbers the harness already measured.
 chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms: i64) {
-	header, header_err := session.session_load(chat.store, chat.id, context.temp_allocator)
-	have_header := header_err == nil
-	defer session.session_destroy(&header, context.temp_allocator)
+	summaries, list_error := journal.list_sessions(chat.store, {session = chat.session, limit = 1}, context.temp_allocator)
+	defer journal.session_summaries_destroy(summaries, context.temp_allocator)
+	summary: journal.Session_Summary
+	have_summary := list_error == nil && len(summaries) > 0
+	if have_summary { summary = summaries[0] }
 
-	chat_status_line(observer, "session", string(chat.id))
-	if have_header {
-		title := header.title if header.title != "" else "(untitled)"
+	chat_status_line(observer, "session", chat_session_text(chat))
+	if have_summary {
+		title := summary.title if summary.title != "" else "(untitled)"
 		chat_status_line(observer, "title", title)
 	}
 	chat_status_line(observer, "cwd", chat.workspace)
-	if have_header {
+	if have_summary {
 		// The age counts from creation, which includes the time the harness was not
 		// running, so it is called age rather than time spent working.
-		age := chat_age_text(now_ms - header.created_at_ms)
+		age := chat_age_text(now_ms - summary.created_ms)
 		chat_status_line(observer, "age", fmt.tprintf("%s%s", age, " (turn active)" if chat.state != .Idle else ""))
 	}
 	chat_status_line(observer, "model", fmt.tprintf("%s / %s", chat.provider_id, chat.model_id))
@@ -68,15 +70,14 @@ chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms:
 	// Session usage is a query over finished requests, so this line also fails
 	// when the store does: a status that hid a storage failure would be lying
 	// about the rest of the session too.
-	totals, totals_err := session.cache_totals(chat.store, chat.id)
-	if totals_err != nil {
-		local := totals_err
-		chat_status_line(observer, "cache", fmt.tprintf("unavailable: %s", session.error_detail(&local)))
+	totals, totals_error := journal.usage_totals(chat.store, chat.session)
+	if totals_error != nil {
+		chat_status_line(observer, "cache", fmt.tprintf("unavailable: %s", journal.error_text(totals_error, context.temp_allocator)))
 		return
 	}
 	rate_text := ""
-	if rate, rate_measured := session.cache_hit_rate(totals); rate_measured {
-		if share, coverage_measured := session.cache_coverage(totals); coverage_measured && share < 1 {
+	if rate, rate_measured := journal.cache_hit_rate(totals); rate_measured {
+		if share, coverage_measured := journal.cache_coverage(totals); coverage_measured && share < 1 {
 			rate_text = fmt.tprintf(" (%.1f%% hit over %.0f%% of input)", rate * 100, share * 100)
 		} else {
 			rate_text = fmt.tprintf(" (%.1f%% hit)", rate * 100)
@@ -86,15 +87,12 @@ chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms:
 		observer,
 		"cache",
 		fmt.tprintf(
-			"input %d in %d, read %d in %d, write %d in %d, output %d in %d%s",
+			"input %d, read %d, write %d, output %d over %d responses%s",
 			totals.input,
-			totals.input_requests,
 			totals.cache_read,
-			totals.cache_read_requests,
 			totals.cache_write,
-			totals.cache_write_requests,
 			totals.output,
-			totals.output_requests,
+			totals.requests,
 			rate_text,
 		),
 	)
