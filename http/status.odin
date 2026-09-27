@@ -1,10 +1,7 @@
 package http
 
-import "base:runtime"
-
-import "core:fmt"
-import "core:strings"
-
+// Status is a response status code with the name RFC 9110 15 gives it, or the
+// registry name for codes defined elsewhere.
 Status :: enum {
 	Continue                        = 100,
 	Switching_Protocols             = 101,
@@ -42,7 +39,7 @@ Status :: enum {
 	Gone                            = 410,
 	Length_Required                 = 411,
 	Precondition_Failed             = 412,
-	Payload_Too_Large               = 413,
+	Content_Too_Large               = 413,
 	URI_Too_Long                    = 414,
 	Unsupported_Media_Type          = 415,
 	Range_Not_Satisfiable           = 416,
@@ -71,49 +68,137 @@ Status :: enum {
 	Network_Authentication_Required = 511,
 }
 
-_status_strings: [max(Status) + Status(1)]string
-
-// Populates the status_strings like a map from status to their string representation.
-// Where an empty string means an invalid code.
-@(init, private)
-status_strings_init :: proc "contextless" () {
-	context = runtime.default_context()
-	for field in Status {
-		name, ok := fmt.enum_value_to_string(field)
-		assert(ok)
-
-		b: strings.Builder
-		strings.write_int(&b, int(field))
-		strings.write_byte(&b, ' ')
-
-		// Some edge cases aside, replaces underscores in the enum name with spaces.
-		#partial switch field {
-		case .Non_Authoritative_Information:
-			strings.write_string(&b, "Non-Authoritative Information")
-		case .Multi_Status:
-			strings.write_string(&b, "Multi-Status")
-		case .Im_A_Teapot:
-			strings.write_string(&b, "I'm a teapot")
-		case:
-			for c in name {
-				switch c {
-				case '_':
-					strings.write_rune(&b, ' ')
-				case:
-					strings.write_rune(&b, c)
-				}
-			}
-		}
-
-		_status_strings[field] = strings.to_string(b)
-	}
-}
-
+// status_string returns the status line text of a status: its code and reason
+// phrase, or "" for a value no status has.
 status_string :: proc(s: Status) -> string {
-	if s >= Status(0) && s <= max(Status) {
-		return _status_strings[s]
+	switch s {
+	case .Continue:
+		return "100 Continue"
+	case .Switching_Protocols:
+		return "101 Switching Protocols"
+	case .Processing:
+		return "102 Processing"
+	case .Early_Hints:
+		return "103 Early Hints"
+	case .OK:
+		return "200 OK"
+	case .Created:
+		return "201 Created"
+	case .Accepted:
+		return "202 Accepted"
+	case .Non_Authoritative_Information:
+		return "203 Non-Authoritative Information"
+	case .No_Content:
+		return "204 No Content"
+	case .Reset_Content:
+		return "205 Reset Content"
+	case .Partial_Content:
+		return "206 Partial Content"
+	case .Multi_Status:
+		return "207 Multi-Status"
+	case .Already_Reported:
+		return "208 Already Reported"
+	case .IM_Used:
+		return "226 IM Used"
+	case .Multiple_Choices:
+		return "300 Multiple Choices"
+	case .Moved_Permanently:
+		return "301 Moved Permanently"
+	case .Found:
+		return "302 Found"
+	case .See_Other:
+		return "303 See Other"
+	case .Not_Modified:
+		return "304 Not Modified"
+	case .Use_Proxy:
+		return "305 Use Proxy"
+	case .Unused:
+		return "306 (Unused)"
+	case .Temporary_Redirect:
+		return "307 Temporary Redirect"
+	case .Permanent_Redirect:
+		return "308 Permanent Redirect"
+	case .Bad_Request:
+		return "400 Bad Request"
+	case .Unauthorized:
+		return "401 Unauthorized"
+	case .Payment_Required:
+		return "402 Payment Required"
+	case .Forbidden:
+		return "403 Forbidden"
+	case .Not_Found:
+		return "404 Not Found"
+	case .Method_Not_Allowed:
+		return "405 Method Not Allowed"
+	case .Not_Acceptable:
+		return "406 Not Acceptable"
+	case .Proxy_Authentication_Required:
+		return "407 Proxy Authentication Required"
+	case .Request_Timeout:
+		return "408 Request Timeout"
+	case .Conflict:
+		return "409 Conflict"
+	case .Gone:
+		return "410 Gone"
+	case .Length_Required:
+		return "411 Length Required"
+	case .Precondition_Failed:
+		return "412 Precondition Failed"
+	case .Content_Too_Large:
+		return "413 Content Too Large"
+	case .URI_Too_Long:
+		return "414 URI Too Long"
+	case .Unsupported_Media_Type:
+		return "415 Unsupported Media Type"
+	case .Range_Not_Satisfiable:
+		return "416 Range Not Satisfiable"
+	case .Expectation_Failed:
+		return "417 Expectation Failed"
+	case .Im_A_Teapot:
+		return "418 I'm a teapot"
+	case .Misdirected_Request:
+		return "421 Misdirected Request"
+	case .Unprocessable_Content:
+		return "422 Unprocessable Content"
+	case .Locked:
+		return "423 Locked"
+	case .Failed_Dependency:
+		return "424 Failed Dependency"
+	case .Too_Early:
+		return "425 Too Early"
+	case .Upgrade_Required:
+		return "426 Upgrade Required"
+	case .Precondition_Required:
+		return "428 Precondition Required"
+	case .Too_Many_Requests:
+		return "429 Too Many Requests"
+	case .Request_Header_Fields_Too_Large:
+		return "431 Request Header Fields Too Large"
+	case .Unavailable_For_Legal_Reasons:
+		return "451 Unavailable For Legal Reasons"
+	case .Internal_Server_Error:
+		return "500 Internal Server Error"
+	case .Not_Implemented:
+		return "501 Not Implemented"
+	case .Bad_Gateway:
+		return "502 Bad Gateway"
+	case .Service_Unavailable:
+		return "503 Service Unavailable"
+	case .Gateway_Timeout:
+		return "504 Gateway Timeout"
+	case .HTTP_Version_Not_Supported:
+		return "505 HTTP Version Not Supported"
+	case .Variant_Also_Negotiates:
+		return "506 Variant Also Negotiates"
+	case .Insufficient_Storage:
+		return "507 Insufficient Storage"
+	case .Loop_Detected:
+		return "508 Loop Detected"
+	case .Not_Extended:
+		return "510 Not Extended"
+	case .Network_Authentication_Required:
+		return "511 Network Authentication Required"
 	}
-
 	return ""
 }
 
@@ -121,16 +206,12 @@ status_valid :: proc(s: Status) -> bool {
 	return status_string(s) != ""
 }
 
+// status_from_string reads the three-digit status code at the start of s.
 status_from_string :: proc(s: string) -> (Status, bool) {
-	if len(s) < 3 { return {}, false }
-
-	code_int := int(s[0] - '0') * 100 + (int(s[1] - '0') * 10) + int(s[2] - '0')
-
-	if !status_valid(Status(code_int)) {
-		return {}, false
-	}
-
-	return Status(code_int), true
+	if len(s) < 3 || !is_digit(s[0]) || !is_digit(s[1]) || !is_digit(s[2]) { return {}, false }
+	code := Status(int(s[0] - '0') * 100 + int(s[1] - '0') * 10 + int(s[2] - '0'))
+	if !status_valid(code) { return {}, false }
+	return code, true
 }
 
 status_is_informational :: proc(s: Status) -> bool {

@@ -25,6 +25,9 @@ Response :: struct {
 	// connection (maybe a small buffer in this struct).
 	_buf:             bytes.Buffer,
 	_heading_written: bool,
+	// _head_len is where the head ends in _buf, which is all a HEAD request is
+	// sent (RFC 9110 9.3.2).
+	_head_len:        int,
 }
 
 response_init :: proc(r: ^Response, allocator := context.allocator) {
@@ -90,13 +93,16 @@ response_status :: proc(r: ^Response, status: Status) {
 }
 
 Response_Writer :: struct {
-	r:     ^Response,
+	r:               ^Response,
+	// close_delimited frames the body by closing the connection, for a client
+	// that cannot receive chunked (RFC 9112 6.1).
+	close_delimited: bool,
 	// The writer you can write to.
-	w:     io.Writer,
+	w:               io.Writer,
 	// A dynamic wrapper over the `buffer` given in `response_writer_init`, doesn't allocate.
-	buf:   [dynamic]byte,
+	buf:             [dynamic]byte,
 	// If destroy or close has been called.
-	ended: bool,
+	ended:           bool,
 }
 
 /*
@@ -107,10 +113,20 @@ The buffer can be used to avoid very small writes, like the ones when you use th
 (each write in the json package is only a few bytes). You are allowed to pass nil which will disable
 buffering.
 
+The body is framed with the chunked transfer coding. A server must not send
+that to an HTTP/1.0 client (RFC 9112 6.1), so its body is framed by closing the
+connection instead.
+
 NOTE: You need to call io.destroy to signal the end of the body, OR io.close to send the response.
 */
 response_writer_init :: proc(rw: ^Response_Writer, r: ^Response, buffer: []byte) -> io.Writer {
-	headers_set_unsafe(&r.headers, "transfer-encoding", "chunked")
+	line, has_line := r._conn.loop.req.line.?
+	rw.close_delimited = has_line && line.version.minor == 0
+	if rw.close_delimited {
+		headers_set_close(&r.headers)
+	} else {
+		headers_set_unsafe(&r.headers, "transfer-encoding", "chunked")
+	}
 	_response_write_heading(r, -1)
 
 	rw.buf = slice.into_dynamic(buffer)
@@ -118,23 +134,6 @@ response_writer_init :: proc(rw: ^Response_Writer, r: ^Response, buffer: []byte)
 
 	rw.w = io.Stream {
 		procedure = proc(stream_data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
-			ws :: bytes.buffer_write_string
-			write_chunk :: proc(b: ^bytes.Buffer, chunk: []byte) {
-				plen := i64(len(chunk))
-				if plen == 0 { return }
-
-				log.debugf("response_writer chunk of size: %i", plen)
-
-				bytes.buffer_grow(b, 16)
-				size_buf := _dynamic_unwritten(b.buf)
-				size := strconv.write_int(size_buf, plen, 16)
-				_dynamic_add_len(&b.buf, len(size))
-
-				ws(b, "\r\n")
-				bytes.buffer_write(b, chunk)
-				ws(b, "\r\n")
-			}
-
 			rw := (^Response_Writer)(stream_data)
 			b := &rw.r._buf
 
@@ -142,7 +141,7 @@ response_writer_init :: proc(rw: ^Response_Writer, r: ^Response, buffer: []byte)
 			case .Flush:
 				assert(!rw.ended)
 
-				write_chunk(b, rw.buf[:])
+				response_writer_chunk(rw, b, rw.buf[:])
 				clear(&rw.buf)
 				return 0, nil
 
@@ -150,23 +149,16 @@ response_writer_init :: proc(rw: ^Response_Writer, r: ^Response, buffer: []byte)
 				assert(!rw.ended)
 
 				// Write what is left.
-				write_chunk(b, rw.buf[:])
+				response_writer_chunk(rw, b, rw.buf[:])
 
-				// Signals the end of the body.
-				ws(b, "0\r\n\r\n")
-
-				rw.ended = true
+				response_writer_end(rw, b)
 				return 0, nil
 
 			case .Close:
 				// Write what is left.
-				write_chunk(b, rw.buf[:])
+				response_writer_chunk(rw, b, rw.buf[:])
 
-				if !rw.ended {
-					// Signals the end of the body.
-					ws(b, "0\r\n\r\n")
-					rw.ended = true
-				}
+				if !rw.ended { response_writer_end(rw, b) }
 
 				// Send the response.
 				respond(rw.r)
@@ -178,11 +170,11 @@ response_writer_init :: proc(rw: ^Response_Writer, r: ^Response, buffer: []byte)
 				// No space, first write rw.buf, then check again for space, if still no space,
 				// fully write the given p.
 				if len(rw.buf) + len(p) > cap(rw.buf) {
-					write_chunk(b, rw.buf[:])
+					response_writer_chunk(rw, b, rw.buf[:])
 					clear(&rw.buf)
 
 					if len(p) > cap(rw.buf) {
-						write_chunk(b, p)
+						response_writer_chunk(rw, b, p)
 					} else {
 						append(&rw.buf, ..p)
 					}
@@ -201,6 +193,30 @@ response_writer_init :: proc(rw: ^Response_Writer, r: ^Response, buffer: []byte)
 		data = rw,
 	}
 	return rw.w
+}
+
+// response_writer_chunk appends one piece of the body, framed as one chunk
+// (RFC 9112 7.1) unless the body is delimited by the connection closing.
+@(private)
+response_writer_chunk :: proc(rw: ^Response_Writer, b: ^bytes.Buffer, chunk: []byte) {
+	if len(chunk) == 0 { return }
+	if rw.close_delimited {
+		bytes.buffer_write(b, chunk)
+		return
+	}
+	size_buf: [16]byte
+	bytes.buffer_write_string(b, strconv.write_int(size_buf[:], i64(len(chunk)), 16))
+	bytes.buffer_write_string(b, "\r\n")
+	bytes.buffer_write(b, chunk)
+	bytes.buffer_write_string(b, "\r\n")
+}
+
+// response_writer_end ends the body: the last chunk and an empty trailer
+// section end a chunked one.
+@(private)
+response_writer_end :: proc(rw: ^Response_Writer, b: ^bytes.Buffer) {
+	if !rw.close_delimited { bytes.buffer_write_string(b, "0\r\n\r\n") }
+	rw.ended = true
 }
 
 /*
@@ -239,10 +255,11 @@ _response_write_heading :: proc(r: ^Response, content_length: int) {
 	ws(b, status_int_str)
 	ws(b, "\r\n")
 
-	// Per RFC 9910 6.6.1 a Date header must be added in 2xx, 3xx, 4xx responses.
-	if r.status >= .OK && r.status <= .Internal_Server_Error && !headers_has_unsafe(r.headers, "date") {
+	// RFC 9110 6.6.1: an origin server with a clock sends Date in every 2xx,
+	// 3xx, and 4xx response, and may in 1xx and 5xx ones.
+	if !status_is_informational(r.status) && !headers_has_unsafe(r.headers, "date") {
 		ws(b, "date: ")
-		ws(b, server_date(conn.server))
+		ws(b, server_date())
 		ws(b, "\r\n")
 	}
 
@@ -275,6 +292,7 @@ _response_write_heading :: proc(r: ^Response, content_length: int) {
 
 	// Empty line denotes end of headers and start of body.
 	ws(b, "\r\n")
+	r._head_len = bytes.buffer_length(b)
 }
 
 // Sends the response over the connection.
@@ -285,54 +303,35 @@ response_send :: proc(r: ^Response, conn: ^Connection, loc := #caller_location) 
 	assert(!r.sent, "response has already been sent", loc)
 	r.sent = true
 
-	check_body :: proc(res: rawptr, body: Body, err: Body_Error) {
-		res := cast(^Response)res
-		will_close: bool
-
-		if err != nil {
-			// Any read error should close the connection.
-			response_status(res, body_error_status(err))
-			headers_set_close(&res.headers)
-			will_close = true
-		}
-
-		response_send_got_body(res, will_close)
+	// RFC 9112 9.3: a server reads the entire request body or closes the
+	// connection after its response, or the unread rest would be taken for the
+	// next request. A body the handler left unread is not read here on its
+	// behalf, so the connection closes instead.
+	will_close := response_must_close(&conn.loop.req, r)
+	if !will_close && conn.loop.req._body_ok == nil && request_has_body(&conn.loop.req) {
+		headers_set_close(&r.headers)
+		will_close = true
 	}
-
-	// RFC 7230 6.3: A server MUST read
-	// the entire request message body or close the connection after sending
-	// its response, since otherwise the remaining data on a persistent
-	// connection would be misinterpreted as the next request.
-	if !response_must_close(&conn.loop.req, r) {
-
-		// Body has been drained during handling.
-		if _, got_body := conn.loop.req._body_ok.?; got_body {
-			response_send_got_body(r, false)
-		} else {
-			body(&conn.loop.req, Max_Post_Handler_Discard_Bytes, r, check_body)
-		}
-
-	} else {
-		response_send_got_body(r, true)
-	}
-}
-
-@(private)
-response_send_got_body :: proc(r: ^Response, will_close: bool) {
-	conn := r._conn
-
-	if will_close {
-		if !connection_set_state(r._conn, .Will_Close) { return }
-	}
+	if will_close && !connection_set_state(conn, .Will_Close) { return }
 
 	if bytes.buffer_length(&r._buf) == 0 {
 		_response_write_heading(r, 0)
 	}
-
 	buf := bytes.buffer_to_bytes(&r._buf)
+	if conn.loop.req.is_head { buf = buf[:r._head_len] }
 	nbio.send_poly(conn.socket, {buf}, conn, on_response_sent)
 }
 
+// request_has_body reports whether the request's framing says content follows
+// its header section (RFC 9112 6.3).
+@(private)
+request_has_body :: proc(req: ^Request) -> bool {
+	if headers_has_unsafe(req.headers, "transfer-encoding") { return true }
+	length, has_length := headers_get_unsafe(req.headers, "content-length")
+	if !has_length { return false }
+	size, valid := content_length_parse(length)
+	return !valid || size > 0
+}
 
 @(private)
 on_response_sent :: proc(op: ^nbio.Operation, conn: ^Connection) {
@@ -361,7 +360,7 @@ clean_request_loop :: proc(conn: ^Connection, close: Maybe(bool) = nil) {
 
 	conn.loop.res = {}
 
-	if c, ok := close.?; (ok && c) || conn.state == .Will_Close {
+	if c, ok := close.?; (ok && c) || conn.state == .Will_Close || atomic_load(&conn.server.closing) {
 		connection_close(conn)
 	} else {
 		if !connection_set_state(conn, .Idle) { return }
@@ -379,46 +378,43 @@ response_needs_content_length :: proc(r: ^Response, conn: ^Connection) -> bool {
 		return false
 	}
 
-	if status_is_success(r.status) {
-		line, _ := conn.loop.req.line.?
-		if line.method == .Connect {
-			return false
-		}
+	if line, has_line := conn.loop.req.line.?; has_line && status_is_success(r.status) && line.method == .Connect {
+		return false
 	}
 
 	return true
 }
 
-// Determines if the connection needs to be closed after sending the response.
+// response_must_close reports whether the connection closes after this
+// response, and states it in the response when the server decided it.
 @(private)
 response_must_close :: proc(req: ^Request, res: ^Response) -> bool {
-	// If the request we are responding to indicates it is closing the connection, close our side too.
-	if req, req_has := headers_get_unsafe(req.headers, "connection"); req_has && req == "close" {
+	// RFC 9112 9.6: a "close" connection option from either side ends the
+	// connection after this response. Connection is a list of case-insensitive
+	// options (RFC 9110 7.6.1).
+	if value, has := headers_get_unsafe(req.headers, "connection"); has && list_has_token(value, "close") {
+		return true
+	}
+	if value, has := headers_get_unsafe(res.headers, "connection"); has && list_has_token(value, "close") {
 		return true
 	}
 
-	// If we are responding with a close connection header, make sure we close.
-	if res, res_has := headers_get_unsafe(res.headers, "connection"); res_has && res == "close" {
-		return true
-	}
-
-	// If the body was tried to be received, but failed, close.
+	// A body that could not be read leaves the rest of the stream unframed.
 	if body_ok, got_body := req._body_ok.?; got_body && !body_ok {
 		headers_set_close(&res.headers)
 		return true
 	}
 
-	// If the connection's state indicates closing, close.
 	if res._conn.state >= .Will_Close {
 		headers_set_close(&res.headers)
 		return true
 	}
 
-	// HTTP 1.0 does not have persistent connections.
-	line := req.line.?
-	if line.version == {1, 0} {
+	// RFC 9112 9.3: an HTTP/1.0 connection persists only when the client asked
+	// with keep-alive, which this server does not offer.
+	if line, has_line := req.line.?; !has_line || line.version.minor == 0 {
+		headers_set_close(&res.headers)
 		return true
 	}
-
 	return false
 }

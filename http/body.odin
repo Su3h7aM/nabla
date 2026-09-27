@@ -13,13 +13,13 @@ Body_Callback :: #type proc(user_data: rawptr, body: Body, err: Body_Error)
 Body_Error :: bufio.Scanner_Error
 
 /*
-Retrieves the request's body.
+Retrieves the request's body, framed as RFC 9112 6.3 says: by the chunked
+transfer coding when it is the final one, otherwise by Content-Length, and as
+empty when the request has neither.
 
-If the request has the chunked Transfer-Encoding header set, the chunks are all read and returned.
-Otherwise, the Content-Length header is used to determine what to read and return it.
-
-`max_length` can be used to set a maximum amount of bytes we try to read, once it goes over this,
-an error is returned.
+`max_length` is the caller's bound on the body; a larger one is an error. A
+negative value reads whatever the request carries, since HTTP itself sets no
+limit (RFC 9110 5.4).
 
 Do not call this more than once.
 
@@ -28,8 +28,14 @@ Do not call this more than once.
 body :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb: Body_Callback) {
 	assert(req._body_ok == nil, "you can only call body once per request")
 
-	enc_header, ok := headers_get_unsafe(req.headers, "transfer-encoding")
-	if ok && strings.has_suffix(enc_header, "chunked") {
+	if coding, has_coding := headers_get_unsafe(req.headers, "transfer-encoding"); has_coding {
+		if !final_transfer_coding_is_chunked(coding) {
+			// The server answers such a request with 400 before a handler runs
+			// (RFC 9112 6.3 item 4), so this is only reached by misuse.
+			req._body_ok = false
+			cb(user_data, "", .Bad_Read_Count)
+			return
+		}
 		_body_chunked(req, max_length, user_data, cb)
 	} else {
 		_body_length(req, max_length, user_data, cb)
@@ -88,7 +94,7 @@ body_error_status :: proc(e: Body_Error) -> Status {
 	case bufio.Scanner_Extra_Error:
 		switch t {
 		case .Too_Long:
-			return .Payload_Too_Large
+			return .Content_Too_Large
 		case .Too_Short, .Bad_Read_Count:
 			return .Bad_Request
 		case .Negative_Advance, .Advanced_Too_Far:
@@ -133,13 +139,15 @@ body_error_status :: proc(e: Body_Error) -> Status {
 _body_length :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb: Body_Callback) {
 	req._body_ok = false
 
-	len, ok := headers_get_unsafe(req.headers, "content-length")
-	if !ok {
+	length_text, has_length := headers_get_unsafe(req.headers, "content-length")
+	if !has_length {
+		// Neither framing field: the request has no content (RFC 9112 6.3 item 7).
+		req._body_ok = true
 		cb(user_data, "", nil)
 		return
 	}
 
-	ilen, lenok := content_length_parse(len)
+	ilen, lenok := content_length_parse(length_text)
 	if !lenok {
 		cb(user_data, "", .Bad_Read_Count)
 		return
@@ -199,20 +207,13 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 
 	on_scan :: proc(s: rawptr, size_line: string, err: bufio.Scanner_Error) {
 		s := cast(^Chunked_State)s
-		size_line := size_line
 
 		if err != nil {
 			s.cb(s.user_data, "", err)
 			return
 		}
 
-		// If there is a semicolon, discard everything after it,
-		// that would be chunk extensions which we currently have no interest in.
-		if semi := strings.index_byte(size_line, ';'); semi > -1 {
-			size_line = size_line[:semi]
-		}
-
-		size, ok := chunk_size_parse(string(size_line))
+		size, ok := chunk_line_parse(size_line)
 		if !ok {
 			log.info("a chunked body declared an invalid chunk size")
 			s.cb(s.user_data, "", .Bad_Read_Count)
@@ -248,7 +249,7 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 			return
 		}
 
-		s.req._scanner.max_token_size = bufio.DEFAULT_MAX_SCAN_TOKEN_SIZE
+		s.req._scanner.max_token_size = 0
 		s.req._scanner.split = scan_lines
 
 		strings.write_string(&s.buf, token)
@@ -260,7 +261,11 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 				s.cb(s.user_data, "", err)
 				return
 			}
-			assert(len(token) == 0)
+			// chunk-data is followed by CRLF and nothing else (RFC 9112 7.1).
+			if len(token) != 0 {
+				s.cb(s.user_data, "", .Bad_Read_Count)
+				return
+			}
 
 			scanner_scan(s.req._scanner, s, on_scan)
 		}
@@ -271,15 +276,21 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 	on_scan_trailer :: proc(s: rawptr, line: string, err: bufio.Scanner_Error) {
 		s := cast(^Chunked_State)s
 
-		// Headers are done, success.
-		if err != nil || len(line) == 0 {
-			headers_delete_unsafe(&s.req.headers, "trailer")
-
-			te_header := headers_get_unsafe(s.req.headers, "transfer-encoding")
-			new_te_header := strings.trim_suffix(te_header, "chunked")
-
+		if err != nil {
+			s.cb(s.user_data, "", err)
+			return
+		}
+		// The empty line ends the trailer section and the message. RFC 9112
+		// 7.1.3: the decoded message no longer carries chunked or Trailer.
+		if len(line) == 0 {
 			s.req.headers.readonly = false
-			headers_set_unsafe(&s.req.headers, "transfer-encoding", new_te_header)
+			headers_delete_unsafe(&s.req.headers, "trailer")
+			coding := headers_get_unsafe(s.req.headers, "transfer-encoding")
+			if comma := strings.last_index_byte(coding, ','); comma >= 0 {
+				headers_set_unsafe(&s.req.headers, "transfer-encoding", trim_ows(coding[:comma]))
+			} else {
+				headers_delete_unsafe(&s.req.headers, "transfer-encoding")
+			}
 			s.req.headers.readonly = true
 
 			s.req._body_ok = true
@@ -287,17 +298,24 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 			return
 		}
 
-		key, ok := header_parse(&s.req.headers, string(line))
-		if !ok {
-			log.info("a chunked body carried an invalid header")
-			s.cb(s.user_data, "", .Unknown)
+		// A trailer field that may not be one is ignored (RFC 9110 6.5.1), and
+		// a field the header section already has is not merged into it.
+		colon := strings.index_byte(line, ':')
+		name := line[:max(colon, 0)]
+		if colon <= 0 || !token_valid(name) {
+			log.info("a chunked body carried an invalid trailer field")
+			s.cb(s.user_data, "", .Bad_Read_Count)
 			return
 		}
-
-		// A recipient MUST ignore (or consider as an error) any fields that are forbidden to be sent in a trailer.
-		if !header_allowed_trailer(key) {
-			log.info("a chunked body carried a trailer header this server discards")
-			headers_delete(&s.req.headers, key)
+		lower := sanitize_key(s.req.headers, name)
+		if header_allowed_trailer(lower) && !headers_has_unsafe(s.req.headers, lower) {
+			s.req.headers.readonly = false
+			_, ok := header_parse(&s.req.headers, line)
+			s.req.headers.readonly = true
+			if !ok {
+				s.cb(s.user_data, "", .Bad_Read_Count)
+				return
+			}
 		}
 
 		scanner_scan(s.req._scanner, s, on_scan_trailer)
