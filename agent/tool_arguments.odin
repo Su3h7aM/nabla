@@ -199,16 +199,22 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 		document = "{}"
 		repairs += {.Empty_Arguments}
 	}
-	if escaped, changed := tool_arguments_escape_control_chars(document, allocator); changed {
+	escaped, changed, escape_error := tool_arguments_escape_control_chars(document, allocator)
+	if escape_error != nil { arguments.allocation_failed = true; return }
+	if changed {
 		rewritten[0], document = escaped, escaped
 		repairs += {.Escaped_Control_Characters}
 	}
-	if inner, is_string := tool_arguments_string_document(document, allocator); is_string {
+	inner, is_string, unquote_error := tool_arguments_string_document(document, allocator)
+	if unquote_error != nil { arguments.allocation_failed = true; return }
+	if is_string {
 		rewritten[1], document = inner, inner
 		repairs += {.Double_Encoded_Object}
 		// Unquoting turns an escaped newline back into a raw one, which inside the inner
 		// document's own string literals is again a control byte with one reading.
-		if escaped, changed := tool_arguments_escape_control_chars(document, allocator); changed {
+		escaped, changed, escape_error = tool_arguments_escape_control_chars(document, allocator)
+		if escape_error != nil { arguments.allocation_failed = true; return }
+		if changed {
 			rewritten[2], document = escaped, escaped
 			repairs += {.Escaped_Control_Characters}
 		}
@@ -220,9 +226,10 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 	}
 	value, parse_err := json.parse_string(document, .JSON, true, allocator)
 	if parse_err != nil {
-		// Admission guarantees the parser accepts the document, so this is unreachable in
-		// practice; refusing is the only safe answer.
 		json.destroy_value(value, allocator)
+		if parse_err == .Out_Of_Memory { arguments.allocation_failed = true; return }
+		// Admission guarantees the parser accepts the document, so no other failure is
+		// reachable; refusing is the only safe answer.
 		arguments.error = tool_argument_error(.Syntax, allocator = allocator)
 		return
 	}
@@ -242,19 +249,20 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 // tool_arguments_string_document returns the content of a document that is one JSON string
 // holding what begins as an object, owned by allocator. Any other document is not one.
 @(private)
-tool_arguments_string_document :: proc(document: string, allocator: mem.Allocator) -> (inner: string, is_string: bool) {
+tool_arguments_string_document :: proc(document: string, allocator: mem.Allocator) -> (inner: string, is_string: bool, err: mem.Allocator_Error) {
 	tokenizer := json.make_tokenizer(document, .JSON, true)
 	token, token_err := json.get_token(&tokenizer)
-	if token_err != nil || token.kind != .String { return "", false }
+	if token_err != nil || token.kind != .String { return "", false, nil }
 	end, end_err := json.get_token(&tokenizer)
-	if (end_err != nil && end_err != .EOF) || end.kind != .EOF { return "", false }
+	if (end_err != nil && end_err != .EOF) || end.kind != .EOF { return "", false, nil }
 	text, unquote_err := json.unquote_string(token, .JSON, allocator)
-	if unquote_err != nil { return "", false }
+	if unquote_err == .Out_Of_Memory { return "", false, .Out_Of_Memory }
+	if unquote_err != nil { return "", false, nil }
 	if !strings.has_prefix(strings.trim_left_space(text), "{") {
 		delete(text, allocator)
-		return "", false
+		return "", false, nil
 	}
-	return text, true
+	return text, true, nil
 }
 
 // tool_repairs_text names a set of repairs in declaration order, joined by commas.
@@ -395,54 +403,57 @@ tool_admit_value :: proc(tokenizer: ^json.Tokenizer, token: json.Token, depth: i
 	return tool_document_error(.Syntax, tokenizer.data, token)
 }
 
-// tool_arguments_escape_control_chars rewrites raw control bytes inside JSON
-// string literals as their escape sequences. It accepts only input whose escape
-// sequences already follow the JSON rules, so it never chooses between two
-// readings of a backslash. It reports unchanged when the input needs no repair,
-// and yields no repair at all when an escape is invalid or the escaped form
-// would exceed the argument budget.
-tool_arguments_escape_control_chars :: proc(raw: string, allocator := context.allocator) -> (repaired: string, changed: bool) {
-	builder := strings.builder_make(allocator)
-	defer if !changed { strings.builder_destroy(&builder) }
+// tool_arguments_escape_control_chars rewrites raw control bytes inside JSON string literals
+// as their escape sequences, owned by allocator. It accepts only input whose escape
+// sequences already follow the JSON rules, so it never chooses between two readings of a
+// backslash. changed is false when the input needs no repair or has an invalid escape.
+@(private)
+tool_arguments_escape_control_chars :: proc(raw: string, allocator: mem.Allocator) -> (repaired: string, changed: bool, err: mem.Allocator_Error) {
+	size, escapes, valid := tool_escape_walk(raw, nil)
+	if !valid || escapes == 0 { return "", false, nil }
+	output := make([]u8, size, allocator) or_return
+	tool_escape_walk(raw, output)
+	return string(output), true, nil
+}
 
+// tool_escape_walk measures raw with every control byte inside a string literal escaped,
+// and writes that form into output when output is not nil. output must hold size bytes.
+// valid is false when an escape sequence in raw breaks the JSON rules.
+@(private)
+tool_escape_walk :: proc(raw: string, output: []u8) -> (size: int, escapes: int, valid: bool) {
 	in_string := false
-	i := 0
-	for i < len(raw) {
-		c := raw[i]
-		if !in_string {
-			if c == '"' { in_string = true }
-			strings.write_byte(&builder, c)
-			i += 1
-		} else if c == '\\' {
-			if i + 1 >= len(raw) { return "", false }
-			esc := raw[i + 1]
-			if !tool_escape_valid(esc) { return "", false }
-			strings.write_byte(&builder, c)
-			strings.write_byte(&builder, esc)
-			i += 2
-			if esc == 'u' {
-				if i + 4 > len(raw) { return "", false }
-				for k in 0 ..< 4 {
-					if !tool_hex_digit(raw[i + k]) { return "", false }
-				}
-				strings.write_string(&builder, raw[i:i + 4])
-				i += 4
-			}
-		} else if c == '"' {
+	index := 0
+	for index < len(raw) {
+		current := raw[index]
+		span := raw[index:index + 1]
+		switch {
+		case !in_string:
+			in_string = current == '"'
+		case current == '"':
 			in_string = false
-			strings.write_byte(&builder, c)
-			i += 1
-		} else if c < 0x20 {
-			tool_write_control_escape(&builder, c)
-			changed = true
-			i += 1
-		} else {
-			strings.write_byte(&builder, c)
-			i += 1
+		case current == '\\':
+			if index + 1 >= len(raw) || !tool_escape_valid(raw[index + 1]) { return 0, 0, false }
+			span = raw[index:index + 2]
+			if raw[index + 1] == 'u' {
+				if index + 6 > len(raw) { return 0, 0, false }
+				for digit in transmute([]u8)raw[index + 2:index + 6] {
+					if !tool_hex_digit(digit) { return 0, 0, false }
+				}
+				span = raw[index:index + 6]
+			}
+		case current < 0x20:
+			escape, length := tool_control_escape(current)
+			if output != nil { copy(output[size:], escape[:length]) }
+			size += length
+			escapes += 1
+			index += 1
+			continue
 		}
+		if output != nil { copy(output[size:], span) }
+		size += len(span)
+		index += len(span)
 	}
-	if !changed { return "", false }
-	return strings.to_string(builder), true
+	return size, escapes, true
 }
 
 @(private)
@@ -459,34 +470,29 @@ tool_hex_digit :: proc(c: u8) -> bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
+// tool_control_escape is the JSON escape of one control byte: its short form where JSON has
+// one, and \u00XX otherwise.
 @(private)
-tool_write_control_escape :: proc(builder: ^strings.Builder, c: u8) {
-	switch c {
+tool_control_escape :: proc(control: u8) -> (escape: [6]u8, length: int) {
+	hex_digits := "0123456789abcdef"
+	escape[0] = '\\'
+	switch control {
 	case 0x08:
-		strings.write_string(builder, `\b`)
-		return
+		escape[1] = 'b'
 	case 0x09:
-		strings.write_string(builder, `\t`)
-		return
+		escape[1] = 't'
 	case 0x0A:
-		strings.write_string(builder, `\n`)
-		return
+		escape[1] = 'n'
 	case 0x0C:
-		strings.write_string(builder, `\f`)
-		return
+		escape[1] = 'f'
 	case 0x0D:
-		strings.write_string(builder, `\r`)
-		return
+		escape[1] = 'r'
+	case:
+		escape[1], escape[2], escape[3] = 'u', '0', '0'
+		escape[4], escape[5] = hex_digits[control >> 4], hex_digits[control & 0x0F]
+		return escape, 6
 	}
-	strings.write_string(builder, `\u00`)
-	strings.write_byte(builder, tool_hex_char(c >> 4))
-	strings.write_byte(builder, tool_hex_char(c & 0x0F))
-}
-
-@(private)
-tool_hex_char :: proc(value: u8) -> u8 {
-	if value < 10 { return '0' + value }
-	return 'a' + (value - 10)
+	return escape, 2
 }
 
 // --- reading fields ----------------------------------------------------------

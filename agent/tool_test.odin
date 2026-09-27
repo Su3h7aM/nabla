@@ -132,6 +132,7 @@ test_admission_repairs_only_what_has_one_reading :: proc(t: ^testing.T) {
 		repairs:   session.Tool_Repairs,
 	} {
 		{"{\"command\":\"printf a\nb\"}", `{"command":"printf a\nb"}`, {.Escaped_Control_Characters}},
+		{"{\"command\":\"a\x01\tb\\u00e9\"}", `{"command":"a\u0001\tb\u00e9"}`, {.Escaped_Control_Characters}},
 		{"", `{}`, {.Empty_Arguments}},
 		{" null ", `{}`, {.Empty_Arguments}},
 		{`"{\"command\":\"echo\"}"`, `{"command":"echo"}`, {.Double_Encoded_Object}},
