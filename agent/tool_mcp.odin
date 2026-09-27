@@ -1,9 +1,7 @@
 package agent
 
 import "base:runtime"
-import "core:encoding/json"
 import "core:fmt"
-import "core:strings"
 import "core:time"
 
 import "nabla:agent/session"
@@ -39,6 +37,7 @@ mcp_tool_definition :: proc(name: string, tool: mcp.Tool, backend: ^MCP_Tool_Bac
 		input_schema = tool.input_schema,
 		hints = mcp_tool_hints(tool.annotations),
 		timeout = timeout,
+		kind = .MCP,
 		execute = tool_mcp_execute,
 		backend = backend,
 	}
@@ -70,13 +69,11 @@ mcp_hint :: proc(hint: mcp.Hint) -> Tool_Hint_Value {
 	return .Unknown
 }
 
-// tool_mcp_execute runs one adapted call. It is the only executor every MCP
-// definition shares, which is what lets a definition carry a backend binding instead
-// of a procedure of its own.
-tool_mcp_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (result: Tool_Result) {
-	// The arguments are already admitted and the object is already parsed; what
-	// travels is the admitted text, so the peer and the dispatch record agree.
-	_ = arguments
+// tool_mcp_execute runs one adapted call. It is the only executor every MCP definition
+// shares, which is what lets a definition carry a backend binding instead of a procedure of
+// its own. An MCP server validates its own tool's arguments, so they are not read here: what
+// travels to the peer is the admitted text, so the peer and the dispatch record agree.
+tool_mcp_execute :: proc(ctx: ^Tool_Context, _: Tool_Args) -> (result: Tool_Result) {
 	backend := cast(^MCP_Tool_Backend)ctx.backend
 	started := time.tick_now()
 	exchange_error: mcp.Error
@@ -133,25 +130,10 @@ tool_mcp_interrupted :: proc(user_data: rawptr) -> bool {
 
 // --- results -----------------------------------------------------------------
 
-// Tool_MCP_Data is what an MCP result looks like to the model. Text blocks carry
-// their text; every other block carries a line saying what was returned and why it
-// is not shown, because a binary payload would consume the context to no purpose.
-Tool_MCP_Data :: struct {
-	content:            []Tool_MCP_Block `json:"content"`,
-	structured_content: string `json:"structured_content"`,
-	truncated:          bool `json:"truncated"`,
-}
-
-Tool_MCP_Block :: struct {
-	type:   string `json:"type"`,
-	text:   string `json:"text"`,
-	detail: string `json:"detail"`,
-}
-
 @(private)
 tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_Result {
-	// The omitted-block details and the message are built in temp memory and
-	// encoded into the result before this returns.
+	// The blocks and their details are built in temp memory and copied into the result
+	// before this returns.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	if call.input_required {
 		// No sampling, elicitation, or roots capability is declared, so a server
@@ -164,10 +146,9 @@ tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_
 		return tool_result_failure(ctx, .Tool_Failed, message, "input required")
 	}
 
-	blocks := make([dynamic]Tool_MCP_Block, 0, len(call.content), ctx.allocator)
-	defer delete(blocks)
+	blocks := make([dynamic]MCP_Block, 0, len(call.content), context.temp_allocator)
 	for content in call.content {
-		block := Tool_MCP_Block {
+		block := MCP_Block {
 			type = content.type_name,
 		}
 		if content.kind == .Text {
@@ -189,15 +170,12 @@ tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_
 		message = "the result was longer than the harness shows"
 	}
 
-	data := Tool_MCP_Data {
-		content   = blocks[:],
-		truncated = call.truncated,
+	output := MCP_Output {
+		truncated          = call.truncated,
+		content            = blocks[:],
+		structured_content = call.structured_json,
 	}
-	// The structured half is spliced in as the JSON value the server sent rather
-	// than as a string, so a model reading it sees an object.
-	value := tool_mcp_data_json(ctx, data, call.structured_json)
-	defer json.destroy_value(json.Value(value), ctx.allocator)
-	return tool_result_of(ctx, outcome, message, value, reason)
+	return tool_result_of(ctx, outcome, message, output, reason)
 }
 
 // tool_mcp_omitted_detail says what a block the harness does not show was. The type
@@ -219,33 +197,6 @@ tool_mcp_omitted_detail :: proc(content: mcp.Content, allocator := context.alloc
 		return fmt.aprintf("%s content is not shown", content.type_name, allocator = allocator)
 	}
 	return ""
-}
-
-// tool_mcp_data_json builds the result data as a JSON object, so the structured half
-// can be spliced in as the value the server sent instead of as an escaped string.
-@(private)
-tool_mcp_data_json :: proc(ctx: ^Tool_Context, data: Tool_MCP_Data, structured_json: string) -> json.Object {
-	object := make(json.Object, 3, ctx.allocator)
-	blocks := make(json.Array, 0, len(data.content), ctx.allocator)
-	for block in data.content {
-		entry := make(json.Object, 3, ctx.allocator)
-		entry[strings.clone("type", ctx.allocator)] = json.String(strings.clone(block.type, ctx.allocator))
-		if block.text != "" {
-			entry[strings.clone("text", ctx.allocator)] = json.String(strings.clone(block.text, ctx.allocator))
-		}
-		if block.detail != "" {
-			entry[strings.clone("detail", ctx.allocator)] = json.String(strings.clone(block.detail, ctx.allocator))
-		}
-		append(&blocks, json.Value(entry))
-	}
-	object[strings.clone("content", ctx.allocator)] = json.Value(blocks)
-	object[strings.clone("truncated", ctx.allocator)] = json.Boolean(data.truncated)
-	if structured_json != "" {
-		if value, parse_err := json.parse_string(structured_json, .JSON, true, ctx.allocator); parse_err == nil {
-			object[strings.clone("structured_content", ctx.allocator)] = value
-		}
-	}
-	return object
 }
 
 // tool_mcp_error_result reports a call that delivered no usable result.

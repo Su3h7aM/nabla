@@ -177,37 +177,35 @@ test_shell_runs_a_command_and_reports_what_it_did :: proc(t: ^testing.T) {
 
 	result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"printf hello"}`)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(result.content, `"status":"success"`), "the envelope names the outcome")
-	testing.expect(t, strings.contains(result.content, `"stdout":"hello"`), "the output reaches the model")
-	testing.expect(t, strings.contains(result.content, `"exit_code":0`), "the exit code is reported")
+	testing.expect(t, strings.contains(result.content, "ok\n"), "the result names the outcome")
+	testing.expect(t, strings.contains(result.content, "stdout:\nhello\n"), "the output reaches the model")
+	testing.expect(t, strings.contains(result.content, `exit_code: 0`), "the exit code is reported")
 
 	failed := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"exit 3"}`)
 	testing.expect_value(t, failed.outcome, session.Tool_Outcome.Tool_Failed)
-	testing.expect(t, strings.contains(failed.content, `"exit_code":3`), "a nonzero exit is still reported")
+	testing.expect(t, strings.contains(failed.content, `exit_code: 3`), "a nonzero exit is still reported")
 
 	outside := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"pwd","working_directory":"/tmp"}`)
 	testing.expect_value(t, outside.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(outside.content, `"stdout":"/tmp\n"`), "an absolute working directory is used as given")
+	testing.expect(t, strings.contains(outside.content, "stdout:\n/tmp\n"), "an absolute working directory is used as given")
 }
 
 @(test)
-test_shell_refuses_arguments_after_recording_the_dispatch :: proc(t: ^testing.T) {
+test_shell_refuses_arguments_before_dispatch :: proc(t: ^testing.T) {
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 
 	result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":""}`)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
-	testing.expect(t, strings.contains(result.content, `"kind":"invalid_value"`), "the refusal names its kind")
+	testing.expect(t, strings.contains(result.content, `kind: invalid_value`), "the refusal names its kind")
 
 	entries := _test_entries(t, &test.fixture.chat)
 	defer session.entries_destroy(entries, context.allocator)
-	// The dispatch preserves the effective arguments before execution. The
-	// invalid-arguments outcome records that the tool performed no effect.
-	if !testing.expect_value(t, len(entries), 4) { return }
+	// Invalid arguments are answered without dispatching an executor.
+	if !testing.expect_value(t, len(entries), 3) { return }
 	testing.expect_value(t, entries[1].kind, session.Entry_Kind.Tool_Call)
-	testing.expect_value(t, entries[2].kind, session.Entry_Kind.Tool_Dispatch)
-	testing.expect_value(t, entries[3].kind, session.Entry_Kind.Tool_Result)
+	testing.expect_value(t, entries[2].kind, session.Entry_Kind.Tool_Result)
 }
 
 @(test)
@@ -223,8 +221,8 @@ test_read_reports_the_lines_it_returned :: proc(t: ^testing.T) {
 	arguments := strings.concatenate({`{"path":"`, path, `","offset":2,"limit":2}`}, context.temp_allocator)
 	result := tool_run(t, &test, TOOL_READ_NAME, arguments)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(result.content, `"content":"two\nthree\n"`), "the requested lines are returned")
-	testing.expect(t, strings.contains(result.content, `"total_lines":4`), "the file's line count is reported")
+	testing.expect(t, strings.contains(result.content, "\n\ntwo\nthree\n"), "the requested lines are returned")
+	testing.expect(t, strings.contains(result.content, `total_lines: 4`), "the file's line count is reported")
 
 	missing := tool_run(t, &test, TOOL_READ_NAME, `{"path":"gone.txt"}`)
 	testing.expect_value(t, missing.outcome, session.Tool_Outcome.Tool_Failed)
@@ -245,14 +243,14 @@ test_read_refuses_a_file_that_is_not_text :: proc(t: ^testing.T) {
 	if !tool_write_file(t, nul, "one\x00two\n") { return }
 	nul_arguments := strings.concatenate({`{"path":"`, nul, `"}`}, context.temp_allocator)
 	nul_result := tool_run(t, &test, TOOL_READ_NAME, nul_arguments)
-	tool_test_envelope_matches(t, nul_result.content, .Tool_Failed, fmt.tprintf("%s is not a text file", nul))
+	tool_test_result_matches(t, nul_result.content, .Tool_Failed, fmt.tprintf("%s is not a text file", nul))
 
 	stray := strings.concatenate({tool_test_workspace(&test), "/stray.bin"}, context.temp_allocator)
 	defer delete(stray, context.temp_allocator)
 	if !tool_write_file(t, stray, "good \xff\xfe bad \xc3\n") { return }
 	stray_arguments := strings.concatenate({`{"path":"`, stray, `"}`}, context.temp_allocator)
 	stray_result := tool_run(t, &test, TOOL_READ_NAME, stray_arguments)
-	tool_test_envelope_matches(t, stray_result.content, .Tool_Failed, fmt.tprintf("%s is not a text file", stray))
+	tool_test_result_matches(t, stray_result.content, .Tool_Failed, fmt.tprintf("%s is not a text file", stray))
 
 	// Text outside ASCII is valid UTF-8 and is returned as written.
 	text := strings.concatenate({tool_test_workspace(&test), "/text.txt"}, context.temp_allocator)
@@ -331,7 +329,7 @@ test_every_native_tool_is_registered_complete :: proc(t: ^testing.T) {
 
 // tool_test_dummy_execute stands in for an executor where only registration
 // matters. Nothing runs through it.
-tool_test_dummy_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+tool_test_dummy_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	return tool_result_failure(ctx, .Tool_Failed, "dummy", "dummy")
 }
 
@@ -505,82 +503,36 @@ test_registry_refuses_name_collisions :: proc(t: ^testing.T) {
 
 // --- result finalization -------------------------------------------------------
 
-// tool_test_envelope_matches parses a stored result and checks the contract
-// finalization guarantees: a bounded object with a matching status, a message,
-// and a data value.
-tool_test_envelope_matches :: proc(t: ^testing.T, content: string, outcome: session.Tool_Outcome, message: string) -> bool {
-	if len(content) > TOOL_MAX_RESULT_BYTES { return testing.expect(t, false, "the envelope exceeds the result budget") }
-	value, parse_error := json.parse_string(content, .JSON, true, context.temp_allocator)
-	if parse_error != nil { return testing.expect(t, false, "the envelope is not valid JSON") }
-	defer json.destroy_value(value, context.temp_allocator)
-	object, is_object := value.(json.Object)
-	if !is_object { return testing.expect(t, false, "the envelope root is not an object") }
-	status, status_ok := object["status"].(json.String)
-	if !status_ok || string(status) != session.tool_outcome_name(outcome) {
-		return testing.expect(t, false, "the envelope status does not match the outcome")
-	}
-	text, message_ok := object["message"].(json.String)
-	if !message_ok || string(text) != message {
-		return testing.expect(t, false, "the envelope message is not what was expected")
-	}
-	if "data" not_in object { return testing.expect(t, false, "the envelope carries no data") }
-	return true
+// tool_test_result_matches checks the outcome line a stored result starts with.
+tool_test_result_matches :: proc(t: ^testing.T, content: string, outcome: session.Tool_Outcome, message: string) -> bool {
+	expected, err := tool_result_render(outcome, message, nil, context.temp_allocator)
+	if !testing.expect_value(t, err, nil) { return false }
+	return testing.expect(t, strings.has_prefix(content, expected), content)
 }
 
-tool_test_finalize_case :: proc(t: ^testing.T, outcome: session.Tool_Outcome, content: string, message: string) {
+// Finalization is the last step before storage: a result that fits passes through untouched,
+// while one over the limit keeps the outcome the harness observed and says it was replaced.
+@(test)
+test_result_finalize_replaces_only_what_is_too_large :: proc(t: ^testing.T) {
 	ctx := Tool_Context {
 		call_id   = "call_1",
 		allocator = context.allocator,
 	}
-	result := Tool_Result {
-		call_id   = strings.clone("call_1", context.allocator),
-		outcome   = outcome,
-		reason    = strings.clone("test", context.allocator),
-		content   = strings.clone(content, context.allocator),
-		allocator = context.allocator,
-	}
-	finalized := tool_result_finalize(&ctx, result)
-	defer tool_result_destroy(&finalized)
-	testing.expect_value(t, finalized.outcome, outcome)
-	tool_test_envelope_matches(t, finalized.content, outcome, message)
-}
 
-// A valid result passes finalization untouched.
-@(test)
-test_result_finalize_keeps_valid_results :: proc(t: ^testing.T) {
-	ctx := Tool_Context {
-		call_id   = "call_1",
-		allocator = context.allocator,
-	}
-	valid := tool_result_success(&ctx, Tool_Empty{}, "done")
-	original := strings.clone(valid.content, context.allocator)
-	defer delete(original, context.allocator)
-	finalized := tool_result_finalize(&ctx, valid)
-	defer tool_result_destroy(&finalized)
-	testing.expect_value(t, finalized.outcome, session.Tool_Outcome.Success)
-	testing.expect_value(t, finalized.content, original)
-}
+	small := tool_result_success(&ctx, nil, "done")
+	small_content := small.content
+	finalized_small := tool_result_finalize(&ctx, small)
+	defer tool_result_destroy(&finalized_small)
+	testing.expect_value(t, finalized_small.outcome, session.Tool_Outcome.Success)
+	testing.expect_value(t, finalized_small.content, small_content)
 
-// A contract violation is replaced with a valid envelope that preserves the
-// observed outcome.
-@(test)
-test_result_finalize_replaces_contract_violations :: proc(t: ^testing.T) {
-	tool_test_finalize_case(t, .Success, "", TOOL_RESULT_REPLACED_MALFORMED)
-	tool_test_finalize_case(t, .Success, "[1,2]", TOOL_RESULT_REPLACED_MALFORMED)
-	tool_test_finalize_case(t, .Success, "not json", TOOL_RESULT_REPLACED_MALFORMED)
-	tool_test_finalize_case(t, .Success, `{"status":"tool_failed","message":"x","data":{}}`, TOOL_RESULT_REPLACED_MALFORMED)
-	tool_test_finalize_case(t, .Success, `{"status":"success","message":"x"}`, TOOL_RESULT_REPLACED_MALFORMED)
-	// A JSON5 escape is not JSON. The parser stops at one without complaining, so a result
-	// that carries an invalid UTF-8 byte has to be rejected before it is read.
-	tool_test_finalize_case(t, .Success, `{"status":"success","message":"x","data":{"text":"a\xffb"}}`, TOOL_RESULT_REPLACED_MALFORMED)
-	tool_test_finalize_case(t, .Tool_Failed, strings.repeat("a", TOOL_MAX_RESULT_BYTES + 1, context.temp_allocator), TOOL_RESULT_REPLACED_OVERSIZED)
-	// A well-formed refusal envelope is valid and passes through.
-	tool_test_finalize_case(
-		t,
-		.Invalid_Arguments,
-		`{"status":"invalid_arguments","message":"missing required field \"path\"","data":{"kind":"missing_field","field":"path","expected":""}}`,
-		`missing required field "path"`,
-	)
+	// Finalization takes the result it is given, so only what it hands back is released.
+	oversized := tool_result_success(&ctx, Read_Output{content = strings.repeat("x", TOOL_MAX_RESULT_BYTES, context.temp_allocator)}, "too large")
+	finalized_oversized := tool_result_finalize(&ctx, oversized)
+	defer tool_result_destroy(&finalized_oversized)
+	testing.expect_value(t, finalized_oversized.outcome, session.Tool_Outcome.Success)
+	testing.expect(t, strings.contains(finalized_oversized.content, TOOL_RESULT_REPLACED_OVERSIZED), finalized_oversized.content)
+	testing.expect(t, len(finalized_oversized.content) <= TOOL_MAX_RESULT_BYTES, "a replaced result fits the limit")
 }
 
 @(test)
@@ -597,14 +549,7 @@ test_read_reports_single_line_byte_truncation :: proc(t: ^testing.T) {
 
 	result := tool_run(t, &test, TOOL_READ_NAME, `{"path":"long.txt"}`)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-	value, parse_error := json.parse_string(result.content, .JSON, true, context.temp_allocator)
-	if parse_error != nil { testing.fail_now(t, "the result is not valid JSON") }
-	defer json.destroy_value(value, context.temp_allocator)
-	data, data_ok := value.(json.Object)["data"].(json.Object)
-	if !testing.expect(t, data_ok, "the result carries data") { return }
-	truncated, truncated_ok := data["truncated"].(json.Boolean)
-	if !testing.expect(t, truncated_ok, "the result reports truncation") { return }
-	testing.expect(t, bool(truncated), "a byte-truncated line must report truncation")
+	testing.expect(t, strings.contains(result.content, "truncated: true\n"), "a byte-truncated line must report truncation")
 }
 
 // --- timeout policy ------------------------------------------------------------
@@ -661,7 +606,7 @@ test_write_cancelled_before_begin_leaves_no_file :: proc(t: ^testing.T) {
 	defer tool_arguments_destroy(&arguments, context.allocator)
 	object, is_object := arguments.value.(json.Object)
 	if !testing.expect(t, is_object, "the arguments should parse") { return }
-	result := tool_write_execute(&ctx, object)
+	result := tool_test_execute(&ctx, TOOL_WRITE_DEFINITION, object)
 	defer tool_result_destroy(&result)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Cancelled)
 	full := strings.concatenate({workspace, "/cancelled.txt"}, context.temp_allocator)
@@ -685,7 +630,7 @@ test_edit_cancelled_before_rename_keeps_destination :: proc(t: ^testing.T) {
 	defer tool_arguments_destroy(&arguments, context.allocator)
 	object, is_object := arguments.value.(json.Object)
 	if !testing.expect(t, is_object, "the arguments should parse") { return }
-	result := tool_edit_execute(&ctx, object)
+	result := tool_test_execute(&ctx, TOOL_EDIT_DEFINITION, object)
 	defer tool_result_destroy(&result)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Cancelled)
 	tool_file_is(t, path, "alpha\n")
@@ -741,19 +686,19 @@ test_replace_tools_swaps_only_while_idle :: proc(t: ^testing.T) {
 
 // --- recovery ----------------------------------------------------------------
 
-// The recovery results are constants so recovery allocates nothing. A drift
-// between them and the encoder would put a shape into an old session that no
-// current request produces, so they are held to it here.
+// The recovery results are constants so recovery allocates nothing. A drift between them and
+// the renderer would put text into a recovered session that no other result looks like, so
+// they are held to it here.
 @(test)
-test_recovery_envelopes_match_the_encoder :: proc(t: ^testing.T) {
+test_recovery_results_match_the_renderer :: proc(t: ^testing.T) {
 	ctx := Tool_Context {
 		allocator = context.temp_allocator,
 	}
-	recovered := tool_result_of(&ctx, .Unknown, TOOL_RECOVERED_MESSAGE, Tool_Empty{})
+	recovered := tool_result_of(&ctx, .Unknown, TOOL_RECOVERED_MESSAGE, nil)
 	defer tool_result_destroy(&recovered)
 	testing.expect_value(t, recovered.content, TOOL_RECOVERED_RESULT)
 
-	unexecuted := tool_result_of(&ctx, .Not_Executed, TOOL_UNEXECUTED_MESSAGE, Tool_Empty{})
+	unexecuted := tool_result_of(&ctx, .Not_Executed, TOOL_UNEXECUTED_MESSAGE, nil)
 	defer tool_result_destroy(&unexecuted)
 	testing.expect_value(t, unexecuted.content, TOOL_UNEXECUTED_RESULT)
 }
@@ -780,4 +725,13 @@ tool_file_is :: proc(t: ^testing.T, path, expected: string) -> bool {
 	}
 	defer delete(data, context.temp_allocator)
 	return testing.expectf(t, string(data) == expected, "%s holds %q, not %q", path, string(data), expected)
+}
+
+// Exercise the provider adapter before calling a typed executor.
+tool_test_execute :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object: json.Object) -> Tool_Result {
+	args, err := tool_args_decode(ctx, definition.kind, object)
+	defer tool_args_destroy(&args, ctx.allocator)
+	defer tool_argument_error_destroy(&err, ctx.allocator)
+	if err.kind != .None { return tool_result_refused(ctx, &err) }
+	return definition.execute(ctx, args)
 }

@@ -232,7 +232,7 @@ test_shell_spawn_is_safe_with_running_threads :: proc(t: ^testing.T) {
 			workspace = workspace,
 			allocator = context.temp_allocator,
 		}
-		result := tool_shell_execute(&ctx, object)
+		result := tool_test_execute(&ctx, Tool_Definition{kind = .Shell, execute = tool_shell_execute}, object)
 		ok_iteration := result.outcome == .Success && strings.contains(result.content, "child-ok")
 		if !ok_iteration {
 			testing.expectf(t, false, "iteration %d produced %v %q", iteration, result.outcome, result.content)

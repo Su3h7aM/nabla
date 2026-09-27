@@ -29,32 +29,15 @@ TOOL_RESULT_READ_DEFINITION :: Tool_Definition {
 	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
 	// Reading a kept result reads the session's store, which belongs to the owner.
 	placement = .Owner,
+	kind = .Result_Read,
 	execute = tool_result_read_execute,
 }
 
 @(private)
 TOOL_RESULT_READ_FIELDS := []string{"call_seq", "offset", "limit"}
 
-// Tool_Result_Read_Args is the read tool's own view of a call. The defaults live here
-// rather than at the call site, so the schema and the executor agree.
-Tool_Result_Read_Args :: struct {
-	call_seq: int,
-	offset:   int,
-	limit:    int,
-}
-
-// Tool_Result_Read_Page is what one read returns: the bytes, where the next read
-// starts, and whether this read reached the end. bytes is the whole kept result, so
-// the model can tell how much there is without reading it all.
-Tool_Result_Read_Page :: struct {
-	text:        string `json:"text"`,
-	next_offset: int `json:"next_offset"`,
-	eof:         bool `json:"eof"`,
-	bytes:       int `json:"bytes"`,
-}
-
 @(private)
-tool_result_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_Result_Read_Args, Tool_Argument_Error) {
+tool_result_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Result_Read_Args, Tool_Argument_Error) {
 	if known_error := tool_fields_known(arguments, TOOL_RESULT_READ_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
 	call_seq, call_seq_error := tool_field_int(arguments, "call_seq", 1, max(int), allocator = ctx.allocator)
 	if call_seq_error.kind != .None { return {}, call_seq_error }
@@ -62,12 +45,12 @@ tool_result_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (To
 	if offset_error.kind != .None { return {}, offset_error }
 	limit, limit_error := tool_field_optional_int(arguments, "limit", TOOL_RESULT_READ_MAX_BYTES, 1, TOOL_RESULT_READ_MAX_BYTES, allocator = ctx.allocator)
 	if limit_error.kind != .None { return {}, limit_error }
-	return Tool_Result_Read_Args{call_seq = call_seq, offset = offset, limit = limit}, {}
+	return Result_Read_Args{call_seq = call_seq, offset = offset, limit = limit}, {}
 }
 
 // tool_result_read_page slices one page out of a kept result. It walks the end back to
 // a character boundary, because half a character is not a string the encoder can send.
-tool_result_read_page :: proc(content: string, offset, limit: int) -> Tool_Result_Read_Page {
+tool_result_read_page :: proc(content: string, offset, limit: int) -> Result_Read_Output {
 	total := len(content)
 	if offset >= total { return {next_offset = total, eof = true, bytes = total} }
 	end := min(offset + limit, total)
@@ -75,10 +58,8 @@ tool_result_read_page :: proc(content: string, offset, limit: int) -> Tool_Resul
 	return {text = content[offset:end], next_offset = end, eof = end >= total, bytes = total}
 }
 
-tool_result_read_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
-	args, args_error := tool_result_read_args(ctx, arguments)
-	defer if args_error.kind != .None { tool_argument_error_destroy(&args_error, ctx.allocator) }
-	if args_error.kind != .None { return tool_result_refused(ctx, &args_error) }
+tool_result_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	args := arguments.(Result_Read_Args)
 	if ctx.results == nil { return tool_result_failure(ctx, .Unavailable, "tool results cannot be read in this session", "unavailable") }
 
 	entry, found, read_err := session.tool_result_read(ctx.results.store, ctx.results.session_id, session.Seq(args.call_seq), ctx.allocator)

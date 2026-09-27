@@ -246,8 +246,8 @@ return true
 	logs := code_mode_lua_logs(run)
 	testing.expect(t, strings.has_prefix(logs, "hello 42\n"), "print should capture strings and numbers")
 	testing.expect(t, strings.contains(logs, "\n{}\n"), "an empty table should print as an empty object")
-	testing.expect(t, strings.contains(logs, `{"nested":[1,2]}`), "a table should print as its JSON form")
-	testing.expect(t, strings.contains(logs, "\n<table>\n"), "a table JSON cannot hold should be named")
+	testing.expect(t, strings.contains(logs, `{nested = {1, 2}}`), "a table should print as a Lua literal")
+	testing.expect(t, strings.contains(logs, "\n<table>\n"), "an unsupported table should be named")
 	testing.expect(t, len(logs) <= LUA_MAX_LOG_BYTES, "the log should stay inside its budget")
 	testing.expect(t, code_mode_lua_logs_truncated(run), "the oversized line should mark the log truncated")
 }

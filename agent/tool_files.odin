@@ -26,33 +26,17 @@ TOOL_READ_MAX_LINES :: 20000
 TOOL_READ_MAX_BYTES :: 48 * 1024
 TOOL_READ_MAX_FILE_BYTES :: 8 * 1024 * 1024
 
-Read_Data :: struct {
-	path:        string `json:"path"`,
-	content:     string `json:"content"`,
-	first_line:  int `json:"first_line"`,
-	line_count:  int `json:"line_count"`,
-	total_lines: int `json:"total_lines"`,
-	truncated:   bool `json:"truncated"`,
-}
-
 TOOL_READ_DEFINITION :: Tool_Definition {
 	name = TOOL_READ_NAME,
 	description = TOOL_READ_DESCRIPTION,
 	input_schema = TOOL_READ_SCHEMA,
 	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
+	kind = .Read,
 	execute = tool_read_execute,
 }
 
-// Tool_Read_Args is the read tool's own view of a call. path borrows the
-// argument document.
-Tool_Read_Args :: struct {
-	path:   string,
-	offset: int,
-	limit:  int,
-}
-
 // tool_read_args reads the read tool's arguments.
-tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_Read_Args, Tool_Argument_Error) {
+tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Read_Args, Tool_Argument_Error) {
 	if known_error := tool_fields_known(arguments, TOOL_READ_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
 	path, path_error := tool_field_string(arguments, "path", allocator = ctx.allocator)
 	if path_error.kind != .None { return {}, path_error }
@@ -60,13 +44,11 @@ tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_Read
 	if offset_error.kind != .None { return {}, offset_error }
 	limit, limit_error := tool_field_optional_int(arguments, "limit", TOOL_READ_DEFAULT_LINES, 1, TOOL_READ_MAX_LINES, allocator = ctx.allocator)
 	if limit_error.kind != .None { return {}, limit_error }
-	return Tool_Read_Args{path = path, offset = offset, limit = limit}, {}
+	return Read_Args{path = path, offset = offset, limit = limit}, {}
 }
 
-tool_read_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
-	args, args_error := tool_read_args(ctx, arguments)
-	defer if args_error.kind != .None { tool_argument_error_destroy(&args_error, ctx.allocator) }
-	if args_error.kind != .None { return tool_result_refused(ctx, &args_error) }
+tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	args := arguments.(Read_Args)
 
 	path, resolve_error := tool_resolve_path(ctx.workspace, args.path, allocator = ctx.allocator)
 	if resolve_error.kind != .None { return tool_result_refused(ctx, &resolve_error) }
@@ -101,10 +83,8 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Re
 	}
 
 	text := string(data)
-	// A result is JSON, and JSON is UTF-8. A file whose bytes are not valid UTF-8 is not
-	// text the model can be handed: the encoder escapes such a byte as JSON5, which is not
-	// JSON, and a reader that silently received a prefix would not know it had. A NUL is
-	// refused for the same reason, so the two checks sit together.
+	// Only text is handed to the model: a provider request carries UTF-8, and a reader
+	// that silently received a prefix would not know it had. A NUL marks a binary file.
 	if strings.index_byte(text, 0) >= 0 || !utf8.valid_string(text) {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("%s is not a text file", args.path), "binary")
 	}
@@ -119,7 +99,7 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Re
 	byte_truncated := len(content) > TOOL_READ_MAX_BYTES
 	if byte_truncated { content = tool_truncate_runes(content, TOOL_READ_MAX_BYTES) }
 
-	result := Read_Data {
+	result := Read_Output {
 		path        = args.path,
 		content     = content,
 		first_line  = args.offset,
@@ -186,11 +166,6 @@ TOOL_WRITE_SCHEMA :: `{"type":"object","properties":{"path":{"type":"string","de
 
 TOOL_WRITE_FIELDS :: []string{"path", "content"}
 
-Write_Data :: struct {
-	path:  string `json:"path"`,
-	bytes: int `json:"bytes"`,
-}
-
 TOOL_WRITE_DEFINITION :: Tool_Definition {
 	name = TOOL_WRITE_NAME,
 	description = TOOL_WRITE_DESCRIPTION,
@@ -198,27 +173,21 @@ TOOL_WRITE_DEFINITION :: Tool_Definition {
 	// Rewriting identical content reaches the same file, so a repeated call
 	// with identical arguments is idempotent.
 	hints = {read_only = .No, destructive = .Yes, idempotent = .Yes, open_world = .No},
+	kind = .Write,
 	execute = tool_write_execute,
 }
 
-Tool_Write_Args :: struct {
-	path:    string,
-	content: string,
-}
-
-tool_write_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_Write_Args, Tool_Argument_Error) {
+tool_write_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Write_Args, Tool_Argument_Error) {
 	if known_error := tool_fields_known(arguments, TOOL_WRITE_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
 	path, path_error := tool_field_string(arguments, "path", allocator = ctx.allocator)
 	if path_error.kind != .None { return {}, path_error }
 	content, content_error := tool_field_string(arguments, "content", allocator = ctx.allocator)
 	if content_error.kind != .None { return {}, content_error }
-	return Tool_Write_Args{path = path, content = content}, {}
+	return Write_Args{path = path, content = content}, {}
 }
 
-tool_write_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
-	args, args_error := tool_write_args(ctx, arguments)
-	defer if args_error.kind != .None { tool_argument_error_destroy(&args_error, ctx.allocator) }
-	if args_error.kind != .None { return tool_result_refused(ctx, &args_error) }
+tool_write_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	args := arguments.(Write_Args)
 
 	path, resolve_error := tool_resolve_path(ctx.workspace, args.path, allocator = ctx.allocator)
 	if resolve_error.kind != .None { return tool_result_refused(ctx, &resolve_error) }
@@ -236,7 +205,7 @@ tool_write_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 	} else if write_error != nil {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("could not write %s: %s", args.path, os.error_string(write_error)), "write failed")
 	}
-	return tool_result_success(ctx, Write_Data{path = args.path, bytes = len(args.content)}, fmt.tprintf("wrote %d bytes", len(args.content)))
+	return tool_result_success(ctx, Write_Output{path = args.path, bytes = len(args.content)}, fmt.tprintf("wrote %d bytes", len(args.content)))
 }
 
 // Tool_Path_Problem is the kind of reason a write tool refused a path before
@@ -360,11 +329,6 @@ TOOL_EDIT_ITEM_FIELDS :: []string{"old", "new"}
 TOOL_EDIT_MAX_REPLACEMENTS :: 64
 TOOL_EDIT_MAX_FILE_BYTES :: 8 * 1024 * 1024
 
-Edit_Data :: struct {
-	path:         string `json:"path"`,
-	replacements: int `json:"replacements"`,
-}
-
 Tool_Replacement :: struct {
 	old: string,
 	new: string,
@@ -384,40 +348,50 @@ TOOL_EDIT_DEFINITION :: Tool_Definition {
 	// A repeated edit finds different text: the first call consumed the match
 	// the second one looks for, so identical arguments do not repeat the effect.
 	hints = {read_only = .No, destructive = .Yes, idempotent = .No, open_world = .No},
+	kind = .Edit,
 	execute = tool_edit_execute,
 }
 
-tool_edit_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+tool_edit_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Edit_Args, Tool_Argument_Error) {
 	if fields_error := tool_fields_known(arguments, TOOL_EDIT_FIELDS, allocator = ctx.allocator); fields_error.kind != .None {
-		return tool_result_refused(ctx, &fields_error)
+		return {}, fields_error
 	}
 	path_argument, path_error := tool_field_string(arguments, "path", allocator = ctx.allocator)
-	if path_error.kind != .None { return tool_result_refused(ctx, &path_error) }
+	if path_error.kind != .None { return {}, path_error }
 	edits_value, edits_error := tool_field_array(arguments, "edits", 1, TOOL_EDIT_MAX_REPLACEMENTS, allocator = ctx.allocator)
-	if edits_error.kind != .None { return tool_result_refused(ctx, &edits_error) }
+	if edits_error.kind != .None { return {}, edits_error }
 
 	replacements := make([]Tool_Replacement, len(edits_value), ctx.allocator)
-	defer delete(replacements, ctx.allocator)
+	complete := false
+	defer if !complete { delete(replacements, ctx.allocator) }
 	for value, index in edits_value {
 		item_path := fmt.tprintf("edits/%d", index)
 		item, item_error := tool_field_object(value, item_path, ctx.allocator)
-		if item_error.kind != .None { return tool_result_refused(ctx, &item_error) }
+		if item_error.kind != .None { return {}, item_error }
 		if fields_error := tool_fields_known(item, TOOL_EDIT_ITEM_FIELDS, item_path, ctx.allocator); fields_error.kind != .None {
-			return tool_result_refused(ctx, &fields_error)
+			return {}, fields_error
 		}
 		old, old_error := tool_field_string(item, "old", item_path, ctx.allocator)
-		if old_error.kind != .None { return tool_result_refused(ctx, &old_error) }
+		if old_error.kind != .None { return {}, old_error }
 		if old == "" {
 			empty := tool_argument_error(.Invalid_Value, fmt.tprintf("%s/old", item_path), "text to find", ctx.allocator)
-			return tool_result_refused(ctx, &empty)
+			return {}, empty
 		}
 		fresh, fresh_error := tool_field_string(item, "new", item_path, ctx.allocator)
-		if fresh_error.kind != .None { return tool_result_refused(ctx, &fresh_error) }
+		if fresh_error.kind != .None { return {}, fresh_error }
 		replacements[index] = Tool_Replacement {
 			old = old,
 			new = fresh,
 		}
 	}
+
+	complete = true
+	return {path = path_argument, edits = replacements}, {}
+}
+
+tool_edit_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	args := arguments.(Edit_Args)
+	path_argument, replacements := args.path, args.edits
 
 	path, resolve_error := tool_resolve_path(ctx.workspace, path_argument, allocator = ctx.allocator)
 	if resolve_error.kind != .None { return tool_result_refused(ctx, &resolve_error) }
@@ -501,5 +475,5 @@ tool_edit_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Re
 	} else if write_error != nil {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("could not write %s: %s", path_argument, os.error_string(write_error)), "write failed")
 	}
-	return tool_result_success(ctx, Edit_Data{path = path_argument, replacements = len(matches)}, fmt.tprintf("%d replacements", len(matches)))
+	return tool_result_success(ctx, Edit_Output{path = path_argument, replacements = len(matches)}, fmt.tprintf("%d replacements", len(matches)))
 }

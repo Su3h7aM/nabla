@@ -94,7 +94,7 @@ shell_run_serve :: proc(thread: ^thread.Thread) {
 		run.result = tool_result_failure(&ctx, .Invalid_Arguments, "the test arguments did not parse")
 		return
 	}
-	run.result = tool_shell_execute(&ctx, object)
+	run.result = tool_test_execute(&ctx, Tool_Definition{kind = .Shell, execute = tool_shell_execute}, object)
 }
 
 shell_run_join :: proc(run: ^Shell_Run) {
@@ -146,7 +146,7 @@ test_shell_timeout_applies_after_pipes_close :: proc(t: ^testing.T) {
 		allocator = allocator,
 	}
 	started := time.tick_now()
-	result := tool_shell_execute(&ctx, object)
+	result := tool_test_execute(&ctx, Tool_Definition{kind = .Shell, execute = tool_shell_execute}, object)
 	defer tool_result_destroy(&result)
 	elapsed := time.tick_since(started)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Timed_Out)

@@ -21,32 +21,12 @@ TOOL_LOAD_SKILL_DESCRIPTION :: "Load one skill's complete instructions by name. 
 TOOL_LOAD_SKILL_SCHEMA :: `{"type":"object","properties":{"name":{"type":"string","description":"The skill name from the catalog."}},"required":["name"],"additionalProperties":false}`
 TOOL_LOAD_SKILL_FIELDS :: []string{"name"}
 
-List_Skills_Record :: struct {
-	name:        string `json:"name"`,
-	description: string `json:"description"`,
-	source:      string `json:"source"`,
-}
-
-List_Skills_Data :: struct {
-	skills:        []List_Skills_Record `json:"skills"`,
-	total_matches: int `json:"total_matches"`,
-	next_offset:   Maybe(int) `json:"next_offset"`,
-}
-
-Load_Skill_Data :: struct {
-	name:           string `json:"name"`,
-	path:           string `json:"path"`,
-	directory:      string `json:"directory"`,
-	content_digest: string `json:"content_digest"`,
-	complete:       bool `json:"complete"`,
-	instructions:   string `json:"instructions"`,
-}
-
 TOOL_LIST_SKILLS_DEFINITION :: Tool_Definition {
 	name = TOOL_LIST_SKILLS_NAME,
 	description = TOOL_LIST_SKILLS_DESCRIPTION,
 	input_schema = TOOL_LIST_SKILLS_SCHEMA,
 	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
+	kind = .List_Skills,
 	execute = tool_list_skills_execute,
 }
 
@@ -55,19 +35,26 @@ TOOL_LOAD_SKILL_DEFINITION :: Tool_Definition {
 	description = TOOL_LOAD_SKILL_DESCRIPTION,
 	input_schema = TOOL_LOAD_SKILL_SCHEMA,
 	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
+	kind = .Load_Skill,
 	execute = tool_load_skill_execute,
 }
 
-tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+tool_list_skills_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (List_Skills_Args, Tool_Argument_Error) {
 	if known_error := tool_fields_known(arguments, TOOL_LIST_SKILLS_FIELDS, allocator = ctx.allocator); known_error.kind != .None {
-		return tool_result_refused(ctx, &known_error)
+		return {}, known_error
 	}
 	query, query_error := tool_field_optional_string(arguments, "query", allocator = ctx.allocator)
-	if query_error.kind != .None { return tool_result_refused(ctx, &query_error) }
+	if query_error.kind != .None { return {}, query_error }
 	offset, offset_error := tool_field_optional_int(arguments, "offset", 0, 0, max(int) / 2, allocator = ctx.allocator)
-	if offset_error.kind != .None { return tool_result_refused(ctx, &offset_error) }
+	if offset_error.kind != .None { return {}, offset_error }
 	limit, limit_error := tool_field_optional_int(arguments, "limit", TOOL_LIST_SKILLS_DEFAULT_LIMIT, 1, TOOL_LIST_SKILLS_MAX_LIMIT, allocator = ctx.allocator)
-	if limit_error.kind != .None { return tool_result_refused(ctx, &limit_error) }
+	if limit_error.kind != .None { return {}, limit_error }
+	return {query = query, offset = offset, limit = limit}, {}
+}
+
+tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	args := arguments.(List_Skills_Args)
+	query, offset, limit := args.query, args.offset, args.limit
 	if ctx.skills == nil {
 		return tool_result_failure(ctx, .Unavailable, "skills are unavailable in this session", "unavailable")
 	}
@@ -88,12 +75,12 @@ tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> 
 		page_end := len(matches)
 		if offset <= len(matches) && page_limit <= len(matches) - offset { page_end = offset + page_limit }
 		page := matches[offset:page_end] if offset <= len(matches) else matches[len(matches):]
-		records := make([]List_Skills_Record, len(page), ctx.allocator)
+		records := make([]Skill_Record, len(page), ctx.allocator)
 		if len(page) > 0 && records == nil {
 			return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be built", "too large")
 		}
 		for match, index in page {
-			records[index] = List_Skills_Record {
+			records[index] = Skill_Record {
 				name        = match.name,
 				description = match.description,
 				source      = skill_source_label(ctx.skills, match^),
@@ -101,17 +88,13 @@ tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> 
 		}
 		next_offset: Maybe(int)
 		if page_end < len(matches) { next_offset = page_end }
-		data := List_Skills_Data {
+		data := Skills_Output {
 			skills        = records,
 			total_matches = len(matches),
 			next_offset   = next_offset,
 		}
 		result := tool_result_success(ctx, data, fmt.tprintf("%d of %d skills", len(records), len(matches)))
 		delete(records, ctx.allocator)
-		if result.content == "" {
-			tool_result_destroy(&result)
-			return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be encoded", "encoding failed")
-		}
 		if len(result.content) <= TOOL_MAX_RESULT_BYTES { return result }
 		tool_result_destroy(&result)
 		if page_limit <= 1 {
@@ -121,12 +104,18 @@ tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> 
 	}
 }
 
-tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+tool_load_skill_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Load_Skill_Args, Tool_Argument_Error) {
 	if known_error := tool_fields_known(arguments, TOOL_LOAD_SKILL_FIELDS, allocator = ctx.allocator); known_error.kind != .None {
-		return tool_result_refused(ctx, &known_error)
+		return {}, known_error
 	}
 	name, name_error := tool_field_string(arguments, "name", allocator = ctx.allocator)
-	if name_error.kind != .None { return tool_result_refused(ctx, &name_error) }
+	if name_error.kind != .None { return {}, name_error }
+	return {name = name}, {}
+}
+
+tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	args := arguments.(Load_Skill_Args)
+	name := args.name
 	if ctx.skills == nil {
 		return tool_result_failure(ctx, .Unavailable, "skills are unavailable in this session", "unavailable")
 	}
@@ -155,19 +144,14 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> T
 	primary, primary_error := skill_primary_path(skill, ctx.allocator)
 	if primary_error != nil { return tool_result_failure(ctx, .Tool_Failed, "the skill path could not be allocated", "encoding failed") }
 	defer delete(primary, ctx.allocator)
-	data := Load_Skill_Data {
+	data := Skill_Output {
 		name           = skill.name,
 		path           = primary,
 		directory      = skill.directory,
 		content_digest = digest,
-		complete       = true,
 		instructions   = loaded.body,
 	}
 	result := tool_result_success(ctx, data, fmt.tprintf("loaded skill %s", skill.name))
-	if result.content == "" {
-		tool_result_destroy(&result)
-		return tool_result_failure(ctx, .Tool_Failed, "the skill result could not be encoded", "encoding failed")
-	}
 	// A single body has no smaller page to shrink to, so an oversized skill is
 	// an explicit bounded failure until pagination or another deliberate design
 	// exists. It must not bypass the global result budget.

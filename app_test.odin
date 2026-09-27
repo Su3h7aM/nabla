@@ -256,13 +256,13 @@ test_stopping_refuses_queued_work :: proc(t: ^testing.T) {
 	testing.expect(t, !more, "nothing may be accepted after the runtime stops")
 }
 
-// A tool box shows what the call produced, not the envelope the model reads: the
-// preview is taken from the result's data and its JSON escapes are decoded.
+// A tool box shows what the call produced, not the outcome line the model reads first: the
+// preview is the body of the rendered result.
 @(test)
-test_tool_display_preview_extracts_and_decodes_shell_output :: proc(t: ^testing.T) {
-	content := `{"status":"success","message":"done","data":{"stdout":"first\nsecond\n","stderr":""}}`
-	testing.expect_value(t, tool_display_preview(content), "first\nsecond\n")
-	testing.expect_value(t, tool_entry_text("builtin_shell", content, "success"), "builtin_shell\nfirst\nsecond\n")
+test_tool_display_preview_shows_the_result_body :: proc(t: ^testing.T) {
+	content := "ok\nexit_code: 3\n\nstdout:\nfirst\nsecond\n"
+	testing.expect_value(t, tool_display_preview(content), "stdout:\nfirst\nsecond\n")
+	testing.expect_value(t, tool_entry_text("builtin_shell", content, "success"), "builtin_shell\nstdout:\nfirst\nsecond\n")
 }
 
 // A scheduled retry is what the working indicator shows, and the send that follows is what

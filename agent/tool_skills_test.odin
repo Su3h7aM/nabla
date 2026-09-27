@@ -61,12 +61,12 @@ test_list_and_load_skills_round_trip :: proc(t: ^testing.T) {
 	}
 	list_arguments := tool_skills_arguments(t, `{}`)
 	defer json.destroy_value(list_arguments, context.allocator)
-	list_result := tool_list_skills_execute(&list_ctx, list_arguments)
+	list_result := tool_test_execute(&list_ctx, TOOL_LIST_SKILLS_DEFINITION, list_arguments)
 	defer tool_result_destroy(&list_result)
 	testing.expect_value(t, list_result.outcome, session.Tool_Outcome.Success)
 	testing.expect(t, len(list_result.content) > 0)
-	testing.expect(t, strings.contains(list_result.content, `"total_matches":2`))
-	testing.expect(t, strings.contains(list_result.content, `"name":"git"`))
+	testing.expect(t, strings.contains(list_result.content, `total_matches: 2`))
+	testing.expect(t, strings.contains(list_result.content, `name: git`))
 	testing.expect(t, strings.contains(list_result.content, `Work with pdf`))
 
 	page_ctx := Tool_Context {
@@ -77,11 +77,11 @@ test_list_and_load_skills_round_trip :: proc(t: ^testing.T) {
 	}
 	page_arguments := tool_skills_arguments(t, `{"offset":5}`)
 	defer json.destroy_value(page_arguments, context.allocator)
-	page_result := tool_list_skills_execute(&page_ctx, page_arguments)
+	page_result := tool_test_execute(&page_ctx, TOOL_LIST_SKILLS_DEFINITION, page_arguments)
 	defer tool_result_destroy(&page_result)
 	testing.expect_value(t, page_result.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(page_result.content, `"total_matches":2`))
-	testing.expect(t, strings.contains(page_result.content, `"skills":[]`))
+	testing.expect(t, strings.contains(page_result.content, `total_matches: 2`))
+	testing.expect(t, tool_result_body(page_result.content) == "")
 
 	unknown_ctx := Tool_Context {
 		call_id   = "call_1-unknown",
@@ -91,7 +91,7 @@ test_list_and_load_skills_round_trip :: proc(t: ^testing.T) {
 	}
 	unknown_arguments := tool_skills_arguments(t, `{"name":"missing"}`)
 	defer json.destroy_value(unknown_arguments, context.allocator)
-	unknown_result := tool_load_skill_execute(&unknown_ctx, unknown_arguments)
+	unknown_result := tool_test_execute(&unknown_ctx, TOOL_LOAD_SKILL_DEFINITION, unknown_arguments)
 	defer tool_result_destroy(&unknown_result)
 	testing.expect_value(t, unknown_result.outcome, session.Tool_Outcome.Tool_Failed)
 
@@ -103,9 +103,9 @@ test_list_and_load_skills_round_trip :: proc(t: ^testing.T) {
 	}
 	load_arguments := tool_skills_arguments(t, `{"name":"pdf"}`)
 	defer json.destroy_value(load_arguments, context.allocator)
-	load_result := tool_load_skill_execute(&load_ctx, load_arguments)
+	load_result := tool_test_execute(&load_ctx, TOOL_LOAD_SKILL_DEFINITION, load_arguments)
 	defer tool_result_destroy(&load_result)
 	testing.expect_value(t, load_result.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(load_result.content, `"complete":true`))
+	testing.expect_value(t, tool_result_body(load_result.content), load_result.output.(Skill_Output).instructions)
 	testing.expect(t, strings.contains(load_result.content, `# pdf`))
 }

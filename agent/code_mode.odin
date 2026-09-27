@@ -1,52 +1,23 @@
 package agent
 
-import "core:encoding/json"
 
 import "nabla:agent/session"
 
 TOOL_CODE_NAME :: "builtin_code"
-TOOL_CODE_DESCRIPTION :: "Execute Lua 5.4 code. Call an available tool through the tools table by its name, for example tools.builtin_read({path = 'README.md'}). Each call suspends the script until the tool finishes and returns its complete JSON result envelope as a Lua table. Use json.null for JSON null, because Lua nil means absence. The chunk returns at most one value, which becomes the data field of this result."
+TOOL_CODE_DESCRIPTION :: "Execute Lua 5.4 code. Call an available tool through the tools table by its name, for example tools.builtin_read({path = 'README.md'}). Each call suspends the script until the tool finishes and returns a table with outcome, message, and the tool's output fields. Use json.null for JSON null, because Lua nil means absence. The chunk returns at most one value, which this result shows as a Lua literal."
 TOOL_CODE_SCHEMA :: `{"type":"object","properties":{"code":{"type":"string","description":"Lua 5.4 source code to execute."}},"required":["code"],"additionalProperties":false}`
-
-// Code_Mode_Call is one tool call a script made, as the script's result reports it. It is
-// a summary, never the child's output: a model that wants the output reads it back from
-// call_seq with context_read_result, so a script that ran a hundred calls does not put a
-// hundred results into the conversation.
-Code_Mode_Call :: struct {
-	call_seq: i64 `json:"call_seq"`,
-	name:     string `json:"name"`,
-	outcome:  string `json:"outcome"`,
-}
+TOOL_CODE_FIELDS :: []string{"code"}
 
 // CODE_MODE_MAX_CALL_SUMMARIES bounds how many child summaries a result carries. The
 // count is reported separately, so a truncated list still says how much a script did.
 CODE_MODE_MAX_CALL_SUMMARIES :: 32
 
-// Code_Mode_Result_Data is the data of an execution that finished. output is the
-// chunk's return value as JSON, so a script may answer with an object or an array as
-// easily as with a string. logs is what print produced, bounded by the Lua boundary.
-// calls is what the script's tool calls were.
-Code_Mode_Result_Data :: struct {
-	output:         json.Value `json:"output"`,
-	logs:           string `json:"logs"`,
-	logs_truncated: bool `json:"logs_truncated,omitempty"`,
-	calls:          []Code_Mode_Call `json:"calls,omitempty"`,
-	calls_total:    int `json:"calls_total,omitempty"`,
-}
-
-// Code_Mode_Error_Data is the data of an execution that failed. kind names why, so a
-// caller can branch on the failure instead of reading prose. The call summaries are kept
-// on failure too: what a script did before it failed is how the failure is understood.
-Code_Mode_Error_Data :: struct {
-	kind:        string `json:"kind"`,
-	calls:       []Code_Mode_Call `json:"calls,omitempty"`,
-	calls_total: int `json:"calls_total,omitempty"`,
-}
-
 // Code_Mode_Diagnostic is why an execution did not finish. It is a closed vocabulary
-// that lives inside the ordinary result envelope, not a second stored outcome: the
+// that lives inside the ordinary result, not a second stored outcome: the
 // outer Tool_Outcome still says whether anything ran.
 Code_Mode_Diagnostic :: enum {
+	// None is the zero value: an execution that finished without a fault.
+	None,
 	Syntax_Error,
 	Runtime_Error,
 	Invalid_Value,
@@ -58,6 +29,7 @@ Code_Mode_Diagnostic :: enum {
 
 @(private)
 code_mode_diagnostic_names := [Code_Mode_Diagnostic]string {
+	.None          = "",
 	.Syntax_Error  = "syntax_error",
 	.Runtime_Error = "runtime_error",
 	.Invalid_Value = "invalid_value",
@@ -71,10 +43,10 @@ code_mode_diagnostic_name :: proc(diagnostic: Code_Mode_Diagnostic) -> string {
 	return code_mode_diagnostic_names[diagnostic]
 }
 
-// code_mode_failure builds a Code Mode failure envelope. The outcome says what the
+// code_mode_failure builds a Code Mode failure result. The outcome says what the
 // harness observed; the diagnostic says which limit or fault Code Mode hit.
 code_mode_failure :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, diagnostic: Code_Mode_Diagnostic, message: string, reason := "") -> Tool_Result {
-	return tool_result_of(ctx, outcome, message, Code_Mode_Error_Data{kind = code_mode_diagnostic_name(diagnostic)}, reason)
+	return tool_result_of(ctx, outcome, message, Code_Output{failure = code_mode_diagnostic_name(diagnostic)}, reason)
 }
 
 TOOL_CODE_DEFINITION :: Tool_Definition {
@@ -85,10 +57,11 @@ TOOL_CODE_DEFINITION :: Tool_Definition {
 	placement = .Lua,
 	// Lua jobs are driven by the owner through the job table. The procedure is a
 	// registry invariant and a defensive fallback, not their execution path.
+	kind = .Code,
 	execute = tool_code_unreachable,
 }
 
 @(private)
-tool_code_unreachable :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+tool_code_unreachable :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	return code_mode_failure(ctx, .Tool_Failed, .Unavailable, "the Code Mode executor was not available", "executor unavailable")
 }

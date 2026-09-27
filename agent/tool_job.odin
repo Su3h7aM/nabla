@@ -112,65 +112,70 @@ Lua_Call_Summary :: struct {
 // Tool_Job is one admitted call.
 Tool_Job :: struct {
 	// identity, owned by the table and stable for the job's life
-	id:               u64,
-	turn_id:          u64,
-	ordinal:          int, // submission order, which is the order results are recorded in
-	call:             ^Chat_Tool_Call, // borrowed: the session's staged calls outlive the batch
-	name:             string, // owned by allocator
-	call_id:          string, // owned by allocator
+	id:              u64,
+	turn_id:         u64,
+	ordinal:         int, // submission order, which is the order results are recorded in
+	call:            ^Chat_Tool_Call, // borrowed: the session's staged calls outlive the batch
+	name:            string, // owned by allocator
+	call_id:         string, // owned by allocator
 
 	// placement
-	placement:        Tool_Placement,
-	lane:             rawptr, // borrowed backend identity; nil is the shared native lane
-	execute:          Tool_Execute,
+	placement:       Tool_Placement,
+	lane:            rawptr, // borrowed backend identity; nil is the shared native lane
+	execute:         Tool_Execute,
 
 	// Lua execution data. A nested call is embedded in its child job so the call
 	// pointer stays stable when the table grows. lua_calls is what the parent reports
 	// about the children it ran: the owner appends one entry as each child commits, and
 	// the parent's result carries them so a model can audit a script and reach one
 	// child's full result by its sequence.
-	lua:              ^Lua_Run,
-	lua_dispatched:   bool,
-	lua_child_no:     int,
-	lua_child:        ^Tool_Job,
-	lua_child_result: string, // owned by allocator until delivered
-	lua_calls:        [dynamic]Lua_Call_Summary,
-	lua_calls_total:  int,
-	parent:           ^Tool_Job,
-	nested_call:      Chat_Tool_Call,
-	nested:           bool,
+	lua:             ^Lua_Run,
+	lua_dispatched:  bool,
+	lua_child_no:    int,
+	lua_child:       ^Tool_Job,
+	lua_child_ready: bool, // the child's result is on the coroutine stack, awaiting resume
+	lua_calls:       [dynamic]Lua_Call_Summary,
+	lua_calls_total: int,
+	parent:          ^Tool_Job,
+	nested_call:     Chat_Tool_Call,
+	nested:          bool,
 
 	// execution data, owned by allocator, which is a thread-safe heap
-	allocator:        mem.Allocator,
-	arguments:        Tool_Arguments,
-	exec:             Tool_Context, // what the executor is given, for the job's whole life
-	logging:          Log_Binding, // the worker's correlation, captured at admission
+	allocator:       mem.Allocator,
+	// admitted is the document the call was admitted from: a provider call is admitted here
+	// from the text it arrived as, while a Lua child call arrives admitted, because its value
+	// came from Lua rather than from a provider document. arguments is the typed call the
+	// executor receives, read out of that document once.
+	admitted:        Tool_Arguments,
+	arguments:       Tool_Args,
+	exec:            Tool_Context, // what the executor is given, for the job's whole life
+	logging:         Log_Binding, // the worker's correlation, captured at admission
 
 	// control
-	phase:            Tool_Job_Phase,
-	interrupt:        ai.Interrupt, // this job's own stop token
+	phase:           Tool_Job_Phase,
+	interrupt:       ai.Interrupt, // this job's own stop token
 	// wake is a worker job's stop pipe: the owner signals it with the stop request,
 	// which wakes a worker sleeping in poll, and closes it when it releases the job.
-	wake:             Tool_Wake,
+	wake:            Tool_Wake,
 	// published is atomic. The worker sets it after writing result, and the owner reads result
 	// only after seeing it.
-	published:        bool,
+	published:       bool,
 	// launched says a worker thread runs this call; otherwise the job is the owner's alone.
-	launched:         bool,
+	launched:        bool,
 	// thread is created and destroyed by the owner, after the worker published.
-	thread:           ^thread.Thread,
+	thread:          ^thread.Thread,
 	// stopping and stop_at are the owner's observation that this job should have stopped and
 	// when that was first seen, which is what the stop patience is measured from.
-	stopping:         bool,
-	stop_at:          time.Tick,
+	stopping:        bool,
+	stop_at:         time.Tick,
 
 	// outcome
-	result:           Tool_Result,
-	result_present:   bool,
-	committed:        bool,
+	result:          Tool_Result,
+	result_present:  bool,
+	committed:       bool,
 	// recorded_seq is the entry this job's result was recorded as. It is the
 	// committed reference a later reader names, such as a Code Mode handle.
-	recorded_seq:     session.Seq,
+	recorded_seq:    session.Seq,
 }
 
 // Tool_Jobs is one batch's table. Only the owner reads and writes it.
@@ -237,14 +242,14 @@ tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) -> (escaped: bool) {
 tool_job_release :: proc(job: ^Tool_Job) {
 	if job.lua != nil { code_mode_lua_destroy(job.lua) }
 	delete(job.lua_calls)
-	delete(job.lua_child_result, job.allocator)
 	if job.nested {
 		delete(job.nested_call.id, job.allocator)
 		delete(job.nested_call.item_id, job.allocator)
 		delete(job.nested_call.name, job.allocator)
 		delete(job.nested_call.arguments, job.allocator)
 	}
-	tool_arguments_destroy(&job.arguments, job.allocator)
+	tool_args_destroy(&job.arguments, job.allocator)
+	tool_arguments_destroy(&job.admitted, job.allocator)
 	if job.result_present { tool_result_destroy(&job.result) }
 	tool_wake_close(&job.wake)
 	delete(job.name, job.allocator)
@@ -396,39 +401,50 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		job.exec.results = &jobs.render
 	}
 
-	job.arguments = tool_arguments_prepare(job.call.arguments, job.allocator)
+	// A provider call is admitted here, from the text it arrived as. A Lua child call arrives
+	// admitted, because its value came from Lua and was checked where it was read.
+	if job.admitted.status == .None { job.admitted = tool_arguments_prepare(job.call.arguments, job.allocator) }
 	prepared := [4]Log_Field {
 		{key = "tool", value = job.name},
-		{key = "status", value = tool_arguments_status_name(job.arguments.status)},
-		{key = "repair", value = session.tool_repair_name(job.arguments.repair)},
-		{key = "effective_bytes", value = i64(len(job.arguments.effective))},
+		{key = "status", value = tool_arguments_status_name(job.admitted.status)},
+		{key = "repair", value = session.tool_repair_name(job.admitted.repair)},
+		{key = "effective_bytes", value = i64(len(job.admitted.effective))},
 	}
 	log_emit({level = .Debug, category = .Tool, event = "tool.arguments_prepared", fields = prepared[:]})
 
-	if job.arguments.allocation_failed {
+	if job.admitted.allocation_failed {
 		job.result = tool_result_failure(&job.exec, .Tool_Failed, "the tool arguments could not be allocated", "allocation failed")
 		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
-	if job.arguments.status == .Rejected {
-		job.result = tool_result_refused(&job.exec, &job.arguments.error)
+	if job.admitted.status == .Rejected {
+		job.result = tool_result_refused(&job.exec, &job.admitted.error)
 		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
-	if job.arguments.repair != .None {
+	if job.admitted.repair != .None {
 		_observer_message(observer, .Notice, "a tool call was repaired before it ran: a raw control character was escaped")
 	}
-	if _, is_object := job.arguments.value.(json.Object); !is_object {
+	if _, is_object := job.admitted.value.(json.Object); !is_object {
 		job.result = tool_result_failure(&job.exec, .Invalid_Arguments, "the arguments are not a JSON object", "invalid arguments")
+		job.result_present = true
+		job.phase = .Result_Ready
+		return
+	}
+	args, args_error := tool_args_decode(&job.exec, definition.kind, job.admitted.value.(json.Object))
+	job.arguments = args
+	if args_error.kind != .None {
+		defer tool_argument_error_destroy(&args_error, job.allocator)
+		job.result = tool_result_refused(&job.exec, &args_error)
 		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
 	// What the call runs with is the text the dispatch record holds, so an executor
 	// that forwards the call cannot send something other than what was recorded.
-	job.exec.arguments_json = job.arguments.effective
+	job.exec.arguments_json = job.admitted.effective
 }
 
 // tool_job_logging captures the owner's log destination for one call, because a worker
@@ -644,7 +660,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	job := tool_jobs_runnable(jobs)
 	if job == nil { return }
 	if job.placement == .Lua && job.lua_dispatched {
-		tool_job_lua_resume(jobs, chat, job, job.lua_child_result != "")
+		tool_job_lua_resume(jobs, chat, job, job.lua_child_ready)
 		return
 	}
 	previous := context.logger
@@ -657,7 +673,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		request_no = chat.active_request,
 		created_at_ms = session.now_ms(),
 		related_seq = job.call.seq,
-		payload = session.Tool_Dispatch_Entry{tool = job.name, arguments = job.arguments.effective, repair = job.arguments.repair},
+		payload = session.Tool_Dispatch_Entry{tool = job.name, arguments = job.admitted.effective, repair = job.admitted.repair},
 	}
 	dispatch_seq, dispatch_error := session.entry_append(chat.store, chat.id, dispatch)
 	if dispatch_error != nil {
@@ -756,7 +772,7 @@ tool_jobs_refuse :: proc(jobs: ^Tool_Jobs) {
 
 // tool_jobs_commit records the earliest uncommitted result. It is the one boundary
 // between execution and storage: every observed result crosses it here, so the store
-// only ever receives a valid bounded envelope.
+// only ever receives a bounded result.
 tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer) {
 	job := tool_jobs_earliest_live(jobs)
 	if job == nil || job.phase != .Result_Ready { return }
@@ -765,9 +781,9 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	defer context.logger = previous
 	job.phase = .Committing
 
-	// The commit takes the result off the job: one owner at a time. What comes back
-	// shares the envelope's strings except when a violation was replaced, and it is
-	// the single release for all of them, so retirement has nothing left to free.
+	// The commit takes the result off the job: one owner at a time. Finalization hands back
+	// what is recorded, which is the same result unless it was too large, and that is the
+	// single release for it, so retirement has nothing left to free.
 	result := job.result
 	job.result = {}
 	job.result_present = false
@@ -805,19 +821,14 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 			append(&job.parent.lua_calls, Lua_Call_Summary{child = job, seq = job.call.seq, outcome = finalized.outcome})
 		}
 		job.parent.lua_calls_total += 1
-		job.parent.lua_child_result = strings.clone(finalized.content, job.parent.allocator)
 		job.parent.lua_child = nil
-		if job.parent.lua_child_result == "" {
-			job.parent.result = tool_result_failure(&job.parent.exec, .Tool_Failed, "the nested tool result could not be retained", "allocation failed")
-			job.parent.result_present = true
-			job.parent.phase = .Result_Ready
-		} else if jobs.stop != .None {
-			delete(job.parent.lua_child_result, job.parent.allocator)
-			job.parent.lua_child_result = ""
+		if jobs.stop != .None {
 			job.parent.result = tool_result_failure(&job.parent.exec, .Cancelled, "the Code Mode execution was cancelled", "cancelled")
 			job.parent.result_present = true
 			job.parent.phase = .Result_Ready
 		} else {
+			code_mode_lua_push_result(job.parent.lua, &finalized)
+			job.parent.lua_child_ready = true
 			job.parent.phase = .Queued
 		}
 	}
@@ -857,7 +868,8 @@ tool_jobs_retire :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 		tool_result_destroy(&job.result)
 		job.result_present = false
 	}
-	tool_arguments_destroy(&job.arguments, job.allocator)
+	tool_args_destroy(&job.arguments, job.allocator)
+	tool_arguments_destroy(&job.admitted, job.allocator)
 	job.phase = job.committed ? .Retired : .Unrecorded
 }
 
@@ -896,8 +908,7 @@ tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
 	defer context.logger = previous
 	started := [1]Log_Field{{key = "tool", value = job.name}}
 	log_emit({level = .Info, category = .Tool, event = "tool.execution_started", fields = started[:]})
-	object, _ := job.arguments.value.(json.Object)
-	result := job.execute(&job.exec, object)
+	result := job.execute(&job.exec, job.arguments)
 	finished := [2]Log_Field{{key = "tool", value = job.name}, {key = "outcome", value = session.tool_outcome_name(result.outcome)}}
 	log_emit({level = .Info, category = .Tool, event = "tool.execution_finished", fields = finished[:]})
 	return result

@@ -220,6 +220,8 @@ log_error_kind_name :: proc(kind: session.Error_Kind) -> string {
 @(private)
 tool_arguments_status_name :: proc(status: Tool_Arguments_Status) -> string {
 	switch status {
+	case .None:
+		return "none"
 	case .Valid:
 		return "valid"
 	case .Repaired:

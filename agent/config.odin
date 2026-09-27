@@ -4,7 +4,7 @@ import c "core:c/libc"
 import "core:mem"
 import "core:os"
 import "core:strings"
-import l "vendor:lua/5.4"
+import lua "vendor:lua/5.4"
 
 CONFIG_MAX_BYTES :: 1024 * 1024
 CONFIG_MAX_ENTRIES :: 4096
@@ -46,59 +46,59 @@ config_error_text :: proc(e: Config_Error) -> string {
 	return "invalid config"
 }
 
-lua_limit_hook :: proc "c" (L: ^l.State, ar: ^l.Debug) {
-	l.pushstring(L, "configuration instruction limit exceeded")
-	l.error(L)
+lua_limit_hook :: proc "c" (state: ^lua.State, ar: ^lua.Debug) {
+	lua.pushstring(state, "configuration instruction limit exceeded")
+	lua.error(state)
 }
 
-lua_string :: proc(L: ^l.State, idx: c.int, allocator: mem.Allocator) -> (string, Config_Error) {
-	if l.type(L, idx) != .STRING { return "", .Invalid }
+lua_string :: proc(state: ^lua.State, idx: c.int, allocator: mem.Allocator) -> (string, Config_Error) {
+	if lua.type(state, idx) != .STRING { return "", .Invalid }
 	n: c.size_t
-	p := l.tolstring(L, idx, &n)
+	p := lua.tolstring(state, idx, &n)
 	if p == nil || n > c.size_t(CONFIG_MAX_BYTES) { return "", .Invalid }
 	value, clone_error := strings.clone(string(p), allocator)
 	if clone_error != nil { return "", .Allocation }
 	return value, .None
 }
 
-lua_bool :: proc(L: ^l.State, idx: c.int) -> (bool, bool) {
-	if l.type(L, idx) != .BOOLEAN { return false, false }
-	return l.toboolean(L, idx) != false, true
+lua_bool :: proc(state: ^lua.State, idx: c.int) -> (bool, bool) {
+	if lua.type(state, idx) != .BOOLEAN { return false, false }
+	return lua.toboolean(state, idx) != false, true
 }
 
-lua_int :: proc(L: ^l.State, idx: c.int) -> (int, bool) {
-	if l.type(L, idx) != .NUMBER { return 0, false }
+lua_int :: proc(state: ^lua.State, idx: c.int) -> (int, bool) {
+	if lua.type(state, idx) != .NUMBER { return 0, false }
 	ok: b32
-	n := l.tointeger(L, idx, &ok)
-	if !ok || n < 0 || n > l.Integer(1 << 30) { return 0, false }
+	n := lua.tointeger(state, idx, &ok)
+	if !ok || n < 0 || n > lua.Integer(1 << 30) { return 0, false }
 	return int(n), true
 }
 
 // lua_field pushes the named field, or nil when the value at idx is not a table.
 // Indexing a non-table would raise a Lua error, which longjmps out of the Odin frame
 // that called it; reading a missing field is the same condition without the hazard.
-lua_field :: proc(L: ^l.State, idx: c.int, name: string) -> c.int {
-	if l.type(L, idx) != .TABLE {
-		l.pushnil(L)
+lua_field :: proc(state: ^lua.State, idx: c.int, name: string) -> c.int {
+	if lua.type(state, idx) != .TABLE {
+		lua.pushnil(state)
 		return 0
 	}
 	name_c, name_err := strings.clone_to_cstring(name, context.temp_allocator)
 	if name_err != nil {
-		l.pushnil(L)
+		lua.pushnil(state)
 		return 0
 	}
 	defer delete(name_c, context.temp_allocator)
-	return l.getfield(L, idx, name_c)
+	return lua.getfield(state, idx, name_c)
 }
 
-lua_plain_table :: proc(L: ^l.State, idx: c.int) -> bool {
-	if l.type(L, idx) != .TABLE { return false }
-	return l.getmetatable(L, idx) == 0
+lua_plain_table :: proc(state: ^lua.State, idx: c.int) -> bool {
+	if lua.type(state, idx) != .TABLE { return false }
+	return lua.getmetatable(state, idx) == 0
 }
 
-load_model :: proc(L: ^l.State, raw_idx: c.int, provider_id, model_id: string, allocator: mem.Allocator, out: ^Catalog_Model_Source) -> Config_Error {
-	if !lua_plain_table(L, raw_idx) { return .Invalid }
-	idx := l.absindex(L, raw_idx)
+load_model :: proc(state: ^lua.State, raw_idx: c.int, provider_id, model_id: string, allocator: mem.Allocator, out: ^Catalog_Model_Source) -> Config_Error {
+	if !lua_plain_table(state, raw_idx) { return .Invalid }
+	idx := lua.absindex(state, raw_idx)
 	model_id_copy, model_id_copy_error := strings.clone(model_id, allocator)
 	if model_id_copy_error != nil { return .Allocation }
 	out^.id = model_id_copy
@@ -110,148 +110,148 @@ load_model :: proc(L: ^l.State, raw_idx: c.int, provider_id, model_id: string, a
 	thinking_levels.allocator = allocator
 	failed := true
 	defer if failed { catalog_model_source_destroy(out, allocator); config_strings_destroy(&input_modalities, allocator); config_strings_destroy(&output_modalities, allocator); config_strings_destroy(&thinking_levels, allocator) }
-	base := l.gettop(L)
-	defer l.settop(L, base)
-	lua_field(L, idx, "disabled")
-	if l.type(L, -1) != .NIL {
-		value, ok := lua_bool(L, -1)
+	base := lua.gettop(state)
+	defer lua.settop(state, base)
+	lua_field(state, idx, "disabled")
+	if lua.type(state, -1) != .NIL {
+		value, ok := lua_bool(state, -1)
 		if !ok { return .Invalid }
 		out^.disabled = value
 		out^.disabled_present = true
 	}
-	l.settop(L, base)
+	lua.settop(state, base)
 	if out^.disabled_present && out^.disabled {
 		failed = false
 		return .None
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "api")
-	if l.type(L, -1) != .NIL {
-		value, value_error := lua_string(L, -1, allocator)
+	lua.settop(state, base)
+	lua_field(state, idx, "api")
+	if lua.type(state, -1) != .NIL {
+		value, value_error := lua_string(state, -1, allocator)
 		if value_error != .None { return value_error }
 		out^.api = value
 		out^.api_present = true
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "display_name")
-	if l.type(L, -1) != .NIL {
-		value, value_error := lua_string(L, -1, allocator)
+	lua.settop(state, base)
+	lua_field(state, idx, "display_name")
+	if lua.type(state, -1) != .NIL {
+		value, value_error := lua_string(state, -1, allocator)
 		if value_error != .None { return value_error }
 		out^.display_name = value
 		out^.display_name_present = true
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "context_window")
-	if l.type(L, -1) != .NIL {
-		value, ok := lua_int(L, -1)
+	lua.settop(state, base)
+	lua_field(state, idx, "context_window")
+	if lua.type(state, -1) != .NIL {
+		value, ok := lua_int(state, -1)
 		if !ok { return .Invalid }
 		out^.context_window = value
 		out^.context_window_present = true
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "max_output_tokens")
-	if l.type(L, -1) != .NIL {
-		value, ok := lua_int(L, -1)
+	lua.settop(state, base)
+	lua_field(state, idx, "max_output_tokens")
+	if lua.type(state, -1) != .NIL {
+		value, ok := lua_int(state, -1)
 		if !ok { return .Invalid }
 		out^.max_output_tokens = value
 		out^.max_output_tokens_present = true
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "tools")
-	if l.type(L, -1) != .NIL {
-		value, ok := lua_bool(L, -1)
+	lua.settop(state, base)
+	lua_field(state, idx, "tools")
+	if lua.type(state, -1) != .NIL {
+		value, ok := lua_bool(state, -1)
 		if !ok { return .Invalid }
 		out^.tools = value
 		out^.tools_present = true
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "input_modalities")
-	if l.type(L, -1) != .NIL {
-		if !lua_plain_table(L, -1) || l.rawlen(L, -1) > l.Unsigned(CONFIG_MAX_LEVELS) { return .Invalid }
-		for i in 1 ..= int(l.rawlen(L, -1)) {
-			l.rawgeti(L, -1, l.Integer(i))
-			value, value_error := lua_string(L, -1, allocator)
+	lua.settop(state, base)
+	lua_field(state, idx, "input_modalities")
+	if lua.type(state, -1) != .NIL {
+		if !lua_plain_table(state, -1) || lua.rawlen(state, -1) > lua.Unsigned(CONFIG_MAX_LEVELS) { return .Invalid }
+		for i in 1 ..= int(lua.rawlen(state, -1)) {
+			lua.rawgeti(state, -1, lua.Integer(i))
+			value, value_error := lua_string(state, -1, allocator)
 			if value_error != .None { return value_error }
 			appended := append(&input_modalities, value)
 			if appended != 1 {
 				if appended == 0 { delete(value, allocator) }
 				return .Allocation
 			}
-			l.pop(L, 1)
+			lua.pop(state, 1)
 		}
 		out^.input_modalities = input_modalities[:]
 		out^.input_modalities_present = true
 		// Ownership moved to out; the failure cleanup below must not free it twice.
 		input_modalities = nil
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "output_modalities")
-	if l.type(L, -1) != .NIL {
-		if !lua_plain_table(L, -1) || l.rawlen(L, -1) > l.Unsigned(CONFIG_MAX_LEVELS) { return .Invalid }
-		for i in 1 ..= int(l.rawlen(L, -1)) {
-			l.rawgeti(L, -1, l.Integer(i))
-			value, value_error := lua_string(L, -1, allocator)
+	lua.settop(state, base)
+	lua_field(state, idx, "output_modalities")
+	if lua.type(state, -1) != .NIL {
+		if !lua_plain_table(state, -1) || lua.rawlen(state, -1) > lua.Unsigned(CONFIG_MAX_LEVELS) { return .Invalid }
+		for i in 1 ..= int(lua.rawlen(state, -1)) {
+			lua.rawgeti(state, -1, lua.Integer(i))
+			value, value_error := lua_string(state, -1, allocator)
 			if value_error != .None { return value_error }
 			appended := append(&output_modalities, value)
 			if appended != 1 {
 				if appended == 0 { delete(value, allocator) }
 				return .Allocation
 			}
-			l.pop(L, 1)
+			lua.pop(state, 1)
 		}
 		out^.output_modalities = output_modalities[:]
 		out^.output_modalities_present = true
 		// Ownership moved to out; the failure cleanup below must not free it twice.
 		output_modalities = nil
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "thinking")
-	if l.type(L, -1) != .NIL {
+	lua.settop(state, base)
+	lua_field(state, idx, "thinking")
+	if lua.type(state, -1) != .NIL {
 		out^.thinking.present = true
-		if l.type(L, -1) == .BOOLEAN {
-			out^.thinking.supported = l.toboolean(L, -1) != false
+		if lua.type(state, -1) == .BOOLEAN {
+			out^.thinking.supported = lua.toboolean(state, -1) != false
 			out^.thinking.supported_present = true
 			if !out^.thinking.supported { out^.thinking.blocked = true }
-		} else if lua_plain_table(L, -1) {
-			tbase := l.gettop(L)
-			lua_field(L, -1, "supported")
-			if l.type(L, -1) != .NIL {
-				value, ok := lua_bool(L, -1)
+		} else if lua_plain_table(state, -1) {
+			tbase := lua.gettop(state)
+			lua_field(state, -1, "supported")
+			if lua.type(state, -1) != .NIL {
+				value, ok := lua_bool(state, -1)
 				if !ok { return .Invalid }
 				out^.thinking.supported = value
 				out^.thinking.supported_present = true
 				if !out^.thinking.supported { out^.thinking.blocked = true }
 			}
-			l.settop(L, tbase)
-			lua_field(L, -1, "toggle")
-			if l.type(L, -1) != .NIL {
-				value, ok := lua_bool(L, -1)
+			lua.settop(state, tbase)
+			lua_field(state, -1, "toggle")
+			if lua.type(state, -1) != .NIL {
+				value, ok := lua_bool(state, -1)
 				if !ok { return .Invalid }
 				out^.thinking.toggle = value
 				out^.thinking.toggle_present = true
 			}
-			l.settop(L, tbase)
-			lua_field(L, -1, "levels")
-			if l.type(L, -1) != .NIL {
-				if !lua_plain_table(L, -1) { return .Invalid }
-				if l.rawlen(L, -1) > l.Unsigned(CONFIG_MAX_LEVELS) { return .Invalid }
-				for i in 1 ..= int(l.rawlen(L, -1)) {
-					l.rawgeti(L, -1, l.Integer(i))
-					value, value_error := lua_string(L, -1, allocator)
+			lua.settop(state, tbase)
+			lua_field(state, -1, "levels")
+			if lua.type(state, -1) != .NIL {
+				if !lua_plain_table(state, -1) { return .Invalid }
+				if lua.rawlen(state, -1) > lua.Unsigned(CONFIG_MAX_LEVELS) { return .Invalid }
+				for i in 1 ..= int(lua.rawlen(state, -1)) {
+					lua.rawgeti(state, -1, lua.Integer(i))
+					value, value_error := lua_string(state, -1, allocator)
 					if value_error != .None { return value_error }
 					appended := append(&thinking_levels, value)
 					if appended != 1 {
 						if appended == 0 { delete(value, allocator) }
 						return .Allocation
 					}
-					l.pop(L, 1)
+					lua.pop(state, 1)
 				}
 				out^.thinking.levels = thinking_levels[:]
 				out^.thinking.levels_present = true
 				// Ownership moved to out; the failure cleanup below must not free it twice.
 				thinking_levels = nil
 			}
-			l.settop(L, tbase)
+			lua.settop(state, tbase)
 		} else {
 			return .Invalid
 		}
@@ -260,9 +260,9 @@ load_model :: proc(L: ^l.State, raw_idx: c.int, provider_id, model_id: string, a
 	return .None
 }
 
-load_provider :: proc(L: ^l.State, raw_idx: c.int, provider_id: string, allocator: mem.Allocator, out: ^Catalog_Provider_Source) -> Config_Error {
-	if !lua_plain_table(L, raw_idx) { return .Invalid }
-	idx := l.absindex(L, raw_idx)
+load_provider :: proc(state: ^lua.State, raw_idx: c.int, provider_id: string, allocator: mem.Allocator, out: ^Catalog_Provider_Source) -> Config_Error {
+	if !lua_plain_table(state, raw_idx) { return .Invalid }
+	idx := lua.absindex(state, raw_idx)
 	id, id_error := strings.clone(provider_id, allocator)
 	if id_error != nil { return .Allocation }
 	out^.id = id
@@ -276,27 +276,27 @@ load_provider :: proc(L: ^l.State, raw_idx: c.int, provider_id: string, allocato
 		delete(models)
 		catalog_provider_source_destroy(out, allocator)
 	}
-	base := l.gettop(L)
-	defer l.settop(L, base)
-	lua_field(L, idx, "base_url")
-	if l.type(L, -1) != .NIL {
-		value, value_error := lua_string(L, -1, allocator)
+	base := lua.gettop(state)
+	defer lua.settop(state, base)
+	lua_field(state, idx, "base_url")
+	if lua.type(state, -1) != .NIL {
+		value, value_error := lua_string(state, -1, allocator)
 		if value_error != .None { return value_error }
 		out^.base_url = value
 		out^.base_url_present = true
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "api")
-	if l.type(L, -1) != .NIL {
-		value, value_error := lua_string(L, -1, allocator)
+	lua.settop(state, base)
+	lua_field(state, idx, "api")
+	if lua.type(state, -1) != .NIL {
+		value, value_error := lua_string(state, -1, allocator)
 		if value_error != .None { return value_error }
 		out^.api = value
 		out^.api_present = true
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "transport")
-	if l.type(L, -1) != .NIL {
-		value, value_error := lua_string(L, -1, allocator)
+	lua.settop(state, base)
+	lua_field(state, idx, "transport")
+	if lua.type(state, -1) != .NIL {
+		value, value_error := lua_string(state, -1, allocator)
 		if value_error != .None { return value_error }
 		switch value {
 		case "http":
@@ -312,29 +312,29 @@ load_provider :: proc(L: ^l.State, raw_idx: c.int, provider_id: string, allocato
 		delete(value, allocator)
 		out^.transport_present = true
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "api_key")
-	if l.type(L, -1) != .NIL {
-		value, value_error := lua_string(L, -1, allocator)
+	lua.settop(state, base)
+	lua_field(state, idx, "api_key")
+	if lua.type(state, -1) != .NIL {
+		value, value_error := lua_string(state, -1, allocator)
 		if value_error != .None { return value_error }
 		out^.api_key = value
 		out^.api_key_present = true
 	}
-	l.settop(L, base)
-	lua_field(L, idx, "models")
-	if l.type(L, -1) != .NIL {
-		if !lua_plain_table(L, -1) { return .Invalid }
-		models_idx := l.absindex(L, -1)
+	lua.settop(state, base)
+	lua_field(state, idx, "models")
+	if lua.type(state, -1) != .NIL {
+		if !lua_plain_table(state, -1) { return .Invalid }
+		models_idx := lua.absindex(state, -1)
 		count := 0
-		l.pushnil(L)
+		lua.pushnil(state)
 		for {
-			if l.next(L, models_idx) == 0 { break }
+			if lua.next(state, models_idx) == 0 { break }
 			count += 1
-			if count > CONFIG_MAX_ENTRIES || l.type(L, -2) != .STRING { return .Invalid }
-			model_id, model_id_error := lua_string(L, -2, allocator)
+			if count > CONFIG_MAX_ENTRIES || lua.type(state, -2) != .STRING { return .Invalid }
+			model_id, model_id_error := lua_string(state, -2, allocator)
 			if model_id_error != .None { return model_id_error }
 			model: Catalog_Model_Source
-			err := load_model(L, -1, provider_id, model_id, allocator, &model)
+			err := load_model(state, -1, provider_id, model_id, allocator, &model)
 			delete(model_id, allocator)
 			if err != .None {
 				catalog_model_source_destroy(&model, allocator)
@@ -345,7 +345,7 @@ load_provider :: proc(L: ^l.State, raw_idx: c.int, provider_id: string, allocato
 				if appended == 0 { catalog_model_source_destroy(&model, allocator) }
 				return .Allocation
 			}
-			l.pop(L, 1)
+			lua.pop(state, 1)
 		}
 		out^.models = models[:]
 	}
@@ -353,15 +353,15 @@ load_provider :: proc(L: ^l.State, raw_idx: c.int, provider_id: string, allocato
 	return .None
 }
 
-load_harness_options :: proc(L: ^l.State, idx: c.int) -> (Harness_Options, Config_Error) {
+load_harness_options :: proc(state: ^lua.State, idx: c.int) -> (Harness_Options, Config_Error) {
 	options: Harness_Options
-	if l.type(L, idx) == .NIL { return options, .None }
-	if !lua_plain_table(L, idx) { return {}, .Invalid }
-	base := l.gettop(L)
-	defer l.settop(L, base)
-	lua_field(L, idx, "project")
-	if l.type(L, -1) != .NIL {
-		project, ok := lua_bool(L, -1)
+	if lua.type(state, idx) == .NIL { return options, .None }
+	if !lua_plain_table(state, idx) { return {}, .Invalid }
+	base := lua.gettop(state)
+	defer lua.settop(state, base)
+	lua_field(state, idx, "project")
+	if lua.type(state, -1) != .NIL {
+		project, ok := lua_bool(state, -1)
 		if !ok { return {}, .Invalid }
 		options.disable_project_instructions = !project
 	}
@@ -389,41 +389,41 @@ load_lua_config_full :: proc(
 	data, read_err := os.read_entire_file(path, context.temp_allocator)
 	if read_err != nil { return {}, {}, {}, .Read }
 	if len(data) > CONFIG_MAX_BYTES { return {}, {}, {}, .Invalid }
-	L := l.L_newstate(); if L == nil { return {}, {}, {}, .Lua }; defer l.close(L)
-	l.sethook(L, lua_limit_hook, l.MASKCOUNT, CONFIG_INSTRUCTIONS)
-	if l.L_loadbuffer(L, raw_data(data), c.size_t(len(data)), "@nabla-config", "t") != .OK { return {}, {}, {}, .Lua }
-	if l.pcall(L, 0, 1, 0) != 0 { return {}, {}, {}, .Lua }
-	if !lua_plain_table(L, -1) { return {}, {}, {}, .Root }
-	base := l.gettop(L)
-	lua_field(L, -1, "instructions")
-	options, options_err := load_harness_options(L, -1)
+	state := lua.L_newstate(); if state == nil { return {}, {}, {}, .Lua }; defer lua.close(state)
+	lua.sethook(state, lua_limit_hook, lua.MASKCOUNT, CONFIG_INSTRUCTIONS)
+	if lua.L_loadbuffer(state, raw_data(data), c.size_t(len(data)), "@nabla-config", "t") != .OK { return {}, {}, {}, .Lua }
+	if lua.pcall(state, 0, 1, 0) != 0 { return {}, {}, {}, .Lua }
+	if !lua_plain_table(state, -1) { return {}, {}, {}, .Root }
+	base := lua.gettop(state)
+	lua_field(state, -1, "instructions")
+	options, options_err := load_harness_options(state, -1)
 	if options_err != .None { return {}, {}, {}, options_err }
-	l.settop(L, base)
-	lua_field(L, -1, "providers")
-	if l.type(L, -1) == .NIL {
-		l.settop(L, base)
-		return {}, options, load_mcp_servers_from(L, -1, allocator)
+	lua.settop(state, base)
+	lua_field(state, -1, "providers")
+	if lua.type(state, -1) == .NIL {
+		lua.settop(state, base)
+		return {}, options, load_mcp_servers_from(state, -1, allocator)
 	}
-	if !lua_plain_table(L, -1) { return {}, {}, {}, .Invalid }
+	if !lua_plain_table(state, -1) { return {}, {}, {}, .Invalid }
 	result: [dynamic]Catalog_Provider_Source
 	result.allocator = allocator
 	count := 0
-	providers_idx := l.absindex(L, -1)
-	l.pushnil(L)
+	providers_idx := lua.absindex(state, -1)
+	lua.pushnil(state)
 	for {
-		if l.next(L, providers_idx) == 0 { break }
+		if lua.next(state, providers_idx) == 0 { break }
 		count += 1
-		if count > CONFIG_MAX_ENTRIES || l.type(L, -2) != .STRING {
+		if count > CONFIG_MAX_ENTRIES || lua.type(state, -2) != .STRING {
 			catalog_sources_destroy(&result, allocator)
 			return {}, {}, {}, .Invalid
 		}
-		provider_id, provider_id_error := lua_string(L, -2, allocator)
+		provider_id, provider_id_error := lua_string(state, -2, allocator)
 		if provider_id_error != .None {
 			catalog_sources_destroy(&result, allocator)
 			return {}, {}, {}, provider_id_error
 		}
 		provider: Catalog_Provider_Source
-		err := load_provider(L, -1, provider_id, allocator, &provider)
+		err := load_provider(state, -1, provider_id, allocator, &provider)
 		delete(provider_id, allocator)
 		if err != .None {
 			catalog_provider_source_destroy(&provider, allocator)
@@ -436,31 +436,31 @@ load_lua_config_full :: proc(
 			catalog_sources_destroy(&result, allocator)
 			return {}, {}, {}, .Allocation
 		}
-		l.settop(L, providers_idx + 1)
+		lua.settop(state, providers_idx + 1)
 	}
-	l.settop(L, base)
-	servers, servers_err := load_mcp_servers_from(L, -1, allocator)
+	lua.settop(state, base)
+	servers, servers_err := load_mcp_servers_from(state, -1, allocator)
 	if servers_err != .None {
 		catalog_sources_destroy(&result, allocator)
 		return {}, {}, {}, servers_err
 	}
-	l.settop(L, base)
+	lua.settop(state, base)
 	return result, options, servers, .None
 }
 
 // load_mcp_servers_from reads the `mcp` table, which holds the `servers` table. The
 // state is reset by the caller.
 @(private)
-load_mcp_servers_from :: proc(L: ^l.State, root_idx: c.int, allocator: mem.Allocator) -> ([dynamic]MCP_Server_Config, Config_Error) {
-	base := l.gettop(L)
-	defer l.settop(L, base)
-	lua_field(L, root_idx, "mcp")
-	if l.type(L, -1) == .NIL { return {}, .None }
-	if !lua_plain_table(L, -1) { return {}, .Invalid }
-	mcp_idx := l.absindex(L, -1)
-	lua_field(L, mcp_idx, "servers")
-	if l.type(L, -1) == .NIL { return {}, .None }
-	return mcp_servers_load(L, -1, allocator)
+load_mcp_servers_from :: proc(state: ^lua.State, root_idx: c.int, allocator: mem.Allocator) -> ([dynamic]MCP_Server_Config, Config_Error) {
+	base := lua.gettop(state)
+	defer lua.settop(state, base)
+	lua_field(state, root_idx, "mcp")
+	if lua.type(state, -1) == .NIL { return {}, .None }
+	if !lua_plain_table(state, -1) { return {}, .Invalid }
+	mcp_idx := lua.absindex(state, -1)
+	lua_field(state, mcp_idx, "servers")
+	if lua.type(state, -1) == .NIL { return {}, .None }
+	return mcp_servers_load(state, -1, allocator)
 }
 
 load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Config_Error) {
@@ -474,34 +474,34 @@ load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynam
 	data, read_err := os.read_entire_file(path, context.temp_allocator)
 	if read_err != nil { return {}, .Read }
 	if len(data) > CONFIG_MAX_BYTES { return {}, .Invalid }
-	L := l.L_newstate(); if L == nil { return {}, .Lua }; defer l.close(L)
-	l.sethook(L, lua_limit_hook, l.MASKCOUNT, CONFIG_INSTRUCTIONS)
-	if l.L_loadbuffer(L, raw_data(data), c.size_t(len(data)), "@nabla-config", "t") != .OK { return {}, .Lua }
-	if l.pcall(L, 0, 1, 0) != 0 { return {}, .Lua }
-	if !lua_plain_table(L, -1) { return {}, .Root }
-	base := l.gettop(L)
-	lua_field(L, -1, "providers")
-	if l.type(L, -1) == .NIL { return {}, .None }
-	if !lua_plain_table(L, -1) { return {}, .Invalid }
+	state := lua.L_newstate(); if state == nil { return {}, .Lua }; defer lua.close(state)
+	lua.sethook(state, lua_limit_hook, lua.MASKCOUNT, CONFIG_INSTRUCTIONS)
+	if lua.L_loadbuffer(state, raw_data(data), c.size_t(len(data)), "@nabla-config", "t") != .OK { return {}, .Lua }
+	if lua.pcall(state, 0, 1, 0) != 0 { return {}, .Lua }
+	if !lua_plain_table(state, -1) { return {}, .Root }
+	base := lua.gettop(state)
+	lua_field(state, -1, "providers")
+	if lua.type(state, -1) == .NIL { return {}, .None }
+	if !lua_plain_table(state, -1) { return {}, .Invalid }
 	result: [dynamic]Catalog_Provider_Source
 	result.allocator = allocator
 	count := 0
-	providers_idx := l.absindex(L, -1)
-	l.pushnil(L)
+	providers_idx := lua.absindex(state, -1)
+	lua.pushnil(state)
 	for {
-		if l.next(L, providers_idx) == 0 { break }
+		if lua.next(state, providers_idx) == 0 { break }
 		count += 1
-		if count > CONFIG_MAX_ENTRIES || l.type(L, -2) != .STRING {
+		if count > CONFIG_MAX_ENTRIES || lua.type(state, -2) != .STRING {
 			catalog_sources_destroy(&result, allocator)
 			return {}, .Invalid
 		}
-		provider_id, provider_id_error := lua_string(L, -2, allocator)
+		provider_id, provider_id_error := lua_string(state, -2, allocator)
 		if provider_id_error != .None {
 			catalog_sources_destroy(&result, allocator)
 			return {}, provider_id_error
 		}
 		provider: Catalog_Provider_Source
-		err := load_provider(L, -1, provider_id, allocator, &provider)
+		err := load_provider(state, -1, provider_id, allocator, &provider)
 		delete(provider_id, allocator)
 		if err != .None {
 			catalog_provider_source_destroy(&provider, allocator)
@@ -514,9 +514,9 @@ load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynam
 			catalog_sources_destroy(&result, allocator)
 			return {}, .Allocation
 		}
-		l.settop(L, providers_idx + 1)
+		lua.settop(state, providers_idx + 1)
 	}
-	l.settop(L, base)
+	lua.settop(state, base)
 	return result, .None
 }
 

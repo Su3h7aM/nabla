@@ -105,11 +105,11 @@ test_shell_inherits_the_process_environment :: proc(t: ^testing.T) {
 
 	seen := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"printf %s \"$NABLA_SHELL_TEST_INHERITED\""}`)
 	testing.expect_value(t, seen.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(seen.content, `"stdout":"inherited-value"`), "a variable of the process environment reaches the command")
+	testing.expect(t, strings.contains(seen.content, "stdout:\ninherited-value\n"), "a variable of the process environment reaches the command")
 
 	// The search path is the user's own, which is what makes their tools reachable.
 	path := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"printf %s \"$PATH\""}`)
-	expected := fmt.aprintf(`"stdout":%q`, os.get_env("PATH", context.temp_allocator), allocator = context.temp_allocator)
+	expected := fmt.aprintf("stdout:\n%s\n", os.get_env("PATH", context.temp_allocator), allocator = context.temp_allocator)
 	testing.expectf(t, strings.contains(path.content, expected), "the command searches the user's own path: %s", path.content)
 }
 
@@ -128,7 +128,7 @@ test_shell_falls_back_to_the_portable_shell :: proc(t: ^testing.T) {
 	defer shell_test_set_shell(t, TOOL_SHELL_FALLBACK)
 	unnamed := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"printf no-shell-named"}`)
 	testing.expect_value(t, unnamed.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(unnamed.content, `"stdout":"no-shell-named"`), "the command runs when the environment names no shell")
+	testing.expect(t, strings.contains(unnamed.content, "stdout:\nno-shell-named\n"), "the command runs when the environment names no shell")
 
 	scratch := shell_test_scratch(t)
 	defer os.remove_all(scratch)
@@ -140,7 +140,7 @@ test_shell_falls_back_to_the_portable_shell :: proc(t: ^testing.T) {
 	shell_test_set_shell(t, broken)
 	fallback := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"printf broken-shell-ran"}`)
 	testing.expect_value(t, fallback.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(fallback.content, `"stdout":"broken-shell-ran"`), "the command runs when the environment's shell cannot be started")
+	testing.expect(t, strings.contains(fallback.content, "stdout:\nbroken-shell-ran\n"), "the command runs when the environment's shell cannot be started")
 }
 
 // The instructions the agent receives name the shell it will run, so it writes

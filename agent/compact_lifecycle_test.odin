@@ -394,7 +394,7 @@ test_the_compact_tool_records_an_intent_and_returns :: proc(t: ^testing.T) {
 	result, is_result := entries[len(entries) - 1].payload.(session.Tool_Result_Entry)
 	if !testing.expect(t, is_result, "the call must have a result") { return }
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(result.content, `"state":"scheduled"`), "the result says the work was queued")
+	testing.expect(t, strings.contains(result.content, `state: scheduled`), "the result says the work was queued")
 
 	// The intent is recorded, and nothing has started: a job starts at the next
 	// request boundary, where the prefix it covers is a closed execution.

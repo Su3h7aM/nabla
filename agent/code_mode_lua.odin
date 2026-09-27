@@ -6,7 +6,7 @@ import "core:encoding/json"
 import "core:mem"
 import "core:strings"
 import "core:unicode/utf8"
-import l "vendor:lua/5.4"
+import lua "vendor:lua/5.4"
 
 // --- Lua execution boundary ---------------------------------------------------
 //
@@ -93,8 +93,8 @@ Lua_Request :: struct {
 // Lua_Run is one execution. Every field is owned by the run or an observed count.
 Lua_Run :: struct {
 	allocator:       mem.Allocator,
-	L:               ^l.State, // the main state; owns every value
-	thread:          ^l.State, // the private coroutine the chunk runs on
+	state:           ^lua.State, // the main state; owns every value
+	thread:          ^lua.State, // the private coroutine the chunk runs on
 	stop_requested:  bool, // latched; the run is never resumed past its next slice
 	failure:         Lua_Failure,
 	terminal:        bool, // the run cannot be resumed
@@ -110,8 +110,8 @@ Lua_Run :: struct {
 // --- state access --------------------------------------------------------------
 
 @(private)
-code_mode_lua_run :: proc "c" (L: ^l.State) -> ^Lua_Run {
-	space := cast(^rawptr)l.getextraspace(L)
+code_mode_lua_run :: proc "c" (state: ^lua.State) -> ^Lua_Run {
+	space := cast(^rawptr)lua.getextraspace(state)
 	if space == nil || space^ == nil { return nil }
 	return cast(^Lua_Run)space^
 }
@@ -121,8 +121,8 @@ code_mode_lua_run :: proc "c" (L: ^l.State) -> ^Lua_Run {
 // space. It is set on the main state and again on the coroutine, because a new thread
 // copies the extra space at creation.
 @(private)
-code_mode_lua_bind :: proc(run: ^Lua_Run, L: ^l.State) {
-	space := cast(^rawptr)l.getextraspace(L)
+code_mode_lua_bind :: proc(run: ^Lua_Run, state: ^lua.State) {
+	space := cast(^rawptr)lua.getextraspace(state)
 	if space != nil { space^ = rawptr(run) }
 }
 
@@ -183,8 +183,8 @@ code_mode_lua_alloc :: proc "c" (ud: rawptr, ptr: rawptr, osize, nsize: c.size_t
 // whether the run continues. It never raises: a raised error would be script-catchable,
 // while a suspension is not.
 @(private)
-code_mode_lua_hook :: proc "c" (L: ^l.State, ar: ^l.Debug) {
-	if l.isyieldable(L) { l.yield(L, 0) }
+code_mode_lua_hook :: proc "c" (state: ^lua.State, ar: ^lua.Debug) {
+	if lua.isyieldable(state) { lua.yield(state, 0) }
 }
 
 // --- tool suspension -----------------------------------------------------------
@@ -199,15 +199,15 @@ code_mode_lua_hook :: proc "c" (L: ^l.State, ar: ^l.Debug) {
 // wrapper takes no argument or exactly one, so a second one is refused instead of
 // silently discarded.
 @(private)
-code_mode_lua_tool_call :: proc "c" (L: ^l.State) -> c.int {
-	run := code_mode_lua_run(L)
+code_mode_lua_tool_call :: proc "c" (state: ^lua.State) -> c.int {
+	run := code_mode_lua_run(state)
 	if run == nil || run.request.pending { return 0 }
 	context = runtime.default_context()
 
 	name := ""
-	if l.type(L, l.REGISTRYINDEX - 1) == .STRING {
+	if lua.type(state, lua.REGISTRYINDEX - 1) == .STRING {
 		length: c.size_t
-		text := l.tolstring(L, l.REGISTRYINDEX - 1, &length)
+		text := lua.tolstring(state, lua.REGISTRYINDEX - 1, &length)
 		if text != nil {
 			name_ok: bool
 			name, name_ok = code_mode_lua_string_clone(string(text), run.allocator)
@@ -215,25 +215,25 @@ code_mode_lua_tool_call :: proc "c" (L: ^l.State) -> c.int {
 				run.failure = .Memory
 				run.terminal = true
 				run.last_event = .Failed
-				return c.int(l.L_error(L, cstring("Code Mode could not allocate a tool name")))
+				return c.int(lua.L_error(state, cstring("Code Mode could not allocate a tool name")))
 			}
 		}
 	}
-	count := int(l.gettop(L))
-	args_ref: c.int = l.REFNIL
-	if count == 1 { args_ref = l.L_ref(L, l.REGISTRYINDEX) }
+	count := int(lua.gettop(state))
+	args_ref: c.int = lua.REFNIL
+	if count == 1 { args_ref = lua.L_ref(state, lua.REGISTRYINDEX) }
 
 	run.request.kind = .Call
 	run.request.name = name
 	run.request.args_ref = args_ref
 	run.request.arg_count = count
 	run.request.pending = true
-	return c.int(l.yield(L, 0, 0, code_mode_lua_tool_resume))
+	return c.int(lua.yield(state, 0, 0, code_mode_lua_tool_resume))
 }
 
 @(private)
-code_mode_lua_tool_resume :: proc "c" (L: ^l.State, status: c.int, ctx: l.KContext) -> c.int {
-	run := code_mode_lua_run(L)
+code_mode_lua_tool_resume :: proc "c" (state: ^lua.State, status: c.int, ctx: lua.KContext) -> c.int {
+	run := code_mode_lua_run(state)
 	if run == nil { return 0 }
 	// The values the owner delivered are on top of the stack, and only those are the
 	// call's results. The whole stack also holds the chunk and its arguments, so the
@@ -247,66 +247,66 @@ code_mode_lua_tool_resume :: proc "c" (L: ^l.State, status: c.int, ctx: l.KConte
 // a library that was never opened costs nothing to reason about, while one that was
 // opened and then patched has to be kept patched.
 @(private)
-code_mode_lua_open_libraries :: proc(L: ^l.State) {
-	l.L_requiref(L, cstring(l.GNAME), l.open_base, 1)
-	l.pop(L, 1)
-	l.L_requiref(L, cstring(l.STRLIBNAME), l.open_string, 1)
-	l.pop(L, 1)
-	l.L_requiref(L, cstring(l.TABLIBNAME), l.open_table, 1)
-	l.pop(L, 1)
-	l.L_requiref(L, cstring(l.MATHLIBNAME), l.open_math, 1)
-	l.pop(L, 1)
-	l.L_requiref(L, cstring(l.UTF8LIBNAME), l.open_utf8, 1)
-	l.pop(L, 1)
+code_mode_lua_open_libraries :: proc(state: ^lua.State) {
+	lua.L_requiref(state, cstring(lua.GNAME), lua.open_base, 1)
+	lua.pop(state, 1)
+	lua.L_requiref(state, cstring(lua.STRLIBNAME), lua.open_string, 1)
+	lua.pop(state, 1)
+	lua.L_requiref(state, cstring(lua.TABLIBNAME), lua.open_table, 1)
+	lua.pop(state, 1)
+	lua.L_requiref(state, cstring(lua.MATHLIBNAME), lua.open_math, 1)
+	lua.pop(state, 1)
+	lua.L_requiref(state, cstring(lua.UTF8LIBNAME), lua.open_utf8, 1)
+	lua.pop(state, 1)
 }
 
 // code_mode_lua_remove_global clears one global. Names are literals here, so this
 // allocates nothing and cannot fail.
 @(private)
-code_mode_lua_remove_global :: proc(L: ^l.State, name: cstring) {
-	l.pushnil(L)
-	l.setglobal(L, name)
+code_mode_lua_remove_global :: proc(state: ^lua.State, name: cstring) {
+	lua.pushnil(state)
+	lua.setglobal(state, name)
 }
 
 // code_mode_lua_remove_field clears one field of a global table.
 @(private)
-code_mode_lua_remove_field :: proc(L: ^l.State, table, field: cstring) {
-	l.getglobal(L, table)
-	if l.type(L, -1) != .TABLE {
-		l.pop(L, 1)
+code_mode_lua_remove_field :: proc(state: ^lua.State, table, field: cstring) {
+	lua.getglobal(state, table)
+	if lua.type(state, -1) != .TABLE {
+		lua.pop(state, 1)
 		return
 	}
-	l.pushnil(L)
-	l.setfield(L, -2, field)
-	l.pop(L, 1)
+	lua.pushnil(state)
+	lua.setfield(state, -2, field)
+	lua.pop(state, 1)
 }
 
 // code_mode_lua_restrict keeps the base library's useful parts and removes the ones
 // that reach outside the execution, escape the value boundary, or hand the script
 // control of the collector. Removing a name that is absent is not an error.
 @(private)
-code_mode_lua_restrict :: proc(L: ^l.State) {
+code_mode_lua_restrict :: proc(state: ^lua.State) {
 	// Loading and dynamic code.
-	code_mode_lua_remove_global(L, "load")
-	code_mode_lua_remove_global(L, "loadfile")
-	code_mode_lua_remove_global(L, "dofile")
-	code_mode_lua_remove_global(L, "require")
+	code_mode_lua_remove_global(state, "load")
+	code_mode_lua_remove_global(state, "loadfile")
+	code_mode_lua_remove_global(state, "dofile")
+	code_mode_lua_remove_global(state, "require")
 	// Control of the collector, and diagnostics the harness owns.
-	code_mode_lua_remove_global(L, "collectgarbage")
-	code_mode_lua_remove_global(L, "warn")
+	code_mode_lua_remove_global(state, "collectgarbage")
+	code_mode_lua_remove_global(state, "warn")
 	// Metatable access: value conversion is the host's, and it must never run script
 	// code, so a table the script can re-shape from the host side is not wanted.
-	code_mode_lua_remove_global(L, "setmetatable")
-	code_mode_lua_remove_global(L, "getmetatable")
-	code_mode_lua_remove_global(L, "rawset")
+	code_mode_lua_remove_global(state, "setmetatable")
+	code_mode_lua_remove_global(state, "getmetatable")
+	code_mode_lua_remove_global(state, "rawset")
 	// Protected calls are deliberately absent for now: a tool outcome is a value, so a
 	// script has nothing to catch, and leaving them out keeps the error surface small.
-	code_mode_lua_remove_global(L, "pcall")
-	code_mode_lua_remove_global(L, "xpcall")
+	code_mode_lua_remove_global(state, "pcall")
+	code_mode_lua_remove_global(state, "xpcall")
 	// print is the harness's, so it writes to the run's bounded log.
-	code_mode_lua_remove_global(L, "print")
+	code_mode_lua_remove_global(state, "print")
 	// Bytecode dumping would put a compiler back in the script's hands.
-	code_mode_lua_remove_field(L, "string", "dump")
+	code_mode_lua_remove_field(state, "string", "dump")
 }
 
 // code_mode_lua_print appends one line to the run's bounded log. It never calls
@@ -314,16 +314,16 @@ code_mode_lua_restrict :: proc(L: ^l.State) {
 // from the host side. It does not need to: the restricted environment removes every way
 // to attach a metatable, so the types a script prints are the types it made.
 @(private)
-code_mode_lua_print :: proc "c" (L: ^l.State) -> c.int {
-	run := code_mode_lua_run(L)
+code_mode_lua_print :: proc "c" (state: ^lua.State) -> c.int {
+	run := code_mode_lua_run(state)
 	// A C callback has no context. Nothing here logs through it; it exists so the
 	// bounded log buffer can grow through the run's own allocator.
 	context = runtime.default_context()
 	if run == nil { return 0 }
-	count := l.gettop(L)
+	count := lua.gettop(state)
 	for index in 1 ..= int(count) {
 		if index > 1 { code_mode_lua_log_append(run, " ") }
-		code_mode_lua_log_value(run, L, c.int(index))
+		code_mode_lua_log_value(run, state, c.int(index))
 	}
 	code_mode_lua_log_append(run, "\n")
 	return 0
@@ -331,69 +331,70 @@ code_mode_lua_print :: proc "c" (L: ^l.State) -> c.int {
 
 // code_mode_lua_log_value writes one printed value. Strings and numbers are their own
 // text, booleans and nil have fixed spellings, the null sentinel is spelled as its JSON
-// name, and a table is written as its bounded JSON form, which is what makes `print`
+// name, and a table is written as its bounded Lua literal, which is what makes `print`
 // usable while debugging a script. Anything else can only be named.
 @(private)
-code_mode_lua_log_value :: proc(run: ^Lua_Run, L: ^l.State, index: c.int) {
-	switch l.type(L, index) {
+code_mode_lua_log_value :: proc(run: ^Lua_Run, state: ^lua.State, index: c.int) {
+	switch lua.type(state, index) {
 	case .NIL:
 		code_mode_lua_log_append(run, "nil")
 	case .BOOLEAN:
-		code_mode_lua_log_append(run, l.toboolean(L, index) != false ? "true" : "false")
+		code_mode_lua_log_append(run, lua.toboolean(state, index) != false ? "true" : "false")
 	case .LIGHTUSERDATA:
 		// The only light userdata the environment hands out is the null sentinel.
-		code_mode_lua_log_append(run, l.touserdata(L, index) == rawptr(run) ? "null" : "<lightuserdata>")
+		code_mode_lua_log_append(run, lua.touserdata(state, index) == rawptr(run) ? "null" : "<lightuserdata>")
 	case .TABLE:
-		code_mode_lua_log_table(run, L, index)
+		code_mode_lua_log_table(run, state, index)
 	case .STRING, .NUMBER:
-		if text, ok := code_mode_lua_stack_string(L, index); ok {
+		if text, ok := code_mode_lua_stack_string(state, index); ok {
 			code_mode_lua_log_append(run, text)
 		} else {
 			code_mode_lua_log_append(run, "<value>")
 		}
 	case .NONE, .FUNCTION, .USERDATA, .THREAD:
 		code_mode_lua_log_append(run, "<")
-		code_mode_lua_log_append(run, string(l.typename(L, l.type(L, index))))
+		code_mode_lua_log_append(run, string(lua.typename(state, lua.type(state, index))))
 		code_mode_lua_log_append(run, ">")
 	}
 }
 
-// code_mode_lua_log_table writes a table as JSON. A table the conversion refuses is a
-// type name: `print` is a diagnostic, and it must not turn a script's own bad value into
-// a boundary failure. The traversal is bounded well below the argument bound because the
-// log it feeds holds 8 KiB.
+// code_mode_lua_log_table writes a table as its Lua literal. A table the conversion refuses
+// is a type name: `print` is a diagnostic, and it must not turn a script's own bad value into
+// a boundary failure. The traversal is bounded because the log it feeds holds 8 KiB.
 @(private)
-code_mode_lua_log_table :: proc(run: ^Lua_Run, L: ^l.State, index: c.int) {
-	state := Code_Mode_Value_State {
+code_mode_lua_log_table :: proc(run: ^Lua_Run, state: ^lua.State, index: c.int) {
+	walk := Code_Mode_Value_Walk {
 		allocator     = run.allocator,
 		null_identity = rawptr(run),
 		max_nodes     = CODE_MODE_LOG_MAX_NODES,
 	}
-	state.seen = make(map[rawptr]bool, run.allocator)
-	defer delete(state.seen)
-	value, message := code_mode_lua_to_json_value(L, index, &state, 0)
-	if message != "" {
+	walk.seen = make(map[rawptr]bool, run.allocator)
+	defer delete(walk.seen)
+	value, defect := code_mode_lua_to_json_value(state, index, &walk, 0)
+	defer delete(defect, run.allocator)
+	if defect != "" {
 		code_mode_lua_log_append(run, "<table>")
 		return
 	}
 	defer json.destroy_value(value, run.allocator)
-	encoded, encode_err := json.marshal(value, allocator = run.allocator)
-	if encode_err != nil {
+	builder := strings.builder_make(run.allocator)
+	defer strings.builder_destroy(&builder)
+	_, write_error := code_mode_write_value_literal(&builder, value)
+	if write_error != nil {
 		code_mode_lua_log_append(run, "<table>")
 		return
 	}
-	defer delete(encoded, run.allocator)
-	code_mode_lua_log_append(run, string(encoded))
+	code_mode_lua_log_append(run, strings.to_string(builder))
 }
 
 // code_mode_lua_stack_string reads a value that is already text. Strings and numbers
 // convert; nothing else does.
 @(private)
-code_mode_lua_stack_string :: proc(L: ^l.State, index: c.int) -> (string, bool) {
-	kind := l.type(L, index)
+code_mode_lua_stack_string :: proc(state: ^lua.State, index: c.int) -> (string, bool) {
+	kind := lua.type(state, index)
 	if kind != .STRING && kind != .NUMBER { return "", false }
 	length: c.size_t
-	pointer := l.tolstring(L, index, &length)
+	pointer := lua.tolstring(state, index, &length)
 	if pointer == nil { return "", false }
 	bytes := cast([^]u8)pointer
 	return string(bytes[:int(length)]), true
@@ -443,33 +444,33 @@ code_mode_lua_start :: proc(source: string, name := "@code", allocator := contex
 	if alloc_error != nil { return nil, false }
 	run^ = Lua_Run {
 		allocator = allocator,
-		request = {args_ref = l.NOREF},
+		request = {args_ref = lua.NOREF},
 		logs = make([dynamic]u8, allocator),
 	}
 
-	run.L = l.newstate(code_mode_lua_alloc, rawptr(run))
-	if run.L == nil {
+	run.state = lua.newstate(code_mode_lua_alloc, rawptr(run))
+	if run.state == nil {
 		run.failure = .Memory
 		run.terminal = true
 		run.last_event = .Failed
 		run.message = strings.clone("the Lua state could not be created", allocator) or_else ""
 		return run, false
 	}
-	code_mode_lua_bind(run, run.L)
+	code_mode_lua_bind(run, run.state)
 
-	code_mode_lua_open_libraries(run.L)
-	code_mode_lua_restrict(run.L)
-	l.pushcclosure(run.L, code_mode_lua_print, 0)
-	l.setglobal(run.L, "print")
-	l.newtable(run.L)
-	l.setglobal(run.L, "tools")
+	code_mode_lua_open_libraries(run.state)
+	code_mode_lua_restrict(run.state)
+	lua.pushcclosure(run.state, code_mode_lua_print, 0)
+	lua.setglobal(run.state, "print")
+	lua.newtable(run.state)
+	lua.setglobal(run.state, "tools")
 	// Lua nil means absence, so JSON null is a stable light-userdata identity.
-	l.newtable(run.L)
-	l.pushlightuserdata(run.L, rawptr(run))
-	l.setfield(run.L, -2, "null")
-	l.setglobal(run.L, "json")
+	lua.newtable(run.state)
+	lua.pushlightuserdata(run.state, rawptr(run))
+	lua.setfield(run.state, -2, "null")
+	lua.setglobal(run.state, "json")
 
-	run.thread = l.newthread(run.L)
+	run.thread = lua.newthread(run.state)
 	if run.thread == nil {
 		run.failure = .Memory
 		run.terminal = true
@@ -480,9 +481,9 @@ code_mode_lua_start :: proc(source: string, name := "@code", allocator := contex
 	// The thread stays on the main stack as a collector anchor: an unreferenced
 	// suspended coroutine could otherwise be collected.
 	code_mode_lua_bind(run, run.thread)
-	l.sethook(run.thread, code_mode_lua_hook, l.MASKCOUNT, LUA_SLICE_INSTRUCTIONS)
+	lua.sethook(run.thread, code_mode_lua_hook, lua.MASKCOUNT, LUA_SLICE_INSTRUCTIONS)
 
-	status := l.L_loadbuffer(run.thread, raw_data(source), c.size_t(len(source)), cstring(raw_data(name)), "t")
+	status := lua.L_loadbuffer(run.thread, raw_data(source), c.size_t(len(source)), cstring(raw_data(name)), "t")
 	if status != .OK {
 		run.failure = .Syntax
 		run.terminal = true
@@ -496,15 +497,15 @@ code_mode_lua_start :: proc(source: string, name := "@code", allocator := contex
 // code_mode_lua_install_tool adds one entry to the `tools` table. The name is the
 // canonical tool name, which a script writes as an ordinary field: `tools.fff_grep`.
 code_mode_lua_install_tool :: proc(run: ^Lua_Run, name: string) -> bool {
-	if run == nil || run.L == nil || !tool_name_valid(name) { return false }
+	if run == nil || run.state == nil || !tool_name_valid(name) { return false }
 	if strings.index_byte(name, 0) >= 0 { return false }
 
 	// lua_getglobal answers with the type it pushed, not an index, so the index is read
 	// from the stack top.
-	_ = l.getglobal(run.L, "tools")
-	table_index := l.gettop(run.L)
-	if l.type(run.L, table_index) != .TABLE {
-		l.settop(run.L, table_index - 1)
+	_ = lua.getglobal(run.state, "tools")
+	table_index := lua.gettop(run.state)
+	if lua.type(run.state, table_index) != .TABLE {
+		lua.settop(run.state, table_index - 1)
 		return false
 	}
 	// The key goes on the stack before the value: `settable` reads t[top-2] = t[top-1].
@@ -512,11 +513,11 @@ code_mode_lua_install_tool :: proc(run: ^Lua_Run, name: string) -> bool {
 	// the name is pushed twice: once for the key, once for the closure. The table index
 	// is kept from before the pushes rather than counted from the top; a wrong index is
 	// an unprotected Lua error, which would abort the process.
-	l.pushlstring(run.L, cstring(raw_data(name)), c.size_t(len(name)))
-	l.pushlstring(run.L, cstring(raw_data(name)), c.size_t(len(name)))
-	l.pushcclosure(run.L, code_mode_lua_tool_call, 1)
-	l.settable(run.L, table_index)
-	l.settop(run.L, table_index - 1)
+	lua.pushlstring(run.state, cstring(raw_data(name)), c.size_t(len(name)))
+	lua.pushlstring(run.state, cstring(raw_data(name)), c.size_t(len(name)))
+	lua.pushcclosure(run.state, code_mode_lua_tool_call, 1)
+	lua.settable(run.state, table_index)
+	lua.settop(run.state, table_index - 1)
 	return true
 }
 
@@ -545,18 +546,18 @@ code_mode_lua_deliver_string :: proc(run: ^Lua_Run, text: string) -> Lua_Event {
 	if run == nil || run.thread == nil { return .Failed }
 	if run.terminal { return run.last_event }
 	if !run.request.pending { return .Failed }
-	if l.pushlstring(run.thread, cstring(raw_data(text)), c.size_t(len(text))) == nil { return .Failed }
+	if lua.pushlstring(run.thread, cstring(raw_data(text)), c.size_t(len(text))) == nil { return .Failed }
 	return code_mode_lua_deliver(run, 1)
 }
 
 @(private)
 code_mode_lua_request_clear :: proc(run: ^Lua_Run) {
-	if run.request.args_ref != l.REFNIL && run.request.args_ref != l.NOREF {
-		l.L_unref(run.L, l.REGISTRYINDEX, run.request.args_ref)
+	if run.request.args_ref != lua.REFNIL && run.request.args_ref != lua.NOREF {
+		lua.L_unref(run.state, lua.REGISTRYINDEX, run.request.args_ref)
 	}
 	code_mode_lua_string_free(run.request.name, run.allocator)
 	run.request.name = ""
-	run.request.args_ref = l.NOREF
+	run.request.args_ref = lua.NOREF
 	run.request.pending = false
 }
 
@@ -564,7 +565,7 @@ code_mode_lua_request_clear :: proc(run: ^Lua_Run) {
 code_mode_lua_step :: proc(run: ^Lua_Run, nargs: int) -> Lua_Event {
 	run.delivered = nargs
 	results: c.int
-	status := l.resume(run.thread, run.L, c.int(nargs), &results)
+	status := lua.resume(run.thread, run.state, c.int(nargs), &results)
 	switch status {
 	case .OK:
 		run.terminal = true
@@ -637,11 +638,11 @@ code_mode_lua_destroy :: proc(run: ^Lua_Run) {
 	// The reference is released while the state is still open: closing the state frees
 	// the registry the reference lives in.
 	code_mode_lua_request_clear(run)
-	if run.L != nil {
+	if run.state != nil {
 		// Closing the main state releases every value, including a coroutine that was
 		// suspended and never resumed.
-		l.close(run.L)
-		run.L = nil
+		lua.close(run.state)
+		run.state = nil
 		run.thread = nil
 	}
 	delete(run.message, allocator)
@@ -685,7 +686,7 @@ code_mode_lua_returned_values :: proc(run: ^Lua_Run) -> int {
 // without a value conversion, which is a separate concern.
 code_mode_lua_returned_boolean :: proc(run: ^Lua_Run) -> bool {
 	if run == nil || run.thread == nil || !run.terminal || run.returned_values < 1 { return false }
-	return l.toboolean(run.thread, c.int(-run.returned_values)) != false
+	return lua.toboolean(run.thread, c.int(-run.returned_values)) != false
 }
 
 // code_mode_lua_returned_string reads the returned value when it is a string.
@@ -698,7 +699,7 @@ code_mode_lua_returned_string :: proc(run: ^Lua_Run) -> (string, bool) {
 code_mode_lua_returned_number :: proc(run: ^Lua_Run) -> (i64, bool) {
 	if run == nil || run.thread == nil || !run.terminal || run.returned_values < 1 { return 0, false }
 	ok: b32
-	value := l.tointeger(run.thread, c.int(-run.returned_values), &ok)
+	value := lua.tointeger(run.thread, c.int(-run.returned_values), &ok)
 	if !ok { return 0, false }
 	return i64(value), true
 }

@@ -1,6 +1,5 @@
 package agent
 
-import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
@@ -9,20 +8,7 @@ import "nabla:agent/session"
 
 @(private)
 tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job) {
-	object := job.arguments.value.(json.Object)
-	if fields_error := tool_fields_known(object, []string{"code"}, allocator = job.allocator); fields_error.kind != .None {
-		job.result = tool_result_refused(&job.exec, &fields_error)
-		job.result_present = true
-		job.phase = .Result_Ready
-		return
-	}
-	source, source_error := tool_field_string(object, "code", allocator = job.allocator)
-	if source_error.kind != .None {
-		job.result = tool_result_refused(&job.exec, &source_error)
-		job.result_present = true
-		job.phase = .Result_Ready
-		return
-	}
+	source := job.arguments.(Code_Args).code
 
 	run, compiled := code_mode_lua_start(source, allocator = job.allocator)
 	if run == nil {
@@ -50,7 +36,7 @@ tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job
 	tool_job_lua_resume(jobs, chat, job, false)
 }
 
-// code_mode_job_failure builds a Code Mode failure envelope. The outcome says what the
+// code_mode_job_failure builds a Code Mode failure result. The outcome says what the
 // harness observed; the diagnostic says which limit or fault Code Mode hit; and the call
 // summaries say what the script had already done.
 @(private)
@@ -61,7 +47,7 @@ code_mode_job_failure :: proc(job: ^Tool_Job, outcome: session.Tool_Outcome, dia
 		&job.exec,
 		outcome,
 		message,
-		Code_Mode_Error_Data{kind = code_mode_diagnostic_name(diagnostic), calls = calls, calls_total = total},
+		Code_Output{failure = code_mode_diagnostic_name(diagnostic), calls = calls, calls_total = total},
 		reason,
 	)
 }
@@ -70,11 +56,11 @@ code_mode_job_failure :: proc(job: ^Tool_Job, outcome: session.Tool_Outcome, dia
 // are borrowed from the child jobs, which outlive the batch, and the returned slice is
 // owned by the caller.
 @(private)
-code_mode_job_calls :: proc(job: ^Tool_Job) -> ([]Code_Mode_Call, int) {
+code_mode_job_calls :: proc(job: ^Tool_Job) -> ([]Code_Call, int) {
 	if len(job.lua_calls) == 0 { return nil, job.lua_calls_total }
-	calls := make([]Code_Mode_Call, len(job.lua_calls), job.allocator)
+	calls := make([]Code_Call, len(job.lua_calls), job.allocator)
 	for summary, index in job.lua_calls {
-		calls[index] = Code_Mode_Call {
+		calls[index] = Code_Call {
 			call_seq = i64(summary.seq),
 			name     = summary.child.name,
 			outcome  = session.tool_outcome_name(summary.outcome),
@@ -87,9 +73,8 @@ code_mode_job_calls :: proc(job: ^Tool_Job) -> ([]Code_Mode_Call, int) {
 tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job, deliver: bool) {
 	event := Lua_Event.Slice
 	if deliver {
-		event = code_mode_lua_deliver_json(job.lua, job.lua_child_result, job.allocator)
-		delete(job.lua_child_result, job.allocator)
-		job.lua_child_result = ""
+		job.lua_child_ready = false
+		event = code_mode_lua_deliver(job.lua, 1)
 	} else {
 		event = code_mode_lua_resume(job.lua)
 	}
@@ -121,28 +106,29 @@ tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Jo
 }
 
 // tool_job_lua_finish builds the parent result from a chunk that returned. The return
-// value becomes structured JSON, so a script answers with an object or an array as
-// easily as with a string, and the result budget is enforced here rather than by the
-// generic oversized replacement, which would hide which value was too large.
+// value is written as a Lua literal, so a script answers with a table as easily as with
+// a string, and the result budget is enforced here rather than by the generic oversized
+// replacement, which would hide which value was too large.
 @(private)
 tool_job_lua_finish :: proc(job: ^Tool_Job) {
 	run := job.lua
 	logs := code_mode_lua_logs(run)
-	output, message := code_mode_lua_returned_json(run, job.allocator)
-	if message != "" {
-		job.result = code_mode_job_failure(job, .Tool_Failed, .Invalid_Value, message, "invalid return value")
+	value, message, diagnostic := code_mode_lua_returned_literal(run, job.allocator)
+	defer delete(message, job.allocator)
+	if diagnostic != .None {
+		job.result = code_mode_job_failure(job, .Tool_Failed, diagnostic, message, "invalid return value")
 		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
-	defer json.destroy_value(output, job.allocator)
+	defer delete(value, job.allocator)
 	calls, calls_total := code_mode_job_calls(job)
 	defer delete(calls, job.allocator)
 	result := tool_result_of(
 		&job.exec,
 		.Success,
 		"",
-		Code_Mode_Result_Data{output = output, logs = logs, logs_truncated = code_mode_lua_logs_truncated(run), calls = calls, calls_total = calls_total},
+		Code_Output{value = value, logs = logs, logs_truncated = code_mode_lua_logs_truncated(run), calls = calls, calls_total = calls_total},
 		"completed",
 	)
 	if len(result.content) > TOOL_MAX_RESULT_BYTES {
@@ -165,21 +151,23 @@ tool_job_lua_finish :: proc(job: ^Tool_Job) {
 
 @(private)
 tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: ^Tool_Job) {
-	arguments, message := code_mode_lua_request_json(parent.lua, parent.allocator)
-	if message != "" {
-		defer delete(message, parent.allocator)
-		parent.result = code_mode_job_failure(parent, .Invalid_Arguments, .Invalid_Value, message, "invalid child arguments")
-		parent.result_present = true
-		parent.phase = .Result_Ready
-		return
-	}
-	defer delete(arguments, parent.allocator)
-
 	// The job struct comes from the same heap as its data: a worker releases a job the owner
 	// handed back, so that allocation has to outlive the batch and its session.
 	child, alloc_error := mem.new(Tool_Job, jobs.worker_allocator)
 	if alloc_error != nil {
 		parent.result = code_mode_job_failure(parent, .Tool_Failed, .Unavailable, "the nested tool call could not be allocated", "allocation failed")
+		parent.result_present = true
+		parent.phase = .Result_Ready
+		return
+	}
+
+	// The script's own table is converted once, here: what the child runs with is the value
+	// that was checked, and the text the record keeps is the same value written down.
+	arguments, message := code_mode_lua_request_arguments(parent.lua, parent.allocator)
+	if message != "" {
+		defer delete(message, parent.allocator)
+		mem.free(child, jobs.worker_allocator)
+		parent.result = code_mode_job_failure(parent, .Invalid_Arguments, .Invalid_Value, message, "invalid child arguments")
 		parent.result_present = true
 		parent.phase = .Result_Ready
 		return
@@ -193,10 +181,11 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 		request_no = chat.active_request,
 		created_at_ms = session.now_ms(),
 		parent_call_seq = parent.call.seq,
-		payload = session.Tool_Call_Entry{call_id = call_id, name = parent.lua.request.name, arguments = arguments},
+		payload = session.Tool_Call_Entry{call_id = call_id, name = parent.lua.request.name, arguments = arguments.effective},
 	}
 	call_seq, append_error := session.entry_append(chat.store, chat.id, entry)
 	if append_error != nil {
+		tool_arguments_destroy(&arguments, parent.allocator)
 		mem.free(child, jobs.worker_allocator)
 		chat_session_record_failure(chat, "the nested tool call could not be recorded", append_error)
 		parent.result = code_mode_job_failure(parent, .Tool_Failed, .Unavailable, "the nested tool call could not be recorded", "storage failed")
@@ -214,11 +203,14 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 		allocator = jobs.worker_allocator,
 		parent    = parent,
 		nested    = true,
+		// The admitted document moves into the child: from here on the child owns it, and the
+		// batch releases it with the rest of the job.
+		admitted  = arguments,
 	}
 	child.nested_call = {
 		id        = strings.clone(call_id, child.allocator),
 		name      = strings.clone(parent.lua.request.name, child.allocator),
-		arguments = strings.clone(arguments, child.allocator),
+		arguments = strings.clone(arguments.effective, child.allocator),
 		seq       = call_seq,
 	}
 	child.call = &child.nested_call
@@ -231,6 +223,7 @@ tool_job_lua_submit_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent:
 		parent.phase = .Result_Ready
 		return
 	}
+
 	parent.lua_child = child
 	parent.phase = .Waiting
 }

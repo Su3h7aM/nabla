@@ -1,7 +1,6 @@
 package agent
 
-import "base:runtime"
-import "core:encoding/json"
+import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:slice"
@@ -91,7 +90,7 @@ Tool_Context :: struct {
 // Tool_Execute runs one admitted call. Returning .Invalid_Arguments promises the
 // tool performed no effect, which is what lets dispatch record the refusal as a
 // call that did not run.
-Tool_Execute :: #type proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result
+Tool_Execute :: #type proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result
 
 // Tool_Hint_Value is one static behavior statement about a tool. Unknown is
 // the zero value, so absence of knowledge reads as unknown rather than as a
@@ -134,6 +133,7 @@ Tool_Placement :: enum {
 // Tool_Definition is one tool the harness can run. The strings are owned by the
 // registry that holds the definition.
 Tool_Definition :: struct {
+	kind:         Tool_Kind,
 	name:         string,
 	description:  string,
 	input_schema: string,
@@ -317,6 +317,7 @@ tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition)
 			placement = definition.placement,
 			timeout = definition.timeout,
 			execute = definition.execute,
+			kind = definition.kind,
 			backend = definition.backend,
 		},
 	)
@@ -350,11 +351,9 @@ tool_definition_destroy :: proc(definition: ^Tool_Definition, allocator: mem.All
 // no single call can consume a large part of the model context.
 TOOL_MAX_RESULT_BYTES :: 64 * 1024
 
-// TOOL_RESULT_REPLACED_OVERSIZED and TOOL_RESULT_REPLACED_MALFORMED are the
-// messages of a replacement envelope. They are constants so a tool bug is
-// always reported in the same bytes.
+// TOOL_RESULT_REPLACED_OVERSIZED is the message of a result replaced for its size. It
+// is a constant so the replacement is always reported in the same bytes.
 TOOL_RESULT_REPLACED_OVERSIZED :: "the tool result exceeded the harness output limit and was replaced"
-TOOL_RESULT_REPLACED_MALFORMED :: "the tool returned a result the harness could not use"
 
 // TOOL_RESULT_READ_NAME is the tool that reads a result back. It is named here, beside
 // the handle that tells the model to call it, because the tool and the handle are one
@@ -365,45 +364,31 @@ TOOL_RESULT_READ_NAME :: "context_read_result"
 // handle says the same thing, so a spilled result is always explained the same way.
 TOOL_RESULT_SPILLED_MESSAGE :: "the observed output did not fit this context and was kept in the session; read it with context_read_result"
 
-// TOOL_RESULT_HANDLE_TOKENS is what one handle costs the model's context. A handle is
-// a fixed envelope carrying a sequence number and a byte count, so every handle costs
-// nearly the same; a test holds the real one to this bound. Reserving a constant is
-// what lets a batch's budget be closed before any result is recorded.
+// TOOL_RESULT_HANDLE_TOKENS is what one handle costs the model's context. A handle is a
+// fixed line carrying a sequence number and a byte count, so every handle costs nearly the
+// same; a test holds the real one to this bound. Reserving a constant is what lets a batch's
+// budget be closed before any result is recorded.
 TOOL_RESULT_HANDLE_TOKENS :: 64
 
-// Tool_Result_Handle is the data of a handle: which call's result was kept, and how
-// much of it there is. call_seq is what the read tool takes.
-Tool_Result_Handle :: struct {
-	call_seq: i64 `json:"call_seq"`,
-	bytes:    int `json:"bytes"`,
-}
-
-// tool_result_handle is the envelope the model is shown in place of a result that was
-// kept rather than sent. It is derived from the stored entry, so it is not itself
-// stored: one fact, one place. The result is owned by allocator.
+// tool_result_handle is the text the model is shown in place of a result that was kept
+// rather than sent. It is derived from the stored entry, so it is not itself stored:
+// one fact, one place. call_seq is what the read tool takes. The text is owned by
+// allocator.
 tool_result_handle :: proc(outcome: session.Tool_Outcome, call_seq: i64, bytes: int, allocator: mem.Allocator) -> string {
-	return tool_content_json(outcome, TOOL_RESULT_SPILLED_MESSAGE, Tool_Result_Handle{call_seq = call_seq, bytes = bytes}, allocator)
+	head, _ := tool_result_render(outcome, TOOL_RESULT_SPILLED_MESSAGE, nil, context.temp_allocator)
+	return fmt.aprintf("%scall_seq: %d\nbytes: %d\n", head, call_seq, bytes, allocator = allocator)
 }
 
-// Tool_Empty is the data of a result that carries none of its own.
-Tool_Empty :: struct {}
-
-// Tool_Content is the one shape every tool result carries. status names the
-// outcome and message explains it; data is the tool's own shape, and a result
-// with nothing to report carries an empty object.
-Tool_Content :: struct($T: typeid) {
-	status:  string `json:"status"`,
-	message: string `json:"message"`,
-	data:    T `json:"data"`,
-}
-
-// Tool_Result is one finished call. content is the envelope the model reads, and
-// it is exactly what the session stores.
+// Tool_Result is one finished call. output is what the tool produced, typed, and
+// content is its rendering: the text the model reads, exactly as the session stores it.
+// Every string and slice is owned by allocator.
 Tool_Result :: struct {
 	call_id:           string,
 	outcome:           session.Tool_Outcome,
 	reason:            string, // short line for the front-end
-	content:           string, // the JSON envelope
+	message:           string, // why the outcome is what it is; "" for a plain success
+	output:            Tool_Output,
+	content:           string,
 	error:             Tool_Argument_Error, // set only when the outcome is .Invalid_Arguments
 	allocation_failed: bool,
 	allocator:         mem.Allocator,
@@ -413,43 +398,44 @@ tool_result_destroy :: proc(result: ^Tool_Result) {
 	allocator := result.allocator
 	delete(result.call_id, allocator)
 	delete(result.reason, allocator)
+	delete(result.message, allocator)
+	tool_output_destroy(&result.output, allocator)
 	delete(result.content, allocator)
 	tool_argument_error_destroy(&result.error, allocator)
 	result^ = {}
 }
 
-// tool_result_of builds a result from a tool's own data.
-// reason is a short line for the front-end; the model reads the envelope.
-tool_result_of :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, message: string, data: $T, reason := "") -> Tool_Result {
+// tool_result_of builds a result from what a tool produced. output may borrow; the
+// result keeps its own copy. reason is a short line for the front-end.
+tool_result_of :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, message: string, output: Tool_Output, reason := "") -> Tool_Result {
 	result := Tool_Result {
 		outcome   = outcome,
 		allocator = ctx.allocator,
 	}
-	call_id, call_error := strings.clone(ctx.call_id, ctx.allocator)
-	if call_error != nil {
-		result.allocation_failed = true
-	} else {
-		result.call_id = call_id
-	}
-	reason_text, reason_error := strings.clone(reason, ctx.allocator)
-	if reason_error != nil {
-		result.allocation_failed = true
-	} else {
-		result.reason = reason_text
-	}
-	result.content = tool_content_json(outcome, message, data, ctx.allocator)
-	if result.content == "" { result.allocation_failed = true }
+	err: mem.Allocator_Error
+	failed := false
+	result.call_id, err = strings.clone(ctx.call_id, ctx.allocator)
+	failed ||= err != nil
+	result.reason, err = strings.clone(reason, ctx.allocator)
+	failed ||= err != nil
+	result.message, err = strings.clone(message, ctx.allocator)
+	failed ||= err != nil
+	result.output, err = tool_output_clone(output, ctx.allocator)
+	failed ||= err != nil
+	result.content, err = tool_result_render(outcome, message, output, ctx.allocator)
+	failed ||= err != nil
+	result.allocation_failed = failed
 	return result
 }
 
-tool_result_success :: proc(ctx: ^Tool_Context, data: $T, reason := "") -> Tool_Result {
-	return tool_result_of(ctx, .Success, "", data, reason)
+tool_result_success :: proc(ctx: ^Tool_Context, output: Tool_Output, reason := "") -> Tool_Result {
+	return tool_result_of(ctx, .Success, "", output, reason)
 }
 
-// tool_result_failure is a result with no data of its own: a refusal, a timeout,
+// tool_result_failure is a result with no output of its own: a refusal, a timeout,
 // a transport failure, or anything else the harness observed without output.
 tool_result_failure :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, message: string, reason := "") -> Tool_Result {
-	return tool_result_of(ctx, outcome, message, Tool_Empty{}, reason)
+	return tool_result_of(ctx, outcome, message, nil, reason)
 }
 
 // tool_result_refused takes ownership of err and answers a call whose arguments
@@ -457,71 +443,26 @@ tool_result_failure :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, m
 tool_result_refused :: proc(ctx: ^Tool_Context, err: ^Tool_Argument_Error) -> Tool_Result {
 	text := tool_argument_error_text(err^, ctx.allocator)
 	defer delete(text, ctx.allocator)
-	result := tool_result_of(ctx, .Invalid_Arguments, text, tool_argument_detail(err^), text)
+	result := tool_result_of(ctx, .Invalid_Arguments, text, tool_argument_failure(err^), text)
 	result.error = err^
 	err^ = {}
 	return result
 }
 
-@(private)
-tool_content_json :: proc(outcome: session.Tool_Outcome, message: string, data: $T, allocator: mem.Allocator) -> string {
-	content := Tool_Content(T) {
-		status  = session.tool_outcome_name(outcome),
-		message = message,
-		data    = data,
-	}
-	encoded, marshal_err := json.marshal(content, allocator = allocator)
-	if marshal_err != nil { return "" }
-	return string(encoded)
-}
-
-// tool_result_finalize is the boundary between execution and storage, applied
-// once in tool_jobs_commit immediately before the result is recorded. It
-// verifies a tool's result against the result contract and returns it
-// unchanged when it complies. A violation never reaches the store: the content
-// is replaced with a minimal envelope that preserves the observed outcome, so
-// a tool bug is reported instead of stored as malformed JSON. The outcome is
-// always preserved, because the harness did observe the end: replacing it with
-// Unknown would claim ignorance it does not have, and replacing success with
-// failure (or the reverse) would rewrite what happened.
+// tool_result_finalize is the boundary between execution and storage, applied once in
+// tool_jobs_commit immediately before the result is recorded. It takes ownership of result
+// and returns the result to record, which is result itself unless it is larger than the
+// harness sends; an oversized result is replaced by one that keeps the observed outcome and
+// says why, because the harness did observe the end and replacing the outcome would rewrite
+// what happened.
 tool_result_finalize :: proc(ctx: ^Tool_Context, result: Tool_Result) -> Tool_Result {
-	finalized := result
-	if finalized.allocation_failed { return finalized }
-	if tool_result_valid(finalized.outcome, finalized.content) { return finalized }
-	message := TOOL_RESULT_REPLACED_MALFORMED
-	if len(finalized.content) > TOOL_MAX_RESULT_BYTES { message = TOOL_RESULT_REPLACED_OVERSIZED }
-	delete(finalized.content, ctx.allocator)
-	finalized.content = tool_content_json(finalized.outcome, message, Tool_Empty{}, ctx.allocator)
-	if finalized.content == "" { finalized.allocation_failed = true }
-	return finalized
-}
-
-// tool_result_valid reports whether content is a usable result envelope for the
-// outcome: one bounded JSON object carrying a matching status, a message
-// string, and a data value. It requires the document to be valid JSON, not merely
-// parseable: the parser is lenient about JSON5 escapes and stops silently at one, so a
-// document that only looks like JSON would otherwise be accepted and sent to a provider.
-@(private)
-tool_result_valid :: proc(outcome: session.Tool_Outcome, content: string) -> bool {
-	// Whether the result is well formed is the only question asked here, so the
-	// parse is scratch: nothing it builds outlives the answer.
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	if content == "" || len(content) > TOOL_MAX_RESULT_BYTES { return false }
-	if !json.is_valid(transmute([]u8)content, .JSON) { return false }
-	value, parse_error := json.parse_string(content, .JSON, true, context.temp_allocator)
-	if parse_error != nil { return false }
-	defer json.destroy_value(value, context.temp_allocator)
-	object, is_object := value.(json.Object)
-	if !is_object { return false }
-	status_value, status_present := object["status"]
-	if !status_present { return false }
-	status, status_is_string := status_value.(json.String)
-	if !status_is_string || string(status) != session.tool_outcome_name(outcome) { return false }
-	message_value, message_present := object["message"]
-	if !message_present { return false }
-	if _, message_is_string := message_value.(json.String); !message_is_string { return false }
-	_, data_present := object["data"]
-	return data_present
+	if result.allocation_failed || len(result.content) <= TOOL_MAX_RESULT_BYTES { return result }
+	replaced := tool_result_of(ctx, result.outcome, TOOL_RESULT_REPLACED_OVERSIZED, nil, result.reason)
+	replaced.error = result.error
+	discarded := result
+	discarded.error = {}
+	tool_result_destroy(&discarded)
+	return replaced
 }
 
 // tool_control_cancelled reports whether the execution, or the work that owns it, was
@@ -543,7 +484,7 @@ tool_control_stop :: proc(control: Tool_Control, start: time.Tick, timeout: time
 // AGENT_SYSTEM_PROMPT states what the agent is for. What each tool does, and
 // what arguments it takes, travels with the tool definitions, so this does not
 // repeat them.
-AGENT_SYSTEM_PROMPT :: "You are nabla, a coding agent working from a session workspace. The tools available to you are listed with their arguments. Each call returns a JSON object with a status and, on success, a data object. Relative paths start at the workspace, while absolute paths may address the wider system. Use the tools to inspect files, make changes, and run programs. Never invent tool output. Keep chat replies short."
+AGENT_SYSTEM_PROMPT :: "You are nabla, a coding agent working from a session workspace. The tools available to you are listed with their arguments. Each result starts with a line saying ok, or error with its kind and reason, then key: value facts, then after a blank line any raw output. Relative paths start at the workspace, while absolute paths may address the wider system. Use the tools to inspect files, make changes, and run programs. Never invent tool output. Keep chat replies short."
 
 // TOOL_DECLARED is the native tools written as constants, in the order they are
 // registered. tool_registry_sort fixes the advertised order after this list is
@@ -575,5 +516,5 @@ TOOL_NATIVE_COUNT :: len(TOOL_DECLARED) + 1
 TOOL_RECOVERED_MESSAGE :: "the session was interrupted before this call finished"
 TOOL_UNEXECUTED_MESSAGE :: "the session was interrupted before this call started"
 
-TOOL_RECOVERED_RESULT :: `{"status":"unknown","message":"the session was interrupted before this call finished","data":{}}`
-TOOL_UNEXECUTED_RESULT :: `{"status":"not_executed","message":"the session was interrupted before this call started","data":{}}`
+TOOL_RECOVERED_RESULT :: "error unknown: " + TOOL_RECOVERED_MESSAGE + "\n"
+TOOL_UNEXECUTED_RESULT :: "error not_executed: " + TOOL_UNEXECUTED_MESSAGE + "\n"

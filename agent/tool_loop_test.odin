@@ -203,52 +203,6 @@ test_tool_calls_are_recorded_then_run :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_invalid_arguments_get_a_dispatch_and_result :: proc(t: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, tool_loop_workspace(t))
-	defer chat_test_end(t, &fixture)
-	chat := &fixture.chat
-	chat.tools_enabled = true
-	_test_accept(t, chat, "bad call")
-
-	call_seq := _test_append(
-		t,
-		chat,
-		{
-			turn_no = chat.turn_no,
-			created_at_ms = 2_000,
-			payload = session.Tool_Call_Entry{call_id = "call_bad", name = TOOL_SHELL_NAME, arguments = `{"command":""}`},
-		},
-	)
-	append(
-		&chat.pending_calls,
-		Chat_Tool_Call {
-			id = chat_clone_string("call_bad", chat.allocator),
-			name = chat_clone_string(TOOL_SHELL_NAME, chat.allocator),
-			arguments = chat_clone_string(`{"command":""}`, chat.allocator),
-			seq = call_seq,
-		},
-	)
-	chat.state = .Executing_Tools
-
-	count := chat_run_tools(chat, {})
-	testing.expect_value(t, count, 1)
-	chat_session_tools_done(chat, chat.active_turn_id, count)
-
-	entries := _test_entries(t, chat)
-	defer session.entries_destroy(entries, context.allocator)
-	// Dispatch records the effective arguments before execution. The result then
-	// records that validation refused the call before any effect.
-	if !testing.expect_value(t, len(entries), 4) { return }
-	testing.expect_value(t, entries[1].kind, session.Entry_Kind.Tool_Call)
-	testing.expect_value(t, entries[2].kind, session.Entry_Kind.Tool_Dispatch)
-	testing.expect_value(t, entries[3].kind, session.Entry_Kind.Tool_Result)
-	result, is_result := entries[3].payload.(session.Tool_Result_Entry)
-	if !testing.expect(t, is_result, "the last entry should be a result") { return }
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
-}
-
-@(test)
 test_malformed_arguments_are_rejected_and_replayed :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, tool_loop_workspace(t))
@@ -272,7 +226,7 @@ test_malformed_arguments_are_rejected_and_replayed :: proc(t: ^testing.T) {
 	result, is_result := entries[2].payload.(session.Tool_Result_Entry)
 	if !testing.expect(t, is_result, "a rejected call still gets a result") { return }
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
-	testing.expect(t, strings.contains(result.content, `"kind":"syntax"`), "the result names the defect")
+	testing.expect(t, strings.contains(result.content, `kind: syntax`), "the result names the defect")
 
 	// The proposal must never reach the wire: an endpoint refuses tool arguments it
 	// cannot parse, and one unsendable request would poison every request after it.
@@ -620,7 +574,7 @@ test_a_recovered_call_reaches_the_model_answered :: proc(t: ^testing.T) {
 			calls_opened += 1
 			call_id = message.Tool_Calls[0].ID
 		}
-		if message.Role == .Tool && strings.contains(message.Content, `"status":"not_executed"`) {
+		if message.Role == .Tool && strings.contains(message.Content, `error not_executed`) {
 			answered = true
 			testing.expect_value(t, message.Tool_Call_ID, call_id)
 		}
@@ -809,53 +763,19 @@ test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(t: ^testing.T
 	testing.expect_value(t, next.kind, Chat_Effect_Kind.Start_Request)
 }
 
-// --- result envelope guarantees -------------------------------------------------
+// --- result rendering ---------------------------------------------------------
 
-// tool_loop_rogue_execute violates the result contract: it reports success with
-// content that is not a result envelope. Dispatch must replace it rather than
-// store it.
-tool_loop_rogue_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
-	return Tool_Result {
-		call_id = strings.clone(ctx.call_id, ctx.allocator),
-		outcome = .Success,
-		reason = strings.clone("rogue", ctx.allocator),
-		content = strings.clone("not json", ctx.allocator),
-		allocator = ctx.allocator,
-	}
-}
-
-// An unavailable tool never executes, and what is stored for it is still a
-// valid envelope whose status names the outcome.
+// An unavailable tool never executes, and the result stored for it says so in the
+// line the model reads.
 @(test)
-test_unavailable_tool_records_a_valid_envelope :: proc(t: ^testing.T) {
+test_an_unavailable_tool_names_itself :: proc(t: ^testing.T) {
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 
 	result := tool_run(t, &test, "no_such_tool", `{}`)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Unavailable)
-	tool_test_envelope_matches(t, result.content, .Unavailable, `no tool named "no_such_tool" is available`)
-}
-
-// A result that violates the contract is replaced with valid bounded feedback,
-// and the observed outcome is preserved.
-@(test)
-test_result_contract_violation_is_replaced_in_dispatch :: proc(t: ^testing.T) {
-	test: Tool_Test
-	tool_test_begin(t, &test)
-	defer tool_test_end(t, &test)
-
-	rogue := Tool_Definition {
-		name         = "test_rogue_tool",
-		description  = "A tool that returns content outside the result contract.",
-		input_schema = `{"type":"object"}`,
-		execute      = tool_loop_rogue_execute,
-	}
-	if !testing.expect_value(t, tool_registry_add(&test.fixture.chat.tools, rogue).kind, Tool_Registry_Error_Kind.None) { return }
-
-	result := tool_run(t, &test, "test_rogue_tool", `{}`)
-	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-	tool_test_envelope_matches(t, result.content, .Success, TOOL_RESULT_REPLACED_MALFORMED)
+	tool_test_result_matches(t, result.content, .Unavailable, `no tool named "no_such_tool" is available`)
 }
 
 // --- execution context policy -------------------------------------------------
@@ -872,12 +792,12 @@ Tool_Policy_Probe :: struct {
 // serving many definitions, reading its bounds and binding from the context
 // rather than from a definition it cannot name. A nil backend records nothing,
 // so a definition that is never dispatched needs no probe.
-tool_policy_probe_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+tool_policy_probe_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	if probe := cast(^Tool_Policy_Probe)ctx.backend; probe != nil {
 		probe.seen_timeout = ctx.timeout
 		probe.seen_backend = ctx.backend
 	}
-	return tool_result_success(ctx, Tool_Empty{}, "probed")
+	return tool_result_success(ctx, nil, "probed")
 }
 
 // One executor serves two definitions with different policies and bindings.
@@ -919,42 +839,6 @@ test_shared_executor_sees_definition_policy :: proc(t: ^testing.T) {
 	testing.expect_value(t, second_result.outcome, session.Tool_Outcome.Success)
 	testing.expect_value(t, probe_second.seen_timeout, 30 * time.Second)
 	testing.expect(t, probe_second.seen_backend == &probe_second, "the second call carries the second binding")
-}
-
-// Every dispatch path stores a valid envelope: the unknown tool, the refused
-// arguments, and the cancellation before dispatch. Finalization sits once before
-// storage rather than in the execute path, so results that never reach a
-// definition cross it too.
-@(test)
-test_every_dispatch_path_stores_a_valid_envelope :: proc(t: ^testing.T) {
-	{
-		test: Tool_Test
-		tool_test_begin(t, &test)
-		defer tool_test_end(t, &test)
-
-		result := tool_run(t, &test, "no_such_tool", `{}`)
-		testing.expect_value(t, result.outcome, session.Tool_Outcome.Unavailable)
-		testing.expect(t, tool_result_valid(result.outcome, result.content), "an unknown tool stores a valid envelope")
-	}
-	{
-		test: Tool_Test
-		tool_test_begin(t, &test)
-		defer tool_test_end(t, &test)
-
-		result := tool_run(t, &test, TOOL_SHELL_NAME, `{"a":1} trailing`)
-		testing.expect_value(t, result.outcome, session.Tool_Outcome.Invalid_Arguments)
-		testing.expect(t, tool_result_valid(result.outcome, result.content), "refused arguments store a valid envelope")
-	}
-	{
-		test: Tool_Test
-		tool_test_begin(t, &test)
-		defer tool_test_end(t, &test)
-
-		ai.interrupt_request(&test.fixture.chat.stop)
-		result := tool_run(t, &test, TOOL_SHELL_NAME, `{"command":"echo hi"}`)
-		testing.expect_value(t, result.outcome, session.Tool_Outcome.Not_Executed)
-		testing.expect(t, tool_result_valid(result.outcome, result.content), "a cancellation before dispatch stores a valid envelope")
-	}
 }
 
 // A batch that cannot answer every committed call must not leave the turn in a stage that would

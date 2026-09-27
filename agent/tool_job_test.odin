@@ -69,7 +69,7 @@ tool_job_hold_release_all :: proc(state: ^Tool_Job_Hold_State) {
 }
 
 // tool_job_hold_execute blocks until the test releases it or its own control ends.
-tool_job_hold_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+tool_job_hold_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	state := tool_job_hold_state(cast(^Tool_Job_Hold_Lane)ctx.backend)
 	sync.atomic_add(&state.running, 1)
 	defer sync.atomic_add(&state.running, -1)
@@ -80,13 +80,13 @@ tool_job_hold_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Too
 		}
 		time.sleep(time.Millisecond)
 	}
-	return tool_result_success(ctx, Tool_Empty{}, "held")
+	return tool_result_success(ctx, nil, "held")
 }
 
 // tool_job_immediate_execute finishes at once, which is what an owner-placed control
 // operation does.
-tool_job_immediate_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
-	return tool_result_success(ctx, Tool_Empty{}, "immediate")
+tool_job_immediate_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	return tool_result_success(ctx, nil, "immediate")
 }
 
 // tool_job_hold_definition is a held tool in one lane. lane is the borrowed backend
@@ -160,14 +160,14 @@ tool_job_test_drain :: proc(t: ^testing.T, test: ^Tool_Test, jobs: ^Tool_Jobs) {
 // A deaf tool never looks at its control: it keeps working until the test releases it,
 // which is what a backend stuck in a syscall looks like to the owner. It reports
 // through its lane's per-test state like a held tool does.
-tool_job_deaf_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
+tool_job_deaf_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	state := tool_job_hold_state(cast(^Tool_Job_Hold_Lane)ctx.backend)
 	sync.atomic_add(&state.running, 1)
 	for sync.atomic_load(&state.release) == 0 {
 		time.sleep(time.Millisecond)
 	}
 	sync.atomic_add(&state.running, -1)
-	return tool_result_success(ctx, Tool_Empty{}, "late")
+	return tool_result_success(ctx, nil, "late")
 }
 
 // tool_job_test_hold_until waits for count held executions to be inside the executor,
@@ -200,7 +200,7 @@ test_code_mode_suspends_for_a_nested_tool_job :: proc(t: ^testing.T) {
 		t,
 		chat,
 		"call_code",
-		`{"code":"local first = tools.test_child({value = 7})\nlocal second = tools.test_child({value = 8})\nreturn first.status .. \"+\" .. second.status"}`,
+		`{"code":"local first = tools.test_child({value = 7})\nlocal second = tools.test_child({value = 8})\nreturn first.outcome .. \"+\" .. second.outcome"}`,
 		TOOL_CODE_NAME,
 	)
 
@@ -221,7 +221,7 @@ test_code_mode_suspends_for_a_nested_tool_job :: proc(t: ^testing.T) {
 	testing.expect(t, second_child.parent == parent, "the second nested call should belong to the Code Mode job")
 	testing.expect(t, first_child.nested && second_child.nested, "nested calls should own their staged records")
 	value, present := code_mode_lua_returned_string(parent.lua)
-	testing.expect(t, present, "the script should return the child envelope statuses")
+	testing.expect(t, present, "the script should return the child outcomes")
 	testing.expect_value(t, value, "success+success")
 	testing.expect_value(t, jobs.committed, 3)
 	testing.expect_value(t, tool_jobs_committed(&jobs), 1)
@@ -325,7 +325,7 @@ test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_step", tool_job_immediate_execute))
 	// More children than the old fixed batch size.
 	source := fmt.aprintf(
-		`local seen = 0 for i = 1, %d do local r = tools.test_step() if r.status == "success" then seen = seen + 1 end end return seen`,
+		`local seen = 0 for i = 1, %d do local r = tools.test_step() if r.outcome == "success" then seen = seen + 1 end end return seen`,
 		CODE_MODE_TEST_CHILD_CALLS,
 		allocator = context.temp_allocator,
 	)
@@ -366,7 +366,7 @@ test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 		if !present || related != parent_seq { continue }
 		found = true
 		testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-		testing.expect(t, strings.contains(result.content, fmt.tprintf(`"output":%d`, CODE_MODE_TEST_CHILD_CALLS)), result.content)
+		testing.expect(t, strings.contains(result.content, fmt.tprintf(`value: %d`, CODE_MODE_TEST_CHILD_CALLS)), result.content)
 	}
 	testing.expect(t, found, "the script should have answered its call")
 }
@@ -415,9 +415,9 @@ test_code_mode_reports_what_its_script_did :: proc(t: ^testing.T) {
 	}
 	if !testing.expect(t, content != "", "the parent should have recorded its result") { return }
 
-	testing.expect(t, strings.contains(content, `"calls_total":2`), content)
+	testing.expect(t, strings.contains(content, `calls_total: 2`), content)
 	for seq in child_seqs {
-		want := strings.concatenate({`{"call_seq":`, fmt.tprintf("%d", seq), `,"name":"test_child","outcome":"success"}`}, context.temp_allocator)
+		want := fmt.tprintf("call: %d test_child success", seq)
 		testing.expectf(t, strings.contains(content, want), "%s should carry %s", content, want)
 	}
 
@@ -436,10 +436,10 @@ test_code_mode_reports_what_its_script_did :: proc(t: ^testing.T) {
 	read_arguments := make(json.Object, context.temp_allocator)
 	defer delete(read_arguments)
 	read_arguments["call_seq"] = json.Integer(child_seqs[0])
-	page := tool_result_read_execute(&reader_ctx, read_arguments)
+	page := tool_test_execute(&reader_ctx, TOOL_RESULT_READ_DEFINITION, read_arguments)
 	defer tool_result_destroy(&page)
 	testing.expect_value(t, page.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(page.content, `"status":"success"`), page.content)
+	testing.expect(t, strings.contains(page.content, "ok\n"), page.content)
 }
 
 // A worker-placed call runs on its own thread: the test thread keeps going while the

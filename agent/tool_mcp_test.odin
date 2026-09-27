@@ -33,7 +33,7 @@ test_mcp_exchange_records_delivery_without_payloads :: proc(t: ^testing.T) {
 		correlation = Log_Correlation{call_id = ctx.call_id},
 	}
 	context.logger = log_logger(&binding)
-	result := tool_mcp_execute(&ctx, json.Object{})
+	result := tool_mcp_execute(&ctx, nil)
 	defer tool_result_destroy(&result)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Unavailable)
 
@@ -142,7 +142,7 @@ test_mcp_result_shows_text_and_reports_what_it_omits :: proc(t: ^testing.T) {
 	testing.expect(t, !strings.contains(result.content, "aGVsbG8"), "the payload is not carried")
 	testing.expect(
 		t,
-		strings.contains(result.content, `"structured_content":{"number":12}`),
+		strings.contains(result.content, "structured_content:\n{\"number\":12}"),
 		"structured content is spliced in as a value rather than escaped as a string",
 	)
 }

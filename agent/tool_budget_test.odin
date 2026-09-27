@@ -49,8 +49,8 @@ test_a_result_is_charged_what_it_costs_and_a_later_result_is_reserved_for :: pro
 }
 
 // budget_test_fixture is a session whose workspace holds one file the read tool can
-// return, so the result comes from the production tool path rather than from a
-// hand-built envelope.
+// return, so the result comes from the production tool path rather than from one built
+// by hand.
 @(private)
 budget_test_fixture :: proc(t: ^testing.T, fixture: ^Chat_Test, workspace: ^string, lines, line_bytes: int) -> (chat: ^Chat_Session, content: string) {
 	directory, directory_err := os.make_directory_temp("", "nabla-batch-budget-*", context.allocator)
@@ -143,7 +143,7 @@ test_a_result_the_batch_cannot_afford_is_kept_and_referenced :: proc(t: ^testing
 	arguments := make(json.Object, context.temp_allocator)
 	defer delete(arguments)
 	arguments["call_seq"] = json.Integer(call_seq)
-	page := tool_result_read_execute(&ctx, arguments)
+	page := tool_test_execute(&ctx, TOOL_RESULT_READ_DEFINITION, arguments)
 	defer tool_result_destroy(&page)
 	testing.expect_value(t, page.outcome, session.Tool_Outcome.Success)
 	testing.expect(t, strings.contains(page.content, "aaaa"), "the kept output is what the read returns")

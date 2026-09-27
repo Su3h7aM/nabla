@@ -38,19 +38,8 @@ TOOL_SHELL_DEFAULT_TIMEOUT :: 120 * time.Second
 TOOL_MAX_STDOUT_BYTES :: 24 * 1024
 TOOL_MAX_STDERR_BYTES :: 24 * 1024
 
-// Both excerpts plus the JSON envelope must fit the result budget together.
+// Both excerpts and the rest of the result must fit the result budget together.
 #assert(TOOL_MAX_STDOUT_BYTES + TOOL_MAX_STDERR_BYTES < TOOL_MAX_RESULT_BYTES)
-
-// Shell_Data is what a command produced. exit_code is present only when the
-// command exited rather than being ended by a signal.
-Shell_Data :: struct {
-	stdout:            string `json:"stdout"`,
-	stderr:            string `json:"stderr"`,
-	exit_code:         Maybe(int) `json:"exit_code"`,
-	stdout_truncated:  bool `json:"stdout_truncated"`,
-	stderr_truncated:  bool `json:"stderr_truncated"`,
-	output_incomplete: bool `json:"output_incomplete"`,
-}
 
 // tool_shell_definition is the shell tool, described for the shell this process
 // will run: the shell decides the syntax the model has to write, and the tool does
@@ -66,22 +55,15 @@ tool_shell_definition :: proc(shell: string, allocator := context.allocator) -> 
 		// static answer for everything but the open world it can reach.
 		hints = {read_only = .Unknown, destructive = .Unknown, idempotent = .Unknown, open_world = .Yes},
 		timeout = TOOL_SHELL_DEFAULT_TIMEOUT,
+		kind = .Shell,
 		execute = tool_shell_execute,
 	}
-}
-
-// Tool_Shell_Args is the shell's own view of a call. Its strings borrow the
-// argument document, so they live only as long as that document does.
-Tool_Shell_Args :: struct {
-	command:           string,
-	working_directory: string, // "" means the workspace root
-	timeout:           time.Duration,
 }
 
 // tool_shell_args reads the shell's arguments and reports the first defect
 // instead of a value, so a refused call is described exactly. A timeout the
 // model gives is honored as given; otherwise the definition's default applies.
-tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Tool_Shell_Args, Tool_Argument_Error) {
+tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Shell_Args, Tool_Argument_Error) {
 	if known_error := tool_fields_known(arguments, TOOL_SHELL_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
 	command, command_error := tool_field_string(arguments, "command", allocator = ctx.allocator)
 	if command_error.kind != .None { return {}, command_error }
@@ -116,10 +98,8 @@ tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write:
 	return tool_spawn_grouped(TOOL_SHELL_FALLBACK, command, directory, stdout_write, stderr_write)
 }
 
-tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_Result {
-	args, args_error := tool_shell_args(ctx, arguments)
-	defer if args_error.kind != .None { tool_argument_error_destroy(&args_error, ctx.allocator) }
-	if args_error.kind != .None { return tool_result_refused(ctx, &args_error) }
+tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	args := arguments.(Shell_Args)
 
 	directory, resolve_error := tool_resolve_path(ctx.workspace, args.working_directory, "working_directory", ctx.allocator)
 	if resolve_error.kind != .None { return tool_result_refused(ctx, &resolve_error) }
@@ -131,7 +111,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 		return tool_result_refused(ctx, &missing)
 	}
 
-	data: Shell_Data
+	data: Shell_Output
 	defer {
 		delete(data.stdout, ctx.allocator)
 		delete(data.stderr, ctx.allocator)
@@ -180,13 +160,13 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: json.Object) -> Tool_R
 
 // tool_shell_not_started reports a command that did not start, naming the
 // system's reason.
-tool_shell_not_started :: proc(ctx: ^Tool_Context, cause: os.Error, data: Shell_Data) -> Tool_Result {
+tool_shell_not_started :: proc(ctx: ^Tool_Context, cause: os.Error, data: Shell_Output) -> Tool_Result {
 	return tool_shell_finish(ctx, .Tool_Failed, fmt.tprintf("the command did not start: %s", os.error_string(cause)), data)
 }
 
 // tool_shell_finish bounds the captured streams to valid UTF-8 inside the model
-// result budget and builds the envelope.
-tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, message: string, captured: Shell_Data, reason := "") -> Tool_Result {
+// result budget and builds the result.
+tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, message: string, captured: Shell_Output, reason := "") -> Tool_Result {
 	data := captured
 	stdout_sanitized, stdout_cut := tool_sanitize_stream(data.stdout, TOOL_MAX_STDOUT_BYTES, ctx.allocator)
 	defer delete(stdout_sanitized, ctx.allocator)
@@ -199,10 +179,10 @@ tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, mes
 
 	result := tool_result_of(ctx, outcome, message, data, reason)
 	for len(result.content) > TOOL_MAX_RESULT_BYTES {
-		delete(result.content, ctx.allocator)
+		tool_result_destroy(&result)
 		if len(data.stdout) == 0 && len(data.stderr) == 0 {
 			data.output_incomplete = true
-			result.content = tool_content_json(outcome, "the result did not fit the harness budget", data, ctx.allocator)
+			result = tool_result_of(ctx, outcome, "the result did not fit the harness budget", data, reason)
 			break
 		}
 		if len(data.stdout) >= len(data.stderr) {
@@ -213,7 +193,7 @@ tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, mes
 			data.stderr_truncated = true
 		}
 		data.output_incomplete = true
-		result.content = tool_content_json(outcome, message, data, ctx.allocator)
+		result = tool_result_of(ctx, outcome, message, data, reason)
 	}
 	return result
 }

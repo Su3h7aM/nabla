@@ -991,7 +991,7 @@ A default changes only with a measurement from the journal or a benchmark test. 
 | `http/client` 50 ms `WAIT_SLICE` probe checks, `SHUTDOWN_JOIN_POLL` | one wait on the socket or thread and a stop wake, with a real deadline as the only timeout |
 | result and output caps (`TOOL_MAX_RESULT_BYTES`, the read window cap, Lua log and message caps) | whole results projected through the context budget (section 14.3) |
 | one native lane, serial Code Mode children | access-class scheduler, `job.start` / `job.wait` |
-| JSON envelope for native results and Lua transport | typed `Tool_Args` / `Tool_Output`, rendered once at commit |
+| a result rendered where the executor built it | typed output kept until commit, rendered once at commit |
 | `builtin_edit` old/new replacements | `builtin_patch` |
 | instruction snapshot frozen per session | snapshot per turn from live config, digests recorded |
 | `Chat_Observer` callbacks on the owner thread | `View_Queue` consumed by frontends |

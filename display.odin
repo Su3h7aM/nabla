@@ -1,6 +1,5 @@
 package main
 
-import "core:encoding/json"
 import "core:fmt"
 import "core:strings"
 import "core:time"
@@ -203,59 +202,22 @@ display_duration :: proc(delay: time.Duration) -> string {
 	return fmt.tprintf("%.0fs", seconds)
 }
 
-// tool_entry_text renders one tool box: the call's name, then the preview of
-// its result. A live turn and a replayed session build the box here, so a
-// resumed conversation shows what the call produced rather than the raw
-// envelope the model reads.
+// tool_entry_text renders one tool box: the call's name, then the preview of its result. A
+// live turn and a replayed session build the box here, so a resumed conversation shows what
+// the call produced rather than the outcome line the model reads first.
 tool_entry_text :: proc(name, content, fallback: string) -> string {
 	preview := tool_display_preview(content)
 	if preview == "" { preview = fallback }
 	return fmt.tprintf("%s\n%s", name, preview)
 }
 
-// tool_display_preview extracts the tool's useful payload from the model-facing
-// result envelope. JSON string escapes are decoded by the parser, so newlines
-// become display lines instead of literal backslash-n text.
+// tool_display_preview returns the raw body of a rendered tool result.
 tool_display_preview :: proc(content: string) -> string {
-	if content == "" { return "" }
-	value, parse_err := json.parse_string(content, .JSON, true, context.temp_allocator)
-	if parse_err != nil { return "" }
-	defer json.destroy_value(value, context.temp_allocator)
-	envelope, envelope_ok := value.(json.Object)
-	if !envelope_ok { return "" }
-	data, data_ok := envelope["data"].(json.Object)
-	if data_ok {
-		stdout := ""
-		stderr := ""
-		if value, ok := data["stdout"].(json.String); ok { stdout = string(value) }
-		if value, ok := data["stderr"].(json.String); ok { stderr = string(value) }
-		if stdout != "" && stderr != "" {
-			return fmt.tprintf("%s\n%s", stdout, stderr)
-		}
-		if stdout != "" { return strings.clone(stdout, context.temp_allocator) }
-		if stderr != "" { return strings.clone(stderr, context.temp_allocator) }
-		if file_text, ok := data["content"].(json.String); ok {
-			return strings.clone(string(file_text), context.temp_allocator)
-		}
-		if blocks, ok := data["content"].(json.Array); ok {
-			for block in blocks {
-				if object, object_ok := block.(json.Object); object_ok {
-					if text, text_ok := object["text"].(json.String); text_ok {
-						return strings.clone(string(text), context.temp_allocator)
-					}
-				}
-			}
-		}
-	}
-	if message, ok := envelope["message"].(json.String); ok {
-		return strings.clone(string(message), context.temp_allocator)
-	}
-	return ""
+	return agent.tool_result_body(content)
 }
 
-// tool_display_summary renders one result line for the transcript. The full
-// JSON envelope goes to the model; a human gets the tool's own short line and
-// the outcome name when it has none.
+// tool_display_summary renders one result line for the transcript. The full rendering goes to
+// the model; a human gets the tool's own short line and the outcome name when it has none.
 tool_display_summary :: proc(result: ^agent.Tool_Result) -> string {
 	if result.reason != "" { return result.reason }
 	return session.tool_outcome_name(result.outcome)

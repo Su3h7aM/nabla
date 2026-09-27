@@ -719,10 +719,9 @@ test_new_and_resume_switch_and_replay :: proc(t: ^testing.T) {
 	testing.expect(t, found, "resuming should replay the conversation")
 }
 
-// A replayed tool call is the box a live turn showed: the call's name, the
-// preview of what the tool produced, and the outcome its border is colored by.
-// The model-facing envelope is not the preview, and a resumed session used to
-// show it as the box's title.
+// A replayed tool call is the box a live turn showed: the call's name, the preview of what
+// the tool produced, and the outcome its border is colored by. The outcome line the model
+// reads first is not the preview, and a resumed session used to show it as the box's title.
 @(test)
 test_resume_replays_a_tool_call_as_a_box :: proc(t: ^testing.T) {
 	app: App
@@ -769,11 +768,7 @@ test_resume_replays_a_tool_call_as_a_box :: proc(t: ^testing.T) {
 			request_no = request_no,
 			created_at_ms = 2_001,
 			related_seq = call_seq,
-			payload = session.Tool_Result_Entry {
-				outcome = .Success,
-				content = `{"status":"success","message":"","data":{"stdout":"first\nsecond\n","stderr":""}}`,
-				origin = .Observed,
-			},
+			payload = session.Tool_Result_Entry{outcome = .Success, content = "ok\nexit_code: 3\n\nstdout:\nfirst\nsecond\n", origin = .Observed},
 		},
 	)
 	if !testing.expect(t, result_err == nil, "the result entry must be recorded") { return }
@@ -788,7 +783,7 @@ test_resume_replays_a_tool_call_as_a_box :: proc(t: ^testing.T) {
 		if entry.kind != .Tool { continue }
 		replayed = true
 		testing.expect_value(t, entry.tool_outcome, session.Tool_Outcome.Success)
-		testing.expect_value(t, string(entry.text[:]), "builtin_shell\nfirst\nsecond\n")
+		testing.expect_value(t, string(entry.text[:]), "builtin_shell\nstdout:\nfirst\nsecond\n")
 	}
 	testing.expect(t, replayed, "resuming should replay the tool call")
 }

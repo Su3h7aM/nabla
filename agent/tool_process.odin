@@ -334,7 +334,7 @@ tool_drain_pipes :: proc(
 	start: time.Tick,
 	budget: time.Duration,
 	control: Tool_Control,
-	data: ^Shell_Data,
+	data: ^Shell_Output,
 	allocator: mem.Allocator,
 ) -> (
 	Tool_Stop,

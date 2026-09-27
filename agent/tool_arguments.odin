@@ -113,22 +113,25 @@ tool_argument_error_text :: proc(err: Tool_Argument_Error, allocator := context.
 	return ""
 }
 
-// Tool_Argument_Detail is the machine-readable half of a refusal, carried as the
-// data of the result envelope. Its strings borrow the error it describes, so it
-// lives only as long as that error does.
-Tool_Argument_Detail :: struct {
-	kind:     string `json:"kind"`,
-	field:    string `json:"field"`,
-	expected: string `json:"expected"`,
+// Argument_Failure is the output of a refusal: which argument was wrong and what was
+// expected of it. Its strings borrow the error it describes, so it lives only as long
+// as that error does.
+Argument_Failure :: struct {
+	kind:     string,
+	field:    string,
+	expected: string,
 }
 
-tool_argument_detail :: proc(err: Tool_Argument_Error) -> Tool_Argument_Detail {
+tool_argument_failure :: proc(err: Tool_Argument_Error) -> Argument_Failure {
 	return {kind = tool_argument_error_code(err), field = err.field, expected = err.expected}
 }
 
 // --- admitting a document ----------------------------------------------------
 
 Tool_Arguments_Status :: enum {
+	// None is the zero value: no admission has been attempted yet, which is what a job that
+	// arrives with its own document reads as.
+	None,
 	Rejected,
 	Valid,
 	Repaired,
@@ -153,11 +156,13 @@ tool_arguments_destroy :: proc(arguments: ^Tool_Arguments, allocator := context.
 	arguments^ = {}
 }
 
-// tool_arguments_prepare admits a proposed argument document, repairing it only
-// when the repair is forced, and reads the repaired form in full before anything
-// runs. Nothing but raw control bytes inside a string literal is ever rewritten,
-// and no value is ever invented.
+// tool_arguments_prepare admits a proposed argument document, repairing it only when the
+// repair is forced, and reads the repaired form in full before anything runs. Nothing but raw
+// control bytes inside a string literal is ever rewritten, and no value is ever invented.
 tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (arguments: Tool_Arguments) {
+	// Every way out of here either says the document is valid or names the defect that refused
+	// it, so the status is never left to mean two things.
+	arguments.status = .Rejected
 	if raw == "" {
 		arguments.error = tool_argument_error(.Syntax, allocator = allocator)
 		return
@@ -178,8 +183,8 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 			arguments.effective = effective
 			return
 		}
-		// Admission guarantees the parser accepts the document, so this is
-		// unreachable in practice; refusing is the only safe answer.
+		// Admission guarantees the parser accepts the document, so this is unreachable in
+		// practice; refusing is the only safe answer.
 		arguments.error = tool_argument_error(.Syntax, allocator = allocator)
 		return
 	}
