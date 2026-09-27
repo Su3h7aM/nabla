@@ -61,6 +61,7 @@ chat_session_observe :: proc(chat: ^Chat_Session) {
 chat_session_observe_at :: proc(chat: ^Chat_Session, now: time.Tick) {
 	chat_session_observe_stop(chat)
 	tool_jobs_reclaim(&chat.abandoned_jobs)
+	agent_team_reap(chat.team)
 	if !chat.tool_jobs_active { return }
 	tool_jobs_observe(&chat.tool_jobs, chat, now)
 }
@@ -352,13 +353,13 @@ chat_session_terminal_status :: proc(chat: ^Chat_Session) -> Chat_Terminal_Statu
 // committed. Recording is what makes the line the session's, and the entry is ordered
 // where it is written, so the request that follows reads the line after everything that
 // was committed before it.
-chat_session_steer :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> Chat_Steer_Result {
+chat_session_steer :: proc(chat: ^Chat_Session, text: string, at_ms: i64, origin := session.User_Origin.Steering) -> Chat_Steer_Result {
 	turn_no, has_turn := chat.turn_no.?
 	if !has_turn { return .No_Turn }
 	entry := session.New_Entry {
 		turn_no = turn_no,
 		created_at_ms = at_ms,
-		payload = session.User_Entry{text = text, origin = .Steering},
+		payload = session.User_Entry{text = text, origin = origin},
 	}
 	if _, err := session.entry_append(chat.store, chat.id, entry); err != nil {
 		chat_session_record_failure(chat, "the steering line could not be recorded", err)

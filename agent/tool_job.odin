@@ -406,6 +406,15 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	// A worker must not reach the session's state, and it does not have to: the tool that
 	// changes the context is owner-placed.
 	if definition.placement == .Owner { job.exec.compact = &chat.compact }
+	switch definition.kind {
+	case .Agent_Spawn, .Agent_Send, .Agent_Stop:
+		job.exec.agents = chat.team if chat.member == nil else nil
+		job.exec.member = chat.member
+		// A blocking subagent holds its worker for its whole run, so each has a lane of its
+		// own and several run side by side.
+		if definition.kind == .Agent_Spawn { job.lane = job }
+	case .Custom, .Read, .Write, .Patch, .Shell, .List_Skills, .Load_Skill, .Compact, .Codemode, .MCP:
+	}
 
 	// A provider call is admitted here, from the text it arrived as. A Lua child call arrives
 	// admitted, because its value came from Lua and was checked where it was read.

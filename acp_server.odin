@@ -843,14 +843,25 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 	// The completion flag is read because the terminal status alone cannot report a
 	// turn the store could not record: the status still names what the model reached,
 	// so an unrecorded completion is corrected to a failure below.
-	turn_completed := agent.chat_run_turn_steered(
-		chat,
-		server.app.run.connection,
-		agent.chat_retry_policy_default(),
-		acp_observer(server),
-		nil,
-		&server.app.run.control,
-	)
+	chat.catalog = app_catalog_ref(&server.app)
+	observer := acp_observer(server)
+	turn_completed := agent.chat_run_turn_steered(chat, server.app.run.connection, agent.chat_retry_policy_default(), observer, nil, &server.app.run.control)
+	// The prompt is answered once its work is done, so it waits for the subagents it started
+	// in the background and answers each report with a turn of its own.
+	for turn_completed && agent.chat_agents_wait(chat, &server.app.run.control.stop) {
+		if report, _ := agent.chat_session_accept_agent_message(chat, observer); report != .Accepted {
+			turn_completed = false
+			break
+		}
+		turn_completed = agent.chat_run_turn_steered(
+			chat,
+			server.app.run.connection,
+			agent.chat_retry_policy_default(),
+			observer,
+			nil,
+			&server.app.run.control,
+		)
+	}
 
 	status := chat.terminal_status
 	if !turn_completed && status == .Completed { status = .Failed }

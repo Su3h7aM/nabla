@@ -147,6 +147,7 @@ chat_build_request_into :: proc(
 		// that only some endpoints read.
 		Session_Id_Present   = true,
 		Session_Id           = string(chat.id),
+		Parent_Session_Id    = chat_parent_session(chat),
 	}
 	// The harness replays history itself, so the endpoint is asked not to keep a
 	// second copy. On Responses this also makes reasoning items carry their
@@ -163,9 +164,11 @@ chat_build_request_into :: proc(
 	// implicit breakpoint advances through the newest eligible boundary on its
 	// own; on both APIs the key is the routing hint for models that need one. A
 	// compaction request shares the conversation's identity because it shares the
-	// conversation's prefix.
+	// conversation's prefix. A subagent uses its orchestrator's key: its requests open with
+	// the orchestrator's tools and instructions, so they belong on the same cache.
 	prep.request.Prompt_Cache_Key_Present = true
 	prep.request.Prompt_Cache_Key = string(chat.id)
+	if parent := chat_parent_session(chat); parent != "" { prep.request.Prompt_Cache_Key = parent }
 	if chat.effort != "" {
 		prep.request.Reasoning_Effort_Present = true
 		prep.request.Reasoning_Effort = chat.effort

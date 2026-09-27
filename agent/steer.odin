@@ -7,24 +7,20 @@ import "core:sync"
 import "nabla:agent/session"
 import "nabla:ai"
 
-// Steering accepts input while a turn is running. A line the user sends is a message the
-// model has not answered, so the turn makes the request that answers it: recording the line
-// puts it in the next request the turn builds, and a turn that had already answered
-// continues instead of finishing. That is the whole difference from a prompt sent while
-// idle, which starts a turn of its own. Nothing here drops a line the user sent: it waits in
-// the queue until the session holds it, and a store that cannot record it leaves it waiting.
+// Steering accepts input while a turn is running. A line the user or another agent sends is
+// a message the model has not answered, so the turn makes the request that answers it:
+// recording the line puts it in the next request the turn builds, and a turn that had
+// already answered continues instead of finishing. That is the whole difference from a
+// prompt sent while idle, which starts a turn of its own. Nothing here drops a line: it
+// waits in the queue until the session holds it, and a store that cannot record it leaves
+// it waiting.
 //
-// The front-end owns reading input, so it pushes lines here; the execution thread remains
-// the only session writer. There are no parallel model requests and no scheduler. The
-// queue is written by the front-end's thread and read by the execution thread, so it is
-// guarded.
-STEER_MAX_ITEMS :: 8
-STEER_MAX_BYTES :: 32 * 1024
-
+// Producers on other threads push lines here: the front-end, and the agents a session
+// talks to. The execution thread remains the only session writer, so the queue is guarded.
+// It holds whatever was sent until it is recorded; a message is never refused for its size.
 Steer_Queue :: struct {
 	mu:        sync.Mutex,
 	items:     [dynamic]string, // owned FIFO
-	bytes:     int,
 	allocator: mem.Allocator,
 }
 
@@ -38,18 +34,20 @@ steer_queue_destroy :: proc(queue: ^Steer_Queue) {
 	queue^ = {}
 }
 
-// steer_push clones a line into the queue. False means the bounds rejected it;
-// the caller keeps nothing either way.
+// steer_push clones a line into the queue and wakes the owner. False means the line could
+// not be allocated; the caller keeps nothing either way.
 steer_push :: proc(queue: ^Steer_Queue, text: string) -> bool {
-	ok := false
+	line, clone_error := strings.clone(text, queue.allocator)
+	if clone_error != nil { return false }
 	sync.mutex_lock(&queue.mu)
-	if len(queue.items) < STEER_MAX_ITEMS && queue.bytes + len(text) <= STEER_MAX_BYTES {
-		append(&queue.items, strings.clone(text, queue.allocator))
-		queue.bytes += len(text)
-		ok = true
-	}
+	_, append_error := append(&queue.items, line)
 	sync.mutex_unlock(&queue.mu)
-	return ok
+	if append_error != nil {
+		delete(line, queue.allocator)
+		return false
+	}
+	owner_wake_signal()
+	return true
 }
 
 // steer_pop transfers ownership of the oldest line. False means empty.
@@ -59,8 +57,13 @@ steer_pop :: proc(queue: ^Steer_Queue) -> (string, bool) {
 	if len(queue.items) == 0 { return "", false }
 	line := queue.items[0]
 	ordered_remove(&queue.items, 0)
-	queue.bytes -= len(line)
 	return line, true
+}
+
+// steer_pending reports whether a line is waiting.
+steer_pending :: proc(queue: ^Steer_Queue) -> bool {
+	sync.mutex_guard(&queue.mu)
+	return len(queue.items) > 0
 }
 
 // steer_requeue puts a popped line back at the front of the queue and takes its
@@ -75,7 +78,6 @@ steer_requeue :: proc(queue: ^Steer_Queue, line: string) -> bool {
 		delete(line, queue.allocator)
 		return false
 	}
-	queue.bytes += len(line)
 	return true
 }
 
@@ -88,7 +90,6 @@ steer_take_all :: proc(queue: ^Steer_Queue) -> [dynamic]string {
 	taken := make([dynamic]string, 0, len(queue.items), queue.allocator)
 	append(&taken, ..queue.items[:])
 	clear(&queue.items)
-	queue.bytes = 0
 	return taken
 }
 
@@ -119,32 +120,37 @@ Steer_Context :: struct {
 	apply_data: rawptr,
 }
 
-// chat_drain_steering hands the queued lines to the session, oldest first, and reports how
-// many it recorded. A line leaves the queue only once the session has recorded it: recording
-// is what makes the line the session's, and a store that refuses the write leaves it pending
-// instead of dropping a message the user sent. The refusal is reported, so a line that cannot
-// be delivered yet is diagnosable rather than gone.
+// chat_drain_steering hands the lines the user queued to the session. See chat_drain_queue.
 chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) -> int {
+	return chat_drain_queue(chat, observer, steer.queue, .Steering)
+}
+
+// chat_drain_queue hands the queued lines to the session, oldest first, and reports how many
+// it recorded. A line leaves the queue only once the session has recorded it: recording is
+// what makes the line the session's, and a store that refuses the write leaves it pending
+// instead of dropping a message. The refusal is reported, so a line that cannot be delivered
+// yet is diagnosable rather than gone.
+chat_drain_queue :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue: ^Steer_Queue, origin: session.User_Origin) -> int {
 	recorded := 0
 	for {
-		line, ok := steer_pop(steer.queue)
+		line, ok := steer_pop(queue)
 		if !ok { break }
-		switch chat_session_steer(chat, line, session.now_ms()) {
+		switch chat_session_steer(chat, line, session.now_ms(), origin) {
 		case .Recorded:
 			_observer_user_text(observer, line)
-			steer_line_free(steer.queue, line)
+			steer_line_free(queue, line)
 			recorded += 1
 		case .No_Turn:
 			// Nothing has run that could carry the line, so it waits for the turn that
 			// will, and the caller is told which condition is holding it up.
 			_observer_message(observer, .Warning, "the steering line is waiting for a turn to carry it")
-			steer_requeue(steer.queue, line)
+			steer_requeue(queue, line)
 			return recorded
 		case .Storage_Failed:
 			// The store refused it, so the line stays pending: the session's own error says
-			// why, and nothing else may drop a message the user sent.
+			// why, and nothing else may drop a message.
 			_observer_message(observer, .Error, chat.last_error)
-			if !steer_requeue(steer.queue, line) {
+			if !steer_requeue(queue, line) {
 				_observer_message(observer, .Warning, "the steering line could not stay pending")
 			}
 			return recorded
@@ -153,10 +159,11 @@ chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer:
 	return recorded
 }
 
-// chat_steering_observe is the driver's collection step for input the front-end queued while
-// the turn ran. It records the lines at a settled point of the turn, and a line recorded for
-// a turn that had finished answering continues that turn: a message the user sent is one the
-// model has not answered, so the next request this turn makes is the one that answers it.
+// chat_steering_observe is the driver's collection step for input queued while the turn ran:
+// the user's lines, then the messages other agents sent this session. It records them at a
+// settled point of the turn, and a line recorded for a turn that had finished answering
+// continues that turn: a message is one the model has not answered, so the next request this
+// turn makes is the one that answers it.
 //
 // That is the whole difference between steering and a prompt sent while idle, which starts a
 // turn of its own. A turn that failed or was cancelled keeps its outcome; its input stays in
@@ -164,6 +171,9 @@ chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer:
 chat_steering_observe :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) {
 	point := chat_session_input_point(chat)
 	if point == .Wait { return }
-	if chat_drain_steering(chat, observer, steer) == 0 { return }
+	recorded := 0
+	if steer != nil { recorded += chat_drain_steering(chat, observer, steer) }
+	if chat.inbox != nil && chat_session_input_point(chat) != .Wait { recorded += chat_drain_queue(chat, observer, chat.inbox, .Agent) }
+	if recorded == 0 { return }
 	if point == .After_Answer { chat_session_continue_for_input(chat) }
 }

@@ -35,9 +35,18 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 			// A stop that arrived with nothing queued leaves through the drain loop
 			// below, so shutdown never waits on a compaction to finish.
 			if runtime_stopping(app) { break }
+			// A background subagent's report that arrived while idle starts a turn of its own.
+			if app_agent_report_turn(app, observer) {
+				refresh_status(app)
+				free_all(context.temp_allocator)
+				continue
+			}
 			// An outstanding compaction is serviced while idle, so a finished summary does
 			// not wait for the next prompt. Work senders signal the same wake.
-			if app_compaction_pending(app) {
+			// While subagents run, the worker waits on the wake instead of the queue, because
+			// their reports arrive through the wake.
+			agents_pending := app.setup.session.store != nil && agent.chat_agents_pending(&app.setup.session)
+			if app_compaction_pending(app) || agents_pending {
 				if app_compaction_tick(app, observer) { refresh_status(app) }
 				free_all(context.temp_allocator)
 				agent.owner_wake_wait(seen, agent.chat_compact_deadline(&app.setup.session))
@@ -161,20 +170,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			return
 		}
 		snap_append(app, .User, work.text)
-		// A stop the front-end asked for is for a running turn, and none runs until the flag
-		// below is set, so an older request is cleared first. Shutdown that already began
-		// stops this turn too, rather than waiting out a whole model request.
-		agent.turn_control_clear(&app.run.control)
-		set_running(app, true)
-		if runtime_stopping(app) { agent.turn_control_stop(&app.run.control) }
-		steer := agent.Steer_Context {
-			queue      = &app.run.steer,
-			apply      = app_steer_apply,
-			apply_data = app,
-		}
-		// How the turn ended reaches the front-end through the observer, which reports the
-		// terminal status, so the worker has nothing of its own to do with the return.
-		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)
+		run_accepted_turn(app, observer)
 	// Steering lines left queued here arrived after the turn recorded what it was sent,
 	// so they are not part of its history. Its end is still the caller's to report, and
 	// the front-end returns them to the prompt when it sees the runtime stop running.
@@ -233,6 +229,45 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	}
 	if rows_dirty { session_refresh_rows(app) }
 	refresh_status(app)
+}
+
+// run_accepted_turn runs the turn the session just accepted.
+run_accepted_turn :: proc(app: ^App, observer: agent.Chat_Observer) {
+	app.setup.session.catalog = app_catalog_ref(app)
+	// A stop the front-end asked for is for a running turn, and none runs until the flag
+	// below is set, so an older request is cleared first. Shutdown that already began
+	// stops this turn too, rather than waiting out a whole model request.
+	agent.turn_control_clear(&app.run.control)
+	set_running(app, true)
+	if runtime_stopping(app) { agent.turn_control_stop(&app.run.control) }
+	steer := agent.Steer_Context {
+		queue      = &app.run.steer,
+		apply      = app_steer_apply,
+		apply_data = app,
+	}
+	// How the turn ended reaches the front-end through the observer, which reports the
+	// terminal status, so the worker has nothing of its own to do with the return.
+	agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)
+}
+
+// app_agent_report_turn runs a turn for the oldest message a subagent sent while no turn ran,
+// and reports whether there was one.
+app_agent_report_turn :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
+	if app.setup.session.store == nil { return false }
+	accepted, had_message := agent.chat_session_accept_agent_message(&app.setup.session, observer)
+	if !had_message { return false }
+	if accepted != .Accepted {
+		snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
+		return false
+	}
+	run_accepted_turn(app, observer)
+	return true
+}
+
+// app_catalog_ref is the catalog subagents resolve models from, with the lock it is
+// replaced under.
+app_catalog_ref :: proc(app: ^App) -> agent.Catalog_Ref {
+	return {catalog = &app.setup.catalog, mutex = &app.catalog_mu}
 }
 
 // session_resume switches to the session a full id or an unambiguous prefix

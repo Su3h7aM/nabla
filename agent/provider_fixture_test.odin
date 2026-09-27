@@ -124,7 +124,9 @@ agent_provider_failed :: proc(provider: ^Agent_Provider) -> bool {
 	return provider.failed
 }
 
-agent_provider_start :: proc(t: ^testing.T, provider: ^Agent_Provider, responses: []string) -> bool {
+// agent_provider_start listens and serves responses in order. A deferred provider listens
+// but answers nothing until agent_provider_serve_now, so a test can hold a client mid-request.
+agent_provider_start :: proc(t: ^testing.T, provider: ^Agent_Provider, responses: []string, deferred := false) -> bool {
 	provider.responses = responses
 	provider.allocator = context.allocator
 	provider.requests = make([dynamic]string, 0, len(responses) + 1, provider.allocator)
@@ -149,8 +151,12 @@ agent_provider_start :: proc(t: ^testing.T, provider: ^Agent_Provider, responses
 		return false
 	}
 	provider.thread.data = provider
-	thread.start(provider.thread)
+	if !deferred { thread.start(provider.thread) }
 	return true
+}
+
+agent_provider_serve_now :: proc(provider: ^Agent_Provider) {
+	thread.start(provider.thread)
 }
 
 // agent_provider_stop ends the fixture: it waits for the responses it was given to

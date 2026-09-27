@@ -458,9 +458,9 @@ submit :: proc(app: ^App) {
 			// A steering line is not a command: commands keep their own path, which
 			// decides what can happen while a turn is running.
 			if !agent.steer_push(&app.run.steer, text) {
-				// The queue refused the line, and the prompt still holds it: the text stays
+				// The line could not be queued, and the prompt still holds it: the text stays
 				// where the user put it rather than being cleared into a warning.
-				snap_append(app, .Warning, "the steering queue is full; the line is still in the prompt")
+				snap_append(app, .Warning, "the steering line could not be queued; it is still in the prompt")
 				completion_reset(app)
 				return
 			}

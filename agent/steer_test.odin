@@ -70,43 +70,23 @@ test_a_boundary_hook_hands_the_next_request_its_connection :: proc(t: ^testing.T
 }
 
 @(test)
-test_steer_queue_is_fifo_and_bounded :: proc(t: ^testing.T) {
+test_steer_queue_is_fifo_and_keeps_every_line_whole :: proc(t: ^testing.T) {
 	queue := steer_queue_init(context.temp_allocator)
 	defer steer_queue_destroy(&queue)
 
 	testing.expect(t, steer_push(&queue, "first"))
-	testing.expect(t, steer_push(&queue, "second"))
+	large := strings.repeat("x", 1 << 20, context.temp_allocator)
+	testing.expect(t, steer_push(&queue, large))
 	line, ok := steer_pop(&queue)
 	testing.expect(t, ok)
 	testing.expect_value(t, line, "first")
 	delete(line, context.temp_allocator)
 	line, ok = steer_pop(&queue)
 	testing.expect(t, ok)
-	testing.expect_value(t, line, "second")
+	testing.expect_value(t, len(line), len(large))
 	delete(line, context.temp_allocator)
 	_, ok = steer_pop(&queue)
 	testing.expect(t, !ok)
-
-	for _ in 0 ..< STEER_MAX_ITEMS {
-		testing.expect(t, steer_push(&queue, "x"))
-	}
-	testing.expect(t, !steer_push(&queue, "dropped"))
-	taken := steer_take_all(&queue)
-	testing.expect_value(t, len(taken), STEER_MAX_ITEMS)
-	steer_taken_destroy(&queue, taken)
-	testing.expect(t, steer_push(&queue, "again"))
-}
-
-@(test)
-test_steer_queue_bounds_total_bytes :: proc(t: ^testing.T) {
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-
-	filler := strings.repeat("x", 6000, context.temp_allocator)
-	defer delete(filler, context.temp_allocator)
-	pushes := 0
-	for steer_push(&queue, filler) { pushes += 1 }
-	testing.expect(t, pushes == 5)
 }
 
 // Taking the queue hands every line over in order and leaves the queue empty with its own
@@ -125,12 +105,6 @@ test_taking_the_queue_hands_every_line_over :: proc(t: ^testing.T) {
 	testing.expect_value(t, taken[1], "second")
 	_, has_line := steer_pop(&queue)
 	testing.expect(t, !has_line, "the queue is empty after taking its lines")
-
-	filler := strings.repeat("x", 6000, context.temp_allocator)
-	defer delete(filler, context.temp_allocator)
-	pushes := 0
-	for steer_push(&queue, filler) { pushes += 1 }
-	testing.expect_value(t, pushes, 5)
 }
 
 // A steering line is a message the user sent. Recording it is what makes it the session's,

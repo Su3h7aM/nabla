@@ -578,6 +578,18 @@ tool_field_optional_string :: proc(object: json.Object, name: string, path := ""
 	return "", tool_argument_error(.Wrong_Type, tool_field_path(path, name), "a string or null", allocator = allocator)
 }
 
+tool_field_optional_bool :: proc(object: json.Object, name: string, path := "", allocator := context.allocator) -> (bool, Tool_Argument_Error) {
+	value, present := object[name]
+	if !present { return false, nil }
+	#partial switch v in value {
+	case json.Null:
+		return false, nil
+	case json.Boolean:
+		return bool(v), nil
+	}
+	return false, tool_argument_error(.Wrong_Type, tool_field_path(path, name), "a boolean or null", allocator = allocator)
+}
+
 // The integer readers take the object's own slot, because a repaired value is written back
 // into the document so the recorded arguments say what ran. The repair is added to repairs.
 tool_field_int :: proc(

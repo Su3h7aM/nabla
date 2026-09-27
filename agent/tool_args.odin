@@ -18,6 +18,9 @@ Tool_Kind :: enum {
 	Compact,
 	Codemode,
 	MCP,
+	Agent_Spawn,
+	Agent_Send,
+	Agent_Stop,
 }
 
 // Tool_Args is one call's arguments, typed by the tool that will run it. A tool sees these
@@ -33,6 +36,9 @@ Tool_Args :: union {
 	List_Skills_Args,
 	Load_Skill_Args,
 	Codemode_Args,
+	Agent_Spawn_Args,
+	Agent_Send_Args,
+	Agent_Stop_Args,
 }
 
 Read_Args :: struct {
@@ -95,6 +101,12 @@ tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object
 		return nil, tool_fields_known(object, nil, allocator = ctx.allocator)
 	case .Codemode:
 		return tool_codemode_args(ctx, object)
+	case .Agent_Spawn:
+		return tool_agent_spawn_args(ctx, object)
+	case .Agent_Send:
+		return tool_agent_send_args(ctx, object)
+	case .Agent_Stop:
+		return tool_agent_stop_args(ctx, object)
 	case .Custom, .MCP:
 		// The tool validates its own arguments, so none are handed over and the document
 		// travels as admitted, with only its integer fields repaired from the schema.

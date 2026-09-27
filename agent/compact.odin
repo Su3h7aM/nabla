@@ -133,19 +133,20 @@ chat_compact_same_request :: proc(a, b: session.Entry) -> bool {
 // from, and may append as much history as it likes, without disturbing the bytes
 // that will be sent.
 Compact_Snapshot :: struct {
-	api:           ai.API_Kind,
-	endpoint:      string, // owned
-	credential:    string, // owned; a secret, never recorded or logged
-	body:          string, // owned; the encoded request
-	model:         string, // owned
-	tools:         int,
-	session_id:    string, // owned
-	user_agent:    string, // owned
-	base_seq:      Maybe(session.Seq), // the checkpoint this summary replaces
-	covered_seq:   session.Seq, // the last entry the summary stands in for
-	turn_no:       Maybe(session.Turn_No),
-	estimate:      int, // the whole compaction request
-	head_estimate: int, // the prefix the summary replaces, without instructions or tools
+	api:               ai.API_Kind,
+	endpoint:          string, // owned
+	credential:        string, // owned; a secret, never recorded or logged
+	body:              string, // owned; the encoded request
+	model:             string, // owned
+	tools:             int,
+	session_id:        string, // owned
+	parent_session_id: string, // owned; "" for a main session
+	user_agent:        string, // owned
+	base_seq:          Maybe(session.Seq), // the checkpoint this summary replaces
+	covered_seq:       session.Seq, // the last entry the summary stands in for
+	turn_no:           Maybe(session.Turn_No),
+	estimate:          int, // the whole compaction request
+	head_estimate:     int, // the prefix the summary replaces, without instructions or tools
 }
 
 // chat_compact_snapshot_make freezes a prepared request. Every string it keeps is
@@ -179,6 +180,7 @@ chat_compact_snapshot_make :: proc(
 			model = strings.clone(prep.request.Model, allocator),
 			tools = len(prep.request.Tools),
 			session_id = strings.clone(prep.request.Session_Id, allocator),
+			parent_session_id = strings.clone(prep.request.Parent_Session_Id, allocator),
 			user_agent = strings.clone(prep.request.User_Agent, allocator),
 			base_seq = base_seq,
 			covered_seq = covered_seq,
@@ -195,6 +197,7 @@ chat_compact_snapshot_destroy :: proc(snapshot: ^Compact_Snapshot, allocator: me
 	delete(snapshot.body, allocator)
 	delete(snapshot.model, allocator)
 	delete(snapshot.session_id, allocator)
+	delete(snapshot.parent_session_id, allocator)
 	delete(snapshot.user_agent, allocator)
 	snapshot^ = {}
 }
@@ -399,6 +402,7 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 		Tools              = job.snapshot.tools,
 		Session_Id_Present = job.snapshot.session_id != "",
 		Session_Id         = job.snapshot.session_id,
+		Parent_Session_Id  = job.snapshot.parent_session_id,
 		User_Agent_Present = job.snapshot.user_agent != "",
 		User_Agent         = job.snapshot.user_agent,
 	}

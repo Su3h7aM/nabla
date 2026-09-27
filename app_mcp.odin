@@ -250,6 +250,8 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	setup := &app.setup
 	if len(setup.mcp_servers) == 0 { return "" }
 	if agent.chat_session_state(&setup.session) != .Idle { return "" }
+	// Child and abandoned workers may still call through these bindings.
+	if agent.chat_session_workers_outstanding(&setup.session) { return "" }
 
 	setup.mcp.refresh_generation += 1
 	// The refresh is recorded against the session it changes, so the caller's

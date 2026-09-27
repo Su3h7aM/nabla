@@ -181,7 +181,20 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 		fmt.eprintln("nabla: the session is already running")
 		return false
 	}
-	completed := agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), headless_observer(out), nil)
+	chat := &app.setup.session
+	chat.catalog = app_catalog_ref(app)
+	observer := headless_observer(out)
+	completed := agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), observer, nil)
+	// A headless run ends when its work does, so it waits for the subagents it started in the
+	// background and answers each report with a turn of its own.
+	for completed && agent.chat_agents_wait(chat, nil) {
+		accepted, _ := agent.chat_session_accept_agent_message(chat, observer)
+		if accepted != .Accepted {
+			fmt.eprintln("nabla:", agent.chat_session_last_error(chat))
+			return false
+		}
+		completed = agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), observer, nil)
+	}
 	if out.write_failed {
 		fmt.eprintln("nabla: the answer could not be written")
 		return false

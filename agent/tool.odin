@@ -87,6 +87,10 @@ Tool_Context :: struct {
 	// repairs collects what reading the arguments changed in their values, which the owner
 	// records with the call and writes back into the arguments the call runs with.
 	repairs:        session.Tool_Repairs,
+	// agents is the calling orchestrator's team and member the calling subagent's own record,
+	// set only for the agent tools; the other is nil. Both outlive the call.
+	agents:         ^Agent_Team,
+	member:         ^Subagent,
 }
 
 // Tool_Execute runs one admitted call. Returning .Invalid_Arguments promises the
@@ -201,6 +205,22 @@ tool_registry_destroy :: proc(registry: ^Tool_Registry) {
 	for &definition in registry.definitions { tool_definition_destroy(&definition, registry.allocator) }
 	delete(registry.definitions)
 	registry^ = {}
+}
+
+// tool_registry_clone copies every definition of source into a registry of its own. Backend
+// pointers are copied, never owned.
+tool_registry_clone :: proc(source: ^Tool_Registry, allocator := context.allocator) -> (registry: Tool_Registry, err: Tool_Registry_Error) {
+	registry.allocator = allocator
+	definitions, alloc_error := make([dynamic]Tool_Definition, 0, len(source.definitions), allocator)
+	if alloc_error != nil { return {}, Tool_Registry_Error{kind = .Allocation} }
+	registry.definitions = definitions
+	for definition in source.definitions {
+		if add_error := tool_registry_add(&registry, definition); add_error.kind != .None {
+			tool_registry_destroy(&registry)
+			return {}, add_error
+		}
+	}
+	return registry, {}
 }
 
 // Tool_Registry_Error_Kind names why a definition was refused. None is the zero
@@ -514,6 +534,9 @@ TOOL_DECLARED := [?]Tool_Definition {
 	TOOL_LOAD_SKILL_DEFINITION,
 	TOOL_COMPACT_DEFINITION,
 	TOOL_CODEMODE_DEFINITION,
+	TOOL_AGENT_SPAWN_DEFINITION,
+	TOOL_AGENT_SEND_DEFINITION,
+	TOOL_AGENT_STOP_DEFINITION,
 }
 
 // TOOL_NATIVE_COUNT is how many native tools a registry holds: the declared ones,

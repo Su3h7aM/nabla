@@ -89,6 +89,16 @@ chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: str
 	}
 	rendered, rendered_error := render_instructions(files, discovered, chat.client_instructions, chat.tools_enabled, chat.allocator)
 	if rendered_error != nil { return "", "", {}, "local instructions could not be allocated" }
+	// A role goes last, so everything before it is the prefix the orchestrator already sends.
+	if chat.role_instructions != "" {
+		with_role, role_error := strings.concatenate({rendered, "\n\n", chat.role_instructions}, chat.allocator)
+		delete(rendered, chat.allocator)
+		if role_error != nil {
+			skills.catalog_destroy(&discovered, chat.allocator)
+			return "", "", {}, "local instructions could not be allocated"
+		}
+		rendered = with_role
+	}
 	if len(rendered) > INSTRUCTIONS_MAX_BYTES {
 		delete(rendered, chat.allocator)
 		skills.catalog_destroy(&discovered, chat.allocator)

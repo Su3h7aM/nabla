@@ -292,31 +292,6 @@ test_a_scheduled_retry_is_shown_until_the_send_clears_it :: proc(t: ^testing.T) 
 
 // A line the steering queue refuses is still the user's, and the prompt holds it: the text
 // is not cleared into a warning, so nothing the user typed leaves the prompt unrecorded.
-@(test)
-test_a_refused_steering_line_stays_in_the_prompt :: proc(t: ^testing.T) {
-	app: App
-	app.run.alloc = context.allocator
-	app.run.steer = agent.steer_queue_init(app.run.alloc)
-	defer {
-		agent.steer_queue_destroy(&app.run.steer)
-		snapshot_clear(&app)
-		delete(app.run.snap.entries)
-		widgets.input_destroy(&app.input)
-	}
-	widgets.input_init(&app.input, app.run.alloc)
-	set_running(&app, true)
-	for _ in 0 ..< agent.STEER_MAX_ITEMS {
-		testing.expect(t, agent.steer_push(&app.run.steer, "x"))
-	}
-	testing.expect(t, widgets.input_insert(&app.input, "check the logs"))
-
-	submit(&app)
-
-	testing.expect_value(t, widgets.input_text(&app.input), "check the logs")
-	if !testing.expect_value(t, len(app.run.snap.entries), 1) { return }
-	testing.expect_value(t, app.run.snap.entries[0].kind, Entry_Kind.Warning)
-}
-
 // Input a turn never recorded is still the user's text. It goes back to the prompt for an
 // explicit submit rather than starting a turn of its own, and it does not stay in the queue
 // for a later request to carry as well.

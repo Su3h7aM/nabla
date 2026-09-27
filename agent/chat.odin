@@ -467,6 +467,22 @@ chat_run_turn_steered :: proc(
 	steer: ^Steer_Context,
 	control: ^Turn_Control = nil,
 ) -> bool {
+	previous: posix.sigaction_t
+	chat_signal_arm(&previous)
+	defer chat_signal_disarm(&previous)
+	return chat_turn_drive(chat, connection, policy, observer, steer, control)
+}
+
+// chat_turn_drive is the turn loop without the process signal handler, for a turn that does
+// not own the terminal, such as a subagent's on its own thread.
+chat_turn_drive :: proc(
+	chat: ^Chat_Session,
+	connection: ai.Provider_Connection,
+	policy: Chat_Retry_Policy,
+	observer: Chat_Observer,
+	steer: ^Steer_Context,
+	control: ^Turn_Control,
+) -> bool {
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
 
@@ -477,10 +493,6 @@ chat_run_turn_steered :: proc(
 		chat.control = nil
 		chat.stop.parent = chat_stop_parent(chat)
 	}
-
-	previous: posix.sigaction_t
-	chat_signal_arm(&previous)
-	defer chat_signal_disarm(&previous)
 
 	// current is the connection the next request is built for. The boundary may
 	// replace it, which is how a selection the user changed mid-turn reaches the
@@ -498,9 +510,9 @@ chat_run_turn_steered :: proc(
 		// storage and its thread are released without waiting for a request boundary. The summary
 		// itself still installs at a boundary, because a frozen prefix is chosen there.
 		chat_compact_poll(chat, observer)
-		// Input the front-end queued while the turn ran is applied before the state is read,
-		// so the selector sees a turn that still has a message to answer.
-		if steer != nil { chat_steering_observe(chat, observer, steer) }
+		// Input queued while the turn ran is applied before the state is read, so the
+		// selector sees a turn that still has a message to answer.
+		chat_steering_observe(chat, observer, steer)
 		effect := chat_session_advance_at(chat, now)
 		switch effect.kind {
 		case .Start_Request:
@@ -510,6 +522,8 @@ chat_run_turn_steered :: proc(
 			// nothing. The input this request carries is already recorded above, so the claim
 			// prepares it from the record.
 			if steer != nil && steer.apply != nil { current = steer.apply(steer) }
+			// A subagent started by this request's calls inherits the selection it runs with.
+			agent_team_note_parent(chat)
 			chat_request_begin(chat, current, policy, observer)
 		case .Send_Attempt:
 			// The claim records the attempt and its row before any network work, and the

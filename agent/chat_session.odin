@@ -218,6 +218,25 @@ Chat_Session :: struct {
 	client_instructions:          string, // owned; client-supplied standing system instructions
 	skill_snapshot_seq:           Maybe(session.Seq),
 	disable_project_instructions: bool,
+
+	// role_instructions are appended after everything else the instructions hold, so a
+	// subagent's requests share its orchestrator's instruction prefix. Owned.
+	role_instructions:            string,
+	// team is the subagents this session started, heap-allocated so they may outlive a
+	// session that could not stop them. member is set only in a subagent's own session: the
+	// record its orchestrator keeps of it, which outlives this session.
+	team:                         ^Agent_Team,
+	member:                       ^Subagent,
+	workers_retained:             bool,
+	// inbox is where other agents' messages to this session wait for a settled point:
+	// team.inbox in an orchestrator, member.inbox in a subagent. Borrowed.
+	inbox:                        ^Steer_Queue,
+	// catalog is where subagent models are resolved from, borrowed from the front-end. A
+	// zero value lets subagents run only the orchestrator's own model.
+	catalog:                      Catalog_Ref,
+	// stop_parent is the wider stop this session's turns chain to when no front-end control
+	// drives them; nil means the process interrupt.
+	stop_parent:                  ^ai.Interrupt,
 }
 
 // chat_session_init builds the running state for a claimed session. workspace is
@@ -259,6 +278,8 @@ chat_session_init :: proc(
 	// A worker publishes through the mailbox, so its payloads come from the process heap
 	// rather than from the allocator the owner may be writing through at the same time.
 	mailbox_init(&chat.mailbox, os.heap_allocator())
+	chat.team = agent_team_make(os.heap_allocator())
+	if chat.team != nil { chat.inbox = &chat.team.inbox }
 	return chat, {}
 }
 
@@ -305,7 +326,12 @@ chat_skill_catalog_release :: proc(chat: ^Chat_Session) {
 // backends the caller owns) must stay allocated.
 chat_session_workers_outstanding :: proc(chat: ^Chat_Session) -> bool {
 	tool_jobs_reclaim(&chat.abandoned_jobs)
-	return len(chat.abandoned_jobs) > 0
+	return(
+		chat.workers_retained ||
+		len(chat.abandoned_jobs) > 0 ||
+		agent_team_running(chat.team) ||
+		(chat.team != nil && sync.atomic_load(&chat.team.abandoned)) \
+	)
 }
 
 // Tool_Registry_Replace_Error names why a registry replacement was refused.
@@ -344,6 +370,10 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 		tool_jobs_destroy(&chat.tool_jobs)
 		chat.tool_jobs_active = false
 	}
+	retained := !agent_team_destroy(chat.team, len(chat.abandoned_jobs) > 0)
+	chat.team = nil
+	chat.inbox = nil
+	chat.workers_retained = retained
 	// Compaction's worker borrows this session's id for its logging correlation, so
 	// it is stopped before anything the session owns is released.
 	chat_compact_destroy(chat)
@@ -364,6 +394,7 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	chat.skill_instructions = ""
 	delete(chat.client_instructions, chat.allocator)
 	chat.client_instructions = ""
+	delete(chat.role_instructions, chat.allocator)
 	delete(string(chat.id), chat.allocator)
 	delete(chat.partial_assistant)
 	chat_pending_response_clear(chat)
@@ -377,7 +408,9 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	delete(chat.provider_id, chat.allocator)
 	delete(chat.model_id, chat.allocator)
 	tool_registry_destroy(&chat.tools)
-	chat^ = {}
+	chat^ = {
+		workers_retained = outstanding,
+	}
 }
 
 chat_clone_string :: proc(value: string, allocator: mem.Allocator) -> string {
@@ -468,6 +501,12 @@ chat_session_record_failure_detail :: proc(chat: ^Chat_Session, what: string, de
 // chat_session_accept_user admits a prompt: it opens a turn and records the
 // prompt as that turn's first entry before any request is made.
 chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> Chat_Accept {
+	return chat_session_accept_message(chat, text, at_ms, .Prompt)
+}
+
+// chat_session_accept_message is chat_session_accept_user for text that did not come from
+// the user, such as a subagent's report that arrived while no turn ran.
+chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, at_ms: i64, origin: session.User_Origin) -> Chat_Accept {
 	if chat.storage_failed { return .Storage_Failed }
 	if chat.state != .Idle { return .Busy }
 
@@ -513,7 +552,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 		}
 	}
 
-	turn_no, turn_err := session.turn_begin(chat.store, chat.id, text, .Prompt, at_ms)
+	turn_no, turn_err := session.turn_begin(chat.store, chat.id, text, origin, at_ms)
 	if turn_err != nil {
 		chat_session_record_failure(chat, "the prompt could not be recorded", turn_err)
 		return .Storage_Failed
@@ -655,6 +694,7 @@ chat_session_observe_stop :: proc(chat: ^Chat_Session) {
 @(private)
 chat_stop_parent :: proc(chat: ^Chat_Session) -> ^ai.Interrupt {
 	if chat.control != nil { return &chat.control.stop }
+	if chat.stop_parent != nil { return chat.stop_parent }
 	return &process_interrupt
 }
 

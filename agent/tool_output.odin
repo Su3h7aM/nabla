@@ -22,6 +22,7 @@ Tool_Output :: union {
 	Compact_Output,
 	Codemode_Output,
 	MCP_Output,
+	Agent_Output,
 	Argument_Failure,
 }
 
@@ -82,6 +83,17 @@ Skill_Output :: struct {
 
 Compact_Output :: struct {
 	state: string,
+}
+
+// Agent_Output is what an agent tool did to one subagent. answer is the subagent's final
+// answer, present once it finished.
+Agent_Output :: struct {
+	agent:   string,
+	status:  string,
+	model:   string,
+	effort:  string,
+	session: string,
+	answer:  string,
 }
 
 // Codemode_Call is one tool call a script made, as its parent reports it. It is a summary,
@@ -198,6 +210,13 @@ tool_result_render :: proc(
 		render_text(&body, value.instructions) or_return
 	case Compact_Output:
 		render_field(&head, "state", value.state) or_return
+	case Agent_Output:
+		render_field(&head, "agent", value.agent) or_return
+		render_field(&head, "status", value.status) or_return
+		if value.model != "" { render_field(&head, "model", value.model) or_return }
+		if value.effort != "" { render_field(&head, "effort", value.effort) or_return }
+		if value.session != "" { render_field(&head, "session", value.session) or_return }
+		render_text(&body, value.answer) or_return
 	case Codemode_Output:
 		if value.failure != "" {
 			render_field(&head, "failure", value.failure) or_return
@@ -431,6 +450,15 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		borrowed := value
 		value.state = ""
 		value.state = strings.clone(borrowed.state, allocator) or_return
+	case Agent_Output:
+		borrowed := value
+		value = {}
+		value.agent = strings.clone(borrowed.agent, allocator) or_return
+		value.status = strings.clone(borrowed.status, allocator) or_return
+		value.model = strings.clone(borrowed.model, allocator) or_return
+		value.effort = strings.clone(borrowed.effort, allocator) or_return
+		value.session = strings.clone(borrowed.session, allocator) or_return
+		value.answer = strings.clone(borrowed.answer, allocator) or_return
 	case Codemode_Output:
 		borrowed := value
 		value.failure = ""
@@ -501,6 +529,13 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 		delete(value.instructions, allocator)
 	case Compact_Output:
 		delete(value.state, allocator)
+	case Agent_Output:
+		delete(value.agent, allocator)
+		delete(value.status, allocator)
+		delete(value.model, allocator)
+		delete(value.effort, allocator)
+		delete(value.session, allocator)
+		delete(value.answer, allocator)
 	case Codemode_Output:
 		delete(value.failure, allocator)
 		delete(value.value, allocator)
