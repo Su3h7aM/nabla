@@ -228,6 +228,8 @@ Chat_Session :: struct {
 	team:                         ^Agent_Team,
 	member:                       ^Subagent,
 	workers_retained:             bool,
+	// acp_agents are the ACP agent programs subagents may run, borrowed from the loaded config.
+	acp_agents:                   []ACP_Agent_Config,
 	// inbox is where other agents' messages to this session wait for a settled point:
 	// team.inbox in an orchestrator, member.inbox in a subagent. Borrowed.
 	inbox:                        ^Steer_Queue,
@@ -363,6 +365,14 @@ chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Regis
 	chat.tools = replacement^
 	replacement^ = {}
 	return .None
+}
+
+// chat_session_apply_harness applies the launch's harness options to a session and its tool
+// registry. The options must outlive the session.
+chat_session_apply_harness :: proc(chat: ^Chat_Session, options: Harness_Options) -> Tool_Registry_Error {
+	chat.disable_project_instructions = options.disable_project_instructions
+	chat.acp_agents = options.acp_agents
+	return tool_registry_describe_agents(&chat.tools, options.acp_agents)
 }
 
 chat_session_destroy :: proc(chat: ^Chat_Session) {

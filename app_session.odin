@@ -292,7 +292,9 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 		fmt.wprintln(stderr, "nabla: the tool registry could not be allocated")
 		return false
 	}
-	setup.session.disable_project_instructions = setup.harness_options.disable_project_instructions
+	if agent.chat_session_apply_harness(&setup.session, setup.harness_options).kind != .None {
+		agent.log_emit({level = .Error, category = .Tool, event = "tools.agents_undescribed"})
+	}
 	return true
 }
 
@@ -501,7 +503,9 @@ session_activate :: proc(app: ^App, adoption: ^Adoption) {
 		snap_append(app, .Error, "the tool registry could not be allocated")
 		return
 	}
-	setup.session.disable_project_instructions = setup.harness_options.disable_project_instructions
+	if agent.chat_session_apply_harness(&setup.session, setup.harness_options).kind != .None {
+		agent.log_emit({level = .Error, category = .Tool, event = "tools.agents_undescribed"})
+	}
 }
 
 // report_recovery says what an earlier run left behind, so a resumed session

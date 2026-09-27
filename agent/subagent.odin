@@ -2,6 +2,7 @@ package agent
 
 import "core:fmt"
 import "core:mem"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -36,6 +37,7 @@ Subagent :: struct {
 	instruction:                  string,
 	prompt:                       string,
 	selection:                    Model_Selection,
+	program:                      Subagent_Program, // an ACP agent to run instead of a native session
 	effort:                       string,
 	tools:                        Tool_Registry,
 	workspace:                    string,
@@ -55,6 +57,10 @@ Subagent :: struct {
 	// stop ends the subagent's work. It chains to the call that waits for it, or to the
 	// process interrupt for a background subagent.
 	stop:                         ai.Interrupt,
+	// wake is signalled with stop, so a subagent asleep in poll sees it; parent_wake is the
+	// wake of the call a blocking subagent runs for, borrowed.
+	wake:                         Tool_Wake,
+	parent_wake:                  ^os.File,
 	thread:                       ^thread.Thread, // background only
 	session_id:                   string,
 	status:                       Subagent_Status,
@@ -89,6 +95,7 @@ Agent_Parent :: struct {
 	disable_project_instructions: bool,
 	tools:                        Tool_Registry,
 	catalog:                      Catalog_Ref,
+	acp_agents:                   []ACP_Agent_Config, // borrowed from the loaded config
 }
 
 agent_team_make :: proc(allocator: mem.Allocator) -> ^Agent_Team {
@@ -137,6 +144,7 @@ agent_team_note_parent :: proc(chat: ^Chat_Session) {
 		disable_project_instructions = chat.disable_project_instructions,
 		tools                        = tools,
 		catalog                      = chat.catalog,
+		acp_agents                   = chat.acp_agents,
 	}
 }
 
@@ -169,7 +177,7 @@ agent_team_destroy :: proc(team: ^Agent_Team, retain := false) -> bool {
 	if team == nil { return true }
 	sync.mutex_lock(&team.mutex)
 	team.closing = true
-	for member in team.members { ai.interrupt_request(&member.stop) }
+	for member in team.members { subagent_request_stop(member) }
 	sync.mutex_unlock(&team.mutex)
 	owner_wake_signal()
 	deadline := time.tick_add(time.tick_now(), TOOL_JOBS_STOP_PATIENCE)
@@ -208,6 +216,8 @@ subagent_destroy :: proc(member: ^Subagent) {
 	delete(member.instruction, allocator)
 	delete(member.prompt, allocator)
 	model_selection_destroy(&member.selection, allocator)
+	subagent_program_destroy(&member.program, allocator)
+	tool_wake_close(&member.wake)
 	delete(member.effort, allocator)
 	tool_registry_destroy(&member.tools)
 	delete(member.workspace, allocator)
@@ -254,40 +264,28 @@ subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, allocator: mem
 			ordered_remove(&tools.definitions, index)
 		}
 	}
-	if parent.catalog.catalog == nil || len(tools.definitions) == 0 { return nil, "subagents are not available in this session" }
 	selection: Model_Selection
-	{
-		if parent.catalog.mutex != nil { sync.mutex_lock(parent.catalog.mutex) }
-		defer if parent.catalog.mutex != nil { sync.mutex_unlock(parent.catalog.mutex) }
-		provider_id, model_id := args.provider, args.model
-		switch {
-		case model_id == "" && (provider_id == "" || provider_id == parent.provider_id):
-			provider_id, model_id = parent.provider_id, parent.model_id
-		case model_id == "":
-			return nil, fmt.tprintf("name a model of provider %s: %s", provider_id, catalog_model_names(parent.catalog.catalog, provider_id))
-		case provider_id == "":
-			provider_id, problem = catalog_model_provider(parent.catalog.catalog, model_id, parent.provider_id)
-			if problem != "" { return nil, problem }
-		}
-		if model_id == "" { return nil, "the orchestrator has no model selected, so name one in model" }
-		selection, problem = model_selection_resolve(parent.catalog.catalog, provider_id, model_id, allocator)
-		if problem != "" { return nil, problem }
-	}
-	// An effort the model does not state is treated as one left out.
+	program: Subagent_Program
 	effort := args.effort
-	if effort_level_index(selection.effort_levels, effort) < 0 {
-		effort = effort_step_down(parent.effort_levels, selection.effort_levels, parent.effort)
+	if args.acp_agent != "" {
+		program, problem = subagent_program(args, &parent, allocator)
+	} else {
+		if len(tools.definitions) == 0 { return nil, "subagents are not available in this session" }
+		selection, effort, problem = subagent_select(args, &parent, allocator)
 	}
+	if problem != "" { return nil, problem }
 
 	member = new(Subagent, allocator)
 	if member == nil {
 		model_selection_destroy(&selection, allocator)
+		subagent_program_destroy(&program, allocator)
 		return nil, "the subagent could not be allocated"
 	}
 	member^ = {
 		instruction                  = strings.clone(args.instruction, allocator),
 		prompt                       = strings.clone(args.prompt, allocator),
 		selection                    = selection,
+		program                      = program,
 		effort                       = strings.clone(effort, allocator),
 		tools                        = tools,
 		workspace                    = strings.clone(parent.workspace, allocator),
@@ -301,6 +299,14 @@ subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, allocator: mem
 		inbox                        = steer_queue_init(allocator),
 	}
 	tools = {}
+	if program.name != "" {
+		wake, wake_error := tool_wake_open()
+		if wake_error != nil {
+			subagent_destroy(member)
+			return nil, "the subagent's stop signal could not be created"
+		}
+		member.wake = wake
+	}
 	sync.mutex_lock(&team.mutex)
 	if team.closing {
 		sync.mutex_unlock(&team.mutex)
@@ -312,6 +318,46 @@ subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, allocator: mem
 	append(&team.members, member)
 	sync.mutex_unlock(&team.mutex)
 	return member, ""
+}
+
+// subagent_select resolves the model and effort a native subagent runs. problem, temp-allocated,
+// says why it cannot run; selection is then empty.
+@(private)
+subagent_select :: proc(
+	args: Agent_Spawn_Args,
+	parent: ^Agent_Parent,
+	allocator: mem.Allocator,
+) -> (
+	selection: Model_Selection,
+	effort: string,
+	problem: string,
+) {
+	if parent.catalog.catalog == nil { return {}, "", "subagents are not available in this session" }
+	{
+		if parent.catalog.mutex != nil { sync.mutex_lock(parent.catalog.mutex) }
+		defer if parent.catalog.mutex != nil { sync.mutex_unlock(parent.catalog.mutex) }
+		provider_id, model_id := args.provider, args.model
+		switch {
+		case model_id == "" && (provider_id == "" || provider_id == parent.provider_id):
+			provider_id, model_id = parent.provider_id, parent.model_id
+		case model_id == "":
+			return {}, "", fmt.tprintf("name a model of provider %s: %s", provider_id, catalog_model_names(parent.catalog.catalog, provider_id))
+		case provider_id == "":
+			provider_id, problem = catalog_model_provider(parent.catalog.catalog, model_id, parent.provider_id)
+			if problem != "" { return {}, "", problem }
+		}
+		if model_id == "" { return {}, "", "the orchestrator has no model selected, so name one in model" }
+		selection, problem = model_selection_resolve(parent.catalog.catalog, provider_id, model_id, allocator)
+		if problem != "" { return {}, "", problem }
+	}
+	// An effort the model does not state is treated as one left out.
+	effort = args.effort
+	if effort_level_index(selection.effort_levels, effort) < 0 {
+		effort = effort_step_down(parent.effort_levels, selection.effort_levels, parent.effort)
+		// A model with other level names still thinks when its orchestrator does.
+		if effort == "" && parent.effort != "" && len(selection.effort_levels) > 0 { effort = selection.effort_levels[0] }
+	}
+	return selection, effort, ""
 }
 
 // subagent_log_sink is where the calling thread's diagnostics go, so a subagent's thread
@@ -408,6 +454,10 @@ subagent_run :: proc(member: ^Subagent) {
 	defer context.logger = previous_logger
 	allocator := member.allocator
 
+	if member.program.name != "" {
+		subagent_acp_run(member)
+		return
+	}
 	store: session.Store
 	if open_error := session.store_open(&store, member.store_directory, allocator); open_error != nil {
 		local := open_error
@@ -537,8 +587,15 @@ subagent_stop :: proc(team: ^Agent_Team, name: string) -> (problem: string) {
 	member := subagent_find(team, name)
 	if member == nil { return subagent_unknown(team, name) }
 	if member.closed { return fmt.tprintf("%s has already finished", name) }
-	ai.interrupt_request(&member.stop)
+	subagent_request_stop(member)
 	return ""
+}
+
+// subagent_request_stop asks a subagent to stop and wakes it. The caller holds team.mutex.
+@(private)
+subagent_request_stop :: proc(member: ^Subagent) {
+	ai.interrupt_request(&member.stop)
+	tool_wake_signal(&member.wake)
 }
 
 // subagent_unknown names the running subagents for a name that is not one. The caller holds

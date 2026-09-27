@@ -282,6 +282,9 @@ app_tools_refresh :: proc(app: ^App) -> string {
 		return "the tool registry could not be built"
 	}
 	defer if !installed { agent.tool_registry_destroy(&registry) }
+	if agent.tool_registry_describe_agents(&registry, setup.harness_options.acp_agents).kind != .None {
+		return "the tool registry could not be built"
+	}
 
 	warnings, warnings_error := strings.builder_make(context.temp_allocator)
 	if warnings_error != nil { return "the MCP warning buffer could not be allocated" }

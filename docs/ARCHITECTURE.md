@@ -875,11 +875,11 @@ Hooks are user-configured Lua files in `$XDG_CONFIG_HOME/nabla/hooks/`, each ret
 
 ### 21.1 Native foundation
 
-The first implementation uses Nabla's existing provider catalog, request state machine, and agent loop. ACP subprocesses and external harnesses are a later stage. Native children run on threads in the current process, so a panic or memory fault is not isolated from the parent.
+A native subagent uses Nabla's provider catalog, request state machine, and agent loop. Native children run on threads in the current process, so a panic or memory fault is not isolated from the parent. Section 21.3 covers subagents that are other ACP programs.
 
 `agent_spawn{instruction, prompt, model?, provider?, effort?, background?}` creates a fresh child session. `prompt` is required. The child receives its own instruction and task, the shared harness instructions, and instructions discovered in the workspace. It inherits neither the parent's conversation nor its client-specific instructions. The caller must supply everything else the child needs or tell it where to find it. There are no agent definition files.
 
-An omitted model inherits the parent's selection. A model override resolves through the live catalog; `provider` disambiguates providers. An omitted effort and an effort the selected model does not state take the same path: the child runs one level below the parent's effort, and the lowest level stays where it is. When the child model lacks that level, the next lower level it states is used, and failing that its lowest level. A child thinks whenever its parent does; only a parent without effort, or a model that states no levels, leaves the provider default. An unsupported effort is reported in the call's result as a repair.
+An omitted model inherits the parent's selection. A model override resolves through the live catalog; `provider` disambiguates providers. An omitted effort and an effort the selected model does not state take the same path: the child runs one level below the parent's effort, and the lowest level stays where it is. When the child model lacks that level, the next lower level both models state is used, and failing that the child's lowest level. A child thinks whenever its parent does; only a parent without effort, or a model that states no levels, leaves the provider default. An unsupported effort is reported in the call's result as a repair.
 
 Each child has its own store connection, session, instruction snapshot, request state, and tool registry. Its provider requests carry `x-parent-session-id` and use the parent session's cache key. The shared harness instructions remain a common prefix. Child registries exclude `agent_spawn` and `agent_stop`, including access through Code Mode. Their executors also reject child callers. Delegation has one level.
 
@@ -890,36 +890,30 @@ The team owns the parent snapshot and child records. Teardown closes admission, 
 ### 21.2 Required later work
 
 - Coordination through the journal. Child start, messages, and outcomes become journal records committed before their effects (invariant 2). Thread coordination, process children, and crash recovery build on those records instead of on in-memory team state. Crash isolation for native children waits for this work.
+- Access and policy. Child permission requests, ACP ones included, should reach the parent's `tool.before_execute` hooks and policy, and children may get access scopes such as read-only.
 - Workspace isolation. Children that write need their own workspace so concurrent edits cannot collide. The mechanism (a Jujutsu workspace, a Git worktree, or another copy) and how a child's changes return to the parent are still open. Until then children share the parent's workspace.
 
-### 21.3 Planned process-backed invocation
+### 21.3 ACP subagents
 
-`agent_spawn` exists only in sessions with `Session_Role.Main`. Child sessions have role `Subagent`; the tool is absent from their registry and refused at admission.
+Any program that speaks the Agent Client Protocol can run as a subagent. No program is named in code. The user lists the programs in `config.lua`, each under a name with its command (an absolute path or a name found on `PATH`), the arguments that start it in ACP mode, and an optional description:
 
-```odin
-Spawn_Args :: struct {
-	instruction: string,
-	harness:     string,             // "nabla" or a configured external agent id
-	model:       Maybe(string),      // resolved through the catalog; default: parent selection
-	effort:      Maybe(string),
-	context:     Maybe(string),      // parent-selected text
-	scope:       Spawn_Scope,        // Read_Only, Workspace_Write
-	timeout:     Maybe(time.Duration),
+```lua
+agents = {
+	goose = { command = "goose", arguments = { "acp" }, description = "Goose, general coding agent" },
 }
 ```
 
-The child receives only the instruction and selected context, never the parent conversation. `Read_Only` gives the child read-only tools and Code Mode over them, with access class Read(all). `Workspace_Write` gives the child its default registry, with access class Process.
+The `agent_spawn` description lists the configured names and descriptions, so the model discovers them without another call, and `acp_agent` names the one to run. An unknown name fails the start with the configured names. Without `acp_agent` the subagent is native (section 21.1). Everything else is shared: blocking and background runs, reports, steering, stop, and one delegation level.
 
-### 21.4 Planned process-backed execution
-
-- Every subagent is a child process driven over ACP by a supervising `Subagent` job worker. Native subagents run `nabla acp --subagent`; external harnesses (Codex, Claude Code) run their configured ACP command from `config.lua` `agents = { {id, command, args, env} }`. One adapter serves both.
-- Spawn: private process group, `PR_SET_PDEATHSIG = SIGKILL` in the child (the supervising thread lives until it reaps the child), stdin and stdout pipes, stderr drained into a diagnostic artifact. Then `initialize`, `session/new{cwd, _meta.nabla: {model, effort, scope, parent_session, parent_call}}`, `session/prompt`.
-- The parent commits `subagent.started{child_session}` before prompting. Native children write their own session to the same journal with `parent_session` and `parent_call`.
-- Child permission requests (`session/request_permission`) reach the owner as job observations and are answered by the parent's `tool.before_execute` hooks and policy. Nabla advertises the ACP client `fs` methods and serves them through its own read and write tools, so file access through them is validated and journaled. Actions an external harness takes without asking are governed by its own policy and by the Process access class.
-- Progress updates become view events only; they never enter the parent's context.
-- Result: final text (projected through the parent's context budget), outcome, child session id, tokens from `usage_update`, CPU and memory from `wait4` rusage. Outcomes distinguish completed, reported failure, malformed or missing terminal, abnormal exit, cancelled, and timed out.
-- Cancellation: ACP `session/cancel`; after `STOP_PATIENCE`, `SIGTERM` to the group; after `SHELL_KILL_GRACE`, `SIGKILL`; then reap. An unconfirmed stop is `Unknown`.
-- Concurrency: up to `SUBAGENTS_MAX_RUNNING`, subject to access conflicts. Several `Read_Only` children run in parallel; `Workspace_Write` children serialize with each other and with parent writes.
+- Process: private process group, `PR_SET_PDEATHSIG = SIGKILL` bound to the supervising thread, which lives until it reaps the child. stdin is one end of a Unix socket pair written with `MSG_NOSIGNAL`, so an agent that exits cannot raise `SIGPIPE` here. stdout carries ACP frames. The end of stderr is kept to explain a failure.
+- One thread drives the connection. It sends one request at a time and reads until the answer, handling notifications and agent requests in between. JSON stays at this boundary: every message is decoded once into typed structs.
+- Versions: `initialize` asks for version 2 and accepts 1. An agent that answers version 2 in version 1's shape, without `info`, is treated as version 1. Version 1 ends a turn with the `session/prompt` answer's `stopReason`. Version 2 acknowledges the prompt and ends the turn with an idle `state_update`, and a `stopReason` in the acknowledgement is also accepted.
+- Session: `session/new{cwd, mcpServers: []}`. The client offers no file system and no terminal; the agent uses its own tools. `model` picks a value of the `model` config option by value or name, or a model from the pre-standard `models` list; a model the agent does not offer fails the start with the models it does offer. Effort follows section 21.1 against the `thought_level` option's values. When the agent shares no level with the parent, the agent's default stays, because its lowest level may turn reasoning off. `session/set_config_option` sends `configId`, and `type: "id"` in version 2.
+- Answer: the text of the agent's latest message after its last tool call. A new `messageId` or a tool call starts it over, and a whole-message update replaces it.
+- Permissions: `session/request_permission` is granted once (`allow_once`, else `allow_always`), as a native subagent runs its tools without asking. After a stop it is answered `cancelled`. Other agent requests get method-not-found.
+- Messages from the parent are sent as the next prompt once the current turn ends, since ACP has no way to add input to a running turn.
+- Stop: `session/cancel`, then the stop patience for the turn to end, then `SIGTERM` to the group, the kill grace, `SIGKILL`, and reap.
+- The subagent's session is the agent's own; Nabla records none for it.
 
 ## 22. Frontends and ACP
 

@@ -554,7 +554,9 @@ acp_session_open :: proc(server: ^Acp_Server, workspace: string, start: Session_
 	if tool_error.kind != .None {
 		return acp_open_message("the tool registry could not be allocated", app.setup.alloc), false
 	}
-	app.setup.session.disable_project_instructions = app.setup.harness_options.disable_project_instructions
+	if agent.chat_session_apply_harness(&app.setup.session, app.setup.harness_options).kind != .None {
+		agent.log_emit({level = .Error, category = .Tool, event = "tools.agents_undescribed"})
+	}
 	return "", true
 }
 

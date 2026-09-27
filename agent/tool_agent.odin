@@ -5,9 +5,9 @@ import "core:fmt"
 import "core:strings"
 
 TOOL_AGENT_SPAWN_NAME :: "agent_spawn"
-TOOL_AGENT_SPAWN_DESCRIPTION :: "Start a subagent: a separate agent in a new session that works on one task and returns a concise answer, so your own context keeps only the result. It inherits none of your conversation. You define it: instruction is its system prompt (how to work and what its answer must contain) and prompt is its task, which must give it every fact, decision, and path it needs, or say exactly where to find them. model and effort choose what runs it; by default it runs your model at one effort level below yours. By default this call waits and returns the answer. With background true it returns the agent id at once, the subagent works in parallel with you, and its answer arrives later as a message. Only the orchestrator can start subagents."
-TOOL_AGENT_SPAWN_SCHEMA :: `{"type":"object","properties":{"instruction":{"type":["string","null"],"description":"The subagent's system prompt: how to work and what its answer must contain."},"prompt":{"type":"string","description":"The task, with every fact the subagent needs."},"model":{"type":["string","null"],"description":"Model id to run. Default: your model."},"provider":{"type":["string","null"],"description":"Provider of model, needed only when several serve it."},"effort":{"type":["string","null"],"description":"Reasoning effort level. Default: one level below yours."},"background":{"type":["boolean","null"],"description":"Return at once and deliver the answer later as a message. Default: false, wait for the answer."}},"required":["prompt"],"additionalProperties":false}`
-TOOL_AGENT_SPAWN_FIELDS :: []string{"instruction", "prompt", "model", "provider", "effort", "background"}
+TOOL_AGENT_SPAWN_DESCRIPTION :: "Start a subagent: a separate agent in a new session that works on one task and returns a concise answer, so your own context keeps only the result. It inherits none of your conversation. You define it: instruction is its system prompt (how to work and what its answer must contain) and prompt is its task, which must give it every fact, decision, and path it needs, or say exactly where to find them. model and effort choose what runs it; by default it runs your model at one effort level below yours. By default this call waits and returns the answer. With background true it returns the agent id at once, the subagent works in parallel with you, and its answer arrives later as a message. With acp_agent set, the subagent is that configured agent program, driven over the Agent Client Protocol, and model and effort are chosen among what it offers. Only the orchestrator can start subagents."
+TOOL_AGENT_SPAWN_SCHEMA :: `{"type":"object","properties":{"instruction":{"type":["string","null"],"description":"The subagent's system prompt: how to work and what its answer must contain."},"prompt":{"type":"string","description":"The task, with every fact the subagent needs."},"model":{"type":["string","null"],"description":"Model id to run. Default: your model."},"provider":{"type":["string","null"],"description":"Provider of model, needed only when several serve it."},"effort":{"type":["string","null"],"description":"Reasoning effort level. Default: one level below yours."},"background":{"type":["boolean","null"],"description":"Return at once and deliver the answer later as a message. Default: false, wait for the answer."},"acp_agent":{"type":["string","null"],"description":"Name of a configured ACP agent program to run as the subagent. Default: a native subagent."}},"required":["prompt"],"additionalProperties":false}`
+TOOL_AGENT_SPAWN_FIELDS :: []string{"instruction", "prompt", "model", "provider", "effort", "background", "acp_agent"}
 
 TOOL_AGENT_SEND_NAME :: "agent_send"
 TOOL_AGENT_SEND_DESCRIPTION :: "Send a message to another agent. It reaches the recipient between its model requests, like a line the user types while it works. The orchestrator names a running subagent in agent to steer it; a subagent leaves agent out to tell its orchestrator something it must know before the final answer. Subagents cannot message each other."
@@ -58,6 +58,7 @@ Agent_Spawn_Args :: struct {
 	provider:    string,
 	effort:      string,
 	background:  bool,
+	acp_agent:   string,
 }
 
 Agent_Send_Args :: struct {
@@ -78,6 +79,7 @@ tool_agent_spawn_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (ar
 	args.provider = tool_field_optional_string(arguments, "provider", allocator = ctx.allocator) or_return
 	args.effort = tool_field_optional_string(arguments, "effort", allocator = ctx.allocator) or_return
 	args.background = tool_field_optional_bool(arguments, "background", allocator = ctx.allocator) or_return
+	args.acp_agent = tool_field_optional_string(arguments, "acp_agent", allocator = ctx.allocator) or_return
 	return
 }
 
@@ -93,6 +95,30 @@ tool_agent_stop_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (arg
 	tool_fields_known(arguments, TOOL_AGENT_STOP_FIELDS, allocator = ctx.allocator) or_return
 	args.agent = tool_field_string(arguments, "agent", allocator = ctx.allocator) or_return
 	return
+}
+
+// tool_registry_describe_agents names the configured ACP agents in the spawn tool's description,
+// so the model knows which it may start. agents is borrowed.
+tool_registry_describe_agents :: proc(registry: ^Tool_Registry, agents: []ACP_Agent_Config) -> Tool_Registry_Error {
+	index := -1
+	for definition, position in registry.definitions {
+		if definition.kind == .Agent_Spawn { index = position }
+	}
+	if index < 0 { return {} }
+	parts := make([dynamic]string, 0, 2 + 4 * len(agents), context.temp_allocator)
+	append(&parts, TOOL_AGENT_SPAWN_DESCRIPTION)
+	if len(agents) == 0 { append(&parts, " No ACP agents are configured, so leave acp_agent out.") }
+	if len(agents) > 0 { append(&parts, " Configured ACP agents:") }
+	for agent in agents {
+		append(&parts, "\n- ", agent.name)
+		if agent.description != "" { append(&parts, ": ", agent.description) }
+	}
+	description, allocation_error := strings.concatenate(parts[:], registry.allocator)
+	if allocation_error != nil { return {kind = .Allocation} }
+	definition := &registry.definitions[index]
+	delete(definition.description, registry.allocator)
+	definition.description = description
+	return {}
 }
 
 // TOOL_AGENT_ORCHESTRATOR_ONLY is what a subagent is told when it tries to manage subagents.
@@ -114,6 +140,12 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	if args.effort != "" && args.effort != member.effort {
 		output.notice = fmt.tprintf("effort %q is not a level of this model, so it runs as if effort were left out", args.effort)
 	}
+	if member.program.name != "" {
+		// The agent program states its models and efforts only once it runs.
+		output.model = member.program.model if member.program.model != "" else "the agent's default"
+		output.effort = args.effort if args.effort != "" else "one level below yours, if the agent offers levels"
+		output.notice = ""
+	}
 	if args.background {
 		// Copy the reply before launch: a fast child can finish and be reaped immediately.
 		result := tool_result_success(ctx, output, fmt.tprintf("%s started", output.agent))
@@ -133,6 +165,7 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 
 	// A blocking subagent stops with this call.
 	member.stop.parent = ctx.control.interrupt
+	member.parent_wake = ctx.control.wake
 	subagent_run(member)
 	output.status = subagent_status_names[member.status]
 	output.session = member.session_id

@@ -2,6 +2,7 @@
 package agent
 
 import "core:fmt"
+import "core:os"
 import "core:strings"
 import "core:testing"
 
@@ -277,8 +278,70 @@ test_stopping_a_background_subagent_reports_to_its_parent :: proc(t: ^testing.T)
 	testing.expect(t, !chat_agents_wait(chat, nil), "cancellation leaves no running child")
 }
 
-// Effort left out steps one level down, and the lowest level stays where it is. A model with
-// other levels still thinks whenever its orchestrator does.
+// SUBAGENT_TEST_ACP_AGENT is an ACP version 2 agent. It answers each request by its method,
+// narrates before a tool call, asks permission for the call, and fails when its prompt lacks
+// the instruction or the task.
+SUBAGENT_TEST_ACP_AGENT :: `#!/bin/sh
+update() { printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":%s}}\n' "$1"; }
+while IFS= read -r line; do
+	id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+	case "$line" in
+	*'"method":"initialize"'*)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":2,"info":{"name":"fake","version":"1"}}}\n' "$id" ;;
+	*'"method":"session/new"'*)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id" ;;
+	*'"method":"session/prompt"'*)
+		case "$line" in *'Answer in one word.'*'six times seven'*) ;; *) echo "prompt lost its instruction or task" >&2; exit 1 ;; esac
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"messageId":"u1"}}\n' "$id"
+		update '{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"Let me compute."}}'
+		update '{"sessionUpdate":"tool_call_update","toolCallId":"c1","title":"multiply","status":"pending"}'
+		printf '{"jsonrpc":"2.0","id":"p1","method":"session/request_permission","params":{"sessionId":"s1","title":"Run multiply?","options":[{"optionId":"no","name":"Reject","kind":"reject_once"},{"optionId":"yes","name":"Allow","kind":"allow_once"}]}}\n'
+		IFS= read -r grant
+		case "$grant" in *'"optionId":"yes"'*) ;; *) echo "permission was not granted: $grant" >&2; exit 1 ;; esac
+		update '{"sessionUpdate":"agent_message_chunk","messageId":"m2","content":{"type":"text","text":"forty-"}}'
+		update '{"sessionUpdate":"agent_message_chunk","messageId":"m2","content":{"type":"text","text":"two"}}'
+		update '{"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"}' ;;
+	esac
+done
+`
+
+// A subagent can be any configured program that speaks ACP. Its answer is its last message, and a failure
+// quotes what the program wrote to stderr.
+@(test)
+test_an_acp_program_answers_as_a_subagent :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	directory, directory_error := os.make_directory_temp("", "nabla-acp-agent-*", context.allocator)
+	if directory_error != nil { testing.fail_now(t, "could not create a temporary directory") }
+	defer {
+		_ = os.remove_all(directory)
+		delete(directory)
+	}
+	script := strings.concatenate({directory, "/agent"}, context.temp_allocator)
+	if os.write_entire_file(script, transmute([]u8)string(SUBAGENT_TEST_ACP_AGENT)) != nil { testing.fail_now(t, "could not write the agent") }
+	if os.chmod(script, {.Read_User, .Write_User, .Execute_User}) != nil { testing.fail_now(t, "could not make the agent executable") }
+	agents := []ACP_Agent_Config{{name = "fake", command = script}}
+	fixture.chat.acp_agents = agents
+	agent_team_note_parent(&fixture.chat)
+	ctx := Tool_Context {
+		allocator = context.allocator,
+		agents    = fixture.chat.team,
+	}
+
+	answered := tool_agent_spawn_execute(&ctx, Agent_Spawn_Args{instruction = "Answer in one word.", prompt = "six times seven", acp_agent = "fake"})
+	defer tool_result_destroy(&answered)
+	testing.expect_value(t, answered.outcome, session.Tool_Outcome.Success)
+	testing.expect(t, strings.contains(answered.content, "forty-two") && !strings.contains(answered.content, "Let me compute"), answered.content)
+
+	failed := tool_agent_spawn_execute(&ctx, Agent_Spawn_Args{prompt = "something else", acp_agent = "fake"})
+	defer tool_result_destroy(&failed)
+	testing.expect_value(t, failed.outcome, session.Tool_Outcome.Tool_Failed)
+	testing.expect(t, strings.contains(failed.content, "prompt lost its instruction or task"), failed.content)
+}
+
+// Effort left out steps one level down, and the lowest level stays where it is. Across models
+// it takes the next lower level both state, and nothing when they share none.
 @(test)
 test_effort_steps_down_one_level :: proc(t: ^testing.T) {
 	levels := []string{"minimal", "low", "medium", "high"}
@@ -286,5 +349,5 @@ test_effort_steps_down_one_level :: proc(t: ^testing.T) {
 	testing.expect_value(t, effort_step_down(levels, levels, "minimal"), "minimal")
 	testing.expect_value(t, effort_step_down(levels, levels, ""), "")
 	testing.expect_value(t, effort_step_down({"medium", "high", "max"}, {"low", "medium", "high"}, "max"), "high")
-	testing.expect_value(t, effort_step_down({"low"}, {"medium", "high"}, "low"), "medium")
+	testing.expect_value(t, effort_step_down({"low"}, {"medium", "high"}, "low"), "")
 }
