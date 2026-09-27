@@ -84,30 +84,38 @@ tool_spawn_shell_flags :: proc(shell: string) -> (first, second: cstring) {
 // only async-signal-safe calls: it allocates, locks, and logs nothing, and every
 // failure leaves through _exit, which runs no atexit handler and flushes no stdio.
 tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stderr_write: ^os.File) -> (child: Tool_Child, spawn: Tool_Spawn, err: os.Error) {
-	// The C strings live only as long as the spawn: exec takes its own copy of the
-	// arguments, so the parent releases its own when the call returns.
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	shell_cstring := strings.clone_to_cstring(shell, context.temp_allocator) or_return
-	source := strings.clone_to_cstring(command, context.temp_allocator) or_return
-	work := strings.clone_to_cstring(directory, context.temp_allocator) or_return
+	arguments := make([dynamic]string, 0, context.temp_allocator)
+	append(&arguments, shell)
 	flag_first, flag_second := tool_spawn_shell_flags(shell)
+	if flag_first != nil { append(&arguments, string(flag_first)) }
+	if flag_second != nil { append(&arguments, string(flag_second)) }
+	append(&arguments, "-c", command)
+	return tool_spawn_command(arguments[:], directory, nil, stdout_write, stderr_write)
+}
 
-	argv: [5]cstring
-	argv[0] = shell_cstring
-	count := 1
-	if flag_first != nil {
-		argv[count] = flag_first
-		count += 1
+// tool_spawn_command execs an argv in a private process group. A nil input closes stdin.
+// parent_death binds the child's lifetime to this supervising thread on Linux.
+tool_spawn_command :: proc(
+	arguments: []string,
+	directory: string,
+	input, stdout_write, stderr_write: ^os.File,
+	parent_death := false,
+) -> (
+	child: Tool_Child,
+	spawn: Tool_Spawn,
+	err: os.Error,
+) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	if len(arguments) == 0 { return {}, .Failed, os.Platform_Error(posix.EINVAL) }
+	argv, argv_error := make([]cstring, len(arguments) + 1, context.temp_allocator)
+	if argv_error != nil { return {}, .Failed, argv_error }
+	for argument, index in arguments {
+		argument_text, argument_error := strings.clone_to_cstring(argument, context.temp_allocator)
+		if argument_error != nil { return {}, .Failed, argument_error }
+		argv[index] = argument_text
 	}
-	if flag_second != nil {
-		argv[count] = flag_second
-		count += 1
-	}
-	argv[count] = "-c"
-	count += 1
-	argv[count] = source
-	count += 1
-	argv[count] = nil
+	work, directory_error := strings.clone_to_cstring(directory, context.temp_allocator)
+	if directory_error != nil { return {}, .Failed, directory_error }
 
 	// The command inherits the environment this process was started with: the
 	// user's own environment, as the shell that launched the harness exported it.
@@ -119,10 +127,14 @@ tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stde
 	// started. Both ends close on exec, so a successful exec closes the child's
 	// write end and the parent reads end-of-file, while a failed one lets the
 	// child report its errno before it exits.
-	exec_read, exec_write := os.pipe() or_return
+	exec_read, exec_write, pipe_error := os.pipe()
+	if pipe_error != nil { return {}, .Failed, pipe_error }
 	defer _ = os.close(exec_read)
 	report_fd := tool_fd(exec_write)
 	child_stdout, child_stderr := tool_fd(stdout_write), tool_fd(stderr_write)
+	child_input := posix.FD(-1)
+	if input != nil { child_input = tool_fd(input) }
+	parent_pid := posix.getpid()
 
 	pid := posix.fork()
 	if pid == -1 {
@@ -130,14 +142,18 @@ tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stde
 		return {}, .Failed, tool_errno()
 	}
 	if pid == 0 {
-		// Standard input is closed: this is explicitly not a terminal.
 		if posix.setpgid(0, 0) != .OK { posix._exit(TOOL_CHILD_SETUP_FAILED) }
-		_ = posix.close(0)
+		if parent_death && !tool_child_bind_parent(parent_pid) { posix._exit(TOOL_CHILD_SETUP_FAILED) }
+		if child_input >= 0 {
+			if posix.dup2(child_input, 0) == -1 { posix._exit(TOOL_CHILD_SETUP_FAILED) }
+		} else {
+			_ = posix.close(0)
+		}
 		if posix.dup2(child_stdout, 1) == -1 { posix._exit(TOOL_CHILD_SETUP_FAILED) }
 		if posix.dup2(child_stderr, 2) == -1 { posix._exit(TOOL_CHILD_SETUP_FAILED) }
 		// Every pipe end closes on exec: os.pipe creates them that way.
 		if posix.chdir(work) != .OK { posix._exit(TOOL_CHILD_SETUP_FAILED) }
-		posix.execve(shell_cstring, &argv[0], envp)
+		posix.execve(argv[0], &argv[0], envp)
 		reported := [1]u8{u8(posix.errno())}
 		_ = posix.write(report_fd, &reported[0], len(reported))
 		posix._exit(TOOL_CHILD_EXEC_FAILED)

@@ -5,6 +5,13 @@ import "core:os"
 import "core:sys/linux"
 import "core:sys/posix"
 
+// The parent may die before prctl, so check its identity after installing the signal.
+@(private)
+tool_child_bind_parent :: proc "contextless" (parent_pid: posix.pid_t) -> bool {
+	PR_SET_PDEATHSIG :: 1
+	return linux.prctl(PR_SET_PDEATHSIG, uint(posix.SIGKILL), 0, 0, 0) == .NONE && posix.getppid() == parent_pid
+}
+
 // Tool_Exit_Watch is a descriptor that becomes readable once a child exits, so a
 // wait for the child joins the same poll as its pipes. Its zero value watches
 // nothing.
