@@ -120,9 +120,9 @@ Acp_Connection :: struct {
 	version:       int, // the ACP version the agent agreed to
 	session_id:    string,
 	answer:        [dynamic]u8, // the text of the agent's latest message since its last tool call
-	message_id:    string, // the latest message's id, temp-allocated; "" when the agent sends none
+	message_id:    string, // the latest message's id, owned; "" when the agent sends none
 	idle:          bool, // version 2: the agent reported its turn over
-	stop_reason:   string, // why the turn ended, temp-allocated
+	stop_reason:   string, // why the turn ended, owned
 	stderr_tail:   [dynamic]u8,
 	cancel_sent:   bool,
 	stop_deadline: time.Tick,
@@ -154,7 +154,7 @@ subagent_acp_run :: proc(member: ^Subagent) {
 	if member.instruction != "" { text = strings.concatenate({member.instruction, "\n\n", member.prompt}, context.temp_allocator) }
 	from_inbox := false
 	for {
-		// A turn's messages are decoded into the temp allocator; each prompt releases its own.
+		// Each prompt releases the temp memory its answers were decoded into.
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		stop_reason, problem := acp_prompt(&connection, text)
 		if from_inbox { steer_line_free(&member.inbox, text) }
@@ -192,9 +192,9 @@ acp_prompt :: proc(connection: ^Acp_Connection, text: string) -> (stop_reason: s
 		prompt:     []Text_Block `json:"prompt"`,
 	}
 	clear(&connection.answer)
-	connection.message_id = ""
+	acp_replace(&connection.message_id, "", connection.member.allocator)
+	acp_replace(&connection.stop_reason, "", connection.member.allocator)
 	connection.idle = false
-	connection.stop_reason = ""
 	prompt := Prompt {
 		session_id = connection.session_id,
 		prompt     = {{type = acp.CONTENT_TEXT, text = text}},
@@ -217,10 +217,11 @@ acp_prompt :: proc(connection: ^Acp_Connection, text: string) -> (stop_reason: s
 		envelope, next_problem := acp_next(connection)
 		if next_problem != "" { return "", next_problem }
 		acp_handle(connection, envelope)
-		acp.destroy_envelope(&envelope, context.temp_allocator)
+		acp.destroy_envelope(&envelope, connection.member.allocator)
 	}
 	// An agent that states no reason ended its turn normally.
-	return connection.stop_reason if connection.stop_reason != "" else "end_turn", ""
+	if connection.stop_reason == "" { return "end_turn", "" }
+	return strings.clone(connection.stop_reason, context.temp_allocator), ""
 }
 
 // acp_connection_open starts the agent program with its three standard streams piped here.
@@ -279,6 +280,8 @@ acp_connection_close :: proc(connection: ^Acp_Connection) {
 	delete(connection.frames)
 	acp.frame_decoder_destroy(&connection.decoder)
 	delete(connection.session_id, connection.member.allocator)
+	delete(connection.message_id, connection.member.allocator)
+	delete(connection.stop_reason, connection.member.allocator)
 	delete(connection.answer)
 	delete(connection.stderr_tail)
 	connection^ = {}
@@ -441,7 +444,7 @@ acp_call :: proc(connection: ^Acp_Connection, method: string, params: $P, result
 	for {
 		envelope, next_problem := acp_next(connection)
 		if next_problem != "" { return next_problem }
-		defer acp.destroy_envelope(&envelope, context.temp_allocator)
+		defer acp.destroy_envelope(&envelope, connection.member.allocator)
 		switch envelope.kind {
 		case .Response:
 			answered, is_number := envelope.id.(i64)
@@ -463,6 +466,8 @@ acp_call :: proc(connection: ^Acp_Connection, method: string, params: $P, result
 // acp_handle acts on a message that answers nothing this client asked.
 @(private)
 acp_handle :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
+	// What a message is decoded into is released with it, so a long turn holds no scratch.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	#partial switch envelope.kind {
 	case .Notification:
 		acp_notification(connection, envelope)
@@ -482,7 +487,7 @@ acp_notification :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
 	switch kind.update.session_update {
 	case acp.UPDATE_TOOL_CALL, acp.UPDATE_TOOL_CALL_UPDATE:
 		clear(&connection.answer)
-		connection.message_id = ""
+		acp_replace(&connection.message_id, "", connection.member.allocator)
 	case acp.UPDATE_AGENT_MESSAGE_CHUNK:
 		chunk: acp.Session_Notification(acp.Message_Chunk)
 		if !acp.params_decode(envelope.params, &chunk, context.temp_allocator) { return }
@@ -492,6 +497,8 @@ acp_notification :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
 		message: acp.Session_Notification(acp.Message_Update)
 		if !acp.params_decode(envelope.params, &message, context.temp_allocator) { return }
 		acp_message_begin(connection, message.update.message_id)
+		// The update is an upsert: content left out keeps the message as it is.
+		if !acp_update_has(envelope.params, "content") { return }
 		clear(&connection.answer)
 		for block in message.update.content {
 			if block.type == acp.CONTENT_TEXT { append(&connection.answer, block.text) }
@@ -500,8 +507,19 @@ acp_notification :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
 		state: acp.Session_Notification(acp.State_Update)
 		if !acp.params_decode(envelope.params, &state, context.temp_allocator) || state.update.state != "idle" { return }
 		connection.idle = true
-		connection.stop_reason = state.update.stop_reason
+		acp_replace(&connection.stop_reason, state.update.stop_reason, connection.member.allocator)
 	}
+}
+
+// acp_update_has reports whether a session/update's update object carries key.
+@(private)
+acp_update_has :: proc(params: json.Value, key: string) -> bool {
+	notification, is_object := params.(json.Object)
+	if !is_object { return false }
+	update, update_is_object := notification["update"].(json.Object)
+	if !update_is_object { return false }
+	_, present := update[key]
+	return present
 }
 
 // acp_message_begin starts the answer over when the agent begins a message with a new id.
@@ -509,7 +527,14 @@ acp_notification :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
 acp_message_begin :: proc(connection: ^Acp_Connection, message_id: string) {
 	if message_id == "" || message_id == connection.message_id { return }
 	clear(&connection.answer)
-	connection.message_id = message_id
+	acp_replace(&connection.message_id, message_id, connection.member.allocator)
+}
+
+// acp_replace sets an owned string to a copy of value.
+@(private)
+acp_replace :: proc(owned: ^string, value: string, allocator: mem.Allocator) {
+	delete(owned^, allocator)
+	owned^ = strings.clone(value, allocator) if value != "" else ""
 }
 
 // acp_answer answers a request the agent sent. A permission request is granted once, as a
@@ -543,7 +568,8 @@ acp_answer :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
 	_ = acp.writer_write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome})
 }
 
-// acp_next returns the next message the agent sent, reading and waiting as needed. A stop
+// acp_next returns the next message the agent sent, owned by the member's allocator, reading
+// and waiting as needed. A stop
 // sends the agent session/cancel and waits the stop patience for its answer; problem says
 // the agent ended, went silent past that, or could not be read.
 @(private)
@@ -552,7 +578,7 @@ acp_next :: proc(connection: ^Acp_Connection) -> (envelope: acp.Envelope, proble
 		for connection.next_frame < len(connection.frames) {
 			frame := connection.frames[connection.next_frame]
 			connection.next_frame += 1
-			parsed, parse_error := acp.parse_envelope(frame, context.temp_allocator)
+			parsed, parse_error := acp.parse_envelope(frame, connection.member.allocator)
 			if parse_error == .None { return parsed, "" }
 		}
 		for frame in connection.frames { delete(frame, connection.member.allocator) }
@@ -572,14 +598,21 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 		if connection.session_id == "" { return "the subagent was stopped before its session opened" }
 		_ = acp.writer_write_notification(&connection.writer, acp.SESSION_CANCEL, acp.Session_Cancel_Params{session_id = connection.session_id})
 	}
-	fds: [4]posix.pollfd
-	count := 0
-	fds[count] = {
+	// The agent's exit is watched beside its output, because a descendant that inherited
+	// stdout can keep it open after the agent itself is gone.
+	fds: [5]posix.pollfd
+	fds[0] = {
 		fd     = tool_fd(connection.output),
 		events = {.IN},
 	}
-	count += 1
+	fds[1] = {
+		fd     = tool_exit_watch_fd(connection.child.exit),
+		events = {.IN},
+	}
+	count := 2
+	errors_index := -1
 	if connection.errors != nil {
+		errors_index = count
 		fds[count] = {
 			fd     = tool_fd(connection.errors),
 			events = {.IN},
@@ -607,7 +640,7 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 		return "the agent did not stop in time and was ended"
 	}
 	buffer: [SUBAGENT_ACP_READ_BYTES]u8
-	if connection.errors != nil && fds[1].revents != {} {
+	if errors_index >= 0 && fds[errors_index].revents != {} {
 		taken, status := tool_read(connection.errors, buffer[:])
 		if status == .Failed || (status == .Ok && taken == 0) {
 			_ = os.close(connection.errors)
@@ -617,7 +650,13 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 			if extra := len(connection.stderr_tail) - SUBAGENT_ACP_STDERR_BYTES; extra > 0 { remove_range(&connection.stderr_tail, 0, extra) }
 		}
 	}
-	if fds[0].revents == {} { return "" }
+	// What the agent wrote before it exited is read first; its exit counts once nothing is
+	// waiting, whoever still holds its pipes.
+	if fds[0].revents == {} {
+		stderr_waiting := errors_index >= 0 && fds[errors_index].revents != {}
+		if fds[1].revents != {} && !stderr_waiting { return acp_ended(connection, "exited") }
+		return ""
+	}
 	read, status := tool_read(connection.output, buffer[:])
 	switch status {
 	case .Again:
