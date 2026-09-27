@@ -230,7 +230,9 @@ chat_append_entries :: proc(
 	// use is released when the projection ends. A caller that asked for the projection in
 	// temp memory keeps its own arena, because the messages it appends land there.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
+	// Each group of calls becomes part of the request, so it grows in the request's allocator.
 	group: [dynamic]ai.Provider_Tool_Call
+	group.allocator = allocator
 	group_open := false
 	call_ids := make(map[i64]string, allocator = context.temp_allocator)
 	defer delete(call_ids)
@@ -441,7 +443,9 @@ chat_flush_calls :: proc(
 	if !open^ { return }
 	append(call_lists, group^)
 	append(messages, ai.Provider_Message{Role = .Assistant, Tool_Calls = call_lists[len(call_lists) - 1][:]})
+	allocator := group.allocator
 	group^ = {}
+	group.allocator = allocator
 	open^ = false
 }
 
