@@ -428,17 +428,34 @@ A queued job starts when no earlier-admitted job that is neither retired nor aba
 `agent/journal` is the durable execution record and the only home of SQLite knowledge. Core `agent` code calls its procedures; the package API is the storage boundary. There is no separate diagnostic log.
 
 ```odin
-open          :: proc(path: string, mode: Open_Mode, allocator := context.allocator) -> (Journal, Error)
-claim         :: proc(j: ^Journal, s: Session_Id) -> Error               // exclusive flock per session
-append        :: proc(j: ^Journal, r: Record)                            // buffered, owner-only
-append_node   :: proc(j: ^Journal, n: Node)                              // buffered, committed by the next commit
-commit        :: proc(j: ^Journal) -> (Journal_Seq, Error)               // durable barrier; flushes the buffer
-read_records  :: proc(j: ^Journal, f: Filter, after: Journal_Seq, page: int, allocator: mem.Allocator) -> ([]Record, Journal_Seq, Error)
-read_ancestry :: proc(j: ^Journal, s: Session_Id, head: Node_Id, allocator: mem.Allocator) -> ([]Node, Error) // stops at the covering checkpoint
-recover       :: proc(j: ^Journal, s: Session_Id, allocator: mem.Allocator) -> (Recovery, Error)
+open           :: proc(j: ^Journal, directory: string, run: Run_Id, mode: Open_Mode, allocator := context.allocator) -> Error
+close          :: proc(j: ^Journal) -> Error
+create_session :: proc(j: ^Journal, info: Session_Info) -> (Session_Id, Error)   // claims it; buffers the row, session.created, branch 1
+claim          :: proc(j: ^Journal, s: Session_Id) -> (Counters, Error)          // exclusive flock per session
+release        :: proc(j: ^Journal) -> Error
+append_record  :: proc(j: ^Journal, header: Record, data: $T, body: []u8 = nil) // buffered, owner-only
+append_node    :: proc(j: ^Journal, node: Node, data: $T, body: []u8 = nil) -> Node_Id
+append_branch  :: proc(j: ^Journal, base: Node_Id) -> Branch_Id
+commit         :: proc(j: ^Journal) -> (Journal_Seq, Error)                      // durable barrier; flushes the buffer
+flush_due      :: proc(j: ^Journal, now: time.Tick) -> Error                     // commits observations past a batch limit
+flush_deadline :: proc(j: ^Journal) -> Maybe(time.Tick)
+read_records   :: proc(j: ^Journal, f: Filter, after: Journal_Seq, page: int, allocator: mem.Allocator) -> ([]Record, Journal_Seq, Error)
+read_ancestry  :: proc(j: ^Journal, s: Session_Id, head: Node_Id, allocator: mem.Allocator) -> ([]Node, Error) // stops at the covering checkpoint
+list_sessions  :: proc(j: ^Journal, f: Session_Filter, allocator: mem.Allocator) -> ([]Session_Summary, Error)
+list_branches  :: proc(j: ^Journal, s: Session_Id, allocator: mem.Allocator) -> ([]Branch_Summary, Error)
+recover        :: proc(j: ^Journal) -> (Recovery, Error)                         // the claimed session, one transaction
 ```
 
-Records and nodes are journal-owned plain data (strings, integers, enums). `agent` maps its execution types to them; `agent/journal` never imports `agent`.
+Records and nodes are journal-owned plain data (strings, integers, enums). `agent` maps its execution types to them; `agent/journal` never imports `agent`. The identities of section 5 are declared in `agent/journal`, the innermost package that stores them, and `agent` uses them from there.
+
+- The journal lives at `$XDG_STATE_HOME/nabla/journal.db`; claims are `flock`s on `locks/<session>.lock` beside it, which the kernel drops when the process dies.
+- A `Journal` is one connection used by one thread. Each owner opens its own and claims one session; frontends and diagnostics open `Read_Only` journals that never claim, migrate, or write.
+- The journal fills `time_ms`, `mono_ns`, and `run` on every record. The caller fills the correlation columns.
+- `data` is encoded from a typed payload struct declared in `agent/journal`, one per kind, named after it (`Tool_Completed` for `tool.completed`). Records and nodes are copied into a batch arena at append, so the caller's memory is borrowed only for the call.
+- The journal allocates `Node_Id` and `Branch_Id` at append, from the counters loaded by `claim`. `Counters` also carries the highest turn, request, and call ids, so the owner continues numbering after a restart.
+- Each node append also writes a `node.committed` record in the same transaction, and the node's `seq` is that record's seq. Branches (`branch.created`) and sessions (`session.created`) follow the same rule, so the records table is the one global order.
+- `append_record`, `append_node`, and `append_branch` return no error. An encoding or allocation failure latches in the journal and is returned by the next `commit`. A failed commit rolls back and latches `Storage_Failed`: every later append is dropped and every later commit returns the latched error.
+- Corrupt or unreadable data returns `.Corrupt`, and the journal keeps the session and seq of the offending row in `j.corrupt` for the message.
 
 ### 8.2 Schema
 
@@ -449,7 +466,7 @@ records(seq INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, mono_ns INTEGER NOT N
         parent_call INTEGER, task TEXT, subagent BLOB, hook TEXT, provider TEXT, model TEXT,
         data TEXT, body BLOB) STRICT
 nodes(session BLOB, node INTEGER, parent INTEGER, branch INTEGER, kind TEXT, turn INTEGER,
-      seq INTEGER NOT NULL, data TEXT, body BLOB, PRIMARY KEY(session, node)) STRICT
+      covers INTEGER, seq INTEGER NOT NULL, data TEXT, body BLOB, PRIMARY KEY(session, node)) STRICT
 branches(session BLOB, branch INTEGER, base_node INTEGER, seq INTEGER NOT NULL,
          PRIMARY KEY(session, branch)) STRICT
 sessions(session BLOB PRIMARY KEY, created_ms INTEGER, workspace TEXT,
@@ -495,6 +512,7 @@ config.published config.rejected catalog.published
 cache.observed resource.observed
 rating.recorded rating.cleared assessment.recorded
 runtime.message job.abandoned job.reclaimed
+selection.changed
 ```
 
 Every record fills the correlation columns that exist at that point: session, branch, node, turn, request, attempt, job, call, parent call, task, subagent, hook, provider, model. A record states one fact at the boundary that observed it, once. Summaries are computed by readers.

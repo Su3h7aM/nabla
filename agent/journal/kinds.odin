@@ -1,0 +1,151 @@
+package journal
+
+// Record_Kind is the closed set of journal facts. The names are stored in the
+// `kind` column, so they are never changed or reused: a new kind is appended to
+// the table and to the enum behind it.
+Record_Kind :: enum u8 {
+	Run_Started,
+	Run_Finished,
+	Session_Created,
+	Session_Titled,
+	Session_Recovered,
+	Session_Claimed,
+	Session_Released,
+	Branch_Created,
+	Branch_Selected,
+	User_Input,
+	Node_Committed,
+	Turn_Started,
+	Turn_Completed,
+	Request_Prepared,
+	Request_Admitted,
+	Request_Sent,
+	Provider_Observed,
+	Response_Committed,
+	Response_Rejected,
+	Request_Interrupted,
+	Retry_Scheduled,
+	Retry_Completed,
+	Tool_Proposed,
+	Tool_Validation_Failed,
+	Tool_Repaired,
+	Tool_Admitted,
+	Tool_Decision,
+	Tool_Started,
+	Tool_Completed,
+	Lua_Started,
+	Lua_Completed,
+	Task_Started,
+	Task_Completed,
+	Subagent_Started,
+	Subagent_Completed,
+	Hook_Applied,
+	Hook_Failed,
+	Compaction_Started,
+	Compaction_Completed,
+	Checkpoint_Installed,
+	Config_Published,
+	Config_Rejected,
+	Catalog_Published,
+	Cache_Observed,
+	Resource_Observed,
+	Rating_Recorded,
+	Rating_Cleared,
+	Assessment_Recorded,
+	Runtime_Message,
+	Job_Abandoned,
+	Job_Reclaimed,
+	Selection_Changed,
+}
+
+RECORD_KIND_NAMES := [Record_Kind]string {
+	.Run_Started            = "run.started",
+	.Run_Finished           = "run.finished",
+	.Session_Created        = "session.created",
+	.Session_Titled         = "session.titled",
+	.Session_Recovered      = "session.recovered",
+	.Session_Claimed        = "session.claimed",
+	.Session_Released       = "session.released",
+	.Branch_Created         = "branch.created",
+	.Branch_Selected        = "branch.selected",
+	.User_Input             = "user.input",
+	.Node_Committed         = "node.committed",
+	.Turn_Started           = "turn.started",
+	.Turn_Completed         = "turn.completed",
+	.Request_Prepared       = "request.prepared",
+	.Request_Admitted       = "request.admitted",
+	.Request_Sent           = "request.sent",
+	.Provider_Observed      = "provider.observed",
+	.Response_Committed     = "response.committed",
+	.Response_Rejected      = "response.rejected",
+	.Request_Interrupted    = "request.interrupted",
+	.Retry_Scheduled        = "retry.scheduled",
+	.Retry_Completed        = "retry.completed",
+	.Tool_Proposed          = "tool.proposed",
+	.Tool_Validation_Failed = "tool.validation_failed",
+	.Tool_Repaired          = "tool.repaired",
+	.Tool_Admitted          = "tool.admitted",
+	.Tool_Decision          = "tool.decision",
+	.Tool_Started           = "tool.started",
+	.Tool_Completed         = "tool.completed",
+	.Lua_Started            = "lua.started",
+	.Lua_Completed          = "lua.completed",
+	.Task_Started           = "task.started",
+	.Task_Completed         = "task.completed",
+	.Subagent_Started       = "subagent.started",
+	.Subagent_Completed     = "subagent.completed",
+	.Hook_Applied           = "hook.applied",
+	.Hook_Failed            = "hook.failed",
+	.Compaction_Started     = "compaction.started",
+	.Compaction_Completed   = "compaction.completed",
+	.Checkpoint_Installed   = "checkpoint.installed",
+	.Config_Published       = "config.published",
+	.Config_Rejected        = "config.rejected",
+	.Catalog_Published      = "catalog.published",
+	.Cache_Observed         = "cache.observed",
+	.Resource_Observed      = "resource.observed",
+	.Rating_Recorded        = "rating.recorded",
+	.Rating_Cleared         = "rating.cleared",
+	.Assessment_Recorded    = "assessment.recorded",
+	.Runtime_Message        = "runtime.message",
+	.Job_Abandoned          = "job.abandoned",
+	.Job_Reclaimed          = "job.reclaimed",
+	.Selection_Changed      = "selection.changed",
+}
+
+// record_kind_from_name reads a stored kind name back. An unknown name is a
+// name this build does not know, and the caller reports the row as corrupt.
+record_kind_from_name :: proc(name: string) -> (Record_Kind, bool) {
+	for candidate in Record_Kind {
+		if RECORD_KIND_NAMES[candidate] == name { return candidate, true }
+	}
+	return {}, false
+}
+
+// Node_Kind is the closed set of committed conversational steps, stored in the
+// `kind` column of `nodes`.
+Node_Kind :: enum u8 {
+	User,
+	Assistant,
+	Results,
+	Context,
+	Notice,
+	Checkpoint,
+}
+
+NODE_KIND_NAMES := [Node_Kind]string {
+	.User       = "user",
+	.Assistant  = "assistant",
+	.Results    = "results",
+	.Context    = "context",
+	.Notice     = "notice",
+	.Checkpoint = "checkpoint",
+}
+
+// node_kind_from_name reads a stored node kind name back.
+node_kind_from_name :: proc(name: string) -> (Node_Kind, bool) {
+	for candidate in Node_Kind {
+		if NODE_KIND_NAMES[candidate] == name { return candidate, true }
+	}
+	return {}, false
+}

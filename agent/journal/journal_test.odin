@@ -1,0 +1,375 @@
+#+test
+#+private file
+package journal
+
+import "core:fmt"
+import "core:os"
+import "core:testing"
+import "core:time"
+
+import "nabla:db"
+import "nabla:db/sqlite"
+
+@(test)
+test_committed_records_survive_a_reopen :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer _remove_directory(directory)
+
+	writer: Journal
+	_open_journal(t, &writer, directory)
+
+	// The directory and the database admit the owner alone.
+	directory_info, directory_err := os.stat(directory, context.temp_allocator)
+	if directory_err != nil { testing.fail_now(t, "the journal directory was not created") }
+	testing.expect(t, permissions_are_private(directory_info.mode), "the journal directory should be owner-only")
+	database := fmt.tprintf("%s/%s", directory, DATABASE_NAME)
+	database_info, database_err := os.stat(database, context.temp_allocator)
+	if database_err != nil { testing.fail_now(t, "the database was not created") }
+	testing.expect(t, permissions_are_private(database_info.mode), "the database should be owner-only")
+
+	session := _create_session(t, &writer, {workspace = "/tmp/project", role = .Main})
+	append_record(&writer, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
+	// A process-scope record names no session, so both session columns are
+	// absent rather than sixteen zero bytes.
+	append_record(&writer, Record{kind = .Run_Started}, _Test_Payload{detail = "run"})
+	node_id := append_node(
+		&writer,
+		Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1},
+		_Test_Payload{detail = "prompt"},
+		_body("hello there"),
+	)
+	testing.expect_value(t, node_id, Node_Id(1))
+	last := _commit_ok(t, &writer)
+	testing.expect(t, last > 0, "a commit should report the seq it wrote")
+	_expect_ok(t, close(&writer))
+
+	reader: Journal
+	_open_journal(t, &reader, directory, .Read_Only)
+	defer _close_journal(t, &reader)
+
+	records := _records_of_session(t, &reader, session)
+	defer records_destroy(records, context.allocator)
+
+	// The global order is the order the items were appended in, and a node's
+	// node.committed record is part of it.
+	expected := [?]Record_Kind{.Session_Created, .Branch_Created, .Turn_Started, .Node_Committed}
+	testing.expect_value(t, len(records), len(expected))
+	previous := Journal_Seq(0)
+	for record, i in records {
+		if i < len(expected) { testing.expect_value(t, record.kind, expected[i]) }
+		testing.expect(t, record.seq > previous, "records should be in ascending seq order")
+		previous = record.seq
+		testing.expect_value(t, record.session, session)
+		testing.expect_value(t, record.subagent, Session_Id{})
+		testing.expect_value(t, record.run, _test_run_id())
+		testing.expect(t, len(record.data) > 0, "every record should carry a payload")
+	}
+
+	// The process-scope record reads back with the absent session id, so the
+	// NULL round-trips as the zero id.
+	scoped, _, scoped_err := read_records(&reader, Filter{kinds = {.Run_Started}}, 0, 0, context.allocator)
+	_expect_ok(t, scoped_err)
+	defer records_destroy(scoped, context.allocator)
+	testing.expect_value(t, len(scoped), 1)
+	testing.expect_value(t, scoped[0].session, Session_Id{})
+	testing.expect_value(t, scoped[0].subagent, Session_Id{})
+
+	committed := _record_seq_of_kind(records, .Node_Committed)
+	testing.expect(t, committed > 0, "the node's record should be there")
+
+	ancestry, ancestry_err := read_ancestry(&reader, session, node_id, context.allocator)
+	_expect_ok(t, ancestry_err)
+	defer nodes_destroy(ancestry, context.allocator)
+
+	testing.expect_value(t, len(ancestry), 1)
+	node := ancestry[0]
+	testing.expect_value(t, node.id, node_id)
+	testing.expect_value(t, node.kind, Node_Kind.User)
+	testing.expect_value(t, node.branch, Branch_Id(INITIAL_BRANCH))
+	testing.expect_value(t, node.turn, Turn_Id(1))
+	testing.expect_value(t, node.parent, Node_Id(0))
+	testing.expect_value(t, string(node.body), "hello there")
+	testing.expect_value(t, node.seq, committed)
+
+	payload: _Test_Payload
+	_decode_payload(t, node.data, &payload)
+	testing.expect_value(t, payload.detail, "prompt")
+	testing.expect_value(t, payload.v, PAYLOAD_VERSION)
+}
+
+@(test)
+test_buffered_records_are_invisible_until_a_commit :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer _remove_directory(directory)
+
+	writer: Journal
+	_open_journal(t, &writer, directory)
+	defer _close_journal(t, &writer)
+
+	session := _create_session(t, &writer, {workspace = "/tmp/project", role = .Main})
+	for _ in 0 ..< 3 {
+		append_record(&writer, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "buffered"})
+	}
+
+	reader: Journal
+	_open_journal(t, &reader, directory, .Read_Only)
+	defer _close_journal(t, &reader)
+
+	expect_records :: proc(t: ^testing.T, j: ^Journal, session: Session_Id, want: int, what: string) {
+		records, _, err := read_records(j, Filter{session = session}, 0, 0, context.allocator)
+		_expect_ok(t, err)
+		defer records_destroy(records, context.allocator)
+		testing.expectf(t, len(records) == want, "%s: expected %d records, read %d", what, want, len(records))
+	}
+
+	// The session created here holds its own two records before the first
+	// observation is buffered.
+	SESSION_RECORDS :: 2
+
+	expect_records(t, &reader, session, 0, "before any commit")
+
+	// Neither the record count nor the age limit has been reached.
+	_expect_ok(t, flush_due(&writer, time.tick_now()))
+	expect_records(t, &reader, session, 0, "after a flush that is not due")
+
+	deadline, has_deadline := flush_deadline(&writer).?
+	testing.expect(t, has_deadline, "a buffered batch has a deadline")
+	_expect_ok(t, flush_due(&writer, time.tick_add(deadline, time.Second)))
+	expect_records(t, &reader, session, SESSION_RECORDS + 3, "after the age limit")
+
+	// The batch record limit commits on its own, with no barrier.
+	for _ in 0 ..< JOURNAL_BATCH_RECORDS {
+		append_record(&writer, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "bulk"})
+	}
+	testing.expect_value(t, flush_deadline(&writer) != nil, true)
+	_expect_ok(t, flush_due(&writer, time.tick_now()))
+	expect_records(t, &reader, session, SESSION_RECORDS + 3 + JOURNAL_BATCH_RECORDS, "after the record limit")
+
+	testing.expect_value(t, flush_deadline(&writer) == nil, true)
+}
+
+@(test)
+test_a_session_has_one_writer_at_a_time :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer _remove_directory(directory)
+
+	first: Journal
+	_open_journal(t, &first, directory)
+	session := _create_session(t, &first, {workspace = "/tmp/project", role = .Main})
+	_commit_ok(t, &first)
+
+	// A second journal cannot take the session the first one holds.
+	second: Journal
+	_open_journal(t, &second, directory)
+	_, claim_err := claim(&second, session)
+	_expect_error(t, claim_err, .Claimed)
+
+	// A journal holding its own session cannot take another one either.
+	other := _create_session(t, &second, {workspace = "/tmp/other", role = .Main})
+	_commit_ok(t, &second)
+	_, second_claim_err := claim(&second, session)
+	_expect_error(t, second_claim_err, .Claimed)
+	_expect_ok(t, release(&second))
+
+	// An id the journal does not hold is not a claim to take.
+	third: Journal
+	_open_journal(t, &third, directory)
+	_, missing_err := claim(&third, _absent_session())
+	_expect_error(t, missing_err, .Not_Found)
+
+	// Releasing the first writer lets another take over, and the ids it reads
+	// back continue where the session stopped.
+	node_id := append_node(&first, Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1}, _Test_Payload{detail = "first writer"})
+	testing.expect_value(t, node_id, Node_Id(1))
+	append_record(&first, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
+	branch_id := append_branch(&first, node_id)
+	testing.expect_value(t, branch_id, Branch_Id(2))
+	_commit_ok(t, &first)
+	_expect_ok(t, release(&first))
+	_expect_ok(t, close(&first))
+
+	_expect_ok(t, close(&second))
+	_expect_ok(t, close(&third))
+
+	resumed: Journal
+	_open_journal(t, &resumed, directory)
+	defer _close_journal(t, &resumed)
+	counters, resumed_err := claim(&resumed, session)
+	_expect_ok(t, resumed_err)
+	testing.expect_value(t, counters.node, Node_Id(1))
+	testing.expect_value(t, counters.branch, Branch_Id(2))
+	testing.expect_value(t, counters.turn, Turn_Id(1))
+	testing.expect_value(t, counters.request, Request_Id(0))
+	testing.expect_value(t, counters.call, Call_Id(0))
+
+	next := append_node(&resumed, Node{session = session, branch = INITIAL_BRANCH, kind = .Assistant}, _Test_Payload{detail = "second writer"})
+	testing.expect_value(t, next, Node_Id(2))
+	_commit_ok(t, &resumed)
+
+	testing.expect(t, other != session, "each session has its own id")
+}
+
+@(test)
+test_a_failed_commit_latches_and_drops_appends :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer _remove_directory(directory)
+
+	j: Journal
+	_open_journal(t, &j, directory)
+	defer _close_journal(t, &j)
+
+	session := _create_session(t, &j, {workspace = "/tmp/project", role = .Main})
+	node_id := append_node(&j, Node{session = session, branch = INITIAL_BRANCH, kind = .User}, _Test_Payload{detail = "first"})
+	testing.expect_value(t, node_id, Node_Id(1))
+	_commit_ok(t, &j)
+
+	// The next node reuses the id already committed, which the primary key of
+	// nodes refuses. A journal only hands out ids that have not been used, so
+	// this is the injected storage failure the latch has to survive.
+	j.counters.node = 0
+	duplicate := append_node(&j, Node{session = session, branch = INITIAL_BRANCH, kind = .User}, _Test_Payload{detail = "second"})
+	testing.expect_value(t, duplicate, Node_Id(1))
+
+	_, commit_err := commit(&j)
+	_expect_error(t, commit_err, .Storage_Failed)
+
+	// The database's own message is kept, so the harness can report why.
+	cause, is_database := j.failure_cause.(db.Error)
+	testing.expect(t, is_database, "a failed commit should keep the database's error")
+	if is_database {
+		message := db.error_message(&cause)
+		testing.expect(t, len(message) > 0, "the database's message should be kept")
+	}
+
+	// Nothing buffered can be written again, so the batch is dropped, every
+	// later append is dropped, and every later commit reports the latch.
+	testing.expect_value(t, len(j.pending), 0)
+	append_record(&j, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "dropped"})
+	testing.expect_value(t, len(j.pending), 0)
+	_, again_err := commit(&j)
+	_expect_error(t, again_err, .Storage_Failed)
+	testing.expect(t, error_is(j.failure, .Storage_Failed))
+
+	// What was committed before the failure is still readable.
+	records := _records_of_session(t, &j, session)
+	defer records_destroy(records, context.allocator)
+	testing.expect_value(t, len(records), 3)
+}
+
+@(test)
+test_open_refuses_a_database_this_build_does_not_read :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer _remove_directory(directory)
+
+	// A database this package created, stamped with a version from the future.
+	created: Journal
+	_open_journal(t, &created, directory)
+	_expect_ok(t, close(&created))
+
+	database_path := fmt.tprintf("%s/%s", directory, DATABASE_NAME)
+	conn: db.Conn
+	_expect_db_ok(t, sqlite.open(&conn, {path = database_path}))
+	_expect_db_ok(t, db.exec(&conn, "PRAGMA user_version = 99"))
+	_expect_db_ok(t, db.close(&conn))
+
+	refused: Journal
+	_expect_error(t, open(&refused, directory, _test_run_id(), .Read_Write), .Schema_Too_New)
+	testing.expect(t, !refused.open, "a refused open leaves a closed journal")
+	_expect_error(t, open(&refused, directory, _test_run_id(), .Read_Only), .Schema_Too_New)
+
+	// A database someone else wrote holds no version this package can read.
+	foreign_directory := _temp_directory(t)
+	defer _remove_directory(foreign_directory)
+	foreign_path := fmt.tprintf("%s/%s", foreign_directory, DATABASE_NAME)
+	file, file_err := os.open(foreign_path, {.Read, .Write, .Create}, PRIVATE_FILE_PERMISSIONS)
+	if file_err != nil { testing.fail_now(t, "could not create a database file") }
+	_expect_ok(t, os.close(file))
+
+	foreign_conn: db.Conn
+	_expect_db_ok(t, sqlite.open(&foreign_conn, {path = foreign_path}))
+	_expect_db_ok(t, db.exec(&foreign_conn, "CREATE TABLE foreign_table (x INTEGER)"))
+	_expect_db_ok(t, db.close(&foreign_conn))
+
+	_expect_error(t, open(&refused, foreign_directory, _test_run_id(), .Read_Write), .Schema_Unknown)
+	_expect_error(t, open(&refused, foreign_directory, _test_run_id(), .Read_Only), .Schema_Unknown)
+
+	// A reader creates nothing, so a directory with no journal is .Not_Found.
+	empty_directory := _temp_directory(t)
+	defer _remove_directory(empty_directory)
+	_expect_error(t, open(&refused, empty_directory, _test_run_id(), .Read_Only), .Not_Found)
+}
+
+@(test)
+test_a_read_only_journal_refuses_to_write :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer _remove_directory(directory)
+
+	writer: Journal
+	_open_journal(t, &writer, directory)
+	session := _create_session(t, &writer, {workspace = "/tmp/project", role = .Main})
+	_commit_ok(t, &writer)
+	_expect_ok(t, close(&writer))
+
+	reader: Journal
+	_open_journal(t, &reader, directory, .Read_Only)
+	defer _close_journal(t, &reader)
+
+	_, claim_err := claim(&reader, session)
+	_expect_error(t, claim_err, .Read_Only)
+	_, create_err := create_session(&reader, {workspace = "/tmp/project", role = .Main})
+	_expect_error(t, create_err, .Read_Only)
+
+	// An append on a read-only journal is dropped and reported by the commit.
+	append_record(&reader, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "refused"})
+	testing.expect_value(t, len(reader.pending), 0)
+	_, commit_err := commit(&reader)
+	_expect_error(t, commit_err, .Read_Only)
+}
+
+@(test)
+test_a_session_created_here_is_claimed_and_numbered :: proc(t: ^testing.T) {
+	directory := _temp_directory(t)
+	defer _remove_directory(directory)
+
+	j: Journal
+	_open_journal(t, &j, directory)
+	defer _close_journal(t, &j)
+
+	parent := _create_session(t, &j, {workspace = "/tmp/project", role = .Main})
+	testing.expect(t, !session_id_is_absent(parent), "a created session has an id")
+	testing.expect_value(t, j.claimed, parent)
+	testing.expect_value(t, j.counters.branch, Branch_Id(INITIAL_BRANCH))
+	_commit_ok(t, &j)
+
+	// A second session needs the first one released.
+	_, second_err := create_session(&j, {workspace = "/tmp/other", role = .Main})
+	_expect_error(t, second_err, .Claimed)
+	_expect_ok(t, release(&j))
+
+	child := _create_session(t, &j, {workspace = "/tmp/other", role = .Subagent, parent_session = parent, parent_call = 7})
+	_commit_ok(t, &j)
+
+	// The hex form of an id is what a lock file and a message use.
+	hex: [SESSION_ID_HEX_LENGTH]u8
+	text := session_id_to_hex(child, hex[:])
+	testing.expect_value(t, len(text), SESSION_ID_HEX_LENGTH)
+	parsed, parsed_ok := session_id_parse(text)
+	testing.expect(t, parsed_ok, "a rendered id should parse")
+	testing.expect_value(t, parsed, child)
+	_, bad_parse := session_id_parse(text[:len(text) - 1])
+	testing.expect(t, !bad_parse, "a short id should not parse")
+	run := run_id_create()
+	testing.expect(t, !run_id_is_absent(run), "a run id should be created")
+	testing.expect(t, run != _test_run_id(), "run ids should be drawn fresh")
+
+	summaries, list_err := list_sessions(&j, {}, context.allocator)
+	_expect_ok(t, list_err)
+	defer session_summaries_destroy(summaries, context.allocator)
+	testing.expect_value(t, len(summaries), 2)
+	testing.expect_value(t, summaries[0].id, child)
+	testing.expect_value(t, summaries[0].role, Session_Role.Subagent)
+	testing.expect_value(t, summaries[0].parent_session, parent)
+	testing.expect_value(t, summaries[0].parent_call, Call_Id(7))
+	testing.expect_value(t, summaries[0].title, "")
+	testing.expect_value(t, summaries[1].id, parent)
+}
