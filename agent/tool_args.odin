@@ -85,8 +85,8 @@ Codemode_Args :: struct {
 // tool_args_decode reads one admitted document as the tool's own arguments, refusing a call
 // whose fields do not match what the tool declares. It is the only place a document becomes
 // arguments, so a tool, a Lua child call, and a repaired call all read the same way.
-tool_args_decode :: proc(ctx: ^Tool_Context, kind: Tool_Kind, object: json.Object) -> (Tool_Args, Tool_Argument_Error) {
-	switch kind {
+tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object: json.Object) -> (Tool_Args, Tool_Argument_Error) {
+	switch definition.kind {
 	case .Read:
 		args, err := tool_read_args(ctx, object)
 		return args, err
@@ -113,12 +113,10 @@ tool_args_decode :: proc(ctx: ^Tool_Context, kind: Tool_Kind, object: json.Objec
 	case .Codemode:
 		args, err := tool_codemode_args(ctx, object)
 		return args, err
-	case .Custom:
-		// The harness does not know what this tool's arguments are, so it hands none over.
-		return nil, {}
-	case .MCP:
-		// An MCP server validates its own tool's arguments, so their document travels to the
-		// server as it arrived rather than through a reader here.
+	case .Custom, .MCP:
+		// The tool validates its own arguments, so none are handed over and the document
+		// travels as admitted, with only its integer fields repaired from the schema.
+		tool_fields_repair_integers(object, definition.integer_fields, &ctx.repairs, ctx.allocator)
 		return nil, {}
 	}
 	return nil, {}

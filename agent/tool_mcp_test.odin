@@ -91,6 +91,41 @@ test_mcp_definition_carries_the_alias_schema_and_hints :: proc(t: ^testing.T) {
 	testing.expect_value(t, definition.hints.open_world, Tool_Hint_Value.Yes)
 }
 
+// A tool whose arguments the server validates has its integer fields repaired from its own
+// schema, and every other field travels exactly as it was sent.
+@(test)
+test_mcp_integer_fields_are_repaired_from_the_schema :: proc(t: ^testing.T) {
+	registry, registry_error := tool_registry_make()
+	if !testing.expect_value(t, registry_error.kind, Tool_Registry_Error_Kind.None) { return }
+	defer tool_registry_destroy(&registry)
+	schema := `{"type":"object","properties":{"count":{"type":"integer"},"page":{"type":["integer","null"]},"label":{"type":"string"},"either":{"type":["integer","string"]}}}`
+	tool := mcp.Tool {
+		name         = "search",
+		description  = "Search.",
+		input_schema = schema,
+	}
+	backend: MCP_Tool_Backend
+	added := tool_registry_add(&registry, mcp_tool_definition("remote_search", tool, &backend, 0))
+	if !testing.expect_value(t, added.kind, Tool_Registry_Error_Kind.None) { return }
+	definition, found := tool_registry_find(&registry, "remote_search")
+	if !testing.expect(t, found, "the tool is registered") { return }
+	testing.expect_value(t, len(definition.integer_fields), 2)
+
+	arguments := tool_arguments_prepare(`{"count":"7","page":3.0,"label":"12","either":"5"}`)
+	defer tool_arguments_destroy(&arguments)
+	ctx := Tool_Context {
+		allocator = context.allocator,
+	}
+	_, decode_error := tool_args_decode(&ctx, definition^, arguments.value.(json.Object))
+	testing.expect_value(t, decode_error.kind, Tool_Argument_Error_Kind.None)
+	testing.expect_value(t, ctx.repairs, session.Tool_Repairs{.Integer_From_String, .Integer_From_Float})
+	object := arguments.value.(json.Object)
+	testing.expect_value(t, object["count"].(json.Integer), 7)
+	testing.expect_value(t, object["page"].(json.Integer), 3)
+	testing.expect_value(t, string(object["label"].(json.String)), "12")
+	testing.expect_value(t, string(object["either"].(json.String)), "5")
+}
+
 // The only question that decides an outcome is whether the call can have happened.
 @(private)
 Mcp_Failure_Case :: struct {

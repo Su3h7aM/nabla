@@ -1,5 +1,6 @@
 package agent
 
+import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -136,23 +137,28 @@ Tool_Placement :: enum {
 // Tool_Definition is one tool the harness can run. The strings are owned by the
 // registry that holds the definition.
 Tool_Definition :: struct {
-	kind:         Tool_Kind,
-	name:         string,
-	description:  string,
-	input_schema: string,
-	hints:        Tool_Behavior_Hints,
-	placement:    Tool_Placement,
+	kind:           Tool_Kind,
+	name:           string,
+	description:    string,
+	input_schema:   string,
+	// integer_fields names the top-level fields whose schema type accepts an integer but
+	// neither a string nor a number. It is read from input_schema by the registry, and only
+	// for a tool whose arguments the harness does not read itself, so those fields can be
+	// repaired the way a native reader repairs its own.
+	integer_fields: []string,
+	hints:          Tool_Behavior_Hints,
+	placement:      Tool_Placement,
 	// timeout applies from the start of an execution when the model gives none. Zero
 	// means none. There is no maximum.
-	timeout:      time.Duration,
-	execute:      Tool_Execute,
+	timeout:        time.Duration,
+	execute:        Tool_Execute,
 	// backend is borrowed adapter state, nil for native tools. The registry
 	// copies the pointer but never frees what it points to: the adapter that
 	// registered the definition owns the state and must keep it alive until no
 	// registry holding the definition and no in-flight turn borrowing it
 	// remains. Dispatch copies it into Tool_Context, and only the execute
 	// procedure paired with this definition may cast it back.
-	backend:      rawptr,
+	backend:        rawptr,
 }
 
 // Tool_Registry owns the tools available to a session. It is built before the
@@ -312,12 +318,19 @@ tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition)
 	if _, present := tool_registry_find(registry, definition.name); present {
 		return {kind = .Name_Collision, tool = definition.name, detail = "a tool with this name is already registered"}
 	}
+	integer_fields: []string
+	if definition.kind == .MCP || definition.kind == .Custom {
+		fields, fields_error := tool_schema_integer_fields(definition.input_schema, registry.allocator)
+		if fields_error != nil { return {kind = .Allocation, tool = definition.name, detail = "the schema's integer fields could not be recorded"} }
+		integer_fields = fields
+	}
 	append(
 		&registry.definitions,
 		Tool_Definition {
 			name = strings.clone(definition.name, registry.allocator),
 			description = strings.clone(definition.description, registry.allocator),
 			input_schema = strings.clone(definition.input_schema, registry.allocator),
+			integer_fields = integer_fields,
 			hints = definition.hints,
 			placement = definition.placement,
 			timeout = definition.timeout,
@@ -327,6 +340,51 @@ tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition)
 		},
 	)
 	return {}
+}
+
+// tool_schema_integer_fields returns, sorted and owned by allocator, the top-level
+// properties of an input schema whose type accepts an integer but neither a string nor a
+// number. A string or a float in such a field is invalid as sent, so reading it as an
+// integer is its only reading. A schema that does not parse declares no such field.
+@(private)
+tool_schema_integer_fields :: proc(schema: string, allocator: mem.Allocator) -> (fields: []string, err: mem.Allocator_Error) {
+	root, parse_error := json.parse_string(schema, .JSON, true, context.temp_allocator)
+	defer json.destroy_value(root, context.temp_allocator)
+	if parse_error != nil { return nil, nil }
+	object, is_object := root.(json.Object)
+	if !is_object { return nil, nil }
+	properties, has_properties := object["properties"].(json.Object)
+	if !has_properties { return nil, nil }
+
+	names := make([dynamic]string, 0, len(properties), allocator) or_return
+	defer if err != nil {
+		for name in names { delete(name, allocator) }
+		delete(names)
+	}
+	for name, property in properties {
+		declared, is_declared := property.(json.Object)
+		if !is_declared { continue }
+		if !tool_schema_type_accepts(declared, "integer") { continue }
+		if tool_schema_type_accepts(declared, "string") || tool_schema_type_accepts(declared, "number") { continue }
+		append(&names, strings.clone(name, allocator) or_return) or_return
+	}
+	slice.sort(names[:])
+	return names[:], nil
+}
+
+// tool_schema_type_accepts reports whether a property's "type", a name or a list of names,
+// includes type_name.
+@(private)
+tool_schema_type_accepts :: proc(property: json.Object, type_name: string) -> bool {
+	#partial switch declared in property["type"] {
+	case json.String:
+		return string(declared) == type_name
+	case json.Array:
+		for element in declared {
+			if name, is_name := element.(json.String); is_name && string(name) == type_name { return true }
+		}
+	}
+	return false
 }
 
 tool_registry_find :: proc(registry: ^Tool_Registry, name: string) -> (^Tool_Definition, bool) {
@@ -346,6 +404,8 @@ tool_definition_destroy :: proc(definition: ^Tool_Definition, allocator: mem.All
 	delete(definition.name, allocator)
 	delete(definition.description, allocator)
 	delete(definition.input_schema, allocator)
+	for name in definition.integer_fields { delete(name, allocator) }
+	delete(definition.integer_fields, allocator)
 	definition^ = {}
 }
 

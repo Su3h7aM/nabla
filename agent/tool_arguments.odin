@@ -552,12 +552,32 @@ tool_field_int_value :: proc(
 	if number < minimum || number > maximum {
 		return 0, tool_argument_error(.Invalid_Value, path, expected, allocator = allocator)
 	}
-	if repair, repaired := repair.?; repaired {
-		json.destroy_value(slot^, allocator)
-		slot^ = json.Integer(number)
-		repairs^ += {repair}
-	}
+	tool_integer_write_back(slot, number, repair, repairs, allocator)
 	return number, {}
+}
+
+// tool_fields_repair_integers repairs the named integer fields of a document whose fields
+// the harness does not read itself. A value with one integer reading is written back as
+// that integer; any other value is left for the tool to judge.
+tool_fields_repair_integers :: proc(object: json.Object, names: []string, repairs: ^session.Tool_Repairs, allocator := context.allocator) {
+	object := object
+	for name in names {
+		slot, present := &object[name]
+		if !present { continue }
+		number, repair, readable := tool_integer_reading(slot^)
+		if readable { tool_integer_write_back(slot, number, repair, repairs, allocator) }
+	}
+}
+
+// tool_integer_write_back replaces a value read as an integer with that integer when
+// reading it was a repair, so the document says what the call runs with.
+@(private)
+tool_integer_write_back :: proc(slot: ^json.Value, number: int, repair: Maybe(session.Tool_Repair), repairs: ^session.Tool_Repairs, allocator: mem.Allocator) {
+	repair, repaired := repair.?
+	if !repaired { return }
+	json.destroy_value(slot^, allocator)
+	slot^ = json.Integer(number)
+	repairs^ += {repair}
 }
 
 // tool_integer_reading reads a value as the one integer it names: an integer, a whole number

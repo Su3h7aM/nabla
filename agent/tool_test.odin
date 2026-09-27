@@ -171,7 +171,7 @@ test_integer_fields_repair_one_reading :: proc(t: ^testing.T) {
 	ctx := Tool_Context {
 		allocator = context.allocator,
 	}
-	args, args_error := tool_args_decode(&ctx, .Read, arguments.value.(json.Object))
+	args, args_error := tool_args_decode(&ctx, TOOL_READ_DEFINITION, arguments.value.(json.Object))
 	if !testing.expect_value(t, args_error.kind, Tool_Argument_Error_Kind.None) { return }
 	testing.expect_value(t, args.(Read_Args).offset, 5)
 	testing.expect_value(t, args.(Read_Args).limit, 2)
@@ -183,7 +183,7 @@ test_integer_fields_repair_one_reading :: proc(t: ^testing.T) {
 		arguments := tool_arguments_prepare(document, context.allocator)
 		defer tool_arguments_destroy(&arguments, context.allocator)
 		if !testing.expect_value(t, arguments.status, Tool_Arguments_Status.Valid) { continue }
-		_, refused := tool_args_decode(&ctx, .Read, arguments.value.(json.Object))
+		_, refused := tool_args_decode(&ctx, TOOL_READ_DEFINITION, arguments.value.(json.Object))
 		defer tool_argument_error_destroy(&refused, context.allocator)
 		testing.expectf(t, refused.kind == .Wrong_Type, "%s was read as an integer", raw)
 	}
@@ -802,7 +802,7 @@ tool_file_is :: proc(t: ^testing.T, path, expected: string) -> bool {
 
 // Exercise the provider adapter before calling a typed executor.
 tool_test_execute :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object: json.Object) -> Tool_Result {
-	args, err := tool_args_decode(ctx, definition.kind, object)
+	args, err := tool_args_decode(ctx, definition, object)
 	defer tool_args_destroy(&args, ctx.allocator)
 	defer tool_argument_error_destroy(&err, ctx.allocator)
 	if err.kind != .None { return tool_result_refused(ctx, &err) }
