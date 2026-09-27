@@ -85,6 +85,7 @@ Agent_Parent :: struct {
 	provider_id:                  string,
 	model_id:                     string,
 	effort:                       string,
+	effort_levels:                []string,
 	disable_project_instructions: bool,
 	tools:                        Tool_Registry,
 	catalog:                      Catalog_Ref,
@@ -107,6 +108,8 @@ agent_parent_destroy :: proc(parent: ^Agent_Parent, allocator: mem.Allocator) {
 	delete(parent.provider_id, allocator)
 	delete(parent.model_id, allocator)
 	delete(parent.effort, allocator)
+	for level in parent.effort_levels { delete(level, allocator) }
+	delete(parent.effort_levels, allocator)
 	tool_registry_destroy(&parent.tools)
 	parent^ = {}
 }
@@ -119,6 +122,8 @@ agent_team_note_parent :: proc(chat: ^Chat_Session) {
 	allocator := team.allocator
 	tools, tools_error := tool_registry_clone(&chat.tools, allocator)
 	if tools_error.kind != .None { return }
+	effort_levels := make([]string, len(chat.effort_levels), allocator)
+	for level, index in chat.effort_levels { effort_levels[index] = strings.clone(level, allocator) }
 	agent_parent_destroy(&team.parent, allocator)
 	directory := chat.store.directory if chat.store != nil else ""
 	team.parent = Agent_Parent {
@@ -128,6 +133,7 @@ agent_team_note_parent :: proc(chat: ^Chat_Session) {
 		provider_id                  = strings.clone(chat.provider_id, allocator),
 		model_id                     = strings.clone(chat.model_id, allocator),
 		effort                       = strings.clone(chat.effort, allocator),
+		effort_levels                = effort_levels,
 		disable_project_instructions = chat.disable_project_instructions,
 		tools                        = tools,
 		catalog                      = chat.catalog,
@@ -225,6 +231,9 @@ subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, allocator: mem
 	parent.provider_id = strings.clone(parent.provider_id, context.temp_allocator)
 	parent.model_id = strings.clone(parent.model_id, context.temp_allocator)
 	parent.effort = strings.clone(parent.effort, context.temp_allocator)
+	levels := make([]string, len(parent.effort_levels), context.temp_allocator)
+	for level, index in parent.effort_levels { levels[index] = strings.clone(level, context.temp_allocator) }
+	parent.effort_levels = levels
 	parent.session_id = strings.clone(parent.session_id, context.temp_allocator)
 	parent.workspace = strings.clone(parent.workspace, context.temp_allocator)
 	parent.store_directory = strings.clone(parent.store_directory, context.temp_allocator)
@@ -264,15 +273,10 @@ subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, allocator: mem
 		selection, problem = model_selection_resolve(parent.catalog.catalog, provider_id, model_id, allocator)
 		if problem != "" { return nil, problem }
 	}
-	effort := effort_step_down(selection.effort_levels, parent.effort)
-	if args.effort != "" {
-		effort = args.effort
-		if !subagent_effort_valid(selection.effort_levels, effort) {
-			levels := strings.join(selection.effort_levels, ", ", context.temp_allocator)
-			model_selection_destroy(&selection, allocator)
-			if levels == "" { return nil, fmt.tprintf("model %s states no effort levels; leave effort out", args.model) }
-			return nil, fmt.tprintf("effort %q is not a level of this model; its levels are %s", effort, levels)
-		}
+	// An effort the model does not state is treated as one left out.
+	effort := args.effort
+	if effort_level_index(selection.effort_levels, effort) < 0 {
+		effort = effort_step_down(parent.effort_levels, selection.effort_levels, parent.effort)
 	}
 
 	member = new(Subagent, allocator)
@@ -308,14 +312,6 @@ subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, allocator: mem
 	append(&team.members, member)
 	sync.mutex_unlock(&team.mutex)
 	return member, ""
-}
-
-@(private)
-subagent_effort_valid :: proc(levels: []string, effort: string) -> bool {
-	for level in levels {
-		if level == effort { return true }
-	}
-	return false
 }
 
 // subagent_log_sink is where the calling thread's diagnostics go, so a subagent's thread
@@ -359,7 +355,6 @@ subagent_finish :: proc(member: ^Subagent, report: bool) {
 	member.closed = true
 	sync.mutex_unlock(&team.mutex)
 	if report {
-		unread := subagent_unread_count(member)
 		text: string
 		switch member.status {
 		case .Completed:
@@ -369,17 +364,10 @@ subagent_finish :: proc(member: ^Subagent, report: bool) {
 		case .Failed, .Running:
 			text = fmt.tprintf("Subagent %s failed: %s", member.name, member.answer)
 		}
-		if unread > 0 { text = fmt.tprintf("%s\n\n%d message(s) sent to it arrived after it finished and were not read.", text, unread) }
 		if !steer_push(&team.inbox, text) { log_emit({level = .Error, category = .Agent, event = "subagent.report_lost"}) }
 	}
 	sync.atomic_store(&member.done, true)
 	owner_wake_signal()
-}
-
-@(private)
-subagent_unread_count :: proc(member: ^Subagent) -> int {
-	sync.mutex_guard(&member.inbox.mu)
-	return len(member.inbox.items)
 }
 
 // Subagent_Answer keeps the text of the latest response, which is the final answer once the
@@ -500,8 +488,8 @@ subagent_run :: proc(member: ^Subagent) {
 			}
 			return
 		}
-		// A message the orchestrator sent after the answer is one the subagent has not
-		// answered, so it gets a turn of its own.
+		// Steering answers every message taken before the turn settled. One that arrived
+		// after its last check is taken here, and the inbox closes only when it is empty.
 		line, more := subagent_next_message(member)
 		if !more { break }
 		text, origin, from_inbox = line, .Agent, true

@@ -93,6 +93,7 @@ Agent_Output :: struct {
 	model:   string,
 	effort:  string,
 	session: string,
+	notice:  string, // a repair of the call, such as an effort the model does not state
 	answer:  string,
 }
 
@@ -216,6 +217,7 @@ tool_result_render :: proc(
 		if value.model != "" { render_field(&head, "model", value.model) or_return }
 		if value.effort != "" { render_field(&head, "effort", value.effort) or_return }
 		if value.session != "" { render_field(&head, "session", value.session) or_return }
+		if value.notice != "" { render_field(&head, "notice", value.notice) or_return }
 		render_text(&body, value.answer) or_return
 	case Codemode_Output:
 		if value.failure != "" {
@@ -458,6 +460,7 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		value.model = strings.clone(borrowed.model, allocator) or_return
 		value.effort = strings.clone(borrowed.effort, allocator) or_return
 		value.session = strings.clone(borrowed.session, allocator) or_return
+		value.notice = strings.clone(borrowed.notice, allocator) or_return
 		value.answer = strings.clone(borrowed.answer, allocator) or_return
 	case Codemode_Output:
 		borrowed := value
@@ -535,6 +538,7 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 		delete(value.model, allocator)
 		delete(value.effort, allocator)
 		delete(value.session, allocator)
+		delete(value.notice, allocator)
 		delete(value.answer, allocator)
 	case Codemode_Output:
 		delete(value.failure, allocator)

@@ -111,6 +111,9 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 		model  = fmt.tprintf("%s/%s", member.selection.provider_id, member.selection.model_id),
 		effort = member.effort if member.effort != "" else "default",
 	}
+	if args.effort != "" && args.effort != member.effort {
+		output.notice = fmt.tprintf("effort %q is not a level of this model, so it runs as if effort were left out", args.effort)
+	}
 	if args.background {
 		// Copy the reply before launch: a fast child can finish and be reaped immediately.
 		result := tool_result_success(ctx, output, fmt.tprintf("%s started", output.agent))

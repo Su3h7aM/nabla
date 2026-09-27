@@ -121,14 +121,28 @@ catalog_model_names :: proc(catalog: ^Catalog, provider_id: string) -> string {
 	return strings.join(names[:], ", ", context.temp_allocator)
 }
 
-// effort_step_down is the level one below current among levels, which are ordered lowest
-// first. The lowest level stays where it is, and a level the list does not hold leaves the
-// provider default ("").
-effort_step_down :: proc(levels: []string, current: string) -> string {
-	for level, index in levels {
-		if level == current { return levels[max(index - 1, 0)] }
+// effort_step_down is a delegated model's effort when the orchestrator runs at current:
+// one of the orchestrator's levels below it, or the next lower one the delegated model also
+// states. Levels are ordered lowest first, and the lowest stays where it is. Only an
+// orchestrator without effort, or a delegated model that states none, leaves the provider
+// default (""); otherwise the result is never below the delegated model's lowest level.
+effort_step_down :: proc(parent_levels, child_levels: []string, current: string) -> string {
+	if current == "" || len(child_levels) == 0 { return "" }
+	if parent_index := effort_level_index(parent_levels, current); parent_index >= 0 {
+		for candidate := max(parent_index - 1, 0); candidate >= 0; candidate -= 1 {
+			if effort_level_index(child_levels, parent_levels[candidate]) >= 0 { return parent_levels[candidate] }
+		}
 	}
-	return ""
+	return child_levels[0]
+}
+
+// effort_level_index is where level sits in levels, or -1.
+effort_level_index :: proc(levels: []string, level: string) -> int {
+	if level == "" { return -1 }
+	for candidate, index in levels {
+		if candidate == level { return index }
+	}
+	return -1
 }
 
 // chat_session_select installs a resolved model on an idle session and applies effort, which

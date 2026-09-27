@@ -879,15 +879,20 @@ The first implementation uses Nabla's existing provider catalog, request state m
 
 `agent_spawn{instruction, prompt, model?, provider?, effort?, background?}` creates a fresh child session. `prompt` is required. The child receives its own instruction and task, the shared harness instructions, and instructions discovered in the workspace. It inherits neither the parent's conversation nor its client-specific instructions. The caller must supply everything else the child needs or tell it where to find it. There are no agent definition files.
 
-An omitted model inherits the parent's selection. A model override resolves through the live catalog; `provider` disambiguates providers. Omitted effort steps down one level in the selected model's supported levels, preserving the lowest. If the parent's effort has no matching level, the child uses the provider default. An explicit unsupported effort is refused before execution.
+An omitted model inherits the parent's selection. A model override resolves through the live catalog; `provider` disambiguates providers. An omitted effort and an effort the selected model does not state take the same path: the child runs one level below the parent's effort, and the lowest level stays where it is. When the child model lacks that level, the next lower level it states is used, and failing that its lowest level. A child thinks whenever its parent does; only a parent without effort, or a model that states no levels, leaves the provider default. An unsupported effort is reported in the call's result as a repair.
 
 Each child has its own store connection, session, instruction snapshot, request state, and tool registry. Its provider requests carry `x-parent-session-id` and use the parent session's cache key. The shared harness instructions remain a common prefix. Child registries exclude `agent_spawn` and `agent_stop`, including access through Code Mode. Their executors also reject child callers. Delegation has one level.
 
-Blocking calls return the child's final answer. Background calls return an agent id, run independently, and send their final answer through the parent's steering queue. `agent_send` lets the parent address a child and lets a child message its parent; sibling delivery is refused. Messages enter context only at settled request boundaries. A message queued as a child finishes gets another turn if it was accepted before its inbox closed. `agent_stop` requests cancellation and the child reports its stopped outcome. An idle frontend starts a turn for a child report; headless and ACP frontends wait for outstanding children.
+Blocking calls return the child's final answer. Background calls return an agent id, run independently, and send their final answer through the parent's steering queue. `agent_send` lets the parent address a child and lets a child message its parent; sibling delivery is refused. Messages follow steering: each enters context at the next settled boundary, and one recorded after the final answer continues the turn. A child closes its inbox only when the inbox is empty, in the same step that checks it, so a message is either answered or refused to its sender. `agent_stop` requests cancellation and the child reports its stopped outcome. An idle frontend starts a turn for a child report; headless and ACP frontends wait for outstanding children.
 
 The team owns the parent snapshot and child records. Teardown closes admission, requests cancellation, and waits using the existing worker stop patience. Unresponsive workers and everything they may reach stay allocated until process exit. Abandonment remains visible after session teardown so callers do not free shared tool backends. Shared MCP clients refuse overlapping requests, and backend refresh waits until child and abandoned workers no longer use the bindings. Concurrent native children share the workspace; this stage does not provide access scopes or serialize conflicting file edits.
 
-### 21.2 Planned process-backed invocation
+### 21.2 Required later work
+
+- Coordination through the journal. Child start, messages, and outcomes become journal records committed before their effects (invariant 2). Thread coordination, process children, and crash recovery build on those records instead of on in-memory team state. Crash isolation for native children waits for this work.
+- Workspace isolation. Children that write need their own workspace so concurrent edits cannot collide. The mechanism (a Jujutsu workspace, a Git worktree, or another copy) and how a child's changes return to the parent are still open. Until then children share the parent's workspace.
+
+### 21.3 Planned process-backed invocation
 
 `agent_spawn` exists only in sessions with `Session_Role.Main`. Child sessions have role `Subagent`; the tool is absent from their registry and refused at admission.
 
@@ -905,7 +910,7 @@ Spawn_Args :: struct {
 
 The child receives only the instruction and selected context, never the parent conversation. `Read_Only` gives the child read-only tools and Code Mode over them, with access class Read(all). `Workspace_Write` gives the child its default registry, with access class Process.
 
-### 21.3 Planned process-backed execution
+### 21.4 Planned process-backed execution
 
 - Every subagent is a child process driven over ACP by a supervising `Subagent` job worker. Native subagents run `nabla acp --subagent`; external harnesses (Codex, Claude Code) run their configured ACP command from `config.lua` `agents = { {id, command, args, env} }`. One adapter serves both.
 - Spawn: private process group, `PR_SET_PDEATHSIG = SIGKILL` in the child (the supervising thread lives until it reaps the child), stdin and stdout pipes, stderr drained into a diagnostic artifact. Then `initialize`, `session/new{cwd, _meta.nabla: {model, effort, scope, parent_session, parent_call}}`, `session/prompt`.

@@ -277,12 +277,14 @@ test_stopping_a_background_subagent_reports_to_its_parent :: proc(t: ^testing.T)
 	testing.expect(t, !chat_agents_wait(chat, nil), "cancellation leaves no running child")
 }
 
-// Effort left out steps one level down, and the lowest level stays where it is.
+// Effort left out steps one level down, and the lowest level stays where it is. A model with
+// other levels still thinks whenever its orchestrator does.
 @(test)
 test_effort_steps_down_one_level :: proc(t: ^testing.T) {
 	levels := []string{"minimal", "low", "medium", "high"}
-	testing.expect_value(t, effort_step_down(levels, "high"), "medium")
-	testing.expect_value(t, effort_step_down(levels, "low"), "minimal")
-	testing.expect_value(t, effort_step_down(levels, "minimal"), "minimal")
-	testing.expect_value(t, effort_step_down(levels, ""), "")
+	testing.expect_value(t, effort_step_down(levels, levels, "high"), "medium")
+	testing.expect_value(t, effort_step_down(levels, levels, "minimal"), "minimal")
+	testing.expect_value(t, effort_step_down(levels, levels, ""), "")
+	testing.expect_value(t, effort_step_down({"medium", "high", "max"}, {"low", "medium", "high"}, "max"), "high")
+	testing.expect_value(t, effort_step_down({"low"}, {"medium", "high"}, "low"), "medium")
 }
