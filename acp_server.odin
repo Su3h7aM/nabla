@@ -1387,7 +1387,7 @@ acp_tool_kind :: proc(chat: ^agent.Chat_Session, name: string) -> acp.Tool_Kind 
 		if definition.hints.destructive == .Yes { return .Edit }
 	}
 	switch name {
-	case agent.TOOL_SHELL_NAME, agent.TOOL_CODE_NAME:
+	case agent.TOOL_SHELL_NAME, agent.TOOL_CODEMODE_NAME:
 		return .Execute
 	case agent.TOOL_READ_NAME, agent.TOOL_RESULT_READ_NAME, agent.TOOL_LIST_SKILLS_NAME, agent.TOOL_LOAD_SKILL_NAME:
 		return .Read

@@ -211,7 +211,7 @@ test_recovery_settles_a_nested_call :: proc(t: ^testing.T) {
 			turn_no = turn,
 			request_no = request,
 			created_at_ms = 2_200,
-			payload = Tool_Call_Entry{call_id = "call_script", name = "builtin_code", arguments = "{}"},
+			payload = Tool_Call_Entry{call_id = "call_script", name = "builtin_codemode", arguments = "{}"},
 		},
 	)
 	_expect_ok(t, script_err)
@@ -558,7 +558,12 @@ test_context_omits_child_tool_records :: proc(t: ^testing.T) {
 	parent, parent_err := entry_append(
 		&store,
 		session.id,
-		{turn_no = turn, request_no = request, created_at_ms = 2_200, payload = Tool_Call_Entry{call_id = "code_1", name = "builtin_code", arguments = "{}"}},
+		{
+			turn_no = turn,
+			request_no = request,
+			created_at_ms = 2_200,
+			payload = Tool_Call_Entry{call_id = "code_1", name = "builtin_codemode", arguments = "{}"},
+		},
 	)
 	_expect_ok(t, parent_err)
 	_, parent_dispatch_err := entry_append(
@@ -569,7 +574,7 @@ test_context_omits_child_tool_records :: proc(t: ^testing.T) {
 			request_no = request,
 			created_at_ms = 2_210,
 			related_seq = parent,
-			payload = Tool_Dispatch_Entry{tool = "builtin_code", arguments = "{}"},
+			payload = Tool_Dispatch_Entry{tool = "builtin_codemode", arguments = "{}"},
 		},
 	)
 	_expect_ok(t, parent_dispatch_err)
@@ -655,7 +660,7 @@ test_child_call_requires_a_parent_in_the_same_turn :: proc(t: ^testing.T) {
 	parent, parent_err := entry_append(
 		&store,
 		session.id,
-		{turn_no = first_turn, created_at_ms = 2_100, payload = Tool_Call_Entry{call_id = "parent", name = "builtin_code", arguments = "{}"}},
+		{turn_no = first_turn, created_at_ms = 2_100, payload = Tool_Call_Entry{call_id = "parent", name = "builtin_codemode", arguments = "{}"}},
 	)
 	_expect_ok(t, parent_err)
 	_expect_ok(t, turn_finish(&store, session.id, first_turn, .Completed, "", 2_200))

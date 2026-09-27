@@ -1,0 +1,329 @@
+package agent
+
+import "core:fmt"
+import "core:strings"
+
+import "nabla:agent/session"
+
+// Codemode_Child is one call a script started. Its handle is its position plus one. job is
+// borrowed and stays valid until the batch is destroyed, because a retired job keeps its
+// record and its name until then.
+Codemode_Child :: struct {
+	job:       ^Tool_Job,
+	outcome:   session.Tool_Outcome,
+	committed: bool, // the result is recorded and kept for job.wait
+	consumed:  bool, // job.wait took the result
+}
+
+@(private)
+tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job) {
+	args := job.arguments.(Codemode_Args)
+	job.lua_children = make([dynamic]Codemode_Child, job.allocator)
+	run, compiled := codemode_lua_start(args.code, &job.interrupt, args.timeout, job.allocator)
+	if run == nil {
+		codemode_job_answer(job, .Tool_Failed, .Unavailable, "the Lua execution could not be allocated", "executor unavailable")
+		return
+	}
+	job.lua = run
+	if !compiled {
+		codemode_job_answer(job, .Tool_Failed, .Syntax_Error, run.message, "syntax error")
+		return
+	}
+	for &definition in chat.tools.definitions {
+		if definition.name == TOOL_CODEMODE_NAME { continue }
+		if !codemode_lua_install_tool(run, definition.name) {
+			codemode_job_answer(job, .Tool_Failed, .Unavailable, "the Lua tool table could not be built", "executor unavailable")
+			return
+		}
+	}
+	tool_job_lua_resume(jobs, chat, job)
+}
+
+// tool_job_lua_resume runs the script's next step and acts on what it reported.
+@(private)
+tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job) {
+	switch codemode_lua_resume(job.lua) {
+	case .Slice:
+		job.phase = .Queued
+	case .Host_Request:
+		codemode_job_request(jobs, chat, job)
+	case .Returned, .Stopped, .Failed:
+		codemode_job_stop_children(job)
+		if codemode_job_settled(job) {
+			codemode_job_finish(job)
+		} else {
+			job.phase = .Waiting
+		}
+	}
+}
+
+// codemode_job_request answers what the script asked for. An answer leaves the job queued
+// to resume; a wait for a child still running parks it until the child commits.
+@(private)
+codemode_job_request :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job) {
+	run := job.lua
+	handle := run.request.handle
+	if run.request.kind != .Wait {
+		refusal: string
+		handle, refusal = codemode_job_start_child(jobs, chat, job)
+		if job.result_present { return }
+		if refusal != "" {
+			codemode_lua_answer_error(run, refusal)
+			delete(refusal, run.allocator)
+			job.phase = .Queued
+			return
+		}
+		if run.request.kind == .Start {
+			codemode_lua_answer_handle(run, handle)
+			job.phase = .Queued
+			return
+		}
+	}
+
+	if handle < 1 || handle > len(job.lua_children) || job.lua_children[handle - 1].consumed {
+		codemode_lua_answer_error(run, fmt.tprintf("job.wait was given %d, which is not a handle from job.start that has not been waited on yet", handle))
+		job.phase = .Queued
+		return
+	}
+	if !job.lua_children[handle - 1].committed {
+		job.lua_waiting = handle
+		job.phase = .Waiting
+		return
+	}
+	codemode_job_deliver(job, handle)
+}
+
+@(private)
+codemode_job_deliver :: proc(job: ^Tool_Job, handle: int) {
+	codemode_lua_answer_kept(job.lua, handle)
+	job.lua_children[handle - 1].consumed = true
+	job.lua_waiting = 0
+	job.phase = .Queued
+}
+
+// codemode_job_start_child admits the requested call as a child job and returns its handle.
+// A call the script can fix is refused with a message owned by the run's allocator, which
+// the script receives as an error. A failure of the batch answers the parent itself.
+@(private)
+codemode_job_start_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: ^Tool_Job) -> (handle: int, refusal: string) {
+	run := parent.lua
+	name := run.request.name
+	if name == TOOL_CODEMODE_NAME {
+		return 0, fmt.aprintf("%s cannot be called from Lua; run the code directly instead", name, allocator = run.allocator)
+	}
+	// The script's table is written once as the call's arguments document, which the child
+	// is admitted from like any provider call, and which its record keeps.
+	arguments, message := codemode_lua_request_arguments(run)
+	if message != "" { return 0, message }
+	defer delete(arguments, run.allocator)
+
+	call_id := fmt.tprintf("%s/%d", parent.call_id, len(parent.lua_children) + 1)
+	entry := session.New_Entry {
+		turn_no = chat.turn_no,
+		request_no = chat.active_request,
+		created_at_ms = session.now_ms(),
+		parent_call_seq = parent.call.seq,
+		payload = session.Tool_Call_Entry{call_id = call_id, name = name, arguments = arguments},
+	}
+	call_seq, append_error := session.entry_append(chat.store, chat.id, entry)
+	if append_error != nil {
+		chat_session_record_failure(chat, "the nested tool call could not be recorded", append_error)
+		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool call could not be recorded", "storage failed")
+		return
+	}
+
+	// The job struct comes from the same heap as its data: a worker releases a job the owner
+	// handed back, so that allocation has to outlive the batch and its session.
+	allocator := jobs.worker_allocator
+	child, allocation_error := new(Tool_Job, allocator)
+	if allocation_error != nil {
+		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool call could not be allocated", "allocation failed")
+		return
+	}
+	child^ = {
+		id = jobs.next_id,
+		turn_id = parent.turn_id,
+		ordinal = len(jobs.jobs),
+		placement = .Worker,
+		phase = .Queued,
+		allocator = allocator,
+		parent = parent,
+		nested = true,
+		nested_call = {
+			id = strings.clone(call_id, allocator),
+			name = strings.clone(name, allocator),
+			arguments = strings.clone(arguments, allocator),
+			seq = call_seq,
+		},
+	}
+	child.call = &child.nested_call
+	child.name = strings.clone(name, allocator)
+	child.call_id = strings.clone(call_id, allocator)
+	tool_job_admit(jobs, chat, {}, child)
+	if !tool_jobs_publish(jobs, child) {
+		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool job could not be admitted", "allocation failed")
+		return
+	}
+	if _, append_failure := append(&parent.lua_children, Codemode_Child{job = child}); append_failure != nil {
+		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool job could not be tracked", "allocation failed")
+		return
+	}
+	return len(parent.lua_children), ""
+}
+
+// codemode_job_child_committed hands a recorded child result to its parent: it is kept for
+// job.wait, delivered at once to a wait that is parked on it, and ends a script that is
+// only waiting for its children to settle.
+codemode_job_child_committed :: proc(jobs: ^Tool_Jobs, child: ^Tool_Job, result: ^Tool_Result) {
+	parent := child.parent
+	handle := 0
+	for &entry, index in parent.lua_children {
+		if entry.job != child { continue }
+		entry.committed = true
+		entry.outcome = result.outcome
+		handle = index + 1
+	}
+	if parent.result_present || handle == 0 { return }
+	if jobs.stop != .None {
+		codemode_job_answer(parent, .Cancelled, .Cancelled, "the Code Mode execution was cancelled", "cancelled")
+		return
+	}
+	if parent.lua.terminal {
+		if codemode_job_settled(parent) { codemode_job_finish(parent) }
+		return
+	}
+	codemode_lua_keep_result(parent.lua, handle, result)
+	if parent.lua_waiting == handle { codemode_job_deliver(parent, handle) }
+}
+
+// codemode_job_stop_children stops every child that has not committed: a queued one never
+// runs, and a running one is asked to stop. Each still commits, so the record stays whole.
+@(private)
+codemode_job_stop_children :: proc(job: ^Tool_Job) {
+	for entry in job.lua_children {
+		if entry.committed { continue }
+		child := entry.job
+		#partial switch child.phase {
+		case .Queued:
+			child.result = tool_result_failure(&child.exec, .Not_Executed, "the script ended before this call ran", "not executed")
+			child.result_present = true
+			child.phase = .Result_Ready
+		case .Dispatching, .Running:
+			tool_job_request_stop(child)
+		}
+	}
+}
+
+@(private)
+codemode_job_settled :: proc(job: ^Tool_Job) -> bool {
+	for entry in job.lua_children {
+		if !entry.committed { return false }
+	}
+	return true
+}
+
+// codemode_job_live_child returns the earliest child that has not committed. Children commit
+// before their parent and in the order they started.
+codemode_job_live_child :: proc(job: ^Tool_Job) -> ^Tool_Job {
+	for entry in job.lua_children {
+		if !entry.committed { return entry.job }
+	}
+	return nil
+}
+
+// codemode_job_finish answers a script that ended and whose children all committed.
+@(private)
+codemode_job_finish :: proc(job: ^Tool_Job) {
+	run := job.lua
+	switch run.last_event {
+	case .Returned:
+		codemode_job_answer_value(job)
+	case .Stopped:
+		codemode_job_answer(job, .Cancelled, .Cancelled, run.message, "cancelled")
+	case .Failed:
+		switch run.failure {
+		case .Timed_Out:
+			codemode_job_answer(job, .Timed_Out, .Timed_Out, run.message, "timed out")
+		case .Memory:
+			codemode_job_answer(job, .Tool_Failed, .Out_Of_Memory, run.message, "Lua failed")
+		case .Syntax:
+			codemode_job_answer(job, .Tool_Failed, .Syntax_Error, run.message, "Lua failed")
+		case .None, .Runtime:
+			codemode_job_answer(job, .Tool_Failed, .Runtime_Error, run.message, "Lua failed")
+		}
+	case .Slice, .Host_Request:
+		codemode_job_answer(job, .Tool_Failed, .Unavailable, "the execution ended while it was still running", "executor unavailable")
+	}
+}
+
+// codemode_job_answer_value answers a script that returned. The value is written as a Lua
+// literal, and the result budget is enforced here rather than by the generic oversized
+// replacement, which would hide which value was too large.
+@(private)
+codemode_job_answer_value :: proc(job: ^Tool_Job) {
+	run := job.lua
+	value, message, diagnostic := codemode_lua_returned_literal(run)
+	defer delete(value, run.allocator)
+	defer delete(message, run.allocator)
+	if diagnostic != .None {
+		codemode_job_answer(job, .Tool_Failed, diagnostic, message, "invalid return value")
+		return
+	}
+	output := Codemode_Output {
+		value          = value,
+		logs           = string(run.logs[:]),
+		logs_truncated = run.logs_truncated,
+	}
+	result := codemode_job_result(job, .Success, "", output, "completed")
+	if len(result.content) > TOOL_MAX_RESULT_BYTES {
+		tool_result_destroy(&result)
+		limit := fmt.tprintf(
+			"the returned value, logs, and call summaries exceed the %d-byte result limit; return less from the script",
+			TOOL_MAX_RESULT_BYTES,
+		)
+		codemode_job_answer(job, .Tool_Failed, .Output_Limit, limit, "output limit")
+		return
+	}
+	job.result = result
+	job.result_present = true
+	job.phase = .Result_Ready
+}
+
+// codemode_job_answer gives a Code Mode job its failure result and stops the children it
+// no longer waits for. The outcome says what the harness observed, and the diagnostic which
+// limit or fault Code Mode hit.
+@(private)
+codemode_job_answer :: proc(job: ^Tool_Job, outcome: session.Tool_Outcome, diagnostic: Codemode_Diagnostic, message: string, reason: string) {
+	codemode_job_stop_children(job)
+	output := Codemode_Output {
+		failure = codemode_diagnostic_names[diagnostic],
+	}
+	if job.lua != nil {
+		output.logs = string(job.lua.logs[:])
+		output.logs_truncated = job.lua.logs_truncated
+	}
+	job.result = codemode_job_result(job, outcome, message, output, reason)
+	job.result_present = true
+	job.phase = .Result_Ready
+}
+
+// codemode_job_result adds the summaries of the calls the script made, so a model can audit
+// it and read one child's full result back by its sequence.
+@(private)
+codemode_job_result :: proc(job: ^Tool_Job, outcome: session.Tool_Outcome, message: string, output: Codemode_Output, reason: string) -> Tool_Result {
+	output := output
+	summaries: [CODEMODE_MAX_CALL_SUMMARIES]Codemode_Call
+	for entry in job.lua_children {
+		if !entry.committed { continue }
+		if output.calls_total < len(summaries) {
+			summaries[output.calls_total] = {
+				call_seq = i64(entry.job.call.seq),
+				name     = entry.job.name,
+				outcome  = session.tool_outcome_name(entry.outcome),
+			}
+		}
+		output.calls_total += 1
+	}
+	output.calls = summaries[:min(output.calls_total, len(summaries))]
+	return tool_result_of(&job.exec, outcome, message, output, reason)
+}

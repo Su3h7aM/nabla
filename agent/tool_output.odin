@@ -21,7 +21,7 @@ Tool_Output :: union {
 	Skill_Output,
 	Result_Read_Output,
 	Compact_Output,
-	Code_Output,
+	Codemode_Output,
 	MCP_Output,
 	Argument_Failure,
 }
@@ -92,23 +92,23 @@ Compact_Output :: struct {
 	state: string,
 }
 
-// Code_Call is one tool call a script made, as its parent reports it. It is a summary,
+// Codemode_Call is one tool call a script made, as its parent reports it. It is a summary,
 // never the child's output: a model that wants the output reads it back from call_seq
 // with context_read_result.
-Code_Call :: struct {
+Codemode_Call :: struct {
 	call_seq: i64,
 	name:     string,
 	outcome:  string,
 }
 
-// Code_Output is what a Code Mode execution did. failure is empty when the chunk
+// Codemode_Output is what a Code Mode execution did. failure is empty when the chunk
 // returned, and otherwise names why it did not. value is the returned value written as
 // a Lua literal, logs is what print produced, and calls are the script's tool calls.
-Code_Output :: struct {
+Codemode_Output :: struct {
 	failure:        string,
 	value:          string,
 	calls_total:    int,
-	calls:          []Code_Call,
+	calls:          []Codemode_Call,
 	logs_truncated: bool,
 	logs:           string,
 }
@@ -205,7 +205,7 @@ tool_result_render :: proc(
 		render_text(&body, value.text) or_return
 	case Compact_Output:
 		render_field(&head, "state", value.state) or_return
-	case Code_Output:
+	case Codemode_Output:
 		if value.failure != "" {
 			render_field(&head, "failure", value.failure) or_return
 		} else {
@@ -437,7 +437,7 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		borrowed := value
 		value.state = ""
 		value.state = strings.clone(borrowed.state, allocator) or_return
-	case Code_Output:
+	case Codemode_Output:
 		borrowed := value
 		value.failure = ""
 		value.value = ""
@@ -446,7 +446,7 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		value.failure = strings.clone(borrowed.failure, allocator) or_return
 		value.value = strings.clone(borrowed.value, allocator) or_return
 		value.logs = strings.clone(borrowed.logs, allocator) or_return
-		value.calls = make([]Code_Call, len(borrowed.calls), allocator) or_return
+		value.calls = make([]Codemode_Call, len(borrowed.calls), allocator) or_return
 		for item, index in borrowed.calls {
 			value.calls[index].call_seq = item.call_seq
 			value.calls[index].name = strings.clone(item.name, allocator) or_return
@@ -505,7 +505,7 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 		delete(value.text, allocator)
 	case Compact_Output:
 		delete(value.state, allocator)
-	case Code_Output:
+	case Codemode_Output:
 		delete(value.failure, allocator)
 		delete(value.value, allocator)
 		delete(value.logs, allocator)

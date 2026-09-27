@@ -17,7 +17,7 @@ Tool_Kind :: enum {
 	Load_Skill,
 	Result_Read,
 	Compact,
-	Code,
+	Codemode,
 	MCP,
 }
 
@@ -34,7 +34,7 @@ Tool_Args :: union {
 	List_Skills_Args,
 	Load_Skill_Args,
 	Result_Read_Args,
-	Code_Args,
+	Codemode_Args,
 }
 
 Read_Args :: struct {
@@ -76,8 +76,10 @@ Result_Read_Args :: struct {
 	limit:    int,
 }
 
-Code_Args :: struct {
-	code: string,
+// Codemode_Args is one Lua program. A zero timeout means none.
+Codemode_Args :: struct {
+	code:    string,
+	timeout: time.Duration,
 }
 
 // tool_args_decode reads one admitted document as the tool's own arguments, refusing a call
@@ -108,10 +110,9 @@ tool_args_decode :: proc(ctx: ^Tool_Context, kind: Tool_Kind, object: json.Objec
 		return args, err
 	case .Compact:
 		return nil, tool_fields_known(object, nil, allocator = ctx.allocator)
-	case .Code:
-		if error := tool_fields_known(object, TOOL_CODE_FIELDS, allocator = ctx.allocator); error.kind != .None { return nil, error }
-		code, code_error := tool_field_string(object, "code", allocator = ctx.allocator)
-		return Code_Args{code = code}, code_error
+	case .Codemode:
+		args, err := tool_codemode_args(ctx, object)
+		return args, err
 	case .Custom:
 		// The harness does not know what this tool's arguments are, so it hands none over.
 		return nil, {}

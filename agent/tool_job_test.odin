@@ -188,7 +188,7 @@ tool_job_test_hold_until :: proc(t: ^testing.T, state: ^Tool_Job_Hold_State, cou
 // --- tests ---------------------------------------------------------------------
 
 @(test)
-test_code_mode_suspends_for_a_nested_tool_job :: proc(t: ^testing.T) {
+test_codemode_suspends_for_a_nested_tool_job :: proc(t: ^testing.T) {
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
@@ -201,7 +201,7 @@ test_code_mode_suspends_for_a_nested_tool_job :: proc(t: ^testing.T) {
 		chat,
 		"call_code",
 		`{"code":"local first = tools.test_child({value = 7})\nlocal second = tools.test_child({value = 8})\nreturn first.outcome .. \"+\" .. second.outcome"}`,
-		TOOL_CODE_NAME,
+		TOOL_CODEMODE_NAME,
 	)
 
 	jobs: Tool_Jobs
@@ -220,7 +220,7 @@ test_code_mode_suspends_for_a_nested_tool_job :: proc(t: ^testing.T) {
 	testing.expect(t, first_child.parent == parent, "the first nested call should belong to the Code Mode job")
 	testing.expect(t, second_child.parent == parent, "the second nested call should belong to the Code Mode job")
 	testing.expect(t, first_child.nested && second_child.nested, "nested calls should own their staged records")
-	value, present := code_mode_lua_returned_string(parent.lua)
+	value, present := codemode_lua_returned_string(parent.lua)
 	testing.expect(t, present, "the script should return the child outcomes")
 	testing.expect_value(t, value, "success+success")
 	testing.expect_value(t, jobs.committed, 3)
@@ -253,12 +253,12 @@ test_nested_tool_storage_failure_frees_with_worker_allocator :: proc(t: ^testing
 	jobs.allocator = mem.tracking_allocator(&session_track)
 	defer tool_jobs_destroy(&jobs)
 
-	run, compiled := code_mode_lua_start(`return tools.test({})`)
+	run, compiled := codemode_lua_start(`return tools.test({})`)
 	if run == nil { testing.fail_now(t, "the Lua run could not be created") }
-	defer code_mode_lua_destroy(run)
+	defer codemode_lua_destroy(run)
 	if !compiled { testing.fail_now(t, "the Lua test chunk did not compile") }
-	if !code_mode_lua_install_tool(run, "test") { testing.fail_now(t, "the Lua tool could not be installed") }
-	if !testing.expect_value(t, code_mode_lua_resume(run), Lua_Event.Host_Request) { return }
+	if !codemode_lua_install_tool(run, "test") { testing.fail_now(t, "the Lua tool could not be installed") }
+	if !testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Host_Request) { return }
 
 	call := Chat_Tool_Call {
 		seq = 1,
@@ -278,13 +278,51 @@ test_nested_tool_storage_failure_frees_with_worker_allocator :: proc(t: ^testing
 	defer delete(parent.call_id, parent.allocator)
 	defer if parent.result_present { tool_result_destroy(&parent.result) }
 
-	tool_job_lua_submit_child(&jobs, chat, &parent)
+	codemode_job_request(&jobs, chat, &parent)
 
 	testing.expect_value(t, parent.phase, Tool_Job_Phase.Result_Ready)
 	testing.expect_value(t, len(jobs.jobs), 0)
 	testing.expect(t, chat_session_storage_failed(chat), "the refused child record latches storage failure")
 	testing.expect_value(t, len(worker_track.allocation_map), 0)
 	testing.expect_value(t, len(session_track.bad_free_array), 0)
+}
+
+// job.start runs calls while the script continues, job.wait takes their results in any
+// order, and a call the script never waited for is stopped and still reported.
+@(test)
+test_codemode_jobs_start_and_wait_in_any_order :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+	chat := &test.fixture.chat
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_child", tool_job_immediate_execute))
+	source := `local a = job.start("test_child", {value = 1})
+local b = job.start("test_child", {value = 2})
+local second = job.wait(b)
+local first = job.wait(a)
+local again = pcall(job.wait, a)
+job.start("test_child")
+return first.outcome .. " " .. second.outcome .. " " .. tostring(again)`
+	object := make(json.Object, 1, context.temp_allocator)
+	object["code"] = json.String(source)
+	arguments, marshal_err := json.marshal(object, allocator = context.temp_allocator)
+	if marshal_err != nil { testing.fail_now(t, "the arguments could not be built") }
+	_test_stage_call(t, chat, "call_code", string(arguments), TOOL_CODEMODE_NAME)
+
+	jobs: Tool_Jobs
+	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
+	defer tool_jobs_destroy(&jobs)
+	tool_jobs_submit(&jobs, chat, {})
+	tool_job_test_drain(t, &test, &jobs)
+
+	if !testing.expect_value(t, len(jobs.jobs), 4) { return }
+	value, _ := codemode_lua_returned_string(jobs.jobs[0].lua)
+	testing.expect_value(t, value, "success success false")
+	for job in jobs.jobs { testing.expect_value(t, job.phase, Tool_Job_Phase.Retired) }
+	testing.expect_value(t, tool_jobs_committed(&jobs), 1)
+	testing.expect_value(t, jobs.committed, 4)
 }
 
 // Admission must preserve every call the provider committed, including a batch larger
@@ -312,10 +350,10 @@ test_tool_batch_admits_every_committed_call :: proc(t: ^testing.T) {
 
 // A script can submit more child calls than the old one-response table size. The
 // table keeps every job until the batch ends, even after a child has committed.
-CODE_MODE_TEST_CHILD_CALLS :: 72
+CODEMODE_TEST_CHILD_CALLS :: 72
 
 @(test)
-test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
+test_codemode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
@@ -326,14 +364,14 @@ test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 	// More children than the old fixed batch size.
 	source := fmt.aprintf(
 		`local seen = 0 for i = 1, %d do local r = tools.test_step() if r.outcome == "success" then seen = seen + 1 end end return seen`,
-		CODE_MODE_TEST_CHILD_CALLS,
+		CODEMODE_TEST_CHILD_CALLS,
 		allocator = context.temp_allocator,
 	)
 	object := make(json.Object, 1, context.temp_allocator)
 	object["code"] = json.String(source)
 	arguments, marshal_err := json.marshal(object, allocator = context.temp_allocator)
 	if marshal_err != nil { testing.fail_now(t, "the arguments could not be built") }
-	_test_stage_call(t, chat, "call_code", string(arguments), TOOL_CODE_NAME)
+	_test_stage_call(t, chat, "call_code", string(arguments), TOOL_CODEMODE_NAME)
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
@@ -341,7 +379,7 @@ test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 	tool_jobs_submit(&jobs, chat, {})
 	tool_job_test_drain(t, &test, &jobs)
 
-	testing.expect_value(t, len(jobs.jobs), CODE_MODE_TEST_CHILD_CALLS + 1)
+	testing.expect_value(t, len(jobs.jobs), CODEMODE_TEST_CHILD_CALLS + 1)
 	testing.expect_value(t, tool_jobs_committed(&jobs), 1)
 
 	// The parent's answer is what the script computed from every child it ran.
@@ -366,7 +404,7 @@ test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 		if !present || related != parent_seq { continue }
 		found = true
 		testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-		testing.expect(t, strings.contains(result.content, fmt.tprintf(`value: %d`, CODE_MODE_TEST_CHILD_CALLS)), result.content)
+		testing.expect(t, strings.contains(result.content, fmt.tprintf(`value: %d`, CODEMODE_TEST_CHILD_CALLS)), result.content)
 	}
 	testing.expect(t, found, "the script should have answered its call")
 }
@@ -375,7 +413,7 @@ test_code_mode_may_exceed_one_response_worth_of_calls :: proc(t: ^testing.T) {
 // result reachable: the model reads it back from call_seq with context_read_result, so a
 // script that ran a hundred calls does not put a hundred results into the conversation.
 @(test)
-test_code_mode_reports_what_its_script_did :: proc(t: ^testing.T) {
+test_codemode_reports_what_its_script_did :: proc(t: ^testing.T) {
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
@@ -383,7 +421,7 @@ test_code_mode_reports_what_its_script_did :: proc(t: ^testing.T) {
 	hold: Tool_Job_Hold_State
 	lane := tool_job_hold_lane(&hold)
 	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_child", tool_job_immediate_execute))
-	_test_stage_call(t, chat, "call_code", `{"code":"local a = tools.test_child()\nlocal b = tools.test_child()\nreturn \"done\""}`, TOOL_CODE_NAME)
+	_test_stage_call(t, chat, "call_code", `{"code":"local a = tools.test_child()\nlocal b = tools.test_child()\nreturn \"done\""}`, TOOL_CODEMODE_NAME)
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())

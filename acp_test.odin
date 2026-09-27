@@ -46,7 +46,7 @@ test_tool_presentation_uses_the_tools_own_names_and_hints :: proc(t: ^testing.T)
 	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_WRITE_NAME), acp.Tool_Kind.Edit)
 	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_PATCH_NAME), acp.Tool_Kind.Edit)
 	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_SHELL_NAME), acp.Tool_Kind.Execute)
-	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_CODE_NAME), acp.Tool_Kind.Execute)
+	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_CODEMODE_NAME), acp.Tool_Kind.Execute)
 	testing.expect_value(t, acp_tool_kind(&chat, "some_mcp_tool"), acp.Tool_Kind.Other)
 
 	testing.expect_value(t, acp_tool_title(agent.TOOL_READ_NAME, `{"path":"/tmp/example.odin"}`), "builtin_read /tmp/example.odin")

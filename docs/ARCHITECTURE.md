@@ -656,8 +656,8 @@ Tool_Definition :: struct {
 	mcp:         ^MCP_Binding,     // kind == .MCP only
 }
 
-Tool_Args   :: union { Read_Args, Write_Args, Patch_Args, Shell_Args, Code_Args, Search_Args, Skill_Load_Args, Task_Run_Args, Spawn_Args, Result_Read_Args, Compact_Args, MCP_Args }
-Tool_Output :: union { Read_Output, Write_Output, Patch_Output, Shell_Output, Code_Output, Search_Output, Skill_Output, Task_Output, Spawn_Output, Result_Read_Output, Compact_Output, MCP_Output }
+Tool_Args   :: union { Read_Args, Write_Args, Patch_Args, Shell_Args, Codemode_Args, Search_Args, Skill_Load_Args, Task_Run_Args, Spawn_Args, Result_Read_Args, Compact_Args, MCP_Args }
+Tool_Output :: union { Read_Output, Write_Output, Patch_Output, Shell_Output, Codemode_Output, Search_Output, Skill_Output, Task_Output, Spawn_Output, Result_Read_Output, Compact_Output, MCP_Output }
 ```
 
 The registry is built, validated (names, schemas, collisions), and sorted inside the config snapshot, and is immutable. Advertisement, Lua `tools.*`, and admission read the same registry. Exposure filters (model without tool support, subagent scope, `tools.expose` in config) apply to advertisement and admission alike.
@@ -668,7 +668,7 @@ The registry is built, validated (names, schemas, collisions), and sorted inside
 | `builtin_write` | Write(path) | Worker |
 | `builtin_patch` | Write(paths) | Worker |
 | `builtin_shell` | Process | Worker |
-| `builtin_code` | None | Lua |
+| `builtin_codemode` | None | Lua |
 | `catalog_search` (skill and Task metadata) | Session | Owner |
 | `skill_load` | Read(skill file) | Worker |
 | `task_run` | None | Lua |
@@ -758,7 +758,7 @@ One embedded `vendor:lua/5.4` runtime serves Code Mode, Tasks, hooks, config eva
 
 | Profile | Memory | Wall | Capabilities |
 | --- | --- | --- | --- |
-| Code Mode | system memory | the model's `timeout`, else none | `tools.*`, `job.*`, `print`, `json.null` |
+| Code Mode | system memory | the model's `timeout_ms`, else none | `tools.*`, `job.*`, `print`, `json.*` |
 | Task | as Code Mode | as Code Mode | as Code Mode, plus `args` |
 | Hook | `LUA_HOOK_MEMORY` | `LUA_HOOK_WALL` | its input value only |
 | Config | `LUA_CONFIG_MEMORY` | `LUA_CONFIG_WALL` | `os.getenv` only |
@@ -766,9 +766,10 @@ One embedded `vendor:lua/5.4` runtime serves Code Mode, Tasks, hooks, config eva
 
 Code Mode and Tasks run model-written programs, so they carry only external limits (section 2.1). Hooks, config, and metadata run user code on the owner or the watcher, so their quotas keep those threads responsive.
 
-- Libraries by allowlist: base without `load`, `loadfile`, `dofile`, `collectgarbage`, `setmetatable`, `getmetatable`, `rawset`, `pcall`, `xpcall`; `string` without `dump`; `table`, `math`, `utf8`. No `io`, `os` (except config's `getenv`), `package`, `debug`, `coroutine`.
+- Libraries by allowlist: base without `load`, `loadfile`, `dofile`, `require`, `collectgarbage`, `warn`; `string` without `dump`; `table`, `math`, `utf8`; `os.clock`, `os.date`, `os.difftime`, `os.time`. No `io`, the rest of `os` (config gets `getenv` only), `package`, `debug`, `coroutine`: files and processes are reached through tools, and a script coroutine would receive the host's yields. Hooks, config, and metadata keep the narrow set without `setmetatable`, `pcall`, or `os`.
+- `setmetatable` refuses a metatable with `__gc`, because a finalizer runs with hooks off and again when the state closes. Every other metamethod runs as script code under the count hook, and the host reads values raw, so it never runs script code.
 - Allocator: `lua_Alloc` over the heap using `mem.resize_non_zeroed`, accounting live requested bytes. Profiles with a memory quota check a resize against `live - old + new`; Code Mode and Tasks have none, so only an OS allocation failure refuses. Refusal returns nil as Lua requires; shrinking never fails. `LUA_HOST_RESERVE` is added while the host pushes values.
-- Scheduling is suspension: a count hook yields every `LUA_SLICE_INSTRUCTIONS` so the owner stays responsive; the owner checks stop, deadlines, and quotas between slices and never resumes a stopped run. The slice size is a scheduling quantum, not a limit on work. Every allocation-capable host entry runs protected. Callbacks hold no Odin resources that depend on `defer`.
+- Scheduling is suspension: a count hook yields every `LUA_SLICE_INSTRUCTIONS` so the owner stays responsive; the owner checks stop, deadlines, and quotas between slices and never resumes a stopped run. Where the script cannot yield (inside a C call such as a `table.sort` comparator), the hook raises once the run should stop and then fires on every instruction, so a `pcall` that catches the raise ends at its next yield. The slice size is a scheduling quantum, not a limit on work. Every allocation-capable host entry runs protected. Callbacks hold no Odin resources that depend on `defer`.
 - Code Mode and Tasks run on the owner, one slice per `Resume_Lua` effect, so several scripts interleave and none holds the owner longer than a slice. Hooks run to completion on the owner within their small limits; config and metadata run on the watcher.
 
 ### 17.1 Code Mode API
@@ -784,8 +785,9 @@ return {ok = a.outcome == "success", errors = b.output.stderr}
 - `job.start` yields a host request; the owner admits a child through section 14.2 and returns an integer handle. `job.wait(h)` yields until that child's result commits and returns its typed table (`outcome`, `message`, `output`). An unknown or already consumed handle raises a Lua error.
 - A script may hold any number of unfinished children. They queue in the job table and run as access and `BLOCKING_JOBS_MAX_RUNNING` allow.
 - When a script ends with unconsumed children, they are stopped, awaited, and reported in the parent result.
-- `builtin_code` and `task_run` are not callable from Lua (nesting depth one). `agent_spawn` is callable from Lua in a main session.
-- Value conversion is one checked path in both directions: finite, exactly representable numbers; UTF-8 strings; dense 1-based arrays; string-keyed tables; the `json.null` sentinel. Cycles, sparse or mixed tables, functions, threads, and userdata are refused with a bounded path. Raw table access only.
+- `builtin_codemode` and `task_run` are not callable from Lua (nesting depth one). `agent_spawn` is callable from Lua in a main session.
+- A refusal the script can fix (a bad handle, arguments that are not one table of named fields, a nested `builtin_codemode`) is a Lua error at the calling line, which `pcall` can catch.
+- Value conversion is one checked walk over the Lua value that writes text directly: a Lua literal for the returned value and `print`, JSON for a child's arguments (admitted through section 14.2 like a provider call) and `json.encode`. It accepts finite numbers; UTF-8 strings; dense 1-based arrays; string-keyed tables, written in name order; the `json.null` sentinel. Cycles, sparse or mixed tables, functions, threads, and userdata are refused with a bounded path. Raw table access only. `json.decode` and a tool output's typed fields are pushed as Lua values without an intermediate document, except a field that holds a peer's JSON.
 - Parent result: the return value, the print log, and the child list, projected through the context budget like any tool result; or a typed failure kind (`syntax_error` with line and message, `runtime_error` with traceback, `invalid_value` with the value path, `out_of_memory`, `cancelled`, `timed_out`) with the list of children already executed. Every failure is returned to the model, which may fix the script and run it again.
 
 ## 18. Tasks
@@ -994,7 +996,7 @@ A default changes only with a measurement from the journal or a benchmark test. 
 | TUI 50 ms input poll | `ppoll` with the view eventfd |
 | `http/client` 50 ms `WAIT_SLICE` probe checks, `SHUTDOWN_JOIN_POLL` | one wait on the socket or thread and a stop wake, with a real deadline as the only timeout |
 | result and output caps (`TOOL_MAX_RESULT_BYTES`, the read window cap, Lua log and message caps) | whole results projected through the context budget (section 14.3) |
-| one native lane, serial Code Mode children | access-class scheduler, `job.start` / `job.wait` |
+| one native lane, so native Code Mode children run one at a time | access-class scheduler |
 | a result rendered where the executor built it | typed output kept until commit, rendered once at commit |
 | instruction snapshot frozen per session | snapshot per turn from live config, digests recorded |
 | `Chat_Observer` callbacks on the owner thread | `View_Queue` consumed by frontends |

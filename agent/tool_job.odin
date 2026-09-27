@@ -100,82 +100,68 @@ Tool_Job_Effect :: enum {
 	Done,
 }
 
-// Lua_Call_Summary is one child call a Code Mode execution made, as its parent reports
-// it. child is borrowed and stays valid until the batch is destroyed, because a released
-// job keeps its record and its name until then.
-Lua_Call_Summary :: struct {
-	child:   ^Tool_Job,
-	seq:     session.Seq,
-	outcome: session.Tool_Outcome,
-}
-
 // Tool_Job is one admitted call.
 Tool_Job :: struct {
 	// identity, owned by the table and stable for the job's life
-	id:              u64,
-	turn_id:         u64,
-	ordinal:         int, // submission order, which is the order results are recorded in
-	call:            ^Chat_Tool_Call, // borrowed: the session's staged calls outlive the batch
-	name:            string, // owned by allocator
-	call_id:         string, // owned by allocator
+	id:             u64,
+	turn_id:        u64,
+	ordinal:        int, // submission order, which is the order results are recorded in
+	call:           ^Chat_Tool_Call, // borrowed: the session's staged calls outlive the batch
+	name:           string, // owned by allocator
+	call_id:        string, // owned by allocator
 
 	// placement
-	placement:       Tool_Placement,
-	lane:            rawptr, // borrowed backend identity; nil is the shared native lane
-	execute:         Tool_Execute,
+	placement:      Tool_Placement,
+	lane:           rawptr, // borrowed backend identity; nil is the shared native lane
+	execute:        Tool_Execute,
 
 	// Lua execution data. A nested call is embedded in its child job so the call
-	// pointer stays stable when the table grows. lua_calls is what the parent reports
-	// about the children it ran: the owner appends one entry as each child commits, and
-	// the parent's result carries them so a model can audit a script and reach one
-	// child's full result by its sequence.
-	lua:             ^Lua_Run,
-	lua_dispatched:  bool,
-	lua_child_no:    int,
-	lua_child:       ^Tool_Job,
-	lua_child_ready: bool, // the child's result is on the coroutine stack, awaiting resume
-	lua_calls:       [dynamic]Lua_Call_Summary,
-	lua_calls_total: int,
-	parent:          ^Tool_Job,
-	nested_call:     Chat_Tool_Call,
-	nested:          bool,
+	// pointer stays stable when the table grows. lua_children are the calls the script
+	// started, by handle, and lua_waiting is the handle job.wait is parked on, or zero.
+	lua:            ^Lua_Run,
+	lua_dispatched: bool,
+	lua_children:   [dynamic]Codemode_Child,
+	lua_waiting:    int,
+	parent:         ^Tool_Job,
+	nested_call:    Chat_Tool_Call,
+	nested:         bool,
 
 	// execution data, owned by allocator, which is a thread-safe heap
-	allocator:       mem.Allocator,
+	allocator:      mem.Allocator,
 	// admitted is the document the call was admitted from: a provider call is admitted here
 	// from the text it arrived as, while a Lua child call arrives admitted, because its value
 	// came from Lua rather than from a provider document. arguments is the typed call the
 	// executor receives, read out of that document once.
-	admitted:        Tool_Arguments,
-	arguments:       Tool_Args,
-	exec:            Tool_Context, // what the executor is given, for the job's whole life
-	logging:         Log_Binding, // the worker's correlation, captured at admission
+	admitted:       Tool_Arguments,
+	arguments:      Tool_Args,
+	exec:           Tool_Context, // what the executor is given, for the job's whole life
+	logging:        Log_Binding, // the worker's correlation, captured at admission
 
 	// control
-	phase:           Tool_Job_Phase,
-	interrupt:       ai.Interrupt, // this job's own stop token
+	phase:          Tool_Job_Phase,
+	interrupt:      ai.Interrupt, // this job's own stop token
 	// wake is a worker job's stop pipe: the owner signals it with the stop request,
 	// which wakes a worker sleeping in poll, and closes it when it releases the job.
-	wake:            Tool_Wake,
+	wake:           Tool_Wake,
 	// published is atomic. The worker sets it after writing result, and the owner reads result
 	// only after seeing it.
-	published:       bool,
+	published:      bool,
 	// launched says a worker thread runs this call; otherwise the job is the owner's alone.
-	launched:        bool,
+	launched:       bool,
 	// thread is created and destroyed by the owner, after the worker published.
-	thread:          ^thread.Thread,
+	thread:         ^thread.Thread,
 	// stopping and stop_at are the owner's observation that this job should have stopped and
 	// when that was first seen, which is what the stop patience is measured from.
-	stopping:        bool,
-	stop_at:         time.Tick,
+	stopping:       bool,
+	stop_at:        time.Tick,
 
 	// outcome
-	result:          Tool_Result,
-	result_present:  bool,
-	committed:       bool,
+	result:         Tool_Result,
+	result_present: bool,
+	committed:      bool,
 	// recorded_seq is the entry this job's result was recorded as. It is the
 	// committed reference a later reader names, such as a Code Mode handle.
-	recorded_seq:    session.Seq,
+	recorded_seq:   session.Seq,
 }
 
 // Tool_Jobs is one batch's table. Only the owner reads and writes it.
@@ -240,8 +226,8 @@ tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) -> (escaped: bool) {
 
 @(private)
 tool_job_release :: proc(job: ^Tool_Job) {
-	if job.lua != nil { code_mode_lua_destroy(job.lua) }
-	delete(job.lua_calls)
+	if job.lua != nil { codemode_lua_destroy(job.lua) }
+	delete(job.lua_children)
 	if job.nested {
 		delete(job.nested_call.id, job.allocator)
 		delete(job.nested_call.item_id, job.allocator)
@@ -283,24 +269,22 @@ tool_jobs_earliest :: proc(jobs: ^Tool_Jobs, phases: bit_set[Tool_Job_Phase]) ->
 }
 
 // tool_jobs_earliest_live returns the job with the lowest ordinal that has not been
-// released. Results are recorded in submission order, which is the order the response
-// asked its calls in, so the context budget is spent the way the model asked for it
-// and a request built later sends the same batch in the same order.
+// released, or the earliest live child of that job. Results are recorded in submission
+// order, which is the order the response asked its calls in, so the context budget is
+// spent the way the model asked for it and a request built later sends the same batch in
+// the same order. The table is in ordinal order, so the first live job is the earliest.
 @(private)
 tool_jobs_earliest_live :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
-	found: ^Tool_Job
 	for job in jobs.jobs {
 		switch job.phase {
 		case .Retired, .Unrecorded, .Abandoned:
 			continue
-		case .Waiting:
-			if job.lua_child != nil { return job.lua_child }
-			continue
-		case .Queued, .Dispatching, .Running, .Result_Ready, .Committing, .Retiring:
+		case .Queued, .Dispatching, .Running, .Waiting, .Result_Ready, .Committing, .Retiring:
 		}
-		if found == nil || job.ordinal < found.ordinal { found = job }
+		if child := codemode_job_live_child(job); child != nil { return child }
+		return job
 	}
-	return found
+	return nil
 }
 
 // --- submission ----------------------------------------------------------------
@@ -604,6 +588,8 @@ tool_jobs_runnable :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
 // job that was already released.
 @(private)
 tool_jobs_lane_free :: proc(jobs: ^Tool_Jobs, candidate: ^Tool_Job) -> bool {
+	// A script runs on the owner in slices, so it never waits for a lane.
+	if candidate.placement == .Lua { return true }
 	for job in jobs.jobs {
 		if job == candidate || job.lane != candidate.lane { continue }
 		switch job.phase {
@@ -640,11 +626,9 @@ tool_jobs_latch_stop :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	for job in jobs.jobs {
 		if job.phase == .Running { tool_job_request_stop(job) }
 		if job.placement == .Lua && job.lua != nil {
-			code_mode_lua_request_stop(job.lua)
+			codemode_lua_request_stop(job.lua)
 			if job.phase == .Queued && candidate == .Cancelled {
-				job.result = tool_result_failure(&job.exec, .Cancelled, "the Code Mode execution was cancelled", "cancelled")
-				job.result_present = true
-				job.phase = .Result_Ready
+				codemode_job_answer(job, .Cancelled, .Cancelled, "the Code Mode execution was cancelled", "cancelled")
 			}
 		}
 	}
@@ -660,7 +644,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	job := tool_jobs_runnable(jobs)
 	if job == nil { return }
 	if job.placement == .Lua && job.lua_dispatched {
-		tool_job_lua_resume(jobs, chat, job, job.lua_child_ready)
+		tool_job_lua_resume(jobs, chat, job)
 		return
 	}
 	previous := context.logger
@@ -812,25 +796,7 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	jobs.committed += 1
 	if !job.nested { jobs.committed_roots += 1 }
 	if job.parent != nil {
-		// What a script did is reported by its parent, so the model can audit it and read
-		// one child's full result back. The list is bounded and the count is not, because a
-		// long script is the case this exists for.
-		// The sequence is the child's call, because that is the key context_read_result
-		// takes: a reader names the call the result answers, not the result.
-		if len(job.parent.lua_calls) < CODE_MODE_MAX_CALL_SUMMARIES {
-			append(&job.parent.lua_calls, Lua_Call_Summary{child = job, seq = job.call.seq, outcome = finalized.outcome})
-		}
-		job.parent.lua_calls_total += 1
-		job.parent.lua_child = nil
-		if jobs.stop != .None {
-			job.parent.result = tool_result_failure(&job.parent.exec, .Cancelled, "the Code Mode execution was cancelled", "cancelled")
-			job.parent.result_present = true
-			job.parent.phase = .Result_Ready
-		} else {
-			code_mode_lua_push_result(job.parent.lua, &finalized)
-			job.parent.lua_child_ready = true
-			job.parent.phase = .Queued
-		}
+		codemode_job_child_committed(jobs, job, &finalized)
 	}
 
 	committed := [4]Log_Field {
