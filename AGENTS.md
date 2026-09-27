@@ -33,7 +33,9 @@ Treat your Odin knowledge as unverified. When unsure about a signature, a langua
 
 ## Naming and comments
 
-Code describes itself through clear names and simple structure. Names are full words that say what the thing is or does: `snake_case` procedures and variables, `Ada_Case` types, `SCREAMING_SNAKE_CASE` constants. Single-letter names and abbreviations are out. Name any literal whose meaning is not obvious at the call site.
+Code describes itself through clear names and simple structure. Names are full words that say what the thing is or does: `snake_case` procedures and variables, `Ada_Case` types, `SCREAMING_SNAKE_CASE` constants. Name any literal whose meaning is not obvious at the call site.
+
+Never use a single-letter name, for anything: a procedure, parameter, variable, field, loop index, receiver, or generic parameter. Write `journal`, `index`, `test`, and `session`, never `j`, `i`, `t`, or `s`. Avoid abbreviations as well: `error` over `err`, `connection` over `conn`, `arguments` over `args`. The only exceptions are names fixed by an external interface, such as a JSON field or a foreign API.
 
 Comments are minimal documentation: one or two lines stating a contract the code cannot express, such as ownership, lifetime, thread, or failure behavior. Delete a comment that restates the code. Long rationale belongs in `docs/`, and a comment never points at a document, task, or discussion.
 

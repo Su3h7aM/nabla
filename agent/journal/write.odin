@@ -72,116 +72,116 @@ INSERT_SQL := [Insert]string {
 
 // append_record buffers one fact for the next commit. The header's strings and
 // body are copied, so they are borrowed only for the call. A failure latches in
-// j.failure and surfaces at the next commit.
-append_record :: proc(j: ^Journal, header: Record, data: $T, body: []u8 = nil) {
-	if !writable(j, header.session) { return }
+// journal.failure and surfaces at the next commit.
+append_record :: proc(journal: ^Journal, header: Record, data: $Payload, body: []u8 = nil) {
+	if !writable(journal, header.session) { return }
 	record := header
 	record.seq = 0
-	record.run = j.run
+	record.run = journal.run
 	record.time_ms = now_ms()
 	record.mono_ns = now_mono_ns()
-	record.task = batch_text(j, header.task)
-	record.hook = batch_text(j, header.hook)
-	record.provider = batch_text(j, header.provider)
-	record.model = batch_text(j, header.model)
-	record.data = batch_json(j, data)
-	record.body = batch_bytes(j, body)
-	push(j, record)
+	record.task = batch_text(journal, header.task)
+	record.hook = batch_text(journal, header.hook)
+	record.provider = batch_text(journal, header.provider)
+	record.model = batch_text(journal, header.model)
+	record.data = batch_json(journal, data)
+	record.body = batch_bytes(journal, body)
+	push(journal, record)
 }
 
 // append_node buffers a node of the claimed session and the `node.committed`
 // record whose seq it takes, and returns the id allocated for it.
-append_node :: proc(j: ^Journal, node: Node, data: $T, body: []u8 = nil) -> Node_Id {
-	assert(node.session == j.claimed && j.claimed != {}, "a node belongs to the claimed session")
-	if !writable(j, node.session) { return 0 }
+append_node :: proc(journal: ^Journal, node: Node, data: $Payload, body: []u8 = nil) -> Node_Id {
+	assert(node.session == journal.claimed && journal.claimed != {}, "a node belongs to the claimed session")
+	if !writable(journal, node.session) { return 0 }
 	row := node
-	row.id = j.counters.node + 1
+	row.id = journal.counters.node + 1
 	row.seq = 0
-	row.data = batch_json(j, data)
-	row.body = batch_bytes(j, body)
+	row.data = batch_json(journal, data)
+	row.body = batch_bytes(journal, body)
 	append_record(
-		j,
+		journal,
 		Record{kind = .Node_Committed, session = row.session, branch = row.branch, node = row.id, turn = row.turn},
 		Node_Committed{kind = NODE_KIND_NAMES[row.kind]},
 	)
-	push(j, row)
-	if j.failure != nil { return 0 }
-	j.counters.node = row.id
+	push(journal, row)
+	if journal.failure != nil { return 0 }
+	journal.counters.node = row.id
 	return row.id
 }
 
 // append_branch buffers a branch of the claimed session forked at base (0 for
 // the start of the session) and returns the id allocated for it.
-append_branch :: proc(j: ^Journal, base: Node_Id) -> Branch_Id {
-	assert(j.claimed != {}, "a branch belongs to the claimed session")
-	if !writable(j, j.claimed) { return 0 }
-	branch := j.counters.branch + 1
-	append_record(j, Record{kind = .Branch_Created, session = j.claimed, branch = branch}, Branch_Created{base_node = base})
-	push(j, Branch_Row{session = j.claimed, branch = branch, base_node = base})
-	if j.failure != nil { return 0 }
-	j.counters.branch = branch
+append_branch :: proc(journal: ^Journal, base: Node_Id) -> Branch_Id {
+	assert(journal.claimed != {}, "a branch belongs to the claimed session")
+	if !writable(journal, journal.claimed) { return 0 }
+	branch := journal.counters.branch + 1
+	append_record(journal, Record{kind = .Branch_Created, session = journal.claimed, branch = branch}, Branch_Created{base_node = base})
+	push(journal, Branch_Row{session = journal.claimed, branch = branch, base_node = base})
+	if journal.failure != nil { return 0 }
+	journal.counters.branch = branch
 	return branch
 }
 
 // put_artifact buffers bytes under their SHA-256 and returns the digest. Storing
 // the same bytes twice keeps one row.
-put_artifact :: proc(j: ^Journal, kind: string, bytes: []u8) -> (digest: Digest) {
+put_artifact :: proc(journal: ^Journal, kind: string, bytes: []u8) -> (digest: Digest) {
 	hash.hash_bytes_to_buffer(.SHA256, bytes, digest[:])
-	if !writable(j, {}) { return }
-	push(j, Artifact_Row{digest = digest, kind = batch_text(j, kind), created_ms = now_ms(), bytes = batch_bytes(j, bytes)})
+	if !writable(journal, {}) { return }
+	push(journal, Artifact_Row{digest = digest, kind = batch_text(journal, kind), created_ms = now_ms(), bytes = batch_bytes(journal, bytes)})
 	return
 }
 
 // commit writes every pending item in one immediate transaction and returns the
 // last seq written. A failure rolls back and latches: the journal stops writing.
 @(require_results)
-commit :: proc(j: ^Journal) -> (Journal_Seq, Error) {
-	assert(j.open && !j.read_only, "commit needs a writable journal")
-	if j.failure != nil { return j.last_seq, j.failure }
-	if len(j.pending) == 0 { return j.last_seq, nil }
+commit :: proc(journal: ^Journal) -> (Journal_Seq, Error) {
+	assert(journal.open && !journal.read_only, "commit needs a writable journal")
+	if journal.failure != nil { return journal.last_seq, journal.failure }
+	if len(journal.pending) == 0 { return journal.last_seq, nil }
 
-	last, err := write_pending(j)
-	clear(&j.pending)
-	virtual.arena_free_all(&j.batch)
-	if err != nil {
-		j.failure = err
-		return j.last_seq, err
+	last, error := write_pending(journal)
+	clear(&journal.pending)
+	virtual.arena_free_all(&journal.batch)
+	if error != nil {
+		journal.failure = error
+		return journal.last_seq, error
 	}
-	j.last_seq = last
+	journal.last_seq = last
 	return last, nil
 }
 
 // flush_due commits once the pending items reach a batch limit.
 @(require_results)
-flush_due :: proc(j: ^Journal, now: time.Tick) -> Error {
-	if len(j.pending) == 0 { return j.failure }
-	full := len(j.pending) >= JOURNAL_BATCH_RECORDS || j.batch.total_used >= JOURNAL_BATCH_BYTES
-	if !full && time.tick_diff(j.oldest, now) < JOURNAL_BATCH_AGE { return nil }
-	_, err := commit(j)
-	return err
+flush_due :: proc(journal: ^Journal, now: time.Tick) -> Error {
+	if len(journal.pending) == 0 { return journal.failure }
+	full := len(journal.pending) >= JOURNAL_BATCH_RECORDS || journal.batch.total_used >= JOURNAL_BATCH_BYTES
+	if !full && time.tick_diff(journal.oldest, now) < JOURNAL_BATCH_AGE { return nil }
+	_, error := commit(journal)
+	return error
 }
 
 // flush_deadline is when the oldest pending item is due, nil when none is.
-flush_deadline :: proc(j: ^Journal) -> Maybe(time.Tick) {
-	if len(j.pending) == 0 { return nil }
-	return time.tick_add(j.oldest, JOURNAL_BATCH_AGE)
+flush_deadline :: proc(journal: ^Journal) -> Maybe(time.Tick) {
+	if len(journal.pending) == 0 { return nil }
+	return time.tick_add(journal.oldest, JOURNAL_BATCH_AGE)
 }
 
 @(private)
-write_pending :: proc(j: ^Journal) -> (last: Journal_Seq, err: Error) {
-	for &statement, insert in j.inserts {
-		if statement.conn == nil { db.prepare(&j.conn, &statement, INSERT_SQL[insert]) or_return }
+write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
+	for &statement, insert in journal.inserts {
+		if statement.conn == nil { db.prepare(&journal.connection, &statement, INSERT_SQL[insert]) or_return }
 	}
-	db.exec(&j.conn, "BEGIN IMMEDIATE") or_return
-	defer if err != nil { _ = db.rollback(&j.conn) }
+	db.exec(&journal.connection, "BEGIN IMMEDIATE") or_return
+	defer if error != nil { _ = db.rollback(&journal.connection) }
 
-	last = j.last_seq
-	for &item in j.pending {
+	last = journal.last_seq
+	for &item in journal.pending {
 		switch &row in item {
 		case Record:
-			last = insert_record(j, &row) or_return
+			last = insert_record(journal, &row) or_return
 		case Node:
-			args := [10]db.Value {
+			arguments := [10]db.Value {
 				id_or_null(&row.session),
 				db.Value(i64(row.id)),
 				int_or_null(row.parent),
@@ -193,12 +193,12 @@ write_pending :: proc(j: ^Journal) -> (last: Journal_Seq, err: Error) {
 				db.Value(row.data),
 				bytes_or_null(row.body),
 			}
-			db.statement_exec(&j.inserts[.Node], args[:]) or_return
+			db.statement_exec(&journal.inserts[.Node], arguments[:]) or_return
 		case Branch_Row:
-			args := [4]db.Value{id_or_null(&row.session), db.Value(i64(row.branch)), db.Value(i64(row.base_node)), db.Value(i64(last))}
-			db.statement_exec(&j.inserts[.Branch], args[:]) or_return
+			arguments := [4]db.Value{id_or_null(&row.session), db.Value(i64(row.branch)), db.Value(i64(row.base_node)), db.Value(i64(last))}
+			db.statement_exec(&journal.inserts[.Branch], arguments[:]) or_return
 		case Session_Row:
-			args := [6]db.Value {
+			arguments := [6]db.Value {
 				id_or_null(&row.session),
 				db.Value(row.created_ms),
 				db.Value(row.workspace),
@@ -206,19 +206,19 @@ write_pending :: proc(j: ^Journal) -> (last: Journal_Seq, err: Error) {
 				int_or_null(row.parent_call),
 				db.Value(row.role),
 			}
-			db.statement_exec(&j.inserts[.Session], args[:]) or_return
+			db.statement_exec(&journal.inserts[.Session], arguments[:]) or_return
 		case Artifact_Row:
-			args := [4]db.Value{db.Value(row.digest[:]), db.Value(row.kind), db.Value(row.created_ms), db.Value(row.bytes)}
-			db.statement_exec(&j.inserts[.Artifact], args[:]) or_return
+			arguments := [4]db.Value{db.Value(row.digest[:]), db.Value(row.kind), db.Value(row.created_ms), db.Value(row.bytes)}
+			db.statement_exec(&journal.inserts[.Artifact], arguments[:]) or_return
 		}
 	}
-	db.commit(&j.conn) or_return
+	db.commit(&journal.connection) or_return
 	return last, nil
 }
 
 @(private)
-insert_record :: proc(j: ^Journal, row: ^Record) -> (seq: Journal_Seq, err: Error) {
-	args := [20]db.Value {
+insert_record :: proc(journal: ^Journal, row: ^Record) -> (seq: Journal_Seq, error: Error) {
+	arguments := [20]db.Value {
 		db.Value(row.time_ms),
 		db.Value(row.mono_ns),
 		db.Value(row.run[:]),
@@ -242,7 +242,7 @@ insert_record :: proc(j: ^Journal, row: ^Record) -> (seq: Journal_Seq, err: Erro
 	}
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	db.statement_query(&j.inserts[.Record], &rows, args[:]) or_return
+	db.statement_query(&journal.inserts[.Record], &rows, arguments[:]) or_return
 	values, has_row := db.rows_next(&rows) or_return
 	if !has_row { return 0, Journal_Error.Corrupt }
 	return Journal_Seq(db.as_i64(values[0]) or_return), nil
@@ -251,50 +251,50 @@ insert_record :: proc(j: ^Journal, row: ^Record) -> (seq: Journal_Seq, err: Erro
 // writable reports whether an append may be buffered. Writing through a
 // read-only journal or for another session is a programming error.
 @(private)
-writable :: proc(j: ^Journal, session: Session_Id) -> bool {
-	assert(j.open && !j.read_only, "appends need a writable journal")
-	assert(session == {} || session == j.claimed, "appends name the claimed session or none")
-	return j.failure == nil
+writable :: proc(journal: ^Journal, session: Session_Id) -> bool {
+	assert(journal.open && !journal.read_only, "appends need a writable journal")
+	assert(session == {} || session == journal.claimed, "appends name the claimed session or none")
+	return journal.failure == nil
 }
 
 @(private)
-push :: proc(j: ^Journal, item: Pending) {
-	if j.failure != nil { return }
-	if _, err := append(&j.pending, item); err != nil {
-		j.failure = err
+push :: proc(journal: ^Journal, item: Pending) {
+	if journal.failure != nil { return }
+	if _, error := append(&journal.pending, item); error != nil {
+		journal.failure = error
 		return
 	}
-	if len(j.pending) == 1 { j.oldest = time.tick_now() }
+	if len(journal.pending) == 1 { journal.oldest = time.tick_now() }
 }
 
 // batch_text, batch_bytes, and batch_json copy into the batch arena and latch an
 // allocation or encoding failure.
 @(private)
-batch_text :: proc(j: ^Journal, text: string) -> string {
-	copied, err := strings.clone(text, virtual.arena_allocator(&j.batch))
-	if err != nil && j.failure == nil { j.failure = err }
+batch_text :: proc(journal: ^Journal, text: string) -> string {
+	copied, error := strings.clone(text, virtual.arena_allocator(&journal.batch))
+	if error != nil && journal.failure == nil { journal.failure = error }
 	return copied
 }
 
 @(private)
-batch_bytes :: proc(j: ^Journal, bytes: []u8) -> []u8 {
+batch_bytes :: proc(journal: ^Journal, bytes: []u8) -> []u8 {
 	if len(bytes) == 0 { return nil }
-	copied, err := slice.clone(bytes, virtual.arena_allocator(&j.batch))
-	if err != nil && j.failure == nil { j.failure = err }
+	copied, error := slice.clone(bytes, virtual.arena_allocator(&journal.batch))
+	if error != nil && journal.failure == nil { journal.failure = error }
 	return copied
 }
 
 @(private)
-batch_json :: proc(j: ^Journal, payload: $T) -> string {
+batch_json :: proc(journal: ^Journal, payload: $Payload) -> string {
 	versioned := payload
-	if versioned.v == 0 { versioned.v = PAYLOAD_VERSION }
-	encoded, err := json.marshal(versioned, allocator = virtual.arena_allocator(&j.batch))
-	if err != nil && j.failure == nil { j.failure = err }
+	if versioned.version == 0 { versioned.version = PAYLOAD_VERSION }
+	encoded, error := json.marshal(versioned, allocator = virtual.arena_allocator(&journal.batch))
+	if error != nil && journal.failure == nil { journal.failure = error }
 	return string(encoded)
 }
 
 @(private)
-int_or_null :: proc(value: $T) -> db.Value {
+int_or_null :: proc(value: $Integer) -> db.Value {
 	if value == 0 { return nil }
 	return db.Value(i64(value))
 }

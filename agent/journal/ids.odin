@@ -64,9 +64,9 @@ HEX_DIGITS := "0123456789abcdef"
 @(private)
 hex_encode :: proc(bytes: []u8, buffer: []u8) -> string {
 	assert(len(buffer) >= 2 * len(bytes))
-	for byte, i in bytes {
-		buffer[2 * i] = HEX_DIGITS[byte >> 4]
-		buffer[2 * i + 1] = HEX_DIGITS[byte & 0x0f]
+	for byte, index in bytes {
+		buffer[2 * index] = HEX_DIGITS[byte >> 4]
+		buffer[2 * index + 1] = HEX_DIGITS[byte & 0x0f]
 	}
 	return string(buffer[:2 * len(bytes)])
 }
@@ -75,10 +75,10 @@ hex_encode :: proc(bytes: []u8, buffer: []u8) -> string {
 @(private)
 hex_decode :: proc(text: string, out: []u8) -> bool {
 	if len(text) != 2 * len(out) { return false }
-	for i in 0 ..< len(out) {
-		high := hex_value(text[2 * i]) or_return
-		low := hex_value(text[2 * i + 1]) or_return
-		out[i] = high << 4 | low
+	for index in 0 ..< len(out) {
+		high := hex_value(text[2 * index]) or_return
+		low := hex_value(text[2 * index + 1]) or_return
+		out[index] = high << 4 | low
 	}
 	return true
 }

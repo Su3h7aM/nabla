@@ -64,10 +64,20 @@ Usage_Totals :: struct {
 // at most page of them (page <= 0 reads all), and the last seq read (after when
 // none). The result is owned by allocator; release it with records_destroy.
 @(require_results)
-read_records :: proc(j: ^Journal, f: Filter, after: Journal_Seq, page: int, allocator: mem.Allocator) -> (records: []Record, last: Journal_Seq, err: Error) {
+read_records :: proc(
+	journal: ^Journal,
+	filter: Filter,
+	after: Journal_Seq,
+	page: int,
+	allocator: mem.Allocator,
+) -> (
+	records: []Record,
+	last: Journal_Seq,
+	error: Error,
+) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
-	assert(j.open)
-	filter := f
+	assert(journal.open)
+	filter := filter
 	query := Query{}
 	query_start(&query, "SELECT " + RECORD_COLUMNS + " FROM records WHERE seq > ?", i64(after)) or_return
 	query_filter(&query, &filter) or_return
@@ -76,10 +86,10 @@ read_records :: proc(j: ^Journal, f: Filter, after: Journal_Seq, page: int, allo
 
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	db.query(&j.conn, &rows, strings.to_string(query.sql), query.args[:]) or_return
+	db.query(&journal.connection, &rows, strings.to_string(query.sql), query.arguments[:]) or_return
 
 	list := make([dynamic]Record, allocator) or_return
-	defer if err != nil { records_destroy(list[:], allocator) }
+	defer if error != nil { records_destroy(list[:], allocator) }
 	for {
 		values, has_row := db.rows_next(&rows) or_return
 		if !has_row { break }
@@ -88,13 +98,13 @@ read_records :: proc(j: ^Journal, f: Filter, after: Journal_Seq, page: int, allo
 			allocator = allocator,
 		}
 		record := scan_record(&row)
-		if row.err != nil {
+		if row.error != nil {
 			record_destroy(&record, allocator)
-			return nil, after, corrupt(j, row.err, record.session, record.seq)
+			return nil, after, corrupt(journal, row.error, record.session, record.seq)
 		}
-		if _, append_err := append(&list, record); append_err != nil {
+		if _, append_error := append(&list, record); append_error != nil {
 			record_destroy(&record, allocator)
-			return nil, after, append_err
+			return nil, after, append_error
 		}
 	}
 	last = after
@@ -105,10 +115,10 @@ read_records :: proc(j: ^Journal, f: Filter, after: Journal_Seq, page: int, allo
 // read_latest returns the matching record with the highest seq, false when none
 // matches. Release it with record_destroy.
 @(require_results)
-read_latest :: proc(j: ^Journal, f: Filter, allocator: mem.Allocator) -> (record: Record, found: bool, err: Error) {
+read_latest :: proc(journal: ^Journal, filter: Filter, allocator: mem.Allocator) -> (record: Record, found: bool, error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
-	assert(j.open)
-	filter := f
+	assert(journal.open)
+	filter := filter
 	query := Query{}
 	query_start(&query, "SELECT " + RECORD_COLUMNS + " FROM records WHERE 1 = 1") or_return
 	query_filter(&query, &filter) or_return
@@ -116,7 +126,7 @@ read_latest :: proc(j: ^Journal, f: Filter, allocator: mem.Allocator) -> (record
 
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	db.query(&j.conn, &rows, strings.to_string(query.sql), query.args[:]) or_return
+	db.query(&journal.connection, &rows, strings.to_string(query.sql), query.arguments[:]) or_return
 	values, has_row := db.rows_next(&rows) or_return
 	if !has_row { return {}, false, nil }
 	row := Row {
@@ -124,9 +134,9 @@ read_latest :: proc(j: ^Journal, f: Filter, allocator: mem.Allocator) -> (record
 		allocator = allocator,
 	}
 	record = scan_record(&row)
-	if row.err != nil {
+	if row.error != nil {
 		record_destroy(&record, allocator)
-		return {}, false, corrupt(j, row.err, record.session, record.seq)
+		return {}, false, corrupt(journal, row.error, record.session, record.seq)
 	}
 	return record, true, nil
 }
@@ -136,24 +146,24 @@ read_latest :: proc(j: ^Journal, f: Filter, allocator: mem.Allocator) -> (record
 // after F through K's parent, then the nodes after K; nodes up to F are not
 // read. Release the result with nodes_destroy.
 @(require_results)
-read_ancestry :: proc(j: ^Journal, s: Session_Id, head: Node_Id, allocator: mem.Allocator) -> (nodes: []Node, err: Error) {
-	assert(j.open)
+read_ancestry :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, allocator: mem.Allocator) -> (nodes: []Node, error: Error) {
+	assert(journal.open)
 	list := make([dynamic]Node, allocator) or_return
-	defer if err != nil { nodes_destroy(list[:], allocator) }
+	defer if error != nil { nodes_destroy(list[:], allocator) }
 
 	// K is appended after the nodes before it, so one reverse gives the order.
 	checkpoint: Maybe(Node)
-	defer if err != nil {
+	defer if error != nil {
 		if node, has := checkpoint.?; has { node_destroy(&node, allocator) }
 	}
 	stop := Node_Id(0)
 	for walk := head; walk != 0 && walk != stop; {
-		node := read_node(j, s, walk, allocator) or_return
+		node := read_node(journal, session, walk, allocator) or_return
 		// Ids grow in commit order, so a parent at or above its child is damage
 		// that would otherwise loop.
 		if node.parent >= walk {
 			node_destroy(&node, allocator)
-			return nil, corrupt(j, Journal_Error.Corrupt, s, node.seq)
+			return nil, corrupt(journal, Journal_Error.Corrupt, session, node.seq)
 		}
 		walk = node.parent
 		if node.kind == .Checkpoint && checkpoint == nil {
@@ -161,9 +171,9 @@ read_ancestry :: proc(j: ^Journal, s: Session_Id, head: Node_Id, allocator: mem.
 			stop = node.covers
 			continue
 		}
-		if _, append_err := append(&list, node); append_err != nil {
+		if _, append_error := append(&list, node); append_error != nil {
 			node_destroy(&node, allocator)
-			return nil, append_err
+			return nil, append_error
 		}
 	}
 	if node, has := checkpoint.?; has {
@@ -177,26 +187,26 @@ read_ancestry :: proc(j: ^Journal, s: Session_Id, head: Node_Id, allocator: mem.
 // session_head returns the active branch (the latest `branch.selected`, else
 // the initial one) and its head (its highest node, else its base node).
 @(require_results)
-session_head :: proc(j: ^Journal, s: Session_Id) -> (branch: Branch_Id, head: Node_Id, err: Error) {
-	assert(j.open)
-	session := s
+session_head :: proc(journal: ^Journal, session: Session_Id) -> (branch: Branch_Id, head: Node_Id, error: Error) {
+	assert(journal.open)
+	session := session
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	row := query_first(j, &rows, SESSION_HEAD_QUERY, {db.Value(session[:]), db.Value(i64(INITIAL_BRANCH))}) or_return
+	row := query_first(journal, &rows, SESSION_HEAD_QUERY, {db.Value(session[:]), db.Value(i64(INITIAL_BRANCH))}) or_return
 	branch = Branch_Id(row_int(&row))
 	head = Node_Id(row_int(&row))
-	if row.err != nil { return 0, 0, corrupt(j, row.err, s, 0) }
+	if row.error != nil { return 0, 0, corrupt(journal, row.error, session, 0) }
 	return
 }
 
 // read_artifact returns the bytes stored under digest, owned by allocator.
 @(require_results)
-read_artifact :: proc(j: ^Journal, digest: Digest, allocator: mem.Allocator) -> (bytes: []u8, found: bool, err: Error) {
-	assert(j.open)
+read_artifact :: proc(journal: ^Journal, digest: Digest, allocator: mem.Allocator) -> (bytes: []u8, found: bool, error: Error) {
+	assert(journal.open)
 	key := digest
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	db.query(&j.conn, &rows, "SELECT bytes FROM artifacts WHERE digest = ?", {db.Value(key[:])}) or_return
+	db.query(&journal.connection, &rows, "SELECT bytes FROM artifacts WHERE digest = ?", {db.Value(key[:])}) or_return
 	values, has_row := db.rows_next(&rows) or_return
 	if !has_row { return nil, false, nil }
 	row := Row {
@@ -204,17 +214,17 @@ read_artifact :: proc(j: ^Journal, digest: Digest, allocator: mem.Allocator) -> 
 		allocator = allocator,
 	}
 	bytes = row_bytes(&row)
-	if row.err != nil { return nil, false, corrupt(j, row.err, {}, 0) }
+	if row.error != nil { return nil, false, corrupt(journal, row.error, {}, 0) }
 	return bytes, true, nil
 }
 
 @(require_results)
-usage_totals :: proc(j: ^Journal, s: Session_Id) -> (totals: Usage_Totals, err: Error) {
-	assert(j.open)
-	session := s
+usage_totals :: proc(journal: ^Journal, session: Session_Id) -> (totals: Usage_Totals, error: Error) {
+	assert(journal.open)
+	session := session
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	row := query_first(j, &rows, USAGE_TOTALS_QUERY, {db.Value(session[:])}) or_return
+	row := query_first(journal, &rows, USAGE_TOTALS_QUERY, {db.Value(session[:])}) or_return
 	totals.requests = int(row_int(&row))
 	totals.paired_requests = int(row_int(&row))
 	totals.input = row_int(&row)
@@ -223,7 +233,7 @@ usage_totals :: proc(j: ^Journal, s: Session_Id) -> (totals: Usage_Totals, err: 
 	totals.cache_write = row_int(&row)
 	totals.paired_input = row_int(&row)
 	totals.paired_read = row_int(&row)
-	if row.err != nil { return {}, corrupt(j, row.err, s, 0) }
+	if row.error != nil { return {}, corrupt(journal, row.error, session, 0) }
 	return totals, nil
 }
 
@@ -242,23 +252,23 @@ cache_coverage :: proc(totals: Usage_Totals) -> (share: f64, measured: bool) {
 // list_sessions returns sessions by latest activity. Release the result with
 // session_summaries_destroy.
 @(require_results)
-list_sessions :: proc(j: ^Journal, f: Session_Filter, allocator: mem.Allocator) -> (sessions: []Session_Summary, err: Error) {
+list_sessions :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.Allocator) -> (sessions: []Session_Summary, error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
-	assert(j.open)
+	assert(journal.open)
 	query := Query{}
 	query_start(&query, SESSION_LIST_QUERY) or_return
-	if f.workspace != "" { query_add(&query, " AND workspace = ?", f.workspace) or_return }
-	if role, has_role := f.role.?; has_role { query_add(&query, " AND role = ?", SESSION_ROLE_NAMES[role]) or_return }
-	if f.before != 0 { query_add(&query, " AND last_seq < ?", i64(f.before)) or_return }
+	if filter.workspace != "" { query_add(&query, " AND workspace = ?", filter.workspace) or_return }
+	if role, has_role := filter.role.?; has_role { query_add(&query, " AND role = ?", SESSION_ROLE_NAMES[role]) or_return }
+	if filter.before != 0 { query_add(&query, " AND last_seq < ?", i64(filter.before)) or_return }
 	query_add(&query, " ORDER BY last_seq DESC, session DESC") or_return
-	if f.limit > 0 { query_add(&query, " LIMIT ?", i64(f.limit)) or_return }
+	if filter.limit > 0 { query_add(&query, " LIMIT ?", i64(filter.limit)) or_return }
 
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	db.query(&j.conn, &rows, strings.to_string(query.sql), query.args[:]) or_return
+	db.query(&journal.connection, &rows, strings.to_string(query.sql), query.arguments[:]) or_return
 
 	list := make([dynamic]Session_Summary, allocator) or_return
-	defer if err != nil { session_summaries_destroy(list[:], allocator) }
+	defer if error != nil { session_summaries_destroy(list[:], allocator) }
 	for {
 		values, has_row := db.rows_next(&rows) or_return
 		if !has_row { break }
@@ -275,13 +285,13 @@ list_sessions :: proc(j: ^Journal, f: Session_Filter, allocator: mem.Allocator) 
 		summary.parent_call = Call_Id(row_int(&row))
 		summary.title = row_text(&row)
 		summary.last_seq = Journal_Seq(row_int(&row))
-		if row.err != nil {
+		if row.error != nil {
 			session_summary_destroy(&summary, allocator)
-			return nil, corrupt(j, row.err, summary.id, 0)
+			return nil, corrupt(journal, row.error, summary.id, 0)
 		}
-		if _, append_err := append(&list, summary); append_err != nil {
+		if _, append_error := append(&list, summary); append_error != nil {
 			session_summary_destroy(&summary, allocator)
-			return nil, append_err
+			return nil, append_error
 		}
 	}
 	return list[:], nil
@@ -290,15 +300,15 @@ list_sessions :: proc(j: ^Journal, f: Session_Filter, allocator: mem.Allocator) 
 // list_branches returns a session's branches in creation order. Release the
 // result with branch_summaries_destroy.
 @(require_results)
-list_branches :: proc(j: ^Journal, s: Session_Id, allocator: mem.Allocator) -> (branches: []Branch_Summary, err: Error) {
-	assert(j.open)
-	session := s
+list_branches :: proc(journal: ^Journal, session: Session_Id, allocator: mem.Allocator) -> (branches: []Branch_Summary, error: Error) {
+	assert(journal.open)
+	session := session
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	db.query(&j.conn, &rows, BRANCH_LIST_QUERY, {db.Value(session[:])}) or_return
+	db.query(&journal.connection, &rows, BRANCH_LIST_QUERY, {db.Value(session[:])}) or_return
 
 	list := make([dynamic]Branch_Summary, allocator) or_return
-	defer if err != nil { branch_summaries_destroy(list[:], allocator) }
+	defer if error != nil { branch_summaries_destroy(list[:], allocator) }
 	for {
 		values, has_row := db.rows_next(&rows) or_return
 		if !has_row { break }
@@ -312,13 +322,13 @@ list_branches :: proc(j: ^Journal, s: Session_Id, allocator: mem.Allocator) -> (
 		branch.seq = Journal_Seq(row_int(&row))
 		branch.head = Node_Id(row_int(&row))
 		branch.last_user_text = row_text(&row)
-		if row.err != nil {
+		if row.error != nil {
 			branch_summary_destroy(&branch, allocator)
-			return nil, corrupt(j, row.err, s, branch.seq)
+			return nil, corrupt(journal, row.error, session, branch.seq)
 		}
-		if _, append_err := append(&list, branch); append_err != nil {
+		if _, append_error := append(&list, branch); append_error != nil {
 			branch_summary_destroy(&branch, allocator)
-			return nil, append_err
+			return nil, append_error
 		}
 	}
 	return list[:], nil
@@ -418,14 +428,14 @@ SELECT COUNT(*), COALESCE(SUM(both), 0),
 FROM paired`
 
 @(private)
-read_node :: proc(j: ^Journal, s: Session_Id, id: Node_Id, allocator: mem.Allocator) -> (node: Node, err: Error) {
-	session := s
+read_node :: proc(journal: ^Journal, session: Session_Id, id: Node_Id, allocator: mem.Allocator) -> (node: Node, error: Error) {
+	session := session
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	db.query(&j.conn, &rows, NODE_QUERY, {db.Value(session[:]), db.Value(i64(id))}) or_return
+	db.query(&journal.connection, &rows, NODE_QUERY, {db.Value(session[:]), db.Value(i64(id))}) or_return
 	values, has_row := db.rows_next(&rows) or_return
 	// A missing node is a parent the tree promised.
-	if !has_row { return {}, corrupt(j, Journal_Error.Corrupt, s, 0) }
+	if !has_row { return {}, corrupt(journal, Journal_Error.Corrupt, session, 0) }
 	row := Row {
 		values    = values,
 		allocator = allocator,
@@ -440,9 +450,9 @@ read_node :: proc(j: ^Journal, s: Session_Id, id: Node_Id, allocator: mem.Alloca
 	node.seq = Journal_Seq(row_int(&row))
 	node.data = row_text(&row)
 	node.body = row_bytes(&row)
-	if row.err != nil {
+	if row.error != nil {
 		node_destroy(&node, allocator)
-		return {}, corrupt(j, row.err, s, node.seq)
+		return {}, corrupt(journal, row.error, session, node.seq)
 	}
 	return node, nil
 }
@@ -476,30 +486,30 @@ scan_record :: proc(row: ^Row) -> (record: Record) {
 // corrupt names the damaged row when a read fails on stored data. A lower
 // failure such as allocation passes through unchanged.
 @(private)
-corrupt :: proc(j: ^Journal, err: Error, session: Session_Id, seq: Journal_Seq) -> Error {
-	if error_is(err, .Corrupt) { j.corrupt = {session, seq} }
-	return err
+corrupt :: proc(journal: ^Journal, error: Error, session: Session_Id, seq: Journal_Seq) -> Error {
+	if error_is(error, .Corrupt) { journal.corrupt = {session, seq} }
+	return error
 }
 
 // Query builds SQL and its bound arguments in temp memory.
 @(private)
 Query :: struct {
-	sql:  strings.Builder,
-	args: [dynamic]db.Value,
+	sql:       strings.Builder,
+	arguments: [dynamic]db.Value,
 }
 
 @(private)
-query_start :: proc(query: ^Query, sql: string, args: ..db.Value) -> mem.Allocator_Error {
+query_start :: proc(query: ^Query, sql: string, arguments: ..db.Value) -> mem.Allocator_Error {
 	query.sql = strings.builder_make(context.temp_allocator) or_return
-	query.args = make([dynamic]db.Value, context.temp_allocator) or_return
-	return query_add(query, sql, ..args)
+	query.arguments = make([dynamic]db.Value, context.temp_allocator) or_return
+	return query_add(query, sql, ..arguments)
 }
 
 @(private)
-query_add :: proc(query: ^Query, sql: string, args: ..db.Value) -> mem.Allocator_Error {
+query_add :: proc(query: ^Query, sql: string, arguments: ..db.Value) -> mem.Allocator_Error {
 	strings.write_string(&query.sql, sql)
-	_, err := append(&query.args, ..args)
-	return err
+	_, error := append(&query.arguments, ..arguments)
+	return error
 }
 
 // query_filter binds the session id by reference, so filter must outlive the query.
@@ -521,8 +531,8 @@ query_filter :: proc(query: ^Query, filter: ^Filter) -> mem.Allocator_Error {
 	}
 	if len(filter.nodes) > 0 {
 		query_add(query, " AND node IN (") or_return
-		for node, i in filter.nodes {
-			query_add(query, ", ?" if i > 0 else "?", i64(node)) or_return
+		for node, index in filter.nodes {
+			query_add(query, ", ?" if index > 0 else "?", i64(node)) or_return
 		}
 		query_add(query, ")") or_return
 	}
@@ -532,37 +542,37 @@ query_filter :: proc(query: ^Query, filter: ^Filter) -> mem.Allocator_Error {
 // query_first runs a query that yields one row and returns it. The caller
 // closes rows.
 @(private)
-query_first :: proc(j: ^Journal, rows: ^db.Rows, sql: string, args: []db.Value) -> (row: Row, err: Error) {
-	db.query(&j.conn, rows, sql, args) or_return
+query_first :: proc(journal: ^Journal, rows: ^db.Rows, sql: string, arguments: []db.Value) -> (row: Row, error: Error) {
+	db.query(&journal.connection, rows, sql, arguments) or_return
 	values, has_row := db.rows_next(rows) or_return
 	if !has_row { return {}, Journal_Error.Corrupt }
 	return Row{values = values}, nil
 }
 
 @(private)
-query_int :: proc(j: ^Journal, sql: string, args: []db.Value) -> (value: i64, err: Error) {
+query_int :: proc(journal: ^Journal, sql: string, arguments: []db.Value) -> (value: i64, error: Error) {
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	row := query_first(j, &rows, sql, args) or_return
+	row := query_first(journal, &rows, sql, arguments) or_return
 	value = row_int(&row)
-	return value, row.err
+	return value, row.error
 }
 
 // Row reads the columns of one result row in order. The first failure is kept
-// in err and later reads return zero values, so a scan checks err once.
+// in error and later reads return zero values, so a scan checks error once.
 @(private)
 Row :: struct {
 	values:    []db.Value,
 	column:    int,
 	allocator: mem.Allocator,
-	err:       Error,
+	error:     Error,
 }
 
 @(private)
 row_next :: proc(row: ^Row) -> (db.Value, bool) {
-	if row.err != nil { return nil, false }
+	if row.error != nil { return nil, false }
 	if row.column >= len(row.values) {
-		row.err = Journal_Error.Corrupt
+		row.error = Journal_Error.Corrupt
 		return nil, false
 	}
 	value := row.values[row.column]
@@ -576,8 +586,8 @@ row_int :: proc(row: ^Row) -> i64 {
 	value, ok := row_next(row)
 	if !ok { return {} }
 	if value == nil { return 0 }
-	number, err := db.as_i64(value)
-	if err != nil { row.err = Journal_Error.Corrupt }
+	number, error := db.as_i64(value)
+	if error != nil { row.error = Journal_Error.Corrupt }
 	return number
 }
 
@@ -587,9 +597,9 @@ row_id :: proc(row: ^Row) -> (id: [16]u8) {
 	value, ok := row_next(row)
 	if !ok { return {} }
 	if value == nil { return }
-	bytes, err := db.as_bytes(value)
-	if err != nil || len(bytes) != len(id) {
-		row.err = Journal_Error.Corrupt
+	bytes, error := db.as_bytes(value)
+	if error != nil || len(bytes) != len(id) {
+		row.error = Journal_Error.Corrupt
 		return
 	}
 	copy(id[:], bytes)
@@ -602,17 +612,17 @@ row_view :: proc(row: ^Row) -> string {
 	value, ok := row_next(row)
 	if !ok { return {} }
 	if value == nil { return "" }
-	text, err := db.as_string(value)
-	if err != nil { row.err = Journal_Error.Corrupt }
+	text, error := db.as_string(value)
+	if error != nil { row.error = Journal_Error.Corrupt }
 	return text
 }
 
 @(private)
 row_text :: proc(row: ^Row) -> string {
 	text := row_view(row)
-	if row.err != nil || text == "" { return "" }
-	copied, err := strings.clone(text, row.allocator)
-	if err != nil { row.err = err }
+	if row.error != nil || text == "" { return "" }
+	copied, error := strings.clone(text, row.allocator)
+	if error != nil { row.error = error }
 	return copied
 }
 
@@ -622,22 +632,22 @@ row_bytes :: proc(row: ^Row) -> []u8 {
 	value, ok := row_next(row)
 	if !ok { return {} }
 	if value == nil { return nil }
-	bytes, err := db.as_bytes(value)
-	if err != nil {
-		row.err = Journal_Error.Corrupt
+	bytes, error := db.as_bytes(value)
+	if error != nil {
+		row.error = Journal_Error.Corrupt
 		return nil
 	}
 	if len(bytes) == 0 { return nil }
-	copied, clone_err := slice.clone(bytes, row.allocator)
-	if clone_err != nil { row.err = clone_err }
+	copied, clone_error := slice.clone(bytes, row.allocator)
+	if clone_error != nil { row.error = clone_error }
 	return copied
 }
 
 @(private)
-row_enum :: proc(row: ^Row, names: [$E]string) -> E {
+row_enum :: proc(row: ^Row, names: [$Enum]string) -> Enum {
 	name := row_view(row)
-	if row.err != nil { return {} }
+	if row.error != nil { return {} }
 	value, known := enum_from_name(names, name)
-	if !known { row.err = Journal_Error.Corrupt }
+	if !known { row.error = Journal_Error.Corrupt }
 	return value
 }

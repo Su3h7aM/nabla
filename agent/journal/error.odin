@@ -33,8 +33,8 @@ Error :: union #shared_nil {
 	json.Marshal_Error,
 }
 
-// error_is reports whether err is this package's own error of that kind.
-error_is :: proc(err: Error, kind: Journal_Error) -> bool {
-	own, is_own := err.(Journal_Error)
+// error_is reports whether error is this package's own error of that kind.
+error_is :: proc(error: Error, kind: Journal_Error) -> bool {
+	own, is_own := error.(Journal_Error)
 	return is_own && own == kind
 }

@@ -83,25 +83,25 @@ MIGRATION_1 := [?]string {
 // schema_migrate creates the schema of an empty database inside one immediate
 // transaction, so two processes opening one database never both migrate it.
 @(private)
-schema_migrate :: proc(j: ^Journal) -> (err: Error) {
+schema_migrate :: proc(journal: ^Journal) -> (error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	db.exec(&j.conn, "BEGIN IMMEDIATE") or_return
-	defer if err != nil { _ = db.rollback(&j.conn) }
+	db.exec(&journal.connection, "BEGIN IMMEDIATE") or_return
+	defer if error != nil { _ = db.rollback(&journal.connection) }
 
-	version := schema_version(j) or_return
+	version := schema_version(journal) or_return
 	if version > SCHEMA_VERSION { return Journal_Error.Schema_Too_New }
 	if version == 0 {
 		// Tables without a version belong to someone else.
-		tables := query_int(j, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'", nil) or_return
+		tables := query_int(journal, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'", nil) or_return
 		if tables != 0 { return Journal_Error.Schema_Unknown }
-		for statement in MIGRATION_1 { db.exec(&j.conn, statement) or_return }
-		db.exec(&j.conn, fmt.tprintf("PRAGMA user_version = %d", SCHEMA_VERSION)) or_return
+		for statement in MIGRATION_1 { db.exec(&journal.connection, statement) or_return }
+		db.exec(&journal.connection, fmt.tprintf("PRAGMA user_version = %d", SCHEMA_VERSION)) or_return
 	}
-	return db.commit(&j.conn)
+	return db.commit(&journal.connection)
 }
 
 @(private)
-schema_version :: proc(j: ^Journal) -> (int, Error) {
-	version, err := query_int(j, "PRAGMA user_version", nil)
-	return int(version), err
+schema_version :: proc(journal: ^Journal) -> (int, Error) {
+	version, error := query_int(journal, "PRAGMA user_version", nil)
+	return int(version), error
 }

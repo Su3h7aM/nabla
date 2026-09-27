@@ -1,7 +1,7 @@
 package journal
 
 // A payload is the JSON `data` of one record or node. Each begins with its
-// version `v`, which an append sets to PAYLOAD_VERSION when left zero. Enums are
+// version `version`, which an append sets to PAYLOAD_VERSION when left zero. Enums are
 // stored as the stable names of their tables; read them back with enum_from_name.
 PAYLOAD_VERSION :: 1
 
@@ -100,7 +100,7 @@ RESPONSE_FINISH_NAMES := [Response_Finish]string {
 // Completion ends a unit of work: outcome is a TURN_OUTCOME_NAMES name for a
 // turn and a TOOL_OUTCOME_NAMES name for a call, Lua run, Task, or subagent.
 Completion :: struct {
-	v:       int,
+	version: int,
 	outcome: string,
 	detail:  string,
 }
@@ -111,15 +111,15 @@ Call_Completed :: Completion // lua.completed, task.completed, subagent.complete
 
 // Detail carries only an explanation: request.interrupted and response.rejected.
 Detail :: struct {
-	v:      int,
-	detail: string,
+	version: int,
+	detail:  string,
 }
 
 Request_Interrupted :: Detail
 Response_Rejected :: Detail
 
 Session_Created :: struct {
-	v:              int,
+	version:        int,
 	workspace:      string,
 	role:           string, // SESSION_ROLE_NAMES
 	parent_session: string, // hex, "" for a main session
@@ -127,13 +127,13 @@ Session_Created :: struct {
 }
 
 Session_Titled :: struct {
-	v:     int,
-	title: string,
+	version: int,
+	title:   string,
 }
 
 // Session_Recovered counts what recover recorded.
 Session_Recovered :: struct {
-	v:        int,
+	version:  int,
 	turns:    int,
 	requests: int,
 	calls:    int,
@@ -143,37 +143,37 @@ Session_Recovered :: struct {
 // Selection_Changed has no session for the process-wide default. effort is the
 // provider's own level name, "" for its default.
 Selection_Changed :: struct {
-	v:        int,
+	version:  int,
 	provider: string,
 	model:    string,
 	effort:   string,
 }
 
 Branch_Created :: struct {
-	v:         int,
+	version:   int,
 	base_node: Node_Id,
 }
 
 // Branch_Selected names the branch in the record's branch column.
 Branch_Selected :: struct {
-	v: int,
+	version: int,
 }
 
 Node_Committed :: struct {
-	v:    int,
-	kind: string, // NODE_KIND_NAMES
+	version: int,
+	kind:    string, // NODE_KIND_NAMES
 }
 
 // Turn_Started names the instruction artifact by hex digest.
 Turn_Started :: struct {
-	v:            int,
+	version:      int,
 	instructions: string,
 	model:        string,
 	effort:       string,
 }
 
 Request_Sent :: struct {
-	v:               int,
+	version:         int,
 	purpose:         string, // REQUEST_PURPOSE_NAMES
 	api:             string,
 	model_requested: string,
@@ -182,7 +182,7 @@ Request_Sent :: struct {
 // Response_Committed carries the endpoint's native output items in the body. A
 // token count the provider did not report is null, never zero.
 Response_Committed :: struct {
-	v:                  int,
+	version:            int,
 	model_resolved:     string,
 	finish:             string, // RESPONSE_FINISH_NAMES
 	input_tokens:       Maybe(i64),
@@ -193,7 +193,7 @@ Response_Committed :: struct {
 
 // Tool_Proposed carries the arguments exactly as the model sent them in the body.
 Tool_Proposed :: struct {
-	v:           int,
+	version:     int,
 	provider_id: string,
 	item_id:     string,
 	name:        string,
@@ -201,15 +201,15 @@ Tool_Proposed :: struct {
 
 // Tool_Admitted carries the arguments the tool runs with in the body.
 Tool_Admitted :: struct {
-	v:       int,
+	version: int,
 	tool:    string,
 	repairs: []string,
 }
 
 // User carries the text in the node body.
 User :: struct {
-	v:      int,
-	origin: string, // USER_ORIGIN_NAMES
+	version: int,
+	origin:  string, // USER_ORIGIN_NAMES
 }
 
 Reasoning_Item :: struct {
@@ -220,7 +220,7 @@ Reasoning_Item :: struct {
 // Assistant carries the visible text in the node body. partial marks text kept
 // from a cancelled or failed response.
 Assistant :: struct {
-	v:         int,
+	version:   int,
 	request:   Request_Id,
 	partial:   bool,
 	reasoning: []Reasoning_Item,
@@ -228,18 +228,18 @@ Assistant :: struct {
 
 // Notice carries the feedback text in the node body.
 Notice :: struct {
-	v: int,
+	version: int,
 }
 
 // Checkpoint carries the summary in the node body; the node's covers names the
 // last node it replaces.
 Checkpoint :: struct {
-	v:       int,
+	version: int,
 	request: Request_Id,
 }
 
 // Results lists the root calls it answers in proposal order.
 Results :: struct {
-	v:     int,
-	calls: []Call_Id,
+	version: int,
+	calls:   []Call_Id,
 }

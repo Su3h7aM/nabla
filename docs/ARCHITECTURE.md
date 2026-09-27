@@ -97,11 +97,11 @@ The harness keeps running for as long as it reasonably can. Robustness comes fir
 - Constructors and state-changing procedures are `@(require_results)`.
 - A harness failure recorded in the journal is `Failure :: struct { stage: Stage, kind: Failure_Kind, detail: string }` with the full `detail` the source reported. `Stage` names where it happened (Prepare, Encode, Admit, Send, Stream, Validate, Commit, Dispatch, Execute, Persist, Hook, Recover).
 - `assert` checks internal invariants in debug; `ensure` checks invariants whose violation would corrupt durable state. Neither handles input, transport, tool, or storage errors. No `panic` on external input.
-- Allocation failure is an explicit error. An operation that builds an owned value uses a local, a `defer if !transferred { destroy(&v) }`, and sets `transferred` only after the owner accepts it. Empty success, zero-length success, and allocation failure are distinct.
+- Allocation failure is an explicit error. An operation that builds an owned value uses a local, a `defer if !transferred { destroy(&value) }`, and sets `transferred` only after the owner accepts it. Empty success, zero-length success, and allocation failure are distinct.
 
 ### 3.3 Allocators and lifetimes
 
-- Allocating procedures take a trailing `allocator := context.allocator`, or a required allocator when the result outlives the call. A procedure that returns an owning slice documents the allocator in the owner that frees it; callers free with `delete(s, allocator)`.
+- Allocating procedures take a trailing `allocator := context.allocator`, or a required allocator when the result outlives the call. A procedure that returns an owning slice documents the allocator in the owner that frees it; callers free with `delete(slice, allocator)`.
 - Arenas are initialized in place at their final address before any allocator handle to them is created. An arena is never copied or moved after `arena_init_*`.
 - `context.temp_allocator` is released only by its owner: the owner loop iteration (section 6.2) and worker entry procedures. Helpers use `runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()` with `ignore = allocator == context.temp_allocator` when returning into a caller-provided allocator. No bare `free_all(context.temp_allocator)` outside an owner.
 - File buffers transfer ownership (`string(bytes)`) instead of cloning.
@@ -429,29 +429,29 @@ A queued job starts when no earlier-admitted job that is neither retired nor aba
 `agent/journal` is the durable execution record and the only home of SQLite knowledge. Core `agent` code calls its procedures; the package API is the storage boundary. There is no separate diagnostic log.
 
 ```odin
-open           :: proc(j: ^Journal, directory: string, run: Run_Id, mode: Open_Mode, allocator := context.allocator) -> Error
-close          :: proc(j: ^Journal) -> Error
-create_session :: proc(j: ^Journal, info: Session_Info) -> (Session_Id, Error)   // claims it; buffers the row, session.created, branch 1
-claim          :: proc(j: ^Journal, s: Session_Id) -> (Counters, Error)          // exclusive flock per session
-release        :: proc(j: ^Journal) -> Error
-append_record  :: proc(j: ^Journal, header: Record, data: $T, body: []u8 = nil) // buffered, owner-only
-append_node    :: proc(j: ^Journal, node: Node, data: $T, body: []u8 = nil) -> Node_Id
-append_branch  :: proc(j: ^Journal, base: Node_Id) -> Branch_Id
-put_artifact   :: proc(j: ^Journal, kind: string, bytes: []u8) -> Digest         // buffered; INSERT OR IGNORE by SHA-256
-commit         :: proc(j: ^Journal) -> (Journal_Seq, Error)                      // durable barrier; flushes the buffer
-flush_due      :: proc(j: ^Journal, now: time.Tick) -> Error                     // commits observations past a batch limit
-flush_deadline :: proc(j: ^Journal) -> Maybe(time.Tick)
-read_records   :: proc(j: ^Journal, f: Filter, after: Journal_Seq, page: int, allocator: mem.Allocator) -> ([]Record, Journal_Seq, Error)
-read_latest    :: proc(j: ^Journal, f: Filter, allocator: mem.Allocator) -> (Record, bool, Error) // the matching record with the highest seq
-read_ancestry  :: proc(j: ^Journal, s: Session_Id, head: Node_Id, allocator: mem.Allocator) -> ([]Node, Error) // stops at the covering checkpoint
-read_artifact  :: proc(j: ^Journal, digest: Digest, allocator: mem.Allocator) -> ([]u8, bool, Error)
-session_head   :: proc(j: ^Journal, s: Session_Id) -> (Branch_Id, Node_Id, Error)
-usage_totals   :: proc(j: ^Journal, s: Session_Id) -> (Usage_Totals, Error)
+open           :: proc(journal: ^Journal, directory: string, run: Run_Id, mode: Open_Mode, allocator := context.allocator) -> Error
+close          :: proc(journal: ^Journal) -> Error
+create_session :: proc(journal: ^Journal, new_session: New_Session) -> (Session_Id, Error) // claims it; buffers the row, session.created, branch 1
+claim          :: proc(journal: ^Journal, session: Session_Id) -> (Counters, Error)        // exclusive flock per session
+release        :: proc(journal: ^Journal) -> Error
+append_record  :: proc(journal: ^Journal, header: Record, data: $Payload, body: []u8 = nil) // buffered, owner-only
+append_node    :: proc(journal: ^Journal, node: Node, data: $Payload, body: []u8 = nil) -> Node_Id
+append_branch  :: proc(journal: ^Journal, base: Node_Id) -> Branch_Id
+put_artifact   :: proc(journal: ^Journal, kind: string, bytes: []u8) -> Digest         // buffered; INSERT OR IGNORE by SHA-256
+commit         :: proc(journal: ^Journal) -> (Journal_Seq, Error)                      // durable barrier; flushes the buffer
+flush_due      :: proc(journal: ^Journal, now: time.Tick) -> Error                     // commits observations past a batch limit
+flush_deadline :: proc(journal: ^Journal) -> Maybe(time.Tick)
+read_records   :: proc(journal: ^Journal, filter: Filter, after: Journal_Seq, page: int, allocator: mem.Allocator) -> ([]Record, Journal_Seq, Error)
+read_latest    :: proc(journal: ^Journal, filter: Filter, allocator: mem.Allocator) -> (Record, bool, Error) // the matching record with the highest seq
+read_ancestry  :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, allocator: mem.Allocator) -> ([]Node, Error) // stops at the covering checkpoint
+read_artifact  :: proc(journal: ^Journal, digest: Digest, allocator: mem.Allocator) -> ([]u8, bool, Error)
+session_head   :: proc(journal: ^Journal, session: Session_Id) -> (Branch_Id, Node_Id, Error)
+usage_totals   :: proc(journal: ^Journal, session: Session_Id) -> (Usage_Totals, Error)
 cache_hit_rate :: proc(totals: Usage_Totals) -> (rate: f64, measured: bool)
 cache_coverage :: proc(totals: Usage_Totals) -> (share: f64, measured: bool)
-list_sessions  :: proc(j: ^Journal, f: Session_Filter, allocator: mem.Allocator) -> ([]Session_Summary, Error)
-list_branches  :: proc(j: ^Journal, s: Session_Id, allocator: mem.Allocator) -> ([]Branch_Summary, Error)
-recover        :: proc(j: ^Journal) -> (Recovery, Error)                         // the claimed session, one transaction
+list_sessions  :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.Allocator) -> ([]Session_Summary, Error)
+list_branches  :: proc(journal: ^Journal, session: Session_Id, allocator: mem.Allocator) -> ([]Branch_Summary, Error)
+recover        :: proc(journal: ^Journal) -> (Recovery, Error)                         // the claimed session, one transaction
 ```
 
 Records and nodes are journal-owned plain data (strings, integers, enums). `agent` maps its execution types to them; `agent/journal` never imports `agent`. The identities of section 5 are declared in `agent/journal`, the innermost package that stores them, and `agent` uses them from there.
@@ -462,8 +462,8 @@ Records and nodes are journal-owned plain data (strings, integers, enums). `agen
 - `data` is encoded from a typed payload struct declared in `agent/journal`, one per kind, named after it (`Tool_Completed` for `tool.completed`). Records and nodes are copied into a batch arena at append, so the caller's memory is borrowed only for the call.
 - The journal allocates `Node_Id` and `Branch_Id` at append, from the counters loaded by `claim`. `Counters` also carries the highest turn, request, and call ids, so the owner continues numbering after a restart.
 - Each node append also writes a `node.committed` record in the same transaction, and the node's `seq` is that record's seq. Branches (`branch.created`) and sessions (`session.created`) follow the same rule, so the records table is the one global order.
-- `append_record`, `append_node`, `append_branch`, and `put_artifact` return no error. An encoding or allocation failure latches in `j.failure` and is returned by the next `commit`. A failed commit rolls back and latches its cause the same way: the session is `Storage_Failed`, every later append is dropped, and every later commit returns that cause. Appending through a read-only journal or for a session the journal did not claim is a programming error and asserts.
-- Corrupt or unreadable data returns `.Corrupt`, and the journal keeps the session and seq of the offending row in `j.corrupt` for the message.
+- `append_record`, `append_node`, `append_branch`, and `put_artifact` return no error. An encoding or allocation failure latches in `journal.failure` and is returned by the next `commit`. A failed commit rolls back and latches its cause the same way: the session is `Storage_Failed`, every later append is dropped, and every later commit returns that cause. Appending through a read-only journal or for a session the journal did not claim is a programming error and asserts.
+- Corrupt or unreadable data returns `.Corrupt`, and the journal keeps the session and seq of the offending row in `journal.corrupt` for the message.
 
 ### 8.2 Schema
 
@@ -483,9 +483,9 @@ artifacts(digest BLOB PRIMARY KEY, kind TEXT, created_ms INTEGER, bytes BLOB) ST
 -- the schema version is PRAGMA user_version
 ```
 
-- Every table is append-only. Mutable facts (title, active branch, selection, ratings) are the latest record of their kind. A branch head is `max(node) WHERE branch = b`.
+- Every table is append-only. Mutable facts (title, active branch, selection, ratings) are the latest record of their kind. A branch head is the highest `node` on that branch.
 - Indexes: `records(session, seq)`, `records(session, call) WHERE call IS NOT NULL`, `records(session, kind, seq)`, `records(session, node) WHERE node IS NOT NULL`, `records(session, request) WHERE request IS NOT NULL`, `nodes(session, branch, node)`.
-- `data` is one JSON object per record, shaped by a versioned struct per kind (`v` field). `body` holds exact bytes. Diagnostics queries use SQLite JSON functions over `data`; analysis needs no custom decoder.
+- `data` is one JSON object per record, shaped by a versioned struct per kind (`version` field). `body` holds exact bytes. Diagnostics queries use SQLite JSON functions over `data`; analysis needs no custom decoder.
 - `body` holds what the model sees: a `User` node's is the user's text, an `Assistant` node's is the model's visible text, `tool.proposed`'s is the argument document exactly as the model sent it, `tool.admitted`'s is the arguments the tool runs with, `tool.completed`'s is the rendered result, and `response.committed`'s is the endpoint's native output items when it returned any. A `Checkpoint` node's body is its summary and a `Notice` node's is the feedback text. A Lua child's records carry a parent call and no node, so they never enter the projection or a `Results` node.
 - WAL, `synchronous = FULL`, `busy_timeout`, private 0700 directory and 0600 files. Several processes (TUI, subagent children, diagnostics readers) share the file; each session has one writer claim.
 - Migrations are explicit steps stamped in the same transaction. A newer schema is refused. Corrupt or unreadable data is a typed error naming the session and seq; the harness never guesses.

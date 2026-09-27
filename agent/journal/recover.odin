@@ -9,14 +9,14 @@ Recovery :: Session_Recovered
 // its process died, in one transaction, and replays nothing. It records nothing
 // when nothing was open, so recovering twice changes nothing.
 @(require_results)
-recover :: proc(j: ^Journal) -> (recovery: Recovery, err: Error) {
-	assert(j.claimed != {}, "recover needs a claimed session")
-	_ = commit(j) or_return
-	recover_open_work(j, &recovery) or_return
-	recover_results(j, &recovery) or_return
+recover :: proc(journal: ^Journal) -> (recovery: Recovery, error: Error) {
+	assert(journal.claimed != {}, "recover needs a claimed session")
+	_ = commit(journal) or_return
+	recover_open_work(journal, &recovery) or_return
+	recover_results(journal, &recovery) or_return
 	if recovery == {} { return }
-	append_record(j, Record{kind = .Session_Recovered, session = j.claimed}, recovery)
-	_ = commit(j) or_return
+	append_record(journal, Record{kind = .Session_Recovered, session = journal.claimed}, recovery)
+	_ = commit(journal) or_return
 	return
 }
 
@@ -33,10 +33,10 @@ Recovery_Rule :: enum {
 }
 
 @(private)
-recover_open_work :: proc(j: ^Journal, recovery: ^Recovery) -> (err: Error) {
+recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error) {
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	db.query(&j.conn, &rows, RECOVERY_QUERY, {db.Value(j.claimed[:])}) or_return
+	db.query(&journal.connection, &rows, RECOVERY_QUERY, {db.Value(journal.claimed[:])}) or_return
 	for {
 		values, has_row := db.rows_next(&rows) or_return
 		if !has_row { break }
@@ -45,7 +45,7 @@ recover_open_work :: proc(j: ^Journal, recovery: ^Recovery) -> (err: Error) {
 		}
 		rule := Recovery_Rule(row_int(&row))
 		header := Record {
-			session = j.claimed,
+			session = journal.claimed,
 		}
 		header.branch = Branch_Id(row_int(&row))
 		header.node = Node_Id(row_int(&row))
@@ -55,7 +55,7 @@ recover_open_work :: proc(j: ^Journal, recovery: ^Recovery) -> (err: Error) {
 		header.job = Job_Id(row_int(&row))
 		header.call = Call_Id(row_int(&row))
 		header.parent_call = Call_Id(row_int(&row))
-		if row.err != nil || rule > max(Recovery_Rule) { return corrupt(j, Journal_Error.Corrupt, j.claimed, 0) }
+		if row.error != nil || rule > max(Recovery_Rule) { return corrupt(journal, Journal_Error.Corrupt, journal.claimed, 0) }
 
 		unknown := Call_Completed {
 			outcome = TOOL_OUTCOME_NAMES[.Unknown],
@@ -64,45 +64,45 @@ recover_open_work :: proc(j: ^Journal, recovery: ^Recovery) -> (err: Error) {
 		switch rule {
 		case .Turn:
 			header.kind = .Turn_Completed
-			append_record(j, header, Turn_Completed{outcome = TURN_OUTCOME_NAMES[.Interrupted], detail = "the process ended during the turn"})
+			append_record(journal, header, Turn_Completed{outcome = TURN_OUTCOME_NAMES[.Interrupted], detail = "the process ended during the turn"})
 			recovery.turns += 1
 		case .Request:
 			header.kind = .Request_Interrupted
-			append_record(j, header, Request_Interrupted{detail = "the request was sent and its outcome is unknown"})
+			append_record(journal, header, Request_Interrupted{detail = "the request was sent and its outcome is unknown"})
 			recovery.requests += 1
 		case .Proposed_Call:
 			header.kind = .Tool_Completed
-			append_record(j, header, Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Not_Executed], detail = "the call was never admitted"})
+			append_record(journal, header, Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Not_Executed], detail = "the call was never admitted"})
 			recovery.calls += 1
 		case .Admitted_Call:
 			header.kind = .Tool_Completed
-			append_record(j, header, unknown)
+			append_record(journal, header, unknown)
 			recovery.calls += 1
 		case .Lua:
 			header.kind = .Lua_Completed
-			append_record(j, header, unknown)
+			append_record(journal, header, unknown)
 			recovery.calls += 1
 		case .Task:
 			header.kind = .Task_Completed
-			append_record(j, header, unknown)
+			append_record(journal, header, unknown)
 			recovery.calls += 1
 		case .Subagent:
 			header.kind = .Subagent_Completed
-			append_record(j, header, unknown)
+			append_record(journal, header, unknown)
 			recovery.calls += 1
 		}
 	}
-	return j.failure
+	return journal.failure
 }
 
 // recover_results gives each Assistant node whose proposed calls have no
 // Results node one, listing the calls in proposal order.
 @(private)
-recover_results :: proc(j: ^Journal, recovery: ^Recovery) -> (err: Error) {
+recover_results :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	rows: db.Rows
 	defer db.rows_close(&rows)
-	db.query(&j.conn, &rows, UNANSWERED_CALLS_QUERY, {db.Value(j.claimed[:])}) or_return
+	db.query(&journal.connection, &rows, UNANSWERED_CALLS_QUERY, {db.Value(journal.claimed[:])}) or_return
 
 	calls := make([dynamic]Call_Id, context.temp_allocator) or_return
 	assistant: Node
@@ -115,13 +115,13 @@ recover_results :: proc(j: ^Journal, recovery: ^Recovery) -> (err: Error) {
 		if has_row { node = Node_Id(row_int(&row)) }
 		if node != assistant.id && len(calls) > 0 {
 			results := Node {
-				session = j.claimed,
+				session = journal.claimed,
 				parent  = assistant.id,
 				branch  = assistant.branch,
 				kind    = .Results,
 				turn    = assistant.turn,
 			}
-			_ = append_node(j, results, Results{calls = calls[:]})
+			_ = append_node(journal, results, Results{calls = calls[:]})
 			recovery.results += 1
 			clear(&calls)
 		}
@@ -130,11 +130,11 @@ recover_results :: proc(j: ^Journal, recovery: ^Recovery) -> (err: Error) {
 		assistant.branch = Branch_Id(row_int(&row))
 		assistant.turn = Turn_Id(row_int(&row))
 		call := Call_Id(row_int(&row))
-		if row.err != nil { return corrupt(j, row.err, j.claimed, 0) }
-		_, append_err := append(&calls, call)
-		if append_err != nil { return append_err }
+		if row.error != nil { return corrupt(journal, row.error, journal.claimed, 0) }
+		_, append_error := append(&calls, call)
+		if append_error != nil { return append_error }
 	}
-	return j.failure
+	return journal.failure
 }
 
 // Each rule finds work whose closing record is missing, so a second recovery
