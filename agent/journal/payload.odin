@@ -1,9 +1,22 @@
 package journal
 
+// payload_decode is generic, so this package never instantiates its use.
+@(require) import "core:encoding/json"
+import "core:mem"
+
 // A payload is the JSON `data` of one record or node. Each begins with its
-// version `version`, which an append sets to PAYLOAD_VERSION when left zero. Enums are
+// `version`, which an append sets to PAYLOAD_VERSION when left zero. Enums are
 // stored as the stable names of their tables; read them back with enum_from_name.
 PAYLOAD_VERSION :: 1
+
+// payload_decode reads a record's or node's data into its payload struct, with
+// strings and slices in allocator. A failed decode may leave partial
+// allocations behind, so allocator is a temp or arena allocator.
+@(require_results)
+payload_decode :: proc(data: string, payload: ^$Payload, allocator: mem.Allocator) -> Error {
+	if json.unmarshal_string(data, payload, allocator = allocator) != nil { return Journal_Error.Corrupt }
+	return nil
+}
 
 Session_Role :: enum u8 {
 	Main,
@@ -212,18 +225,12 @@ User :: struct {
 	origin:  string, // USER_ORIGIN_NAMES
 }
 
-Reasoning_Item :: struct {
-	id:        string,
-	encrypted: string,
-}
-
 // Assistant carries the visible text in the node body. partial marks text kept
 // from a cancelled or failed response.
 Assistant :: struct {
-	version:   int,
-	request:   Request_Id,
-	partial:   bool,
-	reasoning: []Reasoning_Item,
+	version: int,
+	request: Request_Id,
+	partial: bool,
 }
 
 // Notice carries the feedback text in the node body.

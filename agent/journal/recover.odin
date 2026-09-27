@@ -59,7 +59,7 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Err
 
 		unknown := Call_Completed {
 			outcome = TOOL_OUTCOME_NAMES[.Unknown],
-			detail  = "execution may have happened",
+			detail  = "the session ended before this call reported a result; it may have taken effect",
 		}
 		switch rule {
 		case .Turn:
@@ -72,7 +72,11 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Err
 			recovery.requests += 1
 		case .Proposed_Call:
 			header.kind = .Tool_Completed
-			append_record(journal, header, Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Not_Executed], detail = "the call was never admitted"})
+			append_record(
+				journal,
+				header,
+				Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Not_Executed], detail = "the session ended before this call ran; it did not run"},
+			)
 			recovery.calls += 1
 		case .Admitted_Call:
 			header.kind = .Tool_Completed

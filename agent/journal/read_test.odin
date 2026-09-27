@@ -301,7 +301,7 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	assistant := append_node(
 		&journal,
 		Node{session = session, parent = user, branch = INITIAL_BRANCH, kind = .Assistant, turn = 1},
-		Assistant{request = 1, reasoning = []Reasoning_Item{{id = "rs_1", encrypted = "opaque"}}},
+		Assistant{request = 1},
 		_body("let me look"),
 	)
 
@@ -527,8 +527,6 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	answer: Assistant
 	_decode_payload(test, ancestry[1].data, &answer)
 	testing.expect_value(test, answer.request, Request_Id(1))
-	testing.expect_value(test, len(answer.reasoning), 1)
-	testing.expect_value(test, answer.reasoning[0].encrypted, "opaque")
 	summary: Assistant
 	_decode_payload(test, ancestry[4].data, &summary)
 	testing.expect(test, !summary.partial, "a response that committed whole is not partial")

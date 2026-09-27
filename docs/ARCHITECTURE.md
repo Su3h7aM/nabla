@@ -543,7 +543,7 @@ On claiming a session, in one transaction:
 | `turn.started` without `turn.completed` | `turn.completed{Interrupted}` |
 | `request.sent` without terminal | `request.interrupted`; never resent |
 | `tool.proposed` (committed response) without `tool.admitted` | `tool.completed{Not_Executed}` |
-| `tool.admitted` without `tool.completed` | `tool.completed{Unknown, "execution may have happened"}` (roots and Lua children) |
+| `tool.admitted` without `tool.completed` | `tool.completed{Unknown, "it may have taken effect"}` (roots and Lua children) |
 | `lua.started`, `task.started`, `subagent.started` without completion | `*.completed{Unknown}`; scripts are never resumed |
 | `Assistant` node with calls and no `Results` node | `Results` node built from committed and recovered results |
 | compaction output without `checkpoint.installed` | nothing; audit data only |
