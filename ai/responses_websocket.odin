@@ -85,6 +85,7 @@ Provider_Request_Freeze_WebSocket_Reusing :: proc(
 		Tools = len(request.Tools),
 		Session_Id_Present = request.Session_Id_Present,
 		Session_Id = request.Session_Id,
+		Parent_Session_Id = request.Parent_Session_Id,
 		User_Agent_Present = request.User_Agent_Present,
 		User_Agent = request.User_Agent,
 	}, {}

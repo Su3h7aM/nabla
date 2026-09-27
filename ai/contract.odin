@@ -152,6 +152,9 @@ Provider_Request :: struct {
 	User_Agent:                     string, // borrowed until operation retirement,
 	Session_Id_Present:             bool,
 	Session_Id:                     string, // borrowed until operation retirement,
+	// Parent_Session_Id names the conversation that started this one, such as the
+	// orchestrator of a subagent. "" sends no header. Borrowed until operation retirement.
+	Parent_Session_Id:              string,
 }
 
 Provider_Request_Error :: enum {

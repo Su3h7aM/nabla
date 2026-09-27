@@ -762,9 +762,9 @@ test_provider_auth_headers_are_optional :: proc(t: ^testing.T) {
 	}
 }
 
-// A client names itself and the conversation it is having. Both are opaque to
-// this package, and an endpoint that routes, throttles, or traces by client has
-// only these to read; a caller that names neither sends neither header.
+// A client names itself, the conversation it is having, and the conversation that started
+// it. All are opaque to this package, and an endpoint that routes, throttles, or traces by
+// client has only these to read; a caller that names none sends none of the headers.
 @(test)
 test_provider_request_headers_carry_the_client_identity :: proc(t: ^testing.T) {
 	connection := Provider_Connection {
@@ -776,25 +776,28 @@ test_provider_request_headers_carry_the_client_identity :: proc(t: ^testing.T) {
 		User_Agent         = "nabla/0.1.0",
 		Session_Id_Present = true,
 		Session_Id         = "0123456789abcdef0123456789abcdef",
+		Parent_Session_Id  = "fedcba9876543210fedcba9876543210",
 	}
 	headers := provider_encoded_headers(connection, named, context.allocator)
 	defer provider_headers_destroy(headers, context.allocator)
-	if testing.expect_value(t, len(headers), 3) { return }
+	if !testing.expect_value(t, len(headers), 4) { return }
 	testing.expect_value(t, headers[0].name, "authorization")
 	testing.expect_value(t, headers[1].name, "user-agent")
 	testing.expect_value(t, headers[1].value, "nabla/0.1.0")
 	testing.expect_value(t, headers[2].name, "session-id")
 	testing.expect_value(t, headers[2].value, "0123456789abcdef0123456789abcdef")
+	testing.expect_value(t, headers[3].name, "x-parent-session-id")
+	testing.expect_value(t, headers[3].value, "fedcba9876543210fedcba9876543210")
 
 	// A present but empty value is not an identity, so no header is sent for it.
 	blank := Provider_Encoded_Request {
 		User_Agent_Present = true,
 		Session_Id_Present = true,
 	}
-	headers = provider_encoded_headers(connection, blank, context.allocator)
-	defer provider_headers_destroy(headers, context.allocator)
-	testing.expect_value(t, len(headers), 1)
-	testing.expect_value(t, headers[0].name, "authorization")
+	unnamed := provider_encoded_headers(connection, blank, context.allocator)
+	defer provider_headers_destroy(unnamed, context.allocator)
+	testing.expect_value(t, len(unnamed), 1)
+	testing.expect_value(t, unnamed[0].name, "authorization")
 }
 
 @(test)

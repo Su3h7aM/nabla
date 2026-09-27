@@ -188,6 +188,7 @@ Provider_Encoded_Request :: struct {
 	Tools:              int,
 	Session_Id_Present: bool,
 	Session_Id:         string,
+	Parent_Session_Id:  string,
 	User_Agent_Present: bool,
 	User_Agent:         string,
 }
@@ -257,7 +258,7 @@ provider_endpoint :: proc(endpoint: string, api: API_Kind, allocator: mem.Alloca
 provider_encoded_headers :: proc(connection: Provider_Connection, encoded: Provider_Encoded_Request, allocator := context.allocator) -> []client.Header {
 	// Sized for the most any API family needs, so every entry is allocated up
 	// front from the caller's allocator rather than grown through an ambient one.
-	result := make([]client.Header, 4, allocator)
+	result := make([]client.Header, 5, allocator)
 	count := 0
 	switch connection.API {
 	case .OpenAI_Chat_Completions, .OpenAI_Responses:
@@ -282,6 +283,12 @@ provider_encoded_headers :: proc(connection: Provider_Connection, encoded: Provi
 	}
 	if encoded.Session_Id_Present && encoded.Session_Id != "" {
 		result[count] = {"session-id", strings.clone(encoded.Session_Id, allocator)}
+		count += 1
+	}
+	// The name other harnesses send, so a gateway can route a subagent beside the
+	// conversation that started it.
+	if encoded.Parent_Session_Id != "" {
+		result[count] = {"x-parent-session-id", strings.clone(encoded.Parent_Session_Id, allocator)}
 		count += 1
 	}
 	return result[:count]
@@ -353,6 +360,7 @@ Provider_Request_Freeze_Reusing :: proc(
 		Tools = len(request.Tools),
 		Session_Id_Present = request.Session_Id_Present,
 		Session_Id = request.Session_Id,
+		Parent_Session_Id = request.Parent_Session_Id,
 		User_Agent_Present = request.User_Agent_Present,
 		User_Agent = request.User_Agent,
 	}, {}
