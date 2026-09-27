@@ -113,15 +113,6 @@ RECORD_KIND_NAMES := [Record_Kind]string {
 	.Selection_Changed      = "selection.changed",
 }
 
-// record_kind_from_name reads a stored kind name back. An unknown name is a
-// name this build does not know, and the caller reports the row as corrupt.
-record_kind_from_name :: proc(name: string) -> (Record_Kind, bool) {
-	for candidate in Record_Kind {
-		if RECORD_KIND_NAMES[candidate] == name { return candidate, true }
-	}
-	return {}, false
-}
-
 // Node_Kind is the closed set of committed conversational steps, stored in the
 // `kind` column of `nodes`.
 Node_Kind :: enum u8 {
@@ -142,10 +133,10 @@ NODE_KIND_NAMES := [Node_Kind]string {
 	.Checkpoint = "checkpoint",
 }
 
-// node_kind_from_name reads a stored node kind name back.
-node_kind_from_name :: proc(name: string) -> (Node_Kind, bool) {
-	for candidate in Node_Kind {
-		if NODE_KIND_NAMES[candidate] == name { return candidate, true }
+// enum_from_name reads a stored stable name back through its name table.
+enum_from_name :: proc(names: [$E]string, name: string) -> (E, bool) {
+	for candidate in E {
+		if names[candidate] == name { return candidate, true }
 	}
 	return {}, false
 }

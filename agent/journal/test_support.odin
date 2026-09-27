@@ -137,3 +137,5 @@ _record_seq_of_kind :: proc(records: []Record, kind: Record_Kind) -> Journal_Seq
 	}
 	return 0
 }
+
+OTHERS_ACCESS :: os.Permissions{.Read_Group, .Write_Group, .Execute_Group, .Read_Other, .Write_Other, .Execute_Other}

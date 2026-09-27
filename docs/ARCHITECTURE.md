@@ -462,7 +462,7 @@ Records and nodes are journal-owned plain data (strings, integers, enums). `agen
 - `data` is encoded from a typed payload struct declared in `agent/journal`, one per kind, named after it (`Tool_Completed` for `tool.completed`). Records and nodes are copied into a batch arena at append, so the caller's memory is borrowed only for the call.
 - The journal allocates `Node_Id` and `Branch_Id` at append, from the counters loaded by `claim`. `Counters` also carries the highest turn, request, and call ids, so the owner continues numbering after a restart.
 - Each node append also writes a `node.committed` record in the same transaction, and the node's `seq` is that record's seq. Branches (`branch.created`) and sessions (`session.created`) follow the same rule, so the records table is the one global order.
-- `append_record`, `append_node`, `append_branch`, and `put_artifact` return no error. An encoding or allocation failure latches in the journal and is returned by the next `commit`. A failed commit rolls back and latches `Storage_Failed`: every later append is dropped and every later commit returns the latched error.
+- `append_record`, `append_node`, `append_branch`, and `put_artifact` return no error. An encoding or allocation failure latches in `j.failure` and is returned by the next `commit`. A failed commit rolls back and latches its cause the same way: the session is `Storage_Failed`, every later append is dropped, and every later commit returns that cause. Appending through a read-only journal or for a session the journal did not claim is a programming error and asserts.
 - Corrupt or unreadable data returns `.Corrupt`, and the journal keeps the session and seq of the offending row in `j.corrupt` for the message.
 
 ### 8.2 Schema
@@ -480,7 +480,7 @@ branches(session BLOB, branch INTEGER, base_node INTEGER, seq INTEGER NOT NULL,
 sessions(session BLOB PRIMARY KEY, created_ms INTEGER, workspace TEXT,
          parent_session BLOB, parent_call INTEGER, role TEXT) STRICT
 artifacts(digest BLOB PRIMARY KEY, kind TEXT, created_ms INTEGER, bytes BLOB) STRICT
-schema(version INTEGER)
+-- the schema version is PRAGMA user_version
 ```
 
 - Every table is append-only. Mutable facts (title, active branch, selection, ratings) are the latest record of their kind. A branch head is `max(node) WHERE branch = b`.

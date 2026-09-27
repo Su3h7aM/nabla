@@ -316,7 +316,7 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(t: ^testing
 	append_record(
 		&j,
 		Record{session = session, turn = 1, request = 1, node = assistant, call = 1, kind = .Tool_Completed},
-		Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Success], detail = "read a.txt", origin = "builtin_read"},
+		Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Success], detail = "read a.txt"},
 		_body("ok\n\nhello"),
 	)
 	append_record(
@@ -334,7 +334,7 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(t: ^testing
 	append_record(
 		&j,
 		Record{session = session, turn = 1, request = 1, node = assistant, call = 2, kind = .Tool_Completed},
-		Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Success], detail = "grep hello", origin = "builtin_grep"},
+		Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Success], detail = "grep hello"},
 		_body("ok\n\na.txt:1:hello"),
 	)
 	// A Lua child's call carries its parent call and no node, so a projection
@@ -515,7 +515,6 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(t: ^testing
 	testing.expect_value(t, len(admitted.repairs), 1)
 	completed: Tool_Completed
 	_decode_payload(t, projection[2].data, &completed)
-	testing.expect_value(t, completed.origin, "builtin_read")
 	committed: Response_Committed
 	_decode_payload(t, projection[6].data, &committed)
 	testing.expect_value(t, committed.finish, RESPONSE_FINISH_NAMES[.Tool_Call])

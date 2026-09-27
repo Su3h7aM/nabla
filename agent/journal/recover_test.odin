@@ -45,8 +45,7 @@ test_recovery_closes_an_interrupted_turn :: proc(t: ^testing.T) {
 	_expect_ok(t, recover_err)
 	testing.expect_value(t, recovery.turns, 1)
 	testing.expect_value(t, recovery.requests, 1)
-	testing.expect_value(t, recovery.tools, 2)
-	testing.expect_value(t, recovery.effects, 1)
+	testing.expect_value(t, recovery.calls, 3)
 	testing.expect_value(t, recovery.results, 1)
 	testing.expect_value(t, j.counters.node, assistant + 1) // the Results node
 
@@ -103,8 +102,7 @@ test_recovery_closes_an_interrupted_turn :: proc(t: ^testing.T) {
 			payload: Session_Recovered
 			_decode_payload(t, record.data, &payload)
 			testing.expect_value(t, payload.turns, 1)
-			testing.expect_value(t, payload.tools, 2)
-			testing.expect_value(t, payload.effects, 1)
+			testing.expect_value(t, payload.calls, 3)
 			testing.expect_value(t, payload.results, 1)
 		case:
 		}
@@ -142,11 +140,7 @@ test_recovery_closes_an_interrupted_turn :: proc(t: ^testing.T) {
 	// Recovery ran once, so a second one has nothing left to record.
 	again, again_err := recover(&j)
 	_expect_ok(t, again_err)
-	testing.expect_value(t, again.turns, 0)
-	testing.expect_value(t, again.requests, 0)
-	testing.expect_value(t, again.tools, 0)
-	testing.expect_value(t, again.effects, 0)
-	testing.expect_value(t, again.results, 0)
+	testing.expect_value(t, again, Recovery{})
 
 	after := _records_of_session(t, &j, session)
 	defer records_destroy(after, context.allocator)
@@ -184,11 +178,7 @@ test_recovery_records_nothing_after_a_clean_turn :: proc(t: ^testing.T) {
 
 	recovery, recover_err := recover(&j)
 	_expect_ok(t, recover_err)
-	testing.expect_value(t, recovery.turns, 0)
-	testing.expect_value(t, recovery.requests, 0)
-	testing.expect_value(t, recovery.tools, 0)
-	testing.expect_value(t, recovery.effects, 0)
-	testing.expect_value(t, recovery.results, 0)
+	testing.expect_value(t, recovery, Recovery{})
 
 	// A session that was closed cleanly has nothing to say, so recovery writes
 	// no record at all.

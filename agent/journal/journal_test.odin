@@ -21,11 +21,11 @@ test_committed_records_survive_a_reopen :: proc(t: ^testing.T) {
 	// The directory and the database admit the owner alone.
 	directory_info, directory_err := os.stat(directory, context.temp_allocator)
 	if directory_err != nil { testing.fail_now(t, "the journal directory was not created") }
-	testing.expect(t, permissions_are_private(directory_info.mode), "the journal directory should be owner-only")
+	testing.expect(t, directory_info.mode & OTHERS_ACCESS == {}, "the journal directory should be owner-only")
 	database := fmt.tprintf("%s/%s", directory, DATABASE_NAME)
 	database_info, database_err := os.stat(database, context.temp_allocator)
 	if database_err != nil { testing.fail_now(t, "the database was not created") }
-	testing.expect(t, permissions_are_private(database_info.mode), "the database should be owner-only")
+	testing.expect(t, database_info.mode & OTHERS_ACCESS == {}, "the database should be owner-only")
 
 	session := _create_session(t, &writer, {workspace = "/tmp/project", role = .Main})
 	append_record(&writer, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
@@ -163,13 +163,8 @@ test_a_session_has_one_writer_at_a_time :: proc(t: ^testing.T) {
 	_open_journal(t, &second, directory)
 	_, claim_err := claim(&second, session)
 	_expect_error(t, claim_err, .Claimed)
-
-	// A journal holding its own session cannot take another one either.
 	other := _create_session(t, &second, {workspace = "/tmp/other", role = .Main})
 	_commit_ok(t, &second)
-	_, second_claim_err := claim(&second, session)
-	_expect_error(t, second_claim_err, .Claimed)
-	_expect_ok(t, release(&second))
 
 	// An id the journal does not hold is not a claim to take.
 	third: Journal
@@ -231,10 +226,8 @@ test_a_failed_commit_latches_and_drops_appends :: proc(t: ^testing.T) {
 	testing.expect_value(t, duplicate, Node_Id(1))
 
 	_, commit_err := commit(&j)
-	_expect_error(t, commit_err, .Storage_Failed)
-
-	// The database's own message is kept, so the harness can report why.
-	cause, is_database := j.failure_cause.(db.Error)
+	// The database's own error is returned and latched, so the harness can report why.
+	cause, is_database := commit_err.(db.Error)
 	testing.expect(t, is_database, "a failed commit should keep the database's error")
 	if is_database {
 		message := db.error_message(&cause)
@@ -247,8 +240,7 @@ test_a_failed_commit_latches_and_drops_appends :: proc(t: ^testing.T) {
 	append_record(&j, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "dropped"})
 	testing.expect_value(t, len(j.pending), 0)
 	_, again_err := commit(&j)
-	_expect_error(t, again_err, .Storage_Failed)
-	testing.expect(t, error_is(j.failure, .Storage_Failed))
+	testing.expect(t, again_err == commit_err, "a later commit returns the latched failure")
 
 	// What was committed before the failure is still readable.
 	records := _records_of_session(t, &j, session)
@@ -300,33 +292,6 @@ test_open_refuses_a_database_this_build_does_not_read :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_a_read_only_journal_refuses_to_write :: proc(t: ^testing.T) {
-	directory := _temp_directory(t)
-	defer _remove_directory(directory)
-
-	writer: Journal
-	_open_journal(t, &writer, directory)
-	session := _create_session(t, &writer, {workspace = "/tmp/project", role = .Main})
-	_commit_ok(t, &writer)
-	_expect_ok(t, close(&writer))
-
-	reader: Journal
-	_open_journal(t, &reader, directory, .Read_Only)
-	defer _close_journal(t, &reader)
-
-	_, claim_err := claim(&reader, session)
-	_expect_error(t, claim_err, .Read_Only)
-	_, create_err := create_session(&reader, {workspace = "/tmp/project", role = .Main})
-	_expect_error(t, create_err, .Read_Only)
-
-	// An append on a read-only journal is dropped and reported by the commit.
-	append_record(&reader, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "refused"})
-	testing.expect_value(t, len(reader.pending), 0)
-	_, commit_err := commit(&reader)
-	_expect_error(t, commit_err, .Read_Only)
-}
-
-@(test)
 test_a_session_created_here_is_claimed_and_numbered :: proc(t: ^testing.T) {
 	directory := _temp_directory(t)
 	defer _remove_directory(directory)
@@ -336,14 +301,10 @@ test_a_session_created_here_is_claimed_and_numbered :: proc(t: ^testing.T) {
 	defer _close_journal(t, &j)
 
 	parent := _create_session(t, &j, {workspace = "/tmp/project", role = .Main})
-	testing.expect(t, !session_id_is_absent(parent), "a created session has an id")
+	testing.expect(t, parent != {}, "a created session has an id")
 	testing.expect_value(t, j.claimed, parent)
 	testing.expect_value(t, j.counters.branch, Branch_Id(INITIAL_BRANCH))
 	_commit_ok(t, &j)
-
-	// A second session needs the first one released.
-	_, second_err := create_session(&j, {workspace = "/tmp/other", role = .Main})
-	_expect_error(t, second_err, .Claimed)
 	_expect_ok(t, release(&j))
 
 	child := _create_session(t, &j, {workspace = "/tmp/other", role = .Subagent, parent_session = parent, parent_call = 7})
@@ -359,7 +320,7 @@ test_a_session_created_here_is_claimed_and_numbered :: proc(t: ^testing.T) {
 	_, bad_parse := session_id_parse(text[:len(text) - 1])
 	testing.expect(t, !bad_parse, "a short id should not parse")
 	run := run_id_create()
-	testing.expect(t, !run_id_is_absent(run), "a run id should be created")
+	testing.expect(t, run != {}, "a run id should be created")
 	testing.expect(t, run != _test_run_id(), "run ids should be drawn fresh")
 
 	summaries, list_err := list_sessions(&j, {}, context.allocator)

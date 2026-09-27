@@ -1,5 +1,6 @@
 package journal
 
+import "base:runtime"
 import "core:fmt"
 
 import "nabla:db"
@@ -9,23 +10,9 @@ import "nabla:db"
 // names may not be the columns it has, so this build refuses rather than guess.
 SCHEMA_VERSION :: 1
 
-// The schema is one set of STRICT tables, so a column refuses a value of the
-// wrong storage class instead of quietly storing it.
-//
-// Every table is append-only, and the fact that changes an earlier one is
-// another record. `records` is the global order: its rowid is the journal's
-// seq. `nodes` is the session tree, `branches` names where each branch forked,
-// and `sessions` is one row per session. `artifacts` holds exact bytes a record
-// points at by digest.
-//
-// Identity and correlation are columns, because those are the relationships a
-// query uses; content is one level of JSON in `data`, because a payload changes
-// shape as the harness grows. An absent id is NULL, and the seq of a node or a
-// branch is the seq of the record that created it. A base node of 0 is the
-// start of the session rather than an absent value, so the column is NOT NULL.
-//
-// Each element is one statement: the backend refuses a string holding more than
-// one.
+// Every table is append-only and STRICT. The rowid of `records` is the global
+// seq; a node or branch takes the seq of the record that created it. An absent
+// id is NULL. Each element is one statement, as the backend requires.
 @(private)
 MIGRATION_1 := [?]string {
 	`CREATE TABLE records (
@@ -93,81 +80,28 @@ MIGRATION_1 := [?]string {
 	) STRICT`,
 }
 
-// migration_statements returns the statements that bring version to version + 1,
-// or nil when there is no such migration.
+// schema_migrate creates the schema of an empty database inside one immediate
+// transaction, so two processes opening one database never both migrate it.
 @(private)
-migration_statements :: proc(version: int) -> []string {
-	if version == 1 { return MIGRATION_1[:] }
-	return nil
-}
+schema_migrate :: proc(j: ^Journal) -> (err: Error) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	db.exec(&j.conn, "BEGIN IMMEDIATE") or_return
+	defer if err != nil { _ = db.rollback(&j.conn) }
 
-// schema_migrate brings the database up to SCHEMA_VERSION, creating the schema
-// when the database is empty. The version it reads and every statement it runs
-// are in one immediate transaction, so two processes opening the same database
-// cannot both migrate it: the second waits for the write lock and then sees the
-// work already done.
-@(private)
-schema_migrate :: proc(j: ^Journal) -> Error {
-	if err := db.exec(&j.conn, "BEGIN IMMEDIATE"); err != nil { return err }
-	committed := false
-	defer if !committed { _ = db.rollback(&j.conn) }
-
-	version, version_err := schema_read_version(j)
-	if version_err != nil { return version_err }
+	version := schema_version(j) or_return
 	if version > SCHEMA_VERSION { return Journal_Error.Schema_Too_New }
 	if version == 0 {
-		empty, empty_err := schema_is_empty(j)
-		if empty_err != nil { return empty_err }
-		if !empty { return Journal_Error.Schema_Unknown }
+		// Tables without a version belong to someone else.
+		tables := query_int(j, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'", nil) or_return
+		if tables != 0 { return Journal_Error.Schema_Unknown }
+		for statement in MIGRATION_1 { db.exec(&j.conn, statement) or_return }
+		db.exec(&j.conn, fmt.tprintf("PRAGMA user_version = %d", SCHEMA_VERSION)) or_return
 	}
-
-	for from := version; from < SCHEMA_VERSION; from += 1 {
-		statements := migration_statements(from + 1)
-		if statements == nil { return Journal_Error.Schema_Unknown }
-		for statement in statements {
-			if err := db.exec(&j.conn, statement); err != nil { return err }
-		}
-		// The version is stamped in the same transaction as the statements it
-		// describes, so a failure leaves the database at the version it started
-		// from rather than at one whose statements did not all land.
-		if err := db.exec(&j.conn, fmt.tprintf("PRAGMA user_version = %d", from + 1)); err != nil { return err }
-	}
-
-	if err := db.commit(&j.conn); err != nil { return err }
-	committed = true
-	return nil
+	return db.commit(&j.conn)
 }
 
-// schema_read_version is the version stamped in the database, 0 when nothing
-// has been written there yet.
 @(private)
-schema_read_version :: proc(j: ^Journal) -> (int, Error) {
-	rows: db.Rows
-	if err := db.query(&j.conn, &rows, "PRAGMA user_version"); err != nil { return 0, err }
-	defer db.rows_close(&rows)
-
-	values, has_row, next_err := db.rows_next(&rows)
-	if next_err != nil { return 0, next_err }
-	if !has_row { return 0, Journal_Error.Corrupt }
-	version, convert_err := db.as_i64(values[0])
-	if convert_err != nil { return 0, convert_err }
-	return int(version), nil
-}
-
-// schema_is_empty reports whether the database holds no table of its own. A
-// database with tables and no version is someone else's, and migrating it would
-// mean adding tables to a file this package does not own.
-@(private)
-schema_is_empty :: proc(j: ^Journal) -> (bool, Error) {
-	query := "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-	rows: db.Rows
-	if err := db.query(&j.conn, &rows, query); err != nil { return false, err }
-	defer db.rows_close(&rows)
-
-	values, has_row, next_err := db.rows_next(&rows)
-	if next_err != nil { return false, next_err }
-	if !has_row { return true, nil }
-	count, convert_err := db.as_i64(values[0])
-	if convert_err != nil { return false, convert_err }
-	return count == 0, nil
+schema_version :: proc(j: ^Journal) -> (int, Error) {
+	version, err := query_int(j, "PRAGMA user_version", nil)
+	return int(version), err
 }

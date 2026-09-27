@@ -2,13 +2,9 @@ package journal
 
 import "core:crypto"
 
-// The identities of section 5. They are declared here, in the innermost package
-// that stores them, so the harness and the journal agree on one definition.
-//
-// Zero means absent for every one of them, and an absent id is stored as SQL
-// NULL. A session, a run, and a subagent are 16 bytes; the rest are counters,
-// allocated by the journal (branch, node) or by the harness (turn, request,
-// call, job). A digest is the 32 bytes of a SHA-256.
+// The identities of section 5 of the architecture. Zero means absent for every
+// one of them and is stored as SQL NULL. Branch and node ids are allocated by
+// the journal; turn, request, call, and job ids by the harness.
 Run_Id :: distinct [16]u8
 Session_Id :: distinct [16]u8
 Branch_Id :: distinct u32
@@ -20,106 +16,75 @@ Attempt_No :: distinct u8
 Job_Id :: distinct u64
 Call_Id :: distinct u64
 
-// Digest is the SHA-256 of one artifact's bytes. An artifact is stored under
-// it, so the bytes and the name they are read back by cannot drift apart.
+// Digest is the SHA-256 an artifact is stored under.
 Digest :: distinct [32]u8
 
-// SESSION_ID_HEX_LENGTH is how many characters a session or run id takes in
-// lowercase hexadecimal.
-SESSION_ID_HEX_LENGTH :: 32
+SESSION_ID_HEX_LENGTH :: 2 * size_of(Session_Id)
+DIGEST_HEX_LENGTH :: 2 * size_of(Digest)
 
-// DIGEST_HEX_LENGTH is how many characters a digest takes in lowercase
-// hexadecimal.
-DIGEST_HEX_LENGTH :: 64
-
-// session_id_create returns a fresh session id from the operating system's
-// entropy source. Randomness is what makes the id unique without a lookup and
-// unguessable enough to name a lock file, and two processes started at the same
-// moment must not produce the same one. A failed read returns the absent id,
-// which create_session refuses.
-session_id_create :: proc() -> Session_Id {
-	bytes: [16]u8
-	crypto.rand_bytes(bytes[:])
-	return Session_Id(bytes)
+// session_id_create returns a random id from the operating system's entropy
+// source, so ids from concurrent processes never collide.
+session_id_create :: proc() -> (id: Session_Id) {
+	crypto.rand_bytes(id[:])
+	return
 }
 
-// run_id_create returns a fresh run id, one per process run.
-run_id_create :: proc() -> Run_Id {
-	bytes: [16]u8
-	crypto.rand_bytes(bytes[:])
-	return Run_Id(bytes)
+run_id_create :: proc() -> (id: Run_Id) {
+	crypto.rand_bytes(id[:])
+	return
 }
 
-// session_id_to_hex writes the 32 lowercase hexadecimal characters of id into
-// buffer, which must hold at least SESSION_ID_HEX_LENGTH bytes, and returns
-// them. The result aliases buffer.
+// session_id_to_hex writes id as lowercase hexadecimal into buffer, which holds
+// at least SESSION_ID_HEX_LENGTH bytes. The result aliases buffer.
 session_id_to_hex :: proc(id: Session_Id, buffer: []u8) -> string {
-	assert(len(buffer) >= SESSION_ID_HEX_LENGTH, "the id buffer is too small")
-	for byte, i in id {
-		buffer[i * 2] = hex_character(byte >> 4)
-		buffer[i * 2 + 1] = hex_character(byte & 0x0f)
-	}
-	return string(buffer[:SESSION_ID_HEX_LENGTH])
+	bytes := id
+	return hex_encode(bytes[:], buffer)
 }
 
-// session_id_parse reads a session id from its hexadecimal form. Anything but
-// exactly 32 lowercase hexadecimal characters is refused.
-session_id_parse :: proc(text: string) -> (Session_Id, bool) {
-	if len(text) != SESSION_ID_HEX_LENGTH { return Session_Id{}, false }
-	bytes: [16]u8
-	for i in 0 ..< 16 {
-		high, high_ok := hex_digit(text[i * 2])
-		low, low_ok := hex_digit(text[i * 2 + 1])
-		if !high_ok || !low_ok { return Session_Id{}, false }
-		bytes[i] = high << 4 | low
-	}
-	return Session_Id(bytes), true
+session_id_parse :: proc(text: string) -> (id: Session_Id, ok: bool) {
+	if !hex_decode(text, id[:]) { return {}, false }
+	return id, true
 }
 
-// session_id_is_absent reports whether no session is named.
-session_id_is_absent :: proc(id: Session_Id) -> bool {
-	return id == Session_Id{}
-}
-
-// run_id_is_absent reports whether no run is named.
-run_id_is_absent :: proc(id: Run_Id) -> bool {
-	return id == Run_Id{}
-}
-
-// digest_to_hex writes the 64 lowercase hexadecimal characters of digest into
-// buffer, which must hold at least DIGEST_HEX_LENGTH bytes, and returns them.
-// The result aliases buffer.
+// digest_to_hex writes digest as lowercase hexadecimal into buffer, which holds
+// at least DIGEST_HEX_LENGTH bytes. The result aliases buffer.
 digest_to_hex :: proc(digest: Digest, buffer: []u8) -> string {
-	assert(len(buffer) >= DIGEST_HEX_LENGTH, "the digest buffer is too small")
-	for byte, i in digest {
-		buffer[i * 2] = hex_character(byte >> 4)
-		buffer[i * 2 + 1] = hex_character(byte & 0x0f)
-	}
-	return string(buffer[:DIGEST_HEX_LENGTH])
+	bytes := digest
+	return hex_encode(bytes[:], buffer)
 }
 
-// digest_from_hex reads a digest from its hexadecimal form. Anything but
-// exactly 64 lowercase hexadecimal characters is refused.
-digest_from_hex :: proc(text: string) -> (Digest, bool) {
-	if len(text) != DIGEST_HEX_LENGTH { return Digest{}, false }
-	bytes: [32]u8
-	for i in 0 ..< 32 {
-		high, high_ok := hex_digit(text[i * 2])
-		low, low_ok := hex_digit(text[i * 2 + 1])
-		if !high_ok || !low_ok { return Digest{}, false }
-		bytes[i] = high << 4 | low
-	}
-	return Digest(bytes), true
-}
-
-// hex_character is the lowercase hexadecimal character of a nibble.
-@(private)
-hex_character :: proc(nibble: u8) -> u8 {
-	return nibble < 10 ? '0' + nibble : 'a' + (nibble - 10)
+digest_from_hex :: proc(text: string) -> (digest: Digest, ok: bool) {
+	if !hex_decode(text, digest[:]) { return {}, false }
+	return digest, true
 }
 
 @(private)
-hex_digit :: proc(character: u8) -> (u8, bool) {
+HEX_DIGITS := "0123456789abcdef"
+
+@(private)
+hex_encode :: proc(bytes: []u8, buffer: []u8) -> string {
+	assert(len(buffer) >= 2 * len(bytes))
+	for byte, i in bytes {
+		buffer[2 * i] = HEX_DIGITS[byte >> 4]
+		buffer[2 * i + 1] = HEX_DIGITS[byte & 0x0f]
+	}
+	return string(buffer[:2 * len(bytes)])
+}
+
+// hex_decode accepts exactly 2 * len(out) lowercase hexadecimal characters.
+@(private)
+hex_decode :: proc(text: string, out: []u8) -> bool {
+	if len(text) != 2 * len(out) { return false }
+	for i in 0 ..< len(out) {
+		high := hex_value(text[2 * i]) or_return
+		low := hex_value(text[2 * i + 1]) or_return
+		out[i] = high << 4 | low
+	}
+	return true
+}
+
+@(private)
+hex_value :: proc(character: u8) -> (u8, bool) {
 	switch character {
 	case '0' ..= '9':
 		return character - '0', true
