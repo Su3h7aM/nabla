@@ -17,6 +17,7 @@ import "core:crypto/legacy/sha1"
 import "core:encoding/base64"
 import "core:fmt"
 import "core:mem"
+import "core:nbio"
 import "core:net"
 import "core:strings"
 import "core:testing"
@@ -44,7 +45,7 @@ test_websocket_live_peer_upgrade_and_violations :: proc(t: ^testing.T) {
 	defer delete(state.buffer)
 
 	peer: Peer
-	if !testing.expect(t, peer_start(&peer), "the peer could not be started") { return }
+	if !testing.expect(t, peer_start(&peer, SCRIPT), "the peer could not be started") { return }
 	defer peer_destroy(&peer)
 
 	echo_run_message_cases(&state, peer.port)
@@ -179,6 +180,66 @@ echo_run_protocol_violation_case :: proc(state: ^Echo_State, port: int, what: st
 	}
 }
 
+// Handoff carries a connection from the thread that dials it to the test thread. The
+// dialing thread writes it and the test reads it only after the join.
+Handoff :: struct {
+	state:   ^Echo_State,
+	port:    int,
+	conn:    ^Conn,
+	failure: Dial_Failure,
+}
+
+// A connection opened on one thread is used from another that has never run an event
+// loop, which is how a session-owned WebSocket reaches each request's thread. The
+// dial runs on a helper thread and the reads and writes run here, on the runner's
+// test thread: a fault on this thread is reported as this test's failure, where one
+// on a helper thread would leave the test waiting on a join that never returns.
+@(test)
+test_websocket_used_from_a_thread_that_did_not_dial :: proc(t: ^testing.T) {
+	state := Echo_State {
+		t = t,
+	}
+	state.buffer = make([]u8, PEER_BUFFER, context.allocator)
+	defer delete(state.buffer)
+
+	peer: Peer
+	if !testing.expect(t, peer_start(&peer, HANDOFF_SCRIPT), "the peer could not be started") { return }
+	defer peer_destroy(&peer)
+
+	handoff := Handoff {
+		state = &state,
+		port  = peer.port,
+	}
+	dialer := thread.create(echo_handoff_dial, name = "nabla-websocket-dialer")
+	if !testing.expect(t, dialer != nil, "the dialing thread could not be created") { return }
+	dialer.data = &handoff
+	thread.start(dialer)
+	// The dial is bounded by the case deadline its probe reads, so this join is too.
+	thread.join(dialer)
+	thread.destroy(dialer)
+	if !testing.expect_value(t, handoff.failure.kind, Dial_Error.None) {
+		dial_failure_destroy(&handoff.failure, context.allocator)
+		return
+	}
+	conn := handoff.conn
+	defer destroy(conn)
+
+	testing.expect(t, nbio.current_thread_event_loop() == nil, "the test thread already runs an event loop, so this proves nothing")
+	echo_send(&state, conn, .Text, "echo")
+	echo_expect_message(&state, conn, .Text, "echo")
+	closing: [128]u8
+	testing.expect_value(t, close(conn, .Normal, "", closing[:]), Error.None)
+
+	peer_wait(&peer)
+	testing.expect(t, peer_saw(&peer, "the client closed with 1000"), "the connection did not close in order")
+}
+
+@(private)
+echo_handoff_dial :: proc(dialer: ^thread.Thread) {
+	handoff := cast(^Handoff)dialer.data
+	handoff.conn, handoff.failure = echo_open(handoff.state, handoff.port, "/")
+}
+
 echo_send :: proc(state: ^Echo_State, conn: ^Conn, opcode: Opcode, message: string) {
 	t := state.t
 	testing.expect_value(t, write(conn, opcode, transmute([]u8)message), Error.None)
@@ -196,6 +257,8 @@ echo_receive :: proc(state: ^Echo_State, conn: ^Conn, opcode: Opcode) -> (messag
 	t := state.t
 	length := 0
 	for {
+		// A read into no room returns nothing and never completes the message.
+		if !testing.expect(t, length < len(state.buffer), "the message does not fit the case buffer") { return "", false }
 		count, frame_opcode, complete, err := read(conn, state.buffer[length:])
 		if !testing.expect_value(t, err, Error.None) { return "", false }
 		if !testing.expect_value(t, frame_opcode, opcode) { return "", false }
@@ -239,11 +302,16 @@ Case :: enum {
 
 SCRIPT :: []Case{.Messages, .Immediate, .Rejected_Key, .Masked_Frame, .Oversized_Control}
 
+// HANDOFF_SCRIPT is one message conversation, for the connection that changes threads.
+HANDOFF_SCRIPT :: []Case{.Messages}
+
 Peer :: struct {
 	listener:  net.TCP_Socket,
 	started:   bool,
 	port:      int,
 	thread:    ^thread.Thread,
+	// script is the case each accepted connection is served by, in order.
+	script:    []Case,
 	buffer:    []u8,
 	// findings is what the peer saw, in order. It is read after the thread has been
 	// joined, so the two threads never touch it at once.
@@ -251,10 +319,11 @@ Peer :: struct {
 	allocator: mem.Allocator,
 }
 
-peer_start :: proc(peer: ^Peer, allocator := context.allocator) -> bool {
+peer_start :: proc(peer: ^Peer, script: []Case, allocator := context.allocator) -> bool {
 	peer.allocator = allocator
+	peer.script = script
 	peer.buffer = make([]u8, PEER_BUFFER, allocator)
-	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, len(SCRIPT))
+	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, len(script))
 	if listen_err != nil { return false }
 	endpoint, endpoint_err := net.bound_endpoint(listener)
 	if endpoint_err != nil {
@@ -307,7 +376,7 @@ peer_note :: proc(peer: ^Peer, text: string) {
 @(private)
 peer_serve :: proc(thread: ^thread.Thread) {
 	peer := cast(^Peer)thread.data
-	for scripted in SCRIPT {
+	for scripted in peer.script {
 		socket, _, accept_err := net.accept_tcp(peer.listener)
 		if accept_err != nil {
 			peer_note(peer, "the peer could not accept the next case")

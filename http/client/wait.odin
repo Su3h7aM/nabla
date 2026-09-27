@@ -23,6 +23,13 @@ import "core:time"
 // Neither choice is cheaper than the other: nbio.send and nbio.recv copy a
 // multi-buffer operation's slice into the loop's allocator, but a single buffer,
 // which is all this transport submits, is held inline and does not allocate.
+//
+// core:nbio keeps one event loop per thread, and a connection can outlive the
+// thread that opened it: an upgraded connection is read by whichever thread holds
+// it next. Each wait therefore acquires the calling thread's own loop for as long
+// as it runs. The acquisition is reference counted, so a request that already
+// holds the loop pays only for a count; a thread that holds none gets a loop for
+// this wait and releases it afterwards.
 
 // WAIT_SLICE bounds one tick of the event loop, and so bounds how long a request
 // can go without the caller's probe being asked whether to stop.
@@ -71,6 +78,11 @@ A zero socket means the attempt failed on its own; a stop means the probe ended
 it, and the operation was cancelled rather than left to run on.
 */
 wait_connected :: proc(endpoint: net.Endpoint, probe: Probe) -> (socket: net.TCP_Socket, stop: Transport_Stop) {
+	// Without a loop the attempt cannot be made, which the caller reads as a
+	// connect that failed on its own.
+	if nbio.acquire_thread_event_loop() != nil { return 0, .None }
+	defer nbio.release_thread_event_loop()
+
 	state: Connect_State
 	op := nbio.dial_poly(endpoint, &state, on_connect_ready)
 
@@ -118,6 +130,8 @@ A connection whose probe is empty does blocking I/O and never waits here.
 */
 wait_ready :: proc(socket: net.Any_Socket, kind: Ready_For, probe: Probe, timeout: time.Duration = 0) -> (result: Wait_Result, stop: Transport_Stop) {
 	if probe.check == nil { return .Ready, .None }
+	if nbio.acquire_thread_event_loop() != nil { return .Failed, .Failed }
+	defer nbio.release_thread_event_loop()
 
 	event := nbio.Poll_Event.Receive
 	if kind == .Write { event = nbio.Poll_Event.Send }

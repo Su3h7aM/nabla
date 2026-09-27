@@ -41,8 +41,7 @@ dial_first :: proc(endpoints: []net.Endpoint, options: Options, allocator: mem.A
 }
 
 // connection_dial returns nil on failure, so a caller never owns a half-built
-// connection. It waits on the calling thread's core:nbio event loop, which the
-// caller must have acquired.
+// connection. It waits on the calling thread's core:nbio event loop.
 //
 // The probe decides which connect core offers. Waiting for a connect and asking
 // the probe whether to stop at the same time needs an event loop, so a probe

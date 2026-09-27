@@ -178,9 +178,8 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 
 // event_loop_acquire brackets a request with the calling thread's event loop,
 // which owns readiness for both the socket and the resolver's. The caller releases
-// it, except when the request ends in an upgraded connection: that connection's
-// holder waits on the loop for as long as the connection lives, so the acquisition
-// passes to it.
+// it when the request returns, including one that ends in an upgraded connection:
+// that connection's later waits acquire the loop of whichever thread performs them.
 event_loop_acquire :: proc(allocator: mem.Allocator) -> Failure {
 	if nbio.acquire_thread_event_loop() != nil {
 		return failure_from_error(.None, allocator, .Transport, "the event loop could not be started")

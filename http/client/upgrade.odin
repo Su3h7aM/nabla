@@ -8,8 +8,13 @@ import "nabla:http"
 
 // Upgraded is a connection whose HTTP exchange ended with the peer taking it over,
 // which a 101 response states (RFC 9110 15.2.2). A caller reads and writes the
-// protocol it upgraded to through this handle: the handle owns the connection, the
-// response head, and the event loop the exchange began on.
+// protocol it upgraded to through this handle: the handle owns the connection and
+// the response head.
+//
+// The handle is bound to no thread. One thread at a time may use it, and each read
+// or write waits on that thread's own event loop. A holder that reads or writes
+// repeatedly from a thread with no loop of its own acquires one around the whole
+// exchange, so each wait does not start and stop a loop.
 Upgraded :: struct {
 	connection: ^Connection,
 	// pending holds the octets already read past the response head, which are the
@@ -42,9 +47,7 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 	}
 
 	if loop_failure := event_loop_acquire(request.allocator); loop_failure.kind != .None { return nil, loop_failure }
-	// Failure releases the loop; success leaves the acquisition with the handle.
-	released := false
-	defer if !released { nbio.release_thread_event_loop() }
+	defer nbio.release_thread_event_loop()
 
 	connection, send_failure := request_send(request, options, &phase, &summary)
 	if send_failure.kind != .None { return nil, send_failure }
@@ -91,7 +94,6 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 
 	summary.request_complete = true
 	phase = .Complete
-	released = true
 	return handle, {}
 }
 
@@ -127,8 +129,5 @@ upgraded_release :: proc(upgraded: ^Upgraded, aborted: bool) {
 	http.headers_destroy(&upgraded.headers)
 	if aborted { connection_abort(upgraded.connection) } else { connection_destroy(upgraded.connection) }
 	allocator := upgraded.allocator
-	// The loop was acquired for the upgraded connection as much as for the request
-	// that opened it, so it is released once the connection is gone.
-	nbio.release_thread_event_loop()
 	free(upgraded, allocator)
 }

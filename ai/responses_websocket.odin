@@ -1,6 +1,7 @@
 package ai
 
 import "core:mem"
+import "core:nbio"
 import "core:strings"
 
 import "nabla:http/client"
@@ -126,6 +127,12 @@ Provider_WebSocket_Request :: proc(
 		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("invalid Responses WebSocket request", session_allocator(session))}
 	}
 	allocator := session.allocator
+	// The session may be used from a different thread on every operation, and each wait on
+	// its socket runs on the calling thread's event loop. Holding that loop for the whole
+	// operation keeps every wait from starting and stopping one of its own. A loop that
+	// cannot start is not fatal here: each wait then reports its own failure.
+	loop_held := nbio.acquire_thread_event_loop() == nil
+	defer if loop_held { nbio.release_thread_event_loop() }
 	if connect_err := Provider_WebSocket_Connect(session, encoded, options); connect_err.kind != .None {
 		return connect_err
 	}
