@@ -253,9 +253,9 @@ test_a_repaired_call_is_replayed_as_what_ran :: proc(t: ^testing.T) {
 	chat.tools_enabled = true
 	_test_accept(t, chat, "repaired call")
 
-	// A raw newline inside the command string: the repair escapes it, so the
-	// proposal and what ran are different bytes.
-	_test_stage_call(t, chat, "call_fix", "{\"command\":\"echo hello\n\",\"working_directory\":null,\"timeout_ms\":null}")
+	// A raw newline inside the command string and a timeout written as a string: the repairs
+	// escape one and write the other as an integer, so the proposal and what ran differ.
+	_test_stage_call(t, chat, "call_fix", "{\"command\":\"echo hello\n\",\"working_directory\":null,\"timeout_ms\":\"5000\"}")
 	count := chat_run_tools(chat, {})
 	testing.expect_value(t, count, 1)
 	testing.expect(t, chat_session_tools_done(chat, chat.active_turn_id, count))
@@ -270,6 +270,7 @@ test_a_repaired_call_is_replayed_as_what_ran :: proc(t: ^testing.T) {
 			seen = true
 			testing.expect(t, !strings.contains(call.Arguments, "\n"), "the repair is what the provider is told")
 			testing.expect(t, strings.contains(call.Arguments, "echo hello"), "the command survives the repair")
+			testing.expect(t, strings.contains(call.Arguments, `"timeout_ms":5000`), call.Arguments)
 		}
 	}
 	testing.expect(t, seen, "a repaired call is still replayed as a call")

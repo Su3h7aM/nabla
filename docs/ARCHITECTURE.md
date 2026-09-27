@@ -710,20 +710,27 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 
 ## 15. Deterministic repair
 
-Repairs run only after a validation failure and only from a closed set. Each application commits `tool.repaired{kind, before_digest, after_digest}`; each failure commits `tool.validation_failed{field, reason}`.
+A call the model got slightly wrong is repaired whenever its intent has exactly one reading, and refused only when it has none or more than one. Repair is part of admission, not a per-tool feature: every call, whether from the provider, a Lua script, a Task, or MCP, passes through the same two places, so a new tool gets every repair by using the shared readers.
+
+- Document repairs, in `tool_arguments_prepare`, run on the argument text before it is admitted: empty or `null` arguments are the empty object; a raw control byte inside a string literal is its escape; a document that is one JSON string whose content is an object is that object. A Lua table always writes a well-formed document, so these only ever change provider text.
+- Value repairs, in the shared field readers, run while a tool reads its declared fields, because only the reader knows the declared type: an integer field accepts a whole number within 2^53 and a string holding exactly one decimal integer (optional leading minus, no leading zero, nothing else). The reader writes the integer back into the document.
 
 ```odin
-Repair_Kind :: enum u8 {
-	Control_Bytes_In_String,   // raw control bytes inside a JSON string literal become escapes
-	Double_Encoded_Object,     // schema expects an object; value is a string holding exactly one valid object
-	Numeric_String,            // field marked coercible; string is an exact integer or finite number
-	Line_Endings,              // write or patch text normalized to the target file's line-ending convention
-	Patch_Whitespace,          // hunk matches exactly one location when whitespace around its lines is ignored
-	Patch_Loose_Format,        // patch departs from the format in a way with one reading (section 16)
+Tool_Repair :: enum {
+	Escaped_Control_Characters,
+	Empty_Arguments,
+	Double_Encoded_Object,
+	Integer_From_String,
+	Integer_From_Float,
 }
+Tool_Repairs :: bit_set[Tool_Repair]
 ```
 
-A repair is valid only if exactly one interpretation exists, the result passes full revalidation, and policy and hooks then run on the repaired value. Never: invent a missing argument, pick a file, map an unknown tool name to a similar one, change a value that looks wrong, or bypass validation. JSON syntax repair applies only to provider JSON; Lua values are never repaired.
+The set of repairs a call needed is committed with `tool.admitted` beside the effective arguments (today the dispatch record carries both), and each application is also observed as `tool.repaired`. When a value repair rewrote the document, the effective arguments are the document written again from the repaired value with sorted keys. Projection replays the effective arguments, so the model sees the corrected form. A repaired value then passes full validation, and policy and hooks run on it. A new repair joins the enum only if its input has one reading and every other input is still refused with its own defect.
+
+Content repairs belong to the tool that knows the content, because they depend on the target file, and they are reported in that tool's output: a patch hunk that matches exactly one location when surrounding whitespace is ignored (section 16). Normalizing line endings to the target file's convention and reading loose patch formatting with one reading are content repairs of the same kind that do not exist yet.
+
+Never: invent a missing argument, drop or rename an unknown field, pick a file, map an unknown tool name to a similar one, change a value that looks wrong, choose between two values of a repeated field, or bypass validation.
 
 ## 16. Patch contract
 

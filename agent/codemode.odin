@@ -57,7 +57,15 @@ tool_codemode_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Codem
 	if known_error := tool_fields_known(arguments, TOOL_CODEMODE_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
 	code, code_error := tool_field_string(arguments, "code", allocator = ctx.allocator)
 	if code_error.kind != .None { return {}, code_error }
-	timeout_ms, timeout_error := tool_field_optional_int(arguments, "timeout_ms", 0, 1, int(max(time.Duration) / time.Millisecond), allocator = ctx.allocator)
+	timeout_ms, timeout_error := tool_field_optional_int(
+		arguments,
+		"timeout_ms",
+		0,
+		1,
+		int(max(time.Duration) / time.Millisecond),
+		&ctx.repairs,
+		allocator = ctx.allocator,
+	)
 	if timeout_error.kind != .None { return {}, timeout_error }
 	return {code = code, timeout = time.Duration(timeout_ms) * time.Millisecond}, {}
 }

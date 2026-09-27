@@ -177,7 +177,7 @@ test_a_tool_call_is_recorded_from_call_to_result :: proc(t: ^testing.T) {
 	// The call is followed by its own id, and the dispatch and the result name the
 	// entries they were stored as.
 	testing.expect(t, strings.contains(text, `"call_id":"call_1"`), "every tool record carries the call")
-	testing.expect(t, strings.contains(text, `"repair":"none"`), "the admission says nothing was repaired")
+	testing.expect(t, strings.contains(text, `"repairs":""`), "the admission says nothing was repaired")
 	testing.expect(t, strings.contains(text, `"outcome":"success"`), "the execution outcome is named")
 	testing.expect(t, strings.contains(text, `"result_seq":`), "the result names the entry it was stored as")
 }

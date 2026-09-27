@@ -85,6 +85,9 @@ Tool_Context :: struct {
 	// lives for the whole batch, so every call in one turn can read what an earlier
 	// call kept. Nil means results cannot be read here.
 	results:        ^Result_Reader,
+	// repairs collects what reading the arguments changed in their values, which the owner
+	// records with the call and writes back into the arguments the call runs with.
+	repairs:        session.Tool_Repairs,
 }
 
 // Tool_Execute runs one admitted call. Returning .Invalid_Arguments promises the

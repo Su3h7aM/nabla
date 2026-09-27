@@ -2,6 +2,7 @@ package agent
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:math"
 import "core:mem"
 import "core:strings"
 
@@ -17,6 +18,10 @@ import "nabla:agent/session"
 // the stack before any later check could refuse it. It is the parser's bound, not
 // a bound on what the model may say.
 TOOL_MAX_ARGS_DEPTH :: 32
+
+// TOOL_EXACT_FLOAT_INTEGER is the largest magnitude at which every integer has its own f64,
+// so a whole float within it names exactly one integer and one beyond it may not.
+TOOL_EXACT_FLOAT_INTEGER :: 1 << 53
 
 // A tool argument defect. field is the JSON pointer path of the argument the
 // defect is about, and expected names the constraint that was not met: the
@@ -134,17 +139,17 @@ Tool_Arguments_Status :: enum {
 	None,
 	Rejected,
 	Valid,
-	Repaired,
 }
 
 // Tool_Arguments is the outcome of admitting one proposed argument document.
-// value owns the parsed object, effective owns the bytes the call runs with, and
-// error owns the refusal when the status is Rejected.
+// value owns the parsed object, effective owns the bytes the call runs with, repairs
+// names every change of representation made to reach them, and error owns the refusal
+// when the status is Rejected.
 Tool_Arguments :: struct {
 	status:            Tool_Arguments_Status,
 	value:             json.Value,
 	effective:         string,
-	repair:            session.Tool_Repair,
+	repairs:           session.Tool_Repairs,
 	error:             Tool_Argument_Error,
 	allocation_failed: bool,
 }
@@ -156,60 +161,92 @@ tool_arguments_destroy :: proc(arguments: ^Tool_Arguments, allocator := context.
 	arguments^ = {}
 }
 
-// tool_arguments_prepare admits a proposed argument document, repairing it only when the
-// repair is forced, and reads the repaired form in full before anything runs. Nothing but raw
-// control bytes inside a string literal is ever rewritten, and no value is ever invented.
+// tool_arguments_prepare admits a proposed argument document and reads it in full before
+// anything runs. A document is repaired only where it has exactly one reading: empty or null
+// arguments are the empty object, a raw control byte inside a string literal is its escape,
+// and a JSON string whose content is one object is that object. No value is ever invented,
+// and a document that still does not admit is refused with its own defect.
 tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (arguments: Tool_Arguments) {
 	// Every way out of here either says the document is valid or names the defect that refused
 	// it, so the status is never left to mean two things.
 	arguments.status = .Rejected
-	if raw == "" {
-		arguments.error = tool_argument_error(.Syntax, allocator = allocator)
-		return
+	document := raw
+	repairs: session.Tool_Repairs
+	// Each repair that rewrites the text leaves its result here, released on the way out.
+	rewritten: [3]string
+	defer for text in rewritten { delete(text, allocator) }
+
+	trimmed := strings.trim_space(raw)
+	if trimmed == "" || trimmed == "null" {
+		document = "{}"
+		repairs += {.Empty_Arguments}
+	}
+	if escaped, changed := tool_arguments_escape_control_chars(document, allocator); changed {
+		rewritten[0], document = escaped, escaped
+		repairs += {.Escaped_Control_Characters}
+	}
+	if inner, is_string := tool_arguments_string_document(document, allocator); is_string {
+		rewritten[1], document = inner, inner
+		repairs += {.Double_Encoded_Object}
+		// Unquoting turns an escaped newline back into a raw one, which inside the inner
+		// document's own string literals is again a control byte with one reading.
+		if escaped, changed := tool_arguments_escape_control_chars(document, allocator); changed {
+			rewritten[2], document = escaped, escaped
+			repairs += {.Escaped_Control_Characters}
+		}
 	}
 
-	admit_error := tool_arguments_admit(raw, allocator)
-	if admit_error.kind == .None {
-		value, parse_err := json.parse_string(raw, .JSON, true, allocator)
-		if parse_err == nil {
-			effective, clone_err := strings.clone(raw, allocator)
-			if clone_err != nil {
-				json.destroy_value(value, allocator)
-				arguments.allocation_failed = true
-				return
-			}
-			arguments.status = .Valid
-			arguments.value = value
-			arguments.effective = effective
-			return
-		}
+	if admit_error := tool_arguments_admit(document, allocator); admit_error.kind != .None {
+		arguments.error = admit_error
+		return
+	}
+	value, parse_err := json.parse_string(document, .JSON, true, allocator)
+	if parse_err != nil {
 		// Admission guarantees the parser accepts the document, so this is unreachable in
 		// practice; refusing is the only safe answer.
+		json.destroy_value(value, allocator)
 		arguments.error = tool_argument_error(.Syntax, allocator = allocator)
 		return
 	}
-
-	repaired, changed := tool_arguments_escape_control_chars(raw, allocator)
-	if !changed {
-		arguments.error = admit_error
+	effective, clone_err := strings.clone(document, allocator)
+	if clone_err != nil {
+		json.destroy_value(value, allocator)
+		arguments.allocation_failed = true
 		return
 	}
-	if repair_error := tool_arguments_admit(repaired, allocator); repair_error.kind != .None {
-		delete(repaired, allocator)
-		arguments.error = admit_error
-		return
-	}
-	value, parse_err := json.parse_string(repaired, .JSON, true, allocator)
-	if parse_err != nil {
-		delete(repaired, allocator)
-		arguments.error = admit_error
-		return
-	}
-	arguments.status = .Repaired
-	arguments.repair = .Escaped_Control_Characters
+	arguments.status = .Valid
 	arguments.value = value
-	arguments.effective = repaired
+	arguments.effective = effective
+	arguments.repairs = repairs
 	return
+}
+
+// tool_arguments_string_document returns the content of a document that is one JSON string
+// holding what begins as an object, owned by allocator. Any other document is not one.
+@(private)
+tool_arguments_string_document :: proc(document: string, allocator: mem.Allocator) -> (inner: string, is_string: bool) {
+	tokenizer := json.make_tokenizer(document, .JSON, true)
+	token, token_err := json.get_token(&tokenizer)
+	if token_err != nil || token.kind != .String { return "", false }
+	end, end_err := json.get_token(&tokenizer)
+	if (end_err != nil && end_err != .EOF) || end.kind != .EOF { return "", false }
+	text, unquote_err := json.unquote_string(token, .JSON, allocator)
+	if unquote_err != nil { return "", false }
+	if !strings.has_prefix(strings.trim_left_space(text), "{") {
+		delete(text, allocator)
+		return "", false
+	}
+	return text, true
+}
+
+// tool_repairs_text names a set of repairs in declaration order, joined by commas.
+tool_repairs_text :: proc(repairs: session.Tool_Repairs, allocator := context.allocator) -> string {
+	builder := strings.builder_make(allocator)
+	for repair in repairs {
+		if strings.builder_len(builder) > 0 { strings.write_string(&builder, ", ") }
+		strings.write_string(&builder, session.tool_repair_name(repair))
+	}
+	return strings.to_string(builder)
 }
 
 // tool_arguments_admit reports the first structural defect in a proposed
@@ -443,39 +480,96 @@ tool_field_optional_string :: proc(object: json.Object, name: string, path := ""
 	return "", tool_argument_error(.Wrong_Type, tool_field_path(path, name), "a string or null", allocator = allocator)
 }
 
-tool_field_int :: proc(object: json.Object, name: string, minimum, maximum: int, path := "", allocator := context.allocator) -> (int, Tool_Argument_Error) {
-	value, present := object[name]
-	if !present { return 0, tool_argument_error(.Missing_Field, tool_field_path(path, name), allocator = allocator) }
-	return tool_field_int_value(value, tool_field_path(path, name), minimum, maximum, allocator)
-}
-
-tool_field_optional_int :: proc(
+// The integer readers take the object's own slot, because a repaired value is written back
+// into the document so the recorded arguments say what ran. The repair is added to repairs.
+tool_field_int :: proc(
 	object: json.Object,
 	name: string,
-	fallback, minimum, maximum: int,
+	minimum, maximum: int,
+	repairs: ^session.Tool_Repairs,
 	path := "",
 	allocator := context.allocator,
 ) -> (
 	int,
 	Tool_Argument_Error,
 ) {
-	value, present := object[name]
+	object := object
+	slot, present := &object[name]
+	if !present { return 0, tool_argument_error(.Missing_Field, tool_field_path(path, name), allocator = allocator) }
+	return tool_field_int_value(slot, tool_field_path(path, name), minimum, maximum, repairs, allocator)
+}
+
+tool_field_optional_int :: proc(
+	object: json.Object,
+	name: string,
+	fallback, minimum, maximum: int,
+	repairs: ^session.Tool_Repairs,
+	path := "",
+	allocator := context.allocator,
+) -> (
+	int,
+	Tool_Argument_Error,
+) {
+	object := object
+	slot, present := &object[name]
 	if !present { return fallback, {} }
-	if _, is_null := value.(json.Null); is_null { return fallback, {} }
-	return tool_field_int_value(value, tool_field_path(path, name), minimum, maximum, allocator)
+	if _, is_null := slot.(json.Null); is_null { return fallback, {} }
+	return tool_field_int_value(slot, tool_field_path(path, name), minimum, maximum, repairs, allocator)
 }
 
 @(private)
-tool_field_int_value :: proc(value: json.Value, path: string, minimum, maximum: int, allocator: mem.Allocator) -> (int, Tool_Argument_Error) {
+tool_field_int_value :: proc(
+	slot: ^json.Value,
+	path: string,
+	minimum, maximum: int,
+	repairs: ^session.Tool_Repairs,
+	allocator: mem.Allocator,
+) -> (
+	int,
+	Tool_Argument_Error,
+) {
 	expected := tool_int_expected(minimum, maximum, allocator)
 	defer delete(expected, allocator)
-	integer, is_integer := value.(json.Integer)
-	if !is_integer { return 0, tool_argument_error(.Wrong_Type, path, expected, allocator = allocator) }
-	number := int(integer)
+	number, repair, readable := tool_integer_reading(slot^)
+	if !readable { return 0, tool_argument_error(.Wrong_Type, path, expected, allocator = allocator) }
 	if number < minimum || number > maximum {
 		return 0, tool_argument_error(.Invalid_Value, path, expected, allocator = allocator)
 	}
+	if repair, repaired := repair.?; repaired {
+		json.destroy_value(slot^, allocator)
+		slot^ = json.Integer(number)
+		repairs^ += {repair}
+	}
 	return number, {}
+}
+
+// tool_integer_reading reads a value as the one integer it names: an integer, a whole number
+// small enough to name one integer, or a string holding exactly one integer in decimal with
+// no sign other than a leading minus, no leading zero, and nothing around it. repair names
+// the change when the value was not already an integer.
+@(private)
+tool_integer_reading :: proc(value: json.Value) -> (number: int, repair: Maybe(session.Tool_Repair), readable: bool) {
+	#partial switch v in value {
+	case json.Integer:
+		return int(v), nil, true
+	case json.Float:
+		if math.trunc(v) != v || abs(v) > TOOL_EXACT_FLOAT_INTEGER { return 0, nil, false }
+		return int(v), .Integer_From_Float, true
+	case json.String:
+		text := string(v)
+		digits := strings.trim_prefix(text, "-")
+		if digits == "" || (len(digits) > 1 && digits[0] == '0') { return 0, nil, false }
+		for digit in transmute([]u8)digits {
+			if digit < '0' || digit > '9' { return 0, nil, false }
+			place := int(digit - '0')
+			// A number past the int range names no value this reader can hold.
+			if number > (max(int) - place) / 10 { return 0, nil, false }
+			number = number * 10 + place
+		}
+		if len(digits) < len(text) { number = -number }
+		return number, .Integer_From_String, true
+	}
+	return 0, nil, false
 }
 
 // tool_field_array reads a required array field and returns its elements.

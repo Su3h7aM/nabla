@@ -118,27 +118,70 @@ test_admission_bounds_nesting :: proc(t: ^testing.T) {
 	testing.expect_value(t, arguments.error.kind, Tool_Argument_Error_Kind.Too_Deep)
 }
 
-// A raw control byte inside a string literal is the one defect the harness
-// repairs, and the repaired document is read in full before anything runs.
+// A document is repaired only where it has one reading, and the repaired document is read
+// in full before anything runs. Everything else is refused with its own defect.
 @(test)
-test_admission_repairs_control_bytes_only :: proc(t: ^testing.T) {
-	arguments := tool_arguments_prepare("{\"command\":\"printf a\nb\"}", context.allocator)
-	defer tool_arguments_destroy(&arguments, context.allocator)
-	if !testing.expect_value(t, arguments.status, Tool_Arguments_Status.Repaired) { return }
-	testing.expect_value(t, arguments.repair, session.Tool_Repair.Escaped_Control_Characters)
-
-	object, is_object := arguments.value.(json.Object)
-	if !testing.expect(t, is_object, "the repaired document is an object") { return }
-	command, command_error := tool_field_string(object, "command", allocator = context.allocator)
-	defer tool_argument_error_destroy(&command_error, context.allocator)
-	if !testing.expect_value(t, command_error.kind, Tool_Argument_Error_Kind.None) { return }
-	testing.expect_value(t, command, "printf a\nb")
-
-	refused := []string{`{"command":"a\qb"}`, `{"command":.}`, `{"command":"a","command":"b"}`}
-	for raw in refused {
-		arguments := tool_arguments_prepare(raw, context.allocator)
+test_admission_repairs_only_what_has_one_reading :: proc(t: ^testing.T) {
+	repaired := []struct {
+		raw:       string,
+		effective: string,
+		repairs:   session.Tool_Repairs,
+	} {
+		{"{\"command\":\"printf a\nb\"}", `{"command":"printf a\nb"}`, {.Escaped_Control_Characters}},
+		{"", `{}`, {.Empty_Arguments}},
+		{" null ", `{}`, {.Empty_Arguments}},
+		{`"{\"command\":\"echo\"}"`, `{"command":"echo"}`, {.Double_Encoded_Object}},
+		{`"{\"command\":\"a\nb\"}"`, `{"command":"a\nb"}`, {.Double_Encoded_Object, .Escaped_Control_Characters}},
+	}
+	for c in repaired {
+		arguments := tool_arguments_prepare(c.raw, context.allocator)
 		defer tool_arguments_destroy(&arguments, context.allocator)
-		testing.expectf(t, arguments.status == .Rejected, "%s must not be repaired", raw)
+		testing.expectf(t, arguments.status == .Valid, "%q was read as %v", c.raw, arguments.status)
+		testing.expect_value(t, arguments.effective, c.effective)
+		testing.expect_value(t, arguments.repairs, c.repairs)
+	}
+
+	refused := []struct {
+		raw:  string,
+		kind: Tool_Argument_Error_Kind,
+	} {
+		{`{"command":"a\qb"}`, .Syntax},
+		{`{"command":.}`, .Syntax},
+		{`{"command":"a","command":"b"}`, .Duplicate_Field},
+		{`"echo"`, .Not_Object},
+		{`"{\"command\":\"echo\""`, .Syntax},
+	}
+	for c in refused {
+		arguments := tool_arguments_prepare(c.raw, context.allocator)
+		defer tool_arguments_destroy(&arguments, context.allocator)
+		testing.expectf(t, arguments.error.kind == c.kind, "%s reported %v", c.raw, arguments.error.kind)
+	}
+}
+
+// An integer field reads an integer written as a whole number or as a decimal string, writes
+// the integer back into the document, and refuses any other reading.
+@(test)
+test_integer_fields_repair_one_reading :: proc(t: ^testing.T) {
+	arguments := tool_arguments_prepare(`{"path":"notes.txt","offset":"5","limit":2.0}`, context.allocator)
+	defer tool_arguments_destroy(&arguments, context.allocator)
+	ctx := Tool_Context {
+		allocator = context.allocator,
+	}
+	args, args_error := tool_args_decode(&ctx, .Read, arguments.value.(json.Object))
+	if !testing.expect_value(t, args_error.kind, Tool_Argument_Error_Kind.None) { return }
+	testing.expect_value(t, args.(Read_Args).offset, 5)
+	testing.expect_value(t, args.(Read_Args).limit, 2)
+	testing.expect_value(t, ctx.repairs, session.Tool_Repairs{.Integer_From_String, .Integer_From_Float})
+	testing.expect_value(t, arguments.value.(json.Object)["offset"].(json.Integer), 5)
+
+	for raw in ([]string{`"05"`, `"5 "`, `"+5"`, `"5.0"`, `"99999999999999999999"`, `2.5`, `1e300`, `true`}) {
+		document := strings.concatenate({`{"path":"notes.txt","offset":`, raw, "}"}, context.temp_allocator)
+		arguments := tool_arguments_prepare(document, context.allocator)
+		defer tool_arguments_destroy(&arguments, context.allocator)
+		if !testing.expect_value(t, arguments.status, Tool_Arguments_Status.Valid) { continue }
+		_, refused := tool_args_decode(&ctx, .Read, arguments.value.(json.Object))
+		defer tool_argument_error_destroy(&refused, context.allocator)
+		testing.expectf(t, refused.kind == .Wrong_Type, "%s was read as an integer", raw)
 	}
 }
 

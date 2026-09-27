@@ -388,10 +388,11 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	// A provider call is admitted here, from the text it arrived as. A Lua child call arrives
 	// admitted, because its value came from Lua and was checked where it was read.
 	if job.admitted.status == .None { job.admitted = tool_arguments_prepare(job.call.arguments, job.allocator) }
+	repairs_text := tool_repairs_text(job.admitted.repairs, context.temp_allocator)
 	prepared := [4]Log_Field {
 		{key = "tool", value = job.name},
 		{key = "status", value = tool_arguments_status_name(job.admitted.status)},
-		{key = "repair", value = session.tool_repair_name(job.admitted.repair)},
+		{key = "repairs", value = repairs_text},
 		{key = "effective_bytes", value = i64(len(job.admitted.effective))},
 	}
 	log_emit({level = .Debug, category = .Tool, event = "tool.arguments_prepared", fields = prepared[:]})
@@ -408,9 +409,6 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		job.phase = .Result_Ready
 		return
 	}
-	if job.admitted.repair != .None {
-		_observer_message(observer, .Notice, "a tool call was repaired before it ran: a raw control character was escaped")
-	}
 	if _, is_object := job.admitted.value.(json.Object); !is_object {
 		job.result = tool_result_failure(&job.exec, .Invalid_Arguments, "the arguments are not a JSON object", "invalid arguments")
 		job.result_present = true
@@ -425,6 +423,24 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		job.result_present = true
 		job.phase = .Result_Ready
 		return
+	}
+	if job.exec.repairs != {} {
+		// A field was rewritten while it was read, so the recorded arguments are written
+		// again from the value, in key order, to say what the call runs with.
+		effective, marshal_error := json.marshal(job.admitted.value, {sort_maps_by_key = true}, job.allocator)
+		if marshal_error != nil {
+			job.result = tool_result_failure(&job.exec, .Tool_Failed, "the repaired tool arguments could not be written", "allocation failed")
+			job.result_present = true
+			job.phase = .Result_Ready
+			return
+		}
+		delete(job.admitted.effective, job.allocator)
+		job.admitted.effective = string(effective)
+		job.admitted.repairs += job.exec.repairs
+	}
+	if job.admitted.repairs != {} {
+		notice := fmt.tprintf("a tool call was repaired before it ran: %s", tool_repairs_text(job.admitted.repairs, context.temp_allocator))
+		_observer_message(observer, .Notice, notice)
 	}
 	// What the call runs with is the text the dispatch record holds, so an executor
 	// that forwards the call cannot send something other than what was recorded.
@@ -657,7 +673,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		request_no = chat.active_request,
 		created_at_ms = session.now_ms(),
 		related_seq = job.call.seq,
-		payload = session.Tool_Dispatch_Entry{tool = job.name, arguments = job.admitted.effective, repair = job.admitted.repair},
+		payload = session.Tool_Dispatch_Entry{tool = job.name, arguments = job.admitted.effective, repairs = job.admitted.repairs},
 	}
 	dispatch_seq, dispatch_error := session.entry_append(chat.store, chat.id, dispatch)
 	if dispatch_error != nil {

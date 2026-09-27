@@ -90,30 +90,43 @@ user_origin_from_name :: proc(name: string) -> (User_Origin, bool) {
 	return .Prompt, false
 }
 
-// Tool_Repair is what the harness had to change to make a proposed call usable.
-// It is recorded beside the arguments the call actually ran with, so a reader can
-// tell a repaired call from an untouched one without diffing the proposal. None
-// means nothing was changed.
+// Tool_Repair is one change of representation the harness made to a proposed call so it
+// could be read. A call's repairs are recorded as a set beside the arguments it actually ran
+// with, so a reader can tell a repaired call from an untouched one without diffing the
+// proposal. An empty set means nothing was changed.
 Tool_Repair :: enum {
-	None,
+	// A raw control byte inside a string literal was written as its escape.
 	Escaped_Control_Characters,
+	// Empty or null arguments were read as the empty object.
+	Empty_Arguments,
+	// The arguments were a JSON string holding one object, which was read as that object.
+	Double_Encoded_Object,
+	// An integer field held a string of exactly one integer in decimal.
+	Integer_From_String,
+	// An integer field held a number with no fractional part.
+	Integer_From_Float,
 }
+
+Tool_Repairs :: bit_set[Tool_Repair]
 
 @(private)
 tool_repair_names := [Tool_Repair]string {
-	.None                       = "none",
 	.Escaped_Control_Characters = "escaped_control_characters",
+	.Empty_Arguments            = "empty_arguments",
+	.Double_Encoded_Object      = "double_encoded_object",
+	.Integer_From_String        = "integer_from_string",
+	.Integer_From_Float         = "integer_from_float",
 }
 
 tool_repair_name :: proc(repair: Tool_Repair) -> string {
 	return tool_repair_names[repair]
 }
 
-tool_repair_from_name :: proc(name: string) -> (Tool_Repair, bool) {
-	for repair in Tool_Repair {
-		if tool_repair_names[repair] == name { return repair, true }
+tool_repair_from_name :: proc(name: string) -> (repair: Tool_Repair, known: bool) {
+	for candidate in Tool_Repair {
+		if tool_repair_names[candidate] == name { return candidate, true }
 	}
-	return .None, false
+	return
 }
 
 // Tool_Outcome is what the harness observed when it handled a tool call. It is
@@ -300,12 +313,12 @@ Tool_Call_Entry :: struct {
 // Tool_Dispatch_Entry is the harness committing to run a call. It is written
 // before the external work begins, so a dispatch with no result means the
 // outcome is unknown rather than "did not run". arguments is the argument JSON
-// the call actually ran with, and repair names what had to change for it to be
+// the call actually ran with, and repairs names what had to change for it to be
 // usable, if anything.
 Tool_Dispatch_Entry :: struct {
 	tool:      string,
 	arguments: string,
-	repair:    Tool_Repair,
+	repairs:   Tool_Repairs,
 }
 
 // Tool_Result_Entry is what the harness observed, together with the exact text

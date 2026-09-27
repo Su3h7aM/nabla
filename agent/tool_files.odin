@@ -39,9 +39,9 @@ tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Read_Args
 	if known_error := tool_fields_known(arguments, TOOL_READ_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
 	path, path_error := tool_field_string(arguments, "path", allocator = ctx.allocator)
 	if path_error.kind != .None { return {}, path_error }
-	offset, offset_error := tool_field_optional_int(arguments, "offset", 1, 1, TOOL_READ_MAX_LINES, allocator = ctx.allocator)
+	offset, offset_error := tool_field_optional_int(arguments, "offset", 1, 1, TOOL_READ_MAX_LINES, &ctx.repairs, allocator = ctx.allocator)
 	if offset_error.kind != .None { return {}, offset_error }
-	limit, limit_error := tool_field_optional_int(arguments, "limit", TOOL_READ_DEFAULT_LINES, 1, TOOL_READ_MAX_LINES, allocator = ctx.allocator)
+	limit, limit_error := tool_field_optional_int(arguments, "limit", TOOL_READ_DEFAULT_LINES, 1, TOOL_READ_MAX_LINES, &ctx.repairs, allocator = ctx.allocator)
 	if limit_error.kind != .None { return {}, limit_error }
 	return Read_Args{path = path, offset = offset, limit = limit}, {}
 }

@@ -39,11 +39,19 @@ TOOL_RESULT_READ_FIELDS := []string{"call_seq", "offset", "limit"}
 @(private)
 tool_result_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Result_Read_Args, Tool_Argument_Error) {
 	if known_error := tool_fields_known(arguments, TOOL_RESULT_READ_FIELDS, allocator = ctx.allocator); known_error.kind != .None { return {}, known_error }
-	call_seq, call_seq_error := tool_field_int(arguments, "call_seq", 1, max(int), allocator = ctx.allocator)
+	call_seq, call_seq_error := tool_field_int(arguments, "call_seq", 1, max(int), &ctx.repairs, allocator = ctx.allocator)
 	if call_seq_error.kind != .None { return {}, call_seq_error }
-	offset, offset_error := tool_field_optional_int(arguments, "offset", 0, 0, max(int), allocator = ctx.allocator)
+	offset, offset_error := tool_field_optional_int(arguments, "offset", 0, 0, max(int), &ctx.repairs, allocator = ctx.allocator)
 	if offset_error.kind != .None { return {}, offset_error }
-	limit, limit_error := tool_field_optional_int(arguments, "limit", TOOL_RESULT_READ_MAX_BYTES, 1, TOOL_RESULT_READ_MAX_BYTES, allocator = ctx.allocator)
+	limit, limit_error := tool_field_optional_int(
+		arguments,
+		"limit",
+		TOOL_RESULT_READ_MAX_BYTES,
+		1,
+		TOOL_RESULT_READ_MAX_BYTES,
+		&ctx.repairs,
+		allocator = ctx.allocator,
+	)
 	if limit_error.kind != .None { return {}, limit_error }
 	return Result_Read_Args{call_seq = call_seq, offset = offset, limit = limit}, {}
 }

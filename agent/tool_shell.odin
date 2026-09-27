@@ -81,6 +81,7 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Shell_Ar
 		int(ctx.timeout / time.Millisecond),
 		1,
 		int(max(time.Duration) / time.Millisecond),
+		&ctx.repairs,
 		allocator = ctx.allocator,
 	)
 	if timeout_error.kind != .None { return {}, timeout_error }

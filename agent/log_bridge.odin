@@ -224,8 +224,6 @@ tool_arguments_status_name :: proc(status: Tool_Arguments_Status) -> string {
 		return "none"
 	case .Valid:
 		return "valid"
-	case .Repaired:
-		return "repaired"
 	case .Rejected:
 		return "rejected"
 	}

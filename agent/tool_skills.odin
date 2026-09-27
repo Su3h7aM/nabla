@@ -45,9 +45,17 @@ tool_list_skills_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (Li
 	}
 	query, query_error := tool_field_optional_string(arguments, "query", allocator = ctx.allocator)
 	if query_error.kind != .None { return {}, query_error }
-	offset, offset_error := tool_field_optional_int(arguments, "offset", 0, 0, max(int) / 2, allocator = ctx.allocator)
+	offset, offset_error := tool_field_optional_int(arguments, "offset", 0, 0, max(int) / 2, &ctx.repairs, allocator = ctx.allocator)
 	if offset_error.kind != .None { return {}, offset_error }
-	limit, limit_error := tool_field_optional_int(arguments, "limit", TOOL_LIST_SKILLS_DEFAULT_LIMIT, 1, TOOL_LIST_SKILLS_MAX_LIMIT, allocator = ctx.allocator)
+	limit, limit_error := tool_field_optional_int(
+		arguments,
+		"limit",
+		TOOL_LIST_SKILLS_DEFAULT_LIMIT,
+		1,
+		TOOL_LIST_SKILLS_MAX_LIMIT,
+		&ctx.repairs,
+		allocator = ctx.allocator,
+	)
 	if limit_error.kind != .None { return {}, limit_error }
 	return {query = query, offset = offset, limit = limit}, {}
 }
