@@ -515,12 +515,7 @@ report_recovery :: proc(recovery: session.Recovery) {
 		fmt.eprintf("nabla: %d tool call(s) were recorded and never ran; their results say so\n", recovery.unexecuted_calls)
 	}
 }
-// provider_usable reports whether a provider can serve a request at all: an
-// endpoint, an api family, and a credential source. The model menu offers only
-// usable providers' models.
-provider_usable :: proc(provider: ^agent.Catalog_Provider) -> bool {
-	return provider.base_url_present && provider.base_url != "" && provider.api_present && provider.api != "" && provider.api_key_present
-}
+provider_usable :: agent.provider_usable
 
 // provider_configured reports whether the user's own configuration named the
 // provider; models.dev contributes providers the user never set up, and their
@@ -600,51 +595,22 @@ app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
 // the next launch restores it. A failure is reported through the snapshot; the
 // previously selected model, if any, stays in place.
 apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announce := true) -> bool {
+	// The catalog entry is copied out while it is the published one: a refresh releases the
+	// catalog it lives in, and the connection built from it outlives that moment.
 	sync.mutex_lock(&app.catalog_mu)
-	defer sync.mutex_unlock(&app.catalog_mu)
-	provider_index, provider_found := agent.catalog_find_provider(&app.setup.catalog, provider_id)
-	if !provider_found {
-		selection_fail(app, fmt.tprintf("provider not found: %s", provider_id))
+	resolved, problem := agent.model_selection_resolve(&app.setup.catalog, provider_id, model_id, app.run.alloc)
+	sync.mutex_unlock(&app.catalog_mu)
+	if problem != "" {
+		selection_fail(app, problem)
 		return false
 	}
-	provider := &app.setup.catalog.providers[provider_index]
-	if !provider_usable(provider) {
-		selection_fail(app, fmt.tprintf("provider %s needs base_url, api, and api_key", provider_id))
-		return false
-	}
-	credential, credential_ok := agent.config_resolve_credential(provider.api_key, app.setup.alloc)
-	if !credential_ok {
-		selection_fail(app, fmt.tprintf("provider %s needs api_key: name an environment variable that is set, or provide the key", provider_id))
-		return false
-	}
-	model_index, model_found := agent.catalog_find_model(&app.setup.catalog, provider_id, model_id)
-	if !model_found {
-		delete(credential, app.setup.alloc)
-		selection_fail(app, fmt.tprintf("model not found for provider: %s %s", provider_id, model_id))
-		return false
-	}
-	model := &app.setup.catalog.models[model_index]
-	// Routing is per model: a model that states its own API family is served
-	// through it, and the provider's family is what its other models use.
-	api_name := provider.api
-	if model.api_present { api_name = model.api }
-	api, api_ok := agent.chat_api_kind(api_name)
-	if !api_ok {
-		delete(credential, app.setup.alloc)
-		selection_fail(app, fmt.tprintf("unsupported api: %s", api_name))
-		return false
-	}
-	// A transport the selected API adapter does not implement is refused here, where the
-	// user can still choose another model, rather than mid-turn.
-	if provider.transport == .WebSocket && .WebSocket not_in ai.Provider_API_Transports(api) {
-		delete(credential, app.setup.alloc)
-		selection_fail(app, fmt.tprintf("provider %s requires WebSocket, which the %s API has no transport for", provider_id, api_name))
-		return false
-	}
+	defer agent.model_selection_destroy(&resolved, app.run.alloc)
+	api := resolved.connection.API
 
 	running := &app.setup.session
 	selection_changed := app.setup.provider_id != provider_id || app.setup.model_id != model_id
-	connection_changed := app.run.connection.API != api || app.run.connection.Endpoint != provider.base_url || running.provider_transport != provider.transport
+	connection_changed :=
+		app.run.connection.API != api || app.run.connection.Endpoint != resolved.connection.Endpoint || running.provider_transport != resolved.transport
 	// A different model invalidates a pending summary. A metadata-only refresh of
 	// the same model does not: it updates the facts used by the next request while
 	// preserving compaction already in flight.
@@ -653,42 +619,19 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 		ai.Provider_WebSocket_Session_Destroy(running.provider_websocket)
 		running.provider_websocket = nil
 	}
-	running.provider_transport = provider.transport
-	running.websocket_fallback_http = false
-	// The resolved model carries its own context budget, so the session copies that
-	// rather than a window and an output bound to divide again later.
-	running.capacity = model.capacity
 	running.last_estimate = 0
 	running.last_input_measured = nil
-	running.tools_enabled = (model.tools_present && model.tools) && agent.chat_supports_tools(api)
-	// The request record names the provider and model each request was sent to,
-	// so the running session carries them.
-	delete(running.provider_id, running.allocator)
-	running.provider_id = strings.clone(provider_id, running.allocator)
-	delete(running.model_id, running.allocator)
-	running.model_id = strings.clone(model_id, running.allocator)
 	// The level to carry over: an explicit one, or the one already in effect, which
-	// a model switch keeps whenever the new model allows it. It may alias the
-	// session's stored effort, which rebuilding the level list replaces, so it is
-	// copied before the session is touched.
+	// a model switch keeps whenever the new model allows it. It may alias the session's
+	// stored effort, which selecting replaces, so it is copied first.
 	desired := effort
 	if desired == "" { desired = running.effort }
 	carried := strings.clone(desired, app.setup.alloc)
 	defer delete(carried, app.setup.alloc)
-	agent.chat_session_set_effort(running, "")
-	for level in running.effort_levels {
-		delete(level, running.allocator)
-	}
-	clear(&running.effort_levels)
-	if model.thinking.levels_present {
-		for level in model.thinking.levels {
-			append(&running.effort_levels, strings.clone(level, running.allocator))
-		}
-	}
 	// A carried level the new model does not allow falls back to the lowest level
 	// the model does state, so a switch never leaves an effort it cannot serve.
 	// With nothing to carry, the provider default stands.
-	if carried != "" && !agent.chat_session_set_effort(running, carried) && len(running.effort_levels) > 0 {
+	if !agent.chat_session_select(running, resolved, carried) && len(running.effort_levels) > 0 {
 		agent.chat_session_set_effort(running, running.effort_levels[0])
 	}
 
@@ -697,10 +640,8 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 	// the old values are released.
 	setup_provider := strings.clone(provider_id, app.setup.alloc)
 	setup_model := strings.clone(model_id, app.setup.alloc)
-	// The endpoint is copied out of the catalog while it is still the published one:
-	// the catalog this entry lives in is released when a refresh replaces it, and
-	// the connection that borrows this string outlives that moment.
-	setup_endpoint := strings.clone(provider.base_url, app.run.alloc)
+	setup_endpoint := strings.clone(resolved.connection.Endpoint, app.run.alloc)
+	credential := strings.clone(resolved.connection.Credential, app.setup.alloc)
 
 	sync.mutex_lock(&app.run.mu)
 	delete(app.setup.credential, app.setup.alloc)

@@ -57,7 +57,7 @@ menu_rebuild_model :: proc(app: ^App) {
 	defer delete(models)
 	sync.mutex_lock(&app.catalog_mu)
 	for &provider in app.setup.catalog.providers {
-		if !provider_usable(&provider) || !provider_configured(app, provider.id) { continue }
+		if !agent.provider_usable(&provider) || !provider_configured(app, provider.id) { continue }
 		for &model in app.setup.catalog.models {
 			if model.provider_id != provider.id { continue }
 			// The names are copied while the lock is held: a publication releases the
