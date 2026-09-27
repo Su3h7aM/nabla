@@ -36,6 +36,7 @@ Session :: struct {
 	provider:       string, // owned; the last provider used, "" when none
 	model:          string, // owned; the last model used, "" when none
 	archived_at_ms: Maybe(i64),
+	parent:         Session_Id, // owned; the session that started this subagent session, "" for a main session
 }
 
 session_destroy :: proc(session: ^Session, allocator := context.allocator) {
@@ -45,6 +46,7 @@ session_destroy :: proc(session: ^Session, allocator := context.allocator) {
 	delete(session.title, allocator)
 	delete(session.provider, allocator)
 	delete(session.model, allocator)
+	delete(string(session.parent), allocator)
 	session^ = {}
 }
 
@@ -61,6 +63,7 @@ Create_Options :: struct {
 	title:     string,
 	provider:  string,
 	model:     string,
+	parent:    Session_Id,
 }
 
 // Session_Cursor is where a session listing stopped. id is borrowed and only

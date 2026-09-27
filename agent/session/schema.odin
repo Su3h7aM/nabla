@@ -7,7 +7,7 @@ import "nabla:db"
 // SCHEMA_VERSION is the version this package writes. A database at a higher
 // version was written by newer code, and this package refuses it rather than
 // risk losing columns it does not know about.
-SCHEMA_VERSION :: 5
+SCHEMA_VERSION :: 6
 
 // The schema is deliberately small. Identity, order, ownership, and
 // correlation are columns, because those are the relationships the database has
@@ -232,9 +232,16 @@ migration_statements :: proc(version: int) -> []string {
 		return MIGRATION_4[:]
 	case 5:
 		return MIGRATION_5[:]
+	case 6:
+		return MIGRATION_6[:]
 	}
 	return nil
 }
+
+// MIGRATION_6 records which session started a subagent session. A session with a parent is
+// a subagent's, so listings of sessions a person resumes leave it out.
+@(private)
+MIGRATION_6 := [?]string{`ALTER TABLE sessions ADD COLUMN parent_id TEXT CHECK (parent_id IS NULL OR length(parent_id) = 32)`}
 
 // schema_migrate brings the database up to SCHEMA_VERSION, creating the schema
 // when the database is empty. The version it read and every statement it runs

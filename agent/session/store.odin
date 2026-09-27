@@ -335,6 +335,7 @@ session_create :: proc(store: ^Store, options: Create_Options, at_ms: i64, alloc
 		title         = strings.clone(options.title, allocator),
 		provider      = strings.clone(options.provider, allocator),
 		model         = strings.clone(options.model, allocator),
+		parent        = Session_Id(strings.clone(string(options.parent), allocator)),
 	}
 	if session.id == "" { return {}, error_make(.Storage, "a session id could not be created") }
 	if record_err := session_record(store, session); record_err != nil {
@@ -360,7 +361,10 @@ session_record :: proc(store: ^Store, session: Session) -> Error {
 	if session.updated_at_ms < session.created_at_ms {
 		return error_make(.Invalid_Argument, "a session cannot record activity before it was created")
 	}
+	if session.parent != "" && !session_id_valid(session.parent) { return error_make(.Invalid_Argument, "the parent session id is not a valid id") }
 
+	parent := db.Value(nil)
+	if session.parent != "" { parent = db.Value(string(session.parent)) }
 	args := [?]db.Value {
 		db.Value(string(session.id)),
 		db.Value(session.created_at_ms),
@@ -370,6 +374,7 @@ session_record :: proc(store: ^Store, session: Session) -> Error {
 		db.Value(session.provider),
 		db.Value(session.model),
 		db.Value(nil),
+		parent,
 	}
 	if err := db.exec(&store.conn, SESSION_INSERT_IF_ABSENT, args[:]); err != nil {
 		return storage_error("record the session", err)
@@ -406,7 +411,10 @@ session_list :: proc(store: ^Store, options: List_Options, allocator := context.
 	// The filter is assembled rather than parameterized with flags, because a
 	// flag turns an index-usable predicate into one the planner cannot use.
 	builder := strings.builder_make(context.temp_allocator)
+	// A subagent's session belongs to the session that started it, so it is never listed
+	// as one to resume.
 	strings.write_string(&builder, SESSION_SELECT_LIST)
+	strings.write_string(&builder, " AND parent_id IS NULL")
 	args := make([dynamic]db.Value, 0, 6, context.temp_allocator)
 
 	if !options.include_archived {
@@ -603,7 +611,7 @@ session_delete :: proc(store: ^Store, id: Session_Id) -> Error {
 // --- rows -------------------------------------------------------------------
 
 @(private)
-SESSION_INSERT :: `INSERT INTO sessions (id, created_at_ms, updated_at_ms, workspace, title, provider, model, archived_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+SESSION_INSERT :: `INSERT INTO sessions (id, created_at_ms, updated_at_ms, workspace, title, provider, model, archived_at_ms, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // A session that already has a row keeps it: the header a later write brings
 // describes the same session rather than a new one.
@@ -611,7 +619,7 @@ SESSION_INSERT :: `INSERT INTO sessions (id, created_at_ms, updated_at_ms, works
 SESSION_INSERT_IF_ABSENT :: SESSION_INSERT + ` ON CONFLICT (id) DO NOTHING`
 
 @(private)
-SESSION_COLUMNS :: `id, created_at_ms, updated_at_ms, workspace, title, provider, model, archived_at_ms`
+SESSION_COLUMNS :: `id, created_at_ms, updated_at_ms, workspace, title, provider, model, archived_at_ms, parent_id`
 
 @(private)
 SESSION_SELECT_ONE :: `SELECT ` + SESSION_COLUMNS + ` FROM sessions WHERE id = ?`
@@ -647,6 +655,12 @@ session_scan :: proc(values: []db.Value, allocator: mem.Allocator) -> (session: 
 	if model_err != nil { return {}, corrupt_error("read session model", model_err) }
 	archived_at_ms, archived_err := read_optional_i64(values[7])
 	if archived_err != nil { return {}, corrupt_error("read session archive time", archived_err) }
+	parent := ""
+	if values[8] != nil {
+		parent_err: db.Error
+		parent, parent_err = db.as_string(values[8])
+		if parent_err != nil { return {}, corrupt_error("read session parent", parent_err) }
+	}
 
 	session = Session {
 		id             = Session_Id(strings.clone(id, allocator)),
@@ -657,6 +671,7 @@ session_scan :: proc(values: []db.Value, allocator: mem.Allocator) -> (session: 
 		provider       = strings.clone(provider, allocator),
 		model          = strings.clone(model, allocator),
 		archived_at_ms = archived_at_ms,
+		parent         = Session_Id(strings.clone(parent, allocator)),
 	}
 	complete = true
 	return session, nil

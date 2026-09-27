@@ -70,6 +70,9 @@ User_Origin :: enum {
 	Prompt,
 	Steering,
 	Harness,
+	// Agent is a message another agent sent: a subagent's report to its orchestrator, or the
+	// orchestrator's steering of a subagent.
+	Agent,
 }
 
 @(private)
@@ -77,6 +80,7 @@ user_origin_names := [User_Origin]string {
 	.Prompt   = "prompt",
 	.Steering = "steering",
 	.Harness  = "harness",
+	.Agent    = "agent",
 }
 
 user_origin_name :: proc(origin: User_Origin) -> string {
