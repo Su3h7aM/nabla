@@ -336,6 +336,10 @@ Statistics :: struct {
 	declarations:     u64,
 }
 
+// MAX_DEPTH is the deepest tree a frame can hold: Node_Flags records a node's
+// depth in twelve bits.
+MAX_DEPTH :: 1 << 12
+
 Capacities :: struct {
 	nodes, children, clips, commands, text_lines, overlays:    int,
 	measure_cache, id_table, depth, diagnostics, debug_labels: int,

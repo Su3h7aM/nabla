@@ -6,9 +6,6 @@ import "nabla:layout"
 import "nabla:term"
 import width_text "nabla:text"
 
-// MAX_SCOPE_DEPTH bounds the lexical render tree kept inline in Context.
-MAX_SCOPE_DEPTH :: 64
-
 Box :: enum u8 {
 	Outer,
 	Inner,
@@ -46,23 +43,31 @@ Frame :: struct {
 
 @(private)
 _Scope :: struct {
-	node:        layout.Node_Handle,
-	outer:       Cell_Rect,
-	inner:       Cell_Rect,
-	bounds:      Cell_Rect,
-	clip:        Cell_Rect,
-	frame_scope: bool,
+	node:   layout.Node_Handle,
+	outer:  Cell_Rect,
+	inner:  Cell_Rect,
+	bounds: Cell_Rect,
+	clip:   Cell_Rect,
 }
 
 // Context is a zero-initialized, allocation-free renderer for one frame at a
 // time. It borrows the layout result, cell storage, and every drawn grapheme
 // until result is consumed by term.present or the next frame begins.
+//
+// Only the active scope is kept. The scopes around it are the layout tree's
+// ancestors, so leaving an element resolves its parent again from the result,
+// and nesting is as deep as layout allows.
 Context :: struct {
 	_result:       layout.Frame_Result,
 	_buffer:       term.Frame_Buffer,
 	_cursor:       term.Cursor,
-	_scopes:       [MAX_SCOPE_DEPTH]_Scope,
-	_scope_count:  int,
+	_frame:        _Scope,
+	_current:      _Scope,
+	// _depth counts the element scopes open inside the frame scope.
+	_depth:        int,
+	// _inner records, for each open element from the outermost, whether it
+	// selected its inner box: the one fact the tree cannot give back.
+	_inner:        [layout.MAX_DEPTH / 8]u8,
 	_profile:      width_text.Width_Profile,
 	_error:        Frame_Error,
 	_frame_open:   bool,
@@ -94,7 +99,7 @@ frame :: proc(
 
 	ctx._result_ready = false
 	ctx._error = .None
-	ctx._scope_count = 0
+	ctx._depth = 0
 	if len(frame_result.nodes) == 0 || len(frame_result.clips) == 0 {
 		ctx._error = .Invalid_Layout_Result
 		return false
@@ -113,14 +118,13 @@ frame :: proc(
 	ctx._result = frame_result
 	ctx._cursor = {}
 	ctx._profile = profile
-	ctx._scopes[0] = _Scope {
-		outer       = viewport,
-		inner       = viewport,
-		bounds      = viewport,
-		clip        = clip,
-		frame_scope = true,
+	ctx._frame = _Scope {
+		outer  = viewport,
+		inner  = viewport,
+		bounds = viewport,
+		clip   = clip,
 	}
-	ctx._scope_count = 1
+	ctx._current = ctx._frame
 	ctx._frame_open = true
 	return true
 }
@@ -138,24 +142,17 @@ _frame_leave :: proc(
 	if !entered {
 		return
 	}
-	_ = frame_result
-	_ = storage
-	_ = base
-	_ = profile
-	_ = loc
-
-	balanced := ctx != nil && ctx._frame_open && ctx._scope_count == 1 && ctx._scopes[0].frame_scope
+	balanced := ctx != nil && ctx._frame_open && ctx._depth == 0
 	if !balanced {
 		if ctx != nil {
 			ctx._error = .Unbalanced_Scope
 			ctx._frame_open = false
 			ctx._result_ready = false
-			ctx._scope_count = 0
+			ctx._depth = 0
 		}
 		assert(false, "tui: unbalanced internal scope stack")
 		return
 	}
-	ctx._scope_count = 0
 	ctx._frame_open = false
 	ctx._result_ready = ctx._error == .None
 }
@@ -187,7 +184,7 @@ _element_enter :: proc(ctx: ^Context, handle: layout.Node_Handle, box: Box, loc:
 	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return false
 	}
-	if ctx._scope_count >= len(ctx._scopes) {
+	if ctx._depth >= layout.MAX_DEPTH {
 		ctx._error = .Scope_Exhausted
 		return false
 	}
@@ -196,82 +193,105 @@ _element_enter :: proc(ctx: ^Context, handle: layout.Node_Handle, box: Box, loc:
 		ctx._error = .Element_Not_Found
 		return false
 	}
-	parent := ctx._scopes[ctx._scope_count - 1]
-	if resolved.parent != parent.node {
+	if resolved.parent != ctx._current.node {
 		ctx._error = .Element_Outside_Scope
 		when ODIN_DEBUG {
 			assert(false, "tui: render scope does not match the layout tree", loc)
 		}
 		return false
 	}
-	outer, outer_error := project_rect_integral(resolved.outer)
-	inner, inner_error := project_rect_integral(resolved.inner)
-	clip, clip_error := project_rect_integral(layout.clip_of(ctx._result, resolved.clip).rect)
-	if outer_error != .None || inner_error != .None || clip_error != .None {
-		ctx._error = .Non_Integral_Geometry
+	scope, scope_error := _scope_of(ctx._result, handle, resolved, box)
+	if scope_error != .None {
+		ctx._error = scope_error
 		return false
 	}
-	bounds := outer
-	if box == .Inner {
-		bounds = inner
-	}
-	ctx._scopes[ctx._scope_count] = _Scope {
-		node   = handle,
-		outer  = outer,
-		inner  = inner,
-		bounds = bounds,
-		clip   = clip,
-	}
-	ctx._scope_count += 1
+	_set_inner(ctx, ctx._depth, box == .Inner)
+	ctx._depth += 1
+	ctx._current = scope
 	return true
 }
 
+// _scope_of projects a resolved node's boxes and clip to cells.
+@(private)
+_scope_of :: proc(result: layout.Frame_Result, handle: layout.Node_Handle, resolved: layout.Resolved_Node, box: Box) -> (_Scope, Frame_Error) {
+	outer, outer_error := project_rect_integral(resolved.outer)
+	inner, inner_error := project_rect_integral(resolved.inner)
+	clip, clip_error := project_rect_integral(layout.clip_of(result, resolved.clip).rect)
+	if outer_error != .None || inner_error != .None || clip_error != .None {
+		return {}, .Non_Integral_Geometry
+	}
+	return _Scope{node = handle, outer = outer, inner = inner, bounds = inner if box == .Inner else outer, clip = clip}, .None
+}
+
+@(private)
+_set_inner :: proc(ctx: ^Context, depth: int, inner: bool) {
+	mask := u8(1) << uint(depth % 8)
+	if inner {
+		ctx._inner[depth / 8] |= mask
+	} else {
+		ctx._inner[depth / 8] &~= mask
+	}
+}
+
+@(private)
+_is_inner :: proc(ctx: ^Context, depth: int) -> bool {
+	return ctx._inner[depth / 8] & (u8(1) << uint(depth % 8)) != 0
+}
+
+// _element_pop returns to the parent scope, resolved again from the layout
+// result with the box the parent selected.
 @(private)
 _element_pop :: proc(ctx: ^Context) {
-	if ctx == nil || !ctx._frame_open || ctx._scope_count <= 1 {
+	if ctx == nil || !ctx._frame_open || ctx._depth == 0 {
 		if ctx != nil {
 			ctx._error = .Unbalanced_Scope
 		}
 		assert(false, "tui: unbalanced internal element scope")
 		return
 	}
-	ctx._scope_count -= 1
+	ctx._depth -= 1
+	if ctx._depth == 0 {
+		ctx._current = ctx._frame
+		return
+	}
+	resolved, current_found := layout.node(ctx._result, ctx._current.node)
+	parent, found := layout.node(ctx._result, resolved.parent)
+	if !current_found || !found {
+		ctx._error = .Unbalanced_Scope
+		return
+	}
+	box := Box.Inner if _is_inner(ctx, ctx._depth - 1) else Box.Outer
+	scope, scope_error := _scope_of(ctx._result, resolved.parent, parent, box)
+	if scope_error != .None && ctx._error == .None {
+		ctx._error = scope_error
+	}
+	ctx._current = scope
 }
 
 @(private)
 _element_leave :: proc(ctx: ^Context, desc: Element_Desc, loc: runtime.Source_Code_Location, entered: bool) {
-	if !entered {
-		return
-	}
-	_ = desc
-	_ = loc
-	_element_pop(ctx)
+	if entered { _element_pop(ctx) }
 }
 
 @(private)
 _element_node_leave :: proc(ctx: ^Context, desc: Element_Node_Desc, loc: runtime.Source_Code_Location, entered: bool) {
-	if !entered {
-		return
-	}
-	_ = desc
-	_ = loc
-	_element_pop(ctx)
+	if entered { _element_pop(ctx) }
 }
 
 // current_node returns the active layout node. The frame root is handle zero.
 current_node :: proc(ctx: ^Context) -> (layout.Node_Handle, bool) #optional_ok {
-	if ctx == nil || !ctx._frame_open || ctx._scope_count == 0 {
+	if ctx == nil || !ctx._frame_open {
 		return 0, false
 	}
-	return ctx._scopes[ctx._scope_count - 1].node, true
+	return ctx._current.node, true
 }
 
 // bounds returns the active scope's selected box.
 bounds :: proc(ctx: ^Context) -> (Cell_Rect, bool) #optional_ok {
-	if ctx == nil || !ctx._frame_open || ctx._scope_count == 0 {
+	if ctx == nil || !ctx._frame_open {
 		return {}, false
 	}
-	return ctx._scopes[ctx._scope_count - 1].bounds, true
+	return ctx._current.bounds, true
 }
 
 // width_profile returns the width policy bound to the active frame.
@@ -284,10 +304,10 @@ width_profile :: proc(ctx: ^Context) -> (width_text.Width_Profile, bool) #option
 
 // boxes returns the active element's outer and inner boxes.
 boxes :: proc(ctx: ^Context) -> (outer, inner: Cell_Rect, ok: bool) {
-	if ctx == nil || !ctx._frame_open || ctx._scope_count == 0 {
+	if ctx == nil || !ctx._frame_open {
 		return {}, {}, false
 	}
-	scope := ctx._scopes[ctx._scope_count - 1]
+	scope := ctx._current
 	return scope.outer, scope.inner, true
 }
 
@@ -318,20 +338,20 @@ set_cursor :: proc(ctx: ^Context, cursor: term.Cursor) -> bool {
 }
 
 put_context :: proc(ctx: ^Context, x, y: int, grapheme: string, style: term.Style) -> bool {
-	if ctx == nil || !ctx._frame_open || ctx._error != .None || ctx._scope_count == 0 {
+	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return false
 	}
-	scope := ctx._scopes[ctx._scope_count - 1]
+	scope := ctx._current
 	return put_at(ctx, scope.bounds.x + x, scope.bounds.y + y, grapheme, style)
 }
 
 // put_at writes one grapheme at an absolute cell coordinate, clipped to the
 // active scope.
 put_at :: proc(ctx: ^Context, x, y: int, grapheme: string, style: term.Style) -> bool {
-	if ctx == nil || !ctx._frame_open || ctx._error != .None || ctx._scope_count == 0 {
+	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return false
 	}
-	scope := ctx._scopes[ctx._scope_count - 1]
+	scope := ctx._current
 	visible := _intersect_rect(scope.bounds, scope.clip)
 	width := width_text.cluster_width(grapheme, ctx._profile)
 	if width < 1 || x < visible.x || y < visible.y || x + width > _rect_end(visible.x, visible.width) || y >= _rect_end(visible.y, visible.height) {
@@ -341,34 +361,34 @@ put_at :: proc(ctx: ^Context, x, y: int, grapheme: string, style: term.Style) ->
 }
 
 fill_context :: proc(ctx: ^Context, grapheme: string, style: term.Style) -> int {
-	if ctx == nil || !ctx._frame_open || ctx._error != .None || ctx._scope_count == 0 {
+	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return 0
 	}
 	if width_text.cluster_width(grapheme, ctx._profile) != 1 {
 		return 0
 	}
-	scope := ctx._scopes[ctx._scope_count - 1]
+	scope := ctx._current
 	return _fill_clipped(&ctx._buffer, scope.bounds, scope.clip, grapheme, style)
 }
 
 // fill_at fills an absolute cell rectangle, clipped to the active scope.
 fill_at :: proc(ctx: ^Context, rect: Cell_Rect, grapheme: string, style: term.Style) -> int {
-	if ctx == nil || !ctx._frame_open || ctx._error != .None || ctx._scope_count == 0 {
+	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return 0
 	}
 	if width_text.cluster_width(grapheme, ctx._profile) != 1 {
 		return 0
 	}
-	scope := ctx._scopes[ctx._scope_count - 1]
+	scope := ctx._current
 	return _fill_clipped(&ctx._buffer, _intersect_rect(rect, scope.bounds), scope.clip, grapheme, style)
 }
 
 @(require_results)
 draw_text_context :: proc(ctx: ^Context, value: string, style: term.Style) -> (int, bool) {
-	if ctx == nil || !ctx._frame_open || ctx._error != .None || ctx._scope_count == 0 {
+	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return 0, false
 	}
-	scope := ctx._scopes[ctx._scope_count - 1]
+	scope := ctx._current
 	written, ok := _draw_text_clipped(&ctx._buffer, scope.bounds, scope.clip, value, style, ctx._profile)
 	if !ok {
 		ctx._error = .Invalid_Text
@@ -380,10 +400,10 @@ draw_text_context :: proc(ctx: ^Context, value: string, style: term.Style) -> (i
 // positions come from layout; style supplies the terminal-specific paint.
 @(require_results)
 text :: proc(ctx: ^Context, style: term.Style) -> (written: int, ok: bool) {
-	if ctx == nil || !ctx._frame_open || ctx._error != .None || ctx._scope_count <= 1 {
+	if ctx == nil || !ctx._frame_open || ctx._error != .None || ctx._depth == 0 {
 		return 0, false
 	}
-	scope := ctx._scopes[ctx._scope_count - 1]
+	scope := ctx._current
 	ok = true
 	for command in ctx._result.commands {
 		if command.node != scope.node {
@@ -413,10 +433,10 @@ text :: proc(ctx: ^Context, style: term.Style) -> (written: int, ok: bool) {
 // active scope. Text still advances from rect.x when its left edge is clipped.
 @(require_results)
 draw_text_at :: proc(ctx: ^Context, rect: Cell_Rect, value: string, style: term.Style) -> (int, bool) {
-	if ctx == nil || !ctx._frame_open || ctx._error != .None || ctx._scope_count == 0 {
+	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return 0, false
 	}
-	scope := ctx._scopes[ctx._scope_count - 1]
+	scope := ctx._current
 	written, ok := _draw_text_clipped(&ctx._buffer, rect, _intersect_rect(scope.bounds, scope.clip), value, style, ctx._profile)
 	if !ok {
 		ctx._error = .Invalid_Text

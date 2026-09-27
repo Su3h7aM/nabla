@@ -47,8 +47,9 @@
 // by stable Id; element_node selects a Node_Handle while traversing the result.
 // Both select either the resolved outer or inner box and apply the node's
 // effective clip. Their deferred cleanup closes on every block exit, including
-// return, break, and continue. Context uses fixed inline scope storage,
-// allocates nothing, and has a valid zero value.
+// return, break, and continue. Context keeps only the active scope and
+// resolves its ancestors from the layout result, so it nests as deep as layout
+// does, allocates nothing, and has a valid zero value.
 //
 // text draws the resolved lines emitted by layout.text, so layout owns wrapping
 // and line placement while nabla:text supplies width measurement.

@@ -493,7 +493,7 @@ _config_is_valid :: proc(config: Options) -> bool {
 	   capacities.debug_labels < 0 {
 		return false
 	}
-	if u64(capacities.nodes) > u64(max(u32)) || capacities.depth > 4096 || u64(capacities.overlays) > u64(max(u32)) {
+	if u64(capacities.nodes) > u64(max(u32)) || capacities.depth > MAX_DEPTH || u64(capacities.overlays) > u64(max(u32)) {
 		return false
 	}
 	return storage_size(capacities) > 0

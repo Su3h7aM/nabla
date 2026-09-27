@@ -70,6 +70,14 @@ test_scoped_rendering_uses_layout_boxes_and_clips :: proc(t: ^testing.T) {
 				testing.expect_value(t, written, 6)
 			}
 		}
+		// Leaving a child returns to the box its parent selected.
+		if element(&ctx, {id = _SCOPE_PARENT_ID, box = .Inner}) {
+			before, _ := bounds(&ctx)
+			if element_node(&ctx, {node = child}) {  }
+			after, _ := bounds(&ctx)
+			testing.expect_value(t, after, before)
+			testing.expect_value(t, after, Cell_Rect{x = 1, y = 1, width = 6, height = 2})
+		}
 	}
 	rendered, render_error := result(&ctx)
 	testing.expect_value(t, render_error, Frame_Error.None)
@@ -157,4 +165,51 @@ test_scoped_rendering_reports_frame_setup_errors :: proc(t: ^testing.T) {
 	testing.expect(t, !entered)
 	_, render_error := result(&ctx)
 	testing.expect_value(t, render_error, Frame_Error.Buffer_Too_Small)
+}
+
+// _DEEP_LEVELS nests deeper than any fixed scope stack a renderer might keep
+// inline, so rendering is bounded by the layout tree alone.
+_DEEP_LEVELS :: 100
+
+_deep_layout :: proc(ctx: ^layout.Context, level: int) {
+	if level > _DEEP_LEVELS { return }
+	if layout.element(ctx, layout.Element_Desc{id = layout.Id(level), layout = {sizing = {layout.grow(), layout.grow()}}}) {
+		_deep_layout(ctx, level + 1)
+	}
+}
+
+_deep_render :: proc(t: ^testing.T, ctx: ^Context, level: int) {
+	if level > _DEEP_LEVELS {
+		testing.expect(t, put(ctx, 0, 0, "x", {}))
+		return
+	}
+	if element(ctx, {id = layout.Id(level)}) {
+		_deep_render(t, ctx, level + 1)
+	}
+}
+
+@(test)
+test_scoped_rendering_nests_as_deep_as_layout :: proc(t: ^testing.T) {
+	options := _SCOPE_TEST_OPTIONS
+	options.capacities.nodes = _DEEP_LEVELS + 1
+	options.capacities.children = _DEEP_LEVELS + 1
+	options.capacities.id_table = 2 * _DEEP_LEVELS
+	options.capacities.depth = _DEEP_LEVELS + 1
+	layout_ctx: layout.Context
+	testing.expect_value(t, layout.init(&layout_ctx, options), nil)
+	defer layout.destroy(&layout_ctx)
+	if layout.frame(&layout_ctx, {2, 1}) {
+		_deep_layout(&layout_ctx, 1)
+	}
+	frame_result, layout_error := layout.result(&layout_ctx)
+	testing.expect_value(t, layout_error, layout.Frame_Error.None)
+
+	cells: [2]term.Cell
+	ctx: Context
+	if frame(&ctx, frame_result, cells[:]) {
+		_deep_render(t, &ctx, 1)
+	}
+	rendered, render_error := result(&ctx)
+	testing.expect_value(t, render_error, Frame_Error.None)
+	testing.expect_value(t, rendered.buffer.cells[0].grapheme, "x")
 }
