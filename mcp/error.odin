@@ -38,6 +38,8 @@ Error_Kind :: enum {
 	Capability_Missing,
 	Protocol_Violation,
 	Out_Of_Memory,
+	// Busy: another request owned the stream, so this one was not written.
+	Busy,
 }
 
 // Error is why an operation delivered no result. message, data_json, and
@@ -154,6 +156,8 @@ error_text :: proc(err: Error, allocator := context.allocator) -> string {
 		return strings.clone("the server reported an error", allocator)
 	case .Out_Of_Memory:
 		return strings.clone("the message could not be allocated", allocator)
+	case .Busy:
+		return strings.clone("the server is answering another agent's request; nothing was sent, so the call can be made again", allocator)
 	}
 	return ""
 }

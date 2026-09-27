@@ -78,6 +78,8 @@ log_mcp_error_name :: proc(kind: mcp.Error_Kind) -> string {
 		return "protocol_violation"
 	case .Out_Of_Memory:
 		return "out_of_memory"
+	case .Busy:
+		return "busy"
 	}
 	unreachable()
 }

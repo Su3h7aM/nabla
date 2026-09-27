@@ -3,6 +3,7 @@ package mcp
 import "core:encoding/json"
 import "core:mem"
 import "core:strings"
+import "core:sync"
 import "core:time"
 
 // CLIENT_REQUEST_ATTEMPTS is how many times a request with no effect is sent. It is
@@ -25,8 +26,8 @@ CLIENT_HANDSHAKE_TIMEOUT :: 5 * time.Second
 
 // Client is one server the harness can talk to. It owns the process, the config the
 // process was started from, the request id counter, and the revision the server
-// agreed to speak. One request is in flight at a time: the harness runs tools
-// serially, and nothing about a turn benefits from multiplexing.
+// agreed to speak. One request is in flight at a time; a request made while another
+// is in flight, from any thread, is refused with Busy before anything is written.
 Client :: struct {
 	stdio:     Stdio,
 	config:    Stdio_Config,
@@ -35,6 +36,8 @@ Client :: struct {
 	// sent before it is known: the request and result shapes depend on it.
 	version:   Protocol_Version,
 	allocator: mem.Allocator,
+	// busy is atomic: set while a request owns the stream.
+	busy:      bool,
 }
 
 // client_start records how to reach the server and launches it. It does not
@@ -198,6 +201,11 @@ client_notify :: proc(client: ^Client, method: string, params: json.Object, opti
 // a request is a protocol violation, since that revision carries the interaction
 // inside a result instead.
 client_exchange :: proc(client: ^Client, method: string, params: json.Object, options: Operation_Options) -> (result: json.Value, err: Error) {
+	if _, claimed := sync.atomic_compare_exchange_strong(&client.busy, false, true); !claimed {
+		json.destroy_value(json.Value(params), client.allocator)
+		return nil, error_make(.Busy, allocator = client.allocator)
+	}
+	defer sync.atomic_store(&client.busy, false)
 	control := options.control
 	client.next_id += 1
 	id := client.next_id

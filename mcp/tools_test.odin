@@ -5,6 +5,23 @@ import "core:encoding/json"
 import "core:strings"
 import "core:testing"
 
+// One stream serves one request at a time. A call made while another owns it is refused
+// before anything is written, so the caller knows the server never saw it.
+@(test)
+test_a_call_while_another_is_in_flight_is_refused_unsent :: proc(t: ^testing.T) {
+	client := Client {
+		version   = .V2026_07_28,
+		allocator = context.allocator,
+		busy      = true,
+	}
+	result, err := client_tools_call(&client, "search", `{}`, {}, context.allocator)
+	defer call_result_destroy(&result, context.allocator)
+	defer error_destroy(&err, context.allocator)
+	testing.expect_value(t, err.kind, Error_Kind.Busy)
+	testing.expect(t, !error_delivered(err))
+	testing.expect_value(t, client.next_id, 0)
+}
+
 @(test)
 test_tools_list_reads_a_page :: proc(t: ^testing.T) {
 	text := `{"resultType":"complete","nextCursor":"page-2","tools":[{

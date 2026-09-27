@@ -232,6 +232,8 @@ tool_mcp_outcome :: proc(err: mcp.Error) -> (session.Tool_Outcome, string) {
 		return .Timed_Out, "timed out"
 	case .Spawn_Failed:
 		return .Unavailable, "server did not start"
+	case .Busy:
+		return .Unavailable, "server busy"
 	case .Version_Unsupported, .Capability_Missing:
 		return .Unavailable, "server unusable"
 	case .Protocol_Violation:
