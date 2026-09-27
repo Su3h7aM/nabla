@@ -180,15 +180,8 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 	case .Busy:
 		fmt.eprintln("nabla: the session is already running")
 		return false
-	case .Worker_Escaped:
-		fmt.eprintln("nabla:", agent.CHAT_WORKER_ESCAPED_NOTICE)
-		return false
 	}
 	completed := agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), headless_observer(out), nil)
-	if agent.chat_session_worker_escaped(&app.setup.session) {
-		fmt.eprintln("nabla:", agent.CHAT_WORKER_ESCAPED_NOTICE)
-		return false
-	}
 	if out.write_failed {
 		fmt.eprintln("nabla: the answer could not be written")
 		return false
@@ -235,9 +228,9 @@ run_prompt :: proc(
 	app.setup.owns_selection = false
 	defer {
 		snapshot_destroy(app)
-		// A tool worker that ignored its stop still borrows the session's workspace,
-		// registry generation, and backends. The process exits with what it can reach.
-		if !agent.chat_session_worker_escaped(&app.setup.session) {
+		// A tool worker that ignored its stop may still use the tool backends, so the
+		// process exits with them rather than freeing them under it.
+		if !agent.chat_session_workers_outstanding(&app.setup.session) {
 			run_setup_destroy(&app.setup)
 		}
 	}

@@ -71,9 +71,6 @@ Chat_Accept :: enum {
 	Busy,
 	// The input could not be recorded, so the turn was not started.
 	Storage_Failed,
-	// A tool worker ignored its stop and still owns borrowed session data, so the
-	// session must not run another turn.
-	Worker_Escaped,
 }
 
 // Chat_Session is the running half of a session. Committed history lives in the
@@ -121,10 +118,10 @@ Chat_Session :: struct {
 	// let the conversation diverge from what was stored.
 	storage_failed:               bool,
 
-	// worker_escaped latches a tool worker that ignored its stop and still owns borrowed
-	// session data. The session accepts no further turn, and the process exits without
-	// releasing anything that worker can reach.
-	worker_escaped:               bool,
+	// abandoned_jobs are tool jobs whose workers ignored their stop. The session keeps
+	// working; each job is released once its worker publishes, and until then nothing the
+	// worker can reach (the workspace, the skill catalog, the tool backends) is freed.
+	abandoned_jobs:               [dynamic]^Tool_Job,
 
 	// tools is the set of tools a turn may dispatch, owned by the chat. It is
 	// replaceable while the chat is idle and frozen for the entire user turn,
@@ -251,6 +248,7 @@ chat_session_init :: proc(
 		partial_assistant = make([dynamic]u8, 0, allocator),
 		pending_calls     = make([dynamic]Chat_Tool_Call, 0, allocator),
 		effort_levels     = make([dynamic]string, 0, allocator),
+		abandoned_jobs    = make([dynamic]^Tool_Job, 0, allocator),
 		workspace         = strings.clone(workspace, allocator),
 		tools             = tools,
 	}
@@ -271,8 +269,7 @@ chat_session_set_client_instructions :: proc(chat: ^Chat_Session, instructions: 
 	chat.client_instructions = owned
 	delete(chat.skill_instructions, chat.allocator)
 	chat.skill_instructions = ""
-	if catalog, present := &chat.skill_catalog.?; present { skills.catalog_destroy(catalog, chat.allocator) }
-	chat.skill_catalog = nil
+	chat_skill_catalog_release(chat)
 	chat.skill_snapshot_seq = nil
 	return true
 }
@@ -288,6 +285,23 @@ chat_tool_call_destroy :: proc(call: ^Chat_Tool_Call, allocator: mem.Allocator) 
 chat_skill_catalog :: proc(chat: ^Chat_Session) -> ^skills.Catalog {
 	if catalog, present := &chat.skill_catalog.?; present { return catalog }
 	return nil
+}
+
+// chat_skill_catalog_release drops the session's skill catalog. An abandoned worker may still
+// read it, so while one is outstanding the catalog is left allocated.
+chat_skill_catalog_release :: proc(chat: ^Chat_Session) {
+	if catalog, present := &chat.skill_catalog.?; present && !chat_session_workers_outstanding(chat) {
+		skills.catalog_destroy(catalog, chat.allocator)
+	}
+	chat.skill_catalog = nil
+}
+
+// chat_session_workers_outstanding reports whether an abandoned tool worker may still be
+// running. While one is, what it can reach (the workspace, the skill catalog, and the tool
+// backends the caller owns) must stay allocated.
+chat_session_workers_outstanding :: proc(chat: ^Chat_Session) -> bool {
+	tool_jobs_reclaim(&chat.abandoned_jobs)
+	return len(chat.abandoned_jobs) > 0
 }
 
 // Tool_Registry_Replace_Error names why a registry replacement was refused.
@@ -322,16 +336,19 @@ chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Regis
 }
 
 chat_session_destroy :: proc(chat: ^Chat_Session) {
-	// A worker still running a call keeps the job it owns and the workspace, registry generation
-	// and backends it borrows. The session says so rather than pretending the batch retired: what
-	// to do with what such a worker can still reach is the caller's decision.
 	if chat.tool_jobs_active {
-		if tool_jobs_destroy(&chat.tool_jobs) { chat.worker_escaped = true }
+		tool_jobs_destroy(&chat.tool_jobs)
 		chat.tool_jobs_active = false
 	}
 	// Compaction's worker borrows this session's id for its logging correlation, so
 	// it is stopped before anything the session owns is released.
 	chat_compact_destroy(chat)
+	// A worker that is still running keeps its job, the workspace, and the skill catalog, so
+	// those are left to process exit rather than freed under it.
+	outstanding := chat_session_workers_outstanding(chat)
+	chat_skill_catalog_release(chat)
+	if !outstanding { delete(chat.workspace, chat.allocator) }
+	delete(chat.abandoned_jobs)
 	chat_chain_release(chat)
 	mailbox_destroy(&chat.mailbox)
 	ai.Provider_Encode_Cache_Destroy(&chat.encode_cache)
@@ -339,8 +356,6 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 		ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
 		chat.provider_websocket = nil
 	}
-	if catalog, present := &chat.skill_catalog.?; present { skills.catalog_destroy(catalog, chat.allocator) }
-	chat.skill_catalog = nil
 	delete(chat.skill_instructions, chat.allocator)
 	chat.skill_instructions = ""
 	delete(chat.client_instructions, chat.allocator)
@@ -354,7 +369,6 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	for level in chat.effort_levels { delete(level, chat.allocator) }
 	delete(chat.effort_levels)
 	delete(chat.effort, chat.allocator)
-	delete(chat.workspace, chat.allocator)
 	delete(chat.provider_id, chat.allocator)
 	delete(chat.model_id, chat.allocator)
 	tool_registry_destroy(&chat.tools)
@@ -449,7 +463,6 @@ chat_session_record_failure_detail :: proc(chat: ^Chat_Session, what: string, de
 // chat_session_accept_user admits a prompt: it opens a turn and records the
 // prompt as that turn's first entry before any request is made.
 chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) -> Chat_Accept {
-	if chat.worker_escaped { return .Worker_Escaped }
 	if chat.storage_failed { return .Storage_Failed }
 	if chat.state != .Idle { return .Busy }
 
@@ -517,9 +530,7 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, at_ms: i64) 
 	chat_operation_retire(&chat.operation)
 	chat_chain_release(chat)
 	if chat.tool_jobs_active {
-		// The batch is released, and a worker still running a call keeps what it borrows from
-		// this session: the session refuses further work rather than reusing a busy backend.
-		if tool_jobs_destroy(&chat.tool_jobs) { chat.worker_escaped = true }
+		tool_jobs_destroy(&chat.tool_jobs)
 		chat.tool_jobs_active = false
 	}
 	chat_pending_calls_clear(chat)

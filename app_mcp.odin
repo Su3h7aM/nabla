@@ -361,8 +361,13 @@ app_tools_refresh :: proc(app: ^App) -> string {
 		fmt.sbprintf(&warnings, "\nthe tool list could not be replaced")
 		return strings.to_string(warnings)
 	}
-	// Replacement destroys the old registry, so its bindings can now be released.
-	mcp_bindings_destroy(&setup.mcp.bindings, setup.alloc)
+	// Replacement destroys the old registry, so its bindings can now be released, unless an
+	// abandoned tool worker may still be using one; then they are left to process exit.
+	if agent.chat_session_workers_outstanding(&setup.session) {
+		delete(setup.mcp.bindings)
+	} else {
+		mcp_bindings_destroy(&setup.mcp.bindings, setup.alloc)
+	}
 	setup.mcp.bindings = bindings
 	bindings_installed = true
 	installed = true

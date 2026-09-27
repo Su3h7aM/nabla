@@ -100,6 +100,7 @@ tool_job_hold_definition :: proc(lane: ^Tool_Job_Hold_Lane, name: string, execut
 		placement = .Worker,
 		execute = execute,
 		backend = lane,
+		lane = lane,
 	}
 }
 
@@ -619,8 +620,9 @@ test_running_calls_are_bounded :: proc(t: ^testing.T) {
 	testing.expect_value(t, jobs.committed, len(names))
 }
 
-// A call that ignores its stop is answered as unknown rather than waited for, and its job is
-// abandoned: the batch settles and the escape is latched.
+// A call that ignores its stop is answered as unknown rather than waited for. Its job is
+// abandoned: the queued call on the same backend is answered instead of waiting, the batch
+// settles, the session accepts the next turn, and the job is reclaimed once its worker returns.
 @(test)
 test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(t: ^testing.T) {
 	test: Tool_Test
@@ -631,6 +633,7 @@ test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(t: ^testing.
 	lane := tool_job_hold_lane(&hold)
 	tool_job_test_register(t, &test, tool_job_hold_definition(&lane, "test_deaf", tool_job_deaf_execute))
 	_test_stage_call(t, chat, "call_deaf", `{}`, "test_deaf")
+	_test_stage_call(t, chat, "call_behind", `{}`, "test_deaf")
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
@@ -642,8 +645,8 @@ test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(t: ^testing.
 	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, started), Tool_Job_Effect.Dispatch)
 	tool_job_test_hold_until(t, &hold, 1)
 
-	ai.interrupt_request(&chat.stop)
-	tool_jobs_latch_stop(&jobs, chat)
+	// The call's own stop, as its timeout would ask for it: the turn itself keeps running.
+	tool_job_request_stop(jobs.jobs[0])
 	// The stop is observed at the tick it was asked for, and the call is still running, so
 	// there is nothing to do but wait for it.
 	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, started), Tool_Job_Effect.Wait)
@@ -653,10 +656,14 @@ test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(t: ^testing.
 	late := time.tick_add(started, TOOL_JOBS_STOP_PATIENCE + time.Millisecond)
 	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Abandon)
 	testing.expect_value(t, jobs.jobs[0].phase, Tool_Job_Phase.Abandoned)
-	testing.expect(t, jobs.escaped, "abandoning a job must latch the batch")
+	testing.expect_value(t, jobs.active, 0)
 	_, has_deadline := tool_jobs_deadline(&jobs).?
 	testing.expect(t, !has_deadline, "an abandoned call must not remain the batch's deadline")
-	testing.expect_value(t, jobs.committed, 1)
+	// The queued call shares the stuck backend, so it is answered now instead of waiting.
+	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Refuse)
+	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Commit)
+	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Retire)
+	testing.expect_value(t, jobs.committed, 2)
 	testing.expect(t, tool_jobs_settled(&jobs), "the batch must settle without its abandoned call")
 	testing.expect_value(t, tool_job_test_step_at(&test, &jobs, late), Tool_Job_Effect.Done)
 	testing.expect_value(t, sync.atomic_load(&hold.running), i32(1))
@@ -668,14 +675,21 @@ test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(t: ^testing.
 	for entry in entries {
 		if result, is_result := entry.payload.(session.Tool_Result_Entry); is_result { append(&results, result) }
 	}
-	if !testing.expect_value(t, len(results), 1) { return }
+	if !testing.expect_value(t, len(results), 2) { return }
 	testing.expect_value(t, results[0].outcome, session.Tool_Outcome.Unknown)
+	testing.expect_value(t, results[1].outcome, session.Tool_Outcome.Unavailable)
 
-	// Production retains an abandoned job until exit; the test releases it once the worker returns.
+	// Releasing the table hands the stuck job to the session, which tracks it.
+	tool_jobs_destroy(&jobs)
+	testing.expect(t, chat_session_workers_outstanding(chat), "the stuck worker must still be tracked")
+
+	// Once the worker returns, the session reclaims its job.
 	tool_job_hold_release_all(&hold)
-	abandoned := pop(&jobs.jobs)
-	thread.destroy(abandoned.thread)
-	tool_job_release(abandoned)
+	for _ in 0 ..< 10_000 {
+		if !chat_session_workers_outstanding(chat) { break }
+		time.sleep(time.Millisecond)
+	}
+	testing.expect(t, !chat_session_workers_outstanding(chat), "a worker that returned must be reclaimed")
 }
 
 // A cancelled turn still answers every committed call: the running call is stopped
@@ -899,45 +913,6 @@ test_advance_does_not_adopt_a_published_result :: proc(t: ^testing.T) {
 	commit := chat_session_advance(chat)
 	testing.expect_value(t, commit.kind, Chat_Effect_Kind.Step_Tools)
 	testing.expect_value(t, commit.tool, Tool_Job_Effect.Commit)
-}
-
-// An escaped worker latches the session. The observation step is what carries the
-// batch's escape into the session, and an escaped session admits no further turn, which
-// is what keeps the workspace, registry generation, and backends it borrows from being
-// released under a worker that is still running.
-@(test)
-test_an_escaped_worker_refuses_another_turn :: proc(t: ^testing.T) {
-	test: Tool_Test
-	tool_test_begin(t, &test)
-	defer tool_test_end(t, &test)
-	chat := &test.fixture.chat
-
-	testing.expect(t, !chat_session_worker_escaped(chat))
-	tool_jobs_init(&chat.tool_jobs, chat, 0, os.heap_allocator())
-	chat.tool_jobs_active = true
-	chat.tool_jobs.escaped = true
-	chat_session_observe(chat)
-	testing.expect(t, chat_session_worker_escaped(chat))
-
-	// The running turn does not ask the model for more work: the batch closes, and the turn
-	// ends as a failure because the runtime can no longer be reused.
-	chat.state = .Executing_Tools
-	testing.expect(t, !chat_session_tools_done(chat, chat.active_turn_id, 0))
-	testing.expect_value(t, chat.state, Chat_State.Finalizing)
-	finish := chat_session_advance(chat)
-	testing.expect_value(t, finish.kind, Chat_Effect_Kind.Turn_Finished)
-	testing.expect_value(t, finish.status, Chat_Terminal_Status.Failed)
-	chat_session_claim_finish(chat, finish)
-
-	before_entries := _test_entries(t, chat)
-	before := len(before_entries)
-	session.entries_destroy(before_entries, context.allocator)
-	testing.expect_value(t, chat_session_accept_user(chat, "next", session.now_ms()), Chat_Accept.Worker_Escaped)
-
-	// The refused prompt left no record behind.
-	entries := _test_entries(t, chat)
-	defer session.entries_destroy(entries, context.allocator)
-	testing.expect_value(t, len(entries), before)
 }
 
 // Cancellation does not skip the job table. The cancelling state keeps selecting job

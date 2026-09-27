@@ -54,7 +54,7 @@ chat_ensure_instructions :: proc(chat: ^Chat_Session) -> bool {
 		chat_session_record_failure(chat, "the instruction snapshot could not be recorded", append_error)
 		return false
 	}
-	if existing, has_catalog := &chat.skill_catalog.?; has_catalog { skills.catalog_destroy(existing, chat.allocator) }
+	chat_skill_catalog_release(chat)
 	chat.skill_catalog = catalog
 	delete(chat.skill_instructions, chat.allocator)
 	chat.skill_instructions = instructions

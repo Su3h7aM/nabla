@@ -60,9 +60,9 @@ chat_session_observe :: proc(chat: ^Chat_Session) {
 // has already observed time does not read it twice and a test can supply it.
 chat_session_observe_at :: proc(chat: ^Chat_Session, now: time.Tick) {
 	chat_session_observe_stop(chat)
+	tool_jobs_reclaim(&chat.abandoned_jobs)
 	if !chat.tool_jobs_active { return }
 	tool_jobs_observe(&chat.tool_jobs, chat, now)
-	if chat.tool_jobs.escaped { chat.worker_escaped = true }
 }
 
 // chat_session_tool_effect selects one bounded job-table effect while a batch is
@@ -346,18 +346,6 @@ chat_session_terminal_status :: proc(chat: ^Chat_Session) -> Chat_Terminal_Statu
 	return chat.terminal_status
 }
 
-// chat_session_worker_escaped reports that a tool worker ignored its stop and still owns
-// borrowed session data. The session can no longer run a turn or be released normally: the
-// owner stops the runtime and the process exits with what that worker can still reach.
-chat_session_worker_escaped :: proc(chat: ^Chat_Session) -> bool {
-	return chat.worker_escaped
-}
-
-// CHAT_WORKER_ESCAPED_NOTICE is what a front-end shows for that condition. The runtime is
-// stopping and teardown will not release what the worker can reach, so there is nothing
-// for the user to do but exit.
-CHAT_WORKER_ESCAPED_NOTICE :: "a tool call did not stop; the harness must exit"
-
 // chat_session_steer records a queued line as a user entry of the running turn. Unlike
 // accept_user it starts no turn and resets no budget: the turn keeps its identity and its
 // counters, so a steering line changes what a later request sends, never work already
@@ -525,13 +513,6 @@ chat_session_tools_done :: proc(chat: ^Chat_Session, turn_id: u64, results: int)
 	chat.calls_made += len(chat.pending_calls)
 	for &call in chat.pending_calls { chat_tool_call_destroy(&call, chat.allocator) }
 	clear(&chat.pending_calls)
-	if chat.worker_escaped {
-		// A worker that ignored its stop still borrows the storage the next request would reuse,
-		// and the runtime is done after that: the batch is closed, and the turn ends rather than
-		// asking the model for more work.
-		_ = chat_session_fail_turn(chat, "a tool call did not stop")
-		return false
-	}
 	// A cancelled turn resolves its committed calls but must not continue to another
 	// request, so it stays in Cancelling for the finalization owner.
 	if chat.state == .Executing_Tools { chat.state = .Preparing }

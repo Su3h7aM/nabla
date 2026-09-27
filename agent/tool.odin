@@ -159,6 +159,10 @@ Tool_Definition :: struct {
 	// remains. Dispatch copies it into Tool_Context, and only the execute
 	// procedure paired with this definition may cast it back.
 	backend:        rawptr,
+	// lane is the serialization domain: calls with the same lane never run at once. nil is
+	// the native lane; an MCP tool's lane is its client, whose one stdio stream serves
+	// every tool of that server.
+	lane:           rawptr,
 }
 
 // Tool_Registry owns the tools available to a session. It is built before the
@@ -331,6 +335,7 @@ tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition)
 			execute = definition.execute,
 			kind = definition.kind,
 			backend = definition.backend,
+			lane = definition.lane,
 		},
 	)
 	return {}

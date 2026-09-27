@@ -156,10 +156,6 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		case .Storage_Failed:
 			snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
 			return
-		case .Worker_Escaped:
-			snap_append(app, .Error, agent.CHAT_WORKER_ESCAPED_NOTICE)
-			stop_runtime(app)
-			return
 		case .Busy:
 			snap_append(app, .Warning, "chat is busy; input dropped")
 			return
@@ -179,14 +175,6 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		// How the turn ended reaches the front-end through the observer, which reports the
 		// terminal status, so the worker has nothing of its own to do with the return.
 		agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)
-		// A tool worker that ignored its stop still borrows the session's workspace, registry
-		// generation, and backends. Nothing else may run in this process: the runtime stops,
-		// and teardown leaves what that worker can reach to process exit.
-		if agent.chat_session_worker_escaped(&app.setup.session) {
-			snap_append(app, .Error, agent.CHAT_WORKER_ESCAPED_NOTICE)
-			stop_runtime(app)
-			return
-		}
 	// Steering lines left queued here arrived after the turn recorded what it was sent,
 	// so they are not part of its history. Its end is still the caller's to report, and
 	// the front-end returns them to the prompt when it sees the runtime stop running.

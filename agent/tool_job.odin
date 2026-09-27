@@ -34,7 +34,7 @@ TOOL_JOBS_MAX_ACTIVE :: 4
 // TOOL_JOBS_STOP_PATIENCE is how long a call may keep running after its stop was asked for,
 // by the turn's cancellation or by its own timeout. A backend that never returns cannot be
 // stopped cooperatively, so past this the call is answered as unknown and its job is
-// abandoned: retained with everything its worker can reach until the process exits.
+// abandoned: retained until its worker publishes, while the session keeps working.
 TOOL_JOBS_STOP_PATIENCE :: 10 * time.Second
 
 // Tool_Job_Phase is what a job has done and what it still owes. The phase answers one
@@ -62,8 +62,8 @@ Tool_Job_Phase :: enum {
 	// Unrecorded: released without a result in the record, because the session's
 	// storage failed. Recovery records uncertainty for it later.
 	Unrecorded,
-	// Abandoned: the worker ignored its stop. The job, its thread handle, and everything the
-	// worker can reach are retained until the process exits.
+	// Abandoned: the worker ignored its stop. The job and its thread handle are retained
+	// until the worker publishes, and nothing the worker can reach is freed before then.
 	Abandoned,
 }
 
@@ -85,10 +85,11 @@ Tool_Jobs_Stop :: enum {
 Tool_Job_Effect :: enum {
 	// Commit: record the result of the earliest uncommitted job.
 	Commit,
-	// Refuse: give a queued call the not-executed result the stop earned it.
+	// Refuse: answer a queued call that cannot run, because the batch stopped or its lane
+	// is held by an abandoned call.
 	Refuse,
-	// Abandon: answer a call that ignored its stop with what the harness observed, and hand
-	// its job to the worker that is still running it.
+	// Abandon: answer a call that ignored its stop with what the harness observed, and
+	// release its slot and native lane so later calls can run.
 	Abandon,
 	// Retire: release a settled job's execution resources.
 	Retire,
@@ -185,9 +186,10 @@ Tool_Jobs :: struct {
 	// render is the reader owner-placed tools use to read kept results back. It lives
 	// here, not in a frame, so a job can borrow it for its whole life.
 	render:           Result_Reader,
-	// escaped is set when a job was abandoned. Its worker still borrows the session's
-	// workspace, registry, and backends, so the session must not continue.
-	escaped:          bool,
+	// abandoned is the session's list of jobs whose workers ignored their stop, borrowed.
+	// Destroying the table moves its abandoned jobs there, and they block only their own
+	// external lane.
+	abandoned:        ^[dynamic]^Tool_Job,
 }
 
 // --- lifetime ------------------------------------------------------------------
@@ -195,6 +197,7 @@ Tool_Jobs :: struct {
 tool_jobs_init :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, capacity: int, worker_allocator: mem.Allocator) {
 	jobs.allocator = chat.allocator
 	jobs.worker_allocator = worker_allocator
+	jobs.abandoned = &chat.abandoned_jobs
 	jobs.jobs = make([dynamic]^Tool_Job, 0, capacity, chat.allocator)
 	jobs.render = Result_Reader {
 		store      = chat.store,
@@ -204,24 +207,47 @@ tool_jobs_init :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, capacity: int, wor
 }
 
 // tool_jobs_destroy releases the table and every job no worker can still reach. A job whose
-// worker is still running is asked to stop and abandoned, and the result reports it: the
-// caller must then retain the workspace, registry, and backends that worker borrows.
-tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) -> (escaped: bool) {
+// worker is still running is asked to stop and moves to the session's abandoned list.
+tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) {
 	tool_jobs_collect(jobs)
 	for job in jobs.jobs {
 		if job.phase == .Running && job.launched {
 			tool_job_request_stop(job)
-			job.phase = .Abandoned
+			tool_jobs_mark_abandoned(jobs, job)
 		}
 		if job.phase == .Abandoned {
-			escaped = true
+			if jobs.abandoned == nil || append(jobs.abandoned, job) != 1 {
+				log_emit({level = .Error, category = .Tool, event = "tool.job_leaked"})
+			}
 			continue
 		}
 		tool_job_release(job)
 	}
 	delete(jobs.jobs)
 	jobs^ = {}
-	return
+}
+
+// tool_jobs_reclaim releases every abandoned job whose worker has since published. Its call
+// already has its recorded outcome, so the late result is dropped.
+tool_jobs_reclaim :: proc(abandoned: ^[dynamic]^Tool_Job) {
+	for index := len(abandoned) - 1; index >= 0; index -= 1 {
+		job := abandoned[index]
+		if !sync.atomic_load(&job.published) { continue }
+		thread.destroy(job.thread)
+		job.thread = nil
+		fields := [1]Log_Field{{key = "tool", value = job.name}}
+		log_emit({level = .Info, category = .Tool, event = "tool.job_reclaimed", fields = fields[:]})
+		tool_job_release(job)
+		unordered_remove(abandoned, index)
+	}
+}
+
+// tool_jobs_mark_abandoned gives up waiting for a worker. The job keeps what the worker can
+// reach, and gives back its worker slot so the batch can keep running calls.
+@(private)
+tool_jobs_mark_abandoned :: proc(jobs: ^Tool_Jobs, job: ^Tool_Job) {
+	job.phase = .Abandoned
+	if job.placement == .Worker { jobs.active -= 1 }
 }
 
 @(private)
@@ -370,7 +396,7 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	}
 
 	job.placement = definition.placement
-	job.lane = definition.backend
+	job.lane = definition.lane
 	job.execute = definition.execute
 	job.exec.timeout = definition.timeout
 	job.exec.backend = definition.backend
@@ -488,6 +514,7 @@ tool_jobs_next :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> Tool_Job_Effect {
 	// A stopped batch stops admitting calls, and a queued call is one that was
 	// admitted before the stop reached it.
 	if jobs.stop != .None && tool_jobs_earliest(jobs, {.Queued}) != nil { return .Refuse }
+	if tool_jobs_lane_abandoned(jobs) != nil { return .Refuse }
 	if tool_jobs_earliest(jobs, {.Dispatching, .Running}) != nil && tool_jobs_overdue(jobs, now) != nil { return .Abandon }
 	if tool_jobs_retirable(jobs, now) != nil { return .Retire }
 	if tool_jobs_runnable(jobs) != nil { return .Dispatch }
@@ -601,7 +628,8 @@ tool_jobs_runnable :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
 // serialization domain: everything native shares one, and each MCP client is its own,
 // because one stdio stream cannot be read by two calls at once. Occupancy is derived
 // from the table rather than tracked separately, so a lane cannot be left busy by a
-// job that was already released.
+// job that was already released. An abandoned job gives up the native lane, so new
+// native work takes over from it.
 @(private)
 tool_jobs_lane_free :: proc(jobs: ^Tool_Jobs, candidate: ^Tool_Job) -> bool {
 	// A script runs on the owner in slices, so it never waits for a lane.
@@ -609,12 +637,30 @@ tool_jobs_lane_free :: proc(jobs: ^Tool_Jobs, candidate: ^Tool_Job) -> bool {
 	for job in jobs.jobs {
 		if job == candidate || job.lane != candidate.lane { continue }
 		switch job.phase {
-		case .Dispatching, .Running, .Abandoned:
+		case .Dispatching, .Running:
 			return false
-		case .Queued, .Waiting, .Result_Ready, .Committing, .Retiring, .Retired, .Unrecorded:
+		case .Queued, .Waiting, .Result_Ready, .Committing, .Retiring, .Retired, .Unrecorded, .Abandoned:
 		}
 	}
 	return true
+}
+
+// tool_jobs_lane_abandoned returns the earliest queued call whose external lane is held by an
+// abandoned call. The stuck worker may still be using that backend, so the call is answered
+// now instead of waiting for a worker that may never return.
+@(private)
+tool_jobs_lane_abandoned :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
+	for job in jobs.jobs {
+		if job.phase != .Queued || job.placement == .Lua || job.lane == nil { continue }
+		for other in jobs.jobs {
+			if other.phase == .Abandoned && other.lane == job.lane { return job }
+		}
+		if jobs.abandoned == nil { continue }
+		for other in jobs.abandoned {
+			if other.lane == job.lane { return job }
+		}
+	}
+	return nil
 }
 
 // tool_jobs_latch_stop records a stop the owner observed outside the batch: a turn
@@ -736,8 +782,7 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 		result_seq, recorded = chat_record_tool_result(chat, job.call, &finalized, spilled)
 	}
 
-	job.phase = .Abandoned
-	jobs.escaped = true
+	tool_jobs_mark_abandoned(jobs, job)
 	if recorded {
 		job.committed = true
 		job.recorded_seq = result_seq
@@ -760,12 +805,22 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 	}
 }
 
-// tool_jobs_refuse gives one queued call the result the stop earned it. The call never
-// dispatched, so nothing ran and nothing needs to be undone.
+// tool_jobs_refuse answers one queued call that cannot run: the stop earned it a not-executed
+// result, or its backend is still held by an abandoned call. The call never dispatched, so
+// nothing ran and nothing needs to be undone.
 tool_jobs_refuse :: proc(jobs: ^Tool_Jobs) {
-	job := tool_jobs_earliest(jobs, {.Queued})
+	if jobs.stop != .None {
+		job := tool_jobs_earliest(jobs, {.Queued})
+		if job == nil { return }
+		job.result = tool_result_failure(&job.exec, .Not_Executed, "the turn was cancelled before this call ran", "not executed")
+		job.result_present = true
+		job.phase = .Result_Ready
+		return
+	}
+	job := tool_jobs_lane_abandoned(jobs)
 	if job == nil { return }
-	job.result = tool_result_failure(&job.exec, .Not_Executed, "the turn was cancelled before this call ran", "not executed")
+	message := "this tool's server is still running an earlier call that did not stop, so this call was not executed; retry it once that call finishes, or use another tool"
+	job.result = tool_result_failure(&job.exec, .Unavailable, message, "server busy")
 	job.result_present = true
 	job.phase = .Result_Ready
 }
@@ -835,8 +890,7 @@ tool_jobs_retire :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 	if job == nil { return }
 
 	if !tool_job_releasable(job) {
-		job.phase = .Abandoned
-		jobs.escaped = true
+		tool_jobs_mark_abandoned(jobs, job)
 		waited := time.tick_diff(job.stop_at, now)
 		fields := [3]Log_Field {
 			{key = "tool", value = job.name},

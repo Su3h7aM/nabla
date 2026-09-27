@@ -639,11 +639,10 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 	input.parser_destroy(&app.parser)
 	input.events_destroy(&app.raw, app.run.alloc)
 	frame_storage_destroy(app.storage)
-	// A tool worker that ignored its stop still borrows the session's workspace, registry
-	// generation, and backends, so none of that may be released. The process exits with
-	// what that worker can still reach, and the record names why.
-	if agent.chat_session_worker_escaped(&app.setup.session) {
-		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.worker_escaped"})
+	// A tool worker that ignored its stop may still use the tool backends, so the process
+	// exits with them rather than freeing them under it.
+	if agent.chat_session_workers_outstanding(&app.setup.session) {
+		agent.log_emit(agent.Log_Record{level = .Warning, category = .Runtime, event = "runtime.workers_outstanding"})
 		return
 	}
 	run_setup_destroy(&app.setup)

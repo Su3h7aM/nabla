@@ -270,8 +270,8 @@ acp_server_destroy :: proc(server: ^Acp_Server) {
 	delete(server.active_message_id, server.alloc)
 	server.active_message_id = ""
 	snapshot_destroy(&server.app)
-	if agent.chat_session_worker_escaped(&server.app.setup.session) {
-		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.worker_escaped"})
+	if agent.chat_session_workers_outstanding(&server.app.setup.session) {
+		agent.log_emit(agent.Log_Record{level = .Warning, category = .Runtime, event = "runtime.workers_outstanding"})
 		return
 	}
 	run_setup_destroy(&server.app.setup)
@@ -294,7 +294,6 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 		if !ok { break }
 		acp_run_work(server, work)
 		acp_work_destroy(&work, server.alloc)
-		if agent.chat_session_worker_escaped(&server.app.setup.session) { break }
 		// Temp scratch belongs to one request: the worker is long-lived, so its pool is
 		// recycled here rather than left to grow with the conversation.
 		free_all(context.temp_allocator)
@@ -320,7 +319,6 @@ acp_run_work :: proc(server: ^Acp_Server, work: Acp_Work) {
 			acp_work_close_session(server, work)
 		}
 	}
-	if agent.chat_session_worker_escaped(&server.app.setup.session) { return }
 	// The request is answered, so the next one may be admitted. The cancellation belongs
 	// to the turn that just ended; a client that cancels a finished turn is ignored.
 	agent.turn_control_clear(&server.app.run.control)
@@ -518,9 +516,6 @@ acp_replace_string :: proc(slot: ^string, value: string, allocator: mem.Allocato
 // The message of a refusal is owned by the setup's allocator.
 acp_session_open :: proc(server: ^Acp_Server, workspace: string, start: Session_Start) -> (message: string, ok: bool) {
 	app := &server.app
-	if agent.chat_session_worker_escaped(&app.setup.session) {
-		return acp_open_message(agent.CHAT_WORKER_ESCAPED_NOTICE, app.setup.alloc), false
-	}
 	// Loading the session this process already runs is not a switch: it is the same
 	// conversation, and the harness would refuse to claim it twice.
 	if start.kind == .Resume_Id && string(app.setup.session.id) == start.id { return "", true }
@@ -833,9 +828,6 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 	case .Storage_Failed:
 		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, agent.chat_session_last_error(chat))
 		return
-	case .Worker_Escaped:
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, agent.CHAT_WORKER_ESCAPED_NOTICE)
-		return
 	case .Busy:
 		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_REQUEST, "the session is already running a turn")
 		return
@@ -860,10 +852,6 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 		&server.app.run.control,
 	)
 
-	if agent.chat_session_worker_escaped(chat) {
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, agent.CHAT_WORKER_ESCAPED_NOTICE)
-		return
-	}
 	status := chat.terminal_status
 	if !turn_completed && status == .Completed { status = .Failed }
 

@@ -40,6 +40,7 @@ mcp_tool_definition :: proc(name: string, tool: mcp.Tool, backend: ^MCP_Tool_Bac
 		kind = .MCP,
 		execute = tool_mcp_execute,
 		backend = backend,
+		lane = backend.client if backend != nil else nil,
 	}
 }
 
