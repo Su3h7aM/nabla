@@ -313,6 +313,27 @@ test_patch_applies_every_file_or_none :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_patch_reads_loose_patches_with_one_meaning :: proc(t: ^testing.T) {
+	test: Tool_Test
+	tool_test_begin(t, &test)
+	defer tool_test_end(t, &test)
+
+	code := strings.concatenate({tool_test_workspace(&test), "/code.txt"}, context.temp_allocator)
+
+	// A unified diff without the envelope, whose line number picks one of two equal places.
+	if !tool_write_file(t, code, "same\nx\nsame\nx\n") { return }
+	unified := `{"patch":"--- a/code.txt\n+++ b/code.txt\n@@ -3,1 +3,1 @@\n-same\n+SAME\n"}`
+	testing.expect_value(t, tool_run(t, &test, TOOL_PATCH_NAME, unified).outcome, session.Tool_Outcome.Success)
+	tool_file_is(t, code, "same\nx\nSAME\nx\n")
+
+	// A hunk that lost the file's indentation matches, and its added lines take that indentation.
+	if !tool_write_file(t, code, "if x {\n\tfoo()\n}\n") { return }
+	unindented := `{"patch":"*** Update File: code.txt\n if x {\n-foo()\n+bar()\n }\n"}`
+	testing.expect_value(t, tool_run(t, &test, TOOL_PATCH_NAME, unindented).outcome, session.Tool_Outcome.Success)
+	tool_file_is(t, code, "if x {\n\tbar()\n}\n")
+}
+
+@(test)
 test_every_native_tool_is_registered_complete :: proc(t: ^testing.T) {
 	test: Tool_Test
 	tool_test_begin(t, &test)

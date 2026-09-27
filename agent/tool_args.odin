@@ -25,7 +25,7 @@ Tool_Kind :: enum {
 // fields; the document they were read from stays with the call's record.
 //
 // Strings borrow the admitted document, so they live exactly as long as the job that owns it;
-// patch sections are allocated beside it and released by tool_args_destroy.
+// a patch's files, hunks, and lines are allocated beside it and released by tool_args_destroy.
 Tool_Args :: union {
 	Read_Args,
 	Write_Args,
@@ -50,6 +50,8 @@ Write_Args :: struct {
 
 Patch_Args :: struct {
 	files: []Patch_File,
+	hunks: []Patch_Hunk,
+	lines: []Patch_Line,
 }
 
 Shell_Args :: struct {
@@ -121,9 +123,9 @@ tool_args_decode :: proc(ctx: ^Tool_Context, kind: Tool_Kind, object: json.Objec
 	return nil, {}
 }
 
-// tool_args_destroy releases what one typed call owns: the patch sections, which are the only
+// tool_args_destroy releases what one typed call owns: the patch arrays, which are the only
 // part of the union that is not borrowed.
 tool_args_destroy :: proc(args: ^Tool_Args, allocator := context.allocator) {
-	if patch, is_patch := args^.(Patch_Args); is_patch { delete(patch.files, allocator) }
+	if patch, is_patch := &args.(Patch_Args); is_patch { patch_args_destroy(patch, allocator) }
 	args^ = nil
 }

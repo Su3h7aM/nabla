@@ -718,8 +718,8 @@ Repair_Kind :: enum u8 {
 	Double_Encoded_Object,     // schema expects an object; value is a string holding exactly one valid object
 	Numeric_String,            // field marked coercible; string is an exact integer or finite number
 	Line_Endings,              // write or patch text normalized to the target file's line-ending convention
-	Patch_Trailing_Whitespace, // hunk matches exactly one location when trailing whitespace is ignored
-	Patch_Missing_End_Marker,  // patch lacks only its final end marker
+	Patch_Whitespace,          // hunk matches exactly one location when whitespace around its lines is ignored
+	Patch_Loose_Format,        // patch departs from the format in a way with one reading (section 16)
 }
 ```
 
@@ -744,11 +744,13 @@ A repair is valid only if exactly one interpretation exists, the result passes f
 ```
 
 - Paths are workspace-relative or absolute and are canonicalized once; they become the call's `Write` access set.
-- Per file: read the current bytes and locate each hunk (context plus removed lines) searching forward from the previous hunk's end, after the `@@` anchor when given. Exactly one match is required; zero or several fail that hunk. A hunk with only added lines goes directly after its anchor, or at the end of the file when it has none. `*** End of File` requires the hunk to end the file.
+- Parsing accepts every form with one reading, because models of every size must be able to edit: text before the first file header and after `*** End Patch`, a missing envelope, a closing code fence or heredoc terminator, marker letter case, context lines without their leading space, added files without `+` prefixes, unified diffs (`---`/`+++` headers, `/dev/null`, `a/` and `b/` prefixes, `@@ -l,n +l,n @@`), and empty lines trailing a hunk. What has no single reading is `Invalid_Arguments` naming the line.
+- Per file: read the current bytes and locate each hunk's old lines (context plus removed) in the whole file, at three levels tried in order: exact, ignoring trailing whitespace, ignoring surrounding whitespace. At the first level with any match, the candidates are narrowed by each hint that leaves at least one: after the previous hunk, after the `@@` anchor, at the end of the file for `*** End of File`, and at a unified diff's old line number. Exactly one candidate must remain; several fail the hunk as ambiguous. Hints never reject a unique match, so an anchor that is wrong or hunks out of order still apply. A hunk matched by ignoring indentation has its added lines moved to the file's indentation. A hunk with only added lines goes after its anchor, at its line number, or at the end of the file. Hunks may not overlap.
+- `Update File` of a missing file whose hunks only add lines creates it.
 - Unchanged lines keep the file's bytes, added lines take the file's line ending, and a file without a final newline keeps it that way.
 - A path may appear in one section only, counting `Move to` targets.
 - All files are computed in memory first. If any hunk fails, nothing is written. Writes then go file by file through temp-plus-rename. A rename failure after earlier renames reports `Tool_Failed` with the list of applied files, because POSIX has no multi-file atomicity.
-- A malformed patch is `Invalid_Arguments` naming the first bad line. A patch that does not apply is `Tool_Failed` naming the file, hunk index, reason (`not_found`, `ambiguous{count, lines}`, `file_missing`, `file_exists`, `repeated_path`, `not_writable`, `unreadable`, `invalid_path`), and the nearest candidate lines, so the model can correct without rereading the file.
+- A malformed patch is `Invalid_Arguments` naming the first bad line. A patch that does not apply is `Tool_Failed` naming the file, hunk index, reason (`not_found`, `ambiguous{count, lines}`, `overlap`, `file_missing`, `file_exists`, `repeated_path`, `not_writable`, `unreadable`, `invalid_path`), and the nearest candidate lines, or that the hunk's new lines are already present, so the model can correct without rereading the file. The result counts hunks that matched only by ignoring whitespace.
 
 ## 17. Lua runtime
 
