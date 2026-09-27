@@ -23,6 +23,7 @@ Terms: "must" is a hard rule, "default" is a named, tunable value. Every numeric
 15. Configuration is live. Admitted work keeps the immutable snapshot it was admitted with; new work uses the newest valid snapshot.
 16. Only a main session creates subagents. Delegation depth is one.
 17. The zero value of every runtime struct is inert: no owned resources, no pending work, unknown rather than false where the difference matters.
+18. Behavior never branches on a model identity, and branches on a provider identity only as a last resort. It branches on the API family, a catalog fact, or what the provider reported (section 12).
 
 ## 2. Limits, failures, and resources
 
@@ -64,6 +65,19 @@ When a request, a response, or a tool fails, the next step is to tell the model 
 - Large transient data (request preparation, models.dev parsing, compaction snapshots, job output) lives in a `virtual.Arena` owned by that lifetime and is released with `virtual.arena_destroy`, which returns pages to the OS. Small long-lived data uses the heap allocator.
 - Concurrency exists where work is independent and blocking or CPU-bound. Blocking jobs get a thread each, created on admission and joined on completion, bounded by `BLOCKING_JOBS_MAX_RUNNING`. A CPU-bound native operation that splits into independent pieces creates a `thread.Pool` sized `min(os.get_processor_core_count(), pieces)` for that operation and destroys it before returning. No process-lifetime worker pool.
 - An optimization stays only with a measured end-to-end gain (section 26). Complexity without one is deleted.
+
+### 2.4 Robustness
+
+The harness keeps running for as long as it reasonably can. Robustness comes first from prevention: small, simple, idiomatic code with errors as values has fewer places to fail. What still fails is contained to the work it touched, and the recovery for it stays proportionate.
+
+- A non-critical failure degrades only its own work. A failed tool, request, hook, config reload, catalog refresh, MCP server, or subagent becomes feedback (section 2.2) or a recorded diagnostic, and the session and process continue.
+- A worker that stops responding costs only its own resources. It is abandoned (section 7.2): its call reports `Unknown`, its memory leaks, and the session keeps admitting turns.
+- No non-critical failure blocks the agent permanently. Every wait on another job ends when that job commits, times out, or is abandoned, and an abandoned job's claims pass to the next job that needs them. Letting new work take over from stuck work is preferred over holding the agent back.
+- A thread is never killed. `thread.terminate` cancels at an arbitrary point, possibly while it holds a `sync.Mutex` or is inside an allocator, and `core:sync` locks have no owner-death recovery, so every later waiter would deadlock. Stopping is cooperative through `Stop` tokens (section 7.4).
+- A lock guards only plain memory access. No `Mutex` is held across I/O, a blocking wait, a callback, or a call into Lua, SQLite, or another package, so a slow or stuck holder never stalls another thread. Data crosses threads by ownership handoff and atomics where they suffice.
+- Threads share one address space, so a panic, failed assertion, bounds-check trap, or memory fault on any thread ends the process. No code tries to survive one in-process. The crash boundary is the child process: shell commands, MCP servers, and subagents run in their own processes, and their crash is a tool result. A harness crash is answered by the journal, which recovers the session on the next open (section 9).
+- A critical failure stops the work that depends on it and says why. Journal storage failure is critical because intent can no longer be committed before effects (invariant 2): it latches `Storage_Failed` (section 8.3).
+- Recovery is written only when it costs less than the failure it handles. A rare failure whose recovery would need a new mechanism, a second state machine, or broad bookkeeping ends the affected turn, or the process, with a clear message, and journal recovery takes over.
 
 ## 3. Odin implementation rules
 
@@ -286,7 +300,7 @@ Command :: union {
 Session_State :: struct {
 	id:         Session_Id,
 	role:       Session_Role,        // Main, Subagent
-	health:     Session_Health,      // Ok, Storage_Failed, Poisoned
+	health:     Session_Health,      // Ok, Storage_Failed
 	lifecycle:  Lifecycle,           // Open, Closing, Closed
 	branch:     Branch_Id,
 	head:       Node_Id,
@@ -326,7 +340,7 @@ any active phase -> Stopping -> Finishing -> Idle
 
 - A response without calls finishes the turn unless steering input was recorded after it, which returns to `Preparing`.
 - An unusable response (undecodable, incomplete, cut off at the model's output limit, or with defective call identities) is committed as audit data plus a harness `Notice` node, executes nothing, and returns to `Preparing` (section 2.2). A turn has no request count limit: it ends when the model answers without calls, the user cancels, or the model cannot be reached.
-- `Stopping` latches one cause, refuses new work, requests stop on every job, and waits for commit and retirement. User cancel wins the user-facing status; storage failure still poisons the session.
+- `Stopping` latches one cause, refuses new work, requests stop on every job, and waits for commit and retirement or abandonment. User cancel wins the user-facing status; storage failure still latches `Storage_Failed`.
 - Steering: frontend lines queue in `Steer_Queue` and become `User` nodes with origin `Steering` only at a settled boundary. A line leaves the queue only when its node commits.
 - `Finish_Turn` commits `turn.completed` (barrier), releases snapshot references, destroys the turn arena, and emits the terminal view event once.
 
@@ -372,7 +386,8 @@ Job records are heap-allocated individually (stable addresses) into `Job_Table.s
 1. The owner builds `input` in the job arena and commits intent, then creates the thread with the job pointer as data.
 2. The worker sets its context, reads `input`, executes, writes `result` into the job arena under `handoff.mu`, stores `published = true`, calls `owner_wake_signal`, and returns. It touches nothing after the wake.
 3. The owner sees `published`, commits the result (barrier), delivers it, then calls `thread.join` and `thread.destroy` (join is the retirement proof), then destroys the arena and frees the record.
-4. A worker that does not publish within `STOP_PATIENCE` after a stop request: the owner commits `Unknown` for the call, moves the job to `Abandoned`, sets `health = .Poisoned`, and never frees that job, its arena, its thread handle, or anything the worker can reach. A poisoned session admits no turns; root exits after bounded cleanup and leaves the remainder to process exit.
+4. A worker that does not publish within `STOP_PATIENCE` after a stop request is abandoned. The owner commits `Unknown` for the call, saying the operation may still be running, moves the job to `Abandoned`, and records `job.abandoned`. The job releases its access claim and worker slot, and its turn counts it as retired, so the session keeps working. The owner frees nothing the worker can reach: the job record, its arena, its thread handle, and the stop token and snapshot references it borrows stay alive.
+5. If an abandoned worker publishes later, the owner records `job.reclaimed`, discards the result (the call already has its outcome), joins, and frees the job as in step 3. Otherwise its memory leaks until process exit, which never joins abandoned threads.
 
 There is one lifetime rule: the owner frees job memory, and only after join. No self-cleanup, orphan flags, or worker-side frees.
 
@@ -396,7 +411,7 @@ Access :: struct {
 | Process | shell, write-scope subagent, external harness | Read, Write, Process |
 | External | MCP tool | External on the same lane |
 
-A queued job starts when no earlier-admitted, unretired job conflicts with it and running blocking jobs are below `BLOCKING_JOBS_MAX_RUNNING`. Earlier means admission order, which is model call order for root calls. The owner scans the bounded table; there are no cached occupancy counts. Lua parents hold no access and no worker slot, so a parent waiting on children cannot deadlock them. Access comes from typed admitted arguments, never from MCP annotations or tool names.
+A queued job starts when no earlier-admitted job that is neither retired nor abandoned conflicts with it and running blocking jobs are below `BLOCKING_JOBS_MAX_RUNNING`. Earlier means admission order, which is model call order for root calls. The owner scans the bounded table; there are no cached occupancy counts. Lua parents hold no access and no worker slot, so a parent waiting on children cannot deadlock them. Access comes from typed admitted arguments, never from MCP annotations or tool names.
 
 ### 7.4 Deadlines and cancellation
 
@@ -479,7 +494,7 @@ compaction.started compaction.completed checkpoint.installed
 config.published config.rejected catalog.published
 cache.observed resource.observed
 rating.recorded rating.cleared assessment.recorded
-runtime.message runtime.poisoned
+runtime.message job.abandoned job.reclaimed
 ```
 
 Every record fills the correlation columns that exist at that point: session, branch, node, turn, request, attempt, job, call, parent call, task, subagent, hook, provider, model. A record states one fact at the boundary that observed it, once. Summaries are computed by readers.
@@ -577,6 +592,8 @@ coverage     = paired_input / sum(all reported input)
 
 - Sources in precedence order: user configuration, provider discovery (`GET /models`, disk-cached), models.dev (disk-cached). A present higher-precedence value is final; only absence is enriched. False, zero, and empty are present values. Lists replace, never merge. `disabled` is a tombstone.
 - Identity is `(provider_id, model_id)`. API-family behavior lives in `ai`; the catalog carries data only.
+- A difference between providers or models is expressed as data: a catalog fact the user can also set in configuration, or a classification of what the provider returned (status, error body, headers). Data takes effect on the next snapshot, with no rebuild and no new session. No code compares a model id, name, or name prefix.
+- Provider-specific code is allowed only for a wire difference that neither an API family nor a fact can express. It stays in `ai`, is keyed on a named provider behavior rather than on scattered id checks, and carries a comment naming the difference.
 
 ```odin
 Model_Facts :: struct {
