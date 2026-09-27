@@ -282,29 +282,34 @@ test_write_replaces_a_file_by_absolute_or_relative_path :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_edit_applies_every_replacement_or_none :: proc(t: ^testing.T) {
+test_patch_applies_every_file_or_none :: proc(t: ^testing.T) {
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 
-	path := strings.concatenate({tool_test_workspace(&test), "/code.txt"}, context.temp_allocator)
-	defer delete(path, context.temp_allocator)
-	if !tool_write_file(t, path, "alpha beta gamma\n") { return }
+	workspace := tool_test_workspace(&test)
+	code := strings.concatenate({workspace, "/code.txt"}, context.temp_allocator)
+	gone := strings.concatenate({workspace, "/gone.txt"}, context.temp_allocator)
+	added := strings.concatenate({workspace, "/new/added.txt"}, context.temp_allocator)
+	later := strings.concatenate({workspace, "/later.txt"}, context.temp_allocator)
+	if !tool_write_file(t, code, "one\ntwo  \nthree\nfour\nfive\n") { return }
+	if !tool_write_file(t, gone, "bye\n") { return }
 
-	arguments := strings.concatenate({`{"path":"`, path, `","edits":[{"old":"alpha","new":"ALPHA"},{"old":"gamma","new":"GAMMA"}]}`}, context.temp_allocator)
-	result := tool_run(t, &test, TOOL_EDIT_NAME, arguments)
+	// The first hunk matches only once trailing spaces are ignored.
+	patch := `{"patch":"*** Begin Patch\n*** Update File: code.txt\n@@\n one\n-two\n+TWO\n three\n@@\n-five\n+FIVE\n*** Add File: new/added.txt\n+hello\n*** Delete File: gone.txt\n*** End Patch"}`
+	result := tool_run(t, &test, TOOL_PATCH_NAME, patch)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-	if !tool_file_is(t, path, "ALPHA beta GAMMA\n") { return }
+	tool_file_is(t, code, "one\nTWO\nthree\nfour\nFIVE\n")
+	tool_file_is(t, added, "hello\n")
+	testing.expect(t, !os.exists(gone), "a deleted file is removed")
 
-	// A replacement that matches twice is refused, and the file is untouched.
-	if !tool_write_file(t, path, "same same\n") { return }
-	ambiguous := tool_run(t, &test, TOOL_EDIT_NAME, `{"path":"code.txt","edits":[{"old":"same","new":"once"}]}`)
-	testing.expect_value(t, ambiguous.outcome, session.Tool_Outcome.Invalid_Arguments)
-	if !tool_file_is(t, path, "same same\n") { return }
-
-	overlap := tool_run(t, &test, TOOL_EDIT_NAME, `{"path":"code.txt","edits":[{"old":"same","new":"x"},{"old":"e s","new":"y"}]}`)
-	testing.expect_value(t, overlap.outcome, session.Tool_Outcome.Invalid_Arguments)
-	tool_file_is(t, path, "same same\n")
+	// A hunk that matches twice fails the whole patch, so no file in it is written.
+	if !tool_write_file(t, code, "same\nsame\n") { return }
+	ambiguous := `{"patch":"*** Begin Patch\n*** Add File: later.txt\n+x\n*** Update File: code.txt\n-same\n+once\n*** End Patch"}`
+	failed := tool_run(t, &test, TOOL_PATCH_NAME, ambiguous)
+	testing.expect_value(t, failed.outcome, session.Tool_Outcome.Tool_Failed)
+	tool_file_is(t, code, "same\nsame\n")
+	testing.expect(t, !os.exists(later), "a failed patch adds no file")
 }
 
 @(test)
@@ -613,9 +618,9 @@ test_write_cancelled_before_begin_leaves_no_file :: proc(t: ^testing.T) {
 	testing.expect(t, !os.exists(full), "a cancelled write leaves no file")
 }
 
-// An edit cancelled before the rename keeps the destination unchanged.
+// A patch cancelled before the rename keeps the destination unchanged.
 @(test)
-test_edit_cancelled_before_rename_keeps_destination :: proc(t: ^testing.T) {
+test_patch_cancelled_before_rename_keeps_destination :: proc(t: ^testing.T) {
 	workspace, workspace_error := os.make_directory_temp("", "nabla-tool-cancel-*", context.allocator)
 	if workspace_error != nil { testing.fail_now(t, "could not create a workspace") }
 	defer {
@@ -626,11 +631,11 @@ test_edit_cancelled_before_rename_keeps_destination :: proc(t: ^testing.T) {
 	if !tool_write_file(t, path, "alpha\n") { return }
 
 	ctx := tool_test_cancelled_moment(workspace)
-	arguments := tool_arguments_prepare(`{"path":"code.txt","edits":[{"old":"alpha","new":"beta"}]}`, context.allocator)
+	arguments := tool_arguments_prepare(`{"patch":"*** Begin Patch\n*** Update File: code.txt\n-alpha\n+beta\n*** End Patch"}`, context.allocator)
 	defer tool_arguments_destroy(&arguments, context.allocator)
 	object, is_object := arguments.value.(json.Object)
 	if !testing.expect(t, is_object, "the arguments should parse") { return }
-	result := tool_test_execute(&ctx, TOOL_EDIT_DEFINITION, object)
+	result := tool_test_execute(&ctx, TOOL_PATCH_DEFINITION, object)
 	defer tool_result_destroy(&result)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Cancelled)
 	tool_file_is(t, path, "alpha\n")

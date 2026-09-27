@@ -11,7 +11,7 @@ Tool_Kind :: enum {
 	Custom,
 	Read,
 	Write,
-	Edit,
+	Patch,
 	Shell,
 	List_Skills,
 	Load_Skill,
@@ -25,11 +25,11 @@ Tool_Kind :: enum {
 // fields; the document they were read from stays with the call's record.
 //
 // Strings borrow the admitted document, so they live exactly as long as the job that owns it;
-// edit records are allocated beside it and released by tool_args_destroy.
+// patch sections are allocated beside it and released by tool_args_destroy.
 Tool_Args :: union {
 	Read_Args,
 	Write_Args,
-	Edit_Args,
+	Patch_Args,
 	Shell_Args,
 	List_Skills_Args,
 	Load_Skill_Args,
@@ -48,9 +48,8 @@ Write_Args :: struct {
 	content: string,
 }
 
-Edit_Args :: struct {
-	path:  string,
-	edits: []Tool_Replacement,
+Patch_Args :: struct {
+	files: []Patch_File,
 }
 
 Shell_Args :: struct {
@@ -90,8 +89,8 @@ tool_args_decode :: proc(ctx: ^Tool_Context, kind: Tool_Kind, object: json.Objec
 	case .Write:
 		args, err := tool_write_args(ctx, object)
 		return args, err
-	case .Edit:
-		args, err := tool_edit_args(ctx, object)
+	case .Patch:
+		args, err := tool_patch_args(ctx, object)
 		return args, err
 	case .Shell:
 		args, err := tool_shell_args(ctx, object)
@@ -122,9 +121,9 @@ tool_args_decode :: proc(ctx: ^Tool_Context, kind: Tool_Kind, object: json.Objec
 	return nil, {}
 }
 
-// tool_args_destroy releases what one typed call owns: the edit records, which are the only
+// tool_args_destroy releases what one typed call owns: the patch sections, which are the only
 // part of the union that is not borrowed.
 tool_args_destroy :: proc(args: ^Tool_Args, allocator := context.allocator) {
-	if edit, is_edit := args^.(Edit_Args); is_edit { delete(edit.edits, allocator) }
+	if patch, is_patch := args^.(Patch_Args); is_patch { delete(patch.files, allocator) }
 	args^ = nil
 }

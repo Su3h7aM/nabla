@@ -744,9 +744,11 @@ A repair is valid only if exactly one interpretation exists, the result passes f
 ```
 
 - Paths are workspace-relative or absolute and are canonicalized once; they become the call's `Write` access set.
-- Per file: read the current bytes and locate each hunk (context plus removed lines) searching forward from the previous hunk's end, after the `@@` anchor when given. Exactly one match is required; zero or several fail that hunk.
+- Per file: read the current bytes and locate each hunk (context plus removed lines) searching forward from the previous hunk's end, after the `@@` anchor when given. Exactly one match is required; zero or several fail that hunk. A hunk with only added lines goes directly after its anchor, or at the end of the file when it has none. `*** End of File` requires the hunk to end the file.
+- Unchanged lines keep the file's bytes, added lines take the file's line ending, and a file without a final newline keeps it that way.
+- A path may appear in one section only, counting `Move to` targets.
 - All files are computed in memory first. If any hunk fails, nothing is written. Writes then go file by file through temp-plus-rename. A rename failure after earlier renames reports `Tool_Failed` with the list of applied files, because POSIX has no multi-file atomicity.
-- Failure output names the file, hunk index, reason (`not_found`, `ambiguous{count, lines}`, `file_missing`, `file_exists`), and the nearest candidate lines, so the model can correct without rereading the file.
+- A malformed patch is `Invalid_Arguments` naming the first bad line. A patch that does not apply is `Tool_Failed` naming the file, hunk index, reason (`not_found`, `ambiguous{count, lines}`, `file_missing`, `file_exists`, `repeated_path`, `not_writable`, `unreadable`, `invalid_path`), and the nearest candidate lines, so the model can correct without rereading the file.
 
 ## 17. Lua runtime
 
@@ -992,7 +994,6 @@ A default changes only with a measurement from the journal or a benchmark test. 
 | result and output caps (`TOOL_MAX_RESULT_BYTES`, the read window cap, Lua log and message caps) | whole results projected through the context budget (section 14.3) |
 | one native lane, serial Code Mode children | access-class scheduler, `job.start` / `job.wait` |
 | a result rendered where the executor built it | typed output kept until commit, rendered once at commit |
-| `builtin_edit` old/new replacements | `builtin_patch` |
 | instruction snapshot frozen per session | snapshot per turn from live config, digests recorded |
 | `Chat_Observer` callbacks on the owner thread | `View_Queue` consumed by frontends |
 | linear entries, no fork | session tree with branches and checkpoint nodes |

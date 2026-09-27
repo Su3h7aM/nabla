@@ -494,7 +494,7 @@ AGENT_SYSTEM_PROMPT :: "You are nabla, a coding agent working from a session wor
 // tool-specific bound rather than a forgotten configuration.
 @(private)
 TOOL_DECLARED := [?]Tool_Definition {
-	TOOL_EDIT_DEFINITION,
+	TOOL_PATCH_DEFINITION,
 	TOOL_READ_DEFINITION,
 	TOOL_WRITE_DEFINITION,
 	TOOL_LIST_SKILLS_DEFINITION,

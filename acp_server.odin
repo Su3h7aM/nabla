@@ -1391,7 +1391,7 @@ acp_tool_kind :: proc(chat: ^agent.Chat_Session, name: string) -> acp.Tool_Kind 
 		return .Execute
 	case agent.TOOL_READ_NAME, agent.TOOL_RESULT_READ_NAME, agent.TOOL_LIST_SKILLS_NAME, agent.TOOL_LOAD_SKILL_NAME:
 		return .Read
-	case agent.TOOL_WRITE_NAME, agent.TOOL_EDIT_NAME:
+	case agent.TOOL_WRITE_NAME, agent.TOOL_PATCH_NAME:
 		return .Edit
 	}
 	return .Other

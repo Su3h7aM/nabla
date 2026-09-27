@@ -15,7 +15,7 @@ import "nabla:agent/session"
 Tool_Output :: union {
 	Read_Output,
 	Write_Output,
-	Edit_Output,
+	Patch_Output,
 	Shell_Output,
 	Skills_Output,
 	Skill_Output,
@@ -40,9 +40,12 @@ Write_Output :: struct {
 	bytes: int,
 }
 
-Edit_Output :: struct {
-	path:         string,
-	replacements: int,
+// Patch_Output is what a patch changed. summary has one line per file, in patch order, such as
+// `updated <path>` or `moved <path> to <path>`.
+Patch_Output :: struct {
+	files:                     int,
+	whitespace_repaired_hunks: int,
+	summary:                   string,
 }
 
 // Shell_Output is what a command produced. exit_code is present only when the command
@@ -169,9 +172,10 @@ tool_result_render :: proc(
 	case Write_Output:
 		render_field(&head, "path", value.path) or_return
 		render_field(&head, "bytes", value.bytes) or_return
-	case Edit_Output:
-		render_field(&head, "path", value.path) or_return
-		render_field(&head, "replacements", value.replacements) or_return
+	case Patch_Output:
+		render_field(&head, "files", value.files) or_return
+		if value.whitespace_repaired_hunks > 0 { render_field(&head, "whitespace_repaired_hunks", value.whitespace_repaired_hunks) or_return }
+		render_text(&body, value.summary) or_return
 	case Shell_Output:
 		if code, exited := value.exit_code.?; exited { render_field(&head, "exit_code", code) or_return }
 		render_field(&head, "stdout_truncated", value.stdout_truncated) or_return
@@ -394,10 +398,10 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		borrowed := value
 		value.path = ""
 		value.path = strings.clone(borrowed.path, allocator) or_return
-	case Edit_Output:
+	case Patch_Output:
 		borrowed := value
-		value.path = ""
-		value.path = strings.clone(borrowed.path, allocator) or_return
+		value.summary = ""
+		value.summary = strings.clone(borrowed.summary, allocator) or_return
 	case Shell_Output:
 		borrowed := value
 		value.stdout = ""
@@ -479,8 +483,8 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 		delete(value.content, allocator)
 	case Write_Output:
 		delete(value.path, allocator)
-	case Edit_Output:
-		delete(value.path, allocator)
+	case Patch_Output:
+		delete(value.summary, allocator)
 	case Shell_Output:
 		delete(value.stdout, allocator)
 		delete(value.stderr, allocator)

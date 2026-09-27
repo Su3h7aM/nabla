@@ -44,7 +44,7 @@ test_tool_presentation_uses_the_tools_own_names_and_hints :: proc(t: ^testing.T)
 	chat: agent.Chat_Session
 	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_READ_NAME), acp.Tool_Kind.Read)
 	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_WRITE_NAME), acp.Tool_Kind.Edit)
-	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_EDIT_NAME), acp.Tool_Kind.Edit)
+	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_PATCH_NAME), acp.Tool_Kind.Edit)
 	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_SHELL_NAME), acp.Tool_Kind.Execute)
 	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_CODE_NAME), acp.Tool_Kind.Execute)
 	testing.expect_value(t, acp_tool_kind(&chat, "some_mcp_tool"), acp.Tool_Kind.Other)

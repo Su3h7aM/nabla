@@ -35,7 +35,7 @@ test_build_request_uses_canonical_tool_names_directly :: proc(t: ^testing.T) {
 	found_mcp := false
 	for tool in prep.request.Tools {
 		testing.expect(t, !strings.contains(tool.Name, "."), "provider tool names must not contain dots")
-		if tool.Name == "builtin_edit" { found_builtin = true }
+		if tool.Name == TOOL_PATCH_NAME { found_builtin = true }
 		if tool.Name == "FFF_find_files" { found_mcp = true }
 	}
 	testing.expect(t, found_builtin, "built-in tools are advertised")
