@@ -37,13 +37,6 @@ CHAT_DEFAULT_CONTEXT_WINDOW :: 128 * 1024
 // no maximum of its own.
 CHAT_DEFAULT_OUTPUT_TOKENS :: 4096
 
-// CHAT_OUTPUT_MAX_TOKENS is the most a request asks the model to generate. A model's
-// stated maximum is a capability, not a per-request need: one that can emit 128K tokens
-// in a single response almost never does, and asking for it would say nothing useful.
-// This ceiling covers a long answer, a large file written through a tool call, and a
-// reasoning model's thinking.
-CHAT_OUTPUT_MAX_TOKENS :: 32 * 1024
-
 // CHAT_OUTPUT_MIN_TOKENS is the smallest answer worth asking for. A request that cannot
 // leave this much room is refused, because an answer with nowhere to go is not worth
 // sending; the window less this and the margin is therefore the real input limit.
@@ -100,8 +93,7 @@ model_capacity_admits :: proc(capacity: Model_Capacity, estimate: int) -> bool {
 }
 
 // chat_request_output_bound is what a request may ask the model to generate: the room the
-// window has left once the input and the margin are charged, bounded by what the model
-// allows and by what the harness will ever ask for.
+// window has left once the input and the margin are charged, bounded by what the model allows.
 //
 // The bound shrinks as the context fills, which is the point. The window is one budget
 // rather than an input budget plus a reserved output budget, so a fuller context asks for
@@ -113,7 +105,7 @@ model_capacity_admits :: proc(capacity: Model_Capacity, estimate: int) -> bool {
 // what it would have carried.
 chat_request_output_bound :: proc(capacity: Model_Capacity, estimate: int) -> (output: int, fits: bool) {
 	room := capacity.window - estimate - capacity.margin
-	output = min(room, min(capacity.model_max_output, CHAT_OUTPUT_MAX_TOKENS))
+	output = min(room, capacity.model_max_output)
 	if output < 1 { output = 1 }
 	return output, room >= chat_capacity_answer_floor(capacity)
 }

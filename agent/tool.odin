@@ -410,15 +410,6 @@ tool_definition_destroy :: proc(definition: ^Tool_Definition, allocator: mem.All
 
 // --- results -----------------------------------------------------------------
 
-// TOOL_MAX_RESULT_BYTES bounds the model-visible content of every tool result.
-// A result that does not fit is shortened or replaced before it is stored, so
-// no single call can consume a large part of the model context.
-TOOL_MAX_RESULT_BYTES :: 64 * 1024
-
-// TOOL_RESULT_REPLACED_OVERSIZED is the message of a result replaced for its size. It
-// is a constant so the replacement is always reported in the same bytes.
-TOOL_RESULT_REPLACED_OVERSIZED :: "the tool result exceeded the harness output limit and was replaced"
-
 // TOOL_RESULT_READ_NAME is the tool that reads a result back. It is named here, beside
 // the handle that tells the model to call it, because the tool and the handle are one
 // contract.
@@ -511,22 +502,6 @@ tool_result_refused :: proc(ctx: ^Tool_Context, err: ^Tool_Argument_Error) -> To
 	result.error = err^
 	err^ = {}
 	return result
-}
-
-// tool_result_finalize is the boundary between execution and storage, applied once in
-// tool_jobs_commit immediately before the result is recorded. It takes ownership of result
-// and returns the result to record, which is result itself unless it is larger than the
-// harness sends; an oversized result is replaced by one that keeps the observed outcome and
-// says why, because the harness did observe the end and replacing the outcome would rewrite
-// what happened.
-tool_result_finalize :: proc(ctx: ^Tool_Context, result: Tool_Result) -> Tool_Result {
-	if result.allocation_failed || len(result.content) <= TOOL_MAX_RESULT_BYTES { return result }
-	replaced := tool_result_of(ctx, result.outcome, TOOL_RESULT_REPLACED_OVERSIZED, nil, result.reason)
-	replaced.error = result.error
-	discarded := result
-	discarded.error = {}
-	tool_result_destroy(&discarded)
-	return replaced
 }
 
 // tool_control_cancelled reports whether the execution, or the work that owns it, was

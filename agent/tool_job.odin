@@ -773,13 +773,13 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 
 	if sync.atomic_load(&job.published) { return }
 	message := fmt.tprintf("the tool did not stop within %v of its stop being requested; its outcome is unknown", TOOL_JOBS_STOP_PATIENCE)
-	finalized := tool_result_finalize(&job.exec, tool_result_failure(&job.exec, .Unknown, message, "did not stop"))
+	result := tool_result_failure(&job.exec, .Unknown, message, "did not stop")
 	spilled := false
 	result_seq: session.Seq
 	recorded := false
-	if !finalized.allocation_failed {
-		if !job.nested { spilled = !tool_budget_take(&jobs.budget, finalized.content) }
-		result_seq, recorded = chat_record_tool_result(chat, job.call, &finalized, spilled)
+	if !result.allocation_failed {
+		if !job.nested { spilled = !tool_budget_take(&jobs.budget, result.content) }
+		result_seq, recorded = chat_record_tool_result(chat, job.call, &result, spilled)
 	}
 
 	tool_jobs_mark_abandoned(jobs, job)
@@ -796,8 +796,8 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 		{key = "waited_ms", value = i64(waited / time.Millisecond)},
 	}
 	log_emit({level = .Error, category = .Tool, event = "tool.job_stuck", fields = fields[:]})
-	if recorded { _observer_tool_result(observer, job.name, &finalized) }
-	tool_result_destroy(&finalized)
+	if recorded { _observer_tool_result(observer, job.name, &result) }
+	tool_result_destroy(&result)
 	if !recorded {
 		// The answer could not be recorded, so the session's storage failed. Recovery still
 		// answers this call from its dispatch entry.
@@ -836,15 +836,13 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	defer context.logger = previous
 	job.phase = .Committing
 
-	// The commit takes the result off the job: one owner at a time. Finalization hands back
-	// what is recorded, which is the same result unless it was too large, and that is the
-	// single release for it, so retirement has nothing left to free.
+	// The commit takes the result off the job: one owner at a time, and the release here is
+	// the only one, so retirement has nothing left to free.
 	result := job.result
 	job.result = {}
 	job.result_present = false
-	finalized := tool_result_finalize(&job.exec, result)
-	if finalized.allocation_failed {
-		tool_result_destroy(&finalized)
+	if result.allocation_failed {
+		tool_result_destroy(&result)
 		job.phase = .Retiring
 		if jobs.stop == .None { jobs.stop = .Storage_Failed }
 		return
@@ -853,11 +851,11 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	// The decision is made once, here, and stored: a request built later sends the
 	// same bytes however much the context has grown by then.
 	spilled := false
-	if !job.nested { spilled = !tool_budget_take(&jobs.budget, finalized.content) }
-	result_seq, recorded := chat_record_tool_result(chat, job.call, &finalized, spilled)
+	if !job.nested { spilled = !tool_budget_take(&jobs.budget, result.content) }
+	result_seq, recorded := chat_record_tool_result(chat, job.call, &result, spilled)
 	if !recorded {
 		// The result cannot be recorded, so it must not be reported as if it were.
-		tool_result_destroy(&finalized)
+		tool_result_destroy(&result)
 		job.phase = .Result_Ready
 		tool_jobs_latch_stop(jobs, chat)
 		return
@@ -867,18 +865,18 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	jobs.committed += 1
 	if !job.nested { jobs.committed_roots += 1 }
 	if job.parent != nil {
-		codemode_job_child_committed(jobs, job, &finalized)
+		codemode_job_child_committed(jobs, job, &result)
 	}
 
 	committed := [4]Log_Field {
 		{key = "tool", value = job.name},
-		{key = "outcome", value = session.tool_outcome_name(finalized.outcome)},
+		{key = "outcome", value = session.tool_outcome_name(result.outcome)},
 		{key = "result_seq", value = i64(result_seq)},
 		{key = "spilled", value = spilled},
 	}
 	log_emit({level = .Info, category = .Tool, event = "tool.result_committed", fields = committed[:]})
-	_observer_tool_result(observer, job.name, &finalized)
-	tool_result_destroy(&finalized)
+	_observer_tool_result(observer, job.name, &result)
+	tool_result_destroy(&result)
 	job.phase = .Retiring
 }
 

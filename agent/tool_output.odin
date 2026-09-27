@@ -51,12 +51,11 @@ Patch_Output :: struct {
 // Shell_Output is what a command produced. exit_code is present only when the command
 // exited rather than being ended by a signal.
 Shell_Output :: struct {
-	exit_code:         Maybe(int),
-	stdout_truncated:  bool,
-	stderr_truncated:  bool,
-	output_incomplete: bool,
-	stdout:            string,
-	stderr:            string,
+	exit_code:        Maybe(int),
+	stdout_truncated: bool,
+	stderr_truncated: bool,
+	stdout:           string,
+	stderr:           string,
 }
 
 Skill_Record :: struct {
@@ -182,7 +181,6 @@ tool_result_render :: proc(
 		if code, exited := value.exit_code.?; exited { render_field(&head, "exit_code", code) or_return }
 		render_field(&head, "stdout_truncated", value.stdout_truncated) or_return
 		render_field(&head, "stderr_truncated", value.stderr_truncated) or_return
-		render_field(&head, "output_incomplete", value.output_incomplete) or_return
 		render_section(&body, "stdout", value.stdout) or_return
 		render_section(&body, "stderr", value.stderr) or_return
 	case Skills_Output:

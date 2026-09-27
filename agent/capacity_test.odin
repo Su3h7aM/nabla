@@ -77,7 +77,7 @@ test_the_input_ceiling_leaves_only_the_margin_and_one_answer :: proc(t: ^testing
 	// window is, and a model that cannot generate the harness's floor is not asked for
 	// more than it allows.
 	modest, _ := chat_request_output_bound(capacity, 0)
-	testing.expect_value(t, modest, CHAT_OUTPUT_MAX_TOKENS)
+	testing.expect_value(t, modest, 128 * 1_024)
 	small_maximum := capacity_of(1_000_000, 512)
 	tiny, tiny_fits := chat_request_output_bound(small_maximum, 0)
 	testing.expect(t, tiny_fits, "an empty window has room whatever the model can generate")

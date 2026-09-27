@@ -21,9 +21,6 @@ TOOL_READ_SCHEMA :: `{"type":"object","properties":{"path":{"type":"string","des
 TOOL_READ_FIELDS :: []string{"path", "offset", "limit"}
 
 TOOL_READ_DEFAULT_LINES :: 2000
-TOOL_READ_MAX_LINES :: 20000
-TOOL_READ_MAX_BYTES :: 48 * 1024
-TOOL_READ_MAX_FILE_BYTES :: 8 * 1024 * 1024
 
 TOOL_READ_DEFINITION :: Tool_Definition {
 	name = TOOL_READ_NAME,
@@ -38,16 +35,8 @@ TOOL_READ_DEFINITION :: Tool_Definition {
 tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Read_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_READ_FIELDS, allocator = ctx.allocator) or_return
 	args.path = tool_field_string(arguments, "path", allocator = ctx.allocator) or_return
-	args.offset = tool_field_optional_int(arguments, "offset", 1, 1, TOOL_READ_MAX_LINES, &ctx.repairs, allocator = ctx.allocator) or_return
-	args.limit = tool_field_optional_int(
-		arguments,
-		"limit",
-		TOOL_READ_DEFAULT_LINES,
-		1,
-		TOOL_READ_MAX_LINES,
-		&ctx.repairs,
-		allocator = ctx.allocator,
-	) or_return
+	args.offset = tool_field_optional_int(arguments, "offset", 1, 1, max(int) / 2, &ctx.repairs, allocator = ctx.allocator) or_return
+	args.limit = tool_field_optional_int(arguments, "limit", TOOL_READ_DEFAULT_LINES, 1, max(int) / 2, &ctx.repairs, allocator = ctx.allocator) or_return
 	return
 }
 
@@ -62,14 +51,6 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 	defer os.file_info_delete(info, ctx.allocator)
 	if info_error != nil || info.type != .Regular {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("there is no readable file at %s", args.path), "not a file")
-	}
-	if info.size > TOOL_READ_MAX_FILE_BYTES {
-		return tool_result_failure(
-			ctx,
-			.Tool_Failed,
-			fmt.tprintf("%s is larger than the %d-byte read limit", args.path, TOOL_READ_MAX_FILE_BYTES),
-			"too large",
-		)
 	}
 	// The read below can block on the filesystem, so cancellation is checked
 	// before the expensive call and again before the output is built. There is
@@ -97,11 +78,6 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 	start := tool_line_start(text, args.offset)
 	end, lines := tool_line_span(text, start, args.limit)
 	content := text[start:end]
-	// A single very long line is taken whole by the line span and truncated
-	// here, which is a different fact from the line range ending early. Both
-	// set truncated, so the model knows when it did not receive everything.
-	byte_truncated := len(content) > TOOL_READ_MAX_BYTES
-	if byte_truncated { content = tool_truncate_runes(content, TOOL_READ_MAX_BYTES) }
 
 	result := Read_Output {
 		path        = args.path,
@@ -109,7 +85,7 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 		first_line  = args.offset,
 		line_count  = lines,
 		total_lines = total_lines,
-		truncated   = end < len(text) || byte_truncated,
+		truncated   = end < len(text),
 	}
 	reason := fmt.tprintf("lines %d-%d of %d", args.offset, args.offset + lines - 1, total_lines) if lines > 0 else "no lines"
 	return tool_result_success(ctx, result, reason)
@@ -142,10 +118,7 @@ tool_line_start :: proc(text: string, line: int) -> int {
 	return offset
 }
 
-// tool_line_span returns the end offset and line count of up to limit lines
-// starting at start, stopping early when the byte budget is reached. One line is
-// always taken, so a single very long line is returned truncated rather than
-// omitted.
+// tool_line_span returns the end offset and line count of up to limit lines starting at start.
 @(private)
 tool_line_span :: proc(text: string, start, limit: int) -> (end: int, lines: int) {
 	end = start
@@ -153,7 +126,6 @@ tool_line_span :: proc(text: string, start, limit: int) -> (end: int, lines: int
 		newline := strings.index_byte(text[end:], '\n')
 		next := len(text)
 		if newline >= 0 { next = end + newline + 1 }
-		if lines > 0 && next - start > TOOL_READ_MAX_BYTES { break }
 		end = next
 		lines += 1
 	}

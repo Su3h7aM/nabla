@@ -13,8 +13,6 @@ TOOL_LIST_SKILLS_DESCRIPTION :: "List available skills by metadata. Returns name
 TOOL_LIST_SKILLS_SCHEMA :: `{"type":"object","properties":{"query":{"type":["string","null"],"description":"Whitespace-separated terms; every term must occur in the name or description."},"offset":{"type":["integer","null"],"description":"First match to return."},"limit":{"type":["integer","null"],"description":"Maximum matches to return."}},"additionalProperties":false}`
 TOOL_LIST_SKILLS_FIELDS :: []string{"query", "offset", "limit"}
 TOOL_LIST_SKILLS_DEFAULT_LIMIT :: 20
-TOOL_LIST_SKILLS_MAX_LIMIT :: 100
-TOOL_LIST_SKILLS_MAX_QUERY_BYTES :: 4096
 
 TOOL_LOAD_SKILL_NAME :: "builtin_load_skill"
 TOOL_LOAD_SKILL_DESCRIPTION :: "Load one skill's complete instructions by name. Returns the full body in a single tool result."
@@ -48,7 +46,7 @@ tool_list_skills_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (ar
 		"limit",
 		TOOL_LIST_SKILLS_DEFAULT_LIMIT,
 		1,
-		TOOL_LIST_SKILLS_MAX_LIMIT,
+		max(int) / 2,
 		&ctx.repairs,
 		allocator = ctx.allocator,
 	) or_return
@@ -61,50 +59,34 @@ tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	if ctx.skills == nil {
 		return tool_result_failure(ctx, .Unavailable, "skills are unavailable in this session", "unavailable")
 	}
-	if len(query) > TOOL_LIST_SKILLS_MAX_QUERY_BYTES {
-		oversized := tool_argument_error(.Too_Large, "query", "at most 4096 bytes", ctx.allocator)
-		return tool_result_refused(ctx, &oversized)
-	}
 	matches, matched := list_skills_match(ctx.skills.skills, query, ctx.allocator)
 	if !matched {
 		return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be built", "too large")
 	}
 	defer delete(matches, ctx.allocator)
-	// The listing shares the global result budget with every other tool. When
-	// the requested page does not fit, the page shrinks instead of bypassing
-	// the bound: the caller pages forward with next_offset as usual.
-	page_limit := limit
-	for {
-		page_end := len(matches)
-		if offset <= len(matches) && page_limit <= len(matches) - offset { page_end = offset + page_limit }
-		page := matches[offset:page_end] if offset <= len(matches) else matches[len(matches):]
-		records := make([]Skill_Record, len(page), ctx.allocator)
-		if len(page) > 0 && records == nil {
-			return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be built", "too large")
-		}
-		for match, index in page {
-			records[index] = Skill_Record {
-				name        = match.name,
-				description = match.description,
-				source      = skill_source_label(ctx.skills, match^),
-			}
-		}
-		next_offset: Maybe(int)
-		if page_end < len(matches) { next_offset = page_end }
-		data := Skills_Output {
-			skills        = records,
-			total_matches = len(matches),
-			next_offset   = next_offset,
-		}
-		result := tool_result_success(ctx, data, fmt.tprintf("%d of %d skills", len(records), len(matches)))
-		delete(records, ctx.allocator)
-		if len(result.content) <= TOOL_MAX_RESULT_BYTES { return result }
-		tool_result_destroy(&result)
-		if page_limit <= 1 {
-			return tool_result_failure(ctx, .Tool_Failed, "the skill listing exceeds the result limit; narrow the query or use a smaller limit", "too large")
-		}
-		page_limit /= 2
+	page_end := len(matches)
+	if offset <= len(matches) && limit <= len(matches) - offset { page_end = offset + limit }
+	page := matches[offset:page_end] if offset <= len(matches) else matches[len(matches):]
+	records := make([]Skill_Record, len(page), ctx.allocator)
+	if len(page) > 0 && records == nil {
+		return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be allocated", "allocation failed")
 	}
+	defer delete(records, ctx.allocator)
+	for match, index in page {
+		records[index] = Skill_Record {
+			name        = match.name,
+			description = match.description,
+			source      = skill_source_label(ctx.skills, match^),
+		}
+	}
+	next_offset: Maybe(int)
+	if page_end < len(matches) { next_offset = page_end }
+	data := Skills_Output {
+		skills        = records,
+		total_matches = len(matches),
+		next_offset   = next_offset,
+	}
+	return tool_result_success(ctx, data, fmt.tprintf("%d of %d skills", len(records), len(matches)))
 }
 
 tool_load_skill_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Load_Skill_Args, err: Tool_Argument_Error) {
@@ -152,13 +134,6 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 		instructions   = loaded.body,
 	}
 	result := tool_result_success(ctx, data, fmt.tprintf("loaded skill %s", skill.name))
-	// A single body has no smaller page to shrink to, so an oversized skill is
-	// an explicit bounded failure until pagination or another deliberate design
-	// exists. It must not bypass the global result budget.
-	if len(result.content) > TOOL_MAX_RESULT_BYTES {
-		tool_result_destroy(&result)
-		return tool_result_failure(ctx, .Tool_Failed, "the skill exceeds the result limit", "too large")
-	}
 	return result
 }
 

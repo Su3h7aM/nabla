@@ -284,15 +284,6 @@ codemode_job_answer_value :: proc(job: ^Tool_Job) {
 		logs_truncated = run.logs_truncated,
 	}
 	result := codemode_job_result(job, .Success, "", output, "completed")
-	if len(result.content) > TOOL_MAX_RESULT_BYTES {
-		tool_result_destroy(&result)
-		limit := fmt.tprintf(
-			"the returned value, logs, and call summaries exceed the %d-byte result limit; return less from the script",
-			TOOL_MAX_RESULT_BYTES,
-		)
-		codemode_job_answer(job, .Tool_Failed, .Output_Limit, limit, "output limit")
-		return
-	}
 	job.result = result
 	job.result_present = true
 	job.phase = .Result_Ready

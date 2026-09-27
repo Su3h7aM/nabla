@@ -595,46 +595,23 @@ tool_test_result_matches :: proc(t: ^testing.T, content: string, outcome: sessio
 	return testing.expect(t, strings.has_prefix(content, expected), content)
 }
 
-// Finalization is the last step before storage: a result that fits passes through untouched,
-// while one over the limit keeps the outcome the harness observed and says it was replaced.
+// The harness adds no size limit of its own: a long line is returned whole, and the context
+// budget decides later whether the model sees it inline or through a handle.
 @(test)
-test_result_finalize_replaces_only_what_is_too_large :: proc(t: ^testing.T) {
-	ctx := Tool_Context {
-		call_id   = "call_1",
-		allocator = context.allocator,
-	}
-
-	small := tool_result_success(&ctx, nil, "done")
-	small_content := small.content
-	finalized_small := tool_result_finalize(&ctx, small)
-	defer tool_result_destroy(&finalized_small)
-	testing.expect_value(t, finalized_small.outcome, session.Tool_Outcome.Success)
-	testing.expect_value(t, finalized_small.content, small_content)
-
-	// Finalization takes the result it is given, so only what it hands back is released.
-	oversized := tool_result_success(&ctx, Read_Output{content = strings.repeat("x", TOOL_MAX_RESULT_BYTES, context.temp_allocator)}, "too large")
-	finalized_oversized := tool_result_finalize(&ctx, oversized)
-	defer tool_result_destroy(&finalized_oversized)
-	testing.expect_value(t, finalized_oversized.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(finalized_oversized.content, TOOL_RESULT_REPLACED_OVERSIZED), finalized_oversized.content)
-	testing.expect(t, len(finalized_oversized.content) <= TOOL_MAX_RESULT_BYTES, "a replaced result fits the limit")
-}
-
-@(test)
-test_read_reports_single_line_byte_truncation :: proc(t: ^testing.T) {
+test_read_returns_a_long_line_whole :: proc(t: ^testing.T) {
 	test: Tool_Test
 	tool_test_begin(t, &test)
 	defer tool_test_end(t, &test)
 
-	// One line longer than the byte budget: the line span takes it whole, so
-	// only the byte truncation marks the result incomplete.
-	line := strings.concatenate({strings.repeat("a", TOOL_READ_MAX_BYTES + 100, context.temp_allocator), "\n"}, context.temp_allocator)
+	long := strings.repeat("a", 256 * 1024, context.temp_allocator)
+	line := strings.concatenate({long, "\n"}, context.temp_allocator)
 	path := strings.concatenate({tool_test_workspace(&test), "/long.txt"}, context.temp_allocator)
 	if !tool_write_file(t, path, line) { return }
 
 	result := tool_run(t, &test, TOOL_READ_NAME, `{"path":"long.txt"}`)
 	testing.expect_value(t, result.outcome, session.Tool_Outcome.Success)
-	testing.expect(t, strings.contains(result.content, "truncated: true\n"), "a byte-truncated line must report truncation")
+	testing.expect(t, !strings.contains(result.content, "truncated: true\n"), "a whole file must not report truncation")
+	testing.expect(t, strings.contains(result.content, long), "the line must be returned whole")
 }
 
 // --- timeout policy ------------------------------------------------------------

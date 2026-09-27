@@ -38,9 +38,6 @@ TOOL_SHELL_DEFAULT_TIMEOUT :: 120 * time.Second
 TOOL_MAX_STDOUT_BYTES :: 24 * 1024
 TOOL_MAX_STDERR_BYTES :: 24 * 1024
 
-// Both excerpts and the rest of the result must fit the result budget together.
-#assert(TOOL_MAX_STDOUT_BYTES + TOOL_MAX_STDERR_BYTES < TOOL_MAX_RESULT_BYTES)
-
 // tool_shell_definition is the shell tool, described for the shell this process
 // will run: the shell decides the syntax the model has to write, and the tool does
 // not translate between shells. The caller owns the description it returns and
@@ -162,8 +159,7 @@ tool_shell_not_started :: proc(ctx: ^Tool_Context, cause: os.Error, data: Shell_
 	return tool_shell_finish(ctx, .Tool_Failed, fmt.tprintf("the command did not start: %s", os.error_string(cause)), data)
 }
 
-// tool_shell_finish bounds the captured streams to valid UTF-8 inside the model
-// result budget and builds the result.
+// tool_shell_finish sanitizes the captured streams to valid UTF-8 and builds the result.
 tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, message: string, captured: Shell_Output, reason := "") -> Tool_Result {
 	data := captured
 	stdout_sanitized, stdout_cut := tool_sanitize_stream(data.stdout, TOOL_MAX_STDOUT_BYTES, ctx.allocator)
@@ -174,26 +170,7 @@ tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: session.Tool_Outcome, mes
 	data.stderr = stderr_sanitized
 	data.stdout_truncated = data.stdout_truncated || stdout_cut
 	data.stderr_truncated = data.stderr_truncated || stderr_cut
-
-	result := tool_result_of(ctx, outcome, message, data, reason)
-	for len(result.content) > TOOL_MAX_RESULT_BYTES {
-		tool_result_destroy(&result)
-		if len(data.stdout) == 0 && len(data.stderr) == 0 {
-			data.output_incomplete = true
-			result = tool_result_of(ctx, outcome, "the result did not fit the harness budget", data, reason)
-			break
-		}
-		if len(data.stdout) >= len(data.stderr) {
-			data.stdout = tool_truncate_runes(data.stdout, len(data.stdout) / 2)
-			data.stdout_truncated = true
-		} else {
-			data.stderr = tool_truncate_runes(data.stderr, len(data.stderr) / 2)
-			data.stderr_truncated = true
-		}
-		data.output_incomplete = true
-		result = tool_result_of(ctx, outcome, message, data, reason)
-	}
-	return result
+	return tool_result_of(ctx, outcome, message, data, reason)
 }
 
 // tool_truncate_runes returns the longest prefix of s that is at most limit
