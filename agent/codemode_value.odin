@@ -391,9 +391,10 @@ codemode_lua_json_decode :: proc "c" (state: ^lua.State) -> c.int {
 	temp := virtual.arena_temp_begin(&run.scratch)
 	text := string((cast([^]u8)pointer)[:length])
 	if admit_error := tool_json_admit(text, context.temp_allocator); admit_error.kind != .None {
+		defect := codemode_json_defect_text(admit_error)
 		return codemode_lua_raise(
 			state,
-			strings.concatenate({"json.decode refused the text: ", codemode_json_defect_text(admit_error.kind)}, context.temp_allocator),
+			fmt.tprintf("json.decode refused the text: %s, at line %d column %d", defect, admit_error.line, admit_error.column),
 			temp,
 		)
 	}
@@ -406,12 +407,12 @@ codemode_lua_json_decode :: proc "c" (state: ^lua.State) -> c.int {
 	return 1
 }
 
-// codemode_json_defect_text says what makes a text unreadable as JSON.
+// codemode_json_defect_text says what makes a text unreadable as JSON. The text is temporary.
 @(private)
-codemode_json_defect_text :: proc(kind: Tool_Argument_Error_Kind) -> string {
-	#partial switch kind {
+codemode_json_defect_text :: proc(defect: Tool_Argument_Error) -> string {
+	#partial switch defect.kind {
 	case .Duplicate_Field:
-		return "an object repeats a field name"
+		return fmt.tprintf("field %q appears twice in one object", defect.field)
 	case .Too_Deep:
 		return fmt.tprintf("it nests more than %d levels deep", TOOL_MAX_ARGS_DEPTH)
 	case .Number_Out_Of_Range:

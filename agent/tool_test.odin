@@ -160,6 +160,14 @@ test_admission_repairs_only_what_has_one_reading :: proc(t: ^testing.T) {
 		defer tool_arguments_destroy(&arguments, context.allocator)
 		testing.expectf(t, arguments.error.kind == c.kind, "%s reported %v", c.raw, arguments.error.kind)
 	}
+
+	placed := tool_arguments_prepare("{\"path\":\"a\",\n \"path\":\"b\"}", context.allocator)
+	defer tool_arguments_destroy(&placed, context.allocator)
+	testing.expect_value(
+		t,
+		tool_argument_error_text(placed.error, context.temp_allocator),
+		`field "path" appears twice in one object; a field may appear once, at line 2 column 2`,
+	)
 }
 
 // An integer field reads an integer written as a whole number or as a decimal string, writes

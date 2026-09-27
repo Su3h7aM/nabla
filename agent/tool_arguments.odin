@@ -46,6 +46,10 @@ Tool_Argument_Error :: struct {
 	kind:     Tool_Argument_Error_Kind,
 	field:    string, // owned
 	expected: string, // owned
+	// line and column place a defect found in the document text, both counting from 1.
+	// Zero means the defect is about a field's value rather than a place in the text.
+	line:     int,
+	column:   int,
 }
 
 tool_argument_error :: proc(kind: Tool_Argument_Error_Kind, field := "", expected := "", allocator := context.allocator) -> Tool_Argument_Error {
@@ -91,35 +95,43 @@ tool_argument_error_code :: proc(err: Tool_Argument_Error) -> string {
 	return ""
 }
 
-// tool_argument_error_text renders a defect as one sentence. The same defect
-// always renders the same bytes, so a recovery turn adds no wording churn to the
-// cacheable prefix.
+// tool_argument_error_text renders a defect as one sentence, ending with where the defect is
+// when it was found in the document text. The same defect always renders the same bytes, so
+// a recovery turn adds no wording churn to the cacheable prefix.
 tool_argument_error_text :: proc(err: Tool_Argument_Error, allocator := context.allocator) -> string {
+	sentence := tool_argument_error_sentence(err)
+	if err.line == 0 { return strings.clone(sentence, allocator) }
+	return fmt.aprintf("%s, at line %d column %d", sentence, err.line, err.column, allocator = allocator)
+}
+
+// tool_argument_error_sentence says what a defect is. The text is temporary.
+@(private)
+tool_argument_error_sentence :: proc(err: Tool_Argument_Error) -> string {
 	switch err.kind {
 	case .None:
 		return ""
 	case .Not_Object:
-		return strings.clone("the arguments must be a JSON object", allocator)
+		return "the arguments must be a JSON object"
 	case .Syntax:
-		return strings.clone("the arguments are not valid JSON", allocator)
+		return "the arguments are not valid JSON"
 	case .Duplicate_Field:
-		return strings.clone("the arguments repeat a field name; a field may appear once", allocator)
+		return fmt.tprintf("field %q appears twice in one object; a field may appear once", err.field)
 	case .Unknown_Field:
-		return fmt.aprintf("unknown field %q; expected %s", err.field, err.expected, allocator = allocator)
+		return fmt.tprintf("unknown field %q; expected %s", err.field, err.expected)
 	case .Missing_Field:
-		return fmt.aprintf("missing required field %q", err.field, allocator = allocator)
+		return fmt.tprintf("missing required field %q", err.field)
 	case .Wrong_Type:
-		return fmt.aprintf("field %q must be %s", err.field, err.expected, allocator = allocator)
+		return fmt.tprintf("field %q must be %s", err.field, err.expected)
 	case .Invalid_Value:
-		if err.expected != "" { return fmt.aprintf("field %q must be %s", err.field, err.expected, allocator = allocator) }
-		return fmt.aprintf("field %q is invalid", err.field, allocator = allocator)
+		if err.expected != "" { return fmt.tprintf("field %q must be %s", err.field, err.expected) }
+		return fmt.tprintf("field %q is invalid", err.field)
 	case .Too_Large:
-		if err.expected != "" { return fmt.aprintf("field %q must be %s", err.field, err.expected, allocator = allocator) }
-		return fmt.aprintf("field %q is too large", err.field, allocator = allocator)
+		if err.expected != "" { return fmt.tprintf("field %q must be %s", err.field, err.expected) }
+		return fmt.tprintf("field %q is too large", err.field)
 	case .Too_Deep:
-		return fmt.aprintf("the arguments nest more than %d levels deep", TOOL_MAX_ARGS_DEPTH, allocator = allocator)
+		return fmt.tprintf("the arguments nest more than %d levels deep", TOOL_MAX_ARGS_DEPTH)
 	case .Number_Out_Of_Range:
-		return strings.clone("the arguments hold a number that no 64-bit integer or finite float can hold", allocator)
+		return "the arguments hold a number that no 64-bit integer or finite float can hold"
 	}
 	return ""
 }
@@ -255,23 +267,18 @@ tool_repairs_text :: proc(repairs: session.Tool_Repairs, allocator := context.al
 	return strings.to_string(builder)
 }
 
-// tool_arguments_admit reports the first structural defect in a proposed
-// argument document. The document must be one JSON object, alone in its input,
-// with no repeated field name at any depth and no nesting past the argument
-// bound. A repeated field name is refused rather than resolved: the harness will
-// not choose which of two values the model meant.
-//
+// tool_arguments_admit reports the first structural defect in a proposed argument document,
+// which must be one JSON object that tool_json_admit admits.
 tool_arguments_admit :: proc(raw: string, allocator: mem.Allocator) -> Tool_Argument_Error {
-	tokenizer := json.make_tokenizer(raw, .JSON, true)
-	token, token_err := json.get_token(&tokenizer)
-	if tool_token_bad(token, token_err) { return tool_argument_error(.Syntax, allocator = allocator) }
-	if token.kind != .Open_Brace { return tool_argument_error(.Not_Object, allocator = allocator) }
+	if !strings.has_prefix(strings.trim_left_space(raw), "{") { return tool_argument_error(.Not_Object, allocator = allocator) }
 	return tool_json_admit(raw, allocator)
 }
 
 // tool_json_admit reports the first defect in a JSON document of any kind: one value alone
 // in its input, no repeated field name, no nesting past the argument bound, and no number
-// the parser cannot hold. A document it admits parses to exactly what it says.
+// the parser cannot hold. A document it admits parses to exactly what it says. A repeated
+// field name is refused rather than resolved, because the harness will not choose which of
+// two values was meant. Every defect it reports carries the position of the token at fault.
 //
 // Admission walks the tokenizer instead of calling the parser because the parser accepts
 // trailing input, keeps one of two repeated fields, recurses before any depth check, and
@@ -279,14 +286,22 @@ tool_arguments_admit :: proc(raw: string, allocator: mem.Allocator) -> Tool_Argu
 tool_json_admit :: proc(text: string, allocator: mem.Allocator) -> Tool_Argument_Error {
 	tokenizer := json.make_tokenizer(text, .JSON, true)
 	token, token_err := json.get_token(&tokenizer)
-	if tool_token_bad(token, token_err) { return tool_argument_error(.Syntax, allocator = allocator) }
+	if tool_token_bad(token, token_err) { return tool_document_error(.Syntax, tokenizer.data, token) }
 	if value_error := tool_admit_value(&tokenizer, token, 1, allocator); value_error.kind != .None { return value_error }
 
 	token, token_err = json.get_token(&tokenizer)
-	if (token_err != nil && token_err != .EOF) || token.kind != .EOF {
-		return tool_argument_error(.Syntax, allocator = allocator)
-	}
+	if (token_err != nil && token_err != .EOF) || token.kind != .EOF { return tool_document_error(.Syntax, tokenizer.data, token) }
 	return {}
+}
+
+// tool_document_error is a defect found at a token of text, placed by its line and column
+// counted from 1. The column is counted here from the token's byte offset, because the
+// tokenizer counts it from 0 on the first line and from 1 on every other.
+@(private)
+tool_document_error :: proc(kind: Tool_Argument_Error_Kind, text: string, at: json.Token) -> Tool_Argument_Error {
+	offset := min(at.offset, len(text))
+	line_start := strings.last_index_byte(text[:offset], '\n') + 1
+	return {kind = kind, line = strings.count(text[:line_start], "\n") + 1, column = offset - line_start + 1}
 }
 
 // tool_token_bad reports a token that cannot be used: a tokenizer failure or an
@@ -298,60 +313,59 @@ tool_token_bad :: proc(token: json.Token, err: json.Error) -> bool {
 
 @(private)
 tool_admit_object :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.Allocator) -> Tool_Argument_Error {
-	if depth > TOOL_MAX_ARGS_DEPTH { return tool_argument_error(.Too_Deep, allocator = allocator) }
 	seen := make(map[string]bool, context.temp_allocator)
 	defer delete(seen)
 
 	comma := false
 	for {
 		token, token_err := json.get_token(tokenizer)
-		if tool_token_bad(token, token_err) { return tool_argument_error(.Syntax, allocator = allocator) }
+		if tool_token_bad(token, token_err) { return tool_document_error(.Syntax, tokenizer.data, token) }
 		if token.kind == .Close_Brace {
-			if comma { return tool_argument_error(.Syntax, allocator = allocator) }
+			if comma { return tool_document_error(.Syntax, tokenizer.data, token) }
 			return {}
 		}
-		if token.kind != .String { return tool_argument_error(.Syntax, allocator = allocator) }
+		if token.kind != .String { return tool_document_error(.Syntax, tokenizer.data, token) }
 
 		key, key_err := json.unquote_string(token, .JSON, context.temp_allocator)
-		if key_err != nil { return tool_argument_error(.Syntax, allocator = allocator) }
-		if seen[key] { return tool_argument_error(.Duplicate_Field, allocator = allocator) }
+		if key_err != nil { return tool_document_error(.Syntax, tokenizer.data, token) }
+		if seen[key] {
+			duplicate := tool_document_error(.Duplicate_Field, tokenizer.data, token)
+			duplicate.field = strings.clone(key, allocator)
+			return duplicate
+		}
 		seen[key] = true
 
 		colon, colon_err := json.get_token(tokenizer)
-		if tool_token_bad(colon, colon_err) || colon.kind != .Colon {
-			return tool_argument_error(.Syntax, allocator = allocator)
-		}
+		if tool_token_bad(colon, colon_err) || colon.kind != .Colon { return tool_document_error(.Syntax, tokenizer.data, colon) }
 		value, value_err := json.get_token(tokenizer)
-		if tool_token_bad(value, value_err) { return tool_argument_error(.Syntax, allocator = allocator) }
+		if tool_token_bad(value, value_err) { return tool_document_error(.Syntax, tokenizer.data, value) }
 		if value_error := tool_admit_value(tokenizer, value, depth + 1, allocator); value_error.kind != .None { return value_error }
 
 		separator, separator_err := json.get_token(tokenizer)
-		if tool_token_bad(separator, separator_err) { return tool_argument_error(.Syntax, allocator = allocator) }
+		if tool_token_bad(separator, separator_err) { return tool_document_error(.Syntax, tokenizer.data, separator) }
 		if separator.kind == .Comma { comma = true; continue }
 		if separator.kind == .Close_Brace { return {} }
-		return tool_argument_error(.Syntax, allocator = allocator)
+		return tool_document_error(.Syntax, tokenizer.data, separator)
 	}
 }
 
 @(private)
 tool_admit_array :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.Allocator) -> Tool_Argument_Error {
-	if depth > TOOL_MAX_ARGS_DEPTH { return tool_argument_error(.Too_Deep, allocator = allocator) }
-
 	comma := false
 	for {
 		token, token_err := json.get_token(tokenizer)
-		if tool_token_bad(token, token_err) { return tool_argument_error(.Syntax, allocator = allocator) }
+		if tool_token_bad(token, token_err) { return tool_document_error(.Syntax, tokenizer.data, token) }
 		if token.kind == .Close_Bracket {
-			if comma { return tool_argument_error(.Syntax, allocator = allocator) }
+			if comma { return tool_document_error(.Syntax, tokenizer.data, token) }
 			return {}
 		}
 		if value_error := tool_admit_value(tokenizer, token, depth + 1, allocator); value_error.kind != .None { return value_error }
 
 		separator, separator_err := json.get_token(tokenizer)
-		if tool_token_bad(separator, separator_err) { return tool_argument_error(.Syntax, allocator = allocator) }
+		if tool_token_bad(separator, separator_err) { return tool_document_error(.Syntax, tokenizer.data, separator) }
 		if separator.kind == .Comma { comma = true; continue }
 		if separator.kind == .Close_Bracket { return {} }
-		return tool_argument_error(.Syntax, allocator = allocator)
+		return tool_document_error(.Syntax, tokenizer.data, separator)
 	}
 }
 
@@ -364,21 +378,21 @@ tool_admit_array :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.
 @(private)
 tool_admit_value :: proc(tokenizer: ^json.Tokenizer, token: json.Token, depth: int, allocator: mem.Allocator) -> Tool_Argument_Error {
 	#partial switch token.kind {
-	case .Open_Brace:
-		return tool_admit_object(tokenizer, depth, allocator)
-	case .Open_Bracket:
+	case .Open_Brace, .Open_Bracket:
+		if depth > TOOL_MAX_ARGS_DEPTH { return tool_document_error(.Too_Deep, tokenizer.data, token) }
+		if token.kind == .Open_Brace { return tool_admit_object(tokenizer, depth, allocator) }
 		return tool_admit_array(tokenizer, depth, allocator)
 	case .Integer:
-		if _, fits := tool_decimal_integer(token.text); !fits { return tool_argument_error(.Number_Out_Of_Range, allocator = allocator) }
+		if _, fits := tool_decimal_integer(token.text); !fits { return tool_document_error(.Number_Out_Of_Range, tokenizer.data, token) }
 		return {}
 	case .Float:
 		number, parsed := strconv.parse_f64(token.text)
-		if !parsed || math.is_inf(number) { return tool_argument_error(.Number_Out_Of_Range, allocator = allocator) }
+		if !parsed || math.is_inf(number) { return tool_document_error(.Number_Out_Of_Range, tokenizer.data, token) }
 		return {}
 	case .String, .True, .False, .Null:
 		return {}
 	}
-	return tool_argument_error(.Syntax, allocator = allocator)
+	return tool_document_error(.Syntax, tokenizer.data, token)
 }
 
 // tool_arguments_escape_control_chars rewrites raw control bytes inside JSON
