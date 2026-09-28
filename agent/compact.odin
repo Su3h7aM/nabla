@@ -273,15 +273,13 @@ Compact_Job :: struct {
 	request:    journal.Request_Id,
 	interrupt:  ai.Interrupt,
 	thread:     ^thread.Thread,
-	// allocator is the thread-safe heap the worker-owned storage comes from: the frozen
-	// snapshot, the output it accumulates, and everything the request allocates while it
-	// runs. It is deliberately not the session's allocator: wrapping the worker's own
+	// allocator is the thread-safe heap the job itself and the worker-owned storage come from:
+	// the frozen snapshot, the output it accumulates, and everything the request allocates while
+	// it runs. It is deliberately not the session's allocator: wrapping the worker's own
 	// allocations in a lock would not serialize the owner's writes through the same backing
-	// allocator, so the two threads never share one.
+	// allocator, so the two threads never share one, and a job whose worker ignores its stop
+	// outlives the allocator the session releases.
 	allocator:  mem.Allocator,
-	// backing is what the job struct itself was allocated with, which is the session's
-	// allocator: the control object belongs to the thread that drives the session.
-	backing:    mem.Allocator,
 	// logging is the immutable binding the worker uses for provider and runtime records.
 	// It points at the session's sink and owns no strings.
 	logging:    Log_Binding,
@@ -295,6 +293,10 @@ Compact_Job :: struct {
 	operation:  ai.Provider_Operation_Error,
 	usage:      journal.Response_Committed,
 	started_at: time.Tick,
+	// stop_at is when the owner asked this job's worker to stop, and the patience the worker is
+	// given to publish is measured from it. A job that has not published by the end of it is
+	// abandoned: the owner stops waiting for it and keeps the session working.
+	stop_at:    Maybe(time.Tick),
 	// attempts counts the sends this chain has made, including the one in flight.
 	attempts:   int,
 	// due_at is when a job in Backoff is sent again, or none when the delay it waits out
@@ -332,12 +334,12 @@ Compact_Request_Result :: enum {
 	Unavailable,
 }
 
-// chat_compact_job_allocator gives a job the heap its worker-owned storage comes from. The
-// heap is process-wide and thread-safe, so the worker allocates with it directly and the
-// owner releases what is left after the join, with the same allocator.
+// chat_compact_job_allocator gives a job the heap it and its worker-owned storage come from. The
+// heap is process-wide and thread-safe, so the worker allocates with it directly, the owner
+// releases what is left after the join with the same allocator, and a job whose worker ignores
+// its stop is not held in memory the session's allocator owns.
 @(private)
-chat_compact_job_allocator :: proc(job: ^Compact_Job, backing: mem.Allocator) {
-	job.backing = backing
+chat_compact_job_allocator :: proc(job: ^Compact_Job) {
 	job.allocator = os.heap_allocator()
 }
 
@@ -414,12 +416,11 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 @(private)
 chat_compact_job_destroy :: proc(job: ^Compact_Job) {
 	allocator := job.allocator
-	backing := job.backing
 	chat_compact_snapshot_destroy(&job.snapshot, allocator)
 	delete(job.output)
 	delete(job.error_text, allocator)
 	ai.Provider_Operation_Error_Destroy(&job.operation, allocator)
-	free(job, backing)
+	free(job, allocator)
 }
 
 // chat_compact_summary is the summary the job produced, or "" when it produced
@@ -536,11 +537,16 @@ chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bo
 // chat_compact_launch starts the worker for the attempt whose row already exists. The
 // worker must never run the process signal handler, so the handled signals are blocked
 // across the thread's creation: a thread inherits the mask its creator had, and blocking
-// inside the worker would leave a startup window.
+// inside the worker would leave a startup window. The handle comes from the process heap,
+// because a job whose worker ignores its stop keeps it and the session's allocator may already
+// be released by then.
 @(private)
 chat_compact_launch :: proc(job: ^Compact_Job) -> bool {
 	previous := chat_signal_block_watched()
+	previous_allocator := context.allocator
+	context.allocator = os.heap_allocator()
 	job.thread = thread.create(chat_compact_worker, name = "nabla-compaction")
+	context.allocator = previous_allocator
 	chat_signal_restore(previous)
 	if job.thread == nil { return false }
 	job.thread.data = job
@@ -590,7 +596,9 @@ chat_compact_start :: proc(
 		return false
 	}
 
-	job := new(Compact_Job, chat.allocator)
+	// The job is allocated from the same heap its worker-owned storage comes from: it may outlive
+	// the session, which releases its own allocator at teardown.
+	job := new(Compact_Job, os.heap_allocator())
 	if job == nil {
 		_observer_message(observer, .Warning, "compaction could not be started")
 		return false
@@ -598,7 +606,7 @@ chat_compact_start :: proc(
 	job^ = Compact_Job {
 		attempts = 1,
 	}
-	chat_compact_job_allocator(job, chat.allocator)
+	chat_compact_job_allocator(job)
 	job.output = make([dynamic]u8, 0, job.allocator)
 
 	// The bytes are frozen before the row exists: a request that cannot be encoded never
@@ -772,16 +780,21 @@ chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> boo
 	return true
 }
 
-// chat_compact_poll adopts a finished job without waiting for one. The worker publishes its
-// completion through the owner wake, so this is read wherever the owner observes, which is
-// every step of a turn as well as every control boundary: a summary that arrives while the
-// agent is busy is picked up as soon as there is a safe place to put it.
+// chat_compact_poll adopts a finished job, releases a job whose worker published after it was
+// abandoned, and abandons a stopped job whose worker has not published within the patience it
+// was given. None of it waits: the worker publishes its completion through the owner wake, so
+// this is read wherever the owner observes, which is every step of a turn as well as every
+// control boundary.
 @(private)
 chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
+	chat_compact_jobs_reclaim(&chat.abandoned_compactions)
 	control := &chat.compact
 	job := control.job
 	if job == nil || job.thread == nil { return }
-	if !sync.atomic_load(&job.finished) { return }
+	if !sync.atomic_load(&job.finished) {
+		if chat_compact_overdue(job) { chat_compact_abandon(chat, observer, job) }
+		return
+	}
 
 	thread.join(job.thread)
 	thread.destroy(job.thread)
@@ -795,6 +808,56 @@ chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
 		chat_compact_failed_job(control, job)
 		_observer_message(observer, .Notice, "compaction cancelled")
 	case .Idle, .Ready, .Backoff:
+	}
+}
+
+// chat_compact_overdue reports whether a job the owner stopped has ignored its stop for the
+// whole patience, which is as long as the owner waits for a worker that has not published.
+@(private)
+chat_compact_overdue :: proc(job: ^Compact_Job) -> bool {
+	at, stopped := job.stop_at.?
+	if !stopped { return false }
+	return time.tick_since(at) >= TOOL_JOBS_STOP_PATIENCE
+}
+
+// chat_compact_abandon gives up on a stopped summary whose worker has not published. Its send
+// may still be running, so the row it left open is closed with the cancellation that asked it
+// to stop, and the slot is free for the next summary. The job is retained rather than
+// released: the owner frees nothing its worker can still reach.
+@(private)
+chat_compact_abandon :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^Compact_Job) {
+	control := &chat.compact
+	chat_finish_send(chat, job.request, job.attempts, {outcome = .Cancelled})
+	waited := time.Duration(0)
+	if at, stopped := job.stop_at.?; stopped { waited = time.tick_since(at) }
+	fields := [2]Log_Field {
+		{key = "waited_ms", value = i64(waited / time.Millisecond)},
+		{key = "patience_ms", value = Log_Duration_Milliseconds(TOOL_JOBS_STOP_PATIENCE)},
+	}
+	log_emit({level = .Error, category = .Provider, event = "compaction.abandoned", fields = fields[:]})
+	_observer_message(observer, .Notice, "compaction cancelled")
+	control.last_failure_at = time.tick_now()
+	control.trigger = .None
+	control.job = nil
+	control.state = .Idle
+	if append(&chat.abandoned_compactions, job) != 1 {
+		// The list could not grow, so the job stays where it is with the worker that reaches it.
+		log_emit({level = .Error, category = .Provider, event = "compaction.leaked"})
+	}
+}
+
+// chat_compact_jobs_reclaim releases every abandoned summary whose worker has published since.
+// Its result is dropped, because the attempt already has the outcome it was recorded with, and
+// the worker is joined only now, when joining cannot block on it.
+chat_compact_jobs_reclaim :: proc(jobs: ^[dynamic]^Compact_Job) {
+	for index := len(jobs) - 1; index >= 0; index -= 1 {
+		job := jobs[index]
+		if !sync.atomic_load(&job.finished) { continue }
+		thread.destroy(job.thread)
+		job.thread = nil
+		chat_compact_job_destroy(job)
+		unordered_remove(jobs, index)
+		log_emit({level = .Info, category = .Provider, event = "compaction.reclaimed"})
 	}
 }
 
@@ -1141,16 +1204,27 @@ chat_repair_context :: proc(
 		ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
 		return .Repair_Rejected
 	}
-	// The rejected bytes are released only now, after the operation that sent them has
-	// returned and the payload that replaces them is built.
-	if !encoded.Body_Borrowed { delete(encoded.Body, chat.allocator) }
+	// The rebuilt bytes get the same treatment as the rejected ones: the attempt owns a copy in
+	// the arena it is retained with, so it never sends bytes a later encode has written over.
+	// The rejected bytes belong to that arena too, and the arena releases them with it.
+	body, body_error := make([]u8, len(rebuilt.Body), allocator)
+	if body_error != nil {
+		chat_session_fail_turn(chat, "the rebuilt request body could not be kept for the attempt")
+		return .Repair_Rejected
+	}
+	copy(body, rebuilt.Body)
+	if !rebuilt.Body_Borrowed { delete(rebuilt.Body, chat.allocator) }
+	rebuilt.Body = body
+	rebuilt.Body_Borrowed = false
 	encoded^ = rebuilt
 	return .None
 }
 
 // chat_compact_cancel stops a running job and drops a candidate. Compaction
 // belongs to the session rather than to the turn that triggered it, so only an
-// explicit cancellation, a model change, or teardown calls this.
+// explicit cancellation, a model change, or teardown calls this. The stop starts the patience
+// the worker is given to publish: one that does not is abandoned, and the slot it holds is
+// free again.
 chat_compact_cancel :: proc(chat: ^Chat_Session) {
 	control := &chat.compact
 	job := control.job
@@ -1158,6 +1232,7 @@ chat_compact_cancel :: proc(chat: ^Chat_Session) {
 	switch control.state {
 	case .Running:
 		ai.interrupt_request(&job.interrupt)
+		job.stop_at = time.tick_now()
 		control.state = .Retiring
 	case .Ready, .Backoff:
 		chat_compact_destroy_job(control, job)
@@ -1165,20 +1240,28 @@ chat_compact_cancel :: proc(chat: ^Chat_Session) {
 	}
 }
 
-// chat_compact_destroy stops the session's compaction and releases everything it
-// owns. It is the one place that waits, and only because teardown must not leave a
-// thread running against freed memory.
+// chat_compact_destroy stops the session's compaction and releases everything it owns. It
+// joins a worker that published and abandons one that did not: the owner frees nothing a
+// worker can still reach, and teardown never waits on a worker that ignores its stop.
 chat_compact_destroy :: proc(chat: ^Chat_Session) {
 	control := &chat.compact
+	chat_compact_jobs_reclaim(&chat.abandoned_compactions)
 	job := control.job
 	if job != nil {
 		ai.interrupt_request(&job.interrupt)
-		if job.thread != nil {
+		if job.thread != nil && sync.atomic_load(&job.finished) {
 			thread.join(job.thread)
 			thread.destroy(job.thread)
 			job.thread = nil
 		}
-		chat_compact_job_destroy(job)
+		if job.thread == nil {
+			chat_compact_job_destroy(job)
+		} else {
+			// The worker ignored its stop. The job, its frozen snapshot, and its thread handle
+			// stay where they are: they are what the worker may still be reading.
+			fields := [1]Log_Field{{key = "attempts", value = i64(job.attempts)}}
+			log_emit({level = .Error, category = .Provider, event = "compaction.abandoned", fields = fields[:]})
+		}
 	}
 	delete(control.attempted_identity, chat.allocator)
 	control^ = {}

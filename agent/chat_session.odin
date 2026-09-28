@@ -4,6 +4,7 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import "core:time"
 import "core:unicode/utf8"
 
 import "nabla:agent/journal"
@@ -117,7 +118,6 @@ Chat_Session :: struct {
 	// state, not a nested loop. It owns the prepared request and the frozen bytes until
 	// chat_chain_commit releases them.
 	chain:                        Chat_Request_Chain,
-	mailbox:                      Owner_Mailbox,
 
 	// storage_failed latches a durable write that did not land. A session that
 	// could not record its own history accepts no further work: continuing would
@@ -128,6 +128,11 @@ Chat_Session :: struct {
 	// working; each job is released once its worker publishes, and until then nothing the
 	// worker can reach (the workspace, the skill catalog, the tool backends) is freed.
 	abandoned_jobs:               [dynamic]^Tool_Job,
+	// abandoned_attempts are provider attempts whose workers ignored their stop, and
+	// abandoned_compactions are summaries whose workers did. Each is released once its worker
+	// publishes; until then nothing that worker can reach is freed.
+	abandoned_attempts:           [dynamic]^Chat_Abandoned_Attempt,
+	abandoned_compactions:        [dynamic]^Compact_Job,
 
 	// tools is the set of tools a turn may dispatch, owned by the chat. It is
 	// replaceable while the chat is idle and frozen for the entire user turn,
@@ -277,25 +282,24 @@ chat_session_init :: proc(
 	tools, tool_error := tool_registry_make(allocator)
 	if tool_error.kind != .None { return {}, tool_error }
 	chat := Chat_Session {
-		store             = store,
-		session           = session,
-		branch            = branch,
-		head              = head,
-		compact_retry     = chat_retry_policy_default(),
-		allocator         = allocator,
-		next_turn_id      = 1,
-		next_operation_id = 1,
-		partial_assistant = make([dynamic]u8, 0, allocator),
-		pending_calls     = make([dynamic]Chat_Tool_Call, 0, allocator),
-		effort_levels     = make([dynamic]string, 0, allocator),
-		abandoned_jobs    = make([dynamic]^Tool_Job, 0, allocator),
-		workspace         = strings.clone(workspace, allocator),
-		tools             = tools,
+		store                 = store,
+		session               = session,
+		branch                = branch,
+		head                  = head,
+		compact_retry         = chat_retry_policy_default(),
+		allocator             = allocator,
+		next_turn_id          = 1,
+		next_operation_id     = 1,
+		partial_assistant     = make([dynamic]u8, 0, allocator),
+		pending_calls         = make([dynamic]Chat_Tool_Call, 0, allocator),
+		effort_levels         = make([dynamic]string, 0, allocator),
+		abandoned_jobs        = make([dynamic]^Tool_Job, 0, allocator),
+		abandoned_attempts    = make([dynamic]^Chat_Abandoned_Attempt, 0, allocator),
+		abandoned_compactions = make([dynamic]^Compact_Job, 0, allocator),
+		workspace             = strings.clone(workspace, allocator),
+		tools                 = tools,
 	}
 	chat.tool_output_directory = tool_output_directory(chat_session_text(&chat), allocator)
-	// A worker publishes through the mailbox, so its payloads come from the process heap
-	// rather than from the allocator the owner may be writing through at the same time.
-	mailbox_init(&chat.mailbox, os.heap_allocator())
 	chat.team = agent_team_make(os.heap_allocator())
 	if chat.team != nil { chat.inbox = &chat.team.inbox }
 	return chat, {}
@@ -340,14 +344,16 @@ chat_skill_catalog_release :: proc(chat: ^Chat_Session) {
 	chat.skill_catalog = nil
 }
 
-// chat_session_workers_outstanding reports whether an abandoned tool worker may still be
-// running. While one is, what it can reach (the workspace, the skill catalog, and the tool
-// backends the caller owns) must stay allocated.
+// chat_session_workers_outstanding reports whether an abandoned worker may still be running.
+// While one is, what it can reach (the workspace, the skill catalog, the session's own stop
+// token, the WebSocket, and the tool backends the caller owns) must stay allocated.
 chat_session_workers_outstanding :: proc(chat: ^Chat_Session) -> bool {
 	tool_jobs_reclaim(&chat.abandoned_jobs)
+	chat_chain_attempts_reclaim(&chat.abandoned_attempts)
 	return(
 		chat.workers_retained ||
 		len(chat.abandoned_jobs) > 0 ||
+		len(chat.abandoned_attempts) > 0 ||
 		agent_team_running(chat.team) ||
 		(chat.team != nil && sync.atomic_load(&chat.team.abandoned)) \
 	)
@@ -411,9 +417,10 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	if !outstanding { delete(chat.workspace, chat.allocator) }
 	delete(chat.abandoned_jobs)
 	chat_chain_release(chat)
-	mailbox_destroy(&chat.mailbox)
 	ai.Provider_Encode_Cache_Destroy(&chat.encode_cache)
-	if chat.provider_websocket != nil {
+	// A worker that ignored its stop may still be running a WebSocket request through this
+	// session, so the session it borrowed is left allocated rather than destroyed under it.
+	if chat.provider_websocket != nil && !chat_chain_websocket_retained(chat) {
 		ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
 		chat.provider_websocket = nil
 	}
@@ -433,6 +440,10 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	delete(chat.tool_output_directory, chat.allocator)
 	delete(chat.provider_id, chat.allocator)
 	delete(chat.model_id, chat.allocator)
+	// An abandoned attempt and an abandoned summary are released only when their workers
+	// publish, which nothing here waits for: the records stay allocated for the process.
+	delete(chat.abandoned_attempts)
+	delete(chat.abandoned_compactions)
 	tool_registry_destroy(&chat.tools)
 	chat^ = {
 		workers_retained = outstanding,
@@ -707,9 +718,13 @@ chat_session_cancelled :: proc(chat: ^Chat_Session) -> bool {
 
 // chat_session_observe_stop moves a turn the front-end or the process stopped into
 // Cancelling. The stop itself already reached everything that reads the turn's token,
-// including a request blocked on the owner's thread; this is the state machine's side.
+// including a request blocked on the owner's thread; this is the state machine's side. It is
+// also where the patience of an attempt in flight starts: the worker is given that long to
+// confirm the stop before it is abandoned.
 chat_session_observe_stop :: proc(chat: ^Chat_Session) {
-	if chat_session_cancelled(chat) { chat_session_note_cancel(chat) }
+	if !chat_session_cancelled(chat) { return }
+	chat_session_note_cancel(chat)
+	chat_chain_note_stop(chat, time.tick_now())
 }
 
 // chat_stop_parent is the token a turn's stop chains to: the front-end's control while

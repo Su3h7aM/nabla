@@ -4,7 +4,9 @@ import "core:crypto/hash"
 import "core:fmt"
 import "core:log"
 import "core:mem/virtual"
+import "core:os"
 import "core:thread"
+import "core:time"
 
 import "nabla:agent/journal"
 import "nabla:ai"
@@ -48,10 +50,23 @@ Chat_Request_Chain :: struct {
 	// is the argument the owner allocated for it, freed only after the join.
 	worker:              ^thread.Thread,
 	worker_data:         ^Chat_Request_Worker,
+	// mailbox is where the attempt's worker publishes: the events it received, and the one
+	// terminal it ends with. It belongs to the chain rather than to the session, so an attempt
+	// whose worker ignored its stop can keep publishing into it after the chain is released,
+	// while the next request uses a mailbox of its own and never sees those facts. It lives in
+	// scratch, which is the arena an abandoned attempt is retained with.
+	mailbox:             ^Owner_Mailbox,
+	// stop_at is when the owner first saw that this attempt should have stopped, and the stop
+	// patience is measured from it. abandoned records that its worker had not published by the
+	// end of that patience, or was still in flight at teardown: the release then retains
+	// everything that worker can still reach rather than joining it.
+	stop_at:             Maybe(time.Tick),
+	abandoned:           bool,
 	// scratch is the arena the chain builds its request in: the context read out of the
-	// store, the messages the projection makes, the entries it points at, and the worker's
-	// argument. Releasing the chain returns all of it in one unmap. A zero arena is inert,
-	// so a chain that never ran holds nothing.
+	// store, the messages the projection makes, the entries it points at, the frozen bytes it
+	// sends, the worker's argument, and the mailbox the worker publishes through. Releasing the
+	// chain returns all of it in one unmap, and an abandoned attempt is retained with it. A
+	// zero arena is inert, so a chain that never ran holds nothing.
 	scratch:             virtual.Arena,
 	prep:                Chat_Request_Prep,
 	encoded:             ai.Provider_Encoded_Request,
@@ -84,29 +99,62 @@ Chat_Request_Chain :: struct {
 	decision:            Chat_Recovery_Decision,
 }
 
-// chat_chain_release frees everything the chain owns, joining a live worker first. The
+// Chat_Abandoned_Attempt is one attempt whose worker had not published when the chain was
+// released: a worker that ignored its stop for the whole patience, or one still in flight at
+// teardown. The owner never joins it and frees nothing it can reach, so everything the worker
+// touches is here instead: its thread handle, its mailbox, and the arena that holds its
+// argument, the request it was built from, and the frozen bytes it is sending. What it
+// publishes later is dropped, because the send already has the outcome it was recorded with.
+Chat_Abandoned_Attempt :: struct {
+	worker:    ^thread.Thread,
+	mailbox:   ^Owner_Mailbox,
+	arena:     virtual.Arena,
+	// websocket records that the worker may still be using the session's WebSocket, which
+	// teardown therefore leaves allocated instead of destroying it under the worker.
+	websocket: bool,
+}
+
+// chat_chain_release frees everything the chain owns, joining a worker that published. The
 // zero chain is inert, so releasing one that never ran is safe. It retires the operation the
 // chain began: a release that is not a commit, such as one after an attempt row that could not
 // be written, is the only thing left that can, and an operation left running would leave the
 // turn with no stage it can reach a terminal from.
+//
+// A worker that has not published is asked to stop and abandoned: the owner frees nothing it
+// can still reach, and a release reached by teardown or by a failed commit never waits on a
+// worker that ignores its stop.
 chat_chain_release :: proc(chat: ^Chat_Session) {
-	chat_chain_join(chat)
+	chain := &chat.chain
 	chat_session_retire_operation(chat)
+	if !chain.abandoned && chain.worker != nil {
+		// The terminal is the worker's last act, so a worker that published it is done. One a
+		// release takes here belongs to a send whose outcome is already recorded, and it is
+		// dropped rather than waited on.
+		terminal, published := mailbox_take_terminal(chain.mailbox)
+		ai.Provider_Operation_Error_Destroy(&terminal.error, chain.mailbox.allocator)
+		if !published {
+			ai.interrupt_request(chain.options.interrupt)
+			chat_chain_abandon(chat)
+		}
+	}
+	if chain.abandoned {
+		chat_chain_retain_attempt(chat)
+		chain^ = {}
+		return
+	}
+	chat_chain_join(chat)
 	// The request the chain built came from its arena, so there is one release for it rather
-	// than a walk over the context it read and the projection it made.
-	virtual.arena_destroy(&chat.chain.scratch)
-	ai.Provider_Operation_Error_Destroy(&chat.chain.operation_error, chat.mailbox.allocator)
-	if !chat.chain.encoded.Body_Borrowed { delete(chat.chain.encoded.Body, chat.allocator) }
-	chat.chain = {}
-	// Nothing can publish after the join, so what the mailbox still holds is the owner's to
-	// release. A released chain leaves the mailbox empty for the next request.
-	mailbox_reset(&chat.mailbox)
+	// than a walk over the context it read, the bytes it sent, and the projection it made.
+	if chain.mailbox != nil { mailbox_destroy(chain.mailbox) }
+	// A worker's payloads come from the process heap, which is where the mailbox put them.
+	ai.Provider_Operation_Error_Destroy(&chain.operation_error, os.heap_allocator())
+	virtual.arena_destroy(&chain.scratch)
+	chain^ = {}
 }
 
 // chat_chain_join waits for the attempt's worker to finish and drops its argument,
 // which came from the chain's arena. The worker's last mailbox access is its
-// terminal publication, so after the join the frozen bytes it borrowed are the
-// owner's to reuse or release.
+// terminal publication, so after the join what it was sending is the owner's to release.
 @(private)
 chat_chain_join :: proc(chat: ^Chat_Session) {
 	if chat.chain.worker != nil {
@@ -126,6 +174,113 @@ chat_chain_stop :: proc(chat: ^Chat_Session, reason: Request_Recovery_Reason) {
 		reason = reason,
 	}
 	chat.chain.stage = .Committing
+}
+
+// chat_chain_note_stop records when the owner first saw that the attempt in flight should
+// have stopped, which is where the patience it is given to confirm is measured from. Only a
+// worker that was asked to stop can be abandoned, and only the owner's own observation can
+// start the patience: nothing else reads the clock on the chain's behalf.
+chat_chain_note_stop :: proc(chat: ^Chat_Session, now: time.Tick) {
+	chain := &chat.chain
+	if chain.stop_at != nil || !chain.active || chain.stage != .Sending || chain.worker == nil { return }
+	if !ai.interrupt_requested(chain.options.interrupt) { return }
+	chain.stop_at = now
+	fields := [1]Log_Field{{key = "patience_ms", value = Log_Duration_Milliseconds(TOOL_JOBS_STOP_PATIENCE)}}
+	log_emit({level = .Warning, category = .Provider, event = "provider.attempt_stopping", fields = fields[:]})
+}
+
+// chat_chain_patience_deadline is when the owner stops waiting for an attempt that was asked
+// to stop and has not confirmed. It is nil while no stop was asked for, because a provider
+// attempt carries cancellation alone: model deliberation has no harness deadline.
+@(private)
+chat_chain_patience_deadline :: proc(chain: ^Chat_Request_Chain) -> Maybe(time.Tick) {
+	at, started := chain.stop_at.?
+	if !started { return nil }
+	return time.tick_add(at, TOOL_JOBS_STOP_PATIENCE)
+}
+
+// chat_chain_overdue reports whether the attempt's worker has ignored its stop for the whole
+// patience, which is as long as the owner waits for a worker that has not published.
+@(private)
+chat_chain_overdue :: proc(chain: ^Chat_Request_Chain) -> bool {
+	at, started := chain.stop_at.?
+	if !started { return false }
+	return time.tick_since(at) >= TOOL_JOBS_STOP_PATIENCE
+}
+
+// chat_chain_abandon gives up on an attempt whose worker has not confirmed its stop. The send
+// may still be running, so it is answered with the cancellation that asked it to stop: the
+// commit that follows records that outcome, and the release retains everything the worker can
+// still reach instead of joining it.
+@(private)
+chat_chain_abandon :: proc(chat: ^Chat_Session) {
+	chain := &chat.chain
+	chain.decision = {
+		action = .Stop,
+		reason = .Cancelled,
+	}
+	chain.stage = .Committing
+	chain.abandoned = true
+	waited: time.Duration
+	if at, started := chain.stop_at.?; started { waited = time.tick_since(at) }
+	fields := [2]Log_Field {
+		{key = "waited_ms", value = i64(waited / time.Millisecond)},
+		{key = "patience_ms", value = Log_Duration_Milliseconds(TOOL_JOBS_STOP_PATIENCE)},
+	}
+	log_emit({level = .Error, category = .Provider, event = "provider.attempt_abandoned", fields = fields[:]})
+}
+
+// chat_chain_retain_attempt moves everything an abandoned attempt's worker can still reach out
+// of the chain and into a record the owner never joins. A record that cannot be allocated
+// retains nothing, and the release that follows frees nothing either: leaving the worker's
+// storage where it is is the only release that cannot free memory the worker is still using.
+@(private)
+chat_chain_retain_attempt :: proc(chat: ^Chat_Session) {
+	chain := &chat.chain
+	attempt, allocation_error := new(Chat_Abandoned_Attempt, os.heap_allocator())
+	if allocation_error != nil {
+		log_emit({level = .Error, category = .Provider, event = "provider.attempt_leaked"})
+		return
+	}
+	attempt^ = {
+		worker    = chain.worker,
+		mailbox   = chain.mailbox,
+		arena     = chain.scratch,
+		websocket = chain.websocket_request,
+	}
+	if append(&chat.abandoned_attempts, attempt) != 1 {
+		// The record exists and the list could not grow, so the attempt stays with the record
+		// rather than being released: nothing the worker can reach is freed either way.
+		log_emit({level = .Error, category = .Provider, event = "provider.attempt_leaked"})
+	}
+}
+
+// chat_chain_attempts_reclaim releases every abandoned attempt whose worker has published
+// since. What it published is dropped, because the send already has the outcome it was
+// recorded with, and the worker is joined only now, when joining cannot block on it.
+chat_chain_attempts_reclaim :: proc(attempts: ^[dynamic]^Chat_Abandoned_Attempt) {
+	for index := len(attempts) - 1; index >= 0; index -= 1 {
+		attempt := attempts[index]
+		terminal, published := mailbox_take_terminal(attempt.mailbox)
+		if !published { continue }
+		ai.Provider_Operation_Error_Destroy(&terminal.error, attempt.mailbox.allocator)
+		thread.destroy(attempt.worker)
+		mailbox_destroy(attempt.mailbox)
+		virtual.arena_destroy(&attempt.arena)
+		free(attempt, os.heap_allocator())
+		unordered_remove(attempts, index)
+		log_emit({level = .Info, category = .Provider, event = "provider.attempt_reclaimed"})
+	}
+}
+
+// chat_chain_websocket_retained reports whether an abandoned attempt may still be using the
+// session's WebSocket, which teardown therefore leaves allocated.
+@(private)
+chat_chain_websocket_retained :: proc(chat: ^Chat_Session) -> bool {
+	for attempt in chat.abandoned_attempts {
+		if attempt.websocket { return true }
+	}
+	return false
 }
 
 // chat_body_digest returns the hex SHA-256 of body, written into buffer of
@@ -297,10 +452,19 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	// encoding that has to be assumed equal.
 	encoded, websocket_request, transport_ok := chat_request_transport(chat, connection, &prep, options)
 	if !transport_ok { return }
-	body_owned := !encoded.Body_Borrowed
-	defer {
-		if body_owned { delete(encoded.Body, chat.allocator) }
+	// The bytes this attempt sends must outlive the chain, because a worker that ignores its
+	// stop may still be sending them after the chain is released. The transport freezes through
+	// the session's encode cache, whose next encode writes over them, so the attempt gets its
+	// own copy in the arena the chain owns and an abandoned attempt is retained with.
+	body, body_error := make([]u8, len(encoded.Body), scratch_allocator)
+	if body_error != nil {
+		chat_session_fail_turn(chat, "the request body could not be kept for the attempt")
+		return
 	}
+	copy(body, encoded.Body)
+	if !encoded.Body_Borrowed { delete(encoded.Body, chat.allocator) }
+	encoded.Body = body
+	encoded.Body_Borrowed = false
 
 	// What the harness intends to send is recorded before it is stored, so a request that
 	// never reaches the store still says what it was going to carry.
@@ -334,7 +498,6 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	chain.websocket_request = websocket_request
 	chain.recovery_kind = .Transient_Retry
 	scratch_owned = false
-	body_owned = false
 }
 
 // chat_chain_claim_send claims the next attempt: it retires the previous operation, begins
@@ -414,8 +577,20 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 	_observer_request_prepared(chain.observer)
 
 	// The attempt runs on its own thread so the owner can keep observing while the send
-	// blocks, and its facts reach the owner through the mailbox. The worker borrows the
-	// frozen bytes; the join in chat_chain_await is what makes their reuse safe.
+	// blocks, and its facts reach the owner through the chain's own mailbox. Its payloads come
+	// from the process heap, because a worker allocates while the owner may be allocating
+	// through the session's allocator at the same time. The worker borrows the frozen bytes and
+	// the mailbox; an abandoned attempt is retained with both.
+	if chain.mailbox == nil {
+		box, box_error := new(Owner_Mailbox, virtual.arena_allocator(&chain.scratch))
+		if box_error != nil {
+			chat_session_fail_turn(chat, "the request worker could not be allocated")
+			chat_chain_stop(chat, .Harness_Failure)
+			return
+		}
+		mailbox_init(box, os.heap_allocator())
+		chain.mailbox = box
+	}
 	worker, worker_error := new(Chat_Request_Worker, virtual.arena_allocator(&chain.scratch))
 	if worker_error != nil {
 		chat_session_fail_turn(chat, "the request worker could not be allocated")
@@ -423,8 +598,8 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 		return
 	}
 	worker^ = Chat_Request_Worker {
-		allocator         = chat.mailbox.allocator,
-		mailbox           = &chat.mailbox,
+		allocator         = chain.mailbox.allocator,
+		mailbox           = chain.mailbox,
 		interrupt         = chain.options.interrupt,
 		source            = chain.source,
 		connection        = chain.connection,
@@ -434,7 +609,12 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 		options           = chain.options,
 		logging           = binding,
 	}
+	// The handle comes from the process heap, because an attempt whose worker ignores its stop
+	// keeps it and the session's allocator may already be released by then.
+	previous_allocator := context.allocator
+	context.allocator = os.heap_allocator()
 	new_thread := thread.create(chat_request_worker_main, name = "nabla-request")
+	context.allocator = previous_allocator
 	if new_thread == nil {
 		// No producer exists, so nothing will send. The row that was already written stays
 		// as the record of a send that was attempted but not performed.
@@ -451,28 +631,36 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 // chat_chain_await collects the facts the attempt's worker has published and adopts its
 // terminal outcome. Nothing is decided while the producer can still publish: the worker's
 // last act is the terminal, so every fact it observed arrives before the decision, and the
-// join that follows is what lets the frozen bytes be reused or released.
+// join that follows is what lets the frozen bytes be released.
+//
+// A worker that has not published by the end of the patience it was given to confirm its stop
+// is abandoned instead: the wait ends there, and the owner's next observation abandons it. An
+// attempt nothing asked to stop keeps waiting, because model deliberation has no deadline.
 @(private)
 chat_chain_await :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) {
 	chain := &chat.chain
 	if !chain.active || chain.stage != .Sending { return }
 	seen := owner_wake_seen()
 	// The terminal is taken first: the worker publishes it after its last event.
-	terminal, published := mailbox_take_terminal(&chat.mailbox)
-	events := mailbox_take_all(&chat.mailbox)
+	terminal, published := mailbox_take_terminal(chain.mailbox)
+	events := mailbox_take_all(chain.mailbox)
 	defer delete(events)
 	for &event in events {
 		chat_chain_apply_event(chat, usages, &event)
-		chat_event_destroy(&event, chat.mailbox.allocator)
+		chat_event_destroy(&event, chain.mailbox.allocator)
 	}
-	if !published {
-		if len(events) == 0 { owner_wake_wait(seen, nil) }
+	if published {
+		chat_chain_join(chat)
+		chain.operation_error = terminal.error
+		chain.finish_reason = terminal.finish_reason
+		chat_chain_settle(chat, usages)
 		return
 	}
-	chat_chain_join(chat)
-	chain.operation_error = terminal.error
-	chain.finish_reason = terminal.finish_reason
-	chat_chain_settle(chat, usages)
+	if chat_chain_overdue(chain) {
+		chat_chain_abandon(chat)
+		return
+	}
+	if len(events) == 0 { owner_wake_wait(seen, chat_chain_patience_deadline(chain)) }
 }
 
 // chat_chain_apply_event gives one collected provider fact to state and tells the observer
@@ -598,8 +786,9 @@ chat_chain_wait :: proc(chat: ^Chat_Session) {
 		return
 	}
 	// The attempt is over, so the next one owns its own error. The error came from the
-	// attempt's worker, so it is released with the allocator the worker allocated it from.
-	ai.Provider_Operation_Error_Destroy(&chain.operation_error, chat.mailbox.allocator)
+	// attempt's worker, so it is released with the allocator the worker allocated it from,
+	// which is the process heap the mailbox was given.
+	ai.Provider_Operation_Error_Destroy(&chain.operation_error, os.heap_allocator())
 	chain.stage = .Ready
 }
 
@@ -617,7 +806,7 @@ chat_chain_repair :: proc(chat: ^Chat_Session) {
 	chain.repaired = true
 	chain.recovery_kind = .Checkpoint_Repair
 	chat_session_clear_attempt(chat)
-	ai.Provider_Operation_Error_Destroy(&chain.operation_error, chat.mailbox.allocator)
+	ai.Provider_Operation_Error_Destroy(&chain.operation_error, os.heap_allocator())
 	chain.stage = .Ready
 }
 

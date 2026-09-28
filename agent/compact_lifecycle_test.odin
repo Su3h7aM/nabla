@@ -3,6 +3,7 @@ package agent
 
 import "core:fmt"
 import "core:net"
+import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
@@ -349,8 +350,8 @@ test_a_failed_compaction_leaves_the_context_alone :: proc(test: ^testing.T) {
 	testing.expect_value(test, rejections[0].request, sends[0].request)
 }
 
-// Teardown must not leave the worker running against memory the session is about
-// to release.
+// Teardown stops a running summary and abandons a worker that has not published, so the worker is
+// never left running against memory the session is about to release.
 @(test)
 test_destroying_a_session_stops_its_compaction :: proc(test: ^testing.T) {
 	setup: Compact_Setup
@@ -1002,4 +1003,141 @@ test_a_running_summary_ends_the_turn_as_context_exhaustion :: proc(test: ^testin
 	testing.expect(test, !chat_run_turn(chat, foreground_connection, test_retry_policy(), {}), "the turn ends without a repair")
 	testing.expect_value(test, chat_session_repair_refusal(chat), Chat_Repair_Refusal.Summary_Running)
 	testing.expect_value(test, chat.compact.state, Compact_State.Running)
+}
+
+// --- a summary whose worker ignores its stop ----------------------------------
+
+// Compact_Summary_Hold stands in for a summary's worker: it ignores the stop it is given until
+// the test releases it, and then publishes the completion a worker that finally returned
+// would. A summary against a real provider is a transport that observes cancellation, so only
+// a hold like this can outlive its stop. A test allocates one on the process heap: the worker
+// reaches it after the test's frame may be gone, and the owner releases the thread handle,
+// never the test.
+Compact_Summary_Hold :: struct {
+	job:     ^Compact_Job,
+	release: sync.Sema,
+}
+
+// COMPACT_HOLD_BOUND is how long a hold ignores its stop. It outlasts anything a test waits, so a
+// test that abandons one never waits for the hold to give up by itself.
+COMPACT_HOLD_BOUND :: time.Minute
+
+compact_summary_hold_serve :: proc(thread: ^thread.Thread) {
+	hold := cast(^Compact_Summary_Hold)thread.data
+	_ = sync.sema_wait_with_timeout(&hold.release, COMPACT_HOLD_BOUND)
+	sync.atomic_store(&hold.job.finished, true)
+	owner_wake_signal()
+}
+
+// compact_hold_job_start builds the summary a running job is: its frozen request, the row of
+// the send it made, and a worker that ignores its stop. It stands in for chat_compact_start,
+// which starts the real transport instead.
+@(private)
+compact_hold_job_start :: proc(test: ^testing.T, chat: ^Chat_Session, hold: ^Compact_Summary_Hold) -> ^Compact_Job {
+	job := new(Compact_Job, os.heap_allocator())
+	if job == nil { return nil }
+	job^ = {
+		attempts = 1,
+	}
+	chat_compact_job_allocator(job)
+	job.output = make([dynamic]u8, 0, job.allocator)
+	job.snapshot = Compact_Snapshot {
+		api  = .OpenAI_Chat_Completions,
+		body = strings.clone("{}", job.allocator),
+	}
+	job.request = journal.next_request(chat.store)
+	if !chat_compact_begin_attempt(chat, job) {
+		testing.fail_now(test, "the stuck summary's send could not be recorded")
+	}
+	hold.job = job
+	job.thread = test_thread_start(compact_summary_hold_serve, hold, "nabla-stuck-summary")
+	if job.thread == nil { return nil }
+	chat.compact.job = job
+	chat.compact.state = .Running
+	chat.compact.trigger = .Agent_Tool
+	return job
+}
+
+// A summary whose worker ignores its stop is abandoned at the patience: the slot it held is
+// free for the next summary, the attempt it left open is closed, and the job is released once
+// its worker publishes.
+@(test)
+test_a_summary_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 500_000)
+
+	hold := new(Compact_Summary_Hold, os.heap_allocator())
+	released := false
+	defer if !released { sync.sema_post(&hold.release) }
+	job := compact_hold_job_start(test, chat, hold)
+	if job == nil { testing.fail_now(test, "the stuck summary job could not be started") }
+
+	// A model change stops the summary, which is what gives its worker a stop to ignore.
+	chat_compact_cancel(chat)
+	testing.expect_value(test, chat.compact.state, Compact_State.Retiring)
+
+	// An observation past the patience: the worker has had as long as it gets, so the owner
+	// stops waiting for it.
+	job.stop_at = time.tick_add(time.tick_now(), -(TOOL_JOBS_STOP_PATIENCE + time.Millisecond))
+	chat_compact_poll(chat, {})
+	testing.expect_value(test, chat.compact.state, Compact_State.Idle)
+	testing.expect_value(test, chat.compact.job, nil)
+	testing.expect_value(test, len(chat.abandoned_compactions), 1)
+	interrupted := _test_records(test, chat, {.Request_Interrupted})
+	if !testing.expect_value(test, len(interrupted), 1) { return }
+	testing.expect_value(test, interrupted[0].request, job.request)
+
+	// The slot is free, so new work takes over from the worker that did not stop.
+	testing.expect_value(test, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
+
+	// The worker publishes at last, and the owner releases the job then.
+	sync.sema_post(&hold.release)
+	released = true
+	deadline := time.tick_add(time.tick_now(), COMPACT_TEST_BOUND)
+	for len(chat.abandoned_compactions) > 0 && time.tick_since(deadline) < 0 {
+		chat_compact_poll(chat, {})
+		time.sleep(time.Millisecond)
+	}
+	testing.expect_value(test, len(chat.abandoned_compactions), 0)
+}
+
+// Teardown asks a summary's worker to stop and abandons it when it does not: nothing the worker
+// can reach is released under it, and teardown never waits for it.
+@(test)
+test_teardown_abandons_a_summary_that_ignores_its_stop :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	chat := &fixture.chat
+	chat_test_capacity(chat, 500_000)
+
+	hold := new(Compact_Summary_Hold, os.heap_allocator())
+	released := false
+	defer if !released { sync.sema_post(&hold.release) }
+	job := compact_hold_job_start(test, chat, hold)
+	if job == nil { testing.fail_now(test, "the stuck summary job could not be started") }
+
+	started := time.tick_now()
+	chat_compact_destroy(chat)
+	testing.expect(test, time.tick_since(started) < TOOL_JOBS_STOP_PATIENCE, "teardown waited for a worker that ignores its stop")
+	testing.expect_value(test, chat.compact.state, Compact_State.Idle)
+	testing.expect_value(test, chat.compact.job, nil)
+	// The worker is still parked, and the job it reads was not released under it.
+	testing.expect(test, !sync.atomic_load(&job.finished), "teardown joined a summary's worker")
+
+	// The rest of the session goes the way a front-end teardown leaves it.
+	chat_test_end(test, &fixture)
+
+	// This test releases what teardown left behind, so the leak it is about does not outlive it:
+	// the worker publishes, and the handle and job it can no longer reach are released.
+	sync.sema_post(&hold.release)
+	released = true
+	published := time.tick_add(time.tick_now(), COMPACT_TEST_BOUND)
+	for !sync.atomic_load(&job.finished) && time.tick_since(published) < 0 { time.sleep(time.Millisecond) }
+	if !testing.expect(test, sync.atomic_load(&job.finished), "the abandoned worker never published") { return }
+	thread.destroy(job.thread)
+	job.thread = nil
+	chat_compact_job_destroy(job)
 }

@@ -62,6 +62,7 @@ chat_session_observe :: proc(chat: ^Chat_Session) {
 chat_session_observe_at :: proc(chat: ^Chat_Session, now: time.Tick) {
 	chat_session_observe_stop(chat)
 	tool_jobs_reclaim(&chat.abandoned_jobs)
+	chat_chain_attempts_reclaim(&chat.abandoned_attempts)
 	agent_team_reap(chat.team, chat)
 	if !chat.tool_jobs_active { return }
 	tool_jobs_observe(&chat.tool_jobs, chat, now)

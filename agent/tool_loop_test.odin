@@ -616,14 +616,14 @@ test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(test: ^testin
 	// The stream could not be decoded. The model can still be reached, so the turn
 	// must not fail: the failure becomes feedback and the turn prepares again.
 	source := chat_session_event_source(chat)
-	message := strings.clone("malformed provider stream event", chat.mailbox.allocator)
+	message := strings.clone("malformed provider stream event", os.heap_allocator())
 	event: Chat_Event = Chat_Failure_Event {
 		source  = source,
 		kind    = .Invalid_Data,
 		message = message,
 	}
 	chat_session_apply(chat, &event)
-	chat_event_destroy(&event, chat.mailbox.allocator)
+	chat_event_destroy(&event, os.heap_allocator())
 	testing.expect(test, !chat.active_failed, "an unreadable response must not fail the turn")
 	testing.expect_value(test, chat.pending_notice, Chat_Notice.Unreadable_Response)
 	testing.expect_value(test, chat.state, Chat_State.Preparing)
@@ -639,7 +639,7 @@ test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(test: ^testin
 	chat.chain.operation_error = {
 		kind          = .Stream,
 		failure_class = .Invalid_Output,
-		detail        = strings.clone("malformed provider stream event", chat.mailbox.allocator),
+		detail        = strings.clone("malformed provider stream event", os.heap_allocator()),
 	}
 	chat.chain.decision = {
 		action = .Stop,

@@ -2,7 +2,11 @@
 package agent
 
 import "core:mem/virtual"
+import "core:os"
+import "core:sync"
 import "core:testing"
+import "core:thread"
+import "core:time"
 
 import "nabla:agent/journal"
 import "nabla:ai"
@@ -149,4 +153,125 @@ test_turn_finalizes_exactly_once :: proc(test: ^testing.T) {
 	// A completed turn cannot be relabelled as cancelled.
 	testing.expect(test, !chat_session_request_cancel(chat))
 	testing.expect_value(test, chat.terminal_status, Chat_Terminal_Status.Completed)
+}
+
+// --- an attempt whose worker ignores its stop ---------------------------------
+
+// Chain_Attempt_Hold stands in for the attempt's worker: it ignores the stop it is given until
+// the test releases it, and then publishes the terminal a worker that finally returned would.
+// A real attempt's worker is a transport that observes cancellation, so only a hold like this
+// can outlive its stop. A test allocates one on the process heap: the worker reaches it after
+// the test's frame may be gone, and the owner releases the thread handle, never the test.
+Chain_Attempt_Hold :: struct {
+	worker:  ^Chat_Request_Worker,
+	thread:  ^thread.Thread,
+	release: sync.Sema,
+}
+
+// CHAIN_HOLD_BOUND is how long a hold ignores its stop. It outlasts anything a test waits, so a
+// test that abandons one never waits for the hold to give up by itself.
+CHAIN_HOLD_BOUND :: time.Minute
+
+chain_attempt_hold_serve :: proc(thread: ^thread.Thread) {
+	hold := cast(^Chain_Attempt_Hold)thread.data
+	_ = sync.sema_wait_with_timeout(&hold.release, CHAIN_HOLD_BOUND)
+	mailbox_publish_terminal(hold.worker.mailbox, {})
+}
+
+// chain_attempt_hold_start runs hold as the claimed attempt's worker. It stands in for
+// chat_chain_launch_send, which starts the real transport instead.
+@(private)
+chain_attempt_hold_start :: proc(chat: ^Chat_Session, hold: ^Chain_Attempt_Hold) -> bool {
+	chain := &chat.chain
+	if chain.mailbox == nil {
+		box, box_error := new(Owner_Mailbox, virtual.arena_allocator(&chain.scratch))
+		if box_error != nil { return false }
+		mailbox_init(box, os.heap_allocator())
+		chain.mailbox = box
+	}
+	worker, worker_error := new(Chat_Request_Worker, virtual.arena_allocator(&chain.scratch))
+	if worker_error != nil { return false }
+	worker^ = {
+		allocator = chain.mailbox.allocator,
+		mailbox   = chain.mailbox,
+	}
+	hold.worker = worker
+	hold.thread = test_thread_start(chain_attempt_hold_serve, hold, "nabla-stuck-attempt")
+	if hold.thread == nil { return false }
+	chain.worker = hold.thread
+	chain.worker_data = worker
+	return true
+}
+
+// An attempt whose worker ignores its stop is abandoned at the patience rather than waited for:
+// its outcome is recorded, the turn ends, the session takes the next turn, and the attempt is
+// released once its worker finally publishes.
+@(test)
+test_an_attempt_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
+	if !test_isolate_process(test, #procedure) { return }
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	chat_test_capacity(chat, 500_000)
+
+	hold := new(Chain_Attempt_Hold, os.heap_allocator())
+	released := false
+	defer if !released { sync.sema_post(&hold.release) }
+
+	_test_accept(test, chat, "an attempt that never answers")
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = "http://127.0.0.1:1",
+	}
+	chat_request_begin(chat, connection, test_retry_policy(), {})
+	testing.expect(test, chat_chain_claim_send(chat))
+	testing.expect_value(test, chat.chain.stage, Chat_Request_Stage.Sending)
+	if !chain_attempt_hold_start(chat, hold) {
+		testing.fail_now(test, "the stuck attempt's worker could not be started")
+	}
+
+	// The turn is cancelled, and the owner's patience for the worker starts where it first saw
+	// the stop: this observation is past the end of it.
+	testing.expect(test, chat_session_request_cancel(chat))
+	chat_chain_note_stop(chat, time.tick_add(time.tick_now(), -(TOOL_JOBS_STOP_PATIENCE + time.Millisecond)))
+
+	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
+	defer delete(usages)
+	// The owner stops waiting for it: the attempt is abandoned instead of joined, and its send
+	// is recorded as the cancellation that asked it to stop.
+	chat_chain_await(chat, &usages)
+	testing.expect_value(test, chat.chain.stage, Chat_Request_Stage.Committing)
+	testing.expect(test, chat.chain.abandoned, "an attempt past its patience must be abandoned")
+	request := chat.chain.request
+	chat_chain_commit(chat, &usages)
+
+	testing.expect_value(test, chat.chain.worker, nil)
+	testing.expect_value(test, len(chat.abandoned_attempts), 1)
+	interrupted := _test_records(test, chat, {.Request_Interrupted})
+	if !testing.expect_value(test, len(interrupted), 1) { return }
+	testing.expect_value(test, interrupted[0].request, request)
+
+	// The turn ends, and the session takes the next one with the worker still outstanding.
+	finish := _test_settle(test, chat)
+	testing.expect_value(test, finish.status, Chat_Terminal_Status.Cancelled)
+	testing.expect(test, chat_session_workers_outstanding(chat), "an abandoned worker is outstanding")
+	_test_accept(test, chat, "the turn after the abandoned attempt")
+	_test_begin_request(test, chat)
+	testing.expect(test, chat_session_feed_completion(chat, chat_session_event_source(chat)))
+	next := _test_settle(test, chat)
+	testing.expect_value(test, next.status, Chat_Terminal_Status.Completed)
+
+	// The worker publishes at last, and the owner releases the attempt then: its result is
+	// dropped, and nothing it reached is still kept.
+	sync.sema_post(&hold.release)
+	released = true
+	deadline := time.tick_add(time.tick_now(), SHELL_TEST_BOUND)
+	for len(chat.abandoned_attempts) > 0 && time.tick_since(deadline) < 0 {
+		chat_session_observe_at(chat, time.tick_now())
+		time.sleep(time.Millisecond)
+	}
+	testing.expect_value(test, len(chat.abandoned_attempts), 0)
+	testing.expect(test, !chat_session_workers_outstanding(chat))
 }

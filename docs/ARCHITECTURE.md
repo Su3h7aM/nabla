@@ -1098,7 +1098,6 @@ These mechanisms exist in the code today and are replaced by the named target. D
 | --- | --- |
 | TUI 50 ms input poll; headless and ACP output through `Chat_Observer` callbacks on the owner; ACP writes that block under the writer mutex; one ACP session | `View_Queue` and eventfd, the owner never blocks on a frontend, one owner per ACP session (section 22) |
 | `SHUTDOWN_JOIN_POLL` sleep loop in root | one wait on the thread or its stop wake, with a real deadline as the only timeout (section 2.3) |
-| provider attempts and compaction joined without a deadline on stop and teardown | abandonment after `STOP_PATIENCE` (section 7.2) |
 | a stream that breaks after an accepted response head is resent | a `Notice` (section 11.3) |
 | invalid request, payload too large, and content policy end the turn | one `Notice`, then end on a repeat (section 2.2) |
 | a result rendered by `tool_result_of` where the executor built it | typed output kept until commit, rendered once at commit (section 14.3) |
