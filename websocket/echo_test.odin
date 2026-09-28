@@ -67,7 +67,7 @@ test_websocket_live_peer_upgrade_and_violations :: proc(t: ^testing.T) {
 }
 
 // echo_open dials the peer, which is listening before the first case runs.
-echo_open :: proc(state: ^Echo_State, port: int, path: string) -> (conn: ^Conn, failure: Dial_Failure) {
+echo_open :: proc(state: ^Echo_State, port: int, path: string) -> (connection: ^Conn, failure: Dial_Failure) {
 	url := fmt.aprintf("ws://localhost:%d%s", port, path)
 	defer delete(url)
 	state.deadline = time.tick_add(time.tick_now(), ECHO_CASE_TIMEOUT)
@@ -84,26 +84,26 @@ echo_keep_going :: proc(user_data: rawptr) -> client.Wait_Status {
 // The message cases run on one connection, in the order the peer's script expects.
 echo_run_message_cases :: proc(state: ^Echo_State, port: int) {
 	t := state.t
-	conn, failure := echo_open(state, port, "/")
+	connection, failure := echo_open(state, port, "/")
 	if !testing.expect_value(t, failure.kind, Dial_Error.None) {
 		dial_failure_destroy(&failure, context.allocator)
 		return
 	}
-	defer destroy(conn)
+	defer destroy(connection)
 
-	echo_send(state, conn, .Text, "echo")
-	echo_expect_message(state, conn, .Text, "echo")
-	echo_send(state, conn, .Binary, "binary")
-	echo_expect_message(state, conn, .Binary, "binary")
+	echo_send(state, connection, .Text, "echo")
+	echo_expect_message(state, connection, .Text, "echo")
+	echo_send(state, connection, .Binary, "binary")
+	echo_expect_message(state, connection, .Binary, "binary")
 
 	// A message the peer sends as two frames, so the first read ends nothing.
-	echo_send(state, conn, .Text, "fragmented")
+	echo_send(state, connection, .Text, "fragmented")
 	length := 0
-	count, _, complete, err := read(conn, state.buffer[:])
+	count, _, complete, err := read(connection, state.buffer[:])
 	if testing.expect_value(t, err, Error.None) {
 		length += count
 		testing.expect(t, !complete, "the first fragment ended the message")
-		count, _, complete, err = read(conn, state.buffer[length:])
+		count, _, complete, err = read(connection, state.buffer[length:])
 		if testing.expect_value(t, err, Error.None) {
 			length += count
 			testing.expect(t, complete, "the last fragment did not end the message")
@@ -112,8 +112,8 @@ echo_run_message_cases :: proc(state: ^Echo_State, port: int) {
 	}
 
 	// A message far larger than one frame, arriving as several.
-	echo_send(state, conn, .Text, "large")
-	message, received := echo_receive(state, conn, .Text)
+	echo_send(state, connection, .Text, "large")
+	message, received := echo_receive(state, connection, .Text)
 	if testing.expect(t, received, "the large message could not be read") {
 		if testing.expect_value(t, len(message), LARGE_MESSAGE) {
 			content_ok := true
@@ -123,40 +123,40 @@ echo_run_message_cases :: proc(state: ^Echo_State, port: int) {
 	}
 
 	// A ping from the peer is answered while the next message is read.
-	echo_send(state, conn, .Text, "ping")
-	echo_expect_message(state, conn, .Text, "pong")
+	echo_send(state, connection, .Text, "ping")
+	echo_expect_message(state, connection, .Text, "pong")
 
 	// An orderly close, with the peer's code and this client's answer to it.
-	echo_send(state, conn, .Text, "close")
+	echo_send(state, connection, .Text, "close")
 	buffer: [1024]u8
 	err = .None
-	for err == .None { _, _, _, err = read(conn, buffer[:]) }
+	for err == .None { _, _, _, err = read(connection, buffer[:]) }
 	testing.expect_value(t, err, Error.Closed)
-	testing.expect_value(t, conn.close_code, Close_Code.Normal)
-	testing.expect_value(t, close(conn, .Normal, "", buffer[:]), Error.None)
+	testing.expect_value(t, connection.close_code, Close_Code.Normal)
+	testing.expect_value(t, close(connection, .Normal, "", buffer[:]), Error.None)
 }
 
 // A frame the peer sends in the same segment as its response head belongs to the WebSocket,
 // not to the HTTP response, and it must still be the first thing read.
 echo_run_immediate_case :: proc(state: ^Echo_State, port: int) {
 	t := state.t
-	conn, failure := echo_open(state, port, "/")
+	connection, failure := echo_open(state, port, "/")
 	if !testing.expect_value(t, failure.kind, Dial_Error.None) {
 		dial_failure_destroy(&failure, context.allocator)
 		return
 	}
-	defer destroy(conn)
-	echo_expect_message(state, conn, .Text, "immediate")
+	defer destroy(connection)
+	echo_expect_message(state, connection, .Text, "immediate")
 }
 
 // A response that does not accept the key it was sent is not a WebSocket, so no connection
 // may be handed to a caller (RFC 6455 4.1).
 echo_run_rejected_key_case :: proc(state: ^Echo_State, port: int) {
 	t := state.t
-	conn, failure := echo_open(state, port, "/")
+	connection, failure := echo_open(state, port, "/")
 	defer dial_failure_destroy(&failure, context.allocator)
-	if conn != nil {
-		destroy(conn)
+	if connection != nil {
+		destroy(connection)
 		testing.fail_now(t, "a connection was opened on a response that did not accept the key")
 	}
 	testing.expect_value(t, failure.kind, Dial_Error.Response)
@@ -164,16 +164,16 @@ echo_run_rejected_key_case :: proc(state: ^Echo_State, port: int) {
 
 echo_run_protocol_violation_case :: proc(state: ^Echo_State, port: int, what: string) {
 	t := state.t
-	conn, failure := echo_open(state, port, "/")
+	connection, failure := echo_open(state, port, "/")
 	if !testing.expect_value(t, failure.kind, Dial_Error.None) {
 		dial_failure_destroy(&failure, context.allocator)
 		return
 	}
-	defer destroy(conn)
+	defer destroy(connection)
 
 	buffer: [1024]u8
 	for {
-		_, _, _, err := read(conn, buffer[:])
+		_, _, _, err := read(connection, buffer[:])
 		if err == .None { continue }
 		testing.expect_value(t, err, Error.Protocol)
 		return
@@ -183,10 +183,10 @@ echo_run_protocol_violation_case :: proc(state: ^Echo_State, port: int, what: st
 // Handoff carries a connection from the thread that dials it to the test thread. The
 // dialing thread writes it and the test reads it only after the join.
 Handoff :: struct {
-	state:   ^Echo_State,
-	port:    int,
-	conn:    ^Conn,
-	failure: Dial_Failure,
+	state:      ^Echo_State,
+	port:       int,
+	connection: ^Conn,
+	failure:    Dial_Failure,
 }
 
 // A connection opened on one thread is used from another that has never run an event
@@ -221,14 +221,14 @@ test_websocket_used_from_a_thread_that_did_not_dial :: proc(t: ^testing.T) {
 		dial_failure_destroy(&handoff.failure, context.allocator)
 		return
 	}
-	conn := handoff.conn
-	defer destroy(conn)
+	connection := handoff.connection
+	defer destroy(connection)
 
 	testing.expect(t, nbio.current_thread_event_loop() == nil, "the test thread already runs an event loop, so this proves nothing")
-	echo_send(&state, conn, .Text, "echo")
-	echo_expect_message(&state, conn, .Text, "echo")
+	echo_send(&state, connection, .Text, "echo")
+	echo_expect_message(&state, connection, .Text, "echo")
 	closing: [128]u8
-	testing.expect_value(t, close(conn, .Normal, "", closing[:]), Error.None)
+	testing.expect_value(t, close(connection, .Normal, "", closing[:]), Error.None)
 
 	peer_wait(&peer)
 	testing.expect(t, peer_saw(&peer, "the client closed with 1000"), "the connection did not close in order")
@@ -237,29 +237,29 @@ test_websocket_used_from_a_thread_that_did_not_dial :: proc(t: ^testing.T) {
 @(private)
 echo_handoff_dial :: proc(dialer: ^thread.Thread) {
 	handoff := cast(^Handoff)dialer.data
-	handoff.conn, handoff.failure = echo_open(handoff.state, handoff.port, "/")
+	handoff.connection, handoff.failure = echo_open(handoff.state, handoff.port, "/")
 }
 
-echo_send :: proc(state: ^Echo_State, conn: ^Conn, opcode: Opcode, message: string) {
+echo_send :: proc(state: ^Echo_State, connection: ^Conn, opcode: Opcode, message: string) {
 	t := state.t
-	testing.expect_value(t, write(conn, opcode, transmute([]u8)message), Error.None)
+	testing.expect_value(t, write(connection, opcode, transmute([]u8)message), Error.None)
 }
 
-echo_expect_message :: proc(state: ^Echo_State, conn: ^Conn, opcode: Opcode, expected: string) -> string {
-	message, received := echo_receive(state, conn, opcode)
+echo_expect_message :: proc(state: ^Echo_State, connection: ^Conn, opcode: Opcode, expected: string) -> string {
+	message, received := echo_receive(state, connection, opcode)
 	if received { testing.expect_value(state.t, message, expected) }
 	return message
 }
 
 // echo_receive reads one whole message of the given type and reports it, which is an empty
 // string when the message failed.
-echo_receive :: proc(state: ^Echo_State, conn: ^Conn, opcode: Opcode) -> (message: string, ok: bool) {
+echo_receive :: proc(state: ^Echo_State, connection: ^Conn, opcode: Opcode) -> (message: string, ok: bool) {
 	t := state.t
 	length := 0
 	for {
 		// A read into no room returns nothing and never completes the message.
 		if !testing.expect(t, length < len(state.buffer), "the message does not fit the case buffer") { return "", false }
-		count, frame_opcode, complete, err := read(conn, state.buffer[length:])
+		count, frame_opcode, complete, err := read(connection, state.buffer[length:])
 		if !testing.expect_value(t, err, Error.None) { return "", false }
 		if !testing.expect_value(t, frame_opcode, opcode) { return "", false }
 		length += count

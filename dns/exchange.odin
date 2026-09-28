@@ -131,8 +131,8 @@ exchange_udp :: proc(
 		reply := buffer[:count]
 		if source != server || !response_matches(packet, reply) { continue }
 		if message_truncated(reply) { return nil, .Retry_TCP }
-		answer, xid, parsed := net.parse_response(reply, kind, allocator)
-		if !parsed || xid != id {
+		answer, response_id, parsed := net.parse_response(reply, kind, allocator)
+		if !parsed || response_id != id {
 			net.destroy_dns_records(answer, allocator)
 			continue
 		}
@@ -186,8 +186,8 @@ exchange_tcp :: proc(
 	if wait := tcp_receive(socket, response, deadline, interrupt); wait != .Ready { return nil, outcome_of(wait) }
 
 	if !response_matches(packet, response) { return nil, .Skip }
-	answer, xid, parsed := net.parse_response(response, kind, allocator)
-	if !parsed || xid != id {
+	answer, response_id, parsed := net.parse_response(response, kind, allocator)
+	if !parsed || response_id != id {
 		net.destroy_dns_records(answer, allocator)
 		return nil, .Skip
 	}
@@ -241,9 +241,9 @@ Dial_State :: struct {
 // on_dialed copies the dial's answer out of the operation, which is reaped as
 // soon as this callback returns. A failed dial has already closed its socket.
 @(private)
-on_dialed :: proc(op: ^nbio.Operation, state: ^Dial_State) {
-	state.socket = op.dial.socket
-	state.failed = op.dial.err != nil
+on_dialed :: proc(operation: ^nbio.Operation, state: ^Dial_State) {
+	state.socket = operation.dial.socket
+	state.failed = operation.dial.err != nil
 	state.done = true
 }
 
@@ -251,8 +251,8 @@ on_dialed :: proc(op: ^nbio.Operation, state: ^Dial_State) {
 // attempt deadline and the interrupt bound the connect as well.
 dial_tcp :: proc(server: net.Endpoint, deadline: time.Tick, interrupt: Interrupt) -> (socket: net.TCP_Socket, wait: Wait) {
 	state: Dial_State
-	op := nbio.dial_poly(server, &state, on_dialed)
-	if wait = tick_until(op, &state.done, deadline, interrupt); wait != .Ready { return 0, wait }
+	operation := nbio.dial_poly(server, &state, on_dialed)
+	if wait = tick_until(operation, &state.done, deadline, interrupt); wait != .Ready { return 0, wait }
 	if state.failed { return 0, .Failed }
 	// The dial may hand back a blocking socket, and a blocking read would wait
 	// past the deadline and the interrupt.
@@ -270,38 +270,38 @@ Poll_State :: struct {
 }
 
 @(private)
-on_polled :: proc(op: ^nbio.Operation, state: ^Poll_State) {
-	state.result = op.poll.result
+on_polled :: proc(operation: ^nbio.Operation, state: ^Poll_State) {
+	state.result = operation.poll.result
 	state.done = true
 }
 
 // wait_ready waits until socket is ready for event.
 wait_ready :: proc(socket: net.Any_Socket, event: nbio.Poll_Event, deadline: time.Tick, interrupt: Interrupt) -> Wait {
 	state: Poll_State
-	op := nbio.poll_poly(socket, event, &state, on_polled)
-	if wait := tick_until(op, &state.done, deadline, interrupt); wait != .Ready { return wait }
+	operation := nbio.poll_poly(socket, event, &state, on_polled)
+	if wait := tick_until(operation, &state.done, deadline, interrupt); wait != .Ready { return wait }
 	return .Ready if state.result == .Ready else .Failed
 }
 
-// tick_until runs the thread's event loop until op sets done, the deadline
+// tick_until runs the thread's event loop until operation sets done, the deadline
 // passes, or the interrupt fires. Without an interrupt check the deadline is
 // the only timeout; with one, the check runs at least every DNS_IO_SLICE. An
 // operation that did not finish is removed, so its callback never runs and the
 // state it writes may leave scope.
-tick_until :: proc(op: ^nbio.Operation, done: ^bool, deadline: time.Tick, interrupt: Interrupt) -> Wait {
+tick_until :: proc(operation: ^nbio.Operation, done: ^bool, deadline: time.Tick, interrupt: Interrupt) -> Wait {
 	for !done^ {
 		if interrupt_now(interrupt) {
-			nbio.remove(op)
+			nbio.remove(operation)
 			return .Cancelled
 		}
 		remaining := -time.tick_since(deadline)
 		if remaining <= 0 {
-			nbio.remove(op)
+			nbio.remove(operation)
 			return .Expired
 		}
 		if interrupt.check != nil { remaining = min(remaining, DNS_IO_SLICE) }
 		if nbio.tick(remaining) != nil && !done^ {
-			nbio.remove(op)
+			nbio.remove(operation)
 			return .Failed
 		}
 	}

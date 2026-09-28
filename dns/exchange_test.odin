@@ -335,9 +335,9 @@ tcp_answer_serve :: proc(thread: ^thread.Thread) {
 	fixture := cast(^Exchange_Fixture)thread.data
 	deadline := time.tick_add(time.tick_now(), PEER_BOUND)
 	for {
-		conn, _, accept_err := net.accept_tcp(fixture.tcp)
+		connection, _, accept_err := net.accept_tcp(fixture.tcp)
 		if accept_err == .None {
-			tcp_answer(fixture, conn)
+			tcp_answer(fixture, connection)
 			return
 		}
 		if time.tick_since(deadline) >= 0 { return }
@@ -347,18 +347,18 @@ tcp_answer_serve :: proc(thread: ^thread.Thread) {
 
 // tcp_answer serves the one query on an accepted connection. Its reads carry
 // timeouts like every other blocking call in this file.
-tcp_answer :: proc(fixture: ^Exchange_Fixture, conn: net.TCP_Socket) {
-	defer net.close(conn)
-	_ = net.set_option(conn, .Receive_Timeout, DNS_TIMEOUT)
-	_ = net.set_option(conn, .Send_Timeout, DNS_TIMEOUT)
+tcp_answer :: proc(fixture: ^Exchange_Fixture, connection: net.TCP_Socket) {
+	defer net.close(connection)
+	_ = net.set_option(connection, .Receive_Timeout, DNS_TIMEOUT)
+	_ = net.set_option(connection, .Send_Timeout, DNS_TIMEOUT)
 
 	prefix: [2]u8
-	if !tcp_read_full(conn, prefix[:]) { return }
+	if !tcp_read_full(connection, prefix[:]) { return }
 	length := int(prefix[0]) << 8 | int(prefix[1])
 	if length <= HEADER_SIZE || length > 512 { return }
 	query := make([]u8, length, context.temp_allocator)
 	defer delete(query, context.temp_allocator)
-	if !tcp_read_full(conn, query) { return }
+	if !tcp_read_full(connection, query) { return }
 	fixture.tcp_hit = true
 
 	// Header with one answer, the question echoed back, and one A record
@@ -379,12 +379,12 @@ tcp_answer :: proc(fixture: ^Exchange_Fixture, conn: net.TCP_Socket) {
 	if fixture.split_prefix {
 		// The length prefix arrives in two pieces, so the client must
 		// assemble it rather than read it whole.
-		tcp_write_full(conn, reply[:1])
+		tcp_write_full(connection, reply[:1])
 		time.sleep(50 * time.Millisecond)
-		tcp_write_full(conn, reply[1:at])
+		tcp_write_full(connection, reply[1:at])
 		return
 	}
-	tcp_write_full(conn, reply[:at])
+	tcp_write_full(connection, reply[:at])
 }
 
 // tcp_read_full reads exactly len(buffer) bytes: fewer means the peer went

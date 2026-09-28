@@ -37,108 +37,108 @@ Client_Hello_Fields :: struct {
 
 // client_hello_encode writes a ClientHello (RFC 8446 section 4.1.2) and returns
 // how many bytes of `dst` it used.
-client_hello_encode :: proc(dst: []u8, fields: Client_Hello_Fields) -> (n: int, ok: bool) {
-	w := Writer {
+client_hello_encode :: proc(dst: []u8, fields: Client_Hello_Fields) -> (count: int, ok: bool) {
+	writer := Writer {
 		dst = dst,
 		ok  = true,
 	}
 	random := fields.random
-	write_u16(&w, LEGACY_VERSION)
-	write_bytes(&w, random[:])
-	write_u8(&w, len(fields.session_id))
-	write_bytes(&w, fields.session_id)
+	write_u16(&writer, LEGACY_VERSION)
+	write_bytes(&writer, random[:])
+	write_u8(&writer, len(fields.session_id))
+	write_bytes(&writer, fields.session_id)
 
-	suites := write_section_start(&w)
-	for suite in OFFERED_SUITES { write_u16(&w, int(suite)) }
-	write_section_end(&w, suites)
+	suites := write_section_start(&writer)
+	for suite in OFFERED_SUITES { write_u16(&writer, int(suite)) }
+	write_section_end(&writer, suites)
 
 	// legacy_compression_methods: the null compression, and nothing else
 	// (RFC 8446 section 4.1.2).
-	write_u8(&w, 1)
-	write_u8(&w, 0)
+	write_u8(&writer, 1)
+	write_u8(&writer, 0)
 
-	extensions := write_section_start(&w)
-	if fields.server_name != "" { write_server_name(&w, fields.server_name) }
-	write_supported_versions(&w)
-	write_supported_groups(&w)
-	write_signature_algorithms(&w)
-	write_key_share(&w, fields)
-	if len(fields.alpn) > 0 { write_alpn(&w, fields.alpn) }
-	if len(fields.cookie) > 0 { write_cookie(&w, fields.cookie) }
-	write_section_end(&w, extensions)
+	extensions := write_section_start(&writer)
+	if fields.server_name != "" { write_server_name(&writer, fields.server_name) }
+	write_supported_versions(&writer)
+	write_supported_groups(&writer)
+	write_signature_algorithms(&writer)
+	write_key_share(&writer, fields)
+	if len(fields.alpn) > 0 { write_alpn(&writer, fields.alpn) }
+	if len(fields.cookie) > 0 { write_cookie(&writer, fields.cookie) }
+	write_section_end(&writer, extensions)
 
-	return w.at, w.ok
+	return writer.at, writer.ok
 }
 
-write_server_name :: proc(w: ^Writer, server_name: string) {
-	write_u16(w, int(Extension_Type.Server_Name))
-	extension := write_section_start(w)
-	list := write_section_start(w)
-	write_u8(w, 0) // NameType.host_name
-	write_u16(w, len(server_name))
-	write_bytes(w, transmute([]u8)server_name)
-	write_section_end(w, list)
-	write_section_end(w, extension)
+write_server_name :: proc(writer: ^Writer, server_name: string) {
+	write_u16(writer, int(Extension_Type.Server_Name))
+	extension := write_section_start(writer)
+	list := write_section_start(writer)
+	write_u8(writer, 0) // NameType.host_name
+	write_u16(writer, len(server_name))
+	write_bytes(writer, transmute([]u8)server_name)
+	write_section_end(writer, list)
+	write_section_end(writer, extension)
 }
 
-write_supported_versions :: proc(w: ^Writer) {
-	write_u16(w, int(Extension_Type.Supported_Versions))
-	extension := write_section_start(w)
+write_supported_versions :: proc(writer: ^Writer) {
+	write_u16(writer, int(Extension_Type.Supported_Versions))
+	extension := write_section_start(writer)
 	// A ClientHello carries the list of versions under a one-byte length, where a
 	// ServerHello answers with a single version (RFC 8446 section 4.2.1).
-	write_u8(w, 2)
-	write_u16(w, VERSION_1_3)
-	write_section_end(w, extension)
+	write_u8(writer, 2)
+	write_u16(writer, VERSION_1_3)
+	write_section_end(writer, extension)
 }
 
 // write_supported_groups offers every group this client can exchange a key with, which
 // is what a server picks the key share it wants from (RFC 8446 section 4.2.7).
-write_supported_groups :: proc(w: ^Writer) {
-	write_u16(w, int(Extension_Type.Supported_Groups))
-	extension := write_section_start(w)
-	groups := write_section_start(w)
-	for group in OFFERED_GROUPS { write_u16(w, int(group)) }
-	write_section_end(w, groups)
-	write_section_end(w, extension)
+write_supported_groups :: proc(writer: ^Writer) {
+	write_u16(writer, int(Extension_Type.Supported_Groups))
+	extension := write_section_start(writer)
+	groups := write_section_start(writer)
+	for group in OFFERED_GROUPS { write_u16(writer, int(group)) }
+	write_section_end(writer, groups)
+	write_section_end(writer, extension)
 }
 
 // write_cookie repeats the cookie a HelloRetryRequest carried (RFC 8446 section 4.2.2).
-write_cookie :: proc(w: ^Writer, cookie: []u8) {
-	write_u16(w, int(Extension_Type.Cookie))
-	extension := write_section_start(w)
-	write_u16(w, len(cookie))
-	write_bytes(w, cookie)
-	write_section_end(w, extension)
+write_cookie :: proc(writer: ^Writer, cookie: []u8) {
+	write_u16(writer, int(Extension_Type.Cookie))
+	extension := write_section_start(writer)
+	write_u16(writer, len(cookie))
+	write_bytes(writer, cookie)
+	write_section_end(writer, extension)
 }
 
-write_signature_algorithms :: proc(w: ^Writer) {
-	write_u16(w, int(Extension_Type.Signature_Algorithms))
-	extension := write_section_start(w)
-	schemes := write_section_start(w)
-	for scheme in OFFERED_SIGNATURE_SCHEMES { write_u16(w, int(scheme)) }
-	write_section_end(w, schemes)
-	write_section_end(w, extension)
+write_signature_algorithms :: proc(writer: ^Writer) {
+	write_u16(writer, int(Extension_Type.Signature_Algorithms))
+	extension := write_section_start(writer)
+	schemes := write_section_start(writer)
+	for scheme in OFFERED_SIGNATURE_SCHEMES { write_u16(writer, int(scheme)) }
+	write_section_end(writer, schemes)
+	write_section_end(writer, extension)
 }
 
-write_key_share :: proc(w: ^Writer, fields: Client_Hello_Fields) {
-	write_u16(w, int(Extension_Type.Key_Share))
-	extension := write_section_start(w)
-	shares := write_section_start(w)
-	write_u16(w, int(fields.group))
-	write_u16(w, len(fields.keyshare))
-	write_bytes(w, fields.keyshare)
-	write_section_end(w, shares)
-	write_section_end(w, extension)
+write_key_share :: proc(writer: ^Writer, fields: Client_Hello_Fields) {
+	write_u16(writer, int(Extension_Type.Key_Share))
+	extension := write_section_start(writer)
+	shares := write_section_start(writer)
+	write_u16(writer, int(fields.group))
+	write_u16(writer, len(fields.keyshare))
+	write_bytes(writer, fields.keyshare)
+	write_section_end(writer, shares)
+	write_section_end(writer, extension)
 }
 
-write_alpn :: proc(w: ^Writer, protocols: []string) {
-	write_u16(w, int(Extension_Type.Application_Layer_Protocol_Negotiation))
-	extension := write_section_start(w)
-	list := write_section_start(w)
+write_alpn :: proc(writer: ^Writer, protocols: []string) {
+	write_u16(writer, int(Extension_Type.Application_Layer_Protocol_Negotiation))
+	extension := write_section_start(writer)
+	list := write_section_start(writer)
 	for protocol in protocols {
-		write_u8(w, len(protocol))
-		write_bytes(w, transmute([]u8)protocol)
+		write_u8(writer, len(protocol))
+		write_bytes(writer, transmute([]u8)protocol)
 	}
-	write_section_end(w, list)
-	write_section_end(w, extension)
+	write_section_end(writer, list)
+	write_section_end(writer, extension)
 }

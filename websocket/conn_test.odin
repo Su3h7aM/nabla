@@ -41,25 +41,25 @@ fixture_abort :: proc(user_data: rawptr) {
 	fixture.aborted += 1
 }
 
-fixture_conn :: proc(t: ^testing.T, fixture: ^Fixture, incoming: []u8) -> ^Conn {
+fixture_connection :: proc(t: ^testing.T, fixture: ^Fixture, incoming: []u8) -> ^Conn {
 	fixture.incoming = incoming
-	conn, err := init(
+	connection, err := init(
 		{read = fixture_read, write = fixture_write, release = fixture_release, abort = fixture_abort, user_data = fixture},
 		context.temp_allocator,
 	)
 	if !testing.expect(t, err == .None, "a connection could not be prepared") { return nil }
-	return conn
+	return connection
 }
 
 @(test)
 test_stream_end_without_a_close_frame_is_abnormal :: proc(t: ^testing.T) {
 	fixture: Fixture
-	conn := fixture_conn(t, &fixture, nil)
-	if conn == nil { return }
+	connection := fixture_connection(t, &fixture, nil)
+	if connection == nil { return }
 	buffer: [8]u8
-	_, _, _, err := read(conn, buffer[:])
+	_, _, _, err := read(connection, buffer[:])
 	testing.expect_value(t, err, Error.Abnormal_Closure)
-	destroy(conn)
+	destroy(connection)
 	testing.expect_value(t, fixture.released, 1)
 	testing.expect_value(t, fixture.aborted, 0)
 }
@@ -67,9 +67,9 @@ test_stream_end_without_a_close_frame_is_abnormal :: proc(t: ^testing.T) {
 @(test)
 test_abort_uses_nonblocking_transport_teardown :: proc(t: ^testing.T) {
 	fixture: Fixture
-	conn := fixture_conn(t, &fixture, nil)
-	if conn == nil { return }
-	abort(conn)
+	connection := fixture_connection(t, &fixture, nil)
+	if connection == nil { return }
+	abort(connection)
 	testing.expect_value(t, fixture.released, 0)
 	testing.expect_value(t, fixture.aborted, 1)
 }
@@ -106,18 +106,18 @@ test_fragmented_message_with_a_ping_between_the_fragments :: proc(t: ^testing.T)
 		0x03,
 		0xe8,
 	}
-	conn := fixture_conn(t, &fixture, incoming)
-	if conn == nil { return }
-	defer destroy(conn)
+	connection := fixture_connection(t, &fixture, incoming)
+	if connection == nil { return }
+	defer destroy(connection)
 
 	buffer: [64]u8
-	count, opcode, complete, err := read(conn, buffer[:])
+	count, opcode, complete, err := read(connection, buffer[:])
 	if !testing.expect(t, err == .None, "the first fragment could not be read") { return }
 	testing.expect_value(t, string(buffer[:count]), "Hel")
 	testing.expect_value(t, opcode, Opcode.Text)
 	testing.expect(t, !complete, "the message ended at its first fragment")
 
-	count, opcode, complete, err = read(conn, buffer[:])
+	count, opcode, complete, err = read(connection, buffer[:])
 	if !testing.expect(t, err == .None, "the last fragment could not be read") { return }
 	testing.expect_value(t, string(buffer[:count]), "lo")
 	testing.expect_value(t, opcode, Opcode.Text)
@@ -131,10 +131,10 @@ test_fragmented_message_with_a_ping_between_the_fragments :: proc(t: ^testing.T)
 	testing.expect(t, pong_header.masked, "a client frame is masked")
 	testing.expect_value(t, string(pong), "Hello")
 
-	count, _, _, err = read(conn, buffer[:])
+	count, _, _, err = read(connection, buffer[:])
 	testing.expect(t, err == .Closed, "the close frame did not end the stream")
 	testing.expect_value(t, count, 0)
-	testing.expect_value(t, conn.close_code, Close_Code.Normal)
+	testing.expect_value(t, connection.close_code, Close_Code.Normal)
 
 	// The close was echoed, which is what both ends agreeing the connection is over
 	// means (RFC 6455 section 5.5.1).
@@ -149,52 +149,52 @@ test_frames_a_server_may_not_send :: proc(t: ^testing.T) {
 	// section 5.3).
 	fixture: Fixture
 	defer delete(fixture.outgoing)
-	conn := fixture_conn(t, &fixture, []u8{0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58})
-	if conn == nil { return }
+	connection := fixture_connection(t, &fixture, []u8{0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58})
+	if connection == nil { return }
 	buffer: [64]u8
-	_, _, _, masked_err := read(conn, buffer[:])
+	_, _, _, masked_err := read(connection, buffer[:])
 	testing.expect_value(t, masked_err, Error.Protocol)
 	testing.expect(t, close_code_sent(fixture.outgoing[:]) == Close_Code.Protocol_Error, "the close did not name the protocol error")
-	destroy(conn)
+	destroy(connection)
 
 	// A control frame whose payload does not fit in one frame: 0x89 0x7e 0x0100
 	// followed by the octets it claims (RFC 6455 section 5.5).
 	clear(&fixture.outgoing)
 	fixture.at = 0
-	conn = fixture_conn(t, &fixture, []u8{0x89, 0x7e, 0x01, 0x00})
-	if conn == nil { return }
-	_, _, _, large_err := read(conn, buffer[:])
+	connection = fixture_connection(t, &fixture, []u8{0x89, 0x7e, 0x01, 0x00})
+	if connection == nil { return }
+	_, _, _, large_err := read(connection, buffer[:])
 	testing.expect_value(t, large_err, Error.Protocol)
 	testing.expect(t, close_code_sent(fixture.outgoing[:]) == Close_Code.Protocol_Error, "the close did not name the protocol error")
-	destroy(conn)
+	destroy(connection)
 
 	// A text message that is not UTF-8: 0x81 0x01 0xff.
 	clear(&fixture.outgoing)
 	fixture.at = 0
-	conn = fixture_conn(t, &fixture, []u8{0x81, 0x01, 0xff})
-	if conn == nil { return }
-	_, _, _, text_err := read(conn, buffer[:])
+	connection = fixture_connection(t, &fixture, []u8{0x81, 0x01, 0xff})
+	if connection == nil { return }
+	_, _, _, text_err := read(connection, buffer[:])
 	testing.expect_value(t, text_err, Error.Protocol)
 	testing.expect(t, close_code_sent(fixture.outgoing[:]) == Close_Code.Invalid_Payload, "the close did not name the invalid payload")
-	destroy(conn)
+	destroy(connection)
 }
 
 @(test)
 test_empty_text_and_replacement_character_messages :: proc(t: ^testing.T) {
 	fixture: Fixture
 	defer delete(fixture.outgoing)
-	conn := fixture_conn(t, &fixture, []u8{0x81, 0x00, 0x81, 0x03, 0xef, 0xbf, 0xbd})
-	if conn == nil { return }
-	defer destroy(conn)
+	connection := fixture_connection(t, &fixture, []u8{0x81, 0x00, 0x81, 0x03, 0xef, 0xbf, 0xbd})
+	if connection == nil { return }
+	defer destroy(connection)
 
 	buffer: [8]u8
-	count, opcode, complete, err := read(conn, buffer[:])
+	count, opcode, complete, err := read(connection, buffer[:])
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, count, 0)
 	testing.expect_value(t, opcode, Opcode.Text)
 	testing.expect(t, complete, "the empty message did not complete")
 
-	count, opcode, complete, err = read(conn, buffer[:])
+	count, opcode, complete, err = read(connection, buffer[:])
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, opcode, Opcode.Text)
 	testing.expect(t, complete, "the replacement-character message did not complete")
@@ -208,18 +208,18 @@ test_invalid_outgoing_text_is_never_sent :: proc(t: ^testing.T) {
 	// nothing and the connection stays usable.
 	fixture: Fixture
 	defer delete(fixture.outgoing)
-	conn := fixture_conn(t, &fixture, nil)
-	if conn == nil { return }
-	defer destroy(conn)
+	connection := fixture_connection(t, &fixture, nil)
+	if connection == nil { return }
+	defer destroy(connection)
 
-	testing.expect_value(t, write(conn, .Text, []u8{0xff}), Error.Protocol)
+	testing.expect_value(t, write(connection, .Text, []u8{0xff}), Error.Protocol)
 	testing.expect_value(t, len(fixture.outgoing), 0)
-	testing.expect_value(t, write(conn, .Text, transmute([]u8)string("valid")), Error.None)
+	testing.expect_value(t, write(connection, .Text, transmute([]u8)string("valid")), Error.None)
 	testing.expect(t, len(fixture.outgoing) > 0, "valid text was not sent")
 	clear(&fixture.outgoing)
-	testing.expect_value(t, write(conn, .Binary, []u8{0xff}), Error.None)
+	testing.expect_value(t, write(connection, .Binary, []u8{0xff}), Error.None)
 	testing.expect(t, len(fixture.outgoing) > 0, "binary was refused for its bytes")
-	testing.expect_value(t, write(conn, .Text, nil), Error.None)
+	testing.expect_value(t, write(connection, .Text, nil), Error.None)
 	testing.expect_value(t, write(nil, .Text, transmute([]u8)string("hi")), Error.Protocol)
 }
 
@@ -231,13 +231,13 @@ test_invalid_close_payloads_are_not_echoed :: proc(t: ^testing.T) {
 	}{{[]u8{0x88, 0x01, 0x00}, .Protocol_Error}, {[]u8{0x88, 0x02, 0x03, 0xed}, .Protocol_Error}, {[]u8{0x88, 0x03, 0x03, 0xe8, 0xff}, .Invalid_Payload}}
 	for test_case in Cases {
 		fixture: Fixture
-		conn := fixture_conn(t, &fixture, test_case.frame)
-		if conn == nil { continue }
+		connection := fixture_connection(t, &fixture, test_case.frame)
+		if connection == nil { continue }
 		buffer: [8]u8
-		_, _, _, err := read(conn, buffer[:])
+		_, _, _, err := read(connection, buffer[:])
 		testing.expect_value(t, err, Error.Protocol)
 		testing.expect_value(t, close_code_sent(fixture.outgoing[:]), test_case.code)
-		destroy(conn)
+		destroy(connection)
 		delete(fixture.outgoing)
 	}
 }
@@ -245,14 +245,14 @@ test_invalid_close_payloads_are_not_echoed :: proc(t: ^testing.T) {
 @(test)
 test_local_close_input_is_checked_before_the_control_buffer_is_sliced :: proc(t: ^testing.T) {
 	fixture: Fixture
-	conn := fixture_conn(t, &fixture, nil)
-	if conn == nil { return }
-	defer destroy(conn)
+	connection := fixture_connection(t, &fixture, nil)
+	if connection == nil { return }
+	defer destroy(connection)
 	defer delete(fixture.outgoing)
 
 	reason := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	testing.expect_value(t, len(reason), 124)
-	testing.expect_value(t, close(conn, .Normal, reason, nil), Error.Protocol)
+	testing.expect_value(t, close(connection, .Normal, reason, nil), Error.Protocol)
 	testing.expect_value(t, len(fixture.outgoing), 0)
 }
 
@@ -262,9 +262,9 @@ test_local_close_input_is_checked_before_the_control_buffer_is_sliced :: proc(t:
 test_a_large_message_is_fragmented_into_masked_frames :: proc(t: ^testing.T) {
 	fixture: Fixture
 	defer delete(fixture.outgoing)
-	conn := fixture_conn(t, &fixture, nil)
-	if conn == nil { return }
-	defer destroy(conn)
+	connection := fixture_connection(t, &fixture, nil)
+	if connection == nil { return }
+	defer destroy(connection)
 
 	message := make([]u8, 2 * SEND_CHUNK + 100)
 	defer delete(message)
@@ -275,7 +275,7 @@ test_a_large_message_is_fragmented_into_masked_frames :: proc(t: ^testing.T) {
 	message[SEND_CHUNK] = 0x82
 	message[SEND_CHUNK + 1] = 0xac
 
-	if !testing.expect(t, write(conn, .Text, message) == .None, "the message could not be written") { return }
+	if !testing.expect(t, write(connection, .Text, message) == .None, "the message could not be written") { return }
 
 	Expected :: struct {
 		opcode: Opcode,

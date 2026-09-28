@@ -18,7 +18,7 @@ record_nonce :: proc(key: ^Traffic_Key) -> [IV_SIZE]u8 {
 // inner plaintext is built inside `dst` and encrypted there.
 //
 // `dst` must hold RECORD_HEADER_SIZE + len(payload) + 1 + tag bytes.
-record_protect :: proc(suite: Cipher_Suite, key: ^Traffic_Key, record_type: Record_Type, payload: []u8, dst: []u8) -> (n: int, ok: bool) {
+record_protect :: proc(suite: Cipher_Suite, key: ^Traffic_Key, record_type: Record_Type, payload: []u8, dst: []u8) -> (count: int, ok: bool) {
 	info := CIPHER_SUITES[suite]
 	tag_size := aead.TAG_SIZES[info.aead]
 	inner_length := len(payload) + 1

@@ -54,7 +54,7 @@ dial_failure_destroy :: proc(failure: ^Dial_Failure, allocator: mem.Allocator) {
 // The connection owns the socket and the TLS session beneath it, so destroy closes
 // both. A failure owns its detail, released by dial_failure_destroy with the same
 // allocator.
-dial :: proc(url: string, options: Dial_Options, allocator := context.allocator) -> (conn: ^Conn, failure: Dial_Failure) {
+dial :: proc(url: string, options: Dial_Options, allocator := context.allocator) -> (connection: ^Conn, failure: Dial_Failure) {
 	exchange_url, url_ok := http_url(url, allocator)
 	defer delete(exchange_url, allocator)
 	if !url_ok {
@@ -100,12 +100,12 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 		return nil, accept_failure
 	}
 
-	connection, err := init(transport_for(upgraded), allocator)
+	socket, err := init(transport_for(upgraded), allocator)
 	if err != .None {
 		client.upgraded_destroy(upgraded)
 		return nil, Dial_Failure{kind = .Exchange, detail = strings.clone("the WebSocket connection could not be prepared", allocator)}
 	}
-	return connection, {}
+	return socket, {}
 }
 
 // http_url states a WebSocket URL as the HTTP URL of the same request, which is what

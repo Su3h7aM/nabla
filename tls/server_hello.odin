@@ -28,18 +28,18 @@ Server_Hello :: struct {
 // handshake header. The message and every recognized extension must be exactly
 // consumed, and an extension may appear only once.
 server_hello_decode :: proc(message: []u8) -> (hello: Server_Hello, ok: bool) {
-	r := Reader {
+	reader := Reader {
 		data = message,
 		ok   = true,
 	}
-	if read_u16(&r) != LEGACY_VERSION { return {}, false }
-	copy(hello.random[:], read_bytes(&r, len(hello.random)))
+	if read_u16(&reader) != LEGACY_VERSION { return {}, false }
+	copy(hello.random[:], read_bytes(&reader, len(hello.random)))
 	hello.retry = bytes.equal(hello.random[:], HELLO_RETRY_REQUEST_RANDOM[:])
-	hello.session_id = read_bytes(&r, int(read_u8(&r)))
-	hello.cipher_suite = Cipher_Suite(read_u16(&r))
-	if read_u8(&r) != 0 { return {}, false }
+	hello.session_id = read_bytes(&reader, int(read_u8(&reader)))
+	hello.cipher_suite = Cipher_Suite(read_u16(&reader))
+	if read_u8(&reader) != 0 { return {}, false }
 
-	extensions := read_section_u16(&r)
+	extensions := read_section_u16(&reader)
 	for extensions.ok && extensions.at < len(extensions.data) {
 		start := extensions.at
 		extension_type := Extension_Type(read_u16(&extensions))
@@ -66,17 +66,17 @@ server_hello_decode :: proc(message: []u8) -> (hello: Server_Hello, ok: bool) {
 		if !extension.ok || extension.at != len(extension.data) { return {}, false }
 	}
 
-	return hello, r.ok && r.at == len(r.data) && extensions.ok && extensions.at == len(extensions.data)
+	return hello, reader.ok && reader.at == len(reader.data) && extensions.ok && extensions.at == len(extensions.data)
 }
 
 extension_seen :: proc(encoded: []u8, wanted: Extension_Type) -> bool {
-	r := Reader {
+	reader := Reader {
 		data = encoded,
 		ok   = true,
 	}
-	for r.ok && r.at < len(r.data) {
-		extension_type := Extension_Type(read_u16(&r))
-		_ = read_section_u16(&r)
+	for reader.ok && reader.at < len(reader.data) {
+		extension_type := Extension_Type(read_u16(&reader))
+		_ = read_section_u16(&reader)
 		if extension_type == wanted { return true }
 	}
 	return false

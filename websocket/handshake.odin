@@ -36,12 +36,12 @@ accept_key :: proc(key: string) -> (accept: [ACCEPT_SIZE]u8) {
 	// The GUID is bound to a local so that it has a memory representation to hash;
 	// a constant expression has none.
 	guid := KEY_GUID
-	ctx: sha1.Context
-	sha1.init(&ctx)
-	sha1.update(&ctx, transmute([]u8)key)
-	sha1.update(&ctx, transmute([]u8)guid)
+	sha_context: sha1.Context
+	sha1.init(&sha_context)
+	sha1.update(&sha_context, transmute([]u8)key)
+	sha1.update(&sha_context, transmute([]u8)guid)
 	digest: [sha1.DIGEST_SIZE]u8
-	sha1.final(&ctx, digest[:])
+	sha1.final(&sha_context, digest[:])
 	encoded, err := base64.encode_into_buf(accept[:], digest[:])
 	assert(err == nil, "the destination holds an encoded digest")
 	assert(len(encoded) == ACCEPT_SIZE, "the encoded digest is not the expected length")

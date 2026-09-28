@@ -144,17 +144,17 @@ interop_run_client :: proc(t: ^testing.T, directory: string, socket: net.TCP_Soc
 	anchors := certificate_pointers(roots.certificates, context.allocator)
 	defer delete(anchors, context.allocator)
 
-	connection := Interop_Connection {
+	transport := Interop_Connection {
 		socket = socket,
 	}
-	conn, init_err := init(
-		{read = interop_connection_read, write = interop_connection_write, user_data = &connection},
+	connection, init_err := init(
+		{read = interop_connection_read, write = interop_connection_write, user_data = &transport},
 		{roots = anchors, allocator = context.allocator},
 	)
 	if !testing.expect_value(t, init_err, Error.None) { return }
-	defer destroy(conn)
+	defer destroy(connection)
 
-	if err := handshake(conn, "localhost", []string{INTEROP_ALPN}); err != Error.None {
+	if err := handshake(connection, "localhost", []string{INTEROP_ALPN}); err != Error.None {
 		testing.expect(
 			t,
 			false,
@@ -163,29 +163,29 @@ interop_run_client :: proc(t: ^testing.T, directory: string, socket: net.TCP_Soc
 				expected.openssl_suite,
 				expected.openssl_group,
 				err,
-				conn.peer_alert,
-				conn.certificate_requested,
+				connection.peer_alert,
+				connection.certificate_requested,
 			),
 		)
 		return
 	}
-	testing.expect(t, conn.alpn == INTEROP_ALPN, "the server did not select the protocol the client offered")
+	testing.expect(t, connection.alpn == INTEROP_ALPN, "the server did not select the protocol the client offered")
 	// The server picks the suite, and the connection has to be the one it picked.
-	testing.expect_value(t, conn.suite, expected.suite)
+	testing.expect_value(t, connection.suite, expected.suite)
 
-	written, write_err := write(conn, transmute([]u8)INTEROP_REQUEST)
+	written, write_err := write(connection, transmute([]u8)INTEROP_REQUEST)
 	testing.expect(t, write_err == Error.None && written == len(INTEROP_REQUEST), "the request was not written whole")
 
 	// The server answers a page, and its first record carries the head of it.
 	response: [16 * 1024]u8
-	received, read_response_err := read(conn, response[:])
+	received, read_response_err := read(connection, response[:])
 	if !testing.expect(
 		t,
 		read_response_err == Error.None,
-		fmt.tprintf("the response could not be read: %v after %v bytes, peer alert %v", read_response_err, received, conn.peer_alert),
+		fmt.tprintf("the response could not be read: %v after %v bytes, peer alert %v", read_response_err, received, connection.peer_alert),
 	) { return }
 	testing.expect(t, strings.has_prefix(string(response[:received]), "HTTP/1."), "the response does not begin with an HTTP status line")
-	testing.expect_value(t, close(conn), Error.None)
+	testing.expect_value(t, close(connection), Error.None)
 }
 
 interop_generate_certificate :: proc(t: ^testing.T, directory: string) -> bool {

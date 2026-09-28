@@ -18,19 +18,19 @@ test_client_hello_carries_what_the_caller_asked_for :: proc(t: ^testing.T) {
 
 	// Walk the message back: a length that does not add up desynchronizes the
 	// reader, which the extension set and the final position both report.
-	r := Reader {
+	reader := Reader {
 		data = dst[:count],
 		ok   = true,
 	}
-	testing.expect_value(t, read_u16(&r), u16(LEGACY_VERSION))
-	_ = read_bytes(&r, len(fields.random))
-	testing.expect_value(t, len(read_bytes(&r, int(read_u8(&r)))), len(fields.session_id))
-	testing.expect_value(t, len(read_section_u16(&r).data), 2 * len(OFFERED_SUITES))
-	testing.expect_value(t, read_u8(&r), u8(1))
-	testing.expect_value(t, read_u8(&r), u8(0))
+	testing.expect_value(t, read_u16(&reader), u16(LEGACY_VERSION))
+	_ = read_bytes(&reader, len(fields.random))
+	testing.expect_value(t, len(read_bytes(&reader, int(read_u8(&reader)))), len(fields.session_id))
+	testing.expect_value(t, len(read_section_u16(&reader).data), 2 * len(OFFERED_SUITES))
+	testing.expect_value(t, read_u8(&reader), u8(1))
+	testing.expect_value(t, read_u8(&reader), u8(0))
 
 	seen: bit_set[Extension_Type]
-	extensions := read_section_u16(&r)
+	extensions := read_section_u16(&reader)
 	for extensions.ok && extensions.at < len(extensions.data) {
 		seen += {Extension_Type(read_u16(&extensions))}
 		_ = read_section_u16(&extensions)
@@ -44,7 +44,7 @@ test_client_hello_carries_what_the_caller_asked_for :: proc(t: ^testing.T) {
 		.Application_Layer_Protocol_Negotiation,
 	}
 	testing.expect(t, seen == wanted, "the ClientHello does not carry the extensions it should")
-	testing.expect_value(t, r.at, count)
+	testing.expect_value(t, reader.at, count)
 }
 
 // A second ClientHello repeats the first with the cookie the retry carried, and it still
@@ -65,20 +65,20 @@ test_the_second_client_hello_repeats_the_cookie :: proc(t: ^testing.T) {
 	count, encoded := client_hello_encode(dst, fields)
 	if !testing.expect(t, encoded) { return }
 
-	r := Reader {
+	reader := Reader {
 		data = dst[:count],
 		ok   = true,
 	}
-	_ = read_u16(&r)
-	_ = read_bytes(&r, len(fields.random))
-	_ = read_bytes(&r, int(read_u8(&r)))
-	_ = read_section_u16(&r)
-	_ = read_u8(&r)
-	_ = read_u8(&r)
+	_ = read_u16(&reader)
+	_ = read_bytes(&reader, len(fields.random))
+	_ = read_bytes(&reader, int(read_u8(&reader)))
+	_ = read_section_u16(&reader)
+	_ = read_u8(&reader)
+	_ = read_u8(&reader)
 
 	repeated: []u8
 	offered: int
-	extensions := read_section_u16(&r)
+	extensions := read_section_u16(&reader)
 	for extensions.ok && extensions.at < len(extensions.data) {
 		extension_type := Extension_Type(read_u16(&extensions))
 		extension := read_section_u16(&extensions)

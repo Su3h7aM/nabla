@@ -89,7 +89,7 @@ Conn :: struct {
 	close_code:      Close_Code,
 }
 
-init :: proc(transport: Transport, allocator: mem.Allocator) -> (conn: ^Conn, err: Error) {
+init :: proc(transport: Transport, allocator: mem.Allocator) -> (connection: ^Conn, err: Error) {
 	if transport.read == nil || transport.write == nil { return nil, .Transport }
 	self, alloc_error := new(Conn, allocator)
 	if alloc_error != nil { return nil, .No_Room }
@@ -108,38 +108,38 @@ init :: proc(transport: Transport, allocator: mem.Allocator) -> (conn: ^Conn, er
 	return self, .None
 }
 
-destroy :: proc(conn: ^Conn) {
-	connection_release(conn, false)
+destroy :: proc(connection: ^Conn) {
+	connection_release(connection, false)
 }
 
 // abort releases a connection without attempting another protocol close. It is for
 // cancellation and teardown paths where waiting on the peer is not allowed.
-abort :: proc(conn: ^Conn) {
-	connection_release(conn, true)
+abort :: proc(connection: ^Conn) {
+	connection_release(connection, true)
 }
 
-connection_release :: proc(conn: ^Conn, aborted: bool) {
-	if conn == nil { return }
-	delete(conn.send, conn.allocator)
-	delete(conn.recv, conn.allocator)
-	if aborted && conn.transport.abort != nil {
-		conn.transport.abort(conn.transport.user_data)
-	} else if conn.transport.release != nil {
-		conn.transport.release(conn.transport.user_data)
+connection_release :: proc(connection: ^Conn, aborted: bool) {
+	if connection == nil { return }
+	delete(connection.send, connection.allocator)
+	delete(connection.recv, connection.allocator)
+	if aborted && connection.transport.abort != nil {
+		connection.transport.abort(connection.transport.user_data)
+	} else if connection.transport.release != nil {
+		connection.transport.release(connection.transport.user_data)
 	}
-	free(conn, conn.allocator)
+	free(connection, connection.allocator)
 }
 
 // write sends one whole message. A message larger than a frame is fragmented, and
 // every frame is masked under a key of its own, which is what a client must do
 // (RFC 6455 section 5.3).
-write :: proc(conn: ^Conn, opcode: Opcode, message: []u8) -> Error {
-	if conn == nil { return .Protocol }
+write :: proc(connection: ^Conn, opcode: Opcode, message: []u8) -> Error {
+	if connection == nil { return .Protocol }
 	if opcode != .Text && opcode != .Binary { return .Protocol }
 	// RFC 6455 5.6: a text message is valid UTF-8. The whole message is
 	// checked before its first frame, so a refusal sends nothing.
 	if opcode == .Text && !utf8.valid_string(string(message)) { return .Protocol }
-	if conn.closed || conn.close_sent { return .Closed }
+	if connection.closed || connection.close_sent { return .Closed }
 
 	pending := message
 	first := true
@@ -152,9 +152,9 @@ write :: proc(conn: ^Conn, opcode: Opcode, message: []u8) -> Error {
 		crypto.rand_bytes(mask[:])
 		frame_opcode := opcode
 		if !first { frame_opcode = .Continuation }
-		count, encoded := frame_encode(frame_opcode, len(pending) == 0, mask, chunk, conn.send)
+		count, encoded := frame_encode(frame_opcode, len(pending) == 0, mask, chunk, connection.send)
 		if !encoded { return .No_Room }
-		if err := transport_write(conn, conn.send[:count]); err != .None { return err }
+		if err := transport_write(connection, connection.send[:count]); err != .None { return err }
 
 		first = false
 		if len(pending) == 0 { return .None }
@@ -163,30 +163,30 @@ write :: proc(conn: ^Conn, opcode: Opcode, message: []u8) -> Error {
 
 // ping asks the peer whether it is there, with whatever body the caller wants echoed
 // (RFC 6455 section 5.5.2).
-ping :: proc(conn: ^Conn, body: []u8) -> Error {
+ping :: proc(connection: ^Conn, body: []u8) -> Error {
 	if len(body) > MAX_CONTROL_PAYLOAD { return .Protocol }
-	return control_send(conn, .Ping, body)
+	return control_send(connection, .Ping, body)
 }
 
 // close sends the close frame and waits for the peer's, so that both ends agree the
 // connection is over (RFC 6455 section 5.5.1). The transport is the caller's to close.
-close :: proc(conn: ^Conn, code: Close_Code, reason: string, buffer: []u8) -> Error {
+close :: proc(connection: ^Conn, code: Close_Code, reason: string, buffer: []u8) -> Error {
 	if !close_code_valid(code) || len(reason) > MAX_CONTROL_PAYLOAD - 2 || !utf8.valid_string(reason) {
 		return .Protocol
 	}
-	if !conn.close_sent {
-		payload := conn.control[:2 + len(reason)]
+	if !connection.close_sent {
+		payload := connection.control[:2 + len(reason)]
 		payload[0] = u8(u16(code) >> 8)
 		payload[1] = u8(u16(code) & 0xff)
 		copy(payload[2:], reason)
-		if err := control_send(conn, .Close, payload); err != .None { return err }
-		conn.close_sent = true
+		if err := control_send(connection, .Close, payload); err != .None { return err }
+		connection.close_sent = true
 	}
-	if conn.closed { return .None }
+	if connection.closed { return .None }
 
 	// Read what the peer says, which is a close frame or nothing at all.
 	for {
-		_, _, _, err := read(conn, buffer)
+		_, _, _, err := read(connection, buffer)
 		if err == .Closed { return .None }
 		if err != .None { return err }
 	}
@@ -199,198 +199,200 @@ close :: proc(conn: ^Conn, code: Close_Code, reason: string, buffer: []u8) -> Er
 // A control frame is answered here rather than handed out, so a ping that arrives
 // between the fragments of a message does not disturb it. `buffer` is unmasked in
 // place, so it holds the message's bytes on return.
-read :: proc(conn: ^Conn, buffer: []u8) -> (count: int, opcode: Opcode, complete: bool, err: Error) {
+read :: proc(connection: ^Conn, buffer: []u8) -> (count: int, opcode: Opcode, complete: bool, err: Error) {
 	// A connection that ended, whether by the peer's close or by this side failing
 	// it, delivers nothing more.
-	if conn.closed { return 0, conn.message_opcode, false, .Closed }
+	if connection.closed { return 0, connection.message_opcode, false, .Closed }
 	for {
-		if conn.frame_remaining > 0 {
-			count, err = frame_payload_read(conn, buffer)
-			if err != .None { return 0, conn.message_opcode, false, err }
-			if conn.message_opcode == .Text && !text_validate(conn, buffer[:count]) {
-				return 0, conn.message_opcode, false, fail(conn, .Invalid_Payload, .Protocol)
+		if connection.frame_remaining > 0 {
+			count, err = frame_payload_read(connection, buffer)
+			if err != .None { return 0, connection.message_opcode, false, err }
+			if connection.message_opcode == .Text && !text_validate(connection, buffer[:count]) {
+				return 0, connection.message_opcode, false, fail(connection, .Invalid_Payload, .Protocol)
 			}
-			if conn.frame_remaining == 0 && conn.frame_final {
-				if conn.message_opcode == .Text && conn.carry_length != 0 {
-					return 0, conn.message_opcode, false, fail(conn, .Invalid_Payload, .Protocol)
+			if connection.frame_remaining == 0 && connection.frame_final {
+				if connection.message_opcode == .Text && connection.carry_length != 0 {
+					return 0, connection.message_opcode, false, fail(connection, .Invalid_Payload, .Protocol)
 				}
-				conn.in_message = false
+				connection.in_message = false
 				complete = true
 			}
-			return count, conn.message_opcode, complete, .None
+			return count, connection.message_opcode, complete, .None
 		}
 
-		header, header_err := frame_header_read(conn)
-		if header_err != .None { return 0, conn.message_opcode, false, header_err }
+		header, header_err := frame_header_read(connection)
+		if header_err != .None { return 0, connection.message_opcode, false, header_err }
 
 		// A server must not mask, and a client must close a connection if it sees
 		// one that did (RFC 6455 section 5.3).
-		if header.masked { return 0, conn.message_opcode, false, fail(conn, .Protocol_Error, .Protocol) }
+		if header.masked { return 0, connection.message_opcode, false, fail(connection, .Protocol_Error, .Protocol) }
 		// A control frame must fit in one frame, which is what keeps it actionable
 		// in the middle of a message (RFC 6455 section 5.5).
 		if header.opcode >= .Close && (header.length > MAX_CONTROL_PAYLOAD || !header.final) {
-			return 0, conn.message_opcode, false, fail(conn, .Protocol_Error, .Protocol)
+			return 0, connection.message_opcode, false, fail(connection, .Protocol_Error, .Protocol)
 		}
 
 		switch header.opcode {
 		case .Ping:
-			payload, read_err := control_read(conn, header.length)
-			if read_err != .None { return 0, conn.message_opcode, false, read_err }
-			if pong_err := control_send(conn, .Pong, payload); pong_err != .None {
-				return 0, conn.message_opcode, false, pong_err
+			payload, read_err := control_read(connection, header.length)
+			if read_err != .None { return 0, connection.message_opcode, false, read_err }
+			if pong_err := control_send(connection, .Pong, payload); pong_err != .None {
+				return 0, connection.message_opcode, false, pong_err
 			}
 			// A control frame is not part of the message in progress, so the frame
 			// that follows it is the one to read next.
 			continue
 		case .Pong:
-			if _, read_err := control_read(conn, header.length); read_err != .None {
-				return 0, conn.message_opcode, false, read_err
+			if _, read_err := control_read(connection, header.length); read_err != .None {
+				return 0, connection.message_opcode, false, read_err
 			}
 			continue
 		case .Close:
-			payload, read_err := control_read(conn, header.length)
-			if read_err != .None { return 0, conn.message_opcode, false, read_err }
-			if len(payload) == 1 { return 0, conn.message_opcode, false, fail(conn, .Protocol_Error, .Protocol) }
+			payload, read_err := control_read(connection, header.length)
+			if read_err != .None { return 0, connection.message_opcode, false, read_err }
+			if len(payload) == 1 { return 0, connection.message_opcode, false, fail(connection, .Protocol_Error, .Protocol) }
 			if len(payload) >= 2 {
 				code := Close_Code(u16(payload[0]) << 8 | u16(payload[1]))
-				if !close_code_valid(code) { return 0, conn.message_opcode, false, fail(conn, .Protocol_Error, .Protocol) }
+				if !close_code_valid(code) { return 0, connection.message_opcode, false, fail(connection, .Protocol_Error, .Protocol) }
 				if !utf8.valid_string(string(payload[2:])) {
-					return 0, conn.message_opcode, false, fail(conn, .Invalid_Payload, .Protocol)
+					return 0, connection.message_opcode, false, fail(connection, .Invalid_Payload, .Protocol)
 				}
-				conn.close_code = code
+				connection.close_code = code
 			}
-			if !conn.close_sent {
-				_ = control_send(conn, .Close, payload)
-				conn.close_sent = true
+			if !connection.close_sent {
+				// The peer's close is answered best effort: the stream ends either way.
+				_ = control_send(connection, .Close, payload)
+				connection.close_sent = true
 			}
-			conn.closed = true
-			return 0, conn.message_opcode, false, .Closed
+			connection.closed = true
+			return 0, connection.message_opcode, false, .Closed
 		case .Continuation:
-			if !conn.in_message { return 0, conn.message_opcode, false, fail(conn, .Protocol_Error, .Protocol) }
+			if !connection.in_message { return 0, connection.message_opcode, false, fail(connection, .Protocol_Error, .Protocol) }
 		case .Text, .Binary:
-			if conn.in_message {
+			if connection.in_message {
 				// A message in progress may only be continued.
-				return 0, conn.message_opcode, false, fail(conn, .Protocol_Error, .Protocol)
+				return 0, connection.message_opcode, false, fail(connection, .Protocol_Error, .Protocol)
 			}
-			conn.message_opcode = header.opcode
-			conn.in_message = true
-			conn.carry_length = 0
+			connection.message_opcode = header.opcode
+			connection.in_message = true
+			connection.carry_length = 0
 		case:
 			// The opcodes between these are reserved for extensions this client has
 			// negotiated none of (RFC 6455 section 5.8).
-			return 0, conn.message_opcode, false, fail(conn, .Protocol_Error, .Protocol)
+			return 0, connection.message_opcode, false, fail(connection, .Protocol_Error, .Protocol)
 		}
 
-		conn.frame_final = header.final
-		conn.frame_remaining = header.length
-		conn.mask = header.mask
-		conn.mask_at = 0
-		if conn.frame_remaining == 0 {
-			if !conn.frame_final { continue }
-			if conn.message_opcode == .Text && conn.carry_length != 0 {
-				return 0, conn.message_opcode, false, fail(conn, .Invalid_Payload, .Protocol)
+		connection.frame_final = header.final
+		connection.frame_remaining = header.length
+		connection.mask = header.mask
+		connection.mask_at = 0
+		if connection.frame_remaining == 0 {
+			if !connection.frame_final { continue }
+			if connection.message_opcode == .Text && connection.carry_length != 0 {
+				return 0, connection.message_opcode, false, fail(connection, .Invalid_Payload, .Protocol)
 			}
-			conn.in_message = false
-			return 0, conn.message_opcode, true, .None
+			connection.in_message = false
+			return 0, connection.message_opcode, true, .None
 		}
 	}
 }
 
 // fail tells the peer why the connection is ending and reports the failure, which is
 // what the protocol asks of the side that finds it (RFC 6455 section 7.1.7).
-fail :: proc(conn: ^Conn, code: Close_Code, err: Error) -> Error {
-	if !conn.close_sent {
-		payload := conn.control[:2]
+fail :: proc(connection: ^Conn, code: Close_Code, err: Error) -> Error {
+	if !connection.close_sent {
+		payload := connection.control[:2]
 		payload[0] = u8(u16(code) >> 8)
 		payload[1] = u8(u16(code) & 0xff)
-		_ = control_send(conn, .Close, payload)
-		conn.close_sent = true
+		// The close is best effort: the violation is reported whether or not the peer hears it.
+		_ = control_send(connection, .Close, payload)
+		connection.close_sent = true
 	}
-	conn.closed = true
+	connection.closed = true
 	return err
 }
 
-control_send :: proc(conn: ^Conn, opcode: Opcode, payload: []u8) -> Error {
+control_send :: proc(connection: ^Conn, opcode: Opcode, payload: []u8) -> Error {
 	mask: [MASK_KEY_SIZE]u8
 	crypto.rand_bytes(mask[:])
-	count, encoded := frame_encode(opcode, true, mask, payload, conn.send)
+	count, encoded := frame_encode(opcode, true, mask, payload, connection.send)
 	if !encoded { return .No_Room }
-	return transport_write(conn, conn.send[:count])
+	return transport_write(connection, connection.send[:count])
 }
 
 // control_read reads a control frame's payload, which is small enough to hold.
-control_read :: proc(conn: ^Conn, length: int) -> (payload: []u8, err: Error) {
+control_read :: proc(connection: ^Conn, length: int) -> (payload: []u8, err: Error) {
 	if length > MAX_CONTROL_PAYLOAD { return nil, .Protocol }
-	conn.frame_remaining = length
-	conn.mask = {}
-	conn.mask_at = 0
-	payload = conn.control[:length]
+	connection.frame_remaining = length
+	connection.mask = {}
+	connection.mask_at = 0
+	payload = connection.control[:length]
 	if length == 0 { return payload, .None }
-	if read_err := transport_read(conn, payload); read_err != .None { return nil, read_err }
-	conn.frame_remaining = 0
+	if read_err := transport_read(connection, payload); read_err != .None { return nil, read_err }
+	connection.frame_remaining = 0
 	return payload, .None
 }
 
 // frame_header_read reads one frame header, which is as long as its length field says
 // it is.
-frame_header_read :: proc(conn: ^Conn) -> (header: Header, err: Error) {
-	if fill_err := recv_fill(conn, 2); fill_err != .None { return {}, fill_err }
+frame_header_read :: proc(connection: ^Conn) -> (header: Header, err: Error) {
+	if fill_err := recv_fill(connection, 2); fill_err != .None { return {}, fill_err }
 	count := 2
-	switch conn.header[1] & 0x7f {
+	switch connection.header[1] & 0x7f {
 	case 126:
 		count = 4
 	case 127:
 		count = 10
 	}
-	if conn.header[1] & 0x80 != 0 { count += MASK_KEY_SIZE }
-	if fill_err := recv_fill(conn, count); fill_err != .None { return {}, fill_err }
+	if connection.header[1] & 0x80 != 0 { count += MASK_KEY_SIZE }
+	if fill_err := recv_fill(connection, count); fill_err != .None { return {}, fill_err }
 
-	decoded_header, decoded := frame_header_decode(conn.header[:count])
-	if !decoded { return {}, fail(conn, .Protocol_Error, .Protocol) }
-	conn.header_filled = 0
+	decoded_header, decoded := frame_header_decode(connection.header[:count])
+	if !decoded { return {}, fail(connection, .Protocol_Error, .Protocol) }
+	connection.header_filled = 0
 	return decoded_header, .None
 }
 
 // frame_payload_read hands over at most one piece of the frame in progress, unmasking
 // it in place.
-frame_payload_read :: proc(conn: ^Conn, buffer: []u8) -> (count: int, err: Error) {
-	if len(buffer) == 0 || conn.frame_remaining == 0 { return 0, .None }
-	count = min(len(buffer), conn.frame_remaining)
-	if read_err := transport_read(conn, buffer[:count]); read_err != .None { return 0, read_err }
+frame_payload_read :: proc(connection: ^Conn, buffer: []u8) -> (count: int, err: Error) {
+	if len(buffer) == 0 || connection.frame_remaining == 0 { return 0, .None }
+	count = min(len(buffer), connection.frame_remaining)
+	if read_err := transport_read(connection, buffer[:count]); read_err != .None { return 0, read_err }
 	for octet, at in buffer[:count] {
-		buffer[at] = octet ~ conn.mask[(conn.mask_at + at) % MASK_KEY_SIZE]
+		buffer[at] = octet ~ connection.mask[(connection.mask_at + at) % MASK_KEY_SIZE]
 	}
-	conn.mask_at = (conn.mask_at + count) % MASK_KEY_SIZE
-	conn.frame_remaining -= count
+	connection.mask_at = (connection.mask_at + count) % MASK_KEY_SIZE
+	connection.frame_remaining -= count
 	return count, .None
 }
 
 // text_validate checks what has arrived of a text message, carrying the octets of a
 // rune that a read boundary split. A stream that is not UTF-8 ends the connection
 // (RFC 6455 section 8.1).
-text_validate :: proc(conn: ^Conn, chunk: []u8) -> bool {
+text_validate :: proc(connection: ^Conn, chunk: []u8) -> bool {
 	at := 0
-	for conn.carry_length > 0 && at < len(chunk) {
-		conn.carry[conn.carry_length] = chunk[at]
-		conn.carry_length += 1
+	for connection.carry_length > 0 && at < len(chunk) {
+		connection.carry[connection.carry_length] = chunk[at]
+		connection.carry_length += 1
 		at += 1
 
-		window := conn.carry[:conn.carry_length]
+		window := connection.carry[:connection.carry_length]
 		if !utf8.full_rune_in_bytes(window) {
 			// Four octets that are still not a rune cannot become one.
-			if conn.carry_length == utf8.UTF_MAX { return false }
+			if connection.carry_length == utf8.UTF_MAX { return false }
 			continue
 		}
 		decoded, size := utf8.decode_rune_in_bytes(window)
 		if decoded == utf8.RUNE_ERROR && size == 1 { return false }
-		conn.carry_length = 0
+		connection.carry_length = 0
 	}
 
 	remaining := chunk[at:]
 	for len(remaining) > 0 {
 		if !utf8.full_rune_in_bytes(remaining) {
-			copy(conn.carry[:], remaining)
-			conn.carry_length = len(remaining)
+			copy(connection.carry[:], remaining)
+			connection.carry_length = len(remaining)
 			return true
 		}
 		decoded, size := utf8.decode_rune_in_bytes(remaining)
@@ -412,10 +414,10 @@ close_code_valid :: proc(code: Close_Code) -> bool {
 
 // transport_read reads exactly the bytes it is given, from wherever the connection has
 // read up to.
-transport_read :: proc(conn: ^Conn, dst: []u8) -> Error {
+transport_read :: proc(connection: ^Conn, dst: []u8) -> Error {
 	filled := 0
 	for filled < len(dst) {
-		count, err := conn.transport.read(conn.transport.user_data, dst[filled:])
+		count, err := connection.transport.read(connection.transport.user_data, dst[filled:])
 		if err == .Closed { return .Abnormal_Closure }
 		if err != .None { return err }
 		if count <= 0 { return .Transport }
@@ -426,16 +428,16 @@ transport_read :: proc(conn: ^Conn, dst: []u8) -> Error {
 
 // recv_fill reads the next bytes of a frame header into the connection's header
 // buffer.
-recv_fill :: proc(conn: ^Conn, count: int) -> Error {
-	if err := transport_read(conn, conn.header[conn.header_filled:count]); err != .None { return err }
-	conn.header_filled = count
+recv_fill :: proc(connection: ^Conn, count: int) -> Error {
+	if err := transport_read(connection, connection.header[connection.header_filled:count]); err != .None { return err }
+	connection.header_filled = count
 	return .None
 }
 
-transport_write :: proc(conn: ^Conn, data: []u8) -> Error {
+transport_write :: proc(connection: ^Conn, data: []u8) -> Error {
 	pending := data
 	for len(pending) > 0 {
-		written, err := conn.transport.write(conn.transport.user_data, pending)
+		written, err := connection.transport.write(connection.transport.user_data, pending)
 		if err != .None { return err }
 		if written <= 0 { return .Transport }
 		pending = pending[written:]

@@ -122,14 +122,20 @@ parser_finish :: proc(parser: ^Parser) {
 parser_byte :: proc(parser: ^Parser, byte: u8) {
 	if parser.pending_cr {
 		parser.pending_cr = false
-		if byte == '\n' { parser_line(parser); return }
+		if byte == '\n' {
+			parser_line(parser)
+			return
+		}
 		parser_line(parser)
 	}
 	if byte == '\r' {
 		parser.pending_cr = true
 		return
 	}
-	if byte == '\n' { parser_line(parser); return }
+	if byte == '\n' {
+		parser_line(parser)
+		return
+	}
 	append(&parser.line, byte)
 }
 
@@ -151,7 +157,10 @@ parser_field :: proc(parser: ^Parser, line: []u8) {
 
 	colon := -1
 	for byte, i in line {
-		if byte == ':' { colon = i; break }
+		if byte == ':' {
+			colon = i
+			break
+		}
 	}
 	// A line with no colon carries the whole line as the field name and the
 	// empty string as its value.
@@ -197,27 +206,22 @@ contains_null :: proc(value: []u8) -> bool {
 	return false
 }
 
-// append_decoded_utf8 appends value to dst as UTF-8 text.
-//
-// The standard decodes the stream with the WHATWG Encoding Standard's UTF-8
-// decoder, which replaces each maximal ill-formed subsequence with one U+FFFD.
-// A value is complete before it is stored -- line terminators cannot appear
-// inside a UTF-8 sequence, so splitting on them first is safe -- which makes
-// decoding each value with fresh state equivalent to decoding the whole stream
-// up front. A byte that ends a sequence attempt is reprocessed rather than
-// swallowed: it may itself begin a valid sequence. A sequence cut short at the
-// end of the value is one ill-formed subsequence, not one per missing byte.
+// append_decoded_utf8 appends value to dst as UTF-8 text, replacing each maximal
+// ill-formed subsequence with one U+FFFD, as the WHATWG Encoding Standard's UTF-8
+// decoder does. A value is complete before it is stored -- line terminators cannot
+// appear inside a UTF-8 sequence -- so decoding each value with fresh state equals
+// decoding the whole stream up front.
 @(private)
 append_decoded_utf8 :: proc(dst: ^[dynamic]u8, value: []u8) {
 	i := 0
 	for i < len(value) {
-		b := value[i]
-		if b < 0x80 {
-			append(dst, b)
+		byte := value[i]
+		if byte < 0x80 {
+			append(dst, byte)
 			i += 1
 			continue
 		}
-		needed, lower, upper := utf8_lead(b)
+		needed, lower, upper := utf8_lead(byte)
 		if needed == 0 {
 			append_replacement_character(dst)
 			i += 1
@@ -225,8 +229,8 @@ append_decoded_utf8 :: proc(dst: ^[dynamic]u8, value: []u8) {
 		}
 		end := i + 1
 		for end < len(value) && end - i - 1 < needed {
-			c := value[end]
-			if c < lower || c > upper { break }
+			continuation := value[end]
+			if continuation < lower || continuation > upper { break }
 			lower, upper = 0x80, 0xBF
 			end += 1
 		}
@@ -240,23 +244,22 @@ append_decoded_utf8 :: proc(dst: ^[dynamic]u8, value: []u8) {
 	}
 }
 
-// utf8_lead reads the lead byte of a UTF-8 sequence: how many continuation
-// bytes it needs and the range the first of them must fall in. The ranges
-// exclude overlongs, surrogates, and code points past U+10FFFF, which is what
-// makes those sequences ill-formed rather than merely unusual. A need of zero
-// means the byte never begins a sequence.
+// utf8_lead reads the lead byte of a UTF-8 sequence: how many continuation bytes it
+// needs and the range the first of them must fall in. The ranges exclude overlongs,
+// surrogates, and code points past U+10FFFF, so a need of zero means the byte never
+// begins a sequence.
 @(private)
-utf8_lead :: proc(b: byte) -> (needed: int, lower, upper: byte) {
-	switch b {
+utf8_lead :: proc(lead_byte: byte) -> (needed: int, lower, upper: byte) {
+	switch lead_byte {
 	case 0xC2 ..= 0xDF:
 		return 1, 0x80, 0xBF
 	case 0xE0 ..= 0xEF:
-		lower = 0xA0 if b == 0xE0 else 0x80
-		upper = 0x9F if b == 0xED else 0xBF
+		lower = 0xA0 if lead_byte == 0xE0 else 0x80
+		upper = 0x9F if lead_byte == 0xED else 0xBF
 		return 2, lower, upper
 	case 0xF0 ..= 0xF4:
-		lower = 0x90 if b == 0xF0 else 0x80
-		upper = 0x8F if b == 0xF4 else 0xBF
+		lower = 0x90 if lead_byte == 0xF0 else 0x80
+		upper = 0x8F if lead_byte == 0xF4 else 0xBF
 		return 3, lower, upper
 	}
 	return 0, 0, 0
@@ -270,15 +273,12 @@ append_replacement_character :: proc(dst: ^[dynamic]u8) {
 	append(dst, ..bytes[:size])
 }
 
-// parse_retry reads a reconnection time. The specification accepts a field value
-// of ASCII digits and ignores anything else, so ok is false for a malformed or
-// empty value. A digit string wider than the representable time saturates there:
-// the field is an integer of any length, and the only bound added here is the one
-// the type itself has, not a policy about how long a client should wait. Every
-// octet is checked before the result is used, so a digit run followed by anything
-// else is malformed rather than a valid saturated time.
+// parse_retry reads a reconnection time. ok is false for anything but a non-empty
+// run of ASCII digits, which the specification ignores. A digit string wider than
+// the representable time saturates at it: the field's only bound is the type's own,
+// not a policy about how long a client should wait.
 @(private)
-parse_retry :: proc(value: []u8) -> (ms: i64, ok: bool) {
+parse_retry :: proc(value: []u8) -> (retry_ms: i64, ok: bool) {
 	if len(value) == 0 { return 0, false }
 	result: i64
 	saturated := false

@@ -16,7 +16,7 @@ TEST_REPLY ::
 
 // wire views a text literal as bytes for a vector. The vectors are written
 // as escapes for readability; the decoder reads bytes.
-wire :: proc(s: string) -> []u8 { return transmute([]u8)s }
+wire :: proc(text: string) -> []u8 { return transmute([]u8)text }
 
 @(test)
 test_message_truncated :: proc(t: ^testing.T) {

@@ -27,14 +27,14 @@ Certificate_Chain :: struct {
 certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (chain: Certificate_Chain, ok: bool) {
 	chain.allocator = allocator
 
-	r := Reader {
+	reader := Reader {
 		data = message,
 		ok   = true,
 	}
-	if read_u8(&r) != 0 { return {}, false }
+	if read_u8(&reader) != 0 { return {}, false }
 
-	entries := read_section_u24(&r)
-	if !r.ok { return {}, false }
+	entries := read_section_u24(&reader)
+	if !reader.ok { return {}, false }
 
 	certificates := make([dynamic]x509.Certificate, 0, 4, allocator)
 	ders := make([dynamic][]u8, 0, 4, allocator)
@@ -59,7 +59,7 @@ certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (ch
 		append(&ders, der)
 	}
 
-	if failed || !r.ok || r.at != len(r.data) || !entries.ok || entries.at != len(entries.data) || len(certificates) == 0 {
+	if failed || !reader.ok || reader.at != len(reader.data) || !entries.ok || entries.at != len(entries.data) || len(certificates) == 0 {
 		chain.certificates = certificates[:]
 		chain.der = ders[:]
 		certificate_chain_destroy(&chain)
@@ -124,13 +124,13 @@ san_matches :: proc(certificate: ^x509.Certificate, expected: []u8) -> bool {
 // peer's end-entity certificate and the transcript of everything up to and
 // including its Certificate message. A scheme this client did not offer fails.
 certificate_verify_verify :: proc(message: []u8, certificate: ^x509.Certificate, transcript_hash: []u8) -> bool {
-	r := Reader {
+	reader := Reader {
 		data = message,
 		ok   = true,
 	}
-	scheme := Signature_Scheme(read_u16(&r))
-	signature := read_bytes(&r, int(read_u16(&r)))
-	if !r.ok || r.at != len(message) || len(signature) == 0 { return false }
+	scheme := Signature_Scheme(read_u16(&reader))
+	signature := read_bytes(&reader, int(read_u16(&reader)))
+	if !reader.ok || reader.at != len(message) || len(signature) == 0 { return false }
 	if len(transcript_hash) > MAX_SECRET_SIZE { return false }
 
 	input: [CERTIFICATE_VERIFY_INPUT_MAX]u8

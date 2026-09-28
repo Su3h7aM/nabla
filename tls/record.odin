@@ -48,7 +48,7 @@ record_decode_header :: proc(data: []u8) -> (record_type: Record_Type, length: i
 
 // record_encode writes one unprotected record and returns how many bytes of
 // `dst` it used.
-record_encode :: proc(record_type: Record_Type, payload: []u8, dst: []u8) -> (n: int, ok: bool) {
+record_encode :: proc(record_type: Record_Type, payload: []u8, dst: []u8) -> (count: int, ok: bool) {
 	if len(payload) > MAX_PLAINTEXT_RECORD || len(dst) < RECORD_HEADER_SIZE + len(payload) { return 0, false }
 	record_encode_header(record_type, len(payload), dst)
 	copy(dst[RECORD_HEADER_SIZE:], payload)

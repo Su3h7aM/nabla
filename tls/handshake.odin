@@ -116,47 +116,47 @@ Writer :: struct {
 	ok:  bool,
 }
 
-write_u8 :: proc(w: ^Writer, value: int) {
-	if value < 0 || value > 0xff || w.at + 1 > len(w.dst) {
-		w.ok = false
+write_u8 :: proc(writer: ^Writer, value: int) {
+	if value < 0 || value > 0xff || writer.at + 1 > len(writer.dst) {
+		writer.ok = false
 		return
 	}
-	w.dst[w.at] = u8(value)
-	w.at += 1
+	writer.dst[writer.at] = u8(value)
+	writer.at += 1
 }
 
-write_u16 :: proc(w: ^Writer, value: int) {
-	if value < 0 || value > 0xffff || w.at + 2 > len(w.dst) {
-		w.ok = false
+write_u16 :: proc(writer: ^Writer, value: int) {
+	if value < 0 || value > 0xffff || writer.at + 2 > len(writer.dst) {
+		writer.ok = false
 		return
 	}
-	w.dst[w.at] = u8(value >> 8)
-	w.dst[w.at + 1] = u8(value & 0xff)
-	w.at += 2
+	writer.dst[writer.at] = u8(value >> 8)
+	writer.dst[writer.at + 1] = u8(value & 0xff)
+	writer.at += 2
 }
 
-write_bytes :: proc(w: ^Writer, data: []u8) {
-	if w.at + len(data) > len(w.dst) {
-		w.ok = false
+write_bytes :: proc(writer: ^Writer, data: []u8) {
+	if writer.at + len(data) > len(writer.dst) {
+		writer.ok = false
 		return
 	}
-	copy(w.dst[w.at:], data)
-	w.at += len(data)
+	copy(writer.dst[writer.at:], data)
+	writer.at += len(data)
 }
 
 // write_section_start reserves the length field of a section and returns where it
 // is, for write_section_end to fill in once the section's length is known.
-write_section_start :: proc(w: ^Writer) -> int {
-	at := w.at
-	write_u16(w, 0)
+write_section_start :: proc(writer: ^Writer) -> int {
+	at := writer.at
+	write_u16(writer, 0)
 	return at
 }
 
-write_section_end :: proc(w: ^Writer, start: int) {
-	if !w.ok { return }
-	length := w.at - start - 2
-	w.dst[start] = u8(length >> 8)
-	w.dst[start + 1] = u8(length & 0xff)
+write_section_end :: proc(writer: ^Writer, start: int) {
+	if !writer.ok { return }
+	length := writer.at - start - 2
+	writer.dst[start] = u8(length >> 8)
+	writer.dst[start + 1] = u8(length & 0xff)
 }
 
 // Reader walks a length-prefixed structure. A read that does not fit leaves `ok`
@@ -168,58 +168,58 @@ Reader :: struct {
 	ok:   bool,
 }
 
-read_u8 :: proc(r: ^Reader) -> u8 {
-	if !r.ok || r.at + 1 > len(r.data) {
-		r.ok = false
+read_u8 :: proc(reader: ^Reader) -> u8 {
+	if !reader.ok || reader.at + 1 > len(reader.data) {
+		reader.ok = false
 		return 0
 	}
-	value := r.data[r.at]
-	r.at += 1
+	value := reader.data[reader.at]
+	reader.at += 1
 	return value
 }
 
-read_u16 :: proc(r: ^Reader) -> u16 {
-	if !r.ok || r.at + 2 > len(r.data) {
-		r.ok = false
+read_u16 :: proc(reader: ^Reader) -> u16 {
+	if !reader.ok || reader.at + 2 > len(reader.data) {
+		reader.ok = false
 		return 0
 	}
-	value := u16(r.data[r.at]) << 8 | u16(r.data[r.at + 1])
-	r.at += 2
+	value := u16(reader.data[reader.at]) << 8 | u16(reader.data[reader.at + 1])
+	reader.at += 2
 	return value
 }
 
-read_bytes :: proc(r: ^Reader, count: int) -> []u8 {
-	if count < 0 || !r.ok || r.at + count > len(r.data) {
-		r.ok = false
+read_bytes :: proc(reader: ^Reader, count: int) -> []u8 {
+	if count < 0 || !reader.ok || reader.at + count > len(reader.data) {
+		reader.ok = false
 		return nil
 	}
-	value := r.data[r.at:r.at + count]
-	r.at += count
+	value := reader.data[reader.at:reader.at + count]
+	reader.at += count
 	return value
 }
 
-read_section :: proc(r: ^Reader, length: int) -> Reader {
-	return {data = read_bytes(r, length), ok = r.ok}
+read_section :: proc(reader: ^Reader, length: int) -> Reader {
+	return {data = read_bytes(reader, length), ok = reader.ok}
 }
 
-read_section_u8 :: proc(r: ^Reader) -> Reader {
-	return read_section(r, int(read_u8(r)))
+read_section_u8 :: proc(reader: ^Reader) -> Reader {
+	return read_section(reader, int(read_u8(reader)))
 }
 
-read_section_u16 :: proc(r: ^Reader) -> Reader {
-	return read_section(r, int(read_u16(r)))
+read_section_u16 :: proc(reader: ^Reader) -> Reader {
+	return read_section(reader, int(read_u16(reader)))
 }
 
-read_u24 :: proc(r: ^Reader) -> int {
-	if !r.ok || r.at + 3 > len(r.data) {
-		r.ok = false
+read_u24 :: proc(reader: ^Reader) -> int {
+	if !reader.ok || reader.at + 3 > len(reader.data) {
+		reader.ok = false
 		return 0
 	}
-	value := int(r.data[r.at]) << 16 | int(r.data[r.at + 1]) << 8 | int(r.data[r.at + 2])
-	r.at += 3
+	value := int(reader.data[reader.at]) << 16 | int(reader.data[reader.at + 1]) << 8 | int(reader.data[reader.at + 2])
+	reader.at += 3
 	return value
 }
 
-read_section_u24 :: proc(r: ^Reader) -> Reader {
-	return read_section(r, read_u24(r))
+read_section_u24 :: proc(reader: ^Reader) -> Reader {
+	return read_section(reader, read_u24(reader))
 }

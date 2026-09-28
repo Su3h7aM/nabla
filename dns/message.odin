@@ -58,8 +58,8 @@ response_nxdomain :: proc(response: []u8) -> bool {
 response_matches :: proc(query, response: []u8) -> bool {
 	if len(query) < HEADER_SIZE || len(response) < HEADER_SIZE { return false }
 	if read_u16(query, 0) != read_u16(response, 0) { return false }
-	flags, _ := message_flags(response)
-	if !flags.qr { return false }
+	flags, flags_ok := message_flags(response)
+	if !flags_ok || !flags.qr { return false }
 	if read_u16(query, 4) != 1 || read_u16(response, 4) != 1 { return false }
 
 	query_end, query_ok := name_end(query, HEADER_SIZE)
@@ -140,25 +140,25 @@ name_end :: proc(message: []u8, offset: int) -> (end: int, ok: bool) {
 // names_equal_fold compares two possibly compressed names label by label,
 // ASCII case-insensitive (RFC 4343). Only ASCII folds: a Unicode-aware fold
 // would equate labels DNS treats as different.
-names_equal_fold :: proc(a: []u8, a_offset: int, b: []u8, b_offset: int) -> bool {
-	a_walk := name_walk(a, a_offset)
-	b_walk := name_walk(b, b_offset)
+names_equal_fold :: proc(first: []u8, first_offset: int, second: []u8, second_offset: int) -> bool {
+	first_walk := name_walk(first, first_offset)
+	second_walk := name_walk(second, second_offset)
 	for {
-		a_label, a_done := name_next(&a_walk) or_return
-		b_label, b_done := name_next(&b_walk) or_return
-		if a_done || b_done { return a_done == b_done }
-		if !label_equal_fold(a_label, b_label) { return false }
+		first_label, first_done := name_next(&first_walk) or_return
+		second_label, second_done := name_next(&second_walk) or_return
+		if first_done || second_done { return first_done == second_done }
+		if !label_equal_fold(first_label, second_label) { return false }
 	}
 }
 
-label_equal_fold :: proc(a, b: []u8) -> bool {
-	if len(a) != len(b) { return false }
-	for i in 0 ..< len(a) {
-		if fold_ascii(a[i]) != fold_ascii(b[i]) { return false }
+label_equal_fold :: proc(first, second: []u8) -> bool {
+	if len(first) != len(second) { return false }
+	for i in 0 ..< len(first) {
+		if fold_ascii(first[i]) != fold_ascii(second[i]) { return false }
 	}
 	return true
 }
 
-fold_ascii :: proc(c: byte) -> byte {
-	return c + ('a' - 'A') if c >= 'A' && c <= 'Z' else c
+fold_ascii :: proc(character: byte) -> byte {
+	return character + ('a' - 'A') if character >= 'A' && character <= 'Z' else character
 }
