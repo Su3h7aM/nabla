@@ -105,7 +105,11 @@ parse_metadata :: proc(data: []u8, directory_name: string, allocator := context.
 		delete(normalized, allocator)
 		return {}, error_make(.Invalid_Metadata, field = "description", detail = "description is empty", allocator = allocator)
 	}
-	owned_name := strings.clone(name, allocator)
+	owned_name, name_error := strings.clone(name, allocator)
+	if name_error != nil {
+		delete(normalized, allocator)
+		return {}, error_make(.Allocation, allocator = allocator)
+	}
 	return Metadata{name = owned_name, description = normalized, body_offset = body_offset, digest = metadata_digest(owned_name, normalized)}, {}
 }
 
@@ -116,6 +120,17 @@ frontmatter_line :: proc(text: string, start: int) -> (string, int) {
 	end := start + newline
 	if end > start && text[end - 1] == '\r' { end -= 1 }
 	return text[start:end], start + newline + 1
+}
+
+// frontmatter_write_byte and frontmatter_write_string append to a value's builder, and report
+// whether every byte went in: a builder that cannot grow drops what does not fit, which would
+// silently truncate the metadata it holds.
+frontmatter_write_byte :: proc(builder: ^strings.Builder, character: byte) -> bool {
+	return strings.write_byte(builder, character) == 1
+}
+
+frontmatter_write_string :: proc(builder: ^strings.Builder, text: string) -> bool {
+	return strings.write_string(builder, text) == len(text)
 }
 
 frontmatter_key_valid :: proc(key: string) -> bool {
@@ -167,18 +182,22 @@ frontmatter_value :: proc(text, raw: string, next_line, line_number: int, alloca
 		}
 	}
 	if value == "" { return {}, error_make(.Invalid_Metadata, line_number, detail = "value is empty", allocator = allocator) }
-	return Frontmatter_Value{text = strings.clone(value, allocator), next_line = next_line}, {}
+	cloned, clone_error := strings.clone(value, allocator)
+	if clone_error != nil { return {}, error_make(.Allocation, allocator = allocator) }
+	return Frontmatter_Value{text = cloned, next_line = next_line}, {}
 }
 
 frontmatter_single_quoted :: proc(raw: string, next_line, line_number: int, allocator: mem.Allocator) -> (Frontmatter_Value, Load_Error) {
-	builder := strings.builder_make(allocator)
+	builder, builder_error := strings.builder_make(allocator)
+	if builder_error != nil { return {}, error_make(.Allocation, allocator = allocator) }
 	defer strings.builder_destroy(&builder)
 	i := 1
 	closed := false
+	written := true
 	for i < len(raw) {
 		if raw[i] == '\'' {
 			if i + 1 < len(raw) && raw[i + 1] == '\'' {
-				strings.write_byte(&builder, '\'')
+				written = written && frontmatter_write_byte(&builder, '\'')
 				i += 2
 				continue
 			}
@@ -186,20 +205,25 @@ frontmatter_single_quoted :: proc(raw: string, next_line, line_number: int, allo
 			i += 1
 			break
 		}
-		strings.write_byte(&builder, raw[i])
+		written = written && frontmatter_write_byte(&builder, raw[i])
 		i += 1
 	}
+	if !written { return {}, error_make(.Allocation, allocator = allocator) }
 	if !closed ||
 	   strings.trim_space(raw[i:]) !=
 		   "" { return {}, error_make(.Unsupported_Metadata, line_number, detail = "invalid single-quoted value", allocator = allocator) }
-	return Frontmatter_Value{text = strings.clone(strings.to_string(builder), allocator), next_line = next_line}, {}
+	cloned, clone_error := strings.clone(strings.to_string(builder), allocator)
+	if clone_error != nil { return {}, error_make(.Allocation, allocator = allocator) }
+	return Frontmatter_Value{text = cloned, next_line = next_line}, {}
 }
 
 frontmatter_double_quoted :: proc(raw: string, next_line, line_number: int, allocator: mem.Allocator) -> (Frontmatter_Value, Load_Error) {
-	builder := strings.builder_make(allocator)
+	builder, builder_error := strings.builder_make(allocator)
+	if builder_error != nil { return {}, error_make(.Allocation, allocator = allocator) }
 	defer strings.builder_destroy(&builder)
 	i := 1
 	closed := false
+	written := true
 	for i < len(raw) {
 		character := raw[i]
 		if character == '"' {
@@ -208,7 +232,7 @@ frontmatter_double_quoted :: proc(raw: string, next_line, line_number: int, allo
 			break
 		}
 		if character != '\\' {
-			strings.write_byte(&builder, character)
+			written = written && frontmatter_write_byte(&builder, character)
 			i += 1
 			continue
 		}
@@ -216,34 +240,39 @@ frontmatter_double_quoted :: proc(raw: string, next_line, line_number: int, allo
 		i += 1
 		switch raw[i] {
 		case '"', '\\', '/':
-			strings.write_byte(&builder, raw[i])
+			written = written && frontmatter_write_byte(&builder, raw[i])
 		case 'n':
-			strings.write_byte(&builder, '\n')
+			written = written && frontmatter_write_byte(&builder, '\n')
 		case 'r':
-			strings.write_byte(&builder, '\r')
+			written = written && frontmatter_write_byte(&builder, '\r')
 		case 't':
-			strings.write_byte(&builder, '\t')
+			written = written && frontmatter_write_byte(&builder, '\t')
 		case 'b':
-			strings.write_byte(&builder, '\b')
+			written = written && frontmatter_write_byte(&builder, '\b')
 		case 'f':
-			strings.write_byte(&builder, '\f')
+			written = written && frontmatter_write_byte(&builder, '\f')
 		case 'u':
 			if i + 4 >= len(raw) { return {}, error_make(.Unsupported_Metadata, line_number, detail = "short Unicode escape", allocator = allocator) }
 			value, ok := frontmatter_hex4(raw[i + 1:i + 5])
 			if !ok ||
 			   value >= 0xd800 &&
 				   value <= 0xdfff { return {}, error_make(.Unsupported_Metadata, line_number, detail = "invalid Unicode escape", allocator = allocator) }
-			strings.write_rune(&builder, rune(value))
+			if _, write_error := strings.write_rune(&builder, rune(value)); write_error != nil {
+				return {}, error_make(.Allocation, allocator = allocator)
+			}
 			i += 4
 		case:
 			return {}, error_make(.Unsupported_Metadata, line_number, detail = "unsupported quoted escape", allocator = allocator)
 		}
 		i += 1
 	}
+	if !written { return {}, error_make(.Allocation, allocator = allocator) }
 	if !closed ||
 	   strings.trim_space(raw[i:]) !=
 		   "" { return {}, error_make(.Unsupported_Metadata, line_number, detail = "invalid double-quoted value", allocator = allocator) }
-	return Frontmatter_Value{text = strings.clone(strings.to_string(builder), allocator), next_line = next_line}, {}
+	cloned, clone_error := strings.clone(strings.to_string(builder), allocator)
+	if clone_error != nil { return {}, error_make(.Allocation, allocator = allocator) }
+	return Frontmatter_Value{text = cloned, next_line = next_line}, {}
 }
 
 frontmatter_hex4 :: proc(text: string) -> (u32, bool) {
@@ -271,11 +300,13 @@ frontmatter_block :: proc(text, marker: string, next_line, line_number: int, all
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	folded := marker[0] == '>'
 	chomp := marker[len(marker) - 1]
-	builder := strings.builder_make(allocator)
+	builder, builder_error := strings.builder_make(allocator)
+	if builder_error != nil { return {}, error_make(.Allocation, allocator = allocator) }
 	defer strings.builder_destroy(&builder)
 	at := next_line
 	indent := -1
 	previous_blank := false
+	written := true
 	for at < len(text) {
 		line, following := frontmatter_line(text, at)
 		if line == "---" { break }
@@ -288,33 +319,42 @@ frontmatter_block :: proc(text, marker: string, next_line, line_number: int, all
 		}
 		blank := strings.trim_space(line) == ""
 		if blank {
-			strings.write_byte(&builder, '\n')
+			written = written && frontmatter_write_byte(&builder, '\n')
 		} else {
 			content := line[indent:]
 			if folded && strings.builder_len(builder) > 0 && !previous_blank {
-				strings.write_byte(&builder, ' ')
+				written = written && frontmatter_write_byte(&builder, ' ')
 			}
-			strings.write_string(&builder, content)
-			if !folded { strings.write_byte(&builder, '\n') }
+			written = written && frontmatter_write_string(&builder, content)
+			if !folded { written = written && frontmatter_write_byte(&builder, '\n') }
 		}
 		previous_blank = blank
 		at = following
 	}
+	if !written { return {}, error_make(.Allocation, allocator = allocator) }
 	result := strings.to_string(builder)
 	if chomp == '-' {
 		result = strings.trim_right(result, "\n")
 	} else if chomp != '+' {
 		result = strings.trim_right(result, "\n")
-		if result != "" { result = strings.concatenate({result, "\n"}, context.temp_allocator) }
+		if result != "" {
+			terminated, terminate_error := strings.concatenate({result, "\n"}, context.temp_allocator)
+			if terminate_error != nil { return {}, error_make(.Allocation, allocator = allocator) }
+			result = terminated
+		}
 	}
-	return Frontmatter_Value{text = strings.clone(result, allocator), next_line = at}, {}
+	cloned, clone_error := strings.clone(result, allocator)
+	if clone_error != nil { return {}, error_make(.Allocation, allocator = allocator) }
+	return Frontmatter_Value{text = cloned, next_line = at}, {}
 }
 
 description_normalize :: proc(text: string, allocator: mem.Allocator) -> (string, Load_Error) {
-	builder := strings.builder_make(allocator)
+	builder, builder_error := strings.builder_make(allocator)
+	if builder_error != nil { return "", error_make(.Allocation, allocator = allocator) }
 	defer strings.builder_destroy(&builder)
 	pending_space := false
 	runes := 0
+	written := true
 	for index := 0; index < len(text); {
 		character, width := utf8.decode_rune_in_string(text[index:])
 		if character == utf8.RUNE_ERROR &&
@@ -329,17 +369,22 @@ description_normalize :: proc(text: string, allocator: mem.Allocator) -> (string
 			pending_space = strings.builder_len(builder) > 0
 		} else {
 			if pending_space {
-				strings.write_byte(&builder, ' ')
+				written = written && frontmatter_write_byte(&builder, ' ')
 				pending_space = false
 			}
-			strings.write_rune(&builder, character)
+			if _, write_error := strings.write_rune(&builder, character); write_error != nil {
+				return "", error_make(.Allocation, allocator = allocator)
+			}
 			runes += 1
 			if runes >
 			   SKILL_MAX_DESCRIPTION_RUNES { return "", error_make(.Invalid_Metadata, field = "description", detail = "description is too long", allocator = allocator) }
 		}
 		index += width
 	}
-	return strings.clone(strings.to_string(builder), allocator), {}
+	if !written { return "", error_make(.Allocation, allocator = allocator) }
+	normalized, clone_error := strings.clone(strings.to_string(builder), allocator)
+	if clone_error != nil { return "", error_make(.Allocation, allocator = allocator) }
+	return normalized, {}
 }
 
 metadata_digest :: proc(name, description: string) -> [32]u8 {

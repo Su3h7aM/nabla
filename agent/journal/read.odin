@@ -535,7 +535,9 @@ query_start :: proc(query: ^Query, sql: string, arguments: ..db.Value) -> mem.Al
 
 @(private)
 query_add :: proc(query: ^Query, sql: string, arguments: ..db.Value) -> mem.Allocator_Error {
-	strings.write_string(&query.sql, sql)
+	// A builder that cannot grow drops what does not fit, and a query missing part of its
+	// SQL is not the query the caller asked for.
+	if strings.write_string(&query.sql, sql) != len(sql) { return .Out_Of_Memory }
 	_, error := append(&query.arguments, ..arguments)
 	return error
 }

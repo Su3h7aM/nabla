@@ -88,6 +88,7 @@ _temp_directory :: proc(test: ^testing.T) -> string {
 }
 
 _remove_directory :: proc(directory: string) {
+	// The suite's directory is abandoned; a removal that fails changes nothing in a test.
 	_ = os.remove_all(directory)
 	delete(directory, context.allocator)
 }

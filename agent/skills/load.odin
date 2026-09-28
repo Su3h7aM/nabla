@@ -23,6 +23,7 @@ load :: proc(skill: Skill, root: Root, allocator := context.allocator) -> (Loade
 		if open_error == os.General_Error.Not_Exist { kind = .Missing }
 		return {}, error_make(kind, detail = os.error_string(open_error), allocator = allocator)
 	}
+	// The read is what this call is about; a close that fails changes nothing about it.
 	defer os.close(file)
 	before, stat_error := os.fstat(file, allocator)
 	if stat_error != nil { return {}, error_make(.Unreadable, detail = os.error_string(stat_error), allocator = allocator) }
@@ -52,7 +53,8 @@ load :: proc(skill: Skill, root: Root, allocator := context.allocator) -> (Loade
 	}
 	body := string(data)[metadata.body_offset:]
 	if !skill_body_valid(body) { return {}, error_make(.Invalid_Text, detail = "skill body is empty or contains invalid text", allocator = allocator) }
-	owned := strings.clone(body, allocator)
+	owned, clone_error := strings.clone(body, allocator)
+	if clone_error != nil { return {}, error_make(.Allocation, allocator = allocator) }
 	return Loaded{body = owned, content_digest = content_digest(owned)}, {}
 }
 

@@ -76,12 +76,11 @@ directory_id :: proc(path: string, scratch: mem.Allocator) -> (Directory_Id, boo
 
 discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Catalog, load_error: Load_Error) {
 	scratch := context.temp_allocator
-	resolved := make([dynamic]Root, 0, len(roots), scratch)
-	seen := make([dynamic]string, 0, len(roots), scratch)
-	candidates := make([dynamic]Candidate, 0, 64, scratch)
-	if len(roots) > 0 && (resolved == nil || seen == nil) || candidates == nil {
-		catalog_destroy(&catalog, allocator)
-		load_error = error_make(.Allocation, allocator = allocator)
+	resolved, resolved_error := make([dynamic]Root, 0, len(roots), scratch)
+	seen, seen_error := make([dynamic]string, 0, len(roots), scratch)
+	candidates, candidates_error := make([dynamic]Candidate, 0, 64, scratch)
+	if resolved_error != nil || seen_error != nil || candidates_error != nil {
+		load_error = discover_failed(&catalog, allocator)
 		return
 	}
 
@@ -104,8 +103,15 @@ discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Cat
 			record_diagnostic(&catalog, Diagnostic{.Alias, DIAGNOSTIC_NO_ROOT, canonical, 0, "", "same directory as another source root", "", ""}, allocator)
 			continue
 		}
-		append(&seen, canonical)
-		append(&resolved, Root{source = root.source, logical_path = root.logical_path, path = canonical, authority = root.authority})
+		if _, append_error := append(&seen, canonical); append_error != nil {
+			load_error = discover_failed(&catalog, allocator)
+			return
+		}
+		if _, append_error := append(&resolved, Root{source = root.source, logical_path = root.logical_path, path = canonical, authority = root.authority});
+		   append_error != nil {
+			load_error = discover_failed(&catalog, allocator)
+			return
+		}
 	}
 
 	// A root whose scan fails is discarded whole, per the discovery contract:
@@ -121,13 +127,26 @@ discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Cat
 		}
 	}
 	if !select_candidates(candidates[:], &catalog, scratch, allocator) {
+		load_error = discover_failed(&catalog, allocator)
 		release_candidates(candidates[:], scratch)
-		catalog_destroy(&catalog, allocator)
-		load_error = error_make(.Allocation, allocator = allocator)
 		return
 	}
-	catalog.roots = clone_roots(resolved[:], allocator)
+	owned_roots, roots_held := clone_roots(resolved[:], allocator)
+	if !roots_held {
+		load_error = discover_failed(&catalog, allocator)
+		release_candidates(candidates[:], scratch)
+		return
+	}
+	catalog.roots = owned_roots
 	return
+}
+
+// discover_failed ends a discovery that could not build its catalog: what it recorded so
+// far is released, and the reason is that an allocation did not fit.
+@(private)
+discover_failed :: proc(catalog: ^Catalog, allocator: mem.Allocator) -> Load_Error {
+	catalog_destroy(catalog, allocator)
+	return error_make(.Allocation, allocator = allocator)
 }
 
 canonical_root :: proc(root: Root, allocator: mem.Allocator) -> (string, Load_Error) {
@@ -152,15 +171,25 @@ discover_root :: proc(root_pos: int, root: Root, catalog: ^Catalog, candidates: 
 		delete(entries, scratch)
 	}
 	slice.sort_by(entries, proc(a, b: os.File_Info) -> bool { return a.fullpath < b.fullpath })
-	stack := make([dynamic]Walk_Frame, 0, 16, scratch)
+	stack, stack_error := make([dynamic]Walk_Frame, 0, 16, scratch)
+	if stack_error != nil { return false }
 	for &entry in entries {
 		if entry.name == "." || entry.name == ".." { continue }
 		joined, join_error := filepath.join({root.path, entry.name}, scratch)
 		if join_error != nil { return false }
 		defer delete(joined, scratch)
-		path := strings.clone(joined, scratch)
-		name := strings.clone(entry.name, scratch)
-		append(&stack, Walk_Frame{path = path, logical = name})
+		path, path_error := strings.clone(joined, scratch)
+		if path_error != nil { return false }
+		name, name_error := strings.clone(entry.name, scratch)
+		if name_error != nil {
+			delete(path, scratch)
+			return false
+		}
+		if _, append_error := append(&stack, Walk_Frame{path = path, logical = name}); append_error != nil {
+			delete(path, scratch)
+			delete(name, scratch)
+			return false
+		}
 	}
 	// Every directory is entered once per device and inode, the root included, so a symlink
 	// that leads back into a directory the walk already read ends there instead of looping.
@@ -206,8 +235,7 @@ walk_directory :: proc(
 			record_file_diagnostic(catalog, root_pos, frame.logical, allocator, .Unsupported, "SKILL.md is not a regular file")
 			return true
 		}
-		read_candidate(root_pos, root, frame, info.fullpath, catalog, candidates, scratch, allocator)
-		return true
+		return read_candidate(root_pos, root, frame, info.fullpath, catalog, candidates, scratch, allocator)
 	} else if stat_error != os.General_Error.Not_Exist {
 		record_file_diagnostic(catalog, root_pos, frame.logical, allocator, .Invalid, string(os.error_string(stat_error)))
 		return true
@@ -230,13 +258,25 @@ walk_directory :: proc(
 		logical, logical_error := filepath.join({frame.logical, entry.name}, scratch)
 		if logical_error != nil { return false }
 		defer delete(logical, scratch)
-		path := strings.clone(joined, scratch)
-		name := strings.clone(logical, scratch)
-		append(stack, Walk_Frame{path = path, logical = name})
+		path, path_error := strings.clone(joined, scratch)
+		if path_error != nil { return false }
+		name, name_error := strings.clone(logical, scratch)
+		if name_error != nil {
+			delete(path, scratch)
+			return false
+		}
+		if _, append_error := append(stack, Walk_Frame{path = path, logical = name}); append_error != nil {
+			delete(path, scratch)
+			delete(name, scratch)
+			return false
+		}
 	}
 	return true
 }
 
+// read_candidate records the skill a SKILL.md declares, or the diagnostic that says why it is
+// not one. It reports false when the candidate could not be built, which fails the whole root
+// scan rather than leaving a skill out of the catalog.
 read_candidate :: proc(
 	root_pos: int,
 	root: Root,
@@ -245,12 +285,12 @@ read_candidate :: proc(
 	catalog: ^Catalog,
 	candidates: ^[dynamic]Candidate,
 	scratch, allocator: mem.Allocator,
-) {
+) -> bool {
 	basename := filepath.base(frame.logical)
 	data, read_error := os.read_entire_file(canonical_primary, scratch)
 	if read_error != nil {
 		record_file_diagnostic(catalog, root_pos, frame.logical, allocator, .Invalid, string(os.error_string(read_error)))
-		return
+		return true
 	}
 	defer delete(data, scratch)
 	metadata, metadata_error := parse_metadata(data, basename, scratch)
@@ -260,33 +300,52 @@ read_candidate :: proc(
 		kind := Diagnostic_Kind.Invalid
 		if metadata_error.kind == .Unsupported_Metadata { kind = .Unsupported }
 		record_file_diagnostic(catalog, root_pos, frame.logical, allocator, kind, metadata_error.detail)
-		return
+		return true
 	}
 	directory, directory_error := filepath.join({root.path, frame.logical}, scratch)
-	if directory_error != nil { return }
+	if directory_error != nil { return false }
 	defer delete(directory, scratch)
 	logical_primary, logical_error := filepath.join({frame.logical, "SKILL.md"}, scratch)
-	if logical_error != nil { return }
+	if logical_error != nil { return false }
 	defer delete(logical_primary, scratch)
-	candidate := Candidate {
-		name        = strings.clone(metadata.name, scratch),
-		description = strings.clone(metadata.description, scratch),
-		root_pos    = root_pos,
-		logical     = strings.clone(logical_primary, scratch),
-		canonical   = strings.clone(directory, scratch),
-		digest      = metadata.digest,
-		valid       = true,
+	candidate: Candidate
+	candidate.root_pos = root_pos
+	candidate.digest = metadata.digest
+	candidate.valid = true
+	clone_error: mem.Allocator_Error
+	candidate.name, clone_error = strings.clone(metadata.name, scratch)
+	if clone_error != nil { return false }
+	candidate.description, clone_error = strings.clone(metadata.description, scratch)
+	if clone_error != nil {
+		release_candidate(&candidate, scratch)
+		return false
 	}
-	append(candidates, candidate)
+	candidate.logical, clone_error = strings.clone(logical_primary, scratch)
+	if clone_error != nil {
+		release_candidate(&candidate, scratch)
+		return false
+	}
+	candidate.canonical, clone_error = strings.clone(directory, scratch)
+	if clone_error != nil {
+		release_candidate(&candidate, scratch)
+		return false
+	}
+	if _, append_error := append(candidates, candidate); append_error != nil {
+		release_candidate(&candidate, scratch)
+		return false
+	}
+	return true
 }
 
 select_candidates :: proc(candidates: []Candidate, catalog: ^Catalog, scratch, allocator: mem.Allocator) -> bool {
-	ordered := slice.clone(candidates, scratch)
+	ordered, ordered_error := slice.clone(candidates, scratch)
+	if ordered_error != nil { return false }
 	slice.sort_by(ordered, proc(a, b: Candidate) -> bool {
 		if a.root_pos != b.root_pos { return a.root_pos < b.root_pos }
 		return a.logical < b.logical
 	})
-	selected := make([dynamic]Skill, 0, len(ordered), scratch)
+	selected, selected_error := make([dynamic]Skill, 0, len(ordered), scratch)
+	if selected_error != nil { return false }
 	for candidate in ordered {
 		duplicate := false
 		for other in ordered {
@@ -314,7 +373,7 @@ select_candidates :: proc(candidates: []Candidate, catalog: ^Catalog, scratch, a
 			record_diagnostic(catalog, Diagnostic{.Shadowed, candidate.root_pos, candidate.logical, 0, "", "", winner, candidate.logical}, allocator)
 			continue
 		}
-		append(
+		_, append_error := append(
 			&selected,
 			Skill {
 				name = candidate.name,
@@ -325,35 +384,82 @@ select_candidates :: proc(candidates: []Candidate, catalog: ^Catalog, scratch, a
 				metadata_digest = candidate.digest,
 			},
 		)
+		if append_error != nil { return false }
 	}
 	slice.sort_by(selected[:], proc(a, b: Skill) -> bool { return a.name < b.name })
 	owned, owned_error := make([]Skill, len(selected), allocator)
 	if owned_error != nil { return false }
 	for skill, index in selected {
-		owned[index] = Skill {
-			name            = strings.clone(skill.name, allocator),
-			description     = strings.clone(skill.description, allocator),
-			logical_path    = strings.clone(skill.logical_path, allocator),
-			directory       = strings.clone(skill.directory, allocator),
-			root_index      = skill.root_index,
-			metadata_digest = skill.metadata_digest,
+		copied, copied_ok := skill_clone(skill, allocator)
+		if !copied_ok {
+			for &built in owned[:index] { skill_destroy(&built, allocator) }
+			delete(owned, allocator)
+			return false
 		}
+		owned[index] = copied
 	}
 	catalog.skills = owned
 	return true
 }
 
-clone_roots :: proc(roots: []Root, allocator: mem.Allocator) -> []Root {
-	owned := make([]Root, len(roots), allocator)
-	for root, index in roots {
-		owned[index] = Root {
-			source       = root.source,
-			logical_path = strings.clone(root.logical_path, allocator),
-			path         = strings.clone(root.path, allocator),
-			authority    = strings.clone(root.authority, allocator),
-		}
+// skill_clone copies one selected skill into the catalog's allocator. It reports false when a
+// field could not be copied, in which case it releases what it copied.
+skill_clone :: proc(skill: Skill, allocator: mem.Allocator) -> (owned: Skill, ok: bool) {
+	owned = skill
+	clone_error: mem.Allocator_Error
+	owned.name, clone_error = strings.clone(skill.name, allocator)
+	if clone_error != nil { return {}, false }
+	owned.description, clone_error = strings.clone(skill.description, allocator)
+	if clone_error != nil {
+		skill_destroy(&owned, allocator)
+		return {}, false
 	}
-	return owned
+	owned.logical_path, clone_error = strings.clone(skill.logical_path, allocator)
+	if clone_error != nil {
+		skill_destroy(&owned, allocator)
+		return {}, false
+	}
+	owned.directory, clone_error = strings.clone(skill.directory, allocator)
+	if clone_error != nil {
+		skill_destroy(&owned, allocator)
+		return {}, false
+	}
+	return owned, true
+}
+
+// root_clone copies one root into the catalog's allocator. It reports false when a field
+// could not be copied, in which case it releases what it copied.
+root_clone :: proc(root: Root, allocator: mem.Allocator) -> (owned: Root, ok: bool) {
+	owned.source = root.source
+	clone_error: mem.Allocator_Error
+	owned.logical_path, clone_error = strings.clone(root.logical_path, allocator)
+	if clone_error != nil { return {}, false }
+	owned.path, clone_error = strings.clone(root.path, allocator)
+	if clone_error != nil {
+		root_destroy(&owned, allocator)
+		return {}, false
+	}
+	owned.authority, clone_error = strings.clone(root.authority, allocator)
+	if clone_error != nil {
+		root_destroy(&owned, allocator)
+		return {}, false
+	}
+	return owned, true
+}
+
+clone_roots :: proc(roots: []Root, allocator: mem.Allocator) -> ([]Root, bool) {
+	owned, owned_error := make([]Root, len(roots), allocator)
+	if owned_error != nil { return nil, false }
+	for root, index in roots {
+		copied, copied_ok := root_clone(root, allocator)
+		if !copied_ok {
+			for &built in owned[:index] { root_destroy(&built, allocator) }
+			delete(owned, allocator)
+			return nil, false
+		}
+		owned[index] = copied
+	}
+	return owned, true
 }
 
 release_candidate :: proc(candidate: ^Candidate, allocator: mem.Allocator) {

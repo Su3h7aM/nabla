@@ -126,6 +126,7 @@ recover_results :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error
 				kind    = .Results,
 				turn    = assistant.turn,
 			}
+			// The node id is not needed here; a failure latches and is returned below.
 			_ = append_node(journal, results, Results{calls = calls[:]})
 			recovery.results += 1
 			clear(&calls)

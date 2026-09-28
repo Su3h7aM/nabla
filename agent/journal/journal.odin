@@ -251,6 +251,7 @@ create_session :: proc(journal: ^Journal, new_session: New_Session) -> (id: Sess
 			role = role,
 		},
 	)
+	// The initial branch is the one this call creates; a failure latches below.
 	_ = append_branch(journal, 0)
 	if journal.failure != nil {
 		// Dropping the claim is teardown; the latch is what the caller needs.
