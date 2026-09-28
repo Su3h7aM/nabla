@@ -6,14 +6,9 @@ import "core:path/filepath"
 
 // XDG Base Directory resolution.
 //
-// Every application-specific directory is resolved through the specification
-// rather than placed directly under the home directory. The environment variable
-// wins when it names an absolute path; when it is unset, empty, or relative the
-// specification's documented default under the home directory applies, because a
-// relative path in one of these variables is invalid and must be ignored.
-//
-// The application directory name is lowercase, so a path on a case-sensitive
-// filesystem cannot collide with a differently cased application.
+// The environment variable wins when it names an absolute path; an unset, empty, or
+// relative one is invalid and the specification's default under the home directory
+// applies instead. The application directory name is lowercase.
 
 XDG_APP_NAME :: "nabla"
 

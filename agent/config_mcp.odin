@@ -127,11 +127,11 @@ MCP_Server_Configs_Clone :: proc(servers: []MCP_Server_Config, allocator := cont
 	failed := true
 	defer if failed { mcp_servers_destroy(&result, allocator) }
 	for server in servers {
-		copy, copy_error := mcp_server_config_clone(server, allocator)
+		cloned, copy_error := mcp_server_config_clone(server, allocator)
 		if copy_error != .None { return {}, copy_error }
-		appended := append(&result, copy)
+		appended := append(&result, cloned)
 		if appended != 1 {
-			if appended == 0 { mcp_server_config_destroy(&copy, allocator) }
+			if appended == 0 { mcp_server_config_destroy(&cloned, allocator) }
 			return {}, .Allocation
 		}
 	}
@@ -448,8 +448,16 @@ mcp_environment_load :: proc(state: ^lua.State, raw_idx: c.int, allocator: mem.A
 		value, value_error := lua_string(state, -1, allocator)
 		// Only the value is popped: the key has to stay for the next call to next.
 		lua.pop(state, 1)
-		if name_error != .None { delete(value, allocator); mcp_environment_release(entries, allocator); return nil, name_error }
-		if value_error != .None { delete(name, allocator); mcp_environment_release(entries, allocator); return nil, value_error }
+		if name_error != .None {
+			delete(value, allocator)
+			mcp_environment_release(entries, allocator)
+			return nil, name_error
+		}
+		if value_error != .None {
+			delete(name, allocator)
+			mcp_environment_release(entries, allocator)
+			return nil, value_error
+		}
 		if !mcp_environment_name_valid(name) {
 			delete(name, allocator)
 			delete(value, allocator)

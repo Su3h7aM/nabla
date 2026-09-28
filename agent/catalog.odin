@@ -3,27 +3,16 @@ package agent
 import "core:mem"
 import "core:strings"
 
-// Provider and model metadata: what a configuration source states, and what the
-// runtime reads once that configuration has been resolved.
+// Provider and model metadata: what a configuration source states, and what the runtime
+// reads once that configuration has been resolved.
 //
-// Every optional field carries an explicit presence flag, so an absent value
-// stays distinguishable from a present zero. That distinction is the whole point
-// of the shape: a configured context window of 0 is not the same fact as an
-// unconfigured one, and neither is the same as "not reported". Presence is
-// independent of value -- missing permits enrichment, while false, zero, and
-// empty are present and final.
+// Every optional field carries an explicit presence flag, so an absent value stays
+// distinguishable from a present zero. Presence is independent of value: missing permits
+// enrichment, while false, zero, and empty are present and final.
 //
-// A Catalog_*_Source is one source's statement about one entity. Resolution
-// merges the three sources in priority order, first present value wins, into the
-// Catalog the runtime consumes.
-//
-// Serving identity is the exact, case-sensitive pair of provider ID and model ID.
-// Neither part is ever parsed out of a combined string.
-//
-// Routing is per model. A provider states the API family its endpoint speaks by
-// default, and a model may state its own; the model's statement is the more
-// specific one and therefore wins, so an endpoint that serves mostly one family
-// can still route a single model through another.
+// A Catalog_*_Source is one source's statement about one entity; resolution merges the
+// sources in priority order, first present value wins. Serving identity is the exact,
+// case-sensitive pair of provider ID and model ID, never parsed out of a combined string.
 
 // A token-budget control form: the range of reasoning budgets the model accepts.
 // Each bound has its own presence, because upstream states neither, either, or
@@ -176,8 +165,8 @@ catalog_find_model :: proc(catalog: ^Catalog, provider_id, model_id: string) -> 
 	return 0, false
 }
 
-// catalog_model returns the resolved entry for a serving identity, optionally
-// adding an empty one when the identity is new.
+// catalog_model returns the resolved entry for a serving identity, or nil when the
+// catalog has none.
 catalog_model :: proc(catalog: ^Catalog, provider_id, model_id: string) -> (^Catalog_Model, bool) {
 	index, found := catalog_find_model(catalog, provider_id, model_id)
 	if !found { return nil, false }

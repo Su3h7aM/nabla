@@ -289,10 +289,10 @@ write_json_string :: proc(builder: ^strings.Builder, value: string) -> bool {
 	hex := "0123456789abcdef"
 	if !instruction_write_byte(builder, '"') { return false }
 	for i := 0; i < len(value); {
-		c := value[i]
-		switch c {
+		character := value[i]
+		switch character {
 		case '"', '\\':
-			if !instruction_write_byte(builder, '\\') || !instruction_write_byte(builder, c) { return false }
+			if !instruction_write_byte(builder, '\\') || !instruction_write_byte(builder, character) { return false }
 		case '\n':
 			if !instruction_write_string(builder, `\n`) { return false }
 		case '\r':
@@ -300,11 +300,11 @@ write_json_string :: proc(builder: ^strings.Builder, value: string) -> bool {
 		case '\t':
 			if !instruction_write_string(builder, `\t`) { return false }
 		case:
-			if c < 0x20 {
+			if character < 0x20 {
 				if !instruction_write_string(builder, `\u00`) ||
-				   !instruction_write_byte(builder, hex[c >> 4]) ||
-				   !instruction_write_byte(builder, hex[c & 0x0f]) { return false }
-			} else if !instruction_write_byte(builder, c) { return false }
+				   !instruction_write_byte(builder, hex[character >> 4]) ||
+				   !instruction_write_byte(builder, hex[character & 0x0f]) { return false }
+			} else if !instruction_write_byte(builder, character) { return false }
 		}
 		i += 1
 	}

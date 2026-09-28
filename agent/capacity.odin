@@ -2,24 +2,10 @@ package agent
 
 // How much context a model has and where its limits are.
 //
-// The resolved catalog carries the answer: Model_Capacity is computed once, by
-// model_capacity, while the catalog is resolved. Nothing downstream recomputes the
-// arithmetic, so no two features can disagree about what a model can hold.
-//
-// The provider enforces one limit: the input plus the output a request asks for must fit
-// the window. The harness therefore asks for whatever room is left instead of reserving
-// a share of the window for output in advance:
-//
-//	window            the model's stated context window, or the assumed default
-//	model_max_output  what the model states it can generate
-//	margin            what the estimator's error may cost
-//	trigger           where background compaction starts
-//
-// There is no reserved output and no separate input budget. A request asks for as much
-// output as the window has left once its input and the margin are charged, so a context
-// that is nearly full still sends, with a small bound, rather than being refused. The
-// trigger is policy for starting background work and is not a limit: the only limit is
-// the window itself.
+// Model_Capacity is computed once, by model_capacity, while the catalog is resolved, so no
+// two features disagree about what a model can hold. window is the limit; the trigger only
+// decides when background compaction starts, and a request asks for whatever room the window
+// has left rather than reserving a share of it for output in advance.
 Model_Capacity :: struct {
 	window:           int,
 	model_max_output: int,
@@ -42,11 +28,8 @@ CHAT_DEFAULT_OUTPUT_TOKENS :: 4096
 // sending; the window less this and the margin is therefore the real input limit.
 CHAT_OUTPUT_MIN_TOKENS :: 1024
 
-// CHAT_MARGIN_PERCENT and CHAT_MARGIN_MIN_TOKENS bound what the estimator's error may
-// cost. The estimate divides characters by CHAT_CHARS_PER_TOKEN, which holds for prose;
-// a dense payload, and a tool result is dense, carries more tokens per character. A
-// share of the window absorbs that, and the floor keeps the share from vanishing on a
-// small window.
+// CHAT_MARGIN_PERCENT and CHAT_MARGIN_MIN_TOKENS bound what the estimator's error may cost:
+// a share of the window, with a floor so it cannot vanish on a small one.
 CHAT_MARGIN_PERCENT :: 10
 CHAT_MARGIN_MIN_TOKENS :: 1024
 

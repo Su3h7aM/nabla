@@ -8,18 +8,10 @@ import "core:strings"
 
 // models.dev catalog parsing: bytes in, provider source records out.
 //
-// The document is models.dev's API representation, a map of provider id to
-// provider record, each carrying the models that provider serves. It is external
-// input, so it is read defensively. A field of the wrong type is treated as
-// absent rather than as a failure -- upstream adding a string where a number used
-// to be must not take the harness down -- while identity that is missing is a
-// failure, because a source record that cannot be keyed would corrupt the
-// resolved catalog rather than merely be incomplete. Unknown fields are ignored:
-// models.dev carries far more than this harness reads.
-//
-// Nothing here decides precedence between sources, exclusion, credentials, or
-// endpoint defaults for the user. It only transforms bytes, so it performs no
-// I/O, and its input is the raw document the cache layer acquired.
+// A field of the wrong type is treated as absent and an unknown field is ignored, while a
+// missing identity is a failure: a source record that cannot be keyed would corrupt the
+// resolved catalog. Precedence, exclusion, credentials, and endpoint defaults are decided
+// elsewhere; this transforms bytes and performs no I/O.
 
 Models_Dev_Parse_Error :: enum {
 	None,
@@ -32,14 +24,10 @@ Models_Dev_Parse_Error :: enum {
 	Missing_Identity,
 }
 
-// models_dev_parse turns a catalog into one source record per provider, each
-// holding the models that provider serves. The result is owned by the caller and
-// released with catalog_sources_destroy, exactly like the result of the user
-// configuration loader, so both are the same kind of resolver input.
-//
-// `providers` restricts the result to those provider ids; an empty list keeps
-// every provider. The resolved catalog only carries providers the user
-// configured, so the rest of the document is traversed but never materialized.
+// models_dev_parse turns a catalog into one source record per provider, each holding the
+// models that provider serves. `providers` restricts the result to those provider ids; an
+// empty list keeps every provider. The result is owned by the caller and released with
+// catalog_sources_destroy.
 models_dev_parse :: proc(data: []u8, providers: []string = {}, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Models_Dev_Parse_Error) {
 	// The document is megabyte-scale and its tree is several times that, so the
 	// tree lives in a dedicated arena that is unmapped when extraction finishes.
@@ -151,13 +139,9 @@ models_dev_provider_source :: proc(object: json.Object, provider_id: string, all
 	return provider
 }
 
-// models_dev_model_source maps one provider-nested model record. Everything it
-// states is kept: a model that names its own SDK is served through that family
-// regardless of its provider's, which is a statement about routing alone and not
-// a reason to discard the model's window, modalities, or thinking controls.
-//
-// The model's family is stated only when it is one this harness implements; an
-// unstated or unrecognized family leaves it absent, so the provider's stands.
+// models_dev_model_source maps one provider-nested model record. A model that names its own
+// SDK is served through that family regardless of its provider's. The family is stated only
+// when it is one this harness implements, so an unrecognized one leaves the provider's.
 models_dev_model_source :: proc(object: json.Object, allocator: mem.Allocator) -> Catalog_Model_Source {
 	model: Catalog_Model_Source
 	if override_value, has_override := object["provider"]; has_override {
@@ -287,7 +271,9 @@ models_dev_api_family :: proc(npm: string) -> (api: string, known: bool) {
 // asked for. The configured set is small, so a scan beats a lookup structure.
 @(private)
 _models_dev_wanted :: proc(providers: []string, id: string) -> bool {
-	for provider in providers { if provider == id { return true } }
+	for provider in providers {
+		if provider == id { return true }
+	}
 	return false
 }
 
@@ -318,11 +304,9 @@ models_dev_member_integer :: proc(object: json.Object, key: string) -> (value: i
 	return int(number), true
 }
 
-// models_dev_member_strings reads a member that must be an array of strings. The
-// list is copied, because the parsed document is released as soon as parsing
-// finishes. A non-string element is dropped rather than failing the catalog: the
-// list is metadata a caller matches against by exact value, so a malformed entry
-// can never be one of them.
+// models_dev_member_strings reads a member that must be an array of strings. The list is
+// copied, because the parsed document is released as soon as parsing finishes. A non-string
+// element is dropped rather than failing the catalog.
 models_dev_member_strings :: proc(object: json.Object, key: string, allocator: mem.Allocator) -> (values: []string, present: bool) {
 	member, found := object[key]
 	if !found { return nil, false }

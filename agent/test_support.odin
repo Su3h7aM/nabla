@@ -65,7 +65,9 @@ chat_notice_log_destroy :: proc(log: ^Chat_Notice_Log) {
 // count rather than on wording, so a reworded notice does not fail the test.
 chat_notice_log_count :: proc(log: ^Chat_Notice_Log, contains: string) -> int {
 	count := 0
-	for line in log.lines { if strings.contains(line, contains) { count += 1 } }
+	for line in log.lines {
+		if strings.contains(line, contains) { count += 1 }
+	}
 	return count
 }
 

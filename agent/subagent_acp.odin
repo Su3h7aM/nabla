@@ -561,19 +561,20 @@ acp_answer :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
 	}
 	for kind in ([]string{"allow_once", "allow_always"}) {
 		for option in request.options {
-			if option.kind == kind && outcome.option_id == "" {outcome = {
+			if option.kind == kind && outcome.option_id == "" {
+				outcome = {
 					outcome   = "selected",
 					option_id = option.option_id,
-				}}
+				}
+			}
 		}
 	}
 	_ = acp.writer_write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome})
 }
 
 // acp_next returns the next message the agent sent, owned by the member's allocator, reading
-// and waiting as needed. A stop
-// sends the agent session/cancel and waits the stop patience for its answer; problem says
-// the agent ended, went silent past that, or could not be read.
+// and waiting as needed. A stop sends the agent session/cancel and waits the stop patience
+// for its answer; problem says the agent ended, went silent past that, or could not be read.
 @(private)
 acp_next :: proc(connection: ^Acp_Connection) -> (envelope: acp.Envelope, problem: string) {
 	for {

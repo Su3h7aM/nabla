@@ -13,17 +13,9 @@ import "core:time"
 import "nabla:ai"
 import "nabla:http/client"
 
-// The second enrichment stage: each configured provider's own model listing,
-// served from cache at startup and refreshed in the background.
-//
-// The endpoint this harness speaks reports model ids and little else, so
-// discovery contributes identity. A model the user did not configure joins the
-// catalog here, and every field discovery cannot state stays absent, which leaves
-// the user's configuration ahead of it and models.dev behind it.
-//
-// A provider that cannot be reached contributes nothing. That is the whole
-// failure policy: the catalog without this stage is still usable, so enrichment
-// degrades to the sources that answered rather than failing the launch.
+// The second enrichment stage: each configured provider's own model listing, served from
+// cache at startup and refreshed in the background. It contributes identity alone, and a
+// provider that cannot be reached contributes nothing.
 
 // The listing hangs off the configured base URL, which already carries the API
 // version prefix: a base_url of ".../v1" lists ".../v1/models".
@@ -121,7 +113,8 @@ provider_models_refresh :: proc(
 				if fetched {
 					models, listed := provider_models_list(acquired, allocator)
 					if listed {
-						provider_models_cache_write(path, acquired)
+						// Caching is best effort: the listing in hand is what answers.
+						_ = provider_models_cache_write(path, acquired)
 						append(&result, Catalog_Provider_Source{id = strings.clone(provider.id, allocator), models = models})
 						for &cached_model in cached_models { catalog_model_source_destroy(&cached_model, allocator) }
 						if cached_models != nil { delete(cached_models, allocator) }
@@ -173,7 +166,8 @@ provider_models_cache_write :: proc(path: string, body: []u8) -> bool {
 	temporary := fmt.tprintf("%s.%d.tmp", path, os.get_pid())
 	if os.write_entire_file(temporary, body) != nil { return false }
 	if os.rename(temporary, path) != nil {
-		os.remove(temporary)
+		// A temporary file that cannot be removed is left behind; only the cache matters.
+		_ = os.remove(temporary)
 		return false
 	}
 	return true

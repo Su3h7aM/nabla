@@ -277,7 +277,10 @@ subagent_start :: proc(
 	problem: string,
 ) {
 	sync.mutex_lock(&team.mutex)
-	if team.closing { sync.mutex_unlock(&team.mutex); return nil, "the orchestrator is closing; nothing started" }
+	if team.closing {
+		sync.mutex_unlock(&team.mutex)
+		return nil, "the orchestrator is closing; nothing started"
+	}
 	team.starting += 1
 	parent := team.parent
 	tools, tools_error := tool_registry_clone(&parent.tools, allocator)
@@ -554,7 +557,10 @@ subagent_run :: proc(member: ^Subagent) {
 	chat.stop_parent = &member.stop
 	chat.disable_project_instructions = member.disable_project_instructions
 	chat.role_instructions = strings.concatenate({SUBAGENT_ROLE, "\n\n", member.instruction}, allocator)
-	_ = chat_session_replace_tools(&chat, &member.tools)
+	if replace_error := chat_session_replace_tools(&chat, &member.tools); replace_error != .None {
+		subagent_fail(member, .Failed, "the subagent's tools could not be installed")
+		return
+	}
 	chat_session_select(&chat, member.selection, member.effort)
 	binding.correlation = log_correlation(&chat)
 

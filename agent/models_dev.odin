@@ -16,12 +16,9 @@ import "nabla:http/client"
 // alongside user configuration and provider discovery. Nothing here interprets
 // the body.
 
-// The API representation is the models.dev endpoint for provider endpoints and
-// the models they serve, which is exactly what this harness consumes. The
-// catalog representation is the same provider records plus a provider-agnostic
-// model registry this harness never reads, and its two model-shaped maps share
-// ids -- so consuming it would mean fetching and discarding data, and risking a
-// record taken from the wrong map.
+// MODELS_DEV_URL is the models.dev API representation: provider records with the models
+// they serve, which is what this harness consumes. The catalog representation adds a
+// model registry this harness never reads.
 MODELS_DEV_URL :: "https://models.dev/api.json"
 MODELS_DEV_CACHE_FILE :: "models-dev-api.json"
 
@@ -53,18 +50,10 @@ Models_Dev_Error :: enum {
 // exercised without the network.
 Models_Dev_Fetch :: #type proc(user_data: rawptr, allocator: mem.Allocator) -> ([]u8, bool)
 
-// models_dev_catalog returns the catalog, preferring a cache that is still fresh
-// and that can answer the request, and refreshing it otherwise.
-//
-// `providers` is what the caller will ask the document for, so a cached document
-// that names none of them is not usable data and the refresh below replaces it.
-// Without that, a document this harness cannot enrich from -- a stray or damaged
-// file in the cache -- would keep being served until its freshness window expired.
-//
-// A stale cache is never destroyed before its replacement exists: when the
-// refresh fails the cached copy is returned instead, so a network problem
-// degrades to stale metadata rather than to none. The returned body is owned by
-// the caller.
+// models_dev_catalog returns the catalog, preferring a fresh cache that can answer a
+// request for `providers` and refreshing it otherwise. A refresh that fails leaves the
+// cached copy in place, so a network problem degrades to stale metadata, never to none.
+// The returned body is owned by the caller.
 models_dev_catalog :: proc(
 	fetch: Models_Dev_Fetch = models_dev_fetch,
 	user_data: rawptr = nil,
@@ -105,7 +94,7 @@ models_dev_catalog_at :: proc(
 		if models_dev_validate(body) {
 			// Caching is best effort. A document already in hand is a usable source,
 			// so a write that fails is not a failed acquisition.
-			models_dev_cache_write(path, body)
+			_ = models_dev_cache_write(path, body)
 			return body, .None
 		}
 		// An acquired but unusable document never becomes the cache: replacing a
@@ -121,12 +110,9 @@ models_dev_catalog_at :: proc(
 	return nil, .Unavailable
 }
 
-// models_dev_cache_answers reports whether a cached document can serve a request
-// for these providers: it must parse, and it must yield at least one provider
-// source. A document that parses but names none of the providers asked for cannot
-// enrich a single model, so serving it would deny enrichment for a whole
-// freshness window. An empty request asks for every provider, so any document
-// that yields one answers it. The tree lives in an arena released here.
+// models_dev_cache_answers reports whether a cached document can serve a request for these
+// providers: it must parse and yield at least one provider source. An empty request asks for
+// every provider.
 models_dev_cache_answers :: proc(body: []u8, providers: []string) -> bool {
 	arena: virtual.Arena
 	if arena_err := virtual.arena_init_growing(&arena); arena_err != nil { return false }
@@ -170,13 +156,10 @@ models_dev_cached_sources :: proc(providers: []string = {}, allocator := context
 	return {}, .Invalid_Data
 }
 
-// models_dev_sources produces the resolver input from models.dev: the document is
-// taken from the cache when it is fresh and acquired otherwise, then parsed into
-// provider source records. This is the whole ingestion path, so no caller handles
-// the raw document. `providers` restricts extraction to those provider ids, so a
-// provider the user cannot select is never materialized. The result is owned by
-// the caller and released with catalog_sources_destroy, exactly like the user
-// configuration loader's result.
+// models_dev_sources produces the resolver input from models.dev: the document is taken from
+// the cache when it is fresh and acquired otherwise, then parsed into provider source records.
+// `providers` restricts extraction to those provider ids. The result is owned by the caller
+// and released with catalog_sources_destroy.
 models_dev_sources :: proc(
 	fetch: Models_Dev_Fetch = models_dev_fetch,
 	user_data: rawptr = nil,
@@ -204,11 +187,8 @@ models_dev_sources :: proc(
 	return {}, .Invalid_Data
 }
 
-// models_dev_cache_path resolves where the document is cached and creates the
-// directory, so a caller always has somewhere to read from and write to. The
-// state directory is the specification's place for regenerable state, and the
-// application directory beneath it is lowercased. The result is owned by the
-// caller.
+// models_dev_cache_path resolves where the document is cached and creates the directory.
+// The result is owned by the caller.
 models_dev_cache_path :: proc(allocator := context.allocator) -> (string, Models_Dev_Error) {
 	directory, directory_err := xdg_directory(.Cache, allocator)
 	if directory_err != .None { return "", .Cache_Directory }
@@ -247,7 +227,8 @@ models_dev_cache_write :: proc(path: string, body: []u8) -> bool {
 	temporary := fmt.tprintf("%s.%d.tmp", path, os.get_pid())
 	if os.write_entire_file(temporary, body) != nil { return false }
 	if os.rename(temporary, path) != nil {
-		os.remove(temporary)
+		// A temporary file that cannot be removed is left behind; only the cache matters.
+		_ = os.remove(temporary)
 		return false
 	}
 	return true
