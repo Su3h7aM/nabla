@@ -34,6 +34,7 @@ Client :: struct {
 // client_start records how to reach the server and launches it. It does not
 // negotiate anything: a launched process is not yet a server this client can talk
 // to.
+@(require_results)
 client_start :: proc(client: ^Client, config: Stdio_Config, allocator := context.allocator) -> Error {
 	client.allocator = allocator
 	cloned_config, clone_error := stdio_config_clone(config, allocator)
@@ -65,6 +66,7 @@ client_version :: proc(client: ^Client) -> Protocol_Version {
 // client_restart replaces a server that is no longer usable. The config is kept for
 // exactly this: a restarted server is a fresh one, so the handshake has to happen
 // again.
+@(require_results)
 client_restart :: proc(client: ^Client) -> Error {
 	stdio_stop(&client.stdio)
 	client.version = .Unknown
@@ -75,6 +77,7 @@ client_restart :: proc(client: ^Client) -> Error {
 // connection it agreed on. It probes with `server/discover`, a method only the
 // stateless revision defines, and falls back to the 2025 handshake when the server
 // answers that probe with an error or stops answering it.
+@(require_results)
 client_connect :: proc(client: ^Client, options: Operation_Options, allocator := context.allocator) -> (Connection, Error) {
 	control := options.control
 	connection, answered, probe_err := client_try_discover(client, options, allocator)
@@ -102,7 +105,7 @@ client_connect :: proc(client: ^Client, options: Operation_Options, allocator :=
 // client_try_discover probes for the stateless revision. answered reports whether
 // the server produced a discovery result, which is what separates "this server
 // speaks the other era" from "this server speaks this era and refused".
-@(private)
+@(private, require_results)
 client_try_discover :: proc(client: ^Client, options: Operation_Options, allocator: mem.Allocator) -> (connection: Connection, answered: bool, err: Error) {
 	params, build_error := request_params_make(.V2026_07_28, 0, client.allocator)
 	if build_error.kind != .None { return {}, false, build_error }
@@ -125,7 +128,7 @@ client_try_discover :: proc(client: ^Client, options: Operation_Options, allocat
 // client_initialize performs the handshake the 2025 revisions define: one
 // initialize request, which the server answers with the revision it will use, and
 // one notification saying the client is ready.
-@(private)
+@(private, require_results)
 client_initialize :: proc(client: ^Client, options: Operation_Options, allocator: mem.Allocator) -> (Connection, Error) {
 	control := options.control
 	params, build_error := initialize_params_make(client.allocator)
@@ -164,7 +167,7 @@ client_initialize :: proc(client: ^Client, options: Operation_Options, allocator
 	return connection, {}
 }
 
-@(private)
+@(private, require_results)
 client_notify :: proc(client: ^Client, method: string, params: json.Object, options: Operation_Options) -> Error {
 	line, encode_err := notification_encode(method, params, client.allocator)
 	defer delete(line, client.allocator)
@@ -178,6 +181,7 @@ client_notify :: proc(client: ^Client, method: string, params: json.Object, opti
 //
 // Notifications that arrive before the reply are consumed and discarded, and a
 // server-initiated request is answered with a refusal.
+@(require_results)
 client_exchange :: proc(client: ^Client, method: string, params: json.Object, options: Operation_Options) -> (result: json.Value, err: Error) {
 	if _, claimed := sync.atomic_compare_exchange_strong(&client.busy, false, true); !claimed {
 		json.destroy_value(json.Value(params), client.allocator)
@@ -260,7 +264,7 @@ client_exchange :: proc(client: ^Client, method: string, params: json.Object, op
 
 // client_refuse_request answers a server-initiated request with an error, which is
 // the only honest reply from a client that declares no capability for it.
-@(private)
+@(private, require_results)
 client_refuse_request :: proc(client: ^Client, method: string, id: i64, options: Operation_Options) -> Error {
 	line, encode_err := response_error_encode(
 		id,
@@ -278,7 +282,7 @@ client_refuse_request :: proc(client: ^Client, method: string, id: i64, options:
 
 // client_stream_error reports a protocol violation observed after the request was
 // written, which is also what makes the outcome of a call unknown.
-@(private)
+@(private, require_results)
 client_stream_error :: proc(client: ^Client, kind: Error_Kind, detail: string) -> Error {
 	err := error_make(kind, detail, client.allocator)
 	err.delivery = .Delivered
@@ -303,6 +307,7 @@ client_error_is_transport :: proc(err: Error) -> bool {
 //
 // The listing has no effect, so it may be sent again after the server is restarted;
 // a tool call may not.
+@(require_results)
 client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator := context.allocator) -> (Tool_Page, Error) {
 	control := options.control
 	if client.version == .Unknown {
@@ -390,6 +395,7 @@ client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator
 // client_tools_call runs one tool. It is sent exactly once: a server may have
 // performed the call before a lost reply, so a failure after the request was written
 // reports that the outcome is unknown rather than trying again.
+@(require_results)
 client_tools_call :: proc(
 	client: ^Client,
 	name: string,

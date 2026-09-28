@@ -79,6 +79,7 @@ tool_page_destroy :: proc(page: ^Tool_Page, allocator := context.allocator) {
 
 // tools_list_params_make builds the params for one tools/list page. An empty
 // cursor asks for the first page.
+@(require_results)
 tools_list_params_make :: proc(cursor: string, version: Protocol_Version, allocator := context.allocator) -> (json.Object, Error) {
 	params, build_error := request_params_make(version, 1 if cursor != "" else 0, allocator)
 	if build_error.kind != .None { return {}, build_error }
@@ -94,6 +95,7 @@ tools_list_params_make :: proc(cursor: string, version: Protocol_Version, alloca
 // tools_list_decode reads one tools/list page. A tool that cannot be used is
 // reported as rejected rather than failing the page, so one malformed definition
 // does not cost the user the tools that were well formed.
+@(require_results)
 tools_list_decode :: proc(result: json.Object, version: Protocol_Version, allocator := context.allocator) -> (Tool_Page, Error) {
 	// The accumulator is a local rather than the named return value: a deferred
 	// cleanup runs after the return value is assigned, so a named one would be
@@ -178,7 +180,7 @@ tools_list_decode :: proc(result: json.Object, version: Protocol_Version, alloca
 // one was refused, without trusting it as a usable name. A value that carries no
 // name at all reads as no name; a name that cannot be copied is the allocator's own
 // failure, which the caller reports rather than dropping the name from the report.
-@(private)
+@(private, require_results)
 tool_rejected_name :: proc(value: json.Value, allocator: mem.Allocator) -> (name: string, err: mem.Allocator_Error) {
 	object, is_object := value.(json.Object)
 	if !is_object { return "", nil }
@@ -205,7 +207,7 @@ Schema_Role :: enum {
 //
 // The schema arrives whole. It was carried by a message the protocol layer already
 // refused if it nested past the stack bound, so no size or depth of its own applies.
-@(private)
+@(private, require_results)
 tool_schema_canonical :: proc(value: json.Value, role: Schema_Role, allocator: mem.Allocator) -> (schema: string, reason: string) {
 	object, is_object := value.(json.Object)
 	if !is_object {
@@ -224,7 +226,7 @@ tool_schema_canonical :: proc(value: json.Value, role: Schema_Role, allocator: m
 	return encoded, ""
 }
 
-@(private)
+@(private, require_results)
 tool_annotation :: proc(annotations: json.Object, field: string) -> (Hint, bool) {
 	value, present := annotations[field]
 	if !present { return .Unknown, true }
@@ -235,7 +237,7 @@ tool_annotation :: proc(annotations: json.Object, field: string) -> (Hint, bool)
 
 // tool_decode reads one tool definition. A reason other than "" means the tool was
 // refused, and the reason is static text naming what is wrong.
-@(private)
+@(private, require_results)
 tool_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Tool, string) {
 	// The accumulator is a local rather than the named return value: a deferred
 	// cleanup runs after the return value is assigned, so a named one would be
@@ -391,6 +393,7 @@ call_result_destroy :: proc(result: ^Call_Result, allocator := context.allocator
 // the wire are the bytes the session recorded as what the call ran with. Text
 // that does not parse is refused rather than sent, because an endpoint cannot
 // read it and the caller would have no record of what it said.
+@(require_results)
 tools_call_params_make :: proc(name, arguments_json: string, version: Protocol_Version, allocator := context.allocator) -> (params: json.Object, err: Error) {
 	arguments, parse_err := json.parse_string(arguments_json, .JSON, true, allocator)
 	if parse_err != nil {
@@ -434,6 +437,7 @@ tools_call_params_make :: proc(name, arguments_json: string, version: Protocol_V
 // call_result_decode reads one tools/call result, of either shape the revision
 // defines. A result type this revision does not define is refused rather than
 // guessed at, because the fields it carries would be unknown.
+@(require_results)
 call_result_decode :: proc(result: json.Object, version: Protocol_Version, allocator := context.allocator) -> (Call_Result, Error) {
 	decoded: Call_Result
 	decoded.allocator = allocator
@@ -519,7 +523,7 @@ call_result_decode :: proc(result: json.Object, version: Protocol_Version, alloc
 
 // content_decode reads one content block. Every field the block carries is kept as
 // the server sent it.
-@(private)
+@(private, require_results)
 content_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Content, Error) {
 	content: Content
 	object, is_object := value.(json.Object)

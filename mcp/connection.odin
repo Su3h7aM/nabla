@@ -33,6 +33,7 @@ connection_destroy :: proc(connection: ^Connection, allocator := context.allocat
 // connection_from_stateless reads a server/discover result. A list that omits this
 // client's revision is refused with the revisions the server does speak, rather than
 // with a boolean: the reader needs to know what to look for.
+@(require_results)
 connection_from_stateless :: proc(result: json.Object, allocator := context.allocator) -> (Connection, Error) {
 	connection: Connection
 	connection.allocator = allocator
@@ -96,6 +97,7 @@ connection_from_stateless :: proc(result: json.Object, allocator := context.allo
 // connection_from_handshake reads an initialize result. It has no resultType: the
 // handshake revisions predate that discriminator, and the revision in force is
 // whatever the server answered with.
+@(require_results)
 connection_from_handshake :: proc(result: json.Object, allocator := context.allocator) -> (Connection, Error) {
 	connection: Connection
 	connection.allocator = allocator
@@ -125,7 +127,7 @@ connection_from_handshake :: proc(result: json.Object, allocator := context.allo
 	return connection, {}
 }
 
-@(private)
+@(private, require_results)
 connection_read_capabilities :: proc(connection: ^Connection, result: json.Object, allocator: mem.Allocator) -> Error {
 	capabilities_value, has_capabilities := result["capabilities"]
 	if !has_capabilities {
@@ -163,7 +165,7 @@ connection_read_capabilities :: proc(connection: ^Connection, result: json.Objec
 
 // handshake_server_info reads the identity a handshake result carries at its top
 // level. The name and version are owned by allocator.
-@(private)
+@(private, require_results)
 handshake_server_info :: proc(result: json.Object, allocator: mem.Allocator) -> (name: string, version: string, err: mem.Allocator_Error) {
 	value, present := result["serverInfo"]
 	if !present { return "", "", nil }

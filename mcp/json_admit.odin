@@ -22,6 +22,7 @@ Document_Problem :: enum {
 // parser recurses once per nesting level and would reach the stack before a later
 // check could refuse it. How large a document may be is the caller's rule to
 // enforce, not this one's.
+@(require_results)
 document_admit :: proc(text: string, depth_limit: int, root_object: bool) -> Document_Problem {
 	if text == "" { return .Syntax }
 
@@ -46,12 +47,12 @@ document_admit :: proc(text: string, depth_limit: int, root_object: bool) -> Doc
 
 // mcp_token_bad reports a token that cannot be used: a tokenizer failure, or an
 // end of input where the document still owes structure.
-@(private)
+@(private, require_results)
 mcp_token_bad :: proc(token: json.Token, err: json.Error) -> bool {
 	return (err != nil && err != .EOF) || token.kind == .EOF
 }
 
-@(private)
+@(private, require_results)
 mcp_admit_object :: proc(tokenizer: ^json.Tokenizer, depth, depth_limit: int) -> Document_Problem {
 	// The depth check belongs to the container rather than to its caller: every
 	// level enters through here, and a check made once at the root would miss
@@ -99,7 +100,7 @@ mcp_admit_object :: proc(tokenizer: ^json.Tokenizer, depth, depth_limit: int) ->
 	}
 }
 
-@(private)
+@(private, require_results)
 mcp_admit_array :: proc(tokenizer: ^json.Tokenizer, depth, depth_limit: int) -> Document_Problem {
 	if depth > depth_limit { return .Too_Deep }
 	comma := false
@@ -128,7 +129,7 @@ mcp_admit_array :: proc(tokenizer: ^json.Tokenizer, depth, depth_limit: int) -> 
 
 // mcp_admit_value continues from a token that has already been read, which is
 // what keeps a container's first element from being read twice.
-@(private)
+@(private, require_results)
 mcp_admit_value :: proc(tokenizer: ^json.Tokenizer, token: json.Token, depth, depth_limit: int) -> Document_Problem {
 	#partial switch token.kind {
 	case .Open_Brace:

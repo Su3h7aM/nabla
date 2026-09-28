@@ -52,6 +52,7 @@ protocol_version_name :: proc(version: Protocol_Version) -> string {
 // client does not implement is reported as unread rather than as Unknown, so the
 // caller can tell "the server chose something I cannot speak" from "nothing was
 // agreed".
+@(require_results)
 protocol_version_from_name :: proc(name: string) -> (Protocol_Version, bool) {
 	switch name {
 	case VERSION_2026_07_28:
@@ -144,12 +145,14 @@ MAX_MESSAGE_DEPTH :: 64
 // It caps nothing the protocol or the model exchanges.
 MAX_STDERR_TAIL_BYTES :: 32 * 1024
 
+@(require_results)
 mcp_object_make :: proc(capacity: int, allocator: mem.Allocator) -> (json.Object, Error) {
 	object, make_error := make(json.Object, capacity, allocator)
 	if make_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 	return object, {}
 }
 
+@(require_results)
 mcp_object_put_string :: proc(object: ^json.Object, key, value: string, allocator: mem.Allocator) -> bool {
 	owned_key, key_error := strings.clone(key, allocator)
 	if key_error != nil { return false }
@@ -162,6 +165,7 @@ mcp_object_put_string :: proc(object: ^json.Object, key, value: string, allocato
 	return true
 }
 
+@(require_results)
 mcp_object_put_integer :: proc(object: ^json.Object, key: string, value: i64, allocator: mem.Allocator) -> bool {
 	owned_key, key_error := strings.clone(key, allocator)
 	if key_error != nil { return false }
@@ -169,6 +173,7 @@ mcp_object_put_integer :: proc(object: ^json.Object, key: string, value: i64, al
 	return true
 }
 
+@(require_results)
 mcp_object_put_value :: proc(object: ^json.Object, key: string, value: json.Value, allocator: mem.Allocator) -> bool {
 	owned_key, key_error := strings.clone(key, allocator)
 	if key_error != nil { return false }
@@ -180,12 +185,14 @@ mcp_object_put_value :: proc(object: ^json.Object, key: string, value: json.Valu
 // beyond the operations it initiates. Sampling, elicitation, roots, and
 // subscriptions are all unimplemented, and declaring one would invite a server to
 // require it: a server must not rely on a capability the client did not state.
+@(require_results)
 client_capabilities_make :: proc(allocator: mem.Allocator) -> (json.Object, Error) {
 	return mcp_object_make(0, allocator)
 }
 
 // client_info_make names this client. The protocol treats identity as self
 // reported and unverified, so it is advisory: nothing may depend on it.
+@(require_results)
 client_info_make :: proc(allocator: mem.Allocator) -> (json.Object, Error) {
 	info, build_error := mcp_object_make(2, allocator)
 	if build_error.kind != .None { return {}, build_error }
@@ -202,6 +209,7 @@ client_info_make :: proc(allocator: mem.Allocator) -> (json.Object, Error) {
 // built here so a method encoder adds its own fields and cannot forget the
 // envelope. A handshake revision negotiated the version once and carries none of
 // it. The result is passed to request_encode, which consumes it.
+@(require_results)
 request_params_make :: proc(version: Protocol_Version, capacity := 0, allocator := context.allocator) -> (json.Object, Error) {
 	params, build_error := mcp_object_make(capacity + 1, allocator)
 	if build_error.kind != .None { return {}, build_error }
@@ -245,6 +253,7 @@ request_params_make :: proc(version: Protocol_Version, capacity := 0, allocator 
 // this client's preferred revision and carries no `_meta`: the version lives in
 // the request body, and which revision is in force is not known until the server
 // answers.
+@(require_results)
 initialize_params_make :: proc(allocator := context.allocator) -> (json.Object, Error) {
 	params, build_error := mcp_object_make(3, allocator)
 	if build_error.kind != .None { return {}, build_error }
@@ -274,6 +283,7 @@ initialize_params_make :: proc(allocator := context.allocator) -> (json.Object, 
 
 // request_encode frames one JSON-RPC request. It takes ownership of params, including
 // on failure, so a caller cannot leak a partially built envelope.
+@(require_results)
 request_encode :: proc(method: string, params: json.Object, id: i64, allocator := context.allocator) -> (string, Error) {
 	envelope, build_error := mcp_object_make(4, allocator)
 	if build_error.kind != .None {
@@ -298,6 +308,7 @@ request_encode :: proc(method: string, params: json.Object, id: i64, allocator :
 // notification_encode frames one JSON-RPC notification. It takes ownership of
 // params, which may be nil for a notification that carries none, and has no id,
 // which is what makes it a notification rather than a request.
+@(require_results)
 notification_encode :: proc(method: string, params: json.Object, allocator := context.allocator) -> (string, Error) {
 	envelope, build_error := mcp_object_make(3, allocator)
 	if build_error.kind != .None {
@@ -324,6 +335,7 @@ notification_encode :: proc(method: string, params: json.Object, allocator := co
 // only when a handshake-era server asks for an interaction this client has no
 // capability for: the specification requires a reply to every request, and there
 // is nothing else honest to say.
+@(require_results)
 response_error_encode :: proc(id: i64, code: i64, message: string, allocator := context.allocator) -> (string, Error) {
 	remote, build_error := mcp_object_make(2, allocator)
 	if build_error.kind != .None { return "", build_error }
@@ -349,7 +361,7 @@ response_error_encode :: proc(id: i64, code: i64, message: string, allocator := 
 // mcp_frame serializes one message. Keys are sorted so the same request always
 // encodes to the same bytes, which makes a forwarded body reproducible and keeps
 // map iteration order out of the wire format.
-@(private)
+@(private, require_results)
 mcp_frame :: proc(value: json.Value, allocator: mem.Allocator) -> (string, Error) {
 	encoded, unparse_err := json.unparse(value, {spec = .JSON, sort_maps_by_key = true}, allocator)
 	if unparse_err != nil { return "", error_make(.Out_Of_Memory, allocator = allocator) }
@@ -416,6 +428,7 @@ message_destroy :: proc(message: ^Message, allocator := context.allocator) {
 // sends and an unmatchable reply cannot be acted on. An error whose id is null is
 // accepted, because the specification allows it when the server could not read the
 // request's id at all.
+@(require_results)
 message_decode :: proc(line: string, allocator := context.allocator) -> (message: Message, err: Error) {
 	switch problem := document_admit(line, MAX_MESSAGE_DEPTH, true); problem {
 	case .None:
@@ -556,7 +569,7 @@ message_read_id :: proc(value: json.Value, present: bool) -> (id: i64, state: Id
 	return 0, .Invalid
 }
 
-@(private)
+@(private, require_results)
 message_read_remote_error :: proc(value: json.Value, allocator: mem.Allocator) -> (Remote_Error, Error) {
 	object, is_object := value.(json.Object)
 	if !is_object { return {}, error_make(.Malformed_Message, "its error is not an object", allocator = allocator) }
@@ -593,6 +606,7 @@ message_read_remote_error :: proc(value: json.Value, allocator: mem.Allocator) -
 
 // result_type reads the discriminator every result carries. It is read before any
 // other field, because which fields exist depends on it.
+@(require_results)
 result_type :: proc(object: json.Object) -> (string, bool) {
 	value, present := object["resultType"]
 	if !present { return "", false }
@@ -605,6 +619,7 @@ result_type :: proc(object: json.Object) -> (string, bool) {
 // `_meta["io.modelcontextprotocol/serverInfo"]`. Identity is advisory: it is
 // reported, never acted on. The name and version are owned by allocator, and err
 // is the allocator's own failure when either could not be copied.
+@(require_results)
 meta_server_info :: proc(result: json.Object, allocator := context.allocator) -> (name: string, version: string, err: mem.Allocator_Error) {
 	meta_value, meta_present := result["_meta"]
 	if !meta_present { return "", "", nil }
@@ -631,7 +646,7 @@ meta_server_info :: proc(result: json.Object, allocator := context.allocator) ->
 // is advisory, and a server that reports it badly is still a usable server. A field
 // that cannot be copied is reported through err, so failing to own an identity is
 // never read as the server having reported none.
-@(private)
+@(private, require_results)
 meta_identity_field :: proc(info: json.Object, field: string, allocator: mem.Allocator) -> (string, mem.Allocator_Error) {
 	value, present := info[field]
 	if !present { return "", nil }

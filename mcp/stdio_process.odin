@@ -52,7 +52,7 @@ Stdio_Io :: enum {
 }
 
 // stdio_errno is the calling thread's last POSIX error as an os.Error.
-@(private)
+@(private, require_results)
 stdio_errno :: proc() -> os.Error {
 	return os.Platform_Error(i32(posix.errno()))
 }
@@ -70,6 +70,7 @@ stdio_fd :: proc(file: ^os.File) -> posix.FD {
 // Odin's os.process_start has no pre-exec hook, so the process group is made here.
 // The harness may have other threads, so between fork and exec the child makes only
 // async-signal-safe calls and leaves through _exit.
+@(require_results)
 stdio_spawn :: proc(name: cstring, argv: [^]cstring, envp: [^]cstring, directory: cstring) -> (pipes: Stdio_Pipes, child: Stdio_Child, err: os.Error) {
 	// Each pipe end is closed exactly once on every path out of here, and a close that
 	// fails only leaks a descriptor that this procedure cannot report anyway.
@@ -148,6 +149,7 @@ stdio_pipes_close :: proc(pipes: Stdio_Pipes) {
 }
 
 // stdio_read reads what one pipe end holds into buffer.
+@(require_results)
 stdio_read :: proc(file: ^os.File, buffer: []u8) -> (count: int, status: Stdio_Io) {
 	bytes_read := posix.read(stdio_fd(file), raw_data(buffer), uint(len(buffer)))
 	if bytes_read >= 0 { return bytes_read, .Ok }
@@ -155,6 +157,7 @@ stdio_read :: proc(file: ^os.File, buffer: []u8) -> (count: int, status: Stdio_I
 }
 
 // stdio_write writes as much of data as one pipe end accepts.
+@(require_results)
 stdio_write :: proc(file: ^os.File, data: []u8) -> (count: int, status: Stdio_Io) {
 	bytes_written := posix.write(stdio_fd(file), raw_data(data), uint(len(data)))
 	if bytes_written >= 0 { return bytes_written, .Ok }
@@ -172,7 +175,7 @@ stdio_io_failure :: proc() -> Stdio_Io {
 
 // stdio_poll blocks until one of fds is ready or the deadline passes, and never
 // wakes on its own otherwise. A signal restarts the wait with the time left.
-@(private)
+@(private, require_results)
 stdio_poll :: proc(fds: []posix.pollfd, deadline: time.Tick, has_deadline: bool) -> os.Error {
 	for {
 		timeout: i32 = -1
@@ -187,6 +190,7 @@ stdio_poll :: proc(fds: []posix.pollfd, deadline: time.Tick, has_deadline: bool)
 
 // stdio_await_readable blocks until file has data or reaches end of stream, or
 // until stop becomes readable, which wins.
+@(require_results)
 stdio_await_readable :: proc(file: ^os.File, stop: ^os.File) -> (stopped: bool, err: os.Error) {
 	fds := [2]posix.pollfd{{fd = stdio_fd(file), events = {.IN}}, {fd = stdio_fd(stop), events = {.IN}}}
 	stdio_poll(fds[:], {}, false) or_return
@@ -207,6 +211,7 @@ stdio_sigpipe_saved: bool
 
 // stdio_sigpipe_acquire makes a pipe write report EPIPE instead of terminating the
 // process, and saves the disposition that was in force before the first stdio server.
+@(require_results)
 stdio_sigpipe_acquire :: proc() -> os.Error {
 	sync.mutex_guard(&stdio_sigpipe_mutex)
 	if stdio_sigpipe_users == 0 {
@@ -234,6 +239,7 @@ stdio_sigpipe_release :: proc() {
 
 // stdio_set_nonblocking makes a pipe end usable from a poll loop, so reading and
 // writing can observe cancellation instead of blocking through it.
+@(require_results)
 stdio_set_nonblocking :: proc(file: ^os.File) -> os.Error {
 	fd := stdio_fd(file)
 	flags := posix.fcntl(fd, .GETFL)
@@ -304,6 +310,7 @@ Stdio_Wait :: enum {
 // stdio_wait sleeps until a pipe end is ready, the server exits, the control's wake
 // is signalled, or its deadline passes. stop says why a Stopped wait ended, and err
 // why a Failed one did.
+@(require_results)
 stdio_wait :: proc(file: ^os.File, direction: Stdio_Direction, child: ^Stdio_Child, control: Control) -> (result: Stdio_Wait, stop: Stop, err: os.Error) {
 	for {
 		if stop = control_stop(control); stop != .None { return .Stopped, stop, nil }
@@ -336,6 +343,7 @@ stdio_wait :: proc(file: ^os.File, direction: Stdio_Direction, child: ^Stdio_Chi
 // stdio_alloc_vectors builds the nil-terminated argv and envp vectors a spawn
 // needs. It is called before the fork, where allocating is still safe, and the
 // result is released with stdio_destroy_vectors.
+@(require_results)
 stdio_alloc_vectors :: proc(
 	name: string,
 	arguments: []string,
@@ -374,7 +382,7 @@ stdio_alloc_vectors :: proc(
 	return argv, envp, true
 }
 
-@(private)
+@(private, require_results)
 strings_clone_cstring :: proc(value: string, allocator: mem.Allocator) -> (cstring, bool) {
 	text, err := strings.clone_to_cstring(value, allocator)
 	return text, err == nil

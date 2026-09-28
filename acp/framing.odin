@@ -22,6 +22,7 @@ Frame_Error :: enum {
 // frame_decoder_init returns a decoder that clones every frame it yields with allocator,
 // which owns those frames until frame_strings_destroy frees them. It returns the error
 // from creating the frame buffer.
+@(require_results)
 frame_decoder_init :: proc(allocator := context.allocator) -> (Frame_Decoder, mem.Allocator_Error) {
 	buffer, buffer_error := make([dynamic]u8, allocator)
 	if buffer_error != nil {
@@ -68,6 +69,7 @@ frame_strings_destroy :: proc(frames: ^[dynamic]string, allocator := context.all
 // It returns the first frame the chunk was refused for, or .None when it yielded them all,
 // and it keeps reading the chunk after a refusal so that one bad frame does not hide the
 // frames behind it. A frame is dropped whole: its bytes are never yielded in part.
+@(require_results)
 frame_decoder_feed :: proc(decoder: ^Frame_Decoder, chunk: []byte, frames: ^[dynamic]string) -> Frame_Error {
 	first_error := Frame_Error.None
 	for byte in chunk {
@@ -102,7 +104,7 @@ frame_decoder_feed :: proc(decoder: ^Frame_Decoder, chunk: []byte, frames: ^[dyn
 // cloned with the decoder's allocator and appended to frames, which then owns it. The
 // buffer is empty when it returns, whatever the outcome. It returns the reason the frame
 // was refused, or .None when frames received it.
-@(private)
+@(private, require_results)
 frame_end :: proc(decoder: ^Frame_Decoder, frames: ^[dynamic]string) -> Frame_Error {
 	defer clear(&decoder.buffer)
 	length := len(decoder.buffer)

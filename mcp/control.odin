@@ -91,6 +91,7 @@ control_stop :: proc(control: Control) -> Stop {
 // control_error turns a stop into the error an operation reports. delivery says
 // whether the operation's request had already been written, which is the fact a
 // caller needs to tell a transport failure from an unknown outcome.
+@(require_results)
 control_error :: proc(stop: Stop, delivery: Delivery_State, allocator := context.allocator) -> Error {
 	if stop == .None { return {} }
 	err := error_make(.Cancelled if stop == .Cancelled else .Timed_Out, allocator = allocator)

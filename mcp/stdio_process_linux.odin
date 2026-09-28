@@ -14,7 +14,7 @@ Stdio_Exit_Watch :: struct {
 }
 
 // stdio_exit_watch_open watches the child pid, which must not have been reaped yet.
-@(private)
+@(private, require_results)
 stdio_exit_watch_open :: proc(pid: int) -> (watch: Stdio_Exit_Watch, err: os.Error) {
 	fd, errno := linux.pidfd_open(linux.Pid(pid), {})
 	if errno != .NONE { return {}, os.Platform_Error(errno) }

@@ -59,6 +59,7 @@ Error :: struct {
 // error_make builds an Error from a kind and the message that explains it, both
 // owned by the result through allocator. A message that cannot be owned becomes an
 // Out_Of_Memory Error, which carries no message and so can always be built.
+@(require_results)
 error_make :: proc(kind: Error_Kind, message := "", allocator := context.allocator) -> Error {
 	err := Error {
 		kind      = kind,
@@ -77,6 +78,7 @@ error_make :: proc(kind: Error_Kind, message := "", allocator := context.allocat
 
 // error_with_code is an Error that names a specific protocol code, used when a
 // local condition has one, such as a server refusing the requested version.
+@(require_results)
 error_with_code :: proc(kind: Error_Kind, code: i64, message := "", allocator := context.allocator) -> Error {
 	err := error_make(kind, message, allocator)
 	err.code = code
@@ -86,6 +88,7 @@ error_with_code :: proc(kind: Error_Kind, code: i64, message := "", allocator :=
 // error_from_remote turns a JSON-RPC error object into an Error. The remote code
 // is kept as it arrived, so a caller can act on a protocol-defined code without
 // parsing the message text.
+@(require_results)
 error_from_remote :: proc(remote: Remote_Error, delivery: Delivery_State, allocator := context.allocator) -> Error {
 	// The peer's words are owned before the error is published, so a failure here has
 	// nothing to release but what it already copied. The delivery state is kept
@@ -133,6 +136,7 @@ error_delivered :: proc(err: Error) -> bool {
 // failed and, when the failure is the peer's, what the peer said. The sentence is
 // built from parts the caller owns, so a sentence that could not be built is
 // reported through text_error rather than arriving shortened.
+@(require_results)
 error_text :: proc(err: Error, allocator := context.allocator) -> (text: string, text_error: mem.Allocator_Error) {
 	switch err.kind {
 	case .None:

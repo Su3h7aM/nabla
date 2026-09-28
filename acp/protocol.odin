@@ -46,6 +46,7 @@ Envelope_Error :: enum {
 	Allocation,
 }
 
+@(require_results)
 parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Envelope, Envelope_Error) {
 	value, parse_err := json.parse_string(payload, .JSON, true, allocator)
 	if parse_err != nil { return {}, .Invalid_JSON }
@@ -137,6 +138,7 @@ envelope_error_text :: proc(err: Envelope_Error) -> string {
 // parse_batch recognizes a JSON-RPC batch without changing the single-envelope
 // parser. Individual entries are returned as text so the normal dispatcher owns
 // their validation and response rules.
+@(require_results)
 parse_batch :: proc(payload: string, allocator := context.allocator) -> (frames: [dynamic]string, is_batch: bool, err: Envelope_Error) {
 	trimmed := strings.trim_space(payload)
 	if len(trimmed) == 0 || trimmed[0] != '[' { return {}, false, .None }
@@ -180,6 +182,7 @@ parse_batch :: proc(payload: string, allocator := context.allocator) -> (frames:
 // not match the payload the method takes or the copy could not be allocated; the peer
 // is answered with a params refusal either way, so nothing is acted on. The target's
 // own strings are owned by allocator.
+@(require_results)
 params_decode :: proc(value: json.Value, target: ^$T, allocator := context.allocator) -> bool {
 	if value == nil { return false }
 	encoded, marshal_err := json.marshal(value, allocator = allocator)
@@ -188,6 +191,7 @@ params_decode :: proc(value: json.Value, target: ^$T, allocator := context.alloc
 	return json.unmarshal(encoded, target, allocator = allocator) == nil
 }
 
+@(require_results)
 object_string_present :: proc(object: json.Object, key: string) -> (string, bool, bool) {
 	value, present := object[key]
 	if !present { return "", false, true }
@@ -195,6 +199,7 @@ object_string_present :: proc(object: json.Object, key: string) -> (string, bool
 	if !is_string { return "", true, false }
 	return string(text), true, true
 }
+@(require_results)
 object_string :: proc(object: json.Object, key: string) -> (string, bool) {
 	value, present := object[key]
 	if !present { return "", false }
@@ -202,6 +207,7 @@ object_string :: proc(object: json.Object, key: string) -> (string, bool) {
 	if !is_string { return "", false }
 	return string(text), true
 }
+@(require_results)
 object_id :: proc(object: json.Object, key: string, allocator := context.allocator) -> (id: Jsonrpc_Id, present: bool, err: Envelope_Error) {
 	value, has_value := object[key]
 	if !has_value { return nil, false, .None }
@@ -219,6 +225,7 @@ object_id :: proc(object: json.Object, key: string, allocator := context.allocat
 	}
 	return nil, true, .Invalid_ID
 }
+@(require_results)
 parse_rpc_error :: proc(value: json.Value, allocator := context.allocator) -> (Rpc_Error, Envelope_Error) {
 	object, is_object := value.(json.Object)
 	if !is_object { return {}, .Invalid_Error }

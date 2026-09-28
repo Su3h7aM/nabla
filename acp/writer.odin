@@ -23,6 +23,7 @@ Writer :: struct {
 	batch:      [dynamic]string,
 }
 
+@(require_results)
 writer_init :: proc(out: io.Writer, allocator := context.allocator) -> (Writer, mem.Allocator_Error) {
 	builder, err := strings.builder_make(allocator)
 	if err != nil { return {}, err }
@@ -48,6 +49,7 @@ writer_failed :: proc(writer: ^Writer) -> bool { return sync.atomic_load(&writer
 // writer_write_response answers one request with a result payload. The batch check
 // and the write happen under one lock hold, so a response can neither slip into a
 // batch that just ended nor miss one that just began.
+@(require_results)
 writer_write_response :: proc(writer: ^Writer, id: Jsonrpc_Id, result: $T) -> bool {
 	body, marshal_err := json.marshal(result, allocator = context.temp_allocator)
 	if marshal_err != nil { return false }
@@ -65,6 +67,7 @@ Rpc_Error_Wire :: struct {
 }
 
 // writer_write_error answers one request with a failure.
+@(require_results)
 writer_write_error :: proc(writer: ^Writer, id: Jsonrpc_Id, code: i64, message: string) -> bool {
 	body, marshal_err := json.marshal(Rpc_Error_Wire{code = code, message = message}, allocator = context.temp_allocator)
 	if marshal_err != nil { return false }
@@ -79,6 +82,7 @@ writer_write_error :: proc(writer: ^Writer, id: Jsonrpc_Id, code: i64, message: 
 // always its own frame, even while a batch is being collected: a batch answer may
 // only carry responses, so a notification that waited would either be dropped or
 // corrupt the batch.
+@(require_results)
 writer_write_notification :: proc(writer: ^Writer, method: string, params: $T) -> bool {
 	body, marshal_err := json.marshal(params, allocator = context.temp_allocator)
 	if marshal_err != nil { return false }
@@ -100,6 +104,7 @@ writer_write_notification :: proc(writer: ^Writer, method: string, params: $T) -
 }
 
 // writer_write_request sends one request as its own frame, which the agent answers by id.
+@(require_results)
 writer_write_request :: proc(writer: ^Writer, id: i64, method: string, params: $T) -> bool {
 	body, marshal_err := json.marshal(params, allocator = context.temp_allocator)
 	if marshal_err != nil { return false }
@@ -123,7 +128,7 @@ writer_write_request :: proc(writer: ^Writer, id: i64, method: string, params: $
 }
 
 // writer_frame writes one response frame. The caller holds the mutex.
-@(private)
+@(private, require_results)
 writer_frame :: proc(writer: ^Writer, id: Jsonrpc_Id, key: string, body: []byte) -> bool {
 	if writer.out.procedure == nil { return false }
 	builder := &writer.builder
@@ -140,6 +145,7 @@ writer_frame :: proc(writer: ^Writer, id: Jsonrpc_Id, key: string, body: []byte)
 	return writer_flush(writer, builder)
 }
 
+@(require_results)
 writer_begin_batch :: proc(writer: ^Writer) -> bool {
 	sync.mutex_lock(&writer.mutex)
 	defer sync.mutex_unlock(&writer.mutex)
@@ -148,6 +154,7 @@ writer_begin_batch :: proc(writer: ^Writer) -> bool {
 	return true
 }
 
+@(require_results)
 writer_end_batch :: proc(writer: ^Writer) -> bool {
 	sync.mutex_lock(&writer.mutex)
 	defer sync.mutex_unlock(&writer.mutex)
@@ -189,7 +196,7 @@ writer_end_batch :: proc(writer: ^Writer) -> bool {
 
 // writer_batch_frame queues one response inside the open batch. The caller holds the
 // mutex and has checked the batch mode.
-@(private)
+@(private, require_results)
 writer_batch_frame :: proc(writer: ^Writer, id: Jsonrpc_Id, key: string, body: []byte) -> bool {
 	frame_builder, builder_err := strings.builder_make(writer.allocator)
 	if builder_err != nil { return false }
@@ -220,7 +227,7 @@ writer_batch_clear :: proc(writer: ^Writer) {
 	writer.batch.allocator = writer.allocator
 }
 
-@(private)
+@(private, require_results)
 writer_flush :: proc(writer: ^Writer, builder: ^strings.Builder) -> bool {
 	frame := strings.to_string(builder^)
 	written, write_err := io.write_string(writer.out, frame)
@@ -231,22 +238,22 @@ writer_flush :: proc(writer: ^Writer, builder: ^strings.Builder) -> bool {
 	return true
 }
 
-@(private)
+@(private, require_results)
 writer_builder_string :: proc(builder: ^strings.Builder, value: string) -> bool {
 	return strings.write_string(builder, value) == len(value)
 }
 
-@(private)
+@(private, require_results)
 writer_builder_bytes :: proc(builder: ^strings.Builder, value: []byte) -> bool {
 	return strings.write_bytes(builder, value) == len(value)
 }
 
-@(private)
+@(private, require_results)
 writer_builder_byte :: proc(builder: ^strings.Builder, value: byte) -> bool {
 	return strings.write_byte(builder, value) == 1
 }
 
-@(private)
+@(private, require_results)
 writer_write_id :: proc(builder: ^strings.Builder, id: Jsonrpc_Id) -> bool {
 	switch value in id {
 	case i64, f64:
@@ -267,7 +274,7 @@ writer_write_id :: proc(builder: ^strings.Builder, id: Jsonrpc_Id) -> bool {
 
 // writer_write_quoted writes one JSON string. It is the only place outbound text is
 // escaped, so every string the writer emits is valid whatever it contains.
-@(private)
+@(private, require_results)
 writer_write_quoted :: proc(builder: ^strings.Builder, value: string) -> bool {
 	if !writer_builder_byte(builder, '"') { return false }
 	for i := 0; i < len(value); i += 1 {

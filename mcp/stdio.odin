@@ -29,6 +29,7 @@ Stdio_Config :: struct {
 	environment:       []Environment_Entry,
 }
 
+@(require_results)
 stdio_config_clone :: proc(config: Stdio_Config, allocator: mem.Allocator) -> (Stdio_Config, Error) {
 	clone: Stdio_Config
 	clone_error: mem.Allocator_Error
@@ -112,6 +113,7 @@ Stdio :: struct {
 
 // stdio_start launches a server and begins draining its standard error. On failure
 // the transport is left unstarted and owns nothing.
+@(require_results)
 stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.allocator) -> Error {
 	if !strings.has_prefix(config.executable, "/") {
 		return error_make(.Spawn_Failed, "a server executable must be an absolute path", allocator = allocator)
@@ -195,7 +197,7 @@ stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.al
 
 // stdio_spawn_error is a start failure that names what failed and the system's
 // reason for it.
-@(private)
+@(private, require_results)
 stdio_spawn_error :: proc(what: string, cause: os.Error, allocator: mem.Allocator) -> Error {
 	return error_make(.Spawn_Failed, fmt.tprintf("%s: %s", what, os.error_string(cause)), allocator)
 }
@@ -246,6 +248,7 @@ stdio_running :: proc(stdio: ^Stdio) -> bool {
 // newline is added here and the caller's bytes must contain none. A write that does
 // not complete leaves a partial line, which is not a message: the server cannot
 // have acted on it, so the error is reported as not delivered.
+@(require_results)
 stdio_write_line :: proc(stdio: ^Stdio, message: string, control: Control) -> Error {
 	if !stdio.started { return error_make(.Write_Failed, allocator = stdio.allocator) }
 	clear(&stdio.out)
@@ -283,6 +286,7 @@ stdio_write_line :: proc(stdio: ^Stdio, message: string, control: Control) -> Er
 // until the next read. Once a request is written, every failure to read its reply
 // is reported as delivered: the server may have acted, which is what makes the
 // outcome unknown rather than absent.
+@(require_results)
 stdio_read_line :: proc(stdio: ^Stdio, control: Control) -> (line: []u8, err: Error) {
 	for {
 		if start := stdio_find_newline(stdio.line[:], stdio.line_start); start >= 0 {
@@ -345,7 +349,7 @@ stdio_find_newline :: proc(data: []u8, from: int) -> int {
 // stdio_transport_error builds a transport failure with the delivery state and the
 // server's own last words attached, so a diagnostic says what the server was
 // complaining about.
-@(private)
+@(private, require_results)
 stdio_transport_error :: proc(stdio: ^Stdio, kind: Error_Kind, delivery: Delivery_State) -> Error {
 	err := error_make(kind, allocator = stdio.allocator)
 	err.delivery = delivery
@@ -355,7 +359,7 @@ stdio_transport_error :: proc(stdio: ^Stdio, kind: Error_Kind, delivery: Deliver
 
 // stdio_wait_error is a transport failure caused by the system refusing the wait
 // itself, naming the system's reason.
-@(private)
+@(private, require_results)
 stdio_wait_error :: proc(stdio: ^Stdio, kind: Error_Kind, delivery: Delivery_State, cause: os.Error) -> Error {
 	err := stdio_transport_error(stdio, kind, delivery)
 	err.message = fmt.aprintf("the server's pipe could not be waited on: %s", os.error_string(cause), allocator = stdio.allocator)
@@ -366,6 +370,7 @@ stdio_wait_error :: proc(stdio: ^Stdio, kind: Error_Kind, delivery: Delivery_Sta
 // allocator. It is diagnostic text and never decides an outcome, so a copy that
 // cannot be made is reported as the allocator's own failure rather than as an empty
 // tail.
+@(require_results)
 stdio_stderr_excerpt :: proc(stdio: ^Stdio, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	sync.mutex_lock(&stdio.stderr_mutex)
 	defer sync.mutex_unlock(&stdio.stderr_mutex)
