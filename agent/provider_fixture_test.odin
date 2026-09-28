@@ -74,18 +74,22 @@ agent_provider_refusal :: proc(status, body: string, headers := "", allocator :=
 }
 
 Agent_Provider :: struct {
-	listener:  net.TCP_Socket,
-	port:      int,
-	responses: []string,
-	allocator: mem.Allocator,
+	listener:   net.TCP_Socket,
+	// connection is the connection the serve thread is reading or answering right now,
+	// and is empty while it waits in accept. agent_provider_stop takes it, so a read that
+	// is already waiting on it ends instead of waiting for a request that never comes.
+	connection: net.TCP_Socket,
+	port:       int,
+	responses:  []string,
+	allocator:  mem.Allocator,
 	// requests holds what each connection sent, in order, so a test can assert what
 	// left this machine: an attempt chain that sends the same bytes sends equal ones.
-	requests:  [dynamic]string,
-	thread:    ^thread.Thread,
-	failed:    bool,
+	requests:   [dynamic]string,
+	thread:     ^thread.Thread,
+	failed:     bool,
 	// lock orders the state the serve thread writes with the test that reads it. The
 	// socket a response crosses does not give that ordering, so the fixture states it.
-	lock:      sync.Mutex,
+	lock:       sync.Mutex,
 }
 
 // The accessors below are the only way a test touches what the serve thread wrote. Each
@@ -159,14 +163,32 @@ agent_provider_serve_now :: proc(provider: ^Agent_Provider) {
 	thread.start(provider.thread)
 }
 
-// agent_provider_stop ends the fixture: it waits for the responses it was given to
-// be served, then releases everything it kept. A test that never got that far still
-// stops it, because the listener is closed here either way.
+// agent_provider_stop ends the fixture and always returns promptly: it wakes the serve
+// thread out of the accept or read it is waiting in, joins it, then releases everything
+// the fixture kept. A test that failed before it made every request stops the fixture
+// too, so the stop does not wait for the requests that never come.
 agent_provider_stop :: proc(provider: ^Agent_Provider) {
 	if provider.thread != nil {
+		// Closing a socket another thread is already waiting in does not end that wait,
+		// so the stop ends both ways of waiting. It takes the open connection and shuts
+		// it down, which returns a read that is waiting on it, and then connects to
+		// itself once, which is what an accept that is waiting returns from. The wake
+		// connection is closed here, so the read the serve thread enters on it meets the
+		// end of its stream at once.
+		sync.mutex_lock(&provider.lock)
+		connection := provider.connection
+		provider.connection = {}
+		sync.mutex_unlock(&provider.lock)
+		if connection != {} { net.shutdown(connection, .Both) }
+		wake_endpoint := net.Endpoint {
+			address = net.IP4_Address{127, 0, 0, 1},
+			port    = provider.port,
+		}
+		if wake, wake_err := net.dial_tcp_from_endpoint(wake_endpoint); wake_err == nil { net.close(wake) }
 		thread.join(provider.thread)
 		thread.destroy(provider.thread)
 		provider.thread = nil
+		if connection != {} { net.close(connection) }
 	}
 	if provider.listener != {} {
 		net.close(provider.listener)
@@ -189,20 +211,40 @@ agent_provider_serve :: proc(thread: ^thread.Thread) {
 			agent_provider_note_failure(provider)
 			return
 		}
+		agent_provider_publish(provider, socket)
 		request, read_ok := agent_provider_read(socket, provider.allocator)
 		if !read_ok {
 			agent_provider_note_failure(provider)
-			net.close(socket)
+			agent_provider_release(provider, socket)
 			return
 		}
 		agent_provider_record(provider, request)
 		write_ok := agent_provider_write(socket, response)
-		net.close(socket)
+		agent_provider_release(provider, socket)
 		if !write_ok {
 			agent_provider_note_failure(provider)
 			return
 		}
 	}
+}
+
+// agent_provider_publish marks the connection this thread is about to read, so a stop
+// that arrives while that read waits can end it.
+agent_provider_publish :: proc(provider: ^Agent_Provider, socket: net.TCP_Socket) {
+	sync.mutex_lock(&provider.lock)
+	defer sync.mutex_unlock(&provider.lock)
+	provider.connection = socket
+}
+
+// agent_provider_release ends the connection's turn and closes its socket, unless
+// agent_provider_stop took the connection first: then the socket is the stop's to shut
+// down and close, and neither thread touches a descriptor the other may have closed.
+agent_provider_release :: proc(provider: ^Agent_Provider, socket: net.TCP_Socket) {
+	sync.mutex_lock(&provider.lock)
+	owned := provider.connection == socket
+	if owned { provider.connection = {} }
+	sync.mutex_unlock(&provider.lock)
+	if owned { net.close(socket) }
 }
 
 // agent_provider_read reads one whole request: its head, then the body that head's
