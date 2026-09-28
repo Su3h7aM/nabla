@@ -89,6 +89,7 @@ load_error_destroy :: proc(load_error: ^Load_Error, allocator := context.allocat
 
 // error_make builds a load failure. A field or detail that cannot be copied is left empty:
 // the kind is what the caller acts on, and error_text names it when no text was kept.
+@(require_results)
 error_make :: proc(kind: Error_Kind, line: int = 0, field: string = "", detail: string = "", allocator := context.allocator) -> Load_Error {
 	return Load_Error{kind = kind, line = line, field = strings.clone(field, allocator), detail = strings.clone(detail, allocator)}
 }

@@ -66,6 +66,7 @@ Directory_Id :: struct {
 // directory_id reports the identity of the directory path resolves to, following symlinks. It
 // reports false for a path that is not a directory or cannot be inspected; the walk handles
 // that path as it did before. The allocation the stat makes is released before it returns.
+@(require_results)
 directory_id :: proc(path: string, scratch: mem.Allocator) -> (Directory_Id, bool) {
 	info, stat_error := os.stat(path, scratch)
 	if stat_error != nil { return {}, false }
@@ -74,6 +75,7 @@ directory_id :: proc(path: string, scratch: mem.Allocator) -> (Directory_Id, boo
 	return Directory_Id{device = info.device, inode = info.inode}, true
 }
 
+@(require_results)
 discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Catalog, load_error: Load_Error) {
 	scratch := context.temp_allocator
 	resolved, resolved_error := make([dynamic]Root, 0, len(roots), scratch)
@@ -143,12 +145,13 @@ discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Cat
 
 // discover_failed ends a discovery that could not build its catalog: what it recorded so
 // far is released, and the reason is that an allocation did not fit.
-@(private)
+@(private, require_results)
 discover_failed :: proc(catalog: ^Catalog, allocator: mem.Allocator) -> Load_Error {
 	catalog_destroy(catalog, allocator)
 	return error_make(.Allocation, allocator = allocator)
 }
 
+@(require_results)
 canonical_root :: proc(root: Root, allocator: mem.Allocator) -> (string, Load_Error) {
 	canonical, canonical_error := os.get_absolute_path(root.logical_path, allocator)
 	if canonical_error != nil { return "", error_make(.Unreadable, detail = string(os.error_string(canonical_error)), allocator = allocator) }
@@ -159,6 +162,7 @@ canonical_root :: proc(root: Root, allocator: mem.Allocator) -> (string, Load_Er
 	return canonical, {}
 }
 
+@(require_results)
 discover_root :: proc(root_pos: int, root: Root, catalog: ^Catalog, candidates: ^[dynamic]Candidate, scratch, allocator: mem.Allocator) -> bool {
 	entries, entries_error := os.read_directory_by_path(root.path, -1, scratch)
 	if entries_error != nil {
@@ -209,6 +213,7 @@ discover_root :: proc(root_pos: int, root: Root, catalog: ^Catalog, candidates: 
 	return true
 }
 
+@(require_results)
 walk_directory :: proc(
 	root_pos: int,
 	root: Root,
@@ -277,6 +282,7 @@ walk_directory :: proc(
 // read_candidate records the skill a SKILL.md declares, or the diagnostic that says why it is
 // not one. It reports false when the candidate could not be built, which fails the whole root
 // scan rather than leaving a skill out of the catalog.
+@(require_results)
 read_candidate :: proc(
 	root_pos: int,
 	root: Root,
@@ -337,6 +343,7 @@ read_candidate :: proc(
 	return true
 }
 
+@(require_results)
 select_candidates :: proc(candidates: []Candidate, catalog: ^Catalog, scratch, allocator: mem.Allocator) -> bool {
 	ordered, ordered_error := slice.clone(candidates, scratch)
 	if ordered_error != nil { return false }
@@ -404,6 +411,7 @@ select_candidates :: proc(candidates: []Candidate, catalog: ^Catalog, scratch, a
 
 // skill_clone copies one selected skill into the catalog's allocator. It reports false when a
 // field could not be copied, in which case it releases what it copied.
+@(require_results)
 skill_clone :: proc(skill: Skill, allocator: mem.Allocator) -> (owned: Skill, ok: bool) {
 	owned = skill
 	clone_error: mem.Allocator_Error
@@ -429,6 +437,7 @@ skill_clone :: proc(skill: Skill, allocator: mem.Allocator) -> (owned: Skill, ok
 
 // root_clone copies one root into the catalog's allocator. It reports false when a field
 // could not be copied, in which case it releases what it copied.
+@(require_results)
 root_clone :: proc(root: Root, allocator: mem.Allocator) -> (owned: Root, ok: bool) {
 	owned.source = root.source
 	clone_error: mem.Allocator_Error
@@ -447,6 +456,7 @@ root_clone :: proc(root: Root, allocator: mem.Allocator) -> (owned: Root, ok: bo
 	return owned, true
 }
 
+@(require_results)
 clone_roots :: proc(roots: []Root, allocator: mem.Allocator) -> ([]Root, bool) {
 	owned, owned_error := make([]Root, len(roots), allocator)
 	if owned_error != nil { return nil, false }

@@ -12,6 +12,7 @@ Frontmatter_Value :: struct {
 	next_line: int,
 }
 
+@(require_results)
 parse_metadata :: proc(data: []u8, directory_name: string, allocator := context.allocator) -> (Metadata, Load_Error) {
 	text := string(data)
 	start := 0
@@ -125,14 +126,17 @@ frontmatter_line :: proc(text: string, start: int) -> (string, int) {
 // frontmatter_write_byte and frontmatter_write_string append to a value's builder, and report
 // whether every byte went in: a builder that cannot grow drops what does not fit, which would
 // silently truncate the metadata it holds.
+@(require_results)
 frontmatter_write_byte :: proc(builder: ^strings.Builder, character: byte) -> bool {
 	return strings.write_byte(builder, character) == 1
 }
 
+@(require_results)
 frontmatter_write_string :: proc(builder: ^strings.Builder, text: string) -> bool {
 	return strings.write_string(builder, text) == len(text)
 }
 
+@(require_results)
 frontmatter_key_valid :: proc(key: string) -> bool {
 	if key == "" { return false }
 	for character in key {
@@ -145,6 +149,7 @@ frontmatter_key_valid :: proc(key: string) -> bool {
 	return true
 }
 
+@(require_results)
 skill_name_valid :: proc(name: string) -> bool {
 	if len(name) == 0 || len(name) > SKILL_MAX_NAME_BYTES { return false }
 	if name[0] == '-' || name[len(name) - 1] == '-' { return false }
@@ -161,6 +166,7 @@ skill_name_valid :: proc(name: string) -> bool {
 	return true
 }
 
+@(require_results)
 frontmatter_value :: proc(text, raw: string, next_line, line_number: int, allocator: mem.Allocator) -> (Frontmatter_Value, Load_Error) {
 	if raw[0] == '\'' { return frontmatter_single_quoted(raw, next_line, line_number, allocator) }
 	if raw[0] == '"' { return frontmatter_double_quoted(raw, next_line, line_number, allocator) }
@@ -187,6 +193,7 @@ frontmatter_value :: proc(text, raw: string, next_line, line_number: int, alloca
 	return Frontmatter_Value{text = cloned, next_line = next_line}, {}
 }
 
+@(require_results)
 frontmatter_single_quoted :: proc(raw: string, next_line, line_number: int, allocator: mem.Allocator) -> (Frontmatter_Value, Load_Error) {
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return {}, error_make(.Allocation, allocator = allocator) }
@@ -217,6 +224,7 @@ frontmatter_single_quoted :: proc(raw: string, next_line, line_number: int, allo
 	return Frontmatter_Value{text = cloned, next_line = next_line}, {}
 }
 
+@(require_results)
 frontmatter_double_quoted :: proc(raw: string, next_line, line_number: int, allocator: mem.Allocator) -> (Frontmatter_Value, Load_Error) {
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return {}, error_make(.Allocation, allocator = allocator) }
@@ -275,6 +283,7 @@ frontmatter_double_quoted :: proc(raw: string, next_line, line_number: int, allo
 	return Frontmatter_Value{text = cloned, next_line = next_line}, {}
 }
 
+@(require_results)
 frontmatter_hex4 :: proc(text: string) -> (u32, bool) {
 	if len(text) != 4 { return 0, false }
 	value: u32
@@ -294,6 +303,7 @@ frontmatter_hex4 :: proc(text: string) -> (u32, bool) {
 	return value, true
 }
 
+@(require_results)
 frontmatter_block :: proc(text, marker: string, next_line, line_number: int, allocator: mem.Allocator) -> (Frontmatter_Value, Load_Error) {
 	// The block's text is assembled in temp memory and cloned into the allocator the value
 	// is returned in.
@@ -348,6 +358,7 @@ frontmatter_block :: proc(text, marker: string, next_line, line_number: int, all
 	return Frontmatter_Value{text = cloned, next_line = at}, {}
 }
 
+@(require_results)
 description_normalize :: proc(text: string, allocator: mem.Allocator) -> (string, Load_Error) {
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return "", error_make(.Allocation, allocator = allocator) }

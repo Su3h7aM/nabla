@@ -8,6 +8,7 @@ import "core:strings"
 import "core:unicode/utf8"
 
 // load reads a skill body and verifies it against its catalog metadata.
+@(require_results)
 load :: proc(skill: Skill, root: Root, allocator := context.allocator) -> (Loaded, Load_Error) {
 	if skill.root_index < 0 { return {}, error_make(.Outside_Authority, detail = "skill has no source root", allocator = allocator) }
 	if root.source == .Local && !path_within(skill.directory, root.authority) {
@@ -60,12 +61,14 @@ load :: proc(skill: Skill, root: Root, allocator := context.allocator) -> (Loade
 
 // path_within reports whether path is authority itself or a directory inside it. An empty
 // authority holds nothing, and a prefix that stops inside a name does not count.
+@(require_results)
 path_within :: proc(path, authority: string) -> bool {
 	if authority == "" || path == authority { return path == authority }
 	if !strings.has_prefix(path, authority) { return false }
 	return len(path) > len(authority) && path[len(authority)] == filepath.SEPARATOR
 }
 
+@(require_results)
 skill_body_valid :: proc(body: string) -> bool {
 	has_content := false
 	for index := 0; index < len(body); {
@@ -90,6 +93,7 @@ content_digest :: proc(content: string) -> [32]u8 {
 	return digest
 }
 
+@(require_results)
 find :: proc(skills: []Skill, name: string) -> (int, bool) {
 	low, high := 0, len(skills)
 	for low < high {
