@@ -176,6 +176,38 @@ test_a_blocking_subagent_answers_the_call_that_started_it :: proc(test: ^testing
 	testing.expect(test, strings.contains(agent_provider_request(&provider, 2), "agent_spawn"), "nested Lua receives feedback without spawning")
 	testing.expect(test, strings.contains(agent_provider_request(&provider, 3), "forty-two"), "the orchestrator reads the answer")
 	testing.expect(test, !agent_team_running(chat.team), "the finished subagent is released")
+
+	// The delegation is in the orchestrator's journal: every start is closed by a
+	// completion naming the same child, and the child's session is the one it named.
+	records, _, read_error := journal.read_records(
+		chat.store,
+		journal.Filter{session = chat.session, kinds = {.Subagent_Started, .Subagent_Completed}},
+		0,
+		0,
+		context.temp_allocator,
+	)
+	if read_error != nil { testing.fail_now(test, "the delegation records could not be read") }
+	answered: journal.Session_Id
+	for record in records {
+		if record.kind != .Subagent_Started { continue }
+		completions := 0
+		for other in records {
+			if other.kind != .Subagent_Completed || other.subagent != record.subagent { continue }
+			completions += 1
+			testing.expect_value(test, other.call, record.call)
+			completion: journal.Subagent_Completed
+			if journal.payload_decode(other.data, &completion, context.temp_allocator) != nil { testing.fail_now(test, "a completion could not be read") }
+			if completion.outcome == journal.TOOL_OUTCOME_NAMES[.Success] {
+				testing.expect_value(test, string(other.body), "forty-two")
+				answered = record.subagent
+			}
+		}
+		testing.expect_value(test, completions, 1)
+	}
+	children, children_error := journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
+	if children_error != nil { testing.fail_now(test, "the child sessions could not be listed") }
+	if !testing.expect_value(test, len(children), 1) { return }
+	testing.expect(test, answered != {} && children[0].id == answered, "the child's session is the one its start named")
 }
 
 // A background subagent works while its orchestrator continues. Its answer reaches the

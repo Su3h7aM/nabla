@@ -128,8 +128,9 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	args := arguments.(Agent_Spawn_Args)
 	if ctx.member != nil { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }
 	if ctx.agents == nil { return tool_result_failure(ctx, .Unavailable, "subagents are not available in this session", "unavailable") }
-	member, problem := subagent_start(ctx.agents, args, ctx.call, ctx.allocator)
+	member, problem := subagent_start(ctx.agents, args, ctx.call, ctx.subagent, ctx.allocator)
 	if member == nil { return tool_result_failure(ctx, .Invalid_Arguments, problem, "not started") }
+	ctx.subagent_started = true
 
 	output := Agent_Output {
 		agent  = member.name,

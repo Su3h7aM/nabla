@@ -56,41 +56,46 @@ tool_wake_close :: proc(wake: ^Tool_Wake) {
 // Tool_Context is what one execution is given besides its arguments. Every
 // string is borrowed and lives for the call.
 Tool_Context :: struct {
-	call_id:        string,
-	workspace:      string,
-	control:        Tool_Control,
+	call_id:          string,
+	workspace:        string,
+	control:          Tool_Control,
 	// arguments_json is the admitted argument text this call runs with, exactly as
 	// the dispatch record holds it. A tool that reads fields uses arguments; an
 	// executor that forwards the call elsewhere sends this, so the record and the
 	// remote peer see the same bytes rather than two encodings of one value.
-	arguments_json: string,
+	arguments_json:   string,
 	// output_base is where a tool may keep output too large to hold in memory, as
 	// output_base plus a suffix; "" when there is nowhere to keep it.
-	output_base:    string,
+	output_base:      string,
 	// timeout is the definition's default, copied here so a shared executor reads the
 	// value of the definition it runs for.
-	timeout:        time.Duration,
-	allocator:      mem.Allocator,
-	skills:         ^skills.Catalog,
+	timeout:          time.Duration,
+	allocator:        mem.Allocator,
+	skills:           ^skills.Catalog,
 	// backend is the borrowed binding the definition was registered with, copied
 	// here by dispatch. It is nil for native tools. Only the execute procedure
 	// paired with the definition may interpret it; it must never be freed
 	// through this struct. The registry owner keeps it alive until no registry
 	// or in-flight turn can use it.
-	backend:        rawptr,
+	backend:          rawptr,
 	// compact is the session's compaction control, available only to native tools
 	// that ask for a context change. It is borrowed and lives as long as the
 	// session. call is the id of the call being run, which is how such a tool names
 	// the boundary it was called at.
-	compact:        ^Compact_Control,
-	call:           journal.Call_Id,
+	compact:          ^Compact_Control,
+	call:             journal.Call_Id,
 	// repairs collects what reading the arguments changed in their values, which the owner
 	// records with the call and writes back into the arguments the call runs with.
-	repairs:        Tool_Repairs,
+	repairs:          Tool_Repairs,
 	// agents is the calling orchestrator's team and member the calling subagent's own record,
 	// set only for the agent tools; the other is nil. Both outlive the call.
-	agents:         ^Agent_Team,
-	member:         ^Subagent,
+	agents:           ^Agent_Team,
+	member:           ^Subagent,
+	// subagent is the child session an agent_spawn call starts, chosen and recorded by the
+	// owner at dispatch. The worker sets subagent_started once a child exists; the owner
+	// reads it after the result is published.
+	subagent:         journal.Session_Id,
+	subagent_started: bool,
 }
 
 // Tool_Execute runs one admitted call. Returning .Invalid_Arguments promises the

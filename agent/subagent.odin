@@ -44,6 +44,7 @@ Subagent :: struct {
 	store_directory:              string,
 	parent_session:               journal.Session_Id,
 	parent_call:                  journal.Call_Id, // the orchestrator's call that started it
+	session:                      journal.Session_Id, // the child session, named when the start was recorded
 	parent_session_hex:           [journal.SESSION_ID_HEX_LENGTH]u8, // read through chat_parent_session
 	run:                          journal.Run_Id, // the run the subagent's own journal writes under
 	disable_project_instructions: bool,
@@ -153,8 +154,9 @@ agent_team_note_parent :: proc(chat: ^Chat_Session) {
 	}
 }
 
-// agent_team_reap releases every subagent that is done. Owner only.
-agent_team_reap :: proc(team: ^Agent_Team) {
+// agent_team_reap releases every subagent that is done and, given the orchestrator's
+// session, commits each one's subagent.completed there first. Owner only.
+agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) {
 	if team == nil { return }
 	finished: [dynamic]^Subagent
 	finished.allocator = context.temp_allocator
@@ -169,10 +171,37 @@ agent_team_reap :: proc(team: ^Agent_Team) {
 		ordered_remove(&team.members, index)
 	}
 	sync.mutex_unlock(&team.mutex)
+	if chat != nil && chat.store != nil && len(finished) > 0 {
+		for member in finished { subagent_record_completion(chat, member) }
+		_ = chat_commit(chat, "a subagent's outcome could not be recorded")
+	}
 	for member in finished {
 		if member.thread != nil { thread.destroy(member.thread) }
 		subagent_destroy(member)
 	}
+}
+
+// subagent_record_completion buffers the subagent.completed that closes a member's
+// delegation, with its final answer in the body when it completed.
+@(private)
+subagent_record_completion :: proc(chat: ^Chat_Session, member: ^Subagent) {
+	if member.session == {} { return }
+	outcome := journal.Tool_Outcome.Tool_Failed
+	detail, body := member.answer, ""
+	switch member.status {
+	case .Completed:
+		outcome = .Success
+		detail, body = "", member.answer
+	case .Stopped:
+		outcome = .Cancelled
+	case .Failed, .Running:
+	}
+	chat_record(
+		chat,
+		{kind = .Subagent_Completed, call = member.parent_call, subagent = member.session},
+		journal.Subagent_Completed{outcome = journal.TOOL_OUTCOME_NAMES[outcome], detail = detail},
+		transmute([]u8)body,
+	)
 }
 
 // agent_team_destroy stops every subagent, waits for them within the stop patience, and
@@ -188,7 +217,8 @@ agent_team_destroy :: proc(team: ^Agent_Team, retain := false) -> bool {
 	deadline := time.tick_add(time.tick_now(), TOOL_JOBS_STOP_PATIENCE)
 	for {
 		seen := owner_wake_seen()
-		agent_team_reap(team)
+		// Teardown commits nothing more; recovery closes what this leaves open.
+		agent_team_reap(team, nil)
 		if !agent_team_running(team) { break }
 		if time.tick_diff(time.tick_now(), deadline) <= 0 {
 			log_emit({level = .Error, category = .Agent, event = "subagent.abandoned"})
@@ -236,7 +266,16 @@ subagent_destroy :: proc(member: ^Subagent) {
 // subagent_start defines one subagent from a start call and adds it to the team. It resolves
 // the model, the orchestrator's by default, and the effort, one level below the orchestrator's
 // by default. problem, temp-allocated, says why nothing started. Worker thread.
-subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, call: journal.Call_Id, allocator: mem.Allocator) -> (member: ^Subagent, problem: string) {
+subagent_start :: proc(
+	team: ^Agent_Team,
+	args: Agent_Spawn_Args,
+	call: journal.Call_Id,
+	session: journal.Session_Id,
+	allocator: mem.Allocator,
+) -> (
+	member: ^Subagent,
+	problem: string,
+) {
 	sync.mutex_lock(&team.mutex)
 	if team.closing { sync.mutex_unlock(&team.mutex); return nil, "the orchestrator is closing; nothing started" }
 	team.starting += 1
@@ -295,6 +334,7 @@ subagent_start :: proc(team: ^Agent_Team, args: Agent_Spawn_Args, call: journal.
 		store_directory              = strings.clone(parent.store_directory, allocator),
 		parent_session               = parent.session,
 		parent_call                  = call,
+		session                      = session,
 		run                          = parent.run,
 		disable_project_instructions = parent.disable_project_instructions,
 		background                   = args.background,
@@ -474,7 +514,13 @@ subagent_run :: proc(member: ^Subagent) {
 
 	session_id, create_error := journal.create_session(
 		&store,
-		journal.New_Session{workspace = member.workspace, role = .Subagent, parent_session = member.parent_session, parent_call = member.parent_call},
+		journal.New_Session {
+			id = member.session,
+			workspace = member.workspace,
+			role = .Subagent,
+			parent_session = member.parent_session,
+			parent_call = member.parent_call,
+		},
 	)
 	if create_error != nil {
 		subagent_fail(
@@ -630,7 +676,7 @@ chat_parent_session :: proc(chat: ^Chat_Session) -> string {
 // It releases finished subagents first. Owner only.
 chat_agents_pending :: proc(chat: ^Chat_Session) -> bool {
 	if chat.team == nil { return false }
-	agent_team_reap(chat.team)
+	agent_team_reap(chat.team, chat)
 	return steer_pending(&chat.team.inbox) || agent_team_running(chat.team)
 }
 

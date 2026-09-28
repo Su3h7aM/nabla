@@ -236,13 +236,13 @@ Request_Sent :: struct {
 	body_bytes:      int,
 }
 
-// Subagent_Started opens a delegation in the parent's session, committed before
-// the child starts. The record's call is the parent's call, and its subagent
-// column the child's session id, chosen here so the child creates that session.
+// Subagent_Started opens a delegation in the parent's session, committed with the
+// call's dispatch before the child starts. The record's call is the parent's call,
+// and its subagent column the child's session id, chosen here so the child creates
+// that session. The fields are what the call asked for, "" where it inherits;
 // program names the ACP agent, "" for a native child.
 Subagent_Started :: struct {
 	version:    int,
-	name:       string,
 	program:    string,
 	provider:   string,
 	model:      string,

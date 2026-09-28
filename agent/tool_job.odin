@@ -738,6 +738,22 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		journal.Tool_Admitted{tool = job.name, repairs = repair_names[:repair_count]},
 		transmute([]u8)job.admitted.effective,
 	)
+	if spawn, is_spawn := job.arguments.(Agent_Spawn_Args); is_spawn && job.exec.agents != nil && job.exec.member == nil {
+		// The delegation is named before its child exists, so the child's session is
+		// traceable to this call whatever happens next.
+		job.exec.subagent = journal.session_id_create()
+		chat_record(
+			chat,
+			{kind = .Subagent_Started, node = node, request = chat.request, call = job.call.call, parent_call = parent_call, subagent = job.exec.subagent},
+			journal.Subagent_Started {
+				program = spawn.acp_agent,
+				provider = spawn.provider,
+				model = spawn.model,
+				effort = spawn.effort,
+				background = spawn.background,
+			},
+		)
+	}
 	if !chat_commit(chat, "the tool dispatch could not be recorded") {
 		tool_jobs_latch_stop(jobs, chat)
 		return
@@ -864,6 +880,14 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	// file. The decision is stored, so a request built later sends the same bytes.
 	if !job.nested { tool_result_keep(&result, &jobs.budget, chat_tool_output_path(chat, job.call.call)) }
 	node, parent_call := tool_job_record_placement(chat, job)
+	if job.exec.subagent != {} && !job.exec.subagent_started {
+		chat_record(
+			chat,
+			{kind = .Subagent_Completed, node = node, request = chat.request, call = job.call.call, parent_call = parent_call, subagent = job.exec.subagent},
+			journal.Subagent_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Not_Executed], detail = "no subagent started"},
+			transmute([]u8)result.content,
+		)
+	}
 	if !chat_record_tool_result(chat, job.call.call, node, parent_call, &result) {
 		// The result cannot be recorded, so it must not be reported as if it were.
 		tool_result_destroy(&result)

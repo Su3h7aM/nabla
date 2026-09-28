@@ -629,7 +629,7 @@ test_delegation_messages_are_delivered_once :: proc(test: ^testing.T) {
 	append_record(
 		&parent_journal,
 		Record{session = parent, call = call, subagent = child, kind = .Subagent_Started},
-		Subagent_Started{name = "agent-1", model = "gpt-5", effort = "low"},
+		Subagent_Started{model = "gpt-5", effort = "low"},
 	)
 	_commit_ok(test, &parent_journal)
 	testing.expect_value(

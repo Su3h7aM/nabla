@@ -14,7 +14,7 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 	defer _remove_directory(directory)
 
 	// A turn that sent one request and proposed two calls, one of them
-	// admitted, plus a Lua execution that started.
+	// admitted, plus a Lua execution and a subagent that started.
 	writer: Journal
 	_open_journal(test, &writer, directory)
 	session := _create_session(test, &writer, {workspace = "/tmp/project", role = .Main})
@@ -25,6 +25,8 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 	append_record(&writer, Record{session = session, turn = 1, node = assistant, call = 2, kind = .Tool_Proposed}, _Test_Payload{detail = "second call"})
 	append_record(&writer, Record{session = session, turn = 1, node = assistant, call = 2, kind = .Tool_Admitted}, _Test_Payload{detail = "admitted"})
 	append_record(&writer, Record{session = session, turn = 1, call = 3, kind = .Lua_Started}, _Test_Payload{detail = "script"})
+	child := session_id_create()
+	append_record(&writer, Record{session = session, turn = 1, call = 4, subagent = child, kind = .Subagent_Started}, Subagent_Started{})
 	_commit_ok(test, &writer)
 	_expect_ok(test, close(&writer))
 
@@ -37,7 +39,7 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 	_expect_ok(test, claim_error)
 	testing.expect_value(test, counters.turn, Turn_Id(1))
 	testing.expect_value(test, counters.request, Request_Id(1))
-	testing.expect_value(test, counters.call, Call_Id(3))
+	testing.expect_value(test, counters.call, Call_Id(4))
 	testing.expect_value(test, counters.node, assistant)
 	testing.expect_value(test, counters.branch, Branch_Id(INITIAL_BRANCH))
 
@@ -45,7 +47,7 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 	_expect_ok(test, recover_error)
 	testing.expect_value(test, recovery.turns, 1)
 	testing.expect_value(test, recovery.requests, 1)
-	testing.expect_value(test, recovery.calls, 3)
+	testing.expect_value(test, recovery.calls, 4)
 	testing.expect_value(test, recovery.results, 1)
 	testing.expect_value(test, journal.counters.node, assistant + 1) // the Results node
 
@@ -97,12 +99,19 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 			_decode_payload(test, record.data, &payload)
 			testing.expect_value(test, payload.outcome, TOOL_OUTCOME_NAMES[.Unknown])
 			testing.expect_value(test, record.call, Call_Id(3))
+		case .Subagent_Completed:
+			completed_effects += 1
+			payload: Subagent_Completed
+			_decode_payload(test, record.data, &payload)
+			testing.expect_value(test, payload.outcome, TOOL_OUTCOME_NAMES[.Unknown])
+			testing.expect_value(test, record.call, Call_Id(4))
+			testing.expect_value(test, record.subagent, child)
 		case .Session_Recovered:
 			recovered_records += 1
 			payload: Session_Recovered
 			_decode_payload(test, record.data, &payload)
 			testing.expect_value(test, payload.turns, 1)
-			testing.expect_value(test, payload.calls, 3)
+			testing.expect_value(test, payload.calls, 4)
 			testing.expect_value(test, payload.results, 1)
 		case:
 		}
@@ -110,7 +119,7 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 	testing.expect_value(test, completed_turns, 1)
 	testing.expect_value(test, interrupted_requests, 1)
 	testing.expect_value(test, completed_tools, 2)
-	testing.expect_value(test, completed_effects, 1)
+	testing.expect_value(test, completed_effects, 2)
 	testing.expect_value(test, recovered_records, 1)
 
 	// The calls the assistant node proposed have a Results node that answers

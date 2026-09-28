@@ -55,6 +55,7 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Err
 		header.job = Job_Id(row_int(&row))
 		header.call = Call_Id(row_int(&row))
 		header.parent_call = Call_Id(row_int(&row))
+		header.subagent = Session_Id(row_id(&row))
 		if row.error != nil || rule > max(Recovery_Rule) { return corrupt(journal, Journal_Error.Corrupt, journal.claimed, 0) }
 
 		unknown := Call_Completed {
@@ -144,7 +145,7 @@ recover_results :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error
 // Each rule finds work whose closing record is missing, so a second recovery
 // finds nothing.
 @(private)
-RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, job, call, parent_call FROM (
+RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, job, call, parent_call, subagent FROM (
 	SELECT 0 AS rule, * FROM records AS open WHERE session = ?1 AND kind = 'turn.started'
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND turn = open.turn AND kind = 'turn.completed')
 	UNION ALL
