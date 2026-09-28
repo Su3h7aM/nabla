@@ -29,9 +29,6 @@ import "nabla:http/client"
 // version prefix: a base_url of ".../v1" lists ".../v1/models".
 PROVIDER_MODELS_SUFFIX :: "models"
 PROVIDER_MODELS_TIMEOUT :: 10 * time.Second
-// The bound is a ceiling so a broken or hostile response cannot exhaust memory,
-// not an expectation: a listing is small.
-PROVIDER_MODELS_MAX_BYTES :: 4 * 1024 * 1024
 PROVIDER_MODELS_FRESH :: 5 * time.Minute
 PROVIDER_MODELS_CACHE_PREFIX :: "provider-models"
 
@@ -167,7 +164,7 @@ provider_models_cache_fresh :: proc(path: string, now: time.Time) -> bool {
 
 provider_models_cache_read :: proc(path: string, allocator: mem.Allocator) -> ([]u8, bool) {
 	body, read_err := os.read_entire_file(path, allocator)
-	if read_err == nil && len(body) > 0 && len(body) <= PROVIDER_MODELS_MAX_BYTES { return body, true }
+	if read_err == nil && len(body) > 0 { return body, true }
 	if body != nil { delete(body, allocator) }
 	return nil, false
 }
@@ -247,7 +244,6 @@ provider_models_fetch :: proc(user_data: rawptr, base_url, api_key: string, allo
 
 	body: Fetch_Body
 	body.bytes.allocator = allocator
-	body.limit = PROVIDER_MODELS_MAX_BYTES
 	headers := [1]client.Header{{"authorization", authorization}}
 
 	control := Fetch_Control {

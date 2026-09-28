@@ -31,10 +31,6 @@ MODELS_DEV_CACHE_FILE :: "models-dev-api.json"
 MODELS_DEV_FRESH :: 24 * time.Hour
 MODELS_DEV_TIMEOUT :: 60 * time.Second
 
-// The published catalog is a few megabytes. The bound is a ceiling so a broken
-// or hostile response cannot exhaust memory, not an expectation.
-MODELS_DEV_MAX_BYTES :: 32 * 1024 * 1024
-
 Models_Dev_Error :: enum {
 	None,
 	// The cache directory could not be resolved or created, so the specification
@@ -233,11 +229,11 @@ models_dev_cache_fresh :: proc(path: string, now: time.Time) -> bool {
 	return age >= 0 && age < MODELS_DEV_FRESH
 }
 
-// models_dev_cache_read returns a cached catalog when one is present and within
-// the size bound. The result is owned by the caller.
+// models_dev_cache_read returns a cached catalog when one is present and not
+// empty. The result is owned by the caller.
 models_dev_cache_read :: proc(path: string, allocator: mem.Allocator) -> ([]u8, bool) {
 	body, read_err := os.read_entire_file(path, allocator)
-	if read_err == nil && len(body) > 0 && len(body) <= MODELS_DEV_MAX_BYTES { return body, true }
+	if read_err == nil && len(body) > 0 { return body, true }
 	if body != nil { delete(body, allocator) }
 	return nil, false
 }
@@ -263,7 +259,6 @@ models_dev_cache_write :: proc(path: string, body: []u8) -> bool {
 models_dev_fetch :: proc(user_data: rawptr, allocator: mem.Allocator) -> ([]u8, bool) {
 	body: Fetch_Body
 	body.bytes.allocator = allocator
-	body.limit = MODELS_DEV_MAX_BYTES
 
 	control := Fetch_Control {
 		deadline = ai.deadline_in(MODELS_DEV_TIMEOUT),

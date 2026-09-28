@@ -299,6 +299,16 @@ test_models_dev_cache_read_refuses_missing_and_empty_files :: proc(t: ^testing.T
 	testing.expect(t, os.write_entire_file(path, transmute([]u8)string("")) == nil)
 	_, empty_ok := models_dev_cache_read(path, context.temp_allocator)
 	testing.expect(t, !empty_ok)
+
+	// A catalog larger than any harness bound is still a catalog: its size is
+	// upstream's to choose, so this read refuses only absence and emptiness.
+	large := make([]u8, 33 * mem.Megabyte)
+	defer delete(large)
+	testing.expect(t, os.write_entire_file(path, large) == nil)
+	big, big_ok := models_dev_cache_read(path, context.temp_allocator)
+	testing.expect(t, big_ok)
+	testing.expect_value(t, len(big), len(large))
+	delete(big, context.temp_allocator)
 }
 
 @(test)

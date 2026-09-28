@@ -7,26 +7,20 @@ import "nabla:http/client"
 
 // Shared plumbing for the two stages that read a body over the network: the
 // provider's own model listing and the models.dev catalog. Both accumulate a
-// bounded response under a deadline, so that policy lives here once; the stages
-// differ only in URL, credentials, and what they do with the bytes.
+// response under a deadline, so that policy lives here once; the stages differ
+// only in URL, credentials, and what they do with the bytes.
 
-// Fetch_Body accumulates a response body and remembers whether the size bound was
-// exceeded, which is what turns an oversized response into a failure rather than
-// a short body.
+// Fetch_Body accumulates a response body and remembers whether it could be held,
+// which is what turns an allocation that failed into a failure rather than a
+// short body. It states no size bound: every response is read whole.
 Fetch_Body :: struct {
-	bytes:    [dynamic]u8,
-	overflow: bool,
-	failed:   bool,
-	limit:    int,
+	bytes:  [dynamic]u8,
+	failed: bool,
 }
 
 fetch_collect :: proc(user_data: rawptr, chunk: []u8) {
 	body := cast(^Fetch_Body)user_data
 	if body.failed { return }
-	if len(body.bytes) + len(chunk) > body.limit {
-		body.overflow = true
-		return
-	}
 	written := append(&body.bytes, ..chunk)
 	if written != len(chunk) { body.failed = true }
 }
@@ -37,7 +31,7 @@ fetch_collect :: proc(user_data: rawptr, chunk: []u8) {
 // allocation could not be freed correctly.
 fetch_body_finish :: proc(body: ^Fetch_Body, allocator: mem.Allocator) -> ([]u8, bool) {
 	defer delete(body.bytes)
-	if body.failed || body.overflow || len(body.bytes) == 0 { return nil, false }
+	if body.failed || len(body.bytes) == 0 { return nil, false }
 	result, alloc_err := make([]u8, len(body.bytes), allocator)
 	if alloc_err != nil { return nil, false }
 	copy(result, body.bytes[:])

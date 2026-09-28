@@ -1,8 +1,10 @@
 #+test
 package agent
 
+import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strings"
 import "core:testing"
 
 // The listing shape this harness reads: an object whose "data" member is an array
@@ -164,5 +166,31 @@ test_provider_discovery_replaces_an_invalid_fresh_cache :: proc(t: ^testing.T) {
 		defer catalog_sources_destroy(&refreshed)
 		testing.expect_value(t, stub.calls, 1)
 		testing.expect_value(t, refreshed[0].models[0].id, "proxy/one")
+	})
+}
+
+// A listing is read whole whatever its size: the size of a provider's own listing
+// is the provider's to choose, so a large one is neither refused nor truncated. The
+// cached copy serves it without a request, which is the path a size bound would
+// have turned into an empty catalog.
+@(test)
+test_provider_discovery_reads_a_listing_of_any_size :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	models_dev_state_test(t, "provider-models-large", proc(t: ^testing.T, _: string) {
+		providers := []Catalog_Provider_Source{discovery_source("proxy", "http://proxy.test/v1", "literal-key")}
+		path, path_ok := provider_models_cache_path(providers[0], context.temp_allocator)
+		testing.expect(t, path_ok)
+
+		id := strings.repeat("m", 5 * mem.Megabyte, context.temp_allocator)
+		quoted := fmt.aprintf("%q", id, allocator = context.temp_allocator)
+		body := strings.concatenate([]string{`{"data":[{"id":`, quoted, `}]}`}, context.temp_allocator)
+		testing.expect(t, os.write_entire_file(path, transmute([]u8)body) == nil)
+
+		stub := Discovery_Stub{}
+		refreshed := provider_models_refresh(providers, discovery_stub_fetch, &stub, context.allocator)
+		defer catalog_sources_destroy(&refreshed)
+		testing.expect_value(t, stub.calls, 0)
+		testing.expect_value(t, len(refreshed), 1)
+		testing.expect_value(t, len(refreshed[0].models[0].id), len(id))
 	})
 }
