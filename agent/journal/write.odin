@@ -154,6 +154,9 @@ next_call :: proc(journal: ^Journal) -> Call_Id {
 
 // commit writes every pending item in one immediate transaction and returns the
 // last seq written. A failure rolls back and latches: the journal stops writing.
+// The exception is another writer holding the database past the busy timeout:
+// nothing was written, so the items stay pending for the next commit and nothing
+// latches (error_is_busy tells it apart).
 @(require_results)
 commit :: proc(journal: ^Journal) -> (Journal_Seq, Error) {
 	assert(journal.open && !journal.read_only, "commit needs a writable journal")
@@ -161,6 +164,7 @@ commit :: proc(journal: ^Journal) -> (Journal_Seq, Error) {
 	if len(journal.pending) == 0 { return journal.last_seq, nil }
 
 	last, error := write_pending(journal)
+	if error_is_busy(error) { return journal.last_seq, error }
 	clear(&journal.pending)
 	virtual.arena_free_all(&journal.batch)
 	if error != nil {

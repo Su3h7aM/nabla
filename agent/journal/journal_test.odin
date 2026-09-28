@@ -10,6 +10,36 @@ import "core:time"
 import "nabla:db"
 import "nabla:db/sqlite"
 
+// Another writer holding the database is not a storage failure: the commit reports
+// it, keeps its records pending, and the next commit writes them.
+@(test)
+test_a_busy_commit_keeps_its_records_for_the_next_one :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	holder, writer: Journal
+	_open_journal(test, &holder, directory)
+	defer _close_journal(test, &holder)
+	_open_journal(test, &writer, directory)
+	defer _close_journal(test, &writer)
+	session := _create_session(test, &writer, {workspace = "/tmp/project", role = .Main})
+	_commit_ok(test, &writer)
+	// The writer gives up at once instead of waiting out the busy timeout.
+	_expect_db_ok(test, db.exec(&writer.connection, "PRAGMA busy_timeout = 0"))
+
+	_expect_db_ok(test, db.exec(&holder.connection, "BEGIN IMMEDIATE"))
+	append_record(&writer, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
+	_, busy_error := commit(&writer)
+	testing.expect(test, error_is_busy(busy_error), "the commit reports the other writer")
+	testing.expect(test, writer.failure == nil, "a busy database latches nothing")
+	_expect_db_ok(test, db.rollback(&holder.connection))
+
+	_commit_ok(test, &writer)
+	records := _records_of_session(test, &writer, session)
+	defer records_destroy(records, context.allocator)
+	testing.expect(test, _record_seq_of_kind(records, .Turn_Started) != 0, "the pending record was written by the next commit")
+}
+
 @(test)
 test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 	directory := _temp_directory(test)

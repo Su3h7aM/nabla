@@ -40,6 +40,13 @@ error_is :: proc(error: Error, kind: Journal_Error) -> bool {
 	return is_own && own == kind
 }
 
+// error_is_busy reports whether error is another writer holding the database
+// longer than the busy timeout, which a later attempt may get past.
+error_is_busy :: proc(error: Error) -> bool {
+	database, is_database := error.(db.Error)
+	return is_database && db.error_kind(database) == .Busy
+}
+
 JOURNAL_ERROR_TEXT := [Journal_Error]string {
 	.None           = "no error",
 	.Claimed        = "another process holds the session",
