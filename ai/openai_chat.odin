@@ -5,6 +5,7 @@ import "core:strings"
 
 // openai_chat_encode_request writes one Chat Completions request body, with a cache reusing
 // the bytes it already holds for the texts this request carries again.
+@(require_results)
 openai_chat_encode_request :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -194,6 +195,7 @@ openai_chat_calls_open :: proc(state: ^Provider_Stream_State) -> bool {
 // A single Chat payload can carry text, usage, and a finish reason. Decode the
 // whole object first, then stage events in that order so a malformed trailing
 // field never exposes a partial batch.
+@(require_results)
 openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil || state^.API != .OpenAI_Chat_Completions { return .Invalid_State }
 	if payload == "[DONE]" {

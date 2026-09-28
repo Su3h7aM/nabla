@@ -49,6 +49,7 @@ HTTP_Response_Facts :: struct {
 // interrupt and deadline policy handed to the transport as a wait hook, and the facts the
 // caller needs reported. Those facts are reported whatever the observer does, so a recovery
 // decision never depends on diagnostics being enabled.
+@(require_results)
 http_post_sse :: proc(
 	request: HTTP_Request,
 	control: HTTP_Control,

@@ -4,6 +4,7 @@ import "core:encoding/json"
 import "core:mem"
 import "core:strings"
 
+@(require_results)
 openai_responses_encode_request :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -18,6 +19,7 @@ openai_responses_encode_request :: proc(
 // The WebSocket request carries the same Responses fields under a response.create
 // event. Streaming is inherent to the connection, so its HTTP-only stream field is
 // not sent.
+@(require_results)
 openai_responses_encode_websocket_request :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -33,6 +35,7 @@ openai_responses_encode_websocket_request :: proc(
 // reusing the bytes it already holds for the texts this request carries again. What that
 // saves is largest here, because every record the endpoint sent is written back unchanged
 // on every request that follows it.
+@(require_results)
 openai_responses_encode_request_body :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -267,7 +270,7 @@ openai_responses_encode_request_body :: proc(
 //
 // A record does not change once it is stored, so reading it is work that happens once per
 // record rather than once per request.
-@(private = "package")
+@(private = "package", require_results)
 openai_responses_record_write :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, first: ^bool, record: string, allocator := context.allocator) -> bool {
 	slot, hit := encode_slot_for(cursor, record, .Record)
 	if cursor.error != .None { return false }
@@ -316,7 +319,7 @@ openai_responses_items_write :: proc(cursor: ^Encode_Cursor, body: ^strings.Buil
 // written with sorted keys like the rest of the body. It reports false when the record is
 // not an array of items the input schema takes back, which is what makes the request that
 // carries it unsendable.
-@(private = "package")
+@(private = "package", require_results)
 openai_responses_record_bytes :: proc(record: string, out: ^strings.Builder, allocator: mem.Allocator) -> (bool, Provider_Request_Error) {
 	items, parse_err := json.parse_string(record, .JSON, true, allocator)
 	if parse_err != nil { return false, .Invalid_Message }
@@ -358,6 +361,7 @@ openai_responses_record_bytes :: proc(record: string, out: ^strings.Builder, all
 	return true, .None
 }
 
+@(require_results)
 openai_responses_parse_usage :: proc(object: json.Object) -> (Provider_Usage_Event, bool) {
 	usage := Provider_Usage_Event{}
 	ok := true
@@ -392,6 +396,7 @@ openai_responses_incomplete_reason :: proc(reason: string) -> Provider_Finish_Re
 // projection for that response rather than sending an empty native record. ok is
 // false when a present value could not be written, which is a local failure: the
 // caller reports the allocation it is. The caller owns the result on success.
+@(require_results)
 openai_responses_clone_output :: proc(response: json.Object, allocator := context.allocator) -> (cloned: string, ok: bool) {
 	raw_output_value, output_present := response["output"]
 	if !output_present { return "", true }
@@ -413,6 +418,7 @@ openai_responses_clone_output :: proc(response: json.Object, allocator := contex
 // a request cannot carry half a response, and an endpoint that receives one refuses every
 // request built from the same history after it. The returned calls are owned by allocator
 // and released with Provider_Tool_Calls_Destroy.
+@(require_results)
 Provider_Replay_Read :: proc(output: string, allocator := context.allocator) -> (calls: []Provider_Tool_Call, ok: bool) {
 	value, parse_err := json.parse_string(output, .JSON, true, allocator)
 	if parse_err != nil { return nil, false }
@@ -453,6 +459,7 @@ Provider_Replay_Read :: proc(output: string, allocator := context.allocator) -> 
 // the schema could not take back is refused here rather than by the endpoint, which would
 // refuse every request that carried it. An item type this adapter does not model replays
 // as it stands.
+@(require_results)
 openai_responses_replay_item_ok :: proc(object: json.Object, allocator: mem.Allocator) -> bool {
 	item_type, type_present, type_ok := openai_value_string(object, "type")
 	if !type_ok || !type_present || item_type == "" { return false }
@@ -486,6 +493,7 @@ openai_responses_replay_item_ok :: proc(object: json.Object, allocator: mem.Allo
 	return true
 }
 
+@(require_results)
 provider_tool_fragment_by_item :: proc(object: json.Object, state: ^Provider_Stream_State) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
 	id, present, ok := openai_value_string(object, "item_id")
 	if !ok || !present || id == "" {
@@ -504,6 +512,7 @@ provider_tool_fragment_by_item :: proc(object: json.Object, state: ^Provider_Str
 	return fragment, .None
 }
 
+@(require_results)
 openai_responses_call_slot :: proc(object, item: json.Object, state: ^Provider_Stream_State) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
 	if id, present, ok := openai_value_string(item, "id"); ok && present && id != "" {
 		for &fragment in state.Tool_Fragments {
@@ -523,6 +532,7 @@ openai_responses_call_slot :: proc(object, item: json.Object, state: ^Provider_S
 	return provider_tool_fragment_append(state)
 }
 
+@(require_results)
 openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream_State, done: bool) -> Provider_Stream_Error {
 	raw, item_present := object["item"]
 	item: json.Object
@@ -611,6 +621,7 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 	return .None
 }
 
+@(require_results)
 openai_responses_terminal :: proc(event_type: string, object: json.Object, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	raw, response_present := object["response"]
 	if !response_present { return provider_stream_fail(state, .Invalid_Data, "response event has no response") }
@@ -711,6 +722,7 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 	return provider_stream_fail(state, .Invalid_Data, "unknown terminal response event")
 }
 
+@(require_results)
 openai_responses_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil || state^.API != .OpenAI_Responses { return .Invalid_State }
 	if payload != "[DONE]" { return openai_responses_consume_event(payload, state) }
@@ -726,6 +738,7 @@ openai_responses_consume_sse_data :: proc(payload: string, state: ^Provider_Stre
 	return .Invalid_State
 }
 
+@(require_results)
 openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil || state^.API != .OpenAI_Responses { return .Invalid_State }
 	if state^.Phase == .Done || state^.Phase == .Failed {

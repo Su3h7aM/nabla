@@ -88,7 +88,7 @@ Encode_Cursor :: struct {
 	temporary: strings.Builder,
 }
 
-@(private = "package")
+@(private = "package", require_results)
 encode_cursor :: proc(cache: ^Provider_Encode_Cache, allocator := context.allocator) -> Encode_Cursor {
 	// The allocator a cache is first filled with becomes its own: everything it holds
 	// answers with it for the rest of the session, so a later encode that is handed a
@@ -147,7 +147,7 @@ encode_slot_for :: proc(cursor: ^Encode_Cursor, text: string, kind: Encode_Text_
 // encode_slot_store records the text a slot's bytes were written for. The bytes it
 // holds now answer for that text from here on. A failed text clone invalidates the
 // bytes and prevents a later request from treating a partial slot as a cache hit.
-@(private = "package")
+@(private = "package", require_results)
 encode_slot_store :: proc(cursor: ^Encode_Cursor, slot: ^Encode_Slot, text: string) -> bool {
 	owned, clone_error := strings.clone(text, cursor.cache.allocator)
 	if clone_error != nil {
@@ -177,7 +177,7 @@ encode_finish :: proc(cursor: ^Encode_Cursor) {
 // cache the buffer is the cache's, and it holds the request before this one: the bytes that
 // request was sent as stop being valid here. Without a cache the cursor holds a temporary
 // buffer for this encode alone, which encode_body_take hands to the caller.
-@(private = "package")
+@(private = "package", require_results)
 encode_body_begin :: proc(cursor: ^Encode_Cursor, allocator: mem.Allocator) -> (^strings.Builder, Provider_Request_Error) {
 	if cursor.cache != nil {
 		body := &cursor.cache.body
@@ -202,7 +202,7 @@ encode_body_begin :: proc(cursor: ^Encode_Cursor, allocator: mem.Allocator) -> (
 // request, and the caller must not free them. Without one the cursor's temporary buffer is
 // handed over, so the caller owns the bytes and releases them with
 // delete(transmute([]byte)text, allocator).
-@(private = "package")
+@(private = "package", require_results)
 encode_body_take :: proc(cursor: ^Encode_Cursor) -> (string, Provider_Request_Error) {
 	body := cursor.body
 	if body == nil { return "", .None }
@@ -330,7 +330,7 @@ encode_write_text :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: 
 // schema and a call's arguments are the same bytes on every request that carries them.
 // A text that is not an object is remembered as one, so it is read once too and the caller
 // decides what the wire carries in its place.
-@(private = "package")
+@(private = "package", require_results)
 encode_write_object :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: string, allocator: mem.Allocator) -> bool {
 	slot, hit := encode_slot_for(cursor, text, .Parameters)
 	if cursor.error != .None { return false }
@@ -368,7 +368,7 @@ encode_write_object :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text
 // text is parsed on the way out, and only because the keys of every object in it are
 // sorted so that the same conversation writes the same bytes, in this process and in the
 // next one. Its result is what a slot keeps, so the parse happens once per text.
-@(private = "package")
+@(private = "package", require_results)
 encode_object_bytes :: proc(text: string, out: ^strings.Builder, allocator: mem.Allocator) -> (bool, Provider_Request_Error) {
 	value, parse_err := json.parse_string(text, .JSON, true, allocator)
 	if parse_err != nil { return false, .Invalid_Tools }

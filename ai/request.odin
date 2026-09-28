@@ -176,6 +176,7 @@ Provider_Operation_Error_Destroy :: proc(err: ^Provider_Operation_Error, allocat
 // provider_invalid_request reports a request this package refuses to send. The detail is
 // cloned into the error, so the caller owns it like any other detail, and a failure to
 // retain it becomes the allocation failure it is.
+@(require_results)
 provider_invalid_request :: proc(detail: string, allocator := context.allocator) -> Provider_Operation_Error {
 	owned, clone_error := strings.clone(detail, allocator)
 	if clone_error != nil { return Provider_Operation_Error{kind = .Allocation} }
@@ -242,6 +243,7 @@ provider_resource_path :: proc(api: API_Kind) -> string {
 // endpoint may already state the path, and it may state a query, which belongs after
 // the path rather than inside it. It returns an Invalid_Request error when the endpoint
 // states no scheme or host, and an Allocation error when the path could not be built.
+@(require_results)
 provider_endpoint :: proc(endpoint: string, api: API_Kind, allocator: mem.Allocator) -> (result: string, err: Provider_Operation_Error) {
 	url := http.url_parse(endpoint)
 	if url.scheme == "" || url.host == "" {
@@ -278,7 +280,7 @@ provider_endpoint :: proc(endpoint: string, api: API_Kind, allocator: mem.Alloca
 // provider_headers_destroy, and nil means no header set could be built: a value that could
 // not be retained releases the headers already built, because a partial set would
 // authenticate or identify less than the caller asked for.
-@(private)
+@(private, require_results)
 provider_encoded_headers :: proc(connection: Provider_Connection, encoded: Provider_Encoded_Request, allocator := context.allocator) -> []client.Header {
 	// Sized for the most any API family needs, so every entry comes from the caller's
 	// allocator rather than an ambient one.
@@ -359,6 +361,7 @@ provider_headers_destroy :: proc(headers: []client.Header, allocator := context.
 // cancellation and deadline control. It delivers at most one terminal callback,
 // never exposes executable tool calls from an interrupted or truncated stream,
 // and destroys every payload it retains on failure.
+@(require_results)
 Provider_Request_Operation_Controlled :: proc(
 	connection: Provider_Connection,
 	request: Provider_Request,
@@ -383,6 +386,7 @@ Provider_Request_Operation_Controlled :: proc(
 // The returned Body is owned by allocator and released with delete(encoded.Body,
 // allocator). A request that cannot be encoded yields an Invalid_Request operation
 // error, the same failure the one-shot path reports for it.
+@(require_results)
 Provider_Request_Freeze :: proc(request: Provider_Request, allocator := context.allocator) -> (Provider_Encoded_Request, Provider_Operation_Error) {
 	return Provider_Request_Freeze_Reusing(request, nil, allocator)
 }
@@ -392,6 +396,7 @@ Provider_Request_Freeze :: proc(request: Provider_Request, allocator := context.
 // caller owns the cache: one cache is walked by one encode at a time, and a cache's body
 // belongs to the cache, so it stays readable only until that cache encodes the request
 // after this one.
+@(require_results)
 Provider_Request_Freeze_Reusing :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -425,6 +430,7 @@ Provider_Request_Freeze_Reusing :: proc(
 // encoded earlier. Encoding is the only thing it skips: an operation that begins
 // with bytes must behave exactly like one that begins with a request, so this is
 // the one place the send path lives.
+@(require_results)
 Provider_Request_Operation_Encoded :: proc(
 	connection: Provider_Connection,
 	encoded: Provider_Encoded_Request,
@@ -713,6 +719,7 @@ provider_operation_error_kind :: proc(failure: client.Failure) -> Provider_Opera
 // or an expired deadline always wins over whichever path happened to notice first,
 // so a late failure is never reported as an ordinary stream defect and a late
 // success can never be reported at all.
+@(require_results)
 provider_terminal_error :: proc(state: ^Provider_Request_Stream_State, kind: Provider_Operation_Error_Kind) -> Provider_Operation_Error {
 	resolved := kind
 	if interrupt_requested(state.interrupt) {
@@ -815,6 +822,7 @@ provider_request_error_text :: proc(err: Provider_Request_Error) -> string {
 }
 
 // provider_take_failure_detail claims the detail the state still owns.
+@(require_results)
 provider_take_failure_detail :: proc(state: ^Provider_Request_Stream_State) -> string {
 	detail := state.failure_detail
 	state.failure_detail = ""

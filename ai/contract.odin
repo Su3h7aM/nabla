@@ -176,6 +176,7 @@ Provider_Request_Error :: enum {
 	Allocation,
 }
 
+@(require_results)
 Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request_Error {
 	switch request.API {
 	case .OpenAI_Chat_Completions, .OpenAI_Responses, .Anthropic_Messages:
@@ -231,6 +232,7 @@ Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request
 // anything else -- empty, malformed, an array -- makes the request that carries it
 // unsendable. This is a check on the bytes alone: whether the tool accepts the fields they
 // name is the tool's own validator's business.
+@(require_results)
 Provider_Arguments_Object :: proc(raw: string, allocator := context.allocator) -> bool {
 	if raw == "" { return false }
 	value, parse_err := json.parse_string(raw, .JSON, true, allocator)
@@ -380,6 +382,7 @@ Provider_Tool_Fragment :: struct {
 	Arguments_Started:  bool,
 }
 
+@(require_results)
 Provider_Stream_Start :: proc(api: API_Kind, allocator := context.allocator) -> Provider_Stream_State {
 	return {API = api, Phase = .Open, Allocator = allocator}
 }
@@ -402,6 +405,7 @@ provider_stream_push :: proc(state: ^Provider_Stream_State, event: Provider_Even
 
 // Discard staged success events and expose one error. A malformed payload
 // never leaves a partial batch behind.
+@(require_results)
 provider_stream_fail :: proc(
 	state: ^Provider_Stream_State,
 	kind: Provider_Error_Kind,
@@ -425,11 +429,13 @@ provider_stream_fail :: proc(
 
 // provider_stream_fail_allocation reports a stream that could not retain what it decoded.
 // It is a local failure: the payload was usable, and the client could not keep it.
+@(require_results)
 provider_stream_fail_allocation :: proc(state: ^Provider_Stream_State, message: string) -> Provider_Stream_Error {
 	return provider_stream_fail(state, .Allocation, message, .Allocation)
 }
 
 // Transfers one owned event to the caller and removes it from the batch.
+@(require_results)
 Provider_Stream_Drain :: proc(state: ^Provider_Stream_State) -> (Provider_Event, bool) {
 	if state == nil { return nil, false }
 	return pop_front_safe(&state.Batch)
@@ -460,6 +466,7 @@ provider_tool_fragments_present :: proc(state: ^Provider_Stream_State) -> bool {
 // provider_tool_fragment_append reserves the next tool-call slot. The slot is owned by the
 // stream and released with it, and a failure to reserve one fails the stream, so a call is
 // never reserved without storage for its arguments.
+@(require_results)
 provider_tool_fragment_append :: proc(state: ^Provider_Stream_State) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
 	arguments, arguments_error := make([dynamic]u8, 0, state.Allocator)
 	if arguments_error != nil {
@@ -475,6 +482,7 @@ provider_tool_fragment_append :: proc(state: ^Provider_Stream_State) -> (^Provid
 	return &state.Tool_Fragments[len(state.Tool_Fragments) - 1], .None
 }
 
+@(require_results)
 provider_tool_fragment_by_wire_index :: proc(state: ^Provider_Stream_State, index: i64) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
 	if index < 0 { return nil, provider_stream_fail(state, .Invalid_Data, "tool call index is invalid", .Tool_Limit) }
 	for &fragment in state.Tool_Fragments {
@@ -489,6 +497,7 @@ provider_tool_fragment_by_wire_index :: proc(state: ^Provider_Stream_State, inde
 
 // provider_call_clone_strings fills one call from the strings it is made of. It reports
 // false, releasing whatever it copied, when the call could not be retained.
+@(require_results)
 provider_call_clone_strings :: proc(call: ^Provider_Tool_Call, id, item_id, name, arguments: string, allocator: mem.Allocator) -> bool {
 	transferred := false
 	defer if !transferred { provider_tool_call_destroy(call, allocator) }
@@ -510,6 +519,7 @@ provider_call_clone_strings :: proc(call: ^Provider_Tool_Call, id, item_id, name
 
 // provider_call_clone copies one fragment's strings into the call it becomes. It reports
 // false, releasing whatever it already copied, when the call could not be retained.
+@(require_results)
 provider_call_clone :: proc(fragment: ^Provider_Tool_Fragment, allocator: mem.Allocator) -> (call: Provider_Tool_Call, ok: bool) {
 	ok = provider_call_clone_strings(&call, fragment.ID, fragment.Item_ID, fragment.Name, string(fragment.Arguments[:]), allocator)
 	return call, ok
@@ -518,6 +528,7 @@ provider_call_clone :: proc(fragment: ^Provider_Tool_Fragment, allocator: mem.Al
 // provider_tool_finalize assembles the calls the stream decoded. It fails the stream when
 // the decoded calls are not a usable set or could not be retained, so a caller never holds
 // half a call list.
+@(require_results)
 provider_tool_finalize :: proc(state: ^Provider_Stream_State, allocator := context.allocator) -> ([]Provider_Tool_Call, Provider_Stream_Error) {
 	count := 0
 	for &fragment in state.Tool_Fragments {
@@ -565,6 +576,7 @@ Provider_Stream_Error :: enum {
 	Allocation,
 }
 
+@(require_results)
 Provider_Encode_Request :: proc(request: Provider_Request, allocator := context.allocator) -> (string, Provider_Request_Error) {
 	return Provider_Encode_Request_Reusing(request, nil, allocator)
 }
@@ -574,6 +586,7 @@ Provider_Encode_Request :: proc(request: Provider_Request, allocator := context.
 //
 // Reuse never changes what is sent: bytes are written from the cache only for the text
 // they were written for.
+@(require_results)
 Provider_Encode_Request_Reusing :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -594,6 +607,7 @@ Provider_Encode_Request_Reusing :: proc(
 	return "", .Unsupported_API
 }
 
+@(require_results)
 Provider_Consume_Event_JSON :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil { return .Invalid_State }
 	if len(state^.Batch) > 0 { return .Batch_Not_Drained }
@@ -604,6 +618,7 @@ Provider_Consume_Event_JSON :: proc(payload: string, state: ^Provider_Stream_Sta
 	return openai_responses_consume_event(payload, state)
 }
 
+@(require_results)
 Provider_Consume_SSE_Data :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil { return .Invalid_State }
 	if len(state^.Batch) > 0 { return .Batch_Not_Drained }
@@ -623,6 +638,7 @@ Provider_Consume_SSE_Data :: proc(payload: string, state: ^Provider_Stream_State
 // EOF is authoritative when a terminal event was already decoded. Some proxies
 // close the stream without the `[DONE]` sentinel, and the Responses API never
 // sends one. A still-open stream is truncation, not success.
+@(require_results)
 Provider_Stream_Finish :: proc(state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil { return .Invalid_State }
 	switch state^.Phase {

@@ -27,6 +27,7 @@ ANTHROPIC_BLOCK_TOOL_RESULT :: "tool_result"
 
 // anthropic_encode_request writes one Messages request body, with a cache reusing the bytes
 // it already holds for the texts this request carries again.
+@(require_results)
 anthropic_encode_request :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -117,7 +118,7 @@ anthropic_encode_request :: proc(
 // into the open user turn until something that is not user content ends it. A
 // turn that ends up holding exactly one text block is emitted in the plain
 // string form, so an ordinary conversation encodes to the bytes it always has.
-@(private)
+@(private, require_results)
 anthropic_write_messages :: proc(
 	cursor: ^Encode_Cursor,
 	body: ^strings.Builder,
@@ -201,7 +202,7 @@ anthropic_write_messages :: proc(
 // anthropic_write_user_turn writes the open user turn. One text block goes out as the
 // plain string this API has always accepted for a text turn; anything else is written as
 // the blocks it carries, in the order the conversation hands them over.
-@(private)
+@(private, require_results)
 anthropic_write_user_turn :: proc(
 	cursor: ^Encode_Cursor,
 	body: ^strings.Builder,
@@ -259,7 +260,7 @@ anthropic_write_text_block :: proc(cursor: ^Encode_Cursor, body: ^strings.Builde
 // object on the wire, so a call whose arguments are not one is replayed with an empty
 // object: the id and name are preserved so the paired result still answers this call, and
 // the rejection travels in that result rather than in invented arguments.
-@(private)
+@(private, require_results)
 anthropic_write_tool_use :: proc(
 	cursor: ^Encode_Cursor,
 	body: ^strings.Builder,
@@ -284,7 +285,7 @@ anthropic_write_tool_use :: proc(
 	return .None
 }
 
-@(private)
+@(private, require_results)
 anthropic_write_tool_result :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, message: Provider_Message) -> Provider_Request_Error {
 	if message.Tool_Call_ID == "" { return .Invalid_Message }
 	field_first := true
@@ -307,7 +308,7 @@ anthropic_write_tool_result :: proc(cursor: ^Encode_Cursor, body: ^strings.Build
 // declared, written once and kept: a schema does not change between the requests of one
 // conversation. Strict schema enforcement is not set: an optional argument has to stay
 // optional, and the harness reads and validates the arguments itself.
-@(private)
+@(private, require_results)
 anthropic_write_tool_def :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, tool: Provider_Tool_Def, allocator: mem.Allocator) -> bool {
 	field_first := true
 	encode_write_raw(cursor, body, "{")
@@ -342,7 +343,7 @@ anthropic_stop_reason :: proc(reason: string) -> Provider_Finish_Reason {
 // anthropic_parse_usage reads one usage object. Anthropic reports input_tokens as
 // only what the prompt cache did not serve, so the total the harness measures a
 // hit rate against is the sum of the three input counts. Absent stays absent.
-@(private)
+@(private, require_results)
 anthropic_parse_usage :: proc(usage: json.Object) -> (Provider_Usage_Event, bool) {
 	result := Provider_Usage_Event{}
 	uncached, uncached_present, uncached_ok := anthropic_optional_integer(usage, "input_tokens")
@@ -380,7 +381,7 @@ anthropic_parse_usage :: proc(usage: json.Object) -> (Provider_Usage_Event, bool
 
 // anthropic_optional_integer reads an integer that may be absent or null. The
 // two mean the same thing here: the provider did not state it.
-@(private)
+@(private, require_results)
 anthropic_optional_integer :: proc(object: json.Object, key: string) -> (value: i64, present: bool, ok: bool) {
 	raw, exists := object[key]
 	if !exists { return 0, false, true }
@@ -391,7 +392,7 @@ anthropic_optional_integer :: proc(object: json.Object, key: string) -> (value: 
 // anthropic_block_fragment finds the tool-call slot a content block index maps
 // to, or takes the next one. The block index counts every block, not just the
 // tool calls, so it cannot be used as the slot number itself.
-@(private)
+@(private, require_results)
 anthropic_block_fragment :: proc(state: ^Provider_Stream_State, index: i64) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
 	for &fragment in state.Tool_Fragments {
 		if fragment.Wire_Index_Present && fragment.Wire_Index == index { return &fragment, .None }
@@ -406,7 +407,7 @@ anthropic_block_fragment :: proc(state: ^Provider_Stream_State, index: i64) -> (
 // anthropic_complete delivers the terminal event once the stream has stated why
 // it ended. Anthropic states the reason in message_delta and closes in a separate
 // message_stop, so the reason arrives before the end.
-@(private)
+@(private, require_results)
 anthropic_complete :: proc(state: ^Provider_Stream_State, reason_text: string) -> Provider_Stream_Error {
 	reason := anthropic_stop_reason(reason_text)
 	calls: []Provider_Tool_Call
@@ -430,7 +431,7 @@ anthropic_complete :: proc(state: ^Provider_Stream_State, reason_text: string) -
 
 // anthropic_error_event reads the error envelope this API uses, which names the
 // failure kind in `type` rather than `code`.
-@(private)
+@(private, require_results)
 anthropic_error_event :: proc(object: json.Object, allocator := context.allocator) -> (event: Provider_Event, is_error: bool, err: mem.Allocator_Error) {
 	raw, present := object["error"]
 	if !present { return nil, false, nil }
@@ -455,6 +456,7 @@ anthropic_error_event :: proc(object: json.Object, allocator := context.allocato
 // refused request, through the same reader an in-stream error event uses, so a
 // refusal read from a response body and one read from a stream cannot drift apart.
 // The returned strings are owned by allocator.
+@(require_results)
 anthropic_error_rejection :: proc(body: []u8, allocator := context.allocator) -> (Provider_Rejection, mem.Allocator_Error) {
 	value, object, parsed := provider_error_document(body, allocator)
 	if !parsed { return {}, nil }
@@ -481,6 +483,7 @@ ANTHROPIC_CONTEXT_OVERFLOW_MESSAGE :: "prompt is too long"
 // types. `invalid_request_error` covers every malformed request, so overflow is
 // read from the provider's own wording for it and nothing else: a mention of
 // tokens or limits is not evidence, the way every other refusal stays unknown.
+@(require_results)
 anthropic_failure_class :: proc(code, message: string) -> (Provider_Failure_Class, bool) {
 	switch code {
 	case "rate_limit_error":
@@ -496,7 +499,7 @@ anthropic_failure_class :: proc(code, message: string) -> (Provider_Failure_Clas
 	return .None, false
 }
 
-@(private)
+@(private, require_results)
 anthropic_usage_from :: proc(object: json.Object, key: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	raw, present := object[key]
 	if !present { return .None }
@@ -509,6 +512,7 @@ anthropic_usage_from :: proc(object: json.Object, key: string, state: ^Provider_
 	return .None
 }
 
+@(require_results)
 anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil || state^.API != .Anthropic_Messages { return .Invalid_State }
 	if payload == "[DONE]" {

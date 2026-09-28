@@ -18,6 +18,7 @@ Provider_WebSocket_Session :: struct {
 	allocator:  mem.Allocator,
 }
 
+@(require_results)
 Provider_WebSocket_Session_Open :: proc(
 	connection: Provider_Connection,
 	allocator := context.allocator,
@@ -52,6 +53,7 @@ Provider_WebSocket_Session_Destroy :: proc(session: ^Provider_WebSocket_Session)
 
 // Provider_Request_Freeze_WebSocket encodes one full-context Responses request for
 // a WebSocket session. The returned body is owned by allocator.
+@(require_results)
 Provider_Request_Freeze_WebSocket :: proc(request: Provider_Request, allocator := context.allocator) -> (Provider_Encoded_Request, Provider_Operation_Error) {
 	return Provider_Request_Freeze_WebSocket_Reusing(request, nil, allocator)
 }
@@ -59,6 +61,7 @@ Provider_Request_Freeze_WebSocket :: proc(request: Provider_Request, allocator :
 // Provider_Request_Freeze_WebSocket_Reusing freezes a WebSocket request, reusing what
 // cache already holds for the texts the request carries again. A nil cache encodes every
 // byte now, and its body belongs to the caller.
+@(require_results)
 Provider_Request_Freeze_WebSocket_Reusing :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -92,6 +95,7 @@ Provider_Request_Freeze_WebSocket_Reusing :: proc(
 // the session's socket and opens the connection when it is not open yet. Every
 // request clears the binding again when it returns, so the probe never outlives the
 // operation that owns it.
+@(require_results)
 Provider_WebSocket_Connect :: proc(
 	session: ^Provider_WebSocket_Session,
 	encoded: Provider_Encoded_Request,
@@ -116,6 +120,7 @@ Provider_WebSocket_Connect :: proc(
 // terminal event completes the request while the socket remains open for reuse.
 // A reused socket the peer closed while it sat idle is replaced by a new connection
 // and the request is sent again, when none of the response had arrived on it.
+@(require_results)
 Provider_WebSocket_Request :: proc(
 	session: ^Provider_WebSocket_Session,
 	encoded: Provider_Encoded_Request,
@@ -181,7 +186,7 @@ Provider_WebSocket_Request :: proc(
 // provider_websocket_exchange sends the request and reads its response. stale is true,
 // with nothing reported to the callback, when a reused socket ended before any of the
 // response arrived; the socket is then dropped.
-@(private)
+@(private, require_results)
 provider_websocket_exchange :: proc(
 	session: ^Provider_WebSocket_Session,
 	encoded: Provider_Encoded_Request,
@@ -264,6 +269,7 @@ provider_websocket_ended :: proc(state: ^Provider_Request_Stream_State, cause: w
 	return !interrupt_requested(state.interrupt) && !deadline_expired(state.deadline)
 }
 
+@(require_results)
 provider_websocket_dial :: proc(
 	session: ^Provider_WebSocket_Session,
 	encoded: Provider_Encoded_Request,
@@ -308,6 +314,7 @@ provider_websocket_dial :: proc(
 	return {}
 }
 
+@(require_results)
 provider_websocket_endpoint :: proc(base: string, allocator: mem.Allocator) -> (string, Provider_Operation_Error) {
 	resource, resource_error := provider_endpoint(base, .OpenAI_Responses, allocator)
 	if resource_error.kind != .None { return "", resource_error }
@@ -335,6 +342,7 @@ provider_websocket_drop :: proc(session: ^Provider_WebSocket_Session) {
 	session.socket = nil
 }
 
+@(require_results)
 provider_websocket_error :: proc(
 	state: ^Provider_Request_Stream_State,
 	cause: websocket.Error,

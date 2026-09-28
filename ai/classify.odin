@@ -233,6 +233,7 @@ provider_stream_class :: proc(event: Maybe(Provider_Error_Kind)) -> Provider_Fai
 // provider_rejection_class maps a provider's own code onto the meaning this
 // package gives it. A code no adapter knows is not classified here, and the status
 // decides whatever it can.
+@(require_results)
 provider_rejection_class :: proc(api: API_Kind, rejection: Provider_Rejection) -> (Provider_Failure_Class, bool) {
 	if rejection.code == "" { return .None, false }
 	switch api {
@@ -250,6 +251,7 @@ provider_rejection_class :: proc(api: API_Kind, rejection: Provider_Rejection) -
 // or simply not that document yields no rejection: the status and the transport
 // facts stay the evidence, and nothing is read out of prose to fill the gap. A
 // non-nil error means the provider's account could not be retained.
+@(require_results)
 provider_rejection_parse :: proc(api: API_Kind, body: []u8, allocator: mem.Allocator) -> (Provider_Rejection, mem.Allocator_Error) {
 	if len(body) == 0 { return {}, nil }
 	switch api {
@@ -266,6 +268,7 @@ provider_rejection_parse :: proc(api: API_Kind, body: []u8, allocator: mem.Alloc
 // returned value, releases it once it is done with the object, and gets no object
 // at all when the body is empty, truncated, or not a JSON object: a provider's
 // error document is evidence, and a body that is not one is not read as one.
+@(require_results)
 provider_error_document :: proc(body: []u8, allocator: mem.Allocator) -> (value: json.Value, object: json.Object, ok: bool) {
 	parsed, parse_err := json.parse(body, .JSON, false, allocator)
 	if parse_err != nil { return {}, {}, false }

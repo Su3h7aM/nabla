@@ -31,6 +31,7 @@ openai_role_name :: proc(role: Provider_Role) -> string {
 	return ""
 }
 
+@(require_results)
 openai_value_string :: proc(object: json.Object, key: string) -> (string, bool, bool) {
 	value, present := object[key]
 	if !present { return "", false, true }
@@ -40,6 +41,7 @@ openai_value_string :: proc(object: json.Object, key: string) -> (string, bool, 
 	return "", true, false
 }
 
+@(require_results)
 openai_value_integer :: proc(object: json.Object, key: string) -> (i64, bool, bool) {
 	value, present := object[key]
 	if !present { return 0, false, true }
@@ -51,6 +53,7 @@ openai_value_integer :: proc(object: json.Object, key: string) -> (i64, bool, bo
 // openai_error_event builds the error event both OpenAI APIs report a failure with. The
 // event owns its strings, and a failure to retain them yields no event and the allocator
 // error, so a caller never delivers a failure whose wording was silently dropped.
+@(require_results)
 openai_error_event :: proc(kind: Provider_Error_Kind, message: string, code := "", allocator := context.allocator) -> (Provider_Event, mem.Allocator_Error) {
 	owned_message, message_error := strings.clone(message, allocator)
 	if message_error != nil { return nil, message_error }
@@ -67,6 +70,7 @@ openai_error_event :: proc(kind: Provider_Error_Kind, message: string, code := "
 // from a response body and one read from a stream cannot drift apart. The returned
 // strings are owned by allocator, and a failure to retain them is reported rather than
 // read as a document this API did not send.
+@(require_results)
 openai_error_rejection :: proc(body: []u8, allocator := context.allocator) -> (Provider_Rejection, mem.Allocator_Error) {
 	value, object, parsed := provider_error_document(body, allocator)
 	if !parsed { return {}, nil }
@@ -89,6 +93,7 @@ openai_error_rejection :: proc(body: []u8, allocator := context.allocator) -> (P
 // documents, and a prefix or substring rule would classify codes it never wrote
 // down. An unrecognized code is left to the status that carried it, which is the
 // fallback a compatible endpoint depends on.
+@(require_results)
 openai_failure_class :: proc(code: string) -> (Provider_Failure_Class, bool) {
 	switch code {
 	case "context_length_exceeded":
@@ -103,6 +108,7 @@ openai_failure_class :: proc(code: string) -> (Provider_Failure_Class, bool) {
 
 // openai_parse_api_error reads the error envelope both OpenAI APIs return. is_error says the
 // object carried one, and a non-nil err says the event could not be retained.
+@(require_results)
 openai_parse_api_error :: proc(object: json.Object, allocator := context.allocator) -> (event: Provider_Event, is_error: bool, err: mem.Allocator_Error) {
 	raw, present := object["error"]
 	if !present { return nil, false, nil }
@@ -143,6 +149,7 @@ openai_finish_reason :: proc(reason: string) -> Provider_Finish_Reason {
 // Validate a tool parameter schema: one JSON object with nothing trailing. The
 // walk recurses and is bounded by OPENAI_TOOL_SCHEMA_DEPTH; the worker enforces
 // the same shape on arguments.
+@(require_results)
 openai_tool_schema_valid :: proc(raw: string) -> bool {
 	if len(raw) == 0 { return false }
 	bytes := transmute([]u8)raw
@@ -155,7 +162,7 @@ openai_tool_schema_valid :: proc(raw: string) -> bool {
 // reports whether the wire can carry it. The object itself comes from the shared writer,
 // which reads a schema once and keeps the bytes: a schema does not change between the
 // requests of one conversation.
-@(private = "package")
+@(private = "package", require_results)
 openai_tool_parameters_write :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, first: ^bool, schema: string, allocator := context.allocator) -> bool {
 	encode_write_field(cursor, body, first, "parameters")
 	return encode_write_object(cursor, body, schema, allocator)
@@ -230,6 +237,7 @@ openai_json_number_end :: proc(raw: []u8, position: int) -> int {
 
 // openai_json_value_skip skips one JSON value and returns the position after it. Objects
 // recurse with the same duplicate-key rule, arrays recurse for shape only.
+@(require_results)
 openai_json_value_skip :: proc(raw: []u8, position, depth: int) -> (int, bool) {
 	if depth < 0 { return position, false }
 	i := openai_json_skip(raw, position)
