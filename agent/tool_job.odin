@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
@@ -854,6 +855,24 @@ tool_jobs_refuse :: proc(jobs: ^Tool_Jobs) {
 	job.phase = .Result_Ready
 }
 
+// tool_result_report_repairs adds a `repaired:` line after the result's first line. The
+// projection replays the corrected arguments, so this line is how the model learns what it
+// sent wrong.
+@(private)
+tool_result_report_repairs :: proc(result: ^Tool_Result, repairs: Tool_Repairs) -> mem.Allocator_Error {
+	if repairs == {} { return nil }
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	first, rest := result.content, ""
+	if newline := strings.index_byte(result.content, '\n'); newline >= 0 {
+		first, rest = result.content[:newline], result.content[newline + 1:]
+	}
+	names := tool_repairs_text(repairs, context.temp_allocator)
+	content := strings.concatenate({first, "\nrepaired: ", names, " (the arguments you sent were corrected)\n", rest}, result.allocator) or_return
+	delete(result.content, result.allocator)
+	result.content = content
+	return nil
+}
+
 // tool_jobs_commit records the earliest uncommitted result. It is the one boundary
 // between execution and storage: every observed result crosses it here, so the store
 // only ever receives a bounded result.
@@ -870,7 +889,7 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	result := job.result
 	job.result = {}
 	job.result_present = false
-	if result.allocation_failed {
+	if result.allocation_failed || tool_result_report_repairs(&result, job.admitted.repairs) != nil {
 		tool_result_destroy(&result)
 		job.phase = .Retiring
 		if jobs.stop == .None { jobs.stop = .Storage_Failed }

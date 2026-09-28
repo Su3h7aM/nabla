@@ -803,7 +803,7 @@ Tool_Repairs :: bit_set[Tool_Repair]
 
 The set of repairs a call needed is committed with `tool.admitted` beside the effective arguments (today the dispatch record carries both), and each application is also observed as `tool.repaired`. When a value repair rewrote the document, the effective arguments are the document written again from the repaired value with sorted keys. Projection replays the effective arguments, so the model sees the corrected form. A repaired value then passes full validation, and policy and hooks run on it. A new repair joins the enum only if its input has one reading and every other input is still refused with its own defect.
 
-The committed result of a repaired call names every repair it needed: the field, what the model sent, and what ran. This holds for every outcome, failures included. Projection shows the corrected arguments, so without this line the model would never learn it sent something wrong. A repair recorded only in the journal or shown only to the frontend does not count as reported.
+The committed result of a repaired call names every repair it needed in a `repaired:` line after its first line, for every outcome, failures included. Projection shows the corrected arguments, so without this line the model would never learn it sent something wrong. A repair recorded only in the journal or shown only to the frontend does not count as reported.
 
 Content repairs belong to the tool that knows the content, because they depend on the target file, and they are reported in that tool's output: a patch hunk that matches exactly one location when surrounding whitespace is ignored (section 16). Normalizing line endings to the target file's convention and reading loose patch formatting with one reading are content repairs of the same kind that do not exist yet.
 
@@ -1101,7 +1101,6 @@ These mechanisms exist in the code today and are replaced by the named target. D
 | provider attempts and compaction joined without a deadline on stop and teardown | abandonment after `STOP_PATIENCE` (section 7.2) |
 | a stream that breaks after an accepted response head is resent | a `Notice` (section 11.3) |
 | invalid request, payload too large, and content policy end the turn | one `Notice`, then end on a repeat (section 2.2) |
-| repairs reported to the journal and frontend only | named in the committed result (section 15) |
 | harness caps: Code Mode print log 8 KiB, Lua conversion 256 and 16,384 nodes, 32 child summaries, ACP frames 10 MB, MCP messages 4 MiB and depth 64, MCP discovery 32 pages of 1,024 tools, skill files 256 KiB | no harness caps; whole results kept, then previewed (sections 2.1, 14.3) |
 | a result rendered by `tool_result_of` where the executor built it | typed output kept until commit, rendered once at commit (section 14.3) |
 | catalog replaced under a mutex and the old one destroyed; selection reapplied mid-turn | immutable reference-counted snapshots, kept by admitted work (section 13.3) |

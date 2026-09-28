@@ -268,6 +268,15 @@ test_a_repaired_call_is_replayed_as_what_ran :: proc(test: ^testing.T) {
 	testing.expect(test, len(admitted.repairs) > 0, "the repair is recorded with the call")
 	testing.expect(test, strings.contains(string(records[0].body), `"timeout_ms":5000`), "the admission holds what ran")
 
+	// The result the model reads names the repairs, since its replayed call shows only what ran.
+	results := _test_records(test, chat, {.Tool_Completed})
+	if !testing.expect_value(test, len(results), 1) { return }
+	testing.expect(
+		test,
+		strings.contains(string(results[0].body), "\nrepaired: escaped_control_characters, integer_from_string"),
+		"the result reports the repairs",
+	)
+
 	arena: virtual.Arena
 	preparation := request_test_prepare(test, chat, {API = .OpenAI_Chat_Completions}, &arena)
 	defer virtual.arena_destroy(&arena)
