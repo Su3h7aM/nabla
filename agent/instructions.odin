@@ -39,6 +39,7 @@ Instruction_Root :: struct {
 // The launch directory's own `.agents/skills` wins, then Nabla's configuration
 // directory, then the generic user directory. The workspace is the only scope
 // a local root may read from; nothing here depends on any repository state.
+@(require_results)
 instruction_roots :: proc(workspace: string, disable_project: bool, allocator := context.allocator) -> ([]Instruction_Root, mem.Allocator_Error) {
 	roots, roots_error := make([dynamic]Instruction_Root, 0, 3, allocator)
 	if roots_error != nil { return nil, roots_error }
@@ -104,6 +105,7 @@ Agents_File :: struct {
 	body:  string,
 }
 
+@(require_results)
 agents_file_clone :: proc(path, scope, body: string, allocator: mem.Allocator) -> (Agents_File, mem.Allocator_Error) {
 	file: Agents_File
 	clone_error: mem.Allocator_Error
@@ -136,6 +138,7 @@ agents_files_destroy :: proc(files: []Agents_File, allocator := context.allocato
 // directory's AGENTS.md first, then the personal one in the home `.agents`
 // directory. Missing files are normal; an existing file that cannot be read
 // completely is an error, never a silent skip.
+@(require_results)
 collect_agents_files :: proc(workspace: string, disable_project: bool, allocator := context.allocator) -> ([]Agents_File, string, Instruction_Error) {
 	files, files_error := make([dynamic]Agents_File, 0, 2, allocator)
 	if files_error != nil { return nil, "the instruction file list could not be allocated", .Allocation }
@@ -187,6 +190,7 @@ collect_agents_files :: proc(workspace: string, disable_project: bool, allocator
 // it carries no instructions, so it must not block the session. Every other
 // failure names the file, so the session error says which source is wrong. The
 // returned error text is borrowed and lives only for the call.
+@(require_results)
 read_agents_file :: proc(path: string, allocator := context.allocator) -> (string, string, Instruction_Error) {
 	info, stat_error := os.stat(path, context.temp_allocator)
 	defer os.file_info_delete(info, context.temp_allocator)
@@ -205,6 +209,7 @@ read_agents_file :: proc(path: string, allocator := context.allocator) -> (strin
 	return body, "", .None
 }
 
+@(require_results)
 render_instructions :: proc(
 	files: []Agents_File,
 	catalog: skills.Catalog,
@@ -255,6 +260,7 @@ render_instructions :: proc(
 	return text, nil
 }
 
+@(require_results)
 encode_skill_catalog :: proc(catalog: skills.Catalog, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return "", builder_error }
@@ -277,14 +283,17 @@ encode_skill_catalog :: proc(catalog: skills.Catalog, allocator := context.alloc
 	return text, nil
 }
 
+@(require_results)
 instruction_write_string :: proc(builder: ^strings.Builder, value: string) -> bool {
 	return strings.write_string(builder, value) == len(value)
 }
 
+@(require_results)
 instruction_write_byte :: proc(builder: ^strings.Builder, value: byte) -> bool {
 	return strings.write_byte(builder, value) == 1
 }
 
+@(require_results)
 write_json_string :: proc(builder: ^strings.Builder, value: string) -> bool {
 	hex := "0123456789abcdef"
 	if !instruction_write_byte(builder, '"') { return false }
@@ -311,6 +320,7 @@ write_json_string :: proc(builder: ^strings.Builder, value: string) -> bool {
 	return instruction_write_byte(builder, '"')
 }
 
+@(require_results)
 instruction_skill_roots :: proc(roots: []Instruction_Root, allocator := context.allocator) -> ([]skills.Root, mem.Allocator_Error) {
 	converted, converted_error := make([]skills.Root, len(roots), allocator)
 	if converted_error != nil { return nil, converted_error }

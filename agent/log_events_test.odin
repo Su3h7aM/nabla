@@ -78,7 +78,7 @@ log_chat_cancel_turn :: proc(test: ^testing.T, chat: ^Chat_Session) -> (records:
 	chat_session_retire_operation(chat)
 	finish := chat_session_advance(chat)
 	chat_session_claim_finish(chat, finish)
-	chat_persist_turn_end(chat, finish)
+	testing.expect(test, chat_persist_turn_end(chat, finish))
 	return log_chat_record_count(test, chat), chat.calls_made
 }
 
@@ -131,7 +131,7 @@ test_a_superseded_operation_is_recorded :: proc(test: ^testing.T) {
 	chat_session_retire_operation(chat)
 	finish := chat_session_advance(chat)
 	chat_session_claim_finish(chat, finish)
-	chat_persist_turn_end(chat, finish)
+	testing.expect(test, chat_persist_turn_end(chat, finish))
 
 	// The retired operation's event is dropped, and that is what the record says.
 	_test_accept(test, chat, "second")

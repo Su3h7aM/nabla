@@ -58,6 +58,7 @@ tool_shell_definition :: proc(shell: string, allocator := context.allocator) -> 
 // tool_shell_args reads the shell's arguments and reports the first defect
 // instead of a value, so a refused call is described exactly. A timeout the
 // model gives is honored as given; otherwise the definition's default applies.
+@(require_results)
 tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Shell_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_SHELL_FIELDS, allocator = ctx.allocator) or_return
 	command := tool_field_string(arguments, "command", allocator = ctx.allocator) or_return
@@ -84,6 +85,7 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Sh
 // and with the portable shell when that shell cannot be started. Only a command
 // that never started is tried twice: a shell that ran it has already had its
 // effects, and running it again would repeat them.
+@(require_results)
 tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write: ^os.File) -> (child: Tool_Child, spawn: Tool_Spawn, err: os.Error) {
 	shell := tool_shell_preferred()
 	child, spawn, err = tool_spawn_grouped(shell, command, directory, stdout_write, stderr_write)
@@ -91,6 +93,7 @@ tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write:
 	return tool_spawn_grouped(TOOL_SHELL_FALLBACK, command, directory, stdout_write, stderr_write)
 }
 
+@(require_results)
 tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Shell_Args)
 
@@ -156,12 +159,14 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 
 // tool_shell_not_started reports a command that did not start, naming the
 // system's reason.
+@(require_results)
 tool_shell_not_started :: proc(ctx: ^Tool_Context, cause: os.Error, data: Shell_Output) -> Tool_Result {
 	return tool_shell_finish(ctx, .Tool_Failed, fmt.tprintf("the command did not start: %s", os.error_string(cause)), data)
 }
 
 // tool_shell_finish sanitizes the captured streams to valid UTF-8 and builds the result. A
 // stream that could not be prepared is reported rather than shown empty.
+@(require_results)
 tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, message: string, captured: Shell_Output, reason := "") -> Tool_Result {
 	data := captured
 	stdout_sanitized, stdout_error := tool_sanitize_stream(data.stdout, ctx.allocator)
@@ -181,6 +186,7 @@ tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, mes
 // tool_sanitize_stream returns raw with every byte that would make a result invalid text
 // replaced by the replacement character: a result is read by a model, so invalid UTF-8 and
 // control bytes never reach the provider. The text is owned by allocator.
+@(require_results)
 tool_sanitize_stream :: proc(raw: string, allocator := context.allocator) -> (text: string, err: mem.Allocator_Error) {
 	valid, valid_error := strings.to_valid_utf8(raw, "\ufffd", allocator)
 	if valid_error != nil { return "", valid_error }
@@ -196,6 +202,7 @@ tool_sanitize_stream :: proc(raw: string, allocator := context.allocator) -> (te
 	return strings.to_string(builder), nil
 }
 
+@(require_results)
 tool_resolve_path :: proc(workspace, path: string, field := "path", allocator := context.allocator) -> (string, Tool_Argument_Error) {
 	if strings.contains_rune(path, 0) {
 		return "", tool_argument_error(.Invalid_Value, field, "a path without a NUL byte", allocator)

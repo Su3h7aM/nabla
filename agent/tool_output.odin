@@ -138,6 +138,7 @@ MCP_Block :: struct {
 // output's fields as `key: value` lines, and after a blank line the raw body. Raw text
 // needs no escaping inside the provider's own encoding, which is why the body is not
 // quoted. The text is owned by allocator.
+@(require_results)
 tool_result_render :: proc(
 	outcome: journal.Tool_Outcome,
 	message: string,
@@ -336,6 +337,7 @@ render_value :: proc(builder: ^strings.Builder, value: string) -> (written: int,
 
 // render_value_plain reports whether a value reads as itself on one line: no control byte
 // to break it and no edge a reader could not see.
+@(require_results)
 render_value_plain :: proc(value: string) -> bool {
 	if value != strings.trim_space(value) { return false }
 	for c in transmute([]u8)value {
@@ -391,6 +393,7 @@ tool_result_body :: proc(text: string) -> string {
 
 // tool_output_clone copies every string and slice output borrows into its own memory, so a
 // result outlives the buffers its executor used.
+@(require_results)
 tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (owned: Tool_Output, allocation_error: mem.Allocator_Error) {
 	// Every owned field is emptied before its copy is made, so a clone that fails partway
 	// frees only its own copies and never the memory the executor still owns.

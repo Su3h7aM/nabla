@@ -17,7 +17,7 @@ Acp_Input :: struct {
 	open:   bool,
 }
 
-@(private)
+@(private, require_results)
 acp_input_open :: proc() -> (input: Acp_Input, ok: bool) {
 	pair: [2]linux.Fd
 	socket_type := transmute(linux.Socket_Type)(int(linux.Socket_Type.STREAM) | SOCKET_CLOSE_ON_EXEC)
@@ -50,7 +50,7 @@ acp_input_writer :: proc(input: ^Acp_Input) -> io.Writer {
 	return io.Stream{procedure = acp_input_stream, data = input}
 }
 
-@(private = "file")
+@(private = "file", require_results)
 acp_input_stream :: proc(stream_data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
 	input := cast(^Acp_Input)stream_data
 	#partial switch mode {

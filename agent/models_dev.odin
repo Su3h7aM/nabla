@@ -56,6 +56,7 @@ Models_Dev_Fetch :: #type proc(user_data: rawptr, allocator: mem.Allocator) -> (
 // request for `providers` and refreshing it otherwise. A refresh that fails leaves the
 // cached copy in place, so a network problem degrades to stale metadata, never to none.
 // The returned body is owned by the caller.
+@(require_results)
 models_dev_catalog :: proc(
 	fetch: Models_Dev_Fetch = models_dev_fetch,
 	user_data: rawptr = nil,
@@ -70,6 +71,7 @@ models_dev_catalog :: proc(
 
 // models_dev_catalog_at is the same policy against an explicit clock, so the
 // freshness window is testable without waiting for it or forging file times.
+@(require_results)
 models_dev_catalog_at :: proc(
 	now: time.Time,
 	fetch: Models_Dev_Fetch,
@@ -115,6 +117,7 @@ models_dev_catalog_at :: proc(
 // models_dev_cache_answers reports whether a cached document can serve a request for these
 // providers: it must parse and yield at least one provider source. An empty request asks for
 // every provider.
+@(require_results)
 models_dev_cache_answers :: proc(body: []u8, providers: []string) -> bool {
 	arena: virtual.Arena
 	if arena_err := virtual.arena_init_growing(&arena); arena_err != nil { return false }
@@ -127,6 +130,7 @@ models_dev_cache_answers :: proc(body: []u8, providers: []string) -> bool {
 // what decides whether it may replace the cache. The tree and the source records
 // it would produce both live in an arena released here, so the check costs one
 // parse per refresh and leaves nothing resident.
+@(require_results)
 models_dev_validate :: proc(data: []u8) -> bool {
 	arena: virtual.Arena
 	if arena_err := virtual.arena_init_growing(&arena); arena_err != nil { return false }
@@ -137,6 +141,7 @@ models_dev_validate :: proc(data: []u8) -> bool {
 
 // models_dev_cached_sources parses the last cached document without checking its
 // age and never performs a network request. It is the startup path.
+@(require_results)
 models_dev_cached_sources :: proc(providers: []string = {}, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Models_Dev_Error) {
 	path, path_err := models_dev_cache_path(allocator)
 	if path_err != .None { return {}, path_err }
@@ -164,6 +169,7 @@ models_dev_cached_sources :: proc(providers: []string = {}, allocator := context
 // the cache when it is fresh and acquired otherwise, then parsed into provider source records.
 // `providers` restricts extraction to those provider ids. The result is owned by the caller
 // and released with catalog_sources_destroy.
+@(require_results)
 models_dev_sources :: proc(
 	fetch: Models_Dev_Fetch = models_dev_fetch,
 	user_data: rawptr = nil,
@@ -195,6 +201,7 @@ models_dev_sources :: proc(
 
 // models_dev_cache_path resolves where the document is cached and creates the directory.
 // The result is owned by the caller.
+@(require_results)
 models_dev_cache_path :: proc(allocator := context.allocator) -> (string, Models_Dev_Error) {
 	directory, directory_err := xdg_directory(.Cache, allocator)
 	if directory_err != .None { return "", .Cache_Directory }
@@ -208,6 +215,7 @@ models_dev_cache_path :: proc(allocator := context.allocator) -> (string, Models
 // models_dev_cache_fresh reports whether a cached catalog is recent enough to
 // use. A missing file, an unreadable timestamp, and a timestamp ahead of the
 // clock are all stale, so a damaged cache is replaced rather than trusted.
+@(require_results)
 models_dev_cache_fresh :: proc(path: string, now: time.Time) -> bool {
 	modified, err := os.modification_time_by_path(path)
 	if err != nil { return false }
@@ -217,6 +225,7 @@ models_dev_cache_fresh :: proc(path: string, now: time.Time) -> bool {
 
 // models_dev_cache_read returns a cached catalog when one is present and not
 // empty. The result is owned by the caller.
+@(require_results)
 models_dev_cache_read :: proc(path: string, allocator: mem.Allocator) -> ([]u8, bool) {
 	body, read_err := os.read_entire_file(path, allocator)
 	if read_err == nil && len(body) > 0 { return body, true }
@@ -243,6 +252,7 @@ models_dev_cache_write :: proc(path: string, body: []u8) -> bool {
 // models_dev_fetch performs the one request this source needs. It is deliberately
 // thin: freshness, caching, and persistence are the caller's decisions, so none
 // of them has to be exercised to test them.
+@(require_results)
 models_dev_fetch :: proc(user_data: rawptr, allocator: mem.Allocator) -> ([]u8, bool) {
 	body: Fetch_Body
 	body.bytes.allocator = allocator

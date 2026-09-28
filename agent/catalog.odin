@@ -153,6 +153,7 @@ Catalog :: struct {
 	allocator: mem.Allocator,
 }
 
+@(require_results)
 catalog_find_provider :: proc(catalog: ^Catalog, id: string) -> (int, bool) {
 	for provider, index in catalog.providers {
 		if provider.id == id { return index, true }
@@ -160,6 +161,7 @@ catalog_find_provider :: proc(catalog: ^Catalog, id: string) -> (int, bool) {
 	return 0, false
 }
 
+@(require_results)
 catalog_find_model :: proc(catalog: ^Catalog, provider_id, model_id: string) -> (int, bool) {
 	for model, index in catalog.models {
 		if model.provider_id == provider_id && model.id == model_id { return index, true }
@@ -169,6 +171,7 @@ catalog_find_model :: proc(catalog: ^Catalog, provider_id, model_id: string) -> 
 
 // catalog_model returns the resolved entry for a serving identity, or nil when the
 // catalog has none.
+@(require_results)
 catalog_model :: proc(catalog: ^Catalog, provider_id, model_id: string) -> (^Catalog_Model, bool) {
 	index, found := catalog_find_model(catalog, provider_id, model_id)
 	if !found { return nil, false }
@@ -178,6 +181,7 @@ catalog_model :: proc(catalog: ^Catalog, provider_id, model_id: string) -> (^Cat
 // catalog_has_disabled reports whether the user configuration excludes a model.
 // Exclusions are user-owned policy, so they are read from the user sources
 // rather than inferred from whatever a later source reports.
+@(require_results)
 catalog_has_disabled :: proc(provider_id, model_id: string, user: []Catalog_Provider_Source) -> bool {
 	for provider in user {
 		if provider.id != provider_id { continue }
@@ -188,6 +192,7 @@ catalog_has_disabled :: proc(provider_id, model_id: string, user: []Catalog_Prov
 	return false
 }
 
+@(require_results)
 catalog_model_has_customization :: proc(model: Catalog_Model_Source) -> bool {
 	return(
 		model.display_name_present ||
@@ -201,6 +206,7 @@ catalog_model_has_customization :: proc(model: Catalog_Model_Source) -> bool {
 }
 
 // catalog_validate_user rejects configuration that could not take effect.
+@(require_results)
 catalog_validate_user :: proc(user: []Catalog_Provider_Source) -> Catalog_Error {
 	for provider in user {
 		for model in provider.models {
@@ -214,6 +220,7 @@ catalog_validate_user :: proc(user: []Catalog_Provider_Source) -> Catalog_Error 
 
 // catalog_clone_strings copies a string list, and releases what it copied when an
 // allocation fails part-way through.
+@(require_results)
 catalog_clone_strings :: proc(values: []string, allocator: mem.Allocator) -> ([]string, mem.Allocator_Error) {
 	result, result_error := make([]string, len(values), allocator)
 	if result_error != nil { return nil, result_error }
@@ -232,6 +239,7 @@ catalog_clone_strings :: proc(values: []string, allocator: mem.Allocator) -> ([]
 // entirely once the subtree is blocked. A model that cannot think must not
 // acquire a level list, and neither must a model whose support is unresolved in
 // the negative.
+@(require_results)
 catalog_apply_thinking :: proc(dst: ^Catalog_Thinking_Source, src: Catalog_Thinking_Source, allocator: mem.Allocator) -> Catalog_Error {
 	if !src.present || dst.blocked || (dst.supported_present && !dst.supported) { return .None }
 	if src.blocked || (src.supported_present && !src.supported) {
@@ -272,6 +280,7 @@ catalog_apply_thinking :: proc(dst: ^Catalog_Thinking_Source, src: Catalog_Think
 	return .None
 }
 
+@(require_results)
 catalog_apply_model :: proc(dst: ^Catalog_Model, src: Catalog_Model_Source, allocator: mem.Allocator) -> Catalog_Error {
 	if !dst.api_present && src.api_present {
 		api, api_error := strings.clone(src.api, allocator)
@@ -313,6 +322,7 @@ catalog_apply_model :: proc(dst: ^Catalog_Model, src: Catalog_Model_Source, allo
 	return .None
 }
 
+@(require_results)
 catalog_apply_provider :: proc(dst: ^Catalog_Provider, src: Catalog_Provider_Source, allocator: mem.Allocator) -> Catalog_Error {
 	if !dst.base_url_present && src.base_url_present {
 		base_url, base_url_error := strings.clone(src.base_url, allocator)
@@ -345,6 +355,7 @@ catalog_apply_provider :: proc(dst: ^Catalog_Provider, src: Catalog_Provider_Sou
 //
 // Linear scans over the resolved lists are deliberate at this scale; the
 // alternative is a lookup map that nothing yet needs.
+@(require_results)
 catalog_apply_source :: proc(
 	catalog: ^Catalog,
 	source: []Catalog_Provider_Source,
@@ -392,6 +403,7 @@ catalog_apply_source :: proc(
 // resolve_catalog builds the catalog from the three sources in priority order.
 // Loading order is not merge priority: every source is an independent input, and
 // the first one to define a field keeps it.
+@(require_results)
 resolve_catalog :: proc(user, provider, models_dev: []Catalog_Provider_Source, allocator := context.allocator) -> (Catalog, Catalog_Error) {
 	if err := catalog_validate_user(user); err != .None { return {}, err }
 	result := Catalog {

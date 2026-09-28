@@ -268,6 +268,7 @@ chat_report_terminal :: proc(chat: ^Chat_Session, observer: Chat_Observer, statu
 
 // chat_session_feed_text accepts a streamed fragment and returns whether it
 // belongs to the running request.
+@(require_results)
 chat_session_feed_text :: proc(chat: ^Chat_Session, source: Chat_Event_Source, text: string) -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
 	if _, append_error := append(&chat.partial_assistant, text); append_error != nil {
@@ -293,6 +294,7 @@ chat_session_feed_completion :: proc(chat: ^Chat_Session, source: Chat_Event_Sou
 // text and executable calls travel through their own feeds alongside it.
 // Only the Responses API calls this; Chat Completions has no replayable
 // output items to preserve.
+@(require_results)
 chat_session_feed_response_output :: proc(chat: ^Chat_Session, source: Chat_Event_Source, output: string) -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
 	if output == "" { return true }
@@ -310,6 +312,7 @@ chat_session_feed_response_output :: proc(chat: ^Chat_Session, source: Chat_Even
 // levels and applies it to the next request. An empty level clears the
 // override back to provider default. Effort never touches in-flight work:
 // the builder copies the selection when it freezes each request.
+@(require_results)
 chat_session_set_effort :: proc(chat: ^Chat_Session, level: string) -> bool {
 	if level == "" {
 		delete(chat.effort, chat.allocator)
@@ -379,6 +382,7 @@ chat_session_steer :: proc(chat: ^Chat_Session, text: string, origin := journal.
 // chat_tool_call_clone copies one proposed call. valid is false for a call without the
 // identity a result is matched by, and allocation_error reports a copy that did not fit; the
 // caller releases what was copied before it gave up, so a call is never handed on half owned.
+@(require_results)
 chat_tool_call_clone :: proc(call: ai.Provider_Tool_Call, allocator: mem.Allocator) -> (Chat_Tool_Call, bool, mem.Allocator_Error) {
 	if call.ID == "" || call.Name == "" { return {}, false, nil }
 	cloned: Chat_Tool_Call
@@ -447,6 +451,7 @@ chat_notice_text :: proc(notice: Chat_Notice) -> string {
 // account of it. The explanation is a literal and the provider's words vary, so the composed
 // text is built in the caller's memory. A refusal the model cannot read is one it cannot
 // correct, so nothing the provider said is dropped.
+@(require_results)
 chat_notice_committed_text :: proc(chat: ^Chat_Session, allocator: mem.Allocator) -> string {
 	explanation := chat_notice_text(chat.pending_notice)
 	if chat.notice_detail == "" { return explanation }
@@ -543,6 +548,7 @@ chat_session_feed_tool_calls :: proc(chat: ^Chat_Session, source: Chat_Event_Sou
 // may continue. It is the transition that ends the Execute_Tools stage, and every refusal
 // leaves the turn able to reach a terminal instead of in a state that would dispatch the same
 // committed calls again: an unanswered call is still a call whose intent is in the record.
+@(require_results)
 chat_session_tools_done :: proc(chat: ^Chat_Session, turn_id: u64, results: int) -> bool {
 	// A turn already stopping keeps the reason it stopped for. A cancelled turn still resolves
 	// its committed calls, so its history stays well formed even though no further request is

@@ -123,7 +123,7 @@ return err .. "|" .. err_args .. "|" .. err_sort`,
 	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Host_Request)
 	testing.expect_value(t, run.request.kind, Lua_Request_Kind.Wait)
 	testing.expect_value(t, run.request.handle, 3)
-	codemode_lua_answer_error(run, "no such handle")
+	testing.expect(t, codemode_lua_answer_error(run, "no such handle"), "the refusal should reach the script")
 	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Returned)
 	value, _ := codemode_lua_returned_string(run)
 	parts := strings.split(value, "|", context.temp_allocator)

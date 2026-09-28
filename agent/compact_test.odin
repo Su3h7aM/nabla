@@ -81,7 +81,7 @@ test_a_summary_opens_the_request_before_the_kept_tail :: proc(test: ^testing.T) 
 
 	items := []Projection_Item{compact_user_item(1, "kept question"), {node = 2, payload = Projected_Assistant{text = "kept answer"}}}
 	prep: Chat_Request_Prep
-	chat_build_request_into(chat, &prep, items, "earlier work", tool_loop_connection, "", virtual.arena_allocator(&arena))
+	_ = chat_build_request_into(chat, &prep, items, "earlier work", tool_loop_connection, "", virtual.arena_allocator(&arena))
 	testing.expect_value(test, len(prep.request.Messages), 3)
 	testing.expect_value(test, prep.request.Messages[0].Role, ai.Provider_Role.User)
 	testing.expect_value(test, prep.request.Messages[0].Content, "earlier work")
@@ -105,7 +105,7 @@ test_a_partial_answer_is_never_sent :: proc(test: ^testing.T) {
 	_test_commit(test, chat)
 	projection := _test_projection(test, chat, &arena)
 	prep: Chat_Request_Prep
-	chat_build_request_into(chat, &prep, projection.items, projection.summary, tool_loop_connection, "", virtual.arena_allocator(&arena))
+	_ = chat_build_request_into(chat, &prep, projection.items, projection.summary, tool_loop_connection, "", virtual.arena_allocator(&arena))
 	testing.expect_value(test, len(prep.request.Messages), 1)
 	testing.expect_value(test, prep.request.Messages[0].Content, "question")
 }
@@ -124,7 +124,7 @@ test_a_compaction_request_shares_the_conversation_prefix :: proc(test: ^testing.
 
 	items := []Projection_Item{compact_user_item(1, "first")}
 	prep: Chat_Request_Prep
-	chat_build_request_into(chat, &prep, items, "", tool_loop_connection, CHAT_COMPACT_DIRECTIVE, virtual.arena_allocator(&arena))
+	_ = chat_build_request_into(chat, &prep, items, "", tool_loop_connection, CHAT_COMPACT_DIRECTIVE, virtual.arena_allocator(&arena))
 
 	testing.expect(test, prep.request.Instructions_Present)
 	testing.expect_value(test, prep.request.Instructions, AGENT_SYSTEM_PROMPT)

@@ -30,6 +30,7 @@ Models_Dev_Parse_Error :: enum {
 // models that provider serves. `providers` restricts the result to those provider ids; an
 // empty list keeps every provider. The result is owned by the caller and released with
 // catalog_sources_destroy.
+@(require_results)
 models_dev_parse :: proc(data: []u8, providers: []string = {}, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Models_Dev_Parse_Error) {
 	// The document is megabyte-scale and its tree is several times that, so the
 	// tree lives in a dedicated arena that is unmapped when extraction finishes.
@@ -124,6 +125,7 @@ models_dev_model_less :: proc(a, b: Catalog_Model_Source) -> bool { return a.id 
 // represent into out. Everything else models.dev states about a provider -- its
 // display name, documentation link, and SDK version among them -- has no consumer
 // here. A failure releases what it built and leaves out empty.
+@(require_results)
 models_dev_provider_source :: proc(object: json.Object, provider_id: string, allocator: mem.Allocator, out: ^Catalog_Provider_Source) -> mem.Allocator_Error {
 	failed := true
 	defer if failed { catalog_provider_source_destroy(out, allocator) }
@@ -161,6 +163,7 @@ models_dev_provider_source :: proc(object: json.Object, provider_id: string, all
 // its own SDK is served through that family regardless of its provider's. The family is stated
 // only when it is one this harness implements, so an unrecognized one leaves the provider's. A
 // failure releases what it built and leaves out empty.
+@(require_results)
 models_dev_model_source :: proc(object: json.Object, allocator: mem.Allocator, out: ^Catalog_Model_Source) -> mem.Allocator_Error {
 	failed := true
 	defer if failed { catalog_model_source_destroy(out, allocator) }
@@ -220,6 +223,7 @@ models_dev_model_source :: proc(object: json.Object, allocator: mem.Allocator, o
 // support flag every record carries, and `reasoning_options` adds the control forms the
 // provider accepts, which are independent of one another. out owns nothing until a level
 // list is read, and that is the last thing this can fail on.
+@(require_results)
 models_dev_thinking :: proc(object: json.Object, allocator: mem.Allocator, out: ^Catalog_Thinking_Source) -> mem.Allocator_Error {
 	supported, supported_present := models_dev_member_bool(object, "reasoning")
 	if !supported_present { return nil }
@@ -282,6 +286,7 @@ models_dev_thinking :: proc(object: json.Object, allocator: mem.Allocator, out: 
 // Completions. An SDK for another vendor, or a gateway package, is left unstated
 // so the provider requires an explicit api in configuration instead of being sent
 // the wrong wire format.
+@(require_results)
 models_dev_api_family :: proc(npm: string) -> (api: string, known: bool) {
 	switch npm {
 	case "@ai-sdk/openai":
@@ -296,7 +301,7 @@ models_dev_api_family :: proc(npm: string) -> (api: string, known: bool) {
 
 // _models_dev_wanted reports whether a provider id is one of the ids the caller
 // asked for. The configured set is small, so a scan beats a lookup structure.
-@(private)
+@(private, require_results)
 _models_dev_wanted :: proc(providers: []string, id: string) -> bool {
 	for provider in providers {
 		if provider == id { return true }
@@ -304,6 +309,7 @@ _models_dev_wanted :: proc(providers: []string, id: string) -> bool {
 	return false
 }
 
+@(require_results)
 models_dev_member_string :: proc(object: json.Object, key: string) -> (value: string, present: bool) {
 	member, found := object[key]
 	if !found { return "", false }
@@ -312,6 +318,7 @@ models_dev_member_string :: proc(object: json.Object, key: string) -> (value: st
 	return string(text), true
 }
 
+@(require_results)
 models_dev_member_bool :: proc(object: json.Object, key: string) -> (value: bool, present: bool) {
 	member, found := object[key]
 	if !found { return false, false }
@@ -323,6 +330,7 @@ models_dev_member_bool :: proc(object: json.Object, key: string) -> (value: bool
 // models_dev_member_integer reads a member that must be a non-negative integer. A
 // fractional value is refused rather than truncated: a limit is a count, and
 // rounding one would invent a number upstream did not state.
+@(require_results)
 models_dev_member_integer :: proc(object: json.Object, key: string) -> (value: int, present: bool) {
 	member, found := object[key]
 	if !found { return 0, false }
@@ -335,6 +343,7 @@ models_dev_member_integer :: proc(object: json.Object, key: string) -> (value: i
 // copied, because the parsed document is released as soon as parsing finishes. A non-string
 // element is dropped rather than failing the catalog. An allocation failure is reported rather
 // than returning a short list.
+@(require_results)
 models_dev_member_strings :: proc(object: json.Object, key: string, allocator: mem.Allocator) -> (values: []string, present: bool, err: mem.Allocator_Error) {
 	member, found := object[key]
 	if !found { return nil, false, nil }

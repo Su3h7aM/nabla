@@ -387,7 +387,7 @@ test_unknown_tool_is_reported_not_run :: proc(test: ^testing.T) {
 	call := chat.pending_calls[0].call
 	count := chat_run_tools(chat, {})
 	testing.expect_value(test, count, 1)
-	chat_session_tools_done(chat, chat.active_turn_id, count)
+	_ = chat_session_tools_done(chat, chat.active_turn_id, count)
 
 	// The call never dispatched, so it has a result and no admission.
 	records := _test_records(test, chat, {.Tool_Admitted, .Tool_Completed})
@@ -775,7 +775,7 @@ test_an_incomplete_tool_batch_ends_the_turn :: proc(test: ^testing.T) {
 	testing.expect_value(test, finish.kind, Chat_Effect_Kind.Turn_Finished)
 	testing.expect_value(test, finish.status, Chat_Terminal_Status.Cancelled)
 	chat_session_claim_finish(chat, finish)
-	chat_persist_turn_end(chat, finish)
+	testing.expect(test, chat_persist_turn_end(chat, finish))
 	testing.expect_value(test, chat.state, Chat_State.Idle)
 	_test_accept(test, chat, "next")
 	testing.expect_value(test, len(chat.pending_calls), 0)

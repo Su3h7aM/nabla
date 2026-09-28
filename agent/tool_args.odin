@@ -83,6 +83,7 @@ Codemode_Args :: struct {
 // tool_args_decode reads one admitted document as the tool's own arguments, refusing a call
 // whose fields do not match what the tool declares. It is the only place a document becomes
 // arguments, so a tool, a Lua child call, and a repaired call all read the same way.
+@(require_results)
 tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object: json.Object) -> (Tool_Args, Tool_Argument_Error) {
 	switch definition.kind {
 	case .Read:

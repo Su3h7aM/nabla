@@ -51,7 +51,7 @@ chat_tool_jobs_wait :: proc(chat: ^Chat_Session) {
 // count to the chat barrier. A batch that answered every call it was given commits
 // the Results node that lists them in proposal order. It is the only production path
 // that clears the table.
-@(private)
+@(private, require_results)
 chat_tool_jobs_finish :: proc(chat: ^Chat_Session, turn_id: u64) -> bool {
 	if !chat.tool_jobs_active || !tool_jobs_settled(&chat.tool_jobs) { return false }
 	count := tool_jobs_committed(&chat.tool_jobs)
@@ -65,7 +65,7 @@ chat_tool_jobs_finish :: proc(chat: ^Chat_Session, turn_id: u64) -> bool {
 // chat_commit_results commits the Results node answering the staged calls, in proposal
 // order, once roots results were committed for all of them. It reports false only when
 // the commit failed.
-@(private)
+@(private, require_results)
 chat_commit_results :: proc(chat: ^Chat_Session, roots: int) -> bool {
 	if roots != len(chat.pending_calls) || roots == 0 { return true }
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -85,7 +85,7 @@ chat_commit_results :: proc(chat: ^Chat_Session, roots: int) -> bool {
 // the Assistant node of a root call and parent_call the call that started a Lua child. It
 // reports false when the commit failed, which stops the turn: a call that ran and left no
 // result is exactly the unanswered call the record must never have.
-@(private)
+@(private, require_results)
 chat_record_tool_result :: proc(
 	chat: ^Chat_Session,
 	call: journal.Call_Id,

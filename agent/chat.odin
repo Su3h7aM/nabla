@@ -9,6 +9,7 @@ import "core:time"
 import "nabla:agent/journal"
 import "nabla:ai"
 
+@(require_results)
 chat_api_kind :: proc(value: string) -> (ai.API_Kind, bool) {
 	switch value {
 	case "openai_chat_completions":
@@ -55,7 +56,7 @@ Chat_Request_Usage :: struct {
 //
 // On failure the turn is failed here and no body is returned. On success the caller owns
 // encoded.Body and must release it once the chain is over.
-@(private)
+@(private, require_results)
 chat_request_transport :: proc(
 	chat: ^Chat_Session,
 	connection: ai.Provider_Connection,
@@ -180,7 +181,7 @@ chat_commit_response :: proc(
 // tool.proposed record per call, and the harness's notice. It also settles what
 // the response costs the next request and releases the staged response. It
 // reports whether the commit landed; a failure stops the turn.
-@(private)
+@(private, require_results)
 chat_commit_response_nodes :: proc(
 	chat: ^Chat_Session,
 	request: journal.Request_Id,
@@ -282,7 +283,7 @@ chat_response_cost :: proc(chat: ^Chat_Session, text, notice: string) -> int {
 // It reports whether the commit landed. A turn whose outcome did not reach the
 // journal must not be reported as the status the model reached, because that
 // would claim a record the journal does not have.
-@(private)
+@(private, require_results)
 chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (recorded: bool) {
 	if chat.turn == 0 { return true }
 	// The turn is still identifiable here, which is what the end record carries.
@@ -347,7 +348,7 @@ chat_retry_deadline :: proc(delay: time.Duration) -> Maybe(time.Tick) {
 }
 
 // chat_retry_wait waits out a backoff and reports whether it elapsed without a cancel.
-@(private)
+@(private, require_results)
 chat_retry_wait :: proc(chat: ^Chat_Session, delay: time.Duration) -> bool {
 	deadline := chat_retry_deadline(delay)
 	for {
@@ -372,6 +373,7 @@ chat_session_clear_attempt :: proc(chat: ^Chat_Session) {
 
 // --- the turn loop -----------------------------------------------------------
 
+@(require_results)
 chat_run_turn :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, policy: Chat_Retry_Policy, observer: Chat_Observer) -> bool {
 	return chat_run_turn_steered(chat, connection, policy, observer, nil)
 }
@@ -392,6 +394,7 @@ chat_websocket_fallback_safe :: proc(err: ai.Provider_Operation_Error) -> bool {
 // with no input of its own, such as a headless run; otherwise the request boundary
 // consumes what the user queued while the turn ran. control is nil for a caller that
 // never stops a turn itself; a process interrupt stops the turn either way.
+@(require_results)
 chat_run_turn_steered :: proc(
 	chat: ^Chat_Session,
 	connection: ai.Provider_Connection,
@@ -408,6 +411,7 @@ chat_run_turn_steered :: proc(
 
 // chat_turn_drive is the turn loop without the process signal handler, for a turn that does
 // not own the terminal, such as a subagent's on its own thread.
+@(require_results)
 chat_turn_drive :: proc(
 	chat: ^Chat_Session,
 	connection: ai.Provider_Connection,

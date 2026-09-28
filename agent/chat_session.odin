@@ -265,6 +265,7 @@ Chat_Session :: struct {
 //
 // Diagnostics are not a field here. The session's work inherits the writer from
 // context.logger, which is what lets a call site emit without threading one.
+@(require_results)
 chat_session_init :: proc(
 	store: ^journal.Journal,
 	session: journal.Session_Id,
@@ -315,6 +316,7 @@ chat_session_init :: proc(
 // chat_session_set_client_instructions replaces the standing instructions supplied by
 // a client. The replacement invalidates the generated instruction snapshot so the next
 // request renders the client's text together with the harness instructions.
+@(require_results)
 chat_session_set_client_instructions :: proc(chat: ^Chat_Session, instructions: string) -> bool {
 	if chat.state != .Idle { return false }
 	owned, clone_error := strings.clone(instructions, chat.allocator)
@@ -389,6 +391,7 @@ Tool_Registry_Replace_Error :: enum {
 // Whether a failed external refresh keeps the previous registry, removes
 // unavailable tools, or blocks the next turn is the root package's policy
 // once discovery exists; it does not belong here.
+@(require_results)
 chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Registry) -> Tool_Registry_Replace_Error {
 	if chat.state != .Idle { return .Busy }
 	tool_registry_destroy(&chat.tools)
@@ -399,6 +402,7 @@ chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Regis
 
 // chat_session_apply_harness applies the launch's harness options to a session and its tool
 // registry. The options must outlive the session.
+@(require_results)
 chat_session_apply_harness :: proc(chat: ^Chat_Session, options: Harness_Options) -> Tool_Registry_Error {
 	chat.disable_project_instructions = options.disable_project_instructions
 	chat.acp_agents = options.acp_agents
@@ -460,6 +464,7 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 // chat_clone_string copies value with allocator. The caller owns the copy, and a copy that
 // did not fit is reported rather than returned as an empty string, because a field set from
 // an empty string would hold a value the caller never asked for.
+@(require_results)
 chat_clone_string :: proc(value: string, allocator: mem.Allocator) -> (string, mem.Allocator_Error) {
 	return strings.clone(value, allocator)
 }
@@ -506,6 +511,7 @@ CHAT_TITLE_MAX_BYTES :: 80
 // the first line, trimmed and cut to a whole rune. The result is owned by
 // allocator, and a title that did not fit is reported: a listing line the caller
 // cannot have must not be mistaken for an empty one.
+@(require_results)
 chat_title_from_prompt :: proc(prompt: string, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	line := prompt
 	if newline := strings.index_byte(line, '\n'); newline >= 0 { line = line[:newline] }
@@ -690,6 +696,7 @@ chat_session_event_source :: proc(chat: ^Chat_Session) -> Chat_Event_Source {
 // cancelled, retired, or superseded operation cannot mutate a newer turn. A
 // refusal is recorded with its reason: dropping the event is correct, and the
 // reason is what makes the drop legible later.
+@(require_results)
 chat_session_accepts_event :: proc(chat: ^Chat_Session, source: Chat_Event_Source) -> bool {
 	reason := ""
 	switch {

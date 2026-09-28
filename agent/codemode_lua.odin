@@ -192,12 +192,12 @@ codemode_lua_alloc :: proc "c" (user_data: rawptr, ptr: rawptr, osize, nsize: c.
 
 // --- stopping ------------------------------------------------------------------
 
-@(private)
+@(private, require_results)
 codemode_lua_expired :: proc "contextless" (run: ^Lua_Run) -> bool {
 	return run.deadline != {} && time.tick_diff(run.deadline, time.tick_now()) >= 0
 }
 
-@(private)
+@(private, require_results)
 codemode_lua_stopping :: proc "contextless" (run: ^Lua_Run) -> bool {
 	return run.stop_requested || ai.interrupt_requested(run.interrupt) || codemode_lua_expired(run)
 }
@@ -469,7 +469,7 @@ codemode_lua_log_append :: proc(run: ^Lua_Run, text: string) {
 
 // codemode_lua_stack_string reads a value that is already text. Strings and numbers
 // convert; nothing else does.
-@(private)
+@(private, require_results)
 codemode_lua_stack_string :: proc "contextless" (state: ^lua.State, index: c.int) -> (string, bool) {
 	kind := lua.type(state, index)
 	if kind != .STRING && kind != .NUMBER { return "", false }
@@ -493,6 +493,7 @@ codemode_lua_push_string :: proc "contextless" (state: ^lua.State, text: string)
 //
 // A run is returned even when the chunk does not compile, so the caller can read the
 // message; the caller destroys it either way. A nil run means nothing could be allocated.
+@(require_results)
 codemode_lua_start :: proc(
 	source: string,
 	interrupt: ^ai.Interrupt = nil,
@@ -568,6 +569,7 @@ codemode_lua_start :: proc(
 
 // codemode_lua_install_tool adds one entry to the `tools` table under the tool's
 // canonical name, which a script writes as an ordinary field: `tools.fff_grep`.
+@(require_results)
 codemode_lua_install_tool :: proc(run: ^Lua_Run, name: string) -> bool {
 	if run.state == nil || !tool_name_valid(name) { return false }
 	state := run.state
@@ -595,6 +597,7 @@ codemode_lua_resume :: proc(run: ^Lua_Run) -> Lua_Event {
 // script's line, where the script may catch it with pcall. message is copied, and it
 // reports false when there was no memory to copy it, so the caller can answer the parent
 // instead of raising a refusal the script cannot read.
+@(require_results)
 codemode_lua_answer_error :: proc(run: ^Lua_Run, message: string) -> bool {
 	kept, kept_error := strings.clone(message, run.allocator)
 	if kept_error != nil { return false }
@@ -733,6 +736,7 @@ codemode_lua_settle :: proc(run: ^Lua_Run, event: Lua_Event, failure: Lua_Failur
 }
 
 // codemode_lua_returned_string reads the returned value when it is a string or number.
+@(require_results)
 codemode_lua_returned_string :: proc(run: ^Lua_Run) -> (string, bool) {
 	if run.last_event != .Returned || run.returned_values < 1 { return "", false }
 	return codemode_lua_stack_string(run.thread, c.int(-run.returned_values))

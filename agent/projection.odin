@@ -174,7 +174,7 @@ projection_load :: proc(
 
 // projection_add_assistant appends one response in the order it is replayed:
 // its native output, its finished text, then the calls it proposed.
-@(private)
+@(private, require_results)
 projection_add_assistant :: proc(
 	items: ^[dynamic]Projection_Item,
 	node: journal.Node,

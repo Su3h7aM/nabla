@@ -136,6 +136,7 @@ log_active_ring :: proc() -> ^Diag_Ring {
 
 // log_enabled reports whether an entry at level would be kept, for a producer that
 // must do measurable work before it can emit.
+@(require_results)
 log_enabled :: proc(level: log.Level) -> bool {
 	logger := context.logger
 	return logger.procedure == log_procedure && level >= logger.lowest_level
@@ -238,6 +239,7 @@ diag_push :: proc(ring: ^Diag_Ring, entry: ^Diag_Entry) {
 }
 
 // diag_pop takes the oldest entry, if any.
+@(require_results)
 diag_pop :: proc(ring: ^Diag_Ring, entry: ^Diag_Entry) -> bool {
 	sync.mutex_lock(&ring.mutex)
 	defer sync.mutex_unlock(&ring.mutex)
@@ -304,6 +306,7 @@ log_level_name :: proc(level: log.Level) -> string {
 }
 
 // log_level_parse reads a level name; "off" disables diagnostics.
+@(require_results)
 log_level_parse :: proc(name: string) -> (level: log.Level, enabled: bool, known: bool) {
 	switch name {
 	case "off":

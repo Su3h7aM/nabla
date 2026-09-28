@@ -29,6 +29,7 @@ fetch_collect :: proc(user_data: rawptr, chunk: []u8) {
 // slice and releases the accumulator. The accumulator's capacity is never shared
 // with the result: a slice carries no capacity, so a shorter view of a larger
 // allocation could not be freed correctly.
+@(require_results)
 fetch_body_finish :: proc(body: ^Fetch_Body, allocator: mem.Allocator) -> ([]u8, bool) {
 	defer delete(body.bytes)
 	if body.failed || len(body.bytes) == 0 { return nil, false }

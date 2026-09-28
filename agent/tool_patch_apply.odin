@@ -40,7 +40,7 @@ Patch_Placement :: struct {
 // patch_prepare checks every file section against the filesystem and computes each new file.
 // Everything it returns is owned by allocator. summary holds one line per change, and each
 // change records where its line ends.
-@(private)
+@(private, require_results)
 patch_prepare :: proc(
 	workspace: string,
 	args: Patch_Args,
@@ -108,19 +108,19 @@ patch_prepare :: proc(
 	return changes, string(summary_buffer[:]), repaired_hunks, nil
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_failure :: proc(kind: Patch_Failure_Kind, allocator: mem.Allocator, format: string, arguments: ..any) -> Patch_Failure {
 	return {kind, fmt.aprintf(format, ..arguments, allocator = allocator)}
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_resolve :: proc(workspace, path: string, allocator: mem.Allocator) -> (string, Patch_Error) {
 	resolved, resolve_error := tool_resolve_path(workspace, path, allocator = allocator)
 	if resolve_error != nil { return "", patch_failure(.Invalid_Path, allocator, "%s is not a valid path", path) }
 	return resolved, nil
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_existing_mode :: proc(path, path_argument: string, allocator: mem.Allocator) -> (os.Permissions, Patch_Error) {
 	if !os.exists(path) { return {}, patch_failure(.File_Missing, allocator, "%s does not exist; use %s to create it", path_argument, PATCH_HEADERS[.Add]) }
 	mode, problem := tool_write_mode(path)
@@ -128,7 +128,7 @@ patch_existing_mode :: proc(path, path_argument: string, allocator: mem.Allocato
 	return mode, nil
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_append :: proc(buffer: ^[dynamic]u8, parts: ..string) -> mem.Allocator_Error {
 	for part in parts { append(buffer, part) or_return }
 	return nil
@@ -139,7 +139,7 @@ patch_hunk_lines :: proc(lines: []Patch_Line, hunk: Patch_Hunk) -> []Patch_Line 
 	return lines[hunk.first_line:][:hunk.line_count]
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_only_adds :: proc(lines: []Patch_Line, hunks: []Patch_Hunk) -> bool {
 	for hunk in hunks {
 		for line in patch_hunk_lines(lines, hunk) {
@@ -152,7 +152,7 @@ patch_only_adds :: proc(lines: []Patch_Line, hunks: []Patch_Hunk) -> bool {
 // patch_update applies hunks to a file's text. Each hunk is placed on its own, then the
 // placements are applied in file order, so hunks may arrive in any order but may not overlap.
 // Unchanged lines keep the file's own bytes, and added lines take the file's line ending.
-@(private = "file")
+@(private = "file", require_results)
 patch_update :: proc(
 	path_argument, original: string,
 	lines: []Patch_Line,
@@ -223,7 +223,7 @@ patch_update :: proc(
 
 // patch_split_lines views text as lines without their newline. A trailing newline ends the last
 // line rather than starting an empty one.
-@(private = "file")
+@(private = "file", require_results)
 patch_split_lines :: proc(text: string, allocator: mem.Allocator) -> (lines: []string, err: mem.Allocator_Error) {
 	if text == "" { return nil, nil }
 	lines = strings.split(strings.trim_suffix(text, "\n"), "\n", allocator) or_return
@@ -235,7 +235,7 @@ patch_split_lines :: proc(text: string, allocator: mem.Allocator) -> (lines: []s
 // leaves at least one: the previous hunk's end, the anchor, End of File, and a unified diff's line
 // number. The hunk applies only where exactly one candidate remains. A hunk with only added lines
 // goes after its anchor, at its line number, or at the end of the file.
-@(private = "file")
+@(private = "file", require_results)
 patch_place :: proc(
 	path_argument: string,
 	hunk_index: int,
@@ -288,7 +288,7 @@ patch_place :: proc(
 
 // patch_side is the text of a hunk's lines that are not of the excluded kind: excluding Added
 // gives the lines the file holds now, and excluding Removed the lines it will hold.
-@(private = "file")
+@(private = "file", require_results)
 patch_side :: proc(hunk_lines: []Patch_Line, excluded: Patch_Line_Kind, allocator: mem.Allocator) -> (side: []string, err: mem.Allocator_Error) {
 	buffer := make([dynamic]string, 0, len(hunk_lines), allocator) or_return
 	for line in hunk_lines {
@@ -297,7 +297,7 @@ patch_side :: proc(hunk_lines: []Patch_Line, excluded: Patch_Line_Kind, allocato
 	return buffer[:], nil
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_matches :: proc(file_lines, expected: []string, level: Patch_Match_Level, allocator: mem.Allocator) -> (starts: []int, err: mem.Allocator_Error) {
 	buffer := make([dynamic]int, allocator) or_return
 	for start in 0 ..= len(file_lines) - len(expected) {
@@ -306,7 +306,7 @@ patch_matches :: proc(file_lines, expected: []string, level: Patch_Match_Level, 
 	return buffer[:], nil
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_lines_match :: proc(file_lines, expected: []string, level: Patch_Match_Level) -> bool {
 	for text, index in expected {
 		if !patch_line_matches(file_lines[index], text, level) { return false }
@@ -314,7 +314,7 @@ patch_lines_match :: proc(file_lines, expected: []string, level: Patch_Match_Lev
 	return true
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_line_matches :: proc(file_line, text: string, level: Patch_Match_Level) -> bool {
 	file_text := strings.trim_suffix(file_line, "\r")
 	switch level {
@@ -347,7 +347,7 @@ patch_narrow :: proc(candidates: []int, lowest, highest: int) -> []int {
 
 // patch_find_anchor finds the line an @@ names: a whole line before a line that contains it, and
 // from the cursor before the start of the file.
-@(private = "file")
+@(private = "file", require_results)
 patch_find_anchor :: proc(file_lines: []string, anchor: string, cursor: int) -> (index: int, found: bool) {
 	if anchor == "" { return }
 	for whole_line in ([?]bool{true, false}) {
@@ -391,7 +391,7 @@ patch_indentation :: proc(text: string) -> string {
 
 // patch_not_found describes why a hunk matched nowhere: its new lines are already in the file,
 // or where the longest run of its leading lines matches and the first line there that differs.
-@(private = "file")
+@(private = "file", require_results)
 patch_not_found :: proc(
 	path_argument: string,
 	hunk_index: int,

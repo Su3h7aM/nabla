@@ -260,7 +260,7 @@ _test_settle :: proc(test: ^testing.T, chat: ^Chat_Session) -> Chat_Effect {
 	finish := chat_session_advance(chat)
 	if finish.kind != .Turn_Finished { testing.fail_now(test, "expected the turn to finish") }
 	chat_session_claim_finish(chat, finish)
-	chat_persist_turn_end(chat, finish)
+	testing.expect(test, chat_persist_turn_end(chat, finish))
 	return finish
 }
 

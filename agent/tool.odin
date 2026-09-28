@@ -34,6 +34,7 @@ Tool_Wake :: struct {
 	write: ^os.File,
 }
 
+@(require_results)
 tool_wake_open :: proc() -> (wake: Tool_Wake, err: os.Error) {
 	wake.read, wake.write = os.pipe() or_return
 	return
@@ -180,6 +181,7 @@ Tool_Registry :: struct {
 	allocator:   mem.Allocator,
 }
 
+@(require_results)
 tool_registry_make :: proc(allocator := context.allocator) -> (registry: Tool_Registry, err: Tool_Registry_Error) {
 	registry = Tool_Registry {
 		allocator = allocator,
@@ -215,6 +217,7 @@ tool_registry_destroy :: proc(registry: ^Tool_Registry) {
 
 // tool_registry_clone copies every definition of source into a registry of its own. Backend
 // pointers are copied, never owned.
+@(require_results)
 tool_registry_clone :: proc(source: ^Tool_Registry, allocator := context.allocator) -> (registry: Tool_Registry, err: Tool_Registry_Error) {
 	registry.allocator = allocator
 	definitions, alloc_error := make([dynamic]Tool_Definition, 0, len(source.definitions), allocator)
@@ -258,6 +261,7 @@ TOOL_MAX_NAME_BYTES :: 64
 // tool_name_valid admits one canonical tool name: a flat Lua identifier of at most
 // 64 bytes. The same grammar is accepted by the provider APIs Nabla supports, so the
 // registry name is used verbatim on the wire and inside Lua.
+@(require_results)
 tool_name_valid :: proc(name: string) -> bool {
 	if name == "" || len(name) > TOOL_MAX_NAME_BYTES { return false }
 	first := name[0]
@@ -274,6 +278,7 @@ tool_name_valid :: proc(name: string) -> bool {
 // registry. The schema is admitted as JSON with an object root, using the same
 // tokenizer admission as argument documents; general JSON Schema semantics stay
 // the definition source's responsibility.
+@(require_results)
 tool_definition_validate :: proc(definition: Tool_Definition) -> Tool_Registry_Error {
 	if !tool_name_valid(definition.name) {
 		return {
@@ -299,7 +304,7 @@ tool_definition_validate :: proc(definition: Tool_Definition) -> Tool_Registry_E
 
 // tool_schema_valid reports why a schema document is unusable, or "" when it is
 // one JSON object. The returned string is static text.
-@(private)
+@(private, require_results)
 tool_schema_valid :: proc(schema: string) -> string {
 	if schema == "" { return "a tool needs an input schema" }
 	admit_error := tool_arguments_admit(schema, context.temp_allocator)
@@ -323,6 +328,7 @@ tool_schema_valid :: proc(schema: string) -> string {
 // name already in use is refused rather than replaced: two tools sharing a name
 // would make dispatch a coin toss. The backend pointer is copied, never
 // retained: the adapter keeps owning it.
+@(require_results)
 tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition) -> Tool_Registry_Error {
 	if invalid := tool_definition_validate(definition); invalid.kind != .None { return invalid }
 	if _, present := tool_registry_find(registry, definition.name); present {
@@ -364,7 +370,7 @@ tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition)
 // properties of an input schema whose type accepts an integer but neither a string nor a
 // number. A string or a float in such a field is invalid as sent, so reading it as an
 // integer is its only reading. A schema that does not parse declares no such field.
-@(private)
+@(private, require_results)
 tool_schema_integer_fields :: proc(schema: string, allocator: mem.Allocator) -> (fields: []string, err: mem.Allocator_Error) {
 	root, parse_error := json.parse_string(schema, .JSON, true, context.temp_allocator)
 	defer json.destroy_value(root, context.temp_allocator)
@@ -392,7 +398,7 @@ tool_schema_integer_fields :: proc(schema: string, allocator: mem.Allocator) -> 
 
 // tool_schema_type_accepts reports whether a property's "type", a name or a list of names,
 // includes type_name.
-@(private)
+@(private, require_results)
 tool_schema_type_accepts :: proc(property: json.Object, type_name: string) -> bool {
 	#partial switch declared in property["type"] {
 	case json.String:
@@ -405,6 +411,7 @@ tool_schema_type_accepts :: proc(property: json.Object, type_name: string) -> bo
 	return false
 }
 
+@(require_results)
 tool_registry_find :: proc(registry: ^Tool_Registry, name: string) -> (^Tool_Definition, bool) {
 	for &definition in registry.definitions {
 		if definition.name == name { return &definition, true }
@@ -457,6 +464,7 @@ tool_result_destroy :: proc(result: ^Tool_Result) {
 
 // tool_result_of builds a result from what a tool produced. output may borrow; the
 // result keeps its own copy. reason is a short line for the front-end.
+@(require_results)
 tool_result_of :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, message: string, output: Tool_Output, reason := "") -> Tool_Result {
 	result := Tool_Result {
 		outcome   = outcome,
@@ -478,18 +486,21 @@ tool_result_of :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, messag
 	return result
 }
 
+@(require_results)
 tool_result_success :: proc(ctx: ^Tool_Context, output: Tool_Output, reason := "") -> Tool_Result {
 	return tool_result_of(ctx, .Success, "", output, reason)
 }
 
 // tool_result_failure is a result with no output of its own: a refusal, a timeout,
 // a transport failure, or anything else the harness observed without output.
+@(require_results)
 tool_result_failure :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, message: string, reason := "") -> Tool_Result {
 	return tool_result_of(ctx, outcome, message, nil, reason)
 }
 
 // tool_result_refused takes ownership of err and answers a call whose arguments
 // could not be admitted. Nothing ran, and the result says exactly why.
+@(require_results)
 tool_result_refused :: proc(ctx: ^Tool_Context, err: ^Tool_Argument_Error) -> Tool_Result {
 	text, text_error := tool_argument_error_text(err^, ctx.allocator)
 	defer delete(text, ctx.allocator)
@@ -507,6 +518,7 @@ tool_result_refused :: proc(ctx: ^Tool_Context, err: ^Tool_Argument_Error) -> To
 
 // tool_control_cancelled reports whether the execution, or the work that owns it, was
 // asked to stop.
+@(require_results)
 tool_control_cancelled :: proc(control: Tool_Control) -> bool {
 	return ai.interrupt_requested(control.interrupt)
 }

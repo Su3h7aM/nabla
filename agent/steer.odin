@@ -24,6 +24,7 @@ Steer_Queue :: struct {
 	allocator: mem.Allocator,
 }
 
+@(require_results)
 steer_queue_init :: proc(allocator := context.allocator) -> Steer_Queue {
 	// A queue that holds nothing allocates nothing; it carries the allocator its first line
 	// is copied with.
@@ -42,6 +43,7 @@ steer_queue_destroy :: proc(queue: ^Steer_Queue) {
 
 // steer_push clones a line into the queue and wakes the owner. False means the line could
 // not be allocated; the caller keeps nothing either way.
+@(require_results)
 steer_push :: proc(queue: ^Steer_Queue, text: string) -> bool {
 	line, clone_error := strings.clone(text, queue.allocator)
 	if clone_error != nil { return false }
@@ -57,6 +59,7 @@ steer_push :: proc(queue: ^Steer_Queue, text: string) -> bool {
 }
 
 // steer_pop transfers ownership of the oldest line. False means empty.
+@(require_results)
 steer_pop :: proc(queue: ^Steer_Queue) -> (string, bool) {
 	sync.mutex_lock(&queue.mu)
 	defer sync.mutex_unlock(&queue.mu)
@@ -77,6 +80,7 @@ steer_pending :: proc(queue: ^Steer_Queue) -> bool {
 // the session could not record returns here, in its own order, instead of being dropped.
 // False means the queue could not take it back and the line was released: the one case
 // where input cannot stay pending.
+@(require_results)
 steer_requeue :: proc(queue: ^Steer_Queue, line: string) -> bool {
 	sync.mutex_lock(&queue.mu)
 	defer sync.mutex_unlock(&queue.mu)
@@ -92,6 +96,7 @@ steer_requeue :: proc(queue: ^Steer_Queue, line: string) -> bool {
 // takes it decides what it becomes, and steer_taken_destroy releases it. False means the
 // lines could not be copied out, and they stay in the queue for the next drain: a failed
 // take never takes input away from the session.
+@(require_results)
 steer_take_all :: proc(queue: ^Steer_Queue) -> (taken: [dynamic]string, ok: bool) {
 	sync.mutex_lock(&queue.mu)
 	defer sync.mutex_unlock(&queue.mu)

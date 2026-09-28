@@ -25,6 +25,7 @@ Instruction_Manifest_Error :: enum {
 // chat_ensure_instructions settles the instructions the session runs with: the
 // snapshot its latest turn recorded, or a new one rendered from the workspace. A
 // new snapshot is buffered as artifacts that the next turn.started names.
+@(require_results)
 chat_ensure_instructions :: proc(chat: ^Chat_Session) -> bool {
 	if chat.skill_instructions != "" { return true }
 
@@ -53,7 +54,7 @@ chat_ensure_instructions :: proc(chat: ^Chat_Session) -> bool {
 
 // chat_restore_instructions applies the snapshot named by the session's latest
 // turn.started, and reports whether there was one.
-@(private)
+@(private, require_results)
 chat_restore_instructions :: proc(chat: ^Chat_Session) -> (applied: bool, error: journal.Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	filter := journal.Filter {
@@ -77,6 +78,7 @@ chat_restore_instructions :: proc(chat: ^Chat_Session) -> (applied: bool, error:
 	return true, nil
 }
 
+@(require_results)
 chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: string, catalog: skills.Catalog, error_text: string) {
 	files, files_error, files_kind := collect_agents_files(chat.workspace, chat.disable_project_instructions, chat.allocator)
 	if files_kind == .Allocation { return "", "", {}, "local instructions could not be allocated" }
@@ -124,6 +126,7 @@ chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: str
 
 // chat_encode_manifest records the snapshot a later resume applies. The roots it writes are
 // the catalog's own, because every root index it also writes refers to that list.
+@(require_results)
 chat_encode_manifest :: proc(
 	chat: ^Chat_Session,
 	files: []Agents_File,
@@ -261,6 +264,7 @@ instruction_manifest_kind :: proc(kind: skills.Source_Kind) -> string {
 	return "unknown"
 }
 
+@(require_results)
 snapshot_skill_make :: proc(entry: Instruction_Manifest_Skill, allocator: mem.Allocator) -> (skills.Skill, bool) {
 	skill: skills.Skill
 	clone_error: mem.Allocator_Error
@@ -289,6 +293,7 @@ snapshot_skill_make :: proc(entry: Instruction_Manifest_Skill, allocator: mem.Al
 	return skill, true
 }
 
+@(require_results)
 snapshot_root_make :: proc(entry: Instruction_Manifest_Root, allocator: mem.Allocator) -> (skills.Root, bool) {
 	root: skills.Root
 	path, path_error := strings.clone(entry.path, allocator)
@@ -306,6 +311,7 @@ snapshot_root_make :: proc(entry: Instruction_Manifest_Root, allocator: mem.Allo
 	return root, true
 }
 
+@(require_results)
 snapshot_diagnostic_make :: proc(entry: Instruction_Manifest_Diagnostic, allocator: mem.Allocator) -> (skills.Diagnostic, bool) {
 	diagnostic: skills.Diagnostic
 	path, path_error := strings.clone(entry.path, allocator)
@@ -339,6 +345,7 @@ snapshot_diagnostic_make :: proc(entry: Instruction_Manifest_Diagnostic, allocat
 	return diagnostic, true
 }
 
+@(require_results)
 chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: string) -> bool {
 	// The manifest is parsed out of temp memory and everything the catalog keeps is cloned
 	// into the session's allocator.

@@ -75,6 +75,7 @@ patch_args_destroy :: proc(args: ^Patch_Args, allocator: mem.Allocator) {
 // without their leading space, and added files without `+` prefixes. Strings borrow patch, and
 // the arrays are owned by allocator. problem names what has no single reading, is "" for a
 // patch that parsed, and is allocated in the temp allocator.
+@(require_results)
 patch_parse :: proc(patch: string, allocator: mem.Allocator) -> (args: Patch_Args, problem: string, err: mem.Allocator_Error) {
 	parser: Patch_Parser
 	defer if problem != "" || err != nil {
@@ -118,7 +119,7 @@ patch_parse :: proc(patch: string, allocator: mem.Allocator) -> (args: Patch_Arg
 
 // patch_is_wrapper_end reports whether lines start with a closing code fence or heredoc
 // terminator followed only by blank lines, which ends a patch that lacks *** End Patch.
-@(private = "file")
+@(private = "file", require_results)
 patch_is_wrapper_end :: proc(lines: []string) -> bool {
 	first := strings.trim_space(lines[0])
 	if !strings.has_prefix(first, "```") && first != "EOF" { return false }
@@ -128,7 +129,7 @@ patch_is_wrapper_end :: proc(lines: []string) -> bool {
 	return true
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_header :: proc(line: string) -> (operation: Patch_Operation, path: string, is_header: bool) {
 	for marker, candidate in PATCH_HEADERS {
 		if rest, found := patch_marker(line, marker); found { return candidate, patch_clean_path(rest), true }
@@ -137,7 +138,7 @@ patch_header :: proc(line: string) -> (operation: Patch_Operation, path: string,
 }
 
 // patch_marker matches a marker at the start of a line in any letter case.
-@(private = "file")
+@(private = "file", require_results)
 patch_marker :: proc(line, marker: string) -> (rest: string, found: bool) {
 	if len(line) < len(marker) || !strings.equal_fold(line[:len(marker)], marker) { return }
 	return line[len(marker):], true
@@ -154,7 +155,7 @@ patch_clean_path :: proc(text: string) -> string {
 
 // patch_unified_header reads a `--- old` and `+++ new` pair. Inside a section the pair must be
 // followed by an @@ line, because there it could also be a removed and an added line.
-@(private = "file")
+@(private = "file", require_results)
 patch_unified_header :: proc(lines: []string, in_section: bool) -> (operation: Patch_Operation, path, move_to: string, is_header: bool) {
 	if len(lines) < 2 { return }
 	old_line := strings.trim_suffix(lines[0], "\r")
@@ -187,7 +188,7 @@ patch_unified_path :: proc(text: string) -> string {
 	return patch_clean_path(path)
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_open_section :: proc(
 	parser: ^Patch_Parser,
 	operation: Patch_Operation,
@@ -205,14 +206,14 @@ patch_open_section :: proc(
 	return
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_open_hunk :: proc(parser: ^Patch_Parser, anchor: string, line_hint: int) -> mem.Allocator_Error {
 	append(&parser.hunks, Patch_Hunk{anchor = anchor, line_hint = line_hint, first_line = len(parser.lines)}) or_return
 	parser.hunk_open = true
 	return nil
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_add_line :: proc(parser: ^Patch_Parser, line: Patch_Line) -> mem.Allocator_Error {
 	if !parser.hunk_open { patch_open_hunk(parser, "", 0) or_return }
 	append(&parser.lines, line) or_return
@@ -220,7 +221,7 @@ patch_add_line :: proc(parser: ^Patch_Parser, line: Patch_Line) -> mem.Allocator
 	return nil
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_section_line :: proc(parser: ^Patch_Parser, line: string, line_number: int) -> (problem: string, err: mem.Allocator_Error) {
 	file := &parser.files[len(parser.files) - 1]
 	if rest, is_move := patch_marker(line, PATCH_MOVE); is_move {
@@ -292,7 +293,7 @@ patch_classify :: proc(line: string) -> Patch_Line {
 // patch_close_section finishes the last section. An added file drops its `+` prefixes when
 // every line has one, and blank lines that trail it. An updated file drops unchanged empty lines
 // that trail a hunk and hunks that change nothing, since neither can change the result.
-@(private = "file")
+@(private = "file", require_results)
 patch_close_section :: proc(parser: ^Patch_Parser) -> (problem: string) {
 	if !parser.section { return }
 	parser.section = false
@@ -338,7 +339,7 @@ patch_close_section :: proc(parser: ^Patch_Parser) -> (problem: string) {
 	return
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_hunk_changes :: proc(lines: []Patch_Line) -> bool {
 	for line in lines {
 		if line.kind != .Context { return true }

@@ -68,6 +68,7 @@ CHAT_COMPACT_CHECKPOINT_PREAMBLE :: "The conversation was compacted through this
 // chat_checkpoint_text frames a summary as the checkpoint message the model reads.
 // The result is owned by allocator, and a frame that did not fit is reported: a
 // checkpoint the model cannot read must not be installed as an empty one.
+@(require_results)
 chat_checkpoint_text :: proc(summary: string, allocator: mem.Allocator) -> (string, mem.Allocator_Error) {
 	return strings.concatenate({CHAT_COMPACT_CHECKPOINT_PREAMBLE, "\n\n", summary}, allocator)
 }
@@ -146,6 +147,7 @@ Compact_Snapshot :: struct {
 //
 // The worker encodes with no cache: the session's cache belongs to the thread that
 // walks it, and this request is read once, by the thread that sends it.
+@(require_results)
 chat_compact_snapshot_make :: proc(
 	prep: ^Chat_Request_Prep,
 	connection: ai.Provider_Connection,
@@ -527,7 +529,7 @@ chat_compact_progress :: proc(chat: ^Chat_Session, connection: ai.Provider_Conne
 // the endpoint, and the credential. A change to any of them is a change of configuration, and
 // the digest is that generation: comparing it is what lets a corrected credential clear a
 // suppression without the credential itself being stored or logged as a key.
-@(private)
+@(private, require_results)
 chat_compact_identity :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection) -> (string, bool) {
 	text := fmt.tprintf("%s\n%s\n%s\n%s", chat_api_name(connection.API), chat.model_id, connection.Endpoint, connection.Credential)
 	return chat_text_digest(text)
@@ -535,7 +537,7 @@ chat_compact_identity :: proc(chat: ^Chat_Session, connection: ai.Provider_Conne
 
 // chat_compact_begin_attempt records a send before its worker starts, with the digest and
 // the size of the frozen bytes that send will carry.
-@(private)
+@(private, require_results)
 chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bool {
 	header := journal.Record {
 		kind     = .Request_Sent,
@@ -569,7 +571,7 @@ chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bo
 // inside the worker would leave a startup window. The handle comes from the process heap,
 // because a job whose worker ignores its stop keeps it and the session's allocator may already
 // be released by then.
-@(private)
+@(private, require_results)
 chat_compact_launch :: proc(job: ^Compact_Job) -> bool {
 	previous := chat_signal_block_watched()
 	previous_allocator := context.allocator
@@ -586,7 +588,7 @@ chat_compact_launch :: proc(job: ^Compact_Job) -> bool {
 // chat_compact_start freezes the compaction request for the context that prep was
 // built from and runs it on its own thread. The covered boundary is the end of the
 // prefix being summarized, so everything after it stays live.
-@(private)
+@(private, require_results)
 chat_compact_start :: proc(
 	chat: ^Chat_Session,
 	observer: Chat_Observer,
@@ -995,7 +997,7 @@ chat_compact_failed_job :: proc(control: ^Compact_Control, job: ^Compact_Job) {
 
 // chat_compact_install commits the candidate's checkpoint and drops the job. A
 // candidate built against a superseded checkpoint is refused.
-@(private)
+@(private, require_results)
 chat_compact_install :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bool {
 	control := &chat.compact
 	job := control.job
@@ -1206,7 +1208,7 @@ chat_repair_refusal_text :: proc(refusal: Chat_Repair_Refusal) -> string {
 // candidate the store refuses. The caller owns prep and encoded either way: on success
 // they describe the payload the next attempt sends, and the chain's bound does not reset
 // because that payload changed.
-@(private)
+@(private, require_results)
 chat_repair_context :: proc(
 	chat: ^Chat_Session,
 	connection: ai.Provider_Connection,
@@ -1324,6 +1326,7 @@ chat_compact_destroy :: proc(chat: ^Chat_Session) {
 // chat_command_compact starts the same compaction the automatic path starts, at a
 // settled turn or a request boundary. It reports that compaction is under way, not
 // that a summary exists: nothing about it blocks the caller.
+@(require_results)
 chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection) -> bool {
 	if chat.storage_failed { return false }
 	switch chat_compact_request(chat, .User_Command) {

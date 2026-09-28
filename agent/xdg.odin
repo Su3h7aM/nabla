@@ -48,6 +48,7 @@ xdg_variable :: proc(kind: XDG_Kind) -> (variable: string, fallback: string) {
 
 // xdg_directory resolves this application's directory for one XDG category
 // without touching the filesystem. The result is owned by the caller.
+@(require_results)
 xdg_directory :: proc(kind: XDG_Kind, allocator := context.allocator) -> (string, XDG_Error) {
 	// The environment lookup and the base it falls back to are scratch, but the
 	// directory handed back may be the caller's temp memory itself, so a caller
@@ -71,6 +72,7 @@ xdg_directory :: proc(kind: XDG_Kind, allocator := context.allocator) -> (string
 
 // xdg_directory_create creates a resolved directory and its parents when it is
 // missing. An existing directory keeps its permissions.
+@(require_results)
 xdg_directory_create :: proc(path: string) -> XDG_Error {
 	make_err := os.make_directory_all(path, XDG_APP_PERMISSIONS)
 	if make_err != nil && make_err != .Exist { return .Create }

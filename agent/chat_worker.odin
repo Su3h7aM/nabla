@@ -46,7 +46,7 @@ chat_request_worker_main :: proc(thread: ^thread.Thread) {
 // chat_request_worker_attempt runs the blocking send and returns what the owner needs to
 // decide the next stage. Everything it records as progress is queued by the callback, so a
 // stream that ends badly still leaves the owner with every fact that arrived.
-@(private)
+@(private, require_results)
 chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attempt_Terminal {
 	runtime := Chat_Worker_Runtime {
 		worker = worker,
@@ -172,7 +172,7 @@ chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 // chat_worker_completion copies a completed response into what the owner keeps, or reports
 // that it did not fit. A copy that fails releases everything it copied before it gave up, so
 // the owner never receives a response that is missing a piece of what the model sent.
-@(private)
+@(private, require_results)
 chat_worker_completion :: proc(
 	worker: ^Chat_Request_Worker,
 	source: Chat_Event_Source,

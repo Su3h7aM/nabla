@@ -296,7 +296,7 @@ chat_body_digest :: proc(body: []u8, buffer: []u8) -> (digest: string, bytes: in
 // chat_record_attempt commits request.sent for one send before it goes out, with the digest
 // and the size of the exact bytes that send will carry. It reports false after latching a
 // storage failure, which stops the turn: a send whose record did not land is not sent.
-@(private)
+@(private, require_results)
 chat_record_attempt :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, request: journal.Request_Id, attempt: Chat_Attempt, body: []u8) -> bool {
 	header := journal.Record {
 		kind     = .Request_Sent,
@@ -323,7 +323,7 @@ chat_record_attempt :: proc(chat: ^Chat_Session, connection: ai.Provider_Connect
 // It returns None when a summary was installed and the request rebuilt, and otherwise
 // the typed reason the repair failed. A refusal ends the chain and stays on the session,
 // so the record and a front-end can tell why the turn could not make room.
-@(private)
+@(private, require_results)
 chat_try_context_repair :: proc(
 	chat: ^Chat_Session,
 	connection: ai.Provider_Connection,

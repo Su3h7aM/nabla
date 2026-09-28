@@ -98,7 +98,7 @@ tool_preview_cut :: proc(text: string, limit: int) -> string {
 }
 
 // tool_output_write writes one kept output, creating its directory, readable by its owner only.
-@(private)
+@(private, require_results)
 tool_output_write :: proc(path: string, content: string) -> os.Error {
 	file := tool_output_create(path) or_return
 	// The write's own result is the answer; a close that fails after it changes nothing.
@@ -109,6 +109,7 @@ tool_output_write :: proc(path: string, content: string) -> os.Error {
 
 // tool_output_create creates one kept output file for writing, and its directory, readable
 // by its owner only.
+@(require_results)
 tool_output_create :: proc(path: string) -> (^os.File, os.Error) {
 	directory, _ := filepath.split(path)
 	if make_error := os.make_directory_all(directory, XDG_APP_PERMISSIONS); make_error != nil && make_error != .Exist { return nil, make_error }
@@ -118,6 +119,7 @@ tool_output_create :: proc(path: string) -> (^os.File, os.Error) {
 // tool_output_directory is where a session keeps the outputs it did not show in full:
 // $XDG_STATE_HOME/nabla/tool-output/<session>, which outlives the process so a resumed
 // session can still read them. It returns "" when no state directory resolves.
+@(require_results)
 tool_output_directory :: proc(id: string, allocator := context.allocator) -> string {
 	state, state_error := xdg_directory(.State, context.temp_allocator)
 	if state_error != .None { return "" }
@@ -128,6 +130,7 @@ tool_output_directory :: proc(id: string, allocator := context.allocator) -> str
 
 // chat_tool_output_path is the temp-allocated path that names the kept output of the call
 // call, followed by suffix, or "" when the session has no output directory.
+@(require_results)
 chat_tool_output_path :: proc(chat: ^Chat_Session, call: journal.Call_Id, suffix := ".txt", allocator := context.temp_allocator) -> string {
 	if chat.tool_output_directory == "" { return "" }
 	path, join_error := filepath.join({chat.tool_output_directory, fmt.tprintf("%d%s", call, suffix)}, allocator)

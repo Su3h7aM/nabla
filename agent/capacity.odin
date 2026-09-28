@@ -71,6 +71,7 @@ chat_capacity_answer_floor :: proc(capacity: Model_Capacity) -> int {
 // model_capacity_admits reports whether an input of this size can be sent. It is the one
 // predicate admission answers with, so what the harness will send and what it considers
 // too large are the same size.
+@(require_results)
 model_capacity_admits :: proc(capacity: Model_Capacity, estimate: int) -> bool {
 	return capacity.window > 0 && estimate <= chat_capacity_input_ceiling(capacity)
 }
@@ -86,6 +87,7 @@ model_capacity_admits :: proc(capacity: Model_Capacity, estimate: int) -> bool {
 // fits is false when the room left cannot hold that smallest answer. The bound is then
 // whatever room there is, so the request is still encodable and its record still says
 // what it would have carried.
+@(require_results)
 chat_request_output_bound :: proc(capacity: Model_Capacity, estimate: int) -> (output: int, fits: bool) {
 	room := capacity.window - estimate - capacity.margin
 	output = min(room, capacity.model_max_output)

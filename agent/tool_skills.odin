@@ -37,6 +37,7 @@ TOOL_LOAD_SKILL_DEFINITION :: Tool_Definition {
 	execute = tool_load_skill_execute,
 }
 
+@(require_results)
 tool_list_skills_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: List_Skills_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_LIST_SKILLS_FIELDS, allocator = ctx.allocator) or_return
 	args.query = tool_field_optional_string(arguments, "query", allocator = ctx.allocator) or_return
@@ -53,6 +54,7 @@ tool_list_skills_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (ar
 	return
 }
 
+@(require_results)
 tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(List_Skills_Args)
 	query, offset, limit := args.query, args.offset, args.limit
@@ -89,12 +91,14 @@ tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	return tool_result_success(ctx, data, fmt.tprintf("%d of %d skills", len(records), len(matches)))
 }
 
+@(require_results)
 tool_load_skill_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Load_Skill_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_LOAD_SKILL_FIELDS, allocator = ctx.allocator) or_return
 	args.name = tool_field_string(arguments, "name", allocator = ctx.allocator) or_return
 	return
 }
 
+@(require_results)
 tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Load_Skill_Args)
 	name := args.name
@@ -144,6 +148,7 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 // list_skills_match returns the matching skills in name order, owned by allocator, with the
 // skill whose name is exactly the query first. It reports an allocator error when the
 // listing could not be built.
+@(require_results)
 list_skills_match :: proc(catalog: []skills.Skill, query: string, allocator := context.allocator) -> ([]^skills.Skill, mem.Allocator_Error) {
 	terms, terms_error := list_skills_terms(query, allocator)
 	if terms_error != nil { return nil, terms_error }
@@ -182,6 +187,7 @@ list_skills_match :: proc(catalog: []skills.Skill, query: string, allocator := c
 
 // list_skills_terms returns the query's whitespace-separated terms, folded to lower case and
 // owned by allocator. It reports an allocator error when the terms could not be built.
+@(require_results)
 list_skills_terms :: proc(query: string, allocator := context.allocator) -> ([]string, mem.Allocator_Error) {
 	fields, fields_error := strings.fields(query, allocator)
 	if fields_error != nil { return nil, fields_error }
@@ -206,6 +212,7 @@ list_skills_terms :: proc(query: string, allocator := context.allocator) -> ([]s
 }
 
 // list_skills_matches reports whether every term occurs in the skill's name or description.
+@(require_results)
 list_skills_matches :: proc(skill: ^skills.Skill, terms: []string) -> (bool, mem.Allocator_Error) {
 	// The folded copies exist to be searched and are released with the answer.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -237,6 +244,7 @@ skill_source_label :: proc(catalog: ^skills.Catalog, skill: skills.Skill) -> str
 
 // tool_skill_suggestions names the skills whose names begin with an unknown name, owned by
 // allocator. It reports an allocator error when the suggestion line could not be built.
+@(require_results)
 tool_skill_suggestions :: proc(catalog: ^skills.Catalog, name: string, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	suggestions, suggestions_error := make([dynamic]string, 0, 3, allocator)
 	if suggestions_error != nil { return "", suggestions_error }
@@ -253,6 +261,7 @@ tool_skill_suggestions :: proc(catalog: ^skills.Catalog, name: string, allocator
 	return fmt.aprintf("no skill named %q is available; did you mean %s", name, joined, allocator = allocator), nil
 }
 
+@(require_results)
 skill_digest_text :: proc(digest: [32]u8, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	out, out_error := make([]u8, 64, allocator)
 	if out_error != nil { return "", out_error }
@@ -273,6 +282,7 @@ skill_hex_digit :: proc(nibble: u8) -> u8 {
 	return 'a' + (nibble - 10)
 }
 
+@(require_results)
 skill_primary_path :: proc(skill: skills.Skill, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	if strings.has_suffix(skill.directory, "/") { return strings.concatenate({skill.directory, "SKILL.md"}, allocator) }
 	return strings.concatenate({skill.directory, "/SKILL.md"}, allocator)

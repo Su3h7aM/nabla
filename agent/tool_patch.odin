@@ -75,6 +75,7 @@ Patch_Error :: union {
 	mem.Allocator_Error,
 }
 
+@(require_results)
 tool_patch_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Patch_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_PATCH_FIELDS, allocator = ctx.allocator) or_return
 	patch := tool_field_string(arguments, "patch", allocator = ctx.allocator) or_return
@@ -84,6 +85,7 @@ tool_patch_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Pa
 	return parsed, nil
 }
 
+@(require_results)
 tool_patch_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Patch_Args)
 	arena: virtual.Arena
@@ -114,7 +116,7 @@ tool_patch_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	return tool_result_success(ctx, output, fmt.tprintf("%d files", len(changes)))
 }
 
-@(private = "file")
+@(private = "file", require_results)
 patch_failure_result :: proc(ctx: ^Tool_Context, err: Patch_Error) -> Tool_Result {
 	switch failure in err {
 	case Patch_Failure:
@@ -126,7 +128,7 @@ patch_failure_result :: proc(ctx: ^Tool_Context, err: Patch_Error) -> Tool_Resul
 
 // patch_write applies one prepared change. A moved file is written at its new path before the
 // old one is removed, so a failure between the two leaves both rather than neither.
-@(private = "file")
+@(private = "file", require_results)
 patch_write :: proc(change: Patch_Change, control: Tool_Control, allocator: mem.Allocator) -> (write_error: os.Error, cancelled: bool) {
 	if tool_control_cancelled(control) { return nil, true }
 	if change.operation == .Delete { return os.remove(change.source), false }

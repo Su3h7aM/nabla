@@ -30,6 +30,7 @@ mailbox_init :: proc(mailbox: ^Owner_Mailbox, allocator: mem.Allocator) {
 }
 
 // mailbox_push takes ownership of event, or returns false and leaves it with the caller.
+@(require_results)
 mailbox_push :: proc(mailbox: ^Owner_Mailbox, event: Chat_Event) -> bool {
 	sync.mutex_lock(&mailbox.mutex)
 	_, err := append(&mailbox.events, event)
@@ -41,6 +42,7 @@ mailbox_push :: proc(mailbox: ^Owner_Mailbox, event: Chat_Event) -> bool {
 
 // mailbox_take_all transfers the queued events, oldest first. The caller destroys each event
 // and the array with the mailbox allocator.
+@(require_results)
 mailbox_take_all :: proc(mailbox: ^Owner_Mailbox) -> [dynamic]Chat_Event {
 	sync.mutex_guard(&mailbox.mutex)
 	events := mailbox.events
@@ -59,6 +61,7 @@ mailbox_publish_terminal :: proc(mailbox: ^Owner_Mailbox, terminal: Chat_Attempt
 	owner_wake_signal()
 }
 
+@(require_results)
 mailbox_take_terminal :: proc(mailbox: ^Owner_Mailbox) -> (terminal: Chat_Attempt_Terminal, ok: bool) {
 	sync.mutex_guard(&mailbox.mutex)
 	if !mailbox.terminal_present { return }

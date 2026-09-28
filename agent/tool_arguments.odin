@@ -102,6 +102,7 @@ Tool_Argument_Error :: union {
 
 // tool_argument_error builds one defect. A defect whose own text cannot be copied becomes
 // Out_Of_Memory, because a message that names an empty field would read as a real defect.
+@(require_results)
 tool_argument_error :: proc(kind: Tool_Argument_Error_Kind, field := "", expected := "", allocator := context.allocator) -> Tool_Argument_Error {
 	defect := Tool_Argument_Defect {
 		kind = kind,
@@ -134,6 +135,7 @@ tool_argument_error_code :: proc(err: Tool_Argument_Error) -> string {
 // where the defect is when it was found in the document text. The same defect always renders
 // the same bytes, so a recovery turn adds no wording churn to the cacheable prefix. It
 // reports an allocator error when the sentence could not be copied.
+@(require_results)
 tool_argument_error_text :: proc(err: Tool_Argument_Error, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	defect, failed := err.?
 	if !failed { return "", nil }
@@ -143,7 +145,7 @@ tool_argument_error_text :: proc(err: Tool_Argument_Error, allocator := context.
 }
 
 // tool_argument_error_sentence says what a defect is. The text is temporary.
-@(private)
+@(private, require_results)
 tool_argument_error_sentence :: proc(err: Tool_Argument_Defect) -> string {
 	switch err.kind {
 	case .Not_Object:
@@ -223,6 +225,7 @@ tool_arguments_destroy :: proc(arguments: ^Tool_Arguments, allocator := context.
 // arguments are the empty object, a raw control byte inside a string literal is its escape,
 // and a JSON string whose content is one object is that object. No value is ever invented,
 // and a document that still does not admit is refused with its own defect.
+@(require_results)
 tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (arguments: Tool_Arguments) {
 	// Every way out of here either says the document is valid or names the defect that refused
 	// it, so the status is never left to mean two things.
@@ -308,7 +311,7 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 
 // tool_arguments_string_document returns the content of a document that is one JSON string
 // holding what begins as an object, owned by allocator. Any other document is not one.
-@(private)
+@(private, require_results)
 tool_arguments_string_document :: proc(document: string, allocator: mem.Allocator) -> (inner: string, is_string: bool, err: mem.Allocator_Error) {
 	tokenizer := json.make_tokenizer(document, .JSON, true)
 	token, token_err := json.get_token(&tokenizer)
@@ -327,6 +330,7 @@ tool_arguments_string_document :: proc(document: string, allocator: mem.Allocato
 
 // tool_repairs_text names a set of repairs in declaration order, joined by commas, owned by
 // allocator. It reports an allocator error when the text could not be written whole.
+@(require_results)
 tool_repairs_text :: proc(repairs: Tool_Repairs, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return "", builder_error }
@@ -343,6 +347,7 @@ tool_repairs_text :: proc(repairs: Tool_Repairs, allocator := context.allocator)
 
 // tool_arguments_admit reports the first structural defect in a proposed argument document,
 // which must be one JSON object that tool_json_admit admits.
+@(require_results)
 tool_arguments_admit :: proc(raw: string, allocator: mem.Allocator) -> Tool_Argument_Error {
 	if !strings.has_prefix(strings.trim_left_space(raw), "{") { return tool_argument_error(.Not_Object, allocator = allocator) }
 	return tool_json_admit(raw, allocator)
@@ -357,6 +362,7 @@ tool_arguments_admit :: proc(raw: string, allocator: mem.Allocator) -> Tool_Argu
 // Admission walks the tokenizer instead of calling the parser because the parser accepts
 // trailing input, keeps one of two repeated fields, recurses before any depth check, and
 // leaks on some malformed documents.
+@(require_results)
 tool_json_admit :: proc(text: string, allocator: mem.Allocator) -> Tool_Argument_Error {
 	tokenizer := json.make_tokenizer(text, .JSON, true)
 	token, token_err := json.get_token(&tokenizer)
@@ -385,7 +391,7 @@ tool_token_bad :: proc(token: json.Token, err: json.Error) -> bool {
 	return (err != nil && err != .EOF) || token.kind == .EOF
 }
 
-@(private)
+@(private, require_results)
 tool_admit_object :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.Allocator) -> Tool_Argument_Error {
 	seen := make(map[string]bool, context.temp_allocator)
 	defer delete(seen)
@@ -428,7 +434,7 @@ tool_admit_object :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem
 	}
 }
 
-@(private)
+@(private, require_results)
 tool_admit_array :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.Allocator) -> Tool_Argument_Error {
 	comma := false
 	for {
@@ -457,7 +463,7 @@ tool_admit_array :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.
 // A number is admitted only if the parser can hold it as written: the parser wraps an
 // integer past the 64-bit range and reads an enormous float as infinity, and either would
 // run the call with a number the model never sent.
-@(private)
+@(private, require_results)
 tool_admit_value :: proc(tokenizer: ^json.Tokenizer, token: json.Token, depth: int, allocator: mem.Allocator) -> Tool_Argument_Error {
 	#partial switch token.kind {
 	case .Open_Brace, .Open_Bracket:
@@ -481,19 +487,20 @@ tool_admit_value :: proc(tokenizer: ^json.Tokenizer, token: json.Token, depth: i
 // as their escape sequences, owned by allocator. It accepts only input whose escape
 // sequences already follow the JSON rules, so it never chooses between two readings of a
 // backslash. changed is false when the input needs no repair or has an invalid escape.
-@(private)
+@(private, require_results)
 tool_arguments_escape_control_chars :: proc(raw: string, allocator: mem.Allocator) -> (repaired: string, changed: bool, err: mem.Allocator_Error) {
 	size, escapes, valid := tool_escape_walk(raw, nil)
 	if !valid || escapes == 0 { return "", false, nil }
 	output := make([]u8, size, allocator) or_return
-	tool_escape_walk(raw, output)
+	written, _, written_valid := tool_escape_walk(raw, output)
+	assert(written == size && written_valid, "escaping a text writes the size it measured")
 	return string(output), true, nil
 }
 
 // tool_escape_walk measures raw with every control byte inside a string literal escaped,
 // and writes that form into output when output is not nil. output must hold size bytes.
 // valid is false when an escape sequence in raw breaks the JSON rules.
-@(private)
+@(private, require_results)
 tool_escape_walk :: proc(raw: string, output: []u8) -> (size: int, escapes: int, valid: bool) {
 	in_string := false
 	index := 0
@@ -530,7 +537,7 @@ tool_escape_walk :: proc(raw: string, output: []u8) -> (size: int, escapes: int,
 	return size, escapes, true
 }
 
-@(private)
+@(private, require_results)
 tool_escape_valid :: proc(c: u8) -> bool {
 	switch c {
 	case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
@@ -539,7 +546,7 @@ tool_escape_valid :: proc(c: u8) -> bool {
 	return false
 }
 
-@(private)
+@(private, require_results)
 tool_hex_digit :: proc(c: u8) -> bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
@@ -549,7 +556,7 @@ tool_hex_digit :: proc(c: u8) -> bool {
 // string literals, in a copy owned by allocator. A space keeps every other byte where it
 // was, so a defect found later is placed in the text as the model sent it. A comma after
 // another comma or after an opening bracket is left, because it has no one reading.
-@(private)
+@(private, require_results)
 tool_arguments_blank_trailing_commas :: proc(raw: string, allocator: mem.Allocator) -> (repaired: string, changed: bool, err: mem.Allocator_Error) {
 	output: []u8
 	in_string, escaped := false, false
@@ -621,12 +628,13 @@ tool_control_escape :: proc(control: u8) -> (escape: [6]u8, length: int) {
 // told what to change. A path of "" addresses the root object, where the field's
 // own name is path enough.
 
-@(private)
+@(private, require_results)
 tool_field_path :: proc(path, name: string) -> string {
 	if path == "" { return name }
 	return fmt.aprintf("%s/%s", path, name, allocator = context.temp_allocator)
 }
 
+@(require_results)
 tool_field_string :: proc(object: json.Object, name: string, path := "", allocator := context.allocator) -> (string, Tool_Argument_Error) {
 	value, present := object[name]
 	if !present { return "", tool_argument_error(.Missing_Field, tool_field_path(path, name), allocator = allocator) }
@@ -635,6 +643,7 @@ tool_field_string :: proc(object: json.Object, name: string, path := "", allocat
 	return string(text), nil
 }
 
+@(require_results)
 tool_field_optional_string :: proc(object: json.Object, name: string, path := "", allocator := context.allocator) -> (string, Tool_Argument_Error) {
 	value, present := object[name]
 	if !present { return "", nil }
@@ -647,6 +656,7 @@ tool_field_optional_string :: proc(object: json.Object, name: string, path := ""
 	return "", tool_argument_error(.Wrong_Type, tool_field_path(path, name), "a string or null", allocator = allocator)
 }
 
+@(require_results)
 tool_field_optional_bool :: proc(object: json.Object, name: string, path := "", allocator := context.allocator) -> (bool, Tool_Argument_Error) {
 	value, present := object[name]
 	if !present { return false, nil }
@@ -661,6 +671,7 @@ tool_field_optional_bool :: proc(object: json.Object, name: string, path := "", 
 
 // The integer readers take the object's own slot, because a repaired value is written back
 // into the document so the recorded arguments say what ran. The repair is added to repairs.
+@(require_results)
 tool_field_int :: proc(
 	object: json.Object,
 	name: string,
@@ -678,6 +689,7 @@ tool_field_int :: proc(
 	return tool_field_int_value(slot, tool_field_path(path, name), minimum, maximum, repairs, allocator)
 }
 
+@(require_results)
 tool_field_optional_int :: proc(
 	object: json.Object,
 	name: string,
@@ -696,7 +708,7 @@ tool_field_optional_int :: proc(
 	return tool_field_int_value(slot, tool_field_path(path, name), minimum, maximum, repairs, allocator)
 }
 
-@(private)
+@(private, require_results)
 tool_field_int_value :: proc(
 	slot: ^json.Value,
 	path: string,
@@ -746,7 +758,7 @@ tool_integer_write_back :: proc(slot: ^json.Value, number: int, repair: Maybe(To
 // small enough to name one integer, or a string holding exactly one integer in decimal with
 // no sign other than a leading minus, no leading zero, and nothing around it. repair names
 // the change when the value was not already an integer.
-@(private)
+@(private, require_results)
 tool_integer_reading :: proc(value: json.Value) -> (number: int, repair: Maybe(Tool_Repair), readable: bool) {
 	#partial switch item in value {
 	case json.Integer:
@@ -764,7 +776,7 @@ tool_integer_reading :: proc(value: json.Value) -> (number: int, repair: Maybe(T
 
 // tool_decimal_integer reads text that is exactly one decimal integer: an optional leading
 // minus, then digits with no leading zero. A number past the int range is not one.
-@(private)
+@(private, require_results)
 tool_decimal_integer :: proc(text: string) -> (number: int, ok: bool) {
 	digits := strings.trim_prefix(text, "-")
 	if digits == "" || (len(digits) > 1 && digits[0] == '0') { return 0, false }
@@ -779,6 +791,7 @@ tool_decimal_integer :: proc(text: string) -> (number: int, ok: bool) {
 }
 
 // tool_field_array reads a required array field and returns its elements.
+@(require_results)
 tool_field_array :: proc(
 	object: json.Object,
 	name: string,
@@ -804,6 +817,7 @@ tool_field_array :: proc(
 
 // tool_field_object reads an object that is already known to be there, naming it
 // by the path the diagnostic should use.
+@(require_results)
 tool_field_object :: proc(value: json.Value, path: string, allocator := context.allocator) -> (json.Object, Tool_Argument_Error) {
 	object, is_object := value.(json.Object)
 	if !is_object { return nil, tool_argument_error(.Wrong_Type, path, "an object", allocator = allocator) }
@@ -813,6 +827,7 @@ tool_field_object :: proc(value: json.Value, path: string, allocator := context.
 // tool_fields_known refuses a field the tool does not declare. A model that
 // invents a field is guessing at an interface it was not given, and accepting the
 // guess silently would run something other than what it asked for.
+@(require_results)
 tool_fields_known :: proc(object: json.Object, known: []string, path := "", allocator := context.allocator) -> Tool_Argument_Error {
 	for name in object {
 		declared := false
@@ -831,14 +846,14 @@ tool_fields_known :: proc(object: json.Object, known: []string, path := "", allo
 	return {}
 }
 
-@(private)
+@(private, require_results)
 tool_int_expected :: proc(minimum, maximum: int, allocator: mem.Allocator) -> string {
 	if maximum <= 0 { return fmt.aprintf("an integer of at least %d", minimum, allocator = allocator) }
 	if minimum <= 0 { return fmt.aprintf("an integer no greater than %d", maximum, allocator = allocator) }
 	return fmt.aprintf("an integer between %d and %d", minimum, maximum, allocator = allocator)
 }
 
-@(private)
+@(private, require_results)
 tool_count_expected :: proc(minimum, maximum: int, allocator: mem.Allocator) -> string {
 	if maximum <= 0 { return fmt.aprintf("at least %d items", minimum, allocator = allocator) }
 	return fmt.aprintf("between %d and %d items", minimum, maximum, allocator = allocator)
@@ -846,7 +861,7 @@ tool_count_expected :: proc(minimum, maximum: int, allocator: mem.Allocator) -> 
 
 // tool_field_list names the declared fields as one English list, owned by allocator. It
 // reports an allocator error when the list could not be written whole.
-@(private)
+@(private, require_results)
 tool_field_list :: proc(known: []string, allocator: mem.Allocator) -> (string, mem.Allocator_Error) {
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return "", builder_error }

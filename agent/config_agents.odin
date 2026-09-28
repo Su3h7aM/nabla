@@ -46,6 +46,7 @@ acp_agents_destroy :: proc(agents: ^[dynamic]ACP_Agent_Config, allocator := cont
 // select the program. An entry is refused rather than half-configured: a field that
 // cannot be used is something the user has to see, not something to guess a default for.
 // The result is sorted by name so the order is deterministic.
+@(require_results)
 acp_agents_load :: proc(state: ^lua.State, idx: c.int, allocator: mem.Allocator) -> ([dynamic]ACP_Agent_Config, Config_Error) {
 	agents: [dynamic]ACP_Agent_Config
 	agents.allocator = allocator
@@ -90,7 +91,7 @@ acp_agents_load :: proc(state: ^lua.State, idx: c.int, allocator: mem.Allocator)
 	return agents, .None
 }
 
-@(private)
+@(private, require_results)
 acp_agent_load :: proc(state: ^lua.State, raw_idx: c.int, name: string, allocator: mem.Allocator, out: ^ACP_Agent_Config) -> Config_Error {
 	if !lua_plain_table(state, raw_idx) { return .Invalid }
 	idx := lua.absindex(state, raw_idx)
@@ -138,7 +139,7 @@ acp_agent_load :: proc(state: ^lua.State, raw_idx: c.int, name: string, allocato
 
 // acp_agent_fields_known refuses an entry that carries a key the reader does not know,
 // so a misspelled field is reported rather than ignored.
-@(private)
+@(private, require_results)
 acp_agent_fields_known :: proc(state: ^lua.State, raw_idx: c.int) -> Config_Error {
 	index := lua.absindex(state, raw_idx)
 	base := lua.gettop(state)
@@ -158,7 +159,7 @@ acp_agent_fields_known :: proc(state: ^lua.State, raw_idx: c.int) -> Config_Erro
 }
 
 // acp_agent_arguments_load reads one entry's `arguments`, a Lua sequence of strings.
-@(private)
+@(private, require_results)
 acp_agent_arguments_load :: proc(state: ^lua.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]string, Config_Error) {
 	if !lua_plain_table(state, raw_idx) { return nil, .Invalid }
 	index := lua.absindex(state, raw_idx)

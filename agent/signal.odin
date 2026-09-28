@@ -11,6 +11,7 @@ import "nabla:ai"
 @(private)
 process_interrupt: ai.Interrupt
 
+@(require_results)
 process_interrupted :: proc "contextless" () -> bool {
 	return ai.interrupt_requested(&process_interrupt)
 }

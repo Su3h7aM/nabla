@@ -118,7 +118,7 @@ codemode_job_deliver :: proc(job: ^Tool_Job, handle: int) {
 // codemode_job_start_child admits the requested call as a child job and returns its handle.
 // A call the script can fix is refused with a message owned by the run's allocator, which
 // the script receives as an error. A failure of the batch answers the parent itself.
-@(private)
+@(private, require_results)
 codemode_job_start_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: ^Tool_Job) -> (handle: int, refusal: string) {
 	run := parent.lua
 	name := run.request.name
@@ -238,7 +238,7 @@ codemode_job_stop_children :: proc(job: ^Tool_Job) {
 	}
 }
 
-@(private)
+@(private, require_results)
 codemode_job_settled :: proc(job: ^Tool_Job) -> bool {
 	for entry in job.lua_children {
 		if !entry.committed { return false }
@@ -324,7 +324,7 @@ codemode_job_answer :: proc(job: ^Tool_Job, outcome: journal.Tool_Outcome, diagn
 // it and read one child's full result back by its call id. Every committed child is
 // summarized; the summaries borrow the batch's child jobs, which the clone inside
 // tool_result_of copies into the result's own memory.
-@(private)
+@(private, require_results)
 codemode_job_result :: proc(job: ^Tool_Job, outcome: journal.Tool_Outcome, message: string, output: Codemode_Output, reason: string) -> Tool_Result {
 	output := output
 	// One summary per committed child, so the list holds exactly what the count names.

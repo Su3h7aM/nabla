@@ -34,6 +34,7 @@ Provider_Models_Fetch :: #type proc(user_data: rawptr, base_url, api_key: string
 // reached does not hold up the others. The result is owned by the caller and
 // released with catalog_sources_destroy, exactly like the result of the other two
 // stages. ok is false when a source record could not be allocated.
+@(require_results)
 discover_provider_models :: proc(
 	providers: []Catalog_Provider_Source,
 	fetch: Provider_Models_Fetch = provider_models_fetch,
@@ -69,6 +70,7 @@ discover_provider_models :: proc(
 // provider_models_cached reads every usable cache entry without performing I/O
 // beyond the local filesystem. Stale entries remain valid inputs while a later
 // refresh is in flight. ok is false when a source record could not be allocated.
+@(require_results)
 provider_models_cached :: proc(providers: []Catalog_Provider_Source, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, bool) {
 	result: [dynamic]Catalog_Provider_Source
 	result.allocator = allocator
@@ -93,6 +95,7 @@ provider_models_cached :: proc(providers: []Catalog_Provider_Source, allocator :
 // provider_sources_add appends one provider's model listing to a source list, taking
 // ownership of models. It reports false when the source record could not be allocated, and
 // models stays with the caller.
+@(require_results)
 provider_sources_add :: proc(result: ^[dynamic]Catalog_Provider_Source, id: string, models: []Catalog_Model_Source, allocator: mem.Allocator) -> bool {
 	owned, clone_error := strings.clone(id, allocator)
 	if clone_error != nil { return false }
@@ -107,6 +110,7 @@ provider_sources_add :: proc(result: ^[dynamic]Catalog_Provider_Source, id: stri
 // provider. A fresh cache avoids the network. A stale cache remains the fallback
 // when acquisition or validation fails. ok is false when a source record could not be
 // allocated.
+@(require_results)
 provider_models_refresh :: proc(
 	providers: []Catalog_Provider_Source,
 	fetch: Provider_Models_Fetch = provider_models_fetch,
@@ -179,6 +183,7 @@ provider_models_refresh :: proc(
 	return result, true
 }
 
+@(require_results)
 provider_models_cache_path :: proc(provider: Catalog_Provider_Source, allocator: mem.Allocator) -> (string, bool) {
 	directory, directory_err := xdg_directory(.Cache, allocator)
 	if directory_err != .None { return "", false }
@@ -191,6 +196,7 @@ provider_models_cache_path :: proc(provider: Catalog_Provider_Source, allocator:
 	return path, join_err == nil
 }
 
+@(require_results)
 provider_models_cache_fresh :: proc(path: string, now: time.Time) -> bool {
 	modified, err := os.modification_time_by_path(path)
 	if err != nil { return false }
@@ -198,6 +204,7 @@ provider_models_cache_fresh :: proc(path: string, now: time.Time) -> bool {
 	return age >= 0 && age < PROVIDER_MODELS_FRESH
 }
 
+@(require_results)
 provider_models_cache_read :: proc(path: string, allocator: mem.Allocator) -> ([]u8, bool) {
 	body, read_err := os.read_entire_file(path, allocator)
 	if read_err == nil && len(body) > 0 { return body, true }
@@ -223,6 +230,7 @@ provider_models_cache_write :: proc(path: string, body: []u8) -> bool {
 //
 // Duplicate ids need no handling: the resolver keys models by identity, so a
 // listing that repeats one enriches the entry it already has.
+@(require_results)
 provider_models_list :: proc(body: []u8, allocator: mem.Allocator) -> ([]Catalog_Model_Source, bool) {
 	// The tree is a whole response and none of it is kept, so it lives in a
 	// dedicated arena that is unmapped when the ids have been copied out.
@@ -267,6 +275,7 @@ provider_models_list :: proc(body: []u8, allocator: mem.Allocator) -> ([]Catalog
 
 // provider_models_id reads one listing record's id. A record without a usable id
 // is not a model, so it is left out rather than invented.
+@(require_results)
 provider_models_id :: proc(entry: json.Value) -> (id: string, present: bool) {
 	object, is_object := entry.(json.Object)
 	if !is_object { return "", false }
@@ -280,6 +289,7 @@ provider_models_id :: proc(entry: json.Value) -> (id: string, present: bool) {
 // provider_models_fetch performs the one request this stage needs. The content
 // type is not asserted: the provider is the user's own endpoint, and a body that
 // is not a listing is refused by parsing rather than by a header.
+@(require_results)
 provider_models_fetch :: proc(user_data: rawptr, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
 	url := fmt.aprintf("%s/%s", strings.trim_right(base_url, "/"), PROVIDER_MODELS_SUFFIX, allocator = allocator)
 	defer delete(url, allocator)

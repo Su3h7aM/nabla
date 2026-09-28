@@ -31,6 +31,7 @@ TOOL_READ_DEFINITION :: Tool_Definition {
 	execute = tool_read_execute,
 }
 
+@(require_results)
 tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Read_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_READ_FIELDS, allocator = ctx.allocator) or_return
 	args.path = tool_field_string(arguments, "path", allocator = ctx.allocator) or_return
@@ -39,6 +40,7 @@ tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Rea
 	return
 }
 
+@(require_results)
 tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Read_Args)
 
@@ -152,6 +154,7 @@ TOOL_WRITE_DEFINITION :: Tool_Definition {
 	execute = tool_write_execute,
 }
 
+@(require_results)
 tool_write_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Write_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_WRITE_FIELDS, allocator = ctx.allocator) or_return
 	args.path = tool_field_string(arguments, "path", allocator = ctx.allocator) or_return
@@ -159,6 +162,7 @@ tool_write_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Wr
 	return
 }
 
+@(require_results)
 tool_write_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Write_Args)
 
@@ -194,6 +198,7 @@ Tool_Path_Problem :: enum {
 // existing file has, or the default for a new one. A path that exists as
 // anything but a regular file, or that is a symbolic link, is refused rather than
 // replaced: renaming over a link would silently turn it into a regular file.
+@(require_results)
 tool_write_mode :: proc(path: string) -> (os.Permissions, Tool_Path_Problem) {
 	// The mode is the answer; the info the lstat filled in is scratch.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -208,6 +213,7 @@ tool_write_mode :: proc(path: string) -> (os.Permissions, Tool_Path_Problem) {
 	return info.mode, .None
 }
 
+@(require_results)
 tool_write_mode_text :: proc(path: string, problem: Tool_Path_Problem) -> string {
 	switch problem {
 	case .Symlink:
@@ -232,6 +238,7 @@ TOOL_WRITE_TEMP_ATTEMPTS :: 64
 // before the rename commits. A cancellation before the rename deletes the
 // temporary file and reports cancelled; once the rename succeeds the observed
 // result stands, because the effect already committed.
+@(require_results)
 tool_write_atomic :: proc(
 	path: string,
 	content: []u8,

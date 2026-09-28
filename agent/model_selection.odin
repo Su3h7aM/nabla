@@ -38,6 +38,7 @@ model_selection_destroy :: proc(selection: ^Model_Selection, allocator: mem.Allo
 }
 
 // provider_usable reports whether a provider states everything a connection needs.
+@(require_results)
 provider_usable :: proc(provider: ^Catalog_Provider) -> bool {
 	return provider.base_url_present && provider.base_url != "" && provider.api_present && provider.api != "" && provider.api_key_present
 }
@@ -45,6 +46,7 @@ provider_usable :: proc(provider: ^Catalog_Provider) -> bool {
 // model_selection_resolve builds the selection for one serving identity. problem says why the
 // model cannot run, in text owned by the temp allocator, and is "" on success. The caller
 // holds whatever lock guards catalog.
+@(require_results)
 model_selection_resolve :: proc(catalog: ^Catalog, provider_id, model_id: string, allocator: mem.Allocator) -> (selection: Model_Selection, problem: string) {
 	provider_index, provider_found := catalog_find_provider(catalog, provider_id)
 	if !provider_found { return {}, fmt.tprintf("provider not found: %s", provider_id) }
@@ -101,6 +103,7 @@ model_selection_resolve :: proc(catalog: ^Catalog, provider_id, model_id: string
 // catalog_model_provider finds which provider serves model_id: preferred when it does, else
 // the only usable provider that does. problem, temp-allocated, names the candidates when the
 // id is unknown or served by more than one provider.
+@(require_results)
 catalog_model_provider :: proc(catalog: ^Catalog, model_id, preferred: string) -> (provider_id: string, problem: string) {
 	if index, found := catalog_find_model(catalog, preferred, model_id); found { return catalog.models[index].provider_id, "" }
 	candidates, candidates_error := make([dynamic]string, 0, context.temp_allocator)
@@ -167,6 +170,7 @@ effort_level_index :: proc(levels: []string, level: string) -> int {
 // must be one of its levels or "" for the provider default. The session keeps its own copies.
 // installed is false when the session could not hold the selection, in which case it keeps the
 // selection it had; applied is what installing the effort returned.
+@(require_results)
 chat_session_select :: proc(chat: ^Chat_Session, selection: Model_Selection, effort: string) -> (installed: bool, applied: bool) {
 	allocator := chat.allocator
 	// The session's own copies are built before it releases the ones it holds, so a failure
@@ -207,7 +211,8 @@ chat_session_select :: proc(chat: ^Chat_Session, selection: Model_Selection, eff
 	chat.provider_id = provider_id
 	delete(chat.model_id, allocator)
 	chat.model_id = model_id
-	chat_session_set_effort(chat, "")
+	// An empty level always clears, so this reset cannot be refused.
+	_ = chat_session_set_effort(chat, "")
 	for level in chat.effort_levels { delete(level, allocator) }
 	delete(chat.effort_levels)
 	chat.effort_levels = levels

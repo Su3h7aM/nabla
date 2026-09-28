@@ -71,6 +71,7 @@ Agent_Stop_Args :: struct {
 	agent: string,
 }
 
+@(require_results)
 tool_agent_spawn_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Agent_Spawn_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_AGENT_SPAWN_FIELDS, allocator = ctx.allocator) or_return
 	args.instruction = tool_field_optional_string(arguments, "instruction", allocator = ctx.allocator) or_return
@@ -84,6 +85,7 @@ tool_agent_spawn_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (ar
 	return
 }
 
+@(require_results)
 tool_agent_send_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Agent_Send_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_AGENT_SEND_FIELDS, allocator = ctx.allocator) or_return
 	args.agent = tool_field_optional_string(arguments, "agent", allocator = ctx.allocator) or_return
@@ -92,6 +94,7 @@ tool_agent_send_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (arg
 	return
 }
 
+@(require_results)
 tool_agent_stop_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Agent_Stop_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_AGENT_STOP_FIELDS, allocator = ctx.allocator) or_return
 	args.agent = tool_field_string(arguments, "agent", allocator = ctx.allocator) or_return
@@ -100,6 +103,7 @@ tool_agent_stop_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (arg
 
 // tool_registry_describe_agents names the configured ACP agents in the spawn tool's description,
 // so the model knows which it may start. agents is borrowed.
+@(require_results)
 tool_registry_describe_agents :: proc(registry: ^Tool_Registry, agents: []ACP_Agent_Config) -> Tool_Registry_Error {
 	index := -1
 	for definition, position in registry.definitions {
@@ -121,7 +125,7 @@ tool_registry_describe_agents :: proc(registry: ^Tool_Registry, agents: []ACP_Ag
 
 // tool_agent_description_parts collects the parts of the spawn description, naming the
 // configured ACP agents. The parts borrow agents.
-@(private = "file")
+@(private = "file", require_results)
 tool_agent_description_parts :: proc(parts: ^[dynamic]string, agents: []ACP_Agent_Config) -> mem.Allocator_Error {
 	append(parts, TOOL_AGENT_SPAWN_DESCRIPTION) or_return
 	if len(agents) == 0 { append(parts, " No ACP agents are configured, so leave acp_agent out.") or_return }
@@ -136,6 +140,7 @@ tool_agent_description_parts :: proc(parts: ^[dynamic]string, agents: []ACP_Agen
 // TOOL_AGENT_ORCHESTRATOR_ONLY is what a subagent is told when it tries to manage subagents.
 TOOL_AGENT_ORCHESTRATOR_ONLY :: "only the orchestrator manages subagents; a subagent cannot start or stop one. If the task needs one, tell the orchestrator with agent_send"
 
+@(require_results)
 tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Agent_Spawn_Args)
 	if ctx.member != nil { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }
@@ -197,6 +202,7 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	return result
 }
 
+@(require_results)
 tool_agent_send_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Agent_Send_Args)
 	if member := ctx.member; member != nil {
@@ -223,6 +229,7 @@ tool_agent_send_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 	return tool_result_success(ctx, Agent_Output{agent = args.agent, status = "queued"}, "queued")
 }
 
+@(require_results)
 tool_agent_stop_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Agent_Stop_Args)
 	if ctx.member != nil { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }

@@ -46,6 +46,7 @@ chat_finish_reason_text :: proc(reason: ai.Provider_Finish_Reason) -> string {
 }
 
 // chat_text_digest is the hexadecimal SHA-256 of text, in temp memory.
+@(require_results)
 chat_text_digest :: proc(text: string) -> (string, bool) {
 	hash_context: sha2.Context_256
 	sha2.init_256(&hash_context)

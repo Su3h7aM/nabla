@@ -103,6 +103,7 @@ Agent_Parent :: struct {
 	acp_agents:                   []ACP_Agent_Config, // borrowed from the loaded config
 }
 
+@(require_results)
 agent_team_make :: proc(allocator: mem.Allocator) -> ^Agent_Team {
 	team, alloc_error := new(Agent_Team, allocator)
 	if alloc_error != nil { return nil }
@@ -150,7 +151,7 @@ agent_team_note_parent :: proc(chat: ^Chat_Session) {
 
 // agent_parent_copy copies what a subagent start needs from the orchestrator into out. It
 // reports false when a field could not be copied, in which case out holds nothing.
-@(private)
+@(private, require_results)
 agent_parent_copy :: proc(chat: ^Chat_Session, allocator: mem.Allocator, out: ^Agent_Parent) -> bool {
 	failed := true
 	defer if failed { agent_parent_destroy(out, allocator) }
@@ -188,7 +189,7 @@ agent_parent_copy :: proc(chat: ^Chat_Session, allocator: mem.Allocator, out: ^A
 // agent_parent_temp_copy copies one parent snapshot into scratch memory, so a worker thread
 // can keep using it after it releases the team lock. It reports false when a field could not
 // be copied.
-@(private)
+@(private, require_results)
 agent_parent_temp_copy :: proc(parent: Agent_Parent, allocator: mem.Allocator) -> (snapshot: Agent_Parent, ok: bool) {
 	snapshot = parent
 	clone_error: mem.Allocator_Error
@@ -298,6 +299,7 @@ agent_team_destroy :: proc(team: ^Agent_Team, retain := false) -> bool {
 }
 
 // agent_team_running reports whether a subagent the team started is not yet released.
+@(require_results)
 agent_team_running :: proc(team: ^Agent_Team) -> bool {
 	if team == nil { return false }
 	sync.mutex_guard(&team.mutex)
@@ -329,6 +331,7 @@ subagent_destroy :: proc(member: ^Subagent) {
 // subagent_start defines one subagent from a start call and adds it to the team. It resolves
 // the model, the orchestrator's by default, and the effort, one level below the orchestrator's
 // by default. problem, temp-allocated, says why nothing started. Worker thread.
+@(require_results)
 subagent_start :: proc(
 	team: ^Agent_Team,
 	args: Agent_Spawn_Args,
@@ -440,7 +443,7 @@ subagent_start :: proc(
 
 // subagent_select resolves the model and effort a native subagent runs. problem, temp-allocated,
 // says why it cannot run; selection is then empty.
-@(private)
+@(private, require_results)
 subagent_select :: proc(
 	args: Agent_Spawn_Args,
 	parent: ^Agent_Parent,
@@ -487,6 +490,7 @@ subagent_log_sink :: proc() -> ^Diag_Ring {
 
 // subagent_launch starts a background subagent on a thread of its own. The watched signals are
 // blocked across creation, so the process handler never runs there.
+@(require_results)
 subagent_launch :: proc(member: ^Subagent) -> bool {
 	member.stop.parent = &process_interrupt
 	previous := chat_signal_block_watched()
@@ -712,7 +716,7 @@ subagent_run :: proc(member: ^Subagent) {
 // subagent_next_message takes the oldest message the orchestrator sent, or closes the inbox
 // when there is none, in one step, so a message sent at the same moment is either taken here
 // or refused to its sender.
-@(private)
+@(private, require_results)
 subagent_next_message :: proc(member: ^Subagent) -> (string, bool) {
 	sync.mutex_guard(&member.team.mutex)
 	line, ok := steer_pop(&member.inbox)
@@ -731,6 +735,7 @@ subagent_find :: proc(team: ^Agent_Team, name: string) -> ^Subagent {
 
 // subagent_send queues the orchestrator's message for a subagent and returns the child
 // session it went to. problem, temp-allocated, says why it was not queued.
+@(require_results)
 subagent_send :: proc(team: ^Agent_Team, name, text: string) -> (session: journal.Session_Id, problem: string) {
 	message := fmt.tprintf("Message from the orchestrator:\n%s", text)
 	sync.mutex_guard(&team.mutex)
@@ -742,6 +747,7 @@ subagent_send :: proc(team: ^Agent_Team, name, text: string) -> (session: journa
 }
 
 // subagent_stop asks a subagent to stop. Its outcome reaches the orchestrator like any other.
+@(require_results)
 subagent_stop :: proc(team: ^Agent_Team, name: string) -> (problem: string) {
 	defer owner_wake_signal()
 	sync.mutex_guard(&team.mutex)
@@ -773,6 +779,7 @@ subagent_unknown :: proc(team: ^Agent_Team, name: string) -> string {
 }
 
 // subagent_report_message queues a subagent's message for its orchestrator.
+@(require_results)
 subagent_report_message :: proc(member: ^Subagent, text: string) -> bool {
 	return steer_push(&member.team.inbox, fmt.tprintf("Message from subagent %s:\n%s", member.name, text))
 }
@@ -787,6 +794,7 @@ chat_parent_session :: proc(chat: ^Chat_Session) -> string {
 
 // chat_agents_pending reports whether a subagent's message waits or a subagent still runs.
 // It releases finished subagents first. Owner only.
+@(require_results)
 chat_agents_pending :: proc(chat: ^Chat_Session) -> bool {
 	if chat.team == nil { return false }
 	agent_team_reap(chat.team, chat)
@@ -795,6 +803,7 @@ chat_agents_pending :: proc(chat: ^Chat_Session) -> bool {
 
 // chat_agents_wait blocks until a subagent's message waits, and reports false instead when no
 // subagent runs any more or stop is requested. Owner only.
+@(require_results)
 chat_agents_wait :: proc(chat: ^Chat_Session, stop: ^ai.Interrupt) -> bool {
 	if chat.team == nil { return false }
 	for {
@@ -807,6 +816,7 @@ chat_agents_wait :: proc(chat: ^Chat_Session, stop: ^ai.Interrupt) -> bool {
 
 // chat_session_accept_agent_message opens a turn for the oldest message a subagent sent while
 // no turn ran. had_message is false when none waits. A message the store refused stays queued.
+@(require_results)
 chat_session_accept_agent_message :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> (accepted: Chat_Accept, had_message: bool) {
 	if chat.team == nil { return .Accepted, false }
 	text, ok := steer_pop(&chat.team.inbox)
@@ -815,8 +825,9 @@ chat_session_accept_agent_message :: proc(chat: ^Chat_Session, observer: Chat_Ob
 	if accepted == .Accepted {
 		_observer_user_text(observer, text)
 		steer_line_free(&chat.team.inbox, text)
-	} else {
-		steer_requeue(&chat.team.inbox, text)
+	} else if !steer_requeue(&chat.team.inbox, text) {
+		// The one case where the refused report cannot stay pending: it was released.
+		log_emit({level = .Error, category = .Agent, event = "subagent.report_not_requeued"})
 	}
 	return accepted, true
 }

@@ -56,7 +56,7 @@ subagent_program_destroy :: proc(program: ^Subagent_Program, allocator: mem.Allo
 
 // subagent_program defines the configured ACP agent a start call names. problem, temp-allocated,
 // says why it cannot run.
-@(private)
+@(private, require_results)
 subagent_program :: proc(args: Agent_Spawn_Args, parent: ^Agent_Parent, allocator: mem.Allocator) -> (program: Subagent_Program, problem: string) {
 	config: ACP_Agent_Config
 	for candidate in parent.acp_agents {
@@ -108,7 +108,7 @@ subagent_program :: proc(args: Agent_Spawn_Args, parent: ^Agent_Parent, allocato
 // subagent_command_path finds the executable command names, temp-allocated: a path relative to
 // directory when it has a slash, else the first match on PATH. found is false when the path
 // could not be built or no candidate is executable.
-@(private)
+@(private, require_results)
 subagent_command_path :: proc(command, directory: string) -> (string, bool) {
 	if strings.contains_rune(command, '/') {
 		path := command
@@ -129,7 +129,7 @@ subagent_command_path :: proc(command, directory: string) -> (string, bool) {
 	return "", false
 }
 
-@(private)
+@(private, require_results)
 subagent_executable :: proc(path: string) -> bool {
 	text, clone_error := strings.clone_to_cstring(path, context.temp_allocator)
 	if clone_error != nil { return false }
@@ -233,7 +233,7 @@ subagent_acp_run :: proc(member: ^Subagent) {
 // acp_prompt sends one prompt and waits until the agent's turn is over. Version 1 ends the turn
 // with the prompt's answer; version 2 acknowledges the prompt and reports the end as an idle
 // state update. stop_reason is the agent's, temp-allocated.
-@(private)
+@(private, require_results)
 acp_prompt :: proc(connection: ^Acp_Connection, text: string) -> (stop_reason: string, problem: string) {
 	Text_Block :: struct {
 		type: string `json:"type"`,
@@ -244,8 +244,9 @@ acp_prompt :: proc(connection: ^Acp_Connection, text: string) -> (stop_reason: s
 		prompt:     []Text_Block `json:"prompt"`,
 	}
 	clear(&connection.answer)
-	acp_replace(&connection.message_id, "", connection.member.allocator)
-	acp_replace(&connection.stop_reason, "", connection.member.allocator)
+	// Both resets pass an empty value, so neither can fail.
+	_ = acp_replace(&connection.message_id, "", connection.member.allocator)
+	_ = acp_replace(&connection.stop_reason, "", connection.member.allocator)
 	connection.idle = false
 	prompt := Prompt {
 		session_id = connection.session_id,
@@ -280,7 +281,7 @@ acp_prompt :: proc(connection: ^Acp_Connection, text: string) -> (stop_reason: s
 }
 
 // acp_connection_open starts the agent program with its three standard streams piped here.
-@(private)
+@(private, require_results)
 acp_connection_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	member := connection.member
 	input, input_ok := acp_input_open()
@@ -348,7 +349,7 @@ acp_connection_close :: proc(connection: ^Acp_Connection) {
 
 // acp_session_open agrees on the protocol, preferring version 2, opens a session in the workspace,
 // and chooses the model and effort among what the agent offers.
-@(private)
+@(private, require_results)
 acp_session_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	member := connection.member
 	// Version 2 names the client in info; a version 1 agent answers with its own version and
@@ -437,7 +438,7 @@ Acp_Session_Opened :: struct {
 	models:         acp.Models_State `json:"models"`,
 }
 
-@(private)
+@(private, require_results)
 acp_set_option :: proc(connection: ^Acp_Connection, option: Acp_Config_Option, value: string) -> (problem: string) {
 	// Version 2 requires the value's type; version 1 reads a missing type as an id.
 	Set_Option :: struct {
@@ -456,7 +457,7 @@ acp_set_option :: proc(connection: ^Acp_Connection, option: Acp_Config_Option, v
 	return acp_call(connection, acp.METHOD_SESSION_SET_CONFIG_OPTION, request, &set)
 }
 
-@(private)
+@(private, require_results)
 acp_option :: proc(options: []Acp_Config_Option, category: string) -> (Acp_Config_Option, bool) {
 	for option in options {
 		if option.category == category { return option, true }
@@ -474,7 +475,7 @@ acp_option_value :: proc(option: Acp_Config_Option, wanted: string) -> string {
 	return ""
 }
 
-@(private)
+@(private, require_results)
 acp_model_offered :: proc(models: acp.Models_State, model: string) -> bool {
 	for offered in models.available_models {
 		if offered.model_id == model { return true }
@@ -500,7 +501,7 @@ acp_models_text :: proc(opened: Acp_Session_Opened) -> string {
 
 // acp_call sends one request and reads until its answer, which it decodes into result with
 // the temp allocator. problem, temp-allocated, says why there is no answer.
-@(private)
+@(private, require_results)
 acp_call :: proc(connection: ^Acp_Connection, method: string, params: $P, result: ^$R) -> (problem: string) {
 	id := connection.next_id
 	connection.next_id += 1
@@ -530,7 +531,7 @@ acp_call :: proc(connection: ^Acp_Connection, method: string, params: $P, result
 // acp_handle acts on a message that answers nothing this client asked. It reports false when
 // what the message carries could not be held, which ends the connection rather than letting
 // the answer or the stop reason go missing.
-@(private)
+@(private, require_results)
 acp_handle :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool {
 	// What a message is decoded into is released with it, so a long turn holds no scratch.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -546,7 +547,7 @@ acp_handle :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool 
 // acp_notification follows the agent's latest message and, in version 2, the end of its turn.
 // Text before a tool call is narration, so a tool call starts the answer over, and so does a
 // message with a new id. It reports false when what it followed could not be held.
-@(private)
+@(private, require_results)
 acp_notification :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool {
 	if envelope.method != acp.NOTIFICATION_SESSION_UPDATE { return true }
 	kind: acp.Session_Notification(acp.Update_Kind)
@@ -583,7 +584,7 @@ acp_notification :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) ->
 }
 
 // acp_update_has reports whether a session/update's update object carries key.
-@(private)
+@(private, require_results)
 acp_update_has :: proc(params: json.Value, key: string) -> bool {
 	notification, is_object := params.(json.Object)
 	if !is_object { return false }
@@ -595,7 +596,7 @@ acp_update_has :: proc(params: json.Value, key: string) -> bool {
 
 // acp_message_begin starts the answer over when the agent begins a message with a new id. It
 // reports false when the id could not be held.
-@(private)
+@(private, require_results)
 acp_message_begin :: proc(connection: ^Acp_Connection, message_id: string) -> bool {
 	if message_id == "" || message_id == connection.message_id { return true }
 	clear(&connection.answer)
@@ -604,7 +605,7 @@ acp_message_begin :: proc(connection: ^Acp_Connection, message_id: string) -> bo
 
 // acp_replace sets an owned string to a copy of value. It reports false when the copy could
 // not be held, in which case the string is empty.
-@(private)
+@(private, require_results)
 acp_replace :: proc(owned: ^string, value: string, allocator: mem.Allocator) -> bool {
 	delete(owned^, allocator)
 	owned^ = ""
@@ -652,7 +653,7 @@ acp_answer :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
 // acp_next returns the next message the agent sent, owned by the member's allocator, reading
 // and waiting as needed. A stop sends the agent session/cancel and waits the stop patience
 // for its answer; problem says the agent ended, went silent past that, or could not be read.
-@(private)
+@(private, require_results)
 acp_next :: proc(connection: ^Acp_Connection) -> (envelope: acp.Envelope, problem: string) {
 	for {
 		for connection.next_frame < len(connection.frames) {
@@ -669,7 +670,7 @@ acp_next :: proc(connection: ^Acp_Connection) -> (envelope: acp.Envelope, proble
 }
 
 // acp_wait blocks until the agent wrote something or a stop arrived, and reads what came.
-@(private)
+@(private, require_results)
 acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	member := connection.member
 	if ai.interrupt_requested(&member.stop) && !connection.cancel_sent {
@@ -794,7 +795,7 @@ acp_ended :: proc(connection: ^Acp_Connection, what: string) -> string {
 	return fmt.tprintf("the agent %s before it answered. The end of its stderr:\n%s", what, tail)
 }
 
-@(private)
+@(private, require_results)
 acp_stopped :: proc(connection: ^Acp_Connection) -> bool {
 	return connection.cancel_sent || ai.interrupt_requested(&connection.member.stop)
 }

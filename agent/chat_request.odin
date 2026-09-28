@@ -45,7 +45,7 @@ Chat_Request_Prep :: struct {
 // chat_prepare reads the committed projection from the chat's head and builds the
 // request that follows from it, in arena. Every request is built this way: there is
 // no other copy of the conversation to fall out of step with.
-@(private)
+@(private, require_results)
 chat_prepare :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, arena: mem.Allocator) -> (prep: Chat_Request_Prep, error: journal.Error) {
 	prep.projection = projection_load(chat.store, chat.session, chat.head, arena) or_return
 	chat_build_request_into(chat, &prep, prep.projection.items, prep.projection.summary, connection, "", arena) or_return
@@ -56,7 +56,7 @@ chat_prepare :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, ar
 // now, in the same arena. It is how a request is rebuilt after the active context
 // changed under it, such as when a finished compaction was installed. False leaves
 // the caller with nothing to send.
-@(private)
+@(private, require_results)
 chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, prep: ^Chat_Request_Prep, arena: mem.Allocator) -> bool {
 	fresh, prep_error := chat_prepare(chat, connection, arena)
 	if prep_error != nil {
@@ -72,7 +72,7 @@ chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connectio
 // final user message: that is how a compaction request asks for a summary while
 // carrying the same instructions, tools, and cache identity as the conversation it is
 // summarizing, so the provider prefix it reads is the warm one.
-@(private)
+@(private, require_results)
 chat_build_request_into :: proc(
 	chat: ^Chat_Session,
 	prep: ^Chat_Request_Prep,
@@ -210,7 +210,7 @@ Chat_Replay_Target :: struct {
 // It reports how many records it refused, which is a fact about this request: the
 // projection carries the same conversation, so a refusal changes the prefix the
 // endpoint sees and nothing the model is told.
-@(private)
+@(private, require_results)
 chat_append_projection :: proc(
 	messages: ^[dynamic]ai.Provider_Message,
 	call_lists: ^[dynamic][dynamic]ai.Provider_Tool_Call,
@@ -369,7 +369,7 @@ chat_replay_record_agrees :: proc(declared: []ai.Provider_Tool_Call, request: jo
 	return projected == len(declared)
 }
 
-@(private)
+@(private, require_results)
 chat_flush_feedback :: proc(messages: ^[dynamic]ai.Provider_Message, pending: ^[dynamic]string) -> mem.Allocator_Error {
 	for text in pending^ {
 		append(messages, ai.Provider_Message{Role = .User, Content = text}) or_return
@@ -378,7 +378,7 @@ chat_flush_feedback :: proc(messages: ^[dynamic]ai.Provider_Message, pending: ^[
 	return nil
 }
 
-@(private)
+@(private, require_results)
 chat_flush_calls :: proc(
 	messages: ^[dynamic]ai.Provider_Message,
 	call_lists: ^[dynamic][dynamic]ai.Provider_Tool_Call,
@@ -457,6 +457,7 @@ chat_admission_advice :: proc(sizes: Chat_Request_Sizes, ceiling: int) -> string
 // chat_admission_check asks whether the estimate leaves room for an answer. It is not a
 // check against a reserved budget: there is none. The message is temp-allocated; the
 // caller clones it when the turn must record the failure.
+@(require_results)
 chat_admission_check :: proc(chat: ^Chat_Session, estimate: int, sizes: Chat_Request_Sizes) -> (message: string, admitted: bool) {
 	// The decision is recorded even when it admits the request: what the harness
 	// estimated and what it compared that against is the whole reason a request was

@@ -52,6 +52,7 @@ lua_limit_hook :: proc "c" (state: ^lua.State, ar: ^lua.Debug) {
 	lua.error(state)
 }
 
+@(require_results)
 lua_string :: proc(state: ^lua.State, idx: c.int, allocator: mem.Allocator) -> (string, Config_Error) {
 	if lua.type(state, idx) != .STRING { return "", .Invalid }
 	length: c.size_t
@@ -62,11 +63,13 @@ lua_string :: proc(state: ^lua.State, idx: c.int, allocator: mem.Allocator) -> (
 	return value, .None
 }
 
+@(require_results)
 lua_bool :: proc(state: ^lua.State, idx: c.int) -> (bool, bool) {
 	if lua.type(state, idx) != .BOOLEAN { return false, false }
 	return lua.toboolean(state, idx) != false, true
 }
 
+@(require_results)
 lua_int :: proc(state: ^lua.State, idx: c.int) -> (int, bool) {
 	if lua.type(state, idx) != .NUMBER { return 0, false }
 	ok: b32
@@ -92,11 +95,13 @@ lua_field :: proc(state: ^lua.State, idx: c.int, name: string) -> c.int {
 	return lua.getfield(state, idx, name_c)
 }
 
+@(require_results)
 lua_plain_table :: proc(state: ^lua.State, idx: c.int) -> bool {
 	if lua.type(state, idx) != .TABLE { return false }
 	return lua.getmetatable(state, idx) == 0
 }
 
+@(require_results)
 load_model :: proc(state: ^lua.State, raw_idx: c.int, provider_id, model_id: string, allocator: mem.Allocator, out: ^Catalog_Model_Source) -> Config_Error {
 	if !lua_plain_table(state, raw_idx) { return .Invalid }
 	idx := lua.absindex(state, raw_idx)
@@ -264,6 +269,7 @@ load_model :: proc(state: ^lua.State, raw_idx: c.int, provider_id, model_id: str
 	return .None
 }
 
+@(require_results)
 load_provider :: proc(state: ^lua.State, raw_idx: c.int, provider_id: string, allocator: mem.Allocator, out: ^Catalog_Provider_Source) -> Config_Error {
 	if !lua_plain_table(state, raw_idx) { return .Invalid }
 	idx := lua.absindex(state, raw_idx)
@@ -355,6 +361,7 @@ load_provider :: proc(state: ^lua.State, raw_idx: c.int, provider_id: string, al
 	return .None
 }
 
+@(require_results)
 load_harness_options :: proc(state: ^lua.State, idx: c.int) -> (Harness_Options, Config_Error) {
 	options: Harness_Options
 	if lua.type(state, idx) == .NIL { return options, .None }
@@ -370,6 +377,7 @@ load_harness_options :: proc(state: ^lua.State, idx: c.int) -> (Harness_Options,
 	return options, .None
 }
 
+@(require_results)
 load_lua_config_full :: proc(
 	path: string,
 	allocator := context.allocator,
@@ -456,7 +464,7 @@ load_lua_config_full :: proc(
 
 // load_mcp_servers_from reads the `mcp` table, which holds the `servers` table. The
 // state is reset by the caller.
-@(private)
+@(private, require_results)
 load_mcp_servers_from :: proc(state: ^lua.State, root_idx: c.int, allocator: mem.Allocator) -> ([dynamic]MCP_Server_Config, Config_Error) {
 	base := lua.gettop(state)
 	defer lua.settop(state, base)
@@ -470,7 +478,7 @@ load_mcp_servers_from :: proc(state: ^lua.State, root_idx: c.int, allocator: mem
 }
 
 // load_acp_agents_from reads the `agents` table. The state is reset by the caller.
-@(private)
+@(private, require_results)
 load_acp_agents_from :: proc(state: ^lua.State, root_idx: c.int, allocator: mem.Allocator) -> ([dynamic]ACP_Agent_Config, Config_Error) {
 	base := lua.gettop(state)
 	defer lua.settop(state, base)
@@ -478,6 +486,7 @@ load_acp_agents_from :: proc(state: ^lua.State, root_idx: c.int, allocator: mem.
 	return acp_agents_load(state, -1, allocator)
 }
 
+@(require_results)
 load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Config_Error) {
 	if path == "" { return {}, .None }
 	if info, stat_err := os.stat(path, context.temp_allocator); stat_err != nil {
@@ -538,6 +547,7 @@ load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynam
 // variable. `${NAME}` is the reference syntax configuration values already use
 // for environment variables, and it is unambiguous: a literal secret never
 // matches it. The name must be a plain identifier.
+@(require_results)
 config_env_reference :: proc(value: string) -> (name: string, ok: bool) {
 	if len(value) < 4 || value[0] != '$' || value[1] != '{' || value[len(value) - 1] != '}' { return "", false }
 	name = value[2:len(value) - 1]
@@ -559,6 +569,7 @@ config_env_reference :: proc(value: string) -> (name: string, ok: bool) {
 // fails, so a miswired reference can never send the variable's name as a key.
 // Resolution happens at use rather than at load, so the catalog never holds a
 // secret and no state file can.
+@(require_results)
 config_resolve_credential :: proc(value: string, allocator := context.allocator) -> (secret: string, ok: bool) {
 	if name, reference := config_env_reference(value); reference {
 		found: bool

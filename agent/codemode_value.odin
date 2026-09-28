@@ -56,6 +56,7 @@ Codemode_Walk :: struct {
 // says what was refused and where, is owned by allocator; out_of_memory says the refusal
 // was a lack of memory rather than the value. A value of any size converts; a table nested
 // more than TOOL_MAX_ARGS_DEPTH deep, a cycle, and a value that is not data are refused.
+@(require_results)
 codemode_lua_convert :: proc(
 	run: ^Lua_Run,
 	state: ^lua.State,
@@ -96,7 +97,7 @@ codemode_walk_text :: proc(builder: ^strings.Builder, text: string) -> (written:
 
 // codemode_walk_message says what the walk refused, where it refused it, and why. The text
 // is owned by allocator.
-@(private)
+@(private, require_results)
 codemode_walk_message :: proc(walk: ^Codemode_Walk, allocator: runtime.Allocator) -> (text: string, err: runtime.Allocator_Error) {
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return "", builder_error }
@@ -124,7 +125,7 @@ codemode_walk_message :: proc(walk: ^Codemode_Walk, allocator: runtime.Allocator
 // codemode_value_allocation_message is what the value boundary tells a caller when it had no
 // memory to write the text it was asked for. The caller's allocator owns the message, so the
 // caller releases it the way it releases a converted value.
-@(private)
+@(private, require_results)
 codemode_value_allocation_message :: proc(allocator: runtime.Allocator) -> string {
 	return fmt.aprintf("the value could not be written: out of memory", allocator = allocator)
 }
@@ -133,6 +134,7 @@ codemode_value_allocation_message :: proc(allocator: runtime.Allocator) -> strin
 // document the child call is admitted from, exactly like a provider's. A call with no table
 // gets an empty object. The text, or the message that refuses it, is owned by the run's
 // allocator.
+@(require_results)
 codemode_lua_request_arguments :: proc(run: ^Lua_Run) -> (text: string, message: string) {
 	context.allocator = run.allocator
 	if run.request.args_ref == lua.NOREF {
@@ -154,6 +156,7 @@ codemode_lua_request_arguments :: proc(run: ^Lua_Run) -> (text: string, message:
 // codemode_lua_returned_literal writes the chunk's return value as a Lua literal. No value
 // is nil, and more than one is refused: a script has one answer, and dropping a second would
 // hide the mistake. The literal or the message is owned by the run's allocator.
+@(require_results)
 codemode_lua_returned_literal :: proc(run: ^Lua_Run) -> (literal: string, message: string, diagnostic: Codemode_Diagnostic) {
 	context.allocator = run.allocator
 	switch {
@@ -174,7 +177,7 @@ codemode_lua_returned_literal :: proc(run: ^Lua_Run) -> (literal: string, messag
 
 // --- the walk ------------------------------------------------------------------
 
-@(private)
+@(private, require_results)
 codemode_walk_fail :: proc(walk: ^Codemode_Walk, subject, problem: string) -> bool {
 	walk.subject = subject
 	walk.problem = problem
@@ -182,14 +185,14 @@ codemode_walk_fail :: proc(walk: ^Codemode_Walk, subject, problem: string) -> bo
 	return false
 }
 
-@(private)
+@(private, require_results)
 codemode_walk_write :: proc(walk: ^Codemode_Walk, text: string) -> bool {
 	if strings.write_string(&walk.builder, text) == len(text) { return true }
 	walk.out_of_memory = true
 	return codemode_walk_fail(walk, "value", "could not be written: out of memory")
 }
 
-@(private)
+@(private, require_results)
 codemode_walk_value :: proc(walk: ^Codemode_Walk, index: c.int, depth: int) -> bool {
 	state := walk.state
 	switch lua.type(state, index) {
@@ -219,7 +222,7 @@ codemode_walk_value :: proc(walk: ^Codemode_Walk, index: c.int, depth: int) -> b
 // codemode_walk_number writes a finite number so it reads back as the same value: an
 // integer as its digits, and a float as its shortest exact digits with a fraction mark
 // when the digits alone would read as an integer.
-@(private)
+@(private, require_results)
 codemode_walk_number :: proc(walk: ^Codemode_Walk, index: c.int) -> bool {
 	buffer: [32]u8
 	if lua.isinteger(walk.state, index) {
@@ -236,7 +239,7 @@ codemode_walk_number :: proc(walk: ^Codemode_Walk, index: c.int) -> bool {
 
 // codemode_walk_quoted writes valid UTF-8 text as a string literal of the notation. Both
 // keep every character but the quote, the backslash, and control bytes as they are.
-@(private)
+@(private, require_results)
 codemode_walk_quoted :: proc(walk: ^Codemode_Walk, text: string) -> bool {
 	if walk.notation == .Lua {
 		if _, err := render_quoted(&walk.builder, text); err != nil {
@@ -277,7 +280,7 @@ codemode_walk_quoted :: proc(walk: ^Codemode_Walk, text: string) -> bool {
 // only when it is dense from 1, and an object only when every key is a string; an empty table
 // is an object, because a call with no arguments is the common case. Access is raw, so no
 // metamethod runs.
-@(private)
+@(private, require_results)
 codemode_walk_table :: proc(walk: ^Codemode_Walk, table: c.int, depth: int) -> bool {
 	state := walk.state
 	// The problem is kept past this frame, so it is static text; the bound it names is TOOL_MAX_ARGS_DEPTH.
@@ -317,7 +320,7 @@ codemode_walk_table :: proc(walk: ^Codemode_Walk, table: c.int, depth: int) -> b
 	return codemode_walk_object(walk, table, count, depth)
 }
 
-@(private)
+@(private, require_results)
 codemode_walk_array :: proc(walk: ^Codemode_Walk, table: c.int, length, depth: int) -> bool {
 	lua_notation := walk.notation == .Lua
 	codemode_walk_write(walk, lua_notation ? "{" : "[") or_return
@@ -336,7 +339,7 @@ codemode_walk_array :: proc(walk: ^Codemode_Walk, table: c.int, length, depth: i
 
 // codemode_walk_object writes fields in name order, so the same value is always the same
 // text. The names are borrowed from the table, which holds them for the whole walk.
-@(private)
+@(private, require_results)
 codemode_walk_object :: proc(walk: ^Codemode_Walk, table: c.int, count, depth: int) -> bool {
 	state := walk.state
 	names, names_error := make([]string, count)
@@ -397,7 +400,7 @@ codemode_walk_leave :: proc(walk: ^Codemode_Walk, mark: int) {
 }
 
 // codemode_identifier reports whether a name can be written as a bare field name.
-@(private)
+@(private, require_results)
 codemode_identifier :: proc(name: string) -> bool {
 	if !tool_name_valid(name) { return false }
 	switch name {
@@ -469,7 +472,7 @@ codemode_lua_json_decode :: proc "c" (state: ^lua.State) -> c.int {
 }
 
 // codemode_json_defect_text says what makes a text unreadable as JSON. The text is temporary.
-@(private)
+@(private, require_results)
 codemode_json_defect_text :: proc(defect: Tool_Argument_Defect) -> string {
 	#partial switch defect.kind {
 	case .Duplicate_Field:
@@ -484,7 +487,7 @@ codemode_json_defect_text :: proc(defect: Tool_Argument_Defect) -> string {
 
 // codemode_json_push pushes a JSON document as the Lua value with the same shape. JSON null
 // becomes json.null. It reports false, with nothing pushed, for a document nested too deeply.
-@(private)
+@(private, require_results)
 codemode_json_push :: proc(run: ^Lua_Run, state: ^lua.State, value: json.Value, depth: int) -> bool {
 	if depth > TOOL_MAX_ARGS_DEPTH { return false }
 	switch item in value {
@@ -526,6 +529,7 @@ codemode_json_push :: proc(run: ^Lua_Run, state: ^lua.State, value: json.Value, 
 // codemode_lua_keep_result holds a committed child result under its handle until the script
 // waits for it: a table of the outcome, the message, and the typed output. The table is
 // built in protected mode, so a lack of memory is reported rather than aborting the process.
+@(require_results)
 codemode_lua_keep_result :: proc(run: ^Lua_Run, handle: int, result: ^Tool_Result) -> (kept: bool) {
 	state := run.state
 	lua.pushcfunction(state, codemode_lua_keep_body)

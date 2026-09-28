@@ -69,6 +69,7 @@ mcp_hint :: proc(hint: mcp.Hint) -> Tool_Hint_Value {
 // shares, which is what lets a definition carry a backend binding instead of a procedure of
 // its own. An MCP server validates its own tool's arguments, so they are not read here: what
 // travels to the peer is the admitted text, so the peer and the dispatch record agree.
+@(require_results)
 tool_mcp_execute :: proc(ctx: ^Tool_Context, _: Tool_Args) -> (result: Tool_Result) {
 	backend := cast(^MCP_Tool_Backend)ctx.backend
 	started := time.tick_now()
@@ -113,14 +114,14 @@ tool_mcp_options :: proc(ctx: ^Tool_Context) -> mcp.Operation_Options {
 	return options
 }
 
-@(private)
+@(private, require_results)
 tool_mcp_interrupted :: proc(user_data: rawptr) -> bool {
 	return ai.interrupt_requested(cast(^ai.Interrupt)user_data)
 }
 
 // --- results -----------------------------------------------------------------
 
-@(private)
+@(private, require_results)
 tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_Result {
 	// The blocks and their details are built in temp memory and copied into the result
 	// before this returns.
@@ -172,7 +173,7 @@ tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_
 
 // tool_mcp_omitted_detail says what a block the harness does not show was. The type
 // and the MIME type are the parts a reader can act on.
-@(private)
+@(private, require_results)
 tool_mcp_omitted_detail :: proc(content: mcp.Content, allocator := context.allocator) -> string {
 	switch content.kind {
 	case .Image, .Audio:
@@ -192,7 +193,7 @@ tool_mcp_omitted_detail :: proc(content: mcp.Content, allocator := context.alloc
 }
 
 // tool_mcp_error_result reports a call that delivered no usable result.
-@(private)
+@(private, require_results)
 tool_mcp_error_result :: proc(ctx: ^Tool_Context, backend: ^MCP_Tool_Backend, err: mcp.Error) -> Tool_Result {
 	// The message is assembled in temp memory and cloned into the result.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()

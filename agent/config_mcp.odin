@@ -84,6 +84,7 @@ mcp_servers_destroy :: proc(servers: ^[dynamic]MCP_Server_Config, allocator := c
 // MCP_Server_Config_From_Stdio builds a server from the stdio transport shape.
 // Names and values are parallel borrowed slices so callers need not manufacture this
 // package's private environment representation.
+@(require_results)
 MCP_Server_Config_From_Stdio :: proc(
 	id: string,
 	executable: string,
@@ -121,6 +122,7 @@ MCP_Server_Config_From_Stdio :: proc(
 
 // MCP_Server_Configs_Clone copies a configuration list so a client-provided stdio
 // session can extend the launch configuration without borrowing its lifetime.
+@(require_results)
 MCP_Server_Configs_Clone :: proc(servers: []MCP_Server_Config, allocator := context.allocator) -> ([dynamic]MCP_Server_Config, Config_Error) {
 	result, result_error := make([dynamic]MCP_Server_Config, 0, len(servers), allocator)
 	if result_error != nil { return {}, .Allocation }
@@ -143,6 +145,7 @@ MCP_Server_Configs_Destroy :: proc(servers: ^[dynamic]MCP_Server_Config, allocat
 	mcp_servers_destroy(servers, allocator)
 }
 
+@(require_results)
 mcp_string_slice_clone :: proc(values: []string, allocator: mem.Allocator) -> ([]string, Config_Error) {
 	result, result_error := make([]string, len(values), allocator)
 	if result_error != nil { return nil, .Allocation }
@@ -157,6 +160,7 @@ mcp_string_slice_clone :: proc(values: []string, allocator: mem.Allocator) -> ([
 	return result, .None
 }
 
+@(require_results)
 mcp_environment_from_pairs :: proc(names, values: []string, allocator: mem.Allocator) -> ([]MCP_Environment, Config_Error) {
 	result, result_error := make([]MCP_Environment, len(names), allocator)
 	if result_error != nil { return nil, .Allocation }
@@ -192,6 +196,7 @@ mcp_environment_from_pairs :: proc(names, values: []string, allocator: mem.Alloc
 	return result, .None
 }
 
+@(require_results)
 mcp_environment_clone :: proc(source: []MCP_Environment, allocator: mem.Allocator) -> ([]MCP_Environment, Config_Error) {
 	result, result_error := make([]MCP_Environment, len(source), allocator)
 	if result_error != nil { return nil, .Allocation }
@@ -227,6 +232,7 @@ mcp_environment_clone :: proc(source: []MCP_Environment, allocator: mem.Allocato
 	return result, .None
 }
 
+@(require_results)
 mcp_server_config_clone :: proc(source: MCP_Server_Config, allocator: mem.Allocator) -> (MCP_Server_Config, Config_Error) {
 	config := MCP_Server_Config {
 		discovery_timeout = source.discovery_timeout,
@@ -270,6 +276,7 @@ mcp_server_config_clone :: proc(source: MCP_Server_Config, allocator: mem.Alloca
 // The transport is chosen by which endpoint field is present. Only stdio exists, so
 // `executable` is what selects it; a later transport would bring its own field, and
 // setting two would be the error.
+@(require_results)
 mcp_servers_load :: proc(state: ^lua.State, idx: c.int, allocator: mem.Allocator) -> ([dynamic]MCP_Server_Config, Config_Error) {
 	servers: [dynamic]MCP_Server_Config
 	servers.allocator = allocator
@@ -313,7 +320,7 @@ mcp_servers_load :: proc(state: ^lua.State, idx: c.int, allocator: mem.Allocator
 	return servers, .None
 }
 
-@(private)
+@(private, require_results)
 mcp_server_load :: proc(state: ^lua.State, raw_idx: c.int, id: string, allocator: mem.Allocator, out: ^MCP_Server_Config) -> Config_Error {
 	if !lua_plain_table(state, raw_idx) { return .Invalid }
 	idx := lua.absindex(state, raw_idx)
@@ -388,7 +395,7 @@ mcp_server_load :: proc(state: ^lua.State, raw_idx: c.int, id: string, allocator
 
 // mcp_timeout_ms reads one optional millisecond bound. It is converted to a
 // duration here, so milliseconds appear only in the configuration file.
-@(private)
+@(private, require_results)
 mcp_timeout_ms :: proc(state: ^lua.State, idx: c.int, field: string) -> (value: time.Duration, present: bool, ok: bool) {
 	base := lua.gettop(state)
 	defer lua.settop(state, base)
@@ -399,7 +406,7 @@ mcp_timeout_ms :: proc(state: ^lua.State, idx: c.int, field: string) -> (value: 
 	return time.Duration(milliseconds) * time.Millisecond, true, true
 }
 
-@(private)
+@(private, require_results)
 mcp_string_list :: proc(state: ^lua.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]string, Config_Error) {
 	if !lua_plain_table(state, raw_idx) { return nil, .Invalid }
 	index := lua.absindex(state, raw_idx)
@@ -433,7 +440,7 @@ mcp_strings_release :: proc(values: [dynamic]string, allocator: mem.Allocator) {
 // mcp_environment_load reads a name-to-value table. Names are checked for being
 // usable as an environment variable so a malformed entry is refused here rather
 // than by a server that silently sees nothing.
-@(private)
+@(private, require_results)
 mcp_environment_load :: proc(state: ^lua.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]MCP_Environment, Config_Error) {
 	index := lua.absindex(state, raw_idx)
 	entries, entries_error := make([dynamic]MCP_Environment, 0, allocator)
@@ -490,7 +497,7 @@ mcp_environment_release :: proc(entries: [dynamic]MCP_Environment, allocator: me
 	delete(entries)
 }
 
-@(private)
+@(private, require_results)
 mcp_environment_name_valid :: proc(name: string) -> bool {
 	if name == "" { return false }
 	for character, index in name {
@@ -506,7 +513,7 @@ mcp_environment_name_valid :: proc(name: string) -> bool {
 
 // mcp_tool_configs_load reads optional per-tool overrides. The key is the exact
 // remote name. enabled defaults to true within an entry, and name is optional.
-@(private)
+@(private, require_results)
 mcp_tool_configs_load :: proc(state: ^lua.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]MCP_Tool_Config, Config_Error) {
 	if !lua_plain_table(state, raw_idx) { return nil, .Invalid }
 	index := lua.absindex(state, raw_idx)
@@ -603,6 +610,7 @@ mcp_tool_configs_release :: proc(configs: [dynamic]MCP_Tool_Config, allocator: m
 // inherits the launch environment; configured entries replace or add variables.
 // The strings are borrowed until mcp.Client clones the configuration. ok is false when
 // the environment could not be built, in which case no configuration is returned.
+@(require_results)
 mcp_stdio_config :: proc(config: MCP_Server_Config) -> (stdio: mcp.Stdio_Config, ok: bool) {
 	environment, environment_error := make([dynamic]mcp.Environment_Entry, 0, context.temp_allocator)
 	if environment_error != nil { return {}, false }

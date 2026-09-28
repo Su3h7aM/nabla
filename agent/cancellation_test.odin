@@ -46,7 +46,7 @@ test_cancelled_turn_retires_then_next_turn_runs :: proc(test: ^testing.T) {
 	testing.expect_value(test, finish.kind, Chat_Effect_Kind.Turn_Finished)
 	testing.expect_value(test, finish.status, Chat_Terminal_Status.Cancelled)
 	chat_session_claim_finish(chat, finish)
-	chat_persist_turn_end(chat, finish)
+	testing.expect(test, chat_persist_turn_end(chat, finish))
 	testing.expect_value(test, chat.state, Chat_State.Idle)
 
 	// The turn's prompt and the text it produced before stopping are both kept:
@@ -83,7 +83,7 @@ test_cancelled_turn_retires_then_next_turn_runs :: proc(test: ^testing.T) {
 	finish = chat_session_advance(chat)
 	testing.expect_value(test, finish.status, Chat_Terminal_Status.Completed)
 	chat_session_claim_finish(chat, finish)
-	chat_persist_turn_end(chat, finish)
+	testing.expect(test, chat_persist_turn_end(chat, finish))
 }
 
 // Events are identified by turn and operation. An event from a superseded operation
@@ -103,7 +103,7 @@ test_stale_operation_events_are_rejected :: proc(test: ^testing.T) {
 	chat_session_retire_operation(chat)
 	finish := chat_session_advance(chat)
 	chat_session_claim_finish(chat, finish)
-	chat_persist_turn_end(chat, finish)
+	testing.expect(test, chat_persist_turn_end(chat, finish))
 
 	_test_accept(test, chat, "second")
 	effect = _test_begin_request(test, chat)
@@ -143,7 +143,7 @@ test_turn_finalizes_exactly_once :: proc(test: ^testing.T) {
 	testing.expect_value(test, finish.kind, Chat_Effect_Kind.Turn_Finished)
 	testing.expect_value(test, finish.status, Chat_Terminal_Status.Completed)
 	chat_session_claim_finish(chat, finish)
-	chat_persist_turn_end(chat, finish)
+	testing.expect(test, chat_persist_turn_end(chat, finish))
 
 	// No second terminal effect, and no later transition.
 	again := chat_session_advance(chat)

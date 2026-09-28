@@ -272,6 +272,7 @@ tool_jobs_committed :: proc(jobs: ^Tool_Jobs) -> int { return jobs.committed_roo
 
 // tool_jobs_settled reports whether every job is released, which is what ends the
 // batch's loop. An abandoned job counts as settled.
+@(require_results)
 tool_jobs_settled :: proc(jobs: ^Tool_Jobs) -> bool {
 	for job in jobs.jobs {
 		switch job.phase {
@@ -317,7 +318,7 @@ tool_jobs_earliest_live :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
 // tool_jobs_publish makes a fully initialized job visible to the owner table. The
 // table append is part of admission: a job that is not published has no owner, so
 // it must be released with the worker allocator before the batch changes state.
-@(private)
+@(private, require_results)
 tool_jobs_publish :: proc(jobs: ^Tool_Jobs, job: ^Tool_Job) -> bool {
 	if append(&jobs.jobs, job) != 1 {
 		tool_job_release(job)
@@ -544,7 +545,7 @@ tool_jobs_next :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> Tool_Job_Effect {
 // tool_job_under_executor reports whether a call is in one of the two phases where the owner
 // still watches for a stop it asked for: the dispatch write, or an executor running the call.
 
-@(private)
+@(private, require_results)
 tool_job_under_executor :: proc(job: ^Tool_Job) -> bool {
 	switch job.phase {
 	case .Dispatching, .Running:
@@ -599,12 +600,12 @@ tool_jobs_retirable :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> ^Tool_Job {
 
 // tool_job_releasable reports whether no worker can still reach the job. A launched job
 // leaves Running only when collection joined its worker or when it is abandoned.
-@(private)
+@(private, require_results)
 tool_job_releasable :: proc(job: ^Tool_Job) -> bool {
 	return !job.launched || job.phase != .Running
 }
 
-@(private)
+@(private, require_results)
 tool_jobs_stopped_long_enough :: proc(job: ^Tool_Job, now: time.Tick) -> bool {
 	return job.stopping && time.tick_diff(job.stop_at, now) >= TOOL_JOBS_STOP_PATIENCE
 }
@@ -649,7 +650,7 @@ tool_jobs_runnable :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
 // from the table rather than tracked separately, so a lane cannot be left busy by a
 // job that was already released. An abandoned job gives up the native lane, so new
 // native work takes over from it.
-@(private)
+@(private, require_results)
 tool_jobs_lane_free :: proc(jobs: ^Tool_Jobs, candidate: ^Tool_Job) -> bool {
 	// A script runs on the owner in slices, so it never waits for a lane.
 	if candidate.placement == .Lua { return true }
@@ -874,7 +875,7 @@ tool_jobs_refuse :: proc(jobs: ^Tool_Jobs) {
 // tool_result_report_repairs adds a `repaired:` line after the result's first line. The
 // projection replays the corrected arguments, so this line is how the model learns what it
 // sent wrong.
-@(private)
+@(private, require_results)
 tool_result_report_repairs :: proc(result: ^Tool_Result, repairs: Tool_Repairs) -> mem.Allocator_Error {
 	if repairs == {} { return nil }
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -1020,7 +1021,7 @@ tool_jobs_await :: proc(jobs: ^Tool_Jobs, deadline: Maybe(time.Tick)) {
 // tool_job_execute runs one admitted call and logs what it observed. It runs on
 // whichever thread owns the job, so every record it makes carries the job's own
 // correlation rather than the caller's.
-@(private)
+@(private, require_results)
 tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
 	previous := context.logger
 	context.logger = log_logger(&job.logging)
@@ -1035,7 +1036,7 @@ tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
 
 // tool_job_launch starts one worker-placed job. The watched signals are blocked across
 // creation so the worker inherits a mask that keeps it from running the process handler.
-@(private)
+@(private, require_results)
 tool_job_launch :: proc(job: ^Tool_Job) -> os.Error {
 	job.wake = tool_wake_open() or_return
 	job.exec.control.wake = job.wake.read

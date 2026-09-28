@@ -83,6 +83,7 @@ tool_spawn_shell_flags :: proc(shell: string) -> (first, second: cstring) {
 // The harness may have other threads, so between fork and exec the child makes
 // only async-signal-safe calls: it allocates, locks, and logs nothing, and every
 // failure leaves through _exit, which runs no atexit handler and flushes no stdio.
+@(require_results)
 tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stderr_write: ^os.File) -> (child: Tool_Child, spawn: Tool_Spawn, err: os.Error) {
 	arguments, arguments_error := make([dynamic]string, 0, 4, context.temp_allocator)
 	if arguments_error != nil { return {}, .Failed, arguments_error }
@@ -96,6 +97,7 @@ tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stde
 
 // tool_spawn_command execs an argv in a private process group. A nil input closes stdin.
 // parent_death binds the child's lifetime to this supervising thread on Linux.
+@(require_results)
 tool_spawn_command :: proc(
 	arguments: []string,
 	directory: string,
@@ -208,7 +210,7 @@ tool_fd :: proc(file: ^os.File) -> posix.FD {
 }
 
 // tool_errno is the calling thread's last POSIX error as an os.Error.
-@(private)
+@(private, require_results)
 tool_errno :: proc() -> os.Error {
 	return os.Platform_Error(i32(posix.errno()))
 }
@@ -226,7 +228,7 @@ tool_read :: proc(file: ^os.File, buffer: []u8) -> (count: int, status: Tool_Rea
 
 // tool_poll blocks until one of fds is ready or the deadline passes, and never
 // wakes on its own otherwise. A signal restarts the wait with the time left.
-@(private)
+@(private, require_results)
 tool_poll :: proc(fds: []posix.pollfd, deadline: time.Tick, has_deadline: bool) -> os.Error {
 	for {
 		timeout: i32 = -1
@@ -250,6 +252,7 @@ tool_child_record :: proc(child: ^Tool_Child, status: i32) {
 
 // tool_child_poll reports whether the child has finished, reaping it if it has.
 // It never blocks.
+@(require_results)
 tool_child_poll :: proc(child: ^Tool_Child) -> bool {
 	if child.reaped { return true }
 	status: i32
@@ -265,6 +268,7 @@ tool_child_poll :: proc(child: ^Tool_Child) -> bool {
 
 // tool_child_reap blocks until the child is reaped and reports its exit state. A
 // process killed by a signal did not exit, so exited is false.
+@(require_results)
 tool_child_reap :: proc(child: ^Tool_Child) -> (exited: bool, exit_code: int, waited: bool) {
 	if child.reaped { return child.exited, child.exit_code, child.status_known }
 	status: i32
@@ -309,6 +313,7 @@ tool_control_fds :: proc(fds: []posix.pollfd, control: Tool_Control) -> int {
 // also wakes on a stop and ends at the deadline. Background descendants are not
 // waited for: they only keep pipes open, and the caller closes those pipes on
 // return.
+@(require_results)
 tool_retire_child :: proc(child: ^Tool_Child, start: time.Tick, budget: time.Duration, control: Tool_Control) -> (Tool_Stop, os.Error) {
 	deadline := time.tick_add(start, budget)
 	for !tool_child_poll(child) {
@@ -351,7 +356,7 @@ Tool_Stream :: struct {
 // tool_stream_take adds one chunk. The spool is opened the first time the stream outgrows
 // memory, and receives everything kept so far. When it cannot be opened the stream stays in
 // memory, because output is never discarded.
-@(private)
+@(private, require_results)
 tool_stream_take :: proc(stream: ^Tool_Stream, chunk: []u8) -> os.Error {
 	stream.total += len(chunk)
 	if stream.spool == nil && stream.spool_path != "" && len(stream.kept) + len(chunk) > TOOL_STREAM_MEMORY_BYTES {
@@ -379,6 +384,7 @@ tool_stream_take :: proc(stream: ^Tool_Stream, chunk: []u8) -> os.Error {
 // or the deadline passes, and never reads one pipe to EOF before the other, so a
 // child cannot deadlock on a full pipe. Termination and reaping happen here, so
 // the caller only ever sees a finished process.
+@(require_results)
 tool_drain_pipes :: proc(
 	child: ^Tool_Child,
 	stdout_read, stderr_read: ^os.File,
