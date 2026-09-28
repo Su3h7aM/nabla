@@ -1,9 +1,3 @@
-// Package websocket is the WebSocket protocol (RFC 6455): the frame codec, and a
-// connection that moves messages over whatever carries its bytes.
-//
-// It is a client. It masks every frame it sends, refuses a frame a server may not
-// send masked, and never carries the bytes itself: a caller supplies the transport
-// and so keeps its own deadline and cancellation.
 package websocket
 
 // Opcode is what a frame carries (RFC 6455 section 5.2).

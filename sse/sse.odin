@@ -1,16 +1,3 @@
-// Package sse is Server-Sent Events framing: parsing an
-// application/event-stream byte stream into events, writing events back out in
-// the same format, and the POST that asks for a stream.
-//
-// The behaviour follows the WHATWG HTML Standard, "Server-sent events" -- the
-// event stream format and its interpretation algorithm.
-//
-// The grammar sets no size bound on lines or events (`*any-char` repeats
-// without limit), so the parser accumulates without one: a provider may send
-// an event of any size and it still parses.
-//
-// The parser is a pure state machine over bytes: no I/O, no connection, no
-// retained stream. The caller owns the byte source and the event callbacks.
 package sse
 
 import "base:runtime"

@@ -1,11 +1,3 @@
-// Package client is a minimal HTTP/1.1 client whose blocking phases are
-// interruptible. Readiness and deadlines are the transport's business and are
-// answered by a core:nbio event loop; the caller supplies only an interruption
-// policy, so it never has to poll a descriptor itself.
-//
-// It is a stopgap kept deliberately small: streaming bodies, verified TLS,
-// deadlines, and cancellation are the whole requirement set, and nothing is
-// added beyond them.
 package client
 
 import "core:net"

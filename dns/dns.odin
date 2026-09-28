@@ -1,15 +1,3 @@
-// Package dns is a stub DNS resolver: it asks the caller's nameservers for
-// records and reports what they answer. It owns the DNS mechanism (message
-// validation, UDP/TCP exchange framing, truncation fallback, and the
-// attempts-over-servers policy) and nothing else. Which servers to ask, how
-// long to wait, when to stop, and what to do with answers are the caller's
-// policy, carried in Options.
-//
-// The message codec, record model, and OS configuration readers live in
-// core:net and are reused, not repeated here. What core does not provide is
-// truncation-aware transport selection and response validation, which is
-// what this package adds. Every wait runs on the calling thread's core:nbio
-// event loop, which a lookup acquires for its own duration.
 package dns
 
 import "core:mem"

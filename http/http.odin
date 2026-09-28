@@ -1,9 +1,3 @@
-/*
-Package http is HTTP/1.1 as RFC 9110 and RFC 9112 define it: the message
-grammar (methods, versions, request lines, field sections, framing values,
-URLs, dates, status codes, cookies) and a server that runs on core:nbio. The
-client lives in http/client and shares this grammar.
-*/
 package http
 
 import "base:runtime"

@@ -1,7 +1,3 @@
-// Package tls is a TLS 1.3 client: the record layer, the key schedule, and the
-// handshake that reach a peer over a byte stream. It performs no I/O of its own
-// and holds no clock, so a caller decides how bytes move and how long a wait may
-// take.
 package tls
 
 // Record_Type is the TLS ContentType (RFC 8446 section B.1).
