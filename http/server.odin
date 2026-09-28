@@ -107,6 +107,7 @@ Server_Error :: union #shared_nil {
 	mem.Allocator_Error,
 }
 
+@(require_results)
 listen :: proc(server: ^Server, endpoint: net.Endpoint = Default_Endpoint, opts: Server_Opts = Default_Server_Opts) -> (err: Server_Error) {
 	server.opts = opts
 	server.connection_allocator = context.allocator
@@ -121,6 +122,7 @@ listen :: proc(server: ^Server, endpoint: net.Endpoint = Default_Endpoint, opts:
 	return nil
 }
 
+@(require_results)
 serve :: proc(server: ^Server, handler: Handler) -> (err: Server_Error) {
 	if atomic_load(&server.closing) { return }
 	server.handler = handler
@@ -155,6 +157,7 @@ serve :: proc(server: ^Server, handler: Handler) -> (err: Server_Error) {
 	return nil
 }
 
+@(require_results)
 listen_and_serve :: proc(
 	server: ^Server,
 	handler: Handler,
@@ -279,6 +282,7 @@ on_interrupt :: proc(op: ^nbio.Operation, server: ^Server) {
 // signal handler only writes to a pipe the server's first thread waits on, so
 // the shutdown itself runs in ordinary thread context. Call it before serve,
 // once per program: the pipe stays open for the handler it serves.
+@(require_results)
 server_shutdown_on_interrupt :: proc(server: ^Server) -> os.Error {
 	read, write := os.pipe() or_return
 	server.interrupt_read, server.interrupt_write = read, write

@@ -47,6 +47,7 @@ Parses a URL encoded body, aka bodies with the 'Content-Type: application/x-www-
 
 Key&value pairs are percent decoded and put in a map.
 */
+@(require_results)
 body_url_encoded :: proc(encoded: Body, allocator := context.temp_allocator) -> (queries: map[string]string, ok: bool) {
 
 	insert :: proc(result: ^map[string]string, text: string, key_start: int, value_start: int, end: int, allocator := context.temp_allocator) -> bool {

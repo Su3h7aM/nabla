@@ -26,6 +26,7 @@ Certificate_Chain :: struct {
 //
 // Every certificate owns the DER it was decoded from, so the message need not
 // outlive it. A server sends no certificate request context.
+@(require_results)
 certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (chain: Certificate_Chain, ok: bool) {
 	chain.allocator = allocator
 
@@ -106,6 +107,7 @@ certificate_chain_destroy :: proc(chain: ^Certificate_Chain) {
 // certificate_pointers returns the certificates as the pointers core's verifier
 // takes, which is the caller's to free. mem_err is set when that list could not be
 // allocated, and the caller owns nothing.
+@(require_results)
 certificate_pointers :: proc(certificates: []x509.Certificate, allocator: mem.Allocator) -> (pointers: []^x509.Certificate, mem_err: runtime.Allocator_Error) {
 	pointers, mem_err = make([]^x509.Certificate, len(certificates), allocator)
 	if mem_err != nil { return nil, mem_err }
@@ -122,6 +124,7 @@ CERTIFICATE_VERIFY_INPUT_MAX :: 64 + len(SERVER_CERTIFICATE_VERIFY_CONTEXT) + 1 
 
 // identity_verify checks the peer's certificate against the reference identifier the
 // caller reached it by, which is a name or an address literal.
+@(require_results)
 identity_verify :: proc(certificate: ^x509.Certificate, reference: string) -> bool {
 	if ip4, is_ip4 := net.parse_ip4_address(reference); is_ip4 {
 		address := ip4
@@ -136,6 +139,7 @@ identity_verify :: proc(certificate: ^x509.Certificate, reference: string) -> bo
 
 // A name is matched against the certificate's subject alternative names, and an
 // address literal against the addresses among them.
+@(require_results)
 san_matches :: proc(certificate: ^x509.Certificate, expected: []u8) -> bool {
 	for san in certificate.ip_addresses {
 		if bytes.equal(san, expected) { return true }
@@ -146,6 +150,7 @@ san_matches :: proc(certificate: ^x509.Certificate, expected: []u8) -> bool {
 // certificate_verify_verify checks a CertificateVerify message body against the
 // peer's end-entity certificate and the transcript of everything up to and
 // including its Certificate message. A scheme this client did not offer fails.
+@(require_results)
 certificate_verify_verify :: proc(message: []u8, certificate: ^x509.Certificate, transcript_hash: []u8) -> bool {
 	reader := Reader {
 		data = message,
@@ -186,6 +191,7 @@ certificate_verify_verify :: proc(message: []u8, certificate: ^x509.Certificate,
 
 // TLS 1.3 fixes the PSS parameters: MGF1 with the same hash, and a salt as long as
 // the digest (RFC 8446 section 4.2.3).
+@(require_results)
 rsa_pss_verify :: proc(certificate: ^x509.Certificate, hash_algorithm: hash.Algorithm, input, signature: []byte) -> bool {
 	public_key: rsa.Public_Key
 	if !rsa.public_key_set_bytes(&public_key, certificate.rsa_n, certificate.rsa_e) { return false }
@@ -194,12 +200,14 @@ rsa_pss_verify :: proc(certificate: ^x509.Certificate, hash_algorithm: hash.Algo
 
 // A TLS 1.3 ECDSA signature is the DER-encoded ECDSA-Sig-Value (RFC 8446
 // section 4.4.3).
+@(require_results)
 ecdsa_verify :: proc(certificate: ^x509.Certificate, curve: ecdsa.Curve, hash_algorithm: hash.Algorithm, input, signature: []byte) -> bool {
 	public_key: ecdsa.Public_Key
 	if !ecdsa.public_key_set_bytes(&public_key, curve, certificate.ec_point) { return false }
 	return ecdsa.verify_asn1(&public_key, hash_algorithm, input, signature)
 }
 
+@(require_results)
 ed25519_verify :: proc(certificate: ^x509.Certificate, input, signature: []byte) -> bool {
 	public_key: ed25519.Public_Key
 	if !ed25519.public_key_set_bytes(&public_key, certificate.ec_point) { return false }
@@ -209,6 +217,7 @@ ed25519_verify :: proc(certificate: ^x509.Certificate, input, signature: []byte)
 // finished_verify checks the verify_data of a Finished message body, which
 // authenticates every handshake message before it under the traffic secret of the
 // sender's direction (RFC 8446 section 4.4.4).
+@(require_results)
 finished_verify :: proc(suite: Cipher_Suite, secret: []u8, transcript_hash: []u8, verify_data: []u8) -> bool {
 	size := secret_size(suite)
 	finished_key: [MAX_SECRET_SIZE]u8

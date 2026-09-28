@@ -18,12 +18,14 @@ tls_transport :: proc(connection: ^Connection) -> tls.Transport {
 	return {read = connection_transport_read, write = connection_transport_write, user_data = connection}
 }
 
+@(require_results)
 connection_transport_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) {
 	connection := cast(^Connection)user_data
 	read, err := connection_read_socket(connection, buffer)
 	return read, err == .None
 }
 
+@(require_results)
 connection_transport_write :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) {
 	connection := cast(^Connection)user_data
 	written, err := connection_write_socket(connection, buffer)
@@ -33,6 +35,7 @@ connection_transport_write :: proc(user_data: rawptr, buffer: []u8) -> (count: i
 // tls_error maps what the TLS layer reported onto this client's classification. A
 // transport that failed is this client's own business, so the caller's reason is
 // preferred over anything the TLS layer could guess.
+@(require_results)
 tls_error :: proc(connection: ^Connection, tls_err: tls.Error, fallback: Error) -> Error {
 	if tls_err == .Transport {
 		// TLS reaches an orderly end only through an authenticated close_notify.
@@ -61,6 +64,7 @@ tls_error :: proc(connection: ^Connection, tls_err: tls.Error, fallback: Error) 
 // peer's own alert added when it sent one: an alert description is the only reason a
 // server gives, and a server that speaks no version this client does says so that way.
 // An empty string leaves the account to error_text.
+@(require_results)
 handshake_failure_detail :: proc(connection: ^Connection, err: Error, allocator: mem.Allocator) -> string {
 	alert := peer_alert_text(connection, allocator)
 	if alert == "" { return "" }
@@ -71,6 +75,7 @@ handshake_failure_detail :: proc(connection: ^Connection, err: Error, allocator:
 // peer_alert_text describes why the peer ended the handshake, and is empty when it did not
 // end it itself. A close_notify carries no reason, and a peer that sends one has given up
 // on the handshake rather than finished it.
+@(require_results)
 peer_alert_text :: proc(connection: ^Connection, allocator: mem.Allocator) -> string {
 	if connection.tls_session == nil { return "" }
 	if connection.tls_session.peer_alert != 0 {

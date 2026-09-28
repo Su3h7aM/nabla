@@ -37,6 +37,7 @@ Client_Hello_Fields :: struct {
 
 // client_hello_encode writes a ClientHello (RFC 8446 section 4.1.2) and returns
 // how many bytes of `dst` it used.
+@(require_results)
 client_hello_encode :: proc(dst: []u8, fields: Client_Hello_Fields) -> (count: int, ok: bool) {
 	writer := Writer {
 		dst = dst,

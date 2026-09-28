@@ -77,6 +77,7 @@ blocks cannot express.
 A zero socket means the attempt failed on its own; a stop means the probe ended
 it, and the operation was cancelled rather than left to run on.
 */
+@(require_results)
 wait_connected :: proc(endpoint: net.Endpoint, probe: Probe) -> (socket: net.TCP_Socket, stop: Transport_Stop) {
 	// Without a loop the attempt cannot be made, which the caller reads as a
 	// connect that failed on its own.

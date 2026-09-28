@@ -28,6 +28,7 @@ Connection :: struct {
 // that answers. An unreachable address moves on to the next; only the
 // caller's own stop ends the attempts, so fallback never becomes a way to
 // ignore cancellation.
+@(require_results)
 dial_first :: proc(endpoints: []net.Endpoint, options: Options, allocator: mem.Allocator) -> (connection: ^Connection, err: Error) {
 	for endpoint in endpoints {
 		if stop := stop_from_wait(probe_now(options.probe)); stop != .None {
@@ -47,6 +48,7 @@ dial_first :: proc(endpoints: []net.Endpoint, options: Options, allocator: mem.A
 // the probe whether to stop at the same time needs an event loop, so a probe
 // selects nbio's dial. With nothing to interrupt the attempt, core:net's own
 // blocking dial is the whole requirement, and the socket it returns blocks.
+@(require_results)
 connection_dial :: proc(endpoint: net.Endpoint, options: Options, allocator: mem.Allocator) -> (^Connection, Error) {
 	if endpoint.port == 0 { return nil, .Connect }
 	connection, alloc_error := new(Connection, allocator)
@@ -100,6 +102,7 @@ PLATFORM_STORES := [?]string{"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls
 // when it named one, and the platform's otherwise. A store is either read whole or not
 // used at all, since a store this client could only partly read would refuse peers the
 // platform accepts.
+@(require_results)
 load_roots :: proc(connection: ^Connection) -> (roots: tls.Roots, ok: bool) {
 	if connection.ca_file != "" {
 		return read_roots(connection, connection.ca_file)
@@ -110,6 +113,7 @@ load_roots :: proc(connection: ^Connection) -> (roots: tls.Roots, ok: bool) {
 	return {}, false
 }
 
+@(require_results)
 read_roots :: proc(connection: ^Connection, path: string) -> (roots: tls.Roots, ok: bool) {
 	store, read_err := os.read_entire_file(path, connection.allocator)
 	if read_err != nil { return {}, false }
@@ -120,6 +124,7 @@ read_roots :: proc(connection: ^Connection, path: string) -> (roots: tls.Roots, 
 // connection_handshake loads the trust store, completes TLS, and verifies the peer's
 // chain and its name. A failed verification never yields a usable connection, and a
 // store that cannot be loaded is a failure rather than an unverified connection.
+@(require_results)
 connection_handshake :: proc(connection: ^Connection, host: string) -> Error {
 	name, _ := host_without_port(host)
 	if name == "" { return .TLS_Hostname }
@@ -150,6 +155,7 @@ TLS_ALPN :: []string{"http/1.1"}
 // the socket or the TLS layer took, which is not evidence that the peer received
 // them; a failure still reports what was taken before it, so a caller can tell a
 // request that never started from one that stopped halfway.
+@(require_results)
 connection_write_all :: proc(connection: ^Connection, buffer: []u8) -> (accepted: int, err: Error) {
 	if connection.tls_session != nil { return connection_write_tls(connection, buffer) }
 	return connection_write_socket(connection, buffer)
@@ -157,6 +163,7 @@ connection_write_all :: proc(connection: ^Connection, buffer: []u8) -> (accepted
 
 // connection_write_tls hands plaintext to the TLS session, which owns the socket's
 // bytes from there on.
+@(require_results)
 connection_write_tls :: proc(connection: ^Connection, buffer: []u8) -> (accepted: int, err: Error) {
 	written, tls_err := tls.write(connection.tls_session, buffer)
 	if tls_err == tls.Error.None { return written, .None }
@@ -166,6 +173,7 @@ connection_write_tls :: proc(connection: ^Connection, buffer: []u8) -> (accepted
 // connection_write_socket writes plaintext straight to the socket, waiting on the
 // event loop when the socket will not take it. TLS writes through this too, so a
 // record layer has no second way to reach the socket.
+@(require_results)
 connection_write_socket :: proc(connection: ^Connection, buffer: []u8) -> (accepted: int, err: Error) {
 	pending := buffer
 	for len(pending) > 0 {
@@ -208,12 +216,14 @@ connection_write_socket :: proc(connection: ^Connection, buffer: []u8) -> (accep
 // connection_read_source adapts connection_read to the Reader's byte source. Odin
 // procedure types are nominal, so the typed connection pointer cannot stand in
 // for the rawptr the source takes.
+@(require_results)
 connection_read_source :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error) {
 	return connection_read(cast(^Connection)user_data, buffer)
 }
 
 // connection_read returns .Closed for an orderly end of stream. The caller decides
 // whether the message was complete.
+@(require_results)
 connection_read :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {
 	if connection.tls_session != nil { return connection_read_tls(connection, buffer) }
 	return connection_read_socket(connection, buffer)
@@ -221,6 +231,7 @@ connection_read :: proc(connection: ^Connection, buffer: []u8) -> (count: int, e
 
 // connection_read_tls reads plaintext out of the TLS session. The session owns the
 // socket's bytes from there on.
+@(require_results)
 connection_read_tls :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {
 	read, tls_err := tls.read(connection.tls_session, buffer)
 	switch tls_err {
@@ -240,6 +251,7 @@ connection_read_tls :: proc(connection: ^Connection, buffer: []u8) -> (count: in
 // connection_read_socket moves plaintext off the socket, waiting on the event loop
 // when there is none. TLS reads the socket through this and nothing else, so a
 // record layer can never see bytes the message path already took.
+@(require_results)
 connection_read_socket :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {
 	for {
 		// A body that keeps flowing never leaves a read blocked, so waiting

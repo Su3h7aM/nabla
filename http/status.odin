@@ -202,11 +202,13 @@ status_string :: proc(status: Status) -> string {
 	return ""
 }
 
+@(require_results)
 status_valid :: proc(status: Status) -> bool {
 	return status_string(status) != ""
 }
 
 // status_from_string reads the three-digit status code at the start of text.
+@(require_results)
 status_from_string :: proc(text: string) -> (Status, bool) {
 	if len(text) < 3 || !is_digit(text[0]) || !is_digit(text[1]) || !is_digit(text[2]) { return {}, false }
 	code := Status(int(text[0] - '0') * 100 + int(text[1] - '0') * 10 + int(text[2] - '0'))
@@ -214,22 +216,27 @@ status_from_string :: proc(text: string) -> (Status, bool) {
 	return code, true
 }
 
+@(require_results)
 status_is_informational :: proc(status: Status) -> bool {
 	return status >= Status(100) && status < Status(200)
 }
 
+@(require_results)
 status_is_success :: proc(status: Status) -> bool {
 	return status >= Status(200) && status < Status(300)
 }
 
+@(require_results)
 status_is_redirect :: proc(status: Status) -> bool {
 	return status >= Status(300) && status < Status(400)
 }
 
+@(require_results)
 status_is_client_error :: proc(status: Status) -> bool {
 	return status >= Status(400) && status < Status(500)
 }
 
+@(require_results)
 status_is_server_error :: proc(status: Status) -> bool {
 	return status >= Status(500) && status < Status(600)
 }

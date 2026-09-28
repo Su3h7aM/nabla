@@ -46,6 +46,7 @@ url_parse :: proc(raw: string) -> (url: URL) {
 }
 
 // request_path_write writes the origin-form request target of a URL.
+@(require_results)
 request_path_write :: proc(writer: io.Writer, target: URL) -> io.Error {
 	io.write_string(writer, target.path if target.path != "" else "/") or_return
 	if target.query != "" {

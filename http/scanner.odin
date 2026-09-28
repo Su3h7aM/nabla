@@ -11,11 +11,13 @@ Split_Proc :: #type proc(split_data: rawptr, data: []byte, at_eof: bool) -> (adv
 
 // scan_lines splits on LF and drops a CR before it. RFC 9112 2.2 lets a
 // recipient treat a bare LF as a line terminator.
+@(require_results)
 scan_lines :: proc(split_data: rawptr, data: []byte, at_eof: bool) -> (advance: int, token: []byte, err: bufio.Scanner_Error, final_token: bool) {
 	return bufio.scan_lines(data, at_eof)
 }
 
 // scan_num_bytes takes exactly the byte count carried in split_data.
+@(require_results)
 scan_num_bytes :: proc(split_data: rawptr, data: []byte, at_eof: bool) -> (advance: int, token: []byte, err: bufio.Scanner_Error, final_token: bool) {
 	expected := int(uintptr(split_data))
 	if len(data) < expected { return }

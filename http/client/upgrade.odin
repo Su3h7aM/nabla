@@ -35,6 +35,7 @@ Upgraded :: struct {
 // Anything the peer sent before its response head was read stays with the handle,
 // since the upgraded protocol's first bytes can arrive in the same segment as the
 // head. The caller owns the handle and releases it with upgraded_destroy.
+@(require_results)
 upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgraded, failure: Failure) {
 	summary: Transfer_Summary
 	phase := Transfer_Phase.Validate
@@ -118,6 +119,7 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 // upgraded_read takes bytes out of the upgraded protocol's stream. The octets read
 // past the response head are returned first, so nothing the peer already sent is
 // dropped.
+@(require_results)
 upgraded_read :: proc(upgraded: ^Upgraded, buffer: []u8) -> (count: int, err: Error) {
 	if upgraded.pending_at < len(upgraded.pending) {
 		count = copy(buffer, upgraded.pending[upgraded.pending_at:])
@@ -127,6 +129,7 @@ upgraded_read :: proc(upgraded: ^Upgraded, buffer: []u8) -> (count: int, err: Er
 	return connection_read(upgraded.connection, buffer)
 }
 
+@(require_results)
 upgraded_write :: proc(upgraded: ^Upgraded, buffer: []u8) -> (accepted: int, err: Error) {
 	return connection_write_all(upgraded.connection, buffer)
 }

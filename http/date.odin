@@ -35,6 +35,7 @@ HTTP_DATE_MONTHS := [12]string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", 
 // date_write writes instant as an IMF-fixdate, the one HTTP date format a sender
 // may use, with no timezone conversion: `<day-name>, <day> <month> <year>
 // <hour>:<minute>:<second> GMT`.
+@(require_results)
 date_write :: proc(writer: io.Writer, instant: time.Time) -> io.Error {
 	year, month, day := time.date(instant)
 	hour, minute, second := time.clock_from_time(instant)
@@ -60,6 +61,7 @@ date_write :: proc(writer: io.Writer, instant: time.Time) -> io.Error {
 
 // date_string returns instant formatted as date_write writes it, owned by the
 // caller's allocator. mem_err is set when that buffer could not be allocated.
+@(require_results)
 date_string :: proc(instant: time.Time, allocator := context.allocator) -> (text: string, mem_err: runtime.Allocator_Error) {
 	builder: strings.Builder
 
@@ -77,6 +79,7 @@ date_string :: proc(instant: time.Time, allocator := context.allocator) -> (text
 // date_parse reads one HTTP date in any of the three formats a recipient
 // accepts. Each parser validates the shape it expects, so a text that fails one
 // grammar is tried against the next rather than guessed at.
+@(require_results)
 date_parse :: proc(value: string) -> (instant: time.Time, ok: bool) {
 	if parsed, parsed_ok := date_parse_imf(value); parsed_ok { return parsed, true }
 	if parsed, parsed_ok := date_parse_rfc850(value); parsed_ok { return parsed, true }
@@ -85,6 +88,7 @@ date_parse :: proc(value: string) -> (instant: time.Time, ok: bool) {
 
 // date_parse_imf reads `Sun, 06 Nov 1994 08:49:37 GMT`, the format this package
 // writes and the one a modern peer sends.
+@(require_results)
 date_parse_imf :: proc(value: string) -> (instant: time.Time, ok: bool) {
 	if len(value) != HTTP_DATE_LENGTH { return }
 	if value[3] != ',' ||
@@ -110,6 +114,7 @@ date_parse_imf :: proc(value: string) -> (instant: time.Time, ok: bool) {
 // digits, so the century is fixed at receipt: a date that would be more than
 // fifty years in the future is the most recent past year with the same last two
 // digits.
+@(require_results)
 date_parse_rfc850 :: proc(value: string) -> (instant: time.Time, ok: bool) {
 	comma := strings.index_byte(value, ',')
 	if comma < 0 || !date_weekday(value[:comma], HTTP_DATE_WEEKDAYS_LONG[:]) { return }
@@ -131,6 +136,7 @@ date_parse_rfc850 :: proc(value: string) -> (instant: time.Time, ok: bool) {
 
 // date_parse_asctime reads `Sun Nov  6 08:49:37 1994`, whose day is either two
 // digits or one digit padded with a space.
+@(require_results)
 date_parse_asctime :: proc(value: string) -> (instant: time.Time, ok: bool) {
 	if len(value) != 24 { return }
 	if value[3] != ' ' || value[7] != ' ' || value[10] != ' ' || value[13] != ':' || value[16] != ':' || value[19] != ' ' { return }
@@ -149,6 +155,7 @@ date_parse_asctime :: proc(value: string) -> (instant: time.Time, ok: bool) {
 // date_digits reads one field of ASCII digits, however many the field's own
 // grammar allows. It accepts nothing else: a sign, a space, or an empty field is
 // a value this parser does not read.
+@(require_results)
 date_digits :: proc(text: string) -> (value: int, ok: bool) {
 	if len(text) == 0 { return }
 	for character in text {
@@ -160,6 +167,7 @@ date_digits :: proc(text: string) -> (value: int, ok: bool) {
 
 // date_month reads a month name. The names are case-sensitive: every HTTP date
 // grammar writes them exactly as they appear here.
+@(require_results)
 date_month :: proc(text: string) -> (month: int, ok: bool) {
 	for name, i in HTTP_DATE_MONTHS {
 		if text == name { return i + 1, true }
@@ -167,6 +175,7 @@ date_month :: proc(text: string) -> (month: int, ok: bool) {
 	return 0, false
 }
 
+@(require_results)
 date_weekday :: proc(text: string, names: []string) -> bool {
 	for name in names {
 		if text == name { return true }
@@ -179,7 +188,7 @@ date_month_name :: proc(month: time.Month) -> string {
 	return HTTP_DATE_MONTHS[int(month) - 1]
 }
 
-@(private)
+@(private, require_results)
 write_padded_int :: proc(writer: io.Writer, value: int) -> io.Error {
 	if value < 10 {
 		io.write_string(writer, PADDED_NUMS[value]) or_return

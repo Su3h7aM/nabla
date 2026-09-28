@@ -14,6 +14,7 @@ import "core:strings"
 
 // hosts_lookup consults the hosts file before any nameserver, so local names
 // resolve without one.
+@(require_results)
 hosts_lookup :: proc(hostname: string, allocator: mem.Allocator) -> (address: net.Address, found: bool) {
 	handle, open_err := os.open(net.dns_configuration.hosts_file)
 	if open_err != nil { return nil, false }
@@ -52,6 +53,7 @@ hosts_lookup :: proc(hostname: string, allocator: mem.Allocator) -> (address: ne
 
 // system_nameservers reads the caller's nameservers from the system resolver
 // configuration. The result is owned by the caller.
+@(require_results)
 system_nameservers :: proc(allocator: mem.Allocator) -> ([]net.Endpoint, bool) {
 	contents, read_err := os.read_entire_file(net.dns_configuration.resolv_conf, allocator)
 	if read_err != nil { return nil, false }

@@ -139,6 +139,7 @@ respond_dir :: proc(response: ^Response, base, target, request: string, loc := #
 }
 
 // Sets the response to one that returns the JSON representation of the given value.
+@(require_results)
 respond_json :: proc(
 	response: ^Response,
 	value: any,

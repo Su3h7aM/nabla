@@ -12,6 +12,7 @@ import "nabla:dns"
 // Cancellation ends the lookup; every other failure only empties the result,
 // and the caller reports an empty result as unresolvable. Resolution runs on
 // the calling thread, so an interrupted lookup owns nothing that outlives it.
+@(require_results)
 resolve_addresses :: proc(hostname: string, options: Options, allocator: mem.Allocator) -> (addresses: [dynamic]net.Address, err: Error) {
 	addresses.allocator = allocator
 	if host, ok := dns.hosts_lookup(hostname, allocator); ok {
@@ -69,6 +70,7 @@ resolve_addresses :: proc(hostname: string, options: Options, allocator: mem.All
 // dns_interrupt_check adapts the request probe to the resolver's stop policy:
 // any probe state but Ready stops the lookup. The resolver reports the stop
 // as Cancelled, and the caller re-reads its own probe for the specific cause.
+@(require_results)
 dns_interrupt_check :: proc(user_data: rawptr) -> bool {
 	probe := (^Probe)(user_data)
 	return probe_now(probe^) != .Ready
@@ -77,6 +79,7 @@ dns_interrupt_check :: proc(user_data: rawptr) -> bool {
 // host_and_port splits an authority into its name and port. A bracketed IPv6
 // literal carries its port outside the brackets; any other authority with more
 // than one colon is a bare IPv6 literal with no port.
+@(require_results)
 host_and_port :: proc(authority: string) -> (host: string, port: int, ok: bool) {
 	if authority == "" { return "", 0, false }
 	if authority[0] == '[' {
@@ -99,6 +102,7 @@ host_and_port :: proc(authority: string) -> (host: string, port: int, ok: bool) 
 	return authority, 0, true
 }
 
+@(require_results)
 parse_port :: proc(text: string) -> (int, bool) {
 	if text == "" { return 0, false }
 	port := 0

@@ -89,6 +89,7 @@ Conn :: struct {
 	close_code:      Close_Code,
 }
 
+@(require_results)
 init :: proc(transport: Transport, allocator: mem.Allocator) -> (connection: ^Conn, err: Error) {
 	if transport.read == nil || transport.write == nil { return nil, .Transport }
 	self, alloc_error := new(Conn, allocator)
@@ -133,6 +134,7 @@ connection_release :: proc(connection: ^Conn, aborted: bool) {
 // write sends one whole message. A message larger than a frame is fragmented, and
 // every frame is masked under a key of its own, which is what a client must do
 // (RFC 6455 section 5.3).
+@(require_results)
 write :: proc(connection: ^Conn, opcode: Opcode, message: []u8) -> Error {
 	if connection == nil { return .Protocol }
 	if opcode != .Text && opcode != .Binary { return .Protocol }
@@ -163,6 +165,7 @@ write :: proc(connection: ^Conn, opcode: Opcode, message: []u8) -> Error {
 
 // ping asks the peer whether it is there, with whatever body the caller wants echoed
 // (RFC 6455 section 5.5.2).
+@(require_results)
 ping :: proc(connection: ^Conn, body: []u8) -> Error {
 	if len(body) > MAX_CONTROL_PAYLOAD { return .Protocol }
 	return control_send(connection, .Ping, body)
@@ -170,6 +173,7 @@ ping :: proc(connection: ^Conn, body: []u8) -> Error {
 
 // close sends the close frame and waits for the peer's, so that both ends agree the
 // connection is over (RFC 6455 section 5.5.1). The transport is the caller's to close.
+@(require_results)
 close :: proc(connection: ^Conn, code: Close_Code, reason: string, buffer: []u8) -> Error {
 	if !close_code_valid(code) || len(reason) > MAX_CONTROL_PAYLOAD - 2 || !utf8.valid_string(reason) {
 		return .Protocol
@@ -199,6 +203,7 @@ close :: proc(connection: ^Conn, code: Close_Code, reason: string, buffer: []u8)
 // A control frame is answered here rather than handed out, so a ping that arrives
 // between the fragments of a message does not disturb it. `buffer` is unmasked in
 // place, so it holds the message's bytes on return.
+@(require_results)
 read :: proc(connection: ^Conn, buffer: []u8) -> (count: int, opcode: Opcode, complete: bool, err: Error) {
 	// A connection that ended, whether by the peer's close or by this side failing
 	// it, delivers nothing more.
@@ -299,6 +304,7 @@ read :: proc(connection: ^Conn, buffer: []u8) -> (count: int, opcode: Opcode, co
 
 // fail tells the peer why the connection is ending and reports the failure, which is
 // what the protocol asks of the side that finds it (RFC 6455 section 7.1.7).
+@(require_results)
 fail :: proc(connection: ^Conn, code: Close_Code, err: Error) -> Error {
 	if !connection.close_sent {
 		payload := connection.control[:2]
@@ -312,6 +318,7 @@ fail :: proc(connection: ^Conn, code: Close_Code, err: Error) -> Error {
 	return err
 }
 
+@(require_results)
 control_send :: proc(connection: ^Conn, opcode: Opcode, payload: []u8) -> Error {
 	mask: [MASK_KEY_SIZE]u8
 	crypto.rand_bytes(mask[:])
@@ -321,6 +328,7 @@ control_send :: proc(connection: ^Conn, opcode: Opcode, payload: []u8) -> Error 
 }
 
 // control_read reads a control frame's payload, which is small enough to hold.
+@(require_results)
 control_read :: proc(connection: ^Conn, length: int) -> (payload: []u8, err: Error) {
 	if length > MAX_CONTROL_PAYLOAD { return nil, .Protocol }
 	connection.frame_remaining = length
@@ -335,6 +343,7 @@ control_read :: proc(connection: ^Conn, length: int) -> (payload: []u8, err: Err
 
 // frame_header_read reads one frame header, which is as long as its length field says
 // it is.
+@(require_results)
 frame_header_read :: proc(connection: ^Conn) -> (header: Header, err: Error) {
 	if fill_err := recv_fill(connection, 2); fill_err != .None { return {}, fill_err }
 	count := 2
@@ -355,6 +364,7 @@ frame_header_read :: proc(connection: ^Conn) -> (header: Header, err: Error) {
 
 // frame_payload_read hands over at most one piece of the frame in progress, unmasking
 // it in place.
+@(require_results)
 frame_payload_read :: proc(connection: ^Conn, buffer: []u8) -> (count: int, err: Error) {
 	if len(buffer) == 0 || connection.frame_remaining == 0 { return 0, .None }
 	count = min(len(buffer), connection.frame_remaining)
@@ -370,6 +380,7 @@ frame_payload_read :: proc(connection: ^Conn, buffer: []u8) -> (count: int, err:
 // text_validate checks what has arrived of a text message, carrying the octets of a
 // rune that a read boundary split. A stream that is not UTF-8 ends the connection
 // (RFC 6455 section 8.1).
+@(require_results)
 text_validate :: proc(connection: ^Conn, chunk: []u8) -> bool {
 	at := 0
 	for connection.carry_length > 0 && at < len(chunk) {
@@ -402,6 +413,7 @@ text_validate :: proc(connection: ^Conn, chunk: []u8) -> bool {
 	return true
 }
 
+@(require_results)
 close_code_valid :: proc(code: Close_Code) -> bool {
 	value := u16(code)
 	if value >= 3000 && value <= 4999 { return true }
@@ -414,6 +426,7 @@ close_code_valid :: proc(code: Close_Code) -> bool {
 
 // transport_read reads exactly the bytes it is given, from wherever the connection has
 // read up to.
+@(require_results)
 transport_read :: proc(connection: ^Conn, dst: []u8) -> Error {
 	filled := 0
 	for filled < len(dst) {
@@ -428,12 +441,14 @@ transport_read :: proc(connection: ^Conn, dst: []u8) -> Error {
 
 // recv_fill reads the next bytes of a frame header into the connection's header
 // buffer.
+@(require_results)
 recv_fill :: proc(connection: ^Conn, count: int) -> Error {
 	if err := transport_read(connection, connection.header[connection.header_filled:count]); err != .None { return err }
 	connection.header_filled = count
 	return .None
 }
 
+@(require_results)
 transport_write :: proc(connection: ^Conn, data: []u8) -> Error {
 	pending := data
 	for len(pending) > 0 {

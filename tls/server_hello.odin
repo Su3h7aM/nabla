@@ -27,6 +27,7 @@ Server_Hello :: struct {
 // server_hello_decode reads a ServerHello message body, the bytes after its
 // handshake header. The message and every recognized extension must be exactly
 // consumed, and an extension may appear only once.
+@(require_results)
 server_hello_decode :: proc(message: []u8) -> (hello: Server_Hello, ok: bool) {
 	reader := Reader {
 		data = message,
@@ -69,6 +70,7 @@ server_hello_decode :: proc(message: []u8) -> (hello: Server_Hello, ok: bool) {
 	return hello, reader.ok && reader.at == len(reader.data) && extensions.ok && extensions.at == len(extensions.data)
 }
 
+@(require_results)
 extension_seen :: proc(encoded: []u8, wanted: Extension_Type) -> bool {
 	reader := Reader {
 		data = encoded,

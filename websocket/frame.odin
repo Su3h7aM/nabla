@@ -44,6 +44,7 @@ Header :: struct {
 // frame_header_encode writes the header of a masked frame, the masking key included,
 // and returns how many octets of `dst` it used. A client masks every frame it sends,
 // so the key is always written (RFC 6455 section 5.3).
+@(require_results)
 frame_header_encode :: proc(header: Header, mask: [MASK_KEY_SIZE]u8, dst: []u8) -> (count: int, ok: bool) {
 	length := header.length
 	extended := 0
@@ -88,6 +89,7 @@ frame_header_encode :: proc(header: Header, mask: [MASK_KEY_SIZE]u8, dst: []u8) 
 // frame_header_decode reads the header at the front of `data`, which must hold all of
 // it. A reserved bit that is set makes the frame one this client cannot read, since
 // it has negotiated no extension that would define one (RFC 6455 section 5.2).
+@(require_results)
 frame_header_decode :: proc(data: []u8) -> (header: Header, ok: bool) {
 	if len(data) < 2 { return {}, false }
 	if data[0] & 0x70 != 0 { return {}, false }
@@ -131,6 +133,7 @@ frame_mask :: proc(payload: []u8, mask: [MASK_KEY_SIZE]u8) {
 
 // frame_encode writes one whole masked frame and returns how many octets of `dst` it
 // used. The payload is copied, so it may not overlap `dst`.
+@(require_results)
 frame_encode :: proc(opcode: Opcode, final: bool, mask: [MASK_KEY_SIZE]u8, payload: []u8, dst: []u8) -> (count: int, ok: bool) {
 	header_length, encoded := frame_header_encode({final = final, opcode = opcode, length = len(payload)}, mask, dst)
 	if !encoded || len(dst) < header_length + len(payload) { return 0, false }

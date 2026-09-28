@@ -29,6 +29,7 @@ Cookie :: struct {
 }
 
 // cookie_write writes cookie as its Set-Cookie field line.
+@(require_results)
 cookie_write :: proc(writer: io.Writer, cookie: Cookie) -> io.Error {
 	// odinfmt:disable
 	io.write_string(writer, "set-cookie: ")         or_return
@@ -81,6 +82,7 @@ cookie_write :: proc(writer: io.Writer, cookie: Cookie) -> io.Error {
 
 // cookie_string returns cookie as its Set-Cookie field line, owned by the
 // caller's allocator. mem_err is set when the line could not be built.
+@(require_results)
 cookie_string :: proc(cookie: Cookie, allocator := context.allocator) -> (text: string, mem_err: runtime.Allocator_Error) {
 	builder: strings.Builder
 	strings.builder_init(&builder, 0, 20, allocator) or_return
@@ -100,6 +102,7 @@ cookie_string :: proc(cookie: Cookie, allocator := context.allocator) -> (text: 
 // Allocations are done to check case-insensitive attributes but they are deleted right after.
 // So, all the returned strings (inside cookie) are slices into the given value string.
 // mem_err is set when one of those allocations failed.
+@(require_results)
 cookie_parse :: proc(value: string, allocator := context.allocator) -> (cookie: Cookie, ok: bool, mem_err: runtime.Allocator_Error) {
 	remaining := value
 
@@ -203,6 +206,7 @@ cookie_parse :: proc(value: string, allocator := context.allocator) -> (cookie: 
 }
 
 // cookie_date_parse reads a cookie date as RFC 6265 5.1.1 defines it.
+@(require_results)
 cookie_date_parse :: proc(value: string) -> (instant: time.Time, ok: bool) {
 
 	iter_delim :: proc(value: ^string) -> (token: string, ok: bool) {
@@ -387,6 +391,7 @@ Retrieves the cookie with the given `key` out of the requests `Cookie` header.
 
 If the same key is in the header multiple times the last one is returned.
 */
+@(require_results)
 request_cookie_get :: proc(request: ^Request, key: string) -> (value: string, ok: bool) {
 	cookies := headers_get_unsafe(request.headers, "cookie") or_return
 
@@ -402,6 +407,7 @@ Allocates a map with the given allocator and puts all cookie pairs from the requ
 
 If the same key is in the header multiple times the last one is returned.
 */
+@(require_results)
 request_cookies :: proc(request: ^Request, allocator := context.temp_allocator) -> (result: map[string]string) {
 	result.allocator = allocator
 
@@ -419,6 +425,7 @@ request_cookies :: proc(request: ^Request, allocator := context.temp_allocator) 
 /*
 Iterates the cookies from right to left.
 */
+@(require_results)
 request_cookies_iter :: proc(remaining: ^string) -> (key: string, value: string, ok: bool) {
 	end := len(remaining)
 	equals := -1

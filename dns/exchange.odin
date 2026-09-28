@@ -45,11 +45,13 @@ outcome_of :: proc(wait: Wait) -> Query_Outcome {
 
 // query_id draws the correlation nonce for one lookup from the runtime
 // generator: unpredictable across the full 16-bit range, per RFC 5452 9.2.
+@(require_results)
 query_id :: proc() -> (id: u16be, ok: bool) {
 	return id, runtime.random_generator_read_ptr(context.random_generator, &id, size_of(id))
 }
 
 // query_server asks one server and returns its usable answer, if any.
+@(require_results)
 query_server :: proc(
 	server: net.Endpoint,
 	packet: []u8,
@@ -75,6 +77,7 @@ query_server :: proc(
 // deadline. A datagram from anyone but the queried server, or one that does
 // not answer this query, is passed over: a forgery is not an error, and the
 // genuine reply may still arrive.
+@(require_results)
 exchange_udp :: proc(
 	server: net.Endpoint,
 	packet: []u8,
@@ -142,6 +145,7 @@ exchange_udp :: proc(
 
 // reply_outcome turns a parsed reply to this query into the attempt's outcome.
 // A Name Error is definitive: no other server can answer the name either.
+@(require_results)
 reply_outcome :: proc(reply: []u8, answer: []net.DNS_Record, allocator: mem.Allocator) -> ([]net.DNS_Record, Query_Outcome) {
 	if response_nxdomain(reply) {
 		net.destroy_dns_records(answer, allocator)
@@ -153,6 +157,7 @@ reply_outcome :: proc(reply: []u8, answer: []net.DNS_Record, allocator: mem.Allo
 // exchange_tcp retries one query over TCP: a two-octet length prefix frames
 // the exchange both ways (RFC 1035 4.2.2), and the reply's own length sizes
 // the read.
+@(require_results)
 exchange_tcp :: proc(
 	server: net.Endpoint,
 	packet: []u8,
@@ -249,6 +254,7 @@ on_dialed :: proc(operation: ^nbio.Operation, state: ^Dial_State) {
 
 // dial_tcp opens a non-blocking TCP stream through the event loop, so the
 // attempt deadline and the interrupt bound the connect as well.
+@(require_results)
 dial_tcp :: proc(server: net.Endpoint, deadline: time.Tick, interrupt: Interrupt) -> (socket: net.TCP_Socket, wait: Wait) {
 	state: Dial_State
 	operation := nbio.dial_poly(server, &state, on_dialed)

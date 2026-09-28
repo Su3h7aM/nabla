@@ -47,6 +47,7 @@ Interrupt :: struct {
 }
 
 // interrupt_now asks the policy whether the lookup should stop.
+@(require_results)
 interrupt_now :: proc(interrupt: Interrupt) -> bool {
 	if interrupt.check == nil { return false }
 	return interrupt.check(interrupt.user_data)
@@ -80,6 +81,7 @@ attempt_rounds :: proc(options: Options) -> int {
 // for the configured attempts; an interruption stops the lookup within
 // DNS_IO_SLICE. Returned records are owned by the caller, released with
 // net.destroy_dns_records.
+@(require_results)
 lookup :: proc(hostname: string, kind: net.DNS_Record_Type, options: Options, allocator: mem.Allocator) -> (records: []net.DNS_Record, err: Error) {
 	if !net.validate_hostname(hostname) { return nil, .Invalid_Request }
 	if len(options.servers) == 0 { return nil, .Invalid_Request }

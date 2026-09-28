@@ -73,6 +73,7 @@ rate_limit_destroy :: proc(data: ^Rate_Limit_Data) {
 
 // Basic rate limit based on IP address. mem_err is set, and no handler is
 // returned, when the table the limiter counts in could not be allocated.
+@(require_results)
 rate_limit :: proc(
 	data: ^Rate_Limit_Data,
 	next: ^Handler,

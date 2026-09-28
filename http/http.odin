@@ -33,6 +33,7 @@ Requestline :: struct {
 // requestline_parse reads a request-line (RFC 9112 3): a method token, SP, a
 // non-empty request-target, SP, and the protocol version. The target is cloned,
 // because the line is a view into a buffer that changes on the next read.
+@(require_results)
 requestline_parse :: proc(text: string, allocator := context.temp_allocator) -> (line: Requestline, err: Requestline_Error) {
 	method_end := strings.index_byte(text, ' ')
 	if method_end <= 0 { return line, .Not_Enough_Fields }
@@ -51,6 +52,7 @@ requestline_parse :: proc(text: string, allocator := context.temp_allocator) -> 
 	return line, .None
 }
 
+@(require_results)
 requestline_write :: proc(writer: io.Writer, line: Requestline) -> io.Error {
 	io.write_string(writer, method_string(line.method)) or_return
 	io.write_byte(writer, ' ') or_return
@@ -78,6 +80,7 @@ Version :: struct {
 //
 // RFC 9112 2.3: HTTP-version = HTTP-name "/" DIGIT "." DIGIT, where HTTP-name is
 // the case-sensitive string "HTTP".
+@(require_results)
 version_parse :: proc(text: string) -> (version: Version, ok: bool) {
 	switch len(text) {
 	case 8:
@@ -97,6 +100,7 @@ version_parse :: proc(text: string) -> (version: Version, ok: bool) {
 }
 
 // version_write writes the eight-octet HTTP-version (RFC 9112 2.3).
+@(require_results)
 version_write :: proc(writer: io.Writer, version: Version) -> io.Error {
 	octets := [8]byte{'H', 'T', 'T', 'P', '/', '0' + version.major, '.', '0' + version.minor}
 	_, err := io.write(writer, octets[:])
@@ -108,12 +112,13 @@ version_string :: proc(version: Version, allocator := context.allocator) -> (str
 	return strings.clone(string(octets[:]), allocator)
 }
 
-@(private = "package")
+@(private = "package", require_results)
 is_digit :: #force_inline proc(character: byte) -> bool {
 	return character >= '0' && character <= '9'
 }
 
 // is_tchar reports whether a byte may appear in a token (RFC 9110 5.6.2).
+@(require_results)
 is_tchar :: proc(character: byte) -> bool {
 	switch character {
 	case '0' ..= '9', 'a' ..= 'z', 'A' ..= 'Z':
@@ -125,6 +130,7 @@ is_tchar :: proc(character: byte) -> bool {
 }
 
 // token_valid reports whether text is a token: one or more tchars.
+@(require_results)
 token_valid :: proc(text: string) -> bool {
 	if text == "" { return false }
 	for i in 0 ..< len(text) {
@@ -145,6 +151,7 @@ trim_ows :: proc(text: string) -> string {
 // list_has_token reports whether a comma-separated field value lists token,
 // compared case-insensitively, as Connection and Transfer-Encoding options are
 // (RFC 9110 5.6.1, 7.6.1).
+@(require_results)
 list_has_token :: proc(value, token: string) -> bool {
 	rest := value
 	for element in strings.split_iterator(&rest, ",") {
@@ -157,6 +164,7 @@ list_has_token :: proc(value, token: string) -> bool {
 // Transfer-Encoding field is chunked. The final coding decides the framing, not
 // the presence of the name anywhere in the list, and coding names are
 // case-insensitive (RFC 9112 6.1 and 7).
+@(require_results)
 final_transfer_coding_is_chunked :: proc(value: string) -> bool {
 	last := value
 	if comma := strings.last_index_byte(value, ','); comma >= 0 { last = value[comma + 1:] }
@@ -168,6 +176,7 @@ final_transfer_coding_is_chunked :: proc(value: string) -> bool {
 // member is valid and identical, in which case the message is framed by that
 // single value. A sign, differing members, or a value the machine cannot
 // represent is invalid framing rather than a body size.
+@(require_results)
 content_length_parse :: proc(value: string) -> (length: int, ok: bool) {
 	length = -1
 	rest := value
@@ -194,6 +203,7 @@ content_length_parse :: proc(value: string) -> (length: int, ok: bool) {
 // a sign prefix the grammar does not admit, so "+5" would parse as a size.
 // Surrounding BWS is stripped; anything else, including an empty value or one
 // the machine cannot represent, is invalid framing rather than a size.
+@(require_results)
 chunk_size_parse :: proc(value: string) -> (size: int, ok: bool) {
 	text := trim_ows(value)
 	(len(text) > 0) or_return
@@ -219,6 +229,7 @@ chunk_size_parse :: proc(value: string) -> (size: int, ok: bool) {
 // sequence. RFC 9112 7.1.1: a recipient ignores unrecognized extensions, but
 // the sequence still has to parse, so a line that is not a chunk ends the body
 // in failure rather than in a body framed by a guess.
+@(require_results)
 chunk_line_parse :: proc(line: string) -> (size: int, ok: bool) {
 	size_text, extensions := line, ""
 	if semi := strings.index_byte(line, ';'); semi >= 0 {
@@ -232,6 +243,7 @@ chunk_line_parse :: proc(line: string) -> (size: int, ok: bool) {
 // chunk_extensions_valid reports whether text is a chunk-ext sequence:
 // *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] ), where a value
 // is a token or a quoted-string (RFC 9112 7.1.1). Empty text is valid.
+@(require_results)
 chunk_extensions_valid :: proc(text: string) -> bool {
 	rest := text
 	for {
@@ -319,6 +331,7 @@ method_string :: proc(method: Method) -> string {
 }
 
 // method_parse reads a method token. Methods are case-sensitive (RFC 9110 9.1).
+@(require_results)
 method_parse :: proc(text: string) -> (method: Method, ok: bool) {
 	for name, candidate in METHOD_STRINGS {
 		if name == text { return candidate, true }
@@ -335,6 +348,7 @@ method_parse :: proc(text: string) -> (method: Method, ok: bool) {
 // (RFC 9110 5.3), except Host, which may appear once (RFC 9112 3.2), and
 // Content-Length: RFC 9112 6.3 makes differing repeats an unrecoverable error,
 // and identical repeats stand for the first value.
+@(require_results)
 header_parse :: proc(headers: ^Headers, line: string) -> (key: string, ok: bool) {
 	colon := strings.index_byte(line, ':')
 	(colon > 0) or_return
@@ -387,6 +401,7 @@ header_parse :: proc(headers: ^Headers, line: string) -> (key: string, ok: bool)
 // field value is interpreted. The continuation's leading whitespace is the RWS,
 // and a continuation carrying nothing adds nothing, because trailing whitespace is
 // excluded from the field value. A fold that continues no field is refused.
+@(require_results)
 header_fold :: proc(headers: ^Headers, key, line: string) -> bool {
 	value := trim_ows(line)
 	if value == "" { return true }
@@ -401,7 +416,7 @@ header_fold :: proc(headers: ^Headers, key, line: string) -> bool {
 	return true
 }
 
-@(private)
+@(private, require_results)
 field_value_clone :: proc(value: string, allocator: runtime.Allocator) -> (cloned: string, err: runtime.Allocator_Error) {
 	cloned = strings.clone(value, allocator) or_return
 	field_value_sanitize(cloned)
@@ -421,7 +436,7 @@ field_value_sanitize :: proc(value: string) {
 // name the same length. Identical is by numeric meaning: leading zeros state the
 // same length. The comparison strips them instead of parsing, so no representable
 // bound limits which equal values are recognized.
-@(private)
+@(private, require_results)
 content_length_values_equal :: proc(left, right: string) -> bool {
 	left_digits, left_ok := decimal_meaning(left)
 	right_digits, right_ok := decimal_meaning(right)
@@ -430,7 +445,7 @@ content_length_values_equal :: proc(left, right: string) -> bool {
 
 // decimal_meaning validates a nonempty all-digit field value and reports its
 // numeric meaning with leading zeros removed. A zero of any width reports "0".
-@(private)
+@(private, require_results)
 decimal_meaning :: proc(value: string) -> (meaning: string, ok: bool) {
 	if len(value) == 0 { return "", false }
 	for character in transmute([]u8)value {
@@ -446,6 +461,7 @@ decimal_meaning :: proc(value: string) -> (meaning: string, ok: bool) {
 // needed for framing, routing, request modifiers, authentication, response
 // control data, or deciding how to process the content, and a recipient
 // ignores such a field.
+@(require_results)
 header_allowed_trailer :: proc(key: string) -> bool {
 	switch key {
 	case "transfer-encoding",
@@ -487,7 +503,7 @@ _dynamic_add_len :: proc(array: ^[dynamic]$E, length: int) {
 	(transmute(^runtime.Raw_Dynamic_Array)array).len += length
 }
 
-@(private)
+@(private, require_results)
 write_escaped_newlines :: proc(writer: io.Writer, text: string) -> io.Error {
 	for character in text {
 		if character == '\n' {

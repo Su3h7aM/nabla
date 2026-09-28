@@ -26,6 +26,7 @@ Post_Request :: struct {
 // something invented here. The returned failure is the transport's own
 // classification, not a caller-specific taxonomy -- mapping it into provider
 // error kinds is the caller's job.
+@(require_results)
 post :: proc(request: Post_Request, options: client.Options, user_data: rawptr, callback: client.Chunk_Callback) -> client.Failure {
 	headers, headers_err := make([dynamic]client.Header, 0, len(request.headers) + 2, request.allocator)
 	if headers_err != nil {

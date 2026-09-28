@@ -32,6 +32,7 @@ request_init :: proc(request: ^Request, allocator := context.allocator) {
 // coding overrides it (RFC 9112 6.1). valid is false for a request that is
 // answered with 400; will_close is true for one after whose response the
 // connection closes.
+@(require_results)
 headers_validate_for_server :: proc(headers: ^Headers, version: Version) -> (valid: bool, will_close: bool) {
 	// RFC 9112 3.2: an HTTP/1.1 request must carry Host. More than one Host
 	// field line is refused by header_parse.

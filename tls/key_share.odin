@@ -27,6 +27,7 @@ Key_Exchange :: struct {
 
 // key_exchange_generate prepares the exchange for one group and writes the share that
 // goes in a ClientHello.
+@(require_results)
 key_exchange_generate :: proc(exchange: ^Key_Exchange, group: Named_Group) -> bool {
 	curve: ecdh.Curve
 	switch group {
@@ -52,6 +53,7 @@ key_exchange_generate :: proc(exchange: ^Key_Exchange, group: Named_Group) -> bo
 // key_exchange_shared computes the shared secret with the peer's share. A share that is
 // not a point of this group, or one the group refuses, yields nothing: x25519 gives no
 // secret for a share of small order, and secp256r1 has no such point.
+@(require_results)
 key_exchange_shared :: proc(exchange: ^Key_Exchange, peer_share: []u8, secret: []u8) -> bool {
 	peer: ecdh.Public_Key
 	if !ecdh.public_key_set_bytes(&peer, ecdh.curve(&exchange.private), peer_share) { return false }

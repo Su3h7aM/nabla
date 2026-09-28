@@ -33,6 +33,7 @@ Flags :: bit_field u16 {
 Rcode_Name_Error :: 3
 
 // message_flags reads the header flags of a message with at least a header.
+@(require_results)
 message_flags :: proc(message: []u8) -> (flags: Flags, ok: bool) {
 	if len(message) < HEADER_SIZE { return {}, false }
 	return transmute(Flags)read_u16(message, 2), true
@@ -40,12 +41,14 @@ message_flags :: proc(message: []u8) -> (flags: Flags, ok: bool) {
 
 // message_truncated reports the TC bit: the reply answers the query but its
 // answers did not fit the datagram. RFC 1035 4.2.1, RFC 7766 4.
+@(require_results)
 message_truncated :: proc(response: []u8) -> bool {
 	flags, ok := message_flags(response)
 	return ok && flags.tc
 }
 
 // response_nxdomain reports a definitive Name Error.
+@(require_results)
 response_nxdomain :: proc(response: []u8) -> bool {
 	flags, ok := message_flags(response)
 	return ok && flags.rcode == Rcode_Name_Error
@@ -55,6 +58,7 @@ response_nxdomain :: proc(response: []u8) -> bool {
 // the same ID, the QR bit set, and the same question. RFC 5452 9.1 requires
 // matching on ID, name, class, and type before a reply may be trusted; an
 // off-path packet that matches none of those is passed over, never acted on.
+@(require_results)
 response_matches :: proc(query, response: []u8) -> bool {
 	if len(query) < HEADER_SIZE || len(response) < HEADER_SIZE { return false }
 	if read_u16(query, 0) != read_u16(response, 0) { return false }
@@ -99,6 +103,7 @@ name_walk :: proc(message: []u8, offset: int) -> Name_Walk {
 
 // name_next returns the next label of the name. done reports the root label,
 // which ends the name; ok is false for anything that is not a name.
+@(require_results)
 name_next :: proc(walk: ^Name_Walk) -> (label: []u8, done: bool, ok: bool) {
 	for {
 		if walk.at >= len(walk.message) { return nil, false, false }
@@ -129,6 +134,7 @@ name_next :: proc(walk: ^Name_Walk) -> (label: []u8, done: bool, ok: bool) {
 }
 
 // name_end finds the first byte past the name written at offset.
+@(require_results)
 name_end :: proc(message: []u8, offset: int) -> (end: int, ok: bool) {
 	walk := name_walk(message, offset)
 	for {
@@ -140,6 +146,7 @@ name_end :: proc(message: []u8, offset: int) -> (end: int, ok: bool) {
 // names_equal_fold compares two possibly compressed names label by label,
 // ASCII case-insensitive (RFC 4343). Only ASCII folds: a Unicode-aware fold
 // would equate labels DNS treats as different.
+@(require_results)
 names_equal_fold :: proc(first: []u8, first_offset: int, second: []u8, second_offset: int) -> bool {
 	first_walk := name_walk(first, first_offset)
 	second_walk := name_walk(second, second_offset)
@@ -151,6 +158,7 @@ names_equal_fold :: proc(first: []u8, first_offset: int, second: []u8, second_of
 	}
 }
 
+@(require_results)
 label_equal_fold :: proc(first, second: []u8) -> bool {
 	if len(first) != len(second) { return false }
 	for i in 0 ..< len(first) {

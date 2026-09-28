@@ -83,6 +83,7 @@ Conn :: struct {
 
 // init prepares a connection. The transport is the caller's and outlives the
 // connection; a connection owns nothing of it but the bytes it moves.
+@(require_results)
 init :: proc(transport: Transport, config: Config) -> (connection: ^Conn, err: Error) {
 	if transport.read == nil || transport.write == nil { return nil, .Transport }
 
@@ -130,6 +131,7 @@ destroy :: proc(connection: ^Conn) {
 //
 // `alpn` is what the caller speaks over TLS. A server that chooses none leaves the
 // connection's alpn empty, which the caller may treat as a mismatch.
+@(require_results)
 handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Error {
 	suite := OFFERED_SUITES[0]
 	connection.suite = suite
@@ -291,6 +293,7 @@ handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Err
 // handshake_server_flight reads what the server says once the handshake keys are
 // live: its extensions, its chain, its proof of the chain's key, and its Finished,
 // in the order the protocol fixes (RFC 8446 section 4.4).
+@(require_results)
 handshake_server_flight :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Error {
 	extensions_message, err := handshake_next(connection)
 	if err != .None { return err }
@@ -346,6 +349,7 @@ handshake_server_flight :: proc(connection: ^Conn, server_name: string, alpn: []
 
 // certificate_request_read validates a main-handshake request. This client has no
 // credential to select, but a legal request is answered with an empty Certificate.
+@(require_results)
 certificate_request_read :: proc(message: []u8) -> bool {
 	message_type, length, decoded := handshake_decode_header(message)
 	if !decoded || message_type != .Certificate_Request || length != len(message) - HANDSHAKE_HEADER_SIZE {
@@ -379,6 +383,7 @@ certificate_request_read :: proc(message: []u8) -> bool {
 	return has_signature_algorithms && body.ok && body.at == len(body.data) && extensions.ok && extensions.at == len(extensions.data)
 }
 
+@(require_results)
 empty_certificate_send :: proc(connection: ^Conn) -> Error {
 	message := connection.message[:HANDSHAKE_HEADER_SIZE + 4]
 	handshake_encode_header(.Certificate, 4, message)
@@ -388,6 +393,7 @@ empty_certificate_send :: proc(connection: ^Conn) -> Error {
 
 // handshake_client_finished proves the handshake to the server, over the transcript
 // that now ends with the server's own Finished.
+@(require_results)
 handshake_client_finished :: proc(connection: ^Conn) -> Error {
 	size := secret_size(connection.suite)
 	finished := connection.message[:HANDSHAKE_HEADER_SIZE + size]
@@ -402,6 +408,7 @@ handshake_client_finished :: proc(connection: ^Conn) -> Error {
 
 // read returns the next bytes of application data, reading a record when it holds
 // none. Zero bytes with .None is the end of the stream.
+@(require_results)
 read :: proc(connection: ^Conn, buffer: []u8) -> (count: int, err: Error) {
 	for len(connection.payload) == 0 {
 		if connection.closed { return 0, .None }
@@ -429,6 +436,7 @@ read :: proc(connection: ^Conn, buffer: []u8) -> (count: int, err: Error) {
 
 // write hands the whole buffer to the peer as application data. It counts bytes the
 // record layer accepted, which is not evidence that the peer has them.
+@(require_results)
 write :: proc(connection: ^Conn, buffer: []u8) -> (count: int, err: Error) {
 	if connection.closed { return 0, .Alert }
 	for count < len(buffer) {
@@ -442,6 +450,7 @@ write :: proc(connection: ^Conn, buffer: []u8) -> (count: int, err: Error) {
 
 // close sends the close_notify that tells the peer no more records follow. The
 // transport is the caller's to close, and closing twice sends nothing.
+@(require_results)
 close :: proc(connection: ^Conn) -> Error {
 	if connection.closed { return .None }
 	connection.closed = true
@@ -457,6 +466,7 @@ close :: proc(connection: ^Conn) -> Error {
 
 // server_hello_read decodes the answer to a ClientHello, reporting false for a message
 // that is not one.
+@(require_results)
 server_hello_read :: proc(message: []u8) -> (hello: Server_Hello, ok: bool) {
 	hello_type, _, decoded := handshake_decode_header(message)
 	if !decoded || hello_type != .Server_Hello { return {}, false }
@@ -465,6 +475,7 @@ server_hello_read :: proc(message: []u8) -> (hello: Server_Hello, ok: bool) {
 
 // client_hello_message builds a ClientHello in the connection's message buffer and
 // returns it, ready to send. The slice stays valid until the next ClientHello is built.
+@(require_results)
 client_hello_message :: proc(connection: ^Conn, fields: Client_Hello_Fields) -> (message: []u8, ok: bool) {
 	body := connection.message[HANDSHAKE_HEADER_SIZE:]
 	body_length, encoded := client_hello_encode(body, fields)
@@ -479,6 +490,7 @@ client_hello_message :: proc(connection: ^Conn, fields: Client_Hello_Fields) -> 
 // transcript replaced by the message_hash of the first ClientHello, the retry, and the
 // second one (RFC 8446 sections 4.1.4 and 4.4.1). The first ClientHello is hashed
 // again here because the retry names the suite, so the transcript's own hash is not it.
+@(require_results)
 client_hello_retry :: proc(connection: ^Conn, fields: Client_Hello_Fields, first: []u8, retry_message: []u8) -> Error {
 	suite_hash := CIPHER_SUITES[connection.suite].hash
 	hash.init(&connection.transcript, suite_hash)
@@ -506,6 +518,7 @@ CHANGE_CIPHER_SPEC :: 1
 // compatibility mode places before this client's second flight. It goes out unencrypted
 // even when the handshake keys are live, because a peer that is not reading the handshake
 // yet is exactly what it is for.
+@(require_results)
 send_change_cipher_spec :: proc(connection: ^Conn) -> Error {
 	body: [1]u8 = {CHANGE_CIPHER_SPEC}
 	count, encoded := record_encode(.Change_Cipher_Spec, body[:], connection.send)
@@ -519,6 +532,7 @@ send_change_cipher_spec :: proc(connection: ^Conn) -> Error {
 // bytes. Handshake bytes belong to the handshake stream, and a record that carries
 // only a change cipher spec is dropped, which is what a compatibility-mode peer
 // sends and what a receiver does without further processing (RFC 8446 section 5).
+@(require_results)
 read_record :: proc(connection: ^Conn) -> (content: []u8, record_type: Record_Type, err: Error) {
 	for {
 		connection.recv_filled = 0
@@ -575,6 +589,7 @@ read_record :: proc(connection: ^Conn) -> (content: []u8, record_type: Record_Ty
 }
 
 // recv_fill reads exactly `count` bytes of the record being read.
+@(require_results)
 recv_fill :: proc(connection: ^Conn, count: int) -> Error {
 	for connection.recv_filled < count {
 		read, ok := connection.transport.read(connection.transport.user_data, connection.recv[connection.recv_filled:count])
@@ -586,6 +601,7 @@ recv_fill :: proc(connection: ^Conn, count: int) -> Error {
 
 // send_record writes one record, protected once the handshake keys are live, and
 // returns what ended the write.
+@(require_results)
 send_record :: proc(connection: ^Conn, record_type: Record_Type, payload: []u8) -> Error {
 	count: int
 	written: bool
@@ -598,6 +614,7 @@ send_record :: proc(connection: ^Conn, record_type: Record_Type, payload: []u8) 
 	return transport_write(connection, connection.send[:count])
 }
 
+@(require_results)
 transport_write :: proc(connection: ^Conn, data: []u8) -> Error {
 	pending := data
 	for len(pending) > 0 {
@@ -610,6 +627,7 @@ transport_write :: proc(connection: ^Conn, data: []u8) -> Error {
 
 // send_message sends a handshake message that is already built, header included, and
 // adds it to the transcript.
+@(require_results)
 send_message :: proc(connection: ^Conn, message: []u8) -> Error {
 	hash.update(&connection.transcript, message)
 	return send_record(connection, .Handshake, message)
@@ -621,6 +639,7 @@ send_message :: proc(connection: ^Conn, message: []u8) -> Error {
 // stream holds all of it. A handshake message is not aligned to records, so one
 // message can span records and one record can carry several. The message is the
 // whole of it, header included, and it stays valid until the next call.
+@(require_results)
 handshake_next :: proc(connection: ^Conn) -> (message: []u8, err: Error) {
 	for {
 		if available := handshake_available(connection); available != nil { return available, .None }
@@ -671,6 +690,7 @@ handshake_available :: proc(connection: ^Conn) -> []u8 {
 
 // fail tells the peer which rule it broke and reports the failure, which is what the
 // protocol asks of the side that finds a violation (RFC 8446 section 6.2).
+@(require_results)
 fail :: proc(connection: ^Conn, description: Alert_Description, err: Error) -> Error {
 	if connection.closed { return err }
 	alert: [2]u8 = {u8(Alert_Level.Fatal), u8(description)}
@@ -682,6 +702,7 @@ fail :: proc(connection: ^Conn, description: Alert_Description, err: Error) -> E
 
 // alert_report records the peer's alert and reports how the connection ended. A
 // close_notify is the end of the stream, and anything else is the peer refusing.
+@(require_results)
 alert_report :: proc(connection: ^Conn, content: []u8) -> Error {
 	if len(content) < 2 { return .Record }
 	connection.peer_alert = content[1]
@@ -695,6 +716,7 @@ alert_report :: proc(connection: ^Conn, content: []u8) -> Error {
 // post_handshake_handle consumes the handshake messages a peer may send after the
 // handshake. A new session ticket is not this client's business, since it keeps no
 // tickets, and a key update changes the read key (RFC 8446 section 4.6).
+@(require_results)
 post_handshake_handle :: proc(connection: ^Conn) -> Error {
 	for {
 		message := handshake_available(connection)
@@ -728,6 +750,7 @@ post_handshake_handle :: proc(connection: ^Conn) -> Error {
 
 // key_update_send answers a peer's request under the current write key, then advances
 // that key before any later application data (RFC 9846 section 4.7.3).
+@(require_results)
 key_update_send :: proc(connection: ^Conn) -> Error {
 	message: [HANDSHAKE_HEADER_SIZE + 1]u8
 	handshake_encode_header(.Key_Update, 1, message[:])
@@ -755,6 +778,7 @@ transcript_hash :: proc(connection: ^Conn) -> []u8 {
 
 // encrypted_extensions_read validates the server's extension responses and returns
 // the one application protocol it selected, when it selected one.
+@(require_results)
 encrypted_extensions_read :: proc(message: []u8, server_name_offered: bool, alpn_offered: []string) -> (negotiated: string, ok: bool) {
 	message_type, length, decoded := handshake_decode_header(message)
 	if !decoded || message_type != .Encrypted_Extensions || length != len(message) - HANDSHAKE_HEADER_SIZE {
@@ -805,6 +829,7 @@ encrypted_extensions_read :: proc(message: []u8, server_name_offered: bool, alpn
 // validity windows, against the identity the connection was reached by, and for the
 // purpose a TLS server certificate is used for. mem_err is set when the verifier's
 // own list could not be allocated, in which case nothing was verified.
+@(require_results)
 chain_verify :: proc(certificates: []x509.Certificate, server_name: string, config: Config) -> (verified: bool, mem_err: runtime.Allocator_Error) {
 	if len(certificates) == 0 || len(config.roots) == 0 { return false, nil }
 
@@ -826,6 +851,7 @@ chain_verify :: proc(certificates: []x509.Certificate, server_name: string, conf
 	return chain_err == .None, nil
 }
 
+@(require_results)
 suite_offered :: proc(suite: Cipher_Suite) -> bool {
 	for offered in OFFERED_SUITES {
 		if offered == suite { return true }
@@ -833,6 +859,7 @@ suite_offered :: proc(suite: Cipher_Suite) -> bool {
 	return false
 }
 
+@(require_results)
 all_zero :: proc(data: []u8) -> bool {
 	for byte in data {
 		if byte != 0 { return false }

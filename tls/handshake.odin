@@ -101,6 +101,7 @@ handshake_encode_header :: proc(handshake_type: Handshake_Type, length: int, dst
 
 // handshake_decode_header reads the header at the front of `data` and reports the
 // length of the handshake message that follows it.
+@(require_results)
 handshake_decode_header :: proc(data: []u8) -> (handshake_type: Handshake_Type, length: int, ok: bool) {
 	if len(data) < HANDSHAKE_HEADER_SIZE { return {}, 0, false }
 	length = int(data[1]) << 16 | int(data[2]) << 8 | int(data[3])

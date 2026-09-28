@@ -84,6 +84,7 @@ parser_destroy :: proc(parser: ^Parser) {
 // err is the caller's allocator failing: the parser holds a line, an event, or an
 // id of any size, so its buffers have no bound of their own. A feed that failed
 // leaves the stream where it stopped, and the caller feeds no more of it.
+@(require_results)
 parser_feed :: proc(parser: ^Parser, bytes: []u8) -> (err: runtime.Allocator_Error) {
 	if parser.finished { return nil }
 	for byte in bytes {
@@ -115,6 +116,7 @@ parser_feed :: proc(parser: ^Parser, bytes: []u8) -> (err: runtime.Allocator_Err
 //
 // err is the caller's allocator failing, exactly as in parser_feed: a trailing CR
 // and a partial BOM still go through the parser's own buffers.
+@(require_results)
 parser_finish :: proc(parser: ^Parser) -> (err: runtime.Allocator_Error) {
 	if parser.finished { return nil }
 	if parser.bom_len > 0 && parser.bom_len < 3 {
@@ -133,7 +135,7 @@ parser_finish :: proc(parser: ^Parser) -> (err: runtime.Allocator_Error) {
 	return nil
 }
 
-@(private)
+@(private, require_results)
 parser_byte :: proc(parser: ^Parser, byte: u8) -> (err: runtime.Allocator_Error) {
 	if parser.pending_cr {
 		parser.pending_cr = false
@@ -153,7 +155,7 @@ parser_byte :: proc(parser: ^Parser, byte: u8) -> (err: runtime.Allocator_Error)
 	return nil
 }
 
-@(private)
+@(private, require_results)
 parser_line :: proc(parser: ^Parser) -> (err: runtime.Allocator_Error) {
 	line := parser.line[:]
 	if len(line) == 0 {
@@ -165,7 +167,7 @@ parser_line :: proc(parser: ^Parser) -> (err: runtime.Allocator_Error) {
 	return nil
 }
 
-@(private)
+@(private, require_results)
 parser_field :: proc(parser: ^Parser, line: []u8) -> (err: runtime.Allocator_Error) {
 	// A line starting with a colon is a comment, ignored whole.
 	if line[0] == ':' { return nil }
@@ -214,7 +216,7 @@ parser_field :: proc(parser: ^Parser, line: []u8) -> (err: runtime.Allocator_Err
 	return nil
 }
 
-@(private)
+@(private, require_results)
 contains_null :: proc(value: []u8) -> bool {
 	for byte in value {
 		if byte == 0 { return true }
@@ -227,7 +229,7 @@ contains_null :: proc(value: []u8) -> bool {
 // decoder does. A value is complete before it is stored -- line terminators cannot
 // appear inside a UTF-8 sequence -- so decoding each value with fresh state equals
 // decoding the whole stream up front.
-@(private)
+@(private, require_results)
 append_decoded_utf8 :: proc(dst: ^[dynamic]u8, value: []u8) -> (err: runtime.Allocator_Error) {
 	i := 0
 	for i < len(value) {
@@ -282,7 +284,7 @@ utf8_lead :: proc(lead_byte: byte) -> (needed: int, lower, upper: byte) {
 	return 0, 0, 0
 }
 
-@(private)
+@(private, require_results)
 append_replacement_character :: proc(dst: ^[dynamic]u8) -> (err: runtime.Allocator_Error) {
 	// U+FFFD REPLACEMENT CHARACTER. Encoded by the standard library rather than
 	// written out as bytes, which is how the wrong character gets in.
@@ -295,7 +297,7 @@ append_replacement_character :: proc(dst: ^[dynamic]u8) -> (err: runtime.Allocat
 // run of ASCII digits, which the specification ignores. A digit string wider than
 // the representable time saturates at it: the field's only bound is the type's own,
 // not a policy about how long a client should wait.
-@(private)
+@(private, require_results)
 parse_retry :: proc(value: []u8) -> (retry_ms: i64, ok: bool) {
 	if len(value) == 0 { return 0, false }
 	result: i64

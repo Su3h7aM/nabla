@@ -12,6 +12,7 @@ Query_Entry :: struct {
 	key, value: string,
 }
 
+@(require_results)
 query_iter :: proc(query: ^string) -> (entry: Query_Entry, ok: bool) {
 	if len(query) == 0 { return }
 
@@ -50,6 +51,7 @@ query_get :: proc(url: URL, key: string) -> (value: string, ok: bool) #optional_
 	return
 }
 
+@(require_results)
 query_get_percent_decoded :: proc(url: URL, key: string, allocator := context.temp_allocator) -> (value: string, ok: bool) {
 	encoded := query_get(url, key) or_return
 	return net.percent_decode(encoded, allocator)
@@ -66,6 +68,7 @@ query_get_bool :: proc(url: URL, key: string) -> (result, set: bool) #optional_o
 	return
 }
 
+@(require_results)
 query_get_int :: proc(url: URL, key: string, base := 0) -> (result: int, ok: bool, set: bool) {
 	text := query_get(url, key) or_return
 	set = true
@@ -73,6 +76,7 @@ query_get_int :: proc(url: URL, key: string, base := 0) -> (result: int, ok: boo
 	return
 }
 
+@(require_results)
 query_get_uint :: proc(url: URL, key: string, base := 0) -> (result: uint, ok: bool, set: bool) {
 	text := query_get(url, key) or_return
 	set = true
@@ -93,6 +97,7 @@ Router :: struct {
 
 // router_init prepares a router whose patterns live in allocator. mem_err is set,
 // and the router owns nothing, when its table could not be allocated.
+@(require_results)
 router_init :: proc(router: ^Router, allocator := context.allocator) -> (mem_err: runtime.Allocator_Error) {
 	router.allocator = allocator
 	routes, make_err := make(map[Method][dynamic]Route, len(Method), allocator)
@@ -158,44 +163,54 @@ router_handler :: proc(router: ^Router) -> Handler {
 // The route_* procedures each add one handler to a router. mem_err is set, and no
 // route was added, when the pattern or the route's slot could not be allocated.
 
+@(require_results)
 route_get :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
 	return route_add(router, .Get, pattern, handler)
 }
 
+@(require_results)
 route_post :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
 	return route_add(router, .Post, pattern, handler)
 }
 
 // NOTE: this does not get called when `Server_Opts.redirect_head_to_get` is set to true.
+@(require_results)
 route_head :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
 	return route_add(router, .Head, pattern, handler)
 }
 
+@(require_results)
 route_put :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
 	return route_add(router, .Put, pattern, handler)
 }
 
+@(require_results)
 route_patch :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
 	return route_add(router, .Patch, pattern, handler)
 }
 
+@(require_results)
 route_trace :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
 	return route_add(router, .Trace, pattern, handler)
 }
 
+@(require_results)
 route_delete :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
 	return route_add(router, .Delete, pattern, handler)
 }
 
+@(require_results)
 route_connect :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
 	return route_add(router, .Connect, pattern, handler)
 }
 
+@(require_results)
 route_options :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
 	return route_add(router, .Options, pattern, handler)
 }
 
 // Adds a catch-all fallback route (all methods, ran if no other routes match).
+@(require_results)
 route_all :: proc(router: ^Router, pattern: string, handler: Handler) -> (mem_err: runtime.Allocator_Error) {
 	anchored, concat_err := strings.concatenate({"^", pattern, "$"}, router.allocator)
 	if concat_err != nil { return concat_err }
@@ -218,7 +233,7 @@ route_all :: proc(router: ^Router, pattern: string, handler: Handler) -> (mem_er
 // route_add anchors a pattern and adds it to one method's routes. mem_err is set,
 // and no route was added, when the pattern or the method's slot could not be
 // allocated.
-@(private)
+@(private, require_results)
 route_add :: proc(router: ^Router, method: Method, pattern: string, handler: Handler) -> (mem_err: runtime.Allocator_Error) {
 	anchored, concat_err := strings.concatenate({"^", pattern, "$"}, router.allocator)
 	if concat_err != nil { return concat_err }
@@ -241,7 +256,7 @@ route_add :: proc(router: ^Router, method: Method, pattern: string, handler: Han
 // routes_try runs the first route that matches. mem_err is set when the captures
 // that route's handler receives could not be allocated, in which case no handler
 // ran.
-@(private)
+@(private, require_results)
 routes_try :: proc(routes: [dynamic]Route, request: ^Request, response: ^Response) -> (matched: bool, mem_err: runtime.Allocator_Error) {
 	matches: [match.MAX_CAPTURES]match.Match = ---
 	for route in routes {

@@ -169,6 +169,7 @@ stop_from_wait :: proc(status: Wait_Status) -> Transport_Stop {
 	return .Failed
 }
 
+@(require_results)
 error_from_stop :: proc(stop: Transport_Stop) -> Error {
 	switch stop {
 	case .Cancelled:

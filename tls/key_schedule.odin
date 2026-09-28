@@ -52,6 +52,7 @@ MAX_HKDF_OUTPUT_BYTES :: 65535
 // hkdf_expand_label is HKDF-Expand-Label: keying material of `len(dst)` bytes
 // derived from `secret`, with the label and the context carried in the HkdfLabel
 // structure (RFC 8446 section 7.1).
+@(require_results)
 hkdf_expand_label :: proc(suite: Cipher_Suite, secret: []u8, label: string, label_context: []u8, dst: []u8) -> bool {
 	label_length := len(LABEL_PREFIX) + len(label)
 	if label_length > MAX_LABEL_BYTES || len(label_context) > MAX_LABEL_BYTES { return false }
@@ -103,6 +104,7 @@ key_schedule_init :: proc(suite: Cipher_Suite) -> (schedule: Key_Schedule) {
 // derived from the current stage. `ikm` is the ECDHE shared secret for the
 // handshake stage and a zero secret for the master stage, which is the end of the
 // tree (RFC 8446 section 7.1).
+@(require_results)
 key_schedule_advance :: proc(schedule: ^Key_Schedule, ikm: []u8) -> bool {
 	next: Stage
 	switch schedule.stage {
@@ -134,6 +136,7 @@ key_schedule_advance :: proc(schedule: ^Key_Schedule, ikm: []u8) -> bool {
 // current stage: what this endpoint writes under, and what the peer writes under.
 // The transcript hash covers the messages the secrets are bound to (RFC 8446
 // section 7.1). The early stage binds 0-RTT data, which is not implemented.
+@(require_results)
 key_schedule_traffic_secrets :: proc(schedule: ^Key_Schedule, transcript_hash: []u8, client, server: ^Secret) -> bool {
 	client_label, server_label: string
 	switch schedule.stage {
@@ -166,6 +169,7 @@ Traffic_Key :: struct {
 
 // traffic_key_derive fills `dst` from one traffic secret and starts its sequence
 // number at zero (RFC 8446 section 7.3).
+@(require_results)
 traffic_key_derive :: proc(suite: Cipher_Suite, secret: []u8, dst: ^Traffic_Key) -> bool {
 	key_length := aead.KEY_SIZES[CIPHER_SUITES[suite].aead]
 	if !hkdf_expand_label(suite, secret, "key", {}, dst.key[:key_length]) { return false }
@@ -176,6 +180,7 @@ traffic_key_derive :: proc(suite: Cipher_Suite, secret: []u8, dst: ^Traffic_Key)
 
 // key_schedule_update derives the next traffic secret of one direction from the one
 // in use, which is the whole of a key update (RFC 8446 section 7.2).
+@(require_results)
 key_schedule_update :: proc(suite: Cipher_Suite, secret: []u8, dst: []u8) -> bool {
 	return hkdf_expand_label(suite, secret, "traffic upd", {}, dst)
 }

@@ -54,6 +54,7 @@ dial_failure_destroy :: proc(failure: ^Dial_Failure, allocator: mem.Allocator) {
 // The connection owns the socket and the TLS session beneath it, so destroy closes
 // both. A failure owns its detail, released by dial_failure_destroy with the same
 // allocator.
+@(require_results)
 dial :: proc(url: string, options: Dial_Options, allocator := context.allocator) -> (connection: ^Conn, failure: Dial_Failure) {
 	exchange_url, url_ok := http_url(url, allocator)
 	defer delete(exchange_url, allocator)
@@ -114,6 +115,7 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 // dial_failure_detail returns a failure whose detail names text. A detail that
 // could not be copied leaves the failure without one: the kind, the cause, and the
 // status are what the caller acts on, and the failure is reported either way.
+@(require_results)
 dial_failure_detail :: proc(kind: Dial_Error, status: int, text: string, allocator: mem.Allocator) -> Dial_Failure {
 	detail, clone_err := strings.clone(text, allocator)
 	if clone_err != nil { detail = "" }
@@ -123,6 +125,7 @@ dial_failure_detail :: proc(kind: Dial_Error, status: int, text: string, allocat
 // http_url states a WebSocket URL as the HTTP URL of the same request, which is what
 // it is: RFC 6455 4.1 gives an HTTP request over TCP the scheme ws and one over TLS the
 // scheme wss. A URL that is not a WebSocket one is refused.
+@(require_results)
 http_url :: proc(url: string, allocator: mem.Allocator) -> (converted: string, ok: bool) {
 	parsed := http.url_parse(url)
 	scheme: string
@@ -144,6 +147,7 @@ http_url :: proc(url: string, allocator: mem.Allocator) -> (converted: string, o
 // response_accepts reports why a response does not accept the handshake request.
 // RFC 6455 4.1 makes each of these a failure of the WebSocket connection, because a
 // connection that was not accepted is not a WebSocket.
+@(require_results)
 response_accepts :: proc(upgraded: ^client.Upgraded, key: string, request_headers: []client.Header, allocator: mem.Allocator) -> Dial_Failure {
 	upgrade, has_upgrade := http.headers_get_unsafe(upgraded.headers, "upgrade")
 	if !has_upgrade || !field_has_token(upgrade, "websocket") {
@@ -170,6 +174,7 @@ response_accepts :: proc(upgraded: ^client.Upgraded, key: string, request_header
 	return {}
 }
 
+@(require_results)
 handshake_headers_invalid :: proc(headers: []client.Header, allocator: mem.Allocator) -> string {
 	for header in headers {
 		switch {
@@ -190,6 +195,7 @@ handshake_headers_invalid :: proc(headers: []client.Header, allocator: mem.Alloc
 
 // protocol_offer_valid reports whether an offer is 1#token: nonempty tokens, no
 // whitespace inside a token, and no token offered twice (RFC 6455 4.1).
+@(require_results)
 protocol_offer_valid :: proc(value: string, allocator: mem.Allocator) -> bool {
 	tokens, split_err := strings.split(value, ",", allocator)
 	if split_err != .None { return false }
@@ -207,6 +213,7 @@ protocol_offer_valid :: proc(value: string, allocator: mem.Allocator) -> bool {
 // protocol_offered reports whether the peer selected a protocol this client
 // offered. A subprotocol is an exact token, not a field value: matching one
 // without case would accept a selection the offer never named (RFC 6455 4.1).
+@(require_results)
 protocol_offered :: proc(headers: []client.Header, selected: string) -> bool {
 	for header in headers {
 		if !strings.equal_fold(header.name, "sec-websocket-protocol") { continue }
@@ -218,6 +225,7 @@ protocol_offered :: proc(headers: []client.Header, selected: string) -> bool {
 	return false
 }
 
+@(require_results)
 response_refusal :: proc(allocator: mem.Allocator, detail: string) -> Dial_Failure {
 	return dial_failure_detail(.Response, 101, detail, allocator)
 }
@@ -225,6 +233,7 @@ response_refusal :: proc(allocator: mem.Allocator, detail: string) -> Dial_Failu
 // field_has_token reports whether a field value holds one of a list of tokens,
 // compared without case, since HTTP field values are not case-sensitive
 // (RFC 9110 5.6.1).
+@(require_results)
 field_has_token :: proc(value, token: string) -> bool {
 	remaining := value
 	for part in strings.split_iterator(&remaining, ",") {
@@ -239,7 +248,7 @@ transport_for :: proc(upgraded: ^client.Upgraded) -> Transport {
 	return Transport{read = upgraded_read, write = upgraded_write, release = upgraded_release, abort = upgraded_abort, user_data = upgraded}
 }
 
-@(private)
+@(private, require_results)
 upgraded_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error) {
 	upgraded := cast(^client.Upgraded)user_data
 	read, read_err := client.upgraded_read(upgraded, buffer)
@@ -250,7 +259,7 @@ upgraded_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Erro
 	return read, .None
 }
 
-@(private)
+@(private, require_results)
 upgraded_write :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error) {
 	upgraded := cast(^client.Upgraded)user_data
 	accepted, write_err := client.upgraded_write(upgraded, buffer)

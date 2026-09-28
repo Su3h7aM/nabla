@@ -38,6 +38,7 @@ headers_count :: #force_inline proc(headers: Headers) -> int {
 // headers_set stores a value under a name it lowercases first, and returns that
 // name. The section borrows the value. mem_err is set, and nothing is stored,
 // when the name could not be built.
+@(require_results)
 headers_set :: proc(headers: ^Headers, key: string, value: string, loc := #caller_location) -> (name: string, mem_err: runtime.Allocator_Error) {
 	assert(!headers.readonly, "these headers are readonly, did you accidentally try to set a header on the request?", loc)
 	name, mem_err = sanitize_key(headers^, key)
@@ -54,6 +55,7 @@ headers_set_unsafe :: #force_inline proc(headers: ^Headers, key: string, value: 
 // headers_get returns the value stored under a name it lowercases first, and
 // whether a field has that name. mem_err is set, and nothing is looked up, when
 // the name could not be built.
+@(require_results)
 headers_get :: proc(headers: Headers, key: string) -> (value: string, found: bool, mem_err: runtime.Allocator_Error) {
 	name, name_err := sanitize_key(headers, key)
 	if name_err != nil { return "", false, name_err }
@@ -69,6 +71,7 @@ headers_get_unsafe :: #force_inline proc(headers: Headers, key: string) -> (stri
 // headers_entry returns the entry for a name it lowercases first, inserted with a
 // zero value when the section had none. mem_err is set when the name could not be
 // built, or when the entry's allocation failed.
+@(require_results)
 headers_entry :: proc(
 	headers: ^Headers,
 	key: string,
@@ -88,6 +91,7 @@ headers_entry :: proc(
 	return
 }
 
+@(require_results)
 headers_entry_unsafe :: #force_inline proc(
 	headers: ^Headers,
 	key: string,
@@ -105,6 +109,7 @@ headers_entry_unsafe :: #force_inline proc(
 
 // headers_has reports whether a field has a name it lowercases first. mem_err is
 // set, and has is false, when the name could not be built.
+@(require_results)
 headers_has :: proc(headers: Headers, key: string) -> (has: bool, mem_err: runtime.Allocator_Error) {
 	name, name_err := sanitize_key(headers, key)
 	if name_err != nil { return false, name_err }
@@ -112,6 +117,7 @@ headers_has :: proc(headers: Headers, key: string) -> (has: bool, mem_err: runti
 	return name in headers._kv, nil
 }
 
+@(require_results)
 headers_has_unsafe :: #force_inline proc(headers: Headers, key: string) -> bool {
 	return key in headers._kv
 }
@@ -119,6 +125,7 @@ headers_has_unsafe :: #force_inline proc(headers: Headers, key: string) -> bool 
 // headers_delete removes the field with a name it lowercases first, returning what
 // it removed. mem_err is set, and nothing is removed, when the name could not be
 // built.
+@(require_results)
 headers_delete :: proc(headers: ^Headers, key: string) -> (deleted_key: string, deleted_value: string, mem_err: runtime.Allocator_Error) {
 	name, name_err := sanitize_key(headers^, key)
 	if name_err != nil { return "", "", name_err }
@@ -151,7 +158,7 @@ headers_set_close :: #force_inline proc(headers: ^Headers) {
 // sanitize_key lowercases ASCII and escapes newlines, so a name can neither
 // miss a lookup by case nor split a field line when written. The result is owned
 // by the section's allocator, and mem_err is set when it could not be built.
-@(private = "package")
+@(private = "package", require_results)
 sanitize_key :: proc(headers: Headers, key: string) -> (name: string, mem_err: runtime.Allocator_Error) {
 	builder: strings.Builder
 	strings.builder_init(&builder, 0, len(key), headers_allocator(headers)) or_return
@@ -169,7 +176,7 @@ sanitize_key :: proc(headers: Headers, key: string) -> (name: string, mem_err: r
 // write_escaped_character appends one character of a field name, writing a newline
 // as its two-byte escape so a name can never split a field line. It reports false
 // when the builder could not grow to hold it.
-@(private)
+@(private, require_results)
 write_escaped_character :: proc(builder: ^strings.Builder, character: rune) -> bool {
 	if character == '\n' { return strings.write_string(builder, "\\n") == 2 }
 	written, write_err := strings.write_rune(builder, character)

@@ -27,6 +27,7 @@ Write_Error :: enum {
 //
 // Writes are all-or-nothing: on .Invalid_Value and on .No_Room, which is the
 // buffer failing to grow, nothing is appended.
+@(require_results)
 write_event :: proc(buffer: ^[dynamic]u8, data: string, event_type := "", id: Maybe(string) = nil, retry_ms: Maybe(i64) = nil) -> Write_Error {
 	// Validate before appending, so a rejected event leaves buffer untouched.
 	if strings.contains_rune(event_type, '\r') || strings.contains_rune(event_type, '\n') {
@@ -51,7 +52,7 @@ write_event :: proc(buffer: ^[dynamic]u8, data: string, event_type := "", id: Ma
 
 // write_event_fields appends the fields of one event to buffer, which
 // write_event truncates back on a failure.
-@(private)
+@(private, require_results)
 write_event_fields :: proc(buffer: ^[dynamic]u8, data: string, event_type: string, id: Maybe(string), retry_ms: Maybe(i64)) -> Write_Error {
 	if retry_value, has_retry := retry_ms.?; has_retry {
 		scratch: [32]u8
@@ -80,7 +81,7 @@ write_event_fields :: proc(buffer: ^[dynamic]u8, data: string, event_type: strin
 // syntax, not data -- the reader removes exactly one -- so a value that begins
 // with a space keeps it, and an empty value is written without the space to
 // leave no trailing whitespace on the line.
-@(private)
+@(private, require_results)
 append_field :: proc(buffer: ^[dynamic]u8, name, value: string) -> (err: Write_Error) {
 	if _, append_err := append(buffer, ..transmute([]u8)name); append_err != nil { return .No_Room }
 	if _, append_err := append(buffer, ':'); append_err != nil { return .No_Room }

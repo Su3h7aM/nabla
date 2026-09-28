@@ -28,7 +28,9 @@ Test_Server :: struct {
 // JSON value, and anything else with "ok".
 test_handle :: proc(request: ^Request, response: ^Response) {
 	if request.url.path == "/json" {
-		respond_json(response, 7)
+		// respond_json turns its own failure into the 500 it sets on the
+		// response, so this route has nothing left to report.
+		_ = respond_json(response, 7)
 		return
 	}
 	if request.url.path != "/echo" {
@@ -46,7 +48,9 @@ test_handle :: proc(request: ^Request, response: ^Response) {
 }
 
 test_server_start :: proc(t: ^testing.T, fixture: ^Test_Server) -> bool {
-	fixture.thread = thread.create_and_start_with_poly_data(fixture, proc(fixture: ^Test_Server) {
+	fixture.thread = thread.create_and_start_with_poly_data(
+	fixture,
+	proc(fixture: ^Test_Server) {
 		opts := Default_Server_Opts
 		opts.thread_count = 1
 		listen_err := listen(&fixture.server, {address = net.IP4_Loopback, port = 0}, opts)
@@ -55,8 +59,10 @@ test_server_start :: proc(t: ^testing.T, fixture: ^Test_Server) -> bool {
 			fixture.endpoint, fixture.listened = bound, bound_err == nil
 		}
 		sync.sema_post(&fixture.ready)
-		if listen_err == nil { serve(&fixture.server, handler(test_handle)) }
-	})
+		// A serve failure stops the server, which the test's own exchanges report.
+		if listen_err == nil { _ = serve(&fixture.server, handler(test_handle)) }
+	},
+	)
 	if fixture.thread == nil { return false }
 	sync.sema_wait(&fixture.ready)
 	testing.expect(t, fixture.listened, "the server listens")

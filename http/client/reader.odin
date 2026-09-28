@@ -29,6 +29,7 @@ Reader :: struct {
 // reader_init prepares reader to read through `read`. The caller owns the buffer
 // and releases it with reader_destroy. err is .No_Room when the buffer could not
 // be allocated, and the reader then holds nothing.
+@(require_results)
 reader_init :: proc(reader: ^Reader, read: Read_Proc, user_data: rawptr, allocator: mem.Allocator) -> (err: Error) {
 	reader.read = read
 	reader.user_data = user_data
@@ -44,6 +45,7 @@ reader_destroy :: proc(reader: ^Reader) {
 	reader^ = {}
 }
 
+@(require_results)
 reader_fill :: proc(reader: ^Reader) -> Error {
 	if reader.head > 0 {
 		copy(reader.buffer[:], reader.buffer[reader.head:reader.tail])
@@ -73,6 +75,7 @@ reader_fill :: proc(reader: ^Reader) -> Error {
 }
 
 // reader_line returns one CRLF-terminated line without its terminator.
+@(require_results)
 reader_line :: proc(reader: ^Reader) -> (line: string, err: Error) {
 	for {
 		for index in reader.head ..< reader.tail - 1 {
@@ -88,6 +91,7 @@ reader_line :: proc(reader: ^Reader) -> (line: string, err: Error) {
 
 // reader_take returns up to limit buffered bytes without copying them, filling
 // first when none are buffered. The view stays valid until the next fill.
+@(require_results)
 reader_take :: proc(reader: ^Reader, limit: int) -> (bytes: []u8, err: Error) {
 	if reader.head == reader.tail { reader_fill(reader) or_return }
 	count := min(limit, reader.tail - reader.head)
@@ -97,6 +101,7 @@ reader_take :: proc(reader: ^Reader, limit: int) -> (bytes: []u8, err: Error) {
 }
 
 // reader_read returns buffered bytes, filling first when the buffer is empty.
+@(require_results)
 reader_read :: proc(reader: ^Reader, out: []u8) -> (int, Error) {
 	for {
 		if reader.head < reader.tail {
@@ -109,6 +114,7 @@ reader_read :: proc(reader: ^Reader, out: []u8) -> (int, Error) {
 	}
 }
 
+@(require_results)
 reader_read_full :: proc(reader: ^Reader, out: []u8) -> Error {
 	filled := 0
 	for filled < len(out) {

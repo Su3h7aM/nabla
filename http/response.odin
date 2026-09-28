@@ -325,7 +325,7 @@ response_send :: proc(response: ^Response, connection: ^Connection, loc := #call
 
 // request_has_body reports whether the request's framing says content follows
 // its header section (RFC 9112 6.3).
-@(private)
+@(private, require_results)
 request_has_body :: proc(request: ^Request) -> bool {
 	if headers_has_unsafe(request.headers, "transfer-encoding") { return true }
 	length_text, has_length := headers_get_unsafe(request.headers, "content-length")
@@ -369,7 +369,7 @@ clean_request_loop :: proc(connection: ^Connection, close_connection: Maybe(bool
 // with a status code of 1xx (Informational) or 204 (No Content).  A
 // server MUST NOT send a Content-Length header field in any 2xx
 // (Successful) response to a CONNECT request.
-@(private)
+@(private, require_results)
 response_needs_content_length :: proc(response: ^Response, connection: ^Connection) -> bool {
 	if status_is_informational(response.status) || response.status == .No_Content {
 		return false
@@ -384,7 +384,7 @@ response_needs_content_length :: proc(response: ^Response, connection: ^Connecti
 
 // response_must_close reports whether the connection closes after this
 // response, and states it in the response when the server decided it.
-@(private)
+@(private, require_results)
 response_must_close :: proc(request: ^Request, response: ^Response) -> bool {
 	// RFC 9112 9.6: a "close" connection option from either side ends the
 	// connection after this response. Connection is a list of case-insensitive

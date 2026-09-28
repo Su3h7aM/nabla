@@ -22,6 +22,7 @@ skipped: a store may carry other labels, and dropping an anchor can only refuse 
 chain, never admit one. Empty text, or text with no readable certificate, is not a
 trust store.
 */
+@(require_results)
 roots_parse :: proc(text: []u8, allocator: mem.Allocator) -> (roots: Roots, ok: bool) {
 	roots.allocator = allocator
 

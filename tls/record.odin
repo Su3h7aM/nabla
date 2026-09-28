@@ -41,6 +41,7 @@ record_encode_header :: proc(record_type: Record_Type, length: int, dst: []u8) {
 // length of the record body that follows it. The version is not checked: the
 // protocol fixes it rather than negotiating it, and a record that carries
 // another value is not this record layer's to reject.
+@(require_results)
 record_decode_header :: proc(data: []u8) -> (record_type: Record_Type, length: int, ok: bool) {
 	if len(data) < RECORD_HEADER_SIZE { return {}, 0, false }
 	return Record_Type(data[0]), int(data[3]) << 8 | int(data[4]), true
@@ -48,6 +49,7 @@ record_decode_header :: proc(data: []u8) -> (record_type: Record_Type, length: i
 
 // record_encode writes one unprotected record and returns how many bytes of
 // `dst` it used.
+@(require_results)
 record_encode :: proc(record_type: Record_Type, payload: []u8, dst: []u8) -> (count: int, ok: bool) {
 	if len(payload) > MAX_PLAINTEXT_RECORD || len(dst) < RECORD_HEADER_SIZE + len(payload) { return 0, false }
 	record_encode_header(record_type, len(payload), dst)
@@ -57,6 +59,7 @@ record_encode :: proc(record_type: Record_Type, payload: []u8, dst: []u8) -> (co
 
 // record_decode returns the payload of one unprotected record, which must be the
 // whole of that record.
+@(require_results)
 record_decode :: proc(record: []u8) -> (payload: []u8, record_type: Record_Type, ok: bool) {
 	header_type, length, decoded := record_decode_header(record)
 	if !decoded || length > MAX_PLAINTEXT_RECORD || len(record) != RECORD_HEADER_SIZE + length {
@@ -68,6 +71,7 @@ record_decode :: proc(record: []u8) -> (payload: []u8, record_type: Record_Type,
 // record_decode_inner returns the content of a decrypted inner plaintext and
 // drops its padding: the last non-zero byte is the record's own type, and every
 // byte after it is padding (RFC 8446 section 5.4).
+@(require_results)
 record_decode_inner :: proc(inner: []u8) -> (content: []u8, record_type: Record_Type, ok: bool) {
 	for i := len(inner) - 1; i >= 0; i -= 1 {
 		if inner[i] == 0 { continue }

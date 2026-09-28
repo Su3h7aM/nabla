@@ -74,6 +74,7 @@ Request :: struct {
 // use still carries the peer's own account of what went wrong, and HTTP places no
 // limit on a body (RFC 9110 5.4), so no size is invented here and the caller
 // decides how much of it to keep.
+@(require_results)
 stream_request :: proc(request: Request, options: Options, user_data: rawptr, callback: Chunk_Callback) -> (failure: Failure) {
 	// One observation per request, reported on every path once validation has
 	// begun. The phase names the stage about to run, so an error inside a stage is
@@ -182,6 +183,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 // which owns readiness for both the socket and the resolver's. The caller releases
 // it when the request returns, including one that ends in an upgraded connection:
 // that connection's later waits acquire the loop of whichever thread performs them.
+@(require_results)
 event_loop_acquire :: proc(allocator: mem.Allocator) -> Failure {
 	if nbio.acquire_thread_event_loop() != nil {
 		return failure_from_error(.None, allocator, .Transport, "the event loop could not be started")
@@ -196,6 +198,7 @@ event_loop_acquire :: proc(allocator: mem.Allocator) -> Failure {
 //
 // phase and summary are written in place, so the caller's single observation covers
 // validation and the request write as well as the response that follows.
+@(require_results)
 request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase, summary: ^Transfer_Summary) -> (connection: ^Connection, failure: Failure) {
 	url := http.url_parse(request.url)
 	phase^ = .Validate
@@ -257,6 +260,7 @@ request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase,
 // it does not speak, and fields or a target that would frame ambiguously or
 // inject bytes. URL problems report Invalid_URL; everything the caller built
 // reports Invalid_Request. The detail is a static string the failure clones.
+@(require_results)
 request_validate :: proc(url: http.URL, request: Request) -> (err: Error, detail: string) {
 	// RFC 9110 4.2.3: schemes are case-insensitive.
 	if !strings.equal_fold(url.scheme, "http") && !strings.equal_fold(url.scheme, "https") {
@@ -303,6 +307,7 @@ request_validate :: proc(url: http.URL, request: Request) -> (err: Error, detail
 // format_request builds the request line, the fields, and the body. body_offset is
 // where the body begins, which is what lets a partial write say how much of the
 // body the transport took rather than how much of the whole request it took.
+@(require_results)
 format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer, body_offset: int, formatted: bool) {
 	bytes.buffer_init_allocator(&buffer, 0, len(request.body) + 512, request.allocator)
 
@@ -350,13 +355,13 @@ format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer
 	return buffer, body_offset, true
 }
 
-@(private)
+@(private, require_results)
 request_buffer_string :: proc(buffer: ^bytes.Buffer, value: string) -> bool {
 	written, err := bytes.buffer_write_string(buffer, value)
 	return err == nil && written == len(value)
 }
 
-@(private)
+@(private, require_results)
 request_buffer_bytes :: proc(buffer: ^bytes.Buffer, value: []u8) -> bool {
 	written, err := bytes.buffer_write(buffer, value)
 	return err == nil && written == len(value)
@@ -368,6 +373,7 @@ request_buffer_bytes :: proc(buffer: ^bytes.Buffer, value: []u8) -> bool {
 // length even when there is none, which is how a server tells an empty body from no body;
 // a request with no content whose method defines no such meaning states nothing, because
 // there is nothing to state.
+@(require_results)
 request_states_length :: proc(request: Request) -> bool {
 	if len(request.body) > 0 { return true }
 	switch request.method {
@@ -381,6 +387,7 @@ request_states_length :: proc(request: Request) -> bool {
 
 // request_has_header reports whether the caller set a field, so the defaults this
 // builder would supply do not appear twice.
+@(require_results)
 request_has_header :: proc(request: Request, name: string) -> bool {
 	for header in request.headers {
 		if strings.equal_fold(header.name, name) { return true }
@@ -393,6 +400,7 @@ request_has_header :: proc(request: Request, name: string) -> bool {
 // address skips resolution; a name goes through the interruptible resolver,
 // so cancellation during lookup retires with the operation instead of
 // outliving it. The caller owns the result on every path.
+@(require_results)
 resolve_endpoints :: proc(url: http.URL, options: Options, allocator: mem.Allocator) -> (endpoints: []net.Endpoint, err: Error) {
 	hostname, port, ok := host_and_port(url.host)
 	if !ok || hostname == "" { return nil, .Invalid_URL }
@@ -424,6 +432,7 @@ resolve_endpoints :: proc(url: http.URL, options: Options, allocator: mem.Alloca
 // status_detail names the status a response was refused for. The reason phrase
 // is left out on purpose: RFC 9110 15 tells a client to ignore it because it is
 // not a reliable channel for information.
+@(require_results)
 status_detail :: proc(status: int, allocator: mem.Allocator) -> string {
 	return fmt.aprintf("HTTP %d: the response status is not 2xx", status, allocator = allocator)
 }
@@ -435,6 +444,7 @@ Response_Status :: struct {
 	version: http.Version,
 }
 
+@(require_results)
 read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status: Response_Status, headers: http.Headers, err: Error) {
 	line, line_err := reader_line(reader)
 	if line_err != .None { return {}, headers, line_err }
@@ -458,6 +468,7 @@ read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status
 // may hold or how long any of them may be: RFC 9110 5.4 states that HTTP places
 // no predefined limit on a field line, a field value, or a field section, and a
 // client that refuses a long one fails where every other client succeeds.
+@(require_results)
 read_field_section :: proc(reader: ^Reader, headers: ^http.Headers) -> Error {
 	// The field a folded line continues.
 	last_key: string
@@ -492,6 +503,7 @@ read_field_section :: proc(reader: ^Reader, headers: ^http.Headers) -> Error {
 // response, and this client never asks to upgrade, so an unexpected 101 is
 // returned as the final response for the caller to report as a failure rather
 // than being waited past.
+@(require_results)
 read_final_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status: Response_Status, headers: http.Headers, err: Error) {
 	// How many interim responses may precede the final one is not this client's
 	// decision: RFC 9110 15.2 says a client must be able to parse one or more of
@@ -506,6 +518,7 @@ read_final_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (
 	}
 }
 
+@(require_results)
 parse_status_line :: proc(line: string) -> (code: int, version: http.Version, ok: bool) {
 	space := strings.index_byte(line, ' ')
 	if space < 0 { return }
@@ -528,6 +541,7 @@ parse_status_line :: proc(line: string) -> (code: int, version: http.Version, ok
 	return code, version, true
 }
 
+@(require_results)
 content_type_matches :: proc(value, expected: string) -> bool {
 	semi := strings.index_byte(value, ';')
 	media := http.trim_ows(value if semi < 0 else value[:semi])
@@ -555,6 +569,7 @@ Body_Framing :: enum {
 // response delimited by the connection closing; a Content-Length gives the
 // length in octets; and with neither, the body is delimited by the connection
 // closing.
+@(require_results)
 response_framing :: proc(status: int, version: http.Version, method: http.Method, headers: http.Headers) -> (framing: Body_Framing, length: int, err: Error) {
 	// 1. Responses that never carry content, whatever their fields say.
 	if method == .Head || (status >= 100 && status < 200) || status == 204 || status == 304 {
@@ -581,6 +596,7 @@ response_framing :: proc(status: int, version: http.Version, method: http.Method
 	return .Until_Close, 0, .None
 }
 
+@(require_results)
 stream_body :: proc(reader: ^Reader, framing: Body_Framing, length: int, user_data: rawptr, callback: Chunk_Callback) -> Error {
 	switch framing {
 	case .None:
@@ -597,6 +613,7 @@ stream_body :: proc(reader: ^Reader, framing: Body_Framing, length: int, user_da
 
 // stream_exact delivers exactly length octets. Each chunk is a view of the
 // reader's buffer, borrowed for the callback.
+@(require_results)
 stream_exact :: proc(reader: ^Reader, length: int, user_data: rawptr, callback: Chunk_Callback) -> Error {
 	remaining := length
 	for remaining > 0 {
@@ -608,6 +625,7 @@ stream_exact :: proc(reader: ^Reader, length: int, user_data: rawptr, callback: 
 }
 
 // stream_until_closed delivers everything until the peer closes the stream.
+@(require_results)
 stream_until_closed :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callback) -> Error {
 	for {
 		chunk, err := reader_take(reader, max(int))
@@ -617,6 +635,7 @@ stream_until_closed :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_
 	}
 }
 
+@(require_results)
 stream_chunked :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callback) -> Error {
 	for {
 		line, line_err := reader_line(reader)
@@ -646,6 +665,7 @@ stream_chunked :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callb
 // failure_from_error builds a failure from the transport's own error. The text is
 // cloned so that every failure owns its detail, which is what lets one
 // destructor release any of them.
+@(require_results)
 failure_from_error :: proc(err: Error, allocator: mem.Allocator, override: Failure_Kind = .None, detail: string = "") -> Failure {
 	kind := override
 	if kind == .None {
