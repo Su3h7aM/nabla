@@ -352,6 +352,7 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 		fmt.eprintln("nabla: the session database could not be closed cleanly:", detail)
 	}
 	delete(setup.journal_directory, setup.alloc)
+	delete(setup.lock_directory, setup.alloc)
 	agent.catalog_destroy(&setup.catalog)
 	for id in setup.configured {
 		delete(id, setup.alloc)

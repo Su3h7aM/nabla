@@ -20,7 +20,7 @@ TOOL_RESULT_PREVIEW_BYTES :: 32 * 1024
 // the model's context. The budget reserves it for every result still to come.
 TOOL_RESULT_NOTICE_TOKENS :: 128
 
-// TOOL_OUTPUT_DIRECTORY_NAME is the directory, inside the XDG state directory, that holds
+// TOOL_OUTPUT_DIRECTORY_NAME is the directory, inside the XDG cache directory, that holds
 // one directory of kept outputs per session.
 TOOL_OUTPUT_DIRECTORY_NAME :: "tool-output"
 
@@ -117,13 +117,15 @@ tool_output_create :: proc(path: string) -> (^os.File, os.Error) {
 }
 
 // tool_output_directory is where a session keeps the outputs it did not show in full:
-// $XDG_STATE_HOME/nabla/tool-output/<session>, which outlives the process so a resumed
-// session can still read them. It returns "" when no state directory resolves.
+// $XDG_CACHE_HOME/nabla/tool-output/<session>. It outlives the process so a resumed
+// session can still read them, and the user may delete it at any time: the journal keeps
+// what the model was shown, and a read of a removed file fails as feedback. It returns ""
+// when no cache directory resolves.
 @(require_results)
 tool_output_directory :: proc(id: string, allocator := context.allocator) -> string {
-	state, state_error := xdg_directory(.State, context.temp_allocator)
-	if state_error != .None { return "" }
-	directory, join_error := filepath.join({state, TOOL_OUTPUT_DIRECTORY_NAME, id}, allocator)
+	cache, cache_error := xdg_directory(.Cache, context.temp_allocator)
+	if cache_error != .None { return "" }
+	directory, join_error := filepath.join({cache, TOOL_OUTPUT_DIRECTORY_NAME, id}, allocator)
 	if join_error != nil { return "" }
 	return directory
 }

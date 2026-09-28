@@ -17,7 +17,7 @@ test_diagnostics_reads_journal_in_order_and_filters_runtime_level :: proc(test: 
 		directory, directory_error := agent.xdg_directory(.State, context.temp_allocator)
 		if directory_error != .None { testing.fail_now(test, "state directory unavailable") }
 		store: journal.Journal
-		diagnostics_request_expect(test, journal.open(&store, directory, journal.run_id_create(), .Read_Write))
+		diagnostics_request_expect(test, journal.open(&store, directory, directory, journal.run_id_create(), .Read_Write))
 		session, create_error := journal.create_session(&store, {workspace = "/tmp/project", role = .Main})
 		diagnostics_request_expect(test, create_error)
 		for turn in 1 ..= 2 {

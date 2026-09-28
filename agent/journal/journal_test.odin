@@ -328,9 +328,9 @@ test_open_refuses_a_database_this_build_does_not_read :: proc(test: ^testing.T) 
 	_expect_db_ok(test, db.close(&connection))
 
 	refused: Journal
-	_expect_error(test, open(&refused, directory, _test_run_id(), .Read_Write), .Schema_Too_New)
+	_expect_error(test, open(&refused, directory, directory, _test_run_id(), .Read_Write), .Schema_Too_New)
 	testing.expect(test, !refused.open, "a refused open leaves a closed journal")
-	_expect_error(test, open(&refused, directory, _test_run_id(), .Read_Only), .Schema_Too_New)
+	_expect_error(test, open(&refused, directory, directory, _test_run_id(), .Read_Only), .Schema_Too_New)
 
 	// A database someone else wrote holds no version this package can read.
 	foreign_directory := _temp_directory(test)
@@ -345,13 +345,13 @@ test_open_refuses_a_database_this_build_does_not_read :: proc(test: ^testing.T) 
 	_expect_db_ok(test, db.exec(&foreign_connection, "CREATE TABLE foreign_table (x INTEGER)"))
 	_expect_db_ok(test, db.close(&foreign_connection))
 
-	_expect_error(test, open(&refused, foreign_directory, _test_run_id(), .Read_Write), .Schema_Unknown)
-	_expect_error(test, open(&refused, foreign_directory, _test_run_id(), .Read_Only), .Schema_Unknown)
+	_expect_error(test, open(&refused, foreign_directory, foreign_directory, _test_run_id(), .Read_Write), .Schema_Unknown)
+	_expect_error(test, open(&refused, foreign_directory, foreign_directory, _test_run_id(), .Read_Only), .Schema_Unknown)
 
 	// A reader creates nothing, so a directory with no journal is .Not_Found.
 	empty_directory := _temp_directory(test)
 	defer _remove_directory(empty_directory)
-	_expect_error(test, open(&refused, empty_directory, _test_run_id(), .Read_Only), .Not_Found)
+	_expect_error(test, open(&refused, empty_directory, empty_directory, _test_run_id(), .Read_Only), .Not_Found)
 }
 
 @(test)

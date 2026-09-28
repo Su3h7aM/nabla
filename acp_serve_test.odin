@@ -418,6 +418,8 @@ test_acp_serves_a_turn_and_replays_a_loaded_session :: proc(t: ^testing.T) {
 	}
 	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
+	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
 	// The catalog cache is pointed at the state directory too: a run must never read or
 	// write the user's own cache.
 	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
@@ -600,6 +602,8 @@ test_acp_v2_negotiates_and_exposes_the_session_surface :: proc(t: ^testing.T) {
 	}
 	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
+	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
 	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
@@ -701,6 +705,8 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 	}
 	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
+	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
 	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
@@ -849,6 +855,8 @@ test_acp_v2_batch_answers_reader_owned_requests_as_one_frame :: proc(t: ^testing
 	}
 	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
+	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
 	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
@@ -897,6 +905,8 @@ test_acp_buzz_v2_request_uses_the_v1_wire_profile :: proc(t: ^testing.T) {
 	}
 	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
+	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
 	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
@@ -954,6 +964,8 @@ test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
 	}
 	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
+	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
 	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
@@ -1056,6 +1068,8 @@ test_acp_buzz_effort_option_selects_thinking_level :: proc(t: ^testing.T) {
 	}
 	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
+	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
 	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 

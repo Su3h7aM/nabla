@@ -8,7 +8,8 @@ import "core:path/filepath"
 //
 // The environment variable wins when it names an absolute path; an unset, empty, or
 // relative one is invalid and the specification's default under the home directory
-// applies instead. The application directory name is lowercase.
+// applies instead. The runtime directory has no default, so it is unresolved then.
+// The application directory name is lowercase.
 
 XDG_APP_NAME :: "nabla"
 
@@ -16,13 +17,19 @@ XDG_APP_NAME :: "nabla"
 // be readable, writable, and searchable by its owner alone.
 XDG_APP_PERMISSIONS :: os.Permissions{.Read_User, .Write_User, .Execute_User}
 
+// SESSION_LOCK_DIRECTORY_NAME is the directory, inside the runtime directory, that
+// holds one claim lock file per session.
+SESSION_LOCK_DIRECTORY_NAME :: "locks"
+
 XDG_Kind :: enum {
 	// User configuration.
 	Config,
-	// Regenerable data whose loss does not remove user state.
+	// Data the user may delete at any time without breaking anything.
 	Cache,
-	// State that persists across restarts and is not configuration.
+	// History and logs that persist across restarts and are not configuration.
 	State,
+	// Small files for synchronization that do not outlive the user's login.
+	Runtime,
 }
 
 XDG_Error :: enum {
@@ -42,6 +49,8 @@ xdg_variable :: proc(kind: XDG_Kind) -> (variable: string, fallback: string) {
 		variable, fallback = "XDG_CACHE_HOME", ".cache"
 	case .State:
 		variable, fallback = "XDG_STATE_HOME", ".local/state"
+	case .Runtime:
+		variable, fallback = "XDG_RUNTIME_DIR", ""
 	}
 	return
 }
@@ -59,6 +68,7 @@ xdg_directory :: proc(kind: XDG_Kind, allocator := context.allocator) -> (string
 	if value, found := os.lookup_env(variable, context.temp_allocator); found && filepath.is_abs(value) {
 		base = value
 	} else {
+		if fallback == "" { return "", .Unresolved }
 		home, home_err := os.user_home_dir(context.temp_allocator)
 		if home_err != nil || home == "" { return "", .Unresolved }
 		joined, join_err := filepath.join([]string{home, fallback}, context.temp_allocator)
@@ -68,6 +78,26 @@ xdg_directory :: proc(kind: XDG_Kind, allocator := context.allocator) -> (string
 	path, path_err := filepath.join([]string{base, XDG_APP_NAME}, allocator)
 	if path_err != nil { return "", .Unresolved }
 	return path, .None
+}
+
+// session_lock_directory resolves the directory that holds session claim locks:
+// locks under the runtime directory, so they vanish at logout and reboot. Without
+// a runtime directory it is locks under the state directory, which the
+// specification's replacement rule allows because it supports file locking and is
+// private to the user; replaced reports that, so the caller can warn. It does not
+// touch the filesystem. The result is owned by the caller.
+@(require_results)
+session_lock_directory :: proc(allocator := context.allocator) -> (path: string, replaced: bool, error: XDG_Error) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
+	base, base_error := xdg_directory(.Runtime, context.temp_allocator)
+	if base_error != .None {
+		replaced = true
+		base, base_error = xdg_directory(.State, context.temp_allocator)
+		if base_error != .None { return "", replaced, base_error }
+	}
+	joined, join_error := filepath.join({base, SESSION_LOCK_DIRECTORY_NAME}, allocator)
+	if join_error != nil { return "", replaced, .Unresolved }
+	return joined, replaced, .None
 }
 
 // xdg_directory_create creates a resolved directory and its parents when it is

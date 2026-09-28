@@ -74,7 +74,7 @@ diagnostics_main :: proc(args: []string, stdout, stderr: io.Writer) -> int {
 		return 1
 	}
 	store: journal.Journal
-	if open_error := journal.open(&store, directory, journal.run_id_create(), .Read_Only); open_error != nil {
+	if open_error := journal.open(&store, directory, "", journal.run_id_create(), .Read_Only); open_error != nil {
 		fmt.wprintf(stderr, "nabla: the journal could not be opened: %s\n", journal.error_text(open_error, context.temp_allocator))
 		return 1
 	}

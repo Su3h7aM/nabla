@@ -42,6 +42,7 @@ Subagent :: struct {
 	tools:                        Tool_Registry,
 	workspace:                    string,
 	store_directory:              string,
+	lock_directory:               string,
 	parent_session:               journal.Session_Id,
 	parent_call:                  journal.Call_Id, // the orchestrator's call that started it
 	session:                      journal.Session_Id, // the child session, named when the start was recorded
@@ -93,6 +94,7 @@ Agent_Parent :: struct {
 	run:                          journal.Run_Id,
 	workspace:                    string,
 	store_directory:              string,
+	lock_directory:               string,
 	provider_id:                  string,
 	model_id:                     string,
 	effort:                       string,
@@ -122,6 +124,7 @@ agent_team_make :: proc(allocator: mem.Allocator) -> ^Agent_Team {
 agent_parent_destroy :: proc(parent: ^Agent_Parent, allocator: mem.Allocator) {
 	delete(parent.workspace, allocator)
 	delete(parent.store_directory, allocator)
+	delete(parent.lock_directory, allocator)
 	delete(parent.provider_id, allocator)
 	delete(parent.model_id, allocator)
 	delete(parent.effort, allocator)
@@ -162,10 +165,13 @@ agent_parent_copy :: proc(chat: ^Chat_Session, allocator: mem.Allocator, out: ^A
 	if levels_error != nil { return false }
 	out.effort_levels = levels
 	directory := chat.store.directory if chat.store != nil else ""
+	locks := chat.store.locks if chat.store != nil else ""
 	clone_error: mem.Allocator_Error
 	out.workspace, clone_error = strings.clone(chat.workspace, allocator)
 	if clone_error != nil { return false }
 	out.store_directory, clone_error = strings.clone(directory, allocator)
+	if clone_error != nil { return false }
+	out.lock_directory, clone_error = strings.clone(locks, allocator)
 	if clone_error != nil { return false }
 	out.provider_id, clone_error = strings.clone(chat.provider_id, allocator)
 	if clone_error != nil { return false }
@@ -202,6 +208,8 @@ agent_parent_temp_copy :: proc(parent: Agent_Parent, allocator: mem.Allocator) -
 	snapshot.workspace, clone_error = strings.clone(parent.workspace, allocator)
 	if clone_error != nil { return {}, false }
 	snapshot.store_directory, clone_error = strings.clone(parent.store_directory, allocator)
+	if clone_error != nil { return {}, false }
+	snapshot.lock_directory, clone_error = strings.clone(parent.lock_directory, allocator)
 	if clone_error != nil { return {}, false }
 	levels, levels_error := make([]string, len(parent.effort_levels), allocator)
 	if levels_error != nil { return {}, false }
@@ -322,6 +330,7 @@ subagent_destroy :: proc(member: ^Subagent) {
 	tool_registry_destroy(&member.tools)
 	delete(member.workspace, allocator)
 	delete(member.store_directory, allocator)
+	delete(member.lock_directory, allocator)
 	steer_queue_destroy(&member.inbox)
 	delete(member.session_id, allocator)
 	delete(member.answer, allocator)
@@ -416,6 +425,8 @@ subagent_start :: proc(
 	created.workspace, clone_error = strings.clone(parent.workspace, allocator)
 	if clone_error != nil { return nil, "the subagent could not be allocated" }
 	created.store_directory, clone_error = strings.clone(parent.store_directory, allocator)
+	if clone_error != nil { return nil, "the subagent could not be allocated" }
+	created.lock_directory, clone_error = strings.clone(parent.lock_directory, allocator)
 	if clone_error != nil { return nil, "the subagent could not be allocated" }
 	if program.name != "" {
 		wake, wake_error := tool_wake_open()
@@ -584,7 +595,7 @@ subagent_run :: proc(member: ^Subagent) {
 		return
 	}
 	store: journal.Journal
-	if open_error := journal.open(&store, member.store_directory, member.run, .Read_Write, allocator); open_error != nil {
+	if open_error := journal.open(&store, member.store_directory, member.lock_directory, member.run, .Read_Write, allocator); open_error != nil {
 		subagent_fail(
 			member,
 			.Failed,

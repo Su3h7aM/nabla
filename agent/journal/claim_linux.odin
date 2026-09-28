@@ -4,6 +4,16 @@ package journal
 import "core:os"
 import "core:sys/linux"
 
+// claim_file_pin sets the sticky bit on a lock file, which the XDG runtime directory
+// rules name as the mark that keeps periodic clean-up from removing it. A lock file
+// removed while held would let a second process claim the session on a new one.
+@(private, require_results)
+claim_file_pin :: proc(file: ^os.File) -> os.Error {
+	mode := linux.Mode{.IRUSR, .IWUSR, .ISVTX}
+	if chmod_error := linux.fchmod(linux.Fd(os.fd(file)), mode); chmod_error != .NONE { return os.Platform_Error(chmod_error) }
+	return nil
+}
+
 // claim_lock_take takes an exclusive advisory lock on file without waiting. The
 // lock belongs to the open file, so a second claim conflicts whether it is in
 // this process or another, and the kernel drops it when the process dies.

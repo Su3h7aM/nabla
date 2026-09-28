@@ -31,7 +31,7 @@ diagnostics_request_fixture :: proc(test: ^testing.T) -> (session: journal.Sessi
 	directory, directory_error := agent.xdg_directory(.State, context.temp_allocator)
 	if directory_error != .None { testing.fail_now(test, "state directory unavailable") }
 	store: journal.Journal
-	diagnostics_request_expect(test, journal.open(&store, directory, journal.run_id_create(), .Read_Write))
+	diagnostics_request_expect(test, journal.open(&store, directory, directory, journal.run_id_create(), .Read_Write))
 	defer diagnostics_request_expect(test, journal.close(&store))
 	create_error: journal.Error
 	session, create_error = journal.create_session(&store, {workspace = "/tmp/project", role = .Main})

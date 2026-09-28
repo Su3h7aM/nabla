@@ -94,7 +94,7 @@ _remove_directory :: proc(directory: string) {
 }
 
 _open_journal :: proc(test: ^testing.T, journal: ^Journal, directory: string, mode := Open_Mode.Read_Write) {
-	_expect_ok(test, open(journal, directory, _test_run_id(), mode))
+	_expect_ok(test, open(journal, directory, directory, _test_run_id(), mode))
 }
 
 _close_journal :: proc(test: ^testing.T, journal: ^Journal) {

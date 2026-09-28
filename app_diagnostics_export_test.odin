@@ -19,7 +19,7 @@ test_export_session_payload_and_manifest_digest :: proc(test: ^testing.T) {
 		directory, directory_error := agent.xdg_directory(.State, context.temp_allocator)
 		if directory_error != .None { testing.fail_now(test, "state directory unavailable") }
 		store: journal.Journal
-		diagnostics_request_expect(test, journal.open(&store, directory, journal.run_id_create(), .Read_Write))
+		diagnostics_request_expect(test, journal.open(&store, directory, directory, journal.run_id_create(), .Read_Write))
 		session, create_error := journal.create_session(&store, {workspace = "/tmp/project", role = .Main})
 		diagnostics_request_expect(test, create_error)
 		payload := "private payload"

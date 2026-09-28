@@ -86,7 +86,7 @@ chat_test_begin :: proc(test: ^testing.T, fixture: ^Chat_Test, workspace: string
 	if directory_error != nil { testing.fail_now(test, "could not create a temporary directory") }
 	fixture.directory = directory
 
-	if open_error := journal.open(&fixture.store, directory, journal.run_id_create(), .Read_Write); open_error != nil {
+	if open_error := journal.open(&fixture.store, directory, directory, journal.run_id_create(), .Read_Write); open_error != nil {
 		testing.fail_now(
 			test,
 			strings.concatenate({"the journal could not be opened: ", journal.error_text(open_error, context.temp_allocator)}, context.temp_allocator),
@@ -101,7 +101,7 @@ chat_test_begin :: proc(test: ^testing.T, fixture: ^Chat_Test, workspace: string
 	fixture.chat.provider_id = chat_clone_string("test-provider", context.allocator) or_else ""
 	fixture.chat.model_id = chat_clone_string("test-model", context.allocator) or_else ""
 	fixture.chat.skill_instructions = test_skill_instructions(&fixture.chat)
-	// Kept outputs go under the fixture's own directory, never the user's state directory.
+	// Kept outputs go under the fixture's own directory, never the user's cache directory.
 	delete(fixture.chat.tool_output_directory, context.allocator)
 	tool_output_directory, join_error := os.join_path({directory, "tool-output"}, context.allocator)
 	if join_error != nil { testing.fail_now(test, "the tool output directory could not be allocated") }

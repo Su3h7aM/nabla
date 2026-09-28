@@ -667,7 +667,8 @@ acp_stored_session :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, session
 	}
 	// The worker owns the running journal, so the reader asks through a read-only one of its own.
 	store: journal.Journal
-	if open_error := journal.open(&store, server.app.setup.journal_directory, server.app.setup.run, .Read_Only, context.temp_allocator); open_error != nil {
+	if open_error := journal.open(&store, server.app.setup.journal_directory, "", server.app.setup.run, .Read_Only, context.temp_allocator);
+	   open_error != nil {
 		if journal.error_is(open_error, .Not_Found) {
 			acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("no session named %s", session_id))
 			return nil, false

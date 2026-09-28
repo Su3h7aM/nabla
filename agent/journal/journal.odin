@@ -14,10 +14,6 @@ import "nabla:db/sqlite"
 
 DATABASE_NAME :: "journal.db"
 
-// LOCK_DIRECTORY holds one lock file per claimed session. The files are never
-// deleted: replacing a locked inode would let two processes hold one claim.
-LOCK_DIRECTORY :: "locks"
-
 // BUSY_TIMEOUT_MS is how long a commit waits for another process's write lock.
 BUSY_TIMEOUT_MS :: 5_000
 
@@ -105,6 +101,9 @@ Journal :: struct {
 	connection: db.Conn,
 	allocator:  mem.Allocator,
 	directory:  string, // owned
+	// locks holds one lock file per claimed session, owned. The files are never
+	// deleted: replacing a locked inode would let two processes hold one claim.
+	locks:      string,
 	run:        Run_Id,
 	open:       bool,
 	read_only:  bool,
@@ -126,13 +125,16 @@ Journal :: struct {
 }
 
 // open opens the journal in directory, creating it private to the user and
-// migrating its schema when writable. A read-only journal creates, migrates, and
-// writes nothing, and refuses a database at another version.
+// migrating its schema when writable. A writable journal takes its claims on lock
+// files in locks, created private to the user when a claim needs it. A read-only
+// journal ignores locks, creates, migrates, and writes nothing, and refuses a
+// database at another version.
 @(require_results)
-open :: proc(journal: ^Journal, directory: string, run: Run_Id, mode: Open_Mode, allocator := context.allocator) -> (error: Error) {
+open :: proc(journal: ^Journal, directory, locks: string, run: Run_Id, mode: Open_Mode, allocator := context.allocator) -> (error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	assert(!journal.open, "the journal is already open")
 	assert(run != {}, "a journal writes for a run")
+	assert(mode == .Read_Only || locks != "", "a writable journal claims sessions on lock files")
 	journal^ = {
 		allocator = allocator,
 		run       = run,
@@ -144,6 +146,7 @@ open :: proc(journal: ^Journal, directory: string, run: Run_Id, mode: Open_Mode,
 	defer if error != nil { _ = close(journal) }
 
 	journal.directory = strings.clone(directory, allocator) or_return
+	if mode == .Read_Write { journal.locks = strings.clone(locks, allocator) or_return }
 	path := filepath.join({directory, DATABASE_NAME}, context.temp_allocator) or_return
 	if mode == .Read_Write {
 		make_private_directory(directory) or_return
@@ -185,6 +188,7 @@ close :: proc(journal: ^Journal) -> Error {
 	delete(journal.pending)
 	virtual.arena_destroy(&journal.batch)
 	delete(journal.directory, journal.allocator)
+	delete(journal.locks, journal.allocator)
 	journal^ = {}
 	if release_error != nil { return release_error }
 	return close_error
@@ -297,17 +301,21 @@ enable_write_ahead_log :: proc(journal: ^Journal) -> (error: Error) {
 }
 
 // take_claim flocks the session's lock file, which the kernel releases when the
-// process dies.
+// process dies. The file is pinned against periodic clean-up of its directory.
 @(private, require_results)
 take_claim :: proc(journal: ^Journal, session: Session_Id) -> Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	directory := filepath.join({journal.directory, LOCK_DIRECTORY}, context.temp_allocator) or_return
-	make_private_directory(directory) or_return
+	make_private_directory(journal.locks) or_return
 	hex_text: [SESSION_ID_HEX_LENGTH]u8
 	name := fmt.tprintf("%s.lock", session_id_to_hex(session, hex_text[:]))
-	path := filepath.join({directory, name}, context.temp_allocator) or_return
+	path := filepath.join({journal.locks, name}, context.temp_allocator) or_return
 
 	file := os.open(path, {.Read, .Write, .Create}, PRIVATE_FILE_PERMISSIONS) or_return
+	if pin_error := claim_file_pin(file); pin_error != nil {
+		// The file is abandoned; the pin failure is what the caller needs.
+		_ = os.close(file)
+		return pin_error
+	}
 	held_elsewhere, lock_error := claim_lock_take(file)
 	if lock_error != nil || held_elsewhere {
 		// The file is abandoned; the lock outcome is what the caller needs.

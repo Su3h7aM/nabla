@@ -27,6 +27,7 @@ Run_Setup :: struct {
 	// is replaced only together with the chat.
 	store:             ^journal.Journal,
 	journal_directory: string, // owned
+	lock_directory:    string, // owned; where the journal takes session claims
 	run:               journal.Run_Id,
 	// log_binding is what context.logger points at while the run logs; its ring is
 	// owned, nil while diagnostics are off.
@@ -260,6 +261,15 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 		return false
 	}
 	setup.journal_directory = directory
+	locks, replaced, locks_error := agent.session_lock_directory(setup.alloc)
+	if locks_error != .None {
+		fmt.wprintln(stderr, "nabla: cannot resolve the directory for session locks")
+		return false
+	}
+	if replaced {
+		fmt.wprintf(stderr, "nabla: warning: XDG_RUNTIME_DIR is not an absolute path; session locks are kept in %s\n", locks)
+	}
+	setup.lock_directory = locks
 	setup.run = journal.run_id_create()
 
 	opened, message, ok := session_open(setup, start, workspace)
@@ -422,7 +432,7 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 @(require_results)
 session_store_open :: proc(setup: ^Run_Setup) -> (store: ^journal.Journal, error: journal.Error) {
 	store = new(journal.Journal, setup.alloc) or_return
-	if open_error := journal.open(store, setup.journal_directory, setup.run, .Read_Write, setup.alloc); open_error != nil {
+	if open_error := journal.open(store, setup.journal_directory, setup.lock_directory, setup.run, .Read_Write, setup.alloc); open_error != nil {
 		free(store, setup.alloc)
 		return nil, open_error
 	}

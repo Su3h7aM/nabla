@@ -47,8 +47,9 @@ app_session_begin :: proc(t: ^testing.T, app: ^App) -> string {
 
 	app.setup.store = new(journal.Journal)
 	app.setup.journal_directory = strings.clone(directory, app.setup.alloc)
+	app.setup.lock_directory = strings.clone(directory, app.setup.alloc)
 	app.setup.run = journal.run_id_create()
-	if open_error := journal.open(app.setup.store, directory, app.setup.run, .Read_Write, app.setup.alloc); open_error != nil {
+	if open_error := journal.open(app.setup.store, directory, directory, app.setup.run, .Read_Write, app.setup.alloc); open_error != nil {
 		testing.fail_now(t, "journal.open failed")
 	}
 	id, create_error := journal.create_session(app.setup.store, {workspace = workspace, role = .Main})
@@ -93,6 +94,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 	delete(app.setup.model_id, app.setup.alloc)
 	delete(app.setup.credential, app.setup.alloc)
 	delete(app.setup.journal_directory, app.setup.alloc)
+	delete(app.setup.lock_directory, app.setup.alloc)
 	_ = os.remove_all(directory)
 	delete(directory, context.allocator)
 }
@@ -108,6 +110,7 @@ attach_setup_destroy :: proc(setup: ^Run_Setup) {
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
 	delete(setup.journal_directory, setup.alloc)
+	delete(setup.lock_directory, setup.alloc)
 	setup^ = {}
 }
 
@@ -278,7 +281,7 @@ App_Test_Session_Options :: struct {
 
 app_session_add :: proc(test: ^testing.T, setup: ^Run_Setup, options: App_Test_Session_Options, _: i64) -> journal.Session_Id {
 	store := new(journal.Journal, setup.alloc)
-	if open_error := journal.open(store, setup.journal_directory, journal.run_id_create(), .Read_Write, setup.alloc); open_error != nil {
+	if open_error := journal.open(store, setup.journal_directory, setup.lock_directory, journal.run_id_create(), .Read_Write, setup.alloc); open_error != nil {
 		free(store, setup.alloc)
 		testing.fail_now(test, "could not open a session journal")
 	}
@@ -368,16 +371,18 @@ app_test_catalog :: proc(allocator: mem.Allocator) -> agent.Catalog {
 	return catalog
 }
 
-// app_state_isolate points the state directory at a temporary directory, so a
-// test that persists a selection or opens the session database cannot touch the
-// user's own state. It returns the previous value, which app_state_restore puts
-// back. The variable is process-wide, so tests using this helper run isolated
-// in a child of the test binary (see isolate_test.odin).
+// app_state_isolate points the state and runtime directories at a temporary
+// directory, so a test that persists a selection, opens the session database, or
+// claims a session cannot touch the user's own files. It returns the previous
+// state value, which app_state_restore puts back. The variables are process-wide,
+// so tests using this helper run isolated in a child of the test binary (see
+// isolate_test.odin), which is also why the runtime value is not restored.
 app_state_isolate :: proc(t: ^testing.T) -> (state: string, previous: string, had_previous: bool) {
 	directory, directory_err := os.make_directory_temp("", "nabla-app-state-*", context.allocator)
 	if directory_err != nil { testing.fail_now(t, "could not create a temporary state directory") }
 	previous, had_previous = os.lookup_env("XDG_STATE_HOME", context.allocator)
 	if os.set_env("XDG_STATE_HOME", directory) != nil { testing.fail_now(t, "could not set the state root") }
+	if os.set_env("XDG_RUNTIME_DIR", directory) != nil { testing.fail_now(t, "could not set the runtime root") }
 	return directory, previous, had_previous
 }
 
@@ -628,7 +633,7 @@ test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 	// A second store claiming the target is what a second process running it
 	// looks like from here.
 	other: journal.Journal
-	if open_error := journal.open(&other, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	if open_error := journal.open(&other, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
 	   open_error != nil { testing.fail_now(t, "second journal could not open") }
 	defer _ = journal.close(&other)
 	if _, claim_error := journal.claim(&other, id); claim_error != nil { testing.fail_now(t, "the second journal could not claim the target") }
@@ -645,7 +650,7 @@ test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 	// process still cannot take it. A third store holds no claim of its own, so
 	// its refusal can only come from the running session being locked.
 	prober: journal.Journal
-	if open_error := journal.open(&prober, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	if open_error := journal.open(&prober, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
 	   open_error != nil { testing.fail_now(t, "third journal could not open") }
 	defer _ = journal.close(&prober)
 	_, running_claim_error := journal.claim(&prober, running)
