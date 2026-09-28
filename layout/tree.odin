@@ -3,7 +3,7 @@ package layout
 import "base:runtime"
 import "core:math"
 
-@(private)
+@(private, require_results)
 _scalar_is_finite :: proc "contextless" (value: Scalar) -> bool {
 	return !math.is_nan(value) && !math.is_inf(value)
 }

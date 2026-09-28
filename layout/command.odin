@@ -77,7 +77,7 @@ _normalize_border_width :: proc "contextless" (width: Edges, size: Vec2) -> Edge
 	}
 }
 
-@(private)
+@(private, require_results)
 _border_has_width :: proc "contextless" (width: Edges) -> bool {
 	return width.left > 0 || width.top > 0 || width.right > 0 || width.bottom > 0
 }
@@ -89,7 +89,7 @@ Both corners are derived first, then ordered and clamped, so a flipped or
 out-of-range authored rectangle becomes the region it overlaps rather than a
 negative size. A zero-area result is an empty source and emits no command.
 */
-@(private)
+@(private, require_results)
 _normalize_image_source :: proc "contextless" (source: Image_Source) -> (Image_Source, bool) {
 	if source.mode == .Whole {
 		return Image_Source{mode = .Whole}, true
@@ -119,7 +119,7 @@ _normalize_image_source :: proc "contextless" (source: Image_Source) -> (Image_S
 	return result, true
 }
 
-@(private)
+@(private, require_results)
 _command_visible :: proc(state: ^_Context_State, bounds: Rect, clip: Clip_Handle) -> bool {
 	if state._options.cull == .All {
 		return true
@@ -127,7 +127,7 @@ _command_visible :: proc(state: ^_Context_State, bounds: Rect, clip: Clip_Handle
 	return _rect_intersects(bounds, state._clips[clip].rect)
 }
 
-@(private)
+@(private, require_results)
 _emit_command :: proc(state: ^_Context_State, node: Node_Handle, bounds: Rect, clip: Clip_Handle, data: Command_Data) -> bool {
 	if !_command_visible(state, bounds, clip) {
 		return true
@@ -155,7 +155,7 @@ box: content shares the inner box with any children rather than displacing them.
 Text lines are content too, so they precede structural children for the same
 reason, and each resolved line is its own command.
 */
-@(private)
+@(private, require_results)
 _emit_node_enter :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	input := &state._node_inputs[node]
 	resolved := state._nodes[node]
@@ -227,7 +227,7 @@ tracks scroll on both axes: the main axis follows from the displaced child
 boxes, and the cross axis subtracts the offset this node applied, so a rule
 never detaches from the children it separates.
 */
-@(private)
+@(private, require_results)
 _emit_between_children :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	input := &state._node_inputs[node]
 	thickness := input.desc.paint.border.between_children
@@ -278,7 +278,7 @@ Emit the paint a node contributes after its children.
 A border drawn last covers the edge its descendants may have overdrawn, which
 is why the border phase closes a subtree rather than opening it.
 */
-@(private)
+@(private, require_results)
 _emit_node_exit :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	if !_emit_between_children(state, node) {
 		return false

@@ -230,7 +230,8 @@ test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
 		if tui.element(&ctx, {id = block_id}) {
 			draw_block(&ctx, Block{border = BORDER_SINGLE})
 			if tui.element(&ctx, {id = input_id}) {
-				draw_input(&ctx, &input, {})
+				_, draw_error := draw_input(&ctx, &input, {})
+				testing.expect(t, draw_error == nil)
 			}
 		}
 	}

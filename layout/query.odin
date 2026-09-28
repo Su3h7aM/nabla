@@ -7,7 +7,7 @@ Resolve a clip handle to its entry.
 handle resolves there rather than failing: every chain terminates at the
 viewport and no consumer needs an "unclipped" case.
 */
-@(private)
+@(private, require_results)
 _clip_index :: proc "contextless" (frame_result: Frame_Result, handle: Clip_Handle) -> (int, bool) {
 	index := u64(handle)
 	if index >= u64(len(frame_result.clips)) {
@@ -50,6 +50,7 @@ children :: proc(frame_result: Frame_Result, handle: Node_Handle) -> Child_Itera
 	return Child_Iterator{_result = frame_result, _next = parent.first_child}
 }
 
+@(require_results)
 next_child :: proc(iterator: ^Child_Iterator) -> (child: Resolved_Node, handle: Node_Handle, ok: bool) {
 	handle = iterator._next
 	child, ok = node(iterator._result, handle)
@@ -61,7 +62,7 @@ next_child :: proc(iterator: ^Child_Iterator) -> (child: Resolved_Node, handle: 
 	return child, handle, true
 }
 
-@(private)
+@(private, require_results)
 _point_in_rect :: proc "contextless" (rect: Rect, point: Vec2) -> bool {
 	return(
 		rect.size.x > 0 &&
@@ -80,7 +81,7 @@ Padding is part of an element's interactive surface, so eligibility uses the
 border box. The effective clip is already an intersected world rectangle, so a
 node hidden by any clipping ancestor is rejected by one test.
 */
-@(private)
+@(private, require_results)
 _hit_eligible_node :: proc(frame_result: Frame_Result, handle: Node_Handle, point: Vec2) -> (Resolved_Node, bool) {
 	candidate, found := node(frame_result, handle)
 	if !found || !candidate.flags.hit_testable {
@@ -92,7 +93,7 @@ _hit_eligible_node :: proc(frame_result: Frame_Result, handle: Node_Handle, poin
 	return candidate, true
 }
 
-@(private)
+@(private, require_results)
 _hit_eligible :: proc(frame_result: Frame_Result, handle: Node_Handle, point: Vec2) -> bool {
 	_, eligible := _hit_eligible_node(frame_result, handle, point)
 	return eligible
@@ -125,6 +126,7 @@ The returned `complete` flag is false only when an eligible hit did not fit in
 `out`. The scan continues after a full output buffer so callers can distinguish
 an exact result from a truncated prefix without guessing a larger buffer.
 */
+@(require_results)
 hit_stack :: proc(frame_result: Frame_Result, point: Vec2, out: []Node_Handle) -> (hits: []Node_Handle, complete: bool) {
 	count := 0
 	for handle in frame_result.hit_order {
@@ -155,6 +157,7 @@ basis for event bubbling.
 path is walked to completion even after `out` fills, so `complete` reports
 whether the returned prefix contains the whole ancestry.
 */
+@(require_results)
 ancestor_path :: proc(frame_result: Frame_Result, target: Node_Handle, out: []Node_Handle) -> (path: []Node_Handle, complete: bool, found: bool) {
 	count := 0
 	complete = true
@@ -206,6 +209,7 @@ visible_commands :: proc(frame_result: Frame_Result, viewport: Rect) -> Command_
 	return Command_Iterator{_result = frame_result, _viewport = viewport}
 }
 
+@(require_results)
 next_command :: proc(iterator: ^Command_Iterator) -> (command: Render_Command, index: int, ok: bool) {
 	for iterator._next < len(iterator._result.commands) {
 		index = iterator._next

@@ -85,7 +85,7 @@ id_local :: proc(ctx: ^Context, label: string, index: u64 = 0) -> Id {
 	return result
 }
 
-@(private)
+@(private, require_results)
 _id_table_probe :: proc(state: ^_Context_State, identifier: Id) -> (slot: int, found: bool, available: bool) {
 	capacity := len(state._id_table)
 	if capacity == 0 || identifier == 0 {

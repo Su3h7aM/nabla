@@ -59,7 +59,7 @@ individual words without copying. Results are sanitized exactly like custom
 measurements: non-finite or negative components become zero and record a
 `Measure_Failed` diagnostic.
 */
-@(private)
+@(private, require_results)
 _measure_text_run :: proc(state: ^_Context_State, node: Node_Handle, text: string, request: Measure_Request) -> (Measure_Result, bool) {
 	measurer := state._services.measure_text
 	if measurer == nil {

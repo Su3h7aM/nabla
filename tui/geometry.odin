@@ -38,6 +38,7 @@ cols :: proc(area: Cell_Rect, widths: []int, out: []Cell_Rect) -> bool {
 	return _split(area, widths, out, false)
 }
 
+@(require_results)
 _split :: proc(area: Cell_Rect, sizes: []int, out: []Cell_Rect, vertical: bool) -> bool {
 	if len(out) < len(sizes) || area.width < 0 || area.height < 0 {
 		return false

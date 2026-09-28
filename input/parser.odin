@@ -52,6 +52,7 @@ parser_destroy :: proc(parser: ^Parser) {
 // leaves the parser in the Escape state without emitting; the acquisition
 // layer resolves it via parser_escape_pending/parser_resolve_escape after its
 // deadline.
+@(require_results)
 feed :: proc(parser: ^Parser, data: []byte, events: ^[dynamic]Event, allocator := context.allocator) -> (err: Error) {
 	for i := 0; i < len(data); {
 		consumed: int
@@ -79,12 +80,14 @@ feed :: proc(parser: ^Parser, data: []byte, events: ^[dynamic]Event, allocator :
 
 // parser_escape_pending reports whether the parser is awaiting the byte after
 // a lone ESC.
+@(require_results)
 parser_escape_pending :: proc(parser: ^Parser) -> bool {
 	return parser.state == .Escape
 }
 
 // parser_resolve_escape emits an Escape for a lone ESC whose deadline
 // expired, then returns to Ground.
+@(require_results)
 parser_resolve_escape :: proc(parser: ^Parser, events: ^[dynamic]Event, allocator := context.allocator) -> (err: Error) {
 	if parser.state != .Escape {
 		return nil
@@ -101,6 +104,7 @@ parser_reset :: proc(parser: ^Parser) {
 	parser.intermediate = 0
 }
 
+@(require_results)
 parser_emit :: proc(parser: ^Parser, events: ^[dynamic]Event, event: Event, allocator: runtime.Allocator) -> Error {
 	previous := context.allocator
 	context.allocator = allocator
@@ -109,6 +113,7 @@ parser_emit :: proc(parser: ^Parser, events: ^[dynamic]Event, event: Event, allo
 	return err
 }
 
+@(require_results)
 parser_ground :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> (consumed: int, err: Error) {
 	switch {
 	case input_byte == 0x1b:
@@ -146,6 +151,7 @@ parser_ground :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 	return 1, err
 }
 
+@(require_results)
 parser_utf8 :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> (consumed: int, err: Error) {
 	if input_byte >= 0x80 && input_byte <= 0xbf {
 		parser.utf8_pending = (parser.utf8_pending << 6) | u32(input_byte & 0x3f)
@@ -169,6 +175,7 @@ parser_utf8 :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, al
 	return 0, nil
 }
 
+@(require_results)
 parser_escape :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> (consumed: int, err: Error) {
 	switch input_byte {
 	case 0x1b:
@@ -198,6 +205,7 @@ parser_escape :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 	}
 }
 
+@(require_results)
 parser_sequence :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> (consumed: int, err: Error) {
 	if input_byte >= 0x30 && input_byte <= 0x3f {
 		if parser.param_count < len(parser.params) {
@@ -238,6 +246,7 @@ parser_sequence :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event
 	return 1, parser_emit(parser, events, Unknown_Input{}, allocator)
 }
 
+@(require_results)
 parser_sequence_final :: proc(parser: ^Parser, state: Parser_State, final: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> Error {
 	// An SGR mouse report is CSI < Cb ; Cx ; Cy M/m: the leading '<' rides in
 	// the parameter bytes and 'M' (press/motion) and 'm' (release) finalize it.
@@ -381,6 +390,7 @@ parser_key_modifiers :: proc(parser: ^Parser, field: int) -> Key_Modifiers {
 // parser_mouse_fields splits the parameter bytes of an SGR mouse report (after
 // the leading '<') into the protocol's three decimal fields. A field that is
 // empty, non-numeric, or beyond three reports failure.
+@(require_results)
 parser_mouse_fields :: proc(parser: ^Parser) -> (control_byte, x, y: int, ok: bool) {
 	field := 0
 	value := 0
@@ -424,6 +434,7 @@ parser_mouse_fields :: proc(parser: ^Parser) -> (control_byte, x, y: int, ok: bo
 // report outside the 1002 vocabulary (button 3, hover reports from tracking
 // modes this parser never enables) is malformed here and becomes
 // Unknown_Input; wheel reports never release.
+@(require_results)
 parser_mouse_event :: proc(parser: ^Parser, final: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> Error {
 	control_byte, x, y, ok := parser_mouse_fields(parser)
 	if !ok || x <= 0 || y <= 0 {
@@ -448,6 +459,7 @@ parser_mouse_event :: proc(parser: ^Parser, final: u8, events: ^[dynamic]Event, 
 
 // parser_osc discards string content (OSC/DCS/APC/PM/SOS) until BEL or an
 // ESC terminator; the content is intentionally dropped, not surfaced.
+@(require_results)
 parser_osc :: proc(parser: ^Parser, input_byte: u8) -> (consumed: int, err: Error) {
 	if input_byte == 0x07 || input_byte == 0x1b {
 		parser_reset(parser)
@@ -464,6 +476,7 @@ parser_osc :: proc(parser: ^Parser, input_byte: u8) -> (consumed: int, err: Erro
 // The scratch grows to hold the paste, so a paste of any size is delivered
 // whole. A paste whose closing marker never arrives stays in the scratch and is
 // dropped with the parser on parser_destroy.
+@(require_results)
 parser_paste :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> (consumed: int, err: Error) {
 	if _, append_err := append(&parser.paste, input_byte); append_err != nil {
 		return 1, append_err

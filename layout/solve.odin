@@ -236,7 +236,7 @@ _shrink_floor :: proc(state: ^_Context_State, child: Node_Handle, axis: Axis, st
 	return math.min(floor, style.max)
 }
 
-@(private)
+@(private, require_results)
 _is_shrink_candidate :: proc "contextless" (input: ^_Node_Input, axis: Axis, style: Axis_Size) -> bool {
 	// Unwrappable text cannot compress: it overflows instead.
 	if input.is_text && input.text_style.wrap == .None {
@@ -675,7 +675,7 @@ _reflow_at_width :: proc(state: ^_Context_State) {
 	}
 }
 
-@(private)
+@(private, require_results)
 _remeasure_custom_content_at_height :: proc(state: ^_Context_State) -> bool {
 	changed := false
 	for node_index in 1 ..< len(state._node_inputs) {
@@ -700,7 +700,7 @@ _remeasure_custom_content_at_height :: proc(state: ^_Context_State) -> bool {
 	return changed
 }
 
-@(private)
+@(private, require_results)
 _derive_aspect_axis :: proc(state: ^_Context_State, node: Node_Handle, source, target: Axis) -> bool {
 	input := &state._node_inputs[node]
 	style := _axis_size(&input.desc.layout.sizing, target)^
@@ -719,7 +719,7 @@ _derive_aspect_axis :: proc(state: ^_Context_State, node: Node_Handle, source, t
 	return changed
 }
 
-@(private)
+@(private, require_results)
 _derive_aspect_heights :: proc(state: ^_Context_State) -> bool {
 	changed := false
 	for node_index in 1 ..< len(state._node_inputs) {
@@ -735,7 +735,7 @@ _derive_aspect_heights :: proc(state: ^_Context_State) -> bool {
 	return changed
 }
 
-@(private)
+@(private, require_results)
 _derive_aspect_widths :: proc(state: ^_Context_State) -> bool {
 	changed := false
 	for node_index in 1 ..< len(state._node_inputs) {
@@ -801,7 +801,7 @@ _justification_spacing :: proc "contextless" (mode: Justify, remaining: Scalar, 
 	return
 }
 
-@(private)
+@(private, require_results)
 _rect_intersects :: proc "contextless" (left, right: Rect) -> bool {
 	// A clip or viewport with no area shows nothing.
 	if right.size.x <= 0 || right.size.y <= 0 {
@@ -829,7 +829,7 @@ _rect_intersects :: proc "contextless" (left, right: Rect) -> bool {
 	return x_ok && y_ok
 }
 
-@(private)
+@(private, require_results)
 _rect_contains :: proc "contextless" (outer, inner: Rect) -> bool {
 	return(
 		inner.position.x >= outer.position.x &&

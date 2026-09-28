@@ -10,26 +10,32 @@ import "core:os"
 // target and fails explicitly instead of vanishing at compile time.
 Session_Impl :: struct {}
 
+@(require_results)
 _session_open :: proc(session: ^Session, options: Options) -> Error {
 	return General_Error.Unsupported
 }
 
+@(require_results)
 _session_close :: proc(session: ^Session) -> Error {
 	return General_Error.Unsupported
 }
 
+@(require_results)
 _session_file :: proc(session: ^Session) -> (file: ^os.File, err: Error) {
 	return nil, General_Error.Unsupported
 }
 
+@(require_results)
 _session_viewport :: proc(session: ^Session) -> (result: Viewport, err: Error) {
 	return {}, General_Error.Unsupported
 }
 
+@(require_results)
 _session_present :: proc(session: ^Session, bytes: []byte) -> (committed: int, err: Error) {
 	return 0, General_Error.Unsupported
 }
 
+@(require_results)
 _session_clipboard :: proc(session: ^Session, bytes: []byte) -> (committed: int, err: Error) {
 	return 0, General_Error.Unsupported
 }

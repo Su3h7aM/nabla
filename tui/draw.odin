@@ -189,6 +189,7 @@ _draw_text_clipped :: proc(
 
 // _write_cluster writes one cluster and resets every cell it overwrites,
 // including any wide-cluster partner, so no orphaned half survives.
+@(require_results)
 _write_cluster :: proc(buffer: ^term.Frame_Buffer, x, y: int, grapheme: string, style: term.Style, width: int) -> bool {
 	if x < 0 || x >= buffer.columns {
 		return false
@@ -237,6 +238,7 @@ _clear_cluster :: proc(buffer: ^term.Frame_Buffer, x, row: int, style: term.Styl
 }
 
 // _grid_valid reports whether the cell slice can hold the grid.
+@(require_results)
 _grid_valid :: proc "contextless" (buffer: term.Frame_Buffer) -> bool {
 	if buffer.columns < 0 || buffer.rows < 0 {
 		return false

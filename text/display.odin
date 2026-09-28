@@ -38,6 +38,7 @@ display_iterator_make :: proc(value: string, profile: Width_Profile = DEFAULT_WI
 
 // display_next returns the next drawable cluster and advances the running
 // column. A tab yields one space per cell, so callers only see widths 1 and 2.
+@(require_results)
 display_next :: proc(iterator: ^Display_Iterator) -> (cluster: Display_Cluster, status: Display_Status) {
 	if iterator.spaces > 0 {
 		iterator.spaces -= 1
@@ -121,6 +122,7 @@ cluster_width :: proc(grapheme: string, profile: Width_Profile = DEFAULT_WIDTH_P
 
 // _has_emoji_presentation reports whether the cluster contains VARIATION
 // SELECTOR-16. U+FE0E requests text presentation and does not widen.
+@(require_results)
 _has_emoji_presentation :: proc(value: string) -> bool {
 	for i := 0; i < len(value); {
 		code_point, size := utf8.decode_rune(value[i:])

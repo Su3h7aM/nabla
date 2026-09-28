@@ -77,7 +77,7 @@ Context :: struct {
 // frame opens a terminal render scope over a completed layout frame. The
 // viewport initializes the cell grid, and the block closes with a complete
 // Frame available from result.
-@(deferred_in_out = _frame_leave)
+@(deferred_in_out = _frame_leave, require_results)
 frame :: proc(
 	ctx: ^Context,
 	#by_ptr frame_result: layout.Frame_Result,
@@ -159,7 +159,7 @@ _frame_leave :: proc(
 
 // element enters the resolved outer or inner box for id. Lexical nesting must
 // match the layout tree, so a child cannot be rendered outside its parent.
-@(deferred_in_out = _element_leave)
+@(deferred_in_out = _element_leave, require_results)
 element :: proc(ctx: ^Context, desc: Element_Desc, loc := #caller_location) -> bool {
 	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return false
@@ -174,12 +174,12 @@ element :: proc(ctx: ^Context, desc: Element_Desc, loc := #caller_location) -> b
 
 // element_node is the handle-based form used while iterating a Frame_Result.
 // It has the same lexical nesting and clipping contract as element.
-@(deferred_in_out = _element_node_leave)
+@(deferred_in_out = _element_node_leave, require_results)
 element_node :: proc(ctx: ^Context, desc: Element_Node_Desc, loc := #caller_location) -> bool {
 	return _element_enter(ctx, desc.node, desc.box, loc)
 }
 
-@(private)
+@(private, require_results)
 _element_enter :: proc(ctx: ^Context, handle: layout.Node_Handle, box: Box, loc: runtime.Source_Code_Location) -> bool {
 	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return false
@@ -212,7 +212,7 @@ _element_enter :: proc(ctx: ^Context, handle: layout.Node_Handle, box: Box, loc:
 }
 
 // _scope_of projects a resolved node's boxes and clip to cells.
-@(private)
+@(private, require_results)
 _scope_of :: proc(result: layout.Frame_Result, handle: layout.Node_Handle, resolved: layout.Resolved_Node, box: Box) -> (_Scope, Frame_Error) {
 	outer, outer_error := project_rect_integral(resolved.outer)
 	inner, inner_error := project_rect_integral(resolved.inner)
@@ -233,7 +233,7 @@ _set_inner :: proc(ctx: ^Context, depth: int, inner: bool) {
 	}
 }
 
-@(private)
+@(private, require_results)
 _is_inner :: proc(ctx: ^Context, depth: int) -> bool {
 	return ctx._inner[depth / 8] & (u8(1) << uint(depth % 8)) != 0
 }
@@ -283,6 +283,7 @@ _element_node_leave :: proc(ctx: ^Context, desc: Element_Node_Desc, loc: runtime
 }
 
 // current_node returns the active layout node. The frame root is handle zero.
+@(require_results)
 current_node :: proc(ctx: ^Context) -> (layout.Node_Handle, bool) #optional_ok {
 	if ctx == nil || !ctx._frame_open {
 		return 0, false
@@ -291,6 +292,7 @@ current_node :: proc(ctx: ^Context) -> (layout.Node_Handle, bool) #optional_ok {
 }
 
 // bounds returns the active scope's selected box.
+@(require_results)
 bounds :: proc(ctx: ^Context) -> (Cell_Rect, bool) #optional_ok {
 	if ctx == nil || !ctx._frame_open {
 		return {}, false
@@ -299,6 +301,7 @@ bounds :: proc(ctx: ^Context) -> (Cell_Rect, bool) #optional_ok {
 }
 
 // width_profile returns the width policy bound to the active frame.
+@(require_results)
 width_profile :: proc(ctx: ^Context) -> (width_text.Width_Profile, bool) #optional_ok {
 	if ctx == nil || !ctx._frame_open {
 		return {}, false
@@ -307,6 +310,7 @@ width_profile :: proc(ctx: ^Context) -> (width_text.Width_Profile, bool) #option
 }
 
 // boxes returns the active element's outer and inner boxes.
+@(require_results)
 boxes :: proc(ctx: ^Context) -> (outer, inner: Cell_Rect, ok: bool) {
 	if ctx == nil || !ctx._frame_open {
 		return {}, {}, false
@@ -329,6 +333,7 @@ result :: proc(ctx: ^Context) -> (Frame, Frame_Error) {
 }
 
 // set_cursor sets the terminal cursor intent for the current frame.
+@(require_results)
 set_cursor :: proc(ctx: ^Context, cursor: term.Cursor) -> bool {
 	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return false
@@ -341,6 +346,7 @@ set_cursor :: proc(ctx: ^Context, cursor: term.Cursor) -> bool {
 	return true
 }
 
+@(require_results)
 put_context :: proc(ctx: ^Context, x, y: int, grapheme: string, style: term.Style) -> bool {
 	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return false
@@ -351,6 +357,7 @@ put_context :: proc(ctx: ^Context, x, y: int, grapheme: string, style: term.Styl
 
 // put_at writes one grapheme at an absolute cell coordinate, clipped to the
 // active scope.
+@(require_results)
 put_at :: proc(ctx: ^Context, x, y: int, grapheme: string, style: term.Style) -> bool {
 	if ctx == nil || !ctx._frame_open || ctx._error != .None {
 		return false

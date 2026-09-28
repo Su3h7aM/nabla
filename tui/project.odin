@@ -18,6 +18,7 @@ Projection_Error :: enum u8 {
 
 // project_rect_integral converts a layout.Rect to cells. It fails when a
 // coordinate is not integral or an extent is negative.
+@(require_results)
 project_rect_integral :: proc "contextless" (rect: layout.Rect) -> (result: Cell_Rect, err: Projection_Error) {
 	x := int(rect.position[0])
 	y := int(rect.position[1])

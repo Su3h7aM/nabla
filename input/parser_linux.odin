@@ -60,6 +60,7 @@ read_events :: proc(
 	return len(events^) - start, nil
 }
 
+@(require_results)
 input_poll :: proc(fd: posix.FD, timeout: c.int) -> (ready: int, err: Error) {
 	for {
 		poll_descriptor := posix.pollfd {
@@ -80,6 +81,7 @@ input_poll :: proc(fd: posix.FD, timeout: c.int) -> (ready: int, err: Error) {
 // input_drain reads until EAGAIN (the Session sets O_NONBLOCK on the tty
 // descriptor at open), feeding each chunk to the parser. EOF surfaces as an
 // End_Of_Input event; resource failures are errors.
+@(require_results)
 input_drain :: proc(parser: ^Parser, file: ^os.File, events: ^[dynamic]Event, allocator: runtime.Allocator) -> Error {
 	buffer: [256]u8
 	for {

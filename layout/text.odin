@@ -133,7 +133,7 @@ request width is not part of the key: every text measurement is unbounded, and
 the resolved width influences which runs are measured rather than their extent.
 Every remaining field of the normative key changes the measured result.
 */
-@(private)
+@(private, require_results)
 _measure_cache_key :: proc(state: ^_Context_State, node: Node_Handle, text: string, request: Measure_Request) -> (key: u64, cacheable: bool) {
 	if cap(state._measure_cache) == 0 {
 		return 0, false
@@ -165,7 +165,7 @@ within the node's text has no stable identity relative to it and is reported as
 not cacheable, which keeps the key sound if a future caller measures a string
 from elsewhere.
 */
-@(private)
+@(private, require_results)
 _run_offset_in :: proc "contextless" (text, run: string) -> (offset: int, within: bool) {
 	if len(run) > len(text) {
 		return 0, false
@@ -185,7 +185,7 @@ _run_offset_in :: proc "contextless" (text, run: string) -> (offset: int, within
 @(private)
 MEASURE_CACHE_PROBE_LIMIT :: 8
 
-@(private)
+@(private, require_results)
 _measure_cache_lookup :: proc(state: ^_Context_State, key: u64) -> (Measure_Result, bool) {
 	capacity := cap(state._measure_cache)
 	if capacity == 0 {
@@ -413,7 +413,7 @@ _measure_text_intrinsic :: proc(state: ^_Context_State, node: Node_Handle) -> Me
 	}
 }
 
-@(private)
+@(private, require_results)
 _append_text_line :: proc(state: ^_Context_State, node: Node_Handle, line: string, line_index: int) -> (Vec2, bool) {
 	measured := _measure_text_run_cached(state, node, line, _unbounded_request())
 	size := Vec2{measured.size.x, state._node_inputs[node].line_height}
@@ -443,7 +443,7 @@ fit starts a new line, and a word too wide for an empty line occupies that line
 alone and overflows. `Wrap.Newlines` and `Wrap.None` never break inside a hard
 segment.
 */
-@(private)
+@(private, require_results)
 _wrap_text_node :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	input := &state._node_inputs[node]
 	input.text_line_start = len(state._text_lines)
@@ -590,7 +590,7 @@ records and one line measurement per emitted line. Line breaking is identical
 to the measuring path: greedy packing, a word too wide for an empty line
 occupies that line alone, and a hard segment always occupies at least one line.
 */
-@(private)
+@(private, require_results)
 _wrap_text_node_from_records :: proc(state: ^_Context_State, node: Node_Handle, available: f64) -> bool {
 	input := &state._node_inputs[node]
 	words := state._measured_words[input.word_start:input.word_start + input.word_count]
@@ -686,7 +686,7 @@ _wrap_text_node_from_records :: proc(state: ^_Context_State, node: Node_Handle, 
 	return true
 }
 
-@(private)
+@(private, require_results)
 _wrap_text_nodes :: proc(state: ^_Context_State) -> bool {
 	changed := false
 	clear(&state._text_lines)

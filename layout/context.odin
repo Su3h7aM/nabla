@@ -247,7 +247,7 @@ storage_alignment :: proc "contextless" () -> int {
 	return STORAGE_ALIGNMENT
 }
 
-@(private)
+@(private, require_results)
 _checked_add_int :: proc "contextless" (left, right: int) -> (int, bool) {
 	if left < 0 || right < 0 || left > max(int) - right {
 		return 0, false
@@ -255,7 +255,7 @@ _checked_add_int :: proc "contextless" (left, right: int) -> (int, bool) {
 	return left + right, true
 }
 
-@(private)
+@(private, require_results)
 _checked_mul_int :: proc "contextless" (left, right: int) -> (int, bool) {
 	if left < 0 || right < 0 {
 		return 0, false
@@ -266,7 +266,7 @@ _checked_mul_int :: proc "contextless" (left, right: int) -> (int, bool) {
 	return left * right, true
 }
 
-@(private)
+@(private, require_results)
 _align_offset :: proc "contextless" (offset, alignment: int) -> (int, bool) {
 	if offset < 0 || alignment <= 0 || alignment & (alignment - 1) != 0 {
 		return 0, false
@@ -276,7 +276,7 @@ _align_offset :: proc "contextless" (offset, alignment: int) -> (int, bool) {
 	return _checked_add_int(offset, padding)
 }
 
-@(private)
+@(private, require_results)
 _partition_take_bytes :: proc "contextless" (partition: ^_Storage_Partition, count: int, element_size: int, element_alignment: int) -> ([]byte, bool) {
 	start, ok := _align_offset(partition.offset, element_alignment)
 	if !ok {
@@ -299,7 +299,7 @@ _partition_take_bytes :: proc "contextless" (partition: ^_Storage_Partition, cou
 	return ([^]byte)(partition.base + uintptr(start))[:byte_count], true
 }
 
-@(private)
+@(private, require_results)
 _partition_take_slice :: proc "contextless" (partition: ^_Storage_Partition, $T: typeid, count: int) -> ([]T, bool) {
 	region, ok := _partition_take_bytes(partition, count, size_of(T), align_of(T))
 	if !ok {
@@ -311,7 +311,7 @@ _partition_take_slice :: proc "contextless" (partition: ^_Storage_Partition, $T:
 	return ([^]T)(raw_data(region))[:count], true
 }
 
-@(private)
+@(private, require_results)
 _partition_storage :: proc(state: ^_Context_State, partition: ^_Storage_Partition, capacities: Capacities) -> bool {
 	node_inputs, ok := _partition_take_slice(partition, _Node_Input, capacities.nodes)
 	if !ok {
@@ -455,7 +455,7 @@ _partition_storage :: proc(state: ^_Context_State, partition: ^_Storage_Partitio
 	return true
 }
 
-@(private)
+@(private, require_results)
 _storage_payload_size :: proc(capacities: Capacities) -> (int, bool) {
 	partition := _Storage_Partition {
 		limit = max(int),
@@ -479,7 +479,7 @@ storage_size :: proc(capacities: Capacities) -> int {
 	return total_size
 }
 
-@(private)
+@(private, require_results)
 _config_is_valid :: proc(config: Options) -> bool {
 	capacities := config.capacities
 	if capacities.nodes < 1 || capacities.clips < 1 || capacities.depth < 1 || capacities.diagnostics < 1 {
@@ -501,7 +501,7 @@ _config_is_valid :: proc(config: Options) -> bool {
 	return storage_size(capacities) > 0
 }
 
-@(private)
+@(private, require_results)
 _storage_aligned_base :: proc "contextless" (storage: []byte) -> (aligned_base: uintptr, leading_byte_count: int, ok: bool) {
 	if len(storage) == 0 {
 		return
@@ -516,7 +516,7 @@ _storage_aligned_base :: proc "contextless" (storage: []byte) -> (aligned_base: 
 	return aligned_base, int(leading_byte_count_unsigned), true
 }
 
-@(private)
+@(private, require_results)
 _init_with_storage :: proc(ctx: ^Context, config: Options, storage: []byte, allocator: runtime.Allocator, owns_storage: bool) -> Context_Error {
 	payload_size, ok := _storage_payload_size(config.capacities)
 	if !ok {
@@ -705,7 +705,7 @@ reserve :: proc(ctx: ^Context, capacities: Capacities) -> Context_Error {
 	return nil
 }
 
-@(private)
+@(private, require_results)
 _capacities_are_nonnegative :: proc "contextless" (capacities: Capacities) -> bool {
 	return(
 		capacities.nodes >= 0 &&
@@ -815,7 +815,7 @@ _update_high_water :: proc(state: ^_Context_State, pool: Pool_Id, length: int) {
 	}
 }
 
-@(private)
+@(private, require_results)
 _try_append :: proc(array: ^[dynamic]$T, value: T) -> bool {
 	if len(array^) >= cap(array^) {
 		return false
@@ -824,7 +824,7 @@ _try_append :: proc(array: ^[dynamic]$T, value: T) -> bool {
 	return err == nil
 }
 
-@(private)
+@(private, require_results)
 _try_append_diagnostic :: proc(state: ^_Context_State, diagnostic: Diagnostic) -> bool {
 	// Ordinary diagnostics cannot consume the terminal capacity-error slot.
 	if len(state._diagnostics) >= cap(state._diagnostics) - 1 {

@@ -123,6 +123,7 @@ present :: proc(
 // serialized or written: dimensions, logical cell count, width, grapheme
 // safety, and cursor bounds. A zero-sized frame is a deterministic no-op
 // (nil error) unless the cursor intent is invalid.
+@(require_results)
 _validate_frame :: proc(buffer: Frame_Buffer, cursor: Cursor) -> Error {
 	if buffer.columns < 0 || buffer.rows < 0 {
 		return General_Error.Invalid_Frame_Data
@@ -183,6 +184,7 @@ _validate_frame :: proc(buffer: Frame_Buffer, cursor: Cursor) -> Error {
 // non-empty grapheme must be valid UTF-8 and contain no C0 control, DEL, or
 // C1 control code point. ESC is rejected both as a byte and as U+001B, so a
 // cell can never inject terminal control into the output stream.
+@(require_results)
 _grapheme_safe :: proc(grapheme: string) -> bool {
 	if !utf8.valid_string(grapheme) {
 		return false

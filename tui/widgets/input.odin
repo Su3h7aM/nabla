@@ -52,6 +52,7 @@ input_destroy :: proc(input: ^Input) {
 // input_insert inserts value at the cursor. Line breaks are kept, so a pasted
 // block stays a block; every other C0/DEL control is dropped, which reads a CRLF
 // pair as the one break it is. Invalid UTF-8 is refused.
+@(require_results)
 input_insert :: proc(input: ^Input, value: string) -> bool {
 	if !utf8.valid_string(value) {
 		return false
@@ -77,11 +78,13 @@ input_insert :: proc(input: ^Input, value: string) -> bool {
 	return true
 }
 
+@(require_results)
 input_insert_rune :: proc(input: ^Input, value: rune) -> bool {
 	encoded, width := utf8.encode_rune(value)
 	return input_insert(input, string(encoded[:width]))
 }
 
+@(require_results)
 input_insert_newline :: proc(input: ^Input) -> bool {
 	previous_length := len(input.text)
 	if err := resize(&input.text, previous_length + 1); err != nil {
@@ -158,6 +161,7 @@ input_move_end :: proc(input: ^Input) -> bool {
 // On an allocation failure it returns the rows produced so far together with
 // the allocator error. The caller must draw none of them: a short row list is a
 // wrong one, not a shorter view.
+@(require_results)
 input_lines :: proc(
 	input: ^Input,
 	width: int,
@@ -263,6 +267,7 @@ _input_row_offset :: proc(line: Input_Line, column: int, profile: text.Width_Pro
 // draw_input_rect draws the text into rect, wrapping at the rect's width and
 // scrolling the rows to keep the caret visible, and returns the caret for the
 // frame. A failed row list returns the allocator error and draws nothing.
+@(require_results)
 draw_input_rect :: proc(
 	buffer: ^term.Frame_Buffer,
 	rect: tui.Cell_Rect,
@@ -290,6 +295,7 @@ draw_input_rect :: proc(
 // draw_input_context draws into the active layout box, keeps the caret visible,
 // and records the cursor intent on the tui frame. A failed row list returns the
 // allocator error and draws nothing.
+@(require_results)
 draw_input_context :: proc(ctx: ^tui.Context, input: ^Input, style: term.Style) -> (cursor: term.Cursor, err: mem.Allocator_Error) {
 	rect, ok := tui.bounds(ctx)
 	if !ok || rect.width <= 0 || rect.height <= 0 {
@@ -341,6 +347,7 @@ draw_input :: proc {
 	draw_input_context,
 }
 
+@(require_results)
 _input_skip :: proc(byte: u8) -> bool {
 	return byte == '\r' || (byte < 0x20 && byte != '\n') || byte == 0x7f
 }

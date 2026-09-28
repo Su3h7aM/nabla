@@ -20,6 +20,7 @@ wrap_iterator_make :: proc(value: string, width: int, profile: Width_Profile = D
 	return {_rest = value, _width = width, _profile = profile}
 }
 
+@(require_results)
 wrap_next :: proc(iterator: ^Wrap_Iterator) -> (line: string, status: Wrap_Status) {
 	if iterator == nil || iterator._done {
 		return "", .Done

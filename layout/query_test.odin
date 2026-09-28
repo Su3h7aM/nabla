@@ -96,7 +96,7 @@ test_hit_ancestor_and_child_queries :: proc(t: ^testing.T) {
 	iterator := children(frame_result, _handle_of(frame_result, id("background")))
 	expected := [2]Id{id("child"), id("floating")}
 	seen := 0
-	for child in next_child(&iterator) {
+	for child, _ in next_child(&iterator) {
 		testing.expect_value(t, child.id, expected[seen])
 		seen += 1
 	}
@@ -197,7 +197,7 @@ test_result_lifecycle_and_visible_commands :: proc(t: ^testing.T) {
 
 	empty := visible_commands(frame_result, Rect{size = {0, 150}})
 	empty_count := 0
-	for _ in next_command(&empty) {
+	for _, _ in next_command(&empty) {
 		empty_count += 1
 	}
 	testing.expect_value(t, empty_count, 0)

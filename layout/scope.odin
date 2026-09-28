@@ -45,7 +45,7 @@ _discard_unpublished_result :: proc(state: ^_Context_State) {
 // block's body runs only when the frame opened. The frame stays open until the
 // block exits, then resolves and publishes its result. Only one frame may be
 // open at a time, and no frame may be open when `result` is called.
-@(deferred_in_out = _frame_leave)
+@(deferred_in_out = _frame_leave, require_results)
 frame :: proc(ctx: ^Context, viewport: Vec2, loc := #caller_location) -> bool {
 	if ctx == nil || !_context_state(ctx)._initialized {
 		if ctx != nil {
@@ -171,7 +171,7 @@ _complete_node_declaration :: proc(state: ^_Context_State, node: Node_Handle) {
 	_update_high_water(state, .Children, len(state._children) + state._reserved_child_links)
 }
 
-@(private)
+@(private, require_results)
 _declare_node :: proc(
 	ctx: ^Context,
 	#by_ptr desc: Element_Desc,
@@ -338,7 +338,7 @@ _declare_node :: proc(
 	return node, true
 }
 
-@(deferred_in_out = _element_leave)
+@(deferred_in_out = _element_leave, require_results)
 // element declares an element node and, when it returns true, opens a scope
 // that its children are declared into. Pair each call with the closing `}` of
 // the conditional so the scope closes at the right point.

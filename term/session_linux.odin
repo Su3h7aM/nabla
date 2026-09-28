@@ -75,6 +75,7 @@ Linux_Window_Size :: struct {
 // (linux.Errno). posix calls report failure through their return status; the
 // cause always lives in errno, and the error model preserves it instead of
 // collapsing into a stage name.
+@(require_results)
 _errno :: #force_inline proc "contextless" () -> Platform_Error {
 	return Platform_Error(linux.Errno(i32(c.int(posix.get_errno()))))
 }
@@ -111,6 +112,7 @@ atexit_active: bool
 @(private = "file")
 atexit_registered: bool
 
+@(require_results)
 _session_open :: proc(session: ^Session, options: Options) -> (err: Error) {
 	if session_active {
 		return General_Error.Already_Open
@@ -233,6 +235,7 @@ _session_open :: proc(session: ^Session, options: Options) -> (err: Error) {
 // same pointer. The raw errno (os.Platform_Error) passes through as the
 // faithful low-level cause; the few semantic folds core:os applies (close
 // can hit .Invalid_File for an already-closed descriptor) map onto io.Error.
+@(require_results)
 _session_close_file :: proc(file: ^os.File) -> Error {
 	close_error := os.close(file)
 	when #config(NABLA_TERM_TEST_HOOKS, false) {
@@ -269,6 +272,7 @@ _session_close_file :: proc(file: ^os.File) -> Error {
 // no setup cause precedes it; the SIGWINCH flag in particular clears only
 // on a successful restore, because an armed handler outliving the discarded
 // session is a process-wide hazard, not bookkeeping.
+@(require_results)
 _session_rollback :: proc(impl: ^Session_Impl) -> Error {
 	first_error: Error = nil
 	if impl.cursor_hidden {
@@ -364,6 +368,7 @@ _session_rollback :: proc(impl: ^Session_Impl) -> Error {
 // or the Platform_Error/io.Error from the failed syscall). The descriptor
 // close itself is one-shot (core:os consumes the handle); a failure there
 // is reported and the fully-compensated session settles on the next close.
+@(require_results)
 _session_close :: proc(session: ^Session) -> Error {
 	when #config(NABLA_TERM_TEST_HOOKS, false) {
 		if _test_fail_teardown_once {
@@ -478,6 +483,7 @@ _session_close :: proc(session: ^Session) -> Error {
 // _session_present writes the whole frame through the shared write loop.
 // The write reports its committed byte count; the caller surfaces it
 // through present's committed result.
+@(require_results)
 _session_present :: proc(session: ^Session, bytes: []byte) -> (committed: int, err: Error) {
 	if session.impl.file == nil {
 		return 0, General_Error.Not_Open
@@ -487,6 +493,7 @@ _session_present :: proc(session: ^Session, bytes: []byte) -> (committed: int, e
 
 // _session_clipboard writes a clipboard sequence through the same loop, so a
 // copy is as retryable as a frame is.
+@(require_results)
 _session_clipboard :: proc(session: ^Session, bytes: []byte) -> (committed: int, err: Error) {
 	if session.impl.file == nil {
 		return 0, General_Error.Not_Open
@@ -501,6 +508,7 @@ _session_clipboard :: proc(session: ^Session, bytes: []byte) -> (committed: int,
 // Nonzero write failures preserve their Platform_Error cause; a write that
 // returns zero while bytes remain is the one narrow Partial_Write case
 // (no errno exists to preserve).
+@(require_results)
 _session_write_bytes :: proc(fd: posix.FD, bytes: []byte) -> (committed: int, err: Error) {
 	offset := 0
 	for offset < len(bytes) {
@@ -539,6 +547,7 @@ _session_write_bytes :: proc(fd: posix.FD, bytes: []byte) -> (committed: int, er
 // poll failure preserves its Platform_Error cause; EINTR is retried. There
 // is no separate public poll-error channel: the write path surfaces this
 // cause directly.
+@(require_results)
 _session_poll_out :: proc(fd: posix.FD) -> (ok: bool, err: Error) {
 	for {
 		poll_descriptor := posix.pollfd {
@@ -556,6 +565,7 @@ _session_poll_out :: proc(fd: posix.FD) -> (ok: bool, err: Error) {
 	}
 }
 
+@(require_results)
 _session_viewport :: proc(session: ^Session) -> (result: Viewport, err: Error) {
 	if session.impl.file == nil {
 		return {}, General_Error.Not_Open
@@ -574,10 +584,12 @@ _session_viewport :: proc(session: ^Session) -> (result: Viewport, err: Error) {
 	return
 }
 
+@(require_results)
 _session_file :: proc(session: ^Session) -> (file: ^os.File, err: Error) {
 	return session.impl.file, nil
 }
 
+@(require_results)
 _session_write :: proc(file: ^os.File, text: string) -> Error {
 	_, err := _session_write_bytes(posix.FD(os.fd(file)), transmute([]byte)text)
 	return err

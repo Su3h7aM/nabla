@@ -29,6 +29,7 @@ NO_COLUMN_LIMIT :: -1
 // Allocation: none; value is borrowed and not retained.
 // Errors: .Invalid_Constraint for a negative bound other than NO_COLUMN_LIMIT
 // or a negative tab width.
+@(require_results)
 measure_text :: proc(
 	value: string,
 	profile: Width_Profile = DEFAULT_WIDTH_PROFILE,

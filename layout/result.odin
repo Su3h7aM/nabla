@@ -146,6 +146,7 @@ result :: proc(ctx: ^Context) -> (Frame_Result, Frame_Error) {
 
 // lookup_handle finds the handle carrying identifier by binary-searching the
 // frame's id index.
+@(require_results)
 lookup_handle :: proc(frame_result: Frame_Result, identifier: Id) -> (Node_Handle, bool) #optional_ok {
 	if identifier == 0 {
 		return 0, false
@@ -174,6 +175,7 @@ lookup_handle :: proc(frame_result: Frame_Result, identifier: Id) -> (Node_Handl
 
 // lookup finds the node carrying identifier. The returned node is a copy drawn
 // from frame_result.nodes, which shares its lifetime with frame_result.
+@(require_results)
 lookup :: proc(frame_result: Frame_Result, identifier: Id) -> (Resolved_Node, bool) #optional_ok {
 	handle, found := lookup_handle(frame_result, identifier)
 	if !found {
@@ -185,7 +187,7 @@ lookup :: proc(frame_result: Frame_Result, identifier: Id) -> (Resolved_Node, bo
 // node returns the node at `handle`, or false when the handle is out of
 // range. The returned node is a copy drawn from `frame_result.nodes`, which
 // shares its lifetime with `frame_result`.
-@(private)
+@(private, require_results)
 _node_index :: proc "contextless" (frame_result: Frame_Result, handle: Node_Handle) -> (int, bool) {
 	index := u64(handle)
 	if index >= u64(len(frame_result.nodes)) {
@@ -194,6 +196,7 @@ _node_index :: proc "contextless" (frame_result: Frame_Result, handle: Node_Hand
 	return int(index), true
 }
 
+@(require_results)
 node :: proc(frame_result: Frame_Result, handle: Node_Handle) -> (Resolved_Node, bool) #optional_ok {
 	index, valid := _node_index(frame_result, handle)
 	if !valid || index == 0 {

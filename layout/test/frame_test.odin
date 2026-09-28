@@ -177,7 +177,7 @@ test_overlay_hit_stack_and_visible_commands :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(frame_result.commands), 2)
 	painted := 0
 	iterator := layout.visible_commands(frame_result, layout.Rect{size = {200, 200}})
-	for _ in layout.next_command(&iterator) {
+	for _, _ in layout.next_command(&iterator) {
 		painted += 1
 	}
 	testing.expect_value(t, painted, 2)
