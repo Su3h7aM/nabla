@@ -1,5 +1,6 @@
 package agent
 
+import "core:crypto/hash"
 import "core:fmt"
 import "core:log"
 import "core:mem/virtual"
@@ -127,11 +128,21 @@ chat_chain_stop :: proc(chat: ^Chat_Session, reason: Request_Recovery_Reason) {
 	chat.chain.stage = .Committing
 }
 
-// chat_record_attempt commits request.sent for one send before it goes out. It reports
-// false after latching a storage failure, which stops the turn: a send whose record did
-// not land is not sent.
+// chat_body_digest returns the hex SHA-256 of body, written into buffer of
+// journal.DIGEST_HEX_LENGTH bytes and aliasing it, and the body's length. An empty body is "" and 0.
 @(private)
-chat_record_attempt :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, request: journal.Request_Id, attempt: Chat_Attempt) -> bool {
+chat_body_digest :: proc(body: []u8, buffer: []u8) -> (digest: string, bytes: int) {
+	if len(body) == 0 { return "", 0 }
+	raw: journal.Digest
+	hash.hash_bytes_to_buffer(.SHA256, body, raw[:])
+	return journal.digest_to_hex(raw, buffer), len(body)
+}
+
+// chat_record_attempt commits request.sent for one send before it goes out, with the digest
+// and the size of the exact bytes that send will carry. It reports false after latching a
+// storage failure, which stops the turn: a send whose record did not land is not sent.
+@(private)
+chat_record_attempt :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, request: journal.Request_Id, attempt: Chat_Attempt, body: []u8) -> bool {
 	header := journal.Record {
 		kind     = .Request_Sent,
 		request  = request,
@@ -139,11 +150,15 @@ chat_record_attempt :: proc(chat: ^Chat_Session, connection: ai.Provider_Connect
 		provider = chat.provider_id,
 		model    = chat.model_id,
 	}
+	digest_buffer: [journal.DIGEST_HEX_LENGTH]u8
+	body_digest, body_bytes := chat_body_digest(body, digest_buffer[:])
 	sent := journal.Request_Sent {
 		purpose         = journal.REQUEST_PURPOSE_NAMES[.Response],
 		api             = chat_api_name(connection.API),
 		model_requested = chat.model_id,
 		recovery        = CHAT_RECOVERY_KIND_NAMES[attempt.recovery],
+		body_digest     = body_digest,
+		body_bytes      = body_bytes,
 	}
 	chat_record(chat, header, sent)
 	return chat_commit(chat, "the request could not be recorded")
@@ -357,7 +372,7 @@ chat_chain_claim_send :: proc(chat: ^Chat_Session) -> bool {
 		recovery = number == 1 ? .Initial : chain.recovery_kind,
 	}
 	if chain.request == 0 { chain.request = journal.next_request(chat.store) }
-	if !chat_record_attempt(chat, chain.connection, chain.request, attempt) {
+	if !chat_record_attempt(chat, chain.connection, chain.request, attempt, chain.encoded.Body) {
 		// The record did not land, so nothing is sent. The session already latched the
 		// storage failure; the chain stops with it and commits nothing, because no attempt began.
 		chat_chain_stop(chat, .Storage_Failed)

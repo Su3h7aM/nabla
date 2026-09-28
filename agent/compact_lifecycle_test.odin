@@ -344,6 +344,8 @@ test_a_failed_compaction_leaves_the_context_alone :: proc(test: ^testing.T) {
 	if decode_error := journal.payload_decode(sends[0].data, &sent, context.temp_allocator);
 	   decode_error != nil { testing.fail_now(test, "compaction send could not be decoded") }
 	testing.expect_value(test, sent.purpose, journal.REQUEST_PURPOSE_NAMES[.Compaction])
+	testing.expect_value(test, len(sent.body_digest), journal.DIGEST_HEX_LENGTH)
+	testing.expect(test, sent.body_bytes > 0, "the frozen body was not recorded with its size")
 	testing.expect_value(test, rejections[0].request, sends[0].request)
 }
 

@@ -502,7 +502,8 @@ chat_compact_identity :: proc(chat: ^Chat_Session, connection: ai.Provider_Conne
 	return chat_text_digest(text)
 }
 
-/// chat_compact_begin_attempt records a send before its worker starts.
+// chat_compact_begin_attempt records a send before its worker starts, with the digest and
+// the size of the frozen bytes that send will carry.
 @(private)
 chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bool {
 	header := journal.Record {
@@ -514,6 +515,8 @@ chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bo
 	}
 	recovery := Chat_Recovery_Kind.Initial
 	if job.attempts > 1 { recovery = .Transient_Retry }
+	digest_buffer: [journal.DIGEST_HEX_LENGTH]u8
+	body_digest, body_bytes := chat_body_digest(transmute([]u8)job.snapshot.body, digest_buffer[:])
 	chat_record(
 		chat,
 		header,
@@ -522,6 +525,8 @@ chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bo
 			api = chat_api_name(job.snapshot.api),
 			model_requested = chat.model_id,
 			recovery = CHAT_RECOVERY_KIND_NAMES[recovery],
+			body_digest = body_digest,
+			body_bytes = body_bytes,
 		},
 	)
 	return chat_commit(chat, "the compaction request could not be recorded")
