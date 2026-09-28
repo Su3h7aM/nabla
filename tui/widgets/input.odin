@@ -1,5 +1,6 @@
 package widgets
 
+import "core:mem"
 import "core:strings"
 import "core:unicode/utf8"
 
@@ -97,7 +98,9 @@ input_backspace :: proc(input: ^Input) -> bool {
 		return false
 	}
 	start := text.prev_grapheme_offset(input_text(input), input.cursor)
-	_input_remove(input, start, input.cursor)
+	if !_input_remove(input, start, input.cursor) {
+		return false
+	}
 	input.cursor = start
 	return true
 }
@@ -107,7 +110,9 @@ input_delete :: proc(input: ^Input) -> bool {
 	if input.cursor >= len(value) {
 		return false
 	}
-	_input_remove(input, input.cursor, text.next_grapheme_offset(value, input.cursor))
+	if !_input_remove(input, input.cursor, text.next_grapheme_offset(value, input.cursor)) {
+		return false
+	}
 	return true
 }
 
@@ -149,8 +154,19 @@ input_move_end :: proc(input: ^Input) -> bool {
 // line, or the part of one that fits, so a long line wraps rather than running
 // past the edge. The rows borrow the text and are allocated with the caller's
 // temp allocator, because a caller measures and draws them within one frame.
-input_lines :: proc(input: ^Input, width: int, profile: text.Width_Profile = text.DEFAULT_WIDTH_PROFILE) -> [dynamic]Input_Line {
-	lines := make([dynamic]Input_Line, 0, 8, context.temp_allocator)
+//
+// On an allocation failure it returns the rows produced so far together with
+// the allocator error. The caller must draw none of them: a short row list is a
+// wrong one, not a shorter view.
+input_lines :: proc(
+	input: ^Input,
+	width: int,
+	profile: text.Width_Profile = text.DEFAULT_WIDTH_PROFILE,
+) -> (
+	lines: [dynamic]Input_Line,
+	err: mem.Allocator_Error,
+) {
+	lines = make([dynamic]Input_Line, 0, 8, context.temp_allocator)
 	value := input_text(input)
 	start := 0
 	for {
@@ -162,7 +178,9 @@ input_lines :: proc(input: ^Input, width: int, profile: text.Width_Profile = tex
 			logical_end = start + relative_end
 		}
 		if start == logical_end {
-			append(&lines, Input_Line{text = "", start = start, end = start})
+			if _, append_err := append(&lines, Input_Line{text = "", start = start, end = start}); append_err != nil {
+				return lines, append_err
+			}
 		} else {
 			offset := start
 			for offset < logical_end {
@@ -171,7 +189,9 @@ input_lines :: proc(input: ^Input, width: int, profile: text.Width_Profile = tex
 				if end == offset {
 					end = text.next_grapheme_offset(value, offset)
 				}
-				append(&lines, Input_Line{text = value[offset:end], start = offset, end = end})
+				if _, append_err := append(&lines, Input_Line{text = value[offset:end], start = offset, end = end}); append_err != nil {
+					return lines, append_err
+				}
 				offset = end
 			}
 		}
@@ -183,7 +203,7 @@ input_lines :: proc(input: ^Input, width: int, profile: text.Width_Profile = tex
 			break
 		}
 	}
-	return lines
+	return lines, nil
 }
 
 // input_cursor_row returns the row the caret is on.
@@ -211,7 +231,10 @@ input_move_down :: proc(input: ^Input, width: int, profile: text.Width_Profile =
 
 @(private)
 _input_move_row :: proc(input: ^Input, delta, width: int, profile: text.Width_Profile) -> bool {
-	lines := input_lines(input, width, profile)
+	lines, lines_error := input_lines(input, width, profile)
+	if lines_error != nil {
+		return false
+	}
 	row := input_cursor_row(input, lines[:])
 	target := row + delta
 	if target < 0 || target >= len(lines) {
@@ -237,50 +260,63 @@ _input_row_offset :: proc(line: Input_Line, column: int, profile: text.Width_Pro
 	return line.start + offset
 }
 
-// draw_input draws the text into rect, wrapping at the rect's width and
+// draw_input_rect draws the text into rect, wrapping at the rect's width and
 // scrolling the rows to keep the caret visible, and returns the caret for the
-// frame.
+// frame. A failed row list returns the allocator error and draws nothing.
 draw_input_rect :: proc(
 	buffer: ^term.Frame_Buffer,
 	rect: tui.Cell_Rect,
 	input: ^Input,
 	style: term.Style,
 	profile: text.Width_Profile = text.DEFAULT_WIDTH_PROFILE,
-) -> term.Cursor {
+) -> (
+	cursor: term.Cursor,
+	err: mem.Allocator_Error,
+) {
 	if rect.width <= 0 || rect.height <= 0 {
-		return {}
+		return {}, nil
 	}
-	lines := input_lines(input, rect.width, profile)
+	lines, lines_error := input_lines(input, rect.width, profile)
+	if lines_error != nil {
+		return {}, lines_error
+	}
 	window := _input_window(input, lines[:], rect, profile)
 	for index in window.start ..< min(window.start + rect.height, len(lines)) {
 		_, _ = tui.draw_text(buffer, {x = rect.x, y = rect.y + index - window.start, width = rect.width, height = 1}, lines[index].text, style, profile)
 	}
-	return term.Cursor{visible = true, position = {rect.x + window.column, rect.y + window.row - window.start}, placed = true}
+	return term.Cursor{visible = true, position = {rect.x + window.column, rect.y + window.row - window.start}, placed = true}, nil
 }
 
-// draw_input draws into the active layout box, keeps the caret visible, and
-// records the cursor intent on the tui frame.
-draw_input_context :: proc(ctx: ^tui.Context, input: ^Input, style: term.Style) -> term.Cursor {
+// draw_input_context draws into the active layout box, keeps the caret visible,
+// and records the cursor intent on the tui frame. A failed row list returns the
+// allocator error and draws nothing.
+draw_input_context :: proc(ctx: ^tui.Context, input: ^Input, style: term.Style) -> (cursor: term.Cursor, err: mem.Allocator_Error) {
 	rect, ok := tui.bounds(ctx)
 	if !ok || rect.width <= 0 || rect.height <= 0 {
-		return {}
+		return {}, nil
 	}
 	profile, profile_ok := tui.width_profile(ctx)
 	if !profile_ok {
-		return {}
+		return {}, nil
 	}
-	lines := input_lines(input, rect.width, profile)
+	lines, lines_error := input_lines(input, rect.width, profile)
+	if lines_error != nil {
+		return {}, lines_error
+	}
 	window := _input_window(input, lines[:], rect, profile)
 	for index in window.start ..< min(window.start + rect.height, len(lines)) {
 		_, _ = tui.draw_text_at(ctx, {x = rect.x, y = rect.y + index - window.start, width = rect.width, height = 1}, lines[index].text, style)
 	}
-	cursor := term.Cursor {
+	cursor = term.Cursor {
 		visible  = true,
 		position = {rect.x + window.column, rect.y + window.row - window.start},
 		placed   = true,
 	}
+	// A refused cursor (an out-of-bounds caret, or a frame that already failed)
+	// is recorded on the frame, which tui.result reports, so the refusal is not
+	// swallowed here.
 	_ = tui.set_cursor(ctx, cursor)
-	return cursor
+	return cursor, nil
 }
 
 // _Input_Window is the part of the rows a rect shows, and where the caret falls
@@ -319,7 +355,11 @@ _input_byte_count :: proc(value: string) -> int {
 	return count
 }
 
-_input_remove :: proc(input: ^Input, start, end: int) {
+// _input_remove deletes [start, end) and reports whether the buffer holds the
+// shortened text. The asserted span makes the resize a shrink, which cannot
+// allocate.
+_input_remove :: proc(input: ^Input, start, end: int) -> bool {
+	assert(start >= 0 && end >= start && end <= len(input.text))
 	copy(input.text[start:], input.text[end:])
-	resize(&input.text, len(input.text) - (end - start))
+	return resize(&input.text, len(input.text) - (end - start)) == nil
 }

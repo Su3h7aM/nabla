@@ -26,7 +26,12 @@ _build_root_groups :: proc(state: ^_Context_State) {
 		root.node_count = 0
 	}
 	assert(offset <= cap(state._root_nodes))
-	resize(&state._root_nodes, offset)
+	// The pool holds one handle per node and `offset` counts the nodes below the
+	// root, so this resize sets the length and cannot grow the buffer.
+	if resize(&state._root_nodes, offset) != nil {
+		_latch_capacity_error(state, .Nodes)
+		return
+	}
 	for node_index in 1 ..< len(state._node_inputs) {
 		root := &state._roots[state._node_inputs[node_index].root]
 		state._root_nodes[root.node_start + root.node_count] = Node_Handle(node_index)

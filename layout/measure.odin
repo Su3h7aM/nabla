@@ -87,18 +87,16 @@ _measure_text_run :: proc(state: ^_Context_State, node: Node_Handle, text: strin
 @(private)
 _measure_text_run_cached :: proc(state: ^_Context_State, node: Node_Handle, text: string, request: Measure_Request) -> Measure_Result {
 	key, cacheable := _measure_cache_key(state, node, text, request)
-	if !cacheable {
-		measured, _ := _measure_text_run(state, node, text, request)
-		return measured
-	}
-	if cached, hit := _measure_cache_lookup(state, key); hit {
-		return cached
+	if cacheable {
+		if cached, hit := _measure_cache_lookup(state, key); hit {
+			return cached
+		}
 	}
 	// A failed measurement is never cached: caching it would hide the
 	// `Measure_Failed` diagnostic on every later frame while its zero geometry
 	// persisted until the next explicit invalidation.
 	measured, succeeded := _measure_text_run(state, node, text, request)
-	if succeeded {
+	if cacheable && succeeded {
 		_measure_cache_store(state, key, measured)
 	}
 	return measured

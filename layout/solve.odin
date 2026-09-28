@@ -937,6 +937,9 @@ _build_result_order :: proc(state: ^_Context_State) {
 _solve_frame :: proc(state: ^_Context_State) {
 	assert(len(state._node_inputs) == len(state._nodes))
 	_build_root_groups(state)
+	if state._frame_error != .None {
+		return
+	}
 	_resolve_overlay_dependencies(state)
 	if state._frame_error != .None {
 		return

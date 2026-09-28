@@ -436,8 +436,13 @@ _partition_storage :: proc(state: ^_Context_State, partition: ^_Storage_Partitio
 		state._root_paint = mem.buffer_from_slice(root_paint)
 		state._root_nodes = mem.buffer_from_slice(root_nodes)
 		state._measure_cache = mem.buffer_from_slice(measure_cache)
-		// The cache is an open-addressed table, so every slot must be addressable.
-		resize(&state._measure_cache, len(measure_cache))
+		// The cache is an open-addressed table, so every slot must be
+		// addressable. The partition above already holds exactly that many
+		// entries, so the resize cannot grow the buffer; the failure is reported
+		// rather than assumed away.
+		if resize(&state._measure_cache, len(measure_cache)) != nil {
+			return false
+		}
 		state._id_table = id_table
 		state._scopes = mem.buffer_from_slice(scopes)
 		state._solver_scratch = mem.buffer_from_slice(solver_scratch)

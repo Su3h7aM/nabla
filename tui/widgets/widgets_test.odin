@@ -164,7 +164,7 @@ test_input_caret_tracks_the_visible_window :: proc(t: ^testing.T) {
 	// no cell past it to sit in.
 	storage: [8]term.Cell
 	frame := _frame(storage[:], 4, 1)
-	cursor := draw_input(&frame, {width = 4, height = 1}, &input, {})
+	cursor, _ := draw_input(&frame, {width = 4, height = 1}, &input, {})
 	testing.expect(t, cursor.visible)
 	testing.expect_value(t, cursor.position, term.Position{3, 0})
 	testing.expect_value(t, frame.cells[0].grapheme, "a")
@@ -180,7 +180,7 @@ test_input_caret_tracks_the_visible_window :: proc(t: ^testing.T) {
 	testing.expect(t, input_insert(&lines, "one\ntwo\nthree"))
 	line_storage: [10]term.Cell
 	line_frame := _frame(line_storage[:], 5, 2)
-	line_cursor := draw_input(&line_frame, {width = 5, height = 2}, &lines, {})
+	line_cursor, _ := draw_input(&line_frame, {width = 5, height = 2}, &lines, {})
 	testing.expect_value(t, line_cursor.position, term.Position{4, 1})
 	testing.expect_value(t, line_frame.cells[0].grapheme, "t")
 	testing.expect_value(t, line_frame.cells[5].grapheme, "t")
