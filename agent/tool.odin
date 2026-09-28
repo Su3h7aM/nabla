@@ -543,13 +543,3 @@ TOOL_DECLARED := [?]Tool_Definition {
 // plus the shell tool, whose definition is built at run time.
 @(private)
 TOOL_NATIVE_COUNT :: len(TOOL_DECLARED) + 1
-
-// TOOL_RECOVERED_RESULT and TOOL_UNEXECUTED_RESULT are what recovery writes for a
-// call the harness never observed. They are constants so recovery allocates
-// nothing, and a test holds them to what the encoder produces for the same
-// outcome and message.
-TOOL_RECOVERED_MESSAGE :: "the session was interrupted before this call finished"
-TOOL_UNEXECUTED_MESSAGE :: "the session was interrupted before this call started"
-
-TOOL_RECOVERED_RESULT :: "error unknown: " + TOOL_RECOVERED_MESSAGE + "\n"
-TOOL_UNEXECUTED_RESULT :: "error not_executed: " + TOOL_UNEXECUTED_MESSAGE + "\n"

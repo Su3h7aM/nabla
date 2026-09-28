@@ -16,6 +16,7 @@ import "core:time"
 
 import "nabla:acp"
 import "nabla:agent"
+import "nabla:agent/journal"
 
 // The ACP frontend is driven the way a client drives it: a scripted provider behind a
 // socket, a client that writes one message and reads one answer at a time, and the run
@@ -340,6 +341,11 @@ acp_test_client_session_id_from_frame :: proc(t: ^testing.T, frame: string, allo
 		testing.expectf(t, false, "the session/new answer could not be read: %s", frame)
 		return ""
 	}
+	_, valid := journal.session_id_parse(answer.result.session_id)
+	if !testing.expectf(t, valid && len(answer.result.session_id) == journal.SESSION_ID_HEX_LENGTH, "session/new returned an invalid journal id: %s", frame) {
+		delete(answer.result.session_id, allocator)
+		return ""
+	}
 	return answer.result.session_id
 }
 
@@ -658,6 +664,14 @@ test_acp_v2_negotiates_and_exposes_the_session_surface :: proc(t: ^testing.T) {
 	strings.write_byte(&closing, '\n')
 	acp_test_client_send(&client, strings.to_string(closing))
 	if acp_test_client_expect(t, &client, `"id":4,"result":{}`, "v2 session/close was not answered") == "" { return }
+
+	closed_listing := strings.builder_make(context.temp_allocator)
+	strings.write_string(&closed_listing, `{"jsonrpc":"2.0","id":5,"method":"session/list","params":{}}`)
+	strings.write_byte(&closed_listing, '\n')
+	acp_test_client_send(&client, strings.to_string(closed_listing))
+	closed_frame := acp_test_client_expect(t, &client, `"sessions":[]`, "v2 session/list after close was not answered")
+	if closed_frame == "" { return }
+	testing.expectf(t, !strings.contains(closed_frame, session_id), "v2 session/list retained an unprompted session: %s", closed_frame)
 }
 
 @(test)
@@ -799,7 +813,11 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 		testing.expectf(t, false, "v2 replay changed the user message id: %s", replayed_user)
 		return
 	}
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message"`, "v2 replay did not include the assistant message") == "" { return }
+	replayed_assistant := acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message"`, "v2 replay did not include the assistant message")
+	if replayed_assistant == "" || !strings.contains(replayed_assistant, `"messageId":"msg-assistant-1-1"`) {
+		testing.expectf(t, false, "v2 replay changed the assistant message id: %s", replayed_assistant)
+		return
+	}
 	if acp_test_client_expect(t, &client, `"id":4,"result"`, "v2 resume did not answer after replay") == "" { return }
 
 	plain_resume := strings.builder_make(context.temp_allocator)

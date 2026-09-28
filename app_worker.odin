@@ -3,7 +3,7 @@ package main
 
 import "core:fmt"
 import "core:mem"
-import "core:os"
+import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
 import "core:sync/chan"
@@ -11,7 +11,7 @@ import "core:thread"
 import "core:time"
 
 import "nabla:agent"
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 // --- worker ---------------------------------------------------------------
@@ -111,29 +111,32 @@ work_destroy :: proc(app: ^App, work: Work) {
 // calls it, so the store is never read from two threads.
 session_refresh_rows :: proc(app: ^App) {
 	if app.setup.session.store == nil { return }
-	sessions, list_err := session.session_list(&app.setup.store, {workspace = app.setup.workspace, limit = 20}, app.run.alloc)
-	if list_err != nil { return }
-	defer session.sessions_destroy(sessions, app.run.alloc)
+	filter := journal.Session_Filter {
+		workspace = app.setup.workspace,
+		role      = .Main,
+		limit     = SESSION_MENU_ROWS,
+	}
+	sessions, list_error := journal.list_sessions(app.setup.store, filter, app.run.alloc)
+	if list_error != nil { return }
+	defer journal.session_summaries_destroy(sessions, app.run.alloc)
 
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
 	for &row in app.run.snap.sessions {
-		delete(string(row.id), app.run.alloc)
 		delete(row.title, app.run.alloc)
 	}
 	clear(&app.run.snap.sessions)
 	for &entry in sessions {
-		append(
-			&app.run.snap.sessions,
-			Session_Row{id = session.Session_Id(strings.clone(string(entry.id), app.run.alloc)), title = strings.clone(entry.title, app.run.alloc)},
-		)
+		append(&app.run.snap.sessions, Session_Row{id = entry.id, title = strings.clone(entry.title, app.run.alloc)})
 	}
 	// The running session is published with the list, so the menu can open on it
 	// without reading the running session from another thread.
-	delete(string(app.run.snap.active_session), app.run.alloc)
-	app.run.snap.active_session = session.Session_Id(strings.clone(string(app.setup.session.id), app.run.alloc))
+	app.run.snap.active_session = app.setup.session.session
 	app.run.snap.generation += 1
 }
+
+// SESSION_MENU_ROWS is how many recent sessions the /resume menu offers.
+SESSION_MENU_ROWS :: 20
 
 run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	// A stop that arrived while this item was queued abandons it: shutdown does
@@ -159,7 +162,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		// Tools are refreshed between turns, while the session is idle. Both prompt
 		// paths refresh, so an interactive turn and a headless one see the same tools.
 		if warning := app_tools_refresh(app); warning != "" { snap_append(app, .Warning, warning) }
-		accepted := agent.chat_session_accept_user(&app.setup.session, work.text, session.now_ms())
+		accepted := agent.chat_session_accept_user(&app.setup.session, work.text)
 		switch accepted {
 		case .Accepted:
 		case .Storage_Failed:
@@ -182,7 +185,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
 		}
 	case .Status:
-		agent.chat_notice_status(&app.setup.session, observer, session.now_ms())
+		agent.chat_notice_status(&app.setup.session, observer, time.to_unix_nanoseconds(time.now()) / i64(time.Millisecond))
 	case .Effort:
 		applied := true
 		if work.text == "" || work.text == "default" {
@@ -196,14 +199,10 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		}
 		// The effort is part of the persisted selection, so a change rewrites it.
 		if applied {
-			selection := session.Selection {
-				provider = app.setup.provider_id,
-				model    = app.setup.model_id,
-				effort   = app.setup.session.effort,
-			}
-			if save_err := session.selection_save(&app.setup.store, selection); save_err != nil {
-				local := save_err
-				snap_append(app, .Error, fmt.tprintf("the selection could not be recorded: %s", session.error_detail(&local)))
+			record_error := selection_record(app.setup.store, app.setup.provider_id, app.setup.model_id, app.setup.session.effort)
+			if record_error != nil {
+				detail := journal.error_text(record_error, context.temp_allocator)
+				snap_append(app, .Error, fmt.tprintf("the selection could not be recorded: %s", detail))
 			}
 		}
 	case .Catalog:
@@ -218,7 +217,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		model := strings.clone(app.setup.model_id, app.run.alloc)
 		defer delete(provider, app.run.alloc)
 		defer delete(model, app.run.alloc)
-		if session_start_new(app) {
+		if session_switch(app, {kind = .New}) {
 			snapshot_clear(app)
 			snap_append(app, .Notice, "started a new session")
 			if provider != "" && model != "" { apply_selection(app, provider, model, "") }
@@ -279,21 +278,20 @@ session_resume :: proc(app: ^App, reference: string) {
 		snap_append(app, .Notice, "usage: /resume <session id or prefix>")
 		return
 	}
-	sessions, list_err := session.session_list(&app.setup.store, {workspace = app.setup.workspace, limit = session.SESSION_LIST_MAX_LIMIT}, app.run.alloc)
-	if list_err != nil {
-		local := list_err
-		snap_append(app, .Error, fmt.tprintf("cannot list sessions: %s", session.error_detail(&local)))
+	sessions, list_error := journal.list_sessions(app.setup.store, {workspace = app.setup.workspace, role = .Main}, app.run.alloc)
+	if list_error != nil {
+		detail := journal.error_text(list_error, context.temp_allocator)
+		snap_append(app, .Error, fmt.tprintf("cannot list sessions: %s", detail))
 		return
 	}
-	defer session.sessions_destroy(sessions, app.run.alloc)
+	defer journal.session_summaries_destroy(sessions, app.run.alloc)
 
-	matched: session.Session_Id
+	matched: [journal.SESSION_ID_HEX_LENGTH]u8
 	matches := 0
-	defer if matched != "" { delete(string(matched), app.setup.alloc) }
 	for &entry in sessions {
-		if !strings.has_prefix(string(entry.id), reference) { continue }
-		if matches > 0 { delete(string(matched), app.setup.alloc) }
-		matched = session.Session_Id(strings.clone(string(entry.id), app.setup.alloc))
+		hex_text: [journal.SESSION_ID_HEX_LENGTH]u8
+		if !strings.has_prefix(journal.session_id_to_hex(entry.id, hex_text[:]), reference) { continue }
+		matched = hex_text
 		matches += 1
 	}
 	if matches == 0 {
@@ -301,86 +299,44 @@ session_resume :: proc(app: ^App, reference: string) {
 		return
 	}
 	if matches > 1 {
-		delete(string(matched), app.setup.alloc)
-		matched = ""
 		snap_append(app, .Notice, fmt.tprintf("%s matches more than one session", reference))
 		return
 	}
-	if !session_switch(app, matched) { return }
+	matched_text := string(matched[:])
+	if !session_switch(app, {kind = .Resume_Id, id = matched_text}) { return }
 	snapshot_clear(app)
-	snap_append(app, .Notice, fmt.tprintf("resumed session %s", string(matched)))
+	snap_append(app, .Notice, fmt.tprintf("resumed session %s", matched_text))
 	session_replay(app, &app.setup.session)
 }
 
-// session_start_new closes the running session and opens a fresh one, so the
-// next prompt starts a new conversation. Nothing is recorded for the new session
-// until that prompt, so starting one and never prompting leaves the store as it
-// was. The candidate is claimed while the running session stays claimed, so a
-// failure leaves the running session usable rather than dropping the front-end's
-// only session.
-session_start_new :: proc(app: ^App) -> bool {
+// session_switch replaces the running session with the one start names, settling
+// anything an earlier run left open. The session is opened in its own journal while
+// the running one stays claimed, so a refusal leaves the front-end working in the
+// session it already had.
+session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 	setup := &app.setup
-	target, opened := session_open_target(setup, {kind = .New}, setup.workspace, stderr_writer())
-	if !opened { return false }
-	defer session_target_destroy(&target, setup.alloc)
-
-	adoption, message, adopted := session_adopt_new(setup, target)
-	if !adopted {
-		defer delete(message, setup.alloc)
+	opened, message, ok := session_open(setup, start, setup.workspace)
+	if !ok {
 		snap_append(app, .Error, message)
+		delete(message, setup.alloc)
 		return false
 	}
-	defer adoption_destroy(&adoption, setup.alloc)
-	session_activate(app, &adoption)
-	return true
-}
-
-// session_switch opens the named session, settling anything an earlier run left
-// running. The workspace recorded in the session becomes the running session's
-// workspace.
-//
-// The target is read and checked before anything is given up, and session_adopt
-// holds the running session's claim until the candidate is settled, so a refusal
-// leaves the front-end working in the session it already had. Nothing is released
-// in between, so another process cannot take the running session during the
-// attempt.
-session_switch :: proc(app: ^App, target: session.Session_Id) -> bool {
-	setup := &app.setup
-
-	header, load_err := session.session_load(&setup.store, target, setup.alloc)
-	if load_err != nil {
-		local := load_err
-		snap_append(app, .Error, fmt.tprintf("cannot read the session: %s", session.error_detail(&local)))
+	recovery := opened.recovery
+	if !session_install(setup, &opened) {
+		snap_append(app, .Error, "the tool registry could not be allocated")
 		return false
 	}
-	defer session.session_destroy(&header)
-	if !os.is_dir(header.workspace) {
-		snap_append(app, .Error, fmt.tprintf("the session's directory is gone: %s", header.workspace))
-		return false
+	if recovery.calls > 0 {
+		snap_append(app, .Notice, fmt.tprintf("%d tool call(s) in this session never reported a result; their results say whether they ran", recovery.calls))
 	}
-
-	adoption, message, adopted := session_adopt(setup, target)
-	if !adopted {
-		defer delete(message, setup.alloc)
-		snap_append(app, .Error, message)
-		return false
-	}
-	defer adoption_destroy(&adoption, setup.alloc)
-
-	session_activate(app, &adoption)
-	if adoption.recovery.recovered_calls > 0 {
-		snap_append(app, .Notice, fmt.tprintf("%d tool result(s) in this session record an outcome the harness never saw", adoption.recovery.recovered_calls))
-	}
-	if adoption.recovery.unexecuted_calls > 0 {
-		snap_append(app, .Notice, fmt.tprintf("%d tool call(s) in this session never ran", adoption.recovery.unexecuted_calls))
-	}
+	if start.kind == .New { return true }
 
 	// A conversation has to be configured before it can run: the new chat starts
 	// with no model, so the session's recorded one is applied, with the selection
 	// already in effect as the fallback. A session whose model is gone from the
 	// catalog stays open on the current selection, and can still be changed from
 	// the model menu.
-	if adoption.header.provider != "" && adoption.header.model != "" && apply_selection(app, adoption.header.provider, adoption.header.model, "") {
+	if setup.resumed_provider != "" && setup.resumed_model != "" && apply_selection(app, setup.resumed_provider, setup.resumed_model, "") {
 		return true
 	}
 	if setup.provider_id != "" && setup.model_id != "" {
@@ -392,41 +348,45 @@ session_switch :: proc(app: ^App, target: session.Session_Id) -> bool {
 // session_replay shows the tail of a resumed conversation. The store keeps every
 // entry; this is the part a person needs to recognise where they left off.
 session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
-	replayed, replay_err := session.context_load(chat.store, chat.id, app.run.alloc)
-	if replay_err != nil {
-		// Resuming a session and showing nothing would look like an empty
-		// conversation rather than a failure to read one.
-		local := replay_err
-		snap_append(app, .Error, fmt.tprintf("cannot read the session history: %s", session.error_detail(&local)))
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		snap_append(app, .Error, "cannot read the session history: out of memory")
 		return
 	}
-	defer session.context_destroy(&replayed, app.run.alloc)
+	defer virtual.arena_destroy(&arena)
+	replayed, replay_error := agent.projection_load(chat.store, chat.session, chat.head, virtual.arena_allocator(&arena))
+	if replay_error != nil {
+		// Resuming a session and showing nothing would look like an empty
+		// conversation rather than a failure to read one.
+		detail := journal.error_text(replay_error, context.temp_allocator)
+		snap_append(app, .Error, fmt.tprintf("cannot read the session history: %s", detail))
+		return
+	}
 
-	// The name of each call, by the seq its result names.
-	call_names := make(map[session.Seq]string, len(replayed.entries), app.run.alloc)
+	// The name of each call, by the id its result names.
+	call_names := make(map[journal.Call_Id]string, len(replayed.items), app.run.alloc)
 	defer delete(call_names)
 
 	if replayed.summary != "" {
 		snap_append(app, .Notice, "(earlier turns are summarized)")
 	}
-	for &entry in replayed.entries {
-		#partial switch payload in entry.payload {
-		case session.User_Entry:
-			if payload.origin == .Harness {
-				snap_append(app, .Notice, payload.text)
-			} else {
+	for &item in replayed.items {
+		// A native response replays only to the model; its text and calls are items of their own.
+		#partial switch payload in item.payload {
+		case agent.Projected_User:
+			if payload.origin == .Prompt {
 				snap_append(app, .User, payload.text)
+			} else {
+				snap_append(app, .Notice, payload.text)
 			}
-		case session.Assistant_Entry:
+		case agent.Projected_Assistant:
 			snap_append(app, .Assistant, payload.text)
-		case session.Tool_Call_Entry:
+		case agent.Projected_Call:
 			// A result names its call, not the tool, so the call's name is kept
 			// for the result that follows it.
-			call_names[entry.seq] = payload.name
-		case session.Tool_Result_Entry:
-			name := ""
-			if related, present := entry.related_seq.?; present { name = call_names[related] }
-			snap_append_tool(app, name, payload.content, session.tool_outcome_name(payload.outcome), payload.outcome)
+			call_names[payload.call] = payload.name
+		case agent.Projected_Result:
+			snap_append_tool(app, call_names[payload.call], payload.content, journal.TOOL_OUTCOME_NAMES[payload.outcome], payload.outcome)
 		}
 	}
 }
@@ -462,30 +422,32 @@ refresh_status :: proc(app: ^App) {
 	// estimate: the estimate bounds the request being built, the hit rate says
 	// how much of the finished session the provider read from its cache. Both
 	// come from the worker's own records, never from a second thread's query.
-	totals, totals_err := session.cache_totals(running.store, running.id)
-	if totals_err != nil {
+	totals: journal.Usage_Totals
+	totals_error: journal.Error = journal.Journal_Error.Not_Found
+	if running.store != nil { totals, totals_error = journal.usage_totals(running.store, running.session) }
+	if totals_error != nil {
 		status.session_input_present = false
 		status.session_cache_present = false
 		status.session_hit_measured = false
 		status.session_hit_partial = false
 	} else {
-		if totals.input_requests > 0 {
+		if totals.requests > 0 {
 			status.session_input = totals.input
 			status.session_input_present = true
 		} else {
 			status.session_input_present = false
 		}
-		if totals.cache_read_requests > 0 {
+		if totals.paired_requests > 0 {
 			status.session_cache_read = totals.cache_read
 			status.session_cache_present = true
 		} else {
 			status.session_cache_present = false
 		}
-		rate, measured := session.cache_hit_rate(totals)
+		rate, measured := journal.cache_hit_rate(totals)
 		status.session_hit_rate = rate
 		status.session_hit_measured = measured
 		status.session_hit_partial = false
-		if share, coverage_measured := session.cache_coverage(totals); coverage_measured && share < 1 {
+		if share, coverage_measured := journal.cache_coverage(totals); coverage_measured && share < 1 {
 			status.session_hit_partial = true
 		}
 	}
@@ -770,7 +732,7 @@ obs_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Res
 // snap_append_tool records one tool box: the call's name, the preview of its
 // result, and the outcome its border is colored by. The live turn and the
 // replayed session both arrive here, so the box is the same either way.
-snap_append_tool :: proc(app: ^App, name, content, fallback: string, outcome: session.Tool_Outcome) {
+snap_append_tool :: proc(app: ^App, name, content, fallback: string, outcome: journal.Tool_Outcome) {
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
 	entry := snap_entry_make(app, .Tool, tool_entry_text(name, content, fallback))

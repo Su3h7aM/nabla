@@ -18,9 +18,11 @@ Projection :: struct {
 }
 
 // Projection_Item is one step of the conversation. request names the response
-// an Assistant node's items came from, and is 0 for anything else.
+// an Assistant node's items came from, and is 0 for anything else. turn is
+// the turn that committed the node.
 Projection_Item :: struct {
 	node:    journal.Node_Id,
+	turn:    journal.Turn_Id,
 	request: journal.Request_Id,
 	payload: Projection_Payload,
 }
@@ -138,9 +140,9 @@ projection_load :: proc(
 			journal.payload_decode(node.data, &user, context.temp_allocator) or_return
 			origin, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, user.origin)
 			if !known { return {}, journal.Journal_Error.Corrupt }
-			append(&items, Projection_Item{node = node.id, payload = Projected_User{text = body, origin = origin}}) or_return
+			append(&items, Projection_Item{node = node.id, turn = node.turn, payload = Projected_User{text = body, origin = origin}}) or_return
 		case .Context, .Notice:
-			append(&items, Projection_Item{node = node.id, payload = Projected_User{text = body, origin = .Harness}}) or_return
+			append(&items, Projection_Item{node = node.id, turn = node.turn, payload = Projected_User{text = body, origin = .Harness}}) or_return
 		case .Assistant:
 			projection_add_assistant(&items, node, responses[node.id][:], admitted, arena) or_return
 		case .Results:
@@ -157,7 +159,7 @@ projection_load :: proc(
 				}
 				result.outcome, _ = journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
 				if result.content == "" { result.content = completion.detail }
-				append(&items, Projection_Item{node = node.id, payload = result}) or_return
+				append(&items, Projection_Item{node = node.id, turn = node.turn, payload = result}) or_return
 			}
 		}
 	}
@@ -179,6 +181,7 @@ projection_add_assistant :: proc(
 	journal.payload_decode(node.data, &assistant, context.temp_allocator) or_return
 	item := Projection_Item {
 		node    = node.id,
+		turn    = node.turn,
 		request = assistant.request,
 	}
 	for record in records {

@@ -32,6 +32,7 @@ Open_Mode :: enum {
 }
 
 New_Session :: struct {
+	id:             Session_Id, // zero creates a fresh id
 	workspace:      string,
 	role:           Session_Role,
 	parent_session: Session_Id,
@@ -221,7 +222,8 @@ create_session :: proc(journal: ^Journal, new_session: New_Session) -> (id: Sess
 	assert(new_session.workspace != "", "a session runs in a workspace")
 	if journal.failure != nil { return {}, journal.failure }
 
-	id = session_id_create()
+	id = new_session.id
+	if id == {} { id = session_id_create() }
 	take_claim(journal, id) or_return
 
 	parent_hex: [SESSION_ID_HEX_LENGTH]u8

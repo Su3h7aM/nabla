@@ -5,6 +5,7 @@ package main
 import "core:fmt"
 import "core:io"
 import "core:mem"
+import "core:mem/virtual"
 import "core:net"
 import "core:os"
 import "core:strconv"
@@ -15,7 +16,7 @@ import "core:thread"
 import "core:time"
 
 import "nabla:agent"
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 import "nabla:tui/widgets"
 
@@ -44,22 +45,18 @@ app_session_begin :: proc(t: ^testing.T, app: ^App) -> string {
 	app.setup.alloc = context.allocator
 	app.run.snap.entries = make([dynamic]Entry, 0, 4, app.run.alloc)
 
-	if store_err := session.store_open(&app.setup.store, directory); store_err != nil {
-		testing.fail_now(t, "store_open failed")
+	app.setup.store = new(journal.Journal)
+	app.setup.journal_directory = strings.clone(directory, app.setup.alloc)
+	app.setup.run = journal.run_id_create()
+	if open_error := journal.open(app.setup.store, directory, app.setup.run, .Read_Write, app.setup.alloc); open_error != nil {
+		testing.fail_now(t, "journal.open failed")
 	}
-	created, create_err := session.session_create(&app.setup.store, {workspace = workspace}, 1_000)
-	if create_err != nil { testing.fail_now(t, "session_create failed") }
-	id := session.Session_Id(strings.clone(string(created.id), context.allocator))
-	session.session_destroy(&created)
-	if claim_err := session.session_claim(&app.setup.store, id); claim_err != nil {
-		testing.fail_now(t, "session_claim failed")
-	}
-	delete(string(id), context.allocator)
-
+	id, create_error := journal.create_session(app.setup.store, {workspace = workspace, role = .Main})
+	if create_error != nil { testing.fail_now(t, "could not create the running session") }
+	if _, commit_error := journal.commit(app.setup.store); commit_error != nil { testing.fail_now(t, "could not commit the running session") }
 	app.setup.workspace = workspace
-	claimed, _ := session.session_claimed(&app.setup.store)
 	tool_error: agent.Tool_Registry_Error
-	app.setup.session, tool_error = agent.chat_session_init(&app.setup.store, claimed, workspace, context.allocator)
+	app.setup.session, tool_error = agent.chat_session_init(app.setup.store, id, journal.INITIAL_BRANCH, 0, workspace, context.allocator)
 	if tool_error.kind != .None { testing.fail_now(t, "the tool registry could not be created") }
 	app.setup.session.skill_instructions = agent.test_skill_instructions(&app.setup.session)
 	return directory
@@ -67,18 +64,16 @@ app_session_begin :: proc(t: ^testing.T, app: ^App) -> string {
 
 app_session_end :: proc(app: ^App, directory: string) {
 	agent.chat_session_destroy(&app.setup.session)
-	session.session_release(&app.setup.store)
-	session.store_close(&app.setup.store)
+	_ = session_store_close(app.setup.store, app.setup.alloc)
+	app.setup.store = nil
 	for &entry in app.run.snap.entries {
 		if entry.text != nil { delete(entry.text) }
 	}
 	delete(app.run.snap.entries)
 	for &row in app.run.snap.sessions {
-		delete(string(row.id), app.run.alloc)
 		delete(row.title, app.run.alloc)
 	}
 	delete(app.run.snap.sessions)
-	delete(string(app.run.snap.active_session), app.run.alloc)
 	delete(app.run.snap.status.provider_id, app.run.alloc)
 	delete(app.run.snap.status.model_id, app.run.alloc)
 	delete(app.run.snap.status.effort, app.run.alloc)
@@ -97,6 +92,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 	delete(app.setup.provider_id, app.setup.alloc)
 	delete(app.setup.model_id, app.setup.alloc)
 	delete(app.setup.credential, app.setup.alloc)
+	delete(app.setup.journal_directory, app.setup.alloc)
 	os.remove_all(directory)
 	delete(directory, context.allocator)
 }
@@ -105,12 +101,13 @@ app_session_end :: proc(app: ^App, directory: string) {
 // catalog teardown an empty setup does not need.
 attach_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
-	session.session_release(&setup.store)
-	session.store_close(&setup.store)
+	_ = session_store_close(setup.store, setup.alloc)
+	setup.store = nil
 	_ = run_log_close(setup)
 	delete(setup.workspace, setup.alloc)
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
+	delete(setup.journal_directory, setup.alloc)
 	setup^ = {}
 }
 
@@ -132,8 +129,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	first_setup.alloc = context.allocator
 	defer attach_setup_destroy(&first_setup)
 	if !testing.expect(t, run_session_attach_test(&first_setup, workspace, {kind = .New}, &err_text)) { return }
-	first := session.Session_Id(strings.clone(string(first_setup.session.id), context.allocator))
-	defer delete(string(first), context.allocator)
+	first := first_setup.session.session
 	app_session_turn(t, &first_setup)
 	attach_setup_destroy(&first_setup)
 
@@ -145,8 +141,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	second_setup.alloc = context.allocator
 	defer attach_setup_destroy(&second_setup)
 	if !testing.expect(t, run_session_attach_test(&second_setup, workspace, {kind = .New}, &err_text)) { return }
-	second := session.Session_Id(strings.clone(string(second_setup.session.id), context.allocator))
-	defer delete(string(second), context.allocator)
+	second := second_setup.session.session
 	app_session_turn(t, &second_setup)
 	attach_setup_destroy(&second_setup)
 	testing.expect(t, first != second, "a second launch must start a second session")
@@ -155,15 +150,19 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	latest_setup.alloc = context.allocator
 	defer attach_setup_destroy(&latest_setup)
 	if !testing.expect(t, run_session_attach_test(&latest_setup, workspace, {kind = .Resume_Latest}, &err_text)) { return }
-	testing.expect_value(t, latest_setup.session.id, second)
+	testing.expect_value(t, latest_setup.session.session, second)
 	testing.expect_value(t, latest_setup.workspace, workspace)
 	attach_setup_destroy(&latest_setup)
 
 	named_setup: Run_Setup
 	named_setup.alloc = context.allocator
 	defer attach_setup_destroy(&named_setup)
-	if !testing.expect(t, run_session_attach_test(&named_setup, workspace, {kind = .Resume_Id, id = string(first)}, &err_text)) { return }
-	testing.expect_value(t, named_setup.session.id, first)
+	first_text: [journal.SESSION_ID_HEX_LENGTH]u8
+	if !testing.expect(
+		t,
+		run_session_attach_test(&named_setup, workspace, {kind = .Resume_Id, id = journal.session_id_to_hex(first, first_text[:])}, &err_text),
+	) { return }
+	testing.expect_value(t, named_setup.session.session, first)
 	attach_setup_destroy(&named_setup)
 
 	// The running session is the one the launch named, and the store is free
@@ -172,7 +171,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	missing_setup.alloc = context.allocator
 	testing.expect(
 		t,
-		!run_session_attach_test(&missing_setup, workspace, {kind = .Resume_Id, id = "00000000000000000000000000000000"}, &err_text),
+		!run_session_attach_test(&missing_setup, workspace, {kind = .Resume_Id, id = "ffffffffffffffffffffffffffffffff"}, &err_text),
 		"an unknown id must not silently become a new session",
 	)
 	attach_setup_destroy(&missing_setup)
@@ -189,7 +188,7 @@ test_a_launch_restores_the_stored_selection :: proc(t: ^testing.T) {
 	app.setup.catalog = app_test_catalog(app.setup.alloc)
 	defer agent.catalog_destroy(&app.setup.catalog)
 
-	if err := session.selection_save(&app.setup.store, {provider = "test-provider", model = "test-model", effort = ""}); err != nil {
+	if err := selection_record(app.setup.store, "test-provider", "test-model", ""); err != nil {
 		testing.fail_now(t, "the selection could not be stored")
 	}
 
@@ -229,7 +228,7 @@ test_a_stale_selection_falls_back_rather_than_failing :: proc(t: ^testing.T) {
 
 	app.setup.catalog = app_test_catalog(app.setup.alloc)
 	defer agent.catalog_destroy(&app.setup.catalog)
-	if err := session.selection_save(&app.setup.store, {provider = "gone", model = "gone"}); err != nil {
+	if err := selection_record(app.setup.store, "gone", "gone", ""); err != nil {
 		testing.fail_now(t, "the selection could not be stored")
 	}
 	app.setup.resumed_provider = strings.clone("test-provider", app.setup.alloc)
@@ -249,7 +248,7 @@ test_a_launch_with_nothing_to_resolve_continues_to_the_menu :: proc(t: ^testing.
 
 	app.setup.catalog = app_test_catalog(app.setup.alloc)
 	defer agent.catalog_destroy(&app.setup.catalog)
-	if err := session.selection_save(&app.setup.store, {provider = "gone", model = "gone"}); err != nil {
+	if err := selection_record(app.setup.store, "gone", "gone", ""); err != nil {
 		testing.fail_now(t, "the selection could not be stored")
 	}
 
@@ -270,69 +269,65 @@ test_a_half_given_model_flag_is_refused :: proc(t: ^testing.T) {
 	testing.expect(t, !apply_startup_selection(&app, "", "test-model"))
 }
 
-// app_session_add creates another session in the store and returns a copy of its
-// id, owned by setup.alloc.
-app_session_add :: proc(t: ^testing.T, setup: ^Run_Setup, options: session.Create_Options, at_ms: i64) -> session.Session_Id {
-	created, err := session.session_create(&setup.store, options, at_ms)
-	if err != nil { testing.fail_now(t, "session_create failed") }
-	defer session.session_destroy(&created)
-	return session.Session_Id(strings.clone(string(created.id), setup.alloc))
+// app_session_add records a session in a separate journal without disturbing the running claim.
+App_Test_Session_Options :: struct {
+	workspace: string,
+	provider:  string,
+	model:     string,
 }
 
-// app_session_use creates a session and records one turn in it, which is what
-// makes it a candidate for a bare resume. The turn needs the writer claim, and
-// the fixture's own session holds it, so the claim is swapped for the candidate
-// and swapped back, the way a running session switch does it.
-app_session_use :: proc(t: ^testing.T, setup: ^Run_Setup, options: session.Create_Options, at_ms: i64) -> session.Session_Id {
-	created, err := session.session_create(&setup.store, options, at_ms)
-	if err != nil { testing.fail_now(t, "session_create failed") }
-	defer session.session_destroy(&created)
-
-	displaced, claim_err := session.session_claim_candidate(&setup.store, created.id)
-	if claim_err != nil { testing.fail_now(t, "session_claim_candidate failed") }
-	if _, turn_err := session.turn_begin(&setup.store, created.id, "hello", .Prompt, at_ms); turn_err != nil {
-		testing.fail_now(t, "turn_begin failed")
+app_session_add :: proc(test: ^testing.T, setup: ^Run_Setup, options: App_Test_Session_Options, _: i64) -> journal.Session_Id {
+	store := new(journal.Journal, setup.alloc)
+	if open_error := journal.open(store, setup.journal_directory, journal.run_id_create(), .Read_Write, setup.alloc); open_error != nil {
+		free(store, setup.alloc)
+		testing.fail_now(test, "could not open a session journal")
 	}
-	if restore_err := session.session_claim_restore(&setup.store, displaced); restore_err != nil {
-		testing.fail_now(t, "session_claim_restore failed")
+	defer _ = session_store_close(store, setup.alloc)
+	id, create_error := journal.create_session(store, {workspace = options.workspace, role = .Main})
+	if create_error != nil { testing.fail_now(test, "could not create a session") }
+	if options.provider != "" {
+		journal.append_record(
+			store,
+			{kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = 1, provider = options.provider, model = options.model},
+			journal.Turn_Started{},
+		)
 	}
-	return session.Session_Id(strings.clone(string(created.id), setup.alloc))
+	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(test, "could not commit a session") }
+	return id
 }
 
-// app_session_count is how many sessions the store holds for a directory, which
-// is what says whether a launch left anything behind.
-app_session_count :: proc(t: ^testing.T, setup: ^Run_Setup, workspace: string) -> int {
-	sessions, list_err := session.session_list(&setup.store, {workspace = workspace})
-	if !testing.expect(t, list_err == nil) { return -1 }
-	defer session.sessions_destroy(sessions)
+app_session_use :: proc(test: ^testing.T, setup: ^Run_Setup, options: App_Test_Session_Options, at_ms: i64) -> journal.Session_Id {
+	_ = at_ms
+	time.sleep(2 * time.Millisecond)
+	return app_session_add(test, setup, options, 0)
+}
+
+app_session_count :: proc(test: ^testing.T, setup: ^Run_Setup, workspace: string) -> int {
+	sessions, list_error := journal.list_sessions(setup.store, {workspace = workspace, role = .Main}, setup.alloc)
+	if !testing.expect(test, list_error == nil) { return -1 }
+	defer journal.session_summaries_destroy(sessions, setup.alloc)
 	return len(sessions)
 }
 
-// app_session_turn admits a prompt into the session a setup already holds and
-// claims, which is what records the session and makes it a candidate for a bare
-// resume. It goes through the same path the front-end uses, because that path is
-// what writes the row.
-app_session_turn :: proc(t: ^testing.T, setup: ^Run_Setup) {
-	if accepted := agent.chat_session_accept_user(&setup.session, "hello", session.now_ms()); accepted != .Accepted {
-		testing.fail_now(t, "the prompt was not accepted")
+app_session_turn :: proc(test: ^testing.T, setup: ^Run_Setup) {
+	if accepted := agent.chat_session_accept_user(&setup.session, "hello"); accepted != .Accepted {
+		testing.fail_now(test, "the prompt was not accepted")
 	}
 }
 
-// app_session_accept admits a prompt into the running session and checks that it
-// was recorded. A refusal that merely leaves the running session's id looking the
-// same is not enough: the session has to still be claimed and writable.
-app_session_accept :: proc(t: ^testing.T, app: ^App, text: string) {
-	accepted := agent.chat_session_accept_user(&app.setup.session, text, session.now_ms())
-	if !testing.expect_value(t, accepted, agent.Chat_Accept.Accepted) { return }
-
-	entries, load_err := session.entries_load(&app.setup.store, app.setup.session.id, {}, context.allocator)
-	if !testing.expect(t, load_err == nil, "the running session's history must still be readable") { return }
-	defer session.entries_destroy(entries, context.allocator)
+app_session_accept :: proc(test: ^testing.T, app: ^App, text: string) {
+	accepted := agent.chat_session_accept_user(&app.setup.session, text)
+	if !testing.expect_value(test, accepted, agent.Chat_Accept.Accepted) { return }
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil { testing.fail_now(test, "could not allocate projection") }
+	defer virtual.arena_destroy(&arena)
+	projection, load_error := agent.projection_load(app.setup.store, app.setup.session.session, app.setup.session.head, virtual.arena_allocator(&arena))
+	if !testing.expect(test, load_error == nil, "the running session's history must still be readable") { return }
 	found := false
-	for &entry in entries {
-		if user, is_user := entry.payload.(session.User_Entry); is_user && user.text == text { found = true }
+	for &item in projection.items {
+		if user, is_user := item.payload.(agent.Projected_User); is_user && user.text == text { found = true }
 	}
-	testing.expect(t, found, "the running session must still record history")
+	testing.expect(test, found, "the running session must still record history")
 }
 
 // app_workspace_make creates a directory a session can claim to have run in.
@@ -400,8 +395,22 @@ app_state_restore :: proc(state, previous: string, had_previous: bool) {
 
 // session_open_test opens one target against a captured diagnosis writer, so
 // the test run stays quiet and the failure text itself is assertable.
-session_open_test :: proc(setup: ^Run_Setup, start: Session_Start, workspace: string, err: ^strings.Builder) -> (Session_Target, bool) {
-	return session_open_target(setup, start, workspace, strings.to_writer(err))
+session_open_test :: proc(setup: ^Run_Setup, start: Session_Start, workspace: string, err: ^strings.Builder) -> (Opened_Session, bool) {
+	return session_open_test_impl(setup, start, workspace, err)
+}
+
+session_open_test_impl :: proc(setup: ^Run_Setup, start: Session_Start, workspace: string, output: ^strings.Builder) -> (Opened_Session, bool) {
+	opened, message, ok := session_open(setup, start, workspace)
+	if !ok {
+		strings.write_string(output, message)
+		delete(message, setup.alloc)
+	}
+	return opened, ok
+}
+
+app_session_id_text :: proc(id: journal.Session_Id) -> string {
+	buffer: [journal.SESSION_ID_HEX_LENGTH]u8
+	return strings.clone(journal.session_id_to_hex(id, buffer[:]), context.temp_allocator)
 }
 
 // run_session_attach_test attaches one launch against a captured diagnosis
@@ -422,10 +431,10 @@ test_a_launch_without_resume_starts_a_new_session :: proc(t: ^testing.T) {
 
 	first, first_ok := session_open_test(&app.setup, {kind = .New}, app.setup.workspace, &err_text)
 	if !testing.expect(t, first_ok) { return }
-	defer session_target_destroy(&first, app.setup.alloc)
+	defer opened_session_destroy(&first, app.setup.alloc)
 	second, second_ok := session_open_test(&app.setup, {kind = .New}, app.setup.workspace, &err_text)
 	if !testing.expect(t, second_ok) { return }
-	defer session_target_destroy(&second, app.setup.alloc)
+	defer opened_session_destroy(&second, app.setup.alloc)
 
 	testing.expect(t, first.id != second.id, "a second launch must not reuse the first session")
 	testing.expect_value(t, first.workspace, app.setup.workspace)
@@ -484,15 +493,12 @@ test_resume_latest_is_scoped_to_the_directory :: proc(t: ^testing.T) {
 	// up here would be the wrong answer. Every session here holds a turn, so none
 	// of them is passed over for being empty.
 	elder := app_session_use(t, &app.setup, {workspace = app.setup.workspace}, 2_000)
-	defer delete(string(elder), app.setup.alloc)
 	newest := app_session_use(t, &app.setup, {workspace = app.setup.workspace}, 3_000)
-	defer delete(string(newest), app.setup.alloc)
 	elsewhere := app_session_use(t, &app.setup, {workspace = other}, 9_000)
-	defer delete(string(elsewhere), app.setup.alloc)
 
 	target, ok := session_open_test(&app.setup, {kind = .Resume_Latest}, app.setup.workspace, &err_text)
 	if !testing.expect(t, ok) { return }
-	defer session_target_destroy(&target, app.setup.alloc)
+	defer opened_session_destroy(&target, app.setup.alloc)
 	testing.expect_value(t, target.id, newest)
 	testing.expect(t, target.id != elsewhere, "a resume must not leave the directory")
 	testing.expect_value(t, target.workspace, app.setup.workspace)
@@ -510,13 +516,11 @@ test_resume_latest_skips_a_session_that_was_never_used :: proc(t: ^testing.T) {
 	defer app_session_end(&app, directory)
 
 	conversation := app_session_use(t, &app.setup, {workspace = app.setup.workspace}, 2_000)
-	defer delete(string(conversation), app.setup.alloc)
-	abandoned := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 3_000)
-	defer delete(string(abandoned), app.setup.alloc)
+	abandoned := journal.session_id_create()
 
 	target, ok := session_open_test(&app.setup, {kind = .Resume_Latest}, app.setup.workspace, &err_text)
 	if !testing.expect(t, ok) { return }
-	defer session_target_destroy(&target, app.setup.alloc)
+	defer opened_session_destroy(&target, app.setup.alloc)
 	testing.expect_value(t, target.id, conversation)
 	testing.expect(t, target.id != abandoned, "a session that was never used must not be resumed")
 }
@@ -536,9 +540,7 @@ test_resume_latest_refuses_an_empty_directory :: proc(t: ^testing.T) {
 		delete(empty, context.allocator)
 	}
 
-	// A session in that directory that was never used leaves nothing to resume.
-	abandoned := app_session_add(t, &app.setup, {workspace = empty}, 4_000)
-	defer delete(string(abandoned), app.setup.alloc)
+	// A launch without a prompt has no session row to resume.
 
 	_, ok := session_open_test(&app.setup, {kind = .Resume_Latest}, empty, &err_text)
 	testing.expect(t, !ok, "a resume with nothing to resume must fail")
@@ -561,11 +563,10 @@ test_resume_by_id_leaves_the_launch_directory_behind :: proc(t: ^testing.T) {
 		delete(other, context.allocator)
 	}
 	id := app_session_add(t, &app.setup, {workspace = other, provider = "test-provider", model = "test-model"}, 5_000)
-	defer delete(string(id), app.setup.alloc)
 
-	target, ok := session_open_test(&app.setup, {kind = .Resume_Id, id = string(id)}, app.setup.workspace, &err_text)
+	target, ok := session_open_test(&app.setup, {kind = .Resume_Id, id = app_session_id_text(id)}, app.setup.workspace, &err_text)
 	if !testing.expect(t, ok) { return }
-	defer session_target_destroy(&target, app.setup.alloc)
+	defer opened_session_destroy(&target, app.setup.alloc)
 	testing.expect_value(t, target.id, id)
 	testing.expect_value(t, target.workspace, other)
 	testing.expect_value(t, target.provider, "test-provider")
@@ -580,9 +581,9 @@ test_resume_by_id_refuses_what_it_cannot_open :: proc(t: ^testing.T) {
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
 
-	_, missing_ok := session_open_test(&app.setup, {kind = .Resume_Id, id = "00000000000000000000000000000000"}, app.setup.workspace, &err_text)
+	_, missing_ok := session_open_test(&app.setup, {kind = .Resume_Id, id = "ffffffffffffffffffffffffffffffff"}, app.setup.workspace, &err_text)
 	testing.expect(t, !missing_ok, "an unknown id must be refused")
-	testing.expect(t, strings.contains(strings.to_string(err_text), "cannot open session"), "the missing row should be reported")
+	testing.expect(t, strings.contains(strings.to_string(err_text), "does not exist"), "the missing row should be reported")
 
 	_, malformed_ok := session_open_test(&app.setup, {kind = .Resume_Id, id = "not-a-session"}, app.setup.workspace, &err_text)
 	testing.expect(t, !malformed_ok, "a malformed id must be refused")
@@ -599,18 +600,14 @@ test_a_switch_to_a_missing_directory_keeps_the_running_session :: proc(t: ^testi
 
 	gone := app_workspace_make(t)
 	id := app_session_add(t, &app.setup, {workspace = gone}, 6_000)
-	defer delete(string(id), app.setup.alloc)
 	os.remove_all(gone)
 	defer delete(gone, context.allocator)
 
-	running := session.Session_Id(strings.clone(string(app.setup.session.id), context.allocator))
-	defer delete(string(running), context.allocator)
+	running := app.setup.session.session
 
-	testing.expect(t, !session_switch(&app, id))
-	testing.expect_value(t, app.setup.session.id, running)
-	claimed, held := session.session_claimed(&app.setup.store)
-	if !testing.expect(t, held, "the running session must stay claimed") { return }
-	testing.expect_value(t, claimed, running)
+	testing.expect(t, !session_switch(&app, {kind = .Resume_Id, id = app_session_id_text(id)}))
+	testing.expect_value(t, app.setup.session.session, running)
+	testing.expect_value(t, app.setup.store.claimed, running)
 
 	// A refusal costs the running session nothing, so it can still take a prompt.
 	app_session_accept(t, &app, "after the refusal")
@@ -625,22 +622,19 @@ test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 	defer app_session_end(&app, directory)
 
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	defer delete(string(id), app.setup.alloc)
-	running := session.Session_Id(strings.clone(string(app.setup.session.id), context.allocator))
-	defer delete(string(running), context.allocator)
+	running := app.setup.session.session
 
 	// A second store claiming the target is what a second process running it
 	// looks like from here.
-	other: session.Store
-	if err := session.store_open(&other, directory); err != nil { testing.fail_now(t, "second store_open failed") }
-	defer session.store_close(&other)
-	if err := session.session_claim(&other, id); err != nil { testing.fail_now(t, "the second store could not claim the target") }
+	other: journal.Journal
+	if open_error := journal.open(&other, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	   open_error != nil { testing.fail_now(t, "second journal could not open") }
+	defer _ = journal.close(&other)
+	if _, claim_error := journal.claim(&other, id); claim_error != nil { testing.fail_now(t, "the second journal could not claim the target") }
 
-	testing.expect(t, !session_switch(&app, id))
-	testing.expect_value(t, app.setup.session.id, running)
-	claimed, held := session.session_claimed(&app.setup.store)
-	if !testing.expect(t, held, "the running session must stay claimed") { return }
-	testing.expect_value(t, claimed, running)
+	testing.expect(t, !session_switch(&app, {kind = .Resume_Id, id = app_session_id_text(id)}))
+	testing.expect_value(t, app.setup.session.session, running)
+	testing.expect_value(t, app.setup.store.claimed, running)
 
 	// The refusal must not have disturbed the running session: it is still claimed
 	// and still writable, not merely named the same.
@@ -649,11 +643,12 @@ test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 	// The running session was never released during the attempt, so another
 	// process still cannot take it. A third store holds no claim of its own, so
 	// its refusal can only come from the running session being locked.
-	prober: session.Store
-	if err := session.store_open(&prober, directory); err != nil { testing.fail_now(t, "third store_open failed") }
-	defer session.store_close(&prober)
-	running_claim_err := session.session_claim(&prober, running)
-	testing.expect(t, session.error_kind(running_claim_err) == session.Error_Kind.Claimed, "a refused switch must not have released the running session")
+	prober: journal.Journal
+	if open_error := journal.open(&prober, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	   open_error != nil { testing.fail_now(t, "third journal could not open") }
+	defer _ = journal.close(&prober)
+	_, running_claim_error := journal.claim(&prober, running)
+	testing.expect_value(t, running_claim_error, journal.Journal_Error.Claimed)
 }
 
 // Resuming has to leave the conversation able to send, so the model the session
@@ -669,9 +664,8 @@ test_a_switch_applies_the_model_the_session_recorded :: proc(t: ^testing.T) {
 	defer agent.catalog_destroy(&app.setup.catalog)
 
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace, provider = "test-provider", model = "test-model"}, 8_000)
-	defer delete(string(id), app.setup.alloc)
 
-	testing.expect(t, session_switch(&app, id))
+	testing.expect(t, session_switch(&app, {kind = .Resume_Id, id = app_session_id_text(id)}))
 	testing.expect_value(t, app.setup.session.provider_id, "test-provider")
 	testing.expect_value(t, app.setup.session.model_id, "test-model")
 	testing.expect_value(t, app.setup.session.capacity.window, 128_000)
@@ -687,16 +681,14 @@ test_new_and_resume_switch_and_replay :: proc(t: ^testing.T) {
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
 
-	first := session.Session_Id(strings.clone(string(app.setup.session.id), context.allocator))
-	defer delete(string(first), context.allocator)
+	first := app.setup.session.session
 
 	// The first session has one prompt, so a resume has something to replay.
-	accepted := agent.chat_session_accept_user(&app.setup.session, "remember me", session.now_ms())
+	accepted := agent.chat_session_accept_user(&app.setup.session, "remember me")
 	testing.expect_value(t, accepted, agent.Chat_Accept.Accepted)
 
-	testing.expect(t, session_start_new(&app))
-	second := session.Session_Id(strings.clone(string(app.setup.session.id), context.allocator))
-	defer delete(string(second), context.allocator)
+	testing.expect(t, session_switch(&app, {kind = .New}))
+	second := app.setup.session.session
 	testing.expect(t, first != second, "a new session must be a different session")
 
 	// The new session has no prompt, so it has no row: the list still names only
@@ -708,8 +700,8 @@ test_new_and_resume_switch_and_replay :: proc(t: ^testing.T) {
 	menu_close(&app)
 
 	snapshot_clear(&app)
-	session_resume(&app, string(first)[:8])
-	testing.expect_value(t, app.setup.session.id, first)
+	session_resume(&app, app_session_id_text(first)[:8])
+	testing.expect_value(t, app.setup.session.session, first)
 
 	// The replayed prompt is what makes a resumed conversation recognisable.
 	found := false
@@ -728,61 +720,49 @@ test_resume_replays_a_tool_call_as_a_box :: proc(t: ^testing.T) {
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
 
-	id := session.Session_Id(strings.clone(string(app.setup.session.id), context.allocator))
-	defer delete(string(id), context.allocator)
+	id := app.setup.session.session
 
-	accepted := agent.chat_session_accept_user(&app.setup.session, "list files", session.now_ms())
+	accepted := agent.chat_session_accept_user(&app.setup.session, "list files")
 	if !testing.expect_value(t, accepted, agent.Chat_Accept.Accepted) { return }
-	request_no, request_err := session.request_begin(
-		&app.setup.store,
-		app.setup.session.id,
-		{
-			turn_no = app.setup.session.turn_no,
-			purpose = .Response,
-			provider = "test-provider",
-			model_requested = "test-model",
-			api = "openai_chat_completions",
-			config_json = "{}",
-			input_json = "{}",
-		},
-		session.now_ms(),
+	store := app.setup.store
+	chat := &app.setup.session
+	assistant := journal.append_node(
+		store,
+		{session = id, branch = chat.branch, parent = chat.head, turn = chat.turn, kind = .Assistant},
+		journal.Assistant{request = 1},
 	)
-	if !testing.expect(t, request_err == nil, "the request must be recorded") { return }
+	call := journal.next_call(store)
+	arguments: string = `{"command":"ls"}`
+	content: string = "ok\nexit_code: 3\n\nstdout:\nfirst\nsecond\n"
+	journal.append_record(
+		store,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, request = 1, call = call},
+		journal.Tool_Proposed{provider_id = "call_1", name = "builtin_shell"},
+		transmute([]u8)arguments,
+	)
+	journal.append_record(
+		store,
+		{kind = .Tool_Completed, session = id, branch = chat.branch, node = assistant, call = call},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+		transmute([]u8)content,
+	)
+	_ = journal.append_node(
+		store,
+		{session = id, branch = chat.branch, parent = assistant, turn = chat.turn, kind = .Results},
+		journal.Results{calls = []journal.Call_Id{call}},
+	)
+	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(t, "the tool call could not be recorded") }
 
-	call_seq, call_err := session.entry_append(
-		&app.setup.store,
-		app.setup.session.id,
-		{
-			turn_no = app.setup.session.turn_no,
-			request_no = request_no,
-			created_at_ms = 2_000,
-			payload = session.Tool_Call_Entry{call_id = "call_1", name = "builtin_shell", arguments = `{"command":"ls"}`},
-		},
-	)
-	if !testing.expect(t, call_err == nil, "the call entry must be recorded") { return }
-	_, result_err := session.entry_append(
-		&app.setup.store,
-		app.setup.session.id,
-		{
-			turn_no = app.setup.session.turn_no,
-			request_no = request_no,
-			created_at_ms = 2_001,
-			related_seq = call_seq,
-			payload = session.Tool_Result_Entry{outcome = .Success, content = "ok\nexit_code: 3\n\nstdout:\nfirst\nsecond\n", origin = .Observed},
-		},
-	)
-	if !testing.expect(t, result_err == nil, "the result entry must be recorded") { return }
-
-	testing.expect(t, session_start_new(&app))
+	testing.expect(t, session_switch(&app, {kind = .New}))
 	snapshot_clear(&app)
-	session_resume(&app, string(id)[:8])
-	testing.expect_value(t, app.setup.session.id, id)
+	session_resume(&app, app_session_id_text(id)[:8])
+	testing.expect_value(t, app.setup.session.session, id)
 
 	replayed := false
 	for &entry in app.run.snap.entries {
 		if entry.kind != .Tool { continue }
 		replayed = true
-		testing.expect_value(t, entry.tool_outcome, session.Tool_Outcome.Success)
+		testing.expect_value(t, entry.tool_outcome, journal.Tool_Outcome.Success)
 		testing.expect_value(t, string(entry.text[:]), "builtin_shell\nstdout:\nfirst\nsecond\n")
 	}
 	testing.expect(t, replayed, "resuming should replay the tool call")
@@ -794,9 +774,9 @@ test_resume_refuses_an_unknown_reference :: proc(t: ^testing.T) {
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
 
-	before := app.setup.session.id
+	before := app.setup.session.session
 	session_resume(&app, "zzzzzzzz")
-	testing.expect_value(t, app.setup.session.id, before)
+	testing.expect_value(t, app.setup.session.session, before)
 	testing.expect(t, len(app.run.snap.entries) > 0, "the refusal should be reported")
 }
 
@@ -830,9 +810,9 @@ test_a_stopped_worker_abandons_queued_work :: proc(t: ^testing.T) {
 
 	// Nothing ran: the session is idle and its history is empty.
 	testing.expect_value(t, agent.chat_session_state(&app.setup.session), agent.Chat_State.Idle)
-	entries, load_err := session.entries_load(&app.setup.store, app.setup.session.id, {}, context.allocator)
+	entries, _, load_err := journal.read_records(app.setup.store, {session = app.setup.session.session, kinds = {.Node_Committed}}, 0, 0, context.allocator)
 	if !testing.expect(t, load_err == nil, "the session's history must be readable") { return }
-	defer session.entries_destroy(entries, context.allocator)
+	defer journal.records_destroy(entries, context.allocator)
 	testing.expect_value(t, len(entries), 0)
 }
 
@@ -955,6 +935,7 @@ test_a_headless_turn_answers_against_an_endpoint :: proc(t: ^testing.T) {
 	}
 
 	answer: strings.Builder
+	defer strings.builder_destroy(&answer)
 	out := Headless_Output {
 		answer = strings.to_writer(&answer),
 	}
@@ -1046,6 +1027,7 @@ test_a_headless_turn_answers_against_an_anthropic_endpoint :: proc(t: ^testing.T
 	}
 
 	answer: strings.Builder
+	defer strings.builder_destroy(&answer)
 	out := Headless_Output {
 		answer = strings.to_writer(&answer),
 	}
@@ -1069,15 +1051,11 @@ test_a_headless_turn_answers_against_an_anthropic_endpoint :: proc(t: ^testing.T
 
 	// The turn recorded the usage the adapter normalized, so the cache accounting
 	// sees a total rather than only the uncached part.
-	request, request_err := session.request_load(&app.setup.store, app.setup.session.id, 1)
-	if !testing.expect_value(t, request_err, nil) { return }
-	defer session.request_destroy(&request)
-	if input, present := request.usage.input.?; testing.expect(t, present) {
-		testing.expect_value(t, input, i64(1050))
-	}
-	if read, present := request.usage.cache_read.?; testing.expect(t, present) {
-		testing.expect_value(t, read, i64(900))
-	}
+	totals, usage_error := journal.usage_totals(app.setup.store, app.setup.session.session)
+	if !testing.expect_value(t, usage_error, nil) { return }
+	testing.expect_value(t, totals.requests, 1)
+	testing.expect_value(t, totals.input, i64(1050))
+	testing.expect_value(t, totals.cache_read, i64(900))
 }
 
 ANTHROPIC_COMPLETION_RESPONSE ::
@@ -1167,7 +1145,7 @@ test_refresh_degrades_to_native_tools_when_a_server_is_unusable :: proc(t: ^test
 	output := Diagnostics_Output {
 		writer = strings.to_writer(&output_text),
 	}
-	summary := agent.log_read_session(directory, app.setup.session.id, &output, diagnostics_visit)
+	summary := agent.log_read_session(directory, app_session_id_text(app.setup.session.session), &output, diagnostics_visit)
 	testing.expect_value(t, summary.records, 2)
 	testing.expect(t, strings.contains(strings.to_string(output_text), `"installed":true`))
 	testing.expect(t, strings.contains(strings.to_string(output_text), `"unavailable_servers":1`))
@@ -1201,11 +1179,11 @@ session_log_visit :: proc(user_data: rawptr, _: string, line: string) -> bool {
 	return true
 }
 
-app_session_log_text :: proc(t: ^testing.T, logs_root: string, id: session.Session_Id) -> strings.Builder {
+app_session_log_text :: proc(t: ^testing.T, logs_root: string, id: journal.Session_Id) -> strings.Builder {
 	collector := Session_Log_Text {
 		builder = strings.builder_make(context.allocator),
 	}
-	summary := agent.log_read_session(logs_root, id, &collector, session_log_visit)
+	summary := agent.log_read_session(logs_root, app_session_id_text(id), &collector, session_log_visit)
 	testing.expectf(t, summary.cannot_read == 0, "the log should be readable")
 	testing.expectf(t, summary.records_skipped == 0, "every line the reader saw should parse")
 	return collector.builder
@@ -1232,13 +1210,11 @@ test_a_switch_records_the_claim_and_the_release :: proc(t: ^testing.T) {
 	}
 	context.logger = agent.log_logger(&app.setup.log_binding)
 
-	first := session.Session_Id(strings.clone(string(app.setup.session.id), context.allocator))
-	defer delete(string(first), context.allocator)
+	first := app.setup.session.session
 
 	// A new session displaces the running one, so both facts belong in the record.
-	testing.expect(t, session_start_new(&app))
-	second := session.Session_Id(strings.clone(string(app.setup.session.id), context.allocator))
-	defer delete(string(second), context.allocator)
+	testing.expect(t, session_switch(&app, {kind = .New}))
+	second := app.setup.session.session
 	testing.expect(t, first != second, "a new session must be a different session")
 
 	second_builder := app_session_log_text(t, logs_root, second)
@@ -1270,10 +1246,11 @@ test_the_mcp_lifecycle_records_name_the_server_instance :: proc(t: ^testing.T) {
 
 	// The refresh records against the session it changes, so the binding carries one
 	// and the reader can find the records again.
-	session_id := session.Session_Id("00112233445566778899aabbccddeeff")
+	session_id, valid := journal.session_id_parse("00112233445566778899aabbccddeeff")
+	if !testing.expect(t, valid) { return }
 	binding := agent.Log_Binding {
 		sink = &log_record,
-		correlation = agent.Log_Correlation{session_id = session_id},
+		correlation = agent.Log_Correlation{session_id = app_session_id_text(session_id)},
 	}
 	context.logger = agent.log_logger(&binding)
 
@@ -1362,26 +1339,3 @@ test_catalog_refresh_enriches_the_active_selection :: proc(t: ^testing.T) {
 
 // A selection the user asks for is recorded, not applied: the turn owns the session
 // until its next request boundary, so the choice waits in run state for whichever
-// boundary reaches it first, and only that one installs it.
-@(test)
-test_a_requested_selection_waits_for_a_boundary_and_installs_once :: proc(t: ^testing.T) {
-	app: App
-	directory := app_session_begin(t, &app)
-	defer app_session_end(&app, directory)
-	app.setup.catalog = app_test_catalog(app.setup.alloc)
-	defer agent.catalog_destroy(&app.setup.catalog)
-	app.run.work, _ = chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
-	defer chan.destroy(&app.run.work)
-
-	testing.expect(t, apply_selection(&app, "test-provider", "test-model", ""))
-	selection_request(&app, "test-provider", "test-model")
-	testing.expect(t, app.run.pending.present, "a requested selection waits for a boundary")
-	// The wake is what an idle worker blocks on; the choice itself is not in it.
-	wake, queued := chan.recv(app.run.work)
-	if !testing.expect(t, queued, "requesting a selection wakes the worker") { return }
-	testing.expect_value(t, wake.kind, Work_Kind.Model)
-	work_destroy(&app, wake)
-
-	testing.expect(t, apply_pending_selection(&app), "the first boundary installs the selection")
-	testing.expect(t, !apply_pending_selection(&app), "a later boundary has nothing left to install")
-}

@@ -7,7 +7,7 @@ import "core:strings"
 import "core:sync"
 
 import "nabla:agent"
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import input "nabla:input"
 
 menu_begin :: proc(app: ^App, kind: Menu_Kind, title: string, choices: [dynamic]Choice, required: bool) {
@@ -133,36 +133,40 @@ menu_open_effort :: proc(app: ^App) {
 // it built is what the menu shows.
 menu_open_session :: proc(app: ^App) {
 	choices := make([dynamic]Choice, 0, 8, app.run.alloc)
-	active: session.Session_Id
+	active: journal.Session_Id
 
 	// The snapshot's rows and their strings belong to the worker, which can replace
 	// them the moment the lock is released, so the labels are copied while the lock
 	// that protects them is still held.
 	sync.mutex_lock(&app.run.mu)
-	active = session.Session_Id(strings.clone(string(app.run.snap.active_session), app.run.alloc))
+	active = app.run.snap.active_session
 	for &row in app.run.snap.sessions {
 		label := row.title if row.title != "" else "(untitled)"
+		hex_text: [journal.SESSION_ID_HEX_LENGTH]u8
+		hex := journal.session_id_to_hex(row.id, hex_text[:])
 		append(
 			&choices,
 			Choice {
 				label = strings.clone(label, app.run.alloc),
-				detail = strings.clone(string(row.id)[:8], app.run.alloc),
-				action = Session_Choice{id = session.Session_Id(strings.clone(string(row.id), app.run.alloc))},
+				detail = strings.clone(hex[:SESSION_ID_SHORT_LENGTH], app.run.alloc),
+				action = Session_Choice{id = row.id},
 			},
 		)
 	}
 	sync.mutex_unlock(&app.run.mu)
-	defer delete(string(active), app.run.alloc)
 
 	menu_begin(app, .Session, "sessions in this workspace", choices, false)
 	menu_pick_session(app, active)
 }
 
+// SESSION_ID_SHORT_LENGTH is how many hex digits of an id a listing shows.
+SESSION_ID_SHORT_LENGTH :: 8
+
 // menu_pick_session opens the list on the running session, so the menu shows
 // where the user already is.
 @(private)
-menu_pick_session :: proc(app: ^App, active: session.Session_Id) {
-	if active == "" { return }
+menu_pick_session :: proc(app: ^App, active: journal.Session_Id) {
+	if active == {} { return }
 	for choice, index in app.menu.choices {
 		action := choice.action.(Session_Choice)
 		if action.id == active {
@@ -190,7 +194,8 @@ menu_submit :: proc(app: ^App) {
 	case Effort_Choice:
 		enqueue(app, .Effort, action.level)
 	case Session_Choice:
-		enqueue(app, .Resume_Session, string(action.id))
+		hex_text: [journal.SESSION_ID_HEX_LENGTH]u8
+		enqueue(app, .Resume_Session, journal.session_id_to_hex(action.id, hex_text[:]))
 	}
 	if !app.menu.required { menu_close(app) }
 }

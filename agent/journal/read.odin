@@ -37,6 +37,7 @@ Session_Summary :: struct {
 	parent_call:    Call_Id,
 	title:          string, // "" until a session.titled record names it
 	last_seq:       Journal_Seq,
+	updated_ms:     i64, // time of the newest record
 }
 
 Branch_Summary :: struct {
@@ -288,6 +289,7 @@ list_sessions :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.
 		summary.parent_call = Call_Id(row_int(&row))
 		summary.title = row_text(&row)
 		summary.last_seq = Journal_Seq(row_int(&row))
+		summary.updated_ms = row_int(&row)
 		if row.error != nil {
 			session_summary_destroy(&summary, allocator)
 			return nil, corrupt(journal, row.error, summary.id, 0)
@@ -395,7 +397,8 @@ SESSION_LIST_QUERY :: `SELECT * FROM (
 	SELECT session, created_ms, workspace, role, parent_session, parent_call,
 		COALESCE((SELECT json_extract(data, '$.title') FROM records AS titled
 			WHERE titled.session = sessions.session AND titled.kind = 'session.titled' ORDER BY titled.seq DESC LIMIT 1), '') AS title,
-		COALESCE((SELECT MAX(seq) FROM records WHERE records.session = sessions.session), 0) AS last_seq
+		COALESCE((SELECT MAX(seq) FROM records WHERE records.session = sessions.session), 0) AS last_seq,
+		COALESCE((SELECT time_ms FROM records WHERE records.session = sessions.session ORDER BY seq DESC LIMIT 1), created_ms) AS updated_ms
 	FROM sessions)
 WHERE 1 = 1`
 

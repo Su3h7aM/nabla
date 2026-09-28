@@ -5,13 +5,14 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:io"
 import "core:mem"
+import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:time"
 
 import "nabla:agent"
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 // The export writes one session's evidence into a directory of its own, with a
 // manifest that says what was written, what was left out, and why. Metadata is the
@@ -49,14 +50,11 @@ Export_Manifest :: struct {
 	omissions:        []string `json:"omissions"`,
 }
 
-// Export_Request is the durable half of one --request export: what the session
-// database, not the log, is authoritative for. Every optional fact carries its
+// Export_Request summarizes one request from journal records. Every optional fact carries its
 // own presence flag, because JSON cannot tell a reader that did not write the
 // file whether an absent number was unreported or zero.
 //
-// The stored input, response, error, and configuration are deliberately absent,
-// `--include-payloads` included: that flag adds diagnostic wire artifacts, and a
-// conversation dump is a different request than a diagnostics bundle.
+// The stored input, response, error, and configuration are absent from request.json.
 Export_Request :: struct {
 	version:                    int `json:"version"`,
 	session_id:                 string `json:"session_id"`,
@@ -68,6 +66,8 @@ Export_Request :: struct {
 	finished_at_ms_present:     bool `json:"finished_at_ms_present"`,
 	finished_at_ms:             i64 `json:"finished_at_ms"`,
 	outcome:                    string `json:"outcome"`,
+	attempts:                   int `json:"attempts"`,
+	finish:                     string `json:"finish"`,
 	provider:                   string `json:"provider"`,
 	model_requested:            string `json:"model_requested"`,
 	model_resolved:             string `json:"model_resolved"`,
@@ -89,6 +89,20 @@ Export_File :: struct {
 	truncated: bool `json:"truncated"`,
 }
 
+Export_Journal_Record :: struct {
+	seq:      i64 `json:"seq"`,
+	time_ms:  i64 `json:"time_ms"`,
+	kind:     string `json:"kind"`,
+	turn:     int `json:"turn"`,
+	request:  int `json:"request"`,
+	attempt:  int `json:"attempt"`,
+	call:     int `json:"call"`,
+	provider: string `json:"provider"`,
+	model:    string `json:"model"`,
+	data:     json.Value `json:"data"`,
+	body:     string `json:"body,omitempty"`,
+}
+
 // Export_State is what the reader's visitor fills while the session's records are
 // copied: the bytes written, the runs that contributed them, and what the budget
 // refused.
@@ -103,7 +117,8 @@ Export_State :: struct {
 
 diagnostics_export :: proc(
 	logs_root: string,
-	session_id: session.Session_Id,
+	session_text: string,
+	session_id: journal.Session_Id,
 	destination: string,
 	selector: agent.Log_Read_Selector,
 	include_payloads: bool,
@@ -143,12 +158,12 @@ diagnostics_export :: proc(
 	// The durable row is written first, because it is the file that says what the
 	// session decided rather than what one process observed.
 	if request_no, selected := selector.request_no.?; selected {
-		if !diagnostics_export_request(&files, &omissions, destination, session_id, request_no, join_okay) {
+		if !diagnostics_export_request(&files, &omissions, destination, session_text, session_id, journal.Request_Id(request_no), join_okay) {
 			state.written_okay = false
 		}
 	}
 
-	summary := diagnostics_export_session(&files, &state, logs_root, destination, session_id, selector, stderr)
+	summary := diagnostics_export_session(&files, &state, logs_root, destination, session_text, session_id, selector, include_payloads, stderr)
 	if !state.written_okay { return 1 }
 	defer {
 		for run_id in state.runs { delete(run_id, context.allocator) }
@@ -169,7 +184,7 @@ diagnostics_export :: proc(
 	export_note_reader_omissions(&omissions, summary)
 	manifest := Export_Manifest {
 		version          = 1,
-		session_id       = string(session_id),
+		session_id       = session_text,
 		created_unix_ns  = time.time_to_unix_nano(time.now()),
 		level_floor      = agent.log_level_name(selector.level),
 		request_no       = export_request_number(selector),
@@ -189,17 +204,17 @@ diagnostics_export :: proc(
 	return 0
 }
 
-// diagnostics_export_session copies the session's own records and reports the reader
-// summary. The records are written as they were read, so a caller can compare the
-// export against the stream it came from.
+// diagnostics_export_session writes the journal records and collects diagnostic run ids.
 @(private)
 diagnostics_export_session :: proc(
 	files: ^[dynamic]Export_File,
 	state: ^Export_State,
 	logs_root: string,
 	destination: string,
-	session_id: session.Session_Id,
+	session_text: string,
+	session_id: journal.Session_Id,
 	selector: agent.Log_Read_Selector,
+	include_payloads: bool,
 	stderr: io.Writer,
 ) -> agent.Log_Read_Summary {
 	path, joined := export_join(destination, EXPORT_SESSION_NAME, context.allocator)
@@ -216,16 +231,68 @@ diagnostics_export_session :: proc(
 	}
 	state.file = file
 	state.hash = hash
-	summary := agent.log_read_session(logs_root, session_id, state, diagnostics_export_visit, selector)
+	summary := agent.log_read_session(logs_root, session_text, state, diagnostics_export_visit, selector)
+	journal_directory, directory_error := agent.xdg_directory(.State, context.temp_allocator)
+	if directory_error != .None {
+		state.written_okay = false
+	} else {
+		store: journal.Journal
+		if open_error := journal.open(&store, journal_directory, journal.run_id_create(), .Read_Only, context.allocator); open_error != nil {
+			state.written_okay = false
+		} else {
+			last: journal.Journal_Seq
+			for state.written_okay {
+				records, next, read_error := journal.read_records(&store, {session = session_id}, last, 256, context.allocator)
+				if read_error != nil { state.written_okay = false; break }
+				for &record in records {
+					if !diagnostics_export_journal_record(state, &record, include_payloads) { state.written_okay = false; break }
+				}
+				journal.records_destroy(records, context.allocator)
+				if next == last { break }
+				last = next
+			}
+			if journal.close(&store) != nil { state.written_okay = false }
+		}
+	}
 	if !export_close(files, EXPORT_SESSION_NAME, file, hash, state.bytes, state.truncated, context.allocator) {
 		state.written_okay = false
 	}
 	return summary
 }
 
-// diagnostics_export_visit copies one record into the session stream. It keeps
-// scanning once the budget is spent, because the run list still has to be complete
-// even when the records are not.
+@(private)
+diagnostics_export_journal_record :: proc(state: ^Export_State, record: ^journal.Record, include_payloads: bool) -> bool {
+	if state.truncated { return true }
+	scratch: virtual.Arena
+	if virtual.arena_init_growing(&scratch) != nil { return false }
+	defer virtual.arena_destroy(&scratch)
+	value: json.Value
+	if json.unmarshal_string(record.data, &value, allocator = virtual.arena_allocator(&scratch)) != nil { return false }
+	entry := Export_Journal_Record {
+		seq      = i64(record.seq),
+		time_ms  = record.time_ms,
+		kind     = journal.RECORD_KIND_NAMES[record.kind],
+		turn     = int(record.turn),
+		request  = int(record.request),
+		attempt  = int(record.attempt),
+		call     = int(record.call),
+		provider = record.provider,
+		model    = record.model,
+		data     = value,
+	}
+	if include_payloads { entry.body = string(record.body) }
+	encoded, encode_error := json.marshal(entry, allocator = context.allocator)
+	if encode_error != nil { return false }
+	defer delete(encoded, context.allocator)
+	if state.truncated { return true }
+	if state.bytes + len(encoded) + 1 > EXPORT_BYTES { state.truncated = true; return true }
+	if !export_write(state.file, encoded, state.hash) { return false }
+	if !export_write(state.file, []u8{'\n'}, state.hash) { return false }
+	state.bytes += len(encoded) + 1
+	return true
+}
+
+// The log scan collects run ids for the separate run files.
 @(private)
 diagnostics_export_visit :: proc(user_data: rawptr, run_id: string, line: string) -> bool {
 	state := cast(^Export_State)user_data
@@ -233,16 +300,7 @@ diagnostics_export_visit :: proc(user_data: rawptr, run_id: string, line: string
 		state.written_okay = false
 		return false
 	}
-	if state.truncated { return true }
-	text := transmute([]u8)line
-	if state.bytes + len(text) + 1 > EXPORT_BYTES {
-		state.truncated = true
-		return true
-	}
-	if !export_write(state.file, text, state.hash) { state.written_okay = false }
-	if !export_write(state.file, []u8{'\n'}, state.hash) { state.written_okay = false }
-	state.bytes += len(text) + 1
-	return state.written_okay
+	return true
 }
 
 @(private)
@@ -617,15 +675,14 @@ export_request_joined :: proc(selector: agent.Log_Read_Selector, join_okay: bool
 	return !selected || join_okay
 }
 
-// diagnostics_export_request writes the durable row for a --request export. It is
-// the same read the record stream's stderr summary uses, so the two cannot
-// disagree about what the database says.
+// diagnostics_export_request writes the journal summary for a --request export.
 diagnostics_export_request :: proc(
 	files: ^[dynamic]Export_File,
 	omissions: ^[dynamic]string,
 	destination: string,
-	session_id: session.Session_Id,
-	request_no: session.Request_No,
+	session_text: string,
+	session_id: journal.Session_Id,
+	request_no: journal.Request_Id,
 	join_okay: bool,
 ) -> bool {
 	if !join_okay {
@@ -633,15 +690,14 @@ diagnostics_export_request :: proc(
 		return true
 	}
 
-	row, load_err := diagnostics_request_open(session_id, request_no, context.temp_allocator)
+	row, load_err := diagnostics_request_open(session_id, request_no, context.allocator)
 	if load_err != nil {
-		local := load_err
-		export_note(omissions, fmt.tprintf("the stored request could not be read: %s", session.error_detail(&local)))
+		export_note(omissions, fmt.tprintf("the stored request could not be read: %s", journal.error_text(load_err, context.temp_allocator)))
 		return true
 	}
-	defer session.request_destroy(&row, context.temp_allocator)
+	defer diagnostics_request_destroy(&row, context.allocator)
 
-	payload := export_request_from(&row, session_id)
+	payload := export_request_from(&row, session_text)
 	data, marshal_err := json.marshal(payload, {pretty = true, sort_maps_by_key = true}, context.allocator)
 	if marshal_err != nil {
 		export_note(omissions, "request.json could not be encoded")
@@ -662,31 +718,33 @@ diagnostics_export_request :: proc(
 }
 
 @(private)
-export_request_from :: proc(row: ^session.Request, session_id: session.Session_Id) -> Export_Request {
+export_request_from :: proc(row: ^Diagnostics_Request, session_text: string) -> Export_Request {
 	payload := Export_Request {
 		version         = 1,
-		session_id      = string(session_id),
-		request_no      = int(row.request_no),
-		purpose         = session.request_purpose_name(row.purpose),
-		started_at_ms   = row.started_at_ms,
-		outcome         = session.outcome_name(row.outcome),
+		session_id      = session_text,
+		request_no      = int(row.request),
+		purpose         = row.purpose,
+		started_at_ms   = row.started_ms,
+		outcome         = row.outcome,
+		attempts        = row.attempts,
+		finish          = row.finish,
 		provider        = row.provider,
 		model_requested = row.model_requested,
 		model_resolved  = row.model_resolved,
 		api             = row.api,
 	}
-	if turn_no, present := row.turn_no.?; present {
+	if turn_no := row.turn; turn_no != 0 {
 		payload.turn_no_present = true
 		payload.turn_no = int(turn_no)
 	}
-	if finished_at_ms, present := row.finished_at_ms.?; present {
+	if finished_at_ms := row.finished_ms; finished_at_ms != 0 {
 		payload.finished_at_ms_present = true
 		payload.finished_at_ms = finished_at_ms
 	}
-	payload.input_tokens_present, payload.input_tokens = export_usage_bucket(row.usage.input)
-	payload.output_tokens_present, payload.output_tokens = export_usage_bucket(row.usage.output)
-	payload.cache_read_tokens_present, payload.cache_read_tokens = export_usage_bucket(row.usage.cache_read)
-	payload.cache_write_tokens_present, payload.cache_write_tokens = export_usage_bucket(row.usage.cache_write)
+	payload.input_tokens_present, payload.input_tokens = export_usage_bucket(row.input_tokens)
+	payload.output_tokens_present, payload.output_tokens = export_usage_bucket(row.output_tokens)
+	payload.cache_read_tokens_present, payload.cache_read_tokens = export_usage_bucket(row.cache_read_tokens)
+	payload.cache_write_tokens_present, payload.cache_write_tokens = export_usage_bucket(row.cache_write_tokens)
 	return payload
 }
 

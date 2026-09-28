@@ -431,7 +431,7 @@ A queued job starts when no earlier-admitted job that is neither retired nor aba
 ```odin
 open           :: proc(journal: ^Journal, directory: string, run: Run_Id, mode: Open_Mode, allocator := context.allocator) -> Error
 close          :: proc(journal: ^Journal) -> Error
-create_session :: proc(journal: ^Journal, new_session: New_Session) -> (Session_Id, Error) // claims it; buffers the row, session.created, branch 1
+create_session :: proc(journal: ^Journal, new_session: New_Session) -> (Session_Id, Error) // claims new_session.id, or a fresh id when zero; buffers the row, session.created, branch 1
 claim          :: proc(journal: ^Journal, session: Session_Id) -> (Counters, Error)        // exclusive flock per session
 release        :: proc(journal: ^Journal) -> Error
 append_record  :: proc(journal: ^Journal, header: Record, data: $Payload, body: []u8 = nil) // buffered, owner-only
@@ -461,6 +461,8 @@ Records and nodes are journal-owned plain data (strings, integers, enums). `agen
 
 - The journal lives at `$XDG_STATE_HOME/nabla/journal.db`; claims are `flock`s on `locks/<session>.lock` beside it, which the kernel drops when the process dies.
 - A `Journal` is one connection used by one thread. Each owner opens its own and claims one session; frontends and diagnostics open `Read_Only` journals that never claim, migrate, or write.
+- A main session is created by its first prompt, under an id chosen when the session opened, so a session nobody prompted is never recorded. Switching sessions opens the target in a second `Journal` while the running one stays claimed, and the running one is closed only once the target is claimed and recovered.
+- `selection.changed` records carry no session: the latest one is the user's default model, provider, and effort for the next launch.
 - The journal fills `time_ms`, `mono_ns`, and `run` on every record. The caller fills the correlation columns.
 - `data` is encoded from a typed payload struct declared in `agent/journal`, one per kind, named after it (`Tool_Completed` for `tool.completed`). Records and nodes are copied into a batch arena at append, so the caller's memory is borrowed only for the call.
 - The journal allocates `Node_Id` and `Branch_Id` at append, and turn, request, and call ids through `next_turn`, `next_request`, and `next_call`, all from the counters loaded by `claim`, so the owner continues numbering after a restart.

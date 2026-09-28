@@ -11,61 +11,57 @@ import "core:thread"
 import "core:time"
 
 import "nabla:agent"
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 import input "nabla:input"
 import "nabla:term"
 import "nabla:tui"
 import "nabla:tui/widgets"
 
-session_target_destroy :: proc(target: ^Session_Target, allocator: mem.Allocator) {
-	delete(string(target.id), allocator)
-	delete(target.workspace, allocator)
-	delete(target.provider, allocator)
-	delete(target.model, allocator)
-	target^ = {}
-}
-
 Run_Setup :: struct {
-	harness_options:  agent.Harness_Options,
-	catalog:          agent.Catalog,
-	api:              ai.API_Kind,
-	credential:       string, // owned,
-	store:            session.Store,
+	harness_options:   agent.Harness_Options,
+	catalog:           agent.Catalog,
+	api:               ai.API_Kind,
+	credential:        string, // owned,
+	// store is the running session's journal, owned. Chat_Session borrows it, so it
+	// is replaced only together with the chat.
+	store:             ^journal.Journal,
+	journal_directory: string, // owned
+	run:               journal.Run_Id,
 	// log is this launch's diagnostic stream. It is opened before the store and
 	// closed after it, so a launch that cannot reach the store still says so.
-	log:              agent.Log,
+	log:               agent.Log,
 	// log_binding is what context.logger points at while the run is logging. It
 	// lives here, next to the writer, so it outlives every logger value that
 	// borrows it.
-	log_binding:      agent.Log_Binding,
+	log_binding:       agent.Log_Binding,
 	// log_cleanup is what the retention pass did, held until the run's logger is
 	// installed so the pass is reported after run.started rather than before it.
-	log_cleanup:      agent.Log_Cleanup_Summary,
-	session:          agent.Chat_Session,
-	workspace:        string, // owned; the directory sessions here run in
-	provider_id:      string, // owned,
-	model_id:         string, // owned,
+	log_cleanup:       agent.Log_Cleanup_Summary,
+	session:           agent.Chat_Session,
+	workspace:         string, // owned; the directory sessions here run in
+	provider_id:       string, // owned,
+	model_id:          string, // owned,
 	// resumed_provider and resumed_model are what the opened session last ran
 	// with. They are empty for a new session, and they are only a fallback for
 	// when no selection exists anywhere else.
-	resumed_provider: string, // owned,
-	resumed_model:    string, // owned,
+	resumed_provider:  string, // owned,
+	resumed_model:     string, // owned,
 	// configured holds the provider ids the user's own configuration declares;
 	// models.dev also contributes providers, and the model menu offers only the
 	// configured ones, whose credentials the user actually set up.
-	configured:       [dynamic]string, // owned,
+	configured:        [dynamic]string, // owned,
 	// owns_selection says whether this run's model choice is the user's. The
 	// interactive harness owns it: its choice is published to the front-end and
 	// remembered for the next launch. A headless or child run does not, because it
 	// selects a model for one job and must not change what the user starts with.
-	owns_selection:   bool,
+	owns_selection:    bool,
 	// mcp_servers is borrowed from the launch's configuration, which outlives the
 	// setup. mcp owns the running MCP clients and the bindings a tool definition may
 	// borrow, so it is released after the session that holds the registry.
-	mcp_servers:      []agent.MCP_Server_Config,
-	mcp:              MCP_Runtime,
-	alloc:            mem.Allocator,
+	mcp_servers:       []agent.MCP_Server_Config,
+	mcp:               MCP_Runtime,
+	alloc:             mem.Allocator,
 }
 
 App :: struct {
@@ -185,8 +181,8 @@ resolve_run_catalog :: proc(
 	defer agent.catalog_sources_destroy(&discovered, allocator)
 	models_dev, _ := agent.models_dev_cached_sources(providers = names, allocator = allocator)
 	defer agent.catalog_sources_destroy(&models_dev, allocator)
-	resolved, resolve_err := agent.resolve_catalog(sources, discovered[:], models_dev[:], allocator)
-	if resolve_err != .None {
+	resolved, resolve_error := agent.resolve_catalog(sources, discovered[:], models_dev[:], allocator)
+	if resolve_error != .None {
 		fmt.eprintln("nabla: invalid configuration: a model cannot be excluded and customized at the same time")
 		return {}, {}, false
 	}
@@ -220,8 +216,8 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []age
 	setup.catalog = catalog
 	setup.configured = configured
 
-	workspace, workspace_err := os.get_working_directory(setup.alloc)
-	if workspace_err != nil || workspace == "" {
+	workspace, workspace_error := os.get_working_directory(setup.alloc)
+	if workspace_error != nil || workspace == "" {
 		fmt.eprintln("nabla: cannot determine working directory")
 		return false
 	}
@@ -233,63 +229,148 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []age
 	return true
 }
 
-// run_session_attach opens the session store, opens the session the launch asked
-// for, claims it for writing, and settles anything an earlier run left running.
-// The running session is built on top of that claim. A launch that cannot open
-// the session it asked for fails rather than quietly starting a different one.
+// run_session_attach opens the session the launch asked for and makes it the
+// running one. A launch that cannot open the session it asked for fails rather
+// than quietly starting a different one.
 //
-// The caller installs the launch's logger before this runs, so the store and the
-// adoption below are recorded.
+// The caller installs the launch's logger before this runs, so the adoption is
+// recorded.
 run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_Start, stderr: io.Writer) -> bool {
-	directory, directory_err := agent.xdg_directory(.State, setup.alloc)
-	if directory_err != .None {
+	directory, directory_error := agent.xdg_directory(.State, setup.alloc)
+	if directory_error != .None {
 		fmt.wprintln(stderr, "nabla: cannot resolve the state directory for sessions")
 		return false
 	}
-	defer delete(directory, setup.alloc)
+	setup.journal_directory = directory
+	setup.run = journal.run_id_create()
 
-	if store_err := session.store_open(&setup.store, directory); store_err != nil {
-		local := store_err
-		fmt.wprintln(stderr, "nabla: cannot open the session database:", session.error_detail(&local))
-		return false
-	}
-
-	target, opened := session_open_target(setup, start, workspace, stderr)
-	if !opened { return false }
-	defer session_target_destroy(&target, setup.alloc)
-
-	// A session carries the directory it ran in, and an explicit id can name one
-	// from anywhere, so the directory is checked rather than assumed.
-	if !os.is_dir(target.workspace) {
-		fmt.wprintf(stderr, "nabla: the session's directory is not usable: %s\n", target.workspace)
-		return false
-	}
-
-	adoption, message, adopted := session_adopt_target(setup, start.kind, target)
-	if !adopted {
-		defer delete(message, setup.alloc)
+	opened, message, ok := session_open(setup, start, workspace)
+	if !ok {
 		fmt.wprintln(stderr, "nabla:", message)
+		delete(message, setup.alloc)
 		return false
 	}
-	defer adoption_destroy(&adoption, setup.alloc)
-	report_recovery(adoption.recovery)
-
-	claimed, held := session.session_claimed(&setup.store)
-	if !held {
-		fmt.wprintln(stderr, "nabla: the session claim went missing")
-		return false
-	}
-
-	// The session and what an earlier run left unfinished are one record each, so a
-	// launch that found work to settle says which work it found. Both are emitted by
-	// the adoption path this launch shares with an in-session switch.
-	setup.workspace = strings.clone(adoption.header.workspace, setup.alloc)
-	setup.resumed_provider = strings.clone(adoption.header.provider, setup.alloc)
-	setup.resumed_model = strings.clone(adoption.header.model, setup.alloc)
-	tool_error: agent.Tool_Registry_Error
-	setup.session, tool_error = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
-	if tool_error.kind != .None {
+	report_recovery(opened.recovery)
+	if !session_install(setup, &opened) {
 		fmt.wprintln(stderr, "nabla: the tool registry could not be allocated")
+		return false
+	}
+	return true
+}
+
+// Opened_Session is a session resolved and taken in its own journal, not yet
+// running. It owns store and its strings until session_install takes them.
+Opened_Session :: struct {
+	store:     ^journal.Journal,
+	id:        journal.Session_Id,
+	workspace: string,
+	branch:    journal.Branch_Id,
+	head:      journal.Node_Id,
+	// provider and model are what the session's last turn ran with, "" for a new session.
+	provider:  string,
+	model:     string,
+	recovery:  journal.Recovery,
+}
+
+opened_session_destroy :: proc(opened: ^Opened_Session, allocator: mem.Allocator) {
+	session_store_close(opened.store, allocator)
+	delete(opened.workspace, allocator)
+	delete(opened.provider, allocator)
+	delete(opened.model, allocator)
+	opened^ = {}
+}
+
+// session_open resolves start and takes the session in a journal of its own, so a
+// refusal leaves the running session untouched. An existing session is claimed and
+// what an earlier run left open is settled. A new session is only an id: its first
+// prompt creates it. The message is owned by setup.alloc.
+session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: string) -> (opened: Opened_Session, message: string, ok: bool) {
+	allocator := setup.alloc
+	defer if !ok { opened_session_destroy(&opened, allocator) }
+
+	open_error: journal.Error
+	opened.store, open_error = session_store_open(setup)
+	if open_error != nil { return {}, session_error_message("cannot open the session database", open_error, allocator), false }
+
+	filter := journal.Session_Filter {
+		limit = 1,
+	}
+	switch start.kind {
+	case .New:
+		opened.id = journal.session_id_create()
+		opened.workspace = strings.clone(launch_workspace, allocator)
+		opened.branch = journal.INITIAL_BRANCH
+		log_session_claimed(opened.id, false, {})
+		return opened, "", true
+	case .Resume_Latest:
+		filter.workspace = launch_workspace
+		filter.role = .Main
+	case .Resume_Id:
+		id, valid := journal.session_id_parse(start.id)
+		if !valid || id == {} { return opened, fmt.aprintf("%s is not a session id", start.id, allocator = allocator), false }
+		filter.session = id
+	}
+
+	summaries, list_error := journal.list_sessions(opened.store, filter, allocator)
+	if list_error != nil { return opened, session_error_message("cannot list sessions", list_error, allocator), false }
+	defer journal.session_summaries_destroy(summaries, allocator)
+	if len(summaries) == 0 {
+		if start.kind == .Resume_Latest {
+			return opened, fmt.aprintf("no session has run in %s; nothing to resume", launch_workspace, allocator = allocator), false
+		}
+		return opened, fmt.aprintf("session %s does not exist", start.id, allocator = allocator), false
+	}
+	summary := &summaries[0]
+	// A session carries the directory it ran in, and an id can name one from
+	// anywhere, so the directory is checked rather than assumed.
+	if !os.is_dir(summary.workspace) {
+		return opened, fmt.aprintf("the session's directory is not usable: %s", summary.workspace, allocator = allocator), false
+	}
+
+	opened.id = summary.id
+	if _, claim_error := journal.claim(opened.store, summary.id); claim_error != nil {
+		return opened, session_error_message("cannot take the session", claim_error, allocator), false
+	}
+	recover_error: journal.Error
+	opened.recovery, recover_error = journal.recover(opened.store)
+	if recover_error != nil { return opened, session_error_message("cannot settle the session", recover_error, allocator), false }
+	head_error: journal.Error
+	opened.branch, opened.head, head_error = journal.session_head(opened.store, summary.id)
+	if head_error != nil { return opened, session_error_message("cannot read the session", head_error, allocator), false }
+
+	latest, found, read_error := journal.read_latest(opened.store, {session = summary.id, kinds = {.Turn_Started}}, allocator)
+	if read_error != nil { return opened, session_error_message("cannot read the session", read_error, allocator), false }
+	defer journal.record_destroy(&latest, allocator)
+	if found {
+		opened.provider = strings.clone(latest.provider, allocator)
+		opened.model = strings.clone(latest.model, allocator)
+	}
+	opened.workspace = strings.clone(summary.workspace, allocator)
+	log_session_claimed(opened.id, true, opened.recovery)
+	return opened, "", true
+}
+
+// session_install makes opened the running session in place of the one running,
+// whose chat and journal it releases. It takes everything opened owns and leaves
+// it zero. False means the tool registry could not be allocated, and no session runs.
+session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
+	if setup.store != nil { agent.chat_session_destroy(&setup.session) }
+	session_store_close(setup.store, setup.alloc)
+	delete(setup.workspace, setup.alloc)
+	delete(setup.resumed_provider, setup.alloc)
+	delete(setup.resumed_model, setup.alloc)
+	setup.store = opened.store
+	setup.workspace = opened.workspace
+	setup.resumed_provider = opened.provider
+	setup.resumed_model = opened.model
+	id, branch, head := opened.id, opened.branch, opened.head
+	opened^ = {}
+
+	tool_error: agent.Tool_Registry_Error
+	setup.session, tool_error = agent.chat_session_init(setup.store, id, branch, head, setup.workspace, setup.alloc)
+	if tool_error.kind != .None {
+		session_store_close(setup.store, setup.alloc)
+		setup.store = nil
 		return false
 	}
 	if agent.chat_session_apply_harness(&setup.session, setup.harness_options).kind != .None {
@@ -298,227 +379,68 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 	return true
 }
 
-// session_open_target resolves which session the launch opens. It resolves the
-// id without claiming anything, so a refusal costs nothing, and a new session is
-// only an id and a directory: nothing is recorded until the first prompt.
-// Everything it returns is owned by setup.alloc.
-//
-// Every failure here is the launch's own: the caller reports it and exits rather
-// than falling back to a different session.
-session_open_target :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: string, stderr: io.Writer) -> (target: Session_Target, ok: bool) {
-	switch start.kind {
-	case .New:
-		id := session.session_id_create(setup.alloc)
-		if id == "" {
-			fmt.wprintln(stderr, "nabla: cannot start a session: a session id could not be created")
-			return {}, false
-		}
-		target.id = id
-		target.workspace = strings.clone(launch_workspace, setup.alloc)
-		return target, true
-
-	case .Resume_Latest:
-		// A bare resume opens the newest session that holds work. A launch that was
-		// never prompted has no row at all, and a row whose first turn did not land
-		// holds nothing, so neither can be what a resume opens.
-		sessions, list_err := session.session_list(&setup.store, {workspace = launch_workspace, limit = 1, used_only = true}, setup.alloc)
-		if list_err != nil {
-			local := list_err
-			fmt.wprintln(stderr, "nabla: cannot list sessions:", session.error_detail(&local))
-			return {}, false
-		}
-		defer session.sessions_destroy(sessions, setup.alloc)
-		if len(sessions) == 0 {
-			fmt.wprintf(stderr, "nabla: no session has run in %s; nothing to resume\n", launch_workspace)
-			return {}, false
-		}
-		return session_target_from(&sessions[0], setup.alloc), true
-
-	case .Resume_Id:
-		if !session.session_id_valid(session.Session_Id(start.id)) {
-			fmt.wprintf(stderr, "nabla: %s is not a session id\n", start.id)
-			return {}, false
-		}
-		header, load_err := session.session_load(&setup.store, session.Session_Id(start.id), setup.alloc)
-		if load_err != nil {
-			local := load_err
-			fmt.wprintf(stderr, "nabla: cannot open session %s: %s\n", start.id, session.error_detail(&local))
-			return {}, false
-		}
-		defer session.session_destroy(&header)
-		return session_target_from(&header, setup.alloc), true
+// session_store_open opens a journal of this run on the launch's state directory,
+// owned by setup.alloc.
+session_store_open :: proc(setup: ^Run_Setup) -> (store: ^journal.Journal, error: journal.Error) {
+	store = new(journal.Journal, setup.alloc) or_return
+	if open_error := journal.open(store, setup.journal_directory, setup.run, .Read_Write, setup.alloc); open_error != nil {
+		free(store, setup.alloc)
+		return nil, open_error
 	}
-	return {}, false
+	return store, nil
 }
 
-// session_target_from copies what a launch needs out of a stored header.
-@(private)
-session_target_from :: proc(header: ^session.Session, allocator: mem.Allocator) -> Session_Target {
-	return Session_Target {
-		id = session.Session_Id(strings.clone(string(header.id), allocator)),
-		workspace = strings.clone(header.workspace, allocator),
-		provider = strings.clone(header.provider, allocator),
-		model = strings.clone(header.model, allocator),
-	}
+// session_store_close gives up the store's session, if it holds one, and closes it.
+// Pending records are dropped: every write that matters commits where it is made.
+session_store_close :: proc(store: ^journal.Journal, allocator: mem.Allocator) -> journal.Error {
+	if store == nil { return nil }
+	released := store.claimed
+	close_error := journal.close(store)
+	free(store, allocator)
+	if released != {} { log_session_released(released) }
+	return close_error
 }
 
-// Adoption is a session this process has taken over: the header as read under the
-// claim, and what an interrupted run left to settle. header is owned by the
-// allocator session_adopt was given.
-Adoption :: struct {
-	header:   session.Session,
-	recovery: session.Recovery,
-}
-
-adoption_destroy :: proc(adoption: ^Adoption, allocator: mem.Allocator) {
-	session.session_destroy(&adoption.header, allocator)
-	adoption^ = {}
-}
-
-// session_adopt_target brings the session a launch resolved under this store's
-// claim. A new session has no row to read, so it is claimed from the target the
-// launch holds in memory; every other target is adopted from the store.
-session_adopt_target :: proc(setup: ^Run_Setup, kind: Session_Start_Kind, target: Session_Target) -> (adopted: Adoption, message: string, ok: bool) {
-	if kind == .New { return session_adopt_new(setup, target) }
-	return session_adopt(setup, target.id)
-}
-
-// release_displaced gives up the session a switch replaced and records it. The id
-// is copied before the release frees the claim's own copy, so the record still
-// names the session that was given up.
-release_displaced :: proc(displaced: ^session.Claim, allocator: mem.Allocator) {
-	if !displaced.held { return }
-	id := session.Session_Id("")
-	if displaced.session != "" { id = session.Session_Id(strings.clone(string(displaced.session), allocator)) }
-	defer delete(string(id), allocator)
-	_ = session.claim_release(displaced)
-	log_session_released(id)
-}
-
-// run_session_release records the running session and gives it up. It is the
-// teardown counterpart of session_adopt, which records a switch's release.
-run_session_release :: proc(setup: ^Run_Setup) -> session.Error {
-	claimed, held := session.session_claimed(&setup.store)
-	if !held { return nil }
-	id := session.Session_Id("")
-	if claimed != "" { id = session.Session_Id(strings.clone(string(claimed), setup.alloc)) }
-	defer delete(string(id), setup.alloc)
-	release_err := session.session_release(&setup.store)
-	log_session_released(id)
-	return release_err
-}
-
-// session_adopt_new makes a fresh session the claimed one. A new session has no
-// row yet: there is no header to read and nothing an earlier run left to settle,
-// so the claim is taken directly and the header is the id and the directory the
-// launch already holds. The first prompt is what records the session, so a
-// launch that never gets one leaves no row behind.
-//
-// The header is owned by setup.alloc.
-session_adopt_new :: proc(setup: ^Run_Setup, target: Session_Target) -> (adopted: Adoption, message: string, ok: bool) {
-	displaced, claim_err := session.session_claim_candidate(&setup.store, target.id)
-	if claim_err != nil {
-		local := claim_err
-		return {}, strings.concatenate({"cannot start a session: ", session.error_detail(&local)}, setup.alloc), false
-	}
-	// The session that was running is given up only now, with the new claim settled.
-	// A release that reports an error has still closed the descriptor, which is what
-	// actually frees the lock.
-	release_displaced(&displaced, setup.alloc)
-	adopted.header = session.Session {
-		id        = session.Session_Id(strings.clone(string(target.id), setup.alloc)),
-		workspace = strings.clone(target.workspace, setup.alloc),
-	}
-	log_session_claimed(target.id, false, {})
-	return adopted, "", true
-}
-
-// session_adopt makes id the claimed session on this store: it takes the candidate
-// claim while the claim the store already holds stays held, reads the header under
-// the new claim, and settles whatever an interrupted run left running. The
-// displaced claim is released only after all of that has succeeded.
-//
-// A refusal leaves the store holding exactly the claim it held before, so a switch
-// that fails leaves the running session claimed and usable. The message is owned by
-// setup.alloc.
-//
-// It runs on whichever thread owns the store: the startup thread before the worker
-// exists, and the worker afterwards.
-session_adopt :: proc(setup: ^Run_Setup, id: session.Session_Id) -> (adopted: Adoption, message: string, ok: bool) {
-	displaced, claim_err := session.session_claim_candidate(&setup.store, id)
-	if claim_err != nil {
-		local := claim_err
-		return {}, strings.concatenate({"cannot take the session: ", session.error_detail(&local)}, setup.alloc), false
-	}
-
-	// The claim is what makes the row safe to read: another process may have deleted
-	// the session between the caller's own read and this claim.
-	header, load_err := session.session_load(&setup.store, id, setup.alloc)
-	if load_err != nil {
-		// Abandoning the candidate cannot fail in a way the caller could act on: the
-		// descriptor is closed either way, so the lock is gone.
-		_ = session.session_claim_restore(&setup.store, displaced)
-		local := load_err
-		return {}, strings.concatenate({"cannot open the session: ", session.error_detail(&local)}, setup.alloc), false
-	}
-	recovery, recover_err := session.session_recover(
-		&setup.store,
-		id,
-		{at_ms = session.now_ms(), recovered_content = agent.TOOL_RECOVERED_RESULT, unexecuted_content = agent.TOOL_UNEXECUTED_RESULT},
-	)
-	if recover_err != nil {
-		session.session_destroy(&header)
-		_ = session.session_claim_restore(&setup.store, displaced)
-		local := recover_err
-		return {}, strings.concatenate({"cannot settle the session: ", session.error_detail(&local)}, setup.alloc), false
-	}
-
-	// The candidate is settled, so the session that was running can be given up. A
-	// release that reports an error has still closed the descriptor, which is what
-	// actually frees the lock, so there is nothing left for the caller to do.
-	release_displaced(&displaced, setup.alloc)
-	log_session_claimed(id, true, recovery)
-	return Adoption{header = header, recovery = recovery}, "", true
-}
-
-// session_activate makes an adopted session the running one. Its claim is already
-// the store's, so the previous chat is destroyed here and the workspace and chat
-// both become the adopted session's.
-@(private)
-session_activate :: proc(app: ^App, adoption: ^Adoption) {
-	setup := &app.setup
-	claimed, held := session.session_claimed(&setup.store)
-	if !held {
-		// session_adopt commits the candidate claim, so this cannot happen; a missing
-		// claim would mean the store lost it underneath us.
-		snap_append(app, .Error, "the session claim went missing")
-		return
-	}
-	agent.chat_session_destroy(&setup.session)
-	delete(setup.workspace, setup.alloc)
-	setup.workspace = strings.clone(adoption.header.workspace, setup.alloc)
-	tool_error: agent.Tool_Registry_Error
-	setup.session, tool_error = agent.chat_session_init(&setup.store, claimed, setup.workspace, setup.alloc)
-	if tool_error.kind != .None {
-		snap_append(app, .Error, "the tool registry could not be allocated")
-		return
-	}
-	if agent.chat_session_apply_harness(&setup.session, setup.harness_options).kind != .None {
-		agent.log_emit({level = .Error, category = .Tool, event = "tools.agents_undescribed"})
-	}
+// session_error_message is what for a person, followed by the journal's reason,
+// owned by allocator.
+session_error_message :: proc(what: string, error: journal.Error, allocator: mem.Allocator) -> string {
+	detail := journal.error_text(error, allocator)
+	defer delete(detail, allocator)
+	return strings.concatenate({what, ": ", detail}, allocator)
 }
 
 // report_recovery says what an earlier run left behind, so a resumed session
-// starts with the two cases told apart: an outcome the harness never saw, and a
-// call it never began.
-report_recovery :: proc(recovery: session.Recovery) {
-	if recovery.recovered_calls > 0 {
-		fmt.eprintf("nabla: %d tool call(s) were dispatched and never came back; their results say the outcome is unknown\n", recovery.recovered_calls)
-	}
-	if recovery.unexecuted_calls > 0 {
-		fmt.eprintf("nabla: %d tool call(s) were recorded and never ran; their results say so\n", recovery.unexecuted_calls)
+// starts knowing which calls have an outcome the harness never saw.
+report_recovery :: proc(recovery: journal.Recovery) {
+	if recovery.calls > 0 {
+		fmt.eprintf("nabla: %d tool call(s) never reported a result; their results say whether they ran\n", recovery.calls)
 	}
 }
+
+// selection_record remembers the model the user chose, so the next launch starts with it.
+selection_record :: proc(store: ^journal.Journal, provider, model, effort: string) -> journal.Error {
+	journal.append_record(store, {kind = .Selection_Changed}, journal.Selection_Changed{provider = provider, model = model, effort = effort})
+	_, commit_error := journal.commit(store)
+	return commit_error
+}
+
+// selection_latest reads the model the user last chose, owned by allocator.
+selection_latest :: proc(store: ^journal.Journal, allocator: mem.Allocator) -> (selection: journal.Selection_Changed, found: bool, error: journal.Error) {
+	record: journal.Record
+	record, found = journal.read_latest(store, {kinds = {.Selection_Changed}}, allocator) or_return
+	defer journal.record_destroy(&record, allocator)
+	if !found { return }
+	journal.payload_decode(record.data, &selection, allocator) or_return
+	return selection, true, nil
+}
+
+selection_destroy :: proc(selection: ^journal.Selection_Changed, allocator: mem.Allocator) {
+	delete(selection.provider, allocator)
+	delete(selection.model, allocator)
+	delete(selection.effort, allocator)
+	selection^ = {}
+}
+
 provider_usable :: agent.provider_usable
 
 // provider_configured reports whether the user's own configuration named the
@@ -670,14 +592,9 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 	// A run that owns the selection remembers it, so the next launch restores the
 	// user's own last choice. A headless or child run leaves it alone.
 	if app.setup.owns_selection && announce {
-		saved := session.Selection {
-			provider = provider_id,
-			model    = model_id,
-			effort   = running.effort,
-		}
-		if save_err := session.selection_save(&app.setup.store, saved); save_err != nil {
-			local := save_err
-			fmt.eprintln("nabla: the selection could not be recorded:", session.error_detail(&local))
+		if record_error := selection_record(app.setup.store, provider_id, model_id, running.effort); record_error != nil {
+			detail := journal.error_text(record_error, context.temp_allocator)
+			fmt.eprintln("nabla: the selection could not be recorded:", detail)
 		}
 	}
 	return true
@@ -737,13 +654,13 @@ apply_startup_selection :: proc(app: ^App, flag_provider, flag_model: string) ->
 		return apply_selection(app, flag_provider, flag_model, "")
 	}
 
-	selection, found, load_err := session.selection_load(&app.setup.store, app.run.alloc)
-	defer session.selection_destroy(&selection, app.run.alloc)
-	if load_err != nil {
+	selection, found, load_error := selection_latest(app.setup.store, app.run.alloc)
+	defer selection_destroy(&selection, app.run.alloc)
+	if load_error != nil {
 		// A database the store just opened failing to answer this is worth saying
 		// out loud, but the launch can still proceed to the model menu.
-		local := load_err
-		fmt.eprintln("nabla: the selection could not be read:", session.error_detail(&local))
+		detail := journal.error_text(load_error, context.temp_allocator)
+		fmt.eprintln("nabla: the selection could not be read:", detail)
 	}
 	applied := found && apply_selection(app, selection.provider, selection.model, selection.effort)
 	if !applied && app.setup.resumed_provider != "" && app.setup.resumed_model != "" {
@@ -769,8 +686,8 @@ selection_fail :: proc(app: ^App, message: string) {
 	delete(app.run.snap.setup_error, app.run.alloc)
 	app.run.snap.setup_error = ""
 	app.run.snap.setup_error_failed = false
-	cloned, clone_err := strings.clone(message, app.run.alloc)
-	if clone_err != nil {
+	cloned, clone_error := strings.clone(message, app.run.alloc)
+	if clone_error != nil {
 		app.run.snap.setup_error_failed = true
 	} else {
 		app.run.snap.setup_error = cloned

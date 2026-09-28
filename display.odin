@@ -6,7 +6,7 @@ import "core:time"
 import "core:unicode/utf8"
 
 import "nabla:agent"
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 // Display owns the text sanitizer every transcript renderer needs. Model
 // output, tool output, user text, and diagnostics may carry cursor movement,
@@ -220,5 +220,5 @@ tool_display_preview :: proc(content: string) -> string {
 // the model; a human gets the tool's own short line and the outcome name when it has none.
 tool_display_summary :: proc(result: ^agent.Tool_Result) -> string {
 	if result.reason != "" { return result.reason }
-	return session.tool_outcome_name(result.outcome)
+	return journal.TOOL_OUTCOME_NAMES[result.outcome]
 }

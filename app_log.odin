@@ -5,7 +5,7 @@ import "core:log"
 import "core:os"
 
 import "nabla:agent"
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 // Diagnostics for one launch. The writer is opened before the session database and
 // closed after it, so a launch that cannot open either still leaves a record of how
@@ -64,7 +64,7 @@ run_log_header :: proc(setup: ^Run_Setup) {
 	fields := [3]agent.Log_Field {
 		{key = "pid", value = i64(os.get_pid())},
 		{key = "threshold", value = agent.log_level_name(setup.log.lowest)},
-		{key = "schema_version", value = i64(session.SCHEMA_VERSION)},
+		{key = "schema_version", value = i64(journal.SCHEMA_VERSION)},
 	}
 	agent.log_emit(agent.Log_Record{level = .Info, category = .Runtime, event = "run.started", fields = fields[:]})
 
@@ -109,18 +109,19 @@ run_log_failure :: proc(setup: ^Run_Setup, reported: ^bool) {
 // adoption path calls it, so a launch and an in-session switch report the same
 // fact rather than only the launch path doing so. The recovery summary is recorded
 // only when an earlier run actually left work to settle.
-log_session_claimed :: proc(id: session.Session_Id, resumed: bool, recovery: session.Recovery) {
-	if id == "" { return }
+log_session_claimed :: proc(id: journal.Session_Id, resumed: bool, recovery: journal.Recovery) {
+	if id == {} { return }
+	hex_text: [journal.SESSION_ID_HEX_LENGTH]u8
 	binding: agent.Log_Binding
-	context.logger = agent.log_rebind(&binding, agent.Log_Correlation{session_id = id})
+	context.logger = agent.log_rebind(&binding, agent.Log_Correlation{session_id = journal.session_id_to_hex(id, hex_text[:])})
 	claimed := [1]agent.Log_Field{{key = "resumed", value = resumed}}
 	agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.claimed", fields = claimed[:]})
-	if recovery.interrupted_turns > 0 || recovery.interrupted_requests > 0 || recovery.recovered_calls > 0 || recovery.unexecuted_calls > 0 {
+	if recovery != {} {
 		fields := [4]agent.Log_Field {
-			{key = "interrupted_turns", value = i64(recovery.interrupted_turns)},
-			{key = "interrupted_requests", value = i64(recovery.interrupted_requests)},
-			{key = "recovered_calls", value = i64(recovery.recovered_calls)},
-			{key = "unexecuted_calls", value = i64(recovery.unexecuted_calls)},
+			{key = "turns", value = i64(recovery.turns)},
+			{key = "requests", value = i64(recovery.requests)},
+			{key = "calls", value = i64(recovery.calls)},
+			{key = "results", value = i64(recovery.results)},
 		}
 		agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.recovered", fields = fields[:]})
 	}
@@ -128,10 +129,11 @@ log_session_claimed :: proc(id: session.Session_Id, resumed: bool, recovery: ses
 
 // log_session_released records that this process gave a session up. It runs only
 // after the claim is gone, so the record never claims more than happened.
-log_session_released :: proc(id: session.Session_Id) {
-	if id == "" { return }
+log_session_released :: proc(id: journal.Session_Id) {
+	if id == {} { return }
+	hex_text: [journal.SESSION_ID_HEX_LENGTH]u8
 	binding: agent.Log_Binding
-	context.logger = agent.log_rebind(&binding, agent.Log_Correlation{session_id = id})
+	context.logger = agent.log_rebind(&binding, agent.Log_Correlation{session_id = journal.session_id_to_hex(id, hex_text[:])})
 	agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.released"})
 }
 

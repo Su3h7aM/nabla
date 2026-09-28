@@ -6,7 +6,6 @@ import "core:os"
 import "core:strings"
 
 import "nabla:agent"
-import "nabla:agent/session"
 
 Cli_Parse_Error :: enum {
 	None,
@@ -172,7 +171,7 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 	// Tools are refreshed between turns, while the session is idle, so the registry a
 	// turn dispatches against is the one it was advertised with.
 	if warning := app_tools_refresh(app); warning != "" { fmt.eprintln("nabla:", warning) }
-	switch agent.chat_session_accept_user(&app.setup.session, prompt, session.now_ms()) {
+	switch agent.chat_session_accept_user(&app.setup.session, prompt) {
 	case .Accepted:
 	case .Storage_Failed:
 		fmt.eprintln("nabla:", agent.chat_session_last_error(&app.setup.session))

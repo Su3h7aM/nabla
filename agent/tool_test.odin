@@ -778,25 +778,6 @@ test_replace_tools_swaps_only_while_idle :: proc(test: ^testing.T) {
 	testing.expect(test, still_there, "a busy session keeps its registry")
 }
 
-// --- recovery ----------------------------------------------------------------
-
-// The recovery results are constants so recovery allocates nothing. A drift between them and
-// the renderer would put text into a recovered session that no other result looks like, so
-// they are held to it here.
-@(test)
-test_recovery_results_match_the_renderer :: proc(test: ^testing.T) {
-	tool_context := Tool_Context {
-		allocator = context.temp_allocator,
-	}
-	recovered := tool_result_of(&tool_context, .Unknown, TOOL_RECOVERED_MESSAGE, nil)
-	defer tool_result_destroy(&recovered)
-	testing.expect_value(test, recovered.content, TOOL_RECOVERED_RESULT)
-
-	unexecuted := tool_result_of(&tool_context, .Not_Executed, TOOL_UNEXECUTED_MESSAGE, nil)
-	defer tool_result_destroy(&unexecuted)
-	testing.expect_value(test, unexecuted.content, TOOL_UNEXECUTED_RESULT)
-}
-
 // --- helpers -----------------------------------------------------------------
 
 tool_write_file :: proc(test: ^testing.T, path, content: string) -> bool {

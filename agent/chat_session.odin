@@ -251,8 +251,9 @@ Chat_Session :: struct {
 }
 
 // chat_session_init builds the running state for a session the caller claimed in
-// store, positioned at branch and head. workspace is the validated process
-// directory; it is copied, because the caller's copy may be temporary.
+// store, positioned at branch and head. A store without a claim makes session a new
+// one, created by its first prompt. workspace is the validated process directory;
+// it is copied, because the caller's copy may be temporary.
 //
 // Diagnostics are not a field here. The session's work inherits the writer from
 // context.logger, which is what lets a call site emit without threading one.
@@ -530,6 +531,18 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation(chat))
 
+	// A new session is created by its first prompt, so a session nobody prompted is
+	// never recorded.
+	if chat.store.claimed == {} {
+		_, create_error := journal.create_session(chat.store, {id = chat.session, workspace = chat.workspace, role = .Main})
+		if create_error != nil {
+			chat_session_record_failure(chat, "the session could not be created", create_error)
+			chat.state = .Idle
+			return .Storage_Failed
+		}
+		chat.branch = journal.INITIAL_BRANCH
+	}
+
 	// The turn names the instruction snapshot it runs with, so it is settled first.
 	// A failure latches the session with no turn open, so the chat stays idle.
 	if !chat_ensure_instructions(chat) {
@@ -538,8 +551,7 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 	}
 
 	// The first turn names the session, so a listing says what each session was about
-	// without asking the user to name it. Its commit is also what first writes the
-	// session, so a session nobody prompted is never recorded.
+	// without asking the user to name it.
 	first := chat.store.counters.turn == 0
 	chat.turn = journal.next_turn(chat.store)
 	chat.request = 0

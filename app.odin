@@ -11,7 +11,7 @@ import "core:thread"
 import "core:time"
 
 import "nabla:agent"
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:ai"
 import input "nabla:input"
 import "nabla:term"
@@ -49,7 +49,7 @@ Entry :: struct {
 	// text it keeps, so one budget covers everything the transcript holds.
 	bytes:           int,
 	complete:        bool,
-	tool_outcome:    session.Tool_Outcome,
+	tool_outcome:    journal.Tool_Outcome,
 	// tool_scroll is the first preview row a tool box shows, so a long result can
 	// be read inside its own box. The box clamps it to the rows it has, which is
 	// why the value is only a request until the next frame resolves it.
@@ -145,7 +145,7 @@ Snapshot :: struct {
 	// active_session is the session the worker is running. It travels with the row
 	// list so the menu can open on it without reading the running session, which
 	// the worker can replace at any moment.
-	active_session:     session.Session_Id, // owned,
+	active_session:     journal.Session_Id,
 	// setup_error is why the last selection attempt failed; the model menu shows
 	// it because it has no transcript. setup_error_failed means the reason could
 	// not be cloned, so the presentation uses its static fallback instead.
@@ -202,7 +202,7 @@ Effort_Choice :: struct {
 }
 
 Session_Choice :: struct {
-	id: session.Session_Id, // owned
+	id: journal.Session_Id,
 }
 
 choice_destroy :: proc(choice: ^Choice, allocator: mem.Allocator) {
@@ -215,7 +215,6 @@ choice_destroy :: proc(choice: ^Choice, allocator: mem.Allocator) {
 	case Effort_Choice:
 		delete(action.level, allocator)
 	case Session_Choice:
-		delete(string(action.id), allocator)
 	}
 	choice^ = {}
 }
@@ -250,7 +249,7 @@ menu_destroy :: proc(menu: ^Menu, allocator: mem.Allocator) {
 // Session_Row is one session the /resume menu can offer. The worker owns the
 // list; the front-end only renders it.
 Session_Row :: struct {
-	id:    session.Session_Id, // owned
+	id:    journal.Session_Id,
 	title: string, // owned
 }
 
@@ -334,23 +333,16 @@ Session_Start :: struct {
 	id:   string,
 }
 
-// Session_Target is the session a launch resolved to, with what the launch knows
-// about it before the running session exists. Every string is owned by the
-// allocator session_open_target was given.
-Session_Target :: struct {
-	id:        session.Session_Id,
-	workspace: string,
-	provider:  string,
-	model:     string,
-}
-
 run_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
 	// The tool registry borrowed the runtime's bindings, so the session goes first
 	// and the MCP clients second. A runtime that was never built owns nothing.
 	mcp_runtime_destroy(&setup.mcp)
-	_ = run_session_release(setup)
-	session.store_close(&setup.store)
+	if close_error := session_store_close(setup.store, setup.alloc); close_error != nil {
+		detail := journal.error_text(close_error, context.temp_allocator)
+		fmt.eprintln("nabla: the session database could not be closed cleanly:", detail)
+	}
+	delete(setup.journal_directory, setup.alloc)
 	// The log outlives the session and the store deliberately: the record of the
 	// launch ending is the last thing it can write. A close failure is reported
 	// outside the log, because that log is what failed.
@@ -661,11 +653,9 @@ snapshot_destroy :: proc(app: ^App) {
 	}
 	delete(app.run.snap.entries)
 	for &row in app.run.snap.sessions {
-		delete(string(row.id), app.run.alloc)
 		delete(row.title, app.run.alloc)
 	}
 	delete(app.run.snap.sessions)
-	delete(string(app.run.snap.active_session), app.run.alloc)
 	delete(app.run.snap.status.provider_id, app.run.alloc)
 	delete(app.run.snap.status.model_id, app.run.alloc)
 	delete(app.run.snap.status.effort, app.run.alloc)

@@ -10,7 +10,7 @@ import "core:strings"
 import "core:testing"
 
 import "nabla:agent"
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 // diagnostics_test_err collects what the command reports on its diagnosis
 // writer, so a passing test leaves the test runner's own output alone and can
@@ -45,77 +45,60 @@ diagnostics_request_state :: proc(t: ^testing.T, name: string, body: proc(t: ^te
 	body(t)
 }
 
-// diagnostics_request_expect is the session-error counterpart of the log
-// package's own expectation helper.
 @(private)
-diagnostics_request_expect :: proc(t: ^testing.T, err: session.Error) {
-	if err == nil { return }
-	local := err
-	testing.fail_now(t, strings.concatenate({"unexpected session error: ", session.error_detail(&local)}, context.temp_allocator))
+diagnostics_request_expect :: proc(test: ^testing.T, error: journal.Error) {
+	if error == nil { return }
+	testing.fail_now(test, strings.concatenate({"unexpected journal error: ", journal.error_text(error, context.temp_allocator)}, context.temp_allocator))
 }
 
-// diagnostics_request_fixture finishes one request in a store under the test's
-// state root, so a join has a durable row to find. The usage it was given is what
-// the row reports, which is how a test states which buckets were measured.
-//
-// The header it returns owns its strings, exactly as session_create's own result
-// does, so the caller releases it with session_destroy.
 diagnostics_request_fixture :: proc(
 	t: ^testing.T,
-	outcome: session.Outcome,
-	usage: session.Usage,
+	outcome: string,
+	usage: journal.Response_Committed,
 ) -> (
-	created: session.Session,
-	request_no: session.Request_No,
+	created: journal.Session_Id,
+	request_no: journal.Request_Id,
 ) {
 	directory, directory_err := agent.xdg_directory(.State, context.temp_allocator)
 	if directory_err != .None { testing.fail_now(t, "the state directory could not be resolved") }
 
-	store: session.Store
-	diagnostics_request_expect(t, session.store_open(&store, directory))
-	defer session.store_close(&store)
-
-	create_err: session.Error
-	created, create_err = session.session_create(&store, {workspace = "/tmp/project", title = "first"}, 1_000)
-	diagnostics_request_expect(t, create_err)
-	diagnostics_request_expect(t, session.session_claim(&store, created.id))
-	defer session.session_release(&store)
-
-	turn, turn_err := session.turn_begin(&store, created.id, "explain the parser", .Prompt, 2_000)
-	diagnostics_request_expect(t, turn_err)
-	begin_err: session.Error
-	request_no, begin_err = session.request_begin(
-		&store,
-		created.id,
-		{
-			turn_no = turn,
-			purpose = .Response,
-			provider = "openai",
-			model_requested = "gpt-4",
-			api = "openai_chat_completions",
-			config_json = "{}",
-			input_json = `{"messages":1}`,
-		},
-		2_100,
-	)
-	diagnostics_request_expect(t, begin_err)
-	diagnostics_request_expect(
-		t,
-		session.request_finish(
-			&store,
-			created.id,
-			request_no,
-			{outcome = outcome, model_resolved = "gpt-4-0613", response_json = `{"reason":"stop"}`, usage = usage, at_ms = 2_200},
-		),
-	)
-	diagnostics_request_expect(t, session.turn_finish(&store, created.id, turn, .Completed, "", 2_300))
+	store: journal.Journal
+	diagnostics_request_expect(t, journal.open(&store, directory, journal.run_id_create(), .Read_Write))
+	defer diagnostics_request_expect(t, journal.close(&store))
+	create_error: journal.Error
+	created, create_error = journal.create_session(&store, {workspace = "/tmp/project", role = .Main})
+	diagnostics_request_expect(t, create_error)
+	request_no = journal.next_request(&store)
+	header := journal.Record {
+		session  = created,
+		branch   = journal.INITIAL_BRANCH,
+		turn     = 1,
+		request  = request_no,
+		attempt  = 1,
+		provider = "openai",
+		model    = "gpt-4",
+	}
+	header.kind = .Request_Sent
+	journal.append_record(&store, header, journal.Request_Sent{purpose = "response", api = "openai_chat_completions", model_requested = "gpt-4"})
+	if outcome == "completed" {
+		header.kind = .Response_Committed
+		response := usage
+		response.model_resolved = "gpt-4-0613"
+		response.finish = "stop"
+		journal.append_record(&store, header, response)
+	} else if outcome == "rejected" {
+		header.kind = .Response_Rejected
+		journal.append_record(&store, header, journal.Response_Rejected{detail = "provider rejected the request"})
+	}
+	_, commit_error := journal.commit(&store)
+	diagnostics_request_expect(t, commit_error)
 	return
 }
 
 // diagnostics_request_run writes one run holding a record for the session, into
 // the root the diagnostics command itself resolves. The run id is owned by the
 // caller.
-diagnostics_request_run :: proc(t: ^testing.T, session_id: session.Session_Id) -> string {
+diagnostics_request_run :: proc(t: ^testing.T, session_id: journal.Session_Id) -> string {
 	logs_root, directory_err := agent.log_default_directory(context.allocator)
 	if directory_err != nil { testing.fail_now(t, "the log directory could not be resolved") }
 	defer delete(logs_root, context.allocator)
@@ -123,15 +106,17 @@ diagnostics_request_run :: proc(t: ^testing.T, session_id: session.Session_Id) -
 	log_record: agent.Log
 	_, open_err := agent.log_open(&log_record, {directory = logs_root, enabled = true, lowest = .Info}, context.allocator)
 	if open_err != nil { testing.fail_now(t, "the log could not be opened") }
-	run_id := strings.clone(log_record.run_id, context.allocator)
+	run_id, clone_error := strings.clone(log_record.run_id, context.allocator)
+	if clone_error != nil { testing.fail_now(t, "the run id could not be cloned") }
+	session_buffer: [journal.SESSION_ID_HEX_LENGTH]u8
 
 	binding := agent.Log_Binding {
 		sink = &log_record,
-		correlation = agent.Log_Correlation{session_id = session_id, turn_no = 1},
+		correlation = agent.Log_Correlation{session_id = journal.session_id_to_hex(session_id, session_buffer[:]), turn_no = 1},
 	}
 	context.logger = agent.log_logger(&binding)
 	agent.log_emit(agent.Log_Record{level = .Info, category = .Agent, event = "turn.started"})
-	_ = agent.log_close(&log_record)
+	if agent.log_close(&log_record) != nil { testing.fail_now(t, "the log could not be closed") }
 	return run_id
 }
 
@@ -150,29 +135,28 @@ test_request_join_reads_the_durable_row :: proc(t: ^testing.T) {
 		t,
 		"join",
 		proc(t: ^testing.T) {
-			created, request_no := diagnostics_request_fixture(t, .Completed, {input = 10, output = 4})
-			defer session.session_destroy(&created)
+			created, request_no := diagnostics_request_fixture(t, "completed", {input_tokens = 10, output_tokens = 4})
 
-			row, load_err := diagnostics_request_open(created.id, request_no, context.temp_allocator)
+			row, load_err := diagnostics_request_open(created, request_no, context.allocator)
 			diagnostics_request_expect(t, load_err)
-			defer session.request_destroy(&row, context.temp_allocator)
+			defer diagnostics_request_destroy(&row, context.allocator)
 
 			// The stored row is the answer, so every field the summary prints comes
 			// from here rather than from anything the log observed.
-			testing.expect_value(t, row.purpose, session.Request_Purpose.Response)
-			testing.expect_value(t, row.outcome, session.Outcome.Completed)
+			testing.expect_value(t, row.purpose, "response")
+			testing.expect_value(t, row.outcome, "completed")
 			testing.expect_value(t, row.provider, "openai")
 			testing.expect_value(t, row.api, "openai_chat_completions")
 			testing.expect_value(t, row.model_requested, "gpt-4")
 			testing.expect_value(t, row.model_resolved, "gpt-4-0613")
-			testing.expect_value(t, row.usage.input, Maybe(i64)(10))
-			testing.expect_value(t, row.usage.output, Maybe(i64)(4))
+			testing.expect_value(t, row.input_tokens, Maybe(i64)(10))
+			testing.expect_value(t, row.output_tokens, Maybe(i64)(4))
 			// A bucket the provider never reported stays unreported. Reading it as
 			// zero would invent a measurement.
-			if _, present := row.usage.cache_read.?; present { testing.fail_now(t, "an unreported bucket must stay unreported") }
-			if _, present := row.usage.cache_write.?; present { testing.fail_now(t, "an unreported bucket must stay unreported") }
+			if _, present := row.cache_read_tokens.?; present { testing.fail_now(t, "an unreported bucket must stay unreported") }
+			if _, present := row.cache_write_tokens.?; present { testing.fail_now(t, "an unreported bucket must stay unreported") }
 
-			usage := diagnostics_usage_text(row.usage)
+			usage := diagnostics_usage_text(&row)
 			for needle in ([]string{"input 10", "output 4", "cache read unreported", "cache write unreported"}) {
 				testing.expectf(t, strings.contains(usage, needle), "the usage summary should say %q, got %q", needle, usage)
 			}
@@ -180,28 +164,39 @@ test_request_join_reads_the_durable_row :: proc(t: ^testing.T) {
 			// The join is the command's contract, not a best-effort extra.
 			err_text: strings.Builder
 			defer strings.builder_destroy(&err_text)
-			testing.expect(t, diagnostics_report_request(created.id, request_no, diagnostics_test_err(&err_text)), "a present request should be reported")
+			testing.expect(t, diagnostics_report_request(created, request_no, diagnostics_test_err(&err_text)), "a present request should be reported")
 			testing.expect(t, strings.contains(strings.to_string(err_text), "openai"), "the report should name the provider")
 		},
 	)
 }
 
 @(test)
+test_request_join_distinguishes_open_and_rejected_requests :: proc(test: ^testing.T) {
+	if !test_isolate_process(test, #procedure) { return }
+	diagnostics_request_state(test, "outcomes", proc(test: ^testing.T) {
+		for outcome in ([]string{"open", "rejected"}) {
+			session_id, request_no := diagnostics_request_fixture(test, outcome, {})
+			request, error := diagnostics_request_open(session_id, request_no, context.allocator)
+			diagnostics_request_expect(test, error)
+			testing.expect_value(test, request.outcome, outcome)
+			testing.expect_value(test, request.attempts, 1)
+			testing.expect_value(test, request.finished_ms == 0, outcome == "open")
+			diagnostics_request_destroy(&request, context.allocator)
+		}
+	})
+}
+
+@(test)
 test_request_join_reports_a_request_the_database_does_not_have :: proc(t: ^testing.T) {
 	if !test_isolate_process(t, #procedure) { return }
 	diagnostics_request_state(t, "missing-row", proc(t: ^testing.T) {
-		created, _ := diagnostics_request_fixture(t, .Completed, {input = 10})
-		defer session.session_destroy(&created)
+		created, _ := diagnostics_request_fixture(t, "completed", {input_tokens = 10})
 
-		_, load_err := diagnostics_request_open(created.id, 99, context.temp_allocator)
-		testing.expect_value(t, session.error_kind(load_err), session.Error_Kind.Not_Found)
+		_, load_err := diagnostics_request_open(created, 99, context.temp_allocator)
+		testing.expect_value(t, load_err, journal.Journal_Error.Not_Found)
 		err_text: strings.Builder
 		defer strings.builder_destroy(&err_text)
-		testing.expect(
-			t,
-			!diagnostics_report_request(created.id, 99, diagnostics_test_err(&err_text)),
-			"a request the database does not have is not an answer",
-		)
+		testing.expect(t, !diagnostics_report_request(created, 99, diagnostics_test_err(&err_text)), "a request the database does not have is not an answer")
 		testing.expect(t, strings.contains(strings.to_string(err_text), "could not be read"), "the absence should be reported")
 	})
 }
@@ -213,7 +208,8 @@ test_request_join_never_creates_the_store_it_reads :: proc(t: ^testing.T) {
 		t,
 		"missing-store",
 		proc(t: ^testing.T) {
-			session_id := session.Session_Id("00112233445566778899aabbccddeeff")
+			session_id, parsed := journal.session_id_parse("00112233445566778899aabbccddeeff")
+			testing.expect(t, parsed)
 
 			// A diagnostics run must never create the store it was pointed at, so a
 			// missing database is an absence the command reports rather than one it
@@ -225,7 +221,7 @@ test_request_join_never_creates_the_store_it_reads :: proc(t: ^testing.T) {
 			directory, directory_err := agent.xdg_directory(.State, context.allocator)
 			defer delete(directory, context.allocator)
 			if directory_err != .None { testing.fail_now(t, "the state directory could not be resolved") }
-			database := fmt.tprintf("%s/%s", directory, session.DATABASE_NAME)
+			database := fmt.tprintf("%s/%s", directory, journal.DATABASE_NAME)
 			testing.expect(t, !os.exists(database), "the join must not create a session database")
 			testing.expect(t, !os.exists(directory), "the join must not create the state directory")
 		},
@@ -239,9 +235,8 @@ test_export_writes_the_durable_row_for_a_selected_request :: proc(t: ^testing.T)
 		t,
 		"export-row",
 		proc(t: ^testing.T) {
-			created, request_no := diagnostics_request_fixture(t, .Completed, {input = 10, output = 4, cache_read = 2})
-			defer session.session_destroy(&created)
-			run_id := diagnostics_request_run(t, created.id)
+			created, request_no := diagnostics_request_fixture(t, "completed", {input_tokens = 10, output_tokens = 4, cache_read_tokens = 2})
+			run_id := diagnostics_request_run(t, created)
 			defer delete(run_id, context.allocator)
 
 			destination := diagnostics_request_export_dir(t, "row")
@@ -253,7 +248,9 @@ test_export_writes_the_durable_row_for_a_selected_request :: proc(t: ^testing.T)
 			// Driven through the command itself, so the read-only store, the durable
 			// read, and the export are one path rather than three.
 			number_buffer: [16]u8
-			args := [5]string{string(created.id), "--request", fmt.bprintf(number_buffer[:], "%d", i64(request_no)), "--export", destination}
+			session_buffer: [journal.SESSION_ID_HEX_LENGTH]u8
+			session_text := journal.session_id_to_hex(created, session_buffer[:])
+			args := [5]string{session_text, "--request", fmt.bprintf(number_buffer[:], "%d", i64(request_no)), "--export", destination}
 			out_text, err_text: strings.Builder
 			defer strings.builder_destroy(&out_text)
 			defer strings.builder_destroy(&err_text)
@@ -271,7 +268,7 @@ test_export_writes_the_durable_row_for_a_selected_request :: proc(t: ^testing.T)
 			object, is_object := value.(json.Object)
 			if !testing.expect(t, is_object, "request.json should be one object") { return }
 
-			testing.expect_value(t, diagnostics_value_string(t, object, "session_id"), string(created.id))
+			testing.expect_value(t, diagnostics_value_string(t, object, "session_id"), session_text)
 			testing.expect_value(t, diagnostics_value_string(t, object, "outcome"), "completed")
 			testing.expect_value(t, diagnostics_value_string(t, object, "provider"), "openai")
 			testing.expect_value(t, diagnostics_value_string(t, object, "model_requested"), "gpt-4")
@@ -307,9 +304,8 @@ test_export_reports_a_request_the_database_does_not_have :: proc(t: ^testing.T) 
 		t,
 		"export-missing",
 		proc(t: ^testing.T) {
-			created, _ := diagnostics_request_fixture(t, .Completed, {input = 10})
-			defer session.session_destroy(&created)
-			run_id := diagnostics_request_run(t, created.id)
+			created, _ := diagnostics_request_fixture(t, "completed", {input_tokens = 10})
+			run_id := diagnostics_request_run(t, created)
 			defer delete(run_id, context.allocator)
 
 			destination := diagnostics_request_export_dir(t, "missing")
@@ -320,7 +316,8 @@ test_export_reports_a_request_the_database_does_not_have :: proc(t: ^testing.T) 
 
 			// An answer whose authoritative half is missing is an incomplete answer,
 			// so the bundle is written, says so, and the command fails.
-			args := [5]string{string(created.id), "--request", "99", "--export", destination}
+			session_buffer: [journal.SESSION_ID_HEX_LENGTH]u8
+			args := [5]string{journal.session_id_to_hex(created, session_buffer[:]), "--request", "99", "--export", destination}
 			out_text, err_text: strings.Builder
 			defer strings.builder_destroy(&out_text)
 			defer strings.builder_destroy(&err_text)

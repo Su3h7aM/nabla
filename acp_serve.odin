@@ -13,7 +13,7 @@ import "core:thread"
 
 import "nabla:acp"
 import "nabla:agent"
-import "nabla:agent/session"
+import "nabla:agent/journal"
 
 // The ACP conversation: reading messages, answering what the reader can answer on its
 // own, and turning the rest into work for the worker. Everything a turn produces is
@@ -360,7 +360,7 @@ acp_request_session_load :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, reason)
 		return
 	}
-	if !session.session_id_valid(session.Session_Id(params.session_id)) {
+	if _, valid := journal.session_id_parse(params.session_id); !valid {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("%s is not a session id", params.session_id))
 		return
 	}
@@ -368,12 +368,12 @@ acp_request_session_load :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 	// anything is given up for it.
 	header, header_ok := acp_stored_session(server, envelope, params.session_id)
 	if !header_ok { return }
-	defer session.session_destroy(&header, context.temp_allocator)
-	if !os.is_dir(header.workspace) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("the session's directory is not usable: %s", header.workspace))
+	defer journal.session_summaries_destroy(header, context.temp_allocator)
+	if !os.is_dir(header[0].workspace) {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("the session's directory is not usable: %s", header[0].workspace))
 		return
 	}
-	if params.cwd != "" && params.cwd != header.workspace {
+	if params.cwd != "" && params.cwd != header[0].workspace {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the load working directory does not match the session")
 		return
 	}
@@ -426,14 +426,14 @@ acp_request_session_resume :: proc(server: ^Acp_Server, envelope: ^acp.Envelope)
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, reason)
 		return
 	}
-	if !session.session_id_valid(session.Session_Id(params.session_id)) {
+	if _, valid := journal.session_id_parse(params.session_id); !valid {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("%s is not a session id", params.session_id))
 		return
 	}
 	header, header_ok := acp_stored_session(server, envelope, params.session_id)
 	if !header_ok { return }
-	defer session.session_destroy(&header, context.temp_allocator)
-	if header.workspace != params.cwd {
+	defer journal.session_summaries_destroy(header, context.temp_allocator)
+	if header[0].workspace != params.cwd {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the resume working directory does not match the session")
 		return
 	}
@@ -654,15 +654,34 @@ acp_destroy_open_strings :: proc(workspace, reference, prompt, title: string, al
 // acp_stored_session reads the stored session an open request names. An unknown id is
 // refused as invalid params; a store that cannot answer is an internal error. The
 // header is owned by the temp allocator.
-acp_stored_session :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, session_id: string) -> (header: session.Session, ok: bool) {
-	loaded, load_error := session.session_load(&server.app.setup.store, session.Session_Id(session_id), context.temp_allocator)
-	if load_error == nil { return loaded, true }
-	if failure, is_failure := load_error.(session.Failure); is_failure && failure.kind == .Not_Found {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("no session named %s", session_id))
-	} else {
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, fmt.tprintf("the session %s could not be read", session_id))
+acp_stored_session :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, session_id: string) -> (header: []journal.Session_Summary, ok: bool) {
+	parsed_id, valid := journal.session_id_parse(session_id)
+	if !valid {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("%s is not a session id", session_id))
+		return nil, false
 	}
-	return {}, false
+	// The worker owns the running journal, so the reader asks through a read-only one of its own.
+	store: journal.Journal
+	if open_error := journal.open(&store, server.app.setup.journal_directory, server.app.setup.run, .Read_Only, context.temp_allocator); open_error != nil {
+		if journal.error_is(open_error, .Not_Found) {
+			acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("no session named %s", session_id))
+			return nil, false
+		}
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session database could not be opened")
+		return nil, false
+	}
+	defer _ = journal.close(&store)
+	loaded, load_error := journal.list_sessions(&store, {session = parsed_id, limit = 1}, context.temp_allocator)
+	if load_error != nil {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, fmt.tprintf("the session %s could not be read", session_id))
+		return nil, false
+	}
+	if len(loaded) == 0 {
+		journal.session_summaries_destroy(loaded, context.temp_allocator)
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("no session named %s", session_id))
+		return nil, false
+	}
+	return loaded, true
 }
 
 // acp_enqueue_open_session hands a validated open request to the worker. The strings

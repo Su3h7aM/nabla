@@ -6,7 +6,7 @@ import "core:strings"
 import "core:sync/chan"
 import "core:testing"
 
-import "nabla:agent/session"
+import "nabla:agent/journal"
 import "nabla:tui/widgets"
 
 // The slash-command machinery needs the prompt buffer, a snapshot to report
@@ -29,11 +29,9 @@ command_app_end :: proc(app: ^App) {
 	}
 	delete(app.run.snap.entries)
 	for &row in app.run.snap.sessions {
-		delete(string(row.id), app.run.alloc)
 		delete(row.title, app.run.alloc)
 	}
 	delete(app.run.snap.sessions)
-	delete(string(app.run.snap.active_session), app.run.alloc)
 	delete(app.run.snap.status.effort, app.run.alloc)
 	for level in app.run.snap.status.effort_levels { delete(level, app.run.alloc) }
 	delete(app.run.snap.status.effort_levels)
@@ -144,20 +142,11 @@ test_session_menu_choices_become_resume_work :: proc(t: ^testing.T) {
 	defer command_app_end(&app)
 
 	// The worker owns the store, so the menu shows the list it published.
-	append(
-		&app.run.snap.sessions,
-		Session_Row {
-			id = session.Session_Id(strings.clone("0123456789abcdef0123456789abcdef", app.run.alloc)),
-			title = strings.clone("first task", app.run.alloc),
-		},
-	)
-	append(
-		&app.run.snap.sessions,
-		Session_Row {
-			id = session.Session_Id(strings.clone("fedcba9876543210fedcba9876543210", app.run.alloc)),
-			title = strings.clone("second task", app.run.alloc),
-		},
-	)
+	first_id, first_valid := journal.session_id_parse("0123456789abcdef0123456789abcdef")
+	second_id, second_valid := journal.session_id_parse("fedcba9876543210fedcba9876543210")
+	if !testing.expect(t, first_valid && second_valid) { return }
+	append(&app.run.snap.sessions, Session_Row{id = first_id, title = strings.clone("first task", app.run.alloc)})
+	append(&app.run.snap.sessions, Session_Row{id = second_id, title = strings.clone("second task", app.run.alloc)})
 
 	dispatch_command(&app, "/resume")
 	testing.expect(t, app.menu_open)
