@@ -49,6 +49,8 @@ log_provider_report :: proc(user_data: rawptr, report: ai.Provider_Operation_Rep
 		// was written, because a request that never left says so.
 		observation.transfer = report.transfer
 		observation.transfer_seen = true
+	case .Reconnected:
+		log_emit({level = .Info, category = .Provider, event = "provider.websocket_reconnected"})
 	}
 }
 

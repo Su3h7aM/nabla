@@ -908,9 +908,9 @@ run_request_chunks :: proc(api: API_Kind, chunks: []string) -> [dynamic]string {
 	defer Provider_Event_Destroy(&state.completion, context.temp_allocator)
 	defer Provider_Stream_Destroy(&state.stream)
 	for chunk in chunks {
-		sse.parser_feed(&state.parser, transmute([]u8)chunk)
+		_ = sse.parser_feed(&state.parser, transmute([]u8)chunk)
 	}
-	sse.parser_finish(&state.parser)
+	_ = sse.parser_finish(&state.parser)
 	stream_err := Provider_Stream_Finish(&state.stream)
 	provider_drain_events(&state)
 	if stream_err != .None && !state.failed {

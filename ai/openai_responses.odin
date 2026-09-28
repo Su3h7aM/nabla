@@ -389,9 +389,9 @@ openai_responses_incomplete_reason :: proc(reason: string) -> Provider_Finish_Re
 // openai_responses_clone_output clones the terminal response's output array
 // verbatim for the replay record. A missing, null, or empty array replays as
 // empty: there are no items to replay, and the harness falls back to its own
-// projection for that response rather than sending an empty native record. ok
-// is false only when a present value cannot be stringified. The caller owns the
-// result on success.
+// projection for that response rather than sending an empty native record. ok is
+// false when a present value could not be written, which is a local failure: the
+// caller reports the allocation it is. The caller owns the result on success.
 openai_responses_clone_output :: proc(response: json.Object, allocator := context.allocator) -> (cloned: string, ok: bool) {
 	raw_output_value, output_present := response["output"]
 	if !output_present { return "", true }
@@ -404,9 +404,9 @@ openai_responses_clone_output :: proc(response: json.Object, allocator := contex
 
 // Provider_Replay_Read reads one endpoint output array the way a request would carry it
 // back, and reports the calls the record declares. ok is false when the array cannot be
-// sent back at all, which is a fact about the bytes rather than an error: the caller
-// replays its own projection of that response instead, and the conversation loses nothing
-// but the fields only the endpoint models.
+// sent back at all, whether because of the bytes or because the calls it declares could not
+// be retained: the caller replays its own projection of that response instead, and the
+// conversation loses nothing but the fields only the endpoint models.
 //
 // Nothing is spliced unread. The record is the endpoint's own output, so its items are not
 // the harness's to trust: an item the input schema refuses fails the whole record, because
@@ -433,11 +433,10 @@ Provider_Replay_Read :: proc(output: string, allocator := context.allocator) -> 
 		call_id, _, _ := openai_value_string(object, "call_id")
 		name, _, _ := openai_value_string(object, "name")
 		arguments, _, _ := openai_value_string(object, "arguments")
-		call := Provider_Tool_Call {
-			ID        = strings.clone(call_id, allocator),
-			Item_ID   = strings.clone(id, allocator),
-			Name      = strings.clone(name, allocator),
-			Arguments = strings.clone(arguments, allocator),
+		call := Provider_Tool_Call{}
+		if !provider_call_clone_strings(&call, call_id, id, name, arguments, allocator) {
+			Provider_Tool_Calls_Destroy(declared[:], allocator)
+			return nil, false
 		}
 		if _, append_error := append(&declared, call); append_error != nil {
 			provider_tool_call_destroy(&call, allocator)
@@ -487,39 +486,39 @@ openai_responses_replay_item_ok :: proc(object: json.Object, allocator: mem.Allo
 	return true
 }
 
-provider_tool_fragment_by_item :: proc(object: json.Object, state: ^Provider_Stream_State, allocator := context.allocator) -> (^Provider_Tool_Fragment, bool) {
+provider_tool_fragment_by_item :: proc(object: json.Object, state: ^Provider_Stream_State) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
 	id, present, ok := openai_value_string(object, "item_id")
 	if !ok || !present || id == "" {
-		state^.Phase = .Failed
-		return nil, false
+		return nil, provider_stream_fail(state, .Invalid_Data, "arguments event has no item id")
 	}
 	for &fragment in state.Tool_Fragments {
-		if fragment.Present && fragment.Item_ID == id { return &fragment, true }
+		if fragment.Present && fragment.Item_ID == id { return &fragment, .None }
 	}
-	fragment, appended := provider_tool_fragment_append(state)
-	if !appended {
-		state^.Phase = .Failed
-		return nil, false
+	fragment, fragment_error := provider_tool_fragment_append(state)
+	if fragment_error != .None { return nil, fragment_error }
+	owned_id, clone_error := strings.clone(id, state.Allocator)
+	if clone_error != nil {
+		return nil, provider_stream_fail_allocation(state, "the output item id could not be retained")
 	}
-	fragment.Item_ID = strings.clone(id, state.Allocator)
-	return fragment, true
+	fragment.Item_ID = owned_id
+	return fragment, .None
 }
 
-openai_responses_call_slot :: proc(object, item: json.Object, state: ^Provider_Stream_State, allocator: mem.Allocator) -> (^Provider_Tool_Fragment, bool) {
+openai_responses_call_slot :: proc(object, item: json.Object, state: ^Provider_Stream_State) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
 	if id, present, ok := openai_value_string(item, "id"); ok && present && id != "" {
 		for &fragment in state.Tool_Fragments {
-			if fragment.Present && fragment.Item_ID == id { return &fragment, true }
+			if fragment.Present && fragment.Item_ID == id { return &fragment, .None }
 		}
 	}
 	if index, present, ok := openai_value_integer(object, "output_index"); ok && present {
 		for &fragment in state.Tool_Fragments {
-			if fragment.Present && fragment.Wire_Index == index { return &fragment, true }
+			if fragment.Present && fragment.Wire_Index == index { return &fragment, .None }
 		}
-		fragment, appended := provider_tool_fragment_append(state)
-		if !appended { return nil, false }
+		fragment, fragment_error := provider_tool_fragment_append(state)
+		if fragment_error != .None { return nil, fragment_error }
 		fragment.Wire_Index = index
 		fragment.Wire_Index_Present = true
-		return fragment, true
+		return fragment, .None
 	}
 	return provider_tool_fragment_append(state)
 }
@@ -551,35 +550,59 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 			if !id_ok || !id_present || id == "" { return provider_stream_fail(state, .Invalid_Data, "reasoning item has no id") }
 			encrypted, _, encrypted_ok := openai_value_string(item, "encrypted_content")
 			if !encrypted_ok { return provider_stream_fail(state, .Invalid_Data, "reasoning content is invalid") }
-			provider_stream_push(
-				state,
-				Provider_Reasoning_Event{ID = strings.clone(id, state.Allocator), Encrypted = strings.clone(encrypted, state.Allocator)},
-			)
+			owned_id, id_error := strings.clone(id, state.Allocator)
+			if id_error != nil {
+				return provider_stream_fail_allocation(state, "the reasoning item id could not be retained")
+			}
+			owned_encrypted, encrypted_error := strings.clone(encrypted, state.Allocator)
+			if encrypted_error != nil {
+				delete(owned_id, state.Allocator)
+				return provider_stream_fail_allocation(state, "the reasoning content could not be retained")
+			}
+			provider_stream_push(state, Provider_Reasoning_Event{ID = owned_id, Encrypted = owned_encrypted})
 			return .None
 		}
-		fragment, slot_ok := openai_responses_call_slot(object, item, state, state.Allocator)
-		if !slot_ok { return provider_stream_fail(state, .Invalid_Data, "tool call has no slot") }
+		fragment, slot_error := openai_responses_call_slot(object, item, state)
+		if slot_error != .None { return slot_error }
 		if item_type != "function_call" {
 			return provider_stream_fail(state, .Unsupported_Tool_Output, "Responses tool output is unsupported", .None)
 		}
 		if id, present, ok := openai_value_string(item, "id"); ok && present && id != "" {
 			if fragment.Item_ID != "" && fragment.Item_ID != id { return provider_stream_fail(state, .Invalid_Data, "output item id changed") }
-			if fragment.Item_ID == "" { fragment.Item_ID = strings.clone(id, state.Allocator) }
+			if fragment.Item_ID == "" {
+				owned, clone_error := strings.clone(id, state.Allocator)
+				if clone_error != nil {
+					return provider_stream_fail_allocation(state, "the output item id could not be retained")
+				}
+				fragment.Item_ID = owned
+			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "output item id is invalid") }
 		if id, present, ok := openai_value_string(item, "call_id"); ok && present && id != "" {
 			if fragment.ID != "" && fragment.ID != id { return provider_stream_fail(state, .Invalid_Data, "call id changed") }
-			if fragment.ID == "" { fragment.ID = strings.clone(id, state.Allocator) }
+			if fragment.ID == "" {
+				owned, clone_error := strings.clone(id, state.Allocator)
+				if clone_error != nil {
+					return provider_stream_fail_allocation(state, "the tool call id could not be retained")
+				}
+				fragment.ID = owned
+			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call id is invalid") }
 		if name, present, ok := openai_value_string(item, "name"); ok && present && name != "" {
 			if fragment.Name != "" && fragment.Name != name { return provider_stream_fail(state, .Invalid_Data, "call name changed") }
-			if fragment.Name == "" { fragment.Name = strings.clone(name, state.Allocator) }
+			if fragment.Name == "" {
+				owned, clone_error := strings.clone(name, state.Allocator)
+				if clone_error != nil {
+					return provider_stream_fail_allocation(state, "the tool call name could not be retained")
+				}
+				fragment.Name = owned
+			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call name is invalid") }
 		if arguments, present, ok := openai_value_string(item, "arguments"); ok && present && arguments != "" {
 			// The done item repeats the full arguments already streamed
 			// as deltas; replace so a replayed payload is not doubled.
 			clear(&fragment.Arguments)
 			if _, append_error := append(&fragment.Arguments, arguments); append_error != nil {
-				return provider_stream_fail(state, .Invalid_Data, "tool call arguments could not be retained")
+				return provider_stream_fail_allocation(state, "the tool call arguments could not be retained")
 			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call arguments are invalid") }
 		fragment.Present = true
@@ -613,34 +636,31 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 		// An absent or empty array is not an error; a completed response may
 		// carry usage alone.
 		raw_output, output_ok := openai_responses_clone_output(response, state.Allocator)
-		if !output_ok { return provider_stream_fail(state, .Invalid_Data, "response output is invalid") }
+		if !output_ok {
+			return provider_stream_fail_allocation(state, "the response output could not be retained")
+		}
 		calls: []Provider_Tool_Call
 		if provider_tool_fragments_present(state) {
-			finalized, finalized_ok := provider_tool_finalize(state, state.Allocator)
-			if !finalized_ok {
-				delete(raw_output, state.Allocator)
-				return provider_stream_fail(state, .Invalid_Data, "tool calls are invalid")
+			finalized, finalized_error := provider_tool_finalize(state, state.Allocator)
+			if finalized_error != .None {
+				if raw_output != "" { delete(raw_output, state.Allocator) }
+				return finalized_error
 			}
 			calls = finalized
+		}
+		reason_text, reason_error := strings.clone(calls != nil ? "tool_calls" : "completed", state.Allocator)
+		if reason_error != nil {
+			if raw_output != "" { delete(raw_output, state.Allocator) }
+			Provider_Tool_Calls_Destroy(calls, state.Allocator)
+			return provider_stream_fail_allocation(state, "the completion reason could not be retained")
 		}
 		if usage_present { provider_stream_push(state, Provider_Usage_Event(usage)) }
 		state^.Phase = .Completed
 		// The push takes ownership of raw_output on every path.
 		if calls != nil {
-			provider_stream_push(
-				state,
-				Provider_Completed_Event {
-					Reason = .Tool_Call,
-					Reason_Text = strings.clone("tool_calls", state.Allocator),
-					Tool_Calls = calls,
-					Raw_Output = raw_output,
-				},
-			)
+			provider_stream_push(state, Provider_Completed_Event{Reason = .Tool_Call, Reason_Text = reason_text, Tool_Calls = calls, Raw_Output = raw_output})
 		} else {
-			provider_stream_push(
-				state,
-				Provider_Completed_Event{Reason = .Stop, Reason_Text = strings.clone("completed", state.Allocator), Raw_Output = raw_output},
-			)
+			provider_stream_push(state, Provider_Completed_Event{Reason = .Stop, Reason_Text = reason_text, Raw_Output = raw_output})
 		}
 		return .None
 	case "response.incomplete":
@@ -655,12 +675,13 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 				if detail_reason != "" { reason = detail_reason }
 			}
 		}
+		reason_text, reason_error := strings.clone(reason, state.Allocator)
+		if reason_error != nil {
+			return provider_stream_fail_allocation(state, "the completion reason could not be retained")
+		}
 		if usage_present { provider_stream_push(state, Provider_Usage_Event(usage)) }
 		state^.Phase = .Completed
-		provider_stream_push(
-			state,
-			Provider_Completed_Event{Reason = openai_responses_incomplete_reason(reason), Reason_Text = strings.clone(reason, state.Allocator)},
-		)
+		provider_stream_push(state, Provider_Completed_Event{Reason = openai_responses_incomplete_reason(reason), Reason_Text = reason_text})
 		return .None
 	case "response.failed":
 		message := "response failed"
@@ -678,9 +699,13 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 		}
 		// A failed response may still carry usage. Deliver usage first, then
 		// the error; a malformed terminal payload yields the error alone.
+		failed_event, failed_event_error := openai_error_event(.API_Error, message, code, state.Allocator)
+		if failed_event_error != nil {
+			return provider_stream_fail_allocation(state, "the provider error could not be retained")
+		}
 		if usage_present { provider_stream_push(state, Provider_Usage_Event(usage)) }
 		state^.Phase = .Failed
-		provider_stream_push(state, openai_error_event(.API_Error, message, code, state.Allocator))
+		provider_stream_push(state, failed_event)
 		return .None
 	}
 	return provider_stream_fail(state, .Invalid_Data, "unknown terminal response event")
@@ -711,7 +736,10 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 	defer json.destroy_value(value, state.Allocator)
 	object, object_ok := value.(json.Object)
 	if !object_ok { return provider_stream_fail(state, .Invalid_Data, "stream event is not an object") }
-	if api_error, is_error := openai_parse_api_error(object, state.Allocator); is_error {
+	if api_error, is_error, api_error_error := openai_parse_api_error(object, state.Allocator); is_error {
+		if api_error_error != nil {
+			return provider_stream_fail_allocation(state, "the provider error could not be retained")
+		}
 		provider_stream_batch_clear(state)
 		provider_stream_push(state, api_error)
 		state.Phase = .Failed
@@ -724,7 +752,11 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "data received after completion") }
 		delta, delta_present, delta_ok := openai_value_string(object, "delta")
 		if !delta_ok { return provider_stream_fail(state, .Invalid_Data, "delta is not text") }
-		if delta_present && delta != "" { provider_stream_push(state, Provider_Text_Event{Text = strings.clone(delta, state.Allocator)}) }
+		if delta_present && delta != "" {
+			owned, clone_error := strings.clone(delta, state.Allocator)
+			if clone_error != nil { return provider_stream_fail_allocation(state, "the response text could not be retained") }
+			provider_stream_push(state, Provider_Text_Event{Text = owned})
+		}
 		return .None
 	case "response.completed", "response.incomplete", "response.failed":
 		return openai_responses_terminal(event_type, object, state)
@@ -740,41 +772,57 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		if message == "" { message = "provider returned an API error" }
 		code, _, code_ok := openai_value_string(object, "code")
 		if !code_ok { return provider_stream_fail(state, .Invalid_Data, "error code is invalid") }
+		error_event, error_event_error := openai_error_event(.API_Error, message, code, state.Allocator)
+		if error_event_error != nil {
+			return provider_stream_fail_allocation(state, "the provider error could not be retained")
+		}
 		provider_stream_batch_clear(state)
-		provider_stream_push(state, openai_error_event(.API_Error, message, code, state.Allocator))
+		provider_stream_push(state, error_event)
 		state^.Phase = .Failed
 		return .None
 	case "response.function_call_arguments.delta":
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "data received after completion") }
-		fragment, slot_ok := provider_tool_fragment_by_item(object, state)
-		if !slot_ok { return provider_stream_fail(state, .Invalid_Data, "arguments delta has no call") }
+		fragment, slot_error := provider_tool_fragment_by_item(object, state)
+		if slot_error != .None { return slot_error }
 		if id, present, ok := openai_value_string(object, "item_id"); ok && present && id != "" {
 			if fragment.Item_ID != "" && fragment.Item_ID != id { return provider_stream_fail(state, .Invalid_Data, "output item id changed") }
-			if fragment.Item_ID == "" { fragment.Item_ID = strings.clone(id, state.Allocator) }
+			if fragment.Item_ID == "" {
+				owned, clone_error := strings.clone(id, state.Allocator)
+				if clone_error != nil {
+					return provider_stream_fail_allocation(state, "the output item id could not be retained")
+				}
+				fragment.Item_ID = owned
+			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "item id is invalid") }
 		delta, delta_present, delta_ok := openai_value_string(object, "delta")
 		if !delta_ok { return provider_stream_fail(state, .Invalid_Data, "arguments delta is not text") }
 		if delta_present && delta != "" {
 			if _, append_error := append(&fragment.Arguments, delta); append_error != nil {
-				return provider_stream_fail(state, .Invalid_Data, "tool call arguments could not be retained")
+				return provider_stream_fail_allocation(state, "the tool call arguments could not be retained")
 			}
 		}
 		fragment.Present = true
 		return .None
 	case "response.function_call_arguments.done":
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "data received after completion") }
-		fragment, slot_ok := provider_tool_fragment_by_item(object, state)
-		if !slot_ok { return provider_stream_fail(state, .Invalid_Data, "arguments done has no call") }
+		fragment, slot_error := provider_tool_fragment_by_item(object, state)
+		if slot_error != .None { return slot_error }
 		if id, present, ok := openai_value_string(object, "item_id"); ok && present && id != "" {
 			if fragment.Item_ID != "" && fragment.Item_ID != id { return provider_stream_fail(state, .Invalid_Data, "output item id changed") }
-			if fragment.Item_ID == "" { fragment.Item_ID = strings.clone(id, state.Allocator) }
+			if fragment.Item_ID == "" {
+				owned, clone_error := strings.clone(id, state.Allocator)
+				if clone_error != nil {
+					return provider_stream_fail_allocation(state, "the output item id could not be retained")
+				}
+				fragment.Item_ID = owned
+			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "item id is invalid") }
 		if arguments, present, ok := openai_value_string(object, "arguments"); ok && present && arguments != "" {
 			// The done event repeats full arguments; replace the
 			// accumulated bytes so a replayed prefix is not doubled.
 			clear(&fragment.Arguments)
 			if _, append_error := append(&fragment.Arguments, arguments); append_error != nil {
-				return provider_stream_fail(state, .Invalid_Data, "tool call arguments could not be retained")
+				return provider_stream_fail_allocation(state, "the tool call arguments could not be retained")
 			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call arguments are invalid") }
 		fragment.Present = true

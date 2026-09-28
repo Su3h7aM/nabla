@@ -17,10 +17,13 @@ Provider_Event_Callback :: #type proc(user_data: rawptr, event: Provider_Event)
 // the only moment it exists: the operation frees it when it returns. Response_Body
 // carries a plaintext response chunk as it arrives, before it is parsed, which is
 // what a capture needs and what a byte count is counted from.
+// Reconnected says a reused WebSocket was found closed before any of the response
+// arrived, and the request is being sent again on a new connection.
 Provider_Operation_Stage :: enum {
 	Encoded,
 	Response_Body,
 	Transfer,
+	Reconnected,
 }
 
 // Provider_Transfer_Phase is where one provider request stopped at the HTTP
@@ -92,7 +95,8 @@ Provider_Operation_Error_Kind :: enum {
 	Timed_Out,
 	// TLS means the peer did not authenticate; the response was never usable.
 	TLS,
-	// Allocation means the local request state could not be constructed.
+	// Allocation means the local request state could not be constructed, or that
+	// evidence the operation read could not be retained.
 	Allocation,
 }
 
@@ -169,6 +173,15 @@ Provider_Operation_Error_Destroy :: proc(err: ^Provider_Operation_Error, allocat
 	err^ = {}
 }
 
+// provider_invalid_request reports a request this package refuses to send. The detail is
+// cloned into the error, so the caller owns it like any other detail, and a failure to
+// retain it becomes the allocation failure it is.
+provider_invalid_request :: proc(detail: string, allocator := context.allocator) -> Provider_Operation_Error {
+	owned, clone_error := strings.clone(detail, allocator)
+	if clone_error != nil { return Provider_Operation_Error{kind = .Allocation} }
+	return Provider_Operation_Error{kind = .Invalid_Request, detail = owned}
+}
+
 // Provider_Encoded_Request is a provider request whose body was encoded before
 // the operation runs. It exists so a caller that has to freeze the exact bytes it
 // will send can encode once and hand those bytes to another thread. Every string
@@ -227,20 +240,31 @@ provider_resource_path :: proc(api: API_Kind) -> string {
 
 // provider_endpoint places the API's resource path on the configured endpoint. The
 // endpoint may already state the path, and it may state a query, which belongs after
-// the path rather than inside it.
-provider_endpoint :: proc(endpoint: string, api: API_Kind, allocator: mem.Allocator) -> (result: string, ok: bool) {
+// the path rather than inside it. It returns an Invalid_Request error when the endpoint
+// states no scheme or host, and an Allocation error when the path could not be built.
+provider_endpoint :: proc(endpoint: string, api: API_Kind, allocator: mem.Allocator) -> (result: string, err: Provider_Operation_Error) {
 	url := http.url_parse(endpoint)
-	if url.scheme == "" || url.host == "" { return "", false }
+	if url.scheme == "" || url.host == "" {
+		return "", provider_invalid_request("the provider endpoint is not an absolute URL", allocator)
+	}
 	resource := provider_resource_path(api)
 	path := strings.trim_right(url.path, "/")
 	owned := ""
 	defer if owned != "" { delete(owned, allocator) }
 	if !strings.has_suffix(path, resource) {
-		owned = strings.concatenate([]string{path, resource}, allocator = allocator)
+		combined, combine_error := strings.concatenate([]string{path, resource}, allocator = allocator)
+		if combine_error != nil { return "", Provider_Operation_Error{kind = .Allocation} }
+		owned = combined
 		path = owned
 	}
-	if url.query == "" { return strings.concatenate([]string{url.scheme, "://", url.host, path}, allocator = allocator), true }
-	return strings.concatenate([]string{url.scheme, "://", url.host, path, "?", url.query}, allocator = allocator), true
+	if url.query == "" {
+		joined, join_error := strings.concatenate([]string{url.scheme, "://", url.host, path}, allocator = allocator)
+		if join_error != nil { return "", Provider_Operation_Error{kind = .Allocation} }
+		return joined, {}
+	}
+	joined, join_error := strings.concatenate([]string{url.scheme, "://", url.host, path, "?", url.query}, allocator = allocator)
+	if join_error != nil { return "", Provider_Operation_Error{kind = .Allocation} }
+	return joined, {}
 }
 
 // provider_encoded_headers builds the fields one request carries: the ones its API family
@@ -251,43 +275,75 @@ provider_endpoint :: proc(endpoint: string, api: API_Kind, allocator: mem.Alloca
 // An empty credential yields no auth header rather than a refused request, which is what
 // an endpoint that needs no credential expects, and an unnamed client or session sends no
 // header for it. Every value in the result is owned by allocator, released with
-// provider_headers_destroy, and nil means the result could not be allocated at all.
+// provider_headers_destroy, and nil means no header set could be built: a value that could
+// not be retained releases the headers already built, because a partial set would
+// authenticate or identify less than the caller asked for.
 @(private)
 provider_encoded_headers :: proc(connection: Provider_Connection, encoded: Provider_Encoded_Request, allocator := context.allocator) -> []client.Header {
 	// Sized for the most any API family needs, so every entry comes from the caller's
 	// allocator rather than an ambient one.
-	result := make([]client.Header, 5, allocator)
-	if result == nil { return nil }
+	result, make_error := make([]client.Header, 5, allocator)
+	if make_error != nil { return nil }
 	count := 0
 	switch connection.API {
 	case .OpenAI_Chat_Completions, .OpenAI_Responses:
 		if connection.Credential != "" {
-			result[count] = {"authorization", strings.concatenate({"Bearer ", connection.Credential}, allocator)}
+			value, value_error := strings.concatenate({"Bearer ", connection.Credential}, allocator)
+			if value_error != nil {
+				provider_headers_destroy(result[:count], allocator)
+				return nil
+			}
+			result[count] = {"authorization", value}
 			count += 1
 		}
 	case .Anthropic_Messages:
 		// Anthropic authenticates with a key header rather than a bearer token,
 		// and requires the API version on every request.
 		if connection.Credential != "" {
-			result[count] = {"x-api-key", strings.clone(connection.Credential, allocator)}
+			value, value_error := strings.clone(connection.Credential, allocator)
+			if value_error != nil {
+				provider_headers_destroy(result[:count], allocator)
+				return nil
+			}
+			result[count] = {"x-api-key", value}
 			count += 1
 		}
-		result[count] = {"anthropic-version", strings.clone(ANTHROPIC_VERSION, allocator)}
+		value, value_error := strings.clone(ANTHROPIC_VERSION, allocator)
+		if value_error != nil {
+			provider_headers_destroy(result[:count], allocator)
+			return nil
+		}
+		result[count] = {"anthropic-version", value}
 		count += 1
 	case .Invalid:
 	}
 	if encoded.User_Agent_Present && encoded.User_Agent != "" {
-		result[count] = {"user-agent", strings.clone(encoded.User_Agent, allocator)}
+		value, value_error := strings.clone(encoded.User_Agent, allocator)
+		if value_error != nil {
+			provider_headers_destroy(result[:count], allocator)
+			return nil
+		}
+		result[count] = {"user-agent", value}
 		count += 1
 	}
 	if encoded.Session_Id_Present && encoded.Session_Id != "" {
-		result[count] = {"session-id", strings.clone(encoded.Session_Id, allocator)}
+		value, value_error := strings.clone(encoded.Session_Id, allocator)
+		if value_error != nil {
+			provider_headers_destroy(result[:count], allocator)
+			return nil
+		}
+		result[count] = {"session-id", value}
 		count += 1
 	}
 	// The name other harnesses send, so a gateway can route a subagent beside the
 	// conversation that started it.
 	if encoded.Parent_Session_Id != "" {
-		result[count] = {"x-parent-session-id", strings.clone(encoded.Parent_Session_Id, allocator)}
+		value, value_error := strings.clone(encoded.Parent_Session_Id, allocator)
+		if value_error != nil {
+			provider_headers_destroy(result[:count], allocator)
+			return nil
+		}
+		result[count] = {"x-parent-session-id", value}
 		count += 1
 	}
 	return result[:count]
@@ -345,11 +401,11 @@ Provider_Request_Freeze_Reusing :: proc(
 	Provider_Operation_Error,
 ) {
 	if err := Provider_Validate_Request(request); err != .None {
-		return {}, Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(err), allocator)}
+		return {}, provider_invalid_request(provider_request_error_text(err), allocator)
 	}
 	body, encode_err := Provider_Encode_Request_Reusing(request, cache, allocator)
 	if encode_err != .None {
-		return {}, Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone(provider_request_error_text(encode_err), allocator)}
+		return {}, provider_invalid_request(provider_request_error_text(encode_err), allocator)
 	}
 	return Provider_Encoded_Request {
 		API = request.API,
@@ -378,15 +434,13 @@ Provider_Request_Operation_Encoded :: proc(
 	allocator := context.allocator,
 ) -> Provider_Operation_Error {
 	if connection.API != encoded.API {
-		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("connection/request API mismatch", allocator)}
+		return provider_invalid_request("connection/request API mismatch", allocator)
 	}
 	if len(encoded.Body) == 0 {
-		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("the encoded request body is empty", allocator)}
+		return provider_invalid_request("the encoded request body is empty", allocator)
 	}
-	endpoint, endpoint_ok := provider_endpoint(connection.Endpoint, connection.API, allocator)
-	if !endpoint_ok {
-		return Provider_Operation_Error{kind = .Invalid_Request, detail = strings.clone("the provider endpoint is not an absolute URL", allocator)}
-	}
+	endpoint, endpoint_error := provider_endpoint(connection.Endpoint, connection.API, allocator)
+	if endpoint_error.kind != .None { return endpoint_error }
 	defer delete(endpoint, allocator)
 	if options.observer.report != nil {
 		options.observer.report(
@@ -399,6 +453,8 @@ Provider_Request_Operation_Encoded :: proc(
 	if headers == nil { return Provider_Operation_Error{kind = .Allocation} }
 	defer provider_headers_destroy(headers, allocator)
 
+	error_body, error_body_error := make([dynamic]u8, allocator)
+	if error_body_error != nil { return Provider_Operation_Error{kind = .Allocation} }
 	state := Provider_Request_Stream_State {
 		stream     = Provider_Stream_Start(connection.API, allocator),
 		api        = connection.API,
@@ -408,7 +464,7 @@ Provider_Request_Operation_Encoded :: proc(
 		interrupt  = options.interrupt,
 		deadline   = options.deadline,
 		observer   = options.observer,
-		error_body = make([dynamic]u8, allocator),
+		error_body = error_body,
 	}
 	sse.parser_init(&state.parser, provider_sse_event, &state, allocator = allocator)
 	defer sse.parser_destroy(&state.parser)
@@ -452,14 +508,25 @@ Provider_Request_Operation_Encoded :: proc(
 		// A refused response carried the provider's own account of the refusal in its
 		// body. It is decoded before that body is released, and one that is absent,
 		// truncated, or malformed simply leaves the status and the transport facts as
-		// the evidence.
-		state.rejection = provider_rejection_parse(encoded.API, state.error_body[:], allocator)
+		// the evidence. An account that could not be retained is reported as the local
+		// allocation failure it is, with what the transport observed of the attempt.
+		rejection, rejection_error := provider_rejection_parse(encoded.API, state.error_body[:], allocator)
+		state.rejection = rejection
+		if rejection_error != nil { return provider_terminal_error(&state, .Allocation) }
 		if !state.failed { provider_emit_error(&state, provider_failure_kind(failure), failure.detail) }
 		provider_drain_events(&state)
 		return provider_terminal_error(&state, provider_operation_error_kind(failure))
 	}
+	if state.head_allocation_failed {
+		// The response head carried an identifier that could not outlive the transport
+		// call that reported it, so the attempt is reported as the local allocation
+		// failure it is, with what the transport observed of the attempt.
+		return provider_terminal_error(&state, .Allocation)
+	}
 	if state.failed { return provider_terminal_error(&state, .Stream) }
-	sse.parser_finish(&state.parser)
+	if finish_err := sse.parser_finish(&state.parser); finish_err != nil {
+		provider_emit_error(&state, .Allocation, "the event stream could not be stored")
+	}
 	stream_err := Provider_Stream_Finish(&state.stream)
 	provider_drain_events(&state)
 	if stream_err != .None && !state.failed {
@@ -475,44 +542,51 @@ Provider_Request_Operation_Encoded :: proc(
 }
 
 Provider_Request_Stream_State :: struct {
-	stream:           Provider_Stream_State,
-	parser:           sse.Parser,
-	api:              API_Kind,
-	user_data:        rawptr,
-	callback:         Provider_Event_Callback,
-	allocator:        mem.Allocator,
-	interrupt:        ^Interrupt,
-	deadline:         Deadline,
-	observer:         Provider_Operation_Observer,
-	response_bytes:   u64,
-	failed:           bool,
-	failure_detail:   string,
+	stream:                 Provider_Stream_State,
+	parser:                 sse.Parser,
+	api:                    API_Kind,
+	user_data:              rawptr,
+	callback:               Provider_Event_Callback,
+	allocator:              mem.Allocator,
+	interrupt:              ^Interrupt,
+	deadline:               Deadline,
+	observer:               Provider_Operation_Observer,
+	response_bytes:         u64,
+	failed:                 bool,
+	failure_detail:         string,
 	// failure_event is the terminal event the stream layer produced, when it
 	// produced one. It is what separates a stream that ended without its marker from
 	// output this client cannot read.
-	failure_event:    Maybe(Provider_Error_Kind),
+	failure_event:          Maybe(Provider_Error_Kind),
 	// response_head is what the final response head said, recorded while the
 	// transport's own fields were still borrowed.
-	response_head:    Provider_Response_Head,
+	response_head:          Provider_Response_Head,
+	// head_allocation_failed says the response head carried an identifier that could
+	// not be retained. The operation reports that as a local failure rather than as a
+	// response whose evidence is incomplete.
+	head_allocation_failed: bool,
 	// rejection is the provider's own account of a refused request, owned here until
 	// the terminal error hands it to the caller.
-	rejection:        Provider_Rejection,
+	rejection:              Provider_Rejection,
 	// completion is the terminal response, retained until the transport finishes
 	// cleanly: no call becomes executable while a later failure could still arrive.
-	completion:       Provider_Event,
+	completion:             Provider_Event,
 	// error_body keeps a refused response's body. The transport hands over a
 	// body of any size, and all of it is kept: a large valid error document
 	// can carry its rejection evidence past any prefix, and only the complete
 	// body is parsed before classification. Owned here until release.
-	error_body:       [dynamic]u8,
-	transfer:         Provider_Transfer_Summary,
-	transfer_present: bool,
+	error_body:             [dynamic]u8,
+	// error_body_truncated says the refused response's body could not be kept in full,
+	// so what the classification reads is a prefix. Nothing is grown for it again.
+	error_body_truncated:   bool,
+	transfer:               Provider_Transfer_Summary,
+	transfer_present:       bool,
 	// delivery and delivery_present are the model-send evidence this attempt
 	// established. Evidence first established on a failure reaches the caller
 	// through provider_terminal_error.
-	delivery:         Provider_Delivery_State,
-	delivery_present: bool,
-	transport_cause:  Provider_Transport_Cause,
+	delivery:               Provider_Delivery_State,
+	delivery_present:       bool,
+	transport_cause:        Provider_Transport_Cause,
 }
 
 // Provider_Response_Head is what a final response head said, in this package's
@@ -549,7 +623,14 @@ provider_response_head :: proc(user_data: rawptr, head: client.Response_Head, he
 	}
 	if name := provider_request_id_header(state.api); name != "" {
 		if value, present := http.headers_get_unsafe(headers, name); present {
-			state.response_head.provider_request_id = strings.clone(value, state.allocator)
+			owned, clone_error := strings.clone(value, state.allocator)
+			if clone_error != nil {
+				// The identifier cannot outlive this call, and the operation reports the
+				// loss rather than a response missing evidence its head carried.
+				state.head_allocation_failed = true
+			} else {
+				state.response_head.provider_request_id = owned
+			}
 		}
 	}
 	if value, present := http.headers_get_unsafe(headers, "retry-after"); present {
@@ -758,6 +839,8 @@ provider_stream_error_text :: proc(err: Provider_Stream_Error) -> string {
 		return "provider tool call limit exceeded"
 	case .Batch_Not_Drained:
 		return "provider event batch was not drained"
+	case .Allocation:
+		return "the provider stream could not be retained"
 	}
 	return "provider stream error"
 }
@@ -766,11 +849,17 @@ provider_emit_error :: proc(state: ^Provider_Request_Stream_State, kind: Provide
 	if state.failed { return }
 	state.failed = true
 	if state.failure_event == nil { state.failure_event = kind }
-	state.failure_detail = strings.clone(detail, state.allocator)
-	event: Provider_Event = Provider_Error_Event {
-		Kind    = kind,
-		Message = strings.clone(detail, state.allocator),
+	event, event_error := openai_error_event(kind, detail, "", state.allocator)
+	if event_error != nil {
+		// The wording could not be retained. The kind still names the failure, and the
+		// terminal error carries no detail rather than a fabricated one.
+		provider_deliver(state, Provider_Error_Event{Kind = kind})
+		return
 	}
+	// The event owns its wording; the terminal error keeps a second copy, because the
+	// event is released once the caller's callback returns.
+	owned_detail, detail_error := strings.clone(detail, state.allocator)
+	if detail_error == nil { state.failure_detail = owned_detail }
 	provider_deliver(state, event)
 }
 
@@ -806,14 +895,26 @@ provider_accept_event :: proc(state: ^Provider_Request_Stream_State, event: Prov
 		state.failed = true
 		if state.failure_event == nil { state.failure_event = value.Kind }
 		// The provider's own code and message outlive the event, because the event is
-		// released once the caller's callback returns.
+		// released once the caller's callback returns. A copy that cannot be retained
+		// leaves the kind the event names as the classification evidence, and the event
+		// still reaches the caller with the provider's words.
 		if !provider_rejection_present(state.rejection) {
-			state.rejection = Provider_Rejection {
-				code    = strings.clone(value.Provider_Code, state.allocator),
-				message = strings.clone(value.Message, state.allocator),
+			code, code_error := strings.clone(value.Provider_Code, state.allocator)
+			message, message_error := strings.clone(value.Message, state.allocator)
+			if code_error == nil && message_error == nil {
+				state.rejection = Provider_Rejection {
+					code    = code,
+					message = message,
+				}
+			} else {
+				if code_error == nil && code != "" { delete(code, state.allocator) }
+				if message_error == nil && message != "" { delete(message, state.allocator) }
 			}
 		}
-		if state.failure_detail == "" { state.failure_detail = strings.clone(value.Message, state.allocator) }
+		if state.failure_detail == "" {
+			owned_detail, detail_error := strings.clone(value.Message, state.allocator)
+			if detail_error == nil { state.failure_detail = owned_detail }
+		}
 		provider_deliver(state, event)
 	case Provider_Completed_Event:
 		if state.failed {
@@ -867,14 +968,20 @@ provider_http_chunk :: proc(user_data: rawptr, chunk: []u8) {
 		provider_error_body_append(state, chunk)
 		return
 	}
-	sse.parser_feed(&state.parser, chunk)
+	if feed_err := sse.parser_feed(&state.parser, chunk); feed_err != nil {
+		provider_emit_error(state, .Allocation, "the event stream could not be stored")
+	}
 }
 
 // provider_error_body_append keeps a refused response's body for the classification that
 // follows. All of it is kept, because only the complete body is parsed, so a rejection
 // whose evidence arrives late in a large document is still read. A body that could not be
 // retained is treated as a truncated one, which leaves the status and the transport facts
-// as the evidence. The buffer grows with the operation's allocator, and release frees it.
+// as the evidence and stops the buffer from being grown again for a body that cannot be
+// kept. The buffer grows with the operation's allocator, and release frees it.
 provider_error_body_append :: proc(state: ^Provider_Request_Stream_State, chunk: []u8) {
-	append(&state.error_body, ..chunk)
+	if state.error_body_truncated { return }
+	if _, append_error := append(&state.error_body, ..chunk); append_error != nil {
+		state.error_body_truncated = true
+	}
 }

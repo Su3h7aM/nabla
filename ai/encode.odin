@@ -123,7 +123,9 @@ encode_slot_for :: proc(cursor: ^Encode_Cursor, text: string, kind: Encode_Text_
 			return nil, false
 		}
 		if _, init_error := strings.builder_init(&slots[len(slots) - 1].bytes, allocator); init_error != nil {
-			resize(slots, len(slots) - 1)
+			// Dropping the slot this call just appended cannot fail and changes nothing
+			// once the encode has already failed.
+			_ = resize(slots, len(slots) - 1)
 			encode_fail(cursor, .Allocation)
 			return nil, false
 		}

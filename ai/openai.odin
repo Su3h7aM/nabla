@@ -2,6 +2,7 @@ package ai
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 
 // Shared OpenAI helpers used by the Chat Completions and Responses adapters.
@@ -47,24 +48,40 @@ openai_value_integer :: proc(object: json.Object, key: string) -> (i64, bool, bo
 	return i64(integer), true, true
 }
 
-openai_error_event :: proc(kind: Provider_Error_Kind, message: string, code := "", allocator := context.allocator) -> Provider_Event {
-	return Provider_Error_Event{Kind = kind, Message = strings.clone(message, allocator), Provider_Code = strings.clone(code, allocator)}
+// openai_error_event builds the error event both OpenAI APIs report a failure with. The
+// event owns its strings, and a failure to retain them yields no event and the allocator
+// error, so a caller never delivers a failure whose wording was silently dropped.
+openai_error_event :: proc(kind: Provider_Error_Kind, message: string, code := "", allocator := context.allocator) -> (Provider_Event, mem.Allocator_Error) {
+	owned_message, message_error := strings.clone(message, allocator)
+	if message_error != nil { return nil, message_error }
+	owned_code, code_error := strings.clone(code, allocator)
+	if code_error != nil {
+		if owned_message != "" { delete(owned_message, allocator) }
+		return nil, code_error
+	}
+	return Provider_Error_Event{Kind = kind, Message = owned_message, Provider_Code = owned_code}, nil
 }
 
 // openai_error_rejection decodes the error document this API returns for a refused
 // request, through the same reader an in-stream error event uses, so a refusal read
 // from a response body and one read from a stream cannot drift apart. The returned
-// strings are owned by allocator.
-openai_error_rejection :: proc(body: []u8, allocator := context.allocator) -> Provider_Rejection {
+// strings are owned by allocator, and a failure to retain them is reported rather than
+// read as a document this API did not send.
+openai_error_rejection :: proc(body: []u8, allocator := context.allocator) -> (Provider_Rejection, mem.Allocator_Error) {
 	value, object, parsed := provider_error_document(body, allocator)
-	if !parsed { return {} }
+	if !parsed { return {}, nil }
 	defer json.destroy_value(value, allocator)
-	event, is_error := openai_parse_api_error(object, allocator)
-	if !is_error { return {} }
-	defer Provider_Event_Destroy(&event, allocator)
+	event, is_error, event_error := openai_parse_api_error(object, allocator)
+	if !is_error { return {}, nil }
+	if event_error != nil { return {}, event_error }
 	error_event, is_error_event := event.(Provider_Error_Event)
-	if !is_error_event { return {} }
-	return Provider_Rejection{code = strings.clone(error_event.Provider_Code, allocator), message = strings.clone(error_event.Message, allocator)}
+	if !is_error_event {
+		owned := event
+		Provider_Event_Destroy(&owned, allocator)
+		return {}, nil
+	}
+	// The rejection takes the strings the parsed event built; nothing is cloned again.
+	return Provider_Rejection{code = error_event.Provider_Code, message = error_event.Message}, nil
 }
 
 // openai_failure_class names the meaning this API gives to one of its own error
@@ -84,13 +101,21 @@ openai_failure_class :: proc(code: string) -> (Provider_Failure_Class, bool) {
 	return .None, false
 }
 
-openai_parse_api_error :: proc(object: json.Object, allocator := context.allocator) -> (Provider_Event, bool) {
+// openai_parse_api_error reads the error envelope both OpenAI APIs return. is_error says the
+// object carried one, and a non-nil err says the event could not be retained.
+openai_parse_api_error :: proc(object: json.Object, allocator := context.allocator) -> (event: Provider_Event, is_error: bool, err: mem.Allocator_Error) {
 	raw, present := object["error"]
-	if !present { return nil, false }
+	if !present { return nil, false, nil }
 	error_object, ok := raw.(json.Object)
-	if !ok { return openai_error_event(.API_Error, "invalid provider error object", allocator = allocator), true }
+	if !ok {
+		invalid, invalid_error := openai_error_event(.API_Error, "invalid provider error object", allocator = allocator)
+		return invalid, true, invalid_error
+	}
 	message, message_present, message_ok := openai_value_string(error_object, "message")
-	if !message_ok { return openai_error_event(.API_Error, "invalid provider error message", allocator = allocator), true }
+	if !message_ok {
+		invalid, invalid_error := openai_error_event(.API_Error, "invalid provider error message", allocator = allocator)
+		return invalid, true, invalid_error
+	}
 	if !message_present || message == "" { message = "provider returned an API error" }
 	code, code_present, code_ok := openai_value_string(error_object, "code")
 	if !code_ok {
@@ -99,10 +124,12 @@ openai_parse_api_error :: proc(object: json.Object, allocator := context.allocat
 		} else if !code_present {
 			code = ""
 		} else {
-			return openai_error_event(.API_Error, "invalid provider error code", allocator = allocator), true
+			invalid, invalid_error := openai_error_event(.API_Error, "invalid provider error code", allocator = allocator)
+			return invalid, true, invalid_error
 		}
 	}
-	return openai_error_event(.API_Error, message, code, allocator), true
+	parsed, parsed_error := openai_error_event(.API_Error, message, code, allocator)
+	return parsed, true, parsed_error
 }
 
 openai_finish_reason :: proc(reason: string) -> Provider_Finish_Reason {
@@ -274,7 +301,8 @@ openai_json_object_check :: proc(raw: []u8, position, depth: int) -> int {
 	i += 1
 	i = openai_json_skip(raw, i)
 	if i < len(raw) && raw[i] == '}' { return i + 1 }
-	seen := make([dynamic][2]int, 0, context.temp_allocator)
+	seen, seen_error := make([dynamic][2]int, 0, context.temp_allocator)
+	if seen_error != nil { return -1 }
 	for {
 		i = openai_json_skip(raw, i)
 		key_start, key_end := -1, -1

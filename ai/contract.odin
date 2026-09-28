@@ -258,6 +258,10 @@ Provider_Error_Kind :: enum {
 	Timed_Out,
 	// TLS means the peer did not authenticate; it is never a usable response.
 	TLS,
+	// Allocation means the local stream state could not retain what it decoded. It
+	// is a local failure: the provider sent a usable payload, and the client could
+	// not keep it.
+	Allocation,
 }
 
 Provider_Text_Event :: struct {
@@ -406,9 +410,23 @@ provider_stream_fail :: proc(
 	code := "",
 ) -> Provider_Stream_Error {
 	provider_stream_batch_clear(state)
-	provider_stream_push(state, openai_error_event(kind, message, code, state.Allocator))
+	event, event_error := openai_error_event(kind, message, code, state.Allocator)
+	if event_error != nil {
+		// The wording could not be retained. The kind still names the failure, so the
+		// caller learns why the stream stopped rather than nothing at all.
+		event = Provider_Error_Event {
+			Kind = kind,
+		}
+	}
+	provider_stream_push(state, event)
 	state.Phase = .Failed
 	return stream_err
+}
+
+// provider_stream_fail_allocation reports a stream that could not retain what it decoded.
+// It is a local failure: the payload was usable, and the client could not keep it.
+provider_stream_fail_allocation :: proc(state: ^Provider_Stream_State, message: string) -> Provider_Stream_Error {
+	return provider_stream_fail(state, .Allocation, message, .Allocation)
 }
 
 // Transfers one owned event to the caller and removes it from the batch.
@@ -439,54 +457,100 @@ provider_tool_fragments_present :: proc(state: ^Provider_Stream_State) -> bool {
 	return false
 }
 
-// provider_tool_fragment_append reserves the next tool-call slot. The slot is owned by
-// the stream and released with it, and false means it could not be reserved.
-provider_tool_fragment_append :: proc(state: ^Provider_Stream_State) -> (^Provider_Tool_Fragment, bool) {
-	fragment := Provider_Tool_Fragment {
-		Arguments = make([dynamic]u8, 0, state.Allocator),
+// provider_tool_fragment_append reserves the next tool-call slot. The slot is owned by the
+// stream and released with it, and a failure to reserve one fails the stream, so a call is
+// never reserved without storage for its arguments.
+provider_tool_fragment_append :: proc(state: ^Provider_Stream_State) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
+	arguments, arguments_error := make([dynamic]u8, 0, state.Allocator)
+	if arguments_error != nil {
+		return nil, provider_stream_fail_allocation(state, "the tool call could not be stored")
 	}
-	if _, append_error := append(&state.Tool_Fragments, fragment); append_error != nil { return nil, false }
-	return &state.Tool_Fragments[len(state.Tool_Fragments) - 1], true
+	fragment := Provider_Tool_Fragment {
+		Arguments = arguments,
+	}
+	if _, append_error := append(&state.Tool_Fragments, fragment); append_error != nil {
+		delete(arguments)
+		return nil, provider_stream_fail_allocation(state, "the tool call could not be stored")
+	}
+	return &state.Tool_Fragments[len(state.Tool_Fragments) - 1], .None
 }
 
-provider_tool_fragment_by_wire_index :: proc(state: ^Provider_Stream_State, index: i64) -> (^Provider_Tool_Fragment, bool) {
-	if index < 0 { return nil, false }
+provider_tool_fragment_by_wire_index :: proc(state: ^Provider_Stream_State, index: i64) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
+	if index < 0 { return nil, provider_stream_fail(state, .Invalid_Data, "tool call index is invalid", .Tool_Limit) }
 	for &fragment in state.Tool_Fragments {
-		if fragment.Wire_Index_Present && fragment.Wire_Index == index { return &fragment, true }
+		if fragment.Wire_Index_Present && fragment.Wire_Index == index { return &fragment, .None }
 	}
-	fragment, appended := provider_tool_fragment_append(state)
-	if !appended { return nil, false }
+	fragment, fragment_error := provider_tool_fragment_append(state)
+	if fragment_error != .None { return nil, fragment_error }
 	fragment.Wire_Index = index
 	fragment.Wire_Index_Present = true
-	return fragment, true
+	return fragment, .None
 }
 
-provider_tool_finalize :: proc(state: ^Provider_Stream_State, allocator := context.allocator) -> ([]Provider_Tool_Call, bool) {
+// provider_call_clone_strings fills one call from the strings it is made of. It reports
+// false, releasing whatever it copied, when the call could not be retained.
+provider_call_clone_strings :: proc(call: ^Provider_Tool_Call, id, item_id, name, arguments: string, allocator: mem.Allocator) -> bool {
+	transferred := false
+	defer if !transferred { provider_tool_call_destroy(call, allocator) }
+	owned_id, id_error := strings.clone(id, allocator)
+	if id_error != nil { return false }
+	call.ID = owned_id
+	owned_item_id, item_id_error := strings.clone(item_id, allocator)
+	if item_id_error != nil { return false }
+	call.Item_ID = owned_item_id
+	owned_name, name_error := strings.clone(name, allocator)
+	if name_error != nil { return false }
+	call.Name = owned_name
+	owned_arguments, arguments_error := strings.clone(arguments, allocator)
+	if arguments_error != nil { return false }
+	call.Arguments = owned_arguments
+	transferred = true
+	return true
+}
+
+// provider_call_clone copies one fragment's strings into the call it becomes. It reports
+// false, releasing whatever it already copied, when the call could not be retained.
+provider_call_clone :: proc(fragment: ^Provider_Tool_Fragment, allocator: mem.Allocator) -> (call: Provider_Tool_Call, ok: bool) {
+	ok = provider_call_clone_strings(&call, fragment.ID, fragment.Item_ID, fragment.Name, string(fragment.Arguments[:]), allocator)
+	return call, ok
+}
+
+// provider_tool_finalize assembles the calls the stream decoded. It fails the stream when
+// the decoded calls are not a usable set or could not be retained, so a caller never holds
+// half a call list.
+provider_tool_finalize :: proc(state: ^Provider_Stream_State, allocator := context.allocator) -> ([]Provider_Tool_Call, Provider_Stream_Error) {
 	count := 0
 	for &fragment in state.Tool_Fragments {
 		if !fragment.Present { continue }
 		count += 1
-		if fragment.ID == "" || fragment.Name == "" { return nil, false }
+		if fragment.ID == "" || fragment.Name == "" {
+			return nil, provider_stream_fail(state, .Invalid_Data, "tool calls are invalid")
+		}
 		for &other in state.Tool_Fragments {
 			if &other == &fragment || !other.Present { continue }
-			if other.ID != "" && other.ID == fragment.ID { return nil, false }
+			if other.ID != "" && other.ID == fragment.ID {
+				return nil, provider_stream_fail(state, .Invalid_Data, "tool calls are invalid")
+			}
 		}
 	}
-	if count == 0 { return nil, false }
+	if count == 0 { return nil, provider_stream_fail(state, .Invalid_Data, "tool calls are invalid") }
 	calls, make_error := make([]Provider_Tool_Call, count, allocator)
-	if make_error != nil { return nil, false }
-	i := 0
+	if make_error != nil {
+		return nil, provider_stream_fail_allocation(state, "the tool calls could not be retained")
+	}
+	filled := 0
 	for &fragment in state.Tool_Fragments {
 		if !fragment.Present { continue }
-		calls[i] = Provider_Tool_Call {
-			ID        = strings.clone(fragment.ID, allocator),
-			Item_ID   = strings.clone(fragment.Item_ID, allocator),
-			Name      = strings.clone(fragment.Name, allocator),
-			Arguments = strings.clone(string(fragment.Arguments[:]), allocator),
+		call, call_ok := provider_call_clone(&fragment, allocator)
+		if !call_ok {
+			for i in 0 ..< filled { provider_tool_call_destroy(&calls[i], allocator) }
+			delete(calls, allocator)
+			return nil, provider_stream_fail_allocation(state, "the tool calls could not be retained")
 		}
-		i += 1
+		calls[filled] = call
+		filled += 1
 	}
-	return calls, true
+	return calls, .None
 }
 Provider_Stream_Error :: enum {
 	None,
@@ -497,6 +561,8 @@ Provider_Stream_Error :: enum {
 	Stream_Truncated,
 	Tool_Limit,
 	Batch_Not_Drained,
+	// Allocation means the stream could not retain what it decoded.
+	Allocation,
 }
 
 Provider_Encode_Request :: proc(request: Provider_Request, allocator := context.allocator) -> (string, Provider_Request_Error) {

@@ -220,6 +220,10 @@ provider_stream_class :: proc(event: Maybe(Provider_Error_Kind)) -> Provider_Fai
 		// The provider refused inside a stream it had already opened, and what it
 		// wrote named nothing this package knows.
 		return .Unknown
+	case .Allocation:
+		// A local allocation failure says nothing about the provider, and it is
+		// never a reason to classify the refusal.
+		return .None
 	case .Cancelled, .Timed_Out, .TLS:
 		return .None
 	}
@@ -244,9 +248,10 @@ provider_rejection_class :: proc(api: API_Kind, rejection: Provider_Rejection) -
 // provider_rejection_parse decodes a provider's own error document from the body
 // of a response that was not a stream. A body that is empty, truncated, malformed,
 // or simply not that document yields no rejection: the status and the transport
-// facts stay the evidence, and nothing is read out of prose to fill the gap.
-provider_rejection_parse :: proc(api: API_Kind, body: []u8, allocator: mem.Allocator) -> Provider_Rejection {
-	if len(body) == 0 { return {} }
+// facts stay the evidence, and nothing is read out of prose to fill the gap. A
+// non-nil error means the provider's account could not be retained.
+provider_rejection_parse :: proc(api: API_Kind, body: []u8, allocator: mem.Allocator) -> (Provider_Rejection, mem.Allocator_Error) {
+	if len(body) == 0 { return {}, nil }
 	switch api {
 	case .OpenAI_Chat_Completions, .OpenAI_Responses:
 		return openai_error_rejection(body, allocator)
@@ -254,7 +259,7 @@ provider_rejection_parse :: proc(api: API_Kind, body: []u8, allocator: mem.Alloc
 		return anthropic_error_rejection(body, allocator)
 	case .Invalid:
 	}
-	return {}
+	return {}, nil
 }
 
 // provider_error_document parses the root of an error document. The caller owns the

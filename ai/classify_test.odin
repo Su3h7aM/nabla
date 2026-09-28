@@ -1,6 +1,8 @@
 #+test
 package ai
 
+import "base:runtime"
+
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -149,7 +151,9 @@ test_retry_after :: proc(t: ^testing.T) {
 
 	// An HTTP-date, in each of the three formats RFC 9110 5.6.1 defines.
 	future := time.time_add(time.now(), 60 * time.Second)
-	expect_delay_range(t, http.date_string(future, context.temp_allocator), 50 * time.Second, 60 * time.Second)
+	date, date_err := http.date_string(future, context.temp_allocator)
+	if !testing.expect_value(t, date_err, runtime.Allocator_Error.None) { return }
+	expect_delay_range(t, date, 50 * time.Second, 60 * time.Second)
 	expect_delay(t, "Sunday, 06-Nov-94 08:49:37 GMT", 0)
 	expect_delay(t, "Sun Nov  6 08:49:37 1994", 0)
 

@@ -392,15 +392,15 @@ anthropic_optional_integer :: proc(object: json.Object, key: string) -> (value: 
 // to, or takes the next one. The block index counts every block, not just the
 // tool calls, so it cannot be used as the slot number itself.
 @(private)
-anthropic_block_fragment :: proc(state: ^Provider_Stream_State, index: i64) -> (^Provider_Tool_Fragment, bool) {
+anthropic_block_fragment :: proc(state: ^Provider_Stream_State, index: i64) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
 	for &fragment in state.Tool_Fragments {
-		if fragment.Wire_Index_Present && fragment.Wire_Index == index { return &fragment, true }
+		if fragment.Wire_Index_Present && fragment.Wire_Index == index { return &fragment, .None }
 	}
-	fragment, appended := provider_tool_fragment_append(state)
-	if !appended { return nil, false }
+	fragment, fragment_error := provider_tool_fragment_append(state)
+	if fragment_error != .None { return nil, fragment_error }
 	fragment.Wire_Index = index
 	fragment.Wire_Index_Present = true
-	return fragment, true
+	return fragment, .None
 }
 
 // anthropic_complete delivers the terminal event once the stream has stated why
@@ -411,48 +411,65 @@ anthropic_complete :: proc(state: ^Provider_Stream_State, reason_text: string) -
 	reason := anthropic_stop_reason(reason_text)
 	calls: []Provider_Tool_Call
 	if reason == .Tool_Call {
-		finalized, finalized_ok := provider_tool_finalize(state, state.Allocator)
-		if !finalized_ok { return provider_stream_fail(state, .Invalid_Data, "tool calls are invalid") }
+		finalized, finalized_error := provider_tool_finalize(state, state.Allocator)
+		if finalized_error != .None { return finalized_error }
 		calls = finalized
 	} else if provider_tool_fragments_present(state) {
 		// A tool block that never became a usable call is a defect, not a stop.
 		return provider_stream_fail(state, .Invalid_Data, "response ended with unfinished tool calls")
 	}
+	owned_reason, reason_error := strings.clone(reason_text, state.Allocator)
+	if reason_error != nil {
+		Provider_Tool_Calls_Destroy(calls, state.Allocator)
+		return provider_stream_fail_allocation(state, "the completion reason could not be retained")
+	}
 	state^.Phase = .Completed
-	provider_stream_push(state, Provider_Completed_Event{Reason = reason, Reason_Text = strings.clone(reason_text, state.Allocator), Tool_Calls = calls})
+	provider_stream_push(state, Provider_Completed_Event{Reason = reason, Reason_Text = owned_reason, Tool_Calls = calls})
 	return .None
 }
 
 // anthropic_error_event reads the error envelope this API uses, which names the
 // failure kind in `type` rather than `code`.
 @(private)
-anthropic_error_event :: proc(object: json.Object, allocator := context.allocator) -> (Provider_Event, bool) {
+anthropic_error_event :: proc(object: json.Object, allocator := context.allocator) -> (event: Provider_Event, is_error: bool, err: mem.Allocator_Error) {
 	raw, present := object["error"]
-	if !present { return nil, false }
+	if !present { return nil, false, nil }
 	error_object, ok := raw.(json.Object)
-	if !ok { return openai_error_event(.API_Error, "invalid provider error object", allocator = allocator), true }
+	if !ok {
+		invalid, invalid_error := openai_error_event(.API_Error, "invalid provider error object", allocator = allocator)
+		return invalid, true, invalid_error
+	}
 	message, _, message_ok := openai_value_string(error_object, "message")
-	if !message_ok { return openai_error_event(.API_Error, "invalid provider error message", allocator = allocator), true }
+	if !message_ok {
+		invalid, invalid_error := openai_error_event(.API_Error, "invalid provider error message", allocator = allocator)
+		return invalid, true, invalid_error
+	}
 	if message == "" { message = "provider returned an API error" }
 	code, _, code_ok := openai_value_string(error_object, "type")
 	if !code_ok { code = "" }
-	return openai_error_event(.API_Error, message, code, allocator), true
+	parsed, parsed_error := openai_error_event(.API_Error, message, code, allocator)
+	return parsed, true, parsed_error
 }
 
 // anthropic_error_rejection decodes the error document this API returns for a
 // refused request, through the same reader an in-stream error event uses, so a
 // refusal read from a response body and one read from a stream cannot drift apart.
 // The returned strings are owned by allocator.
-anthropic_error_rejection :: proc(body: []u8, allocator := context.allocator) -> Provider_Rejection {
+anthropic_error_rejection :: proc(body: []u8, allocator := context.allocator) -> (Provider_Rejection, mem.Allocator_Error) {
 	value, object, parsed := provider_error_document(body, allocator)
-	if !parsed { return {} }
+	if !parsed { return {}, nil }
 	defer json.destroy_value(value, allocator)
-	event, is_error := anthropic_error_event(object, allocator)
-	if !is_error { return {} }
-	defer Provider_Event_Destroy(&event, allocator)
+	event, is_error, event_error := anthropic_error_event(object, allocator)
+	if !is_error { return {}, nil }
+	if event_error != nil { return {}, event_error }
 	error_event, is_error_event := event.(Provider_Error_Event)
-	if !is_error_event { return {} }
-	return Provider_Rejection{code = strings.clone(error_event.Provider_Code, allocator), message = strings.clone(error_event.Message, allocator)}
+	if !is_error_event {
+		owned := event
+		Provider_Event_Destroy(&owned, allocator)
+		return {}, nil
+	}
+	// The rejection takes the strings the parsed event built; nothing is cloned again.
+	return Provider_Rejection{code = error_event.Provider_Code, message = error_event.Message}, nil
 }
 
 // ANTHROPIC_CONTEXT_OVERFLOW_MESSAGE is this API's own wording for a rejected
@@ -515,7 +532,10 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 	defer json.destroy_value(value, state.Allocator)
 	object, object_ok := value.(json.Object)
 	if !object_ok { return provider_stream_fail(state, .Invalid_Data, "stream event is not an object") }
-	if api_error, is_error := anthropic_error_event(object, state.Allocator); is_error {
+	if api_error, is_error, api_error_error := anthropic_error_event(object, state.Allocator); is_error {
+		if api_error_error != nil {
+			return provider_stream_fail_allocation(state, "the provider error could not be retained")
+		}
 		provider_stream_batch_clear(state)
 		provider_stream_push(state, api_error)
 		state.Phase = .Failed
@@ -551,17 +571,23 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 			text, text_present, text_ok := openai_value_string(block, "text")
 			if !text_ok { return provider_stream_fail(state, .Invalid_Data, "text block is invalid") }
 			if text_present && text != "" {
-				provider_stream_push(state, Provider_Text_Event{Text = strings.clone(text, state.Allocator)})
+				owned, clone_error := strings.clone(text, state.Allocator)
+				if clone_error != nil { return provider_stream_fail_allocation(state, "the response text could not be retained") }
+				provider_stream_push(state, Provider_Text_Event{Text = owned})
 			}
 		case ANTHROPIC_BLOCK_TOOL_USE:
-			fragment, slot_ok := anthropic_block_fragment(state, index)
-			if !slot_ok { return provider_stream_fail(state, .Invalid_Data, "tool block index is invalid", .Tool_Limit) }
+			fragment, slot_error := anthropic_block_fragment(state, index)
+			if slot_error != .None { return slot_error }
 			id, id_present, id_ok := openai_value_string(block, "id")
 			if !id_ok || !id_present || id == "" { return provider_stream_fail(state, .Invalid_Data, "tool_use block has no id") }
 			name, name_present, name_ok := openai_value_string(block, "name")
 			if !name_ok || !name_present || name == "" { return provider_stream_fail(state, .Invalid_Data, "tool_use block has no name") }
-			fragment.ID = strings.clone(id, state.Allocator)
-			fragment.Name = strings.clone(name, state.Allocator)
+			owned_id, id_error := strings.clone(id, state.Allocator)
+			if id_error != nil { return provider_stream_fail_allocation(state, "the tool call id could not be retained") }
+			fragment.ID = owned_id
+			owned_name, name_error := strings.clone(name, state.Allocator)
+			if name_error != nil { return provider_stream_fail_allocation(state, "the tool call name could not be retained") }
+			fragment.Name = owned_name
 			// The block states the input object up front and the stream fills it
 			// afterwards. Keeping the stated value covers a call with no arguments,
 			// which streams no delta at all.
@@ -571,10 +597,12 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 						return provider_stream_fail(state, .Invalid_Data, "tool_use input is not an object")
 					}
 					text, text_err := json.unparse(raw_input, allocator = state.Allocator)
-					if text_err != nil { return provider_stream_fail(state, .Invalid_Data, "tool_use input is invalid") }
+					if text_err != nil {
+						return provider_stream_fail_allocation(state, "the tool call arguments could not be retained")
+					}
 					defer delete(text, state.Allocator)
 					if _, append_error := append(&fragment.Arguments, text); append_error != nil {
-						return provider_stream_fail(state, .Invalid_Data, "tool call arguments could not be retained")
+						return provider_stream_fail_allocation(state, "the tool call arguments could not be retained")
 					}
 				}
 			}
@@ -599,15 +627,17 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 			text, text_present, text_ok := openai_value_string(delta, "text")
 			if !text_ok { return provider_stream_fail(state, .Invalid_Data, "text delta is invalid") }
 			if text_present && text != "" {
-				provider_stream_push(state, Provider_Text_Event{Text = strings.clone(text, state.Allocator)})
+				owned, clone_error := strings.clone(text, state.Allocator)
+				if clone_error != nil { return provider_stream_fail_allocation(state, "the response text could not be retained") }
+				provider_stream_push(state, Provider_Text_Event{Text = owned})
 			}
 		case "input_json_delta":
 			index, index_present, index_ok := openai_value_integer(object, "index")
 			if !index_ok || !index_present || index < 0 {
 				return provider_stream_fail(state, .Invalid_Data, "argument delta has no index")
 			}
-			fragment, slot_ok := anthropic_block_fragment(state, index)
-			if !slot_ok { return provider_stream_fail(state, .Invalid_Data, "argument delta index is invalid", .Tool_Limit) }
+			fragment, slot_error := anthropic_block_fragment(state, index)
+			if slot_error != .None { return slot_error }
 			if !fragment.Present { return provider_stream_fail(state, .Invalid_Data, "argument delta has no block") }
 			partial, partial_present, partial_ok := openai_value_string(delta, "partial_json")
 			if !partial_ok { return provider_stream_fail(state, .Invalid_Data, "argument delta is invalid") }
@@ -617,7 +647,7 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 					fragment.Arguments_Started = true
 				}
 				if _, append_error := append(&fragment.Arguments, partial); append_error != nil {
-					return provider_stream_fail(state, .Invalid_Data, "tool call arguments could not be retained")
+					return provider_stream_fail_allocation(state, "the tool call arguments could not be retained")
 				}
 			}
 		case "thinking_delta", "signature_delta", "citations_delta":
