@@ -138,32 +138,31 @@ test_sgr_mouse_reports_decode :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_oversized_paste_is_discarded_and_reported :: proc(t: ^testing.T) {
+test_a_large_paste_arrives_whole :: proc(t: ^testing.T) {
 	p: Parser
 	parser_init(&p)
 	defer parser_destroy(&p)
 	events: [dynamic]Event
 	defer events_destroy(&events)
 
-	// One byte past the limit: the content is dropped, but the closing marker
-	// is still recognised so the parser returns to Ground and the next key is
-	// decoded normally.
-	chunk := make([]u8, PASTE_LIMIT + 1)
-	defer delete(chunk)
-	for i in 0 ..< len(chunk) {
-		chunk[i] = 'x'
-	}
+	// A paste larger than any scratch the parser could have pre-sized arrives
+	// as one event with every byte of its content, and the closing marker
+	// leaves the parser in Ground so the next key is decoded normally.
+	body := make([]u8, 1 << 20)
+	defer delete(body)
+	for i in 0 ..< len(body) { body[i] = 'x' }
+
 	open_marker := "\e[200~"
 	close_and_key := "\e[201~q"
 	testing.expect(t, feed(&p, transmute([]byte)open_marker, &events) == nil, "open must not error")
-	testing.expect(t, feed(&p, chunk, &events) == nil, "content must not error")
-	// The scratch is bounded, not the paste: once discarded it keeps only the
-	// bytes that can still start the marker.
-	testing.expect(t, len(p.paste) <= len(PASTE_END), "scratch must stay bounded")
+	testing.expect(t, feed(&p, body, &events) == nil, "content must not error")
 	testing.expect(t, feed(&p, transmute([]byte)close_and_key, &events) == nil, "close must not error")
 
 	testing.expect_value(t, len(events), 2)
-	testing.expect_value(t, events[0], Event(Unknown_Input{}))
+	paste, is_paste := events[0].(Paste)
+	testing.expect(t, is_paste, "a paste must arrive as a Paste event")
+	testing.expect_value(t, len(paste.text), len(body))
+	testing.expect(t, paste.text == string(body), "every pasted byte must arrive")
 	testing.expect_value(t, events[1], Event(Key_Event{code = .Character, character = 'q'}))
 	events_clear(&events)
 	testing.expect_value(t, len(events), 0)

@@ -22,9 +22,8 @@
 // them, so a multi-line paste is never decoded into keystrokes. The terminal
 // mode itself is enabled and restored by the session, not here. Paste is the
 // one event that owns memory; release the event list with events_clear or
-// events_destroy. A paste past PASTE_LIMIT is discarded and reported as
-// Unknown_Input, and one whose closing marker never arrives is dropped with
-// the parser, so an unterminated paste cannot grow the parser without bound.
+// events_destroy. A paste arrives whole and is never shortened, and one whose
+// closing marker never arrives is dropped with the parser.
 //
 // Errors: only resource failures are errors (poll, read, allocation).
 // Partial sequences, malformed bytes, and EOF are events, never errors.

@@ -76,9 +76,8 @@ Mouse_Event :: struct {
 // events_clear or events_destroy (or deletes the text individually). Every
 // other event is a plain value.
 //
-// A paste past PASTE_LIMIT is discarded and reported as Unknown_Input rather
-// than arriving truncated: the caller can tell an oversized paste from a
-// keypress, and no event ever carries a silently shortened body.
+// A paste arrives whole, however large it is: len(text) is the pasted length,
+// and no event ever carries a shortened body.
 Paste :: struct {
 	text: string,
 }
@@ -88,9 +87,7 @@ Paste :: struct {
 End_Of_Input :: struct {}
 
 // Unknown_Input is emitted for malformed or unsupported byte sequences; the
-// parser resynchronizes immediately after. An oversized paste (past
-// PASTE_LIMIT) is reported this way too, since its content is discarded rather
-// than delivered. Malformed input is never an error.
+// parser resynchronizes immediately after. Malformed input is never an error.
 Unknown_Input :: struct {}
 
 Event :: union #no_nil {
