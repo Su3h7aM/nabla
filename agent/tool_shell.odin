@@ -2,6 +2,7 @@ package agent
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:time"
@@ -158,35 +159,40 @@ tool_shell_not_started :: proc(ctx: ^Tool_Context, cause: os.Error, data: Shell_
 	return tool_shell_finish(ctx, .Tool_Failed, fmt.tprintf("the command did not start: %s", os.error_string(cause)), data)
 }
 
-// tool_shell_finish sanitizes the captured streams to valid UTF-8 and builds the result.
+// tool_shell_finish sanitizes the captured streams to valid UTF-8 and builds the result. A
+// stream that could not be prepared is reported rather than shown empty.
 tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, message: string, captured: Shell_Output, reason := "") -> Tool_Result {
 	data := captured
-	stdout_sanitized := tool_sanitize_stream(data.stdout, ctx.allocator)
+	stdout_sanitized, stdout_error := tool_sanitize_stream(data.stdout, ctx.allocator)
 	defer delete(stdout_sanitized, ctx.allocator)
-	stderr_sanitized := tool_sanitize_stream(data.stderr, ctx.allocator)
+	stderr_sanitized, stderr_error := tool_sanitize_stream(data.stderr, ctx.allocator)
 	defer delete(stderr_sanitized, ctx.allocator)
 	data.stdout = stdout_sanitized
 	data.stderr = stderr_sanitized
+	if stdout_error != nil || stderr_error != nil {
+		// What the command wrote is lost, so the call says so instead of reading as a command
+		// that printed nothing.
+		return tool_result_of(ctx, .Tool_Failed, "the command's output could not be prepared: out of memory", data, "out of memory")
+	}
 	return tool_result_of(ctx, outcome, message, data, reason)
 }
 
-// tool_sanitize_stream replaces bytes that would make the result invalid text. A tool
-// result is read by a model, so invalid UTF-8 and control bytes become the replacement
-// character instead of reaching the provider.
-tool_sanitize_stream :: proc(raw: string, allocator := context.allocator) -> string {
-	valid, _ := strings.to_valid_utf8(raw, "\ufffd", allocator)
+// tool_sanitize_stream returns raw with every byte that would make a result invalid text
+// replaced by the replacement character: a result is read by a model, so invalid UTF-8 and
+// control bytes never reach the provider. The text is owned by allocator.
+tool_sanitize_stream :: proc(raw: string, allocator := context.allocator) -> (text: string, err: mem.Allocator_Error) {
+	valid, valid_error := strings.to_valid_utf8(raw, "\ufffd", allocator)
+	if valid_error != nil { return "", valid_error }
 	defer delete(valid, allocator)
-	builder := strings.builder_make(allocator)
+	builder := strings.builder_make(allocator) or_return
+	defer if err != nil { strings.builder_destroy(&builder) }
 	for r in valid {
-		if r == utf8.RUNE_ERROR {
-			strings.write_rune(&builder, utf8.RUNE_ERROR)
-		} else if r < 0x20 && r != '\n' && r != '\t' || r == 0x7F {
-			strings.write_rune(&builder, utf8.RUNE_ERROR)
-		} else {
-			strings.write_rune(&builder, r)
-		}
+		breaks := r == utf8.RUNE_ERROR || r < 0x20 && r != '\n' && r != '\t' || r == 0x7F
+		character := utf8.RUNE_ERROR if breaks else r
+		written, write_error := strings.write_rune(&builder, character)
+		if write_error != nil || written != utf8.rune_size(character) { return "", .Out_Of_Memory }
 	}
-	return strings.to_string(builder)
+	return strings.to_string(builder), nil
 }
 
 tool_resolve_path :: proc(workspace, path: string, field := "path", allocator := context.allocator) -> (string, Tool_Argument_Error) {

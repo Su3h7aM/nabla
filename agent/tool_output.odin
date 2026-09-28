@@ -264,14 +264,12 @@ tool_result_render :: proc(
 // missing allocation the way the standard library does, so a caller writes `or_return`
 // and the whole rendering is answered once rather than at every line.
 
-// render_text writes text as it is.
 render_text :: proc(builder: ^strings.Builder, value: string) -> (written: int, err: mem.Allocator_Error) #optional_allocator_error {
 	written = strings.write_string(builder, value)
 	if written != len(value) { err = .Out_Of_Memory }
 	return
 }
 
-// render_byte writes one byte.
 render_byte :: proc(builder: ^strings.Builder, value: u8) -> (written: int, err: mem.Allocator_Error) #optional_allocator_error {
 	written = strings.write_byte(builder, value)
 	if written != 1 { err = .Out_Of_Memory }

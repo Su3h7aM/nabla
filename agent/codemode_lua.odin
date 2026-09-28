@@ -687,8 +687,10 @@ codemode_lua_settle_error :: proc(run: ^Lua_Run) -> Lua_Event {
 	traceback, _ := codemode_lua_stack_string(run.state, -1)
 	traceback = strings.trim_prefix(traceback, "stack traceback:\n")
 	delete(run.traceback)
-	run.traceback, _ = strings.replace_all(traceback, "\t", "")
-	if raw_data(run.traceback) == raw_data(traceback) { run.traceback = strings.clone(run.traceback) or_else "" }
+	allocated: bool
+	run.traceback, allocated = strings.replace_all(traceback, "\t", "")
+	// replace_all borrows its input when it replaces nothing, so the run takes its own copy.
+	if !allocated { run.traceback = strings.clone(run.traceback) or_else "" }
 	lua.pop(run.state, 1)
 	return codemode_lua_settle(run, .Failed, .Runtime, text)
 }

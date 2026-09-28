@@ -31,7 +31,6 @@ TOOL_READ_DEFINITION :: Tool_Definition {
 	execute = tool_read_execute,
 }
 
-// tool_read_args reads the read tool's arguments.
 tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Read_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_READ_FIELDS, allocator = ctx.allocator) or_return
 	args.path = tool_field_string(arguments, "path", allocator = ctx.allocator) or_return

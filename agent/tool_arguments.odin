@@ -227,27 +227,39 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 		repairs += {.Empty_Arguments}
 	}
 	escaped, changed, escape_error := tool_arguments_escape_control_chars(document, allocator)
-	if escape_error != nil { arguments.allocation_failed = true; return }
+	if escape_error != nil {
+		arguments.allocation_failed = true
+		return
+	}
 	if changed {
 		rewritten[0], document = escaped, escaped
 		repairs += {.Escaped_Control_Characters}
 	}
 	inner, is_string, unquote_error := tool_arguments_string_document(document, allocator)
-	if unquote_error != nil { arguments.allocation_failed = true; return }
+	if unquote_error != nil {
+		arguments.allocation_failed = true
+		return
+	}
 	if is_string {
 		rewritten[1], document = inner, inner
 		repairs += {.Double_Encoded_Object}
 		// Unquoting turns an escaped newline back into a raw one, which inside the inner
 		// document's own string literals is again a control byte with one reading.
 		escaped, changed, escape_error = tool_arguments_escape_control_chars(document, allocator)
-		if escape_error != nil { arguments.allocation_failed = true; return }
+		if escape_error != nil {
+			arguments.allocation_failed = true
+			return
+		}
 		if changed {
 			rewritten[2], document = escaped, escaped
 			repairs += {.Escaped_Control_Characters}
 		}
 	}
 	blanked, blanked_any, blank_error := tool_arguments_blank_trailing_commas(document, allocator)
-	if blank_error != nil { arguments.allocation_failed = true; return }
+	if blank_error != nil {
+		arguments.allocation_failed = true
+		return
+	}
 	if blanked_any {
 		rewritten[3], document = blanked, blanked
 		repairs += {.Trailing_Comma}
@@ -260,7 +272,10 @@ tool_arguments_prepare :: proc(raw: string, allocator := context.allocator) -> (
 	value, parse_err := json.parse_string(document, .JSON, true, allocator)
 	if parse_err != nil {
 		json.destroy_value(value, allocator)
-		if parse_err == .Out_Of_Memory { arguments.allocation_failed = true; return }
+		if parse_err == .Out_Of_Memory {
+			arguments.allocation_failed = true
+			return
+		}
 		// Admission guarantees the parser accepts the document, so no other failure is
 		// reachable; refusing is the only safe answer.
 		arguments.error = tool_argument_error(.Syntax, allocator = allocator)
@@ -384,7 +399,10 @@ tool_admit_object :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem
 
 		separator, separator_err := json.get_token(tokenizer)
 		if tool_token_bad(separator, separator_err) { return tool_document_error(.Syntax, tokenizer.data, separator) }
-		if separator.kind == .Comma { comma = true; continue }
+		if separator.kind == .Comma {
+			comma = true
+			continue
+		}
 		if separator.kind == .Close_Brace { return nil }
 		return tool_document_error(.Syntax, tokenizer.data, separator)
 	}
@@ -404,7 +422,10 @@ tool_admit_array :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.
 
 		separator, separator_err := json.get_token(tokenizer)
 		if tool_token_bad(separator, separator_err) { return tool_document_error(.Syntax, tokenizer.data, separator) }
-		if separator.kind == .Comma { comma = true; continue }
+		if separator.kind == .Comma {
+			comma = true
+			continue
+		}
 		if separator.kind == .Close_Bracket { return nil }
 		return tool_document_error(.Syntax, tokenizer.data, separator)
 	}
@@ -597,11 +618,11 @@ tool_field_string :: proc(object: json.Object, name: string, path := "", allocat
 tool_field_optional_string :: proc(object: json.Object, name: string, path := "", allocator := context.allocator) -> (string, Tool_Argument_Error) {
 	value, present := object[name]
 	if !present { return "", nil }
-	#partial switch v in value {
+	#partial switch item in value {
 	case json.Null:
 		return "", nil
 	case json.String:
-		return string(v), nil
+		return string(item), nil
 	}
 	return "", tool_argument_error(.Wrong_Type, tool_field_path(path, name), "a string or null", allocator = allocator)
 }
@@ -609,11 +630,11 @@ tool_field_optional_string :: proc(object: json.Object, name: string, path := ""
 tool_field_optional_bool :: proc(object: json.Object, name: string, path := "", allocator := context.allocator) -> (bool, Tool_Argument_Error) {
 	value, present := object[name]
 	if !present { return false, nil }
-	#partial switch v in value {
+	#partial switch item in value {
 	case json.Null:
 		return false, nil
 	case json.Boolean:
-		return bool(v), nil
+		return bool(item), nil
 	}
 	return false, tool_argument_error(.Wrong_Type, tool_field_path(path, name), "a boolean or null", allocator = allocator)
 }
@@ -707,14 +728,14 @@ tool_integer_write_back :: proc(slot: ^json.Value, number: int, repair: Maybe(To
 // the change when the value was not already an integer.
 @(private)
 tool_integer_reading :: proc(value: json.Value) -> (number: int, repair: Maybe(Tool_Repair), readable: bool) {
-	#partial switch v in value {
+	#partial switch item in value {
 	case json.Integer:
-		return int(v), nil, true
+		return int(item), nil, true
 	case json.Float:
-		if math.trunc(v) != v || abs(v) > TOOL_EXACT_FLOAT_INTEGER { return 0, nil, false }
-		return int(v), .Integer_From_Float, true
+		if math.trunc(item) != item || abs(item) > TOOL_EXACT_FLOAT_INTEGER { return 0, nil, false }
+		return int(item), .Integer_From_Float, true
 	case json.String:
-		number, readable = tool_decimal_integer(string(v))
+		number, readable = tool_decimal_integer(string(item))
 		if !readable { return 0, nil, false }
 		return number, .Integer_From_String, true
 	}
@@ -776,7 +797,10 @@ tool_fields_known :: proc(object: json.Object, known: []string, path := "", allo
 	for name in object {
 		declared := false
 		for field in known {
-			if name == field { declared = true; break }
+			if name == field {
+				declared = true
+				break
+			}
 		}
 		if declared { continue }
 		expected := tool_field_list(known, context.temp_allocator)

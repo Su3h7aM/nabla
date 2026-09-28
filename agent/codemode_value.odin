@@ -307,7 +307,11 @@ codemode_walk_array :: proc(walk: ^Codemode_Walk, table: c.int, length, depth: i
 @(private)
 codemode_walk_object :: proc(walk: ^Codemode_Walk, table: c.int, count, depth: int) -> bool {
 	state := walk.state
-	names := make([]string, count)
+	names, names_error := make([]string, count)
+	if names_error != nil {
+		walk.out_of_memory = true
+		return codemode_walk_fail(walk, "table", "could not be written: out of memory")
+	}
 	defer delete(names)
 	position := 0
 	lua.pushnil(state)
