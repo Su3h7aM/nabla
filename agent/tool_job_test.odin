@@ -717,7 +717,11 @@ test_a_stopped_turn_still_answers_every_call :: proc(test: ^testing.T) {
 	ai.interrupt_request(&chat.stop)
 	tool_jobs_latch_stop(&jobs, chat)
 	testing.expect_value(test, jobs.stop, Tool_Jobs_Stop.Cancelled)
-	testing.expect_value(test, tool_job_test_step(&tool_test, &jobs), Tool_Job_Effect.Refuse)
+	// The running call answers its stop on its own thread, and a result it published
+	// first is settled before the refusal, so either order is correct.
+	effect := tool_job_test_step(&tool_test, &jobs)
+	if effect == .Commit { effect = tool_job_test_step(&tool_test, &jobs) }
+	testing.expect_value(test, effect, Tool_Job_Effect.Refuse)
 	testing.expect_value(test, jobs.jobs[1].phase, Tool_Job_Phase.Result_Ready)
 
 	tool_job_test_drain(test, &tool_test, &jobs)
