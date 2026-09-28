@@ -88,10 +88,6 @@ Chat_Send_Result :: struct {
 	delay:               time.Duration,
 }
 
-// CHAT_ERROR_DETAIL_MAX_BYTES bounds the provider detail a rejection keeps, cut on
-// a character boundary.
-CHAT_ERROR_DETAIL_MAX_BYTES :: 2048
-
 // chat_send_rejection is the evidence of a send that failed, from what the
 // operation returned and the decision the harness took on it. Its strings borrow
 // result and temp memory, so it is recorded before either is released.
@@ -112,7 +108,7 @@ chat_send_rejection :: proc(result: Chat_Send_Result) -> journal.Response_Reject
 	rejection.provider_request_id = error.provider_request_id
 	rejection.retry_directive = ai.provider_retry_directive_name(error.retry_directive)
 	rejection.transport_cause = ai.provider_transport_cause_name(error.transport_cause)
-	rejection.detail = ai.provider_bounded_text(error.detail, CHAT_ERROR_DETAIL_MAX_BYTES, context.temp_allocator)
+	rejection.detail = error.detail
 	if delay, present := error.retry_after.?; present { rejection.retry_after_ms = Log_Duration_Milliseconds(delay) }
 	return rejection
 }

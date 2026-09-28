@@ -17,7 +17,6 @@ import "core:encoding/json"
 import "core:mem"
 import "core:strings"
 import "core:time"
-import "core:unicode/utf8"
 
 import "nabla:http"
 import "nabla:http/client"
@@ -94,24 +93,6 @@ provider_rejection_destroy :: proc(rejection: ^Provider_Rejection, allocator: me
 	if rejection.code != "" { delete(rejection.code, allocator) }
 	if rejection.message != "" { delete(rejection.message, allocator) }
 	rejection^ = {}
-}
-
-// provider_bounded_text clones at most limit bytes of a peer's text, ending on a
-// character boundary: half a character is not a string a JSON writer or a log line
-// can carry. Bytes that are not valid UTF-8 at all are copied as they are, because
-// a peer's text is evidence and not something to repair. The caller owns the clone
-// and picks how much of the text it keeps.
-provider_bounded_text :: proc(value: string, limit: int, allocator: mem.Allocator) -> string {
-	if len(value) <= limit { return strings.clone(value, allocator) }
-	bytes := transmute([]u8)value
-	end := 0
-	for end < limit {
-		_, size := utf8.decode_rune_in_bytes(bytes[end:])
-		width := max(size, 1)
-		if end + width > limit { break }
-		end += width
-	}
-	return strings.clone(value[:end], allocator)
 }
 
 // provider_transport_cause names what the transport reported. Cancellation and an
