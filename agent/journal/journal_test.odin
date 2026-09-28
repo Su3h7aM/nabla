@@ -340,10 +340,10 @@ test_open_refuses_a_database_this_build_does_not_read :: proc(test: ^testing.T) 
 	if file_error != nil { testing.fail_now(test, "could not create a database file") }
 	_expect_ok(test, os.close(file))
 
-	foreign_conn: db.Conn
-	_expect_db_ok(test, sqlite.open(&foreign_conn, {path = foreign_path}))
-	_expect_db_ok(test, db.exec(&foreign_conn, "CREATE TABLE foreign_table (x INTEGER)"))
-	_expect_db_ok(test, db.close(&foreign_conn))
+	foreign_connection: db.Conn
+	_expect_db_ok(test, sqlite.open(&foreign_connection, {path = foreign_path}))
+	_expect_db_ok(test, db.exec(&foreign_connection, "CREATE TABLE foreign_table (x INTEGER)"))
+	_expect_db_ok(test, db.close(&foreign_connection))
 
 	_expect_error(test, open(&refused, foreign_directory, _test_run_id(), .Read_Write), .Schema_Unknown)
 	_expect_error(test, open(&refused, foreign_directory, _test_run_id(), .Read_Only), .Schema_Unknown)

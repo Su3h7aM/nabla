@@ -139,6 +139,8 @@ open :: proc(journal: ^Journal, directory: string, run: Run_Id, mode: Open_Mode,
 		read_only = mode == .Read_Only,
 	}
 	journal.pending.allocator = allocator
+	// A failed open tears down what it built; that teardown's own failure
+	// changes nothing, because the open error is what the caller needs.
 	defer if error != nil { _ = close(journal) }
 
 	journal.directory = strings.clone(directory, allocator) or_return
@@ -175,6 +177,8 @@ open :: proc(journal: ^Journal, directory: string, run: Run_Id, mode: Open_Mode,
 // item. Pending items are dropped, not committed. Closing a zero journal does nothing.
 close :: proc(journal: ^Journal) -> Error {
 	release_error := release(journal)
+	// A statement that refuses to close stays on the connection's list, and the
+	// connection close below is what reports it.
 	for &statement in journal.inserts { _ = db.statement_close(&statement) }
 	close_error := db.close(&journal.connection)
 	delete(journal.pending)
@@ -191,6 +195,7 @@ claim :: proc(journal: ^Journal, session: Session_Id) -> (counters: Counters, er
 	assert(journal.open && !journal.read_only, "claim needs a writable journal")
 	assert(journal.claimed == {}, "the journal already holds a claim")
 	take_claim(journal, session) or_return
+	// Dropping the claim is teardown; the load error is what the caller needs.
 	defer if error != nil { _ = release(journal) }
 
 	exists: bool
@@ -248,6 +253,7 @@ create_session :: proc(journal: ^Journal, new_session: New_Session) -> (id: Sess
 	)
 	_ = append_branch(journal, 0)
 	if journal.failure != nil {
+		// Dropping the claim is teardown; the latch is what the caller needs.
 		_ = release(journal)
 		return {}, journal.failure
 	}
@@ -301,6 +307,7 @@ take_claim :: proc(journal: ^Journal, session: Session_Id) -> Error {
 	file := os.open(path, {.Read, .Write, .Create}, PRIVATE_FILE_PERMISSIONS) or_return
 	held_elsewhere, lock_error := claim_lock_take(file)
 	if lock_error != nil || held_elsewhere {
+		// The file is abandoned; the lock outcome is what the caller needs.
 		_ = os.close(file)
 		if lock_error != nil { return lock_error }
 		return Journal_Error.Claimed

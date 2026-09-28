@@ -88,12 +88,7 @@ discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Cat
 	for root, _ in roots {
 		canonical, canonical_error := canonical_root(root, scratch)
 		if canonical_error.kind != .None {
-			record_diagnostic(
-				&catalog,
-				Diagnostic{.Unreadable_Root, DIAGNOSTIC_NO_ROOT, root.logical_path, 0, "", canonical_error.detail, "", ""},
-				scratch,
-				allocator,
-			)
+			record_diagnostic(&catalog, Diagnostic{.Unreadable_Root, DIAGNOSTIC_NO_ROOT, root.logical_path, 0, "", canonical_error.detail, "", ""}, allocator)
 			load_error_destroy(&canonical_error, scratch)
 			continue
 		}
@@ -106,12 +101,7 @@ discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Cat
 			}
 		}
 		if duplicate {
-			record_diagnostic(
-				&catalog,
-				Diagnostic{.Alias, DIAGNOSTIC_NO_ROOT, canonical, 0, "", "same directory as another source root", "", ""},
-				scratch,
-				allocator,
-			)
+			record_diagnostic(&catalog, Diagnostic{.Alias, DIAGNOSTIC_NO_ROOT, canonical, 0, "", "same directory as another source root", "", ""}, allocator)
 			continue
 		}
 		append(&seen, canonical)
@@ -123,7 +113,7 @@ discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Cat
 	// root keeps its win. The diagnostic the scan recorded says why.
 	for root, resolved_index in resolved {
 		before := len(candidates)
-		if !discover_root(roots, resolved_index, root, &catalog, &candidates, scratch, allocator) {
+		if !discover_root(resolved_index, root, &catalog, &candidates, scratch, allocator) {
 			for index := len(candidates) - 1; index >= before; index -= 1 {
 				release_candidate(&candidates[index], scratch)
 				ordered_remove(&candidates, index)
@@ -150,24 +140,11 @@ canonical_root :: proc(root: Root, allocator: mem.Allocator) -> (string, Load_Er
 	return canonical, {}
 }
 
-discover_root :: proc(
-	all_roots: []Root,
-	root_pos: int,
-	root: Root,
-	catalog: ^Catalog,
-	candidates: ^[dynamic]Candidate,
-	scratch, allocator: mem.Allocator,
-) -> bool {
-	_ = all_roots
+discover_root :: proc(root_pos: int, root: Root, catalog: ^Catalog, candidates: ^[dynamic]Candidate, scratch, allocator: mem.Allocator) -> bool {
 	entries, entries_error := os.read_directory_by_path(root.path, -1, scratch)
 	if entries_error != nil {
 		if entries_error == os.General_Error.Not_Exist { return true }
-		record_diagnostic(
-			catalog,
-			Diagnostic{.Unreadable_Root, root_pos, root.path, 0, "", string(os.error_string(entries_error)), "", ""},
-			scratch,
-			allocator,
-		)
+		record_diagnostic(catalog, Diagnostic{.Unreadable_Root, root_pos, root.path, 0, "", string(os.error_string(entries_error)), "", ""}, allocator)
 		return false
 	}
 	defer {
@@ -219,25 +196,25 @@ walk_directory :: proc(
 	if link, link_error := os.lstat(primary, scratch); link_error == nil {
 		defer os.file_info_delete(link, scratch)
 		if link.type != .Regular {
-			record_file_diagnostic(catalog, root_pos, frame.logical, scratch, allocator, .Unsupported, "SKILL.md is not a regular file")
+			record_file_diagnostic(catalog, root_pos, frame.logical, allocator, .Unsupported, "SKILL.md is not a regular file")
 			return true
 		}
 	}
 	if info, stat_error := os.stat(primary, scratch); stat_error == nil {
 		defer os.file_info_delete(info, scratch)
 		if info.type != .Regular {
-			record_file_diagnostic(catalog, root_pos, frame.logical, scratch, allocator, .Unsupported, "SKILL.md is not a regular file")
+			record_file_diagnostic(catalog, root_pos, frame.logical, allocator, .Unsupported, "SKILL.md is not a regular file")
 			return true
 		}
 		read_candidate(root_pos, root, frame, info.fullpath, catalog, candidates, scratch, allocator)
 		return true
 	} else if stat_error != os.General_Error.Not_Exist {
-		record_file_diagnostic(catalog, root_pos, frame.logical, scratch, allocator, .Invalid, string(os.error_string(stat_error)))
+		record_file_diagnostic(catalog, root_pos, frame.logical, allocator, .Invalid, string(os.error_string(stat_error)))
 		return true
 	}
 	entries, entries_error := os.read_directory_by_path(frame.path, -1, scratch)
 	if entries_error != nil {
-		record_file_diagnostic(catalog, root_pos, frame.logical, scratch, allocator, .Invalid, string(os.error_string(entries_error)))
+		record_file_diagnostic(catalog, root_pos, frame.logical, allocator, .Invalid, string(os.error_string(entries_error)))
 		return true
 	}
 	defer {
@@ -272,7 +249,7 @@ read_candidate :: proc(
 	basename := filepath.base(frame.logical)
 	data, read_error := os.read_entire_file(canonical_primary, scratch)
 	if read_error != nil {
-		record_file_diagnostic(catalog, root_pos, frame.logical, scratch, allocator, .Invalid, string(os.error_string(read_error)))
+		record_file_diagnostic(catalog, root_pos, frame.logical, allocator, .Invalid, string(os.error_string(read_error)))
 		return
 	}
 	defer delete(data, scratch)
@@ -282,7 +259,7 @@ read_candidate :: proc(
 	if metadata_error.kind != .None {
 		kind := Diagnostic_Kind.Invalid
 		if metadata_error.kind == .Unsupported_Metadata { kind = .Unsupported }
-		record_file_diagnostic(catalog, root_pos, frame.logical, scratch, allocator, kind, metadata_error.detail)
+		record_file_diagnostic(catalog, root_pos, frame.logical, allocator, kind, metadata_error.detail)
 		return
 	}
 	directory, directory_error := filepath.join({root.path, frame.logical}, scratch)
@@ -322,7 +299,6 @@ select_candidates :: proc(candidates: []Candidate, catalog: ^Catalog, scratch, a
 			record_diagnostic(
 				catalog,
 				Diagnostic{.Ambiguous, candidate.root_pos, candidate.logical, 0, "", "duplicate skill name in one root", "", ""},
-				scratch,
 				allocator,
 			)
 			continue
@@ -335,7 +311,7 @@ select_candidates :: proc(candidates: []Candidate, catalog: ^Catalog, scratch, a
 			}
 		}
 		if winner != "" {
-			record_diagnostic(catalog, Diagnostic{.Shadowed, candidate.root_pos, candidate.logical, 0, "", "", winner, candidate.logical}, scratch, allocator)
+			record_diagnostic(catalog, Diagnostic{.Shadowed, candidate.root_pos, candidate.logical, 0, "", "", winner, candidate.logical}, allocator)
 			continue
 		}
 		append(
@@ -394,12 +370,11 @@ release_candidates :: proc(candidates: []Candidate, allocator: mem.Allocator) {
 	}
 }
 
-record_file_diagnostic :: proc(catalog: ^Catalog, root_pos: int, logical: string, scratch, allocator: mem.Allocator, kind: Diagnostic_Kind, detail: string) {
-	record_diagnostic(catalog, Diagnostic{kind, root_pos, logical, 0, "", detail, "", ""}, scratch, allocator)
+record_file_diagnostic :: proc(catalog: ^Catalog, root_pos: int, logical: string, allocator: mem.Allocator, kind: Diagnostic_Kind, detail: string) {
+	record_diagnostic(catalog, Diagnostic{kind, root_pos, logical, 0, "", detail, "", ""}, allocator)
 }
 
-record_diagnostic :: proc(catalog: ^Catalog, diagnostic: Diagnostic, scratch, allocator: mem.Allocator) {
-	_ = scratch
+record_diagnostic :: proc(catalog: ^Catalog, diagnostic: Diagnostic, allocator: mem.Allocator) {
 	owned := Diagnostic {
 		kind       = diagnostic.kind,
 		root_index = diagnostic.root_index,
@@ -407,15 +382,34 @@ record_diagnostic :: proc(catalog: ^Catalog, diagnostic: Diagnostic, scratch, al
 	}
 	clone_error: mem.Allocator_Error
 	owned.path, clone_error = strings.clone(diagnostic.path, allocator)
-	if clone_error != nil { catalog.omitted += 1; return }
+	if clone_error != nil {
+		catalog.omitted += 1
+		return
+	}
 	owned.field, clone_error = strings.clone(diagnostic.field, allocator)
-	if clone_error != nil { diagnostic_destroy(&owned, allocator); catalog.omitted += 1; return }
+	if clone_error != nil {
+		diagnostic_destroy(&owned, allocator)
+		catalog.omitted += 1
+		return
+	}
 	owned.detail, clone_error = strings.clone(diagnostic.detail, allocator)
-	if clone_error != nil { diagnostic_destroy(&owned, allocator); catalog.omitted += 1; return }
+	if clone_error != nil {
+		diagnostic_destroy(&owned, allocator)
+		catalog.omitted += 1
+		return
+	}
 	owned.winner, clone_error = strings.clone(diagnostic.winner, allocator)
-	if clone_error != nil { diagnostic_destroy(&owned, allocator); catalog.omitted += 1; return }
+	if clone_error != nil {
+		diagnostic_destroy(&owned, allocator)
+		catalog.omitted += 1
+		return
+	}
 	owned.loser, clone_error = strings.clone(diagnostic.loser, allocator)
-	if clone_error != nil { diagnostic_destroy(&owned, allocator); catalog.omitted += 1; return }
+	if clone_error != nil {
+		diagnostic_destroy(&owned, allocator)
+		catalog.omitted += 1
+		return
+	}
 	grown, grow_error := make([]Diagnostic, len(catalog.diagnostics) + 1, allocator)
 	if grow_error != nil {
 		diagnostic_destroy(&owned, allocator)

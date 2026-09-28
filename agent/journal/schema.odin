@@ -86,6 +86,7 @@ MIGRATION_1 := [?]string {
 schema_migrate :: proc(journal: ^Journal) -> (error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	db.exec(&journal.connection, "BEGIN IMMEDIATE") or_return
+	// The rollback is teardown for a failure already on its way out.
 	defer if error != nil { _ = db.rollback(&journal.connection) }
 
 	version := schema_version(journal) or_return

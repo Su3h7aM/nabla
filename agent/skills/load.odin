@@ -67,10 +67,13 @@ path_within :: proc(path, authority: string) -> bool {
 skill_body_valid :: proc(body: string) -> bool {
 	has_content := false
 	for index := 0; index < len(body); {
-		r, width := utf8.decode_rune_in_string(body[index:])
-		if r == utf8.RUNE_ERROR && width == 1 { return false }
-		if r == 0 || r == 0x1b || r == 0x7f || r < 0x20 && r != '\t' && r != '\n' && r != '\r' { return false }
-		if r != ' ' && r != '\t' && r != '\n' && r != '\r' { has_content = true }
+		character, width := utf8.decode_rune_in_string(body[index:])
+		if character == utf8.RUNE_ERROR && width == 1 { return false }
+		if character == 0 ||
+		   character == 0x1b ||
+		   character == 0x7f ||
+		   character < 0x20 && character != '\t' && character != '\n' && character != '\r' { return false }
+		if character != ' ' && character != '\t' && character != '\n' && character != '\r' { has_content = true }
 		index += width
 	}
 	return has_content

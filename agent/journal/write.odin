@@ -194,9 +194,10 @@ flush_deadline :: proc(journal: ^Journal) -> Maybe(time.Tick) {
 @(private)
 write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 	for &statement, insert in journal.inserts {
-		if statement.conn == nil { db.prepare(&journal.connection, &statement, INSERT_SQL[insert]) or_return }
+		if statement.connection == nil { db.prepare(&journal.connection, &statement, INSERT_SQL[insert]) or_return }
 	}
 	db.exec(&journal.connection, "BEGIN IMMEDIATE") or_return
+	// The rollback is teardown for a failure already on its way out.
 	defer if error != nil { _ = db.rollback(&journal.connection) }
 
 	last = journal.last_seq

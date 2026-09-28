@@ -120,8 +120,12 @@ frontmatter_line :: proc(text: string, start: int) -> (string, int) {
 
 frontmatter_key_valid :: proc(key: string) -> bool {
 	if key == "" { return false }
-	for c in key {
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') { return false }
+	for character in key {
+		if !(character >= 'a' && character <= 'z' ||
+			   character >= 'A' && character <= 'Z' ||
+			   character >= '0' && character <= '9' ||
+			   character == '_' ||
+			   character == '-') { return false }
 	}
 	return true
 }
@@ -130,13 +134,13 @@ skill_name_valid :: proc(name: string) -> bool {
 	if len(name) == 0 || len(name) > SKILL_MAX_NAME_BYTES { return false }
 	if name[0] == '-' || name[len(name) - 1] == '-' { return false }
 	previous_hyphen := false
-	for c in name {
-		if c == '-' {
+	for character in name {
+		if character == '-' {
 			if previous_hyphen { return false }
 			previous_hyphen = true
 			continue
 		}
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9') { return false }
+		if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9') { return false }
 		previous_hyphen = false
 	}
 	return true
@@ -197,9 +201,17 @@ frontmatter_double_quoted :: proc(raw: string, next_line, line_number: int, allo
 	i := 1
 	closed := false
 	for i < len(raw) {
-		c := raw[i]
-		if c == '"' { closed = true; i += 1; break }
-		if c != '\\' { strings.write_byte(&builder, c); i += 1; continue }
+		character := raw[i]
+		if character == '"' {
+			closed = true
+			i += 1
+			break
+		}
+		if character != '\\' {
+			strings.write_byte(&builder, character)
+			i += 1
+			continue
+		}
 		if i + 1 >= len(raw) { break }
 		i += 1
 		switch raw[i] {
@@ -237,15 +249,15 @@ frontmatter_double_quoted :: proc(raw: string, next_line, line_number: int, allo
 frontmatter_hex4 :: proc(text: string) -> (u32, bool) {
 	if len(text) != 4 { return 0, false }
 	value: u32
-	for c in text {
+	for character in text {
 		value *= 16
 		switch {
-		case c >= '0' && c <= '9':
-			value += u32(c - '0')
-		case c >= 'a' && c <= 'f':
-			value += u32(c - 'a' + 10)
-		case c >= 'A' && c <= 'F':
-			value += u32(c - 'A' + 10)
+		case character >= '0' && character <= '9':
+			value += u32(character - '0')
+		case character >= 'a' && character <= 'f':
+			value += u32(character - 'a' + 10)
+		case character >= 'A' && character <= 'F':
+			value += u32(character - 'A' + 10)
 		case:
 			return 0, false
 		}
@@ -304,20 +316,23 @@ description_normalize :: proc(text: string, allocator: mem.Allocator) -> (string
 	pending_space := false
 	runes := 0
 	for index := 0; index < len(text); {
-		r, width := utf8.decode_rune_in_string(text[index:])
-		if r == utf8.RUNE_ERROR &&
+		character, width := utf8.decode_rune_in_string(text[index:])
+		if character == utf8.RUNE_ERROR &&
 		   width == 1 { return "", error_make(.Invalid_Metadata, field = "description", detail = "description is not valid UTF-8", allocator = allocator) }
-		if r < 0x20 || r == 0x7f {
-			if r != '\n' &&
-			   r != '\r' &&
-			   r !=
+		if character < 0x20 || character == 0x7f {
+			if character != '\n' &&
+			   character != '\r' &&
+			   character !=
 				   '\t' { return "", error_make(.Invalid_Metadata, field = "description", detail = "description contains a control character", allocator = allocator) }
 			pending_space = strings.builder_len(builder) > 0
-		} else if r == ' ' {
+		} else if character == ' ' {
 			pending_space = strings.builder_len(builder) > 0
 		} else {
-			if pending_space { strings.write_byte(&builder, ' '); pending_space = false }
-			strings.write_rune(&builder, r)
+			if pending_space {
+				strings.write_byte(&builder, ' ')
+				pending_space = false
+			}
+			strings.write_rune(&builder, character)
 			runes += 1
 			if runes >
 			   SKILL_MAX_DESCRIPTION_RUNES { return "", error_make(.Invalid_Metadata, field = "description", detail = "description is too long", allocator = allocator) }
