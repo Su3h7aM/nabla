@@ -535,7 +535,7 @@ Every record fills the correlation columns that exist at that point: session, br
 
 ### 8.5 Diagnostics from other threads
 
-Workers and library code log through `context.logger`, which writes into a process-wide `Diag_Ring`: a mutex-guarded fixed array of `DIAG_RING_ENTRIES` entries, each with inline fixed-size text (`DIAG_TEXT_MAX`), level, thread id, and correlation copied from the logger binding. Producers never allocate and never block; a full ring increments a dropped counter. Owners drain the ring into observation records. Process-scope facts (a watcher error, catalog refresh failure) are drained by any owner, or by root into a process-scope record when no session is open.
+Workers and library code log through `context.logger`, which writes into a process-wide `Diag_Ring`: a mutex-guarded fixed array of `DIAG_RING_ENTRIES` entries, each with inline fixed-size text (`DIAG_TEXT_MAX`), level, thread id, and correlation copied from the logger binding. Producers never allocate and never block; a full ring increments a dropped counter. Owners drain the ring into `runtime.message` records on every commit, and root drains it after each work item and at exit. An entry of the draining owner's session carries the session column; any other entry is recorded without one and names its session in `data.session`, and readers find it through `Filter.named`. The threshold comes from `NABLA_LOG_LEVEL` (`off`, `error`, `warn`, `info`, `debug`).
 
 Payload capture (full provider request bodies, raw response streams, MCP lines) is opt-in (`diagnostics.capture = true`). Captures are `artifacts` rows keyed by SHA-256, referenced from records by digest, bounded per session and by retention (section 27). Credentials, headers, and environment are never captured.
 

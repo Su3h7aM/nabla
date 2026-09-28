@@ -289,9 +289,6 @@ Runtime :: struct {
 	// at its own boundaries, so shutdown does not have to reach the worker
 	// through the command queue.
 	stopping:                 bool,
-	// log_failure_reported latches the one warning that diagnostics stopped. Only
-	// the worker reads and writes it, so it needs no lock of its own.
-	log_failure_reported:     bool,
 	// catalog_applied_revision is the newest published catalog whose metadata the
 	// worker applied to the active selection. Only the worker reads and writes it.
 	catalog_applied_revision: u64,
@@ -338,18 +335,13 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 	// The tool registry borrowed the runtime's bindings, so the session goes first
 	// and the MCP clients second. A runtime that was never built owns nothing.
 	mcp_runtime_destroy(&setup.mcp)
+	// The launch's last diagnostics reach the journal before it closes.
+	run_log_close(setup)
 	if close_error := session_store_close(setup.store, setup.alloc); close_error != nil {
 		detail := journal.error_text(close_error, context.temp_allocator)
 		fmt.eprintln("nabla: the session database could not be closed cleanly:", detail)
 	}
 	delete(setup.journal_directory, setup.alloc)
-	// The log outlives the session and the store deliberately: the record of the
-	// launch ending is the last thing it can write. A close failure is reported
-	// outside the log, because that log is what failed.
-	if close_err := run_log_close(setup); close_err != nil {
-		local := close_err
-		fmt.eprintln("nabla: the diagnostic log could not be closed cleanly:", agent.log_error_detail(&local))
-	}
 	agent.catalog_destroy(&setup.catalog)
 	for id in setup.configured {
 		delete(id, setup.alloc)

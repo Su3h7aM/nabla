@@ -28,16 +28,9 @@ Run_Setup :: struct {
 	store:             ^journal.Journal,
 	journal_directory: string, // owned
 	run:               journal.Run_Id,
-	// log is this launch's diagnostic stream. It is opened before the store and
-	// closed after it, so a launch that cannot reach the store still says so.
-	log:               agent.Log,
-	// log_binding is what context.logger points at while the run is logging. It
-	// lives here, next to the writer, so it outlives every logger value that
-	// borrows it.
+	// log_binding is what context.logger points at while the run logs; its ring is
+	// owned, nil while diagnostics are off.
 	log_binding:       agent.Log_Binding,
-	// log_cleanup is what the retention pass did, held until the run's logger is
-	// installed so the pass is reported after run.started rather than before it.
-	log_cleanup:       agent.Log_Cleanup_Summary,
 	session:           agent.Chat_Session,
 	workspace:         string, // owned; the directory sessions here run in
 	provider_id:       string, // owned,

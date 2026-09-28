@@ -1,70 +1,69 @@
 #+test
 package agent
 
-import "core:encoding/json"
+import "core:fmt"
 import "core:log"
 import "core:mem/virtual"
-import "core:os"
 import "core:strings"
 import "core:testing"
 
 import "nabla:agent/journal"
 import "nabla:ai"
 
-// The state machine is driven here through the same helpers the rest of the suite
-// uses, so a test reads back what the harness actually recorded for a real turn
-// rather than what a hand-built record would have said.
-//
-// Every test here installs the harness sink on context.logger, and then has to
-// put the test runner's logger back before it asserts anything. core:testing
-// reports a failure by logging it, so a failure logged while the sink is
-// installed is written into the log under test: the assertion is lost and the
-// test passes. fixture.ambient is the runner's logger, and assigning it in the
-// test's own scope is what restores it, because an assignment to context inside a
-// callee configures only that callee.
-
 Log_Chat_Test :: struct {
-	chat:      Chat_Test,
-	sink:      Log,
-	binding:   Log_Binding,
-	logs_root: string,
-	// ambient is the logger the test runner installed. Every test saves it back onto
-	// context.logger in its own scope before it asserts anything.
-	ambient:   log.Logger,
+	chat:    Chat_Test,
+	ring:    ^Diag_Ring,
+	binding: Log_Binding,
+	ambient: log.Logger,
 }
 
-// log_chat_begin is chat_test_begin with a writer attached, so the turn the test
-// drives has somewhere to record itself. It returns the logger for the test to
-// install: a helper cannot configure its caller's context, so the binding lives in
-// the fixture and the caller assigns it in its own scope.
 log_chat_begin :: proc(test: ^testing.T, fixture: ^Log_Chat_Test, workspace: string, lowest := log.Level.Info) -> log.Logger {
 	fixture.ambient = context.logger
-	logs_root, root_error := os.make_directory_temp("", "nabla-log-events-*", context.allocator)
-	if root_error != nil { testing.fail_now(test, "could not create a temporary logs root") }
-	fixture.logs_root = logs_root
-	if _, open_error := log_open(&fixture.sink, {directory = logs_root, enabled = true, lowest = lowest}); open_error != nil {
-		testing.fail_now(test, "the log could not be opened")
-	}
+	fixture.ring = new(Diag_Ring)
+	fixture.ring.lowest = lowest
 	chat_test_begin(test, &fixture.chat, workspace)
 	fixture.binding = Log_Binding {
-		sink = &fixture.sink,
+		ring = fixture.ring,
 	}
 	return log_logger(&fixture.binding)
 }
 
 log_chat_end :: proc(test: ^testing.T, fixture: ^Log_Chat_Test) {
-	// Restored first, so a failure inside the teardown below still reaches the test
-	// runner rather than the sink being closed.
 	context.logger = fixture.ambient
 	chat_test_end(test, &fixture.chat)
-	_ = log_close(&fixture.sink)
-	os.remove_all(fixture.logs_root)
-	delete(fixture.logs_root, context.allocator)
+	free(fixture.ring)
 	fixture^ = {}
 }
 
 log_chat_text :: proc(test: ^testing.T, fixture: ^Log_Chat_Test) -> string {
-	return log_test_text(test, log_test_directory_segment(fixture.sink.directory, 1))
+	text: [dynamic]u8
+	records, _, read_error := journal.read_records(&fixture.chat.store, {kinds = {.Runtime_Message}}, 0, 0, context.allocator)
+	if read_error != nil { testing.fail_now(test, "diagnostic records could not be read") }
+	defer journal.records_destroy(records, context.allocator)
+	for record in records {
+		message: journal.Runtime_Message
+		if journal.payload_decode(record.data, &message, context.temp_allocator) != nil { testing.fail_now(test, "diagnostic message could not be decoded") }
+		append(&text, ..transmute([]u8)message.text)
+		if record.session != {} {
+			hex_text: [journal.SESSION_ID_HEX_LENGTH]u8
+			append(&text, ..transmute([]u8)fmt.tprintf(" session_id=%s", journal.session_id_to_hex(record.session, hex_text[:])))
+		}
+		if record.turn != 0 { append(&text, ..transmute([]u8)fmt.tprintf(" turn_no=%d", record.turn)) }
+		if record.request != 0 { append(&text, ..transmute([]u8)fmt.tprintf(" request_no=%d", record.request)) }
+		append(&text, '\n')
+	}
+	entry: Diag_Entry
+	for diag_pop(fixture.ring, &entry) {
+		append(&text, ..entry.text[:entry.text_length])
+		if entry.session != {} {
+			hex_text: [journal.SESSION_ID_HEX_LENGTH]u8
+			append(&text, ..transmute([]u8)fmt.tprintf(" session_id=%s", journal.session_id_to_hex(entry.session, hex_text[:])))
+		}
+		if entry.turn != 0 { append(&text, ..transmute([]u8)fmt.tprintf(" turn_no=%d", entry.turn)) }
+		if entry.request != 0 { append(&text, ..transmute([]u8)fmt.tprintf(" request_no=%d", entry.request)) }
+		append(&text, '\n')
+	}
+	return string(text[:])
 }
 
 
@@ -89,7 +88,10 @@ log_chat_cancel_turn :: proc(test: ^testing.T, chat: ^Chat_Session) -> (records:
 log_chat_record_count :: proc(test: ^testing.T, chat: ^Chat_Session) -> int {
 	records, _, read_error := journal.read_records(chat.store, {session = chat.session}, 0, 0, context.temp_allocator)
 	if read_error != nil { testing.fail_now(test, "the records could not be read") }
-	return len(records)
+	defer journal.records_destroy(records, context.temp_allocator)
+	count := 0
+	for record in records { if record.kind != .Runtime_Message { count += 1 } }
+	return count
 }
 
 @(test)
@@ -104,15 +106,15 @@ test_a_turn_records_its_start_and_end :: proc(test: ^testing.T) {
 	context.logger = fixture.ambient
 	text := log_chat_text(test, &fixture)
 	defer delete(text, context.allocator)
-	testing.expect(test, strings.contains(text, `"event":"turn.started"`), "the turn start is recorded")
-	testing.expect(test, strings.contains(text, `"event":"turn.finished"`), "the turn end is recorded")
-	testing.expect(test, strings.contains(text, `"prompt_bytes":5`), "the start carries the prompt size")
-	testing.expect(test, strings.contains(text, `"outcome":"cancelled"`), "the end names the outcome")
-	testing.expect(test, strings.contains(text, `"recorded":true`), "the end says the outcome landed")
+	testing.expect(test, strings.contains(text, "turn.started"), "the turn start is recorded")
+	testing.expect(test, strings.contains(text, "turn.finished"), "the turn end is recorded")
+	testing.expect(test, strings.contains(text, "prompt_bytes=5"), "the start carries the prompt size")
+	testing.expect(test, strings.contains(text, "outcome=cancelled"), "the end names the outcome")
+	testing.expect(test, strings.contains(text, "recorded=true"), "the end says the outcome landed")
 	// The scope carries the session the work belongs to and the durable turn.
-	session_field := strings.concatenate({`"session_id":"`, chat_session_text(chat), `"`}, context.temp_allocator)
+	session_field := strings.concatenate({"session_id=", chat_session_text(chat)}, context.temp_allocator)
 	testing.expect(test, strings.contains(text, session_field), "records carry the session")
-	testing.expect(test, strings.contains(text, `"turn_no":1`), "records carry the durable turn")
+	testing.expect(test, strings.contains(text, "turn_no=1"), "records carry the durable turn")
 }
 
 @(test)
@@ -140,8 +142,8 @@ test_a_superseded_operation_is_recorded :: proc(test: ^testing.T) {
 	context.logger = fixture.ambient
 	text := log_chat_text(test, &fixture)
 	defer delete(text, context.allocator)
-	testing.expect(test, strings.contains(text, `"event":"agent.event_ignored"`), "the dropped event is recorded")
-	testing.expect(test, strings.contains(text, `"reason":"superseded_turn"`), "the record names why it was refused")
+	testing.expect(test, strings.contains(text, "agent.event_ignored"), "the dropped event is recorded")
+	testing.expect(test, strings.contains(text, "reason=superseded_turn"), "the record names why it was refused")
 }
 
 @(test)
@@ -170,10 +172,10 @@ test_a_tool_call_is_recorded_from_call_to_result :: proc(test: ^testing.T) {
 	}
 	// The call is followed by its own id, and the dispatch and the result name the
 	// call they were stored as.
-	testing.expect(test, strings.contains(text, `"call_id":"call_1"`), "every tool record carries the call")
-	testing.expect(test, strings.contains(text, `"repairs":""`), "the admission says nothing was repaired")
-	testing.expect(test, strings.contains(text, `"outcome":"success"`), "the execution outcome is named")
-	testing.expect(test, strings.contains(text, `"call":1`), "the result names the call it was stored as")
+	testing.expect(test, strings.contains(text, "call_id=call_1"), "every tool record carries the call")
+	testing.expect(test, strings.contains(text, "repairs="), "the admission says nothing was repaired")
+	testing.expect(test, strings.contains(text, "outcome=success"), "the execution outcome is named")
+	testing.expect(test, strings.contains(text, "call=1"), "the result names the call it was stored as")
 }
 
 @(test)
@@ -198,12 +200,12 @@ test_the_provider_record_names_the_encoded_body :: proc(test: ^testing.T) {
 	context.logger = fixture.ambient
 	text := log_chat_text(test, &fixture)
 	defer delete(text, context.allocator)
-	testing.expect(test, strings.contains(text, `"event":"provider.encoded"`), "the encoded body is recorded")
-	testing.expect(test, strings.contains(text, `"api":"openai_responses"`), "the record names the API family")
-	testing.expect(test, strings.contains(text, `"model":"test-model"`), "the record names the model")
-	testing.expect(test, strings.contains(text, `"tools":3`), "the record counts the encoded tools")
+	testing.expect(test, strings.contains(text, "provider.encoded"), "the encoded body is recorded")
+	testing.expect(test, strings.contains(text, "api=openai_responses"), "the record names the API family")
+	testing.expect(test, strings.contains(text, "model=test-model"), "the record names the model")
+	testing.expect(test, strings.contains(text, "tools=3"), "the record counts the encoded tools")
 	testing.expect_value(test, len(body), 38)
-	testing.expect(test, strings.contains(text, `"body_bytes":38`), "the record counts the encoded bytes")
+	testing.expect(test, strings.contains(text, "body_bytes=38"), "the record counts the encoded bytes")
 	testing.expect(
 		test,
 		strings.contains(text, "9a097790cd5c0aeb05c59c221f90963b0abbba75d5044c094beef975c536f26d"),
@@ -212,19 +214,18 @@ test_the_provider_record_names_the_encoded_body :: proc(test: ^testing.T) {
 }
 
 @(test)
-test_a_writer_does_not_change_a_turn :: proc(test: ^testing.T) {
-	// The same turn twice: once with nowhere to record and once with a writer. A
-	// diagnostic that changed the durable outcome would show up as a difference
-	// here.
+test_diagnostics_do_not_change_a_turn :: proc(test: ^testing.T) {
+	// The same turn with and without diagnostics must keep the same facts and calls.
 	plain: Chat_Test
 	chat_test_begin(test, &plain, tool_loop_workspace(test))
 	defer chat_test_end(test, &plain)
 	plain_records, plain_calls := log_chat_cancel_turn(test, &plain.chat)
 
 	logged: Log_Chat_Test
-	log_chat_begin(test, &logged, tool_loop_workspace(test))
+	context.logger = log_chat_begin(test, &logged, tool_loop_workspace(test))
 	defer log_chat_end(test, &logged)
 	logged_records, logged_calls := log_chat_cancel_turn(test, &logged.chat.chat)
+	context.logger = logged.ambient
 
 	testing.expect(test, plain_records > 0, "the turn recorded something")
 	testing.expect_value(test, logged_records, plain_records)
@@ -251,10 +252,10 @@ test_an_admission_decision_is_recorded :: proc(test: ^testing.T) {
 	context.logger = fixture.ambient
 	text := log_chat_text(test, &fixture)
 	defer delete(text, context.allocator)
-	testing.expect(test, strings.contains(text, `"event":"request.admission"`), "the decision is recorded")
-	testing.expect(test, strings.contains(text, `"decision":"admitted"`), "the admission is named")
-	testing.expect(test, strings.contains(text, `"decision":"refused"`), "the refusal is named")
-	testing.expect(test, strings.contains(text, `"estimate":100000`), "the refusal carries what was estimated")
+	testing.expect(test, strings.contains(text, "request.admission"), "the decision is recorded")
+	testing.expect(test, strings.contains(text, "decision=admitted"), "the admission is named")
+	testing.expect(test, strings.contains(text, "decision=refused"), "the refusal is named")
+	testing.expect(test, strings.contains(text, "estimate=100000"), "the refusal carries what was estimated")
 }
 
 @(test)
@@ -286,9 +287,9 @@ test_starting_a_compaction_records_its_scope :: proc(test: ^testing.T) {
 	context.logger = fixture.ambient
 	text := log_chat_text(test, &fixture)
 	defer delete(text, context.allocator)
-	testing.expect(test, strings.contains(text, `"event":"compaction.started"`), "the start is recorded")
-	testing.expect(test, strings.contains(text, `"trigger":"user_command"`), "the trigger is named")
-	testing.expect(test, strings.contains(text, `"turn_no":1`), "a compaction inside a turn names the turn")
+	testing.expect(test, strings.contains(text, "compaction.started"), "the start is recorded")
+	testing.expect(test, strings.contains(text, "trigger=user_command"), "the trigger is named")
+	testing.expect(test, strings.contains(text, "turn_no=1"), "a compaction inside a turn names the turn")
 
 	// Teardown joins the worker; the dead endpoint makes it finish promptly.
 	chat_compact_destroy(chat)
@@ -372,30 +373,17 @@ test_preparation_never_names_the_previous_request :: proc(test: ^testing.T) {
 	// reader filtering for one request would read the other request's estimate.
 	prepared, recorded := 0, 0
 	for line in strings.split_lines(text, context.temp_allocator) {
-		if line == "" { continue }
-		value, parse_error := parse_log_line(line)
-		if parse_error { continue }
-		object, is_object := value.(json.Object)
-		if !is_object {
-			json.destroy_value(value, context.temp_allocator)
-			continue
-		}
-		event, _ := object["event"].(json.String)
-		switch string(event) {
-		case "request.prepared", "request.admission":
+		switch {
+		case strings.has_prefix(line, "request.prepared"), strings.has_prefix(line, "request.admission"):
 			prepared += 1
-			if string(event) == "request.prepared" {
-				_, turn_named := object["turn_no"]
-				testing.expectf(test, turn_named, "request.prepared must name its turn: %s", line)
+			if strings.has_prefix(line, "request.prepared") {
+				testing.expectf(test, strings.contains(line, " turn_no="), "request.prepared must name its turn: %s", line)
 			}
-			_, named := object["request_no"]
-			testing.expectf(test, !named, "%s must not name a request: %s", event, line)
-		case "request.recorded":
+			testing.expectf(test, !strings.contains(line, " request_no="), "preparation must not name a request: %s", line)
+		case strings.has_prefix(line, "request.recorded"):
 			recorded += 1
-			_, named := object["request_no"]
-			testing.expectf(test, named, "request.recorded must name its request: %s", line)
+			testing.expectf(test, strings.contains(line, " request_no="), "request.recorded must name its request: %s", line)
 		}
-		json.destroy_value(value, context.temp_allocator)
 	}
 	// Two requests were prepared and recorded, so the assertions above saw both
 	// requests rather than passing over an empty stream.
@@ -434,36 +422,15 @@ test_a_scheduled_retry_is_reported_as_events :: proc(test: ^testing.T) {
 
 	scheduled, started := 0, 0
 	for line in strings.split_lines(text, context.temp_allocator) {
-		if line == "" { continue }
-		value, parse_error := parse_log_line(line)
-		if parse_error { continue }
-		object, is_object := value.(json.Object)
-		if !is_object {
-			json.destroy_value(value, context.temp_allocator)
-			continue
-		}
-		event, _ := object["event"].(json.String)
-		switch string(event) {
-		case "request.retry_scheduled":
+		switch {
+		case strings.has_prefix(line, "request.retry_scheduled"):
 			scheduled += 1
-			reason, _ := object["reason"].(json.String)
-			testing.expectf(test, string(reason) == "transient_failure", "a scheduled retry says why: %s", line)
-			_, named := object["request_no"]
-			testing.expectf(test, named, "a scheduled retry names its request: %s", line)
-		case "request.retry_started":
+			testing.expectf(test, strings.contains(line, "reason=transient_failure"), "a scheduled retry says why: %s", line)
+			testing.expectf(test, strings.contains(line, " request_no="), "a scheduled retry names its request: %s", line)
+		case strings.has_prefix(line, "request.retry_started"):
 			started += 1
 		}
-		json.destroy_value(value, context.temp_allocator)
 	}
 	testing.expect_value(test, scheduled, 1)
 	testing.expect_value(test, started, 1)
-}
-
-// parse_log_line reads one record the writer produced. The presence of a key is
-// what these tests ask about, so the object is returned rather than a struct: a
-// zero json.Value is the Null variant, which is not the same as an absent field.
-@(private)
-parse_log_line :: proc(line: string) -> (json.Value, bool) {
-	value, parse_error := json.parse_string(line, parse_integers = true, allocator = context.temp_allocator)
-	return value, parse_error != .None
 }

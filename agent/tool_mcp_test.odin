@@ -17,9 +17,8 @@ mcp_test_context :: proc() -> Tool_Context {
 
 @(test)
 test_mcp_exchange_records_delivery_without_payloads :: proc(test: ^testing.T) {
-	fixture: Log_Test
-	log_test_begin(test, &fixture)
-	defer log_test_end(test, &fixture)
+	ring := new(Diag_Ring)
+	defer free(ring)
 	backend := MCP_Tool_Backend {
 		server_id   = "files",
 		remote_name = "find_files.by_name",
@@ -29,7 +28,7 @@ test_mcp_exchange_records_delivery_without_payloads :: proc(test: ^testing.T) {
 	// The executor is given its call's binding by its caller, so the test installs
 	// one here and the exchange below records against it.
 	binding := Log_Binding {
-		sink = &fixture.log,
+		ring = ring,
 		correlation = Log_Correlation{call_id = tool_context.call_id},
 	}
 	context.logger = log_logger(&binding)
@@ -43,16 +42,21 @@ test_mcp_exchange_records_delivery_without_payloads :: proc(test: ^testing.T) {
 		stderr_tail = "secret-token\nprivate output",
 	}
 	log_mcp_exchange_finished(&backend, failure.delivery, failure, .Timed_Out, time.Second)
-	text := log_test_segment_text(test, &fixture, 1)
-	defer delete(text, context.allocator)
-	testing.expect(test, strings.contains(text, `"event":"mcp.exchange_started"`))
-	testing.expect(test, strings.contains(text, `"remote_name":"find_files.by_name"`))
-	testing.expect(test, strings.contains(text, `"delivery":"not_delivered"`))
-	testing.expect(test, strings.contains(text, `"delivery":"delivered"`))
-	testing.expect(test, strings.contains(text, `"event":"mcp.stderr"`))
-	testing.expect(test, strings.contains(text, `"call_id":"call_mcp"`))
-	testing.expect(test, !strings.contains(text, "secret-token"))
-	testing.expect(test, !strings.contains(text, "private output"))
+	entry: Diag_Entry
+	text: [dynamic]u8
+	defer delete(text)
+	for diag_pop(ring, &entry) {
+		append(&text, ..entry.text[:entry.text_length])
+		append(&text, '\n')
+	}
+	testing.expect(test, strings.contains(string(text[:]), "mcp.exchange_started"))
+	testing.expect(test, strings.contains(string(text[:]), "remote_name=find_files.by_name"))
+	testing.expect(test, strings.contains(string(text[:]), "delivery=not_delivered"))
+	testing.expect(test, strings.contains(string(text[:]), "delivery=delivered"))
+	testing.expect(test, strings.contains(string(text[:]), "mcp.stderr"))
+	testing.expect(test, strings.contains(string(text[:]), "call_id=call_mcp"))
+	testing.expect(test, !strings.contains(string(text[:]), "secret-token"))
+	testing.expect(test, !strings.contains(string(text[:]), "private output"))
 }
 
 @(private)

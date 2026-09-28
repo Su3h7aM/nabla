@@ -192,6 +192,19 @@ Branch_Created :: struct {
 	base_node: Node_Id,
 }
 
+// Runtime_Message is one diagnostic entry. time_ms is when it was emitted, which
+// precedes the record's own time. session names another session's entry in hex;
+// the claimed session's entries use the session column instead.
+Runtime_Message :: struct {
+	version:  int,
+	level:    string,
+	category: string,
+	thread:   int,
+	time_ms:  i64,
+	session:  string,
+	text:     string,
+}
+
 // Branch_Selected names the branch in the record's branch column.
 Branch_Selected :: struct {
 	version: int,

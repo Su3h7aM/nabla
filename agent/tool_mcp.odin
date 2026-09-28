@@ -79,10 +79,6 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, _: Tool_Args) -> (result: Tool_Resu
 	started := time.tick_now()
 	exchange_error: mcp.Error
 	delivery := mcp.Delivery_State.Not_Delivered
-	// The wire log belongs to this call, and every message the call exchanges is
-	// captured against it while payload capture is on.
-	wire := MCP_Log{}
-	if backend != nil { wire.server_id = backend.server_id }
 	defer mcp.error_destroy(&exchange_error, ctx.allocator)
 	defer log_mcp_exchange_finished(backend, delivery, exchange_error, result.outcome, time.tick_since(started))
 	log_mcp_exchange_started(backend)
@@ -99,7 +95,7 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, _: Tool_Args) -> (result: Tool_Resu
 	}
 
 	call: mcp.Call_Result
-	call, exchange_error = mcp.client_tools_call(backend.client, backend.remote_name, ctx.arguments_json, tool_mcp_options(ctx, &wire), ctx.allocator)
+	call, exchange_error = mcp.client_tools_call(backend.client, backend.remote_name, ctx.arguments_json, tool_mcp_options(ctx), ctx.allocator)
 	defer mcp.call_result_destroy(&call, ctx.allocator)
 	if exchange_error.kind != .None {
 		delivery = exchange_error.delivery
@@ -109,13 +105,11 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, _: Tool_Args) -> (result: Tool_Resu
 	return tool_mcp_call_result(ctx, call)
 }
 
-// tool_mcp_options bounds the call by the definition's timeout, measured from now, and
-// attaches the wire log.
+// tool_mcp_options bounds the call by the definition's timeout, measured from now.
 @(private)
-tool_mcp_options :: proc(ctx: ^Tool_Context, wire: ^MCP_Log) -> mcp.Operation_Options {
+tool_mcp_options :: proc(ctx: ^Tool_Context) -> mcp.Operation_Options {
 	options := mcp.Operation_Options {
 		control = {user_data = ctx.control.interrupt, interrupted = tool_mcp_interrupted, wake = ctx.control.wake},
-		observer = mcp_log_observer(wire),
 	}
 	if ctx.timeout > 0 {
 		options.control.deadline_at = time.tick_add(time.tick_now(), ctx.timeout)

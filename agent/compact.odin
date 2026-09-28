@@ -396,13 +396,10 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 		interrupt = &job.interrupt,
 	}
 	provider_log: Provider_Log
-	if log_observation_wanted() {
+	if log_enabled(.Info) {
 		options.observer = provider_log_observer(&provider_log)
 	}
 	job.operation = ai.Provider_Request_Operation_Encoded(connection, request, job, chat_compact_event, options, job.allocator)
-	if provider_log.response_capture.kind != .Invalid {
-		log_capture_finish(&provider_log.response_capture, job.operation.kind == .None)
-	}
 	if job.operation.detail != "" && job.error_text == "" {
 		// The transport's account becomes the job's, so there is one string to
 		// release rather than two owners for one fact.

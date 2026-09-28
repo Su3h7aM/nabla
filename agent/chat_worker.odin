@@ -56,10 +56,10 @@ chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attemp
 
 	// The observation belongs to this attempt: a retry that receives no chunk must not
 	// inherit the previous attempt's byte count. It is only attached when something will
-	// come of it, so a run with diagnostics off and capture off pays nothing per chunk.
+	// come of it, so a run with diagnostics off pays nothing per chunk.
 	provider_log: Provider_Log
 	attempt_options := worker.options
-	if log_observation_wanted() { attempt_options.observer = provider_log_observer(&provider_log) } else { attempt_options.observer = {} }
+	if log_enabled(.Info) { attempt_options.observer = provider_log_observer(&provider_log) } else { attempt_options.observer = {} }
 
 	at := time.tick_now()
 	operation_error: ai.Provider_Operation_Error
@@ -74,11 +74,6 @@ chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attemp
 			attempt_options,
 			worker.allocator,
 		)
-	}
-	// The response artifact covers the whole attempt, so it is settled as soon as the bytes
-	// stop arriving. A cut-short stream is kept and marked incomplete.
-	if provider_log.response_capture.kind != .Invalid {
-		log_capture_finish(&provider_log.response_capture, operation_error.kind == .None)
 	}
 	// The transport's own account of the attempt goes beside the provider's, because "the
 	// peer refused the request" and "nothing ever left this machine" are different findings

@@ -129,10 +129,7 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 		// Connecting negotiates a revision, so a server this client cannot speak to is
 		// refused here with the revision it offered rather than failing later under
 		// semantics neither side agreed to.
-		wire := agent.MCP_Log {
-			server_id = server.id,
-		}
-		connection, connect_err := mcp.client_connect(client, mcp_operation(server.discovery_timeout, &wire), runtime.alloc)
+		connection, connect_err := mcp.client_connect(client, mcp_operation(server.discovery_timeout), runtime.alloc)
 		if connect_err.kind != .None {
 			fmt.sbprintf(warnings, "\n%s: %s", server.id, mcp.error_text(connect_err, context.temp_allocator))
 			if connect_err.stderr_tail != "" {
@@ -180,11 +177,9 @@ log_mcp_stopped :: proc(server_id: string, instance: u64, reason: string) {
 	agent.log_emit(agent.Log_Record{level = .Info, category = .MCP, event = "mcp.stopped", fields = fields[:]})
 }
 
-// mcp_operation is the bound and the observer for one client operation. The wire
-// log is declared by the caller, because the operation borrows it for its whole
-// call and a log owned here would not outlive the return.
+// mcp_operation is the bound for one client operation.
 @(private)
-mcp_operation :: proc(timeout: time.Duration, wire: ^agent.MCP_Log) -> mcp.Operation_Options {
+mcp_operation :: proc(timeout: time.Duration) -> mcp.Operation_Options {
 	options: mcp.Operation_Options
 	if timeout > 0 {
 		options.control = {
@@ -192,7 +187,6 @@ mcp_operation :: proc(timeout: time.Duration, wire: ^agent.MCP_Log) -> mcp.Opera
 			has_deadline = true,
 		}
 	}
-	if agent.log_capture_wanted() { options.observer = agent.mcp_log_observer(wire) }
 	return options
 }
 
@@ -295,10 +289,7 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	for server, index in setup.mcp_servers {
 		client, available := mcp_runtime_ensure(&setup.mcp, setup.mcp_servers, index, &warnings)
 		if !available { unavailable += 1; continue }
-		wire := agent.MCP_Log {
-			server_id = server.id,
-		}
-		page, list_err := mcp.client_tools_list(client, mcp_operation(server.discovery_timeout, &wire), setup.alloc)
+		page, list_err := mcp.client_tools_list(client, mcp_operation(server.discovery_timeout), setup.alloc)
 		if list_err.kind != .None {
 			unavailable += 1
 			fmt.sbprintf(&warnings, "\n%s: %s", server.id, mcp.error_text(list_err, context.temp_allocator))

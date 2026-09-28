@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:io"
+import "core:log"
 import "core:mem"
 import "core:mem/virtual"
 import "core:strconv"
@@ -13,53 +14,41 @@ import "nabla:agent/journal"
 
 // stdout contains JSONL only; diagnostics go to stderr.
 
-DIAGNOSTICS_USAGE :: "nabla diagnostics <session-id> [--request N] [--level NAME] [--export DIR [--include-payloads]]"
+DIAGNOSTICS_USAGE :: "nabla diagnostics <session-id> [--turn N] [--request N] [--level NAME] [--export DIR [--include-payloads]]"
 
 diagnostics_main :: proc(args: []string, stdout, stderr: io.Writer) -> int {
 	session_text := ""
-	selector: agent.Log_Read_Selector
+	filter: journal.Filter
+	level: log.Level = .Debug
 	export_directory := ""
 	include_payloads := false
 	for index := 0; index < len(args); index += 1 {
 		arg := args[index]
 		switch {
-		case arg == "--request" || strings.has_prefix(arg, "--request="):
-			text := arg[len("--request"):]
-			if text == "" {
-				index += 1
-				if index >= len(args) { return diagnostics_bad_usage("--request needs a number", stderr) }
-				text = args[index]
-			} else if text[0] == '=' {
-				text = text[1:]
-			}
+		case diagnostics_option(arg, "--turn"):
+			text, present := diagnostics_option_value(args, &index, "--turn")
+			if !present { return diagnostics_bad_usage("--turn needs a number", stderr) }
+			number, parsed := strconv.parse_i64(text)
+			if !parsed || number <= 0 { return diagnostics_bad_usage("--turn needs a positive turn number", stderr) }
+			filter.turn = journal.Turn_Id(number)
+		case diagnostics_option(arg, "--request"):
+			text, present := diagnostics_option_value(args, &index, "--request")
+			if !present { return diagnostics_bad_usage("--request needs a number", stderr) }
 			number, parsed := strconv.parse_i64(text)
 			if !parsed || number <= 0 { return diagnostics_bad_usage("--request needs a positive request number", stderr) }
-			selector.request_no = number
-		case arg == "--level" || strings.has_prefix(arg, "--level="):
-			text := arg[len("--level"):]
-			if text == "" {
-				index += 1
-				if index >= len(args) { return diagnostics_bad_usage("--level needs a level name", stderr) }
-				text = args[index]
-			} else if text[0] == '=' {
-				text = text[1:]
-			}
-			level, enabled, known := agent.log_level_parse(text)
+			filter.request = journal.Request_Id(number)
+		case diagnostics_option(arg, "--level"):
+			text, present := diagnostics_option_value(args, &index, "--level")
+			if !present { return diagnostics_bad_usage("--level needs a level name", stderr) }
+			selected_level, enabled, known := agent.log_level_parse(text)
 			if !known { return diagnostics_bad_usage("--level takes debug, info, warn, error, or fatal", stderr) }
 			if !enabled { return diagnostics_bad_usage("--level off would visit nothing; omit it instead", stderr) }
-			selector.level = level
+			level = selected_level
 		case arg == "--include-payloads":
 			include_payloads = true
-		case arg == "--export" || strings.has_prefix(arg, "--export="):
-			text := arg[len("--export"):]
-			if text == "" {
-				index += 1
-				if index >= len(args) { return diagnostics_bad_usage("--export needs a directory", stderr) }
-				text = args[index]
-			} else if text[0] == '=' {
-				text = text[1:]
-			}
-			if text == "" { return diagnostics_bad_usage("--export needs a directory", stderr) }
+		case diagnostics_option(arg, "--export"):
+			text, present := diagnostics_option_value(args, &index, "--export")
+			if !present || text == "" { return diagnostics_bad_usage("--export needs a directory", stderr) }
 			export_directory = text
 		case strings.has_prefix(arg, "-"):
 			return diagnostics_bad_usage(fmt.tprintf("unknown option %s", arg), stderr)
@@ -72,41 +61,38 @@ diagnostics_main :: proc(args: []string, stdout, stderr: io.Writer) -> int {
 	if session_text == "" { return diagnostics_bad_usage("a session id is required", stderr) }
 	session_id, valid := journal.session_id_parse(session_text)
 	if !valid { return diagnostics_bad_usage("that is not a session id", stderr) }
+	filter.session = session_id
+	filter.named = true
 
 	if include_payloads && export_directory == "" {
 		return diagnostics_bad_usage("--include-payloads only applies to --export", stderr)
 	}
 
-	logs_root, directory_err := agent.log_default_directory(context.temp_allocator)
-	if directory_err != nil {
-		fmt.wprintln(stderr, "nabla: the log directory could not be resolved")
+	directory, directory_error := agent.xdg_directory(.State, context.temp_allocator)
+	if directory_error != .None {
+		fmt.wprintln(stderr, "nabla: the state directory could not be resolved")
 		return 1
+	}
+	store: journal.Journal
+	if open_error := journal.open(&store, directory, journal.run_id_create(), .Read_Only); open_error != nil {
+		fmt.wprintf(stderr, "nabla: the journal could not be opened: %s\n", journal.error_text(open_error, context.temp_allocator))
+		return 1
+	}
+	defer if close_error := journal.close(&store); close_error != nil {
+		fmt.wprintf(stderr, "nabla: the journal could not be closed: %s\n", journal.error_text(close_error, context.temp_allocator))
 	}
 
 	durable_ok := true
-	if request_no, selected := selector.request_no.?; selected {
-		durable_ok = diagnostics_report_request(session_id, journal.Request_Id(request_no), stderr)
+	if filter.request != 0 {
+		durable_ok = diagnostics_report_request(&store, session_id, filter.request, stderr)
 	}
 
 	if export_directory != "" {
-		return diagnostics_export(logs_root, session_text, session_id, export_directory, selector, include_payloads, durable_ok, stderr)
+		return diagnostics_export(&store, session_text, export_directory, filter, level, include_payloads, durable_ok, stderr)
 	}
-
-	output: Diagnostics_Output
-	output.writer = stdout
-	summary := agent.log_read_session(logs_root, session_text, &output, diagnostics_visit, selector)
-	diagnostics_report(summary, stderr)
-	if !durable_ok { return 1 }
-	if output.broken {
-		fmt.wprintln(stderr, "nabla: the output stream failed before the read was done")
-		return 1
-	}
-	if diagnostics_incomplete(summary) { return 1 }
-	if summary.records == 0 {
-		fmt.wprintln(stderr, "nabla: no diagnostic records matched")
-		return 1
-	}
-	return 0
+	_, _, stream_okay := diagnostics_stream(&store, filter, level, stdout, false, 0)
+	if !stream_okay { fmt.wprintln(stderr, "nabla: the journal could not be read or the output stream failed") }
+	return stream_okay && durable_ok ? 0 : 1
 }
 
 diagnostics_bad_usage :: proc(problem: string, stderr: io.Writer) -> int {
@@ -115,40 +101,24 @@ diagnostics_bad_usage :: proc(problem: string, stderr: io.Writer) -> int {
 	return 2
 }
 
-// diagnostics_incomplete reports whether the read could not be trusted to be
-// complete: unreadable evidence, uninterpretable records, or a stopped visitor.
-diagnostics_incomplete :: proc(summary: agent.Log_Read_Summary) -> bool {
-	return(
-		summary.cannot_read > 0 ||
-		summary.records_skipped > 0 ||
-		summary.records_unsupported > 0 ||
-		summary.records_foreign > 0 ||
-		summary.partial_tails > 0 ||
-		summary.runs_truncated ||
-		summary.stopped \
-	)
+// diagnostics_option reports whether argument is name, alone or as name=value.
+@(private)
+diagnostics_option :: proc(argument, name: string) -> bool {
+	return argument == name || strings.has_prefix(argument, name) && strings.has_prefix(argument[len(name):], "=")
 }
 
-Diagnostics_Output :: struct {
-	writer: io.Writer,
-	broken: bool,
+// diagnostics_option_value is the option's value: after its "=", or the next
+// argument, which index then skips. False means no value was given.
+@(private)
+diagnostics_option_value :: proc(arguments: []string, index: ^int, name: string) -> (value: string, present: bool) {
+	argument := arguments[index^]
+	if len(argument) > len(name) { return argument[len(name) + 1:], true }
+	index^ += 1
+	if index^ >= len(arguments) { return "", false }
+	return arguments[index^], true
 }
 
-// user_data points to the Diagnostics_Output borrowed by log_read_session.
-diagnostics_visit :: proc(user_data: rawptr, run_id: string, line: string) -> bool {
-	output := cast(^Diagnostics_Output)user_data
-	parts := [2]string{line, "\n"}
-	for part in parts {
-		written, write_error := io.write_string(output.writer, part)
-		if write_error != nil || written != len(part) {
-			output.broken = true
-			return false
-		}
-	}
-	return true
-}
-
-// --- the durable half of --request ------------------------------------------
+// --- request summary ---------------------------------------------------------
 
 DIAGNOSTICS_TIMESTAMP_BYTES :: 32
 
@@ -181,8 +151,10 @@ diagnostics_request_destroy :: proc(request: ^Diagnostics_Request, allocator: me
 	request^ = {}
 }
 
-// The returned summary owns its strings in allocator.
+// diagnostics_request_open summarizes one request from its records in store. The
+// summary owns its strings in allocator.
 diagnostics_request_open :: proc(
+	store: ^journal.Journal,
 	session_id: journal.Session_Id,
 	request_no: journal.Request_Id,
 	allocator := context.allocator,
@@ -190,22 +162,13 @@ diagnostics_request_open :: proc(
 	request: Diagnostics_Request,
 	error: journal.Error,
 ) {
-	directory, directory_err := agent.xdg_directory(.State, context.temp_allocator)
-	if directory_err != .None {
-		return {}, journal.Journal_Error.Storage_Failed
-	}
-	store: journal.Journal
-	journal.open(&store, directory, journal.run_id_create(), .Read_Only, allocator) or_return
-	defer {
-		if close_error := journal.close(&store); close_error != nil && error == nil { error = close_error }
-	}
 	kinds: bit_set[journal.Record_Kind;u128] = {.Request_Sent, .Response_Committed, .Response_Rejected, .Request_Interrupted, .Compaction_Completed}
-	records, _, read_error := journal.read_records(&store, {session = session_id, request = request_no, kinds = kinds}, 0, 0, allocator)
+	records, _, read_error := journal.read_records(store, {session = session_id, request = request_no, kinds = kinds}, 0, 0, allocator)
 	if read_error != nil { return {}, read_error }
 	defer journal.records_destroy(records, allocator)
 	if len(records) == 0 { return {}, journal.Journal_Error.Not_Found }
 	scratch: virtual.Arena
-	if virtual.arena_init_growing(&scratch) != nil { return {}, journal.Journal_Error.Storage_Failed }
+	virtual.arena_init_growing(&scratch) or_return
 	defer virtual.arena_destroy(&scratch)
 	scratch_allocator := virtual.arena_allocator(&scratch)
 	request.request = request_no
@@ -257,11 +220,11 @@ diagnostics_request_open :: proc(
 	return request, nil
 }
 
-// diagnostics_report_request prints journal facts beside diagnostic logs on stdout.
-diagnostics_report_request :: proc(session_id: journal.Session_Id, request_no: journal.Request_Id, stderr: io.Writer) -> bool {
-	row, load_err := diagnostics_request_open(session_id, request_no, context.allocator)
-	if load_err != nil {
-		fmt.wprintf(stderr, "nabla: the stored request could not be read: %s\n", journal.error_text(load_err, context.temp_allocator))
+// diagnostics_report_request prints journal facts on stderr.
+diagnostics_report_request :: proc(store: ^journal.Journal, session_id: journal.Session_Id, request_no: journal.Request_Id, stderr: io.Writer) -> bool {
+	row, load_error := diagnostics_request_open(store, session_id, request_no, context.allocator)
+	if load_error != nil {
+		fmt.wprintf(stderr, "nabla: the stored request could not be read: %s\n", journal.error_text(load_error, context.temp_allocator))
 		return false
 	}
 	defer diagnostics_request_destroy(&row, context.allocator)
@@ -319,17 +282,4 @@ diagnostics_timestamp :: proc(at_ms: i64, buffer: []u8) -> string {
 	datetime, okay := time.time_to_datetime(instant)
 	if !okay { return "unknown" }
 	return fmt.bprintf(buffer, "%04d-%02d-%02dT%02d:%02d:%02dZ", datetime.year, datetime.month, datetime.day, datetime.hour, datetime.minute, datetime.second)
-}
-
-diagnostics_report :: proc(summary: agent.Log_Read_Summary, stderr: io.Writer) {
-	fmt.wprintf(stderr, "nabla: %d record(s), %d run(s) scanned, %d file(s) read", summary.records, summary.runs_scanned, summary.files_read)
-	if summary.cannot_read > 0 { fmt.wprintf(stderr, ", %d unreadable", summary.cannot_read) }
-	if summary.records_skipped > 0 { fmt.wprintf(stderr, ", %d line(s) not records", summary.records_skipped) }
-	if summary.records_unsupported > 0 { fmt.wprintf(stderr, ", %d unsupported version(s)", summary.records_unsupported) }
-	if summary.records_foreign > 0 { fmt.wprintf(stderr, ", %d record(s) from another run", summary.records_foreign) }
-	if summary.gaps > 0 { fmt.wprintf(stderr, ", %d segment(s) removed by retention", summary.gaps) }
-	if summary.partial_tails > 0 { fmt.wprintf(stderr, ", %d incomplete line(s)", summary.partial_tails) }
-	if summary.runs_truncated { fmt.wprint(stderr, ", run scan limit reached") }
-	if summary.stopped { fmt.wprint(stderr, ", read stopped by visitor") }
-	fmt.wprintln(stderr)
 }

@@ -103,7 +103,7 @@ attach_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
 	_ = session_store_close(setup.store, setup.alloc)
 	setup.store = nil
-	_ = run_log_close(setup)
+	run_log_close(setup)
 	delete(setup.workspace, setup.alloc)
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
@@ -1109,15 +1109,11 @@ test_refresh_degrades_to_native_tools_when_a_server_is_unusable :: proc(t: ^test
 	mcp_ok: bool
 	app.setup.mcp, mcp_ok = mcp_runtime_make(servers, context.allocator)
 	if !mcp_ok { testing.fail_now(t, "the MCP runtime could not be created") }
-	_, log_error := agent.log_open(&app.setup.log, {directory = directory, enabled = true, lowest = .Debug})
-	if log_error != nil {
-		testing.fail_now(t, "could not open diagnostics")
-	}
-	defer _ = agent.log_close(&app.setup.log)
-	// The refresh records against whatever logger is installed, so the test installs
-	// the one the run would have installed in its own scope.
+	ring, allocation_error := new(agent.Diag_Ring, app.setup.alloc)
+	if allocation_error != nil { testing.fail_now(t, "could not allocate diagnostics") }
+	defer free(ring, app.setup.alloc)
 	app.setup.log_binding = agent.Log_Binding {
-		sink = &app.setup.log,
+		ring = ring,
 	}
 	context.logger = agent.log_logger(&app.setup.log_binding)
 	// The registry borrows the runtime's bindings, so the session goes first and the
@@ -1140,16 +1136,15 @@ test_refresh_degrades_to_native_tools_when_a_server_is_unusable :: proc(t: ^test
 	_, remote_present := agent.tool_registry_find(&app.setup.session.tools, "broken_read")
 	testing.expect(t, !remote_present, "an unreachable server contributes no tools")
 
-	output_text: strings.Builder
-	defer strings.builder_destroy(&output_text)
-	output := Diagnostics_Output {
-		writer = strings.to_writer(&output_text),
-	}
-	summary := agent.log_read_session(directory, app_session_id_text(app.setup.session.session), &output, diagnostics_visit)
-	testing.expect_value(t, summary.records, 2)
-	testing.expect(t, strings.contains(strings.to_string(output_text), `"installed":true`))
-	testing.expect(t, strings.contains(strings.to_string(output_text), `"unavailable_servers":1`))
-	testing.expect(t, strings.contains(strings.to_string(output_text), `"accepted":0`))
+	entry: agent.Diag_Entry
+	if !testing.expect(t, agent.diag_pop(ring, &entry), "the refresh should report its start") { return }
+	testing.expect(t, strings.contains(string(entry.text[:entry.text_length]), "tools.refresh_started"))
+	if !testing.expect(t, agent.diag_pop(ring, &entry), "the refresh should report its result") { return }
+	text := string(entry.text[:entry.text_length])
+	testing.expect(t, strings.contains(text, "installed=true"))
+	testing.expect(t, strings.contains(text, "unavailable_servers=1"))
+	testing.expect(t, strings.contains(text, "accepted=0"))
+	testing.expect(t, !agent.diag_pop(ring, &entry), "the refresh reports only its start and result")
 }
 
 // With nothing configured, refresh has nothing to do and says nothing.
@@ -1165,48 +1160,19 @@ test_refresh_without_servers_is_silent :: proc(t: ^testing.T) {
 	testing.expect(t, present, "the session keeps the native tools it started with")
 }
 
-// Session_Log_Text collects the records one session left, read back through the
-// public reader, so the lifecycle assertions below hold the reader to what the
-// writer produced rather than to a file layout the test also chose.
-Session_Log_Text :: struct {
-	builder: strings.Builder,
-}
-
-session_log_visit :: proc(user_data: rawptr, _: string, line: string) -> bool {
-	text := cast(^Session_Log_Text)user_data
-	strings.write_string(&text.builder, line)
-	strings.write_byte(&text.builder, '\n')
-	return true
-}
-
-app_session_log_text :: proc(t: ^testing.T, logs_root: string, id: journal.Session_Id) -> strings.Builder {
-	collector := Session_Log_Text {
-		builder = strings.builder_make(context.allocator),
-	}
-	summary := agent.log_read_session(logs_root, app_session_id_text(id), &collector, session_log_visit)
-	testing.expectf(t, summary.cannot_read == 0, "the log should be readable")
-	testing.expectf(t, summary.records_skipped == 0, "every line the reader saw should parse")
-	return collector.builder
-}
-
 @(test)
 test_a_switch_records_the_claim_and_the_release :: proc(t: ^testing.T) {
 	app: App
 	directory := app_session_begin(t, &app)
-	defer app_session_end(&app, directory)
 
-	// The launch's logger is installed in the test's own scope, which is what the
-	// adoption path records against.
-	logs_root, root_err := os.make_directory_temp("", "nabla-app-log-*", context.allocator)
+	ring, allocation_error := new(agent.Diag_Ring, app.setup.alloc)
+	if allocation_error != nil { testing.fail_now(t, "could not allocate diagnostics") }
 	defer {
-		os.remove_all(logs_root)
-		delete(logs_root, context.allocator)
+		app_session_end(&app, directory)
+		free(ring, context.allocator)
 	}
-	_, open_err := agent.log_open(&app.setup.log, {directory = logs_root, enabled = true, lowest = .Info}, app.setup.alloc)
-	if open_err != nil { testing.fail_now(t, "the log could not be opened") }
-	defer _ = agent.log_close(&app.setup.log)
 	app.setup.log_binding = agent.Log_Binding {
-		sink = &app.setup.log,
+		ring = ring,
 	}
 	context.logger = agent.log_logger(&app.setup.log_binding)
 
@@ -1217,40 +1183,28 @@ test_a_switch_records_the_claim_and_the_release :: proc(t: ^testing.T) {
 	second := app.setup.session.session
 	testing.expect(t, first != second, "a new session must be a different session")
 
-	second_builder := app_session_log_text(t, logs_root, second)
-	defer strings.builder_destroy(&second_builder)
-	second_text := strings.to_string(second_builder)
-	testing.expect(t, strings.contains(second_text, `"event":"session.claimed"`), "the new claim is recorded")
-	testing.expect(t, strings.contains(second_text, `"resumed":false`), "a fresh session is not a resume")
-
-	first_builder := app_session_log_text(t, logs_root, first)
-	defer strings.builder_destroy(&first_builder)
-	first_text := strings.to_string(first_builder)
-	testing.expect(t, strings.contains(first_text, `"event":"session.released"`), "the replaced session's release is recorded")
+	claimed, released := false, false
+	entry: agent.Diag_Entry
+	for agent.diag_pop(ring, &entry) {
+		text := string(entry.text[:entry.text_length])
+		if entry.session == second && strings.contains(text, "session.claimed resumed=false") { claimed = true }
+		if entry.session == first && strings.contains(text, "session.released") { released = true }
+	}
+	testing.expect(t, claimed, "the fresh session's claim is recorded")
+	testing.expect(t, released, "the replaced session's release is recorded")
 }
 
 @(test)
 test_the_mcp_lifecycle_records_name_the_server_instance :: proc(t: ^testing.T) {
-	// The process boundary is covered by the mcp stdio harness, which forks a real
-	// server. What this holds is the record contract: the fields a reader depends on
-	// and the names they are written by.
-	logs_root, root_err := os.make_directory_temp("", "nabla-app-mcp-log-*", context.allocator)
-	defer {
-		os.remove_all(logs_root)
-		delete(logs_root, context.allocator)
-	}
-	log_record: agent.Log
-	_, open_err := agent.log_open(&log_record, {directory = logs_root, enabled = true, lowest = .Info}, context.allocator)
-	if open_err != nil { testing.fail_now(t, "the log could not be opened") }
-	defer _ = agent.log_close(&log_record)
-
-	// The refresh records against the session it changes, so the binding carries one
-	// and the reader can find the records again.
+	// The stdio harness covers the process boundary; this checks emitted lifecycle facts.
+	ring, allocation_error := new(agent.Diag_Ring, context.allocator)
+	if allocation_error != nil { testing.fail_now(t, "could not allocate diagnostics") }
+	defer free(ring, context.allocator)
 	session_id, valid := journal.session_id_parse("00112233445566778899aabbccddeeff")
 	if !testing.expect(t, valid) { return }
 	binding := agent.Log_Binding {
-		sink = &log_record,
-		correlation = agent.Log_Correlation{session_id = app_session_id_text(session_id)},
+		ring = ring,
+		correlation = agent.Log_Correlation{session = session_id},
 	}
 	context.logger = agent.log_logger(&binding)
 
@@ -1258,16 +1212,17 @@ test_the_mcp_lifecycle_records_name_the_server_instance :: proc(t: ^testing.T) {
 	log_mcp_negotiated("files", 2, {version = .V2026_07_28, server_name = "stub", server_version = "1", tools_supported = true})
 	log_mcp_stopped("files", 2, "restart")
 
-	builder := app_session_log_text(t, logs_root, session_id)
-	defer strings.builder_destroy(&builder)
-	text := strings.to_string(builder)
-	testing.expect(t, strings.contains(text, `"event":"mcp.started"`), "the launch is recorded")
-	testing.expect(t, strings.contains(text, `"event":"mcp.negotiated"`), "the negotiation is recorded")
-	testing.expect(t, strings.contains(text, `"event":"mcp.stopped"`), "the stop is recorded")
-	testing.expect(t, strings.contains(text, `"server_instance":2`), "the launch counter identifies the instance")
-	testing.expect(t, strings.contains(text, `"revision":"`), "the negotiated revision is recorded")
-	testing.expect(t, strings.contains(text, `"tools_supported":true`), "the capability answer is recorded")
-	testing.expect(t, strings.contains(text, `"reason":"restart"`), "the stop names why it stopped")
+	entry: agent.Diag_Entry
+	if !testing.expect(t, agent.diag_pop(ring, &entry), "the start is recorded") { return }
+	testing.expect_value(t, entry.session, session_id)
+	testing.expect(t, strings.contains(string(entry.text[:entry.text_length]), "mcp.started server_id=files server_instance=2"))
+	if !testing.expect(t, agent.diag_pop(ring, &entry), "the negotiation is recorded") { return }
+	text := string(entry.text[:entry.text_length])
+	testing.expect(t, strings.contains(text, "mcp.negotiated"))
+	testing.expect(t, strings.contains(text, "revision="))
+	testing.expect(t, strings.contains(text, "tools_supported=true"))
+	if !testing.expect(t, agent.diag_pop(ring, &entry), "the stop is recorded") { return }
+	testing.expect(t, strings.contains(string(entry.text[:entry.text_length]), "mcp.stopped server_id=files server_instance=2 reason=restart"))
 }
 
 @(test)

@@ -48,7 +48,7 @@ Subagent :: struct {
 	run:                          journal.Run_Id, // the run the subagent's own journal writes under
 	disable_project_instructions: bool,
 	background:                   bool,
-	log_sink:                     ^Log,
+	log_sink:                     ^Diag_Ring,
 	team:                         ^Agent_Team, // the orchestrator's, which outlives every member
 	allocator:                    mem.Allocator,
 
@@ -368,12 +368,8 @@ subagent_select :: proc(
 // subagent_log_sink is where the calling thread's diagnostics go, so a subagent's thread
 // writes to the same place.
 @(private)
-subagent_log_sink :: proc() -> ^Log {
-	active := context.logger
-	if active.procedure != log_procedure { return nil }
-	binding := cast(^Log_Binding)active.data
-	if binding == nil { return nil }
-	return binding.sink
+subagent_log_sink :: proc() -> ^Diag_Ring {
+	return log_active_ring()
 }
 
 // subagent_launch starts a background subagent on a thread of its own. The watched signals are
@@ -452,7 +448,7 @@ subagent_fail :: proc(member: ^Subagent, status: Subagent_Status, reason: string
 // thread and reaches nothing of the orchestrator's except the team.
 subagent_run :: proc(member: ^Subagent) {
 	binding := Log_Binding {
-		sink = member.log_sink,
+		ring = member.log_sink,
 	}
 	previous_logger := context.logger
 	context.logger = log_logger(&binding)

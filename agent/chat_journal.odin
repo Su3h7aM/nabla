@@ -33,6 +33,8 @@ chat_node :: proc(chat: ^Chat_Session, kind: journal.Node_Kind, payload: $Payloa
 // them proceeds. A failure stops the session; what names the step for the message.
 @(require_results)
 chat_commit :: proc(chat: ^Chat_Session, what: string) -> bool {
+	// Diagnostics waiting in the ring ride in the same transaction.
+	diag_drain(log_active_ring(), chat.store)
 	if _, error := journal.commit(chat.store); error != nil {
 		chat_session_record_failure(chat, what, error)
 		return false

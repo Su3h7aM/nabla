@@ -142,9 +142,6 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	// A stop that arrived while this item was queued abandons it: shutdown does
 	// not start new work.
 	if runtime_stopping(app) { return }
-	// A sink that failed during the previous item is reported once, here, where
-	// the snapshot can carry it.
-	run_log_failure(&app.setup, &app.run.log_failure_reported)
 	// Catalog metadata can arrive while the worker is idle or while a turn is in
 	// progress. Apply it before every command; request boundaries do the same for
 	// multi-request turns.
@@ -228,6 +225,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	}
 	if rows_dirty { session_refresh_rows(app) }
 	refresh_status(app)
+	run_log_flush(&app.setup)
 }
 
 // run_accepted_turn runs the turn the session just accepted.

@@ -323,6 +323,8 @@ acp_run_work :: proc(server: ^Acp_Server, work: Acp_Work) {
 	// to the turn that just ended; a client that cancels a finished turn is ignored.
 	agent.turn_control_clear(&server.app.run.control)
 	acp_queue_remove(server)
+	// The worker owns the journal, so the diagnostics commit waits for no reply.
+	run_log_flush(&server.app.setup)
 }
 
 // --- opening a session -------------------------------------------------------

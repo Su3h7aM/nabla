@@ -9,8 +9,6 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 
-import "nabla:agent"
-
 // A thread that never returns is what shutdown cannot wait for. These tests hold both
 // halves of that: a thread that retires is released, and one that does not is reported
 // instead of waited on. The thread is blocked on its own condition rather than leaked, so
@@ -80,7 +78,7 @@ shutdown_test_release :: proc(t: ^testing.T, state: ^Shutdown_Test_Thread, worke
 test_join_retiring_reports_a_thread_that_never_returns :: proc(t: ^testing.T) {
 	fixture: Log_Fixture
 	log_fixture_open(t, &fixture)
-	defer log_fixture_close(t, &fixture)
+	defer log_fixture_close(&fixture)
 	context.logger = fixture.logger
 
 	state := shutdown_test_state()
@@ -90,11 +88,9 @@ test_join_retiring_reports_a_thread_that_never_returns :: proc(t: ^testing.T) {
 	testing.expect(t, !join_retiring(worker, "nabla-test-stuck", 20 * time.Millisecond), "a thread that never returns must not be reported as retired")
 	// A thread that did not retire is left alone: thread.destroy would join it here.
 	testing.expect(t, !thread.is_done(worker), "the thread should still be running")
-	_ = agent.log_close(&fixture.sink)
 	records := log_fixture_records(&fixture)
-	if len(records) == 0 { testing.fail_now(t, "the report reached no log file") }
-	testing.expectf(t, strings.contains(records, `"event":"runtime.thread_unretired"`), "no unretired-thread record: %s", records)
-	testing.expectf(t, strings.contains(records, `"thread":"nabla-test-stuck"`), "the record does not name the thread: %s", records)
+	testing.expectf(t, strings.contains(records, "runtime.thread_unretired"), "no unretired-thread record: %s", records)
+	testing.expectf(t, strings.contains(records, "thread=nabla-test-stuck"), "the record does not name the thread: %s", records)
 
 	shutdown_test_release(t, state, worker, "nabla-test-stuck")
 }
@@ -113,7 +109,7 @@ test_join_retiring_releases_a_thread_that_returns :: proc(t: ^testing.T) {
 test_app_teardown_abandons_its_release_path_for_a_stuck_worker :: proc(t: ^testing.T) {
 	fixture: Log_Fixture
 	log_fixture_open(t, &fixture)
-	defer log_fixture_close(t, &fixture)
+	defer log_fixture_close(&fixture)
 	context.logger = fixture.logger
 
 	app := App{}
@@ -123,11 +119,9 @@ test_app_teardown_abandons_its_release_path_for_a_stuck_worker :: proc(t: ^testi
 	app_teardown(&app, 20 * time.Millisecond)
 
 	testing.expect(t, app.run.worker != nil, "a worker that did not retire must not be claimed retired")
-	_ = agent.log_close(&fixture.sink)
 	records := log_fixture_records(&fixture)
-	if len(records) == 0 { testing.fail_now(t, "the report reached no log file") }
-	testing.expectf(t, strings.contains(records, `"event":"runtime.thread_unretired"`), "no unretired-thread record: %s", records)
-	testing.expectf(t, strings.contains(records, `"event":"runtime.teardown_abandoned"`), "the release path was abandoned silently: %s", records)
+	testing.expectf(t, strings.contains(records, "runtime.thread_unretired"), "no unretired-thread record: %s", records)
+	testing.expectf(t, strings.contains(records, "runtime.teardown_abandoned"), "the release path was abandoned silently: %s", records)
 
 	// The teardown left the worker to the process; the test releases and retires it so the
 	// suite holds no thread of its own.

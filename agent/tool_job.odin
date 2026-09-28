@@ -482,8 +482,8 @@ tool_job_logging :: proc(job: ^Tool_Job, chat: ^Chat_Session) -> Log_Binding {
 	active := context.logger
 	if active.procedure != log_procedure { return {} }
 	source := cast(^Log_Binding)active.data
-	if source == nil || source.sink == nil { return {} }
-	return Log_Binding{sink = source.sink, correlation = log_correlation_for_call(chat, job.call_id)}
+	if source.ring == nil { return {} }
+	return Log_Binding{ring = source.ring, correlation = log_correlation_for_call(chat, job.call_id)}
 }
 
 // --- decisions -----------------------------------------------------------------
