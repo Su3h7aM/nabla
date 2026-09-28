@@ -483,19 +483,20 @@ chat_title_from_prompt :: proc(prompt: string, allocator := context.allocator) -
 // turn is not allowed to continue from memory: the record did not land, and
 // carrying on would let the conversation diverge from what was stored.
 //
-// The latch is deliberately not conditioned on the error kind. A write that
-// failed for any reason leaves the record's state in question, and separating
-// the kinds here would buy a more permissive policy at the cost of having to
-// reason about which failures are safe to continue past.
+// The one kind that does not latch is a database another writer held past the busy
+// timeout: nothing was written and the journal keeps the records for its next
+// commit, so only this turn ends and the next one may go on. Every other failure
+// leaves the record's state in question and stops the session's writes.
 chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, error: journal.Error) {
 	detail := journal.error_text(error, chat.allocator)
 	defer delete(detail, chat.allocator)
-	chat_session_fail(chat, what, detail)
+	chat_session_fail(chat, what, detail, latch = !journal.error_is_busy(error))
 }
 
 // chat_session_fail is the same stop for a failure the journal did not report,
-// such as a snapshot the harness could not build.
-chat_session_fail :: proc(chat: ^Chat_Session, what: string, detail := "") {
+// such as a snapshot the harness could not build. latch stops the session's writes
+// for good; without it only the turn ends.
+chat_session_fail :: proc(chat: ^Chat_Session, what: string, detail := "", latch := true) {
 	delete(chat.last_error, chat.allocator)
 	if detail == "" {
 		chat.last_error = chat_clone_string(what, chat.allocator)
@@ -511,7 +512,7 @@ chat_session_fail :: proc(chat: ^Chat_Session, what: string, detail := "") {
 	fields := [2]Log_Field{{key = "operation", value = what}, {key = "detail_bytes", value = i64(len(detail))}}
 	log_emit({level = .Error, category = .Storage, event = "storage.failed", fields = fields[:]})
 	chat.active_failed = true
-	chat.storage_failed = true
+	if latch { chat.storage_failed = true }
 	chat.state = .Finalizing
 }
 

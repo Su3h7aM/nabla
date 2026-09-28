@@ -488,7 +488,7 @@ Records and nodes are journal-owned plain data (strings, integers, enums). `agen
 - `data` is encoded from a typed payload struct declared in `agent/journal`, one per kind, named after it (`Tool_Completed` for `tool.completed`). Records and nodes are copied into a batch arena at append, so the caller's memory is borrowed only for the call.
 - The journal allocates `Node_Id` and `Branch_Id` at append, and turn, request, and call ids through `next_turn`, `next_request`, and `next_call`, all from the counters loaded by `claim`, so the owner continues numbering after a restart.
 - Each node append also writes a `node.committed` record in the same transaction, and the node's `seq` is that record's seq. Branches (`branch.created`) and sessions (`session.created`) follow the same rule, so the records table is the one global order.
-- `append_record`, `append_node`, `append_branch`, and `put_artifact` return no error. An encoding or allocation failure latches in `journal.failure` and is returned by the next `commit`. A failed commit rolls back and latches its cause the same way: the session is `Storage_Failed`, every later append is dropped, and every later commit returns that cause. Appending through a read-only journal or for a session the journal did not claim is a programming error and asserts.
+- `append_record`, `append_node`, `append_branch`, and `put_artifact` return no error. An encoding or allocation failure latches in `journal.failure` and is returned by the next `commit`. A failed commit rolls back and latches its cause the same way: the session is `Storage_Failed`, every later append is dropped, and every later commit returns that cause. The exception is another writer holding the database past the busy timeout (`error_is_busy`): nothing was written, the records stay pending for the next commit, and only the turn that needed the commit ends. Appending through a read-only journal or for a session the journal did not claim is a programming error and asserts.
 - Corrupt or unreadable data returns `.Corrupt`, and the journal keeps the session and seq of the offending row in `journal.corrupt` for the message.
 
 ### 8.2 Schema
@@ -1101,7 +1101,6 @@ These mechanisms exist in the code today and are replaced by the named target. D
 | provider attempts and compaction joined without a deadline on stop and teardown | abandonment after `STOP_PATIENCE` (section 7.2) |
 | a stream that breaks after an accepted response head is resent | a `Notice` (section 11.3) |
 | invalid request, payload too large, and content policy end the turn | one `Notice`, then end on a repeat (section 2.2) |
-| harness caps: Code Mode print log 8 KiB, Lua conversion 256 and 16,384 nodes, 32 child summaries, ACP frames 10 MB, MCP messages 4 MiB and depth 64, MCP discovery 32 pages of 1,024 tools, skill files 256 KiB | no harness caps; whole results kept, then previewed (sections 2.1, 14.3) |
 | a result rendered by `tool_result_of` where the executor built it | typed output kept until commit, rendered once at commit (section 14.3) |
 | catalog replaced under a mutex and the old one destroyed; selection reapplied mid-turn | immutable reference-counted snapshots, kept by admitted work (section 13.3) |
 | request preparation only in `runtime.message` | a structured `request.prepared` record (section 11.3) |
