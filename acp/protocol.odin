@@ -123,11 +123,6 @@ envelope_error_text :: proc(err: Envelope_Error) -> string {
 	return "the message could not be read"
 }
 
-// MAX_BATCH_ENTRIES bounds how many requests one batch line may carry. The frame
-// itself is already size-bounded; this bounds the dispatch work one line can cause.
-// A batch carries a handful of requests in practice.
-MAX_BATCH_ENTRIES :: 1024
-
 // parse_batch recognizes a JSON-RPC batch without changing the single-envelope
 // parser. Individual entries are returned as text so the normal dispatcher owns
 // their validation and response rules.
@@ -138,7 +133,8 @@ parse_batch :: proc(payload: string, allocator := context.allocator) -> (frames:
 	if parse_err != nil { return {}, true, .Invalid_JSON }
 	defer json.destroy_value(value, allocator)
 	items, is_array := value.(json.Array)
-	if !is_array || len(items) == 0 || len(items) > MAX_BATCH_ENTRIES { return {}, true, .Invalid_Envelope }
+	// JSON-RPC 2.0 section 6 requires a batch to be an array with at least one value.
+	if !is_array || len(items) == 0 { return {}, true, .Invalid_Envelope }
 	batch, allocation_error := make([dynamic]string, 0, len(items), allocator)
 	if allocation_error != nil { return {}, true, .Allocation }
 	frames = batch

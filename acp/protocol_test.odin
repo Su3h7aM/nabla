@@ -65,17 +65,23 @@ test_batch_parser_preserves_entries_and_rejects_empty_batches :: proc(t: ^testin
 }
 
 @(test)
-test_batch_parser_rejects_too_many_entries :: proc(t: ^testing.T) {
+test_batch_parser_accepts_many_entries :: proc(t: ^testing.T) {
+	MANY_ENTRIES :: 4096
 	builder, builder_error := strings.builder_make(context.allocator)
 	if builder_error != nil { testing.fail_now(t, "the batch could not be built") }
 	defer strings.builder_destroy(&builder)
 	strings.write_byte(&builder, '[')
-	for i := 0; i <= MAX_BATCH_ENTRIES; i += 1 {
+	for i in 0 ..< MANY_ENTRIES {
 		if i > 0 { strings.write_byte(&builder, ',') }
 		strings.write_string(&builder, `{"jsonrpc":"2.0","method":"session/cancel"}`)
 	}
 	strings.write_byte(&builder, ']')
-	_, is_batch, batch_err := parse_batch(strings.to_string(builder), context.allocator)
+	frames, is_batch, batch_err := parse_batch(strings.to_string(builder), context.allocator)
+	defer {
+		for frame in frames { delete(frame, context.allocator) }
+		delete(frames)
+	}
 	testing.expect(t, is_batch)
-	testing.expect_value(t, batch_err, Envelope_Error.Invalid_Envelope)
+	testing.expect_value(t, batch_err, Envelope_Error.None)
+	testing.expect_value(t, len(frames), MANY_ENTRIES)
 }
