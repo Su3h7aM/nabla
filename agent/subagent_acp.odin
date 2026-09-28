@@ -29,9 +29,11 @@ Subagent_Program :: struct {
 	parent_levels: []string,
 }
 
-// SUBAGENT_ACP_STDERR_BYTES is how much of the end of an agent's stderr a failure report
-// quotes. It sizes a diagnostic, not the agent's work.
-SUBAGENT_ACP_STDERR_BYTES :: 4096
+// SUBAGENT_ACP_STDERR_TAIL_BYTES is how much of an agent's standard error the
+// connection keeps. It sizes the memory for a diagnostic stream: an ACP agent can live
+// for a whole session and write without end, so only its most recent bytes are held. It
+// caps nothing the agent exchanges.
+SUBAGENT_ACP_STDERR_TAIL_BYTES :: 32 * 1024
 
 SUBAGENT_ACP_READ_BYTES :: 16 * 1024
 
@@ -646,8 +648,7 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 			_ = os.close(connection.errors)
 			connection.errors = nil
 		} else if status == .Ok {
-			append(&connection.stderr_tail, ..buffer[:taken])
-			if extra := len(connection.stderr_tail) - SUBAGENT_ACP_STDERR_BYTES; extra > 0 { remove_range(&connection.stderr_tail, 0, extra) }
+			acp_stderr_retain(&connection.stderr_tail, buffer[:taken])
 		}
 	}
 	// What the agent wrote before it exited is read first; its exit counts once nothing is
@@ -674,6 +675,21 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 		return fmt.tprintf("the agent sent a message that could not be read: %s", acp.frame_error_text(frame_error))
 	}
 	return ""
+}
+
+// acp_stderr_retain adds what the agent just wrote and keeps only the most recent
+// SUBAGENT_ACP_STDERR_TAIL_BYTES of it. The cut is moved to the next rune start, so the
+// retained text stays valid UTF-8.
+@(private)
+acp_stderr_retain :: proc(tail: ^[dynamic]u8, data: []u8) {
+	// A tail that cannot grow keeps what it has; it is diagnostic only.
+	if _, append_error := append(tail, ..data); append_error != nil { return }
+	excess := len(tail) - SUBAGENT_ACP_STDERR_TAIL_BYTES
+	if excess <= 0 { return }
+	// A byte with the top bits 10 is the continuation of a rune that the cut would
+	// otherwise split, so it is dropped along with the bytes before it.
+	for excess < len(tail) && tail[excess] & 0b1100_0000 == 0b1000_0000 { excess += 1 }
+	remove_range(tail, 0, excess)
 }
 
 // acp_ended says the agent went away, with the end of what it wrote to stderr.

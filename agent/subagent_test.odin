@@ -325,7 +325,8 @@ test_stopping_a_background_subagent_reports_to_its_parent :: proc(test: ^testing
 
 // SUBAGENT_TEST_ACP_AGENT is an ACP version 2 agent. It answers each request by its method,
 // narrates before a tool call, asks permission for the call, and fails when its prompt lacks
-// the instruction or the task.
+// the instruction or the task, flooding standard error before it does.
+// SUBAGENT_TEST_ACP_NOISE_BYTES is replaced with that flood's size.
 SUBAGENT_TEST_ACP_AGENT :: `#!/bin/sh
 update() { printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":%s}}\n' "$1"; }
 while IFS= read -r line; do
@@ -336,7 +337,7 @@ while IFS= read -r line; do
 	*'"method":"session/new"'*)
 		printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id" ;;
 	*'"method":"session/prompt"'*)
-		case "$line" in *'Answer in one word.'*'six times seven'*) ;; *) echo "prompt lost its instruction or task" >&2; exit 1 ;; esac
+		case "$line" in *'Answer in one word.'*'six times seven'*) ;; *) printf 'the beginning\n' 1>&2; head -c SUBAGENT_TEST_ACP_NOISE_BYTES /dev/zero | tr '\000' x 1>&2; echo "prompt lost its instruction or task" >&2; exit 1 ;; esac
 		printf '{"jsonrpc":"2.0","id":%s,"result":{"messageId":"u1"}}\n' "$id"
 		update '{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"Let me compute."}}'
 		update '{"sessionUpdate":"tool_call_update","toolCallId":"c1","title":"multiply","status":"pending"}'
@@ -350,8 +351,21 @@ while IFS= read -r line; do
 done
 `
 
+// subagent_test_acp_agent is SUBAGENT_TEST_ACP_AGENT whose standard-error flood is twice
+// what the connection retains, so a report can only hold the end of it.
+subagent_test_acp_agent :: proc() -> string {
+	text, _ := strings.replace(
+		SUBAGENT_TEST_ACP_AGENT,
+		"SUBAGENT_TEST_ACP_NOISE_BYTES",
+		fmt.tprintf("%d", SUBAGENT_ACP_STDERR_TAIL_BYTES * 2),
+		1,
+		context.temp_allocator,
+	)
+	return text
+}
+
 // A subagent can be any configured program that speaks ACP. Its answer is its last message, and a failure
-// quotes what the program wrote to stderr.
+// quotes the end of what the program wrote to stderr, and only that.
 @(test)
 test_an_acp_program_answers_as_a_subagent :: proc(test: ^testing.T) {
 	fixture: Chat_Test
@@ -364,7 +378,7 @@ test_an_acp_program_answers_as_a_subagent :: proc(test: ^testing.T) {
 		delete(directory)
 	}
 	script := strings.concatenate({directory, "/agent"}, context.temp_allocator)
-	if os.write_entire_file(script, transmute([]u8)string(SUBAGENT_TEST_ACP_AGENT)) != nil { testing.fail_now(test, "could not write the agent") }
+	if os.write_entire_file(script, transmute([]u8)subagent_test_acp_agent()) != nil { testing.fail_now(test, "could not write the agent") }
 	if os.chmod(script, {.Read_User, .Write_User, .Execute_User}) != nil { testing.fail_now(test, "could not make the agent executable") }
 	agents := []ACP_Agent_Config{{name = "fake", command = script}}
 	fixture.chat.acp_agents = agents
@@ -383,6 +397,7 @@ test_an_acp_program_answers_as_a_subagent :: proc(test: ^testing.T) {
 	defer tool_result_destroy(&failed)
 	testing.expect_value(test, failed.outcome, journal.Tool_Outcome.Tool_Failed)
 	testing.expect(test, strings.contains(failed.content, "prompt lost its instruction or task"), failed.content)
+	testing.expect(test, !strings.contains(failed.content, "the beginning"), failed.content)
 }
 
 // Effort left out steps one level down, and the lowest level stays where it is. Across models
