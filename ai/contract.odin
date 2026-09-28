@@ -346,19 +346,15 @@ Provider_Stream_Phase :: enum {
 	Failed,
 }
 
-// One payload can carry text, usage, and completion together. Three slots are
-// enough for the current event set; tool calls stay inside completion.
-PROVIDER_STREAM_BATCH_SLOTS :: 3
 Provider_Stream_State :: struct {
 	API:            API_Kind,
 	Phase:          Provider_Stream_Phase,
 	Tool_Fragments: [dynamic]Provider_Tool_Fragment, // owned assembly slots,
 	Allocator:      mem.Allocator,
-	// Operation-owned staging for one decoded payload. Drained before the
-	// next payload is consumed; undrained events are destroyed with the
-	// stream.
-	Batch:          [PROVIDER_STREAM_BATCH_SLOTS]Provider_Event,
-	Batch_Count:    int,
+	// Operation-owned staging for one decoded payload. It grows to hold every
+	// event the payload carried, is drained before the next payload is
+	// consumed, and its undrained events are destroyed with the stream.
+	Batch:          [dynamic]Provider_Event,
 }
 
 Provider_Tool_Fragment :: struct {
@@ -381,20 +377,20 @@ Provider_Stream_Start :: proc(api: API_Kind, allocator := context.allocator) -> 
 }
 
 provider_stream_batch_clear :: proc(state: ^Provider_Stream_State) {
-	for i in 0 ..< state.Batch_Count { Provider_Event_Destroy(&state.Batch[i], state.Allocator) }
-	state.Batch_Count = 0
-	for i in 0 ..< PROVIDER_STREAM_BATCH_SLOTS { state.Batch[i] = nil }
+	for &event in state.Batch { Provider_Event_Destroy(&event, state.Allocator) }
+	clear(&state.Batch)
 }
 
+// provider_stream_push stages one event under the stream's ownership. One payload
+// decides how many events it carries, and the batch holds them all.
 provider_stream_push :: proc(state: ^Provider_Stream_State, event: Provider_Event) {
-	assert(state.Batch_Count < PROVIDER_STREAM_BATCH_SLOTS, "provider event batch overflow")
-	if state.Batch_Count >= PROVIDER_STREAM_BATCH_SLOTS {
+	if state.Batch.allocator.procedure == nil { state.Batch.allocator = state.Allocator }
+	if _, append_error := append(&state.Batch, event); append_error != nil {
+		// An event that cannot be staged is lost, so the stream cannot be trusted.
 		owned := event
 		Provider_Event_Destroy(&owned, state.Allocator)
-		return
+		state.Phase = .Failed
 	}
-	state.Batch[state.Batch_Count] = event
-	state.Batch_Count += 1
 }
 
 // Discard staged success events and expose one error. A malformed payload
@@ -412,19 +408,17 @@ provider_stream_fail :: proc(
 	return stream_err
 }
 
-// Transfers one owned event to the caller and clears its slot.
+// Transfers one owned event to the caller and removes it from the batch.
 Provider_Stream_Drain :: proc(state: ^Provider_Stream_State) -> (Provider_Event, bool) {
-	if state == nil || state.Batch_Count <= 0 { return nil, false }
-	event := state.Batch[0]
-	for i in 0 ..< state.Batch_Count - 1 { state.Batch[i] = state.Batch[i + 1] }
-	state.Batch_Count -= 1
-	state.Batch[state.Batch_Count] = nil
-	return event, true
+	if state == nil { return nil, false }
+	return pop_front_safe(&state.Batch)
 }
 
 Provider_Stream_Destroy :: proc(state: ^Provider_Stream_State) {
 	if state == nil { return }
 	provider_stream_batch_clear(state)
+	delete(state.Batch)
+	state.Batch = nil
 	for &fragment in state.Tool_Fragments {
 		if fragment.Item_ID != "" { delete(fragment.Item_ID, state.Allocator) }
 		if fragment.ID != "" { delete(fragment.ID, state.Allocator) }
@@ -529,7 +523,7 @@ Provider_Encode_Request_Reusing :: proc(
 
 Provider_Consume_Event_JSON :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil { return .Invalid_State }
-	if state^.Batch_Count > 0 { return .Batch_Not_Drained }
+	if len(state^.Batch) > 0 { return .Batch_Not_Drained }
 	if state^.API != .OpenAI_Responses {
 		state^.Phase = .Failed
 		return provider_stream_fail(state, .Invalid_Data, "API family has no JSON event transport", .Unsupported_API)
@@ -539,7 +533,7 @@ Provider_Consume_Event_JSON :: proc(payload: string, state: ^Provider_Stream_Sta
 
 Provider_Consume_SSE_Data :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil { return .Invalid_State }
-	if state^.Batch_Count > 0 { return .Batch_Not_Drained }
+	if len(state^.Batch) > 0 { return .Batch_Not_Drained }
 	switch state^.API {
 	case .OpenAI_Chat_Completions:
 		return openai_chat_consume_sse_data(payload, state)

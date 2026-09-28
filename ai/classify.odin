@@ -96,18 +96,11 @@ provider_rejection_destroy :: proc(rejection: ^Provider_Rejection, allocator: me
 	rejection^ = {}
 }
 
-// PROVIDER_MAX_CODE_BYTES and PROVIDER_MAX_MESSAGE_BYTES bound the provider text
-// this package keeps. A code is a token, so the bound is generous for one; a
-// message is prose quoted from a peer, and what is kept of it is bounded so that a
-// broken endpoint cannot decide how much a failure costs. What was cut is still a
-// value, not an absence: the caller's record shows the text it has.
-PROVIDER_MAX_CODE_BYTES :: 256
-PROVIDER_MAX_MESSAGE_BYTES :: 2048
-
 // provider_bounded_text clones at most limit bytes of a peer's text, ending on a
 // character boundary: half a character is not a string a JSON writer or a log line
 // can carry. Bytes that are not valid UTF-8 at all are copied as they are, because
-// a peer's text is evidence and not something to repair.
+// a peer's text is evidence and not something to repair. The caller owns the clone
+// and picks how much of the text it keeps.
 provider_bounded_text :: proc(value: string, limit: int, allocator: mem.Allocator) -> string {
 	if len(value) <= limit { return strings.clone(value, allocator) }
 	bytes := transmute([]u8)value
@@ -336,14 +329,6 @@ provider_retry_directive :: proc(api: API_Kind, headers: http.Headers) -> Provid
 	return .Unspecified
 }
 
-// PROVIDER_RETRY_AFTER_TOO_LONG is the delay reported for a value that is valid
-// but longer than any policy should wait for. It is a reason to stop and say what
-// the provider asked for, never a delay to sleep for: a ten-minute instruction is
-// not shortened to a shorter wait and answered early.
-PROVIDER_RETRY_AFTER_TOO_LONG :: 365 * 24 * time.Hour
-
-PROVIDER_RETRY_AFTER_MAX_SECONDS :: i64(PROVIDER_RETRY_AFTER_TOO_LONG / time.Second)
-
 // provider_retry_after reads the delay a provider asked for.
 //
 // RFC 9110 10.2.3: the field is either delay-seconds (1*DIGIT, a nonnegative
@@ -352,7 +337,10 @@ PROVIDER_RETRY_AFTER_MAX_SECONDS :: i64(PROVIDER_RETRY_AFTER_TOO_LONG / time.Sec
 // from repeated fields: the field is not a list, so a comma means the peer
 // sent something that is not an instruction this client can read. Digits are
 // scanned in full no matter how many there are, without allocating a big
-// integer; leading zeros do not overflow. A date is
+// integer; leading zeros do not overflow. A delay the provider stated is
+// returned in full: only a value past what a Duration can hold, which is that
+// type's own range and not a policy of this client, becomes the longest delay
+// it has, because a caller that read it as silence would send again. A date is
 // converted once, here at receipt, against the wall clock; the wait itself runs on
 // a monotonic deadline, so the clock moving afterwards cannot shorten it.
 provider_retry_after :: proc(value: string) -> Maybe(time.Duration) {
@@ -372,15 +360,12 @@ provider_retry_after :: proc(value: string) -> Maybe(time.Duration) {
 		for c in text {
 			scaled, mul_overflow := intrinsics.overflow_mul(seconds, 10)
 			next, add_overflow := intrinsics.overflow_add(scaled, i64(c - '0'))
-			// A delay past the policy bound is a reason to stop, and it is reported
-			// as the sentinel rather than as no delay at all: the provider did ask
-			// for something, and a caller that read that as silence would send again.
-			if mul_overflow || add_overflow || next > PROVIDER_RETRY_AFTER_MAX_SECONDS {
-				return PROVIDER_RETRY_AFTER_TOO_LONG
-			}
+			if mul_overflow || add_overflow { return max(time.Duration) }
 			seconds = next
 		}
-		return time.Duration(seconds) * time.Second
+		nanoseconds, mul_overflow := intrinsics.overflow_mul(seconds, i64(time.Second))
+		if mul_overflow { return max(time.Duration) }
+		return time.Duration(nanoseconds)
 	}
 
 	// An HTTP-date, and only in the three formats RFC 9110 5.6.1 defines. An
@@ -388,7 +373,6 @@ provider_retry_after :: proc(value: string) -> Maybe(time.Duration) {
 	if at, parsed := http.date_parse(text); parsed {
 		delay := time.diff(time.now(), at)
 		if delay <= 0 { return time.Duration(0) }
-		if delay > PROVIDER_RETRY_AFTER_TOO_LONG { return PROVIDER_RETRY_AFTER_TOO_LONG }
 		return delay
 	}
 	return nil

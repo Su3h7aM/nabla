@@ -166,17 +166,18 @@ test_retry_after :: proc(t: ^testing.T) {
 	// An RFC 3339 timestamp is not an HTTP date.
 	expect_no_delay(t, "2030-01-01T00:00:00Z")
 
-	// Neither form has a length bound: a long digit string is scanned in full,
-	// and one past any policy still asks for a delay rather than asking for
-	// nothing, because a caller that read that as silence would send again.
-	expect_out_of_policy(t, strings.repeat("1", 300, context.temp_allocator))
+	// Neither form has a length bound: a long digit string is scanned in full.
+	// A delay the provider stated is honored however long it is, and one past
+	// what a Duration can carry is reported as the longest delay that type has
+	// rather than as no delay at all, because a caller that read it as silence
+	// would send again.
+	expect_delay(t, "31536001", 365 * 24 * time.Hour + time.Second)
+	expect_max_delay(t, strings.repeat("1", 300, context.temp_allocator))
 	// Leading zeros do not overflow: this is seven seconds, not a huge one.
 	expect_delay(t, strings.concatenate({strings.repeat("0", 300, context.temp_allocator), "7"}, context.temp_allocator), 7 * time.Second)
 
-	// Valid but beyond any policy: reported as out of policy rather than as absent,
-	// because a caller that read it as silence would send again.
-	expect_out_of_policy(t, "99999999999999999999")
-	expect_out_of_policy(t, "31536001")
+	// Larger than a Duration, in either direction: the longest delay there is.
+	expect_max_delay(t, "99999999999999999999")
 }
 
 expect_delay :: proc(t: ^testing.T, value: string, expected: time.Duration) {
@@ -195,8 +196,8 @@ expect_no_delay :: proc(t: ^testing.T, value: string) {
 	testing.expectf(t, provider_retry_after(value) == nil, "%q should ask for no delay", value)
 }
 
-expect_out_of_policy :: proc(t: ^testing.T, value: string) {
+expect_max_delay :: proc(t: ^testing.T, value: string) {
 	delay, present := provider_retry_after(value).?
 	if !testing.expectf(t, present, "%q should ask for a delay", value) { return }
-	testing.expectf(t, delay == PROVIDER_RETRY_AFTER_TOO_LONG, "%q: expected the out-of-policy delay, got %v", value, delay)
+	testing.expectf(t, delay == max(time.Duration), "%q: expected the longest delay, got %v", value, delay)
 }

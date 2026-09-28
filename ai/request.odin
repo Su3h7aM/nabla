@@ -549,7 +549,7 @@ provider_response_head :: proc(user_data: rawptr, head: client.Response_Head, he
 	}
 	if name := provider_request_id_header(state.api); name != "" {
 		if value, present := http.headers_get_unsafe(headers, name); present {
-			state.response_head.provider_request_id = provider_bounded_text(value, PROVIDER_MAX_CODE_BYTES, state.allocator)
+			state.response_head.provider_request_id = strings.clone(value, state.allocator)
 		}
 	}
 	if value, present := http.headers_get_unsafe(headers, "retry-after"); present {
@@ -814,8 +814,8 @@ provider_accept_event :: proc(state: ^Provider_Request_Stream_State, event: Prov
 		// released once the caller's callback returns.
 		if !provider_rejection_present(state.rejection) {
 			state.rejection = Provider_Rejection {
-				code    = provider_bounded_text(value.Provider_Code, PROVIDER_MAX_CODE_BYTES, state.allocator),
-				message = provider_bounded_text(value.Message, PROVIDER_MAX_MESSAGE_BYTES, state.allocator),
+				code    = strings.clone(value.Provider_Code, state.allocator),
+				message = strings.clone(value.Message, state.allocator),
 			}
 		}
 		if state.failure_detail == "" { state.failure_detail = strings.clone(value.Message, state.allocator) }

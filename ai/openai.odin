@@ -5,8 +5,11 @@ import "core:fmt"
 import "core:strings"
 
 // Shared OpenAI helpers used by the Chat Completions and Responses adapters.
-OPENAI_ERROR_MESSAGE_LIMIT :: 1024
-OPENAI_TOOL_ARGS_BYTES :: 64 * 1024
+
+// OPENAI_TOOL_SCHEMA_DEPTH is the deepest JSON document the schema validator and
+// the argument reader accept. Both walk nested values by recursing, so this is
+// the recursion guard that keeps a hostile document off the stack; it is not a
+// statement about which schemas an API accepts.
 OPENAI_TOOL_SCHEMA_DEPTH :: 16
 
 openai_role_name :: proc(role: Provider_Role) -> string {
@@ -27,12 +30,6 @@ openai_role_name :: proc(role: Provider_Role) -> string {
 	return ""
 }
 
-openai_copy_limited :: proc(value: string, allocator := context.allocator) -> string {
-	end := len(value)
-	if end > OPENAI_ERROR_MESSAGE_LIMIT { end = OPENAI_ERROR_MESSAGE_LIMIT }
-	return strings.clone(value[:end], allocator)
-}
-
 openai_value_string :: proc(object: json.Object, key: string) -> (string, bool, bool) {
 	value, present := object[key]
 	if !present { return "", false, true }
@@ -51,7 +48,7 @@ openai_value_integer :: proc(object: json.Object, key: string) -> (i64, bool, bo
 }
 
 openai_error_event :: proc(kind: Provider_Error_Kind, message: string, code := "", allocator := context.allocator) -> Provider_Event {
-	return Provider_Error_Event{Kind = kind, Message = openai_copy_limited(message, allocator), Provider_Code = openai_copy_limited(code, allocator)}
+	return Provider_Error_Event{Kind = kind, Message = strings.clone(message, allocator), Provider_Code = strings.clone(code, allocator)}
 }
 
 // openai_error_rejection decodes the error document this API returns for a refused
@@ -67,10 +64,7 @@ openai_error_rejection :: proc(body: []u8, allocator := context.allocator) -> Pr
 	defer Provider_Event_Destroy(&event, allocator)
 	error_event, is_error_event := event.(Provider_Error_Event)
 	if !is_error_event { return {} }
-	return Provider_Rejection {
-		code = provider_bounded_text(error_event.Provider_Code, PROVIDER_MAX_CODE_BYTES, allocator),
-		message = provider_bounded_text(error_event.Message, PROVIDER_MAX_MESSAGE_BYTES, allocator),
-	}
+	return Provider_Rejection{code = strings.clone(error_event.Provider_Code, allocator), message = strings.clone(error_event.Message, allocator)}
 }
 
 // openai_failure_class names the meaning this API gives to one of its own error
@@ -119,10 +113,11 @@ openai_finish_reason :: proc(reason: string) -> Provider_Finish_Reason {
 	return .Unknown
 }
 
-// Validate a tool parameter schema: bounded JSON object with nothing
-// trailing. Depth-bounded; the worker enforces the same shape on arguments.
+// Validate a tool parameter schema: one JSON object with nothing trailing. The
+// walk recurses and is bounded by OPENAI_TOOL_SCHEMA_DEPTH; the worker enforces
+// the same shape on arguments.
 openai_tool_schema_valid :: proc(raw: string) -> bool {
-	if len(raw) == 0 || len(raw) > OPENAI_TOOL_ARGS_BYTES { return false }
+	if len(raw) == 0 { return false }
 	bytes := transmute([]u8)raw
 	end := openai_json_object_check(bytes, 0, OPENAI_TOOL_SCHEMA_DEPTH)
 	if end < 0 { return false }
@@ -242,8 +237,8 @@ openai_json_value_skip :: proc(raw: []u8, pos, depth: int) -> (int, bool) {
 }
 
 // True when the key bytes appeared earlier in this object. The caller
-// passes the keys seen so far; linear scan is fine because tool arguments
-// stay under 64 KiB by contract.
+// passes the keys seen so far, and a linear scan is what its small key
+// list costs.
 openai_json_key_seen :: proc(raw: []u8, seen: [dynamic][2]int, key_start, key_end: int) -> bool {
 	for entry in seen {
 		if entry[1] - entry[0] != key_end - key_start { continue }

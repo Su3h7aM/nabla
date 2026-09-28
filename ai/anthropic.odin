@@ -453,10 +453,7 @@ anthropic_error_rejection :: proc(body: []u8, allocator := context.allocator) ->
 	defer Provider_Event_Destroy(&event, allocator)
 	error_event, is_error_event := event.(Provider_Error_Event)
 	if !is_error_event { return {} }
-	return Provider_Rejection {
-		code = provider_bounded_text(error_event.Provider_Code, PROVIDER_MAX_CODE_BYTES, allocator),
-		message = provider_bounded_text(error_event.Message, PROVIDER_MAX_MESSAGE_BYTES, allocator),
-	}
+	return Provider_Rejection{code = strings.clone(error_event.Provider_Code, allocator), message = strings.clone(error_event.Message, allocator)}
 }
 
 // ANTHROPIC_CONTEXT_OVERFLOW_MESSAGE is this API's own wording for a rejected

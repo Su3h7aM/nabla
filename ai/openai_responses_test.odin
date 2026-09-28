@@ -832,7 +832,7 @@ test_undrained_events_destroyed_with_stream :: proc(t: ^testing.T) {
 		&state,
 	)
 	testing.expect_value(t, err, Provider_Stream_Error.None)
-	testing.expect_value(t, state.Batch_Count, 3)
+	testing.expect_value(t, len(state.Batch), 3)
 	// Destroying without draining must release every staged payload.
 	Provider_Stream_Destroy(&state)
 }
@@ -843,7 +843,7 @@ test_batch_not_drained_rejected :: proc(t: ^testing.T) {
 	defer Provider_Stream_Destroy(&state)
 	err := Provider_Consume_SSE_Data(`{"choices":[{"index":0,"delta":{"content":"a"}}]}`, &state)
 	testing.expect_value(t, err, Provider_Stream_Error.None)
-	testing.expect_value(t, state.Batch_Count, 1)
+	testing.expect_value(t, len(state.Batch), 1)
 	err = Provider_Consume_SSE_Data(`{"choices":[{"index":0,"delta":{"content":"b"}}]}`, &state)
 	testing.expect_value(t, err, Provider_Stream_Error.Batch_Not_Drained)
 	events := drain_events(&state)
@@ -851,6 +851,25 @@ test_batch_not_drained_rejected :: proc(t: ^testing.T) {
 	text := expect_event(t, events[0], Provider_Text_Event)
 	testing.expect_value(t, text.Text, "a")
 	destroy_events(events)
+}
+
+// The payload decides how many events the batch holds. A batch that stopped at
+// some number would drop provider output without saying so.
+@(test)
+test_stream_batch_holds_every_staged_event :: proc(t: ^testing.T) {
+	state := Provider_Stream_Start(.OpenAI_Chat_Completions, context.temp_allocator)
+	defer Provider_Stream_Destroy(&state)
+	for i in 0 ..< 5 { provider_stream_push(&state, Provider_Usage_Event{Input_Tokens = i64(i)}) }
+	drained := 0
+	for {
+		event, ok := Provider_Stream_Drain(&state)
+		if !ok { break }
+		usage, is_usage := event.(Provider_Usage_Event)
+		if !testing.expectf(t, is_usage, "event %d is not the staged usage", drained) { return }
+		testing.expect_value(t, usage.Input_Tokens, i64(drained))
+		drained += 1
+	}
+	testing.expect_value(t, drained, 5)
 }
 
 Test_Record :: struct {
