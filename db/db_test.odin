@@ -182,7 +182,7 @@ test_opening_an_already_open_connection_is_refused :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	_fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	// The caller of connection_init keeps ownership of the state it passed, so a
 	// refused open is the backend's to clean up, not a silent overwrite.
@@ -218,7 +218,7 @@ test_query_owns_the_statement_it_prepares :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	_fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	rows: Rows
 	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
@@ -241,7 +241,7 @@ test_statement_query_borrows_the_statement :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	_fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	statement: Statement
 	_expect_ok(t, prepare(&connection, &statement, "SELECT a, b"))
@@ -266,11 +266,11 @@ test_rows_next_stops_at_the_end :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	_fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	rows: Rows
 	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
-	defer rows_close(&rows)
+	defer _ = rows_close(&rows)
 
 	seen := 0
 	for {
@@ -296,7 +296,7 @@ test_an_execution_failure_wins_over_a_cleanup_failure :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	fake := _fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	fake.fail_next = error_make(.Busy, 5, "the statement is locked")
 	fake.fail_finish = error_make(.Backend, 1, "the reset failed")
@@ -315,7 +315,7 @@ test_cleanup_failure_alone_is_reported :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	fake := _fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	fake.fail_finish = error_make(.Busy, 5, "the reset is locked")
 
@@ -329,7 +329,7 @@ test_a_failed_query_leaves_nothing_open :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	fake := _fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	fake.fail_execute = error_make(.Constraint, 19, "no")
 
@@ -362,7 +362,7 @@ test_transactions_reach_the_backend :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	fake := _fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	_expect_ok(t, begin(&connection))
 	_expect_ok(t, commit(&connection))
@@ -467,7 +467,7 @@ test_the_end_of_a_result_set_frees_the_connection :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	_fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	rows: Rows
 	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
@@ -505,7 +505,7 @@ test_a_finished_result_set_can_hold_the_next_one :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	_fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	rows: Rows
 	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
@@ -531,7 +531,7 @@ test_a_row_failure_ends_the_set_and_frees_the_connection :: proc(t: ^testing.T) 
 	calls: Fake_Calls
 	connection: Conn
 	fake := _fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	fake.fail_next = error_make(.Busy, 5, "the row could not be read")
 
@@ -555,11 +555,11 @@ test_a_borrowed_statement_survives_a_failed_set :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	fake := _fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	statement: Statement
 	_expect_ok(t, prepare(&connection, &statement, "SELECT a, b"))
-	defer statement_close(&statement)
+	defer _ = statement_close(&statement)
 
 	fake.fail_next = error_make(.Busy, 5, "the row could not be read")
 
@@ -585,7 +585,7 @@ test_preparing_over_a_live_statement_is_refused :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	_fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	statement: Statement
 	_expect_ok(t, prepare(&connection, &statement, "SELECT 1"))
@@ -607,7 +607,7 @@ test_a_live_result_set_is_not_overwritten :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	_fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	rows: Rows
 	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
@@ -629,11 +629,11 @@ test_a_statement_is_not_queried_over_a_live_result_set :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	_fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	statement: Statement
 	_expect_ok(t, prepare(&connection, &statement, "SELECT a, b"))
-	defer statement_close(&statement)
+	defer _ = statement_close(&statement)
 
 	rows: Rows
 	_expect_ok(t, statement_query(&statement, &rows))
@@ -733,7 +733,7 @@ test_a_row_that_cannot_be_read_ends_the_set :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn
 	fake := _fake_open(&connection, &calls)
-	defer close(&connection)
+	defer _ = close(&connection)
 
 	fake.fail_row = error_make(.Out_Of_Memory, 7, "the row could not be read")
 

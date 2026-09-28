@@ -216,7 +216,7 @@ open :: proc(connection: ^db.Conn, config: Config, allocator := context.allocato
 	return nil
 }
 
-@(private)
+@(private, require_results)
 connection_close :: proc(state: rawptr) -> db.Error {
 	connection := cast(^Conn)state
 	if result_code := close_v2(connection.handle); result_code != .OK {
@@ -227,7 +227,7 @@ connection_close :: proc(state: rawptr) -> db.Error {
 	return nil
 }
 
-@(private)
+@(private, require_results)
 statement_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
 	connection := cast(^Conn)state
 	if len(sql) == 0 {
@@ -332,7 +332,7 @@ statement_finalize :: proc(state: rawptr) {
 	free(statement, statement.connection.allocator)
 }
 
-@(private)
+@(private, require_results)
 statement_execute :: proc(state: rawptr, arguments: []db.Value) -> (rawptr, db.Error) {
 	statement := cast(^Stmt)state
 	if expected := int(bind_parameter_count(statement.handle)); len(arguments) != expected {
@@ -360,7 +360,7 @@ statement_columns :: proc(state: rawptr) -> int {
 	return int(column_count(statement.handle))
 }
 
-@(private)
+@(private, require_results)
 bind :: proc(statement: ^Stmt, index: c.int, value: db.Value) -> db.Error {
 	result_code: Result_Code
 	// SAFETY: SQLITE_TRANSIENT (behaviour = -1) makes SQLite copy every bound
@@ -397,7 +397,7 @@ bind :: proc(statement: ^Stmt, index: c.int, value: db.Value) -> db.Error {
 	return nil
 }
 
-@(private)
+@(private, require_results)
 execution_next :: proc(state: rawptr) -> (has_row: bool, err: db.Error) {
 	statement := cast(^Stmt)state
 	result_code := step(statement.handle)
@@ -411,12 +411,12 @@ execution_next :: proc(state: rawptr) -> (has_row: bool, err: db.Error) {
 	}
 }
 
-@(private)
+@(private, require_results)
 execution_row :: proc(state: rawptr, values: []db.Value) -> db.Error {
 	return fill(cast(^Stmt)state, values)
 }
 
-@(private)
+@(private, require_results)
 execution_finish :: proc(state: rawptr) -> db.Error {
 	statement := cast(^Stmt)state
 	// reset is where an implicit transaction is committed, so it can fail on a
@@ -435,7 +435,7 @@ execution_finish :: proc(state: rawptr) -> db.Error {
 // already stored in the encoding being asked for, and SQLite reports that by
 // handing back the same null pointer it uses for a value that is not there;
 // errcode is the only thing that tells those two apart.
-@(private)
+@(private, require_results)
 fill :: proc(statement: ^Stmt, values: []db.Value) -> db.Error {
 	for _, i in values {
 		column := c.int(i)
@@ -479,7 +479,7 @@ fill :: proc(statement: ^Stmt, values: []db.Value) -> db.Error {
 	return nil
 }
 
-@(private)
+@(private, require_results)
 connection_begin :: proc(state: rawptr) -> db.Error {
 	connection := cast(^Conn)state
 	if get_autocommit(connection.handle) == 0 {
@@ -488,7 +488,7 @@ connection_begin :: proc(state: rawptr) -> db.Error {
 	return run(connection, "BEGIN")
 }
 
-@(private)
+@(private, require_results)
 connection_commit :: proc(state: rawptr) -> db.Error {
 	connection := cast(^Conn)state
 	if get_autocommit(connection.handle) != 0 {
@@ -499,7 +499,7 @@ connection_commit :: proc(state: rawptr) -> db.Error {
 	return run(connection, "COMMIT")
 }
 
-@(private)
+@(private, require_results)
 connection_rollback :: proc(state: rawptr) -> db.Error {
 	connection := cast(^Conn)state
 	if get_autocommit(connection.handle) != 0 {
@@ -510,7 +510,7 @@ connection_rollback :: proc(state: rawptr) -> db.Error {
 }
 
 // run executes one statement this package wrote itself, with no parameters.
-@(private)
+@(private, require_results)
 run :: proc(connection: ^Conn, sql: string) -> db.Error {
 	handle: ^sqlite3_stmt
 	result_code := prepare_v3(connection.handle, cstring(raw_data(sql)), c.int(len(sql)), 0, &handle, nil)
@@ -530,7 +530,7 @@ run :: proc(connection: ^Conn, sql: string) -> db.Error {
 // failure builds a db.Error from the connection's current error state. errmsg
 // and extended_errcode are read before anything else touches the handle,
 // because the next SQLite call can overwrite both.
-@(private)
+@(private, require_results)
 failure :: proc(handle: ^sqlite3, result_code: Result_Code) -> db.Error {
 	message := ""
 	code := c.int(result_code)

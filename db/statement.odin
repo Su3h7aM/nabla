@@ -14,7 +14,7 @@ Statement :: struct {
 
 // statement_prepare compiles sql for an idle connection. It ties the statement
 // into the connection's list of live statements and reports the backend state.
-@(private)
+@(private, require_results)
 statement_prepare :: proc(connection: ^Conn, sql: string) -> (state: rawptr, err: Error) {
 	connection_idle(connection) or_return
 	return connection.driver.prepare(connection.state, sql)
@@ -65,6 +65,7 @@ prepare :: proc(connection: ^Conn, statement: ^Statement, sql: string) -> Error 
 // statement_close releases a prepared statement and its backend state. A result
 // set opened from it has to be closed first. Closing a closed statement does
 // nothing.
+@(require_results)
 statement_close :: proc(statement: ^Statement) -> Error {
 	if statement.state == nil { return nil }
 	if statement.connection.active != nil {

@@ -64,6 +64,7 @@ Error :: union {
 // error_make builds an Error from a classification, a native code, and a
 // message. code is 0 when the backend has none to report. Backends call this to
 // report their own failures; the message is truncated to MAX_ERROR_MESSAGE.
+@(require_results)
 error_make :: proc(kind: Error_Kind, code: i32, message: string) -> Error {
 	failure := Failure {
 		kind = kind,

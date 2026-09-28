@@ -175,6 +175,7 @@ open :: proc(journal: ^Journal, directory: string, run: Run_Id, mode: Open_Mode,
 
 // close releases the claim, the statements, the connection, and every pending
 // item. Pending items are dropped, not committed. Closing a zero journal does nothing.
+@(require_results)
 close :: proc(journal: ^Journal) -> Error {
 	release_error := release(journal)
 	// A statement that refuses to close stays on the connection's list, and the
@@ -206,6 +207,7 @@ claim :: proc(journal: ^Journal, session: Session_Id) -> (counters: Counters, er
 }
 
 // release drops the writer claim, if any.
+@(require_results)
 release :: proc(journal: ^Journal) -> Error {
 	file := journal.claim_file
 	journal.claim_file = nil
@@ -263,7 +265,7 @@ create_session :: proc(journal: ^Journal, new_session: New_Session) -> (id: Sess
 
 // make_private_directory creates path owner-only, and narrows an existing one
 // whose mode is wider.
-@(private)
+@(private, require_results)
 make_private_directory :: proc(path: string) -> Error {
 	error := os.make_directory_all(path, PRIVATE_DIRECTORY_PERMISSIONS)
 	if error != nil && error != .Exist { return error }
@@ -272,7 +274,7 @@ make_private_directory :: proc(path: string) -> Error {
 
 // make_private_file creates path owner-only, or narrows an existing one, before
 // SQLite opens it, since SQLite gives its write-ahead log the same permissions.
-@(private)
+@(private, require_results)
 make_private_file :: proc(path: string) -> Error {
 	file := os.open(path, {.Read, .Write, .Create}, PRIVATE_FILE_PERMISSIONS) or_return
 	chmod_error := os.fchmod(file, PRIVATE_FILE_PERMISSIONS)
@@ -283,10 +285,10 @@ make_private_file :: proc(path: string) -> Error {
 
 // enable_write_ahead_log checks the answer, because SQLite keeps another mode
 // on a filesystem that cannot support WAL.
-@(private)
+@(private, require_results)
 enable_write_ahead_log :: proc(journal: ^Journal) -> (error: Error) {
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
 	row := query_first(journal, &rows, "PRAGMA journal_mode = WAL", nil) or_return
 	mode := row_view(&row)
 	if row.error != nil { return row.error }
@@ -296,7 +298,7 @@ enable_write_ahead_log :: proc(journal: ^Journal) -> (error: Error) {
 
 // take_claim flocks the session's lock file, which the kernel releases when the
 // process dies.
-@(private)
+@(private, require_results)
 take_claim :: proc(journal: ^Journal, session: Session_Id) -> Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	directory := filepath.join({journal.directory, LOCK_DIRECTORY}, context.temp_allocator) or_return
@@ -328,11 +330,11 @@ COUNTERS_QUERY :: `SELECT
 	COALESCE((SELECT MAX(node) FROM nodes WHERE session = ?1), 0),
 	COALESCE((SELECT MAX(branch) FROM branches WHERE session = ?1), 0)`
 
-@(private)
+@(private, require_results)
 load_counters :: proc(journal: ^Journal, session: Session_Id) -> (counters: Counters, exists: bool, error: Error) {
 	session := session
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
 	row := query_first(journal, &rows, COUNTERS_QUERY, {db.Value(session[:])}) or_return
 	exists = row_int(&row) != 0
 	counters.turn = Turn_Id(row_int(&row))

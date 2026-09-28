@@ -35,6 +35,7 @@ Error :: union #shared_nil {
 }
 
 // error_is reports whether error is this package's own error of that kind.
+@(require_results)
 error_is :: proc(error: Error, kind: Journal_Error) -> bool {
 	own, is_own := error.(Journal_Error)
 	return is_own && own == kind
@@ -42,6 +43,7 @@ error_is :: proc(error: Error, kind: Journal_Error) -> bool {
 
 // error_is_busy reports whether error is another writer holding the database
 // longer than the busy timeout, which a later attempt may get past.
+@(require_results)
 error_is_busy :: proc(error: Error) -> bool {
 	database, is_database := error.(db.Error)
 	return is_database && db.error_kind(database) == .Busy
@@ -58,6 +60,7 @@ JOURNAL_ERROR_TEXT := [Journal_Error]string {
 }
 
 // error_text describes error for a person, in allocator.
+@(require_results)
 error_text :: proc(error: Error, allocator := context.allocator) -> string {
 	switch value in error {
 	case Journal_Error:

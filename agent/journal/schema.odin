@@ -82,7 +82,7 @@ MIGRATION_1 := [?]string {
 
 // schema_migrate creates the schema of an empty database inside one immediate
 // transaction, so two processes opening one database never both migrate it.
-@(private)
+@(private, require_results)
 schema_migrate :: proc(journal: ^Journal) -> (error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	db.exec(&journal.connection, "BEGIN IMMEDIATE") or_return
@@ -101,7 +101,7 @@ schema_migrate :: proc(journal: ^Journal) -> (error: Error) {
 	return db.commit(&journal.connection)
 }
 
-@(private)
+@(private, require_results)
 schema_version :: proc(journal: ^Journal) -> (int, Error) {
 	version, error := query_int(journal, "PRAGMA user_version", nil)
 	return int(version), error

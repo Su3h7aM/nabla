@@ -93,7 +93,7 @@ read_records :: proc(
 	if page > 0 { query_add(&query, " LIMIT ?", i64(page)) or_return }
 
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
 	db.query(&journal.connection, &rows, strings.to_string(query.sql), query.arguments[:]) or_return
 
 	list := make([dynamic]Record, allocator) or_return
@@ -133,7 +133,7 @@ read_latest :: proc(journal: ^Journal, filter: Filter, allocator: mem.Allocator)
 	query_add(&query, " ORDER BY seq DESC LIMIT 1") or_return
 
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
 	db.query(&journal.connection, &rows, strings.to_string(query.sql), query.arguments[:]) or_return
 	values, has_row := db.rows_next(&rows) or_return
 	if !has_row { return {}, false, nil }
@@ -199,7 +199,7 @@ session_head :: proc(journal: ^Journal, session: Session_Id) -> (branch: Branch_
 	assert(journal.open)
 	session := session
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
 	row := query_first(journal, &rows, SESSION_HEAD_QUERY, {db.Value(session[:]), db.Value(i64(INITIAL_BRANCH))}) or_return
 	branch = Branch_Id(row_int(&row))
 	head = Node_Id(row_int(&row))
@@ -213,7 +213,7 @@ read_artifact :: proc(journal: ^Journal, digest: Digest, allocator: mem.Allocato
 	assert(journal.open)
 	key := digest
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
 	db.query(&journal.connection, &rows, "SELECT bytes FROM artifacts WHERE digest = ?", {db.Value(key[:])}) or_return
 	values, has_row := db.rows_next(&rows) or_return
 	if !has_row { return nil, false, nil }
@@ -242,7 +242,7 @@ usage_totals :: proc(journal: ^Journal, session: Session_Id) -> (totals: Usage_T
 	assert(journal.open)
 	session := session
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
 	row := query_first(journal, &rows, USAGE_TOTALS_QUERY, {db.Value(session[:])}) or_return
 	totals.requests = int(row_int(&row))
 	totals.paired_requests = int(row_int(&row))
@@ -287,7 +287,7 @@ list_sessions :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.
 	if filter.limit > 0 { query_add(&query, " LIMIT ?", i64(filter.limit)) or_return }
 
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
 	db.query(&journal.connection, &rows, strings.to_string(query.sql), query.arguments[:]) or_return
 
 	list := make([dynamic]Session_Summary, allocator) or_return
@@ -328,7 +328,7 @@ list_branches :: proc(journal: ^Journal, session: Session_Id, allocator: mem.All
 	assert(journal.open)
 	session := session
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
 	db.query(&journal.connection, &rows, BRANCH_LIST_QUERY, {db.Value(session[:])}) or_return
 
 	list := make([dynamic]Branch_Summary, allocator) or_return
@@ -455,11 +455,11 @@ SELECT COUNT(*), COALESCE(SUM(both), 0),
 	COALESCE(SUM(CASE WHEN both THEN input END), 0), COALESCE(SUM(CASE WHEN both THEN cache_read END), 0)
 FROM paired`
 
-@(private)
+@(private, require_results)
 read_node :: proc(journal: ^Journal, session: Session_Id, id: Node_Id, allocator: mem.Allocator) -> (node: Node, error: Error) {
 	session := session
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
 	db.query(&journal.connection, &rows, NODE_QUERY, {db.Value(session[:]), db.Value(i64(id))}) or_return
 	values, has_row := db.rows_next(&rows) or_return
 	// A missing node is a parent the tree promised.
@@ -513,7 +513,7 @@ scan_record :: proc(row: ^Row) -> (record: Record) {
 
 // corrupt names the damaged row when a read fails on stored data. A lower
 // failure such as allocation passes through unchanged.
-@(private)
+@(private, require_results)
 corrupt :: proc(journal: ^Journal, error: Error, session: Session_Id, seq: Journal_Seq) -> Error {
 	if error_is(error, .Corrupt) { journal.corrupt = {session, seq} }
 	return error
@@ -526,14 +526,14 @@ Query :: struct {
 	arguments: [dynamic]db.Value,
 }
 
-@(private)
+@(private, require_results)
 query_start :: proc(query: ^Query, sql: string, arguments: ..db.Value) -> mem.Allocator_Error {
 	query.sql = strings.builder_make(context.temp_allocator) or_return
 	query.arguments = make([dynamic]db.Value, context.temp_allocator) or_return
 	return query_add(query, sql, ..arguments)
 }
 
-@(private)
+@(private, require_results)
 query_add :: proc(query: ^Query, sql: string, arguments: ..db.Value) -> mem.Allocator_Error {
 	// A builder that cannot grow drops what does not fit, and a query missing part of its
 	// SQL is not the query the caller asked for.
@@ -543,7 +543,7 @@ query_add :: proc(query: ^Query, sql: string, arguments: ..db.Value) -> mem.Allo
 }
 
 // query_filter binds the session id by reference, so filter must outlive the query.
-@(private)
+@(private, require_results)
 query_filter :: proc(query: ^Query, filter: ^Filter) -> mem.Allocator_Error {
 	if filter.session != {} && filter.named {
 		hex_text: [SESSION_ID_HEX_LENGTH]u8
@@ -578,7 +578,7 @@ query_filter :: proc(query: ^Query, filter: ^Filter) -> mem.Allocator_Error {
 
 // query_first runs a query that yields one row and returns it. The caller
 // closes rows.
-@(private)
+@(private, require_results)
 query_first :: proc(journal: ^Journal, rows: ^db.Rows, sql: string, arguments: []db.Value) -> (row: Row, error: Error) {
 	db.query(&journal.connection, rows, sql, arguments) or_return
 	values, has_row := db.rows_next(rows) or_return
@@ -586,10 +586,10 @@ query_first :: proc(journal: ^Journal, rows: ^db.Rows, sql: string, arguments: [
 	return Row{values = values}, nil
 }
 
-@(private)
+@(private, require_results)
 query_int :: proc(journal: ^Journal, sql: string, arguments: []db.Value) -> (value: i64, error: Error) {
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
 	row := query_first(journal, &rows, sql, arguments) or_return
 	value = row_int(&row)
 	return value, row.error
@@ -605,7 +605,7 @@ Row :: struct {
 	error:     Error,
 }
 
-@(private)
+@(private, require_results)
 row_next :: proc(row: ^Row) -> (db.Value, bool) {
 	if row.error != nil { return nil, false }
 	if row.column >= len(row.values) {

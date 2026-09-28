@@ -17,7 +17,7 @@ import "nabla:db"
 @(test)
 test_constraint_failures_are_classified :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)"))
 	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (1, 1)"))
@@ -30,7 +30,7 @@ test_constraint_failures_are_classified :: proc(t: ^testing.T) {
 @(test)
 test_foreign_keys_are_enforced_when_requested :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE parent (id INTEGER PRIMARY KEY)"))
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE child (id INTEGER REFERENCES parent(id))"))
@@ -44,7 +44,7 @@ test_foreign_keys_are_enforced_when_requested :: proc(t: ^testing.T) {
 test_foreign_keys_stay_off_by_default :: proc(t: ^testing.T) {
 	connection: db.Conn
 	_expect_ok(t, open(&connection, {path = ":memory:"}))
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE parent (id INTEGER PRIMARY KEY)"))
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE child (id INTEGER REFERENCES parent(id))"))
@@ -88,7 +88,7 @@ test_every_allocation_is_returned :: proc(t: ^testing.T) {
 @(test)
 test_walking_a_result_set_frees_the_connection :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (value INTEGER)"))
 	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (1)"))
@@ -114,7 +114,7 @@ test_walking_a_result_set_frees_the_connection :: proc(t: ^testing.T) {
 @(test)
 test_stopping_short_of_the_end_frees_the_connection :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (value INTEGER)"))
 	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (1), (2), (3)"))
@@ -133,7 +133,7 @@ test_stopping_short_of_the_end_frees_the_connection :: proc(t: ^testing.T) {
 	// The same for a borrowed statement, which has to stay prepared.
 	statement: db.Statement
 	_expect_ok(t, db.prepare(&connection, &statement, "SELECT value FROM t"))
-	defer db.statement_close(&statement)
+	defer _ = db.statement_close(&statement)
 
 	for _ in 0 ..< 2 {
 		_expect_ok(t, db.statement_query(&statement, &rows))
@@ -146,7 +146,7 @@ test_stopping_short_of_the_end_frees_the_connection :: proc(t: ^testing.T) {
 @(test)
 test_text_and_blobs_round_trip_byte_for_byte :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (a TEXT, b BLOB)"))
 
@@ -160,7 +160,7 @@ test_text_and_blobs_round_trip_byte_for_byte :: proc(t: ^testing.T) {
 
 	rows: db.Rows
 	_expect_ok(t, db.query(&connection, &rows, "SELECT a, b FROM t"))
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows)
 
 	values, has_row, err := db.rows_next(&rows)
 	_expect_ok(t, err)
@@ -178,13 +178,13 @@ test_text_and_blobs_round_trip_byte_for_byte :: proc(t: ^testing.T) {
 @(test)
 test_a_statement_survives_a_rejected_row :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (id INTEGER PRIMARY KEY)"))
 
 	statement: db.Statement
 	_expect_ok(t, db.prepare(&connection, &statement, "INSERT INTO t VALUES (?)"))
-	defer db.statement_close(&statement)
+	defer _ = db.statement_close(&statement)
 
 	_expect_ok(t, db.statement_exec(&statement, {db.Value(i64(1))}))
 
@@ -195,7 +195,7 @@ test_a_statement_survives_a_rejected_row :: proc(t: ^testing.T) {
 
 	// One rejected row does not end the transaction it was written in.
 	_expect_ok(t, db.begin(&connection))
-	defer db.rollback(&connection)
+	defer _ = db.rollback(&connection)
 
 	_expect_failure(t, db.statement_exec(&statement, {db.Value(i64(2))}), .Constraint)
 	_expect_ok(t, db.statement_exec(&statement, {db.Value(i64(3))}))
@@ -227,7 +227,7 @@ test_a_refused_open_leaves_no_database_behind :: proc(t: ^testing.T) {
 	defer delete(path)
 
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	// The refusal happens before SQLite sees the path, so the file a refused
 	// open would have created is still not there.
@@ -245,11 +245,11 @@ test_another_connection_sees_only_committed_work :: proc(t: ^testing.T) {
 
 	writer: db.Conn
 	_expect_ok(t, open(&writer, {path = path}))
-	defer db.close(&writer)
+	defer _ = db.close(&writer)
 
 	reader: db.Conn
 	_expect_ok(t, open(&reader, {path = path}))
-	defer db.close(&reader)
+	defer _ = db.close(&reader)
 
 	_expect_ok(t, db.exec(&writer, "CREATE TABLE t (value INTEGER)"))
 
@@ -271,7 +271,7 @@ test_another_connection_sees_only_committed_work :: proc(t: ^testing.T) {
 _count :: proc(connection: ^db.Conn) -> i64 {
 	rows: db.Rows
 	if db.query(connection, &rows, "SELECT count(*) FROM t") != nil { return -1 }
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows)
 
 	values, has_row, err := db.rows_next(&rows)
 	if err != nil || !has_row { return -1 }
@@ -282,7 +282,7 @@ _count :: proc(connection: ^db.Conn) -> i64 {
 @(test)
 test_numeric_extremes_round_trip :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (v)"))
 
@@ -293,7 +293,7 @@ test_numeric_extremes_round_trip :: proc(t: ^testing.T) {
 
 	rows: db.Rows
 	_expect_ok(t, db.query(&connection, &rows, "SELECT v FROM t ORDER BY rowid"))
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows)
 
 	for want in integers {
 		values, has_row, err := db.rows_next(&rows)
@@ -315,7 +315,7 @@ test_numeric_extremes_round_trip :: proc(t: ^testing.T) {
 @(test)
 test_a_not_a_number_is_refused_rather_than_stored_as_null :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (v)"))
 	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (?)", {db.Value(f64(1))}))
@@ -329,7 +329,7 @@ test_a_not_a_number_is_refused_rather_than_stored_as_null :: proc(t: ^testing.T)
 
 	rows: db.Rows
 	_expect_ok(t, db.query(&connection, &rows, "SELECT v FROM t ORDER BY rowid"))
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows)
 
 	values, has_row, err := db.rows_next(&rows)
 	_expect_ok(t, err)
@@ -353,14 +353,14 @@ test_a_pragma_that_reports_a_value_is_readable :: proc(t: ^testing.T) {
 
 	connection: db.Conn
 	_expect_ok(t, open(&connection, {path = path, busy_timeout_ms = 1000}))
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	// The journal mode is not part of Config. It is a pragma, which is ordinary
 	// SQL, and exec runs one without minding that it answers with a row.
 	_expect_ok(t, db.exec(&connection, "PRAGMA journal_mode = WAL"))
 
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows)
 	_expect_ok(t, db.query(&connection, &rows, "PRAGMA journal_mode"))
 
 	mode, has_row, err := db.rows_next(&rows)
@@ -382,7 +382,7 @@ test_a_pragma_that_reports_a_value_is_readable :: proc(t: ^testing.T) {
 @(test)
 test_changed_rows_are_readable_as_a_value :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (v INTEGER)"))
 
@@ -410,11 +410,11 @@ test_a_write_transaction_can_begin_immediately :: proc(t: ^testing.T) {
 
 	writer: db.Conn
 	_expect_ok(t, open(&writer, {path = path}))
-	defer db.close(&writer)
+	defer _ = db.close(&writer)
 
 	other: db.Conn
 	_expect_ok(t, open(&other, {path = path}))
-	defer db.close(&other)
+	defer _ = db.close(&other)
 
 	_expect_ok(t, db.exec(&writer, "CREATE TABLE t (v INTEGER)"))
 
@@ -437,7 +437,7 @@ test_a_write_transaction_can_begin_immediately :: proc(t: ^testing.T) {
 @(test)
 test_a_savepoint_is_ordinary_sql :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (value INTEGER)"))
 	_expect_ok(t, db.exec(&connection, "SAVEPOINT outer"))
@@ -463,7 +463,7 @@ test_a_savepoint_is_ordinary_sql :: proc(t: ^testing.T) {
 _scalar_i64 :: proc(t: ^testing.T, connection: ^db.Conn, sql: string) -> i64 {
 	rows: db.Rows
 	_expect_ok(t, db.query(connection, &rows, sql))
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows)
 
 	values, has_row, err := db.rows_next(&rows)
 	_expect_ok(t, err)
@@ -509,7 +509,7 @@ failing_allocate :: proc(
 @(test)
 test_rejecting_trailing_sql_has_no_effect :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	testing.expect(t, _foreign_keys(&connection), "the test connection starts with foreign keys on")
 
@@ -525,7 +525,7 @@ test_rejecting_trailing_sql_has_no_effect :: proc(t: ^testing.T) {
 _foreign_keys :: proc(connection: ^db.Conn) -> bool {
 	rows: db.Rows
 	if db.query(connection, &rows, "PRAGMA foreign_keys") != nil { return false }
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows)
 
 	values, has_row, err := db.rows_next(&rows)
 	if err != nil || !has_row { return false }
@@ -536,14 +536,14 @@ _foreign_keys :: proc(connection: ^db.Conn) -> bool {
 @(test)
 test_prepared_columns_follow_the_schema_the_rows_come_from :: proc(t: ^testing.T) {
 	connection := _open(t)
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (a INTEGER)"))
 	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (1)"))
 
 	statement: db.Statement
 	_expect_ok(t, db.prepare(&connection, &statement, "SELECT * FROM t"))
-	defer db.statement_close(&statement)
+	defer _ = db.statement_close(&statement)
 
 	// SELECT * changes meaning with the table, and SQLite recompiles a
 	// statement against the new schema when it first steps. The columns a set
@@ -606,7 +606,7 @@ test_a_column_that_cannot_be_read_reports_out_of_memory :: proc(t: ^testing.T) {
 _read_column_with_no_memory_left :: proc(t: ^testing.T) {
 	connection: db.Conn
 	_expect_ok(t, open(&connection, {path = ":memory:"}))
-	defer db.close(&connection)
+	defer _ = db.close(&connection)
 
 	// The encoding has to be chosen before the schema exists. Every text value
 	// is then stored as UTF-16, and reading one has to convert, which is the

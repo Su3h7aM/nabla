@@ -43,6 +43,7 @@ connection_is_open :: proc(connection: ^Conn) -> bool {
 // state stays the backend's to release: close calls driver.close, which must
 // free it. allocator is the one the backend used and the one this package uses
 // for row buffers, so the whole connection has a single owner for its memory.
+@(require_results)
 connection_init :: proc(connection: ^Conn, driver: ^Driver, state: rawptr, allocator: mem.Allocator) -> Error {
 	if connection_is_open(connection) {
 		return error_make(.Invalid_State, 0, "connection is already open")
@@ -54,7 +55,7 @@ connection_init :: proc(connection: ^Conn, driver: ^Driver, state: rawptr, alloc
 }
 
 // connection_idle reports whether connection is open and running nothing.
-@(private)
+@(private, require_results)
 connection_idle :: proc(connection: ^Conn) -> Error {
 	if connection.state == nil {
 		return error_make(.Invalid_State, 0, "connection is closed")
@@ -70,6 +71,7 @@ connection_idle :: proc(connection: ^Conn) -> Error {
 // connection usable rather than free state a live handle still points at. An
 // open transaction is connection state, not a handle, so close rolls it back.
 // Closing a closed connection does nothing.
+@(require_results)
 close :: proc(connection: ^Conn) -> Error {
 	if connection.state == nil { return nil }
 	if connection.active != nil {
@@ -157,8 +159,8 @@ commit :: proc(connection: ^Conn) -> Error {
 }
 
 // rollback discards the open transaction on connection. Rolling back with no
-// transaction open succeeds, so `defer rollback(&connection)` needs no bookkeeping,
-// and rollback is not require_results for the same reason.
+// transaction open succeeds, so a deferred rollback needs no bookkeeping.
+@(require_results)
 rollback :: proc(connection: ^Conn) -> Error {
 	connection_idle(connection) or_return
 	return connection.driver.rollback(connection.state)

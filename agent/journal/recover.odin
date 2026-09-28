@@ -32,10 +32,10 @@ Recovery_Rule :: enum {
 	Subagent,
 }
 
-@(private)
+@(private, require_results)
 recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error) {
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
 	db.query(&journal.connection, &rows, RECOVERY_QUERY, {db.Value(journal.claimed[:])}) or_return
 	for {
 		values, has_row := db.rows_next(&rows) or_return
@@ -102,11 +102,11 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Err
 
 // recover_results gives each Assistant node whose proposed calls have no
 // Results node one, listing the calls in proposal order.
-@(private)
+@(private, require_results)
 recover_results :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
 	db.query(&journal.connection, &rows, UNANSWERED_CALLS_QUERY, {db.Value(journal.claimed[:])}) or_return
 
 	calls := make([dynamic]Call_Id, context.temp_allocator) or_return

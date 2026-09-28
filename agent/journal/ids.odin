@@ -41,6 +41,7 @@ session_id_to_hex :: proc(id: Session_Id, buffer: []u8) -> string {
 	return hex_encode(bytes[:], buffer)
 }
 
+@(require_results)
 session_id_parse :: proc(text: string) -> (id: Session_Id, ok: bool) {
 	if !hex_decode(text, id[:]) { return {}, false }
 	return id, true
@@ -53,6 +54,7 @@ digest_to_hex :: proc(digest: Digest, buffer: []u8) -> string {
 	return hex_encode(bytes[:], buffer)
 }
 
+@(require_results)
 digest_from_hex :: proc(text: string) -> (digest: Digest, ok: bool) {
 	if !hex_decode(text, digest[:]) { return {}, false }
 	return digest, true
@@ -72,7 +74,7 @@ hex_encode :: proc(bytes: []u8, buffer: []u8) -> string {
 }
 
 // hex_decode accepts exactly 2 * len(out) lowercase hexadecimal characters.
-@(private)
+@(private, require_results)
 hex_decode :: proc(text: string, out: []u8) -> bool {
 	if len(text) != 2 * len(out) { return false }
 	for index in 0 ..< len(out) {
@@ -83,7 +85,7 @@ hex_decode :: proc(text: string, out: []u8) -> bool {
 	return true
 }
 
-@(private)
+@(private, require_results)
 hex_value :: proc(character: u8) -> (u8, bool) {
 	switch character {
 	case '0' ..= '9':

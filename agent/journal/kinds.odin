@@ -136,6 +136,7 @@ NODE_KIND_NAMES := [Node_Kind]string {
 }
 
 // enum_from_name reads a stored stable name back through its name table.
+@(require_results)
 enum_from_name :: proc(names: [$Enum]string, name: string) -> (Enum, bool) {
 	for candidate in Enum {
 		if names[candidate] == name { return candidate, true }

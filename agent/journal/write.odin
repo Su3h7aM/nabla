@@ -191,7 +191,7 @@ flush_deadline :: proc(journal: ^Journal) -> Maybe(time.Tick) {
 	return time.tick_add(journal.oldest, JOURNAL_BATCH_AGE)
 }
 
-@(private)
+@(private, require_results)
 write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 	for &statement, insert in journal.inserts {
 		if statement.connection == nil { db.prepare(&journal.connection, &statement, INSERT_SQL[insert]) or_return }
@@ -241,7 +241,7 @@ write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 	return last, nil
 }
 
-@(private)
+@(private, require_results)
 insert_record :: proc(journal: ^Journal, row: ^Record) -> (seq: Journal_Seq, error: Error) {
 	arguments := [20]db.Value {
 		db.Value(row.time_ms),
@@ -266,7 +266,7 @@ insert_record :: proc(journal: ^Journal, row: ^Record) -> (seq: Journal_Seq, err
 		bytes_or_null(row.body),
 	}
 	rows: db.Rows
-	defer db.rows_close(&rows)
+	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
 	db.statement_query(&journal.inserts[.Record], &rows, arguments[:]) or_return
 	values, has_row := db.rows_next(&rows) or_return
 	if !has_row { return 0, Journal_Error.Corrupt }
@@ -275,7 +275,7 @@ insert_record :: proc(journal: ^Journal, row: ^Record) -> (seq: Journal_Seq, err
 
 // writable reports whether an append may be buffered. Writing through a
 // read-only journal or for another session is a programming error.
-@(private)
+@(private, require_results)
 writable :: proc(journal: ^Journal, session: Session_Id) -> bool {
 	assert(journal.open && !journal.read_only, "appends need a writable journal")
 	assert(session == {} || session == journal.claimed, "appends name the claimed session or none")

@@ -28,7 +28,7 @@ Rows :: struct {
 //
 // A failure leaves no execution running, so a caller that gives up here has
 // nothing to finish.
-@(private)
+@(private, require_results)
 rows_execute :: proc(rows: ^Rows, arguments: []Value, materialize: bool) -> Error {
 	connection := rows.connection
 	state, err := connection.driver.execute(rows.statement_state, arguments)
@@ -118,7 +118,7 @@ rows_release :: proc(rows: ^Rows) {
 // rows_drain walks a set to its end, which is how a statement that returns rows
 // nobody wants is finished. rows_next releases everything on the way out, so
 // there is no close here.
-@(private)
+@(private, require_results)
 rows_drain :: proc(rows: ^Rows) -> Error {
 	for {
 		_, has_row, err := rows_next(rows)
@@ -133,6 +133,7 @@ rows_drain :: proc(rows: ^Rows) -> Error {
 // Stopping short of the end can fail, and that failure is returned, but the
 // resources are released either way: an error here never leaves a set to close
 // twice.
+@(require_results)
 rows_close :: proc(rows: ^Rows) -> Error {
 	connection := rows.connection
 	if connection == nil { return nil }
