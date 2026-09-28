@@ -662,9 +662,9 @@ test_a_200_error_document_is_classified_by_its_code :: proc(t: ^testing.T) {
 // still classifies the refusal instead of leaving the status to decide alone.
 @(test)
 test_a_large_error_document_is_classified_by_its_code :: proc(t: ^testing.T) {
-	pad := strings.repeat("x", 9000, context.temp_allocator)
+	padding := strings.repeat("x", 9000, context.temp_allocator)
 	body := strings.concatenate(
-		{`{"error":{"pad":"`, pad, `","message":"This model's maximum context length is 8192 tokens","code":"context_length_exceeded"}}`},
+		{`{"error":{"pad":"`, padding, `","message":"This model's maximum context length is 8192 tokens","code":"context_length_exceeded"}}`},
 		context.temp_allocator,
 	)
 	testing.expect(t, len(body) > 8192, "the code must lie past the old prefix bound")

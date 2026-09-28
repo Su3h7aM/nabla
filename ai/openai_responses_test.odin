@@ -933,9 +933,9 @@ chunk_text :: proc(text: string, width: int) -> []string {
 	return chunks[:]
 }
 
-sequences_equal :: proc(a, b: [dynamic]string) -> bool {
-	if len(a) != len(b) { return false }
-	for index in 0 ..< len(a) { if a[index] != b[index] { return false } }
+sequences_equal :: proc(whole, reassembled: [dynamic]string) -> bool {
+	if len(whole) != len(reassembled) { return false }
+	for index in 0 ..< len(whole) { if whole[index] != reassembled[index] { return false } }
 	return true
 }
 

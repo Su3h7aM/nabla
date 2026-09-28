@@ -29,12 +29,10 @@ openai_responses_encode_websocket_request :: proc(
 	return openai_responses_encode_request_body(request, cache, true, allocator)
 }
 
-// openai_responses_encode_request_body writes one Responses request body. The body is
-// bytes: every string the request carries is written through its slot in the cache, so a
-// request that repeats or extends a conversation copies the bytes already written for
-// the texts it carries again instead of reading and writing them a second time. What
-// that saves is largest here, because a record the endpoint sent is read from the
-// conversation and written back unchanged on every request that follows it.
+// openai_responses_encode_request_body writes one Responses request body, with a cache
+// reusing the bytes it already holds for the texts this request carries again. What that
+// saves is largest here, because every record the endpoint sent is written back unchanged
+// on every request that follows it.
 openai_responses_encode_request_body :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -346,7 +344,10 @@ openai_responses_record_bytes :: proc(record: string, out: ^strings.Builder, all
 		text, unparse_err := json.unparse(json.Value(clone), {sort_maps_by_key = true}, allocator)
 		json.destroy_value(json.Value(clone), allocator)
 		if unparse_err != nil { return false, .Allocation }
-		if !first && strings.write_byte(out, ',') != 1 { delete(text, allocator); return false, .Allocation }
+		if !first && strings.write_byte(out, ',') != 1 {
+			delete(text, allocator)
+			return false, .Allocation
+		}
 		first = false
 		if strings.write_string(out, text) != len(text) {
 			delete(text, allocator)
@@ -422,7 +423,8 @@ Provider_Replay_Read :: proc(output: string, allocator := context.allocator) -> 
 		object, is_object := item.(json.Object)
 		if !is_object || !openai_responses_replay_item_ok(object, allocator) { return nil, false }
 	}
-	declared := make([dynamic]Provider_Tool_Call, 0, len(array), allocator)
+	declared, make_error := make([dynamic]Provider_Tool_Call, 0, len(array), allocator)
+	if make_error != nil { return nil, false }
 	for item in array {
 		object := item.(json.Object)
 		item_type, _, _ := openai_value_string(object, "type")
@@ -431,27 +433,27 @@ Provider_Replay_Read :: proc(output: string, allocator := context.allocator) -> 
 		call_id, _, _ := openai_value_string(object, "call_id")
 		name, _, _ := openai_value_string(object, "name")
 		arguments, _, _ := openai_value_string(object, "arguments")
-		append(
-			&declared,
-			Provider_Tool_Call {
-				ID = strings.clone(call_id, allocator),
-				Item_ID = strings.clone(id, allocator),
-				Name = strings.clone(name, allocator),
-				Arguments = strings.clone(arguments, allocator),
-			},
-		)
+		call := Provider_Tool_Call {
+			ID        = strings.clone(call_id, allocator),
+			Item_ID   = strings.clone(id, allocator),
+			Name      = strings.clone(name, allocator),
+			Arguments = strings.clone(arguments, allocator),
+		}
+		if _, append_error := append(&declared, call); append_error != nil {
+			provider_tool_call_destroy(&call, allocator)
+			Provider_Tool_Calls_Destroy(declared[:], allocator)
+			return nil, false
+		}
 	}
 	return declared[:], true
 }
 
 // openai_responses_replay_item_ok reports whether one item of an endpoint output array can
 // be sent back as request input. An output item carries fields an input item has no place
-// for, and the input schema constrains some values the output schema does not: a call whose
-// arguments are not the object the schema requires is refused here rather than by the
-// endpoint, which would refuse every request that carried it.
-//
-// An item type this adapter does not model replays as it stands. Keeping fields and item
-// types the harness never learned is what the record is for.
+// for, and the input schema constrains some values the output schema does not, so an item
+// the schema could not take back is refused here rather than by the endpoint, which would
+// refuse every request that carried it. An item type this adapter does not model replays
+// as it stands.
 openai_responses_replay_item_ok :: proc(object: json.Object, allocator: mem.Allocator) -> bool {
 	item_type, type_present, type_ok := openai_value_string(object, "type")
 	if !type_ok || !type_present || item_type == "" { return false }
@@ -487,11 +489,18 @@ openai_responses_replay_item_ok :: proc(object: json.Object, allocator: mem.Allo
 
 provider_tool_fragment_by_item :: proc(object: json.Object, state: ^Provider_Stream_State, allocator := context.allocator) -> (^Provider_Tool_Fragment, bool) {
 	id, present, ok := openai_value_string(object, "item_id")
-	if !ok || !present || id == "" { state^.Phase = .Failed; return nil, false }
+	if !ok || !present || id == "" {
+		state^.Phase = .Failed
+		return nil, false
+	}
 	for &fragment in state.Tool_Fragments {
 		if fragment.Present && fragment.Item_ID == id { return &fragment, true }
 	}
-	fragment := provider_tool_fragment_append(state)
+	fragment, appended := provider_tool_fragment_append(state)
+	if !appended {
+		state^.Phase = .Failed
+		return nil, false
+	}
 	fragment.Item_ID = strings.clone(id, state.Allocator)
 	return fragment, true
 }
@@ -506,30 +515,13 @@ openai_responses_call_slot :: proc(object, item: json.Object, state: ^Provider_S
 		for &fragment in state.Tool_Fragments {
 			if fragment.Present && fragment.Wire_Index == index { return &fragment, true }
 		}
-		fragment := provider_tool_fragment_append(state)
+		fragment, appended := provider_tool_fragment_append(state)
+		if !appended { return nil, false }
 		fragment.Wire_Index = index
 		fragment.Wire_Index_Present = true
 		return fragment, true
 	}
-	fragment := provider_tool_fragment_append(state)
-	return fragment, true
-}
-
-openai_responses_tool_def :: proc(tool: Provider_Tool_Def, allocator := context.allocator) -> json.Value {
-	definition := make(json.Object, 5, allocator)
-	definition[strings.clone("type", allocator)] = json.String(strings.clone("function", allocator))
-	definition[strings.clone("name", allocator)] = json.String(strings.clone(tool.Name, allocator))
-	definition[strings.clone("description", allocator)] = json.String(strings.clone(tool.Description, allocator))
-	schema, parse_err := json.parse_string(tool.Parameters_JSON, .JSON, true, allocator)
-	if parse_err == nil {
-		defer json.destroy_value(schema, allocator)
-		definition[strings.clone("parameters", allocator)] = json.Value(json.clone_value(schema, allocator))
-	}
-	// Strict schema enforcement is not set: it requires every property to be
-	// required, which would make an optional argument mandatory and push the model
-	// into filling it with an empty value. The tool's own schema and the harness's
-	// reading of it are the contract.
-	return json.Value(definition)
+	return provider_tool_fragment_append(state)
 }
 
 openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream_State, done: bool) -> Provider_Stream_Error {
@@ -537,13 +529,13 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 	item: json.Object
 	if done {
 		if !item_present { return provider_stream_fail(state, .Invalid_Data, "done item has no item") }
-		var, item_ok := raw.(json.Object)
+		done_item, item_ok := raw.(json.Object)
 		if !item_ok { return provider_stream_fail(state, .Invalid_Data, "done item is not an object") }
-		item = var
+		item = done_item
 	} else if item_present {
-		var, item_ok := raw.(json.Object)
+		added_item, item_ok := raw.(json.Object)
 		if !item_ok { return provider_stream_fail(state, .Invalid_Data, "added item is not an object") }
-		item = var
+		item = added_item
 	}
 	if item != nil {
 		item_type, type_present, type_ok := openai_value_string(item, "type")
@@ -582,11 +574,13 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 			if fragment.Name != "" && fragment.Name != name { return provider_stream_fail(state, .Invalid_Data, "call name changed") }
 			if fragment.Name == "" { fragment.Name = strings.clone(name, state.Allocator) }
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call name is invalid") }
-		if args, present, ok := openai_value_string(item, "arguments"); ok && present && args != "" {
+		if arguments, present, ok := openai_value_string(item, "arguments"); ok && present && arguments != "" {
 			// The done item repeats the full arguments already streamed
 			// as deltas; replace so a replayed payload is not doubled.
 			clear(&fragment.Arguments)
-			append(&fragment.Arguments, args)
+			if _, append_error := append(&fragment.Arguments, arguments); append_error != nil {
+				return provider_stream_fail(state, .Invalid_Data, "tool call arguments could not be retained")
+			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call arguments are invalid") }
 		fragment.Present = true
 		if done { fragment.Complete = true }
@@ -761,7 +755,9 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		delta, delta_present, delta_ok := openai_value_string(object, "delta")
 		if !delta_ok { return provider_stream_fail(state, .Invalid_Data, "arguments delta is not text") }
 		if delta_present && delta != "" {
-			append(&fragment.Arguments, delta)
+			if _, append_error := append(&fragment.Arguments, delta); append_error != nil {
+				return provider_stream_fail(state, .Invalid_Data, "tool call arguments could not be retained")
+			}
 		}
 		fragment.Present = true
 		return .None
@@ -773,11 +769,13 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 			if fragment.Item_ID != "" && fragment.Item_ID != id { return provider_stream_fail(state, .Invalid_Data, "output item id changed") }
 			if fragment.Item_ID == "" { fragment.Item_ID = strings.clone(id, state.Allocator) }
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "item id is invalid") }
-		if args, present, ok := openai_value_string(object, "arguments"); ok && present && args != "" {
+		if arguments, present, ok := openai_value_string(object, "arguments"); ok && present && arguments != "" {
 			// The done event repeats full arguments; replace the
 			// accumulated bytes so a replayed prefix is not doubled.
 			clear(&fragment.Arguments)
-			append(&fragment.Arguments, args)
+			if _, append_error := append(&fragment.Arguments, arguments); append_error != nil {
+				return provider_stream_fail(state, .Invalid_Data, "tool call arguments could not be retained")
+			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call arguments are invalid") }
 		fragment.Present = true
 		fragment.Complete = true

@@ -3,10 +3,8 @@ package ai
 import "core:encoding/json"
 import "core:strings"
 
-// openai_chat_encode_request writes one Chat Completions request body. A body is
-// bytes: each string the request carries is written through its slot in the cache, so
-// the part of the conversation that did not change since the last request is copied
-// rather than written again.
+// openai_chat_encode_request writes one Chat Completions request body, with a cache reusing
+// the bytes it already holds for the texts this request carries again.
 openai_chat_encode_request :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -304,8 +302,10 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 								if fragment.Name != "" && fragment.Name != name { return provider_stream_fail(state, .Invalid_Data, "tool call name changed") }
 								if fragment.Name == "" { fragment.Name = strings.clone(name, state.Allocator) }
 							} else if !ok { return provider_stream_fail(state, .Invalid_Data, "tool call name is invalid") }
-							if args, present, ok := openai_value_string(function, "arguments"); ok && present && args != "" {
-								append(&fragment.Arguments, args)
+							if arguments, present, ok := openai_value_string(function, "arguments"); ok && present && arguments != "" {
+								if _, append_error := append(&fragment.Arguments, arguments); append_error != nil {
+									return provider_stream_fail(state, .Invalid_Data, "tool call arguments could not be retained")
+								}
 							} else if !ok { return provider_stream_fail(state, .Invalid_Data, "tool arguments are invalid") }
 						}
 					}

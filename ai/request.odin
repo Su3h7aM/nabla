@@ -243,22 +243,21 @@ provider_endpoint :: proc(endpoint: string, api: API_Kind, allocator: mem.Alloca
 	return strings.concatenate([]string{url.scheme, "://", url.host, path, "?", url.query}, allocator = allocator), true
 }
 
-// provider_request_headers builds the fields one request carries: the ones its
-// API family authenticates with, the version header that family requires, and
-// the client and session identities the caller named. Authentication and
-// identity are caller policy, so the transport never learns either: sse.post
-// carries whatever headers it is handed.
+// provider_encoded_headers builds the fields one request carries: the ones its API family
+// authenticates with, the version header that family requires, and the client and session
+// identities the caller named. Authentication and identity are caller policy, so the
+// transport never learns either: sse.post carries whatever headers it is handed.
 //
-// An empty credential yields no auth header rather than a refused request, which
-// is what an endpoint that needs no credential expects, and an unnamed client or
-// session sends no header for it. Every value in the result is owned by
-// allocator; the names are literals. provider_headers_destroy releases the whole
-// result.
+// An empty credential yields no auth header rather than a refused request, which is what
+// an endpoint that needs no credential expects, and an unnamed client or session sends no
+// header for it. Every value in the result is owned by allocator, released with
+// provider_headers_destroy, and nil means the result could not be allocated at all.
 @(private)
 provider_encoded_headers :: proc(connection: Provider_Connection, encoded: Provider_Encoded_Request, allocator := context.allocator) -> []client.Header {
-	// Sized for the most any API family needs, so every entry is allocated up
-	// front from the caller's allocator rather than grown through an ambient one.
+	// Sized for the most any API family needs, so every entry comes from the caller's
+	// allocator rather than an ambient one.
 	result := make([]client.Header, 5, allocator)
+	if result == nil { return nil }
 	count := 0
 	switch connection.API {
 	case .OpenAI_Chat_Completions, .OpenAI_Responses:
@@ -397,6 +396,7 @@ Provider_Request_Operation_Encoded :: proc(
 	}
 
 	headers := provider_encoded_headers(connection, encoded, allocator)
+	if headers == nil { return Provider_Operation_Error{kind = .Allocation} }
 	defer provider_headers_destroy(headers, allocator)
 
 	state := Provider_Request_Stream_State {
@@ -598,14 +598,11 @@ provider_state_release :: proc(state: ^Provider_Request_Stream_State) {
 	state.response_head.provider_request_id = ""
 }
 
-// provider_operation_error_kind maps a transport failure onto the operation's own
-// outcome, so a caller that only inspects the returned error still learns that the
-// request was interrupted rather than malformed.
-//
-// A TLS failure is the peer failing to authenticate, with one exception: a read or
-// a write that fails after the connection was established is a connection that
-// broke. That one is a transport failure, and sending again can succeed. The cause
-// is what tells them apart, because both arrive as the transport's TLS failure.
+// provider_operation_error_kind maps a transport failure onto the operation's own outcome,
+// so a caller that reads only the returned error still learns that the request was
+// interrupted rather than malformed. A TLS failure is the peer failing to authenticate,
+// with one exception: a read or write that failed after the connection was established is
+// a connection that broke, and sending again can succeed.
 provider_operation_error_kind :: proc(failure: client.Failure) -> Provider_Operation_Error_Kind {
 	if failure.cause == .TLS_Read || failure.cause == .TLS_Write { return .Transport }
 	switch failure.kind {
@@ -682,11 +679,9 @@ provider_terminal_error :: proc(state: ^Provider_Request_Stream_State, kind: Pro
 	return result
 }
 
-// provider_failure_kind maps a transport failure onto the event kind the caller
-// sees. Interruption is never reported as a stream defect, so a cancelled
-// operation can be distinguished from a broken one. A TLS read or write that failed
-// after the connection was established is a broken stream rather than an
-// unauthenticated peer, which is what lets it be sent again.
+// provider_failure_kind maps a transport failure onto the event kind the caller sees.
+// Interruption is never reported as a stream defect, so a cancelled operation can be told
+// from a broken one.
 provider_failure_kind :: proc(failure: client.Failure) -> Provider_Error_Kind {
 	if failure.cause == .TLS_Read || failure.cause == .TLS_Write { return .Stream_Truncated }
 	switch failure.kind {
@@ -875,11 +870,11 @@ provider_http_chunk :: proc(user_data: rawptr, chunk: []u8) {
 	sse.parser_feed(&state.parser, chunk)
 }
 
-// provider_error_body_append keeps a refused response's body for the
-// classification that follows. All of it is kept: only the complete body is
-// parsed, so a rejection whose evidence arrives late in a large document is
-// still read. The buffer grows with the operation's allocator, and release
-// frees it.
+// provider_error_body_append keeps a refused response's body for the classification that
+// follows. All of it is kept, because only the complete body is parsed, so a rejection
+// whose evidence arrives late in a large document is still read. A body that could not be
+// retained is treated as a truncated one, which leaves the status and the transport facts
+// as the evidence. The buffer grows with the operation's allocator, and release frees it.
 provider_error_body_append :: proc(state: ^Provider_Request_Stream_State, chunk: []u8) {
 	append(&state.error_body, ..chunk)
 }

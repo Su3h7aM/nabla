@@ -204,7 +204,8 @@ Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request
 		if message.Verbatim_Items != "" {
 			if request.API != .OpenAI_Responses { return .Invalid_Message }
 			continue
-		}; if message.Role == .Invalid { return .Invalid_Message }
+		}
+		if message.Role == .Invalid { return .Invalid_Message }
 		#partial switch message.Role {
 		case .Assistant:
 			if message.Content == "" && len(message.Tool_Calls) == 0 { return .Invalid_Message }
@@ -307,17 +308,20 @@ Provider_Event :: union {
 	Provider_Error_Event,
 }
 
-// Provider_Tool_Calls_Destroy releases a call list and every string it owns. It is the one
-// release path for calls a provider fact carries, so a new holder of one cannot free half
-// of a call or leak the rest.
+// Provider_Tool_Calls_Destroy releases a call list and every string it owns. A new holder
+// of calls a provider fact carries cannot free half of a call or leak the rest.
 Provider_Tool_Calls_Destroy :: proc(calls: []Provider_Tool_Call, allocator := context.allocator) {
-	for call in calls {
-		if call.ID != "" { delete(call.ID, allocator) }
-		if call.Item_ID != "" { delete(call.Item_ID, allocator) }
-		if call.Name != "" { delete(call.Name, allocator) }
-		if call.Arguments != "" { delete(call.Arguments, allocator) }
-	}
+	for &call in calls { provider_tool_call_destroy(&call, allocator) }
 	if calls != nil { delete(calls, allocator) }
+}
+
+// provider_tool_call_destroy releases every string one call owns, wherever it is stored.
+provider_tool_call_destroy :: proc(call: ^Provider_Tool_Call, allocator := context.allocator) {
+	if call.ID != "" { delete(call.ID, allocator) }
+	if call.Item_ID != "" { delete(call.Item_ID, allocator) }
+	if call.Name != "" { delete(call.Name, allocator) }
+	if call.Arguments != "" { delete(call.Arguments, allocator) }
+	call^ = {}
 }
 
 Provider_Event_Destroy :: proc(event: ^Provider_Event, allocator := context.allocator) {
@@ -381,12 +385,11 @@ provider_stream_batch_clear :: proc(state: ^Provider_Stream_State) {
 	clear(&state.Batch)
 }
 
-// provider_stream_push stages one event under the stream's ownership. One payload
-// decides how many events it carries, and the batch holds them all.
+// provider_stream_push stages one event under the stream's ownership. An event that
+// cannot be staged is destroyed and fails the stream, so the caller retains nothing.
 provider_stream_push :: proc(state: ^Provider_Stream_State, event: Provider_Event) {
 	if state.Batch.allocator.procedure == nil { state.Batch.allocator = state.Allocator }
 	if _, append_error := append(&state.Batch, event); append_error != nil {
-		// An event that cannot be staged is lost, so the stream cannot be trusted.
 		owned := event
 		Provider_Event_Destroy(&owned, state.Allocator)
 		state.Phase = .Failed
@@ -436,12 +439,14 @@ provider_tool_fragments_present :: proc(state: ^Provider_Stream_State) -> bool {
 	return false
 }
 
-provider_tool_fragment_append :: proc(state: ^Provider_Stream_State) -> ^Provider_Tool_Fragment {
+// provider_tool_fragment_append reserves the next tool-call slot. The slot is owned by
+// the stream and released with it, and false means it could not be reserved.
+provider_tool_fragment_append :: proc(state: ^Provider_Stream_State) -> (^Provider_Tool_Fragment, bool) {
 	fragment := Provider_Tool_Fragment {
 		Arguments = make([dynamic]u8, 0, state.Allocator),
 	}
-	append(&state.Tool_Fragments, fragment)
-	return &state.Tool_Fragments[len(state.Tool_Fragments) - 1]
+	if _, append_error := append(&state.Tool_Fragments, fragment); append_error != nil { return nil, false }
+	return &state.Tool_Fragments[len(state.Tool_Fragments) - 1], true
 }
 
 provider_tool_fragment_by_wire_index :: proc(state: ^Provider_Stream_State, index: i64) -> (^Provider_Tool_Fragment, bool) {
@@ -449,7 +454,8 @@ provider_tool_fragment_by_wire_index :: proc(state: ^Provider_Stream_State, inde
 	for &fragment in state.Tool_Fragments {
 		if fragment.Wire_Index_Present && fragment.Wire_Index == index { return &fragment, true }
 	}
-	fragment := provider_tool_fragment_append(state)
+	fragment, appended := provider_tool_fragment_append(state)
+	if !appended { return nil, false }
 	fragment.Wire_Index = index
 	fragment.Wire_Index_Present = true
 	return fragment, true
@@ -467,7 +473,8 @@ provider_tool_finalize :: proc(state: ^Provider_Stream_State, allocator := conte
 		}
 	}
 	if count == 0 { return nil, false }
-	calls := make([]Provider_Tool_Call, count, allocator)
+	calls, make_error := make([]Provider_Tool_Call, count, allocator)
+	if make_error != nil { return nil, false }
 	i := 0
 	for &fragment in state.Tool_Fragments {
 		if !fragment.Present { continue }

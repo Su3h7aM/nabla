@@ -140,18 +140,11 @@ Provider_Evidence :: struct {
 
 // provider_classify_failure names what a failed attempt means.
 //
-// Precedence, in order:
-//
-//  1. A local outcome keeps its own meaning. Cancellation, an expired deadline,
-//     and a request this client refused are not provider rejections, and provider
-//     text cannot turn them into one.
-//  2. A recognized code beats the status that carried it. A quota failure that
-//     arrived as a 429 is not throttling, and a context-limit code that arrived as
-//     a 400 is not a malformed request.
-//  3. What is left is read from the transport and the status.
-//
-// It never guesses: a status outside the classes HTTP defines, a code the adapter
-// does not know, and a stream defect nobody named all stay Unknown.
+// A local outcome keeps its own meaning, so provider text cannot turn a cancellation, an
+// expired deadline, or a request this client refused into a rejection. A recognized code
+// then beats the status that carried it, and what is left is read from the transport and
+// the status. It never guesses: a status outside the classes HTTP defines, a code the
+// adapter does not know, and a stream defect nobody named all stay Unknown.
 provider_classify_failure :: proc(evidence: Provider_Evidence) -> Provider_Failure_Class {
 	switch evidence.kind {
 	case .Cancelled, .Timed_Out, .Invalid_Request, .Allocation:
@@ -310,37 +303,29 @@ provider_retry_directive :: proc(api: API_Kind, headers: http.Headers) -> Provid
 	return .Unspecified
 }
 
-// provider_retry_after reads the delay a provider asked for.
-//
-// RFC 9110 10.2.3: the field is either delay-seconds (1*DIGIT, a nonnegative
-// number of seconds) or an HTTP-date, and neither form has a length bound.
-// Anything else yields no delay, including a value the transport combined
-// from repeated fields: the field is not a list, so a comma means the peer
-// sent something that is not an instruction this client can read. Digits are
-// scanned in full no matter how many there are, without allocating a big
-// integer; leading zeros do not overflow. A delay the provider stated is
-// returned in full: only a value past what a Duration can hold, which is that
-// type's own range and not a policy of this client, becomes the longest delay
-// it has, because a caller that read it as silence would send again. A date is
-// converted once, here at receipt, against the wall clock; the wait itself runs on
-// a monotonic deadline, so the clock moving afterwards cannot shorten it.
+// provider_retry_after reads the delay a provider asked for, and reports none when the
+// field is absent or is not the delay-seconds or HTTP-date form RFC 9110 10.2.3 defines.
+// Digits are scanned in full without allocating a big integer, and a date is converted
+// here at receipt against the wall clock. A stated delay is returned in full unless it is
+// past what a Duration can hold, which becomes that type's longest delay rather than none,
+// because a caller that read it as silence would send again.
 provider_retry_after :: proc(value: string) -> Maybe(time.Duration) {
 	if len(value) == 0 { return nil }
 	text := http.trim_ows(value)
 	if text == "" { return nil }
 
 	digits := true
-	for c in text {
-		if c < '0' || c > '9' {
+	for character in text {
+		if character < '0' || character > '9' {
 			digits = false
 			break
 		}
 	}
 	if digits {
 		seconds: i64
-		for c in text {
+		for character in text {
 			scaled, mul_overflow := intrinsics.overflow_mul(seconds, 10)
-			next, add_overflow := intrinsics.overflow_add(scaled, i64(c - '0'))
+			next, add_overflow := intrinsics.overflow_add(scaled, i64(character - '0'))
 			if mul_overflow || add_overflow { return max(time.Duration) }
 			seconds = next
 		}

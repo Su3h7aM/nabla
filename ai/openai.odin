@@ -134,35 +134,37 @@ openai_tool_parameters_write :: proc(cursor: ^Encode_Cursor, body: ^strings.Buil
 	return encode_write_object(cursor, body, schema, allocator)
 }
 
-openai_json_skip :: proc(raw: []u8, pos: int) -> int {
-	i := pos
+openai_json_skip :: proc(raw: []u8, position: int) -> int {
+	i := position
 	for i < len(raw) && (raw[i] == ' ' || raw[i] == '\t' || raw[i] == '\n' || raw[i] == '\r') { i += 1 }
 	return i
 }
 
-// Span of a JSON string starting at the opening quote. Returns the content
-// start and the position after the closing quote, or -1 on bad syntax.
-openai_json_string_span :: proc(raw: []u8, pos: int) -> (int, int) {
-	if pos >= len(raw) || raw[pos] != '"' { return -1, -1 }
-	i := pos + 1
+// openai_json_string_span spans a JSON string starting at the opening quote. It returns
+// the content start and the position after the closing quote, or -1 twice on bad syntax.
+openai_json_string_span :: proc(raw: []u8, position: int) -> (int, int) {
+	if position >= len(raw) || raw[position] != '"' { return -1, -1 }
+	i := position + 1
 	for i < len(raw) {
-		c := raw[i]
-		if c == '"' { return pos + 1, i + 1 }
-		if c == '\\' {
+		character := raw[i]
+		if character == '"' { return position + 1, i + 1 }
+		if character == '\\' {
 			i += 1
 			if i >= len(raw) { return -1, -1 }
-			esc := raw[i]
-			if esc == 'u' {
-				for k in 1 ..= 4 {
-					if i + k >= len(raw) { return -1, -1 }
-					h := raw[i + k]
-					if !(h >= '0' && h <= '9' || h >= 'a' && h <= 'f' || h >= 'A' && h <= 'F') { return -1, -1 }
+			escape := raw[i]
+			if escape == 'u' {
+				for offset in 1 ..= 4 {
+					if i + offset >= len(raw) { return -1, -1 }
+					hex_digit := raw[i + offset]
+					if !(hex_digit >= '0' && hex_digit <= '9' ||
+						   hex_digit >= 'a' && hex_digit <= 'f' ||
+						   hex_digit >= 'A' && hex_digit <= 'F') { return -1, -1 }
 				}
 				i += 4
-			} else if esc != '"' && esc != '\\' && esc != '/' && esc != 'b' && esc != 'f' && esc != 'n' && esc != 'r' && esc != 't' {
+			} else if escape != '"' && escape != '\\' && escape != '/' && escape != 'b' && escape != 'f' && escape != 'n' && escape != 'r' && escape != 't' {
 				return -1, -1
 			}
-		} else if c < 0x20 {
+		} else if character < 0x20 {
 			return -1, -1
 		}
 		i += 1
@@ -170,16 +172,16 @@ openai_json_string_span :: proc(raw: []u8, pos: int) -> (int, int) {
 	return -1, -1
 }
 
-openai_json_literal :: proc(raw: []u8, pos: int, word: string) -> int {
-	if pos + len(word) > len(raw) { return -1 }
-	for k in 0 ..< len(word) {
-		if raw[pos + k] != word[k] { return -1 }
+openai_json_literal :: proc(raw: []u8, position: int, word: string) -> int {
+	if position + len(word) > len(raw) { return -1 }
+	for offset in 0 ..< len(word) {
+		if raw[position + offset] != word[offset] { return -1 }
 	}
-	return pos + len(word)
+	return position + len(word)
 }
 
-openai_json_number_end :: proc(raw: []u8, pos: int) -> int {
-	i := pos
+openai_json_number_end :: proc(raw: []u8, position: int) -> int {
+	i := position
 	if i < len(raw) && (raw[i] == '-') { i += 1 }
 	if i >= len(raw) { return -1 }
 	if raw[i] == '0' { i += 1 } else if raw[i] >= '1' && raw[i] <= '9' {
@@ -199,24 +201,24 @@ openai_json_number_end :: proc(raw: []u8, pos: int) -> int {
 	return i
 }
 
-// Skip one JSON value; returns the position after it. Objects recurse with
-// the same duplicate-key rule, arrays recurse for shape only.
-openai_json_value_skip :: proc(raw: []u8, pos, depth: int) -> (int, bool) {
-	if depth < 0 { return pos, false }
-	i := openai_json_skip(raw, pos)
+// openai_json_value_skip skips one JSON value and returns the position after it. Objects
+// recurse with the same duplicate-key rule, arrays recurse for shape only.
+openai_json_value_skip :: proc(raw: []u8, position, depth: int) -> (int, bool) {
+	if depth < 0 { return position, false }
+	i := openai_json_skip(raw, position)
 	if i >= len(raw) { return i, false }
-	c := raw[i]
-	if c == '"' {
+	character := raw[i]
+	if character == '"' {
 		_, end := openai_json_string_span(raw, i)
 		if end < 0 { return i, false }
 		return end, true
 	}
-	if c == '{' {
+	if character == '{' {
 		end := openai_json_object_check(raw, i, depth)
 		if end < 0 { return i, false }
 		return end, true
 	}
-	if c == '[' {
+	if character == '[' {
 		i += 1
 		i = openai_json_skip(raw, i)
 		if i < len(raw) && raw[i] == ']' { return i + 1, true }
@@ -224,36 +226,50 @@ openai_json_value_skip :: proc(raw: []u8, pos, depth: int) -> (int, bool) {
 			next, ok := openai_json_value_skip(raw, i, depth - 1)
 			if !ok { return i, false }
 			i = openai_json_skip(raw, next)
-			if i < len(raw) && raw[i] == ',' { i = openai_json_skip(raw, i + 1); continue }
+			if i < len(raw) && raw[i] == ',' {
+				i = openai_json_skip(raw, i + 1)
+				continue
+			}
 			if i < len(raw) && raw[i] == ']' { return i + 1, true }
 			return i, false
 		}
 	}
-	if c == 't' { end := openai_json_literal(raw, i, "true"); return end, end >= 0 }
-	if c == 'f' { end := openai_json_literal(raw, i, "false"); return end, end >= 0 }
-	if c == 'n' { end := openai_json_literal(raw, i, "null"); return end, end >= 0 }
+	if character == 't' {
+		end := openai_json_literal(raw, i, "true")
+		return end, end >= 0
+	}
+	if character == 'f' {
+		end := openai_json_literal(raw, i, "false")
+		return end, end >= 0
+	}
+	if character == 'n' {
+		end := openai_json_literal(raw, i, "null")
+		return end, end >= 0
+	}
 	end := openai_json_number_end(raw, i)
 	return end, end >= 0
 }
 
-// True when the key bytes appeared earlier in this object. The caller
-// passes the keys seen so far, and a linear scan is what its small key
-// list costs.
+// openai_json_key_seen reports whether the key bytes appeared earlier in this object. The
+// caller passes the keys seen so far, and a linear scan is what its small list costs.
 openai_json_key_seen :: proc(raw: []u8, seen: [dynamic][2]int, key_start, key_end: int) -> bool {
 	for entry in seen {
 		if entry[1] - entry[0] != key_end - key_start { continue }
 		match := true
-		for k in 0 ..< (key_end - key_start) {
-			if raw[entry[0] + k] != raw[key_start + k] { match = false; break }
+		for offset in 0 ..< (key_end - key_start) {
+			if raw[entry[0] + offset] != raw[key_start + offset] {
+				match = false
+				break
+			}
 		}
 		if match { return true }
 	}
 	return false
 }
 
-openai_json_object_check :: proc(raw: []u8, pos, depth: int) -> int {
+openai_json_object_check :: proc(raw: []u8, position, depth: int) -> int {
 	if depth < 0 { return -1 }
-	i := openai_json_skip(raw, pos)
+	i := openai_json_skip(raw, position)
 	if i >= len(raw) || raw[i] != '{' { return -1 }
 	i += 1
 	i = openai_json_skip(raw, i)
@@ -271,7 +287,7 @@ openai_json_object_check :: proc(raw: []u8, pos, depth: int) -> int {
 		// arguments under one name, and core's parser would hide them.
 		// Only keys of this object count; values were already skipped.
 		if openai_json_key_seen(raw, seen, key_start, key_end) { return -1 }
-		append(&seen, [2]int{key_start, key_end})
+		if _, append_error := append(&seen, [2]int{key_start, key_end}); append_error != nil { return -1 }
 		i = openai_json_skip(raw, i)
 		if i >= len(raw) || raw[i] != ':' { return -1 }
 		i = openai_json_skip(raw, i + 1)
@@ -279,7 +295,10 @@ openai_json_object_check :: proc(raw: []u8, pos, depth: int) -> int {
 		if !value_ok { return -1 }
 		i = tail
 		i = openai_json_skip(raw, i)
-		if i < len(raw) && raw[i] == ',' { i += 1; continue }
+		if i < len(raw) && raw[i] == ',' {
+			i += 1
+			continue
+		}
 		if i < len(raw) && raw[i] == '}' { return i + 1 }
 		return -1
 	}

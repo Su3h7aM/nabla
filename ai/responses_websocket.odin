@@ -230,6 +230,7 @@ provider_websocket_dial :: proc(
 	}
 	defer delete(endpoint, allocator)
 	headers := provider_encoded_headers(session.connection, encoded, allocator)
+	if headers == nil { return Provider_Operation_Error{kind = .Allocation} }
 	defer provider_headers_destroy(headers, allocator)
 	http_options := client.Options {
 		ca_file = options.ca_file,

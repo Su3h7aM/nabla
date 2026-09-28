@@ -44,17 +44,11 @@ HTTP_Response_Facts :: struct {
 	transfer:  proc(user_data: rawptr, summary: Provider_Transfer_Summary),
 }
 
-// http_post_sse streams a Server-Sent Events response under one operation's
-// interruption policy. The wire details -- SSE headers, the expected content
-// type -- live in nabla:sse. What stays here is what is provider-specific: the
-// headers the request carries, the interrupt/deadline policy handed to the
-// transport as a wait hook, and the facts the caller needs reported.
-//
-// api and observer name the provider operation this transfer belongs to, so the
-// transport's own account of how far the request got can be reported through the
-// same observer that carries the encoded body and the response chunks. The
-// facts are reported whatever the observer does, so a recovery decision never
-// depends on diagnostics being enabled.
+// http_post_sse streams a Server-Sent Events response under one operation's interruption
+// policy. The wire details live in nabla:sse; what stays here is the request's headers, the
+// interrupt and deadline policy handed to the transport as a wait hook, and the facts the
+// caller needs reported. Those facts are reported whatever the observer does, so a recovery
+// decision never depends on diagnostics being enabled.
 http_post_sse :: proc(
 	request: HTTP_Request,
 	control: HTTP_Control,
@@ -165,10 +159,10 @@ http_transfer_phase :: proc(phase: client.Transfer_Phase) -> Provider_Transfer_P
 	unreachable()
 }
 
-// http_probe adapts this package's interrupt and deadline policy to the
-// transport's probe. Readiness belongs to the transport's event loop, so the
-// policy only answers whether the request should keep running; both cancellation
-// and a deadline stop a stalled phase rather than waiting for it to finish.
+// http_probe adapts this package's interrupt and deadline policy to the transport's probe.
+// Readiness belongs to the transport's event loop, so the policy only answers whether the
+// request should keep running, and both a cancellation and a deadline stop a stalled phase
+// rather than waiting for it to finish.
 http_probe :: proc(user_data: rawptr) -> client.Wait_Status {
 	control := cast(^HTTP_Control)user_data
 	if control == nil { return .Ready }

@@ -25,10 +25,8 @@ ANTHROPIC_BLOCK_TOOL_RESULT :: "tool_result"
 
 // --- encoding ----------------------------------------------------------------
 
-// anthropic_encode_request writes one Messages request body as bytes. The body is mostly
-// text the cache already holds: the instruction lane, every tool's schema, every tool
-// result, and the arguments of every call. A text that did not change is copied rather
-// than read and written again.
+// anthropic_encode_request writes one Messages request body, with a cache reusing the bytes
+// it already holds for the texts this request carries again.
 anthropic_encode_request :: proc(
 	request: Provider_Request,
 	cache: ^Provider_Encode_Cache,
@@ -398,7 +396,8 @@ anthropic_block_fragment :: proc(state: ^Provider_Stream_State, index: i64) -> (
 	for &fragment in state.Tool_Fragments {
 		if fragment.Wire_Index_Present && fragment.Wire_Index == index { return &fragment, true }
 	}
-	fragment := provider_tool_fragment_append(state)
+	fragment, appended := provider_tool_fragment_append(state)
+	if !appended { return nil, false }
 	fragment.Wire_Index = index
 	fragment.Wire_Index_Present = true
 	return fragment, true
@@ -573,8 +572,10 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 					}
 					text, text_err := json.unparse(raw_input, allocator = state.Allocator)
 					if text_err != nil { return provider_stream_fail(state, .Invalid_Data, "tool_use input is invalid") }
-					append(&fragment.Arguments, text)
-					delete(text, state.Allocator)
+					defer delete(text, state.Allocator)
+					if _, append_error := append(&fragment.Arguments, text); append_error != nil {
+						return provider_stream_fail(state, .Invalid_Data, "tool call arguments could not be retained")
+					}
 				}
 			}
 			fragment.Present = true
@@ -615,7 +616,9 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 					clear(&fragment.Arguments)
 					fragment.Arguments_Started = true
 				}
-				append(&fragment.Arguments, partial)
+				if _, append_error := append(&fragment.Arguments, partial); append_error != nil {
+					return provider_stream_fail(state, .Invalid_Data, "tool call arguments could not be retained")
+				}
 			}
 		case "thinking_delta", "signature_delta", "citations_delta":
 		// Not modelled: this adapter requests no thinking and sends no
