@@ -71,15 +71,15 @@
 //
 // # Example
 //
-//	conn: db.Conn
-//	defer db.close(&conn)
-//	sqlite.open(&conn, {path = "sessions.db", foreign_keys = true}) or_return
+//	connection: db.Conn
+//	defer db.close(&connection)
+//	sqlite.open(&connection, {path = "sessions.db", foreign_keys = true}) or_return
 //
-//	db.exec(&conn, "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT)") or_return
+//	db.exec(&connection, "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT)") or_return
 //
 //	rows: db.Rows
 //	defer db.rows_close(&rows)
-//	db.query(&conn, &rows, "SELECT id, title FROM sessions WHERE id = ?", {db.Value("abc")}) or_return
+//	db.query(&connection, &rows, "SELECT id, title FROM sessions WHERE id = ?", {db.Value("abc")}) or_return
 //	for {
 //		values, has_row, err := db.rows_next(&rows)
 //		if err != nil { return err }

@@ -7,114 +7,115 @@ package db
 // The zero value is a closed statement. A live Statement must not be copied or
 // moved: the connection keeps its address in a list of what it still owns.
 Statement :: struct {
-	conn:  ^Conn,
-	next:  ^Statement,
-	state: rawptr,
+	connection: ^Conn,
+	next:       ^Statement,
+	state:      rawptr,
 }
 
 // statement_prepare compiles sql for an idle connection. It ties the statement
 // into the connection's list of live statements and reports the backend state.
 @(private)
-statement_prepare :: proc(conn: ^Conn, sql: string) -> (state: rawptr, err: Error) {
-	conn_idle(conn) or_return
-	return conn.driver.prepare(conn.state, sql)
+statement_prepare :: proc(connection: ^Conn, sql: string) -> (state: rawptr, err: Error) {
+	connection_idle(connection) or_return
+	return connection.driver.prepare(connection.state, sql)
 }
 
 // statement_link and statement_unlink keep the connection's list of live
 // statements. close refuses to run while the list is non-empty.
 @(private)
-statement_link :: proc(stmt: ^Statement) {
-	stmt.next = stmt.conn.statements
-	stmt.conn.statements = stmt
+statement_link :: proc(statement: ^Statement) {
+	statement.next = statement.connection.statements
+	statement.connection.statements = statement
 }
 
 @(private)
-statement_unlink :: proc(stmt: ^Statement) {
-	link := &stmt.conn.statements
+statement_unlink :: proc(statement: ^Statement) {
+	link := &statement.connection.statements
 	for link^ != nil {
-		if link^ == stmt {
-			link^ = stmt.next
+		if link^ == statement {
+			link^ = statement.next
 			return
 		}
 		link = &link^.next
 	}
 }
 
-// prepare compiles sql into stmt for repeated execution. sql holds exactly one
-// statement and no NUL byte.
+// prepare compiles sql into statement for repeated execution. sql holds exactly
+// one statement and no NUL byte.
 //
-// stmt must be closed, so preparing over a live statement is refused rather than
+// statement must be closed, so preparing over a live one is refused rather than
 // silently leaking the state behind it. Pair prepare with statement_close. A
 // prepared statement belongs to one connection and stops being usable when that
 // connection closes, which close enforces by refusing to run first.
 @(require_results)
-prepare :: proc(conn: ^Conn, stmt: ^Statement, sql: string) -> Error {
-	if stmt.state != nil {
+prepare :: proc(connection: ^Conn, statement: ^Statement, sql: string) -> Error {
+	if statement.state != nil {
 		return error_make(.Invalid_State, 0, "the statement passed in is already prepared")
 	}
-	state, err := statement_prepare(conn, sql)
+	state, err := statement_prepare(connection, sql)
 	if err != nil { return err }
-	stmt^ = Statement {
-		conn  = conn,
-		state = state,
+	statement^ = Statement {
+		connection = connection,
+		state      = state,
 	}
-	statement_link(stmt)
+	statement_link(statement)
 	return nil
 }
 
-// statement_close releases stmt. A result set opened from it has to be closed
-// first. Closing a closed statement does nothing.
-statement_close :: proc(stmt: ^Statement) -> Error {
-	if stmt.state == nil { return nil }
-	if stmt.conn.active != nil {
+// statement_close releases a prepared statement and its backend state. A result
+// set opened from it has to be closed first. Closing a closed statement does
+// nothing.
+statement_close :: proc(statement: ^Statement) -> Error {
+	if statement.state == nil { return nil }
+	if statement.connection.active != nil {
 		return error_make(.Invalid_State, 0, "a result set is still open on the connection")
 	}
-	stmt.conn.driver.finalize(stmt.state)
-	statement_unlink(stmt)
-	stmt^ = {}
+	statement.connection.driver.finalize(statement.state)
+	statement_unlink(statement)
+	statement^ = {}
 	return nil
 }
 
-// statement_exec runs stmt with args to completion, discarding any rows it
-// produces. The statement stays prepared and ready for the next call.
+// statement_exec runs the statement with arguments to completion, discarding any
+// rows it produces. The statement stays prepared and ready for the next call.
 @(require_results)
-statement_exec :: proc(stmt: ^Statement, args: []Value = nil) -> Error {
-	if stmt.state == nil {
+statement_exec :: proc(statement: ^Statement, arguments: []Value = nil) -> Error {
+	if statement.state == nil {
 		return error_make(.Invalid_State, 0, "statement is closed")
 	}
-	conn_idle(stmt.conn) or_return
+	connection_idle(statement.connection) or_return
 
 	rows := Rows {
-		conn       = stmt.conn,
-		stmt_state = stmt.state,
+		connection      = statement.connection,
+		statement_state = statement.state,
 	}
-	if err := rows_execute(&rows, args, false); err != nil {
+	if err := rows_execute(&rows, arguments, false); err != nil {
 		return err
 	}
 	return rows_drain(&rows)
 }
 
-// statement_query runs stmt with args and leaves the result set open in rows.
-// The statement is borrowed, not owned: it stays prepared and the end of the set
-// leaves it that way.
+// statement_query runs the statement with arguments and leaves the result set
+// open in rows. The statement is borrowed, not owned: it stays prepared and the
+// end of the set leaves it that way.
 //
 // rows must be a closed set: statement_query refuses to overwrite one that is
 // still open, because nothing else would be left to close it.
 @(require_results)
-statement_query :: proc(stmt: ^Statement, rows: ^Rows, args: []Value = nil) -> Error {
-	if stmt.state == nil {
+statement_query :: proc(statement: ^Statement, rows: ^Rows, arguments: []Value = nil) -> Error {
+	if statement.state == nil {
 		return error_make(.Invalid_State, 0, "statement is closed")
 	}
-	if rows.conn != nil {
+	if rows.connection != nil {
 		return error_make(.Invalid_State, 0, "the result set passed in is still open")
 	}
-	conn_idle(stmt.conn) or_return
+	connection_idle(statement.connection) or_return
 
 	rows^ = Rows {
-		conn       = stmt.conn,
-		stmt_state = stmt.state,
+		connection      = statement.connection,
+		statement_state = statement.state,
 	}
-	if err := rows_execute(rows, args, true); err != nil {
+	if err := rows_execute(rows, arguments, true); err != nil {
 		rows^ = {}
 		return err
 	}

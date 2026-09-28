@@ -23,7 +23,7 @@ Driver :: struct {
 	// prepare compiles sql for the connection. sql is non-empty, holds no NUL
 	// byte, and contains exactly one statement: a backend must reject a second
 	// one rather than run the first and discard the rest.
-	prepare:          proc(conn: rawptr, sql: string) -> (stmt: rawptr, err: Error),
+	prepare:          proc(connection: rawptr, sql: string) -> (statement: rawptr, err: Error),
 
 	// finalize releases a prepared statement, whether or not it was executed.
 	// It reports nothing, so a backend whose finalize can fail has to surface
@@ -31,16 +31,16 @@ Driver :: struct {
 	// promises a caller that an error seen on one of those calls is the whole
 	// story, and it discards whatever finalize would have said. SQLite keeps
 	// that promise by always resetting through execution_finish first.
-	finalize:         proc(stmt: rawptr),
+	finalize:         proc(statement: rawptr),
 
-	// execute binds args to stmt and starts one execution of it. args are
-	// borrowed for the duration of the call; a backend must copy or consume
-	// them before returning. The returned state is what columns, next, row,
-	// and execution_finish run on.
+	// execute binds the arguments to the statement and starts one execution of
+	// it. The arguments are borrowed for the duration of the call; a backend
+	// must copy or consume them before returning. The returned state is what
+	// columns, next, row, and execution_finish run on.
 	//
 	// A wrong argument count or a value the statement cannot take is reported
 	// here rather than left for the first call to next.
-	execute:          proc(stmt: rawptr, args: []Value) -> (rows: rawptr, err: Error),
+	execute:          proc(statement: rawptr, arguments: []Value) -> (rows: rawptr, err: Error),
 
 	// columns reports how many columns the execution yields. It is read after
 	// the first next has stepped, because a backend may only settle on the
@@ -74,12 +74,12 @@ Driver :: struct {
 
 	// begin starts a transaction. It fails when one is already open, because
 	// SQL transactions do not nest.
-	begin:            proc(conn: rawptr) -> Error,
+	begin:            proc(connection: rawptr) -> Error,
 
 	// commit ends the open transaction. It fails when none is open.
-	commit:           proc(conn: rawptr) -> Error,
+	commit:           proc(connection: rawptr) -> Error,
 
 	// rollback discards the open transaction. Rolling back with none open
 	// succeeds, so a deferred rollback needs no state of its own.
-	rollback:         proc(conn: rawptr) -> Error,
+	rollback:         proc(connection: rawptr) -> Error,
 }

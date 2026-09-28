@@ -47,7 +47,7 @@ Fake_Conn :: struct {
 
 Fake_Stmt :: struct {
 	calls:      ^Fake_Calls,
-	conn:       ^Fake_Conn,
+	connection: ^Fake_Conn,
 	parameters: int,
 	columns:    int,
 
@@ -73,65 +73,65 @@ FAKE_DRIVER: Driver = {
 }
 
 fake_close :: proc(state: rawptr) -> Error {
-	conn := cast(^Fake_Conn)state
-	conn.calls.close += 1
-	if conn.fail_close != nil { return conn.fail_close }
-	free(conn)
+	connection := cast(^Fake_Conn)state
+	connection.calls.close += 1
+	if connection.fail_close != nil { return connection.fail_close }
+	free(connection)
 	return nil
 }
 
 fake_prepare :: proc(state: rawptr, sql: string) -> (rawptr, Error) {
-	conn := cast(^Fake_Conn)state
-	conn.calls.prepare += 1
-	if conn.fail_prepare != nil { return nil, conn.fail_prepare }
+	connection := cast(^Fake_Conn)state
+	connection.calls.prepare += 1
+	if connection.fail_prepare != nil { return nil, connection.fail_prepare }
 
-	stmt := new(Fake_Stmt)
-	stmt^ = Fake_Stmt {
-		calls      = conn.calls,
-		conn       = conn,
+	statement := new(Fake_Stmt)
+	statement^ = Fake_Stmt {
+		calls      = connection.calls,
+		connection = connection,
 		parameters = 0,
 		columns    = 2,
 	}
-	conn.prepared = stmt
-	return rawptr(stmt), nil
+	connection.prepared = statement
+	return rawptr(statement), nil
 }
 
 fake_finalize :: proc(state: rawptr) {
-	stmt := cast(^Fake_Stmt)state
-	stmt.calls.finalize += 1
-	free(stmt)
+	statement := cast(^Fake_Stmt)state
+	statement.calls.finalize += 1
+	free(statement)
 }
 
-fake_execute :: proc(state: rawptr, args: []Value) -> (rawptr, Error) {
-	stmt := cast(^Fake_Stmt)state
-	stmt.calls.execute += 1
-	if stmt.conn.fail_execute != nil { return nil, stmt.conn.fail_execute }
-	if len(args) != stmt.parameters {
+fake_execute :: proc(state: rawptr, arguments: []Value) -> (rawptr, Error) {
+	statement := cast(^Fake_Stmt)state
+	statement.calls.execute += 1
+	if statement.connection.fail_execute != nil { return nil, statement.connection.fail_execute }
+	if len(arguments) != statement.parameters {
 		return nil, error_make(.Invalid_Argument, 0, "wrong number of parameters")
 	}
-	return rawptr(stmt), nil
+	return rawptr(statement), nil
 }
 
 fake_columns :: proc(state: rawptr) -> int {
-	stmt := cast(^Fake_Stmt)state
-	stmt.calls.columns += 1
-	return stmt.columns
+	statement := cast(^Fake_Stmt)state
+	statement.calls.columns += 1
+	return statement.columns
 }
 
 fake_next :: proc(state: rawptr) -> (bool, Error) {
-	stmt := cast(^Fake_Stmt)state
-	stmt.calls.next += 1
-	if stmt.conn.fail_next != nil { return false, stmt.conn.fail_next }
-	if stmt.stepped >= len(fake_rows) { return false, nil }
-	stmt.stepped += 1
+	statement := cast(^Fake_Stmt)state
+	statement.calls.next += 1
+	if statement.connection.fail_next != nil { return false, statement.connection.fail_next }
+	if statement.stepped >= len(fake_rows) { return false, nil }
+	statement.stepped += 1
 	return true, nil
 }
 
 fake_row :: proc(state: rawptr, values: []Value) -> Error {
-	stmt := cast(^Fake_Stmt)state
-	stmt.calls.row += 1
-	if stmt.conn.fail_row != nil { return stmt.conn.fail_row }
-	current := fake_rows[stmt.stepped - 1]
+	statement := cast(^Fake_Stmt)state
+	statement.calls.row += 1
+	if statement.connection.fail_row != nil { return statement.connection.fail_row }
+	current := fake_rows[statement.stepped - 1]
 	for value, i in current {
 		if i < len(values) { values[i] = value }
 	}
@@ -139,28 +139,28 @@ fake_row :: proc(state: rawptr, values: []Value) -> Error {
 }
 
 fake_finish :: proc(state: rawptr) -> Error {
-	stmt := cast(^Fake_Stmt)state
-	stmt.calls.finish += 1
-	stmt.stepped = 0
-	return stmt.conn.fail_finish
+	statement := cast(^Fake_Stmt)state
+	statement.calls.finish += 1
+	statement.stepped = 0
+	return statement.connection.fail_finish
 }
 
 fake_begin :: proc(state: rawptr) -> Error {
-	conn := cast(^Fake_Conn)state
-	conn.calls.begin += 1
-	return conn.fail_begin
+	connection := cast(^Fake_Conn)state
+	connection.calls.begin += 1
+	return connection.fail_begin
 }
 
 fake_commit :: proc(state: rawptr) -> Error {
-	conn := cast(^Fake_Conn)state
-	conn.calls.commit += 1
-	return conn.fail_commit
+	connection := cast(^Fake_Conn)state
+	connection.calls.commit += 1
+	return connection.fail_commit
 }
 
 fake_rollback :: proc(state: rawptr) -> Error {
-	conn := cast(^Fake_Conn)state
-	conn.calls.rollback += 1
-	return conn.fail_rollback
+	connection := cast(^Fake_Conn)state
+	connection.calls.rollback += 1
+	return connection.fail_rollback
 }
 
 _expect_ok :: proc(t: ^testing.T, err: Error) {
@@ -170,24 +170,24 @@ _expect_ok :: proc(t: ^testing.T, err: Error) {
 	}
 }
 
-_fake_open :: proc(conn: ^Conn, calls: ^Fake_Calls) -> ^Fake_Conn {
+_fake_open :: proc(connection: ^Conn, calls: ^Fake_Calls) -> ^Fake_Conn {
 	fake := new(Fake_Conn)
 	fake.calls = calls
-	assert(conn_init(conn, &FAKE_DRIVER, fake, context.allocator) == nil, "the test handed conn_init an open connection")
+	assert(connection_init(connection, &FAKE_DRIVER, fake, context.allocator) == nil, "the test handed connection_init an open connection")
 	return fake
 }
 
 @(test)
 test_opening_an_already_open_connection_is_refused :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	_fake_open(&connection, &calls)
+	defer close(&connection)
 
-	// The caller of conn_init keeps ownership of the state it passed, so a
+	// The caller of connection_init keeps ownership of the state it passed, so a
 	// refused open is the backend's to clean up, not a silent overwrite.
 	spare: Fake_Conn
-	testing.expect_value(t, error_kind(conn_init(&conn, &FAKE_DRIVER, &spare, context.allocator)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(connection_init(&connection, &FAKE_DRIVER, &spare, context.allocator)), Error_Kind.Invalid_State)
 	testing.expect_value(t, calls.close, 0)
 	testing.expect_value(t, calls.prepare, 0)
 }
@@ -196,17 +196,17 @@ test_opening_an_already_open_connection_is_refused :: proc(t: ^testing.T) {
 test_zero_handles_are_already_closed :: proc(t: ^testing.T) {
 	// Zero is initialization: an unopened handle is a closed handle, and
 	// releasing it does nothing rather than reaching for null state.
-	conn: Conn
-	stmt: Statement
+	connection: Conn
+	statement: Statement
 	rows: Rows
-	testing.expect_value(t, close(&conn), nil)
-	testing.expect_value(t, statement_close(&stmt), nil)
+	testing.expect_value(t, close(&connection), nil)
+	testing.expect_value(t, statement_close(&statement), nil)
 	testing.expect_value(t, rows_close(&rows), nil)
 
-	testing.expect_value(t, error_kind(exec(&conn, "SELECT 1")), Error_Kind.Invalid_State)
-	testing.expect_value(t, error_kind(begin(&conn)), Error_Kind.Invalid_State)
-	testing.expect_value(t, error_kind(prepare(&conn, &stmt, "SELECT 1")), Error_Kind.Invalid_State)
-	testing.expect_value(t, error_kind(statement_exec(&stmt)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(exec(&connection, "SELECT 1")), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(begin(&connection)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(prepare(&connection, &statement, "SELECT 1")), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(statement_exec(&statement)), Error_Kind.Invalid_State)
 
 	_, has_row, err := rows_next(&rows)
 	testing.expect(t, !has_row, "a closed result set has no rows")
@@ -216,12 +216,12 @@ test_zero_handles_are_already_closed :: proc(t: ^testing.T) {
 @(test)
 test_query_owns_the_statement_it_prepares :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	_fake_open(&connection, &calls)
+	defer close(&connection)
 
 	rows: Rows
-	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
 	testing.expect_value(t, calls.prepare, 1)
 
 	values, has_row, err := rows_next(&rows)
@@ -239,16 +239,16 @@ test_query_owns_the_statement_it_prepares :: proc(t: ^testing.T) {
 @(test)
 test_statement_query_borrows_the_statement :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	_fake_open(&connection, &calls)
+	defer close(&connection)
 
-	stmt: Statement
-	_expect_ok(t, prepare(&conn, &stmt, "SELECT a, b"))
+	statement: Statement
+	_expect_ok(t, prepare(&connection, &statement, "SELECT a, b"))
 
 	for _ in 0 ..< 2 {
 		rows: Rows
-		_expect_ok(t, statement_query(&stmt, &rows))
+		_expect_ok(t, statement_query(&statement, &rows))
 		_, _, _ = rows_next(&rows)
 		_expect_ok(t, rows_close(&rows))
 	}
@@ -257,19 +257,19 @@ test_statement_query_borrows_the_statement :: proc(t: ^testing.T) {
 	testing.expect_value(t, calls.finish, 2)
 	testing.expect_value(t, calls.finalize, 0)
 
-	_expect_ok(t, statement_close(&stmt))
+	_expect_ok(t, statement_close(&statement))
 	testing.expect_value(t, calls.finalize, 1)
 }
 
 @(test)
 test_rows_next_stops_at_the_end :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	_fake_open(&connection, &calls)
+	defer close(&connection)
 
 	rows: Rows
-	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
 	defer rows_close(&rows)
 
 	seen := 0
@@ -294,14 +294,14 @@ test_rows_next_stops_at_the_end :: proc(t: ^testing.T) {
 @(test)
 test_an_execution_failure_wins_over_a_cleanup_failure :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	fake := _fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	fake := _fake_open(&connection, &calls)
+	defer close(&connection)
 
 	fake.fail_next = error_make(.Busy, 5, "the statement is locked")
 	fake.fail_finish = error_make(.Backend, 1, "the reset failed")
 
-	err := exec(&conn, "SELECT a, b")
+	err := exec(&connection, "SELECT a, b")
 	testing.expect_value(t, error_kind(err), Error_Kind.Busy)
 
 	// The cleanup failure is reported only when nothing earlier went wrong, but
@@ -313,13 +313,13 @@ test_an_execution_failure_wins_over_a_cleanup_failure :: proc(t: ^testing.T) {
 @(test)
 test_cleanup_failure_alone_is_reported :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	fake := _fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	fake := _fake_open(&connection, &calls)
+	defer close(&connection)
 
 	fake.fail_finish = error_make(.Busy, 5, "the reset is locked")
 
-	err := exec(&conn, "SELECT a, b")
+	err := exec(&connection, "SELECT a, b")
 	testing.expect_value(t, error_kind(err), Error_Kind.Busy)
 	testing.expect_value(t, calls.finalize, 1)
 }
@@ -327,53 +327,53 @@ test_cleanup_failure_alone_is_reported :: proc(t: ^testing.T) {
 @(test)
 test_a_failed_query_leaves_nothing_open :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	fake := _fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	fake := _fake_open(&connection, &calls)
+	defer close(&connection)
 
 	fake.fail_execute = error_make(.Constraint, 19, "no")
 
 	rows: Rows
-	testing.expect(t, query(&conn, &rows, "INSERT") != nil, "the query should have failed")
+	testing.expect(t, query(&connection, &rows, "INSERT") != nil, "the query should have failed")
 	// The statement prepared on the way to the failure was released, so the
 	// connection is free for the next caller.
 	testing.expect_value(t, calls.finalize, 1)
 
 	fake.fail_execute = nil
-	testing.expect_value(t, error_kind(exec(&conn, "SELECT a, b")), Error_Kind.None)
+	testing.expect_value(t, error_kind(exec(&connection, "SELECT a, b")), Error_Kind.None)
 }
 
 @(test)
 test_a_closed_connection_is_not_touched_by_the_backend :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
+	connection: Conn
+	_fake_open(&connection, &calls)
 
-	_expect_ok(t, close(&conn))
+	_expect_ok(t, close(&connection))
 	testing.expect_value(t, calls.close, 1)
 
 	// Releasing an already-released connection must not call the backend twice.
-	_expect_ok(t, close(&conn))
+	_expect_ok(t, close(&connection))
 	testing.expect_value(t, calls.close, 1)
 }
 
 @(test)
 test_transactions_reach_the_backend :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	fake := _fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	fake := _fake_open(&connection, &calls)
+	defer close(&connection)
 
-	_expect_ok(t, begin(&conn))
-	_expect_ok(t, commit(&conn))
-	_expect_ok(t, rollback(&conn))
+	_expect_ok(t, begin(&connection))
+	_expect_ok(t, commit(&connection))
+	_expect_ok(t, rollback(&connection))
 	testing.expect_value(t, calls.begin, 1)
 	testing.expect_value(t, calls.commit, 1)
 	testing.expect_value(t, calls.rollback, 1)
 
 	// A failure from the backend is what the caller sees, unchanged.
 	fake.fail_commit = error_make(.Busy, 5, "commit is locked")
-	testing.expect_value(t, error_kind(commit(&conn)), Error_Kind.Busy)
+	testing.expect_value(t, error_kind(commit(&connection)), Error_Kind.Busy)
 }
 
 @(test)
@@ -465,12 +465,12 @@ test_a_long_message_is_cut_short_and_marked :: proc(t: ^testing.T) {
 @(test)
 test_the_end_of_a_result_set_frees_the_connection :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	_fake_open(&connection, &calls)
+	defer close(&connection)
 
 	rows: Rows
-	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
 
 	seen := 0
 	for {
@@ -488,7 +488,7 @@ test_the_end_of_a_result_set_frees_the_connection :: proc(t: ^testing.T) {
 
 	finished := calls.finish
 	finalized := calls.finalize
-	_expect_ok(t, exec(&conn, "SELECT a, b"))
+	_expect_ok(t, exec(&connection, "SELECT a, b"))
 	testing.expect_value(t, calls.finish, finished + 1)
 	testing.expect_value(t, calls.finalize, finalized + 1)
 
@@ -503,12 +503,12 @@ test_the_end_of_a_result_set_frees_the_connection :: proc(t: ^testing.T) {
 @(test)
 test_a_finished_result_set_can_hold_the_next_one :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	_fake_open(&connection, &calls)
+	defer close(&connection)
 
 	rows: Rows
-	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
 	for {
 		_, has_row, err := rows_next(&rows)
 		_expect_ok(t, err)
@@ -517,7 +517,7 @@ test_a_finished_result_set_can_hold_the_next_one :: proc(t: ^testing.T) {
 
 	// A set that reached its end holds nothing, so the same Rows is closed as
 	// far as query is concerned.
-	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
 	_, has_row, err := rows_next(&rows)
 	_expect_ok(t, err)
 	testing.expect(t, has_row, "expected the second query to produce a row")
@@ -529,14 +529,14 @@ test_a_finished_result_set_can_hold_the_next_one :: proc(t: ^testing.T) {
 @(test)
 test_a_row_failure_ends_the_set_and_frees_the_connection :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	fake := _fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	fake := _fake_open(&connection, &calls)
+	defer close(&connection)
 
 	fake.fail_next = error_make(.Busy, 5, "the row could not be read")
 
 	rows: Rows
-	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
 
 	_, has_row, err := rows_next(&rows)
 	testing.expect(t, !has_row, "a failed row is not a row")
@@ -546,25 +546,25 @@ test_a_row_failure_ends_the_set_and_frees_the_connection :: proc(t: ^testing.T) 
 	// so the connection is free even though nothing was closed.
 	testing.expect_value(t, calls.finish, 1)
 	testing.expect_value(t, calls.finalize, 1)
-	_expect_ok(t, begin(&conn))
-	_expect_ok(t, rollback(&conn))
+	_expect_ok(t, begin(&connection))
+	_expect_ok(t, rollback(&connection))
 }
 
 @(test)
 test_a_borrowed_statement_survives_a_failed_set :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	fake := _fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	fake := _fake_open(&connection, &calls)
+	defer close(&connection)
 
-	stmt: Statement
-	_expect_ok(t, prepare(&conn, &stmt, "SELECT a, b"))
-	defer statement_close(&stmt)
+	statement: Statement
+	_expect_ok(t, prepare(&connection, &statement, "SELECT a, b"))
+	defer statement_close(&statement)
 
 	fake.fail_next = error_make(.Busy, 5, "the row could not be read")
 
 	rows: Rows
-	_expect_ok(t, statement_query(&stmt, &rows))
+	_expect_ok(t, statement_query(&statement, &rows))
 	_, _, err := rows_next(&rows)
 	testing.expect_value(t, error_kind(err), Error_Kind.Busy)
 	testing.expect_value(t, calls.finalize, 0)
@@ -572,7 +572,7 @@ test_a_borrowed_statement_survives_a_failed_set :: proc(t: ^testing.T) {
 	// The statement belongs to the caller, so a set that failed leaves it
 	// prepared rather than releasing it.
 	fake.fail_next = nil
-	_expect_ok(t, statement_query(&stmt, &rows))
+	_expect_ok(t, statement_query(&statement, &rows))
 	_, has_row, row_err := rows_next(&rows)
 	_expect_ok(t, row_err)
 	testing.expect(t, has_row, "the statement should run again")
@@ -583,43 +583,43 @@ test_a_borrowed_statement_survives_a_failed_set :: proc(t: ^testing.T) {
 @(test)
 test_preparing_over_a_live_statement_is_refused :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	_fake_open(&connection, &calls)
+	defer close(&connection)
 
-	stmt: Statement
-	_expect_ok(t, prepare(&conn, &stmt, "SELECT 1"))
+	statement: Statement
+	_expect_ok(t, prepare(&connection, &statement, "SELECT 1"))
 	testing.expect_value(t, calls.prepare, 1)
 
 	// Preparing over a live statement would leak the state behind it and leave
 	// the connection's list pointing at the old one.
-	testing.expect_value(t, error_kind(prepare(&conn, &stmt, "SELECT 2")), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(prepare(&connection, &statement, "SELECT 2")), Error_Kind.Invalid_State)
 	testing.expect_value(t, calls.prepare, 1)
 
-	_expect_ok(t, statement_close(&stmt))
-	_expect_ok(t, prepare(&conn, &stmt, "SELECT 2"))
+	_expect_ok(t, statement_close(&statement))
+	_expect_ok(t, prepare(&connection, &statement, "SELECT 2"))
 	testing.expect_value(t, calls.prepare, 2)
-	_expect_ok(t, statement_close(&stmt))
+	_expect_ok(t, statement_close(&statement))
 }
 
 @(test)
 test_a_live_result_set_is_not_overwritten :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	_fake_open(&connection, &calls)
+	defer close(&connection)
 
 	rows: Rows
-	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
 	testing.expect_value(t, calls.prepare, 1)
 
 	// Overwriting would strand the first set's statement and row buffer, so the
 	// second query never reaches the backend.
-	testing.expect_value(t, error_kind(query(&conn, &rows, "SELECT a, b")), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(query(&connection, &rows, "SELECT a, b")), Error_Kind.Invalid_State)
 	testing.expect_value(t, calls.prepare, 1)
 
 	_expect_ok(t, rows_close(&rows))
-	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
 	testing.expect_value(t, calls.prepare, 2)
 	_expect_ok(t, rows_close(&rows))
 }
@@ -627,28 +627,28 @@ test_a_live_result_set_is_not_overwritten :: proc(t: ^testing.T) {
 @(test)
 test_a_statement_is_not_queried_over_a_live_result_set :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	_fake_open(&connection, &calls)
+	defer close(&connection)
 
-	stmt: Statement
-	_expect_ok(t, prepare(&conn, &stmt, "SELECT a, b"))
-	defer statement_close(&stmt)
+	statement: Statement
+	_expect_ok(t, prepare(&connection, &statement, "SELECT a, b"))
+	defer statement_close(&statement)
 
 	rows: Rows
-	_expect_ok(t, statement_query(&stmt, &rows))
+	_expect_ok(t, statement_query(&statement, &rows))
 
 	// The connection is busy, and the output object is taken. Either refusal
 	// leaves the set that is running untouched.
-	testing.expect_value(t, error_kind(statement_query(&stmt, &rows)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(statement_query(&statement, &rows)), Error_Kind.Invalid_State)
 	testing.expect_value(t, calls.execute, 1)
 
 	other: Rows
-	testing.expect_value(t, error_kind(statement_query(&stmt, &other)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(statement_query(&statement, &other)), Error_Kind.Invalid_State)
 	testing.expect_value(t, calls.execute, 1)
 
 	_expect_ok(t, rows_close(&rows))
-	_expect_ok(t, statement_query(&stmt, &other))
+	_expect_ok(t, statement_query(&statement, &other))
 	_expect_ok(t, rows_close(&other))
 }
 
@@ -663,31 +663,31 @@ test_the_lifecycle_frees_every_allocation_exactly_once :: proc(t: ^testing.T) {
 	context.allocator = mem.tracking_allocator(&track)
 
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
+	connection: Conn
+	_fake_open(&connection, &calls)
 
-	stmt: Statement
-	_expect_ok(t, prepare(&conn, &stmt, "SELECT a, b"))
+	statement: Statement
+	_expect_ok(t, prepare(&connection, &statement, "SELECT a, b"))
 
 	// A borrowed statement outlives the set that runs on it, so the set has to
 	// release the execution without releasing the statement.
 	rows: Rows
-	_expect_ok(t, statement_query(&stmt, &rows))
+	_expect_ok(t, statement_query(&statement, &rows))
 	for {
 		_, has_row, err := rows_next(&rows)
 		_expect_ok(t, err)
 		if !has_row { break }
 	}
-	_expect_ok(t, statement_close(&stmt))
+	_expect_ok(t, statement_close(&statement))
 
 	// A set that query compiled owns its statement, so stopping short has to
 	// release both.
 	owned: Rows
-	_expect_ok(t, query(&conn, &owned, "SELECT a, b"))
+	_expect_ok(t, query(&connection, &owned, "SELECT a, b"))
 	_, _, _ = rows_next(&owned)
 	_expect_ok(t, rows_close(&owned))
 
-	_expect_ok(t, close(&conn))
+	_expect_ok(t, close(&connection))
 
 	// Freeing backend state twice panics inside the tracking allocator, so
 	// reaching this point already means every release ran once. What is left to
@@ -700,27 +700,27 @@ test_the_lifecycle_frees_every_allocation_exactly_once :: proc(t: ^testing.T) {
 @(test)
 test_statements_release_in_any_order :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	_fake_open(&conn, &calls)
+	connection: Conn
+	_fake_open(&connection, &calls)
 
 	first, second, third: Statement
-	_expect_ok(t, prepare(&conn, &first, "SELECT 1"))
-	_expect_ok(t, prepare(&conn, &second, "SELECT 2"))
-	_expect_ok(t, prepare(&conn, &third, "SELECT 3"))
+	_expect_ok(t, prepare(&connection, &first, "SELECT 1"))
+	_expect_ok(t, prepare(&connection, &second, "SELECT 2"))
+	_expect_ok(t, prepare(&connection, &third, "SELECT 3"))
 
 	// The connection tracks what it still owns in one list and refuses to close
 	// over it, so releasing out of order has to unlink the right entry each
 	// time rather than the head.
 	_expect_ok(t, statement_close(&second))
-	testing.expect_value(t, error_kind(close(&conn)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(close(&connection)), Error_Kind.Invalid_State)
 
 	_expect_ok(t, statement_close(&third))
-	testing.expect_value(t, error_kind(close(&conn)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(close(&connection)), Error_Kind.Invalid_State)
 
 	_expect_ok(t, statement_close(&first))
 	testing.expect_value(t, calls.finalize, 3)
 
-	_expect_ok(t, close(&conn))
+	_expect_ok(t, close(&connection))
 	testing.expect_value(t, calls.close, 1)
 
 	// Releasing one twice reaches nothing the second time.
@@ -731,14 +731,14 @@ test_statements_release_in_any_order :: proc(t: ^testing.T) {
 @(test)
 test_a_row_that_cannot_be_read_ends_the_set :: proc(t: ^testing.T) {
 	calls: Fake_Calls
-	conn: Conn
-	fake := _fake_open(&conn, &calls)
-	defer close(&conn)
+	connection: Conn
+	fake := _fake_open(&connection, &calls)
+	defer close(&connection)
 
 	fake.fail_row = error_make(.Out_Of_Memory, 7, "the row could not be read")
 
 	rows: Rows
-	_expect_ok(t, query(&conn, &rows, "SELECT a, b"))
+	_expect_ok(t, query(&connection, &rows, "SELECT a, b"))
 
 	_, has_row, err := rows_next(&rows)
 	testing.expect(t, !has_row, "a row that cannot be read is not a row")
@@ -748,6 +748,6 @@ test_a_row_that_cannot_be_read_ends_the_set :: proc(t: ^testing.T) {
 	// free even though nothing was closed.
 	testing.expect_value(t, calls.finish, 1)
 	testing.expect_value(t, calls.finalize, 1)
-	_expect_ok(t, begin(&conn))
-	_expect_ok(t, rollback(&conn))
+	_expect_ok(t, begin(&connection))
+	_expect_ok(t, rollback(&connection))
 }

@@ -44,9 +44,9 @@ _expect_failure :: proc(t: ^testing.T, err: db.Error, kind: db.Error_Kind) {
 }
 
 _open :: proc(t: ^testing.T) -> db.Conn {
-	conn: db.Conn
-	_expect_ok(t, open(&conn, CONFIG))
-	return conn
+	connection: db.Conn
+	_expect_ok(t, open(&connection, CONFIG))
+	return connection
 }
 
 _temp_directory :: proc(t: ^testing.T) -> string {
@@ -63,15 +63,15 @@ _temp_database :: proc(directory: string) -> string {
 
 @(test)
 test_exec_and_query_round_trip :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
-	_expect_ok(t, db.exec(&conn, "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, turns INTEGER)"))
-	_expect_ok(t, db.exec(&conn, "INSERT INTO sessions VALUES (?, ?, ?)", {db.Value("a"), db.Value("first"), db.Value(3)}))
-	_expect_ok(t, db.exec(&conn, "INSERT INTO sessions VALUES (?, ?, ?)", {db.Value("b"), db.Value("second"), db.Value(7)}))
+	_expect_ok(t, db.exec(&connection, "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, turns INTEGER)"))
+	_expect_ok(t, db.exec(&connection, "INSERT INTO sessions VALUES (?, ?, ?)", {db.Value("a"), db.Value("first"), db.Value(3)}))
+	_expect_ok(t, db.exec(&connection, "INSERT INTO sessions VALUES (?, ?, ?)", {db.Value("b"), db.Value("second"), db.Value(7)}))
 
 	rows: db.Rows
-	_expect_ok(t, db.query(&conn, &rows, "SELECT id, title, turns FROM sessions ORDER BY id"))
+	_expect_ok(t, db.query(&connection, &rows, "SELECT id, title, turns FROM sessions ORDER BY id"))
 	defer db.rows_close(&rows)
 
 	expected := [?]struct {
@@ -100,15 +100,15 @@ test_exec_and_query_round_trip :: proc(t: ^testing.T) {
 
 @(test)
 test_null_and_empty_are_distinct :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
-	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (a TEXT, b BLOB)"))
-	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (NULL, NULL)"))
-	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (?, ?)", {db.Value(""), db.Value([]u8{})}))
+	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (a TEXT, b BLOB)"))
+	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (NULL, NULL)"))
+	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (?, ?)", {db.Value(""), db.Value([]u8{})}))
 
 	rows: db.Rows
-	_expect_ok(t, db.query(&conn, &rows, "SELECT a, b FROM t"))
+	_expect_ok(t, db.query(&connection, &rows, "SELECT a, b FROM t"))
 	defer db.rows_close(&rows)
 
 	values, has_row, err := db.rows_next(&rows)
@@ -134,14 +134,14 @@ test_null_and_empty_are_distinct :: proc(t: ^testing.T) {
 
 @(test)
 test_row_values_stay_valid_across_columns :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
-	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (a TEXT, b TEXT, c BLOB)"))
-	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (?, ?, ?)", {db.Value("first"), db.Value("second"), db.Value([]u8{1, 2, 3})}))
+	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (a TEXT, b TEXT, c BLOB)"))
+	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (?, ?, ?)", {db.Value("first"), db.Value("second"), db.Value([]u8{1, 2, 3})}))
 
 	rows: db.Rows
-	_expect_ok(t, db.query(&conn, &rows, "SELECT a, b, c FROM t"))
+	_expect_ok(t, db.query(&connection, &rows, "SELECT a, b, c FROM t"))
 	defer db.rows_close(&rows)
 
 	values, has_row, err := db.rows_next(&rows)
@@ -161,21 +161,21 @@ test_row_values_stay_valid_across_columns :: proc(t: ^testing.T) {
 
 @(test)
 test_prepared_statement_rebinds_every_execution :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
-	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (value INTEGER)"))
 
-	stmt: db.Statement
-	_expect_ok(t, db.prepare(&conn, &stmt, "INSERT INTO t VALUES (?)"))
-	defer db.statement_close(&stmt)
+	statement: db.Statement
+	_expect_ok(t, db.prepare(&connection, &statement, "INSERT INTO t VALUES (?)"))
+	defer db.statement_close(&statement)
 
 	for value in ([?]i64{1, 2, 3}) {
-		_expect_ok(t, db.statement_exec(&stmt, {db.Value(value)}))
+		_expect_ok(t, db.statement_exec(&statement, {db.Value(value)}))
 	}
 
 	rows: db.Rows
-	_expect_ok(t, db.query(&conn, &rows, "SELECT sum(value), count(*) FROM t"))
+	_expect_ok(t, db.query(&connection, &rows, "SELECT sum(value), count(*) FROM t"))
 	defer db.rows_close(&rows)
 
 	values, has_row, err := db.rows_next(&rows)
@@ -189,56 +189,56 @@ test_prepared_statement_rebinds_every_execution :: proc(t: ^testing.T) {
 
 @(test)
 test_arity_is_checked_before_binding :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
-	stmt: db.Statement
-	_expect_ok(t, db.prepare(&conn, &stmt, "SELECT ? + ?"))
-	defer db.statement_close(&stmt)
+	statement: db.Statement
+	_expect_ok(t, db.prepare(&connection, &statement, "SELECT ? + ?"))
+	defer db.statement_close(&statement)
 
 	// A mismatch must not silently read the missing parameter as NULL.
-	_expect_failure(t, db.statement_exec(&stmt, {db.Value(1)}), .Invalid_Argument)
-	_expect_ok(t, db.statement_exec(&stmt, {db.Value(1), db.Value(2)}))
+	_expect_failure(t, db.statement_exec(&statement, {db.Value(1)}), .Invalid_Argument)
+	_expect_ok(t, db.statement_exec(&statement, {db.Value(1), db.Value(2)}))
 }
 
 @(test)
 test_one_statement_per_call :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
 	// SQLite compiles only the first statement and drops the rest, so the
 	// backend refuses rather than run half of what was written.
-	_expect_failure(t, db.exec(&conn, "SELECT 1; SELECT 2"), .Invalid_Argument)
-	_expect_failure(t, db.exec(&conn, "CREATE TABLE t (a INTEGER); DROP TABLE t"), .Invalid_Argument)
-	_expect_failure(t, db.exec(&conn, "SELECT 1; -- a note\nSELECT 2"), .Invalid_Argument)
+	_expect_failure(t, db.exec(&connection, "SELECT 1; SELECT 2"), .Invalid_Argument)
+	_expect_failure(t, db.exec(&connection, "CREATE TABLE t (a INTEGER); DROP TABLE t"), .Invalid_Argument)
+	_expect_failure(t, db.exec(&connection, "SELECT 1; -- a note\nSELECT 2"), .Invalid_Argument)
 	// A remainder that will not compile is still a remainder.
-	_expect_failure(t, db.exec(&conn, "SELECT 1; SELCT 2"), .Invalid_Argument)
-	_expect_failure(t, db.exec(&conn, ""), .Invalid_Argument)
-	_expect_failure(t, db.exec(&conn, "-- nothing here"), .Invalid_Argument)
+	_expect_failure(t, db.exec(&connection, "SELECT 1; SELCT 2"), .Invalid_Argument)
+	_expect_failure(t, db.exec(&connection, ""), .Invalid_Argument)
+	_expect_failure(t, db.exec(&connection, "-- nothing here"), .Invalid_Argument)
 
-	_expect_ok(t, db.exec(&conn, "SELECT 1"))
-	_expect_ok(t, db.exec(&conn, "SELECT 1;"))
-	_expect_ok(t, db.exec(&conn, "  SELECT 1 ; \n\t"))
-	_expect_ok(t, db.exec(&conn, "SELECT 1\n"))
-	_expect_ok(t, db.exec(&conn, "SELECT 1; ;"))
+	_expect_ok(t, db.exec(&connection, "SELECT 1"))
+	_expect_ok(t, db.exec(&connection, "SELECT 1;"))
+	_expect_ok(t, db.exec(&connection, "  SELECT 1 ; \n\t"))
+	_expect_ok(t, db.exec(&connection, "SELECT 1\n"))
+	_expect_ok(t, db.exec(&connection, "SELECT 1; ;"))
 }
 
 @(test)
 test_a_comment_after_the_terminator_is_not_a_second_statement :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
 	// The question the backend asks is whether anything after the statement
 	// compiles into another one. A comment does not, so this is one statement
 	// however it is punctuated.
-	_expect_ok(t, db.exec(&conn, "SELECT 1; -- done"))
-	_expect_ok(t, db.exec(&conn, "SELECT 1; /* done */"))
-	_expect_ok(t, db.exec(&conn, "SELECT 1; /* a */ ; /* b */"))
-	_expect_ok(t, db.exec(&conn, "SELECT 1 /* unterminated"))
-	_expect_ok(t, db.exec(&conn, "-- leading\nSELECT 1 -- trailing"))
+	_expect_ok(t, db.exec(&connection, "SELECT 1; -- done"))
+	_expect_ok(t, db.exec(&connection, "SELECT 1; /* done */"))
+	_expect_ok(t, db.exec(&connection, "SELECT 1; /* a */ ; /* b */"))
+	_expect_ok(t, db.exec(&connection, "SELECT 1 /* unterminated"))
+	_expect_ok(t, db.exec(&connection, "-- leading\nSELECT 1 -- trailing"))
 
 	rows: db.Rows
-	_expect_ok(t, db.query(&conn, &rows, "SELECT 2; -- and the row still comes back"))
+	_expect_ok(t, db.query(&connection, &rows, "SELECT 2; -- and the row still comes back"))
 	defer db.rows_close(&rows)
 	values, has_row, err := db.rows_next(&rows)
 	_expect_ok(t, err)
@@ -249,13 +249,13 @@ test_a_comment_after_the_terminator_is_not_a_second_statement :: proc(t: ^testin
 
 @(test)
 test_sql_can_contain_a_semicolon_inside_a_literal :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
 	// The terminator check looks past the compiled statement, not for a ';',
 	// so a semicolon inside a string is part of the statement.
 	rows: db.Rows
-	_expect_ok(t, db.query(&conn, &rows, "SELECT ';'"))
+	_expect_ok(t, db.query(&connection, &rows, "SELECT ';'"))
 	defer db.rows_close(&rows)
 
 	values, has_row, err := db.rows_next(&rows)
@@ -267,24 +267,24 @@ test_sql_can_contain_a_semicolon_inside_a_literal :: proc(t: ^testing.T) {
 
 @(test)
 test_transaction_commit_and_rollback :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
-	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (value INTEGER)"))
 
-	_expect_ok(t, db.begin(&conn))
-	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (1)"))
-	_expect_ok(t, db.rollback(&conn))
+	_expect_ok(t, db.begin(&connection))
+	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (1)"))
+	_expect_ok(t, db.rollback(&connection))
 
-	_expect_ok(t, db.begin(&conn))
-	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (2)"))
-	_expect_ok(t, db.commit(&conn))
+	_expect_ok(t, db.begin(&connection))
+	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (2)"))
+	_expect_ok(t, db.commit(&connection))
 
 	// A rollback with nothing open is what a deferred rollback does.
-	_expect_ok(t, db.rollback(&conn))
+	_expect_ok(t, db.rollback(&connection))
 
 	rows: db.Rows
-	_expect_ok(t, db.query(&conn, &rows, "SELECT value FROM t"))
+	_expect_ok(t, db.query(&connection, &rows, "SELECT value FROM t"))
 	defer db.rows_close(&rows)
 
 	values, has_row, err := db.rows_next(&rows)
@@ -300,50 +300,50 @@ test_transaction_commit_and_rollback :: proc(t: ^testing.T) {
 
 @(test)
 test_transaction_misuse_is_refused :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
-	_expect_failure(t, db.commit(&conn), .Invalid_State)
+	_expect_failure(t, db.commit(&connection), .Invalid_State)
 
-	_expect_ok(t, db.begin(&conn))
-	defer db.rollback(&conn)
-	_expect_failure(t, db.begin(&conn), .Invalid_State)
+	_expect_ok(t, db.begin(&connection))
+	defer db.rollback(&connection)
+	_expect_failure(t, db.begin(&connection), .Invalid_State)
 }
 
 @(test)
 test_result_set_holds_the_connection :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
-	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
-	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (1)"))
+	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (1)"))
 
 	rows: db.Rows
-	_expect_ok(t, db.query(&conn, &rows, "SELECT value FROM t"))
+	_expect_ok(t, db.query(&connection, &rows, "SELECT value FROM t"))
 
 	// One thing at a time: the connection belongs to the open result set.
-	_expect_failure(t, db.exec(&conn, "SELECT 1"), .Invalid_State)
-	_expect_failure(t, db.begin(&conn), .Invalid_State)
-	_expect_failure(t, db.close(&conn), .Invalid_State)
+	_expect_failure(t, db.exec(&connection, "SELECT 1"), .Invalid_State)
+	_expect_failure(t, db.begin(&connection), .Invalid_State)
+	_expect_failure(t, db.close(&connection), .Invalid_State)
 
 	_expect_ok(t, db.rows_close(&rows))
-	_expect_ok(t, db.exec(&conn, "SELECT 1"))
+	_expect_ok(t, db.exec(&connection, "SELECT 1"))
 }
 
 @(test)
 test_statement_holds_the_connection :: proc(t: ^testing.T) {
-	conn := _open(t)
-	defer db.close(&conn)
+	connection := _open(t)
+	defer db.close(&connection)
 
-	stmt: db.Statement
-	_expect_ok(t, db.prepare(&conn, &stmt, "SELECT 1"))
+	statement: db.Statement
+	_expect_ok(t, db.prepare(&connection, &statement, "SELECT 1"))
 
 	// A live statement points into the connection's state, so the connection
 	// will not free it from under the statement.
-	_expect_failure(t, db.close(&conn), .Invalid_State)
+	_expect_failure(t, db.close(&connection), .Invalid_State)
 
-	_expect_ok(t, db.statement_close(&stmt))
-	_expect_ok(t, db.close(&conn))
+	_expect_ok(t, db.statement_close(&statement))
+	_expect_ok(t, db.close(&connection))
 }
 
 @(test)
@@ -454,13 +454,13 @@ test_a_stale_wal_snapshot_is_not_a_busy_to_wait_out :: proc(t: ^testing.T) {
 
 @(test)
 test_read_only_needs_a_database_file :: proc(t: ^testing.T) {
-	conn: db.Conn
+	connection: db.Conn
 	// SQLite's own private temporary database is empty by definition, so a
 	// read-only connection to one would read a database this call invented
 	// rather than the one the caller named.
-	_expect_failure(t, open(&conn, {path = ":memory:", mode = .Read_Only}), .Invalid_Argument)
-	_expect_failure(t, open(&conn, {path = "", mode = .Read_Only}), .Invalid_Argument)
-	testing.expect(t, !db.conn_is_open(&conn), "a refused open must not publish a connection")
+	_expect_failure(t, open(&connection, {path = ":memory:", mode = .Read_Only}), .Invalid_Argument)
+	_expect_failure(t, open(&connection, {path = "", mode = .Read_Only}), .Invalid_Argument)
+	testing.expect(t, !db.connection_is_open(&connection), "a refused open must not publish a connection")
 }
 
 @(test)
@@ -471,8 +471,8 @@ test_read_only_never_creates_the_database :: proc(t: ^testing.T) {
 	path := _temp_database(directory)
 	defer delete(path)
 
-	conn: db.Conn
-	_expect_failure(t, open(&conn, {path = path, mode = .Read_Only}), .Backend)
+	connection: db.Conn
+	_expect_failure(t, open(&connection, {path = path, mode = .Read_Only}), .Backend)
 
 	// The point of the flag: a refused open leaves no file behind, so a
 	// diagnostics command cannot conjure an empty database where the user's
@@ -529,10 +529,10 @@ test_read_write_create_stays_the_default :: proc(t: ^testing.T) {
 
 	// The zero mode is what every existing caller relies on, so it still
 	// creates the database and still writes to it.
-	conn: db.Conn
-	_expect_ok(t, open(&conn, {path = path}))
-	defer db.close(&conn)
-	_expect_ok(t, db.exec(&conn, "CREATE TABLE t (value INTEGER)"))
-	_expect_ok(t, db.exec(&conn, "INSERT INTO t VALUES (1)"))
-	testing.expect_value(t, _scalar_i64(t, &conn, "SELECT value FROM t"), i64(1))
+	connection: db.Conn
+	_expect_ok(t, open(&connection, {path = path}))
+	defer db.close(&connection)
+	_expect_ok(t, db.exec(&connection, "CREATE TABLE t (value INTEGER)"))
+	_expect_ok(t, db.exec(&connection, "INSERT INTO t VALUES (1)"))
+	testing.expect_value(t, _scalar_i64(t, &connection, "SELECT value FROM t"), i64(1))
 }

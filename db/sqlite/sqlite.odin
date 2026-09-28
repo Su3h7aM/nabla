@@ -7,7 +7,7 @@
 // SQLite uses `?` placeholders. Nothing rewrites SQL for you, so write the
 // dialect you are talking to:
 //
-//	db.exec(&conn, "INSERT INTO log (at, message) VALUES (?, ?)", {db.Value(at), db.Value(text)})
+//	db.exec(&connection, "INSERT INTO log (at, message) VALUES (?, ?)", {db.Value(at), db.Value(text)})
 //
 // # One statement per call
 //
@@ -22,7 +22,7 @@
 // Everything else SQLite configures with a pragma is ordinary SQL, so it goes
 // through db.exec like anything else:
 //
-//	db.exec(&conn, "PRAGMA journal_mode = WAL") or_return
+//	db.exec(&connection, "PRAGMA journal_mode = WAL") or_return
 //
 // WAL is persistent, so asking for it once is enough. The other journal modes
 // reset with the connection, and busy_timeout and foreign_keys are per
@@ -37,9 +37,9 @@
 // the most recent one of those on the connection, and a SELECT or a DDL
 // statement does not overwrite it:
 //
-//	db.exec(&conn, "DELETE FROM log WHERE at < ?", {db.Value(cutoff)}) or_return
+//	db.exec(&connection, "DELETE FROM log WHERE at < ?", {db.Value(cutoff)}) or_return
 //	rows: db.Rows
-//	db.query(&conn, &rows, "SELECT changes()") or_return
+//	db.query(&connection, &rows, "SELECT changes()") or_return
 //
 // A transaction that reads before it writes is better started as
 // "BEGIN IMMEDIATE", which takes the write lock up front instead of failing
@@ -112,26 +112,26 @@ Conn :: struct {
 // so this is also the state db hands back for Rows.
 @(private)
 Stmt :: struct {
-	conn:   ^Conn,
-	handle: ^sqlite3_stmt,
+	connection: ^Conn,
+	handle:     ^sqlite3_stmt,
 }
 
 @(private)
 DRIVER: db.Driver = {
-	close            = conn_close,
-	prepare          = stmt_prepare,
-	finalize         = stmt_finalize,
-	execute          = stmt_execute,
-	columns          = stmt_columns,
+	close            = connection_close,
+	prepare          = statement_prepare,
+	finalize         = statement_finalize,
+	execute          = statement_execute,
+	columns          = statement_columns,
 	next             = execution_next,
 	row              = execution_row,
 	execution_finish = execution_finish,
-	begin            = conn_begin,
-	commit           = conn_commit,
-	rollback         = conn_rollback,
+	begin            = connection_begin,
+	commit           = connection_commit,
+	rollback         = connection_rollback,
 }
 
-// open opens the database described by config and publishes it as conn. The
+// open opens the database described by config and publishes it as connection. The
 // connection is fully configured before it is returned, so a caller that gets
 // no error has a database it can use.
 //
@@ -139,10 +139,10 @@ DRIVER: db.Driver = {
 // and never modifies the schema. Every allocation the connection makes comes
 // from allocator, which db.close hands back to this package.
 @(require_results)
-open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> db.Error {
+open :: proc(connection: ^db.Conn, config: Config, allocator := context.allocator) -> db.Error {
 	// Checked before the path reaches SQLite: open_v2 creates the file, so a
 	// refused open would otherwise leave a database behind.
-	if db.conn_is_open(conn) {
+	if db.connection_is_open(connection) {
 		return db.error_make(.Invalid_State, 0, "connection is already open")
 	}
 	if config.busy_timeout_ms < 0 {
@@ -176,11 +176,11 @@ open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> 
 	}
 	flags := OPEN_READWRITE | OPEN_CREATE
 	if config.mode == .Read_Only { flags = OPEN_READONLY }
-	rc := open_v2(path, &state.handle, c.int(flags), nil)
-	if rc != .OK {
+	result_code := open_v2(path, &state.handle, c.int(flags), nil)
+	if result_code != .OK {
 		// open_v2 returns a handle even when it fails, and that handle still
 		// has to be closed. errmsg is read before that happens.
-		err := failure(state.handle, rc)
+		err := failure(state.handle, result_code)
 		if state.handle != nil { close_v2(state.handle) }
 		free(state, allocator)
 		return err
@@ -190,9 +190,9 @@ open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> 
 		// SQLite takes an int here, so a caller asking for longer than one can
 		// express waits as long as it can rather than wrapping around to a
 		// short wait.
-		ms := min(config.busy_timeout_ms, int(max(c.int)))
-		if rc = busy_timeout(state.handle, c.int(ms)); rc != .OK {
-			err := failure(state.handle, rc)
+		milliseconds := min(config.busy_timeout_ms, int(max(c.int)))
+		if result_code = busy_timeout(state.handle, c.int(milliseconds)); result_code != .OK {
+			err := failure(state.handle, result_code)
 			close_v2(state.handle)
 			free(state, allocator)
 			return err
@@ -206,9 +206,9 @@ open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> 
 		}
 	}
 
-	// conn_init refuses a connection that is already open, and on that path the
+	// connection_init refuses a connection that is already open, and on that path the
 	// state is still this procedure's to release.
-	if err := db.conn_init(conn, &DRIVER, state, allocator); err != nil {
+	if err := db.connection_init(connection, &DRIVER, state, allocator); err != nil {
 		close_v2(state.handle)
 		free(state, allocator)
 		return err
@@ -217,19 +217,19 @@ open :: proc(conn: ^db.Conn, config: Config, allocator := context.allocator) -> 
 }
 
 @(private)
-conn_close :: proc(state: rawptr) -> db.Error {
-	conn := cast(^Conn)state
-	if rc := close_v2(conn.handle); rc != .OK {
+connection_close :: proc(state: rawptr) -> db.Error {
+	connection := cast(^Conn)state
+	if result_code := close_v2(connection.handle); result_code != .OK {
 		// The connection is untouched on failure, so the caller can retry.
-		return failure(conn.handle, rc)
+		return failure(connection.handle, result_code)
 	}
-	free(conn, conn.allocator)
+	free(connection, connection.allocator)
 	return nil
 }
 
 @(private)
-stmt_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
-	conn := cast(^Conn)state
+statement_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
+	connection := cast(^Conn)state
 	if len(sql) == 0 {
 		return nil, db.error_make(.Invalid_Argument, 0, "SQL is empty")
 	}
@@ -246,9 +246,9 @@ stmt_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
 	tail: cstring
 	// nByte is how much of sql SQLite may read, so sql needs no NUL terminator
 	// of its own.
-	rc := prepare_v3(conn.handle, cstring(raw_data(sql)), c.int(len(sql)), 0, &handle, &tail)
-	if rc != .OK {
-		return nil, failure(conn.handle, rc)
+	result_code := prepare_v3(connection.handle, cstring(raw_data(sql)), c.int(len(sql)), 0, &handle, &tail)
+	if result_code != .OK {
+		return nil, failure(connection.handle, result_code)
 	}
 	if handle == nil {
 		// An empty string or a lone comment compiles to no statement at all.
@@ -259,14 +259,14 @@ stmt_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
 		return nil, db.error_make(.Invalid_Argument, 0, "SQL contains more than one statement")
 	}
 
-	statement, alloc_err := new(Stmt, conn.allocator)
+	statement, alloc_err := new(Stmt, connection.allocator)
 	if alloc_err != nil {
 		finalize(handle)
 		return nil, db.error_make(.Out_Of_Memory, 0, "statement allocation failed")
 	}
 	statement^ = Stmt {
-		conn   = conn,
-		handle = handle,
+		connection = connection,
+		handle     = handle,
 	}
 	return rawptr(statement), nil
 }
@@ -309,7 +309,10 @@ tail_holds_more_sql :: proc(sql: string, tail: cstring) -> bool {
 				i += 2
 				for {
 					if i + 1 >= len(rest) { return false }
-					if rest[i] == '*' && rest[i + 1] == '/' { i += 2; break }
+					if rest[i] == '*' && rest[i + 1] == '/' {
+						i += 2
+						break
+					}
 					i += 1
 				}
 			} else {
@@ -323,93 +326,91 @@ tail_holds_more_sql :: proc(sql: string, tail: cstring) -> bool {
 }
 
 @(private)
-stmt_finalize :: proc(state: rawptr) {
-	stmt := cast(^Stmt)state
-	finalize(stmt.handle)
-	free(stmt, stmt.conn.allocator)
+statement_finalize :: proc(state: rawptr) {
+	statement := cast(^Stmt)state
+	finalize(statement.handle)
+	free(statement, statement.connection.allocator)
 }
 
 @(private)
-stmt_execute :: proc(state: rawptr, args: []db.Value) -> (rawptr, db.Error) {
-	stmt := cast(^Stmt)state
-	if expected := int(bind_parameter_count(stmt.handle)); len(args) != expected {
+statement_execute :: proc(state: rawptr, arguments: []db.Value) -> (rawptr, db.Error) {
+	statement := cast(^Stmt)state
+	if expected := int(bind_parameter_count(statement.handle)); len(arguments) != expected {
 		scratch: [64]u8
-		message := fmt.bprintf(scratch[:], "statement argument count: expected %d, got %d", expected, len(args))
+		message := fmt.bprintf(scratch[:], "statement argument count: expected %d, got %d", expected, len(arguments))
 		return nil, db.error_make(.Invalid_Argument, 0, message)
 	}
-	for arg, i in args {
-		if bind_err := bind(stmt, c.int(i + 1), arg); bind_err != nil {
+	for argument, i in arguments {
+		if bind_err := bind(statement, c.int(i + 1), argument); bind_err != nil {
 			return nil, bind_err
 		}
 	}
 	// SQLite holds the cursor and the bindings inside the statement, so the
 	// statement is the whole execution state.
-	return rawptr(stmt), nil
+	return rawptr(statement), nil
 }
 
-// stmt_columns reports how many columns the current execution yields. It is
+// statement_columns reports how many columns the current execution yields. It is
 // read after the first row has been stepped to: SQLite can recompile a
 // statement against a changed schema on its first step, and only the count
 // from after that is the count the rows ahead actually have.
 @(private)
-stmt_columns :: proc(state: rawptr) -> int {
-	stmt := cast(^Stmt)state
-	return int(column_count(stmt.handle))
+statement_columns :: proc(state: rawptr) -> int {
+	statement := cast(^Stmt)state
+	return int(column_count(statement.handle))
 }
 
 @(private)
-bind :: proc(stmt: ^Stmt, index: c.int, value: db.Value) -> db.Error {
-	rc: Result_Code
+bind :: proc(statement: ^Stmt, index: c.int, value: db.Value) -> db.Error {
+	result_code: Result_Code
 	// SAFETY: SQLITE_TRANSIENT (behaviour = -1) makes SQLite copy every bound
 	// buffer before it returns, so nothing bound here has to outlive the call.
-	switch v in value {
+	switch member in value {
 	case i64:
-		rc = bind_int64(stmt.handle, index, v)
+		result_code = bind_int64(statement.handle, index, member)
 	case f64:
 		// SQLite has no NaN and stores one as NULL, which would lose the value
 		// without saying so. An infinity is a value it can hold, so only NaN is
 		// refused; a caller that wants NULL passes nil.
-		if math.is_nan(v) {
+		if math.is_nan(member) {
 			return db.error_make(.Invalid_Argument, 0, "NaN has no SQL value; bind nil for NULL")
 		}
-		rc = bind_double(stmt.handle, index, v)
+		result_code = bind_double(statement.handle, index, member)
 	case bool:
-		rc = bind_int64(stmt.handle, index, 1 if v else 0)
+		result_code = bind_int64(statement.handle, index, 1 if member else 0)
 	case string:
 		// An empty string is a value, not NULL, and SQLite reads a null
 		// pointer as NULL, so the buffer handed over is never null.
-		text := raw_data(v)
+		text := raw_data(member)
 		if text == nil { text = raw_data(EMPTY_TEXT[:]) }
-		rc = bind_text64(stmt.handle, index, cstring(text), sqlite3_uint64(len(v)), {behaviour = -1}, UTF8)
+		result_code = bind_text64(statement.handle, index, cstring(text), sqlite3_uint64(len(member)), {behaviour = -1}, UTF8)
 	case []u8:
-		blob := raw_data(v)
+		blob := raw_data(member)
 		if blob == nil { blob = raw_data(EMPTY_TEXT[:]) }
-		rc = bind_blob64(stmt.handle, index, blob, sqlite3_uint64(len(v)), {behaviour = -1})
+		result_code = bind_blob64(statement.handle, index, blob, sqlite3_uint64(len(member)), {behaviour = -1})
 	case:
-		rc = bind_null(stmt.handle, index)
+		result_code = bind_null(statement.handle, index)
 	}
-	if rc != .OK {
-		return failure(stmt.conn.handle, rc)
+	if result_code != .OK {
+		return failure(statement.connection.handle, result_code)
 	}
 	return nil
 }
 
 @(private)
 execution_next :: proc(state: rawptr) -> (has_row: bool, err: db.Error) {
-	stmt := cast(^Stmt)state
-	rc := step(stmt.handle)
-	#partial switch rc {
+	statement := cast(^Stmt)state
+	result_code := step(statement.handle)
+	#partial switch result_code {
 	case .Row:
 		return true, nil
 	case .Done:
 		return false, nil
 	case:
-		return false, failure(stmt.conn.handle, rc)
+		return false, failure(statement.connection.handle, result_code)
 	}
 }
 
-// execution_row copies the row the execution is stopped on into values, which
-// is as long as stmt_columns reported for this execution.
 @(private)
 execution_row :: proc(state: rawptr, values: []db.Value) -> db.Error {
 	return fill(cast(^Stmt)state, values)
@@ -417,12 +418,12 @@ execution_row :: proc(state: rawptr, values: []db.Value) -> db.Error {
 
 @(private)
 execution_finish :: proc(state: rawptr) -> db.Error {
-	stmt := cast(^Stmt)state
+	statement := cast(^Stmt)state
 	// reset is where an implicit transaction is committed, so it can fail on a
 	// statement that stepped cleanly: an INSERT ... RETURNING that was not
 	// walked to the end reports its failure here, not at step.
-	if rc := reset(stmt.handle); rc != .OK {
-		return failure(stmt.conn.handle, rc)
+	if result_code := reset(statement.handle); result_code != .OK {
+		return failure(statement.connection.handle, result_code)
 	}
 	return nil
 }
@@ -435,14 +436,14 @@ execution_finish :: proc(state: rawptr) -> db.Error {
 // handing back the same null pointer it uses for a value that is not there;
 // errcode is the only thing that tells those two apart.
 @(private)
-fill :: proc(stmt: ^Stmt, values: []db.Value) -> db.Error {
+fill :: proc(statement: ^Stmt, values: []db.Value) -> db.Error {
 	for _, i in values {
 		column := c.int(i)
-		switch column_type(stmt.handle, column) {
+		switch column_type(statement.handle, column) {
 		case .Integer:
-			values[i] = column_int64(stmt.handle, column)
+			values[i] = column_int64(statement.handle, column)
 		case .Float:
-			values[i] = column_double(stmt.handle, column)
+			values[i] = column_double(statement.handle, column)
 		case .Text:
 			// The pointer is read before the length, the order SQLite documents
 			// as the safe one: asking for the pointer is what forces any
@@ -450,9 +451,9 @@ fill :: proc(stmt: ^Stmt, values: []db.Value) -> db.Error {
 			// from that call is a failed conversion until errcode says
 			// otherwise, and errcode has to be read at once, before anything
 			// else touches the connection.
-			text := column_text(stmt.handle, column)
+			text := column_text(statement.handle, column)
 			if text == nil {
-				if errcode(stmt.conn.handle) == .No_Mem {
+				if errcode(statement.connection.handle) == .No_Mem {
 					return db.error_make(.Out_Of_Memory, 0, "text column could not be read")
 				}
 				// The column cannot be NULL here, so nothing behind the pointer
@@ -460,17 +461,17 @@ fill :: proc(stmt: ^Stmt, values: []db.Value) -> db.Error {
 				values[i] = ""
 				continue
 			}
-			values[i] = string(text[:int(column_bytes(stmt.handle, column))])
+			values[i] = string(text[:int(column_bytes(statement.handle, column))])
 		case .Blob:
-			blob := column_blob(stmt.handle, column)
+			blob := column_blob(statement.handle, column)
 			if blob == nil {
-				if errcode(stmt.conn.handle) == .No_Mem {
+				if errcode(statement.connection.handle) == .No_Mem {
 					return db.error_make(.Out_Of_Memory, 0, "blob column could not be read")
 				}
 				values[i] = []u8{}
 				continue
 			}
-			values[i] = ([^]u8)(blob)[:int(column_bytes(stmt.handle, column))]
+			values[i] = ([^]u8)(blob)[:int(column_bytes(statement.handle, column))]
 		case .Null:
 			values[i] = nil
 		}
@@ -479,48 +480,48 @@ fill :: proc(stmt: ^Stmt, values: []db.Value) -> db.Error {
 }
 
 @(private)
-conn_begin :: proc(state: rawptr) -> db.Error {
-	conn := cast(^Conn)state
-	if get_autocommit(conn.handle) == 0 {
+connection_begin :: proc(state: rawptr) -> db.Error {
+	connection := cast(^Conn)state
+	if get_autocommit(connection.handle) == 0 {
 		return db.error_make(.Invalid_State, 0, "a transaction is already open")
 	}
-	return run(conn, "BEGIN")
+	return run(connection, "BEGIN")
 }
 
 @(private)
-conn_commit :: proc(state: rawptr) -> db.Error {
-	conn := cast(^Conn)state
-	if get_autocommit(conn.handle) != 0 {
+connection_commit :: proc(state: rawptr) -> db.Error {
+	connection := cast(^Conn)state
+	if get_autocommit(connection.handle) != 0 {
 		return db.error_make(.Invalid_State, 0, "no transaction is open")
 	}
 	// A COMMIT that fails with .Busy leaves the transaction open, so the
 	// caller can retry it rather than assume it was lost.
-	return run(conn, "COMMIT")
+	return run(connection, "COMMIT")
 }
 
 @(private)
-conn_rollback :: proc(state: rawptr) -> db.Error {
-	conn := cast(^Conn)state
-	if get_autocommit(conn.handle) != 0 {
+connection_rollback :: proc(state: rawptr) -> db.Error {
+	connection := cast(^Conn)state
+	if get_autocommit(connection.handle) != 0 {
 		// Nothing to undo, which is what a deferred rollback expects.
 		return nil
 	}
-	return run(conn, "ROLLBACK")
+	return run(connection, "ROLLBACK")
 }
 
 // run executes one statement this package wrote itself, with no parameters.
 @(private)
-run :: proc(conn: ^Conn, sql: string) -> db.Error {
+run :: proc(connection: ^Conn, sql: string) -> db.Error {
 	handle: ^sqlite3_stmt
-	rc := prepare_v3(conn.handle, cstring(raw_data(sql)), c.int(len(sql)), 0, &handle, nil)
-	if rc != .OK {
-		return failure(conn.handle, rc)
+	result_code := prepare_v3(connection.handle, cstring(raw_data(sql)), c.int(len(sql)), 0, &handle, nil)
+	if result_code != .OK {
+		return failure(connection.handle, result_code)
 	}
 	if handle == nil { return nil }
 
 	err: db.Error
-	if rc = step(handle); rc != .Done {
-		err = failure(conn.handle, rc)
+	if result_code = step(handle); result_code != .Done {
+		err = failure(connection.handle, result_code)
 	}
 	finalize(handle)
 	return err
@@ -530,14 +531,14 @@ run :: proc(conn: ^Conn, sql: string) -> db.Error {
 // and extended_errcode are read before anything else touches the handle,
 // because the next SQLite call can overwrite both.
 @(private)
-failure :: proc(handle: ^sqlite3, rc: Result_Code) -> db.Error {
+failure :: proc(handle: ^sqlite3, result_code: Result_Code) -> db.Error {
 	message := ""
-	code := c.int(rc)
+	code := c.int(result_code)
 	if handle != nil {
 		message = string(errmsg(handle))
 		code = extended_errcode(handle)
 	}
-	kind := classify(rc)
+	kind := classify(result_code)
 	// A stale WAL snapshot is an extended Busy, so the primary code the call
 	// returned cannot tell it from a lock worth waiting out.
 	if kind == .Busy && code == BUSY_SNAPSHOT {
@@ -549,9 +550,9 @@ failure :: proc(handle: ^sqlite3, rc: Result_Code) -> db.Error {
 // classify maps a result code onto db.Error_Kind. Only the kinds a caller can
 // act on are named; everything else keeps its code as .Backend.
 @(private)
-classify :: proc(rc: Result_Code) -> db.Error_Kind {
+classify :: proc(result_code: Result_Code) -> db.Error_Kind {
 	// An extended code carries its primary code in the low byte.
-	#partial switch Result_Code(c.int(rc) & 0xFF) {
+	#partial switch Result_Code(c.int(result_code) & 0xFF) {
 	case .OK, .Row, .Done:
 		return .None
 	case .Constraint:

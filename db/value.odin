@@ -28,30 +28,30 @@ I64_MIN_F64 :: -9223372036854775808.0
 @(private)
 I64_MAX_F64 :: 9223372036854775808.0
 
-// as_i64 returns v as an integer. A bool widens to 1 or 0. A float converts
+// as_i64 returns value as an integer. A bool widens to 1 or 0. A float converts
 // only when it is a whole number inside the i64 range, so reading a count that
 // arrived as a double works but rounding a measurement does not. Text, blobs,
 // and NULL do not convert.
 @(require_results)
-as_i64 :: proc(v: Value) -> (n: i64, err: Error) {
-	switch x in v {
+as_i64 :: proc(value: Value) -> (number: i64, err: Error) {
+	switch member in value {
 	case i64:
-		return x, nil
+		return member, nil
 	case f64:
 		// NaN orders false against both bounds, so it needs its own refusal.
-		if math.is_nan(x) {
+		if math.is_nan(member) {
 			return 0, error_make(.Out_Of_Range, 0, "NaN has no integer value")
 		}
-		if x < I64_MIN_F64 || x >= I64_MAX_F64 {
+		if member < I64_MIN_F64 || member >= I64_MAX_F64 {
 			return 0, error_make(.Out_Of_Range, 0, "float is outside the i64 range")
 		}
-		n = i64(x)
-		if f64(n) != x {
+		number = i64(member)
+		if f64(number) != member {
 			return 0, error_make(.Out_Of_Range, 0, "float is not a whole number")
 		}
-		return n, nil
+		return number, nil
 	case bool:
-		return 1 if x else 0, nil
+		return 1 if member else 0, nil
 	case string, []u8:
 		return 0, error_make(.Type_Mismatch, 0, "value is not an integer")
 	case:
@@ -59,23 +59,23 @@ as_i64 :: proc(v: Value) -> (n: i64, err: Error) {
 	}
 }
 
-// as_f64 returns v as a float. An integer converts only when the float can hold
+// as_f64 returns value as a float. An integer converts only when the float can hold
 // it exactly, so a value above 2^53 is an error rather than a rounded number.
 @(require_results)
-as_f64 :: proc(v: Value) -> (x: f64, err: Error) {
-	switch y in v {
+as_f64 :: proc(value: Value) -> (number: f64, err: Error) {
+	switch member in value {
 	case f64:
-		return y, nil
+		return member, nil
 	case i64:
-		x = f64(y)
+		number = f64(member)
 		// Round-tripping has to check the range before converting back: a
 		// float at 2^63 cannot become an i64.
-		if x < I64_MIN_F64 || x >= I64_MAX_F64 || i64(x) != y {
+		if number < I64_MIN_F64 || number >= I64_MAX_F64 || i64(number) != member {
 			return 0, error_make(.Out_Of_Range, 0, "integer is not exactly representable as a float")
 		}
-		return x, nil
+		return number, nil
 	case bool:
-		return 1 if y else 0, nil
+		return 1 if member else 0, nil
 	case string, []u8:
 		return 0, error_make(.Type_Mismatch, 0, "value is not a float")
 	case:
@@ -83,16 +83,16 @@ as_f64 :: proc(v: Value) -> (x: f64, err: Error) {
 	}
 }
 
-// as_bool returns v as a boolean. A bool converts directly; an integer
+// as_bool returns value as a boolean. A bool converts directly; an integer
 // converts only when it is 0 or 1. Text and floats do not convert.
 @(require_results)
-as_bool :: proc(v: Value) -> (b: bool, err: Error) {
-	switch x in v {
+as_bool :: proc(value: Value) -> (result: bool, err: Error) {
+	switch member in value {
 	case bool:
-		return x, nil
+		return member, nil
 	case i64:
-		if x == 0 { return false, nil }
-		if x == 1 { return true, nil }
+		if member == 0 { return false, nil }
+		if member == 1 { return true, nil }
 		return false, error_make(.Out_Of_Range, 0, "integer is neither 0 nor 1")
 	case f64, string, []u8:
 		return false, error_make(.Type_Mismatch, 0, "value is not a boolean")
@@ -101,13 +101,13 @@ as_bool :: proc(v: Value) -> (b: bool, err: Error) {
 	}
 }
 
-// as_string returns v as text. Only the text case converts; use as_bytes for a
-// blob. The result aliases the same storage as v.
+// as_string returns value as text. Only the text case converts; use as_bytes for
+// a blob. The result aliases the same storage as value.
 @(require_results)
-as_string :: proc(v: Value) -> (s: string, err: Error) {
-	switch x in v {
+as_string :: proc(value: Value) -> (text: string, err: Error) {
+	switch member in value {
 	case string:
-		return x, nil
+		return member, nil
 	case i64, f64, bool, []u8:
 		return "", error_make(.Type_Mismatch, 0, "value is not text")
 	case:
@@ -115,13 +115,13 @@ as_string :: proc(v: Value) -> (s: string, err: Error) {
 	}
 }
 
-// as_bytes returns v as a blob. Only the blob case converts; use as_string for
-// text. The result aliases the same storage as v.
+// as_bytes returns value as a blob. Only the blob case converts; use as_string
+// for text. The result aliases the same storage as value.
 @(require_results)
-as_bytes :: proc(v: Value) -> (b: []u8, err: Error) {
-	switch x in v {
+as_bytes :: proc(value: Value) -> (bytes: []u8, err: Error) {
+	switch member in value {
 	case []u8:
-		return x, nil
+		return member, nil
 	case i64, f64, bool, string:
 		return nil, error_make(.Type_Mismatch, 0, "value is not a blob")
 	case:

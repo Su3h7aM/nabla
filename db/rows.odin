@@ -11,15 +11,15 @@ package db
 // The zero value is a closed set. A live Rows must not be copied or moved: the
 // connection holds its address as the one execution currently running.
 Rows :: struct {
-	conn:        ^Conn,
-	stmt_state:  rawptr,
-	owns_stmt:   bool,
+	connection:      ^Conn,
+	statement_state: rawptr,
+	owns_statement:  bool,
 
 	// materialize says whether the caller wants the row values. An execution
 	// whose rows are discarded allocates no buffer and reads no rows.
-	materialize: bool,
-	state:       rawptr,
-	values:      []Value,
+	materialize:     bool,
+	state:           rawptr,
+	values:          []Value,
 }
 
 // rows_execute starts one execution of the statement already prepared for rows.
@@ -29,14 +29,14 @@ Rows :: struct {
 // A failure leaves no execution running, so a caller that gives up here has
 // nothing to finish.
 @(private)
-rows_execute :: proc(rows: ^Rows, args: []Value, materialize: bool) -> Error {
-	conn := rows.conn
-	state, err := conn.driver.execute(rows.stmt_state, args)
+rows_execute :: proc(rows: ^Rows, arguments: []Value, materialize: bool) -> Error {
+	connection := rows.connection
+	state, err := connection.driver.execute(rows.statement_state, arguments)
 	if err != nil { return err }
 
 	rows.state = state
 	rows.materialize = materialize
-	conn.active = rows
+	connection.active = rows
 	return nil
 }
 
@@ -56,9 +56,9 @@ rows_next :: proc(rows: ^Rows) -> (values: []Value, has_row: bool, err: Error) {
 	if rows.state == nil {
 		return nil, false, error_make(.Invalid_State, 0, "no result set is open")
 	}
-	conn := rows.conn
+	connection := rows.connection
 
-	stepped, next_err := conn.driver.next(rows.state)
+	stepped, next_err := connection.driver.next(rows.state)
 	if stepped {
 		if rows.materialize {
 			if rows.values == nil {
@@ -66,18 +66,18 @@ rows_next :: proc(rows: ^Rows) -> (values: []Value, has_row: bool, err: Error) {
 				// to: a backend can only settle on the result's shape while
 				// stepping, and a buffer sized before that can disagree with
 				// the rows it is about to hold.
-				buffer, alloc_err := make([]Value, conn.driver.columns(rows.state), conn.allocator)
+				buffer, alloc_err := make([]Value, connection.driver.columns(rows.state), connection.allocator)
 				if alloc_err != nil {
-					conn.driver.execution_finish(rows.state)
+					connection.driver.execution_finish(rows.state)
 					rows_release(rows)
 					return nil, false, error_make(.Out_Of_Memory, 0, "row buffer allocation failed")
 				}
 				rows.values = buffer
 			}
-			if row_err := conn.driver.row(rows.state, rows.values); row_err != nil {
+			if row_err := connection.driver.row(rows.state, rows.values); row_err != nil {
 				// A row that cannot be read is an end: nothing behind it is
 				// trustworthy, and the execution is over either way.
-				finish_err := conn.driver.execution_finish(rows.state)
+				finish_err := connection.driver.execution_finish(rows.state)
 				first := row_err
 				if first == nil { first = finish_err }
 				rows_release(rows)
@@ -93,7 +93,7 @@ rows_next :: proc(rows: ^Rows) -> (values: []Value, has_row: bool, err: Error) {
 	// can report one more failure on the way out: reset is where SQLite commits
 	// an implicit transaction, so a statement that stepped cleanly can still
 	// fail here. An error from the row itself is the one worth keeping.
-	finish_err := conn.driver.execution_finish(rows.state)
+	finish_err := connection.driver.execution_finish(rows.state)
 	first := next_err
 	if first == nil { first = finish_err }
 	rows_release(rows)
@@ -104,13 +104,13 @@ rows_next :: proc(rows: ^Rows) -> (values: []Value, has_row: bool, err: Error) {
 // connection is still open, which is what lets it reach the allocator.
 @(private)
 rows_release :: proc(rows: ^Rows) {
-	conn := rows.conn
-	if conn != nil {
-		if rows.owns_stmt && rows.stmt_state != nil {
-			conn.driver.finalize(rows.stmt_state)
+	connection := rows.connection
+	if connection != nil {
+		if rows.owns_statement && rows.statement_state != nil {
+			connection.driver.finalize(rows.statement_state)
 		}
-		if rows.values != nil { delete(rows.values, conn.allocator) }
-		if conn.active == rows { conn.active = nil }
+		if rows.values != nil { delete(rows.values, connection.allocator) }
+		if connection.active == rows { connection.active = nil }
 	}
 	rows^ = {}
 }
@@ -134,12 +134,12 @@ rows_drain :: proc(rows: ^Rows) -> Error {
 // resources are released either way: an error here never leaves a set to close
 // twice.
 rows_close :: proc(rows: ^Rows) -> Error {
-	conn := rows.conn
-	if conn == nil { return nil }
+	connection := rows.connection
+	if connection == nil { return nil }
 
 	first: Error
 	if rows.state != nil {
-		if err := conn.driver.execution_finish(rows.state); err != nil { first = err }
+		if err := connection.driver.execution_finish(rows.state); err != nil { first = err }
 	}
 	rows_release(rows)
 	return first
