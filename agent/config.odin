@@ -6,10 +6,9 @@ import "core:os"
 import "core:strings"
 import lua "vendor:lua/5.4"
 
-CONFIG_MAX_BYTES :: 1024 * 1024
-CONFIG_MAX_ENTRIES :: 4096
-CONFIG_MAX_LEVELS :: 64
-CONFIG_MAX_DEPTH :: 16
+// CONFIG_INSTRUCTIONS bounds how long the user's configuration Lua code may run.
+// Configuration is evaluated on a harness thread, so this bound keeps that thread
+// responsive; it caps nothing the model asked for.
 CONFIG_INSTRUCTIONS :: 200000
 
 Config_Error :: enum {
@@ -57,7 +56,7 @@ lua_string :: proc(state: ^lua.State, idx: c.int, allocator: mem.Allocator) -> (
 	if lua.type(state, idx) != .STRING { return "", .Invalid }
 	n: c.size_t
 	p := lua.tolstring(state, idx, &n)
-	if p == nil || n > c.size_t(CONFIG_MAX_BYTES) { return "", .Invalid }
+	if p == nil { return "", .Invalid }
 	value, clone_error := strings.clone(string(p), allocator)
 	if clone_error != nil { return "", .Allocation }
 	return value, .None
@@ -169,7 +168,7 @@ load_model :: proc(state: ^lua.State, raw_idx: c.int, provider_id, model_id: str
 	lua.settop(state, base)
 	lua_field(state, idx, "input_modalities")
 	if lua.type(state, -1) != .NIL {
-		if !lua_plain_table(state, -1) || lua.rawlen(state, -1) > lua.Unsigned(CONFIG_MAX_LEVELS) { return .Invalid }
+		if !lua_plain_table(state, -1) { return .Invalid }
 		for i in 1 ..= int(lua.rawlen(state, -1)) {
 			lua.rawgeti(state, -1, lua.Integer(i))
 			value, value_error := lua_string(state, -1, allocator)
@@ -189,7 +188,7 @@ load_model :: proc(state: ^lua.State, raw_idx: c.int, provider_id, model_id: str
 	lua.settop(state, base)
 	lua_field(state, idx, "output_modalities")
 	if lua.type(state, -1) != .NIL {
-		if !lua_plain_table(state, -1) || lua.rawlen(state, -1) > lua.Unsigned(CONFIG_MAX_LEVELS) { return .Invalid }
+		if !lua_plain_table(state, -1) { return .Invalid }
 		for i in 1 ..= int(lua.rawlen(state, -1)) {
 			lua.rawgeti(state, -1, lua.Integer(i))
 			value, value_error := lua_string(state, -1, allocator)
@@ -236,7 +235,6 @@ load_model :: proc(state: ^lua.State, raw_idx: c.int, provider_id, model_id: str
 			lua_field(state, -1, "levels")
 			if lua.type(state, -1) != .NIL {
 				if !lua_plain_table(state, -1) { return .Invalid }
-				if lua.rawlen(state, -1) > lua.Unsigned(CONFIG_MAX_LEVELS) { return .Invalid }
 				for i in 1 ..= int(lua.rawlen(state, -1)) {
 					lua.rawgeti(state, -1, lua.Integer(i))
 					value, value_error := lua_string(state, -1, allocator)
@@ -327,12 +325,10 @@ load_provider :: proc(state: ^lua.State, raw_idx: c.int, provider_id: string, al
 	if lua.type(state, -1) != .NIL {
 		if !lua_plain_table(state, -1) { return .Invalid }
 		models_idx := lua.absindex(state, -1)
-		count := 0
 		lua.pushnil(state)
 		for {
 			if lua.next(state, models_idx) == 0 { break }
-			count += 1
-			if count > CONFIG_MAX_ENTRIES || lua.type(state, -2) != .STRING { return .Invalid }
+			if lua.type(state, -2) != .STRING { return .Invalid }
 			model_id, model_id_error := lua_string(state, -2, allocator)
 			if model_id_error != .None { return model_id_error }
 			model: Catalog_Model_Source
@@ -390,7 +386,6 @@ load_lua_config_full :: proc(
 	}
 	data, read_err := os.read_entire_file(path, context.temp_allocator)
 	if read_err != nil { return {}, {}, {}, .Read }
-	if len(data) > CONFIG_MAX_BYTES { return {}, {}, {}, .Invalid }
 	state := lua.L_newstate(); if state == nil { return {}, {}, {}, .Lua }; defer lua.close(state)
 	lua.sethook(state, lua_limit_hook, lua.MASKCOUNT, CONFIG_INSTRUCTIONS)
 	if lua.L_loadbuffer(state, raw_data(data), c.size_t(len(data)), "@nabla-config", "t") != .OK { return {}, {}, {}, .Lua }
@@ -406,13 +401,11 @@ load_lua_config_full :: proc(
 	if lua.type(state, -1) != .NIL {
 		if !lua_plain_table(state, -1) { return {}, {}, {}, .Invalid }
 		result.allocator = allocator
-		count := 0
 		providers_idx := lua.absindex(state, -1)
 		lua.pushnil(state)
 		for {
 			if lua.next(state, providers_idx) == 0 { break }
-			count += 1
-			if count > CONFIG_MAX_ENTRIES || lua.type(state, -2) != .STRING {
+			if lua.type(state, -2) != .STRING {
 				catalog_sources_destroy(&result, allocator)
 				return {}, {}, {}, .Invalid
 			}
@@ -489,7 +482,6 @@ load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynam
 	}
 	data, read_err := os.read_entire_file(path, context.temp_allocator)
 	if read_err != nil { return {}, .Read }
-	if len(data) > CONFIG_MAX_BYTES { return {}, .Invalid }
 	state := lua.L_newstate(); if state == nil { return {}, .Lua }; defer lua.close(state)
 	lua.sethook(state, lua_limit_hook, lua.MASKCOUNT, CONFIG_INSTRUCTIONS)
 	if lua.L_loadbuffer(state, raw_data(data), c.size_t(len(data)), "@nabla-config", "t") != .OK { return {}, .Lua }
@@ -501,13 +493,11 @@ load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynam
 	if !lua_plain_table(state, -1) { return {}, .Invalid }
 	result: [dynamic]Catalog_Provider_Source
 	result.allocator = allocator
-	count := 0
 	providers_idx := lua.absindex(state, -1)
 	lua.pushnil(state)
 	for {
 		if lua.next(state, providers_idx) == 0 { break }
-		count += 1
-		if count > CONFIG_MAX_ENTRIES || lua.type(state, -2) != .STRING {
+		if lua.type(state, -2) != .STRING {
 			catalog_sources_destroy(&result, allocator)
 			return {}, .Invalid
 		}

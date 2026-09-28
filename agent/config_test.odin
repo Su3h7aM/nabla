@@ -3,6 +3,7 @@ package agent
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:testing"
 
 @(test)
@@ -165,4 +166,83 @@ test_lua_config_failures_leave_no_partial_sources :: proc(t: ^testing.T) {
 		testing.expect_value(t, len(sources), 0)
 		catalog_sources_destroy(&sources)
 	}
+}
+
+// A user's configuration is plain data, so this reader refuses nothing for its size.
+// The fixture is past every fixed cap such a reader used to impose: a file over 1 MiB,
+// more than 4,096 providers and models, a thinking list over 64 levels, more than 32
+// MCP servers, and a server with more than 256 arguments, environment entries, and
+// tool aliases.
+@(test)
+test_configuration_of_any_size_loads_whole :: proc(t: ^testing.T) {
+	body := strings.builder_make(context.temp_allocator)
+	defer strings.builder_destroy(&body)
+
+	strings.write_string(&body, "return { providers = {")
+	strings.write_string(&body, `padded = { api_key = "`)
+	strings.write_string(&body, strings.repeat("x", 1200 * 1024, context.temp_allocator))
+	strings.write_string(&body, `" },`)
+	for index in 1 ..= 4100 { config_test_lua_index(&body, "p", index, " = {},") }
+	strings.write_string(&body, "big = { models = {")
+	for index in 1 ..= 4100 { config_test_lua_index(&body, "m", index, " = {},") }
+	strings.write_string(&body, "wide = { thinking = { levels = {")
+	for _ in 1 ..= 100 { strings.write_string(&body, `"level",`) }
+	strings.write_string(&body, "} } } } } },")
+
+	strings.write_string(&body, "mcp = { servers = {")
+	strings.write_string(&body, `s0 = { executable = "/usr/bin/serve", arguments = {`)
+	for _ in 1 ..= 300 { strings.write_string(&body, `"--flag",`) }
+	strings.write_string(&body, "}, environment = {")
+	for index in 1 ..= 300 { config_test_lua_index(&body, "VAR", index, ` = "v",`) }
+	strings.write_string(&body, "}, tools = {")
+	for index in 1 ..= 300 { config_test_lua_index(&body, `["remote.`, index, `"] = {enabled = false},`) }
+	strings.write_string(&body, "} },")
+	for index in 1 ..= 40 { config_test_lua_index(&body, "s", index, ` = { executable = "/usr/bin/serve" },`) }
+	strings.write_string(&body, "} } }")
+
+	path := fmt.aprintf("/tmp/nabla-config-test-large-%d.lua", os.get_pid(), allocator = context.temp_allocator)
+	defer os.remove(path)
+	testing.expect(t, os.write_entire_file(path, transmute([]u8)strings.to_string(body)) == nil)
+
+	sources, _, servers, err := load_lua_config_full(path)
+	defer catalog_sources_destroy(&sources)
+	defer mcp_servers_destroy(&servers)
+	if !testing.expect_value(t, err, Config_Error.None) { return }
+	if !testing.expect_value(t, len(sources), 4102) { return }
+
+	big: ^Catalog_Provider_Source
+	padded: ^Catalog_Provider_Source
+	for &provider in sources {
+		if provider.id == "big" { big = &provider }
+		if provider.id == "padded" { padded = &provider }
+	}
+	if !testing.expect(t, big != nil && padded != nil) { return }
+	testing.expect_value(t, len(big.models), 4101)
+	testing.expect_value(t, len(padded.api_key), 1200 * 1024)
+
+	wide_model: ^Catalog_Model_Source
+	for &model in big.models {
+		if model.id == "wide" { wide_model = &model }
+	}
+	if !testing.expect(t, wide_model != nil) { return }
+	testing.expect_value(t, len(wide_model.thinking.levels), 100)
+
+	if !testing.expect_value(t, len(servers), 41) { return }
+	wide: ^MCP_Server_Config
+	for &server in servers {
+		if server.id == "s0" { wide = &server }
+	}
+	if !testing.expect(t, wide != nil) { return }
+	testing.expect_value(t, len(wide.stdio.arguments), 300)
+	testing.expect_value(t, len(wide.stdio.environment), 300)
+	testing.expect_value(t, len(wide.tools), 300)
+}
+
+// config_test_lua_index writes a Lua fragment with a decimal index between its
+// prefix and suffix, which is how the large fixture names its entries.
+@(private)
+config_test_lua_index :: proc(body: ^strings.Builder, prefix: string, index: int, suffix: string) {
+	strings.write_string(body, prefix)
+	strings.write_int(body, index)
+	strings.write_string(body, suffix)
 }

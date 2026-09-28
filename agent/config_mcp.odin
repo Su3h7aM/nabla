@@ -14,11 +14,6 @@ import "nabla:mcp"
 MCP_DEFAULT_DISCOVERY_TIMEOUT :: 5 * time.Second
 MCP_DEFAULT_CALL_TIMEOUT :: 30 * time.Second
 
-// MCP_MAX_SERVERS bounds how many servers one configuration may declare, and
-// MCP_MAX_ENTRIES bounds one server's arguments, environment, and aliases.
-MCP_MAX_SERVERS :: 32
-MCP_MAX_ENTRIES :: 256
-
 // MCP_Environment is one variable a server is launched with. Both strings are owned.
 MCP_Environment :: struct {
 	name:  string,
@@ -100,12 +95,7 @@ MCP_Server_Config_From_Stdio :: proc(
 	MCP_Server_Config,
 	Config_Error,
 ) {
-	if !tool_name_valid(id) ||
-	   executable == "" ||
-	   !strings.has_prefix(executable, "/") ||
-	   len(environment_names) != len(environment_values) ||
-	   len(arguments) > MCP_MAX_ENTRIES ||
-	   len(environment_names) > MCP_MAX_ENTRIES {
+	if !tool_name_valid(id) || executable == "" || !strings.has_prefix(executable, "/") || len(environment_names) != len(environment_values) {
 		return {}, .Invalid
 	}
 	config := MCP_Server_Config {
@@ -287,12 +277,10 @@ mcp_servers_load :: proc(state: ^lua.State, idx: c.int, allocator: mem.Allocator
 	if !lua_plain_table(state, idx) { return {}, .Invalid }
 
 	table := lua.absindex(state, idx)
-	count := 0
 	lua.pushnil(state)
 	for {
 		if lua.next(state, table) == 0 { break }
-		count += 1
-		if count > MCP_MAX_SERVERS || lua.type(state, -2) != .STRING {
+		if lua.type(state, -2) != .STRING {
 			mcp_servers_destroy(&servers, allocator)
 			return {}, .Invalid
 		}
@@ -416,7 +404,6 @@ mcp_string_list :: proc(state: ^lua.State, raw_idx: c.int, allocator: mem.Alloca
 	if !lua_plain_table(state, raw_idx) { return nil, .Invalid }
 	index := lua.absindex(state, raw_idx)
 	length := int(lua.rawlen(state, index))
-	if length > MCP_MAX_ENTRIES { return nil, .Invalid }
 	values, values_error := make([dynamic]string, 0, length, allocator)
 	if values_error != nil { return nil, .Allocation }
 	for position in 1 ..= length {
@@ -451,11 +438,9 @@ mcp_environment_load :: proc(state: ^lua.State, raw_idx: c.int, allocator: mem.A
 	index := lua.absindex(state, raw_idx)
 	entries, entries_error := make([dynamic]MCP_Environment, 0, allocator)
 	if entries_error != nil { return nil, .Allocation }
-	count := 0
 	lua.pushnil(state)
 	for lua.next(state, index) != 0 {
-		count += 1
-		if count > MCP_MAX_ENTRIES || lua.type(state, -2) != .STRING {
+		if lua.type(state, -2) != .STRING {
 			mcp_environment_release(entries, allocator)
 			return nil, .Invalid
 		}
@@ -519,11 +504,9 @@ mcp_tool_configs_load :: proc(state: ^lua.State, raw_idx: c.int, allocator: mem.
 	index := lua.absindex(state, raw_idx)
 	configs, configs_error := make([dynamic]MCP_Tool_Config, 0, allocator)
 	if configs_error != nil { return nil, .Allocation }
-	count := 0
 	lua.pushnil(state)
 	for lua.next(state, index) != 0 {
-		count += 1
-		if count > MCP_MAX_ENTRIES || lua.type(state, -2) != .STRING || !lua_plain_table(state, -1) {
+		if lua.type(state, -2) != .STRING || !lua_plain_table(state, -1) {
 			mcp_tool_configs_release(configs, allocator)
 			return nil, .Invalid
 		}
