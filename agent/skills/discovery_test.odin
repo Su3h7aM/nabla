@@ -128,3 +128,25 @@ test_discover_indexes_the_roots_it_kept :: proc(t: ^testing.T) {
 	testing.expect_value(t, load_failure.kind, Error_Kind.None)
 	testing.expect_value(t, loaded.body, "generic")
 }
+
+// A symlink that leads back into a directory the walk already read ends discovery instead of
+// looping: the directory is skipped by device and inode, however many paths reach it. The
+// skill beside the link is still catalogued, exactly once.
+@(test)
+test_discover_ends_a_directory_symlink_cycle :: proc(t: ^testing.T) {
+	base := fmt.aprintf("/tmp/nabla-skills-cycle-%d", os.get_pid(), allocator = context.temp_allocator)
+	defer os.remove_all(base)
+	root := filepath.join({base, "skills"}, context.temp_allocator) or_else ""
+	group := filepath.join({root, "group"}, context.temp_allocator) or_else ""
+	testing.expect(t, os.make_directory_all(group) == nil)
+	write_skill(t, root, "pdf", "pdf work", "pdf")
+	loop := filepath.join({group, "loop"}, context.temp_allocator) or_else ""
+	testing.expect(t, os.symlink(root, loop) == nil)
+
+	catalog, load_error := discover([]Root{{source = .Generic_User, logical_path = root}})
+	defer catalog_destroy(&catalog)
+	defer load_error_destroy(&load_error)
+	testing.expect_value(t, load_error.kind, Error_Kind.None)
+	testing.expect_value(t, len(catalog.skills), 1)
+	if len(catalog.skills) == 1 { testing.expect_value(t, catalog.skills[0].name, "pdf") }
+}

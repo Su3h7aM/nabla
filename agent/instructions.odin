@@ -11,11 +11,11 @@ import "nabla:agent/skills"
 INSTRUCTIONS_NABLA_SKILLS_DIR :: "skills"
 INSTRUCTIONS_AGENTS_DIR :: ".agents"
 INSTRUCTIONS_AGENTS_FILE :: "AGENTS.md"
-INSTRUCTIONS_MAX_TOTAL_BYTES :: 1 * 1024 * 1024
-INSTRUCTIONS_MAX_FILE_BYTES :: 256 * 1024
-INSTRUCTIONS_MAX_BYTES :: 2 * 1024 * 1024
+
+// SKILL_INLINE_CATALOG_BYTES is the catalog size above which the model is told to read the
+// catalog through builtin_list_skills rather than receive it inline. It picks how the
+// metadata is disclosed; no skill metadata is dropped either way.
 SKILL_INLINE_CATALOG_BYTES :: 16 * 1024
-SKILL_MAX_MANIFEST_BYTES :: 32 * 1024 * 1024
 
 Instruction_Source_Kind :: enum {
 	Nabla_User,
@@ -195,7 +195,6 @@ read_agents_file :: proc(path: string, allocator := context.allocator) -> (strin
 		return "", fmt.aprintf("%s could not be inspected", path, allocator = context.temp_allocator), .Read
 	}
 	if info.type != .Regular { return "", fmt.aprintf("%s is not a regular file", path, allocator = context.temp_allocator), .Read }
-	if info.size > INSTRUCTIONS_MAX_FILE_BYTES { return "", fmt.aprintf("%s exceeds the byte limit", path, allocator = context.temp_allocator), .Read }
 	data, read_error := os.read_entire_file(path, allocator)
 	if read_error != nil { return "", fmt.aprintf("%s could not be read", path, allocator = context.temp_allocator), .Read }
 	defer delete(data, allocator)

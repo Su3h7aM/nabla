@@ -6,15 +6,9 @@ import "core:path/filepath"
 import "core:slice"
 import "core:strings"
 
-SKILL_MAX_DEPTH :: 32
-SKILL_MAX_DIRECTORIES :: 16384
-SKILL_MAX_CATALOG_ENTRIES :: 4096
-SKILL_MAX_DIAGNOSTICS :: 4096
-
 Diagnostic_Kind :: enum {
 	Unknown,
 	Unreadable_Root,
-	Traversal_Limit,
 	Alias,
 	Shadowed,
 	Ambiguous,
@@ -60,7 +54,24 @@ Candidate :: struct {
 Walk_Frame :: struct {
 	path:    string,
 	logical: string,
-	depth:   int,
+}
+
+// Directory_Id identifies a directory on its file system. Every path that reaches the same
+// directory resolves to the same pair, which is what ends a symlink cycle.
+Directory_Id :: struct {
+	device: u64,
+	inode:  u128,
+}
+
+// directory_id reports the identity of the directory path resolves to, following symlinks. It
+// reports false for a path that is not a directory or cannot be inspected; the walk handles
+// that path as it did before. The allocation the stat makes is released before it returns.
+directory_id :: proc(path: string, scratch: mem.Allocator) -> (Directory_Id, bool) {
+	info, stat_error := os.stat(path, scratch)
+	if stat_error != nil { return {}, false }
+	defer os.file_info_delete(info, scratch)
+	if info.type != .Directory { return {}, false }
+	return Directory_Id{device = info.device, inode = info.inode}, true
 }
 
 discover :: proc(roots: []Root, allocator := context.allocator) -> (catalog: Catalog, load_error: Load_Error) {
@@ -174,27 +185,18 @@ discover_root :: proc(
 		name := strings.clone(entry.name, scratch)
 		append(&stack, Walk_Frame{path = path, logical = name})
 	}
-	visited := make(map[string]bool, context.temp_allocator)
-	count := 0
+	// Every directory is entered once per device and inode, the root included, so a symlink
+	// that leads back into a directory the walk already read ends there instead of looping.
+	visited := make(map[Directory_Id]bool, scratch)
+	if root_id, root_is_directory := directory_id(root.path, scratch); root_is_directory { visited[root_id] = true }
 	for len(stack) > 0 {
 		frame := stack[len(stack) - 1]
 		ordered_remove(&stack, len(stack) - 1)
 		defer delete(frame.path, scratch)
 		defer delete(frame.logical, scratch)
-		count += 1
-		if frame.path in visited {
-			record_diagnostic(catalog, Diagnostic{.Traversal_Limit, root_pos, frame.logical, 0, "", "directory cycle detected", "", ""}, scratch, allocator)
-			return false
-		}
-		visited[frame.path] = true
-		if count > SKILL_MAX_DIRECTORIES {
-			record_diagnostic(
-				catalog,
-				Diagnostic{.Traversal_Limit, root_pos, root.path, 0, "", "visited directory budget exhausted", "", ""},
-				scratch,
-				allocator,
-			)
-			return false
+		if id, is_directory := directory_id(frame.path, scratch); is_directory {
+			if id in visited { continue }
+			visited[id] = true
 		}
 		if !walk_directory(root_pos, root, frame, catalog, candidates, &stack, scratch, allocator) { return false }
 	}
@@ -211,15 +213,6 @@ walk_directory :: proc(
 	scratch: mem.Allocator,
 	allocator: mem.Allocator,
 ) -> bool {
-	if frame.depth > SKILL_MAX_DEPTH {
-		record_diagnostic(
-			catalog,
-			Diagnostic{.Traversal_Limit, root_pos, frame.logical, 0, "", "directory depth budget exhausted", "", ""},
-			scratch,
-			allocator,
-		)
-		return true
-	}
 	primary, primary_error := filepath.join({frame.path, "SKILL.md"}, scratch)
 	if primary_error != nil { return false }
 	defer delete(primary, scratch)
@@ -262,7 +255,7 @@ walk_directory :: proc(
 		defer delete(logical, scratch)
 		path := strings.clone(joined, scratch)
 		name := strings.clone(logical, scratch)
-		append(stack, Walk_Frame{path = path, logical = name, depth = frame.depth + 1})
+		append(stack, Walk_Frame{path = path, logical = name})
 	}
 	return true
 }
@@ -277,25 +270,13 @@ read_candidate :: proc(
 	scratch, allocator: mem.Allocator,
 ) {
 	basename := filepath.base(frame.logical)
-	info, info_error := os.stat(canonical_primary, scratch)
-	if info_error != nil {
-		record_file_diagnostic(catalog, root_pos, frame.logical, scratch, allocator, .Invalid, string(os.error_string(info_error)))
-		return
-	}
-	defer os.file_info_delete(info, scratch)
-	if info.size > SKILL_MAX_FILE_BYTES {
-		record_file_diagnostic(catalog, root_pos, frame.logical, scratch, allocator, .Invalid, "SKILL.md exceeds the byte limit")
-		return
-	}
 	data, read_error := os.read_entire_file(canonical_primary, scratch)
 	if read_error != nil {
 		record_file_diagnostic(catalog, root_pos, frame.logical, scratch, allocator, .Invalid, string(os.error_string(read_error)))
 		return
 	}
 	defer delete(data, scratch)
-	front := data
-	if len(front) > SKILL_MAX_FRONTMATTER_BYTES { front = front[:SKILL_MAX_FRONTMATTER_BYTES] }
-	metadata, metadata_error := parse_metadata(front, basename, scratch)
+	metadata, metadata_error := parse_metadata(data, basename, scratch)
 	defer metadata_destroy(&metadata, scratch)
 	defer load_error_destroy(&metadata_error, scratch)
 	if metadata_error.kind != .None {
@@ -370,8 +351,8 @@ select_candidates :: proc(candidates: []Candidate, catalog: ^Catalog, scratch, a
 		)
 	}
 	slice.sort_by(selected[:], proc(a, b: Skill) -> bool { return a.name < b.name })
-	if len(selected) > SKILL_MAX_CATALOG_ENTRIES { return false }
-	owned := make([]Skill, len(selected), allocator)
+	owned, owned_error := make([]Skill, len(selected), allocator)
+	if owned_error != nil { return false }
 	for skill, index in selected {
 		owned[index] = Skill {
 			name            = strings.clone(skill.name, allocator),
@@ -419,10 +400,6 @@ record_file_diagnostic :: proc(catalog: ^Catalog, root_pos: int, logical: string
 
 record_diagnostic :: proc(catalog: ^Catalog, diagnostic: Diagnostic, scratch, allocator: mem.Allocator) {
 	_ = scratch
-	if len(catalog.diagnostics) >= SKILL_MAX_DIAGNOSTICS {
-		catalog.omitted += 1
-		return
-	}
 	owned := Diagnostic {
 		kind       = diagnostic.kind,
 		root_index = diagnostic.root_index,

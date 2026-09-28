@@ -2,10 +2,11 @@ package skills
 
 import "core:strings"
 
-SKILL_MAX_FRONTMATTER_BYTES :: 64 * 1024
+// The Agent Skills format specification caps the `name` field at 64 characters and the
+// `description` field at 1024 characters. Both are the specification's limits, not the
+// harness's: a file that breaks them is not a skill, so no metadata is read from it.
 SKILL_MAX_NAME_BYTES :: 64
 SKILL_MAX_DESCRIPTION_RUNES :: 1024
-SKILL_MAX_FILE_BYTES :: 256 * 1024
 
 // Source_Kind names where a skill root comes from. The session orders roots by
 // priority; discovery itself only needs to know which roots are scope-bound
@@ -47,7 +48,6 @@ Error_Kind :: enum {
 	Unsupported_Metadata,
 	Stale_Metadata,
 	Invalid_Text,
-	Too_Large,
 	Outside_Authority,
 	Changed_During_Read,
 	Allocation,

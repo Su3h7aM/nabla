@@ -113,22 +113,11 @@ chat_build_snapshot :: proc(chat: ^Chat_Session) -> (instructions, manifest: str
 		}
 		rendered = with_role
 	}
-	if len(rendered) > INSTRUCTIONS_MAX_BYTES {
-		delete(rendered, chat.allocator)
-		skills.catalog_destroy(&discovered, chat.allocator)
-		return "", "", {}, "initial instructions exceed the byte limit"
-	}
 	encoded, manifest_error := chat_encode_manifest(chat, files, discovered, rendered, chat.allocator)
 	if manifest_error != .None {
 		delete(rendered, chat.allocator)
 		skills.catalog_destroy(&discovered, chat.allocator)
 		return "", "", {}, "the instruction manifest could not be allocated"
-	}
-	if len(encoded) > SKILL_MAX_MANIFEST_BYTES {
-		delete(rendered, chat.allocator)
-		delete(encoded, chat.allocator)
-		skills.catalog_destroy(&discovered, chat.allocator)
-		return "", "", {}, "the instruction manifest exceeds the byte limit"
 	}
 	return rendered, encoded, discovered, ""
 }

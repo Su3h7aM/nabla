@@ -4,6 +4,7 @@ package skills
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:strings"
 import "core:testing"
 
 @(test)
@@ -82,4 +83,57 @@ test_find_uses_sorted_catalog :: proc(t: ^testing.T) {
 	index, ok = find(skills, "missing")
 	testing.expect(t, !ok)
 	testing.expect_value(t, index, 2)
+}
+
+// A body larger than any fixed byte limit a reader might impose still loads whole.
+@(test)
+test_large_skill_body_loads_whole :: proc(t: ^testing.T) {
+	root_path := fmt.aprintf("/tmp/nabla-skill-large-%d", os.get_pid(), allocator = context.temp_allocator)
+	skill_path := filepath.join({root_path, "large"}, context.temp_allocator) or_else ""
+	primary_path := filepath.join({skill_path, "SKILL.md"}, context.temp_allocator) or_else ""
+	defer os.remove_all(root_path)
+	testing.expect(t, os.make_directory_all(skill_path) == nil)
+	body := strings.repeat("Read references/forms.md.\n", 16 * 1024, context.temp_allocator)
+	file_text := fmt.aprintf("---\nname: large\ndescription: A large body\n---\n%s", body, allocator = context.temp_allocator)
+	testing.expect(t, os.write_entire_file(primary_path, file_text) == nil)
+
+	catalog, discover_error := discover([]Root{{source = .Generic_User, logical_path = root_path}})
+	defer catalog_destroy(&catalog)
+	defer load_error_destroy(&discover_error)
+	testing.expect_value(t, discover_error.kind, Error_Kind.None)
+	index, found := find(catalog.skills, "large")
+	if !found { testing.fail_now(t, "the large skill was not catalogued") }
+
+	loaded, load_error := load(catalog.skills[index], catalog.roots[catalog.skills[index].root_index])
+	defer loaded_destroy(&loaded)
+	defer load_error_destroy(&load_error)
+	testing.expect_value(t, load_error.kind, Error_Kind.None)
+	testing.expect_value(t, loaded.content_digest, content_digest(body))
+}
+
+// A frontmatter longer than any fixed byte limit a reader might impose is parsed whole: the
+// body still starts at the closing ---, and the skill loads.
+@(test)
+test_large_frontmatter_parses_whole :: proc(t: ^testing.T) {
+	root_path := fmt.aprintf("/tmp/nabla-skill-wide-%d", os.get_pid(), allocator = context.temp_allocator)
+	skill_path := filepath.join({root_path, "wide"}, context.temp_allocator) or_else ""
+	primary_path := filepath.join({skill_path, "SKILL.md"}, context.temp_allocator) or_else ""
+	defer os.remove_all(root_path)
+	testing.expect(t, os.make_directory_all(skill_path) == nil)
+	comments := strings.repeat("# a comment line\n", 8 * 1024, context.temp_allocator)
+	file_text := fmt.aprintf("---\nname: wide\ndescription: A wide frontmatter\n%s---\n\n# WIDE\n", comments, allocator = context.temp_allocator)
+	testing.expect(t, os.write_entire_file(primary_path, file_text) == nil)
+
+	catalog, discover_error := discover([]Root{{source = .Generic_User, logical_path = root_path}})
+	defer catalog_destroy(&catalog)
+	defer load_error_destroy(&discover_error)
+	testing.expect_value(t, discover_error.kind, Error_Kind.None)
+	index, found := find(catalog.skills, "wide")
+	if !found { testing.fail_now(t, "the wide-frontmatter skill was not catalogued") }
+
+	loaded, load_error := load(catalog.skills[index], catalog.roots[catalog.skills[index].root_index])
+	defer loaded_destroy(&loaded)
+	defer load_error_destroy(&load_error)
+	testing.expect_value(t, load_error.kind, Error_Kind.None)
+	testing.expect(t, strings.has_prefix(loaded.body, "\n# WIDE\n"), "the body does not start at the closing ---")
 }

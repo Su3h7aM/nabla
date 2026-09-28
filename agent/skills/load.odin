@@ -28,12 +28,10 @@ load :: proc(skill: Skill, root: Root, allocator := context.allocator) -> (Loade
 	if stat_error != nil { return {}, error_make(.Unreadable, detail = os.error_string(stat_error), allocator = allocator) }
 	defer os.file_info_delete(before, allocator)
 	if before.type != .Regular { return {}, error_make(.Not_Regular, detail = "SKILL.md is not a regular file", allocator = allocator) }
-	if before.size > SKILL_MAX_FILE_BYTES { return {}, error_make(.Too_Large, detail = "SKILL.md exceeds the byte limit", allocator = allocator) }
 
 	data, read_error := os.read_entire_file(file, allocator)
 	if read_error != nil { return {}, error_make(.Unreadable, detail = os.error_string(read_error), allocator = allocator) }
 	defer delete(data, allocator)
-	if len(data) > SKILL_MAX_FILE_BYTES { return {}, error_make(.Too_Large, detail = "SKILL.md exceeds the byte limit", allocator = allocator) }
 	after, after_error := os.fstat(file, allocator)
 	if after_error != nil { return {}, error_make(.Unreadable, detail = os.error_string(after_error), allocator = allocator) }
 	defer os.file_info_delete(after, allocator)

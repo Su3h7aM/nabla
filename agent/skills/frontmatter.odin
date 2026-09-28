@@ -34,9 +34,6 @@ parse_metadata :: proc(data: []u8, directory_name: string, allocator := context.
 			body_offset = line_next
 			break
 		}
-		if at >= SKILL_MAX_FRONTMATTER_BYTES {
-			return {}, error_make(.Too_Large, line_number, detail = "frontmatter exceeds the byte limit", allocator = allocator)
-		}
 		trimmed := strings.trim_space(line)
 		if trimmed == "" || strings.has_prefix(trimmed, "#") {
 			at = line_next

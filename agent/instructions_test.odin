@@ -94,3 +94,22 @@ test_read_agents_file_treats_empty_as_missing :: proc(t: ^testing.T) {
 	defer delete(body, context.allocator)
 	testing.expect(t, strings.contains(err, path), err)
 }
+
+// An instruction file larger than any fixed byte limit a reader might impose is read whole.
+@(test)
+test_read_agents_file_reads_a_large_file_whole :: proc(t: ^testing.T) {
+	base, base_error := os.make_directory_temp("", "nabla-agents-large-*", context.allocator)
+	if base_error != nil { testing.fail_now(t, "could not create a temporary directory") }
+	defer os.remove_all(base)
+	defer delete(base, context.allocator)
+	path := filepath.join({base, "AGENTS.md"}, context.allocator) or_else ""
+	defer delete(path, context.allocator)
+	instructions := strings.repeat("a", 512 * 1024, context.temp_allocator)
+	testing.expect(t, os.write_entire_file_from_string(path, instructions) == nil)
+
+	body, err, err_kind := read_agents_file(path)
+	defer delete(body, context.allocator)
+	testing.expect_value(t, err_kind, Instruction_Error.None)
+	testing.expect_value(t, err, "")
+	testing.expect_value(t, len(body), 512 * 1024)
+}
