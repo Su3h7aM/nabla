@@ -71,19 +71,10 @@ client_restart :: proc(client: ^Client) -> Error {
 	return stdio_start(&client.stdio, client.config, client.allocator)
 }
 
-// client_connect agrees a protocol revision with the server.
-//
-// It probes with `server/discover`, which only the stateless revision defines. A
-// server that answers with a discovery result speaks that revision and needs
-// nothing more. A server that answers with an error, or that stopped answering, is
-// of the handshake era and is asked to initialize instead.
-//
-// The probe comes first because it is unambiguous: a method only one revision
-// defines cannot be answered by accident, whereas a method both revisions define
-// could be read under the wrong semantics.
-// Every operation that exchanges a message takes raw Operation_Options rather
-// than a Control, so the observer is an argument to the operation rather than a
-// fact this package keeps. stdio waits receive only its control field.
+// client_connect agrees a protocol revision with the server and returns the
+// connection it agreed on. It probes with `server/discover`, a method only the
+// stateless revision defines, and falls back to the 2025 handshake when the server
+// answers that probe with an error or stops answering it.
 client_connect :: proc(client: ^Client, options: Operation_Options, allocator := context.allocator) -> (Connection, Error) {
 	control := options.control
 	connection, answered, probe_err := client_try_discover(client, options, allocator)
@@ -185,12 +176,8 @@ client_notify :: proc(client: ^Client, method: string, params: json.Object, opti
 // client_exchange sends one request and returns its result object. It takes
 // ownership of params even when it fails before encoding.
 //
-// Notifications that arrive before the reply are consumed and discarded. A
-// server-initiated request is answered with a refusal under a handshake-era
-// revision, because the specification requires a reply to every request and this
-// client declares no capability for any of them. Under the stateless revision such
-// a request is a protocol violation, since that revision carries the interaction
-// inside a result instead.
+// Notifications that arrive before the reply are consumed and discarded, and a
+// server-initiated request is answered with a refusal.
 client_exchange :: proc(client: ^Client, method: string, params: json.Object, options: Operation_Options) -> (result: json.Value, err: Error) {
 	if _, claimed := sync.atomic_compare_exchange_strong(&client.busy, false, true); !claimed {
 		json.destroy_value(json.Value(params), client.allocator)
@@ -261,8 +248,9 @@ client_exchange :: proc(client: ^Client, method: string, params: json.Object, op
 			// The refusal is written after the message is released, so the method it
 			// answers is copied for the length of this iteration.
 			request_id := message.id
-			refused_method := strings.clone(message.method, client.allocator)
+			refused_method, method_error := strings.clone(message.method, client.allocator)
 			message_destroy(&message, client.allocator)
+			if method_error != nil { return nil, error_make(.Out_Of_Memory, allocator = client.allocator) }
 			refuse_err := client_refuse_request(client, refused_method, request_id, options)
 			delete(refused_method, client.allocator)
 			if refuse_err.kind != .None { return nil, refuse_err }
@@ -310,9 +298,8 @@ client_error_is_transport :: proc(err: Error) -> bool {
 }
 
 // client_tools_list follows the listing to its end and returns every page as one
-// page. There is no page count: a server that answers with the cursor it was just
-// given would ask for a page that has already been read, and no page count would
-// make that listing end, so the repeated cursor itself is refused.
+// page. A repeated cursor is refused rather than followed: it asks for a page that
+// has already been read, and no page count would end such a listing.
 //
 // The listing has no effect, so it may be sent again after the server is restarted;
 // a tool call may not.

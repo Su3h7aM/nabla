@@ -23,7 +23,10 @@ stdio_exit_watch_open :: proc(pid: int) -> (watch: Stdio_Exit_Watch, err: os.Err
 
 @(private)
 stdio_exit_watch_close :: proc(watch: ^Stdio_Exit_Watch) {
-	if watch.open { _ = linux.close(watch.fd) }
+	if watch.open {
+		// The watch is released for good, so a close that fails changes nothing.
+		_ = linux.close(watch.fd)
+	}
 	watch^ = {}
 }
 

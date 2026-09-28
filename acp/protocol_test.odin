@@ -39,9 +39,9 @@ test_envelope_kinds_and_validation :: proc(t: ^testing.T) {
 		{"{\"jsonrpc\":\"2.0\",\"id\":\"abc\"}", .Invalid_Result},
 		{"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":1,\"error\":{}}", .Invalid_Result},
 	}
-	for c in invalid_cases {
-		_, err := parse_envelope(c.wire)
-		testing.expectf(t, err == c.err, "envelope %q: expected %v, got %v", c.wire, c.err, err)
+	for invalid_case in invalid_cases {
+		_, err := parse_envelope(invalid_case.wire)
+		testing.expectf(t, err == invalid_case.err, "envelope %q: expected %v, got %v", invalid_case.wire, invalid_case.err, err)
 	}
 }
 

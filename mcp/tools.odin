@@ -479,7 +479,9 @@ call_result_decode :: proc(result: json.Object, version: Protocol_Version, alloc
 			return {}, error_make(.Malformed_Message, "the tool result's content is not an array", allocator = allocator)
 		}
 
-		decoded.content = make([dynamic]Content, 0, len(blocks), allocator)
+		content_blocks, blocks_error := make([dynamic]Content, 0, len(blocks), allocator)
+		if blocks_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		decoded.content = content_blocks
 		for block in blocks {
 			content, content_err := content_decode(block, allocator)
 			if content_err.kind != .None {
@@ -487,7 +489,11 @@ call_result_decode :: proc(result: json.Object, version: Protocol_Version, alloc
 				// cleanup releases.
 				return {}, content_err
 			}
-			append(&decoded.content, content)
+			appended := append(&decoded.content, content)
+			if appended != 1 {
+				if appended == 0 { content_block_destroy(&content, allocator) }
+				return {}, error_make(.Out_Of_Memory, allocator = allocator)
+			}
 		}
 
 		if structured_value, present := result["structuredContent"]; present {

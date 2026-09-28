@@ -207,7 +207,10 @@ request_params_make :: proc(version: Protocol_Version, capacity := 0, allocator 
 	if build_error.kind != .None { return {}, build_error }
 	params_complete := false
 	defer if !params_complete { json.destroy_value(json.Value(params), allocator) }
-	if protocol_version_era(version) != .Stateless { params_complete = true; return params, {} }
+	if protocol_version_era(version) != .Stateless {
+		params_complete = true
+		return params, {}
+	}
 	meta, meta_error := mcp_object_make(3, allocator)
 	if meta_error.kind != .None {
 		return {}, meta_error
@@ -502,7 +505,13 @@ message_decode :: proc(line: string, allocator := context.allocator) -> (message
 			message.id = id
 			message.id_present = true
 		}
-		message.method = strings.clone(string(method_name), allocator)
+		method, method_error := strings.clone(string(method_name), allocator)
+		if method_error != nil {
+			message_destroy(&message, allocator)
+			json.destroy_value(root, allocator)
+			return {}, error_make(.Out_Of_Memory, allocator = allocator)
+		}
+		message.method = method
 		if params, present := object["params"]; present {
 			if _, params_is_null := params.(json.Null); !params_is_null {
 				if _, params_is_object := params.(json.Object); !params_is_object {
@@ -538,9 +547,9 @@ Id_State :: enum {
 @(private)
 message_read_id :: proc(value: json.Value, present: bool) -> (id: i64, state: Id_State) {
 	if !present { return 0, .Absent }
-	#partial switch v in value {
+	#partial switch id_value in value {
 	case json.Integer:
-		return i64(v), .Present
+		return i64(id_value), .Present
 	case json.Null:
 		return 0, .Absent
 	}

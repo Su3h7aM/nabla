@@ -66,7 +66,10 @@ connection_from_stateless :: proc(result: json.Object, allocator := context.allo
 	// reported so the reader knows what to look for.
 	supported := false
 	for value in versions {
-		if string(value.(json.String)) == VERSION_2026_07_28 { supported = true; break }
+		if string(value.(json.String)) == VERSION_2026_07_28 {
+			supported = true
+			break
+		}
 	}
 	if !supported {
 		builder := strings.builder_make(context.temp_allocator)

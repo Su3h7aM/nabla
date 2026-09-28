@@ -50,24 +50,24 @@ parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Enve
 	value, parse_err := json.parse_string(payload, .JSON, true, allocator)
 	if parse_err != nil { return {}, .Invalid_JSON }
 	defer json.destroy_value(value, allocator)
-	obj, ok := value.(json.Object)
-	if !ok { return {}, .Invalid_Envelope }
-	version, version_ok := object_string(obj, "jsonrpc")
+	object, is_object := value.(json.Object)
+	if !is_object { return {}, .Invalid_Envelope }
+	version, version_ok := object_string(object, "jsonrpc")
 	if !version_ok || version != "2.0" { return {}, .Invalid_Version }
-	parsed_id, parsed_id_present, id_ok := object_id(obj, "id", allocator)
-	if !id_ok { return {}, .Invalid_ID }
+	parsed_id, parsed_id_present, id_error := object_id(object, "id", allocator)
+	if id_error != .None { return {}, id_error }
 	// The id can own a cloned string, so every rejection below releases it.
 	result := Envelope {
 		id         = parsed_id,
 		id_present = parsed_id_present,
 	}
-	parsed_method, method_present, method_ok := object_string_present(obj, "method")
+	parsed_method, method_present, method_ok := object_string_present(object, "method")
 	if !method_ok || (method_present && parsed_method == "") {
 		destroy_envelope(&result, allocator)
 		return {}, .Invalid_Method
 	}
-	result_value, result_present := obj["result"]
-	error_value, error_present := obj["error"]
+	result_value, result_present := object["result"]
+	error_value, error_present := object["error"]
 	if method_present {
 		if result_present || error_present {
 			destroy_envelope(&result, allocator)
@@ -79,22 +79,33 @@ parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Enve
 	}
 	result.kind = .Notification
 	if method_present {
-		result.method = strings.clone(parsed_method, allocator)
+		method, method_error := strings.clone(parsed_method, allocator)
+		if method_error != nil {
+			destroy_envelope(&result, allocator)
+			return {}, .Allocation
+		}
+		result.method = method
 		if parsed_id_present { result.kind = .Request }
-		if params_value, present := obj["params"]; present { result.params = json.clone_value(params_value, allocator); result.params_present = true }
+		if params_value, present := object["params"]; present {
+			result.params = json.clone_value(params_value, allocator)
+			result.params_present = true
+		}
 		return result, .None
 	}
 	result.kind = .Response
 	if error_present {
-		parsed_error, error_ok := parse_rpc_error(error_value, allocator)
-		if !error_ok {
+		parsed_error, error_error := parse_rpc_error(error_value, allocator)
+		if error_error != .None {
 			destroy_envelope(&result, allocator)
-			return {}, .Invalid_Error
+			return {}, error_error
 		}
 		result.rpc_error = parsed_error
 		result.error_present = true
 	}
-	if result_present { result.result = json.clone_value(result_value, allocator); result.result_present = true }
+	if result_present {
+		result.result = json.clone_value(result_value, allocator)
+		result.result_present = true
+	}
 	return result, .None
 }
 
@@ -175,49 +186,56 @@ params_decode :: proc(value: json.Value, target: ^$T, allocator := context.alloc
 	return json.unmarshal(encoded, target, allocator = allocator) == nil
 }
 
-object_string_present :: proc(obj: json.Object, key: string) -> (string, bool, bool) {
-	value, present := obj[key]
+object_string_present :: proc(object: json.Object, key: string) -> (string, bool, bool) {
+	value, present := object[key]
 	if !present { return "", false, true }
-	str, ok := value.(json.String)
-	if !ok { return "", true, false }
-	return string(str), true, true
+	text, is_string := value.(json.String)
+	if !is_string { return "", true, false }
+	return string(text), true, true
 }
-object_string :: proc(obj: json.Object, key: string) -> (string, bool) {
-	value, present := obj[key]
+object_string :: proc(object: json.Object, key: string) -> (string, bool) {
+	value, present := object[key]
 	if !present { return "", false }
-	str, ok := value.(json.String)
-	if !ok { return "", false }
-	return string(str), true
+	text, is_string := value.(json.String)
+	if !is_string { return "", false }
+	return string(text), true
 }
-object_id :: proc(obj: json.Object, key: string, allocator := context.allocator) -> (Jsonrpc_Id, bool, bool) {
-	value, present := obj[key]
-	if !present { return nil, false, true }
-	#partial switch v in value {
+object_id :: proc(object: json.Object, key: string, allocator := context.allocator) -> (id: Jsonrpc_Id, present: bool, err: Envelope_Error) {
+	value, has_value := object[key]
+	if !has_value { return nil, false, .None }
+	#partial switch id_value in value {
 	case json.Integer:
-		return i64(v), true, true
+		return i64(id_value), true, .None
 	case json.Float:
-		return f64(v), true, true
+		return f64(id_value), true, .None
 	case json.String:
-		return strings.clone(string(v), allocator), true, true
+		text, clone_error := strings.clone(string(id_value), allocator)
+		if clone_error != nil { return nil, true, .Allocation }
+		return text, true, .None
 	case json.Null:
-		return Jsonrpc_Null{}, true, true
+		return Jsonrpc_Null{}, true, .None
 	}
-	return nil, true, false
+	return nil, true, .Invalid_ID
 }
-parse_rpc_error :: proc(value: json.Value, allocator := context.allocator) -> (Rpc_Error, bool) {
-	obj, ok := value.(json.Object)
-	if !ok { return {}, false }
-	code_value, code_present := obj["code"]
-	message_value, message_present := obj["message"]
-	code, code_ok := code_value.(json.Integer)
-	message, message_ok := message_value.(json.String)
-	if !code_present || !message_present || !code_ok || !message_ok { return {}, false }
+parse_rpc_error :: proc(value: json.Value, allocator := context.allocator) -> (Rpc_Error, Envelope_Error) {
+	object, is_object := value.(json.Object)
+	if !is_object { return {}, .Invalid_Error }
+	code_value, code_present := object["code"]
+	message_value, message_present := object["message"]
+	code, code_is_integer := code_value.(json.Integer)
+	message_text, message_is_string := message_value.(json.String)
+	if !code_present || !message_present || !code_is_integer || !message_is_string { return {}, .Invalid_Error }
+	message, message_error := strings.clone(string(message_text), allocator)
+	if message_error != nil { return {}, .Allocation }
 	result := Rpc_Error {
 		code    = i64(code),
-		message = strings.clone(string(message), allocator),
+		message = message,
 	}
-	if data, present := obj["data"]; present { result.data = json.clone_value(data, allocator); result.data_present = true }
-	return result, true
+	if data, present := object["data"]; present {
+		result.data = json.clone_value(data, allocator)
+		result.data_present = true
+	}
+	return result, .None
 }
 destroy_envelope :: proc(envelope: ^Envelope, allocator := context.allocator) {
 	if envelope.id_present {

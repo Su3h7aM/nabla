@@ -64,17 +64,15 @@ stdio_fd :: proc(file: ^os.File) -> posix.FD {
 
 // stdio_spawn starts name in its own process group with a pipe on each standard
 // stream. argv and envp are already-built, nil-terminated vectors, and directory
-// is nil to inherit the parent's. A failure reports the system's reason, including
-// the reason exec gave when the program could not be run.
+// is nil to inherit the parent's; a failure reports the system's reason, including
+// what exec gave when the program could not be run.
 //
-// Odin's os.process_start cannot express this: it has no pre-exec hook, so the
-// child cannot create its own process group before it execs, and a group kill
-// would then miss the server's descendants.
-//
-// The harness may have other threads, so between fork and exec the child makes
-// only async-signal-safe calls: it allocates, locks, and logs nothing, and every
-// failure leaves through _exit, which runs no atexit handler and flushes no stdio.
+// Odin's os.process_start has no pre-exec hook, so the process group is made here.
+// The harness may have other threads, so between fork and exec the child makes only
+// async-signal-safe calls and leaves through _exit.
 stdio_spawn :: proc(name: cstring, argv: [^]cstring, envp: [^]cstring, directory: cstring) -> (pipes: Stdio_Pipes, child: Stdio_Child, err: os.Error) {
+	// Each pipe end is closed exactly once on every path out of here, and a close that
+	// fails only leaks a descriptor that this procedure cannot report anyway.
 	stdin_read, stdin_write := os.pipe() or_return
 	defer if err != nil { _ = os.close(stdin_write) }
 	defer _ = os.close(stdin_read)
@@ -105,6 +103,8 @@ stdio_spawn :: proc(name: cstring, argv: [^]cstring, envp: [^]cstring, directory
 		if directory != nil && posix.chdir(directory) != .OK { posix._exit(STDIO_CHILD_SETUP_FAILED) }
 		posix.execve(name, argv, envp)
 		code := [1]u8{u8(posix.errno())}
+		// The parent reads this errno, or an end of stream if the write failed, and
+		// reports a spawn failure either way.
 		_ = posix.write(report_fd, &code[0], len(code))
 		posix._exit(STDIO_CHILD_EXEC_FAILED)
 	}
@@ -141,6 +141,7 @@ stdio_child_close :: proc(child: ^Stdio_Child) {
 
 // stdio_pipes_close closes the parent's ends of a server's streams.
 stdio_pipes_close :: proc(pipes: Stdio_Pipes) {
+	// The caller is discarding these ends, so a close that fails changes nothing.
 	_ = os.close(pipes.stdin)
 	_ = os.close(pipes.stdout)
 	_ = os.close(pipes.stderr)
@@ -148,15 +149,15 @@ stdio_pipes_close :: proc(pipes: Stdio_Pipes) {
 
 // stdio_read reads what one pipe end holds into buffer.
 stdio_read :: proc(file: ^os.File, buffer: []u8) -> (count: int, status: Stdio_Io) {
-	n := posix.read(stdio_fd(file), raw_data(buffer), uint(len(buffer)))
-	if n >= 0 { return n, .Ok }
+	bytes_read := posix.read(stdio_fd(file), raw_data(buffer), uint(len(buffer)))
+	if bytes_read >= 0 { return bytes_read, .Ok }
 	return 0, stdio_io_failure()
 }
 
 // stdio_write writes as much of data as one pipe end accepts.
 stdio_write :: proc(file: ^os.File, data: []u8) -> (count: int, status: Stdio_Io) {
-	n := posix.write(stdio_fd(file), raw_data(data), uint(len(data)))
-	if n >= 0 { return n, .Ok }
+	bytes_written := posix.write(stdio_fd(file), raw_data(data), uint(len(data)))
+	if bytes_written >= 0 { return bytes_written, .Ok }
 	return 0, stdio_io_failure()
 }
 
@@ -282,6 +283,8 @@ stdio_child_await :: proc(child: ^Stdio_Child, deadline: time.Tick) {
 stdio_terminate_group :: proc(child: ^Stdio_Child) {
 	if child.pid <= 0 { return }
 	group := posix.pid_t(child.pid)
+	// The child is awaited and reaped below whatever these signals did, so a signal
+	// that cannot be delivered changes nothing.
 	_ = posix.killpg(group, .SIGTERM)
 	stdio_child_await(child, time.tick_add(time.tick_now(), STDIO_KILL_GRACE))
 	_ = posix.killpg(group, .SIGKILL)
@@ -343,7 +346,9 @@ stdio_alloc_vectors :: proc(
 	envp: []cstring,
 	ok: bool,
 ) {
-	argv = make([]cstring, len(arguments) + 2, allocator)
+	vectors_error: mem.Allocator_Error
+	argv, vectors_error = make([]cstring, len(arguments) + 2, allocator)
+	if vectors_error != nil { return nil, nil, false }
 	argv[0], ok = strings_clone_cstring(name, allocator)
 	if !ok { return nil, nil, false }
 	for argument, index in arguments {
@@ -354,9 +359,11 @@ stdio_alloc_vectors :: proc(
 	}
 	argv[len(arguments) + 1] = nil
 
-	envp = make([]cstring, len(environment) + 1, allocator)
+	envp, vectors_error = make([]cstring, len(environment) + 1, allocator)
+	if vectors_error != nil { return nil, nil, false }
 	for entry, index in environment {
-		pair := strings.concatenate({entry.name, "=", entry.value}, allocator)
+		pair, pair_error := strings.concatenate({entry.name, "=", entry.value}, allocator)
+		if pair_error != nil { return nil, nil, false }
 		value: cstring
 		value, ok = strings_clone_cstring(pair, allocator)
 		delete(pair, allocator)

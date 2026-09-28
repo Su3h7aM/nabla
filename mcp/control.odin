@@ -64,17 +64,18 @@ Wire_Observer :: struct {
 }
 
 // Operation_Options is the caller's policy for one client operation: what bounds
-// it, and whether its messages are observed.
+// it, and whether its messages are observed. Every operation that exchanges a
+// message takes it rather than a Control, so the observer is an argument to the
+// operation rather than a fact this package keeps, and a stdio wait receives only
+// its control field.
 //
-// Both fields are borrowed for one synchronous operation. A zero value performs
-// the operation without a bound and without observation, which is what a caller
-// that only wants a result passes.
+// Both fields are borrowed for one synchronous operation. A zero value performs the
+// operation without a bound and without observation.
 Operation_Options :: struct {
 	control:  Control,
 	observer: Wire_Observer,
 }
 
-// operation_report calls the observer, if there is one.
 @(private)
 operation_report :: proc(options: Operation_Options, report: Wire_Report) {
 	if options.observer.report == nil { return }

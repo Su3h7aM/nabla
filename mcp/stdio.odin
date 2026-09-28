@@ -205,6 +205,8 @@ stdio_spawn_error :: proc(what: string, cause: os.Error, allocator: mem.Allocato
 // the process group is escalated to only if the server does not go.
 stdio_stop :: proc(stdio: ^Stdio) {
 	if stdio.started {
+		// Every end is closed once, on the way out, and the transport may not report a
+		// failure by then: a close that fails changes nothing.
 		_ = os.close(stdio.pipes.stdin)
 		stdio_child_await(&stdio.child, time.tick_add(time.tick_now(), STDIO_KILL_GRACE))
 		if !stdio.child.reaped { stdio_terminate_group(&stdio.child) }
