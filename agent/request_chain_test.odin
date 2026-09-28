@@ -105,8 +105,11 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(test: ^testing.T) {
 	testing.expect(test, !evidence.text_exposed && !evidence.completion_accepted)
 }
 
+// A refusal before the model ran is resent on the same bytes. A stream the provider had
+// accepted may have run the model, so it is never resent: the model is told the response
+// was lost, and the turn continues with a new request that carries the notice.
 @(test)
-test_a_chain_of_failures_ends_in_one_answer :: proc(test: ^testing.T) {
+test_a_stream_lost_after_acceptance_is_answered_with_a_notice :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
@@ -131,31 +134,62 @@ test_a_chain_of_failures_ends_in_one_answer :: proc(test: ^testing.T) {
 	retries.allocator = context.allocator
 	retries.events = make([dynamic]Chat_Retry_Event, 0, 4, retries.allocator)
 	defer delete(retries.events)
-	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), retry_log_observer(&retries)), "the turn completed after two retries")
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), retry_log_observer(&retries)), "the turn completed")
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 3) { return }
-	for index in 0 ..< 3 { testing.expect(test, agent_provider_request(&provider, index) == agent_provider_request(&provider, 0)) }
-	sent := request_chain_assert(test, chat, 3, "third try")
-	if len(sent) != 3 { return }
+	testing.expect(test, agent_provider_request(&provider, 1) == agent_provider_request(&provider, 0), "the refused send is repeated as frozen")
+	testing.expect(test, strings.contains(agent_provider_request(&provider, 2), chat_notice_text(.Response_Lost)), "the next request tells the model")
+	sent := _test_records(test, chat, {.Request_Sent})
+	if !testing.expect_value(test, len(sent), 3) { return }
+	testing.expect_value(test, sent[1].request, sent[0].request)
+	testing.expect(test, sent[2].request != sent[0].request, "the lost response is followed by a new request, not a resend")
 	rejected := _test_records(test, chat, {.Response_Rejected})
-	if !testing.expect_value(test, len(rejected), 2) { return }
-	for record, index in rejected {
-		testing.expect_value(test, record.request, sent[0].request)
-		testing.expect_value(test, record.attempt, journal.Attempt_No(index + 1))
-		evidence: journal.Response_Rejected
-		if !testing.expect_value(test, journal.payload_decode(record.data, &evidence, context.temp_allocator), nil) { continue }
-		testing.expect_value(test, evidence.failure_class, "rate_limited" if index == 0 else "incomplete_stream")
+	// The lost response is committed with its notice, so only the refusal is a rejection.
+	if !testing.expect_value(test, len(rejected), 1) { return }
+	testing.expect_value(test, rejected[0].request, sent[0].request)
+	testing.expect_value(test, rejected[0].attempt, journal.Attempt_No(1))
+	evidence: journal.Response_Rejected
+	if testing.expect_value(test, journal.payload_decode(rejected[0].data, &evidence, context.temp_allocator), nil) {
+		testing.expect_value(test, evidence.failure_class, "rate_limited")
 		testing.expect_value(test, evidence.recovery, "transient_failure")
-		if index == 0 { testing.expect_value(test, evidence.status, 429) }
-		if index == 1 { testing.expect_value(test, evidence.kind, "stream") }
 	}
-	if !testing.expect_value(test, len(retries.events), 2) { return }
-	for event, index in retries.events {
-		testing.expect_value(test, event.next_attempt, index + 2)
-		testing.expect_value(test, event.request, sent[0].request)
-		testing.expect(test, event.delay > 0)
-	}
+	if !testing.expect_value(test, len(retries.events), 1) { return }
 	testing.expect_value(test, retries.events[0].failure_class, ai.Provider_Failure_Class.Rate_Limited)
-	testing.expect_value(test, retries.events[1].failure_class, ai.Provider_Failure_Class.Incomplete_Stream)
+	ancestry, ancestry_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
+	if !testing.expect_value(test, ancestry_error, nil) { return }
+	notices, answers := 0, 0
+	for node in ancestry {
+		if node.kind == .Notice { notices += 1 }
+		if node.kind == .Assistant && string(node.body) == "third try" { answers += 1 }
+	}
+	testing.expect_value(test, notices, 1)
+	testing.expect_value(test, answers, 1)
+}
+
+// A refused request is feedback once. The same refusal of the request that carried that
+// feedback means nothing the model adds will fix it, so the turn ends.
+@(test)
+test_a_repeated_refusal_ends_the_turn_after_one_notice :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(test, chat, "say something")
+	refusal := `{"error":{"message":"Unsupported parameter: frobnicate"}}`
+	responses := []string{agent_provider_refusal("400 Bad Request", refusal, ""), agent_provider_refusal("400 Bad Request", refusal, "")}
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+	testing.expect(test, !chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn ends on the repeated refusal")
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
+	second := agent_provider_request(&provider, 1)
+	testing.expect(test, strings.contains(second, chat_notice_text(.Provider_Refused)), "the second request carries the notice")
+	testing.expect(test, strings.contains(second, "Unsupported parameter: frobnicate"), "the notice carries the provider's words")
 }
 
 @(test)

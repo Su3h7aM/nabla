@@ -160,10 +160,13 @@ Chat_Session :: struct {
 	// explanation lands after the text it explains.
 	pending_notice:               Chat_Notice,
 	// notice_detail is the provider's own account of the failure the notice explains:
-	// owned, bounded, and empty when the harness refused the response itself. It is
+	// owned, whole, and empty when the harness refused the response itself. It is
 	// committed with the notice, because a refusal the model cannot read is one it
 	// cannot correct.
 	notice_detail:                string,
+	// refused is the failure class of the provider refusal the turn's last notice
+	// answered. The same refusal again means nothing the model adds will fix it.
+	refused:                      ai.Provider_Failure_Class,
 	requests_made:                int, // model requests made in this turn
 	calls_made:                   int, // tool executions in this turn
 	active_failed:                bool,
@@ -582,6 +585,7 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 	chat.state = .Preparing
 	chat.terminal_status = .None
 	chat.turn_recovery = nil
+	chat.refused = .None
 	chat.turn_repair_refusal = .None
 	chat.active_failed = false
 	chat.requests_made = 0

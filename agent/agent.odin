@@ -2,6 +2,7 @@ package agent
 
 import "core:fmt"
 import "core:mem"
+import "core:strings"
 import "core:time"
 
 import "nabla:agent/journal"
@@ -383,6 +384,8 @@ Chat_Notice :: enum {
 	Duplicate_Call_ID,
 	Unreadable_Response,
 	Incomplete_Response,
+	Response_Lost,
+	Provider_Refused,
 }
 
 // chat_notice_text is the harness's own explanation of an unusable response. The
@@ -401,16 +404,15 @@ chat_notice_text :: proc(notice: Chat_Notice) -> string {
 		return "the previous response arrived in a form that could not be decoded, so none of it was executed; continue the work by sending it again"
 	case .Incomplete_Response:
 		return "the provider ended the previous response before it was complete, so none of it was executed; continue the work by sending it again"
+	case .Response_Lost:
+		return "the connection failed after the previous request was sent and its response was lost, so nothing from it was executed; continue the work"
+	case .Provider_Refused:
+		return "the provider refused the previous request, so nothing from it was executed; change what caused the refusal and continue"
 	case .None, .Ignored:
 		return ""
 	}
 	return ""
 }
-
-// CHAT_NOTICE_DETAIL_MAX_BYTES bounds the provider's own words inside a notice. It is what
-// the model has to work with, and it is the provider's account of the refusal, not a
-// document to be carried whole.
-CHAT_NOTICE_DETAIL_MAX_BYTES :: 2048
 
 // chat_notice_committed_text is the exact text a notice puts into the conversation: the
 // harness's explanation of the refusal, and, when the provider gave one, the provider's own
@@ -438,12 +440,22 @@ chat_notice_clear :: proc(chat: ^Chat_Session) {
 // told what happened and can correct the work it asked for.
 chat_session_note_notice :: proc(chat: ^Chat_Session, source: Chat_Event_Source, notice: Chat_Notice, detail := "") -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
+	chat_notice_set(chat, notice, detail)
+	return true
+}
+
+// chat_notice_set makes notice the running response's explanation and moves the turn on
+// to another request.
+chat_notice_set :: proc(chat: ^Chat_Session, notice: Chat_Notice, detail: string) {
 	delete(chat.notice_detail, chat.allocator)
 	chat.notice_detail = ""
-	if detail != "" { chat.notice_detail = ai.provider_bounded_text(detail, CHAT_NOTICE_DETAIL_MAX_BYTES, chat.allocator) }
+	if detail != "" {
+		// Without memory for the provider's words the notice still says what happened.
+		cloned, clone_error := strings.clone(detail, chat.allocator)
+		if clone_error == nil { chat.notice_detail = cloned }
+	}
 	chat.pending_notice = notice
 	chat.state = .Preparing
-	return true
 }
 
 // chat_session_feed_tool_calls validates the calls a response assembled and

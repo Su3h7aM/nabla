@@ -541,6 +541,12 @@ provider_response_head :: proc(user_data: rawptr, head: client.Response_Head, he
 	state.response_head.seen = true
 	state.response_head.status = head.status
 	state.response_head.stream = head.usable
+	// A head that accepts the stream proves the model received the request, whatever
+	// happens to the stream after it.
+	if head.usable {
+		state.delivery = .Response_Observed
+		state.delivery_present = true
+	}
 	if name := provider_request_id_header(state.api); name != "" {
 		if value, present := http.headers_get_unsafe(headers, name); present {
 			state.response_head.provider_request_id = provider_bounded_text(value, PROVIDER_MAX_CODE_BYTES, state.allocator)
@@ -553,10 +559,10 @@ provider_response_head :: proc(user_data: rawptr, head: client.Response_Head, he
 }
 
 // provider_record_delivery states whether this attempt may have put model input in
-// front of the provider and got nothing back. That is the case a second send cannot
-// repair: the request may have run, and no answer says it did not. A failure after a
-// final response head is the provider's own answer, so classification decides what
-// happens there rather than delivery.
+// front of the provider and got no head back. That is the case a second send cannot
+// repair: the request may have run, and no answer says it did not. A head is recorded
+// when it arrives: one that accepted the stream proves delivery, and one that refused it
+// is the provider's own answer, so classification decides what happens there.
 provider_record_delivery :: proc(state: ^Provider_Request_Stream_State, failure: client.Failure) {
 	if !state.transfer_present || !state.transfer.request_write_started { return }
 	if state.delivery_present || state.response_head.seen { return }

@@ -181,6 +181,19 @@ chat_failure_transient :: proc(class: ai.Provider_Failure_Class) -> bool {
 	return false
 }
 
+// chat_failure_model_reachable reports whether a terminal class still lets the model be
+// reached, so the refusal is feedback: every class except the ones that need the user
+// (credentials, quota) or were already repaired (context overflow).
+chat_failure_model_reachable :: proc(class: ai.Provider_Failure_Class) -> bool {
+	switch class {
+	case .Unknown, .Payload_Too_Large, .Invalid_Request, .Content_Policy, .Invalid_Output:
+		return true
+	case .None, .Authentication, .Quota, .Context_Overflow, .Rate_Limited, .Provider_Unavailable, .Incomplete_Stream:
+		return false
+	}
+	return false
+}
+
 // chat_retry_backoff_delay is the computed wait before transient retry number `attempt`,
 // which starts at 1:
 //

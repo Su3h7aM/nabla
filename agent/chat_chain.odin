@@ -644,6 +644,8 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	// have followed never happened.
 	reason := chain.decision.reason
 	if chat_session_cancelled(chat) { reason = .Cancelled }
+	if reason == .Completed { chat.refused = .None }
+	if !chat_session_cancelled(chat) && chat.pending_notice == .None { chat_chain_notice(chat, reason) }
 	// A response answered with a notice is feedback for the model, not the end of the turn:
 	// the turn goes on to another request whatever this chain decided about its own send.
 	turn_continues := chat.pending_notice != .None && !chat_session_cancelled(chat)
@@ -685,4 +687,33 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	// the session the front-end describes.
 	_observer_request_finished(observer)
 	chat_chain_release(chat)
+}
+
+// chat_chain_notice answers a chain that stopped while the model can still be reached with a
+// notice, so the turn continues with a new request instead of ending. A refusal is answered
+// once: the same refusal again means nothing the model adds will fix it, and the turn ends.
+@(private)
+chat_chain_notice :: proc(chat: ^Chat_Session, reason: Request_Recovery_Reason) {
+	chain := &chat.chain
+	notice := Chat_Notice.None
+	#partial switch reason {
+	// Completed, Harness_Failure, Storage_Failed, Cancelled, Context_Exhausted, and
+	// Transient_Failure are answered elsewhere or end the turn.
+	case .Ambiguous_Delivery:
+		notice = .Response_Lost
+	case .Output_Exposed:
+		if !chain.completion_accepted { notice = .Incomplete_Response }
+	case .Terminal_Failure:
+		class := chain.operation_error.failure_class
+		if chat_failure_model_reachable(class) && class != chat.refused {
+			notice = .Provider_Refused
+			chat.refused = class
+		}
+	}
+	if notice == .None { return }
+	chat_notice_set(chat, notice, chain.operation_error.detail)
+	// The failure is now the model's feedback, not the turn's end.
+	delete(chat.last_error, chat.allocator)
+	chat.last_error = ""
+	chat.active_failed = false
 }
