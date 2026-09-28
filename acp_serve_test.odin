@@ -237,7 +237,8 @@ acp_test_client_stream :: proc(data: rawptr, mode: io.Stream_Mode, p: []byte, of
 		if len(client.input) == 0 { return 0, .EOF }
 		count := copy(p, client.input[:])
 		copy(client.input[:], client.input[count:])
-		resize(&client.input, len(client.input) - count)
+		// A shrink never allocates, so it cannot fail.
+		_ = resize(&client.input, len(client.input) - count)
 		return i64(count), nil
 	case .Write:
 		sync.mutex_lock(&client.mu)
@@ -361,18 +362,21 @@ acp_test_client_session_id :: proc(t: ^testing.T, client: ^Acp_Test_Client, allo
 // --- environment -------------------------------------------------------------
 
 // acp_test_env points one XDG variable at a temporary directory, so a run that opens the
-// session store or reads the catalog cache cannot touch the user's own state.
-acp_test_env :: proc(variable, directory: string) -> (previous: string, had_previous: bool) {
+// session store or reads the catalog cache cannot touch the user's own state. It fails the
+// test rather than leaving the variable pointing at the user's own directory.
+acp_test_env :: proc(t: ^testing.T, variable, directory: string) -> (previous: string, had_previous: bool) {
 	previous, had_previous = os.lookup_env(variable, context.allocator)
-	os.set_env(variable, directory)
+	if os.set_env(variable, directory) != nil { testing.fail_now(t, "the test state directory could not be set") }
 	return
 }
 
 acp_test_env_restore :: proc(variable, previous: string, had_previous: bool) {
+	// The process is the isolated child this suite runs in, so a restore that fails
+	// changes nothing that outlives it.
 	if had_previous {
-		os.set_env(variable, previous)
+		_ = os.set_env(variable, previous)
 	} else {
-		os.unset_env(variable)
+		_ = os.unset_env(variable)
 	}
 	delete(previous, context.allocator)
 }
@@ -400,7 +404,7 @@ test_acp_serves_a_turn_and_replays_a_loaded_session :: proc(t: ^testing.T) {
 		return
 	}
 	defer {
-		os.remove_all(workspace)
+		_ = os.remove_all(workspace)
 		delete(workspace, context.allocator)
 	}
 	state, state_err := os.make_directory_temp("", "nabla-acp-state-*", context.allocator)
@@ -409,14 +413,14 @@ test_acp_serves_a_turn_and_replays_a_loaded_session :: proc(t: ^testing.T) {
 		return
 	}
 	defer {
-		os.remove_all(state)
+		_ = os.remove_all(state)
 		delete(state, context.allocator)
 	}
-	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
 	// The catalog cache is pointed at the state directory too: a run must never read or
 	// write the user's own cache.
-	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
 	note := fmt.aprintf("%s/note.txt", workspace, allocator = context.allocator)
@@ -582,7 +586,7 @@ test_acp_v2_negotiates_and_exposes_the_session_surface :: proc(t: ^testing.T) {
 		return
 	}
 	defer {
-		os.remove_all(workspace)
+		_ = os.remove_all(workspace)
 		delete(workspace, context.allocator)
 	}
 	state, state_err := os.make_directory_temp("", "nabla-acp-v2-state-*", context.allocator)
@@ -591,12 +595,12 @@ test_acp_v2_negotiates_and_exposes_the_session_surface :: proc(t: ^testing.T) {
 		return
 	}
 	defer {
-		os.remove_all(state)
+		_ = os.remove_all(state)
 		delete(state, context.allocator)
 	}
-	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
 	client: Acp_Test_Client
@@ -683,7 +687,7 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 		return
 	}
 	defer {
-		os.remove_all(workspace)
+		_ = os.remove_all(workspace)
 		delete(workspace, context.allocator)
 	}
 	state, state_err := os.make_directory_temp("", "nabla-acp-v2-prompt-state-*", context.allocator)
@@ -692,12 +696,12 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 		return
 	}
 	defer {
-		os.remove_all(state)
+		_ = os.remove_all(state)
 		delete(state, context.allocator)
 	}
-	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
 	replies := []string {
@@ -840,12 +844,12 @@ test_acp_v2_batch_answers_reader_owned_requests_as_one_frame :: proc(t: ^testing
 		return
 	}
 	defer {
-		os.remove_all(state)
+		_ = os.remove_all(state)
 		delete(state, context.allocator)
 	}
-	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
 	client: Acp_Test_Client
@@ -888,12 +892,12 @@ test_acp_buzz_v2_request_uses_the_v1_wire_profile :: proc(t: ^testing.T) {
 		return
 	}
 	defer {
-		os.remove_all(state)
+		_ = os.remove_all(state)
 		delete(state, context.allocator)
 	}
-	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
 	client: Acp_Test_Client
@@ -936,7 +940,7 @@ test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
 		return
 	}
 	defer {
-		os.remove_all(workspace)
+		_ = os.remove_all(workspace)
 		delete(workspace, context.allocator)
 	}
 	state, state_err := os.make_directory_temp("", "nabla-acp-model-state-*", context.allocator)
@@ -945,12 +949,12 @@ test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
 		return
 	}
 	defer {
-		os.remove_all(state)
+		_ = os.remove_all(state)
 		delete(state, context.allocator)
 	}
-	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
 	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
@@ -1038,7 +1042,7 @@ test_acp_buzz_effort_option_selects_thinking_level :: proc(t: ^testing.T) {
 		return
 	}
 	defer {
-		os.remove_all(workspace)
+		_ = os.remove_all(workspace)
 		delete(workspace, context.allocator)
 	}
 	state, state_err := os.make_directory_temp("", "nabla-acp-effort-state-*", context.allocator)
@@ -1047,12 +1051,12 @@ test_acp_buzz_effort_option_selects_thinking_level :: proc(t: ^testing.T) {
 		return
 	}
 	defer {
-		os.remove_all(state)
+		_ = os.remove_all(state)
 		delete(state, context.allocator)
 	}
-	previous_state, had_state := acp_test_env("XDG_STATE_HOME", state)
+	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
 	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_cache, had_cache := acp_test_env("XDG_CACHE_HOME", state)
+	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
 	levels := make([]string, 2, context.allocator)

@@ -17,12 +17,9 @@ import input "nabla:input"
 import "nabla:term"
 import "nabla:tui/widgets"
 
-// The front-end: a worker thread owns the agent session, the main thread owns
-// the terminal, and results cross through the runtime snapshot.
-//
-// The snapshot is a display projection only. The session keeps the real
-// history, request context, effort, and usage; this package renders the
-// snapshot and nothing else.
+// The front-end: a worker thread owns the agent session, the main thread owns the
+// terminal, and results cross through the runtime snapshot. The snapshot is a display
+// projection; the session keeps the real history, request context, effort, and usage.
 
 TUI_POLL_MS :: 50
 WORK_CAPACITY :: 16
@@ -61,13 +58,10 @@ Entry :: struct {
 	tool_scroll_max: int,
 }
 
-// Status carries the runtime facts the footer shows. provider_id and cwd
-// are borrowed from the runtime (the provider id and the session workspace,
-// both stable for the app's lifetime); model_id, effort, and effort_levels are
-// owned display copies, replaced under the runtime mutex when they change.
-// Cache numbers are the token-weighted totals over finished requests: input
-// and cache reads plus the request counts each rests on, so a bucket the
-// provider never reported reads as unknown rather than zero.
+// Status carries the runtime facts the footer shows. provider_id and cwd are borrowed
+// from the runtime for the app's lifetime; model_id, effort, and effort_levels are owned
+// display copies replaced under the runtime mutex. A usage bucket the provider never
+// reported reads as unknown rather than zero.
 Status :: struct {
 	provider_id:           string,
 	model_id:              string, // owned,
@@ -100,12 +94,10 @@ Status :: struct {
 	retry_due:             time.Tick,
 }
 
-// TRANSCRIPT_MAX_BYTES bounds the rendered transcript: the entries the screen keeps
-// for scrolling, and the text they hold. The session store keeps the whole
-// conversation, so past the budget the oldest entries are dropped and their text
-// released, which is what keeps a run that continues for days from holding its
-// whole history in view. The budget is a display bound, not a limit on the run:
-// nothing about the agent's work depends on it.
+// TRANSCRIPT_MAX_BYTES bounds the rendered transcript: the entries the screen keeps for
+// scrolling and the text they hold. Past the budget the oldest entries are dropped and
+// their text released, while the store keeps the whole conversation, so the bound is a
+// display cost and never a limit on the run.
 TRANSCRIPT_MAX_BYTES :: 1 * mem.Megabyte
 
 // TRANSCRIPT_TRIMMED_NOTICE is said once, when the transcript first drops an old
@@ -253,11 +245,10 @@ Session_Row :: struct {
 	title: string, // owned
 }
 
-// Pending_Selection is the selection the user asked for and the worker has not
-// installed yet. The front-end only records it; apply_selection is still the only
-// writer of a resolved selection, and it consumes this at the next request boundary
-// so a change made while a response streams reaches the next request of that same
-// turn rather than waiting for the turn to end.
+// Pending_Selection is the selection the user asked for and the worker has not installed
+// yet. Only the front-end records it; the worker consumes it at the next request
+// boundary, so a change made while a response streams reaches the next request of that
+// same turn rather than waiting for the turn to end.
 Pending_Selection :: struct {
 	present:  bool,
 	provider: string, // owned by the runtime allocator,
@@ -283,11 +274,9 @@ Runtime :: struct {
 	control:                  agent.Turn_Control,
 	alloc:                    mem.Allocator,
 	signals:                  agent.Chat_Interactive_Signals,
-	// stopping is set once by the front-end before the worker is stopped. It is
-	// separate from a turn cancellation: a cancel ends the running turn and the
-	// session keeps going, while stopping ends the process. The worker checks it
-	// at its own boundaries, so shutdown does not have to reach the worker
-	// through the command queue.
+	// stopping is set once by the front-end before the worker is stopped. A cancel ends
+	// the running turn and the session keeps going; stopping ends the process. The worker
+	// checks it at its own boundaries.
 	stopping:                 bool,
 	// catalog_applied_revision is the newest published catalog whose metadata the
 	// worker applied to the active selection. Only the worker reads and writes it.
@@ -461,7 +450,7 @@ tui_run :: proc(
 	thread.start(worker)
 	_ = catalog_refresh_start(app, sources)
 
-	if viewport, vp_err := term.viewport(app.terminal); vp_err == nil {
+	if viewport, viewport_err := term.viewport(app.terminal); viewport_err == nil {
 		app.columns, app.rows = viewport.columns, viewport.rows
 		present_frame(app, app.storage)
 	}
@@ -480,14 +469,12 @@ tui_run :: proc(
 		count := len(app.raw)
 		input.events_clear(&app.raw, app.run.alloc)
 
-		// A terminal that has reported no size cannot be drawn into: nothing may be
-		// presented until one exists, and the frame it would have drawn is dropped
-		// rather than carried over. It must not stop the rest of the iteration
-		// either. The stop check below runs on this pass too, because a front-end
-		// that silently stopped drawing and stopped listening for a quit is a
-		// process nothing but a signal can end.
-		viewport, vp_err := term.viewport(app.terminal)
-		sizable := vp_err == nil
+		// A terminal that has reported no size cannot be drawn into: the frame it would
+		// have drawn is dropped and the rest of the iteration still runs. The stop check
+		// below runs on this pass too, so a front-end waiting on a size still answers a
+		// quit and a signal.
+		viewport, viewport_err := term.viewport(app.terminal)
+		sizable := viewport_err == nil
 		resized := false
 		recovered := false
 		if sizable {
@@ -499,7 +486,7 @@ tui_run :: proc(
 			resized = viewport.columns != app.columns || viewport.rows != app.rows
 			app.columns, app.rows = viewport.columns, viewport.rows
 		} else {
-			report_viewport_unavailable(app, vp_err)
+			report_viewport_unavailable(app, viewport_err)
 		}
 
 		// The working indicator animates only while a request is active, so a
@@ -507,10 +494,8 @@ tui_run :: proc(
 		now := time.tick_now()
 		busy := runtime_busy(app)
 		// A steering line applies at a request boundary inside the turn that was running
-		// when it was typed. The turn is over by the time the runtime reports it stopped,
-		// so whatever is still queued was never applied: it goes back to the prompt as the
-		// user's own text, which is what makes an explicit submit its own decision rather
-		// than work started on their behalf.
+		// when it was typed. Whatever is still queued when the turn stops was never
+		// applied, so it goes back to the prompt as the user's own text.
 		if app.steer_active && !busy { restore_steering(app) }
 		app.steer_active = busy
 		advance_spinner := busy && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
@@ -556,11 +541,8 @@ tui_run :: proc(
 }
 
 // report_viewport_unavailable says once per episode that the terminal reported no size to
-// draw into. The loop cannot present a frame without one, and not saying so left a run
-// whose screen kept its last frame, whose transcript kept the news, and whose log kept
-// nothing: a front-end waiting on a terminal that never answered looked exactly like a
-// front-end that had died. The latch clears when a size arrives, so a terminal that goes
-// quiet and comes back is reported each time it does.
+// draw into, and records it in the log and the transcript. The latch clears when a size
+// arrives, so a terminal that goes quiet and comes back is reported each time.
 report_viewport_unavailable :: proc(app: ^App, err: term.Error) {
 	if app.viewport_reported { return }
 	app.viewport_reported = true
@@ -570,11 +552,10 @@ report_viewport_unavailable :: proc(app: ^App, err: term.Error) {
 	snap_append(app, .Warning, fmt.tprintf("the terminal reports no size to draw into (%s); waiting for one", reason))
 }
 
-// app_teardown releases everything after the worker stopped. It must be
-// called at most once. A thread that does not retire stops the release: what such a
-// thread can still reach must not be handed back while it is using it. patience is how
-// long each thread is given, so a test can hold the give-up path without waiting for the
-// bound a real shutdown uses.
+// app_teardown releases everything after the worker stopped, and must be called at most
+// once. A thread that does not retire stops the release, because what it can still reach
+// must not be handed back while it is using it. patience is per thread, so a test can
+// hold the give-up path without the bound a real shutdown uses.
 app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 	retired := catalog_refresh_stop(app, patience)
 	if app.run.work != {} {

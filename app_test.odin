@@ -48,7 +48,7 @@ catalog_pipeline_app :: proc(t: ^testing.T) -> Catalog_Pipeline_Fixture {
 	if cache_err != nil { testing.fail_now(t, "could not create a cache directory") }
 	fixture.cache = cache
 	fixture.previous, fixture.had_previous = os.lookup_env("XDG_CACHE_HOME", context.allocator)
-	os.set_env("XDG_CACHE_HOME", cache)
+	if os.set_env("XDG_CACHE_HOME", cache) != nil { testing.fail_now(t, "could not set the cache root") }
 
 	fixture.user = make([]agent.Catalog_Provider_Source, 1, context.allocator)
 	fixture.user[0] = agent.Catalog_Provider_Source {
@@ -71,13 +71,15 @@ catalog_pipeline_app :: proc(t: ^testing.T) -> Catalog_Pipeline_Fixture {
 catalog_pipeline_end :: proc(fixture: ^Catalog_Pipeline_Fixture) {
 	agent.catalog_destroy(&fixture.app.setup.catalog)
 	catalog_run_destroy(&fixture.app)
+	// The process is the isolated child this suite runs in, so a restore that fails
+	// changes nothing that outlives it.
 	if fixture.had_previous {
-		os.set_env("XDG_CACHE_HOME", fixture.previous)
+		_ = os.set_env("XDG_CACHE_HOME", fixture.previous)
 	} else {
-		os.unset_env("XDG_CACHE_HOME")
+		_ = os.unset_env("XDG_CACHE_HOME")
 	}
 	delete(fixture.previous, context.allocator)
-	os.remove_all(fixture.cache)
+	_ = os.remove_all(fixture.cache)
 	delete(fixture.cache, context.allocator)
 	delete(fixture.user)
 	fixture^ = {}
@@ -277,7 +279,7 @@ test_a_scheduled_retry_is_shown_until_the_send_clears_it :: proc(t: ^testing.T) 
 	}
 
 	app.run.snap.status.working_since = time.tick_now()
-	obs_retry_scheduled(&app, {next_attempt = 2, failure_class = ai.Provider_Failure_Class.Rate_Limited, delay = 2 * time.Second})
+	observer_retry_scheduled(&app, {next_attempt = 2, failure_class = ai.Provider_Failure_Class.Rate_Limited, delay = 2 * time.Second})
 	testing.expect(t, app.run.snap.status.retry_present, "the front-end is waiting for a retry")
 	// One notice per scheduled retry, in the transcript the user reads.
 	if testing.expect_value(t, len(app.run.snap.entries), 1) {

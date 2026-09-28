@@ -5,9 +5,9 @@ package main
 import "core:testing"
 
 _sanitize_one :: proc(t: ^testing.T, chunk: string) -> string {
-	san: Display_Sanitizer
-	cleaned := display_sanitize_chunk(&san, chunk, context.temp_allocator)
-	tail := display_sanitize_flush(&san, context.temp_allocator)
+	sanitizer: Display_Sanitizer
+	cleaned := display_sanitize_chunk(&sanitizer, chunk, context.temp_allocator)
+	tail := display_sanitize_flush(&sanitizer, context.temp_allocator)
 	testing.expect_value(t, tail, "")
 	return cleaned
 }
@@ -43,10 +43,10 @@ test_sanitize_strips_control_sequences :: proc(t: ^testing.T) {
 @(test)
 test_sanitize_state_across_chunks :: proc(t: ^testing.T) {
 	// An escape sequence split across chunks is dropped.
-	san: Display_Sanitizer
-	testing.expect_value(t, display_sanitize_chunk(&san, "a\x1b", context.temp_allocator), "a")
-	testing.expect_value(t, display_sanitize_chunk(&san, "[2K b", context.temp_allocator), " b")
-	testing.expect_value(t, display_sanitize_flush(&san, context.temp_allocator), "")
+	sanitizer: Display_Sanitizer
+	testing.expect_value(t, display_sanitize_chunk(&sanitizer, "a\x1b", context.temp_allocator), "a")
+	testing.expect_value(t, display_sanitize_chunk(&sanitizer, "[2K b", context.temp_allocator), " b")
+	testing.expect_value(t, display_sanitize_flush(&sanitizer, context.temp_allocator), "")
 
 	// A multi-byte rune split across chunks is completed.
 	split: Display_Sanitizer

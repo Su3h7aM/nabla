@@ -63,18 +63,13 @@ App :: struct {
 	// releases the catalog it replaces, so anything read out of a catalog is either
 	// copied while the lock is held or owned by this run.
 	catalog_mu:         sync.Mutex,
-	// catalog_refresh_at is when the last catalog refresh was asked for, on the
-	// monotonic clock, and catalog_refreshed says one was asked for at all: a zero
-	// tick is not a time. It is the cooldown's own record: a refresh runs because a
-	// person asked to see the catalog, and asking twice in a row is the same
-	// question. Only the front-end asks, so it is front-end state.
+	// catalog_refresh_at is when the last catalog refresh was asked for, on the monotonic
+	// clock, and catalog_refreshed says one was asked for at all, since a zero tick is not
+	// a time. Only the front-end asks, so this is front-end state.
 	catalog_refresh_at: time.Tick,
 	catalog_refreshed:  bool,
-	// models_dev_read_at is when this run last read models.dev into sources. The
-	// document behind it changes on the order of days, so a run re-reads it far less
-	// often than the provider listings, which change when a provider adds a model. It
-	// is only meaningful while models_dev_sources is non-empty, which is what says a
-	// read happened.
+	// models_dev_read_at is when this run last read models.dev into sources. It is only
+	// meaningful while models_dev_sources is non-empty, which is what says a read happened.
 	models_dev_read_at: time.Tick,
 	// endpoint is the base_url the running connection borrows. The catalog a model
 	// was selected from is released when a refresh replaces it, so the endpoint is
@@ -124,18 +119,14 @@ App :: struct {
 	completion_query:   string, // owned,
 	completion_index:   int,
 	completion_active:  bool,
-	// history holds the prompts submitted this run, oldest first;
-	// history_index is the entry the prompt line shows, or len(history) while a
-	// fresh line is composed. Only prompts enter it: a slash command is routed
-	// by dispatch_command and is not one. The zero value works: the list grows
-	// on the first submitted prompt.
+	// history holds the prompts submitted this run, oldest first; history_index is the
+	// entry the prompt line shows, or len(history) while a fresh line is composed. Only
+	// prompts enter it, because submit routes a slash command to dispatch_command.
 	history:            [dynamic]string, // owned,
 	history_index:      int,
-	// history_draft is the fresh line as the arrow keys left it when they first
-	// walked into history: stepping forward past the newest entry puts it back.
-	// It is what the user is typing rather than a submitted prompt, so it never
-	// joins history, and a whole-line clear drops it. The empty string means
-	// nothing is kept.
+	// history_draft is the fresh line as the arrow keys left it: stepping forward past the
+	// newest entry puts it back. It never joins history. The empty string means nothing is
+	// kept.
 	history_draft:      string, // owned,
 	columns:            int,
 	rows:               int,
@@ -222,11 +213,9 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []age
 	return true
 }
 
-// run_session_attach opens the session the launch asked for and makes it the
-// running one. A launch that cannot open the session it asked for fails rather
-// than quietly starting a different one.
-//
-// The caller installs the launch's logger before this runs, so the adoption is
+// run_session_attach opens the session the launch asked for and makes it the running one;
+// a launch that cannot open what it asked for fails rather than quietly starting a
+// different one. The caller installs the launch's logger first, so the adoption is
 // recorded.
 run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_Start, stderr: io.Writer) -> bool {
 	directory, directory_error := agent.xdg_directory(.State, setup.alloc)
@@ -456,12 +445,10 @@ pending_selection_clear :: proc(pending: ^Pending_Selection, allocator: mem.Allo
 	pending^ = {}
 }
 
-// selection_request records the selection the user asked for and wakes the worker.
-//
-// The choice cannot travel in the work item: a turn owns the session until its next
-// request boundary, and applying a selection edits the session, so the choice waits in
-// run state for whichever boundary comes first. The wake exists because an idle worker
-// is blocked on the queue and would otherwise never look.
+// selection_request records the selection the user asked for and wakes the worker. The
+// choice cannot travel in the work item, because a turn owns the session until its next
+// request boundary and applying a selection edits the session, so it waits in run state
+// for whichever boundary comes first.
 selection_request :: proc(app: ^App, provider_id, model_id: string) {
 	if runtime_stopping(app) { return }
 	provider := strings.clone(provider_id, app.run.alloc)
@@ -503,16 +490,12 @@ app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
 	return app.run.connection
 }
 
-// apply_selection switches the runtime to one provider's model and applies an
-// effort level. `effort` is an explicit level for the new model; empty means the
-// caller states none, and the level already in effect is then carried over
-// whenever the new model allows it, so switching models does not silently drop
-// the user's choice. A carried level the model does not allow falls back to the
-// lowest level it does state. It resolves the credential and builds the
-// connection, so it must run where the runtime is owned: on the worker once it
-// exists, or at startup before it starts. The selection persists on success, so
-// the next launch restores it. A failure is reported through the snapshot; the
-// previously selected model, if any, stays in place.
+// apply_selection switches the runtime to one provider's model and applies an effort
+// level. An empty effort carries over the level in effect whenever the new model allows
+// it, falling back to the lowest level the model states. It resolves the credential and
+// builds the connection, so it runs only where the runtime is owned: on the worker once
+// it exists, or at startup before it starts. The selection persists on success; a
+// failure is reported through the snapshot and the previous selection stays in place.
 apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announce := true) -> bool {
 	// The catalog entry is copied out while it is the published one: a refresh releases the
 	// catalog it lives in, and the connection built from it outlives that moment.
@@ -629,15 +612,10 @@ selection_publish_locked :: proc(app: ^App, provider_id, model_id: string, annou
 	app.run.snap.generation += 1
 }
 
-// apply_startup_selection chooses the model a launch runs with. Two flags win,
-// because they are the launch's own instruction, and a pair that cannot be
-// resolved is a launch mistake rather than something to paper over. Otherwise
-// the stored selection is used, because it is the user's own last choice, and
-// the model a resumed session recorded is the fallback when there is no usable
-// selection. Neither is fatal: a stale selection leaves the launch to the model
-// menu, which is where a model would be chosen anyway.
-//
-// False means the launch cannot continue. The reason is in the snapshot.
+// apply_startup_selection chooses the model a launch runs with: the two flags if they are
+// given, otherwise the stored selection, otherwise the model a resumed session recorded.
+// A stale selection is not fatal; it leaves the launch to the model menu. False means the
+// launch cannot continue, and the reason is in the snapshot.
 apply_startup_selection :: proc(app: ^App, flag_provider, flag_model: string) -> bool {
 	if flag_provider != "" || flag_model != "" {
 		if flag_provider == "" || flag_model == "" {

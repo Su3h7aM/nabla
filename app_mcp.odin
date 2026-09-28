@@ -9,12 +9,10 @@ import "core:time"
 import "nabla:agent"
 import "nabla:mcp"
 
-// MCP_Runtime owns the running MCP clients and the adapter bindings that point into
-// them.
-//
-// Client slots never move. Each binding has its own allocation, so collecting the
-// pointers cannot invalidate a definition. A refresh keeps the previous generation
-// alive until the session accepts the replacement registry.
+// MCP_Runtime owns the running MCP clients and the adapter bindings that point into them.
+// Client slots never move, and each binding has its own allocation, so collecting the
+// pointers cannot invalidate a definition. A refresh keeps the previous generation alive
+// until the session accepts the replacement registry.
 MCP_Runtime :: struct {
 	clients:            [dynamic]mcp.Client,
 	bindings:           [dynamic]^agent.MCP_Tool_Backend,
@@ -151,11 +149,10 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 	return client, true
 }
 
-// The MCP lifecycle is recorded from here because this is what launches and stops
-// the processes. The server instance is a run-local launch counter, which is what
-// tells a restart apart from the first launch. An exit status is not recorded
-// because mcp does not expose one; the record names the stop instead of inventing
-// a status.
+// The MCP lifecycle is recorded from here because this is what launches and stops the
+// processes. The server instance is a run-local launch counter, which tells a restart
+// apart from the first launch; an exit status is not recorded because mcp does not expose
+// one.
 log_mcp_started :: proc(server_id: string, instance: u64) {
 	fields := [2]agent.Log_Field{{key = "server_id", value = server_id}, {key = "server_instance", value = instance}}
 	agent.log_emit(agent.Log_Record{level = .Info, category = .MCP, event = "mcp.started", fields = fields[:]})
@@ -230,16 +227,10 @@ mcp_tool_config :: proc(server: agent.MCP_Server_Config, remote_name: string) ->
 	return {}, false
 }
 
-// app_tools_refresh rebuilds the session's tool registry from the native tools and
-// every configured MCP server that answers.
-//
-// It runs between turns, while the session is idle, so the registry it replaces is
-// not borrowed by a running request or call. A server that cannot be reached
-// contributes no tools and is reported once: a definition whose schema or backend no
-// longer matches is worse than an absent tool, and other servers still contribute.
-//
-// The returned warning is allocated on the scratch allocator and is valid until the
-// next reset; the caller copies it if it must outlive the call.
+// app_tools_refresh rebuilds the session's tool registry from the native tools and every
+// configured MCP server that answers. It runs only while the session is idle, so the
+// registry it replaces is not borrowed. The returned warning is scratch memory, valid
+// until the next reset; the caller copies it to outlive the call.
 app_tools_refresh :: proc(app: ^App) -> string {
 	setup := &app.setup
 	if len(setup.mcp_servers) == 0 { return "" }
@@ -288,7 +279,10 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	defer if !bindings_installed { mcp_bindings_destroy(&bindings, setup.alloc) }
 	for server, index in setup.mcp_servers {
 		client, available := mcp_runtime_ensure(&setup.mcp, setup.mcp_servers, index, &warnings)
-		if !available { unavailable += 1; continue }
+		if !available {
+			unavailable += 1
+			continue
+		}
 		page, list_err := mcp.client_tools_list(client, mcp_operation(server.discovery_timeout), setup.alloc)
 		if list_err.kind != .None {
 			unavailable += 1
@@ -300,7 +294,10 @@ app_tools_refresh :: proc(app: ^App) -> string {
 		rejected += len(page.rejected)
 		for tool in page.tools {
 			config, configured := mcp_tool_config(server, tool.name)
-			if configured && !config.enabled { disabled += 1; continue }
+			if configured && !config.enabled {
+				disabled += 1
+				continue
+			}
 			local_name := tool.name
 			if configured && config.name != "" { local_name = config.name }
 			// The remote name is exact and arbitrary; the canonical name must be a flat
@@ -329,7 +326,8 @@ app_tools_refresh :: proc(app: ^App) -> string {
 				rejected += 1
 				fmt.sbprintf(&warnings, "\n%s: %s: %s", server.id, tool.name, add_err.detail)
 				bindings[len(bindings) - 1] = nil
-				resize(&bindings, len(bindings) - 1)
+				// A shrink never allocates, so it cannot fail.
+				_ = resize(&bindings, len(bindings) - 1)
 				mcp_binding_destroy(binding, setup.alloc)
 				continue
 			}
@@ -345,7 +343,10 @@ app_tools_refresh :: proc(app: ^App) -> string {
 		for config in server.tools {
 			found := false
 			for tool in page.tools {
-				if tool.name == config.remote_name { found = true; break }
+				if tool.name == config.remote_name {
+					found = true
+					break
+				}
 			}
 			if !found { fmt.sbprintf(&warnings, "\n%s: the server did not list %s", server.id, config.remote_name) }
 		}

@@ -243,7 +243,12 @@ export_open :: proc(path: string, allocator: mem.Allocator) -> (file: ^os.File, 
 	handle, open_error := os.open(path, {.Write, .Create, .Excl}, EXPORT_FILE_PERMISSIONS)
 	if open_error != nil { return nil, nil, false }
 	state, allocation_error := new(sha2.Context_256, allocator)
-	if allocation_error != nil { _ = os.close(handle); return nil, nil, false }
+	if allocation_error != nil {
+		// The open is being abandoned; a close failure changes nothing the
+		// caller can act on.
+		_ = os.close(handle)
+		return nil, nil, false
+	}
 	sha2.init_256(state)
 	return handle, state, true
 }
@@ -251,21 +256,37 @@ export_open :: proc(path: string, allocator: mem.Allocator) -> (file: ^os.File, 
 @(private)
 export_close :: proc(files: ^[dynamic]Export_File, relative: string, file: ^os.File, hash: ^sha2.Context_256, bytes: int, allocator: mem.Allocator) -> bool {
 	close_error := os.close(file)
-	if close_error != nil { free(hash, allocator); return false }
-	if files == nil { free(hash, allocator); return true }
+	if close_error != nil {
+		free(hash, allocator)
+		return false
+	}
+	if files == nil {
+		free(hash, allocator)
+		return true
+	}
 	entry := Export_File {
 		bytes = bytes,
 	}
 	clone_error: mem.Allocator_Error
 	entry.path, clone_error = strings.clone(relative, allocator)
-	if clone_error != nil { free(hash, allocator); return false }
+	if clone_error != nil {
+		free(hash, allocator)
+		return false
+	}
 	digest: journal.Digest
 	sha2.final(hash, digest[:])
 	text: [journal.DIGEST_HEX_LENGTH]u8
 	entry.sha256, clone_error = strings.clone(journal.digest_to_hex(digest, text[:]), allocator)
 	free(hash, allocator)
-	if clone_error != nil { delete(entry.path, allocator); return false }
-	if append(files, entry) != 1 { delete(entry.path, allocator); delete(entry.sha256, allocator); return false }
+	if clone_error != nil {
+		delete(entry.path, allocator)
+		return false
+	}
+	if append(files, entry) != 1 {
+		delete(entry.path, allocator)
+		delete(entry.sha256, allocator)
+		return false
+	}
 	return true
 }
 
@@ -296,7 +317,10 @@ export_note :: proc(omissions: ^[dynamic]string, text: string) {
 
 @(private)
 export_files_destroy :: proc(files: ^[dynamic]Export_File) {
-	for file in files { delete(file.path, context.allocator); delete(file.sha256, context.allocator) }
+	for file in files {
+		delete(file.path, context.allocator)
+		delete(file.sha256, context.allocator)
+	}
 	delete(files^)
 }
 
@@ -309,9 +333,15 @@ diagnostics_export_request :: proc(
 	request_no: journal.Request_Id,
 	join_okay: bool,
 ) -> bool {
-	if !join_okay { export_note(omissions, "the session database did not report this request, so request.json is absent"); return true }
+	if !join_okay {
+		export_note(omissions, "the session database did not report this request, so request.json is absent")
+		return true
+	}
 	row, load_error := diagnostics_request_open(store, session_id, request_no, context.allocator)
-	if load_error != nil { export_note(omissions, "the stored request could not be read"); return true }
+	if load_error != nil {
+		export_note(omissions, "the stored request could not be read")
+		return true
+	}
 	defer diagnostics_request_destroy(&row, context.allocator)
 	payload := export_request_from(&row, session_text)
 	data, encode_error := json.marshal(payload, {pretty = true, sort_maps_by_key = true}, context.allocator)
@@ -342,8 +372,14 @@ export_request_from :: proc(row: ^Diagnostics_Request, session_text: string) -> 
 		model_resolved  = row.model_resolved,
 		api             = row.api,
 	}
-	if row.turn != 0 { payload.turn_no_present = true; payload.turn_no = int(row.turn) }
-	if row.finished_ms != 0 { payload.finished_at_ms_present = true; payload.finished_at_ms = row.finished_ms }
+	if row.turn != 0 {
+		payload.turn_no_present = true
+		payload.turn_no = int(row.turn)
+	}
+	if row.finished_ms != 0 {
+		payload.finished_at_ms_present = true
+		payload.finished_at_ms = row.finished_ms
+	}
 	payload.input_tokens_present, payload.input_tokens = export_usage_bucket(row.input_tokens)
 	payload.output_tokens_present, payload.output_tokens = export_usage_bucket(row.output_tokens)
 	payload.cache_read_tokens_present, payload.cache_read_tokens = export_usage_bucket(row.cache_read_tokens)

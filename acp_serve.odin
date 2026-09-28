@@ -29,6 +29,8 @@ NABLA_ACP_VERSION :: "0.1.0"
 acp_serve :: proc(server: ^Acp_Server, input: io.Reader) -> bool {
 	decoder, decoder_error := acp.frame_decoder_init(server.alloc)
 	if decoder_error != nil {
+		// A write error latches the writer, which acp_serve reports as the run's
+		// failure, so a reply's own result is not acted on here or below.
 		_ = acp.writer_write_error(&server.writer, nil, acp.ERROR_INTERNAL, "the ACP frame buffer could not be allocated")
 		return false
 	}
@@ -755,10 +757,16 @@ acp_mcp_servers_make :: proc(servers: []acp.Mcp_Server, allocator: mem.Allocator
 	if result_error != nil { return {}, false }
 	for server in servers {
 		for existing in result {
-			if existing.id == server.name { agent.MCP_Server_Configs_Destroy(&result, allocator); return {}, false }
+			if existing.id == server.name {
+				agent.MCP_Server_Configs_Destroy(&result, allocator)
+				return {}, false
+			}
 		}
 		names, names_error := make([dynamic]string, 0, len(server.env), context.temp_allocator)
-		if names_error != nil { agent.MCP_Server_Configs_Destroy(&result, allocator); return {}, false }
+		if names_error != nil {
+			agent.MCP_Server_Configs_Destroy(&result, allocator)
+			return {}, false
+		}
 		values, values_error := make([dynamic]string, 0, len(server.env), context.temp_allocator)
 		if values_error != nil {
 			delete(names)
@@ -782,7 +790,10 @@ acp_mcp_servers_make :: proc(servers: []acp.Mcp_Server, allocator: mem.Allocator
 		config, config_error := agent.MCP_Server_Config_From_Stdio(server.name, server.command, server.args, names[:], values[:], allocator)
 		delete(names)
 		delete(values)
-		if config_error != .None { agent.MCP_Server_Configs_Destroy(&result, allocator); return {}, false }
+		if config_error != .None {
+			agent.MCP_Server_Configs_Destroy(&result, allocator)
+			return {}, false
+		}
 		appended := append(&result, config)
 		if appended != 1 {
 			if appended == 0 { agent.MCP_Server_Config_Destroy(&config, allocator) }
@@ -934,14 +945,11 @@ acp_enqueue :: proc(server: ^Acp_Server, work: Acp_Work) -> bool {
 
 // --- prompts -----------------------------------------------------------------
 
-// acp_prompt_text renders a prompt's content blocks as the one message the harness
-// records. Text blocks are the message itself. A resource link becomes the path it names,
-// so the model reads the file with its own tools rather than being handed a URI nothing
-// in the harness can open. An embedded resource brings its text along. Content this agent
-// does not accept is refused rather than dropped: a client must be told that part of what
-// it sent never reached the model.
-//
-// reason is static text when ok is false.
+// acp_prompt_text renders a prompt's content blocks as the one message the harness records.
+// Text blocks are the message itself; a resource link becomes the path it names, and an
+// embedded resource brings its text along. Content this agent does not accept is refused
+// rather than dropped, so the client is told that part of what it sent never reached the
+// model. reason is static text when ok is false.
 acp_prompt_text :: proc(blocks: []acp.Content_Block, allocator := context.allocator) -> (text: string, reason: string, ok: bool) {
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return "", "the prompt could not be allocated", false }
@@ -1012,10 +1020,9 @@ acp_usage :: proc() {
 }
 
 // acp_run opens the front-end, serves one conversation on the given streams, and releases
-// everything it owns. It is the whole front-end except the configuration it is launched
-// with and the process lifetime around it, which is what lets a test drive a real
-// conversation without a process. False means the run could not be opened or the stream
-// failed before it ended.
+// everything it owns. It is the whole front-end except its configuration and the process
+// lifetime around it, which is what lets a test drive a real conversation without a
+// process. False means the run could not be opened or the stream failed before it ended.
 acp_run :: proc(
 	sources: []agent.Catalog_Provider_Source,
 	harness_options: agent.Harness_Options,
@@ -1079,7 +1086,10 @@ acp_main :: proc(args: []string) -> int {
 			acp_usage()
 			return 0
 		}
-		if strings.has_prefix(arg, "--config=") { config_path = arg[len("--config="):]; continue }
+		if strings.has_prefix(arg, "--config=") {
+			config_path = arg[len("--config="):]
+			continue
+		}
 		if arg == "--config" {
 			if i + 1 >= len(args) {
 				acp_usage()

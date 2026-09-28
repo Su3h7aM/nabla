@@ -85,7 +85,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 	// The run's catalog-side state belongs to the same teardown: an endpoint a
 	// selection copied, and the refresh snapshots.
 	catalog_run_destroy(app)
-	os.remove_all(app.setup.workspace)
+	_ = os.remove_all(app.setup.workspace)
 	delete(app.setup.workspace, app.setup.alloc)
 	delete(app.setup.resumed_provider, app.setup.alloc)
 	delete(app.setup.resumed_model, app.setup.alloc)
@@ -93,7 +93,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 	delete(app.setup.model_id, app.setup.alloc)
 	delete(app.setup.credential, app.setup.alloc)
 	delete(app.setup.journal_directory, app.setup.alloc)
-	os.remove_all(directory)
+	_ = os.remove_all(directory)
 	delete(directory, context.allocator)
 }
 
@@ -330,7 +330,6 @@ app_session_accept :: proc(test: ^testing.T, app: ^App, text: string) {
 	testing.expect(test, found, "the running session must still record history")
 }
 
-// app_workspace_make creates a directory a session can claim to have run in.
 app_workspace_make :: proc(t: ^testing.T) -> string {
 	path, err := os.make_directory_temp("", "nabla-app-other-*", context.allocator)
 	if err != nil { testing.fail_now(t, "could not create a temporary directory") }
@@ -378,18 +377,20 @@ app_state_isolate :: proc(t: ^testing.T) -> (state: string, previous: string, ha
 	directory, directory_err := os.make_directory_temp("", "nabla-app-state-*", context.allocator)
 	if directory_err != nil { testing.fail_now(t, "could not create a temporary state directory") }
 	previous, had_previous = os.lookup_env("XDG_STATE_HOME", context.allocator)
-	os.set_env("XDG_STATE_HOME", directory)
+	if os.set_env("XDG_STATE_HOME", directory) != nil { testing.fail_now(t, "could not set the state root") }
 	return directory, previous, had_previous
 }
 
 app_state_restore :: proc(state, previous: string, had_previous: bool) {
+	// The process is the isolated child this suite runs in, so a restore that fails
+	// changes nothing that outlives it.
 	if had_previous {
-		os.set_env("XDG_STATE_HOME", previous)
+		_ = os.set_env("XDG_STATE_HOME", previous)
 	} else {
-		os.unset_env("XDG_STATE_HOME")
+		_ = os.unset_env("XDG_STATE_HOME")
 	}
 	delete(previous, context.allocator)
-	os.remove_all(state)
+	_ = os.remove_all(state)
 	delete(state, context.allocator)
 }
 
@@ -485,7 +486,7 @@ test_resume_latest_is_scoped_to_the_directory :: proc(t: ^testing.T) {
 
 	other := app_workspace_make(t)
 	defer {
-		os.remove_all(other)
+		_ = os.remove_all(other)
 		delete(other, context.allocator)
 	}
 
@@ -536,7 +537,7 @@ test_resume_latest_refuses_an_empty_directory :: proc(t: ^testing.T) {
 
 	empty := app_workspace_make(t)
 	defer {
-		os.remove_all(empty)
+		_ = os.remove_all(empty)
 		delete(empty, context.allocator)
 	}
 
@@ -559,7 +560,7 @@ test_resume_by_id_leaves_the_launch_directory_behind :: proc(t: ^testing.T) {
 
 	other := app_workspace_make(t)
 	defer {
-		os.remove_all(other)
+		_ = os.remove_all(other)
 		delete(other, context.allocator)
 	}
 	id := app_session_add(t, &app.setup, {workspace = other, provider = "test-provider", model = "test-model"}, 5_000)
@@ -600,7 +601,7 @@ test_a_switch_to_a_missing_directory_keeps_the_running_session :: proc(t: ^testi
 
 	gone := app_workspace_make(t)
 	id := app_session_add(t, &app.setup, {workspace = gone}, 6_000)
-	os.remove_all(gone)
+	_ = os.remove_all(gone)
 	defer delete(gone, context.allocator)
 
 	running := app.setup.session.session

@@ -182,7 +182,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	case .Effort:
 		applied := true
 		if work.text == "" || work.text == "default" {
-			agent.chat_session_set_effort(&app.setup.session, "")
+			_ = agent.chat_session_set_effort(&app.setup.session, "")
 			snap_append(app, .Notice, agent.chat_effort_change_note(""))
 		} else if agent.chat_session_set_effort(&app.setup.session, work.text) {
 			snap_append(app, .Notice, agent.chat_effort_change_note(work.text))
@@ -224,7 +224,6 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	run_log_flush(&app.setup)
 }
 
-// run_accepted_turn runs the turn the session just accepted.
 run_accepted_turn :: proc(app: ^App, observer: agent.Chat_Observer) {
 	app.setup.session.catalog = app_catalog_ref(app)
 	// A stop the front-end asked for is for a running turn, and none runs until the flag
@@ -240,7 +239,7 @@ run_accepted_turn :: proc(app: ^App, observer: agent.Chat_Observer) {
 	}
 	// How the turn ended reaches the front-end through the observer, which reports the
 	// terminal status, so the worker has nothing of its own to do with the return.
-	agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)
+	_ = agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)
 }
 
 // app_agent_report_turn runs a turn for the oldest message a subagent sent while no turn ran,
@@ -325,11 +324,10 @@ session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 	}
 	if start.kind == .New { return true }
 
-	// A conversation has to be configured before it can run: the new chat starts
-	// with no model, so the session's recorded one is applied, with the selection
-	// already in effect as the fallback. A session whose model is gone from the
-	// catalog stays open on the current selection, and can still be changed from
-	// the model menu.
+	// A conversation has to be configured before it can run: the new chat starts with no
+	// model, so the session's recorded one is applied, with the selection already in
+	// effect as the fallback. A session whose model is gone from the catalog stays open on
+	// the current selection.
 	if setup.resumed_provider != "" && setup.resumed_model != "" && apply_selection(app, setup.resumed_provider, setup.resumed_model, "") {
 		return true
 	}
@@ -580,7 +578,6 @@ snap_report_dropped :: proc(app: ^App, alloc_error: mem.Allocator_Error) {
 	agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "ui.transcript_line_dropped", fields = fields[:]})
 }
 
-// snap_push_locked appends one entry and trims the transcript to its budget.
 snap_push_locked :: proc(app: ^App, entry: Entry) {
 	app.run.snap.entries_bytes += entry.bytes
 	if _, append_error := append(&app.run.snap.entries, entry); append_error != nil {
@@ -623,26 +620,24 @@ snap_append_locked :: proc(app: ^App, kind: Entry_Kind, text: string) {
 run_observer :: proc(app: ^App) -> agent.Chat_Observer {
 	return {
 		user_data = app,
-		assistant_begin = obs_assistant_begin,
-		assistant_text = obs_assistant_text,
-		assistant_end = obs_assistant_end,
-		user_text = obs_user_text,
-		tool_result = obs_tool_result,
-		message = obs_message,
-		usage = obs_usage,
-		request_prepared = obs_request_prepared,
-		request_finished = obs_request_finished,
-		retry_scheduled = obs_retry_scheduled,
+		assistant_begin = observer_assistant_begin,
+		assistant_text = observer_assistant_text,
+		assistant_end = observer_assistant_end,
+		user_text = observer_user_text,
+		tool_result = observer_tool_result,
+		message = observer_message,
+		usage = observer_usage,
+		request_prepared = observer_request_prepared,
+		request_finished = observer_request_finished,
+		retry_scheduled = observer_retry_scheduled,
 	}
 }
 
-// obs_request_prepared and obs_request_finished both move what the status describes: the
-// first knows how large the request about to be sent is, and the second has the provider's
-// own report of the one that just finished. Refreshing at both is what keeps the footer
-// live while a turn runs, instead of only once the whole prompt is done. Neither runs
-// inside a store transaction, because a request's record is committed before this is
-// called.
-obs_request_prepared :: proc(user_data: rawptr) {
+// observer_request_prepared and observer_request_finished both move what the status
+// describes: the size of the request about to be sent, and the provider's report of the
+// one that just finished. Neither runs inside a store transaction, because a request's
+// record is committed before this is called.
+observer_request_prepared :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
 	// The send the front-end was waiting for is this one, so whatever it showed about the
 	// last retry is over.
@@ -650,10 +645,10 @@ obs_request_prepared :: proc(user_data: rawptr) {
 	refresh_status(app)
 }
 
-// obs_retry_scheduled reports a scheduled retry twice: the transcript keeps the sentence,
+// observer_retry_scheduled reports a scheduled retry twice: the transcript keeps the sentence,
 // and the status keeps the attempt the turn is waiting for, which is what the working
 // indicator reads.
-obs_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Event) {
+observer_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Event) {
 	app := cast(^App)user_data
 	snap_append(app, .Notice, retry_display_text(event))
 	sync.mutex_lock(&app.run.mu)
@@ -664,7 +659,6 @@ obs_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Event) {
 	app.run.snap.generation += 1
 }
 
-// clear_retry forgets a retry the front-end was showing.
 clear_retry :: proc(app: ^App) {
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
@@ -673,18 +667,18 @@ clear_retry :: proc(app: ^App) {
 	app.run.snap.generation += 1
 }
 
-obs_request_finished :: proc(user_data: rawptr) {
+observer_request_finished :: proc(user_data: rawptr) {
 	refresh_status(cast(^App)user_data)
 }
 
-obs_assistant_begin :: proc(user_data: rawptr) {
+observer_assistant_begin :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
 	snap_push_locked(app, snap_entry_make(app, .Assistant, ""))
 }
 
-obs_assistant_text :: proc(user_data: rawptr, text: string) {
+observer_assistant_text :: proc(user_data: rawptr, text: string) {
 	app := cast(^App)user_data
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
@@ -703,7 +697,7 @@ obs_assistant_text :: proc(user_data: rawptr, text: string) {
 	snap_push_locked(app, snap_entry_make(app, .Assistant, text))
 }
 
-obs_assistant_end :: proc(user_data: rawptr) {
+observer_assistant_end :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
@@ -714,11 +708,11 @@ obs_assistant_end :: proc(user_data: rawptr) {
 	app.run.snap.generation += 1
 }
 
-obs_user_text :: proc(user_data: rawptr, text: string) {
+observer_user_text :: proc(user_data: rawptr, text: string) {
 	snap_append(cast(^App)user_data, .User, text)
 }
 
-obs_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Result) {
+observer_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Result) {
 	app := cast(^App)user_data
 	snap_append_tool(app, name, result.content, tool_display_summary(result), result.outcome)
 }
@@ -734,7 +728,7 @@ snap_append_tool :: proc(app: ^App, name, content, fallback: string, outcome: jo
 	snap_push_locked(app, entry)
 }
 
-obs_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text: string) {
+observer_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text: string) {
 	app := cast(^App)user_data
 	entry_kind := Entry_Kind.Notice
 	switch kind {
@@ -748,7 +742,7 @@ obs_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text: stri
 	snap_append(app, entry_kind, text)
 }
 
-obs_usage :: proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event) {
+observer_usage :: proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event) {
 	app := cast(^App)user_data
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)

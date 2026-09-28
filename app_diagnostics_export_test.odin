@@ -37,7 +37,10 @@ test_export_session_payload_and_manifest_digest :: proc(test: ^testing.T) {
 		for iteration in 0 ..< 2 {
 			include_payloads := iteration == 1
 			destination := fmt.aprintf("/tmp/nabla-diag-export-%d-%v", os.get_pid(), include_payloads)
-			defer { _ = os.remove_all(destination); delete(destination) }
+			defer {
+				_ = os.remove_all(destination)
+				delete(destination)
+			}
 			_ = os.remove_all(destination)
 			arguments := [4]string{session_text, "--export", destination, "--include-payloads"}
 			if !include_payloads { arguments = [4]string{session_text, "--export", destination, ""} }
@@ -81,7 +84,10 @@ test_export_does_not_replace_an_existing_directory :: proc(test: ^testing.T) {
 		buffer: [journal.SESSION_ID_HEX_LENGTH]u8
 		destination, make_error := os.make_directory_temp("", "nabla-diag-existing-*", context.allocator)
 		if make_error != nil { testing.fail_now(test, "temporary directory unavailable") }
-		defer { _ = os.remove_all(destination); delete(destination, context.allocator) }
+		defer {
+			_ = os.remove_all(destination)
+			delete(destination, context.allocator)
+		}
 		arguments := [3]string{journal.session_id_to_hex(session, buffer[:]), "--export", destination}
 		output, errors: strings.Builder
 		defer strings.builder_destroy(&output)

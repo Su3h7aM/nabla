@@ -31,7 +31,6 @@ run_log_open :: proc(setup: ^Run_Setup) -> log.Logger {
 	return agent.log_logger(&setup.log_binding)
 }
 
-// run_log_header records the launch's own header.
 run_log_header :: proc(setup: ^Run_Setup) {
 	if setup.log_binding.ring == nil { return }
 	fields := [3]agent.Log_Field {
@@ -81,7 +80,6 @@ log_session_claimed :: proc(id: journal.Session_Id, resumed: bool, recovery: jou
 	}
 }
 
-// log_session_released records that this process gave a session up.
 log_session_released :: proc(id: journal.Session_Id) {
 	if id == {} { return }
 	binding: agent.Log_Binding

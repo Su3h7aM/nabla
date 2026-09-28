@@ -13,7 +13,10 @@ import "nabla:agent/journal"
 // Environment changes stay in the isolated child process.
 diagnostics_request_state :: proc(test: ^testing.T, name: string, body: proc(test: ^testing.T)) {
 	root := fmt.aprintf("/tmp/nabla-diag-state-%s-%d", name, os.get_pid())
-	defer { _ = os.remove_all(root); delete(root) }
+	defer {
+		_ = os.remove_all(root)
+		delete(root)
+	}
 	previous, present := os.lookup_env("XDG_STATE_HOME", context.temp_allocator)
 	defer if present { _ = os.set_env("XDG_STATE_HOME", previous) } else { _ = os.unset_env("XDG_STATE_HOME") }
 	if os.set_env("XDG_STATE_HOME", root) != nil { testing.fail_now(test, "state root could not be set") }
@@ -60,7 +63,10 @@ test_diagnostics_request_summary_and_export :: proc(test: ^testing.T) {
 		buffer: [journal.SESSION_ID_HEX_LENGTH]u8
 		session_text := journal.session_id_to_hex(session, buffer[:])
 		destination := fmt.aprintf("/tmp/nabla-diag-request-export-%d", os.get_pid())
-		defer { _ = os.remove_all(destination); delete(destination) }
+		defer {
+			_ = os.remove_all(destination)
+			delete(destination)
+		}
 		_ = os.remove_all(destination)
 		arguments := [5]string{session_text, "--request", fmt.tprintf("%d", i64(request)), "--export", destination}
 		output, errors: strings.Builder

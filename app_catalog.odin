@@ -14,22 +14,13 @@ CATALOG_REFRESH_CAPACITY :: 1
 Catalog_Refresh_Chan :: chan.Chan(bool)
 
 // CATALOG_REFRESH_COOLDOWN is how long the published catalog is left alone after a
-// refresh was asked for. The freshness windows in `agent` are not clocks: nothing
-// consults them on its own. A refresh runs because a person asked to see the catalog,
-// and this cooldown is what keeps a burst of asks from rebuilding it: opening the
-// model menu three times in a row is one question, and the answer is already held.
-//
-// The count starts when the refresh is asked for rather than when it finishes, so a
-// refresh that is still running is not asked for again.
+// refresh was asked for. The count starts when the refresh is asked for and not when it
+// finishes, so a burst of asks is one refresh.
 CATALOG_REFRESH_COOLDOWN :: 10 * time.Minute
 
-// MODELS_DEV_INGEST_COOLDOWN is how long a run keeps the models.dev sources it
-// already read. models.dev states which endpoints serve which models, and that
-// changes on the order of days: re-reading the cached document sooner would parse
-// the same bytes into the same records. It is longer than the catalog cooldown
-// because the provider listing is what actually changes while a person works, and it
-// is not a fetch window: whether the document is fetched or read from the cache is
-// the cache's own freshness decision.
+// MODELS_DEV_INGEST_COOLDOWN is how long a run keeps the models.dev sources it already
+// read. It is not a fetch window: whether the document is fetched or read from the cache
+// is the cache's own freshness decision.
 MODELS_DEV_INGEST_COOLDOWN :: 24 * time.Hour
 
 catalog_refresh_start :: proc(app: ^App, sources: []agent.Catalog_Provider_Source) -> bool {
@@ -183,11 +174,9 @@ catalog_selection_refresh_request :: proc(app: ^App) {
 	_ = work_send(app, Work{kind = .Catalog})
 }
 
-// catalog_selection_sync reapplies catalog-derived fields to the selected model.
-// A model can be selected from provider discovery before models.dev arrives, so
-// replacing the catalog must also update the session's capacity, tools, routing,
-// and reasoning controls. The worker owns those values; this procedure runs only
-// on that worker, including at request boundaries inside a turn.
+// catalog_selection_sync reapplies catalog-derived fields to the selected model, so a
+// catalog replacement also updates the session's capacity, tools, routing, and reasoning
+// controls. It runs only on the worker, including at request boundaries inside a turn.
 catalog_selection_sync :: proc(app: ^App) {
 	revision := sync.atomic_load(&app.catalog_revision)
 	if revision == app.run.catalog_applied_revision { return }

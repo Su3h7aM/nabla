@@ -17,17 +17,10 @@ import "nabla:agent"
 import "nabla:agent/journal"
 
 // The ACP agent front-end: one process, one session, one prompt turn at a time,
-// speaking the Agent Client Protocol on the streams it was given. A client (an editor)
-// starts the process, initializes it, opens a session for a working directory, and
-// sends prompts. The session and the turn loop underneath are the harness's own, so an
-// editor conversation is the same conversation the interactive and headless front-ends
-// run.
-//
-// Two threads. The reader owns the protocol conversation: it reads messages, answers
-// what it can answer alone, and hands session work to the worker. The worker owns the
-// session: it opens sessions, runs turns, and writes everything a turn produces. The
-// split exists because a client cancels a running turn by sending another message on the
-// same stream, so nothing may block the reader while a turn runs.
+// speaking the Agent Client Protocol on the streams it was given. Two threads: the
+// reader answers what it can alone and hands session work to the worker, which owns the
+// session and writes everything a turn produces. The split exists because a client
+// cancels a turn by sending another message on the same stream.
 
 // ACP_WORK_CAPACITY bounds requests waiting for the worker. The reader admits one
 // session request at a time, so the queue holds the request being served and, briefly,
@@ -111,7 +104,10 @@ acp_queue_add :: proc(server: ^Acp_Server) {
 acp_queue_remove :: proc(server: ^Acp_Server) {
 	sync.mutex_lock(&server.queue_mu)
 	server.pending_work -= 1
-	if server.pending_work <= 0 { server.pending_work = 0; sync.atomic_store(&server.busy, false) }
+	if server.pending_work <= 0 {
+		server.pending_work = 0
+		sync.atomic_store(&server.busy, false)
+	}
 	sync.mutex_unlock(&server.queue_mu)
 }
 
@@ -302,6 +298,8 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 
 acp_run_work :: proc(server: ^Acp_Server, work: Acp_Work) {
 	if !acp_work_session_valid(server, work) {
+		// A write error latches the writer, which the run reports as its failure, so
+		// every reply's own result is not acted on here or below.
 		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_PARAMS, "the session changed before the request could run")
 	} else {
 		switch work.kind {
@@ -519,10 +517,9 @@ acp_session_open :: proc(server: ^Acp_Server, workspace: string, start: Session_
 }
 
 // acp_session_select_model gives a freshly opened session a model: the one its own record
-// names, otherwise the one this process chose at startup. A session whose record cannot
-// be served keeps the process's selection, so a stale record does not make the session
-// unusable. A session with no selection at all still opens: the prompt refuses it with
-// a clear error, which is also how model discovery over an empty catalog works.
+// names, otherwise the one this process chose at startup. A stale record falls back to the
+// process's selection, and a session with no selection at all still opens, because the
+// prompt is what refuses it.
 acp_session_select_model :: proc(server: ^Acp_Server) {
 	app := &server.app
 	if app.setup.resumed_provider != "" && app.setup.resumed_model != "" {
@@ -550,14 +547,11 @@ acp_select_startup_model :: proc(server: ^Acp_Server) -> bool {
 	return acp_select_first_model(server)
 }
 
-// acp_select_first_model picks the first configured provider that can serve a request
-// and its first model, in catalog order, so the choice is the same on every launch.
-// Nothing is persisted: a model chosen for an editor conversation is not the user's own
-// last choice for the harness.
-//
-// Every candidate is named before any of them is tried: applying a selection takes the
-// catalog lock, and a publication releases the catalog the names were read from, so a
-// borrow would not survive the attempts below.
+// acp_select_first_model picks the first configured provider that can serve a request and
+// its first model, in catalog order, so the choice is the same on every launch. Nothing is
+// persisted: a model chosen for an editor conversation is not the user's own last choice.
+// Every candidate is named before any of them is tried, because applying a selection takes
+// the catalog lock and a publication releases the catalog the names were read from.
 acp_select_first_model :: proc(server: ^Acp_Server) -> bool {
 	app := &server.app
 	candidates, candidates_ok := acp_servable_models(app, app.run.alloc)
@@ -727,7 +721,10 @@ acp_work_list_sessions :: proc(server: ^Acp_Server, work: Acp_Work) {
 	active_listed := false
 	for listed in sessions {
 		buffer: [journal.SESSION_ID_HEX_LENGTH]u8
-		if journal.session_id_to_hex(listed.id, buffer[:]) == active_id { active_listed = true; break }
+		if journal.session_id_to_hex(listed.id, buffer[:]) == active_id {
+			active_listed = true
+			break
+		}
 	}
 	extra := 1 if active_matches && !active_listed else 0
 	infos, infos_error := make([]acp.Session_Info, len(sessions) + extra, server.alloc)
@@ -1191,7 +1188,6 @@ acp_tool_status :: proc(server: ^Acp_Server, outcome: journal.Tool_Outcome) -> a
 	return .Failed
 }
 
-// acp_next_message_id opens a new message.
 acp_next_message_id :: proc(server: ^Acp_Server) -> string {
 	server.message_seq += 1
 	return fmt.tprintf("msg-%d", server.message_seq)

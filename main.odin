@@ -34,8 +34,14 @@ chat_cli_parse :: proc(args: []string) -> (chat_cli_options, Cli_Parse_Error) {
 	result: chat_cli_options
 	for i := 0; i < len(args); i += 1 {
 		arg := args[i]
-		if arg == "--help" || arg == "-h" { result.help = true; continue }
-		if arg == "--list" { result.list = true; continue }
+		if arg == "--help" || arg == "-h" {
+			result.help = true
+			continue
+		}
+		if arg == "--list" {
+			result.list = true
+			continue
+		}
 		if arg == "--resume" {
 			result.resume = true
 			// A following argument that is not another flag names the session.
@@ -65,9 +71,18 @@ chat_cli_parse :: proc(args: []string) -> (chat_cli_options, Cli_Parse_Error) {
 			if result.prompt == "" { return result, .Empty_Prompt }
 			continue
 		}
-		if strings.has_prefix(arg, "--config=") { result.config_path = arg[len("--config="):]; continue }
-		if strings.has_prefix(arg, "--provider=") { result.provider_id = arg[len("--provider="):]; continue }
-		if strings.has_prefix(arg, "--model=") { result.model_id = arg[len("--model="):]; continue }
+		if strings.has_prefix(arg, "--config=") {
+			result.config_path = arg[len("--config="):]
+			continue
+		}
+		if strings.has_prefix(arg, "--provider=") {
+			result.provider_id = arg[len("--provider="):]
+			continue
+		}
+		if strings.has_prefix(arg, "--model=") {
+			result.model_id = arg[len("--model="):]
+			continue
+		}
 		if arg == "--config" || arg == "--provider" || arg == "--model" {
 			if i + 1 >= len(args) { return result, .Missing_Value }
 			i += 1
@@ -160,13 +175,10 @@ headless_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text:
 	}
 }
 
-// run_prompt_turn accepts one prompt on an opened session and runs it to
-// completion, reporting through out. False means the turn did not complete; the
-// observer has already said why, so the caller only needs the exit code.
-//
-// This is the whole of what a headless run does with a prompt, which is what
-// makes it testable without a terminal: the launch around it is shared with the
-// interactive harness.
+// run_prompt_turn accepts one prompt on an opened session and runs it to completion,
+// reporting through out. False means the turn did not complete, and the observer has
+// already said why, so the caller only needs the exit code. It is the whole of what a
+// headless run does with a prompt, and the launch around it is shared.
 run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> bool {
 	// Tools are refreshed between turns, while the session is idle, so the registry a
 	// turn dispatches against is the one it was advertised with.
@@ -201,11 +213,9 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 	return completed
 }
 
-// run_prompt executes one prompt without a terminal and returns the process exit
-// code. It shares the launch path with the interactive harness: the same
-// configuration, the same catalog, the same session. Only the front-end differs,
-// so a headless run is the same conversation rather than a second implementation
-// of one.
+// run_prompt executes one prompt without a terminal and returns the process exit code. It
+// shares the launch path with the interactive harness, so only the front-end differs and a
+// headless run is the same conversation rather than a second implementation of one.
 run_prompt :: proc(
 	sources: []agent.Catalog_Provider_Source,
 	mcp_servers: []agent.MCP_Server_Config,
@@ -345,7 +355,6 @@ main :: proc() {
 	os.exit(chat_main())
 }
 
-// stdout_writer is where a real headless run's answer goes.
 stdout_writer :: proc() -> io.Writer {
 	return io.to_writer(os.to_stream(os.stdout))
 }

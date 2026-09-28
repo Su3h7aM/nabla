@@ -27,11 +27,10 @@ Command_Id :: enum {
 	Model,
 }
 
-// Command is one slash command. name is what the user types, summary is what
-// /help says about it, and open_menu shows the list its argument is chosen from
-// (nil when it takes no argument). The table is the only place a command is
-// declared, so completion, help, and dispatch cannot disagree about what exists
-// or about which commands offer a list.
+// Command is one slash command. name is what the user types, summary is what /help says
+// about it, and open_menu shows the list its argument is chosen from, nil when it takes
+// no argument. The table is the only place a command is declared, so completion, help,
+// and dispatch cannot disagree.
 Command :: struct {
 	id:        Command_Id,
 	name:      string,
@@ -59,7 +58,6 @@ command_find :: proc(name: string) -> (Command, bool) {
 	return {}, false
 }
 
-// command_split separates a command's name from its argument.
 command_split :: proc(text: string) -> (name, argument: string) {
 	trimmed := strings.trim_space(text)
 	space := strings.index_byte(trimmed, ' ')
@@ -74,11 +72,10 @@ command_prefixed :: proc(command, typed: string) -> bool {
 	return strings.equal_fold(command[:len(typed)], typed)
 }
 
-// complete_command advances the slash command at the prompt. Tab cycles: the
-// first press reaches the first match of what is typed, and the next press moves
-// to the one after it, wrapping around, so pressing Tab on "/" walks the whole
-// set. A completed name whose command takes a list opens that list. Matching
-// ignores case; what is written back is the command's own lowercase name.
+// complete_command advances the slash command at the prompt. Tab cycles: the first press
+// reaches the first match of what is typed and the next moves to the one after it,
+// wrapping around. A completed name whose command takes a list opens that list. Matching
+// ignores case; the command's own lowercase name is written back.
 complete_command :: proc(app: ^App) {
 	typed := widgets.input_text(&app.input)
 	if !strings.has_prefix(typed, "/") || strings.contains_rune(typed, ' ') {
@@ -163,10 +160,9 @@ MOUSE_WHEEL_LINES :: 3
 // tool_box_entry_id returns the entry id of the tool box covering a screen cell,
 // or 0 when the cell is not on one.
 //
-// It asks the frame that is on screen rather than a rectangle remembered from a
-// previous frame, so a box that scrolled or resized cannot take a report aimed
-// at whatever now covers those cells. The id travels on the node, so the report
-// still names the right box after the transcript dropped older entries.
+// It asks the frame that is on screen rather than a rectangle remembered from a previous
+// frame, so a box that scrolled or resized cannot take a report aimed at whatever now
+// covers those cells.
 tool_box_entry_id :: proc(app: ^App, x, y: int) -> u64 {
 	frame_result, frame_error := layout.result(&app.storage.layout_ctx)
 	if frame_error != .None { return 0 }
@@ -181,11 +177,8 @@ tool_box_entry_id :: proc(app: ^App, x, y: int) -> u64 {
 	return 0
 }
 
-// snap_entry_by_id finds the resident entry carrying id, or nil when the
-// transcript no longer holds it. The scan runs from the newest entry, which is
-// where the box under the pointer almost always is.
-//
-// The caller holds the runtime mutex.
+// snap_entry_by_id finds the resident entry carrying id, or nil when the transcript no
+// longer holds it. The scan runs from the newest entry. The caller holds the runtime mutex.
 snap_entry_by_id :: proc(app: ^App, id: u64) -> ^Entry {
 	for index := len(app.run.snap.entries) - 1; index >= 0; index -= 1 {
 		entry := &app.run.snap.entries[index]
@@ -212,16 +205,10 @@ tool_box_scroll :: proc(entry: ^Entry, button: input.Mouse_Button) -> bool {
 	return false
 }
 
-// wheel_scroll turns a mouse wheel report into a scroll. Over a tool box that can
-// still move the way the wheel asks, it scrolls that box's window, so a long
-// result can be read without leaving the transcript; everywhere else in the
-// messages area it scrolls the transcript, which is what page up and page down
-// do.
-//
-// The box is asked first, and asked of the frame itself, so a box keeps the wheel
-// wherever it sits in the transcript. The transcript's own guard stays a bound on
-// the footer rather than on the frame, because a report there has nothing to
-// scroll.
+// wheel_scroll turns a mouse wheel report into a scroll: the tool box under the pointer
+// when it can still move the way the wheel asks, and the transcript everywhere else in
+// the messages area. The box is asked first and asked of the frame itself, so it keeps
+// the wheel wherever it sits in the transcript.
 wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 	// The terminal reports mouse cells one-based; the frame is solved from zero.
 	if entry_id := tool_box_entry_id(app, mouse.x - 1, mouse.y - 1); entry_id != 0 {
@@ -342,7 +329,6 @@ handle_event :: proc(app: ^App, event: input.Event) {
 	}
 }
 
-// cancel_or_quit cancels the running turn, or exits when nothing is running.
 cancel_or_quit :: proc(app: ^App) {
 	if runtime_busy(app) {
 		agent.turn_control_stop(&app.run.control)
@@ -439,11 +425,10 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 	}
 }
 
-// submit sends the prompt line as a turn prompt, a steering line, or a slash
-// command. A line typed while a turn runs is queued for the next request boundary
-// instead of being dropped, which is the only point at which it can safely change
-// what the model is asked next. A prompt line also enters the history the arrow
-// keys walk; a slash command is not a prompt and does not.
+// submit sends the prompt line as a turn prompt, a steering line, or a slash command. A
+// line typed while a turn runs is queued for the next request boundary instead of being
+// dropped. A prompt line also enters the history the arrow keys walk; a slash command
+// does not.
 submit :: proc(app: ^App) {
 	text := strings.trim_space(widgets.input_text(&app.input))
 	if text == "" {
@@ -594,11 +579,9 @@ paste_insert :: proc(app: ^App, text_value: string) {
 
 // --- prompt history -------------------------------------------------------
 
-// prompt_clear empties the prompt line and forgets any recalled entry and the
-// kept draft, so the next up arrow starts from the newest prompt. Every clear
-// of the whole line goes through it: history_index says which stored prompt
-// the line shows, and a line cleared any other way would leave it naming text
-// that is gone.
+// prompt_clear empties the prompt line and forgets any recalled entry and the kept draft,
+// so the next up arrow starts from the newest prompt. Every clear of the whole line goes
+// through it, because history_index says which stored prompt the line shows.
 prompt_clear :: proc(app: ^App) {
 	widgets.input_clear(&app.input)
 	app.history_index = len(app.history)
@@ -623,7 +606,6 @@ history_draft_keep :: proc(app: ^App) {
 	}
 }
 
-// history_draft_drop releases the kept draft, if any.
 history_draft_drop :: proc(app: ^App) {
 	if app.history_draft == "" { return }
 	delete(app.history_draft, app.run.alloc)

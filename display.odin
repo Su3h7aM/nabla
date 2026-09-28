@@ -8,11 +8,9 @@ import "core:unicode/utf8"
 import "nabla:agent"
 import "nabla:agent/journal"
 
-// Display owns the text sanitizer every transcript renderer needs. Model
-// output, tool output, user text, and diagnostics may carry cursor movement,
-// erase commands, or OSC sequences, and only the renderer may emit controls,
-// so untrusted text is cleaned before it is drawn. Stored conversation
-// content is never altered for display.
+// Display owns the text sanitizer every transcript renderer needs: model output, tool
+// output, user text, and diagnostics may carry cursor movement, erase commands, or OSC
+// sequences, and only the renderer may emit controls. Stored content is never altered.
 
 Display_San_State :: enum {
 	Text,
@@ -22,11 +20,9 @@ Display_San_State :: enum {
 	Osc_Esc,
 }
 
-// Display_Sanitizer drops terminal control sequences from untrusted text
-// while passing ordinary text and newlines through. State persists across
-// chunks, so a sequence split over two stream fragments is still dropped and
-// a UTF-8 rune split the same way is still completed. The zero value is
-// ready: plain text with no pending state.
+// Display_Sanitizer drops terminal control sequences from untrusted text and passes
+// ordinary text and newlines through. The state persists across chunks, so a sequence or a
+// UTF-8 rune split over two fragments is still handled. The zero value is ready.
 Display_Sanitizer :: struct {
 	state:    Display_San_State,
 	hold:     [4]u8, // incomplete UTF-8 tail carried into the next chunk,
@@ -38,55 +34,55 @@ Display_Sanitizer :: struct {
 // display_sanitize_chunk renders one fragment and returns text owned by allocator.
 // A successful result transfers the builder's backing allocation to the caller.
 // An allocation failure returns an empty string and releases the partial builder.
-display_sanitize_chunk :: proc(san: ^Display_Sanitizer, chunk: string, allocator := context.allocator) -> string {
-	combined, combined_error := make([dynamic]u8, 0, san.hold_len + len(chunk), context.temp_allocator)
+display_sanitize_chunk :: proc(sanitizer: ^Display_Sanitizer, chunk: string, allocator := context.allocator) -> string {
+	combined, combined_error := make([dynamic]u8, 0, sanitizer.hold_len + len(chunk), context.temp_allocator)
 	if combined_error != nil { return "" }
 	defer delete(combined)
-	if append(&combined, ..san.hold[:san.hold_len]) != san.hold_len { return "" }
+	if append(&combined, ..sanitizer.hold[:sanitizer.hold_len]) != sanitizer.hold_len { return "" }
 	if append(&combined, chunk) != len(chunk) { return "" }
-	san.hold_len = 0
+	sanitizer.hold_len = 0
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return "" }
 	failed := false
 	defer if failed { strings.builder_destroy(&builder) }
 	i := 0
 	for i < len(combined) {
-		if san.skip_one {
-			san.skip_one = false
+		if sanitizer.skip_one {
+			sanitizer.skip_one = false
 			i += 1
 			continue
 		}
 		c := combined[i]
-		switch san.state {
+		switch sanitizer.state {
 		case .Text:
 			switch {
 			case c == 0x1B:
-				san.state = .Esc
+				sanitizer.state = .Esc
 				i += 1
 			case c == '\r':
 				strings.write_byte(&builder, '\n')
-				san.after_cr = true
+				sanitizer.after_cr = true
 				i += 1
 			case c == '\n':
-				if !san.after_cr { strings.write_byte(&builder, '\n') }
-				san.after_cr = false
+				if !sanitizer.after_cr { strings.write_byte(&builder, '\n') }
+				sanitizer.after_cr = false
 				i += 1
 			case c == '\t':
 				strings.write_byte(&builder, '\t')
-				san.after_cr = false
+				sanitizer.after_cr = false
 				i += 1
 			case c < 0x20 || c == 0x7F:
-				san.after_cr = false
+				sanitizer.after_cr = false
 				i += 1
 			case c < 0x80:
 				strings.write_byte(&builder, c)
-				san.after_cr = false
+				sanitizer.after_cr = false
 				i += 1
 			case:
 				remaining := combined[i:]
 				if !utf8.full_rune_in_bytes(remaining) {
-					copy(san.hold[:], remaining)
-					san.hold_len = len(remaining)
+					copy(sanitizer.hold[:], remaining)
+					sanitizer.hold_len = len(remaining)
 					i = len(combined)
 				} else {
 					r, size := utf8.decode_rune_in_bytes(remaining)
@@ -97,46 +93,46 @@ display_sanitize_chunk :: proc(san: ^Display_Sanitizer, chunk: string, allocator
 						strings.write_rune(&builder, r)
 						i += size
 					}
-					san.after_cr = false
+					sanitizer.after_cr = false
 				}
 			}
 		case .Esc:
-			san.after_cr = false
+			sanitizer.after_cr = false
 			switch c {
 			case '[', 0x9B:
-				san.state = .Csi
+				sanitizer.state = .Csi
 			case ']', 0x9D, 0x9E, 0x9F, 0x90, 'P', 'X', '^', '_':
-				san.state = .Osc
+				sanitizer.state = .Osc
 			case 0x9C:
-				san.state = .Text
+				sanitizer.state = .Text
 			case '(', ')', '#':
-				san.state = .Text
-				san.skip_one = true
+				sanitizer.state = .Text
+				sanitizer.skip_one = true
 			case 0x20 ..= 0x2F:
 			// Intermediate byte: consume and stay for the final.
 			case:
-				san.state = .Text
+				sanitizer.state = .Text
 			}
 			i += 1
 		case .Csi:
 			if c == 0x1B {
-				san.state = .Esc
+				sanitizer.state = .Esc
 			} else if c >= 0x40 && c <= 0x7E {
-				san.state = .Text
+				sanitizer.state = .Text
 			}
 			i += 1
 		case .Osc:
 			if c == 0x07 {
-				san.state = .Text
+				sanitizer.state = .Text
 			} else if c == 0x1B {
-				san.state = .Osc_Esc
+				sanitizer.state = .Osc_Esc
 			}
 			i += 1
 		case .Osc_Esc:
 			if c == '\\' {
-				san.state = .Text
+				sanitizer.state = .Text
 			} else if c != 0x1B {
-				san.state = .Osc
+				sanitizer.state = .Osc
 			}
 			i += 1
 		}
@@ -147,21 +143,21 @@ display_sanitize_chunk :: proc(san: ^Display_Sanitizer, chunk: string, allocator
 // display_sanitize_flush closes the stream: a dangling escape is dropped and
 // a dangling rune fragment becomes U+FFFD. The returned replacement is owned by
 // allocator.
-display_sanitize_flush :: proc(san: ^Display_Sanitizer, allocator := context.allocator) -> string {
-	san.state = .Text
-	san.after_cr = false
-	san.skip_one = false
-	if san.hold_len == 0 { return "" }
-	san.hold_len = 0
+display_sanitize_flush :: proc(sanitizer: ^Display_Sanitizer, allocator := context.allocator) -> string {
+	sanitizer.state = .Text
+	sanitizer.after_cr = false
+	sanitizer.skip_one = false
+	if sanitizer.hold_len == 0 { return "" }
+	sanitizer.hold_len = 0
 	replacement, replacement_error := strings.clone("�", allocator)
 	if replacement_error != nil { return "" }
 	return replacement
 }
 
 display_clean :: proc(text: string, allocator := context.allocator) -> string {
-	san := Display_Sanitizer{}
-	cleaned := display_sanitize_chunk(&san, text, allocator)
-	tail := display_sanitize_flush(&san, allocator)
+	sanitizer := Display_Sanitizer{}
+	cleaned := display_sanitize_chunk(&sanitizer, text, allocator)
+	tail := display_sanitize_flush(&sanitizer, allocator)
 	defer delete(tail, allocator)
 	if tail == "" { return cleaned }
 	joined, join_error := strings.concatenate([]string{cleaned, tail}, allocator = allocator)
@@ -211,7 +207,6 @@ tool_entry_text :: proc(name, content, fallback: string) -> string {
 	return fmt.tprintf("%s\n%s", name, preview)
 }
 
-// tool_display_preview returns the raw body of a rendered tool result.
 tool_display_preview :: proc(content: string) -> string {
 	return agent.tool_result_body(content)
 }

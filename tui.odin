@@ -1,12 +1,9 @@
 #+build linux
 package main
 
-// Draws the frame: the conversation, a rule, the input line, another rule, and
-// a two-line footer, into term's grid, then presents it.
-//
-// The screen is a projection of runtime state: the conversation comes from the
-// snapshot and the footer from the status block; nothing here owns conversation
-// state.
+// Draws the frame: the conversation, a rule, the input line, another rule, and a
+// two-line footer, into term's grid, then presents it. The screen is a projection of
+// runtime state; nothing here owns conversation state.
 
 import "core:fmt"
 import "core:mem"
@@ -39,7 +36,6 @@ WORKING_LABEL :: "Working"
 // SPINNER_INTERVAL is one spinner frame.
 SPINNER_INTERVAL :: 100 * time.Millisecond
 
-// spinner_glyph returns one braille spinner frame.
 spinner_glyph :: proc(index: int) -> string {
 	glyphs := [10]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	return glyphs[index % len(glyphs)]
@@ -124,12 +120,10 @@ FONT_YELLOW :: layout.Font(7)
 FOOTER_KIB_ROUNDING :: 512
 KIBIBYTE :: 1024
 
-// CONVERSATION_CAPACITIES is where one transcript frame's budget starts: room
-// for about a screen of entries, not for every entry a session ever produced.
-// A frame that outgrows a pool reports which one, and conversation_solve raises
-// it through layout.reserve, so the storage settles at the transcript's own
-// high-water mark. Reserving the worst case instead held about 16 MiB for the
-// life of the process.
+// CONVERSATION_CAPACITIES is where one transcript frame's budget starts: room for about a
+// screen of entries, not for every entry a session ever produced. A frame that outgrows a
+// pool reports it, and conversation_solve raises the budget, so the storage settles at
+// the transcript's own high-water mark instead of a worst-case reservation.
 CONVERSATION_CAPACITIES :: layout.Capacities {
 	nodes          = 512,
 	children       = 1024,
@@ -219,12 +213,10 @@ frame_storage_destroy :: proc(storage: ^Frame_Storage) {
 	free(storage, storage.alloc)
 }
 
-// ensure_frame grows the cell grid to the viewport, so the frame works at any
-// terminal size: the grid holds one cell per terminal cell, and a terminal that
-// grew since the last frame buys the cells it needs. The presentation scratch is
-// sized from term.present's required-size contract in present_frame, not
-// guessed here: a grapheme can carry arbitrarily many combining bytes, so no
-// bytes-per-cell bound is a valid upper bound.
+// ensure_frame grows the cell grid to the viewport: the grid holds one cell per terminal
+// cell, and a terminal that grew since the last frame buys the cells it needs. The
+// presentation scratch is sized from term.present's own required size in present_frame,
+// because no bytes-per-cell bound is valid for a grapheme.
 ensure_frame :: proc(storage: ^Frame_Storage, cols, rows: int) -> bool {
 	need := cols * rows
 	if len(storage.cells) < need {
@@ -236,12 +228,10 @@ ensure_frame :: proc(storage: ^Frame_Storage, cols, rows: int) -> bool {
 	return true
 }
 
-// present_frame renders the runtime snapshot and writes the frame to the
-// terminal.
-//
-// The runtime mutex is held only for the render. Everything the grid holds is
-// either this thread's state or a copy taken out of the snapshot under that
-// lock, so the terminal write does not hold up the worker.
+// present_frame renders the runtime snapshot and writes the frame to the terminal. The
+// runtime mutex is held only for the render: everything the grid holds is this thread's
+// state or a copy taken out of the snapshot under that lock, so the write does not hold
+// up the worker.
 present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	// Frame scratch is temp-allocated; the previous frame was already
 	// presented, so its borrows are dead and the pool can be recycled.
@@ -270,13 +260,10 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	}
 }
 
-// render_frame composes one frame from the current snapshot. The caller
-// holds the runtime mutex.
-//
-// Every string it puts in the grid must outlive the lock: the snapshot's mutable
-// strings are copied into frame scratch, and everything else belongs to this
-// thread. A borrow straight from the snapshot would dangle once the worker
-// replaces it.
+// render_frame composes one frame from the current snapshot, and the caller holds the
+// runtime mutex. Every string it puts in the grid must outlive the lock: the snapshot's
+// mutable strings are copied into frame scratch, and a borrow straight from the snapshot
+// would dangle once the worker replaces it.
 render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor, err: Render_Status) {
 	cols, rows := app.columns, app.rows
 	if cols <= 0 || rows <= 0 {
@@ -332,15 +319,11 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 	return cursor, .None
 }
 
-// draw_conversation solves the transcript as a layout column and draws the
-// visible text lines into rect. The conversation root is a scroll container:
-// app.scroll counts rows back from the bottom (0 follows it), and the clip
-// offset is range - scroll.
-//
-// The offset needs the solved range, which the same frame produces. The first
-// pass uses the previous frame's range; when that moved (new rows, a resize,
-// a cleared transcript), the frame re-solves once with the corrected offset,
-// so following the bottom never trails the newest row.
+// draw_conversation solves the transcript as a layout column and draws the visible text
+// lines into rect. The conversation root is a scroll container: app.scroll counts rows
+// back from the bottom (0 follows it), and the clip offset is range - scroll. The offset
+// needs the solved range, so the first pass uses the previous frame's; when that moved
+// the frame re-solves once with the corrected offset.
 draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> bool {
 	if rect.height <= 0 || rect.width <= 0 {
 		return true
@@ -375,13 +358,10 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 	return false
 }
 
-// conversation_solve declares one conversation frame and returns its solved
-// result, raising the layout budget when the frame ran out of a pool.
-//
-// reserve is layout's own recovery from exhaustion: the frame names the pool it
-// exhausted, growth doubles it, and the raised budget is kept. Each pool pays
-// this once per session, so the storage settles at what this session used
-// instead of a reservation sized for the worst case.
+// conversation_solve declares one conversation frame and returns its solved result,
+// raising the layout budget when the frame ran out of a pool. Each pool pays this once
+// per session, so the storage settles at what this session used instead of a worst-case
+// reservation. False means the budget could not be raised.
 conversation_solve :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int) -> (layout.Frame_Result, bool) {
 	declare_conversation(app, storage, viewport, width, offset)
 	frame_result, frame_error := layout.result(&storage.layout_ctx)
@@ -401,12 +381,9 @@ conversation_solve :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.
 	return frame_result, true
 }
 
-// declare_conversation declares one frame's tree: the transcript column, the
-// startup hint when there is nothing to show, and one element per entry.
-//
-// The declarations live inside the frame's own `if` block because that block is
-// what layout closes the frame on: the frame resolves and publishes its result
-// when the block exits, so a declaration outside it is not part of the frame.
+// declare_conversation declares one frame's tree: the transcript column, the startup hint
+// when there is nothing to show, and one element per entry. The declarations live inside
+// the frame's own `if` block, because that block is what layout closes the frame on.
 declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int) {
 	// Services bind for one frame only, so every solve re-binds them.
 	layout.set_services(
@@ -523,12 +500,9 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 	return true
 }
 
-// selection_paint marks the cells a drag covers. The mark reverses each cell's
-// own style, so the terminal's colors are what the selection inverts and a
-// themed terminal stays themed.
-//
-// A cell outside the transcript's rect is not painted: a drag that ran past the
-// area is clamped to it, so the highlight stops where the content does.
+// selection_paint marks the cells a drag covers, reversing each cell's own style so a
+// themed terminal stays themed. A cell outside the transcript's rect is not painted, so
+// the highlight stops where the content does.
 selection_paint :: proc(app: ^App, storage: ^Frame_Storage, viewport: tui.Cell_Rect) {
 	if !app.selecting || storage.buffer.cells == nil { return }
 	start, end := selection_bounds(app)
@@ -576,7 +550,6 @@ selection_text :: proc(app: ^App, storage: ^Frame_Storage, allocator: mem.Alloca
 	return strings.to_string(builder)
 }
 
-// selection_index locates one transcript cell in the screen grid.
 selection_index :: proc(app: ^App, buffer: term.Frame_Buffer, row, column: int) -> int {
 	return (app.conversation_rect.y + row) * buffer.columns + app.conversation_rect.x + column
 }
@@ -629,14 +602,9 @@ declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Text_Style) {
 	layout.text(ctx, layout.Text_Desc{text = " ", style = band})
 }
 
-// declare_tool_entry draws one tool call as a bordered box: the call's name on
-// the top border, then a window of its result. A result taller than the window
-// scrolls (see `entry.tool_scroll`), and the bottom border says how many rows
-// the window is holding back, so a box never looks like the whole output when it
-// is a preview of one.
-//
-// The box starts where the prompt box does and pads its content one cell inside
-// the border, so a call and a prompt line up on the same columns. Only the
+// declare_tool_entry draws one tool call as a bordered box: the call's name on the top
+// border, then a window of its result. A result taller than the window scrolls (see
+// `entry.tool_scroll`), and the bottom border says how many rows are held back. Only the
 // border carries the outcome color; the content is ordinary text.
 declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 	outline := widgets.BORDER_ROUNDED
@@ -707,11 +675,10 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 	}
 }
 
-// tool_row_next splits the first row a tool box draws from `value` and returns
-// it with the remainder. A row ends at a newline or at the content width,
-// whichever comes first; a grapheme wider than the width still takes a row, so
-// the split always advances. start_column is where the row starts inside its
-// drawn line, so tabs stop where drawing puts them.
+// tool_row_next splits the first row a tool box draws from `value` and returns it with the
+// remainder. A row ends at a newline or at the content width; a grapheme wider than the
+// width still takes a row, so the split always advances. start_column is where the row
+// starts inside its drawn line.
 tool_row_next :: proc(value: string, width, start_column: int) -> (row: string, rest: string) {
 	newline := strings.index(value, "\n")
 	logical := value
@@ -880,11 +847,11 @@ draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 		start = max(total - visible, 0)
 	}
 	for i in 0 ..< visible {
-		idx := start + i
-		if idx >= total {
+		line_index := start + i
+		if line_index >= total {
 			break
 		}
-		line := &lines[idx]
+		line := &lines[line_index]
 		row := tui.Cell_Rect {
 			x      = rect.x + line.indent,
 			y      = rect.y + i,
@@ -983,7 +950,6 @@ draw_working :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect, frame_index: 
 	}
 }
 
-// draw_rule paints one horizontal rule across the row.
 draw_rule :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	if rect.height <= 0 || rect.width <= 0 {
 		return

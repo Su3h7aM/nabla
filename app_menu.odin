@@ -23,7 +23,6 @@ menu_begin :: proc(app: ^App, kind: Menu_Kind, title: string, choices: [dynamic]
 	prompt_clear(app)
 }
 
-// menu_close drops the open menu and returns the prompt.
 menu_close :: proc(app: ^App) {
 	app.menu_open = false
 	menu_destroy(&app.menu, app.run.alloc)
@@ -33,7 +32,10 @@ menu_close :: proc(app: ^App) {
 // value, so a menu opens where the user already is.
 menu_pick :: proc(app: ^App, label: string) {
 	for choice, index in app.menu.choices {
-		if choice.label == label { app.menu.cursor = index; return }
+		if choice.label == label {
+			app.menu.cursor = index
+			return
+		}
 	}
 }
 

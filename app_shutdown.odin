@@ -8,8 +8,7 @@ import "nabla:agent"
 // SHUTDOWN_JOIN_PATIENCE is how long the front-end waits for one thread to retire before
 // it reports the thread and stops releasing what that thread can still reach. A tool stuck
 // in a blocking syscall can outlive any request to stop, and the front-end must not be the
-// reason a process cannot exit. A strict bound for arbitrary native code needs process
-// isolation, not a longer wait.
+// reason a process cannot exit.
 SHUTDOWN_JOIN_PATIENCE :: 5 * time.Second
 
 // SHUTDOWN_JOIN_POLL is how often a retiring thread is checked. The wait polls instead of
