@@ -20,50 +20,47 @@ import "nabla:agent/journal"
 // call's arguments and `json.encode`. Both accept the same values, so what a script may hand
 // to a tool is what it may return.
 
-// CODEMODE_VALUE_MAX_NODES bounds one conversion, not what a script may hold.
-CODEMODE_VALUE_MAX_NODES :: 16_384
-
-// CODEMODE_LOG_MAX_NODES bounds the literal form of one printed value. The log it feeds
-// holds 8 KiB, so a larger traversal could only be discarded.
-CODEMODE_LOG_MAX_NODES :: 256
-
-// CODEMODE_VALUE_PATH_MAX_BYTES bounds the path a refusal names.
-CODEMODE_VALUE_PATH_MAX_BYTES :: 96
-
 Codemode_Notation :: enum {
 	Lua,
 	JSON,
 }
 
+// Codemode_Path_Step is one step the walk took: the field name it entered, or the array
+// position when index is positive.
+@(private)
+Codemode_Path_Step :: struct {
+	name:  string,
+	index: int,
+}
+
 // Codemode_Walk is one conversion. inside holds the tables the walk is in, which is how a
-// cycle is caught. path names where the walk is; a refusal keeps the path it failed at,
-// together with what it refused and why.
+// cycle is caught. path names where the walk is, one step per table it entered, so it
+// cannot hold more steps than the depth guard allows; a refusal keeps the path it failed
+// at, together with what it refused and why.
 @(private)
 Codemode_Walk :: struct {
-	run:            ^Lua_Run,
-	state:          ^lua.State,
-	notation:       Codemode_Notation,
-	builder:        strings.Builder,
-	nodes:          int,
-	max_nodes:      int,
-	inside:         [TOOL_MAX_ARGS_DEPTH + 1]rawptr,
-	path:           [CODEMODE_VALUE_PATH_MAX_BYTES]u8,
-	path_length:    int,
-	failure_length: int,
-	subject:        string,
-	problem:        string,
-	out_of_memory:  bool,
+	run:           ^Lua_Run,
+	state:         ^lua.State,
+	notation:      Codemode_Notation,
+	builder:       strings.Builder,
+	inside:        [TOOL_MAX_ARGS_DEPTH + 1]rawptr,
+	path:          [TOOL_MAX_ARGS_DEPTH + 1]Codemode_Path_Step,
+	path_count:    int,
+	failure_count: int,
+	subject:       string,
+	problem:       string,
+	out_of_memory: bool,
 }
 
 // codemode_lua_convert writes the value at index in notation. The text, or the message that
 // says what was refused and where, is owned by allocator; out_of_memory says the refusal
-// was a lack of memory rather than the value.
+// was a lack of memory rather than the value. A value of any size converts; a table nested
+// more than TOOL_MAX_ARGS_DEPTH deep, a cycle, and a value that is not data are refused.
 codemode_lua_convert :: proc(
 	run: ^Lua_Run,
 	state: ^lua.State,
 	index: i32,
 	notation: Codemode_Notation,
-	max_nodes := CODEMODE_VALUE_MAX_NODES,
 	allocator := context.allocator,
 ) -> (
 	text: string,
@@ -72,17 +69,40 @@ codemode_lua_convert :: proc(
 ) {
 	context.allocator = allocator
 	walk := Codemode_Walk {
-		run       = run,
-		state     = state,
-		notation  = notation,
-		builder   = strings.builder_make(),
-		max_nodes = max_nodes,
+		run      = run,
+		state    = state,
+		notation = notation,
+		builder  = strings.builder_make(),
 	}
 	if codemode_walk_value(&walk, lua.absindex(state, index), 0) { return strings.to_string(walk.builder), "", false }
 	strings.builder_destroy(&walk.builder)
-	path := string(walk.path[:walk.failure_length])
-	if path == "" { return "", fmt.aprintf("the %s %s", walk.subject, walk.problem), walk.out_of_memory }
-	return "", fmt.aprintf("the %s at %s %s", walk.subject, path, walk.problem), walk.out_of_memory
+	refusal, refusal_error := codemode_walk_message(&walk, allocator)
+	if refusal_error != nil { return "", fmt.aprintf("the %s %s", walk.subject, walk.problem), true }
+	return "", refusal, walk.out_of_memory
+}
+
+// codemode_walk_message says what the walk refused, where it refused it, and why. The text
+// is owned by allocator.
+@(private)
+codemode_walk_message :: proc(walk: ^Codemode_Walk, allocator: runtime.Allocator) -> (string, runtime.Allocator_Error) {
+	builder, builder_error := strings.builder_make(allocator)
+	if builder_error != nil { return "", builder_error }
+	strings.write_string(&builder, "the ")
+	strings.write_string(&builder, walk.subject)
+	if walk.failure_count > 0 {
+		strings.write_string(&builder, " at ")
+		for step, position in walk.path[:walk.failure_count] {
+			if step.index > 0 {
+				fmt.sbprintf(&builder, "[%d]", step.index)
+				continue
+			}
+			if position > 0 { strings.write_byte(&builder, '.') }
+			strings.write_string(&builder, step.name)
+		}
+	}
+	strings.write_byte(&builder, ' ')
+	strings.write_string(&builder, walk.problem)
+	return strings.to_string(builder), nil
 }
 
 // codemode_lua_request_arguments writes the pending request's table as the JSON arguments
@@ -126,7 +146,7 @@ codemode_lua_returned_literal :: proc(run: ^Lua_Run) -> (literal: string, messag
 codemode_walk_fail :: proc(walk: ^Codemode_Walk, subject, problem: string) -> bool {
 	walk.subject = subject
 	walk.problem = problem
-	walk.failure_length = walk.path_length
+	walk.failure_count = walk.path_count
 	return false
 }
 
@@ -140,8 +160,6 @@ codemode_walk_write :: proc(walk: ^Codemode_Walk, text: string) -> bool {
 @(private)
 codemode_walk_value :: proc(walk: ^Codemode_Walk, index: c.int, depth: int) -> bool {
 	state := walk.state
-	walk.nodes += 1
-	if walk.nodes > walk.max_nodes { return codemode_walk_fail(walk, "value", "has too many elements; convert less at once") }
 	switch lua.type(state, index) {
 	case .NIL:
 		return codemode_walk_write(walk, walk.notation == .Lua ? "nil" : "null")
@@ -273,13 +291,13 @@ codemode_walk_array :: proc(walk: ^Codemode_Walk, table: c.int, length, depth: i
 	codemode_walk_write(walk, lua_notation ? "{" : "[") or_return
 	for position in 1 ..= length {
 		if position > 1 { codemode_walk_write(walk, lua_notation ? ", " : ",") or_return }
-		buffer: [32]u8
-		entered := codemode_walk_enter(walk, fmt.bprintf(buffer[:], "[%d]", position))
+		mark := walk.path_count
+		codemode_walk_enter(walk, Codemode_Path_Step{index = position})
 		lua.rawgeti(walk.state, table, lua.Integer(position))
 		written := codemode_walk_value(walk, lua.gettop(walk.state), depth + 1)
 		lua.pop(walk.state, 1)
 		if !written { return false }
-		walk.path_length -= entered
+		codemode_walk_leave(walk, mark)
 	}
 	return codemode_walk_write(walk, lua_notation ? "}" : "]")
 }
@@ -314,25 +332,31 @@ codemode_walk_object :: proc(walk: ^Codemode_Walk, table: c.int, count, depth: i
 		}
 		codemode_walk_write(walk, lua_notation ? " = " : ":") or_return
 
-		separator := codemode_walk_enter(walk, walk.path_length > 0 ? "." : "")
-		entered := separator + codemode_walk_enter(walk, name)
+		mark := walk.path_count
+		codemode_walk_enter(walk, Codemode_Path_Step{name = name})
 		codemode_lua_push_string(state, name)
 		lua.rawget(state, table)
 		written := codemode_walk_value(walk, lua.gettop(state), depth + 1)
 		lua.pop(state, 1)
 		if !written { return false }
-		walk.path_length -= entered
+		codemode_walk_leave(walk, mark)
 	}
 	return codemode_walk_write(walk, "}")
 }
 
-// codemode_walk_enter appends one step of the path and returns how much of it fit, so a
-// refusal names a prefix of a deep path rather than nothing.
+// codemode_walk_enter records the step the walk is entering. The depth guard bounds the
+// nesting, so the path always has room for it; the check only keeps the write in bounds.
 @(private)
-codemode_walk_enter :: proc(walk: ^Codemode_Walk, step: string) -> int {
-	written := copy(walk.path[walk.path_length:], step)
-	walk.path_length += written
-	return written
+codemode_walk_enter :: proc(walk: ^Codemode_Walk, step: Codemode_Path_Step) {
+	if walk.path_count == len(walk.path) { return }
+	walk.path[walk.path_count] = step
+	walk.path_count += 1
+}
+
+// codemode_walk_leave drops every step entered since mark.
+@(private)
+codemode_walk_leave :: proc(walk: ^Codemode_Walk, mark: int) {
+	walk.path_count = mark
 }
 
 // codemode_identifier reports whether a name can be written as a bare field name.

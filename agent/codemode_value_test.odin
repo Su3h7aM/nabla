@@ -2,6 +2,7 @@
 #+private file
 package agent
 
+import "core:fmt"
 import "core:strings"
 import "core:testing"
 
@@ -69,7 +70,8 @@ return r.outcome == "success" and r.output.stdout == "done" and r.output.exit_co
 	testing.expect_value(t, value, "yes")
 }
 
-// print renders what a script debugs with and never calls into script code.
+// print renders what a script debugs with and never calls into script code. The log is
+// returned whole, however much a script prints.
 @(test)
 codemode_value_prints_the_values_a_script_debugs_with :: proc(t: ^testing.T) {
 	run := codemode_value_test_start(
@@ -82,8 +84,11 @@ print(string.rep("x", 20000))`,
 	defer codemode_lua_destroy(run)
 	testing.expect_value(t, codemode_value_test_settle(run), Lua_Event.Returned)
 	logs := string(run.logs[:])
-	testing.expect(t, strings.has_prefix(logs, "text 42 true nil json.null\n{items = {1, 2}, ok = true}\n<table>\nxxx"), logs)
-	testing.expect(t, len(logs) == LUA_MAX_LOG_BYTES && run.logs_truncated, "the log should stop at its bound")
+	expected := strings.concatenate(
+		{"text 42 true nil json.null\n{items = {1, 2}, ok = true}\n<table>\n", strings.repeat("x", 20_000, context.temp_allocator), "\n"},
+		context.temp_allocator,
+	)
+	testing.expect_value(t, logs, expected)
 }
 
 // One walk serves arguments, json.encode, and the returned value, so its refusals are
@@ -115,6 +120,39 @@ codemode_value_refuses_what_it_cannot_carry :: proc(t: ^testing.T) {
 		delete(message)
 		codemode_lua_destroy(run)
 	}
+
+	// The refusal names the whole path, however long the field name is.
+	long_name := strings.repeat("n", 200, context.temp_allocator)
+	source := strings.concatenate({`local value = {} value["`, long_name, `"] = function() end return value`}, context.temp_allocator)
+	run := codemode_value_test_start(t, source)
+	defer codemode_lua_destroy(run)
+	testing.expect_value(t, codemode_value_test_settle(run), Lua_Event.Returned)
+	literal, message, _ := codemode_lua_returned_literal(run)
+	defer delete(literal)
+	defer delete(message)
+	testing.expect_value(t, message, fmt.aprintf("the function at %s cannot be converted", long_name, allocator = context.temp_allocator))
+}
+
+// The walk converts a value whole: no number of elements shortens the literal.
+@(test)
+codemode_value_converts_a_value_of_any_size :: proc(t: ^testing.T) {
+	run := codemode_value_test_start(t, `local items = {} for i = 1, 20000 do items[i] = i end return items`)
+	defer codemode_lua_destroy(run)
+	testing.expect_value(t, codemode_value_test_settle(run), Lua_Event.Returned)
+	literal, message, _ := codemode_lua_returned_literal(run)
+	defer delete(literal)
+	defer delete(message)
+	testing.expect_value(t, message, "")
+
+	expected := strings.builder_make(context.temp_allocator)
+	defer strings.builder_destroy(&expected)
+	strings.write_byte(&expected, '{')
+	for item in 1 ..= 20_000 {
+		if item > 1 { strings.write_string(&expected, ", ") }
+		fmt.sbprint(&expected, item)
+	}
+	strings.write_byte(&expected, '}')
+	testing.expectf(t, literal == strings.to_string(expected), "the literal should hold every element (%d bytes)", len(literal))
 }
 
 @(test)

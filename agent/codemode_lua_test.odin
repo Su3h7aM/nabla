@@ -69,6 +69,14 @@ lua_failures_are_values_with_their_position :: proc(t: ^testing.T) {
 	testing.expect_value(t, codemode_lua_resume(table_error), Lua_Event.Failed)
 	testing.expect_value(t, table_error.message, "the script raised a non-string error: {code = 1}")
 
+	// A failure message is kept whole, however long the text the script raised is.
+	long_error := lua_test_start(t, `error(string.rep("y", 5000))`)
+	defer codemode_lua_destroy(long_error)
+	testing.expect_value(t, codemode_lua_resume(long_error), Lua_Event.Failed)
+	testing.expect(t, strings.has_prefix(long_error.message, "code:1: yyy"), long_error.message)
+	testing.expect_value(t, strings.count(long_error.message, "y"), 5_000)
+	testing.expect(t, strings.has_suffix(long_error.traceback, "code:1: in main chunk"), long_error.traceback)
+
 	unknown := lua_test_start(t, `return tools.gamma`)
 	defer codemode_lua_destroy(unknown)
 	testing.expect(t, codemode_lua_install_tool(unknown, "beta"), "beta should install")

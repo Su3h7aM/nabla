@@ -110,13 +110,12 @@ Codemode_Call :: struct {
 // a Lua literal, traceback the frames a runtime error unwound, logs what print produced,
 // and calls the script's tool calls.
 Codemode_Output :: struct {
-	failure:        string,
-	value:          string,
-	calls_total:    int,
-	calls:          []Codemode_Call,
-	logs_truncated: bool,
-	traceback:      string,
-	logs:           string,
+	failure:     string,
+	value:       string,
+	calls_total: int,
+	calls:       []Codemode_Call,
+	traceback:   string,
+	logs:        string,
 }
 
 // MCP_Output is what an MCP server returned. Text blocks carry their text; every other
@@ -235,7 +234,6 @@ tool_result_render :: proc(
 			render_value(&head, call.outcome) or_return
 			render_byte(&head, '\n') or_return
 		}
-		render_field(&head, "logs_truncated", value.logs_truncated) or_return
 		render_section(&body, "traceback", value.traceback) or_return
 		render_section(&body, "logs", value.logs) or_return
 	case MCP_Output:

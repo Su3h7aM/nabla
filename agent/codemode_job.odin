@@ -261,8 +261,7 @@ codemode_job_finish :: proc(job: ^Tool_Job) {
 }
 
 // codemode_job_answer_value answers a script that returned. The value is written as a Lua
-// literal, and the result budget is enforced here rather than by the generic oversized
-// replacement, which would hide which value was too large.
+// literal, and the result is kept and shown the way every other result is.
 @(private)
 codemode_job_answer_value :: proc(job: ^Tool_Job) {
 	run := job.lua
@@ -274,9 +273,8 @@ codemode_job_answer_value :: proc(job: ^Tool_Job) {
 		return
 	}
 	output := Codemode_Output {
-		value          = value,
-		logs           = string(run.logs[:]),
-		logs_truncated = run.logs_truncated,
+		value = value,
+		logs  = string(run.logs[:]),
 	}
 	result := codemode_job_result(job, .Success, "", output, "completed")
 	job.result = result
@@ -295,7 +293,6 @@ codemode_job_answer :: proc(job: ^Tool_Job, outcome: journal.Tool_Outcome, diagn
 	}
 	if job.lua != nil {
 		output.logs = string(job.lua.logs[:])
-		output.logs_truncated = job.lua.logs_truncated
 		output.traceback = job.lua.traceback
 	}
 	job.result = codemode_job_result(job, outcome, message, output, reason)
@@ -304,22 +301,34 @@ codemode_job_answer :: proc(job: ^Tool_Job, outcome: journal.Tool_Outcome, diagn
 }
 
 // codemode_job_result adds the summaries of the calls the script made, so a model can audit
-// it and read one child's full result back by its call id.
+// it and read one child's full result back by its call id. Every committed child is
+// summarized; the summaries borrow the batch's child jobs, which the clone inside
+// tool_result_of copies into the result's own memory.
 @(private)
 codemode_job_result :: proc(job: ^Tool_Job, outcome: journal.Tool_Outcome, message: string, output: Codemode_Output, reason: string) -> Tool_Result {
 	output := output
-	summaries: [CODEMODE_MAX_CALL_SUMMARIES]Codemode_Call
+	// One summary per committed child, so the list holds exactly what the count names.
+	count := 0
+	for entry in job.lua_children {
+		if entry.committed { count += 1 }
+	}
+	allocator := job.exec.allocator
+	summaries, allocation_error := make([]Codemode_Call, count, allocator)
+	if allocation_error != nil {
+		return tool_result_of(&job.exec, .Tool_Failed, "the calls the script made could not be summarized: out of memory", nil, "out of memory")
+	}
+	defer delete(summaries, allocator)
+	position := 0
 	for entry in job.lua_children {
 		if !entry.committed { continue }
-		if output.calls_total < len(summaries) {
-			summaries[output.calls_total] = {
-				call    = entry.job.call.call,
-				name    = entry.job.name,
-				outcome = journal.TOOL_OUTCOME_NAMES[entry.outcome],
-			}
+		summaries[position] = {
+			call    = entry.job.call.call,
+			name    = entry.job.name,
+			outcome = journal.TOOL_OUTCOME_NAMES[entry.outcome],
 		}
-		output.calls_total += 1
+		position += 1
 	}
-	output.calls = summaries[:min(output.calls_total, len(summaries))]
+	output.calls_total = position
+	output.calls = summaries
 	return tool_result_of(&job.exec, outcome, message, output, reason)
 }

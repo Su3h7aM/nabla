@@ -8,7 +8,6 @@ import "core:mem/virtual"
 import "core:slice"
 import "core:strings"
 import "core:time"
-import "core:unicode/utf8"
 import lua "vendor:lua/5.4"
 
 import "nabla:ai"
@@ -40,13 +39,6 @@ import "nabla:ai"
 // LUA_SLICE_INSTRUCTIONS is how many VM instructions run between owner checkpoints.
 // It is a scheduling quantum, not a limit.
 LUA_SLICE_INSTRUCTIONS :: 10_000
-
-// LUA_MAX_MESSAGE_BYTES bounds a diagnostic read out of Lua, traceback included.
-LUA_MAX_MESSAGE_BYTES :: 2048
-
-// LUA_MAX_LOG_BYTES bounds what `print` may keep. Output is returned, not streamed,
-// so it is bounded where it is produced.
-LUA_MAX_LOG_BYTES :: 8 * 1024
 
 // LUA_CHUNK_NAME makes Lua name a source position as `code:3:`.
 @(private)
@@ -137,7 +129,6 @@ Lua_Run :: struct {
 	message:         string, // why it stopped or failed
 	traceback:       string, // the frames a runtime error unwound
 	logs:            [dynamic]u8, // what print produced
-	logs_truncated:  bool,
 	request:         Lua_Request,
 	answer:          Lua_Answer,
 	answer_handle:   int,
@@ -420,7 +411,7 @@ codemode_lua_install_table :: proc(state: ^lua.State, name: cstring, functions: 
 
 // --- print ---------------------------------------------------------------------
 
-// codemode_lua_print appends one line to the run's bounded log. It never calls
+// codemode_lua_print appends one line to the run's log. It never calls
 // `tostring`, so printing runs no script code: a table prints as its Lua literal.
 @(private)
 codemode_lua_print :: proc "c" (state: ^lua.State) -> c.int {
@@ -461,20 +452,16 @@ codemode_lua_log_value :: proc(run: ^Lua_Run, state: ^lua.State, index: c.int) {
 // conversion refuses it: `print` is a diagnostic and never fails the script.
 @(private)
 codemode_lua_log_table :: proc(run: ^Lua_Run, state: ^lua.State, index: c.int) {
-	literal, message, _ := codemode_lua_convert(run, state, index, .Lua, CODEMODE_LOG_MAX_NODES, context.temp_allocator)
+	literal, message, _ := codemode_lua_convert(run, state, index, .Lua, allocator = context.temp_allocator)
 	codemode_lua_log_append(run, message == "" ? literal : "<table>")
 }
 
+// codemode_lua_log_append adds text to the run's log, which is kept whole. A log that
+// cannot grow holds the bytes written before it; print never fails the script.
 @(private)
 codemode_lua_log_append :: proc(run: ^Lua_Run, text: string) {
-	if run.logs_truncated || text == "" { return }
-	take := text
-	room := LUA_MAX_LOG_BYTES - len(run.logs)
-	if len(take) > room {
-		take = codemode_lua_truncate_runes(take, room)
-		run.logs_truncated = true
-	}
-	if _, err := append(&run.logs, take); err != nil { run.logs_truncated = true }
+	if text == "" { return }
+	if _, err := append(&run.logs, text); err != nil { return }
 }
 
 // codemode_lua_stack_string reads a value that is already text. Strings and numbers
@@ -493,15 +480,6 @@ codemode_lua_stack_string :: proc "contextless" (state: ^lua.State, index: c.int
 @(private)
 codemode_lua_push_string :: proc "contextless" (state: ^lua.State, text: string) {
 	lua.pushlstring(state, cstring(raw_data(text)), c.size_t(len(text)))
-}
-
-// codemode_lua_truncate_runes takes at most limit bytes and never cuts a character.
-@(private)
-codemode_lua_truncate_runes :: proc(text: string, limit: int) -> string {
-	if limit >= len(text) { return text }
-	end := max(limit, 0)
-	for end > 0 && !utf8.rune_start(text[end]) { end -= 1 }
-	return text[:end]
 }
 
 // --- lifecycle -----------------------------------------------------------------
@@ -698,7 +676,7 @@ codemode_lua_settle_stop :: proc(run: ^Lua_Run) -> Lua_Event {
 codemode_lua_settle_error :: proc(run: ^Lua_Run) -> Lua_Event {
 	context.allocator = run.allocator
 	text, is_text := codemode_lua_stack_string(run.thread, -1)
-	literal, refusal, _ := codemode_lua_convert(run, run.thread, -1, .Lua, CODEMODE_LOG_MAX_NODES)
+	literal, refusal, _ := codemode_lua_convert(run, run.thread, -1, .Lua)
 	defer delete(literal)
 	defer delete(refusal)
 	if !is_text {
@@ -709,20 +687,20 @@ codemode_lua_settle_error :: proc(run: ^Lua_Run) -> Lua_Event {
 	traceback, _ := codemode_lua_stack_string(run.state, -1)
 	traceback = strings.trim_prefix(traceback, "stack traceback:\n")
 	delete(run.traceback)
-	run.traceback, _ = strings.replace_all(codemode_lua_truncate_runes(traceback, LUA_MAX_MESSAGE_BYTES), "\t", "")
+	run.traceback, _ = strings.replace_all(traceback, "\t", "")
 	if raw_data(run.traceback) == raw_data(traceback) { run.traceback = strings.clone(run.traceback) or_else "" }
 	lua.pop(run.state, 1)
 	return codemode_lua_settle(run, .Failed, .Runtime, text)
 }
 
-// codemode_lua_settle makes the run terminal with its bounded message.
+// codemode_lua_settle makes the run terminal with its message.
 @(private)
 codemode_lua_settle :: proc(run: ^Lua_Run, event: Lua_Event, failure: Lua_Failure, message: string) -> Lua_Event {
 	run.terminal = true
 	run.failure = failure
 	run.last_event = event
 	delete(run.message, run.allocator)
-	run.message = strings.clone(codemode_lua_truncate_runes(message, LUA_MAX_MESSAGE_BYTES), run.allocator) or_else ""
+	run.message = strings.clone(message, run.allocator) or_else ""
 	return event
 }
 

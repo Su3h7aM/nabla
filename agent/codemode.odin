@@ -8,10 +8,6 @@ TOOL_CODEMODE_DESCRIPTION :: "Run a Lua 5.4 program instead of several separate 
 TOOL_CODEMODE_SCHEMA :: `{"type":"object","properties":{"code":{"type":"string","description":"Lua 5.4 source code to execute."},"timeout_ms":{"type":["integer","null"],"description":"Positive timeout in milliseconds for the whole program. Leave out or pass null for no timeout."}},"required":["code"],"additionalProperties":false}`
 TOOL_CODEMODE_FIELDS :: []string{"code", "timeout_ms"}
 
-// CODEMODE_MAX_CALL_SUMMARIES bounds how many child summaries a result carries. The
-// count is reported separately, so a truncated list still says how much a script did.
-CODEMODE_MAX_CALL_SUMMARIES :: 32
-
 // Codemode_Diagnostic is why an execution did not finish. It lives inside the ordinary
 // result, not as a second stored outcome: the outer Tool_Outcome still says whether
 // anything ran.

@@ -424,6 +424,14 @@ test_codemode_may_exceed_one_response_worth_of_calls :: proc(test: ^testing.T) {
 		result := tool_test_result_of(test, record)
 		testing.expect_value(test, result.outcome, journal.Tool_Outcome.Success)
 		testing.expect(test, strings.contains(result.content, fmt.tprintf(`value: %d`, CODEMODE_TEST_CHILD_CALLS)), result.content)
+		// Every child the script committed is named in the parent's result, one summary
+		// line each, however many there were.
+		committed := 0
+		for child_record in records {
+			if child_record.kind == .Tool_Completed && child_record.parent_call == parent_call { committed += 1 }
+		}
+		testing.expect_value(test, committed, CODEMODE_TEST_CHILD_CALLS)
+		testing.expect_value(test, strings.count(result.content, "call: "), CODEMODE_TEST_CHILD_CALLS)
 	}
 	testing.expect(test, found, "the script should have answered its call")
 }
