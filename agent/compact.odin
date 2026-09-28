@@ -297,8 +297,9 @@ Compact_Job :: struct {
 	started_at: time.Tick,
 	// attempts counts the sends this chain has made, including the one in flight.
 	attempts:   int,
-	// due_at is when a job in Backoff is sent again.
-	due_at:     time.Tick,
+	// due_at is when a job in Backoff is sent again, or none when the delay it waits out
+	// is longer than the clock can hold.
+	due_at:     Maybe(time.Tick),
 }
 
 // Compact_Control is the owner-side view. Only the thread that drives the session
@@ -726,7 +727,7 @@ chat_compact_recovery :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> Chat_Re
 }
 
 // chat_compact_deadline is when compaction next acts without a publication: the due time
-// of a summary in backoff, or nil.
+// of a summary in backoff, or nil for a wait that only a cancel ends.
 chat_compact_deadline :: proc(chat: ^Chat_Session) -> Maybe(time.Tick) {
 	if chat.compact.state != .Backoff || chat.compact.job == nil { return nil }
 	return chat.compact.job.due_at
@@ -740,7 +741,7 @@ chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> boo
 	control := &chat.compact
 	job := control.job
 	if control.state != .Backoff || job == nil { return false }
-	if time.tick_since(job.due_at) < 0 { return false }
+	if due, timed := job.due_at.?; timed && time.tick_since(due) < 0 { return false }
 	if chat_session_storage_failed(chat) { return false }
 
 	// What the failed attempt produced belongs to the row that already recorded it: this
@@ -816,7 +817,7 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 		decision := chat_compact_recovery(chat, job)
 		chat_compact_finish_attempt(chat, job, decision, reason)
 		if decision.action == .Retry {
-			job.due_at = time.tick_add(time.tick_now(), decision.delay)
+			job.due_at = chat_retry_deadline(decision.delay)
 			control.state = .Backoff
 			fields := [4]Log_Field {
 				{key = "reason", value = request_recovery_reason_name(decision.reason)},

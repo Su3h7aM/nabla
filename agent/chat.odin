@@ -332,15 +332,28 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	return recorded
 }
 
+// chat_retry_deadline is the tick a wait of delay ends at, or nil when the delay is longer
+// than the clock can hold from now. A wait with no deadline ends on a cancel alone, which
+// is the only end an unrepresentable delay has: it has not elapsed.
+@(private)
+chat_retry_deadline :: proc(delay: time.Duration) -> Maybe(time.Tick) {
+	now := time.tick_now()
+	// The clock's zero tick is its start, so this is the clock's own reading, and what
+	// remains of its range is the most a deadline can add to now.
+	elapsed := time.tick_diff(time.Tick{}, now)
+	if delay > max(time.Duration) - elapsed { return nil }
+	return time.tick_add(now, delay)
+}
+
 // chat_retry_wait waits out a backoff and reports whether it elapsed without a cancel.
 @(private)
 chat_retry_wait :: proc(chat: ^Chat_Session, delay: time.Duration) -> bool {
-	deadline := time.tick_add(time.tick_now(), delay)
+	deadline := chat_retry_deadline(delay)
 	for {
 		seen := owner_wake_seen()
 		chat_session_observe_stop(chat)
 		if chat_session_cancelled(chat) { return false }
-		if time.tick_diff(time.tick_now(), deadline) <= 0 { return true }
+		if due, timed := deadline.?; timed && time.tick_diff(time.tick_now(), due) <= 0 { return true }
 		owner_wake_wait(seen, deadline)
 	}
 }
