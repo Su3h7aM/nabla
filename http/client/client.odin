@@ -516,9 +516,9 @@ parse_status_line :: proc(line: string) -> (code: int, version: http.Version, ok
 	// one this build happens to have a name for. The reason phrase after it is
 	// discarded: RFC 9110 15 says a client should ignore it.
 	if len(code_text) != 3 { return }
-	for c in transmute([]u8)code_text {
-		if c < '0' || c > '9' { return }
-		code = code * 10 + int(c - '0')
+	for character in transmute([]u8)code_text {
+		if character < '0' || character > '9' { return }
+		code = code * 10 + int(character - '0')
 	}
 	if code < 100 { return }
 	return code, version, true

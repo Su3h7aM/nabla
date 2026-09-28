@@ -22,17 +22,17 @@ Request :: struct {
 	_body_ok:   Maybe(bool),
 }
 
-request_init :: proc(r: ^Request, allocator := context.allocator) {
-	headers_init(&r.headers, allocator)
+request_init :: proc(request: ^Request, allocator := context.allocator) {
+	headers_init(&request.headers, allocator)
 }
 
 // headers_validate_for_server checks a request's header section the way a
 // server must before it reads the content, and normalizes its framing: a
 // Content-Length next to a Transfer-Encoding is removed, because the transfer
 // coding overrides it (RFC 9112 6.1). valid is false for a request that is
-// answered with 400; close is true for one after whose response the
+// answered with 400; will_close is true for one after whose response the
 // connection closes.
-headers_validate_for_server :: proc(headers: ^Headers, version: Version) -> (valid: bool, close: bool) {
+headers_validate_for_server :: proc(headers: ^Headers, version: Version) -> (valid: bool, will_close: bool) {
 	// RFC 9112 3.2: an HTTP/1.1 request must carry Host. More than one Host
 	// field line is refused by header_parse.
 	if version.minor >= 1 && !headers_has_unsafe(headers^, "host") { return false, true }

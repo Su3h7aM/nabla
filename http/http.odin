@@ -31,34 +31,34 @@ Requestline :: struct {
 // requestline_parse reads a request-line (RFC 9112 3): a method token, SP, a
 // non-empty request-target, SP, and the protocol version. The target is cloned,
 // because the line is a view into a buffer that changes on the next read.
-requestline_parse :: proc(s: string, allocator := context.temp_allocator) -> (line: Requestline, err: Requestline_Error) {
-	method_end := strings.index_byte(s, ' ')
+requestline_parse :: proc(text: string, allocator := context.temp_allocator) -> (line: Requestline, err: Requestline_Error) {
+	method_end := strings.index_byte(text, ' ')
 	if method_end <= 0 { return line, .Not_Enough_Fields }
-	rest := s[method_end + 1:]
+	rest := text[method_end + 1:]
 	target_end := strings.index_byte(rest, ' ')
 	if target_end <= 0 { return line, .Not_Enough_Fields }
 
 	ok: bool
 	line.version, ok = version_parse(rest[target_end + 1:])
 	if !ok { return line, .Invalid_Version_Format }
-	line.method, ok = method_parse(s[:method_end])
+	line.method, ok = method_parse(text[:method_end])
 	if !ok { return line, .Method_Not_Implemented }
 	line.target = strings.clone(rest[:target_end], allocator)
 	return line, .None
 }
 
-requestline_write :: proc(w: io.Writer, rline: Requestline) -> io.Error {
-	io.write_string(w, method_string(rline.method)) or_return
-	io.write_byte(w, ' ') or_return
-	switch t in rline.target {
+requestline_write :: proc(writer: io.Writer, line: Requestline) -> io.Error {
+	io.write_string(writer, method_string(line.method)) or_return
+	io.write_byte(writer, ' ') or_return
+	switch target in line.target {
 	case string:
-		io.write_string(w, t) or_return
+		io.write_string(writer, target) or_return
 	case URL:
-		request_path_write(w, t) or_return
+		request_path_write(writer, target) or_return
 	}
-	io.write_byte(w, ' ') or_return
-	version_write(w, rline.version) or_return
-	io.write_string(w, "\r\n") or_return
+	io.write_byte(writer, ' ') or_return
+	version_write(writer, line.version) or_return
+	io.write_string(writer, "\r\n") or_return
 	return nil
 }
 
@@ -74,17 +74,17 @@ Version :: struct {
 //
 // RFC 9112 2.3: HTTP-version = HTTP-name "/" DIGIT "." DIGIT, where HTTP-name is
 // the case-sensitive string "HTTP".
-version_parse :: proc(s: string) -> (version: Version, ok: bool) {
-	switch len(s) {
+version_parse :: proc(text: string) -> (version: Version, ok: bool) {
+	switch len(text) {
 	case 8:
-		(s[6] == '.') or_return
-		(is_digit(s[7])) or_return
-		version.minor = s[7] - '0'
+		(text[6] == '.') or_return
+		(is_digit(text[7])) or_return
+		version.minor = text[7] - '0'
 		fallthrough
 	case 6:
-		(s[:5] == "HTTP/") or_return
-		(is_digit(s[5])) or_return
-		version.major = s[5] - '0'
+		(text[:5] == "HTTP/") or_return
+		(is_digit(text[5])) or_return
+		version.major = text[5] - '0'
 	case:
 		return
 	}
@@ -93,25 +93,25 @@ version_parse :: proc(s: string) -> (version: Version, ok: bool) {
 }
 
 // version_write writes the eight-octet HTTP-version (RFC 9112 2.3).
-version_write :: proc(w: io.Writer, v: Version) -> io.Error {
-	text := [8]byte{'H', 'T', 'T', 'P', '/', '0' + v.major, '.', '0' + v.minor}
-	_, err := io.write(w, text[:])
+version_write :: proc(writer: io.Writer, version: Version) -> io.Error {
+	octets := [8]byte{'H', 'T', 'T', 'P', '/', '0' + version.major, '.', '0' + version.minor}
+	_, err := io.write(writer, octets[:])
 	return err
 }
 
-version_string :: proc(v: Version, allocator := context.allocator) -> (string, runtime.Allocator_Error) #optional_allocator_error {
-	text := [8]byte{'H', 'T', 'T', 'P', '/', '0' + v.major, '.', '0' + v.minor}
-	return strings.clone(string(text[:]), allocator)
+version_string :: proc(version: Version, allocator := context.allocator) -> (string, runtime.Allocator_Error) #optional_allocator_error {
+	octets := [8]byte{'H', 'T', 'T', 'P', '/', '0' + version.major, '.', '0' + version.minor}
+	return strings.clone(string(octets[:]), allocator)
 }
 
 @(private = "package")
-is_digit :: #force_inline proc(c: byte) -> bool {
-	return c >= '0' && c <= '9'
+is_digit :: #force_inline proc(character: byte) -> bool {
+	return character >= '0' && character <= '9'
 }
 
 // is_tchar reports whether a byte may appear in a token (RFC 9110 5.6.2).
-is_tchar :: proc(c: byte) -> bool {
-	switch c {
+is_tchar :: proc(character: byte) -> bool {
+	switch character {
 	case '0' ..= '9', 'a' ..= 'z', 'A' ..= 'Z':
 		return true
 	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
@@ -134,8 +134,8 @@ token_valid :: proc(text: string) -> bool {
 // RFC 9110 5.6.3: OWS = *( SP / HTAB ). It is narrower than
 // strings.trim_space, which also removes VT, FF, CR and LF -- bytes the field
 // value grammar does not admit in the first place.
-trim_ows :: proc(s: string) -> string {
-	return strings.trim(s, " \t")
+trim_ows :: proc(text: string) -> string {
+	return strings.trim(text, " \t")
 }
 
 // list_has_token reports whether a comma-separated field value lists token,
@@ -172,9 +172,9 @@ content_length_parse :: proc(value: string) -> (length: int, ok: bool) {
 		text := trim_ows(part)
 		if text == "" { continue }
 		number := 0
-		for c in transmute([]u8)text {
-			if !is_digit(c) { return 0, false }
-			digit := int(c - '0')
+		for character in transmute([]u8)text {
+			if !is_digit(character) { return 0, false }
+			digit := int(character - '0')
 			if number > (max(int) - digit) / 10 { return 0, false }
 			number = number * 10 + digit
 		}
@@ -193,15 +193,15 @@ content_length_parse :: proc(value: string) -> (length: int, ok: bool) {
 chunk_size_parse :: proc(value: string) -> (size: int, ok: bool) {
 	text := trim_ows(value)
 	(len(text) > 0) or_return
-	for c in transmute([]u8)text {
+	for character in transmute([]u8)text {
 		digit: int
-		switch c {
+		switch character {
 		case '0' ..= '9':
-			digit = int(c - '0')
+			digit = int(character - '0')
 		case 'a' ..= 'f':
-			digit = int(c - 'a') + 10
+			digit = int(character - 'a') + 10
 		case 'A' ..= 'F':
-			digit = int(c - 'A') + 10
+			digit = int(character - 'A') + 10
 		case:
 			return 0, false
 		}
@@ -261,17 +261,22 @@ token_width :: proc(text: string) -> int {
 quoted_string_width :: proc(text: string) -> int {
 	if text == "" || text[0] != '"' { return 0 }
 	for i := 1; i < len(text); i += 1 {
-		c := text[i]
+		character := text[i]
 		switch {
-		case c == '"':
+		case character == '"':
 			return i + 1
-		case c == '\\':
+		case character == '\\':
 			// quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
 			i += 1
 			if i >= len(text) { return 0 }
 			escaped := text[i]
 			if escaped != '\t' && escaped != ' ' && escaped < 0x21 || escaped == 0x7F { return 0 }
-		case c == '\t' || c == ' ' || c == 0x21 || (c >= 0x23 && c <= 0x5B) || (c >= 0x5D && c <= 0x7E) || c >= 0x80:
+		case character == '\t' ||
+		     character == ' ' ||
+		     character == 0x21 ||
+		     (character >= 0x23 && character <= 0x5B) ||
+		     (character >= 0x5D && character <= 0x7E) ||
+		     character >= 0x80:
 		// qdtext
 		case:
 			return 0
@@ -305,14 +310,14 @@ METHOD_STRINGS := [Method]string {
 	.Trace   = "TRACE",
 }
 
-method_string :: proc(m: Method) -> string {
-	return METHOD_STRINGS[m]
+method_string :: proc(method: Method) -> string {
+	return METHOD_STRINGS[method]
 }
 
 // method_parse reads a method token. Methods are case-sensitive (RFC 9110 9.1).
-method_parse :: proc(m: string) -> (method: Method, ok: bool) {
-	for text, candidate in METHOD_STRINGS {
-		if text == m { return candidate, true }
+method_parse :: proc(text: string) -> (method: Method, ok: bool) {
+	for name, candidate in METHOD_STRINGS {
+		if name == text { return candidate, true }
 	}
 	return nil, false
 }
@@ -401,8 +406,8 @@ field_value_clone :: proc(value: string, allocator: runtime.Allocator) -> (clone
 @(private)
 field_value_sanitize :: proc(value: string) {
 	bytes := transmute([]u8)value
-	for &c in bytes {
-		if c == '\r' || c == '\n' || c == 0 { c = ' ' }
+	for &character in bytes {
+		if character == '\r' || character == '\n' || character == 0 { character = ' ' }
 	}
 }
 
@@ -411,10 +416,10 @@ field_value_sanitize :: proc(value: string) {
 // same length. The comparison strips them instead of parsing, so no representable
 // bound limits which equal values are recognized.
 @(private)
-content_length_values_equal :: proc(a, b: string) -> bool {
-	a_digits, a_ok := decimal_meaning(a)
-	b_digits, b_ok := decimal_meaning(b)
-	return a_ok && b_ok && a_digits == b_digits
+content_length_values_equal :: proc(left, right: string) -> bool {
+	left_digits, left_ok := decimal_meaning(left)
+	right_digits, right_ok := decimal_meaning(right)
+	return left_ok && right_ok && left_digits == right_digits
 }
 
 // decimal_meaning validates a nonempty all-digit field value and reports its
@@ -422,8 +427,8 @@ content_length_values_equal :: proc(a, b: string) -> bool {
 @(private)
 decimal_meaning :: proc(value: string) -> (meaning: string, ok: bool) {
 	if len(value) == 0 { return "", false }
-	for c in transmute([]u8)value {
-		if !is_digit(c) { return "", false }
+	for character in transmute([]u8)value {
+		if !is_digit(character) { return "", false }
 	}
 	stripped := strings.trim_left(value, "0")
 	if stripped == "" { return "0", true }
@@ -468,21 +473,21 @@ header_allowed_trailer :: proc(key: string) -> bool {
 	return true
 }
 
-_dynamic_unwritten :: proc(d: [dynamic]$E) -> []E {
-	return (cast([^]E)raw_data(d))[len(d):cap(d)]
+_dynamic_unwritten :: proc(array: [dynamic]$E) -> []E {
+	return (cast([^]E)raw_data(array))[len(array):cap(array)]
 }
 
-_dynamic_add_len :: proc(d: ^[dynamic]$E, len: int) {
-	(transmute(^runtime.Raw_Dynamic_Array)d).len += len
+_dynamic_add_len :: proc(array: ^[dynamic]$E, length: int) {
+	(transmute(^runtime.Raw_Dynamic_Array)array).len += length
 }
 
 @(private)
-write_escaped_newlines :: proc(w: io.Writer, v: string) -> io.Error {
-	for c in v {
-		if c == '\n' {
-			io.write_string(w, "\\n") or_return
+write_escaped_newlines :: proc(writer: io.Writer, text: string) -> io.Error {
+	for character in text {
+		if character == '\n' {
+			io.write_string(writer, "\\n") or_return
 		} else {
-			io.write_rune(w, c) or_return
+			io.write_rune(writer, character) or_return
 		}
 	}
 	return nil
@@ -494,11 +499,11 @@ Atomic :: struct($T: typeid) {
 }
 
 @(private)
-atomic_store :: #force_inline proc(a: ^Atomic($T), val: T) {
-	sync.atomic_store(&a.raw, val)
+atomic_store :: #force_inline proc(target: ^Atomic($T), value: T) {
+	sync.atomic_store(&target.raw, value)
 }
 
 @(private)
-atomic_load :: #force_inline proc(a: ^Atomic($T)) -> T {
-	return sync.atomic_load(&a.raw)
+atomic_load :: #force_inline proc(target: ^Atomic($T)) -> T {
+	return sync.atomic_load(&target.raw)
 }

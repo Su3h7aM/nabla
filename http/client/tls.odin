@@ -72,12 +72,12 @@ handshake_failure_detail :: proc(connection: ^Connection, err: Error, allocator:
 // end it itself. A close_notify carries no reason, and a peer that sends one has given up
 // on the handshake rather than finished it.
 peer_alert_text :: proc(connection: ^Connection, allocator: mem.Allocator) -> string {
-	if connection.tls_conn == nil { return "" }
-	if connection.tls_conn.peer_alert != 0 {
-		description := tls.Alert_Description(connection.tls_conn.peer_alert)
-		return fmt.aprintf("the peer sent the %v alert (%d)", description, connection.tls_conn.peer_alert, allocator = allocator)
+	if connection.tls_session == nil { return "" }
+	if connection.tls_session.peer_alert != 0 {
+		description := tls.Alert_Description(connection.tls_session.peer_alert)
+		return fmt.aprintf("the peer sent the %v alert (%d)", description, connection.tls_session.peer_alert, allocator = allocator)
 	}
-	if connection.tls_conn.closed {
+	if connection.tls_session.closed {
 		return fmt.aprintf("the peer closed the connection before the handshake finished", allocator = allocator)
 	}
 	return ""

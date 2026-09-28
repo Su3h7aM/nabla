@@ -26,22 +26,22 @@ Test_Server :: struct {
 
 // test_handle answers "/echo" with the request body, "/json" with a streamed
 // JSON value, and anything else with "ok".
-test_handle :: proc(req: ^Request, res: ^Response) {
-	if req.url.path == "/json" {
-		respond_json(res, 7)
+test_handle :: proc(request: ^Request, response: ^Response) {
+	if request.url.path == "/json" {
+		respond_json(response, 7)
 		return
 	}
-	if req.url.path != "/echo" {
-		respond_plain(res, "ok")
+	if request.url.path != "/echo" {
+		respond_plain(response, "ok")
 		return
 	}
-	body(req, -1, res, proc(user_data: rawptr, content: Body, err: Body_Error) {
-		res := (^Response)(user_data)
+	body(request, -1, response, proc(user_data: rawptr, content: Body, err: Body_Error) {
+		response := (^Response)(user_data)
 		if err != nil {
-			respond(res, body_error_status(err))
+			respond(response, body_error_status(err))
 			return
 		}
-		respond_plain(res, content)
+		respond_plain(response, content)
 	})
 }
 
@@ -51,7 +51,7 @@ test_server_start :: proc(t: ^testing.T, fixture: ^Test_Server) -> bool {
 		opts.thread_count = 1
 		listen_err := listen(&fixture.server, {address = net.IP4_Loopback, port = 0}, opts)
 		if listen_err == nil {
-			bound, bound_err := net.bound_endpoint(fixture.server.tcp_sock)
+			bound, bound_err := net.bound_endpoint(fixture.server.tcp_socket)
 			fixture.endpoint, fixture.listened = bound, bound_err == nil
 		}
 		sync.sema_post(&fixture.ready)

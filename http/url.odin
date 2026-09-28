@@ -22,35 +22,35 @@ URL :: struct {
 // authority is looked for.
 url_parse :: proc(raw: string) -> (url: URL) {
 	url.raw = raw
-	s := raw
+	rest := raw
 
-	if i := strings.index_byte(s, '#'); i >= 0 {
-		url.fragment = s[i + 1:]
-		s = s[:i]
+	if index := strings.index_byte(rest, '#'); index >= 0 {
+		url.fragment = rest[index + 1:]
+		rest = rest[:index]
 	}
-	if i := strings.index_byte(s, '?'); i >= 0 {
-		url.query = s[i + 1:]
-		s = s[:i]
+	if index := strings.index_byte(rest, '?'); index >= 0 {
+		url.query = rest[index + 1:]
+		rest = rest[:index]
 	}
-	if i := strings.index(s, "://"); i >= 0 {
-		url.scheme = s[:i]
-		s = s[i + 3:]
+	if index := strings.index(rest, "://"); index >= 0 {
+		url.scheme = rest[:index]
+		rest = rest[index + 3:]
 	}
-	if i := strings.index_byte(s, '/'); i >= 0 {
-		url.host = s[:i]
-		url.path = s[i:]
+	if index := strings.index_byte(rest, '/'); index >= 0 {
+		url.host = rest[:index]
+		url.path = rest[index:]
 	} else {
-		url.host = s
+		url.host = rest
 	}
 	return
 }
 
 // request_path_write writes the origin-form request target of a URL.
-request_path_write :: proc(w: io.Writer, target: URL) -> io.Error {
-	io.write_string(w, target.path if target.path != "" else "/") or_return
+request_path_write :: proc(writer: io.Writer, target: URL) -> io.Error {
+	io.write_string(writer, target.path if target.path != "" else "/") or_return
 	if target.query != "" {
-		io.write_byte(w, '?') or_return
-		io.write_string(w, target.query) or_return
+		io.write_byte(writer, '?') or_return
+		io.write_string(writer, target.query) or_return
 	}
 	return nil
 }

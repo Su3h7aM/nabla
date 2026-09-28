@@ -20,9 +20,9 @@ Mime_Type :: enum {
 	Wasm,
 }
 
-mime_from_extension :: proc(s: string) -> Mime_Type {
+mime_from_extension :: proc(path: string) -> Mime_Type {
 	//odinfmt:disable
-	switch filepath.ext(s) {
+	switch filepath.ext(path) {
 	case ".html": return .Html
 	case ".js":   return .Js
 	case ".css":  return .Css
@@ -60,6 +60,6 @@ _mime_to_content_type := [Mime_Type]string {
 	.Wasm        = "application/wasm",
 }
 
-mime_to_content_type :: proc(m: Mime_Type) -> string {
-	return _mime_to_content_type[m]
+mime_to_content_type :: proc(mime: Mime_Type) -> string {
+	return _mime_to_content_type[mime]
 }

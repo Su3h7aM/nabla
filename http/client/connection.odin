@@ -14,7 +14,7 @@ import "nabla:tls"
 // is not.
 Connection :: struct {
 	socket:      net.TCP_Socket,
-	tls_conn:    ^tls.Conn,
+	tls_session: ^tls.Conn,
 	roots:       tls.Roots,
 	anchors:     []^x509.Certificate,
 	probe:       Probe,
@@ -129,11 +129,11 @@ connection_handshake :: proc(connection: ^Connection, host: string) -> Error {
 	connection.roots = roots
 	connection.anchors = tls.certificate_pointers(roots.certificates, connection.allocator)
 
-	conn, init_err := tls.init(tls_transport(connection), {roots = connection.anchors, allocator = connection.allocator})
+	session, init_err := tls.init(tls_transport(connection), {roots = connection.anchors, allocator = connection.allocator})
 	if init_err != tls.Error.None { return .TLS_Config }
-	connection.tls_conn = conn
+	connection.tls_session = session
 
-	if err := tls.handshake(conn, name, TLS_ALPN); err != tls.Error.None {
+	if err := tls.handshake(session, name, TLS_ALPN); err != tls.Error.None {
 		return tls_error(connection, err, .TLS_Handshake)
 	}
 	return .None
@@ -149,14 +149,14 @@ TLS_ALPN :: []string{"http/1.1"}
 // them; a failure still reports what was taken before it, so a caller can tell a
 // request that never started from one that stopped halfway.
 connection_write_all :: proc(connection: ^Connection, buffer: []u8) -> (accepted: int, err: Error) {
-	if connection.tls_conn != nil { return connection_write_tls(connection, buffer) }
+	if connection.tls_session != nil { return connection_write_tls(connection, buffer) }
 	return connection_write_socket(connection, buffer)
 }
 
 // connection_write_tls hands plaintext to the TLS session, which owns the socket's
 // bytes from there on.
 connection_write_tls :: proc(connection: ^Connection, buffer: []u8) -> (accepted: int, err: Error) {
-	written, tls_err := tls.write(connection.tls_conn, buffer)
+	written, tls_err := tls.write(connection.tls_session, buffer)
 	if tls_err == tls.Error.None { return written, .None }
 	return written, tls_error(connection, tls_err, .TLS_Write)
 }
@@ -213,15 +213,14 @@ connection_read_source :: proc(user_data: rawptr, buffer: []u8) -> (count: int, 
 // connection_read returns .Closed for an orderly end of stream. The caller decides
 // whether the message was complete.
 connection_read :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {
-	if connection.tls_conn != nil { return connection_read_tls(connection, buffer) }
+	if connection.tls_session != nil { return connection_read_tls(connection, buffer) }
 	return connection_read_socket(connection, buffer)
 }
 
 // connection_read_tls reads plaintext out of the TLS session. The session owns the
-// connection_read_tls takes plaintext out of the TLS session. The session owns the
 // socket's bytes from there on.
 connection_read_tls :: proc(connection: ^Connection, buffer: []u8) -> (count: int, err: Error) {
-	read, tls_err := tls.read(connection.tls_conn, buffer)
+	read, tls_err := tls.read(connection.tls_session, buffer)
 	switch tls_err {
 	case .None:
 		// A close_notify is the peer's orderly end of the stream, which reads the
@@ -292,13 +291,15 @@ connection_abort :: proc(connection: ^Connection) {
 
 connection_destroy :: proc(connection: ^Connection) {
 	if connection == nil { return }
-	if connection.tls_conn != nil {
+	if connection.tls_session != nil {
 		// A close_notify is the polite end of a TLS stream, but sending it can wait
 		// on a peer that has stopped reading, so it goes out only when this
 		// connection was not the interruptible kind and the request ended well.
-		if connection.stop == .None && !connection.nonblocking { _ = tls.close(connection.tls_conn) }
-		tls.destroy(connection.tls_conn)
-		connection.tls_conn = nil
+		// A close that fails changes nothing: the session is destroyed and the
+		// socket closed next.
+		if connection.stop == .None && !connection.nonblocking { _ = tls.close(connection.tls_session) }
+		tls.destroy(connection.tls_session)
+		connection.tls_session = nil
 	}
 	delete(connection.anchors, connection.allocator)
 	tls.roots_destroy(&connection.roots)

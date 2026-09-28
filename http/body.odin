@@ -23,22 +23,22 @@ limit (RFC 9110 5.4).
 
 Do not call this more than once.
 
-**Tip** If an error is returned, easily respond with an appropriate error code like this, `http.respond(res, http.body_error_status(err))`.
+**Tip** If an error is returned, easily respond with an appropriate error code like this, `http.respond(response, http.body_error_status(err))`.
 */
-body :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb: Body_Callback) {
-	assert(req._body_ok == nil, "you can only call body once per request")
+body :: proc(request: ^Request, max_length: int = -1, user_data: rawptr, callback: Body_Callback) {
+	assert(request._body_ok == nil, "you can only call body once per request")
 
-	if coding, has_coding := headers_get_unsafe(req.headers, "transfer-encoding"); has_coding {
+	if coding, has_coding := headers_get_unsafe(request.headers, "transfer-encoding"); has_coding {
 		if !final_transfer_coding_is_chunked(coding) {
 			// The server answers such a request with 400 before a handler runs
 			// (RFC 9112 6.3 item 4), so this is only reached by misuse.
-			req._body_ok = false
-			cb(user_data, "", .Bad_Read_Count)
+			request._body_ok = false
+			callback(user_data, "", .Bad_Read_Count)
 			return
 		}
-		_body_chunked(req, max_length, user_data, cb)
+		_body_chunked(request, max_length, user_data, callback)
 	} else {
-		_body_length(req, max_length, user_data, cb)
+		_body_length(request, max_length, user_data, callback)
 	}
 }
 
@@ -47,52 +47,52 @@ Parses a URL encoded body, aka bodies with the 'Content-Type: application/x-www-
 
 Key&value pairs are percent decoded and put in a map.
 */
-body_url_encoded :: proc(plain: Body, allocator := context.temp_allocator) -> (res: map[string]string, ok: bool) {
+body_url_encoded :: proc(encoded: Body, allocator := context.temp_allocator) -> (queries: map[string]string, ok: bool) {
 
-	insert :: proc(m: ^map[string]string, plain: string, keys: int, vals: int, end: int, allocator := context.temp_allocator) -> bool {
-		has_value := vals != -1
-		key_end := vals - 1 if has_value else end
-		key := plain[keys:key_end]
-		val := plain[vals:end] if has_value else ""
+	insert :: proc(result: ^map[string]string, text: string, key_start: int, value_start: int, end: int, allocator := context.temp_allocator) -> bool {
+		has_value := value_start != -1
+		key_end := value_start - 1 if has_value else end
+		key := text[key_start:key_end]
+		value := text[value_start:end] if has_value else ""
 
 		// PERF: this could be a hot spot and I don't like that we allocate the decoded key and value here.
-		keye := (net.percent_decode(key, allocator) or_return) if strings.index_byte(key, '%') > -1 else key
-		vale := (net.percent_decode(val, allocator) or_return) if has_value && strings.index_byte(val, '%') > -1 else val
+		decoded_key := (net.percent_decode(key, allocator) or_return) if strings.index_byte(key, '%') > -1 else key
+		decoded_value := (net.percent_decode(value, allocator) or_return) if has_value && strings.index_byte(value, '%') > -1 else value
 
-		m[keye] = vale
+		result[decoded_key] = decoded_value
 		return true
 	}
 
 	count := 1
-	for b in plain {
-		if b == '&' { count += 1 }
+	for character in encoded {
+		if character == '&' { count += 1 }
 	}
 
-	queries := make(map[string]string, count, allocator)
+	queries = make(map[string]string, count, allocator)
 
-	keys := 0
-	vals := -1
-	for b, i in plain {
-		switch b {
+	key_start := 0
+	value_start := -1
+	for character, index in encoded {
+		switch character {
 		case '=':
-			vals = i + 1
+			value_start = index + 1
 		case '&':
-			insert(&queries, plain, keys, vals, i) or_return
-			keys = i + 1
-			vals = -1
+			insert(&queries, encoded, key_start, value_start, index) or_return
+			key_start = index + 1
+			value_start = -1
 		}
 	}
 
-	insert(&queries, plain, keys, vals, len(plain)) or_return
+	insert(&queries, encoded, key_start, value_start, len(encoded)) or_return
 
 	return queries, true
 }
 
 // Returns an appropriate status code for the given body error.
-body_error_status :: proc(e: Body_Error) -> Status {
-	switch t in e {
+body_error_status :: proc(body_err: Body_Error) -> Status {
+	switch specific in body_err {
 	case bufio.Scanner_Extra_Error:
-		switch t {
+		switch specific {
 		case .Too_Long:
 			return .Content_Too_Large
 		case .Too_Short, .Bad_Read_Count:
@@ -105,7 +105,7 @@ body_error_status :: proc(e: Body_Error) -> Status {
 			return .Internal_Server_Error
 		}
 	case io.Error:
-		switch t {
+		switch specific {
 		case .EOF, .Unknown, .No_Progress, .Unexpected_EOF:
 			return .Bad_Request
 		case .Empty,
@@ -133,168 +133,142 @@ body_error_status :: proc(e: Body_Error) -> Status {
 	}
 }
 
+// _body_length frames the body by Content-Length, and as empty when the request
+// carries neither framing field (RFC 9112 6.3 items 5 and 7).
+_body_length :: proc(request: ^Request, max_length: int = -1, user_data: rawptr, callback: Body_Callback) {
+	request._body_ok = false
 
-// "Decodes" a request body based on the content length header.
-// Meant for internal usage, you should use `http.request_body`.
-_body_length :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb: Body_Callback) {
-	req._body_ok = false
-
-	length_text, has_length := headers_get_unsafe(req.headers, "content-length")
+	length_text, has_length := headers_get_unsafe(request.headers, "content-length")
 	if !has_length {
 		// Neither framing field: the request has no content (RFC 9112 6.3 item 7).
-		req._body_ok = true
-		cb(user_data, "", nil)
+		request._body_ok = true
+		callback(user_data, "", nil)
 		return
 	}
 
-	ilen, lenok := content_length_parse(length_text)
-	if !lenok {
-		cb(user_data, "", .Bad_Read_Count)
+	length, length_ok := content_length_parse(length_text)
+	if !length_ok {
+		callback(user_data, "", .Bad_Read_Count)
 		return
 	}
 
-	if max_length > -1 && ilen > max_length {
-		cb(user_data, "", .Too_Long)
+	if max_length > -1 && length > max_length {
+		callback(user_data, "", .Too_Long)
 		return
 	}
 
-	if ilen == 0 {
-		req._body_ok = true
-		cb(user_data, "", nil)
+	if length == 0 {
+		request._body_ok = true
+		callback(user_data, "", nil)
 		return
 	}
 
-	req._scanner.max_token_size = ilen
+	request._scanner.max_token_size = length
 
-	req._scanner.split = scan_num_bytes
-	req._scanner.split_data = rawptr(uintptr(ilen))
+	request._scanner.split = scan_num_bytes
+	request._scanner.split_data = rawptr(uintptr(length))
 
-	req._body_ok = true
-	scanner_scan(req._scanner, user_data, cb)
+	request._body_ok = true
+	scanner_scan(request._scanner, user_data, callback)
 }
 
-/*
-"Decodes" a chunked transfer encoded request body.
-Meant for internal usage, you should use `http.request_body`.
+// _body_chunked decodes a chunked body (RFC 9112 7.1) into one buffer, owned by
+// the request's temp allocator, and hands it to the callback once. A trailer
+// field that may be one and is not already in the header section is merged into
+// it; the decoded message carries neither chunked nor Trailer afterwards.
+_body_chunked :: proc(request: ^Request, max_length: int = -1, user_data: rawptr, callback: Body_Callback) {
+	request._body_ok = false
 
-PERF: this could be made non-allocating by writing over the part of the body that contains the
-metadata with the rest of the body, and then returning a slice of that, but it is some effort and
-I don't think this functionality of HTTP is used that much anyway.
-
-RFC 7230 4.1.3 pseudo-code:
-
-length := 0
-read chunk-size, chunk-ext (if any), and CRLF
-while (chunk-size > 0) {
-   read chunk-data and CRLF
-   append chunk-data to decoded-body
-   length := length + chunk-size
-   read chunk-size, chunk-ext (if any), and CRLF
-}
-read trailer field
-while (trailer field is not empty) {
-   if (trailer field is allowed to be sent in a trailer) {
-   	append trailer field to existing header fields
-   }
-   read trailer-field
-}
-Content-Length := length
-Remove "chunked" from Transfer-Encoding
-Remove Trailer from existing header fields
-*/
-_body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb: Body_Callback) {
-	req._body_ok = false
-
-	on_scan :: proc(s: rawptr, size_line: string, err: bufio.Scanner_Error) {
-		s := cast(^Chunked_State)s
+	on_scan :: proc(state_data: rawptr, size_line: string, err: bufio.Scanner_Error) {
+		state := cast(^Chunked_State)state_data
 
 		if err != nil {
-			s.cb(s.user_data, "", err)
+			state.callback(state.user_data, "", err)
 			return
 		}
 
 		size, ok := chunk_line_parse(size_line)
 		if !ok {
 			log.info("a chunked body declared an invalid chunk size")
-			s.cb(s.user_data, "", .Bad_Read_Count)
+			state.callback(state.user_data, "", .Bad_Read_Count)
 			return
 		}
 
 		// start scanning trailer headers.
 		if size == 0 {
-			scanner_scan(s.req._scanner, s, on_scan_trailer)
+			scanner_scan(state.request._scanner, state_data, on_scan_trailer)
 			return
 		}
 
-		if s.max_length > -1 && size > s.max_length - strings.builder_len(s.buf) {
-			s.cb(s.user_data, "", .Too_Long)
+		if state.max_length > -1 && size > state.max_length - strings.builder_len(state.buffer) {
+			state.callback(state.user_data, "", .Too_Long)
 			return
 		}
 
-		s.req._scanner.max_token_size = size
+		state.request._scanner.max_token_size = size
 
-		s.req._scanner.split = scan_num_bytes
+		state.request._scanner.split = scan_num_bytes
 
 		#assert(size_of(int) == size_of(uintptr))
-		s.req._scanner.split_data = rawptr(uintptr(size))
+		state.request._scanner.split_data = rawptr(uintptr(size))
 
-		scanner_scan(s.req._scanner, s, on_scan_chunk)
+		scanner_scan(state.request._scanner, state_data, on_scan_chunk)
 	}
 
-	on_scan_chunk :: proc(s: rawptr, token: string, err: bufio.Scanner_Error) {
-		s := cast(^Chunked_State)s
+	on_scan_chunk :: proc(state_data: rawptr, token: string, err: bufio.Scanner_Error) {
+		state := cast(^Chunked_State)state_data
 
 		if err != nil {
-			s.cb(s.user_data, "", err)
+			state.callback(state.user_data, "", err)
 			return
 		}
 
-		s.req._scanner.max_token_size = 0
-		s.req._scanner.split = scan_lines
+		state.request._scanner.max_token_size = 0
+		state.request._scanner.split = scan_lines
 
-		strings.write_string(&s.buf, token)
+		strings.write_string(&state.buffer, token)
 
-		on_scan_empty_line :: proc(s: rawptr, token: string, err: bufio.Scanner_Error) {
-			s := cast(^Chunked_State)s
+		on_scan_empty_line :: proc(state_data: rawptr, token: string, err: bufio.Scanner_Error) {
+			state := cast(^Chunked_State)state_data
 
 			if err != nil {
-				s.cb(s.user_data, "", err)
+				state.callback(state.user_data, "", err)
 				return
 			}
 			// chunk-data is followed by CRLF and nothing else (RFC 9112 7.1).
 			if len(token) != 0 {
-				s.cb(s.user_data, "", .Bad_Read_Count)
+				state.callback(state.user_data, "", .Bad_Read_Count)
 				return
 			}
 
-			scanner_scan(s.req._scanner, s, on_scan)
+			scanner_scan(state.request._scanner, state_data, on_scan)
 		}
 
-		scanner_scan(s.req._scanner, s, on_scan_empty_line)
+		scanner_scan(state.request._scanner, state_data, on_scan_empty_line)
 	}
 
-	on_scan_trailer :: proc(s: rawptr, line: string, err: bufio.Scanner_Error) {
-		s := cast(^Chunked_State)s
+	on_scan_trailer :: proc(state_data: rawptr, line: string, err: bufio.Scanner_Error) {
+		state := cast(^Chunked_State)state_data
 
 		if err != nil {
-			s.cb(s.user_data, "", err)
+			state.callback(state.user_data, "", err)
 			return
 		}
 		// The empty line ends the trailer section and the message. RFC 9112
 		// 7.1.3: the decoded message no longer carries chunked or Trailer.
 		if len(line) == 0 {
-			s.req.headers.readonly = false
-			headers_delete_unsafe(&s.req.headers, "trailer")
-			coding := headers_get_unsafe(s.req.headers, "transfer-encoding")
+			state.request.headers.readonly = false
+			headers_delete_unsafe(&state.request.headers, "trailer")
+			coding := headers_get_unsafe(state.request.headers, "transfer-encoding")
 			if comma := strings.last_index_byte(coding, ','); comma >= 0 {
-				headers_set_unsafe(&s.req.headers, "transfer-encoding", trim_ows(coding[:comma]))
+				headers_set_unsafe(&state.request.headers, "transfer-encoding", trim_ows(coding[:comma]))
 			} else {
-				headers_delete_unsafe(&s.req.headers, "transfer-encoding")
+				headers_delete_unsafe(&state.request.headers, "transfer-encoding")
 			}
-			s.req.headers.readonly = true
+			state.request.headers.readonly = true
 
-			s.req._body_ok = true
-			s.cb(s.user_data, strings.to_string(s.buf), nil)
+			state.request._body_ok = true
+			state.callback(state.user_data, strings.to_string(state.buffer), nil)
 			return
 		}
 
@@ -304,44 +278,44 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 		name := line[:max(colon, 0)]
 		if colon <= 0 || !token_valid(name) {
 			log.info("a chunked body carried an invalid trailer field")
-			s.cb(s.user_data, "", .Bad_Read_Count)
+			state.callback(state.user_data, "", .Bad_Read_Count)
 			return
 		}
-		lower := sanitize_key(s.req.headers, name)
-		if header_allowed_trailer(lower) && !headers_has_unsafe(s.req.headers, lower) {
-			s.req.headers.readonly = false
-			_, ok := header_parse(&s.req.headers, line)
-			s.req.headers.readonly = true
+		lower := sanitize_key(state.request.headers, name)
+		if header_allowed_trailer(lower) && !headers_has_unsafe(state.request.headers, lower) {
+			state.request.headers.readonly = false
+			_, ok := header_parse(&state.request.headers, line)
+			state.request.headers.readonly = true
 			if !ok {
-				s.cb(s.user_data, "", .Bad_Read_Count)
+				state.callback(state.user_data, "", .Bad_Read_Count)
 				return
 			}
 		}
 
-		scanner_scan(s.req._scanner, s, on_scan_trailer)
+		scanner_scan(state.request._scanner, state_data, on_scan_trailer)
 	}
 
 	Chunked_State :: struct {
-		req:        ^Request,
+		request:    ^Request,
 		max_length: int,
 		user_data:  rawptr,
-		cb:         Body_Callback,
-		buf:        strings.Builder,
+		callback:   Body_Callback,
+		buffer:     strings.Builder,
 	}
 
-	s, s_error := new(Chunked_State, context.temp_allocator)
-	if s_error != nil {
-		cb(user_data, "", .Unknown)
+	state, state_error := new(Chunked_State, context.temp_allocator)
+	if state_error != nil {
+		callback(user_data, "", .Unknown)
 		return
 	}
 
-	s.buf.buf.allocator = context.temp_allocator
+	state.buffer.buf.allocator = context.temp_allocator
 
-	s.req = req
-	s.max_length = max_length
-	s.user_data = user_data
-	s.cb = cb
+	state.request = request
+	state.max_length = max_length
+	state.user_data = user_data
+	state.callback = callback
 
-	s.req._scanner.split = scan_lines
-	scanner_scan(s.req._scanner, s, on_scan)
+	state.request._scanner.split = scan_lines
+	scanner_scan(state.request._scanner, state, on_scan)
 }

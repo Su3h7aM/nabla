@@ -30,50 +30,49 @@ HTTP_DATE_WEEKDAYS_LONG := [7]string{"Sunday", "Monday", "Tuesday", "Wednesday",
 
 HTTP_DATE_MONTHS := [12]string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 
-// Formats a time in the HTTP header format (no timezone conversion is done, GMT expected):
-// `<day-name>, <day> <month> <year> <hour>:<minute>:<second> GMT`
-date_write :: proc(w: io.Writer, t: time.Time) -> io.Error {
-	year, month, day := time.date(t)
-	hour, minute, second := time.clock_from_time(t)
-	wday := time.weekday(t)
-	
-	// odinfmt:disable
-	io.write_string(w, HTTP_DATE_WEEKDAYS_SHORT[wday]) or_return // 'Fri'
-	io.write_string(w, ", ")             or_return // 'Fri, '
-	write_padded_int(w, day)             or_return // 'Fri, 05'
-	io.write_byte(w, ' ')                or_return // 'Fri, 05 '
-	io.write_string(w, date_month_name(month)) or_return // 'Fri, 05 Feb'
-	io.write_byte(w, ' ')                or_return // 'Fri, 05 Feb '
-	io.write_int(w, year)                or_return // 'Fri, 05 Feb 2023'
-	io.write_byte(w, ' ')                or_return // 'Fri, 05 Feb 2023 '
-	write_padded_int(w, hour)            or_return // 'Fri, 05 Feb 2023 09'
-	io.write_byte(w, ':')                or_return // 'Fri, 05 Feb 2023 09:'
-	write_padded_int(w, minute)          or_return // 'Fri, 05 Feb 2023 09:01'
-	io.write_byte(w, ':')                or_return // 'Fri, 05 Feb 2023 09:01:'
-	write_padded_int(w, second)          or_return // 'Fri, 05 Feb 2023 09:01:10'
-	io.write_string(w, " GMT")           or_return // 'Fri, 05 Feb 2023 09:01:10 GMT'
-	// odinfmt:enable
+// date_write writes instant as an IMF-fixdate, the one HTTP date format a sender
+// may use, with no timezone conversion: `<day-name>, <day> <month> <year>
+// <hour>:<minute>:<second> GMT`.
+date_write :: proc(writer: io.Writer, instant: time.Time) -> io.Error {
+	year, month, day := time.date(instant)
+	hour, minute, second := time.clock_from_time(instant)
+	weekday := time.weekday(instant)
+
+	io.write_string(writer, HTTP_DATE_WEEKDAYS_SHORT[weekday]) or_return
+	io.write_string(writer, ", ") or_return
+	write_padded_int(writer, day) or_return
+	io.write_byte(writer, ' ') or_return
+	io.write_string(writer, date_month_name(month)) or_return
+	io.write_byte(writer, ' ') or_return
+	io.write_int(writer, year) or_return
+	io.write_byte(writer, ' ') or_return
+	write_padded_int(writer, hour) or_return
+	io.write_byte(writer, ':') or_return
+	write_padded_int(writer, minute) or_return
+	io.write_byte(writer, ':') or_return
+	write_padded_int(writer, second) or_return
+	io.write_string(writer, " GMT") or_return
 
 	return nil
 }
 
-// Formats a time in the HTTP header format (no timezone conversion is done, GMT expected):
-// `<day-name>, <day> <month> <year> <hour>:<minute>:<second> GMT`
-date_string :: proc(t: time.Time, allocator := context.allocator) -> string {
-	b: strings.Builder
+// date_string returns instant formatted as date_write writes it, owned by the
+// caller's allocator.
+date_string :: proc(instant: time.Time, allocator := context.allocator) -> string {
+	builder: strings.Builder
 
-	buf := make([]byte, HTTP_DATE_LENGTH, allocator)
-	b.buf = slice.into_dynamic(buf)
+	buffer := make([]byte, HTTP_DATE_LENGTH, allocator)
+	builder.buf = slice.into_dynamic(buffer)
 
-	date_write(strings.to_writer(&b), t)
+	date_write(strings.to_writer(&builder), instant)
 
-	return strings.to_string(b)
+	return strings.to_string(builder)
 }
 
 // date_parse reads one HTTP date in any of the three formats a recipient
 // accepts. Each parser validates the shape it expects, so a text that fails one
 // grammar is tried against the next rather than guessed at.
-date_parse :: proc(value: string) -> (t: time.Time, ok: bool) {
+date_parse :: proc(value: string) -> (instant: time.Time, ok: bool) {
 	if parsed, parsed_ok := date_parse_imf(value); parsed_ok { return parsed, true }
 	if parsed, parsed_ok := date_parse_rfc850(value); parsed_ok { return parsed, true }
 	return date_parse_asctime(value)
@@ -81,7 +80,7 @@ date_parse :: proc(value: string) -> (t: time.Time, ok: bool) {
 
 // date_parse_imf reads `Sun, 06 Nov 1994 08:49:37 GMT`, the format this package
 // writes and the one a modern peer sends.
-date_parse_imf :: proc(value: string) -> (t: time.Time, ok: bool) {
+date_parse_imf :: proc(value: string) -> (instant: time.Time, ok: bool) {
 	if len(value) != HTTP_DATE_LENGTH { return }
 	if value[3] != ',' ||
 	   value[7] != ' ' ||
@@ -106,7 +105,7 @@ date_parse_imf :: proc(value: string) -> (t: time.Time, ok: bool) {
 // digits, so the century is fixed at receipt: a date that would be more than
 // fifty years in the future is the most recent past year with the same last two
 // digits.
-date_parse_rfc850 :: proc(value: string) -> (t: time.Time, ok: bool) {
+date_parse_rfc850 :: proc(value: string) -> (instant: time.Time, ok: bool) {
 	comma := strings.index_byte(value, ',')
 	if comma < 0 || !date_weekday(value[:comma], HTTP_DATE_WEEKDAYS_LONG[:]) { return }
 	// ` DD-MMM-YY HH:MM:SS GMT`
@@ -127,7 +126,7 @@ date_parse_rfc850 :: proc(value: string) -> (t: time.Time, ok: bool) {
 
 // date_parse_asctime reads `Sun Nov  6 08:49:37 1994`, whose day is either two
 // digits or one digit padded with a space.
-date_parse_asctime :: proc(value: string) -> (t: time.Time, ok: bool) {
+date_parse_asctime :: proc(value: string) -> (instant: time.Time, ok: bool) {
 	if len(value) != 24 { return }
 	if value[3] != ' ' || value[7] != ' ' || value[10] != ' ' || value[13] != ':' || value[16] != ':' || value[19] != ' ' { return }
 	if !date_weekday(value[:3], HTTP_DATE_WEEKDAYS_SHORT[:]) { return }
@@ -147,9 +146,9 @@ date_parse_asctime :: proc(value: string) -> (t: time.Time, ok: bool) {
 // a value this parser does not read.
 date_digits :: proc(text: string) -> (value: int, ok: bool) {
 	if len(text) == 0 { return }
-	for c in text {
-		if c < '0' || c > '9' { return }
-		value = value * 10 + int(c - '0')
+	for character in text {
+		if character < '0' || character > '9' { return }
+		value = value * 10 + int(character - '0')
 	}
 	return value, true
 }
@@ -176,13 +175,13 @@ date_month_name :: proc(month: time.Month) -> string {
 }
 
 @(private)
-write_padded_int :: proc(w: io.Writer, i: int) -> io.Error {
-	if i < 10 {
-		io.write_string(w, PADDED_NUMS[i]) or_return
+write_padded_int :: proc(writer: io.Writer, value: int) -> io.Error {
+	if value < 10 {
+		io.write_string(writer, PADDED_NUMS[value]) or_return
 		return nil
 	}
 
-	_, err := io.write_int(w, i)
+	_, err := io.write_int(writer, value)
 	return err
 }
 

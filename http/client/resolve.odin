@@ -81,7 +81,7 @@ host_and_port :: proc(authority: string) -> (host: string, port: int, ok: bool) 
 		return
 	}
 	colons := 0
-	for byte in authority { if byte == ':' { colons += 1 } }
+	for character in authority { if character == ':' { colons += 1 } }
 	if colons > 1 { return authority, 0, true }
 	if colon := strings.index_byte(authority, ':'); colon >= 0 {
 		port, ok = parse_port(authority[colon + 1:])
@@ -93,9 +93,9 @@ host_and_port :: proc(authority: string) -> (host: string, port: int, ok: bool) 
 parse_port :: proc(text: string) -> (int, bool) {
 	if text == "" { return 0, false }
 	port := 0
-	for byte in text {
-		if byte < '0' || byte > '9' { return 0, false }
-		port = port * 10 + int(byte - '0')
+	for character in text {
+		if character < '0' || character > '9' { return 0, false }
+		port = port * 10 + int(character - '0')
 		if port > 65535 { return 0, false }
 	}
 	return port, port > 0

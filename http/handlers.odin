@@ -5,8 +5,8 @@ import "core:strconv"
 import "core:sync"
 import "core:time"
 
-Handler_Proc :: proc(handler: ^Handler, req: ^Request, res: ^Response)
-Handle_Proc :: proc(req: ^Request, res: ^Response)
+Handler_Proc :: proc(handler: ^Handler, request: ^Request, response: ^Response)
+Handle_Proc :: proc(request: ^Request, response: ^Response)
 
 Handler :: struct {
 	user_data: rawptr,
@@ -17,36 +17,35 @@ Handler :: struct {
 // TODO: something like http.handler_with_body which gets the body before calling the handler.
 
 handler :: proc(handle: Handle_Proc) -> Handler {
-	h: Handler
-	h.user_data = rawptr(handle)
+	result: Handler
+	result.user_data = rawptr(handle)
 
-	handle := proc(h: ^Handler, req: ^Request, res: ^Response) {
-		p := (Handle_Proc)(h.user_data)
-		p(req, res)
+	result.handle = proc(handler: ^Handler, request: ^Request, response: ^Response) {
+		next := (Handle_Proc)(handler.user_data)
+		next(request, response)
 	}
 
-	h.handle = handle
-	return h
+	return result
 }
 
 middleware_proc :: proc(next: Maybe(^Handler), handle: Handler_Proc) -> Handler {
-	h: Handler
-	h.next = next
-	h.handle = handle
-	return h
+	result: Handler
+	result.next = next
+	result.handle = handle
+	return result
 }
 
 Rate_Limit_On_Limit :: struct {
 	user_data: rawptr,
-	on_limit:  proc(req: ^Request, res: ^Response, user_data: rawptr),
+	on_limit:  proc(request: ^Request, response: ^Response, user_data: rawptr),
 }
 
 // Convenience method to create a Rate_Limit_On_Limit that writes the given message.
 rate_limit_message :: proc(message: ^string) -> Rate_Limit_On_Limit {
-	return Rate_Limit_On_Limit{user_data = message, on_limit = proc(_: ^Request, res: ^Response, user_data: rawptr) {
-			message := (^string)(user_data)
-			body_set(res, message^)
-			respond(res)
+	return Rate_Limit_On_Limit{user_data = message, on_limit = proc(_: ^Request, response: ^Response, user_data: rawptr) {
+			text := (^string)(user_data)
+			body_set(response, text^)
+			respond(response)
 		}}
 }
 
@@ -74,16 +73,16 @@ rate_limit_destroy :: proc(data: ^Rate_Limit_Data) {
 rate_limit :: proc(data: ^Rate_Limit_Data, next: ^Handler, opts: ^Rate_Limit_Opts, allocator := context.allocator) -> Handler {
 	assert(next != nil)
 
-	h: Handler
-	h.next = next
+	result: Handler
+	result.next = next
 
 	data.opts = opts
 	data.hits = make(map[net.Address]int, 16, allocator)
 	data.next_sweep = time.time_add(time.now(), opts.window)
-	h.user_data = data
+	result.user_data = data
 
-	h.handle = proc(h: ^Handler, req: ^Request, res: ^Response) {
-		data := (^Rate_Limit_Data)(h.user_data)
+	result.handle = proc(handler: ^Handler, request: ^Request, response: ^Response) {
+		data := (^Rate_Limit_Data)(handler.user_data)
 
 		sync.lock(&data.mu)
 
@@ -93,29 +92,29 @@ rate_limit :: proc(data: ^Rate_Limit_Data, next: ^Handler, opts: ^Rate_Limit_Opt
 			data.next_sweep = time.time_add(time.now(), data.opts.window)
 		}
 
-		hits := data.hits[req.client.address]
-		data.hits[req.client.address] = hits + 1
+		hits := data.hits[request.client.address]
+		data.hits[request.client.address] = hits + 1
 		sync.unlock(&data.mu)
 
 		if hits > data.opts.max {
-			res.status = .Too_Many_Requests
+			response.status = .Too_Many_Requests
 
-			retry_dur := i64(time.diff(time.now(), data.next_sweep) / time.Second)
-			buf := make([]byte, 32, context.temp_allocator)
-			retry_str := strconv.write_int(buf, retry_dur, 10)
-			headers_set_unsafe(&res.headers, "retry-after", retry_str)
+			retry_after := i64(time.diff(time.now(), data.next_sweep) / time.Second)
+			buffer := make([]byte, 32, context.temp_allocator)
+			retry_text := strconv.write_int(buffer, retry_after, 10)
+			headers_set_unsafe(&response.headers, "retry-after", retry_text)
 
-			if on, ok := data.opts.on_limit.(Rate_Limit_On_Limit); ok {
-				on.on_limit(req, res, on.user_data)
+			if on_limit, ok := data.opts.on_limit.(Rate_Limit_On_Limit); ok {
+				on_limit.on_limit(request, response, on_limit.user_data)
 			} else {
-				respond(res)
+				respond(response)
 			}
 			return
 		}
 
-		next := h.next.(^Handler)
-		next.handle(next, req, res)
+		next_handler := handler.next.(^Handler)
+		next_handler.handle(next_handler, request, response)
 	}
 
-	return h
+	return result
 }

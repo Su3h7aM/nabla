@@ -70,8 +70,8 @@ Status :: enum {
 
 // status_string returns the status line text of a status: its code and reason
 // phrase, or "" for a value no status has.
-status_string :: proc(s: Status) -> string {
-	switch s {
+status_string :: proc(status: Status) -> string {
+	switch status {
 	case .Continue:
 		return "100 Continue"
 	case .Switching_Protocols:
@@ -202,34 +202,34 @@ status_string :: proc(s: Status) -> string {
 	return ""
 }
 
-status_valid :: proc(s: Status) -> bool {
-	return status_string(s) != ""
+status_valid :: proc(status: Status) -> bool {
+	return status_string(status) != ""
 }
 
-// status_from_string reads the three-digit status code at the start of s.
-status_from_string :: proc(s: string) -> (Status, bool) {
-	if len(s) < 3 || !is_digit(s[0]) || !is_digit(s[1]) || !is_digit(s[2]) { return {}, false }
-	code := Status(int(s[0] - '0') * 100 + int(s[1] - '0') * 10 + int(s[2] - '0'))
+// status_from_string reads the three-digit status code at the start of text.
+status_from_string :: proc(text: string) -> (Status, bool) {
+	if len(text) < 3 || !is_digit(text[0]) || !is_digit(text[1]) || !is_digit(text[2]) { return {}, false }
+	code := Status(int(text[0] - '0') * 100 + int(text[1] - '0') * 10 + int(text[2] - '0'))
 	if !status_valid(code) { return {}, false }
 	return code, true
 }
 
-status_is_informational :: proc(s: Status) -> bool {
-	return s >= Status(100) && s < Status(200)
+status_is_informational :: proc(status: Status) -> bool {
+	return status >= Status(100) && status < Status(200)
 }
 
-status_is_success :: proc(s: Status) -> bool {
-	return s >= Status(200) && s < Status(300)
+status_is_success :: proc(status: Status) -> bool {
+	return status >= Status(200) && status < Status(300)
 }
 
-status_is_redirect :: proc(s: Status) -> bool {
-	return s >= Status(300) && s < Status(400)
+status_is_redirect :: proc(status: Status) -> bool {
+	return status >= Status(300) && status < Status(400)
 }
 
-status_is_client_error :: proc(s: Status) -> bool {
-	return s >= Status(400) && s < Status(500)
+status_is_client_error :: proc(status: Status) -> bool {
+	return status >= Status(400) && status < Status(500)
 }
 
-status_is_server_error :: proc(s: Status) -> bool {
-	return s >= Status(500) && s < Status(600)
+status_is_server_error :: proc(status: Status) -> bool {
+	return status >= Status(500) && status < Status(600)
 }

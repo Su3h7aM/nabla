@@ -17,32 +17,32 @@ query_iter :: proc(query: ^string) -> (entry: Query_Entry, ok: bool) {
 
 	ok = true
 
-	param: string
-	i := strings.index(query^, "&")
-	if i < 0 {
-		param = query^
+	pair: string
+	separator := strings.index(query^, "&")
+	if separator < 0 {
+		pair = query^
 		query^ = ""
 	} else {
-		param = query[:i]
-		query^ = query[i + 1:]
+		pair = query[:separator]
+		query^ = query[separator + 1:]
 	}
 
-	i = strings.index(param, "=")
-	if i < 0 {
-		entry.key = param
+	separator = strings.index(pair, "=")
+	if separator < 0 {
+		entry.key = pair
 		entry.value = ""
 		return
 	}
 
-	entry.key = param[:i]
-	entry.value = param[i + 1:]
+	entry.key = pair[:separator]
+	entry.value = pair[separator + 1:]
 
 	return
 }
 
-query_get :: proc(url: URL, key: string) -> (val: string, ok: bool) #optional_ok {
-	q := url.query
-	for entry in #force_inline query_iter(&q) {
+query_get :: proc(url: URL, key: string) -> (value: string, ok: bool) #optional_ok {
+	query := url.query
+	for entry in #force_inline query_iter(&query) {
 		if entry.key == key {
 			return entry.value, true
 		}
@@ -50,15 +50,15 @@ query_get :: proc(url: URL, key: string) -> (val: string, ok: bool) #optional_ok
 	return
 }
 
-query_get_percent_decoded :: proc(url: URL, key: string, allocator := context.temp_allocator) -> (val: string, ok: bool) {
-	str := query_get(url, key) or_return
-	return net.percent_decode(str, allocator)
+query_get_percent_decoded :: proc(url: URL, key: string, allocator := context.temp_allocator) -> (value: string, ok: bool) {
+	encoded := query_get(url, key) or_return
+	return net.percent_decode(encoded, allocator)
 }
 
 query_get_bool :: proc(url: URL, key: string) -> (result, set: bool) #optional_ok {
-	str := query_get(url, key) or_return
+	text := query_get(url, key) or_return
 	set = true
-	switch str {
+	switch text {
 	case "", "false", "0", "no":
 	case:
 		result = true
@@ -67,16 +67,16 @@ query_get_bool :: proc(url: URL, key: string) -> (result, set: bool) #optional_o
 }
 
 query_get_int :: proc(url: URL, key: string, base := 0) -> (result: int, ok: bool, set: bool) {
-	str := query_get(url, key) or_return
+	text := query_get(url, key) or_return
 	set = true
-	result, ok = strconv.parse_int(str, base)
+	result, ok = strconv.parse_int(text, base)
 	return
 }
 
 query_get_uint :: proc(url: URL, key: string, base := 0) -> (result: uint, ok: bool, set: bool) {
-	str := query_get(url, key) or_return
+	text := query_get(url, key) or_return
 	set = true
-	result, ok = strconv.parse_uint(str, base)
+	result, ok = strconv.parse_uint(text, base)
 	return
 }
 
@@ -115,32 +115,31 @@ router_destroy :: proc(router: ^Router) {
 	delete(router.routes)
 }
 
-// Returns a handler that matches against the given routes.
 router_handler :: proc(router: ^Router) -> Handler {
-	h: Handler
-	h.user_data = router
+	result: Handler
+	result.user_data = router
 
-	h.handle = proc(handler: ^Handler, req: ^Request, res: ^Response) {
+	result.handle = proc(handler: ^Handler, request: ^Request, response: ^Response) {
 		router := (^Router)(handler.user_data)
-		rline := req.line.(Requestline)
+		line := request.line.(Requestline)
 
-		if routes_try(router.routes[rline.method], req, res) {
+		if routes_try(router.routes[line.method], request, response) {
 			return
 		}
 
-		if routes_try(router.all, req, res) {
+		if routes_try(router.all, request, response) {
 			return
 		}
 
 		// The method is a structural fact. The target is peer-supplied text that a
 		// persistent log has no business carrying, and a handler can record it
 		// itself when it decides that is safe.
-		log.infof("no route matched %s", method_string(rline.method))
-		res.status = .Not_Found
-		respond(res)
+		log.infof("no route matched %s", method_string(line.method))
+		response.status = .Not_Found
+		respond(response)
 	}
 
-	return h
+	return result
 }
 
 route_get :: proc(router: ^Router, pattern: string, handler: Handler) {
@@ -199,24 +198,24 @@ route_add :: proc(router: ^Router, method: Method, route: Route) {
 }
 
 @(private)
-routes_try :: proc(routes: [dynamic]Route, req: ^Request, res: ^Response) -> bool {
-	try_captures: [match.MAX_CAPTURES]match.Match = ---
+routes_try :: proc(routes: [dynamic]Route, request: ^Request, response: ^Response) -> bool {
+	matches: [match.MAX_CAPTURES]match.Match = ---
 	for route in routes {
-		n, err := match.find_aux(req.url.path, route.pattern, 0, true, &try_captures)
+		count, err := match.find_aux(request.url.path, route.pattern, 0, true, &matches)
 		if err != .OK {
 			log.errorf("Error matching route: %v", err)
 			continue
 		}
 
-		if n > 0 {
-			captures := make([]string, n - 1, context.temp_allocator)
-			for cap, i in try_captures[1:n] {
-				captures[i] = req.url.path[cap.byte_start:cap.byte_end]
+		if count > 0 {
+			params := make([]string, count - 1, context.temp_allocator)
+			for capture, index in matches[1:count] {
+				params[index] = request.url.path[capture.byte_start:capture.byte_end]
 			}
 
-			req.url_params = captures
-			rh := route.handler
-			rh.handle(&rh, req, res)
+			request.url_params = params
+			route_handler := route.handler
+			route_handler.handle(&route_handler, request, response)
 			return true
 		}
 	}
