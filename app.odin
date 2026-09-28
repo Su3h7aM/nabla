@@ -113,6 +113,25 @@ snapshot_transcript_own :: proc(app: ^App) {
 	app.run.snap.entries.allocator = app.run.alloc
 }
 
+// snapshot_status_start publishes the launch's provider, model, and workspace into
+// the status block, each copied into the run's allocator. False means one of the
+// copies failed, and the launch stops rather than show a status that names nothing.
+snapshot_status_start :: proc(app: ^App) -> bool {
+	provider_id, provider_error := strings.clone(app.setup.provider_id, app.run.alloc)
+	model_id, model_error := strings.clone(app.setup.model_id, app.run.alloc)
+	workspace, workspace_error := strings.clone(app.setup.workspace, app.run.alloc)
+	if provider_error != nil || model_error != nil || workspace_error != nil {
+		delete(provider_id, app.run.alloc)
+		delete(model_id, app.run.alloc)
+		delete(workspace, app.run.alloc)
+		return false
+	}
+	app.run.snap.status.provider_id = provider_id
+	app.run.snap.status.model_id = model_id
+	app.run.snap.status.cwd = workspace
+	return true
+}
+
 // Snapshot is everything the renderer reads. The worker bumps generation
 // after any change; the main thread redraws when it moves.
 Snapshot :: struct {
@@ -120,8 +139,8 @@ Snapshot :: struct {
 	// entries_bytes is what the resident entries hold: each entry's own slot and
 	// the text it keeps, the number the transcript's budget is spent from.
 	entries_bytes:      int,
-	// transcript_failed records that a line could not be kept, so the run says
-	// so once instead of dropping lines quietly.
+	// transcript_failed records that the snapshot could not keep a line or a
+	// status field, so the run says so once instead of dropping values quietly.
 	transcript_failed:  bool,
 	// transcript_trimmed records that the transcript dropped old lines, so the
 	// notice is said once rather than at every drop.
@@ -382,13 +401,6 @@ tui_run :: proc(
 	// set before its first line. The slots grow with the transcript and are
 	// bounded by its budget.
 	snapshot_transcript_own(app)
-	app.run.snap.status.provider_id = strings.clone(app.setup.provider_id, app.run.alloc)
-	app.run.snap.status.model_id = strings.clone(app.setup.model_id, app.run.alloc)
-	// cwd is owned by the snapshot: a session switch replaces the workspace, and
-	// the footer reads the status under the lock, so a borrowed workspace would
-	// dangle as soon as the running session changed.
-	app.run.snap.status.cwd = strings.clone(app.setup.workspace, app.run.alloc)
-	app.run.snap.status.context_window = app.setup.session.capacity.window
 	// The resumed conversation is shown before the first prompt, so the screen
 	// matches the history the next request will be built from.
 	session_replay(app, &app.setup.session)
@@ -401,7 +413,24 @@ tui_run :: proc(
 		app_teardown(app)
 		return false
 	}
-	app.run.work, _ = chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
+	// The status is published only once the frame budget exists, so a failure here
+	// can still take the launch down through the same release path as every later
+	// one. cwd is owned by the snapshot because a session switch replaces the
+	// workspace and the footer reads the status under the lock, so a borrowed
+	// workspace would dangle as soon as the running session changed.
+	if !snapshot_status_start(app) {
+		fmt.eprintln("nabla: the status line could not be allocated")
+		app_teardown(app)
+		return false
+	}
+	app.run.snap.status.context_window = app.setup.session.capacity.window
+	work, work_error := chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
+	if work_error != nil {
+		fmt.eprintln("nabla: cannot create the command queue:", work_error)
+		app_teardown(app)
+		return false
+	}
+	app.run.work = work
 	app.run.steer = agent.steer_queue_init(app.run.alloc)
 
 	terminal, open_err := term.open({alternate_screen = true, hide_cursor = true, bracketed_paste = true, mouse = true, input_mode = .Raw}, app.run.alloc)
@@ -410,6 +439,8 @@ tui_run :: proc(
 		app_teardown(app)
 		return false
 	}
+	// The terminal is being released on the way out; a close failure changes
+	// nothing the run can do about it.
 	defer { _ = term.close(terminal) }
 	app.terminal = terminal
 
@@ -421,7 +452,13 @@ tui_run :: proc(
 	}
 	app.tty = tty
 	input.parser_init(&app.parser)
-	app.raw = make([dynamic]input.Event, 0, 16, app.run.alloc)
+	raw, raw_error := make([dynamic]input.Event, 0, 16, app.run.alloc)
+	if raw_error != nil {
+		fmt.eprintln("nabla: the input buffer could not be allocated")
+		app_teardown(app)
+		return false
+	}
+	app.raw = raw
 
 	if !apply_startup_selection(app, flag_provider, flag_model) {
 		fmt.eprintln("nabla:", setup_error_text(app))
@@ -448,7 +485,9 @@ tui_run :: proc(
 	worker.data = app
 	app.run.worker = worker
 	thread.start(worker)
-	_ = catalog_refresh_start(app, sources)
+	if !catalog_refresh_start(app, sources) {
+		snap_append(app, .Warning, "the catalog refresh could not be started; the catalog stays as it is")
+	}
 
 	if viewport, viewport_err := term.viewport(app.terminal); viewport_err == nil {
 		app.columns, app.rows = viewport.columns, viewport.rows
@@ -589,7 +628,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 	// ends, so what is left here reached no turn at all: the process is the last holder, and
 	// saying so is the only report an exiting front-end can give. This is the difference
 	// between input that was pending and input that was dropped.
-	if undelivered := agent.steer_take_all(&app.run.steer); len(undelivered) > 0 {
+	if undelivered, taken := agent.steer_take_all(&app.run.steer); taken && len(undelivered) > 0 {
 		fmt.eprintf("nabla: %d line(s) typed during a turn were never recorded; they were not delivered\n", len(undelivered))
 		agent.steer_taken_destroy(&app.run.steer, undelivered)
 	}

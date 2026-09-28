@@ -260,28 +260,29 @@ tool_write_atomic :: proc(
 			}
 			count, chunk_error := os.write(file, content[written:])
 			if chunk_error != nil {
-				os.close(file)
-				os.remove(temp_path)
+				// The write already failed, so the cleanup that follows reports nothing more.
+				_ = os.close(file)
+				_ = os.remove(temp_path)
 				return chunk_error, false
 			}
 			if count <= 0 {
-				os.close(file)
-				os.remove(temp_path)
+				_ = os.close(file)
+				_ = os.remove(temp_path)
 				return os.General_Error.Invalid_File, false
 			}
 			written += count
 		}
 		if close_error := os.close(file); close_error != nil {
-			os.remove(temp_path)
+			_ = os.remove(temp_path)
 			if cancelled_write { return nil, true }
 			return close_error, false
 		}
 		if cancelled_write || tool_control_cancelled(control) {
-			os.remove(temp_path)
+			_ = os.remove(temp_path)
 			return nil, true
 		}
 		if rename_error := os.rename(temp_path, path); rename_error != nil {
-			os.remove(temp_path)
+			_ = os.remove(temp_path)
 			return rename_error, false
 		}
 		return nil, false

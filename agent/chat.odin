@@ -416,7 +416,10 @@ chat_turn_drive :: proc(
 	steer: ^Steer_Context,
 	control: ^Turn_Control,
 ) -> bool {
-	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
+	// The turn's usage log holds nothing yet and allocates nothing; it carries the allocator
+	// the reports it collects grow from.
+	usages: [dynamic]Chat_Request_Usage
+	usages.allocator = chat.allocator
 	defer delete(usages)
 
 	if control != nil { control.stop.parent = &process_interrupt }

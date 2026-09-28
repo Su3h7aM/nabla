@@ -321,19 +321,22 @@ codemode_lua_unknown_tool :: proc "c" (state: ^lua.State, table_index, name_inde
 	run := codemode_lua_run(state)
 	context = codemode_lua_context(run)
 	temp := virtual.arena_temp_begin(&run.scratch)
-	names := make([dynamic]string, context.temp_allocator)
+	names, names_error := make([dynamic]string, context.temp_allocator)
 	lua.pushnil(state)
 	for lua.next(state, table_index) != 0 {
 		lua.pop(state, 1)
-		if name, is_text := codemode_lua_stack_string(state, -1); is_text { append(&names, name) }
+		name, is_text := codemode_lua_stack_string(state, -1)
+		if !is_text { continue }
+		if _, append_error := append(&names, name); append_error != nil { names_error = append_error }
 	}
 	slice.sort(names[:])
 	name, _ := codemode_lua_stack_string(state, name_index)
-	message := fmt.tprintf(
-		"no tool named %q; the tools are: %s. Use rawget(tools, name) to test whether a tool exists",
-		name,
-		strings.join(names[:], ", ", context.temp_allocator),
-	)
+	listed, list_error := strings.join(names[:], ", ", context.temp_allocator)
+	if names_error != nil || list_error != nil {
+		// The whole list is the point of the message, so an unlisted one says why it is missing.
+		return codemode_lua_raise(state, fmt.tprintf("no tool named %q; the tools could not be listed: out of memory", name), temp)
+	}
+	message := fmt.tprintf("no tool named %q; the tools are: %s. Use rawget(tools, name) to test whether a tool exists", name, listed)
 	return codemode_lua_raise(state, message, temp)
 }
 
@@ -503,11 +506,16 @@ codemode_lua_start :: proc(
 	allocation_error: mem.Allocator_Error
 	run, allocation_error = new(Lua_Run)
 	if allocation_error != nil { return nil, false }
+	logs, logs_error := make([dynamic]u8)
+	if logs_error != nil {
+		free(run)
+		return nil, false
+	}
 	run^ = Lua_Run {
 		allocator = allocator,
 		interrupt = interrupt,
 		request = {args_ref = lua.NOREF},
-		logs = make([dynamic]u8),
+		logs = logs,
 	}
 	if timeout > 0 { run.deadline = time.tick_add(time.tick_now(), timeout) }
 
@@ -584,10 +592,15 @@ codemode_lua_resume :: proc(run: ^Lua_Run) -> Lua_Event {
 }
 
 // codemode_lua_answer_error answers the pending request by raising message at the
-// script's line, where the script may catch it with pcall. message is copied.
-codemode_lua_answer_error :: proc(run: ^Lua_Run, message: string) {
+// script's line, where the script may catch it with pcall. message is copied, and it
+// reports false when there was no memory to copy it, so the caller can answer the parent
+// instead of raising a refusal the script cannot read.
+codemode_lua_answer_error :: proc(run: ^Lua_Run, message: string) -> bool {
+	kept, kept_error := strings.clone(message, run.allocator)
+	if kept_error != nil { return false }
 	run.answer = .Error
-	run.answer_message = strings.clone(message, run.allocator) or_else ""
+	run.answer_message = kept
+	return true
 }
 
 // codemode_lua_answer_handle answers job.start with the child's handle.
@@ -681,7 +694,10 @@ codemode_lua_settle_error :: proc(run: ^Lua_Run) -> Lua_Event {
 	defer delete(refusal)
 	if !is_text {
 		text = refusal == "" ? literal : string(lua.typename(run.thread, lua.type(run.thread, -1)))
-		text = strings.concatenate({"the script raised a non-string error: ", text}, context.temp_allocator)
+		prefixed, prefix_error := strings.concatenate({"the script raised a non-string error: ", text}, context.temp_allocator)
+		// The error value is still the reason the script failed, so a message that cannot be
+		// prefixed says what it is instead of reading as a failure with no cause.
+		text = prefixed if prefix_error == nil else "the script raised an error whose value could not be written: out of memory"
 	}
 	lua.L_traceback(run.state, run.thread, nil, 0)
 	traceback, _ := codemode_lua_stack_string(run.state, -1)
@@ -690,7 +706,11 @@ codemode_lua_settle_error :: proc(run: ^Lua_Run) -> Lua_Event {
 	allocated: bool
 	run.traceback, allocated = strings.replace_all(traceback, "\t", "")
 	// replace_all borrows its input when it replaces nothing, so the run takes its own copy.
-	if !allocated { run.traceback = strings.clone(run.traceback) or_else "" }
+	if !allocated {
+		copied, copy_error := strings.clone(run.traceback)
+		run.traceback = copied
+		if copy_error != nil { text = fmt.tprintf("%s (the traceback could not be kept: out of memory)", text) }
+	}
 	lua.pop(run.state, 1)
 	return codemode_lua_settle(run, .Failed, .Runtime, text)
 }
@@ -702,7 +722,13 @@ codemode_lua_settle :: proc(run: ^Lua_Run, event: Lua_Event, failure: Lua_Failur
 	run.failure = failure
 	run.last_event = event
 	delete(run.message, run.allocator)
-	run.message = strings.clone(message, run.allocator) or_else ""
+	kept, kept_error := strings.clone(message, run.allocator)
+	run.message = kept
+	if kept_error != nil {
+		// The run cannot say why it ended, so it is reported as a memory failure rather than
+		// as one whose message is empty.
+		run.failure = .Memory
+	}
 	return event
 }
 

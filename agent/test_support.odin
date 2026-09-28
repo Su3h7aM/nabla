@@ -52,6 +52,7 @@ chat_notice_log_begin :: proc(log: ^Chat_Notice_Log, allocator := context.alloca
 chat_notice_log_capture :: proc(user_data: rawptr, kind: Chat_Message_Kind, text: string) {
 	_ = kind
 	log := cast(^Chat_Notice_Log)user_data
+	// A notice that cannot be copied is not captured; the test's own count is what reports it.
 	append(&log.lines, strings.clone(text, log.allocator))
 }
 
@@ -97,12 +98,14 @@ chat_test_begin :: proc(test: ^testing.T, fixture: ^Chat_Test, workspace: string
 	tool_error: Tool_Registry_Error
 	fixture.chat, tool_error = chat_session_init(&fixture.store, session, journal.INITIAL_BRANCH, 0, workspace, context.allocator)
 	if tool_error.kind != .None { testing.fail_now(test, "the tool registry could not be created") }
-	fixture.chat.provider_id = chat_clone_string("test-provider", context.allocator)
-	fixture.chat.model_id = chat_clone_string("test-model", context.allocator)
+	fixture.chat.provider_id = chat_clone_string("test-provider", context.allocator) or_else ""
+	fixture.chat.model_id = chat_clone_string("test-model", context.allocator) or_else ""
 	fixture.chat.skill_instructions = test_skill_instructions(&fixture.chat)
 	// Kept outputs go under the fixture's own directory, never the user's state directory.
 	delete(fixture.chat.tool_output_directory, context.allocator)
-	fixture.chat.tool_output_directory, _ = os.join_path({directory, "tool-output"}, context.allocator)
+	tool_output_directory, join_error := os.join_path({directory, "tool-output"}, context.allocator)
+	if join_error != nil { testing.fail_now(test, "the tool output directory could not be allocated") }
+	fixture.chat.tool_output_directory = tool_output_directory
 }
 
 test_skill_instructions :: proc(chat: ^Chat_Session) -> string {
@@ -114,6 +117,7 @@ chat_test_end :: proc(test: ^testing.T, fixture: ^Chat_Test) {
 	if close_error := journal.close(&fixture.store); close_error != nil {
 		testing.expectf(test, false, "the journal did not close: %s", journal.error_text(close_error, context.temp_allocator))
 	}
+	// The fixture's directory is abandoned; a removal that fails changes nothing in a test.
 	_ = os.remove_all(fixture.directory)
 	delete(fixture.directory, context.allocator)
 	fixture^ = {}
@@ -221,12 +225,13 @@ _test_propose :: proc(
 _test_stage_call :: proc(test: ^testing.T, chat: ^Chat_Session, id, arguments: string, name := TOOL_SHELL_NAME) {
 	if chat.response_node == 0 { _test_response(test, chat, chat.request, "") }
 	call := _test_propose(test, chat, id, arguments, name, chat.request)
+	// A call that cannot be queued is not staged; the test's own assertions report it.
 	append(
 		&chat.pending_calls,
 		Chat_Tool_Call {
-			id = chat_clone_string(id, chat.allocator),
-			name = chat_clone_string(name, chat.allocator),
-			arguments = chat_clone_string(arguments, chat.allocator),
+			id = chat_clone_string(id, chat.allocator) or_else "",
+			name = chat_clone_string(name, chat.allocator) or_else "",
+			arguments = chat_clone_string(arguments, chat.allocator) or_else "",
 			call = call,
 		},
 	)

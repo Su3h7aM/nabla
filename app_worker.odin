@@ -126,7 +126,18 @@ session_refresh_rows :: proc(app: ^App) {
 	}
 	clear(&app.run.snap.sessions)
 	for &entry in sessions {
-		append(&app.run.snap.sessions, Session_Row{id = entry.id, title = strings.clone(entry.title, app.run.alloc)})
+		title, title_error := strings.clone(entry.title, app.run.alloc)
+		if title_error != nil {
+			// A row without its title would read as a session that has none, so
+			// the row is left out rather than mislabeled.
+			snap_report_dropped(app, title_error)
+			continue
+		}
+		if _, append_error := append(&app.run.snap.sessions, Session_Row{id = entry.id, title = title}); append_error != nil {
+			delete(title, app.run.alloc)
+			snap_report_dropped(app, append_error)
+			break
+		}
 	}
 	// The running session is published with the list, so the menu can open on it
 	// without reading the running session from another thread.
@@ -180,14 +191,12 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	case .Status:
 		agent.chat_notice_status(&app.setup.session, observer, time.to_unix_nanoseconds(time.now()) / i64(time.Millisecond))
 	case .Effort:
-		applied := true
-		if work.text == "" || work.text == "default" {
-			_ = agent.chat_session_set_effort(&app.setup.session, "")
-			snap_append(app, .Notice, agent.chat_effort_change_note(""))
-		} else if agent.chat_session_set_effort(&app.setup.session, work.text) {
-			snap_append(app, .Notice, agent.chat_effort_change_note(work.text))
+		cleared := work.text == "" || work.text == "default"
+		level := "" if cleared else work.text
+		applied := agent.chat_session_set_effort(&app.setup.session, level)
+		if applied {
+			snap_append(app, .Notice, agent.chat_effort_change_note(level))
 		} else {
-			applied = false
 			snap_append(app, .Notice, fmt.tprintf("effort %s is not allowed for this model", work.text))
 		}
 		// The effort is part of the persisted selection, so a change rewrites it.
@@ -205,9 +214,17 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		apply_pending_selection(app)
 	case .New_Session:
 		rows_dirty = true
-		// The new session runs the same selection; only the conversation is new.
-		provider := strings.clone(app.setup.provider_id, app.run.alloc)
-		model := strings.clone(app.setup.model_id, app.run.alloc)
+		// The new session runs the same selection; only the conversation is new. The
+		// selection is copied first because the switch replaces it, and a session
+		// opened without one could not run a turn.
+		provider, provider_error := strings.clone(app.setup.provider_id, app.run.alloc)
+		model, model_error := strings.clone(app.setup.model_id, app.run.alloc)
+		if provider_error != nil || model_error != nil {
+			delete(provider, app.run.alloc)
+			delete(model, app.run.alloc)
+			snap_append(app, .Error, "a new session could not be started: its model could not be allocated")
+			break
+		}
 		defer delete(provider, app.run.alloc)
 		defer delete(model, app.run.alloc)
 		if session_switch(app, {kind = .New}) {
@@ -443,10 +460,7 @@ refresh_status :: proc(app: ^App) {
 			status.session_hit_partial = true
 		}
 	}
-	if status.cwd != running.workspace {
-		delete(status.cwd, app.run.alloc)
-		status.cwd = strings.clone(running.workspace, app.run.alloc)
-	}
+	snap_status_replace(app, &status.cwd, running.workspace)
 	was_running := status.running
 	status.running = running.state != .Idle
 	if status.running && !was_running {
@@ -455,19 +469,25 @@ refresh_status :: proc(app: ^App) {
 	// A retry belongs to the turn that scheduled it. A turn that is no longer running has
 	// none, so the working indicator cannot keep showing the attempt it waited for.
 	if !status.running { status.retry_present = false }
-	if status.provider_id != app.setup.provider_id {
-		delete(status.provider_id, app.run.alloc)
-		status.provider_id = strings.clone(app.setup.provider_id, app.run.alloc)
-	}
-	if status.model_id != app.setup.model_id {
-		delete(status.model_id, app.run.alloc)
-		status.model_id = strings.clone(app.setup.model_id, app.run.alloc)
-	}
-	if status.effort != running.effort {
-		delete(status.effort, app.run.alloc)
-		status.effort = strings.clone(running.effort, app.run.alloc)
-	}
+	snap_status_replace(app, &status.provider_id, app.setup.provider_id)
+	snap_status_replace(app, &status.model_id, app.setup.model_id)
+	snap_status_replace(app, &status.effort, running.effort)
 	app.run.snap.generation += 1
+}
+
+// snap_status_replace replaces one owned status string with a copy of text, keeping
+// the value already published when the copy fails, so the footer never loses a fact
+// because memory ran out. The caller may hold the runtime mutex; nothing here takes
+// it. The failure is reported by the one snapshot allocation report.
+snap_status_replace :: proc(app: ^App, field: ^string, text: string) {
+	if field^ == text { return }
+	cloned, clone_error := strings.clone(text, app.run.alloc)
+	if clone_error != nil {
+		snap_report_dropped(app, clone_error)
+		return
+	}
+	delete(field^, app.run.alloc)
+	field^ = cloned
 }
 
 // --- hooks into the snapshot ----------------------------------------------
@@ -502,8 +522,12 @@ runtime_model_selected :: proc(app: ^App) -> bool {
 // is the lifetime of one keypress on the front-end.
 runtime_selection_provider :: proc(app: ^App) -> string {
 	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
-	return strings.clone(app.run.snap.status.provider_id, context.temp_allocator)
+	provider, provider_error := strings.clone(app.run.snap.status.provider_id, context.temp_allocator)
+	sync.mutex_unlock(&app.run.mu)
+	if provider_error != nil {
+		snap_report_dropped(app, provider_error)
+	}
+	return provider
 }
 
 generation_changed :: proc(app: ^App) -> bool {
@@ -567,9 +591,11 @@ snap_entry_append_text :: proc(app: ^App, entry: ^Entry, text: string) {
 	snap_entry_account(entry)
 }
 
-// snap_report_dropped says once that the transcript could not hold a line. The
-// line's record is already in the store, so only its display is lost, and the
-// run continues without a screen that quietly disagrees with what it kept.
+// snap_report_dropped says once that the snapshot could not keep a value it was
+// building, whether a transcript line or a status field. What is left out stays
+// out rather than being shown as an empty value, and the run continues without a
+// screen that quietly disagrees with what it kept. One report per run is what
+// keeps a failing allocator from filling the log.
 snap_report_dropped :: proc(app: ^App, alloc_error: mem.Allocator_Error) {
 	if app.run.snap.transcript_failed { return }
 	app.run.snap.transcript_failed = true

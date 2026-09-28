@@ -164,6 +164,9 @@ Render_Status :: enum u8 {
 	Too_Small,
 	Layout_Failed,
 	Buffer_Too_Small,
+	// The frame could not be composed because an allocation failed; the next
+	// frame retries with a reset temp pool.
+	Allocation_Failed,
 }
 
 // Frame_Storage is the caller-owned frame budget: the cell grid backing, the
@@ -207,6 +210,8 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 }
 
 frame_storage_destroy :: proc(storage: ^Frame_Storage) {
+	// A launch that could not allocate the budget has none to release.
+	if storage == nil { return }
 	if storage.cells != nil { delete(storage.cells, storage.alloc) }
 	if storage.output != nil { delete(storage.output, storage.alloc) }
 	layout.destroy(&storage.layout_ctx)
@@ -287,7 +292,10 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 		width  = max(cols - 2, 0),
 		height = rows,
 	}
-	input_rows := input_visible_rows(&app.input, input_content_width(app))
+	input_rows, input_rows_error := input_visible_rows(&app.input, input_content_width(app))
+	if input_rows_error != nil {
+		return {}, .Allocation_Failed
+	}
 	heights := [4]int{-1, input_rows + 2, 1, 1}
 	regions: [4]tui.Cell_Rect
 	if !tui.rows(content, heights[:], regions[:]) {
@@ -313,7 +321,11 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 		if !draw_conversation(app, storage, conv_rect) {
 			return {}, .Layout_Failed
 		}
-		cursor = draw_input(app, storage, input_rect)
+		drawn_cursor, draw_error := draw_input(app, storage, input_rect)
+		if draw_error != nil {
+			return {}, .Allocation_Failed
+		}
+		cursor = drawn_cursor
 	}
 	draw_footer(app, storage, cwd_rect, status_rect)
 	return cursor, .None
@@ -530,12 +542,14 @@ selection_row_range :: proc(app: ^App, row, columns: int) -> (first, last: int) 
 // selection_text reads the selected cells back as text: one line per transcript
 // row, with each line's trailing blanks trimmed, because the frame pads a line
 // out to its box and that padding is not what the user picked. The returned
-// string is allocated with `allocator` and owned by the caller.
-selection_text :: proc(app: ^App, storage: ^Frame_Storage, allocator: mem.Allocator) -> string {
-	if storage == nil || storage.buffer.cells == nil { return "" }
+// string is allocated with `allocator` and owned by the caller. False means the
+// text could not be built, which is distinct from an empty selection.
+selection_text :: proc(app: ^App, storage: ^Frame_Storage, allocator: mem.Allocator) -> (text: string, ok: bool) {
+	if storage == nil || storage.buffer.cells == nil { return "", true }
 	start, end := selection_bounds(app)
 	buffer := storage.buffer
-	builder := strings.builder_make(allocator)
+	builder, builder_error := strings.builder_make(allocator)
+	if builder_error != nil { return "", false }
 	for row in max(start.y, 0) ..= min(end.y, buffer.rows - 1) {
 		first, last := selection_row_range(app, row, buffer.columns)
 		for last >= first {
@@ -547,7 +561,7 @@ selection_text :: proc(app: ^App, storage: ^Frame_Storage, allocator: mem.Alloca
 			strings.write_string(&builder, buffer.cells[selection_index(app, buffer, row, column)].grapheme)
 		}
 	}
-	return strings.to_string(builder)
+	return strings.to_string(builder), true
 }
 
 selection_index :: proc(app: ^App, buffer: term.Frame_Buffer, row, column: int) -> int {
@@ -811,10 +825,25 @@ draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	if rect.height <= 0 || rect.width <= 0 {
 		return
 	}
-	lines := make([dynamic]Line, 0, 64, context.temp_allocator)
-	append(&lines, Line{text = app.menu.title, style = TITLE_STYLE})
+	lines, lines_error := make([dynamic]Line, 0, 64, context.temp_allocator)
+	if lines_error != nil {
+		snap_report_dropped(app, lines_error)
+		return
+	}
+	if _, append_error := append(&lines, Line{text = app.menu.title, style = TITLE_STYLE}); append_error != nil {
+		snap_report_dropped(app, append_error)
+		return
+	}
 	if setup_error := setup_error_text(app); setup_error != "" {
-		append(&lines, Line{text = strings.clone(setup_error, context.temp_allocator), style = ERROR_TEXT})
+		cloned, clone_error := strings.clone(setup_error, context.temp_allocator)
+		if clone_error != nil {
+			snap_report_dropped(app, clone_error)
+			return
+		}
+		if _, append_error := append(&lines, Line{text = cloned, style = ERROR_TEXT}); append_error != nil {
+			snap_report_dropped(app, append_error)
+			return
+		}
 	}
 	cursor := app.menu.cursor
 	if cursor >= len(app.menu.choices) {
@@ -823,10 +852,15 @@ draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	for choice, index in app.menu.choices {
 		marker := "> " if index == cursor else "  "
 		style := PICKED_STYLE if index == cursor else HINT_STYLE
+		text: string
 		if choice.detail != "" {
-			append(&lines, Line{text = fmt.tprintf("%s%-24s %s", marker, choice.label, choice.detail), style = style})
+			text = fmt.tprintf("%s%-24s %s", marker, choice.label, choice.detail)
 		} else {
-			append(&lines, Line{text = fmt.tprintf("%s%s", marker, choice.label), style = style})
+			text = fmt.tprintf("%s%s", marker, choice.label)
+		}
+		if _, append_error := append(&lines, Line{text = text, style = style}); append_error != nil {
+			snap_report_dropped(app, append_error)
+			return
 		}
 	}
 	total := len(lines)
@@ -957,16 +991,19 @@ draw_rule :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	tui.fill(&storage.buffer, rect, "─", RULE_STYLE)
 }
 
-input_visible_rows :: proc(input: ^widgets.Input, width: int) -> int {
-	lines := widgets.input_lines(input, width)
-	return clamp(len(lines), 1, INPUT_MAX_ROWS)
+input_visible_rows :: proc(input: ^widgets.Input, width: int) -> (rows: int, err: mem.Allocator_Error) {
+	lines, lines_error := widgets.input_lines(input, width)
+	if lines_error != nil {
+		return 1, lines_error
+	}
+	return clamp(len(lines), 1, INPUT_MAX_ROWS), nil
 }
 
 // draw_input draws a rounded prompt box and returns the caret. The box grows
 // through five content rows; after that the rows scroll around the caret, which
 // is the widget's own window (draw_input).
-draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> term.Cursor {
-	if rect.height < 3 || rect.width <= 4 { return {} }
+draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> (cursor: term.Cursor, err: mem.Allocator_Error) {
+	if rect.height < 3 || rect.width <= 4 { return {}, nil }
 	border_style := RULE_STYLE
 	widgets.draw_block(&storage.buffer, rect, widgets.Block{border = widgets.BORDER_ROUNDED, style = border_style})
 	if app.run.snap.status.running {
@@ -984,7 +1021,7 @@ draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> t
 		width  = rect.width - 4,
 		height = rect.height - 2,
 	}
-	if content.width <= 0 || content.height <= 0 { return {} }
+	if content.width <= 0 || content.height <= 0 { return {}, nil }
 	return widgets.draw_input(&storage.buffer, content, &app.input, INPUT_TEXT)
 }
 
@@ -993,7 +1030,12 @@ draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> t
 draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: tui.Cell_Rect) {
 	if cwd_rect.height > 0 && cwd_rect.width > 0 {
 		directory := text.truncate_text(shorten_home(app, app.run.snap.status.cwd), cwd_rect.width)
-		_, _ = tui.draw_text(&storage.buffer, cwd_rect, strings.clone(directory, context.temp_allocator), FOOTER_TEXT)
+		shown, clone_error := strings.clone(directory, context.temp_allocator)
+		if clone_error != nil {
+			snap_report_dropped(app, clone_error)
+		} else {
+			_, _ = tui.draw_text(&storage.buffer, cwd_rect, shown, FOOTER_TEXT)
+		}
 	}
 	if status_rect.height <= 0 || status_rect.width <= 0 {
 		return

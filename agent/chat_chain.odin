@@ -695,7 +695,14 @@ chat_chain_apply_event :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Reque
 @(private)
 chat_session_observe_usage :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage, usage: ai.Provider_Usage_Event) {
 	if usage.Input_Tokens_Present { chat.last_input_measured = usage.Input_Tokens }
-	append(usages, Chat_Request_Usage{operation = u64(chat.operation.id), usage = usage})
+	if _, append_error := append(usages, Chat_Request_Usage{operation = u64(chat.operation.id), usage = usage}); append_error == nil { return }
+	// The record of the send is missing the numbers this report carried, and ending the turn
+	// would not bring them back: the log line is what records the loss.
+	binding: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
+	context.logger = log_rebind(&binding, log_correlation_for(chat, chat.chain.attempts))
+	log_emit({level = .Error, category = .Provider, event = "request.usage_lost"})
 }
 
 // chat_chain_settle turns the terminal outcome into the next stage. The row is finished

@@ -136,7 +136,10 @@ tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_
 		return tool_result_failure(ctx, .Tool_Failed, message, "input required")
 	}
 
-	blocks := make([dynamic]MCP_Block, 0, len(call.content), context.temp_allocator)
+	blocks, blocks_error := make([dynamic]MCP_Block, 0, len(call.content), context.temp_allocator)
+	if blocks_error != nil {
+		return tool_result_failure(ctx, .Tool_Failed, "the server's reply could not be prepared: out of memory", "out of memory")
+	}
 	for content in call.content {
 		block := MCP_Block {
 			type = content.type_name,
@@ -146,7 +149,9 @@ tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_
 		} else {
 			block.detail = tool_mcp_omitted_detail(content, context.temp_allocator)
 		}
-		append(&blocks, block)
+		if _, append_error := append(&blocks, block); append_error != nil {
+			return tool_result_failure(ctx, .Tool_Failed, "the server's reply could not be prepared: out of memory", "out of memory")
+		}
 	}
 
 	outcome := journal.Tool_Outcome.Success
@@ -192,7 +197,7 @@ tool_mcp_error_result :: proc(ctx: ^Tool_Context, backend: ^MCP_Tool_Backend, er
 	// The message is assembled in temp memory and cloned into the result.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	outcome, reason := tool_mcp_outcome(err)
-	message := mcp.error_text(err, context.temp_allocator)
+	message := mcp.error_text(err, context.temp_allocator) or_else "the failure could not be described"
 	if err.stderr_tail != "" {
 		message = fmt.tprintf("%s; the server's last output was: %s", message, err.stderr_tail)
 	}

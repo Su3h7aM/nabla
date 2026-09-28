@@ -157,7 +157,12 @@ projection_load :: proc(
 					call    = call,
 					content = string(record.body),
 				}
-				result.outcome, _ = journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
+				// A result whose outcome is not a name this build writes is a record it cannot
+				// read: left at the zero member it would report an unreadable record as a call
+				// whose outcome nobody knows.
+				outcome, known := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
+				if !known { return {}, journal.Journal_Error.Corrupt }
+				result.outcome = outcome
 				if result.content == "" { result.content = completion.detail }
 				append(&items, Projection_Item{node = node.id, turn = node.turn, payload = result}) or_return
 			}

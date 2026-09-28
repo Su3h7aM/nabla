@@ -286,7 +286,7 @@ test_an_unpublished_nested_tool_job_frees_with_worker_allocator :: proc(test: ^t
 	parent := Tool_Job {
 		placement = .Lua,
 		allocator = context.allocator,
-		call_id   = chat_clone_string("parent", context.allocator),
+		call_id   = chat_clone_string("parent", context.allocator) or_else "",
 		lua       = run,
 		call      = &call,
 		turn_id   = chat.active_turn_id,

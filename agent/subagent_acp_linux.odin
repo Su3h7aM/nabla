@@ -28,6 +28,7 @@ acp_input_open :: proc() -> (input: Acp_Input, ok: bool) {
 		open   = true,
 	}
 	if input.theirs == nil {
+		// No file wraps the pair, so both ends are abandoned descriptors.
 		_ = linux.close(pair[0])
 		_ = linux.close(pair[1])
 		return {}, false
@@ -35,7 +36,8 @@ acp_input_open :: proc() -> (input: Acp_Input, ok: bool) {
 	return input, true
 }
 
-// acp_input_close closes this side, which the agent reads as the end of its input.
+// acp_input_close closes this side, which the agent reads as the end of its input. Releasing
+// the descriptors is teardown: a close that fails changes nothing about the input ending.
 @(private)
 acp_input_close :: proc(input: ^Acp_Input) {
 	if input.theirs != nil { _ = os.close(input.theirs) }

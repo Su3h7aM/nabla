@@ -1,6 +1,7 @@
 package agent
 
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 
 import "nabla:agent/journal"
@@ -18,7 +19,12 @@ Codemode_Child :: struct {
 @(private)
 tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job) {
 	args := job.arguments.(Codemode_Args)
-	job.lua_children = make([dynamic]Codemode_Child, job.allocator)
+	children, children_error := make([dynamic]Codemode_Child, job.allocator)
+	if children_error != nil {
+		codemode_job_answer(job, .Tool_Failed, .Out_Of_Memory, "the Code Mode execution could not be tracked: out of memory", "out of memory")
+		return
+	}
+	job.lua_children = children
 	run, compiled := codemode_lua_start(args.code, &job.interrupt, args.timeout, job.allocator)
 	if run == nil {
 		codemode_job_answer(job, .Tool_Failed, .Unavailable, "the Lua execution could not be allocated", "executor unavailable")
@@ -68,8 +74,12 @@ codemode_job_request :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_J
 		handle, refusal = codemode_job_start_child(jobs, chat, job)
 		if job.result_present { return }
 		if refusal != "" {
-			codemode_lua_answer_error(run, refusal)
+			answered := codemode_lua_answer_error(run, refusal)
 			delete(refusal, run.allocator)
+			if !answered {
+				codemode_job_answer(job, .Tool_Failed, .Out_Of_Memory, "the refusal could not be handed to the script: out of memory", "out of memory")
+				return
+			}
 			job.phase = .Queued
 			return
 		}
@@ -81,7 +91,11 @@ codemode_job_request :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_J
 	}
 
 	if handle < 1 || handle > len(job.lua_children) || job.lua_children[handle - 1].consumed {
-		codemode_lua_answer_error(run, fmt.tprintf("job.wait was given %d, which is not a handle from job.start that has not been waited on yet", handle))
+		message := fmt.tprintf("job.wait was given %d, which is not a handle from job.start that has not been waited on yet", handle)
+		if !codemode_lua_answer_error(run, message) {
+			codemode_job_answer(job, .Tool_Failed, .Out_Of_Memory, "the refusal could not be handed to the script: out of memory", "out of memory")
+			return
+		}
 		job.phase = .Queued
 		return
 	}
@@ -136,24 +150,30 @@ codemode_job_start_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: 
 		return
 	}
 	child^ = {
-		id = jobs.next_id,
-		turn_id = parent.turn_id,
-		ordinal = len(jobs.jobs),
+		id        = jobs.next_id,
+		turn_id   = parent.turn_id,
+		ordinal   = len(jobs.jobs),
 		placement = .Worker,
-		phase = .Queued,
+		phase     = .Queued,
 		allocator = allocator,
-		parent = parent,
-		nested = true,
-		nested_call = {
-			id = strings.clone(call_id, allocator),
-			name = strings.clone(name, allocator),
-			arguments = strings.clone(arguments, allocator),
-			call = call,
-		},
+		parent    = parent,
+		nested    = true,
 	}
 	child.call = &child.nested_call
-	child.name = strings.clone(name, allocator)
-	child.call_id = strings.clone(call_id, allocator)
+	child.nested_call.call = call
+	clone_error: mem.Allocator_Error
+	child.nested_call.id, clone_error = strings.clone(call_id, allocator)
+	if clone_error == nil { child.nested_call.name, clone_error = strings.clone(name, allocator) }
+	if clone_error == nil { child.nested_call.arguments, clone_error = strings.clone(arguments, allocator) }
+	if clone_error == nil { child.name, clone_error = strings.clone(name, allocator) }
+	if clone_error == nil { child.call_id, clone_error = strings.clone(call_id, allocator) }
+	if clone_error != nil {
+		// A child the harness cannot name is never published, so releasing it here releases
+		// every copy it already owns.
+		tool_job_release(child)
+		codemode_job_answer(parent, .Tool_Failed, .Out_Of_Memory, "the nested tool call could not be allocated: out of memory", "out of memory")
+		return
+	}
 	tool_job_admit(jobs, chat, {}, child)
 	if !tool_jobs_publish(jobs, child) {
 		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool job could not be admitted", "allocation failed")

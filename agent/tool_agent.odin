@@ -2,6 +2,7 @@ package agent
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 
 TOOL_AGENT_SPAWN_NAME :: "agent_spawn"
@@ -105,20 +106,31 @@ tool_registry_describe_agents :: proc(registry: ^Tool_Registry, agents: []ACP_Ag
 		if definition.kind == .Agent_Spawn { index = position }
 	}
 	if index < 0 { return {} }
-	parts := make([dynamic]string, 0, 2 + 4 * len(agents), context.temp_allocator)
-	append(&parts, TOOL_AGENT_SPAWN_DESCRIPTION)
-	if len(agents) == 0 { append(&parts, " No ACP agents are configured, so leave acp_agent out.") }
-	if len(agents) > 0 { append(&parts, " Configured ACP agents:") }
-	for agent in agents {
-		append(&parts, "\n- ", agent.name)
-		if agent.description != "" { append(&parts, ": ", agent.description) }
+	parts, parts_error := make([dynamic]string, 0, 2 + 4 * len(agents), context.temp_allocator)
+	if parts_error != nil { return {kind = .Allocation, tool = TOOL_AGENT_SPAWN_NAME, detail = "the description could not be built"} }
+	if describe_error := tool_agent_description_parts(&parts, agents); describe_error != nil {
+		return {kind = .Allocation, tool = TOOL_AGENT_SPAWN_NAME, detail = "the description could not be built"}
 	}
 	description, allocation_error := strings.concatenate(parts[:], registry.allocator)
-	if allocation_error != nil { return {kind = .Allocation} }
+	if allocation_error != nil { return {kind = .Allocation, tool = TOOL_AGENT_SPAWN_NAME, detail = "the description could not be built"} }
 	definition := &registry.definitions[index]
 	delete(definition.description, registry.allocator)
 	definition.description = description
 	return {}
+}
+
+// tool_agent_description_parts collects the parts of the spawn description, naming the
+// configured ACP agents. The parts borrow agents.
+@(private = "file")
+tool_agent_description_parts :: proc(parts: ^[dynamic]string, agents: []ACP_Agent_Config) -> mem.Allocator_Error {
+	append(parts, TOOL_AGENT_SPAWN_DESCRIPTION) or_return
+	if len(agents) == 0 { append(parts, " No ACP agents are configured, so leave acp_agent out.") or_return }
+	if len(agents) > 0 { append(parts, " Configured ACP agents:") or_return }
+	for agent in agents {
+		append(parts, "\n- ", agent.name) or_return
+		if agent.description != "" { append(parts, ": ", agent.description) or_return }
+	}
+	return nil
 }
 
 // TOOL_AGENT_ORCHESTRATOR_ONLY is what a subagent is told when it tries to manage subagents.

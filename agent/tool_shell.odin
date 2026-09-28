@@ -114,13 +114,14 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 
 	stdout_read, stdout_write, stdout_error := os.pipe()
 	if stdout_error != nil { return tool_shell_not_started(ctx, stdout_error, data) }
-	defer os.close(stdout_read)
+	// The drain reports its own failure; closing the read ends it in every case.
+	defer _ = os.close(stdout_read)
 	stderr_read, stderr_write, stderr_error := os.pipe()
 	if stderr_error != nil {
 		_ = os.close(stdout_write)
 		return tool_shell_not_started(ctx, stderr_error, data)
 	}
-	defer os.close(stderr_read)
+	defer _ = os.close(stderr_read)
 	child, spawn, spawn_error := tool_shell_start(args.command, directory, stdout_write, stderr_write)
 	_ = os.close(stdout_write)
 	_ = os.close(stderr_write)

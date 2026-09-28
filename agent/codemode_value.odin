@@ -68,11 +68,13 @@ codemode_lua_convert :: proc(
 	out_of_memory: bool,
 ) {
 	context.allocator = allocator
+	builder, builder_error := strings.builder_make(allocator)
+	if builder_error != nil { return "", codemode_value_allocation_message(allocator), true }
 	walk := Codemode_Walk {
 		run      = run,
 		state    = state,
 		notation = notation,
-		builder  = strings.builder_make(),
+		builder  = builder,
 	}
 	if codemode_walk_value(&walk, lua.absindex(state, index), 0) { return strings.to_string(walk.builder), "", false }
 	strings.builder_destroy(&walk.builder)
@@ -81,28 +83,50 @@ codemode_lua_convert :: proc(
 	return "", refusal, walk.out_of_memory
 }
 
+// codemode_walk_text writes one part of a refusal message. A builder write that holds fewer
+// bytes than it was given ran out of memory, so the whole message is refused rather than
+// handed over with a part of it missing.
+@(private)
+codemode_walk_text :: proc(builder: ^strings.Builder, text: string) -> (written: int, err: runtime.Allocator_Error) #optional_allocator_error {
+	if text == "" { return }
+	written = strings.write_string(builder, text)
+	if written != len(text) { err = .Out_Of_Memory }
+	return
+}
+
 // codemode_walk_message says what the walk refused, where it refused it, and why. The text
 // is owned by allocator.
 @(private)
-codemode_walk_message :: proc(walk: ^Codemode_Walk, allocator: runtime.Allocator) -> (string, runtime.Allocator_Error) {
+codemode_walk_message :: proc(walk: ^Codemode_Walk, allocator: runtime.Allocator) -> (text: string, err: runtime.Allocator_Error) {
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return "", builder_error }
-	strings.write_string(&builder, "the ")
-	strings.write_string(&builder, walk.subject)
+	transferred := false
+	defer if !transferred { strings.builder_destroy(&builder) }
+	codemode_walk_text(&builder, "the ") or_return
+	codemode_walk_text(&builder, walk.subject) or_return
 	if walk.failure_count > 0 {
-		strings.write_string(&builder, " at ")
+		codemode_walk_text(&builder, " at ") or_return
 		for step, position in walk.path[:walk.failure_count] {
 			if step.index > 0 {
 				fmt.sbprintf(&builder, "[%d]", step.index)
 				continue
 			}
-			if position > 0 { strings.write_byte(&builder, '.') }
-			strings.write_string(&builder, step.name)
+			if position > 0 { codemode_walk_text(&builder, ".") or_return }
+			codemode_walk_text(&builder, step.name) or_return
 		}
 	}
-	strings.write_byte(&builder, ' ')
-	strings.write_string(&builder, walk.problem)
+	codemode_walk_text(&builder, " ") or_return
+	codemode_walk_text(&builder, walk.problem) or_return
+	transferred = true
 	return strings.to_string(builder), nil
+}
+
+// codemode_value_allocation_message is what the value boundary tells a caller when it had no
+// memory to write the text it was asked for. The caller's allocator owns the message, so the
+// caller releases it the way it releases a converted value.
+@(private)
+codemode_value_allocation_message :: proc(allocator: runtime.Allocator) -> string {
+	return fmt.aprintf("the value could not be written: out of memory", allocator = allocator)
 }
 
 // codemode_lua_request_arguments writes the pending request's table as the JSON arguments
@@ -111,7 +135,11 @@ codemode_walk_message :: proc(walk: ^Codemode_Walk, allocator: runtime.Allocator
 // allocator.
 codemode_lua_request_arguments :: proc(run: ^Lua_Run) -> (text: string, message: string) {
 	context.allocator = run.allocator
-	if run.request.args_ref == lua.NOREF { return strings.clone("{}"), "" }
+	if run.request.args_ref == lua.NOREF {
+		empty, empty_error := strings.clone("{}")
+		if empty_error != nil { return "", fmt.aprintf("the call's arguments could not be allocated: out of memory", allocator = run.allocator) }
+		return empty, ""
+	}
 	lua.rawgeti(run.thread, lua.REGISTRYINDEX, lua.Integer(run.request.args_ref))
 	defer lua.pop(run.thread, 1)
 	text, message, _ = codemode_lua_convert(run, run.thread, -1, .JSON)
@@ -130,9 +158,13 @@ codemode_lua_returned_literal :: proc(run: ^Lua_Run) -> (literal: string, messag
 	context.allocator = run.allocator
 	switch {
 	case run.returned_values == 0:
-		return strings.clone("nil"), "", .None
+		none, none_error := strings.clone("nil")
+		if none_error != nil { return "", codemode_value_allocation_message(run.allocator), .Out_Of_Memory }
+		return none, "", .None
 	case run.returned_values > 1:
-		return "", strings.clone("the chunk returned more than one value; return one table instead"), .Invalid_Value
+		refusal, refusal_error := strings.clone("the chunk returned more than one value; return one table instead")
+		if refusal_error != nil { return "", codemode_value_allocation_message(run.allocator), .Out_Of_Memory }
+		return "", refusal, .Invalid_Value
 	}
 	out_of_memory: bool
 	literal, message, out_of_memory = codemode_lua_convert(run, run.thread, -1, .Lua)
@@ -317,6 +349,7 @@ codemode_walk_object :: proc(walk: ^Codemode_Walk, table: c.int, count, depth: i
 	lua.pushnil(state)
 	for lua.next(state, table) != 0 {
 		lua.pop(state, 1)
+		// codemode_walk_table admitted this table only because every key of it is a string.
 		names[position], _ = codemode_lua_stack_string(state, -1)
 		position += 1
 	}
@@ -404,7 +437,11 @@ codemode_lua_json_encode :: proc "c" (state: ^lua.State) -> c.int {
 	temp := virtual.arena_temp_begin(&run.scratch)
 	lua.settop(state, 1)
 	text, message, _ := codemode_lua_convert(run, state, 1, .JSON, allocator = context.temp_allocator)
-	if message != "" { return codemode_lua_raise(state, strings.concatenate({"json.encode refused ", message}, context.temp_allocator), temp) }
+	if message != "" {
+		refusal, refusal_error := strings.concatenate({"json.encode refused ", message}, context.temp_allocator)
+		if refusal_error != nil { return codemode_lua_raise(state, "json.encode refused the value: out of memory", temp) }
+		return codemode_lua_raise(state, refusal, temp)
+	}
 	codemode_lua_push_string(state, text)
 	virtual.arena_temp_end(temp)
 	return 1

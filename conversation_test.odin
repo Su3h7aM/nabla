@@ -843,7 +843,9 @@ test_selection_text_reads_the_dragged_rows :: proc(t: ^testing.T) {
 	}
 	_, frame_error := render_frame(app, app.storage)
 	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
-	testing.expect_value(t, selection_text(app, app.storage, context.temp_allocator), "alpha\n\nbeta")
+	text, text_ok := selection_text(app, app.storage, context.temp_allocator)
+	testing.expect(t, text_ok)
+	testing.expect_value(t, text, "alpha\n\nbeta")
 
 	// The same drag backwards covers the same rows.
 	app.selection_anchor = Cell_Point {
@@ -854,7 +856,9 @@ test_selection_text_reads_the_dragged_rows :: proc(t: ^testing.T) {
 		x = 0,
 		y = 0,
 	}
-	testing.expect_value(t, selection_text(app, app.storage, context.temp_allocator), "alpha\n\nbeta")
+	text, text_ok = selection_text(app, app.storage, context.temp_allocator)
+	testing.expect(t, text_ok)
+	testing.expect_value(t, text, "alpha\n\nbeta")
 }
 
 // The drag follows the mouse: a press in the transcript anchors it, the motion

@@ -122,51 +122,112 @@ chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attemp
 
 // chat_worker_event is the transport callback. The transport frees the event it hands over
 // as soon as this returns, so everything worth keeping is copied into an owned Chat_Event
-// and pushed to the owner.
+// and pushed to the owner. The callback has no error to return, so a copy or a push that
+// fails is reported to the owner as a response it cannot use: a fact the response carried
+// that the worker could not keep is what tells the owner nothing in it may be trusted.
 @(private)
 chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	runtime := cast(^Chat_Worker_Runtime)user_data
 	worker := runtime.worker
 	#partial switch value in event {
 	case ai.Provider_Text_Event:
-		chat_worker_push(worker, Chat_Text_Event{source = runtime.source, text = strings.clone(value.Text, worker.allocator)})
+		text, clone_error := strings.clone(value.Text, worker.allocator)
+		if clone_error != nil {
+			chat_worker_lost(worker, runtime.source, "the response text")
+			return
+		}
+		chat_worker_deliver(worker, runtime.source, Chat_Text_Event{source = runtime.source, text = text}, "the response text")
 	case ai.Provider_Reasoning_Event:
 	// Reasoning is opaque replay material. The stored response is what replays it, so
 	// the owner never needs the live copy.
 	case ai.Provider_Completed_Event:
 		runtime.finish_reason = value.Reason
-		completion := Chat_Provider_Completion {
-			source      = runtime.source,
-			reason      = value.Reason,
-			reason_text = strings.clone(value.Reason_Text, worker.allocator),
-			output      = strings.clone(value.Raw_Output, worker.allocator),
+		completion, kept := chat_worker_completion(worker, runtime.source, value)
+		if !kept {
+			chat_worker_lost(worker, runtime.source, "the completed response")
+			return
 		}
-		if len(value.Tool_Calls) > 0 {
-			completion.calls = make([]ai.Provider_Tool_Call, len(value.Tool_Calls), worker.allocator)
-			for call, index in value.Tool_Calls {
-				completion.calls[index] = ai.Provider_Tool_Call {
-					ID        = strings.clone(call.ID, worker.allocator),
-					Item_ID   = strings.clone(call.Item_ID, worker.allocator),
-					Name      = strings.clone(call.Name, worker.allocator),
-					Arguments = strings.clone(call.Arguments, worker.allocator),
-				}
-			}
-		}
-		chat_worker_push(worker, completion)
+		chat_worker_deliver(worker, runtime.source, completion, "the completed response")
 	case ai.Provider_Error_Event:
-		chat_worker_push(worker, Chat_Failure_Event{source = runtime.source, kind = value.Kind, message = strings.clone(value.Message, worker.allocator)})
+		message, clone_error := strings.clone(value.Message, worker.allocator)
+		if clone_error != nil {
+			chat_worker_lost(worker, runtime.source, "the provider's failure message")
+			return
+		}
+		chat_worker_deliver(
+			worker,
+			runtime.source,
+			Chat_Failure_Event{source = runtime.source, kind = value.Kind, message = message},
+			"the provider's failure message",
+		)
 	case ai.Provider_Usage_Event:
-		// Usage is a measurement, not text: it is copied whole and needs no ownership.
-		chat_worker_push(worker, Chat_Usage_Event{usage = value})
+		// Usage is a measurement, not text: it is copied whole and needs no ownership, and a
+		// queue that cannot take it does not make the response unusable the way a lost
+		// fragment of the answer does.
+		if mailbox_push(worker.mailbox, Chat_Usage_Event{usage = value}) { return }
+		log_emit({level = .Error, category = .Provider, event = "provider.usage_lost"})
 	}
 }
 
-// chat_worker_push hands one owned event to the mailbox, or releases it when the queue
-// could not grow. The release uses the worker allocator, which is the one the payload was
-// cloned with.
+// chat_worker_completion copies a completed response into what the owner keeps, or reports
+// that it did not fit. A copy that fails releases everything it copied before it gave up, so
+// the owner never receives a response that is missing a piece of what the model sent.
 @(private)
-chat_worker_push :: proc(worker: ^Chat_Request_Worker, event: Chat_Event) {
+chat_worker_completion :: proc(
+	worker: ^Chat_Request_Worker,
+	source: Chat_Event_Source,
+	value: ai.Provider_Completed_Event,
+) -> (
+	Chat_Provider_Completion,
+	bool,
+) {
+	completion: Chat_Provider_Completion
+	completion.source = source
+	completion.reason = value.Reason
+	kept := false
+	defer if !kept { chat_completion_destroy(&completion, worker.allocator) }
+	clone_error: mem.Allocator_Error
+	if completion.reason_text, clone_error = strings.clone(value.Reason_Text, worker.allocator); clone_error != nil { return {}, false }
+	if completion.output, clone_error = strings.clone(value.Raw_Output, worker.allocator); clone_error != nil { return {}, false }
+	if len(value.Tool_Calls) > 0 {
+		if completion.calls, clone_error = make([]ai.Provider_Tool_Call, len(value.Tool_Calls), worker.allocator); clone_error != nil { return {}, false }
+		for call, index in value.Tool_Calls {
+			completion.calls[index].ID, clone_error = strings.clone(call.ID, worker.allocator)
+			if clone_error != nil { return {}, false }
+			completion.calls[index].Item_ID, clone_error = strings.clone(call.Item_ID, worker.allocator)
+			if clone_error != nil { return {}, false }
+			completion.calls[index].Name, clone_error = strings.clone(call.Name, worker.allocator)
+			if clone_error != nil { return {}, false }
+			completion.calls[index].Arguments, clone_error = strings.clone(call.Arguments, worker.allocator)
+			if clone_error != nil { return {}, false }
+		}
+	}
+	kept = true
+	return completion, true
+}
+
+// chat_worker_deliver hands one owned event to the mailbox, or releases it and reports the
+// fact it carried as lost when the queue could not take it. what names the fact, which is
+// also what the report says was lost.
+@(private)
+chat_worker_deliver :: proc(worker: ^Chat_Request_Worker, source: Chat_Event_Source, event: Chat_Event, what: string) {
 	if mailbox_push(worker.mailbox, event) { return }
 	owned := event
 	chat_event_destroy(&owned, worker.allocator)
+	chat_worker_lost(worker, source, what)
+}
+
+// chat_worker_lost tells the owner that a fact the response carried could not be kept, so
+// that response is not usable as it stands. The owner answers it with the notice that says
+// the harness could not keep the response, which tells the model nothing in it ran and asks
+// it to send the work again: the only correction available to the owner, and the only one
+// the model can act on. The report owns no string, so it cannot fail the way the fact it
+// reports did.
+@(private)
+chat_worker_lost :: proc(worker: ^Chat_Request_Worker, source: Chat_Event_Source, what: string) {
+	fields := [1]Log_Field{{key = "lost", value = what}}
+	log_emit({level = .Error, category = .Provider, event = "provider.fact_lost", fields = fields[:]})
+	if mailbox_push(worker.mailbox, Chat_Lost_Event{source = source}) { return }
+	// The queue could not take the report either, so the log line above is the whole record.
+	log_emit({level = .Error, category = .Provider, event = "provider.fact_lost_unreported"})
 }

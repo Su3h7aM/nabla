@@ -2,6 +2,7 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 import "core:slice"
 import "core:strings"
 import "core:sync"
@@ -10,17 +11,33 @@ import "nabla:agent"
 import "nabla:agent/journal"
 import input "nabla:input"
 
-menu_begin :: proc(app: ^App, kind: Menu_Kind, title: string, choices: [dynamic]Choice, required: bool) {
+// menu_begin publishes a freshly built list. The caller owns choices until this
+// takes them; false means the title could not be copied, and the list stays with
+// the caller rather than being shown without a title.
+menu_begin :: proc(app: ^App, kind: Menu_Kind, title: string, choices: [dynamic]Choice, required: bool) -> bool {
+	cloned_title, clone_error := strings.clone(title, app.run.alloc)
+	if clone_error != nil {
+		snap_append(app, .Warning, "the menu could not be built: out of memory")
+		return false
+	}
 	menu_destroy(&app.menu, app.run.alloc)
 	app.menu = Menu {
 		kind     = kind,
-		title    = strings.clone(title, app.run.alloc),
+		title    = cloned_title,
 		choices  = choices,
 		required = required,
 	}
 	app.menu_open = true
 	app.completion_active = false
 	prompt_clear(app)
+	return true
+}
+
+// menu_choices_destroy releases a choice list the menu did not take.
+menu_choices_destroy :: proc(choices: ^[dynamic]Choice, allocator: mem.Allocator) {
+	for &choice in choices^ { choice_destroy(&choice, allocator) }
+	delete(choices^)
+	choices^ = nil
 }
 
 menu_close :: proc(app: ^App) {
@@ -51,12 +68,26 @@ menu_rebuild_model :: proc(app: ^App) {
 	// Catalog publication has its own lock. The current selection is snapshot
 	// state, so it is read under the lock the worker writes it with.
 	sync.mutex_lock(&app.run.mu)
-	current_provider := strings.clone(app.run.snap.status.provider_id, context.temp_allocator)
-	current_model := strings.clone(app.run.snap.status.model_id, context.temp_allocator)
+	current_provider, provider_error := strings.clone(app.run.snap.status.provider_id, context.temp_allocator)
+	current_model, model_error := strings.clone(app.run.snap.status.model_id, context.temp_allocator)
 	sync.mutex_unlock(&app.run.mu)
+	if provider_error != nil || model_error != nil {
+		// The list is still usable; only the cursor cannot be placed on the
+		// selection that could not be copied.
+		snap_append(app, .Warning, "the current model could not be read for its menu")
+	}
 
-	models := make([dynamic]Model_Choice, 0, 16, context.temp_allocator)
+	models, models_error := make([dynamic]Model_Choice, 0, 16, context.temp_allocator)
+	if models_error != nil {
+		snap_append(app, .Warning, "the model menu could not be built")
+		return
+	}
 	defer delete(models)
+	defer for model in models {
+		delete(model.provider_id, context.temp_allocator)
+		delete(model.model_id, context.temp_allocator)
+	}
+	failed := false
 	sync.mutex_lock(&app.catalog_mu)
 	for &provider in app.setup.catalog.providers {
 		if !agent.provider_usable(&provider) || !provider_configured(app, provider.id) { continue }
@@ -64,35 +95,55 @@ menu_rebuild_model :: proc(app: ^App) {
 			if model.provider_id != provider.id { continue }
 			// The names are copied while the lock is held: a publication releases the
 			// catalog they were read from, and the list below outlives this scope.
-			append(
-				&models,
-				Model_Choice{provider_id = strings.clone(provider.id, context.temp_allocator), model_id = strings.clone(model.id, context.temp_allocator)},
-			)
+			provider_id, provider_id_error := strings.clone(provider.id, context.temp_allocator)
+			model_id, model_id_error := strings.clone(model.id, context.temp_allocator)
+			if provider_id_error != nil || model_id_error != nil {
+				delete(provider_id, context.temp_allocator)
+				delete(model_id, context.temp_allocator)
+				failed = true
+				break
+			}
+			if _, append_error := append(&models, Model_Choice{provider_id = provider_id, model_id = model_id}); append_error != nil {
+				delete(provider_id, context.temp_allocator)
+				delete(model_id, context.temp_allocator)
+				failed = true
+				break
+			}
 		}
+		if failed { break }
 	}
 	sync.mutex_unlock(&app.catalog_mu)
-	defer for model in models {
-		delete(model.provider_id, context.temp_allocator)
-		delete(model.model_id, context.temp_allocator)
+	if failed {
+		snap_append(app, .Warning, "the model menu could not be built")
+		return
 	}
 	slice.sort_by(models[:], model_choice_less)
 
-	choices := make([dynamic]Choice, 0, len(models), app.run.alloc)
+	choices, choices_error := make([dynamic]Choice, 0, len(models), app.run.alloc)
+	if choices_error != nil {
+		snap_append(app, .Warning, "the model menu could not be built")
+		return
+	}
+	taken := false
+	defer if !taken { menu_choices_destroy(&choices, app.run.alloc) }
 	for model in models {
-		append(
-			&choices,
-			Choice {
-				label = strings.clone(model.model_id, app.run.alloc),
-				detail = strings.clone(model.provider_id, app.run.alloc),
-				action = Model_Choice{provider_id = strings.clone(model.provider_id, app.run.alloc), model_id = strings.clone(model.model_id, app.run.alloc)},
-			},
-		)
+		choice, choice_ok := model_choice_make(app, model)
+		if !choice_ok {
+			snap_append(app, .Warning, "the model menu could not be built")
+			return
+		}
+		if _, append_error := append(&choices, choice); append_error != nil {
+			choice_destroy(&choice, app.run.alloc)
+			snap_append(app, .Warning, "the model menu could not be built")
+			return
+		}
 	}
 	menu_title := "select a model"
 	if current_model != "" {
 		menu_title = fmt.tprintf("models (current: %s / %s)", current_provider, current_model)
 	}
-	menu_begin(app, .Model, menu_title, choices, false)
+	if !menu_begin(app, .Model, menu_title, choices, false) { return }
+	taken = true
 	for choice, index in app.menu.choices {
 		action := choice.action.(Model_Choice)
 		if action.provider_id == current_provider && action.model_id == current_model {
@@ -100,6 +151,33 @@ menu_rebuild_model :: proc(app: ^App) {
 			break
 		}
 	}
+}
+
+// model_choice_make builds one model menu line, every string owned by the run's
+// allocator. False means one of the copies failed, and what was copied is released.
+@(private)
+model_choice_make :: proc(app: ^App, model: Model_Choice) -> (Choice, bool) {
+	label, label_error := strings.clone(model.model_id, app.run.alloc)
+	if label_error != nil { return {}, false }
+	detail, detail_error := strings.clone(model.provider_id, app.run.alloc)
+	if detail_error != nil {
+		delete(label, app.run.alloc)
+		return {}, false
+	}
+	provider_id, provider_error := strings.clone(model.provider_id, app.run.alloc)
+	if provider_error != nil {
+		delete(label, app.run.alloc)
+		delete(detail, app.run.alloc)
+		return {}, false
+	}
+	model_id, model_id_error := strings.clone(model.model_id, app.run.alloc)
+	if model_id_error != nil {
+		delete(label, app.run.alloc)
+		delete(detail, app.run.alloc)
+		delete(provider_id, app.run.alloc)
+		return {}, false
+	}
+	return Choice{label = label, detail = detail, action = Model_Choice{provider_id = provider_id, model_id = model_id}}, true
 }
 
 model_choice_less :: proc(a, b: Model_Choice) -> bool {
@@ -113,20 +191,72 @@ model_choice_less :: proc(a, b: Model_Choice) -> bool {
 // their strings belong to the worker, so they are copied while the lock that
 // protects them is held.
 menu_open_effort :: proc(app: ^App) {
-	sync.mutex_lock(&app.run.mu)
-	current := strings.clone(app.run.snap.status.effort, context.temp_allocator)
-	levels := make([dynamic]string, 0, len(app.run.snap.status.effort_levels) + 1, context.temp_allocator)
-	append(&levels, "provider default")
-	for level in app.run.snap.status.effort_levels { append(&levels, strings.clone(level, context.temp_allocator)) }
-	sync.mutex_unlock(&app.run.mu)
+	levels, levels_error := make([dynamic]string, 0, 1, context.temp_allocator)
+	if levels_error != nil {
+		snap_append(app, .Warning, "the effort menu could not be built")
+		return
+	}
 	defer delete(levels)
+	current := ""
+	failed := false
+	sync.mutex_lock(&app.run.mu)
+	cloned_current, current_error := strings.clone(app.run.snap.status.effort, context.temp_allocator)
+	if current_error != nil {
+		failed = true
+	}
+	current = cloned_current
+	if _, append_error := append(&levels, "provider default"); append_error != nil {
+		failed = true
+	}
+	if !failed {
+		for level in app.run.snap.status.effort_levels {
+			cloned, clone_error := strings.clone(level, context.temp_allocator)
+			if clone_error != nil {
+				failed = true
+				break
+			}
+			if _, append_error := append(&levels, cloned); append_error != nil {
+				delete(cloned, context.temp_allocator)
+				failed = true
+				break
+			}
+		}
+	}
+	sync.mutex_unlock(&app.run.mu)
+	if failed {
+		snap_append(app, .Warning, "the effort menu could not be built")
+		return
+	}
 
-	choices := make([dynamic]Choice, 0, len(levels), app.run.alloc)
+	choices, choices_error := make([dynamic]Choice, 0, len(levels), app.run.alloc)
+	if choices_error != nil {
+		snap_append(app, .Warning, "the effort menu could not be built")
+		return
+	}
+	taken := false
+	defer if !taken { menu_choices_destroy(&choices, app.run.alloc) }
 	for level in levels {
 		value := "" if level == "provider default" else level
-		append(&choices, Choice{label = strings.clone(level, app.run.alloc), action = Effort_Choice{level = strings.clone(value, app.run.alloc)}})
+		label, label_error := strings.clone(level, app.run.alloc)
+		action_level, action_error := strings.clone(value, app.run.alloc)
+		if label_error != nil || action_error != nil {
+			delete(label, app.run.alloc)
+			delete(action_level, app.run.alloc)
+			snap_append(app, .Warning, "the effort menu could not be built")
+			return
+		}
+		choice := Choice {
+			label = label,
+			action = Effort_Choice{level = action_level},
+		}
+		if _, append_error := append(&choices, choice); append_error != nil {
+			choice_destroy(&choice, app.run.alloc)
+			snap_append(app, .Warning, "the effort menu could not be built")
+			return
+		}
 	}
-	menu_begin(app, .Effort, "reasoning effort", choices, false)
+	if !menu_begin(app, .Effort, "reasoning effort", choices, false) { return }
+	taken = true
 	menu_pick(app, "provider default" if current == "" else current)
 }
 
@@ -134,30 +264,52 @@ menu_open_effort :: proc(app: ^App) {
 // the snapshot, with a short id as the second column. Only the worker reads the
 // store, so the list it built is what the menu shows, and the list scrolls.
 menu_open_session :: proc(app: ^App) {
-	choices := make([dynamic]Choice, 0, 8, app.run.alloc)
+	choices, choices_error := make([dynamic]Choice, 0, 8, app.run.alloc)
+	if choices_error != nil {
+		snap_append(app, .Warning, "the session menu could not be built")
+		return
+	}
+	taken := false
+	defer if !taken { menu_choices_destroy(&choices, app.run.alloc) }
 	active: journal.Session_Id
 
 	// The snapshot's rows and their strings belong to the worker, which can replace
 	// them the moment the lock is released, so the labels are copied while the lock
 	// that protects them is still held.
+	failed := false
 	sync.mutex_lock(&app.run.mu)
 	active = app.run.snap.active_session
 	for &row in app.run.snap.sessions {
 		label := row.title if row.title != "" else "(untitled)"
 		hex_text: [journal.SESSION_ID_HEX_LENGTH]u8
 		hex := journal.session_id_to_hex(row.id, hex_text[:])
-		append(
-			&choices,
-			Choice {
-				label = strings.clone(label, app.run.alloc),
-				detail = strings.clone(hex[:SESSION_ID_SHORT_LENGTH], app.run.alloc),
-				action = Session_Choice{id = row.id},
-			},
-		)
+		row_label, label_error := strings.clone(label, app.run.alloc)
+		row_detail, detail_error := strings.clone(hex[:SESSION_ID_SHORT_LENGTH], app.run.alloc)
+		if label_error != nil || detail_error != nil {
+			delete(row_label, app.run.alloc)
+			delete(row_detail, app.run.alloc)
+			failed = true
+			break
+		}
+		choice := Choice {
+			label = row_label,
+			detail = row_detail,
+			action = Session_Choice{id = row.id},
+		}
+		if _, append_error := append(&choices, choice); append_error != nil {
+			choice_destroy(&choice, app.run.alloc)
+			failed = true
+			break
+		}
 	}
 	sync.mutex_unlock(&app.run.mu)
+	if failed {
+		snap_append(app, .Warning, "the session menu could not be built")
+		return
+	}
 
-	menu_begin(app, .Session, "sessions in this workspace", choices, false)
+	if !menu_begin(app, .Session, "sessions in this workspace", choices, false) { return }
+	taken = true
 	menu_pick_session(app, active)
 }
 

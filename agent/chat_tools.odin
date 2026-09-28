@@ -69,7 +69,13 @@ chat_tool_jobs_finish :: proc(chat: ^Chat_Session, turn_id: u64) -> bool {
 chat_commit_results :: proc(chat: ^Chat_Session, roots: int) -> bool {
 	if roots != len(chat.pending_calls) || roots == 0 { return true }
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	calls := make([]journal.Call_Id, roots, context.temp_allocator)
+	// The list is what the record says the batch answered, so a list that does not fit ends
+	// the turn instead of being committed with part of the batch in it.
+	calls, calls_error := make([]journal.Call_Id, roots, context.temp_allocator)
+	if calls_error != nil {
+		chat_session_fail(chat, "the tool results could not be kept for the record")
+		return false
+	}
 	for staged, index in chat.pending_calls { calls[index] = staged.call }
 	chat_node(chat, .Results, journal.Results{calls = calls})
 	return chat_commit(chat, "the tool results could not be recorded")
@@ -90,7 +96,11 @@ chat_record_tool_result :: proc(
 	// The journal copies the error text, so the temp memory it was built in is released here.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	error_text := ""
-	if result.error != nil { error_text = tool_argument_error_text(result.error, context.temp_allocator) }
+	if result.error != nil {
+		text, text_error := tool_argument_error_text(result.error, context.temp_allocator)
+		error_text = text
+		if text_error != nil { error_text = "the argument defect could not be described: out of memory" }
+	}
 	header := journal.Record {
 		kind        = .Tool_Completed,
 		node        = node,

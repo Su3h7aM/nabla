@@ -63,37 +63,67 @@ subagent_program :: proc(args: Agent_Spawn_Args, parent: ^Agent_Parent, allocato
 		if candidate.name == args.acp_agent { config = candidate }
 	}
 	if config.name == "" {
-		names := make([dynamic]string, 0, len(parent.acp_agents), context.temp_allocator)
-		for candidate in parent.acp_agents { append(&names, candidate.name) }
-		configured := strings.join(names[:], ", ", context.temp_allocator) if len(names) > 0 else "none"
+		configured := "none"
+		names, names_error := make([dynamic]string, 0, len(parent.acp_agents), context.temp_allocator)
+		if names_error == nil {
+			for candidate in parent.acp_agents { append(&names, candidate.name) }
+			if len(names) > 0 {
+				if joined, join_error := strings.join(names[:], ", ", context.temp_allocator); join_error == nil { configured = joined }
+			}
+		}
 		return {}, fmt.tprintf("no ACP agent named %q is configured; configured: %s", args.acp_agent, configured)
 	}
 	path, found := subagent_command_path(config.command, parent.workspace)
 	if !found { return {}, fmt.tprintf("ACP agent %s: command %q is neither an executable file nor a program on PATH; nothing started", config.name, config.command) }
-	program.name = strings.clone(config.name, allocator)
-	program.command = strings.clone(path, allocator)
-	program.arguments = make([]string, len(config.arguments), allocator)
-	for argument, index in config.arguments { program.arguments[index] = strings.clone(argument, allocator) }
-	program.model = strings.clone(args.model, allocator)
-	program.parent_effort = strings.clone(parent.effort, allocator)
-	program.parent_levels = make([]string, len(parent.effort_levels), allocator)
-	for level, index in parent.effort_levels { program.parent_levels[index] = strings.clone(level, allocator) }
-	return program, ""
+	// Everything the program owns is copied into a local, so a copy that fails releases it
+	// rather than starting an agent from what it held so far.
+	built: Subagent_Program
+	failed := true
+	defer if failed { subagent_program_destroy(&built, allocator) }
+	clone_error: mem.Allocator_Error
+	built.name, clone_error = strings.clone(config.name, allocator)
+	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
+	built.command, clone_error = strings.clone(path, allocator)
+	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
+	built.arguments, clone_error = make([]string, len(config.arguments), allocator)
+	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
+	for argument, index in config.arguments {
+		built.arguments[index], clone_error = strings.clone(argument, allocator)
+		if clone_error != nil { return {}, "the ACP agent's program could not be held" }
+	}
+	built.model, clone_error = strings.clone(args.model, allocator)
+	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
+	built.parent_effort, clone_error = strings.clone(parent.effort, allocator)
+	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
+	built.parent_levels, clone_error = make([]string, len(parent.effort_levels), allocator)
+	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
+	for level, index in parent.effort_levels {
+		built.parent_levels[index], clone_error = strings.clone(level, allocator)
+		if clone_error != nil { return {}, "the ACP agent's program could not be held" }
+	}
+	failed = false
+	return built, ""
 }
 
 // subagent_command_path finds the executable command names, temp-allocated: a path relative to
-// directory when it has a slash, else the first match on PATH.
+// directory when it has a slash, else the first match on PATH. found is false when the path
+// could not be built or no candidate is executable.
 @(private)
 subagent_command_path :: proc(command, directory: string) -> (string, bool) {
 	if strings.contains_rune(command, '/') {
 		path := command
-		if !strings.has_prefix(command, "/") { path = strings.concatenate({directory, "/", command}, context.temp_allocator) }
+		if !strings.has_prefix(command, "/") {
+			joined, join_error := strings.concatenate({directory, "/", command}, context.temp_allocator)
+			if join_error != nil { return "", false }
+			path = joined
+		}
 		return path, subagent_executable(path)
 	}
 	search := string(posix.getenv("PATH"))
 	for entry in strings.split_iterator(&search, ":") {
 		if entry == "" { continue }
-		path := strings.concatenate({entry, "/", command}, context.temp_allocator)
+		path, join_error := strings.concatenate({entry, "/", command}, context.temp_allocator)
+		if join_error != nil { return "", false }
 		if subagent_executable(path) { return path, true }
 	}
 	return "", false
@@ -101,7 +131,8 @@ subagent_command_path :: proc(command, directory: string) -> (string, bool) {
 
 @(private)
 subagent_executable :: proc(path: string) -> bool {
-	text := strings.clone_to_cstring(path, context.temp_allocator)
+	text, clone_error := strings.clone_to_cstring(path, context.temp_allocator)
+	if clone_error != nil { return false }
 	return posix.access(text, {.X_OK}) == .OK && !os.is_dir(path)
 }
 
@@ -136,12 +167,19 @@ Acp_Connection :: struct {
 subagent_acp_run :: proc(member: ^Subagent) {
 	allocator := member.allocator
 	connection := Acp_Connection {
-		member      = member,
-		frames      = make([dynamic]string, allocator),
-		answer      = make([dynamic]u8, allocator),
-		stderr_tail = make([dynamic]u8, allocator),
+		member = member,
 	}
 	defer acp_connection_close(&connection)
+	frames, frames_error := make([dynamic]string, allocator)
+	answer_buffer, answer_error := make([dynamic]u8, allocator)
+	tail, tail_error := make([dynamic]u8, allocator)
+	if frames_error != nil || answer_error != nil || tail_error != nil {
+		subagent_fail(member, .Failed, "the agent's connection could not be held")
+		return
+	}
+	connection.frames = frames
+	connection.answer = answer_buffer
+	connection.stderr_tail = tail
 	if problem := acp_connection_open(&connection); problem != "" {
 		subagent_fail(member, .Failed, problem)
 		return
@@ -150,7 +188,12 @@ subagent_acp_run :: proc(member: ^Subagent) {
 		subagent_fail(member, acp_stopped(&connection) ? .Stopped : .Failed, problem)
 		return
 	}
-	member.session_id = strings.clone(connection.session_id, allocator)
+	session_text, session_error := strings.clone(connection.session_id, allocator)
+	if session_error != nil {
+		subagent_fail(member, .Failed, "the agent's session id could not be held")
+		return
+	}
+	member.session_id = session_text
 
 	text := member.prompt
 	if member.instruction != "" { text = strings.concatenate({member.instruction, "\n\n", member.prompt}, context.temp_allocator) }
@@ -176,8 +219,15 @@ subagent_acp_run :: proc(member: ^Subagent) {
 		if !more { break }
 		text, from_inbox = line, true
 	}
+	// An answer that cannot be held is not the answer the orchestrator asked for, so the
+	// outcome says the delegation failed rather than reporting none as a completion.
+	answer_text, clone_error := strings.clone(string(connection.answer[:]), allocator)
+	if clone_error != nil {
+		subagent_fail(member, .Failed, "the agent's answer could not be held")
+		return
+	}
 	member.status = .Completed
-	member.answer = strings.clone(string(connection.answer[:]), allocator)
+	member.answer = answer_text
 }
 
 // acp_prompt sends one prompt and waits until the agent's turn is over. Version 1 ends the turn
@@ -218,12 +268,15 @@ acp_prompt :: proc(connection: ^Acp_Connection, text: string) -> (stop_reason: s
 	for !connection.idle {
 		envelope, next_problem := acp_next(connection)
 		if next_problem != "" { return "", next_problem }
-		acp_handle(connection, envelope)
+		followed := acp_handle(connection, envelope)
 		acp.destroy_envelope(&envelope, connection.member.allocator)
+		if !followed { return "", "the agent's message could not be held" }
 	}
 	// An agent that states no reason ended its turn normally.
 	if connection.stop_reason == "" { return "end_turn", "" }
-	return strings.clone(connection.stop_reason, context.temp_allocator), ""
+	reason, clone_error := strings.clone(connection.stop_reason, context.temp_allocator)
+	if clone_error != nil { return "", "the agent's stop reason could not be held" }
+	return reason, ""
 }
 
 // acp_connection_open starts the agent program with its three standard streams piped here.
@@ -235,6 +288,7 @@ acp_connection_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	connection.input = input
 	output_read, output_write, output_error := os.pipe()
 	if output_error != nil { return "the agent's output pipe could not be created; nothing ran" }
+	// The child holds the write ends; the parent's copies are abandoned here.
 	defer _ = os.close(output_write)
 	connection.output = output_read
 	errors_read, errors_write, errors_error := os.pipe()
@@ -242,7 +296,8 @@ acp_connection_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	defer _ = os.close(errors_write)
 	connection.errors = errors_read
 
-	argv := make([]string, len(member.program.arguments) + 1, context.temp_allocator)
+	argv, argv_error := make([]string, len(member.program.arguments) + 1, context.temp_allocator)
+	if argv_error != nil { return "the agent's arguments could not be held; nothing ran" }
 	argv[0] = member.program.command
 	copy(argv[1:], member.program.arguments)
 	child, spawn, spawn_error := tool_spawn_command(argv, member.workspace, connection.input.theirs, output_write, errors_write, parent_death = true)
@@ -255,6 +310,7 @@ acp_connection_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	}
 	connection.child = child
 	connection.started = true
+	// The child holds the read end of its input from here on.
 	_ = os.close(connection.input.theirs)
 	connection.input.theirs = nil
 
@@ -275,6 +331,7 @@ acp_connection_close :: proc(connection: ^Acp_Connection) {
 		tool_terminate_group(&connection.child)
 		tool_child_close(&connection.child)
 	}
+	// The agent's pipes are abandoned here: its process is gone or going.
 	if connection.output != nil { _ = os.close(connection.output) }
 	if connection.errors != nil { _ = os.close(connection.errors) }
 	acp.writer_destroy(&connection.writer)
@@ -348,7 +405,8 @@ acp_session_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	// When the agent shares no level with the orchestrator, its own default stays, since its
 	// lowest level may turn reasoning off.
 	if option, found := acp_option(opened.config_options, ACP_OPTION_CATEGORY_EFFORT); found {
-		levels := make([]string, len(option.options), context.temp_allocator)
+		levels, levels_error := make([]string, len(option.options), context.temp_allocator)
+		if levels_error != nil { return "the agent's effort levels could not be held" }
 		for choice, index in option.options { levels[index] = choice.value }
 		effort := acp_option_value(option, member.effort)
 		if effort == "" { effort = effort_step_down(member.program.parent_levels, levels, member.program.parent_effort) }
@@ -424,16 +482,20 @@ acp_model_offered :: proc(models: acp.Models_State, model: string) -> bool {
 	return false
 }
 
-// acp_models_text lists the models a session offers, temp-allocated.
+// acp_models_text lists the models a session offers, temp-allocated. A list that cannot be
+// held says so rather than reading as an agent that offers no model.
 @(private)
 acp_models_text :: proc(opened: Acp_Session_Opened) -> string {
-	names := make([dynamic]string, context.temp_allocator)
+	names, names_error := make([dynamic]string, context.temp_allocator)
+	if names_error != nil { return "the model list could not be held" }
 	if option, found := acp_option(opened.config_options, ACP_OPTION_CATEGORY_MODEL); found {
 		for choice in option.options { append(&names, choice.value) }
 	}
 	for offered in opened.models.available_models { append(&names, offered.model_id) }
 	if len(names) == 0 { return "no choice of model" }
-	return strings.join(names[:], ", ", context.temp_allocator)
+	joined, join_error := strings.join(names[:], ", ", context.temp_allocator)
+	if join_error != nil { return "the model list could not be held" }
+	return joined
 }
 
 // acp_call sends one request and reads until its answer, which it decodes into result with
@@ -460,57 +522,64 @@ acp_call :: proc(connection: ^Acp_Connection, method: string, params: $P, result
 			}
 			return ""
 		case .Notification, .Request, .Invalid:
-			acp_handle(connection, envelope)
+			if !acp_handle(connection, envelope) { return "the agent's message could not be held" }
 		}
 	}
 }
 
-// acp_handle acts on a message that answers nothing this client asked.
+// acp_handle acts on a message that answers nothing this client asked. It reports false when
+// what the message carries could not be held, which ends the connection rather than letting
+// the answer or the stop reason go missing.
 @(private)
-acp_handle :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
+acp_handle :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool {
 	// What a message is decoded into is released with it, so a long turn holds no scratch.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	#partial switch envelope.kind {
 	case .Notification:
-		acp_notification(connection, envelope)
+		return acp_notification(connection, envelope)
 	case .Request:
 		acp_answer(connection, envelope)
 	}
+	return true
 }
 
 // acp_notification follows the agent's latest message and, in version 2, the end of its turn.
 // Text before a tool call is narration, so a tool call starts the answer over, and so does a
-// message with a new id.
+// message with a new id. It reports false when what it followed could not be held.
 @(private)
-acp_notification :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
-	if envelope.method != acp.NOTIFICATION_SESSION_UPDATE { return }
+acp_notification :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool {
+	if envelope.method != acp.NOTIFICATION_SESSION_UPDATE { return true }
 	kind: acp.Session_Notification(acp.Update_Kind)
-	if !acp.params_decode(envelope.params, &kind, context.temp_allocator) { return }
+	if !acp.params_decode(envelope.params, &kind, context.temp_allocator) { return true }
 	switch kind.update.session_update {
 	case acp.UPDATE_TOOL_CALL, acp.UPDATE_TOOL_CALL_UPDATE:
 		clear(&connection.answer)
-		acp_replace(&connection.message_id, "", connection.member.allocator)
+		return acp_replace(&connection.message_id, "", connection.member.allocator)
 	case acp.UPDATE_AGENT_MESSAGE_CHUNK:
 		chunk: acp.Session_Notification(acp.Message_Chunk)
-		if !acp.params_decode(envelope.params, &chunk, context.temp_allocator) { return }
-		acp_message_begin(connection, chunk.update.message_id)
-		if chunk.update.content.type == acp.CONTENT_TEXT { append(&connection.answer, chunk.update.content.text) }
+		if !acp.params_decode(envelope.params, &chunk, context.temp_allocator) { return true }
+		if !acp_message_begin(connection, chunk.update.message_id) { return false }
+		if chunk.update.content.type != acp.CONTENT_TEXT { return true }
+		_, append_error := append(&connection.answer, chunk.update.content.text)
+		return append_error == nil
 	case acp.UPDATE_AGENT_MESSAGE:
 		message: acp.Session_Notification(acp.Message_Update)
-		if !acp.params_decode(envelope.params, &message, context.temp_allocator) { return }
-		acp_message_begin(connection, message.update.message_id)
+		if !acp.params_decode(envelope.params, &message, context.temp_allocator) { return true }
+		if !acp_message_begin(connection, message.update.message_id) { return false }
 		// The update is an upsert: content left out keeps the message as it is.
-		if !acp_update_has(envelope.params, "content") { return }
+		if !acp_update_has(envelope.params, "content") { return true }
 		clear(&connection.answer)
 		for block in message.update.content {
-			if block.type == acp.CONTENT_TEXT { append(&connection.answer, block.text) }
+			if block.type != acp.CONTENT_TEXT { continue }
+			if _, append_error := append(&connection.answer, block.text); append_error != nil { return false }
 		}
 	case acp.UPDATE_STATE:
 		state: acp.Session_Notification(acp.State_Update)
-		if !acp.params_decode(envelope.params, &state, context.temp_allocator) || state.update.state != "idle" { return }
+		if !acp.params_decode(envelope.params, &state, context.temp_allocator) || state.update.state != "idle" { return true }
 		connection.idle = true
-		acp_replace(&connection.stop_reason, state.update.stop_reason, connection.member.allocator)
+		return acp_replace(&connection.stop_reason, state.update.stop_reason, connection.member.allocator)
 	}
+	return true
 }
 
 // acp_update_has reports whether a session/update's update object carries key.
@@ -524,25 +593,33 @@ acp_update_has :: proc(params: json.Value, key: string) -> bool {
 	return present
 }
 
-// acp_message_begin starts the answer over when the agent begins a message with a new id.
+// acp_message_begin starts the answer over when the agent begins a message with a new id. It
+// reports false when the id could not be held.
 @(private)
-acp_message_begin :: proc(connection: ^Acp_Connection, message_id: string) {
-	if message_id == "" || message_id == connection.message_id { return }
+acp_message_begin :: proc(connection: ^Acp_Connection, message_id: string) -> bool {
+	if message_id == "" || message_id == connection.message_id { return true }
 	clear(&connection.answer)
-	acp_replace(&connection.message_id, message_id, connection.member.allocator)
+	return acp_replace(&connection.message_id, message_id, connection.member.allocator)
 }
 
-// acp_replace sets an owned string to a copy of value.
+// acp_replace sets an owned string to a copy of value. It reports false when the copy could
+// not be held, in which case the string is empty.
 @(private)
-acp_replace :: proc(owned: ^string, value: string, allocator: mem.Allocator) {
+acp_replace :: proc(owned: ^string, value: string, allocator: mem.Allocator) -> bool {
 	delete(owned^, allocator)
-	owned^ = strings.clone(value, allocator) if value != "" else ""
+	owned^ = ""
+	if value == "" { return true }
+	cloned, clone_error := strings.clone(value, allocator)
+	if clone_error != nil { return false }
+	owned^ = cloned
+	return true
 }
 
 // acp_answer answers a request the agent sent. A permission request is granted once, as a
 // native subagent's tools run without asking; nothing else is offered.
 @(private)
 acp_answer :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
+	// A write to the agent that fails ends the exchange: the next read reports it.
 	if envelope.method != acp.METHOD_SESSION_REQUEST_PERMISSION {
 		_ = acp.writer_write_error(&connection.writer, envelope.id, acp.ERROR_METHOD_NOT_FOUND, "this client offers no such method")
 		return
@@ -599,6 +676,7 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 		connection.cancel_sent = true
 		connection.stop_deadline = time.tick_add(time.tick_now(), TOOL_JOBS_STOP_PATIENCE)
 		if connection.session_id == "" { return "the subagent was stopped before its session opened" }
+		// A cancel that cannot be written is what the stop patience below covers.
 		_ = acp.writer_write_notification(&connection.writer, acp.SESSION_CANCEL, acp.Session_Cancel_Params{session_id = connection.session_id})
 	}
 	// The agent's exit is watched beside its output, because a descendant that inherited

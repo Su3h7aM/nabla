@@ -101,7 +101,8 @@ tool_preview_cut :: proc(text: string, limit: int) -> string {
 @(private)
 tool_output_write :: proc(path: string, content: string) -> os.Error {
 	file := tool_output_create(path) or_return
-	defer os.close(file)
+	// The write's own result is the answer; a close that fails after it changes nothing.
+	defer _ = os.close(file)
 	_, write_error := os.write_string(file, content)
 	return write_error
 }

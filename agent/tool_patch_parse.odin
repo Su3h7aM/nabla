@@ -328,7 +328,8 @@ patch_close_section :: proc(parser: ^Patch_Parser) -> (problem: string) {
 			hunks[kept] = trimmed
 			kept += 1
 		}
-		resize(&parser.hunks, file.first_hunk + kept)
+		// Dropping trailing hunks never grows the array, and shrinking cannot fail.
+		_ = resize(&parser.hunks, file.first_hunk + kept)
 		if kept == 0 && file.move_to == "" {
 			return fmt.tprintf("a patch whose %s %s section adds or removes at least one line", PATCH_HEADERS[.Update], file.path)
 		}

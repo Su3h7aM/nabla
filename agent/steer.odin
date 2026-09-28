@@ -25,7 +25,13 @@ Steer_Queue :: struct {
 }
 
 steer_queue_init :: proc(allocator := context.allocator) -> Steer_Queue {
-	return Steer_Queue{items = make([dynamic]string, 0, allocator), allocator = allocator}
+	// A queue that holds nothing allocates nothing; it carries the allocator its first line
+	// is copied with.
+	queue := Steer_Queue {
+		allocator = allocator,
+	}
+	queue.items.allocator = allocator
+	return queue
 }
 
 steer_queue_destroy :: proc(queue: ^Steer_Queue) {
@@ -83,14 +89,24 @@ steer_requeue :: proc(queue: ^Steer_Queue, line: string) -> bool {
 
 // steer_take_all removes everything queued, oldest first, and returns it in one
 // allocation the caller owns. It is how input no turn recorded leaves the queue: whoever
-// takes it decides what it becomes, and steer_taken_destroy releases it.
-steer_take_all :: proc(queue: ^Steer_Queue) -> [dynamic]string {
+// takes it decides what it becomes, and steer_taken_destroy releases it. False means the
+// lines could not be copied out, and they stay in the queue for the next drain: a failed
+// take never takes input away from the session.
+steer_take_all :: proc(queue: ^Steer_Queue) -> (taken: [dynamic]string, ok: bool) {
 	sync.mutex_lock(&queue.mu)
 	defer sync.mutex_unlock(&queue.mu)
-	taken := make([dynamic]string, 0, len(queue.items), queue.allocator)
-	append(&taken, ..queue.items[:])
+	lines, allocation_error := make([dynamic]string, 0, len(queue.items), queue.allocator)
+	if allocation_error != nil { return {}, false }
+	for line in queue.items {
+		// The lines stay the queue's until every one of them is copied out: the copy is a
+		// header, so releasing the array is all a take that failed owes.
+		if _, append_error := append(&lines, line); append_error != nil {
+			delete(lines)
+			return {}, false
+		}
+	}
 	clear(&queue.items)
-	return taken
+	return lines, true
 }
 
 // steer_taken_destroy releases what steer_take_all returned. Its lines belong to the

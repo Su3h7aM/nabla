@@ -25,7 +25,8 @@ Owner_Mailbox :: struct {
 
 mailbox_init :: proc(mailbox: ^Owner_Mailbox, allocator: mem.Allocator) {
 	mailbox.allocator = allocator
-	mailbox.events = make([dynamic]Chat_Event, allocator)
+	// An empty queue allocates nothing; it carries the allocator the first push grows from.
+	mailbox.events.allocator = allocator
 }
 
 // mailbox_push takes ownership of event, or returns false and leaves it with the caller.
@@ -43,7 +44,10 @@ mailbox_push :: proc(mailbox: ^Owner_Mailbox, event: Chat_Event) -> bool {
 mailbox_take_all :: proc(mailbox: ^Owner_Mailbox) -> [dynamic]Chat_Event {
 	sync.mutex_guard(&mailbox.mutex)
 	events := mailbox.events
-	mailbox.events = make([dynamic]Chat_Event, mailbox.allocator)
+	// The queue the producer pushes into next holds nothing yet and allocates nothing, so
+	// taking the events cannot fail; only the allocator it grows from is carried over.
+	mailbox.events = nil
+	mailbox.events.allocator = mailbox.allocator
 	return events
 }
 

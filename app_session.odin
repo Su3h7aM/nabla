@@ -157,22 +157,55 @@ resolve_run_catalog :: proc(
 ) {
 	// Only configured providers are selectable, so the raw catalog is filtered to
 	// them as it is read: enrichment for anything else has no consumer.
-	names := make([]string, len(sources), context.temp_allocator)
+	names, names_error := make([]string, len(sources), context.temp_allocator)
+	if names_error != nil {
+		fmt.eprintln("nabla: the provider names could not be listed")
+		return {}, {}, false
+	}
 	defer delete(names, context.temp_allocator)
 	for source, index in sources { names[index] = source.id }
 
-	discovered := agent.provider_models_cached(sources, allocator = allocator)
+	discovered, discovered_ok := agent.provider_models_cached(sources, allocator = allocator)
 	defer agent.catalog_sources_destroy(&discovered, allocator)
-	models_dev, _ := agent.models_dev_cached_sources(providers = names, allocator = allocator)
+	if !discovered_ok {
+		fmt.eprintln("nabla: the cached provider listings could not be held")
+		return {}, {}, false
+	}
+	models_dev, models_dev_error := agent.models_dev_cached_sources(providers = names, allocator = allocator)
+	// A cache that was never written is the normal first launch, not a report;
+	// anything else about it is worth saying even though the launch proceeds.
+	if models_dev_error != .None && models_dev_error != .Unavailable {
+		fmt.eprintln("nabla: the cached models.dev document could not be read")
+	}
 	defer agent.catalog_sources_destroy(&models_dev, allocator)
 	resolved, resolve_error := agent.resolve_catalog(sources, discovered[:], models_dev[:], allocator)
 	if resolve_error != .None {
-		fmt.eprintln("nabla: invalid configuration: a model cannot be excluded and customized at the same time")
+		if resolve_error == agent.Catalog_Error.Allocation {
+			fmt.eprintln("nabla: the catalog could not be held")
+		} else {
+			fmt.eprintln("nabla: invalid configuration: a model cannot be excluded and customized at the same time")
+		}
 		return {}, {}, false
 	}
 	configured.allocator = allocator
+	listed := true
 	for &source in sources {
-		append(&configured, strings.clone(source.id, allocator))
+		cloned, clone_error := strings.clone(source.id, allocator)
+		if clone_error != nil {
+			listed = false
+			break
+		}
+		if _, append_error := append(&configured, cloned); append_error != nil {
+			delete(cloned, allocator)
+			listed = false
+			break
+		}
+	}
+	if !listed {
+		for id in configured { delete(id, allocator) }
+		delete(configured)
+		fmt.eprintln("nabla: the configured providers could not be listed")
+		return {}, {}, false
 	}
 	return resolved, configured, true
 }
@@ -280,7 +313,11 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 	switch start.kind {
 	case .New:
 		opened.id = journal.session_id_create()
-		opened.workspace = strings.clone(launch_workspace, allocator)
+		workspace, workspace_error := strings.clone(launch_workspace, allocator)
+		if workspace_error != nil {
+			return opened, fmt.aprintf("the new session's directory could not be stored", allocator = allocator), false
+		}
+		opened.workspace = workspace
 		opened.branch = journal.INITIAL_BRANCH
 		log_session_claimed(opened.id, false, {})
 		return opened, "", true
@@ -324,10 +361,21 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 	if read_error != nil { return opened, session_error_message("cannot read the session", read_error, allocator), false }
 	defer journal.record_destroy(&latest, allocator)
 	if found {
-		opened.provider = strings.clone(latest.provider, allocator)
-		opened.model = strings.clone(latest.model, allocator)
+		provider, provider_error := strings.clone(latest.provider, allocator)
+		model, model_error := strings.clone(latest.model, allocator)
+		if provider_error != nil || model_error != nil {
+			delete(provider, allocator)
+			delete(model, allocator)
+			return opened, fmt.aprintf("the session's model could not be stored", allocator = allocator), false
+		}
+		opened.provider = provider
+		opened.model = model
 	}
-	opened.workspace = strings.clone(summary.workspace, allocator)
+	workspace, workspace_error := strings.clone(summary.workspace, allocator)
+	if workspace_error != nil {
+		return opened, fmt.aprintf("the session's directory could not be stored", allocator = allocator), false
+	}
+	opened.workspace = workspace
 	log_session_claimed(opened.id, true, opened.recovery)
 	return opened, "", true
 }
@@ -384,11 +432,14 @@ session_store_close :: proc(store: ^journal.Journal, allocator: mem.Allocator) -
 }
 
 // session_error_message is what for a person, followed by the journal's reason,
-// owned by allocator.
+// owned by allocator. A message that cannot itself be allocated falls back to the
+// plain reason, so the caller always gets something it can report.
 session_error_message :: proc(what: string, error: journal.Error, allocator: mem.Allocator) -> string {
 	detail := journal.error_text(error, allocator)
 	defer delete(detail, allocator)
-	return strings.concatenate({what, ": ", detail}, allocator)
+	message, join_error := strings.concatenate({what, ": ", detail}, allocator)
+	if join_error != nil { return fmt.aprintf("%s: out of memory", what, allocator = allocator) }
+	return message
 }
 
 // report_recovery says what an earlier run left behind, so a resumed session
@@ -451,8 +502,14 @@ pending_selection_clear :: proc(pending: ^Pending_Selection, allocator: mem.Allo
 // for whichever boundary comes first.
 selection_request :: proc(app: ^App, provider_id, model_id: string) {
 	if runtime_stopping(app) { return }
-	provider := strings.clone(provider_id, app.run.alloc)
-	model := strings.clone(model_id, app.run.alloc)
+	provider, provider_error := strings.clone(provider_id, app.run.alloc)
+	model, model_error := strings.clone(model_id, app.run.alloc)
+	if provider_error != nil || model_error != nil {
+		delete(provider, app.run.alloc)
+		delete(model, app.run.alloc)
+		snap_append(app, .Error, "the model selection could not be stored")
+		return
+	}
 	sync.mutex_lock(&app.run.mu)
 	pending_selection_clear(&app.run.pending, app.run.alloc)
 	app.run.pending = Pending_Selection {
@@ -528,22 +585,41 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 	// stored effort, which selecting replaces, so it is copied first.
 	desired := effort
 	if desired == "" { desired = running.effort }
-	carried := strings.clone(desired, app.setup.alloc)
+	carried, carried_error := strings.clone(desired, app.setup.alloc)
+	if carried_error != nil {
+		selection_fail(app, "the reasoning effort could not be copied")
+		return false
+	}
 	defer delete(carried, app.setup.alloc)
+	installed, applied := agent.chat_session_select(running, resolved, carried)
+	if !installed {
+		selection_fail(app, "the model selection could not be stored")
+		return false
+	}
 	// A carried level the new model does not allow falls back to the lowest level
 	// the model does state, so a switch never leaves an effort it cannot serve.
 	// With nothing to carry, the provider default stands.
-	if !agent.chat_session_select(running, resolved, carried) && len(running.effort_levels) > 0 {
-		agent.chat_session_set_effort(running, running.effort_levels[0])
+	if !applied && len(running.effort_levels) > 0 {
+		if !agent.chat_session_set_effort(running, running.effort_levels[0]) {
+			snap_append(app, .Warning, "the reasoning effort could not be applied")
+		}
 	}
 
 	// The runtime keeps its own copy of the selection, and provider_id and model_id
 	// may alias the strings being replaced, so the replacements are built before
 	// the old values are released.
-	setup_provider := strings.clone(provider_id, app.setup.alloc)
-	setup_model := strings.clone(model_id, app.setup.alloc)
-	setup_endpoint := strings.clone(resolved.connection.Endpoint, app.run.alloc)
-	credential := strings.clone(resolved.connection.Credential, app.setup.alloc)
+	setup_provider, provider_error := strings.clone(provider_id, app.setup.alloc)
+	setup_model, model_error := strings.clone(model_id, app.setup.alloc)
+	setup_endpoint, endpoint_error := strings.clone(resolved.connection.Endpoint, app.run.alloc)
+	credential, credential_error := strings.clone(resolved.connection.Credential, app.setup.alloc)
+	if provider_error != nil || model_error != nil || endpoint_error != nil || credential_error != nil {
+		delete(setup_provider, app.setup.alloc)
+		delete(setup_model, app.setup.alloc)
+		delete(setup_endpoint, app.run.alloc)
+		delete(credential, app.setup.alloc)
+		selection_fail(app, "the model selection could not be stored")
+		return false
+	}
 
 	sync.mutex_lock(&app.run.mu)
 	delete(app.setup.credential, app.setup.alloc)
@@ -551,7 +627,13 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 	app.setup.api = api
 	// The endpoint the connection being replaced borrowed stays valid for any turn
 	// that already holds it.
-	if app.endpoint != "" { append(&app.retired_endpoints, app.endpoint) }
+	if app.endpoint != "" {
+		if _, append_error := append(&app.retired_endpoints, app.endpoint); append_error != nil {
+			// The endpoint is left unfreed rather than freed under a turn that may
+			// still be talking to it, which is a leak and not a dangling pointer.
+			snap_report_dropped(app, append_error)
+		}
+	}
 	app.endpoint = setup_endpoint
 	app.run.connection = ai.Provider_Connection {
 		API        = api,
@@ -583,26 +665,26 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 selection_publish_locked :: proc(app: ^App, provider_id, model_id: string, announce := true) {
 	running := &app.setup.session
 	status := &app.run.snap.status
-	if status.provider_id != provider_id {
-		delete(status.provider_id, app.run.alloc)
-		status.provider_id = strings.clone(provider_id, app.run.alloc)
-	}
-	if status.model_id != model_id {
-		delete(status.model_id, app.run.alloc)
-		status.model_id = strings.clone(model_id, app.run.alloc)
-	}
+	snap_status_replace(app, &status.provider_id, provider_id)
+	snap_status_replace(app, &status.model_id, model_id)
 	// The effort and the window apply here too, not only through refresh_status: a
 	// restored selection must show both before the first work item runs.
-	if status.effort != running.effort {
-		delete(status.effort, app.run.alloc)
-		status.effort = strings.clone(running.effort, app.run.alloc)
-	}
+	snap_status_replace(app, &status.effort, running.effort)
 	// The levels travel with the model, because only the worker owns the session
 	// and the /effort menu is built on the front-end.
 	for level in status.effort_levels { delete(level, app.run.alloc) }
 	clear(&status.effort_levels)
 	for level in running.effort_levels {
-		append(&status.effort_levels, strings.clone(level, app.run.alloc))
+		cloned, clone_error := strings.clone(level, app.run.alloc)
+		if clone_error != nil {
+			snap_report_dropped(app, clone_error)
+			continue
+		}
+		if _, append_error := append(&status.effort_levels, cloned); append_error != nil {
+			delete(cloned, app.run.alloc)
+			snap_report_dropped(app, append_error)
+			break
+		}
 	}
 	status.context_window = running.capacity.window
 	delete(app.run.snap.setup_error, app.run.alloc)

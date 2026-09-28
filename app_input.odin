@@ -110,7 +110,9 @@ complete_command :: proc(app: ^App) {
 	app.completion_index = index
 	app.completion_active = true
 	prompt_clear(app)
-	widgets.input_insert(&app.input, command.name)
+	if !widgets.input_insert(&app.input, command.name) {
+		snap_append(app, .Warning, "the completed command could not be written into the prompt")
+	}
 }
 
 // command_next_match finds the next command after `after` whose name starts with
@@ -134,8 +136,14 @@ completion_reset :: proc(app: ^App) {
 
 @(private)
 completion_query_set :: proc(app: ^App, query: string) {
+	cloned, clone_error := strings.clone(query, app.run.alloc)
 	delete(app.completion_query, app.run.alloc)
-	app.completion_query = strings.clone(query, app.run.alloc)
+	app.completion_query = cloned
+	if clone_error != nil {
+		// The cycle keeps no prefix to anchor on; the next Tab starts from the
+		// first match of an empty query rather than from a stored one.
+		snap_append(app, .Warning, "the completion prefix could not be stored")
+	}
 }
 
 // command_help prints the command table and the keys the prompt answers to. It is
@@ -288,7 +296,11 @@ selection_mouse :: proc(app: ^App, mouse: input.Mouse_Event) {
 selection_copy :: proc(app: ^App) {
 	start, end := selection_bounds(app)
 	if start == end { return }
-	text := selection_text(app, app.storage, context.temp_allocator)
+	text, text_ok := selection_text(app, app.storage, context.temp_allocator)
+	if !text_ok {
+		snap_append(app, .Error, "the selection could not be copied: out of memory")
+		return
+	}
 	if text == "" { return }
 	if _, copy_err := term.clipboard_set(app.terminal, text); copy_err != nil {
 		snap_append(app, .Error, fmt.tprintf("the selection could not be copied: %v", copy_err))
@@ -354,7 +366,9 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 	case .Enter:
 		if .Shift in key.modifiers {
 			completion_reset(app)
-			_ = widgets.input_insert_newline(&app.input)
+			if !widgets.input_insert_newline(&app.input) {
+				snap_append(app, .Warning, "the prompt could not hold the new line")
+			}
 		} else {
 			submit(app)
 		}
@@ -419,7 +433,9 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 			}
 		} else if key.character >= 0x20 && key.character != 0x7f {
 			completion_reset(app)
-			widgets.input_insert_rune(&app.input, key.character)
+			if !widgets.input_insert_rune(&app.input, key.character) {
+				snap_append(app, .Warning, "the prompt could not hold that character")
+			}
 		}
 	case .Insert, .F1, .F2, .F3, .F4, .F5:
 	}
@@ -465,8 +481,13 @@ submit :: proc(app: ^App) {
 // it goes back to the prompt for an explicit submit. Nothing here starts a turn, and
 // nothing here reads the text as a command.
 restore_steering :: proc(app: ^App) {
-	taken := agent.steer_take_all(&app.run.steer)
+	taken, taken_ok := agent.steer_take_all(&app.run.steer)
 	defer agent.steer_taken_destroy(&app.run.steer, taken)
+	if !taken_ok {
+		// The lines could not be copied out, so they are still queued rather than lost.
+		snap_append(app, .Warning, "input queued during that turn could not be restored")
+		return
+	}
 	if len(taken) == 0 { return }
 	restored, join_err := strings.join(taken[:], "\n", app.run.alloc)
 	if join_err != nil {
@@ -540,7 +561,12 @@ enqueue :: proc(app: ^App, kind: Work_Kind, text: string = "") {
 		kind = kind,
 	}
 	if text != "" {
-		item.text = strings.clone(text, app.run.alloc)
+		cloned, clone_error := strings.clone(text, app.run.alloc)
+		if clone_error != nil {
+			snap_append(app, .Warning, "the line could not be stored; it was dropped")
+			return
+		}
+		item.text = cloned
 	}
 	if work_send(app, item) { return }
 	if item.text != "" {
@@ -558,7 +584,11 @@ paste_insert :: proc(app: ^App, text_value: string) {
 	if text_value == "" {
 		return
 	}
-	run := strings.builder_make(0, 0, context.temp_allocator)
+	run, run_error := strings.builder_make(0, 0, context.temp_allocator)
+	if run_error != nil {
+		snap_append(app, .Warning, "the pasted text could not be prepared")
+		return
+	}
 	for index := 0; index < len(text_value); {
 		r, width := utf8.decode_rune(text_value[index:])
 		index += max(width, 1)
@@ -571,10 +601,15 @@ paste_insert :: proc(app: ^App, text_value: string) {
 		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
 		// A control code point has no place in the prompt.
 		case:
-			strings.write_rune(&run, r)
+			if _, write_error := strings.write_rune(&run, r); write_error != nil {
+				snap_append(app, .Warning, "the pasted text could not be prepared")
+				return
+			}
 		}
 	}
-	widgets.input_insert(&app.input, strings.to_string(run))
+	if !widgets.input_insert(&app.input, strings.to_string(run)) {
+		snap_append(app, .Warning, "the prompt could not hold the pasted text")
+	}
 }
 
 // --- prompt history -------------------------------------------------------
@@ -591,7 +626,15 @@ prompt_clear :: proc(app: ^App) {
 // history_push stores a submitted prompt so the arrow keys can recall it. Only
 // prompts reach it: submit routes a slash command to dispatch_command.
 history_push :: proc(app: ^App, text: string) {
-	append(&app.history, strings.clone(text, app.run.alloc))
+	cloned, clone_error := strings.clone(text, app.run.alloc)
+	if clone_error != nil {
+		snap_append(app, .Warning, "the prompt could not be added to the history")
+		return
+	}
+	if append(&app.history, cloned) != 1 {
+		delete(cloned, app.run.alloc)
+		snap_append(app, .Warning, "the prompt could not be added to the history")
+	}
 }
 
 // history_draft_keep saves the composed line just before history navigation
@@ -602,7 +645,12 @@ history_draft_keep :: proc(app: ^App) {
 	history_draft_drop(app)
 	text := widgets.input_text(&app.input)
 	if text != "" {
-		app.history_draft = strings.clone(text, app.run.alloc)
+		cloned, clone_error := strings.clone(text, app.run.alloc)
+		if clone_error != nil {
+			snap_append(app, .Warning, "the line being composed could not be kept")
+			return
+		}
+		app.history_draft = cloned
 	}
 }
 
@@ -638,9 +686,13 @@ history_forward :: proc(app: ^App) {
 history_show :: proc(app: ^App) {
 	widgets.input_clear(&app.input)
 	if app.history_index < len(app.history) {
-		widgets.input_insert(&app.input, app.history[app.history_index])
+		if !widgets.input_insert(&app.input, app.history[app.history_index]) {
+			snap_append(app, .Warning, "the recalled prompt could not be shown")
+		}
 	} else if app.history_draft != "" {
-		widgets.input_insert(&app.input, app.history_draft)
+		if !widgets.input_insert(&app.input, app.history_draft) {
+			snap_append(app, .Warning, "the kept line could not be shown")
+		}
 	}
 }
 

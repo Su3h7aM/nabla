@@ -174,11 +174,8 @@ test_admission_repairs_only_what_has_one_reading :: proc(test: ^testing.T) {
 
 	placed := tool_arguments_prepare("{\"path\":\"a\",\n \"path\":\"b\"}", context.allocator)
 	defer tool_arguments_destroy(&placed, context.allocator)
-	testing.expect_value(
-		test,
-		tool_argument_error_text(placed.error, context.temp_allocator),
-		`field "path" appears twice in one object; a field may appear once, at line 2 column 2`,
-	)
+	placed_text, _ := tool_argument_error_text(placed.error, context.temp_allocator)
+	testing.expect_value(test, placed_text, `field "path" appears twice in one object; a field may appear once, at line 2 column 2`)
 }
 
 // An integer field reads an integer written as a whole number or as a decimal string, writes
@@ -224,7 +221,8 @@ test_field_readers_report_the_defect :: proc(test: ^testing.T) {
 	testing.expect_value(test, unknown.kind, Tool_Argument_Error_Kind.Unknown_Field)
 	testing.expect_value(test, unknown.field, "extra")
 	testing.expect(test, strings.contains(unknown.expected, "timeout_ms"), "the accepted fields are listed")
-	testing.expect(test, tool_argument_error_text(known_error, context.temp_allocator) != "")
+	known_text, _ := tool_argument_error_text(known_error, context.temp_allocator)
+	testing.expect(test, known_text != "")
 
 	_, nested_error := tool_field_object(json.String("x"), "edits/0", context.allocator)
 	defer tool_argument_error_destroy(&nested_error, context.allocator)

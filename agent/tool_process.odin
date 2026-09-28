@@ -84,12 +84,13 @@ tool_spawn_shell_flags :: proc(shell: string) -> (first, second: cstring) {
 // only async-signal-safe calls: it allocates, locks, and logs nothing, and every
 // failure leaves through _exit, which runs no atexit handler and flushes no stdio.
 tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stderr_write: ^os.File) -> (child: Tool_Child, spawn: Tool_Spawn, err: os.Error) {
-	arguments := make([dynamic]string, 0, context.temp_allocator)
-	append(&arguments, shell)
+	arguments, arguments_error := make([dynamic]string, 0, 4, context.temp_allocator)
+	if arguments_error != nil { return {}, .Failed, arguments_error }
+	append(&arguments, shell) or_return
 	flag_first, flag_second := tool_spawn_shell_flags(shell)
-	if flag_first != nil { append(&arguments, string(flag_first)) }
-	if flag_second != nil { append(&arguments, string(flag_second)) }
-	append(&arguments, "-c", command)
+	if flag_first != nil { append(&arguments, string(flag_first)) or_return }
+	if flag_second != nil { append(&arguments, string(flag_second)) or_return }
+	append(&arguments, "-c", command) or_return
 	return tool_spawn_command(arguments[:], directory, nil, stdout_write, stderr_write)
 }
 
@@ -392,13 +393,28 @@ tool_drain_pipes :: proc(
 	os.Error,
 ) {
 	deadline := time.tick_add(start, budget)
-	streams := [2]Tool_Stream {
-		{file = stdout_read, kept = make([dynamic]u8, allocator), open = true},
-		{file = stderr_read, kept = make([dynamic]u8, allocator), open = true},
+	streams := [2]Tool_Stream{{file = stdout_read, open = true}, {file = stderr_read, open = true}}
+	// Both buffers, and both spool paths, are made before the defer that hands them to the
+	// result, so a failure here releases what it made itself.
+	allocation_error: os.Error
+	for &stream in streams {
+		stream.kept, allocation_error = make([dynamic]u8, allocator)
+		if allocation_error != nil { break }
 	}
 	if spool_base != "" {
-		streams[0].spool_path = strings.concatenate({spool_base, ".stdout.txt"}, context.temp_allocator)
-		streams[1].spool_path = strings.concatenate({spool_base, ".stderr.txt"}, context.temp_allocator)
+		if allocation_error == nil {
+			streams[0].spool_path, allocation_error = strings.concatenate({spool_base, ".stdout.txt"}, allocator)
+		}
+		if allocation_error == nil {
+			streams[1].spool_path, allocation_error = strings.concatenate({spool_base, ".stderr.txt"}, allocator)
+		}
+	}
+	if allocation_error != nil {
+		for &stream in streams {
+			delete(stream.kept)
+			delete(stream.spool_path, allocator)
+		}
+		return .Wait_Failed, allocation_error
 	}
 	// Everything the command wrote is kept, whatever the drain ends with.
 	defer {
@@ -406,13 +422,19 @@ tool_drain_pipes :: proc(
 		data.stderr = string(streams[1].kept[:])
 		data.stdout_bytes = streams[0].total
 		data.stderr_bytes = streams[1].total
+		// A stream that never outgrew memory has no file, so its name is released here and the
+		// result takes the name of the file that does hold the whole stream.
 		if streams[0].spool != nil {
 			_ = os.close(streams[0].spool)
-			data.stdout_file = strings.clone(streams[0].spool_path, allocator)
+			data.stdout_file = streams[0].spool_path
+		} else {
+			delete(streams[0].spool_path, allocator)
 		}
 		if streams[1].spool != nil {
 			_ = os.close(streams[1].spool)
-			data.stderr_file = strings.clone(streams[1].spool_path, allocator)
+			data.stderr_file = streams[1].spool_path
+		} else {
+			delete(streams[1].spool_path, allocator)
 		}
 	}
 	scratch: [4096]u8

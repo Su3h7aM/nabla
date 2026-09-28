@@ -91,7 +91,11 @@ catalog_refresh :: proc(app: ^App) {
 
 catalog_refresh_with :: proc(app: ^App, provider_fetch: agent.Provider_Models_Fetch, models_dev_fetch: agent.Models_Dev_Fetch) {
 	allocator := app.run.alloc
-	names := make([]string, len(app.catalog_sources), context.temp_allocator)
+	names, names_error := make([]string, len(app.catalog_sources), context.temp_allocator)
+	if names_error != nil {
+		snap_append(app, .Warning, "the catalog refresh could not run: out of memory")
+		return
+	}
 	defer delete(names, context.temp_allocator)
 	for source, index in app.catalog_sources { names[index] = source.id }
 
@@ -99,7 +103,12 @@ catalog_refresh_with :: proc(app: ^App, provider_fetch: agent.Provider_Models_Fe
 	// result is published: the user's configuration, then the provider listing,
 	// then models.dev. The harness keeps running on the catalog published before
 	// this refresh until it finishes.
-	providers := agent.provider_models_refresh(app.catalog_sources, provider_fetch, &app.run.stopping, allocator)
+	providers, providers_ok := agent.provider_models_refresh(app.catalog_sources, provider_fetch, &app.run.stopping, allocator)
+	if !providers_ok {
+		// The listings could not be held: the catalog already published stays.
+		agent.catalog_sources_destroy(&providers, allocator)
+		return
+	}
 	catalog_sources_merge(&app.provider_sources, &providers, allocator)
 
 	// models.dev is read on its own, much longer cooldown: the records a re-read would
@@ -156,7 +165,16 @@ catalog_sources_replace :: proc(current, incoming: ^[dynamic]agent.Catalog_Provi
 
 catalog_publish :: proc(app: ^App, providers, models_dev: []agent.Catalog_Provider_Source) {
 	catalog, resolve_err := agent.resolve_catalog(app.catalog_sources, providers, models_dev, app.run.alloc)
-	if resolve_err != .None { return }
+	if resolve_err != .None {
+		// The catalog already published stays; the reason the replacement did not
+		// take effect is the one thing the user can act on.
+		if resolve_err == agent.Catalog_Error.Allocation {
+			snap_append(app, .Warning, "the catalog refresh could not be applied: out of memory")
+		} else {
+			snap_append(app, .Warning, "the catalog refresh could not be applied")
+		}
+		return
+	}
 
 	sync.mutex_lock(&app.catalog_mu)
 	replaced := app.setup.catalog
@@ -171,6 +189,8 @@ catalog_publish :: proc(app: ^App, providers, models_dev: []agent.Catalog_Provid
 
 catalog_selection_refresh_request :: proc(app: ^App) {
 	if runtime_stopping(app) || app.run.work == {} { return }
+	// A dropped wake is harmless: a full queue means the worker is already busy,
+	// and it syncs the published catalog at its own next boundary.
 	_ = work_send(app, Work{kind = .Catalog})
 }
 
@@ -184,8 +204,12 @@ catalog_selection_sync :: proc(app: ^App) {
 		app.run.catalog_applied_revision = revision
 		return
 	}
-	provider_id := strings.clone(app.setup.provider_id, context.temp_allocator)
-	model_id := strings.clone(app.setup.model_id, context.temp_allocator)
+	provider_id, provider_error := strings.clone(app.setup.provider_id, context.temp_allocator)
+	model_id, model_error := strings.clone(app.setup.model_id, context.temp_allocator)
+	if provider_error != nil || model_error != nil {
+		snap_append(app, .Warning, "the catalog change could not be applied: out of memory")
+		return
+	}
 	if apply_selection(app, provider_id, model_id, "", false) {
 		app.run.catalog_applied_revision = revision
 	}

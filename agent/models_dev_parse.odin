@@ -15,6 +15,8 @@ import "core:strings"
 
 Models_Dev_Parse_Error :: enum {
 	None,
+	// A source record could not be built because an allocation failed.
+	Allocation,
 	// The bytes are not valid JSON.
 	Invalid_JSON,
 	// The document is not an object of provider records.
@@ -65,11 +67,15 @@ models_dev_parse :: proc(data: []u8, providers: []string = {}, allocator := cont
 		models_object, models_is_object := models_value.(json.Object)
 		if !has_models || !models_is_object { return {}, .Invalid_Structure }
 
-		provider := models_dev_provider_source(provider_object, stated_id, allocator)
+		provider: Catalog_Provider_Source
+		if provider_error := models_dev_provider_source(provider_object, stated_id, allocator, &provider); provider_error != nil {
+			return {}, .Allocation
+		}
 		still_failed := true
 		defer if still_failed { catalog_provider_source_destroy(&provider, allocator) }
 
-		models := make([dynamic]Catalog_Model_Source, 0, len(models_object), allocator)
+		models, models_error := make([dynamic]Catalog_Model_Source, 0, len(models_object), allocator)
+		if models_error != nil { return {}, .Allocation }
 		// The models are handed to the provider on success; until then this loop owns
 		// them, so a refusal part-way through releases what it built.
 		models_owned := true
@@ -83,15 +89,23 @@ models_dev_parse :: proc(data: []u8, providers: []string = {}, allocator := cont
 			model_id, model_id_present := models_dev_member_string(model_object, "id")
 			if !model_id_present || model_id == "" { return {}, .Missing_Identity }
 
-			model := models_dev_model_source(model_object, allocator)
-			model.id = strings.clone(model_id, allocator)
-			append(&models, model)
+			model: Catalog_Model_Source
+			if model_error := models_dev_model_source(model_object, allocator, &model); model_error != nil { return {}, .Allocation }
+			model.id, models_error = strings.clone(model_id, allocator)
+			if models_error != nil {
+				catalog_model_source_destroy(&model, allocator)
+				return {}, .Allocation
+			}
+			if _, models_error = append(&models, model); models_error != nil {
+				catalog_model_source_destroy(&model, allocator)
+				return {}, .Allocation
+			}
 		}
 		provider.models = models[:]
 		slice.sort_by(provider.models, models_dev_model_less)
 		models_owned = false
 
-		append(&result, provider)
+		if _, append_error := append(&result, provider); append_error != nil { return {}, .Allocation }
 		still_failed = false
 	}
 
@@ -107,110 +121,121 @@ models_dev_provider_less :: proc(a, b: Catalog_Provider_Source) -> bool { return
 models_dev_model_less :: proc(a, b: Catalog_Model_Source) -> bool { return a.id < b.id }
 
 // models_dev_provider_source maps the provider fields that the source type can
-// represent. Everything else models.dev states about a provider -- its display
-// name, documentation link, and SDK version among them -- has no consumer here.
-models_dev_provider_source :: proc(object: json.Object, provider_id: string, allocator: mem.Allocator) -> Catalog_Provider_Source {
-	provider := Catalog_Provider_Source {
-		id = strings.clone(provider_id, allocator),
-	}
+// represent into out. Everything else models.dev states about a provider -- its
+// display name, documentation link, and SDK version among them -- has no consumer
+// here. A failure releases what it built and leaves out empty.
+models_dev_provider_source :: proc(object: json.Object, provider_id: string, allocator: mem.Allocator, out: ^Catalog_Provider_Source) -> mem.Allocator_Error {
+	failed := true
+	defer if failed { catalog_provider_source_destroy(out, allocator) }
+	out.id = strings.clone(provider_id, allocator) or_return
 	// The endpoint the provider's SDK talks to. Providers that rely on their
 	// SDK's built-in default do not state one, and leaving it absent is what makes
 	// the provider require an explicit base_url in configuration.
 	if base_url, base_url_present := models_dev_member_string(object, "api"); base_url_present && base_url != "" {
-		provider.base_url_present = true
-		provider.base_url = strings.clone(base_url, allocator)
+		out.base_url = strings.clone(base_url, allocator) or_return
+		out.base_url_present = true
 	}
 	if npm, npm_present := models_dev_member_string(object, "npm"); npm_present {
 		if api, api_known := models_dev_api_family(npm); api_known {
-			provider.api_present = true
-			provider.api = strings.clone(api, allocator)
+			out.api = strings.clone(api, allocator) or_return
+			out.api_present = true
 		}
 	}
 	// The catalog names the environment variable a credential is read from. Only
 	// the first is the credential: a later entry is a project, location, or
 	// account the SDK also needs, not an interchangeable key.
-	if variables, variables_present := models_dev_member_strings(object, "env", allocator); variables_present {
+	variables, variables_present, variables_error := models_dev_member_strings(object, "env", allocator)
+	if variables_error != nil { return variables_error }
+	if variables_present {
 		defer catalog_strings_destroy(variables, allocator)
 		if len(variables) > 0 && variables[0] != "" {
-			provider.api_key_present = true
-			provider.api_key = strings.concatenate([]string{"${", variables[0], "}"}, allocator = allocator)
+			out.api_key = strings.concatenate([]string{"${", variables[0], "}"}, allocator = allocator) or_return
+			out.api_key_present = true
 		}
 	}
-	return provider
+	failed = false
+	return nil
 }
 
-// models_dev_model_source maps one provider-nested model record. A model that names its own
-// SDK is served through that family regardless of its provider's. The family is stated only
-// when it is one this harness implements, so an unrecognized one leaves the provider's.
-models_dev_model_source :: proc(object: json.Object, allocator: mem.Allocator) -> Catalog_Model_Source {
-	model: Catalog_Model_Source
+// models_dev_model_source maps one provider-nested model record into out. A model that names
+// its own SDK is served through that family regardless of its provider's. The family is stated
+// only when it is one this harness implements, so an unrecognized one leaves the provider's. A
+// failure releases what it built and leaves out empty.
+models_dev_model_source :: proc(object: json.Object, allocator: mem.Allocator, out: ^Catalog_Model_Source) -> mem.Allocator_Error {
+	failed := true
+	defer if failed { catalog_model_source_destroy(out, allocator) }
 	if override_value, has_override := object["provider"]; has_override {
 		if override, override_is_object := override_value.(json.Object); override_is_object {
 			if npm, npm_present := models_dev_member_string(override, "npm"); npm_present {
 				if api, api_known := models_dev_api_family(npm); api_known {
-					model.api_present = true
-					model.api = strings.clone(api, allocator)
+					out.api = strings.clone(api, allocator) or_return
+					out.api_present = true
 				}
 			}
 		}
 	}
 
 	if display_name, display_name_present := models_dev_member_string(object, "name"); display_name_present {
-		model.display_name_present = true
-		model.display_name = strings.clone(display_name, allocator)
+		out.display_name = strings.clone(display_name, allocator) or_return
+		out.display_name_present = true
 	}
 	if limit_value, has_limit := object["limit"]; has_limit {
 		if limit, limit_is_object := limit_value.(json.Object); limit_is_object {
 			if context_window, context_present := models_dev_member_integer(limit, "context"); context_present {
-				model.context_window_present = true
-				model.context_window = context_window
+				out.context_window_present = true
+				out.context_window = context_window
 			}
 			if output, output_present := models_dev_member_integer(limit, "output"); output_present {
-				model.max_output_tokens_present = true
-				model.max_output_tokens = output
+				out.max_output_tokens_present = true
+				out.max_output_tokens = output
 			}
 		}
 	}
 	if modalities_value, has_modalities := object["modalities"]; has_modalities {
 		if modalities, modalities_is_object := modalities_value.(json.Object); modalities_is_object {
-			if input, input_present := models_dev_member_strings(modalities, "input", allocator); input_present {
-				model.input_modalities_present = true
-				model.input_modalities = input
+			input, input_present, input_error := models_dev_member_strings(modalities, "input", allocator)
+			if input_error != nil { return input_error }
+			if input_present {
+				out.input_modalities_present = true
+				out.input_modalities = input
 			}
-			if output, output_present := models_dev_member_strings(modalities, "output", allocator); output_present {
-				model.output_modalities_present = true
-				model.output_modalities = output
+			output, output_present, output_error := models_dev_member_strings(modalities, "output", allocator)
+			if output_error != nil { return output_error }
+			if output_present {
+				out.output_modalities_present = true
+				out.output_modalities = output
 			}
 		}
 	}
 	if tools, tools_present := models_dev_member_bool(object, "tool_call"); tools_present {
-		model.tools_present = true
-		model.tools = tools
+		out.tools_present = true
+		out.tools = tools
 	}
-	model.thinking = models_dev_thinking(object, allocator)
-	return model
+	models_dev_thinking(object, allocator, &out.thinking) or_return
+	failed = false
+	return nil
 }
 
-// models_dev_thinking maps the reasoning fields of one model. `reasoning` is the
-// support flag every record carries, and `reasoning_options` adds the control
-// forms the provider accepts, which are independent of one another.
-models_dev_thinking :: proc(object: json.Object, allocator: mem.Allocator) -> Catalog_Thinking_Source {
-	thinking: Catalog_Thinking_Source
+// models_dev_thinking maps the reasoning fields of one model into out. `reasoning` is the
+// support flag every record carries, and `reasoning_options` adds the control forms the
+// provider accepts, which are independent of one another. out owns nothing until a level
+// list is read, and that is the last thing this can fail on.
+models_dev_thinking :: proc(object: json.Object, allocator: mem.Allocator, out: ^Catalog_Thinking_Source) -> mem.Allocator_Error {
 	supported, supported_present := models_dev_member_bool(object, "reasoning")
-	if !supported_present { return thinking }
-	thinking.present = true
-	thinking.supported_present = true
-	thinking.supported = supported
+	if !supported_present { return nil }
+	out.present = true
+	out.supported_present = true
+	out.supported = supported
 	// A model that cannot reason is a terminal negative: no control form below it
 	// can apply, and resolution relies on that to block the whole subtree.
 	if !supported {
-		thinking.blocked = true
-		return thinking
+		out.blocked = true
+		return nil
 	}
 	options_value, has_options := object["reasoning_options"]
-	if !has_options { return thinking }
+	if !has_options { return nil }
 	options, options_is_array := options_value.(json.Array)
-	if !options_is_array { return thinking }
+	if !options_is_array { return nil }
 
 	for option in options {
 		option_object, option_is_object := option.(json.Object)
@@ -219,32 +244,34 @@ models_dev_thinking :: proc(object: json.Object, allocator: mem.Allocator) -> Ca
 		if !kind_present { continue }
 		switch kind {
 		case "toggle":
-			thinking.toggle_present = true
-			thinking.toggle = true
+			out.toggle_present = true
+			out.toggle = true
 		case "effort":
 			// The first effort list wins, and one is kept at most, so a record
 			// that repeats the control form cannot leak the earlier list.
-			if thinking.levels_present { continue }
-			if levels, levels_present := models_dev_member_strings(option_object, "values", allocator); levels_present {
-				thinking.levels_present = true
-				thinking.levels = levels
+			if out.levels_present { continue }
+			levels, levels_present, levels_error := models_dev_member_strings(option_object, "values", allocator)
+			if levels_error != nil { return levels_error }
+			if levels_present {
+				out.levels_present = true
+				out.levels = levels
 			}
 		case "budget_tokens":
-			thinking.budget.present = true
+			out.budget.present = true
 			if minimum, minimum_present := models_dev_member_integer(option_object, "min"); minimum_present {
-				thinking.budget.min_present = true
-				thinking.budget.min = minimum
+				out.budget.min_present = true
+				out.budget.min = minimum
 			}
 			if maximum, maximum_present := models_dev_member_integer(option_object, "max"); maximum_present {
-				thinking.budget.max_present = true
-				thinking.budget.max = maximum
+				out.budget.max_present = true
+				out.budget.max = maximum
 			}
 		case:
 		// A control form this harness does not implement is ignored rather
 		// than guessed at.
 		}
 	}
-	return thinking
+	return nil
 }
 
 // models_dev_api_family translates the package that speaks a provider's wire
@@ -306,24 +333,41 @@ models_dev_member_integer :: proc(object: json.Object, key: string) -> (value: i
 
 // models_dev_member_strings reads a member that must be an array of strings. The list is
 // copied, because the parsed document is released as soon as parsing finishes. A non-string
-// element is dropped rather than failing the catalog.
-models_dev_member_strings :: proc(object: json.Object, key: string, allocator: mem.Allocator) -> (values: []string, present: bool) {
+// element is dropped rather than failing the catalog. An allocation failure is reported rather
+// than returning a short list.
+models_dev_member_strings :: proc(object: json.Object, key: string, allocator: mem.Allocator) -> (values: []string, present: bool, err: mem.Allocator_Error) {
 	member, found := object[key]
-	if !found { return nil, false }
+	if !found { return nil, false, nil }
 	array, is_array := member.(json.Array)
-	if !is_array { return nil, false }
+	if !is_array { return nil, false, nil }
 
 	collected: [dynamic]string
 	collected.allocator = allocator
 	for element in array {
 		text, is_string := element.(json.String)
 		if !is_string { continue }
-		append(&collected, strings.clone(string(text), allocator))
+		cloned, clone_error := strings.clone(string(text), allocator)
+		if clone_error != nil {
+			for owned in collected { delete(owned, allocator) }
+			delete(collected)
+			return nil, false, clone_error
+		}
+		if _, append_error := append(&collected, cloned); append_error != nil {
+			delete(cloned, allocator)
+			for owned in collected { delete(owned, allocator) }
+			delete(collected)
+			return nil, false, append_error
+		}
 	}
 	// The result is a slice the catalog's own release routine can free, so it is
 	// copied out of the accumulator rather than sharing its capacity.
-	result := make([]string, len(collected), allocator)
+	result, result_error := make([]string, len(collected), allocator)
+	if result_error != nil {
+		for owned in collected { delete(owned, allocator) }
+		delete(collected)
+		return nil, false, result_error
+	}
 	copy(result, collected[:])
 	delete(collected)
-	return result, true
+	return result, true, nil
 }

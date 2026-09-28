@@ -21,8 +21,8 @@ Fetch_Body :: struct {
 fetch_collect :: proc(user_data: rawptr, chunk: []u8) {
 	body := cast(^Fetch_Body)user_data
 	if body.failed { return }
-	written := append(&body.bytes, ..chunk)
-	if written != len(chunk) { body.failed = true }
+	written, append_error := append(&body.bytes, ..chunk)
+	if append_error != nil || written != len(chunk) { body.failed = true }
 }
 
 // fetch_body_finish hands the accumulated body to the caller as an exactly-sized

@@ -48,7 +48,7 @@ Chat_Request_Prep :: struct {
 @(private)
 chat_prepare :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, arena: mem.Allocator) -> (prep: Chat_Request_Prep, error: journal.Error) {
 	prep.projection = projection_load(chat.store, chat.session, chat.head, arena) or_return
-	chat_build_request_into(chat, &prep, prep.projection.items, prep.projection.summary, connection, "", arena)
+	chat_build_request_into(chat, &prep, prep.projection.items, prep.projection.summary, connection, "", arena) or_return
 	return prep, nil
 }
 
@@ -81,11 +81,14 @@ chat_build_request_into :: proc(
 	connection: ai.Provider_Connection,
 	directive: string,
 	arena: mem.Allocator,
-) {
-	prep.wire = make([dynamic]ai.Provider_Message, 0, len(items) + 3, arena)
-	prep.tools = make([dynamic]ai.Provider_Tool_Def, 0, arena)
-	prep.calls = make([dynamic][dynamic]ai.Provider_Tool_Call, 0, arena)
-	prep.feedback = make([dynamic]string, 0, arena)
+) -> mem.Allocator_Error {
+	// The request carries one message per entry, so its list is the one table that is sized
+	// before it is filled. The other three hold nothing yet: each carries the arena its first
+	// entry grows from, and nothing here allocates before there is something to put in it.
+	prep.wire = make([dynamic]ai.Provider_Message, 0, len(items) + 3, arena) or_return
+	prep.tools.allocator = arena
+	prep.calls.allocator = arena
+	prep.feedback.allocator = arena
 
 	// The instruction lane is the most stable content a request carries, so it
 	// travels beside the conversation rather than as a turn inside it.
@@ -99,19 +102,19 @@ chat_build_request_into :: proc(
 	// with the checkpoint message as the harness stored it and continues with
 	// the items after it.
 	if summary != "" {
-		append(&prep.wire, ai.Provider_Message{Role = .User, Content = summary})
+		append(&prep.wire, ai.Provider_Message{Role = .User, Content = summary}) or_return
 	}
 	replay := Chat_Replay_Target {
 		api      = connection.API,
 		provider = chat.provider_id,
 		model    = chat.model_id,
 	}
-	prep.replay_refused = chat_append_projection(&prep.wire, &prep.calls, &prep.feedback, replay, items, arena)
+	prep.replay_refused = chat_append_projection(&prep.wire, &prep.calls, &prep.feedback, replay, items, arena) or_return
 	if directive != "" {
-		append(&prep.wire, ai.Provider_Message{Role = .User, Content = directive})
+		append(&prep.wire, ai.Provider_Message{Role = .User, Content = directive}) or_return
 	}
 
-	session_text := strings.clone(chat_session_text(chat), arena)
+	session_text := strings.clone(chat_session_text(chat), arena) or_return
 	prep.request = ai.Provider_Request {
 		API                  = connection.API,
 		Model_Present        = true,
@@ -156,7 +159,10 @@ chat_build_request_into :: proc(
 	}
 	if chat.tools_enabled {
 		for &definition in chat.tools.definitions {
-			append(&prep.tools, ai.Provider_Tool_Def{Name = definition.name, Description = definition.description, Parameters_JSON = definition.input_schema})
+			append(
+				&prep.tools,
+				ai.Provider_Tool_Def{Name = definition.name, Description = definition.description, Parameters_JSON = definition.input_schema},
+			) or_return
 		}
 		prep.request.Tools = prep.tools[:]
 	}
@@ -169,6 +175,7 @@ chat_build_request_into :: proc(
 	// the prefix rather than the whole context.
 	prep.request.Max_Output_Tokens_Present = true
 	prep.request.Max_Output_Tokens, _ = chat_request_output_bound(chat.capacity, prep.estimate)
+	return nil
 }
 
 // Chat_Replay_Target is who a request goes to. An endpoint's native output items are
@@ -213,6 +220,7 @@ chat_append_projection :: proc(
 	arena: mem.Allocator,
 ) -> (
 	replay_refused: int,
+	allocation_error: mem.Allocator_Error,
 ) {
 	// The lookups and replay parses are this projection's own, so the temp memory they use
 	// is released when it ends. A caller that asked for the request in temp memory keeps
@@ -228,7 +236,10 @@ chat_append_projection :: proc(
 	// result becomes harness feedback. The name is kept so the account says which
 	// call it is about.
 	refused := make(map[journal.Call_Id]string, allocator = context.temp_allocator)
-	pending := make([dynamic]string, context.temp_allocator)
+	// The feedback waiting for the result that follows it holds nothing yet; it carries the
+	// allocator its entries grow from.
+	pending: [dynamic]string
+	pending.allocator = context.temp_allocator
 
 	// A response whose native output is not replayed is projected as text and calls. It is
 	// decided here, where the answer still decides what the whole request carries.
@@ -260,19 +271,19 @@ chat_append_projection :: proc(
 		covered := verbatim[item.request]
 		// Feedback waits for the last result of the response it belongs to, so the
 		// results stay adjacent to the assistant message that asked for them.
-		if _, is_result := item.payload.(Projected_Result); !is_result { chat_flush_feedback(messages, &pending) }
+		if _, is_result := item.payload.(Projected_Result); !is_result { chat_flush_feedback(messages, &pending) or_return }
 		switch payload in item.payload {
 		case Projected_User:
-			chat_flush_calls(messages, call_lists, &group, &group_open)
-			append(messages, ai.Provider_Message{Role = .User, Content = payload.text})
+			chat_flush_calls(messages, call_lists, &group, &group_open) or_return
+			append(messages, ai.Provider_Message{Role = .User, Content = payload.text}) or_return
 		case Projected_Assistant:
 			if !covered {
-				chat_flush_calls(messages, call_lists, &group, &group_open)
-				append(messages, ai.Provider_Message{Role = .Assistant, Content = payload.text})
+				chat_flush_calls(messages, call_lists, &group, &group_open) or_return
+				append(messages, ai.Provider_Message{Role = .Assistant, Content = payload.text}) or_return
 			}
 		case Projected_Response:
-			chat_flush_calls(messages, call_lists, &group, &group_open)
-			if covered { append(messages, ai.Provider_Message{Verbatim_Items = payload.output}) }
+			chat_flush_calls(messages, call_lists, &group, &group_open) or_return
+			if covered { append(messages, ai.Provider_Message{Verbatim_Items = payload.output}) or_return }
 		case Projected_Call:
 			// The provider id is indexed before the coverage check: a result names its
 			// call whether or not the call is projected.
@@ -280,17 +291,20 @@ chat_append_projection :: proc(
 			if covered { continue }
 			arguments, project, _ := chat_replay_call(payload)
 			if project {
-				append(&group, ai.Provider_Tool_Call{ID = payload.provider_id, Item_ID = payload.item_id, Name = payload.name, Arguments = arguments})
+				append(
+					&group,
+					ai.Provider_Tool_Call{ID = payload.provider_id, Item_ID = payload.item_id, Name = payload.name, Arguments = arguments},
+				) or_return
 				group_open = true
 			} else {
 				refused[payload.call] = payload.name
 			}
 		case Projected_Result:
-			chat_flush_calls(messages, call_lists, &group, &group_open)
+			chat_flush_calls(messages, call_lists, &group, &group_open) or_return
 			if name, is_refused := refused[payload.call]; is_refused {
-				text := strings.concatenate({name, CHAT_REFUSED_CALL_SUFFIX, payload.content}, arena)
-				append(feedback, text)
-				append(&pending, text)
+				text := strings.concatenate({name, CHAT_REFUSED_CALL_SUFFIX, payload.content}, arena) or_return
+				append(feedback, text) or_return
+				append(&pending, text) or_return
 			} else {
 				message := ai.Provider_Message {
 					Role          = .Tool,
@@ -298,12 +312,12 @@ chat_append_projection :: proc(
 					Tool_Call_ID  = provider_ids[payload.call],
 					Tool_Is_Error = payload.outcome != .Success,
 				}
-				append(messages, message)
+				append(messages, message) or_return
 			}
 		}
 	}
-	chat_flush_calls(messages, call_lists, &group, &group_open)
-	chat_flush_feedback(messages, &pending)
+	chat_flush_calls(messages, call_lists, &group, &group_open) or_return
+	chat_flush_feedback(messages, &pending) or_return
 	return
 }
 
@@ -356,11 +370,12 @@ chat_replay_record_agrees :: proc(declared: []ai.Provider_Tool_Call, request: jo
 }
 
 @(private)
-chat_flush_feedback :: proc(messages: ^[dynamic]ai.Provider_Message, pending: ^[dynamic]string) {
+chat_flush_feedback :: proc(messages: ^[dynamic]ai.Provider_Message, pending: ^[dynamic]string) -> mem.Allocator_Error {
 	for text in pending^ {
-		append(messages, ai.Provider_Message{Role = .User, Content = text})
+		append(messages, ai.Provider_Message{Role = .User, Content = text}) or_return
 	}
 	clear(pending)
+	return nil
 }
 
 @(private)
@@ -369,14 +384,15 @@ chat_flush_calls :: proc(
 	call_lists: ^[dynamic][dynamic]ai.Provider_Tool_Call,
 	group: ^[dynamic]ai.Provider_Tool_Call,
 	open: ^bool,
-) {
-	if !open^ { return }
-	append(call_lists, group^)
-	append(messages, ai.Provider_Message{Role = .Assistant, Tool_Calls = call_lists[len(call_lists) - 1][:]})
+) -> mem.Allocator_Error {
+	if !open^ { return nil }
+	append(call_lists, group^) or_return
+	append(messages, ai.Provider_Message{Role = .Assistant, Tool_Calls = call_lists[len(call_lists) - 1][:]}) or_return
 	allocator := group.allocator
 	group^ = {}
 	group.allocator = allocator
 	open^ = false
+	return nil
 }
 
 @(private)

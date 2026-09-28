@@ -826,7 +826,11 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 	// The prompt is answered once its work is done, so it waits for the subagents it started
 	// in the background and answers each report with a turn of its own.
 	for turn_completed && agent.chat_agents_wait(chat, &server.app.run.control.stop) {
-		if report, _ := agent.chat_session_accept_agent_message(chat, observer); report != .Accepted {
+		report, had_message := agent.chat_session_accept_agent_message(chat, observer)
+		// The report the wait promised was taken elsewhere; there is nothing
+		// left to run a turn for.
+		if !had_message { break }
+		if report != .Accepted {
 			turn_completed = false
 			break
 		}
@@ -1016,7 +1020,8 @@ acp_send_session_info :: proc(server: ^Acp_Server, title: string) -> bool {
 // message in the client, which is what keeps a notice from reading as part of the answer.
 acp_send_user_message :: proc(server: ^Acp_Server, message_id, text: string) -> bool {
 	if !acp_is_v2(server) { return false }
-	content := make([]acp.Text_Content, 1, context.temp_allocator)
+	content, content_error := make([]acp.Text_Content, 1, context.temp_allocator)
+	if content_error != nil { return false }
 	content[0] = {
 		type = acp.CONTENT_TEXT,
 		text = text,
@@ -1031,7 +1036,8 @@ acp_send_state :: proc(server: ^Acp_Server, state, stop_reason: string) -> bool 
 
 acp_send_message_full :: proc(server: ^Acp_Server, kind, message_id, text: string) -> bool {
 	if !acp_is_v2(server) { return acp_send_message(server, kind, text, message_id) }
-	content := make([]acp.Text_Content, 1, context.temp_allocator)
+	content, content_error := make([]acp.Text_Content, 1, context.temp_allocator)
+	if content_error != nil { return false }
 	content[0] = {
 		type = acp.CONTENT_TEXT,
 		text = text,
@@ -1057,8 +1063,10 @@ acp_send_tool_call :: proc(server: ^Acp_Server, call_id, name, arguments: string
 	defer if parse_err == nil { json.destroy_value(raw, context.temp_allocator) }
 	content: []acp.Tool_Call_Content
 	if output != "" {
-		content = make([]acp.Tool_Call_Content, 1, context.temp_allocator)
-		content[0] = acp_tool_content(output)
+		made, content_error := make([]acp.Tool_Call_Content, 1, context.temp_allocator)
+		if content_error != nil { return false }
+		made[0] = acp_tool_content(output)
+		content = made
 	}
 	if acp_is_v2(server) {
 		return acp_notify(
@@ -1091,7 +1099,8 @@ acp_send_tool_call :: proc(server: ^Acp_Server, call_id, name, arguments: string
 
 // acp_send_tool_result settles a call that was already announced, by its id.
 acp_send_tool_result :: proc(server: ^Acp_Server, call_id: string, status: acp.Tool_Status, output: string) -> bool {
-	content := make([]acp.Tool_Call_Content, 1, context.temp_allocator)
+	content, content_error := make([]acp.Tool_Call_Content, 1, context.temp_allocator)
+	if content_error != nil { return false }
 	content[0] = acp_tool_content(output)
 	if acp_is_v2(server) {
 		return acp_notify(
@@ -1167,10 +1176,15 @@ acp_replay_assistant_message_id :: proc(item: agent.Projection_Item) -> string {
 }
 
 // acp_set_active_message_id names the v2 answer being streamed. The id is owned by
-// the server so it outlives the scratch memory the streamed chunks borrow.
+// the server so it outlives the scratch memory the streamed chunks borrow. A copy
+// that fails is recorded and leaves the previous id in place, so the stream
+// continues under the id it already had rather than under none.
 acp_set_active_message_id :: proc(server: ^Acp_Server, message_id: string) {
 	owned, clone_error := strings.clone(message_id, server.alloc)
-	if clone_error != nil { return }
+	if clone_error != nil {
+		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "acp.message_id_failed"})
+		return
+	}
 	delete(server.active_message_id, server.alloc)
 	server.active_message_id = owned
 }
@@ -1369,7 +1383,7 @@ acp_tool_title :: proc(name, arguments: string) -> string {
 		}
 	}
 	if detail == "" { return name }
-	excerpt := agent.chat_title_from_prompt(detail, context.temp_allocator)
-	if excerpt == "" { return name }
+	excerpt, excerpt_error := agent.chat_title_from_prompt(detail, context.temp_allocator)
+	if excerpt_error != nil || excerpt == "" { return name }
 	return fmt.tprintf("%s %s", name, excerpt)
 }

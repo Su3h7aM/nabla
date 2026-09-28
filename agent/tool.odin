@@ -334,22 +334,29 @@ tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition)
 		if fields_error != nil { return {kind = .Allocation, tool = definition.name, detail = "the schema's integer fields could not be recorded"} }
 		integer_fields = fields
 	}
-	append(
-		&registry.definitions,
-		Tool_Definition {
-			name = strings.clone(definition.name, registry.allocator),
-			description = strings.clone(definition.description, registry.allocator),
-			input_schema = strings.clone(definition.input_schema, registry.allocator),
-			integer_fields = integer_fields,
-			hints = definition.hints,
-			placement = definition.placement,
-			timeout = definition.timeout,
-			execute = definition.execute,
-			kind = definition.kind,
-			backend = definition.backend,
-			lane = definition.lane,
-		},
-	)
+	added := Tool_Definition {
+		integer_fields = integer_fields,
+		hints          = definition.hints,
+		placement      = definition.placement,
+		timeout        = definition.timeout,
+		execute        = definition.execute,
+		kind           = definition.kind,
+		backend        = definition.backend,
+		lane           = definition.lane,
+	}
+	copy_error: mem.Allocator_Error
+	added.name, copy_error = strings.clone(definition.name, registry.allocator)
+	if copy_error == nil { added.description, copy_error = strings.clone(definition.description, registry.allocator) }
+	if copy_error == nil { added.input_schema, copy_error = strings.clone(definition.input_schema, registry.allocator) }
+	if copy_error != nil {
+		// The definition owns only the copies made so far, so releasing it here releases them.
+		tool_definition_destroy(&added, registry.allocator)
+		return {kind = .Allocation, tool = definition.name, detail = "the definition could not be copied"}
+	}
+	if _, append_error := append(&registry.definitions, added); append_error != nil {
+		tool_definition_destroy(&added, registry.allocator)
+		return {kind = .Allocation, tool = definition.name, detail = "the tool table could not be grown"}
+	}
 	return {}
 }
 
@@ -484,8 +491,14 @@ tool_result_failure :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, m
 // tool_result_refused takes ownership of err and answers a call whose arguments
 // could not be admitted. Nothing ran, and the result says exactly why.
 tool_result_refused :: proc(ctx: ^Tool_Context, err: ^Tool_Argument_Error) -> Tool_Result {
-	text := tool_argument_error_text(err^, ctx.allocator)
+	text, text_error := tool_argument_error_text(err^, ctx.allocator)
 	defer delete(text, ctx.allocator)
+	if text_error != nil {
+		// The refusal is answered without its own words, so it is released here rather than
+		// handed to a result that never keeps it.
+		tool_argument_error_destroy(err, ctx.allocator)
+		return tool_result_failure(ctx, .Tool_Failed, "the refusal could not be described: out of memory", "out of memory")
+	}
 	result := tool_result_of(ctx, .Invalid_Arguments, text, tool_argument_failure(err^), text)
 	result.error = err^
 	err^ = {}

@@ -227,7 +227,7 @@ test_enrichment_stated_levels_send_the_chosen_effort :: proc(test: ^testing.T) {
 	chat := &fixture.chat
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW)
 	testing.expect(test, !chat_session_set_effort(chat, "high"))
-	append(&chat.effort_levels, chat_clone_string("high", chat.allocator))
+	append(&chat.effort_levels, chat_clone_string("high", chat.allocator) or_else "")
 	testing.expect(test, chat_session_set_effort(chat, "high"))
 
 	_test_accept(test, chat, "hello")

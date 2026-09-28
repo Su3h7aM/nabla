@@ -45,7 +45,8 @@ test_discovery_lists_a_provider_and_states_only_ids :: proc(t: ^testing.T) {
 	}
 	providers := []Catalog_Provider_Source{discovery_source("proxy", "http://proxy.test/v1", "literal-key")}
 
-	discovered := discover_provider_models(providers, discovery_stub_fetch, &stub, context.allocator)
+	discovered, discovered_ok := discover_provider_models(providers, discovery_stub_fetch, &stub, context.allocator)
+	testing.expect(t, discovered_ok)
 	defer catalog_sources_destroy(&discovered, context.allocator)
 
 	testing.expect_value(t, stub.calls, 1)
@@ -77,7 +78,8 @@ test_discovery_skips_a_provider_it_cannot_ask :: proc(t: ^testing.T) {
 		discovery_source("proxy", "http://proxy.test/v1", "literal-key"),
 	}
 
-	discovered := discover_provider_models(providers, discovery_stub_fetch, &stub, context.allocator)
+	discovered, discovered_ok := discover_provider_models(providers, discovery_stub_fetch, &stub, context.allocator)
+	testing.expect(t, discovered_ok)
 	defer catalog_sources_destroy(&discovered, context.allocator)
 
 	testing.expect_value(t, len(discovered), 1)
@@ -108,7 +110,8 @@ test_discovery_contributes_to_the_catalog_without_overriding_the_user :: proc(t:
 		},
 	}
 
-	discovered := discover_provider_models(user, discovery_stub_fetch, &stub, context.allocator)
+	discovered, discovered_ok := discover_provider_models(user, discovery_stub_fetch, &stub, context.allocator)
+	testing.expect(t, discovered_ok)
 	defer catalog_sources_destroy(&discovered, context.allocator)
 	resolved, err := resolve_catalog(user, discovered[:], {})
 	defer catalog_destroy(&resolved)
@@ -131,7 +134,8 @@ test_provider_discovery_refreshes_once_and_serves_the_cache :: proc(t: ^testing.
 		first := Discovery_Stub {
 			body = DISCOVERY_FIXTURE,
 		}
-		refreshed := provider_models_refresh(providers, discovery_stub_fetch, &first, context.allocator)
+		refreshed, refreshed_ok := provider_models_refresh(providers, discovery_stub_fetch, &first, context.allocator)
+		testing.expect(t, refreshed_ok)
 		defer catalog_sources_destroy(&refreshed)
 		testing.expect_value(t, first.calls, 1)
 		testing.expect_value(t, len(refreshed), 1)
@@ -139,12 +143,14 @@ test_provider_discovery_refreshes_once_and_serves_the_cache :: proc(t: ^testing.
 		second := Discovery_Stub {
 			body = `{"data":[{"id":"wrong"}]}`,
 		}
-		fresh := provider_models_refresh(providers, discovery_stub_fetch, &second, context.allocator)
+		fresh, fresh_ok := provider_models_refresh(providers, discovery_stub_fetch, &second, context.allocator)
+		testing.expect(t, fresh_ok)
 		defer catalog_sources_destroy(&fresh)
 		testing.expect_value(t, second.calls, 0)
 		testing.expect_value(t, fresh[0].models[0].id, "proxy/one")
 
-		cached := provider_models_cached(providers, context.allocator)
+		cached, cached_ok := provider_models_cached(providers, context.allocator)
+		testing.expect(t, cached_ok)
 		defer catalog_sources_destroy(&cached)
 		testing.expect_value(t, len(cached), 1)
 		testing.expect_value(t, cached[0].models[1].id, "proxy/two")
@@ -162,7 +168,8 @@ test_provider_discovery_replaces_an_invalid_fresh_cache :: proc(t: ^testing.T) {
 		stub := Discovery_Stub {
 			body = DISCOVERY_FIXTURE,
 		}
-		refreshed := provider_models_refresh(providers, discovery_stub_fetch, &stub, context.allocator)
+		refreshed, refreshed_ok := provider_models_refresh(providers, discovery_stub_fetch, &stub, context.allocator)
+		testing.expect(t, refreshed_ok)
 		defer catalog_sources_destroy(&refreshed)
 		testing.expect_value(t, stub.calls, 1)
 		testing.expect_value(t, refreshed[0].models[0].id, "proxy/one")
@@ -187,7 +194,8 @@ test_provider_discovery_reads_a_listing_of_any_size :: proc(t: ^testing.T) {
 		testing.expect(t, os.write_entire_file(path, transmute([]u8)body) == nil)
 
 		stub := Discovery_Stub{}
-		refreshed := provider_models_refresh(providers, discovery_stub_fetch, &stub, context.allocator)
+		refreshed, refreshed_ok := provider_models_refresh(providers, discovery_stub_fetch, &stub, context.allocator)
+		testing.expect(t, refreshed_ok)
 		defer catalog_sources_destroy(&refreshed)
 		testing.expect_value(t, stub.calls, 0)
 		testing.expect_value(t, len(refreshed), 1)

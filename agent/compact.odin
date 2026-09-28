@@ -66,8 +66,9 @@ Rules:
 CHAT_COMPACT_CHECKPOINT_PREAMBLE :: "The conversation was compacted through this checkpoint. Treat the summary as established background and continue the task from the messages that follow without acknowledging the checkpoint."
 
 // chat_checkpoint_text frames a summary as the checkpoint message the model reads.
-// The result is owned by allocator.
-chat_checkpoint_text :: proc(summary: string, allocator: mem.Allocator) -> string {
+// The result is owned by allocator, and a frame that did not fit is reported: a
+// checkpoint the model cannot read must not be installed as an empty one.
+chat_checkpoint_text :: proc(summary: string, allocator: mem.Allocator) -> (string, mem.Allocator_Error) {
 	return strings.concatenate({CHAT_COMPACT_CHECKPOINT_PREAMBLE, "\n\n", summary}, allocator)
 }
 
@@ -153,8 +154,8 @@ chat_compact_snapshot_make :: proc(
 	turn: journal.Turn_Id,
 	allocator: mem.Allocator,
 ) -> (
-	snapshot: Compact_Snapshot,
-	err: ai.Provider_Request_Error,
+	Compact_Snapshot,
+	ai.Provider_Request_Error,
 ) {
 	body, encode_err := ai.Provider_Encode_Request(prep.request, allocator)
 	if encode_err != .None { return {}, encode_err }
@@ -162,23 +163,35 @@ chat_compact_snapshot_make :: proc(
 	// before it is the prefix this summary will stand in for.
 	head_count := len(prep.wire) - 1
 	if head_count < 0 { head_count = 0 }
-	return Compact_Snapshot {
-			api = connection.API,
-			endpoint = strings.clone(connection.Endpoint, allocator),
-			credential = strings.clone(connection.Credential, allocator),
-			body = body,
-			model = strings.clone(prep.request.Model, allocator),
-			tools = len(prep.request.Tools),
-			session_id = strings.clone(prep.request.Session_Id, allocator),
-			parent_session_id = strings.clone(prep.request.Parent_Session_Id, allocator),
-			user_agent = strings.clone(prep.request.User_Agent, allocator),
-			base = base,
-			covers = covers,
-			turn = turn,
-			estimate = prep.estimate,
-			head_estimate = chat_estimate_input_tokens("", prep.wire[:head_count], nil),
-		},
-		.None
+	snapshot := Compact_Snapshot {
+		api           = connection.API,
+		body          = body,
+		tools         = len(prep.request.Tools),
+		base          = base,
+		covers        = covers,
+		turn          = turn,
+		estimate      = prep.estimate,
+		head_estimate = chat_estimate_input_tokens("", prep.wire[:head_count], nil),
+	}
+	// A copy that does not fit releases the snapshot, so the caller never receives a frozen
+	// request that owns half of what it names: the encoded body belongs to it either way.
+	transferred := false
+	defer if !transferred { chat_compact_snapshot_destroy(&snapshot, allocator) }
+	clone_error: mem.Allocator_Error
+	snapshot.endpoint, clone_error = strings.clone(connection.Endpoint, allocator)
+	if clone_error != nil { return {}, .Allocation }
+	snapshot.credential, clone_error = strings.clone(connection.Credential, allocator)
+	if clone_error != nil { return {}, .Allocation }
+	snapshot.model, clone_error = strings.clone(prep.request.Model, allocator)
+	if clone_error != nil { return {}, .Allocation }
+	snapshot.session_id, clone_error = strings.clone(prep.request.Session_Id, allocator)
+	if clone_error != nil { return {}, .Allocation }
+	snapshot.parent_session_id, clone_error = strings.clone(prep.request.Parent_Session_Id, allocator)
+	if clone_error != nil { return {}, .Allocation }
+	snapshot.user_agent, clone_error = strings.clone(prep.request.User_Agent, allocator)
+	if clone_error != nil { return {}, .Allocation }
+	transferred = true
+	return snapshot, .None
 }
 
 chat_compact_snapshot_destroy :: proc(snapshot: ^Compact_Snapshot, allocator: mem.Allocator) {
@@ -269,39 +282,43 @@ Compact_State :: enum {
 // the interrupt that bounds it. The owner touches none of it between
 // start and join.
 Compact_Job :: struct {
-	snapshot:   Compact_Snapshot,
-	request:    journal.Request_Id,
-	interrupt:  ai.Interrupt,
-	thread:     ^thread.Thread,
+	snapshot:    Compact_Snapshot,
+	request:     journal.Request_Id,
+	interrupt:   ai.Interrupt,
+	thread:      ^thread.Thread,
 	// allocator is the thread-safe heap the job itself and the worker-owned storage come from:
 	// the frozen snapshot, the output it accumulates, and everything the request allocates while
 	// it runs. It is deliberately not the session's allocator: wrapping the worker's own
 	// allocations in a lock would not serialize the owner's writes through the same backing
 	// allocator, so the two threads never share one, and a job whose worker ignores its stop
 	// outlives the allocator the session releases.
-	allocator:  mem.Allocator,
+	allocator:   mem.Allocator,
 	// logging is the immutable binding the worker uses for provider and runtime records.
 	// It points at the session's sink and owns no strings.
-	logging:    Log_Binding,
+	logging:     Log_Binding,
 	// finished is atomic: the worker stores it once the fields below are final.
-	finished:   bool,
-	output:     [dynamic]u8, // owner after join
-	reason:     ai.Provider_Finish_Reason,
-	tool_calls: int,
-	failed:     bool,
-	error_text: string, // owned; the transport's or the provider's account
-	operation:  ai.Provider_Operation_Error,
-	usage:      journal.Response_Committed,
-	started_at: time.Tick,
+	finished:    bool,
+	output:      [dynamic]u8, // owner after join
+	// output_lost records that a fragment of the summary could not be kept, so what the job
+	// holds is not what the model wrote. Such a job has no summary at all: installing what fit
+	// in memory would replace committed history with a partial account of it.
+	output_lost: bool,
+	reason:      ai.Provider_Finish_Reason,
+	tool_calls:  int,
+	failed:      bool,
+	error_text:  string, // owned; the transport's or the provider's account
+	operation:   ai.Provider_Operation_Error,
+	usage:       journal.Response_Committed,
+	started_at:  time.Tick,
 	// stop_at is when the owner asked this job's worker to stop, and the patience the worker is
 	// given to publish is measured from it. A job that has not published by the end of it is
 	// abandoned: the owner stops waiting for it and keeps the session working.
-	stop_at:    Maybe(time.Tick),
+	stop_at:     Maybe(time.Tick),
 	// attempts counts the sends this chain has made, including the one in flight.
-	attempts:   int,
+	attempts:    int,
 	// due_at is when a job in Backoff is sent again, or none when the delay it waits out
 	// is longer than the clock can hold.
-	due_at:     Maybe(time.Tick),
+	due_at:      Maybe(time.Tick),
 }
 
 // Compact_Control is the owner-side view. Only the thread that drives the session
@@ -348,7 +365,9 @@ chat_compact_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	job := cast(^Compact_Job)user_data
 	#partial switch value in event {
 	case ai.Provider_Text_Event:
-		append(&job.output, value.Text)
+		// A summary that cannot be kept whole is not the summary the model wrote, so the job
+		// reports it rather than letting the owner install what happens to fit in memory.
+		if _, append_error := append(&job.output, value.Text); append_error != nil { job.output_lost = true }
 	case ai.Provider_Reasoning_Event:
 	case ai.Provider_Completed_Event:
 		job.reason = value.Reason
@@ -356,7 +375,16 @@ chat_compact_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	case ai.Provider_Error_Event:
 		job.failed = true
 		delete(job.error_text, job.allocator)
-		job.error_text = strings.clone(value.Message, job.allocator)
+		job.error_text = ""
+		message, clone_error := strings.clone(value.Message, job.allocator)
+		if clone_error != nil {
+			// The provider's own words are what explains the failure, and the operation's own
+			// account of the same send is what the record still carries; the loss is logged
+			// here so it is not silent.
+			log_emit({level = .Error, category = .Provider, event = "compaction.failure_text_lost"})
+		} else {
+			job.error_text = message
+		}
 	case ai.Provider_Usage_Event:
 		if value.Input_Tokens_Present { job.usage.input_tokens = value.Input_Tokens }
 		if value.Output_Tokens_Present { job.usage.output_tokens = value.Output_Tokens }
@@ -427,7 +455,7 @@ chat_compact_job_destroy :: proc(job: ^Compact_Job) {
 // none. The result borrows the job's output.
 @(private)
 chat_compact_summary :: proc(job: ^Compact_Job) -> string {
-	if job.failed || job.reason != .Stop || job.tool_calls > 0 { return "" }
+	if job.failed || job.output_lost || job.reason != .Stop || job.tool_calls > 0 { return "" }
 	return strings.trim_space(string(job.output[:]))
 }
 
@@ -436,6 +464,7 @@ chat_compact_summary :: proc(job: ^Compact_Job) -> string {
 @(private)
 chat_compact_reason :: proc(job: ^Compact_Job) -> string {
 	if job.error_text != "" { return job.error_text }
+	if job.output_lost { return "the summary did not fit in memory" }
 	if job.reason == .Length { return "the summary was cut off by the output limit" }
 	if job.tool_calls > 0 { return "the summarizer called a tool instead of answering" }
 	if chat_compact_summary(job) == "" { return "the summarizer produced no summary" }
@@ -586,7 +615,18 @@ chat_compact_start :: proc(
 	}
 	defer virtual.arena_destroy(&arena)
 	compact_prep: Chat_Request_Prep
-	chat_build_request_into(chat, &compact_prep, entries[:seam], prep.projection.summary, connection, CHAT_COMPACT_DIRECTIVE, virtual.arena_allocator(&arena))
+	if build_error := chat_build_request_into(
+		chat,
+		&compact_prep,
+		entries[:seam],
+		prep.projection.summary,
+		connection,
+		CHAT_COMPACT_DIRECTIVE,
+		virtual.arena_allocator(&arena),
+	); build_error != nil {
+		_observer_message(observer, .Warning, "the compaction request could not be built")
+		return false
+	}
 
 	// The request carries the same rule as any other: it asks for the room the window has
 	// left. Its input is the prefix rather than the whole context, so it is given more room
@@ -598,8 +638,8 @@ chat_compact_start :: proc(
 
 	// The job is allocated from the same heap its worker-owned storage comes from: it may outlive
 	// the session, which releases its own allocator at teardown.
-	job := new(Compact_Job, os.heap_allocator())
-	if job == nil {
+	job, job_error := new(Compact_Job, os.heap_allocator())
+	if job_error != nil {
 		_observer_message(observer, .Warning, "compaction could not be started")
 		return false
 	}
@@ -607,7 +647,9 @@ chat_compact_start :: proc(
 		attempts = 1,
 	}
 	chat_compact_job_allocator(job)
-	job.output = make([dynamic]u8, 0, job.allocator)
+	// The output holds nothing yet and so allocates nothing; it carries the allocator the
+	// streamed summary grows from.
+	job.output.allocator = job.allocator
 
 	// The bytes are frozen before the row exists: a request that cannot be encoded never
 	// reaches the network, so it is not recorded as an attempt that was sent.
@@ -716,7 +758,9 @@ chat_compact_suppressible :: proc(job: ^Compact_Job) -> bool {
 // regenerating it blindly is what a retry exists to avoid.
 @(private)
 chat_compact_retryable :: proc(job: ^Compact_Job) -> bool {
-	if job.tool_calls > 0 || job.reason == .Length { return false }
+	// A summary that did not fit in memory is not retried: the same request would ask for the
+	// same bytes again, and the next automatic attempt is free to try a smaller context.
+	if job.tool_calls > 0 || job.reason == .Length || job.output_lost { return false }
 	return job.operation.kind != .None || job.failed || job.error_text != ""
 }
 
@@ -758,6 +802,7 @@ chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> boo
 	delete(job.error_text, job.allocator)
 	job.error_text = ""
 	job.failed = false
+	job.output_lost = false
 	job.reason = .Unknown
 	job.tool_calls = 0
 	job.usage = {}
@@ -966,7 +1011,14 @@ chat_compact_install :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 		_observer_message(observer, .Warning, "the compaction summary was not installed: another checkpoint was installed")
 		return false
 	}
-	checkpoint_text := chat_checkpoint_text(summary, context.temp_allocator)
+	checkpoint_text, frame_error := chat_checkpoint_text(summary, context.temp_allocator)
+	if frame_error != nil {
+		// A checkpoint the model cannot read is worse than none: the history it covers is
+		// still there, and the summary is installed at a later boundary instead.
+		chat_compact_failed_job(control, job)
+		_observer_message(observer, .Warning, "the compaction summary was not installed")
+		return false
+	}
 	node := chat_node(chat, .Checkpoint, journal.Checkpoint{request = job.request}, transmute([]u8)checkpoint_text, covers = job.snapshot.covers)
 	chat_record(chat, {kind = .Checkpoint_Installed, node = node, request = job.request}, journal.Checkpoint{request = job.request})
 	if !chat_commit(chat, "the checkpoint could not be installed") {

@@ -63,6 +63,7 @@ Tool_Argument_Error_Kind :: enum {
 	Too_Large,
 	Too_Deep,
 	Number_Out_Of_Range,
+	Out_Of_Memory,
 }
 
 @(private)
@@ -77,6 +78,7 @@ tool_argument_error_codes := [Tool_Argument_Error_Kind]string {
 	.Too_Large           = "too_large",
 	.Too_Deep            = "too_deep",
 	.Number_Out_Of_Range = "number_out_of_range",
+	.Out_Of_Memory       = "out_of_memory",
 }
 
 // Tool_Argument_Defect is what is wrong with one argument document. field is the JSON
@@ -98,12 +100,19 @@ Tool_Argument_Error :: union {
 	Tool_Argument_Defect,
 }
 
+// tool_argument_error builds one defect. A defect whose own text cannot be copied becomes
+// Out_Of_Memory, because a message that names an empty field would read as a real defect.
 tool_argument_error :: proc(kind: Tool_Argument_Error_Kind, field := "", expected := "", allocator := context.allocator) -> Tool_Argument_Error {
 	defect := Tool_Argument_Defect {
 		kind = kind,
 	}
-	if field != "" { defect.field = strings.clone(field, allocator) }
-	if expected != "" { defect.expected = strings.clone(expected, allocator) }
+	clone_error: mem.Allocator_Error
+	if field != "" { defect.field, clone_error = strings.clone(field, allocator) }
+	if clone_error == nil && expected != "" { defect.expected, clone_error = strings.clone(expected, allocator) }
+	if clone_error != nil {
+		delete(defect.field, allocator)
+		return Tool_Argument_Defect{kind = .Out_Of_Memory}
+	}
 	return defect
 }
 
@@ -121,15 +130,16 @@ tool_argument_error_code :: proc(err: Tool_Argument_Error) -> string {
 	return tool_argument_error_codes[defect.kind]
 }
 
-// tool_argument_error_text renders a defect as one sentence, ending with where the defect is
-// when it was found in the document text. The same defect always renders the same bytes, so
-// a recovery turn adds no wording churn to the cacheable prefix.
-tool_argument_error_text :: proc(err: Tool_Argument_Error, allocator := context.allocator) -> string {
+// tool_argument_error_text renders a defect as one sentence, owned by allocator, ending with
+// where the defect is when it was found in the document text. The same defect always renders
+// the same bytes, so a recovery turn adds no wording churn to the cacheable prefix. It
+// reports an allocator error when the sentence could not be copied.
+tool_argument_error_text :: proc(err: Tool_Argument_Error, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	defect, failed := err.?
-	if !failed { return "" }
+	if !failed { return "", nil }
 	sentence := tool_argument_error_sentence(defect)
 	if defect.line == 0 { return strings.clone(sentence, allocator) }
-	return fmt.aprintf("%s, at line %d column %d", sentence, defect.line, defect.column, allocator = allocator)
+	return fmt.aprintf("%s, at line %d column %d", sentence, defect.line, defect.column, allocator = allocator), nil
 }
 
 // tool_argument_error_sentence says what a defect is. The text is temporary.
@@ -158,6 +168,8 @@ tool_argument_error_sentence :: proc(err: Tool_Argument_Defect) -> string {
 		return fmt.tprintf("the arguments nest more than %d levels deep", TOOL_MAX_ARGS_DEPTH)
 	case .Number_Out_Of_Range:
 		return "the arguments hold a number that no 64-bit integer or finite float can hold"
+	case .Out_Of_Memory:
+		return "the harness ran out of memory while describing what is wrong with the arguments"
 	}
 	return ""
 }
@@ -313,14 +325,20 @@ tool_arguments_string_document :: proc(document: string, allocator: mem.Allocato
 	return text, true, nil
 }
 
-// tool_repairs_text names a set of repairs in declaration order, joined by commas.
-tool_repairs_text :: proc(repairs: Tool_Repairs, allocator := context.allocator) -> string {
-	builder := strings.builder_make(allocator)
+// tool_repairs_text names a set of repairs in declaration order, joined by commas, owned by
+// allocator. It reports an allocator error when the text could not be written whole.
+tool_repairs_text :: proc(repairs: Tool_Repairs, allocator := context.allocator) -> (string, mem.Allocator_Error) {
+	builder, builder_error := strings.builder_make(allocator)
+	if builder_error != nil { return "", builder_error }
+	transferred := false
+	defer if !transferred { strings.builder_destroy(&builder) }
 	for repair in repairs {
-		if strings.builder_len(builder) > 0 { strings.write_string(&builder, ", ") }
-		strings.write_string(&builder, TOOL_REPAIR_NAMES[repair])
+		if strings.builder_len(builder) > 0 && strings.write_string(&builder, ", ") != len(", ") { return "", .Out_Of_Memory }
+		name := TOOL_REPAIR_NAMES[repair]
+		if strings.write_string(&builder, name) != len(name) { return "", .Out_Of_Memory }
 	}
-	return strings.to_string(builder)
+	transferred = true
+	return strings.to_string(builder), nil
 }
 
 // tool_arguments_admit reports the first structural defect in a proposed argument document,
@@ -386,7 +404,9 @@ tool_admit_object :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem
 		if key_err != nil { return tool_document_error(.Syntax, tokenizer.data, token) }
 		if seen[key] {
 			duplicate := tool_document_error(.Duplicate_Field, tokenizer.data, token)
-			duplicate.field = strings.clone(key, allocator)
+			key_error: mem.Allocator_Error
+			duplicate.field, key_error = strings.clone(key, allocator)
+			if key_error != nil { return Tool_Argument_Defect{kind = .Out_Of_Memory} }
 			return duplicate
 		}
 		seen[key] = true
@@ -803,8 +823,9 @@ tool_fields_known :: proc(object: json.Object, known: []string, path := "", allo
 			}
 		}
 		if declared { continue }
-		expected := tool_field_list(known, context.temp_allocator)
+		expected, expected_error := tool_field_list(known, context.temp_allocator)
 		defer delete(expected, context.temp_allocator)
+		if expected_error != nil { return Tool_Argument_Defect{kind = .Out_Of_Memory} }
 		return tool_argument_error(.Unknown_Field, tool_field_path(path, name), expected, allocator = allocator)
 	}
 	return {}
@@ -823,18 +844,25 @@ tool_count_expected :: proc(minimum, maximum: int, allocator: mem.Allocator) -> 
 	return fmt.aprintf("between %d and %d items", minimum, maximum, allocator = allocator)
 }
 
+// tool_field_list names the declared fields as one English list, owned by allocator. It
+// reports an allocator error when the list could not be written whole.
 @(private)
-tool_field_list :: proc(known: []string, allocator: mem.Allocator) -> string {
-	builder := strings.builder_make(allocator)
+tool_field_list :: proc(known: []string, allocator: mem.Allocator) -> (string, mem.Allocator_Error) {
+	builder, builder_error := strings.builder_make(allocator)
+	if builder_error != nil { return "", builder_error }
+	transferred := false
+	defer if !transferred { strings.builder_destroy(&builder) }
 	for name, index in known {
 		switch {
 		case index == 0:
 		case index == len(known) - 1:
-			strings.write_string(&builder, " or " if len(known) == 2 else ", or ")
+			separator := " or " if len(known) == 2 else ", or "
+			if strings.write_string(&builder, separator) != len(separator) { return "", .Out_Of_Memory }
 		case:
-			strings.write_string(&builder, ", ")
+			if strings.write_string(&builder, ", ") != 2 { return "", .Out_Of_Memory }
 		}
-		strings.write_string(&builder, name)
+		if strings.write_string(&builder, name) != len(name) { return "", .Out_Of_Memory }
 	}
-	return strings.to_string(builder)
+	transferred = true
+	return strings.to_string(builder), nil
 }

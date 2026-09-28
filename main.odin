@@ -199,7 +199,12 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 	// A headless run ends when its work does, so it waits for the subagents it started in the
 	// background and answers each report with a turn of its own.
 	for completed && agent.chat_agents_wait(chat, nil) {
-		accepted, _ := agent.chat_session_accept_agent_message(chat, observer)
+		accepted, had_message := agent.chat_session_accept_agent_message(chat, observer)
+		if !had_message {
+			// The report the wait promised was taken elsewhere; there is nothing
+			// left to run a turn for.
+			break
+		}
 		if accepted != .Accepted {
 			fmt.eprintln("nabla:", agent.chat_session_last_error(chat))
 			return false
@@ -309,7 +314,12 @@ chat_main :: proc() -> int {
 			fmt.eprintln("nabla: cannot resolve the configuration directory")
 			return 1
 		}
-		options.config_path = strings.concatenate([]string{directory, "/config.lua"}, allocator = context.temp_allocator)
+		config_path, path_error := strings.concatenate([]string{directory, "/config.lua"}, allocator = context.temp_allocator)
+		if path_error != nil {
+			fmt.eprintln("nabla: the configuration path could not be allocated")
+			return 1
+		}
+		options.config_path = config_path
 	}
 	// A missing config file is a valid setup, not an error: the run proceeds
 	// with no providers and default options. Only a config that exists but

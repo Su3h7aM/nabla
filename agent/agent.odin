@@ -214,8 +214,7 @@ chat_session_continue_for_input :: proc(chat: ^Chat_Session) {
 
 // chat_session_fail_turn records a turn-level failure and moves to finalizing.
 chat_session_fail_turn :: proc(chat: ^Chat_Session, message: string) -> Chat_Effect {
-	delete(chat.last_error, chat.allocator)
-	chat.last_error = chat_clone_string(message, chat.allocator)
+	chat_last_error_set(chat, message)
 	chat.active_failed = true
 	chat.state = .Finalizing
 	return chat_effect_none()
@@ -271,7 +270,15 @@ chat_report_terminal :: proc(chat: ^Chat_Session, observer: Chat_Observer, statu
 // belongs to the running request.
 chat_session_feed_text :: proc(chat: ^Chat_Session, source: Chat_Event_Source, text: string) -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
-	append(&chat.partial_assistant, text)
+	if _, append_error := append(&chat.partial_assistant, text); append_error != nil {
+		// An answer missing a fragment of what the model wrote is not that answer, so what
+		// arrived of it is dropped rather than committed as a shorter answer. The model is
+		// told with the notice of a response the harness could not keep, nothing in the
+		// response runs, and the turn continues.
+		chat_partial_assistant_clear(chat)
+		chat_session_note_notice(chat, source, .Not_Kept)
+		return false
+	}
 	return true
 }
 
@@ -290,7 +297,11 @@ chat_session_feed_response_output :: proc(chat: ^Chat_Session, source: Chat_Even
 	if !chat_session_accepts_event(chat, source) { return false }
 	if output == "" { return true }
 	if chat.pending_response_present { return false }
-	chat.pending_response.output = chat_clone_string(output, chat.allocator)
+	owned, clone_error := chat_clone_string(output, chat.allocator)
+	// The staged output is the replay record; one that cannot be kept leaves the response
+	// with no replay record, which the caller reports as a response it cannot use.
+	if clone_error != nil { return false }
+	chat.pending_response.output = owned
 	chat.pending_response_present = true
 	return true
 }
@@ -307,8 +318,12 @@ chat_session_set_effort :: proc(chat: ^Chat_Session, level: string) -> bool {
 	}
 	for allowed in chat.effort_levels {
 		if allowed == level {
+			selected, clone_error := chat_clone_string(level, chat.allocator)
+			// A level that cannot be kept is a level that was not applied, which is what a
+			// refusal says.
+			if clone_error != nil { return false }
 			delete(chat.effort, chat.allocator)
-			chat.effort = chat_clone_string(level, chat.allocator)
+			chat.effort = selected
 			return true
 		}
 	}
@@ -361,15 +376,21 @@ chat_session_steer :: proc(chat: ^Chat_Session, text: string, origin := journal.
 	return .Recorded
 }
 
-chat_tool_call_clone :: proc(call: ai.Provider_Tool_Call, allocator: mem.Allocator) -> (Chat_Tool_Call, bool) {
-	if call.ID == "" || call.Name == "" { return {}, false }
-	return Chat_Tool_Call {
-			id = chat_clone_string(call.ID, allocator),
-			item_id = chat_clone_string(call.Item_ID, allocator),
-			name = chat_clone_string(call.Name, allocator),
-			arguments = chat_clone_string(call.Arguments, allocator),
-		},
-		true
+// chat_tool_call_clone copies one proposed call. valid is false for a call without the
+// identity a result is matched by, and allocation_error reports a copy that did not fit; the
+// caller releases what was copied before it gave up, so a call is never handed on half owned.
+chat_tool_call_clone :: proc(call: ai.Provider_Tool_Call, allocator: mem.Allocator) -> (Chat_Tool_Call, bool, mem.Allocator_Error) {
+	if call.ID == "" || call.Name == "" { return {}, false, nil }
+	cloned: Chat_Tool_Call
+	transferred := false
+	defer if !transferred { chat_tool_call_destroy(&cloned, allocator) }
+	clone_error: mem.Allocator_Error
+	if cloned.id, clone_error = chat_clone_string(call.ID, allocator); clone_error != nil { return {}, false, clone_error }
+	if cloned.item_id, clone_error = chat_clone_string(call.Item_ID, allocator); clone_error != nil { return {}, false, clone_error }
+	if cloned.name, clone_error = chat_clone_string(call.Name, allocator); clone_error != nil { return {}, false, clone_error }
+	if cloned.arguments, clone_error = chat_clone_string(call.Arguments, allocator); clone_error != nil { return {}, false, clone_error }
+	transferred = true
+	return cloned, true, nil
 }
 
 // Chat_Notice is why a completed response could not be used as it stood. None
@@ -386,6 +407,10 @@ Chat_Notice :: enum {
 	Unreadable_Response,
 	Incomplete_Response,
 	Response_Lost,
+	// Not_Kept is a response the harness could not hold on to: a fragment of its text, one
+	// of its calls, or the response itself did not fit in memory. What the harness holds of
+	// it is not what the model sent, so none of it is used as an answer.
+	Not_Kept,
 	Provider_Refused,
 }
 
@@ -407,6 +432,8 @@ chat_notice_text :: proc(notice: Chat_Notice) -> string {
 		return "the provider ended the previous response before it was complete, so none of it was executed; continue the work by sending it again"
 	case .Response_Lost:
 		return "the connection failed after the previous request was sent and its response was lost, so nothing from it was executed; continue the work"
+	case .Not_Kept:
+		return "the harness could not keep the previous response, so none of it was executed; send the work again"
 	case .Provider_Refused:
 		return "the provider refused the previous request, so nothing from it was executed; change what caused the refusal and continue"
 	case .None, .Ignored:
@@ -468,10 +495,17 @@ chat_session_feed_tool_calls :: proc(chat: ^Chat_Session, source: Chat_Event_Sou
 	if !chat_session_accepts_event(chat, source) { return .Ignored }
 	if len(calls) == 0 { return .Ignored }
 
-	staged := make([dynamic]Chat_Tool_Call, 0, len(calls), chat.allocator)
+	// Calls that could not be kept are calls that never ran, so a response whose calls do not
+	// all fit is refused whole, the way a response the harness could not decode is.
+	staged, allocation_error := make([dynamic]Chat_Tool_Call, 0, len(calls), chat.allocator)
+	if allocation_error != nil { return .Not_Kept }
 	defer delete(staged)
 	for call in calls {
-		cloned, valid := chat_tool_call_clone(call, chat.allocator)
+		cloned, valid, clone_error := chat_tool_call_clone(call, chat.allocator)
+		if clone_error != nil {
+			for &leftover in staged { chat_tool_call_destroy(&leftover, chat.allocator) }
+			return .Not_Kept
+		}
 		if !valid {
 			for &leftover in staged { chat_tool_call_destroy(&leftover, chat.allocator) }
 			return .Missing_Call_Identity
@@ -483,9 +517,23 @@ chat_session_feed_tool_calls :: proc(chat: ^Chat_Session, source: Chat_Event_Sou
 				return .Duplicate_Call_ID
 			}
 		}
-		append(&staged, cloned)
+		if _, stage_error := append(&staged, cloned); stage_error != nil {
+			chat_tool_call_destroy(&cloned, chat.allocator)
+			for &leftover in staged { chat_tool_call_destroy(&leftover, chat.allocator) }
+			return .Not_Kept
+		}
 	}
-	for staged_call in staged { append(&chat.pending_calls, staged_call) }
+	// The calls move into the session's table before any of them can run, and a move that
+	// cannot finish leaves the turn with no batch at all rather than half of one. Nothing is
+	// released twice: a call that moved belongs to the session's table and the rest to the
+	// staging table, which the defer above releases.
+	for index in 0 ..< len(staged) {
+		if _, move_error := append(&chat.pending_calls, staged[index]); move_error != nil {
+			chat_pending_calls_clear(chat)
+			for &leftover in staged[index:] { chat_tool_call_destroy(&leftover, chat.allocator) }
+			return .Not_Kept
+		}
+	}
 	clear(&staged)
 	chat.state = .Executing_Tools
 	return .None
@@ -526,8 +574,7 @@ chat_session_tools_done :: proc(chat: ^Chat_Session, turn_id: u64, results: int)
 
 chat_session_feed_error :: proc(chat: ^Chat_Session, source: Chat_Event_Source, message: string) -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
-	delete(chat.last_error, chat.allocator)
-	chat.last_error = chat_clone_string(message, chat.allocator)
+	chat_last_error_set(chat, message)
 	chat.active_failed = true
 	chat.state = .Finalizing
 	return true
@@ -565,6 +612,15 @@ Chat_Usage_Event :: struct {
 	usage: ai.Provider_Usage_Event,
 }
 
+// Chat_Lost_Event is a fact the running response carried that was lost between the transport
+// and the owner: a fragment of the answer, one of its calls, or the response itself did not
+// fit in memory. It owns nothing, because the thing it reports is exactly what could not be
+// allocated. A response the harness could not hold in full is not the response the model
+// sent, so the owner applies it as one it cannot use.
+Chat_Lost_Event :: struct {
+	source: Chat_Event_Source,
+}
+
 // Chat_Event is one external fact delivered to the owner for application. A provider
 // callback decodes the wire event into one of these, and applying it is the only way an
 // external fact changes turn state. A queued event owns its payload: the producer clones it,
@@ -574,21 +630,30 @@ Chat_Event :: union {
 	Chat_Provider_Completion,
 	Chat_Failure_Event,
 	Chat_Usage_Event,
+	Chat_Lost_Event,
+}
+
+// chat_completion_destroy releases what one completed provider response owns. The strings and
+// the call list came from the allocator the completion was copied with.
+chat_completion_destroy :: proc(completion: ^Chat_Provider_Completion, allocator: mem.Allocator) {
+	delete(completion.reason_text, allocator)
+	delete(completion.output, allocator)
+	ai.Provider_Tool_Calls_Destroy(completion.calls, allocator)
+	completion^ = {}
 }
 
 // chat_event_destroy releases an event's owned payload. An event is released with the
 // allocator it was cloned with, which for a queued event is the mailbox's, not the session's.
 chat_event_destroy :: proc(event: ^Chat_Event, allocator: mem.Allocator) {
-	#partial switch value in event^ {
+	#partial switch &value in event^ {
 	case Chat_Text_Event:
 		delete(value.text, allocator)
 	case Chat_Provider_Completion:
-		delete(value.reason_text, allocator)
-		delete(value.output, allocator)
-		ai.Provider_Tool_Calls_Destroy(value.calls, allocator)
+		chat_completion_destroy(&value, allocator)
 	case Chat_Failure_Event:
 		delete(value.message, allocator)
 	case Chat_Usage_Event:
+	case Chat_Lost_Event:
 	}
 	event^ = nil
 }
@@ -627,6 +692,11 @@ chat_session_apply :: proc(chat: ^Chat_Session, event: ^Chat_Event) -> Chat_Appl
 	case Chat_Usage_Event:
 		// Usage is a measurement the driver records for the request, not a turn
 		// transition; nothing about the turn changes here.
+		return {}
+	case Chat_Lost_Event:
+		// A response the harness could not keep whole is not the response the model sent:
+		// nothing in it is executed, the model is told so, and the turn continues.
+		chat_session_note_notice(chat, value.source, .Not_Kept)
 		return {}
 	case Chat_Provider_Completion:
 		// One response feeds one path: tool handoff when the provider assembled calls, plain

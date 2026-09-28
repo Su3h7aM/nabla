@@ -72,7 +72,9 @@ patch_prepare :: proc(
 				return nil, "", 0, patch_failure(.File_Exists, allocator, "%s already exists; use %s to change it", file.path, PATCH_HEADERS[.Update])
 			}
 			change.mode = os.Permissions_Default_File
-			change.content, _ = patch_update(file.path, "", args.lines, hunks, allocator) or_return
+			hunks_repaired: int
+			change.content, hunks_repaired = patch_update(file.path, "", args.lines, hunks, allocator) or_return
+			repaired_hunks += hunks_repaired
 			patch_append(&summary_buffer, "added ", file.path, "\n") or_return
 		case .Delete:
 			change.mode = patch_existing_mode(change.source, file.path, allocator) or_return

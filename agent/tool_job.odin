@@ -194,7 +194,13 @@ tool_jobs_init :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, capacity: int, wor
 	jobs.allocator = chat.allocator
 	jobs.worker_allocator = worker_allocator
 	jobs.abandoned = &chat.abandoned_jobs
-	jobs.jobs = make([dynamic]^Tool_Job, 0, capacity, chat.allocator)
+	table, table_error := make([dynamic]^Tool_Job, 0, capacity, chat.allocator)
+	jobs.jobs = table
+	if table_error != nil {
+		// A batch with no table cannot admit a call, which is the state a failed durable write
+		// leaves it in: it drains, and the turn reports the calls it never answered.
+		jobs.stop = .Storage_Failed
+	}
 	jobs.budget = chat_tool_budget_open(chat, len(chat.pending_calls))
 }
 
@@ -338,8 +344,15 @@ tool_jobs_submit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 			phase     = .Queued,
 			allocator = jobs.worker_allocator,
 		}
-		job.name = strings.clone(staged.name, job.allocator)
-		job.call_id = strings.clone(staged.id, job.allocator)
+		name, name_error := strings.clone(staged.name, job.allocator)
+		call_id, call_id_error := strings.clone(staged.id, job.allocator)
+		job.name, job.call_id = name, call_id
+		if name_error != nil || call_id_error != nil {
+			// A call that cannot name itself cannot be admitted or recorded, so it is released
+			// unanswered: the batch barrier ends the turn instead of claiming it ran.
+			tool_job_release(job)
+			return
+		}
 		tool_job_admit(jobs, chat, observer, job)
 		if !tool_jobs_publish(jobs, job) { return }
 	}
@@ -417,7 +430,8 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	// A provider call is admitted here, from the text it arrived as. A Lua child call arrives
 	// admitted, because its value came from Lua and was checked where it was read.
 	if job.admitted.status == .None { job.admitted = tool_arguments_prepare(job.call.arguments, job.allocator) }
-	repairs_text := tool_repairs_text(job.admitted.repairs, context.temp_allocator)
+	repairs_text, repairs_error := tool_repairs_text(job.admitted.repairs, context.temp_allocator)
+	if repairs_error != nil { repairs_text = "unwritten: out of memory" }
 	prepared := [4]Log_Field {
 		{key = "tool", value = job.name},
 		{key = "status", value = tool_arguments_status_name(job.admitted.status)},
@@ -468,7 +482,9 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		job.admitted.repairs += job.exec.repairs
 	}
 	if job.admitted.repairs != {} {
-		notice := fmt.tprintf("a tool call was repaired before it ran: %s", tool_repairs_text(job.admitted.repairs, context.temp_allocator))
+		notice_repairs, notice_error := tool_repairs_text(job.admitted.repairs, context.temp_allocator)
+		if notice_error != nil { notice_repairs = "unwritten: out of memory" }
+		notice := fmt.tprintf("a tool call was repaired before it ran: %s", notice_repairs)
 		_observer_message(observer, .Notice, notice)
 	}
 	// What the call runs with is the text the dispatch record holds, so an executor
@@ -866,7 +882,8 @@ tool_result_report_repairs :: proc(result: ^Tool_Result, repairs: Tool_Repairs) 
 	if newline := strings.index_byte(result.content, '\n'); newline >= 0 {
 		first, rest = result.content[:newline], result.content[newline + 1:]
 	}
-	names := tool_repairs_text(repairs, context.temp_allocator)
+	names, names_error := tool_repairs_text(repairs, context.temp_allocator)
+	if names_error != nil { return names_error }
 	content := strings.concatenate({first, "\nrepaired: ", names, " (the arguments you sent were corrected)\n", rest}, result.allocator) or_return
 	delete(result.content, result.allocator)
 	result.content = content

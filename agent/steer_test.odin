@@ -105,8 +105,9 @@ test_taking_the_queue_hands_every_line_over :: proc(test: ^testing.T) {
 	testing.expect(test, steer_push(&queue, "first"))
 	testing.expect(test, steer_push(&queue, "second"))
 
-	taken := steer_take_all(&queue)
+	taken, taken_ok := steer_take_all(&queue)
 	defer steer_taken_destroy(&queue, taken)
+	if !testing.expect(test, taken_ok, "the queued lines could not be taken") { return }
 	if !testing.expect_value(test, len(taken), 2) { return }
 	testing.expect_value(test, taken[0], "first")
 	testing.expect_value(test, taken[1], "second")

@@ -225,7 +225,7 @@ test_a_background_subagent_reports_its_answer_as_a_message :: proc(test: ^testin
 	chat.tools_enabled = true
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW)
 	levels := []string{"low", "medium", "high"}
-	for level in levels { append(&chat.effort_levels, chat_clone_string(level, chat.allocator)) }
+	for level in levels { append(&chat.effort_levels, chat_clone_string(level, chat.allocator) or_else "") }
 	testing.expect(test, chat_session_set_effort(chat, "high"))
 
 	spawn := agent_provider_call(TOOL_AGENT_SPAWN_NAME, `{"prompt":"what is six times seven","model":"sub-model","background":true}`)

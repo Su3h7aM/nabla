@@ -39,6 +39,8 @@ Models_Dev_Error :: enum {
 	// The document was acquired but is not a usable provider document, and no
 	// cached copy could serve instead.
 	Invalid_Data,
+	// A provider source record could not be built because an allocation failed.
+	Allocation,
 	// A document was acquired but cannot become provider source records.
 	Invalid_JSON,
 	Invalid_Structure,
@@ -146,6 +148,8 @@ models_dev_cached_sources :: proc(providers: []string = {}, allocator := context
 	switch parse_err {
 	case .None:
 		return sources, .None
+	case .Allocation:
+		return {}, .Allocation
 	case .Invalid_JSON:
 		return {}, .Invalid_JSON
 	case .Invalid_Structure:
@@ -177,6 +181,8 @@ models_dev_sources :: proc(
 	switch parse_err {
 	case .None:
 		return sources, .None
+	case .Allocation:
+		return {}, .Allocation
 	case .Invalid_JSON:
 		return {}, .Invalid_JSON
 	case .Invalid_Structure:

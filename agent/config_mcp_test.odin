@@ -90,7 +90,8 @@ test_mcp_stdio_environment_inherits_and_applies_overrides :: proc(t: ^testing.T)
 	)
 	defer mcp_servers_destroy(&servers)
 	if !testing.expect_value(t, err, Config_Error.None) { return }
-	stdio := mcp_stdio_config(servers[0])
+	stdio, stdio_ok := mcp_stdio_config(servers[0])
+	if !testing.expect(t, stdio_ok, "the server's environment could be built") { return }
 	found_path := false
 	found_override := false
 	for entry in stdio.environment {

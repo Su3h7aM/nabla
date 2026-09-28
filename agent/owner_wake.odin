@@ -32,6 +32,7 @@ owner_wake_wait :: proc(seen: u32, deadline: Maybe(time.Tick)) {
 		return
 	}
 	if remaining := time.tick_diff(time.tick_now(), due); remaining > 0 {
+		// Whether the wait woke or reached its deadline is a hint; the caller rechecks.
 		_ = sync.futex_wait_with_timeout(&chat_wake.seq, seen, remaining)
 	}
 }

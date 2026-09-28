@@ -59,17 +59,17 @@ tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	if ctx.skills == nil {
 		return tool_result_failure(ctx, .Unavailable, "skills are unavailable in this session", "unavailable")
 	}
-	matches, matched := list_skills_match(ctx.skills.skills, query, ctx.allocator)
-	if !matched {
-		return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be built", "too large")
+	matches, match_error := list_skills_match(ctx.skills.skills, query, ctx.allocator)
+	if match_error != nil {
+		return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be built: out of memory", "out of memory")
 	}
 	defer delete(matches, ctx.allocator)
 	page_end := len(matches)
 	if offset <= len(matches) && limit <= len(matches) - offset { page_end = offset + limit }
 	page := matches[offset:page_end] if offset <= len(matches) else matches[len(matches):]
-	records := make([]Skill_Record, len(page), ctx.allocator)
-	if len(page) > 0 && records == nil {
-		return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be allocated", "allocation failed")
+	records, record_error := make([]Skill_Record, len(page), ctx.allocator)
+	if record_error != nil {
+		return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be allocated: out of memory", "out of memory")
 	}
 	defer delete(records, ctx.allocator)
 	for match, index in page {
@@ -107,7 +107,11 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 	}
 	index, found := skills.find(ctx.skills.skills, name)
 	if !found {
-		return tool_result_failure(ctx, .Tool_Failed, tool_skill_suggestions(ctx.skills, name, ctx.allocator), "unknown skill")
+		suggestions, suggestion_error := tool_skill_suggestions(ctx.skills, name, context.temp_allocator)
+		if suggestion_error != nil {
+			return tool_result_failure(ctx, .Tool_Failed, "the available skills could not be listed: out of memory", "out of memory")
+		}
+		return tool_result_failure(ctx, .Tool_Failed, suggestions, "unknown skill")
 	}
 	skill := ctx.skills.skills[index]
 	if skill.root_index < 0 || skill.root_index >= len(ctx.skills.roots) {
@@ -137,48 +141,83 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 	return result
 }
 
-list_skills_match :: proc(catalog: []skills.Skill, query: string, allocator := context.allocator) -> ([]^skills.Skill, bool) {
-	terms, terms_ok := list_skills_terms(query, allocator)
-	if !terms_ok { return nil, false }
+// list_skills_match returns the matching skills in name order, owned by allocator, with the
+// skill whose name is exactly the query first. It reports an allocator error when the
+// listing could not be built.
+list_skills_match :: proc(catalog: []skills.Skill, query: string, allocator := context.allocator) -> ([]^skills.Skill, mem.Allocator_Error) {
+	terms, terms_error := list_skills_terms(query, allocator)
+	if terms_error != nil { return nil, terms_error }
 	defer {
 		for term in terms { delete(term, allocator) }
 		delete(terms, allocator)
 	}
-	matches := make([dynamic]^skills.Skill, 0, len(catalog), allocator)
+	matches, matches_error := make([dynamic]^skills.Skill, 0, len(catalog), allocator)
+	if matches_error != nil { return nil, matches_error }
+	defer delete(matches)
 	for &skill in catalog {
-		if list_skills_matches(&skill, terms) { append(&matches, &skill) }
+		matched, match_error := list_skills_matches(&skill, terms)
+		if match_error != nil { return nil, match_error }
+		if !matched { continue }
+		if _, append_error := append(&matches, &skill); append_error != nil { return nil, append_error }
 	}
 	exact: ^skills.Skill
-	rest := make([dynamic]^skills.Skill, 0, len(matches), allocator)
-	defer delete(rest)
 	for match in matches {
-		if exact == nil && match.name == strings.trim_space(query) { exact = match } else { append(&rest, match) }
+		if exact == nil && match.name == strings.trim_space(query) { exact = match }
 	}
-	ordered := make([dynamic]^skills.Skill, 0, len(matches), allocator)
-	if exact != nil { append(&ordered, exact) }
-	for match in rest { append(&ordered, match) }
-	delete(matches)
-	return ordered[:], true
+	// The exact match is hoisted in one pass, so the answer is a single owned slice.
+	ordered, ordered_error := make([]^skills.Skill, len(matches), allocator)
+	if ordered_error != nil { return nil, ordered_error }
+	position := 0
+	if exact != nil {
+		ordered[position] = exact
+		position += 1
+	}
+	for match in matches {
+		if match == exact { continue }
+		ordered[position] = match
+		position += 1
+	}
+	return ordered, nil
 }
 
-list_skills_terms :: proc(query: string, allocator := context.allocator) -> ([]string, bool) {
-	fields := strings.fields(query, allocator)
+// list_skills_terms returns the query's whitespace-separated terms, folded to lower case and
+// owned by allocator. It reports an allocator error when the terms could not be built.
+list_skills_terms :: proc(query: string, allocator := context.allocator) -> ([]string, mem.Allocator_Error) {
+	fields, fields_error := strings.fields(query, allocator)
+	if fields_error != nil { return nil, fields_error }
 	defer delete(fields, allocator)
-	terms := make([dynamic]string, 0, len(fields), allocator)
-	for field in fields { append(&terms, strings.to_lower(field, allocator)) }
-	return terms[:], true
+	terms, terms_error := make([dynamic]string, 0, len(fields), allocator)
+	if terms_error != nil { return nil, terms_error }
+	transferred := false
+	defer if !transferred {
+		for term in terms { delete(term, allocator) }
+		delete(terms)
+	}
+	for field in fields {
+		lowered, lower_error := strings.to_lower(field, allocator)
+		if lower_error != nil { return nil, lower_error }
+		if _, append_error := append(&terms, lowered); append_error != nil {
+			delete(lowered, allocator)
+			return nil, append_error
+		}
+	}
+	transferred = true
+	return terms[:], nil
 }
 
-list_skills_matches :: proc(skill: ^skills.Skill, terms: []string) -> bool {
+// list_skills_matches reports whether every term occurs in the skill's name or description.
+list_skills_matches :: proc(skill: ^skills.Skill, terms: []string) -> (bool, mem.Allocator_Error) {
 	// The folded copies exist to be searched and are released with the answer.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	if len(terms) == 0 { return true }
-	name := strings.to_lower(skill.name, context.temp_allocator)
-	description := strings.to_lower(skill.description, context.temp_allocator)
+	if len(terms) == 0 { return true, nil }
+	name, name_error := strings.to_lower(skill.name, context.temp_allocator)
+	if name_error != nil { return false, name_error }
+	description, description_error := strings.to_lower(skill.description, context.temp_allocator)
+	if description_error != nil { return false, description_error }
 	for term in terms {
-		if !strings.contains(name, term) && !strings.contains(description, term) { return false }
+		if !strings.contains(name, term) && !strings.contains(description, term) { return false, nil }
 	}
-	return true
+	return true, nil
 }
 
 skill_source_label :: proc(catalog: ^skills.Catalog, skill: skills.Skill) -> string {
@@ -196,17 +235,22 @@ skill_source_label :: proc(catalog: ^skills.Catalog, skill: skills.Skill) -> str
 	return "unknown"
 }
 
-tool_skill_suggestions :: proc(catalog: ^skills.Catalog, name: string, allocator := context.allocator) -> string {
-	suggestions := make([dynamic]string, 0, 3, allocator)
+// tool_skill_suggestions names the skills whose names begin with an unknown name, owned by
+// allocator. It reports an allocator error when the suggestion line could not be built.
+tool_skill_suggestions :: proc(catalog: ^skills.Catalog, name: string, allocator := context.allocator) -> (string, mem.Allocator_Error) {
+	suggestions, suggestions_error := make([dynamic]string, 0, 3, allocator)
+	if suggestions_error != nil { return "", suggestions_error }
 	defer delete(suggestions)
 	for &skill in catalog.skills {
 		if len(suggestions) >= 3 { break }
-		if strings.has_prefix(skill.name, name) { append(&suggestions, skill.name) }
+		if !strings.has_prefix(skill.name, name) { continue }
+		if _, append_error := append(&suggestions, skill.name); append_error != nil { return "", append_error }
 	}
-	if len(suggestions) == 0 { return fmt.tprintf("no skill named %q is available", name) }
-	joined := strings.join(suggestions[:], ", ", allocator)
+	if len(suggestions) == 0 { return fmt.aprintf("no skill named %q is available", name, allocator = allocator), nil }
+	joined, join_error := strings.join(suggestions[:], ", ", allocator)
+	if join_error != nil { return "", join_error }
 	defer delete(joined, allocator)
-	return fmt.tprintf("no skill named %q is available; did you mean %s", name, joined)
+	return fmt.aprintf("no skill named %q is available; did you mean %s", name, joined, allocator = allocator), nil
 }
 
 skill_digest_text :: proc(digest: [32]u8, allocator := context.allocator) -> (string, mem.Allocator_Error) {

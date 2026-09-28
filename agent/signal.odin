@@ -22,16 +22,20 @@ chat_signal_interrupt :: proc "c" (signal: posix.Signal) {
 
 // chat_signal_arm installs the handler only while a turn is in flight, so a headless
 // run keeps the default meaning of Ctrl-C while idle. The handler is installed without
-// SA_RESTART, so an interrupted wait returns and observes the stop.
+// SA_RESTART, so an interrupted wait returns and observes the stop. A disposition that
+// cannot be installed leaves the default in place, which is what the diagnostic records.
 chat_signal_arm :: proc(previous: ^posix.sigaction_t) {
 	action: posix.sigaction_t
 	action.sa_handler = chat_signal_interrupt
-	_ = posix.sigaction(.SIGINT, &action, previous)
+	if posix.sigaction(.SIGINT, &action, previous) != .OK {
+		log_emit({level = .Error, category = .Runtime, event = "signal.arm_failed"})
+	}
 }
 
-// chat_signal_disarm restores the previous disposition. The handler references only
-// static storage, so a signal that arrives while this runs either latches the
-// interrupt or terminates the process under the restored default.
+// chat_signal_disarm restores the previous disposition, which is teardown: a disposition
+// that cannot be restored changes nothing about a process that is finishing. The handler
+// references only static storage, so a signal that arrives while this runs either latches
+// the interrupt or terminates the process under the restored default.
 chat_signal_disarm :: proc(previous: ^posix.sigaction_t) {
 	if previous == nil { return }
 	_ = posix.sigaction(.SIGINT, previous, nil)
@@ -48,10 +52,16 @@ Chat_Interactive_Signals :: struct {
 chat_interactive_arm :: proc(state: ^Chat_Interactive_Signals) {
 	action: posix.sigaction_t
 	action.sa_handler = chat_signal_interrupt
-	_ = posix.sigaction(.SIGINT, &action, &state.previous_int)
-	_ = posix.sigaction(.SIGTERM, &action, &state.previous_term)
+	if posix.sigaction(.SIGINT, &action, &state.previous_int) != .OK {
+		log_emit({level = .Error, category = .Runtime, event = "signal.arm_failed"})
+	}
+	if posix.sigaction(.SIGTERM, &action, &state.previous_term) != .OK {
+		log_emit({level = .Error, category = .Runtime, event = "signal.arm_failed"})
+	}
 }
 
+// chat_interactive_disarm restores both dispositions, which is teardown: the process is
+// going away and a disposition that cannot be restored changes nothing about that.
 chat_interactive_disarm :: proc(state: ^Chat_Interactive_Signals) {
 	if state == nil { return }
 	_ = posix.sigaction(.SIGINT, &state.previous_int, nil)
@@ -60,16 +70,21 @@ chat_interactive_disarm :: proc(state: ^Chat_Interactive_Signals) {
 
 // chat_signal_block_watched blocks SIGINT and SIGTERM on the calling thread and returns
 // its previous mask. A thread inherits its creator's mask, so a worker that must never
-// run the handler is created between this and chat_signal_restore.
+// run the handler is created between this and chat_signal_restore. A mask that cannot be
+// set leaves the thread exposed, which is what the diagnostic records.
 chat_signal_block_watched :: proc() -> (previous: posix.sigset_t) {
 	blocked: posix.sigset_t
 	posix.sigemptyset(&blocked)
 	posix.sigaddset(&blocked, .SIGINT)
 	posix.sigaddset(&blocked, .SIGTERM)
-	_ = posix.pthread_sigmask(.BLOCK, &blocked, &previous)
+	if posix.pthread_sigmask(.BLOCK, &blocked, &previous) != .NONE {
+		log_emit({level = .Error, category = .Runtime, event = "signal.block_failed"})
+	}
 	return
 }
 
+// chat_signal_restore puts a thread's mask back, which is teardown for a thread that is
+// starting its work: a mask that cannot be restored changes nothing about the process.
 chat_signal_restore :: proc(previous: posix.sigset_t) {
 	mask := previous
 	_ = posix.pthread_sigmask(.SETMASK, &mask, nil)

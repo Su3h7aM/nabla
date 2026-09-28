@@ -308,11 +308,18 @@ export_join :: proc(directory, name: string, allocator: mem.Allocator) -> (strin
 	return path, join_error == nil
 }
 
+// export_note records one omission in the manifest. False means the note could not
+// be stored, so the manifest would be missing the reason it names and the export
+// fails rather than understate what it left out.
 @(private)
-export_note :: proc(omissions: ^[dynamic]string, text: string) {
+export_note :: proc(omissions: ^[dynamic]string, text: string) -> bool {
 	note, clone_error := strings.clone(text, context.allocator)
-	if clone_error != nil { return }
-	if append(omissions, note) != 1 { delete(note, context.allocator) }
+	if clone_error != nil { return false }
+	if append(omissions, note) != 1 {
+		delete(note, context.allocator)
+		return false
+	}
+	return true
 }
 
 @(private)
@@ -334,13 +341,11 @@ diagnostics_export_request :: proc(
 	join_okay: bool,
 ) -> bool {
 	if !join_okay {
-		export_note(omissions, "the session database did not report this request, so request.json is absent")
-		return true
+		return export_note(omissions, "the session database did not report this request, so request.json is absent")
 	}
 	row, load_error := diagnostics_request_open(store, session_id, request_no, context.allocator)
 	if load_error != nil {
-		export_note(omissions, "the stored request could not be read")
-		return true
+		return export_note(omissions, "the stored request could not be read")
 	}
 	defer diagnostics_request_destroy(&row, context.allocator)
 	payload := export_request_from(&row, session_text)

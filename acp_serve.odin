@@ -672,6 +672,8 @@ acp_stored_session :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, session
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session database could not be opened")
 		return nil, false
 	}
+	// The lookup's own store is being abandoned; a close failure changes nothing
+	// the caller can act on.
 	defer _ = journal.close(&store)
 	loaded, load_error := journal.list_sessions(&store, {session = parsed_id, limit = 1}, context.temp_allocator)
 	if load_error != nil {
@@ -1108,7 +1110,12 @@ acp_main :: proc(args: []string) -> int {
 			fmt.eprintln("nabla: cannot resolve the configuration directory")
 			return 1
 		}
-		config_path = strings.concatenate([]string{directory, "/config.lua"}, allocator = context.temp_allocator)
+		path, path_error := strings.concatenate([]string{directory, "/config.lua"}, allocator = context.temp_allocator)
+		if path_error != nil {
+			fmt.eprintln("nabla: the configuration path could not be allocated")
+			return 1
+		}
+		config_path = path
 	}
 	sources, harness_options, mcp_servers, config_err := agent.load_lua_config_full(config_path)
 	if config_err != .None && config_err != .Missing {

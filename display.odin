@@ -46,7 +46,7 @@ display_sanitize_chunk :: proc(sanitizer: ^Display_Sanitizer, chunk: string, all
 	failed := false
 	defer if failed { strings.builder_destroy(&builder) }
 	i := 0
-	for i < len(combined) {
+	for i < len(combined) && !failed {
 		if sanitizer.skip_one {
 			sanitizer.skip_one = false
 			i += 1
@@ -87,10 +87,10 @@ display_sanitize_chunk :: proc(sanitizer: ^Display_Sanitizer, chunk: string, all
 				} else {
 					r, size := utf8.decode_rune_in_bytes(remaining)
 					if r == utf8.RUNE_ERROR && size == 1 {
-						strings.write_rune(&builder, utf8.RUNE_ERROR)
+						if _, write_error := strings.write_rune(&builder, utf8.RUNE_ERROR); write_error != nil { failed = true }
 						i += 1
 					} else {
-						strings.write_rune(&builder, r)
+						if _, write_error := strings.write_rune(&builder, r); write_error != nil { failed = true }
 						i += size
 					}
 					sanitizer.after_cr = false
@@ -137,6 +137,7 @@ display_sanitize_chunk :: proc(sanitizer: ^Display_Sanitizer, chunk: string, all
 			i += 1
 		}
 	}
+	if failed { return "" }
 	return strings.to_string(builder)
 }
 

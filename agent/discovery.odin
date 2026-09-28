@@ -33,13 +33,16 @@ Provider_Models_Fetch :: #type proc(user_data: rawptr, base_url, api_key: string
 // catalog source. Providers are listed independently, so one that cannot be
 // reached does not hold up the others. The result is owned by the caller and
 // released with catalog_sources_destroy, exactly like the result of the other two
-// stages.
+// stages. ok is false when a source record could not be allocated.
 discover_provider_models :: proc(
 	providers: []Catalog_Provider_Source,
 	fetch: Provider_Models_Fetch = provider_models_fetch,
 	user_data: rawptr = nil,
 	allocator := context.allocator,
-) -> [dynamic]Catalog_Provider_Source {
+) -> (
+	[dynamic]Catalog_Provider_Source,
+	bool,
+) {
 	result: [dynamic]Catalog_Provider_Source
 	result.allocator = allocator
 	for provider in providers {
@@ -54,15 +57,19 @@ discover_provider_models :: proc(
 		models, listed := provider_models_list(body, allocator)
 		delete(body, allocator)
 		if !listed { continue }
-		append(&result, Catalog_Provider_Source{id = strings.clone(provider.id, allocator), models = models})
+		if !provider_sources_add(&result, provider.id, models, allocator) {
+			catalog_model_sources_destroy(models, allocator)
+			catalog_sources_destroy(&result, allocator)
+			return {}, false
+		}
 	}
-	return result
+	return result, true
 }
 
 // provider_models_cached reads every usable cache entry without performing I/O
 // beyond the local filesystem. Stale entries remain valid inputs while a later
-// refresh is in flight.
-provider_models_cached :: proc(providers: []Catalog_Provider_Source, allocator := context.allocator) -> [dynamic]Catalog_Provider_Source {
+// refresh is in flight. ok is false when a source record could not be allocated.
+provider_models_cached :: proc(providers: []Catalog_Provider_Source, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, bool) {
 	result: [dynamic]Catalog_Provider_Source
 	result.allocator = allocator
 	for provider in providers {
@@ -74,20 +81,41 @@ provider_models_cached :: proc(providers: []Catalog_Provider_Source, allocator :
 		models, listed := provider_models_list(body, allocator)
 		delete(body, allocator)
 		if !listed { continue }
-		append(&result, Catalog_Provider_Source{id = strings.clone(provider.id, allocator), models = models})
+		if !provider_sources_add(&result, provider.id, models, allocator) {
+			catalog_model_sources_destroy(models, allocator)
+			catalog_sources_destroy(&result, allocator)
+			return {}, false
+		}
 	}
-	return result
+	return result, true
+}
+
+// provider_sources_add appends one provider's model listing to a source list, taking
+// ownership of models. It reports false when the source record could not be allocated, and
+// models stays with the caller.
+provider_sources_add :: proc(result: ^[dynamic]Catalog_Provider_Source, id: string, models: []Catalog_Model_Source, allocator: mem.Allocator) -> bool {
+	owned, clone_error := strings.clone(id, allocator)
+	if clone_error != nil { return false }
+	if _, append_error := append(result, Catalog_Provider_Source{id = owned, models = models}); append_error != nil {
+		delete(owned, allocator)
+		return false
+	}
+	return true
 }
 
 // provider_models_refresh returns the freshest source available for each
 // provider. A fresh cache avoids the network. A stale cache remains the fallback
-// when acquisition or validation fails.
+// when acquisition or validation fails. ok is false when a source record could not be
+// allocated.
 provider_models_refresh :: proc(
 	providers: []Catalog_Provider_Source,
 	fetch: Provider_Models_Fetch = provider_models_fetch,
 	user_data: rawptr = nil,
 	allocator := context.allocator,
-) -> [dynamic]Catalog_Provider_Source {
+) -> (
+	[dynamic]Catalog_Provider_Source,
+	bool,
+) {
 	result: [dynamic]Catalog_Provider_Source
 	result.allocator = allocator
 	now := time.now()
@@ -100,9 +128,14 @@ provider_models_refresh :: proc(
 		if cached { cached_models, cache_valid = provider_models_list(body, allocator) }
 		fresh := cache_valid && provider_models_cache_fresh(path, now)
 		if fresh {
-			append(&result, Catalog_Provider_Source{id = strings.clone(provider.id, allocator), models = cached_models})
+			added := provider_sources_add(&result, provider.id, cached_models, allocator)
 			delete(body, allocator)
 			delete(path, allocator)
+			if !added {
+				catalog_model_sources_destroy(cached_models, allocator)
+				catalog_sources_destroy(&result, allocator)
+				return {}, false
+			}
 			continue
 		}
 		if provider.base_url != "" && provider.api_key != "" {
@@ -115,12 +148,16 @@ provider_models_refresh :: proc(
 					if listed {
 						// Caching is best effort: the listing in hand is what answers.
 						_ = provider_models_cache_write(path, acquired)
-						append(&result, Catalog_Provider_Source{id = strings.clone(provider.id, allocator), models = models})
-						for &cached_model in cached_models { catalog_model_source_destroy(&cached_model, allocator) }
-						if cached_models != nil { delete(cached_models, allocator) }
-						if body != nil { delete(body, allocator) }
+						added := provider_sources_add(&result, provider.id, models, allocator)
+						catalog_model_sources_destroy(cached_models, allocator)
+						delete(body, allocator)
 						delete(acquired, allocator)
 						delete(path, allocator)
+						if !added {
+							catalog_model_sources_destroy(models, allocator)
+							catalog_sources_destroy(&result, allocator)
+							return {}, false
+						}
 						continue
 					}
 					delete(acquired, allocator)
@@ -128,12 +165,18 @@ provider_models_refresh :: proc(
 			}
 		}
 		if cache_valid {
-			append(&result, Catalog_Provider_Source{id = strings.clone(provider.id, allocator), models = cached_models})
+			if !provider_sources_add(&result, provider.id, cached_models, allocator) {
+				catalog_model_sources_destroy(cached_models, allocator)
+				delete(body, allocator)
+				delete(path, allocator)
+				catalog_sources_destroy(&result, allocator)
+				return {}, false
+			}
 		}
-		if body != nil { delete(body, allocator) }
+		delete(body, allocator)
 		delete(path, allocator)
 	}
-	return result
+	return result, true
 }
 
 provider_models_cache_path :: proc(provider: Catalog_Provider_Source, allocator: mem.Allocator) -> (string, bool) {
@@ -202,13 +245,20 @@ provider_models_list :: proc(body: []u8, allocator: mem.Allocator) -> ([]Catalog
 	}
 	if count == 0 { return nil, false }
 
-	result := make([]Catalog_Model_Source, count, allocator)
+	result, result_error := make([]Catalog_Model_Source, count, allocator)
+	if result_error != nil { return nil, false }
 	index := 0
 	for entry in entries {
 		id, present := provider_models_id(entry)
 		if !present { continue }
+		owned, clone_error := strings.clone(id, allocator)
+		if clone_error != nil {
+			for &model in result[:index] { catalog_model_source_destroy(&model, allocator) }
+			delete(result, allocator)
+			return nil, false
+		}
 		result[index] = Catalog_Model_Source {
-			id = strings.clone(id, allocator),
+			id = owned,
 		}
 		index += 1
 	}
@@ -233,7 +283,8 @@ provider_models_id :: proc(entry: json.Value) -> (id: string, present: bool) {
 provider_models_fetch :: proc(user_data: rawptr, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
 	url := fmt.aprintf("%s/%s", strings.trim_right(base_url, "/"), PROVIDER_MODELS_SUFFIX, allocator = allocator)
 	defer delete(url, allocator)
-	authorization := strings.concatenate([]string{"Bearer ", api_key}, allocator = allocator)
+	authorization, authorization_error := strings.concatenate([]string{"Bearer ", api_key}, allocator = allocator)
+	if authorization_error != nil { return nil, false }
 	defer delete(authorization, allocator)
 
 	body: Fetch_Body

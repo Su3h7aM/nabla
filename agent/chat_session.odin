@@ -259,6 +259,10 @@ Chat_Session :: struct {
 // one, created by its first prompt. workspace is the validated process directory;
 // it is copied, because the caller's copy may be temporary.
 //
+// The error is the zero value when the session is ready, and otherwise why it was not
+// built: a tool registry error, or kind Allocation for an allocation the session's own
+// state needed. Nothing is left owned when it is not the zero value.
+//
 // Diagnostics are not a field here. The session's work inherits the writer from
 // context.logger, which is what lets a call site emit without threading one.
 chat_session_init :: proc(
@@ -277,24 +281,31 @@ chat_session_init :: proc(
 	// A partial registry is never installed: make destroys it before returning.
 	tools, tool_error := tool_registry_make(allocator)
 	if tool_error.kind != .None { return {}, tool_error }
-	chat := Chat_Session {
-		store                 = store,
-		session               = session,
-		branch                = branch,
-		head                  = head,
-		compact_retry         = chat_retry_policy_default(),
-		allocator             = allocator,
-		next_turn_id          = 1,
-		next_operation_id     = 1,
-		partial_assistant     = make([dynamic]u8, 0, allocator),
-		pending_calls         = make([dynamic]Chat_Tool_Call, 0, allocator),
-		effort_levels         = make([dynamic]string, 0, allocator),
-		abandoned_jobs        = make([dynamic]^Tool_Job, 0, allocator),
-		abandoned_attempts    = make([dynamic]^Chat_Abandoned_Attempt, 0, allocator),
-		abandoned_compactions = make([dynamic]^Compact_Job, 0, allocator),
-		workspace             = strings.clone(workspace, allocator),
-		tools                 = tools,
+	owned_workspace, clone_error := strings.clone(workspace, allocator)
+	if clone_error != nil {
+		tool_registry_destroy(&tools)
+		return {}, Tool_Registry_Error{kind = .Allocation}
 	}
+	chat := Chat_Session {
+		store             = store,
+		session           = session,
+		branch            = branch,
+		head              = head,
+		compact_retry     = chat_retry_policy_default(),
+		allocator         = allocator,
+		next_turn_id      = 1,
+		next_operation_id = 1,
+		workspace         = owned_workspace,
+		tools             = tools,
+	}
+	// Every table of a new session holds nothing and so allocates nothing; each carries only
+	// the allocator its first entry grows from.
+	chat.partial_assistant.allocator = allocator
+	chat.pending_calls.allocator = allocator
+	chat.effort_levels.allocator = allocator
+	chat.abandoned_jobs.allocator = allocator
+	chat.abandoned_attempts.allocator = allocator
+	chat.abandoned_compactions.allocator = allocator
 	chat.tool_output_directory = tool_output_directory(chat_session_text(&chat), allocator)
 	chat.team = agent_team_make(os.heap_allocator())
 	if chat.team != nil { chat.inbox = &chat.team.inbox }
@@ -446,8 +457,31 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	}
 }
 
-chat_clone_string :: proc(value: string, allocator: mem.Allocator) -> string {
+// chat_clone_string copies value with allocator. The caller owns the copy, and a copy that
+// did not fit is reported rather than returned as an empty string, because a field set from
+// an empty string would hold a value the caller never asked for.
+chat_clone_string :: proc(value: string, allocator: mem.Allocator) -> (string, mem.Allocator_Error) {
 	return strings.clone(value, allocator)
+}
+
+// chat_last_error_set replaces the session's own failure text, which is what the terminal
+// status, the turn's record, and a front-end read. A text that cannot be kept leaves no
+// reason rather than a stale one, and what the session could not keep is logged here
+// instead, so the failure is still recorded somewhere.
+chat_last_error_set :: proc(chat: ^Chat_Session, message: string) {
+	delete(chat.last_error, chat.allocator)
+	chat.last_error = ""
+	cloned, clone_error := chat_clone_string(message, chat.allocator)
+	if clone_error == nil {
+		chat.last_error = cloned
+		return
+	}
+	binding: Log_Binding
+	previous_logger := context.logger
+	defer context.logger = previous_logger
+	context.logger = log_rebind(&binding, log_correlation(chat))
+	fields := [2]Log_Field{{key = "detail", value = message}, {key = "detail_bytes", value = i64(len(message))}}
+	log_emit({level = .Error, category = .Agent, event = "agent.failure_text_lost", fields = fields[:]})
 }
 
 // chat_pending_calls_clear releases calls a turn staged but never ran, such as
@@ -470,8 +504,9 @@ CHAT_TITLE_MAX_BYTES :: 80
 
 // chat_title_from_prompt derives a session title from the prompt that opened it:
 // the first line, trimmed and cut to a whole rune. The result is owned by
-// allocator.
-chat_title_from_prompt :: proc(prompt: string, allocator := context.allocator) -> string {
+// allocator, and a title that did not fit is reported: a listing line the caller
+// cannot have must not be mistaken for an empty one.
+chat_title_from_prompt :: proc(prompt: string, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	line := prompt
 	if newline := strings.index_byte(line, '\n'); newline >= 0 { line = line[:newline] }
 	line = strings.trim_space(line)
@@ -504,11 +539,18 @@ chat_session_record_failure :: proc(chat: ^Chat_Session, what: string, error: jo
 // such as a snapshot the harness could not build. latch stops the session's writes
 // for good; without it only the turn ends.
 chat_session_fail :: proc(chat: ^Chat_Session, what: string, detail := "", latch := true) {
-	delete(chat.last_error, chat.allocator)
 	if detail == "" {
-		chat.last_error = chat_clone_string(what, chat.allocator)
+		chat_last_error_set(chat, what)
 	} else {
-		chat.last_error = strings.concatenate({what, ": ", detail}, chat.allocator)
+		joined, join_error := strings.concatenate({what, ": ", detail}, chat.allocator)
+		if join_error != nil {
+			// The failure is recorded and logged either way; the detail is what a join that
+			// did not fit costs.
+			chat_last_error_set(chat, what)
+		} else {
+			delete(chat.last_error, chat.allocator)
+			chat.last_error = joined
+		}
 	}
 	// The failure can be reached from any depth, so the binding is narrowed here to
 	// the session the failure belongs to.
@@ -567,9 +609,15 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 	chat.turn = journal.next_turn(chat.store)
 	chat.request = 0
 	if first {
-		title := chat_title_from_prompt(text, chat.allocator)
-		defer delete(title, chat.allocator)
-		chat_record(chat, {kind = .Session_Titled}, journal.Session_Titled{title = title})
+		title, title_error := chat_title_from_prompt(text, chat.allocator)
+		if title_error != nil {
+			// A session that cannot be named is still a session: the title is a listing
+			// line, and the turn this prompt opens is what matters.
+			log_emit({level = .Warning, category = .Agent, event = "agent.title_lost"})
+		} else {
+			defer delete(title, chat.allocator)
+			chat_record(chat, {kind = .Session_Titled}, journal.Session_Titled{title = title})
+		}
 	}
 	started := journal.Turn_Started {
 		model  = chat.model_id,

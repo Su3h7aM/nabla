@@ -571,7 +571,9 @@ config_resolve_credential :: proc(value: string, allocator := context.allocator)
 		if found_value == "" { return "", false }
 		return found_value, true
 	}
-	return strings.clone(value, allocator), true
+	literal, clone_error := strings.clone(value, allocator)
+	if clone_error != nil { return "", false }
+	return literal, true
 }
 
 

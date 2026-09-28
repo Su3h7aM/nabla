@@ -601,14 +601,18 @@ mcp_tool_configs_release :: proc(configs: [dynamic]MCP_Tool_Config, allocator: m
 
 // mcp_stdio_config is the transport view of a configured server. A normal child
 // inherits the launch environment; configured entries replace or add variables.
-// The strings are borrowed until mcp.Client clones the configuration.
-mcp_stdio_config :: proc(config: MCP_Server_Config) -> mcp.Stdio_Config {
-	environment := make([dynamic]mcp.Environment_Entry, 0, context.temp_allocator)
-	if inherited, err := os.environ(context.temp_allocator); err == nil {
-		for pair in inherited {
-			separator := strings.index_byte(pair, '=')
-			if separator <= 0 { continue }
-			append(&environment, mcp.Environment_Entry{name = pair[:separator], value = pair[separator + 1:]})
+// The strings are borrowed until mcp.Client clones the configuration. ok is false when
+// the environment could not be built, in which case no configuration is returned.
+mcp_stdio_config :: proc(config: MCP_Server_Config) -> (stdio: mcp.Stdio_Config, ok: bool) {
+	environment, environment_error := make([dynamic]mcp.Environment_Entry, 0, context.temp_allocator)
+	if environment_error != nil { return {}, false }
+	inherited, inherited_error := os.environ(context.temp_allocator)
+	if inherited_error != nil { return {}, false }
+	for pair in inherited {
+		separator := strings.index_byte(pair, '=')
+		if separator <= 0 { continue }
+		if _, append_error := append(&environment, mcp.Environment_Entry{name = pair[:separator], value = pair[separator + 1:]}); append_error != nil {
+			return {}, false
 		}
 	}
 	for override in config.stdio.environment {
@@ -619,12 +623,17 @@ mcp_stdio_config :: proc(config: MCP_Server_Config) -> mcp.Stdio_Config {
 			replaced = true
 			break
 		}
-		if !replaced { append(&environment, mcp.Environment_Entry{name = override.name, value = override.value}) }
+		if !replaced {
+			if _, append_error := append(&environment, mcp.Environment_Entry{name = override.name, value = override.value}); append_error != nil {
+				return {}, false
+			}
+		}
 	}
 	return mcp.Stdio_Config {
-		executable = config.stdio.executable,
-		arguments = config.stdio.arguments,
-		working_directory = config.stdio.working_directory,
-		environment = environment[:],
-	}
+			executable = config.stdio.executable,
+			arguments = config.stdio.arguments,
+			working_directory = config.stdio.working_directory,
+			environment = environment[:],
+		},
+		true
 }

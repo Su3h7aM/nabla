@@ -108,9 +108,16 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 			log_mcp_stopped(server.id, runtime.server_launch[index], "restart")
 			mcp.client_destroy(client)
 		}
-		config_err := mcp.client_start(client, agent.mcp_stdio_config(server), runtime.alloc)
+		stdio, stdio_ok := agent.mcp_stdio_config(server)
+		if !stdio_ok {
+			fmt.sbprintf(warnings, "\n%s: the server environment could not be built", server.id)
+			runtime.server_started[index] = false
+			runtime.server_discovered[index] = false
+			return nil, false
+		}
+		config_err := mcp.client_start(client, stdio, runtime.alloc)
 		if config_err.kind != .None {
-			fmt.sbprintf(warnings, "\n%s: %s", server.id, mcp.error_text(config_err, context.temp_allocator))
+			fmt.sbprintf(warnings, "\n%s: %s", server.id, mcp.error_text(config_err, context.temp_allocator) or_else "the failure could not be described")
 			mcp.error_destroy(&config_err, runtime.alloc)
 			runtime.server_started[index] = false
 			runtime.server_discovered[index] = false
@@ -129,7 +136,7 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 		// semantics neither side agreed to.
 		connection, connect_err := mcp.client_connect(client, mcp_operation(server.discovery_timeout), runtime.alloc)
 		if connect_err.kind != .None {
-			fmt.sbprintf(warnings, "\n%s: %s", server.id, mcp.error_text(connect_err, context.temp_allocator))
+			fmt.sbprintf(warnings, "\n%s: %s", server.id, mcp.error_text(connect_err, context.temp_allocator) or_else "the failure could not be described")
 			if connect_err.stderr_tail != "" {
 				fmt.sbprintf(warnings, "\n%s: its last output was: %s", server.id, connect_err.stderr_tail)
 			}
@@ -286,7 +293,7 @@ app_tools_refresh :: proc(app: ^App) -> string {
 		page, list_err := mcp.client_tools_list(client, mcp_operation(server.discovery_timeout), setup.alloc)
 		if list_err.kind != .None {
 			unavailable += 1
-			fmt.sbprintf(&warnings, "\n%s: %s", server.id, mcp.error_text(list_err, context.temp_allocator))
+			fmt.sbprintf(&warnings, "\n%s: %s", server.id, mcp.error_text(list_err, context.temp_allocator) or_else "the failure could not be described")
 			mcp.error_destroy(&list_err, setup.alloc)
 			continue
 		}
