@@ -11,12 +11,14 @@ Frame_Decoder :: struct {
 	allocator:             mem.Allocator,
 	discard_until_newline: bool,
 }
+
 Frame_Error :: enum {
 	None,
 	Invalid_UTF8,
 	Empty_Frame,
 	Allocation,
 }
+
 // frame_decoder_init returns a decoder that clones every frame it yields with allocator,
 // which owns those frames until frame_strings_destroy frees them. It returns the error
 // from creating the frame buffer.
@@ -27,7 +29,9 @@ frame_decoder_init :: proc(allocator := context.allocator) -> (Frame_Decoder, me
 	}
 	return Frame_Decoder{buffer = buffer, allocator = allocator}, nil
 }
-// frame_error_text says what a decoder refused, in the words the client reads.
+
+// frame_error_text returns the sentence a client reads for err, naming what the decoder
+// refused. The result is a constant string the caller never frees.
 frame_error_text :: proc(err: Frame_Error) -> string {
 	switch err {
 	case .None:
@@ -42,37 +46,83 @@ frame_error_text :: proc(err: Frame_Error) -> string {
 	return "the message could not be read"
 }
 
-frame_decoder_destroy :: proc(decoder: ^Frame_Decoder) { delete(decoder.buffer); decoder^ = {} }
-frame_strings_destroy :: proc(frames: ^[dynamic]string, allocator := context.allocator) { for frame in frames^ { delete(frame, allocator) }; delete(frames^) }
+// frame_decoder_destroy frees the decoder's frame buffer with the allocator that made it
+// and leaves decoder inert. The frames already yielded belong to the caller, who frees
+// them with frame_strings_destroy.
+frame_decoder_destroy :: proc(decoder: ^Frame_Decoder) {
+	delete(decoder.buffer)
+	decoder^ = {}
+}
+
+// frame_strings_destroy frees every frame in frames with allocator, which must be the one
+// frame_decoder_feed cloned them with, and frees the list itself.
+frame_strings_destroy :: proc(frames: ^[dynamic]string, allocator := context.allocator) {
+	for frame in frames^ {
+		delete(frame, allocator)
+	}
+	delete(frames^)
+}
+
+// frame_decoder_feed consumes the next chunk of the stream and appends every frame it
+// completes to frames, cloning each with the decoder's allocator so that frames owns them.
+// It returns the first frame the chunk was refused for, or .None when it yielded them all,
+// and it keeps reading the chunk after a refusal so that one bad frame does not hide the
+// frames behind it. A frame is dropped whole: its bytes are never yielded in part.
 frame_decoder_feed :: proc(decoder: ^Frame_Decoder, chunk: []byte, frames: ^[dynamic]string) -> Frame_Error {
 	first_error := Frame_Error.None
 	for byte in chunk {
 		if decoder.discard_until_newline {
-			if byte == '\n' { decoder.discard_until_newline = false }
-			continue
-		}
-		if byte == '\n' {
-			frame_len := len(decoder.buffer)
-			if frame_len > 0 && decoder.buffer[frame_len - 1] == '\r' { frame_len -= 1 }
-			if frame_len == 0 { clear(&decoder.buffer); if first_error == .None { first_error = .Empty_Frame }; continue }
-			line := decoder.buffer[:frame_len]
-			if !utf8.valid_string(string(line)) { if first_error == .None { first_error = .Invalid_UTF8 }; clear(&decoder.buffer); continue }
-			frame, clone_error := strings.clone(string(line), decoder.allocator)
-			if clone_error != nil { clear(&decoder.buffer); if first_error == .None { first_error = .Allocation }; continue }
-			if append(frames, frame) != 1 {
-				delete(frame, decoder.allocator)
-				clear(&decoder.buffer)
-				if first_error == .None { first_error = .Allocation }
-				continue
+			if byte == '\n' {
+				decoder.discard_until_newline = false
 			}
-			clear(&decoder.buffer)
 			continue
 		}
-		if append(&decoder.buffer, byte) != 1 {
-			clear(&decoder.buffer)
-			decoder.discard_until_newline = true
-			if first_error == .None { first_error = .Allocation }
+		if byte != '\n' {
+			if _, append_error := append(&decoder.buffer, byte); append_error != nil {
+				// The bytes of the frame under assembly went with the failed append, so the
+				// rest of that frame is discarded rather than yielded shortened.
+				clear(&decoder.buffer)
+				decoder.discard_until_newline = true
+				if first_error == .None {
+					first_error = .Allocation
+				}
+			}
+			continue
+		}
+		frame_error := frame_end(decoder, frames)
+		if frame_error != .None && first_error == .None {
+			first_error = frame_error
 		}
 	}
 	return first_error
+}
+
+// frame_end ends the frame the decoder has accumulated at its newline: the line terminator
+// is stripped, an empty or non-UTF-8 frame is refused, and a frame the decoder can store is
+// cloned with the decoder's allocator and appended to frames, which then owns it. The
+// buffer is empty when it returns, whatever the outcome. It returns the reason the frame
+// was refused, or .None when frames received it.
+@(private)
+frame_end :: proc(decoder: ^Frame_Decoder, frames: ^[dynamic]string) -> Frame_Error {
+	defer clear(&decoder.buffer)
+	length := len(decoder.buffer)
+	if length > 0 && decoder.buffer[length - 1] == '\r' {
+		length -= 1
+	}
+	if length == 0 {
+		return .Empty_Frame
+	}
+	line := string(decoder.buffer[:length])
+	if !utf8.valid_string(line) {
+		return .Invalid_UTF8
+	}
+	frame, clone_error := strings.clone(line, decoder.allocator)
+	if clone_error != nil {
+		return .Allocation
+	}
+	if _, append_error := append(frames, frame); append_error != nil {
+		delete(frame, decoder.allocator)
+		return .Allocation
+	}
+	return .None
 }
