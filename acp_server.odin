@@ -34,8 +34,8 @@ import "nabla:agent/journal"
 // nothing else.
 ACP_WORK_CAPACITY :: 4
 
-// ACP_READ_BYTES is how much of the input stream one read takes. A frame is bounded by
-// the decoder; this only bounds a syscall.
+// ACP_READ_BYTES is how much of the input stream one read takes. It sizes a syscall,
+// not a frame: the decoder keeps reading until the frame ends.
 ACP_READ_BYTES :: 16 * 1024
 
 Acp_Work_Kind :: enum {

@@ -4,37 +4,34 @@ import "core:mem"
 import "core:strings"
 import "core:unicode/utf8"
 
-// MAX_FRAME_BYTES matches Buzz's ACP line budget. ACP itself does not impose a
-// frame limit; this is Nabla's allocation and denial-of-service boundary.
-MAX_FRAME_BYTES :: 10_000_000
+// Frame_Decoder turns a byte stream into newline-delimited frames. ACP imposes no frame
+// size, so a frame is as large as the peer sends and the buffer grows to hold it.
 Frame_Decoder :: struct {
 	buffer:                [dynamic]u8,
-	max_frame_bytes:       int,
 	allocator:             mem.Allocator,
 	discard_until_newline: bool,
 }
 Frame_Error :: enum {
 	None,
-	Frame_Too_Large,
 	Invalid_UTF8,
 	Empty_Frame,
 	Allocation,
 }
-frame_decoder_init :: proc(max_frame_bytes := MAX_FRAME_BYTES, allocator := context.allocator) -> (Frame_Decoder, mem.Allocator_Error) {
-	initial_capacity := min(max_frame_bytes + 1, 64 * 1024)
-	buffer, buffer_error := make([dynamic]u8, 0, initial_capacity, allocator)
+// frame_decoder_init returns a decoder that clones every frame it yields with allocator,
+// which owns those frames until frame_strings_destroy frees them. It returns the error
+// from creating the frame buffer.
+frame_decoder_init :: proc(allocator := context.allocator) -> (Frame_Decoder, mem.Allocator_Error) {
+	buffer, buffer_error := make([dynamic]u8, allocator)
 	if buffer_error != nil {
-		return Frame_Decoder{max_frame_bytes = max_frame_bytes, allocator = allocator}, buffer_error
+		return Frame_Decoder{allocator = allocator}, buffer_error
 	}
-	return Frame_Decoder{buffer = buffer, max_frame_bytes = max_frame_bytes, allocator = allocator}, nil
+	return Frame_Decoder{buffer = buffer, allocator = allocator}, nil
 }
 // frame_error_text says what a decoder refused, in the words the client reads.
 frame_error_text :: proc(err: Frame_Error) -> string {
 	switch err {
 	case .None:
 		return ""
-	case .Frame_Too_Large:
-		return "the message exceeds the maximum frame size"
 	case .Invalid_UTF8:
 		return "the message is not valid UTF-8"
 	case .Empty_Frame:
@@ -75,12 +72,6 @@ frame_decoder_feed :: proc(decoder: ^Frame_Decoder, chunk: []byte, frames: ^[dyn
 			clear(&decoder.buffer)
 			decoder.discard_until_newline = true
 			if first_error == .None { first_error = .Allocation }
-			continue
-		}
-		if len(decoder.buffer) > decoder.max_frame_bytes {
-			clear(&decoder.buffer)
-			decoder.discard_until_newline = true
-			if first_error == .None { first_error = .Frame_Too_Large }
 		}
 	}
 	return first_error

@@ -27,7 +27,7 @@ NABLA_ACP_VERSION :: "0.1.0"
 // answers each one. False means the stream failed; ending normally is true even when the
 // client simply closed it, which is how a client says it is done.
 acp_serve :: proc(server: ^Acp_Server, input: io.Reader) -> bool {
-	decoder, decoder_error := acp.frame_decoder_init(acp.MAX_FRAME_BYTES, server.alloc)
+	decoder, decoder_error := acp.frame_decoder_init(server.alloc)
 	if decoder_error != nil {
 		_ = acp.writer_write_error(&server.writer, nil, acp.ERROR_INTERNAL, "the ACP frame buffer could not be allocated")
 		return false

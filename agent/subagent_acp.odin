@@ -666,8 +666,12 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	case .Ok:
 	}
 	if read == 0 { return acp_ended(connection, "exited") }
-	if frame_error := acp.frame_decoder_feed(&connection.decoder, buffer[:read], &connection.frames); frame_error == .Frame_Too_Large {
-		return fmt.tprintf("the agent sent a message larger than %d bytes", acp.MAX_FRAME_BYTES)
+	// A dropped frame could be the answer this connection waits for, so it ends the
+	// connection; a blank line carries nothing.
+	switch frame_error := acp.frame_decoder_feed(&connection.decoder, buffer[:read], &connection.frames); frame_error {
+	case .None, .Empty_Frame:
+	case .Invalid_UTF8, .Allocation:
+		return fmt.tprintf("the agent sent a message that could not be read: %s", acp.frame_error_text(frame_error))
 	}
 	return ""
 }

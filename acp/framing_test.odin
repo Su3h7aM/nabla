@@ -6,7 +6,7 @@ import "core:testing"
 
 @(test)
 test_frame_chunk_boundaries_and_multiple_frames :: proc(t: ^testing.T) {
-	decoder, decoder_error := frame_decoder_init(128)
+	decoder, decoder_error := frame_decoder_init()
 	testing.expect(t, decoder_error == nil)
 	defer frame_decoder_destroy(&decoder)
 	frames: [dynamic]string
@@ -23,26 +23,35 @@ test_frame_chunk_boundaries_and_multiple_frames :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_frame_oversized_and_invalid_utf8 :: proc(t: ^testing.T) {
+test_frame_larger_than_a_chunk_arrives_whole :: proc(t: ^testing.T) {
+	decoder, decoder_error := frame_decoder_init()
+	testing.expect(t, decoder_error == nil)
+	defer frame_decoder_destroy(&decoder)
 	frames: [dynamic]string
 	defer frame_strings_destroy(&frames)
 
-	// A frame larger than the configured bound is rejected.
-	decoder, decoder_error := frame_decoder_init(4)
-	testing.expect(t, decoder_error == nil)
-	testing.expect_value(t, frame_decoder_feed(&decoder, transmute([]u8)string("12345"), &frames), Frame_Error.Frame_Too_Large)
-	frame_decoder_destroy(&decoder)
-
-	// A frame that is not valid UTF-8 is rejected.
-	decoder, decoder_error = frame_decoder_init(4)
-	testing.expect(t, decoder_error == nil)
-	testing.expect_value(t, frame_decoder_feed(&decoder, []byte{0xff, '\n'}, &frames), Frame_Error.Invalid_UTF8)
-	frame_decoder_destroy(&decoder)
+	// A frame that spans many chunks, and is far larger than any read: nothing truncates
+	// it and nothing refuses it.
+	wire := make([]u8, 300 * 1024 + 1)
+	defer delete(wire)
+	for i in 0 ..< len(wire) - 1 { wire[i] = 'a' }
+	wire[len(wire) - 1] = '\n'
+	for offset := 0; offset < len(wire); offset += 16 * 1024 {
+		end := min(offset + 16 * 1024, len(wire))
+		testing.expect_value(t, frame_decoder_feed(&decoder, wire[offset:end], &frames), Frame_Error.None)
+	}
+	testing.expect_value(t, len(frames), 1)
+	testing.expect_value(t, len(frames[0]), len(wire) - 1)
+	testing.expect_value(t, frames[0], string(wire[:len(wire) - 1]))
 }
 
 @(test)
-test_frame_budget_matches_buzz_line_limit :: proc(t: ^testing.T) {
-	// Buzz reads ACP lines up to 10,000,000 bytes; a tighter bound here would cut
-	// Buzz's own messages off, a looser one would waste the comparison.
-	testing.expect_value(t, MAX_FRAME_BYTES, 10_000_000)
+test_frame_invalid_utf8 :: proc(t: ^testing.T) {
+	decoder, decoder_error := frame_decoder_init()
+	testing.expect(t, decoder_error == nil)
+	defer frame_decoder_destroy(&decoder)
+	frames: [dynamic]string
+	defer frame_strings_destroy(&frames)
+
+	testing.expect_value(t, frame_decoder_feed(&decoder, []byte{0xff, '\n'}, &frames), Frame_Error.Invalid_UTF8)
 }
