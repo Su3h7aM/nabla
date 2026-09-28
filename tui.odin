@@ -20,10 +20,6 @@ import "nabla:text"
 import "nabla:tui"
 import "nabla:tui/widgets"
 
-// TUI_MAX_CELLS bounds the frame budget. Larger terminals simply skip the
-// frame; the terminal keeps its previous contents.
-TUI_MAX_CELLS :: 256 * 128
-
 // The prompt shows at most five wrapped rows. Its border adds two more, then
 // the working directory and status each use one row.
 INPUT_MAX_ROWS :: 5
@@ -223,15 +219,14 @@ frame_storage_destroy :: proc(storage: ^Frame_Storage) {
 	free(storage, storage.alloc)
 }
 
-// ensure_frame grows the cell grid to the viewport. The presentation scratch is
+// ensure_frame grows the cell grid to the viewport, so the frame works at any
+// terminal size: the grid holds one cell per terminal cell, and a terminal that
+// grew since the last frame buys the cells it needs. The presentation scratch is
 // sized from term.present's required-size contract in present_frame, not
 // guessed here: a grapheme can carry arbitrarily many combining bytes, so no
 // bytes-per-cell bound is a valid upper bound.
 ensure_frame :: proc(storage: ^Frame_Storage, cols, rows: int) -> bool {
 	need := cols * rows
-	if need > TUI_MAX_CELLS {
-		return false
-	}
 	if len(storage.cells) < need {
 		cells, alloc_error := make([]term.Cell, need, storage.alloc)
 		if alloc_error != nil { return false }
@@ -291,7 +286,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 		return {}, .Too_Small
 	}
 	if !ensure_frame(storage, cols, rows) {
-		return {}, .Too_Small
+		return {}, .Buffer_Too_Small
 	}
 	if !tui.init(&storage.buffer, cols, rows, storage.cells) {
 		return {}, .Buffer_Too_Small

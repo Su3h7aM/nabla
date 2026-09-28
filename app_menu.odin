@@ -128,9 +128,9 @@ menu_open_effort :: proc(app: ^App) {
 	menu_pick(app, "provider default" if current == "" else current)
 }
 
-// menu_open_session lists the workspace's recent sessions from the snapshot, with
-// a short id as the second column. Only the worker reads the store, so the list
-// it built is what the menu shows.
+// menu_open_session lists the workspace's sessions, newest activity first, from
+// the snapshot, with a short id as the second column. Only the worker reads the
+// store, so the list it built is what the menu shows, and the list scrolls.
 menu_open_session :: proc(app: ^App) {
 	choices := make([dynamic]Choice, 0, 8, app.run.alloc)
 	active: journal.Session_Id

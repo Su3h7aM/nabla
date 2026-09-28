@@ -90,7 +90,7 @@ diagnostics_main :: proc(args: []string, stdout, stderr: io.Writer) -> int {
 	if export_directory != "" {
 		return diagnostics_export(&store, session_text, export_directory, filter, level, include_payloads, durable_ok, stderr)
 	}
-	_, _, stream_okay := diagnostics_stream(&store, filter, level, stdout, false, 0)
+	_, _, stream_okay := diagnostics_stream(&store, filter, level, stdout, false)
 	if !stream_okay { fmt.wprintln(stderr, "nabla: the journal could not be read or the output stream failed") }
 	return stream_okay && durable_ok ? 0 : 1
 }

@@ -18,7 +18,6 @@ import "nabla:agent/journal"
 EXPORT_MANIFEST_NAME :: "manifest.json"
 EXPORT_SESSION_NAME :: "session.jsonl"
 EXPORT_REQUEST_NAME :: "request.json"
-EXPORT_BYTES :: 32 * 1024 * 1024
 EXPORT_PAGE_RECORDS :: 256
 EXPORT_DIRECTORY_PERMISSIONS :: os.Permissions{.Read_User, .Write_User, .Execute_User}
 EXPORT_FILE_PERMISSIONS :: os.Permissions{.Read_User, .Write_User}
@@ -63,10 +62,9 @@ Export_Request :: struct {
 }
 
 Export_File :: struct {
-	path:      string `json:"path"`,
-	bytes:     int `json:"bytes"`,
-	sha256:    string `json:"sha256"`,
-	truncated: bool `json:"truncated"`,
+	path:   string `json:"path"`,
+	bytes:  int `json:"bytes"`,
+	sha256: string `json:"sha256"`,
 }
 
 Export_Journal_Record :: struct {
@@ -98,8 +96,8 @@ export_stream_write :: proc(data: rawptr, mode: io.Stream_Mode, bytes: []byte, o
 	return i64(written), nil
 }
 
-// diagnostics_stream writes filter's records to writer as JSON lines, oldest first,
-// and stops before the line that would pass budget; a zero budget is no cap.
+// diagnostics_stream writes every one of filter's records to writer as JSON
+// lines, oldest first, reading the store EXPORT_PAGE_RECORDS at a time.
 // runtime.message records below level are left out.
 diagnostics_stream :: proc(
 	store: ^journal.Journal,
@@ -107,7 +105,6 @@ diagnostics_stream :: proc(
 	level: log.Level,
 	writer: io.Writer,
 	include_payloads: bool,
-	budget: int,
 ) -> (
 	bytes: int,
 	records_written: int,
@@ -128,7 +125,6 @@ diagnostics_stream :: proc(
 			line, kept, line_okay := diagnostics_record_line(&record, level, include_payloads, scratch_allocator)
 			if !line_okay { return }
 			if !kept { continue }
-			if budget > 0 && bytes + len(line) + 1 > budget { return bytes, records_written, true }
 			if written, write_error := io.write(writer, line); write_error != nil || written != len(line) { return }
 			if written, write_error := io.write_string(writer, "\n"); write_error != nil || written != 1 { return }
 			bytes += len(line) + 1
@@ -210,8 +206,8 @@ diagnostics_export :: proc(
 		file = file,
 		hash = hash,
 	}
-	bytes, count, stream_okay := diagnostics_stream(store, filter, level, {procedure = export_stream_write, data = &stream}, include_payloads, EXPORT_BYTES)
-	if !export_close(&files, EXPORT_SESSION_NAME, file, hash, bytes, bytes >= EXPORT_BYTES, context.allocator) || !stream_okay { return 1 }
+	bytes, count, stream_okay := diagnostics_stream(store, filter, level, {procedure = export_stream_write, data = &stream}, include_payloads)
+	if !export_close(&files, EXPORT_SESSION_NAME, file, hash, bytes, context.allocator) || !stream_okay { return 1 }
 	manifest := Export_Manifest {
 		version          = 1,
 		session_id       = session_text,
@@ -239,7 +235,7 @@ diagnostics_export_manifest :: proc(destination: string, manifest: ^Export_Manif
 	file, hash, opened := export_open(path, context.allocator)
 	if !opened { return false }
 	okay := export_write(file, data, hash)
-	return export_close(nil, EXPORT_MANIFEST_NAME, file, hash, len(data), false, context.allocator) && okay
+	return export_close(nil, EXPORT_MANIFEST_NAME, file, hash, len(data), context.allocator) && okay
 }
 
 @(private)
@@ -253,21 +249,12 @@ export_open :: proc(path: string, allocator: mem.Allocator) -> (file: ^os.File, 
 }
 
 @(private)
-export_close :: proc(
-	files: ^[dynamic]Export_File,
-	relative: string,
-	file: ^os.File,
-	hash: ^sha2.Context_256,
-	bytes: int,
-	truncated: bool,
-	allocator: mem.Allocator,
-) -> bool {
+export_close :: proc(files: ^[dynamic]Export_File, relative: string, file: ^os.File, hash: ^sha2.Context_256, bytes: int, allocator: mem.Allocator) -> bool {
 	close_error := os.close(file)
 	if close_error != nil { free(hash, allocator); return false }
 	if files == nil { free(hash, allocator); return true }
 	entry := Export_File {
-		bytes     = bytes,
-		truncated = truncated,
+		bytes = bytes,
 	}
 	clone_error: mem.Allocator_Error
 	entry.path, clone_error = strings.clone(relative, allocator)
@@ -336,7 +323,7 @@ diagnostics_export_request :: proc(
 	file, hash, opened := export_open(path, context.allocator)
 	if !opened { return false }
 	okay := export_write(file, data, hash)
-	return export_close(files, EXPORT_REQUEST_NAME, file, hash, len(data), false, context.allocator) && okay
+	return export_close(files, EXPORT_REQUEST_NAME, file, hash, len(data), context.allocator) && okay
 }
 
 @(private)

@@ -1,7 +1,10 @@
 package db
 
-// MAX_ERROR_MESSAGE bounds the diagnostic text a Failure carries. A longer
-// backend message is cut short and Failure.truncated records that.
+// MAX_ERROR_MESSAGE bounds the diagnostic text a Failure carries. It sizes the
+// message array stored inline in Failure, which is what lets a db.Error travel
+// as a plain value: an error carries its text with it, no error allocates, and
+// no caller has to free one. A longer backend message is cut short and
+// Failure.truncated records that.
 MAX_ERROR_MESSAGE :: 128
 
 // Error_Kind classifies a failure so a caller can decide what to do without

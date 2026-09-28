@@ -114,7 +114,6 @@ session_refresh_rows :: proc(app: ^App) {
 	filter := journal.Session_Filter {
 		workspace = app.setup.workspace,
 		role      = .Main,
-		limit     = SESSION_MENU_ROWS,
 	}
 	sessions, list_error := journal.list_sessions(app.setup.store, filter, app.run.alloc)
 	if list_error != nil { return }
@@ -134,9 +133,6 @@ session_refresh_rows :: proc(app: ^App) {
 	app.run.snap.active_session = app.setup.session.session
 	app.run.snap.generation += 1
 }
-
-// SESSION_MENU_ROWS is how many recent sessions the /resume menu offers.
-SESSION_MENU_ROWS :: 20
 
 run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	// A stop that arrived while this item was queued abandons it: shutdown does
