@@ -64,8 +64,6 @@ log_mcp_error_name :: proc(kind: mcp.Error_Kind) -> string {
 		return "end_of_stream"
 	case .Server_Exited:
 		return "server_exited"
-	case .Message_Too_Large:
-		return "message_too_large"
 	case .Malformed_Message:
 		return "malformed_message"
 	case .Unexpected_Message:

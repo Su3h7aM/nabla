@@ -1,6 +1,7 @@
 #+test
 package mcp
 
+import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -127,4 +128,36 @@ test_stdio_start_reports_why_a_server_did_not_start :: proc(t: ^testing.T) {
 	testing.expect_value(t, err.kind, Error_Kind.Spawn_Failed)
 	testing.expect(t, strings.contains(err.message, "could not be started: "), err.message)
 	testing.expect(t, !stdio.started)
+}
+
+// A server can live for a whole session and write to standard error without end, so
+// the transport keeps only its most recent bytes. The tail holds the end of the
+// stream and nothing older, whatever the server wrote before it.
+@(test)
+test_stdio_retains_only_the_most_recent_stderr :: proc(t: ^testing.T) {
+	marker := "the end"
+	server := fmt.tprintf(`head -c %d /dev/zero | tr '\000' x 1>&2; printf '%s' 1>&2`, MAX_STDERR_TAIL_BYTES + 4096, marker)
+	stdio: Stdio
+	start_error := stdio_start(&stdio, {executable = "/bin/sh", arguments = {"-c", server}})
+	defer stdio_stop(&stdio)
+	if !testing.expect_value(t, start_error.kind, Error_Kind.None) { error_destroy(&start_error); return }
+	error_destroy(&start_error)
+
+	expected := fmt.tprintf("%s%s", strings.repeat("x", MAX_STDERR_TAIL_BYTES - len(marker), context.temp_allocator), marker)
+	// The drain runs on its own thread, so the test waits for the server's end of
+	// stream to be read. Only the end of the stream is ever visible, and the marker
+	// arrives with it, so the wait is for that end.
+	wait_start := time.tick_now()
+	found := false
+	retained := 0
+	for !found {
+		sync.mutex_lock(&stdio.stderr_mutex)
+		found = string(stdio.stderr_tail[:]) == expected
+		retained = len(stdio.stderr_tail)
+		sync.mutex_unlock(&stdio.stderr_mutex)
+		if found { break }
+		if time.tick_since(wait_start) > STDIO_TEST_BOUND { break }
+		time.sleep(time.Millisecond)
+	}
+	testing.expectf(t, found, "the tail must hold the most recent %d bytes of standard error, not %d", MAX_STDERR_TAIL_BYTES, retained)
 }

@@ -125,32 +125,6 @@ test_tools_list_refuses_malformed_results :: proc(t: ^testing.T) {
 	}
 }
 
-// A schema is refused when the harness's own definition admission would refuse it,
-// so a schema this client keeps is one the registry can install.
-@(test)
-test_tool_schema_depth_is_bounded_like_the_definition_admission :: proc(t: ^testing.T) {
-	builder := strings.builder_make(context.allocator)
-	defer strings.builder_destroy(&builder)
-	strings.write_string(&builder, `{"resultType":"complete","tools":[{"name":"deep","description":"d","inputSchema":{"type":"object","p":`)
-	for _ in 0 ..< MAX_TOOL_SCHEMA_DEPTH + 2 { strings.write_string(&builder, `{"p":`) }
-	strings.write_string(&builder, `1`)
-	for _ in 0 ..< MAX_TOOL_SCHEMA_DEPTH + 2 { strings.write_string(&builder, `}`) }
-	strings.write_string(&builder, `}}]}`)
-
-	owner, object := result_fixture(t, strings.to_string(builder))
-	if owner == nil { return }
-	defer json.destroy_value(owner, context.allocator)
-
-	page, err := tools_list_decode(object, .V2026_07_28, context.allocator)
-	defer tool_page_destroy(&page, context.allocator)
-	defer error_destroy(&err, context.allocator)
-	testing.expect_value(t, err.kind, Error_Kind.None)
-	testing.expect_value(t, len(page.tools), 0)
-	if testing.expect_value(t, len(page.rejected), 1) {
-		testing.expect(t, page.rejected[0].reason != "", "the refusal says why")
-	}
-}
-
 @(test)
 test_tools_call_params_carry_the_admitted_arguments :: proc(t: ^testing.T) {
 	params, err := tools_call_params_make("issues.create", `{"title":"a bug"}`, .V2026_07_28, context.allocator)
@@ -259,9 +233,11 @@ test_call_result_reports_content_it_does_not_show :: proc(t: ^testing.T) {
 	testing.expect_value(t, result.content[3].type_name, "future_block")
 }
 
+// A server's text is kept as it was sent. No block is dropped or cut, and nothing is
+// charged against a budget here: what the model is shown is the adapter's decision.
 @(test)
-test_call_result_marks_and_bounds_the_text_it_keeps :: proc(t: ^testing.T) {
-	chunk := strings.repeat("x", MAX_CONTENT_TEXT_BYTES, context.allocator)
+test_call_result_keeps_every_text_block_whole :: proc(t: ^testing.T) {
+	chunk := strings.repeat("x", 64 * 1024, context.allocator)
 	defer delete(chunk, context.allocator)
 	block := strings.concatenate({`{"type":"text","text":"`, chunk, `"}`}, context.allocator)
 	defer delete(block, context.allocator)
@@ -284,10 +260,43 @@ test_call_result_marks_and_bounds_the_text_it_keeps :: proc(t: ^testing.T) {
 	defer error_destroy(&err, context.allocator)
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
 
-	testing.expect(t, result.truncated, "the result says the text was not all kept")
-	kept := 0
-	for content in result.content { kept += len(content.text) }
-	testing.expect(t, kept <= MAX_CALL_RESULT_BYTES, "the kept text stays inside the budget")
+	if !testing.expect_value(t, len(result.content), 6) { return }
+	for content in result.content {
+		testing.expect_value(t, len(content.text), len(chunk))
+	}
+}
+
+// A long title and a long cursor are kept whole: the server chose their length, and
+// this client does not shorten what it read.
+@(test)
+test_tools_list_keeps_long_fields_whole :: proc(t: ^testing.T) {
+	cursor := strings.repeat("c", 8 * 1024, context.allocator)
+	defer delete(cursor, context.allocator)
+	title := strings.repeat("t", 4 * 1024, context.allocator)
+	defer delete(title, context.allocator)
+	text := strings.concatenate(
+		{
+			`{"resultType":"complete","nextCursor":"`,
+			cursor,
+			`","tools":[{"name":"a","description":"d","title":"`,
+			title,
+			`","inputSchema":{"type":"object"}}]}`,
+		},
+		context.allocator,
+	)
+	defer delete(text, context.allocator)
+
+	owner, object := result_fixture(t, text)
+	if owner == nil { return }
+	defer json.destroy_value(owner, context.allocator)
+
+	page, err := tools_list_decode(object, .V2026_07_28, context.allocator)
+	defer tool_page_destroy(&page, context.allocator)
+	defer error_destroy(&err, context.allocator)
+	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
+	testing.expect_value(t, page.next_cursor, cursor)
+	if !testing.expect_value(t, len(page.tools), 1) { return }
+	testing.expect_value(t, page.tools[0].title, title)
 }
 
 @(test)

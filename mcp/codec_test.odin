@@ -174,19 +174,10 @@ test_message_decode_refuses_malformed_input :: proc(t: ^testing.T) {
 	}
 }
 
-// Size and nesting are refused before the parser runs, because the parser
-// recurses once per level and would reach the stack first.
+// Excessive nesting is refused before the parser runs, because the parser recurses
+// once per level and would reach the stack first.
 @(test)
-test_message_decode_bounds_size_and_nesting :: proc(t: ^testing.T) {
-	padding := strings.repeat("x", MAX_MESSAGE_BYTES, context.allocator)
-	defer delete(padding, context.allocator)
-	oversized := strings.concatenate({`{"jsonrpc":"2.0","id":1,"result":{"a":"`, padding, `"}}`}, context.allocator)
-	defer delete(oversized, context.allocator)
-	message, err := message_decode(oversized, context.allocator)
-	testing.expect_value(t, err.kind, Error_Kind.Message_Too_Large)
-	message_destroy(&message, context.allocator)
-	error_destroy(&err, context.allocator)
-
+test_message_decode_refuses_excessive_nesting :: proc(t: ^testing.T) {
 	builder := strings.builder_make(context.allocator)
 	defer strings.builder_destroy(&builder)
 	strings.write_string(&builder, `{"jsonrpc":"2.0","id":1,"result":`)
@@ -195,32 +186,32 @@ test_message_decode_bounds_size_and_nesting :: proc(t: ^testing.T) {
 	for _ in 0 ..< MAX_MESSAGE_DEPTH + 4 { strings.write_string(&builder, `}`) }
 	strings.write_string(&builder, `}`)
 
-	message, err = message_decode(strings.to_string(builder), context.allocator)
+	message, err := message_decode(strings.to_string(builder), context.allocator)
 	testing.expect_value(t, err.kind, Error_Kind.Malformed_Message)
 	testing.expect(t, strings.contains(err.message, "nest"), "the diagnostic should name the nesting bound")
 	message_destroy(&message, context.allocator)
 	error_destroy(&err, context.allocator)
 }
 
-// A remote message is text this harness repeats, so it is bounded and cut back to
-// a rune boundary. Oversized error data is dropped, not truncated into a value the
-// server never sent.
+// A remote error's message and data are the server's own words, so both arrive
+// whole: the harness reports what the peer said rather than a cut-down version of
+// it.
 @(test)
-test_remote_error_text_is_bounded :: proc(t: ^testing.T) {
-	padding := strings.repeat("é", MAX_ERROR_MESSAGE_BYTES, context.allocator)
-	defer delete(padding, context.allocator)
-	data := strings.repeat("y", MAX_ERROR_DATA_BYTES + 1, context.allocator)
+test_remote_error_text_arrives_whole :: proc(t: ^testing.T) {
+	remote_message := strings.repeat("é", 4096, context.allocator)
+	defer delete(remote_message, context.allocator)
+	data := strings.repeat("y", 64 * 1024, context.allocator)
 	defer delete(data, context.allocator)
-	line := strings.concatenate({`{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"`, padding, `","data":"`, data, `"}}`}, context.allocator)
+	line := strings.concatenate({`{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"`, remote_message, `","data":"`, data, `"}}`}, context.allocator)
 	defer delete(line, context.allocator)
 
 	message, err := message_decode(line, context.allocator)
 	defer message_destroy(&message, context.allocator)
 	defer error_destroy(&err, context.allocator)
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
-	testing.expect(t, len(message.remote_error.message) <= MAX_ERROR_MESSAGE_BYTES, "the message should be bounded")
-	testing.expect(t, len(message.remote_error.message) > 0, "the message should still say something")
-	testing.expect(t, !message.remote_error.data_present, "oversized data should be dropped")
+	testing.expect_value(t, message.remote_error.message, remote_message)
+	testing.expect(t, message.remote_error.data_present, "the data member is kept")
+	testing.expect(t, strings.contains(message.remote_error.data_json, data), "the data is what the server sent")
 }
 
 @(test)

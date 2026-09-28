@@ -133,7 +133,7 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 		if connect_err.kind != .None {
 			fmt.sbprintf(warnings, "\n%s: %s", server.id, mcp.error_text(connect_err, context.temp_allocator))
 			if connect_err.stderr_tail != "" {
-				fmt.sbprintf(warnings, "\n%s: its last output was: %s", server.id, tail_excerpt(connect_err.stderr_tail))
+				fmt.sbprintf(warnings, "\n%s: its last output was: %s", server.id, connect_err.stderr_tail)
 			}
 			mcp.error_destroy(&connect_err, runtime.alloc)
 			return nil, false
@@ -369,14 +369,3 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	installed = true
 	return strings.to_string(warnings)
 }
-
-// tail_excerpt is the end of what a server wrote to standard error, bounded, which
-// is the part that says why it gave up.
-@(private)
-tail_excerpt :: proc(text: string) -> string {
-	if len(text) <= MCP_STDERR_EXCERPT { return text }
-	return text[len(text) - MCP_STDERR_EXCERPT:]
-}
-
-// MCP_STDERR_EXCERPT bounds how much of a server's own output a warning repeats.
-MCP_STDERR_EXCERPT :: 1024

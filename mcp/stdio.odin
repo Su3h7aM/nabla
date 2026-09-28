@@ -88,8 +88,8 @@ stdio_config_destroy :: proc(config: ^Stdio_Config, allocator := context.allocat
 // its config for as long as the process lives.
 //
 // Standard input and output carry one JSON-RPC message per line. Standard error is
-// diagnostic text only: a thread drains it into a bounded tail so a chatty server
-// cannot block on a full pipe, and a request outcome never depends on it.
+// diagnostic text only: a thread drains it so a chatty server cannot block on a full
+// pipe, and a request outcome never depends on it.
 Stdio :: struct {
 	pipes:            Stdio_Pipes,
 	child:            Stdio_Child,
@@ -289,9 +289,6 @@ stdio_read_line :: proc(stdio: ^Stdio, control: Control) -> (line: []u8, err: Er
 			return
 		}
 		stdio_compact(stdio)
-		if len(stdio.line) > MAX_MESSAGE_BYTES {
-			return nil, stdio_transport_error(stdio, .Message_Too_Large, .Delivered)
-		}
 		if stop := control_stop(control); stop != .None {
 			return nil, control_error(stop, .Delivered, stdio.allocator)
 		}
@@ -361,8 +358,8 @@ stdio_wait_error :: proc(stdio: ^Stdio, kind: Error_Kind, delivery: Delivery_Sta
 	return err
 }
 
-// stdio_stderr_excerpt copies the bounded tail of what the server wrote to standard
-// error. It is diagnostic text and never decides an outcome.
+// stdio_stderr_excerpt copies what the server wrote to standard error. It is
+// diagnostic text and never decides an outcome.
 stdio_stderr_excerpt :: proc(stdio: ^Stdio, allocator := context.allocator) -> string {
 	sync.mutex_lock(&stdio.stderr_mutex)
 	defer sync.mutex_unlock(&stdio.stderr_mutex)
@@ -370,9 +367,9 @@ stdio_stderr_excerpt :: proc(stdio: ^Stdio, allocator := context.allocator) -> s
 	return strings.clone(string(stdio.stderr_tail[:]), allocator)
 }
 
-// stdio_stderr_serve drains standard error into a bounded tail. It runs on its own
-// thread because a server that fills the pipe while the harness is not reading
-// would block on its next write and never answer.
+// stdio_stderr_serve drains standard error. It runs on its own thread because a
+// server that fills the pipe while the harness is not reading would block on its
+// next write and never answer.
 stdio_stderr_serve :: proc(thread: ^thread.Thread) {
 	stdio := cast(^Stdio)thread.data
 	buffer: [4096]u8
@@ -385,24 +382,24 @@ stdio_stderr_serve :: proc(thread: ^thread.Thread) {
 		if status == .Again { continue }
 		if status == .Failed || read_count <= 0 { return }
 		sync.mutex_lock(&stdio.stderr_mutex)
-		stdio_tail_append(&stdio.stderr_tail, buffer[:read_count], stdio.allocator)
+		stdio_stderr_retain(stdio, buffer[:read_count])
 		sync.mutex_unlock(&stdio.stderr_mutex)
 	}
 }
 
-// stdio_tail_append keeps the last MAX_STDERR_TAIL_BYTES bytes, so a server that
-// logs without bound cannot make the harness hold its output.
+// stdio_stderr_retain adds what the server just wrote and keeps only the most
+// recent MAX_STDERR_TAIL_BYTES of it. The cut is moved to the next rune start, so
+// the retained text stays valid UTF-8. The caller holds stderr_mutex.
 @(private)
-stdio_tail_append :: proc(tail: ^[dynamic]u8, chunk: []u8, allocator: mem.Allocator) {
-	if len(chunk) >= MAX_STDERR_TAIL_BYTES {
-		clear(tail)
-		append(tail, ..chunk[len(chunk) - MAX_STDERR_TAIL_BYTES:])
-		return
-	}
-	append(tail, ..chunk)
-	excess := len(tail) - MAX_STDERR_TAIL_BYTES
+stdio_stderr_retain :: proc(stdio: ^Stdio, data: []u8) {
+	// A tail that cannot grow keeps what it has; it is diagnostic only.
+	if _, append_error := append(&stdio.stderr_tail, ..data); append_error != nil { return }
+	excess := len(stdio.stderr_tail) - MAX_STDERR_TAIL_BYTES
 	if excess <= 0 { return }
-	remaining := len(tail) - excess
-	copy(tail[:remaining], tail[excess:])
-	resize(tail, remaining)
+	// A byte with the top bits 10 is the continuation of a rune that the cut would
+	// otherwise split, so it is dropped along with the bytes before it.
+	for excess < len(stdio.stderr_tail) && stdio.stderr_tail[excess] & 0b1100_0000 == 0b1000_0000 {
+		excess += 1
+	}
+	remove_range(&stdio.stderr_tail, 0, excess)
 }

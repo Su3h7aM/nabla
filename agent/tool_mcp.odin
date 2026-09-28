@@ -21,11 +21,6 @@ MCP_Tool_Backend :: struct {
 	remote_name: string,
 }
 
-// TOOL_MCP_STDERR_EXCERPT bounds how much of a server's own output is repeated in a
-// failure message. The transport keeps a larger tail for diagnostics; a message the
-// model reads is not the place for all of it.
-TOOL_MCP_STDERR_EXCERPT :: 1024
-
 // mcp_tool_definition builds the definition one allowed remote tool becomes. name is
 // the advertised alias the user chose, and the returned strings borrow tool, so the
 // definition must be registered before tool is released: tool_registry_add clones
@@ -161,12 +156,9 @@ tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_
 		outcome = .Tool_Failed
 		reason = "server reported a failure"
 		message = "the tool reported a failure"
-	} else if call.truncated {
-		message = "the result was longer than the harness shows"
 	}
 
 	output := MCP_Output {
-		truncated          = call.truncated,
 		content            = blocks[:],
 		structured_content = call.structured_json,
 	}
@@ -202,11 +194,7 @@ tool_mcp_error_result :: proc(ctx: ^Tool_Context, backend: ^MCP_Tool_Backend, er
 	outcome, reason := tool_mcp_outcome(err)
 	message := mcp.error_text(err, context.temp_allocator)
 	if err.stderr_tail != "" {
-		excerpt := err.stderr_tail
-		if len(excerpt) > TOOL_MCP_STDERR_EXCERPT {
-			excerpt = excerpt[len(excerpt) - TOOL_MCP_STDERR_EXCERPT:]
-		}
-		message = fmt.tprintf("%s; the server's last output was: %s", message, excerpt)
+		message = fmt.tprintf("%s; the server's last output was: %s", message, err.stderr_tail)
 	}
 	if outcome == .Unavailable || outcome == .Transport_Failed {
 		message = fmt.tprintf("%s (server %s)", message, backend.server_id)
@@ -233,7 +221,7 @@ tool_mcp_outcome :: proc(err: mcp.Error) -> (journal.Tool_Outcome, string) {
 	case .Protocol_Violation:
 		// A remote JSON-RPC error: the server received the call and refused it.
 		return .Tool_Failed, "server reported an error"
-	case .Message_Too_Large, .Malformed_Message, .Unexpected_Message, .Out_Of_Memory:
+	case .Malformed_Message, .Unexpected_Message, .Out_Of_Memory:
 		if mcp.error_delivered(err) { return .Unknown, "outcome unknown" }
 		return .Tool_Failed, "the reply could not be used"
 	case .Server_Exited, .End_Of_Stream, .Read_Failed, .Write_Failed:

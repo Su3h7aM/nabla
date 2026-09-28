@@ -200,16 +200,6 @@ test_mcp_failure_flag_and_truncation_reach_the_model :: proc(test: ^testing.T) {
 	result := tool_mcp_call_result(&tool_context, failed)
 	defer tool_result_destroy(&result)
 	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Tool_Failed)
-
-	truncated := mcp.Call_Result {
-		allocator = context.allocator,
-		truncated = true,
-		content   = make([dynamic]mcp.Content, 0, context.allocator),
-	}
-	defer mcp.call_result_destroy(&truncated, context.allocator)
-	message_result := tool_mcp_call_result(&tool_context, truncated)
-	defer tool_result_destroy(&message_result)
-	testing.expect(test, strings.contains(message_result.content, "longer than the harness shows"), "truncation is reported")
 }
 
 // No sampling, elicitation, or roots capability is declared, so a server asking for

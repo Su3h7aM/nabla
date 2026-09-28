@@ -1,13 +1,11 @@
 package mcp
 
 import "core:encoding/json"
-import "core:mem"
 
 // Document_Problem names why a JSON document the server sent cannot be used.
 // None is the zero value, so a fresh result reads as no problem.
 Document_Problem :: enum {
 	None,
-	Too_Large,
 	Too_Deep,
 	Syntax,
 	Duplicate_Key,
@@ -15,17 +13,17 @@ Document_Problem :: enum {
 }
 
 // document_admit reports the first structural defect in a document a server
-// sent. The document must be one complete JSON value, inside the size bound, with
-// no repeated field name at any depth and no nesting past the depth bound.
+// sent. The document must be one complete JSON value, with no repeated field name
+// at any depth and no nesting past depth_limit.
 //
 // A repeated field name is refused rather than resolved: a reply whose meaning
 // depends on which of two identical keys the reader picked is not a reply the
-// harness can act on. Size and depth are checked before the parser runs, because
-// the parser recurses once per nesting level and would reach the stack before a
-// later check could refuse it.
-document_admit :: proc(text: string, limit, depth_limit: int, root_object: bool, allocator: mem.Allocator) -> Document_Problem {
+// harness can act on. The depth is checked before the parser runs, because the
+// parser recurses once per nesting level and would reach the stack before a later
+// check could refuse it. How large a document may be is the caller's rule to
+// enforce, not this one's.
+document_admit :: proc(text: string, depth_limit: int, root_object: bool) -> Document_Problem {
 	if text == "" { return .Syntax }
-	if len(text) > limit { return .Too_Large }
 
 	tokenizer := json.make_tokenizer(text, .JSON, true)
 	token, token_err := json.get_token(&tokenizer)

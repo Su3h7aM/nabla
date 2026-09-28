@@ -5,19 +5,6 @@ import "core:fmt"
 import "core:mem"
 import "core:strings"
 
-// MAX_SUPPORTED_VERSIONS bounds the version list a stateless server may report. The
-// list is short by nature, so a longer one is a malformed reply rather than a large
-// one.
-MAX_SUPPORTED_VERSIONS :: 64
-
-// MAX_VERSION_BYTES bounds one version string. Versions are dates.
-MAX_VERSION_BYTES :: 64
-
-// MAX_INSTRUCTIONS_BYTES bounds the natural-language guidance a server offers. It is
-// bounded because it is text a peer chose the size of, and it is never used as
-// instructions: session guidance comes from the user's own configuration.
-MAX_INSTRUCTIONS_BYTES :: 8 * 1024
-
 // Connection is what a server agreed to: which revision is in force, and what it
 // said it can do. Every later request is encoded and every reply decoded under it.
 //
@@ -43,9 +30,9 @@ connection_destroy :: proc(connection: ^Connection, allocator := context.allocat
 	connection^ = {}
 }
 
-// connection_from_stateless reads a server/discover result. The revision list is
-// kept whole rather than reduced to whether this client's appears in it, because a
-// server that speaks another revision should be reported with what it does speak.
+// connection_from_stateless reads a server/discover result. A list that omits this
+// client's revision is refused with the revisions the server does speak, rather than
+// with a boolean: the reader needs to know what to look for.
 connection_from_stateless :: proc(result: json.Object, allocator := context.allocator) -> (Connection, Error) {
 	connection: Connection
 	connection.allocator = allocator
@@ -69,36 +56,29 @@ connection_from_stateless :: proc(result: json.Object, allocator := context.allo
 	if !versions_are_array {
 		return {}, error_make(.Malformed_Message, "the supported versions are not an array", allocator = allocator)
 	}
-	if len(versions) == 0 || len(versions) > MAX_SUPPORTED_VERSIONS {
-		return {}, error_make(.Malformed_Message, "the supported version list is empty or too long", allocator = allocator)
+	for value in versions {
+		if _, is_string := value.(json.String); !is_string {
+			return {}, error_make(.Malformed_Message, "a supported version is not a string", allocator = allocator)
+		}
 	}
 	// The client can only speak what it implements, so a list that omits its own
 	// revision is a server it cannot use. Which revisions the server does speak is
 	// reported so the reader knows what to look for.
-	advertised, advertised_error := make([dynamic]string, 0, len(versions), allocator)
-	if advertised_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
-	defer delete(advertised)
 	supported := false
 	for value in versions {
-		text, is_string := value.(json.String)
-		if !is_string {
-			return {}, error_make(.Malformed_Message, "a supported version is not a string", allocator = allocator)
-		}
-		name, clone_error := mcp_clone_bounded_result(string(text), MAX_VERSION_BYTES, allocator)
-		if clone_error.kind != .None { return {}, clone_error }
-		if name == VERSION_2026_07_28 { supported = true }
-		appended := append(&advertised, name)
-		if appended != 1 {
-			if appended == 0 { delete(name, allocator) }
-			return {}, error_make(.Out_Of_Memory, allocator = allocator)
-		}
+		if string(value.(json.String)) == VERSION_2026_07_28 { supported = true; break }
 	}
 	if !supported {
-		message := fmt.tprintf("the server does not support %s; it supports %s", VERSION_2026_07_28, version_list_text(advertised[:], context.temp_allocator))
-		for name in advertised { delete(name, allocator) }
-		return {}, error_make(.Version_Unsupported, message, allocator = allocator)
+		builder := strings.builder_make(context.temp_allocator)
+		defer strings.builder_destroy(&builder)
+		fmt.sbprintf(&builder, "the server does not support %s; it supports ", VERSION_2026_07_28)
+		if len(versions) == 0 { strings.write_string(&builder, "nothing this client can read") }
+		for value, index in versions {
+			if index > 0 { strings.write_string(&builder, ", ") }
+			strings.write_string(&builder, string(value.(json.String)))
+		}
+		return {}, error_make(.Version_Unsupported, strings.to_string(builder), allocator = allocator)
 	}
-	for name in advertised { delete(name, allocator) }
 
 	if capabilities_error := connection_read_capabilities(&connection, result, allocator); capabilities_error.kind != .None {
 		return {}, capabilities_error
@@ -167,8 +147,8 @@ connection_read_capabilities :: proc(connection: ^Connection, result: json.Objec
 		if !is_string {
 			return error_make(.Malformed_Message, "the instructions are not a string", allocator = allocator)
 		}
-		instructions, clone_error := mcp_clone_bounded_result(string(text), MAX_INSTRUCTIONS_BYTES, allocator)
-		if clone_error.kind != .None { return clone_error }
+		instructions, clone_error := strings.clone(string(text), allocator)
+		if clone_error != nil { return error_make(.Out_Of_Memory, allocator = allocator) }
 		connection.instructions = instructions
 	}
 	return {}
@@ -183,18 +163,4 @@ handshake_server_info :: proc(result: json.Object, allocator: mem.Allocator) -> 
 	info, is_object := value.(json.Object)
 	if !is_object { return "", "" }
 	return meta_identity_field(info, "name", allocator), meta_identity_field(info, "version", allocator)
-}
-
-// version_list_text joins advertised revisions for a diagnostic. It is bounded by
-// the list it was given, which is already bounded.
-@(private)
-version_list_text :: proc(versions: []string, allocator: mem.Allocator) -> string {
-	if len(versions) == 0 { return "nothing this client can read" }
-	builder := strings.builder_make(allocator)
-	defer strings.builder_destroy(&builder)
-	for version, index in versions {
-		if index > 0 { strings.write_string(&builder, ", ") }
-		strings.write_string(&builder, version)
-	}
-	return strings.to_string(builder)
 }

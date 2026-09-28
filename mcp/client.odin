@@ -11,15 +11,6 @@ import "core:time"
 // for a method that cannot change anything: a tools/call is never reissued.
 CLIENT_REQUEST_ATTEMPTS :: 2
 
-// CLIENT_TOOL_PAGES is how many listing pages are followed, so a server that always
-// reports another cursor cannot make the harness list forever.
-CLIENT_TOOL_PAGES :: 32
-
-// CLIENT_MAX_NOTIFICATIONS bounds how many notifications are consumed while waiting
-// for a reply, so a server that only ever sends notifications cannot keep a request
-// running.
-CLIENT_MAX_NOTIFICATIONS :: 256
-
 // CLIENT_HANDSHAKE_TIMEOUT bounds the notification that completes a handshake. It
 // is short because the write is one line: a server that cannot take it is wedged.
 CLIENT_HANDSHAKE_TIMEOUT :: 5 * time.Second
@@ -218,7 +209,6 @@ client_exchange :: proc(client: ^Client, method: string, params: json.Object, op
 	operation_report(options, {direction = .Outgoing, operation = method, request_id = id, message = transmute([]u8)line})
 	if write_err := stdio_write_line(&client.stdio, line, control); write_err.kind != .None { return nil, write_err }
 
-	notifications := 0
 	for {
 		framed, read_err := stdio_read_line(&client.stdio, control)
 		if read_err.kind != .None { return nil, read_err }
@@ -258,10 +248,6 @@ client_exchange :: proc(client: ^Client, method: string, params: json.Object, op
 
 		case .Notification:
 			message_destroy(&message, client.allocator)
-			notifications += 1
-			if notifications > CLIENT_MAX_NOTIFICATIONS {
-				return nil, client_stream_error(client, .Unexpected_Message, "the server sent notifications without replying")
-			}
 
 		case .Request:
 			if protocol_version_inlines_server_requests(client.version) {
@@ -324,8 +310,9 @@ client_error_is_transport :: proc(err: Error) -> bool {
 }
 
 // client_tools_list follows the listing to its end and returns every page as one
-// page. A cursor the server reports forever is refused at the page bound, because a
-// listing that never ends is not a listing.
+// page. There is no page count: a server that answers with the cursor it was just
+// given would ask for a page that has already been read, and no page count would
+// make that listing end, so the repeated cursor itself is refused.
 //
 // The listing has no effect, so it may be sent again after the server is restarted;
 // a tool call may not.
@@ -347,10 +334,7 @@ client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator
 
 	cursor: string // owned by the loop; empty when the listing is complete
 	defer if cursor != "" { delete(cursor, allocator) }
-	for pages := 0;; pages += 1 {
-		if pages >= CLIENT_TOOL_PAGES {
-			return {}, error_make(.Malformed_Message, "the server reported more listing pages than the harness follows", allocator = allocator)
-		}
+	for {
 		next: Tool_Page
 		// The listing is read-only, so a transport failure is retried once against a
 		// fresh server.
@@ -399,6 +383,12 @@ client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator
 		}
 		clear(&next.rejected)
 		tool_page_destroy(&next, allocator)
+		// The cursor that produced this page is the one the server just answered
+		// with: asking again with it would read the same page forever.
+		if moved_cursor != "" && moved_cursor == cursor {
+			delete(moved_cursor, allocator)
+			return {}, error_make(.Malformed_Message, "the server reported the same listing cursor again", allocator = allocator)
+		}
 		if cursor != "" { delete(cursor, allocator) }
 		cursor = moved_cursor
 		if cursor == "" { break }

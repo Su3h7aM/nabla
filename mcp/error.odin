@@ -31,7 +31,6 @@ Error_Kind :: enum {
 	Read_Failed,
 	End_Of_Stream,
 	Server_Exited,
-	Message_Too_Large,
 	Malformed_Message,
 	Unexpected_Message,
 	Version_Unsupported,
@@ -44,10 +43,9 @@ Error_Kind :: enum {
 
 // Error is why an operation delivered no result. message, data_json, and
 // stderr_tail are owned by allocator; data_json carries the remote error's data
-// member when it had one, bounded so a server cannot make the harness allocate in
-// proportion to its own reply. stderr_tail is a bounded excerpt of what a stdio
-// server wrote to standard error, which is diagnostic only and never decides
-// whether an operation succeeded.
+// member when it had one. stderr_tail is the most recent standard error a stdio
+// server wrote, which is diagnostic only and never decides whether an operation
+// succeeded.
 Error :: struct {
 	kind:        Error_Kind,
 	delivery:    Delivery_State,
@@ -108,9 +106,8 @@ error_delivered :: proc(err: Error) -> bool {
 	return err.delivery == .Delivered
 }
 
-// error_text renders an Error as one sentence. The message is bounded and
-// actionable: it says what failed and, when the failure is the peer's, what the
-// peer said.
+// error_text renders an Error as one sentence, owned by allocator. It says what
+// failed and, when the failure is the peer's, what the peer said.
 error_text :: proc(err: Error, allocator := context.allocator) -> string {
 	switch err.kind {
 	case .None:
@@ -129,8 +126,6 @@ error_text :: proc(err: Error, allocator := context.allocator) -> string {
 		return strings.clone("the server closed its output before replying", allocator)
 	case .Server_Exited:
 		return strings.clone("the server exited before replying", allocator)
-	case .Message_Too_Large:
-		return fmt.aprintf("the server sent a message larger than %d bytes", MAX_MESSAGE_BYTES, allocator = allocator)
 	case .Malformed_Message:
 		if err.message != "" { return fmt.aprintf("the server sent a message that is not valid JSON-RPC: %s", err.message, allocator = allocator) }
 		return strings.clone("the server sent a message that is not valid JSON-RPC", allocator)

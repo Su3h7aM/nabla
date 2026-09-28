@@ -77,36 +77,16 @@ tool_page_destroy :: proc(page: ^Tool_Page, allocator := context.allocator) {
 	page^ = {}
 }
 
-// MAX_TOOLS_PER_PAGE bounds one tools/list page. A page is not a listing, so a
-// page larger than this is a malformed reply rather than a large one.
-MAX_TOOLS_PER_PAGE :: 1024
-
-// MAX_TOOL_NAME_BYTES and MAX_TOOL_DESCRIPTION_BYTES bound what one tool may
-// contribute. The advertised definition carries both on every request, so a tool
-// that does not fit is refused rather than advertised at the user's expense.
-MAX_TOOL_NAME_BYTES :: 128
-MAX_TOOL_DESCRIPTION_BYTES :: 4096
-MAX_TOOL_TITLE_BYTES :: 256
-
-// MAX_TOOL_SCHEMA_BYTES and MAX_TOOL_SCHEMA_DEPTH bound a schema document. The
-// depth matches what the harness's own definition admission accepts, so a schema
-// this client keeps is one the registry can install.
-MAX_TOOL_SCHEMA_BYTES :: 64 * 1024
-MAX_TOOL_SCHEMA_DEPTH :: 32
-
-// MAX_CURSOR_BYTES bounds an opaque pagination cursor. It is a token the server
-// chose, so it is bounded like any other server text.
-MAX_CURSOR_BYTES :: 4096
-
 // tools_list_params_make builds the params for one tools/list page. An empty
 // cursor asks for the first page.
 tools_list_params_make :: proc(cursor: string, version: Protocol_Version, allocator := context.allocator) -> (json.Object, Error) {
 	params, build_error := request_params_make(version, 1 if cursor != "" else 0, allocator)
 	if build_error.kind != .None { return {}, build_error }
 	if cursor != "" {
-		key, clone_error := strings.clone("cursor", allocator)
-		if clone_error != nil { json.destroy_value(json.Value(params), allocator); return {}, error_make(.Out_Of_Memory, allocator = allocator) }
-		params[key] = json.String(mcp_clone_bounded(cursor, MAX_CURSOR_BYTES, allocator))
+		if !mcp_object_put_string(&params, "cursor", cursor, allocator) {
+			json.destroy_value(json.Value(params), allocator)
+			return {}, error_make(.Out_Of_Memory, allocator = allocator)
+		}
 	}
 	return params, {}
 }
@@ -143,10 +123,6 @@ tools_list_decode :: proc(result: json.Object, version: Protocol_Version, alloca
 	if !tools_are_array {
 		return {}, error_make(.Malformed_Message, "the tool listing's tools are not an array", allocator = allocator)
 	}
-	if len(tools) > MAX_TOOLS_PER_PAGE {
-		return {}, error_make(.Malformed_Message, "the tool listing page is larger than 1024 tools", allocator = allocator)
-	}
-
 	page_tools, tools_error := make([dynamic]Tool, 0, len(tools), allocator)
 	if tools_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 	page.tools = page_tools
@@ -156,9 +132,11 @@ tools_list_decode :: proc(result: json.Object, version: Protocol_Version, alloca
 	for value in tools {
 		tool, reason := tool_decode(value, allocator)
 		if reason != "" {
+			owned_reason, reason_error := strings.clone(reason, allocator)
+			if reason_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 			rejected := Rejected_Tool {
 				name   = tool_rejected_name(value, allocator),
-				reason = mcp_clone_bounded(reason, MAX_TOOL_DESCRIPTION_BYTES, allocator),
+				reason = owned_reason,
 			}
 			appended := append(&page.rejected, rejected)
 			if appended != 1 {
@@ -182,8 +160,8 @@ tools_list_decode :: proc(result: json.Object, version: Protocol_Version, alloca
 		if !is_string {
 			return {}, error_make(.Malformed_Message, "the tool listing's next cursor is not a string", allocator = allocator)
 		}
-		next_cursor, clone_error := mcp_clone_bounded_result(string(text), MAX_CURSOR_BYTES, allocator)
-		if clone_error.kind != .None { return {}, clone_error }
+		next_cursor, clone_error := strings.clone(string(text), allocator)
+		if clone_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 		page.next_cursor = next_cursor
 	}
 
@@ -201,7 +179,9 @@ tool_rejected_name :: proc(value: json.Value, allocator: mem.Allocator) -> strin
 	if !present { return "" }
 	text, is_string := name_value.(json.String)
 	if !is_string { return "" }
-	return mcp_clone_bounded(string(text), MAX_TOOL_NAME_BYTES, allocator)
+	owned, clone_error := strings.clone(string(text), allocator)
+	if clone_error != nil { return "" }
+	return owned
 }
 
 // Schema_Role says which schema of a definition is being read, so a refusal names
@@ -212,58 +192,28 @@ Schema_Role :: enum {
 	Output,
 }
 
-@(private)
-tool_schema_reason :: proc(role: Schema_Role, problem: string) -> string {
-	switch role {
-	case .Input:
-		switch problem {
-		case "object":
-			return "the tool input schema is not a JSON object"
-		case "type":
-			return `the tool input schema does not declare "type": "object"`
-		case "size":
-			return "the tool input schema is larger than 64 KiB"
-		case "shape":
-			return "the tool input schema is not one bounded JSON document"
-		}
-	case .Output:
-		switch problem {
-		case "object":
-			return " the tool output schema is not a JSON object"
-		}
-	}
-	return "the tool schema could not be read"
-}
-
 // tool_schema_canonical admits a schema document and returns it as canonical JSON
 // bytes. Sorted keys mean the same remote schema always yields the same advertised
 // bytes, which is what keeps the cacheable prefix stable across refreshes.
 //
-// The nesting bound is repeated here rather than left to the one already applied to
-// the whole message: a schema this client keeps must be one the harness's own
-// definition admission will accept.
+// The schema arrives whole. It was carried by a message the protocol layer already
+// refused if it nested past the stack bound, so no size or depth of its own applies.
 @(private)
 tool_schema_canonical :: proc(value: json.Value, role: Schema_Role, allocator: mem.Allocator) -> (schema: string, reason: string) {
 	object, is_object := value.(json.Object)
-	if !is_object { return "", tool_schema_reason(role, "object") }
+	if !is_object {
+		return "", "the tool input schema is not a JSON object" if role == .Input else "the tool output schema is not a JSON object"
+	}
 	if role == .Input {
 		type_value, has_type := object["type"]
 		type_text, type_is_string := type_value.(json.String)
 		if !has_type || !type_is_string || string(type_text) != "object" {
-			return "", tool_schema_reason(role, "type")
+			return "", `the tool input schema does not declare "type": "object"`
 		}
 	}
 
 	encoded, unparse_err := json.unparse(value, {spec = .JSON, sort_maps_by_key = true}, allocator)
-	if unparse_err != nil { return "", tool_schema_reason(role, "shape") }
-	if len(encoded) > MAX_TOOL_SCHEMA_BYTES {
-		delete(encoded, allocator)
-		return "", tool_schema_reason(role, "size")
-	}
-	if problem := document_admit(encoded, MAX_TOOL_SCHEMA_BYTES, MAX_TOOL_SCHEMA_DEPTH, true, context.temp_allocator); problem != .None {
-		delete(encoded, allocator)
-		return "", tool_schema_reason(role, "shape")
-	}
+	if unparse_err != nil { return "", "the tool schema could not be read" }
 	return encoded, ""
 }
 
@@ -293,9 +243,8 @@ tool_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Tool, strin
 	name_value, has_name := object["name"]
 	name, name_is_string := name_value.(json.String)
 	if !has_name || !name_is_string || string(name) == "" { return {}, "the tool definition has no usable name" }
-	if len(name) > MAX_TOOL_NAME_BYTES { return {}, "the tool name is longer than 128 bytes" }
-	owned_name, name_error := mcp_clone_bounded_result(string(name), MAX_TOOL_NAME_BYTES, allocator)
-	if name_error.kind != .None { return {}, "the tool definition could not be allocated" }
+	owned_name, name_error := strings.clone(string(name), allocator)
+	if name_error != nil { return {}, "the tool definition could not be allocated" }
 	tool.name = owned_name
 
 	// A description is required here even though the protocol makes it optional:
@@ -307,16 +256,15 @@ tool_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Tool, strin
 	if !has_description || !description_is_string || string(description) == "" {
 		return {}, "the tool definition has no description"
 	}
-	if len(description) > MAX_TOOL_DESCRIPTION_BYTES { return {}, "the tool description is longer than 4096 bytes" }
-	owned_description, description_error := mcp_clone_bounded_result(string(description), MAX_TOOL_DESCRIPTION_BYTES, allocator)
-	if description_error.kind != .None { return {}, "the tool definition could not be allocated" }
+	owned_description, description_error := strings.clone(string(description), allocator)
+	if description_error != nil { return {}, "the tool definition could not be allocated" }
 	tool.description = owned_description
 
 	if title_value, present := object["title"]; present {
 		title, title_is_string := title_value.(json.String)
 		if !title_is_string { return {}, "the tool title is not a string" }
-		owned_title, title_error := mcp_clone_bounded_result(string(title), MAX_TOOL_TITLE_BYTES, allocator)
-		if title_error.kind != .None { return {}, "the tool definition could not be allocated" }
+		owned_title, title_error := strings.clone(string(title), allocator)
+		if title_error != nil { return {}, "the tool definition could not be allocated" }
 		tool.title = owned_title
 	}
 
@@ -355,8 +303,8 @@ tool_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Tool, strin
 			if annotation_title, annotation_has_title := annotations["title"]; annotation_has_title {
 				title, title_is_string := annotation_title.(json.String)
 				if !title_is_string { return {}, "the tool annotation title is not a string" }
-				owned_title, title_error := mcp_clone_bounded_result(string(title), MAX_TOOL_TITLE_BYTES, allocator)
-				if title_error.kind != .None { return {}, "the tool definition could not be allocated" }
+				owned_title, title_error := strings.clone(string(title), allocator)
+				if title_error != nil { return {}, "the tool definition could not be allocated" }
 				tool.title = owned_title
 			}
 		}
@@ -367,31 +315,6 @@ tool_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Tool, strin
 }
 
 // --- calling -----------------------------------------------------------------
-
-// MAX_CONTENT_ITEMS bounds how many content blocks one result may carry.
-MAX_CONTENT_ITEMS :: 256
-
-// MAX_CONTENT_TYPE_BYTES, MAX_MIME_BYTES, MAX_CONTENT_URI_BYTES, and
-// MAX_CONTENT_NAME_BYTES bound the descriptive fields of one content block.
-MAX_CONTENT_TYPE_BYTES :: 128
-MAX_MIME_BYTES :: 256
-MAX_CONTENT_URI_BYTES :: 2048
-MAX_CONTENT_NAME_BYTES :: 256
-
-// MAX_CONTENT_TEXT_BYTES bounds one text block, and MAX_CALL_RESULT_BYTES bounds
-// all of them together. The harness result budget is smaller than either, so the
-// adapter trims what it forwards; these bounds exist so a server cannot make this
-// package hold an amount of text it never described a limit for.
-MAX_CONTENT_TEXT_BYTES :: 64 * 1024
-MAX_CALL_RESULT_BYTES :: 256 * 1024
-
-// MAX_STRUCTURED_BYTES bounds the structured half of a result.
-MAX_STRUCTURED_BYTES :: 256 * 1024
-
-// MAX_REQUEST_STATE_BYTES and MAX_INPUT_REQUESTS_BYTES bound what an
-// input-required result may contribute to the diagnostic that reports it.
-MAX_REQUEST_STATE_BYTES :: 4096
-MAX_INPUT_REQUESTS_BYTES :: 16 * 1024
 
 // Content_Kind classifies one content block.
 Content_Kind :: enum {
@@ -435,12 +358,11 @@ content_destroy :: proc(content: []Content, allocator := context.allocator) {
 // Call_Result is one tools/call answer. input_required marks a reply that asks
 // for more input instead of reporting a finished call, in which case content is
 // empty and the server's request description is in request_state and
-// input_requests.
+// input_requests. Every field a result carries arrives whole.
 Call_Result :: struct {
 	input_required:  bool,
 	is_error:        bool,
 	content:         [dynamic]Content,
-	truncated:       bool,
 	structured_json: string,
 	request_state:   string,
 	input_requests:  string,
@@ -484,12 +406,12 @@ tools_call_params_make :: proc(name, arguments_json: string, version: Protocol_V
 		json.destroy_value(arguments, allocator)
 		return {}, error_make(.Out_Of_Memory, allocator = allocator)
 	}
-	name_value, name_value_error := mcp_clone_bounded_result(name, MAX_TOOL_NAME_BYTES, allocator)
-	if name_value_error.kind != .None {
+	name_value, name_value_error := strings.clone(name, allocator)
+	if name_value_error != nil {
 		delete(name_key, allocator)
 		json.destroy_value(json.Value(built_params), allocator)
 		json.destroy_value(arguments, allocator)
-		return {}, name_value_error
+		return {}, error_make(.Out_Of_Memory, allocator = allocator)
 	}
 	built_params[name_key] = json.String(name_value)
 	arguments_key, arguments_key_error := strings.clone("arguments", allocator)
@@ -529,21 +451,14 @@ call_result_decode :: proc(result: json.Object, version: Protocol_Version, alloc
 			if !is_string {
 				return {}, error_make(.Malformed_Message, "the input request state is not a string", allocator = allocator)
 			}
-			decoded.request_state = mcp_clone_bounded(string(text), MAX_REQUEST_STATE_BYTES, allocator)
+			state, clone_error := strings.clone(string(text), allocator)
+			if clone_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+			decoded.request_state = state
 		}
 		if requests_value, present := result["inputRequests"]; present {
 			encoded, unparse_err := json.unparse(requests_value, {spec = .JSON, sort_maps_by_key = true}, allocator)
-			if unparse_err != nil {
-				return {}, error_make(.Out_Of_Memory, allocator = allocator)
-			}
-			// The description is diagnostic. One that does not fit is dropped
-			// rather than cut, because a half-rendered request description is not
-			// what the server asked for.
-			if len(encoded) > MAX_INPUT_REQUESTS_BYTES {
-				delete(encoded, allocator)
-			} else {
-				decoded.input_requests = encoded
-			}
+			if unparse_err != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+			decoded.input_requests = encoded
 		}
 
 	case RESULT_TYPE_COMPLETE:
@@ -563,14 +478,10 @@ call_result_decode :: proc(result: json.Object, version: Protocol_Version, alloc
 		if !blocks_are_array {
 			return {}, error_make(.Malformed_Message, "the tool result's content is not an array", allocator = allocator)
 		}
-		if len(blocks) > MAX_CONTENT_ITEMS {
-			return {}, error_make(.Malformed_Message, "the tool result carries more than 256 content blocks", allocator = allocator)
-		}
 
 		decoded.content = make([dynamic]Content, 0, len(blocks), allocator)
-		kept_text := 0
 		for block in blocks {
-			content, content_err := content_decode(block, &kept_text, allocator)
+			content, content_err := content_decode(block, allocator)
 			if content_err.kind != .None {
 				// The blocks already kept are owned by decoded, which the deferred
 				// cleanup releases.
@@ -578,15 +489,10 @@ call_result_decode :: proc(result: json.Object, version: Protocol_Version, alloc
 			}
 			append(&decoded.content, content)
 		}
-		decoded.truncated = kept_text > MAX_CALL_RESULT_BYTES
 
 		if structured_value, present := result["structuredContent"]; present {
 			encoded, unparse_err := json.unparse(structured_value, {spec = .JSON, sort_maps_by_key = true}, allocator)
 			if unparse_err != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
-			if len(encoded) > MAX_STRUCTURED_BYTES {
-				delete(encoded, allocator)
-				return {}, error_make(.Malformed_Message, "the tool result's structured content is larger than 256 KiB", allocator = allocator)
-			}
 			decoded.structured_json = encoded
 		}
 
@@ -598,12 +504,10 @@ call_result_decode :: proc(result: json.Object, version: Protocol_Version, alloc
 	return decoded, {}
 }
 
-// content_decode reads one content block. kept_text is the running total of text
-// already kept, so a result cannot accumulate text a server never bounded; past
-// the budget a text block is recorded as empty and the result is marked
-// truncated, which is a fact the adapter passes on to the model.
+// content_decode reads one content block. Every field the block carries is kept as
+// the server sent it.
 @(private)
-content_decode :: proc(value: json.Value, kept_text: ^int, allocator: mem.Allocator) -> (Content, Error) {
+content_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Content, Error) {
 	content: Content
 	object, is_object := value.(json.Object)
 	if !is_object { return {}, error_make(.Malformed_Message, "a content block is not an object", allocator = allocator) }
@@ -613,7 +517,9 @@ content_decode :: proc(value: json.Value, kept_text: ^int, allocator: mem.Alloca
 	if !has_type || !type_is_string || string(type_text) == "" {
 		return {}, error_make(.Malformed_Message, "a content block has no usable type", allocator = allocator)
 	}
-	content.type_name = mcp_clone_bounded(string(type_text), MAX_CONTENT_TYPE_BYTES, allocator)
+	owned_type_name, type_error := strings.clone(string(type_text), allocator)
+	if type_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	content.type_name = owned_type_name
 	failed := true
 	defer if failed { content_block_destroy(&content, allocator) }
 
@@ -625,14 +531,9 @@ content_decode :: proc(value: json.Value, kept_text: ^int, allocator: mem.Alloca
 			return {}, error_make(.Malformed_Message, "a text content block carries no text", allocator = allocator)
 		}
 		content.kind = .Text
-		// Every offered block is charged against the budget, whether it was kept
-		// or dropped, so a result that dropped text reports itself as truncated.
-		offered := mcp_clone_bounded(string(text), MAX_CONTENT_TEXT_BYTES, allocator)
-		defer delete(offered, allocator)
-		if kept_text^ < MAX_CALL_RESULT_BYTES {
-			content.text = mcp_clone_bounded(offered, MAX_CONTENT_TEXT_BYTES, allocator)
-		}
-		kept_text^ += len(offered)
+		owned_text, text_error := strings.clone(string(text), allocator)
+		if text_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		content.text = owned_text
 
 	case "image", "audio":
 		// The payload is checked for presence and shape without being copied: the
@@ -649,7 +550,9 @@ content_decode :: proc(value: json.Value, kept_text: ^int, allocator: mem.Alloca
 			return {}, error_make(.Malformed_Message, "a binary content block carries no MIME type", allocator = allocator)
 		}
 		content.kind = .Image if string(type_text) == "image" else .Audio
-		content.mime_type = mcp_clone_bounded(string(mime), MAX_MIME_BYTES, allocator)
+		mime_error: mem.Allocator_Error
+		content.mime_type, mime_error = strings.clone(string(mime), allocator)
+		if mime_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 
 	case "resource_link":
 		name_value, has_name := object["name"]
@@ -663,12 +566,17 @@ content_decode :: proc(value: json.Value, kept_text: ^int, allocator: mem.Alloca
 			return {}, error_make(.Malformed_Message, "a resource link carries no URI", allocator = allocator)
 		}
 		content.kind = .Resource_Link
-		content.name = mcp_clone_bounded(string(name), MAX_CONTENT_NAME_BYTES, allocator)
-		content.uri = mcp_clone_bounded(string(uri), MAX_CONTENT_URI_BYTES, allocator)
+		name_error, uri_error: mem.Allocator_Error
+		content.name, name_error = strings.clone(string(name), allocator)
+		if name_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		content.uri, uri_error = strings.clone(string(uri), allocator)
+		if uri_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 		if mime_value, present := object["mimeType"]; present {
 			mime, mime_is_string := mime_value.(json.String)
 			if !mime_is_string { return {}, error_make(.Malformed_Message, "a resource link's MIME type is not a string", allocator = allocator) }
-			content.mime_type = mcp_clone_bounded(string(mime), MAX_MIME_BYTES, allocator)
+			mime_error: mem.Allocator_Error
+			content.mime_type, mime_error = strings.clone(string(mime), allocator)
+			if mime_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 		}
 
 	case "resource":
@@ -683,11 +591,15 @@ content_decode :: proc(value: json.Value, kept_text: ^int, allocator: mem.Alloca
 			return {}, error_make(.Malformed_Message, "an embedded resource carries no URI", allocator = allocator)
 		}
 		content.kind = .Embedded_Resource
-		content.uri = mcp_clone_bounded(string(uri), MAX_CONTENT_URI_BYTES, allocator)
+		uri_error: mem.Allocator_Error
+		content.uri, uri_error = strings.clone(string(uri), allocator)
+		if uri_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 		if mime_value, present := resource["mimeType"]; present {
 			mime, mime_is_string := mime_value.(json.String)
 			if !mime_is_string { return {}, error_make(.Malformed_Message, "an embedded resource's MIME type is not a string", allocator = allocator) }
-			content.mime_type = mcp_clone_bounded(string(mime), MAX_MIME_BYTES, allocator)
+			mime_error: mem.Allocator_Error
+			content.mime_type, mime_error = strings.clone(string(mime), allocator)
+			if mime_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 		}
 
 	case:

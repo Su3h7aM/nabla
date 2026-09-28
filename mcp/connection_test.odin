@@ -2,6 +2,7 @@
 package mcp
 
 import "core:encoding/json"
+import "core:fmt"
 import "core:strings"
 import "core:testing"
 
@@ -94,6 +95,39 @@ test_stateless_connection_refuses_malformed_results :: proc(t: ^testing.T) {
 		error_destroy(&err, context.allocator)
 		json.destroy_value(owner, context.allocator)
 	}
+}
+
+// A revision list longer than any client needs and guidance longer than a sentence
+// are still what the server said, so both arrive whole.
+@(test)
+test_stateless_connection_keeps_what_the_server_reported_whole :: proc(t: ^testing.T) {
+	versions := strings.builder_make(context.allocator)
+	defer strings.builder_destroy(&versions)
+	for index in 0 ..< 128 {
+		if index > 0 { strings.write_string(&versions, ",") }
+		if index == 64 {
+			fmt.sbprintf(&versions, `"%s"`, VERSION_2026_07_28)
+		} else {
+			fmt.sbprintf(&versions, `"2025-06-1%d"`, index % 10)
+		}
+	}
+	instructions := strings.repeat("i", 16 * 1024, context.allocator)
+	defer delete(instructions, context.allocator)
+	text := strings.concatenate(
+		{`{"resultType":"complete","supportedVersions":[`, strings.to_string(versions), `],"capabilities":{},"instructions":"`, instructions, `"}`},
+		context.allocator,
+	)
+	defer delete(text, context.allocator)
+
+	owner, object := result_fixture(t, text)
+	if owner == nil { return }
+	defer json.destroy_value(owner, context.allocator)
+
+	connection, err := connection_from_stateless(object, context.allocator)
+	defer connection_destroy(&connection, context.allocator)
+	defer error_destroy(&err, context.allocator)
+	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
+	testing.expect_value(t, connection.instructions, instructions)
 }
 
 // --- the handshake revisions --------------------------------------------------

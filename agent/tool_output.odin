@@ -122,7 +122,6 @@ Codemode_Output :: struct {
 // block carries a line saying what was returned and why it is not shown.
 // structured_content is the JSON the server sent, exactly as sent.
 MCP_Output :: struct {
-	truncated:          bool,
 	content:            []MCP_Block,
 	structured_content: string `lua:"json"`,
 }
@@ -237,7 +236,6 @@ tool_result_render :: proc(
 		render_section(&body, "traceback", value.traceback) or_return
 		render_section(&body, "logs", value.logs) or_return
 	case MCP_Output:
-		render_field(&head, "truncated", value.truncated) or_return
 		for block in value.content {
 			if block.text != "" {
 				render_text(&body, block.text) or_return

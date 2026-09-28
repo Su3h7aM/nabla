@@ -3,7 +3,6 @@ package mcp
 import "core:encoding/json"
 import "core:mem"
 import "core:strings"
-import "core:unicode/utf8"
 
 // The protocol revisions this client implements, and how it prefers them.
 //
@@ -133,28 +132,17 @@ ERROR_CODE_HEADER_MISMATCH :: -32020
 ERROR_CODE_MISSING_CLIENT_CAPABILITY :: -32021
 ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION :: -32022
 
-// MAX_MESSAGE_BYTES bounds one JSON-RPC message. It is the first check applied
-// to anything a server sends, so a server cannot make the harness allocate in
-// proportion to its own output.
-MAX_MESSAGE_BYTES :: 4 * 1024 * 1024
-
-// MAX_MESSAGE_DEPTH bounds nesting in a received message. It is checked before
-// parsing, because the parser recurses once per level.
+// MAX_MESSAGE_DEPTH is how deep a received message may nest. It protects the stack
+// rather than capping what a server may send: the parser recurses once per level, so a
+// deeper document would reach the stack before any later check could refuse it. The
+// bound is the operating system's stack, and nothing else about a message is bounded.
 MAX_MESSAGE_DEPTH :: 64
 
-// MAX_ERROR_MESSAGE_BYTES and MAX_ERROR_DATA_BYTES bound what a remote error may
-// contribute to a diagnostic. A server's message is text this harness repeats, so
-// it is cut to size rather than trusted.
-MAX_ERROR_MESSAGE_BYTES :: 4096
-MAX_ERROR_DATA_BYTES :: 16 * 1024
-
-// MAX_STDERR_TAIL_BYTES bounds the excerpt of a stdio server's standard error
-// that is kept for diagnostics.
+// MAX_STDERR_TAIL_BYTES is how much of a server's standard error the transport
+// keeps. It sizes the memory for a diagnostic stream: a stdio server can live for
+// a whole session and write without end, so only its most recent bytes are held.
+// It caps nothing the protocol or the model exchanges.
 MAX_STDERR_TAIL_BYTES :: 32 * 1024
-
-// MAX_IDENTITY_BYTES bounds a name or version reported by a server. Identity is
-// text the harness repeats, so it is cut to size rather than trusted.
-MAX_IDENTITY_BYTES :: 256
 
 mcp_object_make :: proc(capacity: int, allocator: mem.Allocator) -> (json.Object, Error) {
 	object, make_error := make(json.Object, capacity, allocator)
@@ -369,10 +357,6 @@ mcp_frame :: proc(value: json.Value, allocator: mem.Allocator) -> (string, Error
 		delete(encoded, allocator)
 		return "", error_make(.Malformed_Message, "the encoded message contained a newline", allocator = allocator)
 	}
-	if len(encoded) > MAX_MESSAGE_BYTES {
-		delete(encoded, allocator)
-		return "", error_make(.Message_Too_Large, allocator = allocator)
-	}
 	return encoded, {}
 }
 
@@ -430,10 +414,8 @@ message_destroy :: proc(message: ^Message, allocator := context.allocator) {
 // accepted, because the specification allows it when the server could not read the
 // request's id at all.
 message_decode :: proc(line: string, allocator := context.allocator) -> (message: Message, err: Error) {
-	switch problem := document_admit(line, MAX_MESSAGE_BYTES, MAX_MESSAGE_DEPTH, true, allocator); problem {
+	switch problem := document_admit(line, MAX_MESSAGE_DEPTH, true); problem {
 	case .None:
-	case .Too_Large:
-		return {}, error_make(.Message_Too_Large, allocator = allocator)
 	case .Too_Deep:
 		return {}, error_make(.Malformed_Message, "it nests more than 64 levels deep", allocator = allocator)
 	case .Duplicate_Key:
@@ -579,22 +561,24 @@ message_read_remote_error :: proc(value: json.Value, allocator: mem.Allocator) -
 	if !has_text || !text_is_string { return {}, error_make(.Malformed_Message, "its error carries no message", allocator = allocator) }
 
 	remote := Remote_Error {
-		code    = i64(code),
-		message = mcp_clone_bounded(string(text), MAX_ERROR_MESSAGE_BYTES, allocator),
+		code = i64(code),
 	}
+	failed := true
+	defer if failed {
+		delete(remote.message, allocator)
+		delete(remote.data_json, allocator)
+	}
+	message, message_error := strings.clone(string(text), allocator)
+	if message_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	remote.message = message
+
 	if data, present := object["data"]; present {
 		encoded, unparse_err := json.unparse(data, {spec = .JSON, sort_maps_by_key = true}, allocator)
 		if unparse_err != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
-		// Data is diagnostic only. One that does not fit the bound is dropped
-		// rather than truncated into something that is not the value the server
-		// sent, because a half-rendered diagnostic is worse than none.
-		if len(encoded) > MAX_ERROR_DATA_BYTES {
-			delete(encoded, allocator)
-		} else {
-			remote.data_json = encoded
-			remote.data_present = true
-		}
+		remote.data_json = encoded
+		remote.data_present = true
 	}
+	failed = false
 	return remote, {}
 }
 
@@ -634,29 +618,7 @@ meta_identity_field :: proc(info: json.Object, field: string, allocator: mem.All
 	if !present { return "" }
 	text, is_string := value.(json.String)
 	if !is_string { return "" }
-	return mcp_clone_bounded(string(text), MAX_IDENTITY_BYTES, allocator)
-}
-
-// mcp_clone_bounded clones at most limit bytes of text, cut back to a rune
-// boundary so a bounded copy is still valid UTF-8. Nothing this package reports
-// may be text a server chose the size of.
-mcp_clone_bounded_result :: proc(text: string, limit: int, allocator: mem.Allocator) -> (string, Error) {
-	value := text
-	if len(value) > limit {
-		cut := value[:limit]
-		for len(cut) > 0 {
-			_, width := utf8.decode_last_rune_in_string(cut)
-			if width > 0 { break }
-			cut = cut[:len(cut) - 1]
-		}
-		value = cut
-	}
-	owned, clone_error := strings.clone(value, allocator)
-	if clone_error != nil { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-	return owned, {}
-}
-
-mcp_clone_bounded :: proc(text: string, limit: int, allocator: mem.Allocator) -> string {
-	value, _ := mcp_clone_bounded_result(text, limit, allocator)
-	return value
+	owned, clone_error := strings.clone(string(text), allocator)
+	if clone_error != nil { return "" }
+	return owned
 }
