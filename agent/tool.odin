@@ -254,14 +254,6 @@ Tool_Registry_Error :: struct {
 // TOOL_MAX_NAME_BYTES is the common provider limit for a function name.
 TOOL_MAX_NAME_BYTES :: 64
 
-// TOOL_MAX_DESCRIPTION_BYTES bounds a tool description. Descriptions travel
-// with every request, so an unbounded one would tax the cacheable prefix.
-TOOL_MAX_DESCRIPTION_BYTES :: 4096
-
-// TOOL_MAX_SCHEMA_BYTES bounds an input schema document. It matches the
-// argument budget so a schema can never admit what arguments cannot carry.
-TOOL_MAX_SCHEMA_BYTES :: 64 * 1024
-
 // tool_name_valid admits one canonical tool name: a flat Lua identifier of at most
 // 64 bytes. The same grammar is accepted by the provider APIs Nabla supports, so the
 // registry name is used verbatim on the wire and inside Lua.
@@ -278,9 +270,9 @@ tool_name_valid :: proc(name: string) -> bool {
 }
 
 // tool_definition_validate checks a definition before it is copied into a
-// registry. The schema is admitted as bounded JSON with an object root, using
-// the same tokenizer admission as argument documents; general JSON Schema
-// semantics stay the definition source's responsibility.
+// registry. The schema is admitted as JSON with an object root, using the same
+// tokenizer admission as argument documents; general JSON Schema semantics stay
+// the definition source's responsibility.
 tool_definition_validate :: proc(definition: Tool_Definition) -> Tool_Registry_Error {
 	if !tool_name_valid(definition.name) {
 		return {
@@ -291,9 +283,6 @@ tool_definition_validate :: proc(definition: Tool_Definition) -> Tool_Registry_E
 	}
 	if definition.description == "" {
 		return {kind = .Missing_Description, tool = definition.name, detail = "a tool needs a description"}
-	}
-	if len(definition.description) > TOOL_MAX_DESCRIPTION_BYTES {
-		return {kind = .Missing_Description, tool = definition.name, detail = "the description exceeds 4096 bytes"}
 	}
 	if schema_error := tool_schema_valid(definition.input_schema); schema_error != "" {
 		return {kind = .Invalid_Schema, tool = definition.name, detail = schema_error}
@@ -308,11 +297,10 @@ tool_definition_validate :: proc(definition: Tool_Definition) -> Tool_Registry_E
 }
 
 // tool_schema_valid reports why a schema document is unusable, or "" when it is
-// one bounded JSON object. The returned string is static text.
+// one JSON object. The returned string is static text.
 @(private)
 tool_schema_valid :: proc(schema: string) -> string {
 	if schema == "" { return "a tool needs an input schema" }
-	if len(schema) > TOOL_MAX_SCHEMA_BYTES { return "the schema exceeds 64 KiB" }
 	admit_error := tool_arguments_admit(schema, context.temp_allocator)
 	defer tool_argument_error_destroy(&admit_error, context.temp_allocator)
 	defect, failed := admit_error.?

@@ -526,7 +526,8 @@ test_registry_rejects_invalid_definitions :: proc(test: ^testing.T) {
 		tool_test_definition_destroy(&definition, context.allocator)
 	}
 
-	// An overlong name, description, and schema are refused at their bounds.
+	// A name past the provider limit is refused. A description and a schema have no
+	// such limit, so both are registered whole however large they are.
 	definition := tool_test_valid_definition(context.allocator)
 	defer tool_test_definition_destroy(&definition, context.allocator)
 	registry := Tool_Registry {
@@ -542,18 +543,11 @@ test_registry_rejects_invalid_definitions :: proc(test: ^testing.T) {
 	delete(definition.name, context.allocator)
 	definition.name = strings.clone("test_tool", context.allocator)
 	delete(definition.description, context.allocator)
-	definition.description = strings.repeat("d", TOOL_MAX_DESCRIPTION_BYTES + 1, context.allocator)
-	testing.expect_value(test, tool_registry_add(&registry, definition).kind, Tool_Registry_Error_Kind.Missing_Description)
-
-	delete(definition.description, context.allocator)
-	definition.description = strings.clone("A test tool.", context.allocator)
+	definition.description = strings.repeat("d", 1 << 20, context.allocator)
 	delete(definition.input_schema, context.allocator)
-	definition.input_schema = strings.concatenate(
-		{`{"type":"object","x":"`, strings.repeat("x", TOOL_MAX_SCHEMA_BYTES, context.temp_allocator), `"}`},
-		context.allocator,
-	)
-	testing.expect_value(test, tool_registry_add(&registry, definition).kind, Tool_Registry_Error_Kind.Invalid_Schema)
-	testing.expect_value(test, len(registry.definitions), 0)
+	definition.input_schema = strings.concatenate({`{"type":"object","x":"`, strings.repeat("x", 1 << 20, context.temp_allocator), `"}`}, context.allocator)
+	testing.expect_value(test, tool_registry_add(&registry, definition).kind, Tool_Registry_Error_Kind.None)
+	testing.expect_value(test, len(registry.definitions), 1)
 }
 
 // The canonical grammar is the narrowest of every boundary a name crosses: a Lua field
