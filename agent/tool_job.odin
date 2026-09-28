@@ -899,13 +899,29 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	// file. The decision is stored, so a request built later sends the same bytes.
 	if !job.nested { tool_result_keep(&result, &jobs.budget, chat_tool_output_path(chat, job.call.call)) }
 	node, parent_call := tool_job_record_placement(chat, job)
-	if job.exec.subagent != {} && !job.exec.subagent_started {
-		chat_record(
-			chat,
-			{kind = .Subagent_Completed, node = node, request = chat.request, call = job.call.call, parent_call = parent_call, subagent = job.exec.subagent},
-			journal.Subagent_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Not_Executed], detail = "no subagent started"},
-			transmute([]u8)result.content,
-		)
+	delegation := journal.Record {
+		node        = node,
+		request     = chat.request,
+		call        = job.call.call,
+		parent_call = parent_call,
+		subagent    = job.exec.subagent,
+	}
+	#partial switch arguments in job.arguments {
+	// Only the agent tools act on a delegation.
+	case Agent_Spawn_Args:
+		if delegation.subagent != {} && !job.exec.subagent_started {
+			delegation.kind = .Subagent_Completed
+			completed := journal.Subagent_Completed {
+				outcome = journal.TOOL_OUTCOME_NAMES[.Not_Executed],
+				detail  = "no subagent started",
+			}
+			chat_record(chat, delegation, completed, transmute([]u8)result.content)
+		}
+	case Agent_Send_Args:
+		if delegation.subagent != {} && result.outcome == .Success {
+			delegation.kind = .Subagent_Message
+			chat_record(chat, delegation, journal.Subagent_Message{}, transmute([]u8)arguments.message)
+		}
 	}
 	if !chat_record_tool_result(chat, job.call.call, node, parent_call, &result) {
 		// The result cannot be recorded, so it must not be reported as if it were.

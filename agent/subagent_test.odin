@@ -16,9 +16,10 @@ test_agent_messages_follow_steering_boundaries_and_reject_sibling_delivery :: pr
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	member := Subagent {
-		name  = "agent-1",
-		team  = chat.team,
-		inbox = steer_queue_init(context.allocator),
+		name    = "agent-1",
+		session = journal.session_id_create(),
+		team    = chat.team,
+		inbox   = steer_queue_init(context.allocator),
 	}
 	defer steer_queue_destroy(&member.inbox)
 	append(&chat.team.members, &member)
@@ -34,6 +35,7 @@ test_agent_messages_follow_steering_boundaries_and_reject_sibling_delivery :: pr
 	to_child := tool_agent_send_execute(&parent_context, Agent_Send_Args{agent = "agent-1", message = "Inspect the parser instead."})
 	defer tool_result_destroy(&to_child)
 	testing.expect_value(test, to_child.outcome, journal.Tool_Outcome.Success)
+	testing.expect_value(test, parent_context.subagent, member.session)
 	line, queued := steer_pop(&member.inbox)
 	defer steer_line_free(&member.inbox, line)
 	testing.expect(test, queued && strings.contains(line, "Inspect the parser instead."))
@@ -41,6 +43,7 @@ test_agent_messages_follow_steering_boundaries_and_reject_sibling_delivery :: pr
 	to_parent := tool_agent_send_execute(&child_context, Agent_Send_Args{message = "The parser has a race."})
 	defer tool_result_destroy(&to_parent)
 	testing.expect_value(test, to_parent.outcome, journal.Tool_Outcome.Success)
+	testing.expect_value(test, child_context.subagent, member.session)
 	_test_accept(test, chat, "Investigate.")
 	chat.state = .Requesting
 	chat_steering_observe(chat, {}, nil)

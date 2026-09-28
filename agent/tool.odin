@@ -91,9 +91,10 @@ Tool_Context :: struct {
 	// set only for the agent tools; the other is nil. Both outlive the call.
 	agents:           ^Agent_Team,
 	member:           ^Subagent,
-	// subagent is the child session an agent_spawn call starts, chosen and recorded by the
-	// owner at dispatch. The worker sets subagent_started once a child exists; the owner
-	// reads it after the result is published.
+	// subagent is the delegation an agent tool call acts on, named by the child session.
+	// For agent_spawn the owner chooses and records it at dispatch, and the worker sets
+	// subagent_started once a child exists; for agent_send the worker sets it to the
+	// delegation it queued the message on. The owner reads both after the result is published.
 	subagent:         journal.Session_Id,
 	subagent_started: bool,
 }

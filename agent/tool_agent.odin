@@ -195,6 +195,7 @@ tool_agent_send_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 		if !subagent_report_message(member, args.message) {
 			return tool_result_failure(ctx, .Tool_Failed, "the message could not be allocated", "not sent")
 		}
+		ctx.subagent = member.session
 		return tool_result_success(ctx, Agent_Output{agent = "orchestrator", status = "queued"}, "queued")
 	}
 	if ctx.agents == nil { return tool_result_failure(ctx, .Unavailable, "subagents are not available in this session", "unavailable") }
@@ -202,9 +203,11 @@ tool_agent_send_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 		refused := tool_argument_error(.Missing_Field, "agent", "the id of a running subagent", ctx.allocator)
 		return tool_result_refused(ctx, &refused)
 	}
-	if problem := subagent_send(ctx.agents, args.agent, args.message); problem != "" {
+	session, problem := subagent_send(ctx.agents, args.agent, args.message)
+	if problem != "" {
 		return tool_result_failure(ctx, .Tool_Failed, problem, "not sent")
 	}
+	ctx.subagent = session
 	return tool_result_success(ctx, Agent_Output{agent = args.agent, status = "queued"}, "queued")
 }
 

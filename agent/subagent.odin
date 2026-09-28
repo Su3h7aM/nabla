@@ -619,16 +619,16 @@ subagent_find :: proc(team: ^Agent_Team, name: string) -> ^Subagent {
 	return nil
 }
 
-// subagent_send queues the orchestrator's message for a subagent. problem, temp-allocated,
-// says why it was not queued.
-subagent_send :: proc(team: ^Agent_Team, name, text: string) -> (problem: string) {
+// subagent_send queues the orchestrator's message for a subagent and returns the child
+// session it went to. problem, temp-allocated, says why it was not queued.
+subagent_send :: proc(team: ^Agent_Team, name, text: string) -> (session: journal.Session_Id, problem: string) {
 	message := fmt.tprintf("Message from the orchestrator:\n%s", text)
 	sync.mutex_guard(&team.mutex)
 	member := subagent_find(team, name)
-	if member == nil { return subagent_unknown(team, name) }
-	if member.closed { return fmt.tprintf("%s has finished and takes no more messages", name) }
-	if !steer_push(&member.inbox, message) { return "the message could not be allocated" }
-	return ""
+	if member == nil { return {}, subagent_unknown(team, name) }
+	if member.closed { return {}, fmt.tprintf("%s has finished and takes no more messages", name) }
+	if !steer_push(&member.inbox, message) { return {}, "the message could not be allocated" }
+	return member.session, ""
 }
 
 // subagent_stop asks a subagent to stop. Its outcome reaches the orchestrator like any other.
