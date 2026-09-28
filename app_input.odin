@@ -51,6 +51,7 @@ COMMANDS := [?]Command {
 }
 
 // command_find looks a command up by its exact name, ignoring case.
+@(require_results)
 command_find :: proc(name: string) -> (Command, bool) {
 	for command in COMMANDS {
 		if strings.equal_fold(command.name, name) { return command, true }
@@ -67,6 +68,7 @@ command_split :: proc(text: string) -> (name, argument: string) {
 
 // command_prefixed reports whether the typed text is a prefix of a command,
 // ignoring case so a capital is a typo rather than a miss.
+@(require_results)
 command_prefixed :: proc(command, typed: string) -> bool {
 	if len(typed) > len(command) { return false }
 	return strings.equal_fold(command[:len(typed)], typed)
@@ -117,6 +119,7 @@ complete_command :: proc(app: ^App) {
 
 // command_next_match finds the next command after `after` whose name starts with
 // query, wrapping around. -1 starts at the beginning.
+@(require_results)
 command_next_match :: proc(query: string, after: int) -> (int, bool) {
 	for offset in 1 ..= len(COMMANDS) {
 		index := (after + offset) % len(COMMANDS)
@@ -171,6 +174,7 @@ MOUSE_WHEEL_LINES :: 3
 // It asks the frame that is on screen rather than a rectangle remembered from a previous
 // frame, so a box that scrolled or resized cannot take a report aimed at whatever now
 // covers those cells.
+@(require_results)
 tool_box_entry_id :: proc(app: ^App, x, y: int) -> u64 {
 	frame_result, frame_error := layout.result(&app.storage.layout_ctx)
 	if frame_error != .None { return 0 }
@@ -187,6 +191,7 @@ tool_box_entry_id :: proc(app: ^App, x, y: int) -> u64 {
 
 // snap_entry_by_id finds the resident entry carrying id, or nil when the transcript no
 // longer holds it. The scan runs from the newest entry. The caller holds the runtime mutex.
+@(require_results)
 snap_entry_by_id :: proc(app: ^App, id: u64) -> ^Entry {
 	for index := len(app.run.snap.entries) - 1; index >= 0; index -= 1 {
 		entry := &app.run.snap.entries[index]
@@ -199,6 +204,7 @@ snap_entry_by_id :: proc(app: ^App, id: u64) -> ^Entry {
 // the box could take it. The box owns the wheel only while it has rows left in
 // the direction asked for: at its boundary the report is left to the transcript,
 // so scrolling continues there instead of stopping at the box's edge.
+@(require_results)
 tool_box_scroll :: proc(entry: ^Entry, button: input.Mouse_Button) -> bool {
 	#partial switch button {
 	case .Wheel_Up:
@@ -253,6 +259,7 @@ Cell_Point :: struct {
 // transcript so a drag that leaves the area still selects up to its edge. The
 // report is 1-based and in screen cells; the frame is 0-based and solved in the
 // transcript's own coordinates, which is the offset conversation_rect carries.
+@(require_results)
 selection_point :: proc(app: ^App, mouse: input.Mouse_Event) -> (point: Cell_Point, inside: bool) {
 	x := mouse.x - 1 - app.conversation_rect.x
 	y := mouse.y - 1 - app.conversation_rect.y

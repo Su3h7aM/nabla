@@ -23,6 +23,7 @@ CATALOG_REFRESH_COOLDOWN :: 10 * time.Minute
 // is the cache's own freshness decision.
 MODELS_DEV_INGEST_COOLDOWN :: 24 * time.Hour
 
+@(require_results)
 catalog_refresh_start :: proc(app: ^App, sources: []agent.Catalog_Provider_Source) -> bool {
 	app.catalog_sources = sources
 	refresh, channel_err := chan.create_buffered(Catalog_Refresh_Chan, CATALOG_REFRESH_CAPACITY, app.run.alloc)
@@ -58,6 +59,7 @@ catalog_refresh_note :: proc(app: ^App) {
 
 // catalog_refresh_due reports whether the catalog may be rebuilt again. A refresh that
 // was never asked for is due, and one that was asked for within the cooldown is not.
+@(require_results)
 catalog_refresh_due :: proc(app: ^App) -> bool {
 	if !app.catalog_refreshed { return true }
 	return time.tick_since(app.catalog_refresh_at) >= CATALOG_REFRESH_COOLDOWN
@@ -66,6 +68,7 @@ catalog_refresh_due :: proc(app: ^App) -> bool {
 // models_dev_read_due reports whether the run's models.dev sources are old enough to read
 // again. A run that holds none is due, so a launch that found no cached document still
 // reads one.
+@(require_results)
 models_dev_read_due :: proc(app: ^App) -> bool {
 	if len(app.models_dev_sources) == 0 { return true }
 	return time.tick_since(app.models_dev_read_at) >= MODELS_DEV_INGEST_COOLDOWN
@@ -218,6 +221,7 @@ catalog_selection_sync :: proc(app: ^App) {
 // catalog_refresh_stop ends the catalog thread and releases its channel. False means the
 // thread did not retire, so neither the channel it reads nor the sources it read may be
 // released.
+@(require_results)
 catalog_refresh_stop :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	if app.catalog_worker == nil { return true }
 	chan.close(&app.catalog_refresh)

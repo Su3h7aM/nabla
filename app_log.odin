@@ -89,6 +89,7 @@ log_session_released :: proc(id: journal.Session_Id) {
 
 // run_log_level reads the launch's threshold. An unusable value is reported once
 // and info is used, so a typo cannot silently choose a level the user did not ask for.
+@(require_results)
 run_log_level :: proc() -> (lowest: log.Level, enabled: bool) {
 	text, found := os.lookup_env(LOG_LEVEL_VARIABLE, context.temp_allocator)
 	if !found { return .Info, true }

@@ -34,6 +34,7 @@ Display_Sanitizer :: struct {
 // display_sanitize_chunk renders one fragment and returns text owned by allocator.
 // A successful result transfers the builder's backing allocation to the caller.
 // An allocation failure returns an empty string and releases the partial builder.
+@(require_results)
 display_sanitize_chunk :: proc(sanitizer: ^Display_Sanitizer, chunk: string, allocator := context.allocator) -> string {
 	combined, combined_error := make([dynamic]u8, 0, sanitizer.hold_len + len(chunk), context.temp_allocator)
 	if combined_error != nil { return "" }
@@ -144,6 +145,7 @@ display_sanitize_chunk :: proc(sanitizer: ^Display_Sanitizer, chunk: string, all
 // display_sanitize_flush closes the stream: a dangling escape is dropped and
 // a dangling rune fragment becomes U+FFFD. The returned replacement is owned by
 // allocator.
+@(require_results)
 display_sanitize_flush :: proc(sanitizer: ^Display_Sanitizer, allocator := context.allocator) -> string {
 	sanitizer.state = .Text
 	sanitizer.after_cr = false
@@ -155,6 +157,7 @@ display_sanitize_flush :: proc(sanitizer: ^Display_Sanitizer, allocator := conte
 	return replacement
 }
 
+@(require_results)
 display_clean :: proc(text: string, allocator := context.allocator) -> string {
 	sanitizer := Display_Sanitizer{}
 	cleaned := display_sanitize_chunk(&sanitizer, text, allocator)

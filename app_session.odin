@@ -147,6 +147,7 @@ App :: struct {
 // resolve_run_catalog builds the initial resolved catalog from local data only:
 // the user's configuration, any provider listings already cached, and the last
 // models.dev document. Network refresh is owned by the interactive runtime.
+@(require_results)
 resolve_run_catalog :: proc(
 	sources: []agent.Catalog_Provider_Source,
 	allocator: mem.Allocator,
@@ -214,6 +215,7 @@ resolve_run_catalog :: proc(
 // Which provider and model run is applied separately, so the front-end can start
 // without a selection and choose one in the TUI. Errors print to stderr; false
 // means the caller should exit.
+@(require_results)
 run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []agent.MCP_Server_Config, setup: ^Run_Setup, start: Session_Start) -> bool {
 	setup.alloc = context.allocator
 	ok := false
@@ -250,6 +252,7 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []age
 // a launch that cannot open what it asked for fails rather than quietly starting a
 // different one. The caller installs the launch's logger first, so the adoption is
 // recorded.
+@(require_results)
 run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_Start, stderr: io.Writer) -> bool {
 	directory, directory_error := agent.xdg_directory(.State, setup.alloc)
 	if directory_error != .None {
@@ -288,7 +291,8 @@ Opened_Session :: struct {
 }
 
 opened_session_destroy :: proc(opened: ^Opened_Session, allocator: mem.Allocator) {
-	session_store_close(opened.store, allocator)
+	// The opened session is being released; its close failure changes nothing here.
+	_ = session_store_close(opened.store, allocator)
 	delete(opened.workspace, allocator)
 	delete(opened.provider, allocator)
 	delete(opened.model, allocator)
@@ -299,6 +303,7 @@ opened_session_destroy :: proc(opened: ^Opened_Session, allocator: mem.Allocator
 // refusal leaves the running session untouched. An existing session is claimed and
 // what an earlier run left open is settled. A new session is only an id: its first
 // prompt creates it. The message is owned by setup.alloc.
+@(require_results)
 session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: string) -> (opened: Opened_Session, message: string, ok: bool) {
 	allocator := setup.alloc
 	defer if !ok { opened_session_destroy(&opened, allocator) }
@@ -383,9 +388,11 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 // session_install makes opened the running session in place of the one running,
 // whose chat and journal it releases. It takes everything opened owns and leaves
 // it zero. False means the tool registry could not be allocated, and no session runs.
+@(require_results)
 session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 	if setup.store != nil { agent.chat_session_destroy(&setup.session) }
-	session_store_close(setup.store, setup.alloc)
+	// The session being replaced is released; its close failure changes nothing here.
+	_ = session_store_close(setup.store, setup.alloc)
 	delete(setup.workspace, setup.alloc)
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
@@ -399,7 +406,8 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 	tool_error: agent.Tool_Registry_Error
 	setup.session, tool_error = agent.chat_session_init(setup.store, id, branch, head, setup.workspace, setup.alloc)
 	if tool_error.kind != .None {
-		session_store_close(setup.store, setup.alloc)
+		// No session runs; the store is abandoned before the switch completes.
+		_ = session_store_close(setup.store, setup.alloc)
 		setup.store = nil
 		return false
 	}
@@ -411,6 +419,7 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 
 // session_store_open opens a journal of this run on the launch's state directory,
 // owned by setup.alloc.
+@(require_results)
 session_store_open :: proc(setup: ^Run_Setup) -> (store: ^journal.Journal, error: journal.Error) {
 	store = new(journal.Journal, setup.alloc) or_return
 	if open_error := journal.open(store, setup.journal_directory, setup.run, .Read_Write, setup.alloc); open_error != nil {
@@ -422,6 +431,7 @@ session_store_open :: proc(setup: ^Run_Setup) -> (store: ^journal.Journal, error
 
 // session_store_close gives up the store's session, if it holds one, and closes it.
 // Pending records are dropped: every write that matters commits where it is made.
+@(require_results)
 session_store_close :: proc(store: ^journal.Journal, allocator: mem.Allocator) -> journal.Error {
 	if store == nil { return nil }
 	released := store.claimed
@@ -434,6 +444,7 @@ session_store_close :: proc(store: ^journal.Journal, allocator: mem.Allocator) -
 // session_error_message is what for a person, followed by the journal's reason,
 // owned by allocator. A message that cannot itself be allocated falls back to the
 // plain reason, so the caller always gets something it can report.
+@(require_results)
 session_error_message :: proc(what: string, error: journal.Error, allocator: mem.Allocator) -> string {
 	detail := journal.error_text(error, allocator)
 	defer delete(detail, allocator)
@@ -451,6 +462,7 @@ report_recovery :: proc(recovery: journal.Recovery) {
 }
 
 // selection_record remembers the model the user chose, so the next launch starts with it.
+@(require_results)
 selection_record :: proc(store: ^journal.Journal, provider, model, effort: string) -> journal.Error {
 	journal.append_record(store, {kind = .Selection_Changed}, journal.Selection_Changed{provider = provider, model = model, effort = effort})
 	_, commit_error := journal.commit(store)
@@ -458,6 +470,7 @@ selection_record :: proc(store: ^journal.Journal, provider, model, effort: strin
 }
 
 // selection_latest reads the model the user last chose, owned by allocator.
+@(require_results)
 selection_latest :: proc(store: ^journal.Journal, allocator: mem.Allocator) -> (selection: journal.Selection_Changed, found: bool, error: journal.Error) {
 	record: journal.Record
 	record, found = journal.read_latest(store, {kinds = {.Selection_Changed}}, allocator) or_return
@@ -479,6 +492,7 @@ provider_usable :: agent.provider_usable
 // provider_configured reports whether the user's own configuration named the
 // provider; models.dev contributes providers the user never set up, and their
 // credentials are not the user's to resolve.
+@(require_results)
 provider_configured :: proc(app: ^App, provider_id: string) -> bool {
 	for id in app.setup.configured {
 		if id == provider_id {
@@ -553,6 +567,7 @@ app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
 // builds the connection, so it runs only where the runtime is owned: on the worker once
 // it exists, or at startup before it starts. The selection persists on success; a
 // failure is reported through the snapshot and the previous selection stays in place.
+@(require_results)
 apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announce := true) -> bool {
 	// The catalog entry is copied out while it is the published one: a refresh releases the
 	// catalog it lives in, and the connection built from it outlives that moment.
@@ -698,6 +713,7 @@ selection_publish_locked :: proc(app: ^App, provider_id, model_id: string, annou
 // given, otherwise the stored selection, otherwise the model a resumed session recorded.
 // A stale selection is not fatal; it leaves the launch to the model menu. False means the
 // launch cannot continue, and the reason is in the snapshot.
+@(require_results)
 apply_startup_selection :: proc(app: ^App, flag_provider, flag_model: string) -> bool {
 	if flag_provider != "" || flag_model != "" {
 		if flag_provider == "" || flag_model == "" {
@@ -717,7 +733,9 @@ apply_startup_selection :: proc(app: ^App, flag_provider, flag_model: string) ->
 	}
 	applied := found && apply_selection(app, selection.provider, selection.model, selection.effort)
 	if !applied && app.setup.resumed_provider != "" && app.setup.resumed_model != "" {
-		apply_selection(app, app.setup.resumed_provider, app.setup.resumed_model, "")
+		// A fallback that also fails leaves the launch to the model menu, and the
+		// snapshot already carries why.
+		_ = apply_selection(app, app.setup.resumed_provider, app.setup.resumed_model, "")
 	}
 	return true
 }

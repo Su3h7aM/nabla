@@ -14,6 +14,7 @@ import input "nabla:input"
 // menu_begin publishes a freshly built list. The caller owns choices until this
 // takes them; false means the title could not be copied, and the list stays with
 // the caller rather than being shown without a title.
+@(require_results)
 menu_begin :: proc(app: ^App, kind: Menu_Kind, title: string, choices: [dynamic]Choice, required: bool) -> bool {
 	cloned_title, clone_error := strings.clone(title, app.run.alloc)
 	if clone_error != nil {
@@ -155,7 +156,7 @@ menu_rebuild_model :: proc(app: ^App) {
 
 // model_choice_make builds one model menu line, every string owned by the run's
 // allocator. False means one of the copies failed, and what was copied is released.
-@(private)
+@(private, require_results)
 model_choice_make :: proc(app: ^App, model: Model_Choice) -> (Choice, bool) {
 	label, label_error := strings.clone(model.model_id, app.run.alloc)
 	if label_error != nil { return {}, false }
@@ -180,6 +181,7 @@ model_choice_make :: proc(app: ^App, model: Model_Choice) -> (Choice, bool) {
 	return Choice{label = label, detail = detail, action = Model_Choice{provider_id = provider_id, model_id = model_id}}, true
 }
 
+@(require_results)
 model_choice_less :: proc(a, b: Model_Choice) -> bool {
 	order := strings.compare(a.provider_id, b.provider_id)
 	if order == 0 { order = strings.compare(a.model_id, b.model_id) }
@@ -386,6 +388,7 @@ handle_menu_key :: proc(app: ^App, key: input.Key_Event) {
 // resolve_model_reference maps a /model argument onto a serving identity. The
 // current provider is preferred, then any single provider serving that model
 // id, then an explicit "provider/model" pair.
+@(require_results)
 resolve_model_reference :: proc(app: ^App, text: string) -> (provider_id, model_id: string, ok: bool) {
 	sync.mutex_lock(&app.catalog_mu)
 	defer sync.mutex_unlock(&app.catalog_mu)

@@ -82,10 +82,12 @@ Acp_Wire_Profile :: enum {
 	V2,
 }
 
+@(require_results)
 acp_is_v2 :: proc(server: ^Acp_Server) -> bool {
 	return server.profile == .V2
 }
 
+@(require_results)
 acp_server_has_work :: proc(server: ^Acp_Server) -> bool {
 	if sync.atomic_load(&server.busy) { return true }
 	sync.mutex_lock(&server.queue_mu)
@@ -118,6 +120,7 @@ acp_capture_session_generation :: proc(server: ^Acp_Server) -> u64 {
 	return generation
 }
 
+@(require_results)
 acp_work_session_valid :: proc(server: ^Acp_Server, work: Acp_Work) -> bool {
 	if work.kind == .List_Sessions { return true }
 	sync.mutex_lock(&server.mu)
@@ -220,6 +223,7 @@ acp_work_destroy :: proc(work: ^Acp_Work, allocator: mem.Allocator) {
 // acp_work_id copies the request id a response will carry. Only the string form owns
 // memory; a numeric id is a value. A copy failure reports false so the request is
 // refused rather than answered under a wrong id.
+@(require_results)
 acp_work_id :: proc(id: acp.Jsonrpc_Id, allocator: mem.Allocator) -> (acp.Jsonrpc_Id, bool) {
 	switch value in id {
 	case string:
@@ -437,6 +441,7 @@ acp_restore_base_runtime :: proc(server: ^Acp_Server) {
 	}
 }
 
+@(require_results)
 acp_server_apply_mcp :: proc(server: ^Acp_Server, requested: [dynamic]agent.MCP_Server_Config) -> bool {
 	setup := &server.app.setup
 	// The old runtime owns processes and bindings that the newly opened session no
@@ -492,6 +497,7 @@ acp_server_apply_mcp :: proc(server: ^Acp_Server, requested: [dynamic]agent.MCP_
 // acp_open_message copies a refusal reason into setup memory. An empty result means
 // the copy itself failed, which the caller answers as an internal error: without
 // memory there is no better account of what went wrong.
+@(require_results)
 acp_open_message :: proc(text: string, allocator: mem.Allocator) -> string {
 	message, clone_error := strings.clone(text, allocator)
 	if clone_error != nil { return "" }
@@ -502,6 +508,7 @@ acp_open_message :: proc(text: string, allocator: mem.Allocator) -> string {
 // a new conversation, the stored session for a loaded one.
 //
 // The message of a refusal is owned by the setup's allocator.
+@(require_results)
 acp_session_open :: proc(server: ^Acp_Server, workspace: string, start: Session_Start) -> (message: string, ok: bool) {
 	app := &server.app
 	// Loading the session this process already runs is not a switch: it is the same
@@ -537,6 +544,7 @@ acp_session_select_model :: proc(server: ^Acp_Server) {
 // choice, otherwise the first model the configuration can actually serve. The fallback
 // exists because an editor session is often the first thing a person runs, and it must
 // not depend on having opened the interactive harness once.
+@(require_results)
 acp_select_startup_model :: proc(server: ^Acp_Server) -> bool {
 	app := &server.app
 	selection, found, load_err := selection_latest(app.setup.store, app.run.alloc)
@@ -552,6 +560,7 @@ acp_select_startup_model :: proc(server: ^Acp_Server) -> bool {
 // persisted: a model chosen for an editor conversation is not the user's own last choice.
 // Every candidate is named before any of them is tried, because applying a selection takes
 // the catalog lock and a publication releases the catalog the names were read from.
+@(require_results)
 acp_select_first_model :: proc(server: ^Acp_Server) -> bool {
 	app := &server.app
 	candidates, candidates_ok := acp_servable_models(app, app.run.alloc)
@@ -576,6 +585,7 @@ acp_candidates_destroy :: proc(candidates: [dynamic]Model_Choice, allocator: mem
 // order: each configured provider that states a usable endpoint, and each of its models.
 // The names are copied under the catalog lock and owned by allocator. A copy failure
 // releases what was already named and reports false.
+@(require_results)
 acp_servable_models :: proc(app: ^App, allocator: mem.Allocator) -> ([dynamic]Model_Choice, bool) {
 	candidates: [dynamic]Model_Choice
 	candidates.allocator = allocator
@@ -610,6 +620,7 @@ acp_servable_models :: proc(app: ^App, allocator: mem.Allocator) -> ([dynamic]Mo
 
 // --- running a prompt --------------------------------------------------------
 
+@(require_results)
 acp_apply_model_id :: proc(server: ^Acp_Server, model_id: string) -> bool {
 	app := &server.app
 	for provider in app.setup.catalog.providers {
@@ -668,6 +679,7 @@ acp_session_timestamp :: proc(at_ms: i64) -> string {
 	return fmt.tprintf("%04d-%02d-%02dT%02d:%02d:%02dZ", datetime.year, datetime.month, datetime.day, datetime.hour, datetime.minute, datetime.second)
 }
 
+@(require_results)
 acp_session_cursor_decode :: proc(cursor: string) -> (journal.Journal_Seq, bool) {
 	sequence, parsed := strconv.parse_i64(cursor)
 	return journal.Journal_Seq(sequence), parsed && sequence > 0
@@ -683,7 +695,8 @@ acp_work_list_sessions :: proc(server: ^Acp_Server, work: Acp_Work) {
 	store := server.app.setup.store
 	// With no session open, the list is read through a journal of its own.
 	opened_store: ^journal.Journal
-	defer session_store_close(opened_store, server.app.setup.alloc)
+	// The lookup's store is being abandoned; its close failure changes nothing.
+	defer _ = session_store_close(opened_store, server.app.setup.alloc)
 	if store == nil {
 		open_error: journal.Error
 		opened_store, open_error = session_store_open(&server.app.setup)
@@ -880,6 +893,7 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 	}
 }
 
+@(require_results)
 acp_models_state :: proc(server: ^Acp_Server) -> (acp.Models_State, bool) {
 	if len(server.app.setup.catalog.models) == 0 { return {}, true }
 	result: acp.Models_State
@@ -898,6 +912,7 @@ acp_models_state :: proc(server: ^Acp_Server) -> (acp.Models_State, bool) {
 	return result, true
 }
 
+@(require_results)
 acp_model_config_values :: proc(server: ^Acp_Server) -> ([]acp.Config_Value, bool) {
 	values, values_error := make([]acp.Config_Value, len(server.app.setup.catalog.models), context.temp_allocator)
 	if values_error != nil { return nil, false }
@@ -915,6 +930,7 @@ acp_model_config_values :: proc(server: ^Acp_Server) -> ([]acp.Config_Value, boo
 // acp_effort_config_values names the thinking levels the open session's model states,
 // verbatim. An empty result means the model states none, and no effort option is
 // advertised for it.
+@(require_results)
 acp_effort_config_values :: proc(server: ^Acp_Server) -> ([]acp.Config_Value, bool) {
 	levels := server.app.setup.session.effort_levels[:]
 	values, values_error := make([]acp.Config_Value, len(levels), context.temp_allocator)
@@ -928,6 +944,7 @@ acp_effort_config_values :: proc(server: ^Acp_Server) -> ([]acp.Config_Value, bo
 	return values, true
 }
 
+@(require_results)
 acp_model_config_options_v1 :: proc(server: ^Acp_Server) -> ([]acp.V1_Config_Option, bool) {
 	model_count := 0
 	if len(server.app.setup.catalog.models) > 0 { model_count = 1 }
@@ -964,6 +981,7 @@ acp_model_config_options_v1 :: proc(server: ^Acp_Server) -> ([]acp.V1_Config_Opt
 	return options, true
 }
 
+@(require_results)
 acp_model_config_options_v2 :: proc(server: ^Acp_Server) -> ([]acp.V2_Config_Option, bool) {
 	model_count := 0
 	if len(server.app.setup.catalog.models) > 0 { model_count = 1 }
@@ -1002,6 +1020,7 @@ acp_model_config_options_v2 :: proc(server: ^Acp_Server) -> ([]acp.V2_Config_Opt
 
 // acp_notify sends one session/update notification carrying update. Every streamed
 // frame is built here, so the session id and the notification name are stated once.
+@(require_results)
 acp_notify :: proc(server: ^Acp_Server, update: $T) -> bool {
 	params := acp.Session_Notification(T) {
 		session_id = acp_session_id(server),
@@ -1010,6 +1029,7 @@ acp_notify :: proc(server: ^Acp_Server, update: $T) -> bool {
 	return acp.writer_write_notification(&server.writer, acp.NOTIFICATION_SESSION_UPDATE, params)
 }
 
+@(require_results)
 acp_send_session_info :: proc(server: ^Acp_Server, title: string) -> bool {
 	return acp_notify(server, acp.Session_Info_Update{session_update = acp.UPDATE_SESSION_INFO, title = title})
 }
@@ -1018,6 +1038,7 @@ acp_send_session_info :: proc(server: ^Acp_Server, title: string) -> bool {
 
 // acp_send_message writes one streamed message fragment. Chunks that share an id are one
 // message in the client, which is what keeps a notice from reading as part of the answer.
+@(require_results)
 acp_send_user_message :: proc(server: ^Acp_Server, message_id, text: string) -> bool {
 	if !acp_is_v2(server) { return false }
 	content, content_error := make([]acp.Text_Content, 1, context.temp_allocator)
@@ -1029,11 +1050,13 @@ acp_send_user_message :: proc(server: ^Acp_Server, message_id, text: string) -> 
 	return acp_notify(server, acp.Message_Update{session_update = acp.UPDATE_USER_MESSAGE, message_id = message_id, content = content})
 }
 
+@(require_results)
 acp_send_state :: proc(server: ^Acp_Server, state, stop_reason: string) -> bool {
 	if !acp_is_v2(server) { return false }
 	return acp_notify(server, acp.State_Update{session_update = acp.UPDATE_STATE, state = state, stop_reason = stop_reason})
 }
 
+@(require_results)
 acp_send_message_full :: proc(server: ^Acp_Server, kind, message_id, text: string) -> bool {
 	if !acp_is_v2(server) { return acp_send_message(server, kind, text, message_id) }
 	content, content_error := make([]acp.Text_Content, 1, context.temp_allocator)
@@ -1045,6 +1068,7 @@ acp_send_message_full :: proc(server: ^Acp_Server, kind, message_id, text: strin
 	return acp_notify(server, acp.Message_Update{session_update = kind, message_id = message_id, content = content})
 }
 
+@(require_results)
 acp_send_message :: proc(server: ^Acp_Server, kind: string, text, message_id: string) -> bool {
 	resolved_message_id := message_id
 	if acp_is_v2(server) && resolved_message_id == "" {
@@ -1056,6 +1080,7 @@ acp_send_message :: proc(server: ^Acp_Server, kind: string, text, message_id: st
 // acp_send_tool_call announces one call with the state it is in when it is announced: a
 // call about to run is pending, and a call replayed from the record already has its
 // output.
+@(require_results)
 acp_send_tool_call :: proc(server: ^Acp_Server, call_id, name, arguments: string, status: acp.Tool_Status, output: string) -> bool {
 	// The arguments are parsed for the client's benefit and released after the frame is
 	// written, not when this block ends: the value the update carries must outlive it.
@@ -1098,6 +1123,7 @@ acp_send_tool_call :: proc(server: ^Acp_Server, call_id, name, arguments: string
 }
 
 // acp_send_tool_result settles a call that was already announced, by its id.
+@(require_results)
 acp_send_tool_result :: proc(server: ^Acp_Server, call_id: string, status: acp.Tool_Status, output: string) -> bool {
 	content, content_error := make([]acp.Tool_Call_Content, 1, context.temp_allocator)
 	if content_error != nil { return false }
@@ -1126,6 +1152,7 @@ acp_tool_content :: proc(text: string) -> acp.Tool_Call_Content {
 
 // acp_send_usage reports how full the context is: the size the provider measured, or the
 // harness's own count when the provider reported none, against the model's window.
+@(require_results)
 acp_send_usage :: proc(server: ^Acp_Server, used, size: i64) -> bool {
 	return acp_notify(server, acp.Usage_Update{session_update = acp.UPDATE_USAGE, used = used, size = size})
 }

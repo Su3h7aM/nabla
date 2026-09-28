@@ -31,6 +31,7 @@ MCP_Runtime :: struct {
 
 // mcp_runtime_make reserves one stable client slot per configured server. Tool
 // bindings are allocated after discovery because the server decides their count.
+@(require_results)
 mcp_runtime_make :: proc(servers: []agent.MCP_Server_Config, alloc := context.allocator) -> (MCP_Runtime, bool) {
 	runtime := MCP_Runtime {
 		alloc = alloc,
@@ -98,7 +99,7 @@ mcp_runtime_destroy :: proc(runtime: ^MCP_Runtime) {
 // mcp_runtime_ensure makes sure the server at index is running and discovered, and
 // returns its client. A server that cannot be started or does not answer discovery is
 // reported once and contributes nothing to this refresh.
-@(private)
+@(private, require_results)
 mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Config, index: int, warnings: ^strings.Builder) -> (^mcp.Client, bool) {
 	server := servers[index]
 	client := &runtime.clients[index]
@@ -194,7 +195,7 @@ mcp_operation :: proc(timeout: time.Duration) -> mcp.Operation_Options {
 	return options
 }
 
-@(private)
+@(private, require_results)
 mcp_binding_make :: proc(client: ^mcp.Client, server_id, remote_name: string, allocator: mem.Allocator) -> (^agent.MCP_Tool_Backend, bool) {
 	binding, alloc_error := new(agent.MCP_Tool_Backend, allocator)
 	if alloc_error != nil { return nil, false }
@@ -226,7 +227,7 @@ mcp_bindings_destroy :: proc(bindings: ^[dynamic]^agent.MCP_Tool_Backend, alloca
 }
 
 // mcp_tool_config returns the override for one exact, case-sensitive remote name.
-@(private)
+@(private, require_results)
 mcp_tool_config :: proc(server: agent.MCP_Server_Config, remote_name: string) -> (agent.MCP_Tool_Config, bool) {
 	for config in server.tools {
 		if config.remote_name == remote_name { return config, true }
@@ -238,6 +239,7 @@ mcp_tool_config :: proc(server: agent.MCP_Server_Config, remote_name: string) ->
 // configured MCP server that answers. It runs only while the session is idle, so the
 // registry it replaces is not borrowed. The returned warning is scratch memory, valid
 // until the next reset; the caller copies it to outlive the call.
+@(require_results)
 app_tools_refresh :: proc(app: ^App) -> string {
 	setup := &app.setup
 	if len(setup.mcp_servers) == 0 { return "" }

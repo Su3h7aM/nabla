@@ -19,6 +19,7 @@ SHUTDOWN_JOIN_POLL :: 5 * time.Millisecond
 // A thread that did not retire is reported and left alone: thread.destroy joins, so calling
 // it here would block exactly where this procedure refuses to, and the caller must not
 // free anything that thread can still reach.
+@(require_results)
 join_retiring :: proc(worker: ^thread.Thread, name: string, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	if worker == nil { return true }
 	deadline := time.tick_add(time.tick_now(), patience)

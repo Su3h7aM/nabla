@@ -79,6 +79,7 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 // app_compaction_pending reports whether the open session has compaction work to
 // look at. A session that is not open has no control to poll, and its zero state
 // is idle.
+@(require_results)
 app_compaction_pending :: proc(app: ^App) -> bool {
 	if app.setup.session.store == nil { return false }
 	return app.setup.session.compact.state != agent.Compact_State.Idle
@@ -94,6 +95,7 @@ app_compaction_tick :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 
 // work_send queues one command for the worker without blocking and wakes it. False means
 // the queue is full or closed, and the caller still owns the item.
+@(require_results)
 work_send :: proc(app: ^App, item: Work) -> bool {
 	if !chan.try_send(app.run.work, item) { return false }
 	agent.owner_wake_signal()
@@ -230,7 +232,9 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		if session_switch(app, {kind = .New}) {
 			snapshot_clear(app)
 			snap_append(app, .Notice, "started a new session")
-			if provider != "" && model != "" { apply_selection(app, provider, model, "") }
+			// The new session keeps the same selection; a failure is already in the
+			// snapshot, and the session stays open without a model.
+			if provider != "" && model != "" { _ = apply_selection(app, provider, model, "") }
 		}
 	case .Resume_Session:
 		rows_dirty = true
@@ -261,6 +265,7 @@ run_accepted_turn :: proc(app: ^App, observer: agent.Chat_Observer) {
 
 // app_agent_report_turn runs a turn for the oldest message a subagent sent while no turn ran,
 // and reports whether there was one.
+@(require_results)
 app_agent_report_turn :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 	if app.setup.session.store == nil { return false }
 	accepted, had_message := agent.chat_session_accept_agent_message(&app.setup.session, observer)
@@ -323,6 +328,7 @@ session_resume :: proc(app: ^App, reference: string) {
 // anything an earlier run left open. The session is opened in its own journal while
 // the running one stays claimed, so a refusal leaves the front-end working in the
 // session it already had.
+@(require_results)
 session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 	setup := &app.setup
 	opened, message, ok := session_open(setup, start, setup.workspace)
@@ -349,7 +355,9 @@ session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 		return true
 	}
 	if setup.provider_id != "" && setup.model_id != "" {
-		apply_selection(app, setup.provider_id, setup.model_id, "")
+		// The selection already in effect is reapplied; the snapshot carries any
+		// failure.
+		_ = apply_selection(app, setup.provider_id, setup.model_id, "")
 	}
 	return true
 }
@@ -503,6 +511,7 @@ set_running :: proc(app: ^App, running: bool) {
 	app.run.snap.generation += 1
 }
 
+@(require_results)
 runtime_busy :: proc(app: ^App) -> bool {
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
@@ -511,6 +520,7 @@ runtime_busy :: proc(app: ^App) -> bool {
 
 // runtime_model_selected reports whether a model is in effect, under the lock the
 // worker publishes the status with.
+@(require_results)
 runtime_model_selected :: proc(app: ^App) -> bool {
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)

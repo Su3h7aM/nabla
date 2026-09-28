@@ -116,6 +116,7 @@ snapshot_transcript_own :: proc(app: ^App) {
 // snapshot_status_start publishes the launch's provider, model, and workspace into
 // the status block, each copied into the run's allocator. False means one of the
 // copies failed, and the launch stops rather than show a status that names nothing.
+@(require_results)
 snapshot_status_start :: proc(app: ^App) -> bool {
 	provider_id, provider_error := strings.clone(app.setup.provider_id, app.run.alloc)
 	model_id, model_error := strings.clone(app.setup.model_id, app.run.alloc)
@@ -310,6 +311,7 @@ stop_runtime :: proc(app: ^App) {
 	agent.owner_wake_signal()
 }
 
+@(require_results)
 runtime_stopping :: proc(app: ^App) -> bool {
 	return sync.atomic_load(&app.run.stopping)
 }
@@ -368,6 +370,7 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 // the launch asked for, open the terminal, apply the selection (explicit flags,
 // then the persisted one, then the in-TUI model menu), start the worker, and
 // drive the frame loop until quit.
+@(require_results)
 tui_run :: proc(
 	sources: []agent.Catalog_Provider_Source,
 	mcp_servers: []agent.MCP_Server_Config,

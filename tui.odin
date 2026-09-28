@@ -185,6 +185,7 @@ Frame_Storage :: struct {
 	measure:    tui.Measure_Context,
 }
 
+@(require_results)
 frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	storage, storage_error := new(Frame_Storage, alloc)
 	if storage_error != nil { return nil }
@@ -222,6 +223,7 @@ frame_storage_destroy :: proc(storage: ^Frame_Storage) {
 // cell, and a terminal that grew since the last frame buys the cells it needs. The
 // presentation scratch is sized from term.present's own required size in present_frame,
 // because no bytes-per-cell bound is valid for a grapheme.
+@(require_results)
 ensure_frame :: proc(storage: ^Frame_Storage, cols, rows: int) -> bool {
 	need := cols * rows
 	if len(storage.cells) < need {
@@ -269,6 +271,7 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 // runtime mutex. Every string it puts in the grid must outlive the lock: the snapshot's
 // mutable strings are copied into frame scratch, and a borrow straight from the snapshot
 // would dangle once the worker replaces it.
+@(require_results)
 render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor, err: Render_Status) {
 	cols, rows := app.columns, app.rows
 	if cols <= 0 || rows <= 0 {
@@ -336,6 +339,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 // back from the bottom (0 follows it), and the clip offset is range - scroll. The offset
 // needs the solved range, so the first pass uses the previous frame's; when that moved
 // the frame re-solves once with the corrected offset.
+@(require_results)
 draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> bool {
 	if rect.height <= 0 || rect.width <= 0 {
 		return true
@@ -374,6 +378,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 // raising the layout budget when the frame ran out of a pool. Each pool pays this once
 // per session, so the storage settles at what this session used instead of a worst-case
 // reservation. False means the budget could not be raised.
+@(require_results)
 conversation_solve :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int) -> (layout.Frame_Result, bool) {
 	declare_conversation(app, storage, viewport, width, offset)
 	frame_result, frame_error := layout.result(&storage.layout_ctx)
@@ -433,6 +438,7 @@ declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layou
 // raises the context's budget to match. False means the frame failed for
 // another reason, or the raise itself failed; either way the context is left
 // usable at its previous capacities.
+@(require_results)
 conversation_budget_raise :: proc(storage: ^Frame_Storage) -> bool {
 	pool := layout.Pool_Id.None
 	for diagnostic in layout.diagnostics(&storage.layout_ctx) {
@@ -489,6 +495,7 @@ conversation_capacities_raise :: proc(current: layout.Capacities, pool: layout.P
 
 // draw_conversation_commands projects the solved frame's text commands into
 // the cell grid. Culling already dropped every line outside the clip.
+@(require_results)
 draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result, viewport: tui.Cell_Rect) -> bool {
 	for command in frame_result.commands {
 		text_data, is_text := command.data.(layout.Text_Cmd)
@@ -544,6 +551,7 @@ selection_row_range :: proc(app: ^App, row, columns: int) -> (first, last: int) 
 // out to its box and that padding is not what the user picked. The returned
 // string is allocated with `allocator` and owned by the caller. False means the
 // text could not be built, which is distinct from an empty selection.
+@(require_results)
 selection_text :: proc(app: ^App, storage: ^Frame_Storage, allocator: mem.Allocator) -> (text: string, ok: bool) {
 	if storage == nil || storage.buffer.cells == nil { return "", true }
 	start, end := selection_bounds(app)
@@ -571,6 +579,7 @@ selection_index :: proc(app: ^App, buffer: term.Frame_Buffer, row, column: int) 
 // selection_cell_blank reports whether a cell carries only the frame's padding.
 // An empty grapheme is a wide character's continuation cell, which is padding
 // for this purpose too.
+@(require_results)
 selection_cell_blank :: proc(cell: term.Cell) -> bool {
 	return cell.grapheme == "" || cell.grapheme == " "
 }
@@ -991,6 +1000,7 @@ draw_rule :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	tui.fill(&storage.buffer, rect, "─", RULE_STYLE)
 }
 
+@(require_results)
 input_visible_rows :: proc(input: ^widgets.Input, width: int) -> (rows: int, err: mem.Allocator_Error) {
 	lines, lines_error := widgets.input_lines(input, width)
 	if lines_error != nil {
@@ -1002,6 +1012,7 @@ input_visible_rows :: proc(input: ^widgets.Input, width: int) -> (rows: int, err
 // draw_input draws a rounded prompt box and returns the caret. The box grows
 // through five content rows; after that the rows scroll around the caret, which
 // is the widget's own window (draw_input).
+@(require_results)
 draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> (cursor: term.Cursor, err: mem.Allocator_Error) {
 	if rect.height < 3 || rect.width <= 4 { return {}, nil }
 	border_style := RULE_STYLE

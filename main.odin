@@ -30,6 +30,7 @@ chat_cli_options :: struct {
 	list:        bool,
 }
 
+@(require_results)
 chat_cli_parse :: proc(args: []string) -> (chat_cli_options, Cli_Parse_Error) {
 	result: chat_cli_options
 	for i := 0; i < len(args); i += 1 {
@@ -179,6 +180,7 @@ headless_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text:
 // reporting through out. False means the turn did not complete, and the observer has
 // already said why, so the caller only needs the exit code. It is the whole of what a
 // headless run does with a prompt, and the launch around it is shared.
+@(require_results)
 run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> bool {
 	// Tools are refreshed between turns, while the session is idle, so the registry a
 	// turn dispatches against is the one it was advertised with.

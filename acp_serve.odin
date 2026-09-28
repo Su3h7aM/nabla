@@ -26,6 +26,7 @@ NABLA_ACP_VERSION :: "0.1.0"
 // acp_serve reads messages until the input stream ends or the client stops reading, and
 // answers each one. False means the stream failed; ending normally is true even when the
 // client simply closed it, which is how a client says it is done.
+@(require_results)
 acp_serve :: proc(server: ^Acp_Server, input: io.Reader) -> bool {
 	decoder, decoder_error := acp.frame_decoder_init(server.alloc)
 	if decoder_error != nil {
@@ -615,6 +616,7 @@ acp_session_prompt_text :: proc(field: string, meta: ^acp.Session_Meta) -> strin
 
 // acp_clone_open_strings copies the owned strings one Open_Session work item carries.
 // A failure releases whatever was already copied, so the caller answers and returns.
+@(require_results)
 acp_clone_open_strings :: proc(
 	workspace, reference, prompt, title: string,
 	allocator := context.allocator,
@@ -656,6 +658,7 @@ acp_destroy_open_strings :: proc(workspace, reference, prompt, title: string, al
 // acp_stored_session reads the stored session an open request names. An unknown id is
 // refused as invalid params; a store that cannot answer is an internal error. The
 // header is owned by the temp allocator.
+@(require_results)
 acp_stored_session :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, session_id: string) -> (header: []journal.Session_Summary, ok: bool) {
 	parsed_id, valid := journal.session_id_parse(session_id)
 	if !valid {
@@ -735,6 +738,7 @@ acp_session_meta_system_prompt :: proc(meta: ^acp.Session_Meta) -> string {
 // acp_session_params_reason reports a named capability that Nabla cannot honor.
 // Refusing is safer than silently dropping tools or directories. The MCP type is
 // required on v2 and optional on v1, matching what each profile's clients send.
+@(require_results)
 acp_session_params_reason :: proc(mcp_servers: []acp.Mcp_Server, additional_directories: []string, is_v2: bool) -> string {
 	for server in mcp_servers {
 		if is_v2 {
@@ -754,6 +758,7 @@ acp_session_params_reason :: proc(mcp_servers: []acp.Mcp_Server, additional_dire
 	return ""
 }
 
+@(require_results)
 acp_mcp_servers_make :: proc(servers: []acp.Mcp_Server, allocator: mem.Allocator) -> ([dynamic]agent.MCP_Server_Config, bool) {
 	result, result_error := make([dynamic]agent.MCP_Server_Config, 0, len(servers), allocator)
 	if result_error != nil { return {}, false }
@@ -909,12 +914,14 @@ acp_request_set_model :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 // acp_session_matches reports whether the id names the session this process runs. A
 // request is matched against it before it is handed to the worker, so a request for a
 // session the client never opened cannot reach the session the process started with.
+@(require_results)
 acp_session_matches :: proc(server: ^Acp_Server, session_id: string) -> bool {
 	sync.mutex_lock(&server.mu)
 	defer sync.mutex_unlock(&server.mu)
 	return !server.closing && server.session_id != "" && server.session_id == session_id
 }
 
+@(require_results)
 acp_closing_session_matches :: proc(server: ^Acp_Server, session_id: string) -> bool {
 	sync.mutex_lock(&server.mu)
 	defer sync.mutex_unlock(&server.mu)
@@ -933,6 +940,7 @@ acp_cancel_session :: proc(server: ^Acp_Server, session_id: string) {
 // acp_enqueue hands one request to the worker. It owns work on both paths: on success the
 // worker releases it, and on failure it is released here, so the caller must not free it
 // again.
+@(require_results)
 acp_enqueue :: proc(server: ^Acp_Server, work: Acp_Work) -> bool {
 	item := work
 	// The request is marked in flight before it is queued, so a worker that finishes it
@@ -952,6 +960,7 @@ acp_enqueue :: proc(server: ^Acp_Server, work: Acp_Work) -> bool {
 // embedded resource brings its text along. Content this agent does not accept is refused
 // rather than dropped, so the client is told that part of what it sent never reached the
 // model. reason is static text when ok is false.
+@(require_results)
 acp_prompt_text :: proc(blocks: []acp.Content_Block, allocator := context.allocator) -> (text: string, reason: string, ok: bool) {
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return "", "the prompt could not be allocated", false }
@@ -994,7 +1003,7 @@ acp_prompt_text :: proc(blocks: []acp.Content_Block, allocator := context.alloca
 
 // acp_prompt_append keeps the blocks of one message apart, so two blocks do not run
 // together into one sentence the user never wrote.
-@(private)
+@(private, require_results)
 acp_prompt_append :: proc(builder: ^strings.Builder, text: string) -> bool {
 	if text == "" { return true }
 	if strings.builder_len(builder^) > 0 && strings.write_string(builder, "\n\n") != 2 { return false }
@@ -1004,6 +1013,7 @@ acp_prompt_append :: proc(builder: ^strings.Builder, text: string) -> bool {
 // acp_resource_path is the path behind a resource uri. A `file://` uri names a file the
 // harness can open itself, which is what its tools take; anything else is passed through
 // as the client wrote it.
+@(require_results)
 acp_resource_path :: proc(uri: string, allocator := context.allocator) -> (string, bool) {
 	FILE_URI_PREFIX :: "file://"
 	value := uri
@@ -1025,6 +1035,7 @@ acp_usage :: proc() {
 // everything it owns. It is the whole front-end except its configuration and the process
 // lifetime around it, which is what lets a test drive a real conversation without a
 // process. False means the run could not be opened or the stream failed before it ended.
+@(require_results)
 acp_run :: proc(
 	sources: []agent.Catalog_Provider_Source,
 	harness_options: agent.Harness_Options,

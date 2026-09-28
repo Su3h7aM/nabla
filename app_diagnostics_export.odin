@@ -86,7 +86,7 @@ Export_Stream :: struct {
 	hash: ^sha2.Context_256,
 }
 
-@(private)
+@(private, require_results)
 export_stream_write :: proc(data: rawptr, mode: io.Stream_Mode, bytes: []byte, offset: i64, whence: io.Seek_From) -> (i64, io.Error) {
 	if mode != .Write { return 0, .Unsupported }
 	stream := cast(^Export_Stream)data
@@ -99,6 +99,7 @@ export_stream_write :: proc(data: rawptr, mode: io.Stream_Mode, bytes: []byte, o
 // diagnostics_stream writes every one of filter's records to writer as JSON
 // lines, oldest first, reading the store EXPORT_PAGE_RECORDS at a time.
 // runtime.message records below level are left out.
+@(require_results)
 diagnostics_stream :: proc(
 	store: ^journal.Journal,
 	filter: journal.Filter,
@@ -137,7 +138,7 @@ diagnostics_stream :: proc(
 
 // diagnostics_record_line encodes one record as a JSON line in allocator. kept is
 // false for a runtime.message below level.
-@(private)
+@(private, require_results)
 diagnostics_record_line :: proc(
 	record: ^journal.Record,
 	level: log.Level,
@@ -224,7 +225,7 @@ diagnostics_export :: proc(
 	return join_okay ? 0 : 1
 }
 
-@(private)
+@(private, require_results)
 diagnostics_export_manifest :: proc(destination: string, manifest: ^Export_Manifest) -> bool {
 	path, joined := export_join(destination, EXPORT_MANIFEST_NAME, context.allocator)
 	if !joined { return false }
@@ -238,7 +239,7 @@ diagnostics_export_manifest :: proc(destination: string, manifest: ^Export_Manif
 	return export_close(nil, EXPORT_MANIFEST_NAME, file, hash, len(data), context.allocator) && okay
 }
 
-@(private)
+@(private, require_results)
 export_open :: proc(path: string, allocator: mem.Allocator) -> (file: ^os.File, hash: ^sha2.Context_256, okay: bool) {
 	handle, open_error := os.open(path, {.Write, .Create, .Excl}, EXPORT_FILE_PERMISSIONS)
 	if open_error != nil { return nil, nil, false }
@@ -253,7 +254,7 @@ export_open :: proc(path: string, allocator: mem.Allocator) -> (file: ^os.File, 
 	return handle, state, true
 }
 
-@(private)
+@(private, require_results)
 export_close :: proc(files: ^[dynamic]Export_File, relative: string, file: ^os.File, hash: ^sha2.Context_256, bytes: int, allocator: mem.Allocator) -> bool {
 	close_error := os.close(file)
 	if close_error != nil {
@@ -290,7 +291,7 @@ export_close :: proc(files: ^[dynamic]Export_File, relative: string, file: ^os.F
 	return true
 }
 
-@(private)
+@(private, require_results)
 export_write :: proc(file: ^os.File, bytes: []u8, hash: ^sha2.Context_256) -> bool {
 	remaining := bytes
 	for len(remaining) > 0 {
@@ -302,7 +303,7 @@ export_write :: proc(file: ^os.File, bytes: []u8, hash: ^sha2.Context_256) -> bo
 	return true
 }
 
-@(private)
+@(private, require_results)
 export_join :: proc(directory, name: string, allocator: mem.Allocator) -> (string, bool) {
 	path, join_error := filepath.join([]string{directory, name}, allocator)
 	return path, join_error == nil
@@ -311,7 +312,7 @@ export_join :: proc(directory, name: string, allocator: mem.Allocator) -> (strin
 // export_note records one omission in the manifest. False means the note could not
 // be stored, so the manifest would be missing the reason it names and the export
 // fails rather than understate what it left out.
-@(private)
+@(private, require_results)
 export_note :: proc(omissions: ^[dynamic]string, text: string) -> bool {
 	note, clone_error := strings.clone(text, context.allocator)
 	if clone_error != nil { return false }
@@ -331,6 +332,7 @@ export_files_destroy :: proc(files: ^[dynamic]Export_File) {
 	delete(files^)
 }
 
+@(require_results)
 diagnostics_export_request :: proc(
 	store: ^journal.Journal,
 	files: ^[dynamic]Export_File,
@@ -392,7 +394,7 @@ export_request_from :: proc(row: ^Diagnostics_Request, session_text: string) -> 
 	return payload
 }
 
-@(private)
+@(private, require_results)
 export_usage_bucket :: proc(value: Maybe(i64)) -> (bool, i64) {
 	count, present := value.?
 	return present, count

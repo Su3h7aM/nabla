@@ -102,14 +102,14 @@ diagnostics_bad_usage :: proc(problem: string, stderr: io.Writer) -> int {
 }
 
 // diagnostics_option reports whether argument is name, alone or as name=value.
-@(private)
+@(private, require_results)
 diagnostics_option :: proc(argument, name: string) -> bool {
 	return argument == name || strings.has_prefix(argument, name) && strings.has_prefix(argument[len(name):], "=")
 }
 
 // diagnostics_option_value is the option's value: after its "=", or the next
 // argument, which index then skips. False means no value was given.
-@(private)
+@(private, require_results)
 diagnostics_option_value :: proc(arguments: []string, index: ^int, name: string) -> (value: string, present: bool) {
 	argument := arguments[index^]
 	if len(argument) > len(name) { return argument[len(name) + 1:], true }
@@ -153,6 +153,7 @@ diagnostics_request_destroy :: proc(request: ^Diagnostics_Request, allocator: me
 
 // diagnostics_request_open summarizes one request from its records in store. The
 // summary owns its strings in allocator.
+@(require_results)
 diagnostics_request_open :: proc(
 	store: ^journal.Journal,
 	session_id: journal.Session_Id,
@@ -221,6 +222,7 @@ diagnostics_request_open :: proc(
 }
 
 // diagnostics_report_request prints journal facts on stderr.
+@(require_results)
 diagnostics_report_request :: proc(store: ^journal.Journal, session_id: journal.Session_Id, request_no: journal.Request_Id, stderr: io.Writer) -> bool {
 	row, load_error := diagnostics_request_open(store, session_id, request_no, context.allocator)
 	if load_error != nil {
