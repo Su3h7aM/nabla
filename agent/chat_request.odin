@@ -120,8 +120,6 @@ chat_build_request_into :: proc(
 		Instructions         = instructions,
 		Messages_Present     = true,
 		Messages             = prep.wire[:],
-		// Every HTTP client names itself, and an endpoint that routes, throttles,
-		// or traces by client has only this to read.
 		User_Agent_Present   = true,
 		User_Agent           = NABLA_USER_AGENT,
 		// The session is this conversation. Reporting it as a header is how a

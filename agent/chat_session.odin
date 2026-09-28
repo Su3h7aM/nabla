@@ -22,15 +22,11 @@ Chat_Tool_Call :: struct {
 }
 
 // Chat_Response_Output stages one completed Responses output for commit: the
-// terminal output array verbatim, exactly as the endpoint sent it. Display
-// text and executable calls are derived from the completion event alongside
-// this; the output itself is the replay record, owned here until the response
-// commits. Only the Responses API sets it; Chat Completions has no
-// replayable output items to preserve. A Reasoning_Entry payload recorded
-// before this change still decodes, so old sessions replay through the
-// legacy path in the request builder.
+// terminal output array verbatim, exactly as the endpoint sent it. It is the
+// replay record, owned here until the response commits, and only the Responses
+// API sets it.
 Chat_Response_Output :: struct {
-	output: string, // owned; verbatim output array,
+	output: string, // owned; the verbatim output array
 }
 
 chat_response_output_destroy :: proc(output: ^Chat_Response_Output, allocator: mem.Allocator) {

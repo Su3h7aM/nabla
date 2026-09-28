@@ -349,6 +349,8 @@ chat_try_context_repair :: proc(
 		// The session keeps the pressure, so the next safe boundary starts the summary
 		// this refusal was missing. A summary already running is promoted instead: it is
 		// the same work, and it installs as soon as it is ready.
+		// The request is best effort: whether it was recorded or coalesced, the refusal is
+		// what already ended this chain.
 		_ = chat_compact_request(chat, .Provider_Overflow)
 		chat_session_fail_turn(chat, fmt.tprintf("the request does not fit the context: %s", chat_repair_refusal_text(refusal)))
 		return refusal
@@ -383,6 +385,8 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 
 	// A finished summary is installed at a request boundary, so the context the request is
 	// built from is the one this session will actually send.
+	// The result only says whether the context changed; the request below is prepared from
+	// the context as it is now either way.
 	_ = chat_compact_service(chat, observer)
 	// A boundary whose own durable write failed has nothing to prepare from: the record and
 	// the conversation have diverged, and no request may be built on that.
@@ -582,14 +586,14 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 	// through the session's allocator at the same time. The worker borrows the frozen bytes and
 	// the mailbox; an abandoned attempt is retained with both.
 	if chain.mailbox == nil {
-		box, box_error := new(Owner_Mailbox, virtual.arena_allocator(&chain.scratch))
-		if box_error != nil {
+		new_mailbox, mailbox_error := new(Owner_Mailbox, virtual.arena_allocator(&chain.scratch))
+		if mailbox_error != nil {
 			chat_session_fail_turn(chat, "the request worker could not be allocated")
 			chat_chain_stop(chat, .Harness_Failure)
 			return
 		}
-		mailbox_init(box, os.heap_allocator())
-		chain.mailbox = box
+		mailbox_init(new_mailbox, os.heap_allocator())
+		chain.mailbox = new_mailbox
 	}
 	worker, worker_error := new(Chat_Request_Worker, virtual.arena_allocator(&chain.scratch))
 	if worker_error != nil {

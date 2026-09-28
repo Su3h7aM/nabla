@@ -5,9 +5,7 @@ import "core:fmt"
 import "nabla:agent/journal"
 
 // chat_effort_change_note is what a caller reports after changing the effort.
-// The change reaches the provider: reasoning effort is rendered into the prompt
-// prefix, so the prefix the provider has cached no longer matches and the next
-// request reads it again from the start. An empty level means the default.
+// An empty level means the default.
 chat_effort_change_note :: proc(level: string) -> string {
 	if level == "" { return "effort cleared to provider default; the prompt prefix is read again from the start" }
 	return fmt.tprintf("effort set to %s for the next request; the prompt prefix is read again from the start", level)

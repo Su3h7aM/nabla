@@ -10,7 +10,7 @@ import "nabla:ai"
 // retried, and everything else stops. The test names the action and the reason, because
 // a stop nobody can explain is what the reasons exist to prevent.
 @(test)
-test_recovery_decision_follows_the_failure_class :: proc(t: ^testing.T) {
+test_recovery_decision_follows_the_failure_class :: proc(test: ^testing.T) {
 	policy := test_retry_policy()
 	Case :: struct {
 		name:   string,
@@ -33,10 +33,10 @@ test_recovery_decision_follows_the_failure_class :: proc(t: ^testing.T) {
 		{"invalid output", .Stream, .Invalid_Output, .Stop, .Terminal_Failure},
 		{"unknown refusal", .HTTP, .Unknown, .Stop, .Terminal_Failure},
 	}
-	for c in cases {
-		decision := chat_recovery_decide(policy, {attempts = 1, error = {kind = c.kind, failure_class = c.class}}, 0.5)
-		testing.expectf(t, decision.action == c.action, "%s: action is %v", c.name, decision.action)
-		testing.expectf(t, decision.reason == c.reason, "%s: reason is %v", c.name, decision.reason)
+	for entry in cases {
+		decision := chat_recovery_decide(policy, {attempts = 1, error = {kind = entry.kind, failure_class = entry.class}}, 0.5)
+		testing.expectf(test, decision.action == entry.action, "%s: action is %v", entry.name, decision.action)
+		testing.expectf(test, decision.reason == entry.reason, "%s: reason is %v", entry.name, decision.reason)
 	}
 }
 
@@ -44,7 +44,7 @@ test_recovery_decision_follows_the_failure_class :: proc(t: ^testing.T) {
 // a retry is the case worth naming: it says the chain stopped for a reason the provider
 // had nothing to do with.
 @(test)
-test_recovery_decision_stops_for_its_own_facts :: proc(t: ^testing.T) {
+test_recovery_decision_stops_for_its_own_facts :: proc(test: ^testing.T) {
 	policy := test_retry_policy()
 	transient := ai.Provider_Operation_Error {
 		kind          = .HTTP,
@@ -72,31 +72,31 @@ test_recovery_decision_stops_for_its_own_facts :: proc(t: ^testing.T) {
 		// The one repair is the chain's whole allowance: a second refusal is terminal.
 		{"overflow repaired once", {attempts = 2, error = {kind = .HTTP, failure_class = .Context_Overflow}, repaired = true}, .Stop, .Context_Exhausted},
 	}
-	for c in cases {
-		decision := chat_recovery_decide(policy, c.facts, 0.5)
-		testing.expectf(t, decision.action == c.action, "%s: action is %v", c.name, decision.action)
-		testing.expectf(t, decision.reason == c.reason, "%s: reason is %v", c.name, decision.reason)
+	for entry in cases {
+		decision := chat_recovery_decide(policy, entry.facts, 0.5)
+		testing.expectf(test, decision.action == entry.action, "%s: action is %v", entry.name, decision.action)
+		testing.expectf(test, decision.reason == entry.reason, "%s: reason is %v", entry.name, decision.reason)
 	}
 }
 
 // The wait before a transient retry: it doubles per retry, it never exceeds the policy
 // ceiling, and the sample only moves it inside the upper half of that ceiling.
 @(test)
-test_retry_backoff_delay_doubles_and_sampled :: proc(t: ^testing.T) {
+test_retry_backoff_delay_doubles_and_sampled :: proc(test: ^testing.T) {
 	policy := chat_retry_policy_default()
-	testing.expect_value(t, chat_retry_backoff_delay(policy, 1, 0), CHAT_RETRY_BASE_DELAY / 2)
-	testing.expect_value(t, chat_retry_backoff_delay(policy, 1, 1), CHAT_RETRY_BASE_DELAY)
-	testing.expect_value(t, chat_retry_backoff_delay(policy, 2, 0), CHAT_RETRY_BASE_DELAY)
-	testing.expect_value(t, chat_retry_backoff_delay(policy, 3, 1), 4 * CHAT_RETRY_BASE_DELAY)
+	testing.expect_value(test, chat_retry_backoff_delay(policy, 1, 0), CHAT_RETRY_BASE_DELAY / 2)
+	testing.expect_value(test, chat_retry_backoff_delay(policy, 1, 1), CHAT_RETRY_BASE_DELAY)
+	testing.expect_value(test, chat_retry_backoff_delay(policy, 2, 0), CHAT_RETRY_BASE_DELAY)
+	testing.expect_value(test, chat_retry_backoff_delay(policy, 3, 1), 4 * CHAT_RETRY_BASE_DELAY)
 	// The ceiling is clamped, and the sample still spreads the wait under it.
-	testing.expect_value(t, chat_retry_backoff_delay(policy, 99, 1), CHAT_RETRY_BACKOFF_CEILING)
-	testing.expect_value(t, chat_retry_backoff_delay(policy, 99, 0), CHAT_RETRY_BACKOFF_CEILING / 2)
+	testing.expect_value(test, chat_retry_backoff_delay(policy, 99, 1), CHAT_RETRY_BACKOFF_CEILING)
+	testing.expect_value(test, chat_retry_backoff_delay(policy, 99, 0), CHAT_RETRY_BACKOFF_CEILING / 2)
 }
 
 // A wait the provider asked for by name is waited on in full, however long it is, and no
 // number of earlier sends stops a transient chain.
 @(test)
-test_recovery_decision_waits_for_the_provider :: proc(t: ^testing.T) {
+test_recovery_decision_waits_for_the_provider :: proc(test: ^testing.T) {
 	policy := test_retry_policy()
 	rate_limited := ai.Provider_Operation_Error {
 		kind          = .HTTP,
@@ -106,28 +106,28 @@ test_recovery_decision_waits_for_the_provider :: proc(t: ^testing.T) {
 	asked := rate_limited
 	asked.retry_after = 2 * time.Second
 	decision := chat_recovery_decide(policy, {attempts = 1, error = asked}, 0)
-	testing.expect_value(t, decision.action, Request_Recovery_Action.Retry)
-	testing.expect_value(t, decision.delay, 2 * time.Second)
+	testing.expect_value(test, decision.action, Request_Recovery_Action.Retry)
+	testing.expect_value(test, decision.delay, 2 * time.Second)
 
 	// A reported zero is a value, not an absence: the provider said to send again now,
 	// and the harness still spreads the retry.
 	immediate := rate_limited
 	immediate.retry_after = 0
 	decision = chat_recovery_decide(policy, {attempts = 1, error = immediate}, 0)
-	testing.expect_value(t, decision.action, Request_Recovery_Action.Retry)
-	testing.expect_value(t, decision.delay, policy.base_delay / 2)
+	testing.expect_value(test, decision.action, Request_Recovery_Action.Retry)
+	testing.expect_value(test, decision.delay, policy.base_delay / 2)
 
 	long := rate_limited
 	long.retry_after = time.Hour
 	decision = chat_recovery_decide(policy, {attempts = 1_000, error = long}, 0)
-	testing.expect_value(t, decision.action, Request_Recovery_Action.Retry)
-	testing.expect_value(t, decision.delay, time.Hour)
+	testing.expect_value(test, decision.action, Request_Recovery_Action.Retry)
+	testing.expect_value(test, decision.delay, time.Hour)
 }
 
 // A provider directive to stop is authoritative within the transient classes, and a
 // directive to continue never widens them.
 @(test)
-test_recovery_decision_reads_the_provider_directive :: proc(t: ^testing.T) {
+test_recovery_decision_reads_the_provider_directive :: proc(test: ^testing.T) {
 	policy := test_retry_policy()
 
 	forbidden := ai.Provider_Operation_Error {
@@ -136,8 +136,8 @@ test_recovery_decision_reads_the_provider_directive :: proc(t: ^testing.T) {
 		retry_directive = .Forbid,
 	}
 	decision := chat_recovery_decide(policy, {attempts = 1, error = forbidden}, 0.5)
-	testing.expect_value(t, decision.action, Request_Recovery_Action.Stop)
-	testing.expect_value(t, decision.reason, Request_Recovery_Reason.Terminal_Failure)
+	testing.expect_value(test, decision.action, Request_Recovery_Action.Stop)
+	testing.expect_value(test, decision.reason, Request_Recovery_Reason.Terminal_Failure)
 
 	allowed := ai.Provider_Operation_Error {
 		kind            = .HTTP,
@@ -145,6 +145,6 @@ test_recovery_decision_reads_the_provider_directive :: proc(t: ^testing.T) {
 		retry_directive = .Allow,
 	}
 	decision = chat_recovery_decide(policy, {attempts = 1, error = allowed}, 0.5)
-	testing.expect_value(t, decision.action, Request_Recovery_Action.Stop)
-	testing.expect_value(t, decision.reason, Request_Recovery_Reason.Terminal_Failure)
+	testing.expect_value(test, decision.action, Request_Recovery_Action.Stop)
+	testing.expect_value(test, decision.reason, Request_Recovery_Reason.Terminal_Failure)
 }

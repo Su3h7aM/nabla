@@ -247,6 +247,7 @@ chat_finish_send :: proc(chat: ^Chat_Session, request: journal.Request_Id, attem
 		header.kind = .Response_Rejected
 		chat_record(chat, header, chat_send_rejection(result))
 	}
+	// The commit latches the storage failure itself, which is what the turn reads next.
 	_ = chat_commit(chat, "the request outcome could not be recorded")
 }
 
@@ -502,6 +503,7 @@ chat_turn_drive :: proc(
 			// The claim applies the transition the selector proposed, which only read state.
 			// It runs before the line drain so the line still belongs to the turn that was
 			// sent it, while the turn number still names that turn.
+			// A claim refuses only for a turn that already left the state it names.
 			_ = chat_session_claim_finish(chat, effect)
 			// Input the turn never recorded is recorded here, so a turn that ends takes no
 			// message with it: this is input that arrived while a request was in flight, while

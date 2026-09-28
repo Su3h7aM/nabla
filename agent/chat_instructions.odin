@@ -267,11 +267,23 @@ snapshot_skill_make :: proc(entry: Instruction_Manifest_Skill, allocator: mem.Al
 	skill.name, clone_error = strings.clone(entry.name, allocator)
 	if clone_error != nil { return {}, false }
 	skill.description, clone_error = strings.clone(entry.description, allocator)
-	if clone_error != nil { delete(skill.name, allocator); return {}, false }
+	if clone_error != nil {
+		delete(skill.name, allocator)
+		return {}, false
+	}
 	skill.logical_path, clone_error = strings.clone(entry.logical_path, allocator)
-	if clone_error != nil { delete(skill.name, allocator); delete(skill.description, allocator); return {}, false }
+	if clone_error != nil {
+		delete(skill.name, allocator)
+		delete(skill.description, allocator)
+		return {}, false
+	}
 	skill.directory, clone_error = strings.clone(entry.directory, allocator)
-	if clone_error != nil { delete(skill.name, allocator); delete(skill.description, allocator); delete(skill.logical_path, allocator); return {}, false }
+	if clone_error != nil {
+		delete(skill.name, allocator)
+		delete(skill.description, allocator)
+		delete(skill.logical_path, allocator)
+		return {}, false
+	}
 	skill.root_index = entry.root_index
 	skill.metadata_digest = skill_digest_parse(entry.metadata_digest)
 	return skill, true
@@ -282,7 +294,10 @@ snapshot_root_make :: proc(entry: Instruction_Manifest_Root, allocator: mem.Allo
 	path, path_error := strings.clone(entry.path, allocator)
 	if path_error != nil { return {}, false }
 	authority, authority_error := strings.clone(entry.authority, allocator)
-	if authority_error != nil { delete(path, allocator); return {}, false }
+	if authority_error != nil {
+		delete(path, allocator)
+		return {}, false
+	}
 	root = skills.Root {
 		source    = instruction_manifest_source(entry.kind),
 		path      = path,
@@ -296,11 +311,23 @@ snapshot_diagnostic_make :: proc(entry: Instruction_Manifest_Diagnostic, allocat
 	path, path_error := strings.clone(entry.path, allocator)
 	if path_error != nil { return {}, false }
 	detail, detail_error := strings.clone(entry.detail, allocator)
-	if detail_error != nil { delete(path, allocator); return {}, false }
+	if detail_error != nil {
+		delete(path, allocator)
+		return {}, false
+	}
 	winner, winner_error := strings.clone(entry.winner, allocator)
-	if winner_error != nil { delete(path, allocator); delete(detail, allocator); return {}, false }
+	if winner_error != nil {
+		delete(path, allocator)
+		delete(detail, allocator)
+		return {}, false
+	}
 	loser, loser_error := strings.clone(entry.loser, allocator)
-	if loser_error != nil { delete(path, allocator); delete(detail, allocator); delete(winner, allocator); return {}, false }
+	if loser_error != nil {
+		delete(path, allocator)
+		delete(detail, allocator)
+		delete(winner, allocator)
+		return {}, false
+	}
 	diagnostic = skills.Diagnostic {
 		kind       = skills.Diagnostic_Kind(entry.kind),
 		root_index = entry.root_index,
@@ -417,14 +444,14 @@ skill_digest_parse :: proc(text: string) -> [32]u8 {
 	return digest
 }
 
-skill_hex_value :: proc(c: u8) -> u8 {
-	switch c {
+skill_hex_value :: proc(character: u8) -> u8 {
+	switch character {
 	case '0' ..= '9':
-		return c - '0'
+		return character - '0'
 	case 'a' ..= 'f':
-		return c - 'a' + 10
+		return character - 'a' + 10
 	case 'A' ..= 'F':
-		return c - 'A' + 10
+		return character - 'A' + 10
 	}
 	return 0
 }

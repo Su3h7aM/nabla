@@ -144,7 +144,9 @@ chat_drain_queue :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue: ^S
 			// Nothing has run that could carry the line, so it waits for the turn that
 			// will, and the caller is told which condition is holding it up.
 			_observer_message(observer, .Warning, "the steering line is waiting for a turn to carry it")
-			steer_requeue(queue, line)
+			// The line goes back to the front of the queue, or is released when the queue
+			// cannot grow; neither outcome leaves this caller anything to do with it.
+			_ = steer_requeue(queue, line)
 			return recorded
 		case .Storage_Failed:
 			// The store refused it, so the line stays pending: the session's own error says

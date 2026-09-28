@@ -8,18 +8,6 @@ import "nabla:agent/journal"
 
 // --- running tools -----------------------------------------------------------
 
-// chat_run_tools executes the calls the current response committed. Each call's
-// intent is recorded before it runs, and its result after, so an interruption between
-// the two is legible as an unknown outcome rather than a guess.
-//
-// The batch's context budget is opened here, before the first result exists, and every
-// result is charged against it in submission order; a result that does not fit is kept
-// and replaced by a handle, so one turn cannot put more into the context than the
-// window has left.
-//
-// The loop is the driver: it takes the one bounded step the table asks for and stops
-// when every job is released. It returns how many calls it recorded, which is what the
-// caller compares against the number of committed calls before the turn moves on.
 // chat_tool_jobs_begin admits the response's calls into session-owned state. It is
 // the Run_Tools effect: no executor runs and no durable dispatch is written here.
 @(private)
