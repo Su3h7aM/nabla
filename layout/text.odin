@@ -72,10 +72,8 @@ text :: proc(ctx: ^Context, #by_ptr desc: Text_Desc, loc := #caller_location) {
 Fold the identity of a text node's content and style into one key.
 
 Runs measured from this node differ only by which substring they cover, so the
-per-run key is this value extended with that substring's offset and length. That
-keeps a cache lookup proportional to the key size rather than to the text: with
-a hash over each candidate substring instead, wrapping a paragraph spent more
-time hashing bytes than the measurement callback it was avoiding.
+per-run key is this value extended with that substring's offset and length, so
+a cache lookup costs a few multiplies rather than a hash over the text.
 */
 @(private)
 _text_identity_key :: proc(state: ^_Context_State, input: _Node_Input) -> u64 {
@@ -586,15 +584,11 @@ _wrap_text_node :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 /*
 Break a text node into lines using the advances recorded at intrinsic sizing.
 
-The fast path, and the reason it exists: intrinsic sizing already measured every
-word to find the shrink floor, so packing lines needs no measurement at all —
-just a running sum over the records and one line measurement per emitted line.
-Measuring words again here instead made text roughly three cache lookups per
-word, which is what put this library behind Clay on wrapping.
-
-Line breaking is identical to the measuring path: greedy packing, a word too
-wide for an empty line occupies that line alone, and a hard segment always
-occupies at least one line.
+Intrinsic sizing already measured every word to find the shrink floor, so
+packing lines here needs no measurement at all, just a running sum over the
+records and one line measurement per emitted line. Line breaking is identical
+to the measuring path: greedy packing, a word too wide for an empty line
+occupies that line alone, and a hard segment always occupies at least one line.
 */
 @(private)
 _wrap_text_node_from_records :: proc(state: ^_Context_State, node: Node_Handle, available: f64) -> bool {

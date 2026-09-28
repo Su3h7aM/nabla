@@ -170,9 +170,9 @@ test_emoji_presentation_is_a_policy :: proc(t: ^testing.T) {
 
 @(test)
 test_display_next_refuses_malformed_utf8 :: proc(t: ^testing.T) {
-	it := display_iterator_make("a\xffb")
-	_, first := display_next(&it)
+	iterator := display_iterator_make("a\xffb")
+	_, first := display_next(&iterator)
 	testing.expect_value(t, first, Display_Status.OK)
-	_, second := display_next(&it)
+	_, second := display_next(&iterator)
 	testing.expect_value(t, second, Display_Status.Invalid_Text)
 }

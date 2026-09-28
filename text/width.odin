@@ -29,12 +29,12 @@ text_columns :: proc(value: string, profile: Width_Profile = DEFAULT_WIDTH_PROFI
 // advances to the next stop measured from there, so a caller assembling a line
 // one word at a time gets the columns drawing will produce.
 text_columns_at :: proc(value: string, start_column: int, profile: Width_Profile = DEFAULT_WIDTH_PROFILE) -> int {
-	it := display_iterator_make(value, profile)
-	it.column = start_column
+	iterator := display_iterator_make(value, profile)
+	iterator.column = start_column
 	for {
-		_, status := display_next(&it)
+		_, status := display_next(&iterator)
 		if status != .OK {
-			return it.column - start_column
+			return iterator.column - start_column
 		}
 	}
 }
@@ -54,12 +54,12 @@ truncate_text_at :: proc(value: string, max_columns, start_column: int, profile:
 		return ""
 	}
 	start := max(start_column, 0)
-	it := display_iterator_make(value, profile)
-	it.column = start
+	iterator := display_iterator_make(value, profile)
+	iterator.column = start
 	columns := 0
 	result := 0
 	for {
-		cluster, status := display_next(&it)
+		cluster, status := display_next(&iterator)
 		if status != .OK {
 			break
 		}
@@ -67,7 +67,7 @@ truncate_text_at :: proc(value: string, max_columns, start_column: int, profile:
 			break
 		}
 		columns += cluster.width
-		if it.spaces > 0 {
+		if iterator.spaces > 0 {
 			// Mid-expansion: a tab is a valid prefix only once all its cells
 			// fit, so do not commit its offset yet.
 			continue
@@ -84,8 +84,8 @@ next_grapheme_offset :: proc(value: string, offset: int) -> int {
 	if offset >= len(value) {
 		return len(value)
 	}
-	it := grapheme_iterator_make(value)
-	for _, cluster in grapheme_iterate(&it) {
+	iterator := grapheme_iterator_make(value)
+	for _, cluster in grapheme_iterate(&iterator) {
 		end := cluster.byte_index + len(cluster.text)
 		if end > offset {
 			return end
@@ -101,8 +101,8 @@ prev_grapheme_offset :: proc(value: string, offset: int) -> int {
 		return 0
 	}
 	previous := 0
-	it := grapheme_iterator_make(value)
-	for _, cluster in grapheme_iterate(&it) {
+	iterator := grapheme_iterator_make(value)
+	for _, cluster in grapheme_iterate(&iterator) {
 		if cluster.byte_index + len(cluster.text) >= offset {
 			return cluster.byte_index
 		}

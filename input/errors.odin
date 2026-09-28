@@ -9,8 +9,8 @@ import "core:io"
 General_Error :: enum u32 {
 	None = 0,
 	Not_Open, // acquisition on a closed descriptor
-	Read_Failed, // the read path failed
-	Poll_Failed, // poll failed
+	Read_Failed,
+	Poll_Failed,
 	Allocation_Failed,
 }
 

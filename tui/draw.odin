@@ -168,9 +168,9 @@ _draw_text_clipped :: proc(
 
 	right := _rect_end(rect.x, rect.width)
 	column := rect.x
-	it := text.display_iterator_make(value, profile)
+	iterator := text.display_iterator_make(value, profile)
 	for {
-		cluster, status := text.display_next(&it)
+		cluster, status := text.display_next(&iterator)
 		if status != .OK {
 			break
 		}

@@ -149,11 +149,11 @@ test_encode_reduces_colors_by_depth :: proc(t: ^testing.T) {
 		{.Four_Bit, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[mc\x1b[?25l\x1b[m"},
 		{.None, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[mb\x1b[mc\x1b[?25l\x1b[m"},
 	}
-	for c in cases {
+	for fixture in cases {
 		scratch: [4096]byte
-		out, ok := _encode_frame(buffer, {color_depth = c.depth}, {}, scratch[:])
+		out, ok := _encode_frame(buffer, {color_depth = fixture.depth}, {}, scratch[:])
 		testing.expect(t, ok, "a valid frame must encode")
-		testing.expect_value(t, out, c.expected)
+		testing.expect_value(t, out, fixture.expected)
 	}
 
 	// xterm-256 red (196) must reduce to ANSI red (91), never wrap to blue

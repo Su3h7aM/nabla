@@ -69,11 +69,11 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 	lifecycle_wait_for_byte :: proc(fd: posix.FD, expected: byte) -> bool {
 		got: byte
 		for {
-			n := posix.read(fd, &got, 1)
-			if n == 1 {
+			read_count := posix.read(fd, &got, 1)
+			if read_count == 1 {
 				return got == expected
 			}
-			if n < 0 && posix.get_errno() == .EINTR {
+			if read_count < 0 && posix.get_errno() == .EINTR {
 				continue
 			}
 			return false
@@ -87,30 +87,30 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 	lifecycle_drain_slave :: proc(sync_fd: posix.FD, master: posix.FD) {
 		done := false
 		for !done {
-			pfds := [2]posix.pollfd{{fd = sync_fd, events = {.IN}}, {fd = master, events = {.IN}}}
-			n := posix.poll(raw_data(pfds[:]), 2, 5)
-			if n < 0 {
+			poll_descriptors := [2]posix.pollfd{{fd = sync_fd, events = {.IN}}, {fd = master, events = {.IN}}}
+			ready_count := posix.poll(raw_data(poll_descriptors[:]), 2, 5)
+			if ready_count < 0 {
 				continue
 			}
-			if .IN in pfds[0].revents {
+			if .IN in poll_descriptors[0].revents {
 				got: byte
 				if posix.read(sync_fd, &got, 1) == 1 && got == 'D' {
 					done = true
 				}
 			}
-			if .IN in pfds[1].revents {
-				buf: [64]byte
-				posix.read(master, raw_data(buf[:]), c.size_t(len(buf)))
+			if .IN in poll_descriptors[1].revents {
+				buffer: [64]byte
+				posix.read(master, raw_data(buffer[:]), c.size_t(len(buffer)))
 			}
 			if !done {
 				// Throttle: without this the master is constantly readable and
 				// the whole buffer drains in microseconds, which would let the
 				// child's write complete before the SIGALRM lands.
-				ts := posix.timespec {
+				throttle := posix.timespec {
 					tv_sec  = 0,
 					tv_nsec = 5_000_000,
 				}
-				posix.nanosleep(&ts, nil)
+				posix.nanosleep(&throttle, nil)
 			}
 		}
 	}
@@ -242,8 +242,8 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 			junk[i] = 'j'
 		}
 		for {
-			n := posix.write(fd, raw_data(junk[:]), c.size_t(len(junk)))
-			if n < 0 {
+			written := posix.write(fd, raw_data(junk[:]), c.size_t(len(junk)))
+			if written < 0 {
 				break
 			}
 		}

@@ -67,7 +67,9 @@ Session :: struct {
 open :: proc(options: Options = {}, allocator := context.allocator, loc := #caller_location) -> (session: ^Session, err: Error) {
 	alloc_error: runtime.Allocator_Error
 	session, alloc_error = new(Session, allocator, loc)
-	if alloc_error != nil { return nil, alloc_error }
+	if alloc_error != nil {
+		return nil, alloc_error
+	}
 	session.allocator = allocator
 	if err = _session_open(session, options); err != nil {
 		free(session, allocator)

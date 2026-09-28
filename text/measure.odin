@@ -44,13 +44,13 @@ measure_text :: proc(
 		return {}, .Invalid_Constraint
 	}
 
-	it := display_iterator_make(value, profile)
+	iterator := display_iterator_make(value, profile)
 	for {
-		_, status := display_next(&it)
+		_, status := display_next(&iterator)
 		switch status {
 		case .OK:
 		case .Done:
-			columns := it.column
+			columns := iterator.column
 			if max_columns != NO_COLUMN_LIMIT {
 				columns = min(columns, max_columns)
 			}

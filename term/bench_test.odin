@@ -31,12 +31,12 @@ when #config(BENCH, false) {
 
 		required: int
 		for _ in 0 ..< 24 {
-			_, req, err := encode(buffer, profile, {}, scratch)
+			_, required_size, err := encode(buffer, profile, {}, scratch)
 			if err != nil {
 				fmt.eprintln("bench: encode failed:", err)
 				return
 			}
-			required = req
+			required = required_size
 		}
 
 		start := time.tick_now()
@@ -91,10 +91,10 @@ when #config(BENCH, false) {
 			{label = "styled-400x100", columns = 400, rows = 100, frames = 1000, styled = true},
 			{label = "plain-400x100", columns = 400, rows = 100, frames = 1000},
 		}
-		for w in workloads {
-			buffer := _bench_frame(w.columns, w.rows, w.styled)
+		for workload in workloads {
+			buffer := _bench_frame(workload.columns, workload.rows, workload.styled)
 			defer delete(buffer.cells)
-			_bench_encode(w.label, buffer, profile, w.frames)
+			_bench_encode(workload.label, buffer, profile, workload.frames)
 		}
 		fmt.println("\n== done ==")
 	}

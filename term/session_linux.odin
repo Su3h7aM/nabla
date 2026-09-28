@@ -111,11 +111,11 @@ atexit_active: bool
 @(private = "file")
 atexit_registered: bool
 
-_session_open :: proc(s: ^Session, options: Options) -> (err: Error) {
+_session_open :: proc(session: ^Session, options: Options) -> (err: Error) {
 	if session_active {
 		return General_Error.Already_Open
 	}
-	impl := &s.impl
+	impl := &session.impl
 	file, open_err := os.open("/dev/tty", {.Read, .Write})
 	if open_err != nil {
 		// A missing /dev/tty is the semantic "no controlling terminal"
@@ -234,28 +234,28 @@ _session_open :: proc(s: ^Session, options: Options) -> (err: Error) {
 // faithful low-level cause; the few semantic folds core:os applies (close
 // can hit .Invalid_File for an already-closed descriptor) map onto io.Error.
 _session_close_file :: proc(file: ^os.File) -> Error {
-	os_err := os.close(file)
+	close_error := os.close(file)
 	when #config(NABLA_TERM_TEST_HOOKS, false) {
 		if _test_fail_close_once {
 			_test_fail_close_once = false
 			return Platform_Error(.EIO)
 		}
 	}
-	if os_err == nil {
+	if close_error == nil {
 		return nil
 	}
-	#partial switch e in os_err {
+	#partial switch os_error in close_error {
 	case os.Platform_Error:
-		return Platform_Error(e)
+		return Platform_Error(os_error)
 	case os.General_Error:
-		#partial switch e {
+		#partial switch os_error {
 		case .Invalid_File:
 			return io.Error(.Closed)
 		case:
 			return io.Error(.Unknown)
 		}
 	case io.Error:
-		return e
+		return os_error
 	}
 	return io.Error(.Unknown)
 }
@@ -364,14 +364,14 @@ _session_rollback :: proc(impl: ^Session_Impl) -> Error {
 // or the Platform_Error/io.Error from the failed syscall). The descriptor
 // close itself is one-shot (core:os consumes the handle); a failure there
 // is reported and the fully-compensated session settles on the next close.
-_session_close :: proc(s: ^Session) -> Error {
+_session_close :: proc(session: ^Session) -> Error {
 	when #config(NABLA_TERM_TEST_HOOKS, false) {
 		if _test_fail_teardown_once {
 			_test_fail_teardown_once = false
 			return Platform_Error(.EIO)
 		}
 	}
-	impl := &s.impl
+	impl := &session.impl
 	first_error: Error = nil
 	fd := posix.FD(os.fd(impl.file))
 	// The cursor is part of the documented baseline: a presented frame may have
@@ -478,20 +478,20 @@ _session_close :: proc(s: ^Session) -> Error {
 // _session_present writes the whole frame through the shared write loop.
 // The write reports its committed byte count; the caller surfaces it
 // through present's committed result.
-_session_present :: proc(s: ^Session, bytes: []byte) -> (committed: int, err: Error) {
-	if s.impl.file == nil {
+_session_present :: proc(session: ^Session, bytes: []byte) -> (committed: int, err: Error) {
+	if session.impl.file == nil {
 		return 0, General_Error.Not_Open
 	}
-	return _session_write_bytes(posix.FD(os.fd(s.impl.file)), bytes)
+	return _session_write_bytes(posix.FD(os.fd(session.impl.file)), bytes)
 }
 
 // _session_clipboard writes a clipboard sequence through the same loop, so a
 // copy is as retryable as a frame is.
-_session_clipboard :: proc(s: ^Session, bytes: []byte) -> (committed: int, err: Error) {
-	if s.impl.file == nil {
+_session_clipboard :: proc(session: ^Session, bytes: []byte) -> (committed: int, err: Error) {
+	if session.impl.file == nil {
 		return 0, General_Error.Not_Open
 	}
-	return _session_write_bytes(posix.FD(os.fd(s.impl.file)), bytes)
+	return _session_write_bytes(posix.FD(os.fd(session.impl.file)), bytes)
 }
 
 // _session_write_bytes writes all of bytes to fd, retrying EINTR, waiting
@@ -511,8 +511,8 @@ _session_write_bytes :: proc(fd: posix.FD, bytes: []byte) -> (committed: int, er
 			}
 		}
 		remaining := len(bytes) - offset
-		n := posix.write(fd, raw_data(bytes[offset:]), c.size_t(remaining))
-		if n < 0 {
+		written := posix.write(fd, raw_data(bytes[offset:]), c.size_t(remaining))
+		if written < 0 {
 			#partial switch posix.get_errno() {
 			case .EINTR:
 				continue
@@ -526,10 +526,10 @@ _session_write_bytes :: proc(fd: posix.FD, bytes: []byte) -> (committed: int, er
 				return offset, _errno()
 			}
 		}
-		if n == 0 {
+		if written == 0 {
 			return offset, General_Error.Partial_Write
 		}
-		offset += int(n)
+		offset += int(written)
 		committed = offset
 	}
 	return offset, nil
@@ -541,12 +541,12 @@ _session_write_bytes :: proc(fd: posix.FD, bytes: []byte) -> (committed: int, er
 // cause directly.
 _session_poll_out :: proc(fd: posix.FD) -> (ok: bool, err: Error) {
 	for {
-		pfd := posix.pollfd {
+		poll_descriptor := posix.pollfd {
 			fd     = fd,
 			events = {.OUT},
 		}
-		n := posix.poll(&pfd, 1, -1)
-		if n >= 0 {
+		ready_count := posix.poll(&poll_descriptor, 1, -1)
+		if ready_count >= 0 {
 			return true, nil
 		}
 		if posix.get_errno() == .EINTR {
@@ -556,12 +556,12 @@ _session_poll_out :: proc(fd: posix.FD) -> (ok: bool, err: Error) {
 	}
 }
 
-_session_viewport :: proc(s: ^Session) -> (result: Viewport, err: Error) {
-	if s.impl.file == nil {
+_session_viewport :: proc(session: ^Session) -> (result: Viewport, err: Error) {
+	if session.impl.file == nil {
 		return {}, General_Error.Not_Open
 	}
 	size: Linux_Window_Size
-	if linux.ioctl(linux.Fd(os.fd(s.impl.file)), u32(linux.TIOCGWINSZ), uintptr(rawptr(&size))) != 0 {
+	if linux.ioctl(linux.Fd(os.fd(session.impl.file)), u32(linux.TIOCGWINSZ), uintptr(rawptr(&size))) != 0 {
 		return {}, _errno()
 	}
 	if size.columns == 0 || size.rows == 0 {
@@ -574,8 +574,8 @@ _session_viewport :: proc(s: ^Session) -> (result: Viewport, err: Error) {
 	return
 }
 
-_session_file :: proc(s: ^Session) -> (file: ^os.File, err: Error) {
-	return s.impl.file, nil
+_session_file :: proc(session: ^Session) -> (file: ^os.File, err: Error) {
+	return session.impl.file, nil
 }
 
 _session_write :: proc(file: ^os.File, text: string) -> Error {
@@ -585,7 +585,8 @@ _session_write :: proc(file: ^os.File, text: string) -> Error {
 
 _session_atexit_restore :: proc "c" () {
 	// No-op after a normal close: the termios is already restored and the
-	// saved fd may have been reused by an unrelated file.
+	// saved fd may have been reused by an unrelated file. Best effort by
+	// contract: the process is exiting, so a failed restore changes nothing.
 	if atexit_active {
 		_ = posix.tcsetattr(atexit_fd, .TCSAFLUSH, &atexit_termios)
 	}

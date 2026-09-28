@@ -5,12 +5,12 @@ package input
 import "core:testing"
 
 _feed_events :: proc(t: ^testing.T, data: string, expected: []Event) {
-	p: Parser
-	parser_init(&p)
-	defer parser_destroy(&p)
+	parser: Parser
+	parser_init(&parser)
+	defer parser_destroy(&parser)
 	events: [dynamic]Event
 	defer events_destroy(&events)
-	err := feed(&p, transmute([]byte)data, &events)
+	err := feed(&parser, transmute([]byte)data, &events)
 	testing.expect(t, err == nil, "feed must not error")
 	testing.expect_value(t, len(events), len(expected))
 	for i in 0 ..< min(len(events), len(expected)) {
@@ -35,15 +35,15 @@ test_text_and_c0_keys :: proc(t: ^testing.T) {
 
 @(test)
 test_utf8_split_across_feeds :: proc(t: ^testing.T) {
-	p: Parser
-	parser_init(&p)
-	defer parser_destroy(&p)
+	parser: Parser
+	parser_init(&parser)
+	defer parser_destroy(&parser)
 	events: [dynamic]Event
 	defer events_destroy(&events)
 	// U+00E9 (e-acute) is 0xC3 0xA9, split across two feeds.
-	testing.expect(t, feed(&p, []u8{0xc3}, &events) == nil, "first half must not error")
+	testing.expect(t, feed(&parser, []u8{0xc3}, &events) == nil, "first half must not error")
 	testing.expect_value(t, len(events), 0)
-	testing.expect(t, feed(&p, []u8{0xa9}, &events) == nil, "second half must not error")
+	testing.expect(t, feed(&parser, []u8{0xa9}, &events) == nil, "second half must not error")
 	testing.expect_value(t, len(events), 1)
 	testing.expect_value(t, events[0], Event(Key_Event{code = .Character, character = rune(0xe9)}))
 }
@@ -61,15 +61,15 @@ test_modified_enter_sequences :: proc(t: ^testing.T) {
 
 @(test)
 test_lone_escape_resolves_on_deadline :: proc(t: ^testing.T) {
-	p: Parser
-	parser_init(&p)
-	defer parser_destroy(&p)
+	parser: Parser
+	parser_init(&parser)
+	defer parser_destroy(&parser)
 	events: [dynamic]Event
 	defer events_destroy(&events)
-	testing.expect(t, feed(&p, []u8{0x1b}, &events) == nil, "feed ESC must not error")
-	testing.expect(t, parser_escape_pending(&p), "parser must await the sequence byte")
+	testing.expect(t, feed(&parser, []u8{0x1b}, &events) == nil, "feed ESC must not error")
+	testing.expect(t, parser_escape_pending(&parser), "parser must await the sequence byte")
 	testing.expect_value(t, len(events), 0)
-	testing.expect(t, parser_resolve_escape(&p, &events) == nil, "resolve must not error")
+	testing.expect(t, parser_resolve_escape(&parser, &events) == nil, "resolve must not error")
 	testing.expect_value(t, len(events), 1)
 	testing.expect_value(t, events[0], Event(Key_Event{code = .Escape}))
 }
@@ -111,37 +111,37 @@ test_sgr_mouse_reports_decode :: proc(t: ^testing.T) {
 	// a report split across feeds waits for its final byte, and a malformed
 	// report (an empty field, a hover report from a mode this parser never
 	// enables) becomes Unknown_Input and resynchronizes.
-	p: Parser
-	parser_init(&p)
-	defer parser_destroy(&p)
+	parser: Parser
+	parser_init(&parser)
+	defer parser_destroy(&parser)
 	events: [dynamic]Event
 	defer events_destroy(&events)
 	partial := "\e[<0;1000;900"
-	testing.expect(t, feed(&p, transmute([]byte)partial, &events) == nil, "partial report must not error")
+	testing.expect(t, feed(&parser, transmute([]byte)partial, &events) == nil, "partial report must not error")
 	testing.expect_value(t, len(events), 0)
 	final := "M"
-	testing.expect(t, feed(&p, transmute([]byte)final, &events) == nil, "final must not error")
+	testing.expect(t, feed(&parser, transmute([]byte)final, &events) == nil, "final must not error")
 	testing.expect_value(t, len(events), 1)
 	testing.expect_value(t, events[0], Event(Mouse_Event{button = .Left, x = 1000, y = 900}))
 	events_clear(&events)
 	malformed := []string{"\e[<0;;1M", "\e[<35;1;1M"}
 	for data in malformed {
-		testing.expect(t, feed(&p, transmute([]byte)data, &events) == nil, "malformed report must not error")
+		testing.expect(t, feed(&parser, transmute([]byte)data, &events) == nil, "malformed report must not error")
 		testing.expect_value(t, len(events), 1)
 		testing.expect_value(t, events[0], Event(Unknown_Input{}))
 		events_clear(&events)
 	}
 	resync := "q"
-	testing.expect(t, feed(&p, transmute([]byte)resync, &events) == nil, "resync must not error")
+	testing.expect(t, feed(&parser, transmute([]byte)resync, &events) == nil, "resync must not error")
 	testing.expect_value(t, len(events), 1)
 	testing.expect_value(t, events[0], Event(Key_Event{code = .Character, character = 'q'}))
 }
 
 @(test)
 test_a_large_paste_arrives_whole :: proc(t: ^testing.T) {
-	p: Parser
-	parser_init(&p)
-	defer parser_destroy(&p)
+	parser: Parser
+	parser_init(&parser)
+	defer parser_destroy(&parser)
 	events: [dynamic]Event
 	defer events_destroy(&events)
 
@@ -154,9 +154,9 @@ test_a_large_paste_arrives_whole :: proc(t: ^testing.T) {
 
 	open_marker := "\e[200~"
 	close_and_key := "\e[201~q"
-	testing.expect(t, feed(&p, transmute([]byte)open_marker, &events) == nil, "open must not error")
-	testing.expect(t, feed(&p, body, &events) == nil, "content must not error")
-	testing.expect(t, feed(&p, transmute([]byte)close_and_key, &events) == nil, "close must not error")
+	testing.expect(t, feed(&parser, transmute([]byte)open_marker, &events) == nil, "open must not error")
+	testing.expect(t, feed(&parser, body, &events) == nil, "content must not error")
+	testing.expect(t, feed(&parser, transmute([]byte)close_and_key, &events) == nil, "close must not error")
 
 	testing.expect_value(t, len(events), 2)
 	paste, is_paste := events[0].(Paste)

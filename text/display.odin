@@ -25,57 +25,57 @@ Display_Status :: enum u8 {
 // Measurement, truncation, and drawing all run this traversal, so a string that
 // measures N columns also draws as N columns.
 Display_Iterator :: struct {
-	it:      Grapheme_Iterator,
-	profile: Width_Profile,
-	column:  int,
-	spaces:  int,
-	tab_end: int,
+	graphemes: Grapheme_Iterator,
+	profile:   Width_Profile,
+	column:    int,
+	spaces:    int,
+	tab_end:   int,
 }
 
 display_iterator_make :: proc(value: string, profile: Width_Profile = DEFAULT_WIDTH_PROFILE) -> Display_Iterator {
-	return {it = grapheme_iterator_make(value), profile = profile}
+	return {graphemes = grapheme_iterator_make(value), profile = profile}
 }
 
 // display_next returns the next drawable cluster and advances the running
 // column. A tab yields one space per cell, so callers only see widths 1 and 2.
-display_next :: proc(it: ^Display_Iterator) -> (cluster: Display_Cluster, status: Display_Status) {
-	if it.spaces > 0 {
-		it.spaces -= 1
-		it.column += 1
-		return {text = " ", width = 1, end = it.tab_end}, .OK
+display_next :: proc(iterator: ^Display_Iterator) -> (cluster: Display_Cluster, status: Display_Status) {
+	if iterator.spaces > 0 {
+		iterator.spaces -= 1
+		iterator.column += 1
+		return {text = " ", width = 1, end = iterator.tab_end}, .OK
 	}
 	for {
-		_, grapheme, ok := grapheme_iterate(&it.it)
+		_, grapheme, ok := grapheme_iterate(&iterator.graphemes)
 		if !ok {
 			return {}, .Done
 		}
 		if !utf8.valid_string(grapheme.text) {
 			return {}, .Invalid_Text
 		}
-		r, _ := utf8.decode_rune(grapheme.text)
+		code_point, _ := utf8.decode_rune(grapheme.text)
 		end := grapheme.byte_index + len(grapheme.text)
 		switch {
-		case r == '\n' || r == '\r':
+		case code_point == '\n' || code_point == '\r':
 			return {}, .Invalid_Text
-		case r == '\t':
-			if it.profile.tab_width <= 0 {
+		case code_point == '\t':
+			if iterator.profile.tab_width <= 0 {
 				continue
 			}
-			it.tab_end = end
-			it.spaces = it.profile.tab_width - (it.column % it.profile.tab_width) - 1
-			it.column += 1
+			iterator.tab_end = end
+			iterator.spaces = iterator.profile.tab_width - (iterator.column % iterator.profile.tab_width) - 1
+			iterator.column += 1
 			return {text = " ", width = 1, end = end}, .OK
 		case grapheme.width == 0:
-			if it.profile.invalid_text == .Reject {
+			if iterator.profile.invalid_text == .Reject {
 				return {}, .Invalid_Text
 			}
 			continue
 		case:
 			width := grapheme.width
-			if width == 1 && it.profile.emoji == .Wide && _has_emoji_presentation(grapheme.text) {
+			if width == 1 && iterator.profile.emoji == .Wide && _has_emoji_presentation(grapheme.text) {
 				width = 2
 			}
-			it.column += width
+			iterator.column += width
 			return {text = grapheme.text, width = width, end = end}, .OK
 		}
 	}
@@ -108,12 +108,12 @@ cluster_width :: proc(grapheme: string, profile: Width_Profile = DEFAULT_WIDTH_P
 	if grapheme == "" {
 		return 0
 	}
-	it := display_iterator_make(grapheme, profile)
-	cluster, status := display_next(&it)
+	iterator := display_iterator_make(grapheme, profile)
+	cluster, status := display_next(&iterator)
 	if status != .OK || cluster.text != grapheme || cluster.end != len(grapheme) {
 		return -1
 	}
-	if _, next := display_next(&it); next != .Done {
+	if _, next := display_next(&iterator); next != .Done {
 		return -1
 	}
 	return cluster.width
@@ -123,8 +123,8 @@ cluster_width :: proc(grapheme: string, profile: Width_Profile = DEFAULT_WIDTH_P
 // SELECTOR-16. U+FE0E requests text presentation and does not widen.
 _has_emoji_presentation :: proc(value: string) -> bool {
 	for i := 0; i < len(value); {
-		r, size := utf8.decode_rune(value[i:])
-		if r == 0xFE0F {
+		code_point, size := utf8.decode_rune(value[i:])
+		if code_point == 0xFE0F {
 			return true
 		}
 		i += size

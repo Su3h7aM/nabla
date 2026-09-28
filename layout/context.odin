@@ -187,19 +187,16 @@ _Context_State :: struct {
 }
 
 /*
-Context owns the state for one independent layout instance.
+Context is a frame-local solver handle over storage owned by the caller, for
+one independent layout instance.
 
-Its zero value is ready for `init` or `init_from_buffer`. Do not copy a Context after
-successful initialization. Call `destroy` when finished; it frees only storage
-allocated by `init`, never storage supplied to `init_from_buffer`.
+Its zero value is ready for `init` or `init_from_buffer`. Do not copy a Context
+after successful initialization. `init` allocates the storage and frees it in
+`destroy`; `init_from_buffer` borrows the storage slice passed to it and never
+frees it. In either case the caller must keep the backing storage alive and at
+stable addresses until the context is discarded or initialized again. The
+context does not resize, reallocate, or share its storage.
 */
-// Context is a frame-local solver handle over storage owned by the caller.
-//
-// `init` allocates the storage and frees it in `destroy`; `init_from_buffer` borrows
-// the storage slice passed to it and never frees it. In either case the caller
-// must keep the backing storage alive and at stable addresses until the context
-// is discarded or initialized again. The context does not resize, reallocate,
-// or share its storage.
 Context :: struct {
 	_state: _Context_State,
 }
@@ -569,15 +566,17 @@ init :: proc(ctx: ^Context, config: Options, allocator := context.allocator) -> 
 	if size == 0 {
 		return .Invalid_Options
 	}
-	storage, alloc_err := mem.alloc_bytes(size, storage_alignment(), allocator)
-	if alloc_err != nil || len(storage) != size {
+	storage, allocation_error := mem.alloc_bytes(size, storage_alignment(), allocator)
+	if allocation_error != nil || len(storage) != size {
 		if len(storage) > 0 {
+			// Releasing an abandoned block; the reported failure is unchanged.
 			_ = mem.free_bytes(storage, allocator)
 		}
-		return alloc_err if alloc_err != nil else runtime.Allocator_Error.Out_Of_Memory
+		return allocation_error if allocation_error != nil else runtime.Allocator_Error.Out_Of_Memory
 	}
 	err := _init_with_storage(ctx, config, storage, allocator, true)
 	if err != nil {
+		// Releasing the abandoned block; the reported failure is unchanged.
 		_ = mem.free_bytes(storage, allocator)
 	}
 	return err
@@ -670,12 +669,13 @@ reserve :: proc(ctx: ^Context, capacities: Capacities) -> Context_Error {
 		return .Invalid_Options
 	}
 
-	storage, alloc_err := mem.alloc_bytes(size, storage_alignment(), state._allocator)
-	if alloc_err != nil || len(storage) != size {
+	storage, allocation_error := mem.alloc_bytes(size, storage_alignment(), state._allocator)
+	if allocation_error != nil || len(storage) != size {
 		if len(storage) > 0 {
+			// Releasing an abandoned block; the reported failure is unchanged.
 			_ = mem.free_bytes(storage, state._allocator)
 		}
-		return alloc_err if alloc_err != nil else runtime.Allocator_Error.Out_Of_Memory
+		return allocation_error if allocation_error != nil else runtime.Allocator_Error.Out_Of_Memory
 	}
 
 	// Build the replacement beside the live context so a failure here cannot
@@ -683,6 +683,7 @@ reserve :: proc(ctx: ^Context, capacities: Capacities) -> Context_Error {
 	grown: Context
 	err := _init_with_storage(&grown, config, storage, state._allocator, true)
 	if err != nil {
+		// Releasing the abandoned block; the reported failure is unchanged.
 		_ = mem.free_bytes(storage, state._allocator)
 		return err
 	}
@@ -692,6 +693,8 @@ reserve :: proc(ctx: ^Context, capacities: Capacities) -> Context_Error {
 	grown_state._generation = state._generation
 	grown_state._statistics = state._statistics
 
+	// The replacement is complete, so a failed free of the replaced storage
+	// changes no published state.
 	_ = mem.free_bytes(state._storage, state._allocator)
 	ctx^ = grown
 	return nil
@@ -757,6 +760,7 @@ destroy :: proc(ctx: ^Context) {
 		return
 	}
 	if state._owns_storage {
+		// destroy reports nothing; a failed free changes no outcome.
 		_ = mem.free_bytes(state._storage, state._allocator)
 	}
 	ctx^ = {}

@@ -29,18 +29,18 @@ import "core:unicode/utf8"
 
 @(require_results)
 encoded_size :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor) -> (required: int, err: Error) {
-	if v_err := _validate_frame(buffer, cursor); v_err != nil {
-		return 0, v_err
+	if validation_error := _validate_frame(buffer, cursor); validation_error != nil {
+		return 0, validation_error
 	}
 	if buffer.columns == 0 || buffer.rows == 0 {
 		// Zero-sized frame: deterministic no-op success.
 		return 0, nil
 	}
-	e := _Encoder {
+	encoder := _Encoder {
 		count_only = true,
 	}
-	_serialize(&e, buffer, profile, cursor)
-	return e.pos, nil
+	_serialize(&encoder, buffer, profile, cursor)
+	return encoder.pos, nil
 }
 
 // encode serializes the frame into caller-owned output. It returns written
@@ -50,29 +50,29 @@ encoded_size :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Curs
 // never guessing.
 @(require_results)
 encode :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor, output: []byte) -> (written: int, required: int, err: Error) {
-	if v_err := _validate_frame(buffer, cursor); v_err != nil {
-		return 0, 0, v_err
+	if validation_error := _validate_frame(buffer, cursor); validation_error != nil {
+		return 0, 0, validation_error
 	}
 	if buffer.columns == 0 || buffer.rows == 0 {
 		return 0, 0, nil
 	}
-	e := _Encoder {
+	encoder := _Encoder {
 		count_only = true,
 	}
-	_serialize(&e, buffer, profile, cursor)
-	required = e.pos
+	_serialize(&encoder, buffer, profile, cursor)
+	required = encoder.pos
 	if required > len(output) {
 		return 0, required, General_Error.Presentation_Workspace_Too_Small
 	}
-	w := _Encoder {
+	writer := _Encoder {
 		out = output,
 	}
-	_serialize(&w, buffer, profile, cursor)
-	if w.overflowed {
+	_serialize(&writer, buffer, profile, cursor)
+	if writer.overflowed {
 		// Unreachable: the count pass just produced the exact size.
 		return 0, required, General_Error.Presentation_Workspace_Too_Small
 	}
-	return w.pos, required, nil
+	return writer.pos, required, nil
 }
 
 // present performs the same preflight as encode and never touches the
@@ -94,25 +94,25 @@ present :: proc(
 	if session == nil || !session.opened {
 		return 0, 0, General_Error.Not_Open
 	}
-	if v_err := _validate_frame(buffer, cursor); v_err != nil {
-		return 0, 0, v_err
+	if validation_error := _validate_frame(buffer, cursor); validation_error != nil {
+		return 0, 0, validation_error
 	}
 	if buffer.columns == 0 || buffer.rows == 0 {
 		return 0, 0, nil
 	}
-	e := _Encoder {
+	encoder := _Encoder {
 		count_only = true,
 	}
-	_serialize(&e, buffer, profile, cursor)
-	required = e.pos
+	_serialize(&encoder, buffer, profile, cursor)
+	required = encoder.pos
 	if required > len(output) {
 		return 0, required, General_Error.Presentation_Workspace_Too_Small
 	}
-	w := _Encoder {
+	writer := _Encoder {
 		out = output,
 	}
-	_serialize(&w, buffer, profile, cursor)
-	if w.overflowed {
+	_serialize(&writer, buffer, profile, cursor)
+	if writer.overflowed {
 		return 0, required, General_Error.Presentation_Workspace_Too_Small
 	}
 	committed_bytes, write_err := _session_present(session, output[:required])
@@ -188,8 +188,8 @@ _grapheme_safe :: proc(grapheme: string) -> bool {
 		return false
 	}
 	for i := 0; i < len(grapheme); {
-		r, width := utf8.decode_rune(grapheme[i:])
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+		code_point, width := utf8.decode_rune(grapheme[i:])
+		if code_point < 0x20 || code_point == 0x7f || (code_point >= 0x80 && code_point <= 0x9f) {
 			return false
 		}
 		i += width
@@ -207,54 +207,54 @@ _Encoder :: struct {
 	overflowed: bool,
 }
 
-_enc_write :: proc(e: ^_Encoder, bytes: []byte) {
-	if e.count_only {
-		e.pos += len(bytes)
+_encoder_write :: proc(encoder: ^_Encoder, bytes: []byte) {
+	if encoder.count_only {
+		encoder.pos += len(bytes)
 		return
 	}
-	if e.pos + len(bytes) > len(e.out) {
+	if encoder.pos + len(bytes) > len(encoder.out) {
 		// Defensive: callers preflight with the count pass, so this is
 		// unreachable in normal operation.
-		e.overflowed = true
+		encoder.overflowed = true
 		return
 	}
-	copy(e.out[e.pos:], bytes)
-	e.pos += len(bytes)
+	copy(encoder.out[encoder.pos:], bytes)
+	encoder.pos += len(bytes)
 }
 
-_enc_str :: proc(e: ^_Encoder, s: string) {
-	_enc_write(e, transmute([]byte)s)
+_encoder_write_text :: proc(encoder: ^_Encoder, text: string) {
+	_encoder_write(encoder, transmute([]byte)text)
 }
 
-_enc_byte :: proc(e: ^_Encoder, b: u8) {
-	one := [1]u8{b}
-	_enc_write(e, one[:])
+_encoder_write_byte :: proc(encoder: ^_Encoder, value: u8) {
+	one := [1]u8{value}
+	_encoder_write(encoder, one[:])
 }
 
-// _enc_uint writes the decimal form of a nonnegative value. The parameter is
+// _encoder_write_uint writes the decimal form of a nonnegative value. The parameter is
 // u64 so the complete nonnegative int domain is representable (a CUP
 // coordinate of max(int) needs the +1 computed in the unsigned domain, where
 // max(int) + 1 == 2^63 fits). Callers validate nonnegativity before
 // encoding; a negative int passed through is a caller bug, not this proc's
 // contract.
-_enc_uint :: proc(e: ^_Encoder, v: u64) {
+_encoder_write_uint :: proc(encoder: ^_Encoder, value: u64) {
 	// Decimal digits for the complete u64 domain: max(u64) is 20 digits, so
 	// size_of(u64) * 3 bytes is always enough.
 	digits: [size_of(u64) * 3]u8
-	n := 0
-	if v == 0 {
-		_enc_byte(e, '0')
+	digit_count := 0
+	if value == 0 {
+		_encoder_write_byte(encoder, '0')
 		return
 	}
-	value := v
-	for value > 0 {
-		digits[n] = u8('0' + value % 10)
-		value /= 10
-		n += 1
+	remaining := value
+	for remaining > 0 {
+		digits[digit_count] = u8('0' + remaining % 10)
+		remaining /= 10
+		digit_count += 1
 	}
-	for n > 0 {
-		n -= 1
-		_enc_byte(e, digits[n])
+	for digit_count > 0 {
+		digit_count -= 1
+		_encoder_write_byte(encoder, digits[digit_count])
 	}
 }
 
@@ -262,80 +262,80 @@ _enc_uint :: proc(e: ^_Encoder, v: u64) {
 // sequences come from core:terminal/ansi; the numeric ones (SGR parameters,
 // CUP coordinates) are composed here because the encoder owns their exact
 // byte layout.
-_serialize :: proc(e: ^_Encoder, buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor) {
+_serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor) {
 	// Baseline: cursor origin + explicit base style. The frame overwrites the
 	// viewport without a preliminary clear (framework contract); the
 	// unconditional SGR reset prevents stale attributes from a previous frame.
-	_enc_str(e, ansi.CSI + ansi.CUP + ansi.CSI + ansi.SGR)
+	_encoder_write_text(encoder, ansi.CSI + ansi.CUP + ansi.CSI + ansi.SGR)
 	previous_style: Style
 
 	for y in 0 ..< buffer.rows {
 		// Per-row cursor positioning. CUP does not reset SGR attributes, so
 		// the diff carries the previous row's last style into the next row —
 		// a default cell after a styled row end emits its own reset.
-		_enc_str(e, ansi.CSI)
-		_enc_uint(e, u64(y) + 1)
-		_enc_str(e, ";1" + ansi.CUP)
+		_encoder_write_text(encoder, ansi.CSI)
+		_encoder_write_uint(encoder, u64(y) + 1)
+		_encoder_write_text(encoder, ";1" + ansi.CUP)
 
 		for x in 0 ..< buffer.columns {
-			idx := y * buffer.columns + x
-			_enc_cell(e, buffer.cells[idx], &previous_style, profile.color_depth)
+			index := y * buffer.columns + x
+			_encoder_write_cell(encoder, buffer.cells[index], &previous_style, profile.color_depth)
 		}
 	}
 
 	// Position first, then visibility: showing after the move keeps a
 	// terminal from rendering a frame at the stale position.
 	if cursor.placed {
-		_enc_str(e, ansi.CSI)
-		_enc_uint(e, u64(cursor.position.y) + 1)
-		_enc_str(e, ";")
-		_enc_uint(e, u64(cursor.position.x) + 1)
-		_enc_str(e, ansi.CUP)
+		_encoder_write_text(encoder, ansi.CSI)
+		_encoder_write_uint(encoder, u64(cursor.position.y) + 1)
+		_encoder_write_text(encoder, ";")
+		_encoder_write_uint(encoder, u64(cursor.position.x) + 1)
+		_encoder_write_text(encoder, ansi.CUP)
 	}
 	if cursor.visible {
-		_enc_str(e, ansi.CSI + ansi.DECTCEM_SHOW)
+		_encoder_write_text(encoder, ansi.CSI + ansi.DECTCEM_SHOW)
 	} else {
-		_enc_str(e, ansi.CSI + ansi.DECTCEM_HIDE)
+		_encoder_write_text(encoder, ansi.CSI + ansi.DECTCEM_HIDE)
 	}
 
 	// Restore the base style at the end of the frame (baseline contract).
-	_enc_str(e, ansi.CSI + ansi.SGR)
+	_encoder_write_text(encoder, ansi.CSI + ansi.SGR)
 }
 
-_enc_cell :: proc(e: ^_Encoder, cell: Cell, previous: ^Style, depth: Color_Depth) {
-	_enc_style_diff(e, previous^, cell.style, depth)
+_encoder_write_cell :: proc(encoder: ^_Encoder, cell: Cell, previous: ^Style, depth: Color_Depth) {
+	_encoder_style_diff(encoder, previous^, cell.style, depth)
 	previous^ = cell.style
-	_enc_str(e, cell.grapheme)
+	_encoder_write_text(encoder, cell.grapheme)
 }
 
-// _enc_style_establish resets to the base rendition and applies `style` from
+// _encoder_style_establish resets to the base rendition and applies `style` from
 // scratch. It is called on every style change.
-_enc_style_establish :: proc(e: ^_Encoder, style: Style, depth: Color_Depth) {
-	_enc_str(e, ansi.CSI + ansi.SGR)
+_encoder_style_establish :: proc(encoder: ^_Encoder, style: Style, depth: Color_Depth) {
+	_encoder_write_text(encoder, ansi.CSI + ansi.SGR)
 	if style != (Style{}) {
-		for mod in Modifier {
-			if mod in style.modifiers {
-				_enc_str(e, ansi.CSI)
-				_enc_uint(e, u64(_modifier_sgr(mod)))
-				_enc_str(e, ansi.SGR)
+		for modifier in Modifier {
+			if modifier in style.modifiers {
+				_encoder_write_text(encoder, ansi.CSI)
+				_encoder_write_uint(encoder, u64(_modifier_sgr(modifier)))
+				_encoder_write_text(encoder, ansi.SGR)
 			}
 		}
-		_enc_color(e, 38, style.foreground, depth)
-		_enc_color(e, 48, style.background, depth)
+		_encoder_write_color(encoder, 38, style.foreground, depth)
+		_encoder_write_color(encoder, 48, style.background, depth)
 	}
 }
 
-_enc_style_diff :: proc(e: ^_Encoder, prev, next: Style, depth: Color_Depth) {
+_encoder_style_diff :: proc(encoder: ^_Encoder, previous_style, next_style: Style, depth: Color_Depth) {
 	// SGR diff: the whole style is emitted only when it changes. The
 	// baseline \e[m already reset at frame start, so an unchanged style
 	// needs nothing — a style run is one SGR group, not one per cell.
-	if prev != next {
-		_enc_style_establish(e, next, depth)
+	if previous_style != next_style {
+		_encoder_style_establish(encoder, next_style, depth)
 	}
 }
 
-_modifier_sgr :: proc(mod: Modifier) -> u8 {
-	switch mod {
+_modifier_sgr :: proc(modifier: Modifier) -> u8 {
+	switch modifier {
 	case .Bold:
 		return 1
 	case .Dim:
@@ -352,64 +352,64 @@ _modifier_sgr :: proc(mod: Modifier) -> u8 {
 	return 0
 }
 
-_enc_color :: proc(e: ^_Encoder, prefix: u8, color: Color, depth: Color_Depth) {
+_encoder_write_color :: proc(encoder: ^_Encoder, prefix: u8, color: Color, depth: Color_Depth) {
 	// Depth reduction is deterministic: TrueColor as authored, 256 via the
 	// xterm cube, 16/8 via the nearest ANSI entry, None drops colors.
 	if depth == .None {
 		return
 	}
-	switch c in color {
+	switch color_value in color {
 	case Default_Color:
 	// No-op: the SGR reset already set defaults.
 	case Indexed_Color:
-		index := u8(c)
+		index := u8(color_value)
 		switch depth {
 		case .True_Color, .Eight_Bit:
-			_enc_str(e, ansi.CSI)
-			_enc_uint(e, u64(prefix))
-			_enc_str(e, ";5;")
-			_enc_uint(e, u64(index))
-			_enc_str(e, ansi.SGR)
+			_encoder_write_text(encoder, ansi.CSI)
+			_encoder_write_uint(encoder, u64(prefix))
+			_encoder_write_text(encoder, ";5;")
+			_encoder_write_uint(encoder, u64(index))
+			_encoder_write_text(encoder, ansi.SGR)
 		case .Four_Bit:
 			// Decode the xterm-256 index (ANSI/cube/grayscale) to RGB, then
 			// reduce to the nearest 16-color entry — never a modulo wrap
 			// (xterm 196 is red, not blue).
-			_enc_str(e, ansi.CSI)
-			_enc_uint(e, u64(_ansi_4bit(prefix, _nearest_ansi(_xterm_256_to_rgb(index), 16))))
-			_enc_str(e, ansi.SGR)
+			_encoder_write_text(encoder, ansi.CSI)
+			_encoder_write_uint(encoder, u64(_ansi_4bit(prefix, _nearest_ansi(_xterm_256_to_rgb(index), 16))))
+			_encoder_write_text(encoder, ansi.SGR)
 		case .Three_Bit:
-			_enc_str(e, ansi.CSI)
-			_enc_uint(e, u64(_ansi_4bit(prefix, _nearest_ansi(_xterm_256_to_rgb(index), 8))))
-			_enc_str(e, ansi.SGR)
+			_encoder_write_text(encoder, ansi.CSI)
+			_encoder_write_uint(encoder, u64(_ansi_4bit(prefix, _nearest_ansi(_xterm_256_to_rgb(index), 8))))
+			_encoder_write_text(encoder, ansi.SGR)
 		case .None:
 			unreachable()
 		}
 	case RGB_Color:
 		switch depth {
 		case .True_Color:
-			_enc_str(e, ansi.CSI)
-			_enc_uint(e, u64(prefix))
-			_enc_str(e, ";2;")
-			_enc_uint(e, u64(c[0]))
-			_enc_str(e, ";")
-			_enc_uint(e, u64(c[1]))
-			_enc_str(e, ";")
-			_enc_uint(e, u64(c[2]))
-			_enc_str(e, ansi.SGR)
+			_encoder_write_text(encoder, ansi.CSI)
+			_encoder_write_uint(encoder, u64(prefix))
+			_encoder_write_text(encoder, ";2;")
+			_encoder_write_uint(encoder, u64(color_value[0]))
+			_encoder_write_text(encoder, ";")
+			_encoder_write_uint(encoder, u64(color_value[1]))
+			_encoder_write_text(encoder, ";")
+			_encoder_write_uint(encoder, u64(color_value[2]))
+			_encoder_write_text(encoder, ansi.SGR)
 		case .Eight_Bit:
-			_enc_str(e, ansi.CSI)
-			_enc_uint(e, u64(prefix))
-			_enc_str(e, ";5;")
-			_enc_uint(e, u64(_rgb_to_256(c)))
-			_enc_str(e, ansi.SGR)
+			_encoder_write_text(encoder, ansi.CSI)
+			_encoder_write_uint(encoder, u64(prefix))
+			_encoder_write_text(encoder, ";5;")
+			_encoder_write_uint(encoder, u64(_rgb_to_256(color_value)))
+			_encoder_write_text(encoder, ansi.SGR)
 		case .Four_Bit:
-			_enc_str(e, ansi.CSI)
-			_enc_uint(e, u64(_ansi_4bit(prefix, _nearest_ansi(c, 16))))
-			_enc_str(e, ansi.SGR)
+			_encoder_write_text(encoder, ansi.CSI)
+			_encoder_write_uint(encoder, u64(_ansi_4bit(prefix, _nearest_ansi(color_value, 16))))
+			_encoder_write_text(encoder, ansi.SGR)
 		case .Three_Bit:
-			_enc_str(e, ansi.CSI)
-			_enc_uint(e, u64(_ansi_4bit(prefix, _nearest_ansi(c, 8))))
-			_enc_str(e, ansi.SGR)
+			_encoder_write_text(encoder, ansi.CSI)
+			_encoder_write_uint(encoder, u64(_ansi_4bit(prefix, _nearest_ansi(color_value, 8))))
+			_encoder_write_text(encoder, ansi.SGR)
 		case .None:
 			unreachable()
 		}

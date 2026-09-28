@@ -28,12 +28,12 @@ radius_all :: proc "contextless" (value: Scalar) -> Radius {
 	return Radius{tl = value, tr = value, br = value, bl = value}
 }
 
-rgb :: proc "contextless" (r, g, b: u8) -> Color {
-	return Color{r, g, b, 255}
+rgb :: proc "contextless" (red, green, blue: u8) -> Color {
+	return Color{red, green, blue, 255}
 }
 
-rgba :: proc "contextless" (r, g, b, a: u8) -> Color {
-	return Color{r, g, b, a}
+rgba :: proc "contextless" (red, green, blue, alpha: u8) -> Color {
+	return Color{red, green, blue, alpha}
 }
 
 gray :: proc "contextless" (value: u8, alpha: u8 = 255) -> Color {
@@ -49,9 +49,9 @@ with_alpha :: proc "contextless" (color: Color, alpha: u8) -> Color {
 }
 
 /*
-Linearly interpolate between two colors, `t == 0` returning `from` and `t == 1`
-returning `to`. `t` outside `[0, 1]` extrapolates rather than clamping, matching
-`math.lerp`.
+Linearly interpolate between two colors, `amount == 0` returning `from` and
+`amount == 1` returning `to`. An `amount` outside `[0, 1]` extrapolates rather
+than clamping, matching `math.lerp`.
 
 This is the building block for a hover or pressed style: the application blends
 toward a target color using `hovered`, rather than the library owning a
@@ -59,10 +59,10 @@ subtree-wide tint the way Clay's `overlayColor` does. Keeping the blend a pure
 function here, instead of a second paint pass in the core, keeps command
 emission a single deterministic walk.
 */
-mix :: proc(from, to: Color, t: Scalar) -> Color {
-	blend := proc(from, to: u8, t: Scalar) -> u8 {
-		value := f32(from) + (f32(to) - f32(from)) * f32(t)
+mix :: proc(from, to: Color, amount: Scalar) -> Color {
+	blend := proc(from, to: u8, amount: Scalar) -> u8 {
+		value := f32(from) + (f32(to) - f32(from)) * f32(amount)
 		return u8(clamp(value, 0, 255))
 	}
-	return Color{blend(from.r, to.r, t), blend(from.g, to.g, t), blend(from.b, to.b, t), blend(from.a, to.a, t)}
+	return Color{blend(from.r, to.r, amount), blend(from.g, to.g, amount), blend(from.b, to.b, amount), blend(from.a, to.a, amount)}
 }

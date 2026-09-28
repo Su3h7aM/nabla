@@ -59,11 +59,11 @@ input_insert :: proc(input: ^Input, value: string) -> bool {
 	if kept == 0 {
 		return true
 	}
-	old := len(input.text)
-	if err := resize(&input.text, old + kept); err != nil {
+	previous_length := len(input.text)
+	if err := resize(&input.text, previous_length + kept); err != nil {
 		return false
 	}
-	copy(input.text[input.cursor + kept:], input.text[input.cursor:old])
+	copy(input.text[input.cursor + kept:], input.text[input.cursor:previous_length])
 	written := 0
 	for byte in transmute([]byte)value {
 		if _input_skip(byte) {
@@ -82,9 +82,11 @@ input_insert_rune :: proc(input: ^Input, value: rune) -> bool {
 }
 
 input_insert_newline :: proc(input: ^Input) -> bool {
-	old := len(input.text)
-	if err := resize(&input.text, old + 1); err != nil { return false }
-	copy(input.text[input.cursor + 1:], input.text[input.cursor:old])
+	previous_length := len(input.text)
+	if err := resize(&input.text, previous_length + 1); err != nil {
+		return false
+	}
+	copy(input.text[input.cursor + 1:], input.text[input.cursor:previous_length])
 	input.text[input.cursor] = '\n'
 	input.cursor += 1
 	return true
@@ -156,22 +158,30 @@ input_lines :: proc(input: ^Input, width: int, profile: text.Width_Profile = tex
 		relative_end := strings.index(rest, "\n")
 		logical_end := len(value)
 		has_newline := relative_end >= 0
-		if has_newline { logical_end = start + relative_end }
+		if has_newline {
+			logical_end = start + relative_end
+		}
 		if start == logical_end {
 			append(&lines, Input_Line{text = "", start = start, end = start})
 		} else {
-			at := start
-			for at < logical_end {
-				piece := text.truncate_text(value[at:logical_end], width, profile)
-				end := at + len(piece)
-				if end == at { end = text.next_grapheme_offset(value, at) }
-				append(&lines, Input_Line{text = value[at:end], start = at, end = end})
-				at = end
+			offset := start
+			for offset < logical_end {
+				piece := text.truncate_text(value[offset:logical_end], width, profile)
+				end := offset + len(piece)
+				if end == offset {
+					end = text.next_grapheme_offset(value, offset)
+				}
+				append(&lines, Input_Line{text = value[offset:end], start = offset, end = end})
+				offset = end
 			}
 		}
-		if !has_newline { break }
+		if !has_newline {
+			break
+		}
 		start = logical_end + 1
-		if start > len(value) { break }
+		if start > len(value) {
+			break
+		}
 	}
 	return lines
 }
@@ -181,7 +191,9 @@ input_cursor_row :: proc(input: ^Input, lines: []Input_Line) -> int {
 	cursor := input_cursor(input)
 	row := 0
 	for line, index in lines {
-		if cursor >= line.start && cursor <= line.end { row = index }
+		if cursor >= line.start && cursor <= line.end {
+			row = index
+		}
 	}
 	return row
 }
@@ -202,7 +214,9 @@ _input_move_row :: proc(input: ^Input, delta, width: int, profile: text.Width_Pr
 	lines := input_lines(input, width, profile)
 	row := input_cursor_row(input, lines[:])
 	target := row + delta
-	if target < 0 || target >= len(lines) { return false }
+	if target < 0 || target >= len(lines) {
+		return false
+	}
 	column := text.text_columns(input_text(input)[lines[row].start:input.cursor], profile)
 	input.cursor = _input_row_offset(lines[target], column, profile)
 	return true
@@ -212,13 +226,15 @@ _input_move_row :: proc(input: ^Input, delta, width: int, profile: text.Width_Pr
 // `column` from the left.
 @(private)
 _input_row_offset :: proc(line: Input_Line, column: int, profile: text.Width_Profile) -> int {
-	at := 0
-	for at < len(line.text) {
-		next := text.next_grapheme_offset(line.text, at)
-		if text.text_columns(line.text[:next], profile) > column { break }
-		at = next
+	offset := 0
+	for offset < len(line.text) {
+		next := text.next_grapheme_offset(line.text, offset)
+		if text.text_columns(line.text[:next], profile) > column {
+			break
+		}
+		offset = next
 	}
-	return line.start + at
+	return line.start + offset
 }
 
 // draw_input draws the text into rect, wrapping at the rect's width and

@@ -270,12 +270,16 @@ _element_pop :: proc(ctx: ^Context) {
 
 @(private)
 _element_leave :: proc(ctx: ^Context, desc: Element_Desc, loc: runtime.Source_Code_Location, entered: bool) {
-	if entered { _element_pop(ctx) }
+	if entered {
+		_element_pop(ctx)
+	}
 }
 
 @(private)
 _element_node_leave :: proc(ctx: ^Context, desc: Element_Node_Desc, loc: runtime.Source_Code_Location, entered: bool) {
-	if entered { _element_pop(ctx) }
+	if entered {
+		_element_pop(ctx)
+	}
 }
 
 // current_node returns the active layout node. The frame root is handle zero.

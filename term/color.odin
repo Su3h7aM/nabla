@@ -24,11 +24,11 @@ ANSI_16 :: [16][3]u8 {
 
 // _rgb_to_256 maps an RGB triple to the nearest xterm-256 cube entry (the
 // 6x6x6 color cube; the grayscale ramp is not approximated).
-_rgb_to_256 :: proc(c: RGB_Color) -> u8 {
-	step :: proc(v: u8) -> int {
-		return (int(v) * 5 + 127) / 255
+_rgb_to_256 :: proc(color: RGB_Color) -> u8 {
+	step :: proc(channel: u8) -> int {
+		return (int(channel) * 5 + 127) / 255
 	}
-	return u8(16 + 36 * step(c[0]) + 6 * step(c[1]) + step(c[2]))
+	return u8(16 + 36 * step(color[0]) + 6 * step(color[1]) + step(color[2]))
 }
 
 // _xterm_256_to_rgb decodes an xterm-256 palette index to its RGB triple:
@@ -41,11 +41,11 @@ _xterm_256_to_rgb :: proc(index: u8) -> RGB_Color {
 		return RGB_Color(palette[index])
 	case index < 232:
 		cube := int(index) - 16
-		level :: proc(v: int) -> u8 {
-			if v == 0 {
+		level :: proc(cube_index: int) -> u8 {
+			if cube_index == 0 {
 				return 0
 			}
-			return u8(55 + v * 40)
+			return u8(55 + cube_index * 40)
 		}
 		return RGB_Color{level(cube / 36), level((cube % 36) / 6), level(cube % 6)}
 	case:
@@ -56,15 +56,15 @@ _xterm_256_to_rgb :: proc(index: u8) -> RGB_Color {
 
 // _nearest_ansi maps an RGB triple to the nearest of the first count ANSI
 // colors (8 = basic, 16 = basic + bright), by squared distance.
-_nearest_ansi :: proc(c: RGB_Color, count: int) -> u8 {
+_nearest_ansi :: proc(color: RGB_Color, count: int) -> u8 {
 	palette := ANSI_16
 	best := u8(0)
 	best_distance := max(int)
 	for i in 0 ..< count {
-		dr := int(c[0]) - int(palette[i][0])
-		dg := int(c[1]) - int(palette[i][1])
-		db := int(c[2]) - int(palette[i][2])
-		distance := dr * dr + dg * dg + db * db
+		red_delta := int(color[0]) - int(palette[i][0])
+		green_delta := int(color[1]) - int(palette[i][1])
+		blue_delta := int(color[2]) - int(palette[i][2])
+		distance := red_delta * red_delta + green_delta * green_delta + blue_delta * blue_delta
 		if distance < best_distance {
 			best_distance = distance
 			best = u8(i)

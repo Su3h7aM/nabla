@@ -16,7 +16,7 @@
 //  1. ordinary  — a representative tree: root column, fixed header/footer, a
 //     body row with a fixed-width sidebar and a grow main column of rows.
 //     Exercises fixed/grow distribution in the common, non-saturating shape.
-//  2. grow-linear — a single row of `n` Grow children whose max is effectively
+//  2. grow-linear — a single row of `node_count` Grow children whose max is effectively
 //     unbounded: `_grow_children` completes in one pass. Linear control.
 //  3. grow-saturating — the same row, but each child's max comes from the
 //     constant-gap recurrence, which forces `_grow_children` into repeated
@@ -51,7 +51,7 @@ when #config(BENCH, false) {
 
 	Bench_Point :: struct {
 		label:      string,
-		n:          int,
+		node_count: int,
 		frames:     int,
 		sim_passes: int, // simulation-predicted _grow_children passes (saturating/adversarial only)
 		mean_us:    f64, // mean per-frame microseconds across repeats
@@ -63,7 +63,7 @@ when #config(BENCH, false) {
 	// Bench run parameters — set by the driver before each measurement. Package
 	// procs (no closures in Odin) read these.
 	@(private)
-	_bench_n: int
+	_bench_nodes: int
 	@(private)
 	_bench_height: Scalar
 	@(private)
@@ -74,20 +74,20 @@ when #config(BENCH, false) {
 	_bench_sim_passes: int
 
 	@(private)
-	_bench_config :: proc(n: int) -> Options {
+	_bench_config :: proc(node_count: int) -> Options {
 		return Options {
 			capacities = {
-				nodes = n + 8,
-				children = n + 8,
+				nodes = node_count + 8,
+				children = node_count + 8,
 				clips = 16,
-				commands = n + 8,
+				commands = node_count + 8,
 				text_lines = 16,
 				measured_words = 64,
 				overlays = 8,
 				measure_cache = 16,
-				id_table = n + 8,
+				id_table = node_count + 8,
 				depth = 64,
-				diagnostics = n + 8,
+				diagnostics = node_count + 8,
 				debug_labels = 256,
 			},
 		}
@@ -99,8 +99,8 @@ when #config(BENCH, false) {
 	// reported the same pass counts at every measured size.
 	@(private)
 	_sim_grow_passes :: proc(free_space: f64, maxes: []Scalar) -> int {
-		n := len(maxes)
-		current := make([]f64, n)
+		node_count := len(maxes)
+		current := make([]f64, node_count)
 		defer delete(current)
 		remaining := free_space
 		passes := 0
@@ -108,7 +108,7 @@ when #config(BENCH, false) {
 			passes += 1
 			total_weight := 0.0
 			candidate_count := 0
-			for i in 0 ..< n {
+			for i in 0 ..< node_count {
 				if current[i] < f64(maxes[i]) {
 					total_weight += 1
 					candidate_count += 1
@@ -119,7 +119,7 @@ when #config(BENCH, false) {
 			}
 			iteration_remaining := remaining
 			saturated := 0
-			for i in 0 ..< n {
+			for i in 0 ..< node_count {
 				if current[i] >= f64(maxes[i]) {
 					continue
 				}
@@ -140,9 +140,9 @@ when #config(BENCH, false) {
 	// Times `frames` consecutive frames of `build` in a fresh context, repeated
 	// `repeats` times, and aggregates per-frame microseconds.
 	@(private)
-	_measure :: proc(label: string, n: int, viewport: Vec2, frames: int, repeats: int, build: proc(ctx: ^Context)) -> Bench_Point {
+	_measure :: proc(label: string, node_count: int, viewport: Vec2, frames: int, repeats: int, build: proc(ctx: ^Context)) -> Bench_Point {
 		ctx: Context
-		init_err := init(&ctx, _bench_config(n))
+		init_err := init(&ctx, _bench_config(node_count))
 		defer destroy(&ctx)
 		assert(init_err == nil, "bench: init failed")
 
@@ -154,12 +154,12 @@ when #config(BENCH, false) {
 		}
 		_, frame_error := result(&ctx)
 		if frame_error != .None {
-			fmt.printfln("  WARN %s (n=%d): frame error %v", label, n, frame_error)
+			fmt.printfln("  WARN %s (node_count=%d): frame error %v", label, node_count, frame_error)
 		}
 
 		run_means := make([]f64, repeats)
 		defer delete(run_means)
-		for r in 0 ..< repeats {
+		for repeat in 0 ..< repeats {
 			start := time.tick_now()
 			for _ in 0 ..< frames {
 				if frame(&ctx, viewport) {
@@ -167,25 +167,25 @@ when #config(BENCH, false) {
 				}
 			}
 			elapsed_us := time.duration_microseconds(time.tick_diff(start, time.tick_now()))
-			run_means[r] = elapsed_us / f64(frames)
+			run_means[repeat] = elapsed_us / f64(frames)
 		}
 
 		total := 0.0
 		min_us := run_means[0]
 		max_us := run_means[0]
-		for v in run_means {
-			total += v
-			min_us = math.min(min_us, v)
-			max_us = math.max(max_us, v)
+		for sample in run_means {
+			total += sample
+			min_us = math.min(min_us, sample)
+			max_us = math.max(max_us, sample)
 		}
 		mean := total / f64(repeats)
 		variance := 0.0
-		for v in run_means {
-			variance += (v - mean) * (v - mean)
+		for sample in run_means {
+			variance += (sample - mean) * (sample - mean)
 		}
 		return Bench_Point {
 			label = label,
-			n = n,
+			node_count = node_count,
 			frames = frames,
 			sim_passes = _bench_sim_passes,
 			mean_us = mean,
@@ -224,20 +224,20 @@ when #config(BENCH, false) {
 		}
 	}
 
-	// Grow workloads: a single row of `n` Grow children. When `_bench_maxes` is
+	// Grow workloads: a single row of `node_count` Grow children. When `_bench_maxes` is
 	// set, each child's max comes from the chosen generator; otherwise max is
 	// effectively unbounded and the distribution completes in a single pass.
 	@(private)
 	_build_grow_row :: proc(ctx: ^Context) {
-		n := _bench_n
-		row_width := Scalar(4 * n)
+		node_count := _bench_nodes
+		row_width := Scalar(4 * node_count)
 		if element(ctx, {layout = {flow = .Row, sizing = {width = fixed(row_width), height = fixed(_bench_height)}}}) {
-			for i in 0 ..< n {
-				mx: Scalar = 1e6
+			for i in 0 ..< node_count {
+				maximum: Scalar = 1e6
 				if _bench_maxes != nil {
-					mx = _bench_maxes[i]
+					maximum = _bench_maxes[i]
 				}
-				content(ctx, {layout = {sizing = {width = grow(1, 0, mx), height = fixed(_bench_height)}}})
+				content(ctx, {layout = {sizing = {width = grow(1, 0, maximum), height = fixed(_bench_height)}}})
 			}
 		}
 	}
@@ -245,15 +245,15 @@ when #config(BENCH, false) {
 	// Constant-gap max recurrence: the equal-weight max arrangement that keeps the
 	// gap at 1/(2n) below the running per-pass proposal.
 	@(private)
-	_saturating_maxes :: proc(n: int) -> []Scalar {
-		R := f64(4 * n)
-		proposal := R / f64(n)
-		remaining := R
-		candidates := f64(n)
-		gap := 1.0 / (2.0 * f64(n))
-		maxes := make([]Scalar, n)
-		for k in 0 ..< n {
-			maxes[k] = Scalar(math.max(proposal - gap, 0.5))
+	_saturating_maxes :: proc(node_count: int) -> []Scalar {
+		total_width := f64(4 * node_count)
+		proposal := total_width / f64(node_count)
+		remaining := total_width
+		candidates := f64(node_count)
+		gap := 1.0 / (2.0 * f64(node_count))
+		maxes := make([]Scalar, node_count)
+		for index in 0 ..< node_count {
+			maxes[index] = Scalar(math.max(proposal - gap, 0.5))
 			remaining -= proposal - gap
 			candidates -= 1
 			if candidates > 0 {
@@ -267,15 +267,15 @@ when #config(BENCH, false) {
 	// each remaining cap is the current equal-share proposal minus 1e-5, with the
 	// proposal recomputed after each cap.
 	@(private)
-	_adversarial_maxes :: proc(n: int) -> []Scalar {
-		R := f64(4 * n)
-		maxes := make([]Scalar, n)
+	_adversarial_maxes :: proc(node_count: int) -> []Scalar {
+		total_width := f64(4 * node_count)
+		maxes := make([]Scalar, node_count)
 		maxes[0] = 3.5
-		acc := 3.5
-		for k in 1 ..< n {
-			proposal := (R - acc) / f64(n - k)
-			maxes[k] = Scalar(proposal - 1e-5)
-			acc += f64(maxes[k])
+		accumulated := 3.5
+		for index in 1 ..< node_count {
+			proposal := (total_width - accumulated) / f64(node_count - index)
+			maxes[index] = Scalar(proposal - 1e-5)
+			accumulated += f64(maxes[index])
 		}
 		return maxes
 	}
@@ -286,8 +286,18 @@ when #config(BENCH, false) {
 	}
 
 	@(private)
-	_print_point :: proc(p: Bench_Point) {
-		fmt.printfln("%s\t%d\t%d\t%d\t%.2f\t%.2f\t%.2f\t%.2f", p.label, p.n, p.frames, p.sim_passes, p.mean_us, p.min_us, p.max_us, p.stddev_us)
+	_print_point :: proc(point: Bench_Point) {
+		fmt.printfln(
+			"%s\t%d\t%d\t%d\t%.2f\t%.2f\t%.2f\t%.2f",
+			point.label,
+			point.node_count,
+			point.frames,
+			point.sim_passes,
+			point.mean_us,
+			point.min_us,
+			point.max_us,
+			point.stddev_us,
+		)
 	}
 
 	@(private)
@@ -300,8 +310,8 @@ when #config(BENCH, false) {
 			_bench_rows = rows[i]
 			_bench_sim_passes = 0
 			viewport := Vec2{1200, Scalar(f64(rows[i]) * 28.0 + 64.0)}
-			p := _measure("ordinary", rows[i] + 30, viewport, frames[i], 5, _build_ordinary)
-			_print_point(p)
+			point := _measure("ordinary", rows[i] + 30, viewport, frames[i], 5, _build_ordinary)
+			_print_point(point)
 		}
 	}
 
@@ -317,19 +327,19 @@ when #config(BENCH, false) {
 		frames := []int{3000, 1500, 800, 400, 400, 300, 200}
 		height := Scalar(64)
 		for i in 0 ..< len(sizes) {
-			n := sizes[i]
-			_bench_n = n
+			node_count := sizes[i]
+			_bench_nodes = node_count
 			_bench_height = height
 			_bench_maxes = nil
 			_bench_sim_passes = 0
 			if saturating {
-				_bench_maxes = _saturating_maxes(n)
+				_bench_maxes = _saturating_maxes(node_count)
 				defer delete(_bench_maxes)
-				_bench_sim_passes = _sim_grow_passes(f64(4 * n), _bench_maxes)
+				_bench_sim_passes = _sim_grow_passes(f64(4 * node_count), _bench_maxes)
 			}
-			viewport := Vec2{Scalar(4 * n), 64}
-			p := _measure(name, n, viewport, frames[i], 7, _build_grow_row)
-			_print_point(p)
+			viewport := Vec2{Scalar(4 * node_count), 64}
+			point := _measure(name, node_count, viewport, frames[i], 7, _build_grow_row)
+			_print_point(point)
 		}
 	}
 
@@ -341,15 +351,15 @@ when #config(BENCH, false) {
 		frames := []int{3000, 1500, 800, 400, 400, 300, 200}
 		height := Scalar(64)
 		for i in 0 ..< len(sizes) {
-			n := sizes[i]
-			_bench_n = n
+			node_count := sizes[i]
+			_bench_nodes = node_count
 			_bench_height = height
-			_bench_maxes = _adversarial_maxes(n)
+			_bench_maxes = _adversarial_maxes(node_count)
 			defer delete(_bench_maxes)
-			_bench_sim_passes = _sim_grow_passes(f64(4 * n), _bench_maxes)
-			viewport := Vec2{Scalar(4 * n), 64}
-			p := _measure("grow-adversarial", n, viewport, frames[i], 7, _build_grow_row)
-			_print_point(p)
+			_bench_sim_passes = _sim_grow_passes(f64(4 * node_count), _bench_maxes)
+			viewport := Vec2{Scalar(4 * node_count), 64}
+			point := _measure("grow-adversarial", node_count, viewport, frames[i], 7, _build_grow_row)
+			_print_point(point)
 		}
 	}
 
