@@ -254,19 +254,24 @@ create_session :: proc(journal: ^Journal, new_session: New_Session) -> (id: Sess
 	return id, nil
 }
 
+// make_private_directory creates path owner-only, and narrows an existing one
+// whose mode is wider.
 @(private)
 make_private_directory :: proc(path: string) -> Error {
 	error := os.make_directory_all(path, PRIVATE_DIRECTORY_PERMISSIONS)
 	if error != nil && error != .Exist { return error }
-	return nil
+	return os.chmod(path, PRIVATE_DIRECTORY_PERMISSIONS)
 }
 
-// make_private_file creates path owner-only before SQLite opens it, since SQLite
-// gives its write-ahead log the database file's permissions.
+// make_private_file creates path owner-only, or narrows an existing one, before
+// SQLite opens it, since SQLite gives its write-ahead log the same permissions.
 @(private)
 make_private_file :: proc(path: string) -> Error {
 	file := os.open(path, {.Read, .Write, .Create}, PRIVATE_FILE_PERMISSIONS) or_return
-	return os.close(file)
+	chmod_error := os.fchmod(file, PRIVATE_FILE_PERMISSIONS)
+	close_error := os.close(file)
+	if chmod_error != nil { return chmod_error }
+	return close_error
 }
 
 // enable_write_ahead_log checks the answer, because SQLite keeps another mode

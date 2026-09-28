@@ -98,6 +98,39 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 }
 
 @(test)
+test_a_writable_open_narrows_wide_permissions :: proc(test: ^testing.T) {
+	// The modes a default umask leaves on a directory and a database file.
+	WIDE_DIRECTORY_PERMISSIONS :: os.Permissions{.Read_User, .Write_User, .Execute_User, .Read_Group, .Execute_Group, .Read_Other, .Execute_Other}
+	WIDE_FILE_PERMISSIONS :: os.Permissions{.Read_User, .Write_User, .Read_Group, .Read_Other}
+
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	journal_directory := fmt.tprintf("%s/journal", directory)
+	database := fmt.tprintf("%s/%s", journal_directory, DATABASE_NAME)
+	_expect_ok(test, os.make_directory(journal_directory, WIDE_DIRECTORY_PERMISSIONS))
+	_expect_ok(test, os.chmod(journal_directory, WIDE_DIRECTORY_PERMISSIONS))
+	created, create_error := os.open(database, {.Read, .Write, .Create}, WIDE_FILE_PERMISSIONS)
+	if create_error != nil { testing.fail_now(test, "the database file could not be created") }
+	_expect_ok(test, os.chmod(database, WIDE_FILE_PERMISSIONS))
+	_expect_ok(test, os.close(created))
+
+	journal: Journal
+	_open_journal(test, &journal, journal_directory)
+	_close_journal(test, &journal)
+
+	directory_info, directory_error := os.stat(journal_directory, context.allocator)
+	if directory_error != nil { testing.fail_now(test, "the journal directory was not found") }
+	defer os.file_info_delete(directory_info, context.allocator)
+	testing.expect_value(test, directory_info.mode, PRIVATE_DIRECTORY_PERMISSIONS)
+
+	database_info, database_error := os.stat(database, context.allocator)
+	if database_error != nil { testing.fail_now(test, "the database was not found") }
+	defer os.file_info_delete(database_info, context.allocator)
+	testing.expect_value(test, database_info.mode, PRIVATE_FILE_PERMISSIONS)
+}
+
+@(test)
 test_buffered_records_are_invisible_until_a_commit :: proc(test: ^testing.T) {
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)
