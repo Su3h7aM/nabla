@@ -1,6 +1,6 @@
 # Nabla technical architecture
 
-Status: target architecture. This is the implementation contract for the finished harness: its structure, responsibilities, data and execution flow, and constraints. Where current code disagrees, this document wins, and section 29 lists the current mechanisms it replaces. Each rule has one home here: change it where it is written.
+Status: target architecture. This is the implementation contract for the finished harness: its structure, responsibilities, data and execution flow, and constraints. Where current code disagrees, this document wins, and section 29 lists the known differences so that nobody copies them. Each rule has one home here: change it where it is written.
 
 Terms: "must" is a hard rule, "default" is a named, tunable value. Every numeric default is collected in section 27. Section 2 decides which limits may exist at all.
 
@@ -47,12 +47,13 @@ When a request, a response, or a tool fails, the next step is to tell the model 
 | --- | --- | --- |
 | tool failure, invalid arguments, denial, timeout, unknown outcome | the typed result for that call (section 14.3) | continues |
 | response that cannot be decoded, is incomplete, is truncated at the output limit, or has defective calls | a `Notice` node saying what was wrong and that nothing ran | continues |
-| provider refusal caused by the request content (too large, invalid) | a `Notice` node naming the provider's limit and message, after a checkpoint when the context is the cause | continues |
+| provider refusal of the request (invalid request, payload too large, content policy) | a `Notice` node naming the provider's code, message, and stated limit; after a checkpoint when the context is the cause | continues once; a second refusal of the same class in a row ends the turn |
 | transient provider or network failure | nothing; the request is resent with backoff while the model send is provably not entered, otherwise a `Notice` | continues |
 | authentication, quota, missing model, configuration error | nothing: the model cannot be reached | ends, reported to the user with the provider's message |
 | user cancel, storage failure | nothing | ends |
 
 - Feedback is actionable: it names the failing call or response, the cause, the external limit with its value when one applies, and what was not executed.
+- A refusal gets one `Notice` because the model can often fix what it sent, but the harness cannot tell a model-correctable refusal from a request the harness itself built wrong (an unsupported field, an invalid schema). If the request that follows the notice is refused for the same class, nothing the model adds will fix it: the model cannot be reached with this conversation, so the turn ends and the user sees the provider's message.
 - A malformed call is feedback, not an error path: an unknown tool, arguments that are not JSON, a missing or mistyped field, or a value outside the schema returns a result that names the field, what was expected, and what was received, so the model can correct the call and retry.
 - Every layer of the loop handles its failures: the state machine, the request path, tool dispatch, and each tool map an error to one row of this table. No failure escapes as a panic, an unhandled return value, or a silent stop.
 - A notice is committed as a node, so resume, forks, and the cache see the same bytes.
@@ -75,35 +76,41 @@ The harness keeps running for as long as it reasonably can. Robustness comes fir
 - No non-critical failure blocks the agent permanently. Every wait on another job ends when that job commits, times out, or is abandoned, and an abandoned job's claims pass to the next job that needs them. Letting new work take over from stuck work is preferred over holding the agent back.
 - A thread is never killed. `thread.terminate` cancels at an arbitrary point, possibly while it holds a `sync.Mutex` or is inside an allocator, and `core:sync` locks have no owner-death recovery, so every later waiter would deadlock. Stopping is cooperative through `Stop` tokens (section 7.4).
 - A lock guards only plain memory access. No `Mutex` is held across I/O, a blocking wait, a callback, or a call into Lua, SQLite, or another package, so a slow or stuck holder never stalls another thread. Data crosses threads by ownership handoff and atomics where they suffice.
-- Threads share one address space, so a panic, failed assertion, bounds-check trap, or memory fault on any thread ends the process. No code tries to survive one in-process. The crash boundary is the child process: shell commands, MCP servers, and subagents run in their own processes, and their crash is a tool result. A harness crash is answered by the journal, which recovers the session on the next open (section 9).
+- Threads share one address space, so a panic, failed assertion, bounds-check trap, or memory fault on any thread ends the process. No code tries to survive one in-process. The crash boundary is the child process: shell commands, MCP servers, and ACP subagents run in their own processes, and their crash is a tool result. Native subagents run in-process (section 21.1). A harness crash is answered by the journal, which recovers every session on its next open (section 9).
 - A critical failure stops the work that depends on it and says why. Journal storage failure is critical because intent can no longer be committed before effects (invariant 2): it latches `Storage_Failed` (section 8.3).
 - Recovery is written only when it costs less than the failure it handles. A rare failure whose recovery would need a new mechanism, a second state machine, or broad bookkeeping ends the affected turn, or the process, with a clear message, and journal recovery takes over.
 
 ## 3. Odin implementation rules
 
+Write every package to the standard of Odin's own `core:` packages. Before writing a type or procedure, find the nearest `core:` package that solves a similar problem and copy its shape: names, signatures, error type, allocator parameter, `init`/`destroy` pairing, and doc comments. The rules below are project decisions on top of that; where `core:` does something more than one way, they pick one.
+
 ### 3.1 Data
 
 - Concrete structs, enums, `bit_set`, enumerated arrays (`[Enum]T`), tagged unions, `Maybe(T)`, `distinct` integer IDs, slices, and small fixed arrays. Closed control domains use a union or enum with an exhaustive `switch`; `#partial switch` only where the ignored cases are listed in a comment.
+- Zero is inert (invariant 17), not necessarily ready. A type that owns resources has an explicit `<subject>_init` (in place) or `<subject>_make` (returned value) and a `<subject>_destroy`, as `core:strings.Builder` and `core:container/queue` do, and destroying a zero value is a no-op. A type that owns nothing needs neither.
 - Stable wire names use enumerated-array tables (`[Record_Kind]string`), never enum formatting.
 - C types (`core:c`, `posix.FD`, `posix.pid_t`, `linux.Fd`, errno enums) stay inside the procedure or platform file that makes the foreign call. What that code exposes to the rest of the codebase uses Odin types (`int`, `bool`, `^os.File`, `os.Error`, a local enum), converted at that boundary.
 - No `any`, `rawptr`, property maps, or string-typed fields where the shape is known. `rawptr` is confined to FFI (Lua, SQLite) and to procedure-pointer executor boundaries.
-- No service locators, interfaces for single implementations, generic reducers, event buses, plugin lifecycles, or allocator wrappers per component. Procedure pointers exist only at real substitution boundaries: provider API family in `ai`, MCP backend, journal writer sink for tests, frontend output writer.
+- No service locators, interfaces for single implementations, generic reducers, event buses, plugin lifecycles, or allocator wrappers per component. Procedure pointers exist only at real substitution boundaries: provider API family in `ai`, MCP backend, journal writer sink for tests, frontend output writer. A callback is a procedure value plus a `user_data: rawptr`, as in `core:thread`.
 - Fixed-size temporary data uses fixed arrays (`[2]db.Value`), not dynamic arrays in scratch.
 
 ### 3.2 Errors
 
-- Errors are trailing return values. Each package defines `Error`: an enum of local causes, or `union #shared_nil { Local_Error, os.Error, mem.Allocator_Error, ... }` when it composes lower errors. Propagate with `or_return`; default with `or_else`; branch with `or_break`/`or_continue` or an explicit check.
+- Errors are trailing return values, in the form `core:` would choose for what the caller must decide. `ok: bool` when there is one way to fail (a lookup, a parse whose only failure is "not this form"). A package `Error` enum, first member `None`, when callers distinguish several local causes. `Error :: union #shared_nil { Local_Error, os.Error, mem.Allocator_Error }` when the package passes lower errors through. Propagate with `or_return`; default with `or_else`; branch with `or_break`/`or_continue` or an explicit check.
 - Every error is handled: propagated, converted into feedback or a `Failure`, or acted on. Discarding one with `_ =` is allowed only in cleanup whose failure changes no outcome, such as closing a descriptor that is being abandoned.
-- Constructors and state-changing procedures are `@(require_results)`.
+- `@(require_results)` goes on every procedure that returns a value or an error, so the compiler enforces the previous rule. `destroy`-style cleanup that returns nothing does not need it.
 - A harness failure recorded in the journal is `Failure :: struct { stage: Stage, kind: Failure_Kind, detail: string }` with the full `detail` the source reported. `Stage` names where it happened (Prepare, Encode, Admit, Send, Stream, Validate, Commit, Dispatch, Execute, Persist, Hook, Recover).
 - `assert` checks internal invariants in debug; `ensure` checks invariants whose violation would corrupt durable state. Neither handles input, transport, tool, or storage errors. No `panic` on external input.
-- Allocation failure is an explicit error. An operation that builds an owned value uses a local, a `defer if !transferred { destroy(&value) }`, and sets `transferred` only after the owner accepts it. Empty success, zero-length success, and allocation failure are distinct.
+- Allocation failure is an explicit error. This is stricter than much of `core:`, which may ignore it, and it is deliberate: the Lua quota allocator and arenas do fail, and a failure must become feedback rather than a corrupt result. An operation that builds an owned value uses a local, a `defer if !transferred { destroy(&value) }`, and sets `transferred` only after the owner accepts it. Empty success, zero-length success, and allocation failure are distinct.
 
 ### 3.3 Allocators and lifetimes
 
 - Allocating procedures take a trailing `allocator := context.allocator`, or a required allocator when the result outlives the call. A procedure that returns an owning slice documents the allocator in the owner that frees it; callers free with `delete(slice, allocator)`.
+- Borrowing is the default: a returned string or slice is a view into its argument or its owner unless the procedure takes an allocator. A procedure that allocates says so in its signature, and one that borrows says what the view's lifetime is tied to in its doc comment. Clone once, at the boundary where the borrow would end.
 - Arenas are initialized in place at their final address before any allocator handle to them is created. An arena is never copied or moved after `arena_init_*`.
-- `context.temp_allocator` is released only by its owner: the owner loop iteration (section 6.2) and worker entry procedures. Helpers use `runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()` with `ignore = allocator == context.temp_allocator` when returning into a caller-provided allocator. No bare `free_all(context.temp_allocator)` outside an owner.
+- `context.temp_allocator` is per thread and is reset by the loop that owns the thread, with `free_all(context.temp_allocator)` once per unit of work: each owner loop iteration (section 6.2), each item of a worker or frontend loop, and a thread's exit. Nothing allocated in temp survives that point.
+- A procedure below the owning loop never calls `free_all` on the temp allocator, because its caller may still hold temp data. When it needs scratch that should not accumulate until the loop resets, it takes a scoped mark with `runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()`, passing `ignore = allocator == context.temp_allocator` when its result goes into a caller-provided allocator.
+- An arena a procedure owns outright (a connection's arena, a job arena) is reset with `free_all` on that arena by its owner, independently of the thread's temp allocator.
 - File buffers transfer ownership (`string(bytes)`) instead of cloning.
 - Allocator resize uses `mem.resize` / `mem.resize_non_zeroed`, never allocate-copy-free.
 
@@ -136,14 +143,16 @@ The harness keeps running for as long as it reasonably can. Robustness comes fir
 
 ### 3.6 Serialization
 
-- `core:encoding/json` at external boundaries only. Native tool arguments and outputs are typed structs; Lua values convert directly to and from those structs.
+- `core:encoding/json` at external boundaries only. Native tool arguments and outputs are typed structs. A Lua child's arguments are the one JSON path inside the process: they are written as JSON text because they are journaled as the proposed arguments and admitted through the same decoder as a provider call (section 17.1). Typed outputs are pushed to Lua directly.
 - Canonical JSON (sorted keys, no insignificant whitespace) for everything that enters a provider request prefix: tool schemas and harness-generated JSON. Encoded once, stored as bytes, reused verbatim.
 - Journal payloads are one level of JSON (a JSON object column, never JSON inside a JSON string). Exact external bytes (tool arguments as sent, provider replay items, rendered tool results, text) go in a `body` BLOB column.
 - `core:crypto/hash` (SHA-256) for digests.
 
 ### 3.7 Source
 
-- One subject per file, roughly 2000 lines maximum. Names carry meaning; comments state ownership, lifetime, thread, and failure contracts only.
+- One subject per file, named for the subject; split a file when it holds a second subject, not when it grows. Platform code sits in `_linux.odin` (later `_darwin.odin`, `_bsd.odin`) files beside the portable file.
+- Every package has a `doc.odin` with the package overview. Naming and comment rules are in `AGENTS.md`.
+- `mise run check` builds with `-vet -strict-style -disallow-do -warnings-as-errors`; code and examples in this document follow the same rules.
 
 ## 4. Package map
 
@@ -166,7 +175,7 @@ harness      agent  agent/journal  agent/material  root package (nabla executabl
 | `agent` | owner loop, state machine, jobs, tools, repair, policy, hooks, Lua runtime, Tasks, subagents, projection, compaction, catalog resolution, config parsing and validation | terminal, rendering, process-global UI state, file watching |
 | root | process lifetime, signals, config discovery and file watching, catalog refresh thread, TUI, headless, ACP server, diagnostics and export commands | a second copy of any `agent` policy |
 
-Rules: dependencies point inward; only root imports both foundation and `agent`; `agent/journal` imports only `db`, `db/sqlite`, and `core:`; `agent/material` imports only `core:`. `agent/material` replaces `agent/skills`; `agent/journal` replaces `agent/session`. No further packages without a second consumer.
+Rules: dependencies point inward; only root imports both foundation and `agent`; `agent/journal` imports only `db`, `db/sqlite`, and `core:`; `agent/material` imports only `core:`. `agent/material` replaces `agent/skills`. No further packages without a second consumer.
 
 ## 5. Identities and vocabulary
 
@@ -197,7 +206,7 @@ Zero means absent for every ID. IDs render as lowercase hex or decimal only at b
 | Node | one committed conversational step in the session tree |
 | Task | one stored reusable Lua program |
 | Tool call | one invocation of a registered capability |
-| Subagent | one delegated execution in a child process |
+| Subagent | one delegated execution in its own session: native in-process, or an ACP program in a child process |
 
 ## 6. Runtime
 
@@ -212,27 +221,33 @@ Zero means absent for every ID. IDs render as lowercase hex or decimal only at b
 | catalog refresh | 0 or 1, on demand, exits when done | network I/O | provider listing and models.dev fetch |
 | job worker | 0..`BLOCKING_JOBS_MAX_RUNNING` | the blocking operation | one job's input and output |
 | MCP server | per configured server, started lazily | (external) | its own process |
-| subagent child | 0..`SUBAGENTS_MAX_RUNNING` | (external) | its own session |
+| native subagent owner | 0..`SUBAGENTS_MAX_RUNNING` | as owner | its own session |
+| ACP subagent | 0..`SUBAGENTS_MAX_RUNNING`, shared with native | (external) | its own process and session |
 
 An idle process has the main, owner, and watcher threads (plus the ACP reader) asleep in the calls above and nothing else. The table names the Linux mechanisms; another platform supplies its equivalents behind the same package-local procedures (section 3.5).
 
 ### 6.2 Owner loop
 
 ```odin
-owner_run :: proc(o: ^Owner) {
-	for o.state.lifecycle != .Closed {
-		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-		seen := sync.atomic_load(&o.wake.seq)       // load before collecting: closes the lost-wake window
-		now  := time.tick_now()
-		owner_collect(o, now)                        // commands, job handoffs, snapshots, interrupt -> owner_apply
-		for _ in 0..<OWNER_EFFECTS_PER_PASS {
-			effect := owner_select(&o.state, now)    // reads state only: no clock, lock, I/O, allocation, counter
-			if effect == nil do break
-			owner_perform(o, effect)                 // claim, then start or complete work
-			owner_collect(o, now)
+owner_run :: proc(owner: ^Owner) {
+	for owner.state.lifecycle != .Closed {
+		seen := sync.atomic_load(&owner.wake.seq)   // load before collecting: closes the lost-wake window
+		now := time.tick_now()
+		owner_collect(owner, now)                    // commands, job handoffs, snapshots, interrupt -> owner_apply
+		performed := 0
+		for ; performed < OWNER_EFFECTS_PER_PASS; performed += 1 {
+			effect := owner_select(&owner.state, now) // reads state only: no clock, lock, I/O, allocation, counter
+			if effect == nil {
+				break
+			}
+			owner_perform(owner, effect)             // claim, then start or complete work
+			owner_collect(owner, now)
 		}
-		journal_flush_due(&o.journal, now)           // observation batch (section 8.3)
-		owner_wait(&o.wake, u32(seen), owner_nearest_deadline(&o.state, &o.journal))
+		journal_flush_due(&owner.journal, now)       // observation batch (section 8.3)
+		free_all(context.temp_allocator)             // nothing in temp outlives an iteration
+		if performed < OWNER_EFFECTS_PER_PASS {      // an exhausted quantum means work remains: loop without waiting
+			owner_wait(&owner.wake, u32(seen), owner_nearest_deadline(&owner.state, &owner.journal))
+		}
 	}
 }
 ```
@@ -265,16 +280,19 @@ Selection priority, first match wins:
 ```odin
 Owner_Wake :: struct { seq: sync.Futex }   // monotonic; producers never reset it
 
-owner_wake_signal :: proc "contextless" (w: ^Owner_Wake) {
-	sync.atomic_add(&w.seq, 1)
-	sync.futex_broadcast(&w.seq)
+owner_wake_signal :: proc "contextless" (wake: ^Owner_Wake) {
+	sync.atomic_add(&wake.seq, 1)
+	sync.futex_broadcast(&wake.seq)
 }
 
-owner_wait :: proc(w: ^Owner_Wake, seen: u32, deadline: Maybe(time.Tick)) {
-	d, has := deadline.?
-	if !has { sync.futex_wait(&w.seq, seen); return }
-	if left := time.tick_diff(time.tick_now(), d); left > 0 {
-		sync.futex_wait_with_timeout(&w.seq, seen, left)
+owner_wait :: proc(wake: ^Owner_Wake, seen: u32, deadline: Maybe(time.Tick)) {
+	due, has_deadline := deadline.?
+	if !has_deadline {
+		sync.futex_wait(&wake.seq, seen)
+		return
+	}
+	if left := time.tick_diff(time.tick_now(), due); left > 0 {
+		sync.futex_wait_with_timeout(&wake.seq, seen, left)
 	}
 }
 ```
@@ -387,7 +405,9 @@ Job records are heap-allocated individually (stable addresses) into `Job_Table.s
 1. The owner builds `input` in the job arena and commits intent, then creates the thread with the job pointer as data.
 2. The worker sets its context, reads `input`, executes, writes `result` into the job arena under `handoff.mu`, stores `published = true`, calls `owner_wake_signal`, and returns. It touches nothing after the wake.
 3. The owner sees `published`, commits the result (barrier), delivers it, then calls `thread.join` and `thread.destroy` (join is the retirement proof), then destroys the arena and frees the record.
-4. A worker that does not publish within `STOP_PATIENCE` after a stop request is abandoned. The owner commits `Unknown` for the call, saying the operation may still be running, moves the job to `Abandoned`, and records `job.abandoned`. The job releases its access claim and worker slot, and its turn counts it as retired, so the session keeps working. The owner frees nothing the worker can reach: the job record, its arena, its thread handle, and the stop token and snapshot references it borrows stay alive.
+4. A worker that does not publish within `STOP_PATIENCE` after a stop request is abandoned. The owner commits `Unknown` for the call, saying the operation may still be running, moves the job to `Abandoned`, and records `job.abandoned`. The job releases its access claim and worker slot, and its turn counts it as retired, so the session keeps working. The owner frees nothing the worker can reach: the job record, its arena, its thread handle, and the stop token and snapshot references it borrows stay alive. Releasing the claim lets conflicting work start while the abandoned worker may still touch the same paths; this is the accepted price of never blocking the agent on a stuck worker, and the `Unknown` result names the paths it held so the model rereads them before relying on them.
+
+This protocol applies to every job kind with a thread, provider attempts and compaction included: no owner or teardown path calls `thread.join` on a worker that has not published.
 5. If an abandoned worker publishes later, the owner records `job.reclaimed`, discards the result (the call already has its outcome), joins, and frees the job as in step 3. Otherwise its memory leaks until process exit, which never joins abandoned threads.
 
 There is one lifetime rule: the owner frees job memory, and only after join. No self-cleanup, orphan flags, or worker-side frees.
@@ -492,7 +512,7 @@ artifacts(digest BLOB PRIMARY KEY, kind TEXT, created_ms INTEGER, bytes BLOB) ST
 - Indexes: `records(session, seq)`, `records(session, call) WHERE call IS NOT NULL`, `records(session, kind, seq)`, `records(session, node) WHERE node IS NOT NULL`, `records(session, request) WHERE request IS NOT NULL`, `nodes(session, branch, node)`.
 - `data` is one JSON object per record, shaped by a versioned struct per kind (`version` field). `body` holds exact bytes. Diagnostics queries use SQLite JSON functions over `data`; analysis needs no custom decoder.
 - `body` holds what the model sees: a `User` node's is the user's text, an `Assistant` node's is the model's visible text, `tool.proposed`'s is the argument document exactly as the model sent it, `tool.admitted`'s is the arguments the tool runs with, `tool.completed`'s is the rendered result, and `response.committed`'s is the endpoint's native output items when it returned any. A `Checkpoint` node's body is its summary and a `Notice` node's is the feedback text. A Lua child's records carry a parent call and no node, so they never enter the projection or a `Results` node.
-- WAL, `synchronous = FULL`, `busy_timeout`, private 0700 directory and 0600 files. Several processes (TUI, subagent children, diagnostics readers) share the file; each session has one writer claim.
+- WAL, `synchronous = FULL`, `busy_timeout`, private 0700 directory and 0600 files. A writable open narrows an existing directory or file with wider modes to these. Several processes (TUI, diagnostics readers) share the file; each session has one writer claim.
 - Migrations are explicit steps stamped in the same transaction. A newer schema is refused. Corrupt or unreadable data is a typed error naming the session and seq; the harness never guesses.
 
 ### 8.3 Durability classes and write path
@@ -553,7 +573,7 @@ On claiming a session, in one transaction:
 | `Assistant` node with calls and no `Results` node | `Results` node built from committed and recovered results |
 | compaction output without `checkpoint.installed` | nothing; audit data only |
 
-Then `session.recovered{counts}`. Recovery reconstructs history, not stacks: no replay of provider requests, tools, Lua, Tasks, hooks, or scheduled retries. Unknown results enter the projection as ordinary results, so the model sees the uncertainty. A subagent child whose parent died receives `SIGKILL` through `PR_SET_PDEATHSIG` and recovers its own session when next opened.
+Then `session.recovered{counts}`. Recovery reconstructs history, not stacks: no replay of provider requests, tools, Lua, Tasks, hooks, or scheduled retries. Unknown results enter the projection as ordinary results, so the model sees the uncertainty. A native subagent's session recovers like any other when next opened. An ACP subagent whose parent died receives `SIGKILL` through `PR_SET_PDEATHSIG`.
 
 ## 10. Session tree
 
@@ -605,7 +625,8 @@ Replay: provider-native opaque items (encrypted reasoning, Responses output) are
 - `Prepare_Request` copies the projection and encodes into the chain arena, runs `request.prepare` hooks, checks capacity (section 23), then freezes: the encoded body is immutable for every attempt of this request.
 - `Send_Attempt` commits `request.sent{attempt, body digest, sizes}` (barrier), then starts an `Attempt` job that borrows the frozen bytes and streams into its handoff.
 - The owner forwards new stream bytes to the view queue as progress. Completion is validated (identities, count, argument sizes) before `Commit_Response` writes the `Assistant` node and `tool.proposed` records in one barrier.
-- Recovery authorization lives only in `agent`, and every branch keeps the turn going unless section 2.2 says it ends. Order: end on cancel or storage failure; accept a validated completion; answer an unusable or partially exposed response with a `Notice` and a new request; for proven context overflow, install a checkpoint and rebuild; for a refusal of the request content (invalid request, payload too large, content policy), a `Notice` carrying the provider's code, message, and stated limit, then a new request; resend a transient class (rate limited, unavailable, incomplete stream) only while delivery evidence proves the model send was not entered, otherwise a `Notice`; end only on authentication, quota, missing model, or configuration errors, reporting the provider's message to the user.
+- Recovery authorization lives only in `agent`, and every branch keeps the turn going unless section 2.2 says it ends. Order: end on cancel or storage failure; accept a validated completion; answer an unusable or partially exposed response with a `Notice` and a new request; for proven context overflow, install a checkpoint and rebuild; for a refusal of the request (invalid request, payload too large, content policy), a `Notice` carrying the provider's code, message, and stated limit, then a new request, and end the turn if that request is refused for the same class; resend a transient class (rate limited, unavailable, incomplete stream) only while delivery evidence proves the model send was not entered, otherwise a `Notice`; end only on authentication, quota, missing model, or configuration errors, reporting the provider's message to the user.
+- Delivery evidence: a received response head (an HTTP status line of any status, or the first WebSocket response event) proves the send was entered. A stream that breaks after it is answered with a `Notice`, never resent. Only a failure before the head (connect, TLS, or a write the peer never read) permits a resend.
 - Backoff: `ceiling = min(RETRY_BACKOFF_CEILING, 500 ms * 2^(n-1))`, `delay = max(uniform(ceiling/2, ceiling), retry_after)`. Transient resends have no attempt count and honor any provider-requested delay; a network outage while the user is away delays the turn instead of ending it. The wait is an owner deadline, not a sleep, and cancel ends it.
 - Transport: per provider `http | websocket | auto`. `auto` uses WebSocket for APIs that implement it and falls back to HTTP for the affinity only on evidence that no model message was sent. The WebSocket connection is session-owned, used by one attempt at a time, and destroyed on affinity change or any unsuccessful operation.
 
@@ -693,7 +714,7 @@ Config_Snapshot :: struct {
 
 ```odin
 Tool_Kind :: enum u8 { Read, Write, Patch, Shell, Code, Catalog_Search, Skill_Load, Task_Run, Agent_Spawn, Result_Read, Compact, MCP }
-Placement :: enum u8 { Owner, Worker, Lua, Child_Process }
+Placement :: enum u8 { Owner, Worker, Lua, Subagent }
 
 Tool_Definition :: struct {
 	name:        string,           // [A-Za-z_][A-Za-z0-9_]{0,63}, not a Lua keyword
@@ -721,7 +742,7 @@ The registry is built, validated (names, schemas, collisions), and sorted inside
 | `catalog_search` (skill and Task metadata) | Session | Owner |
 | `skill_load` | Read(skill file) | Worker |
 | `task_run` | None | Lua |
-| `agent_spawn` (main sessions only) | Read(all) or Process, by scope | Child_Process |
+| `agent_spawn` (main sessions only) | Read(all) or Process, by scope | Subagent |
 | `context_compact` | Session | Owner |
 | MCP tools `<server>_<tool>` | External(client lane) | Worker |
 
@@ -735,7 +756,7 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
   -> hook tool.after_admit -> schedule (section 7.3) -> hook tool.before_execute -> Start_Job
 ```
 
-- Decode adapters: `args_from_json(kind, json.Value)` for provider input, after a strict parse with duplicate-key and depth checks, and `args_from_lua(kind, L, idx)` for Lua. Both produce `Tool_Args`. `args_validate(kind, &args)` is the single semantic validator (paths, ranges, types). Argument size is not validated: the model's output limit is the only bound. MCP args stay a `json.Value`; the server validates their semantics.
+- Decode: `args_from_json(kind, json.Value)` after a strict parse with duplicate-key checks produces `Tool_Args`. It is the only decoder: Lua children arrive as JSON text (section 17.1). `args_validate(kind, &args)` is the single semantic validator (paths, ranges, types). Argument size and nesting are not validated: the model's output limit is the only bound. MCP args stay a `json.Value`; the server validates their semantics.
 - A call that fails any step gets a committed result (`Invalid_Arguments`, `Unavailable`, `Denied`, `Not_Executed`) and its siblings proceed. A defective response (missing or duplicate call ids, empty names) executes no call and becomes a `Notice` (section 2.2). There is no call count limit per response.
 - Policy: config `policy.tools = { name = "allow" | "ask" | "deny" }`, default allow. `ask` moves the job to `Awaiting_Decision` and emits a permission view event (TUI prompt, ACP `session/request_permission`). The answer arrives as `Permission_Answer` and commits `tool.decision` before execution. A crash while waiting yields `Not_Executed`.
 - A Lua child commits before its result is delivered; a parent's result commits after all its children settle.
@@ -779,6 +800,8 @@ Tool_Repairs :: bit_set[Tool_Repair]
 ```
 
 The set of repairs a call needed is committed with `tool.admitted` beside the effective arguments (today the dispatch record carries both), and each application is also observed as `tool.repaired`. When a value repair rewrote the document, the effective arguments are the document written again from the repaired value with sorted keys. Projection replays the effective arguments, so the model sees the corrected form. A repaired value then passes full validation, and policy and hooks run on it. A new repair joins the enum only if its input has one reading and every other input is still refused with its own defect.
+
+The committed result of a repaired call names every repair it needed: the field, what the model sent, and what ran. This holds for every outcome, failures included. Projection shows the corrected arguments, so without this line the model would never learn it sent something wrong. A repair recorded only in the journal or shown only to the frontend does not count as reported.
 
 Content repairs belong to the tool that knows the content, because they depend on the target file, and they are reported in that tool's output: a patch hunk that matches exactly one location when surrounding whitespace is ignored (section 16). Normalizing line endings to the target file's convention and reading loose patch formatting with one reading are content repairs of the same kind that do not exist yet.
 
@@ -829,6 +852,7 @@ Code Mode and Tasks run model-written programs, so they carry only external limi
 - `setmetatable` refuses a metatable with `__gc`, because a finalizer runs with hooks off and again when the state closes. Every other metamethod runs as script code under the count hook, and the host reads values raw, so it never runs script code.
 - Allocator: `lua_Alloc` over the heap using `mem.resize_non_zeroed`, accounting live requested bytes. Profiles with a memory quota check a resize against `live - old + new`; Code Mode and Tasks have none, so only an OS allocation failure refuses. Refusal returns nil as Lua requires; shrinking never fails. `LUA_HOST_RESERVE` is added while the host pushes values.
 - Scheduling is suspension: a count hook yields every `LUA_SLICE_INSTRUCTIONS` so the owner stays responsive; the owner checks stop, deadlines, and quotas between slices and never resumes a stopped run. Where the script cannot yield (inside a C call such as a `table.sort` comparator), the hook raises once the run should stop and then fires on every instruction, so a `pcall` that catches the raise ends at its next yield. The slice size is a scheduling quantum, not a limit on work. Every allocation-capable host entry runs protected. Callbacks hold no Odin resources that depend on `defer`.
+- The count hook sees Lua instructions only. One library call (`string.rep`, `table.concat`, a pattern match) runs to completion inside its slice, bounded by its own input and, for the quota profiles, by the memory quota. This gap is accepted; preempting C code would need a second mechanism that costs more than the rare long call.
 - Code Mode and Tasks run on the owner, one slice per `Resume_Lua` effect, so several scripts interleave and none holds the owner longer than a slice. Hooks run to completion on the owner within their small limits; config and metadata run on the watcher.
 
 ### 17.1 Code Mode API
@@ -907,7 +931,7 @@ Hooks are user-configured Lua files in `$XDG_CONFIG_HOME/nabla/hooks/`, each ret
 
 ### 21.1 Native foundation
 
-A native subagent uses Nabla's provider catalog, request state machine, and agent loop. Native children run on threads in the current process, so a panic or memory fault is not isolated from the parent. Section 21.3 covers subagents that are other ACP programs.
+A native subagent uses Nabla's provider catalog, request state machine, and agent loop. Native children run in the parent process, each as the owner of its own session. A panic or memory fault in one ends the process, and journal recovery restores every session (section 2.4); a process per child would add a protocol and a supervisor to handle a failure that recovery already covers. Section 21.3 covers subagents that are other ACP programs.
 
 `agent_spawn{instruction, prompt, model?, provider?, effort?, background?}` creates a fresh child session. `prompt` is required. The child receives its own instruction and task, the shared harness instructions, and instructions discovered in the workspace. It inherits neither the parent's conversation nor its client-specific instructions. The caller must supply everything else the child needs or tell it where to find it. There are no agent definition files.
 
@@ -921,7 +945,7 @@ The team owns the parent snapshot and child records. Teardown closes admission, 
 
 ### 21.2 Required later work
 
-- Coordination through the journal. Child start, messages, and outcomes become journal records committed before their effects (invariant 2). Thread coordination, process children, and crash recovery build on those records instead of on in-memory team state. Crash isolation for native children waits for this work.
+- Coordination through the journal. Child start, messages, and outcomes become journal records committed before their effects (invariant 2), so recovery restores a delegation after a crash instead of losing in-memory team state.
 - Access and policy. Child permission requests, ACP ones included, should reach the parent's `tool.before_execute` hooks and policy, and children may get access scopes such as read-only.
 - Workspace isolation. Children that write need their own workspace so concurrent edits cannot collide. The mechanism (a Jujutsu workspace, a Git worktree, or another copy) and how a child's changes return to the parent are still open. Until then children share the parent's workspace.
 
@@ -1060,21 +1084,26 @@ A default changes only with a measurement from the journal or a benchmark test. 
 - Suites run with `ODIN_TEST_FAIL_ON_BAD_MEMORY` in release and `-debug`; tests pass explicit allocators where ownership is the subject.
 - Tests assert outcomes and counts, not layouts, colors, or field order. Process-global state (signals, interrupt) runs in `test_isolate_process` children.
 
-## 29. Current mechanisms this design replaces
+## 29. Known differences in current code
+
+These mechanisms exist in the code today and are replaced by the named target. Do not copy them into new code; when you touch one, move it toward the target.
 
 | Current | Target |
 | --- | --- |
-| `agent/session` tables `turns`, `requests`, `entries`; JSON strings inside JSON | `agent/journal` records, nodes, branches; typed columns, one-level JSON `data`, exact `body` |
-| JSONL run logs, segments, retention, `log_read` | journal records, diag ring, SQL views, artifacts |
-| TUI 50 ms input poll | `ppoll` with the view eventfd |
-| `http/client` 50 ms `WAIT_SLICE` probe checks, `SHUTDOWN_JOIN_POLL` | one wait on the socket or thread and a stop wake, with a real deadline as the only timeout |
-| Lua log and message caps | whole results previewed and kept through section 14.3 |
-| one native lane, so native Code Mode children run one at a time | access-class scheduler |
-| a result rendered where the executor built it | typed output kept until commit, rendered once at commit |
-| instruction snapshot frozen per session | snapshot per turn from live config, digests recorded |
-| `Chat_Observer` callbacks on the owner thread | `View_Queue` consumed by frontends |
-| linear entries, no fork | session tree with branches and checkpoint nodes |
-| no hooks, Tasks, rules, commands, subagents, ratings, policy | sections 14.2 and 18 to 24 |
+| TUI 50 ms input poll; headless and ACP output through `Chat_Observer` callbacks on the owner; ACP writes that block under the writer mutex; one ACP session | `View_Queue` and eventfd, the owner never blocks on a frontend, one owner per ACP session (section 22) |
+| `SHUTDOWN_JOIN_POLL` sleep loop in root | one wait on the thread or its stop wake, with a real deadline as the only timeout (section 2.3) |
+| provider attempts and compaction joined without a deadline on stop and teardown | abandonment after `STOP_PATIENCE` (section 7.2) |
+| a stream that breaks after an accepted response head is resent | a `Notice` (section 11.3) |
+| invalid request, payload too large, and content policy end the turn | one `Notice`, then end on a repeat (section 2.2) |
+| repairs reported to the journal and frontend only | named in the committed result (section 15) |
+| harness caps: Code Mode print log 8 KiB, Lua conversion 256 and 16,384 nodes, 32 child summaries, ACP frames 10 MB, MCP messages 4 MiB and depth 64, MCP discovery 32 pages of 1,024 tools, skill files 256 KiB | no harness caps; whole results kept, then previewed (sections 2.1, 14.3) |
+| a result rendered by `tool_result_of` where the executor built it | typed output kept until commit, rendered once at commit (section 14.3) |
+| catalog replaced under a mutex and the old one destroyed; selection reapplied mid-turn | immutable reference-counted snapshots, kept by admitted work (section 13.3) |
+| `request.sent` without body digest and sizes; request preparation only in `runtime.message` | structured `request.sent` and `request.prepared` records (section 11.3) |
+| existing journal paths keep wider permissions | narrowed on writable open (section 8.2) |
+| native background subagents start without an admission gate | `SUBAGENTS_MAX_RUNNING` (section 27) |
+| `agent/skills` with skill list and load tools | `agent/material` (sections 18, 19) |
+| no hooks, Tasks, rules, commands, tool policy, fork or branch selection, ratings | sections 10.2, 14.2, and 18 to 24 |
 
 ## 30. Admission test for new features
 

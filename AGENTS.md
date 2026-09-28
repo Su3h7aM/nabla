@@ -23,9 +23,19 @@ Read `docs/ARCHITECTURE.md` before changing package boundaries, adding a subsyst
 
 ## Odin
 
-Write idiomatic Odin that follows the language's philosophy: zero is initialization, errors are values, conversions are explicit, and memory has a clear owner and allocator. Prefer `core:` and `vendor:` packages; a new foreign dependency needs a decision.
+Write every package to the standard of Odin's own `core:` packages, as an Odin maintainer would: zero is inert, errors are values, conversions and costs are explicit, and memory has a clear owner and allocator. Before writing a type or procedure, find the nearest `core:` package that solves a similar problem and copy its shape. Prefer `core:`, `base:` and `vendor:` packages; a new foreign dependency needs a decision.
 
 Handle every error that can occur, the Odin way: trailing error return values, `or_return`, `or_else`, `or_break`, `or_continue`, or an explicit check. Section 3 of `docs/ARCHITECTURE.md` covers errors, allocators, context, threads, and platform code.
+
+Memory is managed by hand, and every allocation has an owner and a release point you can name. Choose the release that fits each case; no single pattern fits all of them. The best choice is the simplest one that allocates the least and makes the owner obvious. Odin offers several, and `core:` uses each where it fits:
+
+- Borrow a view (a slice or string into existing memory) instead of allocating at all.
+- `defer delete(value)` or `defer destroy(&value)` directly after one owned allocation.
+- An arena released with one `free_all` or destroy when many allocations die together.
+- `free_all(context.temp_allocator)` in the loop that owns the thread, once per unit of work.
+- `runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()` for scratch inside a procedure below that loop, which must never reset temp memory its caller may hold.
+
+Section 3.3 of `docs/ARCHITECTURE.md` has the lifetimes and their allocators.
 
 Use JSON only where an external interface requires it: provider requests and responses, MCP, ACP, journal payloads, logs, and exports. Everything internal uses native data: typed structs, enums, tagged unions, and slices. Parse JSON once at the boundary into those types and encode only when writing back out, so JSON text and `json.Value` stay inside the boundary code. Section 3.6 of `docs/ARCHITECTURE.md` has the details.
 
@@ -33,11 +43,11 @@ Treat your Odin knowledge as unverified. When unsure about a signature, a langua
 
 ## Naming and comments
 
-Code describes itself through clear names and simple structure. Names are full words that say what the thing is or does: `snake_case` procedures and variables, `Ada_Case` types, `SCREAMING_SNAKE_CASE` constants. Name any literal whose meaning is not obvious at the call site.
+Code describes itself through clear names and simple structure. Names are full words that say what the thing is or does: `snake_case` procedures and variables, `Ada_Case` types, `SCREAMING_SNAKE_CASE` constants. Name a procedure for its package-qualified call site (`journal.commit`, not `journal.journal_commit`); inside a package with several subjects, prefix by subject (`chain_send`). Name any literal whose meaning is not obvious at the call site.
 
-Never use a single-letter name, for anything: a procedure, parameter, variable, field, loop index, receiver, or generic parameter. Write `journal`, `index`, `test`, and `session`, never `j`, `i`, `t`, or `s`. Avoid abbreviations as well: `error` over `err`, `connection` over `conn`, `arguments` over `args`. The only exceptions are names fixed by an external interface, such as a JSON field or a foreign API.
+A name's length follows its scope. Procedures, types, fields, parameters, and package-level values get full words: `journal`, `session`, `request`, never `j`, `s`, or `req`. The short names Odin itself uses stay for short scopes: `i` and `j` for loop indices, `$T` and `$E` for generic parameters, and `err` and `ok` for results. Avoid any other abbreviation, except names fixed by an external interface such as a JSON field or a foreign API.
 
-Comments are minimal documentation: one or two lines stating a contract the code cannot express, such as ownership, lifetime, thread, or failure behavior. Delete a comment that restates the code. Long rationale belongs in `docs/`, and a comment never points at a document, task, or discussion.
+Comments document contracts the code cannot express. Each package has a `doc.odin` overview. An exported declaration whose contract is not obvious from its signature gets a doc comment directly above it, in the `core:os` style: it starts with the name and states what the procedure returns, which errors it can return, who owns the result and with which allocator, and any thread or lifetime rule. It is as long as that contract and no longer. Inside a procedure, a comment explains why, never what. Delete a comment that restates the code. Long rationale belongs in `docs/`, and a comment never points at a document, task, or discussion.
 
 ## Tests
 
