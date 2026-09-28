@@ -643,15 +643,7 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 		return "the agent did not stop in time and was ended"
 	}
 	buffer: [SUBAGENT_ACP_READ_BYTES]u8
-	if errors_index >= 0 && fds[errors_index].revents != {} {
-		taken, status := tool_read(connection.errors, buffer[:])
-		if status == .Failed || (status == .Ok && taken == 0) {
-			_ = os.close(connection.errors)
-			connection.errors = nil
-		} else if status == .Ok {
-			acp_stderr_retain(&connection.stderr_tail, buffer[:taken])
-		}
-	}
+	if errors_index >= 0 && fds[errors_index].revents != {} { acp_stderr_read(connection, buffer[:]) }
 	// What the agent wrote before it exited is read first; its exit counts once nothing is
 	// waiting, whoever still holds its pipes.
 	if fds[0].revents == {} {
@@ -678,6 +670,21 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	return ""
 }
 
+// acp_stderr_read reads one chunk of the agent's stderr into the tail, and closes the pipe at
+// its end. It returns false when nothing more is ready.
+@(private)
+acp_stderr_read :: proc(connection: ^Acp_Connection, buffer: []u8) -> bool {
+	taken, status := tool_read(connection.errors, buffer)
+	if status == .Failed || (status == .Ok && taken == 0) {
+		_ = os.close(connection.errors)
+		connection.errors = nil
+		return false
+	}
+	if status == .Again { return false }
+	acp_stderr_retain(&connection.stderr_tail, buffer[:taken])
+	return true
+}
+
 // acp_stderr_retain adds what the agent just wrote and keeps only the most recent
 // SUBAGENT_ACP_STDERR_TAIL_BYTES of it. The cut is moved to the next rune start, so the
 // retained text stays valid UTF-8.
@@ -696,6 +703,14 @@ acp_stderr_retain :: proc(tail: ^[dynamic]u8, data: []u8) {
 // acp_ended says the agent went away, with the end of what it wrote to stderr.
 @(private)
 acp_ended :: proc(connection: ^Acp_Connection, what: string) -> string {
+	// What the agent wrote to stderr before it went away can still be in the pipe. Only what is
+	// ready is read, so a descendant that holds the pipe open cannot hold up the report.
+	buffer: [SUBAGENT_ACP_READ_BYTES]u8
+	for connection.errors != nil {
+		ready := [1]posix.pollfd{{fd = tool_fd(connection.errors), events = {.IN}}}
+		if posix.poll(raw_data(ready[:]), 1, 0) <= 0 || ready[0].revents == {} { break }
+		if !acp_stderr_read(connection, buffer[:]) { break }
+	}
 	tail := strings.trim_space(string(connection.stderr_tail[:]))
 	if tail == "" { return fmt.tprintf("the agent %s before it answered", what) }
 	return fmt.tprintf("the agent %s before it answered. The end of its stderr:\n%s", what, tail)
