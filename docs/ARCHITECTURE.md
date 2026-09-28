@@ -467,6 +467,7 @@ read_latest    :: proc(journal: ^Journal, filter: Filter, allocator: mem.Allocat
 read_ancestry  :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, allocator: mem.Allocator) -> ([]Node, Error) // stops at the covering checkpoint
 read_artifact  :: proc(journal: ^Journal, digest: Digest, allocator: mem.Allocator) -> ([]u8, bool, Error)
 session_head   :: proc(journal: ^Journal, session: Session_Id) -> (Branch_Id, Node_Id, Error)
+last_delivered_message :: proc(journal: ^Journal, session: Session_Id) -> (Journal_Seq, Error) // highest subagent.message a User node delivered
 usage_totals   :: proc(journal: ^Journal, session: Session_Id) -> (Usage_Totals, Error)
 cache_hit_rate :: proc(totals: Usage_Totals) -> (rate: f64, measured: bool)
 cache_coverage :: proc(totals: Usage_Totals) -> (share: f64, measured: bool)
@@ -519,7 +520,7 @@ artifacts(digest BLOB PRIMARY KEY, kind TEXT, created_ms INTEGER, bytes BLOB) ST
 
 | Class | Kinds (examples) | Rule |
 | --- | --- | --- |
-| Barrier | `session.created`, `branch.created`, `user.input`, `request.sent`, `response.committed`, `tool.admitted`, `tool.decision`, `tool.completed`, `lua.started`, `task.started`, `subagent.started`, `*.completed`, `checkpoint.installed`, `hook.applied` (when it changes model input), `rating.recorded`, `turn.completed` | `commit` before the dependent effect proceeds |
+| Barrier | `session.created`, `branch.created`, `user.input`, `request.sent`, `response.committed`, `tool.admitted`, `tool.decision`, `tool.completed`, `lua.started`, `task.started`, `subagent.started`, `subagent.message`, `*.completed`, `checkpoint.installed`, `hook.applied` (when it changes model input), `rating.recorded`, `turn.completed` | `commit` before the dependent effect proceeds |
 | Observation | `request.prepared`, `request.admitted`, `provider.observed`, `tool.validation_failed`, `tool.repaired`, `retry.scheduled`, `cache.observed`, `resource.observed`, `hook.failed`, `runtime.message` | buffered; written in the next barrier transaction or when the batch reaches `JOURNAL_BATCH_RECORDS`, `JOURNAL_BATCH_BYTES`, or `JOURNAL_BATCH_AGE` |
 
 The owner is the only writer for its session. A commit is one short immediate transaction; no transaction spans a network operation or a wait. Results that publish together commit together. A failed commit latches `Storage_Failed`: admission stops, cleanup continues without the journal. A crash may lose buffered observations, never barriers.
@@ -547,6 +548,7 @@ cache.observed resource.observed
 rating.recorded rating.cleared assessment.recorded
 runtime.message job.abandoned job.reclaimed
 selection.changed
+subagent.message
 ```
 
 Every record fills the correlation columns that exist at that point: session, branch, node, turn, request, attempt, job, call, parent call, task, subagent, hook, provider, model. A record states one fact at the boundary that observed it, once. Summaries are computed by readers.
@@ -945,7 +947,11 @@ The team owns the parent snapshot and child records. Teardown closes admission, 
 
 ### 21.2 Required later work
 
-- Coordination through the journal. Child start, messages, and outcomes become journal records committed before their effects (invariant 2), so recovery restores a delegation after a crash instead of losing in-memory team state.
+- Coordination through the journal. Child start, messages, and outcomes become journal records committed before their effects (invariant 2), so recovery restores a delegation after a crash instead of losing in-memory team state. The journal side exists; the harness does not use it yet. The protocol:
+  - The child's `Session_Id` names the delegation and fills the `subagent` column of every record about it. The parent chooses it and commits `subagent.started{name, program, model, effort, background}` with its call before the child starts; the child passes the same id to `create_session` with `parent_session` and `parent_call`.
+  - A message is a `subagent.message` record in the sender's session, with the text in `body`, committed before the receiver is woken. The receiver reads `Filter{session = peer, subagent = child, kinds = {.Subagent_Message}}` after `last_delivered_message` of its own session, and delivers each message as a `User` node with origin `Agent` whose payload names the message's seq. Delivery commits with the node, so a restart neither loses nor repeats a message.
+  - The parent commits `subagent.completed` for its call with the child's final answer in `body`. A parent's children are `list_sessions(Session_Filter{parent = parent})`.
+  - Threads wake each other through the owner wake after the commit; nothing polls the database.
 - Access and policy. Child permission requests, ACP ones included, should reach the parent's `tool.before_execute` hooks and policy, and children may get access scopes such as read-only.
 - Workspace isolation. Children that write need their own workspace so concurrent edits cannot collide. The mechanism (a Jujutsu workspace, a Git worktree, or another copy) and how a child's changes return to the parent are still open. Until then children share the parent's workspace.
 
@@ -1099,8 +1105,8 @@ These mechanisms exist in the code today and are replaced by the named target. D
 | harness caps: Code Mode print log 8 KiB, Lua conversion 256 and 16,384 nodes, 32 child summaries, ACP frames 10 MB, MCP messages 4 MiB and depth 64, MCP discovery 32 pages of 1,024 tools, skill files 256 KiB | no harness caps; whole results kept, then previewed (sections 2.1, 14.3) |
 | a result rendered by `tool_result_of` where the executor built it | typed output kept until commit, rendered once at commit (section 14.3) |
 | catalog replaced under a mutex and the old one destroyed; selection reapplied mid-turn | immutable reference-counted snapshots, kept by admitted work (section 13.3) |
-| `request.sent` without body digest and sizes; request preparation only in `runtime.message` | structured `request.sent` and `request.prepared` records (section 11.3) |
-| existing journal paths keep wider permissions | narrowed on writable open (section 8.2) |
+| request preparation only in `runtime.message` | a structured `request.prepared` record (section 11.3) |
+| subagent start, messages, and outcomes held in in-memory team state | the journal protocol of section 21.2 |
 | native background subagents start without an admission gate | `SUBAGENTS_MAX_RUNNING` (section 27) |
 | `agent/skills` with skill list and load tools | `agent/material` (sections 18, 19) |
 | no hooks, Tasks, rules, commands, tool policy, fork or branch selection, ratings | sections 10.2, 14.2, and 18 to 24 |

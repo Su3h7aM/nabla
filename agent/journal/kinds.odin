@@ -56,6 +56,7 @@ Record_Kind :: enum u8 {
 	Job_Abandoned,
 	Job_Reclaimed,
 	Selection_Changed,
+	Subagent_Message,
 }
 
 RECORD_KIND_NAMES := [Record_Kind]string {
@@ -111,6 +112,7 @@ RECORD_KIND_NAMES := [Record_Kind]string {
 	.Job_Abandoned          = "job.abandoned",
 	.Job_Reclaimed          = "job.reclaimed",
 	.Selection_Changed      = "selection.changed",
+	.Subagent_Message       = "subagent.message",
 }
 
 // Node_Kind is the closed set of committed conversational steps, stored in the

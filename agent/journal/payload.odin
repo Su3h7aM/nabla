@@ -119,7 +119,7 @@ Completion :: struct {
 }
 
 Tool_Completed :: Completion
-Call_Completed :: Completion // lua.completed, task.completed, subagent.completed
+Call_Completed :: Completion // lua.completed, task.completed
 
 // Turn_Completed ends a turn. reason is why its request chain stopped and cause
 // what kept the context from fitting, both "" when absent.
@@ -232,6 +232,33 @@ Request_Sent :: struct {
 	model_requested: string,
 	// recovery is how the send came to be: initial, transient_retry, or checkpoint_repair.
 	recovery:        string,
+	body_digest:     string, // hex SHA-256 of the frozen body, "" when the body was not encoded
+	body_bytes:      int,
+}
+
+// Subagent_Started opens a delegation in the parent's session, committed before
+// the child starts. The record's call is the parent's call, and its subagent
+// column the child's session id, chosen here so the child creates that session.
+// program names the ACP agent, "" for a native child.
+Subagent_Started :: struct {
+	version:    int,
+	name:       string,
+	program:    string,
+	provider:   string,
+	model:      string,
+	effort:     string,
+	background: bool,
+}
+
+// Subagent_Completed ends a delegation in the parent's session; the child's
+// final answer, or why there is none, is in the body.
+Subagent_Completed :: Completion
+
+// Subagent_Message carries one message of a delegation in the body. The record's
+// session is the sender's and its subagent column the child's session, so each
+// side reads the other's messages with Filter{session = peer, subagent = child}.
+Subagent_Message :: struct {
+	version: int,
 }
 
 // Response_Committed carries the endpoint's native output items in the body. A
@@ -265,6 +292,9 @@ Tool_Admitted :: struct {
 User :: struct {
 	version: int,
 	origin:  string, // USER_ORIGIN_NAMES
+	// message is the seq of the subagent.message this node delivers, 0 for none.
+	// The highest one is where the session's reading of its peer's messages resumes.
+	message: Journal_Seq,
 }
 
 // Assistant carries the visible text in the node body. partial marks text kept

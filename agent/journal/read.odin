@@ -10,21 +10,24 @@ import "nabla:db"
 // Filter selects records. A zero field matches anything; empty kinds or nodes
 // match every kind or node.
 Filter :: struct {
-	session: Session_Id,
+	session:  Session_Id,
 	// named also matches session-less records whose data names session, such as a
 	// runtime.message another session's owner drained.
-	named:   bool,
-	kinds:   bit_set[Record_Kind;u128],
-	turn:    Turn_Id,
-	request: Request_Id,
-	call:    Call_Id,
-	nodes:   []Node_Id,
+	named:    bool,
+	kinds:    bit_set[Record_Kind;u128],
+	turn:     Turn_Id,
+	request:  Request_Id,
+	call:     Call_Id,
+	// subagent selects the records of one delegation, named by the child's session.
+	subagent: Session_Id,
+	nodes:    []Node_Id,
 }
 
 // Session_Filter selects sessions. The zero value lists all of them, newest
 // activity first.
 Session_Filter :: struct {
 	session:   Session_Id,
+	parent:    Session_Id, // lists the subagent sessions this session started
 	workspace: string,
 	role:      Maybe(Session_Role),
 	limit:     int, // 0 lists every match
@@ -223,6 +226,17 @@ read_artifact :: proc(journal: ^Journal, digest: Digest, allocator: mem.Allocato
 	return bytes, true, nil
 }
 
+// last_delivered_message returns the highest subagent.message seq a User node of
+// session delivered, 0 when none did. Reading the peer's messages after it finds
+// the undelivered ones, across restarts, because delivery commits with the node.
+@(require_results)
+last_delivered_message :: proc(journal: ^Journal, session: Session_Id) -> (seq: Journal_Seq, error: Error) {
+	assert(journal.open)
+	session := session
+	value := query_int(journal, LAST_DELIVERED_QUERY, {db.Value(session[:])}) or_return
+	return Journal_Seq(value), nil
+}
+
 @(require_results)
 usage_totals :: proc(journal: ^Journal, session: Session_Id) -> (totals: Usage_Totals, error: Error) {
 	assert(journal.open)
@@ -264,6 +278,8 @@ list_sessions :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.
 	query_start(&query, SESSION_LIST_QUERY) or_return
 	session := filter.session
 	if session != {} { query_add(&query, " AND session = ?", db.Value(session[:])) or_return }
+	parent := filter.parent
+	if parent != {} { query_add(&query, " AND parent_session = ?", db.Value(parent[:])) or_return }
 	if filter.workspace != "" { query_add(&query, " AND workspace = ?", filter.workspace) or_return }
 	if role, has_role := filter.role.?; has_role { query_add(&query, " AND role = ?", SESSION_ROLE_NAMES[role]) or_return }
 	if filter.before != 0 { query_add(&query, " AND last_seq < ?", i64(filter.before)) or_return }
@@ -421,6 +437,9 @@ SELECT active.branch, COALESCE(
 	0)
 FROM active`
 
+@(private)
+LAST_DELIVERED_QUERY :: `SELECT COALESCE(MAX(json_extract(data, '$.message')), 0) FROM nodes WHERE session = ? AND kind = 'user'`
+
 // A count the provider did not report is JSON null, which SUM and the paired
 // test both skip, so it never enters a total as zero.
 @(private)
@@ -534,6 +553,7 @@ query_filter :: proc(query: ^Query, filter: ^Filter) -> mem.Allocator_Error {
 	if filter.turn != 0 { query_add(query, " AND turn = ?", i64(filter.turn)) or_return }
 	if filter.request != 0 { query_add(query, " AND request = ?", i64(filter.request)) or_return }
 	if filter.call != 0 { query_add(query, " AND call = ?", i64(filter.call)) or_return }
+	if filter.subagent != {} { query_add(query, " AND subagent = ?", db.Value(filter.subagent[:])) or_return }
 	if filter.kinds != {} {
 		query_add(query, " AND kind IN (") or_return
 		separator := ""

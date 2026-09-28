@@ -608,3 +608,85 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	_expect_ok(test, moved_error)
 	testing.expect_value(test, moved_head, forked)
 }
+
+// A delegation is coordinated through records alone: each side has its own
+// connection, as it would on its own thread, and a message is delivered exactly
+// once because its delivery commits with the node that carries it.
+@(test)
+test_delegation_messages_are_delivered_once :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	parent_journal, child_journal: Journal
+	_open_journal(test, &parent_journal, directory)
+	defer _close_journal(test, &parent_journal)
+	_open_journal(test, &child_journal, directory)
+	defer _close_journal(test, &child_journal)
+
+	parent := _create_session(test, &parent_journal, {workspace = "/tmp/project", role = .Main})
+	call := next_call(&parent_journal)
+	child := session_id_create()
+	append_record(
+		&parent_journal,
+		Record{session = parent, call = call, subagent = child, kind = .Subagent_Started},
+		Subagent_Started{name = "agent-1", model = "gpt-5", effort = "low"},
+	)
+	_commit_ok(test, &parent_journal)
+	testing.expect_value(
+		test,
+		_create_session(test, &child_journal, {id = child, workspace = "/tmp/project", role = .Subagent, parent_session = parent, parent_call = call}),
+		child,
+	)
+	_commit_ok(test, &child_journal)
+
+	children, children_error := list_sessions(&parent_journal, {parent = parent}, context.allocator)
+	_expect_ok(test, children_error)
+	defer session_summaries_destroy(children, context.allocator)
+	testing.expect_value(test, len(children), 1)
+	testing.expect_value(test, children[0].id, child)
+	testing.expect_value(test, children[0].parent_call, call)
+
+	append_record(&parent_journal, Record{session = parent, subagent = child, kind = .Subagent_Message}, Subagent_Message{}, _body("check the tests"))
+	_commit_ok(test, &parent_journal)
+
+	inbox := Filter {
+		session  = parent,
+		subagent = child,
+		kinds    = {.Subagent_Message},
+	}
+	delivered, delivered_error := last_delivered_message(&child_journal, child)
+	_expect_ok(test, delivered_error)
+	testing.expect_value(test, delivered, Journal_Seq(0))
+	messages, _, messages_error := read_records(&child_journal, inbox, delivered, 0, context.allocator)
+	_expect_ok(test, messages_error)
+	defer records_destroy(messages, context.allocator)
+	testing.expect_value(test, len(messages), 1)
+	testing.expect_value(test, string(messages[0].body), "check the tests")
+
+	_ = append_node(
+		&child_journal,
+		Node{session = child, branch = INITIAL_BRANCH, kind = .User, turn = 1},
+		User{origin = USER_ORIGIN_NAMES[.Agent], message = messages[0].seq},
+		messages[0].body,
+	)
+	_commit_ok(test, &child_journal)
+
+	// After the delivery commits, resuming from the delivered seq finds nothing,
+	// which is what a restarted child would see.
+	resumed, resumed_error := last_delivered_message(&child_journal, child)
+	_expect_ok(test, resumed_error)
+	testing.expect_value(test, resumed, messages[0].seq)
+	pending, _, pending_error := read_records(&child_journal, inbox, resumed, 0, context.allocator)
+	_expect_ok(test, pending_error)
+	defer records_destroy(pending, context.allocator)
+	testing.expect_value(test, len(pending), 0)
+
+	// The child's reply is its own record, which the parent reads from the child's session.
+	append_record(&child_journal, Record{session = child, subagent = child, kind = .Subagent_Message}, Subagent_Message{}, _body("done"))
+	_commit_ok(test, &child_journal)
+	replies, _, replies_error := read_records(&parent_journal, Filter{session = child, subagent = child, kinds = {.Subagent_Message}}, 0, 0, context.allocator)
+	_expect_ok(test, replies_error)
+	defer records_destroy(replies, context.allocator)
+	testing.expect_value(test, len(replies), 1)
+	testing.expect_value(test, string(replies[0].body), "done")
+}
