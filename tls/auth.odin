@@ -1,5 +1,7 @@
 package tls
 
+import "base:runtime"
+
 import "core:bytes"
 import "core:crypto"
 import "core:crypto/ecdsa"
@@ -36,8 +38,13 @@ certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (ch
 	entries := read_section_u24(&reader)
 	if !reader.ok { return {}, false }
 
-	certificates := make([dynamic]x509.Certificate, 0, 4, allocator)
-	ders := make([dynamic][]u8, 0, 4, allocator)
+	certificates, certificate_err := make([dynamic]x509.Certificate, 0, 4, allocator)
+	ders, der_err := make([dynamic][]u8, 0, 4, allocator)
+	if certificate_err != nil || der_err != nil {
+		delete(certificates)
+		delete(ders)
+		return {}, false
+	}
 	failed := false
 	for entries.ok && entries.at < len(entries.data) {
 		encoded := read_bytes(&entries, read_u24(&entries))
@@ -47,7 +54,11 @@ certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (ch
 			break
 		}
 
-		der := make([]u8, len(encoded), allocator)
+		der, make_err := make([]u8, len(encoded), allocator)
+		if make_err != nil {
+			failed = true
+			break
+		}
 		copy(der, encoded)
 		certificate, parse_err := x509.parse(der, allocator)
 		if parse_err != nil {
@@ -55,8 +66,18 @@ certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (ch
 			failed = true
 			break
 		}
-		append(&certificates, certificate)
-		append(&ders, der)
+		if _, append_err := append(&certificates, certificate); append_err != nil {
+			x509.destroy(&certificate, allocator)
+			delete(der, allocator)
+			failed = true
+			break
+		}
+		if _, append_err := append(&ders, der); append_err != nil {
+			// The certificate is already in the list the failure path destroys.
+			delete(der, allocator)
+			failed = true
+			break
+		}
 	}
 
 	if failed || !reader.ok || reader.at != len(reader.data) || !entries.ok || entries.at != len(entries.data) || len(certificates) == 0 {
@@ -83,11 +104,13 @@ certificate_chain_destroy :: proc(chain: ^Certificate_Chain) {
 }
 
 // certificate_pointers returns the certificates as the pointers core's verifier
-// takes, which is the caller's to free.
-certificate_pointers :: proc(certificates: []x509.Certificate, allocator: mem.Allocator) -> []^x509.Certificate {
-	pointers := make([]^x509.Certificate, len(certificates), allocator)
+// takes, which is the caller's to free. mem_err is set when that list could not be
+// allocated, and the caller owns nothing.
+certificate_pointers :: proc(certificates: []x509.Certificate, allocator: mem.Allocator) -> (pointers: []^x509.Certificate, mem_err: runtime.Allocator_Error) {
+	pointers, mem_err = make([]^x509.Certificate, len(certificates), allocator)
+	if mem_err != nil { return nil, mem_err }
 	for &certificate, at in certificates { pointers[at] = &certificate }
-	return pointers
+	return pointers, nil
 }
 
 // SERVER_CERTIFICATE_VERIFY_CONTEXT is the context a server signs its

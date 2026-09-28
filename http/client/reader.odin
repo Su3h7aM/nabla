@@ -26,11 +26,17 @@ Reader :: struct {
 	tail:      int,
 }
 
-reader_init :: proc(reader: ^Reader, read: Read_Proc, user_data: rawptr, allocator: mem.Allocator) {
+// reader_init prepares reader to read through `read`. The caller owns the buffer
+// and releases it with reader_destroy. err is .No_Room when the buffer could not
+// be allocated, and the reader then holds nothing.
+reader_init :: proc(reader: ^Reader, read: Read_Proc, user_data: rawptr, allocator: mem.Allocator) -> (err: Error) {
 	reader.read = read
 	reader.user_data = user_data
 	reader.allocator = allocator
-	reader.buffer = make([]u8, READER_INITIAL_BYTES, allocator)
+	buffer, make_err := make([]u8, READER_INITIAL_BYTES, allocator)
+	if make_err != nil { return .No_Room }
+	reader.buffer = buffer
+	return .None
 }
 
 reader_destroy :: proc(reader: ^Reader) {
@@ -54,7 +60,8 @@ reader_fill :: proc(reader: ^Reader) -> Error {
 			size, overflowed = intrinsics.overflow_mul(len(reader.buffer), 2)
 			if overflowed { return .Bad_Response }
 		}
-		grown := make([]u8, size, reader.allocator)
+		grown, make_err := make([]u8, size, reader.allocator)
+		if make_err != nil { return .No_Room }
 		copy(grown, reader.buffer[:reader.tail])
 		delete(reader.buffer, reader.allocator)
 		reader.buffer = grown

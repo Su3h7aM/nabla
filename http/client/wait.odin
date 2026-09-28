@@ -95,7 +95,12 @@ wait_connected :: proc(endpoint: net.Endpoint, probe: Probe) -> (socket: net.TCP
 			nbio.remove(op)
 			return 0, probe_stop
 		}
-		nbio.tick(WAIT_SLICE)
+		if nbio.tick(WAIT_SLICE) != nil {
+			// The wait itself failed, which the caller reads as a connect that
+			// failed on its own.
+			nbio.remove(op)
+			return 0, .None
+		}
 	}
 
 	if state.failed {
@@ -162,7 +167,10 @@ wait_ready :: proc(socket: net.Any_Socket, kind: Ready_For, probe: Probe, timeou
 			}
 			if remaining < slice { slice = remaining }
 		}
-		nbio.tick(slice)
+		if nbio.tick(slice) != nil {
+			nbio.remove(op)
+			return .Failed, .Failed
+		}
 	}
 
 	switch state.result {

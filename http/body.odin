@@ -68,7 +68,9 @@ body_url_encoded :: proc(encoded: Body, allocator := context.temp_allocator) -> 
 		if character == '&' { count += 1 }
 	}
 
-	queries = make(map[string]string, count, allocator)
+	parsed, make_err := make(map[string]string, count, allocator)
+	if make_err != nil { return nil, false }
+	queries = parsed
 
 	key_start := 0
 	value_start := -1
@@ -226,7 +228,12 @@ _body_chunked :: proc(request: ^Request, max_length: int = -1, user_data: rawptr
 		state.request._scanner.max_token_size = 0
 		state.request._scanner.split = scan_lines
 
-		strings.write_string(&state.buffer, token)
+		// A builder reports the growth it could not make as a short write, which
+		// would silently truncate the body a handler sees.
+		if strings.write_string(&state.buffer, token) != len(token) {
+			state.callback(state.user_data, "", .Unknown)
+			return
+		}
 
 		on_scan_empty_line :: proc(state_data: rawptr, token: string, err: bufio.Scanner_Error) {
 			state := cast(^Chunked_State)state_data
@@ -281,7 +288,11 @@ _body_chunked :: proc(request: ^Request, max_length: int = -1, user_data: rawptr
 			state.callback(state.user_data, "", .Bad_Read_Count)
 			return
 		}
-		lower := sanitize_key(state.request.headers, name)
+		lower, lower_err := sanitize_key(state.request.headers, name)
+		if lower_err != nil {
+			state.callback(state.user_data, "", .Unknown)
+			return
+		}
 		if header_allowed_trailer(lower) && !headers_has_unsafe(state.request.headers, lower) {
 			state.request.headers.readonly = false
 			_, ok := header_parse(&state.request.headers, line)

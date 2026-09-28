@@ -159,7 +159,9 @@ respond_json :: proc(
 	response_writer_init(&writer, response, buffer[:])
 
 	// Ends the body and sends the response.
-	defer io.close(writer.output)
+	// The close is what sends the response, and the call is already returning when
+	// it runs, so its own failure has no channel left to travel on.
+	defer _ = io.close(writer.output)
 
 	if err = json.marshal_to_writer(writer.output, value, &options); err != nil {
 		headers_set_close(&response.headers)

@@ -7,6 +7,8 @@ package http
 // still emit them, so all three grammars live here. None of them is ISO 8601 or
 // RFC 3339, and none of them may be given to a parser for either.
 
+import "base:runtime"
+
 import "core:io"
 import "core:slice"
 import "core:strings"
@@ -57,16 +59,19 @@ date_write :: proc(writer: io.Writer, instant: time.Time) -> io.Error {
 }
 
 // date_string returns instant formatted as date_write writes it, owned by the
-// caller's allocator.
-date_string :: proc(instant: time.Time, allocator := context.allocator) -> string {
+// caller's allocator. mem_err is set when that buffer could not be allocated.
+date_string :: proc(instant: time.Time, allocator := context.allocator) -> (text: string, mem_err: runtime.Allocator_Error) {
 	builder: strings.Builder
 
-	buffer := make([]byte, HTTP_DATE_LENGTH, allocator)
+	buffer, make_err := make([]byte, HTTP_DATE_LENGTH, allocator)
+	if make_err != nil { return "", make_err }
 	builder.buf = slice.into_dynamic(buffer)
 
-	date_write(strings.to_writer(&builder), instant)
+	// The date is a fixed-length format written into an exactly sized buffer, so
+	// the write cannot fail.
+	_ = date_write(strings.to_writer(&builder), instant)
 
-	return strings.to_string(builder)
+	return strings.to_string(builder), nil
 }
 
 // date_parse reads one HTTP date in any of the three formats a recipient

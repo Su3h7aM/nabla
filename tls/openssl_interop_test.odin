@@ -9,6 +9,8 @@ package tls
 // needs it installed; it runs the six peers sequentially through one
 // certificate in a per-test directory.
 
+import "base:runtime"
+
 import "core:fmt"
 import "core:net"
 import "core:os"
@@ -141,7 +143,8 @@ interop_run_client :: proc(t: ^testing.T, directory: string, socket: net.TCP_Soc
 	defer roots_destroy(&roots)
 	if !testing.expect(t, roots_ok, "the server certificate is not a trust store") { return }
 
-	anchors := certificate_pointers(roots.certificates, context.allocator)
+	anchors, anchors_err := certificate_pointers(roots.certificates, context.allocator)
+	if !testing.expect_value(t, anchors_err, runtime.Allocator_Error.None) { return }
 	defer delete(anchors, context.allocator)
 
 	transport := Interop_Connection {

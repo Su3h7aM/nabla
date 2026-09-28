@@ -127,7 +127,9 @@ connection_handshake :: proc(connection: ^Connection, host: string) -> Error {
 	roots, roots_ok := load_roots(connection)
 	if !roots_ok { return .TLS_Trust }
 	connection.roots = roots
-	connection.anchors = tls.certificate_pointers(roots.certificates, connection.allocator)
+	anchors, anchors_err := tls.certificate_pointers(roots.certificates, connection.allocator)
+	if anchors_err != nil { return .TLS_Config }
+	connection.anchors = anchors
 
 	session, init_err := tls.init(tls_transport(connection), {roots = connection.anchors, allocator = connection.allocator})
 	if init_err != tls.Error.None { return .TLS_Config }

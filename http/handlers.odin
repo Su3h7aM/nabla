@@ -1,5 +1,7 @@
 package http
 
+import "base:runtime"
+
 import "core:net"
 import "core:strconv"
 import "core:sync"
@@ -69,15 +71,25 @@ rate_limit_destroy :: proc(data: ^Rate_Limit_Data) {
 	delete(data.hits)
 }
 
-// Basic rate limit based on IP address.
-rate_limit :: proc(data: ^Rate_Limit_Data, next: ^Handler, opts: ^Rate_Limit_Opts, allocator := context.allocator) -> Handler {
+// Basic rate limit based on IP address. mem_err is set, and no handler is
+// returned, when the table the limiter counts in could not be allocated.
+rate_limit :: proc(
+	data: ^Rate_Limit_Data,
+	next: ^Handler,
+	opts: ^Rate_Limit_Opts,
+	allocator := context.allocator,
+) -> (
+	result: Handler,
+	mem_err: runtime.Allocator_Error,
+) {
 	assert(next != nil)
 
-	result: Handler
 	result.next = next
 
 	data.opts = opts
-	data.hits = make(map[net.Address]int, 16, allocator)
+	hits, make_err := make(map[net.Address]int, 16, allocator)
+	if make_err != nil { return {}, make_err }
+	data.hits = hits
 	data.next_sweep = time.time_add(time.now(), opts.window)
 	result.user_data = data
 
@@ -100,9 +112,13 @@ rate_limit :: proc(data: ^Rate_Limit_Data, next: ^Handler, opts: ^Rate_Limit_Opt
 			response.status = .Too_Many_Requests
 
 			retry_after := i64(time.diff(time.now(), data.next_sweep) / time.Second)
-			buffer := make([]byte, 32, context.temp_allocator)
-			retry_text := strconv.write_int(buffer, retry_after, 10)
-			headers_set_unsafe(&response.headers, "retry-after", retry_text)
+			buffer, buffer_err := make([]byte, 32, context.temp_allocator)
+			// Without room for the delay the limit is still answered, just without
+			// the header that states when to come back.
+			if buffer_err == nil {
+				retry_text := strconv.write_int(buffer, retry_after, 10)
+				headers_set_unsafe(&response.headers, "retry-after", retry_text)
+			}
 
 			if on_limit, ok := data.opts.on_limit.(Rate_Limit_On_Limit); ok {
 				on_limit.on_limit(request, response, on_limit.user_data)
@@ -116,5 +132,5 @@ rate_limit :: proc(data: ^Rate_Limit_Data, next: ^Handler, opts: ^Rate_Limit_Opt
 		next_handler.handle(next_handler, request, response)
 	}
 
-	return result
+	return result, nil
 }

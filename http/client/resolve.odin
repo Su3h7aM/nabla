@@ -15,7 +15,10 @@ import "nabla:dns"
 resolve_addresses :: proc(hostname: string, options: Options, allocator: mem.Allocator) -> (addresses: [dynamic]net.Address, err: Error) {
 	addresses.allocator = allocator
 	if host, ok := dns.hosts_lookup(hostname, allocator); ok {
-		append(&addresses, host)
+		if _, append_err := append(&addresses, host); append_err != nil {
+			delete(addresses)
+			return nil, .No_Room
+		}
 		return addresses, .None
 	}
 	if !net.validate_hostname(hostname) { return addresses, .None }
@@ -48,9 +51,15 @@ resolve_addresses :: proc(hostname: string, options: Options, allocator: mem.All
 		for record in records {
 			#partial switch value in record {
 			case net.DNS_Record_IP4:
-				append(&addresses, value.address)
+				if _, append_err := append(&addresses, value.address); append_err != nil {
+					delete(addresses)
+					return nil, .No_Room
+				}
 			case net.DNS_Record_IP6:
-				append(&addresses, value.address)
+				if _, append_err := append(&addresses, value.address); append_err != nil {
+					delete(addresses)
+					return nil, .No_Room
+				}
 			}
 		}
 	}

@@ -10,6 +10,8 @@ Write_Error :: enum {
 	// and change how the stream is parsed: CR in any value, or LF in anything
 	// but data.
 	Invalid_Value,
+	// The buffer could not grow to hold the event.
+	No_Room,
 }
 
 // write_event appends one complete event to buffer: its fields, then the blank
@@ -23,7 +25,8 @@ Write_Error :: enum {
 // present, and an id that is present but empty writes a bare "id:" -- which is
 // how the format resets the reader's last event ID.
 //
-// Writes are all-or-nothing: on .Invalid_Value nothing is appended.
+// Writes are all-or-nothing: on .Invalid_Value and on .No_Room, which is the
+// buffer failing to grow, nothing is appended.
 write_event :: proc(buffer: ^[dynamic]u8, data: string, event_type := "", id: Maybe(string) = nil, retry_ms: Maybe(i64) = nil) -> Write_Error {
 	// Validate before appending, so a rejected event leaves buffer untouched.
 	if strings.contains_rune(event_type, '\r') || strings.contains_rune(event_type, '\n') {
@@ -36,26 +39,40 @@ write_event :: proc(buffer: ^[dynamic]u8, data: string, event_type := "", id: Ma
 		}
 	}
 
+	start := len(buffer^)
+	if err := write_event_fields(buffer, data, event_type, id, retry_ms); err != .None {
+		// Truncating back to where the event began cannot allocate: the buffer
+		// already holds it.
+		_ = resize(buffer, start)
+		return err
+	}
+	return .None
+}
+
+// write_event_fields appends the fields of one event to buffer, which
+// write_event truncates back on a failure.
+@(private)
+write_event_fields :: proc(buffer: ^[dynamic]u8, data: string, event_type: string, id: Maybe(string), retry_ms: Maybe(i64)) -> Write_Error {
 	if retry_value, has_retry := retry_ms.?; has_retry {
 		scratch: [32]u8
 		line := fmt.bprintf(scratch[:], "retry: %d\n", retry_value)
-		append(buffer, ..transmute([]u8)line)
+		if _, append_err := append(buffer, ..transmute([]u8)line); append_err != nil { return .No_Room }
 	}
 	if id_value, has_id := id.?; has_id {
-		append_field(buffer, "id", id_value)
+		if err := append_field(buffer, "id", id_value); err != .None { return err }
 	}
 	if event_type != "" && event_type != DEFAULT_EVENT_TYPE {
-		append_field(buffer, "event", event_type)
+		if err := append_field(buffer, "event", event_type); err != .None { return err }
 	}
 
 	line_start := 0
 	for i in 0 ..= len(data) {
 		if i == len(data) || data[i] == '\n' {
-			append_field(buffer, "data", data[line_start:i])
+			if err := append_field(buffer, "data", data[line_start:i]); err != .None { return err }
 			line_start = i + 1
 		}
 	}
-	append(buffer, '\n')
+	if _, append_err := append(buffer, '\n'); append_err != nil { return .No_Room }
 	return .None
 }
 
@@ -64,12 +81,13 @@ write_event :: proc(buffer: ^[dynamic]u8, data: string, event_type := "", id: Ma
 // with a space keeps it, and an empty value is written without the space to
 // leave no trailing whitespace on the line.
 @(private)
-append_field :: proc(buffer: ^[dynamic]u8, name, value: string) {
-	append(buffer, ..transmute([]u8)name)
-	append(buffer, ':')
+append_field :: proc(buffer: ^[dynamic]u8, name, value: string) -> (err: Write_Error) {
+	if _, append_err := append(buffer, ..transmute([]u8)name); append_err != nil { return .No_Room }
+	if _, append_err := append(buffer, ':'); append_err != nil { return .No_Room }
 	if len(value) > 0 {
-		append(buffer, ' ')
-		append(buffer, ..transmute([]u8)value)
+		if _, append_err := append(buffer, ' '); append_err != nil { return .No_Room }
+		if _, append_err := append(buffer, ..transmute([]u8)value); append_err != nil { return .No_Room }
 	}
-	append(buffer, '\n')
+	if _, append_err := append(buffer, '\n'); append_err != nil { return .No_Room }
+	return .None
 }

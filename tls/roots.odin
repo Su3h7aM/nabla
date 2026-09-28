@@ -25,30 +25,53 @@ trust store.
 roots_parse :: proc(text: []u8, allocator: mem.Allocator) -> (roots: Roots, ok: bool) {
 	roots.allocator = allocator
 
-	certificates := make([dynamic]x509.Certificate, 0, 16, allocator)
-	ders := make([dynamic][]u8, 0, 16, allocator)
+	certificates, certificate_err := make([dynamic]x509.Certificate, 0, 16, allocator)
+	ders, der_err := make([dynamic][]u8, 0, 16, allocator)
+	if certificate_err != nil || der_err != nil {
+		delete(certificates)
+		delete(ders)
+		return {}, false
+	}
 
+	failed := false
 	remaining := text
 	for {
 		block, rest, err := pem.decode(remaining, allocator)
 		if block != nil {
 			if block.label == pem.LABEL_CERTIFICATE {
-				der := make([]u8, len(block.data), allocator)
-				copy(der, block.data[:])
-				certificate, parse_err := x509.parse(der, allocator)
-				if parse_err == nil {
-					append(&certificates, certificate)
-					append(&ders, der)
+				der, make_err := make([]u8, len(block.data), allocator)
+				if make_err != nil {
+					failed = true
 				} else {
-					delete(der, allocator)
+					copy(der, block.data[:])
+					certificate, parse_err := x509.parse(der, allocator)
+					if parse_err != nil {
+						delete(der, allocator)
+					} else if _, append_err := append(&certificates, certificate); append_err != nil {
+						x509.destroy(&certificate, allocator)
+						delete(der, allocator)
+						failed = true
+					} else if _, der_append_err := append(&ders, der); der_append_err != nil {
+						// The certificate is already in the list this failure path
+						// destroys.
+						delete(der, allocator)
+						failed = true
+					}
 				}
 			}
 			delete(block.data)
 			delete(block.label, allocator)
 			free(block, allocator)
 		}
-		if err != nil || block == nil { break }
+		if failed || err != nil || block == nil { break }
 		remaining = rest
+	}
+
+	if failed {
+		roots.certificates = certificates[:]
+		roots.der = ders[:]
+		roots_destroy(&roots)
+		return {}, false
 	}
 
 	if len(certificates) == 0 {

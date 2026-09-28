@@ -17,7 +17,8 @@ import "core:strings"
 hosts_lookup :: proc(hostname: string, allocator: mem.Allocator) -> (address: net.Address, found: bool) {
 	handle, open_err := os.open(net.dns_configuration.hosts_file)
 	if open_err != nil { return nil, false }
-	defer os.close(handle)
+	// A close that fails changes nothing: the file was read already.
+	defer _ = os.close(handle)
 
 	hosts, ok := net.parse_hosts(os.to_stream(handle), allocator)
 	defer {

@@ -54,7 +54,10 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 
 	phase = .Response_Head
 	reader: Reader
-	reader_init(&reader, connection_read_source, connection, request.allocator)
+	if reader_err := reader_init(&reader, connection_read_source, connection, request.allocator); reader_err != .None {
+		connection_destroy(connection)
+		return nil, failure_from_error(reader_err, request.allocator)
+	}
 	defer reader_destroy(&reader)
 
 	head, headers, head_err := read_final_response_head(&reader, request.allocator)
@@ -81,16 +84,31 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 		return nil, Failure{kind = .HTTP_Status, status = status, detail = detail}
 	}
 
-	handle := new(Upgraded, request.allocator)
-	handle.connection = connection
-	handle.headers = headers
-	handle.allocator = request.allocator
 	// The reader may have buffered octets that belong to the upgraded protocol, and
 	// they are handed over in the order they arrived.
+	pending: []u8
 	if reader.head < reader.tail {
-		handle.pending = make([]u8, reader.tail - reader.head, request.allocator)
-		copy(handle.pending, reader.buffer[reader.head:reader.tail])
+		buffered, buffered_err := make([]u8, reader.tail - reader.head, request.allocator)
+		if buffered_err != nil {
+			http.headers_destroy(&headers)
+			connection_destroy(connection)
+			return nil, failure_from_error(.No_Room, request.allocator)
+		}
+		copy(buffered, reader.buffer[reader.head:reader.tail])
+		pending = buffered
 	}
+
+	handle, handle_err := new(Upgraded, request.allocator)
+	if handle_err != nil {
+		delete(pending, request.allocator)
+		http.headers_destroy(&headers)
+		connection_destroy(connection)
+		return nil, failure_from_error(.No_Room, request.allocator)
+	}
+	handle.connection = connection
+	handle.headers = headers
+	handle.pending = pending
+	handle.allocator = request.allocator
 
 	summary.request_complete = true
 	phase = .Complete

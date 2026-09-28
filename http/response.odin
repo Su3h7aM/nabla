@@ -276,15 +276,18 @@ _response_write_heading :: proc(response: ^Response, content_length: int) {
 
 	stream := bytes.buffer_to_stream(body_buffer)
 
+	// The head is written into a core:bytes.Buffer, whose writes report no
+	// failure: it grows with a resize whose allocation error it drops, so a
+	// writer over it can only ever return nil.
 	for header, value in response.headers._kv {
 		write_string(body_buffer, header) // already has newlines escaped.
 		write_string(body_buffer, ": ")
-		write_escaped_newlines(stream, value)
+		_ = write_escaped_newlines(stream, value)
 		write_string(body_buffer, "\r\n")
 	}
 
 	for cookie in response.cookies {
-		cookie_write(stream, cookie)
+		_ = cookie_write(stream, cookie)
 		write_string(body_buffer, "\r\n")
 	}
 

@@ -47,7 +47,7 @@ _reader :: proc(response: string, chunk := 0, truncated := false) -> Reader {
 	source.truncated = truncated
 
 	reader: Reader
-	reader_init(&reader, slice_read, source, context.temp_allocator)
+	assert(reader_init(&reader, slice_read, source, context.temp_allocator) == Error.None)
 	return reader
 }
 
@@ -189,7 +189,7 @@ test_interim_responses :: proc(t: ^testing.T) {
 	source := new(Slice_Source, context.temp_allocator)
 	source.bytes = many[:]
 	many_reader: Reader
-	reader_init(&many_reader, slice_read, source, context.temp_allocator)
+	testing.expect_value(t, reader_init(&many_reader, slice_read, source, context.temp_allocator), Error.None)
 	many_status, many_headers, many_err := read_final_response_head(&many_reader, context.temp_allocator)
 	defer http.headers_destroy(&many_headers)
 	testing.expect_value(t, many_err, Error.None)

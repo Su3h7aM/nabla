@@ -104,6 +104,7 @@ Default_Endpoint := net.Endpoint {
 Server_Error :: union #shared_nil {
 	net.Network_Error,
 	nbio.General_Error,
+	mem.Allocator_Error,
 }
 
 listen :: proc(server: ^Server, endpoint: net.Endpoint = Default_Endpoint, opts: Server_Opts = Default_Server_Opts) -> (err: Server_Error) {
@@ -129,9 +130,11 @@ serve :: proc(server: ^Server, handler: Handler) -> (err: Server_Error) {
 	}
 
 	thread_count := max(1, server.opts.thread_count)
+	threads, threads_err := make([]Server_Thread, thread_count, server.connection_allocator)
+	if threads_err != nil { return threads_err }
 	sync.wait_group_add(&server.threads_closed, thread_count)
 	sync.mutex_lock(&server.threads_mutex)
-	server.threads = make([]Server_Thread, thread_count, server.connection_allocator)
+	server.threads = threads
 	for &server_thread in server.threads[1:] {
 		server_thread.thread = thread.create_and_start_with_poly_data2(server, &server_thread, _server_thread_init, context)
 	}
@@ -141,7 +144,8 @@ serve :: proc(server: ^Server, handler: Handler) -> (err: Server_Error) {
 
 	sync.wait(&server.threads_closed)
 
-	net.shutdown(server.tcp_socket, .Both)
+	// A failed shutdown changes nothing: the socket closes on the next line.
+	_ = net.shutdown(server.tcp_socket, .Both)
 	net.close(server.tcp_socket)
 	sync.mutex_lock(&server.threads_mutex)
 	defer sync.mutex_unlock(&server.threads_mutex)
@@ -366,7 +370,9 @@ connection_close :: proc(connection: ^Connection, loc := #caller_location) {
 		return
 	}
 
-	net.shutdown(connection.socket, .Send)
+	// A failed half-close changes nothing: the linger read still ends the
+	// connection, and the socket closes after it.
+	_ = net.shutdown(connection.socket, .Send)
 	connection.close_deadline = time.time_add(nbio.now(), CLOSE_LINGER)
 	nbio.recv_poly(connection.socket, {connection.scanner.buffer[:]}, connection, on_linger_read, timeout = CLOSE_LINGER)
 }
@@ -489,6 +495,11 @@ connection_handle_request :: proc(connection: ^Connection, allocator := context.
 		case .Invalid_Version_Format, .Not_Enough_Fields:
 			// RFC 9112 3: an invalid request-line is answered with 400.
 			respond_early(loop, .Bad_Request)
+			return
+		case .Allocation:
+			// The request line could not be copied, so this request cannot be
+			// served; the connection closes after the response.
+			respond_early(loop, .Internal_Server_Error)
 			return
 		case .None:
 		}
@@ -617,7 +628,9 @@ server_date :: proc() -> string {
 	if second != current_thread.date_second {
 		current_thread.date_second = second
 		builder := strings.builder_from_bytes(current_thread.date[:])
-		date_write(strings.to_writer(&builder), now)
+		// The date is a fixed-length format written into an exactly sized buffer,
+		// so the write cannot fail.
+		_ = date_write(strings.to_writer(&builder), now)
 	}
 	return string(current_thread.date[:])
 }

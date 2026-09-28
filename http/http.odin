@@ -17,6 +17,8 @@ Requestline_Error :: enum {
 	Method_Not_Implemented,
 	Not_Enough_Fields,
 	Invalid_Version_Format,
+	// Allocation is the request target failing to be copied out of the line.
+	Allocation,
 }
 
 Requestline :: struct {
@@ -43,7 +45,9 @@ requestline_parse :: proc(text: string, allocator := context.temp_allocator) -> 
 	if !ok { return line, .Invalid_Version_Format }
 	line.method, ok = method_parse(text[:method_end])
 	if !ok { return line, .Method_Not_Implemented }
-	line.target = strings.clone(rest[:target_end], allocator)
+	target, clone_err := strings.clone(rest[:target_end], allocator)
+	if clone_err != nil { return line, .Allocation }
+	line.target = target
 	return line, .None
 }
 
@@ -342,8 +346,10 @@ header_parse :: proc(headers: ^Headers, line: string) -> (key: string, ok: bool)
 	// RFC 9112 5.1: the field line value excludes the optional whitespace that
 	// may precede and follow it.
 	value := trim_ows(line[colon + 1:])
-	allocator := headers._kv.allocator
-	name := sanitize_key(headers^, line[:colon])
+	allocator := headers_allocator(headers^)
+	name, name_err := sanitize_key(headers^, line[:colon])
+	// A field line that could not be named is one this section cannot carry.
+	if name_err != nil { return "", false }
 
 	key_ptr, value_ptr, just_inserted, insert_err := map_entry(&headers._kv, name)
 	if insert_err != nil {

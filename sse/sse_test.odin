@@ -59,9 +59,9 @@ parse :: proc(recorder: ^Recorder, chunks: ..string) {
 	for chunk in chunks {
 		// A chunk is bytes on the wire; a string literal is the most readable way
 		// to write one in a test.
-		parser_feed(&parser, transmute([]u8)chunk)
+		_ = parser_feed(&parser, transmute([]u8)chunk)
 	}
-	parser_finish(&parser)
+	_ = parser_finish(&parser)
 }
 
 expect_events :: proc(t: ^testing.T, recorder: ^Recorder, expected: []Recorded_Event, loc := #caller_location) {
@@ -286,9 +286,9 @@ test_end_of_stream_and_chunk_boundaries :: proc(t: ^testing.T) {
 	parser_init(&parser, record_event, &byte_at_a_time, allocator = byte_at_a_time.allocator)
 	defer parser_destroy(&parser)
 	for i in 0 ..< len(stream) {
-		parser_feed(&parser, transmute([]u8)stream[i:i + 1])
+		_ = parser_feed(&parser, transmute([]u8)stream[i:i + 1])
 	}
-	parser_finish(&parser)
+	_ = parser_finish(&parser)
 	expect_events(t, &byte_at_a_time, expected)
 }
 
@@ -321,11 +321,11 @@ test_large_lines_and_events_parse :: proc(t: ^testing.T) {
 		line := strings.concatenate({prefix, filler, "\n"}, context.temp_allocator)
 		lines := 0
 		for lines < 48 {
-			parser_feed(&parser, transmute([]u8)line)
+			_ = parser_feed(&parser, transmute([]u8)line)
 			lines += 1
 		}
-		parser_feed(&parser, transmute([]u8)string("\n"))
-		parser_finish(&parser)
+		_ = parser_feed(&parser, transmute([]u8)string("\n"))
+		_ = parser_finish(&parser)
 		testing.expect_value(t, len(recorder.events), 1)
 		testing.expect_value(t, len(recorder.events[0].data), 48 * (64 * 1024 + 1) - 1)
 	}
@@ -341,17 +341,17 @@ test_parser_lifecycle :: proc(t: ^testing.T) {
 		parser: Parser
 		parser_init(&parser, record_event, &recorder, allocator = recorder.allocator)
 		defer parser_destroy(&parser)
-		parser_feed(&parser, transmute([]u8)string("data: a\n\n"))
-		parser_finish(&parser)
-		parser_finish(&parser)
+		_ = parser_feed(&parser, transmute([]u8)string("data: a\n\n"))
+		_ = parser_finish(&parser)
+		_ = parser_finish(&parser)
 		testing.expect_value(t, len(recorder.events), 1)
 	}
 	{
 		parser: Parser
 		parser_init(&parser, nil)
 		defer parser_destroy(&parser)
-		parser_feed(&parser, transmute([]u8)string("data: a\n\n"))
-		parser_finish(&parser)
+		_ = parser_feed(&parser, transmute([]u8)string("data: a\n\n"))
+		_ = parser_finish(&parser)
 	}
 }
 

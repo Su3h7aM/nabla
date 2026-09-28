@@ -139,7 +139,7 @@ Error :: enum {
 	Send,
 	Recv,
 	Bad_Response,
-	// No_Room is a local allocation failure before a request can be sent.
+	// No_Room is a local allocation failure on the way to a response.
 	No_Room,
 }
 

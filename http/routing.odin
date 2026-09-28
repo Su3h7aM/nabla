@@ -91,9 +91,14 @@ Router :: struct {
 	all:       [dynamic]Route,
 }
 
-router_init :: proc(router: ^Router, allocator := context.allocator) {
+// router_init prepares a router whose patterns live in allocator. mem_err is set,
+// and the router owns nothing, when its table could not be allocated.
+router_init :: proc(router: ^Router, allocator := context.allocator) -> (mem_err: runtime.Allocator_Error) {
 	router.allocator = allocator
-	router.routes = make(map[Method][dynamic]Route, len(Method), allocator)
+	routes, make_err := make(map[Method][dynamic]Route, len(Method), allocator)
+	if make_err != nil { return make_err }
+	router.routes = routes
+	return nil
 }
 
 router_destroy :: proc(router: ^Router) {
@@ -123,13 +128,21 @@ router_handler :: proc(router: ^Router) -> Handler {
 		router := (^Router)(handler.user_data)
 		line := request.line.(Requestline)
 
-		if routes_try(router.routes[line.method], request, response) {
+		matched, routes_err := routes_try(router.routes[line.method], request, response)
+		if routes_err != nil {
+			response.status = .Internal_Server_Error
+			respond(response)
 			return
 		}
+		if matched { return }
 
-		if routes_try(router.all, request, response) {
+		matched, routes_err = routes_try(router.all, request, response)
+		if routes_err != nil {
+			response.status = .Internal_Server_Error
+			respond(response)
 			return
 		}
+		if matched { return }
 
 		// The method is a structural fact. The target is peer-supplied text that a
 		// persistent log has no business carrying, and a handler can record it
@@ -142,63 +155,94 @@ router_handler :: proc(router: ^Router) -> Handler {
 	return result
 }
 
-route_get :: proc(router: ^Router, pattern: string, handler: Handler) {
-	route_add(router, .Get, Route{handler = handler, pattern = strings.concatenate([]string{"^", pattern, "$"}, router.allocator)})
+// The route_* procedures each add one handler to a router. mem_err is set, and no
+// route was added, when the pattern or the route's slot could not be allocated.
+
+route_get :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
+	return route_add(router, .Get, pattern, handler)
 }
 
-route_post :: proc(router: ^Router, pattern: string, handler: Handler) {
-	route_add(router, .Post, Route{handler = handler, pattern = strings.concatenate([]string{"^", pattern, "$"}, router.allocator)})
+route_post :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
+	return route_add(router, .Post, pattern, handler)
 }
 
 // NOTE: this does not get called when `Server_Opts.redirect_head_to_get` is set to true.
-route_head :: proc(router: ^Router, pattern: string, handler: Handler) {
-	route_add(router, .Head, Route{handler = handler, pattern = strings.concatenate([]string{"^", pattern, "$"}, router.allocator)})
+route_head :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
+	return route_add(router, .Head, pattern, handler)
 }
 
-route_put :: proc(router: ^Router, pattern: string, handler: Handler) {
-	route_add(router, .Put, Route{handler = handler, pattern = strings.concatenate([]string{"^", pattern, "$"}, router.allocator)})
+route_put :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
+	return route_add(router, .Put, pattern, handler)
 }
 
-route_patch :: proc(router: ^Router, pattern: string, handler: Handler) {
-	route_add(router, .Patch, Route{handler = handler, pattern = strings.concatenate([]string{"^", pattern, "$"}, router.allocator)})
+route_patch :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
+	return route_add(router, .Patch, pattern, handler)
 }
 
-route_trace :: proc(router: ^Router, pattern: string, handler: Handler) {
-	route_add(router, .Trace, Route{handler = handler, pattern = strings.concatenate([]string{"^", pattern, "$"}, router.allocator)})
+route_trace :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
+	return route_add(router, .Trace, pattern, handler)
 }
 
-route_delete :: proc(router: ^Router, pattern: string, handler: Handler) {
-	route_add(router, .Delete, Route{handler = handler, pattern = strings.concatenate([]string{"^", pattern, "$"}, router.allocator)})
+route_delete :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
+	return route_add(router, .Delete, pattern, handler)
 }
 
-route_connect :: proc(router: ^Router, pattern: string, handler: Handler) {
-	route_add(router, .Connect, Route{handler = handler, pattern = strings.concatenate([]string{"^", pattern, "$"}, router.allocator)})
+route_connect :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
+	return route_add(router, .Connect, pattern, handler)
 }
 
-route_options :: proc(router: ^Router, pattern: string, handler: Handler) {
-	route_add(router, .Options, Route{handler = handler, pattern = strings.concatenate([]string{"^", pattern, "$"}, router.allocator)})
+route_options :: proc(router: ^Router, pattern: string, handler: Handler) -> runtime.Allocator_Error {
+	return route_add(router, .Options, pattern, handler)
 }
 
 // Adds a catch-all fallback route (all methods, ran if no other routes match).
-route_all :: proc(router: ^Router, pattern: string, handler: Handler) {
+route_all :: proc(router: ^Router, pattern: string, handler: Handler) -> (mem_err: runtime.Allocator_Error) {
+	anchored, concat_err := strings.concatenate({"^", pattern, "$"}, router.allocator)
+	if concat_err != nil { return concat_err }
 	if router.all == nil {
-		router.all = make([dynamic]Route, 0, 1, router.allocator)
+		all, make_err := make([dynamic]Route, 0, 1, router.allocator)
+		if make_err != nil {
+			delete(anchored, router.allocator)
+			return make_err
+		}
+		router.all = all
 	}
 
-	append(&router.all, Route{handler = handler, pattern = strings.concatenate([]string{"^", pattern, "$"}, router.allocator)})
+	if _, append_err := append(&router.all, Route{handler = handler, pattern = anchored}); append_err != nil {
+		delete(anchored, router.allocator)
+		return append_err
+	}
+	return nil
 }
 
+// route_add anchors a pattern and adds it to one method's routes. mem_err is set,
+// and no route was added, when the pattern or the method's slot could not be
+// allocated.
 @(private)
-route_add :: proc(router: ^Router, method: Method, route: Route) {
+route_add :: proc(router: ^Router, method: Method, pattern: string, handler: Handler) -> (mem_err: runtime.Allocator_Error) {
+	anchored, concat_err := strings.concatenate({"^", pattern, "$"}, router.allocator)
+	if concat_err != nil { return concat_err }
 	if method not_in router.routes {
-		router.routes[method] = make([dynamic]Route, router.allocator)
+		routes, make_err := make([dynamic]Route, router.allocator)
+		if make_err != nil {
+			delete(anchored, router.allocator)
+			return make_err
+		}
+		router.routes[method] = routes
 	}
 
-	append(&router.routes[method], route)
+	if _, append_err := append(&router.routes[method], Route{handler = handler, pattern = anchored}); append_err != nil {
+		delete(anchored, router.allocator)
+		return append_err
+	}
+	return nil
 }
 
+// routes_try runs the first route that matches. mem_err is set when the captures
+// that route's handler receives could not be allocated, in which case no handler
+// ran.
 @(private)
-routes_try :: proc(routes: [dynamic]Route, request: ^Request, response: ^Response) -> bool {
+routes_try :: proc(routes: [dynamic]Route, request: ^Request, response: ^Response) -> (matched: bool, mem_err: runtime.Allocator_Error) {
 	matches: [match.MAX_CAPTURES]match.Match = ---
 	for route in routes {
 		count, err := match.find_aux(request.url.path, route.pattern, 0, true, &matches)
@@ -208,7 +252,8 @@ routes_try :: proc(routes: [dynamic]Route, request: ^Request, response: ^Respons
 		}
 
 		if count > 0 {
-			params := make([]string, count - 1, context.temp_allocator)
+			params, make_err := make([]string, count - 1, context.temp_allocator)
+			if make_err != nil { return false, make_err }
 			for capture, index in matches[1:count] {
 				params[index] = request.url.path[capture.byte_start:capture.byte_end]
 			}
@@ -216,9 +261,9 @@ routes_try :: proc(routes: [dynamic]Route, request: ^Request, response: ^Respons
 			request.url_params = params
 			route_handler := route.handler
 			route_handler.handle(&route_handler, request, response)
-			return true
+			return true, nil
 		}
 	}
 
-	return false
+	return false, nil
 }

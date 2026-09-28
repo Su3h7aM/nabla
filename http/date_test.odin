@@ -1,6 +1,8 @@
 #+test
 package http
 
+import "base:runtime"
+
 import "core:testing"
 import "core:time"
 
@@ -82,7 +84,8 @@ test_http_date_round_trip :: proc(t: ^testing.T) {
 		time.datetime_to_time(2024, 2, 29, 23, 59, 59),
 	}
 	for instant in instants {
-		text := date_string(instant, context.temp_allocator)
+		text, text_err := date_string(instant, context.temp_allocator)
+		testing.expect_value(t, text_err, runtime.Allocator_Error.None)
 		testing.expect_value(t, len(text), HTTP_DATE_LENGTH)
 		parsed, ok := date_parse(text)
 		if !testing.expectf(t, ok, "%q must read back", text) { continue }

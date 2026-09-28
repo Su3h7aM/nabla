@@ -98,7 +98,9 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 
 	phase = .Response_Head
 	reader: Reader
-	reader_init(&reader, connection_read_source, connection, request.allocator)
+	if reader_err := reader_init(&reader, connection_read_source, connection, request.allocator); reader_err != .None {
+		return failure_from_error(reader_err, request.allocator)
+	}
 	defer reader_destroy(&reader)
 
 	head, headers, head_err := read_final_response_head(&reader, request.allocator)
@@ -396,7 +398,8 @@ resolve_endpoints :: proc(url: http.URL, options: Options, allocator: mem.Alloca
 	if !ok || hostname == "" { return nil, .Invalid_URL }
 	if port == 0 { port = 443 if url.scheme == "https" else 80 }
 	if literal := net.parse_address(hostname); literal != nil {
-		found := make([]net.Endpoint, 1, allocator)
+		found, make_err := make([]net.Endpoint, 1, allocator)
+		if make_err != nil { return nil, .No_Room }
 		found[0] = net.Endpoint {
 			address = literal,
 			port    = port,
@@ -407,7 +410,8 @@ resolve_endpoints :: proc(url: http.URL, options: Options, allocator: mem.Alloca
 	defer delete(addresses)
 	if resolve_err != .None { return nil, resolve_err }
 	if len(addresses) == 0 { return nil, .Resolve }
-	found := make([]net.Endpoint, len(addresses), allocator)
+	found, make_err := make([]net.Endpoint, len(addresses), allocator)
+	if make_err != nil { return nil, .No_Room }
 	for address, i in addresses {
 		found[i] = net.Endpoint {
 			address = address,
@@ -666,7 +670,11 @@ failure_from_error :: proc(err: Error, allocator: mem.Allocator, override: Failu
 	}
 	text := detail
 	if text == "" { text = error_text(err) }
-	return Failure{kind = kind, cause = err, detail = strings.clone(text, allocator)}
+	message, clone_err := strings.clone(text, allocator)
+	// A failure that could not copy its account is still the failure it is: the
+	// kind and the cause are what the caller acts on.
+	if clone_err != nil { message = "" }
+	return Failure{kind = kind, cause = err, detail = message}
 }
 
 error_text :: proc(err: Error) -> string {
@@ -710,7 +718,7 @@ error_text :: proc(err: Error) -> string {
 	case .Bad_Response:
 		return "HTTP response was malformed"
 	case .No_Room:
-		return "the client could not allocate a connection"
+		return "the client could not allocate memory"
 	}
 	return "request failed"
 }

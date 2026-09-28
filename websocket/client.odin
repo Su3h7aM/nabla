@@ -58,11 +58,11 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 	exchange_url, url_ok := http_url(url, allocator)
 	defer delete(exchange_url, allocator)
 	if !url_ok {
-		return nil, Dial_Failure{kind = .Exchange, detail = strings.clone("the URL is not a ws or wss one", allocator)}
+		return nil, dial_failure_detail(.Exchange, 0, "the URL is not a ws or wss one", allocator)
 	}
 
 	if detail := handshake_headers_invalid(options.headers, allocator); detail != "" {
-		return nil, Dial_Failure{kind = .Exchange, detail = strings.clone(detail, allocator)}
+		return nil, dial_failure_detail(.Exchange, 0, detail, allocator)
 	}
 
 	nonce: [NONCE_ENCODED_SIZE]u8
@@ -70,7 +70,10 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 
 	// Protocol-owned fields are appended after caller fields only after validation
 	// has established that the caller did not state another value for them.
-	headers := make([dynamic]client.Header, 0, len(options.headers) + 4, allocator)
+	headers, headers_err := make([dynamic]client.Header, 0, len(options.headers) + 4, allocator)
+	if headers_err != nil {
+		return nil, dial_failure_detail(.Exchange, 0, "the WebSocket handshake request could not be built", allocator)
+	}
 	defer delete(headers)
 	append(&headers, ..options.headers)
 	append(
@@ -103,9 +106,18 @@ dial :: proc(url: string, options: Dial_Options, allocator := context.allocator)
 	socket, err := init(transport_for(upgraded), allocator)
 	if err != .None {
 		client.upgraded_destroy(upgraded)
-		return nil, Dial_Failure{kind = .Exchange, detail = strings.clone("the WebSocket connection could not be prepared", allocator)}
+		return nil, dial_failure_detail(.Exchange, 0, "the WebSocket connection could not be prepared", allocator)
 	}
 	return socket, {}
+}
+
+// dial_failure_detail returns a failure whose detail names text. A detail that
+// could not be copied leaves the failure without one: the kind, the cause, and the
+// status are what the caller acts on, and the failure is reported either way.
+dial_failure_detail :: proc(kind: Dial_Error, status: int, text: string, allocator: mem.Allocator) -> Dial_Failure {
+	detail, clone_err := strings.clone(text, allocator)
+	if clone_err != nil { detail = "" }
+	return Dial_Failure{kind = kind, status = status, detail = detail}
 }
 
 // http_url states a WebSocket URL as the HTTP URL of the same request, which is what
@@ -207,7 +219,7 @@ protocol_offered :: proc(headers: []client.Header, selected: string) -> bool {
 }
 
 response_refusal :: proc(allocator: mem.Allocator, detail: string) -> Dial_Failure {
-	return Dial_Failure{kind = .Response, status = 101, detail = strings.clone(detail, allocator)}
+	return dial_failure_detail(.Response, 101, detail, allocator)
 }
 
 // field_has_token reports whether a field value holds one of a list of tokens,

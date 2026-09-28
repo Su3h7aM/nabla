@@ -1,5 +1,7 @@
 package tls
 
+import "base:runtime"
+
 import "core:bytes"
 import "core:crypto"
 import "core:crypto/hash"
@@ -294,7 +296,11 @@ handshake_server_flight :: proc(connection: ^Conn, server_name: string, alpn: []
 	if err != .None { return err }
 	negotiated, extensions_ok := encrypted_extensions_read(extensions_message, server_name != "", alpn)
 	if !extensions_ok { return fail(connection, .Decode_Error, .Handshake) }
-	if negotiated != "" { connection.alpn = strings.clone(negotiated, connection.config.allocator) }
+	if negotiated != "" {
+		chosen, clone_err := strings.clone(negotiated, connection.config.allocator)
+		if clone_err != nil { return .No_Room }
+		connection.alpn = chosen
+	}
 	hash.update(&connection.transcript, extensions_message)
 
 	certificate_message, certificate_err := handshake_next(connection)
@@ -312,7 +318,9 @@ handshake_server_flight :: proc(connection: ^Conn, server_name: string, alpn: []
 	chain, chain_decoded := certificate_chain_decode(certificate_message[HANDSHAKE_HEADER_SIZE:], connection.config.allocator)
 	defer certificate_chain_destroy(&chain)
 	if !chain_decoded { return .Handshake }
-	if !chain_verify(chain.certificates, server_name, connection.config) { return .Peer_Rejected }
+	verified, verify_mem_err := chain_verify(chain.certificates, server_name, connection.config)
+	if verify_mem_err != nil { return .No_Room }
+	if !verified { return .Peer_Rejected }
 	hash.update(&connection.transcript, certificate_message)
 
 	verify_message, verify_err := handshake_next(connection)
@@ -554,7 +562,7 @@ read_record :: proc(connection: ^Conn) -> (content: []u8, record_type: Record_Ty
 		case .Handshake:
 			// Handshake bytes belong to the handshake stream, and the caller has
 			// them to parse now rather than after the next record.
-			append(&connection.stream, ..payload)
+			if _, append_err := append(&connection.stream, ..payload); append_err != nil { return nil, {}, .No_Room }
 			return nil, .Handshake, .None
 		case .Alert, .Application_Data:
 			return payload, content_type, .None
@@ -795,25 +803,27 @@ encrypted_extensions_read :: proc(message: []u8, server_name_offered: bool, alpn
 
 // chain_verify checks the peer's chain against the configured anchors, within their
 // validity windows, against the identity the connection was reached by, and for the
-// purpose a TLS server certificate is used for.
-chain_verify :: proc(certificates: []x509.Certificate, server_name: string, config: Config) -> bool {
-	if len(certificates) == 0 || len(config.roots) == 0 { return false }
+// purpose a TLS server certificate is used for. mem_err is set when the verifier's
+// own list could not be allocated, in which case nothing was verified.
+chain_verify :: proc(certificates: []x509.Certificate, server_name: string, config: Config) -> (verified: bool, mem_err: runtime.Allocator_Error) {
+	if len(certificates) == 0 || len(config.roots) == 0 { return false, nil }
 
 	dns_name := server_name
 	if net.parse_address(server_name) != nil {
-		if !identity_verify(&certificates[0], server_name) { return false }
+		if !identity_verify(&certificates[0], server_name) { return false, nil }
 		dns_name = ""
 	}
 
-	intermediates := certificate_pointers(certificates[1:], config.allocator)
+	intermediates, pointers_err := certificate_pointers(certificates[1:], config.allocator)
+	if pointers_err != nil { return false, pointers_err }
 	defer delete(intermediates, config.allocator)
-	verified, chain_err := x509.verify_chain(
+	chain, chain_err := x509.verify_chain(
 		&certificates[0],
 		{roots = config.roots, intermediates = intermediates, current_time = time.now(), dns_name = dns_name, required_eku = x509.EKU_Bit.Server_Auth},
 		config.allocator,
 	)
-	defer delete(verified, config.allocator)
-	return chain_err == .None
+	defer delete(chain, config.allocator)
+	return chain_err == .None, nil
 }
 
 suite_offered :: proc(suite: Cipher_Suite) -> bool {

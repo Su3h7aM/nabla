@@ -13,6 +13,8 @@
 // retained stream. The caller owns the byte source and the event callbacks.
 package sse
 
+import "base:runtime"
+
 import "core:unicode/utf8"
 
 // CONTENT_TYPE is the media type of an event stream. It is the type a response
@@ -78,19 +80,26 @@ parser_destroy :: proc(parser: ^Parser) {
 // completes. A chunk may split anywhere -- mid-line, between CR and LF, or inside
 // the leading BOM -- because the parser carries that state between calls. Feeding
 // after the stream was finished is a no-op.
-parser_feed :: proc(parser: ^Parser, bytes: []u8) {
-	if parser.finished { return }
+//
+// err is the caller's allocator failing: the parser holds a line, an event, or an
+// id of any size, so its buffers have no bound of their own. A feed that failed
+// leaves the stream where it stopped, and the caller feeds no more of it.
+parser_feed :: proc(parser: ^Parser, bytes: []u8) -> (err: runtime.Allocator_Error) {
+	if parser.finished { return nil }
 	for byte in bytes {
 		if parser.bom_len < 3 {
 			parser.bom[parser.bom_len] = byte
 			parser.bom_len += 1
 			if parser.bom_len < 3 { continue }
 			if parser.bom == {0xEF, 0xBB, 0xBF} { continue }
-			for prefix_byte in parser.bom[:] { parser_byte(parser, prefix_byte) }
+			for prefix_byte in parser.bom[:] {
+				if prefix_err := parser_byte(parser, prefix_byte); prefix_err != nil { return prefix_err }
+			}
 			continue
 		}
-		parser_byte(parser, byte)
+		if byte_err := parser_byte(parser, byte); byte_err != nil { return byte_err }
 	}
+	return nil
 }
 
 // parser_finish ends the stream: a trailing CR is treated as a line terminator,
@@ -103,57 +112,63 @@ parser_feed :: proc(parser: ^Parser, bytes: []u8) {
 // unprocessed and discarded with the pending data.
 //
 // Calling it twice is harmless.
-parser_finish :: proc(parser: ^Parser) {
-	if parser.finished { return }
+//
+// err is the caller's allocator failing, exactly as in parser_feed: a trailing CR
+// and a partial BOM still go through the parser's own buffers.
+parser_finish :: proc(parser: ^Parser) -> (err: runtime.Allocator_Error) {
+	if parser.finished { return nil }
 	if parser.bom_len > 0 && parser.bom_len < 3 {
 		saved_bom_len := parser.bom_len
 		parser.bom_len = 3
-		for i in 0 ..< saved_bom_len { parser_byte(parser, parser.bom[i]) }
+		for i in 0 ..< saved_bom_len {
+			if byte_err := parser_byte(parser, parser.bom[i]); byte_err != nil { return byte_err }
+		}
 	}
 	if parser.pending_cr {
 		parser.pending_cr = false
-		parser_line(parser)
+		if line_err := parser_line(parser); line_err != nil { return line_err }
 	}
 	// EOF never dispatches an event without a terminating blank line.
 	parser.finished = true
+	return nil
 }
 
 @(private)
-parser_byte :: proc(parser: ^Parser, byte: u8) {
+parser_byte :: proc(parser: ^Parser, byte: u8) -> (err: runtime.Allocator_Error) {
 	if parser.pending_cr {
 		parser.pending_cr = false
 		if byte == '\n' {
-			parser_line(parser)
-			return
+			return parser_line(parser)
 		}
-		parser_line(parser)
+		if line_err := parser_line(parser); line_err != nil { return line_err }
 	}
 	if byte == '\r' {
 		parser.pending_cr = true
-		return
+		return nil
 	}
 	if byte == '\n' {
-		parser_line(parser)
-		return
+		return parser_line(parser)
 	}
-	append(&parser.line, byte)
+	if _, append_err := append(&parser.line, byte); append_err != nil { return append_err }
+	return nil
 }
 
 @(private)
-parser_line :: proc(parser: ^Parser) {
+parser_line :: proc(parser: ^Parser) -> (err: runtime.Allocator_Error) {
 	line := parser.line[:]
 	if len(line) == 0 {
 		parser_dispatch(parser)
-	} else {
-		parser_field(parser, line)
+	} else if field_err := parser_field(parser, line); field_err != nil {
+		return field_err
 	}
 	clear(&parser.line)
+	return nil
 }
 
 @(private)
-parser_field :: proc(parser: ^Parser, line: []u8) {
+parser_field :: proc(parser: ^Parser, line: []u8) -> (err: runtime.Allocator_Error) {
 	// A line starting with a colon is a comment, ignored whole.
-	if line[0] == ':' { return }
+	if line[0] == ':' { return nil }
 
 	colon := -1
 	for byte, i in line {
@@ -175,19 +190,19 @@ parser_field :: proc(parser: ^Parser, line: []u8) {
 	switch string(name) {
 	case "event":
 		clear(&parser.event_type)
-		append_decoded_utf8(&parser.event_type, value)
+		return append_decoded_utf8(&parser.event_type, value)
 	case "data":
 		// Appending the value and one LF is what makes several data fields
 		// join with "\n" when the event is dispatched.
-		append_decoded_utf8(&parser.event_data, value)
-		append(&parser.event_data, '\n')
+		if data_err := append_decoded_utf8(&parser.event_data, value); data_err != nil { return data_err }
+		if _, append_err := append(&parser.event_data, '\n'); append_err != nil { return append_err }
 	case "id":
 		// A value containing U+0000 NULL means the field is ignored and the
 		// previous last event ID stands. The buffer is not cleared first: the
 		// old value must survive a rejected update.
-		if contains_null(value) { return }
+		if contains_null(value) { return nil }
 		clear(&parser.event_id)
-		append_decoded_utf8(&parser.event_id, value)
+		return append_decoded_utf8(&parser.event_id, value)
 	case "retry":
 		// A malformed value is ignored, not an error: the reconnection time
 		// keeps whatever value it already had.
@@ -196,6 +211,7 @@ parser_field :: proc(parser: ^Parser, line: []u8) {
 			parser.retry_present = true
 		}
 	}
+	return nil
 }
 
 @(private)
@@ -212,18 +228,18 @@ contains_null :: proc(value: []u8) -> bool {
 // appear inside a UTF-8 sequence -- so decoding each value with fresh state equals
 // decoding the whole stream up front.
 @(private)
-append_decoded_utf8 :: proc(dst: ^[dynamic]u8, value: []u8) {
+append_decoded_utf8 :: proc(dst: ^[dynamic]u8, value: []u8) -> (err: runtime.Allocator_Error) {
 	i := 0
 	for i < len(value) {
 		byte := value[i]
 		if byte < 0x80 {
-			append(dst, byte)
+			if _, append_err := append(dst, byte); append_err != nil { return append_err }
 			i += 1
 			continue
 		}
 		needed, lower, upper := utf8_lead(byte)
 		if needed == 0 {
-			append_replacement_character(dst)
+			if replace_err := append_replacement_character(dst); replace_err != nil { return replace_err }
 			i += 1
 			continue
 		}
@@ -235,13 +251,14 @@ append_decoded_utf8 :: proc(dst: ^[dynamic]u8, value: []u8) {
 			end += 1
 		}
 		if end - i - 1 == needed {
-			append(dst, ..value[i:end])
+			if _, append_err := append(dst, ..value[i:end]); append_err != nil { return append_err }
 			i = end
 			continue
 		}
-		append_replacement_character(dst)
+		if replace_err := append_replacement_character(dst); replace_err != nil { return replace_err }
 		i = end
 	}
+	return nil
 }
 
 // utf8_lead reads the lead byte of a UTF-8 sequence: how many continuation bytes it
@@ -266,11 +283,12 @@ utf8_lead :: proc(lead_byte: byte) -> (needed: int, lower, upper: byte) {
 }
 
 @(private)
-append_replacement_character :: proc(dst: ^[dynamic]u8) {
+append_replacement_character :: proc(dst: ^[dynamic]u8) -> (err: runtime.Allocator_Error) {
 	// U+FFFD REPLACEMENT CHARACTER. Encoded by the standard library rather than
 	// written out as bytes, which is how the wrong character gets in.
 	bytes, size := utf8.encode_rune(utf8.RUNE_ERROR)
-	append(dst, ..bytes[:size])
+	_, append_err := append(dst, ..bytes[:size])
+	return append_err
 }
 
 // parse_retry reads a reconnection time. ok is false for anything but a non-empty

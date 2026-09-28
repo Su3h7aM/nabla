@@ -1,5 +1,7 @@
 package http
 
+import "base:runtime"
+
 import "core:io"
 import "core:strconv"
 import "core:strings"
@@ -78,21 +80,27 @@ cookie_write :: proc(writer: io.Writer, cookie: Cookie) -> io.Error {
 }
 
 // cookie_string returns cookie as its Set-Cookie field line, owned by the
-// caller's allocator.
-cookie_string :: proc(cookie: Cookie, allocator := context.allocator) -> string {
+// caller's allocator. mem_err is set when the line could not be built.
+cookie_string :: proc(cookie: Cookie, allocator := context.allocator) -> (text: string, mem_err: runtime.Allocator_Error) {
 	builder: strings.Builder
-	strings.builder_init(&builder, 0, 20, allocator)
+	strings.builder_init(&builder, 0, 20, allocator) or_return
 
-	cookie_write(strings.to_writer(&builder), cookie)
+	// The builder's writer reports a short write, which is only ever an
+	// allocation failure: every byte it was given belongs in the line.
+	if write_err := cookie_write(strings.to_writer(&builder), cookie); write_err != nil {
+		strings.builder_destroy(&builder)
+		return "", .Out_Of_Memory
+	}
 
-	return strings.to_string(builder)
+	return strings.to_string(builder), nil
 }
 
 // TODO: check specific whitespace requirements in RFC.
 //
 // Allocations are done to check case-insensitive attributes but they are deleted right after.
 // So, all the returned strings (inside cookie) are slices into the given value string.
-cookie_parse :: proc(value: string, allocator := context.allocator) -> (cookie: Cookie, ok: bool) {
+// mem_err is set when one of those allocations failed.
+cookie_parse :: proc(value: string, allocator := context.allocator) -> (cookie: Cookie, ok: bool, mem_err: runtime.Allocator_Error) {
 	remaining := value
 
 	equals := strings.index_byte(remaining, '=')
@@ -115,11 +123,12 @@ cookie_parse :: proc(value: string, allocator := context.allocator) -> (cookie: 
 		remaining = remaining[semicolon + 1:]
 	}
 
-	parse_part :: proc(cookie: ^Cookie, part: string, allocator := context.temp_allocator) -> (ok: bool) {
+	parse_part :: proc(cookie: ^Cookie, part: string, allocator := context.temp_allocator) -> (ok: bool, mem_err: runtime.Allocator_Error) {
 		equals := strings.index_byte(part, '=')
 		switch equals {
 		case -1:
-			key := strings.to_lower(part, allocator)
+			key, lower_err := strings.to_lower(part, allocator)
+			if lower_err != nil { return false, lower_err }
 			defer delete(key, allocator)
 
 			switch key {
@@ -130,12 +139,13 @@ cookie_parse :: proc(value: string, allocator := context.allocator) -> (cookie: 
 			case "secure":
 				cookie.secure = true
 			case:
-				return
+				return false, nil
 			}
 		case 0:
-			return
+			return false, nil
 		case:
-			key := strings.to_lower(part[:equals], allocator)
+			key, lower_err := strings.to_lower(part[:equals], allocator)
+			if lower_err != nil { return false, lower_err }
 			defer delete(key, allocator)
 
 			value := part[equals + 1:]
@@ -144,9 +154,13 @@ cookie_parse :: proc(value: string, allocator := context.allocator) -> (cookie: 
 			case "domain":
 				cookie.domain = value
 			case "expires":
-				cookie.expires_gmt = cookie_date_parse(value) or_return
+				expires, expires_ok := cookie_date_parse(value)
+				if !expires_ok { return false, nil }
+				cookie.expires_gmt = expires
 			case "max-age":
-				cookie.max_age_secs = strconv.parse_int(value, 10) or_return
+				seconds, seconds_ok := strconv.parse_int(value, 10)
+				if !seconds_ok { return false, nil }
+				cookie.max_age_secs = seconds
 			case "path":
 				cookie.path = value
 			case "samesite":
@@ -158,19 +172,21 @@ cookie_parse :: proc(value: string, allocator := context.allocator) -> (cookie: 
 				case "strict", "Strict", "STRICT":
 					cookie.same_site = .Strict
 				case:
-					return
+					return false, nil
 				}
 			case:
-				return
+				return false, nil
 			}
 		}
-		return true
+		return true, nil
 	}
 
 	for semicolon = strings.index_byte(remaining, ';'); semicolon != -1; semicolon = strings.index_byte(remaining, ';') {
 		part := strings.trim_left_space(remaining[:semicolon])
 		remaining = remaining[semicolon + 1:]
-		parse_part(&cookie, part, allocator) or_return
+		part_ok, part_err := parse_part(&cookie, part, allocator)
+		if part_err != nil { return cookie, false, part_err }
+		if !part_ok { return cookie, false, nil }
 	}
 
 	part := strings.trim_left_space(remaining)
@@ -179,7 +195,9 @@ cookie_parse :: proc(value: string, allocator := context.allocator) -> (cookie: 
 		return
 	}
 
-	parse_part(&cookie, part, allocator) or_return
+	part_ok, part_err := parse_part(&cookie, part, allocator)
+	if part_err != nil { return cookie, false, part_err }
+	if !part_ok { return cookie, false, nil }
 	ok = true
 	return
 }
