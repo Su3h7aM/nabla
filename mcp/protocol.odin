@@ -603,31 +603,41 @@ result_type :: proc(object: json.Object) -> (string, bool) {
 
 // meta_server_info reads the server identity a result may carry under
 // `_meta["io.modelcontextprotocol/serverInfo"]`. Identity is advisory: it is
-// reported, never acted on.
-meta_server_info :: proc(result: json.Object, allocator := context.allocator) -> (name: string, version: string) {
+// reported, never acted on. The name and version are owned by allocator, and err
+// is the allocator's own failure when either could not be copied.
+meta_server_info :: proc(result: json.Object, allocator := context.allocator) -> (name: string, version: string, err: mem.Allocator_Error) {
 	meta_value, meta_present := result["_meta"]
-	if !meta_present { return "", "" }
+	if !meta_present { return "", "", nil }
 	meta, meta_is_object := meta_value.(json.Object)
-	if !meta_is_object { return "", "" }
+	if !meta_is_object { return "", "", nil }
 
 	info_value, info_present := meta[META_SERVER_INFO]
-	if !info_present { return "", "" }
+	if !info_present { return "", "", nil }
 	info, info_is_object := info_value.(json.Object)
-	if !info_is_object { return "", "" }
+	if !info_is_object { return "", "", nil }
 
-	return meta_identity_field(info, "name", allocator), meta_identity_field(info, "version", allocator)
+	owned_name, name_error := meta_identity_field(info, "name", allocator)
+	if name_error != nil { return "", "", name_error }
+	owned_version, version_error := meta_identity_field(info, "version", allocator)
+	if version_error != nil {
+		delete(owned_name, allocator)
+		return "", "", version_error
+	}
+	return owned_name, owned_version, nil
 }
 
 // meta_identity_field reads one optional string from a server identity object. A
 // field that is present but not a string is ignored rather than refused: identity
-// is advisory, and a server that reports it badly is still a usable server.
+// is advisory, and a server that reports it badly is still a usable server. A field
+// that cannot be copied is reported through err, so failing to own an identity is
+// never read as the server having reported none.
 @(private)
-meta_identity_field :: proc(info: json.Object, field: string, allocator: mem.Allocator) -> string {
+meta_identity_field :: proc(info: json.Object, field: string, allocator: mem.Allocator) -> (string, mem.Allocator_Error) {
 	value, present := info[field]
-	if !present { return "" }
+	if !present { return "", nil }
 	text, is_string := value.(json.String)
-	if !is_string { return "" }
+	if !is_string { return "", nil }
 	owned, clone_error := strings.clone(string(text), allocator)
-	if clone_error != nil { return "" }
-	return owned
+	if clone_error != nil { return "", clone_error }
+	return owned, nil
 }

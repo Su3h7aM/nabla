@@ -207,7 +207,7 @@ client_exchange :: proc(client: ^Client, method: string, params: json.Object, op
 		message, decode_err := message_decode(string(framed), client.allocator)
 		if decode_err.kind != .None {
 			decode_err.delivery = .Delivered
-			decode_err.stderr_tail = stdio_stderr_excerpt(&client.stdio, client.allocator)
+			stdio_stderr_attach(&client.stdio, &decode_err)
 			return nil, decode_err
 		}
 
@@ -229,7 +229,7 @@ client_exchange :: proc(client: ^Client, method: string, params: json.Object, op
 				return nil, client_stream_error(client, .Unexpected_Message, "an error arrived for a request this client did not send")
 			}
 			remote := error_from_remote(message.remote_error, .Delivered, client.allocator)
-			remote.stderr_tail = stdio_stderr_excerpt(&client.stdio, client.allocator)
+			stdio_stderr_attach(&client.stdio, &remote)
 			message_destroy(&message, client.allocator)
 			return nil, remote
 
@@ -282,7 +282,7 @@ client_refuse_request :: proc(client: ^Client, method: string, id: i64, options:
 client_stream_error :: proc(client: ^Client, kind: Error_Kind, detail: string) -> Error {
 	err := error_make(kind, detail, client.allocator)
 	err.delivery = .Delivered
-	err.stderr_tail = stdio_stderr_excerpt(&client.stdio, client.allocator)
+	stdio_stderr_attach(&client.stdio, &err)
 	return err
 }
 
@@ -356,7 +356,8 @@ client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator
 		old_tools_len := len(page.tools)
 		tools_appended := append(&page.tools, ..next.tools[:])
 		if tools_appended != len(next.tools) {
-			resize(&page.tools, old_tools_len)
+			// The rollback only shortens the array, which never allocates.
+			_ = resize(&page.tools, old_tools_len)
 			tool_page_destroy(&next, allocator)
 			return {}, error_make(.Out_Of_Memory, allocator = allocator)
 		}
@@ -364,7 +365,8 @@ client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator
 		old_rejected_len := len(page.rejected)
 		rejected_appended := append(&page.rejected, ..next.rejected[:])
 		if rejected_appended != len(next.rejected) {
-			resize(&page.rejected, old_rejected_len)
+			// The rollback only shortens the array, which never allocates.
+			_ = resize(&page.rejected, old_rejected_len)
 			tool_page_destroy(&next, allocator)
 			return {}, error_make(.Out_Of_Memory, allocator = allocator)
 		}

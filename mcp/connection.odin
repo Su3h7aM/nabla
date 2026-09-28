@@ -72,21 +72,23 @@ connection_from_stateless :: proc(result: json.Object, allocator := context.allo
 		}
 	}
 	if !supported {
-		builder := strings.builder_make(context.temp_allocator)
-		defer strings.builder_destroy(&builder)
-		fmt.sbprintf(&builder, "the server does not support %s; it supports ", VERSION_2026_07_28)
-		if len(versions) == 0 { strings.write_string(&builder, "nothing this client can read") }
-		for value, index in versions {
-			if index > 0 { strings.write_string(&builder, ", ") }
-			strings.write_string(&builder, string(value.(json.String)))
-		}
-		return {}, error_make(.Version_Unsupported, strings.to_string(builder), allocator = allocator)
+		names, names_error := make([]string, len(versions), context.temp_allocator)
+		if names_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		for value, index in versions { names[index] = string(value.(json.String)) }
+		listed, list_error := strings.join(names, ", ", context.temp_allocator)
+		if list_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		if len(versions) == 0 { listed = "nothing this client can read" }
+		note, note_error := strings.concatenate({"the server does not support ", VERSION_2026_07_28, "; it supports ", listed}, context.temp_allocator)
+		if note_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		return {}, error_make(.Version_Unsupported, note, allocator = allocator)
 	}
 
 	if capabilities_error := connection_read_capabilities(&connection, result, allocator); capabilities_error.kind != .None {
 		return {}, capabilities_error
 	}
-	connection.server_name, connection.server_version = meta_server_info(result, allocator)
+	server_name, server_version, identity_error := meta_server_info(result, allocator)
+	if identity_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	connection.server_name, connection.server_version = server_name, server_version
 	failed = false
 	return connection, {}
 }
@@ -116,7 +118,9 @@ connection_from_handshake :: proc(result: json.Object, allocator := context.allo
 	}
 	// The handshake revisions report identity at the top level of the result, not
 	// under `_meta`, which those revisions do not use for it.
-	connection.server_name, connection.server_version = handshake_server_info(result, allocator)
+	server_name, server_version, identity_error := handshake_server_info(result, allocator)
+	if identity_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+	connection.server_name, connection.server_version = server_name, server_version
 	failed = false
 	return connection, {}
 }
@@ -158,12 +162,19 @@ connection_read_capabilities :: proc(connection: ^Connection, result: json.Objec
 }
 
 // handshake_server_info reads the identity a handshake result carries at its top
-// level.
+// level. The name and version are owned by allocator.
 @(private)
-handshake_server_info :: proc(result: json.Object, allocator: mem.Allocator) -> (name: string, version: string) {
+handshake_server_info :: proc(result: json.Object, allocator: mem.Allocator) -> (name: string, version: string, err: mem.Allocator_Error) {
 	value, present := result["serverInfo"]
-	if !present { return "", "" }
+	if !present { return "", "", nil }
 	info, is_object := value.(json.Object)
-	if !is_object { return "", "" }
-	return meta_identity_field(info, "name", allocator), meta_identity_field(info, "version", allocator)
+	if !is_object { return "", "", nil }
+	owned_name, name_error := meta_identity_field(info, "name", allocator)
+	if name_error != nil { return "", "", name_error }
+	owned_version, version_error := meta_identity_field(info, "version", allocator)
+	if version_error != nil {
+		delete(owned_name, allocator)
+		return "", "", version_error
+	}
+	return owned_name, owned_version, nil
 }

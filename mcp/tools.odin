@@ -132,10 +132,15 @@ tools_list_decode :: proc(result: json.Object, version: Protocol_Version, alloca
 	for value in tools {
 		tool, reason := tool_decode(value, allocator)
 		if reason != "" {
+			rejected_name, name_error := tool_rejected_name(value, allocator)
+			if name_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 			owned_reason, reason_error := strings.clone(reason, allocator)
-			if reason_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+			if reason_error != nil {
+				delete(rejected_name, allocator)
+				return {}, error_make(.Out_Of_Memory, allocator = allocator)
+			}
 			rejected := Rejected_Tool {
-				name   = tool_rejected_name(value, allocator),
+				name   = rejected_name,
 				reason = owned_reason,
 			}
 			appended := append(&page.rejected, rejected)
@@ -170,18 +175,20 @@ tools_list_decode :: proc(result: json.Object, version: Protocol_Version, alloca
 }
 
 // tool_rejected_name recovers a name for a rejected tool so the report says which
-// one was refused, without trusting it as a usable name.
+// one was refused, without trusting it as a usable name. A value that carries no
+// name at all reads as no name; a name that cannot be copied is the allocator's own
+// failure, which the caller reports rather than dropping the name from the report.
 @(private)
-tool_rejected_name :: proc(value: json.Value, allocator: mem.Allocator) -> string {
+tool_rejected_name :: proc(value: json.Value, allocator: mem.Allocator) -> (name: string, err: mem.Allocator_Error) {
 	object, is_object := value.(json.Object)
-	if !is_object { return "" }
+	if !is_object { return "", nil }
 	name_value, present := object["name"]
-	if !present { return "" }
+	if !present { return "", nil }
 	text, is_string := name_value.(json.String)
-	if !is_string { return "" }
+	if !is_string { return "", nil }
 	owned, clone_error := strings.clone(string(text), allocator)
-	if clone_error != nil { return "" }
-	return owned
+	if clone_error != nil { return "", clone_error }
+	return owned, nil
 }
 
 // Schema_Role says which schema of a definition is being read, so a refusal names

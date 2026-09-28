@@ -328,7 +328,9 @@ stdio_compact :: proc(stdio: ^Stdio) {
 	if stdio.line_start == 0 { return }
 	remaining := len(stdio.line) - stdio.line_start
 	copy(stdio.line[:remaining], stdio.line[stdio.line_start:])
-	resize(&stdio.line, remaining)
+	// The buffer only gets shorter, and a dynamic array that is shortened never
+	// allocates, so the resize cannot fail.
+	_ = resize(&stdio.line, remaining)
 	stdio.line_start = 0
 }
 
@@ -347,7 +349,7 @@ stdio_find_newline :: proc(data: []u8, from: int) -> int {
 stdio_transport_error :: proc(stdio: ^Stdio, kind: Error_Kind, delivery: Delivery_State) -> Error {
 	err := error_make(kind, allocator = stdio.allocator)
 	err.delivery = delivery
-	err.stderr_tail = stdio_stderr_excerpt(stdio, stdio.allocator)
+	stdio_stderr_attach(stdio, &err)
 	return err
 }
 
@@ -360,13 +362,26 @@ stdio_wait_error :: proc(stdio: ^Stdio, kind: Error_Kind, delivery: Delivery_Sta
 	return err
 }
 
-// stdio_stderr_excerpt copies what the server wrote to standard error. It is
-// diagnostic text and never decides an outcome.
-stdio_stderr_excerpt :: proc(stdio: ^Stdio, allocator := context.allocator) -> string {
+// stdio_stderr_excerpt copies what the server wrote to standard error, owned by
+// allocator. It is diagnostic text and never decides an outcome, so a copy that
+// cannot be made is reported as the allocator's own failure rather than as an empty
+// tail.
+stdio_stderr_excerpt :: proc(stdio: ^Stdio, allocator := context.allocator) -> (string, mem.Allocator_Error) {
 	sync.mutex_lock(&stdio.stderr_mutex)
 	defer sync.mutex_unlock(&stdio.stderr_mutex)
-	if len(stdio.stderr_tail) == 0 { return "" }
+	if len(stdio.stderr_tail) == 0 { return "", nil }
 	return strings.clone(string(stdio.stderr_tail[:]), allocator)
+}
+
+// stdio_stderr_attach puts the server's most recent output on err, which is where a
+// reader looks for why the server did what it did. A tail that cannot be copied is
+// left off: err already reports the failure that decides the outcome, and a
+// diagnostic that cannot be owned must not replace it.
+@(private)
+stdio_stderr_attach :: proc(stdio: ^Stdio, err: ^Error) {
+	tail, tail_error := stdio_stderr_excerpt(stdio, stdio.allocator)
+	if tail_error != nil { return }
+	err.stderr_tail = tail
 }
 
 // stdio_stderr_serve drains standard error. It runs on its own thread because a
@@ -394,7 +409,8 @@ stdio_stderr_serve :: proc(thread: ^thread.Thread) {
 // the retained text stays valid UTF-8. The caller holds stderr_mutex.
 @(private)
 stdio_stderr_retain :: proc(stdio: ^Stdio, data: []u8) {
-	// A tail that cannot grow keeps what it has; it is diagnostic only.
+	// A tail that cannot grow keeps what it has: the drain has no caller to report
+	// to, and this text is diagnostic, never an outcome.
 	if _, append_error := append(&stdio.stderr_tail, ..data); append_error != nil { return }
 	excess := len(stdio.stderr_tail) - MAX_STDERR_TAIL_BYTES
 	if excess <= 0 { return }

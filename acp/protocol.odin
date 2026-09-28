@@ -176,8 +176,10 @@ parse_batch :: proc(payload: string, allocator := context.allocator) -> (frames:
 
 // params_decode reads one message's params into a typed payload. The parsed value is
 // encoded again because the JSON package decodes from bytes, and a request payload is
-// small. False means the document does not match the payload the method takes; the
-// target's own strings are owned by allocator.
+// small. False means the caller cannot act on these params, whether the document does
+// not match the payload the method takes or the copy could not be allocated; the peer
+// is answered with a params refusal either way, so nothing is acted on. The target's
+// own strings are owned by allocator.
 params_decode :: proc(value: json.Value, target: ^$T, allocator := context.allocator) -> bool {
 	if value == nil { return false }
 	encoded, marshal_err := json.marshal(value, allocator = allocator)

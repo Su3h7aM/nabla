@@ -226,7 +226,8 @@ test_zero_values_destroy_cleanly :: proc(t: ^testing.T) {
 	for kind in Error_Kind {
 		if kind == .None { continue }
 		local := error_make(kind, allocator = context.allocator)
-		text := error_text(local, context.allocator)
+		text, text_error := error_text(local, context.allocator)
+		testing.expectf(t, text_error == nil, "%v should render in a heap allocator", kind)
 		testing.expectf(t, text != "", "%v should say what happened", kind)
 		delete(text, context.allocator)
 		error_destroy(&local, context.allocator)
