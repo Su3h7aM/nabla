@@ -192,8 +192,14 @@ retry_display_text :: proc(event: agent.Chat_Retry_Event) -> string {
 	case .Invalid_Output:
 		reason = "the response could not be read"
 	case .Invalid_Request:
-		// The only invalid request that is sent again is one resent without its cache hints.
-		reason = "the endpoint refused the request's cache hints; sending it without them"
+		#partial switch event.reason {
+		case .Adaptive_Thinking_Refused:
+			reason = "the endpoint refused the request; sending it again without adaptive thinking in case that caused it"
+		case .Cache_Hints_Refused:
+			reason = "the endpoint refused the request; sending it again without its cache hints in case they caused it"
+		case:
+			reason = "the endpoint refused the request"
+		}
 	case .None, .Unknown, .Authentication, .Quota, .Not_Found, .Context_Overflow, .Payload_Too_Large, .Content_Policy, .Untrusted_Connection:
 	}
 	return fmt.tprintf("%s; retrying in %s (attempt %d)", reason, display_duration(event.delay), event.next_attempt)

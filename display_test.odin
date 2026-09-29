@@ -59,3 +59,17 @@ test_sanitize_state_across_chunks :: proc(t: ^testing.T) {
 	testing.expect_value(t, display_sanitize_chunk(&dangling, "a\x1b[2", context.temp_allocator), "a")
 	testing.expect_value(t, display_sanitize_flush(&dangling, context.temp_allocator), "")
 }
+
+@(test)
+test_retry_display_names_the_omitted_optional_feature :: proc(t: ^testing.T) {
+	testing.expect_value(
+		t,
+		retry_display_text({failure_class = .Invalid_Request, reason = .Adaptive_Thinking_Refused, next_attempt = 2}),
+		"the endpoint refused the request; sending it again without adaptive thinking in case that caused it; retrying in 0.0s (attempt 2)",
+	)
+	testing.expect_value(
+		t,
+		retry_display_text({failure_class = .Invalid_Request, reason = .Cache_Hints_Refused, next_attempt = 2}),
+		"the endpoint refused the request; sending it again without its cache hints in case they caused it; retrying in 0.0s (attempt 2)",
+	)
+}

@@ -62,13 +62,13 @@ Chat_Tool_Event :: struct {
 }
 
 // Chat_Retry_Event is one retry the harness scheduled: which send failed, which one is
-// next, what the provider's failure meant, and how long the harness waits before sending
-// again. It is the decision the failed request's own row
-// records, reported in time for a front-end to act on it while the turn is waiting.
+// next, why it is being retried, what the provider's failure meant, and how long the
+// harness waits before sending again.
 Chat_Retry_Event :: struct {
 	request:       journal.Request_Id,
 	next_attempt:  int,
 	failure_class: ai.Provider_Failure_Class,
+	reason:        Request_Recovery_Reason,
 	delay:         time.Duration,
 }
 

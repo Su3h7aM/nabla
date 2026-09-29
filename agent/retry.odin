@@ -36,10 +36,9 @@ Request_Recovery_Action :: enum {
 	// Repair_Context makes room for a rebuilt request. The provider refused the payload
 	// itself as too large, so sending it again is pointless and waiting changes nothing.
 	Repair_Context,
-	// Omit_Cache_Hints sends the request again without the cache hints the harness added.
-	// They are optional, so a request refused while carrying them is resent without them
-	// before the refusal is treated as the request's own.
-	Omit_Cache_Hints,
+	// Omit_Optional_Feature resends the request without its first optional feature.
+	// The feature order chooses one repair at a time when a request carries several.
+	Omit_Optional_Feature,
 }
 
 // Request_Recovery_Reason names why the chain stopped or waited. A stop is always
@@ -69,11 +68,20 @@ Request_Recovery_Reason :: enum {
 	Terminal_Failure,
 	// Transient_Failure is a failure the chain resends after the scheduled delay.
 	Transient_Failure,
+	// Adaptive_Thinking_Refused is an invalid request carrying adaptive thinking, which
+	// the chain removes before sending again.
+	Adaptive_Thinking_Refused,
 	// Cache_Hints_Refused is a request refused as invalid while it carried the harness's
 	// optional cache hints, which the chain drops before sending it again.
 	Cache_Hints_Refused,
 	// Retries_Exhausted is a transient failure that outlasted every scheduled resend.
 	Retries_Exhausted,
+}
+
+// OPTIONAL_FEATURE_REFUSED_REASONS is why a chain drops each optional feature.
+OPTIONAL_FEATURE_REFUSED_REASONS := [Optional_Request_Feature]Request_Recovery_Reason {
+	.Adaptive_Thinking = .Adaptive_Thinking_Refused,
+	.Cache_Hints       = .Cache_Hints_Refused,
 }
 
 // request_recovery_reason_name is the stable spelling a journal record keeps for a reason.
@@ -96,6 +104,8 @@ request_recovery_reason_name :: proc(reason: Request_Recovery_Reason) -> string 
 		return "terminal_failure"
 	case .Transient_Failure:
 		return "transient_failure"
+	case .Adaptive_Thinking_Refused:
+		return "adaptive_thinking_refused"
 	case .Cache_Hints_Refused:
 		return "cache_hints_refused"
 	case .Retries_Exhausted:
@@ -154,9 +164,8 @@ Chat_Attempt_Facts :: struct {
 	// refusal is terminal even when another candidate appears, and the bound does not
 	// reset because the payload changed.
 	repaired:            bool,
-	// cache_hints_sent records that the refused request carried the harness's optional
-	// cache hints, which a resend can leave out.
-	cache_hints_sent:    bool,
+	// optional_features records which optional features the refused request carried.
+	optional_features:   Optional_Request_Features,
 	storage_failed:      bool,
 	completion_accepted: bool,
 	cancelled:           bool,
@@ -164,10 +173,12 @@ Chat_Attempt_Facts :: struct {
 
 // Chat_Recovery_Decision is the whole answer: what to do, why, and how long to wait.
 Chat_Recovery_Decision :: struct {
-	action: Request_Recovery_Action,
-	reason: Request_Recovery_Reason,
+	action:  Request_Recovery_Action,
+	reason:  Request_Recovery_Reason,
+	// feature is the one to leave out when action is Omit_Optional_Feature.
+	feature: Optional_Request_Feature,
 	// delay is what the chain waits before its next send, and zero when it does not wait.
-	delay:  time.Duration,
+	delay:   time.Duration,
 }
 
 // Chat_Failure_Recovery is what a failure class allows: a resend of the same request, a
@@ -204,7 +215,8 @@ chat_failure_recovery :: proc(class: ai.Provider_Failure_Class) -> Chat_Failure_
 //  3. The recovery the failure class allows, overridden by the provider's own directive
 //     where it gave one: a class that is retried is stopped when the provider forbids it,
 //     and a class that stops is retried when the provider says a resend can help.
-//  4. A repair is used once; a resend waits the scheduled delay or the provider's own
+//  4. Optional features are omitted one at a time in their declared order. A context
+//     repair is used once, and a retry waits the scheduled delay or the provider's own
 //     delay, whichever is longer, until the schedule is spent.
 chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Facts) -> Chat_Recovery_Decision {
 	if facts.cancelled || facts.error.kind == .Cancelled { return {action = .Stop, reason = .Cancelled} }
@@ -228,7 +240,11 @@ chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Fact
 		return {action = .Stop, reason = .Terminal_Failure}
 	case .Repair:
 		if class == .Invalid_Request {
-			if facts.cache_hints_sent { return {action = .Omit_Cache_Hints, reason = .Cache_Hints_Refused} }
+			for feature in Optional_Request_Feature {
+				if feature in facts.optional_features {
+					return {action = .Omit_Optional_Feature, reason = OPTIONAL_FEATURE_REFUSED_REASONS[feature], feature = feature}
+				}
+			}
 			return {action = .Stop, reason = .Terminal_Failure}
 		}
 		// A rejected payload is never resent. The chain either makes room for a rebuilt

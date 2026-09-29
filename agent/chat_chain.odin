@@ -95,9 +95,8 @@ Chat_Request_Chain :: struct {
 	repair_compaction_started: bool,
 	// retries counts the scheduled resends this chain made, which the policy bounds.
 	retries:                   int,
-	// cache_hints_omitted records that this chain resent its request without the cache
-	// hints after a refusal, which it does once.
-	cache_hints_omitted:       bool,
+	// omitted_features records the optional features this chain removed after refusals.
+	omitted_features:          Optional_Request_Features,
 	// settled records that the last row was finished for a retry, so the response commit
 	// must not finish it twice.
 	settled:                   bool,
@@ -701,7 +700,7 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 			error = chain.operation_error,
 			failed = chat.active_failed && chain.operation_error.kind == .None,
 			repaired = chain.repaired,
-			cache_hints_sent = chat_request_cache_hints(chain.prep.request),
+			optional_features = chat_request_optional_features(chain.prep.request),
 			storage_failed = chat_session_storage_failed(chat),
 			completion_accepted = chain.completion_accepted,
 			cancelled = chat_session_cancelled(chat),
@@ -734,16 +733,16 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 		chain.stage = .Repairing
 		return
 	}
-	if chain.decision.action == .Omit_Cache_Hints {
-		chat_request_omit_cache_hints(&chain.prep.request)
+	if chain.decision.action == .Omit_Optional_Feature {
+		feature := chain.decision.feature
+		chat_request_omit_feature(&chain.prep.request, feature)
 		if !chat_request_freeze(chat, &chain.prep, &chain.encoded, chain.websocket_request, virtual.arena_allocator(&chain.scratch)) {
 			chat_chain_stop(chat, .Harness_Failure)
 			return
 		}
-		// Later requests leave the hints out too, unless the resend is refused as well.
-		chat.cache_hints_refused = true
-		chain.cache_hints_omitted = true
-		chain.recovery_kind = .Cache_Hints_Omitted
+		chat.refused_features += {feature}
+		chain.omitted_features += {feature}
+		chain.recovery_kind = OPTIONAL_FEATURE_RECOVERY_KINDS[feature]
 	}
 	if chain.decision.action == .Retry { chain.retries += 1 }
 	// The failed attempt's state and everything it produced are cleared now, so the turn
@@ -758,7 +757,13 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	// failure it is told about finds it.
 	_observer_retry_scheduled(
 		chain.observer,
-		{request = chain.request, next_attempt = chain.attempts + 1, failure_class = chain.operation_error.failure_class, delay = chain.decision.delay},
+		{
+			request = chain.request,
+			next_attempt = chain.attempts + 1,
+			failure_class = chain.operation_error.failure_class,
+			reason = chain.decision.reason,
+			delay = chain.decision.delay,
+		},
 	)
 	chain.stage = .Backoff
 	chat_retry_record_scheduled(chat, chain.request, chain.attempts, .Response, chain.decision.reason, chain.attempts + 1, chain.decision.delay)
@@ -856,9 +861,10 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	reason := chain.decision.reason
 	if chat_session_cancelled(chat) { reason = .Cancelled }
 	class := chain.operation_error.failure_class
-	// The request was refused without its cache hints too, so they were not the cause and
-	// later requests carry them again.
-	if reason == .Terminal_Failure && chain.cache_hints_omitted && class == .Invalid_Request { chat.cache_hints_refused = false }
+	// The request was refused without its optional features too, so they were not the cause.
+	if reason == .Terminal_Failure && class == .Invalid_Request {
+		chat.refused_features -= chain.omitted_features
+	}
 	// A response answered with a notice is feedback for the model, not the end of the turn:
 	// the turn goes on to another request so the model can correct what it sent.
 	turn_continues := chat.pending_notice != .None && !chat_session_cancelled(chat)

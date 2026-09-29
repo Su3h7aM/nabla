@@ -8,19 +8,27 @@ import "nabla:agent/journal"
 import "nabla:ai"
 
 // Chat_Recovery_Kind names how one send came to be: a first send, the same frozen
-// bytes sent again, a send of rebuilt context, or the same request without its cache hints.
+// bytes sent again, a send of rebuilt context, or a request with an omitted feature.
 Chat_Recovery_Kind :: enum {
 	Initial,
 	Transient_Retry,
 	Checkpoint_Repair,
+	Adaptive_Thinking_Omitted,
 	Cache_Hints_Omitted,
 }
 
 CHAT_RECOVERY_KIND_NAMES := [Chat_Recovery_Kind]string {
-	.Initial             = "initial",
-	.Transient_Retry     = "transient_retry",
-	.Checkpoint_Repair   = "checkpoint_repair",
-	.Cache_Hints_Omitted = "cache_hints_omitted",
+	.Initial                   = "initial",
+	.Transient_Retry           = "transient_retry",
+	.Checkpoint_Repair         = "checkpoint_repair",
+	.Adaptive_Thinking_Omitted = "adaptive_thinking_omitted",
+	.Cache_Hints_Omitted       = "cache_hints_omitted",
+}
+
+// OPTIONAL_FEATURE_RECOVERY_KINDS is how a send without each optional feature is recorded.
+OPTIONAL_FEATURE_RECOVERY_KINDS := [Optional_Request_Feature]Chat_Recovery_Kind {
+	.Adaptive_Thinking = .Adaptive_Thinking_Omitted,
+	.Cache_Hints       = .Cache_Hints_Omitted,
 }
 
 // Chat_Attempt is where one send sits in its request: its number, from 1, and

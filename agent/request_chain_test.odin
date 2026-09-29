@@ -1,12 +1,33 @@
 #+test
 package agent
 
+import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:testing"
 
 import "nabla:agent/journal"
 import "nabla:ai"
+
+@(private)
+agent_anthropic_reply :: proc(text: string, allocator := context.temp_allocator) -> string {
+	quoted := fmt.aprintf("%q", text, allocator = allocator)
+	defer delete(quoted, allocator)
+	return strings.concatenate(
+		{
+			"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
+			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":",
+			quoted,
+			"}}\n\n",
+			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+		},
+		allocator,
+	)
+}
 
 Retry_Log :: struct {
 	events:    [dynamic]Chat_Retry_Event,
@@ -165,9 +186,8 @@ test_a_stream_lost_after_acceptance_is_resent :: proc(test: ^testing.T) {
 	testing.expect_value(test, answers, 1)
 }
 
-// A refused request is resent once without its cache hints. Refused again, it is nothing
-// the harness can repair and nothing the model sent, so the turn ends with the provider's
-// words for the user and the model is told nothing.
+// Refusals drop adaptive thinking first and cache hints second. When the request without
+// either feature is refused, the turn ends and both features return on the next request.
 @(test)
 test_a_repeated_refusal_ends_the_turn_for_the_user :: proc(test: ^testing.T) {
 	fixture: Chat_Test
@@ -178,25 +198,38 @@ test_a_repeated_refusal_ends_the_turn_for_the_user :: proc(test: ^testing.T) {
 	_test_accept(test, chat, "say something")
 	refusal := `{"error":{"message":"Unsupported parameter: frobnicate"}}`
 	refused := agent_provider_refusal("400 Bad Request", refusal, "")
-	responses := []string{refused, refused}
+	responses := []string{refused, refused, refused, agent_anthropic_reply("next request")}
 	provider: Agent_Provider
 	if !agent_provider_start(test, &provider, responses) { return }
 	defer agent_provider_stop(&provider)
 	connection := ai.Provider_Connection {
-		API      = .OpenAI_Chat_Completions,
+		API      = .Anthropic_Messages,
 		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 	testing.expect(test, !chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn ends on the repeated refusal")
-	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
-	testing.expect(test, !strings.contains(agent_provider_request(&provider, 1), "prompt_cache_key"), "the first resend leaves the cache hints out")
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 3) { return }
+	first := agent_provider_request(&provider, 0)
+	second := agent_provider_request(&provider, 1)
+	third := agent_provider_request(&provider, 2)
+	testing.expect(test, strings.contains(first, `"thinking":{"type":"adaptive"}`), "the first request carries adaptive thinking")
+	testing.expect(test, strings.contains(first, "cache_control"), "the first request carries cache hints")
+	testing.expect(test, !strings.contains(second, "thinking"), "the first resend omits adaptive thinking")
+	testing.expect(test, strings.contains(second, "cache_control"), "the first resend keeps cache hints")
+	testing.expect(test, !strings.contains(third, "thinking"), "the second resend keeps adaptive thinking out")
+	testing.expect(test, !strings.contains(third, "cache_control"), "the second resend omits cache hints")
 	testing.expectf(
 		test,
 		strings.contains(chat.last_error, "Unsupported parameter: frobnicate"),
 		"the user is told in the provider's words: %q",
 		chat.last_error,
 	)
-	testing.expect(test, !chat.cache_hints_refused, "hints that were not the cause are sent again")
+	_test_accept(test, chat, "and again")
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the next turn completes")
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 4) { return }
+	next := agent_provider_request(&provider, 3)
+	testing.expect(test, strings.contains(next, `"thinking":{"type":"adaptive"}`), "a terminal refusal restores adaptive thinking")
+	testing.expect(test, strings.contains(next, "cache_control"), "a terminal refusal restores cache hints")
 }
 
 // A stream that turns unreadable after the model started answering is a failure of the
@@ -237,37 +270,70 @@ test_an_unreadable_stream_is_resent_and_its_partial_answer_dropped :: proc(test:
 	}
 }
 
-// A request refused while it carries the harness's optional cache hints is sent again
-// without them, and the turn goes on as if nothing happened: no notice reaches the model,
-// and later requests leave the hints out.
+// An Anthropic request refused while it carries adaptive thinking is sent again without it.
+// Later requests for that selection leave thinking out but keep cache hints the endpoint did
+// not refuse.
 @(test)
-test_a_refused_request_is_resent_without_its_cache_hints :: proc(test: ^testing.T) {
+test_a_refused_request_is_resent_without_adaptive_thinking :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
 	_test_accept(test, chat, "say something")
-	refusal := `{"error":{"message":"Unsupported parameter: prompt_cache_key"}}`
-	responses := []string{agent_provider_refusal("400 Bad Request", refusal, ""), agent_provider_reply("first answer"), agent_provider_reply("second answer")}
+	refusal := `{"error":{"message":"Unsupported parameter: thinking"}}`
+	responses := []string {
+		agent_provider_refusal("400 Bad Request", refusal, ""),
+		agent_anthropic_reply("first answer"),
+		agent_anthropic_reply("second answer"),
+	}
 	provider: Agent_Provider
 	if !agent_provider_start(test, &provider, responses) { return }
 	defer agent_provider_stop(&provider)
 	connection := ai.Provider_Connection {
-		API      = .OpenAI_Chat_Completions,
+		API      = .Anthropic_Messages,
 		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
 	}
 	defer delete(connection.Endpoint, chat.allocator)
-	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completes")
+	retries: Retry_Log
+	retries.allocator = context.allocator
+	retries.events = make([dynamic]Chat_Retry_Event, 0, 2, retries.allocator)
+	defer delete(retries.events)
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), retry_log_observer(&retries)), "the turn completes")
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
-	testing.expect(test, strings.contains(agent_provider_request(&provider, 0), "prompt_cache_key"))
+	if testing.expect_value(test, len(retries.events), 1) {
+		testing.expect_value(test, retries.events[0].reason, Request_Recovery_Reason.Adaptive_Thinking_Refused)
+		testing.expect_value(test, retries.events[0].delay, 0)
+	}
+	sent := _test_records(test, chat, {.Request_Sent})
+	if testing.expect_value(test, len(sent), 2) {
+		payload: journal.Request_Sent
+		if testing.expect_value(test, journal.payload_decode(sent[1].data, &payload, context.temp_allocator), nil) {
+			testing.expect_value(test, payload.recovery, "adaptive_thinking_omitted")
+		}
+	}
+	first := agent_provider_request(&provider, 0)
+	testing.expect(test, strings.contains(first, `"thinking":{"type":"adaptive"}`), "Anthropic requests carry adaptive thinking")
+	testing.expect(test, strings.contains(first, "cache_control"), "the request carries its cache hints")
 	resent := agent_provider_request(&provider, 1)
-	testing.expect(test, !strings.contains(resent, "prompt_cache_key"), "the resend leaves the cache hints out")
+	testing.expect(test, !strings.contains(resent, "thinking"), "the resend omits adaptive thinking first")
+	testing.expect(test, strings.contains(resent, "cache_control"), "adaptive thinking is omitted before cache hints")
 	testing.expect(test, !strings.contains(resent, "refused"), "the model is not told about a refusal the harness repaired")
 	_test_accept(test, chat, "and again")
 	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the next turn completes")
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 3) { return }
-	testing.expect(test, !strings.contains(agent_provider_request(&provider, 2), "prompt_cache_key"), "later requests leave the hints out")
+	next := agent_provider_request(&provider, 2)
+	testing.expect(test, !strings.contains(next, "thinking"), "later requests leave adaptive thinking out")
+	testing.expect(test, strings.contains(next, "cache_control"), "later requests retain cache hints")
+	selection := Model_Selection {
+		provider_id = chat.provider_id,
+		model_id = "another-model",
+		connection = {API = .Anthropic_Messages},
+	}
+	installed, _ := chat_session_select(chat, selection, "")
+	testing.expect(test, installed, "the next model selection installs")
+	testing.expect_value(test, chat.model_api, ai.API_Kind.Anthropic_Messages)
+	testing.expect_value(test, chat.refused_features, Optional_Request_Features{})
 }
 
 @(test)
@@ -293,6 +359,7 @@ test_a_scripted_provider_completes_one_request :: proc(test: ^testing.T) {
 	testing.expect_value(test, chat.last_error, "")
 	testing.expect(test, strings.contains(agent_provider_request(&provider, 0), chat.model_id))
 	testing.expect(test, strings.contains(agent_provider_request(&provider, 0), "say something"))
+	testing.expect(test, !strings.contains(agent_provider_request(&provider, 0), "thinking"), "a non-Anthropic request never carries adaptive thinking")
 	request_chain_assert(test, chat, 1, "scripted reply")
 }
 

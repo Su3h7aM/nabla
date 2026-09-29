@@ -65,9 +65,15 @@ test_recovery_decision_stops_for_its_own_facts :: proc(test: ^testing.T) {
 		{"overflow repaired once", {error = {kind = .HTTP, failure_class = .Context_Overflow}, repaired = true}, .Stop, .Context_Exhausted},
 		{
 			"refused with cache hints",
-			{error = {kind = .HTTP, failure_class = .Invalid_Request}, cache_hints_sent = true},
-			.Omit_Cache_Hints,
+			{error = {kind = .HTTP, failure_class = .Invalid_Request}, optional_features = {.Cache_Hints}},
+			.Omit_Optional_Feature,
 			.Cache_Hints_Refused,
+		},
+		{
+			"adaptive thinking is omitted before cache hints",
+			{error = {kind = .HTTP, failure_class = .Invalid_Request}, optional_features = {.Adaptive_Thinking, .Cache_Hints}},
+			.Omit_Optional_Feature,
+			.Adaptive_Thinking_Refused,
 		},
 	}
 	for entry in cases {

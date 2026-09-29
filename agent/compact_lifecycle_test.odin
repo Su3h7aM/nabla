@@ -852,6 +852,89 @@ test_a_transient_summary_failure_is_retried_on_the_same_bytes :: proc(test: ^tes
 	testing.expect(test, chat_compact_install(chat, {}), "the summary installs once it is ready")
 }
 
+@(test)
+test_repeated_invalid_compaction_refusals_restore_omitted_features :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat.model_api = .Anthropic_Messages
+	arena: virtual.Arena
+	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
+	defer virtual.arena_destroy(&arena)
+	chat_test_capacity(chat, 500_000)
+	chat.compact_retry = test_retry_policy()
+	_test_accept(test, chat, "first")
+	large := strings.repeat("work ", 320_000) or_else ""
+	defer delete(large)
+	_test_user(test, chat, large, .Prompt)
+	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
+		_test_response(test, chat, 0, text)
+	}
+	refusal := agent_provider_refusal("400 Bad Request", `{"error":{"message":"Unsupported parameter: thinking"}}`)
+	responses := []string{refusal, refusal, refusal}
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .Anthropic_Messages,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+	prep, prep_error := chat_prepare(chat, connection, virtual.arena_allocator(&arena))
+	if prep_error != nil { testing.fail_now(test, "chat_prepare failed") }
+	chat_compact_consider(chat, {}, connection, &prep)
+	if !compact_service_until(test, chat, .Idle) { return }
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 1) { return }
+	first := agent_provider_request(&provider, 0)
+	testing.expect(test, strings.contains(first, `"thinking":{"type":"adaptive"}`), "the compaction request carries adaptive thinking")
+	testing.expect(test, .Adaptive_Thinking in chat.refused_features)
+	testing.expect(test, .Cache_Hints not_in chat.refused_features)
+	testing.expect(test, .Adaptive_Thinking in chat.compact.omitted_features)
+
+	// A later compaction uses the normal request builder, which leaves out the refused feature.
+	chat.compact.last_failure_at = time.tick_add(time.tick_now(), -CHAT_COMPACT_COOLDOWN - time.Second)
+	testing.expect_value(test, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
+	prep, prep_error = chat_prepare(chat, connection, virtual.arena_allocator(&arena))
+	if prep_error != nil { testing.fail_now(test, "chat_prepare failed") }
+	chat_compact_consider(chat, {}, connection, &prep)
+	if !compact_service_until(test, chat, .Idle) { return }
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
+	second := agent_provider_request(&provider, 1)
+	testing.expect(test, !strings.contains(second, "thinking"), "the next compaction request omits adaptive thinking")
+	testing.expect(test, strings.contains(second, "cache_control"), "the next request retains cache hints")
+	testing.expect(test, .Adaptive_Thinking in chat.refused_features)
+	testing.expect(test, .Cache_Hints in chat.refused_features)
+	testing.expect(test, chat.compact.omitted_features == {.Adaptive_Thinking, .Cache_Hints})
+
+	// Once neither optional feature is present, another invalid request proves the omissions
+	// did not repair it, so both are made available to later requests again.
+	chat.compact.last_failure_at = time.tick_add(time.tick_now(), -CHAT_COMPACT_COOLDOWN - time.Second)
+	testing.expect_value(test, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
+	prep, prep_error = chat_prepare(chat, connection, virtual.arena_allocator(&arena))
+	if prep_error != nil { testing.fail_now(test, "chat_prepare failed") }
+	chat_compact_consider(chat, {}, connection, &prep)
+	if !compact_service_until(test, chat, .Idle) { return }
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 3) { return }
+	third := agent_provider_request(&provider, 2)
+	testing.expect(test, !strings.contains(third, "thinking"), "the final request omits adaptive thinking")
+	testing.expect(test, !strings.contains(third, "cache_control"), "the final request omits cache hints")
+	testing.expect_value(test, chat.refused_features, Optional_Request_Features{})
+	testing.expect_value(test, chat.compact.omitted_features, Optional_Request_Features{})
+
+	sends := _test_records(test, chat, {.Request_Sent})
+	if !testing.expect_value(test, len(sends), 3) { return }
+	for send in sends {
+		sent: journal.Request_Sent
+		if decode_error := journal.payload_decode(send.data, &sent, context.temp_allocator);
+		   decode_error != nil { testing.fail_now(test, "the compaction send could not be decoded") }
+		testing.expect_value(test, send.attempt, journal.Attempt_No(1))
+		testing.expect_value(test, sent.recovery, "initial")
+	}
+	rejections := _test_records(test, chat, {.Response_Rejected})
+	testing.expect_value(test, len(rejections), 3)
+}
+
 // A summary the harness cannot use is not regenerated: the chain ends, and the session
 // waits out the cooldown before any new snapshot starts.
 @(test)

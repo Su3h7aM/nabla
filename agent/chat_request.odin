@@ -8,6 +8,18 @@ import "core:strings"
 import "nabla:agent/journal"
 import "nabla:ai"
 
+Optional_Request_Feature :: enum {
+	Adaptive_Thinking,
+	Cache_Hints,
+}
+
+Optional_Request_Features :: bit_set[Optional_Request_Feature;u8]
+
+OPTIONAL_FEATURE_NAMES := [Optional_Request_Feature]string {
+	.Adaptive_Thinking = "adaptive thinking",
+	.Cache_Hints       = "cache hints",
+}
+
 // --- request assembly --------------------------------------------------------
 
 // NABLA_USER_AGENT names this client to a provider endpoint. Every HTTP client
@@ -67,27 +79,33 @@ chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connectio
 	return true
 }
 
-// chat_request_cache_hints reports whether request carries any of the cache hints the
-// harness adds. None of them changes what the model is asked, so each can be left out.
+// chat_request_optional_features reports the optional features request carries.
 @(private)
-chat_request_cache_hints :: proc(request: ai.Provider_Request) -> bool {
-	return(
-		(request.Cache_Request_Present && request.Cache_Request) ||
-		request.Prompt_Cache_Key_Present ||
-		request.Prompt_Cache_Options_Present ||
-		request.Prompt_Cache_Retention_Present \
-	)
+chat_request_optional_features :: proc(request: ai.Provider_Request) -> Optional_Request_Features {
+	features: Optional_Request_Features
+	if request.Adaptive_Thinking { features += {.Adaptive_Thinking} }
+	if (request.Cache_Request_Present && request.Cache_Request) ||
+	   request.Prompt_Cache_Key_Present ||
+	   request.Prompt_Cache_Options_Present ||
+	   request.Prompt_Cache_Retention_Present {
+		features += {.Cache_Hints}
+	}
+	return features
 }
 
-// chat_request_omit_cache_hints removes the cache hints from request, for an endpoint that
-// refused a request carrying them.
+// chat_request_omit_feature removes feature from request, for an endpoint that refused it.
 @(private)
-chat_request_omit_cache_hints :: proc(request: ^ai.Provider_Request) {
-	request.Cache_Request_Present = false
-	request.Cache_Request = false
-	request.Prompt_Cache_Key_Present = false
-	request.Prompt_Cache_Options_Present = false
-	request.Prompt_Cache_Retention_Present = false
+chat_request_omit_feature :: proc(request: ^ai.Provider_Request, feature: Optional_Request_Feature) {
+	switch feature {
+	case .Adaptive_Thinking:
+		request.Adaptive_Thinking = false
+	case .Cache_Hints:
+		request.Cache_Request_Present = false
+		request.Cache_Request = false
+		request.Prompt_Cache_Key_Present = false
+		request.Prompt_Cache_Options_Present = false
+		request.Prompt_Cache_Retention_Present = false
+	}
 }
 
 // chat_request_freeze encodes prep's request into encoded, with the bytes copied into
@@ -203,6 +221,9 @@ chat_build_request_into :: proc(
 	// including a compaction request, which reads that prefix to summarize it.
 	prep.request.Cache_Request_Present = true
 	prep.request.Cache_Request = true
+	// Only the Messages API has adaptive thinking, and every model it serves is asked for it:
+	// one that cannot take it refuses the request, and the chain resends it without.
+	prep.request.Adaptive_Thinking = connection.API == .Anthropic_Messages
 	// The session id is the cache identity: stable for the session's life, so
 	// related requests route together and account together. On Responses the
 	// implicit breakpoint advances through the newest eligible boundary on its
@@ -213,7 +234,7 @@ chat_build_request_into :: proc(
 	prep.request.Prompt_Cache_Key_Present = true
 	prep.request.Prompt_Cache_Key = session_text
 	if parent := chat_parent_session(chat); parent != "" { prep.request.Prompt_Cache_Key = parent }
-	if chat.cache_hints_refused { chat_request_omit_cache_hints(&prep.request) }
+	for feature in chat.refused_features { chat_request_omit_feature(&prep.request, feature) }
 	if chat.effort != "" {
 		prep.request.Reasoning_Effort_Present = true
 		prep.request.Reasoning_Effort = chat.effort

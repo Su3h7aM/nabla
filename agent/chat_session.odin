@@ -176,6 +176,7 @@ Chat_Session :: struct {
 	tool_output_directory:        string,
 	provider_id:                  string, // owned; the provider requests are addressed to
 	model_id:                     string, // owned; the model requests ask for
+	model_api:                    ai.API_Kind,
 	provider_transport:           Provider_Transport,
 	provider_websocket:           ^ai.Provider_WebSocket_Session,
 	websocket_fallback_http:      bool,
@@ -193,10 +194,9 @@ Chat_Session :: struct {
 	// when the model was selected. It prices the usage each committed response
 	// reports; a zero cost prices nothing.
 	cost:                         Catalog_Cost,
-	// cache_hints_refused records that the endpoint refused a request carrying the cache
-	// hints and accepted it without them, so later requests leave them out. It holds for the
-	// model it was learned on and clears when another model is selected.
-	cache_hints_refused:          bool,
+	// refused_features records optional request features the endpoint refused. Later
+	// requests leave them out until another model is selected.
+	refused_features:             Optional_Request_Features,
 	effort_levels:                [dynamic]string, // owned; allowed levels, verbatim
 	effort:                       string, // owned; "" means provider default
 

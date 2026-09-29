@@ -284,43 +284,45 @@ Compact_State :: enum {
 // the interrupt that bounds it. The owner touches none of it between
 // start and join.
 Compact_Job :: struct {
-	snapshot:    Compact_Snapshot,
-	request:     journal.Request_Id,
-	interrupt:   ai.Interrupt,
-	thread:      ^thread.Thread,
+	snapshot:          Compact_Snapshot,
+	provider_id:       string,
+	optional_features: Optional_Request_Features,
+	request:           journal.Request_Id,
+	interrupt:         ai.Interrupt,
+	thread:            ^thread.Thread,
 	// allocator is the thread-safe heap the job itself and the worker-owned storage come from:
 	// the frozen snapshot, the output it accumulates, and everything the request allocates while
 	// it runs. It is deliberately not the session's allocator: wrapping the worker's own
 	// allocations in a lock would not serialize the owner's writes through the same backing
 	// allocator, so the two threads never share one, and a job whose worker ignores its stop
 	// outlives the allocator the session releases.
-	allocator:   mem.Allocator,
+	allocator:         mem.Allocator,
 	// logging is the immutable binding the worker uses for provider and runtime records.
 	// It points at the session's sink and owns no strings.
-	logging:     Log_Binding,
+	logging:           Log_Binding,
 	// finished is atomic: the worker stores it once the fields below are final.
-	finished:    bool,
-	output:      [dynamic]u8, // owner after join
+	finished:          bool,
+	output:            [dynamic]u8, // owner after join
 	// output_lost records that a fragment of the summary could not be kept, so what the job
 	// holds is not what the model wrote. Such a job has no summary at all: installing what fit
 	// in memory would replace committed history with a partial account of it.
-	output_lost: bool,
-	reason:      ai.Provider_Finish_Reason,
-	tool_calls:  int,
-	failed:      bool,
-	error_text:  string, // owned; the transport's or the provider's account
-	operation:   ai.Provider_Operation_Error,
-	usage:       journal.Response_Committed,
-	started_at:  time.Tick,
+	output_lost:       bool,
+	reason:            ai.Provider_Finish_Reason,
+	tool_calls:        int,
+	failed:            bool,
+	error_text:        string, // owned; the transport's or the provider's account
+	operation:         ai.Provider_Operation_Error,
+	usage:             journal.Response_Committed,
+	started_at:        time.Tick,
 	// stop_at is when the owner asked this job's worker to stop, and the patience the worker is
 	// given to publish is measured from it. A job that has not published by the end of it is
 	// abandoned: the owner stops waiting for it and keeps the session working.
-	stop_at:     Maybe(time.Tick),
+	stop_at:           Maybe(time.Tick),
 	// attempts counts the sends this chain has made, including the one in flight.
-	attempts:    int,
+	attempts:          int,
 	// due_at is when a job in Backoff is sent again, or none when the delay it waits out
 	// is longer than the clock can hold.
-	due_at:      Maybe(time.Tick),
+	due_at:            Maybe(time.Tick),
 }
 
 // Compact_Control is the owner-side view. Only the thread that drives the session
@@ -345,6 +347,8 @@ Compact_Control :: struct {
 	// credentials, a spent quota, or a request the provider refuses. An explicit request clears
 	// it, because the user may have corrected whatever caused it.
 	suppressed:         bool,
+	// omitted_features are refused features that a later compaction has not yet confirmed.
+	omitted_features:   Optional_Request_Features,
 }
 
 Compact_Request_Result :: enum {
@@ -447,6 +451,7 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 chat_compact_job_destroy :: proc(job: ^Compact_Job) {
 	allocator := job.allocator
 	chat_compact_snapshot_destroy(&job.snapshot, allocator)
+	delete(job.provider_id, allocator)
 	delete(job.output)
 	delete(job.error_text, allocator)
 	ai.Provider_Operation_Error_Destroy(&job.operation, allocator)
@@ -535,6 +540,11 @@ chat_compact_identity :: proc(chat: ^Chat_Session, connection: ai.Provider_Conne
 	return chat_text_digest(text)
 }
 
+@(private)
+chat_compact_selection_matches :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bool {
+	return chat.provider_id == job.provider_id && chat.model_id == job.snapshot.model && chat.model_api == job.snapshot.api
+}
+
 // chat_compact_begin_attempt records a send before its worker starts, with the digest and
 // the size of the frozen bytes that send will carry.
 @(private, require_results)
@@ -546,8 +556,6 @@ chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bo
 		provider = chat.provider_id,
 		model    = chat.model_id,
 	}
-	recovery := Chat_Recovery_Kind.Initial
-	if job.attempts > 1 { recovery = .Transient_Retry }
 	digest_buffer: [journal.DIGEST_HEX_LENGTH]u8
 	body_digest, body_bytes := chat_body_digest(transmute([]u8)job.snapshot.body, digest_buffer[:])
 	chat_record(
@@ -557,7 +565,7 @@ chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bo
 			purpose = journal.REQUEST_PURPOSE_NAMES[.Compaction],
 			api = chat_api_name(job.snapshot.api),
 			model_requested = chat.model_id,
-			recovery = CHAT_RECOVERY_KIND_NAMES[recovery],
+			recovery = CHAT_RECOVERY_KIND_NAMES[job.attempts > 1 ? .Transient_Retry : .Initial],
 			body_digest = body_digest,
 			body_bytes = body_bytes,
 		},
@@ -649,9 +657,17 @@ chat_compact_start :: proc(
 		attempts = 1,
 	}
 	chat_compact_job_allocator(job)
+	provider_id, clone_error := strings.clone(chat.provider_id, job.allocator)
+	if clone_error != nil {
+		chat_compact_job_destroy(job)
+		_observer_message(observer, .Warning, "the compaction request identity could not be copied")
+		return false
+	}
+	job.provider_id = provider_id
 	// The output holds nothing yet and so allocates nothing; it carries the allocator the
 	// streamed summary grows from.
 	job.output.allocator = job.allocator
+	job.optional_features = chat_request_optional_features(compact_prep.request)
 
 	// The bytes are frozen before the row exists: a request that cannot be encoded never
 	// reaches the network, so it is not recorded as an attempt that was sent.
@@ -772,10 +788,11 @@ chat_compact_retryable :: proc(job: ^Compact_Job) -> bool {
 @(private)
 chat_compact_recovery :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> Chat_Recovery_Decision {
 	facts := Chat_Attempt_Facts {
-		retries        = max(job.attempts - 1, 0),
-		error          = job.operation,
-		failed         = !chat_compact_retryable(job),
-		storage_failed = chat_session_storage_failed(chat),
+		retries           = max(job.attempts - 1, 0),
+		error             = job.operation,
+		failed            = !chat_compact_retryable(job),
+		optional_features = job.optional_features,
+		storage_failed    = chat_session_storage_failed(chat),
 	}
 	return chat_recovery_decide(chat.compact_retry, facts)
 }
@@ -927,12 +944,20 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 		// asks for: the row says how the send failed and what the owner did about it.
 		decision := chat_compact_recovery(chat, job)
 		chat_compact_finish_attempt(chat, job, decision, reason)
+		if decision.action == .Omit_Optional_Feature {
+			chat_compact_omit_feature(chat, observer, job, decision.feature)
+			return
+		}
 		if decision.action == .Retry {
 			job.due_at = chat_retry_deadline(decision.delay)
 			control.state = .Backoff
 			chat_retry_record_scheduled(chat, job.request, job.attempts, .Compaction, decision.reason, job.attempts + 1, decision.delay)
 			_observer_message(observer, .Notice, "the summary did not complete; it will be sent again")
 			return
+		}
+		if decision.reason == .Terminal_Failure && job.operation.failure_class == .Invalid_Request && chat_compact_selection_matches(chat, job) {
+			chat.refused_features -= control.omitted_features
+			control.omitted_features = {}
 		}
 		// A chain that ended for a reason the same configuration cannot fix is not started
 		// again automatically: the credentials, the quota, or the request itself has to change.
@@ -960,6 +985,7 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 
 	control.state = .Ready
 	control.last_failure_at = {}
+	control.omitted_features = {}
 
 	fields := [7]Log_Field {
 		{key = "trigger", value = compact_trigger_name(control.trigger)},
@@ -972,6 +998,20 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 	}
 	log_emit({level = .Info, category = .Provider, event = "compaction.finished", fields = fields[:]})
 	_observer_message(observer, .Notice, "background compaction finished; the summary is installed when the context reaches the size it was started for")
+}
+
+// chat_compact_omit_feature records a refused feature for the next normal compaction request.
+@(private)
+chat_compact_omit_feature :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^Compact_Job, feature: Optional_Request_Feature) {
+	control := &chat.compact
+	message := "the summary request was refused"
+	if chat_compact_selection_matches(chat, job) {
+		chat.refused_features += {feature}
+		control.omitted_features += {feature}
+		message = fmt.tprintf("the summary request was refused; the next one is sent without %s", OPTIONAL_FEATURE_NAMES[feature])
+	}
+	chat_compact_failed_job(control, job)
+	_observer_message(observer, .Notice, message)
 }
 
 @(private)

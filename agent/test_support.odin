@@ -100,6 +100,7 @@ chat_test_begin :: proc(test: ^testing.T, fixture: ^Chat_Test, workspace: string
 	if tool_error.kind != .None { testing.fail_now(test, "the tool registry could not be created") }
 	fixture.chat.provider_id = chat_clone_string("test-provider", context.allocator) or_else ""
 	fixture.chat.model_id = chat_clone_string("test-model", context.allocator) or_else ""
+	fixture.chat.model_api = .OpenAI_Chat_Completions
 	fixture.chat.skill_instructions = test_skill_instructions(&fixture.chat)
 	// Kept outputs go under the fixture's own directory, never the user's cache directory.
 	delete(fixture.chat.tool_output_directory, context.allocator)
