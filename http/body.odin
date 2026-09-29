@@ -57,8 +57,23 @@ body_url_encoded :: proc(encoded: Body, allocator := context.temp_allocator) -> 
 		value := text[value_start:end] if has_value else ""
 
 		// PERF: this could be a hot spot and I don't like that we allocate the decoded key and value here.
-		decoded_key := (net.percent_decode(key, allocator) or_return) if strings.index_byte(key, '%') > -1 else key
-		decoded_value := (net.percent_decode(value, allocator) or_return) if has_value && strings.index_byte(value, '%') > -1 else value
+		decode_key := strings.index_byte(key, '%') > -1
+		decoded_key := key
+		if decode_key {
+			decoded, decoded_ok := net.percent_decode(key, allocator)
+			if !decoded_ok { return false }
+			decoded_key = decoded
+		}
+
+		decoded_value := value
+		if has_value && strings.index_byte(value, '%') > -1 {
+			decoded, decoded_ok := net.percent_decode(value, allocator)
+			if !decoded_ok {
+				if decode_key { delete(decoded_key, allocator) }
+				return false
+			}
+			decoded_value = decoded
+		}
 
 		result[decoded_key] = decoded_value
 		return true

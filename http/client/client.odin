@@ -159,9 +159,8 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 
 	// A refused response still has a body, and that body is the peer's own account
 	// of why. It is framed and delivered exactly as a usable one is, so the caller
-	// keeps what it wants and nothing is decided here on its behalf. The phase stays
-	// in the body: what ended the exchange was the status, not the transport, and the
-	// status is what the caller reads.
+	// keeps what it wants and nothing is decided here on its behalf. If that transfer
+	// fails, preserve both the refusal status and the error that ended its body.
 	phase = .Response_Body
 	if framing_err != .None {
 		// The head's framing is unusable, so there is no body this client can frame
@@ -170,7 +169,10 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 		return failure_from_error(framing_err, request.allocator)
 	}
 	if body_err := stream_body(&reader, framing, length, user_data, callback); body_err != .None {
-		if refusal.kind != .None { return refusal }
+		if refusal.kind != .None {
+			refusal.cause = body_err
+			return refusal
+		}
 		return failure_from_error(body_err, request.allocator)
 	}
 	if refusal.kind != .None { return refusal }
@@ -258,8 +260,9 @@ request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase,
 
 // request_validate refuses what this client will not put on the wire: a URL
 // it does not speak, and fields or a target that would frame ambiguously or
-// inject bytes. URL problems report Invalid_URL; everything the caller built
-// reports Invalid_Request. The detail is a static string the failure clones.
+// inject bytes. CONNECT needs authority-form and a tunnel handle, which this
+// client does not provide. URL problems report Invalid_URL; everything the
+// caller built reports Invalid_Request. The detail is a static string the failure clones.
 @(require_results)
 request_validate :: proc(url: http.URL, request: Request) -> (err: Error, detail: string) {
 	// RFC 9110 4.2.3: schemes are case-insensitive.
@@ -269,6 +272,9 @@ request_validate :: proc(url: http.URL, request: Request) -> (err: Error, detail
 	if url.host == "" { return .Invalid_URL, "URL host is empty" }
 	if strings.index_byte(url.host, '@') >= 0 {
 		return .Invalid_URL, "URL authority states userinfo, which this client does not send"
+	}
+	if request.method == .Connect {
+		return .Invalid_Request, "CONNECT is unsupported because this client has no tunnel API"
 	}
 	for i in 0 ..< len(url.host) {
 		if url.host[i] <= 0x20 || url.host[i] == 0x7F { return .Invalid_URL, "URL host holds a control byte or space" }

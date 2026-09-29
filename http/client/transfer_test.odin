@@ -2,8 +2,11 @@
 #+private file
 package client
 
+import "core:fmt"
 import "core:mem"
+import "core:net"
 import "core:testing"
+import "core:thread"
 
 // The transport's own account of a request is the one observation a caller cannot
 // make for itself: a truncated stream and a request that was never written both
@@ -24,6 +27,52 @@ transfer_log_complete :: proc(user_data: rawptr, summary: Transfer_Summary) {
 
 transfer_log_options :: proc(log: ^Transfer_Log) -> Options {
 	return {observer = {user_data = log, complete = transfer_log_complete}}
+}
+
+Refusal_Body_Server :: struct {
+	listener: net.TCP_Socket,
+	sent:     bool,
+}
+
+refusal_body_serve :: proc(thread_handle: ^thread.Thread) {
+	server := cast(^Refusal_Body_Server)thread_handle.data
+	socket, _, accept_err := net.accept_tcp(server.listener)
+	if accept_err != nil { return }
+	defer net.close(socket)
+
+	response := "HTTP/1.1 404 Not Found\r\ncontent-length: 4\r\n\r\nx"
+	response_bytes := transmute([]u8)response
+	sent := 0
+	for sent < len(response_bytes) {
+		count, send_err := net.send_tcp(socket, response_bytes[sent:])
+		if send_err != nil || count <= 0 { return }
+		sent += count
+	}
+	server.sent = true
+
+	// Keep the peer open so the client probe, rather than an EOF, ends the
+	// incomplete body after its first byte reaches the callback.
+	scratch: [1024]u8
+	for {
+		count, read_err := net.recv_tcp(socket, scratch[:])
+		if read_err != nil || count <= 0 { return }
+	}
+}
+
+Body_Cancel_State :: struct {
+	cancelled: bool,
+	bytes:     int,
+}
+
+body_cancel_probe :: proc(user_data: rawptr) -> Wait_Status {
+	state := cast(^Body_Cancel_State)user_data
+	return .Cancelled if state.cancelled else .Ready
+}
+
+body_cancel_collect :: proc(user_data: rawptr, chunk: []u8) {
+	state := cast(^Body_Cancel_State)user_data
+	state.bytes += len(chunk)
+	state.cancelled = true
 }
 
 // Every kind of failure owns its own detail, so one destructor releases any of
@@ -72,6 +121,50 @@ test_transfer_reports_a_request_that_was_never_written :: proc(t: ^testing.T) {
 	defer failure_destroy(&failure, context.allocator)
 	testing.expect_value(t, failure.kind, Failure_Kind.Invalid_URL)
 	testing.expect_value(t, log.summary.stopped_at, Transfer_Phase.Validate)
+}
+
+@(test)
+test_refused_response_preserves_body_cancellation :: proc(t: ^testing.T) {
+	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
+	if !testing.expectf(t, listen_err == nil, "the test endpoint could not listen: %v", listen_err) { return }
+	defer net.close(listener)
+	endpoint, endpoint_err := net.bound_endpoint(listener)
+	if !testing.expectf(t, endpoint_err == nil, "the test endpoint could not be read: %v", endpoint_err) { return }
+
+	server := Refusal_Body_Server {
+		listener = listener,
+	}
+	worker := thread.create(refusal_body_serve, name = "nabla-http-refusal-body-test")
+	if worker == nil { testing.fail_now(t, "the test server thread could not be created") }
+	worker.data = &server
+	thread.start(worker)
+	defer if worker != nil {
+		thread.join(worker)
+		thread.destroy(worker)
+	}
+
+	state: Body_Cancel_State
+	log: Transfer_Log
+	options := transfer_log_options(&log)
+	options.probe = {
+		check     = body_cancel_probe,
+		user_data = &state,
+	}
+	url := fmt.aprintf("http://127.0.0.1:%d/", endpoint.port, allocator = context.allocator)
+	defer delete(url, context.allocator)
+	failure := stream_request({url = url, method = .Get, allocator = context.allocator}, options, &state, body_cancel_collect)
+	defer failure_destroy(&failure, context.allocator)
+
+	thread.join(worker)
+	testing.expect(t, server.sent, "the test server did not send the refusal")
+	testing.expect_value(t, state.bytes, 1)
+	testing.expect_value(t, failure.kind, Failure_Kind.HTTP_Status)
+	testing.expect_value(t, failure.status, 404)
+	testing.expect_value(t, failure.cause, Error.Cancelled)
+	testing.expect_value(t, log.summary.stopped_at, Transfer_Phase.Response_Body)
+	testing.expect_value(t, log.summary.error, Error.Cancelled)
+	thread.destroy(worker)
+	worker = nil
 }
 
 @(test)

@@ -117,6 +117,15 @@ test_invalid_requests_are_refused_before_the_wire :: proc(t: ^testing.T) {
 	refused_request_case("https://api.example.com/", {{"content-length", "5x"}}, transmute([]u8)string("hello"), .Invalid_Request, t)
 	// A length that states exactly the body is the caller's own value kept.
 	refused_request_case("https://api.example.com/", {{"content-length", "2"}}, transmute([]u8)string("hi"), .None, t)
+
+	// CONNECT needs authority-form and a tunnel result, neither of which this
+	// client supports, so it is refused before the request reaches the wire.
+	connect := Request {
+		url    = "https://api.example.com:443/",
+		method = .Connect,
+	}
+	connect_err, _ := request_validate(http.url_parse(connect.url), connect)
+	testing.expect_value(t, connect_err, Error.Invalid_Request)
 }
 
 @(test)
