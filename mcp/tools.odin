@@ -52,12 +52,12 @@ Rejected_Tool :: struct {
 	reason: string,
 }
 
-// Tool_Page is one page of a tools/list result. next_cursor is empty when the
-// server reported no more pages.
+// Tool_Page is one page of a tools/list result. next_cursor is nil when the
+// server reported no more pages; a present empty string is still a cursor.
 Tool_Page :: struct {
 	tools:       [dynamic]Tool,
 	rejected:    [dynamic]Rejected_Tool,
-	next_cursor: string,
+	next_cursor: Maybe(string),
 	allocator:   mem.Allocator,
 }
 
@@ -73,18 +73,19 @@ tool_page_destroy :: proc(page: ^Tool_Page, allocator := context.allocator) {
 		delete(rejected.reason, owner)
 	}
 	delete(page.rejected)
-	delete(page.next_cursor, owner)
+	if next_cursor, present := page.next_cursor.(string); present { delete(next_cursor, owner) }
 	page^ = {}
 }
 
-// tools_list_params_make builds the params for one tools/list page. An empty
-// cursor asks for the first page.
+// tools_list_params_make builds the params for one tools/list page. A nil cursor
+// asks for the first page; a present empty string is sent as a cursor.
 @(require_results)
-tools_list_params_make :: proc(cursor: string, version: Protocol_Version, allocator := context.allocator) -> (json.Object, Error) {
-	params, build_error := request_params_make(version, 1 if cursor != "" else 0, allocator)
+tools_list_params_make :: proc(cursor: Maybe(string), version: Protocol_Version, allocator := context.allocator) -> (json.Object, Error) {
+	cursor_value, has_cursor := cursor.(string)
+	params, build_error := request_params_make(version, 1 if has_cursor else 0, allocator)
 	if build_error.kind != .None { return {}, build_error }
-	if cursor != "" {
-		if !mcp_object_put_string(&params, "cursor", cursor, allocator) {
+	if has_cursor {
+		if !mcp_object_put_string(&params, "cursor", cursor_value, allocator) {
 			json.destroy_value(json.Value(params), allocator)
 			return {}, error_make(.Out_Of_Memory, allocator = allocator)
 		}

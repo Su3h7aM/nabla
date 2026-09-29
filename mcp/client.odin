@@ -11,8 +11,8 @@ import "core:time"
 // for a method that cannot change anything: a tools/call is never reissued.
 CLIENT_REQUEST_ATTEMPTS :: 2
 
-// CLIENT_HANDSHAKE_TIMEOUT bounds the notification that completes a handshake. It
-// is short because the write is one line: a server that cannot take it is wedged.
+// CLIENT_HANDSHAKE_TIMEOUT is the default deadline for the notification that
+// completes a handshake. A caller-supplied deadline takes precedence.
 CLIENT_HANDSHAKE_TIMEOUT :: 5 * time.Second
 
 // Client is one server the harness can talk to. It owns the process, the config the
@@ -131,6 +131,7 @@ client_try_discover :: proc(client: ^Client, options: Operation_Options, allocat
 @(private, require_results)
 client_initialize :: proc(client: ^Client, options: Operation_Options, allocator: mem.Allocator) -> (Connection, Error) {
 	control := options.control
+	client.version = .Unknown
 	params, build_error := initialize_params_make(client.allocator)
 	if build_error.kind != .None { return {}, build_error }
 	result, exchange_err := client_exchange(client, METHOD_INITIALIZE, params, options)
@@ -145,25 +146,21 @@ client_initialize :: proc(client: ^Client, options: Operation_Options, allocator
 	json.destroy_value(result, client.allocator)
 	if decode_err.kind != .None { return {}, decode_err }
 
-	// The server is told the handshake is complete before anything else is asked of
-	// it. The revision is in force from here, which is what lets the notification be
-	// framed correctly.
-	client.version = connection.version
-	handshake_control := Control {
-		user_data    = control.user_data,
-		interrupted  = control.interrupted,
-		deadline_at  = time.tick_add(time.tick_now(), CLIENT_HANDSHAKE_TIMEOUT),
-		has_deadline = true,
-		wake         = control.wake,
+	// The notification shares the handshake's observer and deadline. Only callers
+	// that supplied no deadline receive the package default.
+	handshake_control := control
+	if !handshake_control.has_deadline {
+		handshake_control.deadline_at = time.tick_add(time.tick_now(), CLIENT_HANDSHAKE_TIMEOUT)
+		handshake_control.has_deadline = true
 	}
 	// The continuation keeps the caller's observer: the notification is part of
 	// the same handshake the caller asked to watch.
 	if notify_err := client_notify(client, NOTIFICATION_INITIALIZED, nil, Operation_Options{control = handshake_control, observer = options.observer});
 	   notify_err.kind != .None {
 		connection_destroy(&connection, allocator)
-		client.version = .Unknown
 		return {}, notify_err
 	}
+	client.version = connection.version
 	return connection, {}
 }
 
@@ -302,8 +299,8 @@ client_error_is_transport :: proc(err: Error) -> bool {
 }
 
 // client_tools_list follows the listing to its end and returns every page as one
-// page. A repeated cursor is refused rather than followed: it asks for a page that
-// has already been read, and no page count would end such a listing.
+// page. Cursors are opaque, so their contents do not control whether they are
+// followed.
 //
 // The listing has no effect, so it may be sent again after the server is restarted;
 // a tool call may not.
@@ -324,8 +321,8 @@ client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator
 	failed := true
 	defer if failed { tool_page_destroy(&page, allocator) }
 
-	cursor: string // owned by the loop; empty when the listing is complete
-	defer if cursor != "" { delete(cursor, allocator) }
+	cursor: Maybe(string) // owned by the loop; nil when the listing is complete
+	defer if cursor_value, present := cursor.(string); present { delete(cursor_value, allocator) }
 	for {
 		next: Tool_Page
 		// The listing is read-only, so a transport failure is retried once against a
@@ -356,8 +353,6 @@ client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator
 
 		// The page's contents move into the merged page, and the cursor moves into
 		// the loop's own variable, so clearing the page releases only what is left.
-		moved_cursor := next.next_cursor
-		next.next_cursor = ""
 		old_tools_len := len(page.tools)
 		tools_appended := append(&page.tools, ..next.tools[:])
 		if tools_appended != len(next.tools) {
@@ -376,16 +371,12 @@ client_tools_list :: proc(client: ^Client, options: Operation_Options, allocator
 			return {}, error_make(.Out_Of_Memory, allocator = allocator)
 		}
 		clear(&next.rejected)
+		moved_cursor := next.next_cursor
+		next.next_cursor = nil
 		tool_page_destroy(&next, allocator)
-		// The cursor that produced this page is the one the server just answered
-		// with: asking again with it would read the same page forever.
-		if moved_cursor != "" && moved_cursor == cursor {
-			delete(moved_cursor, allocator)
-			return {}, error_make(.Malformed_Message, "the server reported the same listing cursor again", allocator = allocator)
-		}
-		if cursor != "" { delete(cursor, allocator) }
+		if previous_cursor, present := cursor.(string); present { delete(previous_cursor, allocator) }
 		cursor = moved_cursor
-		if cursor == "" { break }
+		if _, present := cursor.(string); !present { break }
 	}
 
 	failed = false

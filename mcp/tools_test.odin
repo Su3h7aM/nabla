@@ -41,13 +41,41 @@ test_tools_list_reads_a_page :: proc(t: ^testing.T) {
 
 	if !testing.expect_value(t, len(page.tools), 1) { return }
 	testing.expect_value(t, len(page.rejected), 0)
-	testing.expect_value(t, page.next_cursor, "page-2")
+	cursor, has_cursor := page.next_cursor.(string)
+	if testing.expect(t, has_cursor, "the next cursor is present") {
+		testing.expect_value(t, cursor, "page-2")
+	}
 	testing.expect_value(t, page.tools[0].name, "issues.create")
 	testing.expect_value(t, page.tools[0].title, "Create an issue")
 	testing.expect_value(t, page.tools[0].description, "Create one issue.")
 	// The harness advertises bytes, so a schema is canonicalized once: sorted keys
 	// make the same remote schema yield the same advertised bytes every refresh.
 	testing.expect_value(t, page.tools[0].input_schema, `{"properties":{"a":{"type":"integer"},"b":{"type":"string"}},"required":["a"],"type":"object"}`)
+}
+
+@(test)
+test_tools_list_preserves_an_empty_cursor :: proc(t: ^testing.T) {
+	owner, object := result_fixture(t, `{"resultType":"complete","nextCursor":"","tools":[]}`)
+	if owner == nil { return }
+	defer json.destroy_value(owner, context.allocator)
+
+	page, err := tools_list_decode(object, .V2026_07_28, context.allocator)
+	defer tool_page_destroy(&page, context.allocator)
+	defer error_destroy(&err, context.allocator)
+	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
+
+	cursor, has_cursor := page.next_cursor.(string)
+	if !testing.expect(t, has_cursor, "an empty cursor is still present") { return }
+	testing.expect_value(t, cursor, "")
+
+	params, params_err := tools_list_params_make(page.next_cursor, .V2026_07_28, context.allocator)
+	defer json.destroy_value(json.Value(params), context.allocator)
+	defer error_destroy(&params_err, context.allocator)
+	if !testing.expect_value(t, params_err.kind, Error_Kind.None) { return }
+	value, present := params["cursor"]
+	text, is_string := value.(json.String)
+	testing.expect(t, present && is_string, "the empty cursor is sent")
+	if present && is_string { testing.expect_value(t, string(text), "") }
 }
 
 // One unusable definition should not cost the user the tools that were well
@@ -294,7 +322,9 @@ test_tools_list_keeps_long_fields_whole :: proc(t: ^testing.T) {
 	defer tool_page_destroy(&page, context.allocator)
 	defer error_destroy(&err, context.allocator)
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
-	testing.expect_value(t, page.next_cursor, cursor)
+	next_cursor, has_next_cursor := page.next_cursor.(string)
+	if !testing.expect(t, has_next_cursor, "the next cursor is present") { return }
+	testing.expect_value(t, next_cursor, cursor)
 	if !testing.expect_value(t, len(page.tools), 1) { return }
 	testing.expect_value(t, page.tools[0].title, title)
 }
@@ -358,14 +388,14 @@ test_handshake_era_results_carry_no_result_type :: proc(t: ^testing.T) {
 // version is what decides.
 @(test)
 test_request_envelope_follows_the_revision :: proc(t: ^testing.T) {
-	stateless, stateless_error := tools_list_params_make("", .V2026_07_28, context.allocator)
+	stateless, stateless_error := tools_list_params_make(nil, .V2026_07_28, context.allocator)
 	if !testing.expect_value(t, stateless_error.kind, Error_Kind.None) { return }
 	defer error_destroy(&stateless_error, context.allocator)
 	defer json.destroy_value(json.Value(stateless), context.allocator)
 	_, stateless_has_meta := stateless["_meta"]
 	testing.expect(t, stateless_has_meta, "a stateless revision declares its version on every request")
 
-	handshake, handshake_error := tools_list_params_make("", .V2025_11_25, context.allocator)
+	handshake, handshake_error := tools_list_params_make(nil, .V2025_11_25, context.allocator)
 	if !testing.expect_value(t, handshake_error.kind, Error_Kind.None) { return }
 	defer error_destroy(&handshake_error, context.allocator)
 	defer json.destroy_value(json.Value(handshake), context.allocator)

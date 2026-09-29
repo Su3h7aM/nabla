@@ -354,20 +354,25 @@ stdio_alloc_vectors :: proc(
 	envp: []cstring,
 	ok: bool,
 ) {
+	argument_vector: []cstring
+	environment_vector: []cstring
+	failed := true
+	defer if failed { stdio_destroy_vectors(argument_vector, environment_vector, allocator) }
+
 	vectors_error: mem.Allocator_Error
-	argv, vectors_error = make([]cstring, len(arguments) + 2, allocator)
+	argument_vector, vectors_error = make([]cstring, len(arguments) + 2, allocator)
 	if vectors_error != nil { return nil, nil, false }
-	argv[0], ok = strings_clone_cstring(name, allocator)
+	argument_vector[0], ok = strings_clone_cstring(name, allocator)
 	if !ok { return nil, nil, false }
 	for argument, index in arguments {
 		value: cstring
 		value, ok = strings_clone_cstring(argument, allocator)
 		if !ok { return nil, nil, false }
-		argv[index + 1] = value
+		argument_vector[index + 1] = value
 	}
-	argv[len(arguments) + 1] = nil
+	argument_vector[len(arguments) + 1] = nil
 
-	envp, vectors_error = make([]cstring, len(environment) + 1, allocator)
+	environment_vector, vectors_error = make([]cstring, len(environment) + 1, allocator)
 	if vectors_error != nil { return nil, nil, false }
 	for entry, index in environment {
 		pair, pair_error := strings.concatenate({entry.name, "=", entry.value}, allocator)
@@ -376,10 +381,11 @@ stdio_alloc_vectors :: proc(
 		value, ok = strings_clone_cstring(pair, allocator)
 		delete(pair, allocator)
 		if !ok { return nil, nil, false }
-		envp[index] = value
+		environment_vector[index] = value
 	}
-	envp[len(environment)] = nil
-	return argv, envp, true
+	environment_vector[len(environment)] = nil
+	failed = false
+	return argument_vector, environment_vector, true
 }
 
 @(private, require_results)
