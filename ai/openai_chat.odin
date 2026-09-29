@@ -192,6 +192,18 @@ openai_chat_calls_open :: proc(state: ^Provider_Stream_State) -> bool {
 	return false
 }
 
+openai_chat_tool_fragments_sort :: proc(state: ^Provider_Stream_State) {
+	for i in 1 ..< len(state.Tool_Fragments) {
+		fragment := state.Tool_Fragments[i]
+		insertion := i
+		for insertion > 0 && state.Tool_Fragments[insertion - 1].Wire_Index > fragment.Wire_Index {
+			state.Tool_Fragments[insertion] = state.Tool_Fragments[insertion - 1]
+			insertion -= 1
+		}
+		state.Tool_Fragments[insertion] = fragment
+	}
+}
+
 // A single Chat payload can carry text, usage, and a finish reason. Decode the
 // whole object first, then stage events in that order so a malformed trailing
 // field never exposes a partial batch.
@@ -254,6 +266,18 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 					if _, write_is_null := raw_write.(json.Null); !write_is_null {
 						usage.Cache_Write_Tokens, usage.Cache_Write_Tokens_Present, details_ok = openai_value_integer(details, "cache_write_tokens")
 						if !details_ok || usage.Cache_Write_Tokens < 0 { return provider_stream_fail(state, .Invalid_Data, "invalid cache_write_tokens") }
+					}
+				}
+			}
+		}
+		if raw_details, details_present := usage_object["completion_tokens_details"]; details_present {
+			if _, details_is_null := raw_details.(json.Null); !details_is_null {
+				details, details_ok := raw_details.(json.Object)
+				if !details_ok { return provider_stream_fail(state, .Invalid_Data, "invalid completion_tokens_details") }
+				if raw_reasoning, reasoning_present := details["reasoning_tokens"]; reasoning_present {
+					if _, reasoning_is_null := raw_reasoning.(json.Null); !reasoning_is_null {
+						usage.Reasoning_Tokens, usage.Reasoning_Tokens_Present, details_ok = openai_value_integer(details, "reasoning_tokens")
+						if !details_ok || usage.Reasoning_Tokens < 0 { return provider_stream_fail(state, .Invalid_Data, "invalid reasoning_tokens") }
 					}
 				}
 			}
@@ -360,6 +384,7 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 	if reason_present {
 		finish := openai_finish_reason(reason)
 		if finish == .Tool_Call {
+			openai_chat_tool_fragments_sort(state)
 			calls, calls_error := provider_tool_finalize(state, state.Allocator)
 			if calls_error != .None { return calls_error }
 			state^.Phase = .Completed

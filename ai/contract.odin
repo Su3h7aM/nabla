@@ -83,12 +83,11 @@ Provider_Message :: struct {
 	Reasoning_ID:        string, // borrowed; set on .Reasoning, the output-item id,
 	Reasoning_Encrypted: string, // borrowed; set on .Reasoning when the endpoint supplied it,
 	Cache_Breakpoint:    bool, // when true, emit prompt_cache_breakpoint explicit on this message,
-	// Verbatim_Items is a JSON array of Responses output items preserved at this
-	// message's position. It is the replay slot: fields the harness does not
-	// model, such as assistant phase, reasoning summaries, and annotations,
-	// survive because nothing here is re-derived. The Responses encoder removes
-	// output-only fields before splicing the array in place. Only the Responses
-	// API accepts it; the harness sets it only for that API.
+	// Verbatim_Items is a JSON array of API-native replay items preserved at this
+	// message's position. Responses items stand for the message; Anthropic
+	// thinking blocks lead the assistant message before its projected content and
+	// tool calls. Only those APIs accept it; the harness sets it only for the
+	// matching API family and model.
 	Verbatim_Items:      string, // borrowed until operation retirement,
 }
 
@@ -198,18 +197,17 @@ Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request
 	   request.Prompt_Cache_Retention != "in_memory" &&
 	   request.Prompt_Cache_Retention != "24h" { return .Invalid_Prompt_Cache_Retention }
 	for message in request.Messages {
-		// A verbatim message is one opaque replay array, not a role plus content,
-		// so the role checks below do not apply to it. Only the Responses API
-		// has native items to replay; asking another API to emit them would send
-		// a message with no role and no content.
+		// A native replay message has no role of its own. Responses items stand
+		// for the message; Anthropic thinking blocks are placed before the
+		// following assistant content and tool calls. Other APIs have no such items.
 		if message.Verbatim_Items != "" {
-			if request.API != .OpenAI_Responses { return .Invalid_Message }
+			if request.API != .OpenAI_Responses && request.API != .Anthropic_Messages { return .Invalid_Message }
 			continue
 		}
 		if message.Role == .Invalid { return .Invalid_Message }
 		#partial switch message.Role {
 		case .Assistant:
-			if message.Content == "" && len(message.Tool_Calls) == 0 { return .Invalid_Message }
+			if message.Content == "" && len(message.Tool_Calls) == 0 && message.Verbatim_Items == "" { return .Invalid_Message }
 		case .Tool:
 			if message.Tool_Call_ID == "" { return .Invalid_Message }
 		case .Reasoning:
@@ -283,22 +281,21 @@ Provider_Usage_Event :: struct {
 	Cache_Write_Tokens_Present:  bool,
 	Input_Tokens:                i64,
 	Output_Tokens:               i64,
+	Reasoning_Tokens:            i64,
 	Total_Tokens:                i64,
 	Input_Tokens_Present:        bool,
 	Output_Tokens_Present:       bool,
+	Reasoning_Tokens_Present:    bool,
 	Total_Tokens_Present:        bool,
 }
 Provider_Completed_Event :: struct {
 	Reason:      Provider_Finish_Reason,
 	Reason_Text: string, // owned by receiver,
 	Tool_Calls:  []Provider_Tool_Call, // owned by receiver; present when Reason == .Tool_Call,
-	// Raw_Output holds the terminal response's output array verbatim, exactly
-	// as the endpoint sent it. Empty when the terminal event carried no
-	// output array. The agent replays this verbatim for its next request, so
-	// the fields the stream decoder does not model -- assistant phase,
-	// reasoning summaries, annotations -- still round-trip; the Responses
-	// encoder drops the output-only fields the input schema refuses. This is
-	// the lossless-replay record; Tool_Calls stays the execution view.
+	// Raw_Output holds the API family's native replay items as a JSON array:
+	// Responses output items, or Anthropic thinking blocks in stream order. It is
+	// empty when the response has no native items. The agent journals it for the
+	// same API family and model; Tool_Calls stays the execution view.
 	Raw_Output:  string, // owned by receiver,
 } // Tool_Calls and Raw_Output owned by receiver
 Provider_Error_Event :: struct {
@@ -358,15 +355,25 @@ Provider_Stream_Phase :: enum {
 	Failed,
 }
 
+Provider_Native_Block :: enum {
+	None,
+	Thinking,
+	Signature,
+	Skipped,
+}
+
 Provider_Stream_State :: struct {
-	API:            API_Kind,
-	Phase:          Provider_Stream_Phase,
-	Tool_Fragments: [dynamic]Provider_Tool_Fragment, // owned assembly slots,
-	Allocator:      mem.Allocator,
+	API:               API_Kind,
+	Phase:             Provider_Stream_Phase,
+	Tool_Fragments:    [dynamic]Provider_Tool_Fragment, // owned assembly slots,
+	Native_Items:      [dynamic]u8, // owned JSON array bytes for API-native replay items,
+	Native_Block:      Provider_Native_Block,
+	Allocator:         mem.Allocator,
 	// Operation-owned staging for one decoded payload. It grows to hold every
 	// event the payload carried, is drained before the next payload is
 	// consumed, and its undrained events are destroyed with the stream.
-	Batch:          [dynamic]Provider_Event,
+	Batch:             [dynamic]Provider_Event,
+	Allocation_Failed: bool,
 }
 
 Provider_Tool_Fragment :: struct {
@@ -386,7 +393,13 @@ Provider_Tool_Fragment :: struct {
 
 @(require_results)
 Provider_Stream_Start :: proc(api: API_Kind, allocator := context.allocator) -> Provider_Stream_State {
-	return {API = api, Phase = .Open, Allocator = allocator}
+	state := Provider_Stream_State {
+		API       = api,
+		Phase     = .Open,
+		Allocator = allocator,
+	}
+	state.Native_Items.allocator = allocator
+	return state
 }
 
 provider_stream_batch_clear :: proc(state: ^Provider_Stream_State) {
@@ -397,10 +410,18 @@ provider_stream_batch_clear :: proc(state: ^Provider_Stream_State) {
 // provider_stream_push stages one event under the stream's ownership. An event that
 // cannot be staged is destroyed and fails the stream, so the caller retains nothing.
 provider_stream_push :: proc(state: ^Provider_Stream_State, event: Provider_Event) {
+	if state.Allocation_Failed {
+		owned := event
+		Provider_Event_Destroy(&owned, state.Allocator)
+		state.Phase = .Failed
+		return
+	}
 	if state.Batch.allocator.procedure == nil { state.Batch.allocator = state.Allocator }
 	if _, append_error := append(&state.Batch, event); append_error != nil {
 		owned := event
 		Provider_Event_Destroy(&owned, state.Allocator)
+		provider_stream_batch_clear(state)
+		state.Allocation_Failed = true
 		state.Phase = .Failed
 	}
 }
@@ -426,6 +447,7 @@ provider_stream_fail :: proc(
 	}
 	provider_stream_push(state, event)
 	state.Phase = .Failed
+	if state.Allocation_Failed { return .Allocation }
 	return stream_err
 }
 
@@ -448,6 +470,8 @@ Provider_Stream_Destroy :: proc(state: ^Provider_Stream_State) {
 	provider_stream_batch_clear(state)
 	delete(state.Batch)
 	state.Batch = nil
+	delete(state.Native_Items)
+	state.Native_Items = nil
 	for &fragment in state.Tool_Fragments {
 		if fragment.Item_ID != "" { delete(fragment.Item_ID, state.Allocator) }
 		if fragment.ID != "" { delete(fragment.ID, state.Allocator) }
@@ -612,29 +636,40 @@ Provider_Encode_Request_Reusing :: proc(
 @(require_results)
 Provider_Consume_Event_JSON :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil { return .Invalid_State }
+	if state.Allocation_Failed { state.Phase = .Failed; return .Allocation }
 	if len(state^.Batch) > 0 { return .Batch_Not_Drained }
-	if state^.API != .OpenAI_Responses {
+	err: Provider_Stream_Error
+	if state^.API == .OpenAI_Responses {
+		err = openai_responses_consume_event(payload, state)
+	} else {
 		state^.Phase = .Failed
-		return provider_stream_fail(state, .Invalid_Data, "API family has no JSON event transport", .Unsupported_API)
+		err = provider_stream_fail(state, .Invalid_Data, "API family has no JSON event transport", .Unsupported_API)
 	}
-	return openai_responses_consume_event(payload, state)
+	if state.Allocation_Failed { state.Phase = .Failed; return .Allocation }
+	return err
 }
 
 @(require_results)
 Provider_Consume_SSE_Data :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil { return .Invalid_State }
+	if state.Allocation_Failed { state.Phase = .Failed; return .Allocation }
 	if len(state^.Batch) > 0 { return .Batch_Not_Drained }
+	err: Provider_Stream_Error
 	switch state^.API {
 	case .OpenAI_Chat_Completions:
-		return openai_chat_consume_sse_data(payload, state)
+		err = openai_chat_consume_sse_data(payload, state)
 	case .OpenAI_Responses:
-		return openai_responses_consume_sse_data(payload, state)
+		err = openai_responses_consume_sse_data(payload, state)
 	case .Anthropic_Messages:
-		return anthropic_consume_sse_data(payload, state)
+		err = anthropic_consume_sse_data(payload, state)
 	case .Invalid:
 	}
-	state^.Phase = .Failed
-	return provider_stream_fail(state, .Invalid_Data, "unsupported API family", .Unsupported_API)
+	if state^.API == .Invalid {
+		state^.Phase = .Failed
+		err = provider_stream_fail(state, .Invalid_Data, "unsupported API family", .Unsupported_API)
+	}
+	if state.Allocation_Failed { state.Phase = .Failed; return .Allocation }
+	return err
 }
 
 // EOF is authoritative when a terminal event was already decoded. Some proxies
@@ -652,6 +687,7 @@ Provider_Stream_Finish :: proc(state: ^Provider_Stream_State) -> Provider_Stream
 	case .Open:
 		return provider_stream_fail(state, .Stream_Truncated, "stream ended before completion", .Stream_Truncated)
 	case .Failed:
+		if state.Allocation_Failed { return .Allocation }
 		return .None
 	}
 	return .Invalid_State

@@ -138,6 +138,7 @@ chat_request_usage :: proc(usages: ^[dynamic]Chat_Request_Usage, operation: u64)
 		if entry.operation != operation { continue }
 		if entry.usage.Input_Tokens_Present { committed.input_tokens = entry.usage.Input_Tokens }
 		if entry.usage.Output_Tokens_Present { committed.output_tokens = entry.usage.Output_Tokens }
+		if entry.usage.Reasoning_Tokens_Present { committed.reasoning_tokens = entry.usage.Reasoning_Tokens }
 		if entry.usage.Cached_Input_Tokens_Present { committed.cache_read_tokens = entry.usage.Cached_Input_Tokens }
 		if entry.usage.Cache_Write_Tokens_Present { committed.cache_write_tokens = entry.usage.Cache_Write_Tokens }
 	}

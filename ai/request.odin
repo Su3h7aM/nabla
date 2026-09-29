@@ -731,6 +731,10 @@ provider_terminal_error :: proc(state: ^Provider_Request_Stream_State, kind: Pro
 		resolved = .Cancelled
 	} else if deadline_expired(state.deadline) {
 		resolved = .Timed_Out
+	} else if state.stream.Allocation_Failed {
+		resolved = .Allocation
+	} else if failure_event, present := state.failure_event.?; present && failure_event == .Allocation {
+		resolved = .Allocation
 	}
 	class := provider_classify_failure(
 		Provider_Evidence {
@@ -860,18 +864,24 @@ provider_stream_error_text :: proc(err: Provider_Stream_Error) -> string {
 
 provider_emit_error :: proc(state: ^Provider_Request_Stream_State, kind: Provider_Error_Kind, detail: string) {
 	if state.failed { return }
+	failure_kind := kind
+	failure_detail := detail
+	if state.stream.Allocation_Failed {
+		failure_kind = .Allocation
+		failure_detail = provider_stream_error_text(.Allocation)
+	}
 	state.failed = true
-	if state.failure_event == nil { state.failure_event = kind }
-	event, event_error := openai_error_event(kind, detail, allocator = state.allocator)
+	if state.failure_event == nil { state.failure_event = failure_kind }
+	event, event_error := openai_error_event(failure_kind, failure_detail, allocator = state.allocator)
 	if event_error != nil {
 		// The wording could not be retained. The kind still names the failure, and the
 		// terminal error carries no detail rather than a fabricated one.
-		provider_deliver(state, Provider_Error_Event{Kind = kind})
+		provider_deliver(state, Provider_Error_Event{Kind = failure_kind})
 		return
 	}
 	// The event owns its wording; the terminal error keeps a second copy, because the
 	// event is released once the caller's callback returns.
-	owned_detail, detail_error := strings.clone(detail, state.allocator)
+	owned_detail, detail_error := strings.clone(failure_detail, state.allocator)
 	if detail_error == nil { state.failure_detail = owned_detail }
 	provider_deliver(state, event)
 }

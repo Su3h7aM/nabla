@@ -5,6 +5,23 @@ package journal
 import "core:math"
 import "core:testing"
 
+@(test)
+test_response_committed_reasoning_tokens_are_presence_aware :: proc(test: ^testing.T) {
+	payload: Response_Committed
+	err := payload_decode(`{"version":1,"model_resolved":"model","finish":"stop","output_tokens":1}`, &payload, context.temp_allocator)
+	if !testing.expect_value(test, err, nil) { return }
+	testing.expect(test, payload.reasoning_tokens == nil, "older response records leave reasoning tokens unknown")
+
+	payload = {}
+	err = payload_decode(`{"version":1,"reasoning_tokens":0}`, &payload, context.temp_allocator)
+	if !testing.expect_value(test, err, nil) { return }
+	if value, present := payload.reasoning_tokens.?; present {
+		testing.expect_value(test, value, i64(0))
+	} else {
+		testing.fail_now(test, "a reported zero reasoning count remains present")
+	}
+}
+
 // Reads are tested through the public API only, on a journal whose records were
 // written through it, so the ordering, the filters, and the tree walk are the
 // behaviour the harness gets.

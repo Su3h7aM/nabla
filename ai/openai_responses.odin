@@ -381,6 +381,14 @@ openai_responses_parse_usage :: proc(object: json.Object) -> (Provider_Usage_Eve
 			if !ok || (usage.Cache_Write_Tokens_Present && usage.Cache_Write_Tokens < 0) { return {}, false }
 		}
 	}
+	if raw_details, present := object["output_tokens_details"]; present {
+		if _, is_null := raw_details.(json.Null); !is_null {
+			details, details_ok := raw_details.(json.Object)
+			if !details_ok { return {}, false }
+			usage.Reasoning_Tokens, usage.Reasoning_Tokens_Present, ok = openai_value_integer(details, "reasoning_tokens")
+			if !ok || (usage.Reasoning_Tokens_Present && usage.Reasoning_Tokens < 0) { return {}, false }
+		}
+	}
 	return usage, true
 }
 

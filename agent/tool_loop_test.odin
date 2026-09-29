@@ -529,12 +529,26 @@ test_usage_is_collected_per_request :: proc(test: ^testing.T) {
 	chat_session_observe_usage(
 		chat,
 		&usages,
-		ai.Provider_Usage_Event{Input_Tokens = 12000, Input_Tokens_Present = true, Cached_Input_Tokens = 9000, Cached_Input_Tokens_Present = true},
+		ai.Provider_Usage_Event {
+			Input_Tokens = 12000,
+			Input_Tokens_Present = true,
+			Reasoning_Tokens = 6,
+			Reasoning_Tokens_Present = true,
+			Cached_Input_Tokens = 9000,
+			Cached_Input_Tokens_Present = true,
+		},
 	)
 	chat_session_observe_usage(
 		chat,
 		&usages,
-		ai.Provider_Usage_Event{Input_Tokens = 12100, Input_Tokens_Present = true, Cached_Input_Tokens = 11800, Cached_Input_Tokens_Present = true},
+		ai.Provider_Usage_Event {
+			Input_Tokens = 12100,
+			Input_Tokens_Present = true,
+			Reasoning_Tokens = 0,
+			Reasoning_Tokens_Present = true,
+			Cached_Input_Tokens = 11800,
+			Cached_Input_Tokens_Present = true,
+		},
 	)
 	testing.expect_value(test, len(usages), 2)
 	testing.expect_value(test, usages[0].usage.Cached_Input_Tokens, 9000)
@@ -546,6 +560,11 @@ test_usage_is_collected_per_request :: proc(test: ^testing.T) {
 		testing.expect_value(test, value, i64(12100))
 	} else {
 		testing.fail_now(test, "reported input tokens should be recorded")
+	}
+	if value, present := total.reasoning_tokens.?; present {
+		testing.expect_value(test, value, i64(0))
+	} else {
+		testing.fail_now(test, "reported reasoning tokens should be recorded")
 	}
 	if _, present := total.cache_write_tokens.?; present {
 		testing.fail_now(test, "an unreported measurement must stay unknown")

@@ -327,7 +327,7 @@ test_responses_stream_text_usage_completed :: proc(t: ^testing.T) {
 		strings.concatenate(
 			[]string {
 				`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":12000,`,
-				`"output_tokens":40,"total_tokens":12040,"input_tokens_details":{"cached_tokens":9000,"cache_write_tokens":3000}}}}`,
+				`"output_tokens":40,"total_tokens":12040,"input_tokens_details":{"cached_tokens":9000,"cache_write_tokens":3000},"output_tokens_details":{"reasoning_tokens":0}}}}`,
 			},
 			context.temp_allocator,
 		),
@@ -337,6 +337,8 @@ test_responses_stream_text_usage_completed :: proc(t: ^testing.T) {
 	usage := expect_event(t, events[0], Provider_Usage_Event)
 	testing.expect_value(t, usage.Input_Tokens, 12000)
 	testing.expect_value(t, usage.Output_Tokens, 40)
+	testing.expect(t, usage.Reasoning_Tokens_Present)
+	testing.expect_value(t, usage.Reasoning_Tokens, i64(0))
 	testing.expect_value(t, usage.Cached_Input_Tokens, 9000)
 	testing.expect_value(t, usage.Cache_Write_Tokens, 3000)
 	completed := expect_event(t, events[1], Provider_Completed_Event)
@@ -736,6 +738,7 @@ test_chat_usage_only_after_completion :: proc(t: ^testing.T) {
 	usage := expect_event(t, events[0], Provider_Usage_Event)
 	testing.expect_value(t, usage.Input_Tokens, 3)
 	testing.expect_value(t, usage.Output_Tokens, 1)
+	testing.expect(t, !usage.Reasoning_Tokens_Present)
 	destroy_events(events)
 }
 
@@ -745,7 +748,7 @@ test_chat_cache_write_without_cached_tokens :: proc(t: ^testing.T) {
 	defer Provider_Stream_Destroy(&state)
 	events := consume(
 		t,
-		`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":1,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":9}}}`,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":1,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":9},"completion_tokens_details":{"reasoning_tokens":17}}}`,
 		&state,
 		2,
 	)
@@ -754,6 +757,8 @@ test_chat_cache_write_without_cached_tokens :: proc(t: ^testing.T) {
 	testing.expect(t, !usage.Cached_Input_Tokens_Present)
 	testing.expect(t, usage.Cache_Write_Tokens_Present)
 	testing.expect_value(t, usage.Cache_Write_Tokens, 9)
+	testing.expect(t, usage.Reasoning_Tokens_Present)
+	testing.expect_value(t, usage.Reasoning_Tokens, i64(17))
 	destroy_events(events)
 }
 

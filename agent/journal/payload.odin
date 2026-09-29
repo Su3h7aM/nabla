@@ -270,6 +270,7 @@ Response_Committed :: struct {
 	finish:             string, // RESPONSE_FINISH_NAMES
 	input_tokens:       Maybe(i64),
 	output_tokens:      Maybe(i64),
+	reasoning_tokens:   Maybe(i64),
 	cache_read_tokens:  Maybe(i64),
 	cache_write_tokens: Maybe(i64),
 	// cost is the response's price in US dollars, absent when the answering model
