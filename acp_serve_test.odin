@@ -36,6 +36,12 @@ import "nabla:agent/journal"
 ACP_TEST_BOUND :: 10 * time.Second
 
 @(test)
+test_request_params_decode_errors_use_json_rpc_internal_for_allocation :: proc(t: ^testing.T) {
+	testing.expect_value(t, acp_request_params_error_code(acp.Params_Error.Invalid), acp.ERROR_INVALID_PARAMS)
+	testing.expect_value(t, acp_request_params_error_code(acp.Params_Error.Allocation), acp.ERROR_INTERNAL)
+}
+
+@(test)
 test_acp_session_meta_reads_client_system_prompt_extensions :: proc(t: ^testing.T) {
 	meta: acp.Session_Meta
 	object: json.Object

@@ -197,7 +197,10 @@ acp_handle_request :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 
 acp_request_cancel :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 	params: acp.Session_Cancel_Params
-	if !acp.params_decode(envelope.params, &params, context.temp_allocator) || params.session_id == "" {
+	if !acp_request_params_decode(server, envelope, &params, "session/cancel needs a session id") {
+		return
+	}
+	if params.session_id == "" {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/cancel needs a session id")
 		return
 	}
@@ -209,7 +212,7 @@ acp_handle_notification :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 	switch envelope.method {
 	case acp.SESSION_CANCEL:
 		params: acp.Session_Cancel_Params
-		if !acp.params_decode(envelope.params, &params, context.temp_allocator) { return }
+		if acp.params_decode(envelope.params, &params, context.temp_allocator) != .None { return }
 		acp_cancel_session(server, params.session_id)
 	case:
 	// A notification is an announcement, not a request: an unknown one is ignored, so a
@@ -221,14 +224,38 @@ acp_reply_error :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, code: i64,
 	_ = acp.writer_write_error(&server.writer, envelope.id, code, message)
 }
 
+@(require_results)
+acp_request_params_decode :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, target: ^$T, invalid_message: string) -> bool {
+	params_error := acp.params_decode(envelope.params, target, context.temp_allocator)
+	return acp_request_params_result(server, envelope, params_error, invalid_message)
+}
+
+@(require_results)
+acp_request_params_result :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, params_error: acp.Params_Error, invalid_message: string) -> bool {
+	if params_error == .None { return true }
+	message := invalid_message
+	if params_error == .Allocation { message = "request parameters could not be allocated" }
+	acp_reply_error(server, envelope, acp_request_params_error_code(params_error), message)
+	return false
+}
+
+acp_request_params_error_code :: proc(params_error: acp.Params_Error) -> i64 {
+	switch params_error {
+	case .None:
+		return 0
+	case .Invalid:
+		return acp.ERROR_INVALID_PARAMS
+	case .Allocation:
+		return acp.ERROR_INTERNAL
+	}
+	return acp.ERROR_INTERNAL
+}
+
 // --- requests the reader answers alone ---------------------------------------
 
 acp_request_initialize :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 	params: acp.Initialize_Params
-	if !acp.params_decode(envelope.params, &params, context.temp_allocator) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "initialize needs a protocol version")
-		return
-	}
+	if !acp_request_params_decode(server, envelope, &params, "initialize needs a protocol version") { return }
 	if params.protocol_version < 1 {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "initialize needs a positive protocol version")
 		return
@@ -298,10 +325,7 @@ acp_request_session_new :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		return
 	}
 	params: acp.Session_New_Params
-	if !acp.params_decode(envelope.params, &params, context.temp_allocator) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/new needs a working directory")
-		return
-	}
+	if !acp_request_params_decode(server, envelope, &params, "session/new needs a working directory") { return }
 	if reason := acp_session_params_reason(params.mcp_servers, params.additional_directories, acp_is_v2(server)); reason != "" {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, reason)
 		return
@@ -355,10 +379,7 @@ acp_request_session_load :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		return
 	}
 	params: acp.Session_Load_Params
-	if !acp.params_decode(envelope.params, &params, context.temp_allocator) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/load needs a session id")
-		return
-	}
+	if !acp_request_params_decode(server, envelope, &params, "session/load needs a session id") { return }
 	if reason := acp_session_params_reason(params.mcp_servers, nil, acp_is_v2(server)); reason != "" {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, reason)
 		return
@@ -421,7 +442,10 @@ acp_request_session_resume :: proc(server: ^Acp_Server, envelope: ^acp.Envelope)
 		return
 	}
 	params: acp.Session_Resume_Params
-	if !acp.params_decode(envelope.params, &params, context.temp_allocator) || params.session_id == "" || params.cwd == "" {
+	if !acp_request_params_decode(server, envelope, &params, "session/resume needs a session id and working directory") {
+		return
+	}
+	if params.session_id == "" || params.cwd == "" {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/resume needs a session id and working directory")
 		return
 	}
@@ -485,10 +509,7 @@ acp_request_session_list :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		return
 	}
 	params: acp.Session_List_Params
-	if envelope.params != nil && !acp.params_decode(envelope.params, &params, context.temp_allocator) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/list has invalid parameters")
-		return
-	}
+	if envelope.params != nil && !acp_request_params_decode(server, envelope, &params, "session/list has invalid parameters") { return }
 	if params.cwd != "" && !strings.has_prefix(params.cwd, "/") {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the session/list working directory must be absolute")
 		return
@@ -529,7 +550,10 @@ acp_request_session_close :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) 
 		return
 	}
 	params: acp.Session_Close_Params
-	if !acp.params_decode(envelope.params, &params, context.temp_allocator) || params.session_id == "" {
+	if !acp_request_params_decode(server, envelope, &params, "session/close needs a session id") {
+		return
+	}
+	if params.session_id == "" {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/close needs a session id")
 		return
 	}
@@ -568,7 +592,10 @@ acp_request_set_config_option :: proc(server: ^Acp_Server, envelope: ^acp.Envelo
 		return
 	}
 	params: acp.Session_Set_Config_Option_Params
-	if !acp.params_decode(envelope.params, &params, context.temp_allocator) || params.session_id == "" || params.config_id == "" || params.value == "" {
+	if !acp_request_params_decode(server, envelope, &params, "session/set_config_option needs a session, config id, and value") {
+		return
+	}
+	if params.session_id == "" || params.config_id == "" || params.value == "" {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/set_config_option needs a session, config id, and value")
 		return
 	}
@@ -822,10 +849,8 @@ acp_request_prompt :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		return
 	}
 	params: acp.Session_Prompt_Params
-	if !acp.params_decode(envelope.params, &params, context.temp_allocator) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/prompt needs a prompt")
-		return
-	}
+	params_error := acp.session_prompt_params_decode(envelope.params, &params, context.temp_allocator)
+	if !acp_request_params_result(server, envelope, params_error, "session/prompt needs a prompt") { return }
 	// The prompt names the session it belongs to. A request for a session this process is
 	// not running is refused here: the process holds a session of its own from startup,
 	// and only the client's own session/new may replace it.
@@ -882,7 +907,10 @@ acp_request_set_model :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		return
 	}
 	params: acp.Session_Set_Model_Params
-	if !acp.params_decode(envelope.params, &params, context.temp_allocator) || params.session_id == "" || params.model_id == "" {
+	if !acp_request_params_decode(server, envelope, &params, "session/set_model needs a session id and model id") {
+		return
+	}
+	if params.session_id == "" || params.model_id == "" {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/set_model needs a session id and model id")
 		return
 	}
@@ -961,9 +989,9 @@ acp_enqueue :: proc(server: ^Acp_Server, work: Acp_Work) -> bool {
 
 // acp_prompt_text renders a prompt's content blocks as the one message the harness records.
 // Text blocks are the message itself; a resource link becomes the path it names, and an
-// embedded resource brings its text along. Content this agent does not accept is refused
-// rather than dropped, so the client is told that part of what it sent never reached the
-// model. reason is static text when ok is false.
+// embedded text resource brings its text along. Binary resources are named in a note so
+// the model knows bytes were attached but not included. Other unsupported content is
+// refused rather than dropped, and reason names it when ok is false.
 @(require_results)
 acp_prompt_text :: proc(blocks: []acp.Content_Block, allocator := context.allocator) -> (text: string, reason: string, ok: bool) {
 	builder, builder_error := strings.builder_make(allocator)
@@ -988,7 +1016,12 @@ acp_prompt_text :: proc(blocks: []acp.Content_Block, allocator := context.alloca
 				if !acp_prompt_append(&builder, block.resource.text) {
 					return "", "the prompt could not be allocated", false
 				}
-			} else if block.resource.uri != "" {
+			}
+			if block.resource.blob_present {
+				if !acp_prompt_append_binary_resource(&builder, block.resource) {
+					return "", "the prompt could not be allocated", false
+				}
+			} else if block.resource.text == "" && block.resource.uri != "" {
 				path, path_ok := acp_resource_path(block.resource.uri, context.temp_allocator)
 				defer delete(path, context.temp_allocator)
 				if !path_ok || !acp_prompt_append(&builder, path) {
@@ -1012,6 +1045,21 @@ acp_prompt_append :: proc(builder: ^strings.Builder, text: string) -> bool {
 	if text == "" { return true }
 	if strings.builder_len(builder^) > 0 && strings.write_string(builder, "\n\n") != 2 { return false }
 	return strings.write_string(builder, text) == len(text)
+}
+
+@(private, require_results)
+acp_prompt_append_binary_resource :: proc(builder: ^strings.Builder, resource: acp.Embedded_Resource) -> bool {
+	BINARY_RESOURCE_PREFIX :: "[binary resource "
+	BINARY_RESOURCE_MIME_PREFIX :: " ("
+	BINARY_RESOURCE_SUFFIX :: ") was attached; its bytes are not included]"
+	mime_type := resource.mime_type
+	if mime_type == "" { mime_type = "unknown type" }
+	if strings.builder_len(builder^) > 0 && strings.write_string(builder, "\n\n") != 2 { return false }
+	parts := [5]string{BINARY_RESOURCE_PREFIX, resource.uri, BINARY_RESOURCE_MIME_PREFIX, mime_type, BINARY_RESOURCE_SUFFIX}
+	for part in parts {
+		if strings.write_string(builder, part) != len(part) { return false }
+	}
+	return true
 }
 
 // acp_resource_path is the path behind a resource uri. A `file://` uri names a file the

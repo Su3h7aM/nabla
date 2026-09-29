@@ -2,6 +2,9 @@
 #+private file
 package acp
 
+import "base:runtime"
+import "core:encoding/json"
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
@@ -43,6 +46,64 @@ test_envelope_kinds_and_validation :: proc(t: ^testing.T) {
 		_, err := parse_envelope(invalid_case.wire)
 		testing.expectf(t, err == invalid_case.err, "envelope %q: expected %v, got %v", invalid_case.wire, invalid_case.err, err)
 	}
+}
+
+@(test)
+test_prompt_params_decode_reads_blob_metadata_without_copying_payload :: proc(t: ^testing.T) {
+	envelope, envelope_err := parse_envelope(
+		`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"resource","resource":{"uri":"file:///a.bin","mimeType":"application/octet-stream","blob":"YWJj"}}]}}`,
+		context.allocator,
+	)
+	if envelope_err != .None { testing.fail_now(t, "the prompt envelope could not be parsed") }
+	defer destroy_envelope(&envelope, context.allocator)
+
+	params: Session_Prompt_Params
+	failed_params: Session_Prompt_Params
+	testing.expect_value(
+		t,
+		session_prompt_params_decode(envelope.params, &failed_params, mem.Allocator{procedure = acp_protocol_test_fail_allocate}),
+		Params_Error.Allocation,
+	)
+	testing.expect_value(t, session_prompt_params_decode(envelope.params, &params, context.allocator), Params_Error.None)
+	defer delete(params.prompt, context.allocator)
+	testing.expect_value(t, params.session_id, "s")
+	if !testing.expect_value(t, len(params.prompt), 1) { return }
+	testing.expect(t, params.prompt[0].resource.blob_present)
+	testing.expect_value(t, params.prompt[0].resource.uri, "file:///a.bin")
+	testing.expect_value(t, params.prompt[0].resource.mime_type, "application/octet-stream")
+}
+
+@(test)
+test_json_allocation_failures_are_not_invalid_json_or_params :: proc(t: ^testing.T) {
+	allocator := mem.Allocator {
+		procedure = acp_protocol_test_fail_allocate,
+	}
+	_, envelope_err := parse_envelope(`{"jsonrpc":"2.0","method":"cancel"}`, allocator)
+	testing.expect_value(t, envelope_err, Envelope_Error.Allocation)
+
+	_, is_batch, batch_err := parse_batch(`[{"jsonrpc":"2.0","method":"cancel"}]`, allocator)
+	testing.expect(t, is_batch)
+	testing.expect_value(t, batch_err, Envelope_Error.Allocation)
+
+	value, parse_err := json.parse_string(`{"sessionId":"s"}`, .JSON, true, context.allocator)
+	if parse_err != nil { testing.fail_now(t, "the params JSON could not be parsed") }
+	defer json.destroy_value(value, context.allocator)
+	params: Session_Load_Params
+	testing.expect_value(t, params_decode(value, &params, allocator), Params_Error.Allocation)
+}
+
+acp_protocol_test_fail_allocate :: proc(
+	_: rawptr,
+	_: mem.Allocator_Mode,
+	_, _: int,
+	_: rawptr,
+	_: int,
+	_: runtime.Source_Code_Location = #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	return nil, .Out_Of_Memory
 }
 
 @(test)

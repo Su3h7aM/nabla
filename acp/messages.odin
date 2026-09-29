@@ -287,11 +287,13 @@ Session_Close_Params :: struct {
 	session_id: string `json:"sessionId"`,
 }
 
-// Embedded_Resource is a resource the client inlined into the prompt: the file's text
-// travels with the message instead of a link the agent would have to follow.
+// Embedded_Resource is a resource the client inlined into the prompt. Text travels with
+// the message, while binary contents are represented without retaining their bytes.
 Embedded_Resource :: struct {
-	uri:  string `json:"uri"`,
-	text: string `json:"text"`,
+	uri:          string `json:"uri"`,
+	text:         string `json:"text"`,
+	mime_type:    string `json:"mimeType,omitempty"`,
+	blob_present: bool `json:"-"`,
 }
 
 // Content_Block is one element of a prompt. The union is by `type`, and every kind's
@@ -307,6 +309,80 @@ Content_Block :: struct {
 Session_Prompt_Params :: struct {
 	session_id: string `json:"sessionId"`,
 	prompt:     []Content_Block `json:"prompt"`,
+}
+
+// session_prompt_params_decode reads the prompt's needed fields from its JSON value.
+// Its strings borrow from value and its block slice is owned by allocator, so value
+// must outlive the returned params. Binary payload bytes are inspected only for presence.
+// It returns Invalid for a mismatched shape and Allocation when the block slice cannot
+// be allocated.
+@(require_results)
+session_prompt_params_decode :: proc(value: json.Value, target: ^Session_Prompt_Params, allocator := context.allocator) -> Params_Error {
+	object, is_object := value.(json.Object)
+	if !is_object { return .Invalid }
+
+	session_id_value, session_id_present := object["sessionId"]
+	session_id, is_string := session_id_value.(json.String)
+	if !session_id_present || !is_string { return .Invalid }
+	prompt_value, prompt_present := object["prompt"]
+	prompt, is_array := prompt_value.(json.Array)
+	if !prompt_present || !is_array { return .Invalid }
+
+	blocks, allocation_error := make([]Content_Block, len(prompt), allocator)
+	if allocation_error != nil { return .Allocation }
+	transferred := false
+	defer if !transferred { delete(blocks, allocator) }
+	for block_value, index in prompt {
+		block_object, block_is_object := block_value.(json.Object)
+		if !block_is_object { return .Invalid }
+		type_value, type_present := block_object["type"]
+		block_type, type_is_string := type_value.(json.String)
+		if !type_present || !type_is_string { return .Invalid }
+		block := Content_Block {
+			type = string(block_type),
+		}
+		if text_value, present := block_object["text"]; present {
+			text, text_is_string := text_value.(json.String)
+			if !text_is_string { return .Invalid }
+			block.text = string(text)
+		}
+		if uri_value, present := block_object["uri"]; present {
+			uri, uri_is_string := uri_value.(json.String)
+			if !uri_is_string { return .Invalid }
+			block.uri = string(uri)
+		}
+		if resource_value, present := block_object["resource"]; present {
+			resource_object, resource_is_object := resource_value.(json.Object)
+			if !resource_is_object { return .Invalid }
+			if uri_value, has_uri := resource_object["uri"]; has_uri {
+				uri, uri_is_string := uri_value.(json.String)
+				if !uri_is_string { return .Invalid }
+				block.resource.uri = string(uri)
+			}
+			if text_value, has_text := resource_object["text"]; has_text {
+				text, text_is_string := text_value.(json.String)
+				if !text_is_string { return .Invalid }
+				block.resource.text = string(text)
+			}
+			if mime_value, has_mime := resource_object["mimeType"]; has_mime {
+				if mime, is_mime_string := mime_value.(json.String); is_mime_string {
+					block.resource.mime_type = string(mime)
+				} else if _, is_null := mime_value.(json.Null); !is_null {
+					return .Invalid
+				}
+			}
+			if blob_value, has_blob := resource_object["blob"]; has_blob {
+				if _, is_blob_string := blob_value.(json.String); !is_blob_string { return .Invalid }
+				block.resource.blob_present = true
+			}
+		}
+		blocks[index] = block
+	}
+
+	target.session_id = string(session_id)
+	target.prompt = blocks
+	transferred = true
+	return .None
 }
 
 Session_Cancel_Params :: struct {

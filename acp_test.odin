@@ -29,6 +29,17 @@ test_prompt_text_renders_blocks_and_refuses_unsupported_content :: proc(t: ^test
 	testing.expect(t, !image_ok)
 	testing.expect(t, image_reason != "")
 
+	binary := []acp.Content_Block {
+		{type = acp.CONTENT_RESOURCE, resource = {uri = "file:///tmp/archive.bin", mime_type = "application/octet-stream", blob_present = true}},
+	}
+	binary_text, binary_reason, binary_ok := acp_prompt_text(binary, context.temp_allocator)
+	testing.expectf(t, binary_ok, "the binary prompt was refused: %s", binary_reason)
+	testing.expect_value(t, binary_text, "[binary resource file:///tmp/archive.bin (application/octet-stream) was attached; its bytes are not included]")
+	unknown_type := []acp.Content_Block{{type = acp.CONTENT_RESOURCE, resource = {uri = "file:///tmp/data", blob_present = true}}}
+	unknown_text, _, unknown_ok := acp_prompt_text(unknown_type, context.temp_allocator)
+	testing.expect(t, unknown_ok)
+	testing.expect_value(t, unknown_text, "[binary resource file:///tmp/data (unknown type) was attached; its bytes are not included]")
+
 	empty, _, empty_ok := acp_prompt_text(nil, context.temp_allocator)
 	testing.expect(t, empty_ok)
 	testing.expect_value(t, empty, "")

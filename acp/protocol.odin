@@ -46,10 +46,19 @@ Envelope_Error :: enum {
 	Allocation,
 }
 
+Params_Error :: enum {
+	None,
+	Invalid,
+	Allocation,
+}
+
 @(require_results)
 parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Envelope, Envelope_Error) {
 	value, parse_err := json.parse_string(payload, .JSON, true, allocator)
-	if parse_err != nil { return {}, .Invalid_JSON }
+	if parse_err != nil {
+		if parse_err == .Out_Of_Memory || parse_err == .Invalid_Allocator { return {}, .Allocation }
+		return {}, .Invalid_JSON
+	}
 	defer json.destroy_value(value, allocator)
 	object, is_object := value.(json.Object)
 	if !is_object { return {}, .Invalid_Envelope }
@@ -88,7 +97,11 @@ parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Enve
 		result.method = method
 		if parsed_id_present { result.kind = .Request }
 		if params_value, present := object["params"]; present {
-			result.params = json.clone_value(params_value, allocator)
+			// The subtree moves into the envelope instead of being copied, so it is
+			// removed from the document the deferred destroy releases.
+			owned_key, _ := delete_key(&value.(json.Object), "params")
+			delete(owned_key, allocator)
+			result.params = params_value
 			result.params_present = true
 		}
 		return result, .None
@@ -143,7 +156,10 @@ parse_batch :: proc(payload: string, allocator := context.allocator) -> (frames:
 	trimmed := strings.trim_space(payload)
 	if len(trimmed) == 0 || trimmed[0] != '[' { return {}, false, .None }
 	value, parse_err := json.parse_string(payload, .JSON, true, allocator)
-	if parse_err != nil { return {}, true, .Invalid_JSON }
+	if parse_err != nil {
+		if parse_err == .Out_Of_Memory || parse_err == .Invalid_Allocator { return {}, true, .Allocation }
+		return {}, true, .Invalid_JSON
+	}
 	defer json.destroy_value(value, allocator)
 	items, is_array := value.(json.Array)
 	// JSON-RPC 2.0 section 6 requires a batch to be an array with at least one value.
@@ -177,18 +193,23 @@ parse_batch :: proc(payload: string, allocator := context.allocator) -> (frames:
 }
 
 // params_decode reads one message's params into a typed payload. The parsed value is
-// encoded again because the JSON package decodes from bytes, and a request payload is
-// small. False means the caller cannot act on these params, whether the document does
-// not match the payload the method takes or the copy could not be allocated; the peer
-// is answered with a params refusal either way, so nothing is acted on. The target's
-// own strings are owned by allocator.
+// encoded again because the JSON package decodes from bytes. The target's strings are
+// owned by allocator. It returns Invalid when the value does not match the target and
+// Allocation when encoding or decoding runs out of storage.
 @(require_results)
-params_decode :: proc(value: json.Value, target: ^$T, allocator := context.allocator) -> bool {
-	if value == nil { return false }
+params_decode :: proc(value: json.Value, target: ^$T, allocator := context.allocator) -> Params_Error {
+	if value == nil { return .Invalid }
 	encoded, marshal_err := json.marshal(value, allocator = allocator)
-	if marshal_err != nil { return false }
+	if marshal_err != nil { return .Allocation }
 	defer delete(encoded, allocator)
-	return json.unmarshal(encoded, target, allocator = allocator) == nil
+	if unmarshal_err := json.unmarshal(encoded, target, allocator = allocator); unmarshal_err != nil {
+		#partial switch error in unmarshal_err {
+		case json.Error:
+			if error == .Out_Of_Memory || error == .Invalid_Allocator { return .Allocation }
+		}
+		return .Invalid
+	}
+	return .None
 }
 
 @(require_results)

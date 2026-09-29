@@ -195,7 +195,7 @@ test_v2_resume_params_read_replay_cursor :: proc(t: ^testing.T) {
 	defer json.destroy_value(value, context.allocator)
 	testing.expect(t, parse_err == nil)
 	params: Session_Resume_Params
-	testing.expect(t, params_decode(value, &params))
+	testing.expect_value(t, params_decode(value, &params), Params_Error.None)
 	defer {
 		delete(params.session_id)
 		delete(params.cwd)
@@ -222,7 +222,7 @@ test_params_decode_reads_content_blocks_and_tolerates_extra_fields :: proc(t: ^t
 	testing.expect(t, parse_err == nil)
 
 	params: Session_Prompt_Params
-	testing.expect(t, params_decode(value, &params))
+	testing.expect_value(t, params_decode(value, &params), Params_Error.None)
 	defer {
 		delete(params.session_id)
 		for block in params.prompt {

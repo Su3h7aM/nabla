@@ -407,6 +407,15 @@ acp_work_open_session :: proc(server: ^Acp_Server, work: Acp_Work) {
 			return
 		}
 	}
+	models: acp.Models_State
+	if work.start.kind != .Resume_Id && !acp_is_v2(server) {
+		models_ok: bool
+		models, models_ok = acp_models_state(server)
+		if !models_ok {
+			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the model catalog could not be allocated")
+			return
+		}
+	}
 
 	session_id := agent.chat_session_text(&server.app.setup.session)
 	owned_session_id, session_id_error := strings.clone(session_id, server.alloc)
@@ -443,11 +452,6 @@ acp_work_open_session :: proc(server: ^Acp_Server, work: Acp_Work) {
 	} else if acp_is_v2(server) {
 		_ = acp.writer_write_response(&server.writer, work.id, acp.V2_Session_New_Result{session_id = session_id, config_options = v2_options})
 	} else {
-		models, models_ok := acp_models_state(server)
-		if !models_ok {
-			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the model catalog could not be allocated")
-			return
-		}
 		_ = acp.writer_write_response(&server.writer, work.id, acp.Session_New_Result{session_id = session_id, config_options = v1_options, models = models})
 	}
 }
