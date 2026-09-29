@@ -2,9 +2,9 @@ package journal
 
 import "core:crypto"
 
-// The identities of section 5 of the architecture. Zero means absent for every
-// one of them and is stored as SQL NULL. Branch and node ids are allocated by
-// the journal; turn, request, call, and job ids by the harness.
+// The identities records correlate by. Zero means absent for every one of them
+// and is stored as SQL NULL. Branch and node ids are allocated by the journal;
+// turn, request, call, and job ids by the harness.
 Run_Id :: distinct [16]u8
 Session_Id :: distinct [16]u8
 Branch_Id :: distinct u32

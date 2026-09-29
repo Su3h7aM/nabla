@@ -4,8 +4,8 @@
 // bytes by digest in `artifacts`. It owns no execution type; the harness maps
 // its own onto records and nodes.
 //
-// A Journal is one connection used by one thread, and writes for at most one
-// session, claimed with a lock the kernel drops when the process dies. Appends
+// A Journal is one connection used by one thread at a time, and writes for at
+// most one session, claimed with a lock the kernel drops when the process dies. Appends
 // are buffered; commit writes them in one transaction. A caller commits a
 // barrier before the effect it names. A failed commit latches: the journal
 // writes nothing more.

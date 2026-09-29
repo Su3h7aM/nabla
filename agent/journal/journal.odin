@@ -94,9 +94,11 @@ Corruption :: struct {
 	seq:     Journal_Seq,
 }
 
-// Journal is one connection, used by one thread, and at most one claimed
-// session. It must not move while open: the connection and arena keep their
-// address. The zero value is closed.
+// Journal is one connection and at most one claimed session. One thread uses it
+// at a time; ownership passes to another thread only while no result set or
+// transaction is open, and the thread that hands it off stops using it. It must
+// not move while open: the connection and arena keep their address. The zero
+// value is closed.
 Journal :: struct {
 	connection: db.Conn,
 	allocator:  mem.Allocator,
@@ -145,6 +147,7 @@ open :: proc(journal: ^Journal, directory, locks: string, run: Run_Id, mode: Ope
 	// changes nothing, because the open error is what the caller needs.
 	defer if error != nil { _ = close(journal) }
 
+	virtual.arena_init_growing(&journal.batch) or_return
 	journal.directory = strings.clone(directory, allocator) or_return
 	if mode == .Read_Write { journal.locks = strings.clone(locks, allocator) or_return }
 	path := filepath.join({directory, DATABASE_NAME}, context.temp_allocator) or_return

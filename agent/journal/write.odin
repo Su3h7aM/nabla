@@ -197,8 +197,11 @@ write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 		if statement.connection == nil { db.prepare(&journal.connection, &statement, INSERT_SQL[insert]) or_return }
 	}
 	db.exec(&journal.connection, "BEGIN IMMEDIATE") or_return
-	// The rollback is teardown for a failure already on its way out.
-	defer if error != nil { _ = db.rollback(&journal.connection) }
+	// A busy failure keeps the items pending for the next commit, which needs this
+	// transaction gone; if it stays open, the rollback failure is the one to latch.
+	defer if error != nil {
+		if rollback_error := db.rollback(&journal.connection); rollback_error != nil && error_is_busy(error) { error = rollback_error }
+	}
 
 	last = journal.last_seq
 	for &item in journal.pending {
