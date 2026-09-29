@@ -1,73 +1,121 @@
 package main
 
 import "core:mem"
+import "core:strconv"
 import "core:strings"
 
 import "nabla:markdown"
 import "nabla:term"
 import "nabla:text"
 
+// Styled_Segment is a borrowed text span and its terminal style in a rendered line.
 Styled_Segment :: struct {
 	text:  string,
 	style: term.Style,
 }
 
-@(private = "file")
-MAX_INT :: int((u64(1) << (size_of(int) * 8 - 1)) - 1)
+// Markdown_Lines stores segments in reading order and the end index of each line.
+Markdown_Lines :: struct {
+	segments:  []Styled_Segment,
+	line_ends: []int,
+}
 
-// markdown_lines renders Markdown into pre-wrapped terminal lines. Every line
-// and segment slice is allocated from allocator; segment text borrows source or
-// is static or allocated from allocator. The result lives until allocator is
-// freed. Parsing and rendering allocate from allocator, and the parsed tree is
-// destroyed before return. The procedure shares no state and runs on any thread.
+// markdown_line returns the segments of line index, a view into lines.
+markdown_line :: proc(lines: Markdown_Lines, index: int) -> []Styled_Segment {
+	start := 0
+	if index > 0 { start = lines.line_ends[index - 1] }
+	return lines.segments[start:lines.line_ends[index]]
+}
+
+// Nabla has no theme, so Markdown styles use only the terminal's default colors,
+// ANSI indices 1 to 6, and modifiers, and they follow whatever theme the terminal has.
+MARKDOWN_CODE_STYLE :: term.Style {
+	foreground = term.Indexed_Color(6),
+}
+MARKDOWN_LINK_STYLE :: term.Style {
+	foreground = term.Indexed_Color(4),
+	modifiers  = {.Underline},
+}
+// MARKDOWN_DIM_STYLE is for decoration: borders, rules, quote bars, info strings, link URLs.
+MARKDOWN_DIM_STYLE :: term.Style {
+	modifiers = {.Dim},
+}
+MARKDOWN_CODE_INDENT :: "  "
+// MARKDOWN_SPACES and MARKDOWN_RULE_RUN are sliced for padding and rules, so a run of
+// either needs no allocation; a longer run is emitted in several pieces.
+MARKDOWN_SPACES :: "                                                                "
+MARKDOWN_RULE_RUN :: "────────────────"
+MARKDOWN_QUOTE_PREFIX :: "│ "
+MARKDOWN_BULLET_PREFIX :: "• "
+MARKDOWN_ORDERED_SUFFIX :: ". "
+// MARKDOWN_TABLE_CELL_PADDING is the columns of space on each side of a table cell.
+MARKDOWN_TABLE_CELL_PADDING :: 1
+MARKDOWN_LINK_URL_PREFIX :: " ("
+MARKDOWN_LINK_URL_SUFFIX :: ")"
+
+// markdown_lines renders source as Markdown into lines no wider than width columns. It
+// makes many small allocations from allocator, including list-number text the segments
+// point into, and the result has no destroy: pass an arena or the temp allocator and
+// free it as a whole. Segment text is otherwise a view into source or a static string,
+// so source must outlive the result. The only error is an allocation failure. The
+// procedure shares no state and runs on any thread.
 @(require_results)
-markdown_lines :: proc(source: string, width: int, allocator := context.allocator) -> (lines: [][]Styled_Segment, err: mem.Allocator_Error) {
-	previous_allocator := context.allocator
-	context.allocator = allocator
-	defer context.allocator = previous_allocator
-
+markdown_lines :: proc(source: string, width: int, allocator := context.allocator) -> (lines: Markdown_Lines, err: mem.Allocator_Error) {
 	document, parse_error := markdown.parse(source, allocator)
 	if parse_error != nil {
-		return nil, parse_error
+		return {}, parse_error
 	}
 	defer markdown.destroy(&document)
 
 	renderer := Renderer {
 		allocator = allocator,
+		segments  = make([dynamic]Styled_Segment, allocator),
+		line_ends = make([dynamic]int, allocator),
+		current   = make([dynamic]Styled_Segment, allocator),
+		word      = make([dynamic]Styled_Segment, allocator),
+		spaces    = make([dynamic]Styled_Segment, allocator),
 	}
 	defer renderer_destroy(&renderer)
 
 	if render_error := render_blocks(&renderer, document.blocks, max(width, 1), false); render_error != nil {
-		return nil, render_error
+		return {}, render_error
 	}
-	lines = renderer_finish(&renderer)
+	lines, err = renderer_finish(&renderer)
+	if err != nil { return {}, err }
 	return lines, nil
 }
 
 @(private = "file")
 Renderer :: struct {
 	allocator: mem.Allocator,
-	lines:     [dynamic][]Styled_Segment,
+	segments:  [dynamic]Styled_Segment,
+	line_ends: [dynamic]int,
+	// prefixes are the open quotes and list items, outermost first; every line
+	// starts with their markers.
+	prefixes:  [dynamic]Renderer_Prefix,
 	current:   [dynamic]Styled_Segment,
 	word:      [dynamic]Styled_Segment,
 	spaces:    [dynamic]Styled_Segment,
 }
 
+// Renderer_Prefix is the marker an open quote or list item puts at the start of each
+// line: first on the item's first line, continuation on every later one.
+@(private = "file")
+Renderer_Prefix :: struct {
+	first:        Styled_Segment,
+	continuation: Styled_Segment,
+	emitted:      bool,
+}
+
 @(private = "file", require_results)
 renderer_flush_line :: proc(renderer: ^Renderer) -> mem.Allocator_Error {
-	line: []Styled_Segment
-	if len(renderer.current) > 0 {
-		allocated, allocation_error := make([]Styled_Segment, len(renderer.current), renderer.allocator)
-		if allocation_error != nil {
-			return allocation_error
-		}
-		copy(allocated, renderer.current[:])
-		line = allocated
+	for &prefix in renderer.prefixes {
+		marker := prefix.continuation if prefix.emitted else prefix.first
+		prefix.emitted = true
+		append(&renderer.segments, marker) or_return
 	}
-	if _, err := append(&renderer.lines, line); err != nil {
-		delete(line, renderer.allocator)
-		return err
-	}
+	append(&renderer.segments, ..renderer.current[:]) or_return
+	append(&renderer.line_ends, len(renderer.segments)) or_return
 	clear(&renderer.current)
 	return nil
 }
@@ -91,49 +139,63 @@ renderer_append_segments :: proc(renderer: ^Renderer, segments: []Styled_Segment
 
 @(private = "file", require_results)
 renderer_spaces :: proc(renderer: ^Renderer, count: int, style: term.Style = {}) -> mem.Allocator_Error {
-	if count <= 0 {
-		return nil
-	}
-	value, err := strings.repeat(" ", count, renderer.allocator)
-	if err != nil {
-		return err
-	}
-	if err = renderer_segment(renderer, value, style); err != nil {
-		delete(value, renderer.allocator)
-		return err
+	return renderer_repeat(renderer, MARKDOWN_SPACES, count, style)
+}
+
+// renderer_repeat adds count columns of run, which repeats one single-column
+// character, as slices of run.
+@(private = "file", require_results)
+renderer_repeat :: proc(renderer: ^Renderer, run: string, count: int, style: term.Style) -> mem.Allocator_Error {
+	run_columns := text.text_columns(run)
+	character_size := len(run) / run_columns
+	for remaining := count; remaining > 0; {
+		columns := min(remaining, run_columns)
+		renderer_segment(renderer, run[:columns * character_size], style) or_return
+		remaining -= columns
 	}
 	return nil
 }
 
 @(private = "file")
 renderer_destroy :: proc(renderer: ^Renderer) {
-	for line in renderer.lines {
-		delete(line, renderer.allocator)
-	}
-	delete(renderer.lines)
+	delete(renderer.segments)
+	delete(renderer.line_ends)
+	delete(renderer.prefixes)
 	delete(renderer.current)
 	delete(renderer.word)
 	delete(renderer.spaces)
 	renderer^ = {}
 }
 
-@(private = "file")
-renderer_finish :: proc(renderer: ^Renderer) -> [][]Styled_Segment {
-	lines := renderer.lines[:]
-	renderer.lines = {}
+@(private = "file", require_results)
+renderer_finish :: proc(renderer: ^Renderer) -> (lines: Markdown_Lines, err: mem.Allocator_Error) {
+	if len(renderer.current) > 0 || len(renderer.line_ends) == 0 { renderer_flush_line(renderer) or_return }
+	lines = Markdown_Lines {
+		segments  = renderer.segments[:],
+		line_ends = renderer.line_ends[:],
+	}
+	renderer.segments = {}
+	renderer.line_ends = {}
 	delete(renderer.current)
 	delete(renderer.word)
 	delete(renderer.spaces)
-	return lines
+	return lines, nil
 }
 
+// renderer_blank_line ends the current block with an empty line, unless nothing was
+// rendered yet or the last line already is empty.
 @(private = "file", require_results)
 renderer_blank_line :: proc(renderer: ^Renderer) -> mem.Allocator_Error {
-	if len(renderer.lines) == 0 || len(renderer.lines[len(renderer.lines) - 1]) == 0 {
+	count := len(renderer.line_ends)
+	if count == 0 || len(renderer_line(renderer, count - 1)) == 0 {
 		return nil
 	}
-	_, err := append(&renderer.lines, []Styled_Segment{})
-	return err
+	return renderer_flush_line(renderer)
+}
+
+@(private = "file")
+renderer_line :: proc(renderer: ^Renderer, index: int) -> []Styled_Segment {
+	return markdown_line(Markdown_Lines{segments = renderer.segments[:], line_ends = renderer.line_ends[:]}, index)
 }
 
 @(private = "file", require_results)
@@ -143,13 +205,12 @@ render_blocks :: proc(renderer: ^Renderer, blocks: []markdown.Block, width: int,
 		if has_previous && !suppress_separators {
 			renderer_blank_line(renderer) or_return
 		}
-		before := len(renderer.lines)
+		before := len(renderer.line_ends)
 		switch value in block {
 		case markdown.Paragraph:
 			paragraph_render(renderer, value.spans, width, {}) or_return
 		case markdown.Heading:
-			modifiers: term.Modifiers
-			modifiers |= {.Bold}
+			modifiers := term.Modifiers{.Bold}
 			if value.level <= 2 {
 				modifiers |= {.Underline}
 			}
@@ -157,26 +218,23 @@ render_blocks :: proc(renderer: ^Renderer, blocks: []markdown.Block, width: int,
 		case markdown.Code_Block:
 			render_code_block(renderer, value, width) or_return
 		case markdown.Quote:
-			start := len(renderer.lines)
-			render_blocks(renderer, value.blocks, max(width - 2, 1), false) or_return
 			quote_prefix := Styled_Segment {
-				text = "│ ",
-				style = term.Style{modifiers = {.Dim}},
+				text  = MARKDOWN_QUOTE_PREFIX,
+				style = MARKDOWN_DIM_STYLE,
 			}
-			render_prefix_lines(renderer, start, quote_prefix, quote_prefix) or_return
+			append(&renderer.prefixes, Renderer_Prefix{first = quote_prefix, continuation = quote_prefix}) or_return
+			render_error := render_blocks(renderer, value.blocks, max(width - text.text_columns(MARKDOWN_QUOTE_PREFIX), 1), false)
+			pop(&renderer.prefixes)
+			if render_error != nil { return render_error }
 		case markdown.List:
 			render_list(renderer, value, width) or_return
 		case markdown.Table:
 			render_table(renderer, value, width) or_return
 		case markdown.Thematic_Break:
-			line, err := strings.repeat("─", width, renderer.allocator)
-			if err != nil {
-				return err
-			}
-			renderer_segment(renderer, line, term.Style{modifiers = {.Dim}}) or_return
+			renderer_repeat(renderer, MARKDOWN_RULE_RUN, width, MARKDOWN_DIM_STYLE) or_return
 			renderer_flush_line(renderer) or_return
 		}
-		if len(renderer.lines) > before {
+		if len(renderer.line_ends) > before {
 			has_previous = true
 		}
 	}
@@ -185,7 +243,7 @@ render_blocks :: proc(renderer: ^Renderer, blocks: []markdown.Block, width: int,
 
 @(private = "file", require_results)
 paragraph_render :: proc(renderer: ^Renderer, spans: []markdown.Span, width: int, extra: term.Modifiers) -> mem.Allocator_Error {
-	start := len(renderer.lines)
+	start := len(renderer.line_ends)
 	for i := 0; i < len(spans); i += 1 {
 		span := spans[i]
 		if span.text == "\n" {
@@ -197,16 +255,14 @@ paragraph_render :: proc(renderer: ^Renderer, spans: []markdown.Span, width: int
 		style := span_style(span.style, extra)
 		paragraph_add_text(renderer, span.text, style, width) or_return
 		if .Link in span.style && paragraph_link_group_end(spans, i) && !paragraph_link_text_is_url(spans, i) {
-			url_text, err := strings.concatenate({" (", span.url, ")"}, renderer.allocator)
-			if err != nil {
-				return err
-			}
-			paragraph_add_text(renderer, url_text, term.Style{modifiers = {.Dim}}, width) or_return
+			paragraph_add_text(renderer, MARKDOWN_LINK_URL_PREFIX, MARKDOWN_DIM_STYLE, width) or_return
+			paragraph_add_text(renderer, span.url, MARKDOWN_DIM_STYLE, width) or_return
+			paragraph_add_text(renderer, MARKDOWN_LINK_URL_SUFFIX, MARKDOWN_DIM_STYLE, width) or_return
 		}
 	}
 	paragraph_place_word(renderer, width) or_return
 	clear(&renderer.spaces)
-	if len(renderer.current) > 0 || len(renderer.lines) == start {
+	if len(renderer.current) > 0 || len(renderer.line_ends) == start {
 		renderer_flush_line(renderer) or_return
 	}
 	return nil
@@ -321,11 +377,11 @@ span_style :: proc(flags: markdown.Style, extra: term.Modifiers) -> term.Style {
 		style.modifiers |= {.Strikethrough}
 	}
 	if .Code in flags {
-		style.foreground = term.Indexed_Color(6)
+		style.foreground = MARKDOWN_CODE_STYLE.foreground
 	}
 	if .Link in flags {
-		style.foreground = term.Indexed_Color(4)
-		style.modifiers |= {.Underline}
+		style.foreground = MARKDOWN_LINK_STYLE.foreground
+		style.modifiers |= MARKDOWN_LINK_STYLE.modifiers
 	}
 	style.modifiers |= extra
 	return style
@@ -358,42 +414,19 @@ paragraph_link_text_is_url :: proc(spans: []markdown.Span, index: int) -> bool {
 }
 
 @(private = "file", require_results)
-render_prefix_lines :: proc(renderer: ^Renderer, start: int, first, continuation: Styled_Segment) -> mem.Allocator_Error {
-	for index := start; index < len(renderer.lines); index += 1 {
-		prefix := continuation
-		if index == start {
-			prefix = first
-		}
-		line := renderer.lines[index]
-		prefixed, err := make([]Styled_Segment, len(line) + 1, renderer.allocator)
-		if err != nil {
-			return err
-		}
-		prefixed[0] = prefix
-		copy(prefixed[1:], line)
-		delete(line, renderer.allocator)
-		renderer.lines[index] = prefixed
-	}
-	return nil
-}
-
-@(private = "file", require_results)
 render_code_block :: proc(renderer: ^Renderer, block: markdown.Code_Block, width: int) -> mem.Allocator_Error {
 	if block.info != "" {
-		render_code_line(renderer, block.info, term.Style{modifiers = {.Dim}}, width) or_return
-	}
-	style := term.Style {
-		foreground = term.Indexed_Color(6),
+		render_code_line(renderer, block.info, MARKDOWN_DIM_STYLE, width) or_return
 	}
 	for line in block.lines {
-		render_code_line(renderer, line, style, width) or_return
+		render_code_line(renderer, line, MARKDOWN_CODE_STYLE, width) or_return
 	}
 	return nil
 }
 
 @(private = "file", require_results)
 render_code_line :: proc(renderer: ^Renderer, value: string, style: term.Style, width: int) -> mem.Allocator_Error {
-	indent := "  "
+	indent := MARKDOWN_CODE_INDENT
 	content_width := max(width - text.text_columns(indent), 1)
 	if value == "" {
 		renderer_segment(renderer, indent, style) or_return
@@ -424,10 +457,9 @@ render_list :: proc(renderer: ^Renderer, list: markdown.List, width: int) -> mem
 	if list.ordered {
 		number := list.start
 		for _ in list.items {
-			number_width = max(number_width, integer_digits(number))
-			if number < MAX_INT {
-				number += 1
-			}
+			buffer: [ORDERED_NUMBER_BUFFER]byte
+			number_width = max(number_width, len(strconv.write_int(buffer[:], i64(number), 10)))
+			number += 1
 		}
 	}
 	number := list.start
@@ -435,77 +467,45 @@ render_list :: proc(renderer: ^Renderer, list: markdown.List, width: int) -> mem
 		if item_index > 0 && !list.tight {
 			renderer_blank_line(renderer) or_return
 		}
-		first_text := "• "
+		first_text := MARKDOWN_BULLET_PREFIX
 		if list.ordered {
-			ordered_prefix, prefix_error := ordered_list_prefix(number, number_width, renderer.allocator)
-			if prefix_error != nil {
-				return prefix_error
-			}
-			first_text = ordered_prefix
-			if number < MAX_INT {
-				number += 1
-			}
+			first_text = ordered_list_prefix(number, number_width, renderer.allocator) or_return
+			number += 1
 		}
 		prefix_width := text.text_columns(first_text)
-		continuation, err := strings.repeat(" ", prefix_width, renderer.allocator)
-		if err != nil {
-			return err
+		// A marker is at most nine digits and its suffix, so the blank continuation
+		// always fits in MARKDOWN_SPACES.
+		spaces := MARKDOWN_SPACES
+		marker := Renderer_Prefix {
+			first = Styled_Segment{text = first_text},
+			continuation = Styled_Segment{text = spaces[:prefix_width]},
 		}
-		start := len(renderer.lines)
-		render_blocks(renderer, item, max(width - prefix_width, 1), list.tight) or_return
-		if len(renderer.lines) == start {
+		append(&renderer.prefixes, marker) or_return
+		start := len(renderer.line_ends)
+		render_error := render_blocks(renderer, item, max(width - prefix_width, 1), list.tight)
+		pop(&renderer.prefixes)
+		if render_error != nil { return render_error }
+		if len(renderer.line_ends) == start {
 			renderer_flush_line(renderer) or_return
 		}
-		render_prefix_lines(renderer, start, Styled_Segment{text = first_text}, Styled_Segment{text = continuation}) or_return
 	}
 	return nil
 }
 
-@(private = "file")
-integer_digits :: proc(value: int) -> int {
-	magnitude := u64(value)
-	if value < 0 {
-		magnitude = u64(-(value + 1)) + 1
-	}
-	digits := 1
-	for magnitude >= 10 {
-		magnitude /= 10
-		digits += 1
-	}
-	if value < 0 {
-		digits += 1
-	}
-	return digits
-}
-
+// ordered_list_prefix formats an item number right-aligned in width digits, followed by
+// the marker suffix, into allocator.
 @(private = "file", require_results)
 ordered_list_prefix :: proc(value, width: int, allocator: mem.Allocator) -> (string, mem.Allocator_Error) {
-	buffer: [64]byte
-	magnitude := u64(value)
-	negative := value < 0
-	if negative {
-		magnitude = u64(-(value + 1)) + 1
-	}
-	end := len(buffer)
-	for {
-		buffer[end - 1] = byte(magnitude % 10) + '0'
-		end -= 1
-		magnitude /= 10
-		if magnitude == 0 {
-			break
-		}
-	}
-	if negative {
-		buffer[end - 1] = '-'
-		end -= 1
-	}
-	number := string(buffer[end:])
-	padding, err := strings.repeat(" ", max(width - len(number), 0), allocator)
-	if err != nil {
-		return "", err
-	}
-	return strings.concatenate({padding, number, ". "}, allocator)
+	buffer: [ORDERED_NUMBER_BUFFER]byte
+	number := strconv.write_int(buffer[:], i64(value), 10)
+	spaces := MARKDOWN_SPACES
+	padding := spaces[:clamp(width - len(number), 0, len(spaces))]
+	return strings.concatenate({padding, number, MARKDOWN_ORDERED_SUFFIX}, allocator)
 }
+
+// ORDERED_NUMBER_BUFFER holds any i64 in decimal with its sign.
+@(private = "file")
+ORDERED_NUMBER_BUFFER :: 20
 
 @(private = "file", require_results)
 render_table :: proc(renderer: ^Renderer, table: markdown.Table, width: int) -> mem.Allocator_Error {
@@ -555,7 +555,7 @@ render_table :: proc(renderer: ^Renderer, table: markdown.Table, width: int) -> 
 
 @(private = "file")
 table_width :: proc(widths: []int) -> int {
-	width := 1 + len(widths) * 3
+	width := 1 + len(widths) * (2 * MARKDOWN_TABLE_CELL_PADDING + 1)
 	for value in widths {
 		width += value
 	}
@@ -579,16 +579,10 @@ cell_columns :: proc(spans: []markdown.Span) -> int {
 
 @(private = "file", require_results)
 render_table_border :: proc(renderer: ^Renderer, widths: []int, left, middle, right: string) -> mem.Allocator_Error {
-	style := term.Style {
-		modifiers = {.Dim},
-	}
+	style := MARKDOWN_DIM_STYLE
 	renderer_segment(renderer, left, style) or_return
 	for column_width, column in widths {
-		line, err := strings.repeat("─", column_width + 2, renderer.allocator)
-		if err != nil {
-			return err
-		}
-		renderer_segment(renderer, line, style) or_return
+		renderer_repeat(renderer, MARKDOWN_RULE_RUN, column_width + 2 * MARKDOWN_TABLE_CELL_PADDING, style) or_return
 		if column + 1 == len(widths) {
 			renderer_segment(renderer, right, style) or_return
 		} else {
@@ -601,11 +595,16 @@ render_table_border :: proc(renderer: ^Renderer, widths: []int, left, middle, ri
 
 @(private = "file", require_results)
 render_table_cells :: proc(renderer: ^Renderer, cells: []markdown.Cell, alignments: []markdown.Alignment, widths: []int, header: bool) -> mem.Allocator_Error {
-	rendered: [dynamic]Renderer
+	rendered := make([dynamic]Renderer, renderer.allocator)
 	defer rendered_cells_destroy(&rendered)
 	for cell, column in cells {
 		cell_renderer := Renderer {
 			allocator = renderer.allocator,
+			segments  = make([dynamic]Styled_Segment, renderer.allocator),
+			line_ends = make([dynamic]int, renderer.allocator),
+			current   = make([dynamic]Styled_Segment, renderer.allocator),
+			word      = make([dynamic]Styled_Segment, renderer.allocator),
+			spaces    = make([dynamic]Styled_Segment, renderer.allocator),
 		}
 		extra: term.Modifiers
 		if header {
@@ -622,23 +621,23 @@ render_table_cells :: proc(renderer: ^Renderer, cells: []markdown.Cell, alignmen
 	}
 	row_height := 1
 	for cell_renderer in rendered {
-		row_height = max(row_height, len(cell_renderer.lines))
+		row_height = max(row_height, len(cell_renderer.line_ends))
 	}
 	for row := 0; row < row_height; row += 1 {
-		renderer_segment(renderer, "│", term.Style{modifiers = {.Dim}}) or_return
+		renderer_segment(renderer, "│", MARKDOWN_DIM_STYLE) or_return
 		for column in 0 ..< len(widths) {
-			renderer_spaces(renderer, 1) or_return
+			renderer_spaces(renderer, MARKDOWN_TABLE_CELL_PADDING) or_return
 			line: []Styled_Segment
-			if row < len(rendered[column].lines) {
-				line = rendered[column].lines[row]
+			if row < len(rendered[column].line_ends) {
+				line = renderer_line(&rendered[column], row)
 			}
 			padding := max(widths[column] - segments_columns(line, 0), 0)
 			left_padding, right_padding := table_alignment_padding(alignments[column], padding)
 			renderer_spaces(renderer, left_padding) or_return
 			renderer_append_segments(renderer, line) or_return
 			renderer_spaces(renderer, right_padding) or_return
-			renderer_spaces(renderer, 1) or_return
-			renderer_segment(renderer, "│", term.Style{modifiers = {.Dim}}) or_return
+			renderer_spaces(renderer, MARKDOWN_TABLE_CELL_PADDING) or_return
+			renderer_segment(renderer, "│", MARKDOWN_DIM_STYLE) or_return
 		}
 		renderer_flush_line(renderer) or_return
 	}

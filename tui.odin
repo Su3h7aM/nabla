@@ -159,13 +159,14 @@ Render_Status :: enum u8 {
 }
 
 // Frame_Storage is the caller-owned frame budget: the cell grid backing, the
-// presentation scratch, and the layout context, whose storage grows to the
-// transcript it is given.
+// Markdown presentation cache, the presentation scratch, and the layout
+// context, whose storage grows to the transcript it is given.
 Frame_Storage :: struct {
 	cells:      []term.Cell,
 	buffer:     term.Frame_Buffer,
 	output:     []byte,
 	alloc:      mem.Allocator,
+	markdown:   Markdown_Cache,
 	layout_ctx: layout.Context,
 	// capacities is what layout_ctx is currently sized for. The context owns its
 	// storage, so the budget is raised through layout.reserve as the transcript
@@ -179,6 +180,7 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	storage, storage_error := new(Frame_Storage, alloc)
 	if storage_error != nil { return nil }
 	storage.alloc = alloc
+	markdown_cache_init(&storage.markdown, alloc)
 	// Measurement and drawing share one width policy, so a tab or an
 	// emoji-presentation sequence measures the columns drawing produces.
 	// The zero profile would drop tabs while drawing expands them, and the
@@ -193,6 +195,7 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	// budget raisable: init_from_buffer storage belongs to the caller, and a
 	// context built on it cannot reserve.
 	if layout.init(&storage.layout_ctx, config, alloc) != nil {
+		markdown_cache_destroy(&storage.markdown)
 		free(storage, alloc)
 		return nil
 	}
@@ -204,6 +207,7 @@ frame_storage_destroy :: proc(storage: ^Frame_Storage) {
 	if storage == nil { return }
 	if storage.cells != nil { delete(storage.cells, storage.alloc) }
 	if storage.output != nil { delete(storage.output, storage.alloc) }
+	markdown_cache_destroy(&storage.markdown)
 	layout.destroy(&storage.layout_ctx)
 	free(storage, storage.alloc)
 }
@@ -229,8 +233,9 @@ ensure_frame :: proc(storage: ^Frame_Storage, cols, rows: int) -> bool {
 // state or a copy taken out of the snapshot under that lock, so the write does not hold
 // up the worker.
 present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
-	// Frame scratch is temp-allocated; the previous frame was already
-	// presented, so its borrows are dead and the pool can be recycled.
+	// Transient frame scratch is temp-allocated; cached Markdown uses frame storage
+	// and survives this reset. The previous frame was already presented, so its
+	// remaining borrows are dead and the pool can be recycled.
 	free_all(context.temp_allocator)
 	sync.mutex_lock(&app.run.mu)
 	cursor, err := render_frame(app, storage)
@@ -354,6 +359,9 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 		}
 		corrected := app.conv_scroll_range - app.scroll
 		if corrected == offset || pass == 1 {
+			// The last solve declared every entry this frame draws, so the
+			// Markdown it did not ask for belongs to entries that are gone.
+			markdown_cache_sweep(&storage.markdown)
 			if !draw_conversation_commands(storage, frame_result, rect) { return false }
 			selection_paint(app, storage, rect)
 			return true
@@ -416,7 +424,7 @@ declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layou
 				}
 			} else {
 				for &entry in app.run.snap.entries {
-					declare_entry(&storage.layout_ctx, &entry, width)
+					declare_entry(&storage.layout_ctx, storage, &entry, width)
 				}
 			}
 		}
@@ -578,18 +586,18 @@ selection_cell_blank :: proc(cell: term.Cell) -> bool {
 // cleaned body in an element whose bottom padding is the blank row that
 // separates entries, so the spacing scrolls with the content instead of being
 // pasted in at draw time.
-declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
+declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int) {
 	if entry.kind == .Tool {
 		declare_tool_entry(ctx, entry, width)
 		return
 	}
-	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
 	if entry.kind == .Assistant {
-		if lines, render_error := markdown_lines(cleaned, width, context.temp_allocator); render_error == nil {
+		if lines, render_error := markdown_cache_lines(&storage.markdown, entry, width); render_error == nil {
 			declare_markdown_entry(ctx, lines)
 			return
 		}
 	}
+	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
 	body_style := layout_text_style(entry_style(entry.kind))
 	// A user message is a band, and the band's padding rows are painted too, so
 	// they keep the band's style rather than the body's wrapping one.
@@ -624,14 +632,15 @@ declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Text_Style) {
 // declare_markdown_entry adds an assistant message rendered from Markdown. The
 // lines arrive wrapped to the transcript width, so each is one row of unwrapped
 // segments, and an empty line still holds its row.
-declare_markdown_entry :: proc(ctx: ^layout.Context, lines: [][]Styled_Segment) {
+declare_markdown_entry :: proc(ctx: ^layout.Context, lines: Markdown_Lines) {
 	entry_layout := layout.Layout_Style {
 		flow = .Column,
 		sizing = layout.Sizing{width = layout.fit(), height = layout.fit()},
 		padding = layout.Edges{bottom = 1},
 	}
 	if layout.element(ctx, layout.Element_Desc{layout = entry_layout}) {
-		for line in lines {
+		for line_index in 0 ..< len(lines.line_ends) {
+			line := markdown_line(lines, line_index)
 			if len(line) == 0 {
 				layout.text(ctx, layout.Text_Desc{text = " ", style = layout_text_style({})})
 				continue

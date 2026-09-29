@@ -8,20 +8,21 @@ import "core:testing"
 import "nabla:term"
 import "nabla:text"
 
-rendered_lines :: proc(t: ^testing.T, source: string, width: int) -> [][]Styled_Segment {
+rendered_lines :: proc(t: ^testing.T, source: string, width: int) -> Markdown_Lines {
 	lines, err := markdown_lines(source, width, context.temp_allocator)
 	if !testing.expect_value(t, err, nil) {
-		return nil
+		return {}
 	}
 	return lines
 }
 
-rendered_text :: proc(lines: [][]Styled_Segment) -> string {
+rendered_text :: proc(lines: Markdown_Lines) -> string {
 	builder := strings.builder_make(context.temp_allocator)
-	for line, line_index in lines {
+	for line_index in 0 ..< len(lines.line_ends) {
 		if line_index > 0 {
 			strings.write_byte(&builder, '\n')
 		}
+		line := markdown_line(lines, line_index)
 		for segment in line {
 			strings.write_string(&builder, segment.text)
 		}
@@ -51,7 +52,8 @@ test_markdown_preserves_strong_and_code_styles :: proc(t: ^testing.T) {
 	lines := rendered_lines(t, "**bold** and `code`", 20)
 	found_bold := false
 	found_cyan_code := false
-	for line in lines {
+	for line_index in 0 ..< len(lines.line_ends) {
+		line := markdown_line(lines, line_index)
 		for segment in line {
 			if segment.text == "bold" {
 				found_bold = true
@@ -87,7 +89,8 @@ test_markdown_quote_prefixes_wrapped_content :: proc(t: ^testing.T) {
 test_markdown_code_block_hard_wraps_and_keeps_cyan_style :: proc(t: ^testing.T) {
 	lines := rendered_lines(t, "```odin\nabcdefghijk\n```", 8)
 	testing.expect_value(t, rendered_text(lines), "  odin\n  abcdef\n  ghijk")
-	for line, line_index in lines {
+	for line_index in 0 ..< len(lines.line_ends) {
+		line := markdown_line(lines, line_index)
 		if line_index == 0 {
 			continue
 		}
@@ -101,14 +104,16 @@ test_markdown_code_block_hard_wraps_and_keeps_cyan_style :: proc(t: ^testing.T) 
 @(test)
 test_markdown_tables_fit_and_shrink_to_width :: proc(t: ^testing.T) {
 	fits := rendered_lines(t, "| A | B |\n| - | -: |\n| x | 9 |", 16)
-	testing.expect(t, len(fits) >= 4, "table must have borders and rows")
-	for line in fits {
+	testing.expect(t, len(fits.line_ends) >= 4, "table must have borders and rows")
+	for line_index in 0 ..< len(fits.line_ends) {
+		line := markdown_line(fits, line_index)
 		testing.expect(t, text.text_columns(rendered_line_text(line)) <= 16, "fitting table lines must stay within width")
 	}
 
 	shrinks := rendered_lines(t, "| firstlong | secondlong | thirdlong |\n| --- | --- | --- |\n| abcdefgh | ijklmnop | qrstuvwx |", 20)
-	testing.expect(t, len(shrinks) >= 4, "shrunk table must have borders and rows")
-	for line in shrinks {
+	testing.expect(t, len(shrinks.line_ends) >= 4, "shrunk table must have borders and rows")
+	for line_index in 0 ..< len(shrinks.line_ends) {
+		line := markdown_line(shrinks, line_index)
 		testing.expect(t, text.text_columns(rendered_line_text(line)) <= 20, "shrunk table lines must stay within width")
 	}
 }

@@ -42,6 +42,8 @@ Entry :: struct {
 	// which is what keeps a box under the pointer its own after the transcript
 	// dropped older lines. Zero is not an entry.
 	id:              u64,
+	// revision counts changes to text, so a presentation derived from the text can tell it is stale.
+	revision:        u64,
 	// bytes is what this entry costs the transcript's budget: its own slot and the
 	// text it keeps, so one budget covers everything the transcript holds.
 	bytes:           int,

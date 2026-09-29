@@ -584,6 +584,7 @@ snap_entry_set_text :: proc(app: ^App, entry: ^Entry, text: string) {
 		return
 	}
 	copy(entry.text[:], text)
+	entry.revision += 1
 	snap_entry_account(entry)
 }
 
@@ -599,6 +600,7 @@ snap_entry_account :: proc(entry: ^Entry) {
 // hold it is reported once rather than silently truncating the line.
 snap_entry_append_text :: proc(app: ^App, entry: ^Entry, text: string) {
 	if len(text) > 0 {
+		entry.revision += 1
 		if _, append_error := append(&entry.text, ..transmute([]byte)text); append_error != nil {
 			snap_report_dropped(app, append_error)
 		}
