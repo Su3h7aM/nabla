@@ -217,6 +217,25 @@ test_allocation_failure_leaves_nothing :: proc(t: ^testing.T) {
 
 MIXED_SOURCE :: "# h\n\np **s** [l](u)\n\n```\ncode\n```\n\n> quote\n> - nested\n\n1. one\n2. two\n   - deep\n\n| a | b |\n| --- | --- |\n| c | d |\n"
 
+DEEP_QUOTE_MARKER_COUNT :: 10_000
+
+@(test)
+test_deep_quote_text_is_rendered :: proc(t: ^testing.T) {
+	builder := strings.builder_make(context.temp_allocator)
+	for _ in 0 ..< DEEP_QUOTE_MARKER_COUNT {
+		strings.write_byte(&builder, '>')
+	}
+	strings.write_byte(&builder, 'x')
+	source := strings.to_string(builder)
+
+	document, err := parse(source)
+	if !testing.expect(t, err == nil, "a deeply nested quote should parse") { return }
+	defer destroy(&document)
+
+	rendered := outline(document)
+	testing.expect(t, strings.contains(rendered, source[MAX_CONTAINER_DEPTH:]), "deep quote text should be rendered")
+}
+
 // Limit_Allocator fails every allocation after the first allowed ones, so a test
 // can fail parse at each allocation in turn.
 Limit_Allocator :: struct {

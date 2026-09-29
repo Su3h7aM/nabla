@@ -3,6 +3,10 @@ package markdown
 import "base:runtime"
 import "core:mem"
 
+// MAX_CONTAINER_DEPTH keeps recursive block walkers within the thread stack;
+// deeper quote and list markers remain text.
+MAX_CONTAINER_DEPTH :: 128
+
 // parse reads source as Markdown and returns its document. Every slice is
 // allocated from allocator and freed by destroy. Every string is a view into
 // source, which must outlive the document. The only error is allocation failure;
@@ -24,7 +28,7 @@ parse :: proc(source: string, allocator := context.allocator) -> (document: Docu
 		start = index + 1
 	}
 
-	blocks := parse_blocks(lines[:], allocator) or_return
+	blocks := parse_blocks(lines[:], 0, allocator) or_return
 	document = Document {
 		blocks    = blocks,
 		allocator = allocator,
@@ -33,7 +37,7 @@ parse :: proc(source: string, allocator := context.allocator) -> (document: Docu
 }
 
 @(private, require_results)
-parse_blocks :: proc(lines: []string, allocator: mem.Allocator) -> (result: []Block, err: mem.Allocator_Error) {
+parse_blocks :: proc(lines: []string, depth: int, allocator: mem.Allocator) -> (result: []Block, err: mem.Allocator_Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	blocks := make([dynamic]Block, allocator) or_return
 	defer if err != nil {
@@ -68,10 +72,10 @@ parse_blocks :: proc(lines: []string, allocator: mem.Allocator) -> (result: []Bl
 				spans = spans,
 			}
 			index += 1
-		case quote_opener(line):
-			block, index = parse_quote(lines, index, allocator) or_return
-		case is_list:
-			block, index = parse_list(lines, index, allocator) or_return
+		case quote_opener(line) && depth < MAX_CONTAINER_DEPTH:
+			block, index = parse_quote(lines, index, depth, allocator) or_return
+		case is_list && depth < MAX_CONTAINER_DEPTH:
+			block, index = parse_list(lines, index, depth, allocator) or_return
 		case table_starts(lines, index):
 			block, index = parse_table(lines, index, allocator) or_return
 		case:
@@ -152,7 +156,7 @@ parse_indented_code :: proc(lines: []string, start: int, allocator: mem.Allocato
 }
 
 @(private, require_results)
-parse_quote :: proc(lines: []string, start: int, allocator: mem.Allocator) -> (block: Block, next_index: int, err: mem.Allocator_Error) {
+parse_quote :: proc(lines: []string, start, depth: int, allocator: mem.Allocator) -> (block: Block, next_index: int, err: mem.Allocator_Error) {
 	quote_lines := make([dynamic]string, context.temp_allocator) or_return
 	index := start
 	fence: Fence_State
@@ -176,7 +180,7 @@ parse_quote :: proc(lines: []string, start: int, allocator: mem.Allocator) -> (b
 		index += 1
 	}
 
-	blocks := parse_blocks(quote_lines[:], allocator) or_return
+	blocks := parse_blocks(quote_lines[:], depth + 1, allocator) or_return
 	block = Quote {
 		blocks = blocks,
 	}
@@ -185,7 +189,7 @@ parse_quote :: proc(lines: []string, start: int, allocator: mem.Allocator) -> (b
 }
 
 @(private, require_results)
-parse_list :: proc(lines: []string, start: int, allocator: mem.Allocator) -> (block: Block, next_index: int, err: mem.Allocator_Error) {
+parse_list :: proc(lines: []string, start, depth: int, allocator: mem.Allocator) -> (block: Block, next_index: int, err: mem.Allocator_Error) {
 	first, _ := list_marker(lines[start])
 	items := make([dynamic][]Block, allocator) or_return
 	defer if err != nil {
@@ -253,7 +257,7 @@ parse_list :: proc(lines: []string, start: int, allocator: mem.Allocator) -> (bl
 			break
 		}
 
-		item_blocks := parse_blocks(item_lines[:], allocator) or_return
+		item_blocks := parse_blocks(item_lines[:], depth + 1, allocator) or_return
 		if _, append_err := append(&items, item_blocks); append_err != nil {
 			blocks_destroy(item_blocks, allocator)
 			return {}, 0, append_err
