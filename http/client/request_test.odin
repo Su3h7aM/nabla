@@ -12,7 +12,7 @@ import "nabla:http"
 // _render formats a request the way the transport sends it. It runs under a
 // tracking allocator, so a request that does not free what it takes fails the
 // test instead of quietly leaking into the caller's.
-_render :: proc(t: ^testing.T, request: Request) -> string {
+_render :: proc(t: ^testing.T, request: Request, connect_authority: string = "") -> string {
 	ambient := context.allocator
 
 	track: mem.Tracking_Allocator
@@ -28,7 +28,7 @@ _render :: proc(t: ^testing.T, request: Request) -> string {
 	owned := request
 	owned.allocator = tracked
 
-	buffer, _, formatted := format_request(http.url_parse(owned.url), owned)
+	buffer, _, formatted := format_request(http.url_parse(owned.url), owned, connect_authority)
 	if !formatted { testing.fail_now(t, "the request could not be formatted") }
 	text := strings.clone(bytes.buffer_to_string(&buffer), context.temp_allocator)
 	bytes.buffer_destroy(&buffer)
@@ -118,14 +118,48 @@ test_invalid_requests_are_refused_before_the_wire :: proc(t: ^testing.T) {
 	// A length that states exactly the body is the caller's own value kept.
 	refused_request_case("https://api.example.com/", {{"content-length", "2"}}, transmute([]u8)string("hi"), .None, t)
 
-	// CONNECT needs authority-form and a tunnel result, neither of which this
-	// client supports, so it is refused before the request reaches the wire.
+	// A CONNECT request supplies its authority-form separately from the endpoint
+	// URL, and an empty request remains valid.
 	connect := Request {
 		url    = "https://api.example.com:443/",
 		method = .Connect,
 	}
-	connect_err, _ := request_validate(http.url_parse(connect.url), connect)
-	testing.expect_value(t, connect_err, Error.Invalid_Request)
+	connect_err, _ := request_validate(http.url_parse(connect.url), connect, "destination.example:443")
+	testing.expect_value(t, connect_err, Error.None)
+}
+
+@(test)
+test_connect_authority_and_request_content_are_validated :: proc(t: ^testing.T) {
+	request := Request {
+		url    = "http://proxy.example:8080/",
+		method = .Connect,
+	}
+	url := http.url_parse(request.url)
+	for authority in ([]string{"example.com:443", "127.0.0.1:80", "[2001:db8::1]:443"}) {
+		valid_err, _ := request_validate(url, request, authority)
+		testing.expectf(t, valid_err == .None, "%q was refused", authority)
+	}
+	for authority in ([]string{"", "example.com", "example.com:", "example.com:0", "example.com:65536", "example.com:4x", "user@example.com:443", "example.com:443 extra", "example.com:443\r\nInjected: yes", "example.com:443:80", "[not-ipv6]:443", "[::1]443", "2001:db8::1:443", "bad%xx.example:443"}) {
+		invalid_err, _ := request_validate(url, request, authority)
+		testing.expectf(t, invalid_err == .Invalid_Request, "%q was accepted", authority)
+	}
+
+	with_content := request
+	with_content.body = transmute([]u8)string("body")
+	content_err, _ := request_validate(url, with_content, "destination.example:443")
+	testing.expect_value(t, content_err, Error.Invalid_Request)
+
+	for header in ([]Header{{name = "content-length", value = "0"}, {name = "transfer-encoding", value = "chunked"}, {name = "host", value = "other.example:443"}}) {
+		with_header := request
+		with_header.headers = {header}
+		header_err, _ := request_validate(url, with_header, "destination.example:443")
+		testing.expectf(t, header_err == .Invalid_Request, "header %q was accepted", header.name)
+	}
+
+	matching_host := request
+	matching_host.headers = {{name = "Host", value = "destination.example:443"}}
+	matching_err, _ := request_validate(url, matching_host, "destination.example:443")
+	testing.expect_value(t, matching_err, Error.None)
 }
 
 @(test)
@@ -146,6 +180,17 @@ test_request_heading_headers :: proc(t: ^testing.T) {
 	// RFC 9112 9.3: a client that does not support persistent connections sends
 	// the "close" connection option in every request.
 	testing.expectf(t, strings.contains(text, "connection: close\r\n"), "missing close in:\n%s", text)
+}
+
+@(test)
+test_connect_formats_authority_and_host_exactly :: proc(t: ^testing.T) {
+	request := Request {
+		url    = "http://proxy.example:8080/unused",
+		method = .Connect,
+	}
+	text := _render(t, request, "Tunnel.Example:8443")
+	expected := "CONNECT Tunnel.Example:8443 HTTP/1.1\r\nhost: Tunnel.Example:8443\r\n\r\n"
+	testing.expect_value(t, text, expected)
 }
 
 @(test)

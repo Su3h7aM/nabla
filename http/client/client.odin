@@ -104,7 +104,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	}
 	defer reader_destroy(&reader)
 
-	head, headers, head_err := read_final_response_head(&reader, request.allocator)
+	head, headers, head_err := read_final_response_head(&reader, request.allocator, request.method)
 	defer http.headers_destroy(&headers)
 	if head_err != .None { return failure_from_error(head_err, request.allocator) }
 	status := head.code
@@ -201,10 +201,19 @@ event_loop_acquire :: proc(allocator: mem.Allocator) -> Failure {
 // phase and summary are written in place, so the caller's single observation covers
 // validation and the request write as well as the response that follows.
 @(require_results)
-request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase, summary: ^Transfer_Summary) -> (connection: ^Connection, failure: Failure) {
+request_send :: proc(
+	request: Request,
+	options: Options,
+	phase: ^Transfer_Phase,
+	summary: ^Transfer_Summary,
+	connect_authority: string = "",
+) -> (
+	connection: ^Connection,
+	failure: Failure,
+) {
 	url := http.url_parse(request.url)
 	phase^ = .Validate
-	if valid_err, valid_detail := request_validate(url, request); valid_err != .None {
+	if valid_err, valid_detail := request_validate(url, request, connect_authority); valid_err != .None {
 		// A refused request never reached the transport, so like a refused
 		// URL it carries no cause; the kind names the refusal.
 		kind := Failure_Kind.Invalid_Request
@@ -239,7 +248,7 @@ request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase,
 	}
 
 	phase^ = .Request_Write
-	buffer, body_offset, formatted := format_request(url, request)
+	buffer, body_offset, formatted := format_request(url, request, connect_authority)
 	defer bytes.buffer_destroy(&buffer)
 	if !formatted {
 		connection_destroy(dialed)
@@ -260,11 +269,10 @@ request_send :: proc(request: Request, options: Options, phase: ^Transfer_Phase,
 
 // request_validate refuses what this client will not put on the wire: a URL
 // it does not speak, and fields or a target that would frame ambiguously or
-// inject bytes. CONNECT needs authority-form and a tunnel handle, which this
-// client does not provide. URL problems report Invalid_URL; everything the
-// caller built reports Invalid_Request. The detail is a static string the failure clones.
+// inject bytes. URL problems report Invalid_URL; everything the caller built
+// reports Invalid_Request. The detail is a static string the failure clones.
 @(require_results)
-request_validate :: proc(url: http.URL, request: Request) -> (err: Error, detail: string) {
+request_validate :: proc(url: http.URL, request: Request, connect_authority: string = "") -> (err: Error, detail: string) {
 	// RFC 9110 4.2.3: schemes are case-insensitive.
 	if !strings.equal_fold(url.scheme, "http") && !strings.equal_fold(url.scheme, "https") {
 		return .Invalid_URL, "URL scheme must be http or https"
@@ -273,19 +281,29 @@ request_validate :: proc(url: http.URL, request: Request) -> (err: Error, detail
 	if strings.index_byte(url.host, '@') >= 0 {
 		return .Invalid_URL, "URL authority states userinfo, which this client does not send"
 	}
-	if request.method == .Connect {
-		return .Invalid_Request, "CONNECT is unsupported because this client has no tunnel API"
-	}
 	for i in 0 ..< len(url.host) {
 		if url.host[i] <= 0x20 || url.host[i] == 0x7F { return .Invalid_URL, "URL host holds a control byte or space" }
 	}
 
-	for part in ([2]string{url.path, url.query}) {
-		for i in 0 ..< len(part) {
-			if part[i] <= 0x20 || part[i] == 0x7F { return .Invalid_Request, "request target holds a control byte or space" }
+	if request.method == .Connect {
+		// RFC 9110 9.3.6 forbids CONNECT content; RFC 9112 3.2.3 requires
+		// its request target to be an explicit host-and-port authority.
+		if !connect_authority_valid(connect_authority) {
+			return .Invalid_Request, "CONNECT target must be a valid host and nonempty port"
+		}
+		if len(request.body) != 0 {
+			return .Invalid_Request, "CONNECT requests cannot contain content"
+		}
+	} else {
+		if connect_authority != "" { return .Invalid_Request, "a CONNECT target was supplied for a non-CONNECT request" }
+		for part in ([2]string{url.path, url.query}) {
+			for i in 0 ..< len(part) {
+				if part[i] <= 0x20 || part[i] == 0x7F { return .Invalid_Request, "request target holds a control byte or space" }
+			}
 		}
 	}
 
+	connect_host_count := 0
 	for header in request.headers {
 		if !http.token_valid(header.name) { return .Invalid_Request, "a request field name is not a token" }
 		for i in 0 ..< len(header.value) {
@@ -293,10 +311,21 @@ request_validate :: proc(url: http.URL, request: Request) -> (err: Error, detail
 				return .Invalid_Request, "a request field value holds a control byte"
 			}
 		}
+		if request.method == .Connect && strings.equal_fold(header.name, "host") {
+			connect_host_count += 1
+			if header.value != connect_authority {
+				return .Invalid_Request, "a CONNECT Host field must exactly match its target"
+			}
+			if connect_host_count > 1 { return .Invalid_Request, "a CONNECT request cannot contain more than one Host field" }
+		}
 		// This client frames with Content-Length or close, never with transfer
 		// codings, so a caller coding would frame ambiguously.
 		if strings.equal_fold(header.name, "transfer-encoding") {
+			if request.method == .Connect { return .Invalid_Request, "CONNECT requests cannot contain Transfer-Encoding" }
 			return .Invalid_Request, "this client sends no transfer codings"
+		}
+		if request.method == .Connect && strings.equal_fold(header.name, "content-length") {
+			return .Invalid_Request, "CONNECT requests cannot contain Content-Length"
 		}
 		// A stated length that is invalid or differs from the body would frame
 		// a different message than the one sent.
@@ -314,19 +343,21 @@ request_validate :: proc(url: http.URL, request: Request) -> (err: Error, detail
 // where the body begins, which is what lets a partial write say how much of the
 // body the transport took rather than how much of the whole request it took.
 @(require_results)
-format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer, body_offset: int, formatted: bool) {
+format_request :: proc(url: http.URL, request: Request, connect_authority: string = "") -> (buffer: bytes.Buffer, body_offset: int, formatted: bool) {
 	bytes.buffer_init_allocator(&buffer, 0, len(request.body) + 512, request.allocator)
 
 	// The request line is appended rather than formatted through a fixed buffer.
 	// A URL has no length limit, and a line that outgrows such a buffer makes fmt
 	// allocate from the ambient context allocator, which this call does not own
 	// and never releases.
-	// The request target is the origin-form of the URL (RFC 9112 3.2.1): the path,
-	// "/" when it is empty, and the query. A fragment is never sent.
+	// CONNECT uses authority-form (RFC 9112 3.2.3); other methods use origin-form
+	// (RFC 9112 3.2.1). A fragment is never sent.
+	target := url.path if url.path != "" else "/"
+	if request.method == .Connect { target = connect_authority }
 	if !request_buffer_string(&buffer, http.method_string(request.method)) ||
 	   !request_buffer_string(&buffer, " ") ||
-	   !request_buffer_string(&buffer, url.path if url.path != "" else "/") ||
-	   (url.query != "" && (!request_buffer_string(&buffer, "?") || !request_buffer_string(&buffer, url.query))) ||
+	   !request_buffer_string(&buffer, target) ||
+	   (request.method != .Connect && url.query != "" && (!request_buffer_string(&buffer, "?") || !request_buffer_string(&buffer, url.query))) ||
 	   !request_buffer_string(&buffer, " HTTP/1.1\r\n") {
 		return buffer, 0, false
 	}
@@ -334,11 +365,13 @@ format_request :: proc(url: http.URL, request: Request) -> (buffer: bytes.Buffer
 	// field itself meant its own value, which is how a request states a connection
 	// it keeps or a body length it already knows.
 	if !request_has_header(request, "host") {
-		if !request_buffer_string(&buffer, "host: ") || !request_buffer_string(&buffer, url.host) || !request_buffer_string(&buffer, "\r\n") {
+		host := url.host
+		if request.method == .Connect { host = connect_authority }
+		if !request_buffer_string(&buffer, "host: ") || !request_buffer_string(&buffer, host) || !request_buffer_string(&buffer, "\r\n") {
 			return buffer, 0, false
 		}
 	}
-	if !request_has_header(request, "connection") && !request_buffer_string(&buffer, "connection: close\r\n") {
+	if request.method != .Connect && !request_has_header(request, "connection") && !request_buffer_string(&buffer, "connection: close\r\n") {
 		return buffer, 0, false
 	}
 	if !request_has_header(request, "content-length") && request_states_length(request) {
@@ -451,14 +484,23 @@ Response_Status :: struct {
 }
 
 @(require_results)
-read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status: Response_Status, headers: http.Headers, err: Error) {
+read_response_head :: proc(
+	reader: ^Reader,
+	allocator: mem.Allocator,
+	method: http.Method = .Get,
+) -> (
+	status: Response_Status,
+	headers: http.Headers,
+	err: Error,
+) {
 	line, line_err := reader_line(reader)
 	if line_err != .None { return {}, headers, line_err }
 	code, version, parsed := parse_status_line(line)
 	if !parsed { return {}, headers, .Bad_Response }
 	http.headers_init(&headers, allocator)
 
-	if section_err := read_field_section(reader, &headers); section_err != .None {
+	ignore_connect_framing := method == .Connect && code >= 200 && code < 300
+	if section_err := read_field_section(reader, &headers, ignore_connect_framing); section_err != .None {
 		return {}, headers, section_err
 	}
 	return {code, version}, headers, .None
@@ -475,7 +517,7 @@ read_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status
 // no predefined limit on a field line, a field value, or a field section, and a
 // client that refuses a long one fails where every other client succeeds.
 @(require_results)
-read_field_section :: proc(reader: ^Reader, headers: ^http.Headers) -> Error {
+read_field_section :: proc(reader: ^Reader, headers: ^http.Headers, ignore_connect_framing: bool = false) -> Error {
 	// The field a folded line continues.
 	last_key: string
 	for {
@@ -491,6 +533,15 @@ read_field_section :: proc(reader: ^Reader, headers: ^http.Headers) -> Error {
 			continue
 		}
 
+		// A successful CONNECT ignores framing fields. The shared parser rejects
+		// conflicting Content-Length repetitions, so retain the first field instead
+		// of letting an ignored field prevent the tunnel from being established.
+		if ignore_connect_framing {
+			colon := strings.index_byte(header_line, ':')
+			if colon > 0 && strings.equal_fold(header_line[:colon], "content-length") {
+				if _, present := http.headers_get_unsafe(headers^, "content-length"); present { continue }
+			}
+		}
 		key, ok := http.header_parse(headers, header_line)
 		if !ok { return .Bad_Response }
 		last_key = key
@@ -510,13 +561,21 @@ read_field_section :: proc(reader: ^Reader, headers: ^http.Headers) -> Error {
 // returned as the final response for the caller to report as a failure rather
 // than being waited past.
 @(require_results)
-read_final_response_head :: proc(reader: ^Reader, allocator: mem.Allocator) -> (status: Response_Status, headers: http.Headers, err: Error) {
+read_final_response_head :: proc(
+	reader: ^Reader,
+	allocator: mem.Allocator,
+	method: http.Method = .Get,
+) -> (
+	status: Response_Status,
+	headers: http.Headers,
+	err: Error,
+) {
 	// How many interim responses may precede the final one is not this client's
 	// decision: RFC 9110 15.2 says a client must be able to parse one or more of
 	// them. A peer that only ever sends them is bounded by the caller's own
 	// cancellation and deadline, asked on every read.
 	for {
-		head_status, head, head_err := read_response_head(reader, allocator)
+		head_status, head, head_err := read_response_head(reader, allocator, method)
 		if head_err != .None { return {}, head, head_err }
 		if head_status.code == 101 || head_status.code >= 200 { return head_status, head, .None }
 
@@ -581,6 +640,9 @@ response_framing :: proc(status: int, version: http.Version, method: http.Method
 	if method == .Head || (status >= 100 && status < 200) || status == 204 || status == 304 {
 		return .None, 0, .None
 	}
+	// RFC 9112 6.3 item 2: a successful CONNECT begins a tunnel at the end of
+	// the response head, regardless of either framing field.
+	if method == .Connect && status >= 200 && status < 300 { return .None, 0, .None }
 
 	// 3 and 4. A Transfer-Encoding overrides Content-Length, and it is the final
 	// coding that decides the framing.

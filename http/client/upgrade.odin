@@ -6,10 +6,10 @@ import "core:nbio"
 
 import "nabla:http"
 
-// Upgraded is a connection whose HTTP exchange ended with the peer taking it over,
-// which a 101 response states (RFC 9110 15.2.2). A caller reads and writes the
-// protocol it upgraded to through this handle: the handle owns the connection and
-// the response head.
+// Upgraded is a connection whose HTTP exchange ended with the peer taking it over:
+// a 101 response (RFC 9110 15.2.2) or a successful CONNECT response (RFC 9110
+// 9.3.6). A caller reads and writes the protocol through this handle, which owns
+// the connection and response head.
 //
 // The handle is bound to no thread. One thread at a time may use it, and each read
 // or write waits on that thread's own event loop. A holder that reads or writes
@@ -61,7 +61,7 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 	}
 	defer reader_destroy(&reader)
 
-	head, headers, head_err := read_final_response_head(&reader, request.allocator)
+	head, headers, head_err := read_final_response_head(&reader, request.allocator, request.method)
 	status := head.code
 	if head_err != .None {
 		http.headers_destroy(&headers)
@@ -85,35 +85,41 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 		return nil, Failure{kind = .HTTP_Status, status = status, detail = detail}
 	}
 
-	// The reader may have buffered octets that belong to the upgraded protocol, and
-	// they are handed over in the order they arrived.
-	pending: []u8
-	if reader.head < reader.tail {
-		buffered, buffered_err := make([]u8, reader.tail - reader.head, request.allocator)
-		if buffered_err != nil {
-			http.headers_destroy(&headers)
-			connection_destroy(connection)
-			return nil, failure_from_error(.No_Room, request.allocator)
-		}
-		copy(buffered, reader.buffer[reader.head:reader.tail])
-		pending = buffered
-	}
-
-	handle, handle_err := new(Upgraded, request.allocator)
-	if handle_err != nil {
-		delete(pending, request.allocator)
+	handle, handle_err := upgraded_make(connection, &reader, headers, request.allocator)
+	if handle_err != .None {
 		http.headers_destroy(&headers)
 		connection_destroy(connection)
-		return nil, failure_from_error(.No_Room, request.allocator)
+		return nil, failure_from_error(handle_err, request.allocator)
 	}
-	handle.connection = connection
-	handle.headers = headers
-	handle.pending = pending
-	handle.allocator = request.allocator
 
 	summary.request_complete = true
 	phase = .Complete
 	return handle, {}
+}
+
+// upgraded_make copies the reader's buffered protocol bytes and takes ownership
+// of the connection and response fields on success. On failure the caller retains
+// both inputs.
+@(private, require_results)
+upgraded_make :: proc(connection: ^Connection, reader: ^Reader, headers: http.Headers, allocator: mem.Allocator) -> (upgraded: ^Upgraded, err: Error) {
+	pending: []u8
+	if reader.head < reader.tail {
+		buffered, buffered_err := make([]u8, reader.tail - reader.head, allocator)
+		if buffered_err != nil { return nil, .No_Room }
+		copy(buffered, reader.buffer[reader.head:reader.tail])
+		pending = buffered
+	}
+
+	handle, handle_err := new(Upgraded, allocator)
+	if handle_err != nil {
+		delete(pending, allocator)
+		return nil, .No_Room
+	}
+	handle.connection = connection
+	handle.headers = headers
+	handle.pending = pending
+	handle.allocator = allocator
+	return handle, .None
 }
 
 // upgraded_read takes bytes out of the upgraded protocol's stream. The octets read

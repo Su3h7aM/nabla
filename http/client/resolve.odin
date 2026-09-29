@@ -108,8 +108,9 @@ parse_port :: proc(text: string) -> (int, bool) {
 	port := 0
 	for character in text {
 		if character < '0' || character > '9' { return 0, false }
-		port = port * 10 + int(character - '0')
-		if port > 65535 { return 0, false }
+		digit := int(character - '0')
+		if port > (65535 - digit) / 10 { return 0, false }
+		port = port * 10 + digit
 	}
 	return port, port > 0
 }

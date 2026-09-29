@@ -43,6 +43,11 @@ test_bodyless_responses :: proc(t: ^testing.T) {
 	framing, _, err = response_framing(200, {1, 1}, .Head, head)
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, framing, Body_Framing.None)
+
+	connect := _framing_headers(t, "content-length: 5", "transfer-encoding: chunked")
+	framing, _, err = response_framing(200, {1, 1}, .Connect, connect)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, framing, Body_Framing.None)
 }
 
 @(test)
