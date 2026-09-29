@@ -2,6 +2,7 @@
 package tls
 
 import "core:crypto/hash"
+import "core:crypto/x509"
 import "core:testing"
 
 // The trace's server flight is EncryptedExtensions, Certificate, CertificateVerify,
@@ -10,6 +11,18 @@ ENCRYPTED_EXTENSIONS_SIZE :: 40
 CERTIFICATE_SIZE :: 445
 CERTIFICATE_VERIFY_SIZE :: 136
 FINISHED_SIZE :: 36
+
+@(test)
+test_ip_reference_identity_requires_an_exact_ip_san :: proc(t: ^testing.T) {
+	ip4 := [4]u8{127, 0, 0, 1}
+	certificate := x509.Certificate {
+		ip_addresses = [][]byte{ip4[:]},
+	}
+
+	testing.expect(t, identity_verify(&certificate, "127.0.0.1"), "the matching IP SAN was rejected")
+	testing.expect(t, !identity_verify(&certificate, "127.0.0.2"), "a different IP address matched the certificate")
+	testing.expect(t, !identity_verify(&certificate, "localhost"), "an IP SAN authenticated a DNS name")
+}
 
 @(test)
 test_rfc_8448_certificate_list :: proc(t: ^testing.T) {

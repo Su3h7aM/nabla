@@ -172,6 +172,7 @@ interop_run_client :: proc(t: ^testing.T, directory: string, socket: net.TCP_Soc
 		)
 		return
 	}
+	testing.expect(t, connection.server_finished_received, "the verified server Finished was not recorded")
 	testing.expect(t, connection.alpn == INTEROP_ALPN, "the server did not select the protocol the client offered")
 	// The server picks the suite, and the connection has to be the one it picked.
 	testing.expect_value(t, connection.suite, expected.suite)

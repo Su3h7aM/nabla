@@ -7,15 +7,22 @@ import "core:testing"
 // Fixture answers the first record this connection writes and nothing after it, which is
 // what a peer that refuses the handshake does.
 Fixture :: struct {
-	incoming: []u8,
-	at:       int,
-	outgoing: [dynamic]u8,
+	incoming:         []u8,
+	at:               int,
+	outgoing:         [dynamic]u8,
+	read_fail_after:  int,
+	write_fail_after: int,
 }
 
 fixture_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) {
 	fixture := cast(^Fixture)user_data
 	available := len(fixture.incoming) - fixture.at
 	if available <= 0 { return 0, false }
+	if fixture.read_fail_after > 0 {
+		remaining := fixture.read_fail_after - fixture.at
+		if remaining <= 0 { return 0, false }
+		available = min(available, remaining)
+	}
 	count = min(available, len(buffer))
 	copy(buffer, fixture.incoming[fixture.at:fixture.at + count])
 	fixture.at += count
@@ -24,8 +31,27 @@ fixture_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) 
 
 fixture_write :: proc(user_data: rawptr, buffer: []u8) -> (count: int, ok: bool) {
 	fixture := cast(^Fixture)user_data
-	append(&fixture.outgoing, ..buffer)
-	return len(buffer), true
+	count = len(buffer)
+	if fixture.write_fail_after > 0 {
+		remaining := fixture.write_fail_after - len(fixture.outgoing)
+		if remaining <= 0 { return 0, false }
+		count = min(count, remaining)
+	}
+	append(&fixture.outgoing, ..buffer[:count])
+	return count, true
+}
+
+@(test)
+test_an_empty_server_name_is_rejected_before_the_client_hello :: proc(t: ^testing.T) {
+	fixture: Fixture
+	defer delete(fixture.outgoing)
+	connection, init_err := init({read = fixture_read, write = fixture_write, user_data = &fixture}, {allocator = context.allocator})
+	if !testing.expect(t, init_err == .None, "a connection could not be prepared") { return }
+	defer destroy(connection)
+
+	testing.expect_value(t, handshake(connection, "", nil), Error.Invalid_Identity)
+	testing.expect_value(t, len(fixture.outgoing), 0)
+	testing.expect_value(t, fixture.at, 0)
 }
 
 // A peer that answers with an alert ends the handshake, and the client reports the alert
@@ -92,6 +118,104 @@ test_a_malformed_change_cipher_spec_is_refused :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_change_cipher_spec_after_the_server_finished_is_refused :: proc(t: ^testing.T) {
+	fixture := Fixture {
+		incoming = []u8{u8(Record_Type.Change_Cipher_Spec), 3, 3, 0, 1, CHANGE_CIPHER_SPEC},
+	}
+	defer delete(fixture.outgoing)
+	connection, init_err := init({read = fixture_read, write = fixture_write, user_data = &fixture}, {allocator = context.allocator})
+	if !testing.expect(t, init_err == .None, "a connection could not be prepared") { return }
+	defer destroy(connection)
+	connection.client_hello_sent = true
+	connection.server_finished_received = true
+
+	_, _, read_err := read_record(connection)
+	testing.expect_value(t, read_err, Error.Record)
+	written := fixture.outgoing[:]
+	tail := written[len(written) - 7:]
+	expect_bytes(t, "unexpected message alert", tail, []u8{21, 3, 3, 0, 2, u8(Alert_Level.Fatal), u8(Alert_Description.Unexpected_Message)})
+}
+
+@(test)
+test_a_change_cipher_spec_is_accepted_after_the_client_hello_before_server_finished :: proc(t: ^testing.T) {
+	fixture := Fixture {
+		incoming = []u8 {
+			u8(Record_Type.Change_Cipher_Spec),
+			3,
+			3,
+			0,
+			1,
+			CHANGE_CIPHER_SPEC,
+			u8(Record_Type.Handshake),
+			3,
+			3,
+			0,
+			4,
+			u8(Handshake_Type.Finished),
+			0,
+			0,
+			0,
+		},
+	}
+	defer delete(fixture.outgoing)
+	connection, init_err := init({read = fixture_read, write = fixture_write, user_data = &fixture}, {allocator = context.allocator})
+	if !testing.expect(t, init_err == .None, "a connection could not be prepared") { return }
+	defer destroy(connection)
+	connection.client_hello_sent = true
+
+	_, record_type, read_err := read_record(connection)
+	testing.expect_value(t, read_err, Error.None)
+	testing.expect_value(t, record_type, Record_Type.Handshake)
+	testing.expect(t, !connection.server_finished_received, "the fixture marked the server Finished as received")
+}
+
+@(test)
+test_transport_failure_mid_record_latches_the_connection :: proc(t: ^testing.T) {
+	fixture := Fixture {
+		incoming        = []u8{u8(Record_Type.Application_Data), 3, 3, 0, 1, 'x'},
+		read_fail_after = RECORD_HEADER_SIZE,
+	}
+	defer delete(fixture.outgoing)
+	connection, init_err := init({read = fixture_read, write = fixture_write, user_data = &fixture}, {allocator = context.allocator})
+	if !testing.expect(t, init_err == .None, "a connection could not be prepared") { return }
+	defer destroy(connection)
+
+	_, _, read_err := read_record(connection)
+	testing.expect_value(t, read_err, Error.Transport)
+	testing.expect(t, connection.transport_failed, "the interrupted record did not fail the connection")
+
+	fixture.read_fail_after = 0
+	buffer: [1]u8
+	count, repeated_err := read(connection, buffer[:])
+	testing.expect_value(t, count, 0)
+	testing.expect_value(t, repeated_err, Error.Transport)
+	testing.expect_value(t, fixture.at, RECORD_HEADER_SIZE)
+}
+
+@(test)
+test_transport_failure_mid_write_latches_the_connection :: proc(t: ^testing.T) {
+	fixture := Fixture {
+		write_fail_after = 3,
+	}
+	defer delete(fixture.outgoing)
+	connection, init_err := init({read = fixture_read, write = fixture_write, user_data = &fixture}, {allocator = context.allocator})
+	if !testing.expect(t, init_err == .None, "a connection could not be prepared") { return }
+	defer destroy(connection)
+
+	count, write_err := write(connection, []u8{'x'})
+	testing.expect_value(t, count, 0)
+	testing.expect_value(t, write_err, Error.Transport)
+	testing.expect(t, connection.transport_failed, "the incomplete record did not fail the connection")
+	written := len(fixture.outgoing)
+
+	fixture.write_fail_after = 0
+	repeated_count, repeated_err := write(connection, []u8{'x'})
+	testing.expect_value(t, repeated_count, 0)
+	testing.expect_value(t, repeated_err, Error.Transport)
+	testing.expect_value(t, len(fixture.outgoing), written)
+}
+
+@(test)
 test_a_main_handshake_certificate_request_can_be_answered_empty :: proc(t: ^testing.T) {
 	request := []u8{u8(Handshake_Type.Certificate_Request), 0, 0, 11, 0, 0, 8, 0, 13, 0, 4, 0, 2, 4, 3}
 	testing.expect(t, certificate_request_read(request), "a legal CertificateRequest was refused")
@@ -109,6 +233,68 @@ test_encrypted_extensions_select_one_offered_protocol :: proc(t: ^testing.T) {
 
 	_, unsolicited := encrypted_extensions_read(message, false, []string{"http/1.1"})
 	testing.expect(t, !unsolicited, "an ALPN protocol the client did not offer was accepted")
+
+	server_name_ack := []u8{u8(Handshake_Type.Encrypted_Extensions), 0, 0, 6, 0, 4, 0, 0, 0, 0}
+	_, unsolicited_server_name := encrypted_extensions_read(server_name_ack, false, nil)
+	testing.expect(t, !unsolicited_server_name, "a server acknowledged SNI the client did not send")
+}
+
+@(test)
+test_peer_close_notify_closes_only_the_read_side :: proc(t: ^testing.T) {
+	fixture: Fixture
+	defer delete(fixture.outgoing)
+	connection, init_err := init({read = fixture_read, write = fixture_write, user_data = &fixture}, {allocator = context.allocator})
+	if !testing.expect(t, init_err == .None, "a connection could not be prepared") { return }
+	defer destroy(connection)
+
+	connection.suite = .AES_128_GCM_SHA256
+	connection.encrypted = true
+	for &octet, index in connection.read_secret { octet = u8(index) }
+	for &octet, index in connection.write_secret { octet = u8(index + 32) }
+	if !testing.expect(t, traffic_key_derive(connection.suite, connection.read_secret[:32], &connection.read_key)) { return }
+	if !testing.expect(t, traffic_key_derive(connection.suite, connection.write_secret[:32], &connection.write_key)) { return }
+
+	peer_key := connection.read_key
+	peer_record: [RECORD_HEADER_SIZE + MAX_CIPHERTEXT_RECORD]u8
+	peer_alert := []u8{u8(Alert_Level.Warning), u8(Alert_Description.Close_Notify)}
+	peer_record_length, protected := record_protect(connection.suite, &peer_key, .Alert, peer_alert, peer_record[:])
+	if !testing.expect(t, protected) { return }
+	fixture.incoming = peer_record[:peer_record_length]
+
+	buffer: [16]u8
+	initial_read_count, read_err := read(connection, buffer[:])
+	testing.expect_value(t, initial_read_count, 0)
+	testing.expect_value(t, read_err, Error.None)
+	testing.expect(t, connection.read_closed, "the peer close_notify did not close the read side")
+	testing.expect(t, !connection.write_closed, "the peer close_notify closed the write side")
+	repeated_read_count, repeated_read_err := read(connection, buffer[:])
+	testing.expect_value(t, repeated_read_count, 0)
+	testing.expect_value(t, repeated_read_err, Error.None)
+
+	client_key := connection.write_key
+	write_count, write_err := write(connection, []u8{'x'})
+	testing.expect_value(t, write_count, 1)
+	testing.expect_value(t, write_err, Error.None)
+	testing.expect_value(t, close(connection), Error.None)
+	written := len(fixture.outgoing)
+	testing.expect_value(t, close(connection), Error.None)
+	testing.expect_value(t, len(fixture.outgoing), written)
+
+	_, first_length, first_decoded := record_decode_header(fixture.outgoing[:RECORD_HEADER_SIZE])
+	if !testing.expect(t, first_decoded, "the application record was not encoded") { return }
+	first_record_length := RECORD_HEADER_SIZE + first_length
+	content, content_type, opened := record_unprotect(connection.suite, &client_key, fixture.outgoing[:first_record_length])
+	if !testing.expect(t, opened, "the application record could not be opened") { return }
+	testing.expect_value(t, content_type, Record_Type.Application_Data)
+	expect_bytes(t, "application data after peer close_notify", content, []u8{'x'})
+
+	_, close_length, close_decoded := record_decode_header(fixture.outgoing[first_record_length:])
+	if !testing.expect(t, close_decoded, "the local close_notify was not encoded") { return }
+	close_record := fixture.outgoing[first_record_length:first_record_length + RECORD_HEADER_SIZE + close_length]
+	content, content_type, opened = record_unprotect(connection.suite, &client_key, close_record)
+	if !testing.expect(t, opened, "the local close_notify could not be opened") { return }
+	testing.expect_value(t, content_type, Record_Type.Alert)
+	expect_bytes(t, "local close_notify", content, []u8{u8(Alert_Level.Warning), u8(Alert_Description.Close_Notify)})
 }
 
 @(test)

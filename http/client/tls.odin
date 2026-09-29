@@ -49,6 +49,8 @@ tls_error :: proc(connection: ^Connection, tls_err: tls.Error, fallback: Error) 
 		return .None
 	case .Transport:
 		unreachable()
+	case .Invalid_Identity:
+		return .TLS_Hostname
 	case .Record, .Handshake, .Alert:
 		return .TLS_Handshake
 	case .Unsupported, .No_Room:
@@ -82,7 +84,7 @@ peer_alert_text :: proc(connection: ^Connection, allocator: mem.Allocator) -> st
 		description := tls.Alert_Description(connection.tls_session.peer_alert)
 		return fmt.aprintf("the peer sent the %v alert (%d)", description, connection.tls_session.peer_alert, allocator = allocator)
 	}
-	if connection.tls_session.closed {
+	if connection.tls_session.read_closed {
 		return fmt.aprintf("the peer closed the connection before the handshake finished", allocator = allocator)
 	}
 	return ""

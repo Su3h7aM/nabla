@@ -31,10 +31,12 @@ Config :: struct {
 	allocator: mem.Allocator,
 }
 
-// Error is why a connection failed. Transport is the caller's own failure handed
-// back, and the rest name what about the peer's answer was not acceptable.
+// Error is why a connection operation failed. Invalid_Identity is an empty reference
+// identity, Transport is the caller's own failure handed back, and the rest name what
+// about the peer's answer was not acceptable.
 Error :: enum {
 	None,
+	Invalid_Identity,
 	Transport,
 	Record,
 	Handshake,
@@ -57,28 +59,32 @@ MAX_SENT_MESSAGE :: 2048
 // Every buffer is allocated once and reused, so a connection moves no memory while
 // it is in use.
 Conn :: struct {
-	transport:             Transport,
-	config:                Config,
-	suite:                 Cipher_Suite,
-	schedule:              Key_Schedule,
-	read_secret:           Secret,
-	write_secret:          Secret,
-	read_key:              Traffic_Key,
-	write_key:             Traffic_Key,
-	transcript:            hash.Context,
-	digest:                [MAX_SECRET_SIZE]u8,
-	send:                  []u8,
-	message:               []u8,
-	recv:                  []u8,
-	recv_filled:           int,
-	stream:                [dynamic]u8,
-	stream_at:             int,
-	payload:               []u8,
-	encrypted:             bool,
-	closed:                bool,
-	certificate_requested: bool,
-	alpn:                  string,
-	peer_alert:            u8,
+	transport:                Transport,
+	config:                   Config,
+	suite:                    Cipher_Suite,
+	schedule:                 Key_Schedule,
+	read_secret:              Secret,
+	write_secret:             Secret,
+	read_key:                 Traffic_Key,
+	write_key:                Traffic_Key,
+	transcript:               hash.Context,
+	digest:                   [MAX_SECRET_SIZE]u8,
+	send:                     []u8,
+	message:                  []u8,
+	recv:                     []u8,
+	recv_filled:              int,
+	stream:                   [dynamic]u8,
+	stream_at:                int,
+	payload:                  []u8,
+	encrypted:                bool,
+	client_hello_sent:        bool,
+	server_finished_received: bool,
+	read_closed:              bool,
+	write_closed:             bool,
+	transport_failed:         bool,
+	certificate_requested:    bool,
+	alpn:                     string,
+	peer_alert:               u8,
 }
 
 // init prepares a connection. The transport is the caller's and outlives the
@@ -133,6 +139,10 @@ destroy :: proc(connection: ^Conn) {
 // connection's alpn empty, which the caller may treat as a mismatch.
 @(require_results)
 handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Error {
+	if server_name == "" { return .Invalid_Identity }
+	if connection.transport_failed { return .Transport }
+	if connection.read_closed || connection.write_closed { return .Alert }
+
 	suite := OFFERED_SUITES[0]
 	connection.suite = suite
 	connection.schedule = key_schedule_init(suite)
@@ -170,6 +180,7 @@ handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Err
 	hello_sent, hello_built := client_hello_message(connection, fields)
 	if !hello_built { return .No_Room }
 	if hello_err := send_message(connection, hello_sent); hello_err != .None { return hello_err }
+	connection.client_hello_sent = true
 
 	hello_message, answer_err := handshake_next(connection)
 	if answer_err != .None { return answer_err }
@@ -256,7 +267,7 @@ handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Err
 	if !traffic_key_derive(suite, connection.read_secret[:secret_size(suite)], &connection.read_key) { return .Unsupported }
 	if !traffic_key_derive(suite, connection.write_secret[:secret_size(suite)], &connection.write_key) { return .Unsupported }
 
-	if flight_err := handshake_server_flight(connection, server_name, alpn); flight_err != .None { return flight_err }
+	if flight_err := handshake_server_flight(connection, server_name, sni != "", alpn); flight_err != .None { return flight_err }
 
 	// The client's Finished is the last thing the handshake keys protect, and it
 	// covers the handshake through the server's Finished. The application secrets
@@ -294,10 +305,10 @@ handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Err
 // live: its extensions, its chain, its proof of the chain's key, and its Finished,
 // in the order the protocol fixes (RFC 8446 section 4.4).
 @(require_results)
-handshake_server_flight :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Error {
+handshake_server_flight :: proc(connection: ^Conn, server_name: string, server_name_offered: bool, alpn: []string) -> Error {
 	extensions_message, err := handshake_next(connection)
 	if err != .None { return err }
-	negotiated, extensions_ok := encrypted_extensions_read(extensions_message, server_name != "", alpn)
+	negotiated, extensions_ok := encrypted_extensions_read(extensions_message, server_name_offered, alpn)
 	if !extensions_ok { return fail(connection, .Decode_Error, .Handshake) }
 	if negotiated != "" {
 		chosen, clone_err := strings.clone(negotiated, connection.config.allocator)
@@ -344,6 +355,7 @@ handshake_server_flight :: proc(connection: ^Conn, server_name: string, alpn: []
 		return .Finished
 	}
 	hash.update(&connection.transcript, finished_message)
+	connection.server_finished_received = true
 	return .None
 }
 
@@ -410,8 +422,9 @@ handshake_client_finished :: proc(connection: ^Conn) -> Error {
 // none. Zero bytes with .None is the end of the stream.
 @(require_results)
 read :: proc(connection: ^Conn, buffer: []u8) -> (count: int, err: Error) {
+	if connection.transport_failed { return 0, .Transport }
 	for len(connection.payload) == 0 {
-		if connection.closed { return 0, .None }
+		if connection.read_closed { return 0, .None }
 		if post_err := post_handshake_handle(connection); post_err != .None { return 0, post_err }
 
 		content, record_type, read_err := read_record(connection)
@@ -438,7 +451,8 @@ read :: proc(connection: ^Conn, buffer: []u8) -> (count: int, err: Error) {
 // record layer accepted, which is not evidence that the peer has them.
 @(require_results)
 write :: proc(connection: ^Conn, buffer: []u8) -> (count: int, err: Error) {
-	if connection.closed { return 0, .Alert }
+	if connection.transport_failed { return 0, .Transport }
+	if connection.write_closed { return 0, .Alert }
 	for count < len(buffer) {
 		chunk := buffer[count:]
 		if len(chunk) > MAX_PLAINTEXT_RECORD { chunk = chunk[:MAX_PLAINTEXT_RECORD] }
@@ -452,8 +466,9 @@ write :: proc(connection: ^Conn, buffer: []u8) -> (count: int, err: Error) {
 // transport is the caller's to close, and closing twice sends nothing.
 @(require_results)
 close :: proc(connection: ^Conn) -> Error {
-	if connection.closed { return .None }
-	connection.closed = true
+	if connection.transport_failed { return .Transport }
+	if connection.write_closed { return .None }
+	connection.write_closed = true
 	if !connection.encrypted { return .None }
 
 	alert := connection.message[:2]
@@ -529,9 +544,9 @@ send_change_cipher_spec :: proc(connection: ^Conn) -> Error {
 // --- records ---
 
 // read_record reads one record and returns what it carried that is not handshake
-// bytes. Handshake bytes belong to the handshake stream, and a record that carries
-// only a change cipher spec is dropped, which is what a compatibility-mode peer
-// sends and what a receiver does without further processing (RFC 8446 section 5).
+// bytes. Handshake bytes belong to the handshake stream. A compatibility-mode change
+// cipher spec is ignored only after the ClientHello and before the server Finished
+// (RFC 8446 section 5).
 @(require_results)
 read_record :: proc(connection: ^Conn) -> (content: []u8, record_type: Record_Type, err: Error) {
 	for {
@@ -548,6 +563,9 @@ read_record :: proc(connection: ^Conn) -> (content: []u8, record_type: Record_Ty
 		// Compatibility mode permits only the one-byte change_cipher_spec
 		// message. Any other record with that type is malformed.
 		if outer_type == .Change_Cipher_Spec {
+			if !connection.client_hello_sent || connection.server_finished_received {
+				return nil, {}, fail(connection, .Unexpected_Message, .Record)
+			}
 			if length != 1 || record[RECORD_HEADER_SIZE] != CHANGE_CIPHER_SPEC {
 				return nil, {}, fail(connection, .Unexpected_Message, .Record)
 			}
@@ -591,9 +609,13 @@ read_record :: proc(connection: ^Conn) -> (content: []u8, record_type: Record_Ty
 // recv_fill reads exactly `count` bytes of the record being read.
 @(require_results)
 recv_fill :: proc(connection: ^Conn, count: int) -> Error {
+	if connection.transport_failed { return .Transport }
 	for connection.recv_filled < count {
 		read, ok := connection.transport.read(connection.transport.user_data, connection.recv[connection.recv_filled:count])
-		if !ok || read <= 0 { return .Transport }
+		if !ok || read <= 0 {
+			connection.transport_failed = true
+			return .Transport
+		}
 		connection.recv_filled += read
 	}
 	return .None
@@ -603,6 +625,7 @@ recv_fill :: proc(connection: ^Conn, count: int) -> Error {
 // returns what ended the write.
 @(require_results)
 send_record :: proc(connection: ^Conn, record_type: Record_Type, payload: []u8) -> Error {
+	if connection.transport_failed { return .Transport }
 	count: int
 	written: bool
 	if connection.encrypted {
@@ -616,10 +639,14 @@ send_record :: proc(connection: ^Conn, record_type: Record_Type, payload: []u8) 
 
 @(require_results)
 transport_write :: proc(connection: ^Conn, data: []u8) -> Error {
+	if connection.transport_failed { return .Transport }
 	pending := data
 	for len(pending) > 0 {
 		written, ok := connection.transport.write(connection.transport.user_data, pending)
-		if !ok || written <= 0 { return .Transport }
+		if !ok || written <= 0 {
+			connection.transport_failed = true
+			return .Transport
+		}
 		pending = pending[written:]
 	}
 	return .None
@@ -692,11 +719,16 @@ handshake_available :: proc(connection: ^Conn) -> []u8 {
 // protocol asks of the side that finds a violation (RFC 8446 section 6.2).
 @(require_results)
 fail :: proc(connection: ^Conn, description: Alert_Description, err: Error) -> Error {
-	if connection.closed { return err }
+	if connection.write_closed || connection.transport_failed {
+		connection.read_closed = true
+		connection.write_closed = true
+		return err
+	}
 	alert: [2]u8 = {u8(Alert_Level.Fatal), u8(description)}
 	// The alert is best effort: the violation is reported whether or not the peer hears it.
 	_ = send_record(connection, .Alert, alert[:])
-	connection.closed = true
+	connection.read_closed = true
+	connection.write_closed = true
 	return err
 }
 
@@ -706,10 +738,11 @@ fail :: proc(connection: ^Conn, description: Alert_Description, err: Error) -> E
 alert_report :: proc(connection: ^Conn, content: []u8) -> Error {
 	if len(content) < 2 { return .Record }
 	connection.peer_alert = content[1]
-	connection.closed = true
+	connection.read_closed = true
 	if Alert_Description(content[1]) == .Close_Notify {
 		return .None
 	}
+	connection.write_closed = true
 	return .Alert
 }
 
