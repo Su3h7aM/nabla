@@ -10,6 +10,33 @@ import "core:time"
 // The Lua boundary suite: slices that return control to the owner, stops a script cannot
 // catch, host requests, and the environment a script gets.
 
+Lua_Test_Failing_Allocator :: struct {
+	tracker:     mem.Tracking_Allocator,
+	allocations: int,
+	fail_at:     int,
+}
+
+lua_test_failing_allocator :: proc(
+	data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	location := #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	fixture := cast(^Lua_Test_Failing_Allocator)data
+	if mode == .Alloc || mode == .Alloc_Non_Zeroed || ((mode == .Resize || mode == .Resize_Non_Zeroed) && size > old_size) {
+		fixture.allocations += 1
+		if fixture.fail_at > 0 && fixture.allocations >= fixture.fail_at {
+			return nil, .Out_Of_Memory
+		}
+	}
+	return mem.tracking_allocator_proc(&fixture.tracker, mode, size, alignment, old_memory, old_size, location)
+}
+
 lua_test_start :: proc(t: ^testing.T, source: string, timeout: time.Duration = 0) -> ^Lua_Run {
 	run, compiled := codemode_lua_start(source, timeout = timeout)
 	if run == nil { testing.fail_now(t, "the execution could not be created") }
@@ -210,4 +237,43 @@ return json.encode(held)`,
 	testing.expect_value(t, event, Lua_Event.Returned)
 	codemode_lua_destroy(run)
 	testing.expect_value(t, len(tracker.allocation_map), 0)
+}
+
+@(test)
+lua_setup_allocation_failure_is_a_memory_result :: proc(t: ^testing.T) {
+	success: Lua_Test_Failing_Allocator
+	mem.tracking_allocator_init(&success.tracker, context.allocator)
+	allocator := mem.Allocator {
+		procedure = lua_test_failing_allocator,
+		data      = &success,
+	}
+	run, compiled := codemode_lua_start("return true", allocator = allocator)
+	if run == nil { testing.fail_now(t, "the successful Lua setup could not be created") }
+	if !compiled { testing.fail_now(t, "the successful Lua chunk did not compile") }
+	allocation_count := success.allocations
+	codemode_lua_destroy(run)
+	if !testing.expect_value(t, len(success.tracker.allocation_map), 0) { return }
+	mem.tracking_allocator_destroy(&success.tracker)
+
+	caught_setup_failure := false
+	for fail_at in 1 ..= allocation_count {
+		fixture: Lua_Test_Failing_Allocator
+		mem.tracking_allocator_init(&fixture.tracker, context.allocator)
+		fixture.fail_at = fail_at
+		allocator := mem.Allocator {
+			procedure = lua_test_failing_allocator,
+			data      = &fixture,
+		}
+		run, compiled := codemode_lua_start("return true", allocator = allocator)
+		if run != nil {
+			if run.state != nil && run.thread == nil && !compiled && run.failure == .Memory {
+				caught_setup_failure = true
+			}
+			codemode_lua_destroy(run)
+		}
+		if !testing.expect_value(t, len(fixture.tracker.allocation_map), 0) { return }
+		mem.tracking_allocator_destroy(&fixture.tracker)
+		if caught_setup_failure { break }
+	}
+	testing.expect(t, caught_setup_failure, "an allocation refused during Lua setup should return an out-of-memory failure")
 }

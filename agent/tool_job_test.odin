@@ -291,6 +291,10 @@ test_an_unpublished_nested_tool_job_frees_with_worker_allocator :: proc(test: ^t
 		call      = &call,
 		turn_id   = chat.active_turn_id,
 	}
+	children, children_error := make([dynamic]Codemode_Child, 0, 1, context.allocator)
+	if children_error != nil { testing.fail_now(test, "the parent tracking table could not be allocated") }
+	parent.lua_children = children
+	defer delete(parent.lua_children)
 	parent.exec = Tool_Context {
 		call_id   = parent.call_id,
 		allocator = parent.allocator,
@@ -302,8 +306,104 @@ test_an_unpublished_nested_tool_job_frees_with_worker_allocator :: proc(test: ^t
 
 	testing.expect_value(test, parent.phase, Tool_Job_Phase.Result_Ready)
 	testing.expect_value(test, len(jobs.jobs), 0)
+	testing.expect_value(test, len(parent.lua_children), 0)
 	testing.expect_value(test, len(worker_track.allocation_map), 0)
 	testing.expect_value(test, len(session_track.bad_free_array), 0)
+}
+
+@(test)
+test_an_untracked_nested_tool_job_is_never_published :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+	chat := &tool_test.fixture.chat
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(test, &tool_test, tool_job_hold_definition(&lane, "test", tool_job_immediate_execute))
+
+	worker_track: mem.Tracking_Allocator
+	session_track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&worker_track, context.allocator)
+	mem.tracking_allocator_init(&session_track, context.allocator)
+	session_track.bad_free_callback = mem.tracking_allocator_bad_free_callback_add_to_array
+	defer mem.tracking_allocator_destroy(&worker_track)
+	defer mem.tracking_allocator_destroy(&session_track)
+
+	jobs: Tool_Jobs
+	tool_jobs_init(&jobs, chat, 0, mem.tracking_allocator(&worker_track))
+	defer tool_jobs_destroy(&jobs)
+
+	run, compiled := codemode_lua_start(`return tools.test({})`)
+	if run == nil { testing.fail_now(test, "the Lua run could not be created") }
+	defer codemode_lua_destroy(run)
+	if !compiled { testing.fail_now(test, "the Lua test chunk did not compile") }
+	if !codemode_lua_install_tool(run, "test") { testing.fail_now(test, "the Lua tool could not be installed") }
+	if !testing.expect_value(test, codemode_lua_resume(run), Lua_Event.Host_Request) { return }
+
+	call := Chat_Tool_Call {
+		call = 1,
+	}
+	parent := Tool_Job {
+		placement = .Lua,
+		allocator = context.allocator,
+		call_id   = chat_clone_string("parent", context.allocator) or_else "",
+		lua       = run,
+		call      = &call,
+		turn_id   = chat.active_turn_id,
+	}
+	parent.lua_children.allocator = mem.Allocator {
+		procedure = tool_job_test_full_table,
+		data      = &session_track,
+	}
+	parent.exec = Tool_Context {
+		call_id   = parent.call_id,
+		allocator = parent.allocator,
+	}
+	defer delete(parent.call_id, parent.allocator)
+	defer delete(parent.lua_children)
+	defer if parent.result_present { tool_result_destroy(&parent.result) }
+
+	codemode_job_request(&jobs, chat, &parent)
+
+	testing.expect_value(test, parent.phase, Tool_Job_Phase.Result_Ready)
+	testing.expect_value(test, parent.result.outcome, journal.Tool_Outcome.Tool_Failed)
+	testing.expect_value(test, len(parent.lua_children), 0)
+	testing.expect_value(test, len(jobs.jobs), 0)
+	testing.expect_value(test, len(worker_track.allocation_map), 0)
+	testing.expect_value(test, len(session_track.bad_free_array), 0)
+}
+
+@(test)
+test_codemode_waiting_on_a_child_expires_and_stops_it :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+	chat := &tool_test.fixture.chat
+
+	source := `local result = tools.builtin_shell({command = "sleep 5", timeout_ms = 10000}) return result.outcome`
+	arguments := make(json.Object, 2, context.temp_allocator)
+	arguments["code"] = json.String(source)
+	arguments["timeout_ms"] = json.Integer(100)
+	encoded, encode_error := json.marshal(arguments, allocator = context.temp_allocator)
+	if encode_error != nil { testing.fail_now(test, "the Code Mode arguments could not be encoded") }
+	_test_stage_call(test, chat, "call_code", string(encoded), TOOL_CODEMODE_NAME)
+
+	jobs: Tool_Jobs
+	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
+	defer tool_jobs_destroy(&jobs)
+	tool_jobs_submit(&jobs, chat, {})
+
+	started := time.tick_now()
+	tool_job_test_drain(test, &tool_test, &jobs)
+	elapsed := time.tick_since(started)
+
+	parent := jobs.jobs[0]
+	if !testing.expect_value(test, parent.lua.failure, Lua_Failure.Timed_Out) { return }
+	if !testing.expect_value(test, len(parent.lua_children), 1) { return }
+	testing.expect_value(test, parent.lua_children[0].outcome, journal.Tool_Outcome.Cancelled)
+	testing.expect(test, elapsed < time.Second * 2, "the parent timeout should stop its child before the child's timeout")
+	result := tool_test_last_result(test, chat)
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Timed_Out)
 }
 
 // job.start runs calls while the script continues, job.wait takes their results in any

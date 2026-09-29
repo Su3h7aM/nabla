@@ -538,7 +538,7 @@ tool_jobs_next :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> Tool_Job_Effect {
 	if tool_jobs_lane_abandoned(jobs) != nil { return .Refuse }
 	if tool_jobs_earliest(jobs, {.Dispatching, .Running}) != nil && tool_jobs_overdue(jobs, now) != nil { return .Abandon }
 	if tool_jobs_retirable(jobs, now) != nil { return .Retire }
-	if tool_jobs_runnable(jobs) != nil { return .Dispatch }
+	if tool_jobs_runnable(jobs, now) != nil { return .Dispatch }
 	if !tool_jobs_settled(jobs) { return .Wait }
 	return .Done
 }
@@ -632,11 +632,18 @@ tool_jobs_collect :: proc(jobs: ^Tool_Jobs) {
 	}
 }
 
-// tool_jobs_runnable returns the earliest queued job whose lane is free and whose
-// placement can start now, or nil when the queue is waiting.
+// tool_jobs_runnable returns the earliest queued job or an expired Code Mode parent.
 @(private)
-tool_jobs_runnable :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
+tool_jobs_runnable :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> ^Tool_Job {
 	for job in jobs.jobs {
+		if job.phase == .Waiting &&
+		   job.placement == .Lua &&
+		   job.lua != nil &&
+		   !job.lua.terminal &&
+		   job.lua.deadline != {} &&
+		   time.tick_diff(job.lua.deadline, now) >= 0 {
+			return job
+		}
 		if job.phase != .Queued { continue }
 		if !tool_jobs_lane_free(jobs, job) { continue }
 		if job.placement == .Worker && jobs.active >= TOOL_JOBS_MAX_ACTIVE { continue }
@@ -733,7 +740,7 @@ tool_job_record_placement :: proc(chat: ^Chat_Session, job: ^Tool_Job) -> (node:
 // outcome, while a result without a dispatch entry would claim knowledge the harness
 // does not have.
 tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
-	job := tool_jobs_runnable(jobs)
+	job := tool_jobs_runnable(jobs, time.tick_now())
 	if job == nil { return }
 	if job.placement == .Lua && job.lua_dispatched {
 		tool_job_lua_resume(jobs, chat, job)
@@ -994,12 +1001,15 @@ tool_jobs_retire :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 	job.phase = job.committed ? .Retired : .Unrecorded
 }
 
-// tool_jobs_deadline is the nearest stop-patience expiry among calls the owner still waits
-// for, or nil when only a worker can change the table.
+// tool_jobs_deadline returns the nearest Lua execution deadline or stop-patience expiry.
 @(private)
 tool_jobs_deadline :: proc(jobs: ^Tool_Jobs) -> Maybe(time.Tick) {
 	earliest: Maybe(time.Tick)
 	for job in jobs.jobs {
+		if job.phase == .Waiting && job.lua != nil && !job.lua.terminal && job.lua.deadline != {} {
+			due := job.lua.deadline
+			if existing, has := earliest.?; !has || time.tick_diff(due, existing) < 0 { earliest = due }
+		}
 		if !job.launched || !job.stopping || !tool_job_under_executor(job) { continue }
 		due := time.tick_add(job.stop_at, TOOL_JOBS_STOP_PATIENCE)
 		if existing, has := earliest.?; !has || time.tick_diff(due, existing) < 0 { earliest = due }

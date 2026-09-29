@@ -32,13 +32,21 @@ tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job
 	}
 	job.lua = run
 	if !compiled {
-		codemode_job_answer(job, .Tool_Failed, .Syntax_Error, run.message, "syntax error")
+		if run.failure == .Memory {
+			codemode_job_answer(job, .Tool_Failed, .Out_Of_Memory, run.message, "Lua failed")
+		} else {
+			codemode_job_answer(job, .Tool_Failed, .Syntax_Error, run.message, "syntax error")
+		}
 		return
 	}
 	for &definition in chat.tools.definitions {
 		if definition.name == TOOL_CODEMODE_NAME { continue }
 		if !codemode_lua_install_tool(run, definition.name) {
-			codemode_job_answer(job, .Tool_Failed, .Unavailable, "the Lua tool table could not be built", "executor unavailable")
+			if run.failure == .Memory {
+				codemode_job_answer(job, .Tool_Failed, .Out_Of_Memory, run.message, "Lua failed")
+			} else {
+				codemode_job_answer(job, .Tool_Failed, .Unavailable, "the Lua tool table could not be built", "executor unavailable")
+			}
 			return
 		}
 	}
@@ -48,7 +56,12 @@ tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job
 // tool_job_lua_resume runs the script's next step and acts on what it reported.
 @(private)
 tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job) {
-	switch codemode_lua_resume(job.lua) {
+	event := Lua_Event.Failed
+	if !codemode_lua_expired(job.lua) { event = codemode_lua_resume(job.lua) }
+	if codemode_lua_expired(job.lua) {
+		event = codemode_lua_settle(job.lua, .Failed, .Timed_Out, "the execution passed its timeout")
+	}
+	switch event {
 	case .Slice:
 		job.phase = .Queued
 	case .Host_Request:
@@ -175,12 +188,14 @@ codemode_job_start_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: 
 		return
 	}
 	tool_job_admit(jobs, chat, {}, child)
-	if !tool_jobs_publish(jobs, child) {
-		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool job could not be admitted", "allocation failed")
+	if _, append_failure := append(&parent.lua_children, Codemode_Child{job = child}); append_failure != nil {
+		tool_job_release(child)
+		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool job could not be tracked", "allocation failed")
 		return
 	}
-	if _, append_failure := append(&parent.lua_children, Codemode_Child{job = child}); append_failure != nil {
-		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool job could not be tracked", "allocation failed")
+	if !tool_jobs_publish(jobs, child) {
+		_ = pop(&parent.lua_children)
+		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool job could not be admitted", "allocation failed")
 		return
 	}
 	return len(parent.lua_children), ""

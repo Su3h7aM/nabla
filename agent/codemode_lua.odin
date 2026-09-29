@@ -244,6 +244,7 @@ codemode_lua_suspend :: proc "c" (state: ^lua.State, kind: Lua_Request_Kind, nam
 		clone_error: mem.Allocator_Error
 		name, clone_error = strings.clone(text)
 		if clone_error != nil { return c.int(lua.L_error(state, "the tool name could not be allocated")) }
+		run.request.name = name
 	}
 	args_ref: c.int = lua.NOREF
 	if argument != 0 && lua.gettop(state) == argument { args_ref = lua.L_ref(state, lua.REGISTRYINDEX) }
@@ -412,6 +413,56 @@ codemode_lua_install_table :: proc(state: ^lua.State, name: cstring, functions: 
 	lua.setglobal(state, name)
 }
 
+@(private)
+codemode_lua_setup :: proc "c" (state: ^lua.State) -> c.int {
+	run := codemode_lua_run(state)
+	context = runtime.default_context()
+	context.allocator = run.allocator
+	codemode_lua_open_libraries(state)
+	lua.pushcfunction(state, codemode_lua_print)
+	lua.setglobal(state, "print")
+	// `tools` raises on a name that is not a tool, and job.start checks names against it.
+	lua.newtable(state)
+	lua.createtable(state, 0, 1)
+	lua.pushcfunction(state, codemode_lua_tools_index)
+	lua.setfield(state, -2, "__index")
+	lua.setmetatable(state, -2)
+	lua.createtable(state, 0, 2)
+	lua.pushvalue(state, -2)
+	lua.pushcclosure(state, codemode_lua_job_start, 1)
+	lua.setfield(state, -2, "start")
+	lua.pushcfunction(state, codemode_lua_job_wait)
+	lua.setfield(state, -2, "wait")
+	lua.setglobal(state, "job")
+	lua.setglobal(state, "tools")
+	codemode_lua_install_table(state, "json", {{"encode", codemode_lua_json_encode}, {"decode", codemode_lua_json_decode}})
+	// Lua nil means absence, so JSON null is a stable light-userdata identity.
+	lua.getglobal(state, "json")
+	lua.pushlightuserdata(state, run)
+	lua.setfield(state, -2, "null")
+	lua.pop(state, 1)
+	lua.newtable(state)
+	run.results_ref = lua.L_ref(state, lua.REGISTRYINDEX)
+
+	// Returning the thread leaves its Lua value on the main stack as a collector anchor.
+	run.thread = lua.newthread(state)
+	lua.sethook(run.thread, codemode_lua_hook, lua.MASKCOUNT, LUA_SLICE_INSTRUCTIONS)
+	return 1
+}
+
+@(private)
+codemode_lua_register_tool :: proc "c" (state: ^lua.State) -> c.int {
+	name := lua.touserdata(state, 1)
+	length := lua.tointeger(state, 2)
+	lua.getglobal(state, "tools")
+	lua.pushlstring(state, cast(cstring)name, c.size_t(length))
+	lua.pushvalue(state, -1)
+	lua.pushcclosure(state, codemode_lua_tool_call, 1)
+	lua.rawset(state, -3)
+	lua.pop(state, 1)
+	return 0
+}
+
 // --- print ---------------------------------------------------------------------
 
 // codemode_lua_print appends one line to the run's log. It never calls
@@ -527,41 +578,25 @@ codemode_lua_start :: proc(
 	}
 	(cast(^^Lua_Run)lua.getextraspace(run.state))^ = run
 	state := run.state
-
-	codemode_lua_open_libraries(state)
-	lua.pushcfunction(state, codemode_lua_print)
-	lua.setglobal(state, "print")
-	// `tools` raises on a name that is not a tool, and job.start checks names against it.
-	lua.newtable(state)
-	lua.createtable(state, 0, 1)
-	lua.pushcfunction(state, codemode_lua_tools_index)
-	lua.setfield(state, -2, "__index")
-	lua.setmetatable(state, -2)
-	lua.createtable(state, 0, 2)
-	lua.pushvalue(state, -2)
-	lua.pushcclosure(state, codemode_lua_job_start, 1)
-	lua.setfield(state, -2, "start")
-	lua.pushcfunction(state, codemode_lua_job_wait)
-	lua.setfield(state, -2, "wait")
-	lua.setglobal(state, "job")
-	lua.setglobal(state, "tools")
-	codemode_lua_install_table(state, "json", {{"encode", codemode_lua_json_encode}, {"decode", codemode_lua_json_decode}})
-	// Lua nil means absence, so JSON null is a stable light-userdata identity.
-	lua.getglobal(state, "json")
-	lua.pushlightuserdata(state, run)
-	lua.setfield(state, -2, "null")
-	lua.pop(state, 1)
-	lua.newtable(state)
-	run.results_ref = lua.L_ref(state, lua.REGISTRYINDEX)
-
-	// The thread stays on the main stack as a collector anchor.
-	run.thread = lua.newthread(state)
-	lua.sethook(run.thread, codemode_lua_hook, lua.MASKCOUNT, LUA_SLICE_INSTRUCTIONS)
+	lua.pushcfunction(state, codemode_lua_setup)
+	setup_status := lua.pcall(state, 0, 1, 0)
+	if setup_status != c.int(lua.OK) {
+		if setup_status == c.int(lua.ERRMEM) {
+			codemode_lua_settle(run, .Failed, .Memory, "the Lua runtime could not be initialized: out of memory")
+		} else {
+			text, is_text := codemode_lua_stack_string(state, -1)
+			message := text if is_text else "the Lua runtime could not be initialized"
+			codemode_lua_settle(run, .Failed, .Runtime, message)
+		}
+		return run, false
+	}
 
 	status := lua.L_loadbuffer(run.thread, raw_data(source), c.size_t(len(source)), LUA_CHUNK_NAME, "t")
 	if status != .OK {
 		text, _ := codemode_lua_stack_string(run.thread, -1)
-		codemode_lua_settle(run, .Failed, .Syntax, text)
+		failure := Lua_Failure.Syntax
+		if status == .ERRMEM { failure = .Memory }
+		codemode_lua_settle(run, .Failed, failure, text)
 		return run, false
 	}
 	return run, true
@@ -573,13 +608,14 @@ codemode_lua_start :: proc(
 codemode_lua_install_tool :: proc(run: ^Lua_Run, name: string) -> bool {
 	if run.state == nil || !tool_name_valid(name) { return false }
 	state := run.state
-	lua.getglobal(state, "tools")
-	codemode_lua_push_string(state, name)
-	codemode_lua_push_string(state, name)
-	lua.pushcclosure(state, codemode_lua_tool_call, 1)
-	lua.rawset(state, -3)
-	lua.pop(state, 1)
-	return true
+	lua.pushcfunction(state, codemode_lua_register_tool)
+	lua.pushlightuserdata(state, raw_data(name))
+	lua.pushinteger(state, lua.Integer(len(name)))
+	status := lua.pcall(state, 2, 0, 0)
+	if status == c.int(lua.ERRMEM) {
+		codemode_lua_settle(run, .Failed, .Memory, "the Lua tool table could not be built: out of memory")
+	}
+	return status == c.int(lua.OK)
 }
 
 // codemode_lua_resume runs one more slice, delivering the answers to a pending request. A
