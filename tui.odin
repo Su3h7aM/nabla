@@ -105,17 +105,6 @@ STARTUP_HINT :: "pgup/wheel scroll | escape interrupt | ctrl+c clear/cancel/quit
 // frame, so the solved scroll range can be looked up after the solve.
 CONVERSATION_ID :: layout.Id(1)
 
-// FONT_NORMAL and FONT_BOLD travel in layout.Text_Style.font, which layout
-// never interprets: the transcript's one styling distinction beyond color.
-FONT_NORMAL :: layout.Font(0)
-FONT_BOLD :: layout.Font(1)
-FONT_USER :: layout.Font(2)
-FONT_DIM :: layout.Font(3)
-FONT_RED :: layout.Font(4)
-FONT_GREEN :: layout.Font(5)
-FONT_CYAN :: layout.Font(6)
-FONT_YELLOW :: layout.Font(7)
-
 // FOOTER_KIB_ROUNDING and KIBIBYTE keep footer token counts rounded to the nearest KiB.
 FOOTER_KIB_ROUNDING :: 512
 KIBIBYTE :: 1024
@@ -509,7 +498,8 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 		line.x += viewport.x
 		line.y += viewport.y
 		style := term_text_style(text_data.style)
-		if text_data.style.font == FONT_USER {
+		// Only a user message has a background.
+		if style.background != nil {
 			// A user message is a band across the whole terminal, not a block inside
 			// the conversation's indent: the text keeps that indent as its padding.
 			tui.fill(&storage.buffer, {x = 0, y = line.y, width = storage.buffer.columns, height = 1}, " ", style)
@@ -594,6 +584,12 @@ declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 		return
 	}
 	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
+	if entry.kind == .Assistant {
+		if lines, render_error := markdown_lines(cleaned, width, context.temp_allocator); render_error == nil {
+			declare_markdown_entry(ctx, lines)
+			return
+		}
+	}
 	body_style := layout_text_style(entry_style(entry.kind))
 	// A user message is a band, and the band's padding rows are painted too, so
 	// they keep the band's style rather than the body's wrapping one.
@@ -623,6 +619,30 @@ declare_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 // the row only has to exist, and `Wrap.None` is what keeps one cell one line.
 declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Text_Style) {
 	layout.text(ctx, layout.Text_Desc{text = " ", style = band})
+}
+
+// declare_markdown_entry adds an assistant message rendered from Markdown. The
+// lines arrive wrapped to the transcript width, so each is one row of unwrapped
+// segments, and an empty line still holds its row.
+declare_markdown_entry :: proc(ctx: ^layout.Context, lines: [][]Styled_Segment) {
+	entry_layout := layout.Layout_Style {
+		flow = .Column,
+		sizing = layout.Sizing{width = layout.fit(), height = layout.fit()},
+		padding = layout.Edges{bottom = 1},
+	}
+	if layout.element(ctx, layout.Element_Desc{layout = entry_layout}) {
+		for line in lines {
+			if len(line) == 0 {
+				layout.text(ctx, layout.Text_Desc{text = " ", style = layout_text_style({})})
+				continue
+			}
+			if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Row}}) {
+				for segment in line {
+					layout.text(ctx, layout.Text_Desc{text = segment.text, style = layout_text_style(segment.style)})
+				}
+			}
+		}
+	}
 }
 
 // declare_tool_entry draws one tool call as a bordered box: the call's name on the top
@@ -770,62 +790,47 @@ declare_tool_row :: proc(ctx: ^layout.Context, content: string, border, body: la
 	}
 }
 
-// layout_text_style converts a palette style into layout's text style: the RGB
-// foreground and the bold distinction. Wrap is the declaration's choice.
+// layout_text_style packs a palette style into layout.Text_Style.font, which
+// layout never interprets: the modifiers in the low byte, then the indexed
+// foreground and background, each stored plus one so zero is the terminal
+// default. RGB colors are not carried. Wrap is the declaration's choice.
 layout_text_style :: proc(style: term.Style) -> layout.Text_Style {
-	result := layout.Text_Style {
+	font := u32(transmute(u8)style.modifiers)
+	if index, ok := style.foreground.(term.Indexed_Color); ok {
+		font |= (u32(index) + 1) << FONT_FOREGROUND_SHIFT
+	}
+	if index, ok := style.background.(term.Indexed_Color); ok {
+		font |= (u32(index) + 1) << FONT_BACKGROUND_SHIFT
+	}
+	return layout.Text_Style {
 		size  = 1,
-		font  = FONT_NORMAL,
+		font  = layout.Font(font),
 		wrap  = .None,
 		// Layout uses alpha as command visibility. RGB is ignored by this
 		// terminal adapter, which restores terminal-default or ANSI styling.
 		color = layout.Color{0, 0, 0, 255},
 	}
-	if _, background_ok := style.background.(term.Indexed_Color); background_ok {
-		result.font = FONT_USER
-	} else if .Bold in style.modifiers {
-		result.font = FONT_BOLD
-	} else if .Dim in style.modifiers {
-		result.font = FONT_DIM
-	} else if indexed, foreground_ok := style.foreground.(term.Indexed_Color); foreground_ok {
-		switch indexed {
-		case 1:
-			result.font = FONT_RED
-		case 2:
-			result.font = FONT_GREEN
-		case 3:
-			result.font = FONT_YELLOW
-		case 6:
-			result.font = FONT_CYAN
-		case:
-		}
+}
+
+// term_text_style unpacks a solved text command's style: the inverse of
+// layout_text_style, so the transcript's styles have one origin.
+term_text_style :: proc(style: layout.Text_Style) -> term.Style {
+	font := u32(style.font)
+	result: term.Style
+	result.modifiers = transmute(term.Modifiers)u8(font)
+	if foreground := (font >> FONT_FOREGROUND_SHIFT) & FONT_COLOR_MASK; foreground != 0 {
+		result.foreground = term.Indexed_Color(foreground - 1)
+	}
+	if background := (font >> FONT_BACKGROUND_SHIFT) & FONT_COLOR_MASK; background != 0 {
+		result.background = term.Indexed_Color(background - 1)
 	}
 	return result
 }
 
-// term_text_style maps a solved text command back onto the palette: the
-// inverse of layout_text_style, so the transcript's styles have one origin.
-term_text_style :: proc(style: layout.Text_Style) -> term.Style {
-	result: term.Style
-	switch style.font {
-	case FONT_BOLD:
-		result.modifiers = {.Bold}
-	case FONT_USER:
-		result.background = USER_TEXT.background
-	case FONT_DIM:
-		result.modifiers = {.Dim}
-	case FONT_RED:
-		result.foreground = term.Indexed_Color(1)
-	case FONT_GREEN:
-		result.foreground = term.Indexed_Color(2)
-	case FONT_CYAN:
-		result.foreground = term.Indexed_Color(6)
-	case FONT_YELLOW:
-		result.foreground = term.Indexed_Color(3)
-	case:
-	}
-	return result
-}
+// A packed color is an index plus one, so each field needs nine bits.
+FONT_FOREGROUND_SHIFT :: 8
+FONT_BACKGROUND_SHIFT :: 17
+FONT_COLOR_MASK :: 0x1ff
 
 // draw_menu renders the open choice list: the title, the last selection error
 // when there is one, and one line per choice with its detail column. The cursor
