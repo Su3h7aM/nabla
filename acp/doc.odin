@@ -21,12 +21,12 @@
 // destroy_envelope releases an Envelope, frame_strings_destroy releases the frames
 // frame_decoder_feed cloned, and frame_decoder_destroy releases the decoder.
 //
-// A Writer writes whole frames to one io.Writer, from whichever thread holds the
-// message: a turn publishes session updates while another thread answers requests,
-// and the mutex makes each frame whole. A write error latches and writer_failed
-// reports it, because a client that stopped reading will not read the next frame
-// either and there is nothing to retry. A refusal is a value instead: a frame or a
-// message a peer's answer cannot be built from is reported as Frame_Error or
-// Envelope_Error, with the sentence a client reads from frame_error_text or
-// envelope_error_text.
+// A Writer encodes each complete frame before transferring its owned bytes to an
+// unbounded FIFO. One writer thread owns the stream, so senders never wait for I/O
+// and frames keep queue order. A write error closes the writer; writer_failed reports
+// it and later sends fail. writer_destroy drains queued frames for the
+// caller's shutdown patience, then abandons a writer thread still blocked in I/O.
+// A refusal is a value instead: a frame or a message a peer's answer cannot be built
+// from is reported as Frame_Error or Envelope_Error, with the sentence a client reads
+// from frame_error_text or envelope_error_text.
 package acp

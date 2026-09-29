@@ -17,10 +17,10 @@ import "nabla:agent"
 import "nabla:agent/journal"
 
 // The ACP agent front-end: one process, one session, one prompt turn at a time,
-// speaking the Agent Client Protocol on the streams it was given. Two threads: the
-// reader answers what it can alone and hands session work to the worker, which owns the
-// session and writes everything a turn produces. The split exists because a client
-// cancels a turn by sending another message on the same stream.
+// speaking the Agent Client Protocol on the streams it was given. The reader answers
+// what it can alone and hands session work to the worker, which owns the session. Both
+// threads enqueue output for the writer thread because a client cancels a turn by
+// sending another message on the same stream.
 
 // ACP_WORK_CAPACITY bounds requests waiting for the worker. The reader admits one
 // session request at a time, so the queue holds the request being served and, briefly,
@@ -236,10 +236,9 @@ acp_work_id :: proc(id: acp.Jsonrpc_Id, allocator: mem.Allocator) -> (acp.Jsonrp
 	return id, true
 }
 
-// acp_server_destroy releases everything the server owns. It must run after the worker
-// has retired: a worker that ignored its stop still borrows the session, the workspace,
-// and the tool backends, and those are not handed back while it can reach them.
-acp_server_destroy :: proc(server: ^Acp_Server) {
+// acp_server_destroy releases everything the server owns after its worker retires. A
+// worker that ignores its stop still borrows the session, workspace, and tool backends.
+acp_server_destroy :: proc(server: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	// A turn still running is stopped before the worker is joined, so it settles as
 	// cancelled and the record says the session was interrupted.
 	if acp_server_has_work(server) { agent.turn_control_stop(&server.app.run.control) }
@@ -248,13 +247,13 @@ acp_server_destroy :: proc(server: ^Acp_Server) {
 		agent.owner_wake_signal()
 	}
 	if server.worker != nil {
-		if join_retiring(server.worker, "nabla-acp-worker") {
+		if join_retiring(server.worker, "nabla-acp-worker", patience) {
 			server.worker = nil
 		} else {
 			// The worker still owns the session and the log binding. Nothing below may
-			// run; the process exits with what that thread can reach.
+			// run or be freed; the process exits with what that thread can reach.
 			agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.teardown_abandoned"})
-			return
+			return false
 		}
 	}
 	for {
@@ -263,7 +262,10 @@ acp_server_destroy :: proc(server: ^Acp_Server) {
 		acp_work_destroy(&queued, server.alloc)
 	}
 	if server.work != {} { chan.destroy(&server.work) }
-	acp.writer_destroy(&server.writer)
+	if !acp.writer_destroy(&server.writer, patience) {
+		fields := [2]agent.Log_Field{{key = "thread", value = "nabla-acp-writer"}, {key = "waited_ms", value = agent.Log_Duration_Milliseconds(patience)}}
+		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.thread_unretired", fields = fields[:]})
+	}
 	sync.mutex_lock(&server.mu)
 	delete(server.session_id, server.alloc)
 	server.session_id = ""
@@ -275,10 +277,11 @@ acp_server_destroy :: proc(server: ^Acp_Server) {
 	snapshot_destroy(&server.app)
 	if server.app.setup.workers_abandoned || agent.chat_session_workers_outstanding(&server.app.setup.session) {
 		agent.log_emit(agent.Log_Record{level = .Warning, category = .Runtime, event = "runtime.workers_outstanding"})
-		return
+		return false
 	}
 	run_setup_destroy(&server.app.setup)
 	agent.MCP_Server_Configs_Destroy(&server.mcp_servers_owned, server.alloc)
+	return true
 }
 
 // --- the worker --------------------------------------------------------------

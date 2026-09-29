@@ -142,7 +142,7 @@ Acp_Connection :: struct {
 	member:        ^Subagent,
 	child:         Tool_Child,
 	started:       bool,
-	input:         Acp_Input,
+	input:         ^Acp_Input,
 	output:        ^os.File, // read end of the agent's stdout
 	errors:        ^os.File, // read end of the agent's stderr; nil once it ends
 	writer:        acp.Writer,
@@ -169,7 +169,7 @@ subagent_acp_run :: proc(member: ^Subagent) {
 	connection := Acp_Connection {
 		member = member,
 	}
-	defer acp_connection_close(&connection)
+	defer acp_connection_close(&connection, TOOL_JOBS_STOP_PATIENCE)
 	frames, frames_error := make([dynamic]string, allocator)
 	answer_buffer, answer_error := make([dynamic]u8, allocator)
 	tail, tail_error := make([dynamic]u8, allocator)
@@ -284,8 +284,14 @@ acp_prompt :: proc(connection: ^Acp_Connection, text: string) -> (stop_reason: s
 @(private, require_results)
 acp_connection_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	member := connection.member
-	input, input_ok := acp_input_open()
+	opened_input, input_ok := acp_input_open()
 	if !input_ok { return "the agent's input could not be created; nothing ran" }
+	input, input_error := new(Acp_Input, member.allocator)
+	if input_error != nil {
+		acp_input_close(&opened_input)
+		return "the agent's input could not be held; nothing ran"
+	}
+	input^ = opened_input
 	connection.input = input
 	output_read, output_write, output_error := os.pipe()
 	if output_error != nil { return "the agent's output pipe could not be created; nothing ran" }
@@ -315,7 +321,7 @@ acp_connection_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	_ = os.close(connection.input.theirs)
 	connection.input.theirs = nil
 
-	writer, writer_error := acp.writer_init(acp_input_writer(&connection.input), member.allocator)
+	writer, writer_error := acp.writer_init(acp_input_writer(connection.input), member.allocator)
 	decoder, decoder_error := acp.frame_decoder_init(allocator = member.allocator)
 	connection.writer = writer
 	connection.decoder = decoder
@@ -323,11 +329,10 @@ acp_connection_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	return ""
 }
 
-// acp_connection_close ends the agent: end of input first, then the process group, then what
-// the connection holds. The agent keeps its own session; nothing here waits for it to save.
+// acp_connection_close stops the child before draining the writer, so a blocked send sees its
+// peer close. The agent keeps its own session; nothing here waits for it to save.
 @(private)
-acp_connection_close :: proc(connection: ^Acp_Connection) {
-	acp_input_close(&connection.input)
+acp_connection_close :: proc(connection: ^Acp_Connection, patience: time.Duration) {
 	if connection.started {
 		tool_terminate_group(&connection.child)
 		tool_child_close(&connection.child)
@@ -335,7 +340,15 @@ acp_connection_close :: proc(connection: ^Acp_Connection) {
 	// The agent's pipes are abandoned here: its process is gone or going.
 	if connection.output != nil { _ = os.close(connection.output) }
 	if connection.errors != nil { _ = os.close(connection.errors) }
-	acp.writer_destroy(&connection.writer)
+	writer_retired := acp.writer_destroy(&connection.writer, patience)
+	if writer_retired {
+		if connection.input != nil {
+			acp_input_close(connection.input)
+			free(connection.input, connection.member.allocator)
+		}
+	} else {
+		// The writer may still dereference its transport state after a timed-out write.
+	}
 	for frame in connection.frames { delete(frame, connection.member.allocator) }
 	delete(connection.frames)
 	acp.frame_decoder_destroy(&connection.decoder)

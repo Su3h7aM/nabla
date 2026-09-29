@@ -231,6 +231,142 @@ acp_test_client_output :: proc(client: ^Acp_Test_Client) -> io.Writer {
 	return io.Writer{data = client, procedure = acp_test_client_stream}
 }
 
+Acp_Test_Stalled_Output :: struct {
+	mutex:   sync.Mutex,
+	cond:    sync.Cond,
+	entered: bool,
+	release: bool,
+	output:  [dynamic]u8,
+}
+
+acp_test_stalled_output :: proc(state: ^Acp_Test_Stalled_Output) -> io.Writer {
+	return io.Writer {
+		data = state,
+		procedure = proc(data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
+			state := cast(^Acp_Test_Stalled_Output)data
+			switch mode {
+			case .Write:
+				sync.mutex_lock(&state.mutex)
+				state.entered = true
+				sync.cond_broadcast(&state.cond)
+				for !state.release { sync.cond_wait(&state.cond, &state.mutex) }
+				append(&state.output, ..p)
+				sync.mutex_unlock(&state.mutex)
+				return i64(len(p)), nil
+			case .Query:
+				return i64(io.Stream_Mode_Set{.Write}), nil
+			case .Close, .Flush, .Destroy:
+				return 0, nil
+			case .Read, .Seek, .Read_At, .Write_At, .Size:
+				return 0, .Unsupported
+			}
+			return 0, .Unsupported
+		},
+	}
+}
+
+acp_test_writer_cleanup :: proc(writer: ^acp.Writer) {
+	_ = acp.writer_destroy(writer, time.Second)
+}
+
+acp_test_stalled_output_wait :: proc(t: ^testing.T, state: ^Acp_Test_Stalled_Output) {
+	sync.mutex_lock(&state.mutex)
+	deadline := time.tick_add(time.tick_now(), time.Second)
+	for !state.entered {
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 { break }
+		_ = sync.cond_wait_with_timeout(&state.cond, &state.mutex, remaining)
+	}
+	entered := state.entered
+	sync.mutex_unlock(&state.mutex)
+	testing.expect(t, entered, "the writer did not enter its blocked output call")
+}
+
+Acp_Test_Cancel_Run :: struct {
+	server:   ^Acp_Server,
+	envelope: acp.Envelope,
+	mutex:    sync.Mutex,
+	cond:     sync.Cond,
+	done:     bool,
+}
+
+acp_test_cancel_request :: proc(thread_handle: ^thread.Thread) {
+	run := cast(^Acp_Test_Cancel_Run)thread_handle.data
+	acp_request_cancel(run.server, &run.envelope)
+	sync.mutex_lock(&run.mutex)
+	run.done = true
+	sync.cond_broadcast(&run.cond)
+	sync.mutex_unlock(&run.mutex)
+}
+
+@(test)
+test_acp_cancel_request_returns_while_stdout_is_stalled :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	state: Acp_Test_Stalled_Output
+	output, output_error := make([dynamic]u8, 0, 0, context.allocator)
+	if output_error != nil { testing.fail_now(t, "the test output buffer could not be created") }
+	state.output = output
+	defer delete(state.output)
+	server: Acp_Server
+	server.alloc = context.allocator
+	server.session_id = "session-stalled"
+	sync.atomic_store(&server.busy, true)
+	writer, writer_error := acp.writer_init(acp_test_stalled_output(&state), server.alloc)
+	if writer_error != nil { testing.fail_now(t, "the writer could not be created") }
+	server.writer = writer
+	defer acp_test_writer_cleanup(&server.writer)
+	defer {
+		sync.mutex_lock(&state.mutex)
+		state.release = true
+		sync.cond_broadcast(&state.cond)
+		sync.mutex_unlock(&state.mutex)
+	}
+
+	testing.expect(
+		t,
+		acp.writer_write_notification(
+			&server.writer,
+			"session/update",
+			acp.Session_Notification(acp.Session_Info_Update) {
+				session_id = "session-stalled",
+				update = acp.Session_Info_Update{session_update = acp.UPDATE_SESSION_INFO, title = "stall"},
+			},
+		),
+	)
+	acp_test_stalled_output_wait(t, &state)
+
+	params, parse_error := json.parse_string(`{"sessionId":"session-stalled"}`, .JSON, true, context.allocator)
+	if parse_error != nil { testing.fail_now(t, "the cancellation parameters could not be parsed") }
+	defer json.destroy_value(params, context.allocator)
+	run := Acp_Test_Cancel_Run {
+		server = &server,
+		envelope = acp.Envelope{kind = .Request, id = i64(1), params = params},
+	}
+	cancel_thread := thread.create(acp_test_cancel_request, name = "nabla-test-acp-cancel")
+	if cancel_thread == nil { testing.fail_now(t, "the cancellation thread could not be created") }
+	cancel_thread.data = &run
+	thread.start(cancel_thread)
+	sync.mutex_lock(&run.mutex)
+	deadline := time.tick_add(time.tick_now(), 200 * time.Millisecond)
+	for !run.done {
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 { break }
+		_ = sync.cond_wait_with_timeout(&run.cond, &run.mutex, remaining)
+	}
+	completed_while_stalled := run.done
+	sync.mutex_unlock(&run.mutex)
+
+	sync.mutex_lock(&state.mutex)
+	state.release = true
+	sync.cond_broadcast(&state.cond)
+	sync.mutex_unlock(&state.mutex)
+	thread.join(cancel_thread)
+	thread.destroy(cancel_thread)
+	testing.expect(t, completed_while_stalled, "the cancellation handler waited for stdout")
+	testing.expect(t, agent.turn_control_stop_requested(&server.app.run.control), "the cancellation did not stop the turn")
+	testing.expect(t, acp.writer_destroy(&server.writer, time.Second), "the released writer should retire")
+}
+
 // acp_test_client_stream serves both ends of the client: a read takes the next message the
 // test wrote, and a write appends what the run produced.
 acp_test_client_stream :: proc(data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {

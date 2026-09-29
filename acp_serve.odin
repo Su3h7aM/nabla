@@ -1097,8 +1097,9 @@ acp_run :: proc(
 ) -> bool {
 	server, server_error := new(Acp_Server)
 	if server_error != nil { return false }
-	defer free(server)
 	server.alloc = context.allocator
+	server_cleanup_managed := false
+	defer if !server_cleanup_managed { free(server, server.alloc) }
 	server.app.run.alloc = server.alloc
 	server.app.setup.alloc = server.alloc
 	server.app.setup.harness_options = harness_options
@@ -1111,7 +1112,11 @@ acp_run :: proc(
 	context.logger = run_log_open(&server.app.setup)
 	run_log_header(&server.app.setup)
 	if !run_catalog(sources, mcp_servers, &server.app.setup, Session_Start{kind = .New}) { return false }
-	defer acp_server_destroy(server)
+	server_cleanup_managed = true
+	defer {
+		// An unretired worker can still reach server, so its owner memory stays alive.
+		if acp_server_destroy(server) { free(server, server.alloc) }
+	}
 
 	writer, writer_err := acp.writer_init(output, server.alloc)
 	if writer_err != nil {
