@@ -76,10 +76,8 @@ test_anthropic_encode_request_shape :: proc(t: ^testing.T) {
 	testing.expect_value(t, bound, i64(1024))
 	mode, mode_ok := object["stream"].(json.Boolean)
 	testing.expect(t, mode_ok && bool(mode))
-	cache, cache_ok := object["cache_control"].(json.Object)
-	testing.expect(t, cache_ok)
-	cache_type, _, _ := openai_value_string(cache, "type")
-	testing.expect_value(t, cache_type, "ephemeral")
+	_, top_level_cache := object["cache_control"]
+	testing.expect(t, !top_level_cache, "the breakpoint is on a block, where a gateway's own marker cannot conflict with it")
 
 	messages, messages_ok := object["messages"].(json.Array)
 	if !testing.expect(t, messages_ok) { return }
@@ -103,6 +101,8 @@ test_anthropic_encode_request_shape :: proc(t: ^testing.T) {
 	if !testing.expect(t, block_ok) { return }
 	block_type, _, _ := openai_value_string(block, "type")
 	testing.expect_value(t, block_type, "tool_use")
+	_, call_cached := block["cache_control"]
+	testing.expect(t, !call_cached, "only the last block is a breakpoint")
 	name, _, _ := openai_value_string(block, "name")
 	testing.expect_value(t, name, "shell")
 	input, input_ok := block["input"].(json.Object)
@@ -123,6 +123,13 @@ test_anthropic_encode_request_shape :: proc(t: ^testing.T) {
 	testing.expect_value(t, block_type, "tool_result")
 	tool_use_id, _, _ := openai_value_string(result_block, "tool_use_id")
 	testing.expect_value(t, tool_use_id, "toolu_1")
+	cache, cache_ok := result_block["cache_control"].(json.Object)
+	if testing.expect(t, cache_ok, "the last block is the breakpoint") {
+		cache_type, _, _ := openai_value_string(cache, "type")
+		testing.expect_value(t, cache_type, "ephemeral")
+		_, has_ttl := cache["ttl"]
+		testing.expect(t, !has_ttl, "the lifetime is left to the API or a gateway on the way")
+	}
 
 	tools, tools_ok := object["tools"].(json.Array)
 	if !testing.expect(t, tools_ok && len(tools) == 1) { return }
@@ -146,13 +153,31 @@ test_anthropic_encode_omits_cache_when_not_requested :: proc(t: ^testing.T) {
 	request.Cache_Request = false
 	body, err := Provider_Encode_Request(request, context.temp_allocator)
 	testing.expect_value(t, err, Provider_Request_Error.None)
+	testing.expect(t, !strings.contains(body, "cache_control"), "a one-off request must not pay for a cache write")
+}
+
+@(test)
+test_anthropic_encode_marks_a_single_text_turn :: proc(t: ^testing.T) {
+	request := anthropic_test_request()
+	request.Messages = request.Messages[:1]
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	testing.expect_value(t, err, Provider_Request_Error.None)
 	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
 	testing.expect_value(t, parse_err, nil)
 	defer json.destroy_value(value, context.temp_allocator)
 	object, object_ok := value.(json.Object)
 	if !testing.expect(t, object_ok) { return }
-	_, present := object["cache_control"]
-	testing.expect(t, !present, "a one-off request must not pay for a cache write")
+	messages, messages_ok := object["messages"].(json.Array)
+	if !testing.expect(t, messages_ok && len(messages) == 1) { return }
+	turn, turn_ok := messages[0].(json.Object)
+	if !testing.expect(t, turn_ok) { return }
+	// The plain string form has no place for a breakpoint, so the turn is written as its block.
+	blocks, blocks_ok := turn["content"].(json.Array)
+	if !testing.expect(t, blocks_ok && len(blocks) == 1) { return }
+	block, block_ok := blocks[0].(json.Object)
+	if !testing.expect(t, block_ok) { return }
+	_, cached := block["cache_control"]
+	testing.expect(t, cached)
 }
 
 @(test)

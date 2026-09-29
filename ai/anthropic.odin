@@ -55,20 +55,12 @@ anthropic_encode_request :: proc(
 	// writes the same bytes in any process.
 	first := true
 	encode_write_raw(&cursor, body, "{")
-	if request.Cache_Request_Present && request.Cache_Request {
-		// Top-level cache control marks the last cacheable block and advances as
-		// the conversation grows, so an append-only history reuses its whole
-		// prefix without the harness naming a breakpoint.
-		encode_write_field(&cursor, body, &first, "cache_control")
-		encode_write_raw(&cursor, body, "{\"type\":")
-		encode_write_literal_string(&cursor, body, "ephemeral")
-		encode_write_raw(&cursor, body, "}")
-	}
 	encode_write_field(&cursor, body, &first, "max_tokens")
 	encode_write_int(&cursor, body, request.Max_Output_Tokens)
 	encode_write_field(&cursor, body, &first, "messages")
 	encode_write_raw(&cursor, body, "[")
-	if messages_err := anthropic_write_messages(&cursor, body, request.Messages, allocator); messages_err != .None {
+	cached := request.Cache_Request_Present && request.Cache_Request
+	if messages_err := anthropic_write_messages(&cursor, body, request.Messages, cached, allocator); messages_err != .None {
 		encode_finish(&cursor)
 		if cursor.error != .None { return "", cursor.error }
 		return "", messages_err
@@ -118,13 +110,30 @@ anthropic_encode_request :: proc(
 // into the open user turn until something that is not user content ends it. A
 // turn that ends up holding exactly one text block is emitted in the plain
 // string form, so an ordinary conversation encodes to the bytes it always has.
+//
+// When cached is set, the last block of the last turn carries the cache breakpoint, so an
+// append-only history reuses its whole prefix as the conversation grows. The breakpoint is
+// written on the block rather than as the top-level field because the API refuses a
+// top-level field whose lifetime differs from a marker already on that block, and not every
+// endpoint of this API accepts the top-level field. A marker on the block is accepted by every
+// endpoint and states no lifetime, so the endpoint's default applies.
 @(private, require_results)
 anthropic_write_messages :: proc(
 	cursor: ^Encode_Cursor,
 	body: ^strings.Builder,
 	messages: []Provider_Message,
+	cached: bool,
 	allocator: mem.Allocator,
 ) -> Provider_Request_Error {
+	// The last message that is written as a turn of its own; an open user turn written
+	// after the loop is always the last one.
+	last_written := -1
+	#reverse for message, index in messages {
+		if message.Role == .Assistant || message.Role == .Tool || (message.Role == .User && message.Content != "") {
+			last_written = index
+			break
+		}
+	}
 	item_first := true
 	// The open user turn: the text and tool results the messages in it carry, and
 	// whether exactly one text block is among them. The turn is written when a message
@@ -151,7 +160,7 @@ anthropic_write_messages :: proc(
 			open_blocks += 1
 		case .Assistant:
 			if open_blocks > 0 {
-				if err := anthropic_write_user_turn(cursor, body, messages[open:index], open_blocks, open_texts, &item_first); err != .None {
+				if err := anthropic_write_user_turn(cursor, body, messages[open:index], open_blocks, open_texts, false, &item_first); err != .None {
 					return err
 				}
 				turns += 1
@@ -166,22 +175,25 @@ anthropic_write_messages :: proc(
 			// the API would refuse.
 			role := "assistant"
 			if turns == 0 && len(message.Tool_Calls) == 0 { role = "user" }
+			// An empty text block is refused, so a turn with nothing in it carries no breakpoint.
+			marked := cached && index == last_written && (message.Content != "" || len(message.Tool_Calls) > 0)
 			encode_write_item(cursor, body, &item_first)
 			field_first := true
 			encode_write_raw(cursor, body, "{")
 			encode_write_field(cursor, body, &field_first, "content")
-			if len(message.Tool_Calls) == 0 {
+			if len(message.Tool_Calls) == 0 && !marked {
 				encode_write_text(cursor, body, message.Content)
 			} else {
 				encode_write_raw(cursor, body, "[")
 				block_first := true
 				if message.Content != "" {
 					encode_write_item(cursor, body, &block_first)
-					anthropic_write_text_block(cursor, body, message.Content)
+					anthropic_write_text_block(cursor, body, message.Content, marked && len(message.Tool_Calls) == 0)
 				}
-				for call in message.Tool_Calls {
+				for call, call_index in message.Tool_Calls {
 					encode_write_item(cursor, body, &block_first)
-					if err := anthropic_write_tool_use(cursor, body, call, allocator); err != .None { return err }
+					call_marked := marked && call_index == len(message.Tool_Calls) - 1
+					if err := anthropic_write_tool_use(cursor, body, call, call_marked, allocator); err != .None { return err }
 				}
 				encode_write_raw(cursor, body, "]")
 			}
@@ -194,14 +206,15 @@ anthropic_write_messages :: proc(
 		}
 	}
 	if open_blocks > 0 {
-		if err := anthropic_write_user_turn(cursor, body, messages[open:], open_blocks, open_texts, &item_first); err != .None { return err }
+		if err := anthropic_write_user_turn(cursor, body, messages[open:], open_blocks, open_texts, cached, &item_first); err != .None { return err }
 	}
 	return .None
 }
 
 // anthropic_write_user_turn writes the open user turn. One text block goes out as the
 // plain string this API has always accepted for a text turn; anything else is written as
-// the blocks it carries, in the order the conversation hands them over.
+// the blocks it carries, in the order the conversation hands them over. A marked turn
+// carries the cache breakpoint on its last block, which needs the block form.
 @(private, require_results)
 anthropic_write_user_turn :: proc(
 	cursor: ^Encode_Cursor,
@@ -209,13 +222,14 @@ anthropic_write_user_turn :: proc(
 	turn: []Provider_Message,
 	blocks: int,
 	texts: int,
+	marked: bool,
 	item_first: ^bool,
 ) -> Provider_Request_Error {
 	encode_write_item(cursor, body, item_first)
 	field_first := true
 	encode_write_raw(cursor, body, "{")
 	encode_write_field(cursor, body, &field_first, "content")
-	if blocks == 1 && texts == 1 {
+	if blocks == 1 && texts == 1 && !marked {
 		for message in turn {
 			if message.Role != .User || message.Content == "" { continue }
 			encode_write_text(cursor, body, message.Content)
@@ -224,15 +238,18 @@ anthropic_write_user_turn :: proc(
 	} else {
 		encode_write_raw(cursor, body, "[")
 		block_first := true
+		written := 0
 		for message in turn {
 			switch message.Role {
 			case .User:
 				if message.Content == "" { continue }
+				written += 1
 				encode_write_item(cursor, body, &block_first)
-				anthropic_write_text_block(cursor, body, message.Content)
+				anthropic_write_text_block(cursor, body, message.Content, marked && written == blocks)
 			case .Tool:
+				written += 1
 				encode_write_item(cursor, body, &block_first)
-				if err := anthropic_write_tool_result(cursor, body, message); err != .None { return err }
+				if err := anthropic_write_tool_result(cursor, body, message, marked && written == blocks); err != .None { return err }
 			case .System, .Reasoning, .Assistant, .Invalid:
 				continue
 			}
@@ -245,10 +262,21 @@ anthropic_write_user_turn :: proc(
 	return .None
 }
 
+// anthropic_write_cache_control writes the breakpoint field of a block. It states no
+// lifetime, so the API's default applies unless a gateway on the way sets its own.
 @(private)
-anthropic_write_text_block :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: string) {
+anthropic_write_cache_control :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, field_first: ^bool) {
+	encode_write_field(cursor, body, field_first, "cache_control")
+	encode_write_raw(cursor, body, "{\"type\":")
+	encode_write_literal_string(cursor, body, "ephemeral")
+	encode_write_raw(cursor, body, "}")
+}
+
+@(private)
+anthropic_write_text_block :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: string, marked: bool) {
 	field_first := true
 	encode_write_raw(cursor, body, "{")
+	if marked { anthropic_write_cache_control(cursor, body, &field_first) }
 	encode_write_field(cursor, body, &field_first, "text")
 	encode_write_text(cursor, body, text)
 	encode_write_field(cursor, body, &field_first, "type")
@@ -265,11 +293,13 @@ anthropic_write_tool_use :: proc(
 	cursor: ^Encode_Cursor,
 	body: ^strings.Builder,
 	call: Provider_Tool_Call,
+	marked: bool,
 	allocator: mem.Allocator,
 ) -> Provider_Request_Error {
 	if call.ID == "" || call.Name == "" { return .Invalid_Tool_Call }
 	field_first := true
 	encode_write_raw(cursor, body, "{")
+	if marked { anthropic_write_cache_control(cursor, body, &field_first) }
 	encode_write_field(cursor, body, &field_first, "id")
 	encode_write_text(cursor, body, call.ID)
 	encode_write_field(cursor, body, &field_first, "input")
@@ -286,10 +316,11 @@ anthropic_write_tool_use :: proc(
 }
 
 @(private, require_results)
-anthropic_write_tool_result :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, message: Provider_Message) -> Provider_Request_Error {
+anthropic_write_tool_result :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, message: Provider_Message, marked: bool) -> Provider_Request_Error {
 	if message.Tool_Call_ID == "" { return .Invalid_Message }
 	field_first := true
 	encode_write_raw(cursor, body, "{")
+	if marked { anthropic_write_cache_control(cursor, body, &field_first) }
 	encode_write_field(cursor, body, &field_first, "content")
 	encode_write_text(cursor, body, message.Content)
 	if message.Tool_Is_Error {

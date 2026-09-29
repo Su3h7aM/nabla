@@ -232,8 +232,6 @@ test_anthropic_request_is_shaped_by_its_adapter :: proc(test: ^testing.T) {
 	if !testing.expect(test, object_ok) { return }
 	testing.expect_value(test, item_string(object, "system"), AGENT_SYSTEM_PROMPT)
 	if bound, present, valid := bound_of(object, "max_tokens"); testing.expect(test, valid && present) { testing.expect_value(test, bound, i64(1024)) }
-	_, cached := object["cache_control"]
-	testing.expect(test, cached)
 	messages, messages_ok := object["messages"].(json.Array)
 	if !testing.expect(test, messages_ok) || !testing.expect_value(test, len(messages), 3) { return }
 	call_turn := item_object(test, messages, 1)
@@ -249,6 +247,8 @@ test_anthropic_request_is_shaped_by_its_adapter :: proc(test: ^testing.T) {
 	result_block := item_object(test, result_blocks, 0)
 	testing.expect_value(test, item_string(result_block, "type"), "tool_result")
 	testing.expect_value(test, item_string(result_block, "tool_use_id"), "toolu_1")
+	_, cached := result_block["cache_control"]
+	testing.expect(test, cached, "the last block carries the conversation's cache breakpoint")
 }
 
 @(test)
@@ -335,6 +335,8 @@ test_a_request_rebuilds_identically_and_only_appends :: proc(test: ^testing.T) {
 		grown := encode_request_body(test, chat, connection)
 		before := encoded_items(test, first)
 		after := encoded_items(test, grown)
+		// The cache breakpoint sits on the last block and moves forward as the conversation
+		// grows. It is not content, so the items are compared without it.
 		if testing.expectf(test, len(after) > len(before), "request did not grow for %v", connection.API) {
 			for item, index in before { if !testing.expectf(test, after[index] == item, "item %d changed for %v", index, connection.API) { break } }
 		}
@@ -356,7 +358,20 @@ encoded_items :: proc(test: ^testing.T, body: string) -> []string {
 	if !array_ok { array, array_ok = object["messages"].(json.Array) }
 	if !testing.expect(test, array_ok) { return nil }
 	items := make([]string, len(array), context.temp_allocator)
-	for item, index in array {
+	for &item, index in array {
+		if message, message_ok := &item.(json.Object); message_ok {
+			if blocks, blocks_ok := message["content"].(json.Array); blocks_ok {
+				for &block in blocks {
+					if fields, fields_ok := &block.(json.Object); fields_ok { delete_key(fields, "cache_control") }
+				}
+				// A single text block is the string form the turn takes when it is not the breakpoint.
+				if len(blocks) == 1 {
+					if fields, fields_ok := blocks[0].(json.Object); fields_ok && len(fields) == 2 {
+						if text, text_ok := fields["text"].(json.String); text_ok { message["content"] = text }
+					}
+				}
+			}
+		}
 		text, unparse_error := json.unparse(item, {sort_maps_by_key = true}, context.temp_allocator)
 		if !testing.expect_value(test, unparse_error, nil) { return nil }
 		items[index] = text
