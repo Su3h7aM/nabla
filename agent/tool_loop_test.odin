@@ -10,6 +10,7 @@ import "core:time"
 
 import "nabla:agent/journal"
 import "nabla:ai"
+import "nabla:db"
 
 // item_object and item_string read the encoded request body the way a provider
 // would: by item type, role, and field. They exist so a test can assert wire
@@ -39,6 +40,19 @@ tool_loop_workspace :: proc(test: ^testing.T) -> string {
 	testing.expect(test, workspace_error == nil)
 	testing.expect(test, workspace != "")
 	return workspace
+}
+
+@(private)
+tool_loop_busy_lock :: proc(test: ^testing.T, fixture: ^Chat_Test, holder: ^journal.Journal) {
+	if open_error := journal.open(holder, fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write); open_error != nil {
+		testing.fail_now(test, "the busy-lock journal could not be opened")
+	}
+	if timeout_error := db.exec(&fixture.store.connection, "PRAGMA busy_timeout = 0"); timeout_error != nil {
+		testing.fail_now(test, "the chat journal timeout could not be set")
+	}
+	if lock_error := db.exec(&holder.connection, "BEGIN IMMEDIATE"); lock_error != nil {
+		testing.fail_now(test, "the busy lock could not be acquired")
+	}
 }
 
 @(test)
@@ -515,6 +529,102 @@ test_a_recovered_call_reaches_the_model_answered :: proc(test: ^testing.T) {
 	}
 	testing.expect_value(test, calls_opened, 1)
 	testing.expect(test, answered, "the recovered call must reach the model with a result")
+}
+
+// A prompt whose barrier meets another writer is finalized into the same pending batch.
+// The user gets the busy failure, then a later prompt can commit that batch and continue.
+@(test)
+test_busy_prompt_is_finalized_and_the_next_prompt_is_accepted :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	_test_commit(test, chat)
+
+	holder: journal.Journal
+	defer _ = journal.close(&holder)
+	tool_loop_busy_lock(test, &fixture, &holder)
+
+	accepted := chat_session_accept_user(chat, "first prompt")
+	testing.expect_value(test, accepted, Chat_Accept.Storage_Failed)
+	testing.expect_value(test, chat.state, Chat_State.Idle)
+	testing.expect_value(test, chat.turn, journal.Turn_Id(0))
+	testing.expect(test, !chat.storage_failed, "a busy commit does not latch the session")
+	message := chat_session_last_error(chat)
+	testing.expect(test, strings.contains(message, "prompt was not answered because the session store was busy"))
+	testing.expect(test, strings.contains(message, "next successful write"))
+
+	if rollback_error := db.rollback(&holder.connection); rollback_error != nil {
+		testing.fail_now(test, "the busy lock could not be released")
+	}
+	accepted = chat_session_accept_user(chat, "second prompt")
+	testing.expect_value(test, accepted, Chat_Accept.Accepted)
+
+	records := _test_records(test, chat, {.Turn_Started, .Turn_Completed})
+	starts, completions := 0, 0
+	for record in records {
+		if record.kind == .Turn_Started { starts += 1 }
+		if record.kind == .Turn_Completed { completions += 1 }
+	}
+	testing.expect_value(test, starts, 2)
+	testing.expect_value(test, completions, 1)
+}
+
+// A response commit that times out while busy leaves its proposals pending. The next live
+// turn runs journal recovery, refreshes the head, and projects a result for each call.
+@(test)
+test_live_recovery_answers_calls_before_the_next_prompt :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(test, chat, "run the tool")
+	_test_begin_request(test, chat)
+	request := journal.next_request(chat.store)
+	chat.request = request
+
+	calls := []ai.Provider_Tool_Call{{ID = "call_1", Name = TOOL_SHELL_NAME, Arguments = `{"command":"echo hi"}`}}
+	notice, feed_error := chat_session_feed_tool_calls(chat, chat_session_event_source(chat), calls)
+	if feed_error != nil { testing.fail_now(test, "the tool call could not be staged") }
+	testing.expect_value(test, notice, Chat_Notice.None)
+
+	usages: [dynamic]Chat_Request_Usage
+	usages.allocator = chat.allocator
+	defer delete(usages)
+	holder: journal.Journal
+	defer _ = journal.close(&holder)
+	tool_loop_busy_lock(test, &fixture, &holder)
+	testing.expect(test, !chat_commit_response_nodes(chat, request, 1, .Tool_Call, &usages), "the response commit should hit the writer lock")
+	testing.expect(test, chat.recovery_pending, "a busy response commit schedules live recovery")
+	testing.expect(test, !chat.storage_failed, "a busy response commit does not latch the session")
+	chat_session_retire_operation(chat)
+	if rollback_error := db.rollback(&holder.connection); rollback_error != nil {
+		testing.fail_now(test, "the busy lock could not be released")
+	}
+	finish := _test_settle(test, chat)
+	testing.expect_value(test, finish.status, Chat_Terminal_Status.Failed)
+
+	accepted := chat_session_accept_user(chat, "continue")
+	testing.expect_value(test, accepted, Chat_Accept.Accepted)
+	testing.expect(test, !chat.recovery_pending, "successful recovery clears the pending flag")
+
+	arena: virtual.Arena
+	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
+	defer virtual.arena_destroy(&arena)
+	projection := _test_projection(test, chat, &arena)
+	found_result := false
+	found_prompt := false
+	for item in projection.items {
+		if result, is_result := item.payload.(Projected_Result); is_result {
+			found_result = true
+			testing.expect_value(test, result.outcome, journal.Tool_Outcome.Not_Executed)
+			testing.expect(test, strings.contains(result.content, "did not run"))
+		}
+		if user, is_user := item.payload.(Projected_User); is_user && user.text == "continue" { found_prompt = true }
+	}
+	testing.expect(test, found_result, "the recovered proposal must have a Results entry")
+	testing.expect(test, found_prompt, "the new prompt follows the recovered Results node")
 }
 
 @(test)

@@ -219,7 +219,10 @@ chat_commit_response_nodes :: proc(
 	}
 	// The harness's explanation of an unusable response follows the response it explains.
 	if notice_text != "" { chat_node(chat, .Notice, journal.Notice{}, transmute([]u8)notice_text) }
-	if !chat_commit(chat, "the response could not be recorded") { return false }
+	if !chat_commit(chat, "the response could not be recorded") {
+		if !chat.storage_failed { chat.recovery_pending = true }
+		return false
+	}
 
 	chat_pending_response_clear(chat)
 	chat_partial_assistant_clear(chat)

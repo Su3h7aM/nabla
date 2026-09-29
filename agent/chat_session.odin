@@ -119,6 +119,9 @@ Chat_Session :: struct {
 	// could not record its own history accepts no further work: continuing would
 	// let the conversation diverge from what was stored.
 	storage_failed:               bool,
+	// recovery_pending marks a response commit that timed out while busy. Recovery
+	// closes its proposed calls before the next turn projects the history.
+	recovery_pending:             bool,
 
 	// abandoned_jobs are tool jobs whose workers ignored their stop. The session keeps
 	// working; each job is released once its worker publishes, and until then nothing the
@@ -593,6 +596,7 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 	previous_logger := context.logger
 	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation(chat))
+	if !chat_session_recover_pending(chat) { return .Storage_Failed }
 
 	// A new session is created by its first prompt, so a session nobody prompted is
 	// never recorded.
@@ -642,7 +646,22 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 	chat_record(chat, {kind = .Turn_Started, provider = chat.provider_id, model = chat.model_id}, started)
 	chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin]}, transmute([]u8)text)
 	if !chat_commit(chat, "the prompt could not be recorded") {
-		chat.turn = 0
+		busy_failure := !chat.storage_failed
+		pending_message := "the prompt was not answered because the session store was busy; its records will be saved with the next successful write"
+		if busy_failure { chat_last_error_set(chat, pending_message) }
+		finish := chat_session_advance(chat)
+		assert(finish.kind == .Turn_Finished, "a rejected prompt must have a terminal effect")
+		assert(chat_session_claim_finish(chat, finish), "a rejected prompt must claim its terminal effect")
+		recorded := chat_persist_turn_end(chat, finish)
+		if busy_failure && !chat.storage_failed {
+			if recorded {
+				chat_last_error_set(chat, "the prompt was not answered because the session store was busy; its records were saved with the next write")
+			} else {
+				chat_last_error_set(chat, pending_message)
+			}
+		}
+		chat.state = .Idle
+		chat.active_failed = false
 		return .Storage_Failed
 	}
 
@@ -676,6 +695,32 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 	binding.correlation = log_correlation(chat)
 	log_emit({level = .Info, category = .Agent, event = "turn.started", fields = fields[:]})
 	return .Accepted
+}
+
+// chat_session_recover_pending repairs a response whose commit timed out while busy,
+// then positions the live session at the recovered branch head. On failure it leaves the
+// repair pending; a busy journal remains usable and a later prompt can try again.
+@(private, require_results)
+chat_session_recover_pending :: proc(chat: ^Chat_Session) -> bool {
+	if !chat.recovery_pending { return true }
+	_, recover_error := journal.recover(chat.store)
+	if recover_error != nil {
+		chat_session_record_failure(chat, "the previous turn could not be recovered", recover_error)
+		chat.state = .Idle
+		chat.active_failed = false
+		return false
+	}
+	branch, head, head_error := journal.session_head(chat.store, chat.session)
+	if head_error != nil {
+		chat_session_record_failure(chat, "the recovered session history could not be read", head_error)
+		chat.state = .Idle
+		chat.active_failed = false
+		return false
+	}
+	chat.branch = branch
+	chat.head = head
+	chat.recovery_pending = false
+	return true
 }
 
 chat_session_state :: proc(chat: ^Chat_Session) -> Chat_State { return chat.state }
