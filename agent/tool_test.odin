@@ -123,11 +123,14 @@ test_admission_rejects_structural_defects :: proc(test: ^testing.T) {
 }
 
 @(test)
-test_admission_bounds_nesting :: proc(test: ^testing.T) {
-	arguments := tool_arguments_prepare(strings.repeat(`{"a":`, TOOL_MAX_ARGS_DEPTH + 1, context.temp_allocator), context.allocator)
+test_admission_accepts_deep_nesting :: proc(test: ^testing.T) {
+	depth :: 64
+	opening := strings.repeat(`{"a":`, depth, context.temp_allocator)
+	closing := strings.repeat("}", depth, context.temp_allocator)
+	raw := strings.concatenate({opening, "null", closing}, context.temp_allocator)
+	arguments := tool_arguments_prepare(raw, context.allocator)
 	defer tool_arguments_destroy(&arguments, context.allocator)
-	testing.expect_value(test, arguments.status, Tool_Arguments_Status.Rejected)
-	testing.expect_value(test, tool_test_defect(arguments.error).kind, Tool_Argument_Error_Kind.Too_Deep)
+	testing.expect_value(test, arguments.status, Tool_Arguments_Status.Valid)
 }
 
 // A document is repaired only where it has one reading, and the repaired document is read
@@ -298,6 +301,18 @@ test_shell_refuses_arguments_before_dispatch :: proc(test: ^testing.T) {
 }
 
 @(test)
+test_read_reports_repairs_when_later_argument_is_refused :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+
+	result := tool_run(test, &tool_test, TOOL_READ_NAME, `{"path":"x","offset":"2","limit":0}`)
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Invalid_Arguments)
+	testing.expect(test, strings.contains(result.content, `field "limit" must be an integer between`), "the refusal names the invalid limit")
+	testing.expect(test, strings.contains(result.content, "repaired: integer_from_string"), "the result reports the repair made before refusal")
+}
+
+@(test)
 test_read_reports_the_lines_it_returned :: proc(test: ^testing.T) {
 	tool_test: Tool_Test
 	tool_test_begin(test, &tool_test)
@@ -399,6 +414,69 @@ test_patch_applies_every_file_or_none :: proc(test: ^testing.T) {
 	testing.expect_value(test, failed.outcome, journal.Tool_Outcome.Tool_Failed)
 	tool_file_is(test, code, "same\nsame\n")
 	testing.expect(test, !os.exists(later), "a failed patch adds no file")
+}
+
+@(test)
+test_patch_add_refuses_a_dangling_symlink :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+
+	workspace := tool_test_workspace(&tool_test)
+	dangling := strings.concatenate({workspace, "/dangling.txt"}, context.temp_allocator)
+	defer delete(dangling, context.temp_allocator)
+	if symlink_error := os.symlink("missing-target", dangling); symlink_error != nil {
+		testing.fail_now(test, "could not create a dangling symlink")
+	}
+
+	patch := `{"patch":"*** Begin Patch\n*** Add File: dangling.txt\n+new\n*** End Patch"}`
+	result := tool_run(test, &tool_test, TOOL_PATCH_NAME, patch)
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Tool_Failed)
+	testing.expect(test, strings.contains(result.content, "dangling.txt already exists"), "the model is told the path already exists")
+
+	info, info_error := os.lstat(dangling, context.temp_allocator)
+	if info_error == nil { defer os.file_info_delete(info, context.temp_allocator) }
+	testing.expect(test, info_error == nil && info.type == .Symlink, "the dangling symlink remains in place")
+}
+
+@(test)
+test_patch_move_reports_destination_when_source_removal_fails :: proc(test: ^testing.T) {
+	// Root can unlink from a read-only directory, so the partial failure is unreliable there.
+	if os.get_euid() == 0 { return }
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+
+	workspace := tool_test_workspace(&tool_test)
+	source_directory := strings.concatenate({workspace, "/source"}, context.temp_allocator)
+	source := strings.concatenate({source_directory, "/moving.txt"}, context.temp_allocator)
+	destination := strings.concatenate({workspace, "/moved.txt"}, context.temp_allocator)
+	if directory_error := os.make_directory(source_directory); directory_error != nil {
+		testing.fail_now(test, "could not create a source directory")
+	}
+	if !tool_write_file(test, source, "old\n") { return }
+	if chmod_error := os.chmod(source_directory, {.Read_User, .Execute_User}); chmod_error != nil {
+		testing.fail_now(test, "could not make the source directory read-only")
+	}
+
+	patch := `{"patch":"*** Begin Patch\n*** Update File: source/moving.txt\n*** Move to: moved.txt\n@@\n-old\n+new\n*** End Patch"}`
+	result := tool_run(test, &tool_test, TOOL_PATCH_NAME, patch)
+	restore_error := os.chmod(source_directory, os.Permissions_Default_Directory)
+	if !testing.expect(test, restore_error == nil, "the source directory permissions are restored") { return }
+
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Tool_Failed)
+	testing.expect(
+		test,
+		strings.contains(result.content, fmt.tprintf("wrote destination %s but could not remove source %s", destination, source)),
+		"the result reports the written destination and failed source removal",
+	)
+	testing.expect(
+		test,
+		strings.contains(result.content, fmt.tprintf("wrote %s; could not remove source %s", destination, source)),
+		"the changed-file list reports the partial move",
+	)
+	tool_file_is(test, destination, "new\n")
+	tool_file_is(test, source, "old\n")
 }
 
 @(test)

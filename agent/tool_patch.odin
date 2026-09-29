@@ -97,14 +97,28 @@ tool_patch_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	if prepare_error != nil { return patch_failure_result(ctx, prepare_error) }
 
 	for change, index in changes {
-		write_error, cancelled := patch_write(change, ctx.control, scratch)
+		write_error, cancelled, target_written := patch_write(change, ctx.control, scratch)
 		if !cancelled && write_error == nil { continue }
+		applied_files := index
+		if target_written { applied_files += 1 }
 		applied := Patch_Output {
-			files   = index,
-			summary = summary[:changes[index - 1].summary_end] if index > 0 else "",
+			files   = applied_files,
+			summary = summary[:changes[applied_files - 1].summary_end] if applied_files > 0 else "",
 		}
 		applied_note := "; the files listed were already changed" if index > 0 else ""
 		if cancelled { return tool_result_of(ctx, .Cancelled, fmt.tprintf("the patch was cancelled%s", applied_note), applied, "cancelled") }
+		if target_written {
+			prior_summary := summary[:changes[index - 1].summary_end] if index > 0 else ""
+			applied.summary = fmt.aprintf("%swrote %s; could not remove source %s\n", prior_summary, change.target, change.source, allocator = scratch)
+			message := fmt.tprintf(
+				"wrote destination %s but could not remove source %s: %s%s",
+				change.target,
+				change.source,
+				os.error_string(write_error),
+				applied_note,
+			)
+			return tool_result_of(ctx, .Tool_Failed, message, applied, "write failed")
+		}
 		message := fmt.tprintf("could not write %s: %s%s", args.files[index].path, os.error_string(write_error), applied_note)
 		return tool_result_of(ctx, .Tool_Failed, message, applied, "write failed")
 	}
@@ -129,16 +143,18 @@ patch_failure_result :: proc(ctx: ^Tool_Context, err: Patch_Error) -> Tool_Resul
 // patch_write applies one prepared change. A moved file is written at its new path before the
 // old one is removed, so a failure between the two leaves both rather than neither.
 @(private = "file", require_results)
-patch_write :: proc(change: Patch_Change, control: Tool_Control, allocator: mem.Allocator) -> (write_error: os.Error, cancelled: bool) {
-	if tool_control_cancelled(control) { return nil, true }
-	if change.operation == .Delete { return os.remove(change.source), false }
+patch_write :: proc(change: Patch_Change, control: Tool_Control, allocator: mem.Allocator) -> (write_error: os.Error, cancelled: bool, target_written: bool) {
+	if tool_control_cancelled(control) { return nil, true, false }
+	if change.operation == .Delete { return os.remove(change.source), false, false }
 
 	directory, _ := os.split_path(change.target)
 	if directory != "" {
 		if directory_error := os.make_directory_all(directory);
-		   directory_error != nil && directory_error != os.General_Error.Exist { return directory_error, false }
+		   directory_error != nil && directory_error != os.General_Error.Exist { return directory_error, false, false }
 	}
 	write_error, cancelled = tool_write_atomic(change.target, change.content, change.mode, allocator, control)
-	if write_error != nil || cancelled || change.target == change.source { return }
-	return os.remove(change.source), false
+	if write_error != nil || cancelled { return }
+	target_written = true
+	if change.target == change.source { return }
+	return os.remove(change.source), false, true
 }

@@ -48,7 +48,12 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 	if resolve_error != nil { return tool_result_refused(ctx, &resolve_error) }
 	defer delete(path, ctx.allocator)
 
-	info, info_error := os.stat(path, ctx.allocator)
+	file, open_error := os.open(path, {.Read, .Non_Blocking})
+	if open_error != nil {
+		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("could not read %s: %s", args.path, os.error_string(open_error)), "unreadable")
+	}
+	defer os.close(file)
+	info, info_error := os.fstat(file, ctx.allocator)
 	defer os.file_info_delete(info, ctx.allocator)
 	if info_error != nil || info.type != .Regular {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("there is no readable file at %s", args.path), "not a file")
@@ -59,7 +64,7 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 	if tool_control_cancelled(ctx.control) {
 		return tool_result_failure(ctx, .Cancelled, "the read was cancelled", "cancelled")
 	}
-	data, read_error := os.read_entire_file(path, ctx.allocator)
+	data, read_error := os.read_entire_file(file, ctx.allocator)
 	if read_error != nil {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("could not read %s: %s", args.path, os.error_string(read_error)), "unreadable")
 	}
@@ -278,6 +283,13 @@ tool_write_atomic :: proc(
 				return os.General_Error.Invalid_File, false
 			}
 			written += count
+		}
+		if !cancelled_write {
+			if sync_error := os.sync(file); sync_error != nil {
+				_ = os.close(file)
+				_ = os.remove(temp_path)
+				return sync_error, false
+			}
 		}
 		if close_error := os.close(file); close_error != nil {
 			_ = os.remove(temp_path)

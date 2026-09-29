@@ -68,7 +68,9 @@ patch_prepare :: proc(
 
 		switch file.operation {
 		case .Add:
-			if os.exists(change.target) {
+			exists, exists_error := patch_path_exists(change.target, file.path, allocator)
+			if exists_error != nil { return nil, "", 0, exists_error }
+			if exists {
 				return nil, "", 0, patch_failure(.File_Exists, allocator, "%s already exists; use %s to change it", file.path, PATCH_HEADERS[.Update])
 			}
 			change.mode = os.Permissions_Default_File
@@ -81,13 +83,17 @@ patch_prepare :: proc(
 			patch_append(&summary_buffer, "deleted ", file.path, "\n") or_return
 		case .Update:
 			original := ""
-			if !os.exists(change.source) && patch_only_adds(args.lines, hunks) && file.move_to == "" {
+			source_exists, source_exists_error := patch_path_exists(change.source, file.path, allocator)
+			if source_exists_error != nil { return nil, "", 0, source_exists_error }
+			if !source_exists && patch_only_adds(args.lines, hunks) && file.move_to == "" {
 				change.mode = os.Permissions_Default_File
 				patch_append(&summary_buffer, "added ", file.path, "\n") or_return
 			} else {
 				change.mode = patch_existing_mode(change.source, file.path, allocator) or_return
-				if change.target != change.source && os.exists(change.target) {
-					return nil, "", 0, patch_failure(.File_Exists, allocator, "%s already exists", file.move_to)
+				if change.target != change.source {
+					target_exists, target_exists_error := patch_path_exists(change.target, file.move_to, allocator)
+					if target_exists_error != nil { return nil, "", 0, target_exists_error }
+					if target_exists { return nil, "", 0, patch_failure(.File_Exists, allocator, "%s already exists", file.move_to) }
 				}
 				data, read_error := os.read_entire_file(change.source, allocator)
 				if read_error !=
@@ -109,6 +115,17 @@ patch_prepare :: proc(
 }
 
 @(private = "file", require_results)
+patch_path_exists :: proc(path, path_argument: string, allocator: mem.Allocator) -> (exists: bool, err: Patch_Error) {
+	info, info_error := os.lstat(path, allocator)
+	if info_error == os.General_Error.Not_Exist { return false, nil }
+	if info_error != nil {
+		return false, patch_failure(.Unreadable, allocator, "could not inspect %s: %s", path_argument, os.error_string(info_error))
+	}
+	os.file_info_delete(info, allocator)
+	return true, nil
+}
+
+@(private = "file", require_results)
 patch_failure :: proc(kind: Patch_Failure_Kind, allocator: mem.Allocator, format: string, arguments: ..any) -> Patch_Failure {
 	return {kind, fmt.aprintf(format, ..arguments, allocator = allocator)}
 }
@@ -122,8 +139,8 @@ patch_resolve :: proc(workspace, path: string, allocator: mem.Allocator) -> (str
 
 @(private = "file", require_results)
 patch_existing_mode :: proc(path, path_argument: string, allocator: mem.Allocator) -> (os.Permissions, Patch_Error) {
-	if !os.exists(path) { return {}, patch_failure(.File_Missing, allocator, "%s does not exist; use %s to create it", path_argument, PATCH_HEADERS[.Add]) }
 	mode, problem := tool_write_mode(path)
+	if problem == .Missing { return {}, patch_failure(.File_Missing, allocator, "%s does not exist; use %s to create it", path_argument, PATCH_HEADERS[.Add]) }
 	if problem != .None { return {}, Patch_Failure{.Not_Writable, tool_write_mode_text(path_argument, problem)} }
 	return mode, nil
 }
