@@ -25,9 +25,6 @@ Codemode_Notation :: enum {
 	JSON,
 }
 
-// CODEMODE_MAX_VALUE_DEPTH is the maximum nesting accepted while converting Lua and JSON values.
-CODEMODE_MAX_VALUE_DEPTH :: 32
-
 // Codemode_Path_Step is one step the walk took: the field name it entered, or the array
 // position when index is positive.
 @(private)
@@ -37,18 +34,16 @@ Codemode_Path_Step :: struct {
 }
 
 // Codemode_Walk is one conversion. inside holds the tables the walk is in, which is how a
-// cycle is caught. path names where the walk is, one step per table it entered, so it
-// cannot hold more steps than the depth guard allows; a refusal keeps the path it failed
-// at, together with what it refused and why.
+// cycle is caught. path names where the walk is, and a refusal keeps the path it failed at,
+// together with what it refused and why.
 @(private)
 Codemode_Walk :: struct {
 	run:           ^Lua_Run,
 	state:         ^lua.State,
 	notation:      Codemode_Notation,
 	builder:       strings.Builder,
-	inside:        [CODEMODE_MAX_VALUE_DEPTH + 1]rawptr,
-	path:          [CODEMODE_MAX_VALUE_DEPTH + 1]Codemode_Path_Step,
-	path_count:    int,
+	inside:        [dynamic]rawptr,
+	path:          [dynamic]Codemode_Path_Step,
 	failure_count: int,
 	subject:       string,
 	problem:       string,
@@ -57,8 +52,8 @@ Codemode_Walk :: struct {
 
 // codemode_lua_convert writes the value at index in notation. The text, or the message that
 // says what was refused and where, is owned by allocator; out_of_memory says the refusal
-// was a lack of memory rather than the value. A value of any size converts; a table nested
-// more than CODEMODE_MAX_VALUE_DEPTH deep, a cycle, and a value that is not data are refused.
+// was a lack of memory rather than the value. A value of any size converts; cycles and values
+// that are not data are refused.
 @(require_results)
 codemode_lua_convert :: proc(
 	run: ^Lua_Run,
@@ -74,13 +69,28 @@ codemode_lua_convert :: proc(
 	context.allocator = allocator
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return "", codemode_value_allocation_message(allocator), true }
+	inside, inside_error := make([dynamic]rawptr, allocator)
+	if inside_error != nil {
+		strings.builder_destroy(&builder)
+		return "", codemode_value_allocation_message(allocator), true
+	}
+	path, path_error := make([dynamic]Codemode_Path_Step, allocator)
+	if path_error != nil {
+		delete(inside)
+		strings.builder_destroy(&builder)
+		return "", codemode_value_allocation_message(allocator), true
+	}
 	walk := Codemode_Walk {
 		run      = run,
 		state    = state,
 		notation = notation,
 		builder  = builder,
+		inside   = inside,
+		path     = path,
 	}
-	if codemode_walk_value(&walk, lua.absindex(state, index), 0) { return strings.to_string(walk.builder), "", false }
+	defer delete(walk.inside)
+	defer delete(walk.path)
+	if codemode_walk_value(&walk, lua.absindex(state, index)) { return strings.to_string(walk.builder), "", false }
 	strings.builder_destroy(&walk.builder)
 	refusal, refusal_error := codemode_walk_message(&walk, allocator)
 	if refusal_error != nil { return "", fmt.aprintf("the %s %s", walk.subject, walk.problem), true }
@@ -184,8 +194,15 @@ codemode_lua_returned_literal :: proc(run: ^Lua_Run) -> (literal: string, messag
 codemode_walk_fail :: proc(walk: ^Codemode_Walk, subject, problem: string) -> bool {
 	walk.subject = subject
 	walk.problem = problem
-	walk.failure_count = walk.path_count
+	walk.failure_count = len(walk.path)
 	return false
+}
+
+@(private, require_results)
+codemode_walk_check_stack :: proc(walk: ^Codemode_Walk, slots: c.int) -> bool {
+	if lua.checkstack(walk.state, slots) != 0 { return true }
+	walk.out_of_memory = true
+	return codemode_walk_fail(walk, "Lua stack", "could not be extended")
 }
 
 @(private, require_results)
@@ -196,7 +213,7 @@ codemode_walk_write :: proc(walk: ^Codemode_Walk, text: string) -> bool {
 }
 
 @(private, require_results)
-codemode_walk_value :: proc(walk: ^Codemode_Walk, index: c.int, depth: int) -> bool {
+codemode_walk_value :: proc(walk: ^Codemode_Walk, index: c.int) -> bool {
 	state := walk.state
 	switch lua.type(state, index) {
 	case .NIL:
@@ -213,7 +230,7 @@ codemode_walk_value :: proc(walk: ^Codemode_Walk, index: c.int, depth: int) -> b
 		if lua.touserdata(state, index) != rawptr(walk.run) { return codemode_walk_fail(walk, "light userdata", "cannot be converted") }
 		return codemode_walk_write(walk, walk.notation == .Lua ? "json.null" : "null")
 	case .TABLE:
-		return codemode_walk_table(walk, index, depth)
+		return codemode_walk_table(walk, index)
 	case .NONE:
 		return codemode_walk_fail(walk, "value", "is missing")
 	case .FUNCTION, .USERDATA, .THREAD:
@@ -284,13 +301,18 @@ codemode_walk_quoted :: proc(walk: ^Codemode_Walk, text: string) -> bool {
 // is an object, because a call with no arguments is the common case. Access is raw, so no
 // metamethod runs.
 @(private, require_results)
-codemode_walk_table :: proc(walk: ^Codemode_Walk, table: c.int, depth: int) -> bool {
+codemode_walk_table :: proc(walk: ^Codemode_Walk, table: c.int) -> bool {
 	state := walk.state
-	// The problem is kept past this frame, so it is static text; the bound it names is CODEMODE_MAX_VALUE_DEPTH.
-	if depth > CODEMODE_MAX_VALUE_DEPTH { return codemode_walk_fail(walk, "table", "nests more than 32 levels deep") }
 	identity := lua.topointer(state, table)
-	if slice.contains(walk.inside[:depth], identity) { return codemode_walk_fail(walk, "table", "contains itself") }
-	walk.inside[depth] = identity
+	if slice.contains(walk.inside[:], identity) { return codemode_walk_fail(walk, "table", "contains a cycle") }
+	if _, append_error := append(&walk.inside, identity); append_error != nil {
+		walk.out_of_memory = true
+		return codemode_walk_fail(walk, "table", "could not be traversed: out of memory")
+	}
+	defer {
+		_ = pop(&walk.inside)
+	}
+	if !codemode_walk_check_stack(walk, 2) { return false }
 
 	length := int(lua.rawlen(state, table))
 	count, names := 0, 0
@@ -318,21 +340,22 @@ codemode_walk_table :: proc(walk: ^Codemode_Walk, table: c.int, depth: int) -> b
 	if names > 0 && names < count { return codemode_walk_fail(walk, "table", "mixes named fields and array indexes") }
 	if names == 0 && count > 0 {
 		if count != length { return codemode_walk_fail(walk, "array", "is not dense from 1") }
-		return codemode_walk_array(walk, table, length, depth)
+		return codemode_walk_array(walk, table, length)
 	}
-	return codemode_walk_object(walk, table, count, depth)
+	return codemode_walk_object(walk, table, count)
 }
 
 @(private, require_results)
-codemode_walk_array :: proc(walk: ^Codemode_Walk, table: c.int, length, depth: int) -> bool {
+codemode_walk_array :: proc(walk: ^Codemode_Walk, table: c.int, length: int) -> bool {
 	lua_notation := walk.notation == .Lua
 	codemode_walk_write(walk, lua_notation ? "{" : "[") or_return
 	for position in 1 ..= length {
 		if position > 1 { codemode_walk_write(walk, lua_notation ? ", " : ",") or_return }
-		mark := walk.path_count
-		codemode_walk_enter(walk, Codemode_Path_Step{index = position})
+		mark := len(walk.path)
+		if !codemode_walk_enter(walk, Codemode_Path_Step{index = position}) { return false }
+		if !codemode_walk_check_stack(walk, 1) { return false }
 		lua.rawgeti(walk.state, table, lua.Integer(position))
-		written := codemode_walk_value(walk, lua.gettop(walk.state), depth + 1)
+		written := codemode_walk_value(walk, lua.gettop(walk.state))
 		lua.pop(walk.state, 1)
 		if !written { return false }
 		codemode_walk_leave(walk, mark)
@@ -343,8 +366,9 @@ codemode_walk_array :: proc(walk: ^Codemode_Walk, table: c.int, length, depth: i
 // codemode_walk_object writes fields in name order, so the same value is always the same
 // text. The names are borrowed from the table, which holds them for the whole walk.
 @(private, require_results)
-codemode_walk_object :: proc(walk: ^Codemode_Walk, table: c.int, count, depth: int) -> bool {
+codemode_walk_object :: proc(walk: ^Codemode_Walk, table: c.int, count: int) -> bool {
 	state := walk.state
+	if !codemode_walk_check_stack(walk, 2) { return false }
 	names, names_error := make([]string, count)
 	if names_error != nil {
 		walk.out_of_memory = true
@@ -375,11 +399,12 @@ codemode_walk_object :: proc(walk: ^Codemode_Walk, table: c.int, count, depth: i
 		}
 		codemode_walk_write(walk, lua_notation ? " = " : ":") or_return
 
-		mark := walk.path_count
-		codemode_walk_enter(walk, Codemode_Path_Step{name = name})
+		mark := len(walk.path)
+		if !codemode_walk_enter(walk, Codemode_Path_Step{name = name}) { return false }
+		if !codemode_walk_check_stack(walk, 1) { return false }
 		codemode_lua_push_string(state, name)
 		lua.rawget(state, table)
-		written := codemode_walk_value(walk, lua.gettop(state), depth + 1)
+		written := codemode_walk_value(walk, lua.gettop(state))
 		lua.pop(state, 1)
 		if !written { return false }
 		codemode_walk_leave(walk, mark)
@@ -387,19 +412,18 @@ codemode_walk_object :: proc(walk: ^Codemode_Walk, table: c.int, count, depth: i
 	return codemode_walk_write(walk, "}")
 }
 
-// codemode_walk_enter records the step the walk is entering. The depth guard bounds the
-// nesting, so the path always has room for it; the check only keeps the write in bounds.
+// codemode_walk_enter records the step the walk is entering.
 @(private)
-codemode_walk_enter :: proc(walk: ^Codemode_Walk, step: Codemode_Path_Step) {
-	if walk.path_count == len(walk.path) { return }
-	walk.path[walk.path_count] = step
-	walk.path_count += 1
+codemode_walk_enter :: proc(walk: ^Codemode_Walk, step: Codemode_Path_Step) -> bool {
+	if _, append_error := append(&walk.path, step); append_error == nil { return true }
+	walk.out_of_memory = true
+	return codemode_walk_fail(walk, "path", "could not be recorded: out of memory")
 }
 
 // codemode_walk_leave drops every step entered since mark.
 @(private)
 codemode_walk_leave :: proc(walk: ^Codemode_Walk, mark: int) {
-	walk.path_count = mark
+	for len(walk.path) > mark { _ = pop(&walk.path) }
 }
 
 // codemode_identifier reports whether a name can be written as a bare field name.
@@ -467,8 +491,8 @@ codemode_lua_json_decode :: proc "c" (state: ^lua.State) -> c.int {
 	}
 	value, parse_error := json.parse_string(text, .JSON, true, context.temp_allocator)
 	if parse_error != nil { return codemode_lua_raise(state, "json.decode refused the text: it is not valid JSON", temp) }
-	if !codemode_json_push(run, state, value, 0) {
-		return codemode_lua_raise(state, fmt.tprintf("json.decode refused a document nested more than %d levels deep", CODEMODE_MAX_VALUE_DEPTH), temp)
+	if !codemode_json_push(run, state, value) {
+		return codemode_lua_raise(state, "json.decode refused the document: the Lua stack could not be extended", temp)
 	}
 	virtual.arena_temp_end(temp)
 	return 1
@@ -487,10 +511,10 @@ codemode_json_defect_text :: proc(defect: Tool_Argument_Defect) -> string {
 }
 
 // codemode_json_push pushes a JSON document as the Lua value with the same shape. JSON null
-// becomes json.null. It reports false, with nothing pushed, for a document nested too deeply.
+// becomes json.null. It reports false, with nothing pushed, when the Lua stack cannot grow.
 @(private, require_results)
-codemode_json_push :: proc(run: ^Lua_Run, state: ^lua.State, value: json.Value, depth: int) -> bool {
-	if depth > CODEMODE_MAX_VALUE_DEPTH { return false }
+codemode_json_push :: proc(run: ^Lua_Run, state: ^lua.State, value: json.Value) -> bool {
+	if lua.checkstack(state, 1) == 0 { return false }
 	switch item in value {
 	case json.Null:
 		lua.pushlightuserdata(state, run)
@@ -505,7 +529,7 @@ codemode_json_push :: proc(run: ^Lua_Run, state: ^lua.State, value: json.Value, 
 	case json.Array:
 		lua.createtable(state, c.int(len(item)), 0)
 		for child, index in item {
-			if !codemode_json_push(run, state, child, depth + 1) {
+			if !codemode_json_push(run, state, child) {
 				lua.pop(state, 1)
 				return false
 			}
@@ -514,8 +538,12 @@ codemode_json_push :: proc(run: ^Lua_Run, state: ^lua.State, value: json.Value, 
 	case json.Object:
 		lua.createtable(state, 0, c.int(len(item)))
 		for key, child in item {
+			if lua.checkstack(state, 1) == 0 {
+				lua.pop(state, 1)
+				return false
+			}
 			codemode_lua_push_string(state, key)
-			if !codemode_json_push(run, state, child, depth + 1) {
+			if !codemode_json_push(run, state, child) {
 				lua.pop(state, 2)
 				return false
 			}
@@ -555,7 +583,9 @@ codemode_lua_keep_body :: proc "c" (state: ^lua.State) -> c.int {
 	codemode_lua_push_string(state, result.message)
 	lua.setfield(state, -2, "message")
 	if result.output != nil {
-		codemode_push_value(run, state, reflect.get_union_variant(result.output), "")
+		if !codemode_push_value(run, state, reflect.get_union_variant(result.output), "") {
+			return codemode_lua_raise(state, "the result could not be pushed: the Lua stack could not be extended", virtual.arena_temp_begin(&run.scratch))
+		}
 		lua.setfield(state, -2, "output")
 	}
 	lua.rawseti(state, -2, handle)
@@ -567,45 +597,65 @@ codemode_lua_keep_body :: proc "c" (state: ^lua.State) -> c.int {
 // field tagged lua:"json" holds JSON from a peer and is pushed decoded. It allocates only
 // from the temporary allocator, which the caller resets.
 @(private)
-codemode_push_value :: proc(run: ^Lua_Run, state: ^lua.State, value: any, tag: reflect.Struct_Tag) {
+codemode_push_value :: proc(run: ^Lua_Run, state: ^lua.State, value: any, tag: reflect.Struct_Tag) -> bool {
+	if lua.checkstack(state, 1) == 0 { return false }
 	#partial switch info in runtime.type_info_base(type_info_of(value.id)).variant {
 	case runtime.Type_Info_String:
 		text := (^string)(value.data)^
 		if format, _ := reflect.struct_tag_lookup(tag, "lua"); format == "json" {
 			decoded, parse_error := json.parse_string(text, .JSON, true, context.temp_allocator)
-			if parse_error != nil || text == "" || !codemode_json_push(run, state, decoded, 0) { lua.pushnil(state) }
-			return
+			if parse_error != nil || text == "" {
+				lua.pushnil(state)
+				return true
+			}
+			return codemode_json_push(run, state, decoded)
 		}
 		codemode_lua_push_string(state, text)
+		return true
 	case runtime.Type_Info_Integer:
 		number, _ := reflect.as_i64(value)
 		lua.pushinteger(state, lua.Integer(number))
+		return true
 	case runtime.Type_Info_Boolean:
 		flag, _ := reflect.as_bool(value)
 		lua.pushboolean(state, b32(flag))
+		return true
 	case runtime.Type_Info_Union:
 		variant := reflect.get_union_variant(value)
 		if variant.id == nil {
 			lua.pushnil(state)
-			return
+			return true
 		}
-		codemode_push_value(run, state, variant, tag)
+		return codemode_push_value(run, state, variant, tag)
 	case runtime.Type_Info_Slice:
 		count := reflect.length(value)
 		lua.createtable(state, c.int(count), 0)
 		for index in 0 ..< count {
-			codemode_push_value(run, state, reflect.index(value, index), "")
+			if !codemode_push_value(run, state, reflect.index(value, index), "") {
+				lua.pop(state, 1)
+				return false
+			}
 			lua.rawseti(state, -2, lua.Integer(index + 1))
 		}
+		return true
 	case runtime.Type_Info_Struct:
 		lua.createtable(state, 0, c.int(info.field_count))
 		for index in 0 ..< int(info.field_count) {
+			if lua.checkstack(state, 1) == 0 {
+				lua.pop(state, 1)
+				return false
+			}
 			codemode_lua_push_string(state, info.names[index])
 			field := any{rawptr(uintptr(value.data) + info.offsets[index]), info.types[index].id}
-			codemode_push_value(run, state, field, reflect.Struct_Tag(info.tags[index]))
+			if !codemode_push_value(run, state, field, reflect.Struct_Tag(info.tags[index])) {
+				lua.pop(state, 2)
+				return false
+			}
 			lua.rawset(state, -3)
 		}
+		return true
 	case:
 		lua.pushnil(state)
+		return true
 	}
 }

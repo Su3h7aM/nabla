@@ -106,7 +106,7 @@ codemode_value_refuses_what_it_cannot_carry :: proc(t: ^testing.T) {
 		{`return {items = {1, "two", [4] = "four"}}`, "the array at items is not dense from 1", .Invalid_Value},
 		{`return {"a", name = "x"}`, "the table mixes named fields and array indexes", .Invalid_Value},
 		{`return {[1.5] = 1}`, "the table has a key that is not a string or an array index", .Invalid_Value},
-		{`local value = {} value.self = value return value`, "the table at self contains itself", .Invalid_Value},
+		{`local value = {} value.self = value return value`, "the table at self contains a cycle", .Invalid_Value},
 		{`return {run = print}`, "the function at run cannot be converted", .Invalid_Value},
 		{`return 1, 2`, "the chunk returned more than one value; return one table instead", .Invalid_Value},
 	}
@@ -131,6 +131,27 @@ codemode_value_refuses_what_it_cannot_carry :: proc(t: ^testing.T) {
 	defer delete(literal)
 	defer delete(message)
 	testing.expect_value(t, message, fmt.aprintf("the function at %s cannot be converted", long_name, allocator = context.temp_allocator))
+}
+
+@(test)
+codemode_value_converts_64_nested_tables_through_json :: proc(t: ^testing.T) {
+	run := codemode_value_test_start(t, `local value = 1
+for i = 1, 64 do value = {value = value} end
+return json.decode(json.encode(value))`)
+	defer codemode_lua_destroy(run)
+	testing.expect_value(t, codemode_value_test_settle(run), Lua_Event.Returned)
+	literal, message, diagnostic := codemode_lua_returned_literal(run)
+	defer delete(literal)
+	defer delete(message)
+	testing.expect_value(t, message, "")
+	testing.expect_value(t, diagnostic, Codemode_Diagnostic.None)
+
+	expected := strings.builder_make(context.temp_allocator)
+	defer strings.builder_destroy(&expected)
+	for _ in 1 ..= 64 { strings.write_string(&expected, "{value = ") }
+	strings.write_byte(&expected, '1')
+	for _ in 1 ..= 64 { strings.write_byte(&expected, '}') }
+	testing.expect_value(t, literal, strings.to_string(expected))
 }
 
 // The walk converts a value whole: no number of elements shortens the literal.
