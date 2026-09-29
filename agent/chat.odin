@@ -527,7 +527,7 @@ chat_turn_drive :: proc(
 			// This runs before the turn's own end writes so the line still belongs to the turn
 			// that was sent it. A partial answer is written after it, and that entry is evidence
 			// no model is shown, so the order the next request reads is unaffected.
-			if steer != nil { chat_drain_steering(chat, observer, steer) }
+			chat_drain_turn_input(chat, observer, steer)
 			// A turn whose outcome did not reach the store reports the storage failure,
 			// not the status the model reached: the session has no record of it. The
 			// session's own error is what the record and the front-end read.

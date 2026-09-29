@@ -192,6 +192,9 @@ Chat_Input_Point :: enum {
 // flight and a call without its result are not settled, because an entry placed there would
 // be read where a result belongs; a turn that failed keeps its outcome instead of continuing.
 chat_session_input_point :: proc(chat: ^Chat_Session) -> Chat_Input_Point {
+	// Provider events can move the turn to Preparing or Finalizing before the response
+	// is committed. The live chain still owns the history until its response is recorded.
+	if chat.chain.active { return .Wait }
 	switch chat.state {
 	case .Preparing:
 		return .Boundary

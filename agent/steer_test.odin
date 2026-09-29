@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:encoding/json"
 import "core:mem/virtual"
 import "core:strings"
 import "core:testing"
@@ -157,6 +158,10 @@ steering_probe_push :: proc(user_data: rawptr) {
 	probe.pushed = steer_push(probe.queue, probe.line)
 }
 
+steering_probe_push_on_text :: proc(user_data: rawptr, _: string) {
+	steering_probe_push(user_data)
+}
+
 // A steering line is a prompt that arrives while a request is running, and the only thing
 // that makes it different from a prompt sent while idle is that it does not interrupt the
 // request in flight. Once that request finishes, the line starts the next request on its
@@ -198,6 +203,107 @@ test_a_steering_line_starts_the_next_request_on_its_own :: proc(test: ^testing.T
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
 	testing.expect(test, !strings.contains(agent_provider_request(&provider, 0), "write another one"), "the request already in flight is not rebuilt")
 	testing.expect(test, strings.contains(agent_provider_request(&provider, 1), "write another one"), "the line starts the request that follows it")
+}
+
+// A line can arrive after the provider has started answering but before its response is
+// committed. The answer must be parented before the line, and the next request must end with
+// the user message so providers that require a user turn do not receive an assistant prefill.
+@(test)
+test_steering_during_response_waits_for_commit_before_recording :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(test, chat, "say something")
+
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, {agent_provider_reply("first answer"), agent_provider_reply("second answer")}) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	queue := steer_queue_init(chat.allocator)
+	defer steer_queue_destroy(&queue)
+	steer := Steer_Context {
+		queue = &queue,
+	}
+	probe := Steering_Probe {
+		queue = &queue,
+		line  = "check the logs",
+	}
+	observer := Chat_Observer {
+		user_data      = &probe,
+		assistant_text = steering_probe_push_on_text,
+	}
+
+	if !testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), observer, &steer), "the turn completed") { return }
+	if !testing.expect(test, probe.pushed, "the line was queued while the provider response was being applied") { return }
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
+	first_request := agent_provider_request(&provider, 0)
+	second_request := agent_provider_request(&provider, 1)
+	testing.expect(test, !strings.contains(first_request, probe.line), "the frozen request does not contain the line")
+	testing.expect(test, strings.contains(second_request, "first answer"), "the next request includes the completed answer")
+	steering_request_ends_with_user_line(test, second_request, probe.line, "first answer")
+
+	records := _test_records(test, chat, {.Request_Sent, .Response_Committed, .Node_Committed})
+	first_send: journal.Record
+	first_response: journal.Record
+	for record in records {
+		if first_send.seq == 0 && record.kind == .Request_Sent {
+			first_send = record
+			continue
+		}
+		if first_send.seq != 0 && record.kind == .Response_Committed && record.request == first_send.request {
+			first_response = record
+			break
+		}
+	}
+	if !testing.expect(test, first_send.seq != 0, "the first request was durably sent") ||
+	   !testing.expect(test, first_response.seq != 0, "the first response was durably committed") { return }
+	for record in records {
+		if record.kind != .Node_Committed || record.seq <= first_send.seq || record.seq >= first_response.seq { continue }
+		committed: journal.Node_Committed
+		if decode_error := journal.payload_decode(record.data, &committed, context.temp_allocator); decode_error != nil {
+			testing.fail_now(test, "the node commit could not be decoded")
+		}
+		testing.expect(test, committed.kind != journal.NODE_KIND_NAMES[.User], "no user node is committed between the send and its response")
+	}
+	ancestry, ancestry_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
+	if !testing.expect_value(test, ancestry_error, nil) { return }
+	steering_after_answer := false
+	for node in ancestry {
+		if node.kind == .User && node.seq > first_response.seq && string(node.body) == probe.line { steering_after_answer = true }
+	}
+	testing.expect(test, steering_after_answer, "the queued line is recorded after the response")
+}
+
+@(private)
+steering_request_ends_with_user_line :: proc(test: ^testing.T, request, expected_line, expected_answer: string) {
+	_, separator, encoded := strings.partition(request, "\r\n\r\n")
+	if !testing.expect(test, separator != "", "the provider request has a body") { return }
+	value, parse_error := json.parse_string(encoded, .JSON, true, context.temp_allocator)
+	if !testing.expect_value(test, parse_error, nil) { return }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, object_ok := value.(json.Object)
+	if !testing.expect(test, object_ok, "the provider request is a JSON object") { return }
+	messages, messages_ok := object["messages"].(json.Array)
+	if !testing.expect(test, messages_ok && len(messages) >= 2, "the request has a conversation") { return }
+	last, last_ok := messages[len(messages) - 1].(json.Object)
+	prior, prior_ok := messages[len(messages) - 2].(json.Object)
+	if !testing.expect(test, last_ok && prior_ok, "the last request messages are objects") { return }
+	last_role, last_role_ok := last["role"].(json.String)
+	last_content, last_content_ok := last["content"].(json.String)
+	prior_role, prior_role_ok := prior["role"].(json.String)
+	prior_content, prior_content_ok := prior["content"].(json.String)
+	if !testing.expect(test, last_role_ok && last_content_ok && prior_role_ok && prior_content_ok, "the final request messages carry text") { return }
+	testing.expect_value(test, string(prior_role), "assistant")
+	testing.expect_value(test, string(prior_content), expected_answer)
+	testing.expect_value(test, string(last_role), "user")
+	testing.expect_value(test, string(last_content), expected_line)
 }
 
 // A line recorded for a turn that had finished answering continues that turn instead of
@@ -354,6 +460,42 @@ test_a_turn_that_ends_without_a_request_records_what_it_was_sent :: proc(test: ^
 	testing.expect(test, !still_queued, "the line should have left the queue")
 }
 
+// A turn-end drain has no front-end steering context for a native subagent, but its agent
+// inbox still needs the same drain path as a user's queue.
+@(test)
+test_turn_end_drain_records_agent_inbox_without_steer_context :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	_test_accept(test, chat, "start")
+	chat_session_fail_turn(chat, "the provider refused the request")
+	effect := chat_session_advance(chat)
+	if !testing.expect_value(test, effect.kind, Chat_Effect_Kind.Turn_Finished) { return }
+	chat_session_claim_finish(chat, effect)
+
+	inbox := steer_queue_init(context.temp_allocator)
+	chat.inbox = &inbox
+	defer {
+		chat.inbox = nil
+		steer_queue_destroy(&inbox)
+	}
+	testing.expect(test, steer_push(&inbox, "check the logs"))
+	chat_drain_turn_input(chat, {}, nil)
+
+	arena: virtual.Arena
+	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
+	defer virtual.arena_destroy(&arena)
+	projection := _test_projection(test, chat, &arena)
+	if !testing.expect(test, len(projection.items) == 2, "the inbox message was recorded") { return }
+	user, is_user := projection.items[1].payload.(Projected_User)
+	if !testing.expect(test, is_user, "the inbox message is user text") { return }
+	testing.expect_value(test, user.text, "check the logs")
+	testing.expect_value(test, user.origin, journal.User_Origin.Agent)
+	_, still_queued := steer_pop(&inbox)
+	testing.expect(test, !still_queued, "the inbox message left its queue")
+}
+
 // A steering line reaches the model in the next request the turn makes, which is the
 // whole point of accepting input during a turn: the request the turn was already sending
 // is frozen, and this one is built from the history the line is now part of.
@@ -411,7 +553,7 @@ test_a_line_the_store_refuses_stays_pending :: proc(test: ^testing.T) {
 	notices: Chat_Notice_Log
 	observer := chat_notice_log_begin(&notices)
 	defer chat_notice_log_destroy(&notices)
-	chat_drain_steering(chat, observer, &steer)
+	chat_drain_turn_input(chat, observer, &steer)
 
 	for expected in ([]string{"check the logs", "and the config"}) {
 		line, queued := steer_pop(&queue)
@@ -437,7 +579,7 @@ test_drain_records_queued_lines_in_order :: proc(test: ^testing.T) {
 	steer := Steer_Context {
 		queue = &queue,
 	}
-	chat_drain_steering(chat, {}, &steer)
+	chat_drain_turn_input(chat, {}, &steer)
 
 	arena: virtual.Arena
 	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
@@ -472,7 +614,7 @@ test_a_refused_steering_line_does_not_repeat_a_turn_error :: proc(test: ^testing
 	notices: Chat_Notice_Log
 	observer := chat_notice_log_begin(&notices)
 	defer chat_notice_log_destroy(&notices)
-	chat_drain_steering(chat, observer, &steer)
+	chat_drain_turn_input(chat, observer, &steer)
 
 	for line in notices.lines {
 		testing.expect(test, line != "the provider refused the request", "a line with no turn must not repeat the turn's failure as its own")

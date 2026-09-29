@@ -141,9 +141,17 @@ Steer_Context :: struct {
 	apply_data: rawptr,
 }
 
-// chat_drain_steering hands the lines the user queued to the session. See chat_drain_queue.
-chat_drain_steering :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) -> int {
-	return chat_drain_queue(chat, observer, steer.queue, .Steering)
+// chat_drain_turn_input records queued user steering and agent messages through one path.
+// It is called at a settled input point or when the turn ends; the caller decides which.
+chat_drain_turn_input :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) -> int {
+	recorded := 0
+	if steer != nil && steer.queue != nil {
+		recorded += chat_drain_queue(chat, observer, steer.queue, .Steering)
+	}
+	if chat.inbox != nil {
+		recorded += chat_drain_queue(chat, observer, chat.inbox, .Agent)
+	}
+	return recorded
 }
 
 // chat_drain_queue hands the queued lines to the session, oldest first, and reports how many
@@ -194,9 +202,7 @@ chat_drain_queue :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue: ^S
 chat_steering_observe :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) {
 	point := chat_session_input_point(chat)
 	if point == .Wait { return }
-	recorded := 0
-	if steer != nil { recorded += chat_drain_steering(chat, observer, steer) }
-	if chat.inbox != nil && chat_session_input_point(chat) != .Wait { recorded += chat_drain_queue(chat, observer, chat.inbox, .Agent) }
+	recorded := chat_drain_turn_input(chat, observer, steer)
 	if recorded == 0 { return }
 	if point == .After_Answer { chat_session_continue_for_input(chat) }
 }
