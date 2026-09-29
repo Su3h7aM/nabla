@@ -145,9 +145,8 @@ Snapshot :: struct {
 	// entries_bytes is what the resident entries hold: each entry's own slot and
 	// the text it keeps, the number the transcript's budget is spent from.
 	entries_bytes:      int,
-	// transcript_failed records that the snapshot could not keep a line or a
-	// status field, so the run says so once instead of dropping values quietly.
-	transcript_failed:  bool,
+	// display_incomplete records that a line or status field could not be kept.
+	display_incomplete: bool,
 	// transcript_trimmed records that the transcript dropped old lines, so the
 	// notice is said once rather than at every drop.
 	transcript_trimmed: bool,

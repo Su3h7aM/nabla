@@ -870,21 +870,21 @@ draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	}
 	lines, lines_error := make([dynamic]Line, 0, 64, context.temp_allocator)
 	if lines_error != nil {
-		snap_report_dropped(app, lines_error)
+		snap_report_dropped_locked(app)
 		return
 	}
 	if _, append_error := append(&lines, Line{text = app.menu.title, style = TITLE_STYLE}); append_error != nil {
-		snap_report_dropped(app, append_error)
+		snap_report_dropped_locked(app)
 		return
 	}
 	if setup_error := setup_error_text(app); setup_error != "" {
 		cloned, clone_error := strings.clone(setup_error, context.temp_allocator)
 		if clone_error != nil {
-			snap_report_dropped(app, clone_error)
+			snap_report_dropped_locked(app)
 			return
 		}
 		if _, append_error := append(&lines, Line{text = cloned, style = ERROR_TEXT}); append_error != nil {
-			snap_report_dropped(app, append_error)
+			snap_report_dropped_locked(app)
 			return
 		}
 	}
@@ -902,7 +902,7 @@ draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 			text = fmt.tprintf("%s%s", marker, choice.label)
 		}
 		if _, append_error := append(&lines, Line{text = text, style = style}); append_error != nil {
-			snap_report_dropped(app, append_error)
+			snap_report_dropped_locked(app)
 			return
 		}
 	}
@@ -1077,7 +1077,7 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 		directory := text.truncate_text(shorten_home(app, app.run.snap.status.cwd), cwd_rect.width)
 		shown, clone_error := strings.clone(directory, context.temp_allocator)
 		if clone_error != nil {
-			snap_report_dropped(app, clone_error)
+			snap_report_dropped_locked(app)
 		} else {
 			_, _ = tui.draw_text(&storage.buffer, cwd_rect, shown, FOOTER_TEXT)
 		}
@@ -1088,7 +1088,9 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 	status := &app.run.snap.status
 	left := "no model selected"
 	right := ""
-	if status.model_id != "" {
+	if app.run.snap.display_incomplete {
+		left = "display incomplete: out of memory"
+	} else if status.model_id != "" {
 		cost := "-"
 		if status.cost_present {
 			cost = fmt.tprintf("$%.2f", status.cost)

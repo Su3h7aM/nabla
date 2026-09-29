@@ -390,6 +390,33 @@ test_tool_box_matches_the_prompt_box :: proc(t: ^testing.T) {
 	testing.expect_value(t, storage.buffer.cells[tool_row * columns + tool_border].style, TOOL_FAILURE)
 }
 
+@(test)
+test_display_allocation_failure_is_reported_in_the_footer_once :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	app.columns = 60
+	app.rows = 8
+	widgets.input_init(&app.input, context.allocator)
+	defer widgets.input_destroy(&app.input)
+
+	snap_report_dropped(app)
+	generation := app.run.snap.generation
+	snap_report_dropped(app)
+	if !testing.expect_value(t, app.run.snap.generation, generation) { return }
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	_, frame_error := render_frame(app, storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	scratch: [128]byte
+	footer := conversation_glyph_row(storage, app.rows - 1, scratch[:])
+	testing.expect(t, strings.contains(footer, "display incomplete: out of memory"))
+}
+
 // A tab inside a tool result expands where drawing puts it, so every content
 // row still pads to the same width and the right border stays in one column.
 @(test)

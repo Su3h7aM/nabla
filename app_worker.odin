@@ -2,7 +2,6 @@
 package main
 
 import "core:fmt"
-import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
@@ -131,12 +130,12 @@ session_refresh_rows :: proc(app: ^App) {
 		if title_error != nil {
 			// A row without its title would read as a session that has none, so
 			// the row is left out rather than mislabeled.
-			snap_report_dropped(app, title_error)
+			snap_report_dropped_locked(app)
 			continue
 		}
 		if _, append_error := append(&app.run.snap.sessions, Session_Row{id = entry.id, title = title}); append_error != nil {
 			delete(title, app.run.alloc)
-			snap_report_dropped(app, append_error)
+			snap_report_dropped_locked(app)
 			break
 		}
 	}
@@ -487,12 +486,12 @@ refresh_status :: proc(app: ^App) {
 // snap_status_replace replaces one owned status string with a copy of text, keeping
 // the value already published when the copy fails, so the footer never loses a fact
 // because memory ran out. The caller may hold the runtime mutex; nothing here takes
-// it. The failure is reported by the one snapshot allocation report.
+// it. The failure appears in the footer's display-incomplete status.
 snap_status_replace :: proc(app: ^App, field: ^string, text: string) {
 	if field^ == text { return }
 	cloned, clone_error := strings.clone(text, app.run.alloc)
 	if clone_error != nil {
-		snap_report_dropped(app, clone_error)
+		snap_report_dropped_locked(app)
 		return
 	}
 	delete(field^, app.run.alloc)
@@ -536,7 +535,7 @@ runtime_selection_provider :: proc(app: ^App) -> string {
 	provider, provider_error := strings.clone(app.run.snap.status.provider_id, context.temp_allocator)
 	sync.mutex_unlock(&app.run.mu)
 	if provider_error != nil {
-		snap_report_dropped(app, provider_error)
+		snap_report_dropped(app)
 	}
 	return provider
 }
@@ -576,7 +575,7 @@ snap_entry_make :: proc(app: ^App, kind: Entry_Kind, text: string) -> Entry {
 snap_entry_set_text :: proc(app: ^App, entry: ^Entry, text: string) {
 	if len(text) == 0 { return }
 	if resize_error := resize(&entry.text, len(text)); resize_error != nil {
-		snap_report_dropped(app, resize_error)
+		snap_report_dropped_locked(app)
 		return
 	}
 	copy(entry.text[:], text)
@@ -598,22 +597,25 @@ snap_entry_append_text :: proc(app: ^App, entry: ^Entry, text: string) {
 	if len(text) > 0 {
 		entry.revision += 1
 		if _, append_error := append(&entry.text, ..transmute([]byte)text); append_error != nil {
-			snap_report_dropped(app, append_error)
+			snap_report_dropped_locked(app)
 		}
 	}
 	snap_entry_account(entry)
 }
 
-// snap_report_dropped says once that the snapshot could not keep a value it was
-// building, whether a transcript line or a status field. What is left out stays
-// out rather than being shown as an empty value, and the run continues without a
-// screen that quietly disagrees with what it kept. One report per run is what
-// keeps a failing allocator from filling stderr. The snapshot cannot carry the report
-// itself, because building it is what failed and its lock may be held.
-snap_report_dropped :: proc(app: ^App, alloc_error: mem.Allocator_Error) {
-	if app.run.snap.transcript_failed { return }
-	app.run.snap.transcript_failed = true
-	fmt.eprintfln("nabla: the display could not keep a value (%v); it may be missing lines", alloc_error)
+// snap_report_dropped records one display failure while holding the snapshot lock.
+snap_report_dropped :: proc(app: ^App) {
+	sync.mutex_lock(&app.run.mu)
+	snap_report_dropped_locked(app)
+	sync.mutex_unlock(&app.run.mu)
+}
+
+// snap_report_dropped_locked marks the display incomplete once, without allocating or
+// writing to the terminal's stderr stream. The footer reads the flag under the same lock.
+snap_report_dropped_locked :: proc(app: ^App) {
+	if app.run.snap.display_incomplete { return }
+	app.run.snap.display_incomplete = true
+	app.run.snap.generation += 1
 }
 
 snap_push_locked :: proc(app: ^App, entry: Entry) {
@@ -624,7 +626,7 @@ snap_push_locked :: proc(app: ^App, entry: Entry) {
 		// dynamic array releases through its own allocator, which the entry's text
 		// was given when it was made.
 		delete(entry.text)
-		snap_report_dropped(app, append_error)
+		snap_report_dropped_locked(app)
 		return
 	}
 	app.run.snap.generation += 1

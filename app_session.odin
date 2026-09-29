@@ -682,7 +682,7 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 		if _, append_error := append(&app.retired_connection_strings, app.setup.credential); append_error != nil {
 			// Keep the old credential rather than freeing it under an operation that
 			// may still be using it.
-			snap_report_dropped(app, append_error)
+			snap_report_dropped_locked(app)
 		}
 	}
 	app.setup.credential = credential
@@ -693,7 +693,7 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 		if _, append_error := append(&app.retired_connection_strings, app.endpoint); append_error != nil {
 			// The endpoint is left unfreed rather than freed under a turn that may
 			// still be talking to it, which is a leak and not a dangling pointer.
-			snap_report_dropped(app, append_error)
+			snap_report_dropped_locked(app)
 		}
 	}
 	app.endpoint = setup_endpoint
@@ -739,12 +739,12 @@ selection_publish_locked :: proc(app: ^App, provider_id, model_id: string, annou
 	for level in running.effort_levels {
 		cloned, clone_error := strings.clone(level, app.run.alloc)
 		if clone_error != nil {
-			snap_report_dropped(app, clone_error)
+			snap_report_dropped_locked(app)
 			continue
 		}
 		if _, append_error := append(&status.effort_levels, cloned); append_error != nil {
 			delete(cloned, app.run.alloc)
-			snap_report_dropped(app, append_error)
+			snap_report_dropped_locked(app)
 			break
 		}
 	}
