@@ -55,8 +55,8 @@ Branch_Summary :: struct {
 }
 
 // Usage_Totals sums what the session's committed responses reported. The
-// paired fields cover only the responses that reported every token count, the
-// one population a cache hit rate may be measured over.
+// paired fields cover only the responses that reported both input and cache
+// read counts, the one population a cache hit rate may be measured over.
 Usage_Totals :: struct {
 	requests:        int,
 	paired_requests: int,
@@ -449,7 +449,7 @@ USAGE_TOTALS_QUERY :: `WITH reported AS (SELECT
 	json_extract(data, '$.cache_read_tokens') AS cache_read,
 	json_extract(data, '$.cache_write_tokens') AS cache_write
 	FROM records WHERE session = ? AND kind = 'response.committed'),
-paired AS (SELECT *, (input IS NOT NULL AND output IS NOT NULL AND cache_read IS NOT NULL AND cache_write IS NOT NULL) AS both FROM reported)
+paired AS (SELECT *, (input IS NOT NULL AND cache_read IS NOT NULL) AS both FROM reported)
 SELECT COUNT(*), COALESCE(SUM(both), 0),
 	COALESCE(SUM(input), 0), COALESCE(SUM(output), 0), COALESCE(SUM(cache_read), 0), COALESCE(SUM(cache_write), 0),
 	COALESCE(SUM(CASE WHEN both THEN input END), 0), COALESCE(SUM(CASE WHEN both THEN cache_read END), 0)

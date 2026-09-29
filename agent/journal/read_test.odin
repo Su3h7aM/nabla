@@ -537,23 +537,24 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	_decode_payload(test, ancestry[3].data, &steered)
 	testing.expect_value(test, steered.origin, USER_ORIGIN_NAMES[.Steering])
 
-	// A count the provider never reported is not a zero in the totals.
+	// A count the provider never reported is not a zero in the totals, and a
+	// response without a cache write count still measures the hit rate.
 	totals, totals_error := usage_totals(&journal, session)
 	_expect_ok(test, totals_error)
 	testing.expect_value(test, totals.requests, 2)
-	testing.expect_value(test, totals.paired_requests, 1)
+	testing.expect_value(test, totals.paired_requests, 2)
 	testing.expect_value(test, totals.input, 300)
 	testing.expect_value(test, totals.output, 50)
 	testing.expect_value(test, totals.cache_read, 190)
 	testing.expect_value(test, totals.cache_write, 5)
-	testing.expect_value(test, totals.paired_input, 100)
-	testing.expect_value(test, totals.paired_read, 40)
+	testing.expect_value(test, totals.paired_input, 300)
+	testing.expect_value(test, totals.paired_read, 190)
 	rate, rate_measured := cache_hit_rate(totals)
 	testing.expect(test, rate_measured, "the paired requests report a hit rate")
-	testing.expectf(test, math.abs(rate - 0.4) < 1e-9, "expected a hit rate of 0.4, got %v", rate)
+	testing.expectf(test, math.abs(rate - 190.0 / 300.0) < 1e-9, "expected a hit rate of 190/300, got %v", rate)
 	coverage, coverage_measured := cache_coverage(totals)
 	testing.expect(test, coverage_measured, "the paired requests report a coverage")
-	testing.expectf(test, math.abs(coverage - 1.0 / 3.0) < 1e-9, "expected a coverage of a third, got %v", coverage)
+	testing.expectf(test, math.abs(coverage - 1.0) < 1e-9, "expected full coverage, got %v", coverage)
 
 	// The latest record of a kind is the one that stands.
 	latest, latest_found, latest_error := read_latest(&journal, Filter{session = session, kinds = {.Selection_Changed}}, context.allocator)
