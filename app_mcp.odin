@@ -245,7 +245,7 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	if len(setup.mcp_servers) == 0 { return "" }
 	if agent.chat_session_state(&setup.session) != .Idle { return "" }
 	// Child and abandoned workers may still call through these bindings.
-	if agent.chat_session_workers_outstanding(&setup.session) { return "" }
+	if setup.workers_abandoned || agent.chat_session_workers_outstanding(&setup.session) { return "" }
 
 	setup.mcp.refresh_generation += 1
 	// The refresh is recorded against the session it changes, so the caller's
@@ -369,7 +369,7 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	}
 	// Replacement destroys the old registry, so its bindings can now be released, unless an
 	// abandoned tool worker may still be using one; then they are left to process exit.
-	if agent.chat_session_workers_outstanding(&setup.session) {
+	if setup.workers_abandoned || agent.chat_session_workers_outstanding(&setup.session) {
 		delete(setup.mcp.bindings)
 	} else {
 		mcp_bindings_destroy(&setup.mcp.bindings, setup.alloc)

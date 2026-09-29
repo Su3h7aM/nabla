@@ -428,6 +428,9 @@ snapshot_clear :: proc(app: ^App) {
 
 refresh_status :: proc(app: ^App) {
 	running := &app.setup.session
+	totals: journal.Usage_Totals
+	totals_error: journal.Error = journal.Journal_Error.Not_Found
+	if running.store != nil { totals, totals_error = journal.usage_totals(running.store, running.session) }
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
 	status := &app.run.snap.status
@@ -435,13 +438,8 @@ refresh_status :: proc(app: ^App) {
 	// the main thread never reads the store, so it cannot compute one itself.
 	status.est_input = running.last_estimate
 	status.context_window = running.capacity.window
-	// The footer shows the session's token-weighted hit rate beside the
-	// estimate: the estimate bounds the request being built, the hit rate says
-	// how much of the finished session the provider read from its cache. Both
-	// come from the worker's own records, never from a second thread's query.
-	totals: journal.Usage_Totals
-	totals_error: journal.Error = journal.Journal_Error.Not_Found
-	if running.store != nil { totals, totals_error = journal.usage_totals(running.store, running.session) }
+	// The footer shows the session's token-weighted hit rate beside the estimate.
+	// Keep the SQLite query outside the lock so readers can still read status.
 	if totals_error != nil {
 		status.session_input_present = false
 		status.session_cache_present = false

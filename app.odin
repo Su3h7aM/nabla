@@ -664,7 +664,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	frame_storage_destroy(app.storage)
 	// A tool worker that ignored its stop may still use the tool backends, so the process
 	// exits with them rather than freeing them under it.
-	if agent.chat_session_workers_outstanding(&app.setup.session) {
+	if app.setup.workers_abandoned || agent.chat_session_workers_outstanding(&app.setup.session) {
 		agent.log_emit(agent.Log_Record{level = .Warning, category = .Runtime, event = "runtime.workers_outstanding"})
 		return true
 	}

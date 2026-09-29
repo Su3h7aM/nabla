@@ -55,94 +55,95 @@ Run_Setup :: struct {
 	// borrow, so it is released after the session that holds the registry.
 	mcp_servers:       []agent.MCP_Server_Config,
 	mcp:               MCP_Runtime,
+	// workers_abandoned stays set after a replaced session leaves a worker behind.
+	workers_abandoned: bool,
 	alloc:             mem.Allocator,
 }
 
 App :: struct {
-	setup:              Run_Setup,
+	setup:                      Run_Setup,
 	// catalog_mu protects publication of a replacement catalog. A publication
 	// releases the catalog it replaces, so anything read out of a catalog is either
 	// copied while the lock is held or owned by this run.
-	catalog_mu:         sync.Mutex,
+	catalog_mu:                 sync.Mutex,
 	// catalog_refresh_at is when the last catalog refresh was asked for, on the monotonic
 	// clock, and catalog_refreshed says one was asked for at all, since a zero tick is not
 	// a time. Only the front-end asks, so this is front-end state.
-	catalog_refresh_at: time.Tick,
-	catalog_refreshed:  bool,
+	catalog_refresh_at:         time.Tick,
+	catalog_refreshed:          bool,
 	// models_dev_read_at is when this run last read models.dev into sources. It is only
 	// meaningful while models_dev_sources is non-empty, which is what says a read happened.
-	models_dev_read_at: time.Tick,
+	models_dev_read_at:         time.Tick,
 	// endpoint is the base_url the running connection borrows. The catalog a model
 	// was selected from is released when a refresh replaces it, so the endpoint is
 	// owned here rather than borrowed from a catalog entry a publication frees.
-	endpoint:           string, // owned,
-	// retired_endpoints are endpoints a turn in flight may still be talking to. A
-	// selection can change at a request boundary inside a turn, so the endpoint the
-	// request before it was given stays valid until the run ends.
-	retired_endpoints:  [dynamic]string, // owned,
-	catalog_sources:    []agent.Catalog_Provider_Source, // borrowed for tui_run
-	provider_sources:   [dynamic]agent.Catalog_Provider_Source, // owned refresh snapshot
-	models_dev_sources: [dynamic]agent.Catalog_Provider_Source, // owned refresh snapshot
-	catalog_refresh:    Catalog_Refresh_Chan,
-	catalog_worker:     ^thread.Thread,
-	catalog_revision:   u64,
-	catalog_seen:       u64,
-	terminal:           ^term.Session,
-	tty:                ^os.File,
-	parser:             input.Parser,
-	raw:                [dynamic]input.Event, // owned; the latest input batch,
-	run:                Runtime,
-	storage:            ^Frame_Storage,
-	home:               string, // owned; shortens the footer path,
-	input:              widgets.Input,
-	scroll:             int, // rows scrolled back; 0 follows the bottom,
+	endpoint:                   string, // owned,
+	// Retired connection strings are endpoints and credentials an abandoned
+	// operation may still borrow, so they stay valid until the run ends.
+	retired_connection_strings: [dynamic]string, // owned,
+	catalog_sources:            []agent.Catalog_Provider_Source, // borrowed for tui_run
+	provider_sources:           [dynamic]agent.Catalog_Provider_Source, // owned refresh snapshot
+	models_dev_sources:         [dynamic]agent.Catalog_Provider_Source, // owned refresh snapshot
+	catalog_refresh:            Catalog_Refresh_Chan,
+	catalog_worker:             ^thread.Thread,
+	catalog_revision:           u64,
+	catalog_seen:               u64,
+	terminal:                   ^term.Session,
+	tty:                        ^os.File,
+	parser:                     input.Parser,
+	raw:                        [dynamic]input.Event, // owned; the latest input batch,
+	run:                        Runtime,
+	storage:                    ^Frame_Storage,
+	home:                       string, // owned; shortens the footer path,
+	input:                      widgets.Input,
+	scroll:                     int, // rows scrolled back; 0 follows the bottom,
 	// conv_scroll_range is the conversation's scrollable height in rows, as
 	// the last completed layout frame reported it. The offset handed to layout
 	// is range - scroll, so a scroll of 0 pins the newest content to the
 	// bottom and the range shrinks and grows with the transcript.
-	conv_scroll_range:  int,
-	generation_seen:    u64,
+	conv_scroll_range:          int,
+	generation_seen:            u64,
 	// steer_active is whether the runtime was running when this thread last looked. The
 	// transition back to idle is what returns input the turn never applied to the
 	// prompt. The loop reads and writes it on the front-end's thread only.
-	steer_active:       bool,
+	steer_active:               bool,
 	// viewport_reported latches the one warning a terminal that reports no size
 	// produces. The loop reads it on the front-end's thread only.
-	viewport_reported:  bool,
-	spin_lap:           time.Tick, // last working-frame advance,
-	spin_frame:         int,
+	viewport_reported:          bool,
+	spin_lap:                   time.Tick, // last working-frame advance,
+	spin_frame:                 int,
 	// menu is the open choice list, when menu_open. One component serves every
 	// command whose argument is picked from a list.
-	menu:               Menu,
-	menu_open:          bool,
+	menu:                       Menu,
+	menu_open:                  bool,
 	// completion_query and completion_index carry a Tab cycle: the prefix the
 	// cycle began with and where it has reached. Any other key ends the cycle.
-	completion_query:   string, // owned,
-	completion_index:   int,
-	completion_active:  bool,
+	completion_query:           string, // owned,
+	completion_index:           int,
+	completion_active:          bool,
 	// history holds the prompts submitted this run, oldest first; history_index is the
 	// entry the prompt line shows, or len(history) while a fresh line is composed. Only
 	// prompts enter it, because submit routes a slash command to dispatch_command.
-	history:            [dynamic]string, // owned,
-	history_index:      int,
+	history:                    [dynamic]string, // owned,
+	history_index:              int,
 	// history_draft is the fresh line as the arrow keys left it: stepping forward past the
 	// newest entry puts it back. It never joins history. The empty string means nothing is
 	// kept.
-	history_draft:      string, // owned,
-	columns:            int,
-	rows:               int,
+	history_draft:              string, // owned,
+	columns:                    int,
+	rows:                       int,
 	// conversation_rect is the cells the transcript occupied in the last frame. A
 	// mouse report is in screen cells, so this is what converts one into the
 	// conversation's own coordinates.
-	conversation_rect:  tui.Cell_Rect,
+	conversation_rect:          tui.Cell_Rect,
 	// selecting marks a drag in progress, and the anchor and cursor are the cells
 	// it spans. The selection lives only while the drag does: the release copies
 	// what it covers, so there is no highlight left to drift when the transcript
 	// moves under it.
-	selecting:          bool,
-	selection_anchor:   Cell_Point,
-	selection_cursor:   Cell_Point,
-	quit:               bool,
+	selecting:                  bool,
+	selection_anchor:           Cell_Point,
+	selection_cursor:           Cell_Point,
+	quit:                       bool,
 }
 
 // resolve_run_catalog builds the initial resolved catalog from local data only:
@@ -396,11 +397,20 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 }
 
 // session_install makes opened the running session in place of the one running,
-// whose chat and journal it releases. It takes everything opened owns and leaves
-// it zero. False means the tool registry could not be allocated, and no session runs.
+// whose chat and journal it releases after the target chat initializes. It takes
+// everything opened owns and leaves it zero. False leaves the running session intact.
 @(require_results)
 session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
-	if setup.store != nil { agent.chat_session_destroy(&setup.session) }
+	new_session, tool_error := agent.chat_session_init(opened.store, opened.id, opened.branch, opened.head, opened.workspace, setup.alloc)
+	if tool_error.kind != .None {
+		opened_session_destroy(opened, setup.alloc)
+		return false
+	}
+
+	if setup.store != nil {
+		agent.chat_session_destroy(&setup.session)
+		setup.workers_abandoned = setup.workers_abandoned || setup.session.workers_retained
+	}
 	// The session being replaced is released; its close failure changes nothing here.
 	_ = session_store_close(setup.store, setup.alloc)
 	delete(setup.workspace, setup.alloc)
@@ -410,17 +420,8 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 	setup.workspace = opened.workspace
 	setup.resumed_provider = opened.provider
 	setup.resumed_model = opened.model
-	id, branch, head := opened.id, opened.branch, opened.head
 	opened^ = {}
-
-	tool_error: agent.Tool_Registry_Error
-	setup.session, tool_error = agent.chat_session_init(setup.store, id, branch, head, setup.workspace, setup.alloc)
-	if tool_error.kind != .None {
-		// No session runs; the store is abandoned before the switch completes.
-		_ = session_store_close(setup.store, setup.alloc)
-		setup.store = nil
-		return false
-	}
+	setup.session = new_session
 	if agent.chat_session_apply_harness(&setup.session, setup.harness_options).kind != .None {
 		agent.log_emit({level = .Error, category = .Tool, event = "tools.agents_undescribed"})
 	}
@@ -595,16 +596,6 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 	selection_changed := app.setup.provider_id != provider_id || app.setup.model_id != model_id
 	connection_changed :=
 		app.run.connection.API != api || app.run.connection.Endpoint != resolved.connection.Endpoint || running.provider_transport != resolved.transport
-	// A different model invalidates a pending summary. A metadata-only refresh of
-	// the same model does not: it updates the facts used by the next request while
-	// preserving compaction already in flight.
-	if selection_changed { agent.chat_compact_cancel(running) }
-	if running.provider_websocket != nil && (selection_changed || connection_changed) {
-		ai.Provider_WebSocket_Session_Destroy(running.provider_websocket)
-		running.provider_websocket = nil
-	}
-	running.last_estimate = 0
-	running.last_input_measured = nil
 	// The level to carry over: an explicit one, or the one already in effect, which
 	// a model switch keeps whenever the new model allows it. It may alias the session's
 	// stored effort, which selecting replaces, so it is copied first.
@@ -616,19 +607,6 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 		return false
 	}
 	defer delete(carried, app.setup.alloc)
-	installed, applied := agent.chat_session_select(running, resolved, carried)
-	if !installed {
-		selection_fail(app, "the model selection could not be stored")
-		return false
-	}
-	// A carried level the new model does not allow falls back to the lowest level
-	// the model does state, so a switch never leaves an effort it cannot serve.
-	// With nothing to carry, the provider default stands.
-	if !applied && len(running.effort_levels) > 0 {
-		if !agent.chat_session_set_effort(running, running.effort_levels[0]) {
-			snap_append(app, .Warning, "the reasoning effort could not be applied")
-		}
-	}
 
 	// The runtime keeps its own copy of the selection, and provider_id and model_id
 	// may alias the strings being replaced, so the replacements are built before
@@ -645,15 +623,48 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 		selection_fail(app, "the model selection could not be stored")
 		return false
 	}
+	installed, applied := agent.chat_session_select(running, resolved, carried)
+	if !installed {
+		delete(setup_provider, app.setup.alloc)
+		delete(setup_model, app.setup.alloc)
+		delete(setup_endpoint, app.run.alloc)
+		delete(credential, app.setup.alloc)
+		selection_fail(app, "the model selection could not be stored")
+		return false
+	}
+	// A different model invalidates a pending summary. A metadata-only refresh of
+	// the same model does not: it updates the facts used by the next request while
+	// preserving compaction already in flight.
+	if selection_changed { agent.chat_compact_cancel(running) }
+	if running.provider_websocket != nil && (selection_changed || connection_changed) {
+		ai.Provider_WebSocket_Session_Destroy(running.provider_websocket)
+		running.provider_websocket = nil
+	}
+	running.last_estimate = 0
+	running.last_input_measured = nil
+	// A carried level the new model does not allow falls back to the lowest level
+	// the model does state, so a switch never leaves an effort it cannot serve.
+	// With nothing to carry, the provider default stands.
+	if !applied && len(running.effort_levels) > 0 {
+		if !agent.chat_session_set_effort(running, running.effort_levels[0]) {
+			snap_append(app, .Warning, "the reasoning effort could not be applied")
+		}
+	}
 
 	sync.mutex_lock(&app.run.mu)
-	delete(app.setup.credential, app.setup.alloc)
+	if app.setup.credential != "" {
+		if _, append_error := append(&app.retired_connection_strings, app.setup.credential); append_error != nil {
+			// Keep the old credential rather than freeing it under an operation that
+			// may still be using it.
+			snap_report_dropped(app, append_error)
+		}
+	}
 	app.setup.credential = credential
 	app.setup.api = api
 	// The endpoint the connection being replaced borrowed stays valid for any turn
 	// that already holds it.
 	if app.endpoint != "" {
-		if _, append_error := append(&app.retired_endpoints, app.endpoint); append_error != nil {
+		if _, append_error := append(&app.retired_connection_strings, app.endpoint); append_error != nil {
 			// The endpoint is left unfreed rather than freed under a turn that may
 			// still be talking to it, which is a leak and not a dangling pointer.
 			snap_report_dropped(app, append_error)

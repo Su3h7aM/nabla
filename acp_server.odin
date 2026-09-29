@@ -273,7 +273,7 @@ acp_server_destroy :: proc(server: ^Acp_Server) {
 	delete(server.active_message_id, server.alloc)
 	server.active_message_id = ""
 	snapshot_destroy(&server.app)
-	if agent.chat_session_workers_outstanding(&server.app.setup.session) {
+	if server.app.setup.workers_abandoned || agent.chat_session_workers_outstanding(&server.app.setup.session) {
 		agent.log_emit(agent.Log_Record{level = .Warning, category = .Runtime, event = "runtime.workers_outstanding"})
 		return
 	}

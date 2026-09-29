@@ -231,17 +231,16 @@ catalog_refresh_stop :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> b
 	return true
 }
 
-// catalog_run_destroy releases what the catalog side of a run owns: the refresh
-// snapshots, and the endpoints this run's connections borrowed. It runs after the
-// worker and the refresh thread stopped, so nothing can still be reading one.
+// catalog_run_destroy releases catalog snapshots and connection strings after all
+// workers that may borrow them have retired.
 catalog_run_destroy :: proc(app: ^App) {
 	agent.catalog_sources_destroy(&app.provider_sources, app.run.alloc)
 	agent.catalog_sources_destroy(&app.models_dev_sources, app.run.alloc)
 	delete(app.endpoint, app.run.alloc)
 	app.endpoint = ""
-	for endpoint in app.retired_endpoints { delete(endpoint, app.run.alloc) }
-	delete(app.retired_endpoints)
-	app.retired_endpoints = nil
+	for value in app.retired_connection_strings { delete(value, app.run.alloc) }
+	delete(app.retired_connection_strings)
+	app.retired_connection_strings = nil
 }
 
 catalog_changed :: proc(app: ^App) -> bool {
