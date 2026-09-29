@@ -158,14 +158,14 @@ Write every package to the standard of Odin's own `core:` packages. Before writi
 ## 4. Package map
 
 ```text
-foundation   text  input  term  layout  tui  tui/widgets
+foundation   text  markdown  input  term  layout  tui  tui/widgets
 libraries    dns  tls  http  http/client  sse  websocket  ai  mcp  acp  db  db/sqlite
 harness      agent  agent/journal  agent/material  root package (nabla executable)
 ```
 
 | Package | Owns | Must not contain |
 | --- | --- | --- |
-| foundation | text, input, terminal, layout, immediate-mode UI | anything about models, sessions, HTTP |
+| foundation | text, Markdown parsing, input, terminal, layout, immediate-mode UI | anything about models, sessions, HTTP |
 | `dns` `tls` `http` `http/client` `sse` `websocket` | protocols, transfer phases, byte and delivery facts | retries of model work, provider knowledge, harness logging policy |
 | `ai` | provider API families, encoding with caller-owned encode cache, stream decoding, failure classification, delivery evidence, one-send operations, Responses WebSocket connection | turn control, retry authorization, catalog policy, storage |
 | `mcp` | MCP client protocol over stdio, delivery state | tool policy, naming policy |
@@ -176,7 +176,7 @@ harness      agent  agent/journal  agent/material  root package (nabla executabl
 | `agent` | owner loop, state machine, jobs, tools, repair, policy, hooks, Lua runtime, Tasks, subagents, projection, compaction, catalog resolution, config parsing and validation | terminal, rendering, process-global UI state, file watching |
 | root | process lifetime, signals, config discovery and file watching, catalog refresh thread, TUI, headless, ACP server, diagnostics and export commands | a second copy of any `agent` policy |
 
-Rules: dependencies point inward; only root imports both foundation and `agent`; `agent/journal` imports only `db`, `db/sqlite`, and `core:`; `agent/material` imports only `core:`. `agent/material` replaces `agent/skills`. No further packages without a second consumer.
+Rules: dependencies point inward; only root imports both foundation and `agent`; `agent/journal` imports only `db`, `db/sqlite`, and `core:`; `agent/material` and `markdown` import only `core:`. `agent/material` replaces `agent/skills`. No further packages without a second consumer.
 
 ## 5. Identities and vocabulary
 
