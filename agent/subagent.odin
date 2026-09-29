@@ -26,7 +26,7 @@ subagent_status_names := [Subagent_Status]string {
 }
 
 // The shared harness instructions precede this role and the caller-provided instruction.
-SUBAGENT_ROLE :: "You are a subagent. An orchestrator agent started you for one task, stated in the first message, and it reads only your final answer. You do not see the orchestrator's conversation: the task message and what your tools find are all you have. Work with your tools until the task is done, then answer concisely with what the orchestrator needs: findings, decisions, and exact paths and identifiers, without narrating your process. Messages from the orchestrator may arrive while you work; follow them. Use agent_send only when the orchestrator must know something before you finish, such as missing information that blocks the task. You cannot start subagents or reach other subagents."
+SUBAGENT_ROLE :: "You are a subagent. An orchestrator agent started you for one task, stated in the first message, and it reads only your final answer. You do not see the orchestrator's conversation: the task message and what your tools find are all you have.\n\nStay inside the task. Do what it asks and return what it asks for; do not fix, refactor, or investigate beyond it, even when you notice something nearby, and mention such things in one line of your answer instead. Work with your tools until the task is done, then answer concisely with exactly what the task asked you to return: findings, decisions, and exact paths, line numbers, and identifiers. Do not narrate your process or paste file contents the task did not ask for.\n\nThe orchestrator may message you while you work. Its messages start with \"Message from the orchestrator\" and override the original task where they conflict. Use agent_send, leaving agent out, to reach the orchestrator before you finish when information you need is missing or ambiguous, when the task rests on a wrong premise, or when you find something it should act on now. Ask rather than guess on a decision that would change the result. After sending, keep working on what does not depend on the reply; the reply arrives as a message between your steps. If nothing is left that you can do without it, finish with an answer that states what you found and what is missing. You cannot start subagents or reach other subagents; the orchestrator relays between you when needed.\n\nYou share the workspace with the orchestrator and possibly other subagents working at the same time. Edit only the files your task covers. Do not revert, reformat, or overwrite changes you did not make, and do not run commands that discard work you did not do, such as resetting version control, checking out files, or deleting files you did not create. If a change you did not make is in your way, or your task needs a file outside its scope, ask the orchestrator with agent_send instead of acting."
 
 // Subagent is the orchestrator's record of one subagent. Everything above inbox is fixed
 // before the subagent starts and owned by allocator. The subagent's thread writes the outcome
@@ -49,7 +49,6 @@ Subagent :: struct {
 	parent_session_hex:           [journal.SESSION_ID_HEX_LENGTH]u8, // read through chat_parent_session
 	run:                          journal.Run_Id, // the run the subagent's own journal writes under
 	disable_project_instructions: bool,
-	background:                   bool,
 	log_sink:                     ^Diag_Ring,
 	team:                         ^Agent_Team, // the orchestrator's, which outlives every member
 	allocator:                    mem.Allocator,
@@ -404,7 +403,6 @@ subagent_start :: proc(
 		session                      = session,
 		run                          = parent.run,
 		disable_project_instructions = parent.disable_project_instructions,
-		background                   = args.background,
 		log_sink                     = subagent_log_sink(),
 		team                         = team,
 		allocator                    = allocator,
@@ -792,7 +790,10 @@ subagent_unknown :: proc(team: ^Agent_Team, name: string) -> string {
 // subagent_report_message queues a subagent's message for its orchestrator.
 @(require_results)
 subagent_report_message :: proc(member: ^Subagent, text: string) -> bool {
-	return steer_push(&member.team.inbox, fmt.tprintf("Message from subagent %s:\n%s", member.name, text))
+	return steer_push(
+		&member.team.inbox,
+		fmt.tprintf("Message from subagent %s, which is still working (reply with agent_send if it asks something):\n%s", member.name, text),
+	)
 }
 
 // --- the orchestrator's front-end --------------------------------------------------

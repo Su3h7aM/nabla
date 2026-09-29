@@ -768,7 +768,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 				provider = spawn.provider,
 				model = spawn.model,
 				effort = spawn.effort,
-				background = spawn.background,
+				background = !spawn.wait,
 			},
 		)
 	}

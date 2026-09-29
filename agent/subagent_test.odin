@@ -143,7 +143,7 @@ test_a_blocking_subagent_answers_the_call_that_started_it :: proc(test: ^testing
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW)
 	chat.client_instructions = strings.clone("parent-private-instructions", chat.allocator)
 
-	spawn := agent_provider_call(TOOL_AGENT_SPAWN_NAME, `{"instruction":"Answer with one word.","prompt":"what is six times seven"}`)
+	spawn := agent_provider_call(TOOL_AGENT_SPAWN_NAME, `{"instruction":"Answer with one word.","prompt":"what is six times seven","wait":true}`)
 	nested := agent_provider_call("builtin_codemode", `{"code":"return tools.agent_spawn({prompt = 'recurse'})"}`)
 	provider: Agent_Provider
 	if !agent_provider_start(test, &provider, {spawn, nested, agent_provider_reply("forty-two"), agent_provider_reply("done")}) { return }
@@ -213,7 +213,7 @@ test_a_blocking_subagent_answers_the_call_that_started_it :: proc(test: ^testing
 	testing.expect(test, answered != {} && children[0].id == answered, "the child's session is the one its start named")
 }
 
-// A background subagent works while its orchestrator continues. Its answer reaches the
+// A subagent runs in the background by default and works while its orchestrator continues. Its answer reaches the
 // orchestrator as a message once the orchestrator's turn is over, and starts a turn of its
 // own. With effort left out it runs one level below the orchestrator's.
 @(test)
@@ -228,7 +228,7 @@ test_a_background_subagent_reports_its_answer_as_a_message :: proc(test: ^testin
 	for level in levels { append(&chat.effort_levels, chat_clone_string(level, chat.allocator) or_else "") }
 	testing.expect(test, chat_session_set_effort(chat, "high"))
 
-	spawn := agent_provider_call(TOOL_AGENT_SPAWN_NAME, `{"prompt":"what is six times seven","model":"sub-model","background":true}`)
+	spawn := agent_provider_call(TOOL_AGENT_SPAWN_NAME, `{"prompt":"what is six times seven","model":"sub-model"}`)
 	orchestrator: Agent_Provider
 	if !agent_provider_start(test, &orchestrator, {spawn, agent_provider_reply("waiting"), agent_provider_reply("got it")}) { return }
 	defer agent_provider_stop(&orchestrator)
@@ -313,7 +313,7 @@ test_stopping_a_background_subagent_reports_to_its_parent :: proc(test: ^testing
 		allocator = context.allocator,
 		agents    = chat.team,
 	}
-	started := tool_agent_spawn_execute(&tool_context, Agent_Spawn_Args{prompt = "wait for instructions", background = true})
+	started := tool_agent_spawn_execute(&tool_context, Agent_Spawn_Args{prompt = "wait for instructions"})
 	defer tool_result_destroy(&started)
 	if !testing.expect_value(test, started.outcome, journal.Tool_Outcome.Success) { return }
 	stopped := tool_agent_stop_execute(&tool_context, Agent_Stop_Args{agent = "agent-1"})
@@ -391,12 +391,15 @@ test_an_acp_program_answers_as_a_subagent :: proc(test: ^testing.T) {
 		agents    = fixture.chat.team,
 	}
 
-	answered := tool_agent_spawn_execute(&tool_context, Agent_Spawn_Args{instruction = "Answer in one word.", prompt = "six times seven", acp_agent = "fake"})
+	answered := tool_agent_spawn_execute(
+		&tool_context,
+		Agent_Spawn_Args{instruction = "Answer in one word.", prompt = "six times seven", acp_agent = "fake", wait = true},
+	)
 	defer tool_result_destroy(&answered)
 	testing.expect_value(test, answered.outcome, journal.Tool_Outcome.Success)
 	testing.expect(test, strings.contains(answered.content, "forty-two") && !strings.contains(answered.content, "Let me compute"), answered.content)
 
-	failed := tool_agent_spawn_execute(&tool_context, Agent_Spawn_Args{prompt = "something else", acp_agent = "fake"})
+	failed := tool_agent_spawn_execute(&tool_context, Agent_Spawn_Args{prompt = "something else", acp_agent = "fake", wait = true})
 	defer tool_result_destroy(&failed)
 	testing.expect_value(test, failed.outcome, journal.Tool_Outcome.Tool_Failed)
 	testing.expect(test, strings.contains(failed.content, "prompt lost its instruction or task"), failed.content)
