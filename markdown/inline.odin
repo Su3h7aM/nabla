@@ -56,11 +56,12 @@ Inline_Bracket :: struct {
 // so far, the delimiter and bracket stacks that index them, and the line the
 // scanner works through.
 Inline_Parser :: struct {
-	tokens:     [dynamic]Inline_Token,
-	delimiters: [dynamic]Inline_Delimiter,
-	brackets:   [dynamic]Inline_Bracket,
-	line:       string,
-	position:   int,
+	tokens:       [dynamic]Inline_Token,
+	delimiters:   [dynamic]Inline_Delimiter,
+	brackets:     [dynamic]Inline_Bracket,
+	link_matches: [dynamic]int,
+	line:         string,
+	position:     int,
 }
 
 // parse_inlines parses the lines of one paragraph, heading, or table cell, which
@@ -75,9 +76,10 @@ parse_inlines :: proc(lines: []string, allocator: mem.Allocator) -> (spans: []Sp
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 
 	parser := Inline_Parser {
-		tokens     = make([dynamic]Inline_Token, context.temp_allocator),
-		delimiters = make([dynamic]Inline_Delimiter, context.temp_allocator),
-		brackets   = make([dynamic]Inline_Bracket, context.temp_allocator),
+		tokens       = make([dynamic]Inline_Token, context.temp_allocator),
+		delimiters   = make([dynamic]Inline_Delimiter, context.temp_allocator),
+		brackets     = make([dynamic]Inline_Bracket, context.temp_allocator),
+		link_matches = make([dynamic]int, context.temp_allocator),
 	}
 
 	for line, index in lines {
@@ -110,6 +112,7 @@ parse_inlines :: proc(lines: []string, allocator: mem.Allocator) -> (spans: []Sp
 // the last line of a paragraph, where a trailing backslash is literal.
 @(require_results)
 scan_line :: proc(parser: ^Inline_Parser, line: string, breakable_backslash: bool) -> (hard_break: bool, err: mem.Allocator_Error) {
+	_ = resize(&parser.link_matches, 0)
 	parser.line = line
 	parser.position = 0
 	for parser.position < len(line) {
@@ -242,8 +245,15 @@ scan_close_bracket :: proc(parser: ^Inline_Parser) -> (err: mem.Allocator_Error)
 		return
 	}
 	bracket := pop(&parser.brackets)
-	destination, next, ok := parse_link_target(line, parser.position)
-	if !bracket.active || !ok {
+	if !bracket.active || parser.position >= len(line) || line[parser.position] != '(' {
+		add_token(parser, line[position:position + 1]) or_return
+		return
+	}
+	if len(parser.link_matches) == 0 {
+		build_link_matches(line, &parser.link_matches) or_return
+	}
+	destination, next, ok := parse_link_target(line, parser.position, parser.link_matches[:])
+	if !ok {
 		// neither bracket is text after all
 		add_token(parser, line[position:position + 1]) or_return
 		return
@@ -308,13 +318,63 @@ parse_autolink :: proc(line: string, position: int) -> (text: string, next: int,
 	return
 }
 
-// parse_link_target parses `(destination "title")` at position, which must point
-// at the `(`, and returns the destination and the position after the closing
-// `)`. The destination excludes its angle brackets and keeps its escapes as
-// they are, and the title is discarded.
+// build_link_matches records matching unescaped parentheses and the first
+// destination boundary inside each pair. It also records the next unescaped
+// quote of each kind, so malformed titles do not rescan the same suffix.
 @(require_results)
-parse_link_target :: proc(line: string, position: int) -> (destination: string, next: int, ok: bool) {
-	if position >= len(line) || line[position] != '(' { return }
+build_link_matches :: proc(line: string, matches: ^[dynamic]int) -> (err: mem.Allocator_Error) {
+	resize(matches, len(line)) or_return
+	openings: [dynamic]int = make([dynamic]int, context.temp_allocator)
+	defer delete(openings)
+	last_single_quote, last_double_quote := -1, -1
+	for index := 0; index < len(line); {
+		character := line[index]
+		if character == '\\' && index + 1 < len(line) && is_punctuation_byte(line[index + 1]) {
+			index += 2
+			continue
+		}
+		if character <= ' ' || character == 0x7F {
+			for opening_index := len(openings) - 1; opening_index >= 0; opening_index -= 1 {
+				opening := openings[opening_index]
+				if matches[opening] >= 0 { break }
+				matches[opening] = index
+			}
+		}
+		switch character {
+		case '(':
+			matches[index] = -1
+			append(&openings, index) or_return
+		case ')':
+			if len(openings) > 0 {
+				opening := openings[len(openings) - 1]
+				boundary := matches[opening]
+				_ = resize(&openings, len(openings) - 1)
+				matches[opening] = index
+				matches[index] = boundary
+			}
+		case '\'':
+			matches[index] = -1
+			if last_single_quote >= 0 { matches[last_single_quote] = index }
+			last_single_quote = index
+		case '"':
+			matches[index] = -1
+			if last_double_quote >= 0 { matches[last_double_quote] = index }
+			last_double_quote = index
+		}
+		index += 1
+	}
+	for opening in openings { matches[opening] = -1 }
+	return
+}
+
+// parse_link_target parses `(destination "title")` at position, which must point
+// at the `(`, and returns the destination and the position after its matching
+// `)`. matches is built once for the line. The destination excludes its angle
+// brackets and keeps its escapes as they are, and the title is discarded.
+@(require_results)
+parse_link_target :: proc(line: string, position: int, matches: []int) -> (destination: string, next: int, ok: bool) {
+	if position >= len(line) || line[position] != '(' || matches[position] < 0 { return }
+	closing := matches[position]
 	index := position + 1
 	for index < len(line) && is_space_or_tab(line[index]) { index += 1 }
 	if index >= len(line) { return }
@@ -330,19 +390,25 @@ parse_link_target :: proc(line: string, position: int) -> (destination: string, 
 		index += 1
 	} else {
 		start := index
-		depth := 0
-		for index < len(line) {
+		for index < closing {
 			character := line[index]
 			if character == '\\' && index + 1 < len(line) && is_punctuation_byte(line[index + 1]) {
 				index += 2
 				continue
 			}
 			if character <= ' ' || character == 0x7F { break }
-			if character == '(' { depth += 1 }
-			if character == ')' {
-				if depth == 0 { break }
-				depth -= 1
+			if character == '(' {
+				nested_closing := matches[index]
+				if nested_closing < 0 { return }
+				boundary := matches[nested_closing]
+				if boundary >= 0 {
+					index = boundary
+					break
+				}
+				index = nested_closing + 1
+				continue
 			}
+			if character == ')' { break }
 			index += 1
 		}
 		if index == start { return }
@@ -359,9 +425,9 @@ parse_link_target :: proc(line: string, position: int) -> (destination: string, 
 	closed := false
 	switch line[index] {
 	case '"', '\'':
-		index, closed = skip_title(line, index, line[index])
+		index, closed = skip_title(index, matches)
 	case '(':
-		index, closed = skip_title(line, index, ')')
+		index, closed = skip_title(index, matches)
 	}
 	if !closed { return }
 	for index < len(line) && is_space_or_tab(line[index]) { index += 1 }
@@ -369,21 +435,12 @@ parse_link_target :: proc(line: string, position: int) -> (destination: string, 
 	return destination, index + 1, true
 }
 
-// skip_title scans the title that opens at position with opener and ends at its
-// first unescaped closer, returning the position after the closer.
+// skip_title returns the position after the title's matching closer.
 @(require_results)
-skip_title :: proc(line: string, position: int, closer: u8) -> (next: int, ok: bool) {
-	index := position + 1
-	for index < len(line) {
-		character := line[index]
-		if character == '\\' && index + 1 < len(line) && is_punctuation_byte(line[index + 1]) {
-			index += 2
-			continue
-		}
-		if character == closer { return index + 1, true }
-		index += 1
-	}
-	return index, false
+skip_title :: proc(position: int, matches: []int) -> (next: int, ok: bool) {
+	closing := matches[position]
+	if closing < 0 { return position, false }
+	return closing + 1, true
 }
 
 // process_emphasis matches delimiter runs into Emphasis, Strong, and

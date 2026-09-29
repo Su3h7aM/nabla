@@ -120,6 +120,30 @@ test_inline_markup :: proc(t: ^testing.T) {
 	expect_outline(t, "![alt](image.png)", "p {l=image.png:alt}\n")
 }
 
+LINK_TARGET_CANDIDATE_COUNT :: 4_096
+
+@(test)
+test_link_target_parsing_handles_unmatched_and_nested_parentheses :: proc(t: ^testing.T) {
+	builder := strings.builder_make(context.temp_allocator)
+	for _ in 0 ..< LINK_TARGET_CANDIDATE_COUNT {
+		strings.write_string(&builder, "[x](")
+	}
+	strings.write_byte(&builder, ')')
+	source := strings.to_string(builder)
+	document, err := parse(source)
+	if !testing.expect(t, err == nil, "unmatched link targets should remain text") { return }
+	defer destroy(&document)
+	if !testing.expect(t, len(document.blocks) == 1, "the line should parse as one block") { return }
+	switch block in document.blocks[0] {
+	case Paragraph:
+		if !testing.expect(t, len(block.spans) == 1, "the line should remain one text span") { return }
+		testing.expect_value(t, block.spans[0].text, source)
+	case Heading, Code_Block, Quote, List, Table, Thematic_Break:
+		testing.fail_now(t, "the line should parse as a paragraph")
+	}
+	expect_outline(t, "[x](a(b)c)", "p {l=a(b)c:x}\n")
+}
+
 @(test)
 test_line_breaks :: proc(t: ^testing.T) {
 	expect_outline(t, "soft\nbreak", "p soft break\n")
