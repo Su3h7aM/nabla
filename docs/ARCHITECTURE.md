@@ -622,7 +622,7 @@ Deterministic order, placed by the `ai` encoder into the API's fields:
 
 Parts 1 and 2 contain no timestamps, request ids, random ordering, or mutable lists. Tool definitions are encoded once per registry build. Unused skill and Task bodies never enter a request. The provider cache key derives from `Session_Id` only, so retries, branches, and reconnects share it. Legitimate prefix changes (snapshot adoption at a turn boundary, model or effort change, checkpoint install) are recorded with their cause in `request.prepared`.
 
-Replay: provider-native opaque items (encrypted reasoning, Responses output) are replayed only to the same API family and model; otherwise neutral text and calls are projected. Repaired calls project their effective arguments, never the original. Partial output is never projected as a complete message.
+Replay: provider-native opaque items (encrypted reasoning, signed or redacted thinking blocks, Responses output) are replayed only to the same API family and model; otherwise neutral text and calls are projected. Repaired calls project their effective arguments, never the original. Partial output is never projected as a complete message.
 
 ### 11.3 Chain, freeze, send
 

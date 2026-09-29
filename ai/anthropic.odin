@@ -11,9 +11,8 @@ import "core:strings"
 // present here rather than flattened into a common form, because flattening
 // loses exactly the fields that make a later request replay faithfully.
 //
-// Extended thinking is not requested by this adapter, so no thinking block is
-// expected on the way back. A response that carries one is not a failure: the
-// block is ignored instead of breaking an answer the model already produced.
+// Adaptive thinking may be enabled by default, so signed and redacted thinking
+// blocks must be preserved when the assistant turn is replayed after tool use.
 ANTHROPIC_VERSION :: "2023-06-01"
 
 // The block type names this adapter understands. Anything else is either
@@ -22,6 +21,9 @@ ANTHROPIC_VERSION :: "2023-06-01"
 ANTHROPIC_BLOCK_TEXT :: "text"
 ANTHROPIC_BLOCK_TOOL_USE :: "tool_use"
 ANTHROPIC_BLOCK_TOOL_RESULT :: "tool_result"
+ANTHROPIC_BLOCK_THINKING :: "thinking"
+ANTHROPIC_BLOCK_REDACTED_THINKING :: "redacted_thinking"
+ANTHROPIC_BLOCK_FALLBACK :: "fallback"
 
 // --- encoding ----------------------------------------------------------------
 
@@ -110,6 +112,8 @@ anthropic_encode_request :: proc(
 // into the open user turn until something that is not user content ends it. A
 // turn that ends up holding exactly one text block is emitted in the plain
 // string form, so an ordinary conversation encodes to the bytes it always has.
+// Consecutive assistant entries are one turn too: native replay items, text, and
+// tool calls remain in their response order without emitting adjacent roles.
 //
 // When cached is set, the last block of the last turn carries the cache breakpoint, so an
 // append-only history reuses its whole prefix as the conversation grows. The breakpoint is
@@ -142,8 +146,38 @@ anthropic_write_messages :: proc(
 	open_blocks := 0
 	open_texts := 0
 	turns := 0
+	assistant_skip_through := -1
 
 	for message, index in messages {
+		if index <= assistant_skip_through { continue }
+		if message.Role == .Assistant || (message.Role == .Invalid && message.Verbatim_Items != "") {
+			if open_blocks > 0 {
+				if err := anthropic_write_user_turn(cursor, body, messages[open:index], open_blocks, open_texts, false, &item_first); err != .None {
+					return err
+				}
+				turns += 1
+				open = -1
+				open_blocks = 0
+				open_texts = 0
+			}
+			assistant_end := index
+			for next_index := index + 1; next_index < len(messages); next_index += 1 {
+				next := messages[next_index]
+				if next.Role != .Assistant && !(next.Role == .Invalid && next.Verbatim_Items != "") { break }
+				assistant_end = next_index
+			}
+			marked :=
+				cached &&
+				last_written >= index &&
+				last_written <= assistant_end &&
+				(messages[last_written].Content != "" || len(messages[last_written].Tool_Calls) > 0)
+			if err := anthropic_write_assistant_turn(cursor, body, messages, index, assistant_end, turns == 0, marked, &item_first, allocator); err != .None {
+				return err
+			}
+			turns += 1
+			assistant_skip_through = assistant_end
+			continue
+		}
 		switch message.Role {
 		case .System, .Reasoning:
 			// The system prompt is the instruction lane, and a replayed reasoning
@@ -159,48 +193,7 @@ anthropic_write_messages :: proc(
 			if open < 0 { open = index }
 			open_blocks += 1
 		case .Assistant:
-			if open_blocks > 0 {
-				if err := anthropic_write_user_turn(cursor, body, messages[open:index], open_blocks, open_texts, false, &item_first); err != .None {
-					return err
-				}
-				turns += 1
-				open = -1
-				open_blocks = 0
-				open_texts = 0
-			}
-			// This API opens a conversation with a user turn. The only assistant
-			// turn that can come first is the checkpoint summary the harness
-			// carries, which is harness-authored context rather than something the
-			// model said, so it opens the conversation instead of being a message
-			// the API would refuse.
-			role := "assistant"
-			if turns == 0 && len(message.Tool_Calls) == 0 { role = "user" }
-			// An empty text block is refused, so a turn with nothing in it carries no breakpoint.
-			marked := cached && index == last_written && (message.Content != "" || len(message.Tool_Calls) > 0)
-			encode_write_item(cursor, body, &item_first)
-			field_first := true
-			encode_write_raw(cursor, body, "{")
-			encode_write_field(cursor, body, &field_first, "content")
-			if len(message.Tool_Calls) == 0 && !marked {
-				encode_write_text(cursor, body, message.Content)
-			} else {
-				encode_write_raw(cursor, body, "[")
-				block_first := true
-				if message.Content != "" {
-					encode_write_item(cursor, body, &block_first)
-					anthropic_write_text_block(cursor, body, message.Content, marked && len(message.Tool_Calls) == 0)
-				}
-				for call, call_index in message.Tool_Calls {
-					encode_write_item(cursor, body, &block_first)
-					call_marked := marked && call_index == len(message.Tool_Calls) - 1
-					if err := anthropic_write_tool_use(cursor, body, call, call_marked, allocator); err != .None { return err }
-				}
-				encode_write_raw(cursor, body, "]")
-			}
-			encode_write_field(cursor, body, &field_first, "role")
-			encode_write_literal_string(cursor, body, role)
-			encode_write_raw(cursor, body, "}")
-			turns += 1
+			return .Invalid_Message
 		case .Invalid:
 			return .Invalid_Message
 		}
@@ -208,6 +201,92 @@ anthropic_write_messages :: proc(
 	if open_blocks > 0 {
 		if err := anthropic_write_user_turn(cursor, body, messages[open:], open_blocks, open_texts, cached, &item_first); err != .None { return err }
 	}
+	return .None
+}
+
+@(private, require_results)
+anthropic_write_assistant_turn :: proc(
+	cursor: ^Encode_Cursor,
+	body: ^strings.Builder,
+	messages: []Provider_Message,
+	start, end: int,
+	first_turn: bool,
+	marked: bool,
+	item_first: ^bool,
+	allocator: mem.Allocator,
+) -> Provider_Request_Error {
+	text_count := 0
+	call_count := 0
+	last_text_index := -1
+	has_native_items := false
+	single_text := ""
+	for index := start; index <= end; index += 1 {
+		message := messages[index]
+		if message.Verbatim_Items != "" { has_native_items = true }
+		if message.Role != .Assistant { continue }
+		if message.Content != "" {
+			text_count += 1
+			last_text_index = index
+			single_text = message.Content
+		}
+		call_count += len(message.Tool_Calls)
+	}
+	if !has_native_items && text_count == 0 && call_count == 0 { return .Invalid_Message }
+	role := "assistant"
+	if first_turn && call_count == 0 { role = "user" }
+	encode_write_item(cursor, body, item_first)
+	field_first := true
+	encode_write_raw(cursor, body, "{")
+	encode_write_field(cursor, body, &field_first, "content")
+	if !has_native_items && call_count == 0 && !marked && text_count == 1 {
+		encode_write_text(cursor, body, single_text)
+	} else {
+		encode_write_raw(cursor, body, "[")
+		block_first := true
+		for index := start; index <= end; index += 1 {
+			message := messages[index]
+			if message.Verbatim_Items == "" { continue }
+			if message.Role != .Invalid && message.Role != .Assistant { return .Invalid_Message }
+			if err := anthropic_write_native_items(cursor, body, &block_first, message.Verbatim_Items); err != .None {
+				return err
+			}
+		}
+		for index := start; index <= end; index += 1 {
+			message := messages[index]
+			if message.Role != .Assistant || message.Content == "" { continue }
+			encode_write_item(cursor, body, &block_first)
+			text_marked := marked && call_count == 0 && index == last_text_index
+			anthropic_write_text_block(cursor, body, message.Content, text_marked)
+		}
+		call_index := 0
+		for index := start; index <= end; index += 1 {
+			message := messages[index]
+			if message.Role != .Assistant { continue }
+			for call in message.Tool_Calls {
+				encode_write_item(cursor, body, &block_first)
+				call_marked := marked && call_index == call_count - 1
+				if err := anthropic_write_tool_use(cursor, body, call, call_marked, allocator); err != .None { return err }
+				call_index += 1
+			}
+		}
+		if block_first { return .Invalid_Message }
+		encode_write_raw(cursor, body, "]")
+	}
+	encode_write_field(cursor, body, &field_first, "role")
+	encode_write_literal_string(cursor, body, role)
+	encode_write_raw(cursor, body, "}")
+	return .None
+}
+
+// anthropic_write_native_items writes the decoder's preserved thinking blocks before the
+// assistant message's projected text and tool calls, without changing their signatures.
+@(private, require_results)
+anthropic_write_native_items :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, block_first: ^bool, record: string) -> Provider_Request_Error {
+	if len(record) < 2 || record[0] != '[' || record[len(record) - 1] != ']' { return .Invalid_Message }
+	items := record[1:len(record) - 1]
+	if items == "" { return .None }
+	encode_write_item(cursor, body, block_first)
+	encode_write_raw(cursor, body, items)
 	return .None
 }
 
@@ -435,11 +514,103 @@ anthropic_block_fragment :: proc(state: ^Provider_Stream_State, index: i64) -> (
 	return fragment, .None
 }
 
+@(private, require_results)
+anthropic_native_append :: proc(state: ^Provider_Stream_State, text: string) -> Provider_Stream_Error {
+	if _, append_error := append(&state^.Native_Items, text); append_error != nil {
+		return provider_stream_fail_allocation(state, "thinking replay could not be retained")
+	}
+	return .None
+}
+
+@(private, require_results)
+anthropic_native_append_escaped :: proc(state: ^Provider_Stream_State, text: string) -> Provider_Stream_Error {
+	builder := strings.Builder {
+		buf = state^.Native_Items,
+	}
+	start := len(builder.buf)
+	cursor := Encode_Cursor{}
+	encode_write_quoted(&cursor, &builder, text)
+	state^.Native_Items = builder.buf
+	if cursor.error != .None { return provider_stream_fail_allocation(state, "thinking replay could not be retained") }
+	end := len(state^.Native_Items)
+	copy(state^.Native_Items[start:], state^.Native_Items[start + 1:end - 1])
+	_ = resize(&state^.Native_Items, end - 2)
+	return .None
+}
+
+@(private, require_results)
+anthropic_native_begin_item :: proc(state: ^Provider_Stream_State) -> Provider_Stream_Error {
+	if len(state^.Native_Items) == 0 {
+		return anthropic_native_append(state, "[")
+	}
+	return anthropic_native_append(state, ",")
+}
+
+@(private, require_results)
+anthropic_native_start_thinking :: proc(state: ^Provider_Stream_State, text: string) -> Provider_Stream_Error {
+	if state^.Native_Block != .None {
+		return provider_stream_fail(state, .Invalid_Data, "thinking block started before the preceding block stopped")
+	}
+	if err := anthropic_native_begin_item(state); err != .None { return err }
+	if err := anthropic_native_append(state, `{"type":"thinking","thinking":"`); err != .None { return err }
+	if err := anthropic_native_append_escaped(state, text); err != .None { return err }
+	state^.Native_Block = .Thinking
+	return .None
+}
+
+@(private, require_results)
+anthropic_native_start_redacted_thinking :: proc(state: ^Provider_Stream_State, data: string) -> Provider_Stream_Error {
+	if state^.Native_Block != .None {
+		return provider_stream_fail(state, .Invalid_Data, "redacted thinking block started before the preceding block stopped")
+	}
+	if err := anthropic_native_begin_item(state); err != .None { return err }
+	if err := anthropic_native_append(state, `{"type":"redacted_thinking","data":"`); err != .None { return err }
+	if err := anthropic_native_append_escaped(state, data); err != .None { return err }
+	return anthropic_native_append(state, `"}`)
+}
+
+@(private, require_results)
+anthropic_native_thinking_delta :: proc(state: ^Provider_Stream_State, text: string) -> Provider_Stream_Error {
+	if state^.Native_Block != .Thinking {
+		return provider_stream_fail(state, .Invalid_Data, "thinking delta has no open thinking block")
+	}
+	return anthropic_native_append_escaped(state, text)
+}
+
+@(private, require_results)
+anthropic_native_signature_delta :: proc(state: ^Provider_Stream_State, signature: string) -> Provider_Stream_Error {
+	if state^.Native_Block == .Thinking {
+		if err := anthropic_native_append(state, `","signature":"`); err != .None { return err }
+		state^.Native_Block = .Signature
+	} else if state^.Native_Block != .Signature {
+		return provider_stream_fail(state, .Invalid_Data, "signature delta has no open thinking block")
+	}
+	return anthropic_native_append_escaped(state, signature)
+}
+
+@(private, require_results)
+anthropic_native_stop_block :: proc(state: ^Provider_Stream_State) -> Provider_Stream_Error {
+	switch state^.Native_Block {
+	case .Thinking:
+		return provider_stream_fail(state, .Invalid_Data, "thinking block ended without a signature")
+	case .Signature:
+		if err := anthropic_native_append(state, `"}`); err != .None { return err }
+		state^.Native_Block = .None
+	case .Skipped:
+		state^.Native_Block = .None
+	case .None:
+	}
+	return .None
+}
+
 // anthropic_complete delivers the terminal event once the stream has stated why
 // it ended. Anthropic states the reason in message_delta and closes in a separate
 // message_stop, so the reason arrives before the end.
 @(private, require_results)
 anthropic_complete :: proc(state: ^Provider_Stream_State, reason_text: string) -> Provider_Stream_Error {
+	if state^.Native_Block != .None {
+		return provider_stream_fail(state, .Invalid_Data, "response ended with an unfinished content block")
+	}
 	reason := anthropic_stop_reason(reason_text)
 	calls: []Provider_Tool_Call
 	if reason == .Tool_Call {
@@ -450,13 +621,27 @@ anthropic_complete :: proc(state: ^Provider_Stream_State, reason_text: string) -
 		// A tool block that never became a usable call is a defect, not a stop.
 		return provider_stream_fail(state, .Invalid_Data, "response ended with unfinished tool calls")
 	}
+	raw_output := ""
+	if len(state^.Native_Items) > 0 {
+		if err := anthropic_native_append(state, "]"); err != .None {
+			Provider_Tool_Calls_Destroy(calls, state.Allocator)
+			return err
+		}
+		owned_output, output_error := strings.clone(string(state^.Native_Items[:]), state.Allocator)
+		if output_error != nil {
+			Provider_Tool_Calls_Destroy(calls, state.Allocator)
+			return provider_stream_fail_allocation(state, "thinking replay could not be retained")
+		}
+		raw_output = owned_output
+	}
 	owned_reason, reason_error := strings.clone(reason_text, state.Allocator)
 	if reason_error != nil {
 		Provider_Tool_Calls_Destroy(calls, state.Allocator)
+		if raw_output != "" { delete(raw_output, state.Allocator) }
 		return provider_stream_fail_allocation(state, "the completion reason could not be retained")
 	}
 	state^.Phase = .Completed
-	provider_stream_push(state, Provider_Completed_Event{Reason = reason, Reason_Text = owned_reason, Tool_Calls = calls})
+	provider_stream_push(state, Provider_Completed_Event{Reason = reason, Reason_Text = owned_reason, Tool_Calls = calls, Raw_Output = raw_output})
 	return .None
 }
 
@@ -619,6 +804,9 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 		if !block_ok { return provider_stream_fail(state, .Invalid_Data, "content block is not an object") }
 		block_type, _, block_type_ok := openai_value_string(block, "type")
 		if !block_type_ok || block_type == "" { return provider_stream_fail(state, .Invalid_Data, "content block has no type") }
+		if state^.Native_Block != .None {
+			return provider_stream_fail(state, .Invalid_Data, "content block started before the preceding block stopped")
+		}
 		switch block_type {
 		case ANTHROPIC_BLOCK_TEXT:
 			text, text_present, text_ok := openai_value_string(block, "text")
@@ -660,9 +848,17 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 				}
 			}
 			fragment.Present = true
-		case "thinking", "redacted_thinking":
-		// Not requested by this adapter; ignoring the block keeps an answer the
-		// model already produced from being discarded.
+		case ANTHROPIC_BLOCK_THINKING:
+			text, text_present, text_ok := openai_value_string(block, "thinking")
+			if !text_ok || !text_present { return provider_stream_fail(state, .Invalid_Data, "thinking block is invalid") }
+			return anthropic_native_start_thinking(state, text)
+		case ANTHROPIC_BLOCK_REDACTED_THINKING:
+			data, data_present, data_ok := openai_value_string(block, "data")
+			if !data_ok || !data_present { return provider_stream_fail(state, .Invalid_Data, "redacted thinking block is invalid") }
+			return anthropic_native_start_redacted_thinking(state, data)
+		case ANTHROPIC_BLOCK_FALLBACK:
+			// A model-boundary marker has no content to replay.
+			state^.Native_Block = .Skipped
 		case:
 			return provider_stream_fail(state, .Unsupported_Tool_Output, "unsupported content block", .None)
 		}
@@ -675,6 +871,7 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 		if !delta_ok { return provider_stream_fail(state, .Invalid_Data, "delta is not an object") }
 		delta_type, _, delta_type_ok := openai_value_string(delta, "type")
 		if !delta_type_ok || delta_type == "" { return provider_stream_fail(state, .Invalid_Data, "delta has no type") }
+		if state^.Native_Block == .Skipped { return .None }
 		switch delta_type {
 		case "text_delta":
 			text, text_present, text_ok := openai_value_string(delta, "text")
@@ -703,15 +900,22 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 					return provider_stream_fail_allocation(state, "the tool call arguments could not be retained")
 				}
 			}
-		case "thinking_delta", "signature_delta", "citations_delta":
-		// Not modelled: this adapter requests no thinking and sends no
-		// documents, so these updates carry nothing the harness can use.
+		case "thinking_delta":
+			text, text_present, text_ok := openai_value_string(delta, "thinking")
+			if !text_ok || !text_present { return provider_stream_fail(state, .Invalid_Data, "thinking delta is invalid") }
+			return anthropic_native_thinking_delta(state, text)
+		case "signature_delta":
+			signature, signature_present, signature_ok := openai_value_string(delta, "signature")
+			if !signature_ok || !signature_present { return provider_stream_fail(state, .Invalid_Data, "signature delta is invalid") }
+			return anthropic_native_signature_delta(state, signature)
+		case "citations_delta":
+		// Citation annotations have no representation in the Messages projection.
 		case:
 		// An unknown delta type is a protocol addition, not a defect.
 		}
 		return .None
 	case "content_block_stop":
-		return .None
+		return anthropic_native_stop_block(state)
 	case "message_delta":
 		if err := anthropic_usage_from(object, "usage", state); err != .None { return err }
 		if state^.Phase == .Completed { return .None }

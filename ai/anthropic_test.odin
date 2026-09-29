@@ -81,23 +81,24 @@ test_anthropic_encode_request_shape :: proc(t: ^testing.T) {
 
 	messages, messages_ok := object["messages"].(json.Array)
 	if !testing.expect(t, messages_ok) { return }
-	// user, assistant text, assistant tool call, user tool result: the two
-	// assistant turns and the result turn are each their own message.
-	if !testing.expect_value(t, len(messages), 4) { return }
+	// Consecutive assistant text and tool calls form one turn between the user
+	// prompt and the tool result.
+	if !testing.expect_value(t, len(messages), 3) { return }
 
 	first, first_ok := messages[0].(json.Object)
 	if !testing.expect(t, first_ok) { return }
 	role, _, _ := openai_value_string(first, "role")
 	testing.expect_value(t, role, "user")
 
-	// The tool call is a typed block whose input is an object, not a JSON string.
-	third, third_ok := messages[2].(json.Object)
+	// The tool call is a typed block after the text block, with an object input
+	// rather than a JSON string.
+	third, third_ok := messages[1].(json.Object)
 	if !testing.expect(t, third_ok) { return }
 	role, _, _ = openai_value_string(third, "role")
 	testing.expect_value(t, role, "assistant")
 	blocks, blocks_ok := third["content"].(json.Array)
-	if !testing.expect(t, blocks_ok && len(blocks) == 1) { return }
-	block, block_ok := blocks[0].(json.Object)
+	if !testing.expect(t, blocks_ok && len(blocks) == 2) { return }
+	block, block_ok := blocks[1].(json.Object)
 	if !testing.expect(t, block_ok) { return }
 	block_type, _, _ := openai_value_string(block, "type")
 	testing.expect_value(t, block_type, "tool_use")
@@ -111,7 +112,7 @@ test_anthropic_encode_request_shape :: proc(t: ^testing.T) {
 	testing.expect_value(t, command, "ls")
 
 	// The result names the call it answers and rides in a user turn.
-	fourth, fourth_ok := messages[3].(json.Object)
+	fourth, fourth_ok := messages[2].(json.Object)
 	if !testing.expect(t, fourth_ok) { return }
 	role, _, _ = openai_value_string(fourth, "role")
 	testing.expect_value(t, role, "user")
@@ -238,6 +239,104 @@ test_anthropic_stream_tool_use_arguments :: proc(t: ^testing.T) {
 	testing.expect_value(t, completed.Tool_Calls[0].Name, "shell")
 	testing.expect_value(t, completed.Tool_Calls[0].Arguments, `{"command":"ls"}`)
 	testing.expect_value(t, completed.Raw_Output, "")
+	destroy_events(events)
+}
+
+@(test)
+test_anthropic_stream_thinking_replays_before_tool_use :: proc(t: ^testing.T) {
+	state := Provider_Stream_Start(.Anthropic_Messages, context.temp_allocator)
+	defer Provider_Stream_Destroy(&state)
+
+	events := consume(t, `{"type":"content_block_start","index":0,"content_block":{"type":"fallback"}}`, &state, 0)
+	destroy_events(events)
+	events = consume(t, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"discard this boundary marker"}}`, &state, 0)
+	destroy_events(events)
+	events = consume(t, `{"type":"content_block_stop","index":0}`, &state, 0)
+	destroy_events(events)
+
+	events = consume(t, `{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}`, &state, 0)
+	destroy_events(events)
+	events = consume(t, `{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"Need inspect \"the source\".\n"}}`, &state, 0)
+	destroy_events(events)
+	events = consume(t, `{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"sig_"}}`, &state, 0)
+	destroy_events(events)
+	events = consume(t, `{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"abc"}}`, &state, 0)
+	destroy_events(events)
+	events = consume(t, `{"type":"content_block_stop","index":1}`, &state, 0)
+	destroy_events(events)
+
+	events = consume(t, `{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"shell","input":{}}}`, &state, 0)
+	destroy_events(events)
+	events = consume(t, `{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}`, &state, 0)
+	destroy_events(events)
+	events = consume(t, `{"type":"content_block_stop","index":2}`, &state, 0)
+	destroy_events(events)
+	events = consume(t, `{"type":"message_delta","delta":{"stop_reason":"tool_use"}}`, &state, 1)
+	completed := expect_event(t, events[0], Provider_Completed_Event)
+	if !testing.expect_value(t, completed.Reason, Provider_Finish_Reason.Tool_Call) { destroy_events(events); return }
+	if !testing.expect_value(t, len(completed.Tool_Calls), 1) { destroy_events(events); return }
+	testing.expect_value(t, completed.Raw_Output, `[{"type":"thinking","thinking":"Need inspect \"the source\".\n","signature":"sig_abc"}]`)
+	testing.expect_value(t, completed.Tool_Calls[0].ID, "toolu_1")
+	testing.expect_value(t, completed.Tool_Calls[0].Name, "shell")
+	testing.expect_value(t, completed.Tool_Calls[0].Arguments, `{"command":"ls"}`)
+
+	request_messages := make([]Provider_Message, 3, context.temp_allocator)
+	request_messages[0] = Provider_Message {
+		Role    = .User,
+		Content = "run it",
+	}
+	request_messages[1] = Provider_Message {
+		Role           = .Assistant,
+		Content        = "Running the command.",
+		Tool_Calls     = completed.Tool_Calls,
+		Verbatim_Items = completed.Raw_Output,
+	}
+	request_messages[2] = Provider_Message {
+		Role         = .Tool,
+		Content      = "done",
+		Tool_Call_ID = completed.Tool_Calls[0].ID,
+	}
+	request := Provider_Request {
+		API                       = .Anthropic_Messages,
+		Model_Present             = true,
+		Model                     = "claude-sonnet-5",
+		Messages_Present          = true,
+		Messages                  = request_messages,
+		Max_Output_Tokens_Present = true,
+		Max_Output_Tokens         = 256,
+	}
+	body, encode_error := Provider_Encode_Request(request, context.temp_allocator)
+	if !testing.expect_value(t, encode_error, Provider_Request_Error.None) { destroy_events(events); return }
+	value, parse_error := json.parse_string(body, .JSON, true, context.temp_allocator)
+	if !testing.expect_value(t, parse_error, nil) { destroy_events(events); return }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, object_ok := value.(json.Object)
+	if !testing.expect(t, object_ok) { destroy_events(events); return }
+	wire_messages, messages_ok := object["messages"].(json.Array)
+	if !testing.expect(t, messages_ok && len(wire_messages) == 3) { destroy_events(events); return }
+	assistant, assistant_ok := wire_messages[1].(json.Object)
+	if !testing.expect(t, assistant_ok) { destroy_events(events); return }
+	blocks, blocks_ok := assistant["content"].(json.Array)
+	if !testing.expect(t, blocks_ok && len(blocks) == 3) { destroy_events(events); return }
+	thinking_block, thinking_ok := blocks[0].(json.Object)
+	if !testing.expect(t, thinking_ok && len(thinking_block) == 3) { destroy_events(events); return }
+	block_type, _, _ := openai_value_string(thinking_block, "type")
+	thinking, _, _ := openai_value_string(thinking_block, "thinking")
+	signature, _, _ := openai_value_string(thinking_block, "signature")
+	testing.expect_value(t, block_type, ANTHROPIC_BLOCK_THINKING)
+	testing.expect_value(t, thinking, "Need inspect \"the source\".\n")
+	testing.expect_value(t, signature, "sig_abc")
+	text_block, text_ok := blocks[1].(json.Object)
+	if !testing.expect(t, text_ok) { destroy_events(events); return }
+	block_type, _, _ = openai_value_string(text_block, "type")
+	testing.expect_value(t, block_type, ANTHROPIC_BLOCK_TEXT)
+	text, _, _ := openai_value_string(text_block, "text")
+	testing.expect_value(t, text, "Running the command.")
+	tool_block, tool_ok := blocks[2].(json.Object)
+	if !testing.expect(t, tool_ok) { destroy_events(events); return }
+	block_type, _, _ = openai_value_string(tool_block, "type")
+	testing.expect_value(t, block_type, ANTHROPIC_BLOCK_TOOL_USE)
+	testing.expect_value(t, len(tool_block), 4)
 	destroy_events(events)
 }
 

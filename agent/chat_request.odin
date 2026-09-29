@@ -305,22 +305,30 @@ chat_append_projection :: proc(
 	// A response whose native output is not replayed is projected as text and calls. It is
 	// decided here, where the answer still decides what the whole request carries.
 	verbatim := make(map[journal.Request_Id]bool, allocator = context.temp_allocator)
-	if target.api == .OpenAI_Responses {
+	if target.api == .OpenAI_Responses || target.api == .Anthropic_Messages {
 		unfaithful := make(map[journal.Request_Id]bool, allocator = context.temp_allocator)
-		for item in items {
-			call, is_call := item.payload.(Projected_Call)
-			if !is_call { continue }
-			_, project, faithful := chat_replay_call(call)
-			if !project || !faithful { unfaithful[item.request] = true }
+		if target.api == .OpenAI_Responses {
+			for item in items {
+				call, is_call := item.payload.(Projected_Call)
+				if !is_call { continue }
+				_, project, faithful := chat_replay_call(call)
+				if !project || !faithful { unfaithful[item.request] = true }
+			}
 		}
 		for item in items {
 			response, is_response := item.payload.(Projected_Response)
 			if !is_response || item.request == 0 { continue }
 			if response.provider != target.provider || response.model != target.model { continue }
-			// A record that cannot be read is not replayed either: the projection is the
-			// copy left.
-			calls, readable := ai.Provider_Replay_Read(response.output, context.temp_allocator)
-			if readable && !unfaithful[item.request] && chat_replay_record_agrees(calls, item.request, items) {
+			if target.api == .OpenAI_Responses {
+				// A record that cannot be read is not replayed either: the projection is the
+				// copy left.
+				calls, readable := ai.Provider_Replay_Read(response.output, context.temp_allocator)
+				if readable && !unfaithful[item.request] && chat_replay_record_agrees(calls, item.request, items) {
+					verbatim[item.request] = true
+				} else {
+					replay_refused += 1
+				}
+			} else if response.output != "" {
 				verbatim[item.request] = true
 			} else {
 				replay_refused += 1
@@ -338,7 +346,7 @@ chat_append_projection :: proc(
 			chat_flush_calls(messages, call_lists, &group, &group_open) or_return
 			append(messages, ai.Provider_Message{Role = .User, Content = payload.text}) or_return
 		case Projected_Assistant:
-			if !covered {
+			if !covered || target.api == .Anthropic_Messages {
 				chat_flush_calls(messages, call_lists, &group, &group_open) or_return
 				append(messages, ai.Provider_Message{Role = .Assistant, Content = payload.text}) or_return
 			}
@@ -349,7 +357,7 @@ chat_append_projection :: proc(
 			// The provider id is indexed before the coverage check: a result names its
 			// call whether or not the call is projected.
 			provider_ids[payload.call] = payload.provider_id
-			if covered { continue }
+			if covered && target.api == .OpenAI_Responses { continue }
 			arguments, project, _ := chat_replay_call(payload)
 			if project {
 				append(

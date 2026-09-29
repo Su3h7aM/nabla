@@ -162,6 +162,56 @@ test_build_request_replays_verbatim_response_output_in_order :: proc(test: ^test
 }
 
 @(test)
+test_anthropic_request_replays_thinking_before_projected_content_and_calls :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(test, chat, "run printf ok")
+	request := journal.next_request(chat.store)
+	output := `[{"type":"thinking","thinking":"Check the command.","signature":"sig_1"}]`
+	_test_response(test, chat, request, "Working.", output)
+	request_test_call(test, chat, request, "toolu_1", `{"command":"printf tool-ok"}`)
+	connection := ai.Provider_Connection {
+		API      = .Anthropic_Messages,
+		Endpoint = "https://api.anthropic.com",
+	}
+	arena: virtual.Arena
+	preparation := request_test_prepare(test, chat, connection, &arena)
+	defer virtual.arena_destroy(&arena)
+	if !testing.expect_value(test, len(preparation.request.Messages), 5) { return }
+	testing.expect_value(test, preparation.request.Messages[1].Verbatim_Items, output)
+	testing.expect_value(test, preparation.request.Messages[2].Content, "Working.")
+	if !testing.expect_value(test, len(preparation.request.Messages[3].Tool_Calls), 1) { return }
+
+	body, encode_error := ai.Provider_Encode_Request(preparation.request)
+	if !testing.expect_value(test, encode_error, ai.Provider_Request_Error.None) { return }
+	defer delete(body)
+	value, parse_error := json.parse_string(body, .JSON, true, context.temp_allocator)
+	if !testing.expect_value(test, parse_error, nil) { return }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, object_ok := value.(json.Object)
+	if !testing.expect(test, object_ok) { return }
+	messages, messages_ok := object["messages"].(json.Array)
+	if !testing.expect(test, messages_ok && len(messages) == 3) { return }
+	assistant := item_object(test, messages, 1)
+	if !testing.expect_value(test, item_string(assistant, "role"), "assistant") { return }
+	blocks, blocks_ok := assistant["content"].(json.Array)
+	if !testing.expect(test, blocks_ok && len(blocks) == 3) { return }
+	thinking := item_object(test, blocks, 0)
+	testing.expect_value(test, item_string(thinking, "type"), "thinking")
+	testing.expect_value(test, item_string(thinking, "thinking"), "Check the command.")
+	testing.expect_value(test, item_string(thinking, "signature"), "sig_1")
+	text := item_object(test, blocks, 1)
+	testing.expect_value(test, item_string(text, "type"), "text")
+	testing.expect_value(test, item_string(text, "text"), "Working.")
+	call := item_object(test, blocks, 2)
+	testing.expect_value(test, item_string(call, "type"), "tool_use")
+	testing.expect_value(test, item_string(call, "id"), "toolu_1")
+}
+
+@(test)
 test_chat_completions_projects_entries_a_response_entry_covers :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
@@ -323,6 +373,9 @@ test_a_request_rebuilds_identically_and_only_appends :: proc(test: ^testing.T) {
 		_test_accept(test, chat, "run printf ok")
 		request := journal.next_request(chat.store)
 		output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Working.","annotations":[]}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"}]`
+		if connection.API == .Anthropic_Messages {
+			output = `[{"type":"thinking","thinking":"Checking the command.","signature":"sig_1"}]`
+		}
 		_test_response(test, chat, request, "Working.", output)
 		request_test_call(test, chat, request, "call_1", `{"command":"ls"}`, .Success, "fc_1")
 		// A finished answer follows the result, so the next user line is a message of its own

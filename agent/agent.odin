@@ -286,11 +286,10 @@ chat_session_feed_completion :: proc(chat: ^Chat_Session, source: Chat_Event_Sou
 	return true
 }
 
-// chat_session_feed_response_output stages the verbatim Responses output array
-// for the response being assembled. The output is the replay record; display
-// text and executable calls travel through their own feeds alongside it.
-// Only the Responses API calls this; Chat Completions has no replayable
-// output items to preserve.
+// chat_session_feed_response_output stages family-native replay data for the
+// response being assembled. Display text and executable calls travel through
+// their own feeds alongside it. Responses and Anthropic Messages supply replay
+// items; Chat Completions has none to preserve.
 @(require_results)
 chat_session_feed_response_output :: proc(chat: ^Chat_Session, source: Chat_Event_Source, output: string) -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
