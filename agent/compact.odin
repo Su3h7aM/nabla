@@ -695,6 +695,13 @@ chat_compact_start :: proc(
 	identity_installed := false
 	defer if !identity_installed { delete(new_identity, chat.allocator) }
 
+	// The start is recorded before the request's own row, so the commit that makes the send
+	// durable makes this durable with it.
+	chat_record(
+		chat,
+		{kind = .Compaction_Started, request = job.request, provider = chat.provider_id, model = chat.model_id},
+		journal.Compaction_Started{trigger = compact_trigger_name(trigger), covers = covered, head_estimate = job.snapshot.head_estimate},
+	)
 	if !chat_compact_begin_attempt(chat, job) {
 		chat_compact_job_destroy(job)
 		return false
@@ -717,22 +724,9 @@ chat_compact_start :: proc(
 	// A job that has started says so, from the one place a job starts. The front-end
 	// can then tell when a summary began and how long it took.
 	_observer_message(observer, .Notice, chat_compact_start_notice(trigger))
-
-	fields := [6]Log_Field {
-		{key = "trigger", value = compact_trigger_name(trigger)},
-		{key = "covers", value = i64(covered)},
-		{key = "base", value = i64(snapshot.base)},
-		{key = "source", value = i64(source)},
-		{key = "estimate", value = i64(compact_prep.estimate)},
-		{key = "context_window", value = i64(chat.capacity.window)},
-	}
-	// The record names the compaction request, not whichever foreground request
-	// happened to be at the boundary when it started. The binding belongs to the
-	// job so the worker can use the same sink after this owner scope returns.
-	previous_logger := context.logger
-	context.logger = log_rebind(&job.logging, log_correlation_for_request(chat, job.request))
-	log_emit({level = .Info, category = .Provider, event = "compaction.started", fields = fields[:]})
-	context.logger = previous_logger
+	// The worker logs through the job's own binding, correlated with the compaction's
+	// request rather than whichever foreground request was at the boundary.
+	_ = log_rebind(&job.logging, log_correlation_for_request(chat, job.request))
 	return true
 }
 
@@ -852,7 +846,7 @@ chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> boo
 // control boundary.
 @(private)
 chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
-	chat_compact_jobs_reclaim(&chat.abandoned_compactions)
+	chat_compact_jobs_reclaim(chat)
 	control := &chat.compact
 	job := control.job
 	if job == nil || job.thread == nil { return }
@@ -895,11 +889,7 @@ chat_compact_abandon :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: 
 	chat_finish_send(chat, job.request, job.attempts, {outcome = .Cancelled})
 	waited := time.Duration(0)
 	if at, stopped := job.stop_at.?; stopped { waited = time.tick_since(at) }
-	fields := [2]Log_Field {
-		{key = "waited_ms", value = i64(waited / time.Millisecond)},
-		{key = "patience_ms", value = Log_Duration_Milliseconds(TOOL_JOBS_STOP_PATIENCE)},
-	}
-	log_emit({level = .Error, category = .Provider, event = "compaction.abandoned", fields = fields[:]})
+	chat_record_job_abandoned(chat, {request = job.request, attempt = journal.Attempt_No(job.attempts)}, .Compaction, waited)
 	_observer_message(observer, .Notice, "compaction cancelled")
 	control.last_failure_at = time.tick_now()
 	control.trigger = .None
@@ -913,16 +903,18 @@ chat_compact_abandon :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: 
 
 // chat_compact_jobs_reclaim releases every abandoned summary whose worker has published since.
 // Its result is dropped, because the attempt already has the outcome it was recorded with, and
-// the worker is joined only now, when joining cannot block on it.
-chat_compact_jobs_reclaim :: proc(jobs: ^[dynamic]^Compact_Job) {
+// the worker is joined only now, when joining cannot block on it. Owner only: it records each
+// release in the session's journal.
+chat_compact_jobs_reclaim :: proc(chat: ^Chat_Session) {
+	jobs := &chat.abandoned_compactions
 	for index := len(jobs) - 1; index >= 0; index -= 1 {
 		job := jobs[index]
 		if !sync.atomic_load(&job.finished) { continue }
 		thread.destroy(job.thread)
 		job.thread = nil
+		chat_record_job_reclaimed(chat, {request = job.request, attempt = journal.Attempt_No(job.attempts)}, .Compaction)
 		chat_compact_job_destroy(job)
 		unordered_remove(jobs, index)
-		log_emit({level = .Info, category = .Provider, event = "compaction.reclaimed"})
 	}
 }
 
@@ -986,17 +978,6 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 	control.state = .Ready
 	control.last_failure_at = {}
 	control.omitted_features = {}
-
-	fields := [7]Log_Field {
-		{key = "trigger", value = compact_trigger_name(control.trigger)},
-		{key = "covers", value = i64(job.snapshot.covers)},
-		{key = "summary_bytes", value = i64(len(summary))},
-		{key = "head_estimate", value = i64(job.snapshot.head_estimate)},
-		{key = "input_tokens", value = log_optional_i64(job.usage.input_tokens)},
-		{key = "output_tokens", value = log_optional_i64(job.usage.output_tokens)},
-		{key = "elapsed_ms", value = Log_Duration_Milliseconds(time.tick_since(job.started_at))},
-	}
-	log_emit({level = .Info, category = .Provider, event = "compaction.finished", fields = fields[:]})
 	_observer_message(observer, .Notice, "background compaction finished; the summary is installed when the context reaches the size it was started for")
 }
 
@@ -1064,13 +1045,6 @@ chat_compact_install :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 		return false
 	}
 	control.checkpoint = node
-
-	fields := [3]Log_Field {
-		{key = "trigger", value = compact_trigger_name(control.trigger)},
-		{key = "covers", value = i64(job.snapshot.covers)},
-		{key = "request", value = i64(job.request)},
-	}
-	log_emit({level = .Info, category = .Provider, event = "compaction.installed", fields = fields[:]})
 	chat_compact_destroy_job(control, job)
 	// The measurement described the context that just went away, and so did the
 	// endpoint's report of it.
@@ -1314,7 +1288,7 @@ chat_compact_cancel :: proc(chat: ^Chat_Session) {
 // worker can still reach, and teardown never waits on a worker that ignores its stop.
 chat_compact_destroy :: proc(chat: ^Chat_Session) {
 	control := &chat.compact
-	chat_compact_jobs_reclaim(&chat.abandoned_compactions)
+	chat_compact_jobs_reclaim(chat)
 	job := control.job
 	if job != nil {
 		if control.state == .Backoff {
@@ -1331,8 +1305,9 @@ chat_compact_destroy :: proc(chat: ^Chat_Session) {
 		} else {
 			// The worker ignored its stop. The job, its frozen snapshot, and its thread handle
 			// stay where they are: they are what the worker may still be reading.
-			fields := [1]Log_Field{{key = "attempts", value = i64(job.attempts)}}
-			log_emit({level = .Error, category = .Provider, event = "compaction.abandoned", fields = fields[:]})
+			waited := time.Duration(0)
+			if at, stopped := job.stop_at.?; stopped { waited = time.tick_since(at) }
+			chat_record_job_abandoned(chat, {request = job.request, attempt = journal.Attempt_No(job.attempts)}, .Compaction, waited)
 		}
 	}
 	delete(control.attempted_identity, chat.allocator)

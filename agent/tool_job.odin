@@ -226,15 +226,16 @@ tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) {
 }
 
 // tool_jobs_reclaim releases every abandoned job whose worker has since published. Its call
-// already has its recorded outcome, so the late result is dropped.
-tool_jobs_reclaim :: proc(abandoned: ^[dynamic]^Tool_Job) {
+// already has its recorded outcome, so the late result is dropped. Owner only: it records
+// each release in the session's journal.
+tool_jobs_reclaim :: proc(chat: ^Chat_Session) {
+	abandoned := &chat.abandoned_jobs
 	for index := len(abandoned) - 1; index >= 0; index -= 1 {
 		job := abandoned[index]
 		if !sync.atomic_load(&job.published) { continue }
 		thread.destroy(job.thread)
 		job.thread = nil
-		fields := [1]Log_Field{{key = "tool", value = job.name}}
-		log_emit({level = .Info, category = .Tool, event = "tool.job_reclaimed", fields = fields[:]})
+		chat_record_job_reclaimed(chat, {call = job.exec.call}, .Tool)
 		tool_job_release(job)
 		unordered_remove(abandoned, index)
 	}
@@ -246,6 +247,19 @@ tool_jobs_reclaim :: proc(abandoned: ^[dynamic]^Tool_Job) {
 tool_jobs_mark_abandoned :: proc(jobs: ^Tool_Jobs, job: ^Tool_Job) {
 	job.phase = .Abandoned
 	if job.placement == .Worker { jobs.active -= 1 }
+}
+
+// tool_job_record_abandoned buffers the fact that the owner stopped waiting for a job's
+// worker, now being the owner's observation of the clock. Owner only.
+@(private)
+tool_job_record_abandoned :: proc(chat: ^Chat_Session, job: ^Tool_Job, now: time.Tick) {
+	_, parent_call := tool_job_record_placement(chat, job)
+	header := journal.Record {
+		request     = chat.request,
+		call        = job.call.call,
+		parent_call = parent_call,
+	}
+	chat_record_job_abandoned(chat, header, .Tool, time.tick_diff(job.stop_at, now))
 }
 
 @(private)
@@ -383,8 +397,6 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		job.output_base = chat_tool_output_path(chat, job.call.call, "", job.allocator)
 		job.exec.output_base = job.output_base
 	}
-	received := [2]Log_Field{{key = "tool", value = job.name}, {key = "arguments_bytes", value = i64(len(job.call.arguments))}}
-	log_emit({level = .Info, category = .Tool, event = "tool.call_received", fields = received[:]})
 	// The call is announced before anything decides whether it runs, so a front-end sees
 	// the proposal itself. The result that follows names the same call id whatever the
 	// harness decided here.
@@ -431,15 +443,6 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	// A provider call is admitted here, from the text it arrived as. A Lua child call arrives
 	// admitted, because its value came from Lua and was checked where it was read.
 	if job.admitted.status == .None { job.admitted = tool_arguments_prepare(job.call.arguments, job.allocator) }
-	repairs_text, repairs_error := tool_repairs_text(job.admitted.repairs, context.temp_allocator)
-	if repairs_error != nil { repairs_text = "unwritten: out of memory" }
-	prepared := [4]Log_Field {
-		{key = "tool", value = job.name},
-		{key = "status", value = tool_arguments_status_name(job.admitted.status)},
-		{key = "repairs", value = repairs_text},
-		{key = "effective_bytes", value = i64(len(job.admitted.effective))},
-	}
-	log_emit({level = .Debug, category = .Tool, event = "tool.arguments_prepared", fields = prepared[:]})
 
 	if job.admitted.allocation_failed {
 		job.result = tool_result_failure(&job.exec, .Tool_Failed, "the tool arguments could not be allocated", "allocation failed")
@@ -784,9 +787,6 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		tool_jobs_latch_stop(jobs, chat)
 		return
 	}
-	dispatched := [2]Log_Field{{key = "tool", value = job.name}, {key = "call", value = i64(job.call.call)}}
-	log_emit({level = .Info, category = .Tool, event = "tool.dispatch_committed", fields = dispatched[:]})
-
 	// Cancellation can land after the intent was recorded but before execution
 	// begins. The intent is durable, but the call never started.
 	if tool_control_cancelled(job.exec.control) {
@@ -795,6 +795,13 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		job.phase = .Result_Ready
 		return
 	}
+	// The executor may run on a worker, which never writes, so the start is recorded here
+	// at the owner's dispatch, the last point before its effect can begin.
+	chat_record(
+		chat,
+		{kind = .Tool_Started, node = node, request = chat.request, call = job.call.call, parent_call = parent_call},
+		journal.Tool_Started{tool = job.name},
+	)
 	if job.placement == .Owner {
 		job.result = tool_job_execute(job)
 		job.result_present = true
@@ -844,13 +851,7 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 		jobs.committed += 1
 		if !job.nested { jobs.committed_roots += 1 }
 	}
-	waited := time.tick_diff(job.stop_at, now)
-	fields := [3]Log_Field {
-		{key = "tool", value = job.name},
-		{key = "outcome", value = journal.TOOL_OUTCOME_NAMES[.Unknown]},
-		{key = "waited_ms", value = i64(waited / time.Millisecond)},
-	}
-	log_emit({level = .Error, category = .Tool, event = "tool.job_stuck", fields = fields[:]})
+	tool_job_record_abandoned(chat, job, now)
 	if recorded { _observer_tool_result(observer, job.name, &result) }
 	tool_result_destroy(&result)
 	if !recorded {
@@ -962,13 +963,6 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	if job.parent != nil {
 		codemode_job_child_committed(jobs, job, &result)
 	}
-
-	committed := [3]Log_Field {
-		{key = "tool", value = job.name},
-		{key = "outcome", value = journal.TOOL_OUTCOME_NAMES[result.outcome]},
-		{key = "call", value = i64(job.call.call)},
-	}
-	log_emit({level = .Info, category = .Tool, event = "tool.result_committed", fields = committed[:]})
 	_observer_tool_result(observer, job.name, &result)
 	tool_result_destroy(&result)
 	job.phase = .Retiring
@@ -977,19 +971,13 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 // tool_jobs_retire releases one settled job's execution resources and drops what could
 // not be recorded. A job whose worker ignored its stop is abandoned instead; this is the
 // only abandon path for a batch that can no longer record anything.
-tool_jobs_retire :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
+tool_jobs_retire :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, now: time.Tick) {
 	job := tool_jobs_retirable(jobs, now)
 	if job == nil { return }
 
 	if !tool_job_releasable(job) {
 		tool_jobs_mark_abandoned(jobs, job)
-		waited := time.tick_diff(job.stop_at, now)
-		fields := [3]Log_Field {
-			{key = "tool", value = job.name},
-			{key = "outcome", value = journal.TOOL_OUTCOME_NAMES[.Unknown]},
-			{key = "waited_ms", value = i64(waited / time.Millisecond)},
-		}
-		log_emit({level = .Error, category = .Tool, event = "tool.job_stuck", fields = fields[:]})
+		tool_job_record_abandoned(chat, job, now)
 		return
 	}
 	if job.result_present {
@@ -1029,20 +1017,14 @@ tool_jobs_await :: proc(jobs: ^Tool_Jobs, deadline: Maybe(time.Tick)) {
 
 // --- the executor --------------------------------------------------------------
 
-// tool_job_execute runs one admitted call and logs what it observed. It runs on
-// whichever thread owns the job, so every record it makes carries the job's own
-// correlation rather than the caller's.
+// tool_job_execute runs one admitted call. It runs on whichever thread owns the job, so
+// every diagnostic it makes carries the job's own correlation rather than the caller's.
 @(private, require_results)
 tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
 	previous := context.logger
 	context.logger = log_logger(&job.logging)
 	defer context.logger = previous
-	started := [1]Log_Field{{key = "tool", value = job.name}}
-	log_emit({level = .Info, category = .Tool, event = "tool.execution_started", fields = started[:]})
-	result := job.execute(&job.exec, job.arguments)
-	finished := [2]Log_Field{{key = "tool", value = job.name}, {key = "outcome", value = journal.TOOL_OUTCOME_NAMES[result.outcome]}}
-	log_emit({level = .Info, category = .Tool, event = "tool.execution_finished", fields = finished[:]})
-	return result
+	return job.execute(&job.exec, job.arguments)
 }
 
 // tool_job_launch starts one worker-placed job. The watched signals are blocked across

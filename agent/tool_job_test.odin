@@ -130,7 +130,7 @@ tool_job_test_step_at :: proc(tool_test: ^Tool_Test, jobs: ^Tool_Jobs, now: time
 	case .Abandon:
 		tool_jobs_abandon(jobs, chat, {}, now)
 	case .Retire:
-		tool_jobs_retire(jobs, now)
+		tool_jobs_retire(jobs, chat, now)
 	case .Dispatch:
 		tool_jobs_dispatch(jobs, chat)
 	case .Wait:
@@ -751,6 +751,7 @@ test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(test: ^testi
 	tool_job_test_hold_until(test, &hold, 1)
 
 	// The call's own stop, as its timeout would ask for it: the turn itself keeps running.
+	deaf_call := jobs.jobs[0].call.call
 	tool_job_request_stop(jobs.jobs[0])
 	// The stop is observed at the tick it was asked for, and the call is still running, so
 	// there is nothing to do but wait for it.
@@ -789,6 +790,27 @@ test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(test: ^testi
 		time.sleep(time.Millisecond)
 	}
 	testing.expect(test, !chat_session_workers_outstanding(chat), "a worker that returned must be reclaimed")
+
+	// Giving up on the worker and releasing it late are both recorded, under the call they
+	// concern and not the queued call that only waited behind it.
+	_test_commit(test, chat)
+	records := _test_records(test, chat, {.Job_Abandoned, .Job_Reclaimed})
+	if !testing.expect_value(test, len(records), 2) { return }
+	testing.expect_value(test, records[0].kind, journal.Record_Kind.Job_Abandoned)
+	testing.expect_value(test, records[1].kind, journal.Record_Kind.Job_Reclaimed)
+	for record in records { testing.expect_value(test, record.call, deaf_call) }
+	abandoned: journal.Job_Abandoned
+	if decode_error := journal.payload_decode(records[0].data, &abandoned, context.temp_allocator); decode_error != nil {
+		testing.fail_now(test, "the abandonment could not be decoded")
+	}
+	testing.expect_value(test, abandoned.job, journal.JOB_KIND_NAMES[.Tool])
+	testing.expect(test, abandoned.waited_ms >= i64(TOOL_JOBS_STOP_PATIENCE / time.Millisecond), "the wait covers the whole patience")
+	testing.expect_value(test, abandoned.patience_ms, i64(TOOL_JOBS_STOP_PATIENCE / time.Millisecond))
+	reclaimed: journal.Job_Reclaimed
+	if decode_error := journal.payload_decode(records[1].data, &reclaimed, context.temp_allocator); decode_error != nil {
+		testing.fail_now(test, "the reclaim could not be decoded")
+	}
+	testing.expect_value(test, reclaimed.job, journal.JOB_KIND_NAMES[.Tool])
 }
 
 // A cancelled turn still answers every committed call: the running call is stopped

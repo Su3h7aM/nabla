@@ -1110,7 +1110,6 @@ acp_run :: proc(
 	// The writer is opened and the logger installed in the scope that owns the run, so
 	// the launch and every turn below it are recorded.
 	context.logger = run_log_open(&server.app.setup)
-	run_log_header(&server.app.setup)
 	if !run_catalog(sources, mcp_servers, &server.app.setup, Session_Start{kind = .New}) { return false }
 	server_cleanup_managed = true
 	defer {

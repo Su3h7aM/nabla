@@ -273,12 +273,6 @@ chat_response_cost :: proc(chat: ^Chat_Session, text, notice: string) -> int {
 @(private, require_results)
 chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (recorded: bool) {
 	if chat.turn == 0 { return true }
-	// The turn is still identifiable here, which is what the end record carries.
-	binding: Log_Binding
-	previous_logger := context.logger
-	defer context.logger = previous_logger
-	context.logger = log_rebind(&binding, log_correlation(chat))
-
 	if text := string(chat.partial_assistant[:]); text != "" {
 		chat_node(chat, .Assistant, journal.Assistant{request = chat.request, partial = true}, transmute([]u8)text)
 		chat_partial_assistant_clear(chat)
@@ -303,15 +297,6 @@ chat_persist_turn_end :: proc(chat: ^Chat_Session, effect: Chat_Effect) -> (reco
 	if chat.turn_repair_refusal != .None { completed.cause = chat_repair_refusal_name(chat.turn_repair_refusal) }
 	chat_record(chat, {kind = .Turn_Completed}, completed)
 	recorded = chat_commit(chat, "the turn outcome could not be recorded")
-
-	finished := [5]Log_Field {
-		{key = "outcome", value = journal.TURN_OUTCOME_NAMES[outcome]},
-		{key = "recorded", value = recorded},
-		{key = "requests", value = i64(chat.requests_made)},
-		{key = "calls", value = i64(chat.calls_made)},
-		{key = "status", value = chat_terminal_text(chat.terminal_status)},
-	}
-	log_emit({level = .Info, category = .Agent, event = "turn.finished", fields = finished[:]})
 	chat.turn = 0
 	chat.request = 0
 	// A turn that ended without running its staged calls, such as one a durable

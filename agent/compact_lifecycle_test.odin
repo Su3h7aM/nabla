@@ -262,6 +262,21 @@ test_a_background_compaction_keeps_the_work_that_followed_it :: proc(test: ^test
 	if !compact_await_state(test, chat, .Ready) { return }
 	testing.expect(test, chat_compact_install(chat, {}))
 
+	// The start is recorded under the compaction's own request, before the summary that ends it.
+	compaction := _test_records(test, chat, {.Compaction_Started, .Compaction_Completed})
+	if !testing.expect_value(test, len(compaction), 2) { return }
+	testing.expect_value(test, compaction[0].kind, journal.Record_Kind.Compaction_Started)
+	testing.expect_value(test, compaction[1].kind, journal.Record_Kind.Compaction_Completed)
+	testing.expect(test, compaction[0].request != 0, "the start names the compaction's request")
+	testing.expect_value(test, compaction[0].request, compaction[1].request)
+	started: journal.Compaction_Started
+	if decode_error := journal.payload_decode(compaction[0].data, &started, context.temp_allocator); decode_error != nil {
+		testing.fail_now(test, "the compaction start could not be decoded")
+	}
+	testing.expect_value(test, started.trigger, compact_trigger_name(.Agent_Tool))
+	testing.expect(test, started.covers != 0, "the start names the node the summary replaces")
+	testing.expect(test, started.head_estimate > 0, "the start carries the estimate of the context it covers")
+
 	// The active context is the checkpoint and everything after the boundary it
 	// covers, including the entry appended while the summary was in flight.
 	projection := _test_projection(test, chat, &arena)
@@ -1176,6 +1191,7 @@ test_a_summary_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
 	interrupted := _test_records(test, chat, {.Request_Interrupted})
 	if !testing.expect_value(test, len(interrupted), 1) { return }
 	testing.expect_value(test, interrupted[0].request, job.request)
+	request := job.request
 
 	// The slot is free, so new work takes over from the worker that did not stop.
 	testing.expect_value(test, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
@@ -1189,6 +1205,20 @@ test_a_summary_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
 		time.sleep(time.Millisecond)
 	}
 	testing.expect_value(test, len(chat.abandoned_compactions), 0)
+
+	// Giving up on the worker and releasing it late are both recorded, under the summary's request.
+	_test_commit(test, chat)
+	jobs := _test_records(test, chat, {.Job_Abandoned, .Job_Reclaimed})
+	if !testing.expect_value(test, len(jobs), 2) { return }
+	testing.expect_value(test, jobs[0].kind, journal.Record_Kind.Job_Abandoned)
+	testing.expect_value(test, jobs[1].kind, journal.Record_Kind.Job_Reclaimed)
+	for record in jobs { testing.expect_value(test, record.request, request) }
+	abandoned: journal.Job_Abandoned
+	if decode_error := journal.payload_decode(jobs[0].data, &abandoned, context.temp_allocator); decode_error != nil {
+		testing.fail_now(test, "the abandonment could not be decoded")
+	}
+	testing.expect_value(test, abandoned.job, journal.JOB_KIND_NAMES[.Compaction])
+	testing.expect_value(test, abandoned.patience_ms, i64(TOOL_JOBS_STOP_PATIENCE / time.Millisecond))
 }
 
 // Teardown asks a summary's worker to stop and abandons it when it does not: nothing the worker

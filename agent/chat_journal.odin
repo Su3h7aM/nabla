@@ -1,5 +1,7 @@
 package agent
 
+import "core:time"
+
 import "nabla:agent/journal"
 
 // chat_record buffers one fact of the running session. The session, branch, and
@@ -46,4 +48,29 @@ chat_commit :: proc(chat: ^Chat_Session, what: string) -> bool {
 // a path, or a person reads. The text lives in the chat.
 chat_session_text :: proc(chat: ^Chat_Session) -> string {
 	return journal.session_id_to_hex(chat.session, chat.session_hex[:])
+}
+
+// chat_record_job_abandoned buffers that the owner stopped waiting for a worker of the
+// given kind that ignored its stop for waited, out of TOOL_JOBS_STOP_PATIENCE. The header
+// names the call, request, or subagent the worker served. Owner only.
+chat_record_job_abandoned :: proc(chat: ^Chat_Session, header: journal.Record, kind: journal.Job_Kind, waited: time.Duration) {
+	header := header
+	header.kind = .Job_Abandoned
+	chat_record(
+		chat,
+		header,
+		journal.Job_Abandoned {
+			job = journal.JOB_KIND_NAMES[kind],
+			waited_ms = i64(waited / time.Millisecond),
+			patience_ms = i64(TOOL_JOBS_STOP_PATIENCE / time.Millisecond),
+		},
+	)
+}
+
+// chat_record_job_reclaimed buffers that the owner released a retained worker of the
+// given kind after it finished late. Owner only.
+chat_record_job_reclaimed :: proc(chat: ^Chat_Session, header: journal.Record, kind: journal.Job_Kind) {
+	header := header
+	header.kind = .Job_Reclaimed
+	chat_record(chat, header, journal.Job_Reclaimed{job = journal.JOB_KIND_NAMES[kind]})
 }

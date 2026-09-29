@@ -82,7 +82,7 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 
 	// The global order is the order the items were appended in, and a node's
 	// node.committed record is part of it.
-	expected := [?]Record_Kind{.Session_Created, .Branch_Created, .Turn_Started, .Node_Committed}
+	expected := [?]Record_Kind{.Session_Created, .Session_Claimed, .Branch_Created, .Turn_Started, .Node_Committed, .Session_Released}
 	testing.expect_value(test, len(records), len(expected))
 	previous := Journal_Seq(0)
 	for record, index in records {
@@ -185,9 +185,9 @@ test_buffered_records_are_invisible_until_a_commit :: proc(test: ^testing.T) {
 		testing.expectf(test, len(records) == want, "%s: expected %d records, read %d", what, want, len(records))
 	}
 
-	// The session created here holds its own two records before the first
+	// The session created here holds its own three records before the first
 	// observation is buffered.
-	SESSION_RECORDS :: 2
+	SESSION_RECORDS :: 3
 
 	expect_records(test, &reader, session, 0, "before any commit")
 
@@ -308,7 +308,7 @@ test_a_failed_commit_latches_and_drops_appends :: proc(test: ^testing.T) {
 	// What was committed before the failure is still readable.
 	records := _records_of_session(test, &journal, session)
 	defer records_destroy(records, context.allocator)
-	testing.expect_value(test, len(records), 3)
+	testing.expect_value(test, len(records), 4)
 }
 
 @(test)
@@ -396,4 +396,35 @@ test_a_session_created_here_is_claimed_and_numbered :: proc(test: ^testing.T) {
 	testing.expect_value(test, summaries[0].parent_call, Call_Id(7))
 	testing.expect_value(test, summaries[0].title, "")
 	testing.expect_value(test, summaries[1].id, parent)
+}
+
+// A resumed claim and its close leave the claim and the release, written by the
+// journal itself.
+@(test)
+test_a_claim_and_its_close_record_claimed_then_released :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	creator: Journal
+	_open_journal(test, &creator, directory)
+	session := _create_session(test, &creator, {workspace = "/tmp/project", role = .Main})
+	_expect_ok(test, close(&creator))
+
+	resumer: Journal
+	_open_journal(test, &resumer, directory)
+	_, claim_error := claim(&resumer, session)
+	_expect_ok(test, claim_error)
+	_expect_ok(test, close(&resumer))
+
+	reader: Journal
+	_open_journal(test, &reader, directory, .Read_Only)
+	defer _close_journal(test, &reader)
+	records := _records_of_session(test, &reader, session)
+	defer records_destroy(records, context.allocator)
+
+	expected := [?]Record_Kind{.Session_Created, .Session_Claimed, .Branch_Created, .Session_Released, .Session_Claimed, .Session_Released}
+	testing.expect_value(test, len(records), len(expected))
+	for record, index in records {
+		if index < len(expected) { testing.expect_value(test, record.kind, expected[index]) }
+	}
 }

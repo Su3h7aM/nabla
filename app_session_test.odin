@@ -104,9 +104,10 @@ app_session_end :: proc(app: ^App, directory: string) {
 // catalog teardown an empty setup does not need.
 attach_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
-	_ = session_store_close(setup.store, setup.alloc)
-	setup.store = nil
 	run_log_close(setup)
+	// The launch's own teardown; a close failure changes nothing the test reads.
+	_ = run_store_close(setup)
+	setup.store = nil
 	delete(setup.workspace, setup.alloc)
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
@@ -1185,37 +1186,70 @@ test_refresh_without_servers_is_silent :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_a_switch_records_the_claim_and_the_release :: proc(t: ^testing.T) {
-	app: App
-	directory := app_session_begin(t, &app)
+test_a_launch_records_its_run_and_the_claims_of_its_sessions :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
+	state, previous, had_previous := app_state_isolate(t)
+	defer app_state_restore(state, previous, had_previous)
 
-	ring, allocation_error := new(agent.Diag_Ring, app.setup.alloc)
-	if allocation_error != nil { testing.fail_now(t, "could not allocate diagnostics") }
-	defer {
-		app_session_end(&app, directory)
-		free(ring, context.allocator)
+	workspace, workspace_err := os.get_working_directory(context.allocator)
+	if workspace_err != nil { testing.fail_now(t, "could not read the working directory") }
+	defer delete(workspace, context.allocator)
+
+	// The first launch starts a session, which its first prompt creates and claims.
+	first_setup: Run_Setup
+	first_setup.alloc = context.allocator
+	defer attach_setup_destroy(&first_setup)
+	if !testing.expect(t, run_session_attach_test(&first_setup, workspace, {kind = .New}, &err_text)) { return }
+	session := first_setup.session.session
+	first_run := first_setup.run
+	directory, clone_error := strings.clone(first_setup.journal_directory, context.temp_allocator)
+	if !testing.expect_value(t, clone_error, nil) { return }
+	app_session_turn(t, &first_setup)
+	attach_setup_destroy(&first_setup)
+
+	// The second launch resumes it, which claims it when the launch takes it.
+	second_setup: Run_Setup
+	second_setup.alloc = context.allocator
+	defer attach_setup_destroy(&second_setup)
+	if !testing.expect(t, run_session_attach_test(&second_setup, workspace, {kind = .Resume_Latest}, &err_text)) { return }
+	second_run := second_setup.run
+	attach_setup_destroy(&second_setup)
+	testing.expect(t, first_run != second_run, "each launch is a run of its own")
+
+	reader: journal.Journal
+	if open_error := journal.open(&reader, directory, "", journal.run_id_create(), .Read_Only, context.allocator); open_error != nil {
+		testing.fail_now(t, "the journal could not be opened for reading")
 	}
-	app.setup.log_binding = agent.Log_Binding {
-		ring = ring,
+	defer _ = journal.close(&reader)
+	records, _, read_error := journal.read_records(
+		&reader,
+		{kinds = {.Run_Started, .Session_Claimed, .Run_Finished, .Session_Released}},
+		0,
+		0,
+		context.temp_allocator,
+	)
+	if !testing.expect_value(t, read_error, nil) { return }
+
+	// Each launch opens its run, claims the session, ends its run, and the journal close releases the session.
+	expected := [?]journal.Record_Kind{.Run_Started, .Session_Claimed, .Run_Finished, .Session_Released}
+	if !testing.expect_value(t, len(records), 2 * len(expected)) { return }
+	for record, index in records {
+		testing.expect_value(t, record.kind, expected[index % len(expected)])
+		testing.expect_value(t, record.run, first_run if index < len(expected) else second_run)
+		is_run_record := record.kind == .Run_Started || record.kind == .Run_Finished
+		testing.expect_value(t, record.session, journal.Session_Id{} if is_run_record else session)
 	}
-	context.logger = agent.log_logger(&app.setup.log_binding)
 
-	first := app.setup.session.session
-
-	// A new session displaces the running one, so both facts belong in the record.
-	testing.expect(t, session_switch(&app, {kind = .New}))
-	second := app.setup.session.session
-	testing.expect(t, first != second, "a new session must be a different session")
-
-	claimed, released := false, false
-	entry: agent.Diag_Entry
-	for agent.diag_pop(ring, &entry) {
-		text := string(entry.text[:entry.text_length])
-		if entry.session == second && strings.contains(text, "session.claimed resumed=false") { claimed = true }
-		if entry.session == first && strings.contains(text, "session.released") { released = true }
-	}
-	testing.expect(t, claimed, "the fresh session's claim is recorded")
-	testing.expect(t, released, "the replaced session's release is recorded")
+	started: journal.Run_Started
+	testing.expect_value(t, journal.payload_decode(records[0].data, &started, context.temp_allocator), nil)
+	testing.expect_value(t, started.pid, int(os.get_pid()))
+	claimed: journal.Session_Claimed
+	testing.expect_value(t, journal.payload_decode(records[1].data, &claimed, context.temp_allocator), nil)
+	testing.expect(t, !claimed.resumed, "a session the launch created is not a resumed one")
+	testing.expect_value(t, journal.payload_decode(records[5].data, &claimed, context.temp_allocator), nil)
+	testing.expect(t, claimed.resumed, "a session an earlier launch left is a resumed one")
 }
 
 @(test)

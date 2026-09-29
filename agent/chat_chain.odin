@@ -115,6 +115,10 @@ Chat_Abandoned_Attempt :: struct {
 	worker:    ^thread.Thread,
 	mailbox:   ^Owner_Mailbox,
 	arena:     virtual.Arena,
+	// request and attempt name the send the worker was running, which is what its
+	// reclaim is recorded under after the chain that made it is gone.
+	request:   journal.Request_Id,
+	attempt:   journal.Attempt_No,
 	// websocket records that the worker may still be using the session's WebSocket, which
 	// teardown therefore leaves allocated instead of destroying it under the worker.
 	websocket: bool,
@@ -229,11 +233,7 @@ chat_chain_abandon :: proc(chat: ^Chat_Session) {
 	chain.abandoned = true
 	waited: time.Duration
 	if at, started := chain.stop_at.?; started { waited = time.tick_since(at) }
-	fields := [2]Log_Field {
-		{key = "waited_ms", value = i64(waited / time.Millisecond)},
-		{key = "patience_ms", value = Log_Duration_Milliseconds(TOOL_JOBS_STOP_PATIENCE)},
-	}
-	log_emit({level = .Error, category = .Provider, event = "provider.attempt_abandoned", fields = fields[:]})
+	chat_record_job_abandoned(chat, {request = chain.request, attempt = journal.Attempt_No(chain.attempts)}, .Provider_Attempt, waited)
 }
 
 // chat_chain_retain_attempt moves everything an abandoned attempt's worker can still reach out
@@ -252,6 +252,8 @@ chat_chain_retain_attempt :: proc(chat: ^Chat_Session) {
 		worker    = chain.worker,
 		mailbox   = chain.mailbox,
 		arena     = chain.scratch,
+		request   = chain.request,
+		attempt   = journal.Attempt_No(chain.attempts),
 		websocket = chain.websocket_request,
 	}
 	if append(&chat.abandoned_attempts, attempt) != 1 {
@@ -264,7 +266,9 @@ chat_chain_retain_attempt :: proc(chat: ^Chat_Session) {
 // chat_chain_attempts_reclaim releases every abandoned attempt whose worker has published
 // since. What it published is dropped, because the send already has the outcome it was
 // recorded with, and the worker is joined only now, when joining cannot block on it.
-chat_chain_attempts_reclaim :: proc(attempts: ^[dynamic]^Chat_Abandoned_Attempt) {
+// Owner only: it records each release in the session's journal.
+chat_chain_attempts_reclaim :: proc(chat: ^Chat_Session) {
+	attempts := &chat.abandoned_attempts
 	for index := len(attempts) - 1; index >= 0; index -= 1 {
 		attempt := attempts[index]
 		terminal, published := mailbox_take_terminal(attempt.mailbox)
@@ -273,9 +277,9 @@ chat_chain_attempts_reclaim :: proc(attempts: ^[dynamic]^Chat_Abandoned_Attempt)
 		thread.destroy(attempt.worker)
 		mailbox_destroy(attempt.mailbox)
 		virtual.arena_destroy(&attempt.arena)
+		chat_record_job_reclaimed(chat, {request = attempt.request, attempt = attempt.attempt}, .Provider_Attempt)
 		free(attempt, os.heap_allocator())
 		unordered_remove(attempts, index)
-		log_emit({level = .Info, category = .Provider, event = "provider.attempt_reclaimed"})
 	}
 }
 

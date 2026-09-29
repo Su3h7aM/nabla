@@ -296,7 +296,7 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		case .Abandon:
 			tool_jobs_abandon(&jobs, chat, observer, now)
 		case .Retire:
-			tool_jobs_retire(&jobs, now)
+			tool_jobs_retire(&jobs, chat, now)
 		case .Dispatch:
 			tool_jobs_dispatch(&jobs, chat)
 		case .Wait:

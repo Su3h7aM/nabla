@@ -171,12 +171,19 @@ test_tool_calls_are_recorded_then_run :: proc(test: ^testing.T) {
 	testing.expect_value(test, count, 1)
 	testing.expect(test, chat_session_tools_done(chat, chat.active_turn_id, count), "the batch must answer every committed call")
 
-	records := _test_records(test, chat, {.Tool_Proposed, .Tool_Admitted, .Tool_Completed})
-	if !testing.expect_value(test, len(records), 3) { return }
+	// The owner's dispatch of the admitted call sits between its admission and its result.
+	records := _test_records(test, chat, {.Tool_Proposed, .Tool_Admitted, .Tool_Started, .Tool_Completed})
+	if !testing.expect_value(test, len(records), 4) { return }
 	testing.expect_value(test, records[0].kind, journal.Record_Kind.Tool_Proposed)
 	testing.expect_value(test, records[1].kind, journal.Record_Kind.Tool_Admitted)
-	testing.expect_value(test, records[2].kind, journal.Record_Kind.Tool_Completed)
+	testing.expect_value(test, records[2].kind, journal.Record_Kind.Tool_Started)
+	testing.expect_value(test, records[3].kind, journal.Record_Kind.Tool_Completed)
 	for record in records { testing.expect_value(test, record.call, call) }
+	started: journal.Tool_Started
+	if decode_error := journal.payload_decode(records[2].data, &started, context.temp_allocator); decode_error != nil {
+		testing.fail_now(test, "the start could not be decoded")
+	}
+	testing.expect_value(test, started.tool, TOOL_SHELL_NAME)
 	testing.expect_value(test, string(records[0].body), arguments)
 
 	admitted: journal.Tool_Admitted
@@ -187,10 +194,10 @@ test_tool_calls_are_recorded_then_run :: proc(test: ^testing.T) {
 	testing.expect_value(test, string(records[1].body), arguments)
 
 	completed: journal.Tool_Completed
-	if decode_error := journal.payload_decode(records[2].data, &completed, context.temp_allocator);
+	if decode_error := journal.payload_decode(records[3].data, &completed, context.temp_allocator);
 	   decode_error != nil { testing.fail_now(test, "the result could not be decoded") }
 	testing.expect_value(test, completed.outcome, journal.TOOL_OUTCOME_NAMES[.Success])
-	testing.expect(test, strings.contains(string(records[2].body), "tool-ok"), "the model-visible result should carry the output")
+	testing.expect(test, strings.contains(string(records[3].body), "tool-ok"), "the model-visible result should carry the output")
 
 	ancestry, ancestry_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
 	if !testing.expect_value(test, ancestry_error, nil) { return }

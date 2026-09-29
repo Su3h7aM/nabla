@@ -48,8 +48,8 @@ test_read_records_filters_and_pages :: proc(test: ^testing.T) {
 	all, last, all_error := read_records(&journal, Filter{session = session}, 0, 0, context.allocator)
 	_expect_ok(test, all_error)
 	defer records_destroy(all, context.allocator)
-	// The session's own two records, then a turn and two calls per turn.
-	testing.expect_value(test, len(all), 2 + 2 * 3)
+	// The session's own three records, then a turn and two calls per turn.
+	testing.expect_value(test, len(all), 3 + 2 * 3)
 	testing.expect_value(test, last, all[len(all) - 1].seq)
 	for record, index in all {
 		if index > 0 { testing.expect(test, record.seq > all[index - 1].seq, "records should be ordered by seq") }

@@ -454,8 +454,8 @@ A queued job starts when no earlier-admitted job that is neither retired nor aba
 ```odin
 open           :: proc(journal: ^Journal, directory: string, run: Run_Id, mode: Open_Mode, allocator := context.allocator) -> Error
 close          :: proc(journal: ^Journal) -> Error
-create_session :: proc(journal: ^Journal, new_session: New_Session) -> (Session_Id, Error) // claims new_session.id, or a fresh id when zero; buffers the row, session.created, branch 1
-claim          :: proc(journal: ^Journal, session: Session_Id) -> (Counters, Error)        // exclusive flock per session
+create_session :: proc(journal: ^Journal, new_session: New_Session) -> (Session_Id, Error) // claims new_session.id, or a fresh id when zero; buffers the row, session.created, session.claimed, branch 1
+claim          :: proc(journal: ^Journal, session: Session_Id) -> (Counters, Error)        // exclusive flock per session; buffers session.claimed
 release        :: proc(journal: ^Journal) -> Error
 append_record  :: proc(journal: ^Journal, header: Record, data: $Payload, body: []u8 = nil) // buffered, owner-only
 append_node    :: proc(journal: ^Journal, node: Node, data: $Payload, body: []u8 = nil) -> Node_Id
@@ -524,13 +524,17 @@ artifacts(digest BLOB PRIMARY KEY, kind TEXT, created_ms INTEGER, bytes BLOB) ST
 | Class | Kinds (examples) | Rule |
 | --- | --- | --- |
 | Barrier | `session.created`, `branch.created`, `user.input`, `request.sent`, `response.committed`, `tool.admitted`, `tool.decision`, `tool.completed`, `lua.started`, `task.started`, `subagent.started`, `subagent.message`, `*.completed`, `checkpoint.installed`, `hook.applied` (when it changes model input), `rating.recorded`, `turn.completed` | `commit` before the dependent effect proceeds |
-| Observation | `request.prepared`, `request.admitted`, `provider.observed`, `tool.validation_failed`, `tool.repaired`, `retry.scheduled`, `retry.completed`, `cache.observed`, `resource.observed`, `hook.failed`, `runtime.message` | buffered; written in the next barrier transaction or when the batch reaches `JOURNAL_BATCH_RECORDS`, `JOURNAL_BATCH_BYTES`, or `JOURNAL_BATCH_AGE` |
+| Observation | `run.started`, `run.finished`, `session.claimed`, `session.released`, `request.prepared`, `request.admitted`, `provider.observed`, `tool.started`, `retry.scheduled`, `retry.completed`, `compaction.started`, `job.abandoned`, `job.reclaimed`, `cache.observed`, `resource.observed`, `hook.failed`, `runtime.message` | buffered; written in the next barrier transaction or when the batch reaches `JOURNAL_BATCH_RECORDS`, `JOURNAL_BATCH_BYTES`, or `JOURNAL_BATCH_AGE` |
 
 The owner is the only writer for its session. A commit is one short immediate transaction; no transaction spans a network operation or a wait. Results that publish together commit together. A failed commit latches `Storage_Failed`: admission stops, cleanup continues without the journal. A crash may lose buffered observations, never barriers.
+
+The journal writes `session.claimed` itself when `claim` or `create_session` takes a claim, so every session, subagents included, records it, and `session.released` when `close` closes a journal that holds a claim, committed with every pending item before the claim drops. If that commit fails, `close` still releases and closes, and returns the commit failure only when nothing else failed. The owner commits `run.finished` just before it closes the journal, so a run's end is durable when the journal closes. `run.started` is buffered in the launch's first journal and reaches disk with that journal's first commit, and `session.claimed` with the commit after the claim: a resumed session's recovery, a new session's first prompt. A `run.started` with no `run.finished`, or a `session.claimed` with no `session.released`, reads as a process that ended abruptly. `tool.started` is recorded at the owner's dispatch, after `tool.admitted` is durable and before the executor begins, whichever thread the executor runs on.
 
 ### 8.4 Record kinds
 
 `Record_Kind` is a closed enum with a stable-name table. Names are never changed or reused; new kinds are appended.
+
+`tool.validation_failed` and `tool.repaired` are declared and never written, and their names are never reused: `tool.admitted` carries a call's repairs and `tool.completed` carries a validation failure's outcome and detail, so a record of either would state a fact twice.
 
 ```text
 run.started run.finished
@@ -809,7 +813,7 @@ Tool_Repair :: enum {
 Tool_Repairs :: bit_set[Tool_Repair]
 ```
 
-The set of repairs a call needed is committed with `tool.admitted` beside the effective arguments (today the dispatch record carries both), and each application is also observed as `tool.repaired`. When a value repair rewrote the document, the effective arguments are the document written again from the repaired value with sorted keys. Projection replays the effective arguments, so the model sees the corrected form. A repaired value then passes full validation, and policy and hooks run on it. A new repair joins the enum only if its input has one reading and every other input is still refused with its own defect.
+The set of repairs a call needed is committed with `tool.admitted` beside the effective arguments (today the dispatch record carries both), and no other record states it again: `tool.repaired` is declared and never written. When a value repair rewrote the document, the effective arguments are the document written again from the repaired value with sorted keys. Projection replays the effective arguments, so the model sees the corrected form. A repaired value then passes full validation, and policy and hooks run on it. A new repair joins the enum only if its input has one reading and every other input is still refused with its own defect.
 
 The committed result of a repaired call names every repair it needed in a `repaired:` line after its first line, for every outcome, failures included. Projection shows the corrected arguments, so without this line the model would never learn it sent something wrong. A repair recorded only in the journal or shown only to the frontend does not count as reported.
 

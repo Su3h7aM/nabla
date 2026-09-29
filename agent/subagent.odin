@@ -277,22 +277,24 @@ subagent_record_completion :: proc(chat: ^Chat_Session, member: ^Subagent) {
 
 // agent_team_destroy stops every subagent, waits for them within the stop patience, and
 // releases the team. A subagent that does not stop keeps the team: both leak, and the
-// session is released anyway.
-agent_team_destroy :: proc(team: ^Agent_Team, retain := false) -> bool {
+// session is released anyway. Each such subagent is recorded as abandoned in chat's
+// journal, so the owner of that journal is the only caller.
+agent_team_destroy :: proc(team: ^Agent_Team, chat: ^Chat_Session, retain := false) -> bool {
 	if team == nil { return true }
 	sync.mutex_lock(&team.mutex)
 	team.closing = true
 	for member in team.members { subagent_request_stop(member) }
 	sync.mutex_unlock(&team.mutex)
 	owner_wake_signal()
-	deadline := time.tick_add(time.tick_now(), TOOL_JOBS_STOP_PATIENCE)
+	began := time.tick_now()
+	deadline := time.tick_add(began, TOOL_JOBS_STOP_PATIENCE)
 	for {
 		seen := owner_wake_seen()
 		// Teardown commits nothing more; recovery closes what this leaves open.
 		agent_team_reap(team, nil)
 		if !agent_team_running(team) { break }
 		if time.tick_diff(time.tick_now(), deadline) <= 0 {
-			log_emit({level = .Error, category = .Agent, event = "subagent.abandoned"})
+			subagent_record_abandoned(team, chat, time.tick_since(began))
 			return false
 		}
 		owner_wake_wait(seen, deadline)
@@ -303,6 +305,27 @@ agent_team_destroy :: proc(team: ^Agent_Team, retain := false) -> bool {
 	agent_parent_destroy(&team.parent, team.allocator)
 	free(team, team.allocator)
 	return true
+}
+
+// subagent_record_abandoned buffers job.abandoned for every subagent still running, named
+// by its parent's call and its own session. Owner only.
+@(private)
+subagent_record_abandoned :: proc(team: ^Agent_Team, chat: ^Chat_Session, waited: time.Duration) {
+	Running :: struct {
+		parent_call: journal.Call_Id,
+		session:     journal.Session_Id,
+	}
+	running := make([dynamic]Running, context.temp_allocator)
+	{
+		sync.mutex_guard(&team.mutex)
+		for member in team.members {
+			if sync.atomic_load(&member.done) { continue }
+			append(&running, Running{parent_call = member.parent_call, session = member.session})
+		}
+	}
+	for member in running {
+		chat_record_job_abandoned(chat, {call = member.parent_call, subagent = member.session}, .Subagent, waited)
+	}
 }
 
 // agent_team_running reports whether a subagent the team started is not yet released.
@@ -646,7 +669,7 @@ subagent_run :: proc(member: ^Subagent) {
 		}
 	}
 	// A subagent starts no subagents, so its session has no team.
-	agent_team_destroy(chat.team)
+	agent_team_destroy(chat.team, &chat)
 	chat.team = nil
 	chat.member = member
 	chat.inbox = &member.inbox

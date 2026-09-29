@@ -31,16 +31,6 @@ run_log_open :: proc(setup: ^Run_Setup) -> log.Logger {
 	return agent.log_logger(&setup.log_binding)
 }
 
-run_log_header :: proc(setup: ^Run_Setup) {
-	if setup.log_binding.ring == nil { return }
-	fields := [3]agent.Log_Field {
-		{key = "pid", value = i64(os.get_pid())},
-		{key = "threshold", value = agent.log_level_name(setup.log_binding.ring.lowest)},
-		{key = "schema_version", value = i64(journal.SCHEMA_VERSION)},
-	}
-	agent.log_emit(agent.Log_Record{level = .Info, category = .Runtime, event = "run.started", fields = fields[:]})
-}
-
 // run_log_flush commits what the ring holds into the running session's journal.
 // Owner thread only. A failed commit latches in the journal, where the session's
 // next commit reports it.
@@ -50,41 +40,14 @@ run_log_flush :: proc(setup: ^Run_Setup) {
 	_, _ = journal.commit(setup.store)
 }
 
-// run_log_close records the end of the launch, flushes the ring, and releases it.
-// It runs before the store closes. Entries emitted afterwards are discarded.
+// run_log_close flushes the ring and releases it. It runs before the store closes.
+// Entries emitted afterwards are discarded.
 run_log_close :: proc(setup: ^Run_Setup) {
 	ring := setup.log_binding.ring
 	if ring == nil { return }
-	agent.log_emit(agent.Log_Record{level = .Info, category = .Runtime, event = "run.finished"})
 	run_log_flush(setup)
 	setup.log_binding.ring = nil
 	free(ring, setup.alloc)
-}
-
-// log_session_claimed records that this process took a session for writing, and
-// what recovery settled when an earlier run left work open.
-log_session_claimed :: proc(id: journal.Session_Id, resumed: bool, recovery: journal.Recovery) {
-	if id == {} { return }
-	binding: agent.Log_Binding
-	context.logger = agent.log_rebind(&binding, agent.Log_Correlation{session = id})
-	claimed := [1]agent.Log_Field{{key = "resumed", value = resumed}}
-	agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.claimed", fields = claimed[:]})
-	if recovery != {} {
-		fields := [4]agent.Log_Field {
-			{key = "turns", value = i64(recovery.turns)},
-			{key = "requests", value = i64(recovery.requests)},
-			{key = "calls", value = i64(recovery.calls)},
-			{key = "results", value = i64(recovery.results)},
-		}
-		agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.recovered", fields = fields[:]})
-	}
-}
-
-log_session_released :: proc(id: journal.Session_Id) {
-	if id == {} { return }
-	binding: agent.Log_Binding
-	context.logger = agent.log_rebind(&binding, agent.Log_Correlation{session = id})
-	agent.log_emit(agent.Log_Record{level = .Info, category = .Session, event = "session.released"})
 }
 
 // run_log_level reads the launch's threshold. An unusable value is reported once

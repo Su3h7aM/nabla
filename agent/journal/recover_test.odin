@@ -190,9 +190,9 @@ test_recovery_records_nothing_after_a_clean_turn :: proc(test: ^testing.T) {
 	testing.expect_value(test, recovery, Recovery{})
 
 	// A session that was closed cleanly has nothing to say, so recovery writes
-	// no record at all.
+	// no record at all; the only new record is the claim's own, committed by it.
 	after := _records_of_session(test, &journal, session)
 	defer records_destroy(after, context.allocator)
-	testing.expect_value(test, len(after), len(before))
+	testing.expect_value(test, len(after), len(before) + 1)
 	for record in after { testing.expect(test, record.kind != Record_Kind.Session_Recovered, "nothing was recovered") }
 }

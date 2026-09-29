@@ -29,6 +29,9 @@ Run_Setup :: struct {
 	journal_directory: string, // owned
 	lock_directory:    string, // owned; where the journal takes session claims
 	run:               journal.Run_Id,
+	// run_open says the running session's journal carries this launch's run.started, so
+	// run.finished is owed when the launch ends.
+	run_open:          bool,
 	// log_binding is what context.logger points at while the run logs; its ring is
 	// owned, nil while diagnostics are off.
 	log_binding:       agent.Log_Binding,
@@ -252,8 +255,7 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []age
 
 // run_session_attach opens the session the launch asked for and makes it the running one;
 // a launch that cannot open what it asked for fails rather than quietly starting a
-// different one. The caller installs the launch's logger first, so the adoption is
-// recorded.
+// different one.
 @(require_results)
 run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_Start, stderr: io.Writer) -> bool {
 	directory, directory_error := agent.xdg_directory(.State, setup.alloc)
@@ -323,6 +325,12 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 	opened.store, open_error = session_store_open(setup)
 	if open_error != nil { return {}, session_error_message("cannot open the session database", open_error, allocator), false }
 
+	// The launch's first journal carries its run.started, before any claim of this launch.
+	// It is buffered: the session install takes the journal, and the first commit writes it.
+	if !setup.run_open {
+		journal.append_record(opened.store, {kind = .Run_Started}, journal.Run_Started{pid = int(os.get_pid())})
+	}
+
 	filter := journal.Session_Filter {
 		limit = 1,
 	}
@@ -335,7 +343,6 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 		}
 		opened.workspace = workspace
 		opened.branch = journal.INITIAL_BRANCH
-		log_session_claimed(opened.id, false, {})
 		return opened, "", true
 	case .Resume_Latest:
 		filter.workspace = launch_workspace
@@ -392,7 +399,6 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 		return opened, fmt.aprintf("the session's directory could not be stored", allocator = allocator), false
 	}
 	opened.workspace = workspace
-	log_session_claimed(opened.id, true, opened.recovery)
 	return opened, "", true
 }
 
@@ -417,6 +423,7 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
 	setup.store = opened.store
+	setup.run_open = true
 	setup.workspace = opened.workspace
 	setup.resumed_provider = opened.provider
 	setup.resumed_model = opened.model
@@ -440,16 +447,38 @@ session_store_open :: proc(setup: ^Run_Setup) -> (store: ^journal.Journal, error
 	return store, nil
 }
 
-// session_store_close gives up the store's session, if it holds one, and closes it.
-// Pending records are dropped: every write that matters commits where it is made.
+// session_store_close records the launch's end when finish_run says the store carries the
+// last of it, commits it, and closes the store, which records the release of the store's
+// session. A commit that fails changes nothing here: the store is closing either way.
+// Owner thread only.
 @(require_results)
-session_store_close :: proc(store: ^journal.Journal, allocator: mem.Allocator) -> journal.Error {
+session_store_close :: proc(store: ^journal.Journal, allocator: mem.Allocator, finish_run := false) -> journal.Error {
 	if store == nil { return nil }
-	released := store.claimed
+	if finish_run {
+		journal.append_record(store, {kind = .Run_Finished}, journal.Run_Finished{})
+		_, _ = journal.commit(store)
+	}
 	close_error := journal.close(store)
 	free(store, allocator)
-	if released != {} { log_session_released(released) }
 	return close_error
+}
+
+// run_store_close ends the launch's use of the journal: the launch's run.finished when it
+// recorded a run.started, then the close, which records the session's release. A launch whose
+// last session was closed has no running store, so one is opened to carry run.finished; when
+// that fails the run reads as ended abruptly and the error is returned. Call it after the
+// diagnostics are flushed, on the thread that owns the journal.
+@(require_results)
+run_store_close :: proc(setup: ^Run_Setup) -> journal.Error {
+	finish := setup.run_open
+	setup.run_open = false
+	store := setup.store
+	if store == nil && finish {
+		open_error: journal.Error
+		store, open_error = session_store_open(setup)
+		if open_error != nil { return open_error }
+	}
+	return session_store_close(store, setup.alloc, finish)
 }
 
 // session_error_message is what for a person, followed by the journal's reason,

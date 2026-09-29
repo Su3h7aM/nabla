@@ -3,7 +3,6 @@ package agent
 
 import "core:fmt"
 import "core:log"
-import "core:mem/virtual"
 import "core:strings"
 import "core:testing"
 
@@ -95,29 +94,6 @@ log_chat_record_count :: proc(test: ^testing.T, chat: ^Chat_Session) -> int {
 }
 
 @(test)
-test_a_turn_records_its_start_and_end :: proc(test: ^testing.T) {
-	fixture: Log_Chat_Test
-	context.logger = log_chat_begin(test, &fixture, tool_loop_workspace(test))
-	defer log_chat_end(test, &fixture)
-	chat := &fixture.chat.chat
-
-	log_chat_cancel_turn(test, chat)
-
-	context.logger = fixture.ambient
-	text := log_chat_text(test, &fixture)
-	defer delete(text, context.allocator)
-	testing.expect(test, strings.contains(text, "turn.started"), "the turn start is recorded")
-	testing.expect(test, strings.contains(text, "turn.finished"), "the turn end is recorded")
-	testing.expect(test, strings.contains(text, "prompt_bytes=5"), "the start carries the prompt size")
-	testing.expect(test, strings.contains(text, "outcome=cancelled"), "the end names the outcome")
-	testing.expect(test, strings.contains(text, "recorded=true"), "the end says the outcome landed")
-	// The scope carries the session the work belongs to and the durable turn.
-	session_field := strings.concatenate({"session_id=", chat_session_text(chat)}, context.temp_allocator)
-	testing.expect(test, strings.contains(text, session_field), "records carry the session")
-	testing.expect(test, strings.contains(text, "turn_no=1"), "records carry the durable turn")
-}
-
-@(test)
 test_a_superseded_operation_is_recorded :: proc(test: ^testing.T) {
 	fixture: Log_Chat_Test
 	context.logger = log_chat_begin(test, &fixture, tool_loop_workspace(test), .Debug)
@@ -144,38 +120,6 @@ test_a_superseded_operation_is_recorded :: proc(test: ^testing.T) {
 	defer delete(text, context.allocator)
 	testing.expect(test, strings.contains(text, "agent.event_ignored"), "the dropped event is recorded")
 	testing.expect(test, strings.contains(text, "reason=superseded_turn"), "the record names why it was refused")
-}
-
-@(test)
-test_a_tool_call_is_recorded_from_call_to_result :: proc(test: ^testing.T) {
-	fixture: Log_Chat_Test
-	context.logger = log_chat_begin(test, &fixture, tool_loop_workspace(test), .Debug)
-	defer log_chat_end(test, &fixture)
-	chat := &fixture.chat.chat
-	chat.tools_enabled = true
-	_test_accept(test, chat, "run printf ok")
-
-	arguments := `{"command":"printf tool-ok","working_directory":null,"timeout_ms":null}`
-	_test_stage_call(test, chat, "call_1", arguments, TOOL_SHELL_NAME)
-	testing.expect_value(test, chat_run_tools(chat, {}), 1)
-
-	context.logger = fixture.ambient
-	text := log_chat_text(test, &fixture)
-	defer delete(text, context.allocator)
-	// Every stage of the call, in the order it happened.
-	previous := -1
-	for event in ([?]string{"tool.call_received", "tool.arguments_prepared", "tool.dispatch_committed", "tool.execution_started", "tool.execution_finished", "tool.result_committed"}) {
-		at := strings.index(text, event)
-		testing.expectf(test, at >= 0, "the log should record %s", event)
-		testing.expectf(test, at > previous, "%s should follow the stage before it", event)
-		previous = at
-	}
-	// The call is followed by its own id, and the dispatch and the result name the
-	// call they were stored as.
-	testing.expect(test, strings.contains(text, "call_id=call_1"), "every tool record carries the call")
-	testing.expect(test, strings.contains(text, "repairs="), "the admission says nothing was repaired")
-	testing.expect(test, strings.contains(text, "outcome=success"), "the execution outcome is named")
-	testing.expect(test, strings.contains(text, "call=1"), "the result names the call it was stored as")
 }
 
 @(test)
@@ -230,43 +174,6 @@ test_diagnostics_do_not_change_a_turn :: proc(test: ^testing.T) {
 	testing.expect(test, plain_records > 0, "the turn recorded something")
 	testing.expect_value(test, logged_records, plain_records)
 	testing.expect_value(test, logged_calls, plain_calls)
-}
-
-@(test)
-test_starting_a_compaction_records_its_scope :: proc(test: ^testing.T) {
-	fixture: Log_Chat_Test
-	context.logger = log_chat_begin(test, &fixture, tool_loop_workspace(test))
-	defer log_chat_end(test, &fixture)
-	chat := &fixture.chat.chat
-	chat_test_capacity(chat, 500_000)
-	_test_accept(test, chat, "compact me")
-	for answer in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
-		_test_response(test, chat, chat.request, answer)
-	}
-
-	// A dead endpoint is enough: what is under test is the record the harness
-	// writes when it decides to compact, not the summary itself.
-	dead := ai.Provider_Connection {
-		API      = .OpenAI_Chat_Completions,
-		Endpoint = "http://127.0.0.1:9/",
-	}
-	arena: virtual.Arena
-	defer virtual.arena_destroy(&arena)
-	prep, prep_error := chat_prepare(chat, dead, virtual.arena_allocator(&arena))
-	if prep_error != nil { testing.fail_now(test, "chat_prepare failed") }
-	testing.expect_value(test, chat_compact_request(chat, .User_Command), Compact_Request_Result.Scheduled)
-	chat_compact_consider(chat, {}, dead, &prep)
-	testing.expect_value(test, chat.compact.state, Compact_State.Running)
-
-	context.logger = fixture.ambient
-	text := log_chat_text(test, &fixture)
-	defer delete(text, context.allocator)
-	testing.expect(test, strings.contains(text, "compaction.started"), "the start is recorded")
-	testing.expect(test, strings.contains(text, "trigger=user_command"), "the trigger is named")
-	testing.expect(test, strings.contains(text, "turn_no=1"), "a compaction inside a turn names the turn")
-
-	// Teardown joins the worker; the dead endpoint makes it finish promptly.
-	chat_compact_destroy(chat)
 }
 
 @(test)

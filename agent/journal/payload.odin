@@ -360,6 +360,80 @@ Tool_Admitted :: struct {
 	repairs: []string,
 }
 
+// Tool_Started is the owner's dispatch of an admitted call, immediately before its
+// effect begins. A call with no such record never started.
+Tool_Started :: struct {
+	version: int,
+	tool:    string,
+}
+
+// Run_Started opens one launch of the harness. The record has no session.
+Run_Started :: struct {
+	version: int,
+	pid:     int,
+}
+
+// Run_Finished closes a launch that reached its teardown; a run without one ended
+// abruptly. The record has no session.
+Run_Finished :: struct {
+	version: int,
+}
+
+// Session_Claimed is the process taking the session's writer claim. resumed is false
+// for a session this launch created, and true for one an earlier run left.
+Session_Claimed :: struct {
+	version: int,
+	resumed: bool,
+}
+
+// Session_Released is written just before the journal that holds the claim closes.
+Session_Released :: struct {
+	version: int,
+}
+
+// Compaction_Started is a summary request about to be sent. The record's request is
+// the compaction's own. trigger is a compaction trigger's name, covers the last node
+// the summary replaces, and head_estimate the token estimate of the context it covers.
+Compaction_Started :: struct {
+	version:       int,
+	trigger:       string,
+	covers:        Node_Id,
+	head_estimate: int,
+}
+
+// Job_Kind is the kind of worker the owner stopped waiting for.
+Job_Kind :: enum u8 {
+	Tool,
+	Provider_Attempt,
+	Compaction,
+	Subagent,
+}
+
+JOB_KIND_NAMES := [Job_Kind]string {
+	.Tool             = "tool",
+	.Provider_Attempt = "provider_attempt",
+	.Compaction       = "compaction",
+	.Subagent         = "subagent",
+}
+
+// Job_Abandoned is the owner giving up on a worker that ignored its stop: the worker
+// and everything it can reach are retained, and its outcome is already recorded as
+// cancelled or unknown. waited_ms is how long the stop went unanswered and patience_ms
+// the patience it was given.
+Job_Abandoned :: struct {
+	version:     int,
+	job:         string, // JOB_KIND_NAMES
+	waited_ms:   i64,
+	patience_ms: i64,
+}
+
+// Job_Reclaimed is a retained worker finishing late, so the owner released it. What it
+// published is dropped.
+Job_Reclaimed :: struct {
+	version: int,
+	job:     string, // JOB_KIND_NAMES
+}
+
 // User carries the text in the node body.
 User :: struct {
 	version: int,

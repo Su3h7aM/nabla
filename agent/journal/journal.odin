@@ -179,10 +179,19 @@ open :: proc(journal: ^Journal, directory, locks: string, run: Run_Id, mode: Ope
 	return nil
 }
 
-// close releases the claim, the statements, the connection, and every pending
-// item. Pending items are dropped, not committed. Closing a zero journal does nothing.
+// close records `session.released` for a held claim and commits it with every
+// pending item, then releases the claim, the statements, and the connection.
+// The first failure wins and cleanup continues: a commit failure is returned
+// only when releasing the claim and closing the connection succeed. A journal
+// that is read-only, not open, holds no claim, or has latched a failure writes
+// nothing, and its pending items are dropped. Closing a zero journal does nothing.
 @(require_results)
 close :: proc(journal: ^Journal) -> Error {
+	commit_error: Error
+	if journal.open && !journal.read_only && journal.claimed != {} && journal.failure == nil {
+		append_record(journal, Record{kind = .Session_Released, session = journal.claimed}, Session_Released{})
+		_, commit_error = commit(journal)
+	}
 	release_error := release(journal)
 	// A statement that refuses to close stays on the connection's list, and the
 	// connection close below is what reports it.
@@ -194,7 +203,8 @@ close :: proc(journal: ^Journal) -> Error {
 	delete(journal.locks, journal.allocator)
 	journal^ = {}
 	if release_error != nil { return release_error }
-	return close_error
+	if close_error != nil { return close_error }
+	return commit_error
 }
 
 // claim takes the writer claim for session and returns the ids it has used.
@@ -210,6 +220,7 @@ claim :: proc(journal: ^Journal, session: Session_Id) -> (counters: Counters, er
 	counters, exists = load_counters(journal, session) or_return
 	if !exists { return {}, Journal_Error.Not_Found }
 	journal.counters = counters
+	append_record(journal, Record{kind = .Session_Claimed, session = session}, Session_Claimed{resumed = true})
 	return counters, nil
 }
 
@@ -249,6 +260,7 @@ create_session :: proc(journal: ^Journal, new_session: New_Session) -> (id: Sess
 		Record{kind = .Session_Created, session = id, branch = INITIAL_BRANCH},
 		Session_Created{workspace = new_session.workspace, role = role, parent_session = parent, parent_call = new_session.parent_call},
 	)
+	append_record(journal, Record{kind = .Session_Claimed, session = id}, Session_Claimed{resumed = false})
 	push(
 		journal,
 		Session_Row {

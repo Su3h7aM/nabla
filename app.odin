@@ -352,7 +352,7 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 	mcp_runtime_destroy(&setup.mcp)
 	// The launch's last diagnostics reach the journal before it closes.
 	run_log_close(setup)
-	if close_error := session_store_close(setup.store, setup.alloc); close_error != nil {
+	if close_error := run_store_close(setup); close_error != nil {
 		detail := journal.error_text(close_error, context.temp_allocator)
 		fmt.eprintln("nabla: the session database could not be closed cleanly:", detail)
 	}
@@ -403,7 +403,6 @@ tui_run :: proc(
 	// cannot install it: assigning context.logger only configures the calling scope.
 	app.setup.alloc = context.allocator
 	context.logger = run_log_open(&app.setup)
-	run_log_header(&app.setup)
 	if !run_catalog(sources, mcp_servers, &app.setup, start) {
 		return false
 	}

@@ -362,10 +362,12 @@ chat_skill_catalog_release :: proc(chat: ^Chat_Session) {
 
 // chat_session_workers_outstanding reports whether an abandoned worker may still be running.
 // While one is, what it can reach (the workspace, the skill catalog, the session's own stop
-// token, the WebSocket, and the tool backends the caller owns) must stay allocated.
+// token, the WebSocket, and the tool backends the caller owns) must stay allocated. It
+// releases the workers that finished, which it records in the journal, so only the thread
+// that owns the journal may call it.
 chat_session_workers_outstanding :: proc(chat: ^Chat_Session) -> bool {
-	tool_jobs_reclaim(&chat.abandoned_jobs)
-	chat_chain_attempts_reclaim(&chat.abandoned_attempts)
+	tool_jobs_reclaim(chat)
+	chat_chain_attempts_reclaim(chat)
 	return(
 		chat.workers_retained ||
 		len(chat.abandoned_jobs) > 0 ||
@@ -421,7 +423,7 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 		tool_jobs_destroy(&chat.tool_jobs)
 		chat.tool_jobs_active = false
 	}
-	retained := !agent_team_destroy(chat.team, len(chat.abandoned_jobs) > 0)
+	retained := !agent_team_destroy(chat.team, chat, len(chat.abandoned_jobs) > 0)
 	chat.team = nil
 	chat.inbox = nil
 	chat.workers_retained = retained
@@ -690,10 +692,6 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 	delete(chat.last_error, chat.allocator)
 	chat.last_error = ""
 	chat_partial_assistant_clear(chat)
-
-	fields := [1]Log_Field{{key = "prompt_bytes", value = i64(len(text))}}
-	binding.correlation = log_correlation(chat)
-	log_emit({level = .Info, category = .Agent, event = "turn.started", fields = fields[:]})
 	return .Accepted
 }
 
