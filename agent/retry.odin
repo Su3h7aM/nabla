@@ -8,6 +8,7 @@ package agent
 
 import "core:time"
 
+import "nabla:agent/journal"
 import "nabla:ai"
 
 // CHAT_RETRY_DELAYS is the wait before each resend of a request that failed for a reason the
@@ -75,8 +76,8 @@ Request_Recovery_Reason :: enum {
 	Retries_Exhausted,
 }
 
-// request_recovery_reason_name is the stable spelling a record and a log line keep for a
-// reason. A name outlives the build that wrote it.
+// request_recovery_reason_name is the stable spelling a journal record keeps for a reason.
+// A name outlives the build that wrote it.
 request_recovery_reason_name :: proc(reason: Request_Recovery_Reason) -> string {
 	switch reason {
 	case .Completed:
@@ -101,6 +102,41 @@ request_recovery_reason_name :: proc(reason: Request_Recovery_Reason) -> string 
 		return "retries_exhausted"
 	}
 	return "unknown"
+}
+
+chat_retry_record_scheduled :: proc(
+	chat: ^Chat_Session,
+	request: journal.Request_Id,
+	attempt: int,
+	purpose: journal.Request_Purpose,
+	reason: Request_Recovery_Reason,
+	next_attempt: int,
+	delay: time.Duration,
+) {
+	chat_record(
+		chat,
+		{kind = .Retry_Scheduled, request = request, attempt = journal.Attempt_No(attempt)},
+		journal.Retry_Scheduled {
+			purpose = journal.REQUEST_PURPOSE_NAMES[purpose],
+			reason = request_recovery_reason_name(reason),
+			next_attempt = next_attempt,
+			delay_ms = Log_Duration_Milliseconds(delay),
+		},
+	)
+}
+
+chat_retry_record_completed :: proc(
+	chat: ^Chat_Session,
+	request: journal.Request_Id,
+	attempt: int,
+	purpose: journal.Request_Purpose,
+	outcome: journal.Retry_Outcome,
+) {
+	chat_record(
+		chat,
+		{kind = .Retry_Completed, request = request, attempt = journal.Attempt_No(attempt)},
+		journal.Retry_Completed{purpose = journal.REQUEST_PURPOSE_NAMES[purpose], outcome = journal.RETRY_OUTCOME_NAMES[outcome]},
+	)
 }
 
 // Chat_Attempt_Facts is one send as the policy sees it. Every field is a fact from the

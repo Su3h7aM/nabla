@@ -30,6 +30,30 @@ Chat_Attempt :: struct {
 	recovery: Chat_Recovery_Kind,
 }
 
+chat_record_prepared_request :: proc(
+	chat: ^Chat_Session,
+	request: journal.Request_Id,
+	purpose: journal.Request_Purpose,
+	api: ai.API_Kind,
+	websocket_request: bool,
+	prep: ^Chat_Request_Prep,
+) {
+	chat_record(
+		chat,
+		{kind = .Request_Prepared, request = request, provider = chat.provider_id, model = chat.model_id},
+		journal.Request_Prepared {
+			purpose = journal.REQUEST_PURPOSE_NAMES[purpose],
+			api = chat_api_name(api),
+			transport = websocket_request ? "websocket" : "http",
+			estimate = prep.estimate,
+			context_window = chat.capacity.window,
+			messages = len(prep.projection.items),
+			tools = len(prep.tools),
+			replay_refused = prep.replay_refused,
+		},
+	)
+}
+
 // chat_finish_reason_text is the RESPONSE_FINISH_NAMES name for why the model
 // stopped.
 chat_finish_reason_text :: proc(reason: ai.Provider_Finish_Reason) -> string {

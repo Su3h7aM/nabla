@@ -2,7 +2,6 @@ package agent
 
 import "core:crypto/hash"
 import "core:fmt"
-import "core:log"
 import "core:mem/virtual"
 import "core:os"
 import "core:thread"
@@ -338,7 +337,6 @@ chat_try_context_repair :: proc(
 	prep: ^Chat_Request_Prep,
 	encoded: ^ai.Provider_Encoded_Request,
 	websocket_request: bool,
-	attempts: int,
 ) -> Chat_Repair_Refusal {
 	previous_estimate := prep.estimate
 	refusal := chat_repair_context(
@@ -363,13 +361,7 @@ chat_try_context_repair :: proc(
 	if refusal != .None {
 		return refusal
 	}
-	repaired := [4]Log_Field {
-		{key = "covers", value = i64(prep.projection.covers)},
-		{key = "estimate_before", value = i64(previous_estimate)},
-		{key = "estimate_after", value = i64(prep.estimate)},
-		{key = "next_attempt", value = i64(attempts + 1)},
-	}
-	log_emit({level = .Info, category = .Provider, event = "request.context_repaired", fields = repaired[:]})
+	chat_record_prepared_request(chat, chat.chain.request, .Response, connection.API, websocket_request, prep)
 	return .None
 }
 
@@ -384,12 +376,8 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	if !chat_session_begin_request(chat) { return }
 	if chat.skill_instructions == "" && !chat_ensure_instructions(chat) { return }
 	// This request has no id yet, and the one the previous request left behind is not its
-	// own; the first claim allocates it.
+	// own; this preparation allocates it before any admission record is written.
 	chat.request = 0
-	binding: Log_Binding
-	previous_logger := context.logger
-	defer context.logger = previous_logger
-	context.logger = log_rebind(&binding, log_correlation(chat))
 
 	// A finished summary is installed at a request boundary, so the context the request is
 	// built from is the one this session will actually send.
@@ -421,6 +409,7 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 		chat_session_record_failure(chat, "the request context could not be read", prep_err)
 		return
 	}
+	chain.request = journal.next_request(chat.store)
 
 	// The exact request about to be sent is what a compaction freezes, so it is considered
 	// here, after the boundary above and before admission decides anything. Compaction never
@@ -480,23 +469,7 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 
 	// What the harness intends to send is recorded before it is stored, so a request that
 	// never reaches the store still says what it was going to carry.
-	prepared := [10]Log_Field {
-		{key = "purpose", value = journal.REQUEST_PURPOSE_NAMES[.Response]},
-		{key = "provider", value = chat.provider_id},
-		{key = "model", value = chat.model_id},
-		{key = "api", value = chat_api_name(connection.API)},
-		{key = "transport", value = websocket_request ? "websocket" : "http"},
-		{key = "estimate", value = i64(prep.estimate)},
-		{key = "context_window", value = i64(chat.capacity.window)},
-		{key = "messages", value = i64(len(prep.projection.items))},
-		{key = "tools", value = i64(len(prep.tools))},
-		// The endpoint's own records this request did not carry: a prefix change the
-		// conversation's content survived, and the only trace a contradictory or
-		// unreadable record leaves.
-		{key = "replay_refused", value = i64(prep.replay_refused)},
-	}
-	context.logger = log_rebind(&binding, log_correlation(chat))
-	log_emit({level = .Info, category = .Provider, event = "request.prepared", fields = prepared[:]})
+	chat_record_prepared_request(chat, chain.request, .Response, connection.API, websocket_request, &prep)
 
 	chat.last_estimate = prep.estimate
 	chain.active = true
@@ -574,14 +547,6 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 	defer context.logger = previous_logger
 	context.logger = log_rebind(&binding, log_correlation_for(chat, chain.attempts))
 
-	recorded := [1]Log_Field{{key = "purpose", value = journal.REQUEST_PURPOSE_NAMES[.Response]}}
-	log_emit({level = .Info, category = .Storage, event = "request.recorded", fields = recorded[:]})
-	// A send that repeats the same bytes after a failure is a retry, so a reader learns the
-	// chain resumed without diffing attempt numbers. A repaired send is a new payload, and
-	// it says so itself.
-	if chain.attempts > 1 && chain.recovery_kind == .Transient_Retry {
-		log_emit({level = .Info, category = .Provider, event = "request.retry_started"})
-	}
 	// The input size is settled and this send has not gone out yet, so this is where a
 	// front-end learns what the context now holds, and how a front-end showing a scheduled
 	// retry clears it: the send it waited for is about to happen.
@@ -795,19 +760,8 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 		chain.observer,
 		{request = chain.request, next_attempt = chain.attempts + 1, failure_class = chain.operation_error.failure_class, delay = chain.decision.delay},
 	)
-	binding: Log_Binding
-	previous_logger := context.logger
-	defer context.logger = previous_logger
-	context.logger = log_rebind(&binding, log_correlation_for(chat, chain.attempts))
-	retry := [5]Log_Field {
-		{key = "reason", value = request_recovery_reason_name(chain.decision.reason)},
-		{key = "error_kind", value = ai.provider_operation_error_name(chain.operation_error.kind)},
-		{key = "failure_class", value = ai.provider_failure_class_name(chain.operation_error.failure_class)},
-		{key = "next_attempt", value = i64(chain.attempts + 1)},
-		{key = "delay_ms", value = Log_Duration_Milliseconds(chain.decision.delay)},
-	}
-	log_emit({level = .Warning, category = .Provider, event = "request.retry_scheduled", fields = retry[:]})
 	chain.stage = .Backoff
+	chat_retry_record_scheduled(chat, chain.request, chain.attempts, .Response, chain.decision.reason, chain.attempts + 1, chain.decision.delay)
 }
 
 // chat_chain_wait waits out the backoff before the next attempt. Cancellation ends the
@@ -818,14 +772,17 @@ chat_chain_wait :: proc(chat: ^Chat_Session) {
 	chain := &chat.chain
 	if !chain.active || chain.stage != .Backoff { return }
 	if !chat_retry_wait(chat, chain.decision.delay) {
+		chat_retry_record_completed(chat, chain.request, chain.attempts, .Response, .Cancelled)
 		chat_chain_stop(chat, .Cancelled)
 		return
 	}
 	// Cancellation can arrive between the last slice of a delay and the send that follows.
 	if chat_session_cancelled(chat) {
+		chat_retry_record_completed(chat, chain.request, chain.attempts, .Response, .Cancelled)
 		chat_chain_stop(chat, .Cancelled)
 		return
 	}
+	chat_retry_record_completed(chat, chain.request, chain.attempts + 1, .Response, .Resent)
 	// The attempt is over, so the next one owns its own error. The error came from the
 	// attempt's worker, so it is released with the allocator the worker allocated it from,
 	// which is the process heap the mailbox was given.
@@ -845,7 +802,7 @@ chat_chain_repair :: proc(chat: ^Chat_Session) {
 		chat_chain_stop(chat, .Cancelled)
 		return
 	}
-	refusal := chat_try_context_repair(chat, chain.connection, chain.observer, &chain.prep, &chain.encoded, chain.websocket_request, chain.attempts)
+	refusal := chat_try_context_repair(chat, chain.connection, chain.observer, &chain.prep, &chain.encoded, chain.websocket_request)
 	if refusal == .Summary_Running {
 		chat_session_observe_stop(chat)
 		if chat_session_cancelled(chat) {
@@ -905,20 +862,8 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	// A response answered with a notice is feedback for the model, not the end of the turn:
 	// the turn goes on to another request so the model can correct what it sent.
 	turn_continues := chat.pending_notice != .None && !chat_session_cancelled(chat)
-	// A chain that stopped says why, which is the one thing the finished request row cannot
-	// say: the row reports the outcome of its own send, not the reason the harness stopped.
-	if reason != .Completed {
-		if !turn_continues { chat.turn_recovery = reason }
-		level := log.Level.Warning
-		if reason == .Cancelled { level = .Info }
-		stopped := [4]Log_Field {
-			{key = "reason", value = request_recovery_reason_name(reason)},
-			{key = "error_kind", value = ai.provider_operation_error_name(chain.operation_error.kind)},
-			{key = "failure_class", value = ai.provider_failure_class_name(chain.operation_error.failure_class)},
-			{key = "attempts", value = i64(chain.attempts)},
-		}
-		log_emit({level = level, category = .Provider, event = "request.recovery_stopped", fields = stopped[:]})
-	}
+	// The request row reports how its send ended; turn.completed carries why the chain stopped.
+	if reason != .Completed && !turn_continues { chat.turn_recovery = reason }
 	send := Chat_Send_Result {
 		finish_reason       = chain.finish_reason,
 		error               = chain.operation_error,

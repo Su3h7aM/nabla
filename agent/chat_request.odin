@@ -531,34 +531,30 @@ chat_admission_check :: proc(chat: ^Chat_Session, estimate: int, sizes: Chat_Req
 	// The decision is recorded even when it admits the request: what the harness
 	// estimated and what it compared that against is the whole reason a request was
 	// refused later.
-	binding: Log_Binding
-	previous_logger := context.logger
-	defer context.logger = previous_logger
-	context.logger = log_rebind(&binding, log_correlation(chat))
 	capacity := chat.capacity
+	admission := journal.Request_Admitted {
+		estimate            = estimate,
+		context_window      = capacity.window,
+		margin              = capacity.margin,
+		instructions_tokens = sizes.instructions,
+		tools_tokens        = sizes.tools,
+		conversation_tokens = sizes.conversation,
+	}
+	header := journal.Record {
+		kind     = .Request_Admitted,
+		request  = chat.chain.request,
+		provider = chat.provider_id,
+		model    = chat.model_id,
+	}
 	if capacity.window <= 0 {
-		fields := [3]Log_Field {
-			{key = "decision", value = "unconfigured"},
-			{key = "estimate", value = i64(estimate)},
-			{key = "context_window", value = i64(capacity.window)},
-		}
-		log_emit({level = .Warning, category = .Provider, event = "request.admission", fields = fields[:]})
+		admission.decision = journal.ADMISSION_DECISION_NAMES[.Unconfigured]
+		chat_record(chat, header, admission)
 		return "context admission needs context_window: add context_window to the model in config.lua", false
 	}
 	output, fits := chat_request_output_bound(capacity, estimate)
-	admission := [8]Log_Field {
-		{key = "decision", value = fits ? "admitted" : "refused"},
-		{key = "estimate", value = i64(estimate)},
-		{key = "context_window", value = i64(capacity.window)},
-		{key = "output", value = i64(output)},
-		{key = "margin", value = i64(capacity.margin)},
-		// The parts travel with the decision: a refusal nobody can explain is what a
-		// breakdown exists to prevent.
-		{key = "instructions_tokens", value = i64(sizes.instructions)},
-		{key = "tools_tokens", value = i64(sizes.tools)},
-		{key = "conversation_tokens", value = i64(sizes.conversation)},
-	}
-	log_emit({level = .Info, category = .Provider, event = "request.admission", fields = admission[:]})
+	admission.decision = journal.ADMISSION_DECISION_NAMES[.Fits if fits else .Refused]
+	admission.output = output
+	chat_record(chat, header, admission)
 	if fits {
 		return "", true
 	}

@@ -797,6 +797,7 @@ chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> boo
 	if control.state != .Backoff || job == nil { return false }
 	if due, timed := job.due_at.?; timed && time.tick_since(due) < 0 { return false }
 	if chat_session_storage_failed(chat) { return false }
+	chat_retry_record_completed(chat, job.request, job.attempts + 1, .Compaction, .Resent)
 
 	// What the failed attempt produced belongs to the row that already recorded it: this
 	// attempt starts from nothing but the frozen bytes.
@@ -929,13 +930,7 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 		if decision.action == .Retry {
 			job.due_at = chat_retry_deadline(decision.delay)
 			control.state = .Backoff
-			fields := [4]Log_Field {
-				{key = "reason", value = request_recovery_reason_name(decision.reason)},
-				{key = "error_kind", value = ai.provider_operation_error_name(job.operation.kind)},
-				{key = "failure_class", value = ai.provider_failure_class_name(job.operation.failure_class)},
-				{key = "delay_ms", value = Log_Duration_Milliseconds(decision.delay)},
-			}
-			log_emit({level = .Warning, category = .Provider, event = "compaction.retry_scheduled", fields = fields[:]})
+			chat_retry_record_scheduled(chat, job.request, job.attempts, .Compaction, decision.reason, job.attempts + 1, decision.delay)
 			_observer_message(observer, .Notice, "the summary did not complete; it will be sent again")
 			return
 		}
@@ -1265,7 +1260,10 @@ chat_compact_cancel :: proc(chat: ^Chat_Session) {
 		ai.interrupt_request(&job.interrupt)
 		job.stop_at = time.tick_now()
 		control.state = .Retiring
-	case .Ready, .Backoff:
+	case .Ready:
+		chat_compact_destroy_job(control, job)
+	case .Backoff:
+		chat_retry_record_completed(chat, job.request, job.attempts, .Compaction, .Cancelled)
 		chat_compact_destroy_job(control, job)
 	case .Idle, .Retiring:
 	}
@@ -1279,6 +1277,9 @@ chat_compact_destroy :: proc(chat: ^Chat_Session) {
 	chat_compact_jobs_reclaim(&chat.abandoned_compactions)
 	job := control.job
 	if job != nil {
+		if control.state == .Backoff {
+			chat_retry_record_completed(chat, job.request, job.attempts, .Compaction, .Cancelled)
+		}
 		ai.interrupt_request(&job.interrupt)
 		if job.thread != nil && sync.atomic_load(&job.finished) {
 			thread.join(job.thread)

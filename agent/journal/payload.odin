@@ -225,6 +225,45 @@ Turn_Started :: struct {
 	effort:       string,
 }
 
+Request_Prepared :: struct {
+	version:        int,
+	purpose:        string, // REQUEST_PURPOSE_NAMES
+	api:            string,
+	transport:      string, // "http" or "websocket"
+	estimate:       int,
+	context_window: int,
+	messages:       int,
+	tools:          int,
+	replay_refused: int,
+}
+
+Admission_Decision :: enum u8 {
+	Fits,
+	Refused,
+	Unconfigured,
+}
+
+ADMISSION_DECISION_NAMES := [Admission_Decision]string {
+	.Fits         = "fits",
+	.Refused      = "refused",
+	.Unconfigured = "unconfigured",
+}
+
+// Request_Admitted is whether a request fits its model's window. output is the
+// answer bound the request would be sent with; margin is what
+// the window keeps back for estimator error.
+Request_Admitted :: struct {
+	version:             int,
+	decision:            string, // ADMISSION_DECISION_NAMES
+	estimate:            int,
+	context_window:      int,
+	margin:              int,
+	output:              int,
+	instructions_tokens: int,
+	tools_tokens:        int,
+	conversation_tokens: int,
+}
+
 Request_Sent :: struct {
 	version:         int,
 	purpose:         string, // REQUEST_PURPOSE_NAMES
@@ -235,6 +274,32 @@ Request_Sent :: struct {
 	recovery:        string,
 	body_digest:     string, // hex SHA-256 of the frozen body, "" when the body was not encoded
 	body_bytes:      int,
+}
+
+Retry_Scheduled :: struct {
+	version:      int,
+	purpose:      string, // REQUEST_PURPOSE_NAMES
+	reason:       string, // request_recovery_reason_name
+	next_attempt: int,
+	delay_ms:     i64,
+}
+
+Retry_Outcome :: enum u8 {
+	Resent,
+	Cancelled,
+}
+
+RETRY_OUTCOME_NAMES := [Retry_Outcome]string {
+	.Resent    = "resent",
+	.Cancelled = "cancelled",
+}
+
+// Retry_Completed ends a retry's wait: resent carries the attempt being sent,
+// cancelled the attempt that failed.
+Retry_Completed :: struct {
+	version: int,
+	purpose: string, // REQUEST_PURPOSE_NAMES
+	outcome: string, // RETRY_OUTCOME_NAMES
 }
 
 // Subagent_Started opens a delegation in the parent's session, committed with the

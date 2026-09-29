@@ -233,32 +233,6 @@ test_diagnostics_do_not_change_a_turn :: proc(test: ^testing.T) {
 }
 
 @(test)
-test_an_admission_decision_is_recorded :: proc(test: ^testing.T) {
-	fixture: Log_Chat_Test
-	context.logger = log_chat_begin(test, &fixture, tool_loop_workspace(test))
-	defer log_chat_end(test, &fixture)
-	chat := &fixture.chat.chat
-
-	// The window has to hold the estimate plus the reserved output plus the margin,
-	// or nothing is ever admitted.
-	chat_test_capacity(chat, 20_000)
-	message, admitted := chat_admission_check(chat, 10, {})
-	testing.expect(test, admitted, "a small request fits")
-	testing.expect_value(test, message, "")
-
-	_, refused := chat_admission_check(chat, 100_000, {})
-	testing.expect(test, !refused, "an oversized request is refused")
-
-	context.logger = fixture.ambient
-	text := log_chat_text(test, &fixture)
-	defer delete(text, context.allocator)
-	testing.expect(test, strings.contains(text, "request.admission"), "the decision is recorded")
-	testing.expect(test, strings.contains(text, "decision=admitted"), "the admission is named")
-	testing.expect(test, strings.contains(text, "decision=refused"), "the refusal is named")
-	testing.expect(test, strings.contains(text, "estimate=100000"), "the refusal carries what was estimated")
-}
-
-@(test)
 test_starting_a_compaction_records_its_scope :: proc(test: ^testing.T) {
 	fixture: Log_Chat_Test
 	context.logger = log_chat_begin(test, &fixture, tool_loop_workspace(test))
@@ -334,68 +308,75 @@ test_a_transfer_account_belongs_to_one_attempt :: proc(test: ^testing.T) {
 }
 
 @(test)
-test_preparation_never_names_the_previous_request :: proc(test: ^testing.T) {
+test_a_prepared_request_records_its_admission :: proc(test: ^testing.T) {
 	fixture: Log_Chat_Test
 	context.logger = log_chat_begin(test, &fixture, tool_loop_workspace(test))
 	defer log_chat_end(test, &fixture)
 	chat := &fixture.chat.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(test, chat, "say something")
 
-	_test_accept(test, chat, "first")
-	// Admission has to accept, or the request would compact instead, and a
-	// compaction is a second provider request this test is not about.
-	chat_test_capacity(chat, 256_000, 16_000)
-
-	// A URL this client refuses fails the attempt as an invalid request, which is
-	// not retried. So both requests are recorded without being sent, and the test
-	// does not wait out a retry backoff.
-	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
-	defer delete(usages)
+	responses := []string{agent_provider_reply("ready")}
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
 	connection := ai.Provider_Connection {
 		API      = .OpenAI_Chat_Completions,
-		Endpoint = "ftp://not-a-provider",
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
 	}
+	defer delete(connection.Endpoint, chat.allocator)
 
-	_test_perform_request(test, chat, connection, test_retry_policy(), {}, &usages)
-	// The second request of one turn is where the defect showed: the durable
-	// number the first request left behind is not this request's identity. It is
-	// prepared from the preparing state, which is where a settled tool batch or a
-	// rejected response leaves the turn; this request failed instead, so the test
-	// states it directly.
-	chat.state = .Preparing
-	_test_perform_request(test, chat, connection, test_retry_policy(), {}, &usages)
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the request completed")
+	records, _, read_error := journal.read_records(
+		&fixture.chat.store,
+		{session = chat.session, kinds = {.Request_Prepared, .Request_Admitted}},
+		0,
+		0,
+		context.allocator,
+	)
+	if read_error != nil { testing.fail_now(test, "the request records could not be read") }
+	defer journal.records_destroy(records, context.allocator)
+	if !testing.expect_value(test, len(records), 2) { return }
 
-	context.logger = fixture.ambient
-	text := log_chat_text(test, &fixture)
-	defer delete(text, context.allocator)
-
-	// A preparation record is emitted before its request has a number, so it must
-	// carry none. Naming the previous request is worse than naming nothing: a
-	// reader filtering for one request would read the other request's estimate.
-	prepared, recorded := 0, 0
-	for line in strings.split_lines(text, context.temp_allocator) {
-		switch {
-		case strings.has_prefix(line, "request.prepared"), strings.has_prefix(line, "request.admission"):
-			prepared += 1
-			if strings.has_prefix(line, "request.prepared") {
-				testing.expectf(test, strings.contains(line, " turn_no="), "request.prepared must name its turn: %s", line)
+	request: journal.Request_Id
+	prepared_found, admitted_found := false, false
+	for record in records {
+		testing.expect_value(test, record.turn, journal.Turn_Id(1))
+		testing.expect_value(test, record.request != 0, true)
+		testing.expect_value(test, record.provider, chat.provider_id)
+		testing.expect_value(test, record.model, chat.model_id)
+		#partial switch record.kind {
+		case .Request_Prepared:
+			payload: journal.Request_Prepared
+			if journal.payload_decode(record.data, &payload, context.temp_allocator) != nil {
+				testing.fail_now(test, "request.prepared could not be decoded")
 			}
-			testing.expectf(test, !strings.contains(line, " request_no="), "preparation must not name a request: %s", line)
-		case strings.has_prefix(line, "request.recorded"):
-			recorded += 1
-			testing.expectf(test, strings.contains(line, " request_no="), "request.recorded must name its request: %s", line)
+			testing.expect_value(test, payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
+			testing.expect_value(test, payload.api, "openai_chat_completions")
+			testing.expect_value(test, payload.transport, "http")
+			testing.expect(test, payload.estimate > 0, "the prepared request carries its estimate")
+			testing.expect_value(test, payload.context_window, CHAT_DEFAULT_CONTEXT_WINDOW)
+			testing.expect(test, payload.messages > 0, "the prepared request counts its messages")
+			request = record.request
+			prepared_found = true
+		case .Request_Admitted:
+			payload: journal.Request_Admitted
+			if journal.payload_decode(record.data, &payload, context.temp_allocator) != nil {
+				testing.fail_now(test, "request.admitted could not be decoded")
+			}
+			testing.expect_value(test, payload.decision, "fits")
+			testing.expect(test, payload.estimate > 0, "the admission carries its estimate")
+			testing.expect_value(test, payload.context_window, CHAT_DEFAULT_CONTEXT_WINDOW)
+			admitted_found = true
 		}
 	}
-	// Two requests were prepared and recorded, so the assertions above saw both
-	// requests rather than passing over an empty stream.
-	testing.expect_value(test, prepared, 4)
-	testing.expect_value(test, recorded, 2)
+	testing.expect(test, prepared_found, "the request preparation is recorded")
+	testing.expect(test, admitted_found, "the admission decision is recorded")
+	for record in records { testing.expect_value(test, record.request, request) }
 }
 
-// A retry is reported as a structured event, for whoever reads the log after the turn
-// rather than while it runs: the decision taken on the failed send, and the send that
-// followed it, both naming the request they belong to.
 @(test)
-test_a_scheduled_retry_is_reported_as_events :: proc(test: ^testing.T) {
+test_a_retry_records_its_schedule_and_completion :: proc(test: ^testing.T) {
 	fixture: Log_Chat_Test
 	context.logger = log_chat_begin(test, &fixture, tool_loop_workspace(test))
 	defer log_chat_end(test, &fixture)
@@ -416,21 +397,36 @@ test_a_scheduled_retry_is_reported_as_events :: proc(test: ^testing.T) {
 
 	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed after a retry")
 
-	context.logger = fixture.ambient
-	text := log_chat_text(test, &fixture)
-	defer delete(text, context.allocator)
+	records, _, read_error := journal.read_records(
+		&fixture.chat.store,
+		{session = chat.session, kinds = {.Retry_Scheduled, .Retry_Completed}},
+		0,
+		0,
+		context.allocator,
+	)
+	if read_error != nil { testing.fail_now(test, "the retry records could not be read") }
+	defer journal.records_destroy(records, context.allocator)
+	if !testing.expect_value(test, len(records), 2) { return }
 
-	scheduled, started := 0, 0
-	for line in strings.split_lines(text, context.temp_allocator) {
-		switch {
-		case strings.has_prefix(line, "request.retry_scheduled"):
-			scheduled += 1
-			testing.expectf(test, strings.contains(line, "reason=transient_failure"), "a scheduled retry says why: %s", line)
-			testing.expectf(test, strings.contains(line, " request_no="), "a scheduled retry names its request: %s", line)
-		case strings.has_prefix(line, "request.retry_started"):
-			started += 1
-		}
+	scheduled := records[0]
+	completed := records[1]
+	testing.expect_value(test, scheduled.kind, journal.Record_Kind.Retry_Scheduled)
+	testing.expect_value(test, completed.kind, journal.Record_Kind.Retry_Completed)
+	testing.expect_value(test, scheduled.request != 0, true)
+	testing.expect_value(test, completed.request, scheduled.request)
+	testing.expect_value(test, scheduled.attempt, journal.Attempt_No(1))
+	testing.expect_value(test, completed.attempt, journal.Attempt_No(2))
+	scheduled_payload: journal.Retry_Scheduled
+	if journal.payload_decode(scheduled.data, &scheduled_payload, context.temp_allocator) != nil {
+		testing.fail_now(test, "retry.scheduled could not be decoded")
 	}
-	testing.expect_value(test, scheduled, 1)
-	testing.expect_value(test, started, 1)
+	testing.expect_value(test, scheduled_payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
+	testing.expect_value(test, scheduled_payload.reason, "transient_failure")
+	testing.expect_value(test, scheduled_payload.next_attempt, 2)
+	completed_payload: journal.Retry_Completed
+	if journal.payload_decode(completed.data, &completed_payload, context.temp_allocator) != nil {
+		testing.fail_now(test, "retry.completed could not be decoded")
+	}
+	testing.expect_value(test, completed_payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
+	testing.expect_value(test, completed_payload.outcome, "resent")
 }

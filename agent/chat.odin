@@ -2,7 +2,6 @@ package agent
 
 import "base:runtime"
 import "core:fmt"
-import "core:log"
 import "core:sys/posix"
 import "core:time"
 
@@ -160,20 +159,6 @@ chat_commit_response :: proc(
 	// did not commit, because the turn failed or was cancelled, is dropped.
 	chat.pending_notice = .None
 
-	finished := [3]Log_Field {
-		{key = "outcome", value = CHAT_SEND_OUTCOME_NAMES[outcome]},
-		{key = "attempts", value = i64(attempt)},
-		{key = "finish_reason", value = chat_finish_reason_text(result.finish_reason)},
-	}
-	// A cancelled request is an ordinary end of the turn; one that failed is an
-	// error.
-	finished_binding: Log_Binding
-	previous_logger := context.logger
-	defer context.logger = previous_logger
-	context.logger = log_rebind(&finished_binding, log_correlation(chat))
-	level := log.Level.Info
-	if outcome == .Failed { level = .Error }
-	log_emit({level = level, category = .Provider, event = "request.finished", fields = finished[:]})
 }
 
 // chat_commit_response_nodes commits one completed response: its Assistant node,
