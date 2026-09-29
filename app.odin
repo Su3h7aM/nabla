@@ -388,7 +388,9 @@ tui_run :: proc(
 ) {
 	app, app_error := new(App)
 	if app_error != nil { return false }
-	defer free(app)
+	app_abandoned := false
+	// An abandoned worker may still access this allocation.
+	defer if !app_abandoned { free(app) }
 	app.run.alloc = context.allocator
 	// This run is the user's own, so its model choice is published to the frame and
 	// remembered for the next launch.
@@ -419,7 +421,7 @@ tui_run :: proc(
 	app.storage = frame_storage_new(app.run.alloc)
 	if app.storage == nil {
 		fmt.eprintln("nabla: cannot allocate the frame budget")
-		app_teardown(app)
+		app_abandoned = app_teardown(app)
 		return false
 	}
 	// The status is published only once the frame budget exists, so a failure here
@@ -429,14 +431,14 @@ tui_run :: proc(
 	// workspace would dangle as soon as the running session changed.
 	if !snapshot_status_start(app) {
 		fmt.eprintln("nabla: the status line could not be allocated")
-		app_teardown(app)
+		app_abandoned = app_teardown(app)
 		return false
 	}
 	app.run.snap.status.context_window = app.setup.session.capacity.window
 	work, work_error := chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
 	if work_error != nil {
 		fmt.eprintln("nabla: cannot create the command queue:", work_error)
-		app_teardown(app)
+		app_abandoned = app_teardown(app)
 		return false
 	}
 	app.run.work = work
@@ -445,18 +447,25 @@ tui_run :: proc(
 	terminal, open_err := term.open({alternate_screen = true, hide_cursor = true, bracketed_paste = true, mouse = true, input_mode = .Raw}, app.run.alloc)
 	if open_err != nil {
 		fmt.eprintln("nabla: cannot open the terminal:", open_err)
-		app_teardown(app)
+		app_abandoned = app_teardown(app)
 		return false
 	}
-	// The terminal is being released on the way out; a close failure changes
-	// nothing the run can do about it.
-	defer { _ = term.close(terminal) }
+	// The terminal is being released on the way out, after the frame loop stops drawing.
+	defer {
+		close_error := term.close(terminal)
+		if close_error != nil {
+			close_error = term.close(terminal)
+			if close_error != nil {
+				fmt.eprintfln("nabla: could not restore the terminal state (%v); run `reset` to restore it", close_error)
+			}
+		}
+	}
 	app.terminal = terminal
 
 	tty, file_err := term.session_file(terminal)
 	if file_err != nil {
 		fmt.eprintln("nabla: cannot access the terminal input:", file_err)
-		app_teardown(app)
+		app_abandoned = app_teardown(app)
 		return false
 	}
 	app.tty = tty
@@ -464,14 +473,14 @@ tui_run :: proc(
 	raw, raw_error := make([dynamic]input.Event, 0, 16, app.run.alloc)
 	if raw_error != nil {
 		fmt.eprintln("nabla: the input buffer could not be allocated")
-		app_teardown(app)
+		app_abandoned = app_teardown(app)
 		return false
 	}
 	app.raw = raw
 
 	if !apply_startup_selection(app, flag_provider, flag_model) {
 		fmt.eprintln("nabla:", setup_error_text(app))
-		app_teardown(app)
+		app_abandoned = app_teardown(app)
 		return false
 	}
 
@@ -488,7 +497,7 @@ tui_run :: proc(
 	worker := thread.create(run_worker, name = "nabla-tui-worker")
 	if worker == nil {
 		fmt.eprintln("nabla: cannot start the worker thread")
-		app_teardown(app)
+		app_abandoned = app_teardown(app)
 		return false
 	}
 	worker.data = app
@@ -584,7 +593,7 @@ tui_run :: proc(
 	// cancellation guarantees that.
 	stop_runtime(app)
 	if runtime_busy(app) { agent.turn_control_stop(&app.run.control) }
-	app_teardown(app)
+	app_abandoned = app_teardown(app)
 	return !read_failed
 }
 
@@ -604,7 +613,8 @@ report_viewport_unavailable :: proc(app: ^App, err: term.Error) {
 // once. A thread that does not retire stops the release, because what it can still reach
 // must not be handed back while it is using it. patience is per thread, so a test can
 // hold the give-up path without the bound a real shutdown uses.
-app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
+@(require_results)
+app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	retired := catalog_refresh_stop(app, patience)
 	if app.run.work != {} {
 		chan.close(&app.run.work)
@@ -623,7 +633,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 		// with that memory owned by the thread that is using it, and the record names
 		// which thread it was.
 		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.teardown_abandoned"})
-		return
+		return true
 	}
 	// The worker frees what it had buffered on the way out; this covers commands
 	// that were queued after it stopped receiving, and a worker that never started.
@@ -656,10 +666,11 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) {
 	// exits with them rather than freeing them under it.
 	if agent.chat_session_workers_outstanding(&app.setup.session) {
 		agent.log_emit(agent.Log_Record{level = .Warning, category = .Runtime, event = "runtime.workers_outstanding"})
-		return
+		return true
 	}
 	run_setup_destroy(&app.setup)
 	catalog_run_destroy(app)
+	return false
 }
 
 // snapshot_destroy releases everything the front-end snapshot owns and zeroes it,

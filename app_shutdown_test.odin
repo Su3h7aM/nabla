@@ -116,8 +116,9 @@ test_app_teardown_abandons_its_release_path_for_a_stuck_worker :: proc(t: ^testi
 	app.setup.log_binding = fixture.binding
 	state := shutdown_test_state()
 	app.run.worker = shutdown_test_start(t, state, "nabla-test-worker")
-	app_teardown(&app, 20 * time.Millisecond)
+	abandoned := app_teardown(&app, 20 * time.Millisecond)
 
+	testing.expect(t, abandoned, "teardown must report that it left a worker running")
 	testing.expect(t, app.run.worker != nil, "a worker that did not retire must not be claimed retired")
 	records := log_fixture_records(&fixture)
 	testing.expectf(t, strings.contains(records, "runtime.thread_unretired"), "no unretired-thread record: %s", records)
