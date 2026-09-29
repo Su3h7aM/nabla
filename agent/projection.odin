@@ -139,22 +139,22 @@ projection_load :: proc(
 			projection.covers = node.covers
 		case .User:
 			user: journal.User
-			journal.payload_decode(node.data, &user, context.temp_allocator) or_return
+			journal.payload_decode(node.data, &user, context.temp_allocator, corruption_journal = store, session = node.session, seq = node.seq) or_return
 			origin, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, user.origin)
 			if !known { return {}, journal.Journal_Error.Corrupt }
 			append(&items, Projection_Item{node = node.id, turn = node.turn, payload = Projected_User{text = body, origin = origin}}) or_return
 		case .Context, .Notice:
 			append(&items, Projection_Item{node = node.id, turn = node.turn, payload = Projected_User{text = body, origin = .Harness}}) or_return
 		case .Assistant:
-			projection_add_assistant(&items, node, responses[node.id][:], admitted, arena) or_return
+			projection_add_assistant(store, &items, node, responses[node.id][:], admitted, arena) or_return
 		case .Results:
 			results: journal.Results
-			journal.payload_decode(node.data, &results, context.temp_allocator) or_return
+			journal.payload_decode(node.data, &results, context.temp_allocator, corruption_journal = store, session = node.session, seq = node.seq) or_return
 			for call in results.calls {
 				record, found := completed[call]
 				if !found { return {}, journal.Journal_Error.Corrupt }
 				completion: journal.Tool_Completed
-				journal.payload_decode(record.data, &completion, arena) or_return
+				journal.payload_decode(record.data, &completion, arena, corruption_journal = store, session = record.session, seq = record.seq) or_return
 				result := Projected_Result {
 					call    = call,
 					content = string(record.body),
@@ -178,6 +178,7 @@ projection_load :: proc(
 // its native output, its finished text, then the calls it proposed.
 @(private, require_results)
 projection_add_assistant :: proc(
+	store: ^journal.Journal,
 	items: ^[dynamic]Projection_Item,
 	node: journal.Node,
 	records: []^journal.Record, // the node's response and proposals, in seq order
@@ -185,7 +186,7 @@ projection_add_assistant :: proc(
 	arena: mem.Allocator,
 ) -> journal.Error {
 	assistant: journal.Assistant
-	journal.payload_decode(node.data, &assistant, context.temp_allocator) or_return
+	journal.payload_decode(node.data, &assistant, context.temp_allocator, corruption_journal = store, session = node.session, seq = node.seq) or_return
 	item := Projection_Item {
 		node    = node.id,
 		turn    = node.turn,
@@ -194,7 +195,7 @@ projection_add_assistant :: proc(
 	for record in records {
 		if record.kind != .Response_Committed || len(record.body) == 0 { continue }
 		response: journal.Response_Committed
-		journal.payload_decode(record.data, &response, arena) or_return
+		journal.payload_decode(record.data, &response, arena, corruption_journal = store, session = record.session, seq = record.seq) or_return
 		item.payload = Projected_Response {
 			output   = string(record.body),
 			api      = response.api,
@@ -212,7 +213,7 @@ projection_add_assistant :: proc(
 	for record in records {
 		if record.kind != .Tool_Proposed { continue }
 		proposal: journal.Tool_Proposed
-		journal.payload_decode(record.data, &proposal, arena) or_return
+		journal.payload_decode(record.data, &proposal, arena, corruption_journal = store, session = record.session, seq = record.seq) or_return
 		item.payload = Projected_Call {
 			call        = record.call,
 			provider_id = proposal.provider_id,

@@ -7,6 +7,7 @@ import "core:path/filepath"
 import "core:strings"
 import "core:testing"
 
+import "nabla:agent/journal"
 import "nabla:agent/skills"
 
 @(test)
@@ -20,35 +21,41 @@ test_client_system_prompt_is_kept_out_of_history_and_rendered_as_instructions ::
 	testing.expect(t, strings.contains(fixture.chat.skill_instructions, "client standing context"))
 }
 
-// A snapshot written by an older build must still apply: resume reads it
-// instead of rediscovering, so an unreadable snapshot would strand the session.
 @(test)
-test_a_v1_instruction_snapshot_still_applies :: proc(t: ^testing.T) {
+test_an_old_instruction_snapshot_is_a_corruption_on_restore :: proc(t: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(t, &fixture, "/tmp")
 	defer chat_test_end(t, &fixture)
 
-	// Version 1 carried a repository boundary field and "project" root kinds;
-	// both are inert for the applied catalog.
+	instructions := "instructions!"
 	manifest :=
 		`{"version":1,"workspace":"/tmp","boundary":"/tmp","disable_project":false,` +
 		`"tools_enabled":true,"metadata_format":1,"instruction_bytes":13,` +
 		`"roots":[{"kind":"project","path":"/tmp/.agents/skills","authority":"/tmp"}],` +
-		`"agents":[],"skills":[{"name":"pdf","description":"pdf work",` +
-		`"logical_path":"/tmp/.agents/skills/pdf/SKILL.md","directory":"/tmp/.agents/skills/pdf",` +
-		`"root_index":0,"metadata_digest":"0000000000000000000000000000000000000000000000000000000000000000"}],` +
-		`"diagnostics":[],"omitted_diagnostics":0,"inline_catalog_truncated":false}`
-	if !testing.expect(t, chat_apply_snapshot(&fixture.chat, "instructions!", manifest)) {
-		return
-	}
-	testing.expect_value(t, fixture.chat.skill_instructions, "instructions!")
-	catalog, has_catalog := &fixture.chat.skill_catalog.?
-	if !testing.expect(t, has_catalog) { return }
-	testing.expect_value(t, len(catalog.skills), 1)
-	if len(catalog.skills) == 1 {
-		testing.expect_value(t, catalog.skills[0].name, "pdf")
-		testing.expect_value(t, catalog.roots[0].source, skills.Source_Kind.Local)
-	}
+		`"agents":[],"skills":[],"diagnostics":[],"omitted_diagnostics":0,` +
+		`"inline_catalog_truncated":false}`
+	instructions_digest := journal.put_artifact(&fixture.store, INSTRUCTIONS_ARTIFACT, transmute([]u8)instructions)
+	manifest_digest := journal.put_artifact(&fixture.store, INSTRUCTION_MANIFEST_ARTIFACT, transmute([]u8)manifest)
+	instructions_hex_buffer: [journal.DIGEST_HEX_LENGTH]u8
+	manifest_hex_buffer: [journal.DIGEST_HEX_LENGTH]u8
+	journal.append_record(
+		&fixture.store,
+		journal.Record{session = fixture.chat.session, turn = 1, kind = .Turn_Started},
+		journal.Turn_Started {
+			instructions = journal.digest_to_hex(instructions_digest, instructions_hex_buffer[:]),
+			manifest = journal.digest_to_hex(manifest_digest, manifest_hex_buffer[:]),
+		},
+	)
+	turn_seq, commit_error := journal.commit(&fixture.store)
+	if !testing.expect_value(t, commit_error, nil) { return }
+
+	delete(fixture.chat.skill_instructions, fixture.chat.allocator)
+	fixture.chat.skill_instructions = ""
+	applied, restore_error := chat_restore_instructions(&fixture.chat)
+	testing.expect(t, !applied)
+	testing.expect(t, journal.error_is(restore_error, .Corrupt))
+	testing.expect_value(t, fixture.store.corrupt.session, fixture.chat.session)
+	testing.expect_value(t, fixture.store.corrupt.seq, turn_seq)
 }
 
 // A corrupt snapshot applies nothing: the session keeps no catalog, and the
@@ -94,10 +101,42 @@ test_an_instruction_snapshot_never_replaces_a_catalog :: proc(t: ^testing.T) {
 	testing.expect_value(t, fixture.chat.skill_instructions, "instructions!")
 }
 
-// A snapshot the harness wrote is applied to the catalog it describes. The roots it records
-// are the catalog's own, because a skill's root_index is an index into that list: a resume
-// that paired a skill with a root discovery had discarded refused the skill as outside its
-// root, which is exactly how every global skill looked on a resumed session.
+@(test)
+test_an_instruction_snapshot_rejects_the_project_root_alias :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, "/tmp")
+	defer chat_test_end(t, &fixture)
+
+	manifest :=
+		`{"version":2,"workspace":"/tmp","disable_project":false,` +
+		`"tools_enabled":true,"metadata_format":1,"instruction_bytes":13,` +
+		`"roots":[{"kind":"project","path":"/tmp/.agents/skills","authority":"/tmp"}],` +
+		`"agents":[],"skills":[],"diagnostics":[],"omitted_diagnostics":0,` +
+		`"inline_catalog_truncated":false}`
+	testing.expect(t, !chat_apply_snapshot(&fixture.chat, "instructions!", manifest))
+}
+
+@(test)
+test_an_instruction_snapshot_rejects_a_skill_paired_with_the_wrong_root :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, "/tmp")
+	defer chat_test_end(t, &fixture)
+
+	manifest :=
+		`{"version":2,"workspace":"/tmp","disable_project":false,` +
+		`"tools_enabled":true,"metadata_format":1,"instruction_bytes":13,` +
+		`"roots":[{"kind":"local","path":"/tmp/.agents/skills","authority":"/tmp"},` +
+		`{"kind":"generic_user","path":"/tmp/home/.agents/skills","authority":""}],` +
+		`"agents":[],"skills":[{"name":"unslop","description":"cut the tells",` +
+		`"logical_path":"/tmp/home/.agents/skills/unslop/SKILL.md",` +
+		`"directory":"/tmp/home/.agents/skills/unslop","root_index":0,` +
+		`"metadata_digest":"0000000000000000000000000000000000000000000000000000000000000000"}],` +
+		`"diagnostics":[],"omitted_diagnostics":0,"inline_catalog_truncated":false}`
+	testing.expect(t, !chat_apply_snapshot(&fixture.chat, "instructions!", manifest))
+}
+
+// A snapshot the harness wrote applies the catalog it describes, including each skill's
+// index into the roots that actually hold it.
 @(test)
 test_a_written_snapshot_restores_the_root_each_skill_came_from :: proc(t: ^testing.T) {
 	workspace, workspace_error := os.make_directory_temp("", "nabla-snapshot-workspace-*", context.allocator)
@@ -155,36 +194,6 @@ test_a_written_snapshot_restores_the_root_each_skill_came_from :: proc(t: ^testi
 	defer skills.load_error_destroy(&load_error, context.allocator)
 	testing.expect_value(t, load_error.kind, skills.Error_Kind.None)
 	testing.expect(t, len(loaded.body) > 0, "the restored skill has no body")
-}
-
-// A snapshot written before the manifest recorded the catalog's own roots names the launch's
-// configured roots, so its skills can point at a root that does not hold them. Applying it
-// has to place each skill on the root it is in: the pairing decides whether a local skill may
-// be read, and which origin the model is told it came from.
-@(test)
-test_a_snapshot_the_old_writer_recorded_is_repaired :: proc(t: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(t, &fixture, "/tmp")
-	defer chat_test_end(t, &fixture)
-
-	manifest :=
-		`{"version":2,"workspace":"/tmp","disable_project":false,` +
-		`"tools_enabled":true,"metadata_format":1,"instruction_bytes":13,` +
-		`"roots":[{"kind":"local","path":"/tmp/.agents/skills","authority":"/tmp"},` +
-		`{"kind":"generic_user","path":"/tmp/home/.agents/skills","authority":""}],` +
-		`"agents":[],"skills":[{"name":"unslop","description":"cut the tells",` +
-		`"logical_path":"/tmp/home/.agents/skills/unslop/SKILL.md",` +
-		`"directory":"/tmp/home/.agents/skills/unslop",` +
-		`"root_index":0,"metadata_digest":"0000000000000000000000000000000000000000000000000000000000000000"}],` +
-		`"diagnostics":[],"omitted_diagnostics":0,"inline_catalog_truncated":false}`
-	if !testing.expect(t, chat_apply_snapshot(&fixture.chat, "instructions!", manifest)) { return }
-	catalog, has_catalog := &fixture.chat.skill_catalog.?
-	if !testing.expect(t, has_catalog, "the snapshot installed no catalog") { return }
-	if len(catalog.skills) != 1 { testing.fail_now(t, "the restored catalog lost the skill") }
-
-	skill := catalog.skills[0]
-	if !testing.expect(t, skill.root_index == 1, "the skill kept a root that does not hold it") { return }
-	testing.expect_value(t, skill_source_label(catalog, skill), "generic user")
 }
 
 // chat_instructions_test_skill installs one valid skill in a root, so a test can discover

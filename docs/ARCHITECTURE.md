@@ -477,7 +477,7 @@ cache_coverage :: proc(totals: Usage_Totals) -> (share: f64, measured: bool)
 list_sessions  :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.Allocator) -> ([]Session_Summary, Error)
 list_branches  :: proc(journal: ^Journal, session: Session_Id, allocator: mem.Allocator) -> ([]Branch_Summary, Error)
 recover        :: proc(journal: ^Journal) -> (Recovery, Error)                         // the claimed session, one transaction
-payload_decode :: proc(data: string, payload: ^$Payload, allocator: mem.Allocator) -> Error // Corrupt when data does not decode
+payload_decode :: proc(data: string, payload: ^$Payload, allocator: mem.Allocator, corruption_journal: ^Journal = nil, session: Session_Id = {}, seq: Journal_Seq = 0) -> Error // Corrupt on malformed data or unsupported version
 error_text     :: proc(error: Error, allocator := context.allocator) -> string
 ```
 

@@ -9,12 +9,26 @@ import "core:mem"
 // stored as the stable names of their tables; read them back with enum_from_name.
 PAYLOAD_VERSION :: 1
 
-// payload_decode reads a record's or node's data into its payload struct, with
-// strings and slices in allocator. A failed decode may leave partial
-// allocations behind, so allocator is a temp or arena allocator.
+// payload_decode reads one supported record or node payload, with strings and slices in
+// allocator. Malformed JSON or a missing or unsupported version returns .Corrupt. A failed
+// decode may leave partial allocations behind, so allocator is a temp or arena allocator.
+// When corruption_journal is given, a corrupt payload also records its session and seq there.
 @(require_results)
-payload_decode :: proc(data: string, payload: ^$Payload, allocator: mem.Allocator) -> Error {
-	if json.unmarshal_string(data, payload, allocator = allocator) != nil { return Journal_Error.Corrupt }
+payload_decode :: proc(
+	data: string,
+	payload: ^$Payload,
+	allocator: mem.Allocator,
+	corruption_journal: ^Journal = nil,
+	session: Session_Id = {},
+	seq: Journal_Seq = 0,
+) -> Error {
+	payload.version = 0
+	if json.unmarshal_string(data, payload, allocator = allocator) != nil || payload.version != PAYLOAD_VERSION {
+		if corruption_journal != nil {
+			return corrupt(corruption_journal, Journal_Error.Corrupt, session, seq)
+		}
+		return Journal_Error.Corrupt
+	}
 	return nil
 }
 

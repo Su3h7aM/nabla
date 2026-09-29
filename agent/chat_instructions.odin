@@ -64,15 +64,39 @@ chat_restore_instructions :: proc(chat: ^Chat_Session) -> (applied: bool, error:
 	record, found := journal.read_latest(chat.store, filter, context.temp_allocator) or_return
 	if !found { return false, nil }
 	started: journal.Turn_Started
-	journal.payload_decode(record.data, &started, context.temp_allocator) or_return
+	journal.payload_decode(
+		record.data,
+		&started,
+		context.temp_allocator,
+		corruption_journal = chat.store,
+		session = record.session,
+		seq = record.seq,
+	) or_return
 	if started.instructions == "" { return false, nil }
 	instructions_digest, instructions_valid := journal.digest_from_hex(started.instructions)
 	manifest_digest, manifest_valid := journal.digest_from_hex(started.manifest)
-	if !instructions_valid || !manifest_valid { return false, journal.Journal_Error.Corrupt }
-	instructions, instructions_found := journal.read_artifact(chat.store, instructions_digest, context.temp_allocator) or_return
-	manifest, manifest_found := journal.read_artifact(chat.store, manifest_digest, context.temp_allocator) or_return
-	if !instructions_found || !manifest_found { return false, journal.Journal_Error.Corrupt }
-	if !chat_apply_snapshot(chat, string(instructions), string(manifest)) { return false, journal.Journal_Error.Corrupt }
+	if !instructions_valid || !manifest_valid {
+		chat.store.corrupt = {record.session, record.seq}
+		return false, journal.Journal_Error.Corrupt
+	}
+	instructions, instructions_found, instructions_error := journal.read_artifact(chat.store, instructions_digest, context.temp_allocator)
+	if instructions_error != nil {
+		if journal.error_is(instructions_error, .Corrupt) { chat.store.corrupt = {record.session, record.seq} }
+		return false, instructions_error
+	}
+	manifest, manifest_found, manifest_error := journal.read_artifact(chat.store, manifest_digest, context.temp_allocator)
+	if manifest_error != nil {
+		if journal.error_is(manifest_error, .Corrupt) { chat.store.corrupt = {record.session, record.seq} }
+		return false, manifest_error
+	}
+	if !instructions_found || !manifest_found {
+		chat.store.corrupt = {record.session, record.seq}
+		return false, journal.Journal_Error.Corrupt
+	}
+	if !chat_apply_snapshot(chat, string(instructions), string(manifest)) {
+		chat.store.corrupt = {record.session, record.seq}
+		return false, journal.Journal_Error.Corrupt
+	}
 	chat.instructions_digest = instructions_digest
 	chat.manifest_digest = manifest_digest
 	return true, nil
@@ -296,6 +320,8 @@ snapshot_skill_make :: proc(entry: Instruction_Manifest_Skill, allocator: mem.Al
 @(require_results)
 snapshot_root_make :: proc(entry: Instruction_Manifest_Root, allocator: mem.Allocator) -> (skills.Root, bool) {
 	root: skills.Root
+	source, source_ok := instruction_manifest_source(entry.kind)
+	if !source_ok { return {}, false }
 	path, path_error := strings.clone(entry.path, allocator)
 	if path_error != nil { return {}, false }
 	authority, authority_error := strings.clone(entry.authority, allocator)
@@ -304,7 +330,7 @@ snapshot_root_make :: proc(entry: Instruction_Manifest_Root, allocator: mem.Allo
 		return {}, false
 	}
 	root = skills.Root {
-		source    = instruction_manifest_source(entry.kind),
+		source    = source,
 		path      = path,
 		authority = authority,
 	}
@@ -355,12 +381,14 @@ chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: st
 	if chat.skill_catalog != nil { return false }
 	manifest: Instruction_Manifest
 	if json.unmarshal_string(manifest_json, &manifest, allocator = context.temp_allocator) != nil { return false }
-	// Version 1 differed from the current manifest only by a removed repository
-	// boundary field and the source-kind name "project"; both are inert, so old
-	// snapshots keep applying instead of stranding their sessions.
-	if manifest.version > INSTRUCTION_MANIFEST_VERSION { return false }
+	if manifest.version != INSTRUCTION_MANIFEST_VERSION { return false }
 	if manifest.workspace != chat.workspace { return false }
 	if manifest.instruction_bytes != len(instructions) { return false }
+	for entry in manifest.skills {
+		if !skills.skill_name_valid(entry.name) { return false }
+		if entry.root_index < 0 || entry.root_index >= len(manifest.roots) { return false }
+		if !skills.path_within(entry.directory, manifest.roots[entry.root_index].path) { return false }
+	}
 	catalog: skills.Catalog
 	// A corrupt entry or allocation failure must not strand what earlier entries cloned.
 	applied := false
@@ -375,7 +403,6 @@ chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: st
 	if diagnostics_error != nil { return false }
 	catalog.diagnostics = catalog_diagnostics
 	for entry, index in manifest.skills {
-		if !skills.skill_name_valid(entry.name) { return false }
 		skill, skill_ok := snapshot_skill_make(entry, chat.allocator)
 		if !skill_ok { return false }
 		catalog.skills[index] = skill
@@ -387,7 +414,6 @@ chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: st
 		if !root_ok { return false }
 		catalog.roots[index] = root
 	}
-	chat_rebind_skill_roots(&catalog)
 	for entry, index in manifest.diagnostics {
 		diagnostic, diagnostic_ok := snapshot_diagnostic_make(entry, chat.allocator)
 		if !diagnostic_ok { return false }
@@ -403,41 +429,18 @@ chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: st
 	return true
 }
 
-// chat_rebind_skill_roots puts each restored skill back on the root that holds it. A
-// snapshot written before the manifest recorded the catalog's own roots lists the launch's
-// configured roots instead, so a root_index can name a different one: the pairing decides
-// whether a local skill may be read and which origin is reported, and a skill paired with a
-// root it is not in is refused as outside that root's scope. The directory each skill was
-// found in is the evidence that places it, and a skill no recorded root holds keeps its
-// pairing, so its load still fails by name rather than reading through a guessed root.
-chat_rebind_skill_roots :: proc(catalog: ^skills.Catalog) {
-	for &skill in catalog.skills {
-		if chat_skill_root_holds(skill, catalog.roots) { continue }
-		for root, index in catalog.roots {
-			if root.path != "" && skills.path_within(skill.directory, root.path) {
-				skill.root_index = index
-				break
-			}
-		}
-	}
-}
-
-// chat_skill_root_holds reports whether the recorded pairing places a skill in its root.
-chat_skill_root_holds :: proc(skill: skills.Skill, roots: []skills.Root) -> bool {
-	if skill.root_index < 0 || skill.root_index >= len(roots) { return false }
-	return skills.path_within(skill.directory, roots[skill.root_index].path)
-}
-
-instruction_manifest_source :: proc(kind: string) -> skills.Source_Kind {
+instruction_manifest_source :: proc(kind: string) -> (skills.Source_Kind, bool) {
 	switch kind {
 	case "nabla_user":
-		return .Nabla_User
-	case "local", "project":
-		return .Local
+		return .Nabla_User, true
+	case "local":
+		return .Local, true
 	case "generic_user":
-		return .Generic_User
+		return .Generic_User, true
+	case "unknown":
+		return .Unknown, true
 	}
-	return .Unknown
+	return .Unknown, false
 }
 
 skill_digest_parse :: proc(text: string) -> [32]u8 {

@@ -513,7 +513,7 @@ selection_latest :: proc(store: ^journal.Journal, allocator: mem.Allocator) -> (
 	record, found = journal.read_latest(store, {kinds = {.Selection_Changed}}, allocator) or_return
 	defer journal.record_destroy(&record, allocator)
 	if !found { return }
-	journal.payload_decode(record.data, &selection, allocator) or_return
+	journal.payload_decode(record.data, &selection, allocator, corruption_journal = store, session = record.session, seq = record.seq) or_return
 	return selection, true, nil
 }
 

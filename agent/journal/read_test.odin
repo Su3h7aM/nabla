@@ -22,6 +22,24 @@ test_response_committed_reasoning_tokens_are_presence_aware :: proc(test: ^testi
 	}
 }
 
+@(test)
+test_payload_decode_rejects_unsupported_and_missing_versions :: proc(test: ^testing.T) {
+	corruption_journal: Journal
+	session := session_id_create()
+	seq := Journal_Seq(37)
+	payload: Response_Committed
+	unsupported_error := payload_decode(`{"version":2}`, &payload, context.temp_allocator, &corruption_journal, session, seq)
+	if !testing.expect(test, error_is(unsupported_error, .Corrupt)) { return }
+	testing.expect_value(test, corruption_journal.corrupt.session, session)
+	testing.expect_value(test, corruption_journal.corrupt.seq, seq)
+
+	corruption_journal.corrupt = {}
+	valid_error := payload_decode(`{"version":1,"model_resolved":"model"}`, &payload, context.temp_allocator)
+	if !testing.expect_value(test, valid_error, nil) { return }
+	missing_error := payload_decode(`{"model_resolved":"model"}`, &payload, context.temp_allocator)
+	testing.expect(test, error_is(missing_error, .Corrupt))
+}
+
 // Reads are tested through the public API only, on a journal whose records were
 // written through it, so the ordering, the filters, and the tree walk are the
 // behaviour the harness gets.
