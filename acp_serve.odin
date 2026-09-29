@@ -1180,9 +1180,10 @@ acp_main :: proc(args: []string) -> int {
 		}
 		config_path = path
 	}
-	sources, harness_options, mcp_servers, config_err := agent.load_lua_config_full(config_path)
+	sources, harness_options, mcp_servers, config_err, config_detail := agent.load_lua_config_full(config_path)
+	defer if config_detail != "" { delete(config_detail) }
 	if config_err != .None && config_err != .Missing {
-		fmt.eprintln("nabla:", agent.config_error_text(config_err))
+		fmt.eprintln(config_error_display_text(config_path, config_err, config_detail))
 		return 1
 	}
 	defer agent.catalog_sources_destroy(&sources)

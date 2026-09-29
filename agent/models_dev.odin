@@ -30,9 +30,8 @@ MODELS_DEV_TIMEOUT :: 60 * time.Second
 
 Models_Dev_Error :: enum {
 	None,
-	// The cache directory could not be resolved or created, so the specification
-	// permits nowhere to cache. Reported rather than worked around with a
-	// home-relative path.
+	// The cache directory could not be resolved or created. Cache-only reads report
+	// this; catalog acquisition still uses the network without reading or writing cache.
 	Cache_Directory,
 	// The document is neither cached nor reachable.
 	Unavailable,
@@ -83,10 +82,10 @@ models_dev_catalog_at :: proc(
 	Models_Dev_Error,
 ) {
 	path, path_err := models_dev_cache_path(allocator)
-	if path_err != .None { return nil, path_err }
-	defer delete(path, allocator)
+	path_ok := path_err == .None
+	defer if path_ok { delete(path, allocator) }
 	unusable := false
-	if models_dev_cache_fresh(path, now) {
+	if path_ok && models_dev_cache_fresh(path, now) {
 		if cached, cached_ok := models_dev_cache_read(path, allocator); cached_ok {
 			if models_dev_cache_answers(cached, providers) { return cached, .None }
 			delete(cached, allocator)
@@ -98,7 +97,7 @@ models_dev_catalog_at :: proc(
 		if models_dev_validate(body) {
 			// Caching is best effort. A document already in hand is a usable source,
 			// so a write that fails is not a failed acquisition.
-			_ = models_dev_cache_write(path, body)
+			if path_ok { _ = models_dev_cache_write(path, body) }
 			return body, .None
 		}
 		// An acquired but unusable document never becomes the cache: replacing a
@@ -109,7 +108,9 @@ models_dev_catalog_at :: proc(
 	}
 	// The refresh failed or was unusable, so the cached copy -- stale or not -- is
 	// the best source available, and it is still there because nothing removed it.
-	if cached, cached_ok := models_dev_cache_read(path, allocator); cached_ok { return cached, .None }
+	if path_ok {
+		if cached, cached_ok := models_dev_cache_read(path, allocator); cached_ok { return cached, .None }
+	}
 	if unusable { return nil, .Invalid_Data }
 	return nil, .Unavailable
 }

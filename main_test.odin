@@ -5,6 +5,8 @@ package main
 import "core:io"
 import "core:testing"
 
+import "nabla:agent"
+
 // A launch says which session to open through the command line, so the three
 // shapes -- nothing, --resume, and --resume with an id -- are the whole contract
 // and are worth pinning down without a terminal.
@@ -96,6 +98,21 @@ test_a_prompt_without_a_value_is_refused :: proc(t: ^testing.T) {
 
 	_, parse_error = chat_cli_parse({"--prompt="})
 	testing.expect_value(t, parse_error, Cli_Parse_Error.Empty_Prompt)
+}
+
+@(test)
+test_config_error_display_includes_path_kind_and_detail :: proc(t: ^testing.T) {
+	message := config_error_display_text(
+		"/tmp/nabla/config.lua",
+		agent.Config_Error.Invalid,
+		`providers["acme"].models["chat"].tools: expected boolean, got string`,
+		context.temp_allocator,
+	)
+	testing.expect_value(
+		t,
+		message,
+		`nabla: /tmp/nabla/config.lua: invalid config value: providers["acme"].models["chat"].tools: expected boolean, got string`,
+	)
 }
 
 headless_test_closed_stream :: proc(data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (i64, io.Error) {

@@ -94,6 +94,13 @@ test_catalog_rejects_disabled_customization :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Catalog_Error.Invalid_Disabled_Model)
 	testing.expect_value(t, len(catalog.models), 0)
 	catalog_destroy(&catalog)
+
+	api_user := []Catalog_Provider_Source {
+		{id = "p", models = []Catalog_Model_Source{{id = "m", disabled_present = true, disabled = true, api_present = true, api = "openai_chat_completions"}}},
+	}
+	api_catalog, api_err := resolve_catalog(api_user, {}, {})
+	testing.expect_value(t, api_err, Catalog_Error.Invalid_Disabled_Model)
+	catalog_destroy(&api_catalog)
 }
 
 @(test)

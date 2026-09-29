@@ -231,10 +231,10 @@ test_models_dev_reports_an_unusable_cache_directory :: proc(t: ^testing.T) {
 		body = MODELS_DEV_STUB_NEW,
 	}
 	body, err := models_dev_catalog(models_dev_stub_fetch, &stub, {}, context.temp_allocator)
-	testing.expect_value(t, err, Models_Dev_Error.Cache_Directory)
-	testing.expect(t, body == nil)
-	// Nothing was fetched or written once the location was refused.
-	testing.expect_value(t, stub.calls, 0)
+	testing.expect_value(t, err, Models_Dev_Error.None)
+	testing.expect_value(t, string(body), MODELS_DEV_STUB_NEW)
+	// The network result remains useful even though the configured cache path failed.
+	testing.expect_value(t, stub.calls, 1)
 }
 
 @(test)

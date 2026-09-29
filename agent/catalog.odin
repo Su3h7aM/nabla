@@ -232,6 +232,7 @@ catalog_has_disabled :: proc(provider_id, model_id: string, user: []Catalog_Prov
 @(require_results)
 catalog_model_has_customization :: proc(model: Catalog_Model_Source) -> bool {
 	return(
+		model.api_present ||
 		model.display_name_present ||
 		model.context_window_present ||
 		model.max_output_tokens_present ||

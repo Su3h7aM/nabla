@@ -120,17 +120,31 @@ provider_models_refresh :: proc(
 	[dynamic]Catalog_Provider_Source,
 	bool,
 ) {
+	return provider_models_refresh_at(time.now(), providers, fetch, user_data, allocator)
+}
+
+@(private, require_results)
+provider_models_refresh_at :: proc(
+	now: time.Time,
+	providers: []Catalog_Provider_Source,
+	fetch: Provider_Models_Fetch,
+	user_data: rawptr,
+	allocator: mem.Allocator,
+) -> (
+	[dynamic]Catalog_Provider_Source,
+	bool,
+) {
 	result: [dynamic]Catalog_Provider_Source
 	result.allocator = allocator
-	now := time.now()
 	for provider in providers {
 		path, path_ok := provider_models_cache_path(provider, allocator)
-		if !path_ok { continue }
-		body, cached := provider_models_cache_read(path, allocator)
+		body: []u8
+		cached := false
+		if path_ok { body, cached = provider_models_cache_read(path, allocator) }
 		cached_models: []Catalog_Model_Source
 		cache_valid := false
 		if cached { cached_models, cache_valid = provider_models_list(body, allocator) }
-		fresh := cache_valid && provider_models_cache_fresh(path, now)
+		fresh := path_ok && cache_valid && provider_models_cache_fresh(path, now)
 		if fresh {
 			added := provider_sources_add(&result, provider.id, cached_models, allocator)
 			delete(body, allocator)
@@ -151,12 +165,12 @@ provider_models_refresh :: proc(
 					models, listed := provider_models_list(acquired, allocator)
 					if listed {
 						// Caching is best effort: the listing in hand is what answers.
-						_ = provider_models_cache_write(path, acquired)
+						if path_ok { _ = provider_models_cache_write(path, acquired) }
 						added := provider_sources_add(&result, provider.id, models, allocator)
 						catalog_model_sources_destroy(cached_models, allocator)
 						delete(body, allocator)
 						delete(acquired, allocator)
-						delete(path, allocator)
+						if path_ok { delete(path, allocator) }
 						if !added {
 							catalog_model_sources_destroy(models, allocator)
 							catalog_sources_destroy(&result, allocator)
@@ -172,13 +186,13 @@ provider_models_refresh :: proc(
 			if !provider_sources_add(&result, provider.id, cached_models, allocator) {
 				catalog_model_sources_destroy(cached_models, allocator)
 				delete(body, allocator)
-				delete(path, allocator)
+				if path_ok { delete(path, allocator) }
 				catalog_sources_destroy(&result, allocator)
 				return {}, false
 			}
 		}
 		delete(body, allocator)
-		delete(path, allocator)
+		if path_ok { delete(path, allocator) }
 	}
 	return result, true
 }
@@ -246,6 +260,7 @@ provider_models_list :: proc(body: []u8, allocator: mem.Allocator) -> ([]Catalog
 	if !has_data { return nil, false }
 	entries, entries_is_array := data_value.(json.Array)
 	if !entries_is_array { return nil, false }
+	if len(entries) == 0 { return nil, true }
 
 	count := 0
 	for entry in entries {

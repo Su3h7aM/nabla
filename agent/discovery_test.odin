@@ -6,6 +6,7 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 // The listing shape this harness reads: an object whose "data" member is an array
 // of records with an id. The second record states no id, so it must not become a
@@ -174,6 +175,62 @@ test_provider_discovery_replaces_an_invalid_fresh_cache :: proc(t: ^testing.T) {
 		testing.expect_value(t, stub.calls, 1)
 		testing.expect_value(t, refreshed[0].models[0].id, "proxy/one")
 	})
+}
+
+@(test)
+test_provider_discovery_replaces_a_stale_listing_with_an_empty_listing :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	models_dev_state_test(t, "provider-models-empty", proc(t: ^testing.T, _: string) {
+		providers := []Catalog_Provider_Source{discovery_source("proxy", "http://proxy.test/v1", "literal-key")}
+		path, path_ok := provider_models_cache_path(providers[0], context.temp_allocator)
+		if !testing.expect(t, path_ok) { return }
+		testing.expect(t, os.write_entire_file(path, transmute([]u8)string(DISCOVERY_FIXTURE)) == nil)
+
+		stub := Discovery_Stub {
+			body = `{"data":[]}`,
+		}
+		stale_at := time.time_add(time.now(), PROVIDER_MODELS_FRESH * 2)
+		refreshed, refreshed_ok := provider_models_refresh_at(stale_at, providers, discovery_stub_fetch, &stub, context.allocator)
+		if !testing.expect(t, refreshed_ok) { return }
+		defer catalog_sources_destroy(&refreshed)
+		testing.expect_value(t, stub.calls, 1)
+		testing.expect_value(t, len(refreshed), 1)
+		testing.expect_value(t, len(refreshed[0].models), 0)
+
+		cached, cached_ok := provider_models_cache_read(path, context.temp_allocator)
+		testing.expect(t, cached_ok)
+		testing.expect_value(t, string(cached), `{"data":[]}`)
+	})
+}
+
+@(test)
+test_provider_discovery_fetches_without_a_cache_directory :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	root := fmt.tprintf("/tmp/nabla-provider-cache-blocked-%d", os.get_pid())
+	os.remove_all(root)
+	defer os.remove_all(root)
+	_ = os.make_directory_all(root)
+	blocking := fmt.tprintf("%s/blocking", root)
+	testing.expect(t, os.write_entire_file(blocking, transmute([]u8)string("file")) == nil)
+
+	previous, had_previous := os.lookup_env("XDG_CACHE_HOME", context.temp_allocator)
+	defer if had_previous {
+		os.set_env("XDG_CACHE_HOME", previous)
+	} else {
+		os.unset_env("XDG_CACHE_HOME")
+	}
+	testing.expect(t, os.set_env("XDG_CACHE_HOME", blocking) == nil)
+
+	providers := []Catalog_Provider_Source{discovery_source("proxy", "http://proxy.test/v1", "literal-key")}
+	stub := Discovery_Stub {
+		body = DISCOVERY_FIXTURE,
+	}
+	refreshed, refreshed_ok := provider_models_refresh(providers, discovery_stub_fetch, &stub, context.allocator)
+	if !testing.expect(t, refreshed_ok) { return }
+	defer catalog_sources_destroy(&refreshed)
+	testing.expect_value(t, stub.calls, 1)
+	testing.expect_value(t, len(refreshed), 1)
+	testing.expect_value(t, len(refreshed[0].models), 2)
 }
 
 // A listing is read whole whatever its size: the size of a provider's own listing

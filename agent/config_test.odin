@@ -176,6 +176,36 @@ test_lua_config_failures_leave_no_partial_sources :: proc(t: ^testing.T) {
 	}
 }
 
+@(test)
+test_lua_config_validates_disabled_models_and_reports_the_field :: proc(t: ^testing.T) {
+	path := fmt.aprintf("/tmp/nabla-config-disabled-%d.lua", os.get_pid(), allocator = context.temp_allocator)
+	defer os.remove(path)
+	body := `return { providers = { acme = { models = { chat = { disabled = true, tools = "yes" } } } } }`
+	testing.expect(t, os.write_entire_file(path, transmute([]u8)body) == nil)
+
+	sources, _, servers, err, detail := load_lua_config_full(path)
+	defer catalog_sources_destroy(&sources)
+	defer mcp_servers_destroy(&servers)
+	testing.expect_value(t, err, Config_Error.Invalid)
+	defer if detail != "" { delete(detail) }
+	testing.expect_value(t, len(sources), 0)
+	testing.expect(t, strings.has_prefix(detail, `providers["acme"].models["chat"].tools: expected boolean, got string`))
+}
+
+@(test)
+test_lua_config_preserves_the_parser_message_and_line :: proc(t: ^testing.T) {
+	path := fmt.aprintf("/tmp/nabla-config-syntax-%d.lua", os.get_pid(), allocator = context.temp_allocator)
+	defer os.remove(path)
+	testing.expect(t, os.write_entire_file(path, transmute([]u8)string("return {\n")) == nil)
+
+	sources, _, servers, err, detail := load_lua_config_full(path)
+	defer catalog_sources_destroy(&sources)
+	defer mcp_servers_destroy(&servers)
+	testing.expect_value(t, err, Config_Error.Lua)
+	defer if detail != "" { delete(detail) }
+	testing.expect(t, strings.has_prefix(detail, fmt.aprintf("%s:2:", path, allocator = context.temp_allocator)))
+}
+
 // A user's configuration is plain data, so this reader refuses nothing for its size.
 // The fixture is past every fixed cap such a reader used to impose: a file over 1 MiB,
 // more than 4,096 providers and models, a thinking list over 64 levels, more than 32
@@ -212,7 +242,8 @@ test_configuration_of_any_size_loads_whole :: proc(t: ^testing.T) {
 	defer os.remove(path)
 	testing.expect(t, os.write_entire_file(path, transmute([]u8)strings.to_string(body)) == nil)
 
-	sources, _, servers, err := load_lua_config_full(path)
+	sources, _, servers, err, detail := load_lua_config_full(path)
+	defer delete(detail)
 	defer catalog_sources_destroy(&sources)
 	defer mcp_servers_destroy(&servers)
 	if !testing.expect_value(t, err, Config_Error.None) { return }

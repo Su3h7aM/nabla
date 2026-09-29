@@ -281,6 +281,13 @@ run_prompt :: proc(
 
 // --- entry point ------------------------------------------------------------
 
+config_error_display_text :: proc(path: string, err: agent.Config_Error, detail: string, allocator := context.temp_allocator) -> string {
+	if detail != "" {
+		return fmt.aprintf("nabla: %s: %s: %s", path, agent.config_error_text(err), detail, allocator = allocator)
+	}
+	return fmt.aprintf("nabla: %s: %s", path, agent.config_error_text(err), allocator = allocator)
+}
+
 // chat_main runs one invocation and returns its exit code, so main has a single
 // exit and the deferred cleanup still runs.
 chat_main :: proc() -> int {
@@ -326,9 +333,10 @@ chat_main :: proc() -> int {
 	// A missing config file is a valid setup, not an error: the run proceeds
 	// with no providers and default options. Only a config that exists but
 	// cannot be used stops the launch.
-	sources, harness_options, mcp_servers, config_err := agent.load_lua_config_full(options.config_path)
+	sources, harness_options, mcp_servers, config_err, config_detail := agent.load_lua_config_full(options.config_path)
+	defer if config_detail != "" { delete(config_detail) }
 	if config_err != .None && config_err != .Missing {
-		fmt.eprintln("nabla:", agent.config_error_text(config_err))
+		fmt.eprintln(config_error_display_text(options.config_path, config_err, config_detail))
 		return 1
 	}
 	defer agent.catalog_sources_destroy(&sources)
