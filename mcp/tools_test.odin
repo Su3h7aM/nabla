@@ -409,7 +409,7 @@ test_request_envelope_follows_the_revision :: proc(t: ^testing.T) {
 	if !testing.expect_value(t, initialize_error.kind, Error_Kind.None) { return }
 	defer error_destroy(&initialize_error, context.allocator)
 	defer json.destroy_value(json.Value(initialize), context.allocator)
-	testing.expect_value(t, wire_string(t, initialize, "protocolVersion"), PROTOCOL_VERSION_PREFERRED)
+	testing.expect_value(t, wire_string(t, initialize, "protocolVersion"), PROTOCOL_VERSION_HANDSHAKE)
 	_, initialize_has_meta := initialize["_meta"]
 	testing.expect(t, !initialize_has_meta)
 }

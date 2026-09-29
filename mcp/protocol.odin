@@ -87,10 +87,9 @@ protocol_version_inlines_server_requests :: proc(version: Protocol_Version) -> b
 	return version == .V2026_07_28
 }
 
-// PROTOCOL_VERSION_PREFERRED is the revision the handshake offers. A server that
-// supports it answers with it, and one that does not answers with what it does
-// support, which is the negotiation the specification defines.
-PROTOCOL_VERSION_PREFERRED :: VERSION_2025_11_25
+// PROTOCOL_VERSION_HANDSHAKE is the newest protocol revision that has an
+// initialize handshake. It is offered only when stateless 2026-07-28 discovery fails.
+PROTOCOL_VERSION_HANDSHAKE :: VERSION_2025_11_25
 
 // CLIENT_NAME and CLIENT_VERSION identify this client in `_meta.clientInfo`. The
 // protocol treats identity as self-reported and unverified, so it is advisory:
@@ -262,7 +261,7 @@ initialize_params_make :: proc(allocator := context.allocator) -> (json.Object, 
 	if !mcp_object_put_string(
 		&params,
 		"protocolVersion",
-		PROTOCOL_VERSION_PREFERRED,
+		PROTOCOL_VERSION_HANDSHAKE,
 		allocator,
 	) { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 	capabilities, capabilities_error := client_capabilities_make(allocator)
