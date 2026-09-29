@@ -271,6 +271,53 @@ test_a_background_subagent_reports_its_answer_as_a_message :: proc(test: ^testin
 	testing.expect(test, strings.contains(report, "forty-two"), "the report carries the answer")
 }
 
+// A script that starts a background subagent and returns without waiting on it still starts
+// it: the script's end does not stop a call whose work is meant to outlive it.
+@(test)
+test_a_script_starts_a_background_subagent_without_waiting :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW)
+
+	script := agent_provider_call("builtin_codemode", `{"code":"job.start('agent_spawn', {prompt = 'what is six times seven', model = 'sub-model'})"}`)
+	orchestrator: Agent_Provider
+	if !agent_provider_start(test, &orchestrator, {script, agent_provider_reply("waiting"), agent_provider_reply("got it")}) { return }
+	defer agent_provider_stop(&orchestrator)
+	delegate: Agent_Provider
+	if !agent_provider_start(test, &delegate, {agent_provider_reply("forty-two")}, deferred = true) { return }
+	defer agent_provider_stop(&delegate)
+	orchestrator_endpoint := agent_provider_endpoint(&orchestrator)
+	defer delete(orchestrator_endpoint)
+	delegate_endpoint := agent_provider_endpoint(&delegate)
+	defer delete(delegate_endpoint)
+
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", orchestrator_endpoint, nil)
+	subagent_test_catalog_add(&catalog, "sub-provider", "sub-model", delegate_endpoint, nil)
+	chat.catalog = {
+		catalog = &catalog.catalog,
+	}
+
+	_test_accept(test, chat, "start a subagent from a script")
+	connection := ai.Provider_Connection {
+		API        = .OpenAI_Chat_Completions,
+		Endpoint   = orchestrator_endpoint,
+		Credential = "test-key",
+	}
+	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the turn completed before the subagent answered")
+
+	agent_provider_serve_now(&delegate)
+	if !testing.expect(test, chat_agents_wait(chat, nil), "the subagent's report arrives") { return }
+	accepted, had_message := chat_session_accept_agent_message(chat, {})
+	testing.expect(test, had_message && accepted == .Accepted)
+	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the report's turn completed")
+	testing.expect(test, strings.contains(agent_provider_request(&orchestrator, 2), "forty-two"), "the report carries the answer")
+}
+
 // A subagent may not start subagents of its own, and the refusal tells it what it can do.
 @(test)
 test_a_subagent_cannot_start_a_subagent :: proc(test: ^testing.T) {
