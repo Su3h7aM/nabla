@@ -75,12 +75,19 @@ test_dial_first_tries_each_address_in_order :: proc(t: ^testing.T) {
 	live, live_err := net.bound_endpoint(listener)
 	if !testing.expectf(t, live_err == nil, "the test endpoint could not be read: %v", live_err) { return }
 
-	// A port nothing listens on: bind it, read it, release it.
-	closed_listener, closed_listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
-	if !testing.expectf(t, closed_listen_err == nil, "the closed endpoint could not listen: %v", closed_listen_err) { return }
-	closed, closed_err := net.bound_endpoint(closed_listener)
-	net.close(closed_listener)
-	if !testing.expectf(t, closed_err == nil, "the closed endpoint could not be read: %v", closed_err) { return }
+	// A bound socket that never listens refuses connections and keeps its port
+	// unavailable to other tests for the duration of this test.
+	refused_socket, create_err := net.create_socket(.IP4, .TCP)
+	if !testing.expectf(t, create_err == nil, "the refused endpoint socket could not be created: %v", create_err) { return }
+	defer net.close(refused_socket)
+	refused_interface := net.Endpoint {
+		address = net.IP4_Address{127, 0, 0, 1},
+		port    = 0,
+	}
+	if bind_err := net.bind(refused_socket, refused_interface);
+	   !testing.expectf(t, bind_err == nil, "the refused endpoint could not bind: %v", bind_err) { return }
+	closed, closed_err := net.bound_endpoint(refused_socket)
+	if !testing.expectf(t, closed_err == nil, "the refused endpoint could not be read: %v", closed_err) { return }
 
 	// The refused address comes first, so reaching the listener proves the
 	// fallback moved on instead of stopping at the first failure.
@@ -92,11 +99,13 @@ test_dial_first_tries_each_address_in_order :: proc(t: ^testing.T) {
 	// Nothing reachable is a connection failure, not a refusal of the request.
 	alone := [1]net.Endpoint{{address = net.IP4_Address{127, 0, 0, 1}, port = closed.port}}
 	failed, failed_err := dial_first(alone[:], {}, context.allocator)
+	if failed != nil { connection_destroy(failed) }
 	testing.expect_value(t, failed_err, Error.Connect)
 	testing.expect(t, failed == nil, "a failed dial owns no connection")
 
 	// Cancellation ends the attempts before any dial.
 	stopped, stop_err := dial_first(endpoints[:], {probe = {check = cancelled_probe}}, context.allocator)
+	if stopped != nil { connection_destroy(stopped) }
 	testing.expect_value(t, stop_err, Error.Cancelled)
 	testing.expect(t, stopped == nil, "a stopped dial owns no connection")
 }
