@@ -518,8 +518,12 @@ acp_call :: proc(connection: ^Acp_Connection, method: string, params: $P, result
 				return fmt.tprintf("the agent refused %s: %s", method, envelope.rpc_error.message)
 			}
 			if _, is_null := envelope.result.(json.Null); is_null { return "" }
-			if !acp.params_decode(envelope.result, result, context.temp_allocator) {
+			switch acp.params_decode(envelope.result, result, context.temp_allocator) {
+			case .None:
+			case .Invalid:
 				return fmt.tprintf("the agent's answer to %s is not what ACP defines", method)
+			case .Allocation:
+				return fmt.tprintf("the agent's answer to %s could not be held because allocation failed", method)
 			}
 			return ""
 		case .Notification, .Request, .Invalid:
@@ -539,7 +543,7 @@ acp_handle :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool 
 	case .Notification:
 		return acp_notification(connection, envelope)
 	case .Request:
-		acp_answer(connection, envelope)
+		return acp_answer(connection, envelope)
 	}
 	return true
 }
@@ -551,21 +555,40 @@ acp_handle :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool 
 acp_notification :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool {
 	if envelope.method != acp.NOTIFICATION_SESSION_UPDATE { return true }
 	kind: acp.Session_Notification(acp.Update_Kind)
-	if !acp.params_decode(envelope.params, &kind, context.temp_allocator) { return true }
+	switch acp.params_decode(envelope.params, &kind, context.temp_allocator) {
+	case .None:
+	case .Invalid:
+		return true
+	case .Allocation:
+		return false
+	}
+	if kind.session_id != connection.session_id { return true }
 	switch kind.update.session_update {
 	case acp.UPDATE_TOOL_CALL, acp.UPDATE_TOOL_CALL_UPDATE:
 		clear(&connection.answer)
 		return acp_replace(&connection.message_id, "", connection.member.allocator)
 	case acp.UPDATE_AGENT_MESSAGE_CHUNK:
 		chunk: acp.Session_Notification(acp.Message_Chunk)
-		if !acp.params_decode(envelope.params, &chunk, context.temp_allocator) { return true }
+		switch acp.params_decode(envelope.params, &chunk, context.temp_allocator) {
+		case .None:
+		case .Invalid:
+			return true
+		case .Allocation:
+			return false
+		}
 		if !acp_message_begin(connection, chunk.update.message_id) { return false }
 		if chunk.update.content.type != acp.CONTENT_TEXT { return true }
 		_, append_error := append(&connection.answer, chunk.update.content.text)
 		return append_error == nil
 	case acp.UPDATE_AGENT_MESSAGE:
 		message: acp.Session_Notification(acp.Message_Update)
-		if !acp.params_decode(envelope.params, &message, context.temp_allocator) { return true }
+		switch acp.params_decode(envelope.params, &message, context.temp_allocator) {
+		case .None:
+		case .Invalid:
+			return true
+		case .Allocation:
+			return false
+		}
 		if !acp_message_begin(connection, message.update.message_id) { return false }
 		// The update is an upsert: content left out keeps the message as it is.
 		if !acp_update_has(envelope.params, "content") { return true }
@@ -576,7 +599,14 @@ acp_notification :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) ->
 		}
 	case acp.UPDATE_STATE:
 		state: acp.Session_Notification(acp.State_Update)
-		if !acp.params_decode(envelope.params, &state, context.temp_allocator) || state.update.state != "idle" { return true }
+		switch acp.params_decode(envelope.params, &state, context.temp_allocator) {
+		case .None:
+		case .Invalid:
+			return true
+		case .Allocation:
+			return false
+		}
+		if state.update.state != "idle" { return true }
 		connection.idle = true
 		return acp_replace(&connection.stop_reason, state.update.stop_reason, connection.member.allocator)
 	}
@@ -618,24 +648,28 @@ acp_replace :: proc(owned: ^string, value: string, allocator: mem.Allocator) -> 
 
 // acp_answer answers a request the agent sent. A permission request is granted once, as a
 // native subagent's tools run without asking; nothing else is offered.
-@(private)
-acp_answer :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
+@(private, require_results)
+acp_answer :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool {
 	// A write to the agent that fails ends the exchange: the next read reports it.
 	if envelope.method != acp.METHOD_SESSION_REQUEST_PERMISSION {
 		_ = acp.writer_write_error(&connection.writer, envelope.id, acp.ERROR_METHOD_NOT_FOUND, "this client offers no such method")
-		return
+		return true
 	}
 	request: acp.Request_Permission_Params
-	if !acp.params_decode(envelope.params, &request, context.temp_allocator) {
+	switch acp.params_decode(envelope.params, &request, context.temp_allocator) {
+	case .None:
+	case .Invalid:
 		_ = acp.writer_write_error(&connection.writer, envelope.id, acp.ERROR_INVALID_PARAMS, "the permission request is not what ACP defines")
-		return
+		return true
+	case .Allocation:
+		return false
 	}
 	outcome := acp.Permission_Outcome {
 		outcome = "cancelled",
 	}
 	if acp_stopped(connection) {
 		_ = acp.writer_write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome})
-		return
+		return true
 	}
 	for kind in ([]string{"allow_once", "allow_always"}) {
 		for option in request.options {
@@ -648,6 +682,7 @@ acp_answer :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) {
 		}
 	}
 	_ = acp.writer_write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome})
+	return true
 }
 
 // acp_next returns the next message the agent sent, owned by the member's allocator, reading
@@ -661,6 +696,7 @@ acp_next :: proc(connection: ^Acp_Connection) -> (envelope: acp.Envelope, proble
 			connection.next_frame += 1
 			parsed, parse_error := acp.parse_envelope(frame, connection.member.allocator)
 			if parse_error == .None { return parsed, "" }
+			return {}, fmt.tprintf("the agent sent a message that could not be parsed as JSON-RPC: %s", acp.envelope_error_text(parse_error))
 		}
 		for frame in connection.frames { delete(frame, connection.member.allocator) }
 		clear(&connection.frames)

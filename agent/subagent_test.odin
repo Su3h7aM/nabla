@@ -373,6 +373,37 @@ test_stopping_a_background_subagent_reports_to_its_parent :: proc(test: ^testing
 	testing.expect(test, !chat_agents_wait(chat, nil), "cancellation leaves no running child")
 }
 
+@(test)
+test_acp_next_reports_a_malformed_json_rpc_frame :: proc(test: ^testing.T) {
+	member := Subagent {
+		allocator = context.allocator,
+	}
+	frames, frames_error := make([dynamic]string, context.allocator)
+	if frames_error != nil { testing.fail_now(test, "could not create the ACP frame") }
+	frame, frame_error := strings.clone("{}", context.allocator)
+	if frame_error != nil {
+		delete(frames)
+		testing.fail_now(test, "could not create the ACP frame")
+	}
+	if _, append_error := append(&frames, frame); append_error != nil {
+		delete(frame, context.allocator)
+		delete(frames)
+		testing.fail_now(test, "could not create the ACP frame")
+	}
+	connection := Acp_Connection {
+		member = &member,
+		frames = frames,
+	}
+	defer {
+		for queued in connection.frames { delete(queued, context.allocator) }
+		delete(connection.frames)
+	}
+
+	_, problem := acp_next(&connection)
+	testing.expect(test, strings.contains(problem, "could not be parsed as JSON-RPC"), problem)
+	testing.expect(test, strings.contains(problem, "does not declare JSON-RPC 2.0"), problem)
+}
+
 // SUBAGENT_TEST_ACP_AGENT is an ACP version 2 agent. It answers each request by its method,
 // narrates before a tool call, asks permission for the call, and fails when its prompt lacks
 // the instruction or the task, flooding standard error before it does.
@@ -389,6 +420,7 @@ while IFS= read -r line; do
 	*'"method":"session/prompt"'*)
 		case "$line" in *'Answer in one word.'*'six times seven'*) ;; *) printf 'the beginning\n' 1>&2; head -c SUBAGENT_TEST_ACP_NOISE_BYTES /dev/zero | tr '\000' x 1>&2; echo "prompt lost its instruction or task" >&2; exit 1 ;; esac
 		printf '{"jsonrpc":"2.0","id":%s,"result":{"messageId":"u1"}}\n' "$id"
+		printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"other","update":{"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"}}}\n'
 		update '{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"Let me compute."}}'
 		update '{"sessionUpdate":"tool_call_update","toolCallId":"c1","title":"multiply","status":"pending"}'
 		printf '{"jsonrpc":"2.0","id":"p1","method":"session/request_permission","params":{"sessionId":"s1","title":"Run multiply?","options":[{"optionId":"no","name":"Reject","kind":"reject_once"},{"optionId":"yes","name":"Allow","kind":"allow_once"}]}}\n'
