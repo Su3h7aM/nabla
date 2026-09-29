@@ -264,30 +264,29 @@ stop_peers :: proc(fixture: ^Exchange_Fixture, udp_thread, tcp_thread: ^thread.T
 	net.close(fixture.udp)
 }
 
-// Exchange_Fixture is one UDP peer that truncates every query and one TCP
-// peer that answers it, sharing a port. The flags ask for hostile shapes:
-// a decoy reply before the real one, and a split length prefix. The result
-// flags are read after both threads join, so no further synchronization is
-// needed.
+// Exchange_Fixture is one UDP peer and one TCP peer sharing a port. Its flags
+// select response codes, decoys, split framing, and unrelated Additional
+// records. Result flags are read after both threads join.
 Exchange_Fixture :: struct {
-	udp:          net.UDP_Socket,
-	tcp:          net.TCP_Socket,
-	port:         int,
-	answer:       net.IP4_Address,
-	udp_hit:      bool,
-	tcp_hit:      bool,
-	send_decoy:   bool,
-	split_prefix: bool,
-	nxdomain:     bool,
+	udp:                  net.UDP_Socket,
+	tcp:                  net.TCP_Socket,
+	port:                 int,
+	answer:               net.IP4_Address,
+	udp_hit:              bool,
+	tcp_hit:              bool,
+	send_decoy:           bool,
+	split_prefix:         bool,
+	nxdomain:             bool,
+	rcode:                u8,
+	unrelated_additional: bool,
 }
 
 // PEER_BOUND limits one peer exchange. It is hit only when the exchange
 // itself is broken; the success path answers in milliseconds on loopback.
 PEER_BOUND :: 15 * time.Second
 
-// udp_truncate_serve answers one query with its own question back and nothing
-// else: QR and TC set, no answers. The truncated bit is what sends the client
-// to TCP.
+// udp_truncate_serve answers one query with a truncated reply unless the
+// fixture selects a definitive response code.
 udp_truncate_serve :: proc(thread: ^thread.Thread) {
 	// Threads share the process-global temp allocator, whose arena is not
 	// thread-safe, so a peer that allocates temporary memory needs its own.
@@ -313,6 +312,12 @@ udp_truncate_serve :: proc(thread: ^thread.Thread) {
 		// name does not exist, so no other server can answer it either.
 		reply[2] = 0x81
 		reply[3] = Rcode_Name_Error
+		net.send_udp(fixture.udp, reply[:received], source)
+		return
+	}
+	if fixture.rcode != Rcode_No_Error {
+		reply[2] = 0x81
+		reply[3] = fixture.rcode
 		net.send_udp(fixture.udp, reply[:received], source)
 		return
 	}
@@ -361,8 +366,7 @@ tcp_answer :: proc(fixture: ^Exchange_Fixture, connection: net.TCP_Socket) {
 	if !tcp_read_full(connection, query) { return }
 	fixture.tcp_hit = true
 
-	// Header with one answer, the question echoed back, and one A record
-	// naming the queried name through a compression pointer at the question.
+	// The A answer names the query through a compression pointer at the question.
 	head := [12]u8{0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2C, 0x00, 0x04}
 	reply: [530]u8
 	reply[2] = query[0]
@@ -374,6 +378,10 @@ tcp_answer :: proc(fixture: ^Exchange_Fixture, connection: net.TCP_Socket) {
 	at := 14 + copy(reply[14:], query[12:])
 	at += copy(reply[at:], head[:])
 	at += copy(reply[at:], fixture.answer[:])
+	if fixture.unrelated_additional {
+		reply[13] = 0x01
+		at += copy(reply[at:], "\x09unrelated\x04test\x00\x00\x01\x00\x01\x00\x00\x01\x2C\x00\x04\xCB\x00\x71\x09")
+	}
 	reply[0] = u8((at - 2) >> 8)
 	reply[1] = u8(at - 2)
 	if fixture.split_prefix {
@@ -408,4 +416,66 @@ tcp_write_full :: proc(socket: net.TCP_Socket, buffer: []u8) -> bool {
 		pending = pending[count:]
 	}
 	return true
+}
+
+@(test)
+test_unrelated_additional_address_is_ignored :: proc(t: ^testing.T) {
+	fixture: Exchange_Fixture
+	fixture.answer = net.IP4_Address{192, 0, 2, 1}
+	fixture.unrelated_additional = true
+
+	udp_thread, tcp_thread, port, started := start_peers(t, &fixture)
+	if !started { return }
+	servers := [1]net.Endpoint{{address = net.IP4_Address{127, 0, 0, 1}, port = port}}
+	records, lookup_err := lookup("example.com", net.DNS_Record_Type.DNS_TYPE_A, Options{servers = servers[:]}, context.temp_allocator)
+	testing.expect_value(t, lookup_err, Error.None)
+	if lookup_err == .None {
+		defer net.destroy_dns_records(records, context.temp_allocator)
+		if testing.expect_value(t, len(records), 1) {
+			address, is_ip4 := records[0].(net.DNS_Record_IP4)
+			if testing.expect(t, is_ip4, "the answer is an A record") {
+				testing.expect_value(t, address.address, fixture.answer)
+			}
+		}
+	}
+
+	stop_peers(&fixture, udp_thread, tcp_thread)
+}
+
+@(test)
+test_server_failure_tries_next_nameserver :: proc(t: ^testing.T) {
+	failing: Exchange_Fixture
+	failing.rcode = Rcode_Server_Failure
+	failing_udp, failing_tcp, failing_port, failing_started := start_peers(t, &failing)
+	if !failing_started { return }
+
+	answering: Exchange_Fixture
+	answering.answer = net.IP4_Address{192, 0, 2, 1}
+	answering_udp, answering_tcp, answering_port, answering_started := start_peers(t, &answering)
+	if !answering_started {
+		stop_peers(&failing, failing_udp, failing_tcp)
+		return
+	}
+
+	servers := [2]net.Endpoint {
+		{address = net.IP4_Address{127, 0, 0, 1}, port = failing_port},
+		{address = net.IP4_Address{127, 0, 0, 1}, port = answering_port},
+	}
+	records, lookup_err := lookup("example.com", net.DNS_Record_Type.DNS_TYPE_A, Options{servers = servers[:]}, context.temp_allocator)
+	testing.expect_value(t, lookup_err, Error.None)
+	if lookup_err == .None {
+		defer net.destroy_dns_records(records, context.temp_allocator)
+		if testing.expect_value(t, len(records), 1) {
+			address, is_ip4 := records[0].(net.DNS_Record_IP4)
+			if testing.expect(t, is_ip4, "the next nameserver returns an A record") {
+				testing.expect_value(t, address.address, answering.answer)
+			}
+		}
+	}
+
+	stop_peers(&failing, failing_udp, failing_tcp)
+	stop_peers(&answering, answering_udp, answering_tcp)
+	testing.expect(t, failing.udp_hit, "the failing nameserver was asked")
+	testing.expect(t, answering.udp_hit, "the server failure moved to the next nameserver")
+	testing.expect(t, answering.tcp_hit, "the answer from the next nameserver was accepted")
 }

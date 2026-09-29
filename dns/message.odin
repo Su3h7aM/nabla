@@ -27,6 +27,12 @@ Flags :: bit_field u16 {
 	qr:     bool | 1,
 }
 
+// Rcode_No_Error is the response code for a successful response.
+Rcode_No_Error :: 0
+
+// Rcode_Server_Failure is the response code for a server failure.
+Rcode_Server_Failure :: 2
+
 // Rcode_Name_Error is the response code for a name that does not exist.
 // RFC 1035 4.1.1. No OPT record leaves this endpoint, so the plain four-bit
 // code is authoritative.

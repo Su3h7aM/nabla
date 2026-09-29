@@ -87,7 +87,7 @@ lookup :: proc(hostname: string, kind: net.DNS_Record_Type, options: Options, al
 	timeout := attempt_timeout(options)
 	for _ in 0 ..< attempt_rounds(options) {
 		for server in options.servers {
-			answer, outcome := query_server(server, packet, id, kind, timeout, options.interrupt, allocator)
+			answer, outcome := query_server(server, hostname, packet, id, kind, timeout, options.interrupt, allocator)
 			switch outcome {
 			case .Answer:
 				if len(answer) == 0 {
