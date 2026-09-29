@@ -8,18 +8,26 @@ import "core:testing"
 // the connection sends back is kept, so a test states the frames rather than a socket
 // fixture.
 Fixture :: struct {
-	incoming: []u8,
-	at:       int,
-	outgoing: [dynamic]u8,
-	released: int,
-	aborted:  int,
+	incoming:           []u8,
+	at:                 int,
+	read_failure_after: int,
+	read_failure:       Error,
+	outgoing:           [dynamic]u8,
+	released:           int,
+	aborted:            int,
 }
 
 fixture_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Error) {
 	fixture := cast(^Fixture)user_data
+	if fixture.read_failure != .None && fixture.at >= fixture.read_failure_after {
+		return 0, fixture.read_failure
+	}
 	available := len(fixture.incoming) - fixture.at
 	if available <= 0 { return 0, .Closed }
 	count = min(available, len(buffer))
+	if fixture.read_failure != .None {
+		count = min(count, fixture.read_failure_after - fixture.at)
+	}
 	copy(buffer, fixture.incoming[fixture.at:fixture.at + count])
 	fixture.at += count
 	return count, .None
@@ -62,6 +70,27 @@ test_stream_end_without_a_close_frame_is_abnormal :: proc(t: ^testing.T) {
 	destroy(connection)
 	testing.expect_value(t, fixture.released, 1)
 	testing.expect_value(t, fixture.aborted, 0)
+}
+
+@(test)
+test_partial_frame_read_ends_the_connection :: proc(t: ^testing.T) {
+	fixture: Fixture
+	connection := fixture_connection(t, &fixture, []u8{0x82, 0x03, 'a', 'b', 'c'})
+	if connection == nil { return }
+	defer destroy(connection)
+
+	fixture.read_failure_after = 3
+	fixture.read_failure = .Transport
+	buffer: [8]u8
+	_, _, _, err := read(connection, buffer[:])
+	testing.expect_value(t, err, Error.Transport)
+	testing.expect_value(t, fixture.at, 3)
+	testing.expect(t, connection.closed, "a partial frame read did not end the connection")
+	_, _, _, later_read_err := read(connection, buffer[:])
+	testing.expect_value(t, later_read_err, Error.Closed)
+	testing.expect_value(t, write(connection, .Binary, []u8{'x'}), Error.Closed)
+	testing.expect_value(t, ping(connection, nil), Error.Closed)
+	testing.expect_value(t, len(fixture.outgoing), 0)
 }
 
 @(test)
@@ -228,7 +257,12 @@ test_invalid_close_payloads_are_not_echoed :: proc(t: ^testing.T) {
 	Cases := []struct {
 		frame: []u8,
 		code:  Close_Code,
-	}{{[]u8{0x88, 0x01, 0x00}, .Protocol_Error}, {[]u8{0x88, 0x02, 0x03, 0xed}, .Protocol_Error}, {[]u8{0x88, 0x03, 0x03, 0xe8, 0xff}, .Invalid_Payload}}
+	} {
+		{[]u8{0x88, 0x01, 0x00}, .Protocol_Error},
+		{[]u8{0x88, 0x02, 0x03, 0xed}, .Protocol_Error},
+		{[]u8{0x88, 0x02, 0x03, 0xf2}, .Protocol_Error},
+		{[]u8{0x88, 0x03, 0x03, 0xe8, 0xff}, .Invalid_Payload},
+	}
 	for test_case in Cases {
 		fixture: Fixture
 		connection := fixture_connection(t, &fixture, test_case.frame)
@@ -240,6 +274,18 @@ test_invalid_close_payloads_are_not_echoed :: proc(t: ^testing.T) {
 		destroy(connection)
 		delete(fixture.outgoing)
 	}
+}
+
+@(test)
+test_client_mandatory_extension_close_code_is_send_only :: proc(t: ^testing.T) {
+	fixture: Fixture
+	connection := fixture_connection(t, &fixture, []u8{0x88, 0x02, 0x03, 0xe8})
+	if connection == nil { return }
+	defer destroy(connection)
+	defer delete(fixture.outgoing)
+
+	testing.expect_value(t, close(connection, .Mandatory_Extension, "", nil), Error.None)
+	testing.expect_value(t, close_code_sent(fixture.outgoing[:]), Close_Code.Mandatory_Extension)
 }
 
 @(test)

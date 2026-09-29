@@ -24,14 +24,15 @@ Transport :: struct {
 
 // Close_Code is why an endpoint closed (RFC 6455 section 7.4.1).
 Close_Code :: enum u16 {
-	Normal           = 1000,
-	Going_Away       = 1001,
-	Protocol_Error   = 1002,
-	Unsupported_Data = 1003,
-	Invalid_Payload  = 1007,
-	Policy_Violation = 1008,
-	Message_Too_Big  = 1009,
-	Internal_Error   = 1011,
+	Normal              = 1000,
+	Going_Away          = 1001,
+	Protocol_Error      = 1002,
+	Unsupported_Data    = 1003,
+	Invalid_Payload     = 1007,
+	Policy_Violation    = 1008,
+	Message_Too_Big     = 1009,
+	Mandatory_Extension = 1010,
+	Internal_Error      = 1011,
 }
 
 Error :: enum {
@@ -145,6 +146,7 @@ write :: proc(connection: ^Conn, opcode: Opcode, message: []u8) -> Error {
 
 	pending := message
 	first := true
+	wrote_frame := false
 	for {
 		chunk := pending
 		if len(chunk) > SEND_CHUNK { chunk = chunk[:SEND_CHUNK] }
@@ -156,8 +158,12 @@ write :: proc(connection: ^Conn, opcode: Opcode, message: []u8) -> Error {
 		if !first { frame_opcode = .Continuation }
 		count, encoded := frame_encode(frame_opcode, len(pending) == 0, mask, chunk, connection.send)
 		if !encoded { return .No_Room }
-		if err := transport_write(connection, connection.send[:count]); err != .None { return err }
+		if err := transport_write(connection, connection.send[:count]); err != .None {
+			if wrote_frame { connection.closed = true }
+			return err
+		}
 
+		wrote_frame = true
 		first = false
 		if len(pending) == 0 { return .None }
 	}
@@ -177,6 +183,10 @@ ping :: proc(connection: ^Conn, body: []u8) -> Error {
 close :: proc(connection: ^Conn, code: Close_Code, reason: string, buffer: []u8) -> Error {
 	if !close_code_valid(code) || len(reason) > MAX_CONTROL_PAYLOAD - 2 || !utf8.valid_string(reason) {
 		return .Protocol
+	}
+	if connection.closed {
+		if connection.close_sent { return .None }
+		return .Closed
 	}
 	if !connection.close_sent {
 		payload := connection.control[:2 + len(reason)]
@@ -258,7 +268,9 @@ read :: proc(connection: ^Conn, buffer: []u8) -> (count: int, opcode: Opcode, co
 			if len(payload) == 1 { return 0, connection.message_opcode, false, fail(connection, .Protocol_Error, .Protocol) }
 			if len(payload) >= 2 {
 				code := Close_Code(u16(payload[0]) << 8 | u16(payload[1]))
-				if !close_code_valid(code) { return 0, connection.message_opcode, false, fail(connection, .Protocol_Error, .Protocol) }
+				if !close_code_valid(code) || code == .Mandatory_Extension {
+					return 0, connection.message_opcode, false, fail(connection, .Protocol_Error, .Protocol)
+				}
 				if !utf8.valid_string(string(payload[2:])) {
 					return 0, connection.message_opcode, false, fail(connection, .Invalid_Payload, .Protocol)
 				}
@@ -320,6 +332,7 @@ fail :: proc(connection: ^Conn, code: Close_Code, err: Error) -> Error {
 
 @(require_results)
 control_send :: proc(connection: ^Conn, opcode: Opcode, payload: []u8) -> Error {
+	if connection.closed { return .Closed }
 	mask: [MASK_KEY_SIZE]u8
 	crypto.rand_bytes(mask[:])
 	count, encoded := frame_encode(opcode, true, mask, payload, connection.send)
@@ -336,7 +349,12 @@ control_read :: proc(connection: ^Conn, length: int) -> (payload: []u8, err: Err
 	connection.mask_at = 0
 	payload = connection.control[:length]
 	if length == 0 { return payload, .None }
-	if read_err := transport_read(connection, payload); read_err != .None { return nil, read_err }
+	if read_err := transport_read(connection, payload); read_err != .None {
+		// The frame header has already been consumed, and read does not retain the
+		// control opcode needed to resume this payload.
+		connection.closed = true
+		return nil, read_err
+	}
 	connection.frame_remaining = 0
 	return payload, .None
 }
@@ -431,9 +449,15 @@ transport_read :: proc(connection: ^Conn, dst: []u8) -> Error {
 	filled := 0
 	for filled < len(dst) {
 		count, err := connection.transport.read(connection.transport.user_data, dst[filled:])
-		if err == .Closed { return .Abnormal_Closure }
-		if err != .None { return err }
-		if count <= 0 { return .Transport }
+		if err != .None {
+			if filled > 0 || count > 0 { connection.closed = true }
+			if err == .Closed { return .Abnormal_Closure }
+			return err
+		}
+		if count <= 0 {
+			if filled > 0 { connection.closed = true }
+			return .Transport
+		}
 		filled += count
 	}
 	return .None
@@ -450,11 +474,20 @@ recv_fill :: proc(connection: ^Conn, count: int) -> Error {
 
 @(require_results)
 transport_write :: proc(connection: ^Conn, data: []u8) -> Error {
+	if connection.closed { return .Closed }
 	pending := data
+	wrote := false
 	for len(pending) > 0 {
 		written, err := connection.transport.write(connection.transport.user_data, pending)
-		if err != .None { return err }
-		if written <= 0 { return .Transport }
+		if err != .None {
+			if wrote || written > 0 { connection.closed = true }
+			return err
+		}
+		if written <= 0 {
+			if wrote { connection.closed = true }
+			return .Transport
+		}
+		wrote = true
 		pending = pending[written:]
 	}
 	return .None
