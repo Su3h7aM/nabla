@@ -30,8 +30,8 @@ Chat_Request_Stage :: enum {
 	Sending,
 	// Backoff: the chain waits out the delay before its next attempt.
 	Backoff,
-	// Repairing: the provider refused the payload as too large, so a ready summary must
-	// be installed and the request rebuilt.
+	// Repairing: the provider refused the payload as too large, so the chain waits for or
+	// starts a summary before rebuilding the request.
 	Repairing,
 	// Committing: the chain has stopped and its response must be recorded.
 	Committing,
@@ -40,68 +40,71 @@ Chat_Request_Stage :: enum {
 // Chat_Request_Chain is one logical request's attempt chain. connection, observer and
 // options are borrowed from the turn that owns them and stay valid for the chain's life.
 Chat_Request_Chain :: struct {
-	active:              bool,
-	stage:               Chat_Request_Stage,
-	connection:          ai.Provider_Connection,
-	policy:              Chat_Retry_Policy,
-	observer:            Chat_Observer,
-	options:             ai.Provider_Operation_Options,
+	active:                    bool,
+	stage:                     Chat_Request_Stage,
+	connection:                ai.Provider_Connection,
+	policy:                    Chat_Retry_Policy,
+	observer:                  Chat_Observer,
+	options:                   ai.Provider_Operation_Options,
 	// worker is the thread running the current attempt, nil when none is live. worker_data
 	// is the argument the owner allocated for it, freed only after the join.
-	worker:              ^thread.Thread,
-	worker_data:         ^Chat_Request_Worker,
+	worker:                    ^thread.Thread,
+	worker_data:               ^Chat_Request_Worker,
 	// mailbox is where the attempt's worker publishes: the events it received, and the one
 	// terminal it ends with. It belongs to the chain rather than to the session, so an attempt
 	// whose worker ignored its stop can keep publishing into it after the chain is released,
 	// while the next request uses a mailbox of its own and never sees those facts. It lives in
 	// scratch, which is the arena an abandoned attempt is retained with.
-	mailbox:             ^Owner_Mailbox,
+	mailbox:                   ^Owner_Mailbox,
 	// stop_at is when the owner first saw that this attempt should have stopped, and the stop
 	// patience is measured from it. abandoned records that its worker had not published by the
 	// end of that patience, or was still in flight at teardown: the release then retains
 	// everything that worker can still reach rather than joining it.
-	stop_at:             Maybe(time.Tick),
-	abandoned:           bool,
+	stop_at:                   Maybe(time.Tick),
+	abandoned:                 bool,
 	// scratch is the arena the chain builds its request in: the context read out of the
 	// store, the messages the projection makes, the entries it points at, the frozen bytes it
 	// sends, the worker's argument, and the mailbox the worker publishes through. Releasing the
 	// chain returns all of it in one unmap, and an abandoned attempt is retained with it. A
 	// zero arena is inert, so a chain that never ran holds nothing.
-	scratch:             virtual.Arena,
-	prep:                Chat_Request_Prep,
-	encoded:             ai.Provider_Encoded_Request,
-	websocket_request:   bool,
+	scratch:                   virtual.Arena,
+	prep:                      Chat_Request_Prep,
+	encoded:                   ai.Provider_Encoded_Request,
+	websocket_request:         bool,
 	// attempts counts the sends this chain has made, including one whose row just landed.
-	attempts:            int,
+	attempts:                  int,
 	// operation_error is the last attempt's error, owned until the chain releases it or
 	// a retry discards it.
-	operation_error:     ai.Provider_Operation_Error,
-	finish_reason:       ai.Provider_Finish_Reason,
-	text_exposed:        bool,
-	completion_accepted: bool,
+	operation_error:           ai.Provider_Operation_Error,
+	finish_reason:             ai.Provider_Finish_Reason,
+	text_exposed:              bool,
+	completion_accepted:       bool,
 	// assistant_open records that the observer was told a response is streaming. A resend
 	// closes it, because the response it showed part of is dropped and the resend is a new one.
-	assistant_open:      bool,
+	assistant_open:            bool,
 	// source is the event source of the last attempt, which its staged output commits under.
-	source:              Chat_Event_Source,
+	source:                    Chat_Event_Source,
 	// request is the id every attempt of this chain is recorded under, allocated by the
 	// first claim.
-	request:             journal.Request_Id,
-	recovery_kind:       Chat_Recovery_Kind,
+	request:                   journal.Request_Id,
+	recovery_kind:             Chat_Recovery_Kind,
 	// repaired records that this chain has used its one context repair. It never resets,
 	// because the bound belongs to the chain rather than to the payload it sends.
-	repaired:            bool,
+	repaired:                  bool,
+	// repair_compaction_started records that this repair started its one compaction. A
+	// terminal compaction failure must not start another job for the same refused request.
+	repair_compaction_started: bool,
 	// retries counts the scheduled resends this chain made, which the policy bounds.
-	retries:             int,
+	retries:                   int,
 	// cache_hints_omitted records that this chain resent its request without the cache
 	// hints after a refusal, which it does once.
-	cache_hints_omitted: bool,
+	cache_hints_omitted:       bool,
 	// settled records that the last row was finished for a retry, so the response commit
 	// must not finish it twice.
-	settled:             bool,
+	settled:                   bool,
 	// decision is what the harness decided about the last send, and, once the chain has
 	// stopped, why it stopped.
-	decision:            Chat_Recovery_Decision,
+	decision:                  Chat_Recovery_Decision,
 }
 
 // Chat_Abandoned_Attempt is one attempt whose worker had not published when the chain was
@@ -325,9 +328,8 @@ chat_record_attempt :: proc(chat: ^Chat_Session, connection: ai.Provider_Connect
 }
 
 // chat_try_context_repair makes room for a payload the provider refused as too large.
-// It returns None when a summary was installed and the request rebuilt, and otherwise
-// the typed reason the repair failed. A refusal ends the chain and stays on the session,
-// so the record and a front-end can tell why the turn could not make room.
+// It returns None when a summary was installed and the request rebuilt, Summary_Running
+// while a compaction is running or in backoff, and otherwise the typed repair result.
 @(private, require_results)
 chat_try_context_repair :: proc(
 	chat: ^Chat_Session,
@@ -349,15 +351,16 @@ chat_try_context_repair :: proc(
 		websocket_request,
 		virtual.arena_allocator(&chat.chain.scratch),
 	)
+	if refusal == .No_Candidate && chat.compact.state == .Idle && !chat.chain.repair_compaction_started {
+		chat.chain.repair_compaction_started = true
+		if chat_compact_request(chat, .Provider_Overflow) != .Unavailable {
+			chat_compact_consider(chat, observer, connection, prep)
+		}
+		if chat.compact.state == .Running || chat.compact.state == .Backoff {
+			return .Summary_Running
+		}
+	}
 	if refusal != .None {
-		chat.turn_repair_refusal = refusal
-		// The session keeps the pressure, so the next safe boundary starts the summary
-		// this refusal was missing. A summary already running is promoted instead: it is
-		// the same work, and it installs as soon as it is ready.
-		// The request is best effort: whether it was recorded or coalesced, the refusal is
-		// what already ended this chain.
-		_ = chat_compact_request(chat, .Provider_Overflow)
-		chat_session_fail_turn(chat, fmt.tprintf("the request does not fit the context: %s", chat_repair_refusal_text(refusal)))
 		return refusal
 	}
 	repaired := [4]Log_Field {
@@ -830,14 +833,38 @@ chat_chain_wait :: proc(chat: ^Chat_Session) {
 	chain.stage = .Ready
 }
 
-// chat_chain_repair installs a summary and rebuilds the frozen payload after the provider
-// refused the request as too large. A refusal ends the chain; otherwise the next attempt
-// sends the rebuilt bytes under the same bound.
+// chat_chain_repair waits for a summary or starts one for the refused request, then rebuilds
+// the frozen payload. The next attempt sends the rebuilt bytes under the same bound.
 @(private)
 chat_chain_repair :: proc(chat: ^Chat_Session) {
 	chain := &chat.chain
 	if !chain.active || chain.stage != .Repairing { return }
-	if chat_try_context_repair(chat, chain.connection, chain.observer, &chain.prep, &chain.encoded, chain.websocket_request, chain.attempts) != .None {
+	seen := owner_wake_seen()
+	chat_session_observe_stop(chat)
+	if chat_session_cancelled(chat) {
+		chat_chain_stop(chat, .Cancelled)
+		return
+	}
+	refusal := chat_try_context_repair(chat, chain.connection, chain.observer, &chain.prep, &chain.encoded, chain.websocket_request, chain.attempts)
+	if refusal == .Summary_Running {
+		chat_session_observe_stop(chat)
+		if chat_session_cancelled(chat) {
+			chat_chain_stop(chat, .Cancelled)
+			return
+		}
+		owner_wake_wait(seen, chat_compact_deadline(chat))
+		chat_session_observe_stop(chat)
+		if chat_session_cancelled(chat) { chat_chain_stop(chat, .Cancelled) }
+		return
+	}
+	if refusal != .None {
+		if chat_session_cancelled(chat) {
+			chat_session_observe_stop(chat)
+			chat_chain_stop(chat, .Cancelled)
+			return
+		}
+		chat.turn_repair_refusal = refusal
+		chat_session_fail_turn(chat, fmt.tprintf("the request does not fit the context: %s", chat_repair_refusal_text(refusal)))
 		chat_chain_stop(chat, .Context_Exhausted)
 		return
 	}

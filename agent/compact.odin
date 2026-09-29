@@ -1148,15 +1148,14 @@ chat_compact_relieve :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 	return chat_compact_install(chat, observer)
 }
 
-// Chat_Repair_Refusal names why a rejected payload could not be repaired. It is the
-// cause behind a turn that ends as context exhaustion: the input did not fit, and this is
-// what stood in the way of making room for it.
+// Chat_Repair_Refusal names the result of repairing a rejected payload. Summary_Running
+// asks the request chain to wait; the other non-None values explain why repair stopped.
 Chat_Repair_Refusal :: enum {
 	// None is a repair that proceeded: the context changed and the rebuilt request fits.
 	None,
-	// Summary_Running is a summary that has not finished. A repair never waits for one.
+	// Summary_Running is a summary in progress or backoff; the request chain waits for it.
 	Summary_Running,
-	// No_Candidate is no summary to install at all.
+	// No_Candidate means compaction could not start or produced no installable summary.
 	No_Candidate,
 	// No_Reduction is a candidate that does not free enough to admit the rebuilt request.
 	No_Reduction,
@@ -1165,7 +1164,7 @@ Chat_Repair_Refusal :: enum {
 	Repair_Rejected,
 }
 
-// chat_repair_refusal_name is the stable spelling a record keeps for a refusal.
+// chat_repair_refusal_name is the stable spelling for a repair result.
 chat_repair_refusal_name :: proc(refusal: Chat_Repair_Refusal) -> string {
 	switch refusal {
 	case .None:
@@ -1188,9 +1187,9 @@ chat_repair_refusal_text :: proc(refusal: Chat_Repair_Refusal) -> string {
 	case .None:
 		return "the context was repaired"
 	case .Summary_Running:
-		return "a summary of the earlier conversation is still running"
+		return "a summary of the earlier conversation is still running or waiting to retry"
 	case .No_Candidate:
-		return "no summary of the earlier conversation is ready"
+		return "no summary of the earlier conversation could be produced"
 	case .No_Reduction:
 		return "a summary was installed and the request still does not fit"
 	case .Repair_Rejected:
@@ -1200,9 +1199,9 @@ chat_repair_refusal_text :: proc(refusal: Chat_Repair_Refusal) -> string {
 }
 
 // chat_repair_context makes room for a request the provider rejected as too large. It
-// polls compaction once, installs a candidate that is ready and valid, rebuilds the
-// request against the installed checkpoint, and re-encodes it. It reports what stood in
-// the way when it could not.
+// polls compaction, resumes a retry whose deadline arrived, installs a candidate that is
+// ready and valid, rebuilds the request against the installed checkpoint, and re-encodes it.
+// It reports what stood in the way when it could not.
 //
 // It never waits for a summary, never resends the rejected payload, and never installs a
 // candidate the store refuses. The caller owns prep and encoded either way: on success
@@ -1224,6 +1223,7 @@ chat_repair_context :: proc(
 ) -> Chat_Repair_Refusal {
 	// A summary may have finished while the rejected request was being sent.
 	chat_compact_poll(chat, observer)
+	chat_compact_resume(chat, observer)
 	switch chat.compact.state {
 	case .Running, .Backoff:
 		return .Summary_Running

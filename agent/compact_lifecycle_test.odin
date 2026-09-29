@@ -594,10 +594,74 @@ test_a_rejected_payload_is_repaired_from_a_ready_summary :: proc(test: ^testing.
 	testing.expect_value(test, evidence.recovery, "context_exhausted")
 }
 
-// A provider that rejects the payload with nothing to install ends the turn as context
-// exhaustion, names the cause, and never sends the refused payload again.
+// An overflow starts compaction when no summary is ready, waits for it, and sends the
+// rebuilt request only after installing the checkpoint.
 @(test)
-test_a_rejected_payload_with_nothing_to_install_ends_the_turn :: proc(test: ^testing.T) {
+test_a_rejected_payload_waits_for_a_summary_that_is_not_ready :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	arena: virtual.Arena
+	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
+	defer virtual.arena_destroy(&arena)
+	chat_test_capacity(chat, 500_000)
+	_test_accept(test, chat, "first")
+	large := strings.repeat("work ", 160_000) or_else ""
+	defer delete(large)
+	_test_user(test, chat, large, .Prompt)
+	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
+		_test_response(test, chat, 0, text)
+	}
+
+	overflow := `{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens"}}`
+	responses := []string{agent_provider_refusal("400 Bad Request", overflow), agent_provider_reply(COMPACT_TEST_SUMMARY), agent_provider_reply("repaired")}
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	prep, prep_error := chat_prepare(chat, connection, virtual.arena_allocator(&arena))
+	if prep_error != nil { testing.fail_now(test, "chat_prepare failed") }
+	testing.expect(test, prep.estimate < chat_compact_trigger(chat), "the summary is not started by pressure")
+	testing.expect_value(test, chat.compact.state, Compact_State.Idle)
+
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the overflow repaired after compaction")
+	testing.expect_value(test, agent_provider_request_count(&provider), 3)
+	testing.expect_value(test, chat_session_terminal_status(chat), Chat_Terminal_Status.Completed)
+
+	refused := agent_provider_request(&provider, 0)
+	repaired := agent_provider_request(&provider, 2)
+	testing.expect(test, repaired != refused, "the repaired request is a new payload")
+	testing.expect(test, len(repaired) < len(refused), "the repaired request is smaller")
+
+	projection := _test_projection(test, chat, &arena)
+	testing.expect(test, strings.contains(projection.summary, COMPACT_TEST_SUMMARY), "the summary was installed")
+	has_answer := false
+	for entry in projection.items {
+		if answer, is_answer := entry.payload.(Projected_Assistant); is_answer && answer.text == "repaired" {
+			has_answer = true
+		}
+	}
+	testing.expect(test, has_answer, "the repaired response completed the turn")
+
+	sends := _test_records(test, chat, {.Request_Sent})
+	compactions := _test_records(test, chat, {.Compaction_Completed})
+	if !testing.expect_value(test, len(sends), 3) || !testing.expect_value(test, len(compactions), 1) { return }
+	second: journal.Request_Sent
+	if decode_error := journal.payload_decode(sends[2].data, &second, context.temp_allocator);
+	   decode_error != nil { testing.fail_now(test, "repair send could not be decoded") }
+	testing.expect_value(test, sends[2].attempt, journal.Attempt_No(2))
+	testing.expect_value(test, second.recovery, "checkpoint_repair")
+}
+
+// An overflow cannot be repaired when the active history has no prefix to summarize.
+@(test)
+test_a_rejected_payload_without_a_compactable_prefix_ends_the_turn :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
@@ -623,7 +687,7 @@ test_a_rejected_payload_with_nothing_to_install_ends_the_turn :: proc(test: ^tes
 	defer delete(connection.Endpoint, chat.allocator)
 
 	testing.expect(test, !chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn ends without a repair")
-	// The refused payload is never sent again: there is nothing to send it with.
+	// The refused payload is never sent again because compaction had no prefix to summarize.
 	testing.expect_value(test, agent_provider_request_count(&provider), 1)
 	testing.expect_value(test, chat_session_repair_refusal(chat), Chat_Repair_Refusal.No_Candidate)
 	testing.expect_value(test, chat_session_terminal_status(chat), Chat_Terminal_Status.Failed)
@@ -631,10 +695,6 @@ test_a_rejected_payload_with_nothing_to_install_ends_the_turn :: proc(test: ^tes
 	value, has_reason := reason.?
 	testing.expect(test, has_reason, "the turn records why its chain stopped")
 	testing.expect_value(test, value, Request_Recovery_Reason.Context_Exhausted)
-	// The session keeps the pressure, so the next safe boundary starts the summary this
-	// refusal was missing.
-	testing.expect_value(test, chat.compact.pending, Compact_Trigger.Provider_Overflow)
-
 	projection := _test_projection(test, chat, &arena)
 	testing.expect_value(test, projection.summary, "")
 	sends := _test_records(test, chat, {.Request_Sent})
@@ -946,62 +1006,6 @@ test_a_failed_chain_waits_for_the_context_to_move :: proc(test: ^testing.T) {
 	if after_error != nil { testing.fail_now(test, "chat_prepare failed") }
 
 	chat_compact_consider(chat, {}, connection, &after)
-	testing.expect_value(test, chat.compact.state, Compact_State.Running)
-}
-
-// A summary that is still running when the provider rejects the context ends the turn at once:
-// the repair never waits for it, and it never cancels work the session owns.
-@(test)
-test_a_running_summary_ends_the_turn_as_context_exhaustion :: proc(test: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
-	defer chat_test_end(test, &fixture)
-	chat := &fixture.chat
-	arena: virtual.Arena
-	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
-	defer virtual.arena_destroy(&arena)
-	// A window small enough that the summary's own request stays inside what the stalling
-	// fixture reads, and still large enough for the context to cross the compaction trigger.
-	chat_test_capacity(chat, 16_000)
-	_test_accept(test, chat, "first")
-	large := strings.repeat("work ", 10_000) or_else ""
-	defer delete(large)
-	_test_user(test, chat, large, .Prompt)
-	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
-		_test_response(test, chat, 0, text)
-	}
-
-	overflow := `{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens"}}`
-	background: Compact_Provider
-	if !compact_provider_start(test, &background, COMPACT_TEST_BODY, true) { return }
-	defer compact_provider_stop(&background)
-	defer sync.sema_post(&background.release)
-	// The foreground is a scripted provider because this test needs a refusal, which the
-	// stalling fixture cannot express.
-	foreground: Agent_Provider
-	if !agent_provider_start(test, &foreground, []string{agent_provider_refusal("400 Bad Request", overflow)}) { return }
-	defer agent_provider_stop(&foreground)
-
-	background_connection := ai.Provider_Connection {
-		API      = .OpenAI_Chat_Completions,
-		Endpoint = compact_provider_endpoint(&background, context.temp_allocator),
-	}
-	foreground_connection := ai.Provider_Connection {
-		API      = .OpenAI_Chat_Completions,
-		Endpoint = agent_provider_endpoint(&foreground, chat.allocator),
-	}
-	defer delete(foreground_connection.Endpoint, chat.allocator)
-
-	// The summary is in flight and the foreground is refused: there is nothing to install, and
-	// nothing waits for the summary to arrive.
-	prep, prep_error := chat_prepare(chat, background_connection, virtual.arena_allocator(&arena))
-	if prep_error != nil { testing.fail_now(test, "chat_prepare failed") }
-	chat_compact_consider(chat, {}, background_connection, &prep)
-
-	if !testing.expect_value(test, chat.compact.state, Compact_State.Running) { return }
-
-	testing.expect(test, !chat_run_turn(chat, foreground_connection, test_retry_policy(), {}), "the turn ends without a repair")
-	testing.expect_value(test, chat_session_repair_refusal(chat), Chat_Repair_Refusal.Summary_Running)
 	testing.expect_value(test, chat.compact.state, Compact_State.Running)
 }
 
