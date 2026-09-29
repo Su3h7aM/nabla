@@ -133,6 +133,36 @@ shell_await_pid_file :: proc(path: string) -> (int, bool) {
 }
 
 @(test)
+test_shell_exit_terminates_background_processes :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+
+	started := time.tick_now()
+	result := tool_run(test, &tool_test, TOOL_SHELL_NAME, `{"command":"sleep 30 & echo $!"}`)
+	elapsed := time.tick_since(started)
+
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Success)
+	testing.expectf(test, elapsed < 2 * time.Second, "the background command took %v to return", elapsed)
+	testing.expect(
+		test,
+		strings.contains(result.content, "background processes left in the command's process group were terminated"),
+		"the result reports the background process group termination",
+	)
+
+	marker := "stdout:\n"
+	start := strings.index(result.content, marker)
+	if !testing.expect(test, start >= 0, "the shell result includes the background process id") { return }
+	rest := result.content[start + len(marker):]
+	end := strings.index_byte(rest, '\n')
+	if !testing.expect(test, end >= 0, "the background process id ends at a line break") { return }
+	pid, parsed := strconv.parse_int(strings.trim_space(rest[:end]))
+	if !testing.expect(test, parsed && pid > 0, "the background process id is a positive integer") { return }
+	defer if !shell_process_gone(pid) { _ = linux.kill(linux.Pid(pid), .SIGKILL) }
+	testing.expectf(test, shell_await_process_gone(pid), "background process %d survived the shell call", pid)
+}
+
+@(test)
 test_shell_timeout_applies_after_pipes_close :: proc(test: ^testing.T) {
 	allocator := context.temp_allocator
 	workspace := shell_test_workspace(allocator)

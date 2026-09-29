@@ -230,3 +230,32 @@ test_shell_runs_fish_without_touching_history :: proc(test: ^testing.T) {
 	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Success)
 	testing.expect(test, strings.contains(result.content, `ran-as-fish --private -c printf payload`), "fish runs the command with history disabled")
 }
+
+@(test)
+test_shell_spools_sanitized_output_that_builtin_read_accepts :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+
+	size := TOOL_STREAM_MEMORY_BYTES
+	command := fmt.tprintf(`{{"command":"head -c %d /dev/zero | tr '\\000' a; printf '\\000\\377'"}}`, size)
+	result := tool_run(test, &tool_test, TOOL_SHELL_NAME, command)
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Success)
+	testing.expect(test, strings.contains(result.content, fmt.tprintf("stdout_bytes: %d\n", size + 2)), "the original byte count is reported")
+
+	marker := "stdout_complete_in: "
+	start := strings.index(result.content, marker)
+	if !testing.expect(test, start >= 0, "the spooled output path is in the result") { return }
+	rest := result.content[start + len(marker):]
+	end := strings.index_byte(rest, '\n')
+	if !testing.expect(test, end >= 0, "the spooled output path ends at a line break") { return }
+	path := rest[:end]
+
+	arguments := fmt.tprintf(`{{"path":%q,"offset":1,"limit":1}}`, path)
+	read := tool_run(test, &tool_test, TOOL_READ_NAME, arguments)
+	testing.expect_value(test, read.outcome, journal.Tool_Outcome.Success)
+	spooled, read_error := os.read_entire_file(path, context.temp_allocator)
+	testing.expect_value(test, read_error, nil)
+	testing.expect_value(test, len(spooled), size + 6)
+	testing.expect(test, strings.has_suffix(string(spooled), "\ufffd\ufffd"), "the spooled NUL and invalid UTF-8 are replacement text")
+}

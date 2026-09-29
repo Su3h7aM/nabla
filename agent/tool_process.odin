@@ -6,6 +6,7 @@ import "core:os"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
+import "core:unicode/utf8"
 
 TOOL_KILL_GRACE :: 500 * time.Millisecond
 
@@ -310,16 +311,15 @@ tool_control_fds :: proc(fds: []posix.pollfd, control: Tool_Control) -> int {
 
 // tool_retire_child waits for the child to exit without ever blocking
 // unobservably. Pipes may close early while the child still sleeps, so the wait
-// also wakes on a stop and ends at the deadline. Background descendants are not
-// waited for: they only keep pipes open, and the caller closes those pipes on
-// return.
+// also wakes on a stop and ends at the deadline. After normal exit, remaining
+// process-group members are terminated through the same escalation path.
 @(require_results)
-tool_retire_child :: proc(child: ^Tool_Child, start: time.Tick, budget: time.Duration, control: Tool_Control) -> (Tool_Stop, os.Error) {
+tool_retire_child :: proc(child: ^Tool_Child, start: time.Tick, budget: time.Duration, control: Tool_Control) -> (Tool_Stop, os.Error, bool) {
 	deadline := time.tick_add(start, budget)
 	for !tool_child_poll(child) {
 		if stop := tool_control_stop(control, start, budget); stop != .None {
-			tool_terminate_group(child)
-			return stop, nil
+			_ = tool_terminate_group(child)
+			return stop, nil, false
 		}
 		fds: [2]posix.pollfd
 		fds[0] = {
@@ -328,11 +328,11 @@ tool_retire_child :: proc(child: ^Tool_Child, start: time.Tick, budget: time.Dur
 		}
 		count := 1 + tool_control_fds(fds[1:], control)
 		if err := tool_poll(fds[:count], deadline, budget > 0); err != nil {
-			tool_terminate_group(child)
-			return .Wait_Failed, err
+			_ = tool_terminate_group(child)
+			return .Wait_Failed, err, false
 		}
 	}
-	return .None, nil
+	return .None, nil, tool_terminate_group(child)
 }
 
 // TOOL_STREAM_MEMORY_BYTES is how much of one output stream is held in memory. A stream
@@ -340,25 +340,108 @@ tool_retire_child :: proc(child: ^Tool_Child, start: time.Tick, budget: time.Dur
 // beginning stays in memory, so a command that prints without end cannot exhaust memory.
 TOOL_STREAM_MEMORY_BYTES :: 1024 * 1024
 
+// TOOL_STREAM_READ_BYTES is the fixed read buffer size, not an output limit.
+TOOL_STREAM_READ_BYTES :: 4096
+
+// TOOL_STREAM_SANITIZE_BYTES holds three replacement bytes per byte read, plus a partial UTF-8 sequence.
+TOOL_STREAM_SANITIZE_BYTES :: 3 * (TOOL_STREAM_READ_BYTES + 3)
+
+TOOL_STREAM_REPLACEMENT :: "\ufffd"
+
 // Tool_Stream is one captured output stream while it is drained. kept holds the whole
 // stream until it outgrows memory, and its beginning after that. spool_path names the
 // file the whole stream goes to then; "" means the stream stays in memory whatever its size.
 @(private)
 Tool_Stream :: struct {
-	file:       ^os.File,
-	kept:       [dynamic]u8,
-	open:       bool,
-	total:      int,
-	spool_path: string,
-	spool:      ^os.File,
+	file:        ^os.File,
+	kept:        [dynamic]u8,
+	open:        bool,
+	total:       int,
+	spool_path:  string,
+	spool:       ^os.File,
+	pending:     [3]u8,
+	pending_len: int,
+	invalid_run: bool,
 }
 
-// tool_stream_take adds one chunk. The spool is opened the first time the stream outgrows
-// memory, and receives everything kept so far. When it cannot be opened the stream stays in
-// memory, because output is never discarded.
+// tool_stream_take sanitizes one chunk, then adds those same bytes to memory and any spool.
 @(private, require_results)
 tool_stream_take :: proc(stream: ^Tool_Stream, chunk: []u8) -> os.Error {
 	stream.total += len(chunk)
+	sanitized: [TOOL_STREAM_SANITIZE_BYTES]u8
+	sanitized_len := tool_stream_sanitize(stream, chunk, false, sanitized[:])
+	return tool_stream_write(stream, sanitized[:sanitized_len])
+}
+
+// tool_stream_finish writes an incomplete final UTF-8 sequence as replacement text.
+@(private, require_results)
+tool_stream_finish :: proc(stream: ^Tool_Stream) -> os.Error {
+	sanitized: [TOOL_STREAM_SANITIZE_BYTES]u8
+	sanitized_len := tool_stream_sanitize(stream, nil, true, sanitized[:])
+	return tool_stream_write(stream, sanitized[:sanitized_len])
+}
+
+// tool_stream_sanitize replaces invalid UTF-8 and disallowed control bytes, carrying a partial rune into the next chunk.
+@(private)
+tool_stream_sanitize :: proc(stream: ^Tool_Stream, chunk: []u8, final: bool, output: []u8) -> int {
+	assert(len(chunk) <= TOOL_STREAM_READ_BYTES)
+	combined: [TOOL_STREAM_READ_BYTES + 3]u8
+	combined_len := stream.pending_len + len(chunk)
+	copy(combined[:], stream.pending[:stream.pending_len])
+	copy(combined[stream.pending_len:combined_len], chunk)
+	stream.pending_len = 0
+
+	process_len := combined_len
+	if !final {
+		pending_len := tool_stream_incomplete_utf8_suffix(combined[:combined_len])
+		process_len -= pending_len
+		stream.pending_len = pending_len
+		copy(stream.pending[:pending_len], combined[process_len:combined_len])
+	}
+
+	output_len := 0
+	for index := 0; index < process_len; {
+		rune, width := utf8.decode_rune_in_bytes(combined[index:process_len])
+		invalid := rune == utf8.RUNE_ERROR && width == 1
+		if invalid {
+			if !stream.invalid_run {
+				copy(output[output_len:], TOOL_STREAM_REPLACEMENT)
+				output_len += len(TOOL_STREAM_REPLACEMENT)
+			}
+			stream.invalid_run = true
+			index += width
+			continue
+		}
+
+		stream.invalid_run = false
+		breaks := rune == utf8.RUNE_ERROR || rune < 0x20 && rune != '\n' && rune != '\t' || rune == 0x7F
+		if breaks {
+			copy(output[output_len:], TOOL_STREAM_REPLACEMENT)
+			output_len += len(TOOL_STREAM_REPLACEMENT)
+		} else {
+			copy(output[output_len:], combined[index:index + width])
+			output_len += width
+		}
+		index += width
+	}
+	return output_len
+}
+
+// tool_stream_incomplete_utf8_suffix retains an incomplete final rune without buffering invalid encodings.
+@(private)
+tool_stream_incomplete_utf8_suffix :: proc(bytes: []u8) -> int {
+	for distance := 0; distance < len(bytes) && distance <= 3; distance += 1 {
+		start := len(bytes) - distance - 1
+		if !utf8.rune_start(bytes[start]) { continue }
+		if !utf8.full_rune(bytes[start:]) { return len(bytes) - start }
+		return 0
+	}
+	return 0
+}
+
+// tool_stream_write stores sanitized bytes in memory and, once the threshold is crossed, in a spool.
+@(private, require_results)
+tool_stream_write :: proc(stream: ^Tool_Stream, chunk: []u8) -> os.Error {
 	if stream.spool == nil && stream.spool_path != "" && len(stream.kept) + len(chunk) > TOOL_STREAM_MEMORY_BYTES {
 		spool, open_error := tool_output_create(stream.spool_path)
 		if open_error == nil {
@@ -379,6 +462,15 @@ tool_stream_take :: proc(stream: ^Tool_Stream, chunk: []u8) -> os.Error {
 	return nil
 }
 
+// tool_stream_finish_all flushes partial UTF-8 suffixes before a drain result transfers the streams.
+@(private, require_results)
+tool_stream_finish_all :: proc(streams: []Tool_Stream) -> os.Error {
+	for &stream in streams {
+		tool_stream_finish(&stream) or_return
+	}
+	return nil
+}
+
 // tool_drain_pipes reads both pipes to end of stream and reports why draining
 // stopped. It sleeps until a pipe has data, the child exits, the call is stopped,
 // or the deadline passes, and never reads one pipe to EOF before the other, so a
@@ -395,8 +487,9 @@ tool_drain_pipes :: proc(
 	spool_base: string,
 	allocator: mem.Allocator,
 ) -> (
-	Tool_Stop,
-	os.Error,
+	stop: Tool_Stop,
+	wait_error: os.Error,
+	background_terminated: bool,
 ) {
 	deadline := time.tick_add(start, budget)
 	streams := [2]Tool_Stream{{file = stdout_read, open = true}, {file = stderr_read, open = true}}
@@ -420,7 +513,7 @@ tool_drain_pipes :: proc(
 			delete(stream.kept)
 			delete(stream.spool_path, allocator)
 		}
-		return .Wait_Failed, allocation_error
+		return .Wait_Failed, allocation_error, false
 	}
 	// Everything the command wrote is kept, whatever the drain ends with.
 	defer {
@@ -447,9 +540,10 @@ tool_drain_pipes :: proc(
 	for streams[0].open || streams[1].open {
 		// One check covers both stops, and cancellation wins: a cancelled turn
 		// is never reported as a timeout.
-		if stop := tool_control_stop(control, start, budget); stop != .None {
-			tool_terminate_group(child)
-			return stop, nil
+		if stop_reason := tool_control_stop(control, start, budget); stop_reason != .None {
+			_ = tool_terminate_group(child)
+			if finish_error := tool_stream_finish_all(streams[:]); finish_error != nil { return .Wait_Failed, finish_error, false }
+			return stop_reason, nil, false
 		}
 		fds: [4]posix.pollfd
 		slots := [2]int{-1, -1}
@@ -471,8 +565,9 @@ tool_drain_pipes :: proc(
 		count += 1
 		count += tool_control_fds(fds[count:], control)
 		if err := tool_poll(fds[:count], deadline, budget > 0); err != nil {
-			tool_terminate_group(child)
-			return .Wait_Failed, err
+			_ = tool_terminate_group(child)
+			if finish_error := tool_stream_finish_all(streams[:]); finish_error != nil { return .Wait_Failed, finish_error, false }
+			return .Wait_Failed, err, false
 		}
 
 		progress := false
@@ -484,33 +579,52 @@ tool_drain_pipes :: proc(
 			case .Again:
 			case .Failed:
 				stream.open = false
+				if finish_error := tool_stream_finish(&stream); finish_error != nil {
+					_ = tool_terminate_group(child)
+					return .Wait_Failed, finish_error, false
+				}
 			case .Ok:
 				if n == 0 {
 					stream.open = false
+					if finish_error := tool_stream_finish(&stream); finish_error != nil {
+						_ = tool_terminate_group(child)
+						return .Wait_Failed, finish_error, false
+					}
 				} else if take_error := tool_stream_take(&stream, scratch[:n]); take_error != nil {
-					tool_terminate_group(child)
-					return .Wait_Failed, take_error
+					_ = tool_terminate_group(child)
+					if finish_error := tool_stream_finish_all(streams[:]); finish_error != nil { return .Wait_Failed, finish_error, false }
+					return .Wait_Failed, take_error, false
 				}
 			}
 		}
-		// Only a descendant of an exited child could still hold a pipe open, and
-		// background jobs are unsupported, so the child's exit ends the drain once
-		// the pipes are quiet rather than waiting out the whole budget.
+		// An exited leader cannot write to a quiet pipe. Retire its group instead
+		// of waiting until a background process closes the pipe.
 		if !progress && fds[exit_slot].revents != {} { break }
+	}
+	if finish_error := tool_stream_finish_all(streams[:]); finish_error != nil {
+		_ = tool_terminate_group(child)
+		return .Wait_Failed, finish_error, false
 	}
 	return tool_retire_child(child, start, budget, control)
 }
 
 // tool_terminate_group asks the whole tree to stop, waits up to the grace period
 // for the direct child to exit, then kills whatever of the group is left and reaps
-// the child. A process that ignores SIGTERM is why the escalation exists;
-// descendants are why the signals go to the group.
-tool_terminate_group :: proc(child: ^Tool_Child) {
-	if child.pid <= 0 { return }
+// the child. It reports group members signalled after the direct child was reaped.
+tool_terminate_group :: proc(child: ^Tool_Child) -> bool {
+	if child.pid <= 0 { return false }
 	group := posix.pid_t(child.pid)
-	_ = posix.killpg(group, .SIGTERM)
+	term_sent := posix.killpg(group, .SIGTERM) == .OK
+	was_reaped := child.reaped
 	tool_child_await(child, time.tick_add(time.tick_now(), TOOL_KILL_GRACE))
+	if was_reaped && term_sent {
+		// A reaped leader cannot keep its group alive, so a successful group signal
+		// means a background member remains. Give it the same TERM grace as the child path.
+		no_fds: []posix.pollfd
+		_ = tool_poll(no_fds, time.tick_add(time.tick_now(), TOOL_KILL_GRACE), true)
+	}
 	_ = posix.killpg(group, .SIGKILL)
 	if !child.reaped { _ = posix.kill(group, .SIGKILL) }
 	_, _, _ = tool_child_reap(child)
+	return was_reaped && term_sent
 }

@@ -2,11 +2,9 @@ package agent
 
 import "core:encoding/json"
 import "core:fmt"
-import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:time"
-import "core:unicode/utf8"
 
 import "nabla:agent/journal"
 
@@ -35,6 +33,8 @@ TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms"}
 
 // TOOL_SHELL_DEFAULT_TIMEOUT applies when the model gives no timeout. There is no maximum.
 TOOL_SHELL_DEFAULT_TIMEOUT :: 120 * time.Second
+
+TOOL_SHELL_BACKGROUND_NOTICE :: "background processes left in the command's process group were terminated; start a long-running process with setsid to keep it"
 
 // tool_shell_definition is the shell tool, described for the shell this process
 // will run: the shell decides the syntax the model has to write, and the tool does
@@ -131,7 +131,17 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	if spawn != .Started { return tool_shell_not_started(ctx, spawn_error, data) }
 	defer tool_child_close(&child)
 
-	stop, wait_error := tool_drain_pipes(&child, stdout_read, stderr_read, time.tick_now(), args.timeout, ctx.control, &data, ctx.output_base, ctx.allocator)
+	stop, wait_error, background_terminated := tool_drain_pipes(
+		&child,
+		stdout_read,
+		stderr_read,
+		time.tick_now(),
+		args.timeout,
+		ctx.control,
+		&data,
+		ctx.output_base,
+		ctx.allocator,
+	)
 	switch stop {
 	case .Wait_Failed:
 		message := fmt.tprintf("the harness could not wait for the command, so it was stopped: %s", os.error_string(wait_error))
@@ -145,16 +155,24 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 
 	exited, exit_code, waited := tool_child_reap(&child)
 	if !waited {
-		return tool_shell_finish(ctx, .Unknown, "the command ran, but its exit status could not be read", data, "exit unknown")
+		message := "the command ran, but its exit status could not be read"
+		if background_terminated { message = fmt.tprintf("%s. %s", message, TOOL_SHELL_BACKGROUND_NOTICE) }
+		return tool_shell_finish(ctx, .Unknown, message, data, "exit unknown")
 	}
 	if !exited {
-		return tool_shell_finish(ctx, .Tool_Failed, "the command was ended by a signal", data, "signalled")
+		message := "the command was ended by a signal"
+		if background_terminated { message = fmt.tprintf("%s. %s", message, TOOL_SHELL_BACKGROUND_NOTICE) }
+		return tool_shell_finish(ctx, .Tool_Failed, message, data, "signalled")
 	}
 	data.exit_code = exit_code
 	if exit_code != 0 {
-		return tool_shell_finish(ctx, .Tool_Failed, fmt.tprintf("the command exited with status %d", exit_code), data, fmt.tprintf("exited %d", exit_code))
+		message := fmt.tprintf("the command exited with status %d", exit_code)
+		if background_terminated { message = fmt.tprintf("%s. %s", message, TOOL_SHELL_BACKGROUND_NOTICE) }
+		return tool_shell_finish(ctx, .Tool_Failed, message, data, fmt.tprintf("exited %d", exit_code))
 	}
-	return tool_shell_finish(ctx, .Success, "", data, "exited 0")
+	message := ""
+	if background_terminated { message = TOOL_SHELL_BACKGROUND_NOTICE }
+	return tool_shell_finish(ctx, .Success, message, data, "exited 0")
 }
 
 // tool_shell_not_started reports a command that did not start, naming the
@@ -164,42 +182,10 @@ tool_shell_not_started :: proc(ctx: ^Tool_Context, cause: os.Error, data: Shell_
 	return tool_shell_finish(ctx, .Tool_Failed, fmt.tprintf("the command did not start: %s", os.error_string(cause)), data)
 }
 
-// tool_shell_finish sanitizes the captured streams to valid UTF-8 and builds the result. A
-// stream that could not be prepared is reported rather than shown empty.
+// tool_shell_finish builds a result from the sanitized streams captured by the drain.
 @(require_results)
 tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, message: string, captured: Shell_Output, reason := "") -> Tool_Result {
-	data := captured
-	stdout_sanitized, stdout_error := tool_sanitize_stream(data.stdout, ctx.allocator)
-	defer delete(stdout_sanitized, ctx.allocator)
-	stderr_sanitized, stderr_error := tool_sanitize_stream(data.stderr, ctx.allocator)
-	defer delete(stderr_sanitized, ctx.allocator)
-	data.stdout = stdout_sanitized
-	data.stderr = stderr_sanitized
-	if stdout_error != nil || stderr_error != nil {
-		// What the command wrote is lost, so the call says so instead of reading as a command
-		// that printed nothing.
-		return tool_result_of(ctx, .Tool_Failed, "the command's output could not be prepared: out of memory", data, "out of memory")
-	}
-	return tool_result_of(ctx, outcome, message, data, reason)
-}
-
-// tool_sanitize_stream returns raw with every byte that would make a result invalid text
-// replaced by the replacement character: a result is read by a model, so invalid UTF-8 and
-// control bytes never reach the provider. The text is owned by allocator.
-@(require_results)
-tool_sanitize_stream :: proc(raw: string, allocator := context.allocator) -> (text: string, err: mem.Allocator_Error) {
-	valid, valid_error := strings.to_valid_utf8(raw, "\ufffd", allocator)
-	if valid_error != nil { return "", valid_error }
-	defer delete(valid, allocator)
-	builder := strings.builder_make(allocator) or_return
-	defer if err != nil { strings.builder_destroy(&builder) }
-	for r in valid {
-		breaks := r == utf8.RUNE_ERROR || r < 0x20 && r != '\n' && r != '\t' || r == 0x7F
-		character := utf8.RUNE_ERROR if breaks else r
-		written, write_error := strings.write_rune(&builder, character)
-		if write_error != nil || written != utf8.rune_size(character) { return "", .Out_Of_Memory }
-	}
-	return strings.to_string(builder), nil
+	return tool_result_of(ctx, outcome, message, captured, reason)
 }
 
 @(require_results)
