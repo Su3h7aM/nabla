@@ -111,8 +111,10 @@ read_records :: proc(
 		}
 		record := scan_record(&row)
 		if row.error != nil {
+			session := record.session
+			seq := record.seq
 			record_destroy(&record, allocator)
-			return nil, after, corrupt(journal, row.error, record.session, record.seq)
+			return nil, after, corrupt(journal, row.error, session, seq)
 		}
 		if _, append_error := append(&list, record); append_error != nil {
 			record_destroy(&record, allocator)
@@ -147,8 +149,10 @@ read_latest :: proc(journal: ^Journal, filter: Filter, allocator: mem.Allocator)
 	}
 	record = scan_record(&row)
 	if row.error != nil {
+		session := record.session
+		seq := record.seq
 		record_destroy(&record, allocator)
-		return {}, false, corrupt(journal, row.error, record.session, record.seq)
+		return {}, false, corrupt(journal, row.error, session, seq)
 	}
 	return record, true, nil
 }
@@ -174,8 +178,10 @@ read_ancestry :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, all
 		// Ids grow in commit order, so a parent at or above its child is damage
 		// that would otherwise loop.
 		if node.parent >= walk {
+			node_session := node.session
+			node_seq := node.seq
 			node_destroy(&node, allocator)
-			return nil, corrupt(journal, Journal_Error.Corrupt, session, node.seq)
+			return nil, corrupt(journal, Journal_Error.Corrupt, node_session, node_seq)
 		}
 		walk = node.parent
 		if node.kind == .Checkpoint && checkpoint == nil {
@@ -316,8 +322,9 @@ list_sessions :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.
 		summary.last_seq = Journal_Seq(row_int(&row))
 		summary.updated_ms = row_int(&row)
 		if row.error != nil {
+			damaged_session := summary.id
 			session_summary_destroy(&summary, allocator)
-			return nil, corrupt(journal, row.error, summary.id, 0)
+			return nil, corrupt(journal, row.error, damaged_session, 0)
 		}
 		if _, append_error := append(&list, summary); append_error != nil {
 			session_summary_destroy(&summary, allocator)
@@ -353,8 +360,9 @@ list_branches :: proc(journal: ^Journal, session: Session_Id, allocator: mem.All
 		branch.head = Node_Id(row_int(&row))
 		branch.last_user_text = row_text(&row)
 		if row.error != nil {
+			seq := branch.seq
 			branch_summary_destroy(&branch, allocator)
-			return nil, corrupt(journal, row.error, session, branch.seq)
+			return nil, corrupt(journal, row.error, session, seq)
 		}
 		if _, append_error := append(&list, branch); append_error != nil {
 			branch_summary_destroy(&branch, allocator)
@@ -487,8 +495,10 @@ read_node :: proc(journal: ^Journal, session: Session_Id, id: Node_Id, allocator
 	node.data = row_text(&row)
 	node.body = row_bytes(&row)
 	if row.error != nil {
+		node_session := node.session
+		node_seq := node.seq
 		node_destroy(&node, allocator)
-		return {}, corrupt(journal, row.error, session, node.seq)
+		return {}, corrupt(journal, row.error, node_session, node_seq)
 	}
 	return node, nil
 }

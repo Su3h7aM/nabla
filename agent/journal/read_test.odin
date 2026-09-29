@@ -195,11 +195,12 @@ test_read_ancestry_refuses_a_parent_that_is_not_there :: proc(test: ^testing.T) 
 	// A node whose parent was never committed: the tree claims a node that is
 	// not in it.
 	orphan := append_node(&journal, Node{session = session, parent = 42, branch = INITIAL_BRANCH, kind = .User}, _Test_Payload{detail = "orphan"})
-	_commit_ok(test, &journal)
+	orphan_seq := _commit_ok(test, &journal)
 
 	_, error := read_ancestry(&journal, session, orphan, context.allocator)
 	_expect_error(test, error, .Corrupt)
 	testing.expect_value(test, journal.corrupt.session, session)
+	testing.expect_value(test, journal.corrupt.seq, orphan_seq)
 }
 
 @(test)
