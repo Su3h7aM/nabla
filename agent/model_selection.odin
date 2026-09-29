@@ -38,6 +38,14 @@ model_selection_destroy :: proc(selection: ^Model_Selection, allocator: mem.Allo
 	selection^ = {}
 }
 
+// model_selection_effort returns preferred when target supports it, otherwise its lowest
+// stated level, or the provider default when it states none. The result borrows target.
+model_selection_effort :: proc(target: Model_Selection, preferred: string) -> string {
+	if effort_level_index(target.effort_levels, preferred) >= 0 { return preferred }
+	if len(target.effort_levels) > 0 { return target.effort_levels[0] }
+	return ""
+}
+
 // provider_usable reports whether a provider states everything a connection needs.
 @(require_results)
 provider_usable :: proc(provider: ^Catalog_Provider) -> bool {

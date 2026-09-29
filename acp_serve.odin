@@ -74,6 +74,7 @@ acp_serve :: proc(server: ^Acp_Server, input: io.Reader) -> bool {
 	// A turn still running is stopped before the worker is joined: it settles as
 	// cancelled, so the record says the session was interrupted rather than guessing.
 	if acp_server_has_work(server) { agent.turn_control_stop(&server.app.run.control) }
+	acp_model_cancel_signal(server)
 	return !read_failed && !acp.writer_failed(&server.writer)
 }
 
@@ -603,6 +604,10 @@ acp_request_set_config_option :: proc(server: ^Acp_Server, envelope: ^acp.Envelo
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id")
 		return
 	}
+	if params.config_id == "model" {
+		acp_request_model_change(server, envelope, .Set_Config_Option, params.session_id, params.value)
+		return
+	}
 	config_id, config_id_error := strings.clone(params.config_id, server.alloc)
 	if config_id_error != nil {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the config id could not be allocated")
@@ -902,10 +907,6 @@ acp_request_set_model :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "initialize must be answered before a model can be selected")
 		return
 	}
-	if acp_server_has_work(server) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "a request is already in flight")
-		return
-	}
 	params: acp.Session_Set_Model_Params
 	if !acp_request_params_decode(server, envelope, &params, "session/set_model needs a session id and model id") {
 		return
@@ -918,26 +919,39 @@ acp_request_set_model :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id; call session/new first")
 		return
 	}
-	model_id, model_error := strings.clone(params.model_id, server.alloc)
+	acp_request_model_change(server, envelope, .Set_Model, params.session_id, params.model_id)
+}
+
+// acp_request_model_change hands a copied raw model id to the owner; catalog
+// resolution stays on that owner and does not hold the reader in session work.
+acp_request_model_change :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, kind: Acp_Work_Kind, session_id, model_id: string) {
+	sync.mutex_lock(&server.mu)
+	valid_session := !server.closing && server.session_id != "" && server.session_id == session_id
+	generation := server.session_generation
+	sync.mutex_unlock(&server.mu)
+	if !valid_session {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id")
+		return
+	}
+	owned_model_id, model_error := strings.clone(model_id, server.alloc)
 	if model_error != nil {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the model id could not be allocated")
 		return
 	}
 	id, id_ok := acp_work_id(envelope.id, server.alloc)
 	if !id_ok {
-		delete(model_id, server.alloc)
+		delete(owned_model_id, server.alloc)
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
 		return
 	}
-	work := Acp_Work {
-		kind     = .Set_Model,
-		id       = id,
-		model_id = model_id,
+	request := Acp_Model_Request {
+		active             = true,
+		kind               = kind,
+		id                 = id,
+		model_id           = owned_model_id,
+		session_generation = generation,
 	}
-	work.session_generation = acp_capture_session_generation(server)
-	if !acp_enqueue(server, work) {
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
-	}
+	acp_model_request_submit(server, request)
 }
 
 // acp_session_matches reports whether the id names the session this process runs. A
@@ -961,9 +975,9 @@ acp_closing_session_matches :: proc(server: ^Acp_Server, session_id: string) -> 
 // not running is ignored, which is what the protocol expects: a turn that already ended
 // has nothing to cancel.
 acp_cancel_session :: proc(server: ^Acp_Server, session_id: string) {
-	if !acp_server_has_work(server) { return }
 	if !acp_session_matches(server, session_id) { return }
-	agent.turn_control_stop(&server.app.run.control)
+	acp_model_cancel_signal(server)
+	if acp_server_has_work(server) { agent.turn_control_stop(&server.app.run.control) }
 }
 
 // acp_enqueue hands one request to the worker. It owns work on both paths: on success the
@@ -1103,6 +1117,7 @@ acp_run :: proc(
 	server.app.run.alloc = server.alloc
 	server.app.setup.alloc = server.alloc
 	server.app.setup.harness_options = harness_options
+	server.app.compact_on_switch = harness_options.compact_on_switch
 	server.base_mcp_servers = mcp_servers
 	// The model this run picks belongs to the conversation, not to the user: an editor
 	// session neither publishes a selection nor remembers one.

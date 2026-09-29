@@ -25,6 +25,7 @@ Config_Error :: enum {
 
 Harness_Options :: struct {
 	disable_project_instructions: bool,
+	compact_on_switch:            bool,
 	// acp_agents is owned by the loaded configuration for the process lifetime.
 	acp_agents:                   []ACP_Agent_Config,
 }
@@ -485,17 +486,27 @@ load_provider :: proc(
 }
 
 @(require_results)
-load_harness_options :: proc(state: ^lua.State, idx: c.int, allocator: mem.Allocator) -> (Harness_Options, Config_Error, string) {
+load_harness_options :: proc(state: ^lua.State, root_idx: c.int, allocator: mem.Allocator) -> (Harness_Options, Config_Error, string) {
 	options: Harness_Options
-	if lua.type(state, idx) == .NIL { return options, .None, "" }
-	if !lua_plain_table(state, idx) { return {}, .Invalid, config_field_detail("instructions", "plain table", state, idx, allocator) }
 	base := lua.gettop(state)
 	defer lua.settop(state, base)
-	lua_field(state, idx, "project")
+	lua_field(state, root_idx, "instructions")
 	if lua.type(state, -1) != .NIL {
-		project, ok := lua_bool(state, -1)
-		if !ok { return {}, .Invalid, config_field_detail("instructions.project", "boolean", state, -1, allocator) }
-		options.disable_project_instructions = !project
+		if !lua_plain_table(state, -1) { return {}, .Invalid, config_field_detail("instructions", "plain table", state, -1, allocator) }
+		instructions_idx := lua.absindex(state, -1)
+		lua_field(state, instructions_idx, "project")
+		if lua.type(state, -1) != .NIL {
+			project, ok := lua_bool(state, -1)
+			if !ok { return {}, .Invalid, config_field_detail("instructions.project", "boolean", state, -1, allocator) }
+			options.disable_project_instructions = !project
+		}
+	}
+	lua.settop(state, base)
+	lua_field(state, root_idx, "compact_on_switch")
+	if lua.type(state, -1) != .NIL {
+		value, ok := lua_bool(state, -1)
+		if !ok { return {}, .Invalid, config_field_detail("compact_on_switch", "boolean", state, -1, allocator) }
+		options.compact_on_switch = value
 	}
 	return options, .None, ""
 }
@@ -544,7 +555,6 @@ load_lua_config_full :: proc(
 	}
 	if !lua_plain_table(state, -1) { return {}, {}, {}, .Root, config_field_detail("return", "plain table", state, -1, allocator) }
 	base := lua.gettop(state)
-	lua_field(state, -1, "instructions")
 	options, options_err, options_detail := load_harness_options(state, -1, allocator)
 	if options_err != .None { return {}, {}, {}, options_err, options_detail }
 	lua.settop(state, base)

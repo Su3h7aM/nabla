@@ -156,6 +156,40 @@ chat_build_request_into :: proc(
 	directive: string,
 	arena: mem.Allocator,
 ) -> mem.Allocator_Error {
+	return chat_build_request_selection_into(
+		chat,
+		prep,
+		items,
+		summary,
+		connection,
+		chat.provider_id,
+		chat.model_id,
+		chat.capacity,
+		chat.tools_enabled,
+		chat.effort,
+		chat.refused_features,
+		directive,
+		arena,
+	)
+}
+
+// chat_build_request_selection_into builds with an explicit identity and capacity without
+// changing the session or its encode cache.
+@(private, require_results)
+chat_build_request_selection_into :: proc(
+	chat: ^Chat_Session,
+	prep: ^Chat_Request_Prep,
+	items: []Projection_Item,
+	summary: string,
+	connection: ai.Provider_Connection,
+	provider_id, model_id: string,
+	capacity: Model_Capacity,
+	tools_enabled: bool,
+	effort: string,
+	refused_features: Optional_Request_Features,
+	directive: string,
+	arena: mem.Allocator,
+) -> mem.Allocator_Error {
 	// The request carries one message per entry, so its list is the one table that is sized
 	// before it is filled. The other three hold nothing yet: each carries the arena its first
 	// entry grows from, and nothing here allocates before there is something to put in it.
@@ -167,7 +201,7 @@ chat_build_request_into :: proc(
 	// The instruction lane is the most stable content a request carries, so it
 	// travels beside the conversation rather than as a turn inside it.
 	instructions := ""
-	if chat.tools_enabled {
+	if tools_enabled {
 		instructions = chat.skill_instructions if chat.skill_instructions != "" else AGENT_SYSTEM_PROMPT
 	} else if chat.skill_instructions != "" {
 		instructions = chat.skill_instructions
@@ -180,8 +214,8 @@ chat_build_request_into :: proc(
 	}
 	replay := Chat_Replay_Target {
 		api      = connection.API,
-		provider = chat.provider_id,
-		model    = chat.model_id,
+		provider = provider_id,
+		model    = model_id,
 	}
 	prep.replay_refused = chat_append_projection(&prep.wire, &prep.calls, &prep.feedback, replay, items, arena) or_return
 	if directive != "" {
@@ -192,7 +226,7 @@ chat_build_request_into :: proc(
 	prep.request = ai.Provider_Request {
 		API                  = connection.API,
 		Model_Present        = true,
-		Model                = chat.model_id,
+		Model                = model_id,
 		Instructions_Present = instructions != "",
 		Instructions         = instructions,
 		Messages_Present     = true,
@@ -230,12 +264,12 @@ chat_build_request_into :: proc(
 	prep.request.Prompt_Cache_Key_Present = true
 	prep.request.Prompt_Cache_Key = session_text
 	if parent := chat_parent_session(chat); parent != "" { prep.request.Prompt_Cache_Key = parent }
-	for feature in chat.refused_features { chat_request_omit_feature(&prep.request, feature) }
-	if chat.effort != "" {
+	for feature in refused_features { chat_request_omit_feature(&prep.request, feature) }
+	if effort != "" {
 		prep.request.Reasoning_Effort_Present = true
-		prep.request.Reasoning_Effort = chat.effort
+		prep.request.Reasoning_Effort = effort
 	}
-	if chat.tools_enabled {
+	if tools_enabled {
 		for &definition in chat.tools.definitions {
 			append(
 				&prep.tools,
@@ -252,7 +286,7 @@ chat_build_request_into :: proc(
 	// summarization request gets the same rule and a larger answer, because its input is
 	// the prefix rather than the whole context.
 	prep.request.Max_Output_Tokens_Present = true
-	prep.request.Max_Output_Tokens, _ = chat_request_output_bound(chat.capacity, prep.estimate)
+	prep.request.Max_Output_Tokens, _ = chat_request_output_bound(capacity, prep.estimate)
 	return nil
 }
 

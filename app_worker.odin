@@ -33,6 +33,8 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 			// A stop that arrived with nothing queued leaves through the drain loop
 			// below, so shutdown never waits on a compaction to finish.
 			if runtime_stopping(app) { break }
+			catalog_selection_sync(app)
+			if app_selection_service(app) { refresh_status(app) }
 			// A background subagent's report that arrived while idle starts a turn of its own.
 			if app_agent_report_turn(app, observer) {
 				refresh_status(app)
@@ -44,8 +46,9 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 			// While subagents run, the worker waits on the wake instead of the queue, because
 			// their reports arrive through the wake.
 			agents_pending := app.setup.session.store != nil && agent.chat_agents_pending(&app.setup.session)
-			if app_compaction_pending(app) || agents_pending {
+			if app_compaction_pending(app) || app.run.pending_target.present || agents_pending {
 				if app_compaction_tick(app, observer) { refresh_status(app) }
+				if app_selection_service(app) { refresh_status(app) }
 				free_all(context.temp_allocator)
 				agent.owner_wake_wait(seen, agent.chat_compact_deadline(&app.setup.session))
 				continue
@@ -153,6 +156,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	// progress. Apply it before every command; request boundaries do the same for
 	// multi-request turns.
 	catalog_selection_sync(app)
+	_ = app_selection_service(app)
 	// Work that can change which sessions exist, or what they are called, marks the
 	// list the /resume menu reads as needing a rebuild.
 	rows_dirty := false
@@ -205,13 +209,24 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			if record_error != nil {
 				detail := journal.error_text(record_error, context.temp_allocator)
 				snap_append(app, .Error, fmt.tprintf("the selection could not be recorded: %s", detail))
+			} else if session_record_error := selection_applied_record(
+				app.setup.store,
+				app.setup.session.session,
+				app.setup.api,
+				app.setup.provider_id,
+				app.setup.model_id,
+				app.setup.session.effort,
+			); session_record_error != nil {
+				app.setup.session.storage_failed = true
+				detail := journal.error_text(session_record_error, context.temp_allocator)
+				snap_append(app, .Error, fmt.tprintf("the session selection could not be recorded: %s", detail))
 			}
 		}
 	case .Catalog:
 	// catalog_selection_sync above consumed the published revision. This item
 	// exists only to wake an idle worker.
 	case .Model:
-		apply_pending_selection(app)
+		_ = app_selection_service(app)
 	case .New_Session:
 		rows_dirty = true
 		// The new session runs the same selection; only the conversation is new. The
@@ -232,7 +247,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			snap_append(app, .Notice, "started a new session")
 			// The new session keeps the same selection; a failure is already in the
 			// snapshot, and the session stays open without a model.
-			if provider != "" && model != "" { _ = apply_selection(app, provider, model, "") }
+			if provider != "" && model != "" { _ = selection_apply_direct(app, provider, model, "", true) }
 		}
 	case .Resume_Session:
 		rows_dirty = true
@@ -339,6 +354,7 @@ session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 		snap_append(app, .Error, "the tool registry could not be allocated")
 		return false
 	}
+	selection_intent_clear(app)
 	if recovery.calls > 0 {
 		snap_append(app, .Notice, fmt.tprintf("%d tool call(s) in this session never reported a result; their results say whether they ran", recovery.calls))
 	}
@@ -348,13 +364,15 @@ session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 	// model, so the session's recorded one is applied, with the selection already in
 	// effect as the fallback. A session whose model is gone from the catalog stays open on
 	// the current selection.
-	if setup.resumed_provider != "" && setup.resumed_model != "" && apply_selection(app, setup.resumed_provider, setup.resumed_model, "") {
+	if setup.resumed_provider != "" &&
+	   setup.resumed_model != "" &&
+	   selection_apply_direct(app, setup.resumed_provider, setup.resumed_model, setup.resumed_effort, true) {
 		return true
 	}
 	if setup.provider_id != "" && setup.model_id != "" {
 		// The selection already in effect is reapplied; the snapshot carries any
 		// failure.
-		_ = apply_selection(app, setup.provider_id, setup.model_id, "")
+		_ = selection_apply_direct(app, setup.provider_id, setup.model_id, "", true)
 	}
 	return true
 }

@@ -217,6 +217,7 @@ Compact_Trigger :: enum {
 	// Provider_Overflow is a provider that refused the request as too large. It is the
 	// same work as an explicit request, asked for because nothing else made room.
 	Provider_Overflow,
+	Model_Switch,
 }
 
 // compact_trigger_explicit reports whether a trigger asks for a context change
@@ -225,7 +226,7 @@ Compact_Trigger :: enum {
 // summary was started for.
 compact_trigger_explicit :: proc(trigger: Compact_Trigger) -> bool {
 	switch trigger {
-	case .Agent_Tool, .User_Command, .Provider_Overflow:
+	case .Agent_Tool, .User_Command, .Provider_Overflow, .Model_Switch:
 		return true
 	case .None, .Pressure:
 		return false
@@ -247,6 +248,8 @@ chat_compact_start_notice :: proc(trigger: Compact_Trigger) -> string {
 		return "background compaction started: requested"
 	case .Provider_Overflow:
 		return "background compaction started: the provider rejected the context as too large"
+	case .Model_Switch:
+		return "background compaction started: preparing the requested model switch"
 	case .None:
 	}
 	return "background compaction started"
@@ -264,6 +267,8 @@ compact_trigger_name :: proc(trigger: Compact_Trigger) -> string {
 		return "user_command"
 	case .Provider_Overflow:
 		return "provider_overflow"
+	case .Model_Switch:
+		return "model_switch"
 	}
 	return "none"
 }
@@ -277,6 +282,13 @@ Compact_State :: enum {
 	// owner starts the next attempt.
 	Backoff,
 	Retiring,
+}
+
+Compact_Outcome :: enum {
+	None,
+	Installed,
+	Failed,
+	Canceled,
 }
 
 // Compact_Job is one summarization in flight. The worker owns everything it
@@ -325,27 +337,30 @@ Compact_Job :: struct {
 // Compact_Control is the owner-side view. Only the thread that drives the session
 // changes it; the worker never reads it.
 Compact_Control :: struct {
-	state:              Compact_State,
-	trigger:            Compact_Trigger,
-	job:                ^Compact_Job,
-	pending:            Compact_Trigger,
-	pending_source:     journal.Call_Id,
-	checkpoint:         journal.Node_Id,
-	last_failure_at:    time.Tick,
+	state:                Compact_State,
+	job_generation:       u64,
+	completed_generation: u64,
+	completed_outcome:    Compact_Outcome,
+	trigger:              Compact_Trigger,
+	job:                  ^Compact_Job,
+	pending:              Compact_Trigger,
+	pending_source:       journal.Call_Id,
+	checkpoint:           journal.Node_Id,
+	last_failure_at:      time.Tick,
 	// attempted is the newest node the last chain covered and attempted_identity is a
 	// digest of what it ran against. A fresh automatic snapshot starts only after the context
 	// has moved past that, or that configuration has changed: repeating the same work over the
 	// same bytes under the same settings cannot produce anything else. attempted_identity is a
 	// digest rather than the values, because the credential is a secret and a suppression key
 	// that carried it would be one too.
-	attempted:          journal.Node_Id,
-	attempted_identity: string, // owned
+	attempted:            journal.Node_Id,
+	attempted_identity:   string, // owned
 	// suppressed records a chain that ended for a reason no automatic start can fix: bad
 	// credentials, a spent quota, or a request the provider refuses. An explicit request clears
 	// it, because the user may have corrected whatever caused it.
-	suppressed:         bool,
+	suppressed:           bool,
 	// omitted_features are refused features that a later compaction has not yet confirmed.
-	omitted_features:   Optional_Request_Features,
+	omitted_features:     Optional_Request_Features,
 }
 
 Compact_Request_Result :: enum {
@@ -704,6 +719,7 @@ chat_compact_start :: proc(
 	control.job = job
 	control.state = .Running
 	control.trigger = trigger
+	control.job_generation += 1
 	// What this attempt saw, which is the whole context it was built from rather than the
 	// boundary it summarizes: the next automatic attempt has to see something newer.
 	if len(entries) > 0 { control.attempted = entries[len(entries) - 1].node }
@@ -851,6 +867,7 @@ chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
 	case .Retiring:
 		chat_finish_send(chat, job.request, job.attempts, {outcome = .Cancelled})
 		chat_compact_failed_job(control, job)
+		control.completed_outcome = .Canceled
 		_observer_message(observer, .Notice, "compaction cancelled")
 	case .Idle, .Ready, .Backoff:
 	}
@@ -881,6 +898,8 @@ chat_compact_abandon :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: 
 	control.trigger = .None
 	control.job = nil
 	control.state = .Idle
+	control.completed_generation = control.job_generation
+	control.completed_outcome = .Failed
 	if append(&chat.abandoned_compactions, job) != 1 {
 		// The list could not grow, so the job stays where it is with the worker that reaches it.
 		chat_runtime_message(chat, .Error, "an abandoned compaction could not be listed for reclaim and is leaked")
@@ -914,7 +933,10 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 	// A summary has to actually free room, or it would pay for a cache break and
 	// return nothing.
 	summary_estimate := len(summary) / CHAT_CHARS_PER_TOKEN + CHAT_MESSAGE_OVERHEAD_TOKENS
-	worthwhile := summary != "" && summary_estimate + CHAT_COMPACT_MIN_REDUCTION_TOKENS <= job.snapshot.head_estimate
+	worthwhile :=
+		summary != "" &&
+		(control.trigger == .Model_Switch && summary_estimate < job.snapshot.head_estimate ||
+				control.trigger != .Model_Switch && summary_estimate + CHAT_COMPACT_MIN_REDUCTION_TOKENS <= job.snapshot.head_estimate)
 
 	if !worthwhile {
 		reason := chat_compact_reason(job)
@@ -994,6 +1016,8 @@ chat_compact_destroy_job :: proc(control: ^Compact_Control, job: ^Compact_Job) {
 @(private)
 chat_compact_failed_job :: proc(control: ^Compact_Control, job: ^Compact_Job) {
 	control.last_failure_at = time.tick_now()
+	control.completed_generation = control.job_generation
+	control.completed_outcome = .Failed
 	chat_compact_destroy_job(control, job)
 }
 
@@ -1031,6 +1055,8 @@ chat_compact_install :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 		return false
 	}
 	control.checkpoint = node
+	control.completed_generation = control.job_generation
+	control.completed_outcome = .Installed
 	chat_compact_destroy_job(control, job)
 	// The measurement described the context that just went away, and so did the
 	// endpoint's report of it.
@@ -1091,7 +1117,7 @@ chat_compact_consider :: proc(chat: ^Chat_Session, observer: Chat_Observer, conn
 	} else if control.suppressed {
 		return
 	}
-	if !chat_compact_retry_allowed(control, trigger) { return }
+	if trigger != .Model_Switch && !chat_compact_retry_allowed(control, trigger) { return }
 	if !compact_trigger_explicit(trigger) && !chat_compact_progress(chat, connection, prep) { return }
 	if !chat_compact_start(chat, observer, connection, prep, trigger, control.pending_source) {
 		// A refusal is a failure like any other, so the next automatic attempt waits
@@ -1261,9 +1287,13 @@ chat_compact_cancel :: proc(chat: ^Chat_Session) {
 		job.stop_at = time.tick_now()
 		control.state = .Retiring
 	case .Ready:
+		control.completed_generation = control.job_generation
+		control.completed_outcome = .Canceled
 		chat_compact_destroy_job(control, job)
 	case .Backoff:
 		chat_retry_record_completed(chat, job.request, job.attempts, .Compaction, .Cancelled)
+		control.completed_generation = control.job_generation
+		control.completed_outcome = .Canceled
 		chat_compact_destroy_job(control, job)
 	case .Idle, .Retiring:
 	}

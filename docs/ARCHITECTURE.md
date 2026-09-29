@@ -523,7 +523,7 @@ artifacts(digest BLOB PRIMARY KEY, kind TEXT, created_ms INTEGER, bytes BLOB) ST
 
 | Class | Kinds (examples) | Rule |
 | --- | --- | --- |
-| Barrier | `session.created`, `branch.created`, `user.input`, `request.sent`, `response.committed`, `tool.admitted`, `tool.decision`, `tool.completed`, `lua.started`, `task.started`, `subagent.started`, `subagent.message`, `*.completed`, `checkpoint.installed`, `hook.applied` (when it changes model input), `rating.recorded`, `turn.completed` | `commit` before the dependent effect proceeds |
+| Barrier | `session.created`, `branch.created`, `user.input`, `request.sent`, `response.committed`, `tool.admitted`, `tool.decision`, `tool.completed`, `lua.started`, `task.started`, `subagent.started`, `subagent.message`, `*.completed`, `checkpoint.installed`, `hook.applied` (when it changes model input), `rating.recorded`, `selection.fit`, `selection.applied`, `turn.completed` | `commit` before the dependent effect proceeds |
 | Observation | `run.started`, `run.finished`, `session.claimed`, `session.released`, `request.prepared`, `request.admitted`, `provider.observed`, `tool.started`, `retry.scheduled`, `retry.completed`, `compaction.started`, `job.abandoned`, `job.reclaimed`, `cache.observed`, `resource.observed`, `hook.failed`, `runtime.message` | buffered; written in the next barrier transaction or when the batch reaches `JOURNAL_BATCH_RECORDS`, `JOURNAL_BATCH_BYTES`, or `JOURNAL_BATCH_AGE` |
 
 The owner is the only writer for its session. A commit is one short immediate transaction; no transaction spans a network operation or a wait. Results that publish together commit together. A failed commit latches `Storage_Failed`: admission stops, cleanup continues without the journal. A crash may lose buffered observations, never barriers.
@@ -554,7 +554,7 @@ config.published config.rejected catalog.published
 cache.observed resource.observed
 rating.recorded rating.cleared assessment.recorded
 runtime.message job.abandoned job.reclaimed
-selection.changed
+selection.changed selection.fit selection.applied
 subagent.message
 ```
 
@@ -1018,13 +1018,25 @@ The estimate is bytes / 4 plus 8 per message, reported per part (instructions, t
 
 - At most one per session: a `Compaction` job (tool-free provider request) over a frozen prefix through `F`, keeping the newest `COMPACT_KEEP_MESSAGES` and never splitting an assistant/results pair.
 - Compaction runs in the background and never pauses the agent. While the job runs, the turn keeps sending requests over the unchanged projection, so the provider prefix and its cache stay intact. Install swaps only the prefix through `F` for the summary: every node committed after `F`, including the steps the agent took while the summary was computed, stays in the projection after the checkpoint (section 10.3).
-- Triggers: estimate at `trigger`, explicit command or `context_compact`, proven provider overflow. Triggers coalesce. Automatic starts require new nodes since the last attempt and respect `COMPACT_COOLDOWN`. Auth, quota, and invalid-request failures suppress automatic starts until configuration or explicit intent changes.
-- A summary is accepted only with a normal stop reason, no tool calls, non-empty text, and a saving of at least `COMPACT_MIN_REDUCTION` tokens.
+- Triggers: estimate at `trigger`, explicit command or `context_compact`, proven provider overflow, pending selection that needs a smaller context. Triggers coalesce. Automatic starts require new nodes since the last attempt and respect `COMPACT_COOLDOWN`. Auth, quota, and invalid-request failures suppress automatic starts until configuration or explicit intent changes.
+- A summary is accepted only with a normal stop reason, no tool calls, non-empty text, and a saving of at least `COMPACT_MIN_REDUCTION` tokens. A pending selection accepts any strictly positive saving; the target fit check determines whether another summary is useful.
 - Install at a request boundary or while idle: verify base and coverage, commit the `Checkpoint` node (section 10.3) and `checkpoint.installed` in one transaction, reload the projection, reset the encode cache.
 - The foreground does not wait for a summary it does not need. When admission refuses, a ready candidate is installed and admission reruns; without one, the turn waits for a compaction and continues after the install. The turn ends with `Context_Exhausted` only when nothing a checkpoint can remove would make room, which is the model's window refusing the instructions and tools themselves; the user is told which part is too large.
 - The summary directive asks for goals, constraints, decisions with evidence, exact identifiers, current and pending work, failures, and unknowns, and tells the model to reload skills before relying on their details.
 
-### 23.3 Encode cache
+### 23.3 Session selection changes
+
+Model, provider, and API changes use one owner-controlled selection path. A frozen request keeps its original selection and connection until its borrows end; a new selection applies at a settled request boundary or while idle. Provider-native replay follows section 11.2, so switching APIs retains neutral conversation content without sending opaque replay to a different endpoint.
+
+Before applying a target, project the current instructions, tools, and conversation for the target API, provider, and model, and check its capacity with the same estimator and admission arithmetic used for requests. A refused switch leaves the current selection and foreground work unchanged. `selection.fit` records the target, API, estimate, window, output allowance, margin, and decision before the switch or compaction effect; a session whose first prompt has not created it yet has no row to carry one, and its first turn records the selection it starts with instead.
+
+An installed selection is recorded as session-scoped `selection.applied` before reporting success. The process-wide `selection.changed` default remains separate, so a change in an ACP session does not become the next interactive launch's default.
+
+The top-level Lua configuration option `compact_on_switch` defaults to false and is read at launch. When a target does not fit, the user receives a warning and the switch is refused. When enabled, keep the target pending and request the existing background compaction on the current selection. The foreground keeps working. After checkpoint installation, check the target again against the summary and all steps committed while compaction ran. Apply only if that second check fits. Another compaction is allowed only while the target estimate decreases; no progress or compaction failure refuses the pending switch and reports why, without stopping foreground work. Instructions and tools that cannot fit even without conversation refuse the switch without starting compaction.
+
+A newer selection request supersedes the pending target. It does not cancel a shared compaction that may still help the current selection. An effort-only change does not require compaction when the request representation and capacity are unchanged.
+
+### 23.4 Encode cache
 
 The `ai` encode cache keeps encoded fragments of unchanged messages. It is bounded by `ENCODE_CACHE_MAX_BYTES` and reset on checkpoint install, on a model or API change, and when its retained bytes exceed twice the last request body.
 

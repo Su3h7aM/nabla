@@ -193,6 +193,43 @@ test_lua_config_validates_disabled_models_and_reports_the_field :: proc(t: ^test
 }
 
 @(test)
+test_lua_config_loads_compact_on_switch :: proc(t: ^testing.T) {
+	directory, directory_error := os.make_directory_temp("", "nabla-config-compact-*", context.allocator)
+	if !testing.expect_value(t, directory_error, nil) { return }
+	defer delete(directory, context.allocator)
+	defer testing.expect_value(t, os.remove_all(directory), nil)
+	cases := []struct {
+		name:  string,
+		value: string,
+		want:  bool,
+	} {
+		{"absent without instructions", `return {}`, false},
+		{"absent with instructions", `return { instructions = {} }`, false},
+		{"true", `return { compact_on_switch = true }`, true},
+		{"false", `return { compact_on_switch = false }`, false},
+	}
+	for entry, index in cases {
+		path := fmt.aprintf("%s/%d.lua", directory, index, allocator = context.temp_allocator)
+		testing.expect(t, os.write_entire_file(path, transmute([]u8)entry.value) == nil)
+		sources, options, servers, err, detail := load_lua_config_full(path)
+		defer catalog_sources_destroy(&sources)
+		defer mcp_servers_destroy(&servers)
+		defer if detail != "" { delete(detail) }
+		testing.expect_value(t, err, Config_Error.None)
+		testing.expectf(t, options.compact_on_switch == entry.want, "%s: got %v want %v", entry.name, options.compact_on_switch, entry.want)
+	}
+
+	path := fmt.aprintf("%s/invalid.lua", directory, allocator = context.temp_allocator)
+	body := `return { compact_on_switch = "yes" }`
+	testing.expect(t, os.write_entire_file(path, transmute([]u8)body) == nil)
+	_, _, servers, err, detail := load_lua_config_full(path)
+	defer mcp_servers_destroy(&servers)
+	defer if detail != "" { delete(detail) }
+	testing.expect_value(t, err, Config_Error.Invalid)
+	testing.expect_value(t, detail, "compact_on_switch: expected boolean, got string")
+}
+
+@(test)
 test_lua_config_preserves_the_parser_message_and_line :: proc(t: ^testing.T) {
 	path := fmt.aprintf("/tmp/nabla-config-syntax-%d.lua", os.get_pid(), allocator = context.temp_allocator)
 	defer os.remove(path)

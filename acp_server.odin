@@ -15,6 +15,7 @@ import "core:time"
 import "nabla:acp"
 import "nabla:agent"
 import "nabla:agent/journal"
+import "nabla:ai"
 
 // The ACP agent front-end: one process, one session, one prompt turn at a time,
 // speaking the Agent Client Protocol on the streams it was given. The reader answers
@@ -37,7 +38,7 @@ Acp_Work_Kind :: enum {
 	Open_Session,
 	// Prompt runs one turn on the open session.
 	Prompt,
-	// Set_Model applies Buzz's model-selection extension on the worker thread.
+	// Set_Model identifies Buzz's v1 model-selection RPC.
 	Set_Model,
 	// Set_Config_Option applies the stable ACP model configuration method.
 	Set_Config_Option,
@@ -75,6 +76,25 @@ Acp_Work :: struct {
 
 Acp_Work_Chan :: chan.Chan(Acp_Work)
 
+// Acp_Model_Request is an ACP model-change intent handed from the reader to the
+// session owner. Its strings are server-allocator owned until settled.
+Acp_Model_Request :: struct {
+	active:             bool,
+	kind:               Acp_Work_Kind,
+	id:                 acp.Jsonrpc_Id,
+	model_id:           string,
+	session_generation: u64,
+}
+
+Acp_Model_Selection :: struct {
+	active:             bool,
+	kind:               Acp_Work_Kind,
+	id:                 acp.Jsonrpc_Id,
+	session_generation: u64,
+	target:             agent.Model_Selection,
+	transition:         agent.Selection_Transition,
+}
+
 // Acp_Server is the whole front-end: the harness runtime, the writer, the worker, and
 // the little of the protocol's own state that is not the harness's.
 Acp_Wire_Profile :: enum {
@@ -111,6 +131,258 @@ acp_queue_remove :: proc(server: ^Acp_Server) {
 		sync.atomic_store(&server.busy, false)
 	}
 	sync.mutex_unlock(&server.queue_mu)
+}
+
+acp_model_request_destroy :: proc(request: ^Acp_Model_Request, allocator: mem.Allocator) {
+	switch id in request.id {
+	case string:
+		delete(id, allocator)
+	case i64, f64, acp.Jsonrpc_Null:
+	}
+	delete(request.model_id, allocator)
+	request^ = {}
+}
+
+// acp_model_request_submit replaces only a not-yet-claimed intent. The caller transfers
+// ownership whether it is superseded or accepted.
+acp_model_request_submit :: proc(server: ^Acp_Server, request: Acp_Model_Request) {
+	sync.mutex_lock(&server.model_mu)
+	previous := server.model_request
+	server.model_request = request
+	server.model_cancel = false
+	sync.mutex_unlock(&server.model_mu)
+	if previous.active {
+		_ = acp.writer_write_error(&server.writer, previous.id, acp.ERROR_INVALID_REQUEST, "a newer model selection replaced this request")
+		acp_model_request_destroy(&previous, server.alloc)
+	}
+	agent.owner_wake_signal()
+}
+
+@(require_results)
+acp_model_request_take :: proc(server: ^Acp_Server) -> Acp_Model_Request {
+	sync.mutex_lock(&server.model_mu)
+	request := server.model_request
+	server.model_request = {}
+	sync.mutex_unlock(&server.model_mu)
+	return request
+}
+
+@(require_results)
+acp_model_request_pending :: proc(server: ^Acp_Server) -> bool {
+	sync.mutex_lock(&server.model_mu)
+	pending := server.model_request.active
+	sync.mutex_unlock(&server.model_mu)
+	return pending
+}
+
+@(require_results)
+acp_model_owner_work_pending :: proc(server: ^Acp_Server) -> bool {
+	sync.mutex_lock(&server.model_mu)
+	pending := server.model_request.active || server.model_cancel
+	sync.mutex_unlock(&server.model_mu)
+	return pending
+}
+
+acp_model_cancel_signal :: proc(server: ^Acp_Server) {
+	sync.mutex_lock(&server.model_mu)
+	server.model_cancel = true
+	sync.mutex_unlock(&server.model_mu)
+	agent.owner_wake_signal()
+}
+
+@(require_results)
+acp_model_cancel_take :: proc(server: ^Acp_Server) -> (bool, Acp_Model_Request) {
+	sync.mutex_lock(&server.model_mu)
+	cancel := server.model_cancel
+	server.model_cancel = false
+	request: Acp_Model_Request
+	if cancel {
+		request = server.model_request
+		server.model_request = {}
+	}
+	sync.mutex_unlock(&server.model_mu)
+	return cancel, request
+}
+
+acp_model_selection_cancel :: proc(server: ^Acp_Server, request: Acp_Model_Request) {
+	owned_request := request
+	if owned_request.active {
+		_ = acp.writer_write_error(&server.writer, owned_request.id, acp.ERROR_INVALID_REQUEST, "the model selection was canceled before it could be applied")
+		acp_model_request_destroy(&owned_request, server.alloc)
+	}
+	if server.model_selection.active {
+		acp_model_selection_error(server, &server.model_selection, acp.ERROR_INVALID_REQUEST, "the model selection was canceled before it could be applied")
+	}
+}
+
+acp_model_selection_destroy :: proc(server: ^Acp_Server, selection: ^Acp_Model_Selection) {
+	if selection.active {
+		switch id in selection.id {
+		case string:
+			delete(id, server.alloc)
+		case i64, f64, acp.Jsonrpc_Null:
+		}
+		agent.model_selection_destroy(&selection.target, server.app.setup.alloc)
+	}
+	selection^ = {}
+}
+
+acp_model_selection_error :: proc(server: ^Acp_Server, selection: ^Acp_Model_Selection, code: i64, message: string) {
+	if !selection.active { return }
+	_ = acp.writer_write_error(&server.writer, selection.id, code, message)
+	acp_model_selection_destroy(server, selection)
+}
+
+// acp_model_request_resolve takes the newest reader handoff and resolves it once on the
+// session owner. The target owns its catalog-derived strings through installation.
+acp_model_request_resolve :: proc(server: ^Acp_Server) {
+	request := acp_model_request_take(server)
+	if !request.active { return }
+	if server.model_selection.active {
+		acp_model_selection_error(server, &server.model_selection, acp.ERROR_INVALID_REQUEST, "a newer model selection replaced this request")
+	}
+	sync.mutex_lock(&server.mu)
+	valid := request.session_generation == server.session_generation && server.session_id != "" && !server.closing
+	sync.mutex_unlock(&server.mu)
+	if !valid {
+		_ = acp.writer_write_error(&server.writer, request.id, acp.ERROR_INVALID_PARAMS, "the session changed before the model selection could run")
+		acp_model_request_destroy(&request, server.alloc)
+		return
+	}
+	app := &server.app
+	provider_id := ""
+	provider_error := false
+	sync.mutex_lock(&app.catalog_mu)
+	for provider in app.setup.catalog.providers {
+		if _, found := agent.catalog_find_model(&app.setup.catalog, provider.id, request.model_id); !found { continue }
+		provider_copy, clone_error := strings.clone(provider.id, app.setup.alloc)
+		provider_id = provider_copy
+		provider_error = clone_error != nil
+		break
+	}
+	sync.mutex_unlock(&app.catalog_mu)
+	if provider_error {
+		_ = acp.writer_write_error(&server.writer, request.id, acp.ERROR_INTERNAL, "the provider id could not be allocated")
+		acp_model_request_destroy(&request, server.alloc)
+		return
+	}
+	if provider_id == "" {
+		_ = acp.writer_write_error(&server.writer, request.id, acp.ERROR_INVALID_PARAMS, fmt.tprintf("the model %q is not available", request.model_id))
+		acp_model_request_destroy(&request, server.alloc)
+		return
+	}
+	defer delete(provider_id, app.setup.alloc)
+	target, problem := selection_target_resolve(app, provider_id, request.model_id, app.setup.alloc)
+	defer if problem != "" { delete(problem, context.temp_allocator) }
+	if target.provider_id == "" {
+		_ = acp.writer_write_error(&server.writer, request.id, acp.ERROR_INVALID_PARAMS, problem)
+		acp_model_request_destroy(&request, server.alloc)
+		return
+	}
+	request_id := request.id
+	request.id = ""
+	delete(request.model_id, server.alloc)
+	request.model_id = ""
+	server.model_selection = Acp_Model_Selection {
+		active             = true,
+		kind               = request.kind,
+		id                 = request_id,
+		session_generation = request.session_generation,
+		target             = target,
+	}
+	request = {}
+}
+
+// acp_model_selection_service checks a pending target at an owner boundary or while
+// idle. The transition is caller-owned state and remains with the target while pending.
+acp_model_selection_service :: proc(server: ^Acp_Server) -> ai.Provider_Connection {
+	cancel, request := acp_model_cancel_take(server)
+	if cancel {
+		acp_model_selection_cancel(server, request)
+		return server.app.run.connection
+	}
+	if acp_model_request_pending(server) { acp_model_request_resolve(server) }
+	selection := &server.model_selection
+	if !selection.active { return server.app.run.connection }
+	sync.mutex_lock(&server.mu)
+	valid := selection.session_generation == server.session_generation && server.session_id != "" && !server.closing
+	sync.mutex_unlock(&server.mu)
+	if !valid {
+		acp_model_selection_error(server, selection, acp.ERROR_INVALID_PARAMS, "the session changed before the model selection could be applied")
+		return server.app.run.connection
+	}
+	status, problem, selection_error := agent.chat_selection_check(
+		&server.app.setup.session,
+		selection.target,
+		&selection.transition,
+		server.app.compact_on_switch,
+		server.app.run.connection,
+	)
+	defer if problem != "" { delete(problem, context.temp_allocator) }
+	if selection_error != nil {
+		detail := journal.error_text(selection_error, context.temp_allocator)
+		server.app.setup.session.storage_failed = true
+		acp_model_selection_error(server, selection, acp.ERROR_INTERNAL, fmt.tprintf("the model switch could not be recorded: %s", detail))
+		return server.app.run.connection
+	}
+	switch status {
+	case .Pending:
+		return server.app.run.connection
+	case .Refused:
+		message := problem
+		if message == "" { message = "the model selection was refused" }
+		acp_model_selection_error(server, selection, acp.ERROR_INVALID_PARAMS, message)
+	case .Ready:
+		cancel_before_install, request_before_install := acp_model_cancel_take(server)
+		if cancel_before_install {
+			acp_model_selection_cancel(server, request_before_install)
+			return server.app.run.connection
+		}
+		if acp_model_request_pending(server) { return server.app.run.connection }
+		model_id := selection.target.model_id
+		installed := selection_install(&server.app, selection.target, "", false)
+		if !installed {
+			acp_model_selection_error(server, selection, acp.ERROR_INTERNAL, "the selected model could not be installed durably")
+			return server.app.run.connection
+		}
+		if selection.kind == .Set_Model {
+			_ = acp.writer_write_response(&server.writer, selection.id, acp.Session_Set_Model_Result{session_id = acp_session_id(server), model_id = model_id})
+		} else if acp_is_v2(server) {
+			v2_options, options_ok := acp_model_config_options_v2(server)
+			if !options_ok {
+				acp_model_selection_error(
+					server,
+					selection,
+					acp.ERROR_INTERNAL,
+					"the model was installed but its configuration response could not be allocated",
+				)
+				return server.app.run.connection
+			}
+			_ = acp.writer_write_response(&server.writer, selection.id, acp.V2_Session_Set_Config_Option_Result{config_options = v2_options})
+		} else {
+			v1_options, options_ok := acp_model_config_options_v1(server)
+			if !options_ok {
+				acp_model_selection_error(
+					server,
+					selection,
+					acp.ERROR_INTERNAL,
+					"the model was installed but its configuration response could not be allocated",
+				)
+				return server.app.run.connection
+			}
+			_ = acp.writer_write_response(&server.writer, selection.id, acp.V1_Session_Set_Config_Option_Result{config_options = v1_options})
+		}
+		acp_model_selection_destroy(server, selection)
+	}
+	return server.app.run.connection
+}
+
+acp_model_selection_steer :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
+	server := cast(^Acp_Server)steer.apply_data
+	_ = acp_model_selection_service(server)
+	sync.mutex_lock(&server.app.run.mu)
+	defer sync.mutex_unlock(&server.app.run.mu)
+	return server.app.run.connection
 }
 
 acp_capture_session_generation :: proc(server: ^Acp_Server) -> u64 {
@@ -163,6 +435,14 @@ acp_invalidate_published_session :: proc(server: ^Acp_Server) {
 	sync.mutex_unlock(&server.mu)
 	delete(server.active_message_id, server.alloc)
 	server.active_message_id = ""
+	request := acp_model_request_take(server)
+	if request.active {
+		_ = acp.writer_write_error(&server.writer, request.id, acp.ERROR_INVALID_PARAMS, "the session changed before the model selection could be applied")
+		acp_model_request_destroy(&request, server.alloc)
+	}
+	if server.model_selection.active {
+		acp_model_selection_error(server, &server.model_selection, acp.ERROR_INVALID_PARAMS, "the session changed before the model selection could be applied")
+	}
 }
 
 Acp_Server :: struct {
@@ -191,6 +471,11 @@ Acp_Server :: struct {
 	session_title:      string, // owned; the client-supplied title for the open session
 	session_generation: u64, // changes whenever the open session is replaced or closed
 	closing:            bool, // a close request has been admitted and invalidates queued work
+	// model_mu guards only the single pending reader-to-owner handoff.
+	model_mu:           sync.Mutex,
+	model_request:      Acp_Model_Request,
+	model_cancel:       bool, // owner should settle all current model-selection RPCs
+	model_selection:    Acp_Model_Selection, // owner only
 	// message_seq numbers process-local fallback messages. The v2 live assistant id
 	// is derived from the durable turn and request instead, so replay can reproduce it.
 	message_seq:        u64,
@@ -262,6 +547,24 @@ acp_server_destroy :: proc(server: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIEN
 		acp_work_destroy(&queued, server.alloc)
 	}
 	if server.work != {} { chan.destroy(&server.work) }
+	request := acp_model_request_take(server)
+	if request.active {
+		_ = acp.writer_write_error(
+			&server.writer,
+			request.id,
+			acp.ERROR_INVALID_REQUEST,
+			"the ACP session is shutting down before the model selection could be applied",
+		)
+		acp_model_request_destroy(&request, server.alloc)
+	}
+	if server.model_selection.active {
+		acp_model_selection_error(
+			server,
+			&server.model_selection,
+			acp.ERROR_INVALID_REQUEST,
+			"the ACP session is shutting down before the model selection could be applied",
+		)
+	}
 	if !acp.writer_destroy(&server.writer, patience) {
 		fmt.eprintln("nabla: the ACP writer thread did not stop in time; the process leaves it running")
 	}
@@ -311,8 +614,29 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 					continue
 				}
 			}
-			work, ok = chan.recv(server.work)
-			if !ok { break }
+			model_pending := acp_model_owner_work_pending(server) || server.model_selection.active
+			if model_pending {
+				_ = acp_model_selection_service(server)
+			}
+			compact_pending := server.app.setup.session.store != nil && server.app.setup.session.compact.state != agent.Compact_State.Idle
+			if model_pending || compact_pending {
+				if compact_pending {
+					observer := acp_observer(server)
+					_ = agent.chat_compact_idle_service(&server.app.setup.session, observer, server.app.run.connection)
+					if server.model_selection.active {
+						_ = acp_model_selection_service(server)
+						if server.app.setup.session.compact.state != agent.Compact_State.Idle {
+							_ = agent.chat_compact_idle_service(&server.app.setup.session, observer, server.app.run.connection)
+						}
+					}
+				}
+				free_all(context.temp_allocator)
+				agent.owner_wake_wait(seen, agent.chat_compact_deadline(&server.app.setup.session))
+				continue
+			}
+			free_all(context.temp_allocator)
+			agent.owner_wake_wait(seen, nil)
+			continue
 		}
 		acp_run_work(server, work)
 		acp_work_destroy(&work, server.alloc)
@@ -334,7 +658,7 @@ acp_run_work :: proc(server: ^Acp_Server, work: Acp_Work) {
 		case .Prompt:
 			acp_work_prompt(server, work)
 		case .Set_Model:
-			acp_work_set_model(server, work)
+			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_REQUEST, "model selection must be handled by the session owner")
 		case .Set_Config_Option:
 			acp_work_set_config_option(server, work)
 		case .List_Sessions:
@@ -550,12 +874,20 @@ acp_session_open :: proc(server: ^Acp_Server, workspace: string, start: Session_
 acp_session_select_model :: proc(server: ^Acp_Server) {
 	app := &server.app
 	if app.setup.resumed_provider != "" && app.setup.resumed_model != "" {
-		if apply_selection(app, app.setup.resumed_provider, app.setup.resumed_model, "") { return }
+		if acp_selection_install(server, app.setup.resumed_provider, app.setup.resumed_model, "") { return }
 	}
 	if app.setup.provider_id != "" && app.setup.model_id != "" {
-		if apply_selection(app, app.setup.provider_id, app.setup.model_id, "") { return }
+		if acp_selection_install(server, app.setup.provider_id, app.setup.model_id, "") { return }
 	}
 	if app.setup.model_id == "" { _ = acp_select_first_model(server) }
+}
+
+acp_selection_install :: proc(server: ^Acp_Server, provider_id, model_id, effort: string) -> bool {
+	target, problem := selection_target_resolve(&server.app, provider_id, model_id, server.app.setup.alloc)
+	defer if problem != "" { delete(problem, context.temp_allocator) }
+	if target.model_id == "" { return false }
+	defer agent.model_selection_destroy(&target, server.app.setup.alloc)
+	return selection_install(&server.app, target, effort, false)
 }
 
 // acp_select_startup_model chooses the model this process runs with: the user's own last
@@ -568,7 +900,7 @@ acp_select_startup_model :: proc(server: ^Acp_Server) -> bool {
 	selection, found, load_err := selection_latest(app.setup.store, app.run.alloc)
 	defer selection_destroy(&selection, app.run.alloc)
 	if load_err == nil && found {
-		if apply_selection(app, selection.provider, selection.model, selection.effort) { return true }
+		if acp_selection_install(server, selection.provider, selection.model, selection.effort) { return true }
 	}
 	return acp_select_first_model(server)
 }
@@ -585,7 +917,7 @@ acp_select_first_model :: proc(server: ^Acp_Server) -> bool {
 	if !candidates_ok { return false }
 	defer acp_candidates_destroy(candidates, app.run.alloc)
 	for candidate in candidates {
-		if apply_selection(app, candidate.provider_id, candidate.model_id, "") { return true }
+		if acp_selection_install(server, candidate.provider_id, candidate.model_id, "") { return true }
 	}
 	return false
 }
@@ -638,29 +970,9 @@ acp_servable_models :: proc(app: ^App, allocator: mem.Allocator) -> ([dynamic]Mo
 
 // --- running a prompt --------------------------------------------------------
 
-@(require_results)
-acp_apply_model_id :: proc(server: ^Acp_Server, model_id: string) -> bool {
-	app := &server.app
-	for provider in app.setup.catalog.providers {
-		if _, found := agent.catalog_find_model(&app.setup.catalog, provider.id, model_id); !found { continue }
-		if apply_selection(app, provider.id, model_id, "") { return true }
-	}
-	return false
-}
-
-acp_work_set_model :: proc(server: ^Acp_Server, work: Acp_Work) {
-	if acp_apply_model_id(server, work.model_id) {
-		_ = acp.writer_write_response(&server.writer, work.id, acp.Session_Set_Model_Result{session_id = acp_session_id(server), model_id = work.model_id})
-		return
-	}
-	_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_PARAMS, fmt.tprintf("the model %q is not available", work.model_id))
-}
-
 acp_work_set_config_option :: proc(server: ^Acp_Server, work: Acp_Work) {
 	applied := false
-	if work.config_id == "model" {
-		applied = acp_apply_model_id(server, work.config_value)
-	} else if work.config_id == "effort" {
+	if work.config_id == "effort" {
 		applied = agent.chat_session_set_effort(&server.app.setup.session, work.config_value)
 	}
 	if !applied {
@@ -854,7 +1166,18 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 	// so an unrecorded completion is corrected to a failure below.
 	chat.catalog = app_catalog_ref(&server.app)
 	observer := acp_observer(server)
-	turn_completed := agent.chat_run_turn_steered(chat, server.app.run.connection, agent.chat_retry_policy_default(), observer, nil, &server.app.run.control)
+	steer := agent.Steer_Context {
+		apply      = acp_model_selection_steer,
+		apply_data = server,
+	}
+	turn_completed := agent.chat_run_turn_steered(
+		chat,
+		server.app.run.connection,
+		agent.chat_retry_policy_default(),
+		observer,
+		&steer,
+		&server.app.run.control,
+	)
 	if acp_is_v2(server) {
 		acp_v2_turn_end(server, turn_completed)
 		return
@@ -918,7 +1241,18 @@ acp_report_turn :: proc(server: ^Acp_Server) -> bool {
 	acp_clear_active_message_id(server)
 	_ = acp_send_state(server, "running", "")
 	chat.catalog = app_catalog_ref(&server.app)
-	turn_completed := agent.chat_run_turn_steered(chat, server.app.run.connection, agent.chat_retry_policy_default(), observer, nil, &server.app.run.control)
+	steer := agent.Steer_Context {
+		apply      = acp_model_selection_steer,
+		apply_data = server,
+	}
+	turn_completed := agent.chat_run_turn_steered(
+		chat,
+		server.app.run.connection,
+		agent.chat_retry_policy_default(),
+		observer,
+		&steer,
+		&server.app.run.control,
+	)
 	acp_v2_turn_end(server, turn_completed)
 	return true
 }

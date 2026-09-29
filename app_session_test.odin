@@ -91,6 +91,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 	delete(app.setup.workspace, app.setup.alloc)
 	delete(app.setup.resumed_provider, app.setup.alloc)
 	delete(app.setup.resumed_model, app.setup.alloc)
+	delete(app.setup.resumed_effort, app.setup.alloc)
 	delete(app.setup.provider_id, app.setup.alloc)
 	delete(app.setup.model_id, app.setup.alloc)
 	delete(app.setup.credential, app.setup.alloc)
@@ -110,6 +111,7 @@ attach_setup_destroy :: proc(setup: ^Run_Setup) {
 	delete(setup.workspace, setup.alloc)
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
+	delete(setup.resumed_effort, setup.alloc)
 	delete(setup.journal_directory, setup.alloc)
 	delete(setup.lock_directory, setup.alloc)
 	setup^ = {}
@@ -340,7 +342,7 @@ app_workspace_make :: proc(t: ^testing.T) -> string {
 	return path
 }
 
-// app_test_catalog is the smallest catalog apply_selection can resolve: one
+// app_test_catalog is the smallest catalog selection_install can apply: one
 // usable provider with a literal credential, and one model that states its
 // window and supports tools. It goes through resolve_catalog rather than filling
 // the resolved lists directly, so a fixture cannot diverge from what resolution
@@ -930,7 +932,7 @@ test_a_headless_turn_answers_against_an_endpoint :: proc(t: ^testing.T) {
 	app: App
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
-	// The chat is configured the way apply_selection would leave it, because this
+	// The chat is configured the way selection_install would leave it, because this
 	// test is about the turn rather than about choosing a model.
 	app.setup.session.provider_id = strings.clone("test-provider", app.setup.session.allocator)
 	app.setup.session.model_id = strings.clone("test-model", app.setup.session.allocator)
@@ -1280,7 +1282,7 @@ test_catalog_refresh_enriches_the_active_selection :: proc(t: ^testing.T) {
 	stage_two, stage_two_err := agent.resolve_catalog(user, provider, {}, app.setup.alloc)
 	if !testing.expect_value(t, stage_two_err, agent.Catalog_Error.None) { return }
 	app.setup.catalog = stage_two
-	testing.expect(t, apply_selection(&app, "test-provider", "discovered-model", ""))
+	testing.expect(t, selection_apply_direct(&app, "test-provider", "discovered-model", "", true))
 	testing.expect_value(t, len(app.setup.session.effort_levels), 0)
 	notices := len(app.run.snap.entries)
 
@@ -1301,5 +1303,113 @@ test_catalog_refresh_enriches_the_active_selection :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(app.run.snap.entries), notices)
 }
 
-// A selection the user asks for is recorded, not applied: the turn owns the session
-// until its next request boundary, so the choice waits in run state for whichever
+// A fitting model switch is applied only after its fit decision and applied identity
+// are committed, while a refusal leaves the active connection untouched.
+app_test_switch_catalog :: proc(allocator: mem.Allocator, target_window: int) -> agent.Catalog {
+	sources := []agent.Catalog_Provider_Source {
+		{
+			id = "test-provider",
+			base_url_present = true,
+			base_url = "http://127.0.0.1:1",
+			api_present = true,
+			api = "openai_chat_completions",
+			api_key_present = true,
+			api_key = "test-key",
+			models = []agent.Catalog_Model_Source {
+				{
+					id = "test-model",
+					context_window_present = true,
+					context_window = 128_000,
+					max_output_tokens_present = true,
+					max_output_tokens = 4_096,
+					tools_present = true,
+					tools = true,
+				},
+				{
+					id = "target-model",
+					api_present = true,
+					api = "openai_responses",
+					context_window_present = true,
+					context_window = target_window,
+					max_output_tokens_present = true,
+					max_output_tokens = 4_096,
+					tools_present = true,
+					tools = true,
+				},
+			},
+		},
+	}
+	catalog, _ := agent.resolve_catalog(sources, {}, {}, allocator)
+	return catalog
+}
+
+app_test_selection_request :: proc(app: ^App, provider, model: string) {
+	provider_copy := strings.clone(provider, app.run.alloc)
+	model_copy := strings.clone(model, app.run.alloc)
+	app.run.pending = Pending_Selection {
+		present  = true,
+		provider = provider_copy,
+		model    = model_copy,
+	}
+}
+
+@(test)
+test_mid_session_selection_refusal_keeps_the_active_model :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.owns_selection = true
+	app.setup.catalog = app_test_switch_catalog(app.setup.alloc, 8)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	app.setup.session.catalog = app_catalog_ref(&app)
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+	previous_api := app.run.connection.API
+	app_test_selection_request(&app, "test-provider", "target-model")
+	testing.expect(t, !app_selection_service(&app))
+	testing.expect_value(t, app.setup.model_id, "test-model")
+	testing.expect_value(t, app.run.connection.API, previous_api)
+	testing.expect(t, strings.contains(app.run.snap.setup_error, "target"), "the refusal must explain why the switch did not run")
+}
+
+@(test)
+test_mid_session_selection_commits_the_fitting_target_before_publish :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.owns_selection = true
+	app.setup.catalog = app_test_switch_catalog(app.setup.alloc, 128_000)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	app.setup.session.catalog = app_catalog_ref(&app)
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+	app_test_selection_request(&app, "test-provider", "target-model")
+	if !testing.expect(t, app_selection_service(&app), "a fitting selection should install at the safe boundary") { return }
+	testing.expect_value(t, app.setup.model_id, "target-model")
+	testing.expect_value(t, app.run.connection.API, ai.API_Kind.OpenAI_Responses)
+	record, found, read_error := journal.read_latest(app.setup.store, {session = app.setup.session.session, kinds = {.Selection_Applied}}, context.allocator)
+	if !testing.expect(t, read_error == nil && found, "the installed selection must be durable before publishing success") { return }
+	defer journal.record_destroy(&record, context.allocator)
+	applied: journal.Selection_Applied
+	if !testing.expect_value(t, journal.payload_decode(record.data, &applied, context.temp_allocator), nil) { return }
+	testing.expect_value(t, applied.provider, "test-provider")
+	testing.expect_value(t, applied.model, "target-model")
+	testing.expect_value(t, applied.api, agent.chat_api_name(ai.API_Kind.OpenAI_Responses))
+}
+
+@(test)
+test_resume_restores_an_installed_selection_without_a_later_turn :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.catalog = app_test_switch_catalog(app.setup.alloc, 128_000)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	app.setup.session.catalog = app_catalog_ref(&app)
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+	app_test_selection_request(&app, "test-provider", "target-model")
+	if !testing.expect(t, app_selection_service(&app)) { return }
+	session := app.setup.session.session
+	if !testing.expect(t, session_switch(&app, {kind = .New})) { return }
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+	if !testing.expect(t, session_switch(&app, {kind = .Resume_Id, id = app_session_id_text(session)})) { return }
+	testing.expect_value(t, app.setup.session.model_id, "target-model")
+	testing.expect_value(t, app.run.connection.API, ai.API_Kind.OpenAI_Responses)
+}

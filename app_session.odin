@@ -1,6 +1,7 @@
 #+build linux
 package main
 
+import "base:runtime"
 import "core:fmt"
 import "core:io"
 import "core:mem"
@@ -41,6 +42,7 @@ Run_Setup :: struct {
 	// when no selection exists anywhere else.
 	resumed_provider:  string, // owned,
 	resumed_model:     string, // owned,
+	resumed_effort:    string, // owned,
 	// configured holds the provider ids the user's own configuration declares;
 	// models.dev also contributes providers, and the model menu offers only the
 	// configured ones, whose credentials the user actually set up.
@@ -62,6 +64,8 @@ Run_Setup :: struct {
 
 App :: struct {
 	setup:                      Run_Setup,
+	// compact_on_switch is the launch's fixed policy for fitting explicit model changes.
+	compact_on_switch:          bool,
 	// catalog_mu protects publication of a replacement catalog. A publication
 	// releases the catalog it replaces, so anything read out of a catalog is either
 	// copied while the lock is held or owned by this run.
@@ -297,6 +301,7 @@ Opened_Session :: struct {
 	// provider and model are what the session's last turn ran with, "" for a new session.
 	provider:  string,
 	model:     string,
+	effort:    string,
 	recovery:  journal.Recovery,
 }
 
@@ -306,6 +311,7 @@ opened_session_destroy :: proc(opened: ^Opened_Session, allocator: mem.Allocator
 	delete(opened.workspace, allocator)
 	delete(opened.provider, allocator)
 	delete(opened.model, allocator)
+	delete(opened.effort, allocator)
 	opened^ = {}
 }
 
@@ -377,19 +383,49 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 	opened.branch, opened.head, head_error = journal.session_head(opened.store, summary.id)
 	if head_error != nil { return opened, session_error_message("cannot read the session", head_error, allocator), false }
 
-	latest, found, read_error := journal.read_latest(opened.store, {session = summary.id, kinds = {.Turn_Started}}, allocator)
-	if read_error != nil { return opened, session_error_message("cannot read the session", read_error, allocator), false }
-	defer journal.record_destroy(&latest, allocator)
-	if found {
-		provider, provider_error := strings.clone(latest.provider, allocator)
-		model, model_error := strings.clone(latest.model, allocator)
-		if provider_error != nil || model_error != nil {
+	selection_record, selection_found, read_error := journal.read_latest(opened.store, {session = summary.id, kinds = {.Selection_Applied}}, allocator)
+	if read_error != nil { return opened, session_error_message("cannot read the session selection", read_error, allocator), false }
+	if selection_found {
+		defer journal.record_destroy(&selection_record, allocator)
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		selection: journal.Selection_Applied
+		if decode_error := journal.payload_decode(
+			selection_record.data,
+			&selection,
+			context.temp_allocator,
+			corruption_journal = opened.store,
+			session = selection_record.session,
+			seq = selection_record.seq,
+		); decode_error != nil {
+			return opened, session_error_message("cannot read the session selection", decode_error, allocator), false
+		}
+		provider, provider_error := strings.clone(selection.provider, allocator)
+		model, model_error := strings.clone(selection.model, allocator)
+		effort, effort_error := strings.clone(selection.effort, allocator)
+		if provider_error != nil || model_error != nil || effort_error != nil {
 			delete(provider, allocator)
 			delete(model, allocator)
+			delete(effort, allocator)
 			return opened, fmt.aprintf("the session's model could not be stored", allocator = allocator), false
 		}
 		opened.provider = provider
 		opened.model = model
+		opened.effort = effort
+	} else {
+		latest, found, turn_read_error := journal.read_latest(opened.store, {session = summary.id, kinds = {.Turn_Started}}, allocator)
+		if turn_read_error != nil { return opened, session_error_message("cannot read the session", turn_read_error, allocator), false }
+		defer journal.record_destroy(&latest, allocator)
+		if found {
+			provider, provider_error := strings.clone(latest.provider, allocator)
+			model, model_error := strings.clone(latest.model, allocator)
+			if provider_error != nil || model_error != nil {
+				delete(provider, allocator)
+				delete(model, allocator)
+				return opened, fmt.aprintf("the session's model could not be stored", allocator = allocator), false
+			}
+			opened.provider = provider
+			opened.model = model
+		}
 	}
 	workspace, workspace_error := strings.clone(summary.workspace, allocator)
 	if workspace_error != nil {
@@ -419,11 +455,13 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 	delete(setup.workspace, setup.alloc)
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
+	delete(setup.resumed_effort, setup.alloc)
 	setup.store = opened.store
 	setup.run_open = true
 	setup.workspace = opened.workspace
 	setup.resumed_provider = opened.provider
 	setup.resumed_model = opened.model
+	setup.resumed_effort = opened.effort
 	opened^ = {}
 	setup.session = new_session
 	if agent.chat_session_apply_harness(&setup.session, setup.harness_options).kind != .None {
@@ -506,6 +544,20 @@ selection_record :: proc(store: ^journal.Journal, provider, model, effort: strin
 	return commit_error
 }
 
+@(require_results)
+selection_applied_record :: proc(store: ^journal.Journal, session: journal.Session_Id, api: ai.API_Kind, provider, model, effort: string) -> journal.Error {
+	// A session nobody prompted is created by its first prompt, so there is nowhere to
+	// keep what it would say yet; its first turn records the selection instead.
+	if store == nil || store.claimed != session { return nil }
+	journal.append_record(
+		store,
+		{session = session, kind = .Selection_Applied, provider = provider, model = model},
+		journal.Selection_Applied{version = 1, api = agent.chat_api_name(api), provider = provider, model = model, effort = effort},
+	)
+	_, commit_error := journal.commit(store)
+	return commit_error
+}
+
 // selection_latest reads the model the user last chose, owned by allocator.
 @(require_results)
 selection_latest :: proc(store: ^journal.Journal, allocator: mem.Allocator) -> (selection: journal.Selection_Changed, found: bool, error: journal.Error) {
@@ -547,6 +599,20 @@ pending_selection_clear :: proc(pending: ^Pending_Selection, allocator: mem.Allo
 	pending^ = {}
 }
 
+pending_target_clear :: proc(pending: ^Pending_Target, allocator: mem.Allocator) {
+	if pending.present { agent.model_selection_destroy(&pending.target, allocator) }
+	pending^ = {}
+}
+
+selection_intent_clear :: proc(app: ^App) {
+	sync.mutex_lock(&app.run.mu)
+	pending := app.run.pending
+	app.run.pending = {}
+	sync.mutex_unlock(&app.run.mu)
+	pending_selection_clear(&pending, app.run.alloc)
+	pending_target_clear(&app.run.pending_target, app.run.alloc)
+}
+
 // selection_request records the selection the user asked for and wakes the worker. The
 // choice cannot travel in the work item, because a turn owns the session until its next
 // request boundary and applying a selection edits the session, so it waits in run state
@@ -562,28 +628,92 @@ selection_request :: proc(app: ^App, provider_id, model_id: string) {
 		return
 	}
 	sync.mutex_lock(&app.run.mu)
-	pending_selection_clear(&app.run.pending, app.run.alloc)
+	previous := app.run.pending
 	app.run.pending = Pending_Selection {
 		present  = true,
 		provider = provider,
 		model    = model,
 	}
 	sync.mutex_unlock(&app.run.mu)
+	pending_selection_clear(&previous, app.run.alloc)
 	enqueue(app, .Model)
 }
 
-// apply_pending_selection installs the pending selection, if there is one, and says
-// whether it did. Taking the intent under the lock is what makes it apply once: the idle
-// path and the turn boundary both call this, and whoever takes it takes it for good.
-apply_pending_selection :: proc(app: ^App) -> bool {
+// app_selection_service resolves and fits the newest explicit intent at a safe owner
+// boundary. A pending fit stays owned here while background compaction advances.
+@(require_results)
+app_selection_service :: proc(app: ^App) -> bool {
+	if runtime_stopping(app) { return false }
 	sync.mutex_lock(&app.run.mu)
-	pending := app.run.pending
+	newer := app.run.pending
 	app.run.pending = {}
 	sync.mutex_unlock(&app.run.mu)
+	if newer.present {
+		pending_target_clear(&app.run.pending_target, app.run.alloc)
+		defer pending_selection_clear(&newer, app.run.alloc)
+		if app.setup.session.state == .Idle {
+			if warning := app_tools_refresh(app); warning != "" { snap_append(app, .Warning, warning) }
+		}
+		target, problem := selection_target_resolve(app, newer.provider, newer.model, app.run.alloc)
+		defer if problem != "" { delete(problem, context.temp_allocator) }
+		sync.mutex_lock(&app.run.mu)
+		superseded := app.run.pending.present
+		sync.mutex_unlock(&app.run.mu)
+		if superseded {
+			agent.model_selection_destroy(&target, app.run.alloc)
+			return false
+		}
+		if problem != "" {
+			selection_fail(app, problem)
+			return false
+		}
+		app.run.pending_target = Pending_Target {
+			present = true,
+			target  = target,
+		}
+	}
+	pending := &app.run.pending_target
 	if !pending.present { return false }
-	// The intent owns its strings through the install, which clones what it keeps.
-	defer pending_selection_clear(&pending, app.run.alloc)
-	return apply_selection(app, pending.provider, pending.model, "")
+
+	status, problem, gate_error := agent.chat_selection_check(
+		&app.setup.session,
+		pending.target,
+		&pending.transition,
+		app.compact_on_switch,
+		app.run.connection,
+	)
+	defer if problem != "" { delete(problem, context.temp_allocator) }
+	if gate_error != nil {
+		detail := journal.error_text(gate_error, context.temp_allocator)
+		app.setup.session.storage_failed = true
+		selection_fail(app, fmt.tprintf("the model switch could not be recorded: %s", detail))
+		pending_target_clear(pending, app.run.alloc)
+		return false
+	}
+	// A newer UI request may arrive while the gate commits or advances compaction.
+	sync.mutex_lock(&app.run.mu)
+	superseded := app.run.pending.present
+	sync.mutex_unlock(&app.run.mu)
+	if superseded {
+		pending_target_clear(pending, app.run.alloc)
+		return false
+	}
+	switch status {
+	case .Ready:
+		installed := selection_install(app, pending.target, "", true)
+		pending_target_clear(pending, app.run.alloc)
+		return installed
+	case .Pending:
+		if !pending.announced {
+			snap_append(app, .Notice, "model switch is waiting for background compaction")
+			pending.announced = true
+		}
+	case .Refused:
+		if problem == "" { problem = "the requested model does not fit the active conversation" }
+		selection_fail(app, problem)
+		pending_target_clear(pending, app.run.alloc)
+	}
+	return false
 }
 
 // app_steer_apply is the turn's request-boundary hook. It installs the selection the
@@ -592,41 +722,41 @@ apply_pending_selection :: proc(app: ^App) -> bool {
 app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
 	app := cast(^App)steer.apply_data
 	catalog_selection_sync(app)
-	apply_pending_selection(app)
+	if app_selection_service(app) { refresh_status(app) }
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
 	return app.run.connection
 }
 
-// apply_selection switches the runtime to one provider's model and applies an effort
-// level. An empty effort carries over the level in effect whenever the new model allows
-// it, falling back to the lowest level the model states. It resolves the credential and
-// builds the connection, so it runs only where the runtime is owned: on the worker once
-// it exists, or at startup before it starts. The selection persists on success; a
-// failure is reported through the snapshot and the previous selection stays in place.
+// selection_target_resolve copies one selection out of the published catalog. The target
+// is owned by allocator; problem is temporary and must be consumed before that allocator resets.
 @(require_results)
-apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announce := true) -> bool {
+selection_target_resolve :: proc(app: ^App, provider_id, model_id: string, allocator: mem.Allocator) -> (agent.Model_Selection, string) {
 	// The catalog entry is copied out while it is the published one: a refresh releases the
 	// catalog it lives in, and the connection built from it outlives that moment.
 	sync.mutex_lock(&app.catalog_mu)
-	resolved, problem := agent.model_selection_resolve(&app.setup.catalog, provider_id, model_id, app.run.alloc)
+	resolved, problem := agent.model_selection_resolve(&app.setup.catalog, provider_id, model_id, allocator)
 	sync.mutex_unlock(&app.catalog_mu)
-	if problem != "" {
-		selection_fail(app, problem)
-		return false
-	}
-	defer agent.model_selection_destroy(&resolved, app.run.alloc)
-	api := resolved.connection.API
+	return resolved, problem
+}
+
+// selection_install installs a resolved target on the session owner. target is borrowed;
+// its owner keeps it alive through this call.
+@(require_results)
+selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: string, announce: bool) -> bool {
+	api := target.connection.API
 
 	running := &app.setup.session
-	selection_changed := app.setup.provider_id != provider_id || app.setup.model_id != model_id
+	same_identity := app.setup.provider_id == target.provider_id && app.setup.model_id == target.model_id && app.setup.api == api
+	selection_changed := !same_identity
 	connection_changed :=
-		app.run.connection.API != api || app.run.connection.Endpoint != resolved.connection.Endpoint || running.provider_transport != resolved.transport
+		app.run.connection.API != api || app.run.connection.Endpoint != target.connection.Endpoint || running.provider_transport != target.transport
 	// The level to carry over: an explicit one, or the one already in effect, which
 	// a model switch keeps whenever the new model allows it. It may alias the session's
 	// stored effort, which selecting replaces, so it is copied first.
 	desired := effort
 	if desired == "" { desired = running.effort }
+	desired = agent.model_selection_effort(target, desired)
 	carried, carried_error := strings.clone(desired, app.setup.alloc)
 	if carried_error != nil {
 		selection_fail(app, "the reasoning effort could not be copied")
@@ -637,10 +767,10 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 	// The runtime keeps its own copy of the selection, and provider_id and model_id
 	// may alias the strings being replaced, so the replacements are built before
 	// the old values are released.
-	setup_provider, provider_error := strings.clone(provider_id, app.setup.alloc)
-	setup_model, model_error := strings.clone(model_id, app.setup.alloc)
-	setup_endpoint, endpoint_error := strings.clone(resolved.connection.Endpoint, app.run.alloc)
-	credential, credential_error := strings.clone(resolved.connection.Credential, app.setup.alloc)
+	setup_provider, provider_error := strings.clone(target.provider_id, app.setup.alloc)
+	setup_model, model_error := strings.clone(target.model_id, app.setup.alloc)
+	setup_endpoint, endpoint_error := strings.clone(target.connection.Endpoint, app.run.alloc)
+	credential, credential_error := strings.clone(target.connection.Credential, app.setup.alloc)
 	if provider_error != nil || model_error != nil || endpoint_error != nil || credential_error != nil {
 		delete(setup_provider, app.setup.alloc)
 		delete(setup_model, app.setup.alloc)
@@ -649,7 +779,9 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 		selection_fail(app, "the model selection could not be stored")
 		return false
 	}
-	installed, applied := agent.chat_session_select(running, resolved, carried)
+	refused_features := running.refused_features
+	omitted_features := running.compact.omitted_features
+	installed, applied := agent.chat_session_select(running, target, carried)
 	if !installed {
 		delete(setup_provider, app.setup.alloc)
 		delete(setup_model, app.setup.alloc)
@@ -658,8 +790,12 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 		selection_fail(app, "the model selection could not be stored")
 		return false
 	}
-	// A different model invalidates a pending summary. A metadata-only refresh of
-	// the same model does not: it updates the facts used by the next request while
+	if same_identity {
+		running.refused_features = refused_features
+		running.compact.omitted_features = omitted_features
+	}
+	// A different serving identity invalidates a pending summary. A metadata-only refresh of
+	// the same identity does not: it updates the facts used by the next request while
 	// preserving compaction already in flight.
 	if selection_changed { agent.chat_compact_cancel(running) }
 	if running.provider_websocket != nil && (selection_changed || connection_changed) {
@@ -668,13 +804,12 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 	}
 	running.last_estimate = 0
 	running.last_input_measured = nil
-	// A carried level the new model does not allow falls back to the lowest level
-	// the model does state, so a switch never leaves an effort it cannot serve.
-	// With nothing to carry, the provider default stands.
-	if !applied && len(running.effort_levels) > 0 {
-		if !agent.chat_session_set_effort(running, running.effort_levels[0]) {
-			snap_append(app, .Warning, "the reasoning effort could not be applied")
-		}
+	if !applied { snap_append(app, .Warning, "the reasoning effort could not be applied") }
+	if record_error := selection_applied_record(app.setup.store, running.session, api, target.provider_id, target.model_id, running.effort);
+	   record_error != nil {
+		running.storage_failed = true
+		selection_fail(app, "the selected model was installed but its session record could not be committed")
+		return false
 	}
 
 	sync.mutex_lock(&app.run.mu)
@@ -706,18 +841,33 @@ apply_selection :: proc(app: ^App, provider_id, model_id, effort: string, announ
 	app.setup.provider_id = setup_provider
 	delete(app.setup.model_id, app.setup.alloc)
 	app.setup.model_id = setup_model
-	if app.setup.owns_selection { selection_publish_locked(app, provider_id, model_id, announce) }
 	sync.mutex_unlock(&app.run.mu)
-
-	// A run that owns the selection remembers it, so the next launch restores the
-	// user's own last choice. A headless or child run leaves it alone.
 	if app.setup.owns_selection && announce {
-		if record_error := selection_record(app.setup.store, provider_id, model_id, running.effort); record_error != nil {
-			detail := journal.error_text(record_error, context.temp_allocator)
-			fmt.eprintln("nabla: the selection could not be recorded:", detail)
+		if record_error := selection_record(app.setup.store, target.provider_id, target.model_id, running.effort); record_error != nil {
+			running.storage_failed = true
+			selection_fail(app, "the selected model was installed but its default could not be committed")
+			return false
 		}
 	}
+	if app.setup.owns_selection {
+		sync.mutex_lock(&app.run.mu)
+		selection_publish_locked(app, target.provider_id, target.model_id, announce)
+		sync.mutex_unlock(&app.run.mu)
+	}
+
 	return true
+}
+
+@(require_results)
+selection_apply_direct :: proc(app: ^App, provider_id, model_id, effort: string, announce: bool) -> bool {
+	target, problem := selection_target_resolve(app, provider_id, model_id, app.run.alloc)
+	defer if problem != "" { delete(problem, context.temp_allocator) }
+	if problem != "" {
+		selection_fail(app, problem)
+		return false
+	}
+	defer agent.model_selection_destroy(&target, app.run.alloc)
+	return selection_install(app, target, effort, announce)
 }
 
 // selection_publish_locked shows an applied selection to the front-end. The
@@ -767,9 +917,8 @@ apply_startup_selection :: proc(app: ^App, flag_provider, flag_model: string) ->
 			selection_fail(app, "--provider and --model must be given together")
 			return false
 		}
-		return apply_selection(app, flag_provider, flag_model, "")
+		return selection_apply_direct(app, flag_provider, flag_model, "", true)
 	}
-
 	selection, found, load_error := selection_latest(app.setup.store, app.run.alloc)
 	defer selection_destroy(&selection, app.run.alloc)
 	if load_error != nil {
@@ -778,11 +927,11 @@ apply_startup_selection :: proc(app: ^App, flag_provider, flag_model: string) ->
 		detail := journal.error_text(load_error, context.temp_allocator)
 		fmt.eprintln("nabla: the selection could not be read:", detail)
 	}
-	applied := found && apply_selection(app, selection.provider, selection.model, selection.effort)
+	applied := found && selection_apply_direct(app, selection.provider, selection.model, selection.effort, true)
 	if !applied && app.setup.resumed_provider != "" && app.setup.resumed_model != "" {
 		// A fallback that also fails leaves the launch to the model menu, and the
 		// snapshot already carries why.
-		_ = apply_selection(app, app.setup.resumed_provider, app.setup.resumed_model, "")
+		_ = selection_apply_direct(app, app.setup.resumed_provider, app.setup.resumed_model, app.setup.resumed_effort, true)
 	}
 	return true
 }

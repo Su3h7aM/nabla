@@ -201,6 +201,42 @@ Selection_Changed :: struct {
 	effort:   string,
 }
 
+Selection_Fit_Decision :: enum u8 {
+	Fits,
+	Compact,
+	Refused,
+}
+
+SELECTION_FIT_DECISION_NAMES := [Selection_Fit_Decision]string {
+	.Fits    = "fits",
+	.Compact = "compact",
+	.Refused = "refused",
+}
+
+// Selection_Fit records a target selection's admission check. The record's provider
+// and model name the target; recheck distinguishes checks after the initial request.
+Selection_Fit :: struct {
+	version:        int,
+	api:            string,
+	recheck:        bool,
+	decision:       string, // SELECTION_FIT_DECISION_NAMES
+	estimate:       int,
+	context_window: int,
+	margin:         int,
+	output:         int,
+	reason:         string,
+}
+
+// Selection_Applied records the session's installed serving identity. It is separate
+// from Selection_Changed, which stores the process-wide default for the next launch.
+Selection_Applied :: struct {
+	version:  int,
+	api:      string,
+	provider: string,
+	model:    string,
+	effort:   string,
+}
+
 Branch_Created :: struct {
 	version:   int,
 	base_node: Node_Id,

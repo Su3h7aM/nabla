@@ -279,6 +279,13 @@ Pending_Selection :: struct {
 	model:    string, // owned by the runtime allocator,
 }
 
+Pending_Target :: struct {
+	present:    bool,
+	target:     agent.Model_Selection, // owned by the runtime allocator,
+	transition: agent.Selection_Transition,
+	announced:  bool,
+}
+
 Runtime :: struct {
 	mu:                       sync.Mutex, // guards snapshot and pending,
 	snap:                     Snapshot,
@@ -289,6 +296,8 @@ Runtime :: struct {
 	// by the front-end and consumed by the worker, so it is guarded by mu like the
 	// snapshot the same boundary is published into.
 	pending:                  Pending_Selection,
+	// pending_target is owner-thread state retained while the target model is being fit.
+	pending_target:           Pending_Target,
 	// steer carries lines typed while a turn is running. The front-end pushes
 	// them as they arrive and the worker drains them at request boundaries, which
 	// is why it is written from one thread and read from another.
@@ -363,6 +372,7 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 	delete(setup.workspace, setup.alloc)
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
+	delete(setup.resumed_effort, setup.alloc)
 	if setup.credential != "" { delete(setup.credential, setup.alloc) }
 	if setup.provider_id != "" { delete(setup.provider_id, setup.alloc) }
 	if setup.model_id != "" { delete(setup.model_id, setup.alloc) }
@@ -395,6 +405,7 @@ tui_run :: proc(
 	// The setup is filled in place: a store owns a live connection, and copying
 	// one would leave two owners of it.
 	app.setup.harness_options = harness_options
+	app.compact_on_switch = harness_options.compact_on_switch
 	app.setup.alloc = context.allocator
 	if !run_catalog(sources, mcp_servers, &app.setup, start) {
 		return false
@@ -643,6 +654,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	}
 	agent.steer_queue_destroy(&app.run.steer)
 	pending_selection_clear(&app.run.pending, app.run.alloc)
+	pending_target_clear(&app.run.pending_target, app.run.alloc)
 	snapshot_destroy(app)
 	menu_destroy(&app.menu, app.run.alloc)
 	delete(app.completion_query, app.run.alloc)

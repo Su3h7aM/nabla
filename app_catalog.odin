@@ -202,6 +202,10 @@ catalog_selection_refresh_request :: proc(app: ^App) {
 catalog_selection_sync :: proc(app: ^App) {
 	revision := sync.atomic_load(&app.catalog_revision)
 	if revision == app.run.catalog_applied_revision { return }
+	sync.mutex_lock(&app.run.mu)
+	explicit_pending := app.run.pending.present
+	sync.mutex_unlock(&app.run.mu)
+	if explicit_pending || app.run.pending_target.present { return }
 	if app.setup.provider_id == "" || app.setup.model_id == "" {
 		app.run.catalog_applied_revision = revision
 		return
@@ -212,7 +216,7 @@ catalog_selection_sync :: proc(app: ^App) {
 		snap_append(app, .Warning, "the catalog change could not be applied: out of memory")
 		return
 	}
-	if apply_selection(app, provider_id, model_id, "", false) {
+	if selection_apply_direct(app, provider_id, model_id, "", false) {
 		app.run.catalog_applied_revision = revision
 	}
 }

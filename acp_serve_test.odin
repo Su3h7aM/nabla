@@ -36,6 +36,20 @@ import "nabla:agent/journal"
 ACP_TEST_BOUND :: 10 * time.Second
 
 @(test)
+test_acp_model_selection_does_not_mark_foreground_work_busy :: proc(t: ^testing.T) {
+	server: Acp_Server
+	server.model_request.active = true
+	testing.expect(t, !acp_server_has_work(&server), "a pending model RPC is not foreground work")
+	server.model_request = {}
+	server.model_selection.active = true
+	testing.expect(t, !acp_server_has_work(&server), "a model switch waiting for compaction is not foreground work")
+	server.model_selection = {}
+	acp_queue_add(&server)
+	testing.expect(t, acp_server_has_work(&server), "queued foreground work remains busy")
+	acp_queue_remove(&server)
+}
+
+@(test)
 test_request_params_decode_errors_use_json_rpc_internal_for_allocation :: proc(t: ^testing.T) {
 	testing.expect_value(t, acp_request_params_error_code(acp.Params_Error.Invalid), acp.ERROR_INVALID_PARAMS)
 	testing.expect_value(t, acp_request_params_error_code(acp.Params_Error.Allocation), acp.ERROR_INTERNAL)
@@ -1113,10 +1127,17 @@ test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
 
 	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
 	defer delete(sources, context.allocator)
-	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
+	models := make([]agent.Catalog_Model_Source, 2, context.allocator)
 	defer delete(models, context.allocator)
 	models[0] = {
 		id                     = "buzzmodel",
+		context_window_present = true,
+		context_window         = 100000,
+		tools_present          = true,
+		tools                  = true,
+	}
+	models[1] = {
+		id                     = "buzzmodel-next",
 		context_window_present = true,
 		context_window         = 100000,
 		tools_present          = true,
@@ -1172,14 +1193,23 @@ test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
 	switching := strings.builder_make(context.temp_allocator)
 	fmt.sbprint(&switching, `{"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"sessionId":"`)
 	strings.write_string(&switching, session_id)
-	strings.write_string(&switching, `","modelId":"buzzmodel"}}`)
+	strings.write_string(&switching, `","modelId":"buzzmodel-next"}}`)
 	acp_test_end(&switching)
 	acp_test_client_send(&client, strings.to_string(switching))
-	switched := acp_test_client_expect(t, &client, `"modelId":"buzzmodel"`, "session/set_model was not answered")
+	switched := acp_test_client_expect(t, &client, `"modelId":"buzzmodel-next"`, "session/set_model was not answered")
 	if switched == "" { return }
 
+	configuring := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(&configuring, `{"jsonrpc":"2.0","id":4,"method":"session/set_config_option","params":{"sessionId":"`)
+	strings.write_string(&configuring, session_id)
+	strings.write_string(&configuring, `","configId":"model","value":"buzzmodel"}}`)
+	acp_test_end(&configuring)
+	acp_test_client_send(&client, strings.to_string(configuring))
+	configured := acp_test_client_expect(t, &client, `"currentValue":"buzzmodel"`, "the model config option was not applied")
+	if configured == "" { return }
+
 	unknown := strings.builder_make(context.temp_allocator)
-	fmt.sbprint(&unknown, `{"jsonrpc":"2.0","id":4,"method":"session/set_model","params":{"sessionId":"`)
+	fmt.sbprint(&unknown, `{"jsonrpc":"2.0","id":5,"method":"session/set_model","params":{"sessionId":"`)
 	strings.write_string(&unknown, session_id)
 	strings.write_string(&unknown, `","modelId":"no-such-model"}}`)
 	acp_test_end(&unknown)
