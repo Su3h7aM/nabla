@@ -122,9 +122,9 @@
 // durable write that fails latches the session, which accepts no further work, because
 // continuing would let the conversation diverge from what was stored.
 //
-// Any thread may emit a diagnostic through `context.logger`. It lands in a fixed-size ring
-// that never allocates and never blocks, and the owner drains it into the session's journal,
-// so what happened and why are recorded together.
+// A process diagnostic is a runtime.message record that the thread owning the journal
+// writes through chat_runtime_message. Worker threads never write the journal; they report
+// to their owner through the mailbox.
 //
 // # Memory
 //

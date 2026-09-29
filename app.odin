@@ -350,8 +350,6 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 	// The tool registry borrowed the runtime's bindings, so the session goes first
 	// and the MCP clients second. A runtime that was never built owns nothing.
 	mcp_runtime_destroy(&setup.mcp)
-	// The launch's last diagnostics reach the journal before it closes.
-	run_log_close(setup)
 	if close_error := run_store_close(setup); close_error != nil {
 		detail := journal.error_text(close_error, context.temp_allocator)
 		fmt.eprintln("nabla: the session database could not be closed cleanly:", detail)
@@ -398,11 +396,7 @@ tui_run :: proc(
 	// The setup is filled in place: a store owns a live connection, and copying
 	// one would leave two owners of it.
 	app.setup.harness_options = harness_options
-	// The writer is opened and the logger installed here, in the scope that owns the
-	// run, so adoption, the store, and every turn below are recorded. A helper
-	// cannot install it: assigning context.logger only configures the calling scope.
 	app.setup.alloc = context.allocator
-	context.logger = run_log_open(&app.setup)
 	if !run_catalog(sources, mcp_servers, &app.setup, start) {
 		return false
 	}
@@ -458,6 +452,8 @@ tui_run :: proc(
 				fmt.eprintfln("nabla: could not restore the terminal state (%v); run `reset` to restore it", close_error)
 			}
 		}
+		// The screen is restored, so the message stays on the user's terminal.
+		if app_abandoned { fmt.eprintln("nabla: a thread did not stop in time; the process exits without releasing what it still uses") }
 	}
 	app.terminal = terminal
 
@@ -597,14 +593,12 @@ tui_run :: proc(
 }
 
 // report_viewport_unavailable says once per episode that the terminal reported no size to
-// draw into, and records it in the log and the transcript. The latch clears when a size
+// draw into, and records it in the transcript. The latch clears when a size
 // arrives, so a terminal that goes quiet and comes back is reported each time.
 report_viewport_unavailable :: proc(app: ^App, err: term.Error) {
 	if app.viewport_reported { return }
 	app.viewport_reported = true
 	reason := fmt.tprintf("%v", err)
-	fields := [1]agent.Log_Field{{key = "viewport_error", value = reason}}
-	agent.log_emit(agent.Log_Record{level = .Warning, category = .Runtime, event = "ui.viewport_unavailable", fields = fields[:]})
 	snap_append(app, .Warning, fmt.tprintf("the terminal reports no size to draw into (%s); waiting for one", reason))
 }
 
@@ -620,18 +614,16 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 		agent.owner_wake_signal()
 	}
 	if app.run.worker != nil {
-		if join_retiring(app.run.worker, "nabla-tui-worker", patience) {
+		if join_retiring(app.run.worker, patience) {
 			app.run.worker = nil
 		} else {
 			retired = false
 		}
 	}
 	if !retired {
-		// Nothing below this line may run: the release path would free the channel, the
-		// snapshot, and the log binding that the thread still reads. The process exits
-		// with that memory owned by the thread that is using it, and the record names
-		// which thread it was.
-		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.teardown_abandoned"})
+		// Nothing below this line may run: the release path would free the channel and the
+		// snapshot that the thread still reads. The process exits with that memory owned by
+		// the thread that is using it.
 		return true
 	}
 	// The worker frees what it had buffered on the way out; this covers commands
@@ -664,7 +656,6 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	// A tool worker that ignored its stop may still use the tool backends, so the process
 	// exits with them rather than freeing them under it.
 	if app.setup.workers_abandoned || agent.chat_session_workers_outstanding(&app.setup.session) {
-		agent.log_emit(agent.Log_Record{level = .Warning, category = .Runtime, event = "runtime.workers_outstanding"})
 		return true
 	}
 	run_setup_destroy(&app.setup)

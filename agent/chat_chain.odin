@@ -195,8 +195,6 @@ chat_chain_note_stop :: proc(chat: ^Chat_Session, now: time.Tick) {
 	if chain.stop_at != nil || !chain.active || chain.stage != .Sending || chain.worker == nil { return }
 	if !ai.interrupt_requested(chain.options.interrupt) { return }
 	chain.stop_at = now
-	fields := [1]Log_Field{{key = "patience_ms", value = Log_Duration_Milliseconds(TOOL_JOBS_STOP_PATIENCE)}}
-	log_emit({level = .Warning, category = .Provider, event = "provider.attempt_stopping", fields = fields[:]})
 }
 
 // chat_chain_patience_deadline is when the owner stops waiting for an attempt that was asked
@@ -245,7 +243,7 @@ chat_chain_retain_attempt :: proc(chat: ^Chat_Session) {
 	chain := &chat.chain
 	attempt, allocation_error := new(Chat_Abandoned_Attempt, os.heap_allocator())
 	if allocation_error != nil {
-		log_emit({level = .Error, category = .Provider, event = "provider.attempt_leaked"})
+		chat_runtime_message(chat, .Error, "an abandoned request attempt could not be retained and is leaked")
 		return
 	}
 	attempt^ = {
@@ -259,7 +257,7 @@ chat_chain_retain_attempt :: proc(chat: ^Chat_Session) {
 	if append(&chat.abandoned_attempts, attempt) != 1 {
 		// The record exists and the list could not grow, so the attempt stays with the record
 		// rather than being released: nothing the worker can reach is freed either way.
-		log_emit({level = .Error, category = .Provider, event = "provider.attempt_leaked"})
+		chat_runtime_message(chat, .Error, "an abandoned request attempt could not be listed for reclaim and is leaked")
 	}
 }
 
@@ -543,12 +541,6 @@ chat_chain_claim_send :: proc(chat: ^Chat_Session) -> bool {
 chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 	chain := &chat.chain
 	if !chain.active || chain.stage != .Sending { return }
-	// This attempt's correlation: the request number became durable in the claim, and the
-	// attempt number is counted there too.
-	binding: Log_Binding
-	previous_logger := context.logger
-	defer context.logger = previous_logger
-	context.logger = log_rebind(&binding, log_correlation_for(chat, chain.attempts))
 
 	// The input size is settled and this send has not gone out yet, so this is where a
 	// front-end learns what the context now holds, and how a front-end showing a scheduled
@@ -587,7 +579,6 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 		websocket_request = chain.websocket_request,
 		encoded           = chain.encoded,
 		options           = chain.options,
-		logging           = binding,
 	}
 	// The handle comes from the process heap, because an attempt whose worker ignores its stop
 	// keeps it and the session's allocator may already be released by then.
@@ -673,12 +664,8 @@ chat_session_observe_usage :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_R
 	if usage.Input_Tokens_Present { chat.last_input_measured = usage.Input_Tokens }
 	if _, append_error := append(usages, Chat_Request_Usage{operation = u64(chat.operation.id), usage = usage}); append_error == nil { return }
 	// The record of the send is missing the numbers this report carried, and ending the turn
-	// would not bring them back: the log line is what records the loss.
-	binding: Log_Binding
-	previous_logger := context.logger
-	defer context.logger = previous_logger
-	context.logger = log_rebind(&binding, log_correlation_for(chat, chat.chain.attempts))
-	log_emit({level = .Error, category = .Provider, event = "request.usage_lost"})
+	// would not bring them back: the runtime message is what records the loss.
+	chat_runtime_message(chat, .Error, "a usage report of the request could not be kept")
 }
 
 // chat_chain_settle turns the terminal outcome into the next stage. The row is finished

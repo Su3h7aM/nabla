@@ -35,13 +35,21 @@ chat_node :: proc(chat: ^Chat_Session, kind: journal.Node_Kind, payload: $Payloa
 // them proceeds. A failure stops the session; what names the step for the message.
 @(require_results)
 chat_commit :: proc(chat: ^Chat_Session, what: string) -> bool {
-	// Diagnostics waiting in the ring ride in the same transaction.
-	diag_drain(log_active_ring(), chat.store)
 	if _, error := journal.commit(chat.store); error != nil {
 		chat_session_record_failure(chat, what, error)
 		return false
 	}
 	return true
+}
+
+// chat_runtime_message buffers a process diagnostic of the running session for the
+// next commit. A journal that is not open for writing or does not hold the session yet
+// has nowhere to keep it, and the message is dropped. Owner only: worker threads never
+// write the journal.
+chat_runtime_message :: proc(chat: ^Chat_Session, level: journal.Runtime_Level, text: string) {
+	store := chat.store
+	if store == nil || !store.open || store.read_only || store.claimed != chat.session { return }
+	chat_record(chat, {kind = .Runtime_Message, request = chat.request}, journal.Runtime_Message{level = journal.RUNTIME_LEVEL_NAMES[level], text = text})
 }
 
 // chat_session_text is the session id as the 32 hexadecimal characters a provider,

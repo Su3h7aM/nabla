@@ -1107,9 +1107,6 @@ acp_run :: proc(
 	// The model this run picks belongs to the conversation, not to the user: an editor
 	// session neither publishes a selection nor remembers one.
 	server.app.setup.owns_selection = false
-	// The writer is opened and the logger installed in the scope that owns the run, so
-	// the launch and every turn below it are recorded.
-	context.logger = run_log_open(&server.app.setup)
 	if !run_catalog(sources, mcp_servers, &server.app.setup, Session_Start{kind = .New}) { return false }
 	server_cleanup_managed = true
 	defer {

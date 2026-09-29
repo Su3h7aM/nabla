@@ -2,7 +2,6 @@
 package agent
 
 import "core:encoding/json"
-import "core:log"
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -13,50 +12,6 @@ import "nabla:mcp"
 @(private)
 mcp_test_context :: proc() -> Tool_Context {
 	return Tool_Context{call_id = "call_mcp", allocator = context.allocator}
-}
-
-@(test)
-test_mcp_exchange_records_delivery_without_payloads :: proc(test: ^testing.T) {
-	ring := new(Diag_Ring)
-	defer free(ring)
-	backend := MCP_Tool_Backend {
-		server_id   = "files",
-		remote_name = "find_files.by_name",
-	}
-	tool_context := mcp_test_context()
-	tool_context.backend = &backend
-	// The executor is given its call's binding by its caller, so the test installs
-	// one here and the exchange below records against it.
-	binding := Log_Binding {
-		ring = ring,
-		correlation = Log_Correlation{call_id = tool_context.call_id},
-	}
-	context.logger = log_logger(&binding)
-	result := tool_mcp_execute(&tool_context, nil)
-	defer tool_result_destroy(&result)
-	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Unavailable)
-
-	failure := mcp.Error {
-		kind        = .Timed_Out,
-		delivery    = .Delivered,
-		stderr_tail = "secret-token\nprivate output",
-	}
-	log_mcp_exchange_finished(&backend, failure.delivery, failure, .Timed_Out, time.Second)
-	entry: Diag_Entry
-	text: [dynamic]u8
-	defer delete(text)
-	for diag_pop(ring, &entry) {
-		append(&text, ..entry.text[:entry.text_length])
-		append(&text, '\n')
-	}
-	testing.expect(test, strings.contains(string(text[:]), "mcp.exchange_started"))
-	testing.expect(test, strings.contains(string(text[:]), "remote_name=find_files.by_name"))
-	testing.expect(test, strings.contains(string(text[:]), "delivery=not_delivered"))
-	testing.expect(test, strings.contains(string(text[:]), "delivery=delivered"))
-	testing.expect(test, strings.contains(string(text[:]), "mcp.stderr"))
-	testing.expect(test, strings.contains(string(text[:]), "call_id=call_mcp"))
-	testing.expect(test, !strings.contains(string(text[:]), "secret-token"))
-	testing.expect(test, !strings.contains(string(text[:]), "private output"))
 }
 
 @(private)

@@ -49,7 +49,6 @@ Subagent :: struct {
 	parent_session_hex:           [journal.SESSION_ID_HEX_LENGTH]u8, // read through chat_parent_session
 	run:                          journal.Run_Id, // the run the subagent's own journal writes under
 	disable_project_instructions: bool,
-	log_sink:                     ^Diag_Ring,
 	team:                         ^Agent_Team, // the orchestrator's, which outlives every member
 	allocator:                    mem.Allocator,
 
@@ -139,16 +138,17 @@ agent_parent_destroy :: proc(parent: ^Agent_Parent, allocator: mem.Allocator) {
 agent_team_note_parent :: proc(chat: ^Chat_Session) {
 	team := chat.team
 	if team == nil { return }
-	sync.mutex_guard(&team.mutex)
-	allocator := team.allocator
-	parent: Agent_Parent
-	if !agent_parent_copy(chat, allocator, &parent) {
+	held: bool
+	{
+		sync.mutex_guard(&team.mutex)
+		allocator := team.allocator
+		parent: Agent_Parent
+		held = agent_parent_copy(chat, allocator, &parent)
 		agent_parent_destroy(&team.parent, allocator)
-		log_emit({level = .Error, category = .Agent, event = "subagent.parent_not_held"})
-		return
+		if held { team.parent = parent }
 	}
-	agent_parent_destroy(&team.parent, allocator)
-	team.parent = parent
+	// The journal write stays outside the team lock.
+	if !held { chat_runtime_message(chat, .Error, "the orchestrator could not be copied, so subagent starts are refused") }
 }
 
 // agent_parent_copy copies what a subagent start needs from the orchestrator into out. It
@@ -426,7 +426,6 @@ subagent_start :: proc(
 		session                      = session,
 		run                          = parent.run,
 		disable_project_instructions = parent.disable_project_instructions,
-		log_sink                     = subagent_log_sink(),
 		team                         = team,
 		allocator                    = allocator,
 		inbox                        = steer_queue_init(allocator),
@@ -513,13 +512,6 @@ subagent_select :: proc(
 	return selection, effort, ""
 }
 
-// subagent_log_sink is where the calling thread's diagnostics go, so a subagent's thread
-// writes to the same place.
-@(private)
-subagent_log_sink :: proc() -> ^Diag_Ring {
-	return log_active_ring()
-}
-
 // subagent_launch starts a background subagent on a thread of its own. The watched signals are
 // blocked across creation, so the process handler never runs there.
 @(require_results)
@@ -560,7 +552,9 @@ subagent_finish :: proc(member: ^Subagent, report: bool) {
 		case .Failed, .Running:
 			text = fmt.tprintf("Subagent %s failed: %s", member.name, member.answer)
 		}
-		if !steer_push(&team.inbox, text) { log_emit({level = .Error, category = .Agent, event = "subagent.report_lost"}) }
+		// A report the inbox cannot take leaves the outcome in member, which the orchestrator's
+		// subagent tools still read.
+		_ = steer_push(&team.inbox, text)
 	}
 	sync.atomic_store(&member.done, true)
 	owner_wake_signal()
@@ -587,28 +581,20 @@ subagent_answer_text :: proc(user_data: rawptr, text: string) {
 }
 
 // subagent_fail records why a subagent ended. The status is the outcome either way; a reason
-// that cannot be kept is what the diagnostic records.
+// that cannot be kept leaves the status as the whole outcome.
 @(private)
 subagent_fail :: proc(member: ^Subagent, status: Subagent_Status, reason: string) {
 	member.status = status
 	delete(member.answer, member.allocator)
 	clone_error: mem.Allocator_Error
 	member.answer, clone_error = strings.clone(reason, member.allocator)
-	if clone_error != nil {
-		log_emit({level = .Error, category = .Agent, event = "subagent.reason_not_held"})
-	}
+	if clone_error != nil { member.answer = "" }
 }
 
 // subagent_run runs the subagent's session until it answers its task and every message its
 // orchestrator sent after that, and records the outcome in member. Runs on the subagent's own
 // thread and reaches nothing of the orchestrator's except the team.
 subagent_run :: proc(member: ^Subagent) {
-	binding := Log_Binding {
-		ring = member.log_sink,
-	}
-	previous_logger := context.logger
-	context.logger = log_logger(&binding)
-	defer context.logger = previous_logger
 	allocator := member.allocator
 
 	if member.program.name != "" {
@@ -690,7 +676,6 @@ subagent_run :: proc(member: ^Subagent) {
 		subagent_fail(member, .Failed, "the subagent's model could not be held")
 		return
 	}
-	binding.correlation = log_correlation(&chat)
 
 	answer := Subagent_Answer {
 		text = make([dynamic]u8, allocator),
@@ -709,12 +694,6 @@ subagent_run :: proc(member: ^Subagent) {
 			subagent_fail(member, .Failed, chat.last_error if chat.last_error != "" else "the task could not be recorded")
 			return
 		}
-		fields := [3]Log_Field {
-			{key = "agent", value = member.name},
-			{key = "model", value = member.selection.model_id},
-			{key = "effort", value = member.effort},
-		}
-		log_emit({level = .Info, category = .Agent, event = "subagent.turn_started", fields = fields[:]})
 		if !chat_turn_drive(&chat, member.selection.connection, chat_retry_policy_default(), observer, nil, nil) {
 			if chat.terminal_status == .Cancelled {
 				subagent_fail(member, .Stopped, "the subagent was stopped before it finished")
@@ -862,7 +841,7 @@ chat_session_accept_agent_message :: proc(chat: ^Chat_Session, observer: Chat_Ob
 		steer_line_free(&chat.team.inbox, text)
 	} else if !steer_requeue(&chat.team.inbox, text) {
 		// The one case where the refused report cannot stay pending: it was released.
-		log_emit({level = .Error, category = .Agent, event = "subagent.report_not_requeued"})
+		chat_runtime_message(chat, .Error, "a subagent report was refused and could not be queued again, so it is lost")
 	}
 	return accepted, true
 }

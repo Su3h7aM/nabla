@@ -67,11 +67,8 @@ tool_result_keep :: proc(result: ^Tool_Result, budget: ^Tool_Budget, path: strin
 	shown := tool_budget_preview_bytes(budget)
 	if len(result.content) <= shown || path == "" { return }
 
-	if write_error := tool_output_write(path, result.content); write_error != nil {
-		fields := [2]Log_Field{{key = "path", value = path}, {key = "error", value = os.error_string(write_error)}}
-		log_emit({level = .Warning, category = .Tool, event = "tool.output_not_kept", fields = fields[:]})
-		return
-	}
+	// The content stays whole in the result, so the model still sees all of it.
+	if tool_output_write(path, result.content) != nil { return }
 	preview := tool_preview_cut(result.content, shown)
 	notice := fmt.tprintf(
 		"\n[output truncated: showing the first %d of %d bytes. The complete output is in %s; read the rest with %s.]\n",

@@ -14,19 +14,13 @@ import "nabla:mcp"
 // pointers cannot invalidate a definition. A refresh keeps the previous generation alive
 // until the session accepts the replacement registry.
 MCP_Runtime :: struct {
-	clients:            [dynamic]mcp.Client,
-	bindings:           [dynamic]^agent.MCP_Tool_Backend,
+	clients:           [dynamic]mcp.Client,
+	bindings:          [dynamic]^agent.MCP_Tool_Backend,
 	// server_started and server_discovered say which clients have been launched and
 	// which have answered discovery since they were launched.
-	server_started:     []bool,
-	server_discovered:  []bool,
-	// server_ids and server_launch name each slot for the lifecycle records, and
-	// server_launch counts launches within this run so a restart is distinguishable
-	// from a first launch without pretending to be a global identity.
-	server_ids:         []string,
-	server_launch:      []u64,
-	alloc:              mem.Allocator,
-	refresh_generation: u64,
+	server_started:    []bool,
+	server_discovered: []bool,
+	alloc:             mem.Allocator,
 }
 
 // mcp_runtime_make reserves one stable client slot per configured server. Tool
@@ -49,23 +43,6 @@ mcp_runtime_make :: proc(servers: []agent.MCP_Server_Config, alloc := context.al
 		mcp_runtime_destroy(&runtime)
 		return {}, false
 	}
-	runtime.server_launch, alloc_error = make([]u64, len(servers), alloc)
-	if alloc_error != nil {
-		mcp_runtime_destroy(&runtime)
-		return {}, false
-	}
-	runtime.server_ids, alloc_error = make([]string, len(servers), alloc)
-	if alloc_error != nil {
-		mcp_runtime_destroy(&runtime)
-		return {}, false
-	}
-	for server, index in servers {
-		runtime.server_ids[index], alloc_error = strings.clone(server.id, alloc)
-		if alloc_error != nil {
-			mcp_runtime_destroy(&runtime)
-			return {}, false
-		}
-	}
 	return runtime, true
 }
 
@@ -76,23 +53,11 @@ mcp_runtime_make :: proc(servers: []agent.MCP_Server_Config, alloc := context.al
 mcp_runtime_destroy :: proc(runtime: ^MCP_Runtime) {
 	if runtime == nil || runtime.alloc.procedure == nil { return }
 	allocator := runtime.alloc
-	for &client, index in runtime.clients {
-		if index < len(runtime.server_started) && runtime.server_started[index] && mcp.client_running(&client) {
-			server_id := ""
-			if index < len(runtime.server_ids) { server_id = runtime.server_ids[index] }
-			launch: u64
-			if index < len(runtime.server_launch) { launch = runtime.server_launch[index] }
-			log_mcp_stopped(server_id, launch, "released")
-		}
-		mcp.client_destroy(&client)
-	}
+	for &client in runtime.clients { mcp.client_destroy(&client) }
 	delete(runtime.clients)
 	mcp_bindings_destroy(&runtime.bindings, allocator)
 	delete(runtime.server_started, allocator)
 	delete(runtime.server_discovered, allocator)
-	delete(runtime.server_launch, allocator)
-	for id in runtime.server_ids { delete(id, allocator) }
-	delete(runtime.server_ids, allocator)
 	runtime^ = {}
 }
 
@@ -106,7 +71,6 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 
 	if !mcp.client_running(client) {
 		if runtime.server_started[index] {
-			log_mcp_stopped(server.id, runtime.server_launch[index], "restart")
 			mcp.client_destroy(client)
 		}
 		stdio, stdio_ok := agent.mcp_stdio_config(server)
@@ -125,8 +89,6 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 			return nil, false
 		}
 		runtime.server_started[index] = true
-		runtime.server_launch[index] += 1
-		log_mcp_started(server.id, runtime.server_launch[index])
 		// A restarted server is a fresh one: it must be asked what it supports again.
 		runtime.server_discovered[index] = false
 	}
@@ -144,7 +106,6 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 			mcp.error_destroy(&connect_err, runtime.alloc)
 			return nil, false
 		}
-		log_mcp_negotiated(server.id, runtime.server_launch[index], connection)
 		if !connection.tools_supported {
 			fmt.sbprintf(warnings, "\n%s: it exposes no tools", server.id)
 			mcp.connection_destroy(&connection, runtime.alloc)
@@ -155,31 +116,6 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 	}
 
 	return client, true
-}
-
-// The MCP lifecycle is recorded from here because this is what launches and stops the
-// processes. The server instance is a run-local launch counter, which tells a restart
-// apart from the first launch; an exit status is not recorded because mcp does not expose
-// one.
-log_mcp_started :: proc(server_id: string, instance: u64) {
-	fields := [2]agent.Log_Field{{key = "server_id", value = server_id}, {key = "server_instance", value = instance}}
-	agent.log_emit(agent.Log_Record{level = .Info, category = .MCP, event = "mcp.started", fields = fields[:]})
-}
-
-log_mcp_negotiated :: proc(server_id: string, instance: u64, connection: mcp.Connection) {
-	fields := [5]agent.Log_Field {
-		{key = "server_id", value = server_id},
-		{key = "server_instance", value = instance},
-		{key = "revision", value = mcp.protocol_version_name(connection.version)},
-		{key = "server_name", value = connection.server_name},
-		{key = "tools_supported", value = connection.tools_supported},
-	}
-	agent.log_emit(agent.Log_Record{level = .Info, category = .MCP, event = "mcp.negotiated", fields = fields[:]})
-}
-
-log_mcp_stopped :: proc(server_id: string, instance: u64, reason: string) {
-	fields := [3]agent.Log_Field{{key = "server_id", value = server_id}, {key = "server_instance", value = instance}, {key = "reason", value = reason}}
-	agent.log_emit(agent.Log_Record{level = .Info, category = .MCP, event = "mcp.stopped", fields = fields[:]})
 }
 
 // mcp_operation is the bound for one client operation.
@@ -247,30 +183,7 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	// Child and abandoned workers may still call through these bindings.
 	if setup.workers_abandoned || agent.chat_session_workers_outstanding(&setup.session) { return "" }
 
-	setup.mcp.refresh_generation += 1
-	// The refresh is recorded against the session it changes, so the caller's
-	// run-level logger is narrowed to this session for the whole refresh.
-	binding: agent.Log_Binding
-	context.logger = agent.log_rebind(&binding, agent.log_correlation(&setup.session))
-	generation := setup.mcp.refresh_generation
-	discovered, accepted, disabled, rejected, unavailable := 0, 0, 0, 0, 0
 	installed := false
-	started := time.tick_now()
-	start_fields := [1]agent.Log_Field{{key = "generation", value = generation}}
-	agent.log_emit({level = .Info, category = .Tool, event = "tools.refresh_started", fields = start_fields[:]})
-	defer {
-		fields := [8]agent.Log_Field {
-			{key = "generation", value = generation},
-			{key = "discovered", value = i64(discovered)},
-			{key = "accepted", value = i64(accepted)},
-			{key = "disabled", value = i64(disabled)},
-			{key = "rejected", value = i64(rejected)},
-			{key = "unavailable_servers", value = i64(unavailable)},
-			{key = "installed", value = installed},
-			{key = "elapsed_ms", value = agent.Log_Duration_Milliseconds(time.tick_since(started))},
-		}
-		agent.log_emit({level = .Info, category = .Tool, event = "tools.refresh_finished", fields = fields[:]})
-	}
 	registry, registry_err := agent.tool_registry_make(setup.alloc)
 	if registry_err.kind != .None {
 		return "the tool registry could not be built"
@@ -289,22 +202,17 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	for server, index in setup.mcp_servers {
 		client, available := mcp_runtime_ensure(&setup.mcp, setup.mcp_servers, index, &warnings)
 		if !available {
-			unavailable += 1
 			continue
 		}
 		page, list_err := mcp.client_tools_list(client, mcp_operation(server.discovery_timeout), setup.alloc)
 		if list_err.kind != .None {
-			unavailable += 1
 			fmt.sbprintf(&warnings, "\n%s: %s", server.id, mcp.error_text(list_err, context.temp_allocator) or_else "the failure could not be described")
 			mcp.error_destroy(&list_err, setup.alloc)
 			continue
 		}
-		discovered += len(page.tools) + len(page.rejected)
-		rejected += len(page.rejected)
 		for tool in page.tools {
 			config, configured := mcp_tool_config(server, tool.name)
 			if configured && !config.enabled {
-				disabled += 1
 				continue
 			}
 			local_name := tool.name
@@ -314,25 +222,21 @@ app_tools_refresh :: proc(app: ^App) -> string {
 			// collapse into one canonical name without the user being told.
 			name := fmt.tprintf("%s_%s", server.id, local_name)
 			if !agent.tool_name_valid(name) {
-				rejected += 1
 				fmt.sbprintf(&warnings, "\n%s: %s cannot become a tool name; shorten it with a tools entry", server.id, tool.name)
 				continue
 			}
 			binding, binding_ok := mcp_binding_make(client, server.id, tool.name, setup.alloc)
 			if !binding_ok {
-				rejected += 1
 				fmt.sbprintf(&warnings, "\n%s: %s: the binding could not be allocated", server.id, tool.name)
 				continue
 			}
 			if append(&bindings, binding) != 1 {
-				rejected += 1
 				fmt.sbprintf(&warnings, "\n%s: %s: the binding table could not grow", server.id, tool.name)
 				mcp_binding_destroy(binding, setup.alloc)
 				continue
 			}
 			definition := agent.mcp_tool_definition(name, tool, binding, server.call_timeout)
 			if add_err := agent.tool_registry_add(&registry, definition); add_err.kind != .None {
-				rejected += 1
 				fmt.sbprintf(&warnings, "\n%s: %s: %s", server.id, tool.name, add_err.detail)
 				bindings[len(bindings) - 1] = nil
 				// A shrink never allocates, so it cannot fail.
@@ -340,14 +244,6 @@ app_tools_refresh :: proc(app: ^App) -> string {
 				mcp_binding_destroy(binding, setup.alloc)
 				continue
 			}
-			accepted += 1
-			fields := [4]agent.Log_Field {
-				{key = "generation", value = generation},
-				{key = "server_id", value = server.id},
-				{key = "remote_name", value = tool.name},
-				{key = "tool", value = name},
-			}
-			agent.log_emit({level = .Debug, category = .Tool, event = "tool.binding", fields = fields[:]})
 		}
 		for config in server.tools {
 			found := false

@@ -72,12 +72,8 @@ mcp_hint :: proc(hint: mcp.Hint) -> Tool_Hint_Value {
 @(require_results)
 tool_mcp_execute :: proc(ctx: ^Tool_Context, _: Tool_Args) -> (result: Tool_Result) {
 	backend := cast(^MCP_Tool_Backend)ctx.backend
-	started := time.tick_now()
 	exchange_error: mcp.Error
-	delivery := mcp.Delivery_State.Not_Delivered
 	defer mcp.error_destroy(&exchange_error, ctx.allocator)
-	defer log_mcp_exchange_finished(backend, delivery, exchange_error, result.outcome, time.tick_since(started))
-	log_mcp_exchange_started(backend)
 	if backend == nil || backend.client == nil {
 		return tool_result_failure(ctx, .Unavailable, "the server for this tool is not configured", "unavailable")
 	}
@@ -94,10 +90,8 @@ tool_mcp_execute :: proc(ctx: ^Tool_Context, _: Tool_Args) -> (result: Tool_Resu
 	call, exchange_error = mcp.client_tools_call(backend.client, backend.remote_name, ctx.arguments_json, tool_mcp_options(ctx), ctx.allocator)
 	defer mcp.call_result_destroy(&call, ctx.allocator)
 	if exchange_error.kind != .None {
-		delivery = exchange_error.delivery
 		return tool_mcp_error_result(ctx, backend, exchange_error)
 	}
-	delivery = .Delivered
 	return tool_mcp_call_result(ctx, call)
 }
 

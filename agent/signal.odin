@@ -24,13 +24,12 @@ chat_signal_interrupt :: proc "c" (signal: posix.Signal) {
 // chat_signal_arm installs the handler only while a turn is in flight, so a headless
 // run keeps the default meaning of Ctrl-C while idle. The handler is installed without
 // SA_RESTART, so an interrupted wait returns and observes the stop. A disposition that
-// cannot be installed leaves the default in place, which is what the diagnostic records.
+// cannot be installed leaves the default in place, under which the signal ends the process
+// and journal recovery takes over.
 chat_signal_arm :: proc(previous: ^posix.sigaction_t) {
 	action: posix.sigaction_t
 	action.sa_handler = chat_signal_interrupt
-	if posix.sigaction(.SIGINT, &action, previous) != .OK {
-		log_emit({level = .Error, category = .Runtime, event = "signal.arm_failed"})
-	}
+	_ = posix.sigaction(.SIGINT, &action, previous)
 }
 
 // chat_signal_disarm restores the previous disposition, which is teardown: a disposition
@@ -54,15 +53,9 @@ Chat_Interactive_Signals :: struct {
 chat_interactive_arm :: proc(state: ^Chat_Interactive_Signals) {
 	action: posix.sigaction_t
 	action.sa_handler = chat_signal_interrupt
-	if posix.sigaction(.SIGINT, &action, &state.previous_int) != .OK {
-		log_emit({level = .Error, category = .Runtime, event = "signal.arm_failed"})
-	}
-	if posix.sigaction(.SIGTERM, &action, &state.previous_term) != .OK {
-		log_emit({level = .Error, category = .Runtime, event = "signal.arm_failed"})
-	}
-	if posix.sigaction(.SIGHUP, &action, &state.previous_hup) != .OK {
-		log_emit({level = .Error, category = .Runtime, event = "signal.arm_failed"})
-	}
+	_ = posix.sigaction(.SIGINT, &action, &state.previous_int)
+	_ = posix.sigaction(.SIGTERM, &action, &state.previous_term)
+	_ = posix.sigaction(.SIGHUP, &action, &state.previous_hup)
 }
 
 // chat_interactive_disarm restores both dispositions, which is teardown: the process is
@@ -77,16 +70,14 @@ chat_interactive_disarm :: proc(state: ^Chat_Interactive_Signals) {
 // chat_signal_block_watched blocks SIGINT, SIGTERM, and SIGHUP on the calling thread and
 // returns its previous mask. A thread inherits its creator's mask, so a worker that must
 // never run the handler is created between this and chat_signal_restore. A mask that
-// cannot be set leaves the thread exposed, which is what the diagnostic records.
+// cannot be set leaves the thread exposed, and the handler only stores atomics.
 chat_signal_block_watched :: proc() -> (previous: posix.sigset_t) {
 	blocked: posix.sigset_t
 	posix.sigemptyset(&blocked)
 	posix.sigaddset(&blocked, .SIGINT)
 	posix.sigaddset(&blocked, .SIGTERM)
 	posix.sigaddset(&blocked, .SIGHUP)
-	if posix.pthread_sigmask(.BLOCK, &blocked, &previous) != .NONE {
-		log_emit({level = .Error, category = .Runtime, event = "signal.block_failed"})
-	}
+	_ = posix.pthread_sigmask(.BLOCK, &blocked, &previous)
 	return
 }
 

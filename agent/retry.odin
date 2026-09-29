@@ -130,7 +130,7 @@ chat_retry_record_scheduled :: proc(
 			purpose = journal.REQUEST_PURPOSE_NAMES[purpose],
 			reason = request_recovery_reason_name(reason),
 			next_attempt = next_attempt,
-			delay_ms = Log_Duration_Milliseconds(delay),
+			delay_ms = i64(delay / time.Millisecond),
 		},
 	)
 }

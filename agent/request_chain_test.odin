@@ -383,3 +383,148 @@ test_the_turn_record_carries_its_typed_failure :: proc(test: ^testing.T) {
 	testing.expect_value(test, completion.cause, "no_candidate")
 	testing.expect_value(test, completion.detail, "the request does not fit the context: no summary")
 }
+
+@(test)
+test_a_prepared_request_records_its_admission :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(test, chat, "say something")
+
+	responses := []string{agent_provider_reply("ready")}
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the request completed")
+	records, _, read_error := journal.read_records(
+		&fixture.store,
+		{session = chat.session, kinds = {.Request_Prepared, .Request_Admitted}},
+		0,
+		0,
+		context.allocator,
+	)
+	if read_error != nil { testing.fail_now(test, "the request records could not be read") }
+	defer journal.records_destroy(records, context.allocator)
+	if !testing.expect_value(test, len(records), 2) { return }
+
+	request: journal.Request_Id
+	prepared_found, admitted_found := false, false
+	for record in records {
+		testing.expect_value(test, record.turn, journal.Turn_Id(1))
+		testing.expect_value(test, record.request != 0, true)
+		testing.expect_value(test, record.provider, chat.provider_id)
+		testing.expect_value(test, record.model, chat.model_id)
+		#partial switch record.kind {
+		case .Request_Prepared:
+			payload: journal.Request_Prepared
+			if journal.payload_decode(record.data, &payload, context.temp_allocator) != nil {
+				testing.fail_now(test, "request.prepared could not be decoded")
+			}
+			testing.expect_value(test, payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
+			testing.expect_value(test, payload.api, "openai_chat_completions")
+			testing.expect_value(test, payload.transport, "http")
+			testing.expect(test, payload.estimate > 0, "the prepared request carries its estimate")
+			testing.expect_value(test, payload.context_window, CHAT_DEFAULT_CONTEXT_WINDOW)
+			testing.expect(test, payload.messages > 0, "the prepared request counts its messages")
+			request = record.request
+			prepared_found = true
+		case .Request_Admitted:
+			payload: journal.Request_Admitted
+			if journal.payload_decode(record.data, &payload, context.temp_allocator) != nil {
+				testing.fail_now(test, "request.admitted could not be decoded")
+			}
+			testing.expect_value(test, payload.decision, "fits")
+			testing.expect(test, payload.estimate > 0, "the admission carries its estimate")
+			testing.expect_value(test, payload.context_window, CHAT_DEFAULT_CONTEXT_WINDOW)
+			admitted_found = true
+		}
+	}
+	testing.expect(test, prepared_found, "the request preparation is recorded")
+	testing.expect(test, admitted_found, "the admission decision is recorded")
+	for record in records { testing.expect_value(test, record.request, request) }
+}
+
+@(test)
+test_a_retry_records_its_schedule_and_completion :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(test, chat, "say something")
+
+	refusal := `{"error":{"message":"Rate limit reached"}}`
+	responses := []string{agent_provider_refusal("429 Too Many Requests", refusal, "retry-after: 0\r\n"), agent_provider_reply("second try")}
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed after a retry")
+
+	records, _, read_error := journal.read_records(
+		&fixture.store,
+		{session = chat.session, kinds = {.Retry_Scheduled, .Retry_Completed}},
+		0,
+		0,
+		context.allocator,
+	)
+	if read_error != nil { testing.fail_now(test, "the retry records could not be read") }
+	defer journal.records_destroy(records, context.allocator)
+	if !testing.expect_value(test, len(records), 2) { return }
+
+	scheduled := records[0]
+	completed := records[1]
+	testing.expect_value(test, scheduled.kind, journal.Record_Kind.Retry_Scheduled)
+	testing.expect_value(test, completed.kind, journal.Record_Kind.Retry_Completed)
+	testing.expect_value(test, scheduled.request != 0, true)
+	testing.expect_value(test, completed.request, scheduled.request)
+	testing.expect_value(test, scheduled.attempt, journal.Attempt_No(1))
+	testing.expect_value(test, completed.attempt, journal.Attempt_No(2))
+	scheduled_payload: journal.Retry_Scheduled
+	if journal.payload_decode(scheduled.data, &scheduled_payload, context.temp_allocator) != nil {
+		testing.fail_now(test, "retry.scheduled could not be decoded")
+	}
+	testing.expect_value(test, scheduled_payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
+	testing.expect_value(test, scheduled_payload.reason, "transient_failure")
+	testing.expect_value(test, scheduled_payload.next_attempt, 2)
+	completed_payload: journal.Retry_Completed
+	if journal.payload_decode(completed.data, &completed_payload, context.temp_allocator) != nil {
+		testing.fail_now(test, "retry.completed could not be decoded")
+	}
+	testing.expect_value(test, completed_payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
+	testing.expect_value(test, completed_payload.outcome, "resent")
+}
+
+@(test)
+test_a_runtime_message_is_recorded_with_its_level_and_text :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	_test_accept(test, chat, "first")
+
+	chat_runtime_message(chat, .Warning, "something odd")
+	testing.expect(test, chat_commit(chat, "the runtime message"))
+
+	records, _, read_error := journal.read_records(&fixture.store, {session = chat.session, kinds = {.Runtime_Message}}, 0, 0, context.allocator)
+	if read_error != nil { testing.fail_now(test, "the runtime messages could not be read") }
+	defer journal.records_destroy(records, context.allocator)
+	if !testing.expect_value(test, len(records), 1) { return }
+	message: journal.Runtime_Message
+	if journal.payload_decode(records[0].data, &message, context.temp_allocator) != nil { testing.fail_now(test, "runtime.message could not be decoded") }
+	testing.expect_value(test, message.level, journal.RUNTIME_LEVEL_NAMES[.Warning])
+	testing.expect_value(test, message.text, "something odd")
+}

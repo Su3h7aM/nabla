@@ -3,7 +3,6 @@
 package main
 
 import "core:os"
-import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -63,69 +62,52 @@ shutdown_test_start :: proc(t: ^testing.T, state: ^Shutdown_Test_Thread, name: s
 
 // shutdown_test_release unblocks the thread and retires it, so every test ends with the
 // thread freed rather than abandoned.
-shutdown_test_release :: proc(t: ^testing.T, state: ^Shutdown_Test_Thread, worker: ^thread.Thread, name: string) {
+shutdown_test_release :: proc(t: ^testing.T, state: ^Shutdown_Test_Thread, worker: ^thread.Thread) {
 	sync.mutex_lock(&state.mu)
 	state.stop = true
 	sync.cond_broadcast(&state.cond)
 	sync.mutex_unlock(&state.mu)
-	retired := join_retiring(worker, name, 2 * time.Second)
+	retired := join_retiring(worker, 2 * time.Second)
 	testing.expect(t, retired, "a released thread should retire")
 	if !retired { return }
 	free(state, os.heap_allocator())
 }
 
 @(test)
-test_join_retiring_reports_a_thread_that_never_returns :: proc(t: ^testing.T) {
-	fixture: Log_Fixture
-	log_fixture_open(t, &fixture)
-	defer log_fixture_close(&fixture)
-	context.logger = fixture.logger
-
+test_join_retiring_gives_up_on_a_thread_that_never_returns :: proc(t: ^testing.T) {
 	state := shutdown_test_state()
 	worker := shutdown_test_start(t, state, "nabla-test-stuck")
-	// The wait is short because the point is the report, not the five seconds a real
+	// The wait is short because the point is giving up, not the five seconds a real
 	// shutdown grants a tool before it gives up on it.
-	testing.expect(t, !join_retiring(worker, "nabla-test-stuck", 20 * time.Millisecond), "a thread that never returns must not be reported as retired")
+	testing.expect(t, !join_retiring(worker, 20 * time.Millisecond), "a thread that never returns must not be reported as retired")
 	// A thread that did not retire is left alone: thread.destroy would join it here.
 	testing.expect(t, !thread.is_done(worker), "the thread should still be running")
-	records := log_fixture_records(&fixture)
-	testing.expectf(t, strings.contains(records, "runtime.thread_unretired"), "no unretired-thread record: %s", records)
-	testing.expectf(t, strings.contains(records, "thread=nabla-test-stuck"), "the record does not name the thread: %s", records)
 
-	shutdown_test_release(t, state, worker, "nabla-test-stuck")
+	shutdown_test_release(t, state, worker)
 }
 
 @(test)
 test_join_retiring_releases_a_thread_that_returns :: proc(t: ^testing.T) {
 	state := shutdown_test_state()
 	worker := shutdown_test_start(t, state, "nabla-test-returning")
-	shutdown_test_release(t, state, worker, "nabla-test-returning")
+	shutdown_test_release(t, state, worker)
 }
 
-// Shutdown gives up on a worker that does not retire instead of waiting for it, and it says
-// so in the record. Nothing below that point is released: the worker can still reach the
-// channel and the log binding the rest of the release path would free.
+// Shutdown gives up on a worker that does not retire instead of waiting for it. Nothing
+// below that point is released: the worker can still reach the channel and the snapshot
+// the rest of the release path would free.
 @(test)
 test_app_teardown_abandons_its_release_path_for_a_stuck_worker :: proc(t: ^testing.T) {
-	fixture: Log_Fixture
-	log_fixture_open(t, &fixture)
-	defer log_fixture_close(&fixture)
-	context.logger = fixture.logger
-
 	app := App{}
-	app.setup.log_binding = fixture.binding
 	state := shutdown_test_state()
 	app.run.worker = shutdown_test_start(t, state, "nabla-test-worker")
 	abandoned := app_teardown(&app, 20 * time.Millisecond)
 
 	testing.expect(t, abandoned, "teardown must report that it left a worker running")
 	testing.expect(t, app.run.worker != nil, "a worker that did not retire must not be claimed retired")
-	records := log_fixture_records(&fixture)
-	testing.expectf(t, strings.contains(records, "runtime.thread_unretired"), "no unretired-thread record: %s", records)
-	testing.expectf(t, strings.contains(records, "runtime.teardown_abandoned"), "the release path was abandoned silently: %s", records)
 
 	// The teardown left the worker to the process; the test releases and retires it so the
 	// suite holds no thread of its own.
-	shutdown_test_release(t, state, app.run.worker, "nabla-test-worker")
+	shutdown_test_release(t, state, app.run.worker)
 	app.run.worker = nil
 }

@@ -100,7 +100,6 @@ chat_cli_parse :: proc(args: []string) -> (chat_cli_options, Cli_Parse_Error) {
 chat_cli_usage :: proc() {
 	fmt.println("nabla [--config PATH] [--resume [SESSION]] [--provider ID --model ID] [--prompt TEXT]")
 	fmt.println("nabla acp                         run an Agent Client Protocol agent on stdin and stdout")
-	fmt.println("nabla diagnostics <session-id>    print what one session left in the diagnostic logs")
 	fmt.println("default config: $XDG_CONFIG_HOME/nabla/config.lua (~/.config/nabla/config.lua)")
 	fmt.println("without --resume, a new session starts in the current directory")
 	fmt.println("--resume opens the newest session for the current directory; --resume SESSION opens that one")
@@ -246,10 +245,7 @@ run_prompt :: proc(
 		start.id = options.resume_id
 	}
 	app.setup.harness_options = harness_options
-	// The writer is opened and the logger installed in the scope that owns the run,
-	// so the headless path records the same launch the interactive one does.
 	app.setup.alloc = context.allocator
-	context.logger = run_log_open(&app.setup)
 	if !run_catalog(sources, mcp_servers, &app.setup, start) { return 1 }
 	// The model this run picks belongs to the job, not to the user: a headless run
 	// must not change what the interactive harness starts with.
@@ -291,9 +287,6 @@ config_error_display_text :: proc(path: string, err: agent.Config_Error, detail:
 // exit and the deferred cleanup still runs.
 chat_main :: proc() -> int {
 	args := os.args[1:]
-	// A subcommand is recognized before the launch options, because its argument is
-	// a session id rather than a flag.
-	if len(args) > 0 && args[0] == "diagnostics" { return diagnostics_main(args[1:], stdout_writer(), stderr_writer()) }
 	// The ACP agent is a front-end of its own: it takes over the process's standard
 	// streams, so it is a subcommand rather than a launch option.
 	if len(args) > 0 && args[0] == "acp" { return acp_main(args[1:]) }
@@ -378,8 +371,7 @@ stdout_writer :: proc() -> io.Writer {
 	return io.to_writer(os.to_stream(os.stdout))
 }
 
-// stderr_writer is where a real run's human-facing notices go. Records go to
-// stdout exactly as written; the summary and unreadable evidence go here.
+// stderr_writer is where a real run's human-facing notices go.
 stderr_writer :: proc() -> io.Writer {
 	return io.to_writer(os.to_stream(os.stderr))
 }

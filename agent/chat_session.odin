@@ -269,9 +269,6 @@ Chat_Session :: struct {
 // The error is the zero value when the session is ready, and otherwise why it was not
 // built: a tool registry error, or kind Allocation for an allocation the session's own
 // state needed. Nothing is left owned when it is not the zero value.
-//
-// Diagnostics are not a field here. The session's work inherits the writer from
-// context.logger, which is what lets a call site emit without threading one.
 @(require_results)
 chat_session_init :: proc(
 	store: ^journal.Journal,
@@ -480,8 +477,8 @@ chat_clone_string :: proc(value: string, allocator: mem.Allocator) -> (string, m
 
 // chat_last_error_set replaces the session's own failure text, which is what the terminal
 // status, the turn's record, and a front-end read. A text that cannot be kept leaves no
-// reason rather than a stale one, and what the session could not keep is logged here
-// instead, so the failure is still recorded somewhere.
+// reason rather than a stale one, and what the session could not keep is recorded as a
+// runtime message instead, so the failure is still in the journal.
 chat_last_error_set :: proc(chat: ^Chat_Session, message: string) {
 	delete(chat.last_error, chat.allocator)
 	chat.last_error = ""
@@ -490,12 +487,7 @@ chat_last_error_set :: proc(chat: ^Chat_Session, message: string) {
 		chat.last_error = cloned
 		return
 	}
-	binding: Log_Binding
-	previous_logger := context.logger
-	defer context.logger = previous_logger
-	context.logger = log_rebind(&binding, log_correlation(chat))
-	fields := [2]Log_Field{{key = "detail", value = message}, {key = "detail_bytes", value = i64(len(message))}}
-	log_emit({level = .Error, category = .Agent, event = "agent.failure_text_lost", fields = fields[:]})
+	chat_runtime_message(chat, .Error, message)
 }
 
 // chat_pending_calls_clear releases calls a turn staged but never ran, such as
@@ -559,7 +551,7 @@ chat_session_fail :: proc(chat: ^Chat_Session, what: string, detail := "", latch
 	} else {
 		joined, join_error := strings.concatenate({what, ": ", detail}, chat.allocator)
 		if join_error != nil {
-			// The failure is recorded and logged either way; the detail is what a join that
+			// The failure is recorded either way; the detail is what a join that
 			// did not fit costs.
 			chat_last_error_set(chat, what)
 		} else {
@@ -567,14 +559,6 @@ chat_session_fail :: proc(chat: ^Chat_Session, what: string, detail := "", latch
 			chat.last_error = joined
 		}
 	}
-	// The failure can be reached from any depth, so the binding is narrowed here to
-	// the session the failure belongs to.
-	binding: Log_Binding
-	previous_logger := context.logger
-	defer context.logger = previous_logger
-	context.logger = log_rebind(&binding, log_correlation(chat))
-	fields := [2]Log_Field{{key = "operation", value = what}, {key = "detail_bytes", value = i64(len(detail))}}
-	log_emit({level = .Error, category = .Storage, event = "storage.failed", fields = fields[:]})
 	chat.active_failed = true
 	if latch { chat.storage_failed = true }
 	chat.state = .Finalizing
@@ -591,13 +575,6 @@ chat_session_accept_user :: proc(chat: ^Chat_Session, text: string) -> Chat_Acce
 chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: journal.User_Origin) -> Chat_Accept {
 	if chat.storage_failed { return .Storage_Failed }
 	if chat.state != .Idle { return .Busy }
-
-	// The turn does not exist yet, so the binding is installed with what is known
-	// and its correlation is refreshed once the durable turn number is.
-	binding: Log_Binding
-	previous_logger := context.logger
-	defer context.logger = previous_logger
-	context.logger = log_rebind(&binding, log_correlation(chat))
 	if !chat_session_recover_pending(chat) { return .Storage_Failed }
 
 	// A new session is created by its first prompt, so a session nobody prompted is
@@ -629,7 +606,7 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 		if title_error != nil {
 			// A session that cannot be named is still a session: the title is a listing
 			// line, and the turn this prompt opens is what matters.
-			log_emit({level = .Warning, category = .Agent, event = "agent.title_lost"})
+			chat_runtime_message(chat, .Warning, "the session title could not be allocated")
 		} else {
 			defer delete(title, chat.allocator)
 			chat_record(chat, {kind = .Session_Titled}, journal.Session_Titled{title = title})
@@ -740,38 +717,12 @@ chat_session_event_source :: proc(chat: ^Chat_Session) -> Chat_Event_Source {
 
 // chat_session_accepts_event is the single gate for turn state changes. An event
 // is accepted only while its own operation is the running one, so an event from a
-// cancelled, retired, or superseded operation cannot mutate a newer turn. A
-// refusal is recorded with its reason: dropping the event is correct, and the
-// reason is what makes the drop legible later.
+// cancelled, retired, or superseded operation cannot mutate a newer turn. Dropping a
+// refused event is correct and leaves no record.
 @(require_results)
 chat_session_accepts_event :: proc(chat: ^Chat_Session, source: Chat_Event_Source) -> bool {
-	reason := ""
-	switch {
-	case chat.state != .Requesting:
-		reason = "not_receiving"
-	case chat.active_turn_id != source.turn_id:
-		reason = "superseded_turn"
-	case chat.operation.id != source.operation_id:
-		reason = "superseded_operation"
-	case chat.operation.state != .Running:
-		reason = "operation_retired"
-	}
-	if reason == "" { return true }
-
-	// The refused event is recorded against the session and the operation the
-	// harness is actually running, not the one the event claimed.
-	binding: Log_Binding
-	previous_logger := context.logger
-	defer context.logger = previous_logger
-	context.logger = log_rebind(&binding, log_correlation(chat))
-	fields := [4]Log_Field {
-		{key = "reason", value = reason},
-		{key = "supplied_turn", value = i64(source.turn_id)},
-		{key = "supplied_operation", value = source.operation_id},
-		{key = "current_operation", value = chat.operation.id},
-	}
-	log_emit({level = .Debug, category = .Agent, event = "agent.event_ignored", fields = fields[:]})
-	return false
+	if chat.state != .Requesting || chat.active_turn_id != source.turn_id { return false }
+	return chat.operation.id == source.operation_id && chat.operation.state == .Running
 }
 
 // chat_session_begin_operation takes ownership of the next operation for the

@@ -104,7 +104,6 @@ app_session_end :: proc(app: ^App, directory: string) {
 // catalog teardown an empty setup does not need.
 attach_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
-	run_log_close(setup)
 	// The launch's own teardown; a close failure changes nothing the test reads.
 	_ = run_store_close(setup)
 	setup.store = nil
@@ -1134,13 +1133,6 @@ test_refresh_degrades_to_native_tools_when_a_server_is_unusable :: proc(t: ^test
 	mcp_ok: bool
 	app.setup.mcp, mcp_ok = mcp_runtime_make(servers, context.allocator)
 	if !mcp_ok { testing.fail_now(t, "the MCP runtime could not be created") }
-	ring, allocation_error := new(agent.Diag_Ring, app.setup.alloc)
-	if allocation_error != nil { testing.fail_now(t, "could not allocate diagnostics") }
-	defer free(ring, app.setup.alloc)
-	app.setup.log_binding = agent.Log_Binding {
-		ring = ring,
-	}
-	context.logger = agent.log_logger(&app.setup.log_binding)
 	// The registry borrows the runtime's bindings, so the session goes first and the
 	// clients second. The directory belongs to app_session_end.
 	defer {
@@ -1160,16 +1152,6 @@ test_refresh_degrades_to_native_tools_when_a_server_is_unusable :: proc(t: ^test
 	testing.expect(t, native_present, "the native tools survive a broken server")
 	_, remote_present := agent.tool_registry_find(&app.setup.session.tools, "broken_read")
 	testing.expect(t, !remote_present, "an unreachable server contributes no tools")
-
-	entry: agent.Diag_Entry
-	if !testing.expect(t, agent.diag_pop(ring, &entry), "the refresh should report its start") { return }
-	testing.expect(t, strings.contains(string(entry.text[:entry.text_length]), "tools.refresh_started"))
-	if !testing.expect(t, agent.diag_pop(ring, &entry), "the refresh should report its result") { return }
-	text := string(entry.text[:entry.text_length])
-	testing.expect(t, strings.contains(text, "installed=true"))
-	testing.expect(t, strings.contains(text, "unavailable_servers=1"))
-	testing.expect(t, strings.contains(text, "accepted=0"))
-	testing.expect(t, !agent.diag_pop(ring, &entry), "the refresh reports only its start and result")
 }
 
 // With nothing configured, refresh has nothing to do and says nothing.
@@ -1250,37 +1232,6 @@ test_a_launch_records_its_run_and_the_claims_of_its_sessions :: proc(t: ^testing
 	testing.expect(t, !claimed.resumed, "a session the launch created is not a resumed one")
 	testing.expect_value(t, journal.payload_decode(records[5].data, &claimed, context.temp_allocator), nil)
 	testing.expect(t, claimed.resumed, "a session an earlier launch left is a resumed one")
-}
-
-@(test)
-test_the_mcp_lifecycle_records_name_the_server_instance :: proc(t: ^testing.T) {
-	// The stdio harness covers the process boundary; this checks emitted lifecycle facts.
-	ring, allocation_error := new(agent.Diag_Ring, context.allocator)
-	if allocation_error != nil { testing.fail_now(t, "could not allocate diagnostics") }
-	defer free(ring, context.allocator)
-	session_id, valid := journal.session_id_parse("00112233445566778899aabbccddeeff")
-	if !testing.expect(t, valid) { return }
-	binding := agent.Log_Binding {
-		ring = ring,
-		correlation = agent.Log_Correlation{session = session_id},
-	}
-	context.logger = agent.log_logger(&binding)
-
-	log_mcp_started("files", 2)
-	log_mcp_negotiated("files", 2, {version = .V2026_07_28, server_name = "stub", server_version = "1", tools_supported = true})
-	log_mcp_stopped("files", 2, "restart")
-
-	entry: agent.Diag_Entry
-	if !testing.expect(t, agent.diag_pop(ring, &entry), "the start is recorded") { return }
-	testing.expect_value(t, entry.session, session_id)
-	testing.expect(t, strings.contains(string(entry.text[:entry.text_length]), "mcp.started server_id=files server_instance=2"))
-	if !testing.expect(t, agent.diag_pop(ring, &entry), "the negotiation is recorded") { return }
-	text := string(entry.text[:entry.text_length])
-	testing.expect(t, strings.contains(text, "mcp.negotiated"))
-	testing.expect(t, strings.contains(text, "revision="))
-	testing.expect(t, strings.contains(text, "tools_supported=true"))
-	if !testing.expect(t, agent.diag_pop(ring, &entry), "the stop is recorded") { return }
-	testing.expect(t, strings.contains(string(entry.text[:entry.text_length]), "mcp.stopped server_id=files server_instance=2 reason=restart"))
 }
 
 @(test)

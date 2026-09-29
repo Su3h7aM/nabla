@@ -247,12 +247,12 @@ acp_server_destroy :: proc(server: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIEN
 		agent.owner_wake_signal()
 	}
 	if server.worker != nil {
-		if join_retiring(server.worker, "nabla-acp-worker", patience) {
+		if join_retiring(server.worker, patience) {
 			server.worker = nil
 		} else {
-			// The worker still owns the session and the log binding. Nothing below may
-			// run or be freed; the process exits with what that thread can reach.
-			agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.teardown_abandoned"})
+			// The worker still owns the session. Nothing below may run or be freed; the
+			// process exits with what that thread can reach.
+			fmt.eprintln("nabla: the ACP worker did not stop in time; the process exits without releasing what it still uses")
 			return false
 		}
 	}
@@ -263,8 +263,7 @@ acp_server_destroy :: proc(server: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIEN
 	}
 	if server.work != {} { chan.destroy(&server.work) }
 	if !acp.writer_destroy(&server.writer, patience) {
-		fields := [2]agent.Log_Field{{key = "thread", value = "nabla-acp-writer"}, {key = "waited_ms", value = agent.Log_Duration_Milliseconds(patience)}}
-		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "runtime.thread_unretired", fields = fields[:]})
+		fmt.eprintln("nabla: the ACP writer thread did not stop in time; the process leaves it running")
 	}
 	sync.mutex_lock(&server.mu)
 	delete(server.session_id, server.alloc)
@@ -276,7 +275,7 @@ acp_server_destroy :: proc(server: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIEN
 	server.active_message_id = ""
 	snapshot_destroy(&server.app)
 	if server.app.setup.workers_abandoned || agent.chat_session_workers_outstanding(&server.app.setup.session) {
-		agent.log_emit(agent.Log_Record{level = .Warning, category = .Runtime, event = "runtime.workers_outstanding"})
+		fmt.eprintln("nabla: a tool worker did not stop in time; the process exits without releasing what it still uses")
 		return false
 	}
 	run_setup_destroy(&server.app.setup)
@@ -292,10 +291,8 @@ acp_server_destroy :: proc(server: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIEN
 // inbox for the next prompt's turn. It leaves when the queue is closed and drained.
 acp_worker :: proc(thread_handle: ^thread.Thread) {
 	server := cast(^Acp_Server)thread_handle.data
-	// A thread started without init_context gets the default context, so the run's
-	// logger and the server's allocator, which the work it destroys was allocated
-	// with, are installed here.
-	context.logger = agent.log_logger(&server.app.setup.log_binding)
+	// A thread started without init_context gets the default context, so the server's
+	// allocator, which the work it destroys was allocated with, is installed here.
 	context.allocator = server.alloc
 	for {
 		seen := agent.owner_wake_seen()
@@ -350,8 +347,6 @@ acp_run_work :: proc(server: ^Acp_Server, work: Acp_Work) {
 	// to the turn that just ended; a client that cancels a finished turn is ignored.
 	agent.turn_control_clear(&server.app.run.control)
 	acp_queue_remove(server)
-	// The worker owns the journal, so the diagnostics commit waits for no reply.
-	run_log_flush(&server.app.setup)
 }
 
 // --- opening a session -------------------------------------------------------
@@ -461,13 +456,9 @@ acp_work_open_session :: proc(server: ^Acp_Server, work: Acp_Work) {
 
 acp_restore_base_runtime :: proc(server: ^Acp_Server) {
 	// A failed restore leaves the zero runtime: no MCP servers. The caller reports the
-	// failure that led here either way, so the restore failure is recorded in the log
-	// rather than answered twice.
-	restored, restore_ok := mcp_runtime_make(server.base_mcp_servers, server.app.setup.alloc)
+	// failure that led here either way, so the restore failure is not answered twice.
+	restored, _ := mcp_runtime_make(server.base_mcp_servers, server.app.setup.alloc)
 	server.app.setup.mcp = restored
-	if !restore_ok {
-		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "acp.mcp_restore_failed"})
-	}
 }
 
 @(require_results)
@@ -564,9 +555,7 @@ acp_session_select_model :: proc(server: ^Acp_Server) {
 	if app.setup.provider_id != "" && app.setup.model_id != "" {
 		if apply_selection(app, app.setup.provider_id, app.setup.model_id, "") { return }
 	}
-	if app.setup.model_id == "" && !acp_select_first_model(server) {
-		agent.log_emit(agent.Log_Record{level = .Warning, category = .Runtime, event = "acp.session_without_model"})
-	}
+	if app.setup.model_id == "" { _ = acp_select_first_model(server) }
 }
 
 // acp_select_startup_model chooses the model this process runs with: the user's own last
@@ -819,9 +808,10 @@ acp_work_close_session :: proc(server: ^Acp_Server, work: Acp_Work) {
 	acp_invalidate_published_session(server)
 	agent.chat_session_destroy(&server.app.setup.session)
 	// A release failure is recorded rather than answered: the session is already
-	// destroyed, so the close stands either way.
+	// destroyed, so the close stands either way. The journal is what failed to close, so
+	// the report goes to stderr.
 	if release_error := session_store_close(server.app.setup.store, server.app.setup.alloc); release_error != nil {
-		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "acp.session_release_failed"})
+		fmt.eprintln("nabla: the session database could not be closed cleanly:", journal.error_text(release_error, context.temp_allocator))
 	}
 	server.app.setup.store = nil
 	mcp_runtime_destroy(&server.app.setup.mcp)
@@ -1244,12 +1234,12 @@ acp_replay_assistant_message_id :: proc(item: agent.Projection_Item) -> string {
 
 // acp_set_active_message_id names the v2 answer being streamed. The id is owned by
 // the server so it outlives the scratch memory the streamed chunks borrow. A copy
-// that fails is recorded and leaves the previous id in place, so the stream
+// that fails is recorded as a runtime message and leaves the previous id in place, so the stream
 // continues under the id it already had rather than under none.
 acp_set_active_message_id :: proc(server: ^Acp_Server, message_id: string) {
 	owned, clone_error := strings.clone(message_id, server.alloc)
 	if clone_error != nil {
-		agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "acp.message_id_failed"})
+		agent.chat_runtime_message(&server.app.setup.session, .Warning, "the answer's message id could not be copied; the stream keeps its previous id")
 		return
 	}
 	delete(server.active_message_id, server.alloc)

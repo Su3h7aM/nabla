@@ -138,7 +138,6 @@ Tool_Job :: struct {
 	arguments:      Tool_Args,
 	exec:           Tool_Context, // what the executor is given, for the job's whole life
 	output_base:    string, // owned by allocator; what exec.output_base borrows
-	logging:        Log_Binding, // the worker's correlation, captured at admission
 
 	// control
 	phase:          Tool_Job_Phase,
@@ -214,9 +213,9 @@ tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) {
 			tool_jobs_mark_abandoned(jobs, job)
 		}
 		if job.phase == .Abandoned {
-			if jobs.abandoned == nil || append(jobs.abandoned, job) != 1 {
-				log_emit({level = .Error, category = .Tool, event = "tool.job_leaked"})
-			}
+			// A job that cannot be listed stays with its worker, which is a leak: its
+			// abandonment is already recorded, and the session is ending.
+			if jobs.abandoned != nil { _ = append(jobs.abandoned, job) }
 			continue
 		}
 		tool_job_release(job)
@@ -378,14 +377,6 @@ tool_jobs_submit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 // never dispatched, and the record says so by having no dispatch entry.
 @(private)
 tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer, job: ^Tool_Job) {
-	job.logging = tool_job_logging(job, chat)
-	// Admission is the owner's, so every record it makes belongs to this call rather
-	// than to the batch. The binding lives in the job, so the logger the frame leaves
-	// behind points at storage that outlives it.
-	previous := context.logger
-	context.logger = log_logger(&job.logging)
-	defer context.logger = previous
-
 	job.exec = Tool_Context {
 		call_id   = job.call_id,
 		workspace = chat.workspace,
@@ -497,16 +488,6 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	job.exec.arguments_json = job.admitted.effective
 }
 
-// tool_job_logging captures the owner's log destination for one call, because a worker
-// thread has no context to inherit and would otherwise log nowhere.
-@(private)
-tool_job_logging :: proc(job: ^Tool_Job, chat: ^Chat_Session) -> Log_Binding {
-	active := context.logger
-	if active.procedure != log_procedure { return {} }
-	source := cast(^Log_Binding)active.data
-	if source.ring == nil { return {} }
-	return Log_Binding{ring = source.ring, correlation = log_correlation_for_call(chat, job.call_id)}
-}
 
 // --- decisions -----------------------------------------------------------------
 
@@ -570,8 +551,6 @@ tool_jobs_note_stops :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
 		if !tool_control_cancelled(job.exec.control) { continue }
 		job.stopping = true
 		job.stop_at = now
-		fields := [2]Log_Field{{key = "tool", value = job.name}, {key = "patience_ms", value = Log_Duration_Milliseconds(TOOL_JOBS_STOP_PATIENCE)}}
-		log_emit({level = .Warning, category = .Tool, event = "tool.stop_requested", fields = fields[:]})
 	}
 }
 
@@ -710,9 +689,6 @@ tool_jobs_latch_stop :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	if candidate == .None { return }
 	if jobs.stop == .None {
 		jobs.stop = candidate
-		reason := candidate == .Storage_Failed ? "storage_failed" : "cancelled"
-		fields := [1]Log_Field{{key = "reason", value = reason}}
-		log_emit({level = .Info, category = .Tool, event = "tool.batch_stopping", fields = fields[:]})
 	}
 	// A running job is asked once; the request is latched in its own token, so a
 	// repeat is harmless and a job that ignores it is drained, not forgotten.
@@ -749,9 +725,6 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		tool_job_lua_resume(jobs, chat, job)
 		return
 	}
-	previous := context.logger
-	context.logger = log_logger(&job.logging)
-	defer context.logger = previous
 	job.phase = .Dispatching
 
 	repair_names: [len(Tool_Repair)]string
@@ -831,9 +804,6 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer, now: time.Tick) {
 	job := tool_jobs_overdue(jobs, now)
 	if job == nil { return }
-	previous := context.logger
-	context.logger = log_logger(&job.logging)
-	defer context.logger = previous
 
 	if sync.atomic_load(&job.published) { return }
 	message := fmt.tprintf("the tool did not stop within %v of its stop being requested; its outcome is unknown", TOOL_JOBS_STOP_PATIENCE)
@@ -906,9 +876,6 @@ tool_result_report_repairs :: proc(result: ^Tool_Result, repairs: Tool_Repairs) 
 tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer) {
 	job := tool_jobs_earliest_live(jobs)
 	if job == nil || job.phase != .Result_Ready { return }
-	previous := context.logger
-	context.logger = log_logger(&job.logging)
-	defer context.logger = previous
 	job.phase = .Committing
 
 	// The commit takes the result off the job: one owner at a time, and the release here is
@@ -1017,13 +984,9 @@ tool_jobs_await :: proc(jobs: ^Tool_Jobs, deadline: Maybe(time.Tick)) {
 
 // --- the executor --------------------------------------------------------------
 
-// tool_job_execute runs one admitted call. It runs on whichever thread owns the job, so
-// every diagnostic it makes carries the job's own correlation rather than the caller's.
+// tool_job_execute runs one admitted call on whichever thread owns the job.
 @(private, require_results)
 tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
-	previous := context.logger
-	context.logger = log_logger(&job.logging)
-	defer context.logger = previous
 	return job.execute(&job.exec, job.arguments)
 }
 
@@ -1057,7 +1020,6 @@ tool_job_request_stop :: proc(job: ^Tool_Job) {
 tool_job_worker :: proc(worker: ^thread.Thread) {
 	job := cast(^Tool_Job)worker.data
 	context.allocator = job.allocator
-	context.logger = log_logger(&job.logging)
 
 	job.result = tool_job_execute(job)
 	job.result_present = true

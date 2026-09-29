@@ -32,9 +32,6 @@ Run_Setup :: struct {
 	// run_open says the running session's journal carries this launch's run.started, so
 	// run.finished is owed when the launch ends.
 	run_open:          bool,
-	// log_binding is what context.logger points at while the run logs; its ring is
-	// owned, nil while diagnostics are off.
-	log_binding:       agent.Log_Binding,
 	session:           agent.Chat_Session,
 	workspace:         string, // owned; the directory sessions here run in
 	provider_id:       string, // owned,
@@ -430,7 +427,7 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 	opened^ = {}
 	setup.session = new_session
 	if agent.chat_session_apply_harness(&setup.session, setup.harness_options).kind != .None {
-		agent.log_emit({level = .Error, category = .Tool, event = "tools.agents_undescribed"})
+		agent.chat_runtime_message(&setup.session, .Error, "the subagent tool descriptions could not be applied to the session")
 	}
 	return true
 }
@@ -466,8 +463,8 @@ session_store_close :: proc(store: ^journal.Journal, allocator: mem.Allocator, f
 // run_store_close ends the launch's use of the journal: the launch's run.finished when it
 // recorded a run.started, then the close, which records the session's release. A launch whose
 // last session was closed has no running store, so one is opened to carry run.finished; when
-// that fails the run reads as ended abruptly and the error is returned. Call it after the
-// diagnostics are flushed, on the thread that owns the journal.
+// that fails the run reads as ended abruptly and the error is returned. Call it on the
+// thread that owns the journal.
 @(require_results)
 run_store_close :: proc(setup: ^Run_Setup) -> journal.Error {
 	finish := setup.run_open

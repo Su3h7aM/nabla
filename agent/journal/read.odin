@@ -11,9 +11,6 @@ import "nabla:db"
 // match every kind or node.
 Filter :: struct {
 	session:  Session_Id,
-	// named also matches session-less records whose data names session, such as a
-	// runtime.message another session's owner drained.
-	named:    bool,
 	kinds:    bit_set[Record_Kind;u128],
 	turn:     Turn_Id,
 	request:  Request_Id,
@@ -563,11 +560,7 @@ query_add :: proc(query: ^Query, sql: string, arguments: ..db.Value) -> mem.Allo
 // query_filter binds the session id by reference, so filter must outlive the query.
 @(private, require_results)
 query_filter :: proc(query: ^Query, filter: ^Filter) -> mem.Allocator_Error {
-	if filter.session != {} && filter.named {
-		hex_text: [SESSION_ID_HEX_LENGTH]u8
-		hex := strings.clone(session_id_to_hex(filter.session, hex_text[:]), context.temp_allocator) or_return
-		query_add(query, " AND (session = ? OR (session IS NULL AND json_extract(data, '$.session') = ?))", db.Value(filter.session[:]), hex) or_return
-	} else if filter.session != {} {
+	if filter.session != {} {
 		query_add(query, " AND session = ?", db.Value(filter.session[:])) or_return
 	}
 	if filter.turn != 0 { query_add(query, " AND turn = ?", i64(filter.turn)) or_return }

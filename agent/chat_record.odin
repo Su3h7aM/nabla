@@ -131,7 +131,7 @@ chat_send_rejection :: proc(result: Chat_Send_Result) -> journal.Response_Reject
 		text_exposed        = result.text_exposed,
 		completion_accepted = result.completion_accepted,
 		recovery            = request_recovery_reason_name(result.recovery),
-		delay_ms            = Log_Duration_Milliseconds(result.delay),
+		delay_ms            = i64(result.delay / time.Millisecond),
 		detail              = result.message,
 	}
 	if !result.error_present { return rejection }
@@ -144,7 +144,7 @@ chat_send_rejection :: proc(result: Chat_Send_Result) -> journal.Response_Reject
 	rejection.retry_directive = ai.provider_retry_directive_name(error.retry_directive)
 	rejection.transport_cause = ai.provider_transport_cause_name(error.transport_cause)
 	rejection.detail = error.detail
-	if delay, present := error.retry_after.?; present { rejection.retry_after_ms = Log_Duration_Milliseconds(delay) }
+	if delay, present := error.retry_after.?; present { rejection.retry_after_ms = i64(delay / time.Millisecond) }
 	return rejection
 }
 

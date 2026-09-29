@@ -297,9 +297,6 @@ Compact_Job :: struct {
 	// allocator, so the two threads never share one, and a job whose worker ignores its stop
 	// outlives the allocator the session releases.
 	allocator:         mem.Allocator,
-	// logging is the immutable binding the worker uses for provider and runtime records.
-	// It points at the session's sink and owns no strings.
-	logging:           Log_Binding,
 	// finished is atomic: the worker stores it once the fields below are final.
 	finished:          bool,
 	output:            [dynamic]u8, // owner after join
@@ -383,12 +380,9 @@ chat_compact_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 		delete(job.error_text, job.allocator)
 		job.error_text = ""
 		message, clone_error := strings.clone(value.Message, job.allocator)
-		if clone_error != nil {
+		if clone_error == nil {
 			// The provider's own words are what explains the failure, and the operation's own
-			// account of the same send is what the record still carries; the loss is logged
-			// here so it is not silent.
-			log_emit({level = .Error, category = .Provider, event = "compaction.failure_text_lost"})
-		} else {
+			// account of the same send is what the record still carries when they are lost.
 			job.error_text = message
 		}
 	case ai.Provider_Usage_Event:
@@ -410,7 +404,6 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 	// allocator the owner releases it with, and that allocator is a thread-safe heap because
 	// the owner is allocating from its own at the same time.
 	context.allocator = job.allocator
-	context.logger = log_logger(&job.logging)
 	job.started_at = time.tick_now()
 
 	connection := ai.Provider_Connection {
@@ -431,10 +424,6 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 	}
 	options := ai.Provider_Operation_Options {
 		interrupt = &job.interrupt,
-	}
-	provider_log: Provider_Log
-	if log_enabled(.Info) {
-		options.observer = provider_log_observer(&provider_log)
 	}
 	job.operation = ai.Provider_Request_Operation_Encoded(connection, request, job, chat_compact_event, options, job.allocator)
 	if job.operation.detail != "" && job.error_text == "" {
@@ -724,9 +713,6 @@ chat_compact_start :: proc(
 	// A job that has started says so, from the one place a job starts. The front-end
 	// can then tell when a summary began and how long it took.
 	_observer_message(observer, .Notice, chat_compact_start_notice(trigger))
-	// The worker logs through the job's own binding, correlated with the compaction's
-	// request rather than whichever foreground request was at the boundary.
-	_ = log_rebind(&job.logging, log_correlation_for_request(chat, job.request))
 	return true
 }
 
@@ -897,7 +883,7 @@ chat_compact_abandon :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: 
 	control.state = .Idle
 	if append(&chat.abandoned_compactions, job) != 1 {
 		// The list could not grow, so the job stays where it is with the worker that reaches it.
-		log_emit({level = .Error, category = .Provider, event = "compaction.leaked"})
+		chat_runtime_message(chat, .Error, "an abandoned compaction could not be listed for reclaim and is leaked")
 	}
 }
 

@@ -19,10 +19,9 @@ import "nabla:ai"
 run_worker :: proc(thread_handle: ^thread.Thread) {
 	app := cast(^App)thread_handle.data
 	// A thread started without init_context gets the default context, not the one
-	// the creating scope modified, so the run's logger and allocator are installed
-	// here. Leaving init_context unset is what keeps the thread library managing
-	// this thread's temporary allocator.
-	context.logger = agent.log_logger(&app.setup.log_binding)
+	// the creating scope modified, so the run's allocator is installed here. Leaving
+	// init_context unset is what keeps the thread library managing this thread's
+	// temporary allocator.
 	context.allocator = app.setup.alloc
 	observer := run_observer(app)
 	// The session list the /resume menu offers is built here, because only the
@@ -242,7 +241,6 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	}
 	if rows_dirty { session_refresh_rows(app) }
 	refresh_status(app)
-	run_log_flush(&app.setup)
 }
 
 run_accepted_turn :: proc(app: ^App, observer: agent.Chat_Observer) {
@@ -610,13 +608,12 @@ snap_entry_append_text :: proc(app: ^App, entry: ^Entry, text: string) {
 // building, whether a transcript line or a status field. What is left out stays
 // out rather than being shown as an empty value, and the run continues without a
 // screen that quietly disagrees with what it kept. One report per run is what
-// keeps a failing allocator from filling the log.
+// keeps a failing allocator from filling stderr. The snapshot cannot carry the report
+// itself, because building it is what failed and its lock may be held.
 snap_report_dropped :: proc(app: ^App, alloc_error: mem.Allocator_Error) {
 	if app.run.snap.transcript_failed { return }
 	app.run.snap.transcript_failed = true
-	detail := fmt.tprintf("%v", alloc_error)
-	fields := [1]agent.Log_Field{{key = "allocation_error", value = detail}}
-	agent.log_emit(agent.Log_Record{level = .Error, category = .Runtime, event = "ui.transcript_line_dropped", fields = fields[:]})
+	fmt.eprintfln("nabla: the display could not keep a value (%v); it may be missing lines", alloc_error)
 }
 
 snap_push_locked :: proc(app: ^App, entry: Entry) {

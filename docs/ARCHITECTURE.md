@@ -11,7 +11,7 @@ Terms: "must" is a hard rule, "default" is a named, tunable value. Every numeric
 3. No consumer (model request, Lua parent, frontend terminal report, next turn) reads a result before it is committed.
 4. An effect that may have executed is never replayed automatically. Unknown is a recorded outcome, not a reason to retry.
 5. Cancellation is intent, completion is an observation, commit is durability, retirement is proof that borrows ended. None substitutes for another.
-6. The journal is the only execution record. Runtime tables hold in-flight work. Provider requests, frontend transcripts, and diagnostics are projections.
+6. The journal is the only execution record. Runtime tables hold in-flight work. Provider requests and frontend transcripts are projections.
 7. Session history is an append-only tree. Nothing deletes, copies, or rewrites a committed node.
 8. Validation, repair, policy, hooks, bounds, and journaling apply identically to direct calls, Lua children, Tasks, MCP tools, and subagents. No path is privileged.
 9. Repair changes representation only, is unambiguous, and is journaled. It never supplies semantic intent.
@@ -36,7 +36,7 @@ A limit exists only when an external constraint imposes it: the provider or its 
 - A limit is data from its source: a catalog fact (`context_window`, `max_output`), a provider refusal classified by `ai`, or an OS error. A constant in source that caps model-driven work is a defect.
 - The context window is the one limit the harness applies before sending, because it is the model's own. Large content is kept whole in a file and the model is shown a preview that names it (section 14.3); the bytes are never discarded.
 - A timeout is a default the model may override with any value, never a maximum. A model-supplied timeout is honored as given.
-- Internal buffers (view queue, diagnostic ring, journal batch) size memory, not work. When one fills, the producer degrades its own output (drops a redraw delta and resyncs, drops a diagnostic line and counts it) and never refuses or truncates model-visible data.
+- Internal buffers (view queue, journal batch) size memory, not work. When one fills, the producer degrades its own output (drops a redraw delta and resyncs) and never refuses or truncates model-visible data.
 - Hooks, config, and material metadata run user code on the owner or the watcher. Their wall-time bound (section 17) keeps those threads responsive; it is a system constraint on the harness's own threads, not a limit on the model.
 
 ### 2.2 Feedback goes to whoever can act
@@ -130,9 +130,9 @@ Write every package to the standard of Odin's own `core:` packages. Before writi
 
 ### 3.4 Context
 
-- `context` carries only `allocator`, `temp_allocator`, `logger`, and the random generator. Session state, cancellation, authority, and snapshots are explicit parameters. `context.user_ptr` is unused.
-- Threads and C callbacks do not inherit the creator's context. Every thread entry and every Lua/SQLite callback sets `allocator` and `logger` explicitly. Never copy the owner's whole context into a worker.
-- `context.logger` is the journal diagnostic logger (section 8.5). `core:log` calls anywhere become bounded `runtime.message` records.
+- `context` carries only `allocator`, `temp_allocator`, and the random generator. Session state, cancellation, authority, and snapshots are explicit parameters. `context.user_ptr` is unused.
+- Threads and C callbacks do not inherit the creator's context. Every thread entry and every Lua/SQLite callback sets `allocator` explicitly. Never copy the owner's whole context into a worker.
+- The harness installs no `context.logger`. `core:log` calls in a library (the `http` packages) do nothing, and harness code never calls `core:log`. A process diagnostic is a `runtime.message` record (section 8.5).
 
 ### 3.5 Threads and synchronization
 
@@ -175,7 +175,7 @@ harness      agent  agent/journal  agent/material  root package (nabla executabl
 | `agent/journal` | journal schema, record and node types, append/commit, claims, recovery queries, bounded reads, migrations | execution types from `agent`, model execution, filesystem discovery |
 | `agent/material` | `.agents/` and user material formats: skills, rules, commands, Task metadata, frontmatter subset, bounded discovery, verified loads | sessions, models, permissions |
 | `agent` | owner loop, state machine, jobs, tools, repair, policy, hooks, Lua runtime, Tasks, subagents, projection, compaction, catalog resolution, config parsing and validation | terminal, rendering, process-global UI state, file watching |
-| root | process lifetime, signals, config discovery and file watching, catalog refresh thread, TUI, headless, ACP server, diagnostics and export commands | a second copy of any `agent` policy |
+| root | process lifetime, signals, config discovery and file watching, catalog refresh thread, TUI, headless, ACP server, export command | a second copy of any `agent` policy |
 
 Rules: dependencies point inward; only root imports both foundation and `agent`; `agent/journal` imports only `db`, `db/sqlite`, and `core:`; `agent/material` and `markdown` import only `core:`. `agent/material` replaces `agent/skills`. No further packages without a second consumer.
 
@@ -484,7 +484,7 @@ error_text     :: proc(error: Error, allocator := context.allocator) -> string
 Records and nodes are journal-owned plain data (strings, integers, enums). `agent` maps its execution types to them; `agent/journal` never imports `agent`. The identities of section 5 are declared in `agent/journal`, the innermost package that stores them, and `agent` uses them from there.
 
 - The journal lives at `$XDG_STATE_HOME/nabla/journal.db`. Claims are `flock`s on `$XDG_RUNTIME_DIR/nabla/locks/<session>.lock`, which the kernel drops when the process dies; the files are never deleted by the harness, carry the sticky bit so periodic clean-up of the runtime directory skips them, and disappear at logout or reboot. When `XDG_RUNTIME_DIR` is not an absolute path, the specification's replacement rule applies: the locks go to `$XDG_STATE_HOME/nabla/locks/` and the launch prints a warning. Read-only journals take no lock directory.
-- A `Journal` is one connection used by one thread at a time. The main thread opens, claims, and recovers it, hands it to the session worker for the run, and takes it back for teardown after the worker stops; a handoff happens only with no result set or transaction open. Each owner opens its own and claims one session; frontends and diagnostics open `Read_Only` journals that never claim, migrate, or write.
+- A `Journal` is one connection used by one thread at a time. The main thread opens, claims, and recovers it, hands it to the session worker for the run, and takes it back for teardown after the worker stops; a handoff happens only with no result set or transaction open. Each owner opens its own and claims one session; frontends and readers open `Read_Only` journals that never claim, migrate, or write.
 - A main session is created by its first prompt, under an id chosen when the session opened, so a session nobody prompted is never recorded. Switching sessions opens the target in a second `Journal` while the running one stays claimed, and the running one is closed only once the target is claimed and recovered.
 - `selection.changed` records carry no session: the latest one is the user's default model, provider, and effort for the next launch.
 - The journal fills `time_ms`, `mono_ns`, and `run` on every record. The caller fills the correlation columns.
@@ -514,9 +514,9 @@ artifacts(digest BLOB PRIMARY KEY, kind TEXT, created_ms INTEGER, bytes BLOB) ST
 
 - Every table is append-only. Mutable facts (title, active branch, selection, ratings) are the latest record of their kind. A branch head is the highest `node` on that branch.
 - Indexes: `records(session, seq)`, `records(session, call) WHERE call IS NOT NULL`, `records(session, kind, seq)`, `records(session, node) WHERE node IS NOT NULL`, `records(session, request) WHERE request IS NOT NULL`, `nodes(session, branch, node)`.
-- `data` is one JSON object per record, shaped by a versioned struct per kind (`version` field). `body` holds exact bytes. Diagnostics queries use SQLite JSON functions over `data`; analysis needs no custom decoder.
+- `data` is one JSON object per record, shaped by a versioned struct per kind (`version` field). `body` holds exact bytes. Queries use SQLite JSON functions over `data`; analysis needs no custom decoder.
 - `body` holds what the model sees: a `User` node's is the user's text, an `Assistant` node's is the model's visible text, `tool.proposed`'s is the argument document exactly as the model sent it, `tool.admitted`'s is the arguments the tool runs with, `tool.completed`'s is the rendered result, and `response.committed`'s is the endpoint's native output items when it returned any. A `Checkpoint` node's body is its summary and a `Notice` node's is the feedback text. A Lua child's records carry a parent call and no node, so they never enter the projection or a `Results` node.
-- WAL, `synchronous = FULL`, `busy_timeout`, private 0700 directory and 0600 files. A writable open narrows an existing directory or file with wider modes to these. Several processes (TUI, diagnostics readers) share the file; each session has one writer claim.
+- WAL, `synchronous = FULL`, `busy_timeout`, private 0700 directory and 0600 files. A writable open narrows an existing directory or file with wider modes to these. Several processes (TUI and read-only readers) share the file; each session has one writer claim.
 - Migrations are explicit steps stamped in the same transaction. A newer schema is refused. Corrupt or unreadable data is a typed error naming the session and seq; the harness never guesses.
 
 ### 8.3 Durability classes and write path
@@ -562,11 +562,9 @@ Every record fills the correlation columns that exist at that point: session, br
 
 `turn.started` carries the digests of what the turn runs with: instruction snapshot, tool schema set, active rules, hooks, config snapshot generation, model, and effort. Offline analysis joins on these.
 
-### 8.5 Diagnostics from other threads
+### 8.5 Diagnostics
 
-Workers and library code log through `context.logger`, which writes into a process-wide `Diag_Ring`: a mutex-guarded fixed array of `DIAG_RING_ENTRIES` entries, each with inline fixed-size text (`DIAG_TEXT_MAX`), level, thread id, and correlation copied from the logger binding. Producers never allocate and never block; a full ring increments a dropped counter. Owners drain the ring into `runtime.message` records on every commit, and root drains it after each work item and at exit. An entry of the draining owner's session carries the session column; any other entry is recorded without one and names its session in `data.session`, and readers find it through `Filter.named`. The threshold comes from `NABLA_LOG_LEVEL` (`off`, `error`, `warn`, `info`, `debug`).
-
-Payload capture (full provider request bodies, raw response streams, MCP lines) is opt-in (`diagnostics.capture = true`). Captures are `artifacts` rows keyed by SHA-256, referenced from records by digest, bounded per session and by retention (section 27). Credentials, headers, and environment are never captured.
+A process diagnostic is a `runtime.message` record with a `level` (`warning` or `error`) and `text`. Only the thread that owns a journal writes one, through `chat_runtime_message`, and the record takes its session, turn, request, and time from the ordinary columns. Worker threads never write the journal: they report to their owner through the mailbox or the job result, and a failure the owner already learns that way, or that the user is already told, leaves no record. A failure before the terminal is taken, or one that has no journal to hold it, goes to stderr. There is no ring, no log level, and no payload capture; a statistics system reads the journal directly.
 
 ## 9. Recovery
 
@@ -686,7 +684,7 @@ Model_Facts :: struct {
 
 | Source | Scope |
 | --- | --- |
-| `$XDG_CONFIG_HOME/nabla/config.lua` (default `~/.config/nabla/`) | providers, credential references, models, MCP servers, external agents, policy, diagnostics, tool exposure |
+| `$XDG_CONFIG_HOME/nabla/config.lua` (default `~/.config/nabla/`) | providers, credential references, models, MCP servers, external agents, policy, tool exposure |
 | `$XDG_CONFIG_HOME/nabla/{skills,rules,commands,tasks,hooks}/` | user material and hooks |
 | `~/.agents/skills/`, `~/.agents/AGENTS.md` | personal material |
 | `<workspace>/.agents/{skills,rules,commands,tasks}/`, `<workspace>/AGENTS.md` | project material; `instructions.project = false` disables it |
@@ -698,7 +696,7 @@ Project definitions win over user definitions of the same name. No ancestor walk
 1. The watcher holds inotify watches on every source directory and each discovered material directory; discovery skips a directory whose device and inode it already visited, so symlink cycles end the walk without a depth cap. `IN_CREATE` of a directory adds a watch. If the watch limit is reached, the watcher reports the degradation and reload falls back to the explicit `Reload` command.
 2. Events are coalesced: after the first event the watcher waits for quiet with `ppoll` timeout `CONFIG_DEBOUNCE`, then rebuilds.
 3. Build on the watcher thread in a fresh arena: evaluate `config.lua` (restricted Lua, section 17), discover material metadata, read instruction files, compile hooks, render the instruction snapshot, encode tool schemas, compute digests. Credential references resolve at connection creation, not here.
-4. Validate completely. On failure the previous snapshot stays current, `config.rejected{source, error}` goes through the diag ring, and the view shows the error.
+4. Validate completely. On failure the previous snapshot stays current and the view shows the error.
 5. Publish: store the pointer in the "latest" slot atomically and wake every owner. When provider configuration changed, the watcher also re-resolves the catalog against cached sources.
 
 ### 13.3 Adoption and lifetime
@@ -1035,9 +1033,9 @@ The `ai` encode cache keeps encoded fragments of unchanged messages. It is bound
 - `Rate{node, value, note}` commits `rating.recorded{node, value: positive | negative, note}` against an `Assistant` node. No rating means no record. `rating.cleared{node}` withdraws; the latest record wins.
 - Offline evaluators write `assessment.recorded{node or turn, evaluator, evaluator_version, score, label, note}` through `nabla assess import`, never as ratings. Assessments are annotations: they need no session claim and change no session state.
 
-## 25. Diagnostics and offline improvement
+## 25. Statistics and offline improvement
 
-- Diagnostics are read-only views over the journal: SQL views in the schema (`v_requests`, `v_tool_calls`, `v_repairs`, `v_turns`, `v_cache`, `v_resources`) plus formatters. `nabla diagnostics [session] [--turn N] [--request N] [--metrics] [--export DIR [--artifacts]]`. Readers open read-only: no claim, no migration, no writes.
+- Statistics are read-only views over the journal, computed by a reader that opens it read-only: no claim, no migration, no writes. No diagnostics command exists.
 - Metrics, per session, per turn, and per successful turn: provider requests, attempts, retries by class, tool calls by outcome, validation failures, repairs and repair success rate, cache hit rate and coverage, input/output/cache tokens, latency distributions (first byte, request, tool, turn), subagent usage, hook interventions, failure categories, stop latency, peak RSS, retained bytes, idle wakeups, ratings.
 - `nabla export --dataset DIR [--since T] [--rated]` writes per-turn trajectories as JSONL: snapshot digests, request sizes, calls with effective args, outcomes and repairs, usage, latencies, final response, ratings, assessments.
 - Improvement is offline. A proposed change edits configuration or material files; the live harness sees it only as an ordinary snapshot, and the recorded digests attribute outcomes to the exact variant. The foreground never rewrites prompts, tools, rules, or hooks from its own observations.
@@ -1090,8 +1088,6 @@ These values schedule work, size internal buffers, and time the harness's own th
 | `COMPACT_KEEP_MESSAGES` / `_MIN_REDUCTION` / `_COOLDOWN` | 10 / 1024 tokens / 30 s | compaction policy |
 | `ENCODE_CACHE_MAX_BYTES` | 16 MiB | cache memory |
 | `JOURNAL_BATCH_RECORDS` / `_BYTES` / `_AGE` | 256 / 1 MiB / 1 s | write batching |
-| `DIAG_RING_ENTRIES` / `DIAG_TEXT_MAX` | 512 / 512 B | diagnostic memory; overflow counts drops |
-| capture per session / artifact retention | 64 MiB / 14 days | opt-in diagnostic disk use |
 | `IDLE_RSS_SLACK` | 8 MiB | acceptance check |
 
 A default changes only with a measurement from the journal or a benchmark test. A new entry that would cap model-driven work is refused by section 2.1.
@@ -1116,7 +1112,6 @@ These mechanisms exist in the code today and are replaced by the named target. D
 | invalid request, payload too large, and content policy end the turn | one `Notice`, then end on a repeat (section 2.2) |
 | a result rendered by `tool_result_of` where the executor built it | typed output kept until commit, rendered once at commit (section 14.3) |
 | catalog replaced under a mutex and the old one destroyed; selection reapplied mid-turn | immutable reference-counted snapshots, kept by admitted work (section 13.3) |
-| request preparation only in `runtime.message` | a structured `request.prepared` record (section 11.3) |
 | subagent start, messages, and outcomes held in in-memory team state | the journal protocol of section 21.2 |
 | native background subagents start without an admission gate | `SUBAGENTS_MAX_RUNNING` (section 27) |
 | `agent/skills` with skill list and load tools | `agent/material` (sections 18, 19) |

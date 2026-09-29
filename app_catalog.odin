@@ -76,9 +76,8 @@ models_dev_read_due :: proc(app: ^App) -> bool {
 
 catalog_refresh_worker :: proc(thread_handle: ^thread.Thread) {
 	app := cast(^App)thread_handle.data
-	// The worker adopts the run's logger and allocator, so what it allocates belongs to
-	// the run rather than to the process default a fresh thread context starts with.
-	context.logger = agent.log_logger(&app.setup.log_binding)
+	// The worker adopts the run's allocator, so what it allocates belongs to the run
+	// rather than to the process default a fresh thread context starts with.
 	context.allocator = app.setup.alloc
 	for {
 		_, open := chan.recv(app.catalog_refresh)
@@ -225,7 +224,7 @@ catalog_selection_sync :: proc(app: ^App) {
 catalog_refresh_stop :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	if app.catalog_worker == nil { return true }
 	chan.close(&app.catalog_refresh)
-	if !join_retiring(app.catalog_worker, "nabla-catalog-refresh", patience) { return false }
+	if !join_retiring(app.catalog_worker, patience) { return false }
 	app.catalog_worker = nil
 	chan.destroy(&app.catalog_refresh)
 	return true
